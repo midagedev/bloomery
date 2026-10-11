@@ -30,12 +30,13 @@
 //!   residual and the shared expert (`hostleg`), into the next layer's
 //!   input — the head's after the last layer of the step.
 //!
-//! The slot map is the plan's for the load's life (no residency machine):
-//! its card copy is what the handoff and the places read, and the host tier
-//! skips the same slots by the same map, so which expert runs where has one
-//! owner. The shared expert is never one of the router's slots here: a
-//! placed load keeps Qwen3.6's routed stacks and its shared expert apart
-//! (the whole-card load folds the shared expert into its stacks as one more
+//! The slot map is the plan's for the load's life while the load's
+//! residency glue runs no machine ([`Placed`]'s `glue`): its card copy is
+//! what the handoff and the places read, and the host tier skips the same
+//! slots by the same map, so which expert runs where has one owner. The
+//! shared expert is never one of the router's slots here: a placed load
+//! keeps Qwen3.6's routed stacks and its shared expert apart (the
+//! whole-card load folds the shared expert into its stacks as one more
 //! expert, which a card holding part of a layer's experts cannot).
 //!
 //! A load whose arena holds more than [`GEMV_COLS`] rows (`Body35`'s, at
@@ -63,10 +64,11 @@ use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, route_byt
 use crate::gemm::GemmRoute;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::run::{HostRun, HostWidths};
+use crate::host::served::{ResidencyParts, TierBody};
+use crate::host::swap_source::ResidencyGlue;
 use crate::host::{BatchLeg, StepLeg};
-use crate::hybrid::{Boundary, BoundaryShape, HOST, HostResidency, Hybrid, Refusal, SlotMap};
+use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, SlotMap};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
-use crate::model::HostServed;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -87,6 +89,9 @@ const WHAT: &str = "qwen3moe placed load";
 /// The rows of a placed prompt unit that reads each host expert once: the
 /// host union's most columns.
 pub(super) const PLACED_ROWS: usize = UNION_MAX_COLS;
+
+/// The rows of a placed decode step: the step arena's one row.
+const STEP_ROWS: usize = 1;
 
 /// The shared expert of a placed Qwen3.6 layer: its three stacks of one
 /// expert each, as the file holds them, its gate·up entry and its down's
@@ -112,6 +117,18 @@ pub(super) struct PlacedFfn {
     gate_up: Option<GateUpEntry>,
     down_ty: SiteTy,
     shared: Option<SharedFfn>,
+}
+
+/// The residency machine's tally shape for a placed load over arena dims
+/// `d`: the ids a row routes a layer, and the rows a pass runs. The ids are
+/// the step boundary's `n_used` (the router's routed slots, not the shared
+/// expert's), which the step port notes slot by slot; the rows are the
+/// step's one ([`STEP_ROWS`]): a placed load refuses a pass of several rows
+/// (`body35::enqueue_rows`), and a prompt unit's rows go through the batch
+/// port, which notes no id (a prompt call keeps 0 rows). A chain of dense
+/// FFNs is refused by name.
+pub(super) fn tally_shape(d: &Dims) -> Result<(usize, usize), GpuError> {
+    Ok((RouteShape::of(d)?.used, STEP_ROWS))
 }
 
 /// What the host leg's launches take a placed chain to be: the experts a
@@ -251,7 +268,7 @@ pub(super) struct PlacedKernels {
 /// count and one entry for the shared expert's id, [`HOST`]).
 pub(super) struct PlacedSide {
     ffn: Vec<PlacedFfn>,
-    slots: DeviceTensor<u32>,
+    slots: Arc<DeviceTensor<u32>>,
     maps: Vec<DeviceBuffer<u32>>,
     shape: RouteShape,
     k: PlacedKernels,
@@ -262,13 +279,17 @@ pub(super) struct PlacedSide {
 /// The placed side of a load: the host tier over every layer's routed
 /// experts, what the walks read, and the step's and the pass arena's host
 /// leg buffers, with the host sums a unit's upload lands in (a row of the
-/// model's width for each of the unit's most rows).
+/// model's width for each of the unit's most rows), and the load's residency
+/// glue ([`ResidencyGlue`]), which carries the residency calls of the shared
+/// [`HostServed`](crate::model::HostServed) impl ([`TierBody`]) when it holds
+/// a machine.
 pub struct Placed {
     pub(super) hybrid: Hybrid<HostRun>,
     pub(super) side: PlacedSide,
     pub(super) step: PlacedRows,
     pub(super) pass: PlacedRows,
     pub(super) pass_hsum: DeviceBuffer<f32>,
+    glue: ResidencyGlue,
 }
 
 /// What [`Placed::new`] builds a load's placed side from.
@@ -280,6 +301,9 @@ pub(super) struct PlacedOpen<'a> {
     pub(super) host: HostCfg,
     /// The plan's host set as the load left it.
     pub(super) set: HostResidency,
+    /// The load's residency side: [`ResidencyGlue::off`] on a load that runs
+    /// no machine.
+    pub(super) glue: ResidencyGlue,
     /// The architecture the host run's refusals name.
     pub(super) arch: &'static str,
     /// The most rows a prompt unit holds: the arena's, [`PLACED_ROWS`] on a
@@ -299,6 +323,10 @@ impl Placed {
     /// serves) watching the fault word and holding the host set, its batch
     /// port for units of up to `o.rows` rows, and the buffers (past
     /// [`GEMV_COLS`] rows each layer's map and table of its card experts).
+    /// The glue is given the host run's NVMe tier
+    /// ([`ResidencyGlue::attach_tier`]), and the machine it may hold is
+    /// started by the body once its pieces are sized
+    /// ([`HostServed::start_residency`](crate::model::HostServed::start_residency)).
     /// A plan of other than one card, with an expert tier, or not of every
     /// layer is refused by name. Load-time only.
     pub(super) fn new(
@@ -339,7 +367,7 @@ impl Placed {
             .map(|(l, p)| placed_ffn(w, &map, shape, p, l))
             .collect::<Result<Vec<_>, _>>()?;
         let stage = map.stage_view();
-        let slots = DeviceTensor::upload(stream, &stage, n, shape.n_expert)?;
+        let slots = Arc::new(DeviceTensor::upload(stream, &stage, n, shape.n_expert)?);
         let cards: Vec<usize> = ffn.iter().map(|f| f.n_card).collect();
         let maps = if o.rows > GEMV_COLS {
             layer_maps(stream, &stage, n, shape.n_expert)?
@@ -371,6 +399,7 @@ impl Placed {
         let mut experts = crate::model::host_run(o.plan, &o.file, 0, o.host.r8, widths, |src| {
             model::arch::qwen35moe::host::routed_layers(src, dims, 0..n, o.arch)
         })?;
+        o.glue.attach_tier(experts.tier())?;
         experts.prepare_union(o.rows)?;
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
@@ -392,9 +421,10 @@ impl Placed {
                 k,
                 cap: o.rows,
             },
-            step: PlacedRows::new(stream, shape, 1, &[])?,
+            step: PlacedRows::new(stream, shape, STEP_ROWS, &[])?,
             pass: PlacedRows::new(stream, shape, o.rows, &cards)?,
             pass_hsum: DeviceBuffer::zeroed(stream, o.rows * shape.hidden)?,
+            glue: o.glue,
         };
         let made = placed.device_bytes() - placed.hybrid.boundary().device_bytes();
         let tables: usize = cards
@@ -647,30 +677,30 @@ fn placed_ffn(
     })
 }
 
-impl HostServed for Placed {
-    fn serve_captured(&mut self, chain: crate::hybrid::Chain) -> Result<(), GpuError> {
+impl TierBody for Placed {
+    type Experts = HostRun;
+
+    fn hybrid(&self) -> &Hybrid<HostRun> {
+        &self.hybrid
+    }
+
+    fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+        &mut self.hybrid
+    }
+
+    /// The machine's parts when the glue holds one; a load that runs none
+    /// keeps the plan's slot map and the residency calls do nothing.
+    fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
+        self.glue.source()?;
+        Some(ResidencyParts {
+            glue: &mut self.glue,
+            hybrid: &mut self.hybrid,
+            slots: &self.side.slots,
+        })
+    }
+
+    fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
         self.hybrid.serve_captured_of(chain)
-    }
-
-    fn take_host_refusal(&mut self) -> Option<Refusal> {
-        self.hybrid.take_step_refusal()
-    }
-
-    /// The host tier's refusal poison lifted
-    /// ([`crate::host::HostTier::lift_refusal`]) — the settling a reset
-    /// runs is [`crate::host::HostTier::settle`]'s ([`Placed::reset`]).
-    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.hybrid.lift_refusal(stream)
-    }
-
-    /// The refusal the host tier is poisoned by now
-    /// ([`crate::host::HostTier::refusal_poison`]).
-    fn refusal_poison(&self) -> Option<Refusal> {
-        self.hybrid.refusal_poison()
-    }
-
-    fn host_residency(&self) -> Option<&HostResidency> {
-        self.hybrid.residency()
     }
 }
 
