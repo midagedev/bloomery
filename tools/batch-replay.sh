@@ -68,9 +68,10 @@ for arm in base new; do
     fi
   fi
   cp "$ROOT/tools/ref/ref-paths.sh" "$WORK/$arm/tools/ref/ref-paths.sh"
-  # real-only.sh: the plan's real-only validation reads it in the tree (its absence would be a named
-  # error for all 44 real-only recipes of the real justfile, in both arms)
+  # real-only.sh and fixture-only.sh: the plan's marker validation reads them in the tree (an absence would be a named
+  # error for every recipe of the real justfile that calls one, in both arms)
   cp "$ROOT/tools/ref/real-only.sh" "$WORK/$arm/tools/ref/real-only.sh"
+  cp "$ROOT/tools/ref/fixture-only.sh" "$WORK/$arm/tools/ref/fixture-only.sh"
 done
 
 # Each arm's table: the first box.sh command of every listed recipe, exactly as just substitutes
