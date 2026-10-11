@@ -166,9 +166,9 @@
 //! with no draft where that plan pages, under `--place bp` too: that one slot
 //! is the room's, not a column's (the same `paged` line, the floor named at
 //! its end); a set `--parallel` there is refused by the floor, by name. The
-//! residency machine's fills share the arena with the step: a
-//! `BLOOMERY_RESIDENCY` word set to other than `off` on such a plan is
-//! refused by name (unset resolves `off`).
+//! residency machine's victim fills read through the NVMe tier's reader
+//! while the step's ids stay pinned in the arena, so a `BLOOMERY_RESIDENCY`
+//! word set on such a plan is served as given (unset resolves `off`).
 //!
 //! The MTP draft keeps the same rule past a break-even, and the server cuts
 //! its prompt calls at the same message starts (the draft's prompt call joins
@@ -1713,23 +1713,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         )
         .into());
     }
-    // The residency machine's lane threads fill victims through the arena
-    // the step reads its paged experts from: a fill can evict the slot a
-    // step is reading. The unset rule resolves `off` there; a set word
-    // other than `off` is refused.
-    if let Some((r, word)) = set
-        && r != Residency::Off
-        && plan.host.nvme_arena_bytes > 0
-    {
-        return Err(format!(
-            "BLOOMERY_RESIDENCY={word}: the plan pages host experts through the NVMe tier's {} B \
-             RAM arena, and the residency machine's fills share that arena with the step, whose \
-             slots a fill can evict; unset BLOOMERY_RESIDENCY (or set it to off) to serve this \
-             plan",
-            plan.host.nvme_arena_bytes
-        )
-        .into());
-    }
     let line = Record::new(&record::PLAN38)
         .w("place", a.place.name())
         .w("card", machine.cards[0].name.as_str())
@@ -2360,7 +2343,9 @@ impl Q38 {
     /// The `tier census` record of the span since the last call's, phase
     /// `call`, on stderr: its picks by where they were served and the bytes
     /// it moved between the tiers, the dropper's calls and wall and the
-    /// pool's dispatch waits. Nothing on a load with no tier.
+    /// pool's dispatch waits; then the load's cumulative `nvtier` record, so
+    /// the last one of a run holds the arena's counters at its end. Nothing
+    /// on a load with no tier.
     fn print_census(&mut self) -> Result<(), GateError> {
         let Some(last) = self.census else {
             return Ok(());
@@ -2378,6 +2363,9 @@ impl Q38 {
             )
             .eprint();
         self.census = Some(now);
+        if let Some(r) = record::nvtier_of(b.nvme_tier().map(|t| &**t)) {
+            r.eprint();
+        }
         Ok(())
     }
 }

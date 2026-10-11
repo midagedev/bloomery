@@ -291,10 +291,12 @@
 //!   off the `cache` line); the prompt cache's default takes nothing beside
 //!   the room the split fills (`paged_default_cache_is_off_by_the_split`:
 //!   `ram=0`, the split named in `why=`); a residency word set to `off`
-//!   reaches the `plan` record (`paged_set_off_residency_is_accepted`), and
-//!   one set to
-//!   `mid-p0-s1` is refused by name before it (`paged_set_residency_is_refused_by_name`:
-//!   the residency machine's fills share the arena with the step). The
+//!   reaches the `plan` record and loads no residency machine
+//!   (`paged_set_off_residency_is_accepted`), and one set to `mid-p0-s1`
+//!   loads it and serves a request (`paged_set_residency_serves`: the
+//!   machine's victim fills read through the NVMe tier's reader, the lane's
+//!   reads of the arena's ids go through its slots and none through the
+//!   model file's mapping, read off the run's last `nvtier` record). The
 //!   floor counts every slot's checkpoints, so between the one-slot plan's
 //!   floor and the asked two slots' lies a band of rooms only the one-slot
 //!   plan clears: the gate reads both floors off its own plans
@@ -3591,11 +3593,13 @@ mod gate {
     /// checkpoint reserve, less `checkpoint_bytes(slots)`, and its `need` that
     /// plan's plus the same); the prompt cache's default is 0 beside the room
     /// the split fills (`paged_default_cache_is_off_by_the_split`); a
-    /// residency word set to `off` reaches the `plan` record
-    /// (`paged_set_off_residency_is_accepted`), and one set to
-    /// `mid-p0-s1` is refused by name before it
-    /// (`paged_set_residency_is_refused_by_name`: the machine's fills share
-    /// the arena with the step). The floor counts the checkpoints too: at the
+    /// residency word set to `off` reaches the `plan` record and loads no
+    /// machine (`paged_set_off_residency_is_accepted`), and one set to
+    /// `mid-p0-s1` loads it and serves a request
+    /// (`paged_set_residency_serves`: the machine's victim fills read through
+    /// the NVMe tier's reader, so the lane's arena reads count as slot reads
+    /// and none as mapping reads, `slot_reads` and `mapping_reads` of the
+    /// run's last `nvtier` record). The floor counts the checkpoints too: at the
     /// middle of the band of rooms between the one-slot plan's floor and the
     /// asked two slots' (the gate's own plans' floors, read off
     /// `HostRoomFloor`, plus `checkpoint_bytes(slots)`) the flagless server
@@ -3611,10 +3615,12 @@ mod gate {
     /// bytes rather than the arena refuses the 40 GiB `--parallel 2`; a
     /// one-column load that keeps the yield's reason names it on the small
     /// card; a machine with no checkpoint reserve gives the arena the gate's
-    /// own plan has, red on the checkpoint clause; a seat that takes a set
-    /// word on the paged plan prints its `plan` record, red on the refusal
-    /// clause; one that refuses `off` as well never reaches that record, red
-    /// on the acceptance clause; a seat that plans the asked two slots with
+    /// own plan has, red on the checkpoint clause; a seat that refuses a set
+    /// word on the paged plan by name never listens, red on the residency
+    /// clause, and so is one that hands the machine's lane no tier (no slot
+    /// read) or lets it read the mapping (a mapping read); one that refuses
+    /// `off` as well never reaches the `plan` record, red on the acceptance
+    /// clause; a seat that plans the asked two slots with
     /// no floor fallback refuses the flagless band server by the floor, red
     /// on the fallback clause.
     fn paged(
@@ -3717,23 +3723,25 @@ mod gate {
             "paged_default_serves_one_column",
             one && named && arena.is_some_and(|a| a > 0),
         );
-        // A set residency word on a plan that pages through the arena is
-        // refused by name (`paged_set_residency_is_refused_by_name`
-        // below); `off`, set on every server of this clause, is not: the
-        // 27 GiB server reaches its `plan` record.
-        let refusal = |word: &str| {
-            format!(
-                "BLOOMERY_RESIDENCY={word}: the plan pages host experts through the NVMe \
-                 tier's "
-            )
+        // `off`, set on every server of this clause, reaches the `plan`
+        // record: its `residency lever` record names `off` with why `set`
+        // and the load runs no residency machine, so no `residency host`
+        // record follows (a set word that runs one is the clause
+        // `paged_set_residency_serves` below).
+        let word_of = |log: &record::Log| -> Result<Option<(String, String)>, ReadError> {
+            log.first(&record::RESIDENCY_LEVER)?
+                .map(|l| -> Result<(String, String), ReadError> {
+                    Ok((l.word("residency")?.to_owned(), l.word("why")?.to_owned()))
+                })
+                .transpose()
         };
-        let planned = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
-            .first(&record::PLAN38)?
-            .is_some();
+        let off_log = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38);
         check(
             &mut ok,
             "paged_set_off_residency_is_accepted",
-            planned && !text.contains(&refusal("off")),
+            off_log.first(&record::PLAN38)?.is_some()
+                && word_of(&off_log)? == Some(("off".to_owned(), "set".to_owned()))
+                && off_log.first(&record::RESIDENCY_HOST)?.is_none(),
         );
         // The split fills the room past the tier's floor, so the prompt
         // cache's default takes nothing beside it: `ram=0`, the split named
@@ -3862,27 +3870,84 @@ mod gate {
                 && !listened(&text)?,
         );
 
-        // The residency machine's fills share the arena with the step: a
-        // set word other than `off` on a plan that pages through the arena
-        // is refused by name, after the slot rule's lines and before the
-        // plan's record.
-        let (line, failed, text) = run(
-            &[
-                (bloomery_levers::HOST_ROOM, "27G"),
-                (bloomery_levers::RESIDENCY, RESIDENCY_WORD),
-            ],
-            &[],
-        )?;
+        // A residency word set on a plan that pages through the arena is
+        // served as given. PIN(2026-10-11): this clause replaced
+        // `paged_set_residency_is_refused_by_name`; the refusal's cause is
+        // gone — the lane's victim fills read through the NVMe tier's reader
+        // and the step's ids stay pinned until its reads end, so a fill
+        // cannot evict a slot the step is reading. The server loads in full
+        // (it is the one server of this clause that does) and answers one
+        // request, and stops before the next server starts. Its words come
+        // from the `residency lever` and `residency host` records (the
+        // `plan` record names no residency), and the lane's reads of the
+        // arena's ids from the run's last `nvtier` record, which each call's
+        // end prints with the counters since the load: a promotion read an
+        // arena slot (`slot_reads` past zero) and none read the model file's
+        // mapping (`mapping_reads` zero).
+        let refusal = format!(
+            "BLOOMERY_RESIDENCY={RESIDENCY_WORD}: the plan pages host experts through the NVMe \
+             tier's "
+        );
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::RESIDENCY, RESIDENCY_WORD)
+            .env(bloomery_levers::HOST_ROOM, "27G")
+            .env_remove(bloomery_levers::DRAFT)
+            .env_remove(bloomery_levers::NVTIER_BYTES)
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT)
+            .env_remove(bloomery_levers::MTP_WIDTH);
+        let mut served = Served38::spawn_with(&DEFAULT_ARGS, &own, &mut cmd)?;
+        println!("paged: residency server pid {}", served.child.id());
+        let completed = match served.address(&err_log, POLLS, POLL) {
+            Ok(addr) => {
+                let body = json!({
+                    "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0,
+                    "return_tokens": true,
+                });
+                let (st, reply) = curl(&format!("http://{addr}/completion"), Some(&body), false)?;
+                let tokens = json_of("/completion", st, &reply)
+                    .map(|c| ids_of(&c["tokens"]))
+                    .unwrap_or_default();
+                println!(
+                    "paged: the residency server's request: HTTP {st}, {} ids",
+                    tokens.len()
+                );
+                st == 200 && !tokens.is_empty()
+            }
+            Err(e) => {
+                println!("paged: the residency server never listened: {e}");
+                false
+            }
+        };
+        if served.child.try_wait()?.is_none() {
+            println!("paged: the residency server stopped: {}", served.stop()?);
+        }
+        let text = std::fs::read_to_string(&err_log)?;
+        let log = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38);
+        let host_word = log
+            .first(&record::RESIDENCY_HOST)?
+            .map(|h| h.word("residency").map(str::to_owned))
+            .transpose()?;
+        let reads = log
+            .all(&record::NVTIER)?
+            .last()
+            .map(|n| Ok::<_, ReadError>((n.u64("slot_reads")?, n.u64("mapping_reads")?)))
+            .transpose()?;
+        let lever = word_of(&log)?;
+        println!(
+            "paged: residency lever {lever:?}, host {host_word:?}, (slot_reads, mapping_reads) \
+             {reads:?}"
+        );
         check(
             &mut ok,
-            "paged_set_residency_is_refused_by_name",
-            failed
-                && line.is_some()
-                && text.contains(&refusal(RESIDENCY_WORD))
-                && !record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
-                    .first(&record::PLAN38)?
-                    .is_some()
-                && !listened(&text)?,
+            "paged_set_residency_serves",
+            log.first(&record::PLAN38)?.is_some()
+                && lever == Some((RESIDENCY_WORD.to_owned(), "set".to_owned()))
+                && host_word.as_deref() == Some(RESIDENCY_WORD)
+                && !text.contains(&refusal)
+                && listened(&text)?
+                && completed
+                && reads.is_some_and(|(slot, mapping)| slot > 0 && mapping == 0),
         );
 
         let (line, _, text) = run(&[(bloomery_levers::HOST_ROOM, "40G")], &["--parallel", "2"])?;

@@ -1632,13 +1632,15 @@ pub static CLEF_ROWS: Kind = Kind {
 /// tier holds them (`NvTierStats`) — the misses `ensure` read, the slots
 /// filled and their bytes and wall, the evictions, the resident bytes (at
 /// or under the budget at every step), the reads the page cache served, the
-/// drops of the mapping's pages a read brought in, their bytes and wall, and
-/// the prompt union's claims: its calls by path, the ids its claims filled
-/// and found filled, and the ids it claimed as keep and as transient.
+/// drops of the mapping's pages a read brought in, their bytes and wall, the
+/// residency lane's reads by where they were served (the arena's slot, the
+/// model file's mapping), and the prompt union's claims: its calls by path,
+/// the ids its claims filled and found filled, and the ids it claimed as
+/// keep and as transient.
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims).",
     parts: &[
         key("budget", U64, "B"),
         key("paged", U64, "B"),
@@ -1653,6 +1655,8 @@ pub static NVTIER: Kind = Kind {
         key("drops", U64, ""),
         key("drop_bytes", U64, "B"),
         key("drop_ns", U64, "ns"),
+        key("slot_reads", U64, ""),
+        key("mapping_reads", U64, ""),
         key("union_small", U64, ""),
         key("union_batched", U64, ""),
         key("union_fills", U64, ""),
@@ -3389,6 +3393,8 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
             .u("drops", s.drops)
             .u("drop_bytes", s.drop_bytes)
             .u("drop_ns", s.drop_ns)
+            .u("slot_reads", s.slot_reads)
+            .u("mapping_reads", s.mapping_reads)
             .u("union_small", s.union_small)
             .u("union_batched", s.union_batched)
             .u("union_fills", s.union_fills)
@@ -3830,17 +3836,19 @@ mod tests {
             .u("drops", 11)
             .u("drop_bytes", 12)
             .u("drop_ns", 13)
-            .u("union_small", 14)
-            .u("union_batched", 15)
-            .u("union_fills", 16)
-            .u("union_hits", 17)
-            .u("keep_claims", 18)
-            .u("transient_claims", 19)
+            .u("slot_reads", 14)
+            .u("mapping_reads", 15)
+            .u("union_small", 16)
+            .u("union_batched", 17)
+            .u("union_fills", 18)
+            .u("union_hits", 19)
+            .u("keep_claims", 20)
+            .u("transient_claims", 21)
             .line();
         assert!(
             line.ends_with(
-                "drop_ns=13 union_small=14 union_batched=15 union_fills=16 union_hits=17 \
-                 keep_claims=18 transient_claims=19"
+                "drop_ns=13 slot_reads=14 mapping_reads=15 union_small=16 union_batched=17 \
+                 union_fills=18 union_hits=19 keep_claims=20 transient_claims=21"
             ),
             "{line}"
         );
