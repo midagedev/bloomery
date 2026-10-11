@@ -26,12 +26,16 @@
 //!   reads, on a fixture variant none of whose routed layers has one
 //!   ([`card_clause`]). The real tier runs it; the fixture tier leaves it to
 //!   the real tier, by name.
+//! - [`Tag::NoHostLayer`]: a clause that reads the NVMe tier's paged experts, on
+//!   a file whose routed layers that stay on the host are too few for the tier
+//!   to page any ([`host_clause`]). The real tier runs it; the fixture tier
+//!   leaves it to the real tier, by name.
 //!
 //! The `real` tier runs every clause except the fixture's oracle comparisons,
 //! tagged or not: nothing changes for a gate that declares no tags. Each of
 //! those is a [`FIXTURE_ONLY`] line. The `fixture` tier runs the
 //! self-consistency clauses and the fixture's oracle comparisons (each a
-//! [`FIXTURE_ORACLE`] line) and defers the other three, each deferral a
+//! [`FIXTURE_ORACLE`] line) and defers the others, each deferral a
 //! [`DEFERRED`] line; the batch runner (`tools/gate-batch.sh`) counts the
 //! deferral lines. A clause with no tag in the fixture tier is a named error,
 //! never a clause that quietly ran or quietly did not. A gate that declares
@@ -84,7 +88,7 @@ pub enum Tier {
     Fixture,
 }
 
-/// What a clause answers (the module doc names the six).
+/// What a clause answers (the module doc names the seven).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tag {
     /// Two arms of the engine under one plan agree.
@@ -102,17 +106,22 @@ pub enum Tag {
     /// variant none of whose routed layers has one: the clause has no input
     /// there, and the real file (which has them) answers it.
     NoCardLayer,
+    /// A clause that reads the NVMe tier's paged experts, on a file whose routed layers that stay on
+    /// the host are too few for the tier to page any: the clause has no input there, and the real
+    /// file answers it.
+    NoHostLayer,
 }
 
 impl Tag {
     /// Every tag, in the order the module doc names them.
-    pub const ALL: [Tag; 6] = [
+    pub const ALL: [Tag; 7] = [
         Tag::SelfConsistency,
         Tag::Oracle,
         Tag::FileBound,
         Tag::Scale,
         Tag::FixtureOracle,
         Tag::NoCardLayer,
+        Tag::NoHostLayer,
     ];
 
     /// The tag's name as a [`DEFERRED`] line prints it.
@@ -125,6 +134,7 @@ impl Tag {
             Tag::Scale => "scale",
             Tag::FixtureOracle => "fixture-oracle",
             Tag::NoCardLayer => "no-card-layer",
+            Tag::NoHostLayer => "no-host-layer",
         }
     }
 }
@@ -481,17 +491,75 @@ fn card_clause_in(
     tally: &Tally,
     out: &mut impl std::io::Write,
 ) -> Result<bool, GateError> {
-    let tag = if no_card_layer && tier == Tier::Fixture {
-        Tag::NoCardLayer
+    input_clause_in(tier, no_card_layer, Tag::NoCardLayer, name, tally, out)
+}
+
+/// A self-consistency clause that reads an input the file may not have: it carries `absent_tag`
+/// where `absent` holds in the fixture tier, and [`Tag::SelfConsistency`] everywhere else.
+/// `Ok(false)`: the clause was left, skip it.
+fn input_clause_in(
+    tier: Tier,
+    absent: bool,
+    absent_tag: Tag,
+    name: &str,
+    tally: &Tally,
+    out: &mut impl std::io::Write,
+) -> Result<bool, GateError> {
+    let tag = if absent && tier == Tier::Fixture {
+        absent_tag
     } else {
         Tag::SelfConsistency
     };
     let runs = run_clause_in(tier, name, tag, tally, out)?;
-    if runs || tag == Tag::NoCardLayer {
+    if runs || tag == absent_tag {
         Ok(runs)
     } else {
         Err(format!("the self-consistency clause {name:?} was deferred").into())
     }
+}
+
+/// The NVMe tier's clause `name` of a gate whose file keeps `host_enough` routed layers on the
+/// host (the family's count over the file's types: more than one, so the tier has something to
+/// page). It is a self-consistency clause, run in both tiers, except on a fixture whose host
+/// layers are too few: there it declares [`Tag::NoHostLayer`] and the fixture tier leaves it to
+/// the real tier, its [`DEFERRED`] line naming the tag. The premise is the file's types, never the
+/// plan's placement, and it approximates the plan's own paging condition: a file it admits whose
+/// plan pages nothing fails the clause, loud, never deferred. A fixture variant exists to run
+/// these clauses, so a variant that fails the premise is a named error. `Ok(false)`: the clause
+/// was left, skip it.
+///
+/// # Errors
+/// As [`run_clause`], [`refset::RefError`] for a malformed `BLOOMERY_FIXTURE_VARIANT`, or a
+/// variant whose file keeps too few routed layers on the host.
+pub fn host_clause(name: &str, host_enough: bool) -> Result<bool, GateError> {
+    let variant = !host_enough && refset::fixture::selected()?.is_some();
+    host_clause_in(
+        Tier::from_env()?,
+        host_enough,
+        variant,
+        name,
+        &TALLY,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// [`host_clause`] of its inputs: the tier, whether the file keeps enough routed layers on the
+/// host, whether a fixture variant is selected, the tally and the sink.
+fn host_clause_in(
+    tier: Tier,
+    host_enough: bool,
+    variant: bool,
+    name: &str,
+    tally: &Tally,
+    out: &mut impl std::io::Write,
+) -> Result<bool, GateError> {
+    if tier == Tier::Fixture && !host_enough && variant {
+        return Err(format!(
+            "the clause {name:?} reads the NVMe tier's paged experts, and the selected fixture variant keeps too few routed layers on the host to page any"
+        )
+        .into());
+    }
+    input_clause_in(tier, !host_enough, Tag::NoHostLayer, name, tally, out)
 }
 
 /// A self-consistency clause: it runs in both tiers, so a tier that deferred it is refused by name
@@ -927,10 +995,10 @@ pub fn witness_card(derived: &model::placement::workstation::CardSpec) -> bool {
 mod tests {
     use super::*;
 
-    /// The six tags are the six kinds of clause the module doc names, once
+    /// The seven tags are the seven kinds of clause the module doc names, once
     /// each, and every name prints as one word.
     #[test]
-    fn six_tags_in_the_docs_order() {
+    fn seven_tags_in_the_docs_order() {
         let names: Vec<&str> = Tag::ALL.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
@@ -940,7 +1008,8 @@ mod tests {
                 "file-bound",
                 "scale",
                 "fixture-oracle",
-                "no-card-layer"
+                "no-card-layer",
+                "no-host-layer"
             ]
         );
         assert!(names.iter().all(|n| !n.contains(' ')));
@@ -1004,6 +1073,11 @@ mod tests {
                 Tag::NoCardLayer,
                 Decision::Run,
                 Decision::Deferred(Tag::NoCardLayer),
+            ),
+            (
+                Tag::NoHostLayer,
+                Decision::Run,
+                Decision::Deferred(Tag::NoHostLayer),
             ),
         ];
         assert_eq!(table.len(), Tag::ALL.len());
@@ -1115,6 +1189,52 @@ mod tests {
             )
         );
         assert_eq!(call(Tier::Real, true), (true, String::new(), (1, 0, 0)));
+    }
+
+    /// The NVMe tier's clause runs as a self-consistency clause whenever the file keeps enough
+    /// routed layers on the host; a fixture without them leaves it by its own tag, the real tier
+    /// runs it whatever the premise says, and a selected variant without them is a named error.
+    /// Mutant: the premise ignored, the tag borrowed from another kind (the line names it), or the
+    /// variant allowed to defer.
+    #[test]
+    fn the_host_clause_is_left_only_on_a_fixture_with_too_few_host_layers() {
+        let call = |tier: Tier, host_enough: bool, variant: bool| {
+            let (tally, mut out) = (Tally::new(), Vec::new());
+            let runs = host_clause_in(tier, host_enough, variant, "tier: attach", &tally, &mut out);
+            (
+                runs.map_err(|e| e.to_string()),
+                String::from_utf8(out).expect("UTF-8"),
+                tally.counts(),
+            )
+        };
+        assert_eq!(
+            call(Tier::Fixture, true, false),
+            (Ok(true), String::new(), (1, 0, 0))
+        );
+        assert_eq!(
+            call(Tier::Fixture, true, true),
+            (Ok(true), String::new(), (1, 0, 0))
+        );
+        assert_eq!(
+            call(Tier::Fixture, false, false),
+            (
+                Ok(false),
+                "deferred(real) no-host-layer: tier: attach\n".to_string(),
+                (0, 1, 0)
+            )
+        );
+        assert_eq!(
+            call(Tier::Real, false, false),
+            (Ok(true), String::new(), (1, 0, 0))
+        );
+        assert_eq!(
+            call(Tier::Real, false, true),
+            (Ok(true), String::new(), (1, 0, 0))
+        );
+        let (named, printed, counted) = call(Tier::Fixture, false, true);
+        let err = named.expect_err("a variant that defers");
+        assert!(err.contains("fixture variant keeps too few"), "{err}");
+        assert_eq!((printed, counted), (String::new(), (0, 0, 0)));
     }
 
     /// The tally counts each kind of decision once, and its line has the
