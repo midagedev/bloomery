@@ -100,6 +100,13 @@
 #   res-nolever  the copy with the residency kinds, 6@BLOOMERY_RESIDENCY=mid-p148-s1 with no STUB_GEN_RES (the stub
 #                prints no lever record): a FAIL row naming the missing record, rc 1, never a row with no column.
 #   cpu-guard    STUB_CPU_BUSY=1 (every CPU sample 99 %), 6 lcpp:6: both rows [cpu-busy], `cpu-busy rows: 2 of 2`.
+#   tier-arm     STUB_GEN_NVTIER=1, 6 12 (one shared load, each arm adding its depth to the cumulative counters): a
+#                `tier-arm r1 ours d=6: fills=6 fill_ns=60 evictions=1 union_fills=6` line under the first arm's row and
+#                `… fills=12 fill_ns=120 evictions=2 union_fills=12` under the second's (its record minus the
+#                first's), and the load's header echoing the `capture` line.
+#   tier-total   STUB_GEN_NVTIER=old, 6 12 (a binary that prints the record once, at the process end): both rows kept,
+#                one `tier-arm r1 ours d=12: no per-arm record (a process total: run with BLOOMERY_AB_LOAD=arm)` line
+#                and none under d=6.
 #   tokens-check STUB_GEN_NVTIER=1, 6 6@STUB_GEN_TOKEN0=7, two rounds: every arm's `nvtier` record in the log (4), a
 #                `tokens r<R>: differ lcg6 ours=<md5> ours@STUB_GEN_TOKEN0=7=<md5>` line a round (the round's order) and
 #                `tokens-differ rounds: 2 of 2`; the same with 6 6@STUB_GEN_PASSES=4 (one ids): `tokens r<R>: equal`
@@ -368,7 +375,9 @@ touch "$T/Cargo.toml"
 # Under BLOOMERY_GEN_SLOTS=N (N >= 2, or STUB_GEN_SLOTS_LEAK=N on any arm) each arm is N slots of depth / N
 # ids: their step, time prompt and tokens lines tagged `slot=<j>`, a `capture slots=` line, each round a
 # `time pass … kind=slots` at 8 ms of N positions (STUB_GEN_SLOTS_POS in its stead), and the slots' SMOKE
-# footer; STUB_GEN_SLOTS_NOPASS=1 prints the plain lines instead.
+# footer; STUB_GEN_SLOTS_NOPASS=1 prints the plain lines instead. Under STUB_GEN_NVTIER=1 each arm ends with an
+# `nvtier` record whose counters are the load's, cumulative: every arm adds its depth (evictions a sixth of it);
+# STUB_GEN_NVTIER=old prints the last arm's only, a binary that prints it once at the process end.
 cat > "$T/target/release/generate_qwen3moe" << 'EOF'
 #!/usr/bin/env bash
 for v in place mem; do
@@ -406,6 +415,15 @@ if [ -n "${STUB_GEN_CARDS_ON:-}" ]; then
 fi
 echo "load arch=stub ctx=$ctx place=${STUB_GEN_PLACE_RAN:-${place:-a}}${cards:+ cards=$cards} (stub)"
 echo "capture graph_nodes=10"
+# The tier's counters since the load, cumulative: the arm's depth is what each arm adds, printed at the end of the
+# arm as the binary does (a level, resident_bytes, stays).
+tf=0
+nv() {
+  [ -n "${STUB_GEN_NVTIER:-}" ] || return 0
+  tf=$((tf + $1))
+  [ "$STUB_GEN_NVTIER" != old ] || [ "$k" -eq $((${#arms[@]} - 1)) ] || return 0
+  echo "nvtier budget=1 paged=1 misses=$tf fills=$tf fill_bytes=$((tf * 100)) fill_ns=$((tf * 10)) evictions=$((tf / 6)) resident_bytes=1 buffered_reads=$tf buffered_bytes=$tf drops=$tf drop_bytes=$tf drop_ns=$tf union_small=$tf union_batched=$tf union_fills=$tf union_hits=$tf keep_claims=$tf transient_claims=$tf"
+}
 for k in "${!arms[@]}"; do
   depth=$(count "${arms[$k]}")
   if [ -n "$listed" ]; then
@@ -442,6 +460,7 @@ for k in "${!arms[@]}"; do
     done
     for j in $(seq 0 $((ns - 1))); do echo "tokens [$(seq -s ', ' 1000 $((1000 + n - 1)))] slot=$j"; done
     echo "SMOKE mode=graph prompt_tokens=$w depth=$w slots=$ns generated=$n warm=0 rounds=$((n - 1)) positions=$(((n - 1) * ns)) p50_ms=8.0000 mean_ms=8.0000 tok/s(aggregate)=$((ns * 125)).00 ctx=$ctx"
+    nv "$depth"
     continue
   fi
   echo "step 0 $depth 1000 (stub)"
@@ -471,8 +490,8 @@ for k in "${!arms[@]}"; do
   else
     echo "SMOKE mode=graph prompt_tokens=$depth depth=$depth seeded=false generated=$n warm=0 steps=$((n - 1)) p50_ms=5.0000 mean_ms=5.0000 tok/s(p50)=200.00 ctx=$ctx"
   fi
+  nv "$depth"
 done
-[ -z "${STUB_GEN_NVTIER:-}" ] || echo "nvtier budget=1 paged=1 misses=1 fills=1 fill_bytes=1 fill_ns=1 evictions=1 resident_bytes=1 buffered_reads=1 buffered_bytes=1 drops=1 drop_bytes=1 drop_ns=1 union_small=1 union_batched=1 union_fills=1 union_hits=1 keep_claims=1 transient_claims=1"
 EOF
 cp "$T/target/release/generate_qwen3moe" "$T/base/target/release/generate_qwen3moe"
 # The stub llama-server: tools/ref/stub-llama-server.py (its docstring has what it answers and the cases).
@@ -1226,6 +1245,29 @@ elif want cpu-guard "$L" 1 '^ROW r1 ours d=6 .*\[cpu-busy\]' &&
   want cpu-guard "$L" 1 '^ROW r1 lcpp d=6 .*\[cpu-busy\]' &&
   want cpu-guard "$L" 1 '^cpu-busy rows: 2 of 2 '; then
   pass cpu-guard
+fi
+
+L=$tmp/tier-arm.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_NVTIER=1 -- 6 12
+if [ "$RC" != 0 ]; then
+  fail tier-arm "rc $RC, want 0" "$L"
+elif want tier-arm "$L" 2 '^nvtier budget=1 paged=1 ' &&
+  want tier-arm "$L" 1 '^    tier-arm r1 ours d=6: fills=6 fill_ns=60 evictions=1 union_fills=6$' &&
+  want tier-arm "$L" 1 '^    tier-arm r1 ours d=12: fills=12 fill_ns=120 evictions=2 union_fills=12$' &&
+  want tier-arm "$L" 2 '^    tier-arm ' &&
+  want tier-arm "$L" 1 '^    capture graph_nodes=10$'; then
+  pass tier-arm
+fi
+
+L=$tmp/tier-total.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_NVTIER=old -- 6 12
+if [ "$RC" != 0 ]; then
+  fail tier-total "rc $RC, want 0" "$L"
+elif want tier-total "$L" 2 '^ROW r1 ours d=(6|12) ' &&
+  want tier-total "$L" 1 '^nvtier budget=1 paged=1 ' &&
+  want tier-total "$L" 1 '^    tier-arm r1 ours d=12: no per-arm record \(a process total: run with BLOOMERY_AB_LOAD=arm\)$' &&
+  want tier-total "$L" 1 '^    tier-arm '; then
+  pass tier-total
 fi
 
 L=$tmp/tokens-check.log

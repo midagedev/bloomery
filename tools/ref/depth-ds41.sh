@@ -686,6 +686,9 @@ slots_check() {
 # order and the blocks' planner and loops: shared with depth-qwen3moe.sh.
 # shellcheck source=tools/ref/cold-blocks.sh
 source "${BASH_SOURCE[0]%/*}/cold-blocks.sh" || exit 2
+# The load's lines echoed once under `[load]` (load-groups.sh): every line a kind of generate_ds41's schema
+# reads and ARM_PLAIN's. The rows read the load's lines unfiltered (LG_HEADER).
+lg_header_lines() { python3 "$RS_RECORDS" keep --bin generate_ds41 --also "$(arm_plain_re)" - <<< "$1"; }
 # `--parse FILE [ARM]`: ours_row over a saved output (`-` for stdin) — its depth and N the SMOKE footer's,
 # the runner's context (round, card, contention) `-` — and nothing loaded, timed or leased. With no ARM the
 # row is an aggregate one when the output holds kind=slots passes (N their positions), and no seed verdict
@@ -872,6 +875,21 @@ ds41_self_test() {
   want parse-past 64 "a prose prompt of 1000 ids (2 slots × 500); $st/data/engram/corpus-prose.ids holds 801 (1..801)"
   run_parse BLOOMERY_GEN_SLOTS=2 -- 6
   want parse-env 64 "BLOOMERY_GEN_SLOTS=2 is set in the runner's own environment"
+  # The load's header lines (the hook the driver calls): every line a kind of generate_ds41's schema reads, and
+  # the plain lines ARM_PLAIN names; a line of no kind and a `host ` line (nothing prints one) are not echoed.
+  local hp hh hl hf
+  sample_rec() { python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import records; print(records.sample_line(records.load("generate_ds41").by_name[sys.argv[2]]))' "${BASH_SOURCE[0]%/*}/../bloomery" "$1"; }
+  hp=$(sample_rec plan) hh=$(sample_rec residency_host) hl=$(sample_rec residency_lever) hf=$(sample_rec prefill_bytes)
+  out=$(lg_header_lines "$(printf '%s\n' "$hp" 'load arch=stub' 'host x=1' "$hh" "$hl" "$hf" 'capture graph_nodes=1' 'a line of no kind')")
+  rc=$?
+  want header-kept 0 "$hp" 'load arch=stub' "$hh" "$hl" "$hf" 'capture graph_nodes=1'
+  checks=$((checks + 1))
+  if [ "$(grep -c . <<< "$out")" = 6 ]; then
+    echo "ok header-dropped"
+  else
+    echo "FAIL header-dropped: want 6 lines, got $(grep -c . <<< "$out")"
+    fails=$((fails + 1))
+  fi
   rm -rf "$st"
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
@@ -1157,9 +1175,7 @@ arm_corpus() {
   esac
 }
 # The driver's hooks (tools/ref/load-groups.sh): a load's command line and environment here, an arm's
-# guards and witness blocks around it (lg_pre, lg_post) below. The load's lines echoed once: its plan,
-# load, host set, capture and prompt buffer lines.
-LG_HEADER_RE='^(plan|load|host|capture|prefill|residency host|residency lever) '
+# guards and witness blocks around it (lg_pre, lg_post) below; lg_header_lines is above, with the arm's lines.
 lg_cmd() {
   local i c
   arm_envs "$1"
