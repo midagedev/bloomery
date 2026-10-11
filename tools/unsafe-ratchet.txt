@@ -254,7 +254,9 @@ placement 0 0 0
 # line.
 # PIN(2026-10-10): qdot 109 -> 111 blocks, 60 -> 61 fns, a new kernel, not old code relaxed: the MXFP4 tile (one
 # unsafe fn) and the dispatch arm that calls it, each with its SAFETY line.
-qdot 111 61 0
+# PIN(2026-10-11): qdot 111 -> 113 blocks, 61 -> 62 fns, a new kernel, not old code relaxed: the Q6_K tile (one
+# unsafe fn, so +1 fn and its body's 1 block) and the dispatch arm that calls it (+1 block), each with its SAFETY line.
+qdot 113 62 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

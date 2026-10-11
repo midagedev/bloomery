@@ -4206,12 +4206,165 @@ fn hw_iq4nl_tile_matches_dot_row() {
     iq_tile_real(GgmlType::IQ4_NL, 18, 32);
 }
 
+/// A synthetic Q6_K block: `ql(i)` the 128 low-nibble bytes, `qh(i)` the 64
+/// high-bit bytes, `sc(j)` the 16 scales, and the f16 bits `d`; packed as
+/// the scalar mirror reads a block (ggml-common.h's `block_q6_K`).
+fn q6k_block(
+    ql: impl Fn(usize) -> u8,
+    qh: impl Fn(usize) -> u8,
+    sc: impl Fn(usize) -> i8,
+    d: u16,
+) -> Vec<u8> {
+    let mut b = vec![0u8; 210];
+    for (i, x) in b[..128].iter_mut().enumerate() {
+        *x = ql(i);
+    }
+    for (i, x) in b[128..192].iter_mut().enumerate() {
+        *x = qh(i);
+    }
+    for (j, x) in b[192..208].iter_mut().enumerate() {
+        *x = sc(j) as u8;
+    }
+    b[208..210].copy_from_slice(&d.to_le_bytes());
+    b
+}
+
+/// The ends a Q6_K tile clause's adversarial rows are built from: every code
+/// 31 (ql and qh all ones) and −32 (all zeros) under scales 127 and −128, the
+/// high bits alone (ql 0, qh 0xFF: codes 16) and the low nibbles alone (ql
+/// 0xFF, qh 0: codes −17) — a tile that drops `qh` or reads the scales out of
+/// order moves a value — a ramp with scales that differ per sub-block, d = 0
+/// and a subnormal d.
+const Q6K_ENDS: [IqEnd; 9] = [
+    || q6k_block(|_| 0xFF, |_| 0xFF, |_| 127, F16_ONE),
+    || q6k_block(|_| 0, |_| 0, |_| 127, F16_ONE),
+    || q6k_block(|_| 0, |_| 0, |_| -128, F16_NEG_ONE),
+    || q6k_block(|_| 0, |_| 0xFF, |_| 127, F16_ONE),
+    || q6k_block(|_| 0xFF, |_| 0, |_| -128, F16_ONE),
+    || {
+        q6k_block(
+            |i| (i * 37) as u8,
+            |i| (i * 91) as u8,
+            |j| 8 * j as i8 - 60,
+            0x3800,
+        )
+    },
+    || q6k_block(|i| (i * 37) as u8, |i| (i * 91) as u8, |j| 1 + j as i8, 0),
+    || q6k_block(|i| (i * 11) as u8, |i| (i * 5) as u8, |_| 127, F16_TINY),
+    || {
+        q6k_block(
+            |i| 0x5A ^ i as u8,
+            |i| 0xA5 ^ (i * 3) as u8,
+            |j| (j as i8 - 8) * 15,
+            0x4200,
+        )
+    },
+];
+
+/// Q6_K tile clause: random rows (every byte but `d`, which is a finite scale
+/// of either sign) and the ends of [`Q6K_ENDS`] at k = 512 (Qwen3.8's routed
+/// down), 2048 and 256 against the ±3.0 and seeded columns; then the first
+/// aligned Q6_K tensor of the model file on ik's dumped column — also within
+/// 1 ULP of ik's own x4 kernel, as `hw_q6k_dot_row_matches_scalar_and_predicts`
+/// holds `dot_row` — the V4.1 set's `output.weight` and the Q6_K routed down
+/// of a Q4_K_M Qwen3.6 file: tile = `dot_row` per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box (AVX2), the model file, the V4.1 shards, the Qwen3.6 Q4_K_M file and $BLOOMERY_DATA/ref"]
+fn hw_q6k_tile_matches_dot_row() {
+    let ty = GgmlType::Q6_K;
+    let mut rng = Lcg(0x6_7113);
+    for k in [512, 2048, 256] {
+        let nb = k / 256;
+        let row_bytes = nb * 210;
+        let cols = legacy_tile_columns(ty, k, vec![]);
+        let mut rows = Vec::new();
+        for _ in 0..LEGACY_RANDOM_ROWS * nb {
+            let mut b: Vec<u8> = (0..210).map(|_| (rng.next_u32() >> 13) as u8).collect();
+            b[208..210].copy_from_slice(&rand_f16(&mut rng).to_le_bytes());
+            rows.extend_from_slice(&b);
+        }
+        let calls = assert_tile_matches(ty, "random rows", k, row_bytes, &rows, &cols);
+        eprintln!("q6k tile: random rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+        let rows = legacy_end_rows(&Q6K_ENDS, nb, |end| end());
+        let calls = assert_tile_matches(ty, "end rows", k, row_bytes, &rows, &cols);
+        eprintln!("q6k tile: end rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+    }
+
+    let g = gguf::Gguf::open(model_path()).unwrap();
+    let w = g
+        .iter_tensors()
+        .find(|w| w.ty == ty && (w.dims[0] as usize).is_multiple_of(256))
+        .expect("the model must carry at least one aligned Q6_K tensor");
+    let k = w.dims[0] as usize;
+    let row_bytes = 210 * k / 256;
+    let bytes = &g.data(w).unwrap()[..TILE_ROWS * row_bytes];
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let dump = std::fs::read_to_string(format!("{base}/ref/q6k-x4-ik-dot.txt"))
+        .expect("run just build-ref first (it builds and runs the x4 reference harnesses)");
+    let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
+    assert_eq!(
+        dump_k, k,
+        "the dump and this scan must land on the same tensor"
+    );
+    assert!(want.len() >= 64, "dump needs 64 rows");
+    for (r, &w) in want.iter().take(64).enumerate() {
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        let mut out = [f32::NAN; 2];
+        qdot::dot_row_cols(ty, src, &[&ik_acol, &ik_acol], k, &mut out).unwrap();
+        for got in out {
+            let ulp = (got.to_bits() as i64 - w as i64).abs();
+            assert!(
+                ulp <= 1,
+                "row {r}: tile {got:.9e} vs ik {}: {ulp} ULP apart",
+                f32::from_bits(w)
+            );
+        }
+    }
+    let calls = assert_tile_matches(
+        ty,
+        &w.name,
+        k,
+        row_bytes,
+        bytes,
+        &coded_columns(ty, k, vec![ik_acol]),
+    );
+    eprintln!(
+        "q6k tile: {} (k = {k}) on ik's column + seeded: {calls} calls, bit-identical, 64 rows \
+         within 1 ULP of ik's x4 kernel",
+        w.name
+    );
+
+    let (name, k, row_bytes, bytes) = v41_rows(ty, "output", TILE_ROWS);
+    let calls = assert_tile_matches(
+        ty,
+        &name,
+        k,
+        row_bytes,
+        &bytes,
+        &legacy_tile_columns(ty, k, vec![]),
+    );
+    eprintln!("q6k tile: {name} (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+
+    let first = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
+    let (name, k, row_bytes, bytes) = split_rows(first, ty, 210, 256, "ffn_down_exps", TILE_ROWS);
+    let calls = assert_tile_matches(
+        ty,
+        &name,
+        k,
+        row_bytes,
+        &bytes,
+        &legacy_tile_columns(ty, k, vec![]),
+    );
+    eprintln!("q6k tile: {name} (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+}
+
 /// A tile call's column count outside `1..=TILE_COLS`, an `out` of another
 /// length and a short column are named refusals, before any kernel runs.
 #[test]
 fn dot_row_cols_refuses_bad_shapes() {
     for (ty, k, row_bytes) in [
         (GgmlType::Q3_K, 256, 110),
+        (GgmlType::Q6_K, 256, 210),
         (GgmlType::Q5_1, 640, 480),
         (GgmlType::Q8_0, 640, 680),
         (GgmlType::MXFP4, 640, 340),

@@ -22,10 +22,11 @@
 //! - Q8_0 x Q8_2_X4: port of ik's `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, 1, block_q8_2>`
 //!   (iqk_gemm_legacy_quants.cpp:404, :753), the body its AVX2 (no AVX512-VNNI) build runs.
 //! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::arch::deepseek2::attn).
-//! - Q3_K, Q4_K, Q5_K, Q5_1, Q8_0, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4 tiles: one weight row against up
+//! - Q3_K, Q4_K, Q5_K, Q6_K, Q5_1, Q8_0, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4 tiles: one weight row against up
 //!   to [`TILE_COLS`] columns, each block unpacked once, every column bit-identical to its
 //!   one-column kernel ([`dot_row_cols`]); the Q5_1 and Q8_0 tiles are ik's `AccumT::compute` at `nrc_y` = the
-//!   column count (iqk_gemm_legacy_quants.cpp:302).
+//!   column count (iqk_gemm_legacy_quants.cpp:302); the Q6_K tile is `mul_mat_qY_K_q8_2_X4_T` at `nrc_y` = the
+//!   column count (iqk_gemm_kquants.cpp:938).
 //! - Q3_K row-lane tile: [`Q3K_R8_ROWS`] rows repacked into one lane-interleaved layout
 //!   ([`repack_q3k_r8`], undone by [`unpack_q3k_r8`]) against up to [`TILE_COLS`] columns,
 //!   every (row, column) value bit-identical to [`dot_row`] ([`dot_q3k_r8_cols`]).
@@ -547,6 +548,7 @@ enum TileKind {
     Q3K,
     Q4K,
     Q5K,
+    Q6K,
     Q51,
     Q80,
     Iq3Xxs,
@@ -563,6 +565,7 @@ fn tile_kind(w: GgmlType) -> Option<TileKind> {
         GgmlType::Q3_K => TileKind::Q3K,
         GgmlType::Q4_K => TileKind::Q4K,
         GgmlType::Q5_K => TileKind::Q5K,
+        GgmlType::Q6_K => TileKind::Q6K,
         GgmlType::Q5_1 => TileKind::Q51,
         GgmlType::Q8_0 => TileKind::Q80,
         GgmlType::IQ3_XXS => TileKind::Iq3Xxs,
@@ -576,8 +579,8 @@ fn tile_kind(w: GgmlType) -> Option<TileKind> {
 }
 
 /// Whether [`dot_row_cols`] runs a tile kernel for `w` on this machine
-/// (Q3_K, Q4_K, Q5_K, Q5_1, Q8_0, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4 with their ISA); otherwise it dots each column
-/// through [`dot_row`].
+/// (Q3_K, Q4_K, Q5_K, Q6_K, Q5_1, Q8_0, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4
+/// with their ISA); otherwise it dots each column through [`dot_row`].
 #[must_use]
 pub fn has_tile(w: GgmlType) -> bool {
     tile_kind(w).is_some()
@@ -650,6 +653,8 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         TileKind::Q4K => unsafe { dot_q45k_q82x4_tile_avx2::<C, false>(wrow, &cols, nb) },
         // SAFETY: as the Q4_K arm.
         TileKind::Q5K => unsafe { dot_q45k_q82x4_tile_avx2::<C, true>(wrow, &cols, nb) },
+        // SAFETY: as the Q4_K arm.
+        TileKind::Q6K => unsafe { dot_q6k_q82x4_tile_avx2::<C>(wrow, &cols, nb) },
         // SAFETY: tile_kind saw AVX2+FMA+F16C; check_row sized the row for nb
         // blocks and every column for nb blocks' x4 groups and q8_2 tails.
         TileKind::Q51 => unsafe { dot_q5f1_q82x4_tile_avx2::<C>(wrow, &cols, nb) },
@@ -3937,6 +3942,162 @@ unsafe fn dot_q6k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         }
 
         hsum_float_8(accd)
+    }
+}
+
+/// AVX2+FMA tile: one Q6_K weight row against `C` Q8_2_X4 columns, value `c`
+/// equal to [`dot_q6k_q82x4_avx2`] of column `c` bit for bit.
+///
+/// The body is ik's `mul_mat_qY_K_q8_2_X4_T<DequantizerQ6K_AVX2, nrc_y = C>`
+/// (iqk_gemm_kquants.cpp:938), whose `nrc_y = 1` instance the one-column
+/// kernel ports: per block the weight's `d` and interleaved scales once; per
+/// column its bf16 block scales; per 128-value half the four code vectors
+/// (ql and qh folded, −32) and their absolute values once, then per column
+/// the sign-folded maddubs sum and `accd = fma(scales_j · dy4, sumi, accd)`.
+/// The one-column kernel multiplies the scales by the column's `dy` before the
+/// fma and the tile multiplies them in the same order, so column `c` sees the
+/// same products, the same single fma per half and the same horizontal sum;
+/// the integer sums are the one-column instructions on the same codes.
+///
+/// # Safety
+/// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` Q6_K blocks and each
+/// `acols[c]` point at the `2 · nb` readable Q8_2_X4 groups of `nb`
+/// super-blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_q6k_q82x4_tile_avx2<const C: usize>(
+    wrow: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [f32; C] {
+    // SAFETY: AVX2+FMA+F16C present, `wrow` holds nb blocks and every column
+    // 2·nb groups per contract.
+    unsafe {
+        let ml = _mm256_set1_epi8(0xF);
+        let mh = _mm256_set1_epi8(0x30);
+        let m32n = _mm256_set1_epi8(-32);
+        // SAFETY: 32-byte load inside the 32-byte static table.
+        let shuff = _mm256_loadu_si256(K_SHUFFLE_Q6K.as_ptr() as *const __m256i);
+        let mut accd = [_mm256_setzero_ps(); C];
+
+        for i in 0..nb {
+            let wb = wrow.as_ptr().add(Q6K_BLOCK * i);
+
+            // SAFETY: one unaligned u16 read inside the super-block.
+            let d = f16c_to_f32((wb.add(208) as *const u16).read_unaligned());
+            let vd = _mm256_set1_ps(d);
+            // SAFETY: 16-byte unaligned load inside the super-block.
+            let sc16 = _mm256_shuffle_epi8(
+                _mm256_cvtepi8_epi16(_mm_loadu_si128(wb.add(192) as *const __m128i)),
+                shuff,
+            );
+            let scales = [
+                _mm256_mul_ps(
+                    vd,
+                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(sc16))),
+                ),
+                _mm256_mul_ps(
+                    vd,
+                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(sc16, 1))),
+                ),
+            ];
+
+            let mut dy = [_mm256_setzero_ps(); C];
+            for (col, dyc) in acols.iter().zip(dy.iter_mut()) {
+                // SAFETY: 8 readable bytes at the head of each of the column's two groups.
+                let g0 = col.add((2 * i) * Q82X4_STRIDE);
+                let g1 = col.add((2 * i + 1) * Q82X4_STRIDE);
+                let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
+                let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
+                *dyc = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
+            }
+
+            for (j, sj) in scales.iter().enumerate() {
+                // SAFETY: loads stay inside the validated 210-byte block.
+                let lbits1 = _mm256_loadu_si256(wb.add(64 * j) as *const __m256i);
+                let lbits2 = _mm256_loadu_si256(wb.add(64 * j + 32) as *const __m256i);
+                let hbits = _mm256_loadu_si256(wb.add(128 + 32 * j) as *const __m256i);
+                let mut values = [
+                    _mm256_or_si256(
+                        _mm256_and_si256(lbits1, ml),
+                        _mm256_and_si256(_mm256_slli_epi16::<4>(hbits), mh),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(lbits2, ml),
+                        _mm256_and_si256(_mm256_slli_epi16::<2>(hbits), mh),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(lbits1), ml),
+                        _mm256_and_si256(hbits, mh),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(lbits2), ml),
+                        _mm256_and_si256(_mm256_srli_epi16::<2>(hbits), mh),
+                    ),
+                ];
+                let mut us = [_mm256_setzero_si256(); 4];
+                for (v, u) in values.iter_mut().zip(us.iter_mut()) {
+                    *v = _mm256_add_epi8(*v, m32n);
+                    *u = _mm256_sign_epi8(*v, *v);
+                }
+
+                for ((col, dyc), acc) in acols.iter().zip(&dy).zip(accd.iter_mut()) {
+                    // SAFETY: loads stay inside the column's validated group 2i + j.
+                    let qs = col.add((2 * i + j) * Q82X4_STRIDE + 16);
+                    let sumi1 = _mm256_maddubs_epi16(
+                        us[0],
+                        _mm256_sign_epi8(_mm256_loadu_si256(qs as *const __m256i), values[0]),
+                    );
+                    let sumi2 = _mm256_maddubs_epi16(
+                        us[1],
+                        _mm256_sign_epi8(
+                            _mm256_loadu_si256(qs.add(32) as *const __m256i),
+                            values[1],
+                        ),
+                    );
+                    let sumi3 = _mm256_maddubs_epi16(
+                        us[2],
+                        _mm256_sign_epi8(
+                            _mm256_loadu_si256(qs.add(64) as *const __m256i),
+                            values[2],
+                        ),
+                    );
+                    let sumi4 = _mm256_maddubs_epi16(
+                        us[3],
+                        _mm256_sign_epi8(
+                            _mm256_loadu_si256(qs.add(96) as *const __m256i),
+                            values[3],
+                        ),
+                    );
+                    let t1 = _mm256_add_epi16(
+                        _mm256_unpacklo_epi32(sumi1, sumi2),
+                        _mm256_unpackhi_epi32(sumi1, sumi2),
+                    );
+                    let t3 = _mm256_add_epi16(
+                        _mm256_unpacklo_epi32(sumi3, sumi4),
+                        _mm256_unpackhi_epi32(sumi3, sumi4),
+                    );
+                    let t = _mm256_add_epi16(
+                        _mm256_unpacklo_epi64(t1, t3),
+                        _mm256_unpackhi_epi64(t1, t3),
+                    );
+                    let sumi = _mm256_madd_epi16(_mm256_set1_epi16(1), t);
+                    let dy4 = if j == 0 {
+                        _mm256_castps256_ps128(*dyc)
+                    } else {
+                        _mm256_extractf128_ps(*dyc, 1)
+                    };
+                    let d4d8 = _mm256_mul_ps(*sj, _mm256_set_m128(dy4, dy4));
+                    *acc = _mm256_fmadd_ps(d4d8, _mm256_cvtepi32_ps(sumi), *acc);
+                }
+            }
+        }
+
+        let mut out = [0.0f32; C];
+        for (o, acc) in out.iter_mut().zip(&accd) {
+            *o = hsum_float_8(*acc);
+        }
+        out
     }
 }
 
