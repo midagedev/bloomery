@@ -174,7 +174,7 @@ TYPE_PLACES = {
              ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "glm": (("crates/model/src/arch/glm5next/place.rs", "pub fn card_routed(ty: GgmlType)"),
             ("crates/gpu/src/card_leg.rs", "match kernels::gate_up(st.gate.ty)"),
-            ("crates/gpu-glm5next/src/body.rs", "if !GLM5NEXT_EMBED.contains(&table.ty())"),
+            ("crates/model/src/embed.rs", "if !layout.ty().has_dequant()"),
             ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "qwen38": (("crates/model/src/arch/qwen35moe/place.rs", "pub fn card_routed(ty: GgmlType)"),
                ("crates/placement/src/placement/qwen38_cards.rs", "fn card_routed(ty: GgmlType)"),
@@ -187,7 +187,7 @@ TYPE_PLACES = {
               ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "mimo2": (("crates/model/src/arch/mimo2/place.rs", "pub fn card_routed(ty: GgmlType)"),
               ("crates/placement/src/kernels.rs", "pub const fn card_runs(ty: GgmlType) -> bool"),
-              ("crates/gpu-mimo2/src/body.rs", "if table.ty() != GgmlType::Q8_0"),
+              ("crates/model/src/embed.rs", "if !layout.ty().has_dequant()"),
               ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
 }
 SEAT_WORDS = SEAT_ORDER + (DECIDE_WORD,)

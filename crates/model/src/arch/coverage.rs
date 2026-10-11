@@ -565,16 +565,6 @@ struct TypePin {
     reads: &'static [GgmlType],
 }
 
-/// The row types the glm5next body's host reader dequantizes for the token
-/// embedding (`gguf::quant::dequant_row`): the one set the body's load check
-/// and the embedding's pin both read.
-pub const GLM5NEXT_EMBED: &[GgmlType] = &[
-    GgmlType::Q8_0,
-    GgmlType::Q4_K,
-    GgmlType::Q5_K,
-    GgmlType::Q6_K,
-];
-
 /// The per-tensor type pins of the programs, as lists (the qwen3moe body's
 /// dense FFN; `Body35`'s
 /// site types, its `PROJ`, `EMBED` and `HEAD_TY` in
@@ -583,8 +573,7 @@ pub const GLM5NEXT_EMBED: &[GgmlType] = &[
 /// chain's attention gemvs, whose head-split sites in `chain/attn.rs` take
 /// q3_K or q8_0, the same head, and the hyper-connection fn `hc.rs` reads as
 /// q3_K words, `hc_f32.rs` as f32; the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the common
-/// head's q8_0, q6_K and q4_K arms, and the embedding row the host
-/// dequantizes).
+/// head's q8_0, q6_K and q4_K arms).
 const TYPE_PINS: &[TypePin] = &[
     TypePin {
         program: Program::Qwen3moeBody,
@@ -706,14 +695,6 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K],
     },
     TypePin {
-        program: Program::Glm5nextBody,
-        role: Role::TokenEmbedding,
-        matrices: true,
-        names: None,
-        what: "token embedding (the host reads q8_0, q4_K, q5_K and q6_K rows)",
-        reads: GLM5NEXT_EMBED,
-    },
-    TypePin {
         program: Program::Qwen38Body,
         role: Role::Attention,
         matrices: true,
@@ -785,14 +766,6 @@ const TYPE_PINS: &[TypePin] = &[
         what: "output head (the head reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
-    TypePin {
-        program: Program::Mimo2Body,
-        role: Role::TokenEmbedding,
-        matrices: true,
-        names: None,
-        what: "token embedding (the host reads q8_0 rows)",
-        reads: &[GgmlType::Q8_0],
-    },
 ];
 
 /// A tensor family whose type a program pins by the card kernel table's
@@ -815,7 +788,8 @@ struct RowPin {
 /// embedding ([`kernels::embed`]: `elem.rs`) and routed stacks
 /// ([`qwen35_gate_up`], [`qwen35_down`]: the FFN dispatch both bodies share),
 /// and `Body35`'s FFN ([`qwen35_gate_up`], [`qwen35_down`], [`qwen35_shared`]),
-/// each `what` naming the types its row takes or the table row it follows.
+/// and the glm5next and mimo2 bodies' token embedding (the host's rows,
+/// `GgmlType::has_dequant`), each `what` naming the types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
     RowPin {
         program: Program::Qwen3moeBody,
@@ -840,6 +814,22 @@ const ROW_PINS: &[RowPin] = &[
         names: None,
         what: "token embedding (the card's rows: the types kernels::embed names)",
         row: |ty| kernels::embed(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Glm5nextBody,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the host's rows: the types dequant_row decodes)",
+        row: GgmlType::has_dequant,
+    },
+    RowPin {
+        program: Program::Mimo2Body,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the host's rows: the types dequant_row decodes)",
+        row: GgmlType::has_dequant,
     },
     RowPin {
         program: Program::Qwen3moeBody,
@@ -1921,41 +1911,47 @@ mod tests {
         );
     }
 
-    /// The glm5next embedding's pin reads the set the host row reader
-    /// dequantizes for the table (`GLM5NEXT_EMBED`, which the body's load
-    /// check reads too), pinned here by its four types; a type outside it is
-    /// an item named by its type.
-    // PIN(2026-10-11): q4_K, q5_K and q6_K joined the embedding's set (the
-    // host reader `gguf::quant::dequant_row` decodes them) so a file whose
-    // `token_embd` is a K-quant loads; derivation: the row is dequantized on
-    // the host, one row a step, so no card launch reads the type.
+    /// The glm5next and mimo2 embedding pins read the set the host row
+    /// reader decodes for the table (`GgmlType::has_dequant`, which
+    /// `EmbedTable::new` checks too), pinned here by type name; a type
+    /// outside it is an item naming the type.
+    // PIN(2026-10-11): q4_K, q5_K, q6_K and the other types `dequant_row`
+    // decodes joined the embedding's set (it was q8_0 alone) so a file whose
+    // `token_embd` is any of them loads; derivation: the row is dequantized
+    // on the host, one row a step, so no card launch reads the type.
     #[test]
-    fn the_glm5next_embedding_pin_reads_the_host_rows_set() {
-        let embed = |ty: GgmlType| {
-            glm5next_whole_items(
-                "token_embd.weight",
-                Role::TokenEmbedding,
-                ty,
-                "token embedding",
+    fn the_embedding_pins_read_the_host_rows_set() {
+        let embed = |program: Program, ty: GgmlType| {
+            items(
+                program,
+                &ModelTensor {
+                    name: "token_embd.weight".into(),
+                    layer: None,
+                    ..matrix("", Role::TokenEmbedding, ty)
+                },
             )
         };
-        for ty in [
-            GgmlType::Q8_0,
-            GgmlType::Q4_K,
-            GgmlType::Q5_K,
-            GgmlType::Q6_K,
-        ] {
-            assert_eq!(embed(ty), Vec::<(Option<usize>, String)>::new(), "{ty}");
-        }
-        for ty in [GgmlType::Q3_K, GgmlType::IQ4_XS, GgmlType::F16] {
-            assert_eq!(
-                embed(ty),
-                [(
-                    None,
-                    format!("{ty} token embedding (the host reads q8_0, q4_K, q5_K and q6_K rows)")
-                )],
-                "{ty}"
-            );
+        for program in [Program::Glm5nextBody, Program::Mimo2Body] {
+            for ty in [
+                GgmlType::Q8_0,
+                GgmlType::Q3_K,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+                GgmlType::F16,
+                GgmlType::IQ4_XS,
+            ] {
+                assert_eq!(embed(program, ty), Vec::<String>::new(), "{program:?} {ty}");
+            }
+            for ty in [GgmlType::IQ2_XXS, GgmlType::IQ1_S, GgmlType::I8] {
+                assert_eq!(
+                    embed(program, ty),
+                    [format!(
+                        "{ty} token embedding (the host's rows: the types dequant_row decodes)"
+                    )],
+                    "{program:?} {ty}"
+                );
+            }
         }
     }
 

@@ -104,7 +104,6 @@ use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::coverage::GLM5NEXT_EMBED;
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::{self, KdaLanes, NextnInputs, NextnPlan, PlanInputs};
 use model::embed::EmbedTable;
@@ -627,8 +626,8 @@ impl RowScratch {
     }
 }
 
-/// The token embedding as the host reads it: the shared table's rows of one
-/// of [`GLM5NEXT_EMBED`]'s types, one dequantized per step and written four
+/// The token embedding as the host reads it: the shared table's rows of a
+/// type [`EmbedTable`] reads, one dequantized per step and written four
 /// times, one copy a stream.
 struct Embedding {
     file: Arc<Split>,
@@ -642,13 +641,6 @@ impl Embedding {
     fn new(file: Arc<Split>, n_embd: usize) -> Result<Embedding, GpuError> {
         let name = names::token_embd();
         let table = EmbedTable::new(file.clone(), &name, n_embd)?;
-        if !GLM5NEXT_EMBED.contains(&table.ty()) {
-            return Err(GpuError::Tensor {
-                what: WHAT,
-                name,
-                need: "q8_0, q4_K, q5_K or q6_K rows of embedding_length values",
-            });
-        }
         Ok(Embedding {
             file,
             n_vocab: table.n_vocab(),
