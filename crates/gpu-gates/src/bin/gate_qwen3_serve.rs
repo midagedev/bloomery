@@ -302,6 +302,21 @@
 //!   record, whose `ctx_max` is the line's `total`, and the process exits 0
 //!   with no `load` or `listening` record. FAIL-first: a seat that ignores
 //!   the flag loads and listens, the clause red.
+//! - `defaults_take_a_long_prompt_on_a_12gb_card`, on a qwen35moe file
+//!   alone: `--plan` with the seat's defaults — no `--ctx`, no `--parallel` —
+//!   under [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`], a 12 GB card in a
+//!   27.5 GiB host, prints a `ctx` line of at least two slots (the default
+//!   count) each of at least [`LONG_PROMPT_SLOT_CTX`] positions, and stops as
+//!   the clause above holds (the line's `total` the `plan` record's
+//!   `ctx_max`, exit 0, no `load` or `listening` record). The plan is asked
+//!   for by name, `--place a`: on a 12 GB card the unset `--place` falls to
+//!   the placed plan on `a`'s card because the whole file does not fit, but
+//!   the whole-fit verdict reads the card's census, not the budget, so a card
+//!   that holds the file whole would print no plan; the placed probes and the
+//!   `ctx` line are the same either way. FAIL-first: a seat whose unset
+//!   default is the base context as the total its slots split, taken whenever
+//!   the plan keeps fewer card experts than the base's, names a slot of half
+//!   the base and the clause is red.
 //! - `placed_slots_are_resident`, `ctx_default`'s placed arm (`--place a
 //!   --parallel 2`, no budget), on both arms: the placed load holds its two
 //!   slots resident — its plan made at the total, which counts every slot's
@@ -379,8 +394,9 @@
 //! two arms pass `--parallel 2` (resident on both files: the whole-card load
 //! and the budgeted placed one), the refusal arm passes `--parallel 2` too
 //! (the split it refuses is the flag's), and its one-slot arm passes none (a
-//! set `--ctx` alone is one request's context, one slot at the whole flag);
-//! the slots-round clause's two
+//! set `--ctx` alone is one request's context, one slot at the whole flag); the
+//! defaults clause's plan-only server passes none (the default count is its
+//! claim); the slots-round clause's two
 //! arms (both files) pass `--parallel 2` with `BLOOMERY_STEP_STATS=1` in their
 //! environment (the whole-card load and the budgeted placed one), and the
 //! late arm passes `--parallel 2` (whole-card, no lever); the host-tier
@@ -746,41 +762,26 @@ mod gate {
         check(ok, "default_ctx_line_names_its_rule", held == Some(true));
     }
 
-    /// `plan_flag_stops_before_the_load` (module header): a placed server
-    /// of two slots under [`PLACED_BUDGET`] given `--plan` prints its `ctx`
-    /// line and its `plan` record, the line's total the record's `ctx_max`,
-    /// and exits 0 with no `load` or `listening` record. A seat that ignores
-    /// the flag loads and listens, which the polls end and the clause names
-    /// red.
-    fn plan_flag_stops_before_the_load(
-        model: &Path,
-        dir: &Path,
-        ok: &mut bool,
-    ) -> Result<(), GateError> {
-        let d = dir.join("plan-only");
+    /// One `--plan` run of the seat on `model`: `args` after the file's own
+    /// flags and before `--plan`, `env` on the child, whose logs go to
+    /// `<dir>/<name>/`. The run's stderr and whether it exited on its own.
+    fn plan_run(
+        name: &str,
+        (model, dir): (&Path, &Path),
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> Result<PlanRun, GateError> {
+        let d = dir.join(name);
         std::fs::create_dir_all(&d)?;
         let err_log = d.join("server.err");
         let mut cmd = Command::new(beside("bloomery-serve")?);
         cmd.env_remove("BLOOMERY_REF_MODEL")
-            .env("BLOOMERY_CARD_BUDGET", PLACED_BUDGET);
+            .envs(env.iter().copied());
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
-        let mut s = Served::spawn_cmd(
-            cmd,
-            &[
-                "--model",
-                "qwen3",
-                "--port",
-                "0",
-                "-m",
-                m,
-                "--parallel",
-                "2",
-                "--place",
-                "a",
-                "--plan",
-            ],
-            &d,
-        )?;
+        let mut argv = vec!["--model", "qwen3", "--port", "0", "-m", m];
+        argv.extend_from_slice(args);
+        argv.push("--plan");
+        let mut s = Served::spawn_cmd(cmd, &argv, &d)?;
         let mut said = String::new();
         let mut exited = None;
         for _ in 0..360 {
@@ -795,23 +796,113 @@ mod gate {
             std::thread::sleep(SLOTS_POLL);
         }
         if exited.is_none() {
-            println!("plan-only arm: server stopped: {}", s.stop()?);
+            println!("{name}: server stopped: {}", s.stop()?);
         }
-        let plan = record::Log::of(&said, record::BLOOMERY_SERVE_QWEN3).first(&record::PLAN38);
-        let ctx_max = match plan {
-            Ok(Some(p)) => p.u64("ctx_max").ok(),
-            _ => None,
-        };
-        let total = ctx_line(&said).and_then(|l| field_u64(l, "total"));
+        Ok(PlanRun { said, exited })
+    }
+
+    /// What a `--plan` run printed and how it ended ([`plan_run`]).
+    struct PlanRun {
+        /// The server's stderr.
+        said: String,
+        /// Whether it exited zero on its own; `None` when it was still up
+        /// at the poll bound and was stopped.
+        exited: Option<bool>,
+    }
+
+    impl PlanRun {
+        /// The whole-number field `name` of the one `ctx` line.
+        fn ctx_field(&self, name: &str) -> Option<u64> {
+            ctx_line(&self.said).and_then(|l| field_u64(l, name))
+        }
+
+        /// The `ctx_max` of the `plan` record.
+        fn ctx_max(&self) -> Option<u64> {
+            let plan =
+                record::Log::of(&self.said, record::BLOOMERY_SERVE_QWEN3).first(&record::PLAN38);
+            match plan {
+                Ok(Some(p)) => p.u64("ctx_max").ok(),
+                _ => None,
+            }
+        }
+
+        /// Whether the run stopped as `--plan` says: exit 0 with no `load`
+        /// or `listening` record, the `ctx` line's total the `plan`
+        /// record's `ctx_max`.
+        fn stopped_with_its_plan(&self) -> bool {
+            let total = self.ctx_field("total");
+            let loaded = self.said.lines().any(|l| l.starts_with("load arch="))
+                || self.said.contains(" listening on http://");
+            self.exited == Some(true) && total.is_some() && total == self.ctx_max() && !loaded
+        }
+    }
+
+    /// `plan_flag_stops_before_the_load` (module header): a placed server
+    /// of two slots under [`PLACED_BUDGET`] given `--plan` prints its `ctx`
+    /// line and its `plan` record, the line's total the record's `ctx_max`,
+    /// and exits 0 with no `load` or `listening` record. A seat that ignores
+    /// the flag loads and listens, which the polls end and the clause names
+    /// red.
+    fn plan_flag_stops_before_the_load(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let run = plan_run(
+            "plan-only",
+            (model, dir),
+            &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
+            &["--parallel", "2", "--place", "a"],
+        )?;
         println!(
-            "plan-only arm: exit ok {exited:?}, ctx line total {total:?}, plan ctx_max {ctx_max:?}"
+            "plan-only arm: exit ok {:?}, ctx line total {:?}, plan ctx_max {:?}",
+            run.exited,
+            run.ctx_field("total"),
+            run.ctx_max()
         );
-        let loaded = said.lines().any(|l| l.starts_with("load arch="))
-            || said.contains(" listening on http://");
         check(
             ok,
             "plan_flag_stops_before_the_load",
-            exited == Some(true) && total.is_some() && total == ctx_max && !loaded,
+            run.stopped_with_its_plan(),
+        );
+        Ok(())
+    }
+
+    /// `defaults_take_a_long_prompt_on_a_12gb_card` (module header): the
+    /// seat's defaults — no `--ctx`, no `--parallel` — planned under
+    /// [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`] print a `ctx` line of at
+    /// least two slots, each of at least [`LONG_PROMPT_SLOT_CTX`] positions,
+    /// and stop as `--plan` says ([`PlanRun::stopped_with_its_plan`]). The
+    /// plan is asked for by name (`--place a`): the census and the whole-fit
+    /// verdict read the card, not the budget, so a card that holds the file
+    /// whole would not plan at all.
+    fn defaults_take_a_long_prompt_on_a_12gb_card(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let run = plan_run(
+            "plan-defaults",
+            (model, dir),
+            &[
+                (bloomery_levers::CARD_BUDGET, SMALL_CARD_BUDGET),
+                (bloomery_levers::HOST_ROOM, SMALL_HOST_ROOM),
+            ],
+            &["--place", "a"],
+        )?;
+        let (ctx, slots) = (run.ctx_field("ctx"), run.ctx_field("slots"));
+        println!(
+            "defaults arm: exit ok {:?}, plan ctx_max {:?}, {}",
+            run.exited,
+            run.ctx_max(),
+            ctx_line(&run.said).unwrap_or("no ctx line")
+        );
+        check(
+            ok,
+            "defaults_take_a_long_prompt_on_a_12gb_card",
+            run.stopped_with_its_plan()
+                && ctx.is_some_and(|c| c >= LONG_PROMPT_SLOT_CTX)
+                && slots.is_some_and(|n| n >= 2),
         );
         Ok(())
     }
@@ -1665,6 +1756,20 @@ mod gate {
     /// routed experts between the card and the host tier on either of this
     /// machine's cards (`gate_qwen3moe_e2e`'s (o) budget).
     const PLACED_BUDGET: &str = "12G";
+
+    /// The card budget that stands for a 12 GB card whose census reads
+    /// 11,789,139,968 free bytes: those bytes plus the context's own creation
+    /// cost (`workstation::CONTEXT_SELF`), which a plan's cap adds back to a
+    /// census reading.
+    const SMALL_CARD_BUDGET: &str = "12073304064";
+
+    /// The host room of the machine that card sits in, 27.5 GiB (the lever
+    /// takes whole MiB or GiB).
+    const SMALL_HOST_ROOM: &str = "28160M";
+
+    /// The slot context the seat's defaults must reach on that machine: a
+    /// prompt of up to 8K tokens fits one slot.
+    const LONG_PROMPT_SLOT_CTX: u64 = 8192;
 
     /// The slots clause (module header) on a server of `--parallel 2` and
     /// `arm`'s flags and environment started into `<dir>/<arm.dir>`: two
@@ -3852,6 +3957,11 @@ mod gate {
             check(&mut ok, "completion_ids_are_the_cli_ids", agree_all);
             ctx_default(model, &dir, default_n, &mut ok)?;
             plan_flag_stops_before_the_load(model, &dir, &mut ok)?;
+            if arch == "qwen35moe" {
+                // The Qwen3.6 file alone: the defaults on the 12 GB card it
+                // is served from.
+                defaults_take_a_long_prompt_on_a_12gb_card(model, &dir, &mut ok)?;
+            }
             whole_fit_counts_the_planes_granules(model, &dir, &mut ok)?;
             cache_refusals(model, &dir, &mut ok)?;
             // Both arms: the resident slots and the split they serve, on the
