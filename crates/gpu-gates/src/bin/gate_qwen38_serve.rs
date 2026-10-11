@@ -415,7 +415,9 @@ mod gate {
 
     use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, checkpoint_bytes, seq_positional_bytes};
+    use bloomery_gpu::arch::qwen3moe::{
+        Body38, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
+    };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
@@ -3180,6 +3182,24 @@ mod gate {
             }
             (lo / CTX_STEP * CTX_STEP).max(lo.min(CTX_STEP))
         };
+        // The plan's floor for the PLE table's tier counts the state the cache
+        // saves ([`PlanInputs::seq_state_bytes`]): the engine's `seq38_bytes`,
+        // plain and with the draft the seat's unset default carries. FAIL-first:
+        // a term of the plan's state off by a byte (the checkpoint's second
+        // copy, the draft's rows) turns this red.
+        let (draft_path, _) = draft_file(None, &path);
+        let draft = Split::open(&draft_path)
+            .map_err(|e| format!("open the MTP draft {}: {e}", draft_path.display()))?;
+        let rows = head_rows_of(None, &split, inputs.spec.vocab)?.rows;
+        let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
+        let state_is_the_engines = [1usize, 4096, 252_416, 262_144].iter().all(|&n| {
+            let p = n as u64;
+            inputs.seq_state_bytes(p, None) == seq38_bytes(gdn, qsa, n, false)
+                && inputs.seq_state_bytes(p, Some(&mtp)) == seq38_bytes(gdn, qsa, n, true)
+        });
+        // The cache rule's ram is the line's, read at the served context; the
+        // derivation holds it at every context, exact where the cap binds as at
+        // this server's plan.
         let (want_rule, want_ctx) = if fit < CTX {
             ("card", fit)
         } else if ram == 0 || state(margin_ctx) <= ram {
@@ -3203,6 +3223,11 @@ mod gate {
             &mut ok,
             "ctx_default_is_the_rules",
             rule.as_str() == want_rule && ctx == want_ctx,
+        );
+        check(
+            &mut ok,
+            "plan_floor_counts_the_engines_state",
+            state_is_the_engines,
         );
         check(
             &mut ok,

@@ -2446,15 +2446,26 @@ pub fn row_room(model: &ModelTensors, positions: u64) -> Result<u64, PlacementEr
 /// host in their file bytes when `room` — the host's available bytes
 /// ([`workstation::host_room`]'s reading, or a room the caller gives) —
 /// holds the plan's host need with them there ([`workstation::HostNeed`],
-/// no churn pool beside it); else on the NVMe tier, where the role rule
-/// placed them ([`place_whole`]), with their reader's room for a call of up
-/// to `positions` positions ([`row_room`]) as the plan's row reserve, in
-/// place of the row cache [`totals`] set aside. A plan with no such table
-/// is left as it is; [`Plan::row_tier`] reads the outcome. A table of other
-/// than one NVMe file segment, or a sum past u64, is refused by name.
+/// no churn pool beside it) and, on a unified machine, `floor` bytes more;
+/// else on the NVMe tier, where the role rule placed them ([`place_whole`]),
+/// with their reader's room for a call of up to `positions` positions
+/// ([`row_room`]) as the plan's row reserve, in place of the row cache
+/// [`totals`] set aside.
+///
+/// `floor` is the prompt cache's: the caller's two saved sequence states at
+/// the plan's context. The cache's default budget is half of what the room
+/// leaves past the need and it holds nothing under one state, so a table
+/// that takes the room whole leaves a load with no cache to serve from. A
+/// machine whose cards have memory of their own takes the room alone, as
+/// every such plan did.
+///
+/// A plan with no such table is left as it is; [`Plan::row_tier`] reads the
+/// outcome. A table of other than one NVMe file segment, or a sum past u64,
+/// is refused by name.
 pub fn row_table_tier(
     plan: &mut Plan<'_>,
     room: u64,
+    floor: u64,
     positions: u64,
 ) -> Result<(), PlacementError> {
     let model = plan.model;
@@ -2507,7 +2518,16 @@ pub fn row_table_tier(
             ),
         )
     })?;
-    let new = if host_arm.bytes() <= room {
+    let floor = if plan.machine.unified.is_some() {
+        floor
+    } else {
+        0
+    };
+    let held = host_arm
+        .bytes()
+        .checked_add(floor)
+        .ok_or_else(|| past("the host's need with the prompt cache's floor"))?;
+    let new = if held <= room {
         plan.nvme_bytes = plan.nvme_bytes.checked_sub(moved).ok_or_else(|| {
             PlacementError::tensor(
                 named,
