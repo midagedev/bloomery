@@ -1,6 +1,8 @@
 //! GPU gate for the i-quant expert-select entries over raw blocks
-//! (`bloomery_gpu::iq_sel`) on one card: the IQ3_XXS and IQ4_XS gate·ups
-//! and the IQ4_NL down `_sel32`, Qwen3.8 UD-Q3_K_XL's card-leg formats.
+//! (`bloomery_gpu::iq_sel`) on one card: the IQ2_XS, IQ3_XXS and IQ4_XS
+//! gate·ups, the IQ4_NL down `_sel32` (Qwen3.8 UD-Q3_K_XL's card-leg formats)
+//! and the IQ2_XS, IQ3_XXS and IQ4_XS downs over `Q8Act` (GLM-5.3-Flash
+//! UD-Q2_K_XL's).
 //!
 //! Weights. The gate·up formats take the synthetic rows `dequant_ref
 //! --synthetic` writes (`$BLOOMERY_DATA/ref-synth/<type>.blocks`: 64 rows
@@ -60,8 +62,26 @@
 //!    nodes, bit-identical to the eager launches; a second eager launch
 //!    equals the first.
 //! 8. **Refusals by name.** A wrong type, short words, `k` off the block,
-//!    m outside 1..=8, short `sel` or `y`: each an `Err(Shape)` of its
-//!    launcher naming the case.
+//!    short `sel` or `y`, a down's activation with fewer columns than slots:
+//!    each an `Err(Shape)` of its launcher naming the case.
+//! 10. **`Q8Act` downs** (`iq2_xs_gemv_sel`, `iq3_xxs_gemv_sel`,
+//!     `iq4_xs_gemv_sel`) at K = 2,048 (GLM's down width) and K = 2,304 (a
+//!     partial last lane iteration), 8 slots with one column a slot: the rows
+//!     equal the host rule bit for bit (`lane_partial_host` per lane plus the
+//!     butterfly), the plane entry over `IqFormat::repack` of the same rows,
+//!     and a launch over a wider activation (12 columns, the leg's cap-sized
+//!     one) the exact-width launch; `HOST` rows stay at the sentinel, a rerun is
+//!     bit-identical. An id past the stack raises `ExpertId` and leaves its
+//!     rows at the sentinel; a NaN `d` block and an inf-`d` row make exactly
+//!     their rows NaN. One 2 × 4,096-row case (GLM's down rows) carries the
+//!     host-rule bits. The IQ2_XS gate·up carries clauses 1-6 at K = 4,096 (GLM's
+//!     gate width) and K = 2,304, and IQ3_XXS at K = 4,096 too.
+//! 11. **Wide activation, gate·up.** A launch over a 16-column activation of
+//!     which two columns are quantized equals the 2-column launch bit for
+//!     bit, all three formats (the leg's `Q8Act` holds its cap's columns).
+//! 12. **Capture, `Q8Act` entries.** The IQ2_XS gate·up and the three downs
+//!     captured in one graph replay as four nodes, bit-identical to the eager
+//!     launches.
 //! 9. **Route vs host dot, a real file** (`--model <path>`): the Qwen3.8
 //!    UD-Q3_K_XL first shard's own stacks, four experts a layer of layers 0
 //!    (IQ3_XXS/IQ4_NL), 4 (IQ3_XXS/Q8_0) and 2 (IQ4_XS/Q8_0), read from the
@@ -121,7 +141,7 @@ mod gate {
         IQ4_NL_BLOCK_BYTES, IqDown, IqGateUp, IqSelKernels, iq4_nl_row_dot32_host,
     };
     use bloomery_gpu::kquant::act::{self, Act};
-    use bloomery_gpu::kquant::walk_a_planes;
+    use bloomery_gpu::kquant::{SelDown, walk_a_planes};
     use bloomery_gpu::q5::Q8Blocks32;
     use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels};
     use bloomery_gpu::{DeviceTensor, Q8Act};
@@ -146,6 +166,16 @@ mod gate {
     const SENT: f32 = 1.0e30;
     /// The bit rule of clauses 1, 2 and 5.
     const CLAMP0: Act = Act::SwigluClamp { limit: 0.0 };
+    /// GLM's slots a token: the `Q8Act` downs' slot count (one column a slot).
+    const SLOTS_DOWN: usize = 8;
+    /// The `Q8Act` downs' widths: GLM's down K and a partial last lane
+    /// iteration (nine super-blocks).
+    const KS_DOWN: [usize; 2] = [2048, 2304];
+    /// The formats of the `Q8Act` downs.
+    const Q8_FMTS: [IqFormat; 3] = [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs];
+    /// Columns of the leg-sized activation the wide-activation clauses launch
+    /// over.
+    const WIDE_COLS: usize = 16;
     /// The down's clause-3 row sampling (every 128th row of its stacks).
     const NL_BAND_STRIDE: usize = 128;
 
@@ -155,11 +185,18 @@ mod gate {
     /// `silu(g64)·u64`, small on negative-g rows while the error enters
     /// through `1.1·Eg·|u|`; every row is inside that composed bound (the
     /// `f64_band` column), which is the assertion, the pin the ratchet.
-    const REL_PIN_GU: [(IqFormat, usize, f64); 4] = [
+    /// PIN(2026-10-11): the three rows added with GLM's widths (IQ2_XS at K =
+    /// 4,096 and 2,304, IQ3_XXS at 4,096), the first run's larger-of-sweep
+    /// values 1.43e-2, 1.13e-2 and 1.14e-2 rounded up the way the rows above
+    /// were; the assertion is the composed bound, as for them.
+    const REL_PIN_GU: [(IqFormat, usize, f64); 7] = [
         (IqFormat::Iq3Xxs, 2560, 1.2e-2),
         (IqFormat::Iq3Xxs, 2304, 2.0e-2),
+        (IqFormat::Iq3Xxs, 4096, 1.4e-2),
         (IqFormat::Iq4Xs, 2560, 8.0e-3),
         (IqFormat::Iq4Xs, 2304, 1.1e-2),
+        (IqFormat::Iq2Xs, 4096, 1.7e-2),
+        (IqFormat::Iq2Xs, 2304, 1.4e-2),
     ];
     /// PIN(2026-10-06): the down's, both K, the dot-level 0.4 % class
     /// widened by the sampled rows' spread.
@@ -522,6 +559,7 @@ mod gate {
             let dx = f64::from(col.1[b / 4]);
             let h = f64::from(half_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
             mag += match fmt {
+                IqFormat::Iq2Xs => (h / 8.0 * dx * f64::from(i)).abs(),
                 IqFormat::Iq3Xxs => (h / 4.0 * dx * f64::from(i)).abs(),
                 _ => (h * dx * f64::from(i)).abs(),
             };
@@ -1346,7 +1384,7 @@ mod gate {
     fn check_ids_and_nan(c: &Ctx) -> Result<bool, GateError> {
         let s = c.gpu.stream();
         let mut ok = true;
-        for fmt in [IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
+        for fmt in [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
             // Clause 5, gate·up: an id past the stack and HOST slots.
             let st = gu_stack(fmt, KS[0], 4, 80)?;
             let (wg, wu) = (st.upload(s, false)?, st.upload(s, true)?);
@@ -1433,8 +1471,8 @@ mod gate {
             );
         }
         // Clause 6: a NaN `d` block and an inf-`d` row (two super-blocks,
-        // one row, identical bytes, opposite `d`) in both entries.
-        for fmt in [IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
+        // one row, identical bytes, opposite `d`) in every gate·up entry.
+        for fmt in [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
             let st = gu_stack(fmt, KS[0], 4, 80)?;
             let (mut gb, mut ub) = (st.g.clone(), st.u.clone());
             let (rb, bb) = (st.row_bytes(), fmt.block_bytes());
@@ -1696,7 +1734,6 @@ mod gate {
         let mut act = Q8Act::with_k(s, 1, st.k)?;
         let xd = DeviceBuffer::from_host(s, &seeded(st.k, 1, -2.0, 4.0))?;
         c.gpu.enqueue_quantize_q8_1_cols(&xd, &mut act, 1, 0)?;
-        let act9 = Q8Act::with_slots(s, 9, st.k)?;
         let act_k = Q8Act::with_k(s, 1, KS[1])?;
         let sel = DeviceBuffer::from_host(s, &[0u32; SLOTS])?;
         let sel_short = DeviceBuffer::from_host(s, &[0u32; 3])?;
@@ -1735,7 +1772,7 @@ mod gate {
             )
         };
         let mut h_short = DeviceBuffer::from_host(s, &[SENT; 8])?;
-        let cases: [(&str, GpuError); 6] = [
+        let cases: [(&str, GpuError); 5] = [
             (
                 "wrong_type_q4_k",
                 launch(GgmlType::Q4_K, &wg, &act, &sel, &mut h)
@@ -1753,12 +1790,6 @@ mod gate {
                 launch(GgmlType::IQ3_XXS, &wg, &act_k, &sel, &mut h)
                     .err()
                     .ok_or("accepted k = 2304 on a k = 2560 stack")?,
-            ),
-            (
-                "m_nine_columns",
-                launch(GgmlType::IQ3_XXS, &wg, &act9, &sel, &mut h)
-                    .err()
-                    .ok_or("accepted nine columns")?,
             ),
             (
                 "short_sel",
@@ -1857,8 +1888,516 @@ mod gate {
             );
             ok &= pass;
         }
+        // The `Q8Act` downs': a wrong type, a stack of another row width, a
+        // non-dividing expert size, fewer columns than slots, short ids and a
+        // short y.
+        let q8st = gu_stack(IqFormat::Iq3Xxs, KS_DOWN[0], 4, 80)?;
+        let w3 = q8st.upload(s, false)?;
+        let rows3 = 4 * 80;
+        let (act8, _) = slot_act(c, &seeded(8 * q8st.k, 3, -2.0, 4.0), q8st.k, 8, 8)?;
+        let (act4, _) = slot_act(c, &seeded(4 * q8st.k, 4, -2.0, 4.0), q8st.k, 4, 4)?;
+        let sel8 = DeviceBuffer::from_host(s, &[0u32; SLOTS_DOWN])?;
+        let sel3 = DeviceBuffer::from_host(s, &[0u32; 3])?;
+        let mut y8 = DeviceBuffer::from_host(s, &vec![SENT; SLOTS_DOWN * 80])?;
+        let mut y_short8 = DeviceBuffer::from_host(s, &[SENT; 9])?;
+        let launch_q8 = |ty: GgmlType,
+                         act: &Q8Act,
+                         sel: &DeviceBuffer<u32>,
+                         rpe: usize,
+                         y: &mut DeviceBuffer<f32>|
+         -> Result<(), GpuError> {
+            c.iqsel.enqueue_gemv_sel(
+                s,
+                ty,
+                &SelDown {
+                    w: &w3,
+                    act,
+                    sel,
+                    n_slots: SLOTS_DOWN,
+                    rows_per_expert: rpe,
+                },
+                sink,
+                y,
+            )
+        };
+        let qcases: [(&str, GpuError); 6] = [
+            (
+                "wrong_type_q4_k",
+                launch_q8(GgmlType::Q4_K, &act8, &sel8, 80, &mut y8)
+                    .err()
+                    .ok_or("accepted a Q4_K stack")?,
+            ),
+            (
+                "iq4_xs_width_on_an_iq3_xxs_stack",
+                launch_q8(GgmlType::IQ4_XS, &act8, &sel8, 80, &mut y8)
+                    .err()
+                    .ok_or("accepted 136-byte blocks over a 98-byte stack")?,
+            ),
+            (
+                "rows_per_expert_50_of_320",
+                launch_q8(GgmlType::IQ3_XXS, &act8, &sel8, 50, &mut y8)
+                    .err()
+                    .ok_or_else(|| format!("accepted 50 of {rows3} rows"))?,
+            ),
+            (
+                "four_columns_for_eight_slots",
+                launch_q8(GgmlType::IQ3_XXS, &act4, &sel8, 80, &mut y8)
+                    .err()
+                    .ok_or("accepted four columns for eight slots")?,
+            ),
+            (
+                "short_sel",
+                launch_q8(GgmlType::IQ3_XXS, &act8, &sel3, 80, &mut y8)
+                    .err()
+                    .ok_or("accepted three ids for eight slots")?,
+            ),
+            (
+                "short_y",
+                launch_q8(GgmlType::IQ3_XXS, &act8, &sel8, 80, &mut y_short8)
+                    .err()
+                    .ok_or("accepted a nine-value y")?,
+            ),
+        ];
+        for (case, e) in qcases {
+            let pass = matches!(
+                &e,
+                GpuError::Shape {
+                    what: "IqSelKernels::enqueue_gemv_sel",
+                    ..
+                }
+            );
+            println!(
+                "refuse_q8[{case}] want=Err(Shape enqueue_gemv_sel) got=\"{e}\" {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
         s.synchronize()?;
         Ok(ok && c.gpu.take_fault()?.is_none())
+    }
+
+    /// The gate·up geometries of `fmt`: Qwen3.8's [`KS`] for the formats its
+    /// card leg runs, and GLM's gate width (4,096) where the format is a GLM
+    /// gate·up; IQ2_XS takes GLM's width and the partial-lane one.
+    fn gu_ks(fmt: IqFormat) -> &'static [usize] {
+        match fmt {
+            IqFormat::Iq2Xs => &[4096, 2304],
+            IqFormat::Iq3Xxs => &[2560, 2304, 4096],
+            IqFormat::Iq4Xs | IqFormat::Q2K => &KS,
+        }
+    }
+
+    /// The ids of the `Q8Act` downs' slots: repeats, an expert in two
+    /// columns, and `HOST` at slot 6.
+    fn sel_down(experts: usize) -> Vec<u32> {
+        [0u32, 1, 2, 3, 2, 1, u32::MAX, 0]
+            .iter()
+            .map(|&v| {
+                if v == u32::MAX || experts >= 4 {
+                    v
+                } else {
+                    v % experts as u32
+                }
+            })
+            .collect()
+    }
+
+    /// `cols` columns of `k` values of `x` quantized into a `Q8Act` of `cap`
+    /// columns (one a slot) by the engine's quantizer, and the quantized
+    /// columns read back.
+    fn slot_act(
+        c: &Ctx,
+        x: &[f32],
+        k: usize,
+        cols: usize,
+        cap: usize,
+    ) -> Result<(Q8Act, Vec<Col>), GateError> {
+        let s = c.gpu.stream();
+        let xd = DeviceBuffer::from_host(s, &x[..cols * k])?;
+        let mut act = Q8Act::with_slots(s, cap, k)?;
+        c.gpu.enqueue_quantize_q8_1_cols(&xd, &mut act, cols, 0)?;
+        s.synchronize()?;
+        let mut read = act_cols(&act, s)?;
+        read.truncate(cols);
+        Ok((act, read))
+    }
+
+    /// The `Q8Act` down entry's output for `sel` into a SENT-filled buffer,
+    /// synchronized: the rows and the fault word.
+    fn down_q8(
+        c: &Ctx,
+        ty: GgmlType,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        sel: &[u32],
+        rpe: usize,
+    ) -> Result<(Vec<f32>, Option<Fault>), GateError> {
+        let stream = c.gpu.stream();
+        let sel_dev = DeviceBuffer::from_host(stream, sel)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; sel.len() * rpe])?;
+        c.iqsel.enqueue_gemv_sel(
+            stream,
+            ty,
+            &SelDown {
+                w,
+                act,
+                sel: &sel_dev,
+                n_slots: sel.len(),
+                rows_per_expert: rpe,
+            },
+            c.gpu.unlabelled_sink(),
+            &mut y,
+        )?;
+        stream.synchronize()?;
+        Ok((y.to_host_vec(stream)?, c.gpu.take_fault()?))
+    }
+
+    /// The `Q8Act` down's host rule over `sel`: `SENT` for `HOST` slots and
+    /// ids past the stack, the host-rule dot of the stack's gate bytes with
+    /// column `s` elsewhere.
+    fn down_q8_host(st: &GuStack, cols: &[Col], sel: &[u32]) -> Vec<f32> {
+        let mut y = vec![SENT; sel.len() * st.rpe];
+        for (s, &id) in sel.iter().enumerate() {
+            if id == u32::MAX || id as usize >= st.experts {
+                continue;
+            }
+            for r in 0..st.rpe {
+                let ra = id as usize * st.rpe + r;
+                y[s * st.rpe + r] = dot_host(st.fmt, st.row(false, ra), &cols[s]);
+            }
+        }
+        y
+    }
+
+    /// Clause 10 over one down geometry: `st`'s gate bytes (`w`) as the down
+    /// stack, eight slots, one column each — host-rule bits, the rerun, the
+    /// `HOST` sentinel, the plane entries (`cross`) and the wide-activation
+    /// launch.
+    fn check_q8_down(
+        c: &Ctx,
+        st: &GuStack,
+        w: &DeviceTensor<u32>,
+        cross: bool,
+    ) -> Result<bool, GateError> {
+        let s = c.gpu.stream();
+        let n = SLOTS_DOWN;
+        let x = seeded(n * st.k, 8101 + st.k as u32, -2.0, 4.0);
+        let (act, cols) = slot_act(c, &x, st.k, n, n)?;
+        let (wide, _) = slot_act(c, &x, st.k, n, 12)?;
+        let sel = sel_down(st.experts);
+        let ty = st.fmt.ggml();
+        let (y, fault) = down_q8(c, ty, w, &act, &sel, st.rpe)?;
+        let (again, fault2) = down_q8(c, ty, w, &act, &sel, st.rpe)?;
+        let (y_wide, fault3) = down_q8(c, ty, w, &wide, &sel, st.rpe)?;
+        let host = down_q8_host(st, &cols, &sel);
+        let bits = bits_equal(&y, &host);
+        let rerun = bits_equal(&y, &again);
+        let sentinel = host_slots_sent(&sel, &y, st.rpe);
+        let wide_bits = bits_equal(&y, &y_wide);
+        let no_fault = fault.is_none() && fault2.is_none() && fault3.is_none();
+        // The plane kernels over repack of the same rows, n columns, one
+        // launch an expert; slot s reads column s.
+        let mut cross_bits = true;
+        let mut cross_want = None;
+        if cross {
+            let (q4, _s8, d8) = walk_a_planes(&act);
+            let (qd, d8d) = (
+                DeviceBuffer::from_host(s, &q4.to_host_vec(s)?)?,
+                DeviceBuffer::from_host(s, &d8.to_host_vec(s)?)?,
+            );
+            let rb = st.row_bytes();
+            let mut expert_y = Vec::with_capacity(st.experts);
+            for e in 0..st.experts {
+                let rows = IqRows::upload(
+                    s,
+                    st.fmt,
+                    &st.g[e * st.rpe * rb..][..st.rpe * rb],
+                    st.rpe,
+                    st.k,
+                )?;
+                let mut yg = DeviceBuffer::from_host(s, &vec![0.0f32; n * st.rpe])?;
+                c.iq.enqueue_rows(s, &rows, &qd, &d8d, n, &mut yg)?;
+                expert_y.push(yg.to_host_vec(s)?);
+            }
+            let mut want = vec![SENT; y.len()];
+            for (si, &id) in sel.iter().enumerate() {
+                if id == u32::MAX {
+                    continue;
+                }
+                want[si * st.rpe..(si + 1) * st.rpe]
+                    .copy_from_slice(&expert_y[id as usize][si * st.rpe..(si + 1) * st.rpe]);
+            }
+            cross_bits = bits_equal(&y, &want);
+            cross_want = Some(want);
+        }
+        let pass = bits && rerun && sentinel && wide_bits && cross_bits && no_fault;
+        println!(
+            "down[{} k={} experts={} rpe={}] host_rule_bits={} rerun={} host_slots_sentinel={} \
+             cross_layout={} wide_act={} fault=\"{}\" {}{}",
+            ty.name().unwrap_or("?"),
+            st.k,
+            st.experts,
+            st.rpe,
+            verdict(bits),
+            verdict(rerun),
+            verdict(sentinel),
+            if cross { verdict(cross_bits) } else { "n/a" },
+            verdict(wide_bits),
+            shown(&fault),
+            mismatch("host_rule", &y, &host),
+            cross_want
+                .as_ref()
+                .map_or(String::new(), |w| mismatch("cross", &y, w)),
+        );
+        Ok(pass)
+    }
+
+    /// Clause 10's ids and NaN `d`: per format, an id past the stack leaves
+    /// its rows at the sentinel and raises `ExpertId`, every other slot is the
+    /// clean launch's; a NaN `d` block and an inf-`d` row make exactly their
+    /// rows NaN.
+    fn check_q8_down_ids_nan(c: &Ctx) -> Result<bool, GateError> {
+        let s = c.gpu.stream();
+        let mut ok = true;
+        for fmt in Q8_FMTS {
+            let ty = fmt.ggml();
+            let st = gu_stack(fmt, KS_DOWN[0], 4, 80)?;
+            let w = st.upload(s, false)?;
+            let n = SLOTS_DOWN;
+            let x = seeded(n * st.k, 8201, -2.0, 4.0);
+            let (act, _) = slot_act(c, &x, st.k, n, n)?;
+            let clean_sel = sel_down(st.experts);
+            let (clean, clean_fault) = down_q8(c, ty, &w, &act, &clean_sel, st.rpe)?;
+            let mut sel = clean_sel.clone();
+            sel[3] = u32::MAX - 1;
+            let (y, fault) = down_q8(c, ty, &w, &act, &sel, st.rpe)?;
+            let bad_sent = y[3 * st.rpe..4 * st.rpe]
+                .iter()
+                .all(|&v| v.to_bits() == SENT.to_bits());
+            let sentinel = host_slots_sent(&sel, &y, st.rpe);
+            let named = match &fault {
+                Some(f) => GpuError::fault("gate_iq_sel", *f)
+                    .to_string()
+                    .contains("expert_id"),
+                None => false,
+            };
+            let others_same = clean
+                .iter()
+                .zip(&y)
+                .enumerate()
+                .all(|(i, (a, b))| i / st.rpe == 3 || a.to_bits() == b.to_bits());
+            let (_, next_fault) = down_q8(c, ty, &w, &act, &clean_sel, st.rpe)?;
+            let ids_pass = bad_sent
+                && sentinel
+                && named
+                && others_same
+                && clean_fault.is_none()
+                && next_fault.is_none();
+            ok &= ids_pass;
+            println!(
+                "ids_down[{} k={}] past_stack_sentinel={} fault_names_expert_id={} \
+                 host_slots_sentinel={} others_are_clean={} next_clean_clean={} fault=\"{}\" {}",
+                ty.name().unwrap_or("?"),
+                st.k,
+                verdict(bad_sent),
+                verdict(named),
+                verdict(sentinel),
+                verdict(others_same),
+                verdict(next_fault.is_none()),
+                shown(&fault),
+                verdict(ids_pass),
+            );
+            // NaN d: expert 1 row 3 super-block 2; inf-d cancel: expert 2 row
+            // 5 super-blocks 1 and 4 (identical bytes, opposite d).
+            let mut gb = st.g.clone();
+            let (rb, bb) = (st.row_bytes(), fmt.block_bytes());
+            gb[(80 + 3) * rb + 2 * bb..][..2].copy_from_slice(&0x7e00u16.to_le_bytes());
+            let src = gb[(2 * 80 + 5) * rb + bb..][..bb].to_vec();
+            gb[(2 * 80 + 5) * rb + 4 * bb..][..bb].copy_from_slice(&src);
+            gb[(2 * 80 + 5) * rb + bb..][..2].copy_from_slice(&0x7c00u16.to_le_bytes());
+            gb[(2 * 80 + 5) * rb + 4 * bb..][..2].copy_from_slice(&0xfc00u16.to_le_bytes());
+            let bad = GuStack {
+                fmt,
+                g: gb,
+                u: Vec::new(),
+                experts: st.experts,
+                rpe: st.rpe,
+                k: st.k,
+            };
+            let wb = bad.upload(s, false)?;
+            let (yb, fault_b) = down_q8(c, ty, &wb, &act, &clean_sel, st.rpe)?;
+            let poisoned = |si: usize, r: usize| {
+                let id = clean_sel[si];
+                id != u32::MAX && ((id == 1 && r == 3) || (id == 2 && r == 5))
+            };
+            let mut nan_rows = true;
+            let mut rest_same = true;
+            for (si, _) in clean_sel.iter().enumerate() {
+                for r in 0..st.rpe {
+                    let (a, b) = (clean[si * st.rpe + r], yb[si * st.rpe + r]);
+                    if poisoned(si, r) {
+                        nan_rows &= b.is_nan();
+                    } else {
+                        rest_same &= a.to_bits() == b.to_bits();
+                    }
+                }
+            }
+            let nan_pass = nan_rows && rest_same && fault_b.is_none();
+            ok &= nan_pass;
+            println!(
+                "nan_d_down[{} k={}] poisoned_rows_nan={} others_bit_equal={} fault=\"{}\" {}",
+                ty.name().unwrap_or("?"),
+                st.k,
+                verdict(nan_rows),
+                verdict(rest_same),
+                shown(&fault_b),
+                verdict(nan_pass),
+            );
+        }
+        Ok(ok)
+    }
+
+    /// Clause 11: the gate·up over a 16-column activation of which two columns
+    /// are quantized equals the 2-column launch, bit for bit, per format.
+    ///
+    /// PIN(2026-10-11): replaces the former refusal of nine columns. The card
+    /// leg's activation holds its cap's columns (`LegBufs`; mimo2's prefill
+    /// cap is hundreds), the kernels read column `slot / slots_per_col` by the
+    /// launch contract alone, and the K-quant gate·ups take any width.
+    fn check_gu_wide(c: &Ctx) -> Result<bool, GateError> {
+        let s = c.gpu.stream();
+        let mut ok = true;
+        for fmt in [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
+            let st = gu_stack(fmt, KS[0], 4, 80)?;
+            let (wg, wu) = (st.upload(s, false)?, st.upload(s, true)?);
+            let m = 2usize;
+            let x = seeded(m * st.k, 9101, -2.0, 4.0);
+            let xd = DeviceBuffer::from_host(s, &x)?;
+            let mut exact = Q8Act::with_k(s, m, st.k)?;
+            c.gpu.enqueue_quantize_q8_1_cols(&xd, &mut exact, m, 0)?;
+            let mut wide = Q8Act::with_slots(s, WIDE_COLS, st.k)?;
+            c.gpu.enqueue_quantize_q8_1_cols(&xd, &mut wide, m, 0)?;
+            s.synchronize()?;
+            let sel = sel_of(m, st.experts);
+            let (h, fault) = gate_up(c, &st, &wg, &wu, &exact, &sel, CLAMP0)?;
+            let (hw, fault_w) = gate_up(c, &st, &wg, &wu, &wide, &sel, CLAMP0)?;
+            let same = bits_equal(&h, &hw);
+            let pass = same && fault.is_none() && fault_w.is_none();
+            ok &= pass;
+            println!(
+                "gu_wide[{} k={} m=2 of {WIDE_COLS}] bits_equal_to_exact_width={} {}{}",
+                fmt.ggml().name().unwrap_or("?"),
+                st.k,
+                verdict(same),
+                verdict(pass),
+                mismatch("wide", &hw, &h),
+            );
+        }
+        Ok(ok)
+    }
+
+    /// Clause 12: the IQ2_XS gate·up and the three downs in one graph.
+    fn check_q8_capture(c: &Ctx) -> Result<bool, GateError> {
+        let s = c.gpu.stream();
+        let gu = gu_stack(IqFormat::Iq2Xs, 4096, 4, 80)?;
+        let (wg, wu) = (gu.upload(s, false)?, gu.upload(s, true)?);
+        let m = 2usize;
+        let xd = DeviceBuffer::from_host(s, &seeded(m * gu.k, 9201, -2.0, 4.0))?;
+        let mut act = Q8Act::with_k(s, m, gu.k)?;
+        c.gpu.enqueue_quantize_q8_1_cols(&xd, &mut act, m, 0)?;
+        let sel = sel_of(m, 4);
+        let sel_dev = DeviceBuffer::from_host(s, &sel)?;
+        let n = SLOTS_DOWN;
+        let sel_d = sel_down(4);
+        let sel_d_dev = DeviceBuffer::from_host(s, &sel_d)?;
+        let mut downs = Vec::new();
+        for fmt in Q8_FMTS {
+            let st = gu_stack(fmt, KS_DOWN[0], 4, 80)?;
+            let w = st.upload(s, false)?;
+            let (a, _) = slot_act(c, &seeded(n * st.k, 9301, -2.0, 4.0), st.k, n, n)?;
+            downs.push((fmt.ggml(), st.rpe, w, a));
+        }
+        s.synchronize()?;
+        let sink = c.gpu.unlabelled_sink();
+        let eager = |st: &CudaStream,
+                     h: &mut DeviceBuffer<f32>,
+                     ys: &mut [DeviceBuffer<f32>]|
+         -> Result<(), GpuError> {
+            c.iqsel.enqueue_gate_up(
+                st,
+                &IqGateUp {
+                    ty: GgmlType::IQ2_XS,
+                    wg: &wg,
+                    wu: &wu,
+                    act: &act,
+                    sel: &sel_dev,
+                    n_slots: sel.len(),
+                    rows_per_expert: gu.rpe,
+                    slots_per_col: SLOTS,
+                    rule: CLAMP0,
+                },
+                sink,
+                h,
+            )?;
+            for ((ty, rpe, w, a), y) in downs.iter().zip(ys.iter_mut()) {
+                c.iqsel.enqueue_gemv_sel(
+                    st,
+                    *ty,
+                    &SelDown {
+                        w,
+                        act: a,
+                        sel: &sel_d_dev,
+                        n_slots: n,
+                        rows_per_expert: *rpe,
+                    },
+                    sink,
+                    y,
+                )?;
+            }
+            Ok(())
+        };
+        let bufs = |s: &CudaStream| {
+            Ok::<_, GateError>((
+                DeviceBuffer::from_host(s, &vec![SENT; sel.len() * gu.rpe])?,
+                (0..downs.len())
+                    .map(|_| DeviceBuffer::from_host(s, &vec![SENT; n * 80]))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        };
+        let read = |h: &DeviceBuffer<f32>, ys: &[DeviceBuffer<f32>]| {
+            let mut all = vec![h.to_host_vec(s)?];
+            for y in ys {
+                all.push(y.to_host_vec(s)?);
+            }
+            Ok::<_, GateError>(all)
+        };
+        let (mut eh, mut eys) = bufs(s)?;
+        eager(s, &mut eh, &mut eys)?;
+        s.synchronize()?;
+        let first = read(&eh, &eys)?;
+        let (mut fh, mut fys) = bufs(s)?;
+        eager(s, &mut fh, &mut fys)?;
+        s.synchronize()?;
+        let second = read(&fh, &fys)?;
+        let (mut gh, mut gys) = bufs(s)?;
+        let graph = c.gpu.capture(|cap| eager(cap, &mut gh, &mut gys))?;
+        let nodes = graph.node_count();
+        graph.launch(s)?;
+        s.synchronize()?;
+        let replayed = read(&gh, &gys)?;
+        drop(graph);
+        let same = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).all(|(x, y)| bits_equal(x, y));
+        let (second_ok, replay_ok) = (same(&first, &second), same(&first, &replayed));
+        let no_fault = c.gpu.take_fault()?.is_none();
+        let pass = nodes == 4 && second_ok && replay_ok && no_fault;
+        println!(
+            "capture_q8 graph_nodes={nodes} (want 4) replay_bits={} second_eager_bits={} \
+             fault=none {}",
+            verdict(replay_ok),
+            verdict(second_ok),
+            verdict(pass),
+        );
+        Ok(pass)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -1872,8 +2411,8 @@ mod gate {
         let s = c.gpu.stream();
         let mut ok = true;
         let mut rels: Vec<(IqFormat, usize, f64)> = Vec::new();
-        for fmt in [IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
-            for &k in KS.iter() {
+        for fmt in [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
+            for &k in gu_ks(fmt) {
                 let st = gu_stack(fmt, k, 4, 80)?;
                 let (wg, wu) = (st.upload(s, false)?, st.upload(s, true)?);
                 let (pass, rel) = check_gu(&c, &st, &wg, &wu, true, true)?;
@@ -1925,8 +2464,22 @@ mod gate {
                 verdict(under),
             );
         }
+        for fmt in Q8_FMTS {
+            for &k in &KS_DOWN {
+                let st = gu_stack(fmt, k, 4, 80)?;
+                let w = st.upload(s, false)?;
+                ok &= check_q8_down(&c, &st, &w, true)?;
+            }
+            // GLM's down rows (4,096 an expert) beside the dots above.
+            let st = gu_stack(fmt, KS_DOWN[0], 2, 4096)?;
+            let w = st.upload(s, false)?;
+            ok &= check_q8_down(&c, &st, &w, false)?;
+        }
         ok &= check_ids_and_nan(&c)?;
+        ok &= check_q8_down_ids_nan(&c)?;
+        ok &= check_gu_wide(&c)?;
         ok &= check_capture(&c)?;
+        ok &= check_q8_capture(&c)?;
         ok &= check_refusals(&c)?;
         let args: Vec<String> = std::env::args().collect();
         if let Some(p) = args

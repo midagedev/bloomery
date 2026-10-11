@@ -456,8 +456,8 @@ impl CardFormat {
     /// format [`CardFormat::of`] names for `ty`, [`CardFormat::Bf16AsF32`] for
     /// a K-quant ([`CardFormat::of_role`]'s engram gain),
     /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
-    /// uses, or [`CardFormat::KQuant`] for q5_1, q8_0, iq3_xxs, iq4_xs, iq4_nl
-    /// and mxfp4, the file's blocks,
+    /// uses, or [`CardFormat::KQuant`] for q5_1, q8_0, iq2_xs, iq3_xxs,
+    /// iq4_xs, iq4_nl and mxfp4, the file's blocks,
     /// which only a program's [`RoutedFormat`] picks.
     #[must_use]
     pub fn holds(self, ty: GgmlType) -> bool {
@@ -469,6 +469,7 @@ impl CardFormat {
                     ty,
                     GgmlType::Q5_1
                         | GgmlType::Q8_0
+                        | GgmlType::IQ2_XS
                         | GgmlType::IQ3_XXS
                         | GgmlType::IQ4_XS
                         | GgmlType::IQ4_NL

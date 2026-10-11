@@ -280,7 +280,7 @@ pub(crate) fn signed4(g: u32, m: u32) -> u32 {
 /// One IQ2_XS code decoded to its eight signed values, as two value-order
 /// words.
 #[inline(always)]
-fn iq2_group(code: u32) -> (u32, u32) {
+pub(crate) fn iq2_group(code: u32) -> (u32, u32) {
     // SAFETY: code & 511 < 512, GRID2's length.
     let g = unsafe { *GRID2.get_unchecked((code & 511) as usize) };
     let s = signs_of(code >> 9);
@@ -324,7 +324,7 @@ pub(crate) fn iq4_word(qs: u32) -> (u32, u32) {
 /// `Σ dp4a(w[i], x[i])` over words `0 .. 4` and `4 .. 8`, each from 0. The
 /// indices are literals so neither array leaves registers.
 #[inline(always)]
-fn dp4_halves(w: &[u32; 8], x: &[u32; 8]) -> (i32, i32) {
+pub(crate) fn dp4_halves(w: &[u32; 8], x: &[u32; 8]) -> (i32, i32) {
     let lo = dp4a_s32(
         w[3],
         x[3],

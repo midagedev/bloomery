@@ -112,7 +112,8 @@ pub struct LegBufs {
 
 impl LegBufs {
     /// The buffers for runs of `shape` whose down entries read [`DownAct::
-    /// Q8Act`] (the K-quant and MXFP4 downs). Load-time or first-prompt only.
+    /// Q8Act`] (the K-quant, MXFP4 and IQ2_XS, IQ3_XXS and IQ4_XS downs).
+    /// Load-time or first-prompt only.
     pub fn new(stream: &CudaStream, shape: LegShape) -> Result<LegBufs, GpuError> {
         LegBufs::for_down(stream, shape, DownAct::Q8Act)
     }
@@ -488,7 +489,7 @@ impl CardLeg {
             Some(GateUpEntry::Q4k) => self.kquant.enqueue_gate_up_q4k(stream, &a, fault, h)?,
             Some(GateUpEntry::Q5k) => self.kquant.enqueue_gate_up_q5k(stream, &a, fault, h)?,
             Some(GateUpEntry::Mxfp4) => self.mxfp4.enqueue_gate_up(stream, &a, fault, h)?,
-            Some(GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs) => {
+            Some(GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs) => {
                 let iq = IqGateUp {
                     ty: st.gate.ty,
                     wg: a.wg,
@@ -567,6 +568,20 @@ impl CardLeg {
                     rows_per_expert,
                 };
                 self.q80.enqueue_gemv_q8_0_sel32(stream, &d, fault, down)?;
+            }
+            (
+                Some((DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq4xs, DownAct::Q8Act)),
+                ActH::Q8Act(act),
+            ) => {
+                let d = SelDown {
+                    w,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                };
+                self.iq
+                    .enqueue_gemv_sel(stream, st.down.ty, &d, fault, down)?;
             }
             (Some((DownEntry::Iq4nl, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
                 let d = IqDown {

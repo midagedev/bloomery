@@ -2,9 +2,11 @@
 //! the KQuant word stream ([`crate::weights`]'s `DevWeight::KQuant`: the row
 //! stream as little-endian u32 words, rows back to back, zero-padded at the
 //! end) — the card leg of Qwen3.8 UD-Q3_K_XL's routed experts, where the
-//! gate·up stacks are IQ3_XXS and the down stack IQ4_NL:
+//! gate·up stacks are IQ3_XXS and the down stack IQ4_NL, and of GLM-5.3-Flash
+//! UD-Q2_K_XL's, where gate·up and down are IQ2_XS, IQ3_XXS or IQ4_XS:
 //!
-//! - `iq3_xxs_gate_up_sel`, `iq4_xs_gate_up_sel`: the [`crate::iq`] gate·up
+//! - `iq2_xs_gate_up_sel`, `iq3_xxs_gate_up_sel`, `iq4_xs_gate_up_sel`: the
+//!   [`crate::iq`] gate·up
 //!   with its rule as a launch argument ([`crate::kquant::act`]), one warp a
 //!   thread row, eight rows a 256-thread block; thread row `n = slot ·
 //!   rows_per_expert + r` dots weight row `sel[slot] · rows_per_expert + r`
@@ -15,6 +17,12 @@
 //!   plane kernels — so a row's `g` equals `iq3_xxs_rows` /
 //!   `iq4_xs_rows` over `IqFormat::repack` of the same row, bit for bit;
 //!   only the reading differs (the raw-block windows below).
+//! - `iq2_xs_gemv_sel`, `iq3_xxs_gemv_sel`, `iq4_xs_gemv_sel`: the same
+//!   per-row dot as a down — slot `s` dots the rows of expert `sel[s]` with
+//!   column `s` of a [`Q8Act`] of at least `n_slots` columns (a
+//!   [`crate::kquant::SelDown`]) and stores `y` from lane 0. Both callers
+//!   share one decode and one dot ([`RawSb`]), so a down row is the gate·up's
+//!   `g` for the same stack row and column.
 //! - `iq4_nl_gemv_sel32`: [`crate::q8_0_sel32`]'s shape with IQ4_NL's
 //!   18-byte blocks — slot `s` dots the rows of expert `sel[s]` with column
 //!   `s` of a [`Q8Blocks32`], lane `b` owning block `b` of the row (warp
@@ -23,8 +31,11 @@
 //!
 //! Raw-block windows. A super-block of absolute row `ra` (the expert's row
 //! `sel[slot] · rows_per_expert + r`) starts at byte `ra · bb · n_sb + bb ·
-//! hb`, `bb` the format's block bytes (IQ3_XXS 98, IQ4_XS 136), and every
-//! field is read through whole words:
+//! hb`, `bb` the format's block bytes (IQ2_XS 74, IQ3_XXS 98, IQ4_XS 136), and
+//! every field is read through whole words:
+//! - IQ2_XS: `x` even; `d` as IQ3_XXS's, sub-block `ib`'s four u16 codes (`x +
+//!   2 + 8·ib`) the same two windows over three words, its scale byte (`x + 66
+//!   + ib`) one shifted word.
 //! - IQ3_XXS: `x` even, so `d` (f16 at `x`) is one half of word `x >> 2`;
 //!   sub-block `ib`'s eight index bytes (`x + 2 + 8·ib`) are two windows over
 //!   three words, its `aux` word (`x + 66 + 4·ib`) one window over two —
@@ -63,7 +74,8 @@ use crate::cores::half_to_f32;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::hybrid::HOST;
-use crate::iq::{ActCols, dp4_all, iq3_group, iq4_word};
+use crate::iq::{ActCols, dp4_all, dp4_halves, iq2_group, iq3_group, iq4_word};
+use crate::kquant::SelDown;
 use crate::kquant::act::{self, Act};
 use crate::kquant::q8_0::q8_0_code;
 use crate::q5::{Q8Blocks32, q5_a_chain};
@@ -92,20 +104,75 @@ pub const IQ4_NL_BLOCK_BYTES: usize = 18;
 
 // ---------------------------------------------------------------- device
 
-/// A gate·up format's raw super-block: its file bytes and one sub-block's
-/// decode into the plane rule's inputs.
+/// A format's raw super-block: its file bytes and one sub-block's decode into
+/// the plane rule's inputs, for the gate·up and the down entries alike.
 trait RawSb {
     /// File bytes per 256-value super-block.
     const BB: usize;
+    /// The integer factors a sub-block's `dp4a` sums are scaled by: one for a
+    /// 32-value sub-block (IQ3_XXS, IQ4_XS), one a 16-value half for IQ2_XS.
+    type Fac: Copy;
 
     /// Sub-block `ib` of the super-block starting at byte `x`: its eight
-    /// weight words in value order, its integer factor `ai` and its scale
-    /// `d` — the values `iq3_xxs_lane_partials` / `iq4_xs_lane_partials`
-    /// compute from the planes, so the fma that consumes them is theirs.
-    /// The caller keeps `x` even (IQ3_XXS) or word-aligned (IQ4_XS) and `x +
-    /// Self::BB` inside `w`'s stream (rust-quality R28: a crate-internal fn
-    /// over unchecked reads under a caller-kept boundary).
-    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], i32, f32);
+    /// weight words in value order, its factors and its scale `d` — the values
+    /// `iq2_xs_lane_partials` / `iq3_xxs_lane_partials` / `iq4_xs_lane_partials`
+    /// compute from the planes, so the fma that consumes them is theirs. The
+    /// caller keeps `x` even (IQ2_XS, IQ3_XXS) or word-aligned (IQ4_XS) and the
+    /// block's `Self::BB` bytes from `x` inside `w`'s stream (rust-quality R28:
+    /// a crate-internal fn over unchecked reads under a caller-kept boundary).
+    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], Self::Fac, f32);
+
+    /// The sub-block's integer sum `I` of the plane rule: the factors times
+    /// the `dp4a` chains of the weight words `wv` against the activation words
+    /// `xw`.
+    fn dot(wv: &[u32; 8], fac: Self::Fac, xw: &[u32; 8]) -> i32;
+}
+
+/// IQ2_XS's raw super-block ([`RawSb`]).
+struct Iq2Xs;
+
+impl RawSb for Iq2Xs {
+    const BB: usize = 74;
+    type Fac = (i32, i32);
+
+    #[inline(always)]
+    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], (i32, i32), f32) {
+        let at = x + 2 + 8 * ib;
+        let (i0, sh) = ((at >> 2), 8 * (at & 3) as u32);
+        let sa = x + 66 + ib;
+        // SAFETY: the whole super-block lies inside the stream by this fn's
+        // contract, and every word read below holds one of its bytes: x is
+        // even, so the f16 at x is one half of word x >> 2; bytes at .. at + 8
+        // (the sub-block's four u16 codes) lie inside it, so the three words of
+        // their window do; the scale byte x + 66 + ib is one more.
+        let (dw, v0, v1, v2, sw) = unsafe {
+            (
+                *w.get_unchecked(x >> 2),
+                *w.get_unchecked(i0),
+                *w.get_unchecked(i0 + 1),
+                *w.get_unchecked(i0 + 2),
+                *w.get_unchecked(sa >> 2),
+            )
+        };
+        let d = half_bits_to_f32((dw >> (8 * (x & 2) as u32)) as u16) * 0.125;
+        let (c0, c1) = (q8_0_code(v0, v1, sh), q8_0_code(v1, v2, sh));
+        let s = (sw >> (8 * (sa & 3) as u32)) & 0xff;
+        let (w0, w1) = iq2_group(c0 & 0xffff);
+        let (w2, w3) = iq2_group(c0 >> 16);
+        let (w4, w5) = iq2_group(c1 & 0xffff);
+        let (w6, w7) = iq2_group(c1 >> 16);
+        (
+            [w0, w1, w2, w3, w4, w5, w6, w7],
+            ((2 * (s & 15) + 1) as i32, (2 * (s >> 4) + 1) as i32),
+            d,
+        )
+    }
+
+    #[inline(always)]
+    fn dot(wv: &[u32; 8], fac: (i32, i32), xw: &[u32; 8]) -> i32 {
+        let (s0, s1) = dp4_halves(wv, xw);
+        fac.0 * s0 + fac.1 * s1
+    }
 }
 
 /// IQ3_XXS's raw super-block ([`RawSb`]).
@@ -113,6 +180,7 @@ struct Iq3Xxs;
 
 impl RawSb for Iq3Xxs {
     const BB: usize = 98;
+    type Fac = i32;
 
     #[inline(always)]
     fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], i32, f32) {
@@ -149,6 +217,11 @@ impl RawSb for Iq3Xxs {
         let (w6, w7) = iq3_group(cw1 >> 16, cw1 >> 24, ax >> 21);
         ([w0, w1, w2, w3, w4, w5, w6, w7], ai, d)
     }
+
+    #[inline(always)]
+    fn dot(wv: &[u32; 8], fac: i32, xw: &[u32; 8]) -> i32 {
+        fac * dp4_all(wv, xw)
+    }
 }
 
 /// IQ4_XS's raw super-block ([`RawSb`]).
@@ -156,6 +229,7 @@ struct Iq4Xs;
 
 impl RawSb for Iq4Xs {
     const BB: usize = 136;
+    type Fac = i32;
 
     #[inline(always)]
     fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], i32, f32) {
@@ -184,6 +258,11 @@ impl RawSb for Iq4Xs {
         let (l2, h2) = iq4_word(q2);
         let (l3, h3) = iq4_word(q3);
         ([l0, l1, l2, l3, h0, h1, h2, h3], ai, d)
+    }
+
+    #[inline(always)]
+    fn dot(wv: &[u32; 8], fac: i32, xw: &[u32; 8]) -> i32 {
+        fac * dp4_all(wv, xw)
     }
 }
 
@@ -261,9 +340,9 @@ fn gate_up_sel_body<D: RawSb>(
         // are here (both returns above are warp-uniform).
         let ((xw, dx), (wgw, gai, gd), (wuw, uai, ud)) =
             unsafe { (a.col(0, b), D::sub(wg, x, b & 7), D::sub(wu, x, b & 7)) };
-        let i = gai * dp4_all(&wgw, &xw);
+        let i = D::dot(&wgw, gai, &xw);
         fg = (gd * dx).mul_add(i as f32, fg);
-        let i = uai * dp4_all(&wuw, &xw);
+        let i = D::dot(&wuw, uai, &xw);
         fu = (ud * dx).mul_add(i as f32, fu);
         b += 32;
     }
@@ -273,6 +352,81 @@ fn gate_up_sel_body<D: RawSb>(
         // SAFETY: row < n_slots · rows_per_expert <= h.len() by this fn's
         // contract; only lane 0 of the warp writes h[row].
         unsafe { *h.get_unchecked_mut(row) = act::apply(act, limit, g, u) };
+    }
+}
+
+/// The body of a down entry over raw format `D` (module doc): thread row `n =
+/// slot · rows_per_expert + r` dots weight row `sel[slot] · rows_per_expert +
+/// r` with activation column `slot` of a [`Q8Act`] — the gate·up body's walk
+/// and term over one stack — and stores `y[n]` from lane 0.
+///
+/// The caller keeps the entry's launch contract over its `n_slots` slots: the
+/// stack holds `D::BB`-byte super-block streams of `n_experts ·
+/// rows_per_expert` rows of `n_sb` super-blocks, the activation planes at
+/// least `n_slots` columns of `256 · n_grp` q words and `2 · n_sb` scales
+/// (`n_grp = ceil(n_sb / 4)`), `sel.len() >= n_slots`, `y.len() >= n_slots ·
+/// rows_per_expert`; `row < n_slots · rows_per_expert` is the calling warp's
+/// row (one warp a row), all 32 lanes of the warp here (rust-quality R28: a
+/// crate-internal fn over unchecked reads under a caller-kept boundary).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+fn down_sel_body<D: RawSb>(
+    w: &[u32],
+    q: &[u32],
+    d8: &[f32],
+    sel: &[u32],
+    n_experts: u32,
+    rows_per_expert: u32,
+    n_sb: u32,
+    n_grp: u32,
+    fault: FaultSink,
+    row: usize,
+    y: &mut DisjointSlice<f32>,
+) {
+    let slot = row / rows_per_expert as usize;
+    // SAFETY: slot < n_slots <= sel.len() by this fn's contract; the load is
+    // warp-uniform (the warp's lanes share `row`, hence `slot`), so the
+    // returns below never diverge a warp.
+    let id = unsafe { *sel.get_unchecked(slot) };
+    let lane = warp::lane_id() as usize;
+    if id >= n_experts {
+        if id != HOST && lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        return;
+    }
+    let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
+    let a = ActCols {
+        q,
+        d8,
+        q0: slot * 256 * n_grp as usize,
+        q_col: 0,
+        d0: slot * 2 * n_sb as usize,
+        d_col: 0,
+    };
+    let n_sub = 8 * n_sb as usize;
+    let base = row_abs * D::BB * n_sb as usize;
+    let mut f = 0.0f32;
+    let mut b = lane;
+    while b < n_sub {
+        let x = base + D::BB * (b >> 3);
+        // SAFETY: b < n_sub, so super-block b >> 3 of row row_abs is inside
+        // the stack by this fn's contract; column slot < n_slots of the
+        // activation; all 32 lanes of the warp are here (the returns above
+        // are warp-uniform).
+        let ((xw, dx), (wv, fac, d)) = unsafe { (a.col(0, b), D::sub(w, x, b & 7)) };
+        let i = D::dot(&wv, fac, &xw);
+        f = (d * dx).mul_add(i as f32, f);
+        b += 32;
+    }
+    let sum = warp::reduce_sum_f32(f);
+    if lane == 0 {
+        // SAFETY: row < n_slots · rows_per_expert <= y.len() by this fn's
+        // contract; only lane 0 of the warp writes y[row].
+        unsafe { *y.get_unchecked_mut(row) = sum };
     }
 }
 
@@ -351,6 +505,78 @@ pub(crate) fn iq4_nl_row_dot32(
 #[cuda_module]
 mod iq_sel_kernels {
     use super::*;
+
+    /// The IQ2_XS gate·up over raw blocks ([`gate_up_sel_body`] over
+    /// [`Iq2Xs`]): 74-byte super-blocks at even byte offsets, read through the
+    /// parity windows of the module doc. `m_cols` only bounds the activation in
+    /// the launch contract.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            2 * wg.len() >= n_experts * rows_per_expert * 37 * n_sb,
+            2 * wu.len() >= n_experts * rows_per_expert * 37 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * n_grp,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn iq2_xs_gate_up_sel(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        n_grp: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // The launch contract is the body's (37 half-words a 74-byte
+        // super-block); the host passes n_grp = ceil(n_sb/4) and one of
+        // Act::code's codes; the return above is warp-uniform and keeps row
+        // in range.
+        gate_up_sel_body::<Iq2Xs>(
+            wg,
+            wu,
+            q,
+            d8,
+            sel,
+            n_experts,
+            rows_per_expert,
+            slots_per_col,
+            n_sb,
+            n_grp,
+            act,
+            limit,
+            fault,
+            row,
+            &mut h,
+        );
+    }
 
     /// The IQ3_XXS gate·up over raw blocks ([`gate_up_sel_body`] over
     /// [`Iq3Xxs`]): 98-byte super-blocks at even byte offsets, read through
@@ -495,6 +721,180 @@ mod iq_sel_kernels {
         );
     }
 
+    /// The IQ2_XS down `_sel` over raw blocks ([`down_sel_body`] over
+    /// [`Iq2Xs`]): 74-byte super-blocks at even byte offsets. One warp per output row, eight rows per
+    /// 256-thread block; thread row `n = slot · rows_per_expert + r` stores
+    /// `y[n]`, the dot of weight row `sel[slot] · rows_per_expert + r` with
+    /// column `slot` of the [`Q8Act`]. Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            2 * w.len() >= n_experts * rows_per_expert * 37 * n_sb,
+            q.len() >= n_slots * 256 * n_grp,
+            d8.len() >= n_slots * 2 * n_sb,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn iq2_xs_gemv_sel(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        n_grp: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // The launch contract is the body's; the host passes n_grp =
+        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
+        // range.
+        down_sel_body::<Iq2Xs>(
+            w,
+            q,
+            d8,
+            sel,
+            n_experts,
+            rows_per_expert,
+            n_sb,
+            n_grp,
+            fault,
+            row,
+            &mut y,
+        );
+    }
+
+    /// The IQ3_XXS down `_sel` over raw blocks ([`down_sel_body`] over
+    /// [`Iq3Xxs`]): 98-byte super-blocks at even byte offsets. One warp per output row, eight rows per
+    /// 256-thread block; thread row `n = slot · rows_per_expert + r` stores
+    /// `y[n]`, the dot of weight row `sel[slot] · rows_per_expert + r` with
+    /// column `slot` of the [`Q8Act`]. Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            2 * w.len() >= n_experts * rows_per_expert * 49 * n_sb,
+            q.len() >= n_slots * 256 * n_grp,
+            d8.len() >= n_slots * 2 * n_sb,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn iq3_xxs_gemv_sel(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        n_grp: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // The launch contract is the body's; the host passes n_grp =
+        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
+        // range.
+        down_sel_body::<Iq3Xxs>(
+            w,
+            q,
+            d8,
+            sel,
+            n_experts,
+            rows_per_expert,
+            n_sb,
+            n_grp,
+            fault,
+            row,
+            &mut y,
+        );
+    }
+
+    /// The IQ4_XS down `_sel` over raw blocks ([`down_sel_body`] over
+    /// [`Iq4Xs`]): word-aligned 136-byte super-blocks. One warp per output row, eight rows per
+    /// 256-thread block; thread row `n = slot · rows_per_expert + r` stores
+    /// `y[n]`, the dot of weight row `sel[slot] · rows_per_expert + r` with
+    /// column `slot` of the [`Q8Act`]. Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows_per_expert * 34 * n_sb,
+            q.len() >= n_slots * 256 * n_grp,
+            d8.len() >= n_slots * 2 * n_sb,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn iq4_xs_gemv_sel(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        n_grp: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // The launch contract is the body's; the host passes n_grp =
+        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
+        // range.
+        down_sel_body::<Iq4Xs>(
+            w,
+            q,
+            d8,
+            sel,
+            n_experts,
+            rows_per_expert,
+            n_sb,
+            n_grp,
+            fault,
+            row,
+            &mut y,
+        );
+    }
+
     /// The IQ4_NL down `_sel` of 32-value blocks ([`iq4_nl_row_dot32`]): one
     /// warp per output row, eight rows per 256-thread block; thread row `n =
     /// slot · rows_per_expert + r` stores `y[n]`, the dot of weight row
@@ -623,7 +1023,7 @@ pub fn iq4_nl_row_dot32_host(
 
 /// A gate·up launch ([`IqSelKernels::enqueue_gate_up`]).
 pub struct IqGateUp<'a> {
-    /// The format of both stacks: IQ3_XXS or IQ4_XS.
+    /// The format of both stacks: IQ2_XS, IQ3_XXS or IQ4_XS.
     pub ty: GgmlType,
     /// The gate stack: `n_experts · rows_per_expert` rows of the file's
     /// super-blocks as the KQuant word stream ([`stream_words`] words a
@@ -726,16 +1126,17 @@ impl IqSelKernels {
         })
     }
 
-    /// Enqueue the i-quant gate·up of `a.ty` (IQ3_XXS or IQ4_XS): slot `s`
-    /// writes `h[s · rows_per_expert ..][..rows_per_expert]` as `a.rule`
-    /// over the rows of expert `sel[s]` of both stacks dotted with column `s
-    /// / slots_per_col` of `a.act` (module doc for [`HOST`] and ids past the
-    /// stack, which raise on `fault` and write NaN). Refused by name: a
-    /// format the entries do not take, a stack whose row width is not the
-    /// KQuant stream of the type, `k` not a multiple of 256, a non-dividing
-    /// expert size, an up stack of another shape, more than eight
-    /// activation columns, and slots the activation, the ids or `h` do not
-    /// cover. Asynchronous, allocation-free, capturable.
+    /// Enqueue the i-quant gate·up of `a.ty` (IQ2_XS, IQ3_XXS or IQ4_XS):
+    /// slot `s` writes `h[s · rows_per_expert ..][..rows_per_expert]` as
+    /// `a.rule` over the rows of expert `sel[s]` of both stacks dotted with
+    /// column `s / slots_per_col` of `a.act` (module doc for [`HOST`] and ids
+    /// past the stack, which raise on `fault` and write NaN). `a.act` may hold
+    /// more columns than the slots read (a cap-sized activation serves a
+    /// smaller run). Refused by name: a format the entries do not take, a
+    /// stack whose row width is not the KQuant stream of the type, `k` not a
+    /// multiple of 256, a non-dividing expert size, an up stack of another
+    /// shape, and slots the activation, the ids or `h` do not cover.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_gate_up(
         &self,
         stream: &CudaStream,
@@ -745,12 +1146,13 @@ impl IqSelKernels {
     ) -> Result<(), GpuError> {
         let what = "IqSelKernels::enqueue_gate_up";
         let (name, bb) = match a.ty {
+            GgmlType::IQ2_XS => ("IQ2_XS", Iq2Xs::BB),
             GgmlType::IQ3_XXS => ("IQ3_XXS", Iq3Xxs::BB),
             GgmlType::IQ4_XS => ("IQ4_XS", Iq4Xs::BB),
             other => {
                 return Err(GpuError::shape(
                     what,
-                    format!("the gate·up takes IQ3_XXS or IQ4_XS stacks, got {other:?}"),
+                    format!("the gate·up takes IQ2_XS, IQ3_XXS or IQ4_XS stacks, got {other:?}"),
                 ));
             }
         };
@@ -785,24 +1187,42 @@ impl IqSelKernels {
                 what,
                 format!(
                     "{n_slots} slots (at least one) at {spc} a column (at least one) over {m} \
-                     columns (at most eight), sel.len() {}, h.len() {} >= n_slots*rows_per_expert \
-                     = {}",
+                     columns, sel.len() {}, h.len() {} >= n_slots*rows_per_expert = {}",
                     a.sel.len(),
                     h.len(),
                     n_slots * rpe
                 ),
             ));
         }
-        if !(1..=8).contains(&m) {
-            return Err(GpuError::shape(
-                what,
-                format!("1 <= m <= 8 activation columns, got {m}"),
-            ));
-        }
         let n_grp = n_sb.div_ceil(4);
         let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
         let (act, limit) = a.rule.code();
         match a.ty {
+            GgmlType::IQ2_XS => {
+                let prep = self
+                    .module
+                    .prepare_iq2_xs_gate_up_sel(LaunchConfig1D::new(grid, THREADS, 0))?;
+                self.module.iq2_xs_gate_up_sel(
+                    stream,
+                    &prep,
+                    a.wg.buf(),
+                    a.wu.buf(),
+                    &a.act.q4,
+                    &a.act.d8,
+                    a.sel,
+                    launch_u32(what, "n_experts", n_experts)?,
+                    launch_u32(what, "rows_per_expert", rpe)?,
+                    launch_u32(what, "n_slots", n_slots)?,
+                    launch_u32(what, "m_cols", m)?,
+                    launch_u32(what, "slots_per_col", spc)?,
+                    launch_u32(what, "n_sb", n_sb)?,
+                    launch_u32(what, "n_grp", n_grp)?,
+                    act,
+                    limit,
+                    fault,
+                    h,
+                )?;
+            }
             GgmlType::IQ3_XXS => {
                 let prep = self
                     .module
@@ -853,6 +1273,83 @@ impl IqSelKernels {
                     h,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    /// Enqueue the i-quant down `_sel` of `ty` (IQ2_XS, IQ3_XXS or IQ4_XS)
+    /// over a [`Q8Act`]: slot `s` writes `y[s · rows_per_expert
+    /// ..][..rows_per_expert]` as the rows of expert `sel[s]` dotted with
+    /// column `s` of `a.act` (module doc for [`HOST`] and ids past the stack,
+    /// which raise on `fault`). `a.act` may hold more columns than the slots
+    /// read. Refused by name: a format the entries do not take, a stack whose
+    /// row width is not the KQuant stream of the type at the activation's
+    /// `k`, a non-dividing expert size, and slots the activation, the ids or
+    /// `y` do not cover. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_gemv_sel(
+        &self,
+        stream: &CudaStream,
+        ty: GgmlType,
+        a: &SelDown<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "IqSelKernels::enqueue_gemv_sel";
+        let (name, bb) = match ty {
+            GgmlType::IQ2_XS => ("IQ2_XS", Iq2Xs::BB),
+            GgmlType::IQ3_XXS => ("IQ3_XXS", Iq3Xxs::BB),
+            GgmlType::IQ4_XS => ("IQ4_XS", Iq4Xs::BB),
+            other => {
+                return Err(GpuError::shape(
+                    what,
+                    format!("the down takes IQ2_XS, IQ3_XXS or IQ4_XS stacks, got {other:?}"),
+                ));
+            }
+        };
+        let n_sb = a.act.n_sb();
+        let n_experts = stack_experts(what, name, bb, a.w, n_sb, a.rows_per_expert)?;
+        let (n_slots, rpe) = (a.n_slots, a.rows_per_expert);
+        if n_slots == 0 || a.act.m() < n_slots || a.sel.len() < n_slots || y.len() < n_slots * rpe {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_slots} slots (at least one): an activation column a slot (act.m() {} >= \
+                     n_slots), an id a slot (sel.len() {}), y.len() {} >= n_slots*rows_per_expert \
+                     = {}",
+                    a.act.m(),
+                    a.sel.len(),
+                    y.len(),
+                    n_slots * rpe
+                ),
+            ));
+        }
+        let n_grp = n_sb.div_ceil(4);
+        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        let cfg = LaunchConfig1D::new(grid, THREADS, 0);
+        macro_rules! down {
+            ($prepare:ident, $entry:ident) => {{
+                let prep = self.module.$prepare(cfg)?;
+                self.module.$entry(
+                    stream,
+                    &prep,
+                    a.w.buf(),
+                    &a.act.q4,
+                    &a.act.d8,
+                    a.sel,
+                    launch_u32(what, "n_experts", n_experts)?,
+                    launch_u32(what, "rows_per_expert", rpe)?,
+                    launch_u32(what, "n_slots", n_slots)?,
+                    launch_u32(what, "n_sb", n_sb)?,
+                    launch_u32(what, "n_grp", n_grp)?,
+                    fault,
+                    y,
+                )?
+            }};
+        }
+        match ty {
+            GgmlType::IQ2_XS => down!(prepare_iq2_xs_gemv_sel, iq2_xs_gemv_sel),
+            GgmlType::IQ3_XXS => down!(prepare_iq3_xxs_gemv_sel, iq3_xxs_gemv_sel),
+            _ => down!(prepare_iq4_xs_gemv_sel, iq4_xs_gemv_sel),
         }
         Ok(())
     }

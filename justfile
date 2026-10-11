@@ -202,9 +202,10 @@ gate-gpu-glm-router:
 gate-gpu-iq:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq'
 
-# i-quant expert 선택 엔트리(bloomery_gpu::iq_sel): IQ3_XXS·IQ4_XS gate·up과 IQ4_NL down `_sel32`를 파일 그대로의
-# 블록 워드 스트림 위에서 합성 스택(ref-synth + 시드 IQ4_NL)으로 본다. 호스트 규칙·플레인 커널과 비트 동일, f64 밴드와 핀,
-# silu 규칙 밴드, 폴트·NaN d·캡처·이름 붙은 거부.
+# i-quant expert select entries (bloomery_gpu::iq_sel) over the file's own block word stream, on synthetic stacks
+# (ref-synth + seeded IQ4_NL): the IQ2_XS, IQ3_XXS and IQ4_XS gate·ups, the IQ4_NL down `_sel32` and the IQ2_XS, IQ3_XXS and
+# IQ4_XS downs over Q8Act (GLM UD-Q2_K_XL's). Bit-equal to the host rule and the plane kernels, the f64 band and pins, the
+# silu rule band, faults, NaN d, a wide activation, capture and named refusals.
 gate-gpu-iq-sel *ARGS:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel {{ARGS}}'
 

@@ -49,8 +49,9 @@
 //!   over two weight planes, with a fused weighted combine. The MXFP4 rows
 //!   below are that file's per-slot pair over the file's own blocks.
 //! - `crates/gpu/src/iq.rs`'s `IqFormat` plane row cores (IQ2_XS, IQ3_XXS,
-//!   IQ4_XS, Q2_K) are run by gates only; IQ3_XXS and IQ4_XS reach a launch
-//!   through `crates/gpu/src/iq_sel.rs`, the rows below.
+//!   IQ4_XS, Q2_K) are run by gates only; IQ2_XS, IQ3_XXS and IQ4_XS reach a
+//!   launch through `crates/gpu/src/iq_sel.rs`, the rows below. Q2_K has no
+//!   launcher of that shape.
 //! - V4.1's BF16 and Q3_K embedding rows (`chain/glue.rs` in
 //!   `crates/gpu-deepseek41`): the BF16 rows are that family's own; the
 //!   Q3_K rows have the common row below.
@@ -83,6 +84,9 @@ pub enum GateUpEntry {
     /// `KquantKernels::enqueue_gate_up_q8_0` (`kq_gate_up_act_q8_0`, the
     /// file's `block_q8_0` stream) in `crates/gpu/src/kquant/sel.rs`.
     Q8_0,
+    /// `IqSelKernels::enqueue_gate_up` (`iq2_xs_gate_up_sel`, the file's
+    /// 74-byte `block_iq2_xs` stream) in `crates/gpu/src/iq_sel.rs`.
+    Iq2xs,
     /// `IqSelKernels::enqueue_gate_up` (`iq3_xxs_gate_up_sel`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
@@ -119,6 +123,15 @@ pub enum DownEntry {
     /// 256-value super-blocks, `Q8Act`) in `crates/gpu/src/kquant/sel.rs`,
     /// which no model body launches.
     Q8_0,
+    /// `IqSelKernels::enqueue_gemv_sel` (`iq2_xs_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq2xs,
+    /// `IqSelKernels::enqueue_gemv_sel` (`iq3_xxs_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq3xxs,
+    /// `IqSelKernels::enqueue_gemv_sel` (`iq4_xs_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq4xs,
     /// `IqSelKernels::enqueue_down` (`iq4_nl_gemv_sel32`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4nl,
@@ -232,6 +245,7 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         GgmlType::Q4_K => Some(GateUpEntry::Q4k),
         GgmlType::Q5_K => Some(GateUpEntry::Q5k),
         GgmlType::Q8_0 => Some(GateUpEntry::Q8_0),
+        GgmlType::IQ2_XS => Some(GateUpEntry::Iq2xs),
         GgmlType::IQ3_XXS => Some(GateUpEntry::Iq3xxs),
         GgmlType::IQ4_XS => Some(GateUpEntry::Iq4xs),
         GgmlType::MXFP4 => Some(GateUpEntry::Mxfp4),
@@ -244,7 +258,6 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::Q6_K
         | GgmlType::BF16
         | GgmlType::IQ2_XXS
-        | GgmlType::IQ2_XS
         | GgmlType::IQ1_S
         | GgmlType::IQ4_NL
         | GgmlType::IQ3_S
@@ -274,18 +287,18 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         GgmlType::Q8_0 => Some((DownEntry::Q8_0, DownAct::Q8Blocks32)),
         GgmlType::IQ4_NL => Some((DownEntry::Iq4nl, DownAct::Q8Blocks32)),
         GgmlType::MXFP4 => Some((DownEntry::Mxfp4, DownAct::Q8Act)),
+        GgmlType::IQ2_XS => Some((DownEntry::Iq2xs, DownAct::Q8Act)),
+        GgmlType::IQ3_XXS => Some((DownEntry::Iq3xxs, DownAct::Q8Act)),
+        GgmlType::IQ4_XS => Some((DownEntry::Iq4xs, DownAct::Q8Act)),
         GgmlType::F32
         | GgmlType::F16
         | GgmlType::Q2_K
         | GgmlType::Q3_K
         | GgmlType::BF16
         | GgmlType::IQ2_XXS
-        | GgmlType::IQ2_XS
-        | GgmlType::IQ3_XXS
         | GgmlType::IQ1_S
         | GgmlType::IQ3_S
         | GgmlType::IQ2_S
-        | GgmlType::IQ4_XS
         | GgmlType::I8
         | GgmlType::I16
         | GgmlType::I32
@@ -455,6 +468,7 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
             GateUpEntry::Q4k
                 | GateUpEntry::Q5k
                 | GateUpEntry::Mxfp4
+                | GateUpEntry::Iq2xs
                 | GateUpEntry::Iq3xxs
                 | GateUpEntry::Iq4xs
         )
@@ -464,16 +478,21 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
 /// Whether the common card leg launches the down entry of a routed down stack
 /// of type `ty`: the table's [`down`] row, for the entries whose launchers take
 /// an activation of more columns than a run uses, with the form the leg
-/// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, MXFP4) or
-/// the 32-value [`DownAct::Q8Blocks32`] (Q5_1, Q8_0, IQ4_NL). The Q6_K launcher
-/// takes such an activation and has no arm in the leg yet; the Q5_0 row reads
-/// the packed layout, not the file's blocks.
+/// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, MXFP4,
+/// IQ2_XS, IQ3_XXS, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`] (Q5_1,
+/// Q8_0, IQ4_NL). The Q6_K launcher takes such an activation and has no arm in
+/// the leg yet; the Q5_0 row reads the packed layout, not the file's blocks.
 #[must_use]
 pub const fn card_down_runs(ty: GgmlType) -> bool {
     matches!(
         down(ty),
         Some((
-            DownEntry::Q4k | DownEntry::Q5k | DownEntry::Mxfp4,
+            DownEntry::Q4k
+                | DownEntry::Q5k
+                | DownEntry::Mxfp4
+                | DownEntry::Iq2xs
+                | DownEntry::Iq3xxs
+                | DownEntry::Iq4xs,
             DownAct::Q8Act
         )) | Some((
             DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl,
@@ -605,6 +624,7 @@ mod tests {
                 (GgmlType::Q4_K, GateUpEntry::Q4k),
                 (GgmlType::Q5_K, GateUpEntry::Q5k),
                 (GgmlType::MXFP4, GateUpEntry::Mxfp4),
+                (GgmlType::IQ2_XS, GateUpEntry::Iq2xs),
                 (GgmlType::IQ3_XXS, GateUpEntry::Iq3xxs),
                 (GgmlType::IQ4_XS, GateUpEntry::Iq4xs),
             ]
@@ -627,13 +647,16 @@ mod tests {
                 (GgmlType::Q5_K, DownEntry::Q5k),
                 (GgmlType::Q6_K, DownEntry::Q6k),
                 (GgmlType::MXFP4, DownEntry::Mxfp4),
+                (GgmlType::IQ2_XS, DownEntry::Iq2xs),
+                (GgmlType::IQ3_XXS, DownEntry::Iq3xxs),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
+                (GgmlType::IQ4_XS, DownEntry::Iq4xs),
             ]
         );
     }
 
-    /// The K-quant and MXFP4 downs read the 128-value `Q8Act`; every other
-    /// down reads the 32-value `Q8Blocks32`.
+    /// The K-quant, MXFP4 and i-quant (IQ2_XS, IQ3_XXS, IQ4_XS) downs read the
+    /// 128-value `Q8Act`; every other down reads the 32-value `Q8Blocks32`.
     #[test]
     fn down_reads_the_activation_form_of_its_entry() {
         let forms: Vec<_> = ALL
@@ -650,7 +673,10 @@ mod tests {
                 (GgmlType::Q5_K, DownAct::Q8Act),
                 (GgmlType::Q6_K, DownAct::Q8Act),
                 (GgmlType::MXFP4, DownAct::Q8Act),
+                (GgmlType::IQ2_XS, DownAct::Q8Act),
+                (GgmlType::IQ3_XXS, DownAct::Q8Act),
                 (GgmlType::IQ4_NL, DownAct::Q8Blocks32),
+                (GgmlType::IQ4_XS, DownAct::Q8Act),
             ]
         );
     }
@@ -730,21 +756,30 @@ mod tests {
     }
 
     /// The common card leg runs exactly the pinned types, each of which has
-    /// both rows.
+    /// both rows: the K-quants, MXFP4 and the i-quants whose raw-block gate·up
+    /// and `Q8Act` down entries `iq_sel.rs` launches.
     #[test]
     fn card_runs_admits_exactly_the_pinned_types() {
         let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_runs(ty)).collect();
-        assert_eq!(runs, [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::MXFP4]);
+        assert_eq!(
+            runs,
+            [
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::MXFP4,
+                GgmlType::IQ2_XS,
+                GgmlType::IQ3_XXS,
+                GgmlType::IQ4_XS,
+            ]
+        );
         for ty in runs {
             assert!(gate_up(ty).is_some() && down(ty).is_some(), "{ty:?}");
         }
     }
 
     /// The leg checks each role by its own rule: the gate·up and down sets
-    /// differ (the i-quant gate·up types have no down row, the 32-value-block
-    /// down types no gate·up row), and a type whose table row the leg has no
-    /// arm for is in neither (the Q8_0 gate·up row, the Q6_K and Q5_0 down
-    /// rows).
+    /// differ (Q5_1, Q8_0 and IQ4_NL run only as downs; Q8_0's gate·up row has
+    /// no arm), and the Q6_K and Q5_0 down rows have no arm.
     #[test]
     fn the_leg_admits_each_role_by_its_own_rule() {
         let gate_up_runs: Vec<GgmlType> = ALL
@@ -758,6 +793,7 @@ mod tests {
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,
                 GgmlType::MXFP4,
+                GgmlType::IQ2_XS,
                 GgmlType::IQ3_XXS,
                 GgmlType::IQ4_XS
             ]
@@ -770,7 +806,10 @@ mod tests {
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,
                 GgmlType::MXFP4,
-                GgmlType::IQ4_NL
+                GgmlType::IQ2_XS,
+                GgmlType::IQ3_XXS,
+                GgmlType::IQ4_NL,
+                GgmlType::IQ4_XS
             ]
         );
         assert!(gate_up(GgmlType::Q8_0).is_some() && !card_gate_up_runs(GgmlType::Q8_0));

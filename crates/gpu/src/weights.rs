@@ -51,10 +51,11 @@ pub fn head_tensor(split: &Split) -> &'static str {
 /// travel as a file tensor.
 pub enum DevWeight {
     /// A file tensor as the file stores its rows (`CardFormat::KQuant`): a
-    /// Q3_K/Q4_K/Q5_K/Q6_K tensor, or a routed Q5_1, Q8_0, IQ3_XXS, IQ4_XS,
-    /// IQ4_NL or MXFP4 stack a program's plan
+    /// Q3_K/Q4_K/Q5_K/Q6_K tensor, or a routed Q5_1, Q8_0, IQ2_XS, IQ3_XXS,
+    /// IQ4_XS, IQ4_NL or MXFP4 stack a program's plan
     /// puts on the card in the file's `block_q5_1`s, `block_q8_0`s,
-    /// `block_iq3_xxs`es, `block_iq4_xs`es, `block_iq4_nl`s or `block_mxfp4`s,
+    /// `block_iq2_xs`es, `block_iq3_xxs`es, `block_iq4_xs`es, `block_iq4_nl`s or
+    /// `block_mxfp4`s,
     /// which its `_sel` and GEMM entries read (`ty` says which). The raw row
     /// stream as little-endian u32 words, zero-padded at its end to a whole
     /// number of words per row —

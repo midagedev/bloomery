@@ -309,19 +309,26 @@ mod tests {
 
     /// A stack is card-routed when the common kernel table gives its type the
     /// entries this program's leg launches, and not otherwise: the types the
-    /// table runs on the card for other families (Q8_0 and the i-quants) and
-    /// the ones it has no row for (Q2_K, the floats) keep their layer's
-    /// experts on the host.
+    /// table runs on the card for other families (Q8_0 and IQ4_NL) and the
+    /// ones it has no row for (Q2_K, the floats) keep their layer's experts on
+    /// the host.
     // PIN(2026-10-11): card_runs now runs Q4_K/Q5_K through the common leg.
+    // PIN(2026-10-11): the leg also runs IQ2_XS, IQ3_XXS and IQ4_XS (the
+    // raw-block entries of `iq_sel.rs`), so those three are card-routed too.
     #[test]
     fn only_the_stacks_the_leg_runs_are_card_routed() {
-        for ty in [GgmlType::MXFP4, GgmlType::Q4_K, GgmlType::Q5_K] {
+        for ty in [
+            GgmlType::MXFP4,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::IQ2_XS,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ4_XS,
+        ] {
             assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");
         }
         for ty in [
             GgmlType::Q8_0,
-            GgmlType::IQ3_XXS,
-            GgmlType::IQ4_XS,
             GgmlType::IQ4_NL,
             GgmlType::Q2_K,
             GgmlType::Q3_K,

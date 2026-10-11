@@ -662,9 +662,14 @@ fn gate_up_sel(
     match entry {
         GateUpEntry::Q4k => kq.enqueue_gate_up_q4k(stream, a, sink, h),
         GateUpEntry::Q5k => kq.enqueue_gate_up_q5k(stream, a, sink, h),
-        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs | GateUpEntry::Mxfp4 => Err(
-            GpuError::state(WHAT, "a gate·up entry the plan admits for no stack here"),
-        ),
+        GateUpEntry::Q8_0
+        | GateUpEntry::Iq2xs
+        | GateUpEntry::Iq3xxs
+        | GateUpEntry::Iq4xs
+        | GateUpEntry::Mxfp4 => Err(GpuError::state(
+            WHAT,
+            "a gate·up entry the plan admits for no stack here",
+        )),
     }
 }
 
@@ -695,15 +700,18 @@ fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
         DownEntry::Q6k => DownArm::Q6k,
         // These read `Q8Blocks32` columns (the 32-value quantizer,
         // `enqueue_quantize_q8_sel`); the placed side's rows are `Q8Act`.
-        DownEntry::Q5_0
-        | DownEntry::Q5_1
-        | DownEntry::Q8_0
-        | DownEntry::Iq4nl
-        | DownEntry::Mxfp4 => {
+        DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => {
             return Err(refuse(format!(
                 "its entry {entry:?} reads {act:?} columns; the placed side quantizes its \
                  SwiGLU rows as {:?}",
                 DownAct::Q8Act
+            )));
+        }
+        // These read `Q8Act` columns (the i-quant downs of `iq_sel.rs`, MXFP4)
+        // and have no launch on the placed side.
+        DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq4xs | DownEntry::Mxfp4 => {
+            return Err(refuse(format!(
+                "its entry {entry:?} has no launch on the placed side"
             )));
         }
     };
@@ -1038,9 +1046,10 @@ mod tests {
     use super::{DownArm, down_arm};
     use gguf::quant::GgmlType;
 
-    /// The placed side launches the table's `Q8Act` downs, each at its own
-    /// entry, and refuses every other type by name: the `Q8Blocks32` entries
-    /// with the form they read, a type with no entry with that fact.
+    /// The placed side launches the table's K-quant `Q8Act` downs, each at its
+    /// own entry, and refuses every other type by name: the `Q8Blocks32`
+    /// entries with the form they read, the entries it has no launch for with
+    /// that fact, a type with no entry with that fact.
     #[test]
     fn the_placed_down_follows_the_tables_entry() {
         for (ty, arm) in [
@@ -1062,7 +1071,23 @@ mod tests {
                 "{ty}: {why:?}"
             );
         }
-        for ty in [GgmlType::Q3_K, GgmlType::IQ3_XXS, GgmlType::F16] {
+        // PIN(2026-10-11): the i-quant downs have table entries now
+        // (`iq_sel.rs`'s `Q8Act` downs), which the placed side has no launch
+        // for; they were in the no-entry list below.
+        for ty in [
+            GgmlType::IQ2_XS,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ4_XS,
+            GgmlType::MXFP4,
+        ] {
+            let why = down_arm(ty).err().map(|e| e.to_string());
+            assert!(
+                why.as_deref()
+                    .is_some_and(|w| w.contains("no launch on the placed side")),
+                "{ty}: {why:?}"
+            );
+        }
+        for ty in [GgmlType::Q3_K, GgmlType::F16] {
             let why = down_arm(ty).err().map(|e| e.to_string());
             assert!(
                 why.as_deref()
