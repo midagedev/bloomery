@@ -204,8 +204,8 @@
 //!   and after each wide prompt every layer's map of the wide arm is the
 //!   card copy's row followed by the shared expert's HOST entry
 //!   (`Placed::stale_maps`), on both runs; every call's logits row within
-//!   [`GREEDY_MARGIN`] of the off run's, the ids equal or parting at a near
-//!   tie. `c1` (green-only): the history twice gives the same ids and
+//!   [`FREE_BAND`] of the off run's (relative), the ids equal or parting at
+//!   a near tie ([`GREEDY_MARGIN`]). `c1` (green-only): the history twice gives the same ids and
 //!   logits bit for bit. `c7`: a residency reset brings every live set back
 //!   to its seed. FAIL-first, `flips`: the maps kept as the load built them
 //!   (`PlacedSide::refresh_maps` returning at once) reads the map line red
@@ -3320,6 +3320,19 @@ mod gate {
         Ok(a - b)
     }
 
+    /// How far a logits row `a` stands from `b`: ‖a − b‖ / ‖b‖ (f64 sums) and
+    /// the largest single |a − b|.
+    fn e_distance(a: &[f32], b: &[f32]) -> (f64, f32) {
+        let (mut d2, mut n2, mut top) = (0.0f64, 0.0f64, 0.0f32);
+        for (&x, &y) in a.iter().zip(b) {
+            let d = f64::from(x) - f64::from(y);
+            d2 += d * d;
+            n2 += f64::from(y) * f64::from(y);
+            top = top.max((x - y).abs());
+        }
+        ((d2 / n2).sqrt(), top)
+    }
+
     /// (e): the placed load under the residency machine (`open_placed_residency`
     /// at the `mid` word [`residency_clauses::mid_of`] gives the plan) against
     /// the same plan with it off, through the session's calls — the prompt is
@@ -3330,10 +3343,12 @@ mod gate {
     ///   before its second prompt, and after each wide prompt every layer's
     ///   map is the card copy's row followed by the shared expert's HOST
     ///   entry (`Placed::stale_maps`: none), on the residency run and the off
-    ///   run alike; every call's logits row within [`GREEDY_MARGIN`] of the
-    ///   off run's everywhere — the card and the host sum a token's experts in
-    ///   another split —, and the ids equal or, where they first part, the
-    ///   residency run's top-1 margin below it (a near tie). Mutant: the maps
+    ///   run alike; every call's logits row within [`FREE_BAND`] of the off
+    ///   run's, relative (‖Δ‖/‖off‖) — the card and the host sum a token's
+    ///   experts in another split with another 8-bit rule, the difference
+    ///   (o2)'s band bounds on a layer's output, taken here through the
+    ///   head —, and the ids equal or, where they first part, the residency
+    ///   run's top-1 margin below [`GREEDY_MARGIN`] (a near tie). Mutant: the maps
     ///   kept as the load built them (`PlacedSide::refresh_maps` returning at
     ///   once): the first prompt's maps still name the spare experts the
     ///   machine emptied at its start and the second's the experts the flips
@@ -3375,18 +3390,12 @@ mod gate {
             .rows
             .iter()
             .zip(&off_seen.rows)
-            .map(|(a, b)| {
-                a.iter()
-                    .zip(b)
-                    .map(|(x, y)| (x - y).abs())
-                    .fold(0.0f32, f32::max)
-            })
+            .map(|(a, b)| e_distance(a, b))
             .enumerate()
-            .fold(
-                (0usize, 0.0f32),
-                |w, (i, d)| if d > w.1 { (i, d) } else { w },
-            );
-        let rows_ok = first.rows.len() == off_seen.rows.len() && dlogit.1 < GREEDY_MARGIN;
+            .fold((0usize, 0.0f64, 0.0f32), |w, (i, (rel, abs))| {
+                if rel > w.1 { (i, rel, abs) } else { w }
+            });
+        let rows_ok = first.rows.len() == off_seen.rows.len() && dlogit.1 <= FREE_BAND;
         let parted = first
             .tokens
             .iter()
@@ -3401,14 +3410,15 @@ mod gate {
         println!(
             "flips: {} flips landed before the second prompt (above 0); wide maps off the card \
              copy's rows after the prompts: residency {:?} off {:?} (none); {} calls' logits \
-             within {GREEDY_MARGIN} of the off run's: worst {:.3e} at call {}; greedy ids part at \
-             {parted:?} (equal or a near tie: {near}): {}",
+             within {FREE_BAND} of the off run's, relative: worst {:.3e} at call {} (largest \
+             single logit {:.3e}); greedy ids part at {parted:?} (equal or a near tie: {near}): {}",
             first.landed,
             first.stale,
             off_seen.stale,
             first.rows.len(),
             dlogit.1,
             dlogit.0,
+            dlogit.2,
             verdict(flips)
         );
         // `c1`
