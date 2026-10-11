@@ -323,10 +323,13 @@ ticket_drop() {
   TICKET=
 }
 
+# The paced loader's `exit` line is written while the process still holds its locks (they go with the process, after the trap), so the
+# test takes it as an end only once the pid is gone (ack). GATE_TEST_LINGER=<s> (the self-test's paced loaders only) widens that gap.
 # on_exit: the EXIT trap of a V4.1 loader. In the self-test a paced loader (PACE) ends with one more line on its ack FIFO.
 on_exit() {
   ticket_drop
   [ -z "$PACE" ] || echo exit > "$PACE.ack"
+  [ -z "$PACE" ] || [ -z "${GATE_TEST_LINGER:-}" ] || sleep "$GATE_TEST_LINGER"
 }
 
 # pace: what a poll rests with: POLL seconds of sleep. A paced loader (the self-test's, PACE=<FIFO prefix>) writes `polled` to
@@ -701,6 +704,7 @@ PY
     rm -f "$t/pc$1.go" "$t/pc$1.ack"
     mkfifo "$t/pc$1.go" "$t/pc$1.ack"
     ENDED[$1]=0
+    LPID[$1]=
     eval "exec $g<> '$t/pc$1.go' $a<> '$t/pc$1.ack'"
   }
   pace_close() {
@@ -708,8 +712,12 @@ PY
     eval "exec $g>&- $a>&-"
   }
   # ack <k> <case>: ACK is loader k's next sign; 60 s is gate()'s own bound on a run, so a run that never signed was killed.
-  # A loader that has signed `exit` is gone: its next sign is `gone` at once, not a minute's wait for one that cannot come.
+  # A loader that has signed `exit` is gone: its next sign is `gone` at once, not a minute's wait for one that cannot come. The `exit`
+  # sign comes from the EXIT trap, before the process lets go of its locks (the V4.1 load lock, the card lock), so `exit` is taken as an end
+  # only once the run's pid is gone: a grant to the next loader right after it would find the lock still held, and that loader would
+  # poll instead of run (a sign short, then a grant it never gets, then gate()'s 60 s: rc 124).
   ack() {
+    local w=0
     ACK=
     if [ "${ENDED[$1]:-0}" = 1 ]; then
       ACK=gone
@@ -717,6 +725,13 @@ PY
     fi
     read -t 60 -r ACK <&"$((21 + 2 * $1))" || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $2: loader $1 gave no sign"; ACK=none; }
     [ "$ACK" != exit ] || ENDED[$1]=1
+    if [ "$ACK" = exit ] && [ -n "${LPID[$1]:-}" ]; then
+      while kill -0 "${LPID[$1]}" 2> /dev/null; do
+        w=$((w + 1))
+        [ "$w" -lt 1200 ] || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $2: loader $1 signed exit and was still there after 60 s"; break; }
+        sleep 0.05
+      done
+    fi
   }
   # grant <k> <case>: lets loader k poll once and takes its sign.
   grant() {
@@ -732,6 +747,7 @@ PY
     gate "$t/q$k" "$c" "$t/lease" BLOOMERY_GATE_V41_LOAD=1 BLOOMERY_V41_CLASS="$cl" GATE_TEST_PACE="$t/pc$k" GATE_TEST_CAP="$cap" \
       STUB_ORDER="$t/order" STUB_ID="$id" "$@" 2> /dev/null &
     PG=$!
+    LPID[$k]=$PG
   }
   # markers: the stub's markers in the order it wrote them, on one line.
   markers() { printf 'markers: %s\n' "$(tr '\n' ' ' < "$t/order" 2> /dev/null)"; }
@@ -805,6 +821,37 @@ PY
   echo "signs: $s1 $s2 $s3" > "$t/out"
   markers >> "$t/out"
   judge_all 'queue class: a class-1 loader arriving after a class-2 one is served first' "$rc" 0 'signs: polled exit exit$' 'markers: Y X $'
+  pace_close 0; pace_close 1
+  # The exit sign is the trap's, written before the process lets go of its locks: loader A lingers 2 s in its trap after signing, holding the
+  # V4.1 load lock, and B is granted its poll the moment A's sign is taken. B must find the lock free (ack waits for A to be gone), run, and
+  # sign exit: a short sign here is the CI's 'queue order' / 'queue class' rc 124. Drain grants keep a failing run from waiting out the bound.
+  qreset
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  pgate 0 A 2 any GATE_TEST_LINGER=2
+  p1=$PG
+  ack 0 'exit sign'
+  pgate 1 B 2 any
+  p2=$PG
+  ack 1 'exit sign'
+  flock -u 6
+  exec 6>&-
+  grant 0 'exit sign'
+  s1=$ACK
+  grant 1 'exit sign'
+  s2=$ACK
+  for r1 in 1 2 3 4 5 6; do
+    case $s2 in *polled) ;; *) break ;; esac
+    sleep 0.5
+    grant 1 'exit sign'
+    s2="$s2 $ACK"
+  done
+  rc=0
+  wait "$p1" || rc=$?
+  wait "$p2" || rc=$?
+  echo "signs: $s1 $s2" > "$t/out"
+  markers >> "$t/out"
+  judge_all 'exit sign: a loader granted right after another signed exit finds the lock free and runs' "$rc" 0 'signs: exit exit$' 'markers: A B $'
   pace_close 0; pace_close 1
   # Dead tickets block nobody: a loader killed outright leaves its ticket (no trap ran), and a ticket whose pid lives on with another start
   # time (a reused pid) is a dead one too. A loader arriving behind both removes them on its first poll, says so, and is the head.
