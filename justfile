@@ -2156,9 +2156,11 @@ gate-gpu-qwen3vl-tower:
 # accumulation-order bound, the merger's convolution against a host convolution of the file's weight, attention inside its f32
 # bound, the clamped SwiGLU at pinned counts and the erf GELU inside its libm bound, on sweeps and in the chain). Also the card bytes (weights
 # 1,128,026,112 B, scratch 2,016,768,000 B at 8000 tokens), 273 launches an image, and reuse after the largest image bit for bit.
-# The fixture tier is the only tier with sets: the real tier ends by name with 0 clauses run, never green on nothing.
+# Fixture-only (tools/ref/fixture-only.sh): no real GLM-5.3-Flash vision encoder file or real-tier set exists yet, so a real-tier batch
+# defers the recipe by name; run by hand on the real tier, the bin ends by name with 0 clauses run, never green on nothing. Drop the
+# call when a real-tier set exists.
 gate-gpu-glm5v-tower:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_glm5v_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5v_tower'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5v-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_glm5v_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5v_tower'
 
 # V4-Flash 인벤토리 게이트: deepseek41 모듈이 V4-Flash 파일(deepseek4)에서 읽은 모델 값·층 종류(비율 4는 자기 인덱스 키로
 # top-k, 비율 128은 전 행, 0–2층 해시 라우팅), 텐서 수·역할별·타입별 바이트, 설계 §5 (a)·(b)·게이트 배치의 카드·호스트 줄과
@@ -2244,10 +2246,11 @@ gate-gpu-glm5next-stagger:
 # gate_glm5next_e2e (`--only media`, `shared/glm5next_media.rs`): the fixture's prompts c1-c3 fed mainline's own tower
 # rows of the image-input sets (`fx_ref_glm5next_vis_*`, `just dump-ref-glmv`), the last position's `result_norm` held
 # within the CPU twin's distance of the CUDA run and nearer it than the text-only control, and the media refusals by
-# name with the model unmoved. Fixture tier only: on the real tier the bin fails by name before any load (0 clauses). Loads the fixture
-# once, on either card.
+# name with the model unmoved. Fixture-only (tools/ref/fixture-only.sh): no real GLM-5.3-Flash vision encoder file or real-tier set
+# exists yet, so a real-tier batch defers the recipe by name; run by hand on the real tier, the bin fails by name before any load (0
+# clauses). Drop the call when a real-tier set exists. Loads the fixture once, on either card.
 gate-gpu-glm5next-media:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-glm5next --release --lib && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5next-media && bash tools/gate.sh --oxide -p bloomery-gpu-glm5next --release --lib && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media'
 
 # The same gate's long step sets (`--only main --step-sets long`): the load at CTX and its clauses, with the 1,024-position
 # set and the 3,070-position `--dsa` set, the only comparisons with ik past 4 positions and the only end-to-end run past
