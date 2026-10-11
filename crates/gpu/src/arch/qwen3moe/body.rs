@@ -44,8 +44,8 @@ use model::arch::Arch;
 use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names::{self, token_embd};
-use model::placement::Plan;
 use model::placement::kernels::{self, SiteEntry};
+use model::placement::{Plan, WholeLoad};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
@@ -285,10 +285,21 @@ pub(super) fn stack_tys(
         stack(up, n * ff, h)?,
         stack(down, n * h, ff)?,
     ];
-    let at = |e: GpuError| GpuError::shape(what, format!("layer {l}: {e}"));
-    gate_up_entry(tys[0], tys[1], what).map_err(at)?;
-    down_entry(tys[2], what).map_err(at)?;
+    stack_entries(tys, l)?;
     Ok(tys)
+}
+
+/// The card kernel table's entries of layer `l`'s routed stacks `tys`
+/// ([`gate_up_entry`], [`down_entry`]), refused by name with the layer: the
+/// one routed-type verdict, run by the load ([`stack_tys`]) on the resident
+/// weights and by the whole-fit check ([`GpuModel::<Body>::whole_load`]) on
+/// the file's header, so a type the load refuses never fits the plan.
+fn stack_entries([gate, up, down]: [SiteTy; 3], l: usize) -> Result<(), GpuError> {
+    let what = "qwen3moe::Body::load";
+    let at = |e: GpuError| GpuError::shape(what, format!("layer {l}: {e}"));
+    gate_up_entry(gate, up, what).map_err(at)?;
+    down_entry(down, what).map_err(at)?;
+    Ok(())
 }
 
 /// The launch family of the table's dense entry `entry`: `site.rs`'s name
@@ -678,6 +689,30 @@ impl GpuModel<Body> {
             ctx,
         );
         placed_bytes(&dims, hp.n_layer)
+    }
+
+    /// What a whole load of `file` ([`GpuModel::open`]) holds past its
+    /// weights, stores and step arenas: `WholeLoad::Unchecked` — the body
+    /// allocates its ubatch arena with no fit check, and the arena's bytes
+    /// have no formula outside the allocation, so the card keeps the expert
+    /// rule's margin past the step arenas in its place, as the placed
+    /// machine does. Past the load's own per-layer routed-type check
+    /// ([`stack_entries`] on the stacks' header types): a file the load
+    /// refuses is refused here by the same name.
+    pub fn whole_load(file: &Split) -> Result<WholeLoad, GpuError> {
+        const WHAT: &str = "qwen3moe::Body::load";
+        let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let (h, ff, e) = (hp.n_embd, hp.experts.ff, hp.experts.n_expert);
+        let site = |name: String, shape| site::file_site(file, WHAT, &name, shape, SiteTy::ALL);
+        for l in 0..hp.n_layer {
+            let tys = [
+                site(names::ffn_gate_exps(l), (e * ff, h))?,
+                site(names::ffn_up_exps(l), (e * ff, h))?,
+                site(names::ffn_down_exps(l), (e * h, ff))?,
+            ];
+            stack_entries(tys, l)?;
+        }
+        Ok(WholeLoad::Unchecked)
     }
 
     /// `ctx` cache rows, the ubatch size this process's lever names

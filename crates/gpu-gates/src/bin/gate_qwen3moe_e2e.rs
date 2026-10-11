@@ -166,6 +166,15 @@
 //!   `cuDeviceTotalMem`'s figure) plans where the refusal is expected and
 //!   answers `Whole` where the placed decision is — every arm red.
 //!
+//! - (w) a file the whole load refuses, `--refused-only` (nothing loaded): a
+//!   crafted two-layer header whose every routed stack is Q8_0, a type the
+//!   card kernel table names no gate·up entry for. The whole-fit path's own
+//!   read (`Qwen3moeModel::whole_load`) refuses it with the load's text, and
+//!   the `--place`-unset decision does not take the whole load (the verdict
+//!   line names the refusal; the placed plan follows). FAIL-first: the check
+//!   gone from the whole-load read, the file fits and the decision is
+//!   `Whole` — every arm red.
+//!
 //! - (n) two resident slots (`add_slots`) on the slot harness (`slots_gate`,
 //!   through this gate's [`SlotsQ3`]): prompts A and B — two distinct windows
 //!   of the prose, [`N_IDS`] ids each, the pass path — [`GEN_W`] greedy steps
@@ -306,6 +315,7 @@ mod gate {
     };
     use bloomery_levers::HostCfg;
     use cuda_core::sys;
+    use gguf::quant::GgmlType;
     use model::arch::Arch;
     use model::arch::qwen3moe::hparams::Hparams;
     use model::placement::PlanLevers;
@@ -532,6 +542,14 @@ mod gate {
             }
             return Ok(());
         }
+        if args.iter().any(|a| a == "--refused-only") {
+            let ok = refused_whole()?;
+            println!("gate_qwen3moe_e2e --refused-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--ubatch-only") {
             let ok = ubatch_sizes()?;
             println!("gate_qwen3moe_e2e --ubatch-only: {}", verdict(ok));
@@ -594,6 +612,7 @@ mod gate {
             return Ok(());
         }
         let mut ok = true;
+        ok &= refused_whole()?;
         ok &= structure(&mut m, NODES_FILE)?;
         let mut s = Session::from_model(m, u32::try_from(CTX)?);
         ok &= clear(&mut s)?;
@@ -1208,6 +1227,168 @@ mod gate {
         );
         ok &= whole;
         Ok(ok)
+    }
+
+    // ------------------------------------------------ (w) the refused whole
+
+    /// The load's refusal text of a Q8_0 gate·up, as [`Qwen3moeModel::open`]
+    /// names it on the resident weights ([`stack_tys`]'s entries: the layer
+    /// wrap around the entry's own `what`-tagged error).
+    const REFUSED_TEXT: &str = "qwen3moe::Body::load: layer 0: qwen3moe::Body::load: a Q8_0 \
+                                gate·up, which the card kernel table names no entry for here";
+
+    /// (w) (module doc): the whole-fit path refuses a file the load refuses,
+    /// with the load's own text, and the `--place`-unset decision does not
+    /// take the whole load.
+    fn refused_whole() -> Result<bool, GateError> {
+        let path = q8_routed_header()?;
+        let split = gguf::Split::open(&path)?;
+        let Err(err) = Qwen3moeModel::whole_load(&split) else {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!(
+                "the whole load read a file whose routed stacks the load refuses: {}",
+                path.display()
+            )
+            .into());
+        };
+        let text = err.to_string();
+        let read = text == REFUSED_TEXT;
+        println!("refused whole: the load's text {read} {text}");
+        // The decision the CLI prints its whole-fit line for: a refused load
+        // never takes the whole card, so the placed plan follows.
+        let placed = !matches!(
+            q3place::unplaced_qwen3(&split, CTX, KvQ8::F16)?,
+            q3place::Unplaced::Whole(_)
+        );
+        println!(
+            "refused whole: placed decision {placed} {}",
+            verdict(placed)
+        );
+        let _ = std::fs::remove_file(&path);
+        Ok(read && placed)
+    }
+
+    /// A qwen3moe header whose every layer's routed stacks are Q8_0, written
+    /// to a fresh temp directory and opened by the whole-fit path's own
+    /// header reads: two layers of the chain's smallest whole super-block
+    /// widths (hidden 256, expert width 256), the flash's head 128 at group
+    /// 8 (one key head of the eight query heads), the router's own shape of
+    /// 128 experts of eight used as an F32 router weight, and every other
+    /// tensor of the same names a Q4_K or F32 one of its chain shape, so
+    /// nothing but the routed type refuses.
+    fn q8_routed_header() -> Result<PathBuf, GateError> {
+        const LAYERS: usize = 2;
+        let (q4_k, q8_0, f32_id) = (
+            GgmlType::Q4_K.as_u32(),
+            GgmlType::Q8_0.as_u32(),
+            GgmlType::F32.as_u32(),
+        );
+        let kvs = vec![
+            (
+                gguf::GENERAL_ARCHITECTURE.to_owned(),
+                gguf::Value::String("qwen3moe".to_owned()),
+            ),
+            (
+                "qwen3moe.block_count".to_owned(),
+                gguf::Value::U32(LAYERS as u32),
+            ),
+            (
+                "qwen3moe.embedding_length".to_owned(),
+                gguf::Value::U32(256),
+            ),
+            (
+                "qwen3moe.attention.head_count".to_owned(),
+                gguf::Value::U32(8),
+            ),
+            (
+                "qwen3moe.attention.head_count_kv".to_owned(),
+                gguf::Value::U32(1),
+            ),
+            (
+                "qwen3moe.attention.key_length".to_owned(),
+                gguf::Value::U32(128),
+            ),
+            (
+                "qwen3moe.attention.value_length".to_owned(),
+                gguf::Value::U32(128),
+            ),
+            (
+                "qwen3moe.attention.layer_norm_rms_epsilon".to_owned(),
+                gguf::Value::F32(1e-6),
+            ),
+            (
+                "qwen3moe.rope.freq_base".to_owned(),
+                gguf::Value::F32(1_000_000.0),
+            ),
+            ("qwen3moe.context_length".to_owned(), gguf::Value::U32(4096)),
+            ("qwen3moe.expert_count".to_owned(), gguf::Value::U32(128)),
+            ("qwen3moe.expert_used_count".to_owned(), gguf::Value::U32(8)),
+            (
+                "qwen3moe.expert_feed_forward_length".to_owned(),
+                gguf::Value::U32(256),
+            ),
+            ("qwen3moe.vocab_size".to_owned(), gguf::Value::U32(16)),
+        ];
+        let tensor =
+            |name: &str, dims: &[u64], ty: u32| -> Result<gguf::write::TensorDecl, GateError> {
+                let (_, blck, tsz) = gguf::ggml_type_info(ty)
+                    .ok_or_else(|| format!("tensor {name}: ggml type {ty} has no block info"))?;
+                let bytes = dims[1..]
+                    .iter()
+                    .try_fold(tsz * (dims[0] / blck), |acc, d| acc.checked_mul(*d))
+                    .ok_or_else(|| format!("tensor {name}: its bytes overflow u64"))?;
+                Ok(gguf::write::TensorDecl {
+                    name: name.to_owned(),
+                    dims: dims.to_vec(),
+                    type_id: ty,
+                    nbytes: bytes,
+                })
+            };
+        let exps = |l: usize, part: &str| format!("blk.{l}.ffn_{part}_exps.weight");
+        let mut tensors = vec![
+            tensor("token_embd.weight", &[256, 16], q4_k)?,
+            tensor("output_norm.weight", &[256, 1], f32_id)?,
+            tensor("output.weight", &[256, 16], q4_k)?,
+        ];
+        for l in 0..LAYERS {
+            let per_layer = [
+                (format!("blk.{l}.attn_norm.weight"), vec![256, 1], f32_id),
+                (format!("blk.{l}.attn_q.weight"), vec![256, 1024], q4_k),
+                (format!("blk.{l}.attn_k.weight"), vec![256, 128], q4_k),
+                (format!("blk.{l}.attn_v.weight"), vec![256, 128], q4_k),
+                (format!("blk.{l}.attn_q_norm.weight"), vec![128, 1], f32_id),
+                (format!("blk.{l}.attn_k_norm.weight"), vec![128, 1], f32_id),
+                (format!("blk.{l}.attn_output.weight"), vec![1024, 256], q4_k),
+                (format!("blk.{l}.ffn_norm.weight"), vec![256, 1], f32_id),
+                (
+                    format!("blk.{l}.ffn_gate_inp.weight"),
+                    vec![256, 128],
+                    f32_id,
+                ),
+                (exps(l, "gate"), vec![256, 32768], q8_0),
+                (exps(l, "up"), vec![256, 32768], q8_0),
+                (exps(l, "down"), vec![256, 32768], q8_0),
+            ];
+            for (name, dims, ty) in per_layer {
+                tensors.push(tensor(&name, &dims, ty)?);
+            }
+        }
+        let layout = gguf::write::Layout::new(&kvs, tensors.clone()).map_err(|e| e.to_string())?;
+        let dir =
+            std::env::temp_dir().join(format!("bloomery-qw2p-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("q8-routed.gguf");
+        let file = std::fs::File::create(&path)?;
+        let mut w = gguf::write::Writer::new(file, layout).map_err(|e| e.to_string())?;
+        for t in &tensors {
+            w.tensor(
+                &t.name,
+                &vec![0u8; usize::try_from(t.nbytes).expect("a tensor's bytes")],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        w.finish().map_err(|e| e.to_string())?;
+        Ok(path)
     }
 
     // -------------------------------------------------- (o) the placed load

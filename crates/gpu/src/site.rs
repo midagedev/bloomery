@@ -76,6 +76,16 @@ pub enum Order {
 }
 
 impl SiteTy {
+    /// Every family, the range of [`SiteTy::of_ggml`].
+    pub const ALL: &'static [SiteTy] = &[
+        SiteTy::Q3K,
+        SiteTy::Q4K,
+        SiteTy::Q5K,
+        SiteTy::Q6K,
+        SiteTy::Q8_0,
+        SiteTy::F32,
+    ];
+
     /// The family of a file tensor of type `ty`; `None` for a type no launch
     /// here reads.
     #[must_use]

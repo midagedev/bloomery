@@ -542,11 +542,15 @@ fn inputs_model(inputs: &Inputs) -> &ModelTensors {
     }
 }
 
-/// The qwen3moe body's whole load. It allocates its ubatch arena with no
-/// fit check, and the arena's bytes have no formula outside the
-/// allocation, so the card keeps the expert rule's margin past the step
+/// A qwen3moe file's whole load (`Qwen3moeModel::whole_load`): the load's
+/// own per-layer routed-type check, read from the file's header, its refusal
+/// by name; past it `WholeLoad::Unchecked` — the body allocates its ubatch
+/// arena with no fit check, and the arena's bytes have no formula outside
+/// the allocation, so the card keeps the expert rule's margin past the step
 /// arenas in its place, as the placed machine does.
-const QWEN3_WHOLE: WholeLoad = WholeLoad::Unchecked;
+fn qwen3_whole(file: &Split) -> Result<WholeLoad, String> {
+    Qwen3moeModel::whole_load(file).map_err(|e| e.to_string())
+}
 
 /// A qwen35moe file's whole load under `o`: its ubatch arena at `o.ubatch`
 /// and the reserve its fit check keeps free past it
@@ -672,7 +676,7 @@ pub fn unplaced_qwen3(file: &Split, ctx: usize, kv: KvQ8) -> Result<Unplaced, Ga
 /// census reading, on `a`'s card ([`PlaceQ3::unplaced_on`]): the whole
 /// model there (`Whole` — no plan, no record) while the whole-fit verdict at
 /// `ctx` for `slots` resident sequences takes it ([`whole_on`]: the qwen3moe
-/// body's whole load, [`QWEN3_WHOLE`], the cache [`kv_bytes`] counts at the
+/// body's whole load ([`qwen3_whole`]), the cache [`kv_bytes`] counts at the
 /// slots' shares); else the placed plan there (`Placed`). The verdict's line
 /// goes to stderr; a file with no routed experts the verdict does not take
 /// is refused by name.
@@ -688,7 +692,7 @@ pub fn unplaced_qwen3_slots(
 ) -> Result<Unplaced, GateError> {
     let census = census()?;
     let probe = PlaceQ3::qwen3_on(file, PlaceQ3::unplaced_on(&census)?, &census, ctx, kv)?;
-    let whole = probe.whole_at(u64::try_from(ctx)?, slots, Ok(QWEN3_WHOLE))?;
+    let whole = probe.whole_at(u64::try_from(ctx)?, slots, qwen3_whole(file))?;
     probe.unplaced(ctx, &whole)
 }
 
@@ -719,7 +723,7 @@ pub fn whole_ctx_qwen3(
     let fits = |ctx: usize| {
         probed();
         Ok(probe
-            .whole_at(u64::try_from(ctx)?, slots, Ok(QWEN3_WHOLE))?
+            .whole_at(u64::try_from(ctx)?, slots, qwen3_whole(file))?
             .fits())
     };
     placement::ctx::searched::<GateError>(trained_ctx(file), floor, CTX_GRAN, &fits)
@@ -782,7 +786,7 @@ pub fn placed_ctx_qwen3(
     let experts = |ctx: usize| {
         probed();
         let machine = probe.machine_at(Qwen3moeModel::placed_arena_bytes(file, ctx)?)?;
-        probe.card_experts(&machine, ctx, levers, slots, || Ok(QWEN3_WHOLE))
+        probe.card_experts(&machine, ctx, levers, slots, || qwen3_whole(file))
     };
     placement::ctx::searched_placed::<GateError>(trained_ctx(file), floor, CTX_GRAN, &experts)
 }
