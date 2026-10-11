@@ -666,7 +666,9 @@ pub(super) fn delta_out(
 /// expert's gate, up, SwiGLU and down on the unit's one-expert table at
 /// their own types, and adds it in the host-sum combine (`hostleg`):
 /// `((routed + 0) + resid) + σ · shared`, the host's routed sum zero on a
-/// whole-card load. Qwen3's plain router takes its wide rows through
+/// whole-card load. That arm is three parts ([`ffn_front`], [`ffn_card`],
+/// [`ffn_combine`]) with the slots' card list between the first two
+/// ([`card_list`]). Qwen3's plain router takes its wide rows through
 /// `ubatch.rs` and is refused here by name.
 pub(super) fn ffn(
     c: &Ctx<'_>,
@@ -675,6 +677,19 @@ pub(super) fn ffn(
     m: usize,
     out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
+    ffn_front(c, n, s, m)?;
+    if n.apart().is_none() {
+        return ffn_joined(c, n, s, m, out);
+    }
+    card_list(c, s, m)?;
+    ffn_card(c, n, s, m)?;
+    ffn_combine(c, n, s, m, out)
+}
+
+/// The FFN's front at `m` rows ([`ffn`]): `ffn_inp` RMS-normed into `normed`,
+/// its forms every site of the layer reads, and the router over the normed
+/// rows (ids and weights in the arena's route).
+pub(super) fn ffn_front(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     const WHAT_FFN: &str = "qwen3moe::wide::ffn";
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
@@ -702,12 +717,9 @@ pub(super) fn ffn(
         ));
     }
     let Arena {
-        x,
         normed,
         ffn_inp,
         route,
-        h,
-        down,
         wide,
         ..
     } = s;
@@ -729,15 +741,6 @@ pub(super) fn ffn(
         sh.map_or(n.up_ty, |a| a.up_ty),
     ];
     wd.act_hid.quantize(c, normed, m, &hid_tys)?;
-    let Wide {
-        act_hid,
-        act_h,
-        up,
-        dense,
-        moe,
-        apart,
-        ..
-    } = wd;
     if let FfnRoute::Router { gate_inp, .. } = &n.route {
         k.q35(WHAT_FFN)?.router.enqueue_ubatch(
             stream,
@@ -748,69 +751,157 @@ pub(super) fn ffn(
             route.gated(WHAT_FFN)?,
         )?;
     }
+    Ok(())
+}
+
+/// The rest of [`ffn`] for a layer whose shared expert is folded into the
+/// stacks (or a dense FFN) after [`ffn_front`]: the slots through the
+/// layer's one table and the combine of their rows.
+fn ffn_joined(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    s: &mut Arena,
+    m: usize,
+    out: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    const WHAT_FFN: &str = "qwen3moe::wide::ffn";
+    let (gpu, k) = (c.gpu, c.k);
+    let stream = gpu.stream();
+    let d = s.dims;
+    let slots = d.slots();
+    let Arena {
+        x,
+        normed,
+        ffn_inp,
+        route,
+        h,
+        down,
+        wide,
+        ..
+    } = s;
+    let wd = wide_of(wide, WHAT_FFN)?;
+    let Wide {
+        act_hid,
+        act_h,
+        up,
+        dense,
+        moe,
+        ..
+    } = wd;
     let hid = act_hid.input(normed);
     let rows = (act_h, &mut *h, &mut *up, &mut *down);
     let y = match out {
         Some(y) => y,
         None => x,
     };
-    let Some(sh) = sh else {
-        let table = match &n.route {
-            FfnRoute::Router { .. } => {
-                let moe = moe.as_mut().ok_or(GpuError::state(
-                    WHAT_FFN,
-                    "the wide part's expert table (a routed chain's)",
-                ))?;
-                k.gemm
-                    .enqueue_route(stream, route.ids(), m * slots, moe, c.sink)?;
-                (&*moe, GemmInput::Shared { top_k: slots })
-            }
-            FfnRoute::Dense => (&*dense, GemmInput::PerSlot),
-        };
-        slots_gemm(c, n, &d, table, &hid, rows, m)?;
-        return k.experts.enqueue_combine_tokens(
-            stream,
-            CombineArgs {
-                down,
-                w: route.weights(),
-                resid: ffn_inp,
-                rows: d.hidden,
-                n_slots: slots,
-                m,
-                y,
-            },
-        );
+    let table = match &n.route {
+        FfnRoute::Router { .. } => {
+            let moe = moe.as_mut().ok_or(GpuError::state(
+                WHAT_FFN,
+                "the wide part's expert table (a routed chain's)",
+            ))?;
+            k.gemm
+                .enqueue_route(stream, route.ids(), m * slots, moe, c.sink)?;
+            (&*moe, GemmInput::Shared { top_k: slots })
+        }
+        FfnRoute::Dense => (&*dense, GemmInput::PerSlot),
     };
+    slots_gemm(c, n, &d, table, &hid, rows, m)?;
+    k.experts.enqueue_combine_tokens(
+        stream,
+        CombineArgs {
+            down,
+            w: route.weights(),
+            resid: ffn_inp,
+            rows: d.hidden,
+            n_slots: slots,
+            m,
+            y,
+        },
+    )
+}
+
+/// The slots' card list the combine reads ([`ffn`]'s apart arm) for the
+/// routed ids of `m` rows: the shared slot's id, the routed count, is
+/// [`HOST`].
+pub(super) fn card_list(c: &Ctx<'_>, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+    const WHAT_C: &str = "qwen3moe::wide::card_list";
+    let d = s.dims;
+    let n_routed = d.routed(WHAT_C)?.experts();
+    let Arena { route, wide, .. } = s;
+    let wd = wide_of(wide, WHAT_C)?;
+    let apart = wd.apart.as_mut().ok_or(GpuError::state(
+        WHAT_C,
+        "the wide part's buffers of a shared expert kept apart",
+    ))?;
+    c.gpu.elem().enqueue_card_sel(
+        c.gpu.stream(),
+        route.ids(),
+        m * d.slots(),
+        n_routed,
+        n_routed + 1,
+        c.sink,
+        &mut apart.sel,
+    )
+}
+
+/// The card's part of the apart arm of [`ffn`] over `m` rows, after
+/// [`ffn_front`] and [`card_list`]: the routed table over the file's routed
+/// stacks, the routed slots' gate, up, SwiGLU and down into `down`, and the
+/// shared expert's gate, up, SwiGLU and down on the unit's one-expert table
+/// into its own output.
+pub(super) fn ffn_card(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+    const WHAT_FFN: &str = "qwen3moe::wide::ffn_card";
+    let (gpu, k) = (c.gpu, c.k);
+    let stream = gpu.stream();
+    let d = s.dims;
+    let slots = d.slots();
+    let sh = n.apart().ok_or(GpuError::state(
+        WHAT_FFN,
+        "a shared expert kept apart (the plan folds it into the stacks)",
+    ))?;
+    let Arena {
+        normed,
+        route,
+        h,
+        down,
+        wide,
+        ..
+    } = s;
+    let wd = wide_of(wide, WHAT_FFN)?;
+    let Wide {
+        act_hid,
+        act_h,
+        up,
+        dense,
+        apart,
+        ..
+    } = wd;
+    let hid = act_hid.input(normed);
+    let rows = (act_h, &mut *h, &mut *up, &mut *down);
     let WideApart {
         map,
         moe: routed,
-        sel,
         g,
         u,
         h: sh_h,
         act_h: sh_act,
         y: sh_y,
-        zero,
+        ..
     } = apart.as_mut().ok_or(GpuError::state(
         WHAT_FFN,
         "the wide part's buffers of a shared expert kept apart",
     ))?;
-    let q35 = k.q35(WHAT_FFN)?;
-    let n_routed = d.routed(WHAT_FFN)?.experts();
-    // The slots' card list the combine reads (the shared slot's id, the
-    // routed count, is HOST), and the routed table over the file's routed
-    // stacks, which lists no shared slot.
-    gpu.elem().enqueue_card_sel(
+    // The routed table over the file's routed stacks, which lists no shared
+    // slot.
+    k.q35(WHAT_FFN)?.g32.enqueue_route_remap(
         stream,
         route.ids(),
+        map,
         m * slots,
-        n_routed,
-        n_routed + 1,
+        routed,
         c.sink,
-        sel,
     )?;
-    q35.g32
-        .enqueue_route_remap(stream, route.ids(), map, m * slots, routed, c.sink)?;
     let table = (&*routed, GemmInput::Shared { top_k: slots });
     slots_gemm(c, n, &d, table, &hid, rows, m)?;
     let one = (&*dense, GemmInput::PerSlot);
@@ -825,11 +916,51 @@ pub(super) fn ffn(
         one,
         m,
         sh_y,
-    )?;
-    // Every routed slot is the card's on a whole-card load, so the host's
-    // routed sum the combine adds is the zero rows.
-    q35.ffn.leg.enqueue_combine(
-        stream,
+    )
+}
+
+/// The combine of the apart arm of [`ffn`] over `m` rows, after
+/// [`ffn_card`], into `out` (`None`: into `x`): the card's slots, the host's
+/// routed sum, the residual and the shared expert. Every routed slot is the
+/// card's on a whole-card load, so the host's routed sum is the zero rows.
+pub(super) fn ffn_combine(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    s: &mut Arena,
+    m: usize,
+    out: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    const WHAT_FFN: &str = "qwen3moe::wide::ffn_combine";
+    let d = s.dims;
+    let used = d.router.map_or(0, |r| r.used());
+    let n_routed = d.routed(WHAT_FFN)?.experts();
+    if n.apart().is_none() {
+        return Err(GpuError::state(
+            WHAT_FFN,
+            "a shared expert kept apart (the plan folds it into the stacks)",
+        ));
+    }
+    let Arena {
+        x,
+        ffn_inp,
+        route,
+        down,
+        wide,
+        ..
+    } = s;
+    let wd = wide_of(wide, WHAT_FFN)?;
+    let WideApart {
+        sel, y: sh_y, zero, ..
+    } = wd.apart.as_mut().ok_or(GpuError::state(
+        WHAT_FFN,
+        "the wide part's buffers of a shared expert kept apart",
+    ))?;
+    let y = match out {
+        Some(y) => y,
+        None => x,
+    };
+    c.k.q35(WHAT_FFN)?.ffn.leg.enqueue_combine(
+        c.gpu.stream(),
         HostCombineArgs {
             down,
             w: route.weights(),
@@ -838,7 +969,7 @@ pub(super) fn ffn(
             resid: ffn_inp,
             shared: Some((sh_y, used)),
             rows: d.hidden,
-            pitch: slots,
+            pitch: d.slots(),
             n_card: n_routed,
             m,
             fault: c.sink,
