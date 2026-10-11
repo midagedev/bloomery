@@ -12,7 +12,7 @@
 //!    that tap: the reference's own CPU-twin distance from its CUDA run, the distance of the
 //!    reference rounded to bf16 from itself (the floor of any bf16 tower), and, for a free-running
 //!    tap, the network's sensitivity — our own encode against our encode with the last bit of one
-//!    patch value in [`NOISE_EVERY`] flipped.
+//!    patch value in sixteen flipped.
 //! 2. Teacher-forced steps where the set holds a step's input: block 0 from `inp_pos_emb`, block 1
 //!    from `layer_out-0`, the final norm and merger from `layer_out-26`, the merger from
 //!    `norm_b-27`; the band is [`K_TAP`] times the larger of the rounding floor and the step's own
@@ -52,14 +52,20 @@ fn main() -> std::process::ExitCode {
 mod vision_rules;
 
 #[cfg(feature = "vision")]
+#[path = "shared/vision_taps.rs"]
+mod vision_taps;
+
+#[cfg(feature = "vision")]
 mod gate {
     use std::collections::{HashMap, HashSet};
-    use std::path::Path;
 
     use super::vision_rules::{Count, exact_check, gemm_check, near_check, par_rows};
+    use super::vision_taps::{
+        Collect, HostFile, band_check, dist, dist_f32, eager_twice, floor, ggml_table, nudge,
+        nudged, read_image, reuse_after_largest, sens as sensitivity, to_bf16, to_f32,
+    };
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_vision::attn::{QkvLayout, attn_72_ref, attn_bound};
-    use bloomery_gpu_vision::chain::TapSink;
     use bloomery_gpu_vision::gelu_tanh::{GeluTanhKernels, gelu_tanh_ref};
     use bloomery_gpu_vision::gemm_bf16::{Epilogue, epilogue_ref, within_order};
     use bloomery_gpu_vision::layer_norm::layer_norm_ref;
@@ -71,8 +77,8 @@ mod gate {
     use gguf::Gguf;
     use refset::arch::qwen35::clefvis::{TAPS, TAPS_CPU_SET, TAPS_SET};
     use refset::clefvis::{ClefvisSet, MMPROJ_BF16, N_EMBD, TapScope};
+    use vision::Patches;
     use vision::arch::qwen3vl::{Hparams, TokenLimits, preprocess};
-    use vision::{Patches, Rgb8};
 
     const NAME: &str = "gate_qwen3vl_tower";
     /// The set's image whose block 0 and merger the op rules run on: the smallest square grid.
@@ -91,9 +97,6 @@ mod gate {
     /// prediction is a block output at about 1.6× the rounding floor, so 4 leaves room for a
     /// free-running network's amplification without admitting an order-one defect.
     const K_TAP: f64 = 4.0;
-    /// The sensitivity run flips the last bit of every `NOISE_EVERY`-th patch value (a 1-ulp noise
-    /// of the order of rounding the patches to bf16).
-    const NOISE_EVERY: usize = 16;
     /// Values of the tanh GELU sweep of [−8, 8] that may differ from the host rule, each by one
     /// bf16 step at most: the device's `tanhf` against the host's.
     /// PIN(2026-10-10): the first measurement of this build; see the sweep line.
@@ -102,100 +105,7 @@ mod gate {
     /// PIN(2026-10-10): the first measurement of this build; see the rule lines.
     const GELU_ROWS_PIN: usize = 0;
 
-    // ------------------------------------------------------------ distances
-
-    #[derive(Clone, Copy)]
-    struct Dist {
-        max_rel: f64,
-        rms_rel: f64,
-    }
-
-    /// `ours` (bf16 bits) against `refv` (f32): `max|Δ| / max|ref|` and `rms(Δ) / rms(ref)`.
-    fn dist(ours: &[u16], refv: &[f32]) -> Dist {
-        dist_f32(&ours.iter().map(|&b| bf16_f32(b)).collect::<Vec<_>>(), refv)
-    }
-
-    fn dist_f32(ours: &[f32], refv: &[f32]) -> Dist {
-        let (mut max_d, mut max_r, mut sd, mut sr) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        for (&a, &b) in ours.iter().zip(refv) {
-            let (x, y) = (f64::from(a), f64::from(b));
-            max_d = max_d.max((x - y).abs());
-            max_r = max_r.max(y.abs());
-            sd += (x - y) * (x - y);
-            sr += y * y;
-        }
-        Dist {
-            max_rel: max_d / max_r,
-            rms_rel: (sd / sr).sqrt(),
-        }
-    }
-
-    /// The reference rounded to bf16 against itself: the floor of any bf16 tower's distance.
-    fn floor(refv: &[f32]) -> f64 {
-        let r: Vec<f32> = refv.iter().map(|&v| bf16_f32(f32_bf16(v))).collect();
-        dist_f32(&r, refv).rms_rel
-    }
-
-    fn to_f32(v: &[u16]) -> Vec<f32> {
-        v.iter().map(|&b| bf16_f32(b)).collect()
-    }
-
-    fn to_bf16(v: &[f32]) -> Vec<u16> {
-        v.iter().map(|&x| f32_bf16(x)).collect()
-    }
-
-    /// One compared tap's line: the distance against `K_TAP ×` the controls.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one tap's names, values and three controls, as the line prints them"
-    )]
-    fn band_check(
-        stem: &str,
-        tap: &str,
-        ours: &[u16],
-        refv: &[f32],
-        twin: f64,
-        floor: f64,
-        sens: Option<f64>,
-    ) -> bool {
-        if ours.len() != refv.len() {
-            println!(
-                "tap {stem:<14} {tap:<20} FAIL: {} values, the set has {}",
-                ours.len(),
-                refv.len()
-            );
-            return false;
-        }
-        let d = dist(ours, refv);
-        let ctl = twin.max(floor).max(sens.unwrap_or(0.0));
-        let pass = d.rms_rel <= K_TAP * ctl;
-        println!(
-            "tap {stem:<14} {tap:<20} max|rel| {:.3e}  rms rel {:.3e}  controls twin {twin:.2e} floor {floor:.2e} sens {}  ratio {:.2} (at most {K_TAP})  {}",
-            d.max_rel,
-            d.rms_rel,
-            sens.map_or("-".to_string(), |s| format!("{s:.2e}")),
-            d.rms_rel / ctl,
-            verdict(pass)
-        );
-        pass
-    }
-
     // ------------------------------------------------------------ taps
-
-    /// Collects the named tensors of one encode.
-    struct Collect {
-        want: HashSet<String>,
-        got: HashMap<String, Vec<u16>>,
-    }
-
-    impl TapSink for Collect {
-        fn wants(&self, name: &str) -> bool {
-            self.want.contains(name)
-        }
-        fn take(&mut self, name: &str, _cols: usize, bits: Vec<u16>) {
-            self.got.insert(name.to_string(), bits);
-        }
-    }
 
     /// `(oracle node, our tap)` of every tap the set holds for blocks [`TAP_BLOCKS`], in chain
     /// order; the final rows (`embd`) are the encode's own output.
@@ -235,42 +145,6 @@ mod gate {
     }
 
     // ------------------------------------------------------------ independent host rules
-
-    /// ggml's vision RoPE cache of one patch `(y, x)`, from the loop of
-    /// `ggml_rope_cache_init` / `ggml_mrope_cache_init` (vision mode, sections of 18): pair `i`
-    /// of the first section is the angle `y`, of the second `x`, each multiplied by `theta_scale`
-    /// after every pair and started again at the section's own position.
-    fn ggml_cache(y: usize, x: usize) -> Vec<f32> {
-        let theta_scale = f64::from(10_000.0f32).powf(f64::from(-2.0f32 / 36.0f32)) as f32;
-        let (mut theta_t, mut theta_h) = (y as f32, x as f32);
-        let mut cache = Vec::with_capacity(2 * PAIRS_72);
-        for pair in 0..PAIRS_72 {
-            if pair == 18 {
-                theta_h = x as f32;
-            }
-            let theta = if pair < 18 { theta_t } else { theta_h };
-            cache.push(f64::from(theta).cos() as f32);
-            cache.push(f64::from(theta).sin() as f32);
-            theta_t *= theta_scale;
-            theta_h *= theta_scale;
-        }
-        cache
-    }
-
-    /// The RoPE table of an `n_h × n_w` grid in merge order, row by row from [`ggml_cache`].
-    fn ggml_table(n_h: usize, n_w: usize) -> Vec<f32> {
-        let mut cs = Vec::with_capacity(n_h * n_w * 2 * PAIRS_72);
-        for gy in 0..n_h / 2 {
-            for gx in 0..n_w / 2 {
-                for dy in 0..2 {
-                    for dx in 0..2 {
-                        cs.extend(ggml_cache(2 * gy + dy, 2 * gx + dx));
-                    }
-                }
-            }
-        }
-        cs
-    }
 
     /// V4.1's table builder as it was before the patch order became a parameter, frozen.
     fn frozen_v41_table(n_h: usize, n_w: usize, theta: f32) -> Vec<f32> {
@@ -322,41 +196,8 @@ mod gate {
 
     fn host_w(file: &Gguf) -> Result<HostW, GateError> {
         use vision::arch::qwen3vl::names as n;
-        let raw = |name: String| -> Result<&[u8], GateError> {
-            let t = file
-                .find(&name)
-                .ok_or_else(|| format!("{name} not in the encoder file"))?;
-            Ok(file.data(t)?)
-        };
-        let b16 = |name: String| -> Result<Vec<u16>, GateError> {
-            let t = file
-                .find(&name)
-                .ok_or_else(|| format!("{name} not in the encoder file"))?;
-            let bytes = file.data(t)?;
-            if t.ty == gguf::GgmlType::F32 {
-                Ok(bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32_bf16(f32::from_le_bytes(*c)))
-                    .collect())
-            } else {
-                Ok(bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| u16::from_le_bytes(*c))
-                    .collect())
-            }
-        };
-        let f32s = |name: String| -> Result<Vec<f32>, GateError> {
-            Ok(raw(name)?
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect())
-        };
+        let hf = HostFile(file);
+        let (b16, f32s) = (|name: String| hf.bf16(name), |name: String| hf.f32s(name));
         let (first, second) = (
             b16(n::patch_embd_weight())?,
             b16(n::patch_embd_weight_second_frame())?,
@@ -606,7 +447,7 @@ mod gate {
         bloomery_gpu_vision::rope2d::RopeTable72 {
             n_h: grid.0,
             n_w: grid.1,
-            cs: ggml_table(grid.0, grid.1),
+            cs: ggml_table(grid.0, grid.1, PAIRS_72),
         }
     }
 
@@ -701,11 +542,8 @@ mod gate {
     }
 
     fn load_image(hp: &Hparams, name: &str) -> Result<Img, GateError> {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/clefvis/images");
-        let bytes =
-            std::fs::read(dir.join(format!("{name}.png"))).map_err(|e| format!("{name}: {e}"))?;
         let rule = hp.size_rule(TokenLimits::DEFAULT)?;
-        let patches = preprocess(&Rgb8::from_png(&bytes)?, &rule)?;
+        let patches = preprocess(&read_image(name)?, &rule)?;
         let grid = (patches.n_vit_h, patches.n_vit_w);
         Ok(Img { patches, grid })
     }
@@ -771,33 +609,23 @@ mod gate {
             );
             ok &= shape;
             let taps_full = set.tap_effect_of(name)?.scope == TapScope::Full;
-            let mut sink = Collect {
-                want: if taps_full {
-                    wanted(*full)
-                } else {
-                    HashSet::new()
-                },
-                got: HashMap::new(),
-            };
+            let mut sink = Collect::new(if taps_full {
+                wanted(*full)
+            } else {
+                HashSet::new()
+            });
             let (out, tapped_launches) = {
                 let r = enc.encode_tapped(&img.patches, &mut sink)?;
                 stream.synchronize()?;
                 (r.rows.buf().to_host_vec(&stream)?, r.launches)
             };
 
-            // The sensitivity run: the same encode with one patch value in NOISE_EVERY nudged.
+            // The sensitivity run: the same encode with one patch value in sixteen nudged.
             let mut sens: HashMap<String, f64> = HashMap::new();
             if taps_full {
                 let mut noisy = img.patches.clone();
-                for (i, v) in noisy.bf16.iter_mut().enumerate() {
-                    if i % NOISE_EVERY == 0 {
-                        *v ^= 1;
-                    }
-                }
-                let mut nsink = Collect {
-                    want: sink.want.clone(),
-                    got: HashMap::new(),
-                };
+                nudge(&mut noisy.bf16);
+                let mut nsink = sink.again();
                 let nout = {
                     let r = enc.encode_tapped(&noisy, &mut nsink)?;
                     stream.synchronize()?;
@@ -805,12 +633,10 @@ mod gate {
                 };
                 for (tap, ours) in &sink.got {
                     if let Some(n) = nsink.got.get(tap) {
-                        let r: Vec<f32> = ours.iter().map(|&b| bf16_f32(b)).collect();
-                        sens.insert(tap.clone(), dist(n, &r).rms_rel);
+                        sens.insert(tap.clone(), sensitivity(n, ours));
                     }
                 }
-                let r: Vec<f32> = out.iter().map(|&b| bf16_f32(b)).collect();
-                sens.insert("embd".to_string(), dist(&nout, &r).rms_rel);
+                sens.insert("embd".to_string(), sensitivity(&nout, &out));
             }
 
             if taps_full {
@@ -825,6 +651,7 @@ mod gate {
                     // sensitivity control applies from block 1 on.
                     let free = !(tap == "embed" || tap.starts_with("blk0."));
                     ok &= band_check(
+                        K_TAP,
                         name,
                         tap,
                         ours,
@@ -838,6 +665,7 @@ mod gate {
             let (_, refv) = set.tap(name, "embd")?;
             let (_, twin_v) = twin.tap(name, "embd")?;
             ok &= band_check(
+                K_TAP,
                 name,
                 "embd",
                 &out,
@@ -850,24 +678,19 @@ mod gate {
             if taps_full {
                 // Teacher-forced steps from the reference's own inputs. A step's control is the
                 // larger of the rounding floor of its output and the step's own sensitivity: the
-                // same step run on its input with one value in NOISE_EVERY nudged by an ulp. (The
+                // same step run on its input with one value in sixteen nudged by an ulp. (The
                 // twin's distance at a late tap measures the amplification over every block
                 // before it, which a step fed the reference's own input does not carry.)
                 let get =
                     |node: &str| -> Result<Vec<f32>, GateError> { Ok(set.tap(name, node)?.1) };
-                let noisy = |x: &[u16]| -> Vec<u16> {
-                    x.iter()
-                        .enumerate()
-                        .map(|(i, &v)| if i % NOISE_EVERY == 0 { v ^ 1 } else { v })
-                        .collect()
-                };
                 for (b, input) in [(0usize, "inp_pos_emb"), (1, "layer_out-0")] {
                     let x = to_bf16(&get(input)?);
                     let got = enc.forced_block(img.grid, b, &x)?;
                     let sens =
-                        dist(&enc.forced_block(img.grid, b, &noisy(&x))?, &to_f32(&got)).rms_rel;
+                        dist(&enc.forced_block(img.grid, b, &nudged(&x))?, &to_f32(&got)).rms_rel;
                     let want = get(&format!("layer_out-{b}"))?;
                     ok &= band_check(
+                        K_TAP,
                         name,
                         &format!("forced.blk{b}"),
                         &got,
@@ -879,9 +702,10 @@ mod gate {
                 }
                 let x = to_bf16(&get("layer_out-26")?);
                 let (vit, rows) = enc.forced_tail(img.grid, &x, false)?;
-                let (nvit, nrows) = enc.forced_tail(img.grid, &noisy(&x), false)?;
+                let (nvit, nrows) = enc.forced_tail(img.grid, &nudged(&x), false)?;
                 let want = get("norm_b-27")?;
                 ok &= band_check(
+                    K_TAP,
                     name,
                     "forced.vit",
                     &vit,
@@ -892,6 +716,7 @@ mod gate {
                 );
                 let want = get("embd")?;
                 ok &= band_check(
+                    K_TAP,
                     name,
                     "forced.tail embd",
                     &rows,
@@ -902,8 +727,9 @@ mod gate {
                 );
                 let x = to_bf16(&get("norm_b-27")?);
                 let (_, rows) = enc.forced_tail(img.grid, &x, true)?;
-                let (_, nrows) = enc.forced_tail(img.grid, &noisy(&x), true)?;
+                let (_, nrows) = enc.forced_tail(img.grid, &nudged(&x), true)?;
                 ok &= band_check(
+                    K_TAP,
                     name,
                     "forced.merger",
                     &rows,
@@ -923,15 +749,7 @@ mod gate {
                 (a.rows.buf().to_host_vec(&stream)?, a.launches)
             };
             let vb = enc.encode(&img.patches)?.rows.buf().to_host_vec(&stream)?;
-            let twice = va.0 == vb && va.0 == out;
-            let launches = va.1 == want_launches && tapped_launches == want_launches;
-            println!(
-                "image {name}: eager twice bit-identical and equal to the tapped run: {}; launches {} (want {want_launches}): {}",
-                verdict(twice),
-                va.1,
-                verdict(launches)
-            );
-            ok &= twice && launches;
+            ok &= eager_twice(name, (&out, tapped_launches), &va, &vb, want_launches);
             if *full {
                 full_state = Some((img, out));
             }
@@ -951,13 +769,11 @@ mod gate {
                 .buf()
                 .to_host_vec(&stream)?;
             let tokens = largest.grid.0 * largest.grid.1 / 4;
-            let pass = again == first && big.len() == tokens * hp.out_dim;
-            println!(
-                "reuse {FULL} after {LARGEST} ({tokens} of {} tokens): bit-identical to its first encode: {}",
-                limits.max(),
-                verdict(pass)
+            ok &= reuse_after_largest(
+                (FULL, LARGEST),
+                (tokens, limits.max(), hp.out_dim),
+                (&first, &big, &again),
             );
-            ok &= pass;
         }
 
         let deferred = deferred_arms();
