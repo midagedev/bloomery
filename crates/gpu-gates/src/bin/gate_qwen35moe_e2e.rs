@@ -176,7 +176,8 @@
 //!   the host tier's batch port) against the fifth step — each row of a
 //!   unit runs every card launch and every host dot the way its one-row
 //!   step does; (o2) (c) on it, the same [`FREE_BAND`] — a host expert runs
-//!   ik's own 8-bit rule (Q8_K activations) where the card runs q8_1, so no
+//!   ik's own 8-bit rule (q8_2 per 32 values for Q4_K-Q6_K and the 32-block
+//!   types, Q8_K per 256 for the rest) where the card runs q8_1, so no
 //!   layer's error grows; (o5) (u) and (d) on it ([`wide_arm`]): the step
 //!   set's prompt as ubatches of [`PLACED_UBATCH`] rows, whose layers run
 //!   the card's experts through the wide GEMMs over a per-layer map and the
