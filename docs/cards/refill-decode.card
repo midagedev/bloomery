@@ -96,3 +96,18 @@ decide-above: f is above 5 a token (the greedy continuation drifts off the promp
   topic jump) or one refill's page work costs more than paper (the zap's TLB shootdowns or the mm lock convoying the pool's
   32 threads). Read the decode fills a token by window and the step's pool wait before the number is claimed as the
   refill's; the release path's give_back (a landing) is then the next suspect and gets its own card
+#
+# Result (2026-10-12, sitting 05:32-05:50, A6000, one lease, 10 rounds + warm-up, BLOOMERY_AB_LOAD=arm, order rotated):
+# - Paired ratio (ours - base) / base: +7.07 % ± 1.61 % (95 %, t 9 df, paired sd 2.25 %). Rounds: +10.9 +3.6 +6.9 +5.8
+#   +6.9 +8.8 +8.3 +8.3 +3.8 +7.3. Inside the predicted +3..+13: decide-in. Means 42.21 tok/s ours, 39.43 base (n=1024).
+# - Conditions: tokens-differ rounds 0 of 10; cpu-busy 0 of 20; other-busy 0 of 20; both arms' nvtier budget and paged equal.
+#   Fills are 10473 in every record, and evictions are 3705 in every record.
+# - [cold]: 10 of 10 base rows, 0 of 10 ours. The tag reads the window's majflt. That is the term itself: the base's
+#   timed window holds 78,387 majflt (the reads faulting the given-back pages back in) against ours' 2. It is not a cold
+#   page cache, so the condition's "no [cold] row" holds in its intent.
+# - s, the fill_ns cut: base 0.950 ms a fill, ours 0.811 ms (n 11 / 10). The cut is 0.139 ms a fill, under paper's 0.40..1.0.
+#   The token's cut is 1.73 ms (25.28 to 23.56 ms mean). 10,473 fills × 0.139 ms is 1.46 s of a 1.77 s run delta, even if
+#   every fill sat in the decode. So part of the page work (the give-back before the read) sits outside fill_ns's span.
+# - f, the decode fills a token, cannot be read on this tree: union_fills equals fills (10473). The step port's pinned
+#   claims count as union fills until R4d-c keys them by kind. The paper's f = 3..5 is not checked.
+# - pp @ P 512: 133.42 ours, 132.74 base (no change expected; prompt fills sit under the drive).
