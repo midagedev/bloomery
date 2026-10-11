@@ -257,7 +257,9 @@ placement 0 0 0
 # PIN(2026-10-11): qdot 111 -> 128 blocks, 61 -> 72 fns, new kernels, not old code relaxed: the Q2_K and IQ2_XS
 # dots and tiles (one-column and tile driver over a shared weight-side closure, a fold and a values fn per type,
 # the scale-lane shuffle), each unsafe fn with its SAFETY line, and the two dispatch arms each.
-qdot 128 72 0
+# PIN(2026-10-11): qdot 128 -> 130 blocks, 72 -> 73 fns, a new kernel, not old code relaxed: the Q6_K tile (one
+# unsafe fn, so +1 fn and its body's 1 block) and the dispatch arm that calls it (+1 block), each with its SAFETY line.
+qdot 130 73 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
