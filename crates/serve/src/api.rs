@@ -1389,11 +1389,15 @@ const SAMPLERS: [&str; 5] = ["penalties", "top_k", "top_p", "min_p", "temperatur
 /// A request's `samplers`, which llama-server reads as the order its samplers
 /// run in: an array of names (any ASCII case; its aliases `top-k`, `topk`, `nucleus`,
 /// `temp`, `typ` and the like) or a string of one character a sampler. This
-/// server runs one order, [`SAMPLERS`], so only that order is taken; another
+/// server runs one order, [`SAMPLERS`], so only that order is taken, after
+/// every sampler that changes nothing at this request's values drops out of
+/// both lists (llama-server's `dry`, `typ_p`, `top_n_sigma` and `xtc` always;
+/// the penalties, `top_k`, `top_p` and `min_p` at their off values, and
+/// `temperature` at 1); another
 /// order, a name or character no sampler has (llama-server skips those with a
 /// warning), or a sampler this server lacks is a 400 naming `samplers`. `null`
 /// is unset.
-fn sampler_order(o: &Map<String, Value>) -> Result<(), ApiError> {
+fn sampler_order(o: &Map<String, Value>, sp: &SamplingParams) -> Result<(), ApiError> {
     const NAMES: [(&str, char); 11] = [
         ("dry", 'd'),
         ("top_k", 'k'),
@@ -1437,7 +1441,31 @@ fn sampler_order(o: &Map<String, Value>) -> Result<(), ApiError> {
             ));
         }
     };
-    if order.as_deref() == Some(&SAMPLERS[..]) {
+    // A sampler that changes nothing at this request's values drops out of
+    // both lists before they are compared, so its place in the order cannot
+    // matter: dry, typ_p, top_n_sigma and xtc always (gen_params runs
+    // unserved_samplers first, which refuses each one whose field turns it
+    // on), the penalties when none applies, and top_k, top_p and min_p at
+    // their off values. Temperature drops out only at 1, which divides by 1:
+    // at `<= 0` it keeps only the best candidate, and llama-server without it
+    // draws at temperature 1.
+    // Under that greedy pick top_k, top_p and min_p change nothing either,
+    // but only while no penalty runs, since a penalty before them can change
+    // which candidate is best.
+    let neutral = sp.temperature <= 0.0 && !sp.penalizes();
+    let off = |name: &str| match name {
+        "dry" | "typ_p" | "top_n_sigma" | "xtc" => true,
+        "penalties" => !sp.penalizes(),
+        "top_k" => neutral || sp.top_k <= 0,
+        "top_p" => neutral || sp.top_p >= 1.0,
+        "min_p" => neutral || sp.min_p <= 0.0,
+        "temperature" => sp.temperature == 1.0,
+        _ => false,
+    };
+    let on = |names: &[&'static str]| -> Vec<&'static str> {
+        names.iter().copied().filter(|name| !off(name)).collect()
+    };
+    if order.as_deref().map(on) == Some(on(&SAMPLERS)) {
         return Ok(());
     }
     Err(invalid(format!(
@@ -1518,7 +1546,6 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         return Err(invalid(format!("{field} is not supported by this server")));
     }
     unserved_samplers(o)?;
-    sampler_order(o)?;
     let d = SamplingParams::default();
     let seed = match get_i(o, "seed")? {
         Some(s) if s >= 0 => s as u64,
@@ -1572,6 +1599,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         repeat_last_n,
         seed,
     };
+    sampler_order(o, &sampling)?;
     let p = GenParams {
         n_predict,
         sampling,
@@ -4889,9 +4917,12 @@ mod tests {
     }
 
     /// `samplers` is taken only in this server's order, by llama-server's
-    /// names, their aliases or its characters; another order, an unknown name
-    /// or character, or a sampler this server lacks is a 400 naming
-    /// `samplers`, on both routes.
+    /// names, their aliases or its characters, with every sampler that is off
+    /// at the request's values dropped from both lists (so llama-server's
+    /// default list passes, and an off stage may stand anywhere); another
+    /// order of the stages that are on, an unknown name or character, or a
+    /// sampler this server lacks that is on is a 400, on every generation
+    /// route.
     #[test]
     fn samplers_are_taken_only_in_this_servers_order() {
         let (addr, _state, _ended) = super::testserve::spawn(
@@ -4899,16 +4930,30 @@ mod tests {
             super::testserve::mock_config(),
         );
         let ask = |path: &str, samplers: &Value| {
-            let mut body = if path == "/completion" {
-                json!({"prompt": "ab", "n_predict": 1})
+            let mut body = if path == "/completion" || path == "/v1/completions" {
+                json!({"prompt": "ab", "max_tokens": 1})
             } else {
                 json!({"messages": [{"role": "user", "content": "ab"}], "max_tokens": 1})
             };
+            // A penalty turns the penalties stage on, so its place counts.
+            body["repeat_penalty"] = json!(1.1);
             body["samplers"] = samplers.clone();
             roundtrip(addr, "POST", path, &body.to_string())
         };
-        for path in ["/completion", "/v1/chat/completions"] {
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
             for ok in [
+                json!([
+                    "penalties",
+                    "dry",
+                    "top_n_sigma",
+                    "top_k",
+                    "typ_p",
+                    "top_p",
+                    "min_p",
+                    "xtc",
+                    "temperature"
+                ]),
+                json!("edskypmxt"),
                 json!(["penalties", "top_k", "top_p", "min_p", "temperature"]),
                 json!(["Penalties", "top-k", "nucleus", "minp", "temp"]),
                 json!("ekpmt"),
@@ -4918,6 +4963,7 @@ mod tests {
                 assert_eq!(status, 200, "{path} {ok}: {text}");
             }
             for bad in [
+                json!(["dry", "top_k", "penalties", "top_p", "min_p", "temperature"]),
                 json!(["top_k", "penalties", "top_p", "min_p", "temperature"]),
                 json!([
                     "penalties",
@@ -4949,6 +4995,91 @@ mod tests {
                     message_of(&text).starts_with("samplers must be this server's order"),
                     "{path} {bad}: {text}"
                 );
+            }
+            let mut on = if path == "/v1/chat/completions" {
+                json!({"messages": [{"role": "user", "content": "ab"}], "max_tokens": 1})
+            } else {
+                json!({"prompt": "ab", "max_tokens": 1})
+            };
+            on["samplers"] = json!("edskypmxt");
+            for (field, value) in [
+                ("typical_p", json!(0.9)),
+                ("dry_multiplier", json!(0.5)),
+                ("xtc_probability", json!(0.5)),
+                ("top_n_sigma", json!(1.0)),
+            ] {
+                let mut body = on.clone();
+                body[field] = value;
+                let (status, text) = roundtrip(addr, "POST", path, &body.to_string());
+                assert_eq!(status, 400, "{path} {field}: {text}");
+                assert_eq!(
+                    message_of(&text),
+                    format!("{field} is not supported by this server")
+                );
+            }
+            // A stage at its off value drops out of the comparison: with no
+            // penalty the penalties stage may stand anywhere, top_k 0 may be
+            // left out, and a greedy request orders none of the later stages.
+            let plain = if path == "/v1/chat/completions" {
+                json!({"messages": [{"role": "user", "content": "ab"}], "max_tokens": 1})
+            } else {
+                json!({"prompt": "ab", "max_tokens": 1})
+            };
+            for (extra, samplers) in [
+                (
+                    json!({}),
+                    json!(["top_k", "top_p", "penalties", "min_p", "temperature"]),
+                ),
+                (
+                    json!({"top_k": 0}),
+                    json!(["penalties", "top_p", "min_p", "temperature"]),
+                ),
+                (
+                    json!({"temperature": 0}),
+                    json!(["temperature", "min_p", "top_k"]),
+                ),
+                (
+                    json!({"temperature": 1}),
+                    json!(["penalties", "top_k", "top_p", "min_p"]),
+                ),
+                (
+                    json!({"temperature": 0, "repeat_penalty": 1.1}),
+                    json!(["penalties", "top_k", "top_p", "min_p", "temperature"]),
+                ),
+            ] {
+                let mut body = plain.clone();
+                for (k, v) in extra.as_object().expect("an object") {
+                    body[k] = v.clone();
+                }
+                body["samplers"] = samplers.clone();
+                let (status, text) = roundtrip(addr, "POST", path, &body.to_string());
+                assert_eq!(status, 200, "{path} {extra} {samplers}: {text}");
+            }
+            // Temperature is never off, and a penalty before a greedy pick makes
+            // the stages around it count again.
+            for (extra, samplers) in [
+                (
+                    json!({"top_k": 0}),
+                    json!(["penalties", "top_p", "temperature"]),
+                ),
+                (json!({"temperature": 0}), json!(["min_p", "top_k"])),
+                (json!({"temperature": 0}), json!([])),
+                (
+                    json!({"temperature": 0, "repeat_penalty": 1.1}),
+                    json!(["temperature", "penalties"]),
+                ),
+                (
+                    json!({"temperature": 0, "repeat_penalty": 1.1}),
+                    json!(["top_p", "penalties", "temperature"]),
+                ),
+            ] {
+                let mut body = plain.clone();
+                for (k, v) in extra.as_object().expect("an object") {
+                    body[k] = v.clone();
+                }
+                body["samplers"] = samplers.clone();
+                let (status, text) = roundtrip(addr, "POST", path, &body.to_string());
+                assert_eq!(status, 400, "{path} {extra} {samplers}: {text}");
             }
             let (status, text) = ask(path, &json!(5));
             assert_eq!(status, 400, "{text}");
