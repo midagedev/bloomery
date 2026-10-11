@@ -15,6 +15,7 @@ pub mod card;
 pub mod hparams;
 pub mod media;
 pub mod names;
+pub mod rules;
 pub mod size;
 pub mod tensors;
 
@@ -26,6 +27,14 @@ use crate::preprocess::ChannelStats;
 
 /// `projector_type` of the files this module reads.
 pub const PROJECTOR_TYPE: &str = "glm5v";
+
+/// The base of the tower's 2D RoPE: a constant of llama.cpp's loader for this projector
+/// (`hparams.rope_theta`), not a key of the file.
+pub const ROPE_THETA: f32 = 10_000.0;
+
+/// The epsilon of the merger's LayerNorm: a literal of llama.cpp's graph (`glm4v.cpp`), not a key
+/// of the file; the tower's RMS norms read [`Hparams::eps`].
+pub const MERGER_NORM_EPS: f32 = 1e-5;
 
 /// Temporal frames of the patch embedding: the two kernels (`v.patch_embd.weight` and `.1`) a
 /// still image fills with itself.
