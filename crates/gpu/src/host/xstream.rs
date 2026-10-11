@@ -78,6 +78,7 @@ use super::batch::BatchKey;
 use super::slots::HOST;
 use super::swap::{SwapSource, Transform};
 use super::{Drain, poll_drained};
+use crate::Gpu;
 use crate::GpuError;
 use crate::graph::{MappedHost, cu, mem_batch, op_wait_geq, op_write};
 
@@ -148,6 +149,9 @@ pub struct XCfg {
     pub max_half: usize,
     /// The card bytes the ring leaves free when it sizes itself.
     pub keep_free: u64,
+    /// The most card bytes past `keep_free` the ring may take: `None` when
+    /// the card's free bytes alone bound it.
+    pub room_cap: Option<u64>,
     /// The fewest slots a half may have; a card with less room is refused
     /// by name.
     pub min_half: usize,
@@ -158,6 +162,60 @@ pub struct XCfg {
     pub deadline: Duration,
     /// Host experts the load's lane probe streams, `(layer, id)` each.
     pub probe: Vec<(usize, u32)>,
+}
+
+impl XCfg {
+    /// The cfg of one family's load: the rule's costs for its expert shape,
+    /// the router's experts and picks per column, and the bound on every
+    /// host wait — the ring's own sizing (`max_half`, `probe`) the tier sets
+    /// from the map ([`super::HostTier::xstream_start`]), the constants this
+    /// module owns beside them, and `room_cap` capping the card bytes past
+    /// `keep_free` the ring may take (`None`: the free bytes alone bound
+    /// it).
+    pub const fn new(
+        costs: Costs,
+        experts: usize,
+        top_k: usize,
+        deadline: Duration,
+        room_cap: Option<u64>,
+    ) -> XCfg {
+        XCfg {
+            costs,
+            experts,
+            top_k,
+            max_half: 0,
+            keep_free: KEEP_FREE,
+            room_cap,
+            min_half: MIN_HALF,
+            fill_threads: FILL_THREADS,
+            staging_slots: STAGING_SLOTS,
+            deadline,
+            probe: Vec::new(),
+        }
+    }
+}
+
+/// A body whose prompt calls stream experts: the two calls the shared
+/// `BLOOMERY_XSTREAM` rule drives any family's load through — set what the
+/// next prompt calls move (starting the stream under `split`), and the load
+/// line's `xstream=` word. The body's own glue (its placement's guards, the
+/// costs row of its routed kind, its card's arming) stays in its
+/// `set_xstream`; the rule and the word's shape are shared.
+pub trait XStreamBody {
+    /// What the next prompt calls move (`BLOOMERY_XSTREAM`): `off` until
+    /// set here, so one load can run every arm. `Split` starts the expert
+    /// stream at its first setting and arms the walk's card route for its
+    /// ring; the stream then stays for the load's life, idle under `Admit`
+    /// and `Off`. Refused by name: `Admit` or `Split` on a load that runs
+    /// no residency machine, `Split` on a load the ring cannot serve, and
+    /// any change while a call streams.
+    fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError>;
+
+    /// The load line's `xstream=` word: the mode, and under a started
+    /// stream its ring's slots a half, its pinned staging slots (0:
+    /// pageable), the lane's measured rate in GB/s and the least unit
+    /// width that streams.
+    fn xstream_word(&self) -> String;
 }
 
 /// What one layer of a unit streamed ([`XStream::layer`]), for the
@@ -236,6 +294,30 @@ pub struct LandBatch {
     /// The copy stream's event after the batch's last copy; `None` when no
     /// copy lands in the batch's slots.
     pub event: Option<Arc<CudaEvent>>,
+}
+
+impl LandBatch {
+    /// `f` over this batch's map row as a non-owning window of `experts`
+    /// words, the row given back after: the window frees nothing, so the
+    /// launches `f` enqueued read the row as they read a buffer of their
+    /// own. `f`'s error is returned whole.
+    pub fn with_map<T>(
+        &self,
+        ctx: &Arc<CudaContext>,
+        experts: usize,
+        f: impl FnOnce(&DeviceBuffer<u32>) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        // SAFETY: the batch's map row is `experts` words of the pool's
+        // host-mapped rows ([`LandRows::row_dev`]), which stay in place for
+        // the stream's life; the window owns nothing and frees nothing. Its
+        // contents are the landing path's contract: filled before the
+        // launches `f` enqueues were issued, rewritten only once they have
+        // run.
+        let bmap = unsafe { crate::tensor::window::<u32>(self.map, experts, ctx) };
+        let ran = f(&bmap);
+        drop(std::mem::ManuallyDrop::into_inner(bmap).into_raw_parts());
+        ran
+    }
 }
 
 /// The batch size rule: a layer's `n` landing slots split into batches of at
@@ -732,7 +814,10 @@ impl XStream {
         let widest = widest.map(|b| b.next_multiple_of(16));
         let per_slot: usize = widest.iter().sum();
         let (free, _) = card_mem(ctx)?;
-        let room = free.saturating_sub(cfg.keep_free);
+        let mut room = free.saturating_sub(cfg.keep_free);
+        if let Some(cap) = cfg.room_cap {
+            room = room.min(cap);
+        }
         let fit = usize::try_from(room / (HALVES * per_slot) as u64).unwrap_or(usize::MAX);
         let half = fit.min(cfg.max_half);
         if half < cfg.min_half {

@@ -218,6 +218,7 @@ mod gate {
             top_k: TOP_K,
             max_half: HALF,
             keep_free: 0,
+            room_cap: None,
             min_half: 2,
             fill_threads: fill,
             staging_slots: staging,
