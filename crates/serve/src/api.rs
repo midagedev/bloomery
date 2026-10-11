@@ -1275,6 +1275,24 @@ fn get_i(o: &Map<String, Value>, k: &str) -> Result<Option<i64>, ApiError> {
     }
 }
 
+/// An integer field within llama-server's hard limits `lo..=i32::MAX` (its
+/// counts and token limit): absent or `null` is `None`; out of range is a 400
+/// naming the field and the range, as a wrong type is.
+fn get_i_in(o: &Map<String, Value>, k: &str, lo: i64) -> Result<Option<i64>, ApiError> {
+    get_i(o, k)?.map(|n| in_limits(k, n, lo)).transpose()
+}
+
+/// `n` held to `lo..=i32::MAX` for the field `k`, else a 400 naming both.
+fn in_limits(k: &str, n: i64, lo: i64) -> Result<i64, ApiError> {
+    if (lo..=i64::from(i32::MAX)).contains(&n) {
+        return Ok(n);
+    }
+    Err(invalid(format!(
+        "{k} must be an integer in {lo}..={}, as llama-server takes it, not {n}",
+        i32::MAX
+    )))
+}
+
 /// A boolean field. Absent or `null` is `None`, any other type than a boolean
 /// a 400.
 fn get_b(o: &Map<String, Value>, k: &str) -> Result<Option<bool>, ApiError> {
@@ -1307,7 +1325,9 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
 /// Knobs shared by both generation endpoints. The token limit is the first set
 /// of `n_predict`, `max_completion_tokens` and `max_tokens`, llama-server's
 /// order on both routes (`n_predict` first, the OpenAI names its aliases in that
-/// order); every one that is set must be an integer, the shadowed ones too.
+/// order); every one that is set must be an integer, the shadowed ones too, and
+/// the one taken must be in `-1..=i32::MAX` (`-1` no limit), llama-server's hard
+/// limits on `n_predict`; outside them it is a 400 naming that field.
 /// `cache_prompt` (default `true`, as llama-server) keeps the longest prefix the
 /// engine's cache already holds; `false` resets it first.
 ///
@@ -1377,11 +1397,14 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         _ => mix(state.next_id() ^ unix_now().rotate_left(17)) & u64::from(u32::MAX),
     };
     let limits = [
-        get_i(o, "n_predict")?,
-        get_i(o, "max_completion_tokens")?,
-        get_i(o, "max_tokens")?,
+        ("n_predict", get_i(o, "n_predict")?),
+        ("max_completion_tokens", get_i(o, "max_completion_tokens")?),
+        ("max_tokens", get_i(o, "max_tokens")?),
     ];
-    let n_predict = limits.into_iter().flatten().next().unwrap_or(-1);
+    let n_predict = match limits.into_iter().find_map(|(k, n)| n.map(|n| (k, n))) {
+        None => -1,
+        Some((k, n)) => in_limits(k, n, -1)?,
+    };
     let top_k = get_i(o, "top_k")?;
     let penalty = |k: &str, d: f32, ok: fn(f32) -> bool, rule: &str| match set(k) {
         None => Ok(d),
@@ -1392,18 +1415,9 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .ok_or_else(|| invalid(format!("{k} must be {rule}, not {v}"))),
     };
     let finite = "a finite number";
-    let repeat_last_n = match (set("repeat_last_n"), get_i(o, "repeat_last_n")?) {
-        (None, _) => d.repeat_last_n,
-        (Some(v), n) => n
-            .filter(|&n| (0..=i64::from(i32::MAX)).contains(&n))
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or_else(|| {
-                invalid(format!(
-                    "repeat_last_n must be an integer in 0..={}, as llama-server takes it, not {v}",
-                    i32::MAX
-                ))
-            })?,
-    };
+    let repeat_last_n = get_i_in(o, "repeat_last_n", 0)?.map_or(d.repeat_last_n, |n| {
+        usize::try_from(n).expect("a count in 0..=i32::MAX fits usize")
+    });
     let sampling = SamplingParams {
         temperature: get_f32(o, "temperature")?.unwrap_or(d.temperature),
         top_k: top_k.map_or(d.top_k, |k| i32::try_from(k).unwrap_or(i32::MAX)),
@@ -1431,7 +1445,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         seed,
     };
     let p = GenParams {
-        n_predict: if n_predict < 0 { -1 } else { n_predict },
+        n_predict,
         sampling,
         stop: stop_list(o.get("stop"))?,
         ignore_eos: get_b(o, "ignore_eos")?.unwrap_or(false),
@@ -4248,6 +4262,76 @@ mod tests {
         assert_eq!(
             message_of(&text),
             "max_tokens must be an integer, not a string"
+        );
+    }
+
+    /// The token limit is an integer in `-1..=i32::MAX`, as llama-server's
+    /// hard limits take `n_predict` (`-1` is no limit, `0` generates nothing);
+    /// below or above is a 400 naming the name that carried it, on both routes,
+    /// never a silent "no limit".
+    #[test]
+    fn a_token_limit_outside_minus_one_to_i32_max_is_a_400_naming_the_field() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        for (k, n) in [
+            ("n_predict", -1),
+            ("max_tokens", 0),
+            ("max_completion_tokens", i64::from(i32::MAX)),
+        ] {
+            let body = json!({"prompt": "abcabc", "temperature": 0, k: n});
+            let (status, text) = roundtrip(addr, "POST", "/completion", &body.to_string());
+            assert_eq!(status, 200, "{k}={n}: {text}");
+            let v: Value = serde_json::from_str(&text).expect("JSON");
+            assert_eq!(v["generation_settings"]["n_predict"], n, "{k}={n}: {v}");
+        }
+        let over = i64::from(i32::MAX) + 1;
+        for (k, n) in [
+            ("n_predict", -2),
+            ("max_completion_tokens", -3),
+            ("max_tokens", i64::MIN),
+            ("n_predict", over),
+        ] {
+            let want = format!(
+                "{k} must be an integer in -1..={}, as llama-server takes it, not {n}",
+                i32::MAX
+            );
+            let completion = json!({"prompt": "ab", k: n});
+            let (status, text) = roundtrip(addr, "POST", "/completion", &completion.to_string());
+            assert_eq!(status, 400, "{k}={n}: {text}");
+            assert_eq!(message_of(&text), want);
+            let chat = json!({"messages": [{"role": "user", "content": "ab"}], k: n});
+            let (status, text) = roundtrip(addr, "POST", "/v1/chat/completions", &chat.to_string());
+            assert_eq!(status, 400, "{k}={n}: {text}");
+            assert_eq!(message_of(&text), want);
+        }
+        // The Responses route checks its own name before it becomes the chat
+        // half's `max_tokens`.
+        let responses = json!({"input": "ab", "max_output_tokens": -2});
+        let (status, text) = roundtrip(addr, "POST", "/v1/responses", &responses.to_string());
+        assert_eq!(status, 400, "{text}");
+        assert_eq!(
+            message_of(&text),
+            format!(
+                "max_output_tokens must be an integer in -1..={}, as llama-server takes it, not -2",
+                i32::MAX
+            )
+        );
+        // The range holds the name taken: a shadowed alias out of range is not
+        // read, and a null one is unset, so the next name is taken.
+        let shadowed = json!({"prompt": "ab", "n_predict": 1, "max_tokens": -2});
+        let (status, text) = roundtrip(addr, "POST", "/completion", &shadowed.to_string());
+        assert_eq!(status, 200, "{text}");
+        let unset = json!({"prompt": "ab", "n_predict": null, "max_tokens": -2});
+        let (status, text) = roundtrip(addr, "POST", "/completion", &unset.to_string());
+        assert_eq!(status, 400, "{text}");
+        assert_eq!(
+            message_of(&text),
+            format!(
+                "max_tokens must be an integer in -1..={}, as llama-server takes it, not -2",
+                i32::MAX
+            )
         );
     }
 

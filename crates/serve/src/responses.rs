@@ -148,7 +148,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     ApiError, ChatPlan, State, body, chat_input, chat_plan, error_body, finish_stream, get_i,
-    invalid, json_type, progress, run_gen, run_whole, send_error, send_json, sse,
+    get_i_in, invalid, json_type, progress, run_gen, run_whole, send_error, send_json, sse,
     tool_markup_error, unix_now,
 };
 use crate::dsml::{Message, ToolCall};
@@ -260,6 +260,9 @@ fn to_chat(b: &Map<String, Value>) -> Result<Map<String, Value>, ApiError> {
             chat.insert("tools".into(), Value::Array(tools));
         }
     }
+    // Range-checked under the name the client sent; the chat half then reads
+    // it as `max_tokens`.
+    get_i_in(b, "max_output_tokens", -1)?;
     if let Some(n) = b.get("max_output_tokens") {
         chat.insert("max_tokens".into(), n.clone());
     }
