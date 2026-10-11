@@ -13,6 +13,7 @@
 use cuda_device::convert::cvt_f32_f16x2_lo;
 use cuda_device::dotprod::dp4a_s32;
 use cuda_device::float::{add_rn_f32, fma_rn_f32, mul_rn_f32};
+use cuda_device::ptx_asm;
 
 // ---- shared ----
 
@@ -64,6 +65,23 @@ pub(crate) fn half_to_f32(bits: u16) -> f32 {
 #[inline(always)]
 pub(crate) fn funnel16(lo: u32, hi: u32) -> u32 {
     (lo >> 16) | (hi << 16)
+}
+
+/// The global-space address of `p`, for a PTX instruction on the global
+/// state space.
+#[inline(always)]
+pub(crate) fn global_addr<T>(p: *const T) -> u64 {
+    let g: u64;
+    // SAFETY: a register-only address conversion; nothing is dereferenced.
+    unsafe {
+        ptx_asm!(
+            "cvta.to.global.u64 %0, %1;",
+            out("=l") g,
+            in("l") p,
+            options(register_only),
+        );
+    }
+    g
 }
 
 // ---- q8_1 activation quantizer (q3k_quantize_q8_1) ----

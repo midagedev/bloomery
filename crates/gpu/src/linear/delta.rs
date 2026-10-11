@@ -69,6 +69,7 @@
 
 use super::{BLOCK, DECAY_HEAD, DECAY_KEY, HEAD, LinearShape};
 use crate::GpuError;
+use crate::cores::global_addr;
 use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -110,22 +111,6 @@ fn lane_dot(a: [f32; KEYS_PER_LANE], b: [f32; KEYS_PER_LANE]) -> f32 {
         p[i % 4] = fma_rn_f32(a[i], b[i], p[i % 4]);
     }
     (p[0] + p[1]) + (p[2] + p[3])
-}
-
-/// The global-space address of `p`, for [`ld4`].
-#[inline(always)]
-fn global_addr(p: *const f32) -> u64 {
-    let g: u64;
-    // SAFETY: a register-only address conversion; nothing is dereferenced.
-    unsafe {
-        ptx_asm!(
-            "cvta.to.global.u64 %0, %1;",
-            out("=l") g,
-            in("l") p,
-            options(register_only),
-        );
-    }
-    g
 }
 
 /// Four f32 at global address `g` in one 128-bit load: the load width the
