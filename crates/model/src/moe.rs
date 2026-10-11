@@ -2022,18 +2022,55 @@ pub enum Claim {
     Transient,
 }
 
+/// What a [`TierPin`] holds, handed back to its [`PinRelease`] when the pin
+/// drops: the layer and the ids the pin counted. `ids` is a buffer the tier
+/// lent the pin, moved in and moved back, so a pin makes no allocation of its
+/// own.
+pub struct PinToken {
+    pub layer: usize,
+    pub ids: Vec<u32>,
+}
+
+/// The tier's end of a [`TierPin`]: the drop of a pin hands its token here.
+/// `Sync` because a pin crosses threads (a ticket's wait) holding a borrow of
+/// the tier.
+pub trait PinRelease: Sync {
+    /// Unpin the ids of `token` and take its buffer back. Infallible, as a
+    /// drop is: a count already at zero is a broken invariant the tier
+    /// panics on by name (unless the thread is unwinding).
+    fn release(&self, token: PinToken);
+}
+
 /// A batch of experts pinned in the tier's slots ([`TierSlots::pin`]): the
-/// ids stay unevictable until the guard drops.
+/// ids stay unevictable until the guard drops. No box holds the guard's
+/// state: a pin is made per paged layer per step, and the step does no
+/// load-time work.
 #[must_use = "the pin lasts until the guard drops"]
 pub struct TierPin<'a> {
-    _held: Box<dyn Send + 'a>,
+    release: &'a dyn PinRelease,
+    token: Option<PinToken>,
 }
 
 impl<'a> TierPin<'a> {
-    /// A guard over `held`, whose drop unpins the batch.
-    pub fn new(held: impl Send + 'a) -> TierPin<'a> {
+    /// A guard over `token`'s ids, whose drop hands the token to `release`.
+    pub fn new(release: &'a dyn PinRelease, token: PinToken) -> TierPin<'a> {
         TierPin {
-            _held: Box::new(held),
+            release,
+            token: Some(token),
+        }
+    }
+
+    /// The ids this pin holds.
+    #[must_use]
+    pub fn ids(&self) -> &[u32] {
+        self.token.as_ref().map_or(&[], |t| &t.ids)
+    }
+}
+
+impl Drop for TierPin<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.release.release(token);
         }
     }
 }
@@ -3191,16 +3228,11 @@ mod tests {
         Unpinned(Vec<u32>),
     }
 
-    /// A batch's pin: the drop unpins it in the mock's log.
-    struct MockPin<'a> {
-        tier: &'a MockTier,
-        ids: Vec<u32>,
-    }
-
-    impl Drop for MockPin<'_> {
-        fn drop(&mut self) {
-            let mut log = self.tier.pins.lock().unwrap();
-            for id in &self.ids {
+    /// A batch's pin is released here: the mock's log unpins the ids.
+    impl super::PinRelease for MockTier {
+        fn release(&self, token: super::PinToken) {
+            let mut log = self.pins.lock().unwrap();
+            for id in &token.ids {
                 let at = log
                     .held
                     .iter()
@@ -3208,7 +3240,7 @@ mod tests {
                     .expect("a pinned id");
                 log.held.remove(at);
             }
-            log.events.push(PinEvent::Unpinned(self.ids.clone()));
+            log.events.push(PinEvent::Unpinned(token.ids));
         }
     }
 
@@ -3246,7 +3278,7 @@ mod tests {
             log.held.extend(ids.iter().map(|&id| (id, waited)));
             log.peak = log.peak.max(log.held.len());
             log.events.push(PinEvent::Pinned(claim, ids.clone()));
-            super::TierPin::new(MockPin { tier: self, ids })
+            super::TierPin::new(self, super::PinToken { layer: 0, ids })
         }
 
         /// The batch pins' events so far.
@@ -3282,9 +3314,9 @@ mod tests {
         fn pin<'a>(
             &'a self,
             _layer: usize,
-            _ids: &[u32],
+            ids: &[u32],
         ) -> Result<super::TierPin<'a>, super::TierError> {
-            Ok(super::TierPin::new(()))
+            Ok(self.pin_batch(ids, super::Claim::Step, true))
         }
 
         fn slots(&self, _layer: usize) -> usize {

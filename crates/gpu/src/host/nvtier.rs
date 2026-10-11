@@ -87,7 +87,7 @@ use std::time::{Duration, Instant};
 
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
-use model::moe::{Claim, Ticket, TierError, TierPin, TierSlots};
+use model::moe::{Claim, PinRelease, PinToken, Ticket, TierError, TierPin, TierSlots};
 use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
 use model::placement::{
@@ -414,7 +414,7 @@ fn claim_with(
     let mut held = BatchPin {
         arena,
         layer,
-        ids: Vec::new(),
+        ids: if pin { arena.take_ids() } else { Vec::new() },
     };
     for &id in ids {
         let at = id as usize;
@@ -647,6 +647,28 @@ struct LayerArena {
     /// Per slot: its state (a pick's read), its id and LRU tick (the
     /// lock's alone).
     slots: Vec<SlotBook>,
+    /// The id buffers idle for the next pin ([`LayerArena::take_ids`]), each
+    /// with capacity for the layer's slot count, the most ids one pin can
+    /// hold; [`id_pool`] fills it at the carve, so a pin makes no allocator
+    /// call. [`PIN_BUFFERS`] is the pins one layer can hold at once: a
+    /// step's (`crates/model/src/moe.rs:2444`, `:2611`), two union batches
+    /// (the computing batch's pin and the next batch's ticket, `:1768`,
+    /// `:1780`; an unbatched union holds one, `:1694`) and one of headroom.
+    /// A pin past those takes a fresh buffer that joins the pool when it
+    /// drops; it is never refused.
+    idle: Mutex<Vec<Vec<u32>>>,
+}
+
+/// The id buffers cut for one layer's pool at the carve ([`LayerArena::idle`]).
+const PIN_BUFFERS: usize = 4;
+
+/// [`LayerArena::idle`] for a layer of `slots` slots: [`PIN_BUFFERS`] buffers
+/// of that capacity, the list itself sized so a buffer's return never grows
+/// it.
+fn id_pool(slots: usize) -> Mutex<Vec<Vec<u32>>> {
+    let mut pool = Vec::with_capacity(PIN_BUFFERS);
+    pool.extend((0..PIN_BUFFERS).map(|_| Vec::with_capacity(slots)));
+    Mutex::new(pool)
 }
 
 impl LayerArena {
@@ -752,14 +774,15 @@ impl LayerArena {
         ids: &[u32],
         what: &'static str,
     ) -> Result<BatchPin<'a>, GpuError> {
-        let mut held: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|id| !self.host.contains(id))
-            .collect();
-        held.sort_unstable();
-        held.dedup();
-        for &id in &held {
+        // Distinct and ascending, in a buffer of the layer's pool: a pin
+        // holds no more ids than the layer has slots.
+        let mut held = self.take_ids();
+        for &id in ids.iter().filter(|id| !self.host.contains(id)) {
+            if let Err(at) = held.binary_search(&id) {
+                held.insert(at, id);
+            }
+        }
+        let checked = held.iter().try_for_each(|&id| {
             self.reading(layer, id, what)?;
             if self.filled(id).is_none() {
                 return Err(GpuError::protocol(
@@ -767,6 +790,11 @@ impl LayerArena {
                     format!("layer {layer} expert {id}: a batch pin of an unfilled slot"),
                 ));
             }
+            Ok(())
+        });
+        if let Err(e) = checked {
+            self.give_ids(held);
+            return Err(e);
         }
         for &id in &held {
             self.open(layer, id, what)?;
@@ -776,6 +804,45 @@ impl LayerArena {
             layer,
             ids: held,
         })
+    }
+
+    /// A buffer for a pin's ids, empty, from the layer's pool; a fresh one
+    /// when the pool is empty, which joins the pool when its pin drops.
+    fn take_ids(&self) -> Vec<u32> {
+        let pooled = self.idle.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        pooled.unwrap_or_else(|| Vec::with_capacity(self.slots.len()))
+    }
+
+    /// `ids` back into the pool, cleared. A buffer that never held capacity
+    /// (a guard's moved-out stand-in) is not kept.
+    fn give_ids(&self, mut ids: Vec<u32>) {
+        ids.clear();
+        if ids.capacity() > 0 {
+            self.idle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ids);
+        }
+    }
+
+    /// Close the reads a pin of `ids` opened and give the buffer back to the
+    /// pool, whatever refused on the way. A count already at zero is a
+    /// broken invariant (a read ended that was never opened), so this panics
+    /// by name once it has closed the rest, unless the thread is already
+    /// unwinding.
+    fn unpin(&self, layer: usize, ids: Vec<u32>) {
+        let mut broken = None;
+        for &id in &ids {
+            if let Err(e) = self.close(layer, id, "NvTier::pin") {
+                broken.get_or_insert(e);
+            }
+        }
+        self.give_ids(ids);
+        if let Some(e) = broken
+            && !std::thread::panicking()
+        {
+            panic!("{e}");
+        }
     }
 
     /// Close a lane's read of expert `id` ([`LayerArena::open`]): refused by
@@ -816,9 +883,7 @@ impl LayerArena {
 }
 
 /// A batch of pinned ids ([`LayerArena::pin_batch`]): the drop closes the
-/// reads it opened. A count already at zero is a broken invariant (a read
-/// ended that was never opened), so the drop panics by name after it has
-/// closed the rest, unless the thread is already unwinding.
+/// reads it opened ([`LayerArena::unpin`]) and gives the id buffer back.
 struct BatchPin<'a> {
     arena: &'a LayerArena,
     layer: usize,
@@ -832,21 +897,27 @@ impl BatchPin<'_> {
         self.ids.push(id);
         Ok(())
     }
+
+    /// The pin as the seam holds it: the ids move into the token, whose
+    /// release closes them ([`LayerArena`]'s [`PinRelease`]), and this
+    /// guard's drop finds none to close.
+    fn into_token(mut self) -> PinToken {
+        PinToken {
+            layer: self.layer,
+            ids: std::mem::take(&mut self.ids),
+        }
+    }
 }
 
 impl Drop for BatchPin<'_> {
     fn drop(&mut self) {
-        let mut broken = None;
-        for &id in &self.ids {
-            if let Err(e) = self.arena.close(self.layer, id, "NvTier::pin") {
-                broken.get_or_insert(e);
-            }
-        }
-        if let Some(e) = broken
-            && !std::thread::panicking()
-        {
-            panic!("{e}");
-        }
+        self.arena.unpin(self.layer, std::mem::take(&mut self.ids));
+    }
+}
+
+impl PinRelease for LayerArena {
+    fn release(&self, token: PinToken) {
+        self.unpin(token.layer, token.ids);
     }
 }
 
@@ -1366,6 +1437,7 @@ impl NvTier {
                 reading: (0..n).map(|_| AtomicU32::new(0)).collect(),
                 mapped: (0..n).map(|_| AtomicU32::new(0)).collect(),
                 slots: Vec::new(),
+                idle: Mutex::new(Vec::new()),
             });
         }
         let least = ArenaFloor::of(plan, ARENA_COLUMNS).map_err(|e| GpuError::plan(WHAT, e))?;
@@ -1386,6 +1458,7 @@ impl NvTier {
                     seq: AtomicU64::new(0),
                 })
                 .collect();
+            arena.idle = id_pool(count);
         }
         let reader = Reader::start(NVTIER_FILL_THREADS, "nvtier-fill")?;
         let drops = Arc::new(DropShared {
@@ -1754,7 +1827,9 @@ impl NvTier {
         const WHAT: &str = "NvTier::pin";
         let arena = self.arena_of(layer, WHAT)?;
         let _books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-        arena.pin_batch(layer, ids, WHAT).map(TierPin::new)
+        arena
+            .pin_batch(layer, ids, WHAT)
+            .map(|held| TierPin::new(arena, held.into_token()))
     }
 
     /// Layer `layer`'s drop, on this thread: every id the arena serves
@@ -1988,7 +2063,7 @@ impl NvTier {
         if self.audit.get().is_some() {
             self.audit_slots(layer, ids)?;
         }
-        Ok(TierPin::new(held))
+        Ok(TierPin::new(held.arena, held.into_token()))
     }
 
     /// Layer `layer`'s slot count; 0 for a layer the arena does not cover.
@@ -2550,7 +2625,7 @@ impl TierSlots for NvTier {
                 self.audit_slots(layer, &ids)
                     .map_err(|e| seam_error(layer, &ids, e))?;
             }
-            Ok(TierPin::new(held))
+            Ok(TierPin::new(held.arena, held.into_token()))
         }))
     }
 
@@ -3256,6 +3331,62 @@ mod tests {
         assert_eq!(filled_ids(&arena), [0, 1, 2]);
     }
 
+    /// A pin over the filled `ids` of layer 0 as the seam holds it: claimed
+    /// pinned, then its ids moved into a [`TierPin`] over the arena.
+    fn pinned<'a>(
+        arena: &'a super::LayerArena,
+        books: &mut super::Books,
+        ids: &[u32],
+    ) -> model::moe::TierPin<'a> {
+        let claim = super::claim_slots_pinned(0, arena, books, ids, Claim::Keep).unwrap();
+        let held = super::BatchPin {
+            arena,
+            layer: 0,
+            ids: claim.pinned,
+        };
+        model::moe::TierPin::new(arena, held.into_token())
+    }
+
+    /// A pin's id buffer comes from the layer's pool and goes back to it when
+    /// the guard drops, so the next pin of the layer takes the same buffer
+    /// and the steady state makes no allocator call for it. A pin past the
+    /// pool's [`super::PIN_BUFFERS`] takes a fresh buffer, never a refusal,
+    /// and the buffer joins the pool when its pin drops.
+    #[test]
+    fn a_pins_id_buffer_returns_to_the_layers_pool() {
+        let arena = arena_of(8, 4);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1, 2], Claim::Step);
+        let first = pinned(&arena, &mut books, &[0, 1, 2]);
+        let at = first.ids().as_ptr();
+        assert_eq!(first.ids(), [0, 1, 2]);
+        assert_eq!(open_reads(&arena, &[0, 1, 2]), [1, 1, 1]);
+        drop(first);
+        assert_eq!(open_reads(&arena, &[0, 1, 2]), [0, 0, 0], "the drop unpins");
+        let second = pinned(&arena, &mut books, &[0, 1, 2]);
+        assert_eq!(
+            second.ids().as_ptr(),
+            at,
+            "the second pin of the layer took the first's buffer"
+        );
+        drop(second);
+        let idle = |arena: &super::LayerArena| arena.idle.lock().unwrap().len();
+        assert_eq!(idle(&arena), super::PIN_BUFFERS);
+        // Five at once: four from the pool, the fifth a fresh buffer.
+        let held: Vec<_> = (0..super::PIN_BUFFERS + 1)
+            .map(|_| pinned(&arena, &mut books, &[0, 1, 2]))
+            .collect();
+        assert_eq!(idle(&arena), 0);
+        assert_eq!(open_reads(&arena, &[0, 1, 2]), [5, 5, 5]);
+        drop(held);
+        assert_eq!(open_reads(&arena, &[0, 1, 2]), [0, 0, 0]);
+        assert_eq!(
+            idle(&arena),
+            super::PIN_BUFFERS + 1,
+            "the fifth pin's fresh buffer joined the pool"
+        );
+    }
+
     /// A prefetch ticket returns the pin only once the batch's fill has
     /// published: before the wait the batch's slots are claimed (no claim
     /// takes them) and its misses unfilled, and what the wait returns holds
@@ -3282,7 +3413,7 @@ mod tests {
             let mut b = books.lock().unwrap();
             super::publish_pinned(&arena, &mut b, &picks, Claim::Keep, &mut held).unwrap();
             drop(b);
-            Ok(TierPin::new(held))
+            Ok(TierPin::new(&arena, held.into_token()))
         });
         // Before the wait: the misses are claimed, not filled, and a claim
         // past the batch takes the one free slot and no more.
@@ -3715,6 +3846,7 @@ mod tests {
             reading: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),
             mapped: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),
             slots: (0..slots).map(|_| book(FREE, 0)).collect(),
+            idle: super::id_pool(slots),
         }
     }
 

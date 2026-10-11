@@ -19,12 +19,15 @@ mod r8layer;
 use gguf::{GgmlType, Split};
 use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{new_cache, step};
-use model::moe::{HostLayer, HostScratch, UnionScratch};
-use model::ops::{Lanes, Tensor2};
+use model::moe::{
+    Claim, HostLayer, HostScratch, PinRelease, PinToken, TierError, TierPin, TierSlots,
+    UnionScratch,
+};
+use model::ops::{Lanes, ShardTensor, Tensor2};
 use model::r8file::R8Source;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 use threads::CcdMap;
 
 /// The counters are the process's: one gate counts at a time.
@@ -212,5 +215,163 @@ fn hw_a_ccd_dispatch_allocates_no_more_than_a_flat_one() {
         "CCD-major lanes made {} allocator calls over 8 calls, the flat lanes {}",
         least[1],
         least[0]
+    );
+}
+
+/// A [`TierSlots`] over a host layer's own bytes for the pin arm: every slot is
+/// filled, and a pin takes an id buffer from a pool and hands it back cleared
+/// when it drops, the way the gpu tier's arena lends them — four buffers cut
+/// at the build, each with the capacity a pin can need.
+struct PoolTier {
+    parts: Vec<Vec<u8>>,
+    idle: Mutex<Vec<Vec<u32>>>,
+    /// The `ensure_pinned` calls the legs made.
+    pins: AtomicU64,
+}
+
+impl PoolTier {
+    fn of(split: &Split, layer: &HostLayer, ids_per_pin: usize) -> PoolTier {
+        let mut parts = Vec::new();
+        for e in 0..layer.n_expert() {
+            for stack in layer.stacks() {
+                parts.push(
+                    ShardTensor::expert(stack, split, e)
+                        .unwrap()
+                        .bytes()
+                        .to_vec(),
+                );
+            }
+        }
+        let mut idle = Vec::with_capacity(4);
+        idle.extend((0..4).map(|_| Vec::with_capacity(ids_per_pin)));
+        PoolTier {
+            parts,
+            idle: Mutex::new(idle),
+            pins: AtomicU64::new(0),
+        }
+    }
+
+    fn pinned(&self, layer: usize, ids: &[u32]) -> TierPin<'_> {
+        let mut held = self.idle.lock().unwrap().pop().unwrap_or_default();
+        held.extend_from_slice(ids);
+        TierPin::new(self, PinToken { layer, ids: held })
+    }
+}
+
+impl PinRelease for PoolTier {
+    fn release(&self, mut token: PinToken) {
+        token.ids.clear();
+        self.idle.lock().unwrap().push(token.ids);
+    }
+}
+
+impl TierSlots for PoolTier {
+    fn ensure_as(&self, _layer: usize, _ids: &[u32], _claim: Claim) -> Result<(), TierError> {
+        Ok(())
+    }
+
+    fn pin<'a>(&'a self, layer: usize, ids: &[u32]) -> Result<TierPin<'a>, TierError> {
+        Ok(self.pinned(layer, ids))
+    }
+
+    fn slots(&self, _layer: usize) -> usize {
+        0
+    }
+
+    fn ensure_pinned<'a>(
+        &'a self,
+        layer: usize,
+        ids: &[u32],
+        _claim: Claim,
+    ) -> Result<TierPin<'a>, TierError> {
+        self.pins.fetch_add(1, Relaxed);
+        Ok(self.pinned(layer, ids))
+    }
+
+    fn slot(&self, _layer: usize, id: u32, part: usize) -> Option<&[u8]> {
+        Some(&self.parts[3 * id as usize + part])
+    }
+}
+
+/// Allocator calls one pin adds to a step leg's call over a paged layer, against
+/// the same layer with no tier, in a steady state. The one-column leg and a
+/// three-column step union each take one pin a call.
+///
+/// PIN(2026-10-12): 0. Derived from the code: the model side's pin was a
+/// `Box<dyn Send>` over the tier's guard, one call a pin, two a call of this
+/// arm's two legs and sixteen over its eight calls. The pin is now a borrow of
+/// the tier and a token that holds an id buffer the tier lent, moved in and
+/// back, so the model side makes none; the tier's own half (its id buffers) is
+/// the gpu crate's gate (`gate-gpu-lib`).
+const PIN_CALLS: u64 = 0;
+
+/// The model side of a paged layer's step makes no allocator call of its own:
+/// the legs over a layer with a tier whose slots are all the arena's (so the
+/// one-column leg and the union both pin) make no more calls than the legs
+/// over the same layer with none. Each arm's count is the least of three
+/// repeats of eight calls after twenty that fill the pools.
+#[test]
+#[ignore = "hw: needs the box; reads no model file"]
+fn hw_a_tier_pin_adds_no_allocator_call_to_the_step_legs() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let layer = r8layer::Layer::write("alloc-pin", 512, 256, 16, GgmlType::Q4_K);
+    let (embd, ff) = (layer.embd, layer.ff);
+    let split = Split::open(&layer.source).unwrap();
+    let src = R8Source::rows(&split);
+    let mut host = HostLayer::build(src, &layer.spec()).unwrap();
+    let mut hs = HostScratch::new(embd, ff, 4).unwrap();
+    let mut us = UnionScratch::new_routed(embd, ff, 3, 4).unwrap();
+    let x = Tensor2::from_vec(
+        embd,
+        1,
+        (0..embd).map(|i| (i % 17) as f32 / 9.0 - 0.9).collect(),
+    );
+    let x3 = Tensor2::from_vec(
+        embd,
+        3,
+        (0..3 * embd)
+            .map(|i| (i % 23) as f32 / 11.0 - 1.0)
+            .collect(),
+    );
+    let list =
+        |j: u32| -> Vec<(u32, f32)> { (0..4).map(|i| ((j * 5 + i * 3) % 16, 0.25)).collect() };
+    let lists = [list(0), list(1), list(2)];
+    let refs: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+    let (mut out1, mut out3) = (vec![0.0f32; embd], vec![0.0f32; 3 * embd]);
+    IS_MAIN.with(|m| m.set(true));
+    let mut least = |host: &HostLayer| {
+        let mut calls = |n: usize| {
+            for _ in 0..n {
+                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs)
+                    .unwrap();
+                host.experts_step_union_into_on(Lanes::Flat, src, &x3, &refs, &mut out3, &mut us)
+                    .unwrap();
+            }
+        };
+        calls(20);
+        let mut least = u64::MAX;
+        for _ in 0..3 {
+            let c0 = CALLS.load(Relaxed);
+            calls(8);
+            least = least.min(CALLS.load(Relaxed) - c0);
+        }
+        least
+    };
+    let flat = least(&host);
+    // Every id is the arena's: no host segment, so the union pins too.
+    let tier = Arc::new(PoolTier::of(&split, &host, 16));
+    host.attach_tier(0, 0..0, tier.clone());
+    let paged = least(&host);
+    eprintln!(
+        "step legs, 8 calls of one-column + 3-column step union: {flat} allocator calls with no tier, {paged} with one"
+    );
+    assert_eq!(
+        tier.pins.load(Relaxed),
+        2 * (20 + 3 * 8),
+        "the arm's legs took one pin each call"
+    );
+    assert!(
+        paged <= flat + PIN_CALLS * 2 * 8, // two pins a call, eight calls
+        "the legs over a paged layer made {paged} allocator calls over 8 calls, {flat} over the same layer with no tier"
     );
 }
