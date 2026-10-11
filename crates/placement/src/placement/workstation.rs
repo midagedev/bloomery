@@ -363,20 +363,16 @@ pub const fn walk_a_tile_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: 
 }
 
 /// The tier's chunk scratch for blocks of rows of `n_embd`, `n_used` slots a
-/// token, through experts of `ff`, cut in chunks of `chunk` tokens: the q8_1
-/// of a chunk's rows, its gate·up rows a slot, and per chunk width `c` from
-/// one to `chunk` the q8_1 of its `c · n_used` slots' columns — the scratch
-/// of a tier that runs the stage card's chunked card path over a block (the
-/// GLM-5.3-Flash tier), in place of the tile path's.
+/// token, through experts of `ff`, cut in chunks of `chunk` tokens: one run of
+/// the card leg's buffers (`bloomery_gpu::card_leg::LegBufs`, the GLM-5.3-Flash
+/// tier), in place of the tile path's scratch. Per `LegBufs` field: the q8_1
+/// of a chunk's rows (`act_x`, a column a token), its gate·up rows (`h`, `ff`
+/// values a slot), the q8_1 of its slots' columns (`act_h`, a column a slot
+/// of `ff`) and its down rows (`down`, `n_embd` values a slot).
 #[must_use]
 pub const fn tier_chunk_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, chunk: u64) -> u64 {
-    let mut b = q8_act_bytes(chunk, n_embd) + 4 * chunk * n_used * ff;
-    let mut c = 1;
-    while c <= chunk {
-        b += q8_act_bytes(c * n_used, ff);
-        c += 1;
-    }
-    b
+    let slots = chunk * n_used;
+    q8_act_bytes(chunk, n_embd) + 4 * slots * ff + q8_act_bytes(slots, ff) + 4 * slots * n_embd
 }
 
 /// The host's part of the tier's prompt-batch service: per exchange set, the

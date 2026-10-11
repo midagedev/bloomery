@@ -11,34 +11,34 @@
 //! after the go; the tier quantizes the same values with the same kernel.
 //!
 //! The tier's own layer ([`GlmTier`], the architecture's [`TierExperts`]) is
-//! the stage card's card-slot launches over the tier's stacks: the q8_1 of
-//! the activation, the gate·up `_sel` with the routed clamped SwiGLU, the
+//! the card leg ([`CardLeg::enqueue_rows`]) over the tier's stacks: the q8_1
+//! of the activation, the gate·up `_sel` with the routed clamped SwiGLU, the
 //! q8_1 of the tier slots' columns and the down `_sel` into the tier's rows;
-//! over a prompt batch's block, the same launches chunk by chunk of
-//! [`CHUNK`] tokens, as the stage card's `card_rows` runs them. Each slot's
-//! down output is the one the stage card would write for it, so the card sum
-//! over both cards' slots in slot order is the one-card sum over their union.
+//! over a prompt batch's block, the same run chunk by chunk of [`CHUNK`]
+//! tokens. Each slot's down output is the one the stage card would write for
+//! it, so the card sum over both cards' slots in slot order is the one-card
+//! sum over their union.
 
 use std::ops::Range;
 
+use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
 use bloomery_gpu::host::tier::{
     TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
 };
 use bloomery_gpu::hybrid::SlotMap;
-use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels, SelDown};
-use bloomery_gpu::q4k_sel::QuantSel;
+use bloomery_gpu::kquant::Act;
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
-use gguf::{GgmlType, Split};
+use gguf::Split;
 use model::arch::names::routed_stacks;
 use model::placement::Plan;
 use models::{Ffn, LayerSpec};
 
 use crate::body::prefill::CHUNK;
-use crate::ffn::{CardStacks, unrun};
+use crate::ffn::CardStacks;
 
 /// What the tier's errors name.
 const WHAT: &str = "glm5next tier";
@@ -136,32 +136,43 @@ fn past_rows(n: usize, row: usize) -> GpuError {
     }
 }
 
-/// A tier layer's experts and its routed SwiGLU limit.
-#[derive(Clone, Copy, Debug)]
+/// A tier layer's experts, its routed SwiGLU limit and its stacks' names.
 struct TierLayer {
     k: usize,
     limit: f32,
+    names: [String; 3],
+}
+
+impl TierLayer {
+    /// The stacks' names, as the card leg reads them.
+    fn names(&self) -> [&str; 3] {
+        self.names.each_ref().map(String::as_str)
+    }
 }
 
 /// The GLM tier card's computation ([`TierExperts`]): per tier layer the
-/// stage card's card-slot launches over the tier's stacks into the tier's
-/// rows; over a prompt batch's block, the same chunk by chunk. Its scratch —
-/// the step's activation in q8_1, the gate·up rows and their q8_1, and per
-/// chunk the same for [`CHUNK`] tokens and each chunk width — is made at
-/// load, as the stage card's is.
+/// card leg over the tier's stacks into the tier's rows; over a prompt
+/// batch's block, the same chunk by chunk. Its scratch, one [`LegBufs`] for
+/// [`CHUNK`] tokens that a step's one token and each chunk share, is made at
+/// load.
 pub(crate) struct GlmTier {
-    kq: KquantKernels,
+    leg: CardLeg,
+    bufs: LegBufs,
     layers: Range<usize>,
     /// Per layer of `layers`, `None` off the tier.
     cfg: Vec<Option<TierLayer>>,
     n_embd: usize,
-    ff: usize,
-    act_x: Q8Act,
-    h: DeviceBuffer<f32>,
-    act_h: Q8Act,
-    block_x: Q8Act,
-    block_h: DeviceBuffer<f32>,
-    block_act_h: Vec<Q8Act>,
+}
+
+/// The card leg's shape for the tier: up to [`CHUNK`] tokens of
+/// [`N_USED`] slots, `n_embd` wide, through experts `ff` wide.
+const fn leg_shape(n_embd: usize, ff: usize) -> LegShape {
+    LegShape {
+        cap: CHUNK,
+        slots_per_col: N_USED,
+        n: n_embd,
+        ff,
+    }
 }
 
 impl GlmTier {
@@ -180,11 +191,13 @@ impl GlmTier {
         ff: usize,
     ) -> Result<GlmTier, GpuError> {
         let run = set.layers();
+        let shape = leg_shape(n_embd, ff);
         let mut cfg = Vec::with_capacity(run.len());
         for l in run.clone() {
             let k = set.on_tier(l)?;
+            let names = routed_stacks(l);
             if k == 0 {
-                if let Some(n) = routed_stacks(l).iter().find(|n| w.get(n).is_some()) {
+                if let Some(n) = names.iter().find(|n| w.get(n).is_some()) {
                     return Err(GpuError::Tensor {
                         what: WHAT,
                         name: n.clone(),
@@ -200,71 +213,52 @@ impl GlmTier {
                     detail: format!("layer {l}: tier experts off a routed block"),
                 });
             };
-            let st = CardStacks::of(w, l)?;
-            for (s, rpe) in [(&st.gate, ff), (&st.up, ff), (&st.down, n_embd)] {
-                if s.w.rows() != k * rpe {
-                    return Err(GpuError::Tensor {
-                        what: WHAT,
-                        name: s.name.clone(),
-                        need: "the rows of the tier's experts of its layer",
-                    });
-                }
-            }
-            cfg.push(Some(TierLayer {
+            // The family's type rule ([`card_routed`]); the card leg also runs more types.
+            CardStacks::of(w, l)?;
+            let layer = TierLayer {
                 k,
                 limit: m.act.swiglu_limit(),
-            }));
+                names,
+            };
+            LegStacks::of(w, layer.names())?.check(k, shape)?;
+            cfg.push(Some(layer));
         }
-        let stream = gpu.stream();
         Ok(GlmTier {
-            kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
+            leg: CardLeg::load(gpu)?,
+            bufs: LegBufs::new(gpu.stream(), shape)?,
             layers: run,
             cfg,
             n_embd,
-            ff,
-            act_x: Q8Act::with_k(stream, 1, n_embd)?,
-            h: DeviceBuffer::zeroed(stream, N_USED * ff)?,
-            act_h: Q8Act::with_slots(stream, N_USED, ff)?,
-            block_x: Q8Act::with_k(stream, CHUNK, n_embd)?,
-            block_h: DeviceBuffer::zeroed(stream, CHUNK * N_USED * ff)?,
-            block_act_h: (1..=CHUNK)
-                .map(|c| Q8Act::with_slots(stream, c * N_USED, ff))
-                .collect::<Result<_, _>>()?,
         })
-    }
-
-    /// Layer `layer`'s tier experts and limit; a layer the tier holds none
-    /// of is refused by name.
-    fn layer(&self, layer: usize, what: &'static str) -> Result<TierLayer, GpuError> {
-        layer
-            .checked_sub(self.layers.start)
-            .and_then(|i| self.cfg.get(i))
-            .copied()
-            .flatten()
-            .ok_or_else(|| GpuError::Shape {
-                what,
-                detail: format!("layer {layer} holds no tier expert"),
-            })
     }
 }
 
+/// Layer `layer`'s tier experts of `cfg` (the tier's layers from
+/// `layers.start`); a layer the tier holds none of is refused by name.
+fn layer_of<'a>(
+    layers: &Range<usize>,
+    cfg: &'a [Option<TierLayer>],
+    layer: usize,
+    what: &'static str,
+) -> Result<&'a TierLayer, GpuError> {
+    layer
+        .checked_sub(layers.start)
+        .and_then(|i| cfg.get(i))
+        .and_then(Option::as_ref)
+        .ok_or_else(|| GpuError::Shape {
+            what,
+            detail: format!("layer {layer} holds no tier expert"),
+        })
+}
+
 impl TierExperts for GlmTier {
-    /// The chunk scratch: the q8_1 of [`CHUNK`] tokens, their gate·up rows
-    /// and, per chunk width, the q8_1 of its slots' columns.
+    /// The scratch of a run of [`CHUNK`] tokens: the leg's buffers.
     fn block_bytes(&self) -> usize {
-        self.block_x.device_bytes()
-            + self.block_h.num_bytes()
-            + self
-                .block_act_h
-                .iter()
-                .map(Q8Act::device_bytes)
-                .sum::<usize>()
+        self.bufs.bytes()
     }
 
-    /// Per chunk of up to [`CHUNK`] tokens, the stage card's `card_rows`
-    /// launches over the tier's stacks but its card sum: the chunk's q8_1,
-    /// the gate·up `_sel`, the q8_1 of its tier slots' columns and the down
-    /// `_sel` into the chunk's slots of `io.down`.
+    /// Per chunk of up to [`CHUNK`] tokens, the card leg over the tier's
+    /// stacks into the chunk's slots of `io.down`.
     fn enqueue_block(
         &mut self,
         gpu: &Gpu,
@@ -273,75 +267,38 @@ impl TierExperts for GlmTier {
         io: TierBlock<'_>,
     ) -> Result<(), GpuError> {
         const W: &str = "GlmTier::enqueue_block";
-        let tl = self.layer(layer, W)?;
-        let st = CardStacks::of(weights, layer)?;
-        let stream = gpu.stream();
-        let fault = gpu.layer_sink(layer)?;
-        let n = self.n_embd;
+        let GlmTier {
+            leg,
+            bufs,
+            layers,
+            cfg,
+            n_embd,
+        } = self;
+        let tl = layer_of(layers, cfg, layer, W)?;
+        let stacks = LegStacks::of(weights, tl.names())?;
+        let n = *n_embd;
         for c0 in (0..io.cols).step_by(CHUNK) {
             let cn = CHUNK.min(io.cols - c0);
             let slots = cn * N_USED;
             let x = span(W, io.x, c0 * n, cn * n)?;
             let sel = span(W, io.sel, c0 * N_USED, slots)?;
-            gpu.enqueue_quantize_q8_1_cols(&x, &mut self.block_x, cn, layer)?;
-            let a = GateUpAct {
-                wg: st.gate.w,
-                wu: st.up.w,
-                act: &self.block_x,
-                sel: &sel,
-                n_slots: slots,
-                rows_per_expert: self.ff,
-                slots_per_col: N_USED,
-                rule: Act::SwigluClamp { limit: tl.limit },
-            };
-            match st.gate.ty {
-                GgmlType::Q4_K => {
-                    self.kq
-                        .enqueue_gate_up_q4k(stream, &a, fault, &mut self.block_h)?
-                }
-                GgmlType::Q5_K => {
-                    self.kq
-                        .enqueue_gate_up_q5k(stream, &a, fault, &mut self.block_h)?
-                }
-                _ => return Err(unrun(&st.gate)),
-            }
-            let act_h = self.block_act_h.get_mut(cn - 1).ok_or(GpuError::State {
-                what: W,
-                missing: "the q8_1 columns of a chunk that wide",
-            })?;
-            let q = QuantSel {
-                x: &self.block_h,
-                cols: 0..slots,
+            let mut down = span_mut(W, &mut *io.down, c0 * N_USED * n, slots * n)?;
+            let run = LegRun {
+                layer,
+                stacks: &stacks,
+                normed: &x,
+                m: cn,
                 sel: &sel,
                 n_card: tl.k,
+                rule: Act::SwigluClamp { limit: tl.limit },
             };
-            gpu.q4k_sel()
-                .enqueue_quantize_sel(stream, &q, fault, act_h)?;
-            let mut down = span_mut(W, &mut *io.down, c0 * N_USED * n, slots * n)?;
-            match st.down.ty {
-                GgmlType::Q5_K => {
-                    let a = SelDown {
-                        w: st.down.w,
-                        act: act_h,
-                        sel: &sel,
-                        n_slots: slots,
-                        rows_per_expert: n,
-                    };
-                    self.kq.enqueue_gemv_q5k_sel(stream, &a, fault, &mut down)?;
-                }
-                GgmlType::Q4_K => gpu
-                    .q4k_sel()
-                    .enqueue_gemv_q4k_sel(stream, st.down.w, act_h, &sel, slots, n, &mut down)?,
-                _ => return Err(unrun(&st.down)),
-            }
+            leg.enqueue_rows(gpu, bufs, &run, &mut down)?;
         }
         Ok(())
     }
 
-    /// The stage card's card-slot launches of one token over the tier's
-    /// stacks but its card sum: the staged activation's q8_1, the gate·up
-    /// `_sel`, the q8_1 of the tier slots' columns and the down `_sel` into
-    /// the row's routed rows.
+    /// The card leg of one token over the tier's stacks into the row's
+    /// routed rows, from the staged activation.
     fn enqueue_layer(
         &mut self,
         gpu: &Gpu,
@@ -350,7 +307,7 @@ impl TierExperts for GlmTier {
         io: TierIo<'_>,
     ) -> Result<(), GpuError> {
         const W: &str = "GlmTier::enqueue_layer";
-        let tl = self.layer(layer, W)?;
+        let tl = layer_of(&self.layers, &self.cfg, layer, W)?;
         let TierInput::F32(x) = io.act else {
             return Err(GpuError::Shape {
                 what: W,
@@ -358,60 +315,17 @@ impl TierExperts for GlmTier {
                     .to_string(),
             });
         };
-        let st = CardStacks::of(weights, layer)?;
-        let stream = gpu.stream();
-        let fault = gpu.layer_sink(layer)?;
-        let n = self.n_embd;
-        gpu.enqueue_quantize_q8_1_layer(x, &mut self.act_x, layer)?;
-        let a = GateUpAct {
-            wg: st.gate.w,
-            wu: st.up.w,
-            act: &self.act_x,
-            sel: io.sel,
-            n_slots: N_USED,
-            rows_per_expert: self.ff,
-            slots_per_col: N_USED,
-            rule: Act::SwigluClamp { limit: tl.limit },
-        };
-        match st.gate.ty {
-            GgmlType::Q4_K => self
-                .kq
-                .enqueue_gate_up_q4k(stream, &a, fault, &mut self.h)?,
-            GgmlType::Q5_K => self
-                .kq
-                .enqueue_gate_up_q5k(stream, &a, fault, &mut self.h)?,
-            _ => return Err(unrun(&st.gate)),
-        }
-        let q = QuantSel {
-            x: &self.h,
-            cols: 0..N_USED,
+        let stacks = LegStacks::of(weights, tl.names())?;
+        let run = LegRun {
+            layer,
+            stacks: &stacks,
+            normed: x,
+            m: 1,
             sel: io.sel,
             n_card: tl.k,
+            rule: Act::SwigluClamp { limit: tl.limit },
         };
-        gpu.q4k_sel()
-            .enqueue_quantize_sel(stream, &q, fault, &mut self.act_h)?;
-        match st.down.ty {
-            GgmlType::Q5_K => {
-                let a = SelDown {
-                    w: st.down.w,
-                    act: &self.act_h,
-                    sel: io.sel,
-                    n_slots: N_USED,
-                    rows_per_expert: n,
-                };
-                self.kq.enqueue_gemv_q5k_sel(stream, &a, fault, io.rows)
-            }
-            GgmlType::Q4_K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
-                stream,
-                st.down.w,
-                &self.act_h,
-                io.sel,
-                N_USED,
-                n,
-                io.rows,
-            ),
-            _ => Err(unrun(&st.down)),
-        }
+        self.leg.enqueue_rows(gpu, &mut self.bufs, &run, io.rows)
     }
 }
 
