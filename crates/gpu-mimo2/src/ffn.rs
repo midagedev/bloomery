@@ -2,9 +2,12 @@
 //! attention `x1` in, the layer's output out (`x`, or the head's input after
 //! the last layer).
 //!
-//! The dense block (layer 0, [`dense`]): `ffn_norm` RMS, the gate·up·SwiGLU
-//! (`ds41_shexp_gate_up` over the q8_0 planes, plain at the layer's limit 0),
-//! the down projection and the add of `x1`. Four launches.
+//! The dense block (layer 0, [`dense`]): `ffn_norm` RMS, the gated block
+//! ([`bloomery_gpu_deepseek41::block`]: gate·up·SwiGLU at the layer's limit,
+//! plain at 0, and the down projection, launched by the file's weight types),
+//! and the add of `x1`. Four launches over q8_0 planes, and
+//! [`bloomery_gpu_deepseek41::block::BlockPlan::extra_launches`] more over
+//! K-quants.
 //!
 //! A routed block runs around its host leg; the card computes the experts the
 //! slot map puts on it ([`crate::card`]), the host tier the rest:
@@ -34,6 +37,7 @@ use bloomery_gpu::hybrid::{Boundary, Hybrid};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
+use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockKernels, enqueue_block};
 use bloomery_gpu_deepseek41::router::mimo2::N_EXPERT;
 use cuda_core::DeviceBuffer;
 use model::ModelError;
@@ -109,6 +113,9 @@ pub(crate) fn dense(
     else {
         return Err(other_kind("dense block", l));
     };
+    let plan = c
+        .block
+        .ok_or_else(|| shape(format!("layer {l}: a dense block without its plan")))?;
     let s = &mut *p.s;
     gpu.elem().enqueue_rms_norm(
         stream,
@@ -119,15 +126,23 @@ pub(crate) fn dense(
         1,
         &mut s.xn,
     )?;
-    p.k.experts.enqueue_shexp_gate_up(
-        stream,
-        w.resident(WHAT, gate)?,
-        w.resident(WHAT, up)?,
-        &s.xn,
-        c.ffn.limit,
-        &mut s.h,
-    )?;
-    w.q8_gemv(gpu, WHAT, down, &s.h, &mut s.out)?;
+    let kernels = BlockKernels {
+        experts: &p.k.experts,
+        kquant: p.k.block.as_ref(),
+    };
+    let blk = Block {
+        plan,
+        names: [gate, up, down],
+        ff: c.ffn.ff,
+        limit: c.ffn.limit,
+        layer: l,
+    };
+    let io = BlockIo {
+        x: &s.xn,
+        h: &mut s.h,
+        y: &mut s.out,
+    };
+    enqueue_block(gpu, w, &kernels, &mut s.block, &blk, io)?;
     let dest = dest.unwrap_or(&mut s.x);
     gpu.elem().enqueue_add(stream, &s.x1, &s.out, d.embd, dest)
 }
