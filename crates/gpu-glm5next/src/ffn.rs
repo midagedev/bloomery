@@ -1,9 +1,11 @@
 //! The feed-forward blocks of one layer at one token: `x` (the fold of the
 //! streams by the block's own mix) in, the update into `out`.
 //!
-//! A dense block ([`dense`]): `ffn_norm` RMS, the gate·up·SwiGLU with the
-//! shared limit (`ds41_shexp_gate_up` over the q8_0 planes), the down
-//! projection. Three launches, all in the layer's front.
+//! A dense block ([`dense`]): `ffn_norm` RMS, then the common gated block
+//! (`bloomery_gpu_deepseek41::block`: the gate·up·SwiGLU with the shared
+//! limit and the down projection, launched by the file's weight types). Three
+//! launches over q8_0 planes, [`BlockPlan::extra_launches`] more over K-quants,
+//! all in the layer's front.
 //!
 //! A routed block runs around its host leg; the card computes the experts the
 //! slot map puts on it ([`CardExperts`]), the host tier the rest:
@@ -17,9 +19,10 @@
 //!   leg (`bloomery_gpu::card_leg`): the norm's q8_1 form, the gate·up `_sel`
 //!   with the routed clamped SwiGLU, the q8_1 of those slots' columns, the
 //!   down `_sel` and the card slots' weighted sum (`ds41_ffn_card_acc_8`) —
-//!   then the shared expert, gate·up·SwiGLU and down, and the card sum plus
-//!   the shared expert's output. Two kernels without card experts,
-//!   [`CARD_LAUNCHES`] more with.
+//!   then the shared expert (the common gated block, as the dense one), and
+//!   the card sum plus the shared expert's output. Two kernels without card
+//!   experts over q8_0 planes, [`CARD_LAUNCHES`] more with, and
+//!   [`BlockPlan::extra_launches`] more over K-quants.
 //! - [`back`]: the wait, then the host's routed sum plus the shadow's:
 //!   `hsum + (card + shexp)`, or `hsum + shexp` on a layer without card
 //!   experts (`moe + shexp` as ik adds them). One kernel after the wait.
@@ -44,6 +47,8 @@
 //! the sum plus `1e-20` (`route_core::renorm_divisor`), under half an ulp of
 //! every sum from 2^-42 up. The two agree bit for bit unless all eight
 //! sigmoid scores sit below that: a named difference.
+//!
+//! [`BlockPlan::extra_launches`]: bloomery_gpu_deepseek41::block::BlockPlan::extra_launches
 
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use bloomery_gpu::host::run::HostRun;
@@ -53,6 +58,7 @@ use bloomery_gpu::kquant::{
 };
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, CardAccTier, FfnBatchKernels, Handoff, Places};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -61,7 +67,7 @@ use model::arch::glm5next::place::{card_routed, card_tile_bytes};
 use model::arch::names::routed_stacks;
 use models::{Ffn, LayerSpec};
 
-use crate::body::{Parts, f32t, f32v, gemv, weight};
+use crate::body::{Parts, f32t, f32v};
 use crate::tensors::{FfnNames, LayerNames, other_kind};
 use crate::tier::{STAGE_TIER, TierSide};
 
@@ -374,6 +380,19 @@ pub(crate) fn moe_names<'a>(p: &Parts<'a>, l: usize) -> Result<MoeNames<'a>, Gpu
     }
 }
 
+/// The gate, up and down names of a layer's dense block or shared expert.
+pub(crate) fn block_names(n: &LayerNames) -> [&str; 3] {
+    match &n.ffn {
+        FfnNames::Dense { gate, up, down, .. }
+        | FfnNames::Moe {
+            sh_gate: gate,
+            sh_up: up,
+            sh_down: down,
+            ..
+        } => [gate, up, down],
+    }
+}
+
 /// Enqueue layer `l`'s dense block (module doc).
 pub(crate) fn dense(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result<(), GpuError> {
     let stream = gpu.stream();
@@ -397,15 +416,20 @@ pub(crate) fn dense(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Resu
         1,
         &mut s.xn,
     )?;
-    p.k.experts.enqueue_shexp_gate_up(
-        stream,
-        weight(w, gate)?,
-        weight(w, up)?,
-        &s.xn,
-        c.limit,
-        &mut s.h,
-    )?;
-    gemv(gpu, w, down, &s.h, &mut s.out)
+    let kernels = p.k.block_kernels();
+    let blk = Block {
+        plan: c.block,
+        names: [gate, up, down],
+        ff: c.ff,
+        limit: c.limit,
+        layer: l,
+    };
+    let io = BlockIo {
+        x: &s.xn,
+        h: &mut s.h,
+        y: &mut s.out,
+    };
+    enqueue_block(gpu, w, &kernels, &mut s.block, &blk, io)
 }
 
 /// Enqueue layer `l`'s routed block up to its go (module doc).
@@ -480,15 +504,20 @@ pub(crate) fn shadow(
     }
     let sh = moe_names(p, l)?;
     let s = &mut *p.s;
-    p.k.experts.enqueue_shexp_gate_up(
-        gpu.stream(),
-        weight(w, sh.sh_gate)?,
-        weight(w, sh.sh_up)?,
-        boundary.normed(),
-        c.limit,
-        &mut s.h,
-    )?;
-    gemv(gpu, w, sh.sh_down, &s.h, &mut s.sh_y)?;
+    let kernels = p.k.block_kernels();
+    let blk = Block {
+        plan: c.block,
+        names: [sh.sh_gate, sh.sh_up, sh.sh_down],
+        ff: c.ff,
+        limit: c.limit,
+        layer: l,
+    };
+    let io = BlockIo {
+        x: boundary.normed(),
+        h: &mut s.h,
+        y: &mut s.sh_y,
+    };
+    enqueue_block(gpu, w, &kernels, &mut s.block, &blk, io)?;
     if card && !tiered {
         let k = card_row_mut(&mut p.card.rows, p.row)?;
         gpu.elem()
