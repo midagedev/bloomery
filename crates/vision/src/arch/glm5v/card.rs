@@ -66,8 +66,8 @@ pub struct ScratchLens {
     /// The MLP's fused gate and up rows, and the clamped SwiGLU's output.
     pub gu: usize,
     pub act: usize,
-    /// The merger's convolution output and its linear's output (the LayerNorm and the GELU run in
-    /// place), per token.
+    /// The merger's convolution output and its linear's output, per token; the LayerNorm reads the
+    /// second and writes the first, and the GELU runs in place on it.
     pub conv: usize,
     pub fc: usize,
     /// The merger MLP's fused gate and up rows, the clamped SwiGLU's output and the MLP's output
