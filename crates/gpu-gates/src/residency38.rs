@@ -15,7 +15,7 @@ use crate::generate::Place;
 use crate::record::{self, Record};
 use crate::residency::PlanRoom;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_levers::{PlanTier, RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
+use bloomery_levers::{RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan};
@@ -110,17 +110,6 @@ pub fn mem_left_38(available: u64, need: u64) -> i128 {
 /// The plan's card a qwen4exp open loads: its one card.
 pub const CARD38: usize = 0;
 
-/// `plan`'s NVMe tier terms the unset residency rules read
-/// ([`PlanTier`]): the routed-expert bytes it pages through the tier and the
-/// RAM arena they page through, 0 and 0 on a plan with no tier.
-#[must_use]
-pub fn plan_tier(plan: &Plan<'_>) -> PlanTier {
-    PlanTier {
-        paged: plan.host.nvme_expert_bytes,
-        arena: plan.host.nvme_arena_bytes,
-    }
-}
-
 /// The plan's card GLM's residency machine runs over: plan (a)'s one card.
 pub const GLM_CARD: usize = 0;
 
@@ -165,12 +154,9 @@ pub enum Lever38<'a> {
 
 /// The residency a load of `plan` runs under `lever`: a set word as given;
 /// unset, the rule's before the plan or on plan (a) from it
-/// (`residency38_at_plan`: `off` on a plan that pages routed experts through
-/// the NVMe tier's RAM arena, whose promotions would copy those experts
-/// through the file mapping, read cold from the drive after the tier's
-/// drops; else P half the fewest card experts a layer, `off` with why where
-/// the plan has no room, or the plan's host headroom or `MemAvailable` none
-/// for the churn pool) — its `residency unset` record handed to `emit`.
+/// (`residency38_at_plan`: P 0, or the first P the plan's card slots, host
+/// headroom and `MemAvailable` leave a churn pool for, `off` with why where
+/// they leave none) — its `residency unset` record handed to `emit`.
 /// Under `mid`, the `residency host` record of `plan` follows: the churn
 /// pool (card [`CARD38`]'s experts past the pinned ones) the load's host set
 /// holds beside the plan's host segments, which the load refuses by name for
@@ -195,7 +181,6 @@ pub fn residency38(
                     residency38_at_plan(
                         room.card_experts(),
                         plan.host.experts,
-                        room.tier(),
                         |pinned| room.pool_bytes(pinned),
                         room.headroom(),
                         room.mem_left()?,
