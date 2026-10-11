@@ -6,6 +6,7 @@
 
 use super::size::{Canvas, SizeRule};
 use super::{CLIP, TEMPORAL_FRAMES};
+use crate::media::{MediaModel, PartJoin, Prepared};
 use crate::preprocess::{PatchLayout, Patches, patchify_with};
 use crate::resample::resize_bicubic;
 use crate::{GridPlan, Rgb8, VisionError};
@@ -61,14 +62,54 @@ pub fn preprocess(image: &Rgb8, rule: &SizeRule) -> Result<Patches, VisionError>
     patchify_with(&canvas_image(image, &canvas), plan, layout, &CLIP)
 }
 
+/// GLM-5.3-Flash's [`MediaModel`]: the size rule of its encoder file at the seat's token limits,
+/// the rest constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Media {
+    rule: SizeRule,
+}
+
+impl Media {
+    /// The media description of an encoder file whose size rule is `rule`
+    /// ([`super::Hparams::size_rule_at`], after `Hparams::read` refused every value this crate does
+    /// not run).
+    #[must_use]
+    pub fn new(rule: SizeRule) -> Media {
+        Media { rule }
+    }
+}
+
+impl MediaModel for Media {
+    fn image_placeholder(&self) -> &str {
+        IMAGE_PLACEHOLDER
+    }
+
+    fn image_token(&self) -> u32 {
+        IMAGE_TOKEN_ID
+    }
+
+    fn part_join(&self) -> PartJoin {
+        PartJoin::LlamaServer
+    }
+
+    fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
+        let patches = preprocess(image, &self.rule)?;
+        Ok(Prepared {
+            span_len: patches.plan.n_llm_h * patches.plan.n_llm_w,
+            patches,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BEGIN_OF_IMAGE_ID, END_OF_IMAGE_ID, IMAGE_PLACEHOLDER, IMAGE_TOKEN_ID, PAD_BLACK,
+        BEGIN_OF_IMAGE_ID, END_OF_IMAGE_ID, IMAGE_PLACEHOLDER, IMAGE_TOKEN_ID, Media, PAD_BLACK,
         canvas_image, preprocess,
     };
     use crate::Rgb8;
     use crate::arch::glm5v::{CLIP, SizeRule};
+    use crate::media::{MediaModel, PartJoin};
 
     fn rule() -> SizeRule {
         SizeRule::new(14, 2, 12_544, 6_272_000).expect("rule")
@@ -186,5 +227,46 @@ mod tests {
             (BEGIN_OF_IMAGE_ID, IMAGE_TOKEN_ID, END_OF_IMAGE_ID),
             (154_830, 154_854, 154_831)
         );
+    }
+
+    /// The model's data is GLM's: the placeholder, the one id the server expands and llama-server's
+    /// join rule, whose separator is a newline.
+    #[test]
+    fn the_media_data_is_glms() {
+        let m = Media::new(rule());
+        assert_eq!(m.image_placeholder(), IMAGE_PLACEHOLDER);
+        assert_eq!(m.image_token(), IMAGE_TOKEN_ID);
+        assert_eq!(m.part_join(), PartJoin::LlamaServer);
+        assert_eq!(m.part_separator(), "\n");
+    }
+
+    /// The span an image takes is its canvas's merged grid: a 900×476 image is on a 924×476 canvas,
+    /// 33×17 = 561 tokens; a 1000×600 image is on a 1008×616 canvas, 36×22 = 792 tokens. The
+    /// plan carries the same grid and the canvas's pixel size.
+    #[test]
+    fn the_span_is_the_canvas_grid() {
+        let rule = rule();
+        let m = Media::new(rule);
+        for ((w, h), (canvas, grid, span)) in [
+            ((900, 476), ((924, 476), (33, 17), 561)),
+            ((1000, 600), ((1008, 616), (36, 22), 792)),
+        ] {
+            let p = m.prepare(&image(w, h, bright)).expect("prepare");
+            let c = rule.canvas(w, h).expect("canvas");
+            assert_eq!((c.width, c.height), canvas, "{w}x{h}");
+            assert_eq!(rule.grid(&c), grid, "{w}x{h}");
+            assert_eq!(p.span_len, span, "{w}x{h}");
+            assert_eq!(p.span_len, rule.grid(&c).0 * rule.grid(&c).1, "{w}x{h}");
+            assert_eq!(
+                (p.patches.plan.n_llm_w, p.patches.plan.n_llm_h),
+                grid,
+                "{w}x{h}"
+            );
+            assert_eq!(
+                (p.patches.plan.best_w, p.patches.plan.best_h),
+                canvas,
+                "{w}x{h}"
+            );
+        }
     }
 }

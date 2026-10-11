@@ -4,15 +4,17 @@
 //! The encoder is one fixed network — GLM-5.3-Flash's mmproj has a single value for each key — so
 //! each key must hold exactly that value, and the error names the key, the value the file holds and
 //! where the module's value comes from. The image budget is two pixel counts (16 and 8000 merged
-//! tokens of 28² pixels each); the other keys the converter writes, such as `image_size`, are the
-//! warm-up size mtmd never reads for planning. Values the file does not carry are the tensors'
-//! shapes ([`super::tensors`]).
+//! tokens of 28² pixels each): the limits a seat starts from ([`Hparams::default_limits`]), which
+//! its token flags replace ([`Hparams::size_rule_at`]); the other keys the converter writes, such
+//! as `image_size`, are the warm-up size mtmd never reads for planning. Values the file does not
+//! carry are the tensors' shapes ([`super::tensors`]).
 
 use gguf::{Gguf, Value};
 
 use super::size::SizeRule;
 use super::{CLIP, PROJECTOR_TYPE};
 use crate::VisionError;
+use crate::arch::TokenLimits;
 use crate::arch::header::{
     KEY_HAS_VISION, KEY_MEAN, KEY_STD, Meta, check_architecture, check_eps, check_projector,
     check_true, count_multiple, counts, need, need_f32, refusal,
@@ -105,9 +107,9 @@ pub struct Hparams {
     pub eps: f32,
     /// The SwiGLU's clamp on gate and up.
     pub swiglu_clamp: f32,
-    /// The least pixels a canvas holds (16 merged tokens).
+    /// The least pixels a canvas holds in the file's own budget (16 merged tokens).
     pub min_pixels: u64,
-    /// The most pixels a canvas holds (8000 merged tokens).
+    /// The most pixels a canvas holds in the file's own budget (8000 merged tokens).
     pub max_pixels: u64,
 }
 
@@ -134,9 +136,37 @@ impl Hparams {
         ))
     }
 
-    /// The size rule an image is planned with: mtmd's canvas inside the file's pixel budget.
-    pub fn size_rule(&self) -> Result<SizeRule, VisionError> {
-        SizeRule::new(self.patch, self.merge, self.min_pixels, self.max_pixels)
+    /// The image-token limits of the file's own pixel budget: its pixel counts over the pixels of
+    /// one merged token (16 and 8000). A seat that is given no limit starts from these.
+    pub fn default_limits(&self) -> Result<TokenLimits, VisionError> {
+        let file = SizeRule::new(self.patch, self.merge, self.min_pixels, self.max_pixels)?;
+        TokenLimits::new(file.min_tokens(), file.max_tokens())
+    }
+
+    /// The size rule an image is planned with when it may take `limits` merged tokens: mtmd's
+    /// canvas inside a budget of the limits' pixels, each side replacing the file's own. A budget
+    /// that does not fit llama.cpp's 32-bit pixel counts is refused by name.
+    pub fn size_rule_at(&self, limits: TokenLimits) -> Result<SizeRule, VisionError> {
+        let pixels = |tokens: usize| {
+            let side = (self.patch as u64).checked_mul(self.merge as u64)?;
+            let per_token = side.checked_mul(side)?;
+            (tokens as u64)
+                .checked_mul(per_token)
+                .filter(|&p| p <= i32::MAX as u64)
+        };
+        let (Some(min_pixels), Some(max_pixels)) = (pixels(limits.min()), pixels(limits.max()))
+        else {
+            return Err(VisionError::Limits {
+                detail: format!(
+                    "{}..={} tokens of patch {} and merge {} do not fit a 32-bit pixel count",
+                    limits.min(),
+                    limits.max(),
+                    self.patch,
+                    self.merge
+                ),
+            });
+        };
+        SizeRule::new(self.patch, self.merge, min_pixels, max_pixels)
     }
 
     fn from_meta(m: &impl Meta) -> Result<Hparams, VisionError> {
@@ -222,6 +252,8 @@ fn check_clip_stats(m: &impl Meta) -> Result<(), VisionError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::Hparams;
+    use crate::arch::TokenLimits;
+    use crate::arch::glm5v::SizeRule;
     use crate::arch::header::testing::{Table, expect_refusals};
     use gguf::Value;
 
@@ -264,7 +296,7 @@ pub(crate) mod tests {
         Hparams::from_meta(&glm()).expect("GLM-5.3-Flash's header reads")
     }
 
-    /// The header reads to the network of the file; the budget is 16..8000 merged tokens.
+    /// The header reads to the network of the file.
     #[test]
     fn glm_header_reads() {
         let hp = Hparams::from_meta(&glm()).expect("GLM-5.3-Flash's header reads");
@@ -276,8 +308,51 @@ pub(crate) mod tests {
         );
         assert_eq!(hp.dim / hp.n_head, 64);
         assert_eq!((hp.eps, hp.swiglu_clamp), (1e-5, 10.0));
-        let rule = hp.size_rule().expect("rule");
-        assert_eq!((rule.min_tokens(), rule.max_tokens()), (16, 8000));
+    }
+
+    /// With no limit given a seat starts from the file's own budget, 16 and 8000 tokens of 28²
+    /// pixels; a rule at those limits is the file's own rule, and each limit moves its own side of
+    /// the budget.
+    #[test]
+    fn each_limit_replaces_its_side_of_the_files_budget() {
+        let hp = hp();
+        let default = hp.default_limits().expect("limits");
+        assert_eq!((default.min(), default.max()), (16, 8000));
+        let at = |min, max| {
+            hp.size_rule_at(TokenLimits::new(min, max).expect("limits"))
+                .expect("rule")
+        };
+        assert_eq!(
+            hp.size_rule_at(default).expect("rule"),
+            SizeRule::new(14, 2, 12_544, 6_272_000).expect("the file's own rule")
+        );
+        let rule = at(16, 1024);
+        assert_eq!((rule.min_tokens(), rule.max_tokens()), (16, 1024));
+        let rule = at(100, 8000);
+        assert_eq!((rule.min_tokens(), rule.max_tokens()), (100, 8000));
+        let rule = at(1, 1);
+        assert_eq!((rule.min_tokens(), rule.max_tokens()), (1, 1));
+    }
+
+    /// A budget past llama.cpp's 32-bit pixel count is refused by name: 2,000,000 tokens of 784
+    /// pixels are 1,568,000,000, under 2^31 - 1, and 3,000,000 are 2,352,000,000, over it.
+    #[test]
+    fn a_budget_past_32_bits_is_refused_by_name() {
+        let hp = hp();
+        let rule = hp
+            .size_rule_at(TokenLimits::new(16, 2_000_000).expect("limits"))
+            .expect("fits");
+        assert_eq!(rule.max_tokens(), 2_000_000);
+        for max in [3_000_000, usize::MAX] {
+            let limits = TokenLimits::new(16, max).expect("limits");
+            assert_eq!(
+                hp.size_rule_at(limits).unwrap_err().to_string(),
+                format!(
+                    "image size limits: 16..={max} tokens of patch 14 and merge 2 do not fit a \
+                     32-bit pixel count"
+                )
+            );
+        }
     }
 
     /// The header prints the epsilon as 9.999999747378752e-06: that f64 is the f32 1e-5.
