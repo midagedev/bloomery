@@ -972,10 +972,7 @@ mod cli {
                 &PlanLevers::from_levers(levers)?,
                 mtp.as_ref(),
                 // The CLI's load leaves checkpoints off (`set_checkpoints`).
-                Seqs {
-                    slots: if mtp.is_some() { 1 } else { slots },
-                    checkpoints: false,
-                },
+                Seqs::none(if mtp.is_some() { 1 } else { slots }),
             )
         })?;
         chosen.record().print();

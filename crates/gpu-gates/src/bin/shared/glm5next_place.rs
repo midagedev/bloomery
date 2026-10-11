@@ -8,7 +8,7 @@
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::{Place, TierRule};
 use bloomery_gpu_gates::residency38::glm_machine;
-use bloomery_gpu_glm5next::checkpoint_budget;
+use bloomery_gpu_glm5next::checkpoint_price;
 use model::arch::glm5next::hparams::Hparams;
 use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
 use model::placement::PlanLevers;
@@ -59,9 +59,13 @@ pub fn tier_experts(
     lanes: KdaLanes,
     slots: usize,
 ) -> Result<u64, GateError> {
-    let budget = checkpoint_budget(inputs, ctx)?;
-    let machine =
-        glm_machine(place, tier_batch(place, &inputs.hp), slots, budget)?(inputs.model.layers);
+    let machine = glm_machine(
+        place,
+        tier_batch(place, &inputs.hp),
+        slots,
+        checkpoint_price(inputs)?,
+        ctx,
+    )?(inputs.model.layers);
     let plan = match nextn {
         None => inputs.plan_slots(&machine, ctx, levers, lanes, slots)?,
         Some(n) => {

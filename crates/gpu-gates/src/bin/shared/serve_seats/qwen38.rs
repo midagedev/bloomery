@@ -160,7 +160,8 @@
 //! the terms the records and rules read (`PlanKey`: the card's and the tiers'
 //! experts, the host's experts, resident bytes and tables, the NVMe tier's
 //! bytes and arena) or the load is refused by name. The plan's host reserves
-//! every slot's checkpoints (`HOST_BUDGET` a slot, [`reserve_checkpoints`]),
+//! every slot's checkpoints (the body's budget at the slot's context,
+//! [`reserve_checkpoints`]),
 //! so the host need, the split's floor and the arena count them, so a default
 //! count whose plan the room leaves under the floor is planned at one slot
 //! with no draft where that plan pages, under `--place bp` too: that one slot
@@ -314,7 +315,9 @@ use std::time::Instant;
 use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_bytes};
+use bloomery_gpu::arch::qwen3moe::{
+    Body38, Prompt38, Seq38, TargetRows, checkpoint_budget38, checkpoint_price38, seq38_bytes,
+};
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::route_trace::RouteTrace;
@@ -329,7 +332,7 @@ use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
-    CARD38, Lever38, Seqs, checkpoints_reserved, reserve_checkpoints, residency38,
+    CARD38, Lever38, Seqs, check_reserve, checkpoints_reserved, reserve_checkpoints, residency38,
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
@@ -518,8 +521,9 @@ impl Place38 {
     /// (`MtpInputs::card_bytes_of`, the reserve `plan_mtp_with_slots`
     /// checks; `place::machine_bp_on`), the one-card plans count them in
     /// `plan_mtp_with_slots`. The host reserves every slot's checkpoints
-    /// ([`seqs38`] through [`reserve_checkpoints`]), which the plan's host
-    /// need, the NVMe tier's floor and its arena then count.
+    /// ([`seqs38`] through [`reserve_checkpoints`], priced at `ctx` positions
+    /// a slot), which the plan's host need, the NVMe tier's floor and its
+    /// arena then count.
     fn machine(
         self,
         inputs: &PlanInputs,
@@ -543,19 +547,27 @@ impl Place38 {
                 )
             }
         };
-        reserve_checkpoints(&mut machine, seqs38(slots));
+        reserve_checkpoints(&mut machine, seqs38(inputs, slots), ctx)?;
         Ok(machine)
     }
 }
 
-/// What the seat's load of `slots` resident sequences declares
-/// ([`reserve_checkpoints`]): every slot takes checkpoints, the seat turning
-/// them on (`set_checkpoints`), up to `HOST_BUDGET` of host a slot.
-fn seqs38(slots: usize) -> Seqs {
-    Seqs {
-        slots,
-        checkpoints: true,
-    }
+/// What the seat's load of `slots` resident sequences of the file `inputs`
+/// describes declares ([`reserve_checkpoints`]): every slot takes checkpoints,
+/// the seat turning them on (`set_checkpoints`), each priced by the body's own
+/// derivation ([`checkpoint_price38`]) from the file's delta layers.
+fn seqs38(inputs: &PlanInputs, slots: usize) -> Seqs {
+    Seqs::priced(slots, checkpoint_price38(gdn_layers(inputs)))
+}
+
+/// The delta layers of the file `inputs` describes.
+fn gdn_layers(inputs: &PlanInputs) -> usize {
+    inputs
+        .spec
+        .layers
+        .iter()
+        .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
+        .count()
 }
 
 /// The MTP draft file at `path`, which `from` picked; an error names both.
@@ -911,12 +923,7 @@ impl Plans<'_> {
 /// copies, the draft's side under `drafts`, [`seq38_bytes`]) — at one
 /// position the least one saved state of the prompt cache holds.
 fn seq38_state(inputs: &PlanInputs, positions: usize, drafts: bool) -> u64 {
-    let gdn = inputs
-        .spec
-        .layers
-        .iter()
-        .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
-        .count();
+    let gdn = gdn_layers(inputs);
     seq38_bytes(gdn, inputs.spec.layers.len() - gdn, positions, drafts)
 }
 
@@ -1409,7 +1416,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             experts,
             &plan_levers,
             mtp_inputs.as_ref(),
-            seqs38(slots),
+            seqs38(&inputs, slots),
         )
     })?;
     chosen.record().eprint();
@@ -1683,6 +1690,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         experts,
         mtp_inputs.as_ref(),
         slots,
+    )?;
+    check_reserve(
+        &machine,
+        slots,
+        checkpoint_budget38(gdn_layers(&inputs), u64::try_from(ctx)?)?,
     )?;
     let (plan, draft_bytes) = match &mtp_inputs {
         None => (
@@ -2049,9 +2061,13 @@ impl Q38 {
         let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.hp)?;
         let ub = ubatch_for(a.ctx)?;
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
+        // The sequences the load makes pin the body's budget at this context;
+        // the plan's machine must reserve at least that.
+        let ckpt = checkpoint_budget38(gdn_layers(&inputs), ctx_ub.0)?;
         let mut m = match a.mtp {
             false => {
                 let machine = a.place.machine(&inputs, ctx_ub, a.experts, None, a.slots)?;
+                check_reserve(&machine, a.slots, ckpt)?;
                 let plan = inputs.plan_with_slots(
                     &machine,
                     u64::try_from(a.ctx)?,
@@ -2081,6 +2097,7 @@ impl Q38 {
                 let machine = a
                     .place
                     .machine(&inputs, ctx_ub, a.experts, Some(&mtp), a.slots)?;
+                check_reserve(&machine, a.slots, ckpt)?;
                 let plan = inputs.plan_mtp_with_slots(
                     &machine,
                     u64::try_from(a.ctx)?,
