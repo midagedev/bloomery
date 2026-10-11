@@ -894,7 +894,7 @@ gate-gpu-qwen35-media:
 # band, and the steps' logits against the same ids through passes of two rows. Not repeated here: Body35's slot and cache
 # clauses (the dense seat closes them). Real file only; the gate lock.
 gate-gpu-qwen35moe-media:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-media && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-media && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
 
 # The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q5_K_M (6.9 GB, the
 # `qwen35` file of rev d7f376ea) with the release's head; the six refusals (a qwen35 file with no head, --model
