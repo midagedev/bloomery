@@ -1178,6 +1178,22 @@ mod tests {
         assert_eq!(budget_for(100_000, 512, 73_728_000), Ok(58 * 73_728_000));
     }
 
+    /// A deeper context never reserves less, and none passes what the host
+    /// budget fits: the budget at the deepest context a plan's search can
+    /// probe bounds the budget of every context the load is granted.
+    #[test]
+    fn budget_never_falls_with_the_context() {
+        const POINT: u64 = 179_372_032;
+        let cap = capacity(HOST_BUDGET, POINT).expect("a capacity") as u64 * POINT;
+        let mut last = 0;
+        for ctx in 1..=20_000 {
+            let budget = budget_for(ctx, 512, POINT).expect("a budget");
+            assert!(budget >= last, "ctx {ctx}: {budget} B under {last} B");
+            assert!(budget <= cap, "ctx {ctx}: {budget} B over {cap} B");
+            last = budget;
+        }
+    }
+
     /// A context of no positions and a checkpoint that copies nothing or
     /// outgrows the host budget are refused by name.
     #[test]
