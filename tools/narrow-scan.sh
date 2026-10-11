@@ -25,11 +25,22 @@
 #      `--worktree`) with every pair, printing its output: the narrowed list with its why-lines, and the `recipes:`
 #      line to paste. DIR/narrowed.txt keeps it.
 #
-# The remote dirs persist across runs (~/repo/bloomery-narrow-base and ~/repo/bloomery-narrow-head), so a second
-# run builds incrementally: the BASE side costs a sync and the scans, the HEAD side the crates the change touched.
-# They belong to this recipe alone, and one run uses them at a time: a lock under ~/.cache/bloomery (a second run
-# waits up to NARROW_WAIT seconds, default 1800, naming the holder). NARROW_BASE_REMOTE and NARROW_HEAD_REMOTE name other dirs. Remove them
-# with `just box-tracks --remove narrow-base narrow-head` once nothing needs the warm builds.
+# The remote dirs are per track and persist across runs: ~/repo/bloomery-<track>-narrow-base and -narrow-head, <track>
+# this tree's directory name without "bloomery-" (the main tree's pair: ~/repo/bloomery-narrow-base and -narrow-head), so
+# two tracks never wait on each other's dirs. A second run builds incrementally: the BASE side costs a sync and the scans
+# (no scan is cached; they run again), the HEAD side the crates the change touched. A pair belongs to this recipe alone,
+# and one run uses it at a time: a lock under ~/.cache/bloomery named by the pair (a second run on it waits up to
+# NARROW_WAIT seconds, default 1800, naming the holder; the main tree's pair keeps the lock name older copies of this
+# script took for every tree). NARROW_BASE_REMOTE and NARROW_HEAD_REMOTE name other dirs. The names follow the
+# auxiliary-dir rule (bloomery-<track>-<suffix>): once the track's worktree is gone, `just box-tracks --remove
+# <track>-narrow-base <track>-narrow-head` clears them (the main tree's: `narrow-base narrow-head`).
+#
+# Stopping (INT/TERM): the side in flight ends from both ends, by pids it recorded and never by a name match. Its box
+# command writes the pid of the `timeout` it started to .narrow-scan-<side>-<pid>.pid in the remote dir (removed when the
+# runner ends, and by the next sync if a run died); the stop reads that file in one READONLY box call (no sync, no guard
+# wait) and signals that pid, whose TERM `timeout` passes to the runner's process group, then signals the local box.sh's
+# process group (job control makes it a group of its own: box.sh, its ssh and rsync) by the pid written under DIR at its
+# start. A stop that finds no file prints so (the runner had not started or had ended).
 #
 # It runs no gate and takes no timing lease, no hold, no card and no gate lock: `--no-jit` loads nothing on a card, and
 # the box commands are builds and ptxas. box.sh's own guard still waits while a sitting's lease or hold is up (rc 75 is
@@ -39,12 +50,12 @@
 #
 # DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>, <base8>-worktree under `--worktree`) keeps: scan-set.tsv, runner.sh (the script each side
 # runs), <side>.build.log (the box's stderr: the builds), <side>.scan.out, <side>/<bin>.log (the scan logs a landing
-# cites), narrowed.txt and MANIFEST.
+# cites), narrowed.txt and MANIFEST; <side>.box.pid while the side runs.
 #
 # NARROW_BOUND (default 7200 s, a hang guard: no box-job length needs approval) bounds the whole run: each side's box command runs under `timeout` with what
 # is left. A cut build keeps its compiled crates, so running again continues it. Exit codes: 0 done; 64 usage; 75
-# contention (the box guard, or the lock); 70 the box's toolchain; 1 a build or scan failed; 124 the bound; the
-# `affected` run's own code otherwise.
+# contention (the box guard, or the lock); 70 the box's toolchain; 1 a build or scan failed; 124 the bound; 130 INT and
+# 143 TERM; the `affected` run's own code otherwise.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds; tools/recipes.py SCAN_PACKAGE
@@ -58,6 +69,11 @@ die() { # die <rc> <message>
 
 md5_of() { # md5_of <file>: the Mac has md5, the box md5sum
   if command -v md5sum > /dev/null; then md5sum "$1" | cut -d' ' -f1; else md5 -q "$1"; fi
+}
+
+# str_key <text>: a short key of the text, for a lock's name.
+str_key() {
+  printf '%s' "$1" | if command -v md5sum > /dev/null; then md5sum | cut -c1-12; else md5 -q | cut -c1-12; fi
 }
 
 # worktree_key <base sha>: a fingerprint of this tree's content against BASE: the tracked diff (binary) and each
@@ -148,7 +164,7 @@ split_logs() {
     }' "$file"
 }
 
-# lock_take <lock dir> <wait seconds> <who>: one run at a time uses the two persistent remote dirs. A holder whose pid
+# lock_take <lock dir> <wait seconds> <who>: one run at a time uses a pair of persistent remote dirs. A holder whose pid
 # is gone is taken over. Prints what it waits for; rc 75 at the bound.
 lock_take() {
   local lockd=$1 wait=$2 who=$3 waited=0 pid
@@ -161,10 +177,10 @@ lock_take() {
       continue
     fi
     if [ "$waited" -ge "$wait" ]; then
-      echo "narrow-scan: $lockd is held by pid ${pid:-?} ($(cat "$lockd/who" 2> /dev/null)); the remote dirs take one run at a time (contention, not failure: run again)" >&2
+      echo "narrow-scan: $lockd is held by pid ${pid:-?} ($(cat "$lockd/who" 2> /dev/null)); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
       return 75
     fi
-    echo "narrow-scan: waiting for pid ${pid:-?} ($(cat "$lockd/who" 2> /dev/null)): the persistent remote dirs take one run at a time (${waited}s of ${wait}s)" >&2
+    echo "narrow-scan: waiting for pid ${pid:-?} ($(cat "$lockd/who" 2> /dev/null)): this pair of remote dirs takes one run at a time (${waited}s of ${wait}s)" >&2
     sleep 30
     waited=$((waited + 30))
   done
@@ -177,17 +193,59 @@ lock_release() { # lock_release <lock dir>: only the holder's own
   return 0
 }
 
-# side_command <bound s>: the one box.sh argument each side runs. The runner arrives on stdin, so the command writes it to a
-# temp file and runs it under `timeout`; its rc comes back whatever came before it (the guard's 75, the backend's 70). The
-# leading `:` names `cargo oxide`, which makes box.sh check the pinned backend before the command, as it does for a recipe.
+# side_command <bound s> <pid file>: the one box.sh argument each side runs. The runner arrives on stdin, so the command writes it to a
+# temp file and runs it under `timeout`, started in the background so that its pid (the `timeout`, which passes a TERM to the runner's
+# process group) is written to <pid file> in the remote dir; the file goes when the runner ends. The command's rc comes back whatever
+# came before it (the guard's 75, the backend's 70). The leading `:` names `cargo oxide`, which makes box.sh check the pinned backend
+# before the command, as it does for a recipe.
 side_command() {
-  printf '%s' ': cargo oxide && T=$(mktemp) && cat > "$T" && timeout --kill-after=10 '"$1"' bash "$T" </dev/null; rc=$?; rm -f "$T"; exit $rc'
+  printf '%s' ': cargo oxide && T=$(mktemp) && cat > "$T" && { timeout --kill-after=10 '"$1"' bash "$T" </dev/null & echo $! > '"$2"'; wait $!; }; rc=$?; rm -f "$T" '"$2"'; exit $rc'
+}
+
+# stop_command <pid file>: the READONLY box command of a stop: signals the pid the side command recorded, if the file is there.
+stop_command() {
+  printf '%s' 'p=$(cat '"$1"' 2>/dev/null); if [ -n "$p" ]; then kill -TERM "$p" && echo "narrow-scan: signalled the recorded remote pid $p"; else echo "narrow-scan: no remote pid recorded in '"$1"' (the runner had not started or had ended)"; fi'
+}
+
+# remote_stop <remote dir> <pid file>: the stop's one READONLY box call (no sync, no guard wait: a sitting does not delay it),
+# bounded at 30 s.
+remote_stop() {
+  local bp k=0
+  env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER BLOOMERY_REMOTE="$1" BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 \
+    "$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 &
+  bp=$!
+  while kill -0 "$bp" 2> /dev/null && [ "$k" -lt 150 ]; do
+    sleep 0.2
+    k=$((k + 1))
+  done
+  if kill -0 "$bp" 2> /dev/null; then
+    kill -TERM "$bp" 2> /dev/null || true
+    echo "narrow-scan: the stop's box call did not return in 30 s: the runner may still be running on the box ($1/$2; 'just box-gc --dry-run' lists orphans)" >&2
+  fi
+}
+
+# stop_run <rc>: INT or TERM. The side in flight (ACTIVE_*, set by run_side) is ended from both ends, then the EXIT trap releases the lock.
+ACTIVE_NAME='' ACTIVE_DIR='' ACTIVE_RPIDF='' ACTIVE_PIDF=''
+stop_run() {
+  local bp
+  trap '' INT TERM # a second signal does not cut the stop short
+  if [ -n "$ACTIVE_NAME" ]; then
+    echo "narrow-scan: stopped: ending the $ACTIVE_NAME side ($ACTIVE_DIR/$ACTIVE_RPIDF on the box, $ACTIVE_PIDF here)" >&2
+    remote_stop "$ACTIVE_DIR" "$ACTIVE_RPIDF"
+    if [ -f "$ACTIVE_PIDF" ]; then
+      bp=$(cat "$ACTIVE_PIDF")
+      kill -TERM -- "-$bp" 2> /dev/null || kill -TERM "$bp" 2> /dev/null || true
+    fi
+  fi
+  exit "$1"
 }
 
 # run_side <name> <rev> <remote dir> <runner> <out dir> <bound s> <bin>...: one side's sync, build and scans on the box.
-# `rev` is a commit (extracted from `git archive`) or `worktree`: this tree as it is, synced by its own tools/box.sh.
+# `rev` is a commit (extracted from `git archive`) or `worktree`: this tree as it is, synced by its own tools/box.sh. The box.sh runs in
+# the background and is waited for, so a stop signal is handled at once (a trap waits for a foreground command); its pid goes to
+# <out>/<name>.box.pid, and its stderr through a fifo to <out>/<name>.build.log and ours.
 run_side() {
-  local name=$1 rev=$2 dir=$3 runner=$4 out=$5 bound=$6 src rc t0 cmd
+  local name=$1 rev=$2 dir=$3 runner=$4 out=$5 bound=$6 src rc t0 cmd fifo tp bp
   shift 6
   if [ "$rev" = worktree ]; then
     src=$ROOT
@@ -199,15 +257,32 @@ run_side() {
     rc=("${PIPESTATUS[@]}")
     [ "${rc[0]}" = 0 ] && [ "${rc[1]}" = 0 ] || die 1 "git archive $rev failed (git ${rc[0]}, tar ${rc[1]})"
   fi
-  cmd=$(side_command "$bound")
+  ACTIVE_RPIDF=.narrow-scan-$name-$$.pid
+  cmd=$(side_command "$bound" "$ACTIVE_RPIDF")
   echo "narrow-scan: $name: $rev -> $dir (bound ${bound}s)" >&2
   t0=$SECONDS
-  # git must not find this tree's repository above the archive (box.sh stamps its HEAD into the build as the commit).
+  fifo=$out/$name.build.fifo
+  rm -f "$fifo"
+  mkfifo "$fifo" || die 70 "cannot make $fifo"
+  tee "$out/$name.build.log" < "$fifo" >&2 &
+  tp=$!
+  # git must not find this tree's repository above the archive (box.sh stamps its HEAD into the build as the commit). Job control
+  # makes the subshell the leader of a process group of its own, so a stop reaches box.sh's ssh and rsync with the one pid.
+  set -m
   (
-    cd "$src" && env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER GIT_CEILING_DIRECTORIES="$out" BLOOMERY_REMOTE="$dir" \
+    cd "$src" && exec env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER GIT_CEILING_DIRECTORIES="$out" BLOOMERY_REMOTE="$dir" \
       ./tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out"
-  ) | tee "$out/$name.build.log" >&2
-  rc=${PIPESTATUS[0]}
+  ) > "$fifo" &
+  bp=$!
+  set +m
+  ACTIVE_PIDF=$out/$name.box.pid
+  echo "$bp" > "$ACTIVE_PIDF"
+  ACTIVE_NAME=$name ACTIVE_DIR=$dir
+  wait "$bp"
+  rc=$?
+  ACTIVE_NAME=''
+  wait "$tp" 2> /dev/null
+  rm -f "$fifo" "$ACTIVE_PIDF"
   SIDE_WALL=$((SECONDS - t0))
   [ "$rev" = worktree ] || rm -rf "$src"
   case $rc in
@@ -242,8 +317,15 @@ self_test() {
   [ "$(grep -c -- '--no-jit' "$t/runner.sh")" = 3 ]; ok "runner: one --no-jit scan per bin" $?
   sed -n "/^cat > \"\$P\" <<'NARROW_PTX_SCAN_EOF'$/,/^NARROW_PTX_SCAN_EOF$/p" "$t/runner.sh" | sed '1d;$d' | cmp -s - "$t/ptx-scan.sh"; ok "runner: ptx-scan.sh embedded verbatim" $?
   [ "$(grep -c '^echo "narrow-scan: wall: ' "$t/runner.sh")" = 6 ]; ok "runner: a wall line per build group, the extractor and each scan" $?
-  case $(side_command 900) in *"cargo oxide"*) ;; *) false ;; esac; ok "side command: names cargo oxide, so box.sh checks the backend" $?
-  case $(side_command 900) in *"timeout --kill-after=10 900 bash"*) ;; *) false ;; esac; ok "side command: the runner runs under the bound" $?
+  case $(side_command 900 .p-1) in *"cargo oxide"*) ;; *) false ;; esac; ok "side command: names cargo oxide, so box.sh checks the backend" $?
+  case $(side_command 900 .p-1) in *"timeout --kill-after=10 900 bash"*) ;; *) false ;; esac; ok "side command: the runner runs under the bound" $?
+  case $(side_command 900 .p-1) in *'echo $! > .p-1'*) ;; *) false ;; esac; ok "side command: the runner's pid is recorded in the named file" $?
+  case $(side_command 900 .p-1) in *'rm -f "$T" .p-1'*) ;; *) false ;; esac; ok "side command: the pid file goes when the runner ends" $?
+  sc=$(stop_command .p-1 2> /dev/null)
+  ro=$(sed -n "s/^    ro_build='\(.*\)'$/\1/p" "$ROOT/tools/box.sh")
+  [ -n "$sc" ] && [ -n "$ro" ] && ! [[ $sc =~ $ro ]] && [[ $sc != *target/* ]]; ok "drift: box.sh's READONLY mode accepts the stop command (no build word, no target/)" $?
+  got=$(cd "$t" && bash -c "$(stop_command .no-such.pid 2> /dev/null)" 2>&1)
+  grep -qF "no remote pid recorded in .no-such.pid" <<< "$got"; ok "stop command: with no pid file it says so and signals nothing" $?
   grep -q "the build with features gpu failed" "$t/runner.sh" && grep -q "the extractor build failed" "$t/runner.sh"; ok "runner: a failed build ends it by name" $?
   # split_logs
   {
@@ -286,7 +368,7 @@ self_test() {
   [ "$rc" = 64 ] && grep -qF "narrow-scan: BLOOMERY_ARCH is 'sm_121': the scan pairs are sm_86's" <<< "$got"; ok "arch: another BLOOMERY_ARCH is refused by name (64)" $?
   # --worktree: this script in a throwaway repository beside stub tools (no box, no card), so the whole run goes through
   # the real argument handling, the side loop and the affected call. The box stub logs which content each side synced.
-  w=$t/wt
+  w=$t/bloomery-wt
   mkdir -p "$w/tools" "$t/home"
   cp "$0" "$w/tools/narrow-scan.sh"
   printf '%s\n' 'import os, sys' 'open(os.environ["STUB_LOG"], "a").write("recipes " + " ".join(sys.argv[1:]) + "\n")' \
@@ -296,9 +378,31 @@ self_test() {
   cat > "$w/tools/box.sh" <<'NARROW_STUB_EOF'
 #!/usr/bin/env bash
 here=$(cd "$(dirname "$0")/.." && pwd)
-cat > /dev/null
+# The stop's read-only call: its command runs in the fake remote dir, as box.sh's READONLY mode runs it on the box.
+if [ "${BLOOMERY_BOX_READONLY:-0}" = 1 ]; then
+  echo "readonly $BLOOMERY_REMOTE" >> "$STUB_LOG"
+  cd "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")" || exit 66
+  exec bash -c "$*"
+fi
 side=head
-[ "$BLOOMERY_REMOTE" = rb ] && side=base
+case $BLOOMERY_REMOTE in rb | *narrow-base) side=base ;; esac
+# STUB_HANG: the box.sh itself is held before it starts anything on the box (the sync, the guard's wait).
+if [ -n "${STUB_HANG:-}" ]; then
+  mkdir -p "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")"
+  echo $$ > "$STUB_REMOTE/hang.pid"
+  sleep 60 &
+  echo $! > "$STUB_REMOTE/hang-sleep.pid"
+  wait $!
+  exit 0
+fi
+# STUB_BLOCK: the box command itself runs in the fake remote dir, with a runner that never ends.
+if [ -n "${STUB_BLOCK:-}" ]; then
+  mkdir -p "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")" && cd "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")" || exit 70
+  echo "$side $BLOOMERY_REMOTE blocked" >> "$STUB_LOG"
+  printf 'exec sleep 60\n' | PATH="$STUB_BIN:$PATH" bash -c "$*"
+  exit $?
+fi
+cat > /dev/null
 new=no
 [ -e "$here/new.txt" ] && new=yes
 echo "$side $BLOOMERY_REMOTE marker=$(cat "$here/marker.txt") new=$new" >> "$STUB_LOG"
@@ -339,6 +443,120 @@ NARROW_STUB_EOF
   orphan=$(git -C "$w" commit-tree "$(git -C "$w" rev-parse 'HEAD^{tree}')" -m orphan)
   wt_run "$t/anc.log" "$orphan" --worktree --out "$t/anc-out"
   [ "$rc" = 64 ] && grep -qF "is not an ancestor of this tree's HEAD" <<< "$got" && [ ! -s "$t/anc.log" ]; ok "worktree: a BASE that is not an ancestor is refused rc 64 by name, nothing synced" $?
+  # Per-track remote dirs (the header): the tree's directory name minus "bloomery-" names its pair, the main tree keeps the old
+  # names. Each case runs a copy of the throwaway tree under another directory name; --dry-run prints the pair and touches no box.
+  mkdir -p "$t/names"
+  for name in bloomery bloomery-aa bloomery-bb plain 'bloomery-a+b'; do cp -R "$w" "$t/names/$name"; done
+  # dirs_of <tree name> [VAR=value…]: the dry run's output in $got, its code in $rc
+  dirs_of() {
+    local name=$1
+    shift
+    got=$(env HOME="$t/home" STUB_LOG="$t/dirs.log" "$@" bash "$t/names/$name/tools/narrow-scan.sh" "$wb" --dry-run 2>&1)
+    rc=$?
+  }
+  dirs_of bloomery-aa
+  grep -qF "base dir ~/repo/bloomery-aa-narrow-base, head dir ~/repo/bloomery-aa-narrow-head," <<< "$got"; ok "dirs: a track's pair is ~/repo/bloomery-<track>-narrow-base and -narrow-head" $?
+  aa=$got
+  dirs_of bloomery-bb
+  [ "$got" != "$aa" ] && grep -qF "~/repo/bloomery-bb-narrow-base" <<< "$got" && ! grep -qF "bloomery-aa" <<< "$got"; ok "dirs: two tracks get distinct dirs" $?
+  dirs_of bloomery
+  grep -qF "base dir ~/repo/bloomery-narrow-base, head dir ~/repo/bloomery-narrow-head," <<< "$got"; ok "dirs: the main tree keeps ~/repo/bloomery-narrow-base and -narrow-head (the unchanged names)" $?
+  dirs_of plain
+  grep -qF "base dir ~/repo/bloomery-plain-narrow-base," <<< "$got"; ok "dirs: a tree not named bloomery-<track> is a track of its own name" $?
+  dirs_of bloomery-aa NARROW_BASE_REMOTE=/x/base
+  grep -qF "base dir /x/base, head dir ~/repo/bloomery-aa-narrow-head," <<< "$got"; ok "dirs: NARROW_BASE_REMOTE overrides the base dir, the head dir stays the track's" $?
+  dirs_of bloomery-aa NARROW_HEAD_REMOTE=/x/head
+  grep -qF "base dir ~/repo/bloomery-aa-narrow-base, head dir /x/head," <<< "$got"; ok "dirs: NARROW_HEAD_REMOTE overrides the head dir, the base dir stays the track's" $?
+  dirs_of 'bloomery-a+b'
+  [ "$rc" = 64 ] && grep -qF "is not a box directory name" <<< "$got"; ok "dirs: a tree name outside [A-Za-z0-9._-] is refused by name (64)" $?
+  dirs_of 'bloomery-a+b' NARROW_BASE_REMOTE=/x/b NARROW_HEAD_REMOTE=/x/h
+  [ "$rc" = 0 ] && grep -qF "base dir /x/b, head dir /x/h," <<< "$got"; ok "dirs: both overrides given, the tree's name is not read" $?
+  # The stop and the lock. trk_run <tree> <stub log> <args…>: a run on the tree's own dirs that does not wait for the lock.
+  trk_run() {
+    local tree=$1 log=$2
+    shift 2
+    : > "$log"
+    got=$(HOME="$t/home" STUB_LOG="$log" NARROW_WAIT=0 bash "$tree/tools/narrow-scan.sh" "$@" 2>&1)
+    rc=$?
+  }
+  # The fake `timeout` execs the command, so the runner is one process (the real one ends its whole process group on a TERM).
+  mkdir -p "$t/fakebin" "$t/remote"
+  printf '%s\n' '#!/bin/sh' 'shift 2' 'exec "$@"' > "$t/fakebin/timeout"
+  chmod +x "$t/fakebin/timeout"
+  : > "$t/stop-stub.log"
+  HOME="$t/home" STUB_LOG="$t/stop-stub.log" STUB_BLOCK=1 STUB_REMOTE="$t/remote" STUB_BIN="$t/fakebin" \
+    bash "$t/names/bloomery-aa/tools/narrow-scan.sh" "$wb" --worktree --out "$t/stop-out" > "$t/stop.log" 2>&1 &
+  sp=$!
+  pf='' k=0
+  while [ -z "$pf" ] && [ "$k" -lt 100 ] && kill -0 "$sp" 2> /dev/null; do
+    for f in "$t"/remote/*/.narrow-scan-*.pid; do [ ! -e "$f" ] || pf=$f; done
+    [ -n "$pf" ] || sleep 0.2
+    k=$((k + 1))
+  done
+  [ -n "$pf" ]; ok "stop: the box command records the pid of the runner it started" $?
+  rp=$(cat "$pf" 2> /dev/null || echo 0)
+  case $rp in '' | *[!0-9]*) rp=0 ;; esac
+  [ "$rp" -gt 1 ] && kill -0 "$rp" 2> /dev/null; ok "stop: … and that pid is the live runner" $?
+  trk_run "$t/names/bloomery-aa" "$t/same.log" "$wb" "$wb" --out "$t/same-out"
+  [ "$rc" = 75 ] && grep -qF "is held by pid $sp" <<< "$got"; ok "lock: a second run on the same pair is refused rc 75, naming the holder" $?
+  trk_run "$t/names/bloomery-bb" "$t/bb.log" "$wb" "$wb" --out "$t/bb-out"
+  [ "$rc" = 0 ] && grep -qx "base ~/repo/bloomery-bb-narrow-base marker=base new=no" "$t/bb.log" && grep -qx "head ~/repo/bloomery-bb-narrow-head marker=base new=no" "$t/bb.log"
+  ok "lock: another track's run is not held up by it and runs on its own pair" $?
+  kill -TERM "$sp"
+  k=0
+  while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 100 ]; do sleep 0.2; k=$((k + 1)); done
+  gone=0
+  if kill -0 "$sp" 2> /dev/null; then kill -KILL "$sp" 2> /dev/null; gone=1; fi
+  src=0
+  { wait "$sp"; src=$?; } 2> /dev/null
+  [ "$gone" = 0 ] && [ "$src" = 143 ]; ok "stop: a TERM ends the run at once, rc 143" $?
+  [ "$rp" -gt 1 ] && ! kill -0 "$rp" 2> /dev/null; ok "stop: the recorded remote pid is gone" $?
+  grep -qx "readonly ~/repo/bloomery-aa-narrow-base" "$t/stop-stub.log" && grep -qF "signalled the recorded remote pid $rp" "$t/stop.log"
+  ok "stop: it signalled exactly that pid, through a read-only call on the side's dir" $?
+  [ -z "$(ls -d "$t/home/.cache/bloomery"/narrow-scan*.lock.d 2> /dev/null)" ]; ok "stop: the lock is released" $?
+  # The main tree's pair keeps the lock older copies of the script took for every tree: a live holder of it holds that pair, and no other.
+  mkdir -p "$t/home/.cache/bloomery/narrow-scan.lock.d"
+  echo $$ > "$t/home/.cache/bloomery/narrow-scan.lock.d/pid"
+  echo "an older copy" > "$t/home/.cache/bloomery/narrow-scan.lock.d/who"
+  trk_run "$t/names/bloomery" "$t/legacy.log" "$wb" "$wb" --out "$t/legacy-out"
+  [ "$rc" = 75 ] && grep -qF "is held by pid $$ (an older copy)" <<< "$got"; ok "lock: the main tree's pair is held by a run of an older copy (the old lock name), rc 75 naming it" $?
+  trk_run "$t/names/bloomery-bb" "$t/legacy-bb.log" "$wb" "$wb" --out "$t/legacy-bb-out"
+  [ "$rc" = 0 ]; ok "lock: … and a track's own pair is not" $?
+  rm -rf "$t/home/.cache/bloomery/narrow-scan.lock.d"
+  # A stop before the box command has started a runner: nothing is recorded there, and the local box.sh is ended by its pid file.
+  # hang_case <TERM|INT> <rc>: a run with the stub held before it starts anything on the box, stopped by that signal. The run starts
+  # with INT at its default: a background job, or any step of a parallel runner (mac-static), has it ignored, and an ignored signal
+  # cannot be trapped.
+  hang_case() {
+    local sig=$1 want=$2 hp hs hc k gone src
+    : > "$t/hang-stub.log"
+    rm -f "$t/remote/hang.pid" "$t/remote/hang-sleep.pid"
+    HOME="$t/home" STUB_LOG="$t/hang-stub.log" STUB_HANG=1 STUB_REMOTE="$t/remote" \
+      python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp("bash", ["bash"] + sys.argv[1:])' \
+      "$t/names/bloomery-bb/tools/narrow-scan.sh" "$wb" "$wb" --out "$t/hang-out-$sig" > "$t/hang-$sig.log" 2>&1 &
+    hp=$!
+    k=0
+    while [ ! -s "$t/remote/hang.pid" ] && [ "$k" -lt 100 ] && kill -0 "$hp" 2> /dev/null; do sleep 0.2; k=$((k + 1)); done
+    hs=$(cat "$t/remote/hang.pid" 2> /dev/null || echo 0)
+    case $hs in '' | *[!0-9]*) hs=0 ;; esac
+    [ "$hs" -gt 1 ] && [ "$(cat "$t/hang-out-$sig/base.box.pid" 2> /dev/null)" = "$hs" ]; ok "stop $sig: the pid file under DIR holds the local box.sh's pid" $?
+    kill -"$sig" "$hp"
+    k=0
+    while kill -0 "$hp" 2> /dev/null && [ "$k" -lt 100 ]; do sleep 0.2; k=$((k + 1)); done
+    gone=0
+    if kill -0 "$hp" 2> /dev/null; then kill -KILL "$hp" 2> /dev/null; gone=1; fi
+    src=0
+    { wait "$hp"; src=$?; } 2> /dev/null
+    [ "$gone" = 0 ] && [ "$src" = "$want" ] && grep -qF "no remote pid recorded in .narrow-scan-base-$hp.pid" "$t/hang-$sig.log"
+    ok "stop $sig: before any runner started it says so and ends rc $want" $?
+    [ "$hs" -gt 1 ] && ! kill -0 "$hs" 2> /dev/null; ok "stop $sig: … and the local box.sh is gone" $?
+    hc=$(cat "$t/remote/hang-sleep.pid" 2> /dev/null || echo 0)
+    case $hc in '' | *[!0-9]*) hc=0 ;; esac
+    [ "$hc" -gt 1 ] && ! kill -0 "$hc" 2> /dev/null; ok "stop $sig: … and so is the process it had started (the ssh), by the job's process group" $?
+    if [ "$hc" -gt 1 ]; then kill -TERM "$hc" 2> /dev/null || true; fi
+  }
+  hang_case TERM 143
+  hang_case INT 130
   # usage refusals
   for args in "" "--bogus a" "a b c" "x --out"; do
     # shellcheck disable=SC2086
@@ -397,8 +615,22 @@ fi
 [ -n "$OUT" ] || OUT=$HOME/.cache/bloomery/narrow/$(basename "$ROOT")/${BASE_SHA:0:8}-$HEAD_NAME
 case $OUT in /*) ;; *) OUT=$PWD/$OUT ;; esac
 mkdir -p "$OUT" || die 70 "cannot make $OUT"
-BASE_DIR=${NARROW_BASE_REMOTE:-'~/repo/bloomery-narrow-base'}
-HEAD_DIR=${NARROW_HEAD_REMOTE:-'~/repo/bloomery-narrow-head'}
+# The pair of remote dirs (the header): this tree's track is its directory name without "bloomery-"; the main tree has none.
+TRACK=''
+if [ -z "${NARROW_BASE_REMOTE:-}" ] || [ -z "${NARROW_HEAD_REMOTE:-}" ]; then
+  case $(basename "$ROOT") in
+    bloomery) ;;
+    bloomery-?*) TRACK=$(basename "$ROOT") TRACK=${TRACK#bloomery-} ;;
+    *) TRACK=$(basename "$ROOT") ;;
+  esac
+  case $TRACK in
+    *[!A-Za-z0-9._-]*) die 64 "this tree's name '$TRACK' is not a box directory name ([A-Za-z0-9._-]): name the remote dirs with NARROW_BASE_REMOTE and NARROW_HEAD_REMOTE" ;;
+  esac
+fi
+PAIR='~/repo/bloomery'
+[ -z "$TRACK" ] || PAIR=$PAIR-$TRACK
+BASE_DIR=${NARROW_BASE_REMOTE:-$PAIR-narrow-base}
+HEAD_DIR=${NARROW_HEAD_REMOTE:-$PAIR-narrow-head}
 BOUND=${NARROW_BOUND:-7200}
 case $BOUND in '' | *[!0-9]*) die 64 "NARROW_BOUND is whole seconds, got '$BOUND'" ;; esac
 if [ "$WORKTREE" = 1 ]; then
@@ -430,11 +662,14 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
-LOCKD=$HOME/.cache/bloomery/narrow-scan.lock.d
+LOCKD=$HOME/.cache/bloomery/narrow-scan-$(str_key "$BASE_DIR $HEAD_DIR").lock.d
+# The main tree's pair is the one every copy of this script shared, under one lock of this name before the pairs were per track: it
+# keeps that lock, so a run of an older copy (a tree not yet rebased) still excludes this one from the dirs.
+[ "$BASE_DIR $HEAD_DIR" != '~/repo/bloomery-narrow-base ~/repo/bloomery-narrow-head' ] || LOCKD=$HOME/.cache/bloomery/narrow-scan.lock.d
 lock_take "$LOCKD" "${NARROW_WAIT:-1800}" "$(basename "$ROOT") ${BASE_SHA:0:8}..$HEAD_NAME since $(date +%H:%M:%S)" || exit $?
 trap 'lock_release "$LOCKD"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'stop_run 130' INT
+trap 'stop_run 143' TERM
 
 T0=$SECONDS
 WALL_BASE=- WALL_HEAD=-
