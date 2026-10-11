@@ -2231,7 +2231,7 @@ gate-gpu-glm5next-stagger:
 # gate_glm5next_e2e (`--only media`, `shared/glm5next_media.rs`): the fixture's prompts c1-c3 fed mainline's own tower
 # rows of the image-input sets (`fx_ref_glm5next_vis_*`, `just dump-ref-glmv`), the last position's `result_norm` held
 # within the CPU twin's distance of the CUDA run and nearer it than the text-only control, and the media refusals by
-# name with the model unmoved. Fixture tier only: the real tier leaves (im) to it before any load. Loads the fixture
+# name with the model unmoved. Fixture tier only: on the real tier the bin fails by name before any load (0 clauses). Loads the fixture
 # once, on either card.
 gate-gpu-glm5next-media:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-glm5next --release --lib && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media'
