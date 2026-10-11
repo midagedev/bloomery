@@ -85,11 +85,14 @@ use super::slot_pass::SlotIn;
 use super::swap35;
 use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
+use super::wide38::STREAM_FLOOR;
 use crate::checkpoint::{self, Checkpoints};
 use crate::flash_gqa::HEAD_256;
 use crate::head::Head;
-use crate::host::swap::Residency;
+use crate::host::prompt_stream::PromptStream;
+use crate::host::swap::{CallPick, CallReport, Residency};
 use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec};
+use crate::host::xstream::{XMode, XStreamBody};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
 use crate::linear::{self, LinearShape};
@@ -125,6 +128,12 @@ const WHAT: &str = "qwen35moe::Body35::load";
 /// allocator's rounding of the arena's some forty buffers to its 2 MiB
 /// pages (at most 80 MiB) — with the rest as margin.
 pub const FIT_RESERVE: usize = 256 << 20;
+
+// The family's no-probe floor ([`Body35::STREAM_FLOOR`]) is past every
+// unit the gemv arm walks — a pass's [`MAX_PASS_ROWS`] and the step's one
+// row among them — so no such unit picks, and the gemv arm, which reads the
+// card copy's row where its front cut its places, never meets a moved map.
+const _: () = assert!(GEMV_COLS < STREAM_FLOOR as usize && MAX_PASS_ROWS <= GEMV_COLS);
 
 /// What [`GpuModel::<Body35>::open`](GpuModel::open) takes besides the card
 /// and the file.
@@ -496,6 +505,9 @@ pub struct Body35 {
     /// Walks the last prompt call ran ([`Body35::prompt_walks`]): one a
     /// unit, counted from the call's start, whichever sequence ran it.
     prompt_walks: usize,
+    /// The prompt call's host streaming (`BLOOMERY_XSTREAM`): off until a
+    /// caller sets it ([`Body35::set_xstream`]).
+    stream: PromptStream,
 }
 
 /// One Qwen3.6 sequence's own state ([`Slots`], what a select exchanges):
@@ -1483,6 +1495,7 @@ impl Body35 {
             every,
             marks: false,
             prompt_walks: 0,
+            stream: PromptStream::default(),
         })
     }
 
@@ -1583,6 +1596,62 @@ impl Body35 {
     #[must_use]
     pub fn prompt_walks(&self) -> usize {
         self.prompt_walks
+    }
+
+    /// The least count an `admit` pick admits: the family's no-probe floor
+    /// (`wide38`'s `STREAM_FLOOR`); a prompt call of fewer ids opens no call.
+    pub const STREAM_FLOOR: u32 = STREAM_FLOOR;
+
+    /// What the next prompt calls move (`BLOOMERY_XSTREAM`,
+    /// [`PromptStream`]): off until set here, so one load can run every
+    /// arm. Under `Admit` a prompt call of the wide units' path moves each
+    /// card layer's residency pool toward the experts its units route most
+    /// ([`super::placed`]'s streaming walk). Refused by name: `Admit` on a
+    /// load that runs no residency machine, `Split` (the walk's card route
+    /// has no ring pass), and any change while a call streams.
+    pub fn set_xstream(&mut self, mode: XMode) -> Result<(), GpuError> {
+        if self.stream.streaming() {
+            return Err(GpuError::state(
+                "Body35::set_xstream",
+                "no prompt call streaming",
+            ));
+        }
+        let machine = self
+            .placed
+            .as_ref()
+            .is_some_and(|p| p.hybrid.swap().is_some());
+        if mode != XMode::Off && !machine {
+            return Err(GpuError::state(
+                "BLOOMERY_XSTREAM",
+                "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>) for admit or split",
+            ));
+        }
+        if mode == XMode::Split {
+            return Err(GpuError::shape(
+                "BLOOMERY_XSTREAM",
+                "split on qwen35moe waits for its ring: the placed walk's card route has no \
+                 ring pass; take admit or off",
+            ));
+        }
+        self.stream.set_mode(mode);
+        Ok(())
+    }
+
+    /// The load line's `xstream=` word ([`PromptStream::word`]); `off` on a
+    /// load with no host tier.
+    #[must_use]
+    pub fn xstream_word(&self) -> String {
+        match self.placed.as_ref() {
+            Some(p) => self.stream.word(&p.hybrid),
+            None => self.stream.mode().word().to_string(),
+        }
+    }
+
+    /// The last streaming prompt call's picks, each with its walk, and its
+    /// end; empty and `None` after a call that did not stream. Taken: a
+    /// second read is empty ([`PromptStream::take_pick_records`]).
+    pub fn take_stream_records(&mut self) -> (Vec<(usize, CallPick)>, Option<CallReport>) {
+        self.stream.take_pick_records()
     }
 
     /// The marks a prompt call from `from` to `to` takes a checkpoint at:
@@ -1906,6 +1975,7 @@ impl Body35 {
             head_state,
             mma,
             placed,
+            stream,
             ..
         } = self;
         let c = PassCtx {
@@ -1935,7 +2005,7 @@ impl Body35 {
         {
             side.refresh_maps(gpu.stream(), m)?;
             let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, side.cap);
-            return BatchWalk {
+            let walk = BatchWalk {
                 p: WalkParts {
                     c: &c,
                     stores: stores.as_mut_slice(),
@@ -1945,8 +2015,11 @@ impl Body35 {
                     side,
                     rows: pass,
                 },
+            };
+            if stream.streaming() {
+                return walk.walk_streamed(&mut leg, tail, stream, pos as usize + m);
             }
-            .walk(&mut leg, tail);
+            return walk.walk(&mut leg, tail);
         }
         Program {
             c: &c,
@@ -2047,8 +2120,40 @@ impl GpuModel<Body35> {
         } else {
             vec![pos0 + n]
         };
+        // A call before a decode history ends with each layer back at the
+        // set it started with; without one (a fresh sequence) the call's
+        // placement stays. Read once, here: the call keeps no row.
+        let history = self
+            .body(WHAT_P)?
+            .placed
+            .as_ref()
+            .is_some_and(|p| p.hybrid.call_history());
+        let r = self
+            .stream_begin(path, tokens.len(), history)
+            .and_then(|()| self.feed_marks(tokens, path, &marks, marked));
+        // The call's own error first: an end refused after a failed call is
+        // its echo. A failed call's streaming ends with each layer back at
+        // the set it started with too.
+        let ended = self.stream_end(r.is_ok() && !history);
+        let next = r?;
+        ended?;
+        Ok(next)
+    }
+
+    /// [`GpuModel::prefill_with`]'s runs between its `marks` from where the
+    /// model stands, a checkpoint taken at each when `marked`: the argmax
+    /// after the last id.
+    fn feed_marks(
+        &mut self,
+        tokens: &[u32],
+        path: PrefillPath,
+        marks: &[u32],
+        marked: bool,
+    ) -> Result<u32, GpuError> {
+        const WHAT_M: &str = "qwen35moe::prefill";
+        let pos0 = self.pos();
         let (mut next, mut at) = (None, pos0);
-        for &mark in &marks {
+        for &mark in marks {
             if mark > at {
                 let run = &tokens[(at - pos0) as usize..(mark - pos0) as usize];
                 next = Some(self.feed35(run, path)?);
@@ -2056,11 +2161,54 @@ impl GpuModel<Body35> {
             }
             if marked {
                 let pos = self.pos();
-                let (gpu, _, body) = self.body_parts(WHAT_P)?;
+                let (gpu, _, body) = self.body_parts(WHAT_M)?;
                 body.take_mark(gpu.stream(), pos)?;
             }
         }
-        next.ok_or(GpuError::state(WHAT_P, "a token read after the last unit"))
+        next.ok_or(GpuError::state(WHAT_M, "a token read after the last unit"))
+    }
+
+    /// Open the prompt call's streaming ([`PromptStream::begin`]) with the
+    /// body's own facts: whether the path runs wide units (a pass-fed call
+    /// opens none: its units are the gemv arm's), the call's `n` ids and its
+    /// end, whether it `returns` to its start, the floor
+    /// ([`Body35::STREAM_FLOOR`]), no card tail rate and the map's layers.
+    /// Nothing on a load with no host tier.
+    fn stream_begin(&mut self, path: PrefillPath, n: usize, returns: bool) -> Result<(), GpuError> {
+        const WHAT_B: &str = "qwen35moe prompt streaming";
+        let end = self.pos() as usize + n;
+        let (gpu, _, body) = self.body_parts(WHAT_B)?;
+        let layers = body.plans.len();
+        let Body35 { placed, stream, .. } = body;
+        let Some(p) = placed.as_mut() else {
+            return Ok(());
+        };
+        // No record prices this family's card tail: a walk balances without it.
+        let tail = 0.0;
+        stream.begin(
+            &mut p.hybrid,
+            gpu.stream(),
+            path != PrefillPath::Pass,
+            n,
+            end,
+            returns,
+            STREAM_FLOOR,
+            tail,
+            layers,
+        )
+    }
+
+    /// End the prompt call's streaming ([`PromptStream::end`]): the end's
+    /// report kept for [`Body35::take_stream_records`]. The call passes
+    /// `kept` false before a decode history: the decode's experts go back on
+    /// the card.
+    fn stream_end(&mut self, kept: bool) -> Result<(), GpuError> {
+        let (gpu, _, body) = self.body_parts("qwen35moe prompt streaming")?;
+        let Body35 { placed, stream, .. } = body;
+        match placed.as_mut() {
+            Some(p) => stream.end(&mut p.hybrid, gpu.stream(), kept),
+            None => Ok(()),
+        }
     }
 
     /// One run of [`GpuModel::prefill_with`]'s call, from where the model
@@ -2091,6 +2239,7 @@ impl GpuModel<Body35> {
                     UnitEnd::Pass
                 };
                 body.walk_unit(gpu, w, unit, pos, end)?;
+                body.stream.walk_done();
                 Ok(last)
             })?;
         }
@@ -2350,6 +2499,19 @@ fn media_call<T>(
             )),
         },
         (ran, _) => ran,
+    }
+}
+
+impl XStreamBody for Body35 {
+    /// [`Body35::set_xstream`]; the card is not read until `split` has a
+    /// ring to start.
+    fn set_xstream(&mut self, _gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
+        Body35::set_xstream(self, mode)
+    }
+
+    /// [`Body35::xstream_word`].
+    fn xstream_word(&self) -> String {
+        Body35::xstream_word(self)
     }
 }
 
