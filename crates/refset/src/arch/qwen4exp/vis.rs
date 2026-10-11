@@ -7,7 +7,7 @@
 
 use super::{ARCH, MODEL};
 use crate::RefError;
-use crate::clefvis::{Profile, QVIS_LCPP_BUILD, vis_families};
+use crate::clefvis::{Profile, ProjectorKind, QVIS_LCPP_BUILD, vis_families};
 
 /// The projector every Qwen3.8 image-input set is dumped with: unsloth's bf16 file from the repository of the seat's
 /// default `--hf` (`crates/gpu-gates/src/bin/bloomery_serve.rs`), under the box's `/models/mmproj`.
@@ -25,6 +25,8 @@ pub static PROFILE: Profile = Profile {
     mmproj_sha256: MMPROJ_BF16_SHA256,
     n_embd: 2560,
     image_pad_id: 248_056,
+    projector: ProjectorKind::Qwen3vlMerger,
+    respell: None,
 };
 
 /// [`MMPROJ_BF16`], as a tower family's `runs`.
@@ -38,9 +40,9 @@ fn model() -> Result<String, RefError> {
 }
 
 vis_families! {
+    recipe: "just dump-ref-qvis qwen4exp",
     prefix: "ref_qwen4exp_vis",
     name: "qwen4exp-vis",
-    model: "qwen4exp",
     profile: PROFILE,
     arch: ARCH,
     build: QVIS_LCPP_BUILD,

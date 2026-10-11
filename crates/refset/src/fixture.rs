@@ -297,6 +297,23 @@ pub fn line(first_shard: &Path) -> Result<String, RefError> {
     Ok(format!("{LINE_PREFIX}{}", keys(first_shard)?))
 }
 
+/// `stated`, the text after the tab of the `# fixture` line set `set` carries, against the [`line`] of the fixture file
+/// whose first shard is `first_shard`: [`RefError::Stale`] unless the two lines are the same string, naming both. A set
+/// that states none is stale too — nothing says which generation of the fixture it came from.
+pub fn check_stated(set: &Path, stated: Option<&str>, first_shard: &Path) -> Result<(), RefError> {
+    let runs = line(first_shard)?;
+    let dumped_from = stated.map(|s| format!("{LINE_PREFIX}{s}"));
+    if dumped_from.as_deref() == Some(runs.as_str()) {
+        return Ok(());
+    }
+    Err(RefError::Stale {
+        set: set.display().to_string(),
+        dumped_from: dumped_from
+            .unwrap_or_else(|| "an unstated fixture (the set has no # fixture line)".to_string()),
+        runs,
+    })
+}
+
 /// What follows the tab of the `# fixture` line: every header key of the file
 /// that starts with `bloomery.fixture.`, sorted by byte order, each as
 /// `key=value`, joined by one space. A value is an integer in decimal, a bool

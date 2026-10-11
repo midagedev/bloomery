@@ -69,6 +69,17 @@ pub(crate) fn put(dir: &Path, rows: &mut Vec<String>, name: &str, ne: [u64; 4], 
 
 /// The i32 row `name` `[v.len(), 1, 1, 1]` with its f32 file and its lossless i32 twin.
 pub(crate) fn put_ints(dir: &Path, rows: &mut Vec<String>, name: &str, v: &[i32]) {
+    put_ints_shaped(dir, rows, name, [v.len() as u64, 1], v);
+}
+
+/// The i32 row `name` of shape `[ne[0], ne[1], 1, 1]` holding `v`, with its f32 file and its lossless i32 twin.
+pub(crate) fn put_ints_shaped(
+    dir: &Path,
+    rows: &mut Vec<String>,
+    name: &str,
+    ne: [u64; 2],
+    v: &[i32],
+) {
     let n = v.len();
     let f32s: Vec<u8> = v.iter().flat_map(|&p| (p as f32).to_le_bytes()).collect();
     let i32s: Vec<u8> = v.iter().flat_map(|p| p.to_le_bytes()).collect();
@@ -78,7 +89,9 @@ pub(crate) fn put_ints(dir: &Path, rows: &mut Vec<String>, name: &str, v: &[i32]
     let sum: i64 = v.iter().map(|&p| i64::from(p)).sum();
     let absmax = v.iter().map(|p| p.unsigned_abs()).max().unwrap_or(0);
     rows.push(format!(
-        "tensor\t{name}\t0\ti32\t{n}\t1\t1\t1\t{}\t{sum}.000000\tINPUT\t1\t0\t-\t-",
+        "tensor\t{name}\t0\ti32\t{}\t{}\t1\t1\t{}\t{sum}.000000\tINPUT\t1\t0\t-\t-",
+        ne[0],
+        ne[1],
         4 * n
     ));
     rows.push(format!(
