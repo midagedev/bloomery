@@ -76,12 +76,15 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
 /// The tile kernel's rate: `rows` weight rows each dotted against `cols` columns through
 /// `dot_row_cols`, single-threaded, as the host union walks a run of columns. Prints the
 /// weight bytes streamed per second and the time per (row, column) dot, the number
-/// `dot_row`'s line gives as bytes over time for one column. MXFP4 only: the filler is its
-/// E8M0 range as in `bench`.
+/// `dot_row`'s line gives as bytes over time for one column. MXFP4 and Q6_K only, the types
+/// whose filler is written: MXFP4's E8M0 byte in its `bench` range, and Q6_K's f16 `d` (bytes
+/// 208..210 of the 210 B block, after ql[128], qh[64] and the 16 i8 scales) at a fixed normal
+/// exponent (2^-5) with two random mantissa bits, since random bytes make it a NaN or an
+/// infinity in 2 blocks of 64 on average. Any other type is refused by name.
 fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize) {
     assert!(
-        ty == GgmlType::MXFP4,
-        "bench_tile fills MXFP4 blocks only, got {ty:?}"
+        matches!(ty, GgmlType::MXFP4 | GgmlType::Q6_K),
+        "bench_tile fills MXFP4 and Q6_K blocks only, got {ty:?}"
     );
     assert!(qdot::has_tile(ty), "{ty:?} has no tile kernel on this CPU");
     let mut s = 0x9E3779B97F4A7C15u64;
@@ -95,8 +98,14 @@ fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize
     for c in w.as_chunks_mut::<8>().0 {
         c.copy_from_slice(&next().to_le_bytes());
     }
-    for b in w.as_chunks_mut::<17>().0 {
-        b[0] = 0x70 | (b[0] & 0x0f);
+    if ty == GgmlType::MXFP4 {
+        for b in w.as_chunks_mut::<17>().0 {
+            b[0] = 0x70 | (b[0] & 0x0f);
+        }
+    } else {
+        for b in w.as_chunks_mut::<210>().0 {
+            b[209] = 0x28 | (b[209] & 0x03);
+        }
     }
     let cb = qdot::col_bytes(ty, k);
     let acols: Vec<Vec<u8>> = (0..cols)
@@ -142,6 +151,9 @@ const ROWS: &[(GgmlType, usize, usize)] = &[
     (GgmlType::Q3_K, 2048, (2048 / 256) * 110),
     (GgmlType::Q4_K, 2048, (2048 / 256) * 144),
     (GgmlType::Q6_K, 2048, (2048 / 256) * 210),
+    // Qwen3.6/3.8 ffn_down_exps k = 512 (2 x 210 B = 420 B/row), the one-column twin of the
+    // Q6_K tile rows at that shape.
+    (GgmlType::Q6_K, 512, (512 / 256) * 210),
     // Real ffn_down_exps shape: k = 1408 (44 x 22 B = 968 B/row).
     (GgmlType::Q5_0, 1408, (1408 / 32) * 22),
     // Real ffn_down shape: k = 10944 (342 x 24 B = 8208 B/row).
@@ -203,6 +215,14 @@ fn main() {
     if only.is_empty() {
         for k in [2048, 4096] {
             bench_tile(GgmlType::MXFP4, k, (k / 32) * 17, rows, qdot::TILE_COLS);
+        }
+        // The Q6_K tile at C = 4 and C = 8 at k = 2048 and k = 512, beside C = 1 on the same
+        // filler: `dot_row_cols` with one column runs `dot_row`, the one-column kernel, so the
+        // tile's ratio reads against C = 1, never against `ROWS`' random-`d` Q6_K lines.
+        for k in [2048, 512] {
+            for cols in [1, 4, qdot::TILE_COLS] {
+                bench_tile(GgmlType::Q6_K, k, (k / 256) * 210, rows, cols);
+            }
         }
     }
 }
