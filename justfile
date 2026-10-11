@@ -883,7 +883,7 @@ gate-gpu-clef-hidden:
 # resumed, a step graph captured at load and replayed after an image call, and the hidden band of set C per region. Real
 # file only (the clefvis sets are dumped from it); the gate lock.
 gate-gpu-qwen35-media:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35-media && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35-media && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
 
 # The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q5_K_M (6.9 GB, the
 # `qwen35` file of rev d7f376ea) with the release's head; the six refusals (a qwen35 file with no head, --model
