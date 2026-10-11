@@ -116,7 +116,8 @@ use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::{GgmlType, dequant_row};
-use model::arch::models::{HeadRows, MtpSource};
+use model::arch::models::MtpSource;
+use model::arch::models::headpick::HeadSet;
 use model::placement::Plan;
 use runtime::hc_gated::Geometry;
 use std::mem::ManuallyDrop;
@@ -300,11 +301,11 @@ impl Mtp38 {
         );
         w.join_rows(stream, &[&gate, &shared], router(d.index as usize))?;
         let head = match &d.head_rows {
-            HeadRows::Full => HeadMap {
+            HeadSet::Full => HeadMap {
                 ids: DeviceBuffer::zeroed(stream, vocab)?,
                 rows: None,
             },
-            HeadRows::List { ids, .. } => {
+            HeadSet::List { ids, .. } => {
                 if let Some(&id) = ids.iter().find(|&&id| id as usize >= vocab) {
                     return Err(GpuError::shape(
                         WHAT,

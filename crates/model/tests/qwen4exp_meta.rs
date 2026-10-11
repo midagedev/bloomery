@@ -845,7 +845,7 @@ const SHARED: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q
 #[test]
 #[ignore = "needs the Qwen3.8-Flash-Next shards and the shared MTP file on the box (just gate-qwen4exp-meta)"]
 fn hw_qwen4exp_card_plan() {
-    use model::arch::models::HeadRows;
+    use model::arch::models::headpick::HeadSet;
     use model::arch::qwen35moe::place::{self, Experts, MtpInputs, PlanInputs};
     use model::placement::workstation::{A6000, CONTEXT, MARGIN, RTX_3090};
     use model::placement::{CardFormat, Device, Format, Plan, PlanLevers, Role};
@@ -864,7 +864,7 @@ fn hw_qwen4exp_card_plan() {
     // memory reads: a room no host need passes, given, not read.
     inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
     let draft = Split::open(SHARED).unwrap_or_else(|e| panic!("open {SHARED}: {e}"));
-    let mtp = MtpInputs::read(&draft, &split, &inputs, HeadRows::Full)
+    let mtp = MtpInputs::read(&draft, &split, &inputs, HeadSet::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
     let mut host_only = inputs.host_only();
     host_only.sort_by(|x, y| (x.layer, &x.tensor).cmp(&(y.layer, &y.tensor)));
@@ -1266,7 +1266,7 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
 #[test]
 #[ignore = "needs the UD-Q3_K_XL shards and the shared MTP file on the box (just gate-qwen4exp-meta)"]
 fn hw_qwen4exp_q3_card_plan() {
-    use model::arch::models::HeadRows;
+    use model::arch::models::headpick::HeadSet;
     use model::arch::qwen35moe::mtp::BorrowedHead;
     use model::arch::qwen35moe::place::{self, Experts, MtpInputs, PlanInputs};
     use model::placement::workstation::{A6000, CONTEXT, MARGIN, RTX_3090};
@@ -1292,7 +1292,7 @@ fn hw_qwen4exp_q3_card_plan() {
         list.iter().map(String::as_str).eq(COVERAGE.iter().copied()),
     );
     let draft = Split::open(SHARED).unwrap_or_else(|e| panic!("open {SHARED}: {e}"));
-    let mtp = MtpInputs::read(&draft, &split, &inputs, HeadRows::Full)
+    let mtp = MtpInputs::read(&draft, &split, &inputs, HeadSet::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED} over {Q3}: {e}"));
     check(
         &mut o,

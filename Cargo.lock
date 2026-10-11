@@ -277,6 +277,8 @@ name = "bloomery-models"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
