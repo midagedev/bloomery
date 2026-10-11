@@ -589,7 +589,7 @@ box() {
   : > "$tmp/ssh.log"
   rm -f "$tmp/rsync.log" "$tmp/rsync.sync-id" "$tmp/rsync.sync-path" "$tmp/boxq.args" "$tmp/boxq.job"
   env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_READONLY -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD \
-    -u BLOOMERY_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_V41_MODEL -u BLOOMERY_DATA \
+    -u BLOOMERY_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_V41_MODEL -u BLOOMERY_DATA -u BLOOMERY_ARCH \
     -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S -u STUB_RSYNC_RC -u STUB_PROBE_RC -u STUB_BOXQ_RC \
     STUB_BOXQ_ARGS="$tmp/boxq.args" STUB_BOXQ_JOB="$tmp/boxq.job" \
     PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
@@ -628,6 +628,30 @@ rc_is 'box.sh: a command with the default card runs' 0 box "$B/tools/box.sh" tru
 sshlog 'box.sh: the default card reaches the box as BLOOMERY_BOX_CARD=3090' ' BLOOMERY_BOX_CARD=3090 && .*true$'
 rc_is 'box.sh: a command with BLOOMERY_CARD=both runs' 0 box env BLOOMERY_CARD=both "$B/tools/box.sh" true
 sshlog 'box.sh: BLOOMERY_CARD=both reaches the box as BLOOMERY_BOX_CARD=both' ' BLOOMERY_BOX_CARD=both && .*true$'
+# The arch (tools/arch.sh): unset adds nothing to the remote command and reads no tools/arch.sh (this stub tree has none yet); set,
+# it is exported ahead of the BLOOMERY_BOX_ENV entries; a value that is no arch, or one BLOOMERY_BOX_ENV contradicts, is 64 before
+# anything reaches ssh.
+rc_is 'box.sh: BLOOMERY_ARCH unset runs without tools/arch.sh' 0 box "$B/tools/box.sh" true
+if grep -q 'BLOOMERY_ARCH' "$tmp/ssh.log"; then fail 'box.sh: BLOOMERY_ARCH unset adds nothing to the remote command' 'the command names it' "$tmp/ssh.log"; else pass 'box.sh: BLOOMERY_ARCH unset adds nothing to the remote command'; fi
+cp "$ROOT/tools/arch.sh" "$B/tools/"
+rc_is 'box.sh: BLOOMERY_ARCH=sm_121 runs' 0 box env BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" true
+sshlog 'box.sh: BLOOMERY_ARCH reaches the command as one export' ' export BLOOMERY_ARCH=sm_121 && .*true$'
+rc_is 'box.sh: the same BLOOMERY_ARCH in BLOOMERY_BOX_ENV runs' 0 box env BLOOMERY_ARCH=sm_121 BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" true
+for bad in sm121 '' SM_86 sm_8; do
+  run "box.sh: BLOOMERY_ARCH='$bad' is refused" 64 "BLOOMERY_ARCH is a CUDA arch.*got '$bad'" box env BLOOMERY_ARCH="$bad" "$B/tools/box.sh" true
+  if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail "box.sh: the refused BLOOMERY_ARCH='$bad' reached ssh or rsync" 'something ran' "$tmp/ssh.log"; else pass "box.sh: the refused BLOOMERY_ARCH='$bad' reached no ssh or rsync"; fi
+done
+run 'box.sh: BLOOMERY_ARCH and a different BLOOMERY_BOX_ENV entry are refused' 64 "BLOOMERY_ARCH is 'sm_86' in BLOOMERY_BOX_ENV and 'sm_121' in the environment \(unset: sm_86\): name it in the environment" \
+  box env BLOOMERY_ARCH=sm_121 BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_86 "$B/tools/box.sh" true
+if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail 'box.sh: the contradicting BLOOMERY_ARCH reached ssh or rsync' 'something ran' "$tmp/ssh.log"; else pass 'box.sh: the contradicting BLOOMERY_ARCH reached no ssh or rsync'; fi
+# An entry with the environment unset is measured against the default: the recipes expanded --arch sm_86 on this side.
+run 'box.sh: a BLOOMERY_BOX_ENV arch entry that is not the default, with BLOOMERY_ARCH unset, is refused' 64 "BLOOMERY_ARCH is 'sm_121' in BLOOMERY_BOX_ENV and 'sm_86' in the environment \(unset: sm_86\)" \
+  box env BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" true
+if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail 'box.sh: the unset-environment BLOOMERY_ARCH entry reached ssh or rsync' 'something ran' "$tmp/ssh.log"; else pass 'box.sh: the unset-environment BLOOMERY_ARCH entry reached no ssh or rsync'; fi
+rc_is 'box.sh: a BLOOMERY_BOX_ENV arch entry equal to the default runs' 0 box env BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_86 "$B/tools/box.sh" true
+sshlog 'box.sh: the entry is the only export of BLOOMERY_ARCH' 'export BLOOMERY_ARCH=sm_86 && .*true$'
+if [ "$(grep -o 'export BLOOMERY_ARCH=' "$tmp/ssh.log" | wc -l | tr -d ' ')" = 1 ]; then pass 'box.sh: the entry alone exports BLOOMERY_ARCH once'; else fail 'box.sh: the entry alone exports BLOOMERY_ARCH once' 'not once' "$tmp/ssh.log"; fi
+rm -f "$B/tools/arch.sh"
 
 # The box queue (BLOOMERY_BOX_QUEUE=1): the call syncs behind the remote directory's lock and submits the command as a job
 # of tools/boxq.py (the stub above: it records its words and the job's text, and ends with $STUB_BOXQ_RC). Where the stub
@@ -840,6 +864,22 @@ if [ -w /root ]; then
 else
   run 'gpu-gate.sh: a lock file it cannot open ends at once, by name' 69 'cannot open /root/bloomery-gate\.lock' gg
 fi
+
+# tools/gate.sh --oxide builds for the arch tools/arch.sh reads (BLOOMERY_ARCH, sm_86 unset) and refuses a value that is no arch by
+# name before cargo runs; a call without --oxide never reads it. The stub timeout drops its two words and the stub cargo prints its.
+GS=$tmp/gateshtree
+mkdir -p "$GS/tools" "$GS/stub"
+cp "$ROOT/tools/gate.sh" "$ROOT/tools/gate-bound.sh" "$ROOT/tools/arch.sh" "$GS/tools/"
+printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$GS/stub/timeout"
+printf '#!/bin/sh\necho "cargo $*"\n' > "$GS/stub/cargo"
+chmod +x "$GS/stub/timeout" "$GS/stub/cargo"
+gs() { (cd "$GS" && env -u BLOOMERY_ARCH -u BLOOMERY_GATE_BOUND PATH="$GS/stub:$PATH" "$@" bash tools/gate.sh "${GS_ARGS[@]}"); }
+GS_ARGS=(--oxide -p x --release --lib)
+run 'gate.sh: --oxide builds for sm_86 when BLOOMERY_ARCH is unset' 0 '^cargo oxide test --arch sm_86 -- -p x --release --lib$' gs
+run 'gate.sh: --oxide builds for BLOOMERY_ARCH' 0 '^cargo oxide test --arch sm_121 -- -p x --release --lib$' gs BLOOMERY_ARCH=sm_121
+run 'gate.sh: --oxide refuses a BLOOMERY_ARCH that is no arch, by name' 64 "gate.sh: BLOOMERY_ARCH is a CUDA arch.*got 'sm121'" gs BLOOMERY_ARCH=sm121
+GS_ARGS=(-p x --release --lib)
+run 'gate.sh: a plain cargo test never reads BLOOMERY_ARCH' 0 '^cargo test -p x --release --lib$' gs BLOOMERY_ARCH=sm121
 
 # card-precheck.sh: lease_card before the build, with the recipe's own card or the environment's.
 pre() {

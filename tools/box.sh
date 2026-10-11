@@ -35,6 +35,13 @@
 #                             BLOOMERY_BOX_ENV entry, before the profile, for the same reason; only under BLOOMERY_TIER=fixture (the
 #                             real tier has no variant: 64), and both set to different tags is 64. ref-paths.sh resolves the file
 #                             and refuses a tag the table does not name.
+#   BLOOMERY_ARCH=<sm_NN>     the CUDA arch (tools/arch.sh; the justfile's `arch` variable reads the same name, sm_86
+#                             unset). Set, it is checked here before anything is synced and exported into the command, so a
+#                             tool that runs on the box (tools/gate.sh, the scans, tools/release/build.sh) reads what the
+#                             recipe's `--arch {{arch}}` expanded to on this side. A value that is no arch is 64, and so is a
+#                             BLOOMERY_ARCH entry of BLOOMERY_BOX_ENV that is not this side's value (the default when it is
+#                             unset): the arch is named in the environment, where the recipes read it. Unset with no such
+#                             entry: every byte of the remote command as before, and tools/arch.sh is not read.
 #   BLOOMERY_BOX_READONLY=1   a read — ps, cat, tail, ls, nvidia-smi, a status probe — runs without the
 #                             guard: the way to read a sitting's log, the owner's own included, while it
 #                             runs. Refused (64) when the command names cargo, just, make, cmake, ninja
@@ -120,6 +127,24 @@ if [ -n "$VARIANT" ] && [ "$TIER" != fixture ]; then
 fi
 VARX=
 [ -z "$VARIANT" ] || VARX="export BLOOMERY_FIXTURE_VARIANT=$VARIANT && "
+# The arch (the header), named before anything is synced: a refusal touches nothing on the box.
+ARCHX='' ARCH_ENTRY=''
+ARCH_SEEN=0
+for kv in ${tier_env[@]+"${tier_env[@]}"}; do
+  if [ "${kv%%=*}" = BLOOMERY_ARCH ]; then
+    ARCH_SEEN=1 ARCH_ENTRY=${kv#*=}
+  fi
+done
+if [ -n "${BLOOMERY_ARCH+x}" ] || [ "$ARCH_SEEN" = 1 ]; then
+  # shellcheck source=tools/arch.sh
+  source "$HERE/tools/arch.sh"
+  bloomery_arch box.sh || exit $?
+  [ -z "${BLOOMERY_ARCH+x}" ] || ARCHX="export BLOOMERY_ARCH=$ARCH && "
+  if [ "$ARCH_SEEN" = 1 ] && [ "$ARCH_ENTRY" != "$ARCH" ]; then
+    echo "box.sh: BLOOMERY_ARCH is '$ARCH_ENTRY' in BLOOMERY_BOX_ENV and '$ARCH' in the environment (unset: sm_86): name it in the environment, where the recipes read it" >&2
+    exit 64
+  fi
+fi
 QUEUE=0
 case ${BLOOMERY_BOX_QUEUE:-0} in
   0) ;;
@@ -357,7 +382,7 @@ esac
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
 REMOTE_CMD="source ~/bloomery-env.sh && { $PICK
-} && cd $REMOTE && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $OXIDE$ENVS$*"
+} && cd $REMOTE && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $OXIDE$ARCHX$ENVS$*"
 if [ "$QUEUE" = 0 ]; then
   ssh "$HOST" "${GUARD}$REMOTE_CMD"
   exit

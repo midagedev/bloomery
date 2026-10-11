@@ -10,6 +10,8 @@
 #   - host code built for this box's CPU (znver3) instead of x86-64-v3: an instruction past x86-64-v3 outside a
 #     function that runs behind a runtime CPU check;
 #   - a binary with no embedded sm_86 PTX, or PTX for another target.
+# The release is one arch's: the archive carries RELEASE_ARCH's PTX and its name says so (cuda-sm86). A BLOOMERY_ARCH naming
+# another arch (tools/arch.sh) ends a build with 64 before anything is built; `--check` reads the binaries and never the variable.
 # Usage: tools/release/build.sh <version> <commit>
 #        tools/release/build.sh --check <dir>   (the binary checks alone, on <dir>/<bin>; builds and packs nothing)
 # The tarball and its .sha256 keep the names this script writes ($NAME.tar.gz…): install.sh resolves the release by
@@ -27,6 +29,7 @@ else
   COMMIT=${2:?usage: tools/release/build.sh <version> <commit>}
 fi
 
+RELEASE_ARCH=sm_86
 GLIBC_FLOOR=2.34
 BINS=(bloomery-serve)
 DISPATCHED='^(sha2::sha256::x86::digest_blocks|sha1::compress::x86::digest_blocks|crc32fast::specialized::pclmulqdq::calculate_avx(512|2))$'
@@ -34,6 +37,13 @@ ALLOWED_NEEDED='^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2
 if [ -n "$CHECK_ONLY" ]; then
   BIN_DIR=$CHECK_ONLY
 else
+  # shellcheck source=tools/arch.sh
+  source "$ROOT/tools/arch.sh"
+  bloomery_arch release/build.sh || exit $?
+  if [ "$ARCH" != "$RELEASE_ARCH" ]; then
+    echo "release: BLOOMERY_ARCH is $ARCH, and the release archive is $RELEASE_ARCH's (its name, cuda-sm86, and the PTX check below): build it with BLOOMERY_ARCH unset" >&2
+    exit 64
+  fi
   NAME="bloomery-$VERSION-linux-x86_64-cuda-sm86"
   DIST="$ROOT/target/release-dist"
   STAGE="$DIST/$NAME"
@@ -44,7 +54,7 @@ else
   bin_args=()
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
   # The commit goes to cargo alone: the servers refuse a BLOOMERY_* variable they do not read.
-  BLOOMERY_BUILD_COMMIT="$COMMIT" cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release "${bin_args[@]}"
+  BLOOMERY_BUILD_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release "${bin_args[@]}"
 fi
 
 fail=0
@@ -79,8 +89,8 @@ for b in "${BINS[@]}"; do
   fi
 
   targets=$(strings -n 8 "$f" | sed -n 's/^\.target[[:space:]]\+\([a-z0-9_]*\).*/\1/p' | sort -u | tr '\n' ' ')
-  if [ "$targets" != "sm_86 " ]; then
-    echo "release: $b embeds PTX targets [$targets], not sm_86 alone" >&2
+  if [ "$targets" != "$RELEASE_ARCH " ]; then
+    echo "release: $b embeds PTX targets [$targets], not $RELEASE_ARCH alone" >&2
     fail=1
   fi
 

@@ -9,6 +9,11 @@
 # The card check a timed recipe runs first in its box command, before any build (tools/ref/card-precheck.sh).
 precheck := 'bash tools/ref/card-precheck.sh'
 
+# The CUDA arch every `cargo oxide` line builds for: BLOOMERY_ARCH, the default below when it is unset. A recipe takes it
+# as `--arch {{arch}}` and tools/check-recipes.sh fails on any other spelling; the tools that run on the box read the
+# same name through tools/arch.sh, which tools/box.sh forwards.
+arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')
+
 # serve-qwen38's placement (a the A6000, gate the 3090) and the card it puts
 # in box.sh's view.
 serve_place := env_var_or_default('SERVE_PLACE', 'a')
@@ -148,98 +153,98 @@ check-loads:
 # GPU 커널 게이트 P1–P3: 트랙마다 자기 바이너리 하나(crates/gpu-gates/src/bin/gate_pN.rs).
 # 참조는 bloomery_gpu_gates(gguf 디퀀트 + f64 내적), 밴드는 KERNEL_BAND = 1e-2. 정확성 실행이고 측정이 아니다.
 gate-gpu-p1:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p1 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p1'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p1 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p1'
 
 gate-gpu-p2:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p2 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p2'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p2 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p2'
 
 gate-gpu-p3:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p3 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p3'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p3 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p3'
 
 gate-gpu-p4:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p4'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p4'
 
 gate-gpu-p5:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p5 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p5'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p5 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p5'
 
 gate-gpu-p6:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p6 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p6'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p6 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p6'
 
 gate-gpu-p9:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p9 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p9'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p9 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p9'
 
 # B6: q4k_gemv_sel — 슬롯마다 그 expert 하나로 돈 q4k_gemv와 비트 동일, 범위 밖 id는 슬롯을 건드리지 않는다.
 gate-gpu-q4k-sel:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_q4k_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_q4k_sel'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_q4k_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_q4k_sel'
 
 # 모델 없는 K-quant expert 계열(bloomery_gpu::kquant): Q5_K `_sel` down과 gate·up(act 런타임 인자)을 합성 스택에서
 # f64 참조의 밴드, 슬롯·m열·폴트·act 절로 보고, 같은 워크의 Q4_K 형제가 q4k_gemv_sel과 비트 동일한지 본다. 모델 파일 없음.
 gate-gpu-kquant:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_kquant && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kquant'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kquant && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kquant'
 
 # 두 단계 후보 선택(bloomery_gpu::cand, V4.1 후보 마스크의 커널 넷)을 모델 없이 합성 점수로 호스트 규칙과 비트 대조한다: 블록 키,
 # 참조 select_candidate_blocks의 선택(핀, 동점은 낮은 블록, ±0 동점), 경계 이하 무작업, 압축·히스토그램·카운트 뷰, remap, 폴트, 캡처 재생.
 gate-gpu-cand:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_cand && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_cand'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_cand && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_cand'
 
 # Qwen3.8의 gated-residual hyper-connection(bloomery_gpu::hc_gated)을 모델 없이 파일 모양(4×2560, rank 320)의 합성
 # 입력으로 본다: f64 규칙의 밴드, 단계마다 카드 규칙과 비트 동일, 8열과 1열, combine·init, 이름 붙은 거부, 폴트, 로컬 depot.
 gate-gpu-hc-gated:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_hc_gated && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_hc_gated'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_hc_gated && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_hc_gated'
 
 # GLM-5.3-Flash 라우터(288개 중 8개, sigmoid, ×2.5 — `router::glm5next`)를 모델 없이 합성 입력으로 호스트 규칙과 맞춘다.
 # 규칙마다 절이 하나다: logits·ids·weights·batch는 비트, scores는 sigmoid 밴드, ties·guard·fault·graph는 명시한 값.
 gate-gpu-glm-router:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm5next_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_router'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm5next_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_router'
 
 # IQ2_XS·IQ3_XXS·IQ4_XS·Q2_K 행 코어(bloomery_gpu::iq): ref-synth 합성 행(gate-1-1이 덤프)을 q8_1 8열과 곱해 호스트 규칙과
 # 비트 동일한지, ggml 디퀀트 × f32 기준 대비 유도 한계와 핀 안인지 본다. K = 4096과 꼬리가 남는 K = 2304 두 형상.
 gate-gpu-iq:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq'
 
 # i-quant expert 선택 엔트리(bloomery_gpu::iq_sel): IQ3_XXS·IQ4_XS gate·up과 IQ4_NL down `_sel32`를 파일 그대로의
 # 블록 워드 스트림 위에서 합성 스택(ref-synth + 시드 IQ4_NL)으로 본다. 호스트 규칙·플레인 커널과 비트 동일, f64 밴드와 핀,
 # silu 규칙 밴드, 폴트·NaN d·캡처·이름 붙은 거부.
 gate-gpu-iq-sel *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel {{ARGS}}'
 
 # 행 사상 Q6_K gemv(bloomery_gpu::q6k_ids): MTP 드래프트가 빌리는 Q6_K `output` 머리. 합성 70,000행 "어휘"(K = 2,560,
 # UD-Q3_K_XL 머리의 형상)를 고정 시드로 짓고, m ∈ {1,2,4,8} × (1·7·65,536 정렬 id 맵 + 맵 없음)의 매 로짓을
 # enqueue_gemv_q6k의 모은 행 스택과 비트 대조하고, ggml 디퀀트 × f32의 f64 합 대비 유도 밴드(PIN), id 범위 밖의 이름 붙은
 # 폴트와 NaN 행, 캡처 재생, 런처의 이름 붙은 거부를 본다. 모델 파일 없음.
 gate-gpu-q6k-ids:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_q6k_ids && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_q6k_ids'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_q6k_ids && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_q6k_ids'
 
 # V4.1 하이퍼커넥션(B4): 사슬 커널(RMS·분할 K hc_fn gemv·HC_PRE), HC_POST와 접기를 우리 규칙과 V4.1 ik 덤프에 서브층마다
 # 대조한다. engram 층(1·14)의 분리 짝(HC_POST 단독 → 접기 단독)이 융합 런치와 비트 동일한지도 본다.
 gate-gpu-ds41-hc:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-hc && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_hc && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_hc'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-hc && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_hc && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_hc'
 
 # 종단 게이트: 27층 + lm_head + argmax 전체 사슬을 ik CUDA greedy(33프롬프트 × 32스텝)와 대조하고,
 # 그래프 재생이 즉시 실행과 토큰 단위로 같은지 본다(정확성 실행, 측정 아님). 이름이 pN이 아닌 이유는
 # gate_e2e.rs 머리글 — P9·P10은 커널 꾸러미로 이미 쓰이고 있다.
 gate-gpu-e2e *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_e2e {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_e2e {{ARGS}}'
 
 # 하이브리드 MoE 경계 게이트: V2-Lite를 n_l 32와 0(n_l 밖 expert는 호스트)으로 올려 전부 카드인 모델과 대조한다.
 # 캡처 노드 수, eager = 재생, 층별 카드 슬롯 비트 동일·호스트 합 밴드, argmax 뒤집힘 밴드, 겹침 레버는 순서만 바꾸는지.
 [group('pool')]
 gate-gpu-hybrid *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_hybrid && bash tools/gpu-gate.sh gate_hybrid {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_hybrid && bash tools/gpu-gate.sh gate_hybrid {{ARGS}}'
 
 # 적응형 residency 기계 게이트(모델 파일 없음, 합성 스택): 같은 이력 = 같은 값(복사 시점과 무관), 정적 재배치와 비트 동일,
 # 늦은 복사는 스트림이 기다림, 호스트·카드 맵이 한 id를 두 번 또는 0번 서비스하지 않음, reset은 시드로, 호스트 비상주
 # 희생자는 이름으로 거부, 고정 시드는 움직이지 않음(adaptres §4 c1–c5·c7).
 [group('pool')]
 gate-gpu-swap *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_swap && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_swap {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_swap && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_swap {{ARGS}}'
 
 # The expert stream's gate (no model file, a synthetic source): the stream is the rule's set cut at the ring's half in
 # rank order, its rows and exclusion set say so, the engine stream reads a slot only once its copy landed, a half's next
 # stream waits for the half's read, an unread stream refuses the call's end, a stuck lane is a named error within its
 # deadline, a ring with no room is refused by its own name.
 gate-gpu-xstream *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_xstream && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_xstream {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_xstream && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_xstream {{ARGS}}'
 
 # 양자화 모델의 정확한 수학(가중치는 정확히 역양자화, 활성·어텐션은 f64, q8·f16 반올림 없음)으로 교사 강제 자의
 # 한 프롬프트를 푼다: 스텝마다 정확 top1·마진·ik 토큰 격차. 두 엔진(우리, ik)이 갈리는 자리의 심판이다.
@@ -291,30 +296,30 @@ build-exact-forced:
 # exact_ref가 세 팔을 CPU 임대 아래 차례로 덤프하고(프롬프트당 팔 하나 약 1.5분), forced_probe가 그 셋과 대조한다.
 # 덤프와 exact_ref 로그는 박스 target/exact-taps/ID-STEP/. 예: `just exact-taps 12 23`.
 exact-taps ID STEP:
-    ./tools/box.sh '{{precheck}} docs/cards/exact-ref.card && cargo build --release -p bloomery-gpu-gates --bin exact_ref && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin forced_probe && D=target/exact-taps/{{ID}}-{{STEP}} && mkdir -p $D && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act f64 --dump $D/f64 > $D/f64.log && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ours --dump $D/ours > $D/ours.log && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ik --dump $D/ik > $D/ik.log && grep -H "top5" $D/f64.log $D/ours.log $D/ik.log && bash tools/gpu-gate.sh forced_probe --prompt-id {{ID}} --step {{STEP}} --dump $D/engine --against $D/f64,$D/ours,$D/ik'
+    ./tools/box.sh '{{precheck}} docs/cards/exact-ref.card && cargo build --release -p bloomery-gpu-gates --bin exact_ref && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin forced_probe && D=target/exact-taps/{{ID}}-{{STEP}} && mkdir -p $D && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act f64 --dump $D/f64 > $D/f64.log && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ours --dump $D/ours > $D/ours.log && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ik --dump $D/ik > $D/ik.log && grep -H "top5" $D/f64.log $D/ours.log $D/ik.log && bash tools/gpu-gate.sh forced_probe --prompt-id {{ID}} --step {{STEP}} --dump $D/engine --against $D/f64,$D/ours,$D/ik'
 
 # 얇은 끝-끝 디코드 CLI(greedy, 토큰 하나씩, 프리필 커널 없음). `--time` 없이 토큰만 찍는 것은
 # 평범한 실행이고, `--time`은 측정이라 임대가 필요하다 — time-gpu-generate가 그쪽이다.
 generate *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate && ./target/release/generate {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate && ./target/release/generate {{ARGS}}'
 
 # generate의 스텝당 ms(리드 전용): 기계 전역 임대 아래, 증인 블록 전후. 기록이 되는 것은 graph 모드의
 # 푸터이고 eager 모드는 호스트 제출 경로의 값이다.
 time-gpu-generate *ARGS:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate && bash tools/ref/time-gate.sh generate {{ARGS}} --time'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate && bash tools/ref/time-gate.sh generate {{ARGS}} --time'
 
 # P0b: 블록 0 FFN 융합 스파이크 — 융합 4런치가 op 8런치와 비트 동일한지(정확성 실행).
 gate-gpu-p0b *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p0b {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p0b {{ARGS}}'
 
 # P8a 블록 0 스텝(ctx_max 64에서 21노드 — fuse1 뒤; 한 구간보다 큰 캐시에서는 flash_merge가 붙어 22)의 재생 µs — 임대·증인, 리드 전용.
 time-gpu-p8:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8'
 
 # P8 op별 프로파일(리드 전용): 스텝을 op 단위로 동기 분해한 µs 표(ops=그래프 노드 수와 동일) + sync_floor
 # 보정 + refresh_params 호스트 시간 + 같은 프로세스의 그래프 재생 µs + 어텐션/FFN 분할. 임대·증인은 time-gate.sh 소유.
 prof-gpu-p8:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --profile'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --profile'
 
 # 커널 런치당 실제 비용(리드 전용): op별 표가 답할 수 없는 것 — 한 행의 net_us가 디바이스 시간인지
 # 프로파일 자신의 제출 경로인지 — 를 두 갈래로 가른다. eager는 N런치 뒤 동기화 하나(호스트 제출과
@@ -322,7 +327,7 @@ prof-gpu-p8:
 # 무는 값). 빈 커널 touch가 둘의 바닥이고, f32 gemv는 행 수 셋에서 같은 프로세스로 잰다. 이어서 그룹 int8 GEMM의
 # 팔들을 `gate_gemm --bench-kernels`로 잰다(ARGS, 예를 들어 `--bench-arm`은 이쪽으로 간다). 임대·증인은 time-gate.sh 소유.
 bench-gpu-kernels *ARGS:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 --bin gate_gemm && bash tools/ref/time-gate.sh gate_p8 --bench-kernels && bash tools/ref/time-gate.sh gate_gemm --bench-kernels {{ARGS}}'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 --bin gate_gemm && bash tools/ref/time-gate.sh gate_p8 --bench-kernels && bash tools/ref/time-gate.sh gate_gemm --bench-kernels {{ARGS}}'
 
 # The grouped GEMM's counters (ncu, A6000, under the lease, lead-only): gate_gemm --bench-kernels --bench-arm ARM (default
 # gemm_q4k_moe_t4096: 128 experts of 768 x 2048 Q4_K, top-8, T = 4096) runs that one arm, and ncu takes 16 of its eager
@@ -331,7 +336,7 @@ bench-gpu-kernels *ARGS:
 # 55-65 % and the top unit, about 1.29e8 LSU data-pipe wavefronts a launch, issue-active 35-40 %, tensor 22-26 %, DRAM
 # 10-15 %. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
 ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
-    ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm; fi && BLOOMERY_NCU_FORM=gemm BLOOMERY_NCU_GEMM_ARM={{ARM}} bash tools/ref/ncu-gpu.sh'
+    ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm; fi && BLOOMERY_NCU_FORM=gemm BLOOMERY_NCU_GEMM_ARM={{ARM}} bash tools/ref/ncu-gpu.sh'
 
 # The V4.1 prompt projections' counters (ncu, A6000, under the lease, lead-only): one launch each of the joined qkv, q_b,
 # wo_a heads and wo_b at m = 8 in the middle full chunk of a layer >= 2 of a P-token prompt (default 512). The launch skip
@@ -340,7 +345,7 @@ ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
 # block-step cycles and each unit's demand in cycles. The header of tools/ref/ncu-gpu.sh has the form. Under
 # BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
 ncu-gpu-ds41-pp P='512':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NCU_FORM=ds41pp BLOOMERY_NCU_PROMPT={{P}} bash tools/ref/ncu-gpu.sh'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NCU_FORM=ds41pp BLOOMERY_NCU_PROMPT={{P}} bash tools/ref/ncu-gpu.sh'
 
 # The Qwen3 prompt's counters (ncu, A6000, under the lease, lead-only): one KERNEL launch (gqa_prefill_flash, the one the
 # form's table holds) in layer LAYER of a P-token prompt, in the process of depth-qwen3moe.sh's `<P>` arm (-n 1), at the
@@ -353,21 +358,21 @@ ncu-gpu-ds41-pp P='512':
 # issue 0.36-0.40 a scheduler, 3,400-3,620 SM cycles a block-step. The header of tools/ref/ncu-gpu.sh has the form.
 # Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints the derivation and its command line.
 ncu-gpu-qwen3-pp P='4096' LAYER='24' KERNEL='gqa_prefill_flash':
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ] && [ -z "${BLOOMERY_NCU_BIN:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NCU_FORM=q3pp BLOOMERY_NCU_PROMPT={{P}} BLOOMERY_NCU_LAYER={{LAYER}} BLOOMERY_NCU_KERNEL={{KERNEL}} bash tools/ref/ncu-gpu.sh'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ] && [ -z "${BLOOMERY_NCU_BIN:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NCU_FORM=q3pp BLOOMERY_NCU_PROMPT={{P}} BLOOMERY_NCU_LAYER={{LAYER}} BLOOMERY_NCU_KERNEL={{KERNEL}} bash tools/ref/ncu-gpu.sh'
 
 # 캡처된 그래프의 노드당 값, 비용 모형의 `c_node`(리드 전용): cnode_probe --time이 빈 `touch` 노드 784개와 504개짜리
 # 그래프를 잡아, 그래프마다 노드 수와 재생 한 번의 기록을 먼저 확인한 뒤 `touch_us_min`·`touch_us_mean`·
 # `touch_us_per_node`를 찍는다. 정확성만 볼 때는 `bash tools/gpu-gate.sh cnode_probe --check`. 임대·증인·A6000 고정은
 # time-gate.sh가 쥔다.
 time-gpu-cnode:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin cnode_probe && bash tools/ref/time-gate.sh cnode_probe'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin cnode_probe && bash tools/ref/time-gate.sh cnode_probe'
 
 # 호스트 → 카드 링크(리드 전용): `nvidia-smi topo -m`과 카드마다 PCI 주소·sysfs 경로·링크를 찍고, A6000에서 1 GiB pinned와
 # pageable(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md의 교정값), 1.6 GB pinned 복사 48회 연속(복사마다 GB/s의 퍼짐, 복사 중에 읽은 링크)을 잰다.
 # BLOOMERY_CARD=both면 3090 단독과 두 카드 동시 복사(카드별 율과 합)도 잰다. 임대·증인·Xid 수는 tools/ref/h2d-pcie.sh가
 # 쥐고, 카드는 docs/cards/pcie-a6000.card다. 예: `BLOOMERY_CARD=both BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pcie-a6000.card' just time-gpu-h2d`.
 time-gpu-h2d:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/h2d-pcie.sh'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/h2d-pcie.sh'
 
 # 호스트 → 카드 복사가 호스트 티어의 DRAM 읽기에서 뺏는 몫(리드 전용): bench_v41_host --time을 단독으로, h2d_probe의
 # pageable-loop 옆에서, staged-loop(스트리밍 설계의 pinned 링) 옆에서 라운드마다 번갈아 돌린다. 복사는 벤치가 비워 둔 코어에
@@ -375,32 +380,32 @@ time-gpu-h2d:
 # 벤치의 팔을 그대로 넘기고 --rounds, --seconds, --chunk, --fill-threads …). 카드는 docs/cards/dma-dram-share.card다.
 # 예: `BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/dma-dram-share.card' just time-dma-dram --arms engine:6`.
 time-dma-dram *ARGS:
-    BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin bench_v41_host && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/dma-dram-share.sh {{ARGS}}'
+    BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin bench_v41_host && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/dma-dram-share.sh {{ARGS}}'
 
 # 유휴 상태 A/B(리드 전용): 가장 깊은 cpuidle 상태(이 박스의 C2, 깨는 데 18 µs)를 모든 CPU에서 켠 팔과 끈 팔을
 # 한 임대 안에서 번갈아 잰다. 명령은 A6000에 고정돼 라운드마다 팔 순서를 바꿔 돌고, 원래 값은 모든 종료 경로에서
 # 되돌린다. 예: `just cstate-ab 6 env BLOOMERY_HYBRID_NL=32 target/release/generate -n 64 --time`.
 cstate-ab ROUNDS *CMD:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate && bash tools/ref/cstate-ab.sh {{ROUNDS}} {{CMD}}'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate && bash tools/ref/cstate-ab.sh {{ROUNDS}} {{CMD}}'
 
 # P8: 조립된 디코드 스텝(블록 0부터)을 덤프와 대조 — 엔진 자신의 탭.
 gate-gpu-p8 *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p8 {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p8 {{ARGS}}'
 
 # MoE 융합(P8 준비): 전문가 여섯의 gate·up·swiglu 한 런치 + 결합 한 런치가 op 경로와 비트 동일한지(정확성 실행).
 gate-gpu-moe:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_moe_fused'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_moe_fused'
 
 # V4.1 라우터와 전문가(B4 J·K): 라우터, 라우팅·공유 전문가의 클램프 SwiGLU, combine을 우리 규칙과 V4.1 ik 덤프
 # (5토큰 세트와 디코드 스텝 세트)에 층마다 대조한다. 클램프는 합성 입력으로 한계 너머까지 따로 본다.
 gate-gpu-ds41-moe:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-moe && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_moe'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-moe && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_moe'
 
 # V4.1 MoE 조각(B5 1단계, chain G1): step4·d1n 세트의 40층 전부에서 라우터·카드 expert·공유 expert·호스트 티어 합류·combine·
 # HC_POST(+접기)를 한 프로세스 안에서 돈다 — op 경로와 비트 동일, 라우터 id는 근접 동률 빼고 정확, combine·스트림·접기는 op 밴드에서
 # 옮겨 온 반올림 한계 안의 예측 차이로 덤프와 대조, 재생 = eager(층마다 호스트가 서비스), 종류별 노드 수.
 gate-gpu-ds41-chain-ffn:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-ffn && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_ffn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_ffn'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-ffn && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_ffn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_ffn'
 
 # P7 뒤 절반: 블록·종단 게이트 하네스의 자기 검증(호스트 전용 — 두 오라클 사이의 알려진 거리를 재현해야 한다).
 gate-gpu-block:
@@ -408,7 +413,7 @@ gate-gpu-block:
 
 # P10: 가중치 상주 — 모델 파일의 모든 텐서를 커널이 먹는 디바이스 형식으로 올린다(정확성 실행, 측정 아님).
 gate-gpu-p10:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p10 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p10'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p10 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p10'
 
 # V4.1 적재 게이트 ②: 배치 계획이 카드마다 두는 세그먼트를, 이름으로 찾은 카드에 올리고 계획과 바이트 단위로 대조한다.
 # 할당기 반올림도 계획의 항과 바이트까지 같아야 한다. 정확성 실행이지 측정이 아니다. 계획 a는 --plan a.
@@ -418,7 +423,7 @@ gate-gpu-p10:
 [group('solo')]
 [group('v41-load')]
 stage-gpu-load-v41 *ARGS='--plan b':
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh stage-gpu-load-v41 && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && __d=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && case " {{ARGS}} " in *" --plan bp "*) set -- --draft "$__d" ;; *) set -- ;; esac && bash tools/gpu-gate.sh gate_load_v41 {{ARGS}} "$@"'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh stage-gpu-load-v41 && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && __d=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && case " {{ARGS}} " in *" --plan bp "*) set -- --draft "$__d" ;; *) set -- ;; esac && bash tools/gpu-gate.sh gate_load_v41 {{ARGS}} "$@"'
 
 # 같은 게이트 ②의 호스트 절반: 계획 (b)의 호스트 세그먼트 전부(유도 약 196 GB)를 샤드 매핑째 잠근다. 리드 전용이고,
 # RAM을 크게 쓰는 트랙이 없을 때만 돈다.
@@ -426,7 +431,7 @@ stage-gpu-load-v41 *ARGS='--plan b':
 [group('solo')]
 [group('v41-load')]
 stage-gpu-load-v41-lock:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh stage-gpu-load-v41-lock && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && BLOOMERY_HOST_LOCK=1 bash tools/gpu-gate.sh gate_load_v41 --plan b --lock'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh stage-gpu-load-v41-lock && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && BLOOMERY_HOST_LOCK=1 bash tools/gpu-gate.sh gate_load_v41 --plan b --lock'
 
 # qdot 커널률(리드 전용): ik 자신의 x4 커널과 Rust qdot-rate를 같은 CPU 임대 안에서 한 코어에 고정해 번갈아 돈다.
 # ik 하네스는 build-ref가 짓는다. 인자는 라운드 수(기본 3).
@@ -843,22 +848,22 @@ gate-qwen35moe-meta:
 # `down`은 다운 `_sel`(Q6_K, Q4_K)을, `head`는 argmax를 접은 Q6_K 헤드를, `flash`는 GQA 플래시 디코드 두 패스(스칼라·텐서
 # 코어)를 잰다. 레시피마다 바이너리 하나.
 gate-gpu-qwen3moe-rope:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_rope'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_rope'
 
 gate-gpu-qwen3moe-router:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_router'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_router'
 
 # Qwen3.6-35B-A3B MoE 블록: 257행 게이트 라우터(전문가 256 + 공유 전문가 게이트 행), 조인된 257-전문가 스택, K=512 down `_sel`,
 # 아홉 슬롯 FFN과 ubatch 경로를 호스트 규칙과 ik 밴드에 맞춘다. ARGS는 `--case <이름>[,…]`.
 gate-gpu-qwen35moe-moe *ARGS:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_moe {{ARGS}}'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_moe {{ARGS}}'
 
 # Qwen3.6-35B-A3B 전 체인 게이트(한 장): 노드 수 핀(디코드 520, 패스 537 + 4m), 디코드 다섯 스텝 = 다섯 행 패스 = eager
 # = 리셋 뒤 반복(logits·저장소 비트 동일), 층별 teacher-forced 탭(GDN·어텐션·MoE)과 자유 주행 l_out을 ik 배치 세트에,
 # step4·d1k 세트는 ik의 프리필 상태(cache_s·cache_k·cache_v)를 실어 한 스텝을 댄다.
 [group('pool')]
 gate-gpu-qwen35moe-e2e:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
 
 # The Clef backbone (Qwen3.5 dense, qwen35) gate: the tensor-core decode flash refused at group 6 before any upload,
 # then the prompt call's final-norm hidden states (Tail::Hidden) of the first 64, 600 and 4,096 prose ids, each from a
@@ -867,7 +872,7 @@ gate-gpu-qwen35moe-e2e:
 # Clef-Flash at bartowski's Q8_0 (9.5 GB: every site through the launch its type picks), then lev at Q4_K_M (3 GB, the
 # 4B geometry with its head tied to the token embedding). Fits either card.
 gate-gpu-clef-hidden:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_hidden'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_hidden'
 
 # Body35's image rows on Clef-Flash at bartowski's Q8_0 (9.5 GB, either card), against the clefvis sets (set B's tower rows
 # as the spans' rows; set C's three prompts, their CPU twins and the C'' runs): the unit rows and the text rows a media call
@@ -890,7 +895,7 @@ gate-gpu-qwen35-media:
 # Q8_0; fetched into /root/models/clef-flash/) serves the request with no head flag, and its answers equal the
 # same file's with the release's head (the one difference: the head's dtype). Either card.
 gate-gpu-clef-serve:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --dir $D'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --dir $D'
 
 # The decide seat of bloomery-serve on lev (gate_lev_serve's doc): ggml-org/lev-GGUF's Q4_K_M (3.0 GB, a `qwen35`
 # file with `qwen35.decision.type = lev`, fetched into /root/models/lev-4b/) with no head flag; five refusals before
@@ -900,12 +905,12 @@ gate-gpu-clef-serve:
 # prompts' ids; ARGS `--hf ggml-org/lev-GGUF:Q4_K_M` adds the clause that serves the file from the hub, no head flag, and
 # answers the first request as the `-m` server does (a network read). Either card.
 gate-gpu-lev-serve *ARGS:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
 
 # clef_hidden on the box (ARGS as its doc: --model, --ids, --out, ...): a qwen35 file's prompt-only pass, every
 # position's final-norm hidden state to a file and a `clef hidden` record with the call's functional wall.
 clef-hidden *ARGS:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh clef_hidden {{ARGS}}'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh clef_hidden {{ARGS}}'
 
 # Qwen3.8-Flash-Next (qwen4exp) whole-program gate on the 3090's plan (either card, shared/gate_card.rs): the step's
 # node count, graph = eager = one pass (logits and every store bit for bit), reset clears, every layer's streams on the
@@ -916,7 +921,7 @@ clef-hidden *ARGS:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-qwen4exp-e2e:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_e2e'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_e2e'
 
 # Qwen3.8 UD-Q3_K_XL's i-quant routed experts (IQ3_XXS and IQ4_XS gate/up, IQ4_NL down) through the threaded host leg
 # on the 3090's plan (either card, shared/gate_card.rs): the leg's per-expert gate, up, combine and down and its union
@@ -929,7 +934,7 @@ gate-gpu-qwen4exp-e2e:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen4exp-iqleg:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen4exp-iqleg && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen4exp-iqleg && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
 
 # Qwen3.8's MTP draft program on the 3090 beside the target: first, before any walk, the draft's load — its weights,
 # store and row map hold its plan's bytes, its token_embd and output are the target's own buffers at their addresses,
@@ -942,40 +947,40 @@ gate-gpu-qwen4exp-iqleg:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-qwen4exp-mtp:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
 
 gate-gpu-qwen3moe-down:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'
 
 # qwen3moe 헤드: argmax를 접은 Q6_K 투영을 `q6k_gemv` + `argmax_fault`에 대고 — logits 비트 동일, 토큰과 폴트 워드 동일,
 # 동점, NaN 행, NaN 활성, 그래프.
 gate-gpu-qwen3moe-head:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_head && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_head'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_head && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_head'
 
 # 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
 # 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512,4096} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
 # fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다
 # (리드 전용, `bench-gpu-kernels`).
 gate-gpu-gemm *ARGS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
 
 # 선형 어텐션(Gated DeltaNet) 카드 커널 셋 — conv+준비, delta 스텝, 게이트 노름 — 을 호스트 규칙과 비트로 맞춘다.
 # 모델 없이 Qwen3.6-35B-A3B 형상의 합성 입력으로 돌고, fault 사이트, 한 토큰의 그래프, 깊이 4,096의 f64 drift 보고를 함께 찍는다.
 # ARGS `--case kda_ik`는 그 대신 KDA 층마다 conv·준비·delta·게이트 노름을 ik GLM 배치 세트(ref_glm5next)의 입력에 대 본다.
 gate-gpu-linear *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_linear && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_linear {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_linear && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_linear {{ARGS}}'
 
 # Qwen3.6-35B-A3B full-attention 카드 커널 — rope-256(q/k 노름 + 앞 64차원 NEOX), 디코드 flash 256(두 패스),
 # 프리필 flash 256, 게이트 접은 o-proj 양자화기 — 을 모델 없이 16/2×256, n_rot 64, θ 1e7 합성 입력으로 호스트 규칙에 맞추고,
 # ik 배치 세트의 층 3 탭 넷과 비교한다.
 gate-gpu-qwen35moe-attn:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_attn'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_attn'
 
 # GLM-5.3-Flash MLA 층의 카드 부분 — 잠재 RMS + f16 추가, 인덱서 키 LayerNorm + [키; 게이트] 추가(`latent`),
 # 창 0·싱크 −∞·스케일 1/16으로 다시 쓰는 V4.1 어텐션 — 을 모델 없이 합성 입력으로 호스트 규칙에 맞춘다.
 # 추가는 캐시 비트, 어텐션은 오차 모형에서 끌어낸 밴드, 싱크 −∞는 분할 부분합의 무싱크 접기와 비트로 본다.
 gate-gpu-glm-mla:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_mla && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_mla'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_mla && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_mla'
 
 # GLM-5.3-Flash's k-pool selector on the card (`latent::index_pool`, `kpool::kpool_score`, `qsa::qsa_topk_high`, the
 # V4.1 attention over the list): synthetic clauses against the host rules and the exact rule's bands, then every
@@ -983,7 +988,7 @@ gate-gpu-glm-mla:
 # and `d16kdsa`). Reads no weight but the file's `indexer_compressor_ape`. The two --dsa sets are ik's: Oracle clauses, deferred
 # to the real tier by name in the fixture tier; the synthetic clauses run on either file.
 gate-gpu-glm-sel:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_sel'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_sel'
 
 # GLM-5.3-Flash's prompt projections on the tensor-core GEMM (`gpu-glm5next/src/gemm.rs`, no engine caller yet): a KDA
 # layer's seven and a latent layer's stack over 512 fixed-seed columns, on the file's own weights (only those tensors
@@ -991,27 +996,27 @@ gate-gpu-glm-sel:
 # (`gpu-gates/src/gemm32.rs`); one quantize per input; the refusals by name. Every clause is a self-consistency clause,
 # so the fixture tier runs them all on the fixture's layers.
 gate-gpu-glm5next-gemm:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_gemm'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_gemm'
 
 # MiMo-V2's attention kernels: the rope-only append and the K192/V128 scalar flash with the window and the sinks
 # (A1-A2, F0-F9 on seeded data; G1-G2 on ik's ref_mimo2* sets, each opened through the ik-mimo2 family check against
 # the mimo2 profile's model file).
 gate-gpu-mimo2-flash *ARGS:
-    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_mimo2_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_flash {{ARGS}}'
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_mimo2_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_flash {{ARGS}}'
 
 gate-gpu-qwen3moe-flash:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
 
 # qwen3moe 체인 커널 셋(3090): Q4_K 임베딩 행(dequant_row·ik inp_embd와 비트 동일), expert gate·up·SwiGLU `_sel`
 # (ffn_moe_gate_par 대조), combine(routed_out 대조).
 gate-gpu-qwen3moe-experts:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_experts && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_experts'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_experts && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_experts'
 
 # qwen3moe 전 체인 게이트(3090 한 장): 노드 수 핀, 층별 teacher-forced·자유 주행 l_out 대조, greedy(ik-greedy-qwen3moe의
 # 파일), graph = eager. 텐서 코어 플래시(엔진 경로)로 한 번 돈다. 스칼라 패스는 (u)의 자로 eager 안에서만 돈다.
 [group('pool')]
 gate-gpu-qwen3moe-e2e:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
 
 # ik CPU의 greedy 연속(프롬프트 0–7, 32토큰)을 $BLOOMERY_DATA/qwen3moe/greedy/에. 프롬프트마다 CPU 임대를 잡는다.
 ik-greedy-qwen3moe:
@@ -1019,7 +1024,7 @@ ik-greedy-qwen3moe:
 
 # ik KLD 기준 파일 TAG에 대한 qwen3moe 체인의 NLL·KLD·top-1(출력만, 판정 없음).
 run-qwen3moe-ppl TAG:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_qwen3moe_e2e --ppl {{TAG}}'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_qwen3moe_e2e --ppl {{TAG}}'
 
 # ik-ppl을 qwen3moe 파일에(MODEL을 프로필 값으로 넘긴다). ARGS는 ik-ppl.sh 머리글.
 ik-ppl-qwen3moe TREE TAG *ARGS:
@@ -1027,7 +1032,7 @@ ik-ppl-qwen3moe TREE TAG *ARGS:
 
 # qwen3moe 생성 CLI(3090): --prompt 텍스트 또는 --tokens id 목록, -n, --ctx, --mode, --time.
 gen-qwen3moe *ARGS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && bash tools/gpu-gate.sh generate_qwen3moe {{ARGS}}'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && bash tools/gpu-gate.sh generate_qwen3moe {{ARGS}}'
 
 # V4.1 호스트 expert 티어 게이트(B5). moe::Meta가 파일의 expert 384개를 Hparams와 같게 읽는지 확인한 뒤, 5토큰 세트의
 # 모든 층에서 ik의 라우팅을 주입해 호스트 티어가 낸 routed 부분합을 ik의 ffn_moe_out과 도출한 밴드 안에서 대조한다
@@ -1256,13 +1261,13 @@ inventory-v41 OUT='target/v41-inventory.md':
 # GPU 헤드(P8의 head 조각): result_norm → lm_head(Q6_K) → argmax를 그래프 하나로 잡아
 # 덤프의 마지막 토큰과 대조(정확성 실행, 핀된 헤드 밴드 안).
 gate-gpu-head:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_head_gpu'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_head_gpu'
 
 # m열 커널(q8_0·q8_0 heads·K-quant q3_K·q4_K·q5_K·q6_K·블록 대각 heads·공유 expert gate·up·헤드 argmax): m열 런치의 열 c가
 # 그 열 하나를 m = 1로 쏜 결과와 비트 동일한지를 파일의 형식으로 고른 V4.1 실제 행과 합성 K(≤ 8192)에서 m = 1..8 전부
 # 본다 — k토큰 스텝이 k개 순차 스텝과 비트 동일하려면 이것이 서야 한다.
 gate-gpu-mcol:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-mcol && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_mcol && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mcol'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-mcol && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_mcol && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mcol'
 
 # bloomery-gpu's lib tests through tools/gate.sh --oxide (its bound, cargo's exit code), with no gate lock, so the
 # batch keeps them on the 3090 (lane A). The hw_ tests (graph.rs' capture, replay, host flags and node kinds;
@@ -1310,18 +1315,18 @@ gate-ds41-plan:
 # V4.1 rope 계열(머리 꼬리 rope, ROPE_BACK, 잠재 K/V의 norm·rope·f16 링 기록)을 5토큰 세트와 디코드 스텝 세트 전부에 대조한다.
 # rope 사이트는 ik와 비트 동일, K/V 행은 유도한 밴드 안이어야 한다. 게이트가 V4.1 파일의 메타데이터를 읽으므로 모델을 고정한다.
 gate-gpu-ds41-rope:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-rope && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_rope'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-rope && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_rope'
 
 # V4.1 압축기와 인덱스 키(상태 gemv, DS4_COMP 풀링, norm, 꼬리 rope, f16 캐시 행, 링 persist, 인덱스 키의
 # norm·rope·Hadamard)를 5토큰 세트와 디코드 스텝 세트의 모든 소스 층에서 대조한다.
 gate-gpu-ds41-comp:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-comp && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_comp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_comp'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-comp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_comp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_comp'
 
 # V4.1 인덱서(op F: 쿼리·가중치·점수·top-k 목록)를 d1·d2 세트와 그 unfused 쌍의 내는 층 전부에서 ik 덤프와 대조한다.
 # d1n의 항등 목록과 그 위의 attention을 접두 경로와 비트 대조하고, 16,384·32,768행의 합성 깊이 케이스(심어 둔 동점 포함),
 # 재실행 비트 동일과 캡처된 재생까지 본다. 목록은 행 오름차순, 동점은 낮은 행.
 gate-gpu-ds41-index:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-index && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_index && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_index'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-index && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_index && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_index'
 
 # V4.1 디바이스 크레이트의 호스트 단위 시험(카드·게이트 락 없음): 오라클 세트가 닿지 않는 큰 위치에서도 rope 표가 ggml 레시피와 같다.
 # 락이 없어도 되는 까닭: 이 크레이트의 시험 모듈은 카드를 열지 않는다(Gpu·스트림·디바이스 버퍼를 쓰는 시험이 없다). cargo oxide는 빌드 때문이다.
@@ -1363,13 +1368,13 @@ gate-ds41-kld:
 # 규칙은 파일의 형식이 고른다: engram_wkv가 Q8_0이면 q8_0_gemv와 ik의 q8_2 규칙, Q3_K(공개 파일)이면 q8_1 → q3k_gemv와
 # ik의 q8_K × Q3_K 점곱(engram_kv와 비트 동일), 행 테이블과 gain 둘도 Q8_0/bf16 또는 Q3_K. 그 밖의 형식은 텐서 이름을 대며 거부한다.
 gate-gpu-ds41-engram:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-engram && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_engram && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_engram'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-engram && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_engram && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_engram'
 
 # A PLE site's two kernels (Qwen3.8's layer 1, bloomery_gpu::ple) on synthetic inputs, no model: the gate bit for bit
 # against its host rule and within a derived per-value bound of the exact f64 values; the dilated conv bit for bit
 # against its host rule; then the m-column, ring-wrap, rollback, reset, fault and refusal clauses.
 gate-gpu-ple:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_ple && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ple'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_ple && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ple'
 
 # The V4.1 glue piece (chain G1) on the step4 and d1n sets: the host engram row ids against the dump's int rows,
 # the embedding broadcast bit for bit, each engram site's step within the band b4engram's pins propagate, and
@@ -1378,22 +1383,22 @@ gate-gpu-ple:
 # formats, so a Q3_K engram_wkv (the public file) runs q8_1 + q3k_gemv, pinned within KERNEL_BAND of the exact
 # dot and against ik's Q3_K dot bit for bit; the node count follows the format.
 gate-gpu-ds41-chain-glue:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-glue && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_glue && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_glue'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-glue && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_glue && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_glue'
 
 # V4.1 attn_output_a(블록 대각 여덟 그룹)를 q8_0_gemv_heads 한 번의 발사로, attn_output_b는 q8_0_gemv로 돌려 5토큰 세트와
 # 디코드 스텝 세트의 층마다 우리 규칙(비트 동일), ik 규칙 시뮬(덤프와 비트 동일), 덤프(값마다 유도한 밴드)에 대조한다.
 gate-gpu-ds41-woa:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-woa && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_woa && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_woa'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-woa && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_woa && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_woa'
 
 # V4.1 어텐션(B4): 세트 일곱(5토큰 배치와 디코드 스텝 여섯)의 모든 층을 접두 키와 선택 행 두 경로로 본다. ik 규칙
 # 시뮬 대 덤프, 커널 대 우리 f32 규칙과 덤프, 그래프 재생, 깊이 케이스. sink를 읽으려고 V4.1 모델 파일을 연다.
 gate-gpu-ds41-attn:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-attn && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_attn'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-attn && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_attn'
 
 # V4.1 attention 조각(B5 1단계, chain G1): step4·d1n 세트의 40층 전부에 덤프의 입력을 주입하고, 스트림·접기·링·압축기
 # 캐시를 유도한 편차(σ 전파, z ≤ 9) 안에서 ik와 대조한다. 스텝이 안 쓴 슬롯은 비트 동일, 재생 = eager, 층 종류별 노드 수.
 gate-gpu-ds41-chain-attn:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-attn && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_attn'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-attn && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_attn'
 
 # 조립된 V4.1 스텝(B5 1단계, pos < 512·선택 없음)을 게이트 배치로 엔진 입구를 거쳐 돌린다. --structure: 캡처된 스텝의
 # 커널·메모리 연산 배치 수가 조각들이 예측한 수와 같고, step4 세트의 상태를 주입한 재생이 eager 실행과 비트까지 같다.
@@ -1411,7 +1416,7 @@ gate-gpu-ds41-chain-attn:
 # then the deep cuts. One load.
 [group('v41-load')]
 gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-sets --skew-api':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots'
 
 # V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
 # The gate plan puts each layer's id prefix [0, n_l) on the card; the tier plan moves its last 23 ids (n_l−23 … n_l) to
@@ -1432,7 +1437,7 @@ gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-se
 # in the landing run: weekly-gpu-ds41-lost runs them. The 3090's plan on either card (shared/gate_card.rs), gate lock.
 [group('v41-load')]
 gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
 # V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.
 # The reference is the same plan with every tier set joined to the stage card's (one card, no tier code); --loopback, by
@@ -1449,7 +1454,7 @@ gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfea
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-twocard *ARGS='--union':
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard {{ARGS}}'
 
 # The lost-card clauses: gate_deepseek41_tier --bfirst --blost --lost (B3f, B3 and T3: the loopback's tier stream held
 # behind a host flag before a fresh load's first prompt call, before a prompt call, before a step, on the 3090, each on
@@ -1461,15 +1466,15 @@ gate-gpu-ds41-twocard *ARGS='--union':
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-ds41-lost:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard --lost'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard --lost'
 
 # 상주 교체의 r8 → Q3_K 풀기(`ds41_r8_q3k_groups`, 그룹 하나를 블록 하나가 제자리에서): 무작위 r8 워드를 V4.1 파트
 # 모양(2304행 × 20 슈퍼블록)과 홀수 폭 작은 모양으로 풀어 참조 커널 `ds41_r8_q3k`와 `qdot::unpack_q3k_r8`의 바이트와
 # 같고 파트 밖 보호 워드를 건드리지 않는지, 잘못된 파트(16바이트 경계 밖, 21 슈퍼블록, 반 그룹)는 이름 붙은 오류인지 본다.
 # 모델 파일 없음.
 gate-gpu-ds41-unpack:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_unpack && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_unpack'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_unpack && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_unpack'
 
 # V4.1 host streaming in a prompt call (BLOOMERY_HOSTSTREAM, set on in the gate) over the residency at mid-p40-s1, plan
 # (b′), groups of 2, the host set locked, both cards, one load. First the residency's own clauses (shared/ds41_residency.rs,
@@ -1486,7 +1491,7 @@ gate-gpu-ds41-unpack:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-callstream *ARGS:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream {{ARGS}}'
 
 # The same residency clauses on plan (a), the serving plan: every layer and the head on the A6000, no tier card
 # (gate_ds41_callstream --place a --only residency; the tier clause asks that the host map holds no tier entry), and
@@ -1499,7 +1504,7 @@ gate-gpu-ds41-callstream *ARGS:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-ds41-residency-a:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream --place a --only residency'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream --place a --only residency'
 
 # V4.1 long runs on the gate placement, three arms on one load, the host set populated and locked
 # (BLOOMERY_HOST_LOCK=1 unless the environment says otherwise: populated pages alone are reclaimed under
@@ -1516,7 +1521,7 @@ gate-gpu-ds41-residency-a:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-long *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-long && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_long --faults --free --trigger {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-long && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_long --faults --free --trigger {{ARGS}}'
 
 # The candidate mask past the 16,384 positions where it first selects, on the live model at the serving context (gate
 # placement, 3090), two loads one after the other. G2, gate_deepseek41_long --candidates: 16,448 prose ids through the
@@ -1531,7 +1536,7 @@ gate-gpu-ds41-long *ARGS:
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-ds41-cand:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-cand && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long --bin gate_deepseek41_prefill && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_long --candidates && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_prefill --cand'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-cand && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long --bin gate_deepseek41_prefill && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_long --candidates && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_prefill --cand'
 
 # ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — long 게이트
 # --free의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
@@ -1542,7 +1547,7 @@ ik-greedy-ds41 PROMPT='0':
 # 스텝 하나. 512 × 16청크는 약 8,200스텝이라 한도를 28분으로 올린다. 빨강은 Δ_PPL > +1.5 %.
 [group('v41-load')]
 run-ds41-ppl TAG:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh run-ds41-ppl && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_deepseek41_step --ppl {{TAG}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh run-ds41-ppl && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_deepseek41_step --ppl {{TAG}}'
 
 # V4.1 decode CLI, functional run (no timing): generate_ds41 feeds the prompt one real step per id, then greedy
 # -n tokens, and prints them. The recipe loads the step gate's placement on the 3090 (--place gate), so its tokens
@@ -1550,7 +1555,7 @@ run-ds41-ppl TAG:
 # `BLOOMERY_CARD=a6000 just gen-ds41 --place a …` loads the serving placement (a) on the A6000. 3090, gate lock.
 [group('v41-load')]
 gen-ds41 *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gen-ds41 && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/gpu-gate.sh generate_ds41 --place gate {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gen-ds41 && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/gpu-gate.sh generate_ds41 --place gate {{ARGS}}'
 
 # The V4.1 binaries' record schemas (crates/gpu-gates/src/record.rs) into tools/bloomery/schema/, which record.rs's
 # checked_in_schemas_are_current holds to the binaries', and the engine's plans the flow model reads
@@ -1559,7 +1564,7 @@ gen-ds41 *ARGS:
 # runs with the A6000 in view, since --place a plans the stage on the largest visible card. Each plan runs at the plan
 # room (tools/ref/plan-room.sh: BLOOMERY_HOST_ROOM pinned); a plan that moves with the room turns the refresh red.
 records-refresh:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh records-refresh && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe --bin clef_hidden --bin probe_nvread >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe clef_hidden probe_nvread; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c at the plan room" && bash tools/ref/plan-room.sh $P $c; done; done' | python3 tools/bloomery/records.py refresh
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh records-refresh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe --bin clef_hidden --bin probe_nvread >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe clef_hidden probe_nvread; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c at the plan room" && bash tools/ref/plan-room.sh $P $c; done; done' | python3 tools/bloomery/records.py refresh
 
 # The flow model's queue entries held to the engine's (3090, placement gate): generate_ds41 -n 2 under
 # BLOOMERY_STEP_STATS=1 prints its counter (`stat prefill front`, `stat prefill lb`), at --depth 512 once at the default
@@ -1580,7 +1585,7 @@ records-refresh:
 # changes.
 [group('v41-load')]
 weekly-gpu-ds41-flowcounts:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-flowcounts && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && D=target/flowcounts-gate && rm -rf $D && mkdir -p $D && { BLOOMERY_STEP_STATS=1 bash tools/gpu-gate.sh generate_ds41 --place gate --arm 512/2 --arm 1536/2 --arm 512/2 > $D/g-arms.log 2> $D/g-arms.err; ga=$?; cat $D/g-arms.err; (exit $ga); } && BLOOMERY_STEP_STATS=1 BLOOMERY_PREFILL_GROUP=1 bash tools/gpu-gate.sh generate_ds41 --place gate --depth 512 -n 2 > $D/g1.log && { python3 tools/flow/ds41_prefill.py --counts $D/g-arms.log > $D/g-arms.counts; ra=$?; python3 tools/flow/ds41_prefill.py --counts $D/g1.log > $D/g1.counts; r1=$?; cat $D/g-arms.counts $D/g1.counts; echo "--counts rc: the --arm list (512, 1536, 512 again) $ra, BLOOMERY_PREFILL_GROUP=1 $r1"; [ "$ra" = 0 ] && [ "$r1" = 0 ] && [ "$(grep -c "^arm [0-9]*: counts: equal$" $D/g-arms.counts)" = 3 ] && grep -q "^repeat of arm 0: equal$" $D/g-arms.counts && grep -qx "counts: equal" $D/g1.counts && [ "$(grep -c "^state back at arm [0-9]*: ok$" $D/g-arms.err)" = 2 ] && echo "the state back: ok before arms 1 and 2" && echo "weekly-gpu-ds41-flowcounts: PASS"; }'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-flowcounts && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && D=target/flowcounts-gate && rm -rf $D && mkdir -p $D && { BLOOMERY_STEP_STATS=1 bash tools/gpu-gate.sh generate_ds41 --place gate --arm 512/2 --arm 1536/2 --arm 512/2 > $D/g-arms.log 2> $D/g-arms.err; ga=$?; cat $D/g-arms.err; (exit $ga); } && BLOOMERY_STEP_STATS=1 BLOOMERY_PREFILL_GROUP=1 bash tools/gpu-gate.sh generate_ds41 --place gate --depth 512 -n 2 > $D/g1.log && { python3 tools/flow/ds41_prefill.py --counts $D/g-arms.log > $D/g-arms.counts; ra=$?; python3 tools/flow/ds41_prefill.py --counts $D/g1.log > $D/g1.counts; r1=$?; cat $D/g-arms.counts $D/g1.counts; echo "--counts rc: the --arm list (512, 1536, 512 again) $ra, BLOOMERY_PREFILL_GROUP=1 $r1"; [ "$ra" = 0 ] && [ "$r1" = 0 ] && [ "$(grep -c "^arm [0-9]*: counts: equal$" $D/g-arms.counts)" = 3 ] && grep -q "^repeat of arm 0: equal$" $D/g-arms.counts && grep -qx "counts: equal" $D/g1.counts && [ "$(grep -c "^state back at arm [0-9]*: ok$" $D/g-arms.err)" = 2 ] && echo "the state back: ok before arms 1 and 2" && echo "weekly-gpu-ds41-flowcounts: PASS"; }'
 
 # The served draft, bit for bit (3090, placement gate): generate_ds41 under BLOOMERY_DRAFT=lookup must emit the plain
 # run's tokens. One prompt, both arms, -n 64: the first 128 ids of the code corpus. Red unless the two `tokens` lines are
@@ -1590,7 +1595,7 @@ weekly-gpu-ds41-flowcounts:
 # Two loads, each its own tools/gpu-gate.sh run: the gate compares the CLI's two arms as shipped; logs in target/draft-gate/.
 [group('v41-load')]
 gate-gpu-ds41-draft:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-draft && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && D=target/draft-gate && rm -rf $D && mkdir -p $D && C=$(head -n 128 "$BLOOMERY_DATA/engram/corpus-code.ids" | paste -sd, -) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$C" -n 64 > $D/code-plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=lookup bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$C" -n 64 > $D/code-draft.log && grep -h "^draft summary " $D/code-draft.log && grep "^tokens " $D/code-plain.log > $D/code-plain.tok && grep "^tokens " $D/code-draft.log > $D/code-draft.tok && echo "code plain $(cat $D/code-plain.tok)" && echo "code draft $(cat $D/code-draft.tok)" && cmp $D/code-plain.tok $D/code-draft.tok && echo "code: tokens identical" && S=$(grep "^draft summary " $D/code-draft.log) && P=$(echo "$S" | sed -n "s/.*proposals=\([0-9]*\).*/\1/p") && A=$(echo "$S" | sed -n "s/.* accepts=\([0-9]*\).*/\1/p") && [ "$A" -gt 0 ] && [ "$A" -lt "$P" ] && echo "code: accepts $A of $P proposals: both branches ran" && echo "gate-gpu-ds41-draft: PASS"'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-draft && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && D=target/draft-gate && rm -rf $D && mkdir -p $D && C=$(head -n 128 "$BLOOMERY_DATA/engram/corpus-code.ids" | paste -sd, -) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$C" -n 64 > $D/code-plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=lookup bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$C" -n 64 > $D/code-draft.log && grep -h "^draft summary " $D/code-draft.log && grep "^tokens " $D/code-plain.log > $D/code-plain.tok && grep "^tokens " $D/code-draft.log > $D/code-draft.tok && echo "code plain $(cat $D/code-plain.tok)" && echo "code draft $(cat $D/code-draft.tok)" && cmp $D/code-plain.tok $D/code-draft.tok && echo "code: tokens identical" && S=$(grep "^draft summary " $D/code-draft.log) && P=$(echo "$S" | sed -n "s/.*proposals=\([0-9]*\).*/\1/p") && A=$(echo "$S" | sed -n "s/.* accepts=\([0-9]*\).*/\1/p") && [ "$A" -gt 0 ] && [ "$A" -lt "$P" ] && echo "code: accepts $A of $P proposals: both branches ran" && echo "gate-gpu-ds41-draft: PASS"'
 
 # The DSpark loop (3090, placement gate). gate_deepseek41_dsloop: the target's feature tap of the draft's target_layers
 # (header only) — node counts equal the step's predicted nodes plus the taps, each mean right after the MoE join before
@@ -1606,7 +1611,7 @@ gate-gpu-ds41-draft:
 # Lane A (fixed 3090) in both tiers: the real tier's generate_ds41 calls are --place gate, which opens the 3090 by name.
 [group('v41-load')]
 gate-gpu-ds41-dspark-loop:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin gate_deepseek41_dsloop && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_dsloop --structure --tap && D=target/dsloop-gate && rm -rf $D && mkdir -p $D && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log; else export BLOOMERY_CARD_BUDGET=13G && bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log; fi && grep -h "^load draft=\|^draft summary " $D/dspark.log && grep "^tokens " $D/plain.log > $D/plain.tok && grep "^tokens " $D/dspark.log > $D/dspark.tok && echo "plain $(cat $D/plain.tok)" && echo "dspark $(cat $D/dspark.tok)" && cmp $D/plain.tok $D/dspark.tok && echo "tokens identical" && S=$(grep "^draft summary " $D/dspark.log) && P=$(echo "$S" | sed -n "s/.*proposals=\([0-9]*\).*/\1/p") && A=$(echo "$S" | sed -n "s/.* accepts=\([0-9]*\).*/\1/p") && N=$(echo "$S" | sed -n "s/.* passes=\([0-9]*\).*/\1/p") && [ -n "$N" ] && [ "$P" = "$N" ] && echo "proposals $P = passes $N: every pass verified a proposal" && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then echo "deferred(real) file-bound: accepts $A of $P proposals (the real draft accept rate)"; else [ "$A" -gt 0 ] && [ "$A" -lt "$P" ] && echo "accepts $A of $P proposals: both branches ran"; fi && echo "gate-gpu-ds41-dspark-loop: PASS"'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin gate_deepseek41_dsloop && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_dsloop --structure --tap && D=target/dsloop-gate && rm -rf $D && mkdir -p $D && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log; else export BLOOMERY_CARD_BUDGET=13G && bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log; fi && grep -h "^load draft=\|^draft summary " $D/dspark.log && grep "^tokens " $D/plain.log > $D/plain.tok && grep "^tokens " $D/dspark.log > $D/dspark.tok && echo "plain $(cat $D/plain.tok)" && echo "dspark $(cat $D/dspark.tok)" && cmp $D/plain.tok $D/dspark.tok && echo "tokens identical" && S=$(grep "^draft summary " $D/dspark.log) && P=$(echo "$S" | sed -n "s/.*proposals=\([0-9]*\).*/\1/p") && A=$(echo "$S" | sed -n "s/.* accepts=\([0-9]*\).*/\1/p") && N=$(echo "$S" | sed -n "s/.* passes=\([0-9]*\).*/\1/p") && [ -n "$N" ] && [ "$P" = "$N" ] && echo "proposals $P = passes $N: every pass verified a proposal" && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then echo "deferred(real) file-bound: accepts $A of $P proposals (the real draft accept rate)"; else [ "$A" -gt 0 ] && [ "$A" -lt "$P" ] && echo "accepts $A of $P proposals: both branches ran"; fi && echo "gate-gpu-ds41-dspark-loop: PASS"'
 
 # V4.1 배치 프리필(`body::prefill`)을 게이트 배치에서: corpus-prose.ids 앞부분으로 3001스텝 디코드 오라클을 한 번 뜨고(DSpark
 # 드래프트의 특징 탭 포함), P ∈ {1, 127, 128, 129, 511, 512, 513, 2300}과 분할 700+400·1800+1000·300+2700마다 모든 층의 창 링·
@@ -1614,7 +1619,7 @@ gate-gpu-ds41-dspark-loop:
 # `--no-split`은 FAIL-first용 부분 실행, `--seams P`는 판정이 아니라 첫 어긋난 이음매를 찾는 로케이터.
 [group('v41-load')]
 gate-gpu-ds41-prefill *ARGS='':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_prefill && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_prefill {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_prefill && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_prefill {{ARGS}}'
 
 # V4.1 텍스트 쪽 이미지 주입(`body::prefill_media`, `Session::prompt_media`)을 게이트 배치에서: 공식 비전 오라클 세트
 # (deepseek41v, `grad-448`)의 aligner 행과 mmproj 구분자 행으로 스팬을 만들어 세 배치(프롬프트 한가운데, T_MAX 경계를
@@ -1624,7 +1629,7 @@ gate-gpu-ds41-prefill *ARGS='':
 # 스냅숏/바이트 재개, 세 거부의 이름. The 3090's plan on either card (shared/gate_card.rs), gate lock.
 [group('v41-load')]
 gate-gpu-ds41-media *ARGS='':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ds41_media {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ds41_media {{ARGS}}'
 
 # Text in, text out (3090, placement gate). One bloomery-chat load runs four --then runs, ordered
 # seed 7 a (row 0, --seed 7), row 0 --greedy, row 7 --greedy, seed 7 b: the two seed-7 runs bracket the
@@ -1642,7 +1647,7 @@ gate-gpu-ds41-media *ARGS='':
 # stderr into the recipe's output whatever its rc, and the rc kept. Logs in target/chat-gate/.
 [group('v41-load')]
 gate-gpu-ds41-chat:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chat && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat && D=target/chat-gate && rm -rf $D && mkdir -p $D && R0=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && R7=$BLOOMERY_DATA/greedy-ds41/prompt7.tsv && T0=$(grep -v "^#" $R0 | head -n 1 | cut -f2) && T7=$(grep -v "^#" $R7 | head -n 1 | cut -f2) && echo "[$(grep -v "^#" $R0 | head -n 1 | cut -f3)]" | sed "s/,/, /g" > $D/p0-row.ids && echo "[$(grep -v "^#" $R7 | head -n 1 | cut -f3)]" | sed "s/,/, /g" > $D/p7-row.ids && { bash tools/gpu-gate.sh bloomery-chat --place gate --seed 7 --prompt "$T0" -n 16 --then --greedy --prompt "$T0" -n 16 --then --greedy --prompt "$T7" -n 16 --then --seed 7 --prompt "$T0" -n 16 > $D/chat.out 2> $D/chat.err; rc=$?; sed -n "/^gpu-gate\.sh: waited /p; /^runs in order: /p; /^state back at /p; /^bloomery-chat: /p; /^GPU GATE /p" $D/chat.err; (exit $rc); } && awk -v d=$D "{ print > sprintf(\"%s/run%d.err\", d, n) } /^chat: /{ n++ }" $D/chat.err && I7=$(grep -v "^#" $R7 | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I7" -n 16 > $D/p7-gen.log && sed -n "s/^prompt_ids //p" $D/run1.err > $D/p0-chat.ids && sed -n "s/^ids //p" $D/run1.err > $D/p0-chat.tok && sed -n "s/^prompt_ids //p" $D/run2.err > $D/p7-chat.ids && sed -n "s/^ids //p" $D/run2.err > $D/p7-chat.tok && sed -n "s/^tokens //p" $D/p7-gen.log > $D/p7-gen.tok && sed -n "s/^ids //p" $D/run0.err > $D/seed7a.tok && sed -n "s/^ids //p" $D/run3.err > $D/seed7b.tok && echo "p0 row ids     $(cat $D/p0-row.ids)" && echo "p0 chat ids    $(cat $D/p0-chat.ids)" && echo "p0 chat greedy $(cat $D/p0-chat.tok)" && echo "p7 row ids     $(cat $D/p7-row.ids)" && echo "p7 chat ids    $(cat $D/p7-chat.ids)" && echo "p7 chat greedy $(cat $D/p7-chat.tok)" && echo "p7 generate    $(cat $D/p7-gen.tok)" && echo "seed 7 a $(cat $D/seed7a.tok)" && echo "seed 7 b $(cat $D/seed7b.tok)" && echo "chat texts: $(cat $D/chat.out)" && cmp $D/p0-row.ids $D/p0-chat.ids && echo "p0 prompt ids: identical to the row" && test -s $D/p0-chat.tok && grep -q "^chat: .* stop=eog$" $D/run1.err && echo "p0: stopped at the end-of-generation id" && grep -qx "text_consistent=true" $D/run1.err && echo "p0 text: consistent with the decode" && cmp $D/p7-row.ids $D/p7-chat.ids && echo "p7 prompt ids: identical to the row" && test -s $D/p7-chat.tok && case "$(tr -d "[] " < $D/p7-gen.tok)," in "$(tr -d "[] " < $D/p7-chat.tok),"*) echo "p7 greedy ids: a prefix of generate_ds41 (the whole of it unless stop=eog)" ;; *) false ;; esac && grep -qx "text_consistent=true" $D/run2.err && echo "p7 text: consistent with the decode" && grep -q "^chat: .* stop=length$" $D/run2.err && echo "p7: ran to -n, every id compared" && grep -qx "text_consistent=true" $D/run0.err && grep -qx "text_consistent=true" $D/run3.err && test -s $D/seed7a.tok && cmp $D/seed7a.tok $D/seed7b.tok && echo "seed 7: ids identical" && [ "$(grep -c "^chat: " $D/chat.err)" = 4 ] && echo "chat: four runs on one load" && [ "$(grep -c "^state back at run [0-9]*: ok$" $D/chat.err)" = 3 ] && echo "the state back: ok before runs 1, 2 and 3" && echo "gate-gpu-ds41-chat: PASS"'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chat && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat && D=target/chat-gate && rm -rf $D && mkdir -p $D && R0=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && R7=$BLOOMERY_DATA/greedy-ds41/prompt7.tsv && T0=$(grep -v "^#" $R0 | head -n 1 | cut -f2) && T7=$(grep -v "^#" $R7 | head -n 1 | cut -f2) && echo "[$(grep -v "^#" $R0 | head -n 1 | cut -f3)]" | sed "s/,/, /g" > $D/p0-row.ids && echo "[$(grep -v "^#" $R7 | head -n 1 | cut -f3)]" | sed "s/,/, /g" > $D/p7-row.ids && { bash tools/gpu-gate.sh bloomery-chat --place gate --seed 7 --prompt "$T0" -n 16 --then --greedy --prompt "$T0" -n 16 --then --greedy --prompt "$T7" -n 16 --then --seed 7 --prompt "$T0" -n 16 > $D/chat.out 2> $D/chat.err; rc=$?; sed -n "/^gpu-gate\.sh: waited /p; /^runs in order: /p; /^state back at /p; /^bloomery-chat: /p; /^GPU GATE /p" $D/chat.err; (exit $rc); } && awk -v d=$D "{ print > sprintf(\"%s/run%d.err\", d, n) } /^chat: /{ n++ }" $D/chat.err && I7=$(grep -v "^#" $R7 | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I7" -n 16 > $D/p7-gen.log && sed -n "s/^prompt_ids //p" $D/run1.err > $D/p0-chat.ids && sed -n "s/^ids //p" $D/run1.err > $D/p0-chat.tok && sed -n "s/^prompt_ids //p" $D/run2.err > $D/p7-chat.ids && sed -n "s/^ids //p" $D/run2.err > $D/p7-chat.tok && sed -n "s/^tokens //p" $D/p7-gen.log > $D/p7-gen.tok && sed -n "s/^ids //p" $D/run0.err > $D/seed7a.tok && sed -n "s/^ids //p" $D/run3.err > $D/seed7b.tok && echo "p0 row ids     $(cat $D/p0-row.ids)" && echo "p0 chat ids    $(cat $D/p0-chat.ids)" && echo "p0 chat greedy $(cat $D/p0-chat.tok)" && echo "p7 row ids     $(cat $D/p7-row.ids)" && echo "p7 chat ids    $(cat $D/p7-chat.ids)" && echo "p7 chat greedy $(cat $D/p7-chat.tok)" && echo "p7 generate    $(cat $D/p7-gen.tok)" && echo "seed 7 a $(cat $D/seed7a.tok)" && echo "seed 7 b $(cat $D/seed7b.tok)" && echo "chat texts: $(cat $D/chat.out)" && cmp $D/p0-row.ids $D/p0-chat.ids && echo "p0 prompt ids: identical to the row" && test -s $D/p0-chat.tok && grep -q "^chat: .* stop=eog$" $D/run1.err && echo "p0: stopped at the end-of-generation id" && grep -qx "text_consistent=true" $D/run1.err && echo "p0 text: consistent with the decode" && cmp $D/p7-row.ids $D/p7-chat.ids && echo "p7 prompt ids: identical to the row" && test -s $D/p7-chat.tok && case "$(tr -d "[] " < $D/p7-gen.tok)," in "$(tr -d "[] " < $D/p7-chat.tok),"*) echo "p7 greedy ids: a prefix of generate_ds41 (the whole of it unless stop=eog)" ;; *) false ;; esac && grep -qx "text_consistent=true" $D/run2.err && echo "p7 text: consistent with the decode" && grep -q "^chat: .* stop=length$" $D/run2.err && echo "p7: ran to -n, every id compared" && grep -qx "text_consistent=true" $D/run0.err && grep -qx "text_consistent=true" $D/run3.err && test -s $D/seed7a.tok && cmp $D/seed7a.tok $D/seed7b.tok && echo "seed 7: ids identical" && [ "$(grep -c "^chat: " $D/chat.err)" = 4 ] && echo "chat: four runs on one load" && [ "$(grep -c "^state back at run [0-9]*: ok$" $D/chat.err)" = 3 ] && echo "the state back: ok before runs 1, 2 and 3" && echo "gate-gpu-ds41-chat: PASS"'
 
 # The HTTP server on the V4.1 engine (3090, placement gate). Prompt row 0: generate_ds41 --tokens <the row's ids> -n 16
 # under its own gate-lock hold, then gate_ds41_serve under another: it starts bloomery-serve-ds41 --port 0 --place gate,
@@ -1672,7 +1677,7 @@ gate-gpu-ds41-chat:
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-ds41-serve:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41,vision --release --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && bash tools/gpu-gate.sh gate_ds41_serve --mmproj --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision --release --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && bash tools/gpu-gate.sh gate_ds41_serve --mmproj --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
 
 # nvtier R2의 게이트: 페이지드 계획(방 27 GiB — 분할 다이얼이 아레나를 준다)의 NVMe 전문가 티어 램 아레나를
 # 상주 전 계획과 같은 파일에서 적재해, 설계 §7의 조항들을 본다 — 비트 동일성(512 프롬프트 + 96 탐욕 스텝),
@@ -1686,7 +1691,7 @@ weekly-gpu-ds41-serve:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-nvtier:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nvtier && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvtier'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nvtier && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvtier'
 
 # Qwen3.8's adaptive expert residency on one card (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P from the plan's
 # card experts): the churn pool's host refusal at load, a verify keeping its counted rows only, the same history twice
@@ -1698,7 +1703,7 @@ gate-gpu-nvtier:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-residency:
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-residency && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-residency && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
 
 # Qwen3.8 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier on the 3090, its decode walks (a
 # step and the 2-, 3- and 4-row verifies) and its ubatch prompt walk serving the tier. The reference is the same plan
@@ -1717,7 +1722,7 @@ gate-gpu-qwen38-residency:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard --bin generate_qwen3moe && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard --bin generate_qwen3moe && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
 
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's
@@ -1746,7 +1751,7 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-serve:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_qwen3moe --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --arm plain --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/plain && bash tools/gpu-gate.sh gate_qwen38_serve --arm drafted --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/drafted'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_qwen3moe --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --arm plain --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/plain && bash tools/gpu-gate.sh gate_qwen38_serve --arm drafted --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/drafted'
 
 # The qwen3 seat of bloomery-serve (--model qwen3 -m <file>) against generate_qwen3moe, on the qwen3moe profile's file
 # (Qwen3-30B-A3B, the MODEL box.sh exports under BLOOMERY_MODEL=qwen3moe) and the qwen35moe profile's (Qwen3.6-35B-A3B,
@@ -1757,7 +1762,7 @@ gate-gpu-qwen38-serve:
 # target/qwen3-serve-gate/<n>/. The build takes glm5next: bloomery-serve links every seat's device bundle.
 [group('pool')]
 gate-gpu-qwen3-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin generate_qwen3moe --bin gate_qwen3_serve && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --dir $D'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin generate_qwen3moe --bin gate_qwen3_serve && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --dir $D'
 
 # bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
 # default (SERVE_PLACE=gate for the 3090), the port 8080 unless SERVE_PORT, a four-hour gate bound unless
@@ -1765,12 +1770,12 @@ gate-gpu-qwen3-serve:
 # through the environment). gpu-gate.sh takes the card's gate lock, so no other gate lands on the card it serves
 # from, and bounds the run; the address is on the server's stderr.
 serve-qwen38 *ARGS:
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD={{serve_card}} ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-qwen38 && BLOOMERY_GATE_BOUND=${BLOOMERY_GATE_BOUND:-14400} bash tools/gpu-gate.sh bloomery-serve-qwen38 --port ${SERVE_PORT:-8080} --place {{serve_place}} {{ARGS}}'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD={{serve_card}} ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-qwen38 && BLOOMERY_GATE_BOUND=${BLOOMERY_GATE_BOUND:-14400} bash tools/gpu-gate.sh bloomery-serve-qwen38 --port ${SERVE_PORT:-8080} --place {{serve_place}} {{ARGS}}'
 
 # The same CLI's per-step ms (lead-only): placement (a) on the A6000 under the machine-wide lease, witness blocks
 # around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
 time-gpu-ds41 *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/time-gate.sh generate_ds41 {{ARGS}} --time'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/time-gate.sh generate_ds41 {{ARGS}} --time'
 
 # ik's V4.1 decode on the first 512 ids of corpus-<CORPUS>.ids, plain or with the DSpark draft, under the lease on
 # the A6000 (lead-only): the ik twin of `just time-gpu-ds41 --tokens <those ids> -n N`. tools/ref/ik-draft.sh's header
@@ -1805,7 +1810,7 @@ time-lcpp-prompt CORPUS N:
 # With no ours arm generate_ds41 is not built, nor under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 (the command lines, no lease);
 # no arms means the runner's default (6 ik:6), which builds.
 depth-gpu-ds41 *ARMS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:* | code:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:* | code:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
 
 # Qwen3-30B-A3B 전 카드 디코드를 깊이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(프롬프트를 실제 D스텝으로 먹임), ik `ik:<D>`(-gp D,96, 프로필
 # 플래그)·`ikdef:<D>`(llama-bench 기본값), mainline `lcpp:<D>`(-d D)를 바퀴마다 순서를 돌려 번갈아 재고, 깊이마다 ours/각 참조 비율을 찍는다.
@@ -1817,7 +1822,7 @@ depth-gpu-ds41 *ARMS:
 # --tokens로 넣는다(행 라벨 ours@prose). prose 팔은 같은 P의 prose 팔하고만, 자기 표에서 비교한다.
 # Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 the runner prints the command lines and exits before the lease, and nothing is built.
 depth-gpu-qwen3moe *ARMS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # Qwen3.6-35B-A3B(qwen35moe) 같은 표: depth-gpu-qwen3moe의 러너·팔·표를 qwen35moe 프로필로 돈다. 우리 팔은 같은
 # generate_qwen3moe가 파일 헤더에서 아키텍처를 읽어 Body35로 연다.
@@ -1826,7 +1831,7 @@ depth-gpu-qwen3moe *ARMS:
 # $BLOOMERY_DATA/qwen35moe/corpus-prose.ids 앞 P개 id를 --tokens로 넣고(행 라벨 ours@prose), prose 표에서만 비교한다.
 # 참조 트리와 플래그는 tools/ref/models/qwen35moe.sh. BLOOMERY_DRY=1이면 명령줄만, 빌드 없음.
 depth-gpu-qwen35moe *ARMS:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # Qwen3.8-Flash-Next (qwen4exp), the same table: depth-gpu-qwen3moe's runner, arms and tables under the qwen4exp
 # profile. Our arm is generate_qwen3moe opening Body38 on the A6000, each layer's routed expert prefix on the card as
@@ -1838,7 +1843,7 @@ depth-gpu-qwen35moe *ARMS:
 # ids route heavily skewed, so a lever tuned on it can mean nothing on real text. Each arm pages the ~111 GB host set
 # in when it is cold. BLOOMERY_DRY=1 prints the command lines only, nothing built.
 depth-gpu-qwen4exp *ARMS:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용):
 # ours `<D>` (the first D prose ids, run as the binary's `--prefill` default, batches; `kind=` in the row names the feed),
@@ -1848,7 +1853,7 @@ depth-gpu-qwen4exp *ARMS:
 # 돌리고 exllamav3 팔은 그 뒤 한 덩어리로 돈다. 팔·플래그 근거는 tools/ref/depth-glm5next.sh와 models/glm5next.sh 머리에.
 # 우리 팔이 없거나 BLOOMERY_BOX_ENV=BLOOMERY_DRY=1이면 generate_glm5next를 빌드하지 않는다; 인자 없으면 512 lcpp27754:512.
 depth-gpu-glm5next *ARMS:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next; fi; } && bash tools/ref/depth-glm5next.sh {{ARMS}}'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next; fi; } && bash tools/ref/depth-glm5next.sh {{ARMS}}'
 
 # Any model's decode and prompt rate through `bloomery-serve`, one fresh server an arm and a round (A6000, one lease,
 # lead-only): `<tree>:<D>` is ~/repo/<tree>'s bloomery-serve on the first D ids of the model's prose corpus, `env=K=V,K=V:<tree>:<D>`
@@ -1862,13 +1867,13 @@ depth-gpu-glm5next *ARMS:
 # BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and no lease is taken: the plan and each binary's state.
 depth-serve *ARMS:
     @[ -n "${BLOOMERY_MODEL:-}" ] || { echo "depth-serve: BLOOMERY_MODEL is unset: name the model profile (tools/ref/models/<name>.sh), e.g. BLOOMERY_MODEL=mimo2 just depth-serve <tree>:<D>" >&2; exit 64; }
-    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { here=$(basename "$PWD"); ours=; for a in {{ARMS}}; do t=${a#env=*:}; [ "${t%%:*}" != "$here" ] || ours=1; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve; fi; } && bash tools/ref/depth-serve.sh {{ARMS}}'
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { here=$(basename "$PWD"); ours=; for a in {{ARMS}}; do t=${a#env=*:}; [ "${t%%:*}" != "$here" ] || ours=1; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve; fi; } && bash tools/ref/depth-serve.sh {{ARMS}}'
 
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
 # header of tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-qwen3moe *DEPTHS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_DEPTHS="{{DEPTHS}}" bash tools/ref/nsys-gpu.sh'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_DEPTHS="{{DEPTHS}}" bash tools/ref/nsys-gpu.sh'
 
 # Qwen3-30B-A3B prefill kernel table (nsys, A6000, under the lease, lead-only): generate_qwen3moe's timed prompt (the
 # depth runner's `<P>` arm) at each length P (default 4096, one ubatch at the default ubatch size), then
@@ -1877,7 +1882,7 @@ nsys-gpu-qwen3moe *DEPTHS:
 # https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3next-design-report.md; not numbers of record]: gemm_q4k + gemm_q6k about 62 % of the prompt,
 # qwen3moe_router_logits 0.36-0.54 ms a launch. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-qwen3moe-prefill *PROMPTS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_FORM=prefill BLOOMERY_NSYS_DEPTHS="{{PROMPTS}}" bash tools/ref/nsys-gpu.sh'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_FORM=prefill BLOOMERY_NSYS_DEPTHS="{{PROMPTS}}" bash tools/ref/nsys-gpu.sh'
 
 # V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록
 # 또는 말뭉치 팔(prose:<P>, code:<P> — depth-ds41.sh의 말뭉치 팔이 먹이는 같은 id). BLOOMERY_GEN_PLACE(a|gate|bp)와
@@ -1885,7 +1890,7 @@ nsys-gpu-qwen3moe-prefill *PROMPTS:
 # 프로파일 대상에 그대로 전해지고 [levers] 줄로 찍힌다; 레지던시가 켜진 실행은 엔진 스트림 옆 복사 스트림 표
 # (tools/ref/ds41copy.py)를 더한다. BLOOMERY_BOX_ENV=BLOOMERY_DRY=1이면 빌드도 임대도 없이 명령줄만 찍는다.
 nsys-gpu-ds41 *DEPTHS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
 
 # V4.1 prompt batch timeline (nsys, A6000, under the lease, lead-only): generate_ds41 --depth P -n 2 --mode graph --time at
 # each prompt length P (default 512), the window from the prompt's first kernel to the first replay, cut into layer-batches
@@ -1894,7 +1899,7 @@ nsys-gpu-ds41 *DEPTHS:
 # launch queue from the CUDA API trace. The
 # header of tools/ref/nsys-ds41.sh and tools/ref/ds41pp.py have the cut. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-ds41-prefill *PROMPTS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NSYS_FORM=prefill bash tools/ref/nsys-ds41.sh {{PROMPTS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NSYS_FORM=prefill bash tools/ref/nsys-ds41.sh {{PROMPTS}}'
 
 # ik KLD 기준 파일 둘을 위치마다 비교한다(P = A, Q = B, 태그는 $BLOOMERY_DATA/ikppl 아래, 호스트만).
 # ARGS: --ubatch N(여러 번 줄 수 있다), --ik <ik-ppl --kld 태그>(ik가 찍은 요약과 밴드 안에서 맞는지).
@@ -1912,7 +1917,7 @@ kld-diff A B *ARGS:
 # reads the routed gates and ups from the file, and the r8 load, last, leaves the sidecar's pages cached.
 [group('v41-load')]
 gate-ds41-load:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_load && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_load'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_load && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_load'
 
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
@@ -1931,7 +1936,7 @@ greedy-ref-cuda:
 # P8b: 조립된 MoE 층(층 1) 스텝을 덤프와 대조 — 어텐션 절반 + 라우터·전문가 여섯·공유 전문가·결합.
 # 입력은 오라클의 l_out-0, KV는 오라클의 kv_cache-1 앞 다섯 행. 밴드는 핀하지 않고 표만 찍는다.
 gate-gpu-p8b *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8b && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p8b {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8b && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_p8b {{ARGS}}'
 
 # PTX 스캔(계측기, 게이트 아님): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
@@ -1949,7 +1954,7 @@ gate-gpu-p8b *ARGS:
 [arg("NOJIT", long="no-jit", value="--no-jit")]
 ptx-scan BIN FEATURES='gpu' NOJIT='' *ARGS:
     @bash tools/scan-args.sh ptx {{BIN}} {{NOJIT}} {{ARGS}}
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} {{ if (NOJIT + " " + ARGS) =~ "(^| )--no-jit( |$)" { "" } else { "--bin oxart_jit" } }} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{NOJIT}} {{BIN}} {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} {{ if (NOJIT + " " + ARGS) =~ "(^| )--no-jit( |$)" { "" } else { "--bin oxart_jit" } }} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{NOJIT}} {{BIN}} {{ARGS}}'
 
 # PTX 스필 래칫 — 빌드 시점 게이트. generate_ds41(deepseek41)과 gate_e2e(V2-Lite)의 ptx-scan 표에서 엔트리마다
 # spill(ptxas 스필 저장 바이트)·jit_local(드라이버 JIT의 스레드당 로컬 바이트)을 tools/ref/ptx-shapes.tsv의 핀과 대조한다.
@@ -1959,7 +1964,7 @@ ptx-scan BIN FEATURES='gpu' NOJIT='' *ARGS:
 # (bloomery-gpu-vision, V4.1's six and the Qwen3-VL tower's five); the bloomery-gpu entries of the same bundle are pinned by the
 # first two binaries.
 gate-ptx-spill:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41 --bin oxart_jit && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e --bin oxart_jit && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv generate_ds41 gate_e2e gate_qwen3vl_tower:vis_'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41 --bin oxart_jit && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e --bin oxart_jit && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv generate_ds41 gate_e2e gate_qwen3vl_tower:vis_'
 
 # 인자: `<엔트리> n,t,…`(분기 결정 한 줄을 따라간 경로), `<엔트리> list`(목록).
 # SASS 스캔(ptx-scan의 짝, 계측기): 첫 대기 전에 발행된 전역 로드 수를 루프마다, 그리고 한 경로를 따라 센다.
@@ -1967,7 +1972,7 @@ gate-ptx-spill:
 [arg("FEATURES", long="features")]
 sass-scan BIN FEATURES='gpu' *ARGS:
     @bash tools/scan-args.sh sass {{BIN}} {{ARGS}}
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/sass-scan.sh {{BIN}} {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/sass-scan.sh {{BIN}} {{ARGS}}'
 
 # 공유 로드·스필 스캔(계측기, 게이트 아님): 엔트리마다 PTX 본문의 ld.shared(폭별)·ld.global·st.shared·shfl·fma·
 # cvt.f16 수와, ptxas가 만든 SASS의 STL·LDL·LDS(폭별) 수를 한 줄에 센다. ptx-scan의 spill 열(저장+적재 바이트)이
@@ -1976,7 +1981,7 @@ sass-scan BIN FEATURES='gpu' *ARGS:
 [arg("FEATURES", long="features")]
 lds-scan BIN FEATURES='gpu' *ARGS:
     @bash tools/scan-args.sh lds {{BIN}} {{ARGS}}
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/lds-scan.sh {{BIN}} {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/lds-scan.sh {{BIN}} {{ARGS}}'
 
 # 판정 비교(맥에서 돈다): 두 트리에서 같은 레시피를 돌리고, 빌드 줄·시간·pid·스레드 id를 가린 뒤 출력을 비교한다.
 verdict-diff *ARGS:
@@ -1996,24 +2001,24 @@ gate-dspark-read:
 # DSpark 드래프트의 두 커널(f32 가중치 HC_PRE, bf16 Markov 헤드 + argmax)을 카드에서 호스트 규칙과 비트 단위로 대조한다.
 # dsref 세트(code64_n32_w3) 블록 0에 대한 ik와의 거리는 찍기만 한다(진단, 핀 아님).
 gate-gpu-dspark-hc:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-hc && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_hc && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_hc'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-hc && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_hc && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_hc'
 
 # DSpark 드래프트의 routed MoE(MXFP4 expert gate·up·SwiGLU와 down+결합, 128개 중 3개 라우터)를 카드에서 호스트 규칙과
 # 비트 단위로, f32 참조와는 q8_1 한계와 핀으로 대조한다. dsref 세트 블록 0 층 0에 대한 ik와의 거리는 찍기만 한다.
 gate-gpu-dspark-experts:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-experts && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_experts && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_experts'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-experts && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_experts && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_experts'
 
 # DSpark 드래프트를 3090에 올리고(텐서별 카드 형식, 그룹별 바이트 = 인벤토리, cuMemGetInfo 증감), 특징→KV 그래프를
 # dsref 세트 블록 0–3에 대조한다: main_x와 층마다 링 행이 ik의 q8_1 활성값 규칙이 허용하는 유도 한계 안.
 gate-gpu-dspark-kv:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-kv && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_kv && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_kv'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-kv && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_kv && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_kv'
 
 # DSpark 드래프트의 블록 패스와 헤드를 ik가 떨군 dsref 세트와 대조한다. ik 규칙 arm(블록 인과 마스크, SwiGLU clamp 없음 —
 # ik 드래프트가 도는 방식)은 블록 0–2의 모든 탭을 유도 밴드로 판정하고, 엔진이 도는 기준 규칙(model.py) arm은 두 규칙이
 # 갈리지 않는 행만 판정한다. 블록마다 draft_argmax, w=5 비트 동일, 캡처 노드 수 = 커널 목록(패스 73 + 8w, 링 append 8). DraftBody가
 # 로드 때 잡은 그래프는 블록 0–2·폭 1–5에서 eager와 비트 동일, 세트 전체에서 id와 링이 eager 쌍둥이와 같다. 수락 수는 찍기만 한다.
 gate-gpu-dspark-graph:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-graph && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_graph && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_graph'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-graph && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_graph && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_graph'
 
 # DSpark Markov 헤드 단독 초안(E6)의 오프라인 수락률 — 시간을 재지 않는 CPU 실행이고 임대를 잡지 않는다. 먼저 self-test,
 # 다음 코퍼스 스트림마다 앞 50k토큰의 acc/positions·top-2·top-4와 E5 markov1 재계산, 이전 토큰별 argmax 표의 해시와
@@ -2065,7 +2070,7 @@ gate-vision:
 # 비전 오라클 세트의 모든 이미지에 돌려 공식 vision.py와 탭별로 대조한다 — embed·blk0·forced 탭은 절대 핀, 자유 실행 탭은
 # 참조의 자기 민감도 행(MANIFEST `# sensitivity`)의 K배 안; 블록 0은 crates/gpu-vision의 호스트 규칙과 연산별로 대조. 3090, 게이트 락.
 gate-gpu-vision:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_vision_encoder && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_vision_encoder'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_vision_encoder && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_vision_encoder'
 
 # The Qwen3-VL image tower on the card (the `qwen3vl_merger` mmproj of Clef-Flash, Qwen3.6 and Qwen3.8): 27 blocks (heads of 72,
 # LayerNorm, tanh GELU, the learned position table resized to the grid, 2D RoPE) and the 2x2 merger against every tap of the Clef
@@ -2077,7 +2082,7 @@ gate-gpu-vision:
 # Qwen3.6 and Qwen3.8 arms end in a named deferred line while their family's set is not in the tree (a deferral is not a pass).
 # Real file only; the gate lock.
 gate-gpu-qwen3vl-tower:
-    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3vl-tower && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3vl_tower'
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3vl-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3vl_tower'
 
 # V4-Flash 인벤토리 게이트: deepseek41 모듈이 V4-Flash 파일(deepseek4)에서 읽은 모델 값·층 종류(비율 4는 자기 인덱스 키로
 # top-k, 비율 128은 전 행, 0–2층 해시 라우팅), 텐서 수·역할별·타입별 바이트, 설계 §5 (a)·(b)·게이트 배치의 카드·호스트 줄과
@@ -2115,7 +2120,7 @@ gate-mimo2-meta:
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-mimo2-e2e *ARGS:
-    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features mimo2 --release --bin gate_mimo2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_e2e {{ARGS}}'
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features mimo2 --release --bin gate_mimo2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_e2e {{ARGS}}'
 
 # glm5next (GLM-5.3-Flash) end-to-end: the program loaded once by the gate placement on the card the runner puts in view
 # (the 3090's bytes; every routed expert on the host tier, the host set of about 185 GB populated), against ik's sets
@@ -2144,7 +2149,7 @@ weekly-gpu-mimo2-e2e *ARGS:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-e2e:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_BOUND=1200 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --step-sets short'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_BOUND=1200 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --step-sets short'
 
 # The same gate's drafted slots pass (`--only stagger-draft`, (h1)-(h4)) on a NextN load of its own at SLOT_CTX, its plan
 # counting two slots: each slot's verify rows, two a slot, as one pass of four (`GpuModel::verify_slots` and
@@ -2156,7 +2161,7 @@ gate-gpu-glm5next-e2e:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-stagger:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only stagger-draft'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only stagger-draft'
 
 # The same gate's long step sets (`--only main --step-sets long`): the load at CTX and its clauses, with the 1,024-position
 # set and the 3,070-position `--dsa` set, the only comparisons with ik past 4 positions and the only end-to-end run past
@@ -2168,7 +2173,7 @@ gate-gpu-glm5next-stagger:
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-glm5next-e2e-long:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
 
 # glm5next (GLM-5.3-Flash) NextN draft: the target loaded twice by its NextN plan on the card the runner puts in view
 # (the 3090's bytes in the real tier), without the next-token layer and with it (`Body::open_placed_nextn`), against ik's MTP
@@ -2183,7 +2188,7 @@ weekly-gpu-glm5next-e2e-long:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-mtp:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_mtp'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_mtp'
 
 # glm5next (GLM-5.3-Flash) on plan (b′): the stage on the A6000, the expert tier on the 3090 (`app::arch::glm5next::open_pair`
 # at --place bp, two KDA lanes, under a card budget on both cards: 16 GiB in the real tier, the header's in the fixture
@@ -2205,7 +2210,7 @@ gate-gpu-glm5next-mtp:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-twocard:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_twocard --bin generate_glm5next && bash tools/gpu-gate.sh gate_glm5next_twocard && bash tools/gpu-gate.sh gate_glm5next_twocard --residency && bash tools/gpu-gate.sh gate_glm5next_twocard --nextn && bash tools/gpu-gate.sh gate_glm5next_twocard --records'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_twocard --bin generate_glm5next && bash tools/gpu-gate.sh gate_glm5next_twocard && bash tools/gpu-gate.sh gate_glm5next_twocard --residency && bash tools/gpu-gate.sh gate_glm5next_twocard --nextn && bash tools/gpu-gate.sh gate_glm5next_twocard --records'
 
 # GLM's adaptive expert residency on the gate placement (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P half the
 # plan's least card slots a layer): the churn pool's host refusal at load, the batch prompt one pass keeping 0 and each
@@ -2216,7 +2221,7 @@ gate-gpu-glm5next-twocard:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-residency:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_residency && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_residency'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_residency && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_residency'
 
 # The GLM seat of bloomery-serve (--model glm) on the gate placement, against generate_glm5next on the same card
 # (gate_glm5next_serve's header has the clauses). Two processes, each under its own gate-lock hold and bound, the loads
@@ -2236,7 +2241,7 @@ gate-gpu-glm5next-residency:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-serve:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
 
 # The MiMo seat of `bloomery-serve` (gate_mimo2_serve): the refusals before any load (--plan's default context, the one
 # slot, the tier card), one server at --ctx 4160 --parallel 1 holding its load and listening records, the three prompts'
@@ -2253,13 +2258,13 @@ gate-gpu-glm5next-serve:
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-mimo2-serve:
-    BLOOMERY_MODEL=mimo2 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-mimo2-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_mimo2_serve && D=target/mimo2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_mimo2_serve --dir $D'
+    BLOOMERY_MODEL=mimo2 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-mimo2-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_mimo2_serve && D=target/mimo2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_mimo2_serve --dir $D'
 
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.
 [group('v41-load')]
 gen-glm5next *ARGS:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next && bash tools/gpu-gate.sh generate_glm5next --place gate {{ARGS}}'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next && bash tools/gpu-gate.sh generate_glm5next --place gate {{ARGS}}'
 
 # qwen4exp(Qwen3.8-Flash-Next) 헤더 게이트: qwen35moe 리더의 변형 행이 합성 헤더에서 이름으로 거절하는 것들, 그다음 파일의
 # 서술·역할별 텐서·커버리지 검사의 목록과 헤더에서 세운 계획(카드·호스트·캐시 바이트). 헤더만, 초 단위. 마지막 호출은
@@ -2281,7 +2286,7 @@ gate-qwen4exp-meta:
 # tools/gpu-gate.sh can run): run it inside a hold. The server runs under the driver's own bound (--bound, 1800 s),
 # and every request under an HTTP timeout, so the driver ends when the server does.
 route-trace-chat OUT PROMPTS='tools/ref/data/d2-prompts-ko.tsv,tools/ref/data/d2-prompts-en-code.tsv':
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh route-trace-chat && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 && python3 tools/ref/route-trace-chat.py run --server target/release/bloomery-serve-ds41 --out {{OUT}} --prompts {{PROMPTS}}'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh route-trace-chat && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 && python3 tools/ref/route-trace-chat.py run --server target/release/bloomery-serve-ds41 --out {{OUT}} --prompts {{PROMPTS}}'
 
 # The chat route trace of Qwen3.8 (D2's input for the second family, not a gate, lead-only, in the lead's A6000 window):
 # route-trace-chat with one bloomery-serve-qwen38 process (one load, plan (a) on the A6000) instead of the V4.1 server.
@@ -2297,11 +2302,11 @@ route-trace-chat OUT PROMPTS='tools/ref/data/d2-prompts-ko.tsv,tools/ref/data/d2
 # tools/gpu-gate.sh can run): run it inside a hold. The server runs under the driver's own bound (--bound, 1800 s), and every request under an
 # HTTP timeout, so the driver ends when the server does.
 route-trace-chat-q38 OUT PROMPTS='tools/ref/data/d2-prompts-ko.tsv,tools/ref/data/d2-prompts-en-code.tsv':
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh route-trace-chat-q38 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-qwen38 && python3 tools/ref/route-trace-chat.py run --server target/release/bloomery-serve-qwen38 --out {{OUT}} --prompts {{PROMPTS}}'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh route-trace-chat-q38 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-qwen38 && python3 tools/ref/route-trace-chat.py run --server target/release/bloomery-serve-qwen38 --out {{OUT}} --prompts {{PROMPTS}}'
 
 # 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)로 띄우고, 시드를 고정한 요청 묶음을
 # MINUTES분 보낸다. 30초마다 표본을 떠서 메모리 누수를 판정한다. 상한은 MINUTES분에 900초를 더한 값이다.
 [group('solo')]
 [group('v41-load')]
 soak-ds41 MINUTES='30':
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh soak-ds41 && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 --bin soak_ds41_serve && D=target/soak && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=$(( {{MINUTES}} * 60 + 900 )) bash tools/gpu-gate.sh soak_ds41_serve --minutes {{MINUTES}} --dir $D'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh soak-ds41 && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 --bin soak_ds41_serve && D=target/soak && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=$(( {{MINUTES}} * 60 + 900 )) bash tools/gpu-gate.sh soak_ds41_serve --minutes {{MINUTES}} --dir $D'

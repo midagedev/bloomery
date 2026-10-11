@@ -74,7 +74,7 @@ aarch64 Linux runs T0 only until the host compiles there (`docs/contrib/dgx-spar
 | 3 | A timing lease and holds under `/root` gate every command | `tools/ref/lease-probe.sh:14,45` | already overridable (`BLOOMERY_LEASE_LOCK`, `BLOOMERY_LEASE_HOLDS`); local mode points both at a file in a user directory so the guard finds no lease | XS | maintainers |
 | 4 | Gate locks per card name at `/root/bloomery-gate*.lock`, the V4.1 load lock, the batch hold | `tools/gpu-gate.sh:48-50` | a lock directory variable, and the lock keyed by card UUID so `any` takes the card that exists | M | maintainers |
 | 5 | Cards are found by exact name, `NVIDIA GeForce RTX 3090` and `NVIDIA RTX A6000` | `tools/ref/cards.sh:33-34`; `box.sh` `a6000\|both` pick, `:116-134` | local mode accepts only the default pick; a one-card host is the card the census finds. Which fixture gates open on a card that is neither named one is `[unverified]`: `AGENTS.md` ("The 3090 pins today") lists the pinned ones, the first run answers the rest | M | maintainers |
-| 6 | The device arch is `sm_86` in 136 `justfile` lines and `gate.sh:35` | `tools/gate.sh:35`, `justfile` | one `BLOOMERY_ARCH` default `sm_86`; the ptx-spill table (`tools/ref/ptx-shapes.tsv`) stays sm_86 only | M, mechanical | contributor, after the maintainers say which archs they accept |
+| 6 | The device arch was `sm_86` in 139 `justfile` lines and `tools/gate.sh` | the justfile's `arch` variable, `tools/arch.sh` | **Done:** `BLOOMERY_ARCH`, default `sm_86`, read by the justfile and by the tools on the box, forwarded by `box.sh`; `check-recipes` fails on a literal. The ptx-spill table (`tools/ref/ptx-shapes.tsv`) stays sm_86 only: `gate-ptx-spill`, `ptx-scan`, `just narrow` and `release-build` refuse another arch by name | done | maintainers |
 | 7 | The cuda-oxide backend is a prebuilt `.so` per rev, and `cargo oxide` refuses (rc 70) without it | `tools/box.sh:217` | local mode leaves `CUDA_OXIDE_BACKEND` unset so `cargo-oxide` builds from the fork checkout (`docs/BUILD.md:32`) | XS | maintainers |
 | 8 | The CPU flag `znver3` in both cargo files | `.cargo/config.toml:8`, `.cargo/cuda-oxide.toml:5` | host units: `RUSTFLAGS` as the nightly does. A `cargo oxide` build on another CPU needs both files edited (`docs/BUILD.md:51`); whether `RUSTFLAGS` reaches `cargo oxide` is `[unverified]` | S | maintainers |
 | 9 | Real model files at `/models/...`: 133 path literals in `crates/**/*.rs` (`grep -rn '"/models/\|"/root/\|/home/user'`, comments included), e.g. `crates/model/tests/mimo2_meta.rs:20` | tests, `tools/ref/models/*.sh` | one resolver (`crates/model/tests/common/model_path.rs:4` reads `$BLOOMERY_MODEL` already) and `BLOOMERY_DATA` (`tools/ref/ref-paths.sh:67`, overridable) | M, mechanical | contributor |
@@ -133,7 +133,7 @@ they are published as one dataset. The download is those sets: 6.48 GB in 17 set
 
 ## Open questions for the maintainers
 
-1. Row 5 and 6: do you accept a card that is neither the 3090 nor the A6000 and an arch other than `sm_86` for
+1. Row 5, and row 6's open half (the arch is `BLOOMERY_ARCH` now): do you accept a card that is neither the 3090 nor the A6000 and an arch other than `sm_86` for
    contributor evidence, and which fixture gates must stay on named cards?
 2. Row 10: where do fixtures and the `fx_` sets live, and may a contributor regenerate fixtures from headers?
    **Answered 2026-10-11, the first half:** the `fx_` sets are public at

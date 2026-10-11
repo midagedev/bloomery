@@ -21,7 +21,7 @@
 #              entries' listings (<addr> <instruction>) to pick them from.
 #   The recipe (`just sass-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds the
 #   binary and the extractor first. SASS_SCAN_PTXAS and SASS_SCAN_CUOBJDUMP (default the box env's
-#   CUDA_TOOLKIT_PATH, else /usr/local/cuda), SASS_SCAN_ARCH (default sm_86) and SASS_SCAN_EXTRACT
+#   CUDA_TOOLKIT_PATH, else /usr/local/cuda), SASS_SCAN_ARCH (default BLOOMERY_ARCH, sm_86 unset: tools/arch.sh) and SASS_SCAN_EXTRACT
 #   (default target/release/oxart_ptx) override the tools.
 #
 # The SASS is what ptxas makes of the PTX here; the driver JITs the same PTX at load and may allocate
@@ -56,7 +56,10 @@ fi
 TOOLKIT=${CUDA_TOOLKIT_PATH:-/usr/local/cuda}
 PTXAS=${SASS_SCAN_PTXAS:-$TOOLKIT/bin/ptxas}
 CUOBJDUMP=${SASS_SCAN_CUOBJDUMP:-$TOOLKIT/bin/cuobjdump}
-ARCH=${SASS_SCAN_ARCH:-sm_86}
+# shellcheck source=tools/arch.sh
+source "${BASH_SOURCE[0]%/*}/arch.sh"
+bloomery_arch sass-scan.sh || exit $?
+ARCH=${SASS_SCAN_ARCH:-$ARCH}
 EXTRACT=${SASS_SCAN_EXTRACT:-target/release/oxart_ptx}
 BIN=target/release/$NAME
 fail() { # fail <banner fields...>

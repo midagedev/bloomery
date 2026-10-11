@@ -34,7 +34,8 @@
 # It runs no gate and takes no timing lease, no hold, no card and no gate lock: `--no-jit` loads nothing on a card, and
 # the box commands are builds and ptxas. box.sh's own guard still waits while a sitting's lease or hold is up (rc 75 is
 # contention: run again, BLOOMERY_BOX_WAIT=3600 waits longer). BLOOMERY_CARD, BLOOMERY_BOX_ENV and BLOOMERY_TIER are
-# unset for the box calls, so nothing card-related reaches the box.
+# unset for the box calls, so nothing card-related reaches the box. The scans are sm_86's: a BLOOMERY_ARCH naming another
+# arch is refused (64) before anything runs.
 #
 # DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>, <base8>-worktree under `--worktree`) keeps: scan-set.tsv, runner.sh (the script each side
 # runs), <side>.build.log (the box's stderr: the builds), <side>.scan.out, <side>/<bin>.log (the scan logs a landing
@@ -47,6 +48,7 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds; tools/recipes.py SCAN_PACKAGE
+ARCH=sm_86 # the arch of the scans: tools/ptx-scan.sh's blk/SM column is its arithmetic and it refuses another (BLOOMERY_ARCH, tools/arch.sh)
 USAGE="usage: narrow-scan.sh BASE [HEAD | --worktree] [--out DIR] [--dry-run] | --self-test"
 
 die() { # die <rc> <message>
@@ -99,7 +101,7 @@ make_runner() {
     for f in "${featl[@]}"; do
       case " $groups " in *" $f "*) continue ;; esac
       groups="$groups $f"
-      line="cargo oxide build --arch sm_86 -- -p $PKG --features $f --release"
+      line="cargo oxide build --arch $ARCH -- -p $PKG --features $f --release"
       for b in "${!bins[@]}"; do
         [ "${featl[$b]}" = "$f" ] && line="$line --bin ${bins[$b]}"
       done
@@ -220,6 +222,7 @@ run_side() {
 
 self_test() {
   local t n=0 bad=0 want rc got
+  unset BLOOMERY_ARCH
   t=$(mktemp -d "${TMPDIR:-/tmp}/narrow-scan-test.XXXXXX") || die 70 "self-test: no temporary directory"
   # ok <name> <condition rc>
   ok() {
@@ -233,8 +236,8 @@ self_test() {
   make_runner "$t/set.tsv" "$t/ptx-scan.sh" "$t/runner.sh"; ok "runner written" $?
   bash -n "$t/runner.sh"; ok "runner parses" $?
   [ "$(grep -c '^cargo oxide build' "$t/runner.sh")" = 2 ]; ok "runner: one cargo oxide build per feature list" $?
-  grep -qF "cargo oxide build --arch sm_86 -- -p $PKG --features deepseek41,vision --release --bin bloomery-serve-ds41 >&2" "$t/runner.sh"; ok "runner: the V4.1 group" $?
-  grep -qF "cargo oxide build --arch sm_86 -- -p $PKG --features gpu --release --bin gate_kquant --bin gate_swap >&2" "$t/runner.sh"; ok "runner: the gpu group takes both bins" $?
+  grep -qF "cargo oxide build --arch $ARCH -- -p $PKG --features deepseek41,vision --release --bin bloomery-serve-ds41 >&2" "$t/runner.sh"; ok "runner: the V4.1 group" $?
+  grep -qF "cargo oxide build --arch $ARCH -- -p $PKG --features gpu --release --bin gate_kquant --bin gate_swap >&2" "$t/runner.sh"; ok "runner: the gpu group takes both bins" $?
   [ "$(grep -c "^cargo build --release -p $PKG --bin oxart_ptx" "$t/runner.sh")" = 1 ]; ok "runner: one extractor build" $?
   [ "$(grep -c -- '--no-jit' "$t/runner.sh")" = 3 ]; ok "runner: one --no-jit scan per bin" $?
   sed -n "/^cat > \"\$P\" <<'NARROW_PTX_SCAN_EOF'$/,/^NARROW_PTX_SCAN_EOF$/p" "$t/runner.sh" | sed '1d;$d' | cmp -s - "$t/ptx-scan.sh"; ok "runner: ptx-scan.sh embedded verbatim" $?
@@ -275,9 +278,12 @@ self_test() {
   [ -d "$t/lock.d" ]; ok "lock: release leaves another holder's lock" $?
   # the runner's build lines are the ptx-scan recipe's: a recipe edit that this script does not follow is red
   recipe=$(awk '/^ptx-scan /{f=1; next} f && /^[^ ]/{exit} f' "$ROOT/justfile")
-  grep -qF "cargo oxide build --arch sm_86 -- -p $PKG --features {{FEATURES}} --release --bin {{BIN}}" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds with this runner's cargo oxide line" $?
+  grep -qF "cargo oxide build --arch {{arch}} -- -p $PKG --features {{FEATURES}} --release --bin {{BIN}}" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds with this runner's cargo oxide line" $?
   grep -qF "cargo build --release -p $PKG --bin oxart_ptx && bash tools/ptx-scan.sh" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds the extractor as this runner does" $?
   grep -qF "NARROW_PTX_SCAN_EOF" "$ROOT/tools/ptx-scan.sh"; [ $? = 1 ]; ok "drift: ptx-scan.sh does not hold the runner's here-document marker" $?
+  # another arch is refused by name before any git or box call, and the scan's own arch is not
+  got=$(env BLOOMERY_ARCH=sm_121 bash "$0" HEAD --dry-run 2>&1); rc=$?
+  [ "$rc" = 64 ] && grep -qF "narrow-scan: BLOOMERY_ARCH is 'sm_121': the scan pairs are sm_86's" <<< "$got"; ok "arch: another BLOOMERY_ARCH is refused by name (64)" $?
   # --worktree: this script in a throwaway repository beside stub tools (no box, no card), so the whole run goes through
   # the real argument handling, the side loop and the affected call. The box stub logs which content each side synced.
   w=$t/wt
@@ -352,6 +358,9 @@ if [ "${1:-}" = --self-test ]; then
   self_test
   exit
 fi
+
+# The scan pairs are sm_86's (ARCH): ptx-scan.sh refuses another arch, and a box build at one would end there.
+[ "${BLOOMERY_ARCH-$ARCH}" = "$ARCH" ] || die 64 "BLOOMERY_ARCH is '$BLOOMERY_ARCH': the scan pairs are $ARCH's (tools/ptx-scan.sh refuses another arch: its blk/SM column is $ARCH's occupancy arithmetic)"
 
 BASE='' HEAD_REV='' OUT='' DRY=0 WORKTREE=0
 while [ $# -gt 0 ]; do

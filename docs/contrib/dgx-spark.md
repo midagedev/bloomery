@@ -23,7 +23,7 @@ Sparks. The Spark-prep rounds of the earlier memo:
 |---|---|---|
 | `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | done in [#14](https://github.com/midagedev/bloomery/pull/14) (P0): every AVX2 item under `cfg(target_arch = "x86_64")`, design R off it |
 | `sparkprep` S2: per-triple `extra-rustflags` | fork patch | not done: `.cargo/cuda-oxide.toml:5` is a flat list; ledger row 32 (`docs/upstream/nvlabs-ledger.md:42`) is open and the fork still reads a flat `Vec` (`cargo-oxide/src/commands/context.rs:19,311` at fork rev `4da6c13`) |
-| `sparkprep` S3 / `archkey`: one owner of `--arch` | 136 recipe lines | not done: `grep -c -- '--arch sm_86' justfile` is 136, plus `tools/gate.sh:35` |
+| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (default `sm_86`; unset, every recipe expands as before), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `gate-ptx-spill`, `ptx-scan`, `just narrow` and `release-build` refuse another arch by name; the per-arch pin rows are P3 |
 | `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | not done: `tools/ref/cards.sh:31-35` names two cards |
 | `isarefuse`: CPU check at `main` | x86-64-v3 refusal | partly: `crates/serve/src/preflight.rs` and `crates/gpu-gates/src/bin/bloomery_serve.rs:70-71` (`cpu_gate`, x86-only); no other bin calls it |
 
@@ -154,8 +154,10 @@ irrelevant to a whole-on-card run that never starts a host service.
 
 ### 3.2 The card
 
-- **Targets today.** Recipes pass `--arch sm_86` (136 lines, `tools/gate.sh:35`); `tools/ptx-scan.sh:141`,
-  `tools/lds-scan.sh:147`, `tools/sass-scan.sh:59` default to it. The kernels are SIMT code with no generation-specific
+- **Targets today.** Recipes pass `--arch {{arch}}`, the justfile's variable (139 lines): `BLOOMERY_ARCH`, default `sm_86`,
+  so `BLOOMERY_ARCH=sm_121 just <recipe>` passes `--arch sm_121`; whether the pinned toolchain accepts it is `[unverified]`
+  (the `sm_121` bullet below). `tools/gate.sh`, `tools/lds-scan.sh` and
+  `tools/sass-scan.sh` read it through `tools/arch.sh`; `tools/ptx-scan.sh` refuses any arch but `sm_86`. The kernels are SIMT code with no generation-specific
   instruction (the three `ptx_asm!` sites are `cvta`, `ld.global`, `max.f32`: `crates/gpu/src/linear/delta.rs:121-157`,
   `flash_gqa_prefill.rs:289`; `fault.rs:714` not read).
 - **Documented state.** `docs/cuda-oxide.md:5`: "Everything here runs on Ampere (sm_86) only." The toolchain ledger
@@ -174,9 +176,10 @@ irrelevant to a whole-on-card run that never starts a host service.
   is datacenter-Blackwell only (`rustc-codegen-cuda/README.md:107-108`: "need `sm_100a`, which a consumer `sm_120` lacks"),
   and we use no such instruction.
 - **Pins that follow the compute capability.** `tools/ref/ptx-shapes.tsv:6` pins spill and `jit_local` from "sm_86, JIT on
-  the RTX 3090"; `tools/recipes.py:1960-1965` says the JIT columns follow the capability; `tools/ptx-scan.sh:104` hard-codes
-  the sm_86 occupancy column. So `gate-ptx-spill` and every occupancy-derived pin are red or meaningless on cc 12.1 until
-  the maintainers add per-arch rows (`archkey`, memo M1). A Spark contributor leaves them out.
+  the RTX 3090" and carries a `# arch: sm_86` line; `tools/recipes.py:1960-1965` says the JIT columns follow the capability;
+  `tools/ptx-scan.sh` hard-codes the sm_86 occupancy column. So under `BLOOMERY_ARCH=sm_121` `gate-ptx-spill` ends with "no
+  ptx-shapes rows for sm_121; the shape pins are sm_86 only" and `ptx-scan` (so `just narrow`) refuses by name, and no sm_121
+  scan is read against sm_86 rows; per-arch rows are P3 (memo M1). A Spark contributor leaves them out.
 - **Bit gates.** The memo concludes the bit gates have no generation dependence by structure (they compare against oracle
   files) and names two residual risks: `ptxas` contracting `.rn`-less mul-then-add differently, and the `ex2.approx`-class
   approximate instructions in about 30 places (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L198, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md#L10-L16). The proof is
@@ -318,7 +321,7 @@ must exist before a contributor can start; "contributor" is what the Spark's own
 | **P0** compiles on aarch64 (done, [#14](https://github.com/midagedev/bloomery/pull/14)) | `cargo check` of the host chain passes on aarch64 Linux (on a Spark, or the cross check of 3.1 from any machine), then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; and on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | `crates/qdot/src/lib.rs`, `crates/model/src/arch/deepseek2/attn.rs`, `crates/model/src/ops.rs:5529`, `markov-accept.rs`, the two test files; `tools/mac-check.sh` triple; a local `.cargo/cuda-oxide.toml` | M | **Contributor** writes it. **Maintainers first**: decide Q1 (R or S) and answer Q5; **maintainers after**: run the x86 landing batch on the PR (the box is the only x86 judge) |
 | **P1** fixture gates pass (`qdot` design S: [#15](https://github.com/midagedev/bloomery/pull/15)) | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | `crates/qdot/src/lib.rs` (design S), `gpu-gate.sh`, `box.sh`, `lease*.sh`, `cards.sh` (3.4); the spin sites if a red points there | L | **Maintainers first**: the fixture recipe published beside the reference sets (answer 3; the sets are public), the contributor gate list (Q4), the fixture path rule (Q2). **Contributor**: the local runner mode (M, answer 10; the maintainers review it), then run, triage, fix Arm-only defects; leaves `gate-ptx-spill` out |
 | **P2** a real model runs (the pool invariant: [#16](https://github.com/midagedev/bloomery/pull/16), section 3.6) | Clef-Flash, then Qwen3-30B-A3B and Qwen3.6-35B-A3B, answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool; the published P2 tape replayed byte for byte once it exists (answer 14) | `crates/placement/src/placement.rs` (`unified: Option<UnifiedPool>`), `workstation.rs` (`unified_of`, `host_of`), `crates/gpu/src/lib.rs` (`census` reads `CU_DEVICE_ATTRIBUTE_INTEGRATED`; free bytes from `MemAvailable` on an integrated device) | M | **Contributor** (`bloomery-placement` is a pure crate: the invariant is testable off the box); the shape is answer 11. **Maintainers first** for the tape clause: the P2 tape and its reference rows (answer 14) |
-| **P3** Spark-specific speed | the section 2 term measured; a Spark table with its own ruler; `--arch sm_121` rows | `justfile` + `tools/gate.sh` arch owner (S3), `ptx-shapes.tsv` per-arch rows, the fork's per-triple key (S2), `crates/threads` P/E split, `timing-card.sh` single-card mode | L | **Maintainers**: `archkey` and S2 (they touch every recipe and the fork pin). **Contributor**: the measurement, the table |
+| **P3** Spark-specific speed | the section 2 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | `ptx-shapes.tsv` per-arch rows (the arch owner, S3, is in: `justfile` `arch`, `tools/arch.sh`), the fork's per-triple key (S2), `crates/threads` P/E split, `timing-card.sh` single-card mode | L | **Maintainers**: S2 (it touches the fork pin). **Contributor**: the measurement, the table |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots; the section 7 term measured | the unified tier's slot seam (section 7), `crates/gpu/src/host/nvtier.rs`, the card leg | L | **Maintainers first**: the unified tier and its integrated-device seam. **Contributor**: the read-rate measurement, then runs and extends the seam on the Spark |
 | **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 8 criteria, N = 2 first: split (a), the star, with raw verbs and a pump thread a node (8.5, 8.6); the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 (8.8) | `crates/placement` (`Machine { cards, tiers, nodes, fabric }`, `nodes_scale`), `crates/gpu/src/host/{mod,tier}.rs` (monotonic words, a `Link` seam), the transport (8.6) | L | **Maintainers first**: single-node P1 (the host-tier protocol on Arm); #16 with its doc line, then `host` and `unified` into `nodes[0]`; the per-node `Machine` and `nodes_scale`; the monotonic-word change and the `Link` seam; the `libibverbs` decision under `just deny` (8.9). **Contributor**: the two measurements of 8.9 (`ib_write_bw` / `ib_write_lat`, then the GPU flag ping-pong probe, which takes N as an argument), then the transport and the N = 2 run |
 
@@ -344,7 +347,7 @@ before any Spark run.
 6. **P2 golden:** yes. A published Clef-Flash tape, byte for byte, is the P2 criterion once it is published (answer 14);
    until then P2's criterion is "answers, plan clean, `PoolOver` holds".
 7. **Toolkit:** CUDA 13.3 for aarch64 (sbsa) is the tested set, not DGX OS's 13.0. `sm_86` PTX through the JIT until P3;
-   `sm_121` PTX is a P3 item.
+   `sm_121` PTX is a P3 item (`BLOOMERY_ARCH=sm_121`, section 3.2).
 8. **64 GB Spark:** best effort, for the models that fit; not a target.
 9. **An aarch64 release tarball:** P3 or later.
 

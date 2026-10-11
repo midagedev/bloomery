@@ -23,6 +23,10 @@
 #   its own device crate's entries. The table (tools/ref/ptx-shapes.tsv) holds
 #   `<binary> <entry> <spill> <jit_local>`, whitespace-separated; `#` starts a comment. A pinned
 #   nonzero value carries a `# PIN(YYYY-MM-DD): <reason>` comment on the line above its row.
+#   The table names the one arch its rows pin on a `# arch: <sm_NN>` line of its header. The scan is of the arch the build
+#   targeted (BLOOMERY_ARCH, sm_86 unset: tools/arch.sh): another arch ends the script before any scan, so a scan is never
+#   read against another arch's pins; a table with no such line, or with two, is refused too (a second arch's rows are a
+#   table of their own).
 #   The table is read once, into a copy every binary reads: a table given as a pipe or a process
 #   substitution (`<(grep … tools/ref/ptx-shapes.tsv)`) is empty on a second read.
 #
@@ -32,13 +36,16 @@
 #   <bin> <entry> stale                                    (in the table, not in the scan)
 #   ptx-spill bin=<bin> scan is no-jit (jit_local not read) FAIL   (a scan that skipped the JIT)
 # Exit status: 0 when every binary's scan read and matched its pins; 1 on a violation or a scan
-# that failed (ptx-scan's own nonzero exit, or a table it printed without rows); 2 on a usage error.
+# that failed (ptx-scan's own nonzero exit, or a table it printed without rows); 2 on a usage error
+# (a table that does not name exactly one arch included); 64 a BLOOMERY_ARCH that is no arch or not the table's.
 set -uo pipefail
 
 self_test() {
   local t fails=0 out rc
   t=$(mktemp -d)
   cp "${BASH_SOURCE[0]}" "$t/ptx-spill-check.sh"
+  cp "${BASH_SOURCE[0]%/*}/arch.sh" "$t/arch.sh"
+  unset BLOOMERY_ARCH
   # The stub scan prints the fixture scan of its binary, or fails as ptx-scan does on a missing binary.
   printf '%s\n' '#!/usr/bin/env bash' \
     'f="${BASH_SOURCE[0]%/*}/$1${2:+.$2}.scan"' \
@@ -66,7 +73,7 @@ self_test() {
   marked g " jit=skipped(no-jit)" 0 "k1 0"
   marked h "" "skipped(no-jit)" "k1 0"
   scan v.vis_ "vis_a 0 0"
-  printf '%s\n' '# fixture' 'a k1 0 0' '# PIN(2000-01-01): fixture' 'a k2 8 0' 'b k3 0 0' 'd k1 0 0' 'd k9 0 0' \
+  printf '%s\n' '# fixture' '# arch: sm_86' 'a k1 0 0' '# PIN(2000-01-01): fixture' 'a k2 8 0' 'b k3 0 0' 'd k1 0 0' 'd k9 0 0' \
     'f k1 0 0' 'g k1 0 0' 'h k1 0 0' 'v vis_a 0 0' > "$t/table"
   check() { # check <name> <want rc> <want line or -> <args...>
     local name=$1 want=$2 line=$3
@@ -89,6 +96,19 @@ self_test() {
   check "a skipped jit_local under a banner that ran the JIT" 1 "ptx-spill bin=h scan is no-jit (jit_local not read) FAIL" "$t/table" h
   check "a binary scanned under an entry filter pins only the filtered entries" 0 "ptx-spill bin=v entries=1 pinned=1 nonzero=none violations=0 PASS" "$t/table" v:vis_
   check "no binary" 2 - "$t/table"
+  # The arch: the scan is of the build's arch, the table's rows are one arch's. Another arch ends it before any scan.
+  printf '%s\n' '# fixture' 'a k1 0 0' > "$t/noarch"
+  printf '%s\n' '# fixture' '# arch: sm_86' '# arch: sm_90' 'a k1 0 0' 'a k2 8 0' > "$t/twoarch"
+  check "a table that names no arch" 2 "ptx-spill-check: the table $t/noarch declares no \`# arch: <sm_NN>\` line: its rows pin no arch" "$t/noarch" a
+  check "a table that names two archs" 2 "ptx-spill-check: the table $t/twoarch declares 2 archs (sm_86 sm_90): a table pins one arch" "$t/twoarch" a
+  BLOOMERY_ARCH=sm_121 check "an arch the table has no rows for" 64 "ptx-spill-check: no ptx-shapes rows for sm_121; the shape pins are sm_86 only" "$t/table" a
+  if grep -q 'ptx-scan bin=' <<< "$out"; then
+    echo "ptx-spill-check self-test: the refusal of another arch ran a scan:" >&2
+    sed 's/^/  /' <<< "$out" >&2
+    fails=$((fails + 1))
+  fi
+  BLOOMERY_ARCH=sm_86 check "the table's own arch is read against the table" 0 "ptx-spill bin=a entries=2 pinned=2 nonzero=k2(spill=8,jit_local=0) violations=0 PASS" "$t/table" a
+  BLOOMERY_ARCH=sm86 check "a BLOOMERY_ARCH that is no arch" 64 "ptx-spill-check.sh: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got 'sm86'" "$t/table" a
   rm -rf "$t"
   [ "$fails" = 0 ] && echo "ptx-spill-check: self-test ok" || { echo "ptx-spill-check: self-test $fails failed" >&2; return 1; }
 }
@@ -108,6 +128,18 @@ SCAN="${BASH_SOURCE[0]%/*}/ptx-scan.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 cat -- "$TABLE" > "$TMP/table" || { echo "ptx-spill-check: cannot read the table $TABLE" >&2; exit 2; }
+# shellcheck source=tools/arch.sh
+source "${BASH_SOURCE[0]%/*}/arch.sh"
+bloomery_arch ptx-spill-check.sh || exit $?
+PINNED=$(awk '/^# arch: [^ ]+$/ { print $3 }' "$TMP/table" | tr '\n' ' ')
+case "${PINNED% }" in
+  '') echo "ptx-spill-check: the table $TABLE declares no \`# arch: <sm_NN>\` line: its rows pin no arch" >&2; exit 2 ;;
+  *' '*) echo "ptx-spill-check: the table $TABLE declares $(wc -w <<< "$PINNED" | tr -d ' ') archs (${PINNED% }): a table pins one arch" >&2; exit 2 ;;
+esac
+if [ "${PINNED% }" != "$ARCH" ]; then
+  echo "ptx-spill-check: no ptx-shapes rows for $ARCH; the shape pins are ${PINNED% } only" >&2
+  exit 64
+fi
 rc=0
 for ARG in "$@"; do
   BIN=${ARG%%:*}

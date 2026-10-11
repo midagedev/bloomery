@@ -13,7 +13,7 @@
 #   with ptxas for the card's arch and disassembles that entry alone (cuobjdump -sass -fun). The recipe
 #   (`just lds-scan <binary> [entry substring]`; `--features deepseek41` for a V4.1 binary) builds the
 #   binary and the extractor first; it needs no card. LDS_SCAN_PTXAS and LDS_SCAN_CUOBJDUMP (default
-#   the box env's CUDA_TOOLKIT_PATH, else /usr/local/cuda), LDS_SCAN_ARCH (default sm_86) and
+#   the box env's CUDA_TOOLKIT_PATH, else /usr/local/cuda), LDS_SCAN_ARCH (default BLOOMERY_ARCH, sm_86 unset: tools/arch.sh) and
 #   LDS_SCAN_EXTRACT (default target/release/oxart_ptx) override the tools.
 #
 # Output: a banner `lds-scan bin=… ptxas=… ptxas-version=… arch=… modules=N entries=M`, then per matching
@@ -94,7 +94,7 @@ PTX
         /*0080*/                   LDSM.16.M88.4 R12, [R0] ;
 SASS
   printf '%s\n' '		Function : up_down' '        /*0010*/                   LDG.E R2, [R2.64] ;' > "$t/fix/up_down.sass"
-  scan() { (cd "$t/tree" && env PATH="$t/bin:$PATH" FIX="$t/fix" LDS_SCAN_PTXAS="$t/bin/ptxas" LDS_SCAN_CUOBJDUMP="$t/bin/cuobjdump" \
+  scan() { (cd "$t/tree" && env -u BLOOMERY_ARCH ${SCAN_ARCH:+"BLOOMERY_ARCH=$SCAN_ARCH"} PATH="$t/bin:$PATH" FIX="$t/fix" LDS_SCAN_PTXAS="$t/bin/ptxas" LDS_SCAN_CUOBJDUMP="$t/bin/cuobjdump" \
     LDS_SCAN_EXTRACT="$t/bin/oxart_ptx" bash "$self" "$@") > "$t/out" 2>&1; }
   # case_ <name> <want rc> <want output, whole>
   case_() {
@@ -128,6 +128,13 @@ cuobjdump stub: no function other
 lds-scan bin=target/release/gate_x cuobjdump-failed=other scan=failed"
   rc=0; scan gate_x mix extra || rc=$?
   case_ third-argument 2 "usage: lds-scan.sh <binary name> [entry substring] | --self-test"
+  # The arch is BLOOMERY_ARCH (tools/arch.sh), sm_86 unset (every case above); a value that is no arch is refused by name.
+  rc=0; SCAN_ARCH=sm_121 scan gate_x mix || rc=$?
+  case_ arch-from-env 0 "${banner/arch=sm_86/arch=sm_121} entries=1 filter=mix
+$mix"
+  rc=0; SCAN_ARCH=sm121 scan gate_x mix || rc=$?
+  case_ arch-refused 64 "lds-scan.sh: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got 'sm121'"
+  SCAN_ARCH=
   echo "lds-scan: self-test $([ "$bad" = 0 ] && echo ok || echo FAIL) ($n cases, $bad failed)"
   [ "$bad" = 0 ]
 }
@@ -144,7 +151,10 @@ FILTER=${2:-}
 TOOLKIT=${CUDA_TOOLKIT_PATH:-/usr/local/cuda}
 PTXAS=${LDS_SCAN_PTXAS:-$TOOLKIT/bin/ptxas}
 CUOBJDUMP=${LDS_SCAN_CUOBJDUMP:-$TOOLKIT/bin/cuobjdump}
-ARCH=${LDS_SCAN_ARCH:-sm_86}
+# shellcheck source=tools/arch.sh
+source "${BASH_SOURCE[0]%/*}/arch.sh"
+bloomery_arch lds-scan.sh || exit $?
+ARCH=${LDS_SCAN_ARCH:-$ARCH}
 EXTRACT=${LDS_SCAN_EXTRACT:-target/release/oxart_ptx}
 BIN=target/release/$NAME
 fail() { # fail <banner fields...>

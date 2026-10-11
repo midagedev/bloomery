@@ -4,6 +4,9 @@
 # check is exact: a value above its pin, below it, an entry the scan prints that has no row, and a
 # row whose entry the scan no longer prints are each a failure. A nonzero pin carries a PIN line.
 # Pinned from the scans on ptxas 13.3.73, sm_86, JIT on the RTX 3090 with CUDA 13.4.
+# arch: sm_86
+# The `# arch:` line names the one arch every row pins (tools/ptx-spill-check.sh refuses another BLOOMERY_ARCH by name, and reads
+# no row against another arch's scan); a second arch's rows are a table of their own.
 #
 # binary          entry                              spill  jit_local
 

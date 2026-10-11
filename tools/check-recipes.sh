@@ -94,14 +94,14 @@ BUILD = re.compile(r"\bcargo (?:oxide )?(?:build|run|test)\b|\bjust build-[A-Za-
 
 
 def body(name):
-    """The recipe's text with the justfile's variables in place; a parameter stays {{}}."""
+    """The recipe's text with the justfile's string variables in place; a parameter and a computed variable (`arch`) stay {{}}."""
     out = []
     for frags in recipes[name]["body"]:
         line = ""
         for f in frags:
             if isinstance(f, str):
                 line += f
-            elif len(f) == 1 and f[0][0] == "variable" and f[0][1] in assigns:
+            elif len(f) == 1 and f[0][0] == "variable" and f[0][1] in assigns and isinstance(assigns[f[0][1]]["value"], str):
                 line += assigns[f[0][1]]["value"]
             else:
                 line += "{{}}"
@@ -548,9 +548,78 @@ blk_orphan() {
   echo "${ot##*$'\n'}"
 }
 
+# The device arch has one owner: the justfile's `arch` variable (BLOOMERY_ARCH, sm_86 unset; tools/arch.sh reads the same name for
+# the tools that run on the box). A recipe line that spells an arch builds for it whatever BLOOMERY_ARCH says, so a contributor's
+# `BLOOMERY_ARCH=sm_121 just gate-…` would build sm_86 and run it through the driver's JIT without a word. Held: exactly one
+# `arch := env_var_or_default('BLOOMERY_ARCH', 'sm_NN')` line, no `sm_<digit>` anywhere else in the justfile, and every `--arch`
+# followed by `{{arch}}`. The fixtures below are the FAIL-first: each spelling the rule forbids is red on its own copy.
+blk_archowner() {
+  python3 - "$JF" << 'PY'
+import re
+import sys
+
+DEF = re.compile(r"^arch := env_var_or_default\('BLOOMERY_ARCH', 'sm_[0-9]+[af]?'\)$")
+LITERAL = re.compile(r"sm_[0-9]")
+OWNED = re.compile(r" \{\{arch\}\}(?![A-Za-z0-9_])")
+
+
+def problems(text):
+    out, defs = [], 0
+    for n, line in enumerate(text.split("\n"), 1):
+        if DEF.match(line):
+            defs += 1
+            continue
+        if LITERAL.search(line):
+            out.append(f"{n}: an arch literal outside the definition of `arch`: {line.strip()[:110]}")
+        rest = line
+        while (m := re.search(r"--arch", rest)) is not None:
+            rest = rest[m.end():]
+            if not OWNED.match(rest):
+                out.append(f"{n}: `--arch` is not followed by {{{{arch}}}}: {line.strip()[:110]}")
+    if defs != 1:
+        out.append(f"the justfile defines `arch` {defs} times, want exactly one `arch := env_var_or_default('BLOOMERY_ARCH', 'sm_NN')` line")
+    return out
+
+
+good = "arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')\nx:\n    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p y'\n"
+fixtures = [
+    ("the owner and a recipe that takes it", good, 0),
+    ("a literal arch after --arch", good.replace("--arch {{arch}}", "--arch sm_86"), 2),
+    ("a literal arch that is not another arch's", good.replace("--arch {{arch}}", "--arch sm_121a"), 2),
+    ("a literal arch in a comment", good + "# built for sm_86\n", 1),
+    ("an arch literal in a recipe line", good + "y:\n    echo sm_90\n", 1),
+    ("--arch spelt with an equals sign", good.replace("--arch {{arch}}", "--arch=sm_86"), 2),
+    ("--arch with the variable spelt another way", good.replace("{{arch}}", "{{ arch }}"), 1),
+    ("--arch with another variable", good.replace("--arch {{arch}}", "--arch {{archive}}"), 1),
+    ("--arch with no value", good.replace("--arch {{arch}} ", "--arch"), 1),
+    ("a second --arch on one line", good.replace("-- -p y", "--arch sm_90 -- -p y"), 2),
+    ("no definition of the variable", good.split("\n", 1)[1], 1),
+    ("two definitions", good + "arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')\n", 1),
+]
+bad = 0
+for name, text, want in fixtures:
+    got = problems(text)
+    if len(got) != want:
+        bad += 1
+        print(f"check-recipes: arch owner fixture '{name}': {len(got)} problems, want {want}: {got}", file=sys.stderr)
+if bad:
+    sys.exit(1)
+with open(sys.argv[1], encoding="utf-8") as fh:
+    text = fh.read()
+found = problems(text)
+if found:
+    print("check-recipes: the device arch has one owner, the justfile's `arch` variable (BLOOMERY_ARCH): a recipe line that spells an arch builds for it whatever BLOOMERY_ARCH says:", file=sys.stderr)
+    for f in found:
+        print(f"  justfile:{f}", file=sys.stderr)
+    sys.exit(1)
+uses = sum(1 for line in text.split("\n") if line.startswith(" ") and "--arch {{arch}}" in line)
+print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{arch}}}}, {len(fixtures)} fixtures)")
+PY
+}
+
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxspill scanargs narrowscan ldsscan mutantrun macstatic carry pytools boxqcodes fixturevariants
-  refsetpublish orphan)
+  refsetpublish orphan archowner)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done

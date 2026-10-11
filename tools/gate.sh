@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 게이트 러너 — 박스에서, box.sh가 들어간 원격 디렉터리에서 돈다. 인자는 `cargo test` 뒤에 그대로 붙는다.
 #   ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test mt -- --ignored --nocapture'
-# 첫 인자가 --oxide면 디바이스 크레이트용으로 `cargo oxide test --arch sm_86 --` 뒤에 붙는다(plain cargo는
-# 디바이스 크레이트를 빌드하지 못한다 — AGENTS.md 「Never」).
+# 첫 인자가 --oxide면 디바이스 크레이트용으로 `cargo oxide test --arch $BLOOMERY_ARCH --` 뒤에 붙는다(arch는
+# tools/arch.sh가 읽는다, 설정이 없으면 sm_86. plain cargo는 디바이스 크레이트를 빌드하지 못한다 — AGENTS.md 「Never」).
 #   ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib'
 #
 # 막는 실패 둘:
@@ -32,7 +32,10 @@ gate_bound gate.sh || exit $?
 RUN=(cargo test)
 if [ "${1:-}" = --oxide ]; then
   shift
-  RUN=(cargo oxide test --arch sm_86 --)
+  # shellcheck source=tools/arch.sh
+  source "${BASH_SOURCE[0]%/*}/arch.sh"
+  bloomery_arch gate.sh || exit $?
+  RUN=(cargo oxide test --arch "$ARCH" --)
 fi
 # The libtest options that take a value. The one list: tools/recipes.py reads this line (by its
 # `LIBTEST_VALUE=(` prefix, one line, one word per option) to tell a recipe's filters from values.

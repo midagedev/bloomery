@@ -1574,6 +1574,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          `rotate` and `1` under `blocks`.",
     ),
     runner(
+        "BLOOMERY_ARCH",
+        Some("arch.sh"),
+        "The CUDA arch the device builds target: `sm_` and the capability's digits, with an \
+         optional `a` or `f` (`sm_86`, `sm_121`, `sm_121a`); unset is `sm_86`. The justfile's \
+         `arch` variable reads it for every `--arch`, `tools/arch.sh` parses it for the tools \
+         that run on the box, and `tools/box.sh` forwards it there.",
+    ),
+    runner(
         "BLOOMERY_ARM_BOUND",
         Some("ref/lease.sh"),
         "Seconds one arm of a timed runner may run under the lease before `timeout` ends \

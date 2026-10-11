@@ -41,7 +41,8 @@
 #   (`just ptx-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds all three first;
 #   with `--no-jit` it builds the binary and the extractor only.
 #   PTX_SCAN_PTXAS (default $CUDA_TOOLKIT_PATH/bin/ptxas, else /usr/local/cuda/bin/ptxas),
-#   PTX_SCAN_ARCH (default sm_86), PTX_SCAN_EXTRACT (default target/release/oxart_ptx) and
+#   PTX_SCAN_ARCH (default BLOOMERY_ARCH, else sm_86; sm_86 is the only arch accepted, see the blk/SM column),
+#   PTX_SCAN_EXTRACT (default target/release/oxart_ptx) and
 #   PTX_SCAN_JIT (default oxart_jit, a target/release binary run through tools/gpu-gate.sh)
 #   override the tools.
 #   --no-jit (anywhere among the words; the only flag) skips the driver JIT: no card, no gate lock, no
@@ -94,6 +95,7 @@
 #   digest-unread=NAME   the extractor wrote no normalized body for these entries (`method`: it named
 #                        no digest method)
 # 2: a usage error (no binary, more than one entry substring, a flag other than --no-jit).
+# 64: an arch other than sm_86 (BLOOMERY_ARCH or PTX_SCAN_ARCH): the blk/SM column is sm_86's arithmetic.
 #
 # The next four columns come from `ptxas -v` on the same PTX, not from the byte scan:
 #   regs   registers per thread ("Used N registers")
@@ -138,7 +140,7 @@ FILTER=${WORDS[1]:-}
 # The toolkit the build uses (the box env's CUDA_TOOLKIT_PATH): toolkits differ here by a register
 # on some entries, so the scan reads the one the bindings were generated from.
 PTXAS=${PTX_SCAN_PTXAS:-${CUDA_TOOLKIT_PATH:-/usr/local/cuda}/bin/ptxas}
-ARCH=${PTX_SCAN_ARCH:-sm_86}
+ARCH=${PTX_SCAN_ARCH:-${BLOOMERY_ARCH-sm_86}}
 EXTRACT=${PTX_SCAN_EXTRACT:-target/release/oxart_ptx}
 JIT=${PTX_SCAN_JIT:-oxart_jit}
 if [ -z "$NAME" ]; then
@@ -149,6 +151,13 @@ if [ "${#WORDS[@]}" -gt 2 ]; then
   echo "ptx-scan.sh: '${WORDS[*]:2}' after the entry substring '$FILTER': the scan takes one binary and at most one entry substring" >&2
   echo "usage: ptx-scan.sh [--no-jit] <gate_bin_name> [entry-substring]" >&2
   exit 2
+fi
+# The blk/SM column is the sm_86 limits (header) and the file holds no other arch's: a scan at another arch would print sm_86's
+# number as that arch's occupancy. Refused here and not through tools/arch.sh: tools/narrow-scan.sh ships this file alone to a
+# tree that may predate that helper.
+if [ "$ARCH" != sm_86 ]; then
+  echo "ptx-scan.sh: arch '$ARCH': the blk/SM column is sm_86's occupancy arithmetic and this scan holds no other arch's limits (BLOOMERY_ARCH, PTX_SCAN_ARCH)" >&2
+  exit 64
 fi
 BIN=target/release/$NAME
 # A failed scan prints its banner and no rows: two failed scans must never diff as two equal tables.

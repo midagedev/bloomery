@@ -19,6 +19,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py host-nightly [--excluded]  # the units tools/nightly/run.sh runs on a Linux host with no card and no model files: name<TAB>command
     python3 tools/recipes.py combos           # every build shape a recipe compiles, one cargo check command each (tools/mac-check.sh combos)
     python3 tools/recipes.py orphan-tests      # every #[test] no gate-* or lab-* recipe runs on the box
+    python3 tools/recipes.py expand [--justfile F]  # every recipe as just runs it, each top-level variable replaced by its value in this environment
     python3 tools/recipes.py --self-test
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
@@ -249,17 +250,22 @@ def join_continued(name: str, lines: list[str]) -> list[str]:
     return out
 
 
-def load_justfile(path: str) -> dict[str, Recipe]:
+def _just(path: str, *words: str) -> str:
+    """`just` on the justfile at PATH, its stdout. Refused by name when just is missing or exits non-zero."""
     if shutil.which("just") is None:
         raise RecipeError("`just` is not on PATH — recipes.py reads the justfile through `just --dump`")
     proc = subprocess.run(
-        ["just", "--justfile", path, "--working-directory", os.path.dirname(path) or ".", "--dump", "--dump-format", "json"],
+        ["just", "--justfile", path, "--working-directory", os.path.dirname(path) or ".", *words],
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
-        raise RecipeError(f"`just --dump` failed on {path} (exit {proc.returncode}): {proc.stderr.strip()}")
-    dump = json.loads(proc.stdout)
+        raise RecipeError(f"`just {' '.join(words)}` failed on {path} (exit {proc.returncode}): {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def load_justfile(path: str) -> dict[str, Recipe]:
+    dump = json.loads(_just(path, "--dump", "--dump-format", "json"))
     with open(path, encoding="utf-8") as fh:
         header_lines = fh.read().split("\n")
     recipes: dict[str, Recipe] = {}
@@ -2003,6 +2009,45 @@ def cmd_box_command(args: argparse.Namespace) -> int:
     except BoxCommandError as err:
         print(f"recipes.py box-command: {err}", file=sys.stderr)
         return 64
+    return 0
+
+
+def expand_justfile(path: str) -> list[str]:
+    """Every recipe of the justfile as just runs it, one line each: a `recipe NAME` header, its parameters, dependencies,
+    attributes and doc as JSON, and each body line with every top-level variable (`{{arch}}`, `{{precheck}}`) replaced by
+    the value `just --evaluate` gives it in this environment. A parameter and any other expression stay as the JSON of
+    the expression, so a change inside one still shows. The proof that a refactor of the recipes moves no command: the
+    output of the two justfiles is the same text."""
+    dump = json.loads(_just(path, "--dump", "--dump-format", "json"))
+    values: dict[str, str] = {}
+
+    def value(name: str) -> str:
+        if name not in values:
+            values[name] = _just(path, "--evaluate", name)
+        return values[name]
+
+    out: list[str] = []
+    for name in sorted(dump["recipes"]):
+        rec = dump["recipes"][name]
+        out.append(f"recipe {name}")
+        for key in ("parameters", "dependencies", "attributes", "doc", "shebang", "quiet", "private"):
+            out.append(f"  {key} {json.dumps(rec.get(key), sort_keys=True, ensure_ascii=False)}")
+        for frags in rec["body"]:
+            line = ""
+            for frag in frags:
+                if isinstance(frag, str):
+                    line += frag
+                elif len(frag) == 1 and isinstance(frag[0], list) and frag[0][:1] == ["variable"] and frag[0][1] in dump["assignments"]:
+                    line += value(frag[0][1])
+                else:
+                    line += "{{" + json.dumps(frag, sort_keys=True, ensure_ascii=False) + "}}"
+            out.append(f"  | {line}")
+    return out
+
+
+def cmd_expand(args: argparse.Namespace) -> int:
+    for line in expand_justfile(args.justfile or os.path.join(ROOT, "justfile")):
+        print(line)
     return 0
 
 
@@ -8060,6 +8105,37 @@ def box_tier_self_test(expect) -> None:
         expect(rc == 64 and sent == "" and "real or fixture" in err and "'both'" in err, f"box.sh: a tier that is neither: {rc} {sent!r} {err!r}")
 
 
+def expand_self_test(expect) -> None:
+    """expand: a top-level variable's value lands in the recipe line, so a literal spelling and the variable at its default
+    expand to the same text; the variable's value in this environment shows, a parameter stays a parameter, and a change
+    inside any other expression still shows."""
+    head = "arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')\n"
+    body = "r BIN:\n    ./tools/box.sh 'cargo oxide build --arch {} -- -p y --bin {{{{BIN}}}} {{{{ if BIN == \"a\" {{ \"{}\" }} else {{ \"c\" }} }}}}'\n"
+    saved = os.environ.pop("BLOOMERY_ARCH", None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="recipes-expand-") as tmp:
+
+            def expanded(name: str, text: str) -> list[str]:
+                path = os.path.join(tmp, name)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                return expand_justfile(path)
+
+            lit = expanded("lit", body.format("sm_86", "b"))
+            var = expanded("var", head + body.format("{{arch}}", "b"))
+            expect(lit == var, f"expand: the variable at its default and the literal expand differently: {lit} / {var}")
+            expect(any("--arch sm_86 -- -p y --bin {{[[\"variable\", \"BIN\"]]}} " in ln for ln in var), f"expand: the parameter did not stay a parameter: {var}")
+            expect(expanded("other", head + body.format("{{arch}}", "d")) != var, "expand: a change inside an if-expression did not show")
+            os.environ["BLOOMERY_ARCH"] = "sm_121"
+            other = expanded("var121", head + body.format("{{arch}}", "b"))
+            expect(other != var and any("--arch sm_121 -- -p y" in ln for ln in other) and not any("sm_86" in ln for ln in other), f"expand: BLOOMERY_ARCH=sm_121 did not reach the line: {other}")
+            expect(expanded("lit121", body.format("sm_86", "b")) == lit, "expand: a justfile with no variable read the environment")
+    finally:
+        os.environ.pop("BLOOMERY_ARCH", None)
+        if saved is not None:
+            os.environ["BLOOMERY_ARCH"] = saved
+
+
 def oxide_rev_self_test(expect) -> None:
     """The cuda-oxide rev the key (oxide_rev) and tools/box.sh (the backend directory it exports) read from this tree's
     Cargo.toml is the [patch] section's cuda-device rev as TOML reads it — the fork's, not the upstream declaration's,
@@ -9104,6 +9180,7 @@ def self_test() -> int:
     ref_paths_self_test(expect)
     box_tier_self_test(expect)
     oxide_rev_self_test(expect)
+    expand_self_test(expect)
 
     # opens: the targets that reach the fixture fence
     opens_self_test(expect)
@@ -9167,6 +9244,8 @@ def main(argv: list[str]) -> int:
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
     b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")
     b.add_argument("--workers", type=int, default=8)
+    ex = sub.add_parser("expand", help="every recipe as just runs it, each top-level variable replaced by its value in this environment: the text two justfiles must share for a refactor of the recipes to move no command")
+    ex.add_argument("--justfile")
     op = sub.add_parser("opens", help="per RECIPE, whether a cargo target it builds or runs reaches the fixture fence (Tier::check_file): opens<TAB>recipe<TAB>pkg:kind:target<TAB>path:line<TAB>called, or none<TAB>recipe (tools/gate-batch.sh's real-file deferral)")
     op.add_argument("items", nargs="*", metavar="RECIPE")
     op.add_argument("--explain", action="store_true", help="the fence, the openers and each recipe's targets, on stderr")
@@ -9202,6 +9281,8 @@ def main(argv: list[str]) -> int:
             return cmd_box_manifest(args)
         if args.cmd == "opens":
             return cmd_opens(args)
+        if args.cmd == "expand":
+            return cmd_expand(args)
         ap.print_help()
         return 64
     except RecipeError as err:
