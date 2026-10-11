@@ -2,19 +2,27 @@
 # shellcheck shell=bash
 # The seat the image-input oracle runs for: what clefvis.sh and build-clefvis.sh need that is a property of the seat, not of
 # the machine. Sourced after tools/ref/ref-paths.sh, which has picked the model profile (BLOOMERY_MODEL); never executed,
-# and it exports nothing. A seat is a family of the Qwen3-VL tower (mtmd `qwen3vl_merger`) and its text model:
+# and it exports nothing. A seat is a family of the Qwen3-VL tower (mtmd `qwen3vl_merger`) and its text model, or of the GLM
+# tower (`glm5v`) and its:
 #
 #   qwen35     Clef-Flash         sets ref_clefvis_*             mainline 53ed051ce (the model profile's LCPP)
 #   qwen35moe  Qwen3.6-35B-A3B    sets ref_qwen35moe_vis_*       mainline 36a73916e (QVIS_LCPP)
 #   qwen4exp   Qwen3.8-Flash-Next sets ref_qwen4exp_vis_*        mainline 36a73916e (QVIS_LCPP)
+#   glm5next   GLM-5.3-Flash      sets fx_ref_glm5next_vis_*     mainline 36a73916e (QVIS_LCPP), the fixture tier only
 #
-# The two Qwen seats share the mainline tree and so the binary; the Clef seat keeps its own tree and binary, so its sets'
-# bytes do not move with the Qwen seats' pin. The values below are the ones crates/refset names for the same seat
+# The Qwen seats and the GLM seat share the mainline tree and so the binary; the Clef seat keeps its own tree and binary, so
+# its sets' bytes do not move with the Qwen seats' pin. The values below are the ones crates/refset names for the same seat
 # (arch/qwen35/clefvis.rs, arch/qwen35moe/vis.rs, arch/qwen4exp/vis.rs): the family checks a set's `# model`, `# mmproj`,
 # `# build` lines against them.
 #
 #   FAMILY          clef | qvis: which arms the seat has. clef: set A (preproc), the release's ids (clef_ref.py), set D;
 #                   qvis: the chat ids (E) and the decode steps (F), the tower tapped to its output end
+#   PREPROC         1: the tower arm writes set A (preproc, the card run only): Clef and the GLM seat; 0: the Qwen seats
+#   ARMS            the prompt kinds a case dumps: hidden (C), prose (C', with PROSE_IDS), bf16rows (C''); the GLM seat's is hidden
+#   IMAGES_EXTRA    a file of more image rows (images.tsv's format) the tower arm takes after images.tsv: the GLM seat's cap case
+#   IMAGE_PAD_ID    the id of the text model's image token, passed to dump_mtmd as --image-pad-id (empty: its Qwen default)
+#   RESPELL_SOURCE  the fixture's first shard the text model is a respelled copy of (tools/ref/gguf-respell.py): the set's
+#                   `# fixture` line is that file's, and dump_mtmd refuses a copy whose bloomery.respell.source names another
 #   SETPFX          the sets' common name
 #   ORACLE          the mainline tree the sets are dumped from, its build/bin holding libmtmd, libllama and libggml
 #   BIN             the dump_mtmd binary of that tree
@@ -32,17 +40,20 @@
 # shellcheck disable=SC2034
 : "${QVIS_LCPP:=/home/user/llama.cpp-36a73916}"
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+# CLEFVIS_OUT moves the binary's directory, as build-clefvis.sh reads it (a scratch build under test).
+BINDIR=${CLEFVIS_OUT:-$DATA/bin}
 NCMOE_A6000=0 NCMOE_3090=0 ROWS_FROM=embd THREADS=16 CASES=tools/ref/clefvis/cases.tsv REQUESTS=
+PREPROC=0 ARMS="hidden prose bf16rows" IMAGES_EXTRA="" IMAGE_PAD_ID="" RESPELL_SOURCE=""
 case ${MODEL_NAME:-} in
   qwen35)
-    FAMILY=clef SETPFX=ref_clefvis ORACLE=$LCPP BIN=$DATA/bin/dump_mtmd
+    FAMILY=clef PREPROC=1 SETPFX=ref_clefvis ORACLE=$LCPP BIN=$BINDIR/dump_mtmd
     MMPROJ=/root/models/clef-flash/mmproj-Cloudflare_clef-flash-bf16.gguf
     MMPROJ_SHA256=3c45b34aee6f353a0d41d6b96ba712a498a17a82f0a6152bf68a5021f9652c0f
     TEXT=$FLASH_Q8
     REF=${CLEFVIS_REF:-$DATA/clefvis/ref}
     ;;
   qwen35moe)
-    FAMILY=qvis SETPFX=ref_qwen35moe_vis ORACLE=$QVIS_LCPP BIN=$DATA/bin/dump_mtmd_qvis
+    FAMILY=qvis SETPFX=ref_qwen35moe_vis ORACLE=$QVIS_LCPP BIN=$BINDIR/dump_mtmd_qvis
     MMPROJ=/models/mmproj/lmstudio-community--Qwen3.6-35B-A3B-GGUF/mmproj-Qwen3.6-35B-A3B-BF16.gguf
     MMPROJ_SHA256=e5c205cec2fd28f66c3895e4040021ab994b860323c3db8531640305ff49b322
     TEXT=/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf
@@ -55,7 +66,7 @@ case ${MODEL_NAME:-} in
     THREADS=16
     ;;
   qwen4exp)
-    ROWS_FROM=node FAMILY=qvis SETPFX=ref_qwen4exp_vis ORACLE=$QVIS_LCPP BIN=$DATA/bin/dump_mtmd_qvis
+    ROWS_FROM=node FAMILY=qvis SETPFX=ref_qwen4exp_vis ORACLE=$QVIS_LCPP BIN=$BINDIR/dump_mtmd_qvis
     MMPROJ=/models/mmproj/Qwen3.8-Flash-Next-GGUF/mmproj-BF16.gguf
     MMPROJ_SHA256=2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355
     TEXT=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
@@ -68,8 +79,26 @@ case ${MODEL_NAME:-} in
     NCMOE_A6000=${QVIS_NCMOE_A6000:-28} NCMOE_3090=${QVIS_NCMOE_3090:-45}
     THREADS=24
     ;;
+  glm5next)
+    # GLM-5.3-Flash on the fixture tier: the text model is the fixture's copy in mainline's spelling `glm5-next`
+    # (tools/ref/gguf-respell.py: only the header differs), read vocab-only by the tower arm; sets carry the fx_ prefix
+    # (ref-paths.sh SET_PREFIX). The real tier waits for its file's spelling and offload plan (a release-batch round).
+    fixture_dump_tier clefvis.sh
+    [ -n "$SET_PREFIX" ] || { echo "profile.sh: the glm5next image-input seat runs on the fixture tier (BLOOMERY_TIER=fixture); the real file is a later round (exit 66)" >&2; exit 66; }
+    FAMILY=qvis PREPROC=1 ARMS=hidden SETPFX=${SET_PREFIX}ref_glm5next_vis ORACLE=$QVIS_LCPP BIN=$BINDIR/dump_mtmd_qvis
+    MMPROJ=/models/mmproj/unsloth--GLM-5.3-Flash-GGUF/mmproj-BF16.gguf
+    MMPROJ_SHA256=82b7adb44411dbb298b1c689567804e5ed0790d80f308ed8b5b6b8ac0527d2ac
+    TEXT=${QVIS_FIXTURE_MAINLINE_ROOT:-/models/fixtures-mainline}/glm5next/$(basename "$MODEL")
+    RESPELL_SOURCE=$MODEL
+    IMAGE_PAD_ID=154854
+    IMAGES_EXTRA=tools/ref/clefvis/images-glm5v.tsv
+    CASES=tools/ref/qvis/cases.tsv REQUESTS=tools/ref/qvis/requests.jsonl
+    REF=${QVIS_REF:-$DATA/qvis/${SET_PREFIX}glm5next}
+    # the 8 GB fixture fits a card whole with the tower and a 4,096 context: no experts stay on the host
+    THREADS=16
+    ;;
   *)
-    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${MODEL_NAME:-}' (qwen35, qwen35moe or qwen4exp)" >&2
+    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${MODEL_NAME:-}' (qwen35, qwen35moe, qwen4exp or glm5next)" >&2
     exit 2
     ;;
 esac

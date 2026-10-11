@@ -1,0 +1,3 @@
+# name	w	h	branch of mtmd glm5v preprocessing (align 28, 12544..6272000 pixels, top-left on black); the file is images/<name>.png
+# The glm5v seat's tower arm follows images.tsv and then this file; the Qwen seats follow images.tsv only.
+cap-3000x2200	3000	2200	above image_max_pixels: the budget branch (canvas 2912x2128 = 7904 tokens, derived from the preprocess source)

@@ -5,12 +5,15 @@
 # into $BLOOMERY_DATA/<set>/ in dump_ref's set format — the sets the refset families (crates/refset/src/arch/qwen35/clefvis.rs,
 # arch/{qwen35moe,qwen4exp}/vis.rs) check and the image-input rounds read. SETPFX is the profile's set prefix.
 #
-#   <pfx>_preproc          A  the 8 test images after mtmd's preprocess: the tower's graph input, f32 channel-planar (Clef only)
+#   <pfx>_preproc          A  the test images after mtmd's preprocess: the tower's graph input, f32 channel-planar (Clef and the
+#                             GLM seat: PREPROC=1 in the profile)
 #   <pfx>_taps             B  the tower's named graph nodes of blocks 0, 1, 13, 26 and the final embeddings; a Qwen seat taps
-#                             the output end only (the post-LN output and the final embeddings of every image)
-#   <pfx>_hidden_c{1,2,3}   C  result_norm of every position of three prompts and the M-RoPE positions fed
-#   <pfx>_prose_c{1,2,3}   C' the same prompts with each image's rows replaced by prose-id text rows
-#   <pfx>_bf16rows_c{1,2,3} C'' the same prompts with mainline's own tower rows rounded to bf16
+#                             the output end only (the post-LN output and the final embeddings of every image), the GLM seat
+#                             its output nodes (vit_out, after_fc_proj, after_ffn_proj)
+#   <pfx>_hidden_c{1,2,3}   C  result_norm of every position of three prompts and the positions fed (M-RoPE `mrope_pos`; the
+#                             GLM seat's normal `pos`)
+#   <pfx>_prose_c{1,2,3}   C' the same prompts with each image's rows replaced by prose-id text rows (Qwen seats)
+#   <pfx>_bf16rows_c{1,2,3} C'' the same prompts with mainline's own tower rows rounded to bf16 (Qwen seats)
 #   <pfx>_chatids_<case>   E  the ids llama-server's chat path gives each request, with its rendered prompt (Qwen seats)
 #   <pfx>_decode_<case>    F  32 greedy decode steps after a prompt: id, result_norm, n_past (Qwen seats, cases with steps)
 #   <set>.cpu                 the CPU twin of taps, hidden_*, prose_* and decode_* (no card in view, -ngl 0, THREADS threads)
@@ -32,7 +35,11 @@
 # card pick; no timing lease (a functional oracle). The script links itself as target/release/clefvis_dump and runs under that name
 # inside the runner. `--ids` and `--cpu-twin` open no card (CUDA_VISIBLE_DEVICES empty, -ngl 0), so they take no gate lock, as
 # hidden.sh's twin takes none; each run is still bounded by `timeout`. A model that does not fit the card (Qwen3.8) keeps the
-# experts of NCMOE blocks on the host (profile.sh; QVIS_NCMOE_A6000 and QVIS_NCMOE_3090 move them).
+# experts of NCMOE blocks on the host (profile.sh; QVIS_NCMOE_A6000 and QVIS_NCMOE_3090 move them). CLEFVIS_SETS_ROOT writes the sets
+# (and the chat ids' staging) into another directory than $BLOOMERY_DATA, CLEFVIS_OUT reads the binary from another one (a build
+# under test: build-clefvis.sh writes there too), QVIS_REF moves the ids: a re-dump compared with an installed set touches none.
+# The GLM seat (BLOOMERY_MODEL=glm5next, BLOOMERY_TIER=fixture) dumps on the respelled copy of the fixture the profile names; its sets
+# carry the fixture's `# fixture` line (refset-check --fixture-line, built here) and the copy's `# respell` line.
 set -euo pipefail
 REAL=$(readlink -f "${BASH_SOURCE[0]}")
 HERE=$(cd "$(dirname "$REAL")/../../.." && pwd)
@@ -52,6 +59,7 @@ source tools/ref/ref-paths.sh
 # shellcheck source=tools/ref/clefvis/profile.sh
 source tools/ref/clefvis/profile.sh
 IMG=$HERE/tools/ref/clefvis/images
+OUT=${CLEFVIS_SETS_ROOT:-$DATA}
 PY=${CLEFVIS_PYTHON:-/home/user/clef-venv/bin/python}
 SNAPSHOT=${CLEFVIS_SNAPSHOT:-/models/clef-flash/hf}
 REVISION=17f0b0ad64efb65d273590632833508766b2aae6
@@ -84,6 +92,17 @@ check_inputs() {
   BUILD_COMMIT=$want_commit
 }
 
+# What the GLM seat's dumps are told beyond a Qwen seat's: the image token's id, and the fixture the text model is a copy of (its
+# `# fixture` line, written by refset-check, and the file dump_mtmd holds the copy's bloomery.respell.source to). A Qwen seat's
+# command line is as it was.
+seat_args=()
+tower_seat_args=()
+fixture_args() {
+  [ -z "$RESPELL_SOURCE" ] || tower_seat_args=(--fixture-line "$(fixture_line clefvis.sh)" --respell-source "$RESPELL_SOURCE")
+  seat_args=("${tower_seat_args[@]}")
+  [ -z "$IMAGE_PAD_ID" ] || seat_args+=(--image-pad-id "$IMAGE_PAD_ID")
+}
+
 img_args=() # <name,name,…>: --image <name>=<png> for each
 set_images() {
   img_args=()
@@ -94,7 +113,7 @@ set_images() {
     img_args+=(--image "$n=$IMG/$n.png")
   done
 }
-all_images() { awk -F'\t' '!/^#/ && NF { print $1 }' tools/ref/clefvis/images.tsv | paste -sd, -; }
+all_images() { awk -F'\t' '!/^#/ && NF { print $1 }' tools/ref/clefvis/images.tsv ${IMAGES_EXTRA:+"$IMAGES_EXTRA"} | paste -sd, -; }
 
 publish() { # <staging> <final>
   rm -rf "$2"
@@ -108,20 +127,21 @@ fail() { echo "clefvis.sh: $1 failed (rc $2); the old set, if any, stays" >&2; r
 write_ids() {
   if [ "$FAMILY" = clef ]; then ref_d --encode-only "$@"; return $?; fi
   check_inputs
+  fixture_args
   export BLOOMERY_REF_BUILD=$BUILD_COMMIT
-  local stage=$DATA/qvis/$MODEL_NAME.ids.staging case_ set_ ok=1
+  local stage=$OUT/qvis/$MODEL_NAME.ids.staging case_ set_ ok=1
   rm -rf "$stage"
-  mkdir -p "$DATA/qvis" "$REF"
+  mkdir -p "$OUT/qvis" "$REF"
   set_images "$(all_images)"
   SECONDS=0
   if env CUDA_VISIBLE_DEVICES= timeout --kill-after=10 "$BOUND" "$BIN" chat --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
-      --card cpu --requests "$REQUESTS" "${img_args[@]}" --out "$stage" -t "$THREADS"; then
+      --card cpu --requests "$REQUESTS" "${img_args[@]}" "${seat_args[@]}" --out "$stage" -t "$THREADS"; then
     while read -r case_; do
       set_=${SETPFX}_chatids_$case_
       [ -d "$stage/$case_" ] && [ -f "$stage/$case_.ids" ] || { echo "clefvis.sh: chat wrote no $case_" >&2; ok=0; continue; }
       cp "$stage/$case_.ids" "$REF/$case_.ids"
-      publish "$stage/$case_" "$DATA/$set_"
-      echo "clefvis.sh: $set_ -> $DATA/$set_ ($(wc -l < "$REF/$case_.ids") ids)"
+      publish "$stage/$case_" "$OUT/$set_"
+      echo "clefvis.sh: $set_ -> $OUT/$set_ ($(wc -l < "$REF/$case_.ids") ids)"
     done < <(sed -n 's/^{"id":"\([^"]*\)".*/\1/p' "$REQUESTS")
     [ "$ok" = 1 ] || rc=1
     rm -rf "$stage"
@@ -139,6 +159,7 @@ esac
 twin=0
 if [ "${1:-}" = --cpu-twin ]; then twin=1; shift; fi
 check_inputs
+fixture_args
 
 selected() { # <base name>: no SET argument selects every set; else the base name must be one of them
   [ $# -eq 1 ] || return 2
@@ -147,10 +168,10 @@ selected() { # <base name>: no SET argument selects every set; else the base nam
 }
 SETS=("$@")
 if [ "${#SETS[@]}" -gt 0 ]; then
-  if [ "$FAMILY" = clef ]; then known=" ${SETPFX}_preproc ${SETPFX}_taps"; else known=" ${SETPFX}_taps"; fi
+  if [ "$PREPROC" = 1 ]; then known=" ${SETPFX}_preproc ${SETPFX}_taps"; else known=" ${SETPFX}_taps"; fi
   while IFS=$'\t' read -r c _ steps _; do
     case $c in '' | '#'*) continue ;; esac
-    known+=" ${SETPFX}_hidden_$c ${SETPFX}_prose_$c ${SETPFX}_bf16rows_$c"
+    for arm in $ARMS; do known+=" ${SETPFX}_${arm}_$c"; done
     [ "${steps:-0}" -le 0 ] || known+=" ${SETPFX}_decode_$c"
   done < "$CASES"
   for s in "${SETS[@]}"; do
@@ -180,22 +201,22 @@ fi
 # The tower job: Clef's A (the card run only) and B, both from one run; a Qwen seat's B, the output end only. B's twin
 # from the CPU run.
 tower=0
-if [ "$twin" = 1 ] || [ "$FAMILY" != clef ]; then
+if [ "$twin" = 1 ] || [ "$PREPROC" != 1 ]; then
   ! selected "${SETPFX}_taps" || tower=1
 else
   ! { selected "${SETPFX}_preproc" || selected "${SETPFX}_taps"; } || tower=1
 fi
 if [ "$tower" = 1 ]; then
   set_images "$(all_images)"
-  pre=$DATA/${SETPFX}_preproc
-  taps=$DATA/${SETPFX}_taps$suffix
+  pre=$OUT/${SETPFX}_preproc
+  taps=$OUT/${SETPFX}_taps$suffix
   rm -rf "$taps.staging" "$pre.staging"
   pre_args=() tap_args=()
-  [ "$twin" = 1 ] || [ "$FAMILY" != clef ] || pre_args=(--out-preproc "$pre.staging")
+  [ "$twin" = 1 ] || [ "$PREPROC" != 1 ] || pre_args=(--out-preproc "$pre.staging")
   [ "$FAMILY" != qvis ] || tap_args=(--taps final)
   SECONDS=0
   if "${run[@]}" timeout --kill-after=10 "$BOUND" "$BIN" tower --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
-      --card "$device" "${img_args[@]}" "${pre_args[@]}" "${tap_args[@]}" --out-taps "$taps.staging" "${where[@]}"; then
+      --card "$device" "${img_args[@]}" "${pre_args[@]}" "${tap_args[@]}" "${tower_seat_args[@]}" --out-taps "$taps.staging" "${where[@]}"; then
     [ "${#pre_args[@]}" -eq 0 ] || publish "$pre.staging" "$pre"
     publish "$taps.staging" "$taps"
     echo "clefvis.sh: tower -> $taps ($SECONDS s)"
@@ -205,8 +226,15 @@ if [ "$tower" = 1 ]; then
 fi
 
 # The prompt sets (a case with decode steps writes its decode set from the same run).
-kinds=(hidden:mtmd prose:prose)
-[ "$twin" = 1 ] || kinds+=(bf16rows:bf16)
+kinds=()
+for arm in $ARMS; do
+  case $arm in
+    hidden) kinds+=(hidden:mtmd) ;;
+    prose) kinds+=(prose:prose) ;;
+    bf16rows) [ "$twin" = 1 ] || kinds+=(bf16rows:bf16) ;;
+    *) echo "clefvis.sh: the profile's ARMS names '$arm' (hidden, prose or bf16rows)" >&2; exit 64 ;;
+  esac
+done
 while IFS=$'\t' read -r c imgs steps _; do
   case $c in '' | '#'*) continue ;; esac
   for k in "${kinds[@]}"; do
@@ -221,11 +249,11 @@ while IFS=$'\t' read -r c imgs steps _; do
     ids=$REF/$c.ids
     [ -f "$ids" ] || { echo "clefvis.sh: no $ids (write it: just dump-ref-clefvis --ids / dump-ref-qvis <model> --ids)" >&2; rc=2; continue; }
     set_images "$imgs"
-    dir=$DATA/$name$suffix
+    dir=$OUT/$name$suffix
     rm -rf "$dir.staging"
-    extra=()
-    [ "$rows" != prose ] || extra=(--prose-ids "$PROSE_IDS")
-    ddir=$DATA/${SETPFX}_decode_$c$suffix
+    extra=("${seat_args[@]}")
+    [ "$rows" != prose ] || extra+=(--prose-ids "$PROSE_IDS")
+    ddir=$OUT/${SETPFX}_decode_$c$suffix
     rm -rf "$ddir.staging"
     [ "$dec" -le 0 ] || extra+=(--decode "$dec" --out-decode "$ddir.staging")
     [ "$FAMILY" != qvis ] || extra+=(--rows-from "$ROWS_FROM")

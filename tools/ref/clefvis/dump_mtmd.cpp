@@ -1,13 +1,26 @@
-// dump_mtmd — llama.cpp mainline's image path for a Qwen3-VL family seat (mtmd `qwen3vl_merger` tower + the family's
-// text model: Clef-Flash's qwen35, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp), written as oracle sets in dump_ref's set
-// format, so crates/refset reads them through its node-dump family check (refset::arch::{qwen35::clefvis, qwen35moe::vis,
-// qwen4exp::vis}, refset::clefvis). One source, one binary a mainline tree: the Clef sets are dumped by the binary built
-// against the tree that pins them, the Qwen sets by the one built against theirs (tools/ref/clefvis/build-clefvis.sh).
+// dump_mtmd — llama.cpp mainline's image path for a vision seat (mtmd tower + the family's text model: the Qwen3-VL
+// seats' `qwen3vl_merger` with Clef-Flash's qwen35, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp, and GLM-5.3-Flash's `glm5v`
+// with glm5-next), written as oracle sets in dump_ref's set format, so crates/refset reads them through its node-dump
+// family check (refset::arch::{qwen35::clefvis, qwen35moe::vis, qwen4exp::vis}, refset::clefvis). One source, one binary a
+// mainline tree: the Clef sets are dumped by the binary built against the tree that pins them, the Qwen and GLM sets by the
+// one built against theirs (tools/ref/clefvis/build-clefvis.sh).
+//
+// The seat is the mmproj's `clip.projector_type` (SEATS below), and mtmd's position type must agree with it:
+//   qwen3vl_merger  M-RoPE: an image keeps its (nx, ny) grid, takes max(nx, ny) positions and its rows carry (t, y, x);
+//                   the image token is `<|image_pad|>`; a set's `mrope_pos` is [3, ids].
+//   glm5v           normal positions: an image row takes the next position like a text row (n_pos == n_tokens), mtmd keeps
+//                   no grid (nx = n_tokens, ny = 1), so the planned canvas is read from `inp_raw` of a tap context in every
+//                   mode (probe_canvas); the image token is `<|image|>`; a set's `pos` is [1, ids]; the tower's output nodes
+//                   are glm4v's `vit_out`, `after_fc_proj`, `after_ffn_proj`; the sets add the `# projector` line, and for
+//                   a text model that is a respelled copy (tools/ref/gguf-respell.py) its `# respell` line.
+// A set of a Qwen seat is byte-identical to what this tool wrote before the glm5v seat existed.
 //
 //   dump_mtmd tower  --mmproj <gguf> -m <text gguf> --image <name>=<png> ... [--out-preproc <dir>] --out-taps <dir>
 //                    [--cpu] [-t <threads>] [--image-min-tokens <n>] [--image-max-tokens <n>] [--tap-patches <n>]
 //                    [--taps full|final] [--mmproj-sha256 <hex>] [--card <name>]
-//                    (both modes: the header's `# mmproj` digest and `# device` card)
+//                    [--fixture-line <# fixture line>] [--respell-source <first shard>]
+//                    (both modes: the header's `# mmproj` digest and `# device` card; the glm5v seat's `# fixture` line
+//                    and the file its text model's bloomery.respell.source must name)
 //   dump_mtmd hidden --mmproj <gguf> -m <text gguf> --ids <file> --image <name>=<png> ... --out <dir>
 //                    [--rows mtmd|prose|bf16] [--prose-ids <file>] [--image-pad-id <id>]
 //                    [-c <ctx>] [-ub <ubatch>] [-ngl <n>] [-ncmoe <n>] [-t <threads>] [--cpu]
@@ -354,6 +367,48 @@ static uint32_t gguf_u32(const std::string & path, const std::string & key) {
     return v;
 }
 
+// The projector layouts this tool dumps (see the header): the mmproj's `clip.projector_type` picks one. `align` is the unit
+// of the planned canvas a side: a Qwen seat's is the constant 32, the glm5v seat's patch_size * spatial_merge_size.
+struct seat_t {
+    const char * projector;
+    const char * pad_text;   // the vocabulary's text of the image-token id
+    bool         mrope;      // M-RoPE positions (4 arrays of n_tokens), else normal (one)
+};
+static const seat_t SEATS[] = {
+    {"qwen3vl_merger", "<|image_pad|>", true},
+    {"glm5v",          "<|image|>",     false},
+};
+static const seat_t * g_seat  = nullptr;
+static int            g_align = 32;
+
+static std::string gguf_str(const std::string & path, const std::string & key, bool required) {
+    gguf_init_params gp = {true, nullptr};
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) DIE("cannot read the gguf header of %s", path.c_str());
+    const int64_t k = gguf_find_key(g, key.c_str());
+    if (k < 0 && required) DIE("%s has no key %s", path.c_str(), key.c_str());
+    const std::string v = k >= 0 ? gguf_get_val_str(g, k) : "";
+    gguf_free(g);
+    return v;
+}
+
+static void select_seat(const std::string & mmproj) {
+    const std::string proj = gguf_str(mmproj, "clip.projector_type", true);
+    for (const seat_t & s : SEATS) {
+        if (proj == s.projector) g_seat = &s;
+    }
+    if (!g_seat) DIE("%s: no seat for the projector '%s' (qwen3vl_merger or glm5v)", mmproj.c_str(), proj.c_str());
+    if (!g_seat->mrope) g_align = (int) (gguf_u32(mmproj, "clip.vision.patch_size") * gguf_u32(mmproj, "clip.vision.spatial_merge_size"));
+}
+
+// mtmd's position type comes from the text model's rope; it must be the one the seat's projector lays its rows out for.
+static void check_pos_type(const mtmd_context * ctx) {
+    if (mtmd_decode_use_mrope(ctx) != g_seat->mrope) {
+        DIE("the text model is %s, the %s seat wants %s positions", g_seat->mrope ? "not an M-RoPE decoder" : "an M-RoPE decoder",
+            g_seat->projector, g_seat->mrope ? "M-RoPE" : "normal");
+    }
+}
+
 // The first GPU device ggml sees: its name and description, as the set's `# device` line records the card the run used.
 static std::string ggml_card() {
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -373,6 +428,11 @@ static std::string env_or(const char * name, const char * dflt) {
 // The header's provenance the caller states: the projector file's sha256 and the card's name (--mmproj-sha256, --card).
 static std::string g_mmproj_sha256 = "unknown";
 static std::string g_card = "unknown";
+// The glm5v seat's provenance lines: the `# fixture` line of the fixture the text model is a copy of (--fixture-line, written
+// verbatim) and the path its `bloomery.respell.source` must name (--respell-source).
+static std::string g_fixture_line;
+static std::string g_respell_expect;
+
 
 struct image_arg {
     std::string name, path;
@@ -440,19 +500,82 @@ static void tokenize_image(mtmd_context * ctx, const image_arg & a, image_chunk 
     if (!out.chunk) DIE("%s tokenized to no image chunk", a.path.c_str());
     out.n_tokens = (int) mtmd_input_chunk_get_n_tokens(out.chunk);
     const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(out.chunk);
-    // the grid from the last token's decoder position: (row ny-1, column nx-1) of a raster grid
-    const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) out.n_tokens - 1);
-    out.nx = (int) last.x + 1;
-    out.ny = (int) last.y + 1;
-    if (out.nx * out.ny != out.n_tokens) DIE("%s: grid %d x %d is not %d tokens", a.path.c_str(), out.nx, out.ny, out.n_tokens);
-    if (mtmd_image_tokens_get_n_pos(it) != std::max(out.nx, out.ny)) DIE("%s: n_pos is not max(nx, ny)", a.path.c_str());
+    if (g_seat->mrope) {
+        // the grid from the last token's decoder position: (row ny-1, column nx-1) of a raster grid
+        const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) out.n_tokens - 1);
+        out.nx = (int) last.x + 1;
+        out.ny = (int) last.y + 1;
+        if (out.nx * out.ny != out.n_tokens) DIE("%s: grid %d x %d is not %d tokens", a.path.c_str(), out.nx, out.ny, out.n_tokens);
+        if (mtmd_image_tokens_get_n_pos(it) != std::max(out.nx, out.ny)) DIE("%s: n_pos is not max(nx, ny)", a.path.c_str());
+    } else {
+        // normal positions: mtmd keeps no grid (set_canvas puts the measured one in), an image takes one position a token
+        out.nx = out.n_tokens;
+        out.ny = 1;
+        if (mtmd_image_tokens_get_n_pos(it) != out.n_tokens) DIE("%s: n_pos is not n_tokens", a.path.c_str());
+    }
 }
+
+// The positions an image advances by: M-RoPE's max(nx, ny), else one a token.
+static int n_pos_of(const image_chunk & ic) { return g_seat->mrope ? std::max(ic.nx, ic.ny) : ic.n_tokens; }
 
 static void encode_image(mtmd_context * ctx, const image_chunk & ic, int n_embd, std::vector<float> & out) {
     if (mtmd_encode_chunk(ctx, ic.chunk) != 0) DIE("mtmd_encode_chunk failed");
     const float * e = mtmd_get_output_embd(ctx);
     if (!e) DIE("no output embeddings");
     out.assign(e, e + (size_t) ic.n_tokens * n_embd);
+}
+
+// A normal-position seat's grid: the planned canvas W x H (the tower's graph input `inp_raw`: each side aligned to g_align)
+// holds the chunk's tokens, nx = W / align and ny = H / align.
+static void set_canvas(image_chunk & ic, int W, int H, const std::string & name) {
+    if (W % g_align != 0 || H % g_align != 0 || (long) (W / g_align) * (H / g_align) != ic.n_tokens) {
+        DIE("%s: inp_raw %d x %d is not %d tokens of %d x %d", name.c_str(), W, H, ic.n_tokens, g_align, g_align);
+    }
+    ic.nx = W / g_align;
+    ic.ny = H / g_align;
+}
+
+// The canvas of an image by a tap context that arms `inp_raw` only: one more tower run, the only way to see the canvas of a seat
+// whose mtmd image tokens keep no grid. The tokens are the clean context's; this run's embeddings are dropped.
+static void probe_canvas(mtmd_context * tapc, tap_state & taps, const image_arg & a, int n_embd, image_chunk & ic) {
+    image_chunk it;
+    tokenize_image(tapc, a, it);
+    if (it.n_tokens != ic.n_tokens || it.w != ic.w || it.h != ic.h) DIE("%s: the probe context disagrees on the plan", a.name.c_str());
+    taps.got.clear();
+    taps.want.clear();
+    taps.want_inp = true;
+    taps.inp_done = false;
+    taps.armed = true;
+    std::vector<float> dropped;
+    encode_image(tapc, it, n_embd, dropped);
+    taps.armed = false;
+    if (!taps.inp_done) DIE("%s: the first consumer of inp_raw was never seen", a.name.c_str());
+    const tap_data & inp = taps.got["inp_raw"];
+    if (inp.ne[2] != 3 || inp.ne[3] != 1) DIE("%s: inp_raw is not [W, H, 3, 1]", a.name.c_str());
+    set_canvas(ic, (int) inp.ne[0], (int) inp.ne[1], a.name);
+}
+
+// The seat's lines every set carries beyond the common header (a Qwen seat has none: its sets are as they were).
+static void seat_lines(set_writer & w, const std::string & text_model, const std::string & mmproj) {
+    if (g_seat->mrope) return;
+    w.line(std::string("# projector\t") + g_seat->projector + "\tpatch_size " + std::to_string(gguf_u32(mmproj, "clip.vision.patch_size")) +
+           "\tspatial_merge_size " + std::to_string(gguf_u32(mmproj, "clip.vision.spatial_merge_size")) + "\talign " + std::to_string(g_align) +
+           "\timage_min_pixels " + std::to_string(gguf_u32(mmproj, "clip.vision.image_min_pixels")) + "\timage_max_pixels " +
+           std::to_string(gguf_u32(mmproj, "clip.vision.image_max_pixels")));
+    if (!g_fixture_line.empty()) w.line(g_fixture_line);
+    const std::string src = gguf_str(text_model, "bloomery.respell.source", false);
+    if (!g_respell_expect.empty() && src != g_respell_expect) {
+        DIE("the text model's bloomery.respell.source is '%s', this run was handed '%s'", src.c_str(), g_respell_expect.c_str());
+    }
+    if (!src.empty()) {
+        const std::string set = gguf_str(text_model, "bloomery.respell.set", false);
+        w.line("# respell\tsource " + src + "\tsource_sha256 " + gguf_str(text_model, "bloomery.respell.source_sha256", true) + "\tfrom " +
+               gguf_str(text_model, "bloomery.respell.from", true) + "\tset " + (set.empty() ? "-" : set));
+    }
+}
+
+static void positions_line(set_writer & w) {
+    if (!g_seat->mrope) w.line("# positions\tnormal");
 }
 
 static void header_common(set_writer & w, const std::string & kind, const std::string & model, const std::string & arch,
@@ -474,6 +597,7 @@ static void header_common(set_writer & w, const std::string & kind, const std::s
     w.line("# flash_attn\tenabled\tclip warmup off");
     w.line("# image_tokens\tmin\t" + (min_tokens > 0 ? std::to_string(min_tokens) : std::string("default")) + "\tmax\t" +
            (max_tokens > 0 ? std::to_string(max_tokens) : std::string("default")));
+    seat_lines(w, text_model, mmproj);
 }
 
 static void image_lines(set_writer & w, const std::vector<image_info> & infos) {
@@ -508,7 +632,7 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
     tap_state taps;
     mtmd_context * clean = make_mtmd(mmproj, model, cpu, threads, min_tokens, max_tokens, nullptr);
     mtmd_context * tapc  = make_mtmd(mmproj, model, cpu, threads, min_tokens, max_tokens, &taps);
-    if (!mtmd_decode_use_mrope(clean)) DIE("the text model is not an M-RoPE decoder");
+    check_pos_type(clean);
 
     const std::string arch = gguf_arch(mmproj);
     std::unique_ptr<set_writer> pre;
@@ -517,9 +641,15 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
     std::vector<image_info> infos;
     std::string effect;
     std::vector<std::string> wanted;
-    if (!taps_final) wanted.push_back("inp_pos_emb");
-    wanted.push_back("norm_b-27");
-    if (!taps_final) for (int b : TAP_BLOCKS) for (const char * n : TAP_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
+    if (g_seat->mrope) {
+        if (!taps_final) wanted.push_back("inp_pos_emb");
+        wanted.push_back("norm_b-27");
+        if (!taps_final) for (int b : TAP_BLOCKS) for (const char * n : TAP_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
+    } else {
+        // glm4v.cpp's output nodes (cb(..., -1): no block suffix); the per-block taps of the Qwen graph are not this seat's
+        if (!taps_final) DIE("--taps full is the Qwen seats' per-block taps; the %s seat taps its output nodes: --taps final", g_seat->projector);
+        wanted = {"vit_out", "after_fc_proj", "after_ffn_proj"};
+    }
 
     for (const auto & a : images) {
         fprintf(stderr, "dump_mtmd: tower %s\n", a.name.c_str());
@@ -532,7 +662,7 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
         image_chunk ic;
         tokenize_image(clean, a, ic);
         info.w = ic.w; info.h = ic.h; info.rgb_sha = ic.rgb_sha;
-        info.nx = ic.nx; info.ny = ic.ny; info.n_tokens = ic.n_tokens; info.n_pos = std::max(ic.nx, ic.ny);
+        info.nx = ic.nx; info.ny = ic.ny; info.n_tokens = ic.n_tokens; info.n_pos = n_pos_of(ic);
         std::vector<float> embd_clean;
         encode_image(clean, ic, n_embd, embd_clean);
 
@@ -557,7 +687,12 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
         info.best_w = (int) inp.ne[0];
         info.best_h = (int) inp.ne[1];
         if (inp.ne[2] != 3 || inp.ne[3] != 1) DIE("%s: inp_raw is not [W, H, 3, 1]", a.name.c_str());
-        if ((long) (info.best_w / 32) * (info.best_h / 32) != ic.n_tokens) DIE("%s: inp_raw %d x %d is not %d tokens", a.name.c_str(), info.best_w, info.best_h, ic.n_tokens);
+        if (g_seat->mrope) {
+            if ((long) (info.best_w / 32) * (info.best_h / 32) != ic.n_tokens) DIE("%s: inp_raw %d x %d is not %d tokens", a.name.c_str(), info.best_w, info.best_h, ic.n_tokens);
+        } else {
+            set_canvas(ic, info.best_w, info.best_h, a.name);
+            info.nx = ic.nx; info.ny = ic.ny; info.n_pos = n_pos_of(ic);
+        }
         if (pre) pre->tensor_f32(a.name + "/inp_raw", inp.op.c_str(), inp.ne, inp.v.data());
 
         size_t diff = 0;
@@ -589,9 +724,10 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
         pre->finish();
     }
     header_common(tw, "taps", mmproj, arch, text_model, mmproj, cpu, threads, min_tokens, max_tokens, flags,
-                  "dump_mtmd tower — mtmd's qwen3vl_merger graph nodes and final embeddings, raw f32, little-endian");
+                  std::string("dump_mtmd tower — mtmd's ") + g_seat->projector + " graph nodes and final embeddings, raw f32, little-endian");
     if (taps_final) {
-        tw.line("# taps\tnorm_b-27 (the post-LN output) of every image; embd (the clean pass)");
+        tw.line(g_seat->mrope ? "# taps\tnorm_b-27 (the post-LN output) of every image; embd (the clean pass)"
+                              : "# taps\tvit_out after_fc_proj after_ffn_proj of every image; embd (the clean pass)");
     } else {
         tw.line("# tap_patches\t" + std::to_string(tap_patches));
         tw.line("# taps\tblocks 0,1,13,26 of ln1 Qcur_rope attn_out ffn_inp ffn_out layer_out; inp_pos_emb; norm_b-27 (the post-LN output); embd (the clean pass)");
@@ -668,10 +804,16 @@ static void take_rows(row_sink * s, int n, const int32_t * t, const int32_t * y,
     s->at += (size_t) n;
 }
 
-// The positions of one image batch view: n_tokens (t, y, x, z) arrays, section-major, n_tokens long each.
-static void take_image_batch(row_sink * s, int n, const llama_pos * pos) {
-    std::vector<int32_t> t(pos, pos + n), y(pos + n, pos + 2 * n), x(pos + 2 * n, pos + 3 * n);
-    take_rows(s, n, t.data(), y.data(), x.data());
+// The positions of one image batch view: an M-RoPE view's (t, y, x, z) arrays, section-major, n_tokens long each; a normal
+// view's one array, which is each row's t, y and x alike.
+static void take_image_batch(row_sink * s, int n, const llama_pos * pos, int n_pos) {
+    if (n_pos == 1) {
+        std::vector<int32_t> p(pos, pos + n);
+        take_rows(s, n, p.data(), p.data(), p.data());
+    } else {
+        std::vector<int32_t> t(pos, pos + n), y(pos + n, pos + 2 * n), x(pos + 2 * n, pos + 3 * n);
+        take_rows(s, n, t.data(), y.data(), x.data());
+    }
     s->fed += n;
 }
 
@@ -680,13 +822,15 @@ static void take_image_batch(row_sink * s, int n, const llama_pos * pos) {
 // became mtmd_helper_embd_batch (build-clefvis.sh defines DUMP_MTMD_EMBD_BATCH for a tree whose header has it).
 #ifdef DUMP_MTMD_EMBD_BATCH
 static int32_t after_image_batch(const mtmd_helper_embd_batch * batch, void * user) {
-    if (batch->n_pos != 4) DIE("an image batch view of %d position arrays, an M-RoPE view has 4", (int) batch->n_pos);
-    take_image_batch(static_cast<row_sink *>(user), batch->n_tokens, batch->pos);
+    const int want = g_seat->mrope ? 4 : 1;
+    if (batch->n_pos != want) DIE("an image batch view of %d position arrays, the %s seat's has %d", (int) batch->n_pos, g_seat->projector, want);
+    take_image_batch(static_cast<row_sink *>(user), batch->n_tokens, batch->pos, want);
     return 0;
 }
 #else
 static int32_t after_image_batch(llama_batch batch, void * user) {
-    take_image_batch(static_cast<row_sink *>(user), batch.n_tokens, batch.pos);
+    if (!g_seat->mrope) DIE("this mtmd tree hands the helper's batch as a llama_batch: only the M-RoPE layout is built for it");
+    take_image_batch(static_cast<row_sink *>(user), batch.n_tokens, batch.pos, 4);
     return 0;
 }
 #endif
@@ -816,7 +960,7 @@ static int run_hidden(const std::string & mmproj, const std::string & text_model
     const int n_embd = llama_model_n_embd_inp(model);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const char * pad_text = llama_vocab_get_text(vocab, pad_id);
-    if (!pad_text || strcmp(pad_text, "<|image_pad|>") != 0) DIE("id %d is %s, not <|image_pad|>", pad_id, pad_text ? pad_text : "(none)");
+    if (!pad_text || strcmp(pad_text, g_seat->pad_text) != 0) DIE("id %d is %s, not %s", pad_id, pad_text ? pad_text : "(none)", g_seat->pad_text);
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = (uint32_t) n_ctx;
@@ -836,9 +980,13 @@ static int run_hidden(const std::string & mmproj, const std::string & text_model
     if (!lctx) DIE("failed to make the context");
 
     mtmd_context * mctx = nullptr;
+    mtmd_context * probe_ctx = nullptr;
+    tap_state probe_taps;
     if (!prose) {
         mctx = make_mtmd(mmproj, model, cpu, threads > 0 ? threads : 4, min_tokens, max_tokens, nullptr);
-        if (!mtmd_decode_use_mrope(mctx)) DIE("the text model is not an M-RoPE decoder");
+        check_pos_type(mctx);
+        // a normal-position seat's canvas comes from a second context's inp_raw (probe_canvas)
+        if (!g_seat->mrope && !images.empty()) probe_ctx = make_mtmd(mmproj, model, cpu, threads > 0 ? threads : 4, min_tokens, max_tokens, &probe_taps);
     }
 
     std::vector<float> rows((size_t) n_ids * n_embd);
@@ -881,8 +1029,9 @@ static int run_hidden(const std::string & mmproj, const std::string & text_model
                 DIE("%s: mtmd gives %d tokens, the prompt's span %zu holds %zu image pad ids", a.name.c_str(), ic.n_tokens, k, len);
             }
             info.w = ic.w; info.h = ic.h; info.rgb_sha = ic.rgb_sha;
-            info.nx = ic.nx; info.ny = ic.ny; info.n_tokens = ic.n_tokens; info.n_pos = std::max(ic.nx, ic.ny);
-            info.best_w = ic.nx * 32; info.best_h = ic.ny * 32;
+            if (probe_ctx) probe_canvas(probe_ctx, probe_taps, a, n_embd, ic);
+            info.nx = ic.nx; info.ny = ic.ny; info.n_tokens = ic.n_tokens; info.n_pos = n_pos_of(ic);
+            info.best_w = ic.nx * g_align; info.best_h = ic.ny * g_align;
             std::vector<float> embd;
             encode_image(mctx, ic, n_embd, embd);
             if (bf16) for (float & v : embd) v = bf16_round(v);
@@ -890,6 +1039,7 @@ static int run_hidden(const std::string & mmproj, const std::string & text_model
             sink.fed = 0;
             if (rows_node) {
 #ifdef DUMP_MTMD_EMBD_BATCH
+                if (!g_seat->mrope) DIE("--rows-from node reads the helper's M-RoPE batch by hand: not built for the %s seat", g_seat->projector);
                 decode_image_rows(lctx, &sink, ic.chunk, embd, n_embd, n_past, n_ctx, &new_past);
 #else
                 DIE("--rows-from node needs the llama_batch_ext API of a tree that has mtmd_helper_embd_batch");
@@ -952,13 +1102,25 @@ static int run_hidden(const std::string & mmproj, const std::string & text_model
     w.line("# rows\t" + rows_mode + "\tprose_ids\t" + prose_path + "\tsha256\t" + prose_sha);
     if (rows_node) w.line("# rows_from\tnode");
     w.line("# image_pad_id\t" + std::to_string(pad_id));
+    positions_line(w);
     w.line("# ctx\t" + std::to_string(n_ctx) + "\tubatch\t" + std::to_string(cp.n_ubatch) + "\tn_pos_end\t" + std::to_string((int) n_past));
     w.head += span_lines;
     if (!prose) image_lines(w, infos);
     const int64_t ne_r[4] = {n_embd, (int64_t) n_ids, 1, 1};
     w.tensor_f32("result_norm", "RMS_NORM", ne_r, rows.data());
-    const int64_t ne_p[4] = {3, (int64_t) n_ids, 1, 1};
-    w.tensor_i32("mrope_pos", "INPUT", ne_p, pos3);
+    if (g_seat->mrope) {
+        const int64_t ne_p[4] = {3, (int64_t) n_ids, 1, 1};
+        w.tensor_i32("mrope_pos", "INPUT", ne_p, pos3);
+    } else {
+        // normal positions: the one position each row was fed (a row's t, y and x are the same value)
+        std::vector<int32_t> pos1(n_ids);
+        for (size_t r = 0; r < n_ids; ++r) {
+            if (pos3[r * 3 + 1] != pos3[r * 3] || pos3[r * 3 + 2] != pos3[r * 3]) DIE("row %zu: positions (%d, %d, %d) are not one", r, pos3[r * 3], pos3[r * 3 + 1], pos3[r * 3 + 2]);
+            pos1[r] = pos3[r * 3];
+        }
+        const int64_t ne_p[4] = {1, (int64_t) n_ids, 1, 1};
+        w.tensor_i32("pos", "INPUT", ne_p, pos1);
+    }
     w.finish();
     if (decode_steps > 0) {
         set_writer dw(out_decode);
@@ -970,6 +1132,7 @@ static int run_hidden(const std::string & mmproj, const std::string & text_model
         dw.line("# rows\t" + rows_mode + "\tprose_ids\t" + prose_path + "\tsha256\t" + prose_sha);
         if (rows_node) dw.line("# rows_from\tnode");
         dw.line("# image_pad_id\t" + std::to_string(pad_id));
+        positions_line(dw);
         dw.line("# ctx\t" + std::to_string(n_ctx) + "\tubatch\t" + std::to_string(cp.n_ubatch) + "\tn_pos_end\t" + std::to_string((int) n_past));
         dw.line("# decode\tsteps\t" + std::to_string(decode_steps) + "\tn_past_start\t" + std::to_string((int) n_past_start) + "\tsampler\tgreedy, the first of equal logits");
         dw.head += span_lines;
@@ -981,6 +1144,7 @@ static int run_hidden(const std::string & mmproj, const std::string & text_model
         dw.tensor_i32("n_past", "INPUT", ne_n, dec_past);
         dw.finish();
     }
+    if (probe_ctx) mtmd_free(probe_ctx);
     if (mctx) mtmd_free(mctx);
     llama_free(lctx);
     llama_model_free(model);
@@ -1015,9 +1179,15 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
     if (!model) DIE("cannot load the vocabulary of %s", text_model.c_str());
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const char * pad_text = llama_vocab_get_text(vocab, pad_id);
-    if (!pad_text || strcmp(pad_text, "<|image_pad|>") != 0) DIE("id %d is %s, not <|image_pad|>", pad_id, pad_text ? pad_text : "(none)");
+    if (!pad_text || strcmp(pad_text, g_seat->pad_text) != 0) DIE("id %d is %s, not %s", pad_id, pad_text ? pad_text : "(none)", g_seat->pad_text);
     mtmd_context * mctx = make_mtmd(mmproj, model, true, threads, min_tokens, max_tokens, nullptr);
-    if (!mtmd_decode_use_mrope(mctx)) DIE("the text model is not an M-RoPE decoder");
+    check_pos_type(mctx);
+    // a normal-position seat's canvas comes from a second context's inp_raw (probe_canvas), once an image
+    mtmd_context * probe_ctx = nullptr;
+    tap_state probe_taps;
+    std::map<std::string, std::pair<int, int>> canvases;
+    if (!g_seat->mrope) probe_ctx = make_mtmd(mmproj, model, true, threads, min_tokens, max_tokens, &probe_taps);
+    const int proj_dim = (int) gguf_u32(mmproj, "clip.vision.projection_dim");
     const std::string marker = mtmd_default_marker();
     common_chat_templates_ptr tmpls = common_chat_templates_init(model, "");
     if (!tmpls) DIE("no chat template in %s", text_model.c_str());
@@ -1112,18 +1282,32 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
                 if (n_img >= used.size()) DIE("request %s: more image chunks than image parts", id.c_str());
                 const size_t n = mtmd_input_chunk_get_n_tokens(c);
                 const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(c);
-                const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, n - 1);
                 image_info info;
                 info.name = used[n_img];
                 info.png_sha = png_sha[n_img];
                 info.rgb_sha = rgb_sha[n_img];
                 info.w = bw[n_img]; info.h = bh[n_img];
-                info.nx = (int) last.x + 1; info.ny = (int) last.y + 1;
-                if ((size_t) info.nx * info.ny != n) DIE("request %s: grid %d x %d is not %zu tokens", id.c_str(), info.nx, info.ny, n);
                 info.n_tokens = (int) n;
                 info.n_pos = (int) mtmd_input_chunk_get_n_pos(c);
-                if (info.n_pos != std::max(info.nx, info.ny)) DIE("request %s: n_pos is not max(nx, ny)", id.c_str());
-                info.best_w = info.nx * 32; info.best_h = info.ny * 32;
+                if (g_seat->mrope) {
+                    const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, n - 1);
+                    info.nx = (int) last.x + 1; info.ny = (int) last.y + 1;
+                    if ((size_t) info.nx * info.ny != n) DIE("request %s: grid %d x %d is not %zu tokens", id.c_str(), info.nx, info.ny, n);
+                    if (info.n_pos != std::max(info.nx, info.ny)) DIE("request %s: n_pos is not max(nx, ny)", id.c_str());
+                } else {
+                    // normal positions: the grid is the probed canvas's, one position a token
+                    if (info.n_pos != info.n_tokens) DIE("request %s: n_pos is not n_tokens", id.c_str());
+                    if (!canvases.count(info.name)) {
+                        image_chunk ic;
+                        const image_arg a = {info.name, by_name[info.name]};
+                        tokenize_image(probe_ctx, a, ic);
+                        probe_canvas(probe_ctx, probe_taps, a, proj_dim, ic);
+                        canvases[info.name] = {ic.nx, ic.ny};
+                    }
+                    info.nx = canvases[info.name].first; info.ny = canvases[info.name].second;
+                    if ((size_t) info.nx * info.ny != n) DIE("request %s: grid %d x %d is not %zu tokens", id.c_str(), info.nx, info.ny, n);
+                }
+                info.best_w = info.nx * g_align; info.best_h = info.ny * g_align;
                 char b[256];
                 snprintf(b, sizeof(b), "# span\t%zu\t%s\t%zu\t%zu\t%d\t%d\t%d\t%d\t%d\n", n_img, info.name.c_str(), ids.size(), n, info.nx,
                          info.ny, info.n_pos, (int) n_past, (int) n_past + info.n_pos);
@@ -1158,12 +1342,14 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
         w.line("# prompt\t" + escape_line(prompt));
         w.line("# tokens_count\t" + std::to_string(ids.size()));
         w.line("# image_pad_id\t" + std::to_string(pad_id));
+        positions_line(w);
         w.head += span_lines;
         image_lines(w, infos);
         const int64_t ne_i[4] = {(int64_t) ids.size(), 1, 1, 1};
         w.tensor_i32("ids", "TOKENS", ne_i, ids);
         w.finish();
     }
+    if (probe_ctx) mtmd_free(probe_ctx);
     mtmd_free(mctx);
     llama_model_free(model);
     llama_backend_free();
@@ -1182,7 +1368,11 @@ int main(int argc, char ** argv) {
     long tap_patches = 4096;
     bool cpu = false, taps_final = false, rows_node = false;
     std::string flags;
-    for (int i = 1; i < argc; ++i) flags += (i > 1 ? " " : "") + std::string(argv[i]);
+    for (int i = 1; i < argc; ++i) {
+        // the `# fixture` line holds tabs: it has its own header line, and the flags line stays one field
+        const bool fixture_line = i > 1 && std::string(argv[i - 1]) == "--fixture-line";
+        flags += (i > 1 ? " " : "") + (fixture_line ? std::string("<the # fixture line>") : std::string(argv[i]));
+    }
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         const bool more = i + 1 < argc;
@@ -1224,10 +1414,17 @@ int main(int argc, char ** argv) {
         else if (a == "--tap-patches" && more) tap_patches = atol(argv[++i]);
         else if (a == "--mmproj-sha256" && more) g_mmproj_sha256 = argv[++i];
         else if (a == "--card" && more) g_card = argv[++i];
+        else if (a == "--fixture-line" && more) {
+            g_fixture_line = argv[++i];
+            if (g_fixture_line.rfind("# fixture\t", 0) != 0) DIE("--fixture-line wants a '# fixture<TAB>…' line, got '%s'", g_fixture_line.c_str());
+        }
+        else if (a == "--respell-source" && more) g_respell_expect = argv[++i];
         else if (a == "--cpu") { cpu = true; ngl = 0; }
         else DIE("unknown or incomplete argument '%s'", a.c_str());
     }
-    if (mmproj.empty() || model.empty() || out.empty() || images.empty()) DIE("--mmproj, -m, --out and at least one --image are required");
+    // a hidden run with no --image is a text prompt (its ids hold no image span: run_hidden refuses a span without an image)
+    if (mmproj.empty() || model.empty() || out.empty() || (images.empty() && mode != "hidden")) DIE("--mmproj, -m, --out and at least one --image are required");
+    select_seat(mmproj);
     if (mode == "tower") return run_tower(mmproj, model, images, out_pre, out, cpu, threads > 0 ? threads : 4, min_t, max_t, tap_patches, taps_final, flags);
     if (mode == "hidden") {
         if (ids.empty()) DIE("hidden needs --ids");
