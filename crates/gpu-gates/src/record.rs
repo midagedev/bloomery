@@ -3159,6 +3159,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &NVTIER,
     &CAPTURE,
     &CAPTURE_PAIR,
     &PROMPT_UNITS,

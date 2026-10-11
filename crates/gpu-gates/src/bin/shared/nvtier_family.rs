@@ -189,6 +189,17 @@ pub trait Family {
     fn refusals(&self, _paged: Arm) -> Vec<Refusal<'_>> {
         Vec::new()
     }
+
+    /// Whether the file keeps routed layers on the host in a number the tier can page (the family's
+    /// count over the file's types, never the plan's placement): the clauses that read the paged
+    /// experts are left by name ([`tier::host_clause`]) on a fixture where it is false. An
+    /// approximation of the plan's own condition; a miss is a red clause, never a deferral.
+    ///
+    /// # Errors
+    /// A file the count cannot be read from.
+    fn host_layers_enough(&self) -> Result<bool, GateError> {
+        Ok(true)
+    }
 }
 
 /// What one arm left behind.
@@ -336,8 +347,10 @@ fn refused(what: &str, holds: &str, got: Result<(), GateError>) -> bool {
 /// # Errors
 /// A clause that is red ([`checks_failed`]), or a failure the clauses cannot name: a probe, a load, a run.
 pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
-    tier::sc(
+    let host = f.host_layers_enough()?;
+    let plan_runs = tier::host_clause(
         "plan: the paged plan pages through an arena of exactly the given slots, all-RAM pages nothing",
+        host,
     )?;
     let probe = |arm| f.plan(arm);
     // The base: a room no need passes, so no split runs and the plan's need and arena floor are the file's.
@@ -398,40 +411,52 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
     let ram = arm_run(f, name, ram_arm, ram_plan)?;
     let paged = arm_run(f, name, paged_arm, paged_plan)?;
     let mut pass = true;
-    pass &= plan_clause("plan", &ram.plan, &paged.plan, a, paged.tier.as_ref());
-    tier::sc("attach: the tier is built, covers every paged layer and counts a run's traffic")?;
-    pass &= attach_clause("attach", &paged.plan, paged.tier.as_ref());
+    if plan_runs {
+        pass &= plan_clause("plan", &ram.plan, &paged.plan, a, paged.tier.as_ref());
+    }
+    if tier::host_clause(
+        "attach: the tier is built, covers every paged layer and counts a run's traffic",
+        host,
+    )? {
+        pass &= attach_clause("attach", &paged.plan, paged.tier.as_ref());
+    }
     tier::sc("bits: every position equals the all-RAM arm's")?;
     pass &= bits_clause("bits", &ram.run, &paged.run);
-    tier::sc(
+    if tier::host_clause(
         "refuse: a room under the floor, an arena under the arena's floor and the family's own, by name",
-    )?;
-    let under = (base.floor.slots - 1) * base.floor.slot_set;
-    pass &= refused(
-        "room",
-        "the NVMe expert tier's floor",
-        probe(low)?.map(|_| ()).map_err(GateError::from),
-    );
-    pass &= refused(
-        "arena",
-        "is under its floor",
-        probe(Arm {
-            room: paged_arm.room,
-            arena: Some(under),
-        })?
-        .map(|_| ())
-        .map_err(GateError::from),
-    );
-    for r in f.refusals(paged_arm) {
-        pass &= refused(r.what, r.holds, (r.attempt)());
+        host,
+    )? {
+        let under = (base.floor.slots - 1) * base.floor.slot_set;
+        pass &= refused(
+            "room",
+            "the NVMe expert tier's floor",
+            probe(low)?.map(|_| ()).map_err(GateError::from),
+        );
+        pass &= refused(
+            "arena",
+            "is under its floor",
+            probe(Arm {
+                room: paged_arm.room,
+                arena: Some(under),
+            })?
+            .map(|_| ())
+            .map_err(GateError::from),
+        );
+        for r in f.refusals(paged_arm) {
+            pass &= refused(r.what, r.holds, (r.attempt)());
+        }
     }
-    tier::sc("residency: the unset rule on the paged plan is off, why paged")?;
-    let (word, why) = f.unset_residency(paged_arm)?;
-    pass &= clause(
-        "residency",
-        &format!("the unset word on the paged plan is {word:?}, why {why:?}"),
-        word == "off" && why == "paged",
-    );
+    if tier::host_clause(
+        "residency: the unset rule on the paged plan is off, why paged",
+        host,
+    )? {
+        let (word, why) = f.unset_residency(paged_arm)?;
+        pass &= clause(
+            "residency",
+            &format!("the unset word on the paged plan is {word:?}, why {why:?}"),
+            word == "off" && why == "paged",
+        );
+    }
     println!("{name}: {}", tier::tally_line());
     if pass {
         println!("{name}: every clause passed");

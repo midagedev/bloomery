@@ -19,7 +19,7 @@ use super::hparams::{Hparams, Kind};
 use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
-use crate::placement::workstation::{self, GRANULE, TierBatchBytes};
+use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
     ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
@@ -235,6 +235,18 @@ pub struct PlanInputs {
     /// Each trunk layer's recurrent and cache bytes, at one KDA lane
     /// ([`KvLayout::with_lanes`] for more).
     pub kv: KvLayout,
+    /// The host's available bytes when the inputs were read, with the
+    /// reading that decided ([`workstation::host_available_read`]): the
+    /// routed experts the room cannot hold follow it to the NVMe tier
+    /// ([`placement::expert_nvme_tier`]); a NextN plan splits the trunk at
+    /// the room less the draft layer's routed experts. A gate that plans an
+    /// arm by a room of its own sets it, read [`HostRead::Given`].
+    pub room: (u64, HostRead),
+    /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
+    /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
+    /// as its `given`. A gate that plans an arm by an arena of its own sets
+    /// it.
+    pub arena: Option<u64>,
 }
 
 /// Why a plan was refused.
@@ -358,18 +370,24 @@ impl PlanInputs {
         }
     }
 
-    /// [`PlanInputs::read`] without the refusal of unimplemented features.
+    /// [`PlanInputs::read`] without the refusal of unimplemented features,
+    /// and with the host's room ([`workstation::host_available_read`]) and the
+    /// arena's given bytes, a room that cannot be read refused by name.
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
         let chat = chat_of(split, spec::TOOLS, Some(models::ReasoningFormat::ThinkSpan))?;
         let spec = spec::spec_of(&hp, &model, chat)?;
         let kv = KvLayout::of(&hp);
+        let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
+        let arena = workstation::nvtier_arena_given().map_err(PlacementError::HostRoom)?;
         Ok(PlanInputs {
             hp,
             model,
             spec,
             kv,
+            room,
+            arena,
         })
     }
 
@@ -418,7 +436,9 @@ impl PlanInputs {
     /// those reserved out of the expert budget before it fills, so a card
     /// that cannot hold them is refused as [`PlanInputs::plan_lanes`] refuses
     /// it. The stage card's KV term is [`PlanInputs::kv_term`]. One slot is
-    /// [`PlanInputs::plan_lanes`] itself; zero is refused by name.
+    /// [`PlanInputs::plan_lanes`] itself; zero is refused by name. The
+    /// routed experts the host's room ([`PlanInputs::room`]) cannot hold are
+    /// paged through the NVMe tier ([`placement::expert_nvme_tier`]).
     pub fn plan_slots<'a>(
         &'a self,
         machine: &'a Machine,
@@ -455,6 +475,7 @@ impl PlanInputs {
         if let Some(t) = plan.cards.first_mut() {
             t.grow_kv(beside);
         }
+        placement::expert_nvme_tier(&mut plan, self.room.0, self.arena)?;
         // The front stays beside the plan's terms (`refuse_front` holds it to
         // the card), so a unified pool counts it beside them.
         let plan = checked_beside(plan, front).map_err(PlaceError::Broken)?;
@@ -738,7 +759,9 @@ impl PlanInputs {
     /// sequence past the live one, those reserved out of the expert budget
     /// before it fills ([`PlanInputs::kv_term`]). The two plans' kv classes
     /// sum to [`SeqTerms::plan_kv`]. One slot is [`PlanInputs::plan_nextn`]
-    /// itself; zero is refused by name.
+    /// itself; zero is refused by name. The trunk's NVMe tier split runs at the
+    /// room less the NextN layer's routed experts, which are the host's beside
+    /// it; a room under them is refused by name.
     pub fn plan_nextn_slots<'a>(
         &'a self,
         machine: &'a Machine,
@@ -788,10 +811,27 @@ impl PlanInputs {
         // The bytes beside the stores ride the stage card's KV term, as
         // [`PlanInputs::plan_slots`] counts them.
         plan.cards[0].grow_kv(beside);
+        // The draft layer's routed experts are the host's beside the trunk's,
+        // a plan of their own: the trunk splits at the room they leave.
+        let draft_host = draft.host.expert_bytes;
+        let room = self.room.0.checked_sub(draft_host).ok_or_else(|| {
+            PlacementError::HostRoom(format!(
+                "the NextN layer's routed experts, {draft_host} B, pass the host room {} B",
+                self.room.0
+            ))
+        })?;
+        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         let total = card_terms(&plan.cards[0]) + nextn_card + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
-        let host_headroom = plan.host.headroom_bytes - i128::from(draft.host.expert_bytes);
+        // A split plan's headroom is what the room it ran at left, and that
+        // room lost the draft's experts already; an unsplit plan's is the
+        // machine's figure, which has not.
+        let host_headroom = if plan.host.nvme_expert_bytes > 0 {
+            plan.host.headroom_bytes
+        } else {
+            plan.host.headroom_bytes - i128::from(draft_host)
+        };
         // On a unified machine the pool holds the draft and the front beside
         // the target's own terms.
         let mut broken: Vec<Violation> = plan
@@ -1236,6 +1276,7 @@ mod tests {
             KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
             prompt_reserve_bytes, row_bytes,
         };
+        use crate::placement::workstation::HostRead;
         use crate::placement::{
             Card, Host, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role, UnifiedPool,
             Violation,
@@ -1406,6 +1447,8 @@ mod tests {
                     },
                 },
                 kv,
+                room: (u64::MAX, HostRead::Given),
+                arena: None,
             }
         }
 
