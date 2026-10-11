@@ -1,15 +1,25 @@
 # Status board
 
-One pinned GitHub issue whose body `board.py` rewrites from state files, `gh` and `git log`. No LLM runs
-in it. Contributors read the same page: where a PR stands, what is landing.
+One pinned GitHub issue whose body `board.py` rewrites from facts that already exist: the Claude session registry,
+the gate batches' event logs, git and its tags, `gh`. No LLM runs in it, and nobody has to remember to update it. The
+files in the state directory are the lead's and the sessions' optional notes and overrides. Contributors read the same
+page: where a PR stands, what is landing.
 
     python3 tools/board/board.py                  # print the body
     python3 tools/board/board.py --publish ISSUE  # replace the issue's body (what launchd runs)
-    python3 tools/board/board.py --self-test      # synthetic state, a stub gh, no network
+    python3 tools/board/board.py --self-test      # synthetic state, a stub gh, temp git repos, no network
 
 The body opens with ASCII art and one caption line, then the sections, each with its own "as of": Release, Trains,
-Batches, Workers, Contributor PRs and issues, Recently landed. A missing state directory is an empty section. A source that fails (gh, git, an unreadable state file) is a `problem:` line in its
+Batches, Workers, Contributor PRs and issues, Recently landed. A missing state directory is an empty section. A source that fails (gh, git, an unreadable state file or registry) is a `problem:` line in its
 section, a line on stderr, and exit 1 after everything else is rendered and published.
+
+## What is derived, and from what
+
+| Section | Derived from | The hand-written file is |
+|---|---|---|
+| Workers | `~/.claude/sessions/<pid>.json` (`--sessions`), the sessions named in `--roles` | `workers/<role>.md`, a note |
+| Trains | `batch/*.jsonl` (the lead's batches) and `git` in `--tree`: a branch on `origin/main` has landed | `trains/<name>.json`, overrides |
+| Release | `git ls-remote --tags origin`: a version with its tag is tagged | `release.json`, the plan |
 
 ## State files
 
@@ -21,20 +31,43 @@ The directory is `~/.cache/bloomery/board` (`--dir`). `tools/gate-batch.sh` puts
     {"version": "0.3.0", "cut": "2026-10-11 22:00–24:00 KST", "state": "collecting|union-batch|user-pass|tagged",
      "items": [{"what": "...", "owner": "...", "state": "landed|in-train|pending|deferred", "eta": "HH:MM"|null, "note": "..."}]}
 
+If `v<version>` is a tag on origin (`git ls-remote --tags origin`, so no local ref is read or moved; a leading `v` in `version` is
+the tag's own), the release renders as **tagged** with the tag's date (the annotated tag's, else the commit's, from the
+objects this checkout has) whatever its `state` says, followed by `next: not opened`, and flags no item late or overdue.
+It stays so until `release.json` names a newer version. A lookup that fails is a `problem:` line and the release shows the
+file's own state.
+
 Items are shown in four groups in file order: Landed, In a train now, Pending (with ETA), Deferred to the next release.
 An item in a train or pending whose `eta` is later in the day than the cut window's start (the first HH:MM of `cut`;
 both are times of day, in the Mac's zone) is flagged **late for the cut**; an ETA equal to the start is not. An item in a train or pending whose `eta` is earlier than
 the clock now (a time of today) is flagged **overdue**; an ETA equal to now is not. A `cut` with
 no HH:MM–HH:MM window, an unknown state or a bad ETA is a `problem:` line and no release is shown.
 
-**`trains/<name>.json`**, written by the lead:
+**`trains/<name>.json`**, written by the lead, optional. Only what the facts cannot say is the lead's to give:
 
     {"name": "train3", "branch": "train3", "base": "abc1234",
      "pieces": [{"what": "kv pool", "owner": "kvpool", "pr": 41}, {"what": "spark docs", "owner": "sparkdoc", "pr": null}],
      "state": "building|static|batch|ab|landing|landed", "note": "free text"}
 
-A `landed` train drops off 24 h after the file was last written (its mtime). A batch belongs to a train when the batch's
-`branch` equals the train's `branch`; the newest such batch shows under the train.
+Everything is optional but a readable JSON object; `state` is the lead's word for a stage git and the batches cannot see
+(`static`, `ab`, `landing`). A `state` that is none of those words is appended to the note, never a `problem:`.
+
+How a train's row is made:
+
+- **A file with no state** takes its newest batch's: `batch running|green|red|stopped|quiet`.
+- **A lead batch with no train file** makes a train of its own, named by its `branch`. Only batches with `mode: lead`
+  (`--ledger`) count: a round's `--round-ledger` batch ran on a round's tree and stays in Batches (without this cut
+  one day of rounds is about 25 rows). A branch that is `HEAD` (a detached tree), `main` or empty makes no row.
+- **Landed by ancestry.** After the `git fetch`, a train (file or derived) whose local branch head is an ancestor of
+  `origin/main` renders as **landed** whatever its file says, with `on origin/main at <head>` (landing is
+  fast-forward, so the branch head is the main commit it reached). The branch must have carried commits of its own:
+  `base..head` is not empty (the file's `base`), or, with no usable base, the branch's reflog moved past its creation.
+  A branch still at its base (a train before its first commit) has nothing to land. A branch that no longer exists
+  keeps its file state or its last batch state.
+- **A landed train** drops off a day after the newest of its file's last write, its head commit and its batch. A
+  train landed by the file's word alone, with no branch to test, drops a day after the file was last written.
+
+A batch belongs to a train when the batch's `branch` equals the train's `branch`; the newest such batch shows under the train.
 
 **`batch/<out-dir basename>.jsonl`**, appended by `tools/gate-batch.sh` on a real run (a dry run writes none), one JSON
 object per line, whole lines under a flock. Best effort: a failed write costs one stderr line, never the batch's exit code
@@ -51,12 +84,30 @@ number (the batch's own count), predicted end = start + predicted_wall. A batch 
 quiet 3 h reads "no DONE, last event HH:MM" (it died). A batch quiet 24 h drops off. Old files are not pruned; `find
 ~/.cache/bloomery/board/batch -mtime +14 -delete` does it.
 
-**`workers/<role>.md`**, written by the sessions. The rule each session follows:
+**`workers/<role>.md`**, optional, written by a session that has something to say beyond what the registry shows
+(the round, its ETA, what it waits on). The board needs no note: a session may write one, and none is overdue.
 
-> On a round's start, end, or a landing request, rewrite `~/.cache/bloomery/board/workers/<role>.md` with at most 6 lines:
-> the round, its ETA, what it waits on.
+**The session registry** is the Workers section's source: `~/.claude/sessions/<pid>.json` (`--sessions`), one file per
+live Claude session, with `name`, `status` (`busy`, `idle`, `shell`, ...), `updatedAt` and `statusUpdatedAt` (epoch ms), `cwd`,
+`pid`. Only `<pid>.json` is read; the `.key` files beside them hold peer tokens and are never opened. A session is a
+worker when its name, less a trailing ` (2)`, is one of `--roles` (default `leader,vision,unitier,common,quant,toktape`).
+Of several sessions of a role, the live one with the newest update wins. Each worker shows:
 
-The board shows the first 6 lines under the file's mtime; a file quiet for 3 h reads "stale since HH:MM".
+- the state: `busy` (the registry's word, whatever it is, but `idle`), `idle since HH:MM` (from `statusUpdatedAt`), or
+  `gone` (the pid is not alive, `kill -0`). A non-idle session whose `updatedAt` is older than 30 min is flagged
+  **quiet 30+ min**. The registry's timestamps move with the status, not with the session's output, so this reads
+  "one turn or wait has run 30+ min", which is a prompt to look at the session, not proof it is stuck;
+- the age of `updatedAt`;
+- the train pieces it owns (`owner` in `trains/*.json`; an owner field with several names is split on `, / & +`; a landed
+  train's pieces are not listed). `lead` is not `leader`: the names must match;
+- the newest batch run from its own tree, when the session's `cwd` (its last component) names that batch's `tree` and
+  no other live session shares that cwd. The registry holds no branch. The role sessions all sit in the main checkout, so
+  today this maps nothing for them; it is not guessed any other way. A worker with nothing derivable shows state and age only.
+- its note, when `workers/<role>.md` exists: newer than 30 min, its first 6 lines nested under `note (updated HH:MM)` (a
+  leading `- ` is dropped); older, `(note from HH:MM, stale)` and its first line. A note with no session is headed `no session`.
+
+A session's cwd, pid and id are never rendered, and a session file the board cannot read is only counted
+(`sessions: N unreadable file(s)`). No registry directory is no sessions.
 
 ## The header art
 
@@ -81,7 +132,9 @@ rotates by date. The caption under it names the state: the train (or the batch's
 ## Privacy filter
 
 Every rendered line is checked before it is printed or published (same path for both). A line matching a pattern in
-`PRIVACY` is dropped and counted; the body ends with `N lines withheld`. stderr says how many and by which pattern
+`PRIVACY` is dropped and counted; the body ends with `N lines withheld`. The patterns: the home-LAN `192.168.`, tailnet
+`100.x` addresses and `.ts.net`, `admin`, the host names `sihyung`, `dopc` and `ws` (whole word), the paths `/Users/`,
+`/root/`, `/home/…` and `~/`, and tokens. stderr says how many and by which pattern
 names; `--explain` also prints each line. The self-test has one case per pattern, each red with the filter off.
 The token patterns are narrow on purpose: `token:` / `token =` and `Bearer <x>` are withheld (with `hf_…` and `ghp_`), while
 prose such as "token limits" and "tokenize" in a title is not.
@@ -89,7 +142,9 @@ prose such as "token limits" and "tokenize" in a title is not.
 ## When it runs
 
 launchd runs it when a state file changes (`WatchPaths` in the plist: `KICK`, `release.json`, `trains/`, `workers/`,
-`batch/`), at most once per 15 s, and every 600 s as the fallback for changes on GitHub's side. A writer that appends to
+`batch/`), at most once per 15 s, and every 600 s as the fallback for changes on GitHub's side and for the facts nothing
+watches: the session registry (its files change with every status, so watching it would publish every few seconds), the
+tags and `origin/main`. A worker's state and a landing therefore show within 10 minutes without anyone writing a file. A writer that appends to
 a file in place (a batch's event log) also touches `~/.cache/bloomery/board/KICK`, since appending does not change the
 directory launchd watches.
 

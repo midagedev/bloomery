@@ -6,10 +6,12 @@
   board.py --self-test           the renderer, the privacy filter and the publish path on synthetic state, no network
 
 The body opens with a piece of ASCII art that follows the board's state, then the sections, each with its own "as of":
-Release, Trains, Batches, Workers, Contributor PRs and issues, Recently landed. The state files it reads (formats in
-tools/board/README.md) live under --dir, default ~/.cache/bloomery/board: release.json and trains/*.json (the lead),
-batch/*.jsonl (tools/gate-batch.sh), workers/<role>.md (the sessions). The PR and issue lists come from `gh`, the landed
-list from `git log origin/main` in --tree (the checkout holding this file).
+Release, Trains, Batches, Workers, Contributor PRs and issues, Recently landed. It derives what it can from facts that
+already exist (formats in tools/board/README.md): the workers from the Claude session registry (--sessions, --roles), the
+trains from batch/*.jsonl (tools/gate-batch.sh) and from git (a branch on origin/main has landed), the release from its
+tag on origin. The files under --dir, default ~/.cache/bloomery/board, are the lead's and the sessions' optional notes and
+overrides: release.json and trains/*.json (the lead), workers/<role>.md (the sessions). The PR and issue lists come from
+`gh`, the landed list from `git log origin/main` in --tree (the checkout holding this file).
 
 A missing state directory is an empty section. A source that fails (gh, git, an unreadable or malformed state file) is
 a named line in its section and a non-zero exit after the rest is rendered and published: the board shows its own gaps.
@@ -31,7 +33,7 @@ import sys
 import tempfile
 
 STATES = ("building", "static", "batch", "ab", "landing", "landed")
-QUIET_S = 3 * 3600  # a worker file or a batch that has been quiet this long is shown as such
+QUIET_S = 3 * 3600  # a batch that has been quiet this long is shown as such
 BLOOM_S = 3600  # a train landed this recently puts the header art in bloom
 RELEASE_STATES = ("collecting", "union-batch", "user-pass", "tagged")
 RELEASE_GROUPS = (  # item state -> the group's heading, in the order shown
@@ -43,9 +45,15 @@ RELEASE_GROUPS = (  # item state -> the group's heading, in the order shown
 DROP_S = 24 * 3600  # a landed train and an ended or quiet batch drop off after a day
 COMMENT_DAYS = 7  # an issue is listed while its last non-maintainer comment is this recent
 WORKER_LINES = 6
+ROLES = ("leader", "vision", "unitier", "common", "quant", "toktape")  # the session names that are workers
+NOTE_FRESH_S = 30 * 60  # a hand-written worker note newer than this shows in full; older, its first line as stale
+BUSY_QUIET_S = 30 * 60  # a session that is not idle and has not changed status this long is flagged
+# Only the lead's landing batches (--ledger) stand for a train; a round's batch (--round-ledger) ran on a round's tree.
+DERIVE_MODES = ("lead",)
+NOT_TRAIN_BRANCHES = ("", "HEAD", "main", "master")  # a detached tree and the trunk are no train's branch
 SUBJECT_MAX = 100
 LOG_N = 10
-LIST_MAX = {"prs": 40, "issues": 20, "red": 15, "batches": 10, "pieces": 30}
+LIST_MAX = {"prs": 40, "issues": 20, "red": 15, "batches": 10, "pieces": 30, "trains": 12}
 BODY_MAX = 60000  # GitHub's limit is 65536 characters
 DEFAULT_MAINTAINERS = ("midagedev",)
 GH_TIMEOUT_S = 60
@@ -60,9 +68,11 @@ PRIVACY = (
     ("admin", r"\badmin\b"),
     ("host-sihyung", r"sihyung"),
     ("host-dopc", r"dopc"),
-    ("mac-home", r"/Users/[^ ]+"),
+    ("host-ws", r"\bws\b"),
+    ("mac-home", r"/Users/"),
     ("root-path", r"/root/"),
     ("linux-home", r"/home/[^ ]+"),
+    ("tilde-home", r"~/"),
     ("hf-token", r"hf_[A-Za-z0-9]{10,}"),
     ("gh-token", r"ghp_"),
     ("token-assign", r"(?i)\btoken\b\s*[:=]"),
@@ -197,6 +207,19 @@ def clock(t, now):
     return t.strftime("%H:%M") if t.date() == now.date() else t.strftime("%m-%d %H:%M")
 
 
+def ago(secs):
+    s = max(0, int(secs))
+    if s < 60:
+        return "just now"
+    m = s // 60
+    if m < 60:
+        return f"{m} min ago"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h} h {m} min ago" if m else f"{h} h ago"
+    return f"{h // 24} d ago"
+
+
 def parse_ts(s):
     t = dt.datetime.fromisoformat(s)
     return t if t.tzinfo else t.astimezone()
@@ -234,13 +257,16 @@ class Train:
     branch: str
     base: str
     pieces: list
-    state: str
+    state: str  # the file's state if it is one of STATES, else what the batch and git say
     note: str
-    at: dt.datetime  # the file's mtime: when the lead last wrote it
+    at: dt.datetime  # the file's mtime (when the lead last wrote it); a landed train: the newest of that, its head commit and its batch
+    head: str = ""  # the branch head's hash when the branch is on origin/main
+    derived: bool = False  # a batch's branch with no train file
 
 
-def read_trains(root, now):
-    """(trains, problems): the lead's trains/*.json; a landed train drops off a day after its last write."""
+def read_trains(root):
+    """(file trains, problems): the lead's trains/*.json. Only name, branch, base, pieces and note are the lead's to give;
+    the state is optional, and a state that is none of STATES is a note, never a problem."""
     trains, problems = [], []
     for path in files(os.path.join(root, "trains"), ".json"):
         base = os.path.basename(path)
@@ -249,27 +275,22 @@ def read_trains(root, now):
                 j = json.load(fh)
             if not isinstance(j, dict):
                 raise ValueError("not a JSON object")
-            for k in ("name", "state", "pieces"):
-                if k not in j:
-                    raise ValueError(f"no \"{k}\"")
-            if j["state"] not in STATES:
-                raise ValueError(f"state \"{j['state']}\" is none of {'|'.join(STATES)}")
-            if not isinstance(j["pieces"], list) or not all(isinstance(p, dict) and "what" in p for p in j["pieces"]):
+            pieces = j.get("pieces", [])
+            if not isinstance(pieces, list) or not all(isinstance(p, dict) and "what" in p for p in pieces):
                 raise ValueError("pieces is not a list of {what, owner, pr}")
-            for p in j["pieces"]:
+            for p in pieces:
                 if p.get("pr") is not None and not isinstance(p["pr"], int):
                     raise ValueError("a piece's pr is neither a number nor null")
-            tr = Train(
-                str(j["name"]), str(j.get("branch", "")), str(j.get("base", "")), j["pieces"], j["state"],
-                str(j.get("note", "")), mtime(path),
-            )
+            state, note = j.get("state"), str(j.get("note", ""))
+            if state is not None and state not in STATES:
+                note = f"{note} · {one_line(state)}" if note else one_line(state)
+                state = None
+            tr = Train(str(j.get("name", base[: -len(".json")])), str(j.get("branch", "")), str(j.get("base", "")), pieces,
+                       state or "", note, mtime(path))
         except (OSError, ValueError) as e:  # json.JSONDecodeError is a ValueError
             problems.append(f"trains/{base}: {one_line(e)}")
             continue
-        if tr.state == "landed" and (now - tr.at).total_seconds() > DROP_S:
-            continue
         trains.append(tr)
-    trains.sort(key=lambda t: t.at, reverse=True)
     return trains, problems
 
 
@@ -323,6 +344,75 @@ def read_batches(root, now):
     return out, problems
 
 
+def batch_state(x, now):
+    """A train's state as its newest batch tells it: batch running / green / red / stopped / quiet."""
+    status = batch_status(x, now)
+    if status == "running":
+        return "batch running"
+    if x.done:
+        return "batch red" if batch_counts(x)[2] else "batch green"
+    return "batch stopped" if x.stop else "batch quiet"
+
+
+def landing(tree, branch, base):
+    """(the branch head's 8-character hash, its commit time) when the branch has landed on origin/main, else None.
+    Landed = the local branch's head is an ancestor of origin/main and the branch carried commits of its own: base..head
+    is not empty, or without a usable base its reflog moved past the creation. A branch still at its base (a train before
+    its first commit, a round's tree) has nothing to land. A branch that is gone, a ref that does not resolve and a tree
+    with no origin/main are not landed: the train keeps its last state."""
+    if branch in NOT_TRAIN_BRANCHES:
+        return None
+    ref = f"refs/heads/{branch}"
+    rc, head, _ = run(["git", "-C", tree, "rev-parse", "--verify", "-q", ref + "^{commit}"])
+    head = head.strip()
+    if rc != 0 or not head:
+        return None
+    if run(["git", "-C", tree, "merge-base", "--is-ancestor", head, "origin/main"])[0] != 0:
+        return None
+    own = None
+    if re.fullmatch(r"[0-9a-fA-F]{4,40}", base or ""):
+        rc, out, _ = run(["git", "-C", tree, "rev-list", "--count", f"{base}..{head}"])
+        own = int(out) >= 1 if rc == 0 and out.strip().isdigit() else None
+    if own is None:
+        rc, out, _ = run(["git", "-C", tree, "reflog", "show", "--format=%H", ref])
+        own = rc == 0 and len(out.split()) >= 2
+    if not own:
+        return None
+    rc, out, _ = run(["git", "-C", tree, "log", "-1", "--format=%cI", head])
+    return head[:8], parse_ts(out.strip()) if rc == 0 and out.strip() else None
+
+
+def resolve_trains(file_trains, batches, tree, now):
+    """The trains shown. A trains/*.json is the lead's override of the facts below; a lead-mode batch whose branch has no
+    train file makes a train of its own (named by the branch). The state is the file's if it names one, else the newest
+    batch's. A branch on origin/main renders as landed whatever the file says, and a landed train drops off a day after
+    the newest of its file write, its head commit and its batch."""
+    newest = {}  # branch -> its newest batch (batches are newest first)
+    for x in batches:
+        newest.setdefault(x.start.get("branch") or "", x)
+    derived = {}
+    for x in batches:
+        br = x.start.get("branch") or ""
+        if br not in NOT_TRAIN_BRANCHES and br not in derived and x.start.get("mode") in DERIVE_MODES \
+                and not any(t.branch == br for t in file_trains):
+            derived[br] = Train(br, br, "", [], batch_state(x, now), "from batch events, no train file", x.last, derived=True)
+    out = []
+    for t in [*file_trains, *derived.values()]:
+        x = newest.get(t.branch) if t.branch else None
+        if not t.state and x:
+            t.state = batch_state(x, now)
+        lr = landing(tree, t.branch, t.base) if t.branch else None
+        if lr:
+            t.head, t.state = lr[0], "landed"
+            t.at = max([t.at, *(v for v in (lr[1], x.last if x else None) if v)])
+        t.state = t.state or "unknown"
+        if t.state == "landed" and (now - t.at).total_seconds() > DROP_S:
+            continue
+        out.append(t)
+    out.sort(key=lambda t: t.at, reverse=True)
+    return out
+
+
 @dataclasses.dataclass
 class Release:
     version: str
@@ -331,6 +421,8 @@ class Release:
     items: list
     at: dt.datetime  # the file's mtime
     start: int  # the cut window's start as minutes of the day, or None when the text has no window
+    tagged: bool = False  # v<version> is a tag on origin
+    tag_at: dt.datetime = None  # the tag's date, None when unknown
 
 
 CUT_WINDOW = re.compile(r"(\d{1,2}):(\d{2})\s*[–—-]\s*\d{1,2}:\d{2}")
@@ -387,19 +479,113 @@ def overdue(it, now):
     return it["state"] in ("in-train", "pending") and it.get("eta") is not None and minutes(it["eta"]) < n.hour * 60 + n.minute
 
 
-def read_workers(root, now):
-    """([(role, mtime, stale, lines, lines cut)], problems): workers/<role>.md, at most WORKER_LINES lines each."""
-    out, problems = [], []
+def release_tag(tree, version):
+    """(tagged, the tag's time or None, the reason or None): whether origin has the tag v<version> (git ls-remote, so no
+    local ref is read or moved). The time is the tagger's for an annotated tag, else the commit's, from the objects this
+    checkout has; None when it has neither."""
+    v = str(version).strip()
+    tag = "refs/tags/" + (v if re.match(r"v\d", v) else "v" + v)
+    rc, out, err = run(["git", "-C", tree, "ls-remote", "--tags", "origin", tag, tag + "^{}"], env={"GIT_TERMINAL_PROMPT": "0"})
+    if rc != 0:
+        print(f"board.py: git ls-remote: {one_line(err)[:200]}", file=sys.stderr)  # the log, never the body
+        return False, None, f"git ls-remote --tags origin failed (exit {rc}): the release state is the file's"
+    refs = {r: sha for sha, _, r in (ln.partition("\t") for ln in out.splitlines()) if r}
+    obj, commit = refs.get(tag), refs.get(tag + "^{}")
+    if not obj:
+        return False, None, None
+    when = None
+    if commit and commit != obj:  # annotated: the tag object carries the tagger's time
+        rc, body, _ = run(["git", "-C", tree, "cat-file", "tag", obj])
+        m = re.search(r"^tagger .* (\d+) [+-]\d{4}$", body, re.M) if rc == 0 else None
+        when = dt.datetime.fromtimestamp(int(m[1])).astimezone() if m else None
+    if when is None:
+        rc, body, _ = run(["git", "-C", tree, "log", "-1", "--format=%cI", commit or obj])
+        when = parse_ts(body.strip()) if rc == 0 and body.strip() else None
+    return True, when, None
+
+
+@dataclasses.dataclass
+class Worker:
+    role: str
+    status: str = ""  # the registry's status ("busy", "idle", ...); "" with no session
+    alive: bool = False
+    since: dt.datetime = None  # when the status last changed
+    updated: dt.datetime = None  # the session's updatedAt; None with no session
+    tree: str = ""  # the cwd's last component when no other session shares it: compared with a batch's tree, never shown
+    note: list = dataclasses.field(default_factory=list)  # workers/<role>.md, the non-blank lines
+    note_at: dt.datetime = None
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or not 0 < pid < 2 ** 31:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True  # it exists, under another user
+    except OSError:
+        return False
+    return True
+
+
+def epoch_ms(ms):
+    return dt.datetime.fromtimestamp(ms / 1000).astimezone()
+
+
+def read_sessions(path, roles):
+    """({role: its session}, problems): ~/.claude/sessions/<pid>.json, one per live session. A worker is a session
+    whose name, less a trailing ` (2)`, is a role; with several of a role the live one with the newest update wins.
+    Only <pid>.json is read (the .key files hold peer tokens). The cwd is kept as its last component, and only when
+    no other session shares it. No directory is no sessions."""
+    try:
+        names = sorted(n for n in os.listdir(path) if re.fullmatch(r"\d+\.json", n))
+    except FileNotFoundError:
+        return {}, []
+    except OSError as e:
+        return {}, [f"sessions: {e.strerror or type(e).__name__}"]
+    rows, bad = [], 0
+    for n in names:
+        try:
+            with open(os.path.join(path, n), encoding="utf-8") as fh:
+                j = json.load(fh)
+            name = re.sub(r"\s*\(\d+\)$", "", str(j["name"]))
+            rows.append((name, str(j.get("status", "")), pid_alive(j.get("pid")), epoch_ms(j["updatedAt"]),
+                         epoch_ms(j.get("statusUpdatedAt", j["updatedAt"])), os.path.basename(str(j.get("cwd", "")).rstrip("/"))))
+        except (OSError, ValueError, KeyError, TypeError, OverflowError):
+            bad += 1  # not a session file we can read; its name is unknown, so say only how many
+    shared = {}
+    for r in rows:
+        shared[r[5]] = shared.get(r[5], 0) + (1 if r[2] else 0)  # a dead session's cwd is nobody's
+    found = {}
+    for name, status, alive, updated, since, tree in rows:
+        if name not in roles:
+            continue
+        w = Worker(name, status if re.fullmatch(r"[a-z][a-z-]{0,19}", status) else "?", alive, since, updated,
+                   tree if alive and shared[tree] == 1 else "")
+        if name not in found or (w.alive, w.updated) > (found[name].alive, found[name].updated):
+            found[name] = w
+    return found, [f"sessions: {bad} unreadable file(s)"] if bad else []
+
+
+def read_workers(root, sessions, roles):
+    """([Worker], problems): the role sessions, each with its optional workers/<role>.md note. A role with a session or a
+    note is listed, the roles first in their order, then the other notes by name."""
+    found, problems = read_sessions(sessions, roles)
+    notes = {}
     for path in files(os.path.join(root, "workers"), ".md"):
         role = os.path.basename(path)[: -len(".md")]
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 lines = [ln.rstrip() for ln in fh.read().splitlines() if ln.strip()]
-            at = mtime(path)
+            notes[role] = (lines, mtime(path))
         except OSError as e:
             problems.append(f"workers/{role}.md: {one_line(e)}")
-            continue
-        out.append((role, at, (now - at).total_seconds() > QUIET_S, lines[:WORKER_LINES], max(0, len(lines) - WORKER_LINES)))
+    out = []
+    for role in [*roles, *sorted(r for r in notes if r not in roles)]:
+        if role in found or role in notes:
+            w = found.get(role) or Worker(role)
+            w.note, w.note_at = notes.get(role, ([], None))
+            out.append(w)
     return out, problems
 
 
@@ -484,10 +670,15 @@ class Board:
 
 
 def collect(a, now):
-    trains, p1 = read_trains(a.dir, now)
+    e_fetch = git_fetch(a.tree)  # first: a branch landed since the last fetch must show as landed
+    file_trains, p1 = read_trains(a.dir)
     batches, p2 = read_batches(a.dir, now)
-    workers, p3 = read_workers(a.dir, now)
+    trains = resolve_trains(file_trains, batches, a.tree, now)
+    workers, p3 = read_workers(a.dir, a.sessions, a.roles)
     release, p4 = read_release(a.dir)
+    if release is not None:
+        release.tagged, release.tag_at, why = release_tag(a.tree, release.version)
+        p4 += [why] if why else []
     problems = {"trains": p1, "batches": p2, "workers": p3, "release": p4, "gh": [], "log": []}
     prs = issues = None
     if not a.no_gh:
@@ -504,9 +695,8 @@ def collect(a, now):
                                for what, rows in (("pr", prs), ("issue", issues)) if rows is not None and len(rows) >= GH_LIMIT]
             if issues is not None:
                 issues = contributor_issues(issues, a.maintainer, now, int(a.board_issue) if a.board_issue else None)
-    e = git_fetch(a.tree)
-    if e:
-        problems["log"].append(e)
+    if e_fetch:
+        problems["log"].append(e_fetch)
     log, e = git_log(a.tree)
     if e:
         problems["log"].append(e)
@@ -584,7 +774,7 @@ def mood(b, now):
     for x in b.batches:
         if batch_status(x, now) == "running":
             return "furnace", f"{label(x)}: {batch_counts(x)[1]}/{x.start.get('total', '?')} green, running"
-    moving = [t for t in b.trains if t.state != "landed"]
+    moving = [t for t in b.trains if t.state in STATES and t.state != "landed"]  # a derived or unnamed state is no flight
     if moving:  # a train in flight whose batch writes no events yet
         return "furnace", f"{moving[0].name}: {moving[0].state}"
     if cur and cur.done and not red and recent:
@@ -602,14 +792,16 @@ def release_lines(b, now):
     if rel is None:
         return L + ["_No release planned._", ""]
     counts = {g: sum(1 for it in rel.items if it["state"] == g) for g, _ in RELEASE_GROUPS}
-    L += [f"### {code(rel.version)}: {rel.state}", "",
-          f"cut window {one_line(rel.cut)}; plan updated {clock(rel.at, now)}; "
+    tagged = f"**tagged**{' ' + local(rel.tag_at).strftime('%Y-%m-%d %H:%M') if rel.tag_at else ''}"
+    L += [f"### {code(rel.version)}: {tagged if rel.tagged else rel.state}", ""]
+    L += ["next: not opened", ""] if rel.tagged else []  # a newer version in release.json opens the next one
+    L += [f"cut window {one_line(rel.cut)}; plan updated {clock(rel.at, now)}; "
           + ", ".join(f"{counts[g]} {h.split(' (')[0].lower()}" for g, h in RELEASE_GROUPS), ""]
     for g, heading in RELEASE_GROUPS:
         L += [f"#### {heading} ({counts[g]})", ""]
         for it in (it for it in rel.items if it["state"] == g):
             eta = f", ETA {it['eta']}" if it.get("eta") else ""
-            flag = ("" if not overdue(it, now) else ", **overdue**") + ("" if not late(rel, it) else ", **late for the cut**")
+            flag = "" if rel.tagged else ("" if not overdue(it, now) else ", **overdue**") + ("" if not late(rel, it) else ", **late for the cut**")
             note = f" — {one_line(it['note'])}" if it.get("note") else ""
             L.append(f"- {one_line(it['what'])} ({one_line(it.get('owner', '?'))}){eta}{flag}{note}")
         L += [] if counts[g] else ["_None._", ""]
@@ -619,6 +811,42 @@ def release_lines(b, now):
 
 def more(n, shown):
     return [f"- … and {n - shown} more"] if n > shown else []
+
+
+def worker_lines(w, b, now):
+    """A worker's block. The registry gives the state and its age; the rest is what the lead's files say about the role,
+    never a guess: the train pieces it owns (their `owner`) and the newest batch run from its own tree (the session's cwd
+    names the batch's tree, and no other session shares that cwd). A session's cwd, pid and id are never shown."""
+    if w.updated is None:
+        head = "no session"
+    elif not w.alive:
+        head = "gone"
+    elif w.status == "idle":
+        head = f"idle since {clock(w.since, now)}"
+    else:
+        head = w.status
+    quiet = w.updated is not None and w.alive and w.status != "idle" and (now - w.updated).total_seconds() > BUSY_QUIET_S
+    L = [f"### {code(w.role)}: {head}" + (", **quiet 30+ min**" if quiet else ""), ""]
+    if w.updated is not None:
+        facts = [f"registry updated {ago((now - w.updated).total_seconds())} ({clock(w.updated, now)})"]
+        owns = [f"{code(t.name)} ({t.state})" for t in b.trains if t.state != "landed"
+                and any(w.role in re.split(r"[,/&+\s]+", str(p.get("owner", ""))) for p in t.pieces)]
+        if owns:
+            facts.append("owns pieces in " + ", ".join(owns[:3]))
+        mine = next((x for x in b.batches if w.tree and x.start.get("tree") == w.tree), None)
+        if mine:
+            facts.append(f"newest batch {code(mine.name)}: {batch_status(mine, now)}, {batch_progress(mine, now)}")
+        L.append("- " + "; ".join(facts))
+    if w.note:
+        text = [re.sub(r"^[-*]\s+", "", ln.strip()) for ln in w.note]
+        if (now - w.note_at).total_seconds() <= NOTE_FRESH_S:
+            L.append(f"- note (updated {clock(w.note_at, now)}):")
+            L += [f"  - {one_line(ln)}" for ln in text[:WORKER_LINES]]
+            if len(text) > WORKER_LINES:
+                L.append(f"  - … {len(text) - WORKER_LINES} more line(s) not shown")
+        else:
+            L.append(f"- (note from {clock(w.note_at, now)}, stale) {cut(text[0], SUBJECT_MAX)}")
+    return L + [""]
 
 
 def render(b, now):
@@ -635,13 +863,13 @@ def render(b, now):
     # Trains
     L += ["## Trains", ""]
     stamp = max((t.at for t in b.trains), default=None)
-    L += [f"_as of {clock(stamp, now)} (the newest train file)_" if stamp else "_no train files_", ""]
+    L += [f"_as of {clock(stamp, now)} (the newest train)_" if stamp else "_no trains_", ""]
     L += problems("trains")
     if not b.trains:
         L += ["_No trains in flight._", ""]
-    for t in b.trains:
+    for t in b.trains[: LIST_MAX["trains"]]:
         L += [f"### {code(t.name)}: {t.state}", f"updated {clock(t.at, now)}; branch {code(t.branch or '-')} on base {code(t.base or '-')}"
-              + (f"; {one_line(t.note)}" if t.note else ""), ""]
+              + (f"; on origin/main at {code(t.head)}" if t.head else "") + (f"; {one_line(t.note)}" if t.note else ""), ""]
         for p in t.pieces[: LIST_MAX["pieces"]]:
             pr = f" #{p['pr']}" if p.get("pr") else ""
             L.append(f"- {one_line(p['what'])} ({one_line(p.get('owner', '?'))}){pr}")
@@ -650,6 +878,7 @@ def render(b, now):
         if mine:
             L.append(f"- batch {code(mine.name)}: {batch_status(mine, now)}, {batch_progress(mine, now)}")
         L.append("")
+    L += more(len(b.trains), LIST_MAX["trains"]) + ([""] if len(b.trains) > LIST_MAX["trains"] else [])
 
     # Batches
     L += ["## Batches", ""]
@@ -676,16 +905,12 @@ def render(b, now):
         L += more(len(b.batches), LIST_MAX["batches"]) + [""]
 
     # Workers
-    L += ["## Workers", "", "_each file's own time; quiet for 3 hours reads as stale_", ""]
+    L += ["## Workers", "", "_from the Claude session registry; a note file is the session's own words_", ""]
     L += problems("workers")
     if not b.workers:
-        L += ["_No worker files._", ""]
-    for role, at, stale, lines, cutn in b.workers:
-        L += [f"### {code(role)}: {'stale since' if stale else 'updated'} {clock(at, now)}", ""]
-        L += [f"- {one_line(ln)}" for ln in lines]
-        if cutn:
-            L.append(f"- … {cutn} more line(s) not shown")
-        L.append("")
+        L += ["_No workers (no role session in the registry, no note file)._", ""]
+    for w in b.workers:
+        L += worker_lines(w, b, now)
 
     # Contributor PRs and issues
     L += ["## Contributor PRs and issues", ""]
@@ -749,6 +974,8 @@ def parser():
     ap.add_argument("--dir", default=os.path.expanduser("~/.cache/bloomery/board"), help="the state directory")
     ap.add_argument("--tree", default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
                     help="the checkout whose origin/main the landed list reads (default: the one holding this file)")
+    ap.add_argument("--sessions", default=os.path.expanduser("~/.claude/sessions"), help="the Claude session registry the workers come from")
+    ap.add_argument("--roles", default=",".join(ROLES), help="the session names that are workers, comma separated")
     ap.add_argument("--repo", help="OWNER/NAME for gh (default: the tree's origin remote)")
     ap.add_argument("--gh", default="gh", help="the gh program")
     ap.add_argument("--maintainer", action="append", help="a login whose comments do not list an issue (default midagedev)")
@@ -760,6 +987,7 @@ def parser():
 def parse(argv):
     a = parser().parse_args(argv)
     a.maintainer = tuple(a.maintainer or DEFAULT_MAINTAINERS)
+    a.roles = tuple(r.strip() for r in a.roles.split(",") if r.strip())
     a.board_issue = a.board_issue or a.publish
     return a
 
@@ -825,9 +1053,11 @@ PRIVACY_SAMPLES = {
     "admin": "log in as admin now",
     "host-sihyung": "ran on sihyung last night",
     "host-dopc": "the dopc host",
+    "host-ws": "ran on ws last night",
     "mac-home": "see /Users" + "/someone/repo/x",
     "root-path": "file /root" + "/bloomery-gate.lock",
     "linux-home": "at /home" + "/someone/x",
+    "tilde-home": "log at ~" + "/repo/x",
     "hf-token": "key hf" + "_abcdefghij12 leaked",
     "gh-token": "key gh" + "p_abcdef leaked",
     "token-assign": "my TOKEN: abc is here",
@@ -839,6 +1069,7 @@ CLEAN = (
     "serve: named 400s for token limits, /tokenize content, unserved samplers (#24-#26)",
     "- #24 `serve: a token limit outside -1..=i32::MAX is a 400 naming the field`",
     "the tokens, the Tokenizer and a token budget of 4096",
+    "5 rows/s, the news, lows, a ws2 pool and about ~5 min or ~10 %",
 )
 
 
@@ -879,10 +1110,20 @@ else:
     os.chmod(path, 0o755)
 
 
-def git(tree, *args):
+def git(tree, *args, date=None):
     env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-    subprocess.run(["git", "-C", tree, *args], check=True, capture_output=True, env=env)
+    if date:
+        env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+    return subprocess.run(["git", "-C", tree, *args], check=True, capture_output=True, text=True, env=env).stdout.strip()
+
+
+def commit(tree, name, date):
+    """A commit that adds the file `name`, dated `date` (ISO), and its hash."""
+    write(os.path.join(tree, name), name)
+    git(tree, "add", name)
+    git(tree, "-c", "commit.gpgsign=false", "commit", "-q", "-m", name, date=date)
+    return git(tree, "rev-parse", "HEAD")
 
 
 def capture(fn, *args):
@@ -897,7 +1138,243 @@ def capture(fn, *args):
     return rc, out.getvalue(), err.getvalue()
 
 
+def attempt(c, name, fn):
+    """One case whose body may raise on a board.py without the feature: a raise is a FAIL, not a crash."""
+    try:
+        cond, detail = fn()
+    except (Exception, SystemExit) as e:
+        cond, detail = False, f"raised {type(e).__name__}: {e}"
+    c.check(name, cond, detail)
+
+
+def block(text, head):
+    """The part of text from the heading line that starts with `head` to the next heading of its level or above ('' when
+    there is none)."""
+    i = text.find(head)
+    if i < 0:
+        return ""
+    m = re.search(r"\n#{1,%d} " % (len(head) - len(head.lstrip("#"))), text[i + 1:])
+    return text[i: i + 1 + m.start()] if m else text[i:]
+
+
+def auto_cases(c, tmp, now):
+    """The derived state (boardauto, 2026-10-12): workers from a session registry, trains from batches and git, the release
+    from its tag. Every case goes through collect/render/finish, so each is red on a board.py that reads hand-written files only."""
+    ago_s = lambda s: now - dt.timedelta(seconds=s)
+    ms = lambda s: int(ago_s(s).timestamp() * 1000)
+    iso = lambda h: ago_s(h * 3600).isoformat(timespec="seconds")
+    empty = os.path.join(tmp, "no-sessions")
+    os.makedirs(empty, exist_ok=True)
+
+    def render_of(argv, unfiltered=False):
+        b = capture(collect, parse(argv), now)[0]  # a fetch that fails in a fixture tree is not noise on this run's stderr
+        lines = render(b, now)
+        return b, ("\n".join(lines) if unfiltered else finish(lines)[0])
+
+    # ---- workers: the registry
+    wroot, wsess = os.path.join(tmp, "w-board"), os.path.join(tmp, "w-sessions")
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    dead, live, sid = p.pid, os.getpid(), "5e55-1d00-feed-cafe"
+    main_cwd, w9_cwd = "/Users" + "/zz/repo/bloomery", "/Users" + "/zz/repo/bloomery-w9"
+
+    def sess(n, name, status, age, cwd=main_cwd, pid=live, since=None):
+        write(os.path.join(wsess, f"{n}.json"), json.dumps({
+            "pid": pid, "sessionId": sid + str(n), "cwd": cwd, "name": name, "status": status, "kind": "interactive",
+            "startedAt": ms(86400), "updatedAt": ms(age), "statusUpdatedAt": ms(age if since is None else since)}))
+
+    sess(1, "leader", "busy", 300)
+    sess(2, "vision", "idle", 3 * 3600)
+    sess(3, "unitier", "busy", 45 * 60)
+    sess(4, "common", "busy", 600, pid=dead)
+    sess(5, "quant", "busy", 1200)
+    sess(6, "quant (2)", "idle", 120)
+    sess(7, "toktape", "busy", 60, cwd=w9_cwd)
+    sess(8, "toktape", "busy", 30, cwd=w9_cwd, pid=dead)
+    sess(9, "gadak-32", "idle", 40 * 3600)
+    sess(10, "bloomery-83", "idle", 600)
+    write(os.path.join(wsess, "4242.deadbeef.key"), json.dumps({"peerToken": "PEERSECRET"}))
+    write(os.path.join(wroot, "trains/tA.json"), json.dumps({"name": "tA", "branch": "", "state": "building", "pieces": [
+        {"what": "x", "owner": "quant"}, {"what": "y", "owner": "leader, common"}]}), now, 600)
+    write(os.path.join(wroot, "trains/tB.json"), json.dumps({"name": "tB", "branch": "", "state": "landed", "pieces": [{"what": "z", "owner": "vision"}]}), now, 600)
+    write(os.path.join(wroot, "workers/quant.md"), "- ETA 16:30\nfix x\n", now, 600)
+    write(os.path.join(wroot, "workers/vision.md"), "first line of an old note\nsecond line\n", now, 2 * 3600)
+    write(os.path.join(wroot, "workers/extra.md"), "round: extra\n", now, 60)
+    write(os.path.join(wroot, "batch/wb1.jsonl"), "\n".join([
+        ev(now, 1200, "start", total=3, tier="fixture", lanes=2, mode="round", predicted_wall=3600, tree="bloomery-w9", branch="w9"),
+        ev(now, 900, "item", name="g1", rc=0, secs=1, lane="A")]) + "\n", now, 900)
+    write(os.path.join(wroot, "batch/wm.jsonl"), "\n".join([
+        ev(now, 1200, "start", total=3, tier="fixture", lanes=2, mode="lead", predicted_wall=3600, tree="bloomery", branch="main"),
+        ev(now, 900, "item", name="g2", rc=0, secs=1, lane="A")]) + "\n", now, 900)
+    wargs = ["--dir", wroot, "--tree", os.path.join(tmp, "no-such-tree"), "--no-gh", "--sessions", wsess]
+    wb, text = render_of(wargs)
+    raw = render_of(wargs, unfiltered=True)[1]
+    ws = block(text, "## Workers")
+    for name, want in (
+        ("workers: a busy session is busy, with the age of its registry update", ["### `leader`: busy\n", "registry updated 5 min ago (14:55)"]),
+        ("workers: an idle session says since when", ["### `vision`: idle since 12:00\n"]),
+        ("workers: a busy session whose registry has not moved for 30 min is flagged", ["### `unitier`: busy, **quiet 30+ min**"]),
+        ("workers: a session whose pid is not alive is gone", ["### `common`: gone\n"]),
+        ("workers: of a role's sessions the newest live one speaks (`quant (2)` is the role `quant`)", ["### `quant`: idle since 14:58\n"]),
+        ("workers: a live session beats a dead twin of its role", ["### `toktape`: busy\n"]),
+        ("workers: a session alone in its cwd maps to the batch run from that tree", ["newest batch `wb1`: running, 1/3 done (1 green, 0 red)"]),
+        ("workers: a train piece's owner is named, a landed train's is not", ["owns pieces in `tA` (building)"]),
+        ("workers: a fresh note nests under the state, a bullet marker stripped", ["- note (updated 14:50):\n  - ETA 16:30\n  - fix x"]),
+        ("workers: an old note is its first line, marked stale", ["- (note from 13:00, stale) first line of an old note"]),
+        ("workers: a note with no session is headed so", ["### `extra`: no session"])):
+        miss = [w for w in want if w not in ws]
+        c.check(name, not miss, f"missing {miss} in {ws}")
+    c.check("workers: exactly one session is flagged quiet", ws.count("quiet 30+ min") == 1, ws)
+    c.check("workers: a vision note older than 30 min does not show its second line", "second line" not in ws, ws)
+    c.check("workers: the shared main cwd maps to no batch", ws.count("newest batch") == 1 and "owns pieces in `tB`" not in ws, ws)
+    c.check("workers: a session's cwd is not shown even as its last component", "bloomery-w9" not in ws, ws)
+    c.check("workers: only the role sessions are listed", "gadak" not in ws and "bloomery-83" not in ws and block(ws, "### `toktape`").count("###") == 1, ws)
+    c.check("workers: the roles come first in their order, then the other notes",
+            [m for m in re.findall(r"### `(\w+)`", ws)] == ["leader", "vision", "unitier", "common", "quant", "toktape", "extra"], re.findall(r"### `(\w+)`", ws))
+    leaks = [x for x in ("/Users" + "/zz", sid, "PEERSECRET") if x in raw] + (["pid"] if re.search(rf"(?<![\w.:]){live}(?![\w.:])|(?<![\w.:]){dead}(?![\w.:])", raw) else [])
+    c.check("workers: a session's cwd, pid and id are never rendered, nor a .key file's token", not leaks, f"rendered {leaks}")
+    c.check("workers: the registry is read as it is: no problem for a clean one", not wb.problems["workers"], wb.problems["workers"])
+    write(os.path.join(wsess, "11.json"), "{broken")
+    bb, text = render_of(wargs)
+    c.check("workers: an unreadable session file is counted, its name never shown",
+            bb.problems["workers"] == ["sessions: 1 unreadable file(s)"] and "- problem: sessions: 1 unreadable file(s)" in text and "11.json" not in text, bb.problems["workers"])
+    os.remove(os.path.join(wsess, "11.json"))
+    nb, text = render_of(["--dir", os.path.join(tmp, "nothing"), "--tree", os.path.join(tmp, "no-such-tree"), "--no-gh", "--sessions", os.path.join(tmp, "nope")])
+    c.check("workers: no registry and no notes is an empty section, not a problem",
+            nb.problems["workers"] == [] and "_No workers (no role session" in text, nb.problems["workers"])
+    rb, text = render_of(wargs + ["--roles", "vision, nobody"])
+    got = re.findall(r"### `(\w+)`", block(text, "## Workers"))
+    c.check("workers: --roles picks the sessions that are workers (quant is left with its note only)", got == ["vision", "extra", "quant"], got)
+
+    # ---- trains: batch events and git
+    torig, ttree, troot = (os.path.join(tmp, d) for d in ("t-origin.git", "t-tree", "t-board"))
+    os.makedirs(ttree)
+    git(tmp, "init", "-q", "--bare", "-b", "main", torig)
+    git(ttree, "init", "-q", "-b", "main")
+    git(ttree, "remote", "add", "origin", torig)
+    c0 = commit(ttree, "c0", iso(96))
+    git(ttree, "push", "-q", "origin", "main")
+    heads = {}
+    for br, hours, after in (("old", 72, None), ("landed1", 2, "old"), ("landed2", 1, "landed1")):
+        git(ttree, "checkout", "-q", "-b", br)
+        heads[br] = commit(ttree, br, iso(hours))
+        git(ttree, "push", "-q", "origin", f"{br}:main")
+    git(ttree, "checkout", "-q", "main")
+    for br in ("open1", "dr1"):
+        git(ttree, "checkout", "-q", "-b", br, "main")
+        heads[br] = commit(ttree, br, iso(1))
+    git(ttree, "checkout", "-q", "main")
+    for br in ("empty1", "empty2"):
+        git(ttree, "branch", br, c0)
+
+    def tfile(name, j, age):
+        write(os.path.join(troot, f"trains/{name}.json"), json.dumps(j), now, age)
+
+    b8 = c0[:8]
+    tfile("tl", {"name": "tl", "branch": "landed1", "base": b8, "state": "building", "pieces": []}, 3 * 86400)
+    tfile("tdrop", {"name": "tdrop", "branch": "old", "base": b8, "state": "building", "pieces": []}, 3 * 86400)
+    tfile("to", {"name": "to", "branch": "open1", "base": b8, "state": "static", "pieces": []}, 600)
+    tfile("te", {"name": "te", "branch": "empty1", "base": b8, "state": "building", "pieces": []}, 600)
+    tfile("tx", {"name": "tx", "state": "landed: v0.3.0 released (b00ff641)", "pieces": []}, 600)
+    tfile("ts", {"name": "ts", "branch": "dr1", "pieces": []}, 600)
+
+    def bfile(stem, branch, mode, end, red=False, age=7000):
+        evs = [ev(now, age, "start", total=2, tier="fixture", lanes=2, mode=mode, predicted_wall=3600, tree=f"bloomery-{stem}", branch=branch),
+               ev(now, age - 100, "item", name="g1", rc=1 if red else 0, secs=1, lane="A")]
+        if end == "done":
+            evs.append(ev(now, age - 200, "done", total=2, red=int(red), wall=9))
+        write(os.path.join(troot, f"batch/{stem}.jsonl"), "\n".join(evs) + "\n", now, age - (200 if end == "done" else 100))
+
+    bfile("dl", "landed2", "lead", "done")
+    bfile("dg", "gone1", "lead", "done")
+    bfile("de", "empty2", "lead", "done")
+    bfile("drun", "dr2", "lead", "run", age=600)
+    bfile("dred", "dr3", "lead", "done", red=True)
+    bfile("dh", "HEAD", "lead", "done")
+    bfile("dm", "main", "lead", "done")
+    bfile("rr", "rb1", "round", "run", age=600)
+    bfile("nn", "nb1", "none", "done")
+    bfile("fdr1", "dr1", "lead", "run", age=600)
+    targs = ["--dir", troot, "--tree", ttree, "--no-gh", "--sessions", empty]
+    tb, text = render_of(targs)
+    ts = block(text, "## Trains")
+    names = re.findall(r"### `([^`]+)`", ts)
+    c.check("trains: the rows are the train files and the lead batches' branches, nothing else",
+            sorted(names) == sorted(["tl", "to", "te", "tx", "ts", "landed2", "gone1", "empty2", "dr2", "dr3"]), names)
+    for name, want in (
+        ("trains: a file train whose branch is on origin/main is landed, with its head, whatever the file says", [f"### `tl`: landed\n", f"on origin/main at `{heads['landed1'][:8]}`"]),
+        ("trains: a batch's branch with no train file is a row, landed when its branch is on origin/main", ["### `landed2`: landed\n", f"on origin/main at `{heads['landed2'][:8]}`"]),
+        ("trains: a derived row says it comes from batch events", ["from batch events, no train file"]),
+        ("trains: a branch not on origin/main keeps the file's state", ["### `to`: static\n"]),
+        ("trains: a branch still at its base has nothing to land (base..head is empty)", ["### `te`: building\n"]),
+        ("trains: a derived row's branch with no commit of its own has nothing to land (its reflog never moved)", ["### `empty2`: batch green\n"]),
+        ("trains: a derived row whose branch is gone keeps its last batch state", ["### `gone1`: batch green\n"]),
+        ("trains: a running lead batch is a row in state batch running", ["### `dr2`: batch running\n"]),
+        ("trains: a red lead batch is a row in state batch red", ["### `dr3`: batch red\n"]),
+        ("trains: a file with no state takes its batch's", ["### `ts`: batch running\n"]),
+        ("trains: a state that is no state is a note, the train's state unknown", ["### `tx`: unknown\n", "landed: v0.3.0 released (b00ff641)"])):
+        miss = [w for w in want if w not in ts]
+        c.check(name, not miss, f"missing {miss} in {ts}")
+    c.check("trains: an old file whose branch landed a day ago drops off", "tdrop" not in ts, ts)
+    c.check("trains: the state-less and the odd files are no problem", tb.problems["trains"] == [], tb.problems["trains"])
+    c.check("trains: a round's batch, a batch with no ledger, a detached tree and the trunk make no row", all(f"`{n}`" not in ts for n in ("rb1", "nb1", "HEAD", "main")), ts)
+    attempt(c, "trains: a derived row in a state other than running does not hold the furnace art",
+            lambda: (mood(Board([Train("d", "d", "", [], "batch green", "", now, derived=True)], [], [], None, None, None, None, {}, True), now)[0] in IDLE, "furnace"))
+
+    # ---- release: the tag
+    rroot2 = os.path.join(tmp, "r-board")
+    git(ttree, "-c", "tag.gpgsign=false", "tag", "-a", "v0.3.0", "-m", "v0.3.0", heads["landed1"], date="2026-10-10T12:00:00+00:00")
+    git(ttree, "tag", "v0.5.0", heads["landed2"])
+    git(ttree, "push", "-q", "origin", "v0.3.0", "v0.5.0")
+
+    def release(version, state="collecting"):
+        write(os.path.join(rroot2, "release.json"), json.dumps({"version": version, "cut": "2026-10-11 22:00–24:00 KST", "state": state, "items": [
+            {"what": "a", "owner": "o", "state": "landed", "eta": None}, {"what": "b", "owner": "o", "state": "pending", "eta": "23:30"}]}), now, 300)
+        return render_of(["--dir", rroot2, "--tree", ttree, "--no-gh", "--sessions", empty])
+
+    ann = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    light = ago_s(3600).strftime("%Y-%m-%d %H:%M")
+    rb, text = release("0.3.0")
+    rel = block(text, "## Release")
+    c.check("release: a version with its tag on origin is tagged, with the annotated tag's date, whatever its state says",
+            f"### `0.3.0`: **tagged** {ann}\n" in rel and "collecting" not in rel, rel)
+    c.check("release: a tagged release says the next is not opened, and flags no item late", "next: not opened" in rel and "late for the cut" not in rel and "overdue" not in rel, rel)
+    rel = block(release("v0.5.0", "union-batch")[1], "## Release")
+    c.check("release: a lightweight tag is dated by its commit, and a leading v in release.json is the tag's own", f"### `v0.5.0`: **tagged** {light}\n" in rel, rel)
+    rb, text = release("0.3.1")
+    rel = block(text, "## Release")
+    c.check("release: a version with no tag on origin keeps its state and its flags, with no next line",
+            "### `0.3.1`: collecting" in rel and "next: not opened" not in rel and "late for the cut" in rel and rb.problems["release"] == [], rel)
+    os.rename(torig, torig + ".gone")
+    rb, text = release("0.3.0")
+    c.check("release: a tag lookup that fails is a named problem over the file's own state",
+            any(p.startswith("git ls-remote --tags origin failed") for p in rb.problems["release"]) and "### `0.3.0`: collecting" in text, rb.problems["release"])
+    os.rename(torig + ".gone", torig)
+
+    # ---- privacy: the paths and hosts the board must never carry
+    spec_lines = ["/Users" + "/x/y", "/root" + "/z", "~" + "/x", "192" + ".168.1.2", "100" + ".64.0.1", "a.tail" + ".ts" + ".net", "admin", "sihyung", "dopc", "ws", "on ws today"]
+    kept = [ln for ln in spec_lines if not withhold([ln])[1]]
+    c.check("privacy: every path, address and host name of the spec is withheld", not kept, f"kept {kept}")
+    write(os.path.join(wroot, "workers/quant.md"), "round: x\nran on ws and ~" + "/repo\n", now, 60)
+    text = render_of(wargs)[1]
+    c.check("privacy: a worker note naming a host and a home is withheld from the full body", "ran on ws" not in text and "~/" not in text and text.endswith("\n1 lines withheld\n"), text[-120:])
+
+
 def self_test():
+    """The cases, with HOME moved into a temp dir: every default path (--sessions, --dir) is then the test's own."""
+    home = os.environ.get("HOME")
+    with tempfile.TemporaryDirectory(prefix="board-home-") as h:
+        os.environ["HOME"] = h
+        try:
+            return run_cases()
+        finally:
+            if home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home
+
+
+def run_cases():
     c = Cases()
     now = dt.datetime(2026, 10, 11, 15, 0, 0).astimezone()
 
@@ -943,7 +1420,8 @@ def self_test():
         b = collect(parse(args[:-2]), now)
         text = finish(render(b, now))[0]
         c.check("empty: no state directory renders each section empty", all(s in text for s in (
-            "_No release planned._", "_No trains in flight._", "_No batch in the last day._", "_No worker files._", "_No open PRs._", "_None._")), text)
+            "_No release planned._", "_No trains in flight._", "_No batch in the last day._", "_No workers (no role session in the registry, no note file)._",
+            "_No open PRs._", "_None._")), text)
         c.check("landed: a subject is cut to 100 characters", ("x" * 99 + "…") in text and "x" * 100 not in text, text)
 
         # Trains, with a batch matched by branch.
@@ -998,16 +1476,19 @@ def self_test():
             ("trains: a train shows its state, branch and pieces with PR numbers", ["### `train3`: batch", "branch `train3` on base `abc1234`", "- kv pool (kvpool) #41", "- spark docs (sparkdoc)"]),
             ("trains: a fresh landed train stays", ["`train4`: landed"]),
             ("trains: the train shows the batch matched by its branch", ["- batch `20261011-140000`: running, 3/5 done (1 green, 1 skip, 1 red), predicted end 16:00"]),
-            ("trains: an unreadable and an invalid file are named", ["- problem: trains/bad.json:", "- problem: trains/odd.json: state \"sleeping\" is none of"]),
+            ("trains: an unreadable file is named", ["- problem: trains/bad.json:"]),
             ("batches: red items are named with their rc and lane", ["  - red: `gate-b` rc 1, lane B, 200 s", "tree `bloomery-train3`, branch `train3`, fixture tier, round ledger"]),
             ("batches: a bad event line is a named problem", ["- problem: batch/corrupt.jsonl: 1 unreadable event line(s)", "`corrupt`: running, 0/1 done"]),
             ("batches: an ended batch shows its DONE line", ["`20261011-100000`: ended, 1/1 done (1 green, 0 red)", "`DONE total=1 red=0 wall=95s laneA=90s laneB=0s`"]),
             ("batches: a stopped batch says so", ["`20261011-090000`: stopped (signal) at"]),
             ("batches: a batch with no DONE and no event for hours says when it last spoke", ["`20261011-080000`: no DONE, last event"]),
             ("batches: only the last run of a reused log name counts", ["`reused`: running, 1/2 done"]),
-            ("workers: a fresh file shows its lines under its time", ["### `kvpool`: updated 14:50", "- ETA 16:30"]),
-            ("workers: a file quiet for 3 hours is stale since its time", ["### `sparkdoc`: stale since 11:00"]),
-            ("workers: lines past six are counted, not shown", ["- line 5", "- … 3 more line(s) not shown"]),
+            # PIN(2026-10-12): the three worker-note cases follow the new contract (boardauto spec 1): a note with no session is
+            # headed "no session", a note newer than 30 min shows its lines nested under "note (updated HH:MM)", an older one
+            # shows its first line as "(note from HH:MM, stale)". Derived from NOTE_FRESH_S; each is red on the previous board.py.
+            ("workers: a fresh note shows its lines under its time", ["### `kvpool`: no session", "- note (updated 14:50):", "  - ETA 16:30"]),
+            ("workers: a note older than 30 min is a stale first line", ["### `sparkdoc`: no session", "- (note from 11:00, stale) round: spark docs"]),
+            ("workers: lines past six are counted, not shown", ["  - line 5", "  - … 3 more line(s) not shown"]),
             ("prs: a train piece's PR is in its train", ["#41 `kv pool '@mention' <b>x</b>` by `kvpool`: in train train3 (batch)"]),
             ("prs: a draft and a changes-requested PR are waiting, the rest not yet picked",
              ["#42 `a draft` by `ext1`: waiting (draft)", "#43 `needs work` by `ext2`: waiting (changes requested)", "#44 `ready, unpicked` by `ext3`: not yet picked"]),
@@ -1024,14 +1505,16 @@ def self_test():
             c.check(name, absent not in text, f"{absent} is in the body")
 
         # The privacy filter inside the full path: a worker line with a home path is withheld and counted.
+        # PIN(2026-10-12): odd.json (state "sleeping") is a note now, not a problem (boardauto spec 2), so it is no exit-1 fixture
+        c.check("trains: an unknown state is a note, not a problem", "trains/odd.json" not in text and "sleeping" in text, "odd.json named as a problem or its state lost")
         for f in ("trains/bad.json", "trains/odd.json", "batch/corrupt.jsonl"):  # the problem fixtures: they make the exit 1
             os.remove(os.path.join(root, f))
         write(os.path.join(root, "workers/leaky.md"), "round: x\nsee /Users" + "/someone/repo for the log\n", now, 60)
         text = finish(render(collect(parse(args), now), now))[0]
         c.check("privacy: a leaking worker line is gone from the full body and counted", "someone" not in text and text.endswith("\n1 lines withheld\n"), text[-200:])
-        _, _, err = capture(main, args[:-2] + ["--explain"], now)
+        _, _, err = capture(main, args[:-2] + ["--explain"], now)  # PIN(2026-10-12): a note line is nested two spaces under "note (updated HH:MM):"
         c.check("privacy: stderr counts what was withheld and --explain names the line and its pattern",
-                "1 lines withheld (mac-home)" in err and "withheld (mac-home): - see /Users" in err and "withheld (mac-home): " not in capture(main, args[:-2], now)[2], err)
+                "1 lines withheld (mac-home)" in err and "withheld (mac-home):   - see /Users" in err and "withheld (mac-home): " not in capture(main, args[:-2], now)[2], err)
         os.remove(os.path.join(root, "workers/leaky.md"))
 
         # Print mode and publish mode send the same body, through gh with the issue number, the repo and the body on stdin.
@@ -1161,6 +1644,8 @@ def self_test():
         block = text.split("```")[1].splitlines()
         c.check("art: the body opens with the fenced art and one caption line, above the Release section",
                 text.startswith("```text\n") and 2 <= len(block) <= ART_ROWS + 2 and max(len(ln) for ln in block) <= ART_COLS and text.index("```text") < text.index("## Release"), text[:300])
+
+        auto_cases(c, tmp, now)
 
     print(f"self-test: {'FAIL' if c.bad else 'ok'} ({c.n} cases, {c.bad} failed)")
     return 1 if c.bad else 0
