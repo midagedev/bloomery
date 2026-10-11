@@ -84,7 +84,13 @@
 //! named `QuantColumn` fault with its 128-value block refused: a NaN scale,
 //! and every other byte of the five planes what the same input with that
 //! block zeroed leaves; its refusals (no columns, more than the activation
-//! holds, a short input).
+//! holds, a short input). Case `swiglu_clamp`: the same launch under ik's
+//! clamped SwiGLU (`GemmKernels::enqueue_swiglu_act_quant`, limits 10 and 0.5)
+//! bit for bit the CPU tier's ik-verified `qdot::swiglu_clamp` then
+//! `Gpu::enqueue_quantize_gemm`, a `Q8Act` fill (`enqueue_swiglu_act_quant_q8`)
+//! holding the `GemmAct`'s codes and scales, a NaN up value refused as
+//! `QuantColumn` where the clamp alone would make it the limit, a non-finite
+//! limit refused by name.
 //!
 //! And once per case: a rerun bit-identical, the route and the GEMM
 //! captured into a graph whose replay equals the eager launch. Then the
@@ -187,6 +193,7 @@ mod gate {
     };
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
+    use bloomery_gpu::kquant::{Act, act::silu_ik};
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::rounding::gamma;
@@ -1966,6 +1973,121 @@ mod gate {
         Ok(ok && nan_ok && all)
     }
 
+    /// Clamp limits of the clamped SwiGLU quantizer case: GLM-5.3's 10, and
+    /// 0.5, under the activations' scale, so both clamps (`silu(g)` above the
+    /// limit, `u` outside ±limit) act on a share of the values.
+    const SWIGLU_LIMITS: [f32; 2] = [10.0, 0.5];
+
+    /// The clamped SwiGLU quantizer (`GemmKernels::enqueue_swiglu_act_quant`
+    /// under `Act::SwigluClamp`) against the CPU tier's ik-verified
+    /// `qdot::swiglu_clamp` quantized by `Gpu::enqueue_quantize_gemm`: the
+    /// same planes bit for bit, and a `Q8Act` filled by
+    /// `enqueue_swiglu_act_quant_q8` holding the `GemmAct`'s codes and
+    /// scales. At limit 0.5 values reach the clamp and the planes differ from
+    /// the unclamped rule's. A NaN up value is refused as `QuantColumn` where the
+    /// clamp alone would carry it to the limit, and a non-finite limit is
+    /// refused by name.
+    fn swiglu_clamp_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("swiglu") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        let mut ok = true;
+        for k in [768usize, 2048] {
+            let n = 8;
+            let scale = |v: Vec<f32>| v.into_iter().map(|x| 2.0 * x).collect::<Vec<f32>>();
+            let gh = scale(activations(k, n, 6600 + k as u32));
+            let uh = scale(activations(k, n, 6700 + k as u32));
+            let (g, u) = (
+                DeviceBuffer::from_host(stream, &gh)?,
+                DeviceBuffer::from_host(stream, &uh)?,
+            );
+            let mut plain = GemmAct::new(stream, n, k)?;
+            dev.gk
+                .enqueue_swiglu_quant(stream, &g, &u, n, &mut plain, sink)?;
+            for limit in SWIGLU_LIMITS {
+                let rule = Act::SwigluClamp { limit };
+                let live = gh
+                    .iter()
+                    .zip(&uh)
+                    .filter(|&(&gv, &uv)| silu_ik(gv) > limit || uv.abs() > limit)
+                    .count();
+                let mut hh = vec![0.0f32; n * k];
+                qdot::swiglu_clamp(&gh, &uh, limit, &mut hh);
+                let h = DeviceBuffer::from_host(stream, &hh)?;
+                let mut fused = GemmAct::new(stream, n, k)?;
+                let mut split = GemmAct::new(stream, n, k)?;
+                let mut gemv = Q8Act::with_k(stream, n, k)?;
+                dev.gk
+                    .enqueue_swiglu_act_quant(stream, &g, &u, rule, n, &mut fused, sink)?;
+                gpu.enqueue_quantize_gemm(&h, n, &mut split, sink)?;
+                dev.gk
+                    .enqueue_swiglu_act_quant_q8(stream, &g, &u, rule, n, &mut gemv, sink)?;
+                stream.synchronize()?;
+                let (pf, ps, pp) = (
+                    planes(&fused, stream)?,
+                    planes(&split, stream)?,
+                    planes(&plain, stream)?,
+                );
+                let eq_host_clamp = pf.0 == ps.0
+                    && pf.1 == ps.1
+                    && pf.2 == ps.2
+                    && pf.3 == ps.3
+                    && bits_equal(&pf.4, &ps.4);
+                let clamp_acts = limit > 1.0 || (live > 0 && pf.0 != pp.0);
+                let q8_eq = gemv.q3().to_host_vec(stream)? == pf.0
+                    && bits_equal(&gemv.d8().to_host_vec(stream)?, &pf.4);
+                let pass = eq_host_clamp && clamp_acts && q8_eq;
+                println!(
+                    "gemm case=swiglu_clamp K={k} cols={n} limit={limit} live_values={live} \
+                     planes_eq_host_clamp_bits={eq_host_clamp} differs_from_unclamped={clamp_acts} \
+                     q8act_eq_gemmact={q8_eq} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
+        // A NaN up value under the clamp: the clamp alone would make it the
+        // limit; the block is refused and the fault named.
+        let k = 768;
+        let rule = Act::SwigluClamp { limit: 0.5 };
+        let mut act = GemmAct::new(stream, 8, k)?;
+        let gh = activations(k, 8, 77);
+        let mut uh = activations(k, 8, 78);
+        uh[3 * k + 5] = f32::NAN;
+        gpu.clear_fault()?;
+        let (g, u) = (
+            DeviceBuffer::from_host(stream, &gh)?,
+            DeviceBuffer::from_host(stream, &uh)?,
+        );
+        dev.gk
+            .enqueue_swiglu_act_quant(stream, &g, &u, rule, 8, &mut act, sink)?;
+        stream.synchronize()?;
+        let fault = gpu.take_fault()?;
+        let refused = act.d8().to_host_vec(stream)?[3 * (k / 128)].is_nan();
+        let nan_ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn)) && refused;
+        println!(
+            "gemm case=swiglu_clamp fault=nan_up fault_raised={} block_refused={refused} {}",
+            fault.is_some(),
+            verdict(nan_ok)
+        );
+        ok &= nan_ok;
+        let inf_limit = Act::SwigluClamp {
+            limit: f32::INFINITY,
+        };
+        let bad_limit = dev
+            .gk
+            .enqueue_swiglu_act_quant(stream, &g, &u, inf_limit, 8, &mut act, sink)
+            .is_err();
+        println!(
+            "gemm case=swiglu_clamp refusal=non_finite_limit refused={bad_limit} {}",
+            verdict(bad_limit)
+        );
+        Ok(ok && nan_ok && bad_limit)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         if std::env::args().any(|a| a == "--bench-kernels") {
@@ -2091,6 +2213,7 @@ mod gate {
         ok &= dense_case(&dev)?;
         ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
+        ok &= swiglu_clamp_case(&dev)?;
         ok &= faults(&dev)?;
         ok &= sel_faults(&dev)?;
         ok &= site_mask(&dev)?;

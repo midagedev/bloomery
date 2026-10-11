@@ -25,13 +25,18 @@ use cuda_device::{
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
+// `gemm_swiglu_quant`'s contract spells the largest gate·up rule code as a
+// literal.
+const _: () =
+    assert!(crate::kquant::act::ACT_SILU_MUL == 0 && crate::kquant::act::ACT_SWIGLU_CLAMP == 1);
+
 #[cuda_module]
 mod gemm_kernels {
     use super::*;
     use crate::cores::{q4k_scale_min, q6k_dequant};
-    use crate::elem::silu_mul;
     use crate::flash::half_bits_to_f32;
     use crate::iq::iq4_word;
+    use crate::kquant::act::apply;
     use crate::q8_1_quant_vals;
     use cuda_device::async_copy::{
         cp_async_ca_4, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
@@ -661,12 +666,16 @@ mod gemm_kernels {
     /// SwiGLU of `n_cols` slot columns of `256 · n_sb` values quantized to
     /// q8_1 in one launch, one 32-thread block per 128-value block: lane `l`
     /// of block `(col, b)` takes values `128·b + 4·l .. +3` of column `col` of
-    /// `g` and `u`, forms `elem::silu_mul` of each pair, and hands the four
-    /// to `q8_1_quant_vals` — the values `elem::swiglu` stores and the bytes
+    /// `g` and `u`, forms the gate·up rule `kquant::act::apply(act, limit, ..)`
+    /// of each pair — `elem::silu_mul` (`ACT_SILU_MUL`) or ik's clamped SwiGLU
+    /// at `limit` (`ACT_SWIGLU_CLAMP`), the contract admits those two codes
+    /// alone — and hands the four to `q8_1_quant_vals`: the values
+    /// `elem::swiglu` stores under the first rule and the bytes
     /// `q3k_quantize_q8_1` writes from them, since both run the same bodies
-    /// on the same geometry. A block holding a non-finite value is refused
-    /// as the quantizer refuses it (NaN scale, zero codes) and raises
-    /// [`FaultSite::QuantColumn`].
+    /// on the same geometry. A block holding a non-finite `g` or `u` value is
+    /// refused as the quantizer refuses it (NaN scale, zero codes) and raises
+    /// [`FaultSite::QuantColumn`] under either rule: the clamp would carry it
+    /// to a finite value the quantizer's own test cannot see.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -677,6 +686,7 @@ mod gemm_kernels {
         domain = 1,
         block = (32, 1, 1),
         requires = (
+            act <= 1,
             g.len() >= n_cols * 256 * n_sb,
             u.len() >= n_cols * 256 * n_sb,
             q3.len() >= n_cols * 64 * half_it,
@@ -689,6 +699,8 @@ mod gemm_kernels {
     pub fn gemm_swiglu_quant(
         g: &[f32],
         u: &[f32],
+        act: u32,
+        limit: f32,
         n_cols: u32,
         n_sb: u32,
         half_it: u32,
@@ -728,12 +740,16 @@ mod gemm_kernels {
                 ],
             )
         };
-        let v = [
-            silu_mul(gv[0], uv[0]),
-            silu_mul(gv[1], uv[1]),
-            silu_mul(gv[2], uv[2]),
-            silu_mul(gv[3], uv[3]),
-        ];
+        let v = if crate::fault::quad_finite(gv) & crate::fault::quad_finite(uv) {
+            [
+                apply(act, limit, gv[0], uv[0]),
+                apply(act, limit, gv[1], uv[1]),
+                apply(act, limit, gv[2], uv[2]),
+                apply(act, limit, gv[3], uv[3]),
+            ]
+        } else {
+            [f32::NAN; 4]
+        };
         // SAFETY: col < n_cols and b < 2·n_sb by the lines above, the output
         // bounds are the launch contract's, the block is one warp with one
         // `(col, b)`, and `v` holds values 128·b + 4·lane .. +3 of column col.
