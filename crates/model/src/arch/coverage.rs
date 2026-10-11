@@ -1870,6 +1870,10 @@ mod tests {
             // The host's alone too, and no change: `CardFormat::of` takes
             // q3_K, so this passed before the card-or-host rule as well.
             (GgmlType::Q3_K, GgmlType::Q4_K, none.clone()),
+            // The host's alone: UD-Q2_K_XL's trunk (iq2_xs gate and up, iq3_xxs
+            // down) and its NextN layer (q2_K gate and up, q3_K down).
+            (GgmlType::IQ2_XS, GgmlType::IQ3_XXS, none.clone()),
+            (GgmlType::Q2_K, GgmlType::Q3_K, none.clone()),
             // No side: bf16 has no card expert and no fused qdot kernel, as
             // a gate and up or as a down.
             (GgmlType::BF16, GgmlType::Q4_K, item(GgmlType::BF16)),

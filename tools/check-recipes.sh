@@ -402,6 +402,7 @@ blk_pytools() {
     "tools/ref/draft-vocab.py --self-test"
     "tools/ref/ds41copy.py --self-test"
     "tools/ref/ds41pp.py self-test"
+    "tools/ref/flat-imatrix.py --self-test"
     "tools/ref/gguf-ranges.py --self-test"
     "tools/ref/hidden-diff.py --self-test"
     "tools/ref/lev_ref.py --self-test"

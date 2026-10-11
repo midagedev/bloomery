@@ -1,0 +1,46 @@
+# The three qdot-rate pairs that read RED in round 2 of the 2026-10-11 qw2-h1 sitting, rerun in a quiet window.
+# That sitting [measured, scratchpad qw2h/rate-sitting.nocard.log] ran rounds 1 and 2 with pre-witness loadavg 23.5 and
+# both GPUs at 36-37 %; round 3 matched the IQ3_XXS anchor (5.0 GB/s). Ratios ours/ik a round, floor in brackets:
+#   IQ3_XXS@4096 [1.43]: 1.584, 1.321 RED, 1.587
+#   IQ4_NL@640   [0.65]: 0.675, 0.641 RED, 0.847
+#   IQ3_S@4096   [0.90]: 0.976, 0.876 RED, 0.981
+# Round 2 is the only round that runs the Rust arm first, and it is the second of three, so two causes fit: the
+# contention of that window (the other rows of the sitting read lower in rounds 1-2 than in round 3, e.g. Q4_K
+# 0.925, 0.924, 1.122) or an arm-order effect of the runner. The rerun separates them: a quiet window that reads
+# green in all three rounds, round 2 included, leaves contention as the cause.
+# The runner runs every pair each round (tools/ref/qdot-rate.sh has no pair selection), so the sitting is the same
+# 12 pairs; the card's term is the worst of these three pairs' nine rows.
+# Prediction [derived from the clean rounds 1 and 3 of that sitting]: the worst row over floor is IQ4_NL at 0.675/0.65
+# = 1.04 in round 1 and 0.847/0.65 = 1.30 in round 3; IQ3_XXS 1.584/1.43 = 1.11; IQ3_S 0.976/0.90 = 1.08. The worst of
+# nine rows, quiet, sits at 1.02-1.10 of its floor.
+# Resource timeline: one core pinned (BLOOMERY_RATE_CORE), DRAM-bound at ~11-16 GB/s for the rows of the sitting; the
+# whole sitting's timed region was 91 s [measured]; a rerun is ~100 s including the build check; card, PCIe and NVMe 0.
+# Result, 2026-10-11 13:02:37Z..13:03:56Z [measured]: pre-witness loadavg 7.03, pressure-cpu avg10 0.00, both cards 0 %; post loadavg 5.65.
+#   Runner rc 0, 12 rows x 3 rounds green. Ratios ours/ik a round (1, 2, 3), floor in brackets:
+#   IQ3_XXS@4096 [1.43] 1.620, 1.658, 1.627; IQ4_NL@640 [0.65] 0.739, 0.793, 0.735; IQ3_S@4096 [0.90] 0.982, 0.971, 0.964.
+#   The worst of the nine rows is IQ3_S round 3, 0.964/0.90 = 1.071 of its floor (predicted 1.02-1.10): decide-in. Round 2, the Rust-first
+#   round, is green on all three pairs, so the first sitting's round-2 REDs were that window's contention, not an arm-order effect.
+#   Quiet-window rates, GB/s ours (ik) a round: IQ3_XXS 5.1 (3.2), 5.1 (3.1), 5.0 (3.1), the 10-08 anchor; IQ2_XS 4.6 (4.4), 4.6 (4.5), 4.3 (4.6);
+#   Q2_K 14.0 (12.7), 13.6 (12.4), 12.9 (13.1). The first sitting's IQ2_XS 4.1 (docs/cards/q2k-iq2xs-rate.card) was therefore not clean.
+kind: calibration
+question: do IQ3_XXS@4096, IQ4_NL@640 and IQ3_S@4096 read at or above their floors in every one of three rounds, round 2
+  (Rust arm first) included, when the machine is quiet?
+term: the smallest of ours/ik over floor across the nine rows of the three pairs (tools/ref/qdot-rate-floors.py check lines
+  of one `just measure-qdot-rate 3` sitting)
+unit: ratio over floor
+predict: 1.02..1.10
+condition: the run starts only when a read-only probe just before it shows loadavg 1 min under 8, 0 % utilisation on both
+  cards and no cargo, rustc or opt process busy on the box; the sitting's own pre and post witness blocks record the
+  loadavg, the pressure files and the card state; the run is BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/qdot-rate-redpairs.card'
+  just measure-qdot-rate 3 on this tree, with the binary the first sitting measured (the recipe rebuilds qdot-rate, which
+  is up to date)
+reason: the lead's order relayed from the quant session: show that the three REDs were contention or report the numbers; no
+  floor is touched either way
+decide-in: 1.00 <= term <= 1.10 (every row green): the round-2 REDs were the first window's contention; report the nine
+  ratios and leave the floors and the runner alone
+decide-below: under 1.00 (a row red): note which round and which pair; red only in round 2 on every pair is an arm-order
+  effect (round 2 is the Rust-first round): report the numbers and propose an A/A in the runner's reversal, no floor
+  change; red in another round is contention again (read the witness) or a real regression of that kernel (bisect the
+  kernel's last change)
+decide-above: over 1.10: the floors sit looser than the quiet readings; report it, change no floor (a re-pin needs its
+  own dated derivation and FAIL-first)

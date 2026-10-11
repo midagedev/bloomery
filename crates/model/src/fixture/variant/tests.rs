@@ -99,6 +99,11 @@ fn source_kvs() -> Vec<(String, Value)> {
         ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
         ("bloomery.fixture.version".into(), Value::U32(1)),
         ("bloomery.fixture.card_budget".into(), Value::U64(1 << 20)),
+        (
+            "quantize.imatrix.file".into(),
+            Value::String("source.imatrix".into()),
+        ),
+        ("quantize.imatrix.entries_count".into(), Value::U32(7)),
     ]
 }
 
@@ -126,6 +131,9 @@ fn variant_tensors(source: &[T]) -> Vec<T> {
 fn variant_kvs() -> Vec<(String, Value)> {
     let mut kvs = source_kvs();
     kvs[1].1 = Value::U32(14);
+    // The quantizer's own words about the matrix it was given, not the file's content.
+    kvs[5].1 = Value::String("flat.imatrix".into());
+    kvs[6].1 = Value::U32(6);
     kvs.push((KEY_VARIANT.into(), Value::String("v1".into())));
     kvs
 }
@@ -421,7 +429,8 @@ fn a_variant_that_differs_otherwise_is_refused_by_name() {
     kvs.pop();
     run(kvs, good.clone(), 2, &[KEY_VARIANT, "missing"]);
     let mut kvs = variant_kvs();
-    kvs[5].1 = Value::String("v2".into());
+    let tag = kvs.len() - 1;
+    kvs[tag].1 = Value::String("v2".into());
     run(kvs, good.clone(), 2, &[KEY_VARIANT, "\"v2\""]);
     let mut kvs = variant_kvs();
     kvs.remove(4);

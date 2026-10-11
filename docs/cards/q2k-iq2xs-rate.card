@@ -1,0 +1,74 @@
+# The IQ2_XS x Q8_K single-core rate, never measured: the qw2-h1 round's kernel (dot_iq2xs_q8k_avx2, the port of
+# ik's mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ2XS, 1>, iqk_gemm_iquants.cpp:788, :236) against its derivation, with
+# ik's own iq2xs_rate beside it, and the Q2_K x Q8_K row (dot_q2k_q8k_avx2, the port of ik's
+# mul_mat_qY_K_q8_K_T<DequantizerQ2K, 1>, iqk_gemm_kquants.cpp:678, :511) riding in the same qdot-rate sitting.
+# Anchors [measured, rig-log 2026-10-08 #mxfp4-core-rate and docs/cards/iq3s-rate.card]: our IQ3_XXS 5.0-5.2 GB/s at
+# k = 4096 (98 B a block), ik's IQ3_XXS 3.2.
+# Census of the per-block loop in the release disassembly [counted at build time, objdump -d of
+# target/release/qdot-rate built from this tree on the box via tools/ref/asm-census.py loop; not a runtime number]:
+#   IQ3_XXS: 309 instructions a block (the loop fully unrolled), 98 B: 0.317 B per instruction at 5.0-5.2 GB/s.
+#   IQ3_S:   341 instructions, 110 B: 0.323 B per instruction.
+#   IQ2_XS:  the outer loop is 202 instructions and holds ONE trip of the rolled j loop (4 sub-blocks: 16 movzwl,
+#     16 and, 16 shr, 33 vmovq, 16 vpunpcklqdq, 8 vinserti128, 4 vpmaddubsw); the fixed part is ~45 (scale decode,
+#     the bsums fold, the two fmadds), the trip ~157, so a block runs ~45 + 2 x 157 = ~359 instructions for 74 B
+#     (0.206 B per instruction). 28 of each 36 a sub-block go to the four codes' index extraction and the grid and
+#     sign words' assembly (4 movzwl + 4 and + 4 shr + 8 vmovq + 4 vpunpcklqdq + 2 vinserti128).
+#   Q2_K: dot_q2k_q8k_avx2 is inlined into dot_row (no symbol, so no loop census); by its structure (a code load,
+#     a shift and a mask, the scale shuffle, maddubs, madd and the sum a sub-block, ~9 x 8, plus ~40 fixed) it is
+#     ~112 instructions for 84 B (0.75 B per instruction) [derived from the source, not counted].
+# Rate R = 5.1 GB/s x (B per instruction / 0.317), the instruction-count form the iq3s card used (same IPC as the
+# XXS kernel), band +-20 %:
+#   IQ2_XS: 5.1 x 0.206/0.317 = 3.3, band 2.7-4.0 GB/s [derived].
+#   Q2_K:   5.1 x 0.75/0.317 = 12.1, band 8-14 GB/s [derived]; its upper edge is the one thread's stream rate
+#     (>= 12 GB/s per the iq3s card) and 17 multiply-pipe cycles a block (~19 GB/s), so the point sits near 12.
+# The design's 4.7-6.9 for IQ2_XS (quantwide design 4.2) counted 96 table loads and not the index extraction and the
+# word assembly, which the census puts at 28 of 36 instructions a sub-block.
+# Resource timeline of one 256-value block of one row, one thread [derived]: IQ2_XS host CPU 359 instructions
+# = 22 ns at R = 3.3 (74 B), DRAM 74 B at the thread's 1/32 share of ~135-145 GB/s (4.2-4.5 GB/s) = 16-18 ns; at the
+# one thread alone (this sitting) 74 B at its stream rate (>= 12 GB/s) <= 6.2 ns. The decode wall is max(CPU, DRAM):
+# at 32 threads the CPU term is the longer one for R < 4.3, so the rate decides the routed leg there. GLM UD-Q2_K_XL
+# decode, one MoE layer, 8 experts on the host (gate/up IQ2_XS 38.8 MB, down IQ3_XXS 25.7 MB): DRAM 64.5 MB / 135 GB/s
+# = 0.478 ms; cores 38.8 MB / (32 x 3.3) = 0.367 ms + 25.7 MB / (32 x 5.1) = 0.157 ms = 0.524 ms: within 10 % of each
+# other, so a faster IQ2_XS loop is worth at most ~9 % of the leg [derived]. Card, PCIe and NVMe 0.
+# The cheaper loop [derived, not built]: ik's parity-shuffle signs (about 7 instructions a sub-block for the four
+# sign words against 13 here: -48 a block) and one u64 load with bextr for the four codes (-24 a block) give
+# ~287 a block, 74/287 = 0.258 B per instruction, R = 4.1 GB/s at the same IPC.
+# Result, 2026-10-11 (sitting at witness pre 01:52:21Z, post 01:53:52Z; the card's sha256 at the run was ffa7839e39f8ff7ab3e4e93dca48ba31bc259db407295e57c0c6573e7a38a7e0) [measured]:
+#   IQ2_XS@4096 ours 3.7, 3.6, 4.1 GB/s a round (ik's iq2xs_rate 3.3, 3.7, 4.6); Q2_K@4096 ours 11.1, 11.4, 13.4 (ik 10.2, 12.2, 12.8);
+#   same-run IQ3_XXS@4096 anchor 3.9, 4.2, 5.0 (the 10-08 anchor 5.0-5.2). Rounds 1 and 2 were not quiet (pre-witness loadavg 23.5, both
+#   GPUs 36-37 % busy), so only round 3 is anchor-consistent: IQ2_XS 4.1, 2.5 % over the band, inside the 4.0-4.6 branch.
+#   Quiet rerun (docs/cards/qdot-rate-redpairs.card: pre loadavg 7.03, cards 0 %, IQ3_XXS anchor 5.1, 5.1, 5.0) [measured]: IQ2_XS ours 4.6, 4.6, 4.3
+#   (ik 4.4, 4.5, 4.6), Q2_K ours 14.0, 13.6, 12.9 (ik 12.7, 12.4, 13.1). IQ2_XS is 8-15 % over the band's top (4.0): the census's 359
+#   instructions a block ran at a higher IPC than the XXS anchor's; it sits at the 4.0-4.6 branch's edge (the card's DRAM-bound mark is 4.6).
+#   The wall: 12-14 minutes was an analogy and wrong; the timed region took 91 s (rows x bytes / rate: ~17 s a round [derived afterwards]).
+kind: calibration
+question: does the IQ2_XS x Q8_K dot's single-core rate at k = 4096 (GLM-5.3-Flash UD-Q2_K_XL gate/up, 1184 B a row)
+  sit inside the instruction-count derivation, and does it hold the host leg DRAM-bound (per core at or above the
+  4.3-4.6 GB/s break-even of the per-layer model) or leave it compute-bound?
+term: qdot-rate single-thread GB/s of IQ2_XS rows at k = 4096 (1184 B/row), one pinned core (BLOOMERY_RATE_CORE),
+  the runner's rounds alternating with ik's iq2xs_rate in one lease; the same log's IQ3_XXS@4096 row is the same-run
+  anchor (ratio R_IQ2_XS / R_IQ3_XXS predicted 0.52-0.78 [derived]: 3.3/5.1 = 0.65 at the instruction ratio)
+unit: GB/s
+predict: 2.7..4.0
+condition: the lead runs, on this tree after just build-ref (done on the box: q2k_rate and iq2xs_rate are built and
+  q2k-ik-dot.txt and iq2xs-ik-dot.txt are dumped), BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q2k-iq2xs-rate.card'
+  just measure-qdot-rate 3, about 12-14 minutes [struck: the timed region took 91 s, see the result note above; the figure was an analogy to the iq3s card];
+  the recipe builds qdot-rate itself, the runner pins one core and reverses arm order every round, the witness shows
+  no other compute on the box, and tools/ref/qdot-rate-floors.tsv names the two new pairs (provisional floor 0.65,
+  PIN(2026-10-11)) so the runner runs q2k_rate and iq2xs_rate. The Q2_K row (predicted 8-14 GB/s) and every other row
+  of the log are read from the same log: the card's term is the IQ2_XS row
+reason: sets the IQ2_XS per-core cost c in plan.md's host-union row (t(m) = max(W, a + c m)) for GLM-5.3-Flash
+  UD-Q2_K_XL (41 of its 43 routed gate/up stacks), and decides whether a decode-leg kernel round on the IQ2_XS loop
+  comes before the fixed-term read; why now: the kernel is written and gated (96 rows at 0 ULP against ik for each
+  type), and the engine loads an IQ2_XS stack on the host tier the moment it lands, so its rate is the price of that load
+decide-in: 2.7 <= R <= 4.0, the leg is compute-bound within ~10 % of DRAM at batch 1 (0.524 against 0.478 ms a
+  layer): do not touch the kernel yet; read the decode host leg's fixed term per expert off a GLM profile at
+  BLOOMERY_PROFILE level 1 and price the step with it; the cheaper loop above (parity-shuffle signs, u64 code load)
+  goes into the triage as the lever, priced at ~287 instructions a block = 4.1 GB/s
+decide-below: under 2.7 the loop runs at a lower IPC than the XXS anchor's: profile qdot-rate (perf record -e
+  cpu-clock, core pinned) before any change; the suspects are the 33 vmovq and 16 vpunpcklqdq that assemble the
+  grid and sign words and the rolled j loop's spills (11 stack operands); price each candidate by the disassembly
+  census before coding it — the parity-shuffle signs, the u64 code load with bextr, the j loop unrolled by hand
+decide-above: over 4.0 the assembly costs less than the census says; from 4.6 the kernel is DRAM-bound at 32 threads
+  (per-layer model R* = 4.3-4.6): record the rate in plan.md's host-union row and stop; between 4.0 and 4.6 read the
+  fixed term first as for the band

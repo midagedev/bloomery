@@ -24,8 +24,11 @@ pub const TABLE: &str = "tools/fixture-variants.tsv";
 
 /// The keys the quantizer writes itself: the file's type word and the quantization format version
 /// carry its argument, not the file's content. The `split.*` keys are the shard layout, which the
-/// check holds equal through the shard count and each tensor's shard.
+/// check holds equal through the shard count and each tensor's shard. The `quantize.imatrix.*` keys name the
+/// importance matrix the quantizer was given (the flat one of `tools/ref/flat-imatrix.py` for a very-low-bit
+/// map), which is its input and not the file's content.
 const QUANTIZER_KEYS: [&str; 2] = ["general.file_type", "general.quantization_version"];
+const QUANTIZER_KEY_PREFIX: &str = "quantize.imatrix.";
 
 /// Which layers a row's map reaches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,8 +363,12 @@ fn kv_diff(source: &Split, variant: &Split, tag: &str) -> Result<(), FixtureErro
         }
         None => return Err(mismatch(format!("{KEY_VARIANT} is missing, want {tag:?}"))),
     }
-    let skipped =
-        |k: &str| k == KEY_VARIANT || k.starts_with("split.") || QUANTIZER_KEYS.contains(&k);
+    let skipped = |k: &str| {
+        k == KEY_VARIANT
+            || k.starts_with("split.")
+            || QUANTIZER_KEYS.contains(&k)
+            || k.starts_with(QUANTIZER_KEY_PREFIX)
+    };
     for (k, v) in source.iter_kv().filter(|(k, _)| !skipped(k)) {
         match variant.value(k) {
             Some(got) if got == v => {}

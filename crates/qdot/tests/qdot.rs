@@ -617,12 +617,54 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::IQ3_S, &wrow3s, &acol3s, 4096).unwrap(),
         0.0
     );
+    // Q2_K pairs q8_K with 84 weight bytes per 256 values.
+    assert_eq!(col_bytes(GgmlType::Q2_K, 4096), 296 * 16);
+    let wrow2k = vec![0u8; 84 * 16];
+    let acol2k = vec![0u8; 296 * 16];
+    assert!(matches!(
+        dot_row(GgmlType::Q2_K, &wrow2k, &acol2k, 4096 + 32),
+        Err(QdotError::UnalignedK { k: 4128, gran: 256 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q2_K, &wrow2k[..84 * 16 - 1], &acol2k, 4096),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q2_K, &wrow2k, &acol2k[..296 * 16 - 1], 4096),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::Q2_K, &wrow2k, &acol2k, 4096).unwrap(),
+        0.0
+    );
+    // IQ2_XS pairs q8_K with 74 weight bytes per 256 values.
+    assert_eq!(col_bytes(GgmlType::IQ2_XS, 4096), 296 * 16);
+    let wrow2xs = vec![0u8; 74 * 16];
+    let acol2xs = vec![0u8; 296 * 16];
+    assert!(matches!(
+        dot_row(GgmlType::IQ2_XS, &wrow2xs, &acol2xs, 4096 + 32),
+        Err(QdotError::UnalignedK { k: 4128, gran: 256 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::IQ2_XS, &wrow2xs[..74 * 16 - 1], &acol2xs, 4096),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::IQ2_XS, &wrow2xs, &acol2xs[..296 * 16 - 1], 4096),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::IQ2_XS, &wrow2xs, &acol2xs, 4096).unwrap(),
+        0.0
+    );
     // Supported type table check.
     assert!(!supports(GgmlType::F16));
     assert!(supports(GgmlType::Q5_K));
     assert!(supports(GgmlType::Q5_1));
     assert!(supports(GgmlType::IQ3_XXS));
     assert!(supports(GgmlType::IQ3_S));
+    assert!(supports(GgmlType::Q2_K));
+    assert!(supports(GgmlType::IQ2_XS));
     assert!(supports(GgmlType::MXFP4));
     assert!(supports(GgmlType::Q8_0));
     assert!(supports(GgmlType::IQ4_NL));
@@ -1532,8 +1574,17 @@ fn qwen_dump(file: &str, ty: GgmlType, block: usize, gran: usize) -> QwenDump {
     d
 }
 
+/// The byte offsets of a block's f16 scale fields in the generated-row gates: Q2_K carries
+/// `d` and `dmin` at the block's end, every other gated type its `d` first.
+fn f16_scale_fields(ty: GgmlType) -> &'static [usize] {
+    match ty {
+        GgmlType::Q2_K => &[80, 82],
+        _ => &[0],
+    }
+}
+
 /// Gate A over generated rows: `ROWS` pseudo-random rows at every `k`, every byte a
-/// valid code, each block's f16 d masked finite, against a `quantize_col` column —
+/// valid code, each block's f16 scales masked finite, against a `quantize_col` column —
 /// kernel vs mirror, bit for bit.
 #[cfg(target_arch = "x86_64")]
 fn generated_gate_a(ty: GgmlType, block: usize, gran: usize, ks: &[usize]) {
@@ -1541,14 +1592,15 @@ fn generated_gate_a(ty: GgmlType, block: usize, gran: usize, ks: &[usize]) {
         supports(ty),
         "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
     );
+    let fields = f16_scale_fields(ty);
     let mut rng = Lcg(0x1AD5_0BEE_5EED);
     for &k in ks {
         let row_bytes = block * k / gran;
         let mut w = vec![0u8; ROWS * row_bytes];
         for (i, b) in w.iter_mut().enumerate() {
             *b = (rng.next_u32() >> 13) as u8;
-            if i % block == 1 {
-                *b &= 0x7b; // the f16 d's exponent top bit: keep every scale finite
+            if fields.iter().any(|&f| i % block == f + 1) {
+                *b &= 0x7b; // an f16 scale's exponent top bit: keep every scale finite
             }
         }
         let x: Vec<f32> = (0..k).map(|_| rng.unit() * 30.0).collect();
@@ -1885,6 +1937,262 @@ fn hw_iq3s_kernel_predicts_ik() {
         d.name,
         worst.0,
         d.want.len()
+    );
+}
+
+// ------------------------------------------- Q2_K and IQ2_XS x Q8_K
+// GLM-5.3-Flash's UD-Q2_K_XL routed experts. Both gates read the dump tools/ref/q2k_ref.cpp or
+// tools/ref/iq2xs_ref.cpp writes: 96 rows at one k, the first 64 real rows of the file's first
+// aligned tensor of the type (the harness names it in the dump), the last 32 synthetic rows of
+// random codes (every scale and min nibble, grid index and sign index), beside ik's column and
+// results. There is no per-row marker; the split is the rows' order.
+
+/// The dump's real rows, which come first.
+const Q2_DUMP_REAL: usize = 64;
+/// The dump's rows in all: the real ones, then the synthetic random-code rows.
+const Q2_DUMP_ROWS: usize = 96;
+
+/// Reads one of the two dumps and checks it holds the harness's 64 real and 32 synthetic rows.
+fn glm_q2_dump(file: &str, ty: GgmlType, block: usize) -> QwenDump {
+    let d = qwen_dump(file, ty, block, 256);
+    assert_eq!(
+        d.rows.len(),
+        Q2_DUMP_ROWS,
+        "{file}: the harness writes {Q2_DUMP_REAL} real and {} synthetic rows",
+        Q2_DUMP_ROWS - Q2_DUMP_REAL
+    );
+    d
+}
+
+/// A Q2_K block: the 16 scale bytes from `scales` (scale in the low nibble, min in the high),
+/// the 64 code bytes from `qs`, then the f16 `d` and `dmin`.
+fn q2k_block(scales: impl Fn(usize) -> u8, qs: impl Fn(usize) -> u8, d: u16, dmin: u16) -> Vec<u8> {
+    let mut b: Vec<u8> = (0..16).map(scales).collect();
+    b.extend((0..64).map(qs));
+    b.extend_from_slice(&d.to_le_bytes());
+    b.extend_from_slice(&dmin.to_le_bytes());
+    b
+}
+
+/// An IQ2_XS block: f16 `d`, the 32 u16 codes from `codes` (9-bit grid index, 7-bit sign index
+/// above it) and the 8 scale bytes (two 4-bit scales a byte).
+fn iq2xs_block(d: u16, codes: impl Fn(usize) -> u16, scales: [u8; 8]) -> Vec<u8> {
+    let mut b = d.to_le_bytes().to_vec();
+    for i in 0..32 {
+        b.extend_from_slice(&codes(i).to_le_bytes());
+    }
+    b.extend_from_slice(&scales);
+    b
+}
+
+/// Q2_K end blocks: every scale and min 15 with every code 3 under either sign of `d` and
+/// `dmin`, the scales alone (mins 0), the mins alone (scales 0), every code 0, a scrambled
+/// pattern, `d` = `dmin` = 0, a subnormal `d` beside a unit `dmin`, and `dmin` against the sign
+/// of `d`.
+const Q2K_ENDS: [IqEnd; 9] = [
+    || q2k_block(|_| 0xFF, |_| 0xFF, F16_ONE, F16_ONE),
+    || q2k_block(|_| 0xFF, |_| 0xFF, F16_NEG_ONE, F16_NEG_ONE),
+    || q2k_block(|_| 0x0F, |_| 0xFF, F16_ONE, F16_ONE),
+    || q2k_block(|_| 0xF0, |_| 0xFF, F16_ONE, F16_ONE),
+    || q2k_block(|_| 0xFF, |_| 0, F16_ONE, F16_ONE),
+    || {
+        q2k_block(
+            |i| (i * 37 + 11) as u8,
+            |i| (i * 53 + 7) as u8,
+            F16_ONE,
+            F16_ONE,
+        )
+    },
+    || q2k_block(|_| 0xFF, |_| 0xFF, 0, 0),
+    || q2k_block(|_| 0xFF, |i| (i * 37) as u8, F16_TINY, F16_ONE),
+    || q2k_block(|_| 0xFF, |_| 0xFF, F16_ONE, F16_NEG_ONE),
+];
+
+/// IQ2_XS end blocks: every code 0xFFFF (grid entry 511 under sign index 127) with the top
+/// scales under either sign of `d`, a scrambled pattern, the sign index alone (grid index 0),
+/// the grid index alone (sign index 0), the smallest scales, d = 0 and a subnormal d.
+const IQ2XS_ENDS: [IqEnd; 8] = [
+    || iq2xs_block(F16_ONE, |_| 0xFFFF, [0xFF; 8]),
+    || iq2xs_block(F16_NEG_ONE, |_| 0xFFFF, [0xFF; 8]),
+    || {
+        iq2xs_block(
+            F16_ONE,
+            |i| (i as u16).wrapping_mul(37).wrapping_add(11),
+            [0x5A, 0xA5, 0x3C, 0xC3, 0x96, 0x69, 0x1E, 0xE1],
+        )
+    },
+    || iq2xs_block(F16_ONE, |_| 0xFE00, [0xFF; 8]),
+    || iq2xs_block(F16_ONE, |_| 0x01FF, [0xFF; 8]),
+    || iq2xs_block(F16_ONE, |_| 0xFFFF, [0; 8]),
+    || iq2xs_block(0, |_| 0xFFFF, [0xFF; 8]),
+    || iq2xs_block(F16_TINY, |i| i as u16 * 0x0409, [0xF0; 8]),
+];
+
+/// Q2_K gate A: kernel vs mirror on the dump's rows, on `ROWS` generated rows at the dump's
+/// width and both smaller block counts, and on the ends of [`Q2K_ENDS`] (every scale, min and
+/// code at its extreme, `d` and `dmin` of either sign, zero and subnormal) against the ±3.0
+/// and seeded columns — bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_q2k_kernel_matches_mirror() {
+    assert!(
+        supports(GgmlType::Q2_K),
+        "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
+    );
+    let d = glm_q2_dump("q2k-ik-dot.txt", GgmlType::Q2_K, 84);
+    for r in 0..d.rows.len() {
+        let a = dot_row_avx2(GgmlType::Q2_K, &d.rows[r], &d.ik_acol, d.k).unwrap();
+        let b = dot_row_scalar(GgmlType::Q2_K, &d.rows[r], &d.ik_acol, d.k).unwrap();
+        assert!(
+            a.to_bits() == b.to_bits(),
+            "dump row {r}: kernel {a:e} and mirror {b:e} must be bit-identical"
+        );
+    }
+    eprintln!(
+        "Q2_K gate A: {} dump rows bit-identical ({}, k = {})",
+        d.rows.len(),
+        d.name,
+        d.k
+    );
+    generated_gate_a(GgmlType::Q2_K, 84, 256, &[4096, 512, 768]);
+    for k in [4096, 256] {
+        let nb = k / 256;
+        let rows = legacy_end_rows(&Q2K_ENDS, nb, |end| end());
+        let cols = legacy_tile_columns(GgmlType::Q2_K, k, vec![]);
+        for (r, row) in rows.chunks(84 * nb).enumerate() {
+            for (j, col) in cols.iter().enumerate() {
+                let a = dot_row_avx2(GgmlType::Q2_K, row, col, k).unwrap();
+                let b = dot_row_scalar(GgmlType::Q2_K, row, col, k).unwrap();
+                assert!(
+                    a.to_bits() == b.to_bits(),
+                    "end row {r} (k = {k}) column {j}: kernel {a:e} (bits {:#x}) and mirror {b:e} \
+                     (bits {:#x}) must be bit-identical",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+        eprintln!(
+            "Q2_K gate A: {} end rows x {} columns bit-identical (k = {k})",
+            rows.len() / (84 * nb),
+            cols.len()
+        );
+    }
+}
+
+/// Q2_K gate B: every dumped row bit for bit equal to ik's
+/// `mul_mat_qY_K_q8_K_T<DequantizerQ2K, 1>` (iqk_gemm_kquants.cpp:678) on ik's own column.
+/// Both run the same integer sums (exact in i32) and the same float steps in the same order
+/// (the fmadd of the bsums fold, the fmadd of the codes, `hsum_float_8`), so any difference is
+/// a bug, not rounding.
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_q2k_kernel_predicts_ik() {
+    let d = glm_q2_dump("q2k-ik-dot.txt", GgmlType::Q2_K, 84);
+    let mut worst = 0i64;
+    for (r, (&bits, row)) in d.want.iter().zip(&d.rows).enumerate() {
+        let got = dot_row(GgmlType::Q2_K, row, &d.ik_acol, d.k).unwrap();
+        let ulp = (got.to_bits() as i64 - bits as i64).abs();
+        assert!(
+            ulp == 0,
+            "row {r}: ours {got:.9e} vs ik {}: {ulp} ULP apart",
+            f32::from_bits(bits)
+        );
+        worst = worst.max(ulp);
+    }
+    eprintln!(
+        "Q2_K gate B: {} rows bit-identical to ik's mul_mat_qY_K_q8_K_T<DequantizerQ2K, 1> (on \
+         ik's own activations, {}; the first {Q2_DUMP_REAL} rows real, the last {} synthetic): \
+         max {} ULP",
+        d.want.len(),
+        d.name,
+        d.want.len() - Q2_DUMP_REAL,
+        worst
+    );
+}
+
+/// IQ2_XS gate A: kernel vs mirror on the dump's rows, on `ROWS` generated rows at the dump's
+/// width and both smaller block counts, and on the ends of [`IQ2XS_ENDS`] (every grid index,
+/// sign index and scale at its extreme, d = 0, a subnormal d) against the ±3.0 and seeded
+/// columns — bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_iq2xs_kernel_matches_mirror() {
+    assert!(
+        supports(GgmlType::IQ2_XS),
+        "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
+    );
+    let d = glm_q2_dump("iq2xs-ik-dot.txt", GgmlType::IQ2_XS, 74);
+    for r in 0..d.rows.len() {
+        let a = dot_row_avx2(GgmlType::IQ2_XS, &d.rows[r], &d.ik_acol, d.k).unwrap();
+        let b = dot_row_scalar(GgmlType::IQ2_XS, &d.rows[r], &d.ik_acol, d.k).unwrap();
+        assert!(
+            a.to_bits() == b.to_bits(),
+            "dump row {r}: kernel {a:e} and mirror {b:e} must be bit-identical"
+        );
+    }
+    eprintln!(
+        "IQ2_XS gate A: {} dump rows bit-identical ({}, k = {})",
+        d.rows.len(),
+        d.name,
+        d.k
+    );
+    generated_gate_a(GgmlType::IQ2_XS, 74, 256, &[4096, 512, 768]);
+    for k in [4096, 256] {
+        let nb = k / 256;
+        let rows = legacy_end_rows(&IQ2XS_ENDS, nb, |end| end());
+        let cols = legacy_tile_columns(GgmlType::IQ2_XS, k, vec![]);
+        for (r, row) in rows.chunks(74 * nb).enumerate() {
+            for (j, col) in cols.iter().enumerate() {
+                let a = dot_row_avx2(GgmlType::IQ2_XS, row, col, k).unwrap();
+                let b = dot_row_scalar(GgmlType::IQ2_XS, row, col, k).unwrap();
+                assert!(
+                    a.to_bits() == b.to_bits(),
+                    "end row {r} (k = {k}) column {j}: kernel {a:e} (bits {:#x}) and mirror {b:e} \
+                     (bits {:#x}) must be bit-identical",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+        eprintln!(
+            "IQ2_XS gate A: {} end rows x {} columns bit-identical (k = {k})",
+            rows.len() / (74 * nb),
+            cols.len()
+        );
+    }
+}
+
+/// IQ2_XS gate B: every dumped row bit for bit equal to ik's
+/// `mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ2XS, 1>` (iqk_gemm_iquants.cpp:788) on ik's own column.
+/// Both run the same integer sums (exact in i32) and the same float steps in the same order
+/// (the fmadd of the bsums fold, the fmadd of the codes, `hsum_float_8`), so any difference is
+/// a bug, not rounding.
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_iq2xs_kernel_predicts_ik() {
+    let d = glm_q2_dump("iq2xs-ik-dot.txt", GgmlType::IQ2_XS, 74);
+    let mut worst = 0i64;
+    for (r, (&bits, row)) in d.want.iter().zip(&d.rows).enumerate() {
+        let got = dot_row(GgmlType::IQ2_XS, row, &d.ik_acol, d.k).unwrap();
+        let ulp = (got.to_bits() as i64 - bits as i64).abs();
+        assert!(
+            ulp == 0,
+            "row {r}: ours {got:.9e} vs ik {}: {ulp} ULP apart",
+            f32::from_bits(bits)
+        );
+        worst = worst.max(ulp);
+    }
+    eprintln!(
+        "IQ2_XS gate B: {} rows bit-identical to ik's mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ2XS, 1> \
+         (on ik's own activations, {}; the first {Q2_DUMP_REAL} rows real, the last {} \
+         synthetic): max {} ULP",
+        d.want.len(),
+        d.name,
+        d.want.len() - Q2_DUMP_REAL,
+        worst
     );
 }
 
@@ -3102,10 +3410,12 @@ fn f16_scales_bit_identical_kernel_vs_mirror() {
     let mut rng = Lcg(0x00F1_6C5C_A1E5);
     // (type, block bytes, offsets of its f16 scale fields)
     for (w, block, fields) in [
-        (GgmlType::Q3_K, 110usize, &[108usize][..]),
+        (GgmlType::Q2_K, 84usize, &[80usize, 82][..]),
+        (GgmlType::Q3_K, 110, &[108][..]),
         (GgmlType::Q4_K, 144, &[0, 2][..]),
         (GgmlType::Q5_K, 176, &[0, 2][..]),
         (GgmlType::Q6_K, 210, &[208][..]),
+        (GgmlType::IQ2_XS, 74, &[0][..]),
         (GgmlType::IQ3_XXS, 98, &[0][..]),
         (GgmlType::IQ3_S, 110, &[0][..]),
         // IQ4_NL at k = 256 is eight 18-byte blocks, one f16 scale each.
@@ -4118,11 +4428,13 @@ const IQ4NL_ENDS: [IqEnd; 7] = [
     || iq4nl_block(F16_TINY, |i| i as u8),
 ];
 
-/// A random block of `len` bytes whose f16 `d` (the first two bytes) is a
-/// finite scale of either sign.
-fn iq_random_block(rng: &mut Lcg, len: usize) -> Vec<u8> {
+/// A random block of `len` bytes whose f16 scales (at the `fields` offsets) are
+/// finite and of either sign.
+fn iq_random_block(rng: &mut Lcg, len: usize, fields: &[usize]) -> Vec<u8> {
     let mut b: Vec<u8> = (0..len).map(|_| (rng.next_u32() >> 13) as u8).collect();
-    b[0..2].copy_from_slice(&rand_f16(rng).to_le_bytes());
+    for &f in fields {
+        b[f..f + 2].copy_from_slice(&rand_f16(rng).to_le_bytes());
+    }
     b
 }
 
@@ -4131,13 +4443,14 @@ fn iq_random_block(rng: &mut Lcg, len: usize) -> Vec<u8> {
 /// hold `gran` values.
 fn iq_tile_synthetic(ty: GgmlType, block: usize, gran: usize, ks: &[usize], ends: &[IqEnd]) {
     let mut rng = Lcg(0x1A_7113 ^ block as u64);
+    let fields = f16_scale_fields(ty);
     for &k in ks {
         let nb = k / gran;
         let row_bytes = nb * block;
         let cols = legacy_tile_columns(ty, k, vec![]);
         let mut rows = Vec::new();
         for _ in 0..LEGACY_RANDOM_ROWS * nb {
-            rows.extend_from_slice(&iq_random_block(&mut rng, block));
+            rows.extend_from_slice(&iq_random_block(&mut rng, block, fields));
         }
         let calls = assert_tile_matches(ty, "random rows", k, row_bytes, &rows, &cols);
         eprintln!("{ty:?} tile: random rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
@@ -4193,6 +4506,24 @@ fn hw_iq4xs_tile_matches_dot_row() {
 #[ignore = "hw: needs the box (AVX2)"]
 fn hw_iq3s_tile_matches_dot_row() {
     iq_tile_synthetic(GgmlType::IQ3_S, 110, 256, &[4096, 768, 256], &IQ3S_ENDS);
+}
+
+/// Q2_K tile clause: random rows (every scale and min nibble, code and `d`/`dmin` of either
+/// sign) and the ends of [`Q2K_ENDS`] at k = 4096, 768 and 256 — tile = `dot_row` per column,
+/// bit for bit.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_q2k_tile_matches_dot_row() {
+    iq_tile_synthetic(GgmlType::Q2_K, 84, 256, &[4096, 768, 256], &Q2K_ENDS);
+}
+
+/// IQ2_XS tile clause: random rows (every grid index, sign index and scale nibble, `d` of
+/// either sign) and the ends of [`IQ2XS_ENDS`] at k = 4096, 768 and 256 — tile = `dot_row`
+/// per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_iq2xs_tile_matches_dot_row() {
+    iq_tile_synthetic(GgmlType::IQ2_XS, 74, 256, &[4096, 768, 256], &IQ2XS_ENDS);
 }
 
 /// IQ4_NL tile clause: random rows and the ends of [`IQ4NL_ENDS`] at each of
