@@ -76,9 +76,18 @@
 //!     their rows NaN. One 2 × 4,096-row case (GLM's down rows) carries the
 //!     host-rule bits. The IQ2_XS gate·up carries clauses 1-6 at K = 4,096 (GLM's
 //!     gate width) and K = 2,304, and IQ3_XXS at K = 4,096 too.
-//! 11. **Wide activation, gate·up.** A launch over a 16-column activation of
-//!     which two columns are quantized equals the 2-column launch bit for
-//!     bit, all three formats (the leg's `Q8Act` holds its cap's columns).
+//! 11. (removed) **Wide activation, gate·up.**
+//!     PIN(2026-10-11): removed. The clause held a launch over a 16-column
+//!     activation of which two columns are quantized equal to the 2-column
+//!     launch, bit for bit, the three formats at K = 2,560 over real rows.
+//!     `bloomery_gpu::card_leg`'s `hw_the_leg_writes_each_slots_one_token_rows_at_any_m`
+//!     holds that fact through the leg for those formats, the K-quant and the
+//!     MXFP4 gate·ups at K = 2,560: its run of one token reads a 40-column
+//!     activation of which one column is quantized and equals the same token's
+//!     run in one-column buffers, and its runs of 9 and 40 tokens read every
+//!     column past the eighth. The clause's rows were ggml-quantized and random
+//!     blocks; the leg test's are random blocks, which reach every code of
+//!     the three formats.
 //! 12. **Capture, `Q8Act` entries.** The IQ2_XS gate·up and the three downs
 //!     captured in one graph replay as four nodes, bit-identical to the eager
 //!     launches.
@@ -173,9 +182,6 @@ mod gate {
     const KS_DOWN: [usize; 2] = [2048, 2304];
     /// The formats of the `Q8Act` downs.
     const Q8_FMTS: [IqFormat; 3] = [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs];
-    /// Columns of the leg-sized activation the wide-activation clauses launch
-    /// over.
-    const WIDE_COLS: usize = 16;
     /// The down's clause-3 row sampling (every 128th row of its stacks).
     const NL_BAND_STRIDE: usize = 128;
 
@@ -2257,45 +2263,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// Clause 11: the gate·up over a 16-column activation of which two columns
-    /// are quantized equals the 2-column launch, bit for bit, per format.
-    ///
-    /// PIN(2026-10-11): replaces the former refusal of nine columns. The card
-    /// leg's activation holds its cap's columns (`LegBufs`; mimo2's prefill
-    /// cap is hundreds), the kernels read column `slot / slots_per_col` by the
-    /// launch contract alone, and the K-quant gate·ups take any width.
-    fn check_gu_wide(c: &Ctx) -> Result<bool, GateError> {
-        let s = c.gpu.stream();
-        let mut ok = true;
-        for fmt in [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
-            let st = gu_stack(fmt, KS[0], 4, 80)?;
-            let (wg, wu) = (st.upload(s, false)?, st.upload(s, true)?);
-            let m = 2usize;
-            let x = seeded(m * st.k, 9101, -2.0, 4.0);
-            let xd = DeviceBuffer::from_host(s, &x)?;
-            let mut exact = Q8Act::with_k(s, m, st.k)?;
-            c.gpu.enqueue_quantize_q8_1_cols(&xd, &mut exact, m, 0)?;
-            let mut wide = Q8Act::with_slots(s, WIDE_COLS, st.k)?;
-            c.gpu.enqueue_quantize_q8_1_cols(&xd, &mut wide, m, 0)?;
-            s.synchronize()?;
-            let sel = sel_of(m, st.experts);
-            let (h, fault) = gate_up(c, &st, &wg, &wu, &exact, &sel, CLAMP0)?;
-            let (hw, fault_w) = gate_up(c, &st, &wg, &wu, &wide, &sel, CLAMP0)?;
-            let same = bits_equal(&h, &hw);
-            let pass = same && fault.is_none() && fault_w.is_none();
-            ok &= pass;
-            println!(
-                "gu_wide[{} k={} m=2 of {WIDE_COLS}] bits_equal_to_exact_width={} {}{}",
-                fmt.ggml().name().unwrap_or("?"),
-                st.k,
-                verdict(same),
-                verdict(pass),
-                mismatch("wide", &hw, &h),
-            );
-        }
-        Ok(ok)
-    }
-
     /// Clause 12: the IQ2_XS gate·up and the three downs in one graph.
     fn check_q8_capture(c: &Ctx) -> Result<bool, GateError> {
         let s = c.gpu.stream();
@@ -2477,7 +2444,6 @@ mod gate {
         }
         ok &= check_ids_and_nan(&c)?;
         ok &= check_q8_down_ids_nan(&c)?;
-        ok &= check_gu_wide(&c)?;
         ok &= check_capture(&c)?;
         ok &= check_q8_capture(&c)?;
         ok &= check_refusals(&c)?;
