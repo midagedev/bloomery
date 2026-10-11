@@ -254,10 +254,11 @@ mod gate {
     use bloomery_levers::{CARD_BUDGET, HostCfg, Levers};
     use gguf::quant::{GgmlType, half_to_f32};
     use gguf::{Gguf, Split};
-    use model::arch::models::{Borrows, HeadRows, MtpSource};
+    use model::arch::models::headpick::{HeadSet, vocab_sha256};
+    use model::arch::models::{Borrows, MtpSource};
     use model::arch::qwen35moe::head_list::{HeadWhy, SHIPPED, head_rows_of};
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, MtpPlan, PlanInputs, machine, machine_for_experts, vocab_sha256,
+        Experts, MtpInputs, MtpPlan, PlanInputs, machine, machine_for_experts,
     };
     use model::fileio::hex;
     use model::placement::PlanLevers;
@@ -3800,7 +3801,7 @@ mod gate {
         println!("(d) the walk's borrow resolves: {}", verdict(borrowed));
         let rows_ok = head_rows(m, mtp38, ids)?;
         ok &= rows_ok;
-        let mut own = MtpInputs::read(draft, &target, inputs, HeadRows::Full)?;
+        let mut own = MtpInputs::read(draft, &target, inputs, HeadSet::Full)?;
         if let MtpSource::File { borrows, .. } = &mut own.draft.source {
             *borrows = Borrows {
                 embedding: false,
@@ -3830,11 +3831,11 @@ mod gate {
     /// `shipped`; `full` set is the full head.
     fn shipped_head(file: &Split, vocab: u32) -> Result<bool, GateError> {
         let want = vocab_sha256(file)?;
-        let first = SHIPPED.lines().next().unwrap_or_default();
+        let first = SHIPPED.text.lines().next().unwrap_or_default();
         let line_ok = first.contains(&format!(" rows={SHIPPED_ROWS} "))
             && first.ends_with(&format!(" vocab_sha256={}", hex(&want)));
         let pick = head_rows_of(None, file, vocab)?;
-        let rows_ok = matches!(&pick.rows, HeadRows::List { ids, digest }
+        let rows_ok = matches!(&pick.rows, HeadSet::List { ids, digest }
             if ids.len() == SHIPPED_ROWS && *digest == want);
         let unset_ok = line_ok && rows_ok && pick.why == HeadWhy::Shipped;
         println!(
@@ -3848,7 +3849,7 @@ mod gate {
             verdict(unset_ok)
         );
         let full = head_rows_of(Some(bloomery_levers::MtpHead::Full), file, vocab)?;
-        let full_ok = full.rows == HeadRows::Full && full.why == HeadWhy::SetFull;
+        let full_ok = full.rows == HeadSet::Full && full.why == HeadWhy::SetFull;
         println!(
             "(u) full: head {} of {} rows from {} ({}) {}",
             full.head_word(),
@@ -4693,7 +4694,7 @@ mod gate {
         )?;
         let shipped_ok = shipped_head(&file, inputs.spec.vocab)?;
         let ids: Vec<u32> = (0..LIST_ROWS).map(|i| i * 6).collect();
-        let rows = HeadRows::List {
+        let rows = HeadSet::List {
             ids: ids.clone().into(),
             digest: vocab_sha256(&file)?,
         };

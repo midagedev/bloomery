@@ -21,10 +21,10 @@
 //! read, and the shared MTP draft as its header states it.
 
 use gguf::GgmlType;
+use model::arch::models::headpick::HeadSet;
 use model::arch::models::{
-    Act, Arch, Borrows, ChatSpec, Ffn, Gqa, HcKind, HcSpec, HeadRows, LayerSpec, Mixer, ModelSpec,
-    Moe, MtpDraft, MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode, Router, Score,
-    Shared,
+    Act, Arch, Borrows, ChatSpec, Ffn, Gqa, HcKind, HcSpec, LayerSpec, Mixer, ModelSpec, Moe,
+    MtpDraft, MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode, Router, Score, Shared,
 };
 use model::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
 use model::arch::qwen35moe::mtp::BorrowedHead;
@@ -240,7 +240,7 @@ fn draft() -> MtpDraft {
         }),
         input: MtpInput::Streams,
         head_norm: MtpHeadNorm::HcHead,
-        head_rows: HeadRows::Full,
+        head_rows: HeadSet::Full,
     }
 }
 
