@@ -18,12 +18,16 @@
 //! - `bits`: every position's argmax and logits digest equal the all-RAM arm's.
 //! - `refuse`: by name, a room under the floor and an arena one slot set under the arena's floor (both at plan time),
 //!   and the family's own refusals.
-//! - `residency`: the unset residency rule on the paged plan is `off`, with why `paged`.
+//! - `residency`: the unset residency rule on the paged plan resolves as the plan's own numbers say (the card
+//!   experts, the churn pool at the counts the rule probes, the host headroom and what `MemAvailable` leaves,
+//!   [`RoomFacts`]), never with why `paged`: the family states the pair it expects ([`Family::expected_residency`]).
 
 use std::sync::Arc;
 
 use bloomery_gpu::host::nvtier::{NvTier, NvTierStats};
+use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::{GateError, checks_failed, record, tier, verdict};
+use bloomery_levers::{RESIDENCY_SERVING, ResidencyWord, residency_word};
 use model::placement::workstation::HostNeed;
 use model::placement::{
     ARENA_COLUMNS, ArenaFloor, Device, PlacementError, Plan, Role, arena_slots,
@@ -62,12 +66,159 @@ pub struct PlanFacts {
     pub paged_layers: Vec<usize>,
     /// The expert ids a layer holds.
     pub experts: u32,
+    /// What the unset residency rule reads of the plan.
+    pub room: RoomFacts,
+}
+
+/// What the unset residency rule reads of a plan, taken through the rule's own reader ([`PlanRoom`]) so the gate
+/// prints the numbers the rule decided by and judges them without running the rule.
+#[derive(Clone, Copy, Debug)]
+pub struct RoomFacts {
+    /// The fewest card experts a layer that holds any; `None` where the plan holds none.
+    pub fewest: Option<u64>,
+    /// The serving word's free slots a layer.
+    pub spares: usize,
+    /// The churn pool's bytes at the first count the rule probes (the word's P, 0) and at the last
+    /// (`fewest - spares - 1`, at least 0).
+    pub pool_first: u64,
+    pub pool_last: u64,
+    /// The plan's host headroom, in bytes.
+    pub headroom: i128,
+    /// What `MemAvailable` leaves past the plan's host need, in bytes.
+    pub mem_left: i128,
+}
+
+impl RoomFacts {
+    /// The facts of `plan` for the churn pool of card `card`.
+    ///
+    /// # Errors
+    /// A serving word whose P is not 0 (the table in [`Unset::serving`] covers P 0), a pool the placement
+    /// refuses, or an unreadable `MemAvailable`.
+    pub fn of(plan: &Plan<'_>, card: usize) -> Result<RoomFacts, GateError> {
+        let Some(ResidencyWord::Mid { pinned: 0, spares }) = residency_word(RESIDENCY_SERVING)
+        else {
+            return Err(format!(
+                "the serving word {RESIDENCY_SERVING:?} is not a mid word at P 0: the table of \
+                 `Unset::serving` covers P 0"
+            )
+            .into());
+        };
+        let room = PlanRoom::new(plan, card, 0);
+        let fewest = room.card_experts().filter(|&n| n > 0).min();
+        let last = fewest.map_or(0, |f| {
+            usize::try_from(f).map_or(usize::MAX, |f| f.saturating_sub(spares + 1))
+        });
+        Ok(RoomFacts {
+            fewest,
+            spares,
+            pool_first: room.pool_bytes(0)?,
+            pool_last: room.pool_bytes(last)?,
+            headroom: room.headroom(),
+            mem_left: room.mem_left()?,
+        })
+    }
+}
+
+impl std::fmt::Display for RoomFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "fewest card experts a layer {:?}, churn pool {} B at P0 and {} B at the last count, host headroom {} B, \
+             MemAvailable leaves {} B",
+            self.fewest, self.pool_first, self.pool_last, self.headroom, self.mem_left
+        )
+    }
+}
+
+/// What the unset residency rule resolves on a plan, as the plan's numbers fix it ([`RoomFacts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unset {
+    /// The serving word as it is, why `place`.
+    Kept,
+    /// The serving word at a higher P the pool fits, why `shrunk`: `mid-p<q>-s<spares>`, `1 <= q <= ceiling`.
+    Shrunk { ceiling: usize, spares: usize },
+    /// `off`, with this why's name.
+    Off(&'static str),
+}
+
+impl Unset {
+    /// The serving word's resolution on `room`, the table of the rule's clauses in `room_for`
+    /// (`crates/levers/src/lib.rs:1279`), which both families' rules reach (`residency_at_plan`, `:1379`;
+    /// `glm_residency_at_plan`, `:2134`, whose why names are the families' to map: `Serving` is `place`, `Moved`
+    /// is `shrunk`):
+    /// - no layer holds a card expert (`:1287`): `off`, `no_card_experts`;
+    /// - the fewest layer cannot hold P 0 and the spares (`:1294-1306`, `fewest < spares + 1`, and half of it is
+    ///   under the minimum P): `off`, `no_room`;
+    /// - the pool at P 0 fits the headroom and what `MemAvailable` leaves (`:1333-1337`): the word as it is;
+    /// - else the pool at the last count fits (`:1350-1361`, the pool only shrinks as the count grows): `shrunk`
+    ///   to some `q` in `1..=fewest - spares - 1`;
+    /// - else `off` (`:1362`): `host_short` where the headroom is under that pool (`:1320-1325`), else
+    ///   `mem_short`.
+    #[must_use]
+    pub fn serving(room: &RoomFacts) -> Unset {
+        let Some(fewest) = room.fewest else {
+            return Unset::Off("no_card_experts");
+        };
+        let Some(ceiling) = usize::try_from(fewest)
+            .ok()
+            .and_then(|f| f.checked_sub(room.spares + 1))
+        else {
+            return Unset::Off("no_room");
+        };
+        let fits =
+            |pool: u64| room.headroom >= i128::from(pool) && room.mem_left >= i128::from(pool);
+        if fits(room.pool_first) {
+            Unset::Kept
+        } else if ceiling >= 1 && fits(room.pool_last) {
+            Unset::Shrunk {
+                ceiling,
+                spares: room.spares,
+            }
+        } else if room.headroom < i128::from(room.pool_last) {
+            Unset::Off("host_short")
+        } else {
+            Unset::Off("mem_short")
+        }
+    }
+
+    /// Whether the rule's pair is this resolution. A why that names the removed `paged` clause is red whatever
+    /// the table says.
+    #[must_use]
+    pub fn holds(&self, word: &str, why: &str) -> bool {
+        why != "paged"
+            && match *self {
+                Unset::Kept => word == RESIDENCY_SERVING && why == "place",
+                Unset::Shrunk { ceiling, spares } => {
+                    why == "shrunk"
+                        && matches!(
+                            residency_word(word),
+                            Some(ResidencyWord::Mid { pinned, spares: s })
+                                if (1..=ceiling).contains(&pinned) && s == spares
+                        )
+                }
+                Unset::Off(name) => word == "off" && why == name,
+            }
+    }
+}
+
+impl std::fmt::Display for Unset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unset::Kept => write!(f, "{RESIDENCY_SERVING:?}, why \"place\""),
+            Unset::Shrunk { ceiling, spares } => {
+                write!(f, "mid-p1..{ceiling}-s{spares}, why \"shrunk\"")
+            }
+            Unset::Off(name) => write!(f, "\"off\", why {name:?}"),
+        }
+    }
 }
 
 impl PlanFacts {
+    /// `plan`'s facts, its unset residency rule's inputs for the churn pool of card `card`.
+    ///
     /// # Errors
     /// The arena's slots or floor refused by the placement, or an expert count past `u32`.
-    pub fn of(plan: &Plan<'_>) -> Result<PlanFacts, GateError> {
+    pub fn of(plan: &Plan<'_>, card: usize) -> Result<PlanFacts, GateError> {
         let model = plan.model;
         let mut paged_layers: Vec<usize> = plan
             .rows
@@ -90,6 +241,7 @@ impl PlanFacts {
             floor: ArenaFloor::of(plan, ARENA_COLUMNS)?,
             paged_layers,
             experts: u32::try_from(model.experts)?,
+            room: RoomFacts::of(plan, card)?,
         })
     }
 }
@@ -184,6 +336,13 @@ pub trait Family {
     /// # Errors
     /// The rule's refusal.
     fn unset_residency(&self, arm: Arm) -> Result<(String, &'static str), GateError>;
+
+    /// The pair the family's unset rule must resolve on the paged plan `plan`, from the plan's numbers alone: the
+    /// family names the rule it runs and its clauses (path:line), never runs it.
+    ///
+    /// PIN(2026-10-12): the unset word on a paged plan was `off`, why `paged`, until the `Paged` clause was
+    /// removed; it now follows `room_for`'s next clause (`crates/levers/src/lib.rs:1287-1362`).
+    fn expected_residency(&self, plan: &PlanFacts) -> Unset;
 
     /// The family's own refusals on the paged arm `paged`.
     fn refusals(&self, _paged: Arm) -> Vec<Refusal<'_>> {
@@ -447,14 +606,18 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
         }
     }
     if tier::host_clause(
-        "residency: the unset rule on the paged plan is off, why paged",
+        "residency: the unset rule on the paged plan resolves as the plan's numbers say, never why paged",
         host,
     )? {
         let (word, why) = f.unset_residency(paged_arm)?;
+        let expected = f.expected_residency(&paged.plan);
         pass &= clause(
             "residency",
-            &format!("the unset word on the paged plan is {word:?}, why {why:?}"),
-            word == "off" && why == "paged",
+            &format!(
+                "the unset word on the paged plan is {word:?}, why {why:?}; the plan's numbers give {expected} ({})",
+                paged.plan.room
+            ),
+            expected.holds(&word, why),
         );
     }
     println!("{name}: {}", tier::tally_line());

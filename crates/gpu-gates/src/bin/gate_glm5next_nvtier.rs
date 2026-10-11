@@ -57,10 +57,11 @@ mod gate {
     use app::{Loaded, Open, Session};
     use bloomery_gpu::host::nvtier::NvTier;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
+    use bloomery_gpu_gates::residency::PlanRoom;
+    use bloomery_gpu_gates::residency38::{GLM_CARD, Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, tier};
     use bloomery_gpu_glm5next::{Body, PrefillMode, checkpoint_price};
-    use bloomery_levers::{HostCfg, ResidencyAt, residency_unset};
+    use bloomery_levers::{GlmAt, GlmWhy, HostCfg, glm_residency_at_plan, glm_unset};
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
     use model::arch::glm5next::place::{NextnInputs, PlaceError, PlanInputs, card_routed};
@@ -70,7 +71,7 @@ mod gate {
     use runtime::{Out, Target, Want};
 
     use crate::glm5next_tier;
-    use crate::nvtier_family::{Arm, Family, PlanFacts, Pos, Refusal, SLOTS};
+    use crate::nvtier_family::{Arm, Family, PlanFacts, Pos, Refusal, SLOTS, Unset};
     use crate::quiet::Quiet;
 
     const NAME: &str = "gate_glm5next_nvtier";
@@ -147,7 +148,7 @@ mod gate {
             let machine = Glm::machine(&inputs)?;
             match inputs.plan_nextn(&machine, u64::try_from(CTX)?, &self.place, nextn) {
                 Ok(plan) => Ok(Ok((
-                    PlanFacts::of(&plan.plan)?,
+                    PlanFacts::of(&plan.plan, GLM_CARD)?,
                     plan.nextn.host.expert_bytes,
                 ))),
                 Err(PlaceError::Placement(e)) => Ok(Err(e)),
@@ -242,6 +243,23 @@ mod gate {
         }
     }
 
+    /// `why` in the names the family gate's table uses ([`Unset`]): the word kept as the rule's `Serving` is `place`,
+    /// the word moved to another P is `shrunk`, the other whys keep their meaning.
+    fn why_name(why: GlmWhy) -> &'static str {
+        match why {
+            GlmWhy::Serving => "place",
+            GlmWhy::Gate => "gate",
+            GlmWhy::Nextn { .. } => "nextn",
+            GlmWhy::Ctx { .. } => "ctx",
+            GlmWhy::PrefillSteps => "prefill_steps",
+            GlmWhy::NoCardExperts => "no_card_experts",
+            GlmWhy::NoRoom { .. } => "no_room",
+            GlmWhy::Moved { .. } => "shrunk",
+            GlmWhy::HostShort { .. } => "host_short",
+            GlmWhy::MemShort { .. } => "mem_short",
+        }
+    }
+
     impl Family for Glm {
         type Session = Session<Body>;
 
@@ -250,7 +268,7 @@ mod gate {
             let inputs = self.inputs(&file, arm)?;
             let machine = Glm::machine(&inputs)?;
             match inputs.plan(&machine, u64::try_from(CTX)?, &self.place) {
-                Ok(plan) => Ok(Ok(PlanFacts::of(&plan)?)),
+                Ok(plan) => Ok(Ok(PlanFacts::of(&plan, GLM_CARD)?)),
                 Err(PlaceError::Placement(e)) => Ok(Err(e)),
                 Err(e) => Err(e.into()),
             }
@@ -289,17 +307,40 @@ mod gate {
             Ok(())
         }
 
+        /// The seat's own two calls: `glm_unset` on a serving placement, then `glm_residency_at_plan` on the plan
+        /// (`serve_seats/glm.rs`, `residency_at`), the why in the family gate's names ([`why_name`]).
         fn unset_residency(&self, arm: Arm) -> Result<(String, &'static str), GateError> {
             let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
             let inputs = self.inputs(&file, arm)?;
             let machine = Glm::machine(&inputs)?;
             let plan = inputs.plan(&machine, u64::try_from(CTX)?, &self.place)?;
-            let unset = residency_unset(ResidencyAt {
+            let unset = glm_unset(GlmAt {
                 serving_place: true,
-                ..ResidencyAt::FIXED
-            });
-            let pick = bloomery_gpu_gates::residency::at_plan(&plan, 0, unset)?;
-            Ok((pick.word.to_string(), pick.why.name()))
+                nextn_layers: 1,
+                need: 0,
+                ctx: 0,
+                prefill_steps: false,
+            })
+            .residency;
+            let room = PlanRoom::new(&plan, GLM_CARD, 0);
+            let pick = glm_residency_at_plan(
+                unset,
+                room.card_experts(),
+                |pinned| room.pool_bytes(pinned),
+                room.headroom(),
+                room.mem_left()?,
+            )
+            .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?;
+            Ok((pick.word.to_string(), why_name(pick.why)))
+        }
+
+        /// The rule is `glm_residency_at_plan` (`crates/levers/src/lib.rs:2134`), which runs `room_for` (`:1279`)
+        /// with no clause of its own beside the pass-through of a word that is not `mid` (`:2141`): the table of
+        /// [`Unset::serving`] holds as it is, its `place` and `shrunk` being the rule's `Serving` and `Moved`.
+        /// On the 3090 the plan holds no routed expert on the card, so the first clause (`:1287`) answers `off`,
+        /// `no_card_experts`, whatever the arena; on the A6000 the card experts, the pool and the headroom decide.
+        fn expected_residency(&self, plan: &PlanFacts) -> Unset {
+            Unset::serving(&plan.room)
         }
 
         /// More than one routed layer stays on the host, so the tier has something to page: an

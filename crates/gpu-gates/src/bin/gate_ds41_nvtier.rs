@@ -63,7 +63,7 @@ mod gate {
     use model::placement::{Machine, PlacementError};
     use runtime::{Out, Target, Want};
 
-    use crate::nvtier_family::{Arm, Family, PlanFacts, Pos, Refusal};
+    use crate::nvtier_family::{Arm, Family, PlanFacts, Pos, Refusal, Unset};
     use crate::quiet::Quiet;
 
     const NAME: &str = "gate_ds41_nvtier";
@@ -119,7 +119,7 @@ mod gate {
             let inputs = self.inputs(&file, arm)?;
             let machine = (self.machine)(inputs.model.layers);
             match inputs.plan(&machine, workstation::CTX_MAX, &self.cfg.place) {
-                Ok(plan) => Ok(Ok(PlanFacts::of(&plan)?)),
+                Ok(plan) => Ok(Ok(PlanFacts::of(&plan, 0)?)),
                 Err(PlaceError::Placement(e)) => Ok(Err(e)),
                 Err(e) => Err(e.into()),
             }
@@ -170,6 +170,14 @@ mod gate {
             });
             let pick = bloomery_gpu_gates::residency::at_plan(&plan, 0, unset)?;
             Ok((pick.word.to_string(), pick.why.name()))
+        }
+
+        /// The rule is `residency_at_plan` (`crates/levers/src/lib.rs:1379`) on the serving word, through
+        /// `room_for` (`:1279`). A routed stack the card holds whole puts its experts past P in the churn pool
+        /// (`crates/placement/src/placement/churn.rs:46-49`) against a headroom the split's floor leaves near 0:
+        /// `host_short`. A plan whose every card-expert layer pages has an empty pool and keeps the word.
+        fn expected_residency(&self, plan: &PlanFacts) -> Unset {
+            Unset::serving(&plan.room)
         }
 
         fn refusals(&self, paged: Arm) -> Vec<Refusal<'_>> {
