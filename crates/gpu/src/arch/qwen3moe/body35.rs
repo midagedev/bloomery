@@ -66,7 +66,9 @@ use super::body::{Kernels, KvQ8, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::image::{ImageWrite, MediaRows, PromptImage};
-use super::placed::{BatchWalk, Placed, PlacedOpen, StepWalk, WalkParts, placed_bytes};
+use super::placed::{
+    BatchWalk, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans, placed_bytes,
+};
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
     SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, kinds35, moe_fits, q35,
@@ -152,12 +154,13 @@ fn prompt_rows(u: usize, ctx: usize) -> usize {
     u.max(GEMV_COLS).min(ctx)
 }
 
-/// `o` as a placed load opens it: its prompt runs as passes of up to
-/// [`MAX_PASS_ROWS`] positions through the host tier's batch port, so its
-/// ubatch arena holds that many rows, whatever `o.ubatch` asks.
+/// `o` as a placed load opens it: its prompt runs in units of up to
+/// [`PLACED_ROWS`] positions through the host tier's batch port, each host
+/// expert read once a unit, so its ubatch arena holds that many rows,
+/// whatever `o.ubatch` asks.
 fn placed_open(o: Open35) -> Open35 {
     Open35 {
-        ubatch: MAX_PASS_ROWS,
+        ubatch: PLACED_ROWS,
         ..o
     }
 }
@@ -190,8 +193,8 @@ fn ubatch_of(d: &Dims, u: usize) -> Result<NonZeroUsize, GpuError> {
 /// own ubatches. A denser spacing takes a copy of every store inside each
 /// smaller window of the prompt's own walk without saving a walk; a sparser
 /// one trades the copies away for rows every cut repeats. A placed load's
-/// prompt runs as passes of a few rows instead ([`placed_open`]), and the
-/// asked size stays the spacing: its marks cut a pass at most once a mark,
+/// prompt runs in units of [`PLACED_ROWS`] instead ([`placed_open`]), and the
+/// asked size stays the spacing: its marks cut a unit at most once a mark,
 /// a copy a window apart. The size [`ubatch_of`] returns is at most
 /// [`UBATCH`], so the `u32` loses nothing.
 fn checkpoint_every(asked: usize, d: &Dims) -> Result<u32, GpuError> {
@@ -921,6 +924,16 @@ struct Pre35 {
 }
 
 impl Pre35 {
+    /// [`Pre35::read`] for a placed load: the plans with every routed layer's
+    /// shared expert kept apart from the stacks ([`apart_plans`]).
+    fn read_placed(file: &Split, o: Open35) -> Result<Pre35, GpuError> {
+        let pre = Pre35::read(file, o)?;
+        Ok(Pre35 {
+            plans: apart_plans(pre.plans),
+            ..pre
+        })
+    }
+
     fn read(file: &Split, o: Open35) -> Result<Pre35, GpuError> {
         let Open35 {
             ctx,
@@ -1168,10 +1181,10 @@ impl GpuModel<Body35> {
     /// [`GpuModel::open_placed`] refuses to pass.
     pub fn placed_arena_bytes(file: &Split, o: Open35) -> Result<u64, GpuError> {
         let o = placed_open(o);
-        let pre = Pre35::read(file, o)?;
+        let pre = Pre35::read_placed(file, o)?;
         let forms = Forms::of(&pre.plans, &pre.d);
         let arena = arena_bytes(&pre.d, prompt_rows(o.ubatch, o.ctx), forms) as u64;
-        Ok(arena + placed_bytes(&pre.d, pre.plans.len())?)
+        Ok(arena + placed_bytes(&pre.d, pre.plans.len(), PLACED_ROWS)?)
     }
 
     /// What a whole load of `file` opened with `o` ([`GpuModel::open`])
@@ -1222,7 +1235,7 @@ impl GpuModel<Body35> {
                 ),
             ));
         }
-        let pre = Pre35::read(&file, o)?;
+        let pre = Pre35::read_placed(&file, o)?;
         if pre.layers.len() != n_layers {
             return Err(GpuError::shape(
                 WHAT_P,
@@ -1260,6 +1273,7 @@ impl GpuModel<Body35> {
                     host,
                     set,
                     arch: "qwen35moe",
+                    rows: PLACED_ROWS,
                 };
                 Body35::build(gpu, w, pre, o, asked, Some((open, counted)))
             },
@@ -1355,7 +1369,7 @@ impl Body35 {
                 (ubatch_arena(stream, (d, forms), ubatch.get(), free)?, None)
             }
             Some((open, counted)) => {
-                let side = placed_bytes(&d, plans.len())?;
+                let side = placed_bytes(&d, plans.len(), open.rows)?;
                 let u = counted_arena(stream, (d, forms), ubatch.get(), counted, side)?;
                 (u, Some(Placed::new(gpu, w, &plans, &d, open)?))
             }
@@ -1842,7 +1856,7 @@ impl Body35 {
             ..
         }) = placed
         {
-            let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, MAX_PASS_ROWS);
+            let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, side.cap);
             return BatchWalk {
                 p: WalkParts {
                     c: &c,
@@ -1887,7 +1901,7 @@ impl GpuModel<Body35> {
                 "qwen35moe::set_ubatch",
                 format!(
                     "ubatches of {u} tokens on a placed load: its arena is the plan's count, \
-                     passes of up to {MAX_PASS_ROWS}"
+                     units of up to {PLACED_ROWS}"
                 ),
             ));
         }
@@ -1906,18 +1920,6 @@ impl GpuModel<Body35> {
     /// by `path`, at this model's ubatch size.
     pub fn prefill_plan(&self, tokens: usize, path: PrefillPath) -> Result<PrefillPlan, GpuError> {
         let body = self.body("qwen35moe::prefill_plan")?;
-        // A placed load walks units of at most GEMV_COLS rows through the
-        // host tier's batch port: its prompt runs as passes.
-        let path = match (body.placed.is_some(), path) {
-            (true, PrefillPath::Gemm) => {
-                return Err(GpuError::shape(
-                    "qwen35moe::prefill_plan",
-                    "a GEMM ubatch on a placed load: its prompt runs as passes (auto or pass)",
-                ));
-            }
-            (true, _) => PrefillPath::Pass,
-            (false, p) => p,
-        };
         PrefillPlan::new(tokens, path, body.ubatch)
     }
 

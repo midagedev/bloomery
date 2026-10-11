@@ -6,8 +6,11 @@
 //!
 //! The walks are the layer program's (`program`) over a host leg: the
 //! decode step `(1, 1, Step)` through the tier's step port ([`StepWalk`],
-//! captured), a prompt unit `(1, m, Batch)` of up to [`GEMV_COLS`] rows
-//! through its batch port ([`BatchWalk`]). A layer's parts:
+//! captured), a prompt unit `(1, m, Batch)` of up to [`PlacedOpen::rows`]
+//! rows through its batch port ([`BatchWalk`]): a unit of up to
+//! [`GEMV_COLS`] rows runs the gemv arm's launches below, a longer one the
+//! wide arm's (`wide::ffn_front`, `wide::ffn_card`, `wide::ffn_combine`) over
+//! the layer's own map and table of the card's experts. A layer's parts:
 //! - the front: the mixer (`dispatch::mixer`, the chain's own), the FFN
 //!   norm with its q8_1 form and the router — the norm into the step
 //!   boundary's activation, or the arena's for a unit — then the host leg's
@@ -35,6 +38,12 @@
 //! (the whole-card load folds the shared expert into its stacks as one more
 //! expert, which a card holding part of a layer's experts cannot).
 //!
+//! A load whose arena holds more than [`GEMV_COLS`] rows (`Body35`'s, at
+//! the host union's [`PLACED_ROWS`]) reads each host expert once a unit; the
+//! walk of `Body`'s plain router stays within [`GEMV_COLS`] rows (the wide
+//! arm refuses a plain router by name). The wide arm's tables see the shared
+//! expert kept apart on every layer ([`apart_plans`]).
+//!
 //! Numerics: the routing is the whole-card chain's bit for bit (the step's
 //! norm and router are `norm_quant` and the router, which the whole-card
 //! step's fused launch writes bit for bit); the host's experts are qdot's
@@ -45,17 +54,20 @@
 use super::body::{Kernels, ggml_ty, stack_tys};
 use super::dispatch::{self, Ctx, PassCtx};
 use super::hostleg::{HostCombineArgs, HostLegKernels, PlacesArgs};
-use super::plan::{FfnPlan, FfnRoute, GateUpEntry, LayerPlan, SiteTy, gate_up_entry};
+use super::plan::{
+    FfnPlan, FfnRoute, GateUpEntry, LayerPlan, SharedPlan, SharedSites, SiteTy, gate_up_entry,
+};
 use super::program::{Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Io};
-use super::wide::{GEMV_COLS, act_col_bytes};
+use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, route_bytes};
+use crate::gemm::GemmRoute;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, HOST, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
+use crate::model::HostServed;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
-use crate::model::{HostServed, MAX_PASS_ROWS};
 use crate::q4k_sel::QuantSel;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::Weights;
@@ -64,12 +76,17 @@ use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
+use model::moe::UNION_MAX_COLS;
 use model::placement::Plan;
 use model::placement::kernels::{self, DownAct, DownEntry};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::sync::Arc;
 
 const WHAT: &str = "qwen3moe placed load";
+
+/// The rows of a placed prompt unit that reads each host expert once: the
+/// host union's most columns.
+pub(super) const PLACED_ROWS: usize = UNION_MAX_COLS;
 
 /// The shared expert of a placed Qwen3.6 layer: its three stacks of one
 /// expert each, as the file holds them, its gate·up entry and its down's
@@ -133,10 +150,13 @@ impl RouteShape {
 /// One arena's buffers of the host leg: each slot's place (`pitch` a row),
 /// and for the shared expert its fixed route (every row's slot on expert 0),
 /// its SwiGLU rows, their q8_1 form (one activation of `m` columns for each
-/// gemv width `m`) and its output.
+/// gemv width `m`) and its output; when the arena holds more than
+/// [`GEMV_COLS`] rows, each layer's table over the card's experts (`None`
+/// on a layer with none).
 pub(super) struct PlacedRows {
     sel: DeviceBuffer<u32>,
     shared: Option<SharedRows>,
+    routes: Vec<Option<GemmRoute>>,
 }
 
 /// The shared expert's buffers of [`PlacedRows`].
@@ -148,31 +168,54 @@ struct SharedRows {
 }
 
 impl PlacedRows {
-    /// The buffers of an arena of `rows` rows (at most [`GEMV_COLS`]) for
-    /// `shape`, every place [`HOST`] until a launch writes it. Load-time
-    /// only.
-    fn new(stream: &CudaStream, shape: RouteShape, rows: usize) -> Result<PlacedRows, GpuError> {
-        if rows == 0 || rows > GEMV_COLS {
+    /// The buffers of an arena of `rows` rows for `shape`, every place
+    /// [`HOST`] until a launch writes it: the shared expert's rows for the
+    /// gemv arm's widths (at most [`GEMV_COLS`]), and past that many rows the
+    /// routed table of each layer over its `cards` experts. Load-time only.
+    fn new(
+        stream: &CudaStream,
+        shape: RouteShape,
+        rows: usize,
+        cards: &[usize],
+    ) -> Result<PlacedRows, GpuError> {
+        if rows == 0 {
             return Err(GpuError::shape(
                 WHAT,
-                format!("a host leg's rows for an arena of {rows} rows (1..={GEMV_COLS})"),
+                "a host leg's rows for an arena of no row",
             ));
         }
+        let narrow = rows.min(GEMV_COLS);
         let sel = DeviceBuffer::from_host(stream, &vec![HOST; rows * shape.pitch])?;
         let shared = shape
             .shared()
             .then(|| {
                 Ok::<_, GpuError>(SharedRows {
-                    zero: DeviceBuffer::zeroed(stream, rows)?,
-                    h: DeviceBuffer::zeroed(stream, rows * shape.ff)?,
-                    act: (1..=rows)
+                    zero: DeviceBuffer::zeroed(stream, narrow)?,
+                    h: DeviceBuffer::zeroed(stream, narrow * shape.ff)?,
+                    act: (1..=narrow)
                         .map(|m| Q8Act::with_k(stream, m, shape.ff))
                         .collect::<Result<Vec<_>, _>>()?,
-                    y: DeviceBuffer::zeroed(stream, rows * shape.hidden)?,
+                    y: DeviceBuffer::zeroed(stream, narrow * shape.hidden)?,
                 })
             })
             .transpose()?;
-        Ok(PlacedRows { sel, shared })
+        let routes = if rows > GEMV_COLS {
+            cards
+                .iter()
+                .map(|&n| {
+                    (n > 0)
+                        .then(|| GemmRoute::new(stream, rows * shape.pitch, n))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(PlacedRows {
+            sel,
+            shared,
+            routes,
+        })
     }
 
     /// Device bytes.
@@ -184,6 +227,12 @@ impl PlacedRows {
                     + s.act.iter().map(Q8Act::device_bytes).sum::<usize>()
                     + s.y.num_bytes()
             })
+            + self
+                .routes
+                .iter()
+                .flatten()
+                .map(GemmRoute::bytes)
+                .sum::<usize>()
     }
 }
 
@@ -196,17 +245,24 @@ pub(super) struct PlacedKernels {
 }
 
 /// What every placed walk reads besides the arena: each layer's card
-/// experts, the slot map's card copy, the route's shape and the kernels.
+/// experts, the slot map's card copy, the route's shape and the kernels, the
+/// most rows of a unit, and — past [`GEMV_COLS`] of them — each layer's map
+/// of the experts to their places in the card's stacks (the router's expert
+/// count and one entry for the shared expert's id, [`HOST`]).
 pub(super) struct PlacedSide {
     ffn: Vec<PlacedFfn>,
     slots: DeviceTensor<u32>,
+    maps: Vec<DeviceBuffer<u32>>,
     shape: RouteShape,
     k: PlacedKernels,
+    /// The rows of the most a unit walks.
+    pub(super) cap: usize,
 }
 
 /// The placed side of a load: the host tier over every layer's routed
 /// experts, what the walks read, and the step's and the pass arena's host
-/// leg buffers, with the host sums a unit's upload lands in.
+/// leg buffers, with the host sums a unit's upload lands in (a row of the
+/// model's width for each of the unit's most rows).
 pub struct Placed {
     pub(super) hybrid: Hybrid<HostRun>,
     pub(super) side: PlacedSide,
@@ -226,6 +282,9 @@ pub(super) struct PlacedOpen<'a> {
     pub(super) set: HostResidency,
     /// The architecture the host run's refusals name.
     pub(super) arch: &'static str,
+    /// The most rows a prompt unit holds: the arena's, [`PLACED_ROWS`] on a
+    /// load that runs the wide arm, [`GEMV_COLS`] on a plain router's.
+    pub(super) rows: usize,
 }
 
 impl Placed {
@@ -238,8 +297,9 @@ impl Placed {
     /// chain, the boundary of one row, the host tier over every layer's
     /// routed stacks (qdot's, refused by name for a stack no fused kernel
     /// serves) watching the fault word and holding the host set, its batch
-    /// port for passes of up to [`MAX_PASS_ROWS`] rows, and the buffers. A
-    /// plan of other than one card, with an expert tier, or not of every
+    /// port for units of up to `o.rows` rows, and the buffers (past
+    /// [`GEMV_COLS`] rows each layer's map and table of its card experts).
+    /// A plan of other than one card, with an expert tier, or not of every
     /// layer is refused by name. Load-time only.
     pub(super) fn new(
         gpu: &Gpu,
@@ -278,7 +338,14 @@ impl Placed {
             .enumerate()
             .map(|(l, p)| placed_ffn(w, &map, shape, p, l))
             .collect::<Result<Vec<_>, _>>()?;
-        let slots = DeviceTensor::upload(stream, &map.stage_view(), n, shape.n_expert)?;
+        let stage = map.stage_view();
+        let slots = DeviceTensor::upload(stream, &stage, n, shape.n_expert)?;
+        let cards: Vec<usize> = ffn.iter().map(|f| f.n_card).collect();
+        let maps = if o.rows > GEMV_COLS {
+            layer_maps(stream, &stage, n, shape.n_expert)?
+        } else {
+            Vec::new()
+        };
         let boundary = Boundary::new(
             gpu.context(),
             stream,
@@ -304,11 +371,11 @@ impl Placed {
         let mut experts = crate::model::host_run(o.plan, &o.file, 0, o.host.r8, widths, |src| {
             model::arch::qwen35moe::host::routed_layers(src, dims, 0..n, o.arch)
         })?;
-        experts.prepare_union(MAX_PASS_ROWS)?;
+        experts.prepare_union(o.rows)?;
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(o.set);
-        hybrid.prepare_batch(gpu.context(), MAX_PASS_ROWS)?;
+        hybrid.prepare_batch(gpu.context(), o.rows)?;
         let ctx = gpu.context();
         let k = PlacedKernels {
             handoff: HandoffKernels::load(ctx)?,
@@ -320,15 +387,22 @@ impl Placed {
             side: PlacedSide {
                 ffn,
                 slots,
+                maps,
                 shape,
                 k,
+                cap: o.rows,
             },
-            step: PlacedRows::new(stream, shape, 1)?,
-            pass: PlacedRows::new(stream, shape, MAX_PASS_ROWS)?,
-            pass_hsum: DeviceBuffer::zeroed(stream, MAX_PASS_ROWS * shape.hidden)?,
+            step: PlacedRows::new(stream, shape, 1, &[])?,
+            pass: PlacedRows::new(stream, shape, o.rows, &cards)?,
+            pass_hsum: DeviceBuffer::zeroed(stream, o.rows * shape.hidden)?,
         };
         let made = placed.device_bytes() - placed.hybrid.boundary().device_bytes();
-        let counted = placed_bytes(d, n)?;
+        let tables: usize = cards
+            .iter()
+            .filter(|&&c| c > 0)
+            .map(|&c| route_bytes(o.rows * shape.pitch, c))
+            .sum();
+        let counted = placed_total(d, n, o.rows, if o.rows > GEMV_COLS { tables } else { 0 })?;
         if made as u64 != counted {
             return Err(GpuError::shape(
                 WHAT,
@@ -345,10 +419,16 @@ impl Placed {
     }
 
     /// Device bytes the placed side holds: the slot map's card copy, the
-    /// buffers, the host sums and the boundary.
+    /// layers' maps, the buffers, the host sums and the boundary.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
         self.side.slots.buf().num_bytes()
+            + self
+                .side
+                .maps
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
             + self.step.bytes()
             + self.pass.bytes()
             + self.pass_hsum.num_bytes()
@@ -377,25 +457,126 @@ impl Placed {
 }
 
 /// Device bytes [`Placed`] holds for a chain of `layers` layers over arena
-/// dims `d`, beside the boundary (which the context and margin cover): what
-/// a plan counts in the card's scratch for it. A chain of dense FFNs is
-/// refused by name.
-pub(super) fn placed_bytes(d: &Dims, layers: usize) -> Result<u64, GpuError> {
+/// dims `d` with units of up to `rows` rows, beside the boundary (which the
+/// context and margin cover): what a plan counts in the card's scratch for
+/// it. Past [`GEMV_COLS`] rows each layer's table over its card experts is
+/// counted at the larger of the file's expert count and one expert, the
+/// bound the plan's expert split (which this count is an input to) cannot
+/// know; [`Placed::new`] checks the load against the count at its split. A
+/// chain of dense FFNs is refused by name.
+pub(super) fn placed_bytes(d: &Dims, layers: usize, rows: usize) -> Result<u64, GpuError> {
     let s = RouteShape::of(d)?;
-    let rows = |r: usize| {
-        let shared = if s.shared() {
+    let slots = rows * s.pitch;
+    let table = route_bytes(slots, s.n_expert).max(route_bytes(slots, 1));
+    placed_total(
+        d,
+        layers,
+        rows,
+        if rows > GEMV_COLS { layers * table } else { 0 },
+    )
+}
+
+/// [`placed_bytes`] with the layers' tables counted as `tables` bytes in all
+/// (past [`GEMV_COLS`] rows).
+fn placed_total(d: &Dims, layers: usize, rows: usize, tables: usize) -> Result<u64, GpuError> {
+    let s = RouteShape::of(d)?;
+    let shared = |r: usize| {
+        if s.shared() {
             r * 4
                 + r * s.ff * 4
                 + (1..=r).map(|m| m * act_col_bytes(s.ff)).sum::<usize>()
                 + r * s.hidden * 4
         } else {
             0
-        };
-        r * s.pitch * 4 + shared
+        }
     };
-    let total =
-        layers * s.n_expert * 4 + rows(1) + rows(MAX_PASS_ROWS) + MAX_PASS_ROWS * s.hidden * 4;
+    let leg = |sel: usize, narrow: usize| sel * s.pitch * 4 + shared(narrow);
+    let maps = if rows > GEMV_COLS {
+        layers * (s.n_expert + 1) * 4 + tables
+    } else {
+        0
+    };
+    let total = layers * s.n_expert * 4
+        + leg(1, 1)
+        + leg(rows, rows.min(GEMV_COLS))
+        + rows * s.hidden * 4
+        + maps;
     u64::try_from(total).map_err(|_| GpuError::shape(WHAT, "the placed side's bytes pass u64"))
+}
+
+/// Each layer's map of the experts to their places in the card's stacks:
+/// `stage` the slot map's card copy (`n_expert` places a layer, [`HOST`]
+/// for the host's), each row with one more entry, [`HOST`], for the shared
+/// expert's id. Load-time only.
+fn layer_maps(
+    stream: &CudaStream,
+    stage: &[u32],
+    layers: usize,
+    n_expert: usize,
+) -> Result<Vec<DeviceBuffer<u32>>, GpuError> {
+    if stage.len() != layers * n_expert {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the slot map's card copy holds {} places, {layers} layers of {n_expert} \
+                 experts hold {}",
+                stage.len(),
+                layers * n_expert
+            ),
+        ));
+    }
+    stage
+        .chunks(n_expert)
+        .map(|row| {
+            let map: Vec<u32> = row.iter().copied().chain([HOST]).collect();
+            DeviceBuffer::from_host(stream, &map)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// `plans` with every routed layer's shared expert kept apart from the
+/// routed stacks: a layer the plan folds into its stacks
+/// ([`SharedPlan::Joined`], whose three types the stacks and the shared
+/// expert share) names the file's routed stacks and the shared expert's own
+/// three, at those types, as a layer of other types does. A placed load joins
+/// no stacks (the card holds a layer's routed experts in the file's own, the
+/// shared expert on its own), so the wide arm reads the plan this makes: a
+/// fact of the placed load, made once in `Pre35::read_placed` for both the
+/// plan's count (`GpuModel::placed_arena_bytes`) and the open, so on a file
+/// whose layers are all folded the arena bytes the plan counts are the bytes
+/// the open allocates.
+pub(super) fn apart_plans(plans: Vec<LayerPlan>) -> Vec<LayerPlan> {
+    plans
+        .into_iter()
+        .enumerate()
+        .map(|(l, LayerPlan { mixer, ffn })| {
+            let ffn = match ffn.route {
+                FfnRoute::Router {
+                    gate_inp,
+                    shared: Some(SharedPlan::Joined),
+                } => FfnPlan {
+                    route: FfnRoute::Router {
+                        gate_inp,
+                        shared: Some(SharedPlan::Apart(SharedSites {
+                            gate: format!("blk.{l}.ffn_gate_shexp.weight"),
+                            up: format!("blk.{l}.ffn_up_shexp.weight"),
+                            down: format!("blk.{l}.ffn_down_shexp.weight"),
+                            gate_ty: ffn.gate_ty,
+                            up_ty: ffn.up_ty,
+                            down_ty: ffn.down_ty,
+                        })),
+                    },
+                    gate: model::arch::qwen3moe::names::ffn_gate_exps(l),
+                    up: model::arch::qwen3moe::names::ffn_up_exps(l),
+                    down: model::arch::qwen3moe::names::ffn_down_exps(l),
+                    ..ffn
+                },
+                route => FfnPlan { route, ..ffn },
+            };
+            LayerPlan { mixer, ffn }
+        })
+        .collect()
 }
 
 /// Layer `l`'s card experts under `map` (module doc, [`Placed::new`]).
@@ -813,6 +994,31 @@ fn combine(
     )
 }
 
+/// Layer `l`'s card work under the host leg over `m` rows (more than
+/// [`GEMV_COLS`]) of arena `s`: the wide arm's routed table over the layer's
+/// card experts through its map, the routed GEMMs, and the shared expert.
+fn card_wide(
+    c: &Ctx<'_>,
+    side: &PlacedSide,
+    rows: &mut PlacedRows,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    let map = side.maps.get(c.layer).ok_or(GpuError::state(
+        WHAT,
+        "a map of the card's experts for every layer of a wide unit",
+    ))?;
+    let table = rows
+        .routes
+        .get_mut(c.layer)
+        .ok_or(GpuError::state(
+            WHAT,
+            "a table of the card's experts for every layer of a wide unit",
+        ))?
+        .as_mut();
+    wide::ffn_card(c, &c.p.ffn, s, m, Some(CardRoute { map, table }))
+}
+
 /// What a placed walk reads and writes: the chain's context, its stores,
 /// the arena and its input, the unit's rows, the placed side and the
 /// arena's host leg buffers.
@@ -950,27 +1156,30 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
     }
 }
 
-/// A prompt unit's walk `(1, m, Batch)` of up to [`GEMV_COLS`] rows through
-/// the host tier's batch port; its [`Tail`] follows the walk
-/// ([`BatchWalk::walk`]).
+/// A prompt unit's walk `(1, m, Batch)` of up to [`PlacedSide::cap`] rows
+/// through the host tier's batch port; its [`Tail`] follows the walk
+/// ([`BatchWalk::walk`]). A unit of up to [`GEMV_COLS`] rows is the gemv
+/// arm's launches (`route`, `shadow`, `combine`), a longer one the wide
+/// arm's.
 pub(super) struct BatchWalk<'a, S: Stores + ?Sized> {
     pub(super) p: WalkParts<'a, S>,
 }
 
 impl<'a, S: Stores + ?Sized> BatchWalk<'a, S> {
     /// Walk every layer at the unit's rows through `leg`, then `tail`. A
-    /// unit of no row or past [`GEMV_COLS`] rows is refused by name.
+    /// unit of no row or past the placed side's most rows is refused by name.
     pub(super) fn walk(
         mut self,
         leg: &mut BatchLeg<'a, HostRun>,
         mut tail: Tail<'a>,
     ) -> Result<(), GpuError> {
         let m = self.p.m;
-        if m == 0 || m > GEMV_COLS || self.p.c.plans.is_empty() {
+        let cap = self.p.side.cap;
+        if m == 0 || m > cap || self.p.c.plans.is_empty() {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "a unit of {m} rows over {} layers; a placed unit walks 1..={GEMV_COLS} rows",
+                    "a unit of {m} rows over {} layers; a placed unit walks 1..={cap} rows",
                     self.p.c.plans.len()
                 ),
             ));
@@ -990,15 +1199,20 @@ impl<'a, S: Stores + ?Sized> BatchWalk<'a, S> {
 impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
     type Port = BatchLeg<'a, HostRun>;
 
-    /// The mixer, the norm into the arena's `normed` and the router, the
-    /// download of the unit's rows, weights and ids, and the places.
+    /// The mixer, the norm into the arena's `normed` and the router (the
+    /// wide arm's front past [`GEMV_COLS`] rows), the download of the unit's
+    /// rows, weights and ids, and the places.
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         self.p.mixer(l)?;
         let p = &mut self.p;
         let lc = ctx_of(p.c, l)?;
         let m = p.m;
-        route(&lc, &lc.p.ffn, p.s, m, None)?;
+        if m > GEMV_COLS {
+            wide::ffn_front(&lc, &lc.p.ffn, p.s, m)?;
+        } else {
+            route(&lc, &lc.p.ffn, p.s, m, None)?;
+        }
         let shape = p.side.shape;
         let key = port.key(at);
         let stream = lc.gpu.stream();
@@ -1030,6 +1244,9 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
     fn shadow(&mut self, _: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let p = &mut self.p;
         let lc = ctx_of(p.c, at.layer)?;
+        if p.m > GEMV_COLS {
+            return card_wide(&lc, p.side, p.rows, p.s, p.m);
+        }
         shadow(&lc, p.side, p.rows, p.s, p.m)
     }
 
@@ -1037,6 +1254,19 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let p = &mut self.p;
         let lc = ctx_of(p.c, at.layer)?;
+        if p.m > GEMV_COLS {
+            let f = p
+                .side
+                .ffn
+                .get(at.layer)
+                .ok_or(GpuError::state(WHAT, "a placed FFN for every layer"))?;
+            let host = HostSide {
+                sel: &p.rows.sel,
+                hsum: port.hsum(),
+                n_card: f.n_card,
+            };
+            return wide::ffn_combine(&lc, &lc.p.ffn, p.s, p.m, Some(host), None);
+        }
         combine(&lc, p.side, p.rows, p.s, p.m, port.hsum(), None)
     }
 }

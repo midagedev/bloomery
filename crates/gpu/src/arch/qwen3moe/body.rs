@@ -26,7 +26,8 @@ use crate::head::Head;
 use crate::host::StepLeg;
 use crate::linear::LinearKernels;
 use crate::model::{
-    ChainBody, GpuModel, Instrumented, Rollback, RowHeads, SlotRange, SlotRows, Slots, block_count,
+    ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, RowHeads, SlotRange, SlotRows,
+    Slots, block_count,
 };
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
@@ -655,6 +656,7 @@ impl GpuModel<Body> {
                     host,
                     set,
                     arch: "qwen3moe",
+                    rows: MAX_PASS_ROWS,
                 };
                 Body::load(
                     gpu,
@@ -688,7 +690,7 @@ impl GpuModel<Body> {
             router,
             ctx,
         );
-        placed_bytes(&dims, hp.n_layer)
+        placed_bytes(&dims, hp.n_layer, MAX_PASS_ROWS)
     }
 
     /// What a whole load of `file` ([`GpuModel::open`]) holds past its
@@ -788,7 +790,7 @@ impl Body {
         let placed = match placed {
             None => None,
             Some((open, counted)) => {
-                let side = placed_bytes(&dims, plans.len())?;
+                let side = placed_bytes(&dims, plans.len(), MAX_PASS_ROWS)?;
                 if side > counted {
                     return Err(GpuError::shape(
                         what,

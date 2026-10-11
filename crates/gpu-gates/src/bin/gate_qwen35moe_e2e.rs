@@ -177,9 +177,13 @@
 //!   unit runs every card launch and every host dot the way its one-row
 //!   step does; (o2) (c) on it, the same [`FREE_BAND`] — a host expert runs
 //!   ik's own 8-bit rule (Q8_K activations) where the card runs q8_1, so no
-//!   layer's error grows; (o3) a GEMM prompt, a ubatch resize and a pass of
-//!   two resident slots refused by name, the ubatch kept; (o4) the host tier
-//!   served slots on both of its ports. `--placed-only` runs (o) alone.
+//!   layer's error grows; (o5) (u) and (d) on it ([`wide_arm`]): the step
+//!   set's prompt as ubatches of [`PLACED_UBATCH`] rows, whose layers run
+//!   the card's experts through the wide GEMMs over a per-layer map and the
+//!   host's once a unit, against the pass run, within the same bands; (o3)
+//!   a ubatch resize and a pass of two resident slots refused by name, the
+//!   ubatch kept; (o4) the host tier served slots on both of its ports.
+//!   `--placed-only` runs (o) alone.
 //!
 //! (m) the memory guard, `--memguard-only` (no model loaded): the census
 //!   free reading, the quiet-card whole decision, the held-card refusal by
@@ -293,6 +297,10 @@ mod gate {
     const W_SIZES: [usize; 3] = [512, 1000, 100];
     const W_CUT: usize = 24;
 
+    /// A placed load's prompt unit: the host union's columns
+    /// (`model::moe::UNION_MAX_COLS`), each host expert read once a unit.
+    const PLACED_UBATCH: usize = model::moe::UNION_MAX_COLS;
+
     /// PIN(2026-09-27): (u)'s band on layer 0's recurrent state and conv ring
     /// against the pass run's (`‖ubatch − pass‖ / ‖pass‖`). Layer 0's input is
     /// the same bits on both paths (the embedding rows; `rms_norm` then the
@@ -322,6 +330,21 @@ mod gate {
     /// one, a stale route row — adds an error of order one to distances of
     /// 1e-2 to 0.3, a ratio above 3 on every layer it reaches.
     const STEP_RATIO: f64 = 1.5;
+
+    /// PIN(2026-10-11): [`STEP_RATIO`] for the placed load's wide arm: the
+    /// stores' [`PROMPT_RATIO`], 2.5. Derivation: the ratio is one step's output
+    /// distance from ik after the ubatch run's own state over the pass run's,
+    /// and each distance is one excursion of the state it started from, not an
+    /// average (the whole-card load's per-layer ratios scatter about 1 on
+    /// the log scale, the pass run's distance jumping at single layers). The
+    /// placed pass run is the host's 8-bit rule, another realization of the
+    /// same rule, so its denominator has its own excursions. The bound is
+    /// [`PROMPT_RATIO`]'s: √(1 + (d_wp/d_pi)²) with the two runs' own distance
+    /// up to 2.3 d_pi is 2.5. A wiring fault adds an error of order one to
+    /// distances of 1e-2 to 0.3, a ratio above 3 on every layer it reaches
+    /// ([`STEP_RATIO`]'s note). The last logits keep [`STEP_RATIO`]: they are
+    /// the one tensor all layers' excursions average into.
+    const PLACED_STEP_RATIO: f64 = 2.5;
 
     /// PIN(2026-09-28): (d)'s bound on a layer's store distance from ik (a
     /// recurrent state and the conv ring's rows ik keeps, or the K and V rows,
@@ -1686,15 +1709,22 @@ mod gate {
         }
     }
 
-    fn wide_arm(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
+    /// (u) and (d) on `m`, whose ubatch is `ubatch`: the step set's prompt on
+    /// the pass path (the one-token path's bits) and as the ubatch walk, whose
+    /// units are all wide (`label` prefixes the clause's lines). The whole
+    /// load runs the prompt as one ubatch ([`U_GATE`]); the placed load as
+    /// ubatches of [`PLACED_UBATCH`] — the host union's columns — whose layers
+    /// run the card's experts through the wide GEMMs and the host's once a
+    /// unit.
+    fn wide_arm(m: &mut Qwen35moeModel, label: &str, ubatch: usize) -> Result<bool, GateError> {
         let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
         let (p, tail, prompt) = man.step()?;
         let token = *tail.first().ok_or("the step set holds no token")?;
         let pu = p as usize;
-        if prompt.len() != pu || m.ubatch()? != U_GATE {
+        if prompt.len() != pu || m.ubatch()? != ubatch {
             return Err(format!(
                 "the step set's prompt is {} ids before position {p}, the model's ubatch {}; \
-                 the clause runs {U_GATE} ids as one ubatch",
+                 the clause runs them as ubatches of {ubatch}",
                 prompt.len(),
                 m.ubatch()?
             )
@@ -1711,7 +1741,7 @@ mod gate {
             if l == 0 {
                 let pass0 = kinds[0] == LayerKind35::Delta && worse(x, y) <= U_L0_REL;
                 println!(
-                    "wide layer=0 {:?} state_rel={x:.3e} ring_rel={y:.3e} against the pass run \
+                    "{label}wide layer=0 {:?} state_rel={x:.3e} ring_rel={y:.3e} against the pass run \
                      (band {U_L0_REL:.0e}) {}",
                     kinds[0],
                     verdict(pass0)
@@ -1719,13 +1749,13 @@ mod gate {
                 ok &= pass0;
             } else {
                 println!(
-                    "wide layer={l} {:?} rel={x:.3e} / {y:.3e} (printed)",
+                    "{label}wide layer={l} {:?} rel={x:.3e} / {y:.3e} (printed)",
                     kinds[l]
                 );
             }
         }
         println!(
-            "wide prefill: token ours ubatch={} pass={}, last logits_rel={:.3e} (printed)",
+            "{label}wide prefill: token ours ubatch={} pass={}, last logits_rel={:.3e} (printed)",
             ub.next,
             pass.next,
             rel_to(&ub.logits, &pass.logits)
@@ -1745,7 +1775,7 @@ mod gate {
             }
             let rw = worse(wa, wb) / d_pi;
             println!(
-                "prompt store layer={l} {kind:?} from ik: ubatch {:.3e} pass {:.3e} ratio {r:.2}; \
+                "{label}prompt store layer={l} {kind:?} from ik: ubatch {:.3e} pass {:.3e} ratio {r:.2}; \
                  ubatch from pass {:.3e}, independent-error bound {:.2} (printed)",
                 worse(ua, ub_),
                 worse(pa, pb),
@@ -1755,7 +1785,7 @@ mod gate {
         }
         let pass_d = worst.0 <= PROMPT_RATIO;
         println!(
-            "prompt stores: worst ratio {:.2} at layer {} (band {PROMPT_RATIO}) {}",
+            "{label}prompt stores: worst ratio {:.2} at layer {} (band {PROMPT_RATIO}) {}",
             worst.0,
             worst.1,
             verdict(pass_d)
@@ -1765,9 +1795,11 @@ mod gate {
         for (l, (a, b)) in ub.step_taps.iter().zip(&pass.step_taps).enumerate() {
             let want = tap(&man, &format!("l_out-{l}"))?;
             let want = last_rows(&want, HIDDEN, 1).ok_or("l_out")?;
-            let r = worse(
-                0.0,
-                rel_to(a, want) / rel_to(b, want).max(f64::MIN_POSITIVE),
+            let (da, db) = (rel_to(a, want), rel_to(b, want));
+            let r = worse(0.0, da / db.max(f64::MIN_POSITIVE));
+            println!(
+                "{label}prompt step layer={l} l_out from ik: ubatch {da:.3e} pass {db:.3e} ratio \
+                 {r:.2} (printed)"
             );
             if r > worst_out.0 {
                 worst_out = (r, l);
@@ -1781,10 +1813,15 @@ mod gate {
             rel_to(&pass.step_logits, ik_last),
         );
         let r_logits = worse(0.0, lu / lp.max(f64::MIN_POSITIVE));
-        let pass_s = worst_out.0 <= STEP_RATIO && r_logits <= STEP_RATIO;
+        let step_band = if label.is_empty() {
+            STEP_RATIO
+        } else {
+            PLACED_STEP_RATIO
+        };
+        let pass_s = worst_out.0 <= step_band && r_logits <= STEP_RATIO;
         println!(
-            "prompt step {p}: worst l_out ratio {:.2} at layer {}, logits from ik ubatch {lu:.3e} \
-             pass {lp:.3e} ratio {r_logits:.2} (band {STEP_RATIO}); argmax ubatch={} pass={} \
+            "{label}prompt step {p}: worst l_out ratio {:.2} at layer {}, logits from ik ubatch {lu:.3e} \
+             pass {lp:.3e} ratio {r_logits:.2} (band {step_band}); argmax ubatch={} pass={} \
              ik={} (printed) {}",
             worst_out.0,
             worst_out.1,
@@ -2897,8 +2934,24 @@ mod gate {
         if !split {
             return Ok(false);
         }
+        // (o6)
+        let scratch = GpuModel::<Body35>::placed_arena_bytes(&file, o)?;
+        let card = plan.machine.cards.first().ok_or("a plan of no card")?;
+        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let joined = header_apart(MODEL)?.iter().filter(|&&a| !a).count();
         let t = Instant::now();
         let mut m = GpuModel::<Body35>::open_placed(file, &plan, o, host)?;
+        let apart = m.body("gate_qwen35moe_e2e")?.shared_apart();
+        let every = apart.iter().all(|&a| a);
+        let counts = scratch == counted;
+        println!(
+            "placed scratch: the plan counts {counted} B, the arena and placed side the planner \
+             counts {scratch} B {}; every layer's shared expert kept apart on the placed load \
+             {every} ({joined} of {N_LAYER} layers are folded in the file) {}",
+            verdict(counts),
+            verdict(every)
+        );
+        let mut ok_scratch = counts && every;
         let counts = m
             .body("gate_qwen35moe_e2e")?
             .placed()
@@ -2948,9 +3001,10 @@ mod gate {
             &call,
             &fifth,
         );
+        // (o5)
+        ok &= wide_arm(&mut m, "placed ", PLACED_UBATCH)?;
         // (o3)
         let u0 = m.ubatch()?;
-        let gemm = m.prefill_plan(toks.len(), PrefillPath::Gemm).err();
         let resize = m.set_ubatch(U_GATE).err();
         m.add_slots(2)?;
         let pass = refused(
@@ -2958,11 +3012,10 @@ mod gate {
             "qwen35moe slots",
             "on a placed load",
         );
-        let named = gemm.is_some() && resize.is_some() && m.ubatch()? == u0 && pass;
+        let named = resize.is_some() && m.ubatch()? == u0 && pass;
         println!(
-            "placed refusals: a GEMM prompt: {}; ubatches of {U_GATE}: {} (ubatch {u0} kept); a \
-             pass of two resident slots named {pass} {}",
-            gemm.map_or("accepted".to_string(), |e| e.to_string()),
+            "placed refusals: ubatches of {U_GATE}: {} (ubatch {u0} kept); a pass of two \
+             resident slots named {pass} {}",
             resize.map_or("accepted".to_string(), |e| e.to_string()),
             verdict(named)
         );
@@ -2980,7 +3033,8 @@ mod gate {
             stats.batch_host_slots,
             verdict(served)
         );
-        Ok(ok && named && served)
+        ok_scratch &= named && served;
+        Ok(ok && ok_scratch)
     }
 
     /// The batch set's manifest and its five tokens.
@@ -3146,7 +3200,7 @@ mod gate {
             ok &= step_set(&mut m, set, &gains)?;
         }
         ok &= gemv_arm(&mut m, &toks, &decode)?;
-        ok &= wide_arm(&mut m)?;
+        ok &= wide_arm(&mut m, "", U_GATE)?;
         ok &= ubatch_bits(&mut m)?;
         ok &= wide_plan(&mut m)?;
         ok &= refusals(&mut m)?;
