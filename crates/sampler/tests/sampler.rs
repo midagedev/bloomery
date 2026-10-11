@@ -1,6 +1,7 @@
 //! Gate for the sampler: every stage of the chain against an oracle written
 //! from the reference's definition, the draw against its softmax, the seed
-//! against itself, and the allocator against zero.
+//! against itself, the allocator against zero, and the one-scan top-k chain
+//! against a frozen copy of the selection chain (same kept set and id).
 //!
 //! Pure host code — no box resources, so no `hw_` prefix and no `#[ignore]`.
 
@@ -93,6 +94,18 @@ impl Gen {
     }
     fn normal_row(&mut self, n: usize, sd: f64) -> Vec<f32> {
         (0..n).map(|_| self.normal(sd)).collect()
+    }
+    /// Uniform in `(0, 1)`.
+    fn open_unit(&mut self) -> f64 {
+        ((self.u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+    /// Normal with standard deviation `sd` (Box-Muller).
+    fn gauss(&mut self, sd: f64) -> f32 {
+        let r = (-2.0 * self.open_unit().ln()).sqrt();
+        (sd * r * (std::f64::consts::TAU * self.open_unit()).cos()) as f32
+    }
+    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+        xs[self.below(xs.len() as u64) as usize]
     }
 }
 
@@ -582,4 +595,447 @@ fn no_allocation_after_the_first_call() {
         println!("alloc: {name}: {calls} allocator calls over {CALLS_PER_ARM} warm calls");
         assert_eq!(calls, 0, "{name}");
     }
+}
+
+// ---------------------------------------------------------------- the chain against its frozen form
+
+/// The chain as it ran before the top-k scan: every row materialized as candidates,
+/// penalized in place, one selection for top-k, then top-p, min-p and the draw. It
+/// shares no code with the crate, so a change to the crate's chain cannot move it.
+mod frozen {
+    use sampler::SamplerParams;
+    use std::cmp::Ordering;
+
+    #[derive(Clone, Copy)]
+    pub struct Cand {
+        pub id: u32,
+        pub logit: f32,
+    }
+
+    struct Rng {
+        s: [u64; 4],
+    }
+
+    impl Rng {
+        fn seeded(seed: u64) -> Self {
+            let mut z = seed;
+            let mut next = || {
+                z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut x = z;
+                x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                x ^ (x >> 31)
+            };
+            Self {
+                s: [next(), next(), next(), next()],
+            }
+        }
+
+        fn next_f64(&mut self) -> f64 {
+            let s = &mut self.s;
+            let out = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+            let t = s[1] << 17;
+            s[2] ^= s[0];
+            s[3] ^= s[1];
+            s[1] ^= s[2];
+            s[0] ^= s[3];
+            s[2] ^= t;
+            s[3] = s[3].rotate_left(45);
+            (out >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+        }
+    }
+
+    fn ids(logits: &[f32]) -> impl Iterator<Item = (u32, f32)> + '_ {
+        (0..=u32::MAX).zip(logits.iter().copied())
+    }
+
+    fn argmax(xs: impl Iterator<Item = (u32, f32)>) -> (u32, f32) {
+        let (mut best_i, mut best_v) = (0u32, f32::NEG_INFINITY);
+        for (i, v) in xs {
+            if v > best_v || (v == best_v && i < best_i) {
+                best_i = i;
+                best_v = v;
+            }
+        }
+        (best_i, best_v)
+    }
+
+    fn sanitize(v: f32) -> f32 {
+        if v.is_nan() {
+            f32::NEG_INFINITY
+        } else {
+            v + 0.0
+        }
+    }
+
+    fn best_first(a: &Cand, b: &Cand) -> Ordering {
+        b.logit.total_cmp(&a.logit).then(a.id.cmp(&b.id))
+    }
+
+    fn weight(logit: f32, max: f32, inv_t: f64) -> f64 {
+        (f64::from(logit - max) * inv_t).exp()
+    }
+
+    pub struct Chain {
+        p: SamplerParams,
+        rng: Rng,
+        /// What the last call drew from.
+        pub cand: Vec<Cand>,
+        cum: Vec<f64>,
+        count: Vec<u32>,
+    }
+
+    impl Chain {
+        pub fn new(p: SamplerParams) -> Self {
+            Self {
+                p,
+                rng: Rng::seeded(p.seed),
+                cand: Vec::new(),
+                cum: Vec::new(),
+                count: Vec::new(),
+            }
+        }
+
+        pub fn sample(&mut self, logits: &[f32], recent: &[u32]) -> u32 {
+            let p = self.p;
+            self.cand.clear();
+            if logits.is_empty() {
+                return 0;
+            }
+            let window = &recent[recent.len().saturating_sub(p.repeat_last_n)..];
+            let penalize = !window.is_empty()
+                && (p.repeat_penalty != 1.0
+                    || p.frequency_penalty != 0.0
+                    || p.presence_penalty != 0.0);
+            if p.temperature <= 0.0 && !penalize {
+                let (id, logit) = argmax(ids(logits));
+                self.cand.push(Cand { id, logit });
+                return id;
+            }
+            self.cand.extend(ids(logits).map(|(id, v)| Cand {
+                id,
+                logit: sanitize(v),
+            }));
+            if penalize {
+                self.penalize(window);
+            }
+            if p.temperature <= 0.0 {
+                let (id, logit) = argmax(self.cand.iter().map(|c| (c.id, c.logit)));
+                self.cand.clear();
+                self.cand.push(Cand { id, logit });
+                return id;
+            }
+            let k = p.top_k as usize;
+            if k > 0 && k < self.cand.len() {
+                self.cand.select_nth_unstable_by(k - 1, best_first);
+                self.cand.truncate(k);
+            }
+            self.top_p_min_p();
+            self.draw()
+        }
+
+        fn penalize(&mut self, window: &[u32]) {
+            let p = self.p;
+            let n = self.cand.len();
+            if self.count.len() < n {
+                self.count.resize(n, 0);
+            }
+            for &t in window {
+                let i = t as usize;
+                if i < n {
+                    self.count[i] += 1;
+                }
+            }
+            for &t in window {
+                let i = t as usize;
+                if i < n && self.count[i] > 0 {
+                    let k = self.count[i] as f32;
+                    self.count[i] = 0;
+                    let c = &mut self.cand[i];
+                    let l = c.logit;
+                    let l = if l <= 0.0 {
+                        l * p.repeat_penalty
+                    } else {
+                        l / p.repeat_penalty
+                    };
+                    c.logit = sanitize(l - (k * p.frequency_penalty + p.presence_penalty));
+                }
+            }
+        }
+
+        fn top_p_min_p(&mut self) {
+            let p = self.p;
+            let max = self
+                .cand
+                .iter()
+                .fold(f32::NEG_INFINITY, |m, c| m.max(c.logit));
+            if !max.is_finite() {
+                let best = self.cand.iter().copied().min_by(best_first);
+                self.cand.clear();
+                self.cand.extend(best);
+                return;
+            }
+            let top_p = p.top_p < 1.0;
+            let norm: f64 = if top_p {
+                self.cand.iter().map(|c| weight(c.logit, max, 1.0)).sum()
+            } else {
+                0.0
+            };
+            if p.min_p > 0.0 {
+                let floor = max + p.min_p.ln();
+                self.cand.retain(|c| c.logit >= floor);
+            }
+            self.cand.sort_unstable_by(best_first);
+            if top_p {
+                let target = f64::from(p.top_p);
+                let mut mass = 0.0;
+                let mut keep = self.cand.len();
+                for (i, c) in self.cand.iter().enumerate() {
+                    mass += weight(c.logit, max, 1.0) / norm;
+                    if mass >= target {
+                        keep = i + 1;
+                        break;
+                    }
+                }
+                self.cand.truncate(keep);
+            }
+        }
+
+        fn draw(&mut self) -> u32 {
+            let [first, rest @ ..] = self.cand.as_slice() else {
+                return 0;
+            };
+            if rest.is_empty() {
+                return first.id;
+            }
+            let max = first.logit;
+            let inv_t = 1.0 / f64::from(self.p.temperature);
+            self.cum.clear();
+            let mut total = 0.0;
+            for c in &self.cand {
+                total += weight(c.logit, max, inv_t);
+                self.cum.push(total);
+            }
+            let u = self.rng.next_f64() * total;
+            let i = self
+                .cum
+                .partition_point(|&c| c <= u)
+                .min(self.cand.len() - 1);
+            self.cand[i].id
+        }
+    }
+}
+
+/// The rows `examples/sample_bench.rs` times, built the same way from the same seeds.
+fn bench_row(peaked: bool, n: usize, seed: u64) -> Vec<f32> {
+    let mut g = Gen(seed);
+    if peaked {
+        let mut row: Vec<f32> = (0..n).map(|_| g.gauss(2.0)).collect();
+        let body_max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let at = (g.u64() % n as u64) as usize;
+        row[at] = body_max + 8.0 + 4.0 * g.open_unit() as f32;
+        row
+    } else {
+        (0..n).map(|_| g.gauss(1.0)).collect()
+    }
+}
+
+/// A row of one of the shapes the chain's order rules are about: normal, with ties,
+/// signed zeros, infinities and NaN, on few levels (a tie at every boundary), constant,
+/// and ascending or descending (the top-k scan's buffer fills over and over).
+fn shaped_row(g: &mut Gen, n: usize, shape: u64) -> Vec<f32> {
+    match shape {
+        0 | 1 => {
+            let sd = 0.5 + 3.0 * g.unit();
+            g.normal_row(n, sd)
+        }
+        2 => g.nasty_row(n),
+        3 => (0..n).map(|_| g.below(8) as f32 * 0.5 - 1.0).collect(),
+        4 => vec![1.5; n],
+        5 => (0..n).map(|i| (i / 7) as f32 * 0.01).collect(),
+        _ => (0..n).rev().map(|i| (i / 3) as f32 * 0.01).collect(),
+    }
+}
+
+/// A row whose logits above the floor are the maximum and a few entries sitting on
+/// `max + ln(min_p)` in `f32`, the way the chain computes it, with the whole body below.
+fn floor_row(g: &mut Gen, n: usize, min_p: f32) -> Vec<f32> {
+    let max = 5.0f32;
+    let floor = max + min_p.ln();
+    let mut row: Vec<f32> = (0..n)
+        .map(|_| floor - 0.25 - 3.0 * g.unit() as f32)
+        .collect();
+    let mut at: Vec<usize> = Vec::new();
+    while at.len() < 4 + g.below(4) as usize {
+        let i = g.below(n as u64) as usize;
+        if !at.contains(&i) {
+            at.push(i);
+        }
+    }
+    row[at[0]] = max;
+    for &i in &at[1..] {
+        row[i] = floor;
+    }
+    row
+}
+
+fn random_params(g: &mut Gen, n: usize) -> SamplerParams {
+    let n32 = n as u32;
+    SamplerParams {
+        temperature: if g.below(10) == 0 {
+            0.0
+        } else {
+            0.2 + 1.8 * g.unit() as f32
+        },
+        top_k: match g.below(8) {
+            0 => 0,
+            1 => 1,
+            2 => 2 + g.below(4) as u32,
+            3 => 40,
+            4 => n32,
+            5 => n32 + 1,
+            6 => 1 + g.below(n as u64) as u32,
+            _ => 20,
+        },
+        top_p: match g.below(6) {
+            0 => 1.0,
+            1 => 0.95,
+            2 => 0.9,
+            3 => 0.5,
+            4 => 0.0,
+            _ => g.unit() as f32,
+        },
+        min_p: match g.below(6) {
+            0 => 0.0,
+            1 => 0.05,
+            2 => 0.3,
+            3 => 1.0,
+            4 => 0.01,
+            _ => g.unit() as f32,
+        },
+        repeat_penalty: g.pick(&[1.0, 1.0, 1.1, 1.3, 0.8, 2.0]),
+        frequency_penalty: g.pick(&[0.0, 0.0, 0.3]),
+        presence_penalty: g.pick(&[0.0, 0.0, 0.7]),
+        repeat_last_n: g.pick(&[0, 4, 64, 1000]),
+        seed: g.u64(),
+    }
+}
+
+/// Each call of `s` answers what the frozen chain answers: the same id and the same
+/// survivors, bit for bit and in the same order.
+fn same_as_frozen(
+    s: &mut Sampler,
+    f: &mut frozen::Chain,
+    row: &[f32],
+    recent: &[u32],
+    what: impl Fn() -> String,
+) {
+    let (got, want) = (s.sample(row, recent), f.sample(row, recent));
+    let kept: Vec<(u32, u32)> = s
+        .candidates()
+        .iter()
+        .map(|c| (c.id, c.logit.to_bits()))
+        .collect();
+    let want_kept: Vec<(u32, u32)> = f.cand.iter().map(|c| (c.id, c.logit.to_bits())).collect();
+    assert_eq!(kept, want_kept, "kept set: {}", what());
+    assert_eq!(got, want, "drawn id: {}", what());
+}
+
+#[test]
+fn the_chain_is_its_frozen_form() {
+    const RANDOM_ROWS: u64 = 1500;
+    const FLOOR_ROWS: u64 = 300;
+    let mut g = Gen(7);
+    let mut calls = 0usize;
+
+    // The rows the bench times, at the vocabularies it times, under the bench's parameters.
+    let defaults = SamplerParams::default();
+    let bench_sets = [
+        defaults,
+        SamplerParams {
+            top_p: 1.0,
+            min_p: 0.0,
+            ..defaults
+        },
+        SamplerParams {
+            top_k: 0,
+            ..defaults
+        },
+        SamplerParams {
+            top_k: 0,
+            top_p: 1.0,
+            ..defaults
+        },
+    ];
+    for n in [151_936, 154_880] {
+        for peaked in [true, false] {
+            let row = bench_row(peaked, n, 0xB100_0000);
+            for (i, p) in bench_sets.iter().enumerate() {
+                let (mut s, mut f) = (sampler(*p), frozen::Chain::new(*p));
+                for _ in 0..3 {
+                    same_as_frozen(&mut s, &mut f, &row, &[], || {
+                        format!("bench row (V = {n}, peaked = {peaked}), set {i}")
+                    });
+                    calls += 1;
+                }
+            }
+        }
+    }
+
+    // Random rows under random parameters, penalties included; a second row of another
+    // length goes through the same sampler to carry its scratch over.
+    for r in 0..RANDOM_ROWS {
+        let n = match g.below(4) {
+            0 => 1 + g.below(40) as usize,
+            1 => 1 + g.below(1500) as usize,
+            _ => 1 + g.below(6000) as usize,
+        };
+        let p = random_params(&mut g, n);
+        let shape = g.below(7);
+        let row = shaped_row(&mut g, n, shape);
+        let n2 = 1 + g.below(6000) as usize;
+        let shape2 = g.below(7);
+        let row2 = shaped_row(&mut g, n2, shape2);
+        let recent: Vec<u32> = (0..g.below(200))
+            .map(|_| g.below(n as u64 + n as u64 / 4 + 1) as u32)
+            .collect();
+        let (mut s, mut f) = (sampler(p), frozen::Chain::new(p));
+        same_as_frozen(&mut s, &mut f, &row, &recent, || {
+            format!("random row {r} (n = {n}, shape {shape}) under {p:?}")
+        });
+        same_as_frozen(&mut s, &mut f, &row2, &recent, || {
+            format!("random row {r}, second row (n = {n2}, shape {shape2}) under {p:?}")
+        });
+        calls += 2;
+    }
+
+    // Entries exactly on the min-p floor and the whole body below it: they stay under
+    // `>=` and go under `>`, with top-k keeping them and top-p keeping everything.
+    for r in 0..FLOOR_ROWS {
+        let n = 50 + g.below(2000) as usize;
+        let min_p = g.pick(&[0.05, 0.1, 0.3]);
+        let row = floor_row(&mut g, n, min_p);
+        let p = SamplerParams {
+            temperature: 0.2 + 1.8 * g.unit() as f32,
+            top_k: g.pick(&[0, 40]),
+            top_p: 1.0,
+            min_p,
+            repeat_last_n: 0,
+            seed: g.u64(),
+            ..defaults
+        };
+        let (mut s, mut f) = (sampler(p), frozen::Chain::new(p));
+        same_as_frozen(&mut s, &mut f, &row, &[], || {
+            format!("floor row {r} (n = {n}) under {p:?}")
+        });
+        assert!(
+            s.candidates().len() > 3,
+            "floor row {r}: the entries on the floor were dropped"
+        );
+        calls += 1;
+    }
+    println!(
+        "frozen chain: {calls} calls over bench rows, {RANDOM_ROWS} random rows (penalties, ties, \
+         NaN, ascending and descending) and {FLOOR_ROWS} floor rows: same kept set and id on every one"
+    );
 }

@@ -124,6 +124,8 @@ pub struct Sampler {
     rng: Xoshiro256,
     cand: Vec<Candidate>,
     cum: Vec<f64>,
+    // The row after the penalties; read only by a call that penalizes.
+    row: Vec<f32>,
     // Occurrences of each token in the penalty window; zero again before `sample` returns.
     count: Vec<u32>,
 }
@@ -166,6 +168,7 @@ impl Sampler {
             rng: Xoshiro256::seeded(params.seed),
             cand: Vec::new(),
             cum: Vec::new(),
+            row: Vec::new(),
             count: Vec::new(),
         })
     }
@@ -190,6 +193,7 @@ impl Sampler {
         if logits.is_empty() {
             return 0;
         }
+        let logits = &logits[..logits.len().min(ID_SPAN)];
         let window = &recent[recent.len().saturating_sub(p.repeat_last_n)..];
         let penalize = !window.is_empty()
             && (p.repeat_penalty != 1.0 || p.frequency_penalty != 0.0 || p.presence_penalty != 0.0);
@@ -198,20 +202,24 @@ impl Sampler {
             self.cand.push(Candidate { id, logit });
             return id;
         }
-        self.cand.extend(ids(logits).map(|(id, v)| Candidate {
-            id,
-            logit: sanitize(v),
-        }));
         if penalize {
-            self.penalize(window);
+            self.penalize(logits, window);
         }
+        let row = if penalize { &self.row[..] } else { logits };
         if p.temperature <= 0.0 {
-            let (id, logit) = argmax(self.cand.iter().map(|c| (c.id, c.logit)));
-            self.cand.clear();
+            let (id, logit) = argmax(ids(row));
             self.cand.push(Candidate { id, logit });
             return id;
         }
-        self.top_k();
+        let k = p.top_k as usize;
+        if k > 0 && k < row.len() {
+            top_k(&mut self.cand, row, k);
+        } else {
+            self.cand.extend(ids(row).map(|(id, v)| Candidate {
+                id,
+                logit: sanitize(v),
+            }));
+        }
         self.top_p_min_p();
         self.draw()
     }
@@ -224,14 +232,17 @@ impl Sampler {
         &self.cand
     }
 
-    /// The reference's penalties (`llama_sample_repetition_penalties_impl`,
-    /// llama.cpp's `llama_sampler_penalties_apply`): once per distinct
+    /// `self.row` as the reference's penalties
+    /// (`llama_sample_repetition_penalties_impl`, llama.cpp's
+    /// `llama_sampler_penalties_apply`) leave `logits`: once per distinct
     /// in-vocabulary token of `window`, occurring `count` times, a logit `<= 0`
     /// is multiplied by the repetition penalty and a positive one divided by
     /// it, then `count * frequency + presence` is subtracted, in `f32`.
-    fn penalize(&mut self, window: &[u32]) {
+    fn penalize(&mut self, logits: &[f32], window: &[u32]) {
         let p = self.params;
-        let n = self.cand.len();
+        let n = logits.len();
+        self.row.clear();
+        self.row.extend(logits.iter().map(|&v| sanitize(v)));
         if self.count.len() < n {
             self.count.resize(n, 0);
         }
@@ -246,24 +257,14 @@ impl Sampler {
             if i < n && self.count[i] > 0 {
                 let k = self.count[i] as f32;
                 self.count[i] = 0;
-                let c = &mut self.cand[i];
-                let l = c.logit;
+                let l = self.row[i];
                 let l = if l <= 0.0 {
                     l * p.repeat_penalty
                 } else {
                     l / p.repeat_penalty
                 };
-                c.logit = sanitize(l - (k * p.frequency_penalty + p.presence_penalty));
+                self.row[i] = sanitize(l - (k * p.frequency_penalty + p.presence_penalty));
             }
-        }
-    }
-
-    /// Keep the `top_k` best candidates, unordered (`llama_sample_top_k_impl`).
-    fn top_k(&mut self) {
-        let k = self.params.top_k as usize;
-        if k > 0 && k < self.cand.len() {
-            self.cand.select_nth_unstable_by(k - 1, best_first);
-            self.cand.truncate(k);
         }
     }
 
@@ -342,6 +343,86 @@ impl Sampler {
             .partition_point(|&c| c <= u)
             .min(self.cand.len() - 1);
         self.cand[i].id
+    }
+}
+
+/// Rows are cut here: ids stop at `u32::MAX`.
+const ID_SPAN: usize = (u32::MAX as usize).saturating_add(1);
+
+/// Logits per reject test of the top-k scan.
+const LANES: usize = 16;
+const STEP: u32 = LANES as u32;
+
+/// The scan's buffer is cut back to `top_k` once it holds this many candidates or
+/// four times `top_k`, whichever is more, so a cut costs O(1) per admitted logit.
+const SCAN_MIN: usize = 1024;
+
+/// `cand` becomes the `k` best of `row` (`0 < k < row.len()`) sanitized, best
+/// first, from one scan over the row.
+///
+/// The scan buffers every logit above a threshold, the k-th best at the last cut;
+/// until the first cut everything enters. Ids rise along the scan, so a logit equal
+/// to the threshold ranks below the k-th best and need not enter, and one vectorized
+/// compare skips a block of `LANES` logits none of which passes. A cut orders by
+/// [`best_first`], a total order, so the survivors are the set a selection over the
+/// whole row gives.
+fn top_k(cand: &mut Vec<Candidate>, row: &[f32], k: usize) {
+    let cap = k.saturating_mul(4).max(SCAN_MIN);
+    cand.clear();
+    cand.reserve(cap.min(row.len()) + LANES);
+    let mut scan = Scan {
+        cand,
+        k,
+        cap,
+        thr: f32::NEG_INFINITY,
+        armed: false,
+    };
+    let (blocks, rest) = row.as_chunks::<LANES>();
+    let mut base = 0u32;
+    for block in blocks {
+        scan.block(base, block);
+        base = base.wrapping_add(STEP);
+    }
+    scan.block(base, rest);
+    scan.keep_best();
+    scan.cand.sort_unstable_by(best_first);
+}
+
+struct Scan<'a> {
+    cand: &'a mut Vec<Candidate>,
+    k: usize,
+    cap: usize,
+    // The k-th best logit at the last cut; read only once `armed`.
+    thr: f32,
+    armed: bool,
+}
+
+impl Scan<'_> {
+    #[inline(always)]
+    fn block(&mut self, base: u32, logits: &[f32]) {
+        let thr = self.thr;
+        if self.armed && !logits.iter().fold(false, |any, &v| any | (v > thr)) {
+            return;
+        }
+        for (id, &v) in (base..=u32::MAX).zip(logits) {
+            let logit = sanitize(v);
+            if !self.armed || logit > thr {
+                self.cand.push(Candidate { id, logit });
+            }
+        }
+        if self.cand.len() >= self.cap {
+            self.keep_best();
+            self.thr = self.cand[self.k - 1].logit;
+            self.armed = true;
+        }
+    }
+
+    /// Cut the buffer back to its `k` best; the k-th best ends at index `k - 1`.
+    fn keep_best(&mut self) {
+        if self.cand.len() > self.k {
+            self.cand.select_nth_unstable_by(self.k - 1, best_first);
+            self.cand.truncate(self.k);
+        }
     }
 }
 
