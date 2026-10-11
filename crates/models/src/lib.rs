@@ -4,14 +4,17 @@
 //! runs a [`ModelSpec`]; the coverage check ([`needs`], and the available
 //! table that joins it) says which of its parts no program here runs.
 //!
-//! This crate is host-only and depends on the GGUF reader alone: no reader
-//! and no kernel lives here, only the vocabulary the readers write and the
-//! programs read. A fact the file does not carry is a field the reader fills
-//! from a cited constant, never a default here.
+//! This crate is host-only and depends on the GGUF reader alone among the
+//! workspace's crates: no family reader and no kernel lives here, only the
+//! vocabulary the readers write and the programs read, and the one reader of
+//! a row-list head's file that every draft shares ([`headpick`]). A fact the
+//! file does not carry is a field the reader fills from a cited constant,
+//! never a default here.
 //!
 //! Counts are `u32`, the files' key type. A field with a `None` or an empty
 //! list names what it means in its own comment.
 
+pub mod headpick;
 mod need;
 mod role;
 pub mod shape;
@@ -646,7 +649,7 @@ pub struct MtpDraft {
     pub hc: Option<HcSpec>,
     pub input: MtpInput,
     pub head_norm: MtpHeadNorm,
-    pub head_rows: HeadRows,
+    pub head_rows: headpick::HeadSet,
 }
 
 /// Where an MTP layer's tensors are.
@@ -700,19 +703,6 @@ pub enum MtpHeadNorm {
     HcHead,
     /// The layer's own RMS gain (`nextn.shared_head_norm`).
     Rms,
-}
-
-/// The output rows an MTP head scores.
-#[derive(Clone, Debug, PartialEq)]
-pub enum HeadRows {
-    /// Every token of the vocabulary.
-    Full,
-    /// Only these tokens: ids ascending, distinct, each below the vocabulary.
-    List {
-        ids: std::sync::Arc<[u32]>,
-        /// The SHA-256 of the tokenizer the ids index.
-        digest: [u8; 32],
-    },
 }
 
 /// A block draft: blocks of positions proposed in one pass from the

@@ -187,9 +187,9 @@ const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_194_276), ("3090", 431_3
 #[test]
 #[ignore = "needs the Qwen3.8-Flash-Next shards and MTP files on the box (just gate-qwen4exp-meta)"]
 fn hw_qwen4exp_mtp_plan() {
-    use model::arch::models::HeadRows;
+    use model::arch::models::headpick::{HeadSet, vocab_sha256};
     use model::arch::qwen35moe::place::{
-        self, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, vocab_sha256,
+        self, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs,
     };
     use model::placement::workstation::{A6000, RTX_3090};
     use model::placement::{PlanLevers, Violation};
@@ -208,7 +208,7 @@ fn hw_qwen4exp_mtp_plan() {
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
     inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
-    let full = MtpInputs::read(&draft, &target, &inputs, HeadRows::Full)
+    let full = MtpInputs::read(&draft, &target, &inputs, HeadSet::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
     let digest = vocab_sha256(&target).unwrap_or_else(|e| panic!("vocab_sha256: {e}"));
     let ids: Vec<u32> = (0..LIST_ROWS).map(|i| i * 6).collect();
@@ -216,7 +216,7 @@ fn hw_qwen4exp_mtp_plan() {
         &draft,
         &target,
         &inputs,
-        HeadRows::List {
+        HeadSet::List {
             ids: ids.into(),
             digest,
         },
@@ -392,7 +392,7 @@ fn hw_qwen4exp_mtp_plan() {
         );
     }
     let own = Split::open(OWN).unwrap_or_else(|e| panic!("open {OWN}: {e}"));
-    let refused = MtpInputs::read(&own, &target, &inputs, HeadRows::Full)
+    let refused = MtpInputs::read(&own, &target, &inputs, HeadSet::Full)
         .err()
         .map_or("read".to_string(), |e| e.to_string());
     check(
@@ -404,7 +404,7 @@ fn hw_qwen4exp_mtp_plan() {
         &draft,
         &target,
         &inputs,
-        HeadRows::List {
+        HeadSet::List {
             ids: vec![0u32, 1].into(),
             digest: [0; 32],
         },
@@ -460,7 +460,7 @@ const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
 #[test]
 #[ignore = "needs the Qwen3.8-Flash-Next shards and MTP files on the box (just gate-qwen4exp-meta)"]
 fn hw_qwen4exp_bp_mtp_plan() {
-    use model::arch::models::HeadRows;
+    use model::arch::models::headpick::HeadSet;
     use model::arch::qwen35moe::place::{
         self, Experts, MtpInputs, PlaceError, PlanInputs, machine_bp, tier_batch,
     };
@@ -481,7 +481,7 @@ fn hw_qwen4exp_bp_mtp_plan() {
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
     inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
-    let mtp = MtpInputs::read(&draft, &target, &inputs, HeadRows::Full)
+    let mtp = MtpInputs::read(&draft, &target, &inputs, HeadSet::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
     let (ctx, u) = (4096u64, 4096u64);
     let n = inputs.hp.n_layer;

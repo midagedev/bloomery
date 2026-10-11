@@ -15,9 +15,10 @@
 //! declares that it carries neither.
 
 use gguf::{GgmlType, Split, TensorInfo};
+use models::headpick::HeadSet;
 use models::{
-    Arch, Borrows, DraftSpec, Ffn, Gqa, HcKind, HeadRows, LayerSpec, Mixer, ModelSpec, MtpDraft,
-    MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode,
+    Arch, Borrows, DraftSpec, Ffn, Gqa, HcKind, LayerSpec, Mixer, ModelSpec, MtpDraft, MtpHeadNorm,
+    MtpInput, MtpSource, Residual, Rope, RopeMode,
 };
 
 use super::hparams::{
@@ -271,7 +272,7 @@ pub fn mtp_of(
         hc: Some(hc),
         input: MtpInput::Streams,
         head_norm: MtpHeadNorm::HcHead,
-        head_rows: HeadRows::Full,
+        head_rows: HeadSet::Full,
     })))
 }
 
