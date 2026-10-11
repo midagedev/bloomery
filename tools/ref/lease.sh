@@ -378,7 +378,10 @@ lease_trace_take() {
   # Detached: a subshell that exits at once, so no `wait` of the runner meets it; its own session; no
   # descriptor 9, or it would hold the lease it waits for; no stdin, stdout or stderr, or an ssh
   # session never ends; its directory is /, so it pins no track's directory while it waits.
-  (setsid bash -c "$(declare -f now __lease_trace_waiter)"$'\n''cd / && __lease_trace_waiter "$@"' _ "$LEASE_LOCK" "$f" "$id" "$epoch" 9>&- < /dev/null > /dev/null 2>&1 &)
+  # Descriptor 9 is closed first, by the subshell itself: a `9>&-` on the command is applied after its
+  # words are expanded, and the background child holds the lease through the $(declare -f …) fork in
+  # between — on a loaded CI runner long enough for the next take or probe to find it held (#27).
+  (exec 9>&-; setsid bash -c "$(declare -f now __lease_trace_waiter)"$'\n''cd / && __lease_trace_waiter "$@"' _ "$LEASE_LOCK" "$f" "$id" "$epoch" < /dev/null > /dev/null 2>&1 &)
 }
 # lease_trace_let_go <0|1|?>: lease-hold.sh's `let_go` line for the lease this process took.
 lease_trace_let_go() {
@@ -1048,6 +1051,13 @@ EOF
     RC=0
     lease_free "$t/tlock2" 2> /dev/null || RC=$?
     check trace-waiter-frees-lease "$RC" 0
+    # The same with the waiter's spawn slowed between its fork and its exec (#27): a function named `declare`
+    # shadows the builtin for 0.3 s, as the $(declare -f …) fork takes on a loaded CI runner. The spawn must have
+    # closed descriptor 9 before that, or the lease reads held right after the runner exits.
+    (declare() { sleep 0.3; builtin declare "$@"; } && exec 9>"$t/tlock3" && flock -n 9 && LEASE_LOCK=$t/tlock3 lease_trace_take)
+    RC=0
+    lease_free "$t/tlock3" 2> /dev/null || RC=$?
+    check trace-waiter-frees-lease-slow-fork "$RC" 0
     # A take whose runner took a queue job and two cards names them.
     BLOOMERY_LEASE_TRACE=$t/trace2.log BLOOMERY_Q_JOB=q42 TIMING_GPU=GPU-a TIMING_GPU2=GPU-b
     export BLOOMERY_LEASE_TRACE BLOOMERY_Q_JOB TIMING_GPU TIMING_GPU2
