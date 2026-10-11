@@ -342,6 +342,26 @@ fn plan_with<'a>(
     room: u64,
     experts_to_nvme: bool,
 ) -> Result<Plan<'a>, PlacementError> {
+    plan_given(
+        model,
+        machine,
+        ctx,
+        slots,
+        room,
+        experts_to_nvme.then_some(None),
+    )
+}
+
+/// [`plan_with`] with the split's given arena (`BLOOMERY_NVTIER_BYTES`'s
+/// value) chosen: `None` runs no split, `Some(given)` runs it with `given`.
+fn plan_given<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx: u64,
+    slots: u64,
+    room: u64,
+    split: Option<Option<u64>>,
+) -> Result<Plan<'a>, PlacementError> {
     let terms = SeqTerms {
         layers: Stores {
             kv: &Kv38,
@@ -355,8 +375,8 @@ fn plan_with<'a>(
     let levers = PlanLevers::default();
     let mut plan = plan_routed_reserving(model, machine, ctx, &kv, &levers, card_routed, rows)?;
     super::row_table_tier(&mut plan, room, 2 * state38(ctx, false), UBATCH_PLANNED)?;
-    if experts_to_nvme {
-        super::expert_nvme_tier(&mut plan, room)?;
+    if let Some(given) = split {
+        super::expert_nvme_tier(&mut plan, room, given)?;
     }
     plan.cards[0].grow_kv(rows);
     let broken = plan.violations();
@@ -1345,6 +1365,46 @@ fn a_given_arena_under_the_floor_is_refused_by_name() {
     }
 }
 
+/// The split reads no environment: its arena is the `given` it is passed. The
+/// test re-runs itself, marked by libtest's `--test-threads=1`, in a child
+/// process whose `BLOOMERY_NVTIER_BYTES` is not bytes, which the lever's own
+/// read refuses by name; there a plan with a given arena is planned as it is,
+/// where a second read of the lever inside the split would refuse it or
+/// replace the arena.
+#[test]
+fn the_split_reads_no_environment() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let room = 27 << 30;
+    let twin = plan_with(&q4, &gate, 4096, 1, room, false).expect("the unsplit plan");
+    let least = dial_of(&twin, room).least.bytes;
+    if std::env::args().any(|a| a == "--test-threads=1") {
+        assert!(
+            bloomery_levers::nvtier_levers().is_err(),
+            "the lever read must refuse a value that is not bytes"
+        );
+        let split = plan_given(&q4, &gate, 4096, 1, room, Some(Some(least)))
+            .expect("a given arena is planned whatever the environment holds");
+        assert_eq!(split.host.nvme_arena_bytes, least);
+        return;
+    }
+    let (_, path) = module_path!().split_once("::").expect("a crate path");
+    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            &format!("{path}::the_split_reads_no_environment"),
+        ])
+        .arg("--test-threads=1")
+        .env(bloomery_levers::NVTIER_BYTES, "not-bytes")
+        .output()
+        .expect("the child test run");
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+        "the child run: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The dial's one step on the gate plan, through the planner: the last room
 /// with an arena is `H/2 − 1`, where the arena is the deep side's largest,
 /// `H/2 − 1 − F`, and at `H/2` the plan pages through the file mapping with
@@ -1592,7 +1652,7 @@ fn spark_plan<'a>(
     .expect("a Spark plan");
     let floor = if floor { 2 * state38(ctx, true) } else { 0 };
     super::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED).expect("the PLE table's tier");
-    super::expert_nvme_tier(&mut plan, room).expect("the NVMe expert tier");
+    super::expert_nvme_tier(&mut plan, room, None).expect("the NVMe expert tier");
     plan.cards[0].grow_kv(rows);
     let broken = plan.violations();
     assert!(broken.is_empty(), "ctx {ctx}: {broken:?}");

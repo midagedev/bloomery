@@ -990,12 +990,12 @@ mod drive {
         };
         print_arm_order(&runs);
         if slots > 1 {
-            return s
-                .arms(&runs, |s, i, r| {
-                    let ran = arm_slots(s, &pre, i, r, feed_mode, call.as_ref());
-                    after_passes(s, ran)
-                })
-                .map_err(|f| Box::new(f) as GateError);
+            s.arms(&runs, |s, i, r| {
+                let ran = arm_slots(s, &pre, i, r, feed_mode, call.as_ref());
+                after_passes(s, ran)
+            })
+            .map_err(|f| Box::new(f) as GateError)?;
+            return print_nvtier(&s);
         }
         if draft == Draft::Off && !check_finite {
             a.diag.begin()?;
@@ -1049,7 +1049,7 @@ mod drive {
                 let t = r.table()?;
                 slot_table(&t, &r.check(&t)?, t.differ(&v)?).print();
             }
-            return Ok(());
+            return print_nvtier(&s);
         }
         // One arm: the pair pass's capture comes before its prelude, so no
         // arm's window holds it.
@@ -1063,7 +1063,7 @@ mod drive {
             )
             .into());
         }
-        match (draft, spark, check.as_mut()) {
+        let done: Result<(), GateError> = match (draft, spark, check.as_mut()) {
             (Draft::Off, _, None) => {
                 Err("generate_ds41: the plain run goes through the arm list".into())
             }
@@ -1093,7 +1093,20 @@ mod drive {
                 after_passes(&mut s, ran)
             }
             (Draft::Dspark, None, _) => Err("generate_ds41: the DSpark draft did not load".into()),
+        };
+        print_nvtier(&s)?;
+        done
+    }
+
+    /// The load's `nvtier` record at the end of a run (counters since the
+    /// load, as `generate_qwen3moe` prints it), nothing on a load without a
+    /// tier.
+    fn print_nvtier(s: &Session<Body>) -> Result<(), GateError> {
+        let b = s.model().body("generate_ds41")?;
+        if let Some(r) = record::nvtier_of(b.nvme_tier().map(|t| &**t)) {
+            r.print();
         }
+        Ok(())
     }
 
     /// `d` behind the width chooser of `mode` (`runtime::width`): this

@@ -173,6 +173,7 @@ fn inputs() -> PlanInputs {
         kv,
         // A synthetic file: a room no host need passes, given, not read.
         room: (u64::MAX, model::placement::workstation::HostRead::Given),
+        arena: None,
     }
 }
 

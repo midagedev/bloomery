@@ -1763,7 +1763,8 @@ pub fn nvme_tier(
         return Err(GpuError::shape(
             WHAT,
             "a paged plan under an r8 pair that reads a sidecar: the NVMe tier's slots follow \
-             the sidecar's bytes, which the tier does not fill from yet",
+             the sidecar's bytes, which the tier does not fill from yet (`BLOOMERY_R8=off` \
+             reads the source: same bits)",
         ));
     }
     NvTier::of_paged(plan, file, levers.direct).map(|t| t.map(Arc::new))
