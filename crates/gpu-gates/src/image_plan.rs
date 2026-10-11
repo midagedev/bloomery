@@ -1,13 +1,13 @@
 //! The plan's side of an image input, free of the encoder crates so a placement module every
 //! build includes can take it: the tower's reserve on the stage card, entered into a placed plan's
 //! machine and a whole-fit probe's by one function ([`reserve_on`]), a plan's refusal beside it
-//! ([`refusal`]), and what a plan adds per position of a sequence for a media load
+//! ([`refusal`]) and a verdict line's note of it ([`note`]), and what a plan adds per position of a sequence for a media load
 //! ([`table_bytes_per_position`]). The seat that owns the rest of the vision seat
 //! (`crate::vision_seat`) re-exports these.
 
 use std::fmt::Display;
 
-use model::placement::Machine;
+use model::placement::{Card, Machine};
 
 /// What the plan's reserve for the tower is called, as the plan's terms name it (beside
 /// `workstation`'s draft and tier-batch reserves).
@@ -32,6 +32,19 @@ pub fn with_reserve(
         reserve_on(&mut machine, reserve);
         machine
     }
+}
+
+/// What a verdict's line adds when its card carries the image encoder's reserve: the reserve by
+/// name and bytes, beside the reserves term the verdict sums them in. Nothing for a card that
+/// carries none, so a load without `--mmproj` prints its line as it did.
+#[must_use]
+pub fn note(card: &Card) -> String {
+    card.reserves
+        .iter()
+        .find(|(name, _)| name == RESERVE)
+        .map_or_else(String::new, |(name, bytes)| {
+            format!("; the reserves term holds the {name}'s {bytes} B")
+        })
 }
 
 /// A plan's refusal, beside the reserve that was in it: with no reserve the refusal as it is.

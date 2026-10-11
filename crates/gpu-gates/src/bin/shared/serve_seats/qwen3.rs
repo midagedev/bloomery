@@ -1182,6 +1182,7 @@ fn vision_of(
     };
     vision_seat::open_seat(
         &a.vision,
+        a.vision.mmproj()?,
         a.place.unwrap_or(Place::A),
         &[vision::arch::qwen3vl::PROJECTOR_TYPE],
         &facts,

@@ -419,6 +419,7 @@ fn vision_of(
     };
     vision_seat::open_seat(
         &a.vision,
+        a.vision.mmproj()?,
         a.place,
         &[vision::arch::deepseek41v::PROJECTOR_TYPE],
         &facts,

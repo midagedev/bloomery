@@ -47,7 +47,7 @@ use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
 use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
-    self, Card, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
+    self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
     WholeLoad, WholeNeed,
 };
 use runtime::seqstate::HOST_BUDGET;
@@ -618,18 +618,6 @@ fn qwen35_whole(file: &Split, o: Open35) -> Result<WholeLoad, String> {
     Qwen35moeModel::whole_load(file, o).map_err(|e| e.to_string())
 }
 
-/// What a verdict's line adds when its card carries the image encoder's reserve: the reserve by
-/// name and bytes, beside the reserves term the verdict sums them in. Nothing for a card that
-/// carries none, so a load without `--mmproj` prints its line as it did.
-fn encoder_note(card: &Card) -> String {
-    card.reserves
-        .iter()
-        .find(|(name, _)| name == image_plan::RESERVE)
-        .map_or_else(String::new, |(name, bytes)| {
-            format!("; the reserves term holds the {name}'s {bytes} B")
-        })
-}
-
 /// The whole-fit verdict ([`whole_on`]).
 enum Whole {
     /// The whole load fits what the card had.
@@ -652,7 +640,7 @@ impl Whole {
     fn line(&self, ctx: usize) -> String {
         match self {
             Whole::Fits(n) | Whole::Short(n) => {
-                format!("whole fit at ctx {ctx}: {n}{}", encoder_note(&n.card))
+                format!("whole fit at ctx {ctx}: {n}{}", image_plan::note(&n.card))
             }
             Whole::Refused(why) => format!("whole fit at ctx {ctx}: {why}"),
         }

@@ -6,6 +6,7 @@
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
 use model::arch::qwen3moe::place as q3;
@@ -127,16 +128,7 @@ fn refuse_unless_whole_fits(
     let ctx = u64::try_from(o.ctx)?;
     let kv = (0..layers).map(|l| inputs.kv.layer_bytes(l, ctx)).sum();
     let mut machine = q3::machine(card, layers, 0);
-    let before = machine.cards.first().map_or(0, |c| c.reserves.len());
     seat(&mut machine);
-    // What the seat put among the card's reserves, by name and bytes, beside the reserves term the
-    // verdict sums them in; nothing for a load whose seat adds none.
-    let held: String = machine.cards.first().map_or_else(String::new, |c| {
-        c.reserves[before..]
-            .iter()
-            .map(|(name, bytes)| format!("; the reserves term holds the {name}'s {bytes} B"))
-            .collect()
-    });
     let card = machine
         .whole_card()
         .ok_or_else(|| format!("the whole load on {}: a machine with no card", card.name))?;
@@ -146,6 +138,7 @@ fn refuse_unless_whole_fits(
         kv,
         Qwen35moeModel::whole_load(split, o)?,
     )?;
+    let held = image_plan::note(&need.card);
     eprintln!("whole fit at ctx {}: {need}{held}", o.ctx);
     if need.fits() {
         return Ok(());

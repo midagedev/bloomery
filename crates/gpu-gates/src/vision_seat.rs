@@ -345,18 +345,23 @@ pub struct Opened {
     pub limits: TokenLimits,
 }
 
-/// The seat's encoder under `flags`: `None` without `--mmproj`, refused by name when a limit is
-/// given with none (no image input to bound); else the file opened ([`Projector::open`], its type
-/// one of `takes`), held against the text model (`text`, `token` — [`Projector::check_text`]) and
-/// seated for a plan on `place` ([`encoder_seat`]). Every check runs before a card is touched.
+/// The seat's encoder: `file`, the encoder file the seat resolved (`--mmproj`'s, [`Flags::mmproj`],
+/// or one a seat picks itself, as the decide seat's `--hf` takes the repo's projector). `None`
+/// serves no image, and a limit given then is refused by name (no image input to bound); else the
+/// file opened ([`Projector::open`], its type one of `takes`, the limits from `flags`), held
+/// against the text model (`text`, `token` — [`Projector::check_text`]) and seated for a plan on
+/// `place` ([`encoder_seat`]). Every check runs before a card is touched.
 pub fn open_seat(
     flags: &Flags,
+    file: Option<&Path>,
     place: Place,
     takes: &[&str],
     text: &TextFacts,
     token: &dyn Fn(u32) -> Option<String>,
 ) -> Result<Option<Opened>, GateError> {
-    let Some(path) = flags.wanted()? else {
+    let Some(path) = file else {
+        // With no file, `--mmproj` was not given either: `wanted` refuses a limit there.
+        flags.wanted()?;
         return Ok(None);
     };
     let projector = Projector::open(path, flags, takes)?;
@@ -865,8 +870,9 @@ mod tests {
     #[test]
     fn open_seat_refuses_by_name_before_a_card() {
         let text = facts(2048, QWEN_ROPE, PleImage::Absent);
-        let open = |a: &[&str]| {
-            open_seat(&flags(a).unwrap(), Place::A, &[], &text, &qwen_vocab).map(|o| o.is_some())
+        let open = |a: &[&str]| -> Result<bool, GateError> {
+            let f = flags(a).unwrap();
+            open_seat(&f, f.mmproj()?, Place::A, &[], &text, &qwen_vocab).map(|o| o.is_some())
         };
         assert!(!open(&[]).unwrap());
         assert!(!open(&["--no-mmproj"]).unwrap());
