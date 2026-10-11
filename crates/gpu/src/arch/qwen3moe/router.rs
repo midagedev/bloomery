@@ -531,6 +531,24 @@ unsafe fn store_rows_live(
     }
 }
 
+/// `(v, i)` becomes the running best `(bv, bi)` when it beats it under
+/// [`take`]`::<false>`.
+#[inline(always)]
+fn keep(v: f32, i: u32, bv: &mut f32, bi: &mut u32) {
+    if take::<false>(v, i, *bv, *bi) {
+        *bv = v;
+        *bi = i;
+    }
+}
+
+/// A probability `p` as a rescan candidate: itself when its bit `free` is set,
+/// else `−inf`, which [`take`]`::<false>` never takes over the seed `(−inf, 0)`
+/// or a probability. A select, not a branch, so a walk's loads issue together.
+#[inline(always)]
+fn untaken(free: u32, p: f32) -> f32 {
+    if free != 0 { p } else { f32::NEG_INFINITY }
+}
+
 /// One token's routing by one warp for a router whose last row is a shared
 /// expert's gate ([`gated`]'s contract): `32 · PER_LANE` experts, lane `L`
 /// owning experts `L + 32 j`. On entry `p` holds the token's expert logits,
@@ -556,7 +574,7 @@ unsafe fn store_rows_live(
 /// shared memory that no other warp touches, written as above; `1 <= used
 /// <= 32`; `probs.len() >= (t + 1)·n`, and `ids.len()`,
 /// `weights.len() >= (t + 1)·(used + 1)`, those slots written by this warp
-/// alone; `PER_LANE <= 32`.
+/// alone; `PER_LANE` a multiple of 4, at most 32.
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
@@ -664,21 +682,31 @@ unsafe fn route_warp_gated<const PER_LANE: usize>(
     let mut mine = 0.0f32;
     let mut s = 0usize;
     while s < used {
-        let mut bv = f32::NEG_INFINITY;
-        let mut bi = 0u32;
+        // Four running bests, one per entry `j` mod 4, merged after the walk:
+        // `take` is a total order, so the merge picks the entry one running
+        // best picks, on chains a quarter as long.
+        let (mut v0, mut i0) = (f32::NEG_INFINITY, 0u32);
+        let (mut v1, mut i1) = (f32::NEG_INFINITY, 0u32);
+        let (mut v2, mut i2) = (f32::NEG_INFINITY, 0u32);
+        let (mut v3, mut i3) = (f32::NEG_INFINITY, 0u32);
         let mut j = 0usize;
         while j < PER_LANE {
-            if (taken >> j) & 1 == 0 {
-                let ej = lane + 32 * j;
-                // SAFETY: ej < 32·PER_LANE = n, this lane's own entry.
-                let pv = unsafe { *p.add(ej) };
-                if take::<false>(pv, ej as u32, bv, bi) {
-                    bv = pv;
-                    bi = ej as u32;
-                }
-            }
-            j += 1;
+            let e = lane + 32 * j;
+            // SAFETY: e + 96 < 32·PER_LANE = n (j + 3 < PER_LANE, a multiple
+            // of 4), this lane's own entries.
+            let (a, b, c, d) =
+                unsafe { (*p.add(e), *p.add(e + 32), *p.add(e + 64), *p.add(e + 96)) };
+            let free = !taken >> j;
+            keep(untaken(free & 1, a), e as u32, &mut v0, &mut i0);
+            keep(untaken(free & 2, b), (e + 32) as u32, &mut v1, &mut i1);
+            keep(untaken(free & 4, c), (e + 64) as u32, &mut v2, &mut i2);
+            keep(untaken(free & 8, d), (e + 96) as u32, &mut v3, &mut i3);
+            j += 4;
         }
+        keep(v1, i1, &mut v0, &mut i0);
+        keep(v3, i3, &mut v2, &mut i2);
+        let (mut bv, mut bi) = (v0, i0);
+        keep(v2, i2, &mut bv, &mut bi);
         let mut off = 16u32;
         while off > 0 {
             let (ov, oi) = (warp::shuffle_xor_f32(bv, off), warp::shuffle_xor(bi, off));
@@ -2464,8 +2492,14 @@ pub mod gated {
             (1, shape::LANE_PICKS)
         )
     );
-    // Each lane's taken experts are the bits of one u32, one per `j`.
-    const _: () = assert!(PER_LANE <= 32 && PER_LANE_WIDE <= 32);
+    // Each lane's taken experts are the bits of one u32, one per `j`, and its
+    // rescan walks them four at a time.
+    const _: () = assert!(
+        PER_LANE <= 32
+            && PER_LANE_WIDE <= 32
+            && PER_LANE.is_multiple_of(4)
+            && PER_LANE_WIDE.is_multiple_of(4)
+    );
     // The fused and norm-fused grids are one block per row, and the norm
     // quantizes group `g` in block `g` — row `t`'s group `g` in block
     // `t · (k / 128) + g` at more than one row.
