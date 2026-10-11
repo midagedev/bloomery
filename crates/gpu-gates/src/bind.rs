@@ -4303,11 +4303,17 @@ mod tests {
         use super::super::{CacheRam, HostRead};
         use crate::generate::Place;
         use crate::residency38::{
-            CHECKPOINTS_RESERVE, Seqs, checkpoint_bytes, checkpoints_reserved, glm_machine,
-            reserve_checkpoints,
+            CHECKPOINTS_RESERVE, Seqs, check_glm_reserve, checkpoint_bytes, checkpoints_reserved,
+            glm_machine, reserve_checkpoints, reserve_glm_checkpoints,
         };
         use model::placement::{Host, Machine};
-        use runtime::seqstate::HOST_BUDGET;
+        use runtime::seqstate::{HOST_BUDGET, budget_for};
+
+        /// One GLM checkpoint's bytes: 34 KDA layers' recurrent state and
+        /// conv ring (5,275,648 B a layer).
+        const GLM_POINT: u64 = 34 * 5_275_648;
+        /// The spacing of a GLM prompt call's inner checkpoints.
+        const GLM_EVERY: u32 = 512;
 
         /// A machine of `os` reserved bytes on the host and nothing else.
         fn machine(os: u64) -> Machine {
@@ -4520,21 +4526,27 @@ mod tests {
         }
 
         /// A GLM load's machine (`glm_machine`, the one its offer, plans and
-        /// open take) reserves every slot's checkpoints, since the GLM body
-        /// takes them on every load: one `HOST_BUDGET` at one slot and three
-        /// at three. At one slot the prompt cache's default budget is the one
-        /// the load's single sequence left when the term sat beside the need
-        /// (half of the reading past need, pool and one `HOST_BUDGET`); at
+        /// open take) reserves every slot's checkpoints at the body's budget
+        /// for the load's context: at 4,096 positions that is the 8 points
+        /// one prompt call over it takes (the marks 512 to 3,584 and its
+        /// end), not the 4 GiB of the default, one budget at one slot and
+        /// three at three. At one slot the prompt cache's default budget is
+        /// the one the load's single sequence left when the term sat beside
+        /// the need (half of the reading past need, pool and one budget); at
         /// three the two further slots' come off it too.
         #[test]
         fn a_glm_load_reserves_every_slots_checkpoints() {
             let layers = 4;
             let (need, pool) = (6_000u64, 1_000u64);
             let available = need + pool + 4 * HOST_BUDGET + 100_000;
+            let budget = budget_for(4_096, GLM_EVERY, GLM_POINT).expect("a budget");
             for slots in [1usize, 3] {
-                let m = glm_machine(Place::A, None, slots).expect("plan (a)'s machine")(layers);
+                let slots_u64 = u64::try_from(slots).expect("a slot count fits u64");
+                let m =
+                    glm_machine(Place::A, None, slots, budget).expect("plan (a)'s machine")(layers);
                 let reserved = checkpoints_reserved(&m);
-                assert_eq!(reserved, checkpoint_bytes(slots), "{slots} slots");
+                assert_eq!(reserved, slots_u64 * 8 * GLM_POINT, "{slots} slots");
+                assert_ne!(reserved, checkpoint_bytes(slots), "{slots} slots");
                 let c = CacheRam::at(
                     None,
                     (available, HostRead::Given),
@@ -4544,14 +4556,70 @@ mod tests {
                     reserved,
                 )
                 .expect("the budget");
-                let beside_one = (available - need - pool - HOST_BUDGET) / 2;
-                let slots_u64 = u64::try_from(slots).expect("a slot count fits u64");
+                let beside_one = (available - need - pool - 8 * GLM_POINT) / 2;
                 assert_eq!(
                     c.ram,
-                    beside_one - (slots_u64 - 1) * HOST_BUDGET / 2,
+                    beside_one - (slots_u64 - 1) * 8 * GLM_POINT / 2,
                     "{slots} slots"
                 );
             }
+        }
+
+        /// A GLM load's reserve follows the context it is granted: a slot
+        /// holds the points one prompt call over its context takes, 1 at 512
+        /// positions, 8 at 4,096, and past 11,264 positions the 23 that
+        /// `HOST_BUDGET` fits — less than `HOST_BUDGET` itself, which is not a
+        /// multiple of a checkpoint. A second declaration on a machine, by
+        /// either owner, is a panic by name.
+        #[test]
+        fn a_glm_reserve_follows_the_granted_context() {
+            for (ctx, points) in [(512u32, 1u64), (4_096, 8), (11_265, 23), (16_384, 23)] {
+                let budget = budget_for(ctx, GLM_EVERY, GLM_POINT).expect("a budget");
+                let m = glm_machine(Place::A, None, 2, budget).expect("plan (a)'s machine")(4);
+                assert_eq!(
+                    checkpoints_reserved(&m),
+                    2 * points * GLM_POINT,
+                    "ctx {ctx}"
+                );
+            }
+            assert_eq!(23 * GLM_POINT, 4_125_556_736);
+            const { assert!(23 * GLM_POINT < HOST_BUDGET) };
+            let twice = std::panic::catch_unwind(|| {
+                let mut m = machine(1_000);
+                reserve_glm_checkpoints(&mut m, 1, GLM_POINT);
+                reserve_checkpoints(&mut m, Seqs::ONE);
+            })
+            .expect_err("a second declaration panics");
+            let said = twice
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| twice.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            assert!(said.contains("reserves its checkpoints already"), "{said}");
+        }
+
+        /// The plan's reserve must cover what the load's sequences pin: a
+        /// machine reserved for a context of 512 positions does not cover a
+        /// load of 16,384, refused by name with both figures; the machine
+        /// reserved for the load's own context covers it, and a deeper one
+        /// does too.
+        #[test]
+        fn a_glm_reserve_short_of_the_load_is_refused_by_name() {
+            let at = |ctx: u32| budget_for(ctx, GLM_EVERY, GLM_POINT).expect("a budget");
+            let load = at(16_384);
+            let reserved =
+                |ctx: u32| glm_machine(Place::A, None, 2, at(ctx)).expect("plan (a)'s machine")(4);
+            let Err(e) = check_glm_reserve(&reserved(512), 2, load) else {
+                panic!("a reserve of 512 positions covers a load of 16,384");
+            };
+            let e = e.to_string();
+            assert!(
+                e.contains(&format!("reserves {} B of checkpoints", 2 * GLM_POINT))
+                    && e.contains(&format!("pin up to {} B", 2 * 23 * GLM_POINT)),
+                "{e}"
+            );
+            assert!(check_glm_reserve(&reserved(16_384), 2, load).is_ok());
+            assert!(check_glm_reserve(&reserved(16_384), 2, at(4_096)).is_ok());
         }
 
         /// The default budget reads the checkpoints once, inside the need:

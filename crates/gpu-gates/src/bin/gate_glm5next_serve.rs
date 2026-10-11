@@ -276,13 +276,14 @@ mod gate {
     use std::time::Duration;
 
     use bloomery_gpu_gates::record::{self, Log};
-    use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
+    use bloomery_gpu_gates::residency38::reserve_glm_checkpoints;
     use bloomery_gpu_gates::serve_client::{
         self, agree, beside, check, completion, curl, ids_of, json_of, metric, parse_ids, rendered,
         server_log, stage_usable, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
+    use bloomery_gpu_glm5next::{checkpoint_budget, search_checkpoint_budget};
     use gguf::Split;
     use model::arch::glm5next::place::{
         KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs,
@@ -716,7 +717,8 @@ mod gate {
         let inputs = PlanInputs::read(&split)?;
         let nextn = NextnInputs::read(&inputs)?;
         let mut machine = workstation::plan_gate(inputs.model.layers);
-        reserve_checkpoints(&mut machine, glm_seqs(1));
+        let ckpt = checkpoint_budget(&inputs, u64::try_from(CTX)?)?;
+        reserve_glm_checkpoints(&mut machine, 1, ckpt);
         let plan = inputs.plan_nextn(
             &machine,
             u64::try_from(CTX)?,
@@ -947,8 +949,9 @@ mod gate {
         ctx: usize,
         free: Option<u64>,
     ) -> Result<Option<u64>, GateError> {
+        // The seat's ctx rule probes one machine, its checkpoints reserved at the search's bound.
         let mut machine = workstation::plan_gate(inputs.model.layers);
-        reserve_checkpoints(&mut machine, glm_seqs(1));
+        reserve_glm_checkpoints(&mut machine, 1, search_checkpoint_budget(inputs, None)?);
         machine.cards[0].free_bytes = free;
         Ok(inputs
             .plan(&machine, u64::try_from(ctx)?, levers)
