@@ -18,6 +18,7 @@
 //! Like `bloomery-gpu`, this crate is built with `cargo oxide` only.
 
 pub mod attn;
+pub mod block;
 pub mod body;
 pub mod chain;
 pub mod compress;
