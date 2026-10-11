@@ -298,6 +298,51 @@
 //!   FAIL-first: a prompt call that asks a placed load for the GEMM walk is
 //!   refused by `prefill_plan` and the request answers no tokens.
 //!
+//! With `--images` (the file's own clauses first) or `--only-images`, the image clauses on the
+//! Qwen3.6 file (`images`), against the oracle sets of `refset::arch::qwen35moe::vis` — llama.cpp
+//! mainline's mtmd on the same model file and the family's bf16 projector — and on the Qwen3-30B
+//! file the open's refusal:
+//!
+//! - `image_without_mmproj_is_refused`: an image part on the seat with no `--mmproj` is a 400 in the
+//!   server's own words for every seat that takes no image. FAIL-first: a seat that hands the
+//!   server an image input it has no tower for answers another status;
+//! - `mmproj_on_a_qwen3moe_file_is_refused`: `--mmproj` on the Qwen3-30B file exits at the open
+//!   naming the flag and the file. FAIL-first: an open that ignores the flag listens;
+//! - `mmproj_props_vision_true` and `mmproj_vision_record_is_the_towers_figure`: the server with
+//!   `--mmproj` (`--parallel 2`, the seat's own default context) answers `/props` with vision on, and
+//!   its `vision` record names the card and the seat word the plan gives the tower
+//!   (`vision_seat::encoder_seat`, on this process's cards: a reserve of the stage card when it
+//!   holds one) and the weight and activation bytes of the projector's card figure at the default
+//!   limits. FAIL-first: a record that swaps the two byte counts;
+//! - `mmproj_whole_fit_names_the_reserve` and `mmproj_whole_fit_counts_the_rotation_tables`: the
+//!   seat's whole-fit line (read from the lines it prints before its load) carries the encoder's
+//!   reserve by name and bytes when the tower sits on the stage card (none named off the plan), and
+//!   its cache term is the allocator's bytes of the file's own planes ([`cache_planes`]) with each
+//!   slot's rotation table after them, one f32 row of `rope.dimension_count` a position of the
+//!   slot's share. FAIL-first: a verdict that leaves the reserve out; one that leaves the tables
+//!   out;
+//! - `mmproj_plan_holds_the_reserve` and `mmproj_ctx_default_names_the_reserve`: under
+//!   [`PLACED_BUDGET`] at one `--ctx` the placed plan keeps as many routed experts on the card as
+//!   the plan of a text load under the budget less what the image load sets aside (the tower's
+//!   reserve and each slot's rotation table), and fewer than the plan without `--mmproj` when the
+//!   tower sits on the stage card; the default `--ctx` line of the placed load names the reserve.
+//!   FAIL-first: a plan that leaves the reserve out keeps as many as without `--mmproj`; a line
+//!   that does not name it;
+//! - `mmproj_prompt_ids_are_set_e`: for each request of set E (`e1`: text, image, text; `e2`: a
+//!   system turn and an image-only turn; `e3`: an image in each of two user turns) the prompt the
+//!   server renders (`/apply-template`, `/tokenize`) is the set's ids with each image's pad run
+//!   cut to the one placeholder id, and the tokens the server evaluates are the set's count.
+//!   FAIL-first: parts of a message joined by a newline throughout, not llama-server's rule;
+//! - `mmproj_image_chat_follows_set_f`: the greedy ids of [`F_STEPS`] steps after the prompts `c1`
+//!   and `c2` equal set F's CUDA ids over the prefix on which the set's CPU twin (a second
+//!   reading of mainline) gives the same ids, at least [`F_MIN_PREFIX`] long and printed; at the
+//!   first difference the oracle's id must be the server's own runner-up within [`F_NEAR_TIE`]
+//!   of its top ([`follows`]). FAIL-first: an image's grid taken as `(ny, nx)`, which `c2`'s
+//!   two images of other proportions show;
+//! - `mmproj_image_slot_beside_a_text_slot`: an image request posted on the second slot while a text
+//!   request decodes on the first answers the ids it answered alone, the text request too, and the
+//!   server ran rounds of both slots. FAIL-first: a media call that lands on the first slot.
+//!
 //! The spawn census, every server this gate starts and its `--parallel`:
 //! [`spawn`] and `ctx_default`'s q8 arm pin `--parallel 1` (the prefix and
 //! ctx clauses hold the one-slot path's keeps and defaults), its placed arm
@@ -352,6 +397,7 @@ mod q3place;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
@@ -362,23 +408,31 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
         self, Answer, PrefixTurns, Served, agree, beside, chat_is_those_ids, check, curl,
         edit_and_extension, ids_of, json_of, metric, parse_ids, rendered, serve_cmd, server_log,
         tokenized,
     };
+    use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
     use bloomery_gpu_gates::{GateError, checks_failed};
-    use gguf::Split;
+    use gguf::{Gguf, Split};
     use model::placement::WholeLoad;
     use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
+    use refset::arch::qwen35moe::vis::{self, CHATIDS, DECODE};
+    use refset::clefvis::{ClefvisSet, Span};
+    use refset::family::Family;
     use runtime::seqstate::HOST_BUDGET;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
+    use vision::arch::card::CardBytes;
+    use vision::arch::qwen3vl::{self, TokenLimits};
 
     use crate::q3place;
 
-    const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir>";
+    const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> \
+                         [--images | --only-images]";
 
     /// The tokens each request makes.
     const N: usize = 64;
@@ -452,23 +506,39 @@ mod gate {
     struct Args {
         models: Vec<PathBuf>,
         dir: PathBuf,
+        /// `--images`: the image clauses ([`images`]) after each file's own.
+        images: bool,
+        /// `--only-images`: the image clauses alone.
+        only_images: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        let (mut models, mut dir) = (Vec::new(), None);
+        let (mut models, mut dir, mut images, mut only_images) = (Vec::new(), None, false, false);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
-            let v = it
-                .next()
-                .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
             match flag.as_str() {
-                "--model" => models.push(PathBuf::from(v)),
-                "--dir" => dir = Some(PathBuf::from(v)),
+                "--images" => images = true,
+                "--only-images" => only_images = true,
+                "--model" | "--dir" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
+                    if flag == "--model" {
+                        models.push(PathBuf::from(v));
+                    } else {
+                        dir = Some(PathBuf::from(v));
+                    }
+                }
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
         match (models.is_empty(), dir) {
-            (false, Some(dir)) => Ok(Args { models, dir }),
+            (false, Some(dir)) => Ok(Args {
+                models,
+                dir,
+                images: images || only_images,
+                only_images,
+            }),
             _ => Err(USAGE.into()),
         }
     }
@@ -1741,9 +1811,7 @@ mod gate {
             let d = dir.join(dir_name);
             std::fs::create_dir_all(&d)?;
             let err_log = d.join("server.err");
-            let mut cmd = Command::new(beside("bloomery-serve")?);
-            cmd.env_remove("BLOOMERY_REF_MODEL")
-                .env(bloomery_levers::STEP_STATS, "1");
+            let mut cmd = stats_cmd()?;
             for &(k, v) in env {
                 cmd.env(k, v);
             }
@@ -2653,6 +2721,853 @@ mod gate {
         Ok(())
     }
 
+    // ------------------------------------------------------------ images
+
+    /// The chat requests the oracle sets E and F were dumped from, one JSON line a request
+    /// (`tools/ref/qvis/make_requests.py`), and the images they name, under the tree this binary
+    /// was built from.
+    const REQUESTS: &str = "../../tools/ref/qvis/requests.jsonl";
+    const IMAGE_DIR: &str = "../../tools/ref/clefvis/images";
+
+    /// The tokens an image request answers: set F's decode steps.
+    const F_STEPS: usize = 32;
+
+    /// The widest gap between the server's top two logprobs at which an id that parts from the
+    /// oracle's counts as a near tie, in nats.
+    // PIN(2026-10-11): the Qwen3.6 image seat's own band, under the V4.1 `GREEDY_MARGIN` of 1.5, which
+    // let a grid taken as `(ny, nx)` pass: the clean `c2` run's first difference has a gap of 0.032
+    // (step 26), that defect's 0.36 (step 19).
+    const F_NEAR_TIE: f64 = 0.1;
+
+    /// The fewest ids a prompt's CUDA and CPU oracle runs must agree on for set F to hold the
+    /// server to them: a shorter prefix says too little of the image to be a clause.
+    const F_MIN_PREFIX: usize = 8;
+
+    /// One prompt of set F: the oracle's CUDA decode ids and the length of the prefix on which its
+    /// CPU twin (`decode_<n>.cpu`, a second reading of mainline) gives the same ids.
+    struct Decoded {
+        ids: Vec<u32>,
+        agree: usize,
+    }
+
+    /// The standard base64 of `bytes` with padding — the alphabet `serve::media`'s strict decoder
+    /// reads; no encoder exists in the tree to borrow.
+    fn base64(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for c in bytes.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+            out.push(A[(n >> 18) as usize & 63] as char);
+            out.push(A[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// The sha256 of the file at `path`, as `sha256sum` prints it.
+    fn sha256(path: &Path) -> Result<String, GateError> {
+        let out = Command::new("sha256sum").arg(path).output()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        match text.split_whitespace().next() {
+            Some(h) if out.status.success() => Ok(h.to_owned()),
+            _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
+        }
+    }
+
+    /// The set of `family` whose name ends in `suffix`, opened as a set of that family.
+    fn open_set(family: &'static Family, suffix: &str) -> Result<ClefvisSet, GateError> {
+        let name = family
+            .sets
+            .iter()
+            .find(|s| s.ends_with(suffix))
+            .ok_or_else(|| format!("the {} family names no set ending in {suffix}", family.name))?;
+        Ok(ClefvisSet::open(&family.path(name), family)?)
+    }
+
+    /// The image clauses' facts: the encoder file (the family's projector, held to its digest) and
+    /// its card figure and seat under `--place a`, the oracle sets of the Qwen3.6 image-input
+    /// families (`refset::arch::qwen35moe::vis`; llama.cpp mainline's mtmd on the same model
+    /// file) — E's chat ids of e1..e3 and c1, c2, F's 32 greedy ids after c1 and c2 — and the
+    /// requests and images they were dumped from.
+    struct Images {
+        mmproj: PathBuf,
+        /// The tower's weight and activation bytes at the default token limits.
+        bytes: CardBytes,
+        /// Where the plan seats the tower: a reserve of `bytes.total()` on the stage card when
+        /// every card this process holds is on the plan, else off it.
+        seat: EncoderSeat,
+        e: Vec<ClefvisSet>,
+        c: Vec<ClefvisSet>,
+        f: Vec<Decoded>,
+        requests: BTreeMap<String, Value>,
+        pngs: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl Images {
+        fn read() -> Result<Images, GateError> {
+            let mmproj = PathBuf::from(vis::MMPROJ_BF16);
+            let got = sha256(&mmproj)?;
+            if got != vis::MMPROJ_BF16_SHA256 {
+                return Err(format!(
+                    "{} is {got}; the Qwen3.6 sets were dumped with {}",
+                    mmproj.display(),
+                    vis::MMPROJ_BF16_SHA256
+                )
+                .into());
+            }
+            let file = Gguf::open(&mmproj)?;
+            let hp = qwen3vl::Hparams::read(&file)?;
+            let bytes = qwen3vl::card::of(&hp, TokenLimits::DEFAULT);
+            let seat = vision_seat::encoder_seat(Place::A, bytes.total())?;
+            let set = |f: &'static Family, tail: &str| open_set(f, tail);
+            let e = ["e1", "e2", "e3"]
+                .map(|n| set(&CHATIDS, &format!("chatids_{n}")))
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            let c = ["c1", "c2"]
+                .map(|n| set(&CHATIDS, &format!("chatids_{n}")))
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut f = Vec::new();
+            for n in ["c1", "c2"] {
+                // The CUDA run's ids; the CPU twin of the same prompt is a second reading of
+                // mainline, whose agreement with it is printed.
+                let cuda = open_set(&DECODE, &format!("decode_{n}"))?.decode_ids()?;
+                let twin = open_set(&DECODE, &format!("decode_{n}.cpu"))?.decode_ids()?;
+                let agree = cuda.iter().zip(&twin).take_while(|(a, b)| a == b).count();
+                println!(
+                    "set F {n}: {} CUDA ids, the CPU twin agrees on the first {agree}",
+                    cuda.len()
+                );
+                if agree < F_MIN_PREFIX {
+                    return Err(format!(
+                        "set F {n}: the CUDA and CPU ids agree on {agree} ids, fewer than \
+                         {F_MIN_PREFIX}: no prefix to hold the server to"
+                    )
+                    .into());
+                }
+                f.push(Decoded { ids: cuda, agree });
+            }
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let text = std::fs::read_to_string(root.join(REQUESTS))?;
+            let mut requests = BTreeMap::new();
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let v: Value = serde_json::from_str(line)?;
+                let id = v["id"].as_str().ok_or("a request with no id")?.to_owned();
+                requests.insert(id, v["messages"].clone());
+            }
+            let mut pngs = BTreeMap::new();
+            for set in e.iter().chain(&c) {
+                for image in &set.images {
+                    let path = root.join(IMAGE_DIR).join(format!("{}.png", image.name));
+                    if sha256(&path)? != image.png_sha256 {
+                        return Err(format!(
+                            "{} is not the image the sets were dumped from ({})",
+                            path.display(),
+                            image.png_sha256
+                        )
+                        .into());
+                    }
+                    pngs.insert(image.name.clone(), std::fs::read(&path)?);
+                }
+            }
+            Ok(Images {
+                mmproj,
+                bytes,
+                seat,
+                e,
+                c,
+                f,
+                requests,
+                pngs,
+            })
+        }
+
+        /// The chat body of request `id` of the sets, its images as `data:` URLs, the thinking
+        /// switch the set's chat line records.
+        fn chat(&self, id: &str, thinking: bool) -> Result<Value, GateError> {
+            let mut messages = self
+                .requests
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("no request {id} in {REQUESTS}"))?;
+            for m in messages.as_array_mut().into_iter().flatten() {
+                for part in m["content"].as_array_mut().into_iter().flatten() {
+                    if part["type"] != "image_url" {
+                        continue;
+                    }
+                    let name = part["image_url"]["url"]
+                        .as_str()
+                        .ok_or("an image part with no name")?
+                        .to_owned();
+                    let png = self
+                        .pngs
+                        .get(&name)
+                        .ok_or_else(|| format!("request {id}: no image {name} among the sets'"))?;
+                    part["image_url"]["url"] =
+                        json!(format!("data:image/png;base64,{}", base64(png)));
+                }
+            }
+            Ok(json!({
+                "messages": messages,
+                "chat_template_kwargs": { "enable_thinking": thinking },
+            }))
+        }
+
+        /// [`Images::chat`] of the case `n` (`c1`, `c2`, `e1`, `e2`, `e3`) as its chat-ids set's
+        /// chat line renders it.
+        fn case(&self, n: &str) -> Result<Value, GateError> {
+            let (sets, at) = match n {
+                "c1" => (&self.c, 0),
+                "c2" => (&self.c, 1),
+                "e1" => (&self.e, 0),
+                "e2" => (&self.e, 1),
+                "e3" => (&self.e, 2),
+                other => return Err(format!("no chat-ids set of case {other}").into()),
+            };
+            self.chat(n, sets[at].chat()?.enable_thinking)
+        }
+    }
+
+    /// `ids` with each of `spans` — a run of the image-pad id — cut to the one id the chat
+    /// template's placeholder tokenizes to: the prompt before the server expands its images.
+    fn collapsed(ids: &[u32], spans: &[Span]) -> Result<Vec<u32>, GateError> {
+        let (mut out, mut at) = (Vec::new(), 0);
+        for s in spans {
+            let run = ids
+                .get(s.at..s.at + s.len)
+                .filter(|r| !r.is_empty() && r.iter().all(|&i| i == r[0]))
+                .ok_or_else(|| format!("span {} is not one id repeated", s.index))?;
+            out.extend_from_slice(&ids[at..s.at]);
+            out.push(run[0]);
+            at = s.at + s.len;
+        }
+        out.extend_from_slice(&ids[at..]);
+        Ok(out)
+    }
+
+    /// A server of `args` over `env` beside `--model qwen3 -m <model>` whose stderr is read until
+    /// a line starts with `until`, then stopped: its stderr. The seat prints its plan and its
+    /// whole-fit verdict before it opens the model, so no clause on them waits on a load.
+    fn before_load(
+        model: &Path,
+        dir: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+        until: &str,
+    ) -> Result<String, GateError> {
+        std::fs::create_dir_all(dir)?;
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mut cmd = serve_cmd()?;
+        for &(k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut all = vec!["--model", "qwen3", "--port", "0", "-m", m];
+        all.extend_from_slice(args);
+        let mut s = Served::spawn_cmd(cmd, &all, dir)?;
+        let err_log = dir.join("server.err");
+        for _ in 0..720 {
+            let text = std::fs::read_to_string(&err_log).unwrap_or_default();
+            if text.lines().any(|l| l.starts_with(until)) || s.child.try_wait()?.is_some() {
+                s.stop()?;
+                return Ok(std::fs::read_to_string(&err_log)?);
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Err(format!("the server printed no `{until}` line in 3 minutes ({all:?})").into())
+    }
+
+    /// The server command with its step counters on (`BLOOMERY_STEP_STATS=1`, which only prints
+    /// the `slots round` records the slot clauses read): the one place this gate sets it.
+    fn stats_cmd() -> Result<Command, GateError> {
+        let mut cmd = serve_cmd()?;
+        cmd.env(bloomery_levers::STEP_STATS, "1");
+        Ok(cmd)
+    }
+
+    /// A chat request posted on a helper thread ([`post_chat`]): the thread and the receiver of
+    /// its status and body.
+    type Posted = (
+        JoinHandle<()>,
+        mpsc::Receiver<Result<(u16, String), String>>,
+    );
+
+    /// One chat request `body` posted on a helper thread of its own, as [`streamed`] posts a
+    /// completion.
+    fn post_chat(addr: &str, body: Value) -> Result<Posted, GateError> {
+        let (tx, rx) = mpsc::channel();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let (h, _) = spawn_helper("image-request", Placement::Float, move || {
+            let _ = tx.send(curl(&url, Some(&body), false).map_err(|e| e.to_string()));
+        })
+        .map_err(|e| format!("image slots: {}", e.what()))?;
+        Ok((h, rx))
+    }
+
+    /// The ids a greedy chat answered, each with the runner-up of its step and the gap between the
+    /// top two logprobs (`None` where the answer carried one only), the prompt's token count and
+    /// the text the ids say.
+    struct Answer35 {
+        ids: Vec<u32>,
+        second: Vec<Option<(u32, f64)>>,
+        prompt: u64,
+        text: String,
+    }
+
+    /// `body` as a greedy chat of `n` tokens with each step's two best tokens returned, no prompt
+    /// cache.
+    fn ask(body: &Value, n: usize) -> Value {
+        let mut b = body.clone();
+        b["max_tokens"] = json!(n);
+        b["temperature"] = json!(0);
+        b["cache_prompt"] = json!(false);
+        b["logprobs"] = json!(true);
+        b["top_logprobs"] = json!(2);
+        b
+    }
+
+    /// The answer in `status`/`text` of a chat of [`ask`], or a named error.
+    fn answered(status: u16, text: &str) -> Result<Answer35, GateError> {
+        let v = json_of("/v1/chat/completions", status, text)?;
+        let content = v["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .ok_or("the chat answer carries no logprobs content")?;
+        let (mut ids, mut second) = (Vec::new(), Vec::new());
+        for e in content {
+            ids.push(u32::try_from(
+                e["id"].as_u64().ok_or("a logprobs entry with no id")?,
+            )?);
+            second.push(e["top_logprobs"].as_array().and_then(|t| {
+                let (a, b) = (t.first()?, t.get(1)?);
+                Some((
+                    u32::try_from(b["id"].as_u64()?).ok()?,
+                    a["logprob"].as_f64()? - b["logprob"].as_f64()?,
+                ))
+            }));
+        }
+        let msg = &v["choices"][0]["message"];
+        Ok(Answer35 {
+            ids,
+            second,
+            prompt: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+            text: format!(
+                "{}{}",
+                msg["reasoning_content"].as_str().unwrap_or(""),
+                msg["content"].as_str().unwrap_or("")
+            ),
+        })
+    }
+
+    /// Set F's rule for one prompt, over the prefix where the oracle's own CUDA and CPU runs agree
+    /// (`want.agree`; past it the oracle is two engines' roundings parting and holds nothing): the
+    /// server's greedy ids equal the oracle's CUDA ids, or at the first difference the oracle's id
+    /// is the server's own runner-up within [`F_NEAR_TIE`] of its top (a near tie, where two
+    /// engines' roundings may part) and nothing after it is held. The step the ids agreed up to, the gap at the first difference when there is
+    /// one, and whether the rule holds; an answer shorter than the prefix fails.
+    fn follows(a: &Answer35, want: &Decoded) -> (usize, Option<f64>, bool) {
+        if a.ids.len() < want.agree {
+            return (a.ids.len(), None, false);
+        }
+        for k in 0..want.agree {
+            if a.ids[k] == want.ids[k] {
+                continue;
+            }
+            let gap = a.second[k]
+                .filter(|&(id, _)| id == want.ids[k])
+                .map(|(_, g)| g);
+            return (k, gap, gap.is_some_and(|g| g < F_NEAR_TIE));
+        }
+        (want.agree, None, true)
+    }
+
+    /// The `vision` record and `/props` of the image server (`--mmproj` over `--parallel 2`,
+    /// `BLOOMERY_STEP_STATS=1`, no `--ctx`: the seat's own default) and the clauses that read
+    /// them: `mmproj_props_vision_true` and `mmproj_vision_record_is_the_towers_figure`; then the
+    /// requests' clauses ([`image_requests`]).
+    fn image_server(
+        model: &Path,
+        img: &Images,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let d = dir.join("server");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let cmd = stats_cmd()?;
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mm = img
+            .mmproj
+            .to_str()
+            .ok_or("the projector path is not UTF-8")?;
+        let mut s = Served::spawn_cmd(
+            cmd,
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "2",
+                "-m",
+                m,
+                "--mmproj",
+                mm,
+            ],
+            &d,
+        )?;
+        let addr = match s.address(&err_log, 900, Duration::from_secs(1)) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("the image server never listened: {e}");
+                check(ok, "mmproj_server_listens", false);
+                return Ok(());
+            }
+        };
+        let url = |p: &str| format!("http://{addr}{p}");
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let props = json_of("/props", st, &body)?;
+        println!("props modalities {}", props["modalities"]);
+        check(
+            ok,
+            "mmproj_props_vision_true",
+            props["modalities"]["vision"] == json!(true),
+        );
+
+        let log = seat_log(&err_log)?;
+        let vision = log.first(&record::VISION)?;
+        let seat = &img.seat;
+        let figure = (
+            seat.name.replace(' ', "_"),
+            seat.word(),
+            img.bytes.weights,
+            img.bytes.scratch,
+        );
+        let seen = match &vision {
+            Some(f) => Some((
+                f.word("card")?.to_owned(),
+                f.word("seat")?,
+                f.u64("weights")?,
+                f.u64("scratch")?,
+                f.u64("cap")?,
+                f.word("scratch_home")?,
+            )),
+            None => None,
+        };
+        println!("vision record {seen:?}; the figure {figure:?}");
+        check(
+            ok,
+            "mmproj_vision_record_is_the_towers_figure",
+            seen.as_ref().is_some_and(|(card, word, w, sc, cap, home)| {
+                (card.as_str(), *word, *w, *sc) == (figure.0.as_str(), figure.1, figure.2, figure.3)
+                    && *cap == u64::try_from(TokenLimits::DEFAULT.max()).unwrap_or(0)
+                    && *home == "own"
+            }),
+        );
+
+        image_requests(img, &addr, &err_log, dir, ok)?;
+        println!("image server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
+    /// The whole-fit line of an image load (`--mmproj` over `--parallel 2`, no `--ctx`: the seat's
+    /// own default), read from the lines the seat prints before it loads, so the verdict stands on
+    /// its own: a verdict that leaves the reserve out would load the whole model and leave the tower
+    /// no room. `mmproj_whole_fit_names_the_reserve` and
+    /// `mmproj_whole_fit_counts_the_rotation_tables`.
+    fn image_whole_fit(
+        model: &Path,
+        img: &Images,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let mm = img
+            .mmproj
+            .to_str()
+            .ok_or("the projector path is not UTF-8")?;
+        let err = before_load(
+            model,
+            &dir.join("whole-fit"),
+            &["--parallel", "2", "--mmproj", mm],
+            &[],
+            "parallel rule=",
+        )?;
+        let fit = err
+            .lines()
+            .find(|l| l.starts_with("whole fit at ctx "))
+            .ok_or("the image seat printed no whole-fit line")?;
+        println!("{fit}");
+        let seat = &img.seat;
+        let named = format!(
+            "; the reserves term holds the {}'s {} B",
+            vision_seat::RESERVE,
+            seat.reserve.unwrap_or(0)
+        );
+        check(
+            ok,
+            "mmproj_whole_fit_names_the_reserve",
+            match seat.reserve {
+                Some(r) => r == img.bytes.total() && fit.ends_with(&named),
+                None => !fit.contains(vision_seat::RESERVE),
+            },
+        );
+        check(
+            ok,
+            "mmproj_whole_fit_counts_the_rotation_tables",
+            tables_in_the_cache(model, fit, 2)?,
+        );
+        Ok(())
+    }
+
+    /// `rope.dimension_count` of the file: the f32 a sequence's rotation table holds a position.
+    fn rope_width(model: &Path) -> Result<u64, GateError> {
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        split
+            .arch_get_u64("rope.dimension_count")
+            .ok_or_else(|| format!("{}: no rope.dimension_count", model.display()).into())
+    }
+
+    /// The cache term of the whole-fit line `fit` of a load of `slots` slots is the allocator's
+    /// bytes of the file's own planes ([`cache_planes`]) with, after each slot's, the rotation
+    /// table of a media load: one f32 row of the file's rope width a position of the slot's
+    /// share (`rope.dimension_count`, 64 on Qwen3.6, 256 B a position).
+    fn tables_in_the_cache(model: &Path, fit: &str, slots: u64) -> Result<bool, GateError> {
+        let total: u64 = fit
+            .strip_prefix("whole fit at ctx ")
+            .and_then(|t| t.split(':').next())
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(|| format!("no context in the whole-fit line: {fit}"))?;
+        let said: u64 = fit
+            .split(" + cache ")
+            .nth(1)
+            .and_then(|t| t.split(" B").next())
+            .and_then(|t| t.parse().ok())
+            .ok_or("the whole-fit line names no cache bytes")?;
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let rope = rope_width(model)?;
+        let rows = total / slots;
+        let mut planes = Vec::new();
+        for _ in 0..slots {
+            planes.extend(cache_planes(model, &split, rows)?);
+            planes.push(rows * rope * 4);
+        }
+        let want = model::placement::allocator_bytes(GRANULE, planes);
+        println!(
+            "tables: {slots} slots of {rows} rows, the line's cache {said} B, the allocator's \
+             bytes of the planes and the {rope}-wide tables {want} B"
+        );
+        Ok(said == want)
+    }
+
+    /// The image server's request clauses (module header): `mmproj_prompt_ids_are_set_e`,
+    /// `mmproj_image_chat_follows_set_f` and `mmproj_image_slot_beside_a_text_slot`.
+    fn image_requests(
+        img: &Images,
+        addr: &str,
+        err_log: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let url = |p: &str| format!("http://{addr}{p}");
+
+        // J1: the prompt each request of set E renders to is mainline's, an image one
+        // placeholder (`/apply-template`, `/tokenize`) the server expands to its span's ids —
+        // and the count it evaluates is the set's.
+        let mut j1 = true;
+        for (k, set) in img.e.iter().enumerate() {
+            let n = format!("e{}", k + 1);
+            let body = img.case(&n)?;
+            let (st, text) = curl(&url("/apply-template"), Some(&body), false)?;
+            let prompt = json_of("/apply-template", st, &text)?["prompt"]
+                .as_str()
+                .ok_or("/apply-template: no prompt")?
+                .to_owned();
+            let ids = tokenized(&url, &prompt)?;
+            let oracle = set.ids()?;
+            let want = collapsed(&oracle, &set.spans)?;
+            let mut chat = body.clone();
+            chat["max_tokens"] = json!(1);
+            chat["temperature"] = json!(0);
+            chat["cache_prompt"] = json!(false);
+            let (st, text) = curl(&url("/v1/chat/completions"), Some(&chat), false)?;
+            let served =
+                json_of("/v1/chat/completions", st, &text)?["usage"]["prompt_tokens"].as_u64();
+            println!(
+                "J1 {n}: the rendered prompt {} ids (set {}); the server evaluated {served:?} \
+                 (set {})",
+                ids.len(),
+                want.len(),
+                oracle.len()
+            );
+            j1 &= ids == want && served == u64::try_from(oracle.len()).ok();
+        }
+        check(ok, "mmproj_prompt_ids_are_set_e", j1);
+
+        // F: 32 greedy ids after c1 and c2.
+        let mut f = true;
+        for (k, n) in ["c1", "c2"].into_iter().enumerate() {
+            let body = ask(&img.case(n)?, F_STEPS);
+            let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+            std::fs::write(dir.join(format!("chat-{n}.json")), &text)?;
+            let a = answered(st, &text)?;
+            let (agreed, gap, holds) = follows(&a, &img.f[k]);
+            println!(
+                "F {n}: {} ids, the prompt {} tokens (set {}); equal to the oracle's CUDA ids for \
+                 {agreed} of the {} the oracle's CPU twin agrees on (the gap at the first \
+                 difference {gap:?}), the rule {}; said {:?}",
+                a.ids.len(),
+                a.prompt,
+                img.c[k].ids()?.len(),
+                img.f[k].agree,
+                if holds { "holds" } else { "fails" },
+                a.text.chars().take(80).collect::<String>()
+            );
+            f &= holds && a.prompt == img.c[k].ids()?.len() as u64;
+        }
+        check(ok, "mmproj_image_chat_follows_set_f", f);
+
+        // S6: an image request on one slot beside a text request on the other. Each answers
+        // what it answered alone, and the server ran rounds of both slots together.
+        let text = tokenized(&url, PROSE)?;
+        let image = ask(&img.case("c1")?, SLOTS_PREDICT);
+        let alone_text = {
+            let (h, rx) = streamed(addr, &text, SLOTS_PREDICT)?;
+            h.join().map_err(|_| "image slots: a thread panicked")?;
+            rx.recv().map_err(|_| "image slots: no answer")??.tokens
+        };
+        let (st, body) = curl(&url("/v1/chat/completions"), Some(&image), false)?;
+        let alone_image = answered(st, &body)?;
+        let first = streamed(addr, &text, SLOTS_PREDICT)?;
+        let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let mut polls = 0;
+        while polls < LATE_POLLS
+            && metric(&url, "n_decode_total")?.unwrap_or(decode0) < decode0 + LATE_ROUNDS as f64
+        {
+            std::thread::sleep(LATE_POLL);
+            polls += 1;
+        }
+        let (second, second_rx) = post_chat(addr, image)?;
+        let (h, rx) = first;
+        h.join().map_err(|_| "image slots: a thread panicked")?;
+        let together_text = rx.recv().map_err(|_| "image slots: no answer")??.tokens;
+        second
+            .join()
+            .map_err(|_| "image slots: the image request's thread panicked")?;
+        let (st, body) = second_rx
+            .recv()
+            .map_err(|_| "image slots: no image answer")??;
+        let together_image = answered(st, &body)?;
+        let both = seat_log(err_log)?
+            .all(&record::SLOTS_ROUND)?
+            .iter()
+            .filter(|r| r.u64("rows") == Ok(2))
+            .count();
+        println!(
+            "image slots: the image request posted after {polls} poll(s); {} text ids and {} \
+             image ids; {both} round(s) of both slots",
+            together_text.len(),
+            together_image.ids.len(),
+        );
+        check(
+            ok,
+            "mmproj_image_slot_beside_a_text_slot",
+            both > 0
+                && !together_text.is_empty()
+                && together_text == alone_text
+                && !together_image.ids.is_empty()
+                && together_image.ids == alone_image.ids,
+        );
+        Ok(())
+    }
+
+    /// The placed plan of an image load (`--place a` under [`PLACED_BUDGET`]): at one context it
+    /// keeps as many routed experts on the card as the plan of a text load under the budget less
+    /// what the image load sets aside of it — the tower's reserve when the tower sits on the stage
+    /// card, and each slot's rotation table of its share of the context — and fewer than the plan
+    /// without `--mmproj` at the full budget when the tower sits there
+    /// (`mmproj_plan_holds_the_reserve`); and the default `--ctx` line names the reserve
+    /// (`mmproj_ctx_default_names_the_reserve`).
+    fn image_plan(model: &Path, img: &Images, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let mm = img
+            .mmproj
+            .to_str()
+            .ok_or("the projector path is not UTF-8")?;
+        let env = [(bloomery_levers::CARD_BUDGET, PLACED_BUDGET)];
+        let (ctx, slots) = (16384_u64, 2_u64);
+        let ctx_arg = ctx.to_string();
+        let experts = |name: &str, extra: &[&str], budget: &str| -> Result<u64, GateError> {
+            let mut args = vec!["--place", "a", "--parallel", "2", "--ctx", ctx_arg.as_str()];
+            args.extend_from_slice(extra);
+            let d = dir.join(name);
+            before_load(
+                model,
+                &d,
+                &args,
+                &[(bloomery_levers::CARD_BUDGET, budget)],
+                "plan ",
+            )?;
+            let plan = seat_log(&d.join("server.err"))?
+                .first(&record::PLAN38)?
+                .ok_or_else(|| format!("{name}: the seat printed no plan record"))?;
+            Ok(plan.u64("card_experts")?)
+        };
+        let without = experts("plan-text", &[], PLACED_BUDGET)?;
+        let with = experts("plan-image", &["--mmproj", mm], PLACED_BUDGET)?;
+        let tables = slots * (ctx / slots) * rope_width(model)? * 4;
+        let aside = img.seat.reserve.unwrap_or(0) + tables;
+        let budget = bloomery_levers::parse_bytes(PLACED_BUDGET)
+            .map_err(|e| format!("{PLACED_BUDGET}: {e}"))?
+            - aside;
+        let same = experts("plan-text-less", &[], &budget.to_string())?;
+        println!(
+            "placed plan at ctx {ctx}: {without} card experts without --mmproj, {with} with it (the \
+             tower {}), {same} of a text load under the budget less the {aside} B it sets aside \
+             ({tables} B of tables)",
+            img.seat.word()
+        );
+        check(
+            ok,
+            "mmproj_plan_holds_the_reserve",
+            with == same && (img.seat.reserve.is_none() || with < without),
+        );
+
+        let d = dir.join("plan-ctx");
+        let err = before_load(
+            model,
+            &d,
+            &["--place", "a", "--parallel", "2", "--mmproj", mm],
+            &env,
+            "plan ",
+        )?;
+        let line = err
+            .lines()
+            .find(|l| l.contains("--ctx defaults to "))
+            .ok_or("the placed image server printed no --ctx default line")?;
+        println!("{line}");
+        let counted = format!(
+            ", the {} reserve of {} B counted",
+            vision_seat::RESERVE,
+            img.seat.reserve.unwrap_or(0)
+        );
+        check(
+            ok,
+            "mmproj_ctx_default_names_the_reserve",
+            match img.seat.reserve {
+                Some(_) => line.contains(&counted),
+                None => !line.contains(vision_seat::RESERVE),
+            },
+        );
+        Ok(())
+    }
+
+    /// An image part on a seat with no `--mmproj` is the server's own refusal of every seat that
+    /// takes no image: a 400 naming the kind, never a prompt run without the image
+    /// (`image_without_mmproj_is_refused`).
+    fn image_without_mmproj_is_refused(
+        model: &Path,
+        img: &Images,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let d = dir.join("no-mmproj");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut s = spawn(model, &d)?;
+        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+        let (st, body) = curl(
+            &format!("http://{addr}/v1/chat/completions"),
+            Some(&img.case("c1")?),
+            false,
+        )?;
+        println!("an image on the seat with no --mmproj: {st} {body}");
+        check(
+            ok,
+            "image_without_mmproj_is_refused",
+            st == 400 && body.contains("image input is not supported: this server reads text only"),
+        );
+        println!("no-mmproj server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
+    /// `--mmproj` on a Qwen3-30B file is refused at the open, by name, before any card work: the
+    /// server exits on its own with the file named, never listens
+    /// (`mmproj_on_a_qwen3moe_file_is_refused`).
+    fn mmproj_on_a_qwen3moe_file_is_refused(
+        model: &Path,
+        mmproj: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let d = dir.join("mmproj-qwen3moe");
+        std::fs::create_dir_all(&d)?;
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mm = mmproj.to_str().ok_or("the projector path is not UTF-8")?;
+        let mut s = Served::spawn_cmd(
+            serve_cmd()?,
+            &["--model", "qwen3", "--port", "0", "-m", m, "--mmproj", mm],
+            &d,
+        )?;
+        let mut status = None;
+        for _ in 0..240 {
+            status = s.child.try_wait()?;
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let said = std::fs::read_to_string(d.join("server.err"))?;
+        println!("--mmproj on the qwen3moe file: exit {status:?}, said {said}");
+        let refused = status.is_some_and(|s| !s.success())
+            && said.contains(&format!("--mmproj {}", mmproj.display()))
+            && said.contains("is a qwen3moe file")
+            && said.contains("no image input");
+        check(ok, "mmproj_on_a_qwen3moe_file_is_refused", refused);
+        if status.is_none() {
+            println!("the server listened: stopped {}", s.stop()?);
+        }
+        Ok(())
+    }
+
+    /// The image clauses (module header) on `model`: the qwen3moe arm holds the open's refusal,
+    /// the qwen35moe arm the seat with the encoder.
+    fn images(model: &Path, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let arch = {
+            let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+            split.architecture().map(str::to_owned)
+        };
+        let d = dir.join("images");
+        std::fs::create_dir_all(&d)?;
+        match arch.as_deref() {
+            Some("qwen3moe") => {
+                mmproj_on_a_qwen3moe_file_is_refused(model, Path::new(vis::MMPROJ_BF16), &d, ok)
+            }
+            Some("qwen35moe") => {
+                let img = Images::read()?;
+                println!(
+                    "the encoder {} ({} B of weights, {} B of activations): {} under --place a",
+                    img.mmproj.display(),
+                    img.bytes.weights,
+                    img.bytes.scratch,
+                    img.seat.word()
+                );
+                image_without_mmproj_is_refused(model, &img, &d, ok)?;
+                image_plan(model, &img, &d, ok)?;
+                image_whole_fit(model, &img, &d, ok)?;
+                image_server(model, &img, &d, ok)
+            }
+            other => Err(format!("{}: images on a {other:?} file", model.display()).into()),
+        }
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let a = parse_args()?;
@@ -2662,6 +3577,10 @@ mod gate {
             let dir = a.dir.join(i.to_string());
             std::fs::create_dir_all(&dir)?;
             println!("== {}", model.display());
+            if a.only_images {
+                images(model, &dir, &mut ok)?;
+                continue;
+            }
             let Some((answers, arch, default_n)) = served(model, &dir, &mut ok)? else {
                 continue;
             };
@@ -2695,6 +3614,9 @@ mod gate {
                 // The qwen3moe arm alone: the placed prompt past the GEMM
                 // walk.
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
+            }
+            if a.images {
+                images(model, &dir, &mut ok)?;
             }
         }
         if ok {

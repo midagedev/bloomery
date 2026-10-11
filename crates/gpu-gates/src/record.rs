@@ -3073,7 +3073,8 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf`
 /// fetch's lines (printed by the server before the seat registers), the
-/// load, the address and each request's note of the prefix it kept none of.
+/// load, the image encoder's after it under `--mmproj`, the address and each
+/// request's note of the prefix it kept none of.
 pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
     &PLACE_UNSET,
     &PLAN38,
@@ -3083,6 +3084,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
     &HF_PROGRESS,
     &HF_DONE,
     &LOAD_QWEN3,
+    &VISION,
     &LISTENING_QWEN3,
     &CACHE_REUSE,
     &SLOTS_ROUND,

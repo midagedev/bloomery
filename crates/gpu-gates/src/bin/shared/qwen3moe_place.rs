@@ -37,6 +37,7 @@ use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::{Place, PlaceWhy};
+use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoint_bytes, reserve_checkpoints};
 use bloomery_levers::{HostCfg, Levers};
@@ -46,7 +47,7 @@ use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
 use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
-    self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
+    self, Card, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
     WholeLoad, WholeNeed,
 };
 use runtime::seqstate::HOST_BUDGET;
@@ -154,6 +155,8 @@ pub struct PlaceQ3 {
     /// The sequences the load holds, whose rows every machine of it carries
     /// ([`laid`]).
     seqs: Seqs,
+    /// What a media load adds to every machine and verdict of this load.
+    media: Media,
     machine: Machine,
 }
 
@@ -167,6 +170,11 @@ pub use bloomery_gpu_gates::residency38::Seqs;
 /// The card reserve of a load's resident sequences past the live one
 /// ([`laid`]): each one's stores that no position moves.
 pub const SLOTS_RESERVE: &str = "resident slots";
+
+/// The card reserve of a media load's rotation tables, one for every resident sequence ([`laid`]):
+/// a placed plan's KV term counts a text load's bytes a position, not the table each sequence's
+/// image positions rewrite (`gpu::media::SeqRope`).
+pub const TABLES_RESERVE: &str = "sequence rotation tables";
 
 /// The layers the model loads: a qwen35moe file's trunk (its next-token
 /// layers are never loaded).
@@ -199,7 +207,13 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
 /// one owner ([`reserve_checkpoints`]). The one owner of a placed
 /// load's machine, so a relaid machine ([`PlaceQ3::machine_at`]) keeps the
 /// rows.
-fn laid(spec: CardSpec, inputs: &Inputs, arena: u64, seqs: Seqs) -> Machine {
+fn laid(
+    spec: CardSpec,
+    inputs: &Inputs,
+    arena: u64,
+    seqs: Seqs,
+    (media, rows): (Media, u64),
+) -> Machine {
     let mut machine = q3::machine(spec, layers_of(inputs), arena);
     let past = u64::try_from(seqs.slots.saturating_sub(1))
         .map_or(u64::MAX, |n| n.saturating_mul(fixed_seq_bytes(inputs)));
@@ -208,8 +222,27 @@ fn laid(spec: CardSpec, inputs: &Inputs, arena: u64, seqs: Seqs) -> Machine {
             .reserves
             .push((SLOTS_RESERVE.to_owned(), past));
     }
+    if let Some(width) = media.tables {
+        let positions = u64::try_from(seqs.slots).map_or(u64::MAX, |n| n.saturating_mul(rows));
+        machine.cards[0].reserves.push((
+            TABLES_RESERVE.to_owned(),
+            positions.saturating_mul(image_plan::table_bytes_per_position(width)),
+        ));
+    }
     reserve_checkpoints(&mut machine, seqs);
+    image_plan::reserve_on(&mut machine, media.encoder);
     machine
+}
+
+/// What a media load adds to the machines and verdicts of a load ([`laid`], [`whole_on`]): the
+/// image encoder's bytes when its tower sits on the stage card
+/// (`vision_seat::EncoderSeat::reserve`, entered by [`image_plan::reserve_on`]), and the width
+/// in f32 of the rotation table every sequence holds on a media load (`Open35::media`;
+/// [`image_plan::table_bytes_per_position`] a position). A text load adds neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Media {
+    encoder: Option<u64>,
+    tables: Option<usize>,
 }
 
 /// `o` for the load each of `slots` slots opens when they split `ctx`
@@ -253,13 +286,21 @@ impl PlaceQ3 {
         }
         let inputs = Inputs::Qwen3(inputs);
         let arena = Qwen3moeModel::placed_arena_bytes(file, ctx)?;
-        let machine = laid(place.card_specs()?[0], &inputs, arena, Seqs::ONE);
+        let media = Media::default();
+        let machine = laid(
+            place.card_specs()?[0],
+            &inputs,
+            arena,
+            Seqs::ONE,
+            (media, 0),
+        );
         Ok(PlaceQ3 {
             place,
             arch: "qwen3moe",
             inputs,
             kv,
             seqs: Seqs::ONE,
+            media,
             machine,
         })
     }
@@ -272,12 +313,14 @@ impl PlaceQ3 {
         reason = "the CLI's and the e2e gates' load; the serve seat's holds its slots (qwen35_seqs)"
     )]
     pub fn qwen35(file: &Split, place: Place, o: Open35) -> Result<PlaceQ3, GateError> {
-        PlaceQ3::qwen35_on(file, place, &census()?, o, Seqs::ONE)
+        PlaceQ3::qwen35_on(file, place, &census()?, o, Seqs::ONE, None)
     }
 
     /// [`PlaceQ3::qwen35`] of a load that holds `seqs`, each of its slots
     /// opened under `o` (a slot's share of the total, [`share`]), its machine
-    /// carrying their rows ([`laid`]): the serve seat's.
+    /// carrying their rows ([`laid`]) and, on a media load (`o.media`), the
+    /// tables of its sequences and the image encoder's `encoder` bytes when
+    /// the tower sits on this card: the serve seat's.
     #[allow(
         dead_code,
         reason = "the serve seat's resident slots; the CLI and the e2e gates load one sequence"
@@ -287,8 +330,9 @@ impl PlaceQ3 {
         place: Place,
         o: Open35,
         seqs: Seqs,
+        encoder: Option<u64>,
     ) -> Result<PlaceQ3, GateError> {
-        PlaceQ3::qwen35_on(file, place, &census()?, o, seqs)
+        PlaceQ3::qwen35_on(file, place, &census()?, o, seqs, encoder)
     }
 
     /// [`PlaceQ3::qwen35_seqs`] resolved against `census`.
@@ -298,21 +342,28 @@ impl PlaceQ3 {
         census: &[DeviceInfo],
         o: Open35,
         seqs: Seqs,
+        encoder: Option<u64>,
     ) -> Result<PlaceQ3, GateError> {
         let place = PlaceQ3::resolve(place, census)?;
         let mut inputs = q35::PlanInputs::describe(file)?;
         if o.kv == KvQ8::Q8 {
             inputs.kv = inputs.kv.in_q8();
         }
+        let media = Media {
+            encoder,
+            tables: o.media.then_some(inputs.hp.rope_dims),
+        };
         let inputs = Inputs::Qwen35(Box::new(inputs));
         let arena = Qwen35moeModel::placed_arena_bytes(file, o)?;
-        let machine = laid(place.card_specs()?[0], &inputs, arena, seqs);
+        let rows = u64::try_from(o.ctx)?;
+        let machine = laid(place.card_specs()?[0], &inputs, arena, seqs, (media, rows));
         Ok(PlaceQ3 {
             place,
             arch: "qwen35moe",
             inputs,
             kv: o.kv,
             seqs,
+            media,
             machine,
         })
     }
@@ -341,13 +392,15 @@ impl PlaceQ3 {
     /// The same placed load's machine at `ctx`: the place, the inputs and the
     /// sequences this one resolved and read stay — the census and the file's
     /// headers a context search's every probe retook before — and the machine
-    /// is relaid over the arena `ctx` sets, its only ctx-dependent term.
-    fn machine_at(&self, arena: u64) -> Result<Machine, GateError> {
+    /// is relaid over the arena `ctx` sets and, on a media load, the tables of
+    /// `rows` positions a sequence (a slot's share), its ctx-dependent terms.
+    fn machine_at(&self, arena: u64, rows: usize) -> Result<Machine, GateError> {
         Ok(laid(
             self.place.card_specs()?[0],
             &self.inputs,
             arena,
             self.seqs,
+            (self.media, u64::try_from(rows)?),
         ))
     }
 
@@ -391,13 +444,13 @@ impl PlaceQ3 {
         load: Result<WholeLoad, String>,
     ) -> Result<Whole, GateError> {
         let layers = 0..self.layers();
-        let kv = kv_bytes(&layers, &self.inputs, self.kv, slots, ctx);
+        let kv = kv_bytes(&layers, &self.inputs, (self.kv, self.media), slots, ctx);
         whole_on(
             self.place.card_specs()?[0],
             inputs_model(&self.inputs),
             layers.end,
             kv,
-            Seqs { slots, ..self.seqs },
+            (Seqs { slots, ..self.seqs }, self.media.encoder),
             load,
         )
     }
@@ -474,7 +527,7 @@ impl PlaceQ3 {
 fn kv_bytes(
     layers: &std::ops::Range<usize>,
     inputs: &Inputs,
-    kv: KvQ8,
+    (kv, media): (KvQ8, Media),
     slots: usize,
     ctx: u64,
 ) -> u64 {
@@ -507,6 +560,11 @@ fn kv_bytes(
                     None => {}
                 },
             }
+        }
+        // A media load's sequence holds its rotation table after its stores,
+        // one buffer of its own (`SeqRope::new`).
+        if let Some(width) = media.tables {
+            planes.push(rows * image_plan::table_bytes_per_position(width));
         }
     }
     placement::allocator_bytes(GRANULE, planes)
@@ -560,6 +618,18 @@ fn qwen35_whole(file: &Split, o: Open35) -> Result<WholeLoad, String> {
     Qwen35moeModel::whole_load(file, o).map_err(|e| e.to_string())
 }
 
+/// What a verdict's line adds when its card carries the image encoder's reserve: the reserve by
+/// name and bytes, beside the reserves term the verdict sums them in. Nothing for a card that
+/// carries none, so a load without `--mmproj` prints its line as it did.
+fn encoder_note(card: &Card) -> String {
+    card.reserves
+        .iter()
+        .find(|(name, _)| name == image_plan::RESERVE)
+        .map_or_else(String::new, |(name, bytes)| {
+            format!("; the reserves term holds the {name}'s {bytes} B")
+        })
+}
+
 /// The whole-fit verdict ([`whole_on`]).
 enum Whole {
     /// The whole load fits what the card had.
@@ -581,7 +651,9 @@ impl Whole {
     /// the need term by term and what the card had.
     fn line(&self, ctx: usize) -> String {
         match self {
-            Whole::Fits(n) | Whole::Short(n) => format!("whole fit at ctx {ctx}: {n}"),
+            Whole::Fits(n) | Whole::Short(n) => {
+                format!("whole fit at ctx {ctx}: {n}{}", encoder_note(&n.card))
+            }
             Whole::Refused(why) => format!("whole fit at ctx {ctx}: {why}"),
         }
     }
@@ -601,7 +673,9 @@ impl Whole {
 /// layers, `kv` bytes of cache — on `spec`'s card: the card the plan lays
 /// out for the program ([`q3::machine`], its step arenas' scratch), on a
 /// unified machine with the checkpoints `seqs` pin ([`reserve_checkpoints`],
-/// `Machine::whole_card`), and what the program holds past it (`load`, or
+/// `Machine::whole_card`) and the image `encoder`'s bytes when its tower sits
+/// on the card ([`image_plan::reserve_on`], the reserve a placed plan
+/// carries), and what the program holds past it (`load`, or
 /// the program's refusal), sized by `placement::whole_need`, the verdict's
 /// one owner. A tensor no card format loads is a refusal; any other planner
 /// error is the error.
@@ -610,7 +684,7 @@ fn whole_on(
     model: &ModelTensors,
     layers: usize,
     kv: u64,
-    seqs: Seqs,
+    (seqs, encoder): (Seqs, Option<u64>),
     load: Result<WholeLoad, String>,
 ) -> Result<Whole, GateError> {
     let refused = |why: &dyn std::fmt::Display| {
@@ -622,6 +696,7 @@ fn whole_on(
     };
     let mut machine = q3::machine(spec, layers, 0);
     reserve_checkpoints(&mut machine, seqs);
+    image_plan::reserve_on(&mut machine, encoder);
     let card = machine
         .whole_card()
         .ok_or_else(|| format!("the whole load on {}: a machine with no card", spec.name))?;
@@ -732,9 +807,10 @@ pub fn whole_ctx_qwen3(
 /// [`whole_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context
 /// terms, for `slots` resident sequences: the verdict counts every slot's
 /// stores at its share of the context ([`kv_bytes`]: the attention planes
-/// at `ctx / slots` rows and the delta layers' fixed stores, once a slot),
-/// and the program's own arena and reserve as the load each slot's share
-/// opens at gives them ([`share`]).
+/// at `ctx / slots` rows and the delta layers' fixed stores, once a slot,
+/// and on a media load a slot's rotation table), and the program's own arena
+/// and reserve as the load each slot's share opens at gives them ([`share`]),
+/// the image `encoder`'s bytes among the stage card's reserves.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -744,9 +820,17 @@ pub fn whole_ctx_qwen35(
     o: &Open35,
     floor: usize,
     slots: usize,
+    encoder: Option<u64>,
 ) -> Result<Option<usize>, GateError> {
     let census = census()?;
-    let probe = PlaceQ3::qwen35_on(file, PlaceQ3::unplaced_on(&census)?, &census, *o, Seqs::ONE)?;
+    let probe = PlaceQ3::qwen35_on(
+        file,
+        PlaceQ3::unplaced_on(&census)?,
+        &census,
+        *o,
+        Seqs::ONE,
+        encoder,
+    )?;
     let fits = |ctx: usize| {
         probed();
         Ok(probe
@@ -785,7 +869,7 @@ pub fn placed_ctx_qwen3(
     let probe = PlaceQ3::qwen3(file, place, floor, kv)?;
     let experts = |ctx: usize| {
         probed();
-        let machine = probe.machine_at(Qwen3moeModel::placed_arena_bytes(file, ctx)?)?;
+        let machine = probe.machine_at(Qwen3moeModel::placed_arena_bytes(file, ctx)?, 0)?;
         probe.card_experts(&machine, ctx, levers, slots, || qwen3_whole(file))
     };
     placement::ctx::searched_placed::<GateError>(trained_ctx(file), floor, CTX_GRAN, &experts)
@@ -795,7 +879,8 @@ pub fn placed_ctx_qwen3(
 /// terms, for the load's `seqs`: every plan carries their rows ([`laid`]),
 /// its arena the load each slot's share opens at ([`share`]), and a plan
 /// that keeps every expert is held to the whole verdict of every slot, as
-/// [`whole_ctx_qwen35`] counts them.
+/// [`whole_ctx_qwen35`] counts them; the image `encoder`'s bytes are a
+/// reserve of each plan.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -806,13 +891,20 @@ pub fn placed_ctx_qwen35(
     place: Place,
     floor: usize,
     levers: &PlanLevers,
-    seqs: Seqs,
+    (seqs, encoder): (Seqs, Option<u64>),
 ) -> Result<Option<usize>, GateError> {
-    let probe = PlaceQ3::qwen35_on(file, place, &census()?, share(o, floor, seqs.slots), seqs)?;
+    let probe = PlaceQ3::qwen35_on(
+        file,
+        place,
+        &census()?,
+        share(o, floor, seqs.slots),
+        seqs,
+        encoder,
+    )?;
     let experts = |ctx: usize| {
         probed();
         let at = share(o, ctx, seqs.slots);
-        let machine = probe.machine_at(Qwen35moeModel::placed_arena_bytes(file, at)?)?;
+        let machine = probe.machine_at(Qwen35moeModel::placed_arena_bytes(file, at)?, at.ctx)?;
         probe.card_experts(&machine, ctx, levers, seqs.slots, || qwen35_whole(file, at))
     };
     placement::ctx::searched_placed::<GateError>(trained_ctx(file), floor, CTX_GRAN, &experts)
@@ -822,7 +914,7 @@ pub fn placed_ctx_qwen35(
 /// of a qwen35moe file under `o`: one sequence taking no checkpoints
 /// ([`unplaced_qwen35_slots`]), as the CLI's own runs do.
 pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> {
-    unplaced_qwen35_slots(file, o, Seqs::ONE)
+    unplaced_qwen35_slots(file, o, Seqs::ONE, None)
 }
 
 /// What a run with `--place` unset loads, as [`unplaced_qwen3_slots`]
@@ -831,11 +923,24 @@ pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> 
 /// its share ([`whole_ctx_qwen35`]'s count) over the program's own arena and
 /// reserve as a slot's load gives them ([`qwen35_whole`] at [`share`]); the
 /// placed plan on `a`'s card, carrying the sequences' rows ([`laid`]), when
-/// it does not take it.
-pub fn unplaced_qwen35_slots(file: &Split, o: &Open35, seqs: Seqs) -> Result<Unplaced, GateError> {
+/// it does not take it; the image `encoder`'s bytes are in the verdict and in
+/// the plan.
+pub fn unplaced_qwen35_slots(
+    file: &Split,
+    o: &Open35,
+    seqs: Seqs,
+    encoder: Option<u64>,
+) -> Result<Unplaced, GateError> {
     let census = census()?;
     let at = share(o, o.ctx, seqs.slots);
-    let probe = PlaceQ3::qwen35_on(file, PlaceQ3::unplaced_on(&census)?, &census, at, seqs)?;
+    let probe = PlaceQ3::qwen35_on(
+        file,
+        PlaceQ3::unplaced_on(&census)?,
+        &census,
+        at,
+        seqs,
+        encoder,
+    )?;
     let whole = probe.whole_at(u64::try_from(o.ctx)?, seqs.slots, qwen35_whole(file, at))?;
     probe.unplaced(o.ctx, &whole)
 }
@@ -978,8 +1083,9 @@ pub fn open_qwen35_slots(
 /// against), every other term the plan's own at the total; once open, the
 /// `slots` sequences' stores — the body's own sequence bytes
 /// ([`Slots::seq_bytes`]), `slots` times — past what the plan counts for
-/// them — its KV term and its card's [`SLOTS_RESERVE`] rows ([`laid`]) — are
-/// refused by name, and both stand on one stderr line.
+/// them — its KV term and its card's [`SLOTS_RESERVE`] and, on a media load,
+/// [`TABLES_RESERVE`] rows ([`laid`]) — are refused by name, and both stand
+/// on one stderr line.
 fn open_slots<B: Slots>(
     plan: &Plan<'_>,
     slots: usize,
@@ -1006,17 +1112,22 @@ fn open_slots<B: Slots>(
         return Err(format!("{WHAT}: a plan of no card").into());
     };
     let kv = totals.kv_bytes;
-    let row: u64 = card
-        .reserves
-        .iter()
-        .filter(|(name, _)| name == SLOTS_RESERVE)
-        .map(|&(_, b)| b)
-        .sum();
-    let counted = kv.saturating_add(row);
-    let terms = if row > 0 {
-        format!(" (its KV term {kv} B and its {SLOTS_RESERVE} reserve {row} B)")
-    } else {
-        String::new()
+    let reserved = |what: &str| -> u64 {
+        card.reserves
+            .iter()
+            .filter(|(name, _)| name == what)
+            .map(|&(_, b)| b)
+            .sum()
+    };
+    let (row, tables) = (reserved(SLOTS_RESERVE), reserved(TABLES_RESERVE));
+    let counted = kv.saturating_add(row).saturating_add(tables);
+    let terms = match (row > 0, tables > 0) {
+        (false, false) => String::new(),
+        (true, false) => format!(" (its KV term {kv} B and its {SLOTS_RESERVE} reserve {row} B)"),
+        (_, true) => format!(
+            " (its KV term {kv} B, its {SLOTS_RESERVE} reserve {row} B and its {TABLES_RESERVE} \
+             reserve {tables} B)"
+        ),
     };
     let line = format!(
         "{WHAT}: {slots} sequences of {ctx} rows hold {held} B of cache; the plan at {} positions \
