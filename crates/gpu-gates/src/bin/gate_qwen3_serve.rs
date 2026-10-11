@@ -376,9 +376,10 @@
 //!   printed; at the first difference the oracle's id must be the server's own runner-up within
 //!   [`F_NEAR_TIE`] of its top ([`follows`]). FAIL-first: an image's grid taken as `(ny, nx)`,
 //!   which `c2`'s two images of other proportions show; the clause's precondition,
-//!   `mmproj_set_f_server_keeps_every_expert_on_the_card`, reads that server's plan record and
-//!   refuses by name a plan that keeps a routed expert on the host (a server at the seat's own
-//!   default `--ctx` does);
+//!   `mmproj_set_f_server_keeps_every_expert_on_the_card`, reads that server's load by record kind
+//!   (its `load` record, then its `plan` record or, with none, a whole-fit verdict that says
+//!   `fits`) and refuses by name a plan that keeps a routed expert on the host (a server at the
+//!   seat's own default `--ctx` does) and a load it cannot read as whole or placed;
 //! - `mmproj_image_slot_beside_a_text_slot`: an image request posted on the second slot while a text
 //!   request decodes on the first answers the ids it answered alone, the text request too, and the
 //!   server ran rounds of both slots. FAIL-first: a media call that lands on the first slot.
@@ -3474,11 +3475,49 @@ mod gate {
         Ok(())
     }
 
+    /// How a Qwen3 seat's load holds the routed experts.
+    enum Experts {
+        /// The whole-card load.
+        Whole,
+        /// A placed load: the host experts its `plan` record keeps and the context it was made at.
+        Placed { host: u64, ctx_max: u64 },
+    }
+
+    /// The load a server's stderr `text` (`what` names it) says it made, by record kind: a
+    /// `load_qwen3` record, and either one `plan` record, or none and the one whole-fit verdict
+    /// saying it fits (`default_load_is_its_whole_fit`'s pairing). A record absent where one is
+    /// due, a line that opens one and does not read whole, and a load with no `plan` record whose
+    /// verdict is not there or does not say it fits are errors naming it, never a whole load by
+    /// default.
+    fn experts_in(text: &str, what: &str) -> Result<Experts, GateError> {
+        let log = record::Log::of(text, record::BLOOMERY_SERVE_QWEN3).named(what);
+        log.one(&record::LOAD_QWEN3)?;
+        if let Some(plan) = log.first(&record::PLAN38)? {
+            return Ok(Experts::Placed {
+                host: plan.u64("host_experts")?,
+                ctx_max: plan.u64("ctx_max")?,
+            });
+        }
+        let verdicts: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("whole fit at ctx "))
+            .collect();
+        match verdicts[..] {
+            [v] if v.contains(": fits: ") => Ok(Experts::Whole),
+            _ => Err(format!(
+                "{what}: the load printed no `plan` record and its whole-fit verdicts are not one \
+                 line saying it fits: {verdicts:?}"
+            )
+            .into()),
+        }
+    }
+
     /// `mmproj_image_chat_follows_set_f`, on a server of its own: `--mmproj` over `--parallel 2` at
-    /// [`SET_F_CTX`]. Its plan record is read first (`mmproj_set_f_server_keeps_every_expert_on_the_card`):
-    /// a plan that keeps a routed expert on the host is refused by name and set F is not run,
-    /// since a host expert's rule is not the oracle's. A load with no plan record is the whole
-    /// model on the card.
+    /// [`SET_F_CTX`]. Its load is read first ([`experts_in`],
+    /// `mmproj_set_f_server_keeps_every_expert_on_the_card`): a plan that keeps a routed expert on
+    /// the host is refused by name and set F is not run, since a host expert's rule is not the
+    /// oracle's, and so is a load it cannot read. A load with no plan record is the whole model
+    /// on the card when its whole-fit verdict says so.
     fn image_set_f(model: &Path, img: &Images, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
         let d = dir.join("set-f");
         std::fs::create_dir_all(&d)?;
@@ -3515,23 +3554,23 @@ mod gate {
                 return Ok(());
             }
         };
-        let log = std::fs::read_to_string(&err_log)?;
-        let plan = log.lines().find(|l| l.starts_with("plan "));
-        let host = plan.map_or(Some(0), |l| field_u64(l, "host_experts"));
-        let at = plan
-            .and_then(|l| field_u64(l, "ctx_max"))
-            .unwrap_or(SET_F_CTX as u64);
-        let on_card = host == Some(0);
-        if !on_card {
-            let kept = host.map_or_else(
-                || "an unread count of experts".to_owned(),
-                |h| h.to_string(),
-            );
-            println!(
-                "set F needs every routed expert on the card: the plan at ctx {at} keeps {kept} on \
-                 the host"
-            );
-        }
+        let text = std::fs::read_to_string(&err_log)?;
+        let on_card = match experts_in(&text, "set F's server") {
+            Ok(Experts::Whole) => true,
+            Ok(Experts::Placed { host, ctx_max }) => {
+                if host > 0 {
+                    println!(
+                        "set F needs every routed expert on the card: the plan at ctx {ctx_max} \
+                         keeps {host} on the host"
+                    );
+                }
+                host == 0
+            }
+            Err(e) => {
+                println!("set F needs every routed expert on the card: its load is unread: {e}");
+                false
+            }
+        };
         check(
             ok,
             "mmproj_set_f_server_keeps_every_expert_on_the_card",
