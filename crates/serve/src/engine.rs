@@ -425,6 +425,29 @@ pub trait Engine: Send {
     fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, EngineError> {
         Ok(None)
     }
+    /// Closes serving slot `slot`'s residency stream at its request's end and
+    /// returns the stream's warm section (`runtime::warmprof::WarmSection`,
+    /// encoded), for the prompt-cache entry the request's state goes into.
+    /// `Ok(None)` (the default): the engine keeps no warm section.
+    fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, EngineError> {
+        let _ = slot;
+        Ok(None)
+    }
+    /// Opens serving slot `slot`'s residency stream at its request's start:
+    /// from `section` (what [`Engine::warm_close`] returned for the entry a full
+    /// hit loaded), or fresh. `expected` is the request's expected tokens, set
+    /// once here. `why` is the server's reuse outcome, for the engine's record.
+    /// The default does nothing.
+    fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+        why: WarmWhy,
+    ) -> Result<(), EngineError> {
+        let _ = (slot, section, expected, why);
+        Ok(())
+    }
     /// The whole cache as a value [`Engine::resume`] takes back, the cache
     /// unchanged. The default is [`Engine::save_state`] into host memory.
     fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
@@ -862,6 +885,22 @@ impl std::fmt::Display for CacheNote {
 /// cancelled, experts copied back onto the card, entries of the live map
 /// that still differ from the load's after it (0 when it worked), and host
 /// bytes released.
+/// How a request's start reused the prompt cache, as [`Engine::warm_open`]
+/// reads it: only a full hit carries a warm section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarmWhy {
+    /// An entry was loaded and the request keeps every position it holds.
+    Hit,
+    /// An entry was loaded and the request keeps fewer positions than it holds.
+    Cut,
+    /// No entry was loaded.
+    Miss,
+    /// A full hit on an entry that carries no warm section.
+    NoSection,
+    /// The request resumes its own parked state ([`Engine::warm_close`] at its park).
+    Resume,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResidencyReset {
     pub cancelled: u64,
