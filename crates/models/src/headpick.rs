@@ -307,9 +307,15 @@ const KEPT: [f64; 4] = [0.0, 3.0, 2.0, 21.0];
 /// positions a window, AL(q) = 1 + sum_j A_j (1 - q)^j with A_j the share of windows keeping j or more draft
 /// positions (KEPT), fall by the fraction of the window the list saves, AL(q) / AL(0) = 1 - S / T, with S the ms the
 /// unread rows save (WALKS x the rows not in the list x ROW_BYTES at HEAD_GB_PER_S) and T the window [derived].
+///
+/// # Panics
+/// A list of more rows than the head has, by name.
 #[must_use]
 pub fn break_even(rows: usize, vocab: usize) -> f64 {
-    let saved_ms = WALKS * (vocab - rows) as f64 * ROW_BYTES / (HEAD_GB_PER_S * 1e9) * 1e3;
+    let unread = vocab
+        .checked_sub(rows)
+        .unwrap_or_else(|| panic!("break_even: a list of {rows} rows over a head of {vocab}"));
+    let saved_ms = WALKS * unread as f64 * ROW_BYTES / (HEAD_GB_PER_S * 1e9) * 1e3;
     let windows: f64 = KEPT.iter().sum();
     let al = |q: f64| {
         1.0 + (1..KEPT.len())
