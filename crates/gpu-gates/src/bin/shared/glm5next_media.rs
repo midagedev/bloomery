@@ -12,6 +12,10 @@
 //!   positions then read the `<|image|>` token's embedding, so a band that anything passes is caught;
 //! - a media call that is refused by name moves nothing: a span of another width, an id that is not the
 //!   image token, a load not set for media.
+//!
+//! The serve seat's media call is [`seat`]'s (`gate_glm5next_e2e --only media-seat`, behind the `vision`
+//! feature): our tower's rows of procedural images, through the seat's own steps, held to the body's
+//! media call on the same rows.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::media::MediaSpan;
@@ -178,4 +182,261 @@ pub fn media_clause(m: &mut Glm5nextModel) -> Result<bool, GateError> {
     ok &= refused(m, r, "not set for media", from);
     set_prefill_media(m, Some(PROFILE.image_pad_id))?;
     Ok(ok)
+}
+
+/// (sm): the serve seat's media call (`bloomery-serve --mmproj` on a GLM file) against the body's own,
+/// on our tower's rows of procedural images. The seat's steps are the resident encoder's
+/// `merged_rows` (the one call the Qwen3 and GLM seats make for their rows), then
+/// `Session::prompt_media` over the spans the rows make (`serve_seats::glm`'s `prefill_media`); the
+/// body's call is `prefill_media` with spans put together from the images' known sizes. The numbers' quality is the tower's gate's and (im)'s, not this
+/// one's: any image will do.
+#[cfg(feature = "vision")]
+pub mod seat {
+    use std::path::Path;
+
+    use app::Session;
+    use bloomery_gpu::media::MediaSpan;
+    use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::vision_seat::{
+        self, Flags, Image, Opened, PleImage, Resident, TextFacts,
+    };
+    use bloomery_gpu_gates::{GateError, verdict};
+    use bloomery_gpu_glm5next::{Body, prefill, prefill_media, set_prefill_media};
+    use runtime::Want;
+    use vision::Prepared;
+    use vision::Rgb8;
+    use vision::arch::glm5v::{
+        self,
+        media::{BEGIN_OF_IMAGE_ID, END_OF_IMAGE_ID, IMAGE_TOKEN_ID},
+    };
+
+    /// The tower's cap in merged tokens: above both images' grids.
+    const CAP: usize = 256;
+
+    /// A smaller cap: the tower of the refusal clause holds fewer tokens than the first image's grid.
+    const SMALL_CAP: usize = 64;
+
+    /// The two images, `(width, height)` in pixels: 224 x 336 is a grid of 8 x 12 merged tokens
+    /// (28-pixel cells), 448 x 112 one of 16 x 4 — another aspect, and under [`SMALL_CAP`] only the
+    /// second.
+    const SIZES: [(usize, usize); 2] = [(224, 336), (448, 112)];
+
+    /// The tokens each image takes: the grids above.
+    const TOKENS: [usize; 2] = [96, 64];
+
+    /// Ordinary text ids around the spans.
+    const TEXT: [u32; 6] = [785, 6722, 315, 9621, 374, 1879];
+
+    /// An image of `w` x `h` whose every cell differs: channel `c` of pixel `(x, y)` a mix of its
+    /// position and `salt`.
+    fn procedural(w: usize, h: usize, salt: usize) -> Rgb8 {
+        let mut image = Rgb8::filled(w, h, [0, 0, 0]);
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    image.data[(y * w + x) * 3 + c] =
+                        ((x * (c + 3) + y * (7 - c) + salt * 41 + x * y / 17) % 256) as u8;
+                }
+            }
+        }
+        image
+    }
+
+    /// The seat's flags for `mmproj` at a cap of `cap` merged tokens.
+    fn flags(mmproj: &Path, cap: usize) -> Result<Flags, GateError> {
+        let (file, max) = (mmproj.display().to_string(), cap.to_string());
+        let args = ["--mmproj", &file, "--image-max-tokens", &max];
+        let mut it = args.into_iter();
+        let mut flags = Flags::default();
+        while let Some(flag) = it.next() {
+            flags.take(flag, &mut it)?;
+        }
+        Ok(flags)
+    }
+
+    /// The encoder file seated as the seat seats it ([`vision_seat::open_seat`]), held against the
+    /// text model's width and vocabulary `vocab`.
+    fn opened(
+        mmproj: &Path,
+        cap: usize,
+        n_embd: usize,
+        vocab: &dyn Fn(u32) -> Option<String>,
+    ) -> Result<Opened, GateError> {
+        let flags = flags(mmproj, cap)?;
+        let facts = TextFacts {
+            n_embd,
+            imrope: None,
+            ple: PleImage::Absent,
+        };
+        vision_seat::open_seat(
+            &flags,
+            flags.mmproj()?,
+            Place::A,
+            &[glm5v::PROJECTOR_TYPE],
+            &facts,
+            vocab,
+        )?
+        .ok_or_else(|| "--mmproj opened no encoder".into())
+    }
+
+    /// The call's ids: text, then each image as the server expands its placeholder (`<|begin_of_image|>`,
+    /// `span_len` image tokens, `<|end_of_image|>`) with text after it; and each span's first position.
+    fn call(images: &[Prepared]) -> (Vec<u32>, Vec<usize>) {
+        let mut ids = TEXT.to_vec();
+        let mut at = Vec::new();
+        for (i, p) in images.iter().enumerate() {
+            ids.push(BEGIN_OF_IMAGE_ID);
+            at.push(ids.len());
+            ids.extend(std::iter::repeat_n(IMAGE_TOKEN_ID, p.span_len));
+            ids.push(END_OF_IMAGE_ID);
+            ids.extend_from_slice(&TEXT[i..i + 3]);
+        }
+        (ids, at)
+    }
+
+    /// The bf16 value of `bits` as f32.
+    fn bf16(bits: u16) -> f32 {
+        f32::from_bits(u32::from(bits) << 16)
+    }
+
+    /// `‖a − b‖ / ‖b‖`.
+    fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
+        let (mut num, mut den) = (0.0_f64, 0.0_f64);
+        for (x, y) in a.iter().zip(b) {
+            num += f64::from(x - y).powi(2);
+            den += f64::from(*y).powi(2);
+        }
+        (num / den).sqrt()
+    }
+
+    /// (sm): on the session `s` (the batch feed, room for the call), the encoder file `mmproj` and
+    /// the text model's width `n_embd` and vocabulary `vocab`.
+    pub fn clauses(
+        s: &mut Session<Body>,
+        mmproj: &Path,
+        n_embd: usize,
+        vocab: &dyn Fn(u32) -> Option<String>,
+    ) -> Result<bool, GateError> {
+        let at = opened(mmproj, CAP, n_embd, vocab)?;
+        println!(
+            "(sm) encoder file {}: seat {} on {}, cap {} tokens, card figure {} B",
+            at.path.display(),
+            at.seat.word(),
+            at.seat.name,
+            at.cap,
+            at.card.total()
+        );
+        set_prefill_media(s.model_mut(), Some(at.media.image_token()))?;
+        let ctx = s.model().gpu().context().clone();
+        let mut tower = Resident::open(&ctx, &at)?;
+        let images: Vec<Prepared> = SIZES
+            .iter()
+            .enumerate()
+            .map(|(i, &(w, h))| at.media.prepare(&procedural(w, h, i)))
+            .collect::<Result<_, _>>()?;
+        let tokens: Vec<usize> = images.iter().map(|p| p.span_len).collect();
+        let mut ok = tokens == TOKENS;
+        println!(
+            "(sm) the images' spans: {tokens:?} tokens (want {TOKENS:?}, the size rule's grids of \
+             {SIZES:?} pixels) {}",
+            verdict(ok)
+        );
+        let (ids, starts) = call(&images);
+
+        // The tower refuses patches planned past its cap by name, and the model's card is bound
+        // back after the refusal: a request cannot reach it (the size rule shrinks every canvas
+        // into the cap the seat's limits name), so this holds the tower's own check.
+        let small = opened(mmproj, SMALL_CAP, n_embd, vocab)?;
+        let mut narrow = Resident::open(&ctx, &small)?;
+        let from = s.model().pos();
+        let refused = narrow.merged_rows(&ctx, [Image::of(starts[0], &images[0])]);
+        let named = matches!(
+            &refused,
+            Err(e) if e.to_string().contains("does not fit the tower's buffers")
+        );
+        let stood = s.model().pos() == from;
+        println!(
+            "(sm) a {}-token grid at a tower of {SMALL_CAP} tokens: {} {}, model {} {}",
+            tokens[0],
+            if named {
+                "refused by name"
+            } else {
+                "NOT REFUSED BY NAME"
+            },
+            verdict(named),
+            if stood { "unmoved" } else { "MOVED" },
+            verdict(stood)
+        );
+        ok &= named && stood;
+        drop(narrow);
+
+        // The seat's steps: both images encoded on the resident encoder in one call, read back as bf16
+        // rows, one a cell of each grid, then one prompt call over the spans those rows make.
+        let rows = tower.merged_rows(
+            &ctx,
+            images
+                .iter()
+                .zip(&starts)
+                .map(|(p, &start)| Image::of(start, p)),
+        )?;
+        let finite = rows.rows.iter().all(|&b| bf16(b).is_finite());
+        let alive = rows.rows.iter().any(|&b| bf16(b) != 0.0);
+        println!(
+            "(sm) tower rows: {} values ({} positions of {n_embd}), finite {finite}, not all zero \
+             {alive} {}",
+            rows.rows.len(),
+            rows.rows.len() / n_embd,
+            verdict(finite && alive && rows.rows.len() == tokens.iter().sum::<usize>() * n_embd)
+        );
+        ok &= finite && alive && rows.rows.len() == tokens.iter().sum::<usize>() * n_embd;
+        s.model_mut().reset()?;
+        let seat_next = s
+            .prompt_media(&ids, &rows.media_spans(), Want::Argmax)?
+            .argmax();
+        let seat_row = s.model().head_normed()?;
+
+        // The body's call on the same rows, its spans put together from the images' known sizes.
+        let mut first = 0;
+        let spans: Vec<MediaSpan<'_>> = tokens
+            .iter()
+            .zip(&starts)
+            .map(|(&n, &start)| {
+                let span = MediaSpan {
+                    at: start..start + n,
+                    rows: &rows.rows[first * n_embd..(first + n) * n_embd],
+                };
+                first += n;
+                span
+            })
+            .collect();
+        s.model_mut().reset()?;
+        let body_next = prefill_media(s.model_mut(), &ids, &spans)?;
+        let body_row = s.model().head_normed()?;
+        let same_bits = seat_row.len() == body_row.len()
+            && seat_row
+                .iter()
+                .zip(&body_row)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        let pass = seat_next == body_next && same_bits;
+        println!(
+            "(sm) the seat's media call against the body's on the same rows: argmax {seat_next} vs \
+             {body_next}, last hidden row bit-identical {same_bits} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
+        // The control: the same ids with no rows, whose image positions read the image token's own
+        // embedding, lies away from the media call, so a call that dropped the rows is not this one.
+        s.model_mut().reset()?;
+        prefill(s.model_mut(), &ids)?;
+        let away = rel_l2(&s.model().head_normed()?, &seat_row);
+        let pass = away > 0.0;
+        println!(
+            "(sm) control (the image tokens' own embeddings): last row {away:.4} rel L2 from the media \
+             call {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        Ok(ok)
+    }
 }

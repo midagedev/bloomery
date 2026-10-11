@@ -395,6 +395,14 @@
 //! (`prefill_media`) fed mainline's own tower rows of the fixture's image sets, held on the last position's
 //! `result_norm` against the CUDA run within the CPU twin's distance, and the refusals by name. The real tier
 //! leaves it to the fixture tier before any load.
+//!
+//! `--only media-seat` is (sm), the serve seat's media call (`shared/glm5next_media.rs`'s `seat`, behind the
+//! `vision` feature, which the bin's `required-features` leave out): our tower's rows of two procedural
+//! images (the fixture's encoder file, seated as `bloomery-serve --mmproj` seats it), through the seat's own
+//! steps (`Resident::span_rows`, `Session::prompt_media`), held to `prefill_media` called with spans put
+//! together from the images' sizes — the same argmax and a bit-identical last hidden row — with a control
+//! that lies away from the media call and the tower's refusal of a grid past its cap by name. It declares
+//! no fixture-oracle clause, and the real tier fails it by name before any load (0 clauses).
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -501,6 +509,11 @@ mod gate {
 
     /// (im): the media call against mainline's image-input sets of the fixture (`--only media`).
     const IM: &str = "(im) image rows in the prompt batch against mainline's sets";
+
+    /// (sm): the serve seat's media call against the body's, on our tower's rows
+    /// (`--only media-seat`).
+    #[cfg(feature = "vision")]
+    const SM: &str = "(sm) the serve seat's media call against the body's on the same rows";
 
     /// The prompt batch's load: every position the latent layers attend whole
     /// (`place::dense_positions`: the indexer's top-k in whole pools of 512,
@@ -4904,6 +4917,9 @@ mod gate {
         /// (im) alone, on a load at [`CTX`] on the batch feed: the fixture's media rows against
         /// mainline's sets.
         Media,
+        /// (sm) alone, on a load at [`CTX`] on the batch feed: the serve seat's media call on our
+        /// tower's rows against the body's own (the `vision` feature).
+        MediaSeat,
     }
 
     impl Only {
@@ -4970,7 +4986,7 @@ mod gate {
 
     /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, `--only
     /// keep`, `--only slots`, `--only stagger`, `--only stagger-draft`,
-    /// `--only media`, or every clause.
+    /// `--only media`, `--only media-seat`, or every clause.
     fn only() -> Result<Only, GateError> {
         match word_after("--only") {
             None => Ok(Only::All),
@@ -4984,9 +5000,10 @@ mod gate {
                 Some("stagger") => Ok(Only::Stagger),
                 Some("stagger-draft") => Ok(Only::StaggerDraft),
                 Some("media") => Ok(Only::Media),
+                Some("media-seat") => Ok(Only::MediaSeat),
                 other => Err(format!(
-                    "--only is main, pp, pplong, verify, keep, slots, stagger, stagger-draft or \
-                     media, not {other:?}"
+                    "--only is main, pp, pplong, verify, keep, slots, stagger, stagger-draft, \
+                     media or media-seat, not {other:?}"
                 )
                 .into()),
             },
@@ -5047,6 +5064,11 @@ mod gate {
                 ok = false;
             }
         }
+        if only == Only::MediaSeat {
+            let t = Instant::now();
+            ok &= media_seat(&levers)?;
+            elapsed("arm media-seat", &t);
+        }
         if matches!(only, Only::All | Only::Slots) {
             let t = Instant::now();
             ok &= slots(&levers)?;
@@ -5085,6 +5107,46 @@ mod gate {
         println!("gate_glm5next_e2e: {}", tier::tally_line());
         tier::expect_fixture_oracle("gate_glm5next_e2e", declared_fixture_oracle(only, sets))?;
         if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
+    /// (sm), the `--only media-seat` arm: the serve seat's media call on the fixture's load at
+    /// [`CTX`] on the batch feed, its tower the encoder file the fixture's image sets were dumped
+    /// with, held to the body's call on the same rows. Fixture tier only: on the real tier it fails
+    /// by name before any load, as `--only media` does (0 clauses).
+    #[cfg(feature = "vision")]
+    fn media_seat(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let tier = tier::Tier::from_env()?;
+        if tier != tier::Tier::Fixture {
+            println!(
+                "glm5next-media-seat: 0 clauses on the {} tier: (sm) pairs the fixture's text model \
+                 with the encoder file of the fixture's image sets",
+                tier.name()
+            );
+            return Ok(false);
+        }
+        if !tier::run_clause(SM, Tag::SelfConsistency)? {
+            return Ok(false);
+        }
+        let path = glm5next_tier::model_path()?;
+        let file = glm5next_tier::open()?;
+        let n_embd = PlanInputs::read(&file)?.hp.n_embd;
+        drop(file);
+        let tok = tokenizer::Tokenizer::from_gguf(&path)?;
+        let vocab = |id| tok.text(id).map(str::to_owned);
+        let t = Instant::now();
+        let (mut s, _) = open(levers, CTX, PrefillMode::Batch, KdaLanes::One)?;
+        let mmproj = PathBuf::from(refset::arch::glm5next::vis::PROFILE.mmproj);
+        let ok = crate::glm5next_media::seat::clauses(&mut s, &mmproj, n_embd, &vocab)?;
+        elapsed("(sm)", &t);
+        Ok(ok)
+    }
+
+    /// Built without the `vision` feature, the arm is refused by name.
+    #[cfg(not(feature = "vision"))]
+    fn media_seat(_: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        Err("--only media-seat: built without the vision feature \
+             (just gate-gpu-glm5next-media-seat)"
+            .into())
     }
 
     /// The batch set's manifest and ik's routing of every routed layer, opened by the clause that
