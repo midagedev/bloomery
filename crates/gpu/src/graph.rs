@@ -1026,7 +1026,16 @@ mod tests {
                 [quant_grid, 1, 1],
                 [32, 1, 1],
             ),
-            ("q4k_gemv".to_owned(), [gemv_grid, 1, 1], [256, 1, 1]),
+            (
+                if gpu.row_prefetch() {
+                    "q4k_gemv_prefetch"
+                } else {
+                    "q4k_gemv"
+                }
+                .to_owned(),
+                [gemv_grid, 1, 1],
+                [256, 1, 1],
+            ),
         ];
         assert_eq!(got.len(), want.len(), "node list {got:?}");
         if let Some(i) = (0..want.len()).find(|&i| got[i] != want[i]) {

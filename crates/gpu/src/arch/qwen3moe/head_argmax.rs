@@ -21,7 +21,7 @@
 //! integer order is that order.
 
 use crate::GpuError;
-use crate::cores::{funnel16, half_to_f32, q6k_chain, q6k_dequant, q6k_sub_scale};
+use crate::cores::{funnel16, half_to_f32, l2_prefetch, q6k_chain, q6k_dequant, q6k_sub_scale};
 use crate::elem::argmax_take;
 use crate::fault::FaultSink;
 use crate::launch_u32;
@@ -70,6 +70,9 @@ mod qwen3moe_head_kernels {
     /// (module doc). `key[0]` and `done[0]` are the block reduction's key and
     /// ticket count: [`KEY_SEED`] and zero before the launch, the same again
     /// after it.
+    ///
+    /// `qwen3moe_head_q6k_argmax_prefetch` carries a copy of this body: a change here
+    /// goes there too.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -287,6 +290,229 @@ mod qwen3moe_head_kernels {
             *out.get_unchecked_mut(2) = sites;
         }
     }
+
+    /// `qwen3moe_head_q6k_argmax` with the warp's row asked of L2 first
+    /// ([`l2_prefetch`]): the entry an integrated device launches. Its body is
+    /// `qwen3moe_head_q6k_argmax`'s, copied: sharing it through an inline walk
+    /// changes `qwen3moe_head_q6k_argmax`'s PTX.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_rows * 210 * n_sb,
+            q.len() >= 128 * iters,
+            d8.len() >= 2 * n_sb,
+            y.len() >= n_rows,
+            key.len() >= 1,
+            done.len() >= 1,
+            out.len() >= 3
+        )
+    )]
+    pub fn qwen3moe_head_q6k_argmax_prefetch(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut key: DisjointSlice<u64>,
+        mut done: DisjointSlice<u32>,
+        mut out: DisjointSlice<u32>,
+    ) {
+        static mut BEST_V: SharedArray<f32, ROWS_PER_BLOCK> = SharedArray::UNINIT;
+        static mut BEST_I: SharedArray<u32, ROWS_PER_BLOCK> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let wi = tid / 32;
+        let lane = warp::lane_id() as usize;
+        let row = thread::blockIdx_x() as usize * ROWS_PER_BLOCK + wi;
+        // A warp past the rows keeps the seed and still meets the barrier.
+        let mut cand_v = f32::NEG_INFINITY;
+        let mut cand_i = 0u32;
+        if row < n_rows as usize {
+            let n_sb = n_sb as usize;
+            let row_bytes = 210 * n_sb;
+            l2_prefetch(w, row * row_bytes, row_bytes, lane);
+            let w16 = lane & 15;
+            let half = lane >> 4;
+            let qlok = 16 * (w16 & 3);
+            let qhok = 16 * (w16 & 1);
+            let nib_sh = ((w16 >> 2) & 1) as u32 * 4;
+            let hib_sh = 2 * ((w16 >> 1) as u32 & 3);
+
+            let mut f0 = 0.0f32;
+            let mut it: u32 = 0;
+            while it < iters {
+                let sbp = ((it << 1) | half as u32) as usize;
+                if sbp < n_sb {
+                    let base = row * row_bytes + sbp * 210;
+                    let par = (base >> 1) & 1;
+
+                    let lk = (base + 64 * (w16 >> 3) + qlok) >> 2;
+                    // SAFETY: row < n_rows, so the window ends inside the
+                    // row's words (launch contract: 4·w.len() covers every
+                    // row's 210·n_sb bytes; the floored word index of a
+                    // window stays inside the row's words, as in q6k_gemv).
+                    let (l0, l1, l2, l3, l4) = unsafe {
+                        (
+                            *w.get_unchecked(lk),
+                            *w.get_unchecked(lk + 1),
+                            *w.get_unchecked(lk + 2),
+                            *w.get_unchecked(lk + 3),
+                            *w.get_unchecked(lk + 4),
+                        )
+                    };
+                    let ql0 = if par == 0 { l0 } else { funnel16(l0, l1) };
+                    let ql1 = if par == 0 { l1 } else { funnel16(l1, l2) };
+                    let ql2 = if par == 0 { l2 } else { funnel16(l2, l3) };
+                    let ql3 = if par == 0 { l3 } else { funnel16(l3, l4) };
+
+                    let hk = (base + 128 + 32 * (w16 >> 3) + qhok) >> 2;
+                    // SAFETY: the same row bounds as the ql window.
+                    let (h0, h1, h2, h3, h4) = unsafe {
+                        (
+                            *w.get_unchecked(hk),
+                            *w.get_unchecked(hk + 1),
+                            *w.get_unchecked(hk + 2),
+                            *w.get_unchecked(hk + 3),
+                            *w.get_unchecked(hk + 4),
+                        )
+                    };
+                    let qh0 = if par == 0 { h0 } else { funnel16(h0, h1) };
+                    let qh1 = if par == 0 { h1 } else { funnel16(h1, h2) };
+                    let qh2 = if par == 0 { h2 } else { funnel16(h2, h3) };
+                    let qh3 = if par == 0 { h3 } else { funnel16(h3, h4) };
+
+                    let ak = (base + 192) >> 2;
+                    // SAFETY: ak + 4 is at most the final word of the last
+                    // row's last super-block; the launch contract bounds
+                    // 4·w.len().
+                    let (a0, a1, a2, a3, a4) = unsafe {
+                        (
+                            *w.get_unchecked(ak),
+                            *w.get_unchecked(ak + 1),
+                            *w.get_unchecked(ak + 2),
+                            *w.get_unchecked(ak + 3),
+                            *w.get_unchecked(ak + 4),
+                        )
+                    };
+                    let (sw0, sw1, sw2, sw3, d_bits) = if par == 0 {
+                        (a0, a1, a2, a3, (a4 & 0xffff) as u16)
+                    } else {
+                        (
+                            funnel16(a0, a1),
+                            funnel16(a1, a2),
+                            funnel16(a2, a3),
+                            funnel16(a3, a4),
+                            (a4 >> 16) as u16,
+                        )
+                    };
+                    let sc = q6k_sub_scale(&[sw0, sw1, sw2, sw3], w16);
+                    let drow = half_to_f32(d_bits);
+                    let vi = [
+                        q6k_dequant(ql0, qh0, nib_sh, hib_sh),
+                        q6k_dequant(ql1, qh1, nib_sh, hib_sh),
+                        q6k_dequant(ql2, qh2, nib_sh, hib_sh),
+                        q6k_dequant(ql3, qh3, nib_sh, hib_sh),
+                    ];
+                    let qb = 128 * it as usize + lane;
+                    let d8b = 2 * sbp + (w16 >> 3);
+                    // SAFETY: qb + 99 < 128·iters <= q.len() — this lane's
+                    // four q8 words are inside the column; d8b < 2·n_sb <=
+                    // d8.len() by the sbp guard (launch contract).
+                    let (q0, q1, q2, q3, e0) = unsafe {
+                        (
+                            *q.get_unchecked(qb),
+                            *q.get_unchecked(qb + 32),
+                            *q.get_unchecked(qb + 64),
+                            *q.get_unchecked(qb + 96),
+                            *d8.get_unchecked(d8b),
+                        )
+                    };
+                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                    f0 += (a as f32) * (e0 * drow * sc as f32);
+                }
+                it += 1;
+            }
+            let s0 = warp::reduce_sum_f32(f0);
+            if lane == 0 {
+                // SAFETY: row < n_rows <= y.len() by the launch contract;
+                // only lane 0 of the row's warp writes y[row].
+                unsafe {
+                    *y.get_unchecked_mut(row) = s0;
+                }
+            }
+            cand_v = s0;
+            // row < n_rows, a u32: the cast is exact.
+            cand_i = row as u32;
+        }
+
+        // SAFETY: both arrays are this block's own shared allocations; the
+        // raw form reaches the `static mut` without a reference.
+        let (bv, bi) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
+            )
+        };
+        if lane == 0 {
+            // SAFETY: wi < ROWS_PER_BLOCK; lane 0 of each warp writes its
+            // own slot pair.
+            unsafe {
+                *bv.add(wi) = cand_v;
+                *bi.add(wi) = cand_i;
+            }
+        }
+        thread::sync_threads();
+        if tid != 0 {
+            return;
+        }
+        let (mut fv, mut fi) = (f32::NEG_INFINITY, 0u32);
+        let mut s = 0usize;
+        while s < ROWS_PER_BLOCK {
+            // SAFETY: s < ROWS_PER_BLOCK, written above, past the barrier.
+            let (cv, ci) = unsafe { (*bv.add(s), *bi.add(s)) };
+            if argmax_take(cv, ci, fv, fi) {
+                fv = cv;
+                fi = ci;
+            }
+            s += 1;
+        }
+        // SAFETY: key[0] and done[0] are inside their buffers by the launch
+        // contract; every access to either on the card is atomic.
+        let (k, count) = unsafe {
+            (
+                DeviceAtomicU64::from_ptr(key.as_mut_ptr()),
+                DeviceAtomicU32::from_ptr(done.as_mut_ptr()),
+            )
+        };
+        k.fetch_max(argmax_key(fv, fi), AtomicOrdering::Relaxed);
+        // The ticket's release orders this block's max before it; the last
+        // block's acquire sees every block's.
+        if count.fetch_add(1, AtomicOrdering::AcqRel) + 1 != thread::gridDim_x() {
+            return;
+        }
+        let best = k.load(AtomicOrdering::Relaxed);
+        k.store(KEY_SEED, AtomicOrdering::Relaxed);
+        count.store(0, AtomicOrdering::Relaxed);
+        let word = fault.read();
+        let sites = fault.read_sites(word);
+        // SAFETY: out.len() >= 3 by the launch contract; the last block's
+        // thread 0 alone writes it.
+        unsafe {
+            *out.get_unchecked_mut(0) = !(best as u32);
+            *out.get_unchecked_mut(1) = word;
+            *out.get_unchecked_mut(2) = sites;
+        }
+    }
 }
 
 /// The block reduction's device state: the packed key and the ticket count,
@@ -322,6 +548,8 @@ impl HeadArgmaxState {
 /// stream.
 pub struct HeadArgmaxKernels {
     module: qwen3moe_head_kernels::LoadedModule,
+    /// [`crate::row_prefetch`] of the context's device.
+    row_prefetch: bool,
 }
 
 impl HeadArgmaxKernels {
@@ -330,7 +558,10 @@ impl HeadArgmaxKernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(qwen3moe_head_kernels, ctx)? };
-        Ok(HeadArgmaxKernels { module })
+        Ok(HeadArgmaxKernels {
+            module,
+            row_prefetch: crate::row_prefetch(ctx)?,
+        })
     }
 
     /// Enqueue `logits = w · act` for the Q6_K head weight `w` (the word
@@ -385,24 +616,45 @@ impl HeadArgmaxKernels {
         let grid = launch_u32(what, "grid", n_rows.div_ceil(ROWS_PER_BLOCK))?;
         let n_rows = launch_u32(what, "n_rows", n_rows)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_qwen3moe_head_q6k_argmax(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.qwen3moe_head_q6k_argmax(
-            stream,
-            &prep,
-            w.buf(),
-            &act.q6,
-            &act.d8,
-            n_rows,
-            n_sb,
-            n_sb.div_ceil(2),
-            fault,
-            logits,
-            &mut state.key,
-            &mut state.done,
-            out,
-        )?;
+        if self.row_prefetch {
+            let prep = self
+                .module
+                .prepare_qwen3moe_head_q6k_argmax_prefetch(LaunchConfig1D::new(grid, THREADS, 0))?;
+            self.module.qwen3moe_head_q6k_argmax_prefetch(
+                stream,
+                &prep,
+                w.buf(),
+                &act.q6,
+                &act.d8,
+                n_rows,
+                n_sb,
+                n_sb.div_ceil(2),
+                fault,
+                logits,
+                &mut state.key,
+                &mut state.done,
+                out,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_qwen3moe_head_q6k_argmax(LaunchConfig1D::new(grid, THREADS, 0))?;
+            self.module.qwen3moe_head_q6k_argmax(
+                stream,
+                &prep,
+                w.buf(),
+                &act.q6,
+                &act.d8,
+                n_rows,
+                n_sb,
+                n_sb.div_ceil(2),
+                fault,
+                logits,
+                &mut state.key,
+                &mut state.done,
+                out,
+            )?;
+        }
         Ok(())
     }
 }

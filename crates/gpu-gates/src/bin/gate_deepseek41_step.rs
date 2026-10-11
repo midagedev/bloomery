@@ -2757,10 +2757,11 @@ mod gate {
             let (gpu, w, body) = m.body_parts("structure")?;
             let graph = step_graph(gpu, w, body, head)?;
             let ok_topo = hc_branch(&graph, &body.layers());
-            let ok_arrival = rows_arrival(&graph, body, split, hp)?;
+            let prefetch = gpu.row_prefetch();
+            let ok_arrival = rows_arrival(&graph, body, split, hp, prefetch)?;
             (
                 ok_topo,
-                shadow_sets(&graph.nodes, body, split, hp)?,
+                shadow_sets(&graph.nodes, body, split, hp, prefetch)?,
                 ok_arrival,
             )
         };
@@ -2787,6 +2788,7 @@ mod gate {
         body: &Body,
         split: &Split,
         hp: &Hparams,
+        prefetch: bool,
     ) -> Result<bool, GateError> {
         let layers = body.layers();
         let at = regions(&g.nodes, &layers);
@@ -2802,7 +2804,7 @@ mod gate {
             .iter()
             .min()
             .ok_or("the file has no engram site")?;
-        let decode = shadow::engram_kv_kernels(split, first)?[0];
+        let decode = shadow::engram_kv_kernels(split, first, prefetch)?[0];
         let decodes: Vec<usize> = (0..g.nodes.len())
             .filter(|&i| {
                 g.kernel(i)
@@ -3009,6 +3011,7 @@ mod gate {
         body: &Body,
         split: &Split,
         hp: &Hparams,
+        prefetch: bool,
     ) -> Result<bool, GateError> {
         let layers = body.layers();
         let at = regions(nodes, &layers);
@@ -3052,7 +3055,7 @@ mod gate {
         let sites = &hp.engram()?.layer_ids;
         let mut kv_lists: Vec<Vec<&str>> = Vec::new();
         for &site in sites {
-            let k = shadow::engram_kv_kernels(split, site)?;
+            let k = shadow::engram_kv_kernels(split, site, prefetch)?;
             if !kv_lists.contains(&k) {
                 kv_lists.push(k);
             }
@@ -3063,9 +3066,9 @@ mod gate {
             let launches = body
                 .ffn_launches(l)
                 .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
-            let mut want = shadow::shadow_kernels(split, l, launches > 7)?;
+            let mut want = shadow::shadow_kernels(split, l, launches > 7, prefetch)?;
             if sites.contains(&(l + 1)) {
-                want.extend(shadow::engram_kv_kernels(split, l + 1)?);
+                want.extend(shadow::engram_kv_kernels(split, l + 1, prefetch)?);
             }
             let got: Vec<&str> = nodes
                 .iter()

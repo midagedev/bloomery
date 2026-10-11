@@ -842,6 +842,7 @@ fn structure(
     hp: &Hparams,
 ) -> Result<bool, GateError> {
     let (gpu, w, body) = m.body_parts("structure")?;
+    let prefetch = gpu.row_prefetch();
     let layers = body.layers();
     let [ha, hb] = heads;
     let one = chain_order(gpu, || body.enqueue_chain(gpu, w, &mut *ha))?;
@@ -968,9 +969,9 @@ fn structure(
         let launches = body
             .ffn_launches(l)
             .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
-        let mut want = shadow::shadow_kernels(split, l, launches > 7)?;
+        let mut want = shadow::shadow_kernels(split, l, launches > 7, prefetch)?;
         if sites.contains(&(l + 1)) {
-            want.extend(shadow::engram_kv_kernels(split, l + 1)?);
+            want.extend(shadow::engram_kv_kernels(split, l + 1, prefetch)?);
         }
         // Row 0's first go has no wait of row 1 behind it: row 1's layer
         // 0 up to its go runs there too, in the same host leg's shadow.
@@ -997,7 +998,7 @@ fn structure(
         .collect();
     let mut kv_lists: Vec<Vec<&str>> = Vec::new();
     for &site in sites {
-        let k = shadow::engram_kv_kernels(split, site)?;
+        let k = shadow::engram_kv_kernels(split, site, prefetch)?;
         if !kv_lists.contains(&k) {
             kv_lists.push(k);
         }

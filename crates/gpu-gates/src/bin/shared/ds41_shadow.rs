@@ -15,11 +15,17 @@ fn type_of(split: &Split, name: &str) -> Result<GgmlType, GateError> {
 
 /// The kernels the step launches for one dense projection of file type `ty`,
 /// in stream order: the q8_1 form of its input first where a K-quant gemv
-/// reads one and the step makes it for this projection alone.
-fn projection(ty: GgmlType, name: &str) -> Result<&'static [&'static str], GateError> {
+/// reads one and the step makes it for this projection alone. `prefetch` is
+/// the device's `Gpu::row_prefetch`, which names the Q4_K gemvs' entries.
+fn projection(
+    ty: GgmlType,
+    name: &str,
+    prefetch: bool,
+) -> Result<&'static [&'static str], GateError> {
     match ty {
         GgmlType::Q8_0 => Ok(&["q8_0_gemv"]),
         GgmlType::Q3_K => Ok(&["q3k_quantize_q8_1", "q3k_gemv"]),
+        GgmlType::Q4_K if prefetch => Ok(&["q3k_quantize_q8_1", "q4k_gemv_prefetch"]),
         GgmlType::Q4_K => Ok(&["q3k_quantize_q8_1", "q4k_gemv"]),
         GgmlType::Q5_K => Ok(&["ds41_q5k_gemv_f32"]),
         other => Err(format!("{name}: {other} has no dense kernel").into()),
@@ -35,6 +41,7 @@ pub fn shadow_kernels(
     split: &Split,
     l: usize,
     card_experts: bool,
+    prefetch: bool,
 ) -> Result<Vec<&'static str>, GateError> {
     let mut k = vec!["ds41_hc_pre"];
     if card_experts {
@@ -43,7 +50,15 @@ pub fn shadow_kernels(
         // holds what the last faulted step left there, a reset keeps it, and a
         // quantizer that read it raised quant_column on a clean step
         // (gate_deepseek41_prefill, "fault-reset steps").
-        k.extend(["ds41_expert_gate_up", "q8_1_quantize_sel", "q4k_gemv_sel"]);
+        k.extend([
+            "ds41_expert_gate_up",
+            "q8_1_quantize_sel",
+            if prefetch {
+                "q4k_gemv_sel_prefetch"
+            } else {
+                "q4k_gemv_sel"
+            },
+        ]);
     }
     let gate = type_of(split, &names::ffn_gate_shexp(l))?;
     let up = type_of(split, &names::ffn_up_shexp(l))?;
@@ -53,7 +68,7 @@ pub fn shadow_kernels(
         "ds41_shexp_gate_up"
     });
     let down = names::ffn_down_shexp(l);
-    k.extend(projection(type_of(split, &down)?, &down)?);
+    k.extend(projection(type_of(split, &down)?, &down, prefetch)?);
     Ok(k)
 }
 
@@ -61,7 +76,11 @@ pub fn shadow_kernels(
 /// (`ds41_glue_engram_rows`, or `_q3k` for a q3_K table), `engram_wkv`
 /// ([`projection`]) and the key norm. It reads the step image and weights
 /// alone.
-pub fn engram_kv_kernels(split: &Split, l: usize) -> Result<Vec<&'static str>, GateError> {
+pub fn engram_kv_kernels(
+    split: &Split,
+    l: usize,
+    prefetch: bool,
+) -> Result<Vec<&'static str>, GateError> {
     let table = names::engram_embd(l);
     let mut k = vec![match type_of(split, &table)? {
         GgmlType::Q8_0 => "ds41_glue_engram_rows",
@@ -69,7 +88,7 @@ pub fn engram_kv_kernels(split: &Split, l: usize) -> Result<Vec<&'static str>, G
         other => return Err(format!("{table}: {other} has no row kernel").into()),
     }];
     let wkv = names::engram_wkv(l);
-    k.extend(projection(type_of(split, &wkv)?, &wkv)?);
+    k.extend(projection(type_of(split, &wkv)?, &wkv, prefetch)?);
     k.push("ds41_engram_key_norm");
     Ok(k)
 }

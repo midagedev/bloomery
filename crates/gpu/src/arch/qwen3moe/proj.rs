@@ -6,7 +6,9 @@
 //! copies them into the token-major layout the rest of the chain reads.
 //!
 //! Every projection has two entries, split by column count the way
-//! `q4k_gemv` and `q4k_gemv_mcol` are. The one-column entries
+//! `q4k_gemv` and `q4k_gemv_mcol` are, and its one-column entry a
+//! `_prefetch` twin that an integrated device launches instead
+//! ([`crate::row_prefetch`]). The one-column entries
 //! (`qwen3moe_qkv_q4k`, `qwen3moe_o_resid_q4k`) run the step (m = 1), every
 //! row and column `q4k_gemv`'s one-column body: `cores::q4k_row_dot_1col`,
 //! the fixed warp tree and the lane-0 store, run once per activation
@@ -26,7 +28,7 @@
 //! layout of every consumer.
 
 use crate::GpuError;
-use crate::cores::{q4k_row_dot, q4k_row_dot_1col};
+use crate::cores::{l2_prefetch, q4k_row_dot, q4k_row_dot_1col};
 use crate::launch_u32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -44,6 +46,9 @@ mod qwen3moe_proj_kernels {
     /// of `wv`, stored token-major into the blocks of `y` at 0, `off_k` and
     /// `off_v`. `rows_v` 0 leaves `wv` and the value block untouched (a Q6_K
     /// value projection).
+    ///
+    /// `qwen3moe_qkv_q4k_prefetch` carries a copy of this body: a change here
+    /// goes there too.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -100,6 +105,86 @@ mod qwen3moe_proj_kernels {
         } else {
             (wv, off_v as usize, row - rq - rk, rv)
         };
+        // The core's caller contract, from the launch contract: r < rows
+        // rows of `w`, m_cols columns of q/s8/d8, iters = ceil(n_sb/4) from
+        // the host, and all 32 lanes of the warp are here (the return above
+        // is warp-uniform). One column takes the single-column body
+        // directly, as `q4k_gemv` does.
+        let mut c = 0;
+        while c < m {
+            let v = warp::reduce_sum_f32(q4k_row_dot_1col(w, q, s8, d8, n_sb, iters, r, c, lane));
+            if lane == 0 {
+                // SAFETY: c < m_cols and r < rows, so base + c·rows + r <
+                // base + rows·m_cols <= y.len() by the launch contract's
+                // block bounds; lane 0 of the row's warp is the only writer
+                // of the row's slots.
+                unsafe { *y.get_unchecked_mut(base + c * rows + r) = v };
+            }
+            c += 1;
+        }
+    }
+
+    /// `qwen3moe_qkv_q4k` with the warp's row asked of L2 first
+    /// ([`l2_prefetch`]): the entry an integrated device launches. Its body is
+    /// `qwen3moe_qkv_q4k`'s, copied: sharing it through an inline walk changes
+    /// `qwen3moe_qkv_q4k`'s PTX.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            wq.len() >= rows_q * 36 * n_sb,
+            wk.len() >= rows_k * 36 * n_sb,
+            wv.len() >= rows_v * 36 * n_sb,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            off_k >= rows_q * m_cols,
+            off_v >= off_k + rows_k * m_cols,
+            y.len() >= off_v + rows_v * m_cols
+        )
+    )]
+    pub fn qwen3moe_qkv_q4k_prefetch(
+        wq: &[u32],
+        wk: &[u32],
+        wv: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        rows_q: u32,
+        rows_k: u32,
+        rows_v: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        off_k: u32,
+        off_v: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let (rq, rk, rv) = (rows_q as usize, rows_k as usize, rows_v as usize);
+        if row >= rq + rk + rv {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let m = m_cols as usize;
+        let n_sb = n_sb as usize;
+        // The row's matrix and its output block, warp-uniform: the warp's
+        // 32 lanes share `row`.
+        let (w, base, r, rows) = if row < rq {
+            (wq, 0, row, rq)
+        } else if row < rq + rk {
+            (wk, off_k as usize, row - rq, rk)
+        } else {
+            (wv, off_v as usize, row - rq - rk, rv)
+        };
+        l2_prefetch(w, r * 144 * n_sb, 144 * n_sb, lane);
         // The core's caller contract, from the launch contract: r < rows
         // rows of `w`, m_cols columns of q/s8/d8, iters = ceil(n_sb/4) from
         // the host, and all 32 lanes of the warp are here (the return above
@@ -291,10 +376,82 @@ mod qwen3moe_proj_kernels {
         m_cols: u32,
         n_sb: u32,
         iters: u32,
-        mut y: DisjointSlice<f32>,
+        y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
         let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        // SAFETY: the arguments meet this entry's launch contract, which is
+        // the walk's; `row` is this warp's row; every thread of the launch
+        // calls it.
+        unsafe { o_resid_q4k_walk::<false>(row, w, q, s8, d8, x, rows, m_cols, n_sb, iters, y) }
+    }
+
+    /// `qwen3moe_o_resid_q4k` with the warp's row asked of L2 first
+    /// ([`l2_prefetch`]): the entry an integrated device launches.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= rows * 36 * n_sb,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            x.len() >= rows * m_cols,
+            y.len() >= rows * m_cols
+        )
+    )]
+    pub fn qwen3moe_o_resid_q4k_prefetch(
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        x: &[f32],
+        rows: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        // SAFETY: the arguments meet this entry's launch contract, which is
+        // the walk's; `row` is this warp's row; every thread of the launch
+        // calls it.
+        unsafe { o_resid_q4k_walk::<true>(row, w, q, s8, d8, x, rows, m_cols, n_sb, iters, y) }
+    }
+
+    /// The walk of [`qwen3moe_o_resid_q4k`], and of
+    /// [`qwen3moe_o_resid_q4k_prefetch`] when `PREFETCH`.
+    ///
+    /// # Safety
+    ///
+    /// The arguments meet `qwen3moe_o_resid_q4k`'s launch contract, `row` is
+    /// the calling warp's row as the entry computes it from the thread index,
+    /// and every thread of the launch calls it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+    )]
+    #[inline(always)]
+    unsafe fn o_resid_q4k_walk<const PREFETCH: bool>(
+        row: usize,
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        x: &[f32],
+        rows: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
         let rows = rows as usize;
         if row >= rows {
             return;
@@ -302,6 +459,9 @@ mod qwen3moe_proj_kernels {
         let lane = warp::lane_id() as usize;
         let m = m_cols as usize;
         let n_sb = n_sb as usize;
+        if PREFETCH {
+            l2_prefetch(w, row * 144 * n_sb, 144 * n_sb, lane);
+        }
         // The core's caller contract as in `qwen3moe_qkv_q4k`.
         let mut c = 0;
         while c < m {
@@ -495,6 +655,8 @@ pub struct OResidArgs<'a> {
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct ProjKernels {
     module: qwen3moe_proj_kernels::LoadedModule,
+    /// [`crate::row_prefetch`] of the context's device.
+    row_prefetch: bool,
 }
 
 /// Err unless `w` holds Q4_K rows of `act`'s K (`36 · n_sb` words) and the
@@ -538,7 +700,10 @@ impl ProjKernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(qwen3moe_proj_kernels, ctx)? };
-        Ok(ProjKernels { module })
+        Ok(ProjKernels {
+            module,
+            row_prefetch: crate::row_prefetch(ctx)?,
+        })
     }
 
     /// Enqueue the query, key and (a Q4_K) value projections of `a.act`'s
@@ -588,28 +753,53 @@ impl ProjKernels {
         // count and blocks per SM do not move; more go to the m-column
         // entry, whose column c is that entry's launch of column c.
         if m == 1 {
-            let prep = self
-                .module
-                .prepare_qwen3moe_qkv_q4k(LaunchConfig1D::new(grid, 256, 0))?;
-            self.module.qwen3moe_qkv_q4k(
-                stream,
-                &prep,
-                wq.buf(),
-                wk.buf(),
-                wv.unwrap_or(wk).buf(),
-                &act.q4,
-                &act.s8,
-                &act.d8,
-                rows_q,
-                rows_k,
-                rows_v,
-                m,
-                n_sb,
-                n_sb.div_ceil(4),
-                off_k,
-                off_v,
-                y,
-            )?;
+            if self.row_prefetch {
+                let prep = self
+                    .module
+                    .prepare_qwen3moe_qkv_q4k_prefetch(LaunchConfig1D::new(grid, 256, 0))?;
+                self.module.qwen3moe_qkv_q4k_prefetch(
+                    stream,
+                    &prep,
+                    wq.buf(),
+                    wk.buf(),
+                    wv.unwrap_or(wk).buf(),
+                    &act.q4,
+                    &act.s8,
+                    &act.d8,
+                    rows_q,
+                    rows_k,
+                    rows_v,
+                    m,
+                    n_sb,
+                    n_sb.div_ceil(4),
+                    off_k,
+                    off_v,
+                    y,
+                )?;
+            } else {
+                let prep = self
+                    .module
+                    .prepare_qwen3moe_qkv_q4k(LaunchConfig1D::new(grid, 256, 0))?;
+                self.module.qwen3moe_qkv_q4k(
+                    stream,
+                    &prep,
+                    wq.buf(),
+                    wk.buf(),
+                    wv.unwrap_or(wk).buf(),
+                    &act.q4,
+                    &act.s8,
+                    &act.d8,
+                    rows_q,
+                    rows_k,
+                    rows_v,
+                    m,
+                    n_sb,
+                    n_sb.div_ceil(4),
+                    off_k,
+                    off_v,
+                    y,
+                )?;
+            }
         } else {
             let prep = self
                 .module
@@ -695,23 +885,43 @@ impl ProjKernels {
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         // One column is the one-column entry, as in `enqueue_qkv`.
         if m == 1 {
-            let prep = self
-                .module
-                .prepare_qwen3moe_o_resid_q4k(LaunchConfig1D::new(grid, 256, 0))?;
-            self.module.qwen3moe_o_resid_q4k(
-                stream,
-                &prep,
-                w.buf(),
-                &act.q4,
-                &act.s8,
-                &act.d8,
-                x,
-                rows,
-                m,
-                n_sb,
-                n_sb.div_ceil(4),
-                y,
-            )?;
+            if self.row_prefetch {
+                let prep = self
+                    .module
+                    .prepare_qwen3moe_o_resid_q4k_prefetch(LaunchConfig1D::new(grid, 256, 0))?;
+                self.module.qwen3moe_o_resid_q4k_prefetch(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    &act.q4,
+                    &act.s8,
+                    &act.d8,
+                    x,
+                    rows,
+                    m,
+                    n_sb,
+                    n_sb.div_ceil(4),
+                    y,
+                )?;
+            } else {
+                let prep = self
+                    .module
+                    .prepare_qwen3moe_o_resid_q4k(LaunchConfig1D::new(grid, 256, 0))?;
+                self.module.qwen3moe_o_resid_q4k(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    &act.q4,
+                    &act.s8,
+                    &act.d8,
+                    x,
+                    rows,
+                    m,
+                    n_sb,
+                    n_sb.div_ceil(4),
+                    y,
+                )?;
+            }
         } else {
             let prep = self
                 .module

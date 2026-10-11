@@ -84,6 +84,32 @@ pub(crate) fn global_addr<T>(p: *const T) -> u64 {
     g
 }
 
+/// Ask L2 for the 128-byte lines that hold the `bytes` bytes of `w` from byte
+/// `byte0` on, one line per lane per pass of the warp. A gemv warp walks its
+/// row with few loads in flight per lane; issuing the row's lines first lets
+/// the walk's loads hit L2. A hint only: it reads nothing into registers and
+/// changes no value. Only the `_prefetch` entries call it, the ones an
+/// integrated device launches ([`crate::row_prefetch`]).
+///
+/// The caller keeps the range inside `w`. The first line can start before
+/// `byte0`, and before `w` itself when `w` is a window into a larger buffer;
+/// it is the line that holds `byte0`, and a line never crosses a page.
+#[inline(always)]
+pub(crate) fn l2_prefetch<T>(w: &[T], byte0: usize, bytes: usize, lane: usize) {
+    let g = global_addr(w.as_ptr().cast::<u8>().wrapping_add(byte0));
+    let end = g + bytes as u64;
+    let mut a = (g & !127) + 128 * lane as u64;
+    while a < end {
+        // SAFETY: a prefetch hint at a global line that holds bytes of the
+        // range (caller's contract), so it lies in a mapped page; it writes
+        // no register.
+        unsafe {
+            ptx_asm!("prefetch.global.L2 [%0];", in("l") a);
+        }
+        a += 32 * 128;
+    }
+}
+
 // ---- q8_1 activation quantizer (q3k_quantize_q8_1) ----
 
 /// One lane's four consecutive values of a 128-value block, quantized to

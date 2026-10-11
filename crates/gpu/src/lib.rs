@@ -764,8 +764,8 @@ pub(crate) unsafe fn q8_1_quant_vals(
 mod kernels {
     use super::*;
     use crate::cores::{
-        funnel16, half_to_f32, q3k_row_dot, q3k_row_dot_1col, q4k_row_dot, q4k_row_dot_1col,
-        q6k_chain, q6k_dequant, q6k_sub_scale,
+        funnel16, half_to_f32, l2_prefetch, q3k_row_dot, q3k_row_dot_1col, q4k_row_dot,
+        q4k_row_dot_1col, q6k_chain, q6k_dequant, q6k_sub_scale,
     };
 
     // Q3_K packing recap (decode verified against ggml's
@@ -923,14 +923,83 @@ mod kernels {
         n_rows: u32,
         n_sb: u32,
         iters: u32,
-        mut y: DisjointSlice<f32>,
+        y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
         let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        // SAFETY: the arguments meet this entry's launch contract, which is
+        // the walk's; `row` is this warp's row; every thread of the launch
+        // calls it.
+        unsafe { q4k_gemv_walk::<false>(row, w, q, s8, d8, n_rows, n_sb, iters, y) }
+    }
+
+    /// `q4k_gemv` with the warp's row asked of L2 first
+    /// ([`l2_prefetch`]): the entry an integrated device launches.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_rows * 36 * n_sb,
+            q.len() >= 256 * iters,
+            s8.len() >= 8 * n_sb,
+            d8.len() >= 2 * n_sb,
+            y.len() >= n_rows
+        )
+    )]
+    pub fn q4k_gemv_prefetch(
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        iters: u32,
+        y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        // SAFETY: the arguments meet this entry's launch contract, which is
+        // the walk's; `row` is this warp's row; every thread of the launch
+        // calls it.
+        unsafe { q4k_gemv_walk::<true>(row, w, q, s8, d8, n_rows, n_sb, iters, y) }
+    }
+
+    /// The walk of [`q4k_gemv`], and of [`q4k_gemv_prefetch`] when `PREFETCH`.
+    ///
+    /// # Safety
+    ///
+    /// The arguments meet `q4k_gemv`'s launch contract, `row` is the calling
+    /// warp's row as the entry computes it from the thread index, and every
+    /// thread of the launch calls it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+    )]
+    #[inline(always)]
+    unsafe fn q4k_gemv_walk<const PREFETCH: bool>(
+        row: usize,
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
         if row >= n_rows as usize {
             return;
         }
         let lane = warp::lane_id() as usize;
+        if PREFETCH {
+            l2_prefetch(w, row * 144 * n_sb as usize, 144 * n_sb as usize, lane);
+        }
         let f0 = q4k_row_dot_1col(w, q, s8, d8, n_sb as usize, iters, row, 0, lane);
         let s0 = warp::reduce_sum_f32(f0);
         if lane == 0 {
@@ -1107,10 +1176,75 @@ mod kernels {
         m_cols: u32,
         n_sb: u32,
         iters: u32,
-        mut y: DisjointSlice<f32>,
+        y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
         let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        // SAFETY: the arguments meet this entry's launch contract, which is
+        // the walk's; `row` is this warp's row; every thread of the launch
+        // calls it.
+        unsafe { q6k_gemv_walk::<false>(row, w, q, d8, n_rows, m_cols, n_sb, iters, y) }
+    }
+
+    /// `q6k_gemv` with the warp's row asked of L2 first
+    /// ([`l2_prefetch`]): the entry an integrated device launches.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_rows * 210 * n_sb,
+            q.len() >= m_cols * 128 * iters,
+            d8.len() >= m_cols * 2 * n_sb,
+            y.len() >= n_rows * m_cols
+        )
+    )]
+    pub fn q6k_gemv_prefetch(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        n_rows: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        // SAFETY: the arguments meet this entry's launch contract, which is
+        // the walk's; `row` is this warp's row; every thread of the launch
+        // calls it.
+        unsafe { q6k_gemv_walk::<true>(row, w, q, d8, n_rows, m_cols, n_sb, iters, y) }
+    }
+
+    /// The walk of [`q6k_gemv`], and of [`q6k_gemv_prefetch`] when `PREFETCH`.
+    ///
+    /// # Safety
+    ///
+    /// The arguments meet `q6k_gemv`'s launch contract, `row` is the calling
+    /// warp's row as the entry computes it from the thread index, and every
+    /// thread of the launch calls it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+    )]
+    #[inline(always)]
+    unsafe fn q6k_gemv_walk<const PREFETCH: bool>(
+        row: usize,
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        n_rows: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
         if row >= n_rows as usize {
             return;
         }
@@ -1118,6 +1252,9 @@ mod kernels {
         let m = m_cols as usize;
         let n_sb = n_sb as usize;
         let row_bytes = 210 * n_sb;
+        if PREFETCH {
+            l2_prefetch(w, row * row_bytes, row_bytes, lane);
+        }
         let q_col = 128 * iters as usize; // q8 words per column
         let d8_col = 2 * n_sb; // 128-value blocks per column
 
@@ -1790,6 +1927,15 @@ fn raw_device_integrated(dev: cuda_core::sys::CUdevice) -> Result<bool, GpuError
     Ok(integrated != 0)
 }
 
+/// Whether `ctx`'s device launches the decode gemvs' `_prefetch` entries
+/// ([`cores::l2_prefetch`] of the row first): true on an integrated device,
+/// whose gemvs wait on DRAM latency; false on a card with its own memory,
+/// where the prefetch costs more than it hides and the plain entries run.
+/// Load-time only.
+pub(crate) fn row_prefetch(ctx: &CudaContext) -> Result<bool, GpuError> {
+    raw_device_integrated(ctx.cu_device())
+}
+
 /// The room a device allocation can take on an integrated device: the
 /// host's ([`::model::placement::workstation::host_available`]), since
 /// `cuMemGetInfo` there leaves out the page cache the kernel gives back to a
@@ -1871,6 +2017,8 @@ pub struct Gpu {
     /// modules given it at load ([`Gpu::fault_word`]), which keep it alive
     /// while they can launch.
     fault: Arc<DeviceBuffer<u32>>,
+    /// [`row_prefetch`] of this context's device, for the decode gemvs.
+    row_prefetch: bool,
 }
 
 /// The sink over a `Gpu`'s fault allocation ([`Gpu::fault_word`]), for
@@ -2181,6 +2329,7 @@ impl Gpu {
         // contract before launching.
         let module = unsafe { crate::shared_module!(kernels, &ctx)? };
         Ok(Gpu {
+            row_prefetch: row_prefetch(&ctx)?,
             q4k_sel: q4k_sel::Q4kSelKernels::load(&ctx, &fault)?,
             q5: q5::Q5Kernels::load(&ctx, &fault)?,
             q8f32: q8f32::Q8F32Kernels::load(&ctx)?,
@@ -2328,6 +2477,12 @@ impl Gpu {
     /// The device's name as the driver reports it.
     pub fn device_name(&self) -> Result<String, GpuError> {
         Ok(self.ctx.device_name()?)
+    }
+
+    /// Whether this context's decode gemvs launch their `_prefetch` entries
+    /// ([`row_prefetch`]), the names a launch order then holds.
+    pub fn row_prefetch(&self) -> bool {
+        self.row_prefetch
     }
 
     /// The bytes a new allocation on this context's device can take now:
@@ -2595,19 +2750,35 @@ impl Gpu {
         // One column is the decode entry; more go to the m-column entry,
         // whose column c is the decode entry's launch of column c.
         if m == 1 {
-            let prep = self.module.prepare_q4k_gemv(cfg)?;
-            self.module.q4k_gemv(
-                &self.stream,
-                &prep,
-                w.buf(),
-                &act.q4,
-                &act.s8,
-                &act.d8,
-                n_rows,
-                n_sb,
-                n_sb.div_ceil(4),
-                y,
-            )?;
+            if self.row_prefetch {
+                let prep = self.module.prepare_q4k_gemv_prefetch(cfg)?;
+                self.module.q4k_gemv_prefetch(
+                    &self.stream,
+                    &prep,
+                    w.buf(),
+                    &act.q4,
+                    &act.s8,
+                    &act.d8,
+                    n_rows,
+                    n_sb,
+                    n_sb.div_ceil(4),
+                    y,
+                )?;
+            } else {
+                let prep = self.module.prepare_q4k_gemv(cfg)?;
+                self.module.q4k_gemv(
+                    &self.stream,
+                    &prep,
+                    w.buf(),
+                    &act.q4,
+                    &act.s8,
+                    &act.d8,
+                    n_rows,
+                    n_sb,
+                    n_sb.div_ceil(4),
+                    y,
+                )?;
+            }
         } else {
             let m = launch_u32(what, "m", m)?;
             let prep = self.module.prepare_q4k_gemv_mcol(cfg)?;
@@ -2907,21 +3078,41 @@ impl Gpu {
         let n_rows = launch_u32(what, "n_rows", n_rows)?;
         let m = launch_u32(what, "m", m)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_q6k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
-        self.module.q6k_gemv(
-            &self.stream,
-            &prep,
-            w.buf(),
-            &act.q6,
-            &act.d8,
-            n_rows,
-            m,
-            n_sb,
-            n_sb.div_ceil(2),
-            y,
-        )?;
+        if self.row_prefetch {
+            let prep = self.module.prepare_q6k_gemv_prefetch(LaunchConfig1D::new(
+                n_rows.div_ceil(8),
+                256,
+                0,
+            ))?;
+            self.module.q6k_gemv_prefetch(
+                &self.stream,
+                &prep,
+                w.buf(),
+                &act.q6,
+                &act.d8,
+                n_rows,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                y,
+            )?;
+        } else {
+            let prep =
+                self.module
+                    .prepare_q6k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
+            self.module.q6k_gemv(
+                &self.stream,
+                &prep,
+                w.buf(),
+                &act.q6,
+                &act.d8,
+                n_rows,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                y,
+            )?;
+        }
         Ok(())
     }
 }

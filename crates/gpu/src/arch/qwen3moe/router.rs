@@ -54,6 +54,7 @@
 //! them zeroed.
 
 use super::ubatch::UBATCH;
+use crate::cores::l2_prefetch;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::gemm::GEMM_MAX_SLOTS;
@@ -951,7 +952,7 @@ unsafe fn gated_fused_body<const PER_LANE: usize>(
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-unsafe fn norm_row_body(
+unsafe fn norm_row_body<const PREFETCH: bool>(
     w: &[f32],
     x: &[f32],
     gain: &[f32],
@@ -979,6 +980,10 @@ unsafe fn norm_row_body(
     let k = k as usize;
     let n_sb = n_sb as usize;
     let base = t * k;
+    // The row's weights stream into L2 while the norm runs.
+    if PREFETCH && t == 0 && wi == 0 && row < rows {
+        l2_prefetch(w, 4 * row * k, 4 * k, lane);
+    }
 
     // Phase A: `norm_quant`'s sum of squares on this block's threads.
     // SAFETY: base + k = (t + 1)·k <= x.len() by this fn's contract; tid <
@@ -1471,7 +1476,114 @@ mod qwen3moe_router_kernels {
         // multiple of 128 up to NORM_K, n_sb = k/256 and its halves and
         // quarters rounded up; the lengths are the launch contract's.
         unsafe {
-            norm_row_body(
+            norm_row_body::<false>(
+                w,
+                x,
+                gain,
+                eps,
+                k,
+                n_sb,
+                half_it,
+                quad_it,
+                0,
+                WIDTH,
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                SharedArray::as_raw_mut_ptr(&raw mut NORMED),
+                &mut q3,
+                &mut q4,
+                &mut q6,
+                &mut s8,
+                &mut d8,
+                &mut logits,
+                fault,
+            );
+        }
+        // SAFETY: as in `qwen3moe_router_fused`, at one token: LAST and P
+        // are this block's own and untouched until here, every thread arrives
+        // converged, 1 <= used <= 32, the output lengths are the launch
+        // contract's and `done[0]` is zero before the launch.
+        unsafe {
+            publish_route(
+                1,
+                used as usize,
+                SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                SharedArray::as_raw_mut_ptr(&raw mut P),
+                &mut logits,
+                &mut probs,
+                &mut ids,
+                &mut weights,
+                &mut done,
+                fault,
+            );
+        }
+    }
+
+    /// `qwen3moe_router_norm` with warp 0 of each block asking L2 for its router row
+    /// first ([`l2_prefetch`]): the entry an integrated device launches.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            k <= 2048,
+            used >= 1,
+            used <= 32,
+            w.len() >= 128 * k,
+            x.len() >= k,
+            gain.len() >= k,
+            q3.len() >= 64 * half_it,
+            q4.len() >= 256 * quad_it,
+            q6.len() >= 128 * half_it,
+            s8.len() >= 8 * n_sb,
+            d8.len() >= 2 * n_sb,
+            logits.len() >= 128,
+            probs.len() >= 128,
+            ids.len() >= used,
+            weights.len() >= used,
+            done.len() >= 1
+        )
+    )]
+    pub fn qwen3moe_router_norm_prefetch(
+        w: &[f32],
+        x: &[f32],
+        gain: &[f32],
+        eps: f32,
+        k: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        used: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        mut logits: DisjointSlice<f32>,
+        mut probs: DisjointSlice<f32>,
+        mut ids: DisjointSlice<u32>,
+        mut weights: DisjointSlice<f32>,
+        mut done: DisjointSlice<u32>,
+        fault: FaultSink,
+    ) {
+        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+        static mut NORMED: SharedArray<f32, NORM_K> = SharedArray::UNINIT;
+        static mut P: SharedArray<f32, P_LEN> = SharedArray::UNINIT;
+        static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+
+        // SAFETY: WSUM and NORMED are this block's own shared allocations (the
+        // raw form reaches each `static mut` without a reference), touched by
+        // nothing else; every thread arrives converged with token 0, and the
+        // grid is WIDTH >= k / 128 blocks of 256 (the launcher's, and the
+        // const assert beside NORM_K); the launcher passes k a positive
+        // multiple of 128 up to NORM_K, n_sb = k/256 and its halves and
+        // quarters rounded up; the lengths are the launch contract's.
+        unsafe {
+            norm_row_body::<true>(
                 w,
                 x,
                 gain,
@@ -1597,7 +1709,124 @@ mod qwen3moe_router_kernels {
             // up to NORM_K, n_sb = k/256 and its halves and quarters rounded
             // up; the lengths are the launch contract's at m_cols tokens.
             unsafe {
-                norm_row_body(
+                norm_row_body::<false>(
+                    w,
+                    x,
+                    gain,
+                    eps,
+                    k,
+                    n_sb,
+                    half_it,
+                    quad_it,
+                    t,
+                    WIDTH,
+                    SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                    SharedArray::as_raw_mut_ptr(&raw mut NORMED),
+                    &mut q3,
+                    &mut q4,
+                    &mut q6,
+                    &mut s8,
+                    &mut d8,
+                    &mut logits,
+                    fault,
+                );
+            }
+            t += 1;
+        }
+        // SAFETY: as in `qwen3moe_router_fused` at m_cols tokens: LAST is
+        // this block's own and untouched until here, and the routing's
+        // scratch is NORMED's first P_LEN <= NORM_K entries (const assert),
+        // which warp 0's last gemv has read before publish_route's first
+        // barrier and nothing touches after it; every thread arrives
+        // converged, 1 <= m_cols <= 8, 1 <= used <= 32, the output lengths
+        // are the launch contract's and `done[0]` is zero before the launch.
+        unsafe {
+            publish_route(
+                m_cols as usize,
+                used as usize,
+                SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                SharedArray::as_raw_mut_ptr(&raw mut NORMED),
+                &mut logits,
+                &mut probs,
+                &mut ids,
+                &mut weights,
+                &mut done,
+                fault,
+            );
+        }
+    }
+
+    /// `qwen3moe_router_norm_m` with warp 0 of each block asking L2 for its router row
+    /// first ([`l2_prefetch`]): the entry an integrated device launches.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            m_cols >= 1,
+            m_cols <= 8,
+            k <= 2048,
+            used >= 1,
+            used <= 32,
+            w.len() >= 128 * k,
+            x.len() >= m_cols * k,
+            gain.len() >= k,
+            q3.len() >= m_cols * 64 * half_it,
+            q4.len() >= m_cols * 256 * quad_it,
+            q6.len() >= m_cols * 128 * half_it,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            logits.len() >= 128 * m_cols,
+            probs.len() >= 128 * m_cols,
+            ids.len() >= used * m_cols,
+            weights.len() >= used * m_cols,
+            done.len() >= 1
+        )
+    )]
+    pub fn qwen3moe_router_norm_m_prefetch(
+        w: &[f32],
+        x: &[f32],
+        gain: &[f32],
+        eps: f32,
+        k: u32,
+        m_cols: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        used: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        mut logits: DisjointSlice<f32>,
+        mut probs: DisjointSlice<f32>,
+        mut ids: DisjointSlice<u32>,
+        mut weights: DisjointSlice<f32>,
+        mut done: DisjointSlice<u32>,
+        fault: FaultSink,
+    ) {
+        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+        static mut NORMED: SharedArray<f32, NORM_K> = SharedArray::UNINIT;
+        static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+
+        let mut t = 0usize;
+        while t < m_cols as usize {
+            // SAFETY: WSUM and NORMED are this block's own shared allocations
+            // (the raw form reaches each `static mut` without a reference),
+            // touched by nothing else; every thread arrives converged with
+            // the same t < m_cols <= 8, and the grid is WIDTH >= m_cols ·
+            // (k / 128) blocks of 256 (the launcher's, and the const assert
+            // beside NORM_K); the launcher passes k a positive multiple of 128
+            // up to NORM_K, n_sb = k/256 and its halves and quarters rounded
+            // up; the lengths are the launch contract's at m_cols tokens.
+            unsafe {
+                norm_row_body::<true>(
                     w,
                     x,
                     gain,
@@ -2075,6 +2304,8 @@ impl RouterBufs {
 /// stream, so its launch orders with the rest of the step and capture.
 pub struct RouterKernels {
     module: qwen3moe_router_kernels::LoadedModule,
+    /// [`crate::row_prefetch`] of the context's device.
+    row_prefetch: bool,
 }
 
 impl RouterKernels {
@@ -2083,7 +2314,10 @@ impl RouterKernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(qwen3moe_router_kernels, ctx)? };
-        Ok(RouterKernels { module })
+        Ok(RouterKernels {
+            module,
+            row_prefetch: crate::row_prefetch(ctx)?,
+        })
     }
 
     /// Enqueue the router of `m` tokens, 1..=[`MAX_TOKENS`] and at most
@@ -2300,33 +2534,67 @@ impl RouterKernels {
         let k = launch_u32(what, "k", k)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let grid = launch_u32(what, "grid", WIDTH)?;
-        let prep = self
-            .module
-            .prepare_qwen3moe_router_norm(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-        self.module.qwen3moe_router_norm(
-            stream,
-            &prep,
-            w.buf(),
-            x,
-            gain,
-            eps,
-            k,
-            n_sb,
-            n_sb.div_ceil(2),
-            n_sb.div_ceil(4),
-            used,
-            &mut act.q3,
-            &mut act.q4,
-            &mut act.q6,
-            &mut act.s8,
-            &mut act.d8,
-            &mut out.logits,
-            &mut out.probs,
-            &mut out.ids,
-            &mut out.weights,
-            &mut out.done,
-            fault,
-        )?;
+        if self.row_prefetch {
+            let prep = self
+                .module
+                .prepare_qwen3moe_router_norm_prefetch(LaunchConfig1D::new(
+                    grid,
+                    FUSED_THREADS_U32,
+                    0,
+                ))?;
+            self.module.qwen3moe_router_norm_prefetch(
+                stream,
+                &prep,
+                w.buf(),
+                x,
+                gain,
+                eps,
+                k,
+                n_sb,
+                n_sb.div_ceil(2),
+                n_sb.div_ceil(4),
+                used,
+                &mut act.q3,
+                &mut act.q4,
+                &mut act.q6,
+                &mut act.s8,
+                &mut act.d8,
+                &mut out.logits,
+                &mut out.probs,
+                &mut out.ids,
+                &mut out.weights,
+                &mut out.done,
+                fault,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_qwen3moe_router_norm(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+            self.module.qwen3moe_router_norm(
+                stream,
+                &prep,
+                w.buf(),
+                x,
+                gain,
+                eps,
+                k,
+                n_sb,
+                n_sb.div_ceil(2),
+                n_sb.div_ceil(4),
+                used,
+                &mut act.q3,
+                &mut act.q4,
+                &mut act.q6,
+                &mut act.s8,
+                &mut act.d8,
+                &mut out.logits,
+                &mut out.probs,
+                &mut out.ids,
+                &mut out.weights,
+                &mut out.done,
+                fault,
+            )?;
+        }
         Ok(())
     }
 
@@ -2389,34 +2657,69 @@ impl RouterKernels {
         let m = launch_u32(what, "m", m)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let grid = launch_u32(what, "grid", WIDTH)?;
-        let prep = self
-            .module
-            .prepare_qwen3moe_router_norm_m(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-        self.module.qwen3moe_router_norm_m(
-            stream,
-            &prep,
-            w.buf(),
-            x,
-            gain,
-            eps,
-            k,
-            m,
-            n_sb,
-            n_sb.div_ceil(2),
-            n_sb.div_ceil(4),
-            used,
-            &mut act.q3,
-            &mut act.q4,
-            &mut act.q6,
-            &mut act.s8,
-            &mut act.d8,
-            &mut out.logits,
-            &mut out.probs,
-            &mut out.ids,
-            &mut out.weights,
-            &mut out.done,
-            fault,
-        )?;
+        if self.row_prefetch {
+            let prep = self
+                .module
+                .prepare_qwen3moe_router_norm_m_prefetch(LaunchConfig1D::new(
+                    grid,
+                    FUSED_THREADS_U32,
+                    0,
+                ))?;
+            self.module.qwen3moe_router_norm_m_prefetch(
+                stream,
+                &prep,
+                w.buf(),
+                x,
+                gain,
+                eps,
+                k,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                n_sb.div_ceil(4),
+                used,
+                &mut act.q3,
+                &mut act.q4,
+                &mut act.q6,
+                &mut act.s8,
+                &mut act.d8,
+                &mut out.logits,
+                &mut out.probs,
+                &mut out.ids,
+                &mut out.weights,
+                &mut out.done,
+                fault,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_qwen3moe_router_norm_m(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+            self.module.qwen3moe_router_norm_m(
+                stream,
+                &prep,
+                w.buf(),
+                x,
+                gain,
+                eps,
+                k,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                n_sb.div_ceil(4),
+                used,
+                &mut act.q3,
+                &mut act.q4,
+                &mut act.q6,
+                &mut act.s8,
+                &mut act.d8,
+                &mut out.logits,
+                &mut out.probs,
+                &mut out.ids,
+                &mut out.weights,
+                &mut out.done,
+                fault,
+            )?;
+        }
         Ok(())
     }
 }
@@ -2660,7 +2963,114 @@ pub mod gated {
             // and its halves and quarters rounded up; the lengths are the
             // launch contract's.
             unsafe {
-                norm_row_body(
+                norm_row_body::<false>(
+                    w,
+                    x,
+                    gain,
+                    eps,
+                    k,
+                    n_sb,
+                    half_it,
+                    quad_it,
+                    0,
+                    ROWS,
+                    SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                    SharedArray::as_raw_mut_ptr(&raw mut NORMED),
+                    &mut q3,
+                    &mut q4,
+                    &mut q6,
+                    &mut s8,
+                    &mut d8,
+                    &mut logits,
+                    fault,
+                );
+            }
+            // SAFETY: LAST and P are this block's own shared allocations of 1
+            // and EXPERTS entries, untouched until here; every thread arrives
+            // converged, 1 <= used <= 32, the output lengths are the launch
+            // contract's at one token and `done[0]` is zero before the launch.
+            unsafe {
+                publish_route_gated::<PER_LANE>(
+                    1,
+                    used as usize,
+                    SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                    SharedArray::as_raw_mut_ptr(&raw mut P),
+                    &mut logits,
+                    &mut probs,
+                    &mut ids,
+                    &mut weights,
+                    &mut done,
+                    fault,
+                );
+            }
+        }
+
+        /// `qwen35moe_router_norm` with warp 0 of each block asking L2 for its router row
+        /// first ([`l2_prefetch`]): the entry an integrated device launches.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+        )]
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (
+                k <= NORM_K,
+                used >= 1,
+                used <= 32,
+                w.len() >= ROWS * k,
+                x.len() >= k,
+                gain.len() >= k,
+                q3.len() >= 64 * half_it,
+                q4.len() >= 256 * quad_it,
+                q6.len() >= 128 * half_it,
+                s8.len() >= 8 * n_sb,
+                d8.len() >= 2 * n_sb,
+                logits.len() >= ROWS,
+                probs.len() >= EXPERTS,
+                ids.len() >= used + 1,
+                weights.len() >= used + 1,
+                done.len() >= 1
+            )
+        )]
+        pub fn qwen35moe_router_norm_prefetch(
+            w: &[f32],
+            x: &[f32],
+            gain: &[f32],
+            eps: f32,
+            k: u32,
+            n_sb: u32,
+            half_it: u32,
+            quad_it: u32,
+            used: u32,
+            mut q3: DisjointSlice<u64>,
+            mut q4: DisjointSlice<u32>,
+            mut q6: DisjointSlice<u32>,
+            mut s8: DisjointSlice<i32>,
+            mut d8: DisjointSlice<f32>,
+            mut logits: DisjointSlice<f32>,
+            mut probs: DisjointSlice<f32>,
+            mut ids: DisjointSlice<u32>,
+            mut weights: DisjointSlice<f32>,
+            mut done: DisjointSlice<u32>,
+            fault: FaultSink,
+        ) {
+            static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+            static mut NORMED: SharedArray<f32, NORM_K> = SharedArray::UNINIT;
+            static mut P: SharedArray<f32, EXPERTS> = SharedArray::UNINIT;
+            static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+            // SAFETY: WSUM and NORMED are this block's own shared allocations
+            // (the raw form reaches each `static mut` without a reference),
+            // touched by nothing else; every thread arrives converged with
+            // token 0, and the grid is ROWS >= k / 128 blocks of 256 (the
+            // launcher's, and the const assert beside ROWS); the launcher
+            // passes k a positive multiple of 128 up to NORM_K, n_sb = k/256
+            // and its halves and quarters rounded up; the lengths are the
+            // launch contract's.
+            unsafe {
+                norm_row_body::<true>(
                     w,
                     x,
                     gain,
@@ -2783,7 +3193,126 @@ pub mod gated {
                 // halves and quarters rounded up; the lengths are the launch
                 // contract's at m_cols tokens.
                 unsafe {
-                    norm_row_body(
+                    norm_row_body::<false>(
+                        w,
+                        x,
+                        gain,
+                        eps,
+                        k,
+                        n_sb,
+                        half_it,
+                        quad_it,
+                        t,
+                        ROWS,
+                        SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                        SharedArray::as_raw_mut_ptr(&raw mut NORMED),
+                        &mut q3,
+                        &mut q4,
+                        &mut q6,
+                        &mut s8,
+                        &mut d8,
+                        &mut logits,
+                        fault,
+                    );
+                }
+                t += 1;
+            }
+            // SAFETY: LAST is this block's own and untouched until here; the
+            // routing's scratch is NORMED's first m_cols · EXPERTS <= NORM_K
+            // entries (const assert), which warp 0's last gemv has read
+            // before the routing's first barrier and nothing touches after
+            // it; every thread arrives converged, 1 <= m_cols <= 8, 1 <= used
+            // <= 32, the output lengths are the launch contract's and
+            // `done[0]` is zero before the launch.
+            unsafe {
+                publish_route_gated::<PER_LANE>(
+                    m_cols as usize,
+                    used as usize,
+                    SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                    SharedArray::as_raw_mut_ptr(&raw mut NORMED),
+                    &mut logits,
+                    &mut probs,
+                    &mut ids,
+                    &mut weights,
+                    &mut done,
+                    fault,
+                );
+            }
+        }
+
+        /// `qwen35moe_router_norm_m` with warp 0 of each block asking L2 for its router row
+        /// first ([`l2_prefetch`]): the entry an integrated device launches.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+        )]
+        #[kernel]
+        // The plain entry's bounds: four blocks an SM, 64 registers a thread.
+        #[launch_bounds(256, 4)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (
+                m_cols >= 1,
+                m_cols <= 8,
+                k <= NORM_K,
+                used >= 1,
+                used <= 32,
+                w.len() >= ROWS * k,
+                x.len() >= m_cols * k,
+                gain.len() >= k,
+                q3.len() >= m_cols * 64 * half_it,
+                q4.len() >= m_cols * 256 * quad_it,
+                q6.len() >= m_cols * 128 * half_it,
+                s8.len() >= m_cols * 8 * n_sb,
+                d8.len() >= m_cols * 2 * n_sb,
+                logits.len() >= ROWS * m_cols,
+                probs.len() >= EXPERTS * m_cols,
+                ids.len() >= (used + 1) * m_cols,
+                weights.len() >= (used + 1) * m_cols,
+                done.len() >= 1
+            )
+        )]
+        pub fn qwen35moe_router_norm_m_prefetch(
+            w: &[f32],
+            x: &[f32],
+            gain: &[f32],
+            eps: f32,
+            k: u32,
+            m_cols: u32,
+            n_sb: u32,
+            half_it: u32,
+            quad_it: u32,
+            used: u32,
+            mut q3: DisjointSlice<u64>,
+            mut q4: DisjointSlice<u32>,
+            mut q6: DisjointSlice<u32>,
+            mut s8: DisjointSlice<i32>,
+            mut d8: DisjointSlice<f32>,
+            mut logits: DisjointSlice<f32>,
+            mut probs: DisjointSlice<f32>,
+            mut ids: DisjointSlice<u32>,
+            mut weights: DisjointSlice<f32>,
+            mut done: DisjointSlice<u32>,
+            fault: FaultSink,
+        ) {
+            static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+            static mut NORMED: SharedArray<f32, NORM_K> = SharedArray::UNINIT;
+            static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+
+            let mut t = 0usize;
+            while t < m_cols as usize {
+                // SAFETY: WSUM and NORMED are this block's own shared
+                // allocations (the raw form reaches each `static mut` without
+                // a reference), touched by nothing else; every thread arrives
+                // converged with the same t < m_cols <= 8, and the grid is
+                // ROWS >= m_cols · (k / 128) blocks of 256 (the launcher's,
+                // and the const assert beside ROWS); the launcher passes k a
+                // positive multiple of 128 up to NORM_K, n_sb = k/256 and its
+                // halves and quarters rounded up; the lengths are the launch
+                // contract's at m_cols tokens.
+                unsafe {
+                    norm_row_body::<true>(
                         w,
                         x,
                         gain,
@@ -3224,6 +3753,8 @@ pub mod gated {
     /// enqueue takes the engine stream.
     pub struct RouterKernels {
         module: qwen35moe_router_kernels::LoadedModule,
+        /// [`crate::row_prefetch`] of the context's device.
+        row_prefetch: bool,
     }
 
     impl RouterKernels {
@@ -3232,7 +3763,10 @@ pub mod gated {
             // SAFETY: this package owns the embedded device bundle produced
             // for the module above; each launcher checks its launch contract.
             let module = unsafe { crate::shared_module!(qwen35moe_router_kernels, ctx)? };
-            Ok(RouterKernels { module })
+            Ok(RouterKernels {
+                module,
+                row_prefetch: crate::row_prefetch(ctx)?,
+            })
         }
 
         /// Enqueue the router of `m` tokens, 1..=`MAX_TOKENS` and at most
@@ -3443,33 +3977,71 @@ pub mod gated {
             let k = launch_u32(what, "k", k)?;
             let n_sb = launch_u32(what, "n_sb", n_sb)?;
             let grid = launch_u32(what, "grid", ROWS)?;
-            let prep = self
-                .module
-                .prepare_qwen35moe_router_norm(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-            self.module.qwen35moe_router_norm(
-                stream,
-                &prep,
-                w.buf(),
-                x,
-                gain,
-                eps,
-                k,
-                n_sb,
-                n_sb.div_ceil(2),
-                n_sb.div_ceil(4),
-                used,
-                &mut act.q3,
-                &mut act.q4,
-                &mut act.q6,
-                &mut act.s8,
-                &mut act.d8,
-                &mut out.logits,
-                &mut out.probs,
-                &mut out.ids,
-                &mut out.weights,
-                &mut out.done,
-                fault,
-            )?;
+            if self.row_prefetch {
+                let prep =
+                    self.module
+                        .prepare_qwen35moe_router_norm_prefetch(LaunchConfig1D::new(
+                            grid,
+                            FUSED_THREADS_U32,
+                            0,
+                        ))?;
+                self.module.qwen35moe_router_norm_prefetch(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    x,
+                    gain,
+                    eps,
+                    k,
+                    n_sb,
+                    n_sb.div_ceil(2),
+                    n_sb.div_ceil(4),
+                    used,
+                    &mut act.q3,
+                    &mut act.q4,
+                    &mut act.q6,
+                    &mut act.s8,
+                    &mut act.d8,
+                    &mut out.logits,
+                    &mut out.probs,
+                    &mut out.ids,
+                    &mut out.weights,
+                    &mut out.done,
+                    fault,
+                )?;
+            } else {
+                let prep = self
+                    .module
+                    .prepare_qwen35moe_router_norm(LaunchConfig1D::new(
+                        grid,
+                        FUSED_THREADS_U32,
+                        0,
+                    ))?;
+                self.module.qwen35moe_router_norm(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    x,
+                    gain,
+                    eps,
+                    k,
+                    n_sb,
+                    n_sb.div_ceil(2),
+                    n_sb.div_ceil(4),
+                    used,
+                    &mut act.q3,
+                    &mut act.q4,
+                    &mut act.q6,
+                    &mut act.s8,
+                    &mut act.d8,
+                    &mut out.logits,
+                    &mut out.probs,
+                    &mut out.ids,
+                    &mut out.weights,
+                    &mut out.done,
+                    fault,
+                )?;
+            }
             Ok(())
         }
 
@@ -3525,34 +4097,73 @@ pub mod gated {
             let m = launch_u32(what, "m", m)?;
             let n_sb = launch_u32(what, "n_sb", n_sb)?;
             let grid = launch_u32(what, "grid", ROWS)?;
-            let prep = self
-                .module
-                .prepare_qwen35moe_router_norm_m(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-            self.module.qwen35moe_router_norm_m(
-                stream,
-                &prep,
-                w.buf(),
-                x,
-                gain,
-                eps,
-                k,
-                m,
-                n_sb,
-                n_sb.div_ceil(2),
-                n_sb.div_ceil(4),
-                used,
-                &mut act.q3,
-                &mut act.q4,
-                &mut act.q6,
-                &mut act.s8,
-                &mut act.d8,
-                &mut out.logits,
-                &mut out.probs,
-                &mut out.ids,
-                &mut out.weights,
-                &mut out.done,
-                fault,
-            )?;
+            if self.row_prefetch {
+                let prep =
+                    self.module
+                        .prepare_qwen35moe_router_norm_m_prefetch(LaunchConfig1D::new(
+                            grid,
+                            FUSED_THREADS_U32,
+                            0,
+                        ))?;
+                self.module.qwen35moe_router_norm_m_prefetch(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    x,
+                    gain,
+                    eps,
+                    k,
+                    m,
+                    n_sb,
+                    n_sb.div_ceil(2),
+                    n_sb.div_ceil(4),
+                    used,
+                    &mut act.q3,
+                    &mut act.q4,
+                    &mut act.q6,
+                    &mut act.s8,
+                    &mut act.d8,
+                    &mut out.logits,
+                    &mut out.probs,
+                    &mut out.ids,
+                    &mut out.weights,
+                    &mut out.done,
+                    fault,
+                )?;
+            } else {
+                let prep = self
+                    .module
+                    .prepare_qwen35moe_router_norm_m(LaunchConfig1D::new(
+                        grid,
+                        FUSED_THREADS_U32,
+                        0,
+                    ))?;
+                self.module.qwen35moe_router_norm_m(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    x,
+                    gain,
+                    eps,
+                    k,
+                    m,
+                    n_sb,
+                    n_sb.div_ceil(2),
+                    n_sb.div_ceil(4),
+                    used,
+                    &mut act.q3,
+                    &mut act.q4,
+                    &mut act.q6,
+                    &mut act.s8,
+                    &mut act.d8,
+                    &mut out.logits,
+                    &mut out.probs,
+                    &mut out.ids,
+                    &mut out.weights,
+                    &mut out.done,
+                    fault,
+                )?;
+            }
             Ok(())
         }
     }

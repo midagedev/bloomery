@@ -39,7 +39,7 @@
 //! [`tile_block`] (over [`tile_at`]) is the one reading of a tile launch's
 //! block, every tiled kernel's prologue, each kernel's work a [`TileWork`].
 
-use crate::cores::q4k_row_dot_1col;
+use crate::cores::{l2_prefetch, q4k_row_dot_1col};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::hybrid::HOST;
 use crate::kquant::tiles::{GemvTiles, TiledDown, down_grid};
@@ -334,6 +334,9 @@ mod q4k_sel_kernels {
     /// of `y` untouched and every other slot unaffected. [`HOST`] is a slot
     /// the host tier serves, skipped by contract; any other id past the
     /// stack raises [`FaultSite::ExpertId`] on `fault` first.
+    ///
+    /// `q4k_gemv_sel_prefetch` carries a copy of this body: a change here
+    /// goes there too.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -384,6 +387,75 @@ mod q4k_sel_kernels {
             return;
         }
         let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
+        // The core's caller contract, from the launch contract: row_abs <
+        // n_experts * rows_per_expert rows of `w`, column slot < n_slots of
+        // `q`/`s8`/`d8`, iters = ceil(n_sb/4) from the host, and all 32
+        // lanes of the warp are here (both returns above are warp-uniform).
+        let f0 = q4k_row_dot_1col(w, q, s8, d8, n_sb as usize, iters, row_abs, slot, lane);
+        let s0 = warp::reduce_sum_f32(f0);
+        if lane == 0 {
+            // SAFETY: row < n_slots*rows_per_expert <= y.len() by the launch
+            // contract; only lane 0 of the warp writes y[row].
+            unsafe {
+                *y.get_unchecked_mut(row) = s0;
+            }
+        }
+    }
+
+    /// `q4k_gemv_sel` with the warp's row asked of L2 first ([`l2_prefetch`]):
+    /// the entry an integrated device launches. Its body is `q4k_gemv_sel`'s,
+    /// copied: sharing it through an inline walk changes `q4k_gemv_sel`'s PTX.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows_per_expert * 36 * n_sb,
+            q.len() >= n_slots * 256 * iters,
+            s8.len() >= n_slots * 8 * n_sb,
+            d8.len() >= n_slots * 2 * n_sb,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q4k_gemv_sel_prefetch(
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        let slot = row / rows_per_expert as usize;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform (all 32 lanes of the warp share `row`, hence
+        // `slot`), so the out-of-range return below never diverges a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
+        l2_prefetch(w, row_abs * 144 * n_sb as usize, 144 * n_sb as usize, lane);
         // The core's caller contract, from the launch contract: row_abs <
         // n_experts * rows_per_expert rows of `w`, column slot < n_slots of
         // `q`/`s8`/`d8`, iters = ceil(n_sb/4) from the host, and all 32
@@ -859,6 +931,8 @@ pub struct Q4kSelKernels {
     module: q4k_sel_kernels::LoadedModule,
     /// The fault word of the `Gpu` that owns the context.
     fault: Arc<DeviceBuffer<u32>>,
+    /// [`crate::row_prefetch`] of the context's device.
+    row_prefetch: bool,
 }
 
 impl Q4kSelKernels {
@@ -873,7 +947,11 @@ impl Q4kSelKernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(q4k_sel_kernels, ctx)? };
-        Ok(Q4kSelKernels { module, fault })
+        Ok(Q4kSelKernels {
+            module,
+            fault,
+            row_prefetch: crate::row_prefetch(ctx)?,
+        })
     }
 
     /// Enqueue the device-indirect MoE down projection for a Q4_K expert
@@ -969,25 +1047,47 @@ impl Q4kSelKernels {
         let rows_per_expert = launch_u32(what, "rows_per_expert", rows_per_expert)?;
         let n_slots = launch_u32(what, "n_slots", n_slots)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_q4k_gemv_sel(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.q4k_gemv_sel(
-            stream,
-            &prep,
-            w.buf(),
-            &act.q4,
-            &act.s8,
-            &act.d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            n_slots,
-            n_sb,
-            n_sb.div_ceil(4),
-            crate::sink_over(&self.fault, LAYER_NONE),
-            y,
-        )?;
+        if self.row_prefetch {
+            let prep = self
+                .module
+                .prepare_q4k_gemv_sel_prefetch(LaunchConfig1D::new(grid, THREADS, 0))?;
+            self.module.q4k_gemv_sel_prefetch(
+                stream,
+                &prep,
+                w.buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                sel,
+                n_experts,
+                rows_per_expert,
+                n_slots,
+                n_sb,
+                n_sb.div_ceil(4),
+                crate::sink_over(&self.fault, LAYER_NONE),
+                y,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_q4k_gemv_sel(LaunchConfig1D::new(grid, THREADS, 0))?;
+            self.module.q4k_gemv_sel(
+                stream,
+                &prep,
+                w.buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                sel,
+                n_experts,
+                rows_per_expert,
+                n_slots,
+                n_sb,
+                n_sb.div_ceil(4),
+                crate::sink_over(&self.fault, LAYER_NONE),
+                y,
+            )?;
+        }
         Ok(())
     }
 

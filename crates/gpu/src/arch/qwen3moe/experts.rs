@@ -34,7 +34,7 @@
 //! grouping.
 
 use crate::GpuError;
-use crate::cores::q4k_row_dot_1col;
+use crate::cores::{l2_prefetch, q4k_row_dot_1col};
 use crate::elem::{silu_mul, weighted_expert_sum};
 use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
@@ -64,7 +64,7 @@ const ROWS_PER_BLOCK: usize = 8;
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-unsafe fn gate_up_row(
+unsafe fn gate_up_row<const PREFETCH: bool>(
     wg: &[u32],
     wu: &[u32],
     q: &[u32],
@@ -97,6 +97,11 @@ unsafe fn gate_up_row(
     }
     let row_abs = id * rows_per_expert as usize + row % rows_per_expert as usize;
     let col = slot / slots_per_col as usize;
+    if PREFETCH {
+        let row_bytes = 144 * n_sb as usize;
+        l2_prefetch(wg, row_abs * row_bytes, row_bytes, lane);
+        l2_prefetch(wu, row_abs * row_bytes, row_bytes, lane);
+    }
     // The core's caller contract, from this fn's: row_abs < n_experts ·
     // rows_per_expert rows of both stacks, column col < m_cols, iters =
     // ceil(n_sb/4), and all 32 lanes of the warp are here (the return above
@@ -175,7 +180,80 @@ mod qwen3moe_expert_kernels {
         // passes iters = ceil(n_sb/4); the rest is the launch contract; each
         // row is one warp's.
         unsafe {
-            gate_up_row(
+            gate_up_row::<false>(
+                wg,
+                wu,
+                q,
+                s8,
+                d8,
+                sel,
+                n_experts,
+                rows_per_expert,
+                slots_per_col,
+                n_sb,
+                iters,
+                row,
+                warp::lane_id() as usize,
+                fault,
+                &mut h,
+            );
+        }
+    }
+
+    /// `qwen3moe_gate_up_swiglu_q4k` with each warp's gate and up rows asked
+    /// of L2 first ([`l2_prefetch`]): the entry an integrated device launches.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            wg.len() >= n_experts * rows_per_expert * 36 * n_sb,
+            wu.len() >= n_experts * rows_per_expert * 36 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn qwen3moe_gate_up_swiglu_q4k_prefetch(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        // SAFETY: the guard above is warp-uniform (the warp's lanes share
+        // `row`) and keeps row < n_slots · rows_per_expert; slot / slots_per_col
+        // < m_cols because slot < n_slots <= m_cols · slots_per_col; the host
+        // passes iters = ceil(n_sb/4); the rest is the launch contract; each
+        // row is one warp's.
+        unsafe {
+            gate_up_row::<true>(
                 wg,
                 wu,
                 q,
@@ -357,6 +435,8 @@ fn gate_up_shape(what: &'static str, a: &GateUpArgs<'_>) -> Result<GateUpShape, 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct ExpertKernels {
     module: qwen3moe_expert_kernels::LoadedModule,
+    /// [`crate::row_prefetch`] of the context's device.
+    row_prefetch: bool,
 }
 
 impl ExpertKernels {
@@ -365,7 +445,10 @@ impl ExpertKernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(qwen3moe_expert_kernels, ctx)? };
-        Ok(ExpertKernels { module })
+        Ok(ExpertKernels {
+            module,
+            row_prefetch: crate::row_prefetch(ctx)?,
+        })
     }
 
     /// Enqueue the selected experts' gate·up·SwiGLU: slot `s` writes
@@ -387,28 +470,55 @@ impl ExpertKernels {
             h,
             ..
         } = a;
-        let prep = self
-            .module
-            .prepare_qwen3moe_gate_up_swiglu_q4k(LaunchConfig1D::new(g.grid, 256, 0))?;
-        self.module.qwen3moe_gate_up_swiglu_q4k(
-            stream,
-            &prep,
-            wg.buf(),
-            wu.buf(),
-            &act.q4,
-            &act.s8,
-            &act.d8,
-            sel,
-            g.n_experts,
-            g.rows_per_expert,
-            g.n_slots,
-            g.m,
-            g.slots_per_col,
-            g.n_sb,
-            g.n_sb.div_ceil(4),
-            fault,
-            h,
-        )?;
+        if self.row_prefetch {
+            let prep =
+                self.module
+                    .prepare_qwen3moe_gate_up_swiglu_q4k_prefetch(LaunchConfig1D::new(
+                        g.grid, 256, 0,
+                    ))?;
+            self.module.qwen3moe_gate_up_swiglu_q4k_prefetch(
+                stream,
+                &prep,
+                wg.buf(),
+                wu.buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                sel,
+                g.n_experts,
+                g.rows_per_expert,
+                g.n_slots,
+                g.m,
+                g.slots_per_col,
+                g.n_sb,
+                g.n_sb.div_ceil(4),
+                fault,
+                h,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_qwen3moe_gate_up_swiglu_q4k(LaunchConfig1D::new(g.grid, 256, 0))?;
+            self.module.qwen3moe_gate_up_swiglu_q4k(
+                stream,
+                &prep,
+                wg.buf(),
+                wu.buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                sel,
+                g.n_experts,
+                g.rows_per_expert,
+                g.n_slots,
+                g.m,
+                g.slots_per_col,
+                g.n_sb,
+                g.n_sb.div_ceil(4),
+                fault,
+                h,
+            )?;
+        }
         Ok(())
     }
 
