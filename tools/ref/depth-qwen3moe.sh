@@ -464,6 +464,12 @@
 # row. A compute
 # process on either card as an arm starts is waited out (10 minutes, then rc 75). A dry run prints the
 # pre-lease checks' verdict and goes on.
+#
+# Local mode. Under tools/box.sh's local mode (BLOOMERY_BOX_CARD=local; timing-card.sh's header has its
+# refusals) the arms time this machine's one card, every row's card field its name, our arms at a alone
+# (arm-place.sh refuses gate and bp). Before the lease a kernel journal that does not answer, or shows a
+# user other than root no line, refuses the run (69); after every arm, whatever it exited with, an Xid
+# since the last arm or the card lost makes the arm a FAIL row.
 set -uo pipefail
 # The drive the model file is on and its read counter (an ours row's drive column).
 # shellcheck source=tools/ref/drive-read.sh
@@ -1601,8 +1607,8 @@ for i in "${!ARMS[@]}"; do
   done < <(model_shards "${A_MODEL[$i]:-$MODEL}")
 done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
-# has the two-card mode (the header's Two cards).
-TIMING_CARDS_RUNNER=1
+# has the two-card mode (the header's Two cards) and local mode (timing-card.sh's header).
+TIMING_CARDS_RUNNER=1 TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 timing_cards_mode || exit $?
@@ -1868,9 +1874,10 @@ ref_arm() {
   rm -f "$markf"
   witness "post r$r $eng d=$dep"
   guard_cpu "post r$r $eng d=$dep"
-  # Two cards: an Xid, a card lost or off its cap, or an engine that saw one card fails the arm.
+  # Two cards: an Xid, a card lost or off its cap, or an engine that saw one card fails the arm. Local mode:
+  # an Xid or the card lost.
   if ! timing_cards_arm "$raw"; then
-    arm_fail "$r" "$eng" "$key" "$rc" "two cards: $TWOCARD_WHY" "$raw"
+    arm_fail "$r" "$eng" "$key" "$rc" "${TIMING_CARDS:+two cards: }$TWOCARD_WHY" "$raw"
     return 0
   fi
   val=$(echo "$raw" | ref_val "$eng" "$REF_LABEL")
@@ -2031,7 +2038,7 @@ ours_pre() {
 # and mean, no time prompt row). An output that opens with an `arm` line (an --arm list's) gives the
 # row its slot in the load. MAJ_WHOLE and MAJ_TIMED are the arm's (the driver's, or ours_arm's).
 ours_post() {
-  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot='' win timed ran mtp=''
+  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot='' win timed ran mtp='' why
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} ctx=$(arm_ctx "$i")
   # The bytes the model file's drive was asked to read across the arm, every reader of it: a foreign
   # reader shows in the arm's own delta.
@@ -2048,6 +2055,14 @@ ours_post() {
   guard_cpu "post r$r $label d=$dep"
   a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
   [ -z "$a" ] || slot=" | slot $((${a% *} + 1))/${a#* }"
+  # Local mode: an Xid since the last arm's check, or the card lost, fails the arm, whatever it exited with,
+  # so the next arm is not charged with it.
+  if [ -n "$TIMING_LOCAL" ] && ! timing_cards_arm "$out"; then
+    why=$TWOCARD_WHY
+    [ "$rc" -eq 0 ] || why="exited $rc; $why"
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$why" "$out"
+    return 0
+  fi
   if [ "$rc" -ne 0 ]; then
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "exited $rc" "$out"
     return 0
@@ -2424,7 +2439,7 @@ majflt_require depth-qwen3moe.sh
 DRIVE_DEV=$(drive_dev "$MODEL") || exit 2
 timing_cards_precheck || {
   rc=$?
-  echo "depth-qwen3moe.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2
+  echo "depth-qwen3moe.sh: ${TIMING_CARDS:+two cards, }refused before the lease: $TWOCARD_WHY" >&2
   exit "$rc"
 }
 lease_take

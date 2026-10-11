@@ -153,6 +153,15 @@
 #                [cards-busy] wait and then the row; rc 0.
 #   twocard-optin  timing-card.sh sourced by a runner that does not opt in: TIMING_GPU and
 #                CUDA_VISIBLE_DEVICES empty and the refusal named (lease_take refuses an empty TIMING_GPU).
+# Local mode (BLOOMERY_BOX_CARD=local, timing-card.sh; red on the runner before it). The box
+# (/root/bloomery-cpu.lock) refuses it: there the first three are skipped by name.
+#   local        6 lcpp:6 at BLOOMERY_GEN_PLACE=a, one round, the one card listed a GB10: each row's card
+#                field `GB10 (stub)`, the witness's local lines (the card's power limit [N/A], the Xid count,
+#                local-apps, pool, machine) and none of the box's, the Xid reader's lines; rc 0.
+#   local-xid    the same with ours d=6 exiting rc 3 after an Xid line in the kernel journal: its FAIL row
+#                naming both, lcpp's row after it uncharged; rc 1.
+#   local-twocard  BLOOMERY_TIMING_CARDS=a6000+3090 in local mode: refused by name, rc 64.
+#   local-box    on the box only: local mode refused by name, rc 64.
 # The server arms and the warm rows (lcpp-warm.sh; red on the runner before them):
 #   srv          6 lcppsrv:6 lcppsrvpp:4 lcppsrvpp8:4 lcppsrvfit:6, one round: the server rows in this runner's
 #                field order (the tags and the majflt column after the wall), the flags of the qwen4exp
@@ -339,7 +348,8 @@ touch "$T/Cargo.toml"
 # --arm list prints each arm's `arm` line, waits for a line on stdin under --arm-sync, then its prompt ids.
 # Each arm: the step-0, time prompt (P x 10 tok/s, kind=gemm) and step lines, and a SMOKE footer at 5 ms
 # a step. Every process appends its arm list to $TMPDIR/stub-gen-loads. An arm of depth
-# STUB_GEN_FAIL_DEPTH ends the process at rc 3 the first time (a marker file), after its prompt ids. Its
+# STUB_GEN_FAIL_DEPTH ends the process at rc 3 the first time (a marker file), after its prompt ids; the
+# first arm of depth STUB_GEN_XID adds an Xid line to $TMPDIR/stub-xid (the stub journalctl's) before that. Its
 # load line names --place's placement (a when none; STUB_GEN_PLACE_RAN in its stead), each arm ends with
 # its `tokens` line (token 0 STUB_GEN_TOKEN0, 1000 by default, then the step lines' ids), and under
 # STUB_GEN_MTP an `mtp summary` of 10 positions in 4 passes and the MTP form of the SMOKE line (steps= the
@@ -404,6 +414,10 @@ for k in "${!arms[@]}"; do
     echo $(($(cat "$cm" 2> /dev/null || echo 0) + 1)) > "$cm"
     sleep 0.3
     echo $(($(cat "$STUB_MAJFLT") + 100000)) > "$STUB_MAJFLT"
+  fi
+  if [ "$depth" = "${STUB_GEN_XID:-none}" ] && [ ! -e "${TMPDIR:-/tmp}/stub-once-xid-gen" ]; then
+    touch "${TMPDIR:-/tmp}/stub-once-xid-gen"
+    echo "1790428806.570394 ws kernel: NVRM: Xid (PCI:000f:01:00): 13, pid=4242, name=generate_qwen3moe, Graphics Exception" >> "${TMPDIR:-/tmp}/stub-xid"
   fi
   mark=${TMPDIR:-/tmp}/stub-once-gen-$depth
   if [ "$depth" = "${STUB_GEN_FAIL_DEPTH:-none}" ] && [ ! -e "$mark" ]; then
@@ -1012,6 +1026,47 @@ if want twocard-optin "$L" 1 '^\[timing-cards\] refused: BLOOMERY_TIMING_CARDS=a
   want twocard-optin "$L" 1 '^TIMING_GPU=\[\] CUDA_VISIBLE_DEVICES=\[\] TIMING_CARDS=\[\]$'; then
   pass twocard-optin
 fi
+
+# Local mode (red on the runner before it). The box (/root/bloomery-cpu.lock) refuses it, and there that
+# refusal is the one case.
+LOC=(BLOOMERY_BOX_CARD=local "BLOOMERY_LOCK_DIR=$tmp/locks")
+if [ -e /root/bloomery-cpu.lock ]; then
+  echo "skip local, local-xid, local-twocard: /root/bloomery-cpu.lock exists (the box), where local mode is refused"
+  twocard_refused local-box 64 "^depth-qwen3moe.sh: BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu.lock \(the box\): " \
+    "${LOC[@]}" -- 6 lcpp:6
+else
+  L=$tmp/local.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PLACE=a "${LOC[@]}" -- 6 lcpp:6
+  if [ "$RC" != 0 ]; then
+    fail local "rc $RC, want 0" "$L"
+  elif [ "$(heads "$L" | paste -sd'|' -)" != "ROW r1 ours d=6|ROW r1 lcpp d=6" ]; then
+    fail local "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+  elif want local "$L" 1 '^ROW r1 ours d=6 n=4 ctx=256 \| tok/s\(mean\) 200.00 @ n=4, depth 6, GB10 \(stub\) \| ' &&
+    want local "$L" 1 '^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, GB10 \(stub\) \| ' &&
+    want local "$L" 1 "^\[config\] arms=6 lcpp:6 timing_gpu=$STUB_GPU_GB10 other_gpu= CUDA_VISIBLE_DEVICES=$STUB_GPU_GB10$" &&
+    want local "$L" 1 '^\[timing-card\] Xid reader: journalctl -k$' &&
+    want local "$L" 1 '^\[timing-card\] Xid count from @[0-9]+ ' &&
+    want local "$L" 6 '^    timing-card: NVIDIA GB10 \(stub\), \[N/A\], stub$' &&
+    want local "$L" 6 '^    xid: 0 NVRM Xid line\(s\) since the lease was taken \(@[0-9]+\); last: none$' &&
+    want local "$L" 6 '^    local-apps: \[\]$' &&
+    want local "$L" 6 '^    pool: MemFree=[0-9]+ SwapFree=[0-9]+ kB$' &&
+    want local "$L" 6 '^    machine: .*, kernel [^,]+, driver stub, nvcc [^,]*on PATH, MemTotal [0-9]+ kB$' &&
+    want local "$L" 0 '\[other-card\]|3090-apps|a6000-apps|llm\.service|timing-cards'; then
+    pass local
+  fi
+  L=$tmp/local-xid.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 "${LOC[@]}" STUB_GEN_XID=6 STUB_GEN_FAIL_DEPTH=6 -- 6 lcpp:6
+  if [ "$RC" != 1 ]; then
+    fail local-xid "rc $RC, want 1" "$L"
+  elif [ "$(heads "$L" | paste -sd'|' -)" != "FAIL r1 ours d=6|ROW r1 lcpp d=6" ]; then
+    fail local-xid "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+  elif want local-xid "$L" 1 "^FAIL r1 ours d=6 rc=3 \| exited 3; 1 NVRM Xid line\(s\) since the last arm.s check \(1 since the lease was taken\); last: [0-9.]+ ws kernel: NVRM: Xid \(PCI:000f:01:00\): 13, .*; last line: " &&
+    want local-xid "$L" 1 '^failed arms: r1 ours d=6 rc=3; $'; then
+    pass local-xid
+  fi
+  twocard_refused local-twocard 64 "^depth-qwen3moe.sh: BLOOMERY_TIMING_CARDS=a6000\+3090 and BLOOMERY_BOX_CARD=local: " \
+    "$TC" "${LOC[@]}" -- 6 lcpp:6
+fi
 L=$tmp/srv.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- 6 lcppsrv:6 lcppsrvpp:4 lcppsrvpp8:4 lcppsrvfit:6
 TAIL='\| wall [0-9]+s \| majflt 0 \(timed 0; ≤ 0.0 % of W'
@@ -1385,7 +1440,7 @@ if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
     "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
     "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/slots*.log "$tmp"/bin-slots.log "$tmp"/bin-mem.log \
-    "$tmp"/evict*.log "$tmp"/cpu-guard.log "$tmp"/warm.log; do
+    "$tmp"/evict*.log "$tmp"/cpu-guard.log "$tmp"/warm.log "$tmp"/local*.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done

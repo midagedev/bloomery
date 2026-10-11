@@ -1399,8 +1399,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     path(
         "BLOOMERY_LEASE_TRACE",
         Some("ref/lease.sh"),
-        "The lease's trace file, `/root/bloomery-sittings.log` under the machine lease when \
-         unset; the tools' stub tests point it at their own.",
+        "The lease's trace file, `bloomery-sittings.log` in the lock directory under the \
+         machine lease when unset (`/root/bloomery-sittings.log` on the box); the tools' stub \
+         tests point it at their own.",
     ),
     path(
         "BLOOMERY_LOCK_DIR",
@@ -1794,7 +1795,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("box.sh"),
         "The card `tools/box.sh` put in view, passed to the box side: `3090`, `a6000`, \
          `both`, or `local` in its local mode; `tools/gpu-gate.sh` takes that card's gate lock \
-         (both locks for `both`, the one local lock for `local`).",
+         (both locks for `both`, the one local lock for `local`), and under `local` \
+         `tools/ref/timing-card.sh` times this machine's card.",
     ),
     runner(
         "BLOOMERY_GEN_CTX",
@@ -2236,7 +2238,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     runner(
         "BLOOMERY_TIMING_GPU",
         Some("ref/timing-card.sh"),
-        "The card a timed run takes, the A6000 when unset (`tools/ref/timing-card.sh`).",
+        "The card a timed run takes, the A6000 when unset; in `tools/box.sh`'s local mode a \
+         UUID `nvidia-smi` lists, the machine's one card when unset \
+         (`tools/ref/timing-card.sh`).",
     ),
     runner(
         "BLOOMERY_VISION_BOUND",
