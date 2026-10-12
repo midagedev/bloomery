@@ -570,7 +570,7 @@ impl PlanInputs {
             )?,
         };
         let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
-        let room = workstation::plan_room(&self.room);
+        let room = plan.host.plan_at(&self.room);
         placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
         placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         Ok(plan)

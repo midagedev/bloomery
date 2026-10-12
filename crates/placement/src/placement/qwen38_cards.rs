@@ -16,9 +16,9 @@ use gguf::GgmlType;
 use super::churn::ChurnPool;
 use super::ctx::{CtxError, within_cache};
 use super::workstation::{
-    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HostNeed, HostRead,
-    MARGIN, MIB, PLAN_ROOM, Pick, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
-    census_usable, host, host_of, plan_room, resolve, tier_batch_host_bytes,
+    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
+    HostRead, MARGIN, MIB, PLAN_ROOM, Pick, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+    TIER_BATCH_RESERVE, census_usable, host, host_of, plan_room, resolve, tier_batch_host_bytes,
     tier_batch_staging_bytes, unified_of,
 };
 use super::{
@@ -1054,6 +1054,74 @@ fn a_given_room_plans_as_given() {
     let at = plan_at(&q4, &gate, 16384, 1, room).expect("the plan at the given room");
     let direct = plan_at(&q4, &gate, 16384, 1, GIVEN).expect("the plan at the room");
     assert_eq!(format!("{at:?}"), format!("{direct:?}"));
+}
+
+/// An unpaged plan keeps the drift margin too. The default context grows
+/// while no expert goes to the NVMe tier ([`super::ctx::default_slot_ctx`]),
+/// so a plan made at the reading itself ends with its need at the reading,
+/// and a load whose reading fell by a little less than the margin is
+/// refused with no arena to shrink. A plan made at [`plan_room`] of the
+/// reading pages the context whose need passes the margin, which stops the
+/// search a margin under the reading.
+#[test]
+fn an_unpaged_plans_search_stops_a_margin_under_the_reading() {
+    // The reading the load took less than the plan's, as a second host
+    // reported it.
+    const SHORT: u64 = 162_668_544;
+    // A room under the PLE table and over the experts: the table is on the
+    // NVMe tier already, as in the reporter's plan (tables 0), and no
+    // expert is.
+    const WHOLE: u64 = 70 << 30;
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let whole = plan_given(&q4, &gate, 4096, 1, WHOLE, Some(None)).expect("the plan at 4096");
+    assert_eq!(whole.host.table_bytes, 0, "the table is off the host");
+    assert_eq!(whole.host.nvme_expert_bytes, 0, "the room pages no expert");
+    let need = HostNeed::of(&whole, 0).bytes();
+    assert!(need < WHOLE, "the room holds the experts whole");
+
+    // A plan made at the reading itself fills it, and its load is refused.
+    let at_reading =
+        plan_given(&q4, &gate, 4096, 1, need, Some(None)).expect("the plan at its need");
+    assert_eq!(
+        at_reading.host.nvme_expert_bytes, 0,
+        "the reading holds it whole"
+    );
+    let filled = HostNeed::of(&at_reading, 0);
+    assert_eq!(filled.bytes(), need);
+    assert!(filled.check(need - SHORT).is_err(), "no arena to shrink");
+
+    // The plan at the reading's plan room pages, so the search stops there,
+    // and its load passes the lowered reading.
+    let room = plan_room(&(need, HostRead::MemAvailable));
+    let kept =
+        plan_given(&q4, &gate, 4096, 1, room, Some(None)).expect("the plan at the plan room");
+    assert!(
+        kept.host.nvme_expert_bytes > 0,
+        "the context passes the margin: it pages"
+    );
+    assert_eq!(HostNeed::of(&kept, 0).check(need - SHORT), Ok(()));
+}
+
+/// A plan names the room it was made at: the reading and the plan room, a
+/// read room's less the drift margin and a given room's as given; a plan
+/// made with no host room names none and adds nothing to the load's refusal.
+#[test]
+fn a_plan_names_the_room_it_was_made_at() {
+    const READ: u64 = 27_631_529_984;
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let mut plan = plan_given(&q4, &gate, 4096, 1, PLAN_ROOM, None).expect("the plan");
+    assert_eq!(plan.host.room, None);
+    assert_eq!(plan.host.room_clause(), "");
+    let planned = plan.host.plan_at(&(READ, HostRead::MemAvailable));
+    assert_eq!(planned, READ - HOST_DRIFT);
+    assert_eq!(plan.host.room, Some((READ, planned)));
+    assert_eq!(
+        plan.host.room_clause(),
+        format!("; the plan was made at a reading of {READ} B (plan room {planned} B)")
+    );
+    let given = plan.host.plan_at(&(READ, HostRead::Given));
+    assert_eq!(plan.host.room, Some((READ, given)));
+    assert_eq!(given, READ);
 }
 
 /// The seat's prompt-cache budget counts the arena once: `HostNeed::bytes`

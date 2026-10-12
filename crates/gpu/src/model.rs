@@ -1849,7 +1849,7 @@ fn placed_pre(
     };
     let grant = HostNeed::of(plan, extra_bytes)
         .grant(available, least)
-        .map_err(|e| GpuError::plan(what, e))?;
+        .map_err(|e| GpuError::plan(what, format!("{e}{}", plan.host.room_clause())))?;
     let t = Instant::now();
     let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
     let upload = t.elapsed();
