@@ -1682,6 +1682,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          under `BLOOMERY_LOCK_DIR`.",
     ),
     runner(
+        "BLOOMERY_BOX_PIDDIR",
+        Some("box.sh"),
+        "Mac side: a directory `tools/box.sh` files its own pid in (an empty file named for the pid) \
+         while it runs, for the caller to end it by: `tools/gate-batch.sh` sets it per item \
+         (`lane-<L>.box` under its out directory) and its stop and dead-lane paths send TERM to \
+         the pids there that still read as a box.sh. Unset: nothing is filed. Local and queue \
+         mode (`BLOOMERY_BOX_LOCAL`, `BLOOMERY_BOX_QUEUE`) file nothing.",
+    ),
+    runner(
         "BLOOMERY_BOX_QUEUE",
         Some("box.sh"),
         "Mac side: `1` makes a box command a job of the box queue: the tree syncs under the remote \

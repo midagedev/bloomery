@@ -76,7 +76,7 @@ A track's first run is a cold build; the next ones are warm. A retired track's c
     two runs at once      533 s, 548 s   (+5-8 %; one of them lint-cold: lint 72 s, setup 24 s)
     one run, both slots held for 63 s    571 s = 63 s of waiter lines naming the holders, then the usual 497 s + setup 8 s
 
-The wall is one block of `check-recipes`: the gate-batch self-test (`tools/gate-batch.sh --self-test`, 424 checks, serial)
+The wall is one block of `check-recipes`: the gate-batch self-test (`tools/gate-batch.sh --self-test`, serial; 424 checks at dc49ae45, and the count and its wall grow with every case added since)
 took 474 s of the 494 s `check-recipes` wall at load 1.5 (a timed copy of check-recipes.sh); the next block took 84 s, the
 prelude 20 s, the other blocks run in parallel under those. `just mac-static` on any Mac meets the same block (derived, not
 measured on the lead's Mac), so the second Mac removes the load effect, not the 474 s.

@@ -238,7 +238,10 @@
 # Failures. An arm that exits non-zero or prints no value prints `FAIL
 # r<r> <label> <d|p>=<X> rc=<rc> | <why> | full output: <file>` where its row would be; the runner
 # goes on, that label at that key drops out of the means and ratios, and the runner exits 1 at the end
-# with the list.
+# with the list. A warm-up (`WARMUP r0`) or the exllamav3 block's discard (`DISCARD r0`) that fails is `FAIL r0 …` and counts in that
+# list; the block's rounds still run, unless its last line is the binary's lever refusal (`<NAME>="<value>" is
+# refused: …`): then the run stops there with a `stopped:` line, whatever the other arms, and exits 1 (cold-blocks.sh's
+# header says why).
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (default 2), BLOOMERY_GEN_WARM
 # (--warm), BLOOMERY_GEN_CTX (C for every ours and server arm; unset: D + N rounded up to 256 an arm,
