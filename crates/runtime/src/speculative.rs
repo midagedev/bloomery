@@ -40,7 +40,9 @@ pub trait Tapped: Verify {
 pub trait TappedPrompt: Tapped {
     /// Tap the rows entering these layers from the next call on;
     /// [`Tapped::tap_width`] becomes `layers.len()` times the hidden width.
-    /// Refused by name past the target's layer count.
+    /// A target whose taps are fixed at its open (a captured model) only
+    /// checks that they are these layers. Refused by name past the target's
+    /// layer count, or against fixed taps that differ.
     fn set_taps(&mut self, layers: &[usize]) -> Result<(), Self::Error>;
 
     /// [`Target::prompt`] with the tapped rows of the call's last `window`

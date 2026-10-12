@@ -13,6 +13,11 @@ pub struct DsparkShape {
     /// Tokens one block pass drafts: row 0 is the token at the target's
     /// position, rows 1.. the mask token's.
     pub block: usize,
+    /// Whether row 0's output (the token at the target's position) drafts
+    /// id 0: then a block of `w` rows drafts `w` ids; otherwise row 0 is
+    /// only the anchor and `w` ids take `w + 1` rows. The file's convention,
+    /// set by its reader.
+    pub row0_drafts: bool,
     /// The target layers whose entering rows the draft reads
     /// ([`crate::TapNeed::Layers`]), in the file's order: the residual row
     /// entering layer `L` (HF `hidden_states[L]`). A file written in another
@@ -133,17 +138,29 @@ impl DraftVocab {
 }
 
 impl DsparkShape {
+    /// The most ids one block drafts.
+    pub fn ids_per_block(&self) -> usize {
+        if self.row0_drafts {
+            self.block
+        } else {
+            self.block.saturating_sub(1)
+        }
+    }
+
     /// The most ids one proposal holds against a target that verifies
-    /// `verify_rows` rows: `min(block − 1, verify_rows − 1)`.
+    /// `verify_rows` rows: the block's ids, and at most `verify_rows − 1`.
     pub fn width(&self, verify_rows: usize) -> usize {
-        self.block
-            .saturating_sub(1)
-            .min(verify_rows.saturating_sub(1))
+        self.ids_per_block().min(verify_rows.saturating_sub(1))
+    }
+
+    /// The block rows a proposal of `width` ids runs.
+    pub fn rows(&self, width: usize) -> usize {
+        if self.row0_drafts { width } else { width + 1 }
     }
 
     /// Every field's own check, a named error per field.
     pub fn check(&self) -> Result<(), DsparkError> {
-        if self.block < 2 {
+        if self.ids_per_block() == 0 {
             return Err(DsparkError::Block(self.block));
         }
         if self.taps.is_empty() || self.taps.windows(2).any(|w| w[0] >= w[1]) {
@@ -196,6 +213,7 @@ mod tests {
     fn shape(block: usize, vocab: DraftVocab) -> DsparkShape {
         DsparkShape {
             block,
+            row0_drafts: true,
             taps: vec![2, 10, 20, 30, 37],
             hidden: 2048,
             vocab,
@@ -212,7 +230,14 @@ mod tests {
         assert_eq!(shape(8, full.clone()).width(8), 7);
         assert_eq!(shape(15, full.clone()).width(8), 7);
         assert_eq!(shape(5, full.clone()).width(2), 1);
-        assert_eq!(shape(5, full).width(8), 4);
+        assert_eq!(shape(5, full.clone()).width(8), 5);
+        assert_eq!(shape(5, full.clone()).rows(3), 3);
+        let mut anchor = shape(5, full);
+        anchor.row0_drafts = false;
+        assert_eq!(anchor.width(8), 4);
+        assert_eq!(anchor.rows(3), 4);
+        anchor.block = 1;
+        assert_eq!(anchor.check(), Err(DsparkError::Block(1)));
     }
 
     #[test]
@@ -240,8 +265,8 @@ mod tests {
         );
         assert_eq!(ok.check(), Ok(()));
         assert_eq!(
-            shape(1, DraftVocab::Full { n: 16 }).check(),
-            Err(DsparkError::Block(1))
+            shape(0, DraftVocab::Full { n: 16 }).check(),
+            Err(DsparkError::Block(0))
         );
         let mut taps = ok.clone();
         taps.taps = vec![3, 3];
