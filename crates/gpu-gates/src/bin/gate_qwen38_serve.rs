@@ -3284,18 +3284,15 @@ mod gate {
             .count();
         let qsa = inputs.spec.layers.len() - gdn;
         let state = |n: usize| seq_positional_bytes(qsa, n) + 2 * checkpoint_bytes(gdn);
+        // The prompt cache's halving ladder, derived here apart from the
+        // seat's: `from`, then `from >> k` rounded down to the step and raised
+        // to the base, the first rung whose state the budget holds; the base
+        // when none does.
         let cache_ctx = |from: usize| {
-            let mut lo = 1;
-            let mut hi = from;
-            while lo < hi {
-                let mid = lo + (hi - lo).div_ceil(2);
-                if state(mid) <= ram {
-                    lo = mid;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            (lo / CTX_STEP * CTX_STEP).max(lo.min(CTX_STEP))
+            std::iter::once(from)
+                .chain((1..usize::BITS).map(|k| ((from >> k) / CTX_STEP * CTX_STEP).max(CTX)))
+                .find(|&n| n <= CTX || state(n) <= ram)
+                .unwrap_or(CTX)
         };
         // The plan's floor for the PLE table's tier counts the state the cache
         // saves ([`PlanInputs::seq_state_bytes`]): the engine's `seq38_bytes`,
@@ -3317,20 +3314,33 @@ mod gate {
         // The cache rule's ram is the line's, read at the served context; the
         // derivation holds it at every context, exact where the cap binds as at
         // this server's plan.
-        let (want_rule, want_ctx) = if fit < CTX {
-            ("card", fit)
-        } else {
-            let word = match margin_ctx {
-                c if c == CTX => "base",
-                c if c == fit => "fit",
-                _ => "margin",
-            };
-            if ram == 0 || state(margin_ctx) <= ram {
-                (word, margin_ctx)
+        // The host room's veto (`host`): the base stands where the card's
+        // context `margin_ctx` past it does not plan within the margin at the
+        // room read (the clause below holds the card's context to the card's
+        // plans); a unified pool's rung (`pool`): a rung of the halving
+        // ladder from the cap, `cap >> k` rounded down to the step, never
+        // under the base.
+        let (want_rule, want_ctx) =
+            if rule.as_str() == "host" && margin_ctx > CTX && here != Some(true) {
+                ("host", CTX)
+            } else if rule.as_str() == "pool"
+                && (0..usize::BITS).any(|k| ctx == ((cap >> k) / CTX_STEP * CTX_STEP).max(CTX))
+            {
+                ("pool", ctx)
+            } else if fit < CTX {
+                ("card", fit)
             } else {
-                ("cache", cache_ctx(margin_ctx))
-            }
-        };
+                let word = match margin_ctx {
+                    c if c == CTX => "base",
+                    c if c == fit => "fit",
+                    _ => "margin",
+                };
+                if ram == 0 || state(margin_ctx) <= ram {
+                    (word, margin_ctx)
+                } else {
+                    ("cache", cache_ctx(margin_ctx))
+                }
+            };
         println!(
             "ctx: the gate's plans: within the margin at {margin_ctx} {here:?}, at {} {past:?}, fit \
              {fit} {at_fit:?}, past it {past_fit:?}; the serving cap {cap} ({}); the default the \
@@ -3370,9 +3380,13 @@ mod gate {
                 } else {
                     fit == cap
                 })
-                && here == Some(true)
+                // The context the host room vetoed (`host`) is the one whose
+                // plan at the room read is not within; a rung (`pool`) is not
+                // the last multiple of the step within.
+                && (here == Some(true)) != (rule.as_str() == "host")
                 && margin_ctx <= fit
                 && (margin_ctx == fit
+                    || rule.as_str() == "pool"
                     || (margin_ctx.is_multiple_of(CTX_STEP) && past != Some(true))),
         );
         // PIN(2026-10-07): the refusal arm's server takes one slot — a set

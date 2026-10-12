@@ -49,12 +49,21 @@ use gguf::Split;
 use model::arch::qwen3moe::place::{self as q3, card_routed};
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
-use model::placement::ctx::{ExpertBytes, SlotCtx, default_slot_ctx, default_slot_ctx_by_card};
-use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE, HostRead};
+use model::placement::ctx::{
+    ExpertBytes, SlotCtx, Veto, default_slot_ctx, default_slot_ctx_by_card,
+};
+use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
     self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
     WholeLoad, WholeNeed,
 };
+
+#[allow(
+    clippy::duplicate_mod,
+    reason = "the serving binary compiles both seats that plan a qwen35moe file, each including this one file"
+)]
+#[path = "plan_room.rs"]
+mod plan_room;
 
 /// The census readings this module took and the probes its context searches
 /// ran, since the process began: a caller reads them around a search
@@ -147,21 +156,14 @@ enum Inputs {
 }
 
 impl Inputs {
-    /// These inputs with the host room unbounded (`HostRead::Given` of every
-    /// byte), for the file whose plan reads a room: the plan they make pages
-    /// no expert to the NVMe tier, so what it holds on the card is the card's
+    /// These inputs with the host room unbounded ([`plan_room::unbounded`]),
+    /// for the file whose plan reads a room: the plan they make pages no
+    /// expert to the NVMe tier, so what it holds on the card is the card's
     /// alone. `None` for a qwen3moe file, whose plan reads no room.
     fn room_free(&self) -> Option<Inputs> {
         match self {
             Inputs::Qwen3(_) => None,
-            Inputs::Qwen35(i) => Some(Inputs::Qwen35(Box::new(q35::PlanInputs {
-                hp: i.hp.clone(),
-                model: i.model.clone(),
-                spec: i.spec.clone(),
-                kv: i.kv.clone(),
-                room: (u64::MAX, HostRead::Given),
-                arena: i.arena,
-            }))),
+            Inputs::Qwen35(i) => Some(Inputs::Qwen35(Box::new(plan_room::unbounded(i)))),
         }
     }
 }
@@ -938,13 +940,17 @@ struct Sizing<'a> {
 /// plan on the probe's card, whose card and NVMe expert bytes the margin
 /// counts.
 ///
-/// The card decides and the host room only vetoes: a qwen35moe file's placed
+/// The card decides and the host room only vetoes, by the placement's fact on
+/// how far ([`Veto::of`] of the probe's machine): a qwen35moe file's placed
 /// plan reads a room, so it is probed a second time at an unbounded one
-/// ([`Inputs::room_free`]). The two other loads read none and are one probe
-/// for both terms (`default_slot_ctx`, the same answer at half the probes):
-/// a qwen3moe plan has no NVMe tier, and the whole load's verdict is a
-/// whole-load fit, which on a machine whose card shares the host's memory is
-/// the room itself — a named exception, not an unbounded room.
+/// ([`Inputs::room_free`]). The two other loads read none: a qwen3moe plan has
+/// no NVMe tier, and the whole load's verdict is a whole-load fit. Where each
+/// card has memory of its own they are one probe for both terms
+/// (`default_slot_ctx`, the same answer at half the probes). Where the card
+/// shares the host's memory (a unified pool) the pool is their room, the
+/// verdict and the plan are refused where it cannot hold them, and the ladder
+/// reads the one probe: every answer is a rung of the halving ladder from the
+/// cap.
 fn default_over(
     probe: &PlaceQ3,
     (cap, rule): (usize, SlotRule),
@@ -974,17 +980,23 @@ fn default_over(
     } else {
         probe.inputs.room_free()
     };
-    let slot = match &free {
-        Some(free) => {
+    let veto = Veto::of(&probe.machine);
+    let slot = match (&free, veto) {
+        (Some(free), _) => {
             let card = |ctx: usize| -> Result<ExpertBytes, GateError> {
                 probed();
                 let total = ctx.saturating_mul(slots);
                 let machine = probe.machine_at((sizing.arena)(total)?, u64::try_from(ctx)?)?;
                 expert_bytes_of(free, &machine, total, levers)
             };
-            default_slot_ctx_by_card(cap, rule.base, rule.step, rule.margin, &card, &held)?
+            default_slot_ctx_by_card(cap, rule.base, rule.step, rule.margin, veto, &card, &held)?
         }
-        None => default_slot_ctx(cap, rule.base, rule.step, rule.margin, &held)?,
+        // No room to read: the ladder asks no card, the other machine's rule
+        // is the one probe.
+        (None, Veto::Ladder) => {
+            default_slot_ctx_by_card(cap, rule.base, rule.step, rule.margin, veto, &held, &held)?
+        }
+        (None, Veto::Binary) => default_slot_ctx(cap, rule.base, rule.step, rule.margin, &held)?,
     };
     Ok(Defaulted {
         slot,

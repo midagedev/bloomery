@@ -63,11 +63,16 @@
 //! vetoes it: where the plan at the room read pages no expert at 2048, that
 //! context stands only if the plan at the room read pages none there either,
 //! else the answer is 2048 (the `host` word), so a reading of the room never
-//! picks a depth between; where that plan pages already, the context is the
-//! largest that holds no more than a hundredth of the plan at 2048's missed
-//! NVMe expert bytes more. A `ctx` line on stderr names the rule (`card`,
-//! `base`, `fit`, `margin` or `host`), the chosen context, the slots and
-//! their total, the cap, the fit and the margin. Set, the flag
+//! picks a depth between; on a machine whose card allocates from the host's
+//! memory (`Machine.unified`) the pool is the card's room too, so the answer
+//! is instead the first rung of the halving ladder from the cap down to 2048
+//! whose plan at the room read stands, is within the margin and pages nothing
+//! past the base's (the `pool` word below the cap's rung); where that plan
+//! pages already, the context is the largest that holds no more than a
+//! hundredth of the plan at 2048's missed NVMe expert bytes more. A `ctx`
+//! line on stderr names the rule (`card`, `base`, `fit`, `margin`, `host` or
+//! `pool`), the chosen context, the slots and their total, the cap, the fit
+//! and the margin. Set, the flag
 //! is the total and each slot takes `total / N` positions rounded down
 //! (llama-server's `-np N` without `-kvu`) under a set `--parallel N` —
 //! alone it is one request's context, one slot at the whole of it
@@ -285,7 +290,7 @@ use model::arch::glm5next::place::{
     KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlaceError, PlanInputs, refusal_text,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::ctx::{ExpertBytes, SlotCtx, default_slot_ctx_by_card};
+use model::placement::ctx::{ExpertBytes, SlotCtx, Veto, default_slot_ctx_by_card};
 use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, HostRead, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
@@ -456,7 +461,8 @@ fn draft_of(
 /// [`ORACLE_POSITIONS`] (`placement::ctx::default_slot_ctx_by_card`: [`CTX`]
 /// a slot, the largest multiple of [`CTX_STEP`] within [`MARGIN`] of
 /// stage-card expert bytes), the card deciding it over a plan at an unbounded
-/// host room ([`room_free`]) and the plan at the room read only vetoing it.
+/// host room ([`room_free`]) and the plan at the room read only vetoing it,
+/// by the placement's fact on how far ([`Veto::of`] of the machine).
 /// The searches are planning-time only: one plan a probe of the bisections,
 /// none past the cap. A card whose plan stands nowhere, not even at one
 /// position a slot, refuses by name here, as the load's own plan would.
@@ -485,12 +491,13 @@ fn ctx_of(
     let expert_bytes = |ctx: usize| bytes_over(inputs, ctx);
     let free = room_free(inputs);
     let card_bytes = |ctx: usize| bytes_over(&free, ctx);
+    let veto = Veto::of(&machine_at(u64::try_from(CTX)?)?);
     let cap = inputs
         .hp
         .n_ctx_train
         .min(usize::try_from(ORACLE_POSITIONS)?);
     let mut rule =
-        default_slot_ctx_by_card(cap, CTX, CTX_STEP, MARGIN, &card_bytes, &expert_bytes)?;
+        default_slot_ctx_by_card(cap, CTX, CTX_STEP, MARGIN, veto, &card_bytes, &expert_bytes)?;
     if let Some(ctx) = set {
         rule.ctx = ctx;
         rule.rule = "set";
@@ -511,7 +518,8 @@ fn ctx_of(
 /// `inputs` with the host room unbounded (`HostRead::Given` of every byte):
 /// the plan it makes pages no expert to the NVMe tier, so what it holds on the
 /// card is the card's alone. A machine whose card shares the host's memory (a
-/// unified pool) has no such plan; the pool binds both probes alike.
+/// unified pool) has no such plan; the pool binds every probe alike, and the
+/// ladder ([`Veto::Ladder`]) does not ask this one.
 fn room_free(inputs: &PlanInputs) -> PlanInputs {
     PlanInputs {
         hp: inputs.hp.clone(),

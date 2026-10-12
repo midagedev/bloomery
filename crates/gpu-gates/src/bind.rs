@@ -753,8 +753,9 @@ pub struct CacheRam {
     /// Why the default budget is 0, named for the line's `why=` term: the
     /// reading left nothing past the need and the pool; the NVMe tier's
     /// split took the room; or the budget was under one saved state. `None`
-    /// for a budget above 0 and for a set one (`--cache-ram 0` is the
-    /// caller's own ask).
+    /// for a set one (`--cache-ram 0` is the caller's own ask) and for a
+    /// budget above 0, except one that holds no session at the context the
+    /// load serves ([`CacheRam::short_of`]).
     pub why: Option<String>,
 }
 
@@ -882,6 +883,28 @@ impl CacheRam {
             why: Some(format!(
                 "the default budget {} B is under one saved state's {entry} B: no prompt cache, \
                  every state recomputed",
+                self.ram
+            )),
+            ..self
+        }
+    }
+
+    /// This budget, one sequence state of `state` bytes at the `ctx` positions
+    /// a slot serves over it: kept, with a `why` naming both. The default
+    /// context never falls under the base for the budget's sake, and the cache
+    /// refuses a state over its whole budget and keeps the shorter ones it
+    /// holds, so a budget that holds no session at the base stays on for the
+    /// sessions it holds. A budget of 0 has its own `why`.
+    #[must_use]
+    pub fn short_of(self, ctx: usize, state: u64) -> CacheRam {
+        if self.ram == 0 || self.ram >= state {
+            return self;
+        }
+        CacheRam {
+            why: Some(format!(
+                "the budget {} B is under one session's state of {state} B at the {ctx} positions \
+                 a slot serves: the cache keeps the shorter sessions it holds and refuses the \
+                 longer ones",
                 self.ram
             )),
             ..self
@@ -4785,6 +4808,39 @@ mod tests {
                 .expect("the budget");
             let why = none.why.clone();
             let still = none.holding(u64::MAX);
+            assert_eq!((still.ram, still.why), (0, why));
+        }
+
+        /// A budget under the one session's state the load serves at is kept
+        /// and says so: `short_of` at one byte over the budget gives the same
+        /// budget with a `why=` naming both and the context, at the state's
+        /// own bytes (and for a budget of 0, which has its own `why`) it
+        /// changes nothing, and a set budget keeps its value with the `why`.
+        #[test]
+        fn a_budget_under_one_session_is_kept_and_named() {
+            let (need, pool) = (6_000u64, 1_000u64);
+            let available = need + pool + 100_000;
+            let at = |set: Option<u64>| {
+                CacheRam::at(set, (available, HostRead::Given), need, pool, (0, 0), 0)
+                    .expect("the budget")
+            };
+            let short = at(None).short_of(4096, 50_001);
+            assert_eq!(short.ram, 50_000, "the budget stays on");
+            let why = short.why.as_deref().expect("the shortfall is named");
+            assert!(
+                why.contains("budget 50000 B is under one session's state of 50001 B at the 4096"),
+                "{why}"
+            );
+            assert!(short.line().contains(" why="), "{}", short.line());
+            let held = at(None).short_of(4096, 50_000);
+            assert_eq!((held.ram, held.why.as_deref()), (50_000, None));
+            let set = at(Some(10)).short_of(4096, 11);
+            assert_eq!((set.ram, set.set), (10, true));
+            assert!(set.why.is_some(), "a set budget is named too");
+            let none = CacheRam::at(None, (need, HostRead::Given), need, pool, (0, 0), 0)
+                .expect("the budget");
+            let why = none.why.clone();
+            let still = none.short_of(4096, u64::MAX);
             assert_eq!((still.ram, still.why), (0, why));
         }
 

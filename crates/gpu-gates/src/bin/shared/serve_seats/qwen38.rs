@@ -51,12 +51,21 @@
 //! [`CTX`]. Where the plan at the room read pages no expert at [`CTX`], the
 //! card's context stands only if the plan at the room read pages none there
 //! either, else the answer is [`CTX`] (the `host` rule), so a reading of the
-//! room never picks a depth between the two. Where that plan pages already,
-//! the answer is the largest such context whose plan misses the arena on at
-//! most a hundredth of the base's missed expert bytes more
+//! room never picks a depth between the two; on a machine whose card
+//! allocates from the host's memory (`Machine.unified`) the pool is the
+//! card's room too, so the answer is instead the first rung of the halving
+//! ladder from the serving cap down to [`CTX`] whose plan at the room read
+//! stands and is within the margin and pages nothing past the base's (the
+//! `pool` rule below the cap's rung), and the reading moves it only where it
+//! crosses one rung's need (`placement::ctx::Veto`). Where that plan pages
+//! already, the answer is the largest such context whose plan misses the arena
+//! on at most a hundredth of the base's missed expert bytes more
 //! (`placement::ctx::NVME_SLACK_DIV`). The answer is also at most what lets
 //! one session's sequence state with its two recurrent copies fit the prompt
-//! cache's budget (one session's whole slot context can be saved). Set, a
+//! cache's budget (one session's whole slot context can be saved): the first
+//! rung of the halving ladder from the answer down to [`CTX`] that holds it,
+//! and [`CTX`] when none does (the `cache` line then names that its budget
+//! holds no session there; the cache keeps the shorter ones). Set, a
 //! total a slot's share of which passes the file's
 //! `context_length` (`place::serve_ctx`: YaRN scaling past it is not built),
 //! then one whose N-slot plan the card cannot hold beside the plan's dense
@@ -70,8 +79,8 @@
 //! ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`, `/props`'
 //! `engine.ctx_verified`), which bounds nothing. A `ctx` line on stderr names
 //! the rule (`card`, `base`, `fit`, `margin`, `host` where the host room
-//! vetoed the card's context, or `cache` where the prompt cache's budget
-//! lowered it), the slot context, the slots and the total they serve, the
+//! vetoed the card's context, `pool` where the unified pool's reading took a
+//! lower rung, or `cache` where the prompt cache's budget lowered it), the slot context, the slots and the total they serve, the
 //! cap, the largest context the card holds with its card expert bytes, and
 //! the largest whose plan holds at most the plan's own margin (`MARGIN`)
 //! fewer card expert bytes than the plan at [`CTX`] a slot (`margin_ctx`;
@@ -370,7 +379,9 @@ use model::arch::qwen35moe::place::{
     tier_batch,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::ctx::{ExpertBytes, Refused, SlotCtx, default_slot_ctx_by_card, fit_of};
+use model::placement::ctx::{
+    ExpertBytes, Refused, SlotCtx, Veto, default_slot_ctx_by_card, fit_of, within_cache,
+};
 use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN, host_available_read};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
@@ -384,6 +395,12 @@ use tokenizer::Tokenizer;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
 
+#[allow(
+    clippy::duplicate_mod,
+    reason = "the serving binary compiles both seats that plan a qwen35moe file, each including this one file"
+)]
+#[path = "../plan_room.rs"]
+mod plan_room;
 #[path = "../qwen38_place.rs"]
 mod q38place;
 #[path = "../qwen38_levers.rs"]
@@ -854,6 +871,21 @@ struct Plans<'a> {
 }
 
 impl Plans<'_> {
+    /// How far a default the host room vetoed falls on this placement's
+    /// machine ([`Veto::of`]), read at the base: the machine's card either
+    /// has memory of its own or shares the host's, whatever the context.
+    fn veto(&self) -> Result<Veto, GateError> {
+        let ub = ubatch_for(CTX)?;
+        let machine = self.place.machine(
+            self.inputs,
+            (u64::try_from(CTX)?, u64::try_from(ub)?),
+            self.experts,
+            self.mtp,
+            self.slots,
+        )?;
+        Ok(Veto::of(&machine))
+    }
+
     /// The plan's routed-expert bytes by tier at `ctx` positions a sequence
     /// serves — the stage card's and the NVMe tier's, what the default rule
     /// counts — or why no plan takes that context.
@@ -1003,8 +1035,8 @@ fn fit38(plans: &Plans<'_>) -> Result<usize, GateError> {
 /// ([`fit38`]), else refused by name; unset, the common rule's answer
 /// (`placement::ctx::default_slot_ctx_by_card`: [`CTX`] a slot, [`CTX_STEP`],
 /// a margin of `MARGIN` card expert bytes) over two probes of the same plan,
-/// the card's at an unbounded host room ([`room_free`]) and the load's at the
-/// room read. The prompt cache's bound comes after ([`Ctx38::host_bound`]).
+/// the card's at an unbounded host room ([`plan_room::unbounded`]) and the
+/// load's at the room read. The prompt cache's bound comes after ([`Ctx38::host_bound`]).
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
     let n = plans.slots;
     if let Some(c) = set {
@@ -1062,8 +1094,9 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
         };
     }
     // The card decides, the host room only vetoes: the plan at an unbounded
-    // room is the card's probe, the plan at the room read the veto's.
-    let free = room_free(plans.inputs);
+    // room is the card's probe, the plan at the room read the veto's. How far
+    // a veto falls is the placement's fact (`Veto::of`).
+    let free = plan_room::unbounded(plans.inputs);
     let card = Plans {
         inputs: &free,
         ..*plans
@@ -1073,27 +1106,12 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
         CTX,
         CTX_STEP,
         MARGIN,
+        plans.veto()?,
         &|c| card.expert_bytes(c),
         &|c| plans.expert_bytes(c),
     )
     .map_err(refusal38)?;
     Ok(Ctx38::Rule { found, slots: n })
-}
-
-/// `inputs` with the host room unbounded (`HostRead::Given` of every byte):
-/// the plan it makes pages no expert to the NVMe tier and keeps the PLE table
-/// on the host, so what it holds on the card is the card's alone. A machine
-/// whose card shares the host's memory (a unified pool) has no such plan; the
-/// pool binds both probes alike.
-fn room_free(inputs: &PlanInputs) -> PlanInputs {
-    PlanInputs {
-        hp: inputs.hp.clone(),
-        model: inputs.model.clone(),
-        spec: inputs.spec.clone(),
-        kv: inputs.kv.clone(),
-        room: (u64::MAX, HostRead::Given),
-        arena: inputs.arena,
-    }
 }
 
 impl Ctx38 {
@@ -1114,38 +1132,42 @@ impl Ctx38 {
         }
     }
 
-    /// A default bounded by the prompt cache too: one session's state at its
-    /// slot's context ([`seq38_state`]) fits the budget `ram_at` gives
-    /// there, when the cache is on ([`model::placement::ctx::within_cache`]:
-    /// a unified pool's need moves with the context, so the budget is read
-    /// at the context bounded, not at the one the rule read), and the plan's
-    /// bytes at the lowered context are `plans`' ([`Plans::expert_bytes`]).
-    /// A set context keeps its value, as does a default whose budget is 0 at
-    /// the rule's context (the cache is off: `--cache-ram 0`, or the NVMe
-    /// tier's split fills the room); a set budget too small for one
-    /// position's state is refused by name (a default one is 0 already,
-    /// [`CacheRam::holding`]).
+    /// A default bounded by the prompt cache too: the first rung of the
+    /// halving ladder from the rule's context down to [`CTX`] whose one
+    /// session's state at its slot's context ([`seq38_state`]) fits the
+    /// budget `ram_at` gives there, when the cache is on
+    /// ([`model::placement::ctx::within_cache`]: a unified pool's need moves
+    /// with the context, so the budget is read at the context bounded, not at
+    /// the one the rule read), and the plan's bytes at the lowered context are
+    /// `plans`' ([`Plans::expert_bytes`]). A set context keeps its value, as
+    /// does a default whose budget is 0 at the rule's context (the cache is
+    /// off: `--cache-ram 0`, or the NVMe tier's split fills the room); a set
+    /// budget too small for one position's state is refused by name (a
+    /// default one is 0 already, [`CacheRam::holding`]). The second term is
+    /// whether the budget holds one session at the context returned: false
+    /// when not even [`CTX`]'s does, which the cache line says
+    /// ([`CacheRam::short_of`]) — the cache keeps the shorter sessions it
+    /// holds.
     fn host_bound(
         self,
         plans: &Plans<'_>,
         ram_at: &dyn Fn(usize) -> Result<u64, GateError>,
         drafts: bool,
-    ) -> Result<Ctx38, GateError> {
+    ) -> Result<(Ctx38, bool), GateError> {
         let Ctx38::Rule { mut found, slots } = self else {
-            return Ok(self);
+            return Ok((self, true));
         };
         if ram_at(found.ctx)? == 0 {
-            return Ok(Ctx38::Rule { found, slots });
+            return Ok((Ctx38::Rule { found, slots }, true));
         }
         let state = |n: usize| seq38_state(plans.inputs, n, drafts);
-        let ctx = model::placement::ctx::within_cache(found.ctx, CTX_STEP, &state, ram_at)?;
-        if ctx == found.ctx {
-            return Ok(Ctx38::Rule { found, slots });
+        let bound = within_cache(found.ctx, CTX, CTX_STEP, &state, ram_at)?;
+        if bound.ctx != found.ctx {
+            found.ctx = bound.ctx;
+            found.rule = "cache";
+            found.chosen = plans.expert_bytes(bound.ctx)?;
         }
-        found.ctx = ctx;
-        found.rule = "cache";
-        found.chosen = plans.expert_bytes(ctx)?;
-        Ok(Ctx38::Rule { found, slots })
+        Ok((Ctx38::Rule { found, slots }, bound.holds))
     }
 
     /// The `ctx` line on stderr: the common rule's ([`SlotCtx::line`]); a
@@ -1670,12 +1692,18 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     let before = rule.ctx();
-    let rule = rule.host_bound(&live, &ram_at, mtp)?;
-    // The cache line names the need of the context the load serves at.
+    let (rule, holds) = rule.host_bound(&live, &ram_at, mtp)?;
+    // The cache line names the need of the context the load serves at, and
+    // that its budget holds no session there when it does not.
     let cache = if rule.ctx() == before {
         first
     } else {
         cache_of(live.host(rule.ctx(), set)?)?
+    };
+    let cache = if holds {
+        cache
+    } else {
+        cache.short_of(rule.ctx(), seq38_state(&inputs, rule.ctx(), mtp))
     };
     if paged_one {
         mtp_inputs = None;

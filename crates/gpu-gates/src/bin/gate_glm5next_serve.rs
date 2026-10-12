@@ -1017,7 +1017,10 @@ mod gate {
         };
         for (place, lines) in [("a", &a), ("bp", &bp), ("gate", &g)] {
             let named = ctx_line(lines).is_some_and(|(rule, ctx)| {
-                matches!(rule.as_str(), "base" | "margin" | "fit" | "card") && ctx >= CTX
+                matches!(
+                    rule.as_str(),
+                    "base" | "margin" | "fit" | "card" | "host" | "pool"
+                ) && ctx >= CTX
             });
             println!("--place {place}: a default ctx line, rule and context in {named}");
             check(&mut ok, "unset_plans_take_the_ctx_default", named);
@@ -1258,6 +1261,18 @@ mod gate {
                 "card" => ctx == fit && margin_ctx == fit && fit < CTX,
                 "margin" => ctx == margin_ctx && CTX < margin_ctx && margin_ctx < fit,
                 "fit" => ctx == fit && margin_ctx == fit && fit > CTX,
+                // The host room vetoed the card's context `margin_ctx` past
+                // the base: the base stands.
+                "host" => ctx == CTX && CTX < margin_ctx && margin_ctx <= fit,
+                // A unified machine's pool took a lower rung of the halving
+                // ladder from the cap: `cap >> k` rounded down to the step,
+                // never under the base.
+                "pool" => {
+                    ctx == margin_ctx
+                        && ctx <= fit
+                        && (0..usize::BITS)
+                            .any(|k| ctx == ((cap >> k) / CTX_STEP * CTX_STEP).max(CTX))
+                }
                 _ => false,
             },
         );
@@ -1274,9 +1289,13 @@ mod gate {
                 } else {
                     fit == cap
                 })
-                && here == Some(true)
+                // The context the host room vetoed (`host`) is the one whose
+                // plan at the room read is not within; a rung (`pool`) is
+                // not the last multiple of the step within.
+                && (here == Some(true)) != (rule == "host")
                 && margin_ctx <= fit
                 && (margin_ctx == fit
+                    || rule == "pool"
                     || (margin_ctx.is_multiple_of(CTX_STEP) && past != Some(true))),
         );
 

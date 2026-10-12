@@ -1828,19 +1828,26 @@ fn spark_plan<'a>(
 
 /// The seat's default context on a DGX Spark with no flag, both files, each
 /// at its own host reading (the census's free bytes, `MemAvailable`): the
-/// largest context whose sequence state the prompt cache's default budget
-/// holds, the budget read from the host need at the context bounded
-/// ([`within_cache`]) and the PLE table on the host only where it fits
-/// beside two saved states ([`super::row_table_tier`]).
+/// first rung of the halving ladder from the serving cap down to the base
+/// whose sequence state the prompt cache's default budget holds, the budget
+/// read from the host need at the rung bounded ([`within_cache`]) and the PLE
+/// table on the host only where it fits beside two saved states
+/// ([`super::row_table_tier`]).
 ///
 /// A unified pool counts the positions' bytes in the need (60,928 B a
 /// position across two slots, the draft's included), so a need read once at
 /// the untrimmed 262,144 gives a budget the bounded context does not have:
 /// the same chain with the budget read once there is the order the seat had,
-/// which the test also runs (UD-Q3 18,176, UD-Q4 134,400: the smaller file
-/// the smaller context). Read at the context bounded, UD-Q4 serves 198,144;
+/// which the test also runs (UD-Q3 16,384, UD-Q4 131,072: the smaller file
+/// the smaller context). Read at the rung bounded, UD-Q4 serves 131,072;
 /// UD-Q3 keeps its table on the NVMe tier, where the whole serving cap
 /// holds its state.
+///
+/// PIN(2026-10-12): the bound is the halving ladder, not the largest context
+/// that holds. UD-Q3's budget read once answered 18,176 and answers 16,384;
+/// UD-Q4's answered 134,400 and answers 131,072, and read at the context
+/// bounded 198,144 and now 131,072 (its need 112,495,484,208 B and budget
+/// 6,308,004,200 B there are now 108,408,921,392 B and 8,351,285,608 B).
 ///
 /// The draft's fixed card bytes are the term that closes each file's need at
 /// 262,144 [derived: the need less every other term]; UD-Q3's is 68,736 B
@@ -1861,7 +1868,7 @@ fn a_spark_defaults_to_the_context_its_prompt_cache_holds() {
             free: 125_309_718_528,
             room: 125_124_673_536,
             fixed: 2_839_606_572,
-            old: (18_176, 123_483_268_528, 820_702_504),
+            old: (16_384, 123_483_268_528, 820_702_504),
             new: (262_144, 95_220_001_200, CACHE_CAP, Device::Nvme),
         },
         File {
@@ -1869,8 +1876,8 @@ fn a_spark_defaults_to_the_context_its_prompt_cache_holds() {
             free: 125_394_333_696,
             room: 125_111_492_608,
             fixed: 2_839_537_836,
-            old: (134_400, 116_394_876_208, 4_358_308_200),
-            new: (198_144, 112_495_484_208, 6_308_004_200, Device::Nvme),
+            old: (131_072, 116_394_876_208, 4_358_308_200),
+            new: (131_072, 108_408_921_392, 8_351_285_608, Device::Nvme),
         },
     ];
     for f in files {
@@ -1910,7 +1917,9 @@ fn a_spark_defaults_to_the_context_its_prompt_cache_holds() {
         );
         assert_eq!(ram_of(old_need), ram, "q3 {}", f.q3);
         let once = |_: usize| Ok::<_, CtxError>(ram);
-        let got = within_cache(SPARK_FROM, CTX_STEP, &state, &once).expect("a context");
+        let got = within_cache(SPARK_FROM, SEAT_CTX, CTX_STEP, &state, &once)
+            .expect("a context")
+            .ctx;
         assert_eq!(
             got, ctx,
             "q3 {}: the budget read once at {SPARK_FROM}",
@@ -1920,7 +1929,9 @@ fn a_spark_defaults_to_the_context_its_prompt_cache_holds() {
         // After: both read at the context bounded, the table beside the floor.
         let (ctx, new_need, ram, table) = f.new;
         let at = |n: usize| Ok::<_, CtxError>(ram_of(need(n, true)));
-        let got = within_cache(SPARK_FROM, CTX_STEP, &state, &at).expect("a context");
+        let got = within_cache(SPARK_FROM, SEAT_CTX, CTX_STEP, &state, &at)
+            .expect("a context")
+            .ctx;
         assert_eq!(got, ctx, "q3 {}", f.q3);
         let (served, tier) = plan(ctx, true);
         assert_eq!(

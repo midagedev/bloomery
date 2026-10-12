@@ -28,16 +28,36 @@
 //! nothing, so the card clause alone decides), and keeps it only when the
 //! `probe` plan at `c*` also pages no more than the base's: the answer is
 //! `c*` or the base, both fixed by the card and the file, and the room enters
-//! through one comparison, at the host bytes `c*` needs past the base. A base
-//! that pages already (the room is under its need) or a card that holds
-//! under the base runs the one-probe rule ([`default_slot_ctx`]) over `probe`
-//! alone: there the room cancels out of a deeper context's extra missed
-//! bytes, which are its extra host need, so the answer does not ride it.
+//! through one comparison, at the host bytes `c*` needs past the base. That
+//! holds where the card has memory of its own ([`Veto::Binary`]). Where it
+//! allocates from the host's memory ([`Veto::Ladder`], the placement's
+//! `Machine.unified`) no answer of the card is independent of the room: the
+//! pool is the card's room, a plan the pool cannot hold is refused for the
+//! card too, and `c*` would ride the reading wherever the cap does not fit.
+//! There the answer is the first rung of the halving ladder from the cap
+//! (rounded down to the step) down to the base whose `probe` plan stands and
+//! is within the base's, so every answer is one of a few contexts fixed by the
+//! cap and the base, and the reading moves it only where it crosses one rung's
+//! need. A base that pages already (the room is under its need) or a card that
+//! holds under the base runs the one-probe rule ([`default_slot_ctx`]) over
+//! `probe` alone: there the room cancels out of a deeper context's extra
+//! missed bytes, which are its extra host need, so the answer does not ride
+//! it.
+//!
+//! The prompt cache's bound ([`within_cache`]) is the same class: its budget
+//! is half of what the host's reading leaves past the plan's need, so a bound
+//! that took the largest context whose sequence state holds the budget would
+//! ride the reading at every step. It takes the halving ladder too: the
+//! answer is the first rung, from the default down to the base, whose state
+//! holds the budget there, and it changes only where the budget crosses one
+//! rung's state.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt;
+
+use super::Machine;
 
 /// Why a slot count was refused.
 #[derive(Debug, thiserror::Error)]
@@ -46,22 +66,13 @@ pub enum CtxError {
     /// refuses it too, so no call can serve a count of no slot.
     #[error("--parallel 0: the server serves no slot")]
     NoSlot,
-    /// No context holds one sequence state in the prompt cache's budget:
-    /// at one position the state takes `state` bytes and the budget is
-    /// `ram`.
+    /// The prompt cache's budget holds no sequence state at all: at one
+    /// position the state takes `state` bytes and the budget is `ram`.
     #[error(
         "the prompt cache's {ram} bytes hold no sequence state ({state} bytes at one position, \
          two recurrent copies among its terms); --cache-ram 0 turns it off"
     )]
     NoCacheState { state: u64, ram: u64 },
-    /// The context the cache's bound rounded to does not hold its state: the
-    /// budget at `ctx` is under the `state` there, so the budget is not
-    /// monotone across the rounding.
-    #[error(
-        "the prompt cache's bound rounded to a context of {ctx} positions, whose state of \
-         {state} bytes passes the budget of {ram} bytes there"
-    )]
-    CacheRounding { ctx: usize, state: u64, ram: u64 },
 }
 
 /// The resident sequences a seat serves and what set the count, for its
@@ -309,13 +320,74 @@ fn scan<E>(
 pub const RULE_CARD: &str = "card";
 /// No multiple of the step past the base is within the margin.
 pub const RULE_BASE: &str = "base";
-/// The fit itself is within the margin.
+/// The fit itself is within the margin (under [`Veto::Ladder`], the ladder's
+/// top rung, the cap rounded down to the step, is).
 pub const RULE_FIT: &str = "fit";
 /// The margin binds: the largest multiple of the step within it.
 pub const RULE_MARGIN: &str = "margin";
 /// The host room vetoed the card's deeper context: its plan at the room read
 /// pages more than the base's does, or is refused, so the base stands.
 pub const RULE_HOST: &str = "host";
+/// The unified pool's reading took a lower rung of the halving ladder than the
+/// top one ([`Veto::Ladder`]), the base itself the lowest.
+pub const RULE_POOL: &str = "pool";
+
+/// How far a default the host room vetoed falls ([`default_slot_ctx_by_card`]):
+/// the placement's fact, never a model's ([`Veto::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Veto {
+    /// The card has memory of its own: the card's context stands whole or the
+    /// base is the answer ([`RULE_HOST`]).
+    Binary,
+    /// The card allocates from the host's memory (`Machine.unified`): the
+    /// pool is the card's room, so a card answer independent of the room does
+    /// not exist (a plan the pool cannot hold is refused for the card too).
+    /// The answer is the first rung of the halving ladder ([`rungs`]) from
+    /// the cap that the plan at the room read holds ([`RULE_POOL`] below the
+    /// cap's), and the card probe is not asked.
+    Ladder,
+}
+
+impl Veto {
+    /// The veto of `machine`: the ladder where its card shares the host's
+    /// memory, the one comparison where each card has memory of its own. The
+    /// one owner of the mapping: a seat hands its machine over and picks no
+    /// word.
+    #[must_use]
+    pub fn of(machine: &Machine) -> Veto {
+        if machine.unified.is_some() {
+            Veto::Ladder
+        } else {
+            Veto::Binary
+        }
+    }
+}
+
+/// The halving ladder from `from` down to `floor` (`floor <= from`): `from`
+/// first, then `from >> k` for `k = 1, 2, …` rounded down to a multiple of
+/// `step` and raised to `floor` when under it, ending at the first rung equal
+/// to `floor`; a rung equal to the last is skipped. `from == floor` is the one
+/// rung. The `k`-th rung is under half the last until the floor, so the ladder
+/// has `⌈log2(from / floor)⌉ + 1` rungs at most.
+///
+/// # Panics
+/// On a `step` of 0, or a `floor` over `from`.
+fn rungs(from: usize, floor: usize, step: usize) -> Vec<usize> {
+    assert!(step > 0, "a context step of 0");
+    assert!(floor <= from, "a ladder floor {floor} over its top {from}");
+    let mut out = vec![from];
+    let mut last = from;
+    let mut k = 1;
+    while last > floor {
+        let rung = ((from >> k) / step * step).max(floor);
+        if rung < last {
+            out.push(rung);
+            last = rung;
+        }
+        k += 1;
+    }
+    out
+}
 
 /// What [`default_slot_ctx`] chose and the terms it chose by: a seat prints
 /// them as one line ([`SlotCtx::line`]).
@@ -327,8 +399,8 @@ pub struct SlotCtx {
     /// below as they are.
     pub ctx: usize,
     /// What set it: [`RULE_CARD`], [`RULE_BASE`], [`RULE_FIT`],
-    /// [`RULE_MARGIN`] or [`RULE_HOST`], or the seat's own word for a bound it
-    /// applied.
+    /// [`RULE_MARGIN`], [`RULE_HOST`] or [`RULE_POOL`], or the seat's own word
+    /// for a bound it applied.
     pub rule: &'static str,
     /// The most a slot may take, as the seat's model gives it (the trained
     /// context, capped where the engine's is).
@@ -340,6 +412,8 @@ pub struct SlotCtx {
     pub fit_bytes: ExpertBytes,
     /// The scan's answer: `ctx` as the rule returns it, except under
     /// [`RULE_HOST`], where it is the card's context the host room vetoed.
+    /// Under [`Veto::Ladder`] no card context exists beside the answer, and
+    /// it is `ctx`.
     pub margin_ctx: usize,
     /// The context the margin counts against, `base` or `fit` when that is
     /// fewer, and its plan's bytes at the room read.
@@ -490,6 +564,68 @@ impl Rule {
     }
 }
 
+impl Rule {
+    /// The answer where the base stands at the read room and pages nothing on
+    /// a machine whose card shares the host's memory ([`Veto::Ladder`]): the
+    /// first rung of the halving ladder from the cap (rounded down to the
+    /// step, at least the base) down to the base whose `probes` plan stands
+    /// and is within the base's. The card is not asked. A rung above the fit
+    /// is refused without a probe (a refused plan stays refused as the context
+    /// deepens). The word: [`RULE_FIT`] at the top rung ([`RULE_BASE`] when
+    /// that is the base), [`RULE_POOL`] at every rung below it, the base
+    /// included.
+    fn ladder<E>(
+        self,
+        probes: &Probes<'_, E>,
+        (fit, fit_bytes): (usize, ExpertBytes),
+        at_base: ExpertBytes,
+    ) -> SlotCtx {
+        let Rule {
+            cap,
+            base,
+            step,
+            margin,
+        } = self;
+        let mut answer = (0, base, at_base);
+        for (i, rung) in rungs((cap / step * step).max(base), base, step)
+            .into_iter()
+            .enumerate()
+        {
+            let held = if rung > fit {
+                None
+            } else {
+                probes
+                    .at(rung)
+                    .ok()
+                    .filter(|plan| plan.within(at_base, margin))
+            };
+            if let Some(plan) = held {
+                answer = (i, rung, plan);
+                break;
+            }
+        }
+        let (i, ctx, chosen) = answer;
+        let rule = match i {
+            0 if ctx == base => RULE_BASE,
+            0 => RULE_FIT,
+            _ => RULE_POOL,
+        };
+        SlotCtx {
+            ctx,
+            rule,
+            cap,
+            fit,
+            fit_bytes,
+            margin_ctx: ctx,
+            base_ctx: base,
+            base: at_base,
+            chosen,
+            margin,
+            nvme_bound: at_base.nvme_bound(),
+        }
+    }
+}
+
 /// The context a slot takes when the flag names none, over one probe, every
 /// number a slot's: `fit` ([`fit_of`] up to `cap`) when it is under `base`
 /// ([`RULE_CARD`]: the card holds fewer than a base context), else the
@@ -553,7 +689,8 @@ pub fn default_slot_ctx<E>(
 
 /// The context a slot takes when the flag names none, decided by the card:
 /// the host room may veto it, never choose it. Two probes plan a context: `card`
-/// at an unbounded host room and `probe` at the room read.
+/// at an unbounded host room and `probe` at the room read. `veto` is the
+/// placement's fact ([`Veto::of`]).
 ///
 /// 1. `probe`'s fit and its plan at the base come first, as in
 ///    [`default_slot_ctx`]. If `probe` holds fewer than a base context
@@ -562,10 +699,20 @@ pub fn default_slot_ctx<E>(
 ///    context's extra missed bytes are its extra host need and the room
 ///    cancels out of the miss clause), the answer is [`default_slot_ctx`]'s
 ///    over `probe` alone.
-/// 2. Otherwise the base stands at the room read and pages nothing. `card`'s
-///    fit is taken; if the card holds under the base the answer is again
-///    [`default_slot_ctx`]'s over `probe`.
-/// 3. Otherwise `c*` is [`default_slot_ctx`]'s scan over `card` (the fit and
+/// 2. Otherwise the base stands at the room read and pages nothing. Under
+///    [`Veto::Ladder`] the card is not asked: the machine's card allocates
+///    from the host's memory, a plan its pool cannot hold is refused for the
+///    card too, so a card context independent of the room does not exist, and
+///    the answer is the first rung of the halving ladder from the cap (rounded
+///    down to the step) down to the base whose `probe` plan stands and is
+///    within the base's, no expert byte missed past it and no more than the
+///    margin of card expert bytes lost ([`ExpertBytes::within`]): the top
+///    rung is [`RULE_FIT`] ([`RULE_BASE`] when it is the base), a lower one
+///    [`RULE_POOL`]. Every answer is a context the cap and the base fix, and
+///    the reading moves it only where it crosses one rung's need.
+/// 3. Under [`Veto::Binary`] `card`'s fit is taken; if the card holds under
+///    the base the answer is again [`default_slot_ctx`]'s over `probe`.
+/// 4. Otherwise `c*` is [`default_slot_ctx`]'s scan over `card` (the fit and
 ///    the margin from `card`; its plan pages nothing, so the card clause
 ///    alone decides). When `c*` is the base the answer is the base
 ///    ([`RULE_BASE`]). Else the `probe` plan at `c*` must stand and be within
@@ -574,21 +721,24 @@ pub fn default_slot_ctx<E>(
 ///    [`RULE_MARGIN`]), else the base ([`RULE_HOST`], `c*` kept as
 ///    [`SlotCtx::margin_ctx`]).
 ///
-/// Stable by construction: in step 3 the answer is the base or `c*`, both
+/// Stable by construction: in step 4 the answer is the base or `c*`, both
 /// fixed by the card and the file; the room enters through one comparison, at
 /// `need(c*) - need(base)`, so a reading's noise changes the answer only when
 /// the reading falls within that noise of that one threshold. A host whose
 /// slack lies between 0 and that threshold gets the base, where
 /// [`default_slot_ctx`] gave it an intermediate depth that moved with the
-/// reading.
+/// reading. In step 2 the answer is a rung, and the reading's noise changes it
+/// only within that noise of one rung's need, of which there are `⌈log2(cap /
+/// base)⌉ + 1`.
 ///
-/// `fit` and `fit_bytes` are `card`'s in step 3. Each probe plans a context at
-/// most once, and `card` is asked only in steps 2 and 3. A plan that reads no
-/// room gets [`default_slot_ctx`]'s answer from this form too (the same plan
-/// as `card` and `probe`), at twice the probes.
+/// `fit` and `fit_bytes` are `card`'s in step 4 and `probe`'s in step 2. Each
+/// probe plans a context at most once, and `card` is asked only in steps 3 and
+/// 4. A plan that reads no room gets [`default_slot_ctx`]'s answer from this
+/// form too under [`Veto::Binary`] (the same plan as `card` and `probe`), at
+/// twice the probes.
 ///
 /// # Errors
-/// [`Refused`] as [`default_slot_ctx`]'s over `probe`; in steps 2 and 3 also
+/// [`Refused`] as [`default_slot_ctx`]'s over `probe`; in steps 3 and 4 also
 /// `card`'s refusal at 1 or at the base while `probe`'s base stands (the
 /// probes disagree: a room cannot make a plan stand).
 ///
@@ -599,6 +749,7 @@ pub fn default_slot_ctx_by_card<E>(
     base: usize,
     step: usize,
     margin: u64,
+    veto: Veto,
     card: &dyn Fn(usize) -> Result<ExpertBytes, E>,
     probe: &dyn Fn(usize) -> Result<ExpertBytes, E>,
 ) -> Result<SlotCtx, Refused<E>> {
@@ -613,6 +764,9 @@ pub fn default_slot_ctx_by_card<E>(
     let (fit, fit_bytes) = fit_probed(cap, &probes)?;
     let at_base = probes.named(base.min(fit))?;
     if fit >= base && at_base.miss() == 0 {
+        if veto == Veto::Ladder {
+            return Ok(rule.ladder(&probes, (fit, fit_bytes), at_base));
+        }
         let cards = Probes::new(card);
         let (card_fit, card_fit_bytes) = fit_probed(cap, &cards)?;
         if card_fit >= base {
@@ -622,31 +776,63 @@ pub fn default_slot_ctx_by_card<E>(
     Ok(rule.over(&probes, (fit, fit_bytes), at_base))
 }
 
+/// What the prompt cache's bound left of a default ([`within_cache`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheBound {
+    /// The context a slot takes.
+    pub ctx: usize,
+    /// Whether the cache's budget holds one sequence state at `ctx`. False
+    /// only when no rung holds and `ctx` is the ladder's floor: the cache
+    /// keeps the sessions it holds, which are shorter than `ctx`, and refuses
+    /// the longer ones (a state over the whole budget is refused).
+    pub holds: bool,
+}
+
 /// The context a default keeps when the prompt cache must hold one sequence
-/// state there: `from` when its `state` fits the budget `ram_at` gives at
-/// `from`, else the largest context under `from` that holds, rounded down
-/// to a multiple of `step` (a context under `step` is its own). The budget
-/// is read at the context it bounds, not at `from`: a plan's host need
-/// moves with the context (a unified pool counts the positions' bytes, a
-/// split moves experts), so the budget a smaller context leaves is larger.
-/// `from` is tried first and alone: the budget is not monotone where the
-/// plan's tables change tier, and a search that skipped it could pass a
-/// holding `from` for a smaller context. The rounding keeps the bound: the
-/// returned context holds, checked after it.
+/// state there: the first rung of the halving ladder from `from` down to
+/// `base` whose `state` fits the budget `ram_at` gives at that rung ([`rungs`]:
+/// `from`, then `from >> k` rounded down to a multiple of `step` and raised to
+/// `base`). When no rung holds the answer is the floor, `base` (or `from`
+/// when that is under it), with [`CacheBound::holds`] false: the cache keeps
+/// the shorter sessions its budget holds and the caller says so. The budget
+/// is read at the rung it bounds, not at `from`: a plan's host need moves
+/// with the context (a unified pool counts the positions' bytes, a split
+/// moves experts), so the budget a smaller context leaves is larger. `from` is
+/// tried first and alone: the budget is not monotone where the plan's tables
+/// change tier, and a search that skipped it could pass a holding `from` for
+/// a smaller context.
+///
+/// Why a ladder: the largest context holding the budget changes at every
+/// multiple of `step` the budget crosses, so a reading of the host's available
+/// bytes that moves by `D` moves the answer by `D / 2` over one step's state,
+/// wherever the budget sits. With the ladder the answer changes only where the
+/// budget crosses the state of one rung, so it is constant between two
+/// consecutive rungs' states, and a reading that moves by `D` moves it only
+/// within `D` of one of those few budgets (one per rung, each rung half the
+/// last). The floor is the base and not `from`: a run with less memory never
+/// gets a deeper context (a floor at `from` would jump between the base and
+/// `from` across one budget).
 ///
 /// # Errors
-/// [`CtxError::NoCacheState`] when not even one position's state holds;
-/// [`CtxError::CacheRounding`] when the rounded context does not hold; the
-/// first error `ram_at` returns.
+/// [`CtxError::NoCacheState`] when not even one position's state holds and no
+/// rung does; the first error `ram_at` returns.
+///
+/// # Panics
+/// On a `step` or a `base` of 0.
 pub fn within_cache<E: From<CtxError>>(
     from: usize,
+    base: usize,
     step: usize,
     state: &dyn Fn(usize) -> u64,
     ram_at: &dyn Fn(usize) -> Result<u64, E>,
-) -> Result<usize, E> {
+) -> Result<CacheBound, E> {
+    assert!(base > 0, "a base context of 0");
     let holds = |n: usize| Ok::<_, E>(state(n) <= ram_at(n)?);
-    if holds(from)? {
-        return Ok(from);
+    let floor = base.min(from);
+    for ctx in rungs(from, floor, step) {
+        if holds(ctx)? {
+            return Ok(CacheBound { ctx, holds: true });
+        }
     }
     if !holds(1)? {
         return Err(CtxError::NoCacheState {
@@ -655,17 +841,10 @@ pub fn within_cache<E: From<CtxError>>(
         }
         .into());
     }
-    let c = largest(1, from.saturating_sub(1), holds)?;
-    let ctx = (c / step * step).max(c.min(step));
-    if !holds(ctx)? {
-        return Err(CtxError::CacheRounding {
-            ctx,
-            state: state(ctx),
-            ram: ram_at(ctx)?,
-        }
-        .into());
-    }
-    Ok(ctx)
+    Ok(CacheBound {
+        ctx: floor,
+        holds: false,
+    })
 }
 
 /// The search a seat's whole-card and placed defaults run over the context
@@ -793,12 +972,16 @@ mod tests {
         assert_eq!(refused, Err("refused"), "a probe's error is the search's");
     }
 
-    /// The cache guard's rows: `from` when its state holds there, else the
-    /// largest context whose state holds the budget there — the budget
+    /// The cache guard's rows: the first rung of the halving ladder from
+    /// `from` down to the base whose state holds the budget there, the budget
     /// shrinking with the context as a unified pool's need grows with it —
-    /// rounded down to the step, a context under the step its own; a budget
-    /// that does not move with the context (`--cache-ram`) is the plain
-    /// bound; and a search no longer than a halving takes.
+    /// each rung `from >> k` rounded down to the step, a rung under the base
+    /// the base — and a budget that does not move with the context
+    /// (`--cache-ram`) the plain bound; each answer within a probe per rung.
+    /// PIN(2026-10-12): the rows (199, 1), (199, 16) and (400, 256) answered
+    /// 198, 192 and 198, the largest context that holds, and answer rungs now
+    /// (99, 96 and 16); the constant budget's rows (262,144 and 31, step 256)
+    /// answered 30, the largest context that holds, and answer the base 16.
     #[test]
     fn within_cache_rows() {
         let state = |n: usize| 3 * n as u64 + 10;
@@ -807,10 +990,10 @@ mod tests {
         let rows: [(usize, usize, usize); 6] = [
             (150, 16, 150),
             (198, 16, 198),
-            (199, 1, 198),
-            (199, 16, 192),
+            (199, 1, 99),
+            (199, 16, 96),
             (400, 16, 192),
-            (400, 256, 198),
+            (400, 256, 16),
         ];
         for (from, step, want) in rows {
             let probes = Count::new();
@@ -818,48 +1001,107 @@ mod tests {
                 probes.take();
                 shrinking(n)
             };
-            let got = within_cache(from, step, &state, &counted).expect("a context");
-            assert_eq!(got, want, "from {from}, step {step}");
-            assert!(state(got) <= 1000 - 2 * got as u64);
+            let got = within_cache(from, 16, step, &state, &counted).expect("a context");
+            assert_eq!(
+                got,
+                CacheBound {
+                    ctx: want,
+                    holds: true
+                },
+                "from {from}, step {step}"
+            );
+            assert!(state(got.ctx) <= 1000 - 2 * got.ctx as u64);
+            assert!(
+                probes.0.get() <= rungs(from, 16.min(from), step).len(),
+                "from {from}, step {step}: {} probes",
+                probes.0.get()
+            );
         }
-        // A constant budget of 100 B holds through 30 positions; a context
-        // under the step is its own.
+        // A constant budget of 100 B holds through 30 positions. A `from`
+        // that holds is its own; over it the base 16 holds (58 B) and is the
+        // first rung that does; over the base 64 no rung holds (202 B), and
+        // the base is the answer with the budget's say that it holds none.
         let constant = |_: usize| Ok::<_, Box<dyn std::error::Error>>(100u64);
+        let kept = |ctx| CacheBound { ctx, holds: true };
+        for (from, base, want) in [
+            (30, 16, kept(30)),
+            (262_144, 16, kept(16)),
+            (31, 16, kept(16)),
+            (10, 16, kept(10)),
+            (
+                262_144,
+                64,
+                CacheBound {
+                    ctx: 64,
+                    holds: false,
+                },
+            ),
+        ] {
+            let got = within_cache(from, base, 256, &state, &constant).expect("a context");
+            assert_eq!(got, want, "from {from}, base {base}");
+        }
+    }
+
+    /// The ladder's rungs: `from`, then `from >> k` rounded down to a multiple
+    /// of the step and raised to the floor, ending at the first rung equal to
+    /// the floor; the trained 262,144 over 4096 in steps of 256 is the seven
+    /// powers of two, and a top under twice the floor is two rungs.
+    #[test]
+    fn rungs_rows() {
         assert_eq!(
-            within_cache(262_144, 256, &state, &constant).expect("a context"),
-            30
+            rungs(262_144, 4096, 256),
+            [262_144, 131_072, 65_536, 32_768, 16_384, 8192, 4096]
         );
         assert_eq!(
-            within_cache(30, 256, &state, &constant).expect("a context"),
-            30
+            rungs(196_608, 4096, 256),
+            [196_608, 98_304, 49_152, 24_576, 12_288, 6144, 4096]
         );
+        assert_eq!(rungs(5000, 4096, 256), [5000, 4096]);
+        assert_eq!(rungs(4096, 4096, 256), [4096]);
         assert_eq!(
-            within_cache(31, 256, &state, &constant).expect("a context"),
-            30
+            rungs(400, 16, 256),
+            [400, 16],
+            "a half under the step is the floor"
         );
+        assert_eq!(rungs(199, 1, 1), [199, 99, 49, 24, 12, 6, 3, 1]);
     }
 
     /// `from` is tried first: a budget that holds at `from` and fails in
     /// between (the plan's table changing tier at a context) keeps `from`,
-    /// where a bisection over `1..=from` lands under the gap.
+    /// where a search over the contexts under it lands under the gap.
+    /// PIN(2026-10-12): (239, 1) answered 100, the largest context that
+    /// holds; the ladder from 239 over the base 64 answers 64, the first rung
+    /// that holds.
     #[test]
-    fn within_cache_tries_from_before_the_search() {
+    fn within_cache_tries_from_before_the_ladder() {
         let state = |n: usize| n as u64;
         let gap = |n: usize| {
             Ok::<_, Box<dyn std::error::Error>>(if n <= 100 || n >= 240 { 10_000 } else { 0 })
         };
-        assert_eq!(within_cache(250, 1, &state, &gap).expect("a context"), 250);
-        assert_eq!(within_cache(239, 1, &state, &gap).expect("a context"), 100);
+        let kept = |ctx| CacheBound { ctx, holds: true };
+        assert_eq!(
+            within_cache(250, 64, 1, &state, &gap).expect("a context"),
+            kept(250)
+        );
+        assert_eq!(
+            within_cache(239, 64, 1, &state, &gap).expect("a context"),
+            kept(64)
+        );
     }
 
     /// The cache guard's refusals, by name: no context holds one position's
-    /// state, a rounding that lands where the state does not hold, and a
-    /// budget read that fails.
+    /// state, and a budget read that fails. A budget that holds one position
+    /// but no rung is not a refusal: the base is the answer and the cache
+    /// keeps the shorter sessions.
+    /// PIN(2026-10-12): the rounding refusal (`CacheRounding`, a bisection's
+    /// context rounded to the step where the state did not hold) is gone with
+    /// the bisection; its case, a budget holding 1, 5 and 7 positions only,
+    /// answers the base 4 with `holds` false.
     #[test]
     fn within_cache_refuses_by_name() {
         let state = |n: usize| 3 * n as u64 + 10;
         let none = |_: usize| Ok::<_, Box<dyn std::error::Error>>(5u64);
-        let err = within_cache(1000, 16, &state, &none).expect_err("no state holds");
+        let err = within_cache(1000, 16, 16, &state, &none).expect_err("no state holds");
         assert_eq!(
             err.downcast_ref::<CtxError>().map(ToString::to_string),
             Some(
@@ -868,20 +1110,20 @@ mod tests {
                     .to_string()
             )
         );
-        // Holds at 1, 5 and 7 only: the bisection over 1..=8 ends at 7,
-        // which the step of 4 rounds to 4, where the state does not hold.
+        // Holds at 1, 5 and 7 only: no rung of 9 over the base 4 holds (9 is
+        // not a multiple of the step 4; the rungs are 9 and 4), and one
+        // position's does.
         let state = |n: usize| n as u64;
         let sparse = |n: usize| {
             Ok::<_, Box<dyn std::error::Error>>(if matches!(n, 1 | 5 | 7) { 100 } else { 0 })
         };
-        let err = within_cache(9, 4, &state, &sparse).expect_err("a rounding past the bound");
+        let got = within_cache(9, 4, 4, &state, &sparse).expect("the base");
         assert_eq!(
-            err.downcast_ref::<CtxError>().map(ToString::to_string),
-            Some(
-                "the prompt cache's bound rounded to a context of 4 positions, whose state of 4 \
-                 bytes passes the budget of 0 bytes there"
-                    .to_string()
-            )
+            got,
+            CacheBound {
+                ctx: 4,
+                holds: false
+            }
         );
         let refused = |n: usize| -> Result<u64, Box<dyn std::error::Error>> {
             if n < 100 {
@@ -890,7 +1132,7 @@ mod tests {
                 Err("refused".into())
             }
         };
-        let err = within_cache(200, 1, &state, &refused).expect_err("a plan refused");
+        let err = within_cache(200, 4, 1, &state, &refused).expect_err("a plan refused");
         assert_eq!(err.to_string(), "refused");
     }
 
@@ -967,7 +1209,15 @@ mod tests {
             card.take();
             free(c)
         };
-        let got = default_slot_ctx_by_card(cap, AT, step, margin, &counted_card, &counted_read);
+        let got = default_slot_ctx_by_card(
+            cap,
+            AT,
+            step,
+            margin,
+            Veto::Binary,
+            &counted_card,
+            &counted_read,
+        );
         (got, read.0.get().max(card.0.get()))
     }
 
@@ -1531,8 +1781,16 @@ mod tests {
                 seen_card.borrow_mut().push(c);
                 free(c)
             };
-            default_slot_ctx_by_card(cap, AT, STEP, margin, &counted_card, &counted_read)
-                .expect("a plan");
+            default_slot_ctx_by_card(
+                cap,
+                AT,
+                STEP,
+                margin,
+                Veto::Binary,
+                &counted_card,
+                &counted_read,
+            )
+            .expect("a plan");
             for (which, seen) in [("read", seen_read), ("card", seen_card)] {
                 let mut asked = seen.take();
                 let n = asked.len();
@@ -1603,7 +1861,8 @@ mod tests {
     /// The default of the card rule at `slack`, the cap of the trained 262,144.
     fn q38_by_card(slack: i64) -> SlotCtx {
         let read = q38_read(q38_room(slack));
-        default_slot_ctx_by_card(262_144, AT, STEP, GIB, &q38_card, &read).expect("a plan")
+        default_slot_ctx_by_card(262_144, AT, STEP, GIB, Veto::Binary, &q38_card, &read)
+            .expect("a plan")
     }
 
     /// The default of the one-probe rule at `slack`: the room read alone.
@@ -1712,12 +1971,13 @@ mod tests {
         // The card holds 3000, the room-read plan stands to the cap.
         let read = plan(CARD, AT, 1, |_| 0);
         let card = refused_past(3000, plan(CARD, AT, 1, |_| 0));
-        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, &card, &read).expect("a plan");
+        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, Veto::Binary, &card, &read)
+            .expect("a plan");
         let one = default_slot_ctx(9000, AT, STEP, MARGIN, &read).expect("a plan");
         assert_eq!(got, one, "a card under the base");
         // The card plan refused at 1 and at the base, the room-read plan standing.
         let nothing = |c: usize| Err::<ExpertBytes, _>(format!("no card at {c}"));
-        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, &nothing, &read);
+        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, Veto::Binary, &nothing, &read);
         assert_eq!(
             got,
             Err(Refused {
@@ -1732,7 +1992,7 @@ mod tests {
                 plan(CARD, AT, 1, |_| 0)(c)
             }
         };
-        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, &no_base, &read);
+        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, Veto::Binary, &no_base, &read);
         assert_eq!(
             got,
             Err(Refused {
@@ -1742,7 +2002,8 @@ mod tests {
         );
         // The room-read plan refused at the card's context: vetoed, not an error.
         let tight = refused_past(4600, plan(CARD, AT, 1, |_| 0));
-        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, &read, &tight).expect("a plan");
+        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, Veto::Binary, &read, &tight)
+            .expect("a plan");
         assert_eq!(
             (got.ctx, got.rule, got.margin_ctx, got.fit),
             (AT, RULE_HOST, 4864, 9000)
@@ -1780,6 +2041,313 @@ mod tests {
              card_expert_bytes=9000000000 nvme_expert_bytes=0 arena=0 base_arena=0 \
              nvme_bound=0 lost_bytes=0 margin_bytes=1073741824"
         );
+    }
+
+    /// A DGX Spark (GB10) at two slots as a probe model [derived from the
+    /// serve line `ctx rule=cache ctx=196608 slots=2 … fit=262144`, whose
+    /// `cache` line gave `available=124659433472 need=112142376240
+    /// checkpoints=8330412032`]: the plan needs [`GB10_NEED`] of the pool at
+    /// 196,608 positions a slot and [`GB10_PER`] more a position (52,584 B a
+    /// position a slot: 31,832 B of state, fitted to the cache line, and one
+    /// 85,004,204 B checkpoint per 4096 positions, 8,330,412,032 over 2 × 49);
+    /// the card's bytes do not move (every routed expert is in the pool).
+    /// The plan stands iff its need is within the room.
+    const GB10_AT: usize = 196_608;
+    const GB10_NEED: u64 = 112_142_376_240;
+    const GB10_PER: u64 = 2 * 52_584;
+    const GB10_AVAILABLE: u64 = 124_659_433_472;
+    /// The rungs of the halving ladder from the trained 262,144 to the base.
+    const GB10_RUNGS: [usize; 7] = [262_144, 131_072, 65_536, 32_768, 16_384, 8192, 4096];
+    /// The spread of #46's two readings of one machine.
+    const DRIFT: u64 = 778_326_016;
+    /// The sweeps' grid, 16 MiB.
+    const GRID: u64 = 16 << 20;
+
+    /// The pool bytes the GB10 model's plan needs at `c` positions a slot.
+    fn gb10_need(c: usize) -> u64 {
+        let apart = GB10_PER * c.abs_diff(GB10_AT) as u64;
+        if c >= GB10_AT {
+            GB10_NEED + apart
+        } else {
+            GB10_NEED - apart
+        }
+    }
+
+    /// The room the plan is made at: the available bytes less the host drift.
+    const GB10_ROOM: u64 = GB10_AVAILABLE - (512 << 20);
+
+    /// The GB10 model's plan at a `room`: its bytes where it stands, a
+    /// refusal where the pool cannot hold it.
+    fn gb10_read(room: u64) -> impl Fn(usize) -> Result<ExpertBytes, String> {
+        move |c| {
+            if gb10_need(c) <= room {
+                Ok(ExpertBytes {
+                    card: GIB,
+                    nvme: 0,
+                    arena: 0,
+                })
+            } else {
+                Err(format!(
+                    "the pool holds {room} B, the plan needs {}",
+                    gb10_need(c)
+                ))
+            }
+        }
+    }
+
+    /// The default of the ladder at `room` for the trained 262,144; the card
+    /// is not asked on a unified machine.
+    fn gb10_ladder(room: u64) -> Result<SlotCtx, Refused<String>> {
+        let asked = Cell::new(false);
+        let card = |c: usize| {
+            asked.set(true);
+            Err::<ExpertBytes, _>(format!("the card is asked at {c}"))
+        };
+        let got = default_slot_ctx_by_card(
+            262_144,
+            AT,
+            STEP,
+            GIB,
+            Veto::Ladder,
+            &card,
+            &gb10_read(room),
+        );
+        assert!(!asked.get(), "room {room}: a unified machine asks no card");
+        got
+    }
+
+    /// The largest rung whose plan the GB10 model's `room` holds, the base
+    /// when none above it does.
+    fn gb10_rung(room: u64) -> usize {
+        GB10_RUNGS
+            .into_iter()
+            .find(|&r| gb10_need(r) <= room)
+            .unwrap_or(AT)
+    }
+
+    /// The rooms the unified sweeps cover: from the base's need on (below it
+    /// the plan of the pool is the fit's, [`RULE_CARD`], or refused), in 16 MiB
+    /// steps, to the reading and 5 GB past it.
+    fn gb10_rooms() -> impl Iterator<Item = u64> {
+        let first = gb10_need(AT).div_ceil(GRID) * GRID;
+        (0..)
+            .map(move |i| first + i * GRID)
+            .take_while(|&room| room <= GB10_ROOM + 5_000_000_000)
+    }
+
+    /// On a unified pool the read room decides through a halving ladder
+    /// [FAIL-first: the room-read rule's fit rides the room between the base's
+    /// need and the cap's, 91.9 and 119.0 GB]. The model is the GB10's at two
+    /// slots; its rungs' needs are 119.03, 105.25, 98.36, 94.91, 93.19, 92.33
+    /// and 91.90 GB [derived]. Over the rooms of [`gb10_rooms`] every answer is
+    /// the largest rung the room holds: the cap's is `fit`, a lower one
+    /// `pool`, and the card is never asked. Below the base's need the plan of
+    /// the pool is the fit's ([`RULE_CARD`]) and below one position's need it
+    /// is refused.
+    #[test]
+    fn default_ctx_on_a_unified_pool_is_a_rung() {
+        let needs: Vec<u64> = GB10_RUNGS
+            .iter()
+            .map(|&r| (gb10_need(r) as f64 / 1e7).round() as u64)
+            .collect();
+        assert_eq!(needs, [11903, 10525, 9836, 9491, 9319, 9233, 9190]);
+        let mut before = 0;
+        for room in gb10_rooms() {
+            let got = gb10_ladder(room).expect("a plan");
+            assert_eq!(got.ctx, gb10_rung(room), "room {room}");
+            let word = if got.ctx == 262_144 {
+                RULE_FIT
+            } else {
+                RULE_POOL
+            };
+            assert_eq!(got.rule, word, "room {room}");
+            assert_eq!(got.base_ctx, AT, "room {room}");
+            assert!(got.ctx >= before, "room {room}: {} after {before}", got.ctx);
+            before = got.ctx;
+        }
+        let under = gb10_ladder(gb10_need(AT) - 1).expect("a plan");
+        assert_eq!((under.ctx, under.rule), (AT - 1, RULE_CARD));
+        let none = gb10_ladder(gb10_need(1) - 1);
+        assert_eq!(none.map_err(|e| e.at), Err(1), "refused at one position");
+    }
+
+    /// The default moves only across a rung's need [FAIL-first: the
+    /// room-read rule moves at every step of the room]. The answer at a room
+    /// differs from the answer a spread of #46's two readings higher only where
+    /// a rung's need lies between them, so the rooms that flip are the union of
+    /// one spread under each of seven needs, 4.16 GB together [derived], at
+    /// most seven spreads.
+    #[test]
+    fn default_ctx_on_a_unified_pool_moves_only_across_a_rungs_need() {
+        let mut flipped = 0;
+        for room in gb10_rooms() {
+            let (low, high) = (
+                gb10_ladder(room).expect("a plan"),
+                gb10_ladder(room + DRIFT).expect("a plan"),
+            );
+            if low.ctx != high.ctx {
+                flipped += GRID;
+                assert!(
+                    GB10_RUNGS
+                        .iter()
+                        .any(|&r| room < gb10_need(r) && gb10_need(r) <= room + DRIFT),
+                    "room {room}: {} and {} with no rung's need between",
+                    low.ctx,
+                    high.ctx
+                );
+            }
+        }
+        assert!(
+            flipped <= GB10_RUNGS.len() as u64 * DRIFT,
+            "{flipped} B of room answer differently across the reading"
+        );
+    }
+
+    /// The reading #46 reports, 5 GB under it and 5 GB over it all answer the
+    /// cap, 262,144 a slot: the cap's need is 119.03 GB, the reading's room less
+    /// 5 GB is 119.12 GB.
+    #[test]
+    fn default_ctx_on_a_unified_pool_keeps_the_cap_at_the_reading() {
+        for room in [
+            GB10_ROOM - 5_000_000_000,
+            GB10_ROOM,
+            GB10_ROOM + 5_000_000_000,
+        ] {
+            let got = gb10_ladder(room).expect("a plan");
+            assert_eq!((got.ctx, got.rule), (262_144, RULE_FIT), "room {room}");
+            assert_eq!(got.chosen, got.base, "the plan's bytes do not move");
+        }
+    }
+
+    /// A pool that cannot hold the cap: with a room 1 GiB under the cap's
+    /// need the room-read rule's answer is the fit, which moves with every
+    /// 105,168 B of room, and the ladder answers 131,072, the first rung the
+    /// room holds.
+    #[test]
+    fn default_ctx_on_a_pool_under_the_cap_is_a_rung() {
+        let room = gb10_need(262_144) - GIB;
+        let read = gb10_read(room);
+        let rides = default_slot_ctx(262_144, AT, STEP, GIB, &read).expect("a plan");
+        let moved = default_slot_ctx(262_144, AT, STEP, GIB, &gb10_read(room + 512 * GB10_PER))
+            .expect("a plan");
+        assert!(
+            !GB10_RUNGS.contains(&rides.ctx) && moved.ctx > rides.ctx,
+            "the room-read rule answers {} and {}: no rung, riding the room",
+            rides.ctx,
+            moved.ctx
+        );
+        let got = gb10_ladder(room).expect("a plan");
+        assert_eq!((got.ctx, got.rule), (131_072, RULE_POOL));
+        assert_eq!(got.fit, rides.fit, "the fit is the room-read plan's");
+        assert_eq!(got.chosen, got.base, "the plan's bytes do not move");
+    }
+
+    /// A ladder of one rung: a cap that is the base answers the base by
+    /// `base`, the word the discrete scan gives a fit at the base, not `fit`.
+    #[test]
+    fn default_ctx_on_a_unified_pool_at_a_cap_of_the_base_is_the_base() {
+        let read = gb10_read(GB10_ROOM);
+        let card = |c: usize| Err::<ExpertBytes, _>(format!("the card is asked at {c}"));
+        let got = default_slot_ctx_by_card(AT, AT, STEP, GIB, Veto::Ladder, &card, &read)
+            .expect("a plan");
+        assert_eq!((got.ctx, got.rule, got.fit), (AT, RULE_BASE, AT));
+    }
+
+    /// The prompt cache's bound on the GB10 model: a sequence state is 31,832 B
+    /// a position [fitted: it reproduces `ctx=196608` at `ram=6258528616`
+    /// under the largest-holding bound], the default is the trained 262,144
+    /// over the base 4096 in steps of 256, and the budget is the lesser of
+    /// 8 GiB and half of the slack S, swept in 16 MiB steps.
+    fn gb10_cache(slack: u64) -> Result<CacheBound, CtxError> {
+        let ram = (8u64 << 30).min(slack / 2);
+        within_cache(262_144, AT, STEP, &|n| 31_832 * n as u64, &|_| Ok(ram))
+    }
+
+    /// The budget at which a rung's state holds: twice its state.
+    fn gb10_budget(rung: usize) -> u64 {
+        2 * 31_832 * rung as u64
+    }
+
+    /// The prompt cache's bound is a rung [FAIL-first: the largest context that
+    /// holds rides the budget]. Over S from 16 MiB to 20 GiB every answer is
+    /// the largest rung whose state the budget holds, the base when none above
+    /// it does (it holds only from S = 2 × state(4096): the cache then keeps the
+    /// shorter sessions, `holds` false), and the answer never falls as S
+    /// grows. A budget of no byte holds no state at all, by name.
+    #[test]
+    fn within_cache_answers_a_rung() {
+        let none = gb10_cache(0);
+        assert!(
+            matches!(
+                none,
+                Err(CtxError::NoCacheState {
+                    state: 31_832,
+                    ram: 0
+                })
+            ),
+            "{none:?}"
+        );
+        let mut before = 0;
+        for slack in (1..).map(|i| i * GRID).take_while(|&s| s <= 20 << 30) {
+            let got = gb10_cache(slack).expect("a bound");
+            let want = GB10_RUNGS
+                .into_iter()
+                .find(|&r| gb10_budget(r) <= slack)
+                .unwrap_or(AT);
+            assert_eq!(got.ctx, want, "slack {slack}");
+            assert_eq!(got.holds, slack >= gb10_budget(AT), "slack {slack}");
+            assert!(
+                got.ctx >= before,
+                "slack {slack}: {} after {before}",
+                got.ctx
+            );
+            before = got.ctx;
+        }
+    }
+
+    /// The prompt cache's bound moves only across a rung's budget [FAIL-first:
+    /// the largest-holding bound moves at every step of the budget]. The
+    /// answer is the same between two consecutive rungs' budgets (2 × state of
+    /// a rung: 0.26, 0.52, 1.04, 2.09, 4.17, 8.34 and 16.69 GB), so the S where
+    /// it differs from the answer a spread of #46's two readings higher lie
+    /// within one spread under those seven budgets, at most seven spreads in
+    /// all (4.16 GB together [derived]).
+    #[test]
+    fn within_cache_moves_only_across_a_rungs_budget() {
+        let mut flipped = 0;
+        for slack in (1..).map(|i| i * GRID).take_while(|&s| s <= 20 << 30) {
+            let (low, high) = (
+                gb10_cache(slack).expect("a bound"),
+                gb10_cache(slack + DRIFT).expect("a bound"),
+            );
+            if low.ctx != high.ctx {
+                flipped += GRID;
+                assert!(
+                    GB10_RUNGS
+                        .iter()
+                        .any(|&r| slack < gb10_budget(r) && gb10_budget(r) <= slack + DRIFT),
+                    "slack {slack}: {} and {} with no rung's budget between",
+                    low.ctx,
+                    high.ctx
+                );
+            }
+        }
+        assert!(
+            flipped <= GB10_RUNGS.len() as u64 * DRIFT,
+            "{flipped} B of slack answer differently across the reading"
+        );
+    }
+
+    /// At #46's budget, 6,258,528,616 B (S = 12.5 GB), and a spread of the
+    /// readings either side of it, the bound is 131,072 [FAIL-first: the
+    /// largest-holding bound answers 196,608 at it].
+    #[test]
+    fn within_cache_holds_still_at_the_reports_budget() {
+        let report = 2 * 6_258_528_616;
+        for slack in [report - DRIFT, report, report + DRIFT] {
+            let got = gb10_cache(slack).expect("a bound");
+            assert_eq!((got.ctx, got.holds), (131_072, true), "slack {slack}");
+        }
     }
 
     /// The grid search's rows: no trained context is no answer, a trained

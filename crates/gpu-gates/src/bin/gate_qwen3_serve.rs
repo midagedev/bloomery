@@ -817,7 +817,10 @@ mod gate {
     /// seat's base a slot ([`SEAT_FLOOR`]) and step ([`CTX_GRAN`]):
     /// `card` the fit under the base, `base` the base itself with the fit at
     /// least it, `margin` a multiple of the step past the base and under the
-    /// fit, `fit` the fit past the base; and on every word the paged bytes
+    /// fit, `fit` the fit past the base, `host` the base with the card's
+    /// context past it that the host room vetoed (`margin_ctx`), `pool` a
+    /// rung of the halving ladder from the cap on a unified machine; and on
+    /// every word the paged bytes
     /// at most a hundredth of the base's past them, the line's `nvme_bound`
     /// that hundredth. A named error when the line is missing or one of its
     /// terms is.
@@ -844,6 +847,21 @@ mod gate {
                 "base" => ctx == SEAT_FLOOR && base == SEAT_FLOOR && fit >= SEAT_FLOOR,
                 "margin" => ctx % step == 0 && SEAT_FLOOR < ctx && ctx < fit,
                 "fit" => ctx == fit && fit > SEAT_FLOOR,
+                // The host room vetoed the card's context `margin_ctx` past
+                // the base: the base stands.
+                "host" => {
+                    ctx == SEAT_FLOOR
+                        && base == SEAT_FLOOR
+                        && SEAT_FLOOR < margin_ctx
+                        && margin_ctx <= fit
+                }
+                // A unified machine's pool took a lower rung of the halving
+                // ladder from the cap: `cap >> k` rounded down to the step,
+                // never under the base.
+                "pool" => {
+                    ctx <= fit
+                        && (0..u64::BITS).any(|k| ctx == ((cap >> k) / step * step).max(SEAT_FLOOR))
+                }
                 _ => false,
             };
             Some(
@@ -853,7 +871,7 @@ mod gate {
                     && cap == trained
                     && ctx <= fit
                     && fit <= cap
-                    && margin_ctx == ctx
+                    && (margin_ctx == ctx || rule == "host")
                     && margin == model::placement::workstation::MARGIN
                     && base_card.saturating_sub(card) == lost
                     && (rule == "card" || lost <= margin)
