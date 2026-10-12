@@ -1197,7 +1197,8 @@ pub struct NvTier {
     /// One buffered handle per shard, once [`NvTier::audit_on`] turned the
     /// audit on.
     audit: OnceLock<Vec<(PathBuf, std::fs::File)>>,
-    /// The threads a prompt batch's fill runs on ([`NvTier::prefetch_pinned`]).
+    /// The threads a decode step's misses and a prompt batch's fill run on
+    /// ([`NvTier::prefetch_pinned`]).
     reader: Reader,
     /// The split whose shards' mappings the readers read and the drops
     /// advise.
@@ -2266,17 +2267,21 @@ impl NvTier {
 
     /// [`NvTier::ensure_pinned`] as a claim in flight: the batch is claimed
     /// and its hits pinned on the caller, its misses' reads queued on the
-    /// tier's reader at the prompt rank, and the [`Inflight`] returned holds
-    /// the claim until [`Inflight::finish`] joins the fill and publishes it.
-    /// Refused by name like [`NvTier::ensure_pinned`], and once the reader
-    /// has stopped; nothing is pinned then.
-    fn prefetch(&self, layer: usize, ids: &[u32], kind: Claim) -> Result<Inflight<'_>, GpuError> {
+    /// tier's reader at the rank its claim sets, and the [`Inflight`] returned
+    /// holds the claim until [`Inflight::finish`] joins the fill and publishes
+    /// it. A batch with no miss queues nothing and allocates no job: its
+    /// pins are the batch's. Refused by name like [`NvTier::ensure_pinned`],
+    /// and once the reader has stopped; nothing is pinned then.
+    fn prefetch(&self, layer: usize, ids: &[u32], kind: Claim) -> Result<Prefetch<'_>, GpuError> {
         let (arena, claim) = self.claim(layer, ids, kind, true)?;
         let held = BatchPin {
             arena,
             layer,
             ids: claim.pinned,
         };
+        if claim.picks.is_empty() {
+            return Ok(Prefetch::Held(held));
+        }
         let reads: Vec<PickRead> = claim.picks.iter().map(|p| read_of(arena, p)).collect();
         let mem = Arc::clone(&self.mem);
         Inflight::queue(
@@ -2291,7 +2296,15 @@ impl NvTier {
             kind,
             move |i| read_pick(&mem, &reads[i]),
         )
+        .map(Prefetch::Filling)
     }
+}
+
+/// What [`NvTier::prefetch`] made of a claim: the pins of a batch with
+/// nothing to fill, or the claim in flight.
+enum Prefetch<'a> {
+    Held(BatchPin<'a>),
+    Filling(Inflight<'a>),
 }
 
 /// One pick's reads as a reader thread needs them, all owned: each part's
@@ -2425,9 +2438,9 @@ struct FillFailed {
     error: GpuError,
 }
 
-/// A prompt batch's claim whose misses are read on the reader
-/// ([`NvTier::prefetch`]). It holds the hits' pins and the picks' slots,
-/// filling; [`Inflight::finish`] joins the fill and publishes the picks under
+/// A batch's claim whose misses are read on the reader ([`NvTier::prefetch`]),
+/// at the rank its claim sets ([`Kind::of_claim`]). It holds the hits' pins
+/// and the picks' slots, filling; [`Inflight::finish`] joins the fill and publishes the picks under
 /// the books' lock, each pinned as it turns filled, so no claim between the
 /// claim and the pin takes a slot of the batch. A fill that failed frees its
 /// slots and closes the pins. Dropped unfinished — a caller that refused for
@@ -2468,7 +2481,7 @@ impl<'a> Inflight<'a> {
             match inflight
                 .tier
                 .reader
-                .submit(Job::new(Kind::Prompt, units, read))
+                .submit(Job::new(Kind::of_claim(kind), units, read))
             {
                 Ok(job) => inflight.job = Some(job),
                 Err(e) => {
@@ -2628,9 +2641,19 @@ impl TierSlots for NvTier {
         ids: &[u32],
         claim: Claim,
     ) -> Result<Ticket<'a>, TierError> {
-        let inflight = self
+        let inflight = match self
             .prefetch(layer, ids, claim)
-            .map_err(|e| seam_error(layer, ids, e))?;
+            .map_err(|e| seam_error(layer, ids, e))?
+        {
+            Prefetch::Held(held) => {
+                if self.audit.get().is_some() {
+                    self.audit_slots(layer, ids)
+                        .map_err(|e| seam_error(layer, ids, e))?;
+                }
+                return Ok(Ticket::ready(TierPin::new(held.arena, held.into_token())));
+            }
+            Prefetch::Filling(inflight) => inflight,
+        };
         let ids = ids.to_vec();
         Ok(Ticket::new(move || {
             let held = inflight.finish().map_err(|f| fill_error(layer, f))?;
@@ -3453,11 +3476,12 @@ mod tests {
         stats: &'a super::Stats,
         reader: &'a super::Reader,
         ids: &[u32],
+        kind: Claim,
         read: impl Fn(usize) -> Result<(), crate::GpuError> + Send + Sync + 'static,
     ) -> super::Inflight<'a> {
         let claim = {
             let mut b = books.lock().unwrap();
-            super::claim_slots_pinned(0, arena, &mut b, ids, Claim::Keep).unwrap()
+            super::claim_slots_pinned(0, arena, &mut b, ids, kind).unwrap()
         };
         let held = super::BatchPin {
             arena,
@@ -3470,7 +3494,7 @@ mod tests {
             stats,
             reader,
         };
-        super::Inflight::queue(tier, held, claim.picks, Claim::Keep, read).unwrap()
+        super::Inflight::queue(tier, held, claim.picks, kind, read).unwrap()
     }
 
     /// A prompt batch's fill runs on the reader's threads, not the caller's:
@@ -3486,17 +3510,25 @@ mod tests {
         let (started_tx, started) = mpsc::channel();
         let (release_tx, release) = mpsc::channel::<()>();
         let release = Mutex::new(release);
-        let inflight = queued(&arena, &books, &stats, &reader, &[0, 1], move |_| {
-            started_tx.send(std::thread::current().id()).unwrap();
-            // Bounded, so a fill run on the caller (which never releases
-            // itself) fails the test rather than hanging it.
-            let released = release
-                .lock()
-                .unwrap()
-                .recv_timeout(std::time::Duration::from_secs(5));
-            released.expect("the test released the read");
-            Ok(())
-        });
+        let inflight = queued(
+            &arena,
+            &books,
+            &stats,
+            &reader,
+            &[0, 1],
+            Claim::Keep,
+            move |_| {
+                started_tx.send(std::thread::current().id()).unwrap();
+                // Bounded, so a fill run on the caller (which never releases
+                // itself) fails the test rather than hanging it.
+                let released = release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                released.expect("the test released the read");
+                Ok(())
+            },
+        );
         // Both reads run, each on a thread that is not this one, and hold:
         // the caller is back with the claim in the books and nothing filled.
         let ran: Vec<_> = (0..2).map(|_| started.recv().unwrap()).collect();
@@ -3531,6 +3563,54 @@ mod tests {
         );
         drop(pin);
         assert_eq!(open_reads(&arena, &[0, 1]), [0, 0]);
+    }
+
+    /// A decode step's claim queues its misses at the step rank, a keep or
+    /// transient claim's at the prompt rank: the reader counts each kind
+    /// alone, and a step's join publishes its picks pinned and counted as the
+    /// step's fills.
+    #[test]
+    fn a_step_claims_misses_run_at_the_step_rank() {
+        use std::sync::Mutex;
+        use std::sync::atomic::Ordering::Relaxed;
+        let arena = arena_of(8, 4);
+        let books = Mutex::new(super::Books::default());
+        let stats = super::Stats::default();
+        let reader = super::Reader::start(2, "test-fill").unwrap();
+        let counted = |r: &super::Reader| {
+            let r = r.stats();
+            ((r.step.jobs, r.step.units), (r.prompt.jobs, r.prompt.units))
+        };
+        let step = queued(
+            &arena,
+            &books,
+            &stats,
+            &reader,
+            &[0, 1],
+            Claim::Step,
+            |_| Ok(()),
+        );
+        let pin = step.finish().ok().expect("the step's fill ended");
+        assert_eq!(
+            counted(&reader),
+            ((1, 2), (0, 0)),
+            "a step claim's misses ran as a step fill"
+        );
+        assert_eq!(
+            (stats.fills.load(Relaxed), stats.step_fills.load(Relaxed)),
+            (2, 2),
+            "and are the step's fills"
+        );
+        drop(pin);
+        let keep = queued(&arena, &books, &stats, &reader, &[2], Claim::Keep, |_| {
+            Ok(())
+        });
+        drop(keep.finish().ok().expect("the keep claim's fill ended"));
+        assert_eq!(
+            counted(&reader),
+            ((1, 2), (1, 1)),
+            "a keep claim's as a prompt fill"
+        );
     }
 
     /// A victim's fill runs on the reader at the victim rank and ends
@@ -3599,15 +3679,23 @@ mod tests {
         let reader = super::Reader::start(1, "test-fill").unwrap();
         ensure_as(&arena, &mut books.lock().unwrap(), &[0], Claim::Step);
         // Id 0 is a hit; 1 and 2 are the picks, and the second read fails.
-        let inflight = queued(&arena, &books, &stats, &reader, &[0, 1, 2], |i| {
-            if i == 1 {
-                return Err(crate::GpuError::shape(
-                    "NvTier::fill",
-                    "expert 2: the run ends 0 B in, its part needs 1 B at 4096".to_string(),
-                ));
-            }
-            Ok(())
-        });
+        let inflight = queued(
+            &arena,
+            &books,
+            &stats,
+            &reader,
+            &[0, 1, 2],
+            Claim::Keep,
+            |i| {
+                if i == 1 {
+                    return Err(crate::GpuError::shape(
+                        "NvTier::fill",
+                        "expert 2: the run ends 0 B in, its part needs 1 B at 4096".to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        );
         let failed = inflight.finish().err().expect("the fill failed");
         assert_eq!(failed.id, 2, "the failing pick's id");
         match super::fill_error(3, failed) {
@@ -3649,21 +3737,35 @@ mod tests {
         let stats = super::Stats::default();
         let reader = super::Reader::start(1, "test-fill").unwrap();
         ensure_as(&arena, &mut books.lock().unwrap(), &[0], Claim::Step);
-        drop(queued(&arena, &books, &stats, &reader, &[0, 1, 2], |_| {
-            Ok(())
-        }));
+        drop(queued(
+            &arena,
+            &books,
+            &stats,
+            &reader,
+            &[0, 1, 2],
+            Claim::Keep,
+            |_| Ok(()),
+        ));
         assert_eq!(
             filled_ids(&arena),
             [0, 1, 2],
             "the read picks are published"
         );
         assert_eq!(open_reads(&arena, &[0, 1, 2]), [0, 0, 0], "and unpinned");
-        drop(queued(&arena, &books, &stats, &reader, &[3, 4], |_| {
-            Err(crate::GpuError::shape(
-                "NvTier::fill",
-                "a short read".to_string(),
-            ))
-        }));
+        drop(queued(
+            &arena,
+            &books,
+            &stats,
+            &reader,
+            &[3, 4],
+            Claim::Keep,
+            |_| {
+                Err(crate::GpuError::shape(
+                    "NvTier::fill",
+                    "a short read".to_string(),
+                ))
+            },
+        ));
         assert_eq!(
             filled_ids(&arena),
             [0, 1, 2],

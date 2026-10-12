@@ -2765,6 +2765,14 @@ pub(crate) fn defer_quant() -> bool {
     DEFER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 2
 }
 
+/// Whether a union call of `cols` columns claims its quantizations inside its
+/// two row dispatches: at most [`DEFER_MAX_COLS`] columns, with the deferral
+/// on. The one owner of the rule, for [`UnionCall::run`] and a step served in
+/// two groups.
+pub(crate) fn defers(cols: usize) -> bool {
+    cols <= DEFER_MAX_COLS && defer_quant()
+}
+
 /// [`lane_prefetch`]'s value: the registry's default until a binary's `main`
 /// sets its parsed lever ([`set_lane_prefetch`]).
 static LANE_PREFETCH: std::sync::atomic::AtomicBool =
@@ -4813,6 +4821,14 @@ pub(crate) struct UnionXq<'s> {
     up: Option<&'s mut [u8]>,
 }
 
+/// The claim states of a narrow batch ([`UnionCall::run_batch`]): whether its
+/// gate/up pass quantizes `x` (the call's first batch), and the scratch's
+/// per-expert states its down pass claims the combines through.
+pub(crate) struct GroupClaims<'a> {
+    pub(crate) x: bool,
+    pub(crate) states: &'a mut [std::sync::atomic::AtomicU8],
+}
+
 /// The front `len` cells of `slab`, or a named panic when the scratch has no
 /// room for them — a scratch made for fewer columns or narrower encodings
 /// than the call's.
@@ -4940,7 +4956,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         let lvl = profile::level();
         let timer = || (lvl > 0).then(Instant::now);
         let since = |t: Option<Instant>| t.map_or(0, |t| t.elapsed().as_nanos() as u64);
-        let claim = cols <= DEFER_MAX_COLS && defer_quant();
+        let claim = defers(cols);
         let (mut x_ns, mut h_ns) = (0u64, 0u64);
         if !claim {
             let t = timer();
@@ -4970,16 +4986,10 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         Ok(())
     }
 
-    /// x quantized once for a call served in batches of experts: the pass
-    /// [`UnionCall::run`] opens with, into the front of `xq` (the gate's
-    /// encoding) and, when the up's rows read other bytes, of `xq_up`. Every
-    /// batch's [`UnionCall::run_batch`] reads the returned rooms.
-    pub(crate) fn quantize_batched<'s>(
-        &self,
-        xq: &'s mut [u8],
-        xq_up: &'s mut [u8],
-        passes: &mut u64,
-    ) -> UnionXq<'s> {
+    /// The rooms of `x` in the gate's encoding and, when the up's rows read
+    /// other bytes, in the up's: the front of `xq` and `xq_up`, poisoned
+    /// like a dispatch's own buffers, not yet written.
+    pub(crate) fn x_rooms<'s>(&self, xq: &'s mut [u8], xq_up: &'s mut [u8]) -> UnionXq<'s> {
         let cols = self.x.ne1();
         let xq = room(xq, cols * self.gate.cb, "x in the gate's encoding");
         let mut xq_up = if self.gate.shares_input(&self.up) {
@@ -4993,16 +5003,29 @@ impl<'c, 'w> UnionCall<'c, 'w> {
                 xq_up.fill(0xA5);
             }
         }
-        let t = (profile::level() > 0).then(Instant::now);
-        self.quantize_x(xq, xq_up.as_deref_mut());
-        *passes += 1;
-        if let Some(t) = t {
-            profile::record_time("host_x_quant", t.elapsed().as_nanos() as u64);
-        }
         UnionXq {
             gate: xq,
             up: xq_up,
         }
+    }
+
+    /// x quantized once for a call served in batches of experts: the pass
+    /// [`UnionCall::run`] opens with, into the rooms [`UnionCall::x_rooms`]
+    /// cuts. Every batch's [`UnionCall::run_batch`] reads the returned rooms.
+    pub(crate) fn quantize_batched<'s>(
+        &self,
+        xq: &'s mut [u8],
+        xq_up: &'s mut [u8],
+        passes: &mut u64,
+    ) -> UnionXq<'s> {
+        let mut rooms = self.x_rooms(xq, xq_up);
+        let t = (profile::level() > 0).then(Instant::now);
+        self.quantize_x(rooms.gate, rooms.up.as_deref_mut());
+        *passes += 1;
+        if let Some(t) = t {
+            profile::record_time("host_x_quant", t.elapsed().as_nanos() as u64);
+        }
+        rooms
     }
 
     /// One batch of a call served in batches: this call's plan is the
@@ -5010,16 +5033,21 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     /// run over them — gate and up, the combines, the downs — from the
     /// call's `x` as [`UnionCall::quantize_batched`] left it, into the front
     /// of `gu` and `qc` (the batch's own, reused by the next) and of `store`,
-    /// where the caller placed the batch's downs. No claim state: the
+    /// where the caller placed the batch's downs. Without `claims` the
     /// quantizations are whole before the first batch, whatever the width.
-    /// Every value is the one [`UnionCall::run`] writes for the same (expert,
-    /// column).
+    /// With them (a narrow call served in two groups, [`defers`]) the batch
+    /// runs the two claiming passes of [`UnionCall::run`]: its gate/up pass
+    /// quantizes `x` first when `claims.x` (the call's first batch, over rooms
+    /// [`UnionCall::x_rooms`] cut), and its down pass claims the batch's
+    /// combines through `claims.states`. Every value is the one
+    /// [`UnionCall::run`] writes for the same (expert, column).
     pub(crate) fn run_batch(
         &self,
         xq: &mut UnionXq<'_>,
         gu: &mut [f32],
         qc: &mut [u8],
         store: &mut [f32],
+        claims: Option<GroupClaims<'_>>,
         passes: &mut u64,
     ) -> Result<(), crate::ModelError> {
         let (ff, embd, slots) = (self.gate.n, self.down.n, self.plan.slots());
@@ -5032,16 +5060,21 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             store.fill(f32::NAN);
         }
         let lvl = profile::level();
-        // No claim runs here, so the passes' claim time is none.
-        self.gate_up(xq.gate, xq.up.as_deref_mut(), gu, false, lvl)?;
+        let (claim_x, states) = match claims {
+            Some(c) => (c.x, Some(c.states)),
+            None => (false, None),
+        };
+        self.gate_up(xq.gate, xq.up.as_deref_mut(), gu, claim_x, lvl)?;
         *passes += 1;
-        let t = (lvl > 0).then(Instant::now);
-        self.combine(gu, qc);
-        *passes += 1;
-        if let Some(t) = t {
-            profile::record_time("host_h_quant", t.elapsed().as_nanos() as u64);
+        if states.is_none() {
+            let t = (lvl > 0).then(Instant::now);
+            self.combine(gu, qc);
+            *passes += 1;
+            if let Some(t) = t {
+                profile::record_time("host_h_quant", t.elapsed().as_nanos() as u64);
+            }
         }
-        self.down(gu, qc, store, None, lvl)?;
+        self.down(gu, qc, store, states, lvl)?;
         *passes += 1;
         Ok(())
     }

@@ -7,7 +7,8 @@
 //!
 //! One queue, by rank: a job of a lower rank is taken before every job of a
 //! higher one, first come first served within a rank. A job's rank is its
-//! [`Kind`]'s: a prompt batch's fill goes ahead of every queued victim fill.
+//! [`Kind`]'s: a decode step's fill goes ahead of every queued prompt batch's,
+//! and a prompt batch's ahead of every queued victim fill.
 //! A job's units are taken in order, so the queue holds one front job at a
 //! time and the threads that find it taken go on to the next.
 
@@ -18,6 +19,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::GpuError;
+use model::moe::Claim;
 
 /// The work of one unit of a job: a pick's reads. Runs on a reader thread.
 type Unit = Box<dyn Fn(usize) -> Result<(), GpuError> + Send + Sync>;
@@ -33,6 +35,10 @@ pub(super) struct Failure {
 /// of a kind to a rank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
+    /// A decode step's misses, read while the step computes its hits and
+    /// waited for right after: ahead of every queued prompt fill, so a
+    /// concurrent prompt batch does not stall a step.
+    Step,
     /// A prompt batch's misses, read ahead of the compute that waits on them.
     Prompt,
     /// A residency flip's victim id: read inside the flip's window, behind
@@ -41,15 +47,25 @@ pub(super) enum Kind {
 }
 
 /// The kinds a job is: the length of every per-kind counter.
-const KINDS: usize = 2;
+const KINDS: usize = 3;
 
 impl Kind {
     /// The queue rank: lower is taken first, and the index of the kind's
     /// counters.
     fn rank(self) -> u8 {
         match self {
-            Kind::Prompt => 0,
-            Kind::Victim => 1,
+            Kind::Step => 0,
+            Kind::Prompt => 1,
+            Kind::Victim => 2,
+        }
+    }
+
+    /// The kind of the fill of a batch claimed as `claim`: the one mapping of
+    /// a claim to a rank.
+    pub(super) fn of_claim(claim: Claim) -> Kind {
+        match claim {
+            Claim::Step => Kind::Step,
+            Claim::Keep | Claim::Transient => Kind::Prompt,
         }
     }
 }
@@ -151,10 +167,13 @@ pub struct KindStats {
     pub run_ns: u64,
 }
 
-/// What the readers count ([`Reader::stats`]): the prompt batches' fills and
-/// the residency flips' victim fills, each kind alone.
+/// What the readers count ([`Reader::stats`]): the decode steps' fills, the
+/// prompt batches' and the residency flips' victim fills, each kind alone.
+/// `step.wait_ns` is the wall a step's compute waited for fills after the
+/// overlap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReaderStats {
+    pub step: KindStats,
     pub prompt: KindStats,
     pub victim: KindStats,
 }
@@ -171,6 +190,7 @@ impl ReaderStats {
             run_ns: now.run_ns - then.run_ns,
         };
         ReaderStats {
+            step: kind(self.step, base.step),
             prompt: kind(self.prompt, base.prompt),
             victim: kind(self.victim, base.victim),
         }
@@ -446,6 +466,7 @@ impl Reader {
             }
         };
         ReaderStats {
+            step: of(Kind::Step),
             prompt: of(Kind::Prompt),
             victim: of(Kind::Victim),
         }
@@ -518,6 +539,7 @@ impl Drop for Reader {
 mod tests {
     use super::{Failure, Job, Kind, KindStats, Reader, StopError};
     use crate::GpuError;
+    use model::moe::Claim;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -540,12 +562,13 @@ mod tests {
         }
     }
 
-    /// A prompt fill is taken before every queued victim fill, whenever the
-    /// victim was submitted, and the units of a kind in arrival order. One
-    /// thread, so the order the units start in is the order the queue pops
-    /// them.
+    /// A step's fill is taken before every queued prompt fill and a prompt
+    /// fill before every queued victim fill, whenever each was submitted, and
+    /// the units of a kind in arrival order; a claim's kind is the one
+    /// [`Kind::of_claim`] maps it to. One thread, so the order the units start
+    /// in is the order the queue pops them.
     #[test]
-    fn the_reader_takes_prompt_fills_before_victims() {
+    fn the_reader_takes_step_fills_before_prompts_before_victims() {
         let reader = Reader::start(1, "test-fill").unwrap();
         let (started_tx, started) = mpsc::channel();
         let (release_tx, release) = mpsc::channel();
@@ -569,6 +592,8 @@ mod tests {
             (Kind::Prompt, "prompt"),
             (Kind::Victim, "victim-later"),
             (Kind::Prompt, "prompt-later"),
+            (Kind::of_claim(Claim::Step), "step"),
+            (Kind::of_claim(Claim::Keep), "keep-later"),
         ]
         .into_iter()
         .map(|(kind, tag)| reader.submit(Job::new(kind, 1, tagged(tag, &log))).unwrap())
@@ -579,13 +604,24 @@ mod tests {
         }
         assert_eq!(
             *log.lock().unwrap(),
-            ["prompt", "prompt-later", "victim", "victim-later"]
+            [
+                "step",
+                "prompt",
+                "prompt-later",
+                "keep-later",
+                "victim",
+                "victim-later"
+            ]
         );
         let stats = reader.stats();
         let counted = |k: KindStats| (k.jobs, k.units);
         assert_eq!(
-            (counted(stats.prompt), counted(stats.victim)),
-            ((3, 3), (2, 2)),
+            (
+                counted(stats.step),
+                counted(stats.prompt),
+                counted(stats.victim)
+            ),
+            ((1, 1), (4, 4), (2, 2)),
             "each kind counted alone"
         );
         assert!(

@@ -30,10 +30,10 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertStack, GroupInput, Lanes, R8Stack, RowLayout, ShardTensor,
-    StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack, WarmSpan,
-    Weight, matmul_q, matmul_q_group, matmul_q_group_into_on, matmul_q_group_swiglu,
-    matmul_q_group_swiglu_into_on,
+    self, DEFER_MAX_COLS, ExpertStack, GroupClaims, GroupInput, Lanes, R8Stack, RowLayout,
+    ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack,
+    WarmSpan, Weight, defers, matmul_q, matmul_q_group, matmul_q_group_into_on,
+    matmul_q_group_swiglu, matmul_q_group_swiglu_into_on,
 };
 use crate::profile;
 use crate::r8file::{R8Error, R8Source};
@@ -1291,6 +1291,41 @@ impl UnionBatches {
             keep: keep.div_ceil(batch),
         }
     }
+
+    /// `plan`'s experts cut for a step served in two groups: the early group
+    /// — the ones `host` holds, then the arena's `lent` ones — and the late
+    /// one, the arena's others, each run ascending by id. `lent` is the tier's
+    /// answer for an arena id (held by the claim, or in flight); it decides
+    /// the same for an id on each of its two walks, since nothing publishes a
+    /// fill before the wait. Returns the early group's host experts and its
+    /// all.
+    fn split_step(
+        &mut self,
+        plan: &UnionPlan,
+        host: &std::ops::Range<u32>,
+        lent: impl Fn(u32) -> bool,
+    ) -> (usize, usize) {
+        let (order, ids) = (&mut self.order, &mut self.ids);
+        order.clear();
+        let ds = || (0..plan.n()).map(|d| (d, plan.ids[d]));
+        order.extend(
+            ds().filter(|&(_, e)| host.contains(&e))
+                .map(|(d, _)| d as u32),
+        );
+        let n_host = order.len();
+        order.extend(
+            ds().filter(|&(_, e)| !host.contains(&e) && lent(e))
+                .map(|(d, _)| d as u32),
+        );
+        let early = order.len();
+        order.extend(
+            ds().filter(|&(_, e)| !host.contains(&e) && !lent(e))
+                .map(|(d, _)| d as u32),
+        );
+        ids.clear();
+        ids.extend(order.iter().map(|&d| plan.ids[d as usize]));
+        (n_host, early)
+    }
 }
 
 /// The slabs a union call writes, made once for a layer shape and a column
@@ -1791,10 +1826,115 @@ fn serve_batched<'w>(
         }
         let batch_call =
             UnionCall::new(sub.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
-        batch_call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], passes)?;
+        batch_call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], None, passes)?;
         base += sub.cols.len();
         drop(pin);
     }
+    whole.sum_batched(slot, store, lists, out, passes);
+    Ok(())
+}
+
+/// A decode step's union over a layer whose claim has misses in flight
+/// ([`HostLayer::experts_step_union_into_on`]) as two groups of
+/// [`serve_batched`]'s shape: the host segment's experts and the ones the
+/// claim found filled compute while the misses fill on the tier's threads,
+/// then the ticket is waited for and the misses compute. Each group runs the
+/// two claiming passes of a narrow call (the three of the pre-pass shape when
+/// the call is wide or the deferral is off), its downs stored by their slot,
+/// and the per-column sums run once after the second, in list order from
+/// zero: every value is the whole call's, bit for bit. A step with nothing
+/// early or nothing late waits first and runs whole.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the call's pieces: stacks, leg, input, lists, output, scratch, tier and ticket"
+)]
+fn serve_step_split<'w>(
+    stacks: [ExpertStack<'w>; 3],
+    run: LegRun,
+    x: Tensor2View<'_>,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    s: &mut UnionScratch,
+    tier: &'w LayerTier,
+    ticket: Ticket<'w>,
+) -> Result<(), ModelError> {
+    let (n_host, early) = {
+        let UnionScratch { plan, batches, .. } = &mut *s;
+        batches.split_step(plan, &tier.host, |e| {
+            tier.slots.slot(tier.layer, e, 0).is_some()
+        })
+    };
+    let n = s.plan.n();
+    if early == 0 || early == n {
+        let pin = ticket.wait()?;
+        tier.check_lent(&stacks, &s.tier_ids)?;
+        let served = serve_planned(stacks, run, x, lists, out, s);
+        drop(pin);
+        return served;
+    }
+    let (embd, ff) = (x.ne0(), s.ff);
+    let UnionScratch {
+        plan,
+        xq,
+        xq_up,
+        gu,
+        qc,
+        store,
+        passes,
+        batches,
+        claims,
+        ..
+    } = s;
+    let plan = &*plan;
+    let UnionBatches {
+        order,
+        ids,
+        slot,
+        plan: sub,
+        ..
+    } = batches;
+    let (order, ids) = (&*order, &*ids);
+    let whole = UnionCall::new(plan.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
+    let deferred = defers(x.ne1());
+    let mut xqs = if deferred {
+        whole.x_rooms(xq, xq_up)
+    } else {
+        whole.quantize_batched(xq, xq_up, passes)
+    };
+    slot.clear();
+    slot.resize(n, 0);
+    let mut ticket = Some(ticket);
+    let mut pin = None;
+    let mut base = 0;
+    for (g, span) in [0..early, early..n].into_iter().enumerate() {
+        if g == 0 {
+            tier.check_lent(&stacks, &ids[n_host..early])?;
+        } else {
+            let t = (profile::level() > 0).then(Instant::now);
+            pin = Some(
+                ticket
+                    .take()
+                    .expect("one ticket for the late group")
+                    .wait()?,
+            );
+            if let Some(t) = t {
+                profile::record_time("host_fill_wait", t.elapsed().as_nanos() as u64);
+            }
+            tier.check_lent(&stacks, &ids[span.clone()])?;
+        }
+        sub.cut(plan, &order[span.clone()]);
+        for (i, &d) in order[span].iter().enumerate() {
+            slot[d as usize] = base + sub.off[i];
+        }
+        let call = UnionCall::new(sub.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
+        let claim = deferred.then(|| GroupClaims {
+            x: g == 0,
+            states: &mut claims[..],
+        });
+        call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], claim, passes)?;
+        base += sub.cols.len();
+    }
+    drop(pin);
     whole.sum_batched(slot, store, lists, out, passes);
     Ok(())
 }
@@ -2079,12 +2219,20 @@ impl Drop for TierPin<'_> {
 /// slots are taken in the tier's books and being filled, and
 /// [`Ticket::wait`] returns once every one is filled, with the batch pinned.
 /// The ticket owns its completion — a boxed handle, not a borrow of the
-/// tier's threads — so whoever fills may run anywhere. A ticket dropped
-/// without a wait gives its claim back: the batch is unpinned, once its fill
-/// has ended.
+/// tier's threads — so whoever fills may run anywhere. A claim with nothing
+/// to fill is a ready ticket, which holds its pin and allocates nothing. A
+/// ticket dropped without a wait gives its claim back: the batch is unpinned,
+/// once its fill has ended.
 #[must_use = "the claim lasts until the ticket is waited for or dropped"]
 pub struct Ticket<'a> {
-    wait: Box<dyn FnOnce() -> Result<TierPin<'a>, TierError> + Send + 'a>,
+    state: TicketState<'a>,
+}
+
+enum TicketState<'a> {
+    /// Filled and pinned already.
+    Ready(TierPin<'a>),
+    /// The fill ends as the handle returns.
+    Pending(Box<dyn FnOnce() -> Result<TierPin<'a>, TierError> + Send + 'a>),
 }
 
 impl<'a> Ticket<'a> {
@@ -2092,18 +2240,29 @@ impl<'a> Ticket<'a> {
     /// slot is filled, or the fill's refusal.
     pub fn new(wait: impl FnOnce() -> Result<TierPin<'a>, TierError> + Send + 'a) -> Ticket<'a> {
         Ticket {
-            wait: Box::new(wait),
+            state: TicketState::Pending(Box::new(wait)),
         }
     }
 
     /// A ticket whose batch is filled and pinned already.
     pub fn ready(pin: TierPin<'a>) -> Ticket<'a> {
-        Ticket::new(move || Ok(pin))
+        Ticket {
+            state: TicketState::Ready(pin),
+        }
+    }
+
+    /// Whether the batch is filled and pinned already: a wait returns at once.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        matches!(self.state, TicketState::Ready(_))
     }
 
     /// Block until the batch is filled; its pin, or the fill's refusal.
     pub fn wait(self) -> Result<TierPin<'a>, TierError> {
-        (self.wait)()
+        match self.state {
+            TicketState::Ready(pin) => Ok(pin),
+            TicketState::Pending(wait) => wait(),
+        }
     }
 }
 
@@ -2147,8 +2306,12 @@ pub trait TierSlots: Send + Sync {
     /// are claimed when this returns, the fill may run on other threads, and
     /// [`Ticket::wait`] returns the pin once it ends. A caller issues the
     /// next batch's ticket before it computes the one it holds, so the fill
-    /// of the next runs under the compute of this. The default fills on the
-    /// caller, the ticket ready.
+    /// of the next runs under the compute of this. Once this returns, an id
+    /// of `ids` whose [`TierSlots::slot`] lends is filled and held by the
+    /// ticket's pin (the claim found it so), and an id whose slot lends
+    /// nothing is in flight until the wait: a step computes the first early
+    /// and the second after its wait. The default fills on the caller, the
+    /// ticket ready.
     fn prefetch_pinned<'a>(
         &'a self,
         layer: usize,
@@ -2602,22 +2765,28 @@ impl HostLayer {
                 .filter(|e| !tier.host.contains(e)),
         );
         let mut stacks = self.stacks_of(split)?;
-        // Pinned until the union's reads end, as `experts_into_on`'s ids are.
-        let _pin = if scratch.tier_ids.is_empty() {
-            None
-        } else {
-            let pin = tier
-                .slots
-                .ensure_pinned(tier.layer, &scratch.tier_ids, Claim::Step)?;
-            tier.check_lent(&stacks, &scratch.tier_ids)?;
-            tier.lend(&mut stacks);
-            Some(pin)
-        };
         let run = LegRun {
             limit: Some(self.limit),
             lanes,
         };
-        serve_union(stacks, run, x, lists, out, scratch, None)
+        if scratch.tier_ids.is_empty() {
+            return serve_union(stacks, run, x, lists, out, scratch, None);
+        }
+        // The claim is made now and the misses fill on the tier's threads;
+        // the pin lasts until the union's reads end, as `experts_into_on`'s
+        // ids are.
+        let ticket = tier
+            .slots
+            .prefetch_pinned(tier.layer, &scratch.tier_ids, Claim::Step)?;
+        tier.lend(&mut stacks);
+        if ticket.is_ready() || !scratch.plan.fits(scratch.max_slots) {
+            let pin = ticket.wait()?;
+            tier.check_lent(&stacks, &scratch.tier_ids)?;
+            let served = serve_union(stacks, run, x, lists, out, scratch, None);
+            drop(pin);
+            return served;
+        }
+        serve_step_split(stacks, run, x, lists, out, scratch, tier, ticket)
     }
 
     /// The matrices a warm routine fills for `ids`, pushed to `out` in `ids`'
@@ -3197,6 +3366,24 @@ mod tests {
         /// What `note_union` was told: the layer, the call's ids and column
         /// offsets, and whether it took the batched path.
         told: std::sync::Mutex<Vec<Told>>,
+        /// A step's claim: `None` holds every id of a ticket unwaited (the
+        /// prompt batches' mode); `Some(late)` holds the claim's hits waited
+        /// for at once and the ids in `late` in flight, lending nothing
+        /// until their ticket's wait.
+        late: Option<Vec<u32>>,
+        flight: std::sync::Mutex<Vec<u32>>,
+        /// An id the mock evicts the moment after its first lent probe: a
+        /// tier that broke the pin, to show the refusal by name.
+        evict: Option<u32>,
+        gone: std::sync::Mutex<Vec<u32>>,
+        /// Each lent `slot` and each ticket wait, in order.
+        trail: std::sync::Mutex<Vec<Trail>>,
+    }
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum Trail {
+        Lent(u32, usize),
+        Wait,
     }
 
     /// One `note_union` call as the mock was told it.
@@ -3268,6 +3455,11 @@ mod tests {
                 asked: std::sync::Mutex::new(Vec::new()),
                 pins: std::sync::Mutex::new(PinLog::default()),
                 told: std::sync::Mutex::new(Vec::new()),
+                late: None,
+                flight: std::sync::Mutex::new(Vec::new()),
+                evict: None,
+                gone: std::sync::Mutex::new(Vec::new()),
+                trail: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -3335,16 +3527,32 @@ mod tests {
 
         /// The claim is made now, as a ready ticket's would be, and only the
         /// wait covers the batch's reads: a compute that reads it before its
-        /// ticket was waited for reads a fill that may be running.
+        /// ticket was waited for reads a fill that may be running. A step's
+        /// claim (`late` set) holds its hits at once; the ids in flight lend
+        /// nothing until the wait.
         fn prefetch_pinned<'a>(
             &'a self,
-            _layer: usize,
+            layer: usize,
             ids: &[u32],
             claim: super::Claim,
         ) -> Result<super::Ticket<'a>, super::TierError> {
+            self.ensured.lock().unwrap().push((layer, ids.to_vec()));
             let pin = self.pin_batch(ids, claim, false);
+            if let Some(late) = &self.late {
+                let mut log = self.pins.lock().unwrap();
+                for h in log.held.iter_mut() {
+                    h.1 = !late.contains(&h.0);
+                }
+                drop(log);
+                self.flight
+                    .lock()
+                    .unwrap()
+                    .extend(ids.iter().filter(|id| late.contains(id)));
+            }
             let ids = ids.to_vec();
             Ok(super::Ticket::new(move || {
+                self.trail.lock().unwrap().push(Trail::Wait);
+                self.flight.lock().unwrap().clear();
                 let mut log = self.pins.lock().unwrap();
                 for id in &ids {
                     log.held
@@ -3360,9 +3568,20 @@ mod tests {
 
         fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
             self.asked.lock().unwrap().push((layer, id, part));
+            if self.flight.lock().unwrap().contains(&id) || self.gone.lock().unwrap().contains(&id)
+            {
+                return None;
+            }
+            if self.evict == Some(id) && self.filled {
+                self.gone.lock().unwrap().push(id);
+            }
             let mut log = self.pins.lock().unwrap();
             if !log.held.contains(&(id, true)) {
                 log.loose.push((id, part));
+            }
+            drop(log);
+            if self.filled {
+                self.trail.lock().unwrap().push(Trail::Lent(id, part));
             }
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
         }
@@ -4062,6 +4281,7 @@ mod tests {
 
         let mut full = MockTier::of(&split, &layer, true);
         full.slots = 2 * super::UNION_BATCH_IDS + 8;
+        full.late = Some(Vec::new());
         let full = std::sync::Arc::new(full);
         layer.attach_tier(4, 1..2, full.clone());
         let mut got = vec![f32::NAN; embd * cols];
@@ -4115,6 +4335,160 @@ mod tests {
             bits(&prompt),
             bits(&want),
             "the same layer's prompt union, from the arena, writes a tier-less union's bits"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A decode step whose claim has misses in flight computes the host
+    /// segment's experts and the claim's hits first, waits for the ticket,
+    /// and computes the misses: the misses lend nothing before the wait, a
+    /// hit's down part is read by its pass before the wait, and each column
+    /// is the one-column leg's bit for bit — lists of four experts of mixed
+    /// weights, so a sum in another order moves bits. Two groups of two
+    /// claiming passes run.
+    #[test]
+    fn a_step_union_computes_its_hits_under_the_misses_fill() {
+        let (embd, ff, n_expert) = (256, 256, 8);
+        let tys = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q4_K];
+        let path = layer_file("stepsplit", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        let cols = 3;
+        let xw = Tensor2::from_vec(
+            embd,
+            cols,
+            (0..embd * cols)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        // Host id 1; tier ids 0, 2, 3, 5, 6, 7 of which 0 and 6 are in flight.
+        let lists: [&[(u32, f32)]; 3] = [
+            &[(5, 0.9), (1, 1e-3), (2, 0.25), (0, 40.0)],
+            &[(2, 0.5), (6, 3e-4), (1, 0.25), (5, 7.0)],
+            &[(7, 0.6), (3, 2.0), (5, 1e-2), (0, 0.125)],
+        ];
+        let tier_ids = [0u32, 2, 3, 5, 6, 7];
+        let (late, hits) = ([0u32, 6], [2u32, 3, 5, 7]);
+        let src = R8Source::rows(&split);
+        let mut us = UnionScratch::new_routed(embd, ff, 8, 4).unwrap();
+        let plain = build_layer(&split, embd, ff, n_expert).unwrap();
+        let mut hs = HostScratch::new(embd, ff, 4).unwrap();
+        let mut want = vec![f32::NAN; embd * cols];
+        for (j, list) in lists.iter().enumerate() {
+            let xj = Tensor2::from_vec(embd, 1, xw.data[j * embd..(j + 1) * embd].to_vec());
+            plain
+                .experts_into(src, &xj, list, &mut want[j * embd..(j + 1) * embd], &mut hs)
+                .unwrap();
+        }
+
+        let mut tier = MockTier::of(&split, &layer, true);
+        tier.slots = 2 * super::UNION_BATCH_IDS + 8;
+        tier.late = Some(late.to_vec());
+        let tier = std::sync::Arc::new(tier);
+        layer.attach_tier(4, 1..2, tier.clone());
+        let mut got = vec![f32::NAN; embd * cols];
+        let passes = us.passes();
+        layer
+            .experts_step_union_into(src, &xw, &lists, &mut got, &mut us)
+            .unwrap();
+        let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "the step split in two groups writes the one-column leg's bits"
+        );
+        assert_eq!(us.passes() - passes, 4, "two groups of two claiming passes");
+
+        let trail = tier.trail.lock().unwrap().clone();
+        let wait = trail
+            .iter()
+            .position(|t| *t == Trail::Wait)
+            .expect("the ticket was waited for");
+        let before = |id: u32, part: usize| {
+            trail[..wait]
+                .iter()
+                .filter(|t| **t == Trail::Lent(id, part))
+                .count()
+        };
+        for id in late {
+            assert_eq!(
+                (0..3).map(|part| before(id, part)).sum::<usize>(),
+                0,
+                "expert {id} lent a part before its fill ended"
+            );
+            assert!(
+                trail[wait..]
+                    .iter()
+                    .any(|t| matches!(t, Trail::Lent(i, 2) if *i == id)),
+                "expert {id} was computed after the wait"
+            );
+        }
+        for id in hits {
+            assert!(
+                before(id, 2) >= 2,
+                "expert {id}'s down part was read once by the lent check and again by its pass \
+                 before the wait, got {} reads",
+                before(id, 2)
+            );
+        }
+        assert!(
+            tier.pins.lock().unwrap().loose.is_empty(),
+            "every slot the step read was pinned"
+        );
+        assert_eq!(
+            tier.events(),
+            vec![
+                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
+                PinEvent::Unpinned(tier_ids.to_vec()),
+            ],
+            "one claim for the call's tier ids, let go after it"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The probe classifies a hit once, and the claim's pin holds it until the
+    /// call ends. A tier that broke the pin — the mock evicts a hit the moment
+    /// after its probe — is refused by name, before the ticket is waited for:
+    /// the hit is not recomputed as a miss, and nothing is computed from an
+    /// unfilled slot.
+    #[test]
+    fn a_hit_evicted_after_its_probe_is_refused_by_name() {
+        let (embd, ff, n_expert) = (256, 256, 8);
+        let tys = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q4_K];
+        let path = layer_file("stepevict", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        let xw = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd).map(|i| (i % 13) as f32 / 7.0 - 0.9).collect(),
+        );
+        // Host id 1; tier ids 2 and 5 held by the claim, 0 in flight.
+        let lists: [&[(u32, f32)]; 1] = [&[(5, 0.9), (1, 0.1), (2, 0.25), (0, 0.5)]];
+        let src = R8Source::rows(&split);
+        let mut us = UnionScratch::new_routed(embd, ff, 8, 4).unwrap();
+        let mut tier = MockTier::of(&split, &layer, true);
+        tier.slots = 2 * super::UNION_BATCH_IDS + 8;
+        tier.late = Some(vec![0]);
+        tier.evict = Some(5);
+        let tier = std::sync::Arc::new(tier);
+        layer.attach_tier(4, 1..2, tier.clone());
+        let mut got = vec![f32::NAN; embd];
+        match layer.experts_step_union_into(src, &xw, &lists, &mut got, &mut us) {
+            Err(crate::ModelError::Tier(super::TierError::Unfilled { layer: 4, id: 5 })) => {}
+            other => panic!("not the unfilled refusal of the evicted hit: {other:?}"),
+        }
+        assert!(
+            !tier.trail.lock().unwrap().contains(&Trail::Wait),
+            "the refusal came before the wait: the hit was not treated as a miss"
+        );
+        assert_eq!(
+            tier.events(),
+            vec![
+                PinEvent::Pinned(super::Claim::Step, vec![0, 2, 5]),
+                PinEvent::Unpinned(vec![0, 2, 5]),
+            ],
+            "the claim is let go whole"
         );
         std::fs::remove_file(&path).unwrap();
     }
