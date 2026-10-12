@@ -10,7 +10,7 @@ use std::fmt;
 use models::{BlockDraft, DraftSpec};
 
 use crate::stores::PASS_ROWS;
-use crate::{Advance, Committed, Target, Verify, Want};
+use crate::{Advance, Committed, Plain, Target, Verify, Want};
 
 /// Which hidden rows of the target a draft reads. The rows themselves — which
 /// layers, how wide — are the draft file's and the target's to agree on at
@@ -106,8 +106,8 @@ pub trait Draft<T: Verify> {
 
     /// The verify of `rows` keeps its first `accepted` rows; `out` holds one
     /// id a row, the id the pass took at each kept row ([`Pick`]: the
-    /// argmax on a greedy pass, the draw on a sampled one) and the argmax
-    /// past them. Runs before [`Verify::commit`] takes the rest back, so the
+    /// argmax on a greedy pass, the draw on a sampled one, the stream's id
+    /// on a [`Forced`] one) and the argmax past them. Runs before [`Verify::commit`] takes the rest back, so the
     /// target's taps still hold every row. `rows` is the proposal's `n + 1`,
     /// fewer than `WIDTH + 1` when the draft proposed fewer.
     fn accept(
@@ -279,6 +279,194 @@ pub struct Sample<F>(pub F);
 impl<T: RowLogits, F: FnMut(&[f32]) -> u32> Pick<T> for Sample<F> {
     fn pick(&mut self, t: &mut T, r: usize, _argmax: u32) -> Result<u32, T::Error> {
         Ok((self.0)(t.row_logits(r)?))
+    }
+}
+
+/// A [`Forced`] stream asked for an id past its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exhausted {
+    /// The ids the stream held.
+    pub ids: usize,
+}
+
+impl fmt::Display for Exhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the forced id stream holds {} ids and a pass took one more",
+            self.ids
+        )
+    }
+}
+
+impl std::error::Error for Exhausted {}
+
+/// The forced pick: each row's id is the next of a fixed stream, whatever the
+/// row's argmax. A draft's proposal is then kept exactly while it matches the
+/// stream, so a drafted run and a plain run take one id stream and differ in
+/// the passes they run. The verify rows past the first mismatch still run
+/// and are taken back. A stream that runs out is an [`Exhausted`], which
+/// `fail` makes the target's own error (as [`Sample`]'s closure is the
+/// target's draw); no default id is ever taken.
+pub struct Forced<'a, F> {
+    ids: &'a [u32],
+    cursor: usize,
+    fail: F,
+}
+
+impl<'a, F> Forced<'a, F> {
+    /// The pick over `ids`, none taken yet.
+    pub fn new(ids: &'a [u32], fail: F) -> Forced<'a, F> {
+        Forced {
+            ids,
+            cursor: 0,
+            fail,
+        }
+    }
+
+    /// The next id of the stream, then the cursor one on: the one owner of
+    /// the cursor, for the pick and for a loop that has no [`Target`].
+    pub fn take(&mut self) -> Result<u32, Exhausted> {
+        let id = *self.ids.get(self.cursor).ok_or(Exhausted {
+            ids: self.ids.len(),
+        })?;
+        self.cursor += 1;
+        Ok(id)
+    }
+
+    /// The ids taken so far.
+    pub fn taken(&self) -> usize {
+        self.cursor
+    }
+}
+
+impl<T: Target, F: FnMut(Exhausted) -> T::Error> Pick<T> for Forced<'_, F> {
+    fn pick(&mut self, _t: &mut T, _r: usize, _argmax: u32) -> Result<u32, T::Error> {
+        self.take().map_err(&mut self.fail)
+    }
+}
+
+/// A line of an id file that is no id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotAnId {
+    /// The line's number in the file, counted from 1.
+    pub line: usize,
+    pub text: String,
+}
+
+impl fmt::Display for NotAnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "line {} ({:?}) is no id", self.line, self.text)
+    }
+}
+
+impl std::error::Error for NotAnId {}
+
+/// The ids of `text`, one a line, from the line `from` on (counted from 0;
+/// the lines before it are not read): the stream a [`Forced`] pick takes.
+pub fn ids_from(text: &str, from: usize) -> Result<Vec<u32>, NotAnId> {
+    text.lines()
+        .enumerate()
+        .skip(from)
+        .map(|(i, l)| {
+            l.parse().map_err(|_| NotAnId {
+                line: i + 1,
+                text: l.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// An [`Advance`] whose pass takes its ids by any [`Pick`], not only the
+/// argmax: [`Plain`] and [`Speculative`].
+pub trait Picking<T: Target>: Advance<T> {
+    /// [`Advance::pass`] with the ids taken by `pick`, one call a row.
+    fn pass_with<P: Pick<T>>(
+        &mut self,
+        t: &mut T,
+        last: u32,
+        pick: &mut P,
+        out: &mut Vec<u32>,
+    ) -> Result<Committed, T::Error>;
+}
+
+impl<T: Target> Picking<T> for Plain {
+    fn pass_with<P: Pick<T>>(
+        &mut self,
+        t: &mut T,
+        last: u32,
+        pick: &mut P,
+        out: &mut Vec<u32>,
+    ) -> Result<Committed, T::Error> {
+        let pos = t.pos();
+        let argmax = t.step(last, Want::Argmax)?.argmax();
+        out.push(pick.pick(t, 0, argmax)?);
+        Ok(Committed {
+            pos,
+            kept: 1,
+            rows: 1,
+            proposed: false,
+        })
+    }
+}
+
+impl<T: Verify, D: Draft<T>, const M: usize> Picking<T> for Speculative<D, M>
+where
+    Window<M>: Widths,
+{
+    fn pass_with<P: Pick<T>>(
+        &mut self,
+        t: &mut T,
+        last: u32,
+        pick: &mut P,
+        out: &mut Vec<u32>,
+    ) -> Result<Committed, T::Error> {
+        self.pass_picking(t, last, pick, out)
+    }
+}
+
+/// An advance driven by a pick of its own: [`generate`](crate::generate)
+/// over it takes every id the pick gives, the passes' and, through
+/// [`Picked::first`], generated token 0's.
+pub struct Picked<'a, A, P> {
+    advance: &'a mut A,
+    pick: P,
+}
+
+impl<'a, A, P> Picked<'a, A, P> {
+    /// `advance`, its ids taken by `pick`.
+    pub fn new(advance: &'a mut A, pick: P) -> Picked<'a, A, P> {
+        Picked { advance, pick }
+    }
+
+    /// The pick, for what it counts.
+    pub fn pick(&self) -> &P {
+        &self.pick
+    }
+
+    /// Generated token 0: the prompt call's `argmax`, taken by the pick as
+    /// every later id is; pass it to [`generate`](crate::generate) as `first`.
+    pub fn first<T: Target>(&mut self, t: &mut T, argmax: u32) -> Result<u32, T::Error>
+    where
+        P: Pick<T>,
+    {
+        self.pick.pick(t, 0, argmax)
+    }
+}
+
+impl<T: Target, A: Picking<T>, P: Pick<T>> Advance<T> for Picked<'_, A, P> {
+    const ROWS: usize = <A as Advance<T>>::ROWS;
+
+    fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error> {
+        self.advance.prompt(t, ids)
+    }
+
+    fn begin(&mut self, t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error> {
+        self.advance.begin(t, prompt, first)
+    }
+
+    fn pass(&mut self, t: &mut T, last: u32, out: &mut Vec<u32>) -> Result<Committed, T::Error> {
+        self.advance.pass_with(t, last, &mut self.pick, out)
     }
 }
 
@@ -464,8 +652,9 @@ mod tests {
     use super::{NotBuilt, Program, Width, Widths, Window, accepted_rows, program};
     use crate::mock::{Call, Mock, MockError, Quiet};
     use crate::{
-        Advance, Committed, Draft, Lookup, Out, PassSink, Plain, RowLogits, Sample, Speculative,
-        Stop, StopReason, TapNeed, Verify, Want, generate,
+        Advance, Argmax, Committed, Draft, Forced, GenOutcome, Lookup, Out, PassSink, Picked,
+        Picking, Plain, RowLogits, Sample, Speculative, Stop, StopReason, TapNeed, Verify, Want,
+        generate, ids_from,
     };
 
     /// Row 0 always; then while the argmax of row r is row r + 1's id.
@@ -741,6 +930,9 @@ mod tests {
         heard: Vec<u32>,
         whole: usize,
         cut: usize,
+        /// Each accept's rows (the token at the target's position, then the
+        /// proposal) and the rows it kept.
+        accepts: Vec<(Vec<u32>, usize)>,
     }
 
     impl Heard {
@@ -751,6 +943,7 @@ mod tests {
                 heard: Vec::new(),
                 whole: 0,
                 cut: 0,
+                accepts: Vec::new(),
             }
         }
     }
@@ -783,6 +976,7 @@ mod tests {
             accepted: usize,
         ) -> Result<(), MockError> {
             self.heard.extend_from_slice(&out[..accepted]);
+            self.accepts.push((rows.to_vec(), accepted));
             if accepted == rows.len() {
                 self.whole += 1;
             } else {
@@ -958,6 +1152,172 @@ mod tests {
             "{s_reads} reads for {} ids",
             ids.len()
         );
+    }
+
+    /// `n` ids over `prompt` that follow the mock's own argmax at about
+    /// half the positions and leave it at the others (seeded), so a draft
+    /// that proposes the target's argmax is right on some rows and wrong on
+    /// others.
+    fn forced_stream(prompt: &[u32], seed: u64, n: usize) -> Vec<u32> {
+        let mut t = Mock::new();
+        let mut rng = rng_of(seed);
+        let mut argmax = t.prompt(prompt, Want::Argmax).unwrap().argmax();
+        let mut ids = Vec::new();
+        while ids.len() < n {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let off = u32::try_from((rng >> 40) % 4).unwrap();
+            let id = if rng >> 61 < 4 {
+                argmax
+            } else {
+                (argmax + 1 + off) % 5
+            };
+            ids.push(id);
+            argmax = t.step(id, Want::Argmax).unwrap().argmax();
+        }
+        ids
+    }
+
+    /// A run over `stream` through [`Picked`] and [`Forced`]: the prompt,
+    /// generated token 0 from the pick, then [`generate`] until `n` ids at
+    /// least; the outcome, each pass, the target's calls and the ids the
+    /// stream gave.
+    fn forced_run<A: Picking<Mock>>(
+        adv: &mut A,
+        prompt: &[u32],
+        stream: &[u32],
+        n: usize,
+    ) -> Result<(GenOutcome, Vec<Committed>, Vec<Call>, usize), MockError> {
+        let mut t = Mock::new();
+        let argmax = adv.prompt(&mut t, prompt)?;
+        let mut picked = Picked::new(adv, Forced::new(stream, MockError::Forced));
+        let first = picked.first(&mut t, argmax)?;
+        let mut sink = Kept::default();
+        let stop = Stop::new(n, 1000).unwrap();
+        let out = generate(&mut t, &mut picked, prompt, first, &stop, &mut sink)?;
+        Ok((out, sink.0, t.calls().to_vec(), picked.pick().taken()))
+    }
+
+    /// Identity under the forced pick: a plain run and a drafted run over one
+    /// stream emit that stream, token 0 included, one pick a token; the
+    /// drafted run keeps on a proposed pass the rows whose proposal matches
+    /// the stream and no more (the correcting row is kept, taken from the
+    /// stream, and the rows past it taken back), with windows both kept
+    /// whole and cut short.
+    #[test]
+    fn forced_passes_emit_the_stream() {
+        let prompt = [1, 2, 3, 1, 2];
+        let n = 60;
+        let (mut whole, mut cut) = (0, 0);
+        for seed in 0..16 {
+            let stream = forced_stream(&prompt, seed, n + 3);
+            let (plain, _, calls, taken) = forced_run(&mut Plain, &prompt, &stream, n).unwrap();
+            assert_eq!(plain.tokens[..], stream[..n], "seed {seed}");
+            assert_eq!(taken, n, "seed {seed}: one pick a token");
+            assert!(
+                calls
+                    .iter()
+                    .all(|c| matches!(c, Call::Prompt(..) | Call::Step(_)))
+            );
+
+            let mut spec = Speculative::<Heard, 4>::new(Heard::new(&[3, 1, 0, 2]));
+            let (got, passes, _, taken) = forced_run(&mut spec, &prompt, &stream, n).unwrap();
+            assert_eq!(got.tokens[..n], stream[..n], "seed {seed}");
+            assert_eq!(taken, got.tokens.len(), "seed {seed}: one pick a token");
+            let mut at = 1;
+            let mut accepts = spec.draft().accepts.iter();
+            for c in &passes {
+                if !c.proposed {
+                    assert_eq!(c.kept, 1, "seed {seed}: a step keeps its row");
+                    at += 1;
+                    continue;
+                }
+                let (rows, accepted) = accepts.next().expect("an accept a proposed pass");
+                assert_eq!(rows[0], stream[at - 1], "seed {seed}: the row 0 token");
+                let matched = (0..rows.len() - 1)
+                    .take_while(|&r| rows[r + 1] == stream[at + r])
+                    .count();
+                let want = rows.len().min(1 + matched);
+                assert_eq!((c.kept, *accepted), (want, want), "seed {seed} at {at}");
+                if want == rows.len() {
+                    whole += 1;
+                } else {
+                    cut += 1;
+                }
+                at += c.kept;
+            }
+            assert!(accepts.next().is_none());
+            assert_eq!(at, got.tokens.len(), "seed {seed}");
+            assert_eq!(
+                spec.draft().heard,
+                stream[1..got.tokens.len()],
+                "seed {seed}"
+            );
+        }
+        assert!(whole > 0 && cut > 0, "whole {whole}, cut {cut}");
+    }
+
+    /// A stream shorter than the run needs is a named error from the
+    /// pick, on a plain pass and on a drafted one, and no id past it is
+    /// taken.
+    #[test]
+    fn a_short_forced_stream_is_a_named_error() {
+        let prompt = [1, 2, 3, 1, 2];
+        let stream = forced_stream(&prompt, 3, 10);
+        let plain = forced_run(&mut Plain, &prompt, &stream, 30).unwrap_err();
+        assert!(
+            matches!(plain, MockError::Forced(e) if e.ids == 10),
+            "{plain}"
+        );
+        let mut spec = Speculative::<Heard, 4>::new(Heard::new(&[3, 1, 0, 2]));
+        let drafted = forced_run(&mut spec, &prompt, &stream, 30).unwrap_err();
+        assert!(
+            matches!(drafted, MockError::Forced(e) if e.ids == 10),
+            "{drafted}"
+        );
+        assert_eq!(
+            drafted.to_string(),
+            "the forced id stream holds 10 ids and a pass took one more"
+        );
+        let mut forced = Forced::new(&stream, MockError::Forced);
+        for want in &stream {
+            assert_eq!(forced.take().unwrap(), *want);
+        }
+        assert_eq!((forced.taken(), forced.take().is_err()), (10, true));
+        assert_eq!(forced.taken(), 10, "a refused take moves nothing");
+    }
+
+    /// An id file is one id a line from the offset on: the lines before it
+    /// are not read, and a line that is no id is refused with its number in
+    /// the file.
+    #[test]
+    fn an_id_file_is_read_from_its_offset() {
+        assert_eq!(ids_from("5\n6\n7\n", 0).unwrap(), [5, 6, 7]);
+        assert_eq!(ids_from("x\n6\r\n7", 1).unwrap(), [6, 7]);
+        assert_eq!(ids_from("5\n6\n", 2).unwrap(), Vec::<u32>::new());
+        let e = ids_from("5\n6\nx3\n7", 1).unwrap_err();
+        assert_eq!((e.line, e.text.as_str()), (3, "x3"));
+        assert_eq!(e.to_string(), "line 3 (\"x3\") is no id");
+        let blank = ids_from("5\n\n7", 0).unwrap_err();
+        assert_eq!((blank.line, blank.text.as_str()), (2, ""));
+    }
+
+    /// The argmax pick through [`Picked`] is the pass itself: the same calls
+    /// and tokens as the advance alone, plain and drafted.
+    #[test]
+    fn the_argmax_pick_through_picked_changes_nothing() {
+        let prompt = [1, 2, 3, 1, 2];
+        let stop = Stop::new(40, 1000).unwrap();
+        let (plain, plain_calls) = run(&mut Plain, &prompt, &stop);
+        let mut p = Plain;
+        let (got, calls) = run(&mut Picked::new(&mut p, Argmax), &prompt, &stop);
+        assert_eq!((got, calls), (plain, plain_calls));
+        let mut spec = Speculative::<Heard, 4>::new(Heard::new(&[3, 1, 0, 2]));
+        let (want, want_calls) = run(&mut spec, &prompt, &stop);
+        let mut spec = Speculative::<Heard, 4>::new(Heard::new(&[3, 1, 0, 2]));
+        let (got, calls) = run(&mut Picked::new(&mut spec, Argmax), &prompt, &stop);
+        assert_eq!((got, calls), (want, want_calls));
     }
 
     /// A sink that keeps every pass's [`Committed`].

@@ -635,21 +635,24 @@ tier_arm() {
 
 # The greedy text check's rows, TK_ROWS: `<round>|<key>|<label>|<hash>` a line. tk_hash <output>: the md5
 # (12 hex) of the arm's ids, one `tokens` line a slot (the ` slot=<j>` tag, brackets and spaces dropped),
-# `none` when it printed none. tk_key <ids> <dep> [<slots> [<model>]]: the arms that fed one prompt share a
-# key. tk_add <round> <key> <label> <output>.
+# `none` when it printed none. tk_key <ids> <dep> [<slots> [<model> [<forced>]]]: the arms that fed one prompt
+# share a key; a non-empty <forced> (the arm takes its ids from BLOOMERY_FORCE_IDS) ends it `.f`, so forced
+# arms are compared with each other and never with greedy ones. tk_add <round> <key> <label> <output>.
 TK_ROWS='' TK_SHOWN=','
 tk_hash() {
   local ids
   ids=$(sed -n 's/^tokens //p' <<< "$1" | sed 's/ slot=[0-9]*$//' | tr -d '[] ')
   if [ -z "$ids" ]; then echo none; else printf '%s\n' "$ids" | md5sum | cut -c1-12; fi
 }
-tk_key() { echo "$1$2${3:+.s$3}${4:+.m${4##*/}}"; }
+tk_key() { echo "$1$2${3:+.s$3}${4:+.m${4##*/}}${5:+.f}"; }
 tk_add() { TK_ROWS="$TK_ROWS$1|$2|$3|$(tk_hash "$4")"$'\n'; }
-# tk_line <round>: `tokens r<R>: equal`, or `tokens r<R>: differ <key> <label>=<hash> ...` (the groups that
-# parted, ` ;` between them), nothing when no two arms of the round fed one prompt.
+# tk_line <round> [<forced>]: `tokens r<R>: equal`, or `tokens r<R>: differ <key> <label>=<hash> ...` (the
+# groups that parted, ` ;` between them), nothing when no two arms of the round fed one prompt. The groups
+# are the greedy ones (keys not ending `.f`); with a <forced> they are the forced ones, and the line reads
+# `tokens r<R> forced: ...`.
 tk_line() {
-  printf '%s' "$TK_ROWS" | awk -F'|' -v r="$1" '
-    $1 == r {
+  printf '%s' "$TK_ROWS" | awk -F'|' -v r="$1" -v f="${2:+1}" '
+    $1 == r && (($2 ~ /\.f$/) ? "1" : "") == f {
       if (!($2 in n)) order[++k] = $2
       n[$2]++
       ent[$2] = ent[$2] " " $3 "=" $4
@@ -663,28 +666,87 @@ tk_line() {
         if (distinct[g] > 1) { bad++; diff = diff (diff == "" ? "" : " ;") " " g ent[g] }
       }
       if (compared == 0) exit
-      if (bad == 0) print "tokens r" r ": equal"
-      else print "tokens r" r ": differ" diff
+      tag = f == "1" ? " forced" : ""
+      if (bad == 0) print "tokens r" r tag ": equal"
+      else print "tokens r" r tag ": differ" diff
     }'
 }
 # tk_round <round>: that round's line, once. tk_rounds: every round's, in order (a blocks run, whose rounds
 # finish together). tk_summary: the closing count, over the rounds that had a pair.
 tk_round() {
-  local line
+  local line forced
   case $TK_SHOWN in *",$1,"*) return 0 ;; esac
-  line=$(tk_line "$1")
-  [ -z "$line" ] || { echo "$line"; TK_SHOWN="$TK_SHOWN$1,"; }
+  line=$(tk_line "$1") forced=$(tk_line "$1" 1)
+  [ -z "$line" ] || echo "$line"
+  [ -z "$forced" ] || echo "$forced"
+  [ -z "$line$forced" ] || TK_SHOWN="$TK_SHOWN$1,"
 }
 tk_rounds() {
   local r
   for r in $(printf '%s' "$TK_ROWS" | cut -d'|' -f1 | sort -un); do tk_round "$r"; done
 }
+# The forced groups (the arms of BLOOMERY_FORCE_IDS) are counted apart: every arm takes the stream's ids, so
+# a forced round that parted is a defect, not a text difference; TK_FORCED_PARTED is their count of rounds
+# that parted, for the runner to fail on. A run of forced pairs only reads its own counts on the one line.
+TK_FORCED_PARTED=0
 tk_summary() {
-  local r line n=0 k=0
+  local r line forced n=0 k=0 nf=0 kf=0
   for r in $(printf '%s' "$TK_ROWS" | cut -d'|' -f1 | sort -un); do
-    line=$(tk_line "$r")
+    line=$(tk_line "$r") forced=$(tk_line "$r" 1)
     [ -z "$line" ] || n=$((n + 1))
     case $line in *": differ"*) k=$((k + 1)) ;; esac
+    [ -z "$forced" ] || nf=$((nf + 1))
+    case $forced in *": differ"*) kf=$((kf + 1)) ;; esac
   done
-  echo "tokens-differ rounds: $k of $n (arms on one prompt, P and n whose greedy ids differ)"
+  TK_FORCED_PARTED=$kf
+  if [ "$n" = 0 ] && [ "$nf" -gt 0 ]; then
+    echo "tokens-differ rounds: $kf of $nf (forced: arms on one prompt fed one id stream, so a part is a defect)"
+  elif [ "$nf" -gt 0 ]; then
+    echo "tokens-differ rounds: $k of $n (arms on one prompt, P and n whose greedy ids differ); forced: $kf of $nf (arms fed one id stream, so a part is a defect)"
+  else
+    echo "tokens-differ rounds: $k of $n (arms on one prompt, P and n whose greedy ids differ)"
+  fi
+}
+
+# The `[loop]` tag: a single-stream row whose distinct ids (the row's distinct_tokens, over the steps after
+# step 0) are under the floor of tools/ref/loop-floor.py for a window of that many ids, derived from the
+# profile's own corpus windows (LOOP_CORPUS, the runner's corpus-prose.ids, and corpus-code.ids beside it
+# where the profile holds one).
+# loop_floor <steps>: LOOP_FLOOR, the floor in distinct ids for that window size, `-` where the profile holds
+# no corpus or the script refuses; computed once a size (LOOP_FLOORS: ` <steps>=<floor>` words) and printed
+# once as a `loop-floor:` line. loop_tag <steps> <distinct>: LOOP_TAG ` [loop]` when the row holds fewer
+# distinct ids than the floor, else empty.
+LOOP_FLOORS=' ' LOOP_FLOOR=- LOOP_TAG= LOOP_CORPUS=${LOOP_CORPUS:-}
+loop_floor() {
+  local line corpus code
+  local -a files
+  case $LOOP_FLOORS in
+    *" $1="*)
+      LOOP_FLOOR=${LOOP_FLOORS##* "$1"=}
+      LOOP_FLOOR=${LOOP_FLOOR%% *}
+      return 0
+      ;;
+  esac
+  LOOP_FLOOR=-
+  corpus=$LOOP_CORPUS
+  if [ -n "$corpus" ] && [ -r "$corpus" ]; then
+    files=("$corpus")
+    code=${corpus%/*}/corpus-code.ids
+    [ ! -r "$code" ] || files+=("$code")
+    if line=$(python3 "${BASH_SOURCE[0]%/*}/loop-floor.py" --n "$1" "${files[@]}" 2>&1); then
+      echo "    loop-floor: $line (1st percentile of distinct/n over the n-id windows of ${files[*]})"
+      LOOP_FLOOR=${line#*distinct=}
+      LOOP_FLOOR=${LOOP_FLOOR%% *}
+    else
+      echo "    loop-floor: n=$1 none: ${line##*$'\n'}"
+    fi
+  fi
+  LOOP_FLOORS+="$1=$LOOP_FLOOR "
+}
+loop_tag() {
+  LOOP_TAG=
+  [ "$1" -ge 1 ] || return 0
+  loop_floor "$1"
+  [ "$LOOP_FLOOR" != - ] || return 0
+  [ "$2" -ge "$LOOP_FLOOR" ] || LOOP_TAG=' [loop]'
 }

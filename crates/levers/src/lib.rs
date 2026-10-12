@@ -31,11 +31,12 @@ use std::path::{Path, PathBuf};
 mod registry;
 use registry::REGISTRY;
 pub use registry::{
-    CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, GEN_SLOTS_MAX,
-    HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM, LANE_PREFETCH,
-    LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NVTIER_BYTES,
-    NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX,
-    QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS,
+    CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, FORCE_IDS, GEN_SLOTS,
+    GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM,
+    LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
+    NVTIER_BYTES, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
+    PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN,
+    STEP_STATS, THREADS,
 };
 pub use registry::{SPLIT_WALK, XSTREAM};
 
@@ -101,6 +102,9 @@ pub(crate) enum Kind {
     PathOr(&'static [&'static str]),
     /// The path of a regular file that exists when the value is read.
     File,
+    /// `<path>:<offset>`: the path of a regular file that exists when the
+    /// value is read (holding no `:`), a `:` and a whole number.
+    FileAt,
     /// What the name's owner takes: a name no reading here parses.
     Text,
     /// `off`, or the adaptive residency rule's `mid-p<P>-s<S>`
@@ -174,6 +178,20 @@ impl Kind {
             },
             Kind::File if Path::new(v).is_file() => Ok(Value::Path(PathBuf::from(v))),
             Kind::File if !v.is_empty() => Err(refused(Some("no regular file is at that path"))),
+            Kind::FileAt => {
+                let (path, at) = v.rsplit_once(':').ok_or_else(|| refused(None))?;
+                if path.contains(':') {
+                    return Err(refused(Some("the path holds a ':'")));
+                }
+                if !Path::new(path).is_file() {
+                    return Err(refused(Some("no regular file is at that path")));
+                }
+                match whole(at) {
+                    Ok(at) => Ok(Value::PathAt(PathBuf::from(path), at)),
+                    Err(NotWhole::Syntax) => Err(refused(None)),
+                    Err(NotWhole::Overflow) => Err(refused(Some(OVERFLOW))),
+                }
+            }
             Kind::Residency => match residency_word(v) {
                 Some(ResidencyWord::Off) => Ok(Value::Word("off")),
                 // Parsed once at `main`: the word lives for the process, as
@@ -213,6 +231,10 @@ impl Kind {
             Kind::Path => "a non-empty path".to_string(),
             Kind::PathOr(words) => format!("{}, or a non-empty path", words.join(", ")),
             Kind::File => "the path of an existing regular file".to_string(),
+            Kind::FileAt => format!(
+                "<path>:<offset>, the path of an existing regular file holding no ':' and a \
+                 whole number ({DIGITS})"
+            ),
             Kind::Text => "what its owner takes".to_string(),
             Kind::Residency => {
                 format!("off, or mid-p<P>-s<S> with P and S whole numbers ({DIGITS}), S at least 1")
@@ -269,6 +291,8 @@ pub(crate) enum Value {
     Bytes(u64),
     /// A [`Kind::Path`], [`Kind::PathOr`] or [`Kind::File`] path.
     Path(PathBuf),
+    /// A [`Kind::FileAt`] path and offset.
+    PathAt(PathBuf, u64),
 }
 
 /// What an unset name means.
@@ -972,6 +996,18 @@ impl Levers {
     pub fn gen_slots(&self) -> usize {
         let n = Levers::defaulted(GEN_SLOTS, self.count(GEN_SLOTS));
         Levers::usize_of(GEN_SLOTS, n)
+    }
+
+    /// `BLOOMERY_FORCE_IDS`: the file of ids (one a line), which existed
+    /// when the reading ran, and the offset its ids are taken from; `None`
+    /// unset (each row's argmax).
+    #[must_use]
+    pub fn force_ids(&self) -> Option<(&Path, u64)> {
+        match &self.entry(FORCE_IDS).value {
+            None => None,
+            Some(Value::PathAt(p, at)) => Some((p, *at)),
+            v => panic!("{FORCE_IDS} holds {v:?}, not a path and an offset"),
+        }
     }
 
     /// `BLOOMERY_SCREEN`: a serving seat draws its start screen on a

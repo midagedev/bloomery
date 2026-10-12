@@ -430,6 +430,7 @@ blk_pytools() {
     "tools/ref/gguf-respell.py --self-test"
     "tools/ref/hidden-diff.py --self-test"
     "tools/ref/lev_ref.py --self-test"
+    "tools/ref/loop-floor.py --self-test"
     "tools/ref/nsys-bridge.py --self-test"
     "tools/ref/ptx-canon.py --self-test"
     "tools/ref/qdot-rate-floors.py --self-test"

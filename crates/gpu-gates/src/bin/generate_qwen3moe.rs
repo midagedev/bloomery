@@ -200,6 +200,16 @@
 //! how many the target kept (`tools/flow/q38width.py` replays them). A
 //! sampling request is a server matter; this CLI is greedy.
 //!
+//! `BLOOMERY_FORCE_IDS=<path>:<offset>` takes every generated id from a
+//! file of ids (one a line) from the line `offset` on, whatever the row's
+//! argmax: generated token 0 is the file's first id, the plain path
+//! (`run_arm`) and the draft's passes (`runtime::Forced`) take the next, so a
+//! `BLOOMERY_DRAFT=mtp` arm and a `BLOOMERY_DRAFT=off` arm decode one id
+//! stream and differ only in the passes they run. A file with fewer ids
+//! than `-n` (and the window's rows less one, drafting) from `offset` is
+//! refused by name before the load; so is the lever beside
+//! `BLOOMERY_GEN_SLOTS` past 1 and `--dump-taps`.
+//!
 //! Lines: `prompt_ids`, `load` (`arch=` the file's architecture; with the
 //! decode flash pass: `flash_mma=`; for qwen3moe the ubatches' attention,
 //! `ubatch_attn=gqa_prefill_flash`, and their size,
@@ -371,9 +381,9 @@ mod cli {
     use super::route_trace38::{self, TraceRun, experts_name};
     use super::taps;
     use super::xstream_rule::{Stage, xstream_rule};
-    use app::Session;
     use app::arch::qwen3moe::Q38Cfg;
     use app::mtp::{MtpBody, MtpDraft, WindowDraft};
+    use app::{Session, SessionError};
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
@@ -410,7 +420,9 @@ mod cli {
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
     use runtime::width::{Choosing, Chosen as _, Mode as WidthMode};
-    use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
+    use runtime::{
+        Advance, Committed, Exhausted, Forced, PassSink, Picked, Speculative, Stop, Target,
+    };
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -1205,6 +1217,9 @@ mod cli {
         last_step: bool,
         /// `BLOOMERY_GEN_SLOTS`: the streams an arm decodes in one pass.
         slots: usize,
+        /// `BLOOMERY_FORCE_IDS`: the ids every arm takes, from the file's
+        /// `offset` line on (each arm starts at its first).
+        force: Option<Vec<u32>>,
     }
 
     /// A prompt call's streaming picks, each with its ubatch, and its end;
@@ -1242,6 +1257,7 @@ mod cli {
             bloomery_levers::XSTREAM,
             bloomery_levers::SPLIT_WALK,
             bloomery_levers::GEN_SLOTS,
+            bloomery_levers::FORCE_IDS,
         ];
         if std::env::args().any(|a| a == "--place") {
             acts_on.extend(q3place::PLACED_LEVERS);
@@ -1304,6 +1320,13 @@ mod cli {
                     levers.gen_slots()
                 )
                 .into());
+            }
+            if levers.force_ids().is_some() {
+                return Err(
+                    "BLOOMERY_FORCE_IDS takes a generation's ids from a file; --dump-taps runs \
+                     each prompt one eager step per id"
+                        .into(),
+                );
             }
             residency_unset_early(
                 &levers,
@@ -1376,6 +1399,13 @@ mod cli {
                 .collect::<Result<_, GateError>>()?
         };
         let slots = levers.gen_slots();
+        if slots > 1 && levers.force_ids().is_some() {
+            return Err(format!(
+                "BLOOMERY_FORCE_IDS takes one stream's ids from a file; BLOOMERY_GEN_SLOTS={slots} \
+                 takes each slot's argmax, which the slots pass does not hand to a pick"
+            )
+            .into());
+        }
         if slots > 1 {
             slots_refused(
                 slots,
@@ -1609,6 +1639,7 @@ mod cli {
             width: WidthMode::of(levers.mtp_width())?,
             last_step,
             slots,
+            force: force_ids(&levers, &arms, draft)?,
         };
         match chosen {
             Chosen::Qwen3(path, place) => {
@@ -1712,6 +1743,52 @@ mod cli {
         "--mode",
         "--place",
     ];
+
+    /// The window of the MTP draft's passes: the most ids a pass takes.
+    const MTP_ROWS: usize =
+        <Speculative<Choosing<MtpDraft<Body38>>, 4> as Advance<Session<Body38>>>::ROWS;
+
+    /// `BLOOMERY_FORCE_IDS`'s ids: the file's lines from the offset on, one
+    /// id each. Refused by name: a line that is no id, and a file with fewer
+    /// ids from the offset than the longest arm takes — its `-n`, and a
+    /// drafted pass's rows less one more, since the last pass may keep rows
+    /// past `-n`.
+    fn force_ids(
+        levers: &Levers,
+        arms: &[Arm],
+        draft: Draft38,
+    ) -> Result<Option<Vec<u32>>, GateError> {
+        let Some((path, offset)) = levers.force_ids() else {
+            return Ok(None);
+        };
+        let name = bloomery_levers::FORCE_IDS;
+        let offset = usize::try_from(offset)?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("{name}: {} was not read: {e}", path.display()))?;
+        let ids = runtime::ids_from(&text, offset)
+            .map_err(|e| format!("{name}: {} {e}", path.display()))?;
+        let rows = if draft == Draft38::Mtp {
+            MTP_ROWS - 1
+        } else {
+            0
+        };
+        let need = arms.iter().map(|a| a.n_gen).max().unwrap_or(0) + rows;
+        if ids.len() < need {
+            return Err(format!(
+                "{name}: {} holds {} ids from line {offset}; this run takes {need} (-n {}{})",
+                path.display(),
+                ids.len(),
+                need - rows,
+                if rows > 0 {
+                    format!(", and {rows} more for the draft's last window")
+                } else {
+                    String::new()
+                }
+            )
+            .into());
+        }
+        Ok(Some(ids))
+    }
 
     /// Whether `BLOOMERY_DRAFT` drafts this run: `mtp` on a qwen4exp file;
     /// every other family and word is refused by name.
@@ -2666,7 +2743,8 @@ mod cli {
 
     /// One arm through the draft: the prompt — the draft walked over its
     /// units, its own lines as the plain run's — then the windows until `-n`
-    /// tokens are out, every kept token the target's own argmax.
+    /// tokens are out, every kept token the target's own argmax (under
+    /// `BLOOMERY_FORCE_IDS`, the file's id at its position).
     fn run_arm38_mtp(
         s: &mut Session<Body38>,
         spec: &mut Speculative<Choosing<MtpDraft<Body38>>, 4>,
@@ -2681,6 +2759,17 @@ mod cli {
         let next = spec.prompt(s, ids)?;
         after38_prompt(s.model_mut(), before)?;
         let prefill_wall = t.elapsed();
+        // Under `BLOOMERY_FORCE_IDS` the passes take the file's ids by a
+        // `Forced` pick, generated token 0 the first of them.
+        let fail = |e: Exhausted| SessionError::Caller(Box::new(e));
+        let mut picked = run
+            .force
+            .as_deref()
+            .map(|ids| Picked::new(&mut *spec, Forced::new(ids, fail)));
+        let next = match &mut picked {
+            Some(p) => p.first(s, next)?,
+            None => next,
+        };
         println!(
             "step 0 {} {next} (the {} prompt ids in prefill_steps={} units, plan={}, {:.2} s, \
              runtime value)",
@@ -2698,7 +2787,10 @@ mod cli {
             n_gen,
         };
         let stop = Stop::new(n_gen, s.ctx())?;
-        let out = runtime::generate(s, spec, ids, next, &stop, &mut sink)?;
+        let out = match &mut picked {
+            Some(p) => runtime::generate(s, p, ids, next, &stop, &mut sink)?,
+            None => runtime::generate(s, spec, ids, next, &stop, &mut sink)?,
+        };
         if out.tokens.len() < n_gen {
             return Err(format!(
                 "generate_qwen3moe: the generation stopped at {} after {} tokens, before -n",
@@ -2898,6 +2990,15 @@ mod cli {
             (true, None) => return Err("the prompt has no ids".into()),
         };
         let prefill_wall = t.elapsed();
+        // Under `BLOOMERY_FORCE_IDS` the file's ids replace the argmax, the
+        // prompt call's included.
+        let mut forced = run
+            .force
+            .as_deref()
+            .map(|ids| Forced::new(ids, |e: Exhausted| e));
+        if let Some(f) = &mut forced {
+            next = f.take()?;
+        }
         let image = B::image(m, &plan)?;
         println!(
             "step 0 {} {next} (the {} prompt ids in prefill_steps={} units, plan={}, {:.2} s, \
@@ -2919,8 +3020,13 @@ mod cli {
         }
         for _ in 1..n_gen {
             let t0 = Instant::now();
-            next = m.step(&[next])?;
-            rows.push((m.pos() - 1, next, t0.elapsed().as_secs_f64() * 1e3));
+            let argmax = m.step(&[next])?;
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            next = match &mut forced {
+                Some(f) => f.take()?,
+                None => argmax,
+            };
+            rows.push((m.pos() - 1, next, ms));
             if run.stats {
                 probes.extend(B::host_probe(m, probes.last())?);
             }

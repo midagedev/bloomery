@@ -122,6 +122,17 @@
 #            line count, a P < 1, a line among its first P that is not one id, and prose: on a
 #            reference arm — a corpus arm feeds our binary, a second build (bin:<path>:prose:<P>) or a
 #            server (lcppsrv…:prose:<P>, below).
+#            prose:<P>@BLOOMERY_FORCE_IDS=continue (and bin:<path>:prose:<P>@…) forces the arm's generated ids
+#            to the corpus's next ones: the runner expands `continue` to `<corpus file>:<P>`, the lever's value
+#            (`<path>:<offset>`, crates/levers/src/registry.rs), for that arm's process and keeps `continue` in
+#            the label. Arms of one P with the lever, e.g. `prose:512@BLOOMERY_DRAFT=mtp,BLOOMERY_FORCE_IDS=continue`
+#            and `prose:512@BLOOMERY_DRAFT=off,BLOOMERY_FORCE_IDS=continue`, decode one id stream, so the tok/s
+#            pair compares the passes and not two texts (a draft's verify rows round differently from a plain
+#            step, and a paged plan's cost of a token depends on its routing). A forced arm is compared, in the
+#            greedy text check, with forced arms only (key `.f`), and the closing `tokens-differ` line reads
+#            their rounds apart as `forced`: a forced pair that parts is a defect, a FAIL of the run. Refused by
+#            name before anything runs: continue on an arm that feeds no corpus, beside BLOOMERY_GEN_SLOTS, and a
+#            corpus with fewer than P + N + 3 ids (the binary's draft window).
 #   bin:<path>:<D>  a second generate_qwen3moe (an absolute path on the box, a base tree's build) at
 #             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
 #             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
@@ -201,7 +212,11 @@
 #             table: T/s = P / TTFT.
 # ik and mainline feed std::rand() ids, prefill and steps alike; mistral.rs feeds prompt ids 1000 +
 # (start + i) mod 2048 and then its greedy continuation; ours feeds its greedy continuation, which
-# is why our row carries distinct_tokens. Every reference arm is one process — a model load, the
+# is why our row carries distinct_tokens. A single-stream row whose distinct_tokens is under the floor of
+# tools/ref/loop-floor.py for its steps (the 1st percentile of distinct/n over the n-id windows of the profile's
+# corpus-prose.ids, and corpus-code.ids beside it where there is one; the `loop-floor:` line prints it, the
+# files and the window count) carries `[loop]`: its arm decoded a loop, and a speed read against an arm that
+# decoded text is void. The closing `loop rows:` line counts them. Every reference arm is one process — a model load, the
 # prefill, N steps (mistral.rs: its warmup request, then the timed one) — and the four engines open
 # the one file. Our arms of one round that share a load key — this binary and C — run in one process
 # (generate_qwen3moe --arm <ids> ... --arm-sync), the engine cleared between them (app::Session::clear),
@@ -807,6 +822,24 @@ q3_self_test() {
     "[parse] load: $bin --arm <lcg_prompt 512> --arm <prose_prompt 512> -n 96 --ctx 768 --time --arm-sync"
   run_parse BLOOMERY_DATA="$pt/data" -- lcppsrv:prose:702
   want prose-srv-past 64 "a prose prompt of 702 ids; $pt/data/qwen3moe/corpus-prose.ids holds 701 (1..701)"
+  # BLOOMERY_FORCE_IDS=continue (the header's prose:<P>): the arm's process gets `<corpus file>:<P>`, the load key
+  # holds it, the label keeps `continue`; refused by name on an arm with no corpus, beside slots, and on a corpus
+  # too short for the N ids after the prompt and FORCE_SLACK more (N 96 here, 701 ids: P up to 602).
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:4@BLOOMERY_FORCE_IDS=continue "bin:/root/r/t/target/release/generate_qwen3moe:prose:4@BLOOMERY_FORCE_IDS=continue"
+  want force-continue 0 \
+    "[parse] prose:4@BLOOMERY_FORCE_IDS=continue: kind=ours depth=4 label=ours@prose@BLOOMERY_FORCE_IDS=continue env=BLOOMERY_FORCE_IDS=$pt/data/qwen3moe/corpus-prose.ids:4 load=$bin|ctx=256|BLOOMERY_FORCE_IDS=$pt/data/qwen3moe/corpus-prose.ids:4 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
+    "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:4@BLOOMERY_FORCE_IDS=continue: kind=bin depth=4 label=bin:t@prose@BLOOMERY_FORCE_IDS=continue env=BLOOMERY_FORCE_IDS=$pt/data/qwen3moe/corpus-prose.ids:4 load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
+  run_parse BLOOMERY_DATA="$pt/data" -- 4@BLOOMERY_FORCE_IDS=continue
+  want force-continue-lcg 64 "BLOOMERY_FORCE_IDS=continue continues the prose corpus past the prompt, and this arm feeds the LCG walk"
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:4@BLOOMERY_GEN_SLOTS=2,BLOOMERY_FORCE_IDS=continue
+  want force-continue-slots 64 "BLOOMERY_FORCE_IDS takes one stream's ids, and 2 slots in one pass take each slot's argmax"
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:602@BLOOMERY_FORCE_IDS=continue
+  want force-continue-fits 0 "[parse] prose:602@BLOOMERY_FORCE_IDS=continue: kind=ours depth=602 label=ours@prose@BLOOMERY_FORCE_IDS=continue env=BLOOMERY_FORCE_IDS=$pt/data/qwen3moe/corpus-prose.ids:602 load=$bin|ctx=768|BLOOMERY_FORCE_IDS=$pt/data/qwen3moe/corpus-prose.ids:602 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:603@BLOOMERY_FORCE_IDS=continue
+  want force-continue-short 64 "takes the 96 ids after the prompt's 603 and 3 more (a draft's last window); $pt/data/qwen3moe/corpus-prose.ids holds 701"
+  # A literal value passes the lever grammar as given.
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:4@BLOOMERY_FORCE_IDS=/x/ids:7
+  want force-literal 0 "[parse] prose:4@BLOOMERY_FORCE_IDS=/x/ids:7: kind=ours depth=4 label=ours@prose@BLOOMERY_FORCE_IDS=/x/ids:7 env=BLOOMERY_FORCE_IDS=/x/ids:7 load=$bin|ctx=256|BLOOMERY_FORCE_IDS=/x/ids:7 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
   run_parse -- lcppsrv+x1:512
   want srv-flag-bad 64 "'+x1' in 'lcppsrv+x1' is none of +t<N> (-t), +nopo<0|1> (-nopo), +k<K> (--n-cpu-moe)"
   # The placement (BLOOMERY_GEN_PLACE): a qwen4exp file's only, in the load key and the command line.
@@ -1067,6 +1100,48 @@ ratio slots bin: bin:t@BLOOMERY_GEN_SLOTS=2 has no ours aggregate arm on its pro
   tk_add 1 lcg6.s2 ours 'tokens [1, 2] slot=0'$'\n''tokens [3, 4] slot=1'
   tk_add 1 lcg6.s2 bin:t 'tokens [1, 2] slot=0'$'\n''tokens [3, 5] slot=1'
   eq tokens-slots "$(tk_line 1 | sed 's/=[0-9a-f]\{12\}/=H/g')" 'tokens r1: differ lcg6.s2 ours=H bin:t=H'
+  # The forced arms (BLOOMERY_FORCE_IDS) compare with each other and never with a greedy arm of the same prompt: a
+  # forced pair that agrees reads `forced: equal` beside the greedy pair that parts; a forced round that parts is
+  # a defect, counted apart (TK_FORCED_PARTED) and read on the closing line as `forced`.
+  TK_ROWS='' TK_SHOWN=','
+  eq tokens-forced-key "$(tk_key prose 512 '' '' 1)|$(tk_key prose 512 2 '' 1)|$(tk_key prose 512)" 'prose512.f|prose512.s2.f|prose512'
+  tk_add 1 prose512.f ours@mtp 'tokens [5, 6]'
+  tk_add 1 prose512.f ours@off 'tokens [5, 6]'
+  tk_add 1 prose512 ours@a 'tokens [5, 7]'
+  tk_add 1 prose512 ours@b 'tokens [5, 9]'
+  tk_add 2 prose512.f ours@mtp 'tokens [5, 6]'
+  tk_add 2 prose512.f ours@off 'tokens [5, 8]'
+  eq tokens-forced-greedy-only "$(tk_line 1 | sed 's/=[0-9a-f]\{12\}/=H/g')" 'tokens r1: differ prose512 ours@a=H ours@b=H'
+  eq tokens-forced-equal "$(tk_line 1 1)" 'tokens r1 forced: equal'
+  eq tokens-forced-parted "$(tk_line 2 1 | sed 's/=[0-9a-f]\{12\}/=H/g')" 'tokens r2 forced: differ prose512.f ours@mtp=H ours@off=H'
+  eq tokens-forced-no-greedy "$(tk_line 2)" ''
+  eq tokens-forced-mixed "$(tk_summary)" 'tokens-differ rounds: 1 of 1 (arms on one prompt, P and n whose greedy ids differ); forced: 1 of 2 (arms fed one id stream, so a part is a defect)'
+  { tk_summary; } > /dev/null
+  eq tokens-forced-parted-count "$TK_FORCED_PARTED" 1
+  TK_ROWS='' TK_SHOWN=','
+  tk_add 1 prose512.f ours@mtp 'tokens [5, 6]'
+  tk_add 1 prose512.f ours@off 'tokens [5, 6]'
+  eq tokens-forced-only "$(tk_summary)" 'tokens-differ rounds: 0 of 1 (forced: arms on one prompt fed one id stream, so a part is a defect)'
+  { tk_summary; } > /dev/null
+  eq tokens-forced-only-count "$TK_FORCED_PARTED" 0
+  # The `[loop]` tag: a row whose distinct ids are under the floor of the profile's corpus windows
+  # (loop-floor.py; the corpus here is 300 distinct ids, so every window of 10 holds 10 and the floor is 1).
+  # The floor line prints once a size; no corpus, or one shorter than the window, tags nothing and says so.
+  mkdir -p "$pt/loop"
+  seq 1 300 > "$pt/loop/corpus-prose.ids"
+  LOOP_CORPUS="$pt/loop/corpus-prose.ids" LOOP_FLOORS=' '
+  loop_tag 10 9 > "$pt/lf1"
+  eq loop-tag "$LOOP_TAG" ' [loop]'
+  eq loop-floor-line "$(cat "$pt/lf1")" "    loop-floor: floor=1.0000 distinct=10 windows=291 n=10 files=1 (1st percentile of distinct/n over the n-id windows of $pt/loop/corpus-prose.ids)"
+  loop_tag 10 10 > "$pt/lf2"
+  eq loop-tag-clear "$LOOP_TAG|$(cat "$pt/lf2")" '|'
+  loop_tag 400 400 > "$pt/lf3"
+  eq loop-floor-short "$LOOP_TAG|$(cat "$pt/lf3")" '|    loop-floor: n=400 none: loop-floor.py: no window: every file is shorter than the window'
+  LOOP_CORPUS="$pt/none.ids" LOOP_FLOORS=' '
+  loop_tag 10 1 > "$pt/lf4"
+  eq loop-no-corpus "$LOOP_TAG|$(cat "$pt/lf4")" '|'
+  LOOP_CORPUS='' LOOP_FLOORS=' ' LOOP_TAG=''
+  eq loop-wired "$(grep -c 'distinct_tokens \$uniq_tok | nodes .*\$PROBE_TAG\$LOOP_TAG"$' "$me")" 1
   # Each runner keeps its arm's lines through arm_lines and feeds the text check; none keeps a list of its own.
   eq arm-lines-wired "$(for b in qwen3moe ds41 glm5next; do grep -c "arm_lines generate_$b \"\$out\"" "${me%/*}/depth-$b.sh"; grep -c '^ *tk_add "\$r" ' "${me%/*}/depth-$b.sh"; grep -c '^ *tk_summary' "${me%/*}/depth-$b.sh"; grep -c "echo \"\$out\" | grep -E '^(" "${me%/*}/depth-$b.sh"; done | paste -sd' ' -)" '1 1 1 0 1 1 1 0 1 1 1 0'
   rm -rf "$pt"
@@ -1185,6 +1260,8 @@ arm_refuse() {
 # reference set is cut from. PROSE_N, its line count, is read once, when the first prose arm names it.
 PROSE_N=
 corpus_file() { echo "${BLOOMERY_DATA:-}/$MODEL_NAME/corpus-prose.ids"; }
+# The corpus the `[loop]` floor is derived from (cold-blocks.sh's loop_floor).
+LOOP_CORPUS=$(corpus_file)
 # corpus_check <arm> <P> [<note>]: the corpus file's checks, each refusal by name before anything runs: the
 # file readable, P within 1..its line count, and every one of its first P lines one id. Under
 # --parse-arms a file that is not readable (the box's path, read on the Mac) is named on the arm's
@@ -1217,6 +1294,30 @@ corpus_ids() {
 corpus_feed() {
   corpus_check "$1" "$(($2 * ${ASLOTS:-1}))" "${ASLOTS:+$ASLOTS slots × $2}"
   tok=$(corpus_ids "$(($2 * ${ASLOTS:-1}))")
+}
+# force_continue <arm> <NAME=VALUE list> <P> <corpus>: the list with BLOOMERY_FORCE_IDS=continue (the header's
+# prose:<P>) expanded to the corpus file and the offset P, `<file>:<P>`, into FORCE_ENVS: the binary takes the
+# corpus's ids after the prompt as its generated ids. The arm's label keeps `continue`. Any other list is
+# FORCE_ENVS as given. Refused by name: continue on an arm that feeds no corpus (<corpus> empty), on an
+# aggregate arm (the binary refuses slots beside the lever), and a corpus too short for the N ids after the
+# prompt and FORCE_SLACK more (the binary's MTP window less one, `MTP_ROWS - 1` in generate_qwen3moe.rs, which
+# owns the count and refuses a short file by name: a last pass may keep rows past -n).
+FORCE_SLACK=3
+force_continue() {
+  local a=$1 s="$2," e rest='' seen=''
+  FORCE_ENVS=$2
+  case ,$2, in *,BLOOMERY_FORCE_IDS=continue,*) ;; *) return 0 ;; esac
+  [ -n "$4" ] || arm_refuse "$a" "BLOOMERY_FORCE_IDS=continue continues the prose corpus past the prompt, and this arm feeds the LCG walk: use a prose:<P> arm"
+  [ -z "$ASLOTS" ] || arm_refuse "$a" "BLOOMERY_FORCE_IDS takes one stream's ids, and $ASLOTS slots in one pass take each slot's argmax"
+  if [ -n "$PROSE_N" ] && [ $(($3 + N + FORCE_SLACK)) -gt "$PROSE_N" ]; then
+    arm_refuse "$a" "BLOOMERY_FORCE_IDS=continue takes the $N ids after the prompt's $3 and $FORCE_SLACK more (a draft's last window); $(corpus_file) holds $PROSE_N"
+  fi
+  while [ -n "$s" ]; do
+    e=${s%%,*} s=${s#*,}
+    [ "$e" != BLOOMERY_FORCE_IDS=continue ] || e=BLOOMERY_FORCE_IDS=$(corpus_file):$3
+    rest+="${seen:+,}$e" seen=1
+  done
+  FORCE_ENVS=$rest
 }
 # The lever arms' list checks (the header's <D>@NAME=VALUE): tools/ref/lever-arms.sh, shared with
 # depth-glm5next.sh. BLOOMERY_AB_LOAD=arm is the load driver's solo marker (load-groups.sh), never the
@@ -1472,6 +1573,8 @@ for a in "${ARMS[@]}"; do
       # (arm_feed) or the corpus's first N·P, through its one-arm command line.
       arm_slots "$a" "$envs"
       [ -z "$corpus" ] || corpus_feed "$a" "$dep"
+      force_continue "$a" "$envs" "$dep" "$corpus"
+      envs=$FORCE_ENVS
       ;;
     prose:*)
       # prose:<P>[@NAME=VALUE,...]: ours on the corpus's first P ids (the header's prose:<P>).
@@ -1483,6 +1586,8 @@ for a in "${ARMS[@]}"; do
       # An aggregate arm feeds the corpus's first N·P ids, slot j the window j.
       arm_slots "$a" "$envs"
       corpus_feed "$a" "$dep"
+      force_continue "$a" "$envs" "$dep" 1
+      envs=$FORCE_ENVS
       ours=1
       ;;
     *@*)
@@ -1490,6 +1595,8 @@ for a in "${ARMS[@]}"; do
       split_at "$a" "${a#*@}"
       envs=$ENVS
       arm_slots "$a" "$envs"
+      force_continue "$a" "$envs" "$dep" ''
+      envs=$FORCE_ENVS
       ;;
     *:*)
       case $dep in prose:*) arm_refuse "$a" "prose:<P> is ours on the corpus's first P ids, and ${eng}: is a reference engine, which feeds its own prompt ids" ;; esac
@@ -2025,6 +2132,7 @@ ref_arm() {
 # [cold] and [probe-off] (ours rows only: a reference's PROBE_TAG is empty).
 count_row() {
   n_rows=$((n_rows + 1))
+  [ -z "${LOOP_TAG:-}" ] || loop_rows=$((loop_rows + 1))
   [ -z "$CPU_BUSY_TAG" ] || busy_rows=$((busy_rows + 1))
   [ -z "$OTHER_BUSY_TAG" ] || other_rows=$((other_rows + 1))
   [ -z "$COLD_TAG" ] || cold_rows=$((cold_rows + 1))
@@ -2246,6 +2354,8 @@ ours_post() {
   h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
   t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
   uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
+  LOOP_TAG=
+  [ -n "$nslots" ] || loop_tag "$(echo "$out" | awk '/^step / && $2 != 0 {c++} END {print c + 0}')" "$uniq_tok"
   tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
   tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
   # The timed window: the prompt's wall and the N generated steps at the mean; an aggregate arm's, every
@@ -2278,7 +2388,7 @@ ours_post() {
     count_row
     sums+=("$label|$dep|$r|$agg||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG|$nslots")
   else
-    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace}${A_MEM[$i]:+ | capped mem=${A_MEM[$i]}G} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace}${A_MEM[$i]:+ | capped mem=${A_MEM[$i]}G} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG$LOOP_TAG"
     [ -z "$TIER_DELTA" ] || echo "    tier-arm r$r $label d=$dep: $TIER_DELTA"
     counted || return 0
     count_row
@@ -2288,9 +2398,11 @@ ours_post() {
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
   res_sums_add "$label" "$dep" "$r"
   # The greedy text check: every counted row of the model's own engine, lever and bin: arms included.
-  local tkids=lcg
+  local tkids=lcg tkf=''
   [ -z "${A_TOK[$i]}" ] || tkids=prose
-  tk_add "$r" "$(tk_key "$tkids" "$dep" "${A_SLOTS[$i]}" "${A_MODEL[$i]}")" "$label" "$out"
+  # An arm that takes its ids from BLOOMERY_FORCE_IDS is compared with the other forced arms only (cold-blocks.sh).
+  case ",${A_ENV[$i]}," in *,BLOOMERY_FORCE_IDS=*) tkf=1 ;; esac
+  tk_add "$r" "$(tk_key "$tkids" "$dep" "${A_SLOTS[$i]}" "${A_MODEL[$i]}" "$tkf")" "$label" "$out"
   # The greedy cross-check's ours side: the plain rows (no NAME=VALUE list) of this tree's binary.
   case ${A_KIND[$i]}:$label in
     ours:ours) xc_add ours lcg "$dep" "$r" "$label" "$(sed -n 's/^tokens //p' <<< "$out" | tail -n 1)" ;;
@@ -2559,7 +2671,7 @@ guard_timing
 guard_cpu pre
 
 sums=() pp_sums=() pass_sums=()
-n_rows=0 busy_rows=0 other_rows=0 cold_rows=0 probe_rows=0
+n_rows=0 busy_rows=0 other_rows=0 cold_rows=0 probe_rows=0 loop_rows=0
 if [ "$ORDER" = rotate ]; then
   if [ "$AB_WARMUP" = 1 ]; then
     ROW_TAG=WARMUP
@@ -2579,8 +2691,10 @@ echo
 echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 tk_summary
+[ "$TK_FORCED_PARTED" = 0 ] || FAILED+=("tokens-forced: arms fed one id stream parted in $TK_FORCED_PARTED round(s)")
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
 echo "probe-off rows: $probe_rows of $n_rows (an ours row whose load probed lane_gbs under ${PROBE_QUIET_LO} GB/s: a lighter prompt plan than its pair's)"
+echo "loop rows: $loop_rows of $n_rows (a single-stream row whose distinct_tokens is under the floor of its steps, loop-floor.py: its arm decoded a loop, so a speed read against a pair on other text is void)"
 warm_rows_summary
 # The greedy cross-check (lcpp-warm.sh), before the tables: a server row whose first id parts from ours
 # is a failed arm and drops out at its depth or P with them; a later id's part is a [xcheck-tail] line.

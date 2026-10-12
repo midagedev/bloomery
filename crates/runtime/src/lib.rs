@@ -9,9 +9,10 @@
 //! [`generate`] is the one loop over both, until the [`Stop`] rule ends it.
 //!
 //! A pass takes each row's id by a [`Pick`]: the target's argmax
-//! ([`Argmax`], the greedy pass), or a draw from the row's logits ([`Sample`]
-//! over a [`RowLogits`] target), one call a taken id. Either way a draft
-//! changes which passes run and never a token.
+//! ([`Argmax`], the greedy pass), a draw from the row's logits ([`Sample`]
+//! over a [`RowLogits`] target), or the next id of a fixed stream
+//! ([`Forced`], driven through [`Picked`]), one call a taken id. Either way a
+//! draft changes which passes run and never a token.
 //!
 //! Beneath a target's call: [`sched`], the order in which a schedule runs a
 //! layer program's parts over its units ([`sched::walk`]), [`prompt`], how a
@@ -46,8 +47,8 @@ pub mod xsplit;
 
 pub use lookup::Lookup;
 pub use speculative::{
-    Argmax, Draft, NotBuilt, Pick, Program, RowLogits, Sample, Speculative, TapNeed, Tapped, Width,
-    Widths, Window, accepted_rows, program,
+    Argmax, Draft, Exhausted, Forced, NotAnId, NotBuilt, Pick, Picked, Picking, Program, RowLogits,
+    Sample, Speculative, TapNeed, Tapped, Width, Widths, Window, accepted_rows, ids_from, program,
 };
 pub use stop::{NoTokens, Stop, StopReason};
 pub use width::{Choosing, Chosen, Rule, Tally, WidthError};
@@ -192,14 +193,7 @@ impl<T: Target> Advance<T> for Plain {
     }
 
     fn pass(&mut self, t: &mut T, last: u32, out: &mut Vec<u32>) -> Result<Committed, T::Error> {
-        let pos = t.pos();
-        out.push(t.step(last, Want::Argmax)?.argmax());
-        Ok(Committed {
-            pos,
-            kept: 1,
-            rows: 1,
-            proposed: false,
-        })
+        self.pass_with(t, last, &mut Argmax, out)
     }
 }
 

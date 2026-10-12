@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::width::{Clock, WidthError};
-use crate::{Committed, Out, PassSink, RowLogits, Target, Verify, Want};
+use crate::{Committed, Exhausted, Out, PassSink, RowLogits, Target, Verify, Want};
 
 /// The ids the mock's rows span.
 pub(crate) const VOCAB: usize = 5;
@@ -24,6 +24,7 @@ pub(crate) enum Call {
 pub(crate) enum MockError {
     Mock(&'static str),
     Width(WidthError),
+    Forced(Exhausted),
 }
 
 impl std::fmt::Display for MockError {
@@ -31,6 +32,7 @@ impl std::fmt::Display for MockError {
         match self {
             MockError::Mock(why) => f.write_str(why),
             MockError::Width(e) => e.fmt(f),
+            MockError::Forced(e) => e.fmt(f),
         }
     }
 }

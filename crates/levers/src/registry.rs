@@ -39,6 +39,7 @@ pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
 pub const HOST_LANES: &str = "BLOOMERY_HOST_LANES";
 pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
+pub const FORCE_IDS: &str = "BLOOMERY_FORCE_IDS";
 pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
 pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
@@ -855,6 +856,30 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               resident sequences, runs each slot's window as the plain run's prompt call, prints \
               each slot's records in slot order, and refuses N ≥ 2 beside `BLOOMERY_DRAFT`, \
               `BLOOMERY_CHECK_FINITE`, `BLOOMERY_STEP_STATS` and `--logits`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: FORCE_IDS,
+        class: Class::D,
+        kind: Kind::FileAt,
+        default: Unset::Means("each row's argmax, the greedy ids"),
+        doc: "`generate_qwen3moe` on a qwen3moe, qwen35moe or qwen4exp file, greedy, one stream: \
+              `<path>:<offset>` takes every generated id from a file of ids, one a line, from the \
+              line `offset` on (the file's first `offset` lines are skipped; a corpus runner's \
+              `continue` is its prompt's length), whatever the row's argmax. Generated token 0 is \
+              the file's first id and every id after it the next, on the plain path and under \
+              `BLOOMERY_DRAFT=mtp`, where a proposal is kept exactly while it matches the file, \
+              so a drafted run and a plain run decode one id stream and differ only in the \
+              passes they run (a verify's batched rows round differently from a one-row step, so \
+              their greedy ids part otherwise, and a paged plan's cost of a token depends on its \
+              routing). The file holds at least `-n` ids from `offset`, and with a draft the \
+              window's rows less one more, or the run is refused by name before the load. Refused \
+              by name beside `BLOOMERY_GEN_SLOTS` past 1 (the slots pass takes each slot's \
+              argmax) and `--dump-taps`; this CLI has no sampler to refuse. The ids are not the \
+              model's: an accuracy or text reading of a forced run is void.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

@@ -71,6 +71,7 @@ fn sample(kind: Kind) -> String {
         Kind::Path => "/data/set".into(),
         Kind::PathOr(words) => words[0].into(),
         Kind::File => A_FILE.into(),
+        Kind::FileAt => format!("{A_FILE}:0"),
         Kind::Text => "text".into(),
         Kind::Residency => "mid-p33-s1".into(),
     }
@@ -127,6 +128,19 @@ fn garbage(kind: Kind) -> Vec<String> {
         Kind::File => g.extend([
             "/no/such/file".to_string(),
             env!("CARGO_MANIFEST_DIR").to_string(),
+        ]),
+        Kind::FileAt => g.extend([
+            A_FILE.to_string(),
+            format!("{A_FILE}:"),
+            format!("{A_FILE}:-1"),
+            format!("{A_FILE}:01"),
+            format!("{A_FILE}: 1"),
+            format!("{A_FILE}:one"),
+            format!("{A_FILE}:{PAST_U64}"),
+            format!("{A_FILE}:0:0"),
+            "/no/such/file:0".to_string(),
+            format!("{}:0", env!("CARGO_MANIFEST_DIR")),
+            ":0".to_string(),
         ]),
         Kind::Path | Kind::PathOr(_) | Kind::Text => {}
         Kind::Residency => g.extend(
@@ -482,6 +496,7 @@ fn accessors_read_their_rows() {
             LANE_PREFETCH,
             HOST_LANES,
             GEN_SLOTS,
+            FORCE_IDS,
             SCREEN
         ]
     );
