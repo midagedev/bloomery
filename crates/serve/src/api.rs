@@ -5624,9 +5624,10 @@ mod tests {
             assert_ne!(s0, 401, "{method} {path}: no key set, no 401");
         }
 
-        /// One body as the comparison takes it: JSON with `created` and
-        /// `id` (the bind time and the wall-clock-mixed request id) pinned
-        /// and `timings` dropped; a stream the same, chunk by chunk;
+        /// One body as the comparison takes it: JSON with `created`, `id`
+        /// and `seed` (the bind time, the wall-clock-mixed request id, and
+        /// the default seed drawn from both) pinned and `timings` dropped; a
+        /// stream the same, chunk by chunk;
         /// anything else (`OPTIONS`' empty body) whole.
         fn normalize(body: &str) -> String {
             if let Ok(v) = serde_json::from_str::<Value>(body) {
@@ -5655,7 +5656,7 @@ mod tests {
                 }
                 let Value::Object(o) = v else { return };
                 o.remove("timings");
-                for leaf in ["created", "id"] {
+                for leaf in ["created", "id", "seed"] {
                     if let Some(c) = o.get_mut(leaf) {
                         *c = Value::from(0);
                     }
