@@ -1,0 +1,12 @@
+# The one lease term of the Qwen3.6 decode roofline (grout g3, specs/leader/grout/out/g3-roofline.md section 7): the
+# UD-Q4_K_XL decode step's window wall in bloomery's own bench form, the row the bench page lacks. Q4_K_M is profiled in the
+# same lease as the control; its depth-6 window must reproduce the 204.4 tok/s row (4.892 ms).
+kind: profile
+question: is the UD-Q4_K_XL decode step's gap to Q4_K_M in the kernels (file shape) or in the server (host turnaround)?
+term: generate_qwen3moe window wall ms @ n=96, depth 6, UD-Q4_K_XL, A6000 (nsys seed form)
+unit: ms
+predict: 6.49..8.13 ms
+condition: lease held; seed form; both files' profiles in one lease; the Q4_K_M window at depth 6 within 1 % of 4.892 ms or the sitting is void
+decide-in: L2 ud35fold first; L3 priced from 8.51 - window
+decide-below: L3 serveahead design next (host turnaround >= 1.2 ms), then L2
+decide-above: L2 first, L3 closed (<= 0.5 ms)

@@ -1979,6 +1979,15 @@ depth-serve *ARMS:
 nsys-gpu-qwen3moe *DEPTHS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_DEPTHS="{{DEPTHS}}" bash tools/ref/nsys-gpu.sh'
 
+# Qwen3.6-35B-A3B (qwen35moe) decode-step kernel timeline (nsys, A6000, under the lease, lead-only): the seed form of
+# nsys-gpu-qwen3moe on the qwen35moe profile, generate_qwen3moe opening the file as Body35. A depth entry is `D` or
+# `D@model=<absolute path>` for another file of the family (the profile's own is the Q4_K_M); each profile takes its
+# boundary entry from its file's token_embd type, so one lease can profile the Q4_K_M and the UD-Q4_K_XL. The header of
+# tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and no
+# lease is taken.
+nsys-gpu-qwen35moe *DEPTHS:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_DEPTHS="{{DEPTHS}}" bash tools/ref/nsys-gpu.sh'
+
 # Qwen3-30B-A3B prefill kernel table (nsys, A6000, under the lease, lead-only): generate_qwen3moe's timed prompt (the
 # depth runner's `<P>` arm) at each length P (default 4096, one ubatch at the default ubatch size), then
 # BLOOMERY_NSYS_N - 1 replays; the table is the prompt's window, its units and the head, per kernel, with the grouped

@@ -20,29 +20,41 @@
 # 같이 찍는다 — 둘의 차가 런치 사이 빈틈이고, 창 벽시계가 depth-gpu.sh의 스텝 ms와 맞아야 이 표를
 # 그 기록 옆에 놓을 수 있다.
 #
-# qwen3moe (BLOOMERY_MODEL=qwen3moe, `just nsys-gpu-qwen3moe 6 1024 4096`): generate_qwen3moe
-# prefills a prompt eight positions per eager pass, so the prompt form above would put ⌈D/8⌉
-# multi-row passes into the trace. This profile runs the binary's seed form instead:
+# qwen3moe and qwen35moe (BLOOMERY_MODEL=qwen3moe, `just nsys-gpu-qwen3moe 6 1024 4096`; BLOOMERY_MODEL=qwen35moe,
+# `just nsys-gpu-qwen35moe 6 4096`): generate_qwen3moe opens either file by its header, and prefills a prompt eight
+# positions per eager pass, so the prompt form above would put ⌈D/8⌉ multi-row passes into the trace. These
+# profiles run the binary's seed form instead:
 # `--seed-depth D -n N --ctx C --mode M --time`. The caches are filled by host copies (no kernel),
 # then one eager one-row prefill pass feeds id 0 at position D - 1 and yields token 0, and N - 1
 # graph replays follow: N windows, window r at depth D - 1 + r, windows 1 .. N - 1 being `time step
-# 1 .. N - 1` of the same run. The boundary is named, not searched for: `embed_rows_q4k`, layer 0's
-# embedding gather, one launch per pass and per replay (arch/qwen3moe/dispatch.rs `layer`, embed =
-# slot 0); its count must be N or no table. C defaults to depth-qwen3moe.sh's height for the same
-# D (D + BLOOMERY_DECODE_N rounded up to 256; BLOOMERY_GEN_CTX fixes it), so the table is of the
-# load that runner times; the flash grid does not depend on C (flash_gqa::SEGMENTS segments a row).
+# 1 .. N - 1` of the same run. The boundary is named, not searched for: the embedding gather of layer 0,
+# one launch per pass and per replay (arch/qwen3moe/dispatch.rs `layer`, embed = slot 0); its count must be N or
+# no table. The entry follows the file's `token_embd.weight` type, as the plan's launch does (dispatch.rs
+# `embed_rows`): Q4_K `embed_rows_q4k`, Q3_K `embed_rows_q3k`, Q5_K `embed_rows_q5k`, Q6_K `embed_rows_q6k`, Q8_0
+# `embed_rows_q8_0`. Any other type is refused by name (exit 65); BLOOMERY_NSYS_MARKER names the entry by hand and
+# wins over the file. `bash tools/ref/nsys-gpu.sh --marker <file>` prints the entry for a file.
+# C defaults to depth-qwen3moe.sh's height for the same D (D + BLOOMERY_DECODE_N rounded up to 256;
+# BLOOMERY_GEN_CTX fixes it), so the table is of the load that runner times; the flash grid does not
+# depend on C (flash_gqa::SEGMENTS segments a row).
 # The seeded cache is a pattern, so routing differs from a real prompt's; the kernel shapes do not.
 # N >= 3, so that the control window is a replay. Each profile runs under BLOOMERY_ARM_BOUND
 # (seconds, default 900).
 #
+# A depth entry is `D` or `D@model=<absolute path>`, the depth runner's arm item of that name: the entry's profile
+# opens that file as BLOOMERY_REF_MODEL and resolves its own boundary entry from it; an entry without the item opens
+# the profile's MODEL (BLOOMERY_REF_MODEL moves it). One lease profiles several files:
+# `BLOOMERY_NSYS_DEPTHS="6 4096 6@model=/models/a.gguf 4096@model=/models/a.gguf"`. With --analyze the file is
+# the profile's MODEL, so set BLOOMERY_REF_MODEL for a table of another file.
 #
-# qwen3moe prefill (BLOOMERY_NSYS_FORM=prefill, `just nsys-gpu-qwen3moe-prefill 4096`): the timed prompt
+#
+# qwen3moe prefill (BLOOMERY_NSYS_FORM=prefill, `just nsys-gpu-qwen3moe-prefill 4096`; a qwen35moe file takes the
+# form by the same rule, and the count below is the check): the timed prompt
 # of depth-qwen3moe.sh's `<P>` arm instead of a decode step. Each entry of BLOOMERY_NSYS_DEPTHS is a
 # prompt length P >= 9 (a GEMM ubatch runs); the profiled command is that arm's,
 # `generate_qwen3moe --tokens <lcg_prompt P> -n N --ctx C --mode M --time`, C as in the seed form. The
 # prompt runs as the plan's K units (at the default ubatch size 4096 and P <= 4096, one ubatch: K = 1),
-# each opening with one `embed_rows_q4k` launch, then the head; the N - 1 feedback steps are graph
-# replays, each opening with one. So the boundary count is K + N - 1, K read from the run's own `time
+# each opening with one boundary launch (the file's embedding gather, above), then the head; the N - 1
+# feedback steps are graph replays, each opening with one. So the boundary count is K + N - 1, K read from the run's own `time
 # prompt ... passes=K` row, or no table; the prefill window runs from the first boundary to the
 # (K+1)-th — the prompt's launches and its head. Its table is per kernel over that window (launches,
 # total ms, share of the window's kernel sum), with the grouped GEMM entries summed, beside the
@@ -50,25 +62,28 @@
 # launch and the token's readback). N >= 2, so that a replay closes the window.
 #
 #   bash tools/ref/nsys-gpu.sh --analyze <out>.sqlite <depth> <n> [<out>.txt]   # tables again, no profile
+#   bash tools/ref/nsys-gpu.sh --marker <file>                                  # the boundary entry of a file
 #   BLOOMERY_DRY=1 ...                                                          # command lines, no lease
 set -uo pipefail
 # 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
 # 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가 ref-paths.sh의 MODEL을 그 이름으로
 # export한다(generate 자신에게는 기본값이 없다).
+HERE=${BASH_SOURCE[0]%/*}
 # shellcheck source=tools/ref/ref-paths.sh
-source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+source "$HERE/ref-paths.sh"
+# The profiles generate_qwen3moe opens: the seed and prefill forms are its, the prompt form is `generate`'s.
+case $MODEL_NAME in qwen3moe | qwen35moe) GEN_QWEN3MOE=1 ;; *) GEN_QWEN3MOE= ;; esac
 FORM=prompt
-[ "$MODEL_NAME" != qwen3moe ] || FORM=seed
+[ -z "$GEN_QWEN3MOE" ] || FORM=seed
 case ${BLOOMERY_NSYS_FORM:-} in
   '') ;;
   prefill)
-    [ "$MODEL_NAME" = qwen3moe ] || { echo "nsys-gpu.sh: BLOOMERY_NSYS_FORM=prefill profiles generate_qwen3moe; the profile is '$MODEL_NAME'" >&2; exit 64; }
+    [ -n "$GEN_QWEN3MOE" ] || { echo "nsys-gpu.sh: BLOOMERY_NSYS_FORM=prefill profiles generate_qwen3moe (BLOOMERY_MODEL=qwen3moe or qwen35moe); the profile is '$MODEL_NAME'" >&2; exit 64; }
     FORM=prefill
     ;;
   *) echo "nsys-gpu.sh: BLOOMERY_NSYS_FORM is prefill or unset, got '$BLOOMERY_NSYS_FORM'" >&2; exit 64 ;;
 esac
 if [ "$FORM" != prompt ]; then BIN=${BLOOMERY_GEN_BIN:-target/release/generate_qwen3moe}; else BIN=${BLOOMERY_GEN_BIN:-target/release/generate}; fi
-MARKER=${BLOOMERY_NSYS_MARKER:-embed_rows_q4k}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 DEPTH_N=${BLOOMERY_DECODE_N:-96}
 GEN_CTX=${BLOOMERY_GEN_CTX:-}
@@ -220,13 +235,76 @@ else:
 PY
 }
 
+# embed_marker <file>: the entry that gathers the embedding rows of <file>'s token_embd.weight, the launch
+# the seed and prefill forms cut the trace at, into MARKER and its type name into EMBD_TYPE. It follows the
+# type, as the plan's launch does (arch/qwen3moe/dispatch.rs `embed_rows`: Q8_0 planes run q38's gather,
+# K-quant rows ElemKernels::enqueue_embed_rows_kquant). The header is read by tools/ref/gguf-ranges.py. A file
+# the reader refuses keeps its code (2 unreadable, 65 malformed); a type with no gather is 65.
+# BLOOMERY_NSYS_MARKER wins over the file.
+embed_marker() {
+  local out
+  if [ -n "${BLOOMERY_NSYS_MARKER:-}" ]; then
+    MARKER=$BLOOMERY_NSYS_MARKER EMBD_TYPE=by-hand
+    return 0
+  fi
+  out=$(timeout --kill-after=10 "$BOUND" python3 -I - "$HERE/gguf-ranges.py" "$1" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gguf_ranges", sys.argv[1])
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+# GGML type id -> (type name, kernel entry): the types dispatch.rs `embed_rows` has a gather for.
+GATHER = {8: ("Q8_0", "embed_rows_q8_0"), 11: ("Q3_K", "embed_rows_q3k"), 12: ("Q4_K", "embed_rows_q4k"),
+          13: ("Q5_K", "embed_rows_q5k"), 14: ("Q6_K", "embed_rows_q6k")}
+NAMES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 10: "Q2_K", 15: "Q8_K", 30: "BF16"}
+path = sys.argv[2]
+try:
+    ids = [t[1] for t in g.header(path)[1] if t[0] == "token_embd.weight"]
+    if not ids:
+        raise g.Refusal(65, f"{path}: no token_embd.weight in the header (a split set's first shard holds it)")
+    if ids[0] not in GATHER:
+        raise g.Refusal(65, f"{path}: token_embd.weight is {NAMES.get(ids[0], 'type id %d' % ids[0])} (GGML type id "
+                            f"{ids[0]}), which has no embedding gather (Q3_K, Q4_K, Q5_K, Q6_K and Q8_0 do); "
+                            "BLOOMERY_NSYS_MARKER names the entry by hand")
+except g.Refusal as e:
+    print(f"nsys-gpu.sh: {e}", file=sys.stderr)
+    sys.exit(e.code)
+name, entry = GATHER[ids[0]]
+print(entry, name)
+PY
+  ) || return $?
+  MARKER=${out%% *} EMBD_TYPE=${out#* }
+}
+
+if [ "${1:-}" = --marker ]; then
+  [ $# -eq 2 ] || { echo "usage: nsys-gpu.sh --marker <gguf file>" >&2; exit 64; }
+  embed_marker "$2" || exit $?
+  echo "$MARKER ($EMBD_TYPE)"
+  exit 0
+fi
 if [ "${1:-}" = --analyze ]; then
   [ $# -ge 4 ] || { echo "usage: nsys-gpu.sh --analyze <sqlite> <depth> <n> [<run log>]" >&2; exit 64; }
+  MARKER=
+  [ "$FORM" = prompt ] || embed_marker "$MODEL" || exit $?
   analyze "$2" "$3" "$4" "$TOP" "$FORM" "${5:-/dev/null}" "$MARKER"
   exit $?
 fi
+# The entries of BLOOMERY_NSYS_DEPTHS: `D`, or `D@model=<absolute path>` (the header has the item). DEPTH_LIST holds
+# the depths, DEPTH_FILE the item's path or '' for the profile's MODEL.
+DEPTH_LIST=() DEPTH_FILE=()
+for item in $DEPTHS; do
+  d=${item%%@*} f=''
+  if [ "$d" != "$item" ]; then
+    case ${item#*@} in
+      model=/*) f=${item#*@model=} ;;
+      model=*) echo "nsys-gpu.sh: depth entry '$item': the path of model= is absolute" >&2; exit 64 ;;
+      *) echo "nsys-gpu.sh: depth entry '$item': the one item after '@' is model=<absolute path>" >&2; exit 64 ;;
+    esac
+  fi
+  DEPTH_LIST+=("$d") DEPTH_FILE+=("$f")
+done
+[ "${#DEPTH_LIST[@]}" -gt 0 ] || { echo "nsys-gpu.sh: BLOOMERY_NSYS_DEPTHS names no depth" >&2; exit 64; }
 if [ "$FORM" = seed ]; then
-  for d in $DEPTHS; do
+  for d in "${DEPTH_LIST[@]}"; do
     case $d in
       '' | *[!0-9]* | 0) echo "nsys-gpu.sh: depth '$d' is a positive integer (the seed form feeds one id at D - 1)" >&2; exit 64 ;;
     esac
@@ -239,7 +317,7 @@ if [ "$FORM" = seed ]; then
   esac
 fi
 if [ "$FORM" = prefill ]; then
-  for d in $DEPTHS; do
+  for d in "${DEPTH_LIST[@]}"; do
     case $d in
       '' | *[!0-9]* | [0-8]) echo "nsys-gpu.sh: prompt length '$d' is an integer >= 9 in the prefill form (a GEMM ubatch runs)" >&2; exit 64 ;;
     esac
@@ -251,22 +329,34 @@ if [ "$FORM" = prefill ]; then
     *[!0-9]* | 0) echo "nsys-gpu.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
   esac
 fi
-# The profiled command for depth $1 (the prompt and prefill forms' ids: $2), into CMD and CTX.
+# Each entry's file and, in the seed and prefill forms, its boundary entry and the type behind it, before the
+# lease and the card. A file an entry names must be there; the profile's own is read by embed_marker.
+DEPTH_MARKER=() DEPTH_TYPE=()
+for i in "${!DEPTH_LIST[@]}"; do
+  [ -z "${DEPTH_FILE[i]}" ] || [ -f "${DEPTH_FILE[i]}" ] || {
+    echo "nsys-gpu.sh: depth entry '${DEPTH_LIST[i]}': no model file at ${DEPTH_FILE[i]}" >&2
+    exit 2
+  }
+  MARKER='' EMBD_TYPE=''
+  [ "$FORM" = prompt ] || embed_marker "${DEPTH_FILE[i]:-$MODEL}" || exit $?
+  DEPTH_MARKER+=("$MARKER") DEPTH_TYPE+=("$EMBD_TYPE")
+done
+# The profiled command for depth $1 (the prompt and prefill forms' ids: $2) over the model file $3, into CMD and CTX.
 profile_cmd() {
-  local d=$1 ids=${2:-}
+  local d=$1 ids=${2:-} f=${3:-$MODEL}
   if [ "$FORM" = seed ]; then
     CTX=${GEN_CTX:-$(((d + DEPTH_N + 255) / 256 * 256))}
-    CMD=(timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
+    CMD=(env "BLOOMERY_REF_MODEL=$f" timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
          --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
          "$BIN" --seed-depth "$d" -n "$NGEN" --ctx "$CTX" --mode "$MODE" --time)
   elif [ "$FORM" = prefill ]; then
     CTX=${GEN_CTX:-$(((d + DEPTH_N + 255) / 256 * 256))}
-    CMD=(timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
+    CMD=(env "BLOOMERY_REF_MODEL=$f" timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
          --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
          "$BIN" --tokens "$ids" -n "$NGEN" --ctx "$CTX" --mode "$MODE" --time)
   else
     CTX=$((d + 128))
-    CMD=(timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
+    CMD=(env "BLOOMERY_REF_MODEL=$f" timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
          --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
          "$BIN" --tokens "$ids" -n "$NGEN" --ctx "$CTX" --mode "$MODE")
   fi
@@ -280,16 +370,20 @@ source "${BASH_SOURCE[0]%/*}/lease.sh"
 
 if [ -n "$DRY" ]; then
   echo "[dry] form=$FORM model=$MODEL bin=$BIN mode=$MODE n=$NGEN depths='$DEPTHS' out=$OUTDIR timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-  for d in $DEPTHS; do
+  for i in "${!DEPTH_LIST[@]}"; do
+    d=${DEPTH_LIST[i]} f=${DEPTH_FILE[i]:-$MODEL} MARKER=${DEPTH_MARKER[i]}
     out="$OUTDIR/<name>"
-    profile_cmd "$d" "<lcg_prompt $d>"
+    profile_cmd "$d" "<lcg_prompt $d>" "$f"
     if [ "$FORM" = seed ]; then
+      echo "[dry] depth $d: file $f, token_embd ${DEPTH_TYPE[i]}"
       echo "[dry] depth $d: ctx $CTX, windows expected $NGEN (1 prefill pass + $((NGEN - 1)) replays), boundary $MARKER"
       echo "[dry] depth $d: ${CMD[*]}"
     elif [ "$FORM" = prefill ]; then
+      echo "[dry] prompt $d: file $f, token_embd ${DEPTH_TYPE[i]}"
       echo "[dry] prompt $d: ctx $CTX, boundaries expected K + $((NGEN - 1)) (K = the run's time prompt passes=), boundary $MARKER"
       echo "[dry] prompt $d: ${CMD[*]}"
     else
+      echo "[dry] depth $d: file $f"
       echo "[dry] depth $d: ctx $CTX, replays expected $((d + NGEN - 1))"
       echo "[dry] depth $d: ${CMD[*]}"
     fi
@@ -305,27 +399,31 @@ WITNESS=(head-open indent card model)
 
 lease_take
 echo "[config] nsys=$($NSYS --version) mode=$MODE n=$NGEN depths='$DEPTHS' out=$OUTDIR"
-[ "$FORM" != seed ] || echo "[config] form=seed bin=$BIN boundary=$MARKER ctx=${GEN_CTX:-D+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
-[ "$FORM" != prefill ] || echo "[config] form=prefill bin=$BIN boundary=$MARKER ctx=${GEN_CTX:-P+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
+[ "$FORM" != seed ] || echo "[config] form=seed bin=$BIN boundary=${BLOOMERY_NSYS_MARKER:-by token_embd type} ctx=${GEN_CTX:-D+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
+[ "$FORM" != prefill ] || echo "[config] form=prefill bin=$BIN boundary=${BLOOMERY_NSYS_MARKER:-by token_embd type} ctx=${GEN_CTX:-P+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
 witness pre
 
 rc_all=0
-for d in $DEPTHS; do
+for i in "${!DEPTH_LIST[@]}"; do
+  d=${DEPTH_LIST[i]} f=${DEPTH_FILE[i]:-$MODEL} MARKER=${DEPTH_MARKER[i]}
+  # An entry that names its file puts the file's stem in the output name, so one lease's traces of two files differ by name.
+  tag=''
+  [ -z "${DEPTH_FILE[i]}" ] || { tag=${f##*/}; tag=-${tag%.gguf}; }
   if [ "$FORM" = seed ]; then
-    out="$OUTDIR/nsys-qwen3moe-d${d}-n${NGEN}-${MODE}-$(date -u +%H%M%S)"
-    profile_cmd "$d"
+    out="$OUTDIR/nsys-${MODEL_NAME}${tag}-d${d}-n${NGEN}-${MODE}-$(date -u +%H%M%S)"
+    profile_cmd "$d" "" "$f"
     echo
-    echo "=== depth $d (ctx $CTX, mode $MODE, 1 prefill pass + $((NGEN - 1)) replays expected) -> $out.nsys-rep"
+    echo "=== depth $d (ctx $CTX, mode $MODE, 1 prefill pass + $((NGEN - 1)) replays expected) file $f, token_embd ${DEPTH_TYPE[i]}, boundary $MARKER -> $out.nsys-rep"
     guard_other
   elif [ "$FORM" = prefill ]; then
-    out="$OUTDIR/nsys-qwen3moe-pp${d}-n${NGEN}-${MODE}-$(date -u +%H%M%S)"
-    profile_cmd "$d" "$(lcg_prompt "$d")"
+    out="$OUTDIR/nsys-${MODEL_NAME}${tag}-pp${d}-n${NGEN}-${MODE}-$(date -u +%H%M%S)"
+    profile_cmd "$d" "$(lcg_prompt "$d")" "$f"
     echo
-    echo "=== prompt $d (ctx $CTX, mode $MODE, the prompt's units + $((NGEN - 1)) replays expected) -> $out.nsys-rep"
+    echo "=== prompt $d (ctx $CTX, mode $MODE, the prompt's units + $((NGEN - 1)) replays expected) file $f, token_embd ${DEPTH_TYPE[i]}, boundary $MARKER -> $out.nsys-rep"
     guard_other
   else
-    out="$OUTDIR/nsys-d${d}-${MODE}-$(date -u +%H%M%S)"
-    profile_cmd "$d" "$(lcg_prompt "$d")"
+    out="$OUTDIR/nsys${tag}-d${d}-${MODE}-$(date -u +%H%M%S)"
+    profile_cmd "$d" "$(lcg_prompt "$d")" "$f"
     echo
     echo "=== 깊이 $d (ctx $CTX, mode $MODE, 재생 $((d + NGEN - 1))개 기대) → $out.nsys-rep"
   fi
