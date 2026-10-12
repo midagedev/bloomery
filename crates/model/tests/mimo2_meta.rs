@@ -20,9 +20,18 @@ use gguf::{Gguf, Split, Value};
 const MIMO: &str = "/models/MiMo-V2.6-Flash-RL/MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf";
 
 /// The separate MTP file, whose 51 blocks carry only the next-token three:
-/// a trunk's tensors it does not carry, refused by name until the draft
-/// round reads it beside a target.
+/// the target reader refuses it by a trunk tensor it does not carry; the
+/// sidecar reader (`mimo2::mtp::mtp_of`) reads it beside a target.
 const MTP: &str = "/models/MiMo-V2.6-Flash-RL/mtp-MiMo-V2.6-Flash-RL-MXFP4.gguf";
+
+/// The MOPD checkpoint's target (the file the ik oracle is dumped from), its
+/// own Q8_0 sidecar, and the RL checkpoint's Q8_0 sidecar as the type
+/// census's header stub (`tools/type-census.py build`, which writes
+/// `<root>/<org>/<repo>/<file>`: a sparse file of the real header, read by
+/// header alone).
+const MOPD: &str = "/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf";
+const MOPD_MTP: &str = "/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf";
+const RL_MTP_STUB: &str = "/models/census-stubs-a134239f/ggml-org/MiMo-V2.6-Flash-RL-GGUF/mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf";
 
 // PIN(2026-10-07): the file's description as `arch::mimo2::spec` reads it, line by line (the key
 // values checked against the shard-0 header dump and llama.cpp's mimo2 loader, src/models/mimo2.
@@ -373,8 +382,9 @@ fn hw_mimo2_short_kv_array_refused() {
 }
 
 /// The separate MTP file, whose blocks carry only the next-token layers, is
-/// refused by the first trunk tensor it lacks — the draft round's reader
-/// opens it beside a target.
+/// refused by the target reader at the first trunk tensor it lacks; the
+/// sidecar reader opens it beside a target
+/// (`hw_mimo2_mtp_sidecar_reads_beside_its_checkpoints_target`).
 #[test]
 #[ignore = "needs the MiMo-V2.6-Flash-RL mtp file on the box (just gate-mimo2-meta)"]
 fn hw_mimo2_mtp_file_is_refused_until_its_round() {
@@ -386,6 +396,92 @@ fn hw_mimo2_mtp_file_is_refused_until_its_round() {
         err.contains("tensor blk.0.attn_norm.weight: is not in the file"),
         "{err}"
     );
+}
+
+/// The MOPD target's sidecar of its own checkpoint reads as one next-token
+/// layer, `blk.48`: a window layer with sinks over the target's dense block,
+/// fed the rows before the norms, the two matrices carried.
+#[test]
+#[ignore = "needs the MiMo-V2.6-Flash-MOPD shards and its Q8_0 sidecar on the box (just gate-mimo2-meta)"]
+fn hw_mimo2_mtp_sidecar_reads_beside_its_checkpoints_target() {
+    use model::arch::models::{DraftSpec, Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource};
+
+    let target = Split::open(MOPD).unwrap_or_else(|e| panic!("open {MOPD}: {e}"));
+    let read = model::arch::spec(&target).unwrap_or_else(|e| panic!("spec of {MOPD}: {e}"));
+    let draft = Split::open(MOPD_MTP).unwrap_or_else(|e| panic!("open {MOPD_MTP}: {e}"));
+    let spec = model::arch::mimo2::mtp::mtp_of(&draft, &target, &read.spec)
+        .unwrap_or_else(|e| panic!("mtp_of {MOPD_MTP}: {e}"));
+    let DraftSpec::Mtp(m) = spec else {
+        panic!("{MOPD_MTP} read as a block draft")
+    };
+    let Mixer::Gqa(g) = &m.layer.mixer else {
+        panic!("the MTP layer is {:?}, not GQA", m.layer.mixer)
+    };
+    let MtpSource::File {
+        first_shard,
+        bytes,
+        borrows,
+    } = &m.source
+    else {
+        panic!("the sidecar is a file source")
+    };
+    println!(
+        "{MOPD_MTP}: layer {} hidden {} vocab {} gqa {}/{} x {} v {} window {:?} sinks {} \
+         tensor bytes {bytes} borrows {borrows:?}",
+        m.index, m.hidden, m.vocab, g.heads, g.kv_heads, g.head_dim, g.value_dim, g.window, g.sinks
+    );
+    assert_eq!(m.index, 48);
+    assert_eq!((m.hidden, m.vocab), (4096, 152_576));
+    assert_eq!(m.input, MtpInput::PreNorm);
+    assert_eq!(m.head_norm, MtpHeadNorm::Rms);
+    assert!(m.hc.is_none(), "{:?}", m.hc);
+    assert_eq!(
+        (g.heads, g.kv_heads, g.head_dim, g.value_dim),
+        (64, 8, 192, 128)
+    );
+    assert_eq!((g.window, g.sinks), (Some(128), true));
+    assert!(
+        matches!(m.layer.ffn, Ffn::Dense { ff: 16_384, .. }),
+        "{:?}",
+        m.layer.ffn
+    );
+    assert!(
+        first_shard.ends_with("mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf"),
+        "{first_shard:?}"
+    );
+    assert!(
+        !borrows.embedding && !borrows.head,
+        "the sidecar carries both matrices: {borrows:?}"
+    );
+}
+
+/// The RL checkpoint's sidecar beside the MOPD target is refused on
+/// `general.name`, naming both checkpoints, and by the table's rule before it
+/// is fetched; the stub holds the real header, so nothing else differs.
+#[test]
+#[ignore = "needs the MiMo-V2.6-Flash-MOPD shards and the RL sidecar's census stub on the box (just gate-mimo2-meta)"]
+fn hw_mimo2_mtp_sidecar_of_the_other_checkpoint_is_refused() {
+    let target = Split::open(MOPD).unwrap_or_else(|e| panic!("open {MOPD}: {e}"));
+    let read = model::arch::spec(&target).unwrap_or_else(|e| panic!("spec of {MOPD}: {e}"));
+    let stub = Split::open(RL_MTP_STUB).unwrap_or_else(|e| panic!("open {RL_MTP_STUB}: {e}"));
+    let err = model::arch::mimo2::mtp::mtp_of(&stub, &target, &read.spec)
+        .expect_err("the RL sidecar beside the MOPD target is refused")
+        .to_string();
+    println!("{err}");
+    assert!(err.starts_with("metadata general.name:"), "{err}");
+    assert!(
+        err.contains("MiMo-V2.6-Flash-MOPD") && err.contains("MiMo-V2.6-Flash-RL"),
+        "{err}"
+    );
+    let rule = model::arch::draft::draft_usable(&target, Some("MiMo-V2.6-Flash-RL"))
+        .expect_err("the table refuses the RL file for the MOPD set")
+        .to_string();
+    assert!(
+        rule.contains("MiMo-V2.6-Flash-MOPD") && rule.contains("MiMo-V2.6-Flash-RL"),
+        "{rule}"
+    );
+    model::arch::draft::draft_usable(&target, Some("MiMo-V2.6-Flash-MOPD"))
+        .unwrap_or_else(|e| panic!("the MOPD file for the MOPD set: {e}"));
 }
 
 /// `shard`'s metadata rewritten: the `split.*` keys dropped, so the copy is

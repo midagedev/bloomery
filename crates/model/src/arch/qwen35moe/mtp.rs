@@ -12,12 +12,13 @@
 //! would select its positions; this reader builds only the dense one. The
 //! file uses the target's `token_embd` and `output` where it carries none
 //! (`src/llama-spec-features.cpp:242-291`); `nextn_shared_target_tensors`
-//! declares that it carries neither.
+//! declares that it carries neither, and the format's rule is
+//! [`crate::arch::draft::borrows`].
 
 use gguf::{GgmlType, Split, TensorInfo};
 use models::headpick::HeadSet;
 use models::{
-    Arch, Borrows, DraftSpec, Ffn, Gqa, HcKind, LayerSpec, Mixer, ModelSpec, MtpDraft, MtpHeadNorm,
+    Arch, DraftSpec, Ffn, Gqa, HcKind, LayerSpec, Mixer, ModelSpec, MtpDraft, MtpHeadNorm,
     MtpInput, MtpSource, Residual, Rope, RopeMode,
 };
 
@@ -25,18 +26,13 @@ use super::hparams::{
     ATTN_STEMS, EXP_LAYER_STEMS, GDN_STEMS, NORM_STEMS, PLE_STEMS, Variant, expert_ff,
     refuse_unless, sections,
 };
+use super::place::{PlaceError, PlanInputs};
 use super::spec::out_gate;
+use crate::arch::draft::{EMBEDDING, HEAD, borrows, same, same_token_ids};
 use crate::arch::{
     architecture_is, meta_arr, meta_f32, meta_usize, metadata, n_vocab, qwen35moe_variant, spec_u32,
 };
 use crate::placement::PlacementError;
-
-/// The key that declares a file carries neither `token_embd` nor `output`.
-const SHARED: &str = "nextn_shared_target_tensors";
-
-/// The token embedding and the output matrix, by name.
-const EMBEDDING: &str = "token_embd.weight";
-const HEAD: &str = "output.weight";
 
 /// The layer's own stems: the input's norms and projection and the
 /// gated-residual head.
@@ -148,18 +144,7 @@ pub fn mtp_of(
         rank,
     )?;
     same(draft, "vocab_size", n_vocab(draft)?, spec.vocab)?;
-    for key in [
-        "tokenizer.ggml.eos_token_id",
-        "tokenizer.ggml.padding_token_id",
-    ] {
-        let (d, t) = (token_id(draft, key)?, token_id(target, key)?);
-        if d != t {
-            return Err(PlacementError::Metadata {
-                key: key.to_string(),
-                detail: format!("is {d:?} in the draft file, {t:?} in the target's"),
-            });
-        }
-    }
+    same_token_ids(draft, target)?;
     let ratio = ratio(draft, n_layer, n_main)?;
     if ratio > 0 {
         return Err(metadata(
@@ -324,32 +309,6 @@ fn streams_u32(streams: usize) -> Result<u32, PlacementError> {
     spec_u32("hyper_connection.count", streams)
 }
 
-/// Err naming `<architecture>.<suffix>` when the draft's `value` is not the target's.
-fn same(draft: &Split, suffix: &str, value: usize, target: u32) -> Result<(), PlacementError> {
-    if u64::try_from(value).ok() == Some(u64::from(target)) {
-        return Ok(());
-    }
-    Err(metadata(
-        draft,
-        suffix,
-        format!("is {value}; the target's is {target}"),
-    ))
-}
-
-/// `key`, an un-prefixed token id; `None` when absent.
-fn token_id(split: &Split, key: &str) -> Result<Option<u64>, PlacementError> {
-    match split.value(key) {
-        None => Ok(None),
-        Some(v) => v
-            .as_unsigned()
-            .map(Some)
-            .ok_or_else(|| PlacementError::Metadata {
-                key: key.to_string(),
-                detail: format!("is {v:?}, not a token id"),
-            }),
-    }
-}
-
 /// The MTP layer's pool from `attention.compress_ratios`, as ik reads it: an
 /// array of `n_layer` values gives the layer its own; one of the `n_main`
 /// main layers' makes it inherit the last main layer's. Any other length,
@@ -459,46 +418,20 @@ fn layer_tensors(draft: &Split, index: usize) -> Result<(), PlacementError> {
     Ok(())
 }
 
-/// Which of the target's matrices the draft uses: those it carries none of,
-/// or both when `nextn_shared_target_tensors` is true. A declaration the
-/// tensors present contradict is refused.
-fn borrows(draft: &Split) -> Result<Borrows, PlacementError> {
-    let has_embedding = draft.find(EMBEDDING).is_some();
-    let has_head = draft.find(HEAD).is_some();
-    let declared = match draft.value(&draft.arch_key(SHARED)) {
-        None => None,
-        Some(v) => Some(
-            v.as_bool()
-                .ok_or_else(|| metadata(draft, SHARED, format!("is {v:?}, not a bool")))?,
-        ),
-    };
-    let carried: Vec<&str> = [(EMBEDDING, has_embedding), (HEAD, has_head)]
-        .iter()
-        .filter(|(_, has)| *has)
-        .map(|(n, _)| *n)
-        .collect();
-    match declared {
-        Some(true) if !carried.is_empty() => Err(metadata(
-            draft,
-            SHARED,
-            format!(
-                "is true, and the file carries {}: a shared file uses the target's token_embd and output",
-                carried.join(" and ")
-            ),
-        )),
-        Some(false) if carried.len() != 2 => Err(metadata(
-            draft,
-            SHARED,
-            format!(
-                "is false, and the file carries only [{}] of token_embd and output",
-                carried.join(", ")
-            ),
-        )),
-        _ => Ok(Borrows {
-            embedding: !has_embedding,
-            head: !has_head,
-        }),
+/// Whether the qwen4exp set whose first shard is `target` can run its draft
+/// file ([`crate::arch::draft::draft_usable`]'s qwen4exp rule): the plan's
+/// own rule for the matrices the draft borrows
+/// ([`PlanInputs::mtp_borrows`]). The draft is one shared file, so a set that
+/// names the checkpoint it is made from is a table error, refused.
+pub fn target_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), PlaceError> {
+    if let Some(c) = checkpoint {
+        return Err(PlacementError::Metadata {
+            key: "general.name".to_string(),
+            detail: format!("is named {c:?} for a qwen4exp draft, which is one shared file"),
+        }
+        .into());
     }
+    PlanInputs::describe(target)?.mtp_borrows()
 }
 
 /// The borrowed `output.weight`'s form, as [`mtp_of`] admitted it: Q8_0
@@ -824,43 +757,6 @@ mod tests {
         assert_eq!(bytes - shared, 2 * (64 * 2 / 32 * 34));
     }
 
-    /// With no declaration, each matrix the file lacks is the target's.
-    #[test]
-    fn absence_borrows_each_matrix() {
-        let mut c = Case::unshared();
-        c.tensors.retain(|(n, _, _)| n != EMBEDDING);
-        let m = c.read("mtp-half").expect("the draft reads");
-        assert_eq!(
-            borrows_of(&m),
-            Borrows {
-                embedding: true,
-                head: false
-            }
-        );
-    }
-
-    #[test]
-    fn a_shared_declaration_beside_the_matrices_is_refused() {
-        let mut c = Case::shared();
-        c.tensors.extend(own_matrices().into_iter().take(1));
-        c.refused(
-            "mtp-contra-t",
-            "qwen4exp.nextn_shared_target_tensors: is true, and the file carries token_embd.weight",
-        );
-    }
-
-    #[test]
-    fn an_unshared_declaration_without_the_matrices_is_refused() {
-        let mut c = Case::shared();
-        c.kv = with(c.kv, "nextn_shared_target_tensors", Some(V::Bool(false)));
-        c.refused(
-            "mtp-contra-f",
-            "qwen4exp.nextn_shared_target_tensors: is false, and the file carries only []",
-        );
-    }
-
-    /// An array of `block_count` values gives the layer its own ratio: 0
-    /// here, where the last main layer's is 4.
     #[test]
     fn a_ratio_array_of_block_count_takes_the_layers_own() {
         let m = Case::shared().read("mtp-r5").expect("the draft reads");

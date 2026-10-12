@@ -679,9 +679,44 @@ pub struct Borrows {
     pub head: bool,
 }
 
-/// How an MTP layer's input is made. Both forms norm the token's embedding
-/// by `nextn.enorm` and the target's row by `nextn.hnorm`, join them with the
-/// embedding's half first, and project the join by `nextn.eh_proj`
+/// Why a draft file is not of its target's checkpoint ([`same_checkpoint`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CheckpointMismatch {
+    /// Both files name their checkpoint, and the names differ.
+    #[error(
+        "the draft file is of checkpoint {draft:?} and the target of {target:?}: a draft head \
+         reads the hidden state of the checkpoint it was made from"
+    )]
+    Differs { target: String, draft: String },
+    /// A file names no checkpoint, so nothing says whose it is.
+    #[error("the {file} file has no `general.name`: its checkpoint is unknown")]
+    Unnamed { file: &'static str },
+}
+
+/// Whether a draft file was made from the checkpoint its target is: the
+/// `general.name` of each file (`None`: the key is absent), the names equal.
+/// Two checkpoints of one architecture share every key and tensor shape but
+/// this name, so no other check tells them apart; a file with no name is
+/// refused, never taken for a match.
+pub fn same_checkpoint(
+    target: Option<&str>,
+    draft: Option<&str>,
+) -> Result<(), CheckpointMismatch> {
+    let target = target.ok_or(CheckpointMismatch::Unnamed { file: "target" })?;
+    let draft = draft.ok_or(CheckpointMismatch::Unnamed { file: "draft" })?;
+    if target == draft {
+        Ok(())
+    } else {
+        Err(CheckpointMismatch::Differs {
+            target: target.to_string(),
+            draft: draft.to_string(),
+        })
+    }
+}
+
+/// How an MTP layer's input is made. Every form norms the token's embedding
+/// by `nextn.enorm` and the target's row by `nextn.hnorm`, joins them with
+/// the embedding's half first, and projects the join by `nextn.eh_proj`
 /// (`2 × hidden` values to `hidden`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MtpInput {
@@ -692,6 +727,11 @@ pub enum MtpInput {
     /// The row the target's head reads, its streams collapsed and normed by
     /// the output norm: one row joined and projected.
     HeadRow,
+    /// The target's last-layer row before its output norm, and the draft's
+    /// own row before its head norm: the row the next step reads is taken
+    /// ahead of the norm, and `hnorm` is the only norm it meets
+    /// (MiMo-V2's graph).
+    PreNorm,
 }
 
 /// What the MTP layer's row goes through before the output matrix, in place
@@ -701,7 +741,8 @@ pub enum MtpHeadNorm {
     /// The layer's own gated-residual head (`nextn.hc_head_*`), of the
     /// target's `output_hc_*` form: it norms and collapses the streams.
     HcHead,
-    /// The layer's own RMS gain (`nextn.shared_head_norm`).
+    /// The layer's own RMS gain: `nextn.shared_head_norm`, or MiMo-V2's
+    /// `blk.N.layer_output_norm`.
     Rms,
 }
 
@@ -778,7 +819,43 @@ fn count_u32(n: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::Act;
+    use super::{Act, CheckpointMismatch, same_checkpoint};
+
+    const MOPD: &str = "MiMo-V2.6-Flash-MOPD";
+    const RL: &str = "MiMo-V2.6-Flash-RL";
+
+    /// A draft of the target's checkpoint is accepted; a draft of the other
+    /// checkpoint is refused naming both.
+    #[test]
+    fn a_draft_of_another_checkpoint_is_refused_naming_both() {
+        assert_eq!(same_checkpoint(Some(MOPD), Some(MOPD)), Ok(()));
+        assert_eq!(same_checkpoint(Some(RL), Some(RL)), Ok(()));
+        let err = same_checkpoint(Some(MOPD), Some(RL)).expect_err("RL beside MOPD is refused");
+        assert_eq!(
+            err,
+            CheckpointMismatch::Differs {
+                target: MOPD.to_string(),
+                draft: RL.to_string(),
+            }
+        );
+        let text = err.to_string();
+        assert!(text.contains(MOPD) && text.contains(RL), "{text}");
+        assert!(same_checkpoint(Some(RL), Some(MOPD)).is_err());
+    }
+
+    /// A file with no name proves no checkpoint, on either side.
+    #[test]
+    fn a_file_without_a_name_is_refused() {
+        assert_eq!(
+            same_checkpoint(None, Some(RL)),
+            Err(CheckpointMismatch::Unnamed { file: "target" })
+        );
+        assert_eq!(
+            same_checkpoint(Some(RL), None),
+            Err(CheckpointMismatch::Unnamed { file: "draft" })
+        );
+        assert!(same_checkpoint(None, None).is_err());
+    }
 
     /// No limit is the plain combine's 0; a limit is itself.
     #[test]
