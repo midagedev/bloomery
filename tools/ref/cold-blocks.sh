@@ -27,8 +27,13 @@
 #
 # The failed arms. An arm that fails prints a FAIL row where its row would be (arm_fail) and the runner goes
 # on; a counted arm's label drops out of the tables at that depth or P (failed_tally), and the runner ends
-# with the list and exit 1 (failed_end). A warm-up's or a discard's failure is `FAIL r0 …`, in the list and
-# dropping nothing. depth-ds41.sh's header has the contract (Failures).
+# with the list and exit 1 (failed_end). A warm-up's, a discard's or a prime's failure is `FAIL r0 …`, in the
+# list and dropping nothing, and the block's rounds still run — except when its last line is a lever refusal
+# (lever_refusal): the binary refuses a variable the arm ran under, the same at every round, so no timed round of
+# that arm would run, and the run ends there (refused_stop), whatever the other arms: the lease is held, the
+# arm is one the comparison asked for, and the tables without it are not that comparison. A prime counts: it
+# runs the arm's own words. A refusal at a later round is an ordinary FAIL row. depth-ds41.sh's header has the
+# contract (Failures).
 #
 # The warm rows. Under BLOOMERY_WARM_ROWS=1 (warm_rows_init) every counted row is taken warm, and a row
 # that is not is a named failure. Two halves of one rule — a row's timed window reads only what the same
@@ -91,8 +96,20 @@ arm_fail() {
   fi
   echo "FAIL r$r $label $key rc=$rc | $why${f:+ | full output: $f}$CPU_BUSY_TAG$OTHER_BUSY_TAG"
   FAILED+=("r$r $label $key rc=$rc")
+  if [ "$r" = 0 ] && [ -n "$last" ] && lever_refusal "$last"; then refused_stop "$label" "$key" "$last"; fi
   counted || return 0
   FAILED_KEYS+=("$label|${key#*=}")
+}
+# lever_refusal <line>: whether <line> is a lever refusal of the levers crate, whatever the binary prints before it:
+# `<NAME>=<value as Rust's {:?} writes it, quoted> is refused: <why>` (crates/levers/src/lib.rs:496, Refusal's
+# Display). The quote closing the value is what other "is refused" prose of the binaries lacks (a busy card's).
+LEVER_REFUSAL_RE='(^|[^A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*="([^"\\]|\\.)*" is refused: '
+lever_refusal() { [[ $1 =~ $LEVER_REFUSAL_RE ]]; }
+# refused_stop <label> <d=|p=key> <last line>: the FAIL r0 row above is a lever refusal; end the run, rc 1, with
+# the arm and the refusal named and failed_end's list.
+refused_stop() {
+  echo "stopped: $1 at $2: its binary refuses a variable it ran under ($3); no timed round of it would run, and the comparison is broken without it, so the run ends here"
+  failed_end
 }
 # drop_failed: the records `label|key|…` on stdin, less those whose `label|key` a counted arm failed at.
 drop_failed() {
@@ -438,6 +455,29 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check fail-discard "$row" "FAIL r0 ours@X=1 d=6 rc=3 | exited 3 [other-busy]"
   check fail-list "$(printf '%s; ' "${FAILED[@]}")|${FAILED_KEYS[*]}" "r1 lcpppp4096 p=4096 rc=134; r0 ours@X=1 d=6 rc=3; |lcpppp4096|4096"
   check fail-drop "$(printf 'lcpppp4096|4096|1|9\nlcpppp4096|512|1|9\nours|4096|1|9\n' | drop_failed | paste -sd';' -)" "lcpppp4096|512|1|9;ours|4096|1|9"
+  # A lever refusal as the last line of a FAIL r0 row ends the run, rc 1, with the stop line and the failed list; the
+  # same line on a round's row, or an r0 row whose last line is other "is refused" prose, does not.
+  FAILED=() FAILED_KEYS=()
+  ref='generate_qwen3moe: BLOOMERY_CARD_BUDGET="12G" is refused: this binary (generate_qwen3moe) does not act on it; unset it'
+  out=$(arm_fail 0 'ours@BLOOMERY_CARD_BUDGET=12G' d=512 1 "exited 1" "$(printf 'load\n%s\n' "$ref")" 2> /dev/null) && r=0 || r=$?
+  check refusal-rc "$r" 1
+  check refusal-stop "$(grep '^stopped: ' <<< "$out")" "stopped: ours@BLOOMERY_CARD_BUDGET=12G at d=512: its binary refuses a variable it ran under ($ref); no timed round of it would run, and the comparison is broken without it, so the run ends here"
+  check refusal-list "$(grep '^failed arms: ' <<< "$out")" "failed arms: r0 ours@BLOOMERY_CARD_BUDGET=12G d=512 rc=1; "
+  out=$(arm_fail 1 'ours@BLOOMERY_CARD_BUDGET=12G' d=512 1 "exited 1" "$(printf 'load\n%s\n' "$ref")" 2> /dev/null) && r=0 || r=$?
+  check refusal-round "$r|$(grep -c '^stopped: ' <<< "$out")" "0|0"
+  out=$(arm_fail 0 ours d=512 1 "exited 1" "$(printf 'BLOOMERY_CARD=a6000 is refused while the card is busy\n')" 2> /dev/null) && r=0 || r=$?
+  check refusal-near "$r|$(grep -c '^stopped: ' <<< "$out")" "0|0"
+  out=$(arm_fail 0 ours d=512 1 "exited 1" 2> /dev/null) && r=0 || r=$?
+  check refusal-no-output "$r|$(grep -c '^stopped: ' <<< "$out")" "0|0"
+  rm -f "$TMPDIR"/runner-*
+  hits=''
+  for l in 'BLOOMERY_CARD_BUDGET="1" is refused: why' 'Error: BLOOMERY_CARD_BUDGET="a\"b c" is refused: why' 'CUDA_X="" is refused: why' '  generate_qwen3moe: BLOOMERY_CARD_BUDGET="1" is refused: '; do
+    lever_refusal "$l" && hits+=y || hits+=n
+  done
+  for l in 'BLOOMERY_CARD_BUDGET=1 is refused: why' 'BLOOMERY_CARD_BUDGET="1" is refused while busy' 'BLOOMERY_CARD_BUDGET="1" refused: why' 'x is refused: why' 'BLOOMERY_CARD_BUDGET="1 is refused: why'; do
+    lever_refusal "$l" && hits+=y || hits+=n
+  done
+  check refusal-match "$hits" yyyynnnnn
   rm -rf "$TMPDIR"
   FAILED=() FAILED_KEYS=()
   # The planner: ours 6 and 512 (prompts), a reference engine `x` at K 26 whose pp arm draws 2P, the same

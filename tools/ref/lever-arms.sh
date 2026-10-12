@@ -10,10 +10,12 @@
 #                      (depth-qwen3moe.sh's load driver's solo marker): skipped by the registry check
 # and defines arm_refuse <arm> <why>, which prints the refusal in the runner's shape and exits 64.
 #
-# The runner calls, once the lists are parsed and before the lease: lever_probe <bin> <NAME=VALUE>... (below)
-# for each distinct engine and list of its arms, and gets back rc 0, or rc 1 with LEVER_PROBE_WHY the binary's
-# last output line. The loop, the dedupe, the words it adds to the list (a BLOOMERY_DRAFT=mtp for a draft
-# engine's arm) and the message it checks with are the runner's.
+# The runner calls, once the lists are parsed and before the lease: lever_probe <bin> <NAME=VALUE>... [-- <arg>...]
+# (below) for each distinct engine, list and arguments of its arms, and gets back rc 0, or rc 1 with
+# LEVER_PROBE_WHY the binary's last output line. The loop, the dedupe, the words it adds to the list (a
+# BLOOMERY_DRAFT=mtp for a draft engine's arm), the arguments a binary needs to act on a lever (depth-qwen3moe.sh's
+# --place <p>: generate_qwen3moe acts on the placement's levers only when its arguments name --place) and the
+# message it checks with are the runner's.
 
 # lever_rows_py <registry.rs>: every row of the lever registry as `<name> <site>` — Parsed or Direct (a
 # lever), Retired, or Env (a runner's, a harness's or a path's own variable: the path() and runner()
@@ -100,17 +102,62 @@ arm_envs_ok() {
     esac
   done
 }
-# lever_probe <bin> <NAME=VALUE>...: `env <words> <bin> --levers`, the binary's own check of the words it will
-# run under (it refuses a lever it does not act on and a value its kind does not take, --levers included).
-# Returns 0 when it passes. Returns 1 when it refuses, with LEVER_PROBE_WHY the binary's last output line (the
-# empty string when the binary printed none; empty again after a pass). The output of a pass is dropped.
+# lever_probe <bin> <NAME=VALUE>... [-- <arg>...]: `env <words> <bin> --levers <args>`, the binary's own check of
+# the words it will run under (it refuses a lever it does not act on and a value its kind does not take,
+# --levers included). The words are the items before the first `--`; the args after it follow `--levers`, for a
+# lever a binary acts on only under an argument of its run's (generate_qwen3moe's --place <p>); a call with no
+# `--` has none. Returns 0 when it passes. Returns 1 when it refuses, with LEVER_PROBE_WHY the binary's last output
+# line (the empty string when the binary printed none; empty again after a pass). The output of a pass is dropped.
 LEVER_PROBE_WHY=
 lever_probe() {
   local bin=$1 out
+  local -a words=() args=()
   shift
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    words+=("$1")
+    shift
+  done
+  [ $# -eq 0 ] || shift
+  args=("$@")
   LEVER_PROBE_WHY=
-  out=$(env "$@" "$bin" --levers 2>&1) && return 0
+  out=$(env ${words[@]+"${words[@]}"} "$bin" --levers ${args[@]+"${args[@]}"} 2>&1) && return 0
   # shellcheck disable=SC2034 # read by the runner that sources this file
   LEVER_PROBE_WHY=${out##*$'\n'}
   return 1
 }
+
+# `bash tools/ref/lever-arms.sh --self-test`: lever_probe against fake binaries, on the Mac: the words go to env and
+# the args after `--` follow `--levers`, a binary that refuses without an arg passes with it, and the last output
+# line of a refusal is its reason.
+if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
+  fails=0 checks=0
+  check() {
+    checks=$((checks + 1))
+    if [ "$2" = "$3" ]; then echo "ok $1"; else echo "FAIL $1: got [$2], want [$3]"; fails=$((fails + 1)); fi
+  }
+  d=$(mktemp -d) || exit 2
+  trap 'rm -rf "$d"' EXIT
+  # seen: records its arguments and X, passes. needs-place: refuses unless its arguments name --place.
+  printf '#!/bin/bash\necho "args=$* X=${X:-unset}" >> "%s/seen.log"\n' "$d" > "$d/seen"
+  printf '#!/bin/bash\necho first\nfor a in "$@"; do [ "$a" != --place ] || exit 0; done\necho "last: X=${X:-nox} needs --place"\nexit 1\n' > "$d/needs-place"
+  chmod +x "$d/seen" "$d/needs-place"
+  : > "$d/seen.log"
+  lever_probe "$d/seen" X=1 Y=2
+  check words-rc "$?" 0
+  lever_probe "$d/seen" X=1 -- --place a
+  lever_probe "$d/seen" -- --place gate
+  lever_probe "$d/seen" X=2 --
+  lever_probe "$d/seen"
+  check args "$(paste -sd'|' - < "$d/seen.log")" "args=--levers X=1|args=--levers --place a X=1|args=--levers --place gate X=unset|args=--levers X=2|args=--levers X=unset"
+  lever_probe "$d/needs-place" X=1
+  check refuse "$?|$LEVER_PROBE_WHY" "1|last: X=1 needs --place"
+  lever_probe "$d/needs-place" X=1 -- --place a
+  check args-pass "$?|$LEVER_PROBE_WHY" "0|"
+  lever_probe "$d/needs-place" X=1 -- --other
+  check args-wrong "$?|$LEVER_PROBE_WHY" "1|last: X=1 needs --place"
+  lever_probe "$d/missing" X=1
+  check missing "$?" 1
+  echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
+  [ "$fails" = 0 ]
+  exit
+fi
