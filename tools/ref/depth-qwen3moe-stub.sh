@@ -126,6 +126,30 @@
 #   warmup-fail  BLOOMERY_AB_WARMUP=1 under rotate, the warm-up lcpp:6 aborts: `FAIL r0 lcpp`, the rows after.
 #   group-fail   6 4 5 in one load, depth 4 ending the process once: 6's row, 4's FAIL row, the driver's
 #                `[load]` line, and 5 in a fresh load (the processes' --arm lists 6 4 5, then 5); rc 1.
+# The lever probe and the refusal stop (red on the runner before them: no probe before the lease, and a FAIL r0
+# row that is a lever refusal let every round run). The stub binary's --levers refuses BLOOMERY_AB_LOAD and the
+# variable STUB_GEN_REFUSE names; STUB_GEN_REFUSE_RUN names one a run alone refuses; it records the arm variables it
+# saw in $TMPDIR/stub-gen-levers, one line a call.
+#   probe-ours   6 6@STUB_GEN_PASSES=5 under STUB_GEN_REFUSE=STUB_GEN_PASSES: rc 2 and the named line before the
+#                lease (no [config], no lease line, no row, no process of an arm).
+#   probe-bin    bin:<stub base>:6@STUB_GEN_PASSES=5: the same for a bin: arm, naming its binary.
+#   probe-words  6@model=<shard>,STUB_GEN_PASSES=5 6@BLOOMERY_AB_LOAD=arm,STUB_GEN_PASSES=5 4@STUB_GEN_PASSES=5, a
+#                binary that refuses BLOOMERY_AB_LOAD: rc 0, two probes (the model= arm's with its
+#                BLOOMERY_REF_MODEL, the solo arm's and the third's one, deduped), no solo marker in them.
+#   probe-unplaced  6@BLOOMERY_CARD_BUDGET=12G (the 2026-10-12 sitting's arm; the stub binary acts on that lever only
+#                under --place): rc 2 and the binary's refusal in the named line, before the lease.
+#   probe-placed 6@place=a,BLOOMERY_CARD_BUDGET=12G 4@place=a,BLOOMERY_CARD_BUDGET=12G, and 6@BLOOMERY_CARD_BUDGET=12G
+#                under BLOOMERY_GEN_PLACE=a: rc 0, the probe carries `--place a` (one probe for the first pair), and a
+#                placed arm the binary refuses (6@place=a,STUB_GEN_PASSES=5) is named with its `--place a`; no probe
+#                under BLOOMERY_DRY=1 (rc 0, probe-dry).
+#   refused-warmup  BLOOMERY_AB_WARMUP=1, the warm-up arm's run refusing STUB_GEN_PASSES (its --levers passes):
+#                `FAIL r0` with the refusal as its last line, the `stopped:` line, `failed arms: r0 …`, rc 1,
+#                and no other row or process.
+#   refused-discard  BLOOMERY_AB_ORDER=blocks, lcpp:6 then the refused ours arm: the lcpp block's discard and
+#                round, then the ours block's `FAIL r0` and the stop (no `ROW r1 ours`), rc 1.
+#   refused-prime  BLOOMERY_WARM_ROWS=1: the prime of the refused arm is `FAIL r0` and the stop, no other row.
+#   refused-other, refused-near  an ordinary warm-up failure (rc 3, the stub's depth refusal) is today's: `FAIL r0`,
+#                the round's rows after it, rc 1; so is a last line of other "is refused" prose (a busy card's).
 # The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, timing-card.sh), red on the runner before it (it
 # has no mode: timing-card.sh leaves it no card, and its rows would name one):
 #   twocard      lcpp:6 lcpppp:4 lcppfit:6, one round: every row's card field `A6000+3090` and device
@@ -386,6 +410,36 @@ for v in place mem; do
     exit 9
   fi
 done
+# generate_qwen3moe's lever refusal as the levers crate prints it (crates/levers/src/lib.rs, Refusal's Display).
+refuse() { echo "generate_qwen3moe: $1=\"$(printenv "$1")\" is refused: this binary (generate_qwen3moe) does not act on it; unset it" >&2; exit 1; }
+# BLOOMERY_CARD_BUDGET is a placement lever (q3place::PLACED_LEVERS): the binary acts on it only when its arguments
+# name --place, and refuses it by name otherwise, in a run and under --levers alike.
+placed='' prev=''
+for a in "$@"; do
+  [ "$prev" != --place ] || placed=$a
+  prev=$a
+done
+[ -n "$placed" ] || ! printenv BLOOMERY_CARD_BUDGET > /dev/null || refuse BLOOMERY_CARD_BUDGET
+# --levers: the check of the variables the process would run under. It refuses BLOOMERY_AB_LOAD as a name no
+# registry row names (the runner's solo marker, never the binary's) and the variable STUB_GEN_REFUSE names when
+# it is set; it appends the arm variables it saw (BLOOMERY_REF_MODEL, BLOOMERY_CARD_BUDGET, STUB_GEN_PASSES,
+# STUB_GEN_TOKEN0) and its --place <p> to $TMPDIR/stub-gen-levers, one line a call, and starts no arm (no
+# stub-gen-loads or stub-gen-place line).
+if [ "${1:-}" = --levers ]; then
+  if printenv BLOOMERY_AB_LOAD > /dev/null; then
+    echo "generate_qwen3moe: BLOOMERY_AB_LOAD=\"$(printenv BLOOMERY_AB_LOAD)\" is refused: no row of the lever registry names it (the nearest is BLOOMERY_AB_ORDER); unset it or fix the name" >&2
+    exit 1
+  fi
+  [ -z "${STUB_GEN_REFUSE:-}" ] || ! printenv "$STUB_GEN_REFUSE" > /dev/null || refuse "$STUB_GEN_REFUSE"
+  seen=$(printenv | grep -E '^(BLOOMERY_REF_MODEL|BLOOMERY_CARD_BUDGET|STUB_GEN_PASSES|STUB_GEN_TOKEN0)=' | sort | paste -sd' ' - || true)
+  echo "$seen${placed:+ --place $placed}" >> "${TMPDIR:-/tmp}/stub-gen-levers"
+  echo "lever table (stub)"
+  exit 0
+fi
+# A run refuses the same variable, and under STUB_GEN_REFUSE_RUN the run alone does (its --levers passes).
+for v in "${STUB_GEN_REFUSE:-}" "${STUB_GEN_REFUSE_RUN:-}"; do
+  [ -z "$v" ] || ! printenv "$v" > /dev/null || refuse "$v"
+done
 # STUB_GEN_READ_MODEL=1: the process reads every shard of BLOOMERY_REF_MODEL's split set, as a load faults them in.
 if [ -n "${STUB_GEN_READ_MODEL:-}" ]; then
   m=${BLOOMERY_REF_MODEL:?STUB_GEN_READ_MODEL reads BLOOMERY_REF_MODEL}
@@ -445,7 +499,7 @@ for k in "${!arms[@]}"; do
   mark=${TMPDIR:-/tmp}/stub-once-gen-$depth
   if [ "$depth" = "${STUB_GEN_FAIL_DEPTH:-none}" ] && [ ! -e "$mark" ]; then
     touch "$mark"
-    echo "error: the stub refuses depth $depth once" >&2
+    echo "${STUB_GEN_FAIL_LINE:-error: the stub refuses depth $depth once}" >&2
     exit 3
   fi
   ns=${STUB_GEN_SLOTS_LEAK:-$(printenv BLOOMERY_GEN_SLOTS)}
@@ -540,7 +594,7 @@ stub_run() {
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
   rm -f "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-*
-  rm -f "$tmp/tmp/stub-xid" "$tmp/tmp/stub-systemd-run"
+  rm -f "$tmp/tmp/stub-xid" "$tmp/tmp/stub-systemd-run" "$tmp/tmp/stub-gen-levers"
   echo 0 > "$tmp/tmp/stub-majflt"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
     STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 STUB_MAJFLT="$tmp/tmp/stub-majflt" \
@@ -839,6 +893,145 @@ elif want warmup-fail "$L" 1 "^FAIL r0 lcpp d=6 rc=134 \| no 'tg4 @ d6' row; " &
   want warmup-fail "$L" 1 '^failed arms: r0 lcpp d=6 rc=134; $'; then
   pass warmup-fail
 fi
+
+# The lever probe: a lever arm's variables are the binary's to take, asked of its --levers before the lease.
+REFUSAL='generate_qwen3moe: STUB_GEN_PASSES="5" is refused: this binary \(generate_qwen3moe\) does not act on it; unset it'
+L=$tmp/probe-ours.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_REFUSE=STUB_GEN_PASSES -- 6 6@STUB_GEN_PASSES=5
+if [ "$RC" != 2 ]; then
+  fail probe-ours "rc $RC, want 2" "$L"
+elif want probe-ours "$L" 1 "^depth-qwen3moe.sh: arm 6@STUB_GEN_PASSES=5: target/release/generate_qwen3moe refuses STUB_GEN_PASSES=5 \(its --levers under them: $REFUSAL\): the arm cannot run as written\$" &&
+  want probe-ours "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
+  [ ! -e "$tmp/tmp/stub-gen-loads" ]; then
+  pass probe-ours
+fi
+
+L=$tmp/probe-bin.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_REFUSE=STUB_GEN_PASSES -- "bin:$BASEBIN:6@STUB_GEN_PASSES=5"
+if [ "$RC" != 2 ]; then
+  fail probe-bin "rc $RC, want 2" "$L"
+elif want probe-bin "$L" 1 "^depth-qwen3moe.sh: arm bin:[^ ]*generate_qwen3moe:6@STUB_GEN_PASSES=5: [^ ]*/base/target/release/generate_qwen3moe refuses STUB_GEN_PASSES=5 \(its --levers under them: $REFUSAL\): the arm cannot run as written\$" &&
+  want probe-bin "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
+  [ ! -e "$tmp/tmp/stub-gen-loads" ]; then
+  pass probe-bin
+fi
+
+# The words: a model= arm's BLOOMERY_REF_MODEL is among them, the solo marker is not (this binary refuses it as a
+# name no row names), and two arms of one list are one probe.
+L=$tmp/probe-words.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- "6@model=$SHARD,STUB_GEN_PASSES=5" 6@BLOOMERY_AB_LOAD=arm,STUB_GEN_PASSES=5 4@STUB_GEN_PASSES=5
+if [ "$RC" != 0 ]; then
+  fail probe-words "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$tmp/tmp/stub-gen-levers" 2> /dev/null)" != "BLOOMERY_REF_MODEL=$SHARD STUB_GEN_PASSES=5|STUB_GEN_PASSES=5" ]; then
+  fail probe-words "the probes' words: $(paste -sd'|' - < "$tmp/tmp/stub-gen-levers" 2> /dev/null), want BLOOMERY_REF_MODEL=$SHARD STUB_GEN_PASSES=5|STUB_GEN_PASSES=5" "$L"
+elif want probe-words "$L" 3 '^ROW r1 ' && want probe-words "$L" 0 'refuses|^FAIL '; then
+  pass probe-words
+fi
+
+# The placement's levers act only under --place, so a placed arm's probe carries it.
+REFUSAL_CB='generate_qwen3moe: BLOOMERY_CARD_BUDGET="12G" is refused: this binary \(generate_qwen3moe\) does not act on it; unset it'
+L=$tmp/probe-unplaced.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- 6@BLOOMERY_CARD_BUDGET=12G
+if [ "$RC" != 2 ]; then
+  fail probe-unplaced "rc $RC, want 2" "$L"
+elif want probe-unplaced "$L" 1 "^depth-qwen3moe.sh: arm 6@BLOOMERY_CARD_BUDGET=12G: target/release/generate_qwen3moe refuses BLOOMERY_CARD_BUDGET=12G \(its --levers under them: $REFUSAL_CB\): the arm cannot run as written\$" &&
+  want probe-unplaced "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
+  [ ! -e "$tmp/tmp/stub-gen-loads" ]; then
+  pass probe-unplaced
+fi
+
+L=$tmp/probe-placed.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- 6@place=a,BLOOMERY_CARD_BUDGET=12G 4@place=a,BLOOMERY_CARD_BUDGET=12G
+if [ "$RC" != 0 ]; then
+  fail probe-placed "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$tmp/tmp/stub-gen-levers" 2> /dev/null)" != "BLOOMERY_CARD_BUDGET=12G --place a" ]; then
+  fail probe-placed "the probes: $(paste -sd'|' - < "$tmp/tmp/stub-gen-levers" 2> /dev/null), want one BLOOMERY_CARD_BUDGET=12G --place a" "$L"
+elif want probe-placed "$L" 2 '^ROW r1 ours@place=a,BLOOMERY_CARD_BUDGET=12G d=[46] ' && want probe-placed "$L" 0 'refuses|^FAIL '; then
+  pass probe-placed
+fi
+
+L=$tmp/probe-placed-run.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PLACE=a -- 6@BLOOMERY_CARD_BUDGET=12G
+if [ "$RC" != 0 ]; then
+  fail probe-placed-run "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$tmp/tmp/stub-gen-levers" 2> /dev/null)" != "BLOOMERY_CARD_BUDGET=12G --place a" ]; then
+  fail probe-placed-run "the probes: $(paste -sd'|' - < "$tmp/tmp/stub-gen-levers" 2> /dev/null), want BLOOMERY_CARD_BUDGET=12G --place a" "$L"
+elif want probe-placed-run "$L" 1 '^ROW r1 ours@BLOOMERY_CARD_BUDGET=12G d=6 ' && want probe-placed-run "$L" 0 'refuses|^FAIL '; then
+  pass probe-placed-run
+fi
+
+L=$tmp/probe-placed-refused.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_REFUSE=STUB_GEN_PASSES -- 6@place=a,STUB_GEN_PASSES=5
+if [ "$RC" != 2 ]; then
+  fail probe-placed-refused "rc $RC, want 2" "$L"
+elif want probe-placed-refused "$L" 1 "^depth-qwen3moe.sh: arm 6@place=a,STUB_GEN_PASSES=5: target/release/generate_qwen3moe refuses STUB_GEN_PASSES=5 --place a \(its --levers under them: $REFUSAL\): the arm cannot run as written\$" &&
+  want probe-placed-refused "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)'; then
+  pass probe-placed-refused
+fi
+L=$tmp/probe-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 STUB_GEN_REFUSE=STUB_GEN_PASSES -- 6 6@STUB_GEN_PASSES=5
+if [ "$RC" != 0 ]; then
+  fail probe-dry "rc $RC, want 0" "$L"
+elif [ -e "$tmp/tmp/stub-gen-levers" ]; then
+  fail probe-dry "a dry run probed: $(cat "$tmp/tmp/stub-gen-levers")" "$L"
+elif want probe-dry "$L" 0 'cannot run as written'; then
+  pass probe-dry
+fi
+
+# A warm-up, discard or prime whose last line is the binary's lever refusal ends the run; the refusal is the run's
+# alone (STUB_GEN_REFUSE_RUN: the --levers probe passes, so the lease is taken and the warm-up is reached).
+STOP="^stopped: ours@STUB_GEN_PASSES=5 at d=6: its binary refuses a variable it ran under \($REFUSAL\); no timed round of it would run, and the comparison is broken without it, so the run ends here\$"
+ROWR="^FAIL r0 ours@STUB_GEN_PASSES=5 d=6 rc=1 \| exited 1; last line: $REFUSAL \| full output: "
+L=$tmp/refused-warmup.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=1 STUB_GEN_REFUSE_RUN=STUB_GEN_PASSES -- 6@STUB_GEN_PASSES=5 6
+if [ "$RC" != 1 ]; then
+  fail refused-warmup "rc $RC, want 1" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "FAIL r0 ours@STUB_GEN_PASSES=5 d=6" ]; then
+  fail refused-warmup "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want refused-warmup "$L" 1 "$ROWR" && want refused-warmup "$L" 1 "$STOP" &&
+  want refused-warmup "$L" 1 '^failed arms: r0 ours@STUB_GEN_PASSES=5 d=6 rc=1; $' &&
+  want refused-warmup "$L" 1 '^\[stub\] no lease' && want refused-warmup "$L" 0 '^(ROW|mean|\[warmup\]) ' &&
+  [ ! -e "$tmp/tmp/stub-gen-loads" ]; then
+  pass refused-warmup
+fi
+
+L=$tmp/refused-discard.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks BLOOMERY_AB_WARMUP=1 STUB_GEN_REFUSE_RUN=STUB_GEN_PASSES -- lcpp:6 6@STUB_GEN_PASSES=5
+if [ "$RC" != 1 ]; then
+  fail refused-discard "rc $RC, want 1" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "DISCARD r0 lcpp d=6|ROW r1 lcpp d=6|FAIL r0 ours@STUB_GEN_PASSES=5 d=6" ]; then
+  fail refused-discard "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want refused-discard "$L" 1 "$ROWR" && want refused-discard "$L" 1 "$STOP" &&
+  want refused-discard "$L" 1 '^failed arms: r0 ours@STUB_GEN_PASSES=5 d=6 rc=1; $'; then
+  pass refused-discard
+fi
+
+L=$tmp/refused-prime.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_REFUSE_RUN=STUB_GEN_PASSES -- 6@STUB_GEN_PASSES=5 lcpp:6
+if [ "$RC" != 1 ]; then
+  fail refused-prime "rc $RC, want 1" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "FAIL r0 ours@STUB_GEN_PASSES=5 d=6" ]; then
+  fail refused-prime "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want refused-prime "$L" 1 "$ROWR" && want refused-prime "$L" 1 "$STOP" &&
+  want refused-prime "$L" 1 '^failed arms: r0 ours@STUB_GEN_PASSES=5 d=6 rc=1; $'; then
+  pass refused-prime
+fi
+
+# Not a refusal: today's FAIL r0 and the rounds after it, for the stub's depth refusal (rc 3) and for prose that
+# says "is refused" without a quoted value, as the runners' busy-card message does.
+for pair in 'refused-other|error: the stub refuses depth 6 once' 'refused-near|generate_qwen3moe: BLOOMERY_CARD=a6000 is refused while the card is busy'; do
+  name=${pair%%|*} variant=${pair#*|}
+  L=$tmp/$name.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=1 STUB_GEN_FAIL_DEPTH=6 "STUB_GEN_FAIL_LINE=$variant" -- 6 lcpp:6
+  if [ "$RC" != 1 ]; then
+    fail "$name" "rc $RC, want 1 ($variant)" "$L"
+  elif [ "$(heads "$L" | paste -sd'|' -)" != "FAIL r0 ours d=6|ROW r1 ours d=6|ROW r1 lcpp d=6" ]; then
+    fail "$name" "the rows' heads: $(heads "$L" | paste -sd'|' -) ($variant)" "$L"
+  elif want "$name" "$L" 1 "^FAIL r0 ours d=6 rc=3 \| exited 3; last line: $variant \| full output: " &&
+    want "$name" "$L" 0 '^stopped: ' && want "$name" "$L" 1 '^failed arms: r0 ours d=6 rc=3; $'; then
+    pass "$name"
+  fi
+done
 
 L=$tmp/group-fail.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_FAIL_DEPTH=4 -- 6 4 5
@@ -1503,7 +1696,7 @@ fi
 if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
-    "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
+    "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/probe-*.log "$tmp"/refused-*.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
     "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/slots*.log "$tmp"/bin-slots.log "$tmp"/bin-mem.log \
     "$tmp"/evict*.log "$tmp"/cpu-guard.log "$tmp"/warm.log "$tmp"/local*.log; do
     echo "--- ${L##*/}"

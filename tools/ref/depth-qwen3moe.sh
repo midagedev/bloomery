@@ -56,8 +56,14 @@
 #             read only when an arm has an `@`); a name given twice; a value holding `,`, `@`, `|` or
 #             white space; a name the runner's own environment already sets (BLOOMERY_BOX_ENV reaches
 #             every arm, so the plain rows' labels would hide it); and `@` on a reference or server arm —
-#             a lever of ours is not a reference's (a bin: arm takes a list of its own, bin: below). The
-#             item place=<a|gate|bp> is no lever: it is the arm's placement (Placement below), in its load
+#             a lever of ours is not a reference's (a bin: arm takes a list of its own, bin: below).
+#             Before the lease the binary's `--levers` under each lever arm's variables (a model= arm's
+#             BLOOMERY_REF_MODEL among them, the solo marker not) must pass, once for each binary and
+#             list: a binary that does not act on a lever, or a value its kind does not take, refuses it
+#             by name, and the run exits 2 naming the arm. An arm with a placement (place= or
+#             BLOOMERY_GEN_PLACE) is probed with its `--place <p>`: the placement's levers act only on
+#             a run that names --place. A dry run does not probe.
+#             The item place=<a|gate|bp> is no lever: it is the arm's placement (Placement below), in its load
 #             key and its --place, never a variable its process gets; the label keeps it. The item
 #             mem=<N>G is no lever either: it is the arm's host memory (Mem below), a systemd-run scope
 #             of the arm's process, never a variable its process gets; the label keeps it. The item
@@ -388,7 +394,9 @@
 # <file>` where its row would be, and the runner goes on with the next arm. That label at that depth or
 # P drops out of the means and the ratios (the tables name what they dropped), and the runner ends with
 # `failed arms: …` and exits 1. A warm-up or a block's discard that fails is `FAIL r0 …` and counts in
-# that list; the block's rounds still run. An arm that fails in a load shared with other arms ends that
+# that list; the block's rounds still run, unless its last line is the binary's lever refusal (`<NAME>="<value>"
+# is refused: …`): then the run stops there with a `stopped:` line, whatever the other arms, and exits 1
+# (cold-blocks.sh's header says why). An arm that fails in a load shared with other arms ends that
 # process: the arms after it in the round re-run in a fresh load (tools/ref/load-groups.sh), never on
 # the failed one; a load that fails before its first arm fails every arm of it. A row's rc is the
 # process's (134 an abort, 124/137 the arm bound's timeout), 0 when it exited cleanly with no row.
@@ -1913,6 +1921,32 @@ for i in "${!ARMS[@]}"; do
   [ "$t" != "$b" ] || t=${b%/*}
   BIN_LINES+=("${A_LABEL[$i]}: $(tree_line "$b" "$t")")
 done
+# A lever arm's variables are the binary's to take (at_main refuses a lever it does not act on, a value its kind
+# does not take, a retired or unknown name, --levers included), so each distinct binary, word list and placement is
+# probed once before the lease (tools/ref/lever-arms.sh lever_probe, as depth-glm5next.sh does): an arm it refuses
+# would fail every round on a held lease. The words are arm_envs': a model= arm's BLOOMERY_REF_MODEL among
+# them (a path row, which the binary's sweep leaves alone), the solo marker out (no registry row, never the
+# binary's). A placed arm's probe carries its `--place <p>`: generate_qwen3moe acts on the placement's levers
+# (BLOOMERY_CARD_BUDGET and the host set's) only when its arguments name --place, and builds that set before it
+# answers --levers. A dry run asks nothing of the binary.
+if [ -z "$DRY" ]; then
+  probed='|'
+  for i in "${!ARMS[@]}"; do
+    case ${A_KIND[$i]} in
+      ours) b=$BIN ;;
+      bin) b=${A_BIN[$i]} ;;
+      *) continue ;;
+    esac
+    [ -n "$(arm_env_list "$i")" ] && [ -x "$b" ] || continue
+    arm_envs "$i"
+    case $probed in *"|$b@${ARM_ENVS[*]}@${A_PLACE[$i]}|"*) continue ;; esac
+    probed+="$b@${ARM_ENVS[*]}@${A_PLACE[$i]}|"
+    lever_probe "$b" "${ARM_ENVS[@]}" ${A_PLACE[$i]:+-- --place "${A_PLACE[$i]}"} || {
+      echo "depth-qwen3moe.sh: arm ${ARMS[$i]}: $b refuses ${ARM_ENVS[*]}${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} (its --levers under them: $LEVER_PROBE_WHY): the arm cannot run as written" >&2
+      exit 2
+    }
+  done
+fi
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
   [ -z "$LCPP_LINE" ] || echo "    lcpp: $LCPP_LINE"

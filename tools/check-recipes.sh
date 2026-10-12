@@ -216,6 +216,16 @@ blk_coldblocks() {
   fi
   echo "${cb##*$'\n'}"
 }
+# lever-arms.sh is the depth runners' lever-arm list check and their pre-lease `--levers` probe (lever_probe): its
+# words and its args after `--`, no box.
+blk_leverarms() {
+  if ! la=$(bash "$(dirname "$0")/ref/lever-arms.sh" --self-test 2>&1); then
+    echo "$la" >&2
+    echo "check-recipes: the lever-arms self-test failed" >&2
+    return 1
+  fi
+  echo "${la##*$'\n'}"
+}
 # slots-arm.sh is the depth runners' aggregate arm (<arm>@BLOOMERY_GEN_SLOTS=N): its N, its plain twin, the
 # environment's refusal, its time pass and residency clauses and the plain tables' labels, no box.
 blk_slotsarm() {
@@ -655,7 +665,7 @@ print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{
 PY
 }
 
-BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
+BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh carry pytools boxqcodes fixturevariants
   refsetpublish orphan archowner)
 for b in "${BLOCKS[@]}"; do
