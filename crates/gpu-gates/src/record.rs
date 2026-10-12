@@ -3092,6 +3092,21 @@ pub static TAPS_DUMP: Kind = Kind {
     ],
 };
 
+/// A serve gate's server, up.
+pub static SERVER_SPAWN: Kind = Kind {
+    name: "server_spawn",
+    head: "server",
+    doc: "A serve gate's server spawn: the server binary's file name, its process id, and the wall \
+          from the gate's spawn call to the `listening on` line of the server's stderr (a runtime \
+          value) — the process start, the card's init, the load and the server's start, the poll \
+          that found the line included.",
+    parts: &[
+        key("exe", Word, ""),
+        key("pid", U64, ""),
+        key("listening_s", F64(2), "s"),
+    ],
+};
+
 // ---------------------------------------------------------------- the groups
 
 /// The kinds of `parts`, one part after another, as a constant: the length.
@@ -3244,6 +3259,16 @@ pub mod groups {
         /// The placed plan of a qwen3moe or qwen35moe load: `PlaceQ3::record`.
         pub const PLAN: &[&Kind] = &[&PLAN38];
     }
+
+    /// `serve_client.rs`.
+    pub mod serve_client {
+        use crate::record::{Kind, SERVER_SPAWN};
+
+        /// A gate's server spawn: the `server` record `Served::address` prints
+        /// on stdout when the server listens. The gates that start a server
+        /// register no list (`at_main`), so the record tests hold the group.
+        pub const SPAWN: &[&Kind] = &[&SERVER_SPAWN];
+    }
 }
 
 /// What `generate_ds41` prints, in the order it prints them.
@@ -3375,6 +3400,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     groups::drafted::PROMPT,
     &[
         &LANE,
+        &LOAD_PHASES,
         &LOAD_DRAFT_OFF38,
         &MTP_HEAD38,
         &MTP_KEEP38,
@@ -3397,15 +3423,15 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf` repo's resolve and fetch
 /// lines (the server prints the resolve before the seat registers), the
-/// load, the image encoder's seat with the plan and its record after the load
-/// under `--mmproj`, the address and each request's note of the prefix it kept
-/// none of.
+/// load and its phases, the image encoder's seat with the plan and its record
+/// after them under `--mmproj`, the address and each request's note of the
+/// prefix it kept none of.
 pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
     &[&PLACE_UNSET],
     groups::qwen3moe_place::PLAN,
     groups::model_file::FETCH,
     groups::model_file::SET,
-    &[&LOAD_QWEN3],
+    &[&LOAD_QWEN3, &LOAD_PHASES],
     groups::vision_seat::RECORDS,
     &[&LISTENING_QWEN3],
     groups::bind::CACHE,
@@ -3415,21 +3441,21 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
 /// What the MiMo seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
 /// the server before the seat registers), the residency lever's word and why, the
-/// plan, the churn pool's share of the host under `mid`, the load, the
-/// address and each request's note of the prefix it kept less of than it
-/// shared.
+/// plan, the churn pool's share of the host under `mid`, the load and its
+/// phases, the address and each request's note of the prefix it kept less of
+/// than it shared.
 pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
     &[&RESIDENCY_LEVER, &PLACE_UNSET, &PLAN],
     groups::residency38::HOST,
     groups::model_file::FETCH,
     groups::model_file::SET,
-    &[&LANE, &LOAD_MIMO2, &LISTENING_MIMO2],
+    &[&LANE, &LOAD_MIMO2, &LOAD_PHASES, &LISTENING_MIMO2],
     groups::bind::CACHE,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
-/// residency lever's word, the placement and why, the `plan`, `load` and
-/// `capture` lines `generate_glm5next` prints, the host set's records of a
+/// residency lever's word, the placement and why, the `plan`, `load`, `load
+/// phases` and `capture` lines `generate_glm5next` prints, the host set's records of a
 /// placed load, the draft's load line and its verify's capture, the
 /// listening line, the reuse records the checkpoint rule answers, the
 /// draft's joins, the residency machine's records, and the rounds of several
@@ -3445,6 +3471,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = kinds![
     &[
         &LANE,
         &LOAD_GENERATOR,
+        &LOAD_PHASES,
         &HOST_POPULATE,
         &HOST_POPULATE_OFF,
         &HOST_LOCK,
@@ -3714,6 +3741,36 @@ pub fn load_phases(
         .f("body_s", body)
         .f("head_s", head)
         .f("other_s", other)
+}
+
+/// [`load_phases`] of `model`'s load on stderr, for the seat that just
+/// printed the `load` line whose `load_s` is `total`: `open` is the wall
+/// from the seat's start to the load the phases time (the file's headers,
+/// and the plan where the seat makes it before the loader's call), the other
+/// phases those the load timed ([`bloomery_gpu::model::GpuModel::load_times`]).
+/// A load that timed none prints nothing; phases past `total` panic by name,
+/// as [`load_phases`] does.
+#[cfg(feature = "gpu")]
+pub fn eprint_load_phases<B: bloomery_gpu::model::ChainBody>(
+    model: &bloomery_gpu::model::GpuModel<B>,
+    total: std::time::Duration,
+    open: std::time::Duration,
+) {
+    let Some(times) = model.load_times() else {
+        return;
+    };
+    load_phases(
+        total.as_secs_f64(),
+        open.as_secs_f64(),
+        times.plan.map(|d| d.as_secs_f64()),
+        times.context.as_secs_f64(),
+        times.upload.as_secs_f64(),
+        times.derive.as_secs_f64(),
+        times.host_set.as_secs_f64(),
+        times.body.as_secs_f64(),
+        times.head.as_secs_f64(),
+    )
+    .eprint();
 }
 
 /// The `lane` record of the rate a load probed on the card it stages on
@@ -4379,6 +4436,7 @@ mod tests {
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
             GATE_NVTIER,
+            groups::serve_client::SPAWN,
         ] {
             let mut names: Vec<&str> = set.iter().map(|k| k.name).collect();
             names.sort_unstable();
@@ -4672,6 +4730,29 @@ mod tests {
         }
     }
 
+    /// A serve gate's `server` record names the binary, its process and the
+    /// wall to the `listening on` line, in the kind's order.
+    #[test]
+    fn server_spawn_names_the_binary_the_process_and_the_wall() {
+        let line = Record::new(&SERVER_SPAWN)
+            .w("exe", "bloomery-serve")
+            .u("pid", 4242)
+            .f("listening_s", 12.3456)
+            .line();
+        assert_eq!(line, "server exe=bloomery-serve pid=4242 listening_s=12.35");
+    }
+
+    /// A `server` record that leaves a part out panics, naming the kind and
+    /// the part.
+    #[test]
+    #[should_panic(expected = "record server_spawn: listening_s left out")]
+    fn server_spawn_refuses_a_missing_wall() {
+        let _ = Record::new(&SERVER_SPAWN)
+            .w("exe", "bloomery-serve")
+            .u("pid", 4242)
+            .line();
+    }
+
     #[test]
     #[should_panic(expected = "record time_step: ms given where i is due")]
     fn refuses_a_value_out_of_order() {
@@ -4758,6 +4839,7 @@ mod tests {
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
             GATE_NVTIER,
+            groups::serve_client::SPAWN,
         ] {
             for &kind in set {
                 for full in [true, false] {

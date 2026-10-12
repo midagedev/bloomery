@@ -430,6 +430,12 @@ fn print_join<B: MtpBody, const M: usize>(spec: &mut Spec<B, M>) {
     }
 }
 
+/// A seat that prints the chooser's record ([`print_widths`]) names its group at its
+/// start, so a list without it fails before the first drafted request.
+pub(crate) fn serves_widths() {
+    record::require(record::groups::drafted::WIDTH, "drafted::serves_widths");
+}
+
 /// The chooser's passes over the request a slot just finished and its state
 /// at the request's end, as its `mtp width` record: nothing under `fixed`,
 /// whose passes are the draft's own, and nothing for a request that ran no

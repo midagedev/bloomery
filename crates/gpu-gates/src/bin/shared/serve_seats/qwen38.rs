@@ -1226,6 +1226,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
+    super::drafted::serves_widths();
     // Set, the word runs as given; unset, the Qwen3.8 rule picks it once the
     // placement and the plan are known (`residency unset`).
     if let Some(word) = levers.residency() {

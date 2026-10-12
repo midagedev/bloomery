@@ -98,6 +98,10 @@ impl Served {
         polls: usize,
         poll: Duration,
     ) -> Result<String, GateError> {
+        record::require(
+            record::groups::serve_client::SPAWN,
+            "serve_client::Served::address",
+        );
         let gap = poll.min(READ_GAP);
         let per_poll = poll.as_nanos().div_ceil(gap.as_nanos().max(1)).max(1);
         let reads = usize::try_from(per_poll)

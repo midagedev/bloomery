@@ -453,6 +453,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
+    super::drafted::serves_widths();
     let (a, placed) = parse_args(args)?;
     placed.record().eprint();
     // The lane's rate, taken before the plan reads the room (`lane_of`).
