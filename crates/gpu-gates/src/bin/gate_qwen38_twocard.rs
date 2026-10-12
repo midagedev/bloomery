@@ -76,6 +76,23 @@
 //!   by the recurrent stores (the delta layers ran it already); the flag is
 //!   then raised, both streams drain, and a reset is refused by the lost
 //!   card's poison, which a reset does not lift.
+//! - `--slots`: a tier load planned for two slots (the plan counts them, under
+//!   the budget `--union` found), so the tier's page, places and card leg are
+//!   cut to the step port's [`Prompt38::PASS_ROWS`] columns; a load of one
+//!   slot keeps four. The shared slot harness (`slots_gate`) drives it through
+//!   an adapter for this body: its interleave (H1), one pass of one row a slot
+//!   (H2), bytes (H3), reset (H4), poison (H5), refusals (H6) and captures
+//!   (H7); both streams are prompted by the ubatch walk (a tier load has no
+//!   pass walk), from two windows of the prose corpus of two lengths. Then
+//!   `slots_wide`, on that load with both slots rewound: five passes of 4+4,
+//!   4+3, 3+4, 4+2 and 3+2 rows, which the tier serves as 8, 7, 7, 6 and 5
+//!   columns, each slot's every row's id and logits, two plain steps after them,
+//!   state hash and position bit for bit its own rows run alone as verifies
+//!   kept whole on the same load. And `structure`
+//!   on that load after the passes: the tier's graph of each of 5 to 8 columns
+//!   holds [`TIER_LAYER_NODES`] nodes a tier layer and the fault copy, and the
+//!   tier is opened for the port's columns. The clauses run in both tiers
+//!   (self-consistency); the harness's one-slot clause opens the second load.
 //!
 //! Before the arms' loads, one child run of `generate_qwen3moe` beside this
 //! binary with no `--place` takes the common unset rule
@@ -101,23 +118,31 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/q38_arch.rs"]
+mod q38_arch;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::Path;
     use std::time::Instant;
 
     use app::Session;
-    use bloomery_gpu::HostFlags;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, SplitWalk};
+    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, SplitWalk, Store38Host};
     use bloomery_gpu::host::swap::{PassReport, Residency};
     use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet};
     use bloomery_gpu::host::xstream::XMode;
     use bloomery_gpu::host::{PassKind, PoisonKind};
     use bloomery_gpu::hybrid::Chain;
+    use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::{GpuError, HostFlags};
+    use bloomery_gpu_gates::q38_fixture::Shape;
     use bloomery_gpu_gates::record::{self, Fields};
+    use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
-        GREEDY_MARGIN, GateError, checks_failed, prose_ids, ref_model_path, verdict,
+        Fnv1a64, GREEDY_MARGIN, GateError, bits_equal, checks_failed, prose_ids, ref_model_path,
+        verdict,
     };
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
     use gguf::Split;
@@ -128,6 +153,7 @@ mod gate {
         Device, ExpertList, Machine, PlacementError, Plan, PlanLevers, Role, Row, Segment,
     };
     use refset::arch::qwen4exp::MODEL;
+    use runtime::swaprule::KeptRows;
     use runtime::{Out, Target, Verify, Want};
 
     const NAME: &str = "gate_qwen38_twocard";
@@ -171,22 +197,40 @@ mod gate {
     /// The experts the child's plan of `bp` puts on this box's 3090 at its
     /// default context, a band for the free bytes each census reads.
     const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 7_230..=7_242;
+    /// `--slots`' two streams: each one's prompt ids, then the ids its wide
+    /// passes' rows are filled from; the two windows of the prose corpus come
+    /// one after the other.
+    const SLOT_PROMPTS: [usize; 2] = [24, 40];
+    const SLOT_FILL: usize = 16;
+    /// `--slots`' wide passes: the rows a pass gives slot 0 and slot 1. The
+    /// tier serves a pass as the sum of them in columns: 8, 7, 7, 6 and 5.
+    const WIDE_PASSES: [(usize, usize); 5] = [(4, 4), (4, 3), (3, 4), (4, 2), (3, 2)];
+    /// The fewest columns a wide pass takes: one past a verify's four.
+    const WIDE_FROM: usize = 5;
+    /// The plain steps after the wide passes, which read what the passes left.
+    const WIDE_STEPS: usize = 2;
+    /// The file's model width and its residual streams, as the header states
+    /// them (`gate_qwen4exp_e2e`'s): the arena rows of one sequence's bytes.
+    const HIDDEN: usize = 2560;
+    const PLE_STREAMS: usize = 4;
 
     struct Args {
         union: bool,
         residency: bool,
         lost: bool,
         prompt4k: bool,
+        slots: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str =
-            "usage: gate_qwen38_twocard [--union] [--residency] [--lost] [--prompt4k]";
+            "usage: gate_qwen38_twocard [--union] [--residency] [--lost] [--prompt4k] [--slots]";
         let mut a = Args {
             union: false,
             residency: false,
             lost: false,
             prompt4k: false,
+            slots: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
@@ -194,10 +238,11 @@ mod gate {
                 "--residency" => a.residency = true,
                 "--lost" => a.lost = true,
                 "--prompt4k" => a.prompt4k = true,
+                "--slots" => a.slots = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.union || a.residency || a.lost || a.prompt4k) {
+        if !(a.union || a.residency || a.lost || a.prompt4k || a.slots) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -766,12 +811,13 @@ mod gate {
         Ok(ok)
     }
 
-    /// What [`chosen_plan`] found: the plan, and whether its budget is the
+    /// What [`chosen_plan`] found: the plan, whether its budget is the
     /// largest whole GiB the gate fits (the next one is refused) and, on the
-    /// real file, the literal's.
+    /// real file, the literal's, and that budget in GiB.
     struct Chosen<'a> {
         plan: Plan<'a>,
         tight: bool,
+        gib: u64,
     }
 
     /// Plan (b′) under a whole-GiB budget on both cards: the plan (`None` when the
@@ -853,6 +899,7 @@ mod gate {
             return Ok(Chosen {
                 plan,
                 tight: tight && witnessed,
+                gib,
             });
         }
         Err(format!("no whole-GiB budget fits the gate at {ctx} positions").into())
@@ -1041,7 +1088,7 @@ mod gate {
         }
         let layers = inputs.spec.layers.len();
         let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
-        let Chosen { plan, tight } = chosen_plan(inputs, &bp, CTX_4K)?;
+        let Chosen { plan, tight, .. } = chosen_plan(inputs, &bp, CTX_4K)?;
         let tl = tier_layers(&plan);
         let ids = prose_ids("qwen4exp", PROMPT_4K)?;
         let mut um = bp.clone();
@@ -1174,6 +1221,484 @@ mod gate {
         Ok(ok)
     }
 
+    /// `--slots`' body for the shared slot harness ([`slots_gate`]): the tier
+    /// load of plan (b′) planned for `slots` sequences under the budget the
+    /// gate found, its two streams two windows of the prose corpus.
+    struct SlotsTier<'a> {
+        path: &'a Path,
+        inputs: &'a PlanInputs,
+        bp: &'a Machine,
+        gib: u64,
+        host: HostCfg,
+        ub: usize,
+        shape: Shape,
+        windows: [Vec<u32>; 2],
+    }
+
+    impl<'a> SlotsTier<'a> {
+        /// Plan (b′) for `slots` sequences at [`CTX`] positions under the
+        /// gate's budget: one slot is [`PlanInputs::plan_with`] itself.
+        fn plan(&self, slots: usize) -> Result<Plan<'a>, GateError> {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(self.gib << 30),
+            };
+            Ok(self
+                .inputs
+                .plan_with_slots(self.bp, CTX as u64, &levers, Experts::Card, slots)?)
+        }
+
+        /// The ids stream `s` fills its wide passes' rows from.
+        fn fill(&self, s: usize) -> &[u32] {
+            &self.windows[s][SLOT_PROMPTS[s]..]
+        }
+    }
+
+    /// `reset`, then every selecting store's planes set to the one pattern
+    /// the state hash reads whole: a row no call writes must read it, never a
+    /// previous run's value (`gate_qwen4exp_e2e`'s `fresh`).
+    fn fresh(m: &mut Qwen38Model) -> Result<(), GateError> {
+        /// The f16 pattern (100.0): finite, and far from any value the model
+        /// writes there.
+        const PLANE_FILL: u16 = 0x5640;
+        m.reset()?;
+        let (gpu, _, b) = m.body_parts("fresh")?;
+        b.fill_planes(gpu, PLANE_FILL)?;
+        Ok(())
+    }
+
+    /// The digest of the selected slot's whole resident state: every store,
+    /// the PLE ring and the lane word.
+    fn slot_digest(m: &mut Qwen38Model) -> Result<u64, GateError> {
+        let (stores, ring) = {
+            let (gpu, _, b) = m.body_parts("slot digest")?;
+            b.stores_host(gpu)?
+        };
+        let lane = m.body("slot digest")?.lane();
+        let u16s = |h: Fnv1a64, v: &[u16]| v.iter().fold(h, |h, &w| h.bytes(&w.to_le_bytes()));
+        let mut h = Fnv1a64::default();
+        for s in &stores {
+            match s {
+                Store38Host::Rec { state, ring } => h = h.f32s(state).f32s(ring),
+                Store38Host::Qsa { k, v, raw, pooled } => {
+                    h = u16s(u16s(u16s(u16s(h, k), v), raw), pooled);
+                }
+            }
+        }
+        Ok(h.f32s(&ring).bytes(&lane.to_le_bytes()).value())
+    }
+
+    impl SlotsAdapter for SlotsTier<'_> {
+        type Body = Body38;
+
+        const STEPS: usize = 8;
+        const TAIL: usize = 4;
+
+        /// The tier load planned for `slots`: its plan counts them, and its
+        /// tier is cut to the port's columns for more than one.
+        fn open(&self, slots: usize) -> Result<Qwen38Model, GateError> {
+            let t0 = Instant::now();
+            let plan = self.plan(slots)?;
+            let file =
+                Split::open(self.path).map_err(|e| format!("open {}: {e}", self.path.display()))?;
+            let mut m = Body38::open_placed_residency(
+                file,
+                &plan,
+                self.inputs,
+                0,
+                self.host,
+                self.ub,
+                Residency::Off,
+                slots,
+            )?;
+            let b = m.body_parts(NAME)?.2;
+            b.log_residency(0);
+            b.set_split_walk(SplitWalk::Off)?;
+            let tiers = m.body(NAME)?.hybrid().tiers();
+            let tier = tiers.first().ok_or("the slots load holds no tier")?;
+            println!(
+                "slots load in {:.1} s, planned for {slots}: tier {} experts on {}, opened for {} \
+                 columns a row",
+                t0.elapsed().as_secs_f64(),
+                tier.set().experts(),
+                tier.gpu().device_name()?,
+                tier.cols()
+            );
+            Ok(m)
+        }
+
+        fn rewind(&self, m: &mut Qwen38Model) -> Result<(), GateError> {
+            fresh(m)
+        }
+
+        /// Each stream's window by the ubatch walk: a tier load refuses the
+        /// pass walk.
+        fn prompt(&self, m: &mut Qwen38Model, stream: usize) -> Result<u32, GateError> {
+            let window = self
+                .windows
+                .get(stream)
+                .ok_or_else(|| format!("--slots runs streams 0 and 1, not {stream}"))?;
+            Ok(m.prompt38(&window[..SLOT_PROMPTS[stream]], Prompt38::Gemm)?)
+        }
+
+        fn state_hash(&self, m: &mut Qwen38Model) -> Result<u64, GateError> {
+            slot_digest(m)
+        }
+
+        /// The stores ([`Body38::store_bytes`]), the lane word (one device
+        /// word) and the two arena-row buffers
+        /// (`(1 + PASS_ROWS) · PLE_STREAMS · HIDDEN` f32).
+        fn seq_bytes_derived(&self, m: &Qwen38Model) -> Result<Derived, GateError> {
+            let stores = m.body("slots")?.store_bytes();
+            let rows = (1 + Prompt38::PASS_ROWS) * PLE_STREAMS * HIDDEN * 4;
+            Ok(Derived {
+                bytes: stores + 4 + rows,
+                terms: format!("store_bytes {stores} + the lane word 4 + the arena rows {rows}"),
+            })
+        }
+
+        /// H5's planter: the host tier's refusal, through the body's own mut
+        /// path to the tier.
+        fn plant_refusal(&self, m: &mut Qwen38Model) -> Result<bool, GateError> {
+            m.body_parts("gate_qwen38_twocard slots")?
+                .2
+                .hybrid_mut()
+                .plant_refusal("a planted refusal (the slots harness's seam)");
+            Ok(true)
+        }
+
+        /// H5's window: the tier's own refusal, read through the body.
+        fn tier_poisoned(&self, m: &mut Qwen38Model) -> Result<bool, GateError> {
+            Ok(m.body_parts("gate_qwen38_twocard slots")?
+                .2
+                .hybrid()
+                .refuse_if_poisoned("slots H5")
+                .is_err())
+        }
+
+        /// H5's round of several slots: the body's one pass.
+        fn step_all(&self, m: &mut Qwen38Model, last: &[u32]) -> Result<Vec<u32>, GpuError> {
+            let ones: Vec<[u32; 1]> = last.iter().map(|&t| [t]).collect();
+            let rows: Vec<(usize, &[u32])> = ones.iter().map(|t| &t[..]).enumerate().collect();
+            Ok(m.step_slots(&rows)?.ids)
+        }
+    }
+
+    impl PassAdapter for SlotsTier<'_> {
+        /// The header's slot nodes ([`Shape::nodes_slot`]): the tier takes
+        /// none of a slot's sequence-bound launches.
+        fn added_slot_launches(&self, _m: &Qwen38Model) -> Result<Launches, GateError> {
+            let (gdn, qsa) = (self.shape.n_gdn(), self.shape.n_qsa());
+            Ok(Launches {
+                n: self.shape.nodes_slot(),
+                terms: format!(
+                    "the embedding 1 + the PLE conv 1 + {gdn} delta layers' 2 + {qsa} selecting \
+                     layers' 8 + the parked rows' copy 1"
+                ),
+            })
+        }
+
+        fn slots_launches(
+            &self,
+            m: &Qwen38Model,
+            key: &[(usize, usize)],
+        ) -> Result<usize, GateError> {
+            Ok(m.body("slots")?.slots_launches(key))
+        }
+    }
+
+    /// One slot's side of `slots_wide`: every row's id and logits over the
+    /// windows, then the slot's state hash and position.
+    struct Side {
+        ids: Vec<u32>,
+        logits: Vec<Vec<f32>>,
+        hash: u64,
+        pos: u32,
+    }
+
+    /// A window's `n` rows of a slot: `last`, then `fill`'s ids from `at`.
+    fn wide_rows(fill: &[u32], last: u32, at: usize, n: usize) -> Result<Vec<u32>, GateError> {
+        let more = fill
+            .get(at..at + n - 1)
+            .ok_or("the slot's window holds too few ids for the wide passes' rows")?;
+        let mut rows = vec![last; n];
+        rows[1..].copy_from_slice(more);
+        Ok(rows)
+    }
+
+    /// Slot `s`'s rows of pass `(n0, n1)`.
+    fn rows_of((n0, n1): (usize, usize), s: usize) -> usize {
+        if s == 0 { n0 } else { n1 }
+    }
+
+    /// `rows` (2 to 4) as one verify of the selected slot kept whole, settled
+    /// as `Session::commit` of every row settles it (a rollback to the
+    /// position past them, the rows kept for the residency): each row's greedy
+    /// id and logits.
+    fn solo_rows(
+        m: &mut Qwen38Model,
+        rows: &[u32],
+    ) -> Result<(Vec<u32>, Vec<Vec<f32>>), GateError> {
+        fn run<const M: usize>(
+            m: &mut Qwen38Model,
+            rows: &[u32],
+        ) -> Result<(Vec<u32>, Vec<Vec<f32>>), GateError> {
+            let rows: [u32; M] = rows
+                .try_into()
+                .map_err(|_| format!("{} rows for a verify of {M}", rows.len()))?;
+            let first = m.pos();
+            let ids = m.step_rows::<M>(rows)?;
+            let logits = m.rows_logits::<M>()?;
+            m.rollback(first + u32::try_from(M)?)?;
+            m.keep_rows(KeptRows::prefix(M), PassKind::Pair)?;
+            Ok((ids.to_vec(), Vec::from(logits)))
+        }
+        match rows.len() {
+            2 => run::<2>(m, rows),
+            3 => run::<3>(m, rows),
+            4 => run::<4>(m, rows),
+            n => Err(format!("a verify of {n} rows: the wide passes give a slot 2 to 4").into()),
+        }
+    }
+
+    /// [`WIDE_STEPS`] plain steps of the selected slot from `last`, each id
+    /// and logits row appended.
+    fn wide_steps(
+        m: &mut Qwen38Model,
+        mut last: u32,
+        ids: &mut Vec<u32>,
+        logits: &mut Vec<Vec<f32>>,
+    ) -> Result<(), GateError> {
+        for _ in 0..WIDE_STEPS {
+            last = m.step(&[last])?;
+            ids.push(last);
+            logits.push(m.logits()?);
+        }
+        Ok(())
+    }
+
+    /// Slot `s` alone, from a rewind: its prompt, each wide pass's rows of it
+    /// as one verify kept whole (the same rows the pass gives it, which the
+    /// tier serves at 2 to 4 columns), every row's id and logits read, then
+    /// the plain steps.
+    fn wide_alone(a: &SlotsTier<'_>, m: &mut Qwen38Model, s: usize) -> Result<Side, GateError> {
+        m.select_slot(s)?;
+        a.rewind(m)?;
+        let mut last = a.prompt(m, s)?;
+        let (mut ids, mut logits, mut at) = (Vec::new(), Vec::new(), 0);
+        for pass in WIDE_PASSES {
+            let n = rows_of(pass, s);
+            let (out, rows) = solo_rows(m, &wide_rows(a.fill(s), last, at, n)?)?;
+            last = out[n - 1];
+            ids.extend(out);
+            logits.extend(rows);
+            at += n - 1;
+        }
+        wide_steps(m, last, &mut ids, &mut logits)?;
+        Ok(Side {
+            ids,
+            logits,
+            hash: a.state_hash(m)?,
+            pos: m.pos(),
+        })
+    }
+
+    /// Both slots from a rewind, each its prompt, then every [`WIDE_PASSES`]
+    /// pass as one pass of both slots' rows (`GpuModel::step_slots`, in graph
+    /// mode, so the tier captures each width), every row's id and logits
+    /// read, then each slot's plain steps.
+    fn wide_together(a: &SlotsTier<'_>, m: &mut Qwen38Model) -> Result<[Side; 2], GateError> {
+        for s in (0..2).rev() {
+            m.select_slot(s)?;
+            a.rewind(m)?;
+        }
+        let mut last = [0; 2];
+        for (s, l) in last.iter_mut().enumerate() {
+            m.select_slot(s)?;
+            *l = a.prompt(m, s)?;
+        }
+        let mut side = [(Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
+        let mut at = [0; 2];
+        for pass in WIDE_PASSES {
+            let n = [pass.0, pass.1];
+            let rows = [
+                wide_rows(a.fill(0), last[0], at[0], n[0])?,
+                wide_rows(a.fill(1), last[1], at[1], n[1])?,
+            ];
+            let out = m.step_slots(&[(0, &rows[0]), (1, &rows[1])])?.ids;
+            let all = m.slots_logits()?;
+            if out.len() != n[0] + n[1] || all.len() != n[0] + n[1] {
+                return Err(format!(
+                    "a pass of {} and {} rows read back {} ids and {} logits rows",
+                    n[0],
+                    n[1],
+                    out.len(),
+                    all.len()
+                )
+                .into());
+            }
+            let mut from = 0;
+            for (s, (ids, logits)) in side.iter_mut().enumerate() {
+                ids.extend_from_slice(&out[from..from + n[s]]);
+                logits.extend_from_slice(&all[from..from + n[s]]);
+                last[s] = out[from + n[s] - 1];
+                at[s] += n[s] - 1;
+                from += n[s];
+            }
+        }
+        let mut done = Vec::with_capacity(2);
+        for (s, (mut ids, mut logits)) in side.into_iter().enumerate() {
+            m.select_slot(s)?;
+            wide_steps(m, last[s], &mut ids, &mut logits)?;
+            done.push(Side {
+                ids,
+                logits,
+                hash: a.state_hash(m)?,
+                pos: m.pos(),
+            });
+        }
+        done.try_into()
+            .map_err(|_| "the wide passes' two slots".into())
+    }
+
+    /// What differs between slot `s`'s side `got` and its solo run's `want`,
+    /// by the harness's four parts: ids, last logits (here every row's, bit
+    /// for bit), state hash and position.
+    fn wide_off(s: usize, want: &Side, got: &Side) -> Vec<String> {
+        let mut off = Vec::new();
+        if want.ids != got.ids {
+            let at = want.ids.iter().zip(&got.ids).position(|(x, y)| x != y);
+            off.push(format!("slot {s} ids (first apart at {at:?})"));
+        }
+        let row = want
+            .logits
+            .iter()
+            .zip(&got.logits)
+            .position(|(x, y)| !bits_equal(x, y));
+        if row.is_some() || want.logits.len() != got.logits.len() {
+            off.push(format!("slot {s} logits (first row apart {row:?})"));
+        }
+        if want.hash != got.hash {
+            off.push(format!("slot {s} state"));
+        }
+        if want.pos != got.pos {
+            off.push(format!("slot {s} position {} (solo {})", got.pos, want.pos));
+        }
+        off
+    }
+
+    /// `slots_wide` (module doc) on the load `m`: each slot's solo run first,
+    /// then the passes of both, in graph mode.
+    fn slots_wide(a: &SlotsTier<'_>, m: &mut Qwen38Model) -> Result<bool, GateError> {
+        m.set_mode(StepMode::Graph);
+        let want = [wide_alone(a, m, 0)?, wide_alone(a, m, 1)?];
+        let got = wide_together(a, m)?;
+        let off: Vec<String> = (0..2)
+            .flat_map(|s| wide_off(s, &want[s], &got[s]))
+            .collect();
+        let ok = off.is_empty();
+        let rows: Vec<usize> = WIDE_PASSES.iter().map(|&(n0, n1)| n0 + n1).collect();
+        println!(
+            "slots wide: passes of {WIDE_PASSES:?} rows a slot (the tier's {rows:?} columns) and \
+             {WIDE_STEPS} plain steps after them, {} ids and logits rows against each slot's own \
+             rows run alone as verifies kept whole on the same load: {} {}",
+            want[0].ids.len() + want[1].ids.len(),
+            if ok {
+                "every row's id and logits, each slot's state hash and position bit for bit"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `--slots`' structure line over the load `m` after its wide passes:
+    /// the tier's graph of each of 5 to 8 columns holds nine nodes a tier
+    /// layer of `layers` and the fault copy, and the tier is opened for the
+    /// port's columns.
+    fn structure_wide(m: &Qwen38Model, layers: &[usize]) -> Result<bool, GateError> {
+        let tier = m
+            .body(NAME)?
+            .hybrid()
+            .tiers()
+            .first()
+            .ok_or("the slots load holds no tier")?;
+        let want = Some(TIER_LAYER_NODES * layers.len() + 1);
+        let graphs: Vec<Option<usize>> = (WIDE_FROM..=Prompt38::PASS_ROWS)
+            .map(|c| tier.graph_nodes(Chain::Cols(c)))
+            .collect();
+        let ok = graphs.iter().all(|&g| g == want) && tier.cols() == Prompt38::PASS_ROWS;
+        println!(
+            "structure: the tier's graphs of the 5, 6, 7, 8-column passes hold {graphs:?} nodes, \
+             {TIER_LAYER_NODES} a tier layer ({}) and the fault copy ({want:?}), the tier opened \
+             for {} columns (want {}): {}",
+            layers.len(),
+            tier.cols(),
+            Prompt38::PASS_ROWS,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// A clause's verdict: a call that failed inside it is its red, the error
+    /// printed on its line.
+    fn red(clause: &str, r: Result<bool, GateError>) -> bool {
+        r.unwrap_or_else(|e| {
+            println!("{clause}: a call failed: {e} {}", verdict(false));
+            false
+        })
+    }
+
+    /// `--slots` (module doc) on plan (b′) under `gib` GiB: the harness's
+    /// contracts over the load planned for two slots, then `slots_wide` and
+    /// the wide structure line on that load, then the harness's one-slot
+    /// clause on a load of one.
+    fn slots_clauses(
+        (path, inputs, bp): (&Path, &PlanInputs, &Machine),
+        (gib, host, ub): (u64, HostCfg, usize),
+    ) -> Result<bool, GateError> {
+        let [w0, w1] = [0, 1].map(|s| SLOT_PROMPTS[s] + SLOT_FILL);
+        let ids = prose_ids("qwen4exp", w0 + w1)?;
+        let (a0, a1) = ids.split_at(w0);
+        let a = SlotsTier {
+            path,
+            inputs,
+            bp,
+            gib,
+            host,
+            ub,
+            shape: crate::q38_arch::shape_of(&inputs.hp)?,
+            windows: [a0.to_vec(), a1.to_vec()],
+        };
+        let plan = a.plan(slots_gate::STREAMS)?;
+        let layers = tier_layers(&plan);
+        let missing: Vec<usize> = plan
+            .tier_n_l
+            .first()
+            .map(|t| (0..t.len()).filter(|&l| t[l] == 0).collect())
+            .unwrap_or_default();
+        let mut ok = missing.is_empty();
+        println!(
+            "slots plan: plan (b′) for {} slots under a card budget of {gib} GiB: stage {} \
+             experts, tier {} experts on {} layers; precondition: a tier expert on every layer \
+             (missing {missing:?}): {}",
+            slots_gate::STREAMS,
+            plan.cards[0].experts,
+            plan.cards.get(1).map_or(0, |c| c.experts),
+            layers.len(),
+            verdict(ok)
+        );
+        drop(plan);
+        let mut s = slots_gate::interleave(&a)?;
+        s.one_pass();
+        let (harness, mut m, one_slot) = s.finish_keep();
+        ok &= harness;
+        ok &= red("slots wide", slots_wide(&a, &mut m));
+        ok &= red("structure", structure_wide(&m, &layers));
+        Ok(one_slot.run(m) && ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
@@ -1198,7 +1723,7 @@ mod gate {
         let Chosen {
             plan,
             tight: tight_3k,
-            ..
+            gib,
         } = chosen_plan(&inputs, &bp, CTX)?;
         pass &= tight_3k;
         let tl = tier_layers(&plan);
@@ -1313,6 +1838,13 @@ mod gate {
             tier::sc("--prompt4k: a 4,096-id prompt call, two cards = the union")?;
             drop(last.take());
             pass &= prompt4k(path, &inputs, host)?;
+        }
+        if args.slots {
+            tier::sc(
+                "--slots: a tier load planned for two slots through the slot harness, wide passes of 5 to 8 columns",
+            )?;
+            drop(last.take());
+            pass &= slots_clauses((path, &inputs, &bp), (gib, host, ub))?;
         }
         let (ran, deferred) = tier::tally();
         println!(
