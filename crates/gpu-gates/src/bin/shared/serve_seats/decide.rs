@@ -285,19 +285,16 @@ impl Backbone {
             tower.span_rows(self.body.context(), images)?;
         let tower_ms = t.elapsed().as_secs_f64() * 1e3;
         // Each span borrows its own range of the call's one buffer of rows; its grid is the
-        // image's merged-token plan, `nx` along a line (the width).
+        // image's merged-token plan (`vision::GridPlan::span_grid`).
         let spans: Vec<ImageSpan<'_>> = ats
             .iter()
             .zip(images)
-            .map(|(at, image)| {
-                let plan = &image.prepared.patches.plan;
-                ImageSpan {
-                    span: MediaSpan {
-                        at: at.positions.clone(),
-                        rows: &rows[at.rows.clone()],
-                    },
-                    grid: (plan.n_llm_w, plan.n_llm_h),
-                }
+            .map(|(at, image)| ImageSpan {
+                span: MediaSpan {
+                    at: at.positions.clone(),
+                    rows: &rows[at.rows.clone()],
+                },
+                grid: image.prepared.patches.plan.span_grid(),
             })
             .collect();
         let t = Instant::now();

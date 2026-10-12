@@ -95,6 +95,7 @@ impl MediaModel for Media {
 #[cfg(test)]
 mod tests {
     use super::{IMAGE_PLACEHOLDER, Media, PAD_BLACK, VISION_END_ID, VISION_START_ID};
+    use crate::MropeSeq;
     use crate::Rgb8;
     use crate::arch::qwen3vl::size::{SizeRule, TokenLimits};
     use crate::media::{MediaModel, PartJoin};
@@ -178,6 +179,38 @@ mod tests {
             assert!(
                 last[py * 16..(py + 1) * 16].iter().all(|&v| v == want),
                 "last, row {py}"
+            );
+        }
+    }
+
+    /// The grid a span hands the prompt follows the image's width: a landscape image has more
+    /// tokens along a line than lines, a portrait one fewer, and the M-RoPE positions of its last
+    /// token (`MropeSeq`, which reads the grid as `(nx, ny)`) are `ny - 1` down and `nx - 1`
+    /// across. Planned by `Media::prepare`, the one planner both `qwen3vl_merger` seats call, at
+    /// Clef's file rule (one token per 32×32 pixels); the expected grids are written out from the
+    /// image's own size (`w → round(w / 32)` tokens), not read from the plan.
+    #[test]
+    fn a_spans_grid_runs_along_the_images_width() {
+        for (w, h, across, down) in [
+            // 640 / 32 = 20 tokens along a line, 320 / 32 = 10 lines; 204,800 pixels.
+            (640, 320, 20, 10),
+            (320, 640, 10, 20),
+            // round(1000 / 32 = 31.25) = 31, round(700 / 32 = 21.875) = 22; 698,368 pixels.
+            (1000, 700, 31, 22),
+            (700, 1000, 22, 31),
+        ] {
+            let p = media()
+                .prepare(&Rgb8::filled(w, h, [10, 200, 30]))
+                .expect("prepare");
+            let (nx, ny) = p.patches.plan.span_grid();
+            assert_eq!((nx, ny), (across, down), "{w}x{h}");
+            assert_eq!(nx > ny, w > h, "{w}x{h}: wider than tall");
+            let mut seq = MropeSeq::new();
+            seq.push(0, nx, ny).expect("push");
+            assert_eq!(
+                seq.pos(nx * ny - 1),
+                (0, down - 1, across - 1),
+                "{w}x{h}: the last token's (t, h, w)"
             );
         }
     }
