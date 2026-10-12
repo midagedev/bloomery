@@ -147,6 +147,7 @@ use super::program38::{Ctx38, q8};
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
 use super::tier38::TierSide38;
+use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
 use crate::card_slots::CardAcc;
 use crate::fault::{FaultSink, LAYER_HEAD};
@@ -1034,26 +1035,7 @@ impl CardRoute38 {
             ));
         }
         let ctx = gpu.context();
-        // SAFETY: the stream's union row is `EXPERTS` words of its mapped
-        // host rows, and its half holds `half_slots` experts of this layer's
-        // part bytes in each part from the half's first slot — its gate and
-        // up rows of the stack's words, its down rows likewise
-        // (`XStream::ring_layer`); all stay allocated while the stream lives,
-        // past these launches, and the windows are given back below.
-        let windows = ring.map(|r| unsafe {
-            (
-                crate::tensor::window::<u32>(r.union_map, geo::EXPERTS, ctx),
-                DeviceTensor::<u32>::window(r.parts[0], r.half_slots * geo::FF, gate.cols(), ctx),
-                DeviceTensor::<u32>::window(r.parts[1], r.half_slots * geo::FF, up.cols(), ctx),
-                DeviceTensor::<u32>::window(
-                    r.parts[2],
-                    r.half_slots * geo::HIDDEN,
-                    st.down.cols(),
-                    ctx,
-                ),
-            )
-        });
-        let ran = (|| {
+        let mut run = |windows: Option<(&DeviceBuffer<u32>, &RingStacks<'_>)>| {
             let mut c0 = 0;
             while c0 < m {
                 let n = self.run.min(m - c0);
@@ -1143,8 +1125,8 @@ impl CardRoute38 {
                 // The card sum's places and experts: the stack's, or with a
                 // stream the union row's over the stack's and the ring's.
                 let mut sum_places = (&*sel_w, n_card);
-                if let (Some(r), Some((union_map, wg, wu, wd)), Some(rr)) =
-                    (ring, windows.as_ref(), self.ring.as_mut())
+                if let (Some(r), Some((union_map, w)), Some(rr)) =
+                    (ring, windows, self.ring.as_mut())
                 {
                     places(union_map, &mut rr.union)?;
                     for b in &r.batches {
@@ -1155,8 +1137,8 @@ impl CardRoute38 {
                                 b.event.as_deref(),
                                 (&ids_w, &self.ids),
                                 bmap,
-                                (gate_up_ty, wg, wu),
-                                down_weight(l, st.down_ty, wd)?,
+                                (gate_up_ty, w.gate, w.up),
+                                down_weight(l, st.down_ty, w.down)?,
                                 (n, r.n),
                                 sink,
                                 &mut down_w,
@@ -1184,14 +1166,17 @@ impl CardRoute38 {
                 c0 += n;
             }
             Ok(())
-        })();
-        if let Some((union_map, wg, wu, wd)) = windows {
-            drop(std::mem::ManuallyDrop::into_inner(union_map).into_raw_parts());
-            for w in [wg, wu, wd] {
-                DeviceTensor::release(w);
+        };
+        match ring {
+            Some(r) => {
+                let rows = [geo::FF, geo::FF, geo::HIDDEN];
+                let cols = [gate.cols(), up.cols(), st.down.cols()];
+                with_ring_windows(r, ctx, geo::EXPERTS, rows, cols, |union_map, w| {
+                    run(Some((union_map, w)))
+                })
             }
+            None => run(None),
         }
-        ran
     }
 
     /// The unit's tier places, for the front's places launch and the

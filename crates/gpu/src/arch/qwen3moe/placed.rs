@@ -64,9 +64,7 @@ use super::plan::{
 };
 use super::program::{Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
-use super::wide::{
-    self, CardRoute, GEMV_COLS, HostSide, RingStacks, act_col_bytes, arena_bytes, route_bytes,
-};
+use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, arena_bytes, route_bytes};
 use crate::gemm::{Gemm32Kernels, GemmRoute};
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::prompt_stream::PromptStream;
@@ -1447,26 +1445,14 @@ fn ring_pass(
     let (ctx, stream) = (c.gpu.context(), c.gpu.stream());
     let cols = |name: &str| kq_weight(c.w, name).map(DeviceTensor::cols);
     let (gate_cols, up_cols, down_cols) = (cols(&n.gate)?, cols(&n.up)?, cols(&n.down)?);
-    // SAFETY: the stream's union row is `n_expert` words of its mapped host
-    // rows, and its half holds `half_slots` experts of this layer's part
-    // bytes in each part from the half's first slot — its gate and up rows
-    // of the card stacks' words, its down rows likewise
-    // (`XStream::ring_layer`); all stay allocated while the stream lives,
-    // past these launches, and the windows are given back below.
-    let (union_map, gate, up, down) = unsafe {
-        (
-            crate::tensor::window::<u32>(r.union_map, shape.n_expert, ctx),
-            DeviceTensor::<u32>::window(r.parts[0], r.half_slots * shape.ff, gate_cols, ctx),
-            DeviceTensor::<u32>::window(r.parts[1], r.half_slots * shape.ff, up_cols, ctx),
-            DeviceTensor::<u32>::window(r.parts[2], r.half_slots * shape.hidden, down_cols, ctx),
-        )
-    };
-    let ran = (|| {
+    let rows = [shape.ff, shape.ff, shape.hidden];
+    let cols = [gate_cols, up_cols, down_cols];
+    wide::with_ring_windows(r, ctx, shape.n_expert, rows, cols, |union_map, stacks| {
         side.k.leg.enqueue_places(
             stream,
             &PlacesArgs {
                 ids: s.route.ids(),
-                map: &union_map,
+                map: union_map,
                 row_off: 0,
                 n_expert: shape.n_expert,
                 pitch: shape.pitch,
@@ -1476,25 +1462,11 @@ fn ring_pass(
             c.sink,
             &mut ring.union,
         )?;
-        let stacks = RingStacks {
-            gate: &gate,
-            up: &up,
-            down: &down,
-        };
         for (b, map) in r.batches.iter().zip(ring.maps.iter_mut()) {
             b.with_map(ctx, shape.n_expert, |row| {
                 widen_map(stream, (row, 0), shape.n_expert, map)
             })?;
-            wide::ffn_ring(
-                c,
-                n,
-                s,
-                m,
-                map,
-                &mut ring.route,
-                b.event.as_deref(),
-                &stacks,
-            )?;
+            wide::ffn_ring(c, n, s, m, map, &mut ring.route, b.event.as_deref(), stacks)?;
         }
         if let Some(checks) = ring.checks.as_mut() {
             let maps = ring.maps.get(..r.batches.len()).unwrap_or_default();
@@ -1502,12 +1474,7 @@ fn ring_pass(
             checks.push(union_check(c, side, (ids, &ring.union), maps, m, n_card)?);
         }
         Ok(n_card + r.n)
-    })();
-    drop(std::mem::ManuallyDrop::into_inner(union_map).into_raw_parts());
-    for w in [gate, up, down] {
-        DeviceTensor::release(w);
-    }
-    ran
+    })
 }
 
 /// Layer `c.layer`'s union places of `m` rows (`union`, cut from the
