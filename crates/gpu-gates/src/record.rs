@@ -1028,7 +1028,7 @@ pub static PLAN: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read).",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -1041,6 +1041,8 @@ pub static PLAN38: Kind = Kind {
         opt("tier", Word, ""),
         opt("tier_experts", U64, "experts"),
         opt("card_free", U64, "B"),
+        opt("room", U64, "B"),
+        opt("plan_room", U64, "B"),
         opt("why", Word, ""),
         opt("rows", Word, ""),
         opt("read", Word, ""),
@@ -3059,6 +3061,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &NVTIER,
     &HELPER,
     &LOAD_DRAFT,
     &CAPTURE,
@@ -3171,6 +3174,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &NVTIER,
     &LOAD_DRAFT_GLM,
     &LOAD_DRAFT_OFF_GLM,
     &CAPTURE,
@@ -3299,6 +3303,16 @@ pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Reco
 /// records of the paged plan and the tier census of each phase.
 pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST, &TIER_CENSUS];
 
+/// `r` with the host room's reading and the plan room when the plan was made at
+/// one (`HostTotals::room`), the two parts `plan` and `plan38` share; the
+/// caller has put every part the kind lists before `room`.
+pub fn with_room(r: Record, room: Option<(u64, u64)>) -> Record {
+    match room {
+        Some((read, planned)) => r.u("room", read).u("plan_room", planned),
+        None => r,
+    }
+}
+
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
 /// card counts' range, the budget, and the NVMe tier's terms (the bytes paged,
@@ -3335,10 +3349,7 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
             "arena_slots",
             arena_slots(plan).expect("the arena's slots of a plan the split made"),
         );
-    let r = match plan.host.room {
-        Some((read, planned)) => r.u("room", read).u("plan_room", planned),
-        None => r,
-    };
+    let r = with_room(r, plan.host.room);
     let r = match machine.cards.first().and_then(|c| c.free_bytes) {
         Some(free) => r.u("card_free", free),
         None => r,
@@ -4347,6 +4358,48 @@ mod tests {
             ])
         );
         assert_eq!(bp.word("card_budget"), Ok("none"));
+    }
+
+    /// A plan made at a host room prints its reading and the plan room right
+    /// after the card's free bytes, and a plan made at none prints neither;
+    /// the parts after them keep their values, and a line from before the
+    /// parts reads as absent.
+    #[test]
+    fn a_plan38_names_the_host_room_it_was_made_at() {
+        let line = |room| {
+            let r = Record::new(&PLAN38)
+                .w("place", "cuda0")
+                .w("card", "5090")
+                .w("experts", "card")
+                .u("ctx_max", 4096)
+                .u("host_experts", 11_735)
+                .u("card_experts", 12_841)
+                .u("card_free", 31_000_000_000_u64);
+            with_room(r, room).w("why", "whole_does_not_fit").line()
+        };
+        let at = line(Some((60_943_515_648, 60_500_000_000)));
+        assert_eq!(
+            at,
+            "plan place=cuda0 card=5090 experts=card ctx_max=4096 host_experts=11735 \
+             card_experts=12841 card_free=31000000000 room=60943515648 plan_room=60500000000 \
+             why=whole_does_not_fit"
+        );
+        let none = line(None);
+        assert!(!none.contains("room"), "{none}");
+        let read = |text: &str| Log::of(text, BLOOMERY_SERVE_QWEN38).one(&PLAN38).unwrap();
+        let (at, none) = (read(&at), read(&none));
+        assert_eq!(at.opt_u64("room"), Ok(Some(60_943_515_648)));
+        assert_eq!(at.opt_u64("plan_room"), Ok(Some(60_500_000_000)));
+        assert_eq!(at.opt_word("why"), Ok(Some("whole_does_not_fit")));
+        assert_eq!(none.opt_u64("room"), Ok(None));
+        assert_eq!(none.opt_u64("plan_room"), Ok(None));
+        assert_eq!(none.opt_word("why"), Ok(Some("whole_does_not_fit")));
+        let old = read(PLAN38_PLACED);
+        assert_eq!(old.opt_u64("room"), Ok(None));
+        let with = PLAN_BP.replace("arena_slots=0 ", "arena_slots=0 room=7 plan_room=5 ");
+        let bp = Log::of(&with, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+        assert_eq!(bp.opt_u64("room"), Ok(Some(7)));
+        assert_eq!(bp.u64("card_free"), Ok(50_668_240_896));
     }
 
     /// Kinds that share a head are told apart by the whole line: a qwen3moe
