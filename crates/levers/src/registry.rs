@@ -645,7 +645,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               holds the churn pool, refused by name as above, and prints `residency host`, and \
               each arm prints its `residency pass` records after its lines; an arm's clear \
               resets it, with a `residency reset` record; a set word and \
-              `why=set` print as a `residency lever` record before the load. There `mid-…` is refused by \
+              `why=set` print as a `residency lever` record before the load. A set \
+              `mid-p<P>-s<S>-unhosted` (Qwen3.8 only, refused by name on every other family) asks \
+              the load to keep P with the churn pool unhosted: the pool is not read in or \
+              locked, its victims are served from the file on the token path, and `residency \
+              host` prints `hosted=unhosted` — measured −37 % decode on the maintainers' box at \
+              plan a, so it is asked for, never a default. There `mid-…` is refused by \
               name beside `BLOOMERY_ROUTE_TRACE` (a fixed placement's routing), with a step-fed \
               prompt (`--prefill step`, at the prompt), on a qwen3moe or qwen35moe file and under \
               `--dump-taps`. `bloomery-serve-qwen38` takes it as `generate_qwen3moe` does, \

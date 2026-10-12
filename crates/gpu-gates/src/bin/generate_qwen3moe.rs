@@ -1274,7 +1274,7 @@ mod cli {
             .print();
         }
         let word_set = levers.residency().unwrap_or("off");
-        let residency = Residency::parse(word_set)?;
+        let residency = Residency::parse_asking(word_set)?;
         let experts = experts38(&levers)?;
         // The K/V planes' format, read once here: the loads below carry it
         // and the plan's KV term counts it (the lever's kind holds the word

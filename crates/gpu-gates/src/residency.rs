@@ -66,10 +66,10 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
 /// `BLOOMERY_RESIDENCY` against `plan` on the pair rule
 /// ([`residency_at_plan`]): `pick` as it is unless it is the serving word
 /// the plan has not yet seen, which the plan's card slots, host headroom and
-/// `MemAvailable` then keep, move or turn `off` with why, as the loading
-/// body carries an unhosted pool or not (`carry`, its `ChainBody::UNHOSTED_POOL`;
-/// a value, so this module reaches no body). The churn pool's bytes are card
-/// `card`'s.
+/// `MemAvailable` then keep, move or turn `off` with why, on every body (an
+/// unset word never asks for its pool unhosted; `carry` is the loading body's
+/// `ChainBody::UNHOSTED_POOL`, a value, so this module reaches no body). The
+/// churn pool's bytes are card `card`'s.
 pub fn at_plan(
     carry: UnhostedPool,
     plan: &Plan<'_>,

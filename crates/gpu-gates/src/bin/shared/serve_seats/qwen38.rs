@@ -1311,7 +1311,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .eprint();
     }
     let set = match levers.residency() {
-        Some(word) => Some((Residency::parse(word)?, word)),
+        Some(word) => Some((Residency::parse_asking(word)?, word)),
         None => None,
     };
     let feed = Feed38::of(&levers)?;

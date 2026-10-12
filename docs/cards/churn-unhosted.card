@@ -1,3 +1,4 @@
+# [measured 2026-10-13, the forced-id A/B of this card, n=1024, depth 512, A6000, plan a: -37.5 % +/- 1.1 % (ours 40.74 against base 65.14 tok/s), the predict below (+15..+50) missed. The unset word therefore climbs; the unhosted pool is now opt-in, ours = BLOOMERY_RESIDENCY=mid-p0-s1-unhosted, base = unset. Log: the lead's abrun/runchurn2.log.]
 # Churn: an unset residency keeps its P when the unpaged churn pool does not fit the host, and the pool is unhosted (its
 # victims served from the file mapping, counted in rereads and unresident). Host-only rule (no kernel moved), so this is
 # the dispatch-path A/B AGENTS.md asks for, two builds: this tree's generate_qwen3moe against main f9706dbd's, the base

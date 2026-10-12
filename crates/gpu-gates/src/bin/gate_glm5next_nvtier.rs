@@ -348,10 +348,7 @@ mod gate {
         /// On the 3090 the plan holds no routed expert on the card, so the first clause (`:1287`) answers `off`,
         /// `no_card_experts`, whatever the arena; on the A6000 the card experts, the pool and the headroom decide.
         fn expected_residency(&self, plan: &PlanFacts) -> Unset {
-            Unset::serving(
-                &plan.room,
-                <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
-            )
+            Unset::serving(&plan.room)
         }
 
         /// More than one routed layer stays on the host, so the tier has something to page: an

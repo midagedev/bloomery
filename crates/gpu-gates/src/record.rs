@@ -2037,8 +2037,11 @@ pub static RESIDENCY_LEVER: Kind = Kind {
           set, or unset and what picked it (place: the serving placement's default; off under \
           fixed_place, check_finite, route_trace or prefill_steps, where the machine does not run; \
           on the plan, shrunk where its card slots moved P, off under no_card_experts or no_room, \
-          and pool_unhosted where the churn pool at P fits neither the plan's host headroom nor \
-          what MemAvailable leaves: the word keeps P and the load does not host the pool).",
+          pool_shrunk where the churn pool at P fits neither the plan's host headroom nor what \
+          MemAvailable leaves and P is raised to the first count whose pool fits, and \
+          pool_unhostable under off where no count fits). A word that asks for its pool \
+          unhosted (a set mid word ending in -unhosted) prints as set, and its residency host \
+          record reads unhosted.",
     parts: &[key("residency", Word, ""), key("why", Word, "")],
 };
 
@@ -2050,9 +2053,9 @@ pub static RESIDENCY_UNSET: Kind = Kind {
     doc: "What BLOOMERY_RESIDENCY unset resolved to in generate_qwen3moe: the word the load runs \
           by (off, or mid-p<P>-s1 on plan (a), P half the plan's fewest card experts a layer) \
           and why, the condition that picked it (the placement, the flags, the file, or the plan: \
-          no card expert, no room, or — the word kept at P — the churn pool past the plan's host \
-          headroom or past what MemAvailable leaves: the pool is not hosted, its victims are \
-          served from the file).",
+          no card expert, no room, or the churn pool past the plan's host headroom or past what \
+          MemAvailable leaves: P raised to the first count whose pool fits, or off where none \
+          does).",
     parts: &[key("residency", Word, ""), key("why", Text, "")],
 };
 

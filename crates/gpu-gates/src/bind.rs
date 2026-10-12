@@ -3581,8 +3581,8 @@ mod tests {
     /// the load's machine reserves ([`reserve_checkpoints`]) once: a churn
     /// pool that fits past the need of a load that declares none does not
     /// fit past the same plan's need on a machine that reserves two slots',
-    /// and the pick keeps P 0 with the pool unhosted, naming the room the
-    /// reserve leaves.
+    /// and the pick is `off`, naming the room the reserve leaves: an unset
+    /// word climbs on every body, and this pool fits at no P.
     #[test]
     fn the_residency38_room_reads_the_reserved_need() {
         use crate::residency38::{Seqs, checkpoints_reserved, mem_left_38, reserve_checkpoints};
@@ -3598,7 +3598,7 @@ mod tests {
         assert_eq!(slot, 4 << 30);
         // A plan of one card layer of 100 experts, its host the rest: the
         // unset rule pins none (P 0), the pool a fixed 10 GiB whatever P is, on
-        // the Qwen3.8 body, which carries an unhosted pool (`Body38::UNHOSTED_POOL`).
+        // the Qwen3.8 body (`Body38::UNHOSTED_POOL`).
         let pick = |mem_left: i128| {
             bloomery_levers::residency38_at_plan(
                 bloomery_levers::UnhostedPool::Carried,
@@ -3629,15 +3629,16 @@ mod tests {
         assert_eq!(pick(mem_left_38(available, none)).pinned, Some(0));
         let two = terms + declared(Seqs::priced(2, price));
         assert_eq!(two - none, 2 * slot);
-        // PIN(2026-10-12): the pool past the reserved need turned the word
-        // `off` (`MemShort`); a 64 GB host decoded far faster with the pool
-        // left out at P 0, so the word keeps P 0 with the pool unhosted.
+        // PIN(2026-10-13): the pool past the reserved need turns the word
+        // `off` (`PoolUnhostable`): the pool is the same at every P here, so
+        // the climb finds no count that fits. An unset word that kept P 0
+        // with the pool unhosted decoded far slower than the climb.
         let short = pick(mem_left_38(available, two));
-        assert_eq!(short.pinned, Some(0));
-        assert_eq!(short.pool(), bloomery_levers::ChurnHosting::Unhosted);
-        let bloomery_levers::Residency38Why::Unhosted(pool) = short.why else {
+        assert_eq!(short.pinned, None);
+        assert_eq!(short.pool(), bloomery_levers::ChurnHosting::Hosted);
+        let bloomery_levers::Residency38Why::PoolUnhostable(pool) = short.why else {
             panic!(
-                "the pool past the reserved need is unhosted: {:?}",
+                "the pool past the reserved need fits no count: {:?}",
                 short.why
             );
         };

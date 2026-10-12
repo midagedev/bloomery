@@ -811,37 +811,37 @@ fn residency38_unset_follows_the_plan() {
         Some(0),
         "the unpinned default fits a plan of two card experts a layer"
     );
-    // PIN(2026-10-12): the host side raised P to the first count whose pool
-    // fit, and turned the word `off` where none did; a 64 GB host decoded
-    // far faster with the pool left out at P 0 than at the raised P, so the
-    // host side keeps P and leaves the pool unhosted.
+    // PIN(2026-10-13): was P 0 with the pool unhosted below the budget; an unset word now climbs on every body.
     // The churn pool at P 0 is 297 experts a layer, 2 layers, 10 B each:
-    // 5,940 B. A headroom of 2,980 B does not take it: the word keeps P 0
-    // and the pool is unhosted.
-    let unhosted = |headroom, mem_left| Residency38Pick {
-        pinned: Some(0),
-        why: Residency38Why::Unhosted(PoolUnhosted {
-            needs: 5_940,
-            headroom,
-            mem_left,
-        }),
+    // 5,940 B, and 20 × (297 − P) B at P. A headroom of 2,980 B takes it from
+    // P 148 (20 × 149), MemAvailable of 2,979 B from P 149: an unset word
+    // climbs to the first P whose pool fits, whatever the body carries.
+    let raised = |to: usize| Residency38Pick {
+        pinned: Some(to),
+        why: Residency38Why::PoolShrunk { from: 0, to },
     };
     let kept = pick(&[297, 297], 2_980);
-    assert_eq!(kept, unhosted(2_980, 1 << 40));
-    assert_eq!(kept.word(), "mid-p0-s1");
-    assert_eq!(kept.pool(), ChurnHosting::Unhosted);
+    assert_eq!(kept, raised(148));
+    assert_eq!(kept.word(), "mid-p148-s1");
+    assert_eq!(kept.pool(), ChurnHosting::Hosted);
     assert_eq!(
         kept.why.to_string(),
-        "unset: the churn pool needs 5940 B, the plan leaves 2980 B and MemAvailable \
-         1099511627776 B: the pool is not hosted, its victims are served from the file"
+        "unset: p0→p148 (host: the churn pool did not fit, raised)"
     );
-    // MemAvailable short of the pool keeps P 0 too, and a negative budget
-    // is the same rule.
+    assert_eq!(pick_mem(&[297, 297], 1 << 40, 2_979), raised(149));
+    // A negative budget takes no count: `off`, at the last pool probed (the
+    // card ceiling 295's, 40 B).
     assert_eq!(
-        pick_mem(&[297, 297], 1 << 40, 2_979),
-        unhosted(1 << 40, 2_979)
+        pick(&[297, 297], -5),
+        Residency38Pick {
+            pinned: None,
+            why: Residency38Why::PoolUnhostable(PoolUnhostable {
+                needs: 40,
+                headroom: -5,
+                mem_left: 1 << 40,
+            }),
+        }
     );
-    assert_eq!(pick(&[297, 297], -5), unhosted(-5, 1 << 40));
     // The pool that fits both budgets is hosted.
     let fits = pick_mem(&[297, 297], 5_940, 5_940);
     assert_eq!(fits.pinned, Some(0));
@@ -891,18 +891,20 @@ fn residency38_at_plan_resolves_a_paged_plan_by_its_own_rule() {
     };
     assert_eq!(at(0, big), planned);
     assert_eq!(at(big, 0), planned);
-    // A negative budget does not take even an empty pool: P 0, unhosted.
+    // PIN(2026-10-13): was P 0 unhosted; an unset word now climbs on every body.
+    // A negative budget does not take even an empty pool, at any count:
+    // `off`, at the last pool probed.
     assert_eq!(
         at(-1, big).why,
-        Residency38Why::Unhosted(PoolUnhosted {
+        Residency38Why::PoolUnhostable(PoolUnhostable {
             needs: 0,
             headroom: -1,
             mem_left: big,
         })
     );
-    assert_eq!(at(big, -1).pinned, Some(0));
+    assert_eq!(at(big, -1).pinned, None);
     assert_eq!(
-        room_for(UnhostedPool::Carried, 0, 1, [297u64, 298], empty, 0, big),
+        room_for(false, 0, 1, [297u64, 298], empty, 0, big),
         Ok(Room::AsIs),
         "the room is the same rule under every family"
     );
@@ -910,8 +912,8 @@ fn residency38_at_plan_resolves_a_paged_plan_by_its_own_rule() {
 
 /// The plan's room for a family's target word ([`room_for`]): the word at
 /// its target where its card slots and its host take it, at half the fewest
-/// where its card slots do not, at that P with the pool unhosted where its
-/// host does not, `off` where the card slots leave no count.
+/// where its card slots do not, at that P with the pool unhosted where the
+/// word asks for it, `off` where the card slots leave no count.
 #[test]
 fn room_for_keeps_the_word_where_the_plan_has_room() {
     // The pool shrinks as the pinned count grows: 10 B an expert past it, on
@@ -920,7 +922,7 @@ fn room_for_keeps_the_word_where_the_plan_has_room() {
     let room = |target: usize, spares: usize, n_l: &[u64], headroom: i128, mem_left: i128| {
         let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
         room_for(
-            UnhostedPool::Carried,
+            false,
             target,
             spares,
             n_l.iter().copied(),
@@ -962,39 +964,23 @@ fn room_for_keeps_the_word_where_the_plan_has_room() {
             Room::Short(RoomShort::NoCardExperts)
         );
     }
-    // PIN(2026-10-12): the host side raised P to the first count whose pool
-    // fit, and turned the word `off` where none did; a 64 GB host decoded
-    // far faster with the pool left out at P 0 than at the raised P, so on a
-    // load that carries an unhosted pool the host side keeps P and leaves the
-    // pool unhosted.
-    // The host side: the pool at the word's P (40: 10 experts, 100 B) fits
-    // neither budget: the word keeps P 40 and the pool is unhosted.
-    let unhosted = |headroom, mem_left| Room::Unhosted {
-        pinned: 40,
-        pool: PoolUnhosted {
-            needs: 100,
-            headroom,
-            mem_left,
-        },
-    };
-    assert_eq!(room(40, 1, &[50], 50, big), unhosted(50, big));
-    assert_eq!(room(40, 1, &[50], big, 99), unhosted(big, 99));
-    assert_eq!(room(40, 1, &[50], 100, 100), Room::AsIs);
-    // Under the card side's half (29/2 = 14, 15 experts, 150 B), the pool
-    // that does not fit keeps the half.
+    // PIN(2026-10-13): was `Room::Unhosted` for an unset word on a carrying body; an unset word now climbs on every
+    // body, and the asked word's room is pinned by
+    // `a_word_that_asks_keeps_its_pool_unhosted_on_a_body_that_carries_it`.
+    // An unset word climbs on a body that carries an unhosted pool too: the
+    // pool at 40 (10 experts, 100 B) fits neither budget, and the first count
+    // above whose pool fits raises P, never past the card ceiling 48.
     assert_eq!(
-        room(40, 1, &[29], 149, big),
-        Room::Unhosted {
-            pinned: 14,
-            pool: PoolUnhosted {
-                needs: 150,
-                headroom: 149,
-                mem_left: big,
-            },
-        }
+        room(40, 1, &[50], 50, big),
+        Room::MovedForPool { from: 40, to: 45 }
     );
     assert_eq!(
-        room_for(UnhostedPool::Carried, 40, 1, [42u64], |_| Err(()), 0, 0),
+        room(40, 1, &[50], big, 99),
+        Room::MovedForPool { from: 40, to: 41 }
+    );
+    assert_eq!(room(40, 1, &[50], 100, 100), Room::AsIs);
+    assert_eq!(
+        room_for(false, 40, 1, [42u64], |_| Err(()), 0, 0),
         Err(()),
         "the pool's error is the call's"
     );
@@ -1007,7 +993,7 @@ fn room_for_keeps_the_word_where_the_plan_has_room() {
     let climb = |n_l: &[u64], headroom: i128, mem_left: i128| {
         let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
         room_for(
-            UnhostedPool::NotCarried,
+            false,
             40,
             1,
             n_l.iter().copied(),
@@ -1097,41 +1083,8 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
         None,
         "a why the plan did not move details nothing"
     );
-    // PIN(2026-10-12): the host side raised P to the first count whose pool
-    // fit, and turned the word `off` where none did; a 64 GB host decoded
-    // far faster with the pool left out at P 0 than at the raised P, so the
-    // host side keeps P and leaves the pool unhosted.
-    // The host side keeps the word's P 0 where the pool there (500 B) does
-    // not fit a headroom of 50 B: the pool is unhosted.
-    let kept = residency_at_plan(
-        UnhostedPool::Carried,
-        unset,
-        [50u64],
-        |p| Ok::<u64, ()>(10 * (50 - p) as u64),
-        50,
-        big,
-    )
-    .expect("no pool error");
-    assert_eq!(
-        kept,
-        ResidencyPick {
-            word: "mid-p0-s1",
-            why: ResidencyWhy::Unhosted(PoolUnhosted {
-                needs: 500,
-                headroom: 50,
-                mem_left: big,
-            }),
-        }
-    );
-    assert_eq!(kept.why.name(), "pool_unhosted");
-    assert_eq!(kept.pool(), ChurnHosting::Unhosted);
-    assert_eq!(
-        kept.why.detail().expect("the unhosted why details"),
-        format!(
-            "unset: the churn pool needs 500 B, the plan leaves 50 B and MemAvailable {big} B: \
-             the pool is not hosted, its victims are served from the file"
-        )
-    );
+    // PIN(2026-10-13): the keep-P block (P 0 with the pool unhosted below the budget) is gone; an unset word now climbs on
+    // every body, pinned by `an_unset_word_climbs_on_a_body_that_carries_an_unhosted_pool`.
     // A set word and every other why pass through untouched, the pool unasked.
     let refused = |pick: ResidencyPick| {
         residency_at_plan(
@@ -1557,39 +1510,132 @@ fn glm_residency_at_plan_takes_only_what_fits() {
         Err("the pool"),
         "the pool's error is the call's"
     );
-    // PIN(2026-10-12): the host side raised P to the first count whose pool
-    // fit, and turned the word `off` where none did; a 64 GB host decoded
-    // far faster with the pool left out at P 0 than at the raised P, so the
-    // host side keeps P and leaves the pool unhosted.
-    // The host side: the pool at the word's pinned count (66 B) fits, a
-    // byte less of either budget keeps P 0 with the pool unhosted.
-    let keep = |headroom, mem| {
-        glm_residency_at_plan(
-            UnhostedPool::Carried,
-            mid,
-            [66u64],
-            |p| Ok::<u64, &str>((66 - p) as u64),
+    // PIN(2026-10-13): the keep-P block (P 0 with the pool unhosted below the budget) is gone; an unset word now climbs on
+    // every body, pinned by `an_unset_word_climbs_on_a_body_that_carries_an_unhosted_pool`.
+}
+
+/// An unset word climbs on a body that carries an unhosted pool, as on any
+/// other: where its pool at P fits neither host budget, the load runs at the
+/// first P whose pool fits, in every family's resolution.
+// PIN(2026-10-13): an unset word on a body that carried an unhosted pool kept
+// P and left the pool unhosted; that word decoded far slower than the climbed
+// word, each victim read from the file mapping on the token path. The
+// unhosted pool is the word's suffix (`-unhosted`), not a default.
+// FAIL-first: the rule before this pin returns P 0 with `pool_unhosted` here.
+#[test]
+fn an_unset_word_climbs_on_a_body_that_carries_an_unhosted_pool() {
+    let big = 1 << 40;
+    let pool = |p: usize| Ok::<u64, ()>(10 * (50 - p) as u64);
+    let serving = residency_unset(ResidencyAt {
+        serving_place: true,
+        ..ResidencyAt::FIXED
+    });
+    // 10 B an expert past P on 50: the first count whose pool fits 50 B is
+    // 45.
+    let v41 = residency_at_plan(UnhostedPool::Carried, serving, [50u64], pool, 50, big)
+        .expect("no pool error");
+    assert_eq!(
+        (v41.word, v41.why, v41.pool()),
+        (
+            "mid-p45-s1",
+            ResidencyWhy::PoolShrunk { from: 0, to: 45 },
+            ChurnHosting::Hosted
+        )
+    );
+    let q38 = residency38_at_plan(UnhostedPool::Carried, [50u64], 1, pool, 50, big)
+        .expect("no pool error");
+    assert_eq!(
+        (q38.pinned, q38.why, q38.pool()),
+        (
+            Some(45),
+            Residency38Why::PoolShrunk { from: 0, to: 45 },
+            ChurnHosting::Hosted
+        )
+    );
+    let glm = GlmPick {
+        word: GLM_RESIDENCY_UNSET,
+        why: GlmWhy::Serving,
+    };
+    let g = glm_residency_at_plan(UnhostedPool::Carried, glm, [50u64], pool, 50, big)
+        .expect("no pool error");
+    assert_eq!(
+        (g.word, g.why, g.pool()),
+        (
+            "mid-p45-s1",
+            GlmWhy::PoolShrunk { from: 0, to: 45 },
+            ChurnHosting::Hosted
+        )
+    );
+}
+
+/// A word that asks for its churn pool unhosted (`-unhosted`) on a body that
+/// carries one keeps its P with the pool unhosted, whether or not the pool
+/// fits; a body that hosts every pool refuses the ask by name.
+#[test]
+fn a_word_that_asks_keeps_its_pool_unhosted_on_a_body_that_carries_it() {
+    let pool = |fewest: usize| move |p: usize| Ok::<u64, ()>(10 * (fewest - p) as u64);
+    let asked = |target: usize, n_l: &[u64], headroom: i128, mem_left: i128| {
+        let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
+        room_for(
+            UnhostedPool::Carried.takes(true),
+            target,
+            1,
+            n_l.iter().copied(),
+            pool(fewest),
             headroom,
-            mem,
+            mem_left,
         )
         .expect("no pool error")
     };
-    let unhosted = |headroom, mem_left| GlmPick {
-        word: "mid-p0-s1",
-        why: GlmWhy::Unhosted(PoolUnhosted {
-            needs: 66,
+    let big = 1 << 40;
+    let unhosted = |pinned, needs, headroom, mem_left| Room::Unhosted {
+        pinned,
+        pool: PoolUnhosted {
+            needs,
             headroom,
             mem_left,
+        },
+    };
+    // The pool at P 40 (10 experts, 100 B) fits neither budget, or both: the
+    // word keeps P 40 and the pool is unhosted.
+    assert_eq!(asked(40, &[50], 50, big), unhosted(40, 100, 50, big));
+    assert_eq!(asked(40, &[50], big, 99), unhosted(40, 100, big, 99));
+    assert_eq!(asked(40, &[50], 100, 100), unhosted(40, 100, 100, 100));
+    // Under the card side's half (29 / 2 = 14, 15 experts, 150 B) it keeps the
+    // half; the card side's refusals stand.
+    assert_eq!(asked(40, &[29], big, big), unhosted(14, 150, big, big));
+    assert_eq!(
+        asked(40, &[2], big, big),
+        Room::Short(RoomShort::NoRoom { fewest: 2 })
+    );
+    assert_eq!(
+        asked(40, &[0, 0], big, big),
+        Room::Short(RoomShort::NoCardExperts)
+    );
+    // The Qwen3.8 pick of such a word hosts nothing.
+    let pick = Residency38Pick {
+        pinned: Some(0),
+        why: Residency38Why::Unhosted(PoolUnhosted {
+            needs: 1,
+            headroom: 0,
+            mem_left: 0,
         }),
     };
-    assert_eq!(keep(65, 1 << 40), unhosted(65, 1 << 40));
-    assert_eq!(keep(1 << 40, 65), unhosted(1 << 40, 65));
-    assert_eq!(keep(65, 1 << 40).pool(), ChurnHosting::Unhosted);
-    assert_eq!(keep(66, 66).pool(), ChurnHosting::Hosted);
+    assert_eq!(pick.pool(), ChurnHosting::Unhosted);
+    // The pool is taken unhosted only where the word asks and the body carries
+    // one.
+    assert!(UnhostedPool::Carried.takes(true));
+    assert!(!UnhostedPool::Carried.takes(false));
+    assert!(!UnhostedPool::NotCarried.takes(true));
+    // A body that hosts every pool it runs refuses the ask, naming the word.
+    let word = "mid-p0-s1-unhosted";
+    assert_eq!(UnhostedPool::Carried.refuse(word), None);
     assert_eq!(
-        keep(9, 9).why.to_string(),
-        "unset: the churn pool needs 66 B, the plan leaves 9 B and MemAvailable 9 B: the pool \
-         is not hosted, its victims are served from the file"
+        UnhostedPool::NotCarried.refuse(word).as_deref(),
+        Some(
+            "BLOOMERY_RESIDENCY=mid-p0-s1-unhosted: -unhosted asks to keep the churn pool \
+             unhosted, and this load hosts every churn pool it runs"
+        )
     );
 }
 
@@ -2031,12 +2077,40 @@ fn residency_words_take_any_p_and_s_at_least_1() {
     ] {
         assert_eq!(
             residency_word(v),
-            Some(ResidencyWord::Mid { pinned, spares }),
+            Some(ResidencyWord::Mid {
+                pinned,
+                spares,
+                unhosted: false
+            }),
             "{v}"
         );
         assert!(Kind::Residency.parse(v).is_ok(), "{v}");
+        // The suffix asks for the churn pool unhosted and changes nothing
+        // else of the word.
+        let asked = format!("{v}{UNHOSTED_SUFFIX}");
+        assert_eq!(
+            residency_word(&asked),
+            Some(ResidencyWord::Mid {
+                pinned,
+                spares,
+                unhosted: true
+            }),
+            "{asked}"
+        );
+        assert!(Kind::Residency.parse(&asked).is_ok(), "{asked}");
     }
     assert_eq!(residency_word("mid-p33-s0"), None);
+    // The suffix ends a `mid` word and nothing else.
+    for v in [
+        "off-unhosted",
+        "mid-p0-s1-unhosted-unhosted",
+        "mid-p0-s0-unhosted",
+        "mid-p0-unhosted",
+        "mid-p0-s1unhosted",
+        "-unhosted",
+    ] {
+        assert_eq!(residency_word(v), None, "{v}");
+    }
 }
 
 /// `BLOOMERY_MTP_HEAD_ROWS`'s word is never a path, and every other value
@@ -2140,11 +2214,6 @@ fn a_load_that_hosts_its_pool_climbs_through_every_family_rule() {
             why: GlmWhy::PoolUnhostable(unhostable)
         }
     );
-    // The same plan on a load that carries an unhosted pool keeps P 0.
-    let kept = residency38_at_plan(UnhostedPool::Carried, [50u64], 1, pool, 50, big)
-        .expect("no pool error");
-    assert_eq!(
-        (kept.pinned, kept.pool()),
-        (Some(0), ChurnHosting::Unhosted)
-    );
+    // PIN(2026-10-13): the closing check that a carrying body keeps P 0 on the same plan is gone; the carrying body now
+    // climbs like these, pinned by `an_unset_word_climbs_on_a_body_that_carries_an_unhosted_pool`.
 }

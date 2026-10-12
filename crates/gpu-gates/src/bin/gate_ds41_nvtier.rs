@@ -181,13 +181,10 @@ mod gate {
         /// The rule is `residency_at_plan` (`crates/levers/src/lib.rs:1379`) on the serving word, through
         /// `room_for` (`:1279`). A routed stack the card holds whole puts its experts past P in the churn pool
         /// (`crates/placement/src/placement/churn.rs:46-49`) against a headroom the split's floor leaves near 0:
-        /// `pool_unhostable`, the V4.1 body hosting its pool (`ChainBody::UNHOSTED_POOL`). A plan whose every
+        /// `pool_unhostable`, an unset word climbing on every body. A plan whose every
         /// card-expert layer pages has an empty pool and keeps the word.
         fn expected_residency(&self, plan: &PlanFacts) -> Unset {
-            Unset::serving(
-                &plan.room,
-                <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
-            )
+            Unset::serving(&plan.room)
         }
 
         fn refusals(&self, paged: Arm, _slots: u64) -> Vec<Refusal<'_>> {

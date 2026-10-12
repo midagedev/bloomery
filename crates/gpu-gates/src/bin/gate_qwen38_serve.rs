@@ -345,41 +345,48 @@
 //!   the set word runs the unset rule's `off` at `--place gate` and prints
 //!   no host record; one that records the lever's why as unset names another
 //!   why;
-//! - `churn_unhosted` ([`churn_unhosted`], both tiers): an unset residency
-//!   at a host room that holds the plan's host need and not the churn pool
-//!   beside it keeps its P and leaves the pool out of the host set, so a
-//!   victim outside the set is served from the file and counted. Two servers
-//!   of `--parallel 2` and `--cache-ram 0` (no cache budget, so the card
-//!   rule alone sets the context and no room moves it), the draft off and
-//!   the residency unset. The first stops at `--plan` under a room no plan
-//!   needs: its `cache` line gives the plan's host need, its `residency host`
-//!   record the pool at P 0 (hosted, pinned 0) and the plan's host
-//!   headroom, the machine's there (the room asked is past its figure). A
-//!   stated room binds the headroom of a plan whose need it holds
-//!   (`Plan::plan_at`: the tighter of the room and the machine's figure, past
-//!   the need), and the unset rule reads the available bytes past the need
-//!   too (`BLOOMERY_HOST_ROOM` replaces the reading): both budgets are what
-//!   the room sets. The second server runs under the room `need + pool / 2`,
-//!   loads, and answers one greedy request of [`CHURN_PREDICT`] ids:
-//!   the `residency unset` record's why is `bloomery_levers::PoolUnhosted`'s
-//!   sentence at the pool and half the pool left in both budgets
-//!   (`churn_unhosted_why_names_the_pool_not_hosted`); the `residency host`
-//!   record reads `hosted=unhosted` at `pinned=0` with a pool that is not
-//!   empty (`churn_unhosted_host_record_keeps_p0_unhosted`); the request is
-//!   a 200 of at least [`CHURN_MIN_TOKENS`] ids
-//!   (`churn_unhosted_request_completes`); `rereads` plus `unresident` over
-//!   the `residency pass` records sum above 0, and the log holds no refused
-//!   flip (`churn_unhosted_victims_are_served_from_the_file`). A plan-only
-//!   run whose terms cannot be read fails the four checks by name, none
-//!   skipped. FAIL-first mutants: an unset word of this body taking the
-//!   climb prints the climb's why (`p0→p<q> (host: the churn pool did not
-//!   fit, raised)`) and a `residency host` record `hosted=hosted` at a P
-//!   above 0, red on the first two; a seat that hands the load `Hosted`
-//!   beside an unhosted pick holds the pool against the plan's headroom, and
-//!   the pool's refusal (`residency pinning 0 experts a layer: the churn
-//!   pool's <n> experts take <pool> B of host RAM, and the plan leaves the
-//!   host <pool / 2> B`, `ChurnPool::check_beside`) ends the server before
-//!   it listens, red on the last two.
+//! - `churn_unhosted` ([`churn_unhosted`], both tiers): a residency word
+//!   that asks for the pool unhosted (`mid-p0-s1-unhosted`) at a host room
+//!   that holds the plan's host need and not the churn pool beside it keeps
+//!   its P and leaves the pool out of the host set, so a victim outside the
+//!   set is served from the file and counted; the unset word on the same
+//!   room climbs to a hosted pool instead. Three servers of `--parallel 2`
+//!   and `--cache-ram 0` (no cache budget, so the card rule alone sets the
+//!   context and no room moves it) and the draft off. The first stops at
+//!   `--plan` under a room no plan needs, the residency unset: its `cache`
+//!   line gives the plan's host need, its `residency host` record the pool
+//!   at P 0 (hosted, pinned 0) and the plan's host headroom, the machine's
+//!   there (the room asked is past its figure). A stated room binds the
+//!   headroom of a plan whose need it holds (`Plan::plan_at`: the tighter of
+//!   the room and the machine's figure, past the need), and the unset rule
+//!   reads the available bytes past the need too (`BLOOMERY_HOST_ROOM`
+//!   replaces the reading): both budgets are what the room sets. The second
+//!   server runs under the room `need + pool / 2` with
+//!   `BLOOMERY_RESIDENCY=mid-p0-s1-unhosted`, loads, and answers one greedy
+//!   request of [`CHURN_PREDICT`] ids: the `residency lever` record names
+//!   that word with why `set`
+//!   (`churn_unhosted_lever_record_names_the_asked_word`); the `residency
+//!   host` record carries the word and reads `hosted=unhosted` at `pinned=0`
+//!   with a pool that is not empty
+//!   (`churn_unhosted_host_record_keeps_p0_unhosted`); the request is a 200
+//!   of at least [`CHURN_MIN_TOKENS`] ids (`churn_unhosted_request_completes`);
+//!   `rereads` plus `unresident` over the `residency pass` records sum above
+//!   0, and the log holds no refused flip
+//!   (`churn_unhosted_victims_are_served_from_the_file`). The third stops at
+//!   `--plan` under the same room with the residency unset: its `residency
+//!   unset` record names the climb (`p0→p<q>`, `host: the churn pool did not
+//!   fit, raised`) and its `residency host` record the climbed word at
+//!   `pinned=<q>` with the pool hosted (`churn_unset_climbs_to_a_hosted_pool`).
+//!   A plan-only run whose terms cannot be read fails the five checks by
+//!   name, none skipped. FAIL-first mutants: an unset word of this body
+//!   keeping P 0 with the pool unhosted prints a `residency unset` record
+//!   that is not the climb and `hosted=unhosted` at `pinned=0`, red on the
+//!   last check; a seat that hands the load `Hosted` beside the asked word
+//!   holds the pool against the plan's headroom, and the pool's refusal
+//!   (`residency pinning 0 experts a layer: the churn pool's <n> experts take
+//!   <pool> B of host RAM, and the plan leaves the host <pool / 2> B`,
+//!   `ChurnPool::check_beside`) ends the server before it listens, red on
+//!   the checks after the lever record.
 //!
 //! Held by another test, and not run here:
 //!
@@ -630,11 +637,15 @@ mod gate {
     /// A flip the host cannot serve is refused with this sentence
     /// (`swap::Unresident`'s Display); the clause's server must never print it.
     const UNRESIDENT_REFUSED: &str = "is not host-resident after its pages were read in again";
-    /// The unhosted-pool clause's checks, one line each.
-    const CHURN_WHY: &str = "churn_unhosted_why_names_the_pool_not_hosted";
+    /// The word that asks the load to keep P 0 with the churn pool unhosted.
+    const CHURN_WORD: &str = "mid-p0-s1-unhosted";
+    /// The unhosted-pool clause's checks, one line each, and the unset
+    /// word's one beside them.
+    const CHURN_WHY: &str = "churn_unhosted_lever_record_names_the_asked_word";
     const CHURN_HOST: &str = "churn_unhosted_host_record_keeps_p0_unhosted";
     const CHURN_REQUEST: &str = "churn_unhosted_request_completes";
     const CHURN_VICTIMS: &str = "churn_unhosted_victims_are_served_from_the_file";
+    const CHURN_CLIMBS: &str = "churn_unset_climbs_to_a_hosted_pool";
 
     /// `BLOOMERY_QWEN38_EXPERTS` as the plan's expert rule — the server's
     /// reading of the inherited environment.
@@ -2592,11 +2603,15 @@ mod gate {
         }
     }
 
-    /// A server of the unhosted-pool clause under `room` bytes of host.
-    fn churn_server(room: u64) -> Result<Command, GateError> {
+    /// A server of the unhosted-pool clause under `room` bytes of host, the
+    /// residency word `word` (unset for `None`).
+    fn churn_server(room: u64, word: Option<&str>) -> Result<Command, GateError> {
         let mut cmd = Command::new(Served38::exe()?);
+        match word {
+            Some(word) => cmd.env(bloomery_levers::RESIDENCY, word),
+            None => cmd.env_remove(bloomery_levers::RESIDENCY),
+        };
         cmd.env(bloomery_levers::DRAFT, "off")
-            .env_remove(bloomery_levers::RESIDENCY)
             .env_remove(bloomery_levers::NVTIER_BYTES)
             .env_remove(bloomery_levers::MTP_HEAD_ROWS)
             .env_remove(bloomery_levers::MTP_DRAFT)
@@ -2605,16 +2620,16 @@ mod gate {
         Ok(cmd)
     }
 
-    /// The unhosted-pool clause's first server, stopped at `--plan` under
-    /// [`CHURN_PLAN_ROOM`], into `own`: the plan's host need, headroom and
-    /// churn pool ([`ChurnRoom`]), or why they cannot be read, as text. The
-    /// pool must be hosted at P 0 on this room and non-empty, and its `cache`
-    /// line must name the room asked and the same pool, so the terms are the
-    /// plan the second server loads.
-    fn churn_plan(own: &Path) -> Result<Result<ChurnRoom, String>, GateError> {
+    /// A server of the unhosted-pool clause stopped at `--plan` under `room`
+    /// bytes of host, the residency word unset, into `own`: its error log and
+    /// that log's records, or why it printed none, as text.
+    fn churn_plan_only(
+        own: &Path,
+        room: u64,
+    ) -> Result<Result<(PathBuf, record::Log), String>, GateError> {
         std::fs::create_dir_all(own)?;
         let err_log = own.join("server.err");
-        let mut cmd = churn_server(CHURN_PLAN_ROOM)?;
+        let mut cmd = churn_server(room, None)?;
         let args: Vec<&str> = CHURN_ARGS.iter().copied().chain(["--plan"]).collect();
         let mut served = Served38::spawn_with(&args, own, &mut cmd)?;
         println!("churn-unhosted plan server pid {}", served.child.id());
@@ -2640,6 +2655,20 @@ mod gate {
             return Ok(Err(format!("the plan-only server exited {status}: {text}")));
         }
         let log = seat_log(&err_log)?;
+        Ok(Ok((err_log, log)))
+    }
+
+    /// The unhosted-pool clause's first server, stopped at `--plan` under
+    /// [`CHURN_PLAN_ROOM`], into `own`: the plan's host need, headroom and
+    /// churn pool ([`ChurnRoom`]), or why they cannot be read, as text. The
+    /// pool must be hosted at P 0 on this room and non-empty, and its `cache`
+    /// line must name the room asked and the same pool, so the terms are the
+    /// plan the second server loads.
+    fn churn_plan(own: &Path) -> Result<Result<ChurnRoom, String>, GateError> {
+        let (err_log, log) = match churn_plan_only(own, CHURN_PLAN_ROOM)? {
+            Ok(ran) => ran,
+            Err(why) => return Ok(Err(why)),
+        };
         let Some(host) = log.first(&record::RESIDENCY_HOST)? else {
             let unset = log
                 .first(&record::RESIDENCY_UNSET)?
@@ -2691,20 +2720,27 @@ mod gate {
     /// server gives the plan's host need and churn pool ([`churn_plan`]); a
     /// second server runs under the room that holds the need and half the
     /// pool, loads, and answers one greedy request of [`CHURN_PREDICT`] ids.
-    /// The unset rule keeps P 0 with the pool unhosted: its `residency
-    /// unset` record says so with `PoolUnhosted`'s sentence at the terms read
-    /// ([`CHURN_WHY`]), its `residency host` record reads `hosted=unhosted`
-    /// at `pinned=0` ([`CHURN_HOST`]), the request completes
-    /// ([`CHURN_REQUEST`]), and the `residency pass` records count a victim
-    /// served from the file ([`CHURN_VICTIMS`]). FAIL-first: the module
-    /// header's two mutants.
+    /// The word asks for P 0 with the pool unhosted ([`CHURN_WORD`]): its
+    /// `residency lever` record names that word with why `set`
+    /// ([`CHURN_WHY`]), its `residency host` record carries the same word and
+    /// reads `hosted=unhosted` at `pinned=0` ([`CHURN_HOST`]), the request
+    /// completes ([`CHURN_REQUEST`]), and the `residency pass` records count
+    /// a victim served from the file ([`CHURN_VICTIMS`]). The unset word on
+    /// the same room climbs ([`churn_unset_climbs`], [`CHURN_CLIMBS`]).
+    /// FAIL-first: the module header's mutants.
     fn churn_unhosted(dir: &Path) -> Result<bool, GateError> {
         let mut ok = true;
         let room = match churn_plan(&dir.join("churn-plan"))? {
             Ok(room) => room,
             Err(why) => {
                 println!("churn-unhosted: no room can be derived: {why}");
-                for name in [CHURN_WHY, CHURN_HOST, CHURN_REQUEST, CHURN_VICTIMS] {
+                for name in [
+                    CHURN_WHY,
+                    CHURN_HOST,
+                    CHURN_REQUEST,
+                    CHURN_VICTIMS,
+                    CHURN_CLIMBS,
+                ] {
                     check(&mut ok, name, false);
                 }
                 return Ok(ok);
@@ -2723,7 +2759,7 @@ mod gate {
         let own = dir.join("churn-unhosted");
         std::fs::create_dir_all(&own)?;
         let err_log = own.join("server.err");
-        let mut cmd = churn_server(asked)?;
+        let mut cmd = churn_server(asked, Some(CHURN_WORD))?;
         let mut served = Served38::spawn_with(&CHURN_ARGS, &own, &mut cmd)?;
         println!("churn-unhosted server pid {}", served.child.id());
         let completed = match served.address(&err_log, POLLS, POLL) {
@@ -2754,39 +2790,38 @@ mod gate {
         }
         let text = std::fs::read_to_string(&err_log)?;
         let log = seat_log(&err_log)?;
-        // The why is the sentence of a pool that needs the plan-only run's
-        // pool and finds half of it past the need in both budgets: the plan's
-        // headroom under the derived room, and the available bytes.
-        let why = log
-            .first(&record::RESIDENCY_UNSET)?
-            .map(|u| u.text("why").map(str::to_owned))
+        // A set word prints the lever record: the word as asked, why `set`.
+        let lever = log
+            .first(&record::RESIDENCY_LEVER)?
+            .map(|l| -> Result<(String, String), ReadError> {
+                Ok((l.word("residency")?.to_owned(), l.word("why")?.to_owned()))
+            })
             .transpose()?;
-        let want = bloomery_levers::PoolUnhosted {
-            needs: room.churn,
-            headroom: room.headroom_under_room(),
-            mem_left: i128::from(room.churn / 2),
-        }
-        .to_string();
-        println!(
-            "churn-unhosted: residency unset why {why:?}, the pool unhosted at the terms: {want:?}"
+        println!("churn-unhosted: residency lever (word, why) {lever:?}, asked {CHURN_WORD:?}");
+        check(
+            &mut ok,
+            CHURN_WHY,
+            lever
+                .as_ref()
+                .is_some_and(|(word, why)| word == CHURN_WORD && why == "set"),
         );
-        check(&mut ok, CHURN_WHY, why.as_deref() == Some(want.as_str()));
         let host = log
             .first(&record::RESIDENCY_HOST)?
-            .map(|h| -> Result<(String, u64, u64), ReadError> {
+            .map(|h| -> Result<(String, String, u64, u64), ReadError> {
                 Ok((
+                    h.word("residency")?.to_owned(),
                     h.word("hosted")?.to_owned(),
                     h.u64("pinned")?,
                     h.u64("churn_bytes")?,
                 ))
             })
             .transpose()?;
-        println!("churn-unhosted: residency host (hosted, pinned, churn_bytes) {host:?}");
+        println!("churn-unhosted: residency host (word, hosted, pinned, churn_bytes) {host:?}");
         check(
             &mut ok,
             CHURN_HOST,
-            host.as_ref().is_some_and(|(hosted, pinned, bytes)| {
-                hosted == "unhosted" && *pinned == 0 && *bytes > 0
+            host.as_ref().is_some_and(|(word, hosted, pinned, bytes)| {
+                word == CHURN_WORD && hosted == "unhosted" && *pinned == 0 && *bytes > 0
             }),
         );
         check(&mut ok, CHURN_REQUEST, completed);
@@ -2807,7 +2842,60 @@ mod gate {
             CHURN_VICTIMS,
             rereads.saturating_add(unresident) > 0 && !refused,
         );
+        churn_unset_climbs(dir, &room, &mut ok)?;
         Ok(ok)
+    }
+
+    /// The unset word on the unhosted-pool clause's room ([`ChurnRoom::room`]:
+    /// the plan's need and half the pool), a plan-only server: the pool does
+    /// not fit, so the `residency unset` record names the climb (`p0→p<q>`,
+    /// the first P whose pool fits), and the `residency host` record carries
+    /// the climbed word at `pinned=<q>` with the pool hosted, whatever the
+    /// body carries ([`CHURN_CLIMBS`]). FAIL-first: an unset word that keeps
+    /// P 0 with the pool unhosted prints `p0` kept and `hosted=unhosted`.
+    fn churn_unset_climbs(dir: &Path, room: &ChurnRoom, ok: &mut bool) -> Result<(), GateError> {
+        let log = match churn_plan_only(&dir.join("churn-climbs"), room.room())? {
+            Ok((_, log)) => log,
+            Err(why) => {
+                println!("churn-unset-climbs: {why}");
+                check(ok, CHURN_CLIMBS, false);
+                return Ok(());
+            }
+        };
+        let why = log
+            .first(&record::RESIDENCY_UNSET)?
+            .map(|u| u.text("why").map(str::to_owned))
+            .transpose()?;
+        let host = log
+            .first(&record::RESIDENCY_HOST)?
+            .map(|h| -> Result<(String, String, u64), ReadError> {
+                Ok((
+                    h.word("residency")?.to_owned(),
+                    h.word("hosted")?.to_owned(),
+                    h.u64("pinned")?,
+                ))
+            })
+            .transpose()?;
+        println!("churn-unset-climbs: residency unset why {why:?}, residency host {host:?}");
+        // `unset: p0→p<q> (host: the churn pool did not fit, raised)`.
+        let climbed = why.as_deref().and_then(|w| {
+            let q = w.strip_prefix("unset: p0→p")?;
+            let (q, rest) = q.split_once(' ')?;
+            (rest == "(host: the churn pool did not fit, raised)")
+                .then(|| q.parse::<u64>().ok())
+                .flatten()
+        });
+        check(
+            ok,
+            CHURN_CLIMBS,
+            climbed.is_some_and(|q| {
+                q > 0
+                    && host.as_ref().is_some_and(|(word, hosted, pinned)| {
+                        hosted == "hosted" && *pinned == q && *word == format!("mid-p{q}-s1")
+                    })
+            }),
+        );
+        Ok(())
     }
 
     /// The drafted clauses beside the slots clause's pair, on its server

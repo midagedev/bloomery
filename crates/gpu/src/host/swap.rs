@@ -226,11 +226,30 @@ pub enum Residency {
 impl Residency {
     /// `v` as a value of [`RESIDENCY`], in the lever's grammar
     /// ([`bloomery_levers::residency_word`]: `off`, or `mid-p<P>-s<S>`, `S` at
-    /// least 1). Anything else is refused by name.
+    /// least 1), for a load that hosts every churn pool it runs. Anything
+    /// else is refused by name, a word that asks for its pool unhosted
+    /// ([`bloomery_levers::UNHOSTED_SUFFIX`]) included: a load that carries
+    /// one reads it with [`Residency::parse_asking`].
     pub fn parse(v: &str) -> Result<Residency, GpuError> {
+        if let Some(bloomery_levers::ResidencyWord::Mid { unhosted: true, .. }) =
+            bloomery_levers::residency_word(v)
+        {
+            return Err(GpuError::shape(
+                "Residency::parse",
+                bloomery_levers::unhosted_refusal(v),
+            ));
+        }
+        Residency::parse_asking(v)
+    }
+
+    /// [`Residency::parse`] for a load that carries an unhosted pool: the
+    /// word's [`bloomery_levers::UNHOSTED_SUFFIX`], which asks for it, is
+    /// taken and read again by the load's own rule
+    /// (`bloomery_levers::room_for`).
+    pub fn parse_asking(v: &str) -> Result<Residency, GpuError> {
         match bloomery_levers::residency_word(v) {
             Some(bloomery_levers::ResidencyWord::Off) => Ok(Residency::Off),
-            Some(bloomery_levers::ResidencyWord::Mid { pinned, spares }) => {
+            Some(bloomery_levers::ResidencyWord::Mid { pinned, spares, .. }) => {
                 Ok(Residency::Mid { pinned, spares })
             }
             None => Err(GpuError::shape(
@@ -4295,7 +4314,8 @@ mod tests {
 
     /// The parse takes exactly what the lever's grammar takes
     /// (`bloomery_levers::residency_word`, the one owner), with the same
-    /// numbers. Mutant: a parse of its own that drifts from the lever's.
+    /// numbers; the suffix only where the load carries an unhosted pool.
+    /// Mutant: a parse of its own that drifts from the lever's.
     #[test]
     fn parse_is_the_levers_grammar() {
         for v in [
@@ -4311,13 +4331,33 @@ mod tests {
             "mid-p04-s1",
             "mid-p4-s1x",
             "mid-p+4-s1",
+            "mid-p0-s1-unhosted",
+            "off-unhosted",
         ] {
             assert_eq!(
-                Residency::parse(v).is_ok(),
+                Residency::parse_asking(v).is_ok(),
                 bloomery_levers::residency_word(v).is_some(),
                 "{v:?}"
             );
         }
+        // A load that hosts every pool refuses the suffix by name, and one
+        // that carries an unhosted pool takes it.
+        let e = Residency::parse("mid-p0-s1-unhosted").expect_err("a body that hosts");
+        assert!(
+            e.to_string()
+                .contains("-unhosted asks to keep the churn pool")
+        );
+        assert_eq!(
+            Residency::parse_asking("mid-p0-s1-unhosted").ok(),
+            Some(Residency::Mid {
+                pinned: 0,
+                spares: 1
+            })
+        );
+        assert_eq!(
+            Residency::parse("mid-p0-s1").ok(),
+            Residency::parse_asking("mid-p0-s1").ok()
+        );
         assert_eq!(
             Residency::parse("mid-p40-s2").ok(),
             Some(Residency::Mid {

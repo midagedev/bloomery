@@ -16,7 +16,8 @@ use crate::record::{self, Record};
 use crate::residency::PlanRoom;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_levers::{
-    ChurnHosting, RESIDENCY38_SPARES, Residency38Pick, UnhostedPool, residency38_at_plan,
+    ChurnHosting, RESIDENCY38_SPARES, Residency38Pick, Residency38Why, ResidencyWord, Room,
+    UnhostedPool, residency_word, residency38_at_plan, room_for,
 };
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::TierBatchBytes;
@@ -207,12 +208,15 @@ pub enum Lever38<'a> {
 }
 
 /// The residency a load of `plan` runs under `lever`, and whether the load
-/// hosts its churn pool: a set word as given, hosted; unset, the rule's
-/// before the plan or on plan (a) from it under the loading body's capability (`carry`)
-/// (`residency38_at_plan`: P 0, its pool unhosted where it fits neither the
-/// plan's host headroom nor `MemAvailable`, `off` with why where the card
-/// slots leave no room) — its `residency unset` record handed to `emit`, the
-/// hosting the pick's ([`Residency38Pick::pool`]), which the load takes.
+/// hosts its churn pool: a set word as given, hosted unless it asks for its
+/// pool unhosted ([`set_hosting`]); unset, the rule's before the plan or on
+/// plan (a) from it (`residency38_at_plan`: P 0, the first P whose pool fits
+/// the plan's host headroom and `MemAvailable` where P 0 does not, `off` with
+/// why where the card slots leave no room), always hosted — its
+/// `residency unset` record handed to `emit`, the hosting the pick's
+/// ([`Residency38Pick::pool`]), which the load takes. `carry` is the loading
+/// body's capability: a word that asks for its pool unhosted is refused by
+/// name where the body hosts every pool it runs.
 /// Under `mid`, the `residency host` record of `plan` follows: the churn
 /// pool (card [`CARD38`]'s experts past the pinned ones) the load's host set
 /// holds beside the plan's host segments, which the load refuses by name for
@@ -229,7 +233,7 @@ pub fn residency38(
         "residency38::residency38",
     );
     let (residency, word, hosting) = match lever {
-        Lever38::Set(r, word) => (r, word.to_owned(), ChurnHosting::Hosted),
+        Lever38::Set(r, word) => (r, word.to_owned(), set_hosting(carry, plan, word)?),
         Lever38::Unset(pre) => {
             let pick = match pre {
                 Some(off) => off,
@@ -263,6 +267,53 @@ pub fn residency38(
     };
     residency_set(plan, CARD38, residency, hosting, &word, 0, emit)?;
     Ok((residency, hosting))
+}
+
+/// The hosting a set `word` asks of a load of `plan`: hosted, or unhosted
+/// where it ends in [`bloomery_levers::UNHOSTED_SUFFIX`] — the word's room
+/// read by `room_for` as asked: its P kept with the pool left out, whether or
+/// not the pool fits ([`Room::Unhosted`]). Refused by name where the body
+/// hosts every pool it runs (`carry`) or the card slots do not hold the
+/// word's P.
+fn set_hosting(
+    carry: UnhostedPool,
+    plan: &Plan<'_>,
+    word: &str,
+) -> Result<ChurnHosting, GateError> {
+    let Some(ResidencyWord::Mid {
+        pinned,
+        spares,
+        unhosted: true,
+    }) = residency_word(word)
+    else {
+        return Ok(ChurnHosting::Hosted);
+    };
+    if let Some(refusal) = carry.refuse(word) {
+        return Err(refusal.into());
+    }
+    let room = PlanRoom::new(plan, CARD38, 0);
+    let asked = room_for(
+        carry.takes(true),
+        pinned,
+        spares,
+        room.card_experts(),
+        |p| room.pool_bytes(p),
+        room.headroom(),
+        room.mem_left()?,
+    )
+    .map_err(|e| format!("BLOOMERY_RESIDENCY={word}: the churn pool: {e}"))?;
+    match asked {
+        Room::Unhosted { pinned: p, pool } if p == pinned => Ok(Residency38Pick {
+            pinned: Some(p),
+            why: Residency38Why::Unhosted(pool),
+        }
+        .pool()),
+        room => Err(format!(
+            "BLOOMERY_RESIDENCY={word}: the plan's card slots do not hold p{pinned}, {spares} \
+             spare and one that moves ({room:?})"
+        )
+        .into()),
+    }
 }
 
 /// A load of `plan` under `residency`, the word `word` names, whatever the
