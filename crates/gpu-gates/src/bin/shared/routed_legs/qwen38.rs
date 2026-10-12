@@ -1,0 +1,276 @@
+//! qwen4exp (Qwen3.8): the two `--place`-unset production defaults that
+//! plan a qwen4exp file, as `generate_qwen3moe` and the Qwen3.8 serve seat
+//! call the planner. The unset placement is the family's common rule
+//! (`q38place::choose` by `Q38_RULE`, the tier count asked of the offer's
+//! plan — a question the gate's one-card census never reaches, the offer
+//! being `a` alone). The plan is `PlanInputs::plan_with_slots` under
+//! [`Experts::Card`] (`BLOOMERY_QWEN38_EXPERTS` unset) on the machine the
+//! load lays out: the CLI's at the CLI's 4096 for one sequence with no
+//! checkpoints (`machine38`'s one-card arm), the seat's at the context its
+//! `--ctx` search answers (`default_slot_ctx` at the seat's own base and
+//! step over the plans' expert bytes) for two slots whose checkpoints are
+//! priced (`checkpoint_price38` of the file's delta layers) and reserved.
+//! Drafts are off in both (the draft levers unset).
+
+use super::q38place;
+use super::{Adapter, Arm, Outcome, outcome_of, view_of};
+use bloomery_gpu::GpuError;
+use bloomery_gpu::arch::qwen3moe::checkpoint_price38;
+use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
+use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::gpu_census;
+use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
+use gguf::Split;
+use model::arch::models::Mixer;
+use model::arch::qwen35moe::place::{
+    Experts, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
+};
+use model::placement::ctx::{ExpertBytes, default_slot_ctx};
+use model::placement::workstation::MARGIN;
+use model::placement::{Machine, Plan, PlanLevers};
+
+/// The CLI's default context (`generate_qwen3moe`'s `--ctx` unset).
+const CLI_CTX: usize = 4096;
+
+/// The seat's context rule (`serve_seats/qwen38.rs`'s own constants): a
+/// slot's base context and the step the answer moves in.
+const SEAT_CTX: usize = 4096;
+const SEAT_CTX_STEP: usize = 256;
+
+/// The serve seat's resident sequences, `--parallel` unset.
+const SERVE_PARALLEL: usize = 2;
+
+/// The family's adapter, one row of the gate's dispatch.
+pub(super) struct ADAPTER;
+
+impl Adapter for ADAPTER {
+    fn name(&self) -> &'static str {
+        "qwen38"
+    }
+
+    fn arms(&self, split: &Split) -> Vec<Result<Arm, Outcome>> {
+        vec![cli_arm(split), serve_arm(split)]
+    }
+}
+
+/// The CLI's default: the unset placement by the family's rule, the plan of
+/// one sequence at the CLI's 4096.
+fn cli_arm(split: &Split) -> Result<Arm, Outcome> {
+    let ctx = u64::try_from(CLI_CTX).expect("the CLI's context is a u64");
+    let ub = ub_of(CLI_CTX)?;
+    let place = choose(split, ctx, Seqs::none(1))?;
+    let inputs = describe(split)?;
+    let machine = machine(place, &inputs, (ctx, ub), Seqs::none(1))?;
+    let unbudgeted = planned(&inputs, &machine, ctx, &PlanLevers::default(), 1);
+    Ok(Arm {
+        name: "cli",
+        whole: false,
+        unbudgeted: Some(unbudgeted),
+        placed: Box::new(move |levers| planned(&inputs, &machine, ctx, levers, 1)),
+    })
+}
+
+/// The serve seat's default: the unset placement by the family's rule, its
+/// `--ctx` search over the plans' expert bytes for two checkpointing slots,
+/// then the load's plan at the context it answered.
+fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
+    let inputs = describe(split)?;
+    let seqs = seqs38(&inputs, SERVE_PARALLEL);
+    let ctx = u64::try_from(SEAT_CTX).expect("the seat's base context is a u64");
+    let place = choose(split, ctx, seqs)?;
+    // The seat's search: `serve_ctx`'s cap, the seat's base and step, the
+    // margin over the plans' card expert bytes.
+    let cap = usize::try_from(serve_ctx(1, &inputs.hp).map_err(|e| outcome_of(&e))?)
+        .map_err(|e| Outcome::Red(format!("the file's serving cap: {e}")))?;
+    let found = default_slot_ctx(cap, SEAT_CTX, SEAT_CTX_STEP, MARGIN, &|c| {
+        probe(&inputs, place, seqs, c)
+    })
+    .map_err(|refused| outcome_of(refused.source.as_ref()))?;
+    let ctx =
+        u64::try_from(found.ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?;
+    let ub = ub_of(found.ctx)?;
+    let machine = machine(place, &inputs, (ctx, ub), seqs)?;
+    let unbudgeted = planned(
+        &inputs,
+        &machine,
+        ctx,
+        &PlanLevers::default(),
+        SERVE_PARALLEL,
+    );
+    Ok(Arm {
+        name: "serve",
+        whole: false,
+        unbudgeted: Some(unbudgeted),
+        placed: Box::new(move |levers| planned(&inputs, &machine, ctx, levers, SERVE_PARALLEL)),
+    })
+}
+
+/// One probe of the seat's `--ctx` search: the plan at a slot context `c`
+/// and its routed-expert bytes, the search's term.
+fn probe(
+    inputs: &PlanInputs,
+    place: Place,
+    seqs: Seqs,
+    c: usize,
+) -> Result<ExpertBytes, GateError> {
+    let ctx = u64::try_from(c).expect("a context the search probed is a u64");
+    let ub = ub_of(c).map_err(text_of)?;
+    let machine = machine(place, inputs, (ctx, ub), seqs).map_err(text_of)?;
+    inputs
+        .plan_with_slots(
+            &machine,
+            ctx,
+            &PlanLevers::default(),
+            Experts::Card,
+            seqs.slots,
+        )
+        .map(expert_bytes_of)
+        .map_err(GateError::from)
+}
+
+/// The family's unset `--place` (`q38place::choose` by `Q38_RULE`): the
+/// cards' offer kept by the rule, the tier count asked of the offer's plan
+/// at the run's context — the CLI's plain plan (`Seqs::none` of its slots)
+/// or the seat's checkpointing ones. Under the gate's one-card census the
+/// offer is `a` alone and the question is never asked.
+fn choose(split: &Split, ctx: u64, seqs: Seqs) -> Result<Place, Outcome> {
+    let at = usize::try_from(ctx).expect("the run's context is a usize");
+    let ub = ub_of(at)?;
+    q38place::choose(
+        None,
+        &gpu_census::census().map_err(|e| outcome_of(e.as_ref()))?,
+        |offer| {
+            let inputs = describe(split).map_err(text_of)?;
+            let specs = offer.card_specs()?;
+            q38place::tier_experts(
+                &inputs,
+                (specs[0], specs[1]),
+                (ctx, ub),
+                Experts::Card,
+                &PlanLevers::default(),
+                // The default runs carry no MTP draft: the draft levers
+                // unset.
+                None,
+                seqs,
+            )
+        },
+    )
+    .map(|chosen| chosen.place)
+    .map_err(|e| outcome_of(e.as_ref()))
+}
+
+/// The file described by the family's reader (`PlanInputs::describe`, the
+/// host's room its own reading).
+fn describe(split: &Split) -> Result<PlanInputs, Outcome> {
+    PlanInputs::describe(split).map_err(|e| outcome_of(&e))
+}
+
+/// The ubatch a load of `ctx` positions runs (`ubatch_for`: the default
+/// size clipped to the cache).
+fn ub_of(ctx: usize) -> Result<u64, Outcome> {
+    ubatch_for(ctx)
+        .map_err(gpu_red)
+        .and_then(|ub| u64::try_from(ub).map_err(|e| Outcome::Red(format!("the ubatch: {e}"))))
+}
+
+/// The machine a qwen4exp plan runs on over `place`'s cards
+/// (`generate_qwen3moe`'s `machine38` and the seat's `Place38::machine`):
+/// the one-card plan (a)'s `machine_for_experts` under card experts, plan
+/// (b′)'s `machine_bp_on`, the host reserving what `seqs` pin
+/// (`reserve_checkpoints` at the context).
+fn machine(
+    place: Place,
+    inputs: &PlanInputs,
+    terms: (u64, u64),
+    seqs: Seqs,
+) -> Result<Machine, Outcome> {
+    let (ctx, ub) = terms;
+    let layers = inputs.spec.layers.len();
+    let mut machine = match place
+        .card_specs()
+        .map_err(|e| outcome_of(e.as_ref()))?
+        .as_slice()
+    {
+        &[stage] => machine_for_experts(stage, layers, ub, Experts::Card),
+        &[stage, tier] => {
+            machine_bp_on((stage, tier), layers, ub, None, tier_batch(&inputs.hp, ub))
+        }
+        cards => {
+            return Err(Outcome::Red(format!(
+                "the placement {} names {} cards; a qwen4exp plan takes a stage and at most \
+                     one tier",
+                place.name(),
+                cards.len()
+            )));
+        }
+    };
+    reserve_checkpoints(&mut machine, seqs, ctx).map_err(|e| outcome_of(e.as_ref()))?;
+    Ok(machine)
+}
+
+/// The plan `levers` ask of `inputs` on `machine` for `slots` resident
+/// sequences, as the gate reads it.
+fn planned(
+    inputs: &PlanInputs,
+    machine: &Machine,
+    ctx: u64,
+    levers: &PlanLevers,
+    slots: usize,
+) -> Outcome {
+    match plan_of(inputs, machine, ctx, levers, slots) {
+        Ok(plan) => Outcome::Plan(view_of(&plan)),
+        Err(outcome) => outcome,
+    }
+}
+
+/// [`planned`]'s plan itself, where a caller reads its bytes.
+fn plan_of<'a>(
+    inputs: &'a PlanInputs,
+    machine: &'a Machine,
+    ctx: u64,
+    levers: &PlanLevers,
+    slots: usize,
+) -> Result<Plan<'a>, Outcome> {
+    inputs
+        .plan_with_slots(machine, ctx, levers, Experts::Card, slots)
+        .map_err(|e| outcome_of(&e))
+}
+
+/// A plan's routed-expert bytes, the `--ctx` search's probe term.
+fn expert_bytes_of(plan: Plan<'_>) -> ExpertBytes {
+    ExpertBytes {
+        card: plan.cards.first().map_or(0, |c| c.expert_bytes),
+        nvme: plan.host.nvme_expert_bytes,
+        arena: plan.host.nvme_arena_bytes,
+    }
+}
+
+/// An outcome's text, where a search probe or the placement rule reports it
+/// as an error the chain no longer types.
+fn text_of(outcome: Outcome) -> GateError {
+    match outcome {
+        Outcome::Red(text) => text.into(),
+        Outcome::Refused(r) => r.text.into(),
+        Outcome::Plan(_) => "a plan, where an error was read".into(),
+    }
+}
+
+/// The seat's resident sequences: every slot takes checkpoints, priced by
+/// the body's own derivation from the file's delta layers
+/// (`checkpoint_price38`).
+fn seqs38(inputs: &PlanInputs, slots: usize) -> Seqs {
+    let gdn = inputs
+        .spec
+        .layers
+        .iter()
+        .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
+        .count();
+    Seqs::priced(slots, checkpoint_price38(gdn))
+}
+
+/// A `GpuError` as a red outcome: the device census and the ubatch read
+/// are not planner refusals.
+fn gpu_red(e: GpuError) -> Outcome {
+    Outcome::Red(e.to_string())
+}

@@ -476,6 +476,10 @@ name = "gate_qwen3moe_types"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_routed_legs"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_mimo2_flash"
 required-features = ["gpu"]
 

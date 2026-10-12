@@ -1072,6 +1072,19 @@ gate-gpu-qwen3moe-e2e:
 gate-gpu-qwen3moe-types:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_types && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_types'
 
+# routed card layers vs the card leg, over the census stubs: every qwen family's --place-unset production defaults
+# (the CLI's and the serve seat's, per family) plan each set's header-only stub at derived card rooms (the floor of a
+# CardBudgetFloor refusal, then floor + f·E), and every layer a plan gives card experts must be one leg_runs runs for
+# the file's own architecture; one set per family is retyped through the sweep triples (127 headers: every T×T×T
+# of five types plus the two gate≠up mixed triples, the block-mis-dividing ones skipped by name) and planned the
+# same way. Plan only: no weight loaded, no card opened, no model file opened (the census manifest names the stubs, by
+# default tools/census/stubs.tsv under /models), so the fixture tier runs it as the real tier does. The gate runs on
+# the 3090 (gpu-gate.sh's default pin, lane A in a batch): the arms plan on the census they see, and an `any` run on
+# the A6000 would plan its bytes instead of the gate machine's. BLOOMERY_ROUTED_LEGS_ARGS (a box env) or the recipe's
+# ARGS carry the bin's --manifest/--root.
+gate-gpu-routed-legs *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_routed_legs && bash tools/gpu-gate.sh gate_routed_legs $BLOOMERY_ROUTED_LEGS_ARGS {{ARGS}}'
+
 # ik CPU의 greedy 연속(프롬프트 0–7, 32토큰)을 $BLOOMERY_DATA/qwen3moe/greedy/에. 프롬프트마다 CPU 임대를 잡는다.
 ik-greedy-qwen3moe:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'for p in 0 1 2 3 4 5 6 7; do GEN=32 PROMPT=$p bash tools/ref/ik-greedy.sh || exit $?; done'
