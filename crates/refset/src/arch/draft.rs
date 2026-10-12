@@ -29,7 +29,8 @@ use super::qwen4exp;
 pub enum DraftFrom {
     /// `BLOOMERY_MTP_DRAFT`.
     Lever,
-    /// The file of the row's draft name in the target's directory.
+    /// The file of the row's draft name in the target's directory, or in the
+    /// directory the target's symlinks resolve to.
     Beside,
     /// The row's path itself: the lever unset and no file of its name beside
     /// the target.
@@ -77,22 +78,34 @@ impl BesideDraft {
             .unwrap_or_else(|| panic!("the draft path {:?} names no file", self.path))
     }
 
-    /// The MTP draft file a run of `target` opens: `set` when given (the
-    /// lever, which its reading has proven a file); else the file of
-    /// [`BesideDraft::name`] in `target`'s directory, when one is there; else
-    /// [`BesideDraft::path`]. The family's identity stays the path whichever
-    /// the run opens: a set is checked against that path, never against this
-    /// one.
+    /// The MTP draft file a run of `target` opens, the first of:
+    ///
+    /// 1. `set`, when given (the lever, which its reading has proven a file);
+    /// 2. the file of [`BesideDraft::name`] in `target`'s directory, as the
+    ///    path spells it;
+    /// 3. the file of that name in the directory of `target` with its
+    ///    symlinks resolved, when that directory is another one: a shard
+    ///    reached through a symlink, or one a user linked by hand, keeps its
+    ///    draft beside the real file, not beside the link;
+    /// 4. [`BesideDraft::path`].
+    ///
+    /// The family's identity stays the path whichever the run opens: a set is
+    /// checked against that path, never against this one.
     #[must_use]
     pub fn pick(&self, set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
         if let Some(p) = set {
             return (p.to_path_buf(), DraftFrom::Lever);
         }
-        let beside = Path::new(self.path)
-            .file_name()
-            .zip(target.parent())
-            .map(|(name, dir)| dir.join(name))
-            .filter(|p| p.is_file());
+        let name = Path::new(self.path).file_name();
+        let named_in = |dir: &Path| name.map(|n| dir.join(n)).filter(|p| p.is_file());
+        let unresolved = target.parent();
+        let beside = unresolved.and_then(named_in).or_else(|| {
+            let resolved = target.canonicalize().ok()?;
+            resolved
+                .parent()
+                .filter(|dir| Some(*dir) != unresolved)
+                .and_then(named_in)
+        });
         match beside {
             Some(p) => (p, DraftFrom::Beside),
             None => (PathBuf::from(self.path), DraftFrom::Family),
@@ -199,5 +212,112 @@ mod tests {
                 r.arch
             );
         }
+    }
+
+    /// A row of this test's own, so no test depends on a path that exists.
+    const ROW: BesideDraft = BesideDraft {
+        arch: "test",
+        path: "/nowhere/mtp-linked-shard.gguf",
+    };
+
+    /// A directory of the test's own, removed when the test ends, passed or not.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("bloomery-beside-{test}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            Scratch(dir)
+        }
+
+        /// An empty file `name` in the subdirectory `dir`, made as needed.
+        fn file(&self, dir: &str, name: &str) -> PathBuf {
+            let d = self.0.join(dir);
+            std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
+            let p = d.join(name);
+            std::fs::write(&p, b"").unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            p
+        }
+
+        /// `links/<name>`, a symlink to `real`.
+        #[cfg(unix)]
+        fn link(&self, real: &Path) -> PathBuf {
+            let d = self.0.join("links");
+            std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
+            let p = d.join(real.file_name().expect("a shard names a file"));
+            std::os::unix::fs::symlink(real, &p)
+                .unwrap_or_else(|e| panic!("{} -> {}: {e}", p.display(), real.display()));
+            p
+        }
+
+        /// `dir`, with its symlinks resolved, as the run opens it.
+        fn real_dir(&self, dir: &str) -> PathBuf {
+            let d = self.0.join(dir);
+            d.canonicalize()
+                .unwrap_or_else(|e| panic!("{}: {e}", d.display()))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // A directory left behind is litter, not a result: the test's own
+            // assertions already said what they had to.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `-m` a symlink whose directory holds no draft: the draft beside the
+    /// real shard is the run's, as the real directory spells it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_target_finds_the_draft_beside_the_real_shard() {
+        let s = Scratch::new("link-real");
+        let shard = s.file("real", "shard-00001.gguf");
+        s.file("real", ROW.name());
+        let target = s.link(&shard);
+        assert_eq!(
+            ROW.pick(None, &target),
+            (s.real_dir("real").join(ROW.name()), DraftFrom::Beside)
+        );
+    }
+
+    /// A draft in the link's own directory is found first: the unresolved
+    /// directory is the user's word, the resolved one the fallback.
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_beside_the_link_wins_over_one_beside_the_real_shard() {
+        let s = Scratch::new("link-first");
+        let shard = s.file("real", "shard-00001.gguf");
+        s.file("real", ROW.name());
+        let beside_link = s.file("links", ROW.name());
+        let target = s.link(&shard);
+        assert_eq!(ROW.pick(None, &target), (beside_link, DraftFrom::Beside));
+    }
+
+    /// A symlink whose real directory holds no draft either is the family's
+    /// path.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_with_no_draft_beside_either_shard_is_the_family_path() {
+        let s = Scratch::new("link-none");
+        let shard = s.file("real", "shard-00001.gguf");
+        let target = s.link(&shard);
+        assert_eq!(
+            ROW.pick(None, &target),
+            (PathBuf::from(ROW.path), DraftFrom::Family)
+        );
+    }
+
+    /// A target that is no symlink and has no draft beside it is the family's
+    /// path, as before the resolved directory was looked at.
+    #[test]
+    fn a_plain_target_with_no_draft_beside_is_the_family_path() {
+        let s = Scratch::new("plain-none");
+        let target = s.file("only", "shard-00001.gguf");
+        assert_eq!(
+            ROW.pick(None, &target),
+            (PathBuf::from(ROW.path), DraftFrom::Family)
+        );
     }
 }
