@@ -15,20 +15,22 @@
 #   <D>       ours: generate_glm5next --tokens <D ids of GLM_PROSE from GLM_PROSE_FROM> -n N --ctx C --place
 #             PLACE --time. The prompt runs as the binary's --prefill default, its batches (the row's
 #             pp_tok/s `kind=` names the feed): D over the wall from the first fed position to the
-#             readback of generated token 0. The N - 1 steps after token 0 are timed. C is one context
-#             for every ours arm and every server arm (BLOOMERY_GEN_CTX, default 2048; docs/fair-measure.md
-#             1.5): the plan refuses more than the deepest context a reference set checks
-#             (place::ORACLE_POSITIONS, 16,384), and D + N <= C is checked before the lease. The binary
-#             takes no --arm list, so an ours arm's warm-up is a process of its own (WARMUP r0, below),
-#             not a same-id PRIME in its load. The prompt is prose under this model's own
+#             readback of generated token 0. The N - 1 steps after token 0 are timed. C is D + N
+#             rounded up to 256, an arm's own (depth-qwen3moe.sh's rule; docs/fair-measure.md 1.5): the
+#             row's `ctx=` names it. BLOOMERY_GEN_CTX fixes C for every ours arm and every server arm
+#             instead, e.g. at a serving height. The plan refuses more than the deepest context a
+#             reference set checks (place::ORACLE_POSITIONS, 16,384), and D + N <= C is checked before
+#             the lease. The binary takes no --arm list, so an ours arm's warm-up is a process of its own
+#             (WARMUP r0, below), not a same-id PRIME in its load. The prompt is prose under this model's own
 #             vocabulary (models/glm5next.sh GLM_PROSE, its sha256 checked before the lease): the D
 #             ids from 0-based index GLM_PROSE_FROM (models/glm5next.sh: past the ids the router set
 #             was traced from, docs/fair-measure.md 4.2). Each ours and server row prints
 #             `prompt ids <a>..<b>`.
 #   oursmtp:<D>  ours with the MTP draft: the same command under `env BLOOMERY_DRAFT=mtp`, its rows
 #             labelled `oursmtp`, its prompt row a prefill record under that label. A drafted arm takes
-#             one position more than ours, for the verify's last window: D + N + 1 <= C, checked before
-#             the lease. Before the lease the binary's `--levers` under BLOOMERY_DRAFT=mtp must pass (a
+#             one position more than ours, for the verify's last window: its C is D + N + 1 rounded up to
+#             256 (BLOOMERY_GEN_CTX fixes it as for ours) and D + N + 1 <= C is checked before the
+#             lease. Before the lease the binary's `--levers` under BLOOMERY_DRAFT=mtp must pass (a
 #             binary that does not act on the lever refuses it by name), and a BLOOMERY_DRAFT already set
 #             in the runner's environment is refused: the plain ours arms would draft too. Its greedy ids
 #             are the plain run's, so each row is held to ours' on the same ids and length as a server row
@@ -71,9 +73,10 @@
 #             lay, and the lever beside the draft, each a FAIL row here). It feeds N·D prose ids from
 #             GLM_PROSE_FROM — slot 0 holds exactly the D ids its plain twin feeds, slot j the next D — which
 #             the binary cuts into N windows, window j slot j's prompt call; each slot holds its window and the
-#             N - 1 ids after it at its own positions, so D + N <= C as for ours, and N·D ids past the prose
-#             file are refused before the lease. Its row reads the counted (`warm` left out) `time pass …
-#             kind=slots` records through records.py: `tok/s(aggregate) <Σ positions · 1000 / Σ ms> @
+#             N - 1 ids after it at its own positions, so its C is its twin's, D + N rounded up to 256 (not
+#             N·D: arm_ctx reads no slot count, as depth-qwen3moe.sh's), D + N <= C as for ours, and N·D ids
+#             past the prose file are refused before the lease. Its row reads the counted (`warm` left out)
+#             `time pass … kind=slots` records through records.py: `tok/s(aggregate) <Σ positions · 1000 / Σ ms> @
 #             n=N·<rounds>, depth D, <card>`, then `slots N`, the per stream rate and the SMOKE footer's p50
 #             and mean ms a pass; its pp column is slot 0's prompt call, its timed window every slot's prompt
 #             call and every round. The per-arm means hold it as `(aggregate of N slots)`; it stays out of the
@@ -121,9 +124,11 @@
 #             LCPP2775x_GPU_FLAGS in the server's spellings (that file's table, -fit off), its
 #             LCPP_SRV_FIXED (-np 1 -ctxcp 0 --cache-ram 0: without -ctxcp 0 this model's recurrent
 #             layers have the server copy their state to the host inside the prompt clock) and -c C,
-#             ours' --ctx; #27754's under LCPP27754_ENV; the MTP arm at GLM_NCMOE_MTP with GLM_MTP_FLAGS
+#             ours' --ctx at that D (or P): BLOOMERY_GEN_CTX, else D + N rounded up to 256 (a srvpp arm
+#             too: its P is the depth of the ours row it is ratioed against); #27754's under
+#             LCPP27754_ENV; the MTP arm at GLM_NCMOE_MTP with GLM_MTP_FLAGS
 #             (--spec-type draft-mtp --spec-draft-n-max 2) after them. A server arm whose ids + n_predict +
-#             1 pass C is refused before the lease, and a server whose log names another n_ctx is a FAIL
+#             1 pass its C is refused before the lease, and a server whose log names another n_ctx is a FAIL
 #             row. After /health answers, one POST /completion of ours' D prompt ids (from
 #             GLM_PROSE_FROM), so the draft sees prose, is sent and discarded (the warm-up,
 #             docs/fair-measure.md 2.1), then the same request is timed: greedy, ignore_eos, cache_prompt
@@ -236,7 +241,8 @@
 # with the list.
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (default 2), BLOOMERY_GEN_WARM
-# (--warm), BLOOMERY_GEN_CTX (C), BLOOMERY_GEN_BIN (default target/release/generate_glm5next),
+# (--warm), BLOOMERY_GEN_CTX (C for every ours and server arm; unset: D + N rounded up to 256 an arm,
+# above), BLOOMERY_GEN_BIN (default target/release/generate_glm5next),
 # BLOOMERY_GEN_PLACE (a, the default, needs the A6000 as the timing card; gate the 3090; bp the two-card
 # mode, BLOOMERY_TIMING_CARDS=a6000+3090: Placement and Two cards above),
 # BLOOMERY_GEN_PAIR (1 passes --pair to our arms; unset or empty passes nothing),
@@ -255,7 +261,7 @@ RECORDS="${BASH_SOURCE[0]%/*}/../bloomery/records.py"
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-2}
 WARM=${BLOOMERY_GEN_WARM:-}
-CTX=${BLOOMERY_GEN_CTX:-2048}
+GEN_CTX=${BLOOMERY_GEN_CTX:-}
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate_glm5next}
 PLACE=${BLOOMERY_GEN_PLACE:-a}
 PAIR=${BLOOMERY_GEN_PAIR:-}
@@ -271,9 +277,13 @@ DRY=${BLOOMERY_DRY:-}
 PROSE=$BLOOMERY_DATA/$GLM_PROSE
 PROSE_FROM=$GLM_PROSE_FROM
 case $PROSE_FROM in '' | *[!0-9]*) echo "depth-glm5next.sh: GLM_PROSE_FROM is an id count, got '$PROSE_FROM'" >&2; exit 64 ;; esac
-for v in N:$N ROUNDS:$ROUNDS CTX:$CTX BOUND:$BOUND; do
+for v in N:$N ROUNDS:$ROUNDS ${GEN_CTX:+"BLOOMERY_GEN_CTX:$GEN_CTX"} BOUND:$BOUND; do
   case ${v#*:} in '' | *[!0-9]* | 0*) echo "depth-glm5next.sh: ${v%%:*} is a positive integer, got '${v#*:}'" >&2; exit 64 ;; esac
 done
+# CTX_DERIVED: the server arm's refusal clause that says where a derived C comes from (empty under BLOOMERY_GEN_CTX,
+# where that refusal reads as it always did); depth-qwen3moe.sh's SRV_CTX_SRC words.
+CTX_DERIVED=''
+[ -n "$GEN_CTX" ] || CTX_DERIVED='D + N rounded up to 256, '
 case $PLACE in a | gate | bp) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_PLACE is a (the default), gate or bp (the two-card mode's), got '$PLACE'" >&2; exit 64 ;; esac
 case $PAIR in '' | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_PAIR is 1 or unset, got '$PAIR'" >&2; exit 64 ;; esac
 case $WARMUP in 0 | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_AB_WARMUP is 0 or 1, got '$WARMUP'" >&2; exit 64 ;; esac
@@ -289,6 +299,9 @@ A_ENG=() A_PP=() A_UB=() A_DEP=() A_LABEL=() A_ENV=()
 # An ours arm's placement (its place= item, else BLOOMERY_GEN_PLACE; empty for a reference arm) and whether
 # place= set it (1, or empty). A_ENV is the arm's list less its place= item: the variables its process gets.
 A_PLACE=() A_PLACE_SET=()
+# The context C each arm runs at (--ctx for ours and oursmtp, -c for a server arm; empty for the arms that take
+# none): ctx_for's value, read by every reader below through ${A_CTX[$i]}.
+A_CTX=()
 ours=0 ours_mtp=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0 levers=0
 usage() {
   echo "depth-glm5next.sh: arm '$1' is <D>[@NAME=VALUE,...], oursmtp:<D>[@NAME=VALUE,...], lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}[+t<N>][+nopo<0|1>][+k<K>]:<D>, lcpp2775{2,4}srvpp[<U>][+…]:<P>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
@@ -331,9 +344,14 @@ srv_glm() { case ${1%%+*} in lcpp2775[24]srv | lcpp2775[24]srvpp | lcpp2775[24]s
 fit_eng() { case $1 in lcpp2775[24]fit | lcpp2775[24]ppfit | lcpp2775[24]ppfit[1-9]*) return 0 ;; *) return 1 ;; esac; }
 # gpu_flags <engine>: the profile's llama-bench flags of that engine's branch.
 gpu_flags() { case $1 in lcpp27752*) echo "$LCPP27752_GPU_FLAGS" ;; *) echo "$LCPP27754_GPU_FLAGS" ;; esac; }
+# ctx_for <ids> <more>: the C of an arm that holds <ids> prompt ids and <more> positions past them: BLOOMERY_GEN_CTX
+# for every arm, else ids + more rounded up to 256 (depth-qwen3moe.sh's arm_ctx; docs/fair-measure.md 1.5).
+# ours takes <more> = N, oursmtp N + 1 (the verify's last window), a server arm N: ours' C at that D, a srvpp
+# arm's P included (the depth of the ours row its pp is ratioed against; its own ids + 1 + 1 fit it).
+ctx_for() { echo "${GEN_CTX:-$((($1 + $2 + 255) / 256 * 256))}"; }
 for a in "${ARMS[@]}"; do
   # `@` is ours only: split at it first, so a value with a `:` is not read as an engine's arm.
-  arm_head=${a%%@*} envs='' at='' aplace='' ASLOTS='' TWIN=''
+  arm_head=${a%%@*} envs='' at='' aplace='' ASLOTS='' TWIN='' actx=''
   eng=${arm_head%%:*} dep=${arm_head#*:} pp=0 ub=''
   [ "$arm_head" != "$eng" ] || { eng=ours dep=$arm_head; }
   if [ "$arm_head" != "$a" ]; then
@@ -370,12 +388,12 @@ for a in "${ARMS[@]}"; do
   fi
   case ${eng%%+*} in
     ours)
-      ours=1
-      [ "$dep" -ge 1 ] && [ $((dep + N)) -le "$CTX" ] || usage "$a" "ours needs 1 <= D and D + N <= C ($N + D against --ctx $CTX)"
+      ours=1 actx=$(ctx_for "$dep" "$N")
+      [ "$dep" -ge 1 ] && [ $((dep + N)) -le "$actx" ] || usage "$a" "ours needs 1 <= D and D + N <= C ($N + D against --ctx $actx)"
       ;;
     oursmtp)
-      ours=1 ours_mtp=1
-      [ "$dep" -ge 1 ] && [ $((dep + N + 1)) -le "$CTX" ] || usage "$a" "oursmtp needs 1 <= D and D + N + 1 <= C ($dep + $N + 1 = $((dep + N + 1)) against --ctx $CTX): the verify's last window takes one position past the N-th token"
+      ours=1 ours_mtp=1 actx=$(ctx_for "$dep" $((N + 1)))
+      [ "$dep" -ge 1 ] && [ $((dep + N + 1)) -le "$actx" ] || usage "$a" "oursmtp needs 1 <= D and D + N + 1 <= C ($dep + $N + 1 = $((dep + N + 1)) against --ctx $actx): the verify's last window takes one position past the N-th token"
       ;;
     lcpp27752 | lcpp27754) lcpp=1 ;;
     lcpp27752fit | lcpp27754fit) lcpp=1 ;;
@@ -388,7 +406,8 @@ for a in "${ARMS[@]}"; do
           ;;
       esac
       [ "$dep" -ge 1 ] || usage "$a" "a server arm feeds D >= 1 prose ids"
-      [ $((dep + np + 1)) -le "$CTX" ] || usage "$a" "the server's -c is ours' --ctx $CTX (docs/fair-measure.md 1.5), and $dep ids + n_predict $np + 1 take $((dep + np + 1)) positions; raise BLOOMERY_GEN_CTX"
+      actx=$(ctx_for "$dep" "$N")
+      [ $((dep + np + 1)) -le "$actx" ] || usage "$a" "the server's -c is ours' --ctx $actx (${CTX_DERIVED}docs/fair-measure.md 1.5), and $dep ids + n_predict $np + 1 take $((dep + np + 1)) positions; raise BLOOMERY_GEN_CTX"
       srv_mods_split "$eng"
       lcpp_srv_flags "$(srv_mods_apply "$(gpu_flags "$eng")" "$SRV_MODS")" || usage "$a" "$SRV_WHY"
       ;;
@@ -413,7 +432,7 @@ for a in "${ARMS[@]}"; do
     case $eng in lcpp27752*) fit27752=1 ;; *) fit27754=1 ;; esac
   fi
   case $eng in exl3*) ;; *) gguf=1 ;; esac
-  A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng${at:+@$at}") A_ENV+=("$envs")
+  A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng${at:+@$at}") A_ENV+=("$envs") A_CTX+=("$actx")
   case $eng in ours | oursmtp) A_PLACE+=("${aplace:-$PLACE}") A_PLACE_SET+=("${aplace:+1}") ;; *) A_PLACE+=('') A_PLACE_SET+=('') ;; esac
   [ -z "$ASLOTS" ] || slots_twin "$eng${at:+@$at}" "$at"
   A_SLOTS+=("$ASLOTS") A_TWIN+=("$TWIN")
@@ -423,6 +442,14 @@ if [ "$ours" = 1 ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
   echo "depth-glm5next.sh: BLOOMERY_DRAFT is set to '$BLOOMERY_DRAFT' in the runner's environment, so the plain ours arms would run it too; unset it (the oursmtp:<D> arm sets BLOOMERY_DRAFT=mtp for its own command)" >&2
   exit 64
 fi
+
+# What the run-wide lines (the [dry] head and the [config] ours line) print for C: the fixed value, else the rule
+# (the rows, the dry arm lines' commands and the refusals print an arm's own).
+CTX_RULE=$GEN_CTX
+[ -n "$GEN_CTX" ] || { CTX_RULE='D+N rounded up to 256'; [ "$ours_mtp" = 0 ] || CTX_RULE+=' (oursmtp: D+N+1)'; }
+# The server arms' dry and [config] clause for -c, up to the point the two lines differ (SRV_C_WORDS, then their own
+# closing).
+if [ -n "$GEN_CTX" ]; then SRV_C_WORDS="-c $GEN_CTX (ours' --ctx"; else SRV_C_WORDS="-c D + N rounded up to 256 (ours' --ctx at that D or P"; fi
 
 # The card pin, the witness, the other-card guard; this runner has the two-card mode (the header's Two
 # cards).
@@ -618,7 +645,7 @@ arm_cmd() {
   case ${eng%%+*} in
     ours | oursmtp)
       # An aggregate arm's N·D ids (arm_feed), which the binary cuts into N windows.
-      CMD=("$BIN" --tokens "$(prompt_ids "$(arm_feed "$i")" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
+      CMD=("$BIN" --tokens "$(prompt_ids "$(arm_feed "$i")" | paste -sd, -)" -n "$N" --ctx "${A_CTX[$i]}" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
       # A lever arm's variables, after oursmtp's draft.
       arm_envs "$i"
       [ ${#ARM_ENVS[@]} -eq 0 ] || CMD=("${ARM_ENVS[@]}" "${CMD[@]}")
@@ -649,9 +676,9 @@ arm_cmd() {
       lcpp_srv_flags "$flags"
       read -r -a words <<< "$SRV_FLAGS"
       case ${eng%%+*} in *mtp) read -r -a mtpw <<< "$GLM_MTP_FLAGS" && words+=("${mtpw[@]}") ;; esac
-      lcpp_srv_cmd "$server" "$MODEL" "$CTX" "${words[@]}"
+      lcpp_srv_cmd "$server" "$MODEL" "${A_CTX[$i]}" "${words[@]}"
       CMD=("${SRV_CMD[@]}")
-      LABEL_TEST="POST /completion: GLM_PROSE ids $PROSE_FROM..$((PROSE_FROM + dep - 1)), a discarded warm-up then the same timed, n_predict $SRV_NP, temperature 0, ignore_eos, -c $CTX (ours' --ctx)"
+      LABEL_TEST="POST /completion: GLM_PROSE ids $PROSE_FROM..$((PROSE_FROM + dep - 1)), a discarded warm-up then the same timed, n_predict $SRV_NP, temperature 0, ignore_eos, -c ${A_CTX[$i]} (ours' --ctx)"
       ;;
     lcpp*)
       # shellcheck disable=SC2206 # the profile's NAME=VALUE words
@@ -796,7 +823,7 @@ preheat_arm() {
 }
 
 if [ -n "$DRY" ]; then
-  echo "[dry] model=$MODEL n=$N rounds=$ROUNDS ctx=$CTX place=$PLACE warm=${WARM:-0} card=$CARD_NAME timing_gpu=$TIMING_GPU arm_bound=${BOUND}s warmup=$WARMUP cold_us=$COLD_US"
+  echo "[dry] model=$MODEL n=$N rounds=$ROUNDS ctx=$CTX_RULE place=$PLACE warm=${WARM:-0} card=$CARD_NAME timing_gpu=$TIMING_GPU arm_bound=${BOUND}s warmup=$WARMUP cold_us=$COLD_US"
   echo "[dry] ours: $BIN prose=$PROSE"
   [ -z "$PLACES_SET" ] || echo "[dry] placements: $(place_line "${PLACE_ARMS[@]}")"
   if [ -n "$TIMING_CARDS" ]; then
@@ -833,7 +860,7 @@ if [ -n "$DRY" ]; then
   else
     echo "[dry] preheat: off ($([ "$PREHEAT" = 0 ] && echo BLOOMERY_PREHEAT=0 || echo 'no GGUF arm'))"
   fi
-  [ "$srv" = 0 ] || echo "[dry] server arms: -c $CTX (ours' --ctx), a discarded request then the timed one; each row's first $XC_N ids held to ours' on the same ids (xcheck)"
+  [ "$srv" = 0 ] || echo "[dry] server arms: $SRV_C_WORDS), a discarded request then the timed one; each row's first $XC_N ids held to ours' on the same ids (xcheck)"
   [ "$gguf" = 0 ] || [ "$WARMUP" = 0 ] || echo "[dry] WARMUP r0: every ours and llama-bench arm once on its own ids, discarded, right before its round-1 row (a server arm's warm-up is its own discarded request)"
   for r in $(seq "$ROUNDS"); do
     o='' ; for i in $(order_of "$r" 0); do o+="${ARMS[$i]} "; done
@@ -918,8 +945,8 @@ srv_start_arm() {
   log=$(mktemp "${TMPDIR:-/tmp}/depth-glm5next-server.XXXXXX") || exit 2
   SRV_RUN_WHY='' SRV_FAIL_RC=0
   if ! lcpp_srv_start "$BOUND" "$log" ${SRV_ENVS[@]+"${SRV_ENVS[@]}"}; then
-    SRV_FAIL_RC=$SRV_RC SRV_RUN_WHY="-c $CTX (ours' --ctx): $SRV_WHY"
-  elif ! lcpp_srv_ctx_check "$log" "$CTX"; then
+    SRV_FAIL_RC=$SRV_RC SRV_RUN_WHY="-c ${A_CTX[$1]} (ours' --ctx): $SRV_WHY"
+  elif ! lcpp_srv_ctx_check "$log" "${A_CTX[$1]}"; then
     SRV_RUN_WHY=$SRV_WHY
   elif ! lcpp_srv_arm "$ids" "$SRV_NP" "$BOUND"; then
     SRV_RUN_WHY=$SRV_WHY
@@ -1013,7 +1040,12 @@ run_arm() {
       [ -n "$P50" ] && [ -n "$PP_N" ] || { fail_row "" "${r_tag#r}" "$i" 0 "no SMOKE or time prompt record" "$out"; return; }
       [ "$PLACE_RAN" = "${A_PLACE[$i]}" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its SMOKE names place=$PLACE_RAN; the runner passed --place ${A_PLACE[$i]}" "$out"; return; }
       # The context the servers are given is the one this load made (docs/fair-measure.md 1.5).
-      [ "$LCTX" = "$CTX" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its load record names ctx=${LCTX:-none}, and the server arms run at -c $CTX (BLOOMERY_GEN_CTX, ours' --ctx)" "$out"; return; }
+      if [ -n "$GEN_CTX" ]; then
+        why="the server arms run at -c $GEN_CTX (BLOOMERY_GEN_CTX, ours' --ctx)"
+      else
+        why="the runner passed --ctx ${A_CTX[$i]} (D + N rounded up to 256, oursmtp D + N + 1)"
+      fi
+      [ "$LCTX" = "${A_CTX[$i]}" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its load record names ctx=${LCTX:-none}, and $why" "$out"; return; }
       # The oursmtp row's draft fields: the mtp summary record, when the schema declares it (MTP_REC).
       local MK='' MP='' MQ='' MTP_COL='' mrec mlines
       if [ "$eng" = oursmtp ] && [ "$MTP_REC" = 1 ]; then
@@ -1082,9 +1114,9 @@ run_arm() {
         # The aggregate: Σ positions · 1000 / Σ ms over the counted rounds; the SMOKE footer's p50 and mean are
         # a round's, so 1000 / mean is one stream's rate.
         agg=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
-        echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | slots $nslots | tok/s(per stream, mean) $tps | p50 $P50 ms/pass | mean $MEAN ms/pass | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$RS_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        echo "$PTAG $r_tag $label d=$dep n=$N ctx=${A_CTX[$i]} | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | slots $nslots | tok/s(per stream, mean) $tps | p50 $P50 ms/pass | mean $MEAN ms/pass | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$RS_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
       else
-        echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$RS_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        echo "$PTAG $r_tag $label d=$dep n=$N ctx=${A_CTX[$i]} | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$RS_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
       fi
       [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
       # An aggregate row's record names its N (the means' `(aggregate of N slots)`).
@@ -1115,12 +1147,12 @@ run_arm() {
       prompt_col "$dep"
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
       if [ "${A_PP[$i]}" = 1 ]; then
-        echo "$PTAG $r_tag $label p=$dep n=0 | tok/s(pp) $prps @ n=0, prompt $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | warm-up $wtps tok/s(pp) majflt $WARM_FAULTS, continuation $SRV_SAME | -c $CTX | $BATCH$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        echo "$PTAG $r_tag $label p=$dep n=0 | tok/s(pp) $prps @ n=0, prompt $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | warm-up $wtps tok/s(pp) majflt $WARM_FAULTS, continuation $SRV_SAME | -c ${A_CTX[$i]} | $BATCH$MAJ_COL | wall $((t1 - t0))s$rowtags"
         [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
         pp_sums+=("$label|$dep|$r|$prps")
       else
         val=$(awk -v v="$SRV_PRED_TPS" 'BEGIN{printf "%.2f", v}')
-        echo "$PTAG $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | warm-up $wtps tok/s majflt $WARM_FAULTS, continuation $SRV_SAME | -c $CTX | prompt_n $SRV_PROMPT_N prompt tok/s $prps | draft_n $SRV_DRAFT_N draft_n_accepted $SRV_DRAFT_ACC | ${acc:-no draft acceptance line}$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        echo "$PTAG $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | warm-up $wtps tok/s majflt $WARM_FAULTS, continuation $SRV_SAME | -c ${A_CTX[$i]} | prompt_n $SRV_PROMPT_N prompt tok/s $prps | draft_n $SRV_DRAFT_N draft_n_accepted $SRV_DRAFT_ACC | ${acc:-no draft acceptance line}$MAJ_COL | wall $((t1 - t0))s$rowtags"
         [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
         sums+=("$label|$dep|$r|$val")
         pp_sums+=("$label|$dep|$r|$prps")
@@ -1262,7 +1294,7 @@ lease_take
 timing_cards_start
 [ -z "$TIMING_CARDS" ] || echo "[config] $(tc_config)"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS card=$CARD_NAME timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU arm_bound=${BOUND}s cold_us=$COLD_US"
-[ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE"
+[ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX_RULE --place $PLACE warm=${WARM:-0} prose=$PROSE"
 [ -z "$PLACES_SET" ] || echo "[config] placements: $(place_line "${PLACE_ARMS[@]}")"
 [ "$ours_mtp" = 0 ] || echo "[config] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; $MTP_NOTE"
 [ -z "$RS_NOTE" ] || echo "[config] residency: $RS_NOTE"
@@ -1273,7 +1305,7 @@ for e in 27752 27754; do
   lcpp_fit_flags "$(gpu_flags "lcpp$e")"
   echo "[config] lcpp${e}fit: flags=$FIT_FLAGS (llama-bench's fit places the model; dropped: $FIT_DROPPED; lcpp${e}ppfit<U>: -ub U -b max(U, 2048))"
 done
-[ "$srv" = 0 ] || echo "[config] server arms: the branch's bench flags in llama-server's spellings (lcpp-warm.sh) with $LCPP_SRV_FIXED, -c $CTX (ours' --ctx; a load record naming another ctx, or a server log naming another n_ctx, is a FAIL row), a discarded request then the timed one on ours' prose ids; MTP at --n-cpu-moe $GLM_NCMOE_MTP with $GLM_MTP_FLAGS; each row's first $XC_N ids held to ours' on the same ids (xcheck)"
+[ "$srv" = 0 ] || echo "[config] server arms: the branch's bench flags in llama-server's spellings (lcpp-warm.sh) with $LCPP_SRV_FIXED, $SRV_C_WORDS; a load record naming another ctx, or a server log naming another n_ctx, is a FAIL row), a discarded request then the timed one on ours' prose ids; MTP at --n-cpu-moe $GLM_NCMOE_MTP with $GLM_MTP_FLAGS; each row's first $XC_N ids held to ours' on the same ids (xcheck)"
 [ "$exl3" = 0 ] || echo "[config] exl3: $EXL3_MODEL ($EXL3_BPW bpw) flags=$EXL3_FLAGS, perf.py's defaults otherwise (cache 32768, chunk 4096)"
 echo "[config] arms=${ARMS[*]}"
 if [ -n "$PH_DIR" ]; then
