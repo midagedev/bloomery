@@ -132,6 +132,8 @@
 #                with its residency column; no ratio line and no xcheck line for it; rc 0.
 #   lever-levers a generate_glm5next whose --levers refuses BLOOMERY_R8 (STUB_GEN_REFUSE): 512@BLOOMERY_R8=off
 #                refused before the lease by name with the binary's line, rc 2, no row.
+#   lever-levers-mtp  the same for oursmtp:512@BLOOMERY_R8=off: the refusal names BLOOMERY_DRAFT=mtp before the arm's
+#                variable (the probe ran under both), rc 2, no row.
 # The aggregate arm (the runner's <D>@BLOOMERY_GEN_SLOTS=N; red on the runner before it, which reads the arm as a
 # plain lever arm):
 #   slots-env    BLOOMERY_GEN_SLOTS=2 in the runner's own environment: refused by name, rc 64, before any row.
@@ -1162,6 +1164,18 @@ PY
     want lever-levers "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
     want lever-levers "$tmp/tmp/stub-gen-env" 0 '.'; then
     pass lever-levers
+  fi
+
+  # The same refusal for an oursmtp arm: the probe's words are BLOOMERY_DRAFT=mtp and the arm's list, both of them.
+  L=$tmp/lever-levers-mtp.log
+  : > "$tmp/tmp/stub-gen-env"
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_REFUSE=BLOOMERY_R8 -- 512 oursmtp:512@BLOOMERY_R8=off
+  if [ "$RC" != 2 ]; then
+    fail lever-levers-mtp "rc $RC, want 2" "$L"
+  elif want lever-levers-mtp "$L" 1 '^depth-glm5next.sh: arm oursmtp:512@BLOOMERY_R8=off: target/release/generate_glm5next refuses BLOOMERY_DRAFT=mtp BLOOMERY_R8=off \(its --levers under them: Error: BLOOMERY_R8 is set, and generate_glm5next does not act on it \(stub\)\): the arm cannot run as written$' &&
+    want lever-levers-mtp "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
+    want lever-levers-mtp "$tmp/tmp/stub-gen-env" 0 '.'; then
+    pass lever-levers-mtp
   fi
 
   # The two-card mode (red on the runner before it, which has none: timing-card.sh refuses the mode and the

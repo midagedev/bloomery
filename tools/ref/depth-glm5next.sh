@@ -561,8 +561,8 @@ if [ "$levers" = 1 ] && [ -x "$BIN" ]; then
     arm_envs "$i"
     draft=()
     [ "${A_ENG[$i]}" = ours ] || draft=(BLOOMERY_DRAFT=mtp)
-    lv=$(env ${draft[@]+"${draft[@]}"} "${ARM_ENVS[@]}" "$BIN" --levers 2>&1) ||
-      check 2 "arm ${ARMS[$i]}: $BIN refuses ${draft[*]:+${draft[*]} }${ARM_ENVS[*]} (its --levers under them: ${lv##*$'\n'}): the arm cannot run as written"
+    lever_probe "$BIN" ${draft[@]+"${draft[@]}"} "${ARM_ENVS[@]}" ||
+      check 2 "arm ${ARMS[$i]}: $BIN refuses ${draft[*]:+${draft[*]} }${ARM_ENVS[*]} (its --levers under them: $LEVER_PROBE_WHY): the arm cannot run as written"
   done
 fi
 # The residency records (cold-blocks.sh's residency sums): G_RES 0 when generate_glm5next's checked-in

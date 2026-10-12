@@ -9,6 +9,11 @@
 #   LEVER_ARM_PASS     (optional) one NAME=VALUE item the runner consumes itself and the binary never sees
 #                      (depth-qwen3moe.sh's load driver's solo marker): skipped by the registry check
 # and defines arm_refuse <arm> <why>, which prints the refusal in the runner's shape and exits 64.
+#
+# The runner calls, once the lists are parsed and before the lease: lever_probe <bin> <NAME=VALUE>... (below)
+# for each distinct engine and list of its arms, and gets back rc 0, or rc 1 with LEVER_PROBE_WHY the binary's
+# last output line. The loop, the dedupe, the words it adds to the list (a BLOOMERY_DRAFT=mtp for a draft
+# engine's arm) and the message it checks with are the runner's.
 
 # lever_rows_py <registry.rs>: every row of the lever registry as `<name> <site>` — Parsed or Direct (a
 # lever), Retired, or Env (a runner's, a harness's or a path's own variable: the path() and runner()
@@ -94,4 +99,18 @@ arm_envs_ok() {
       *) arm_refuse "$a" "$name's row in $LEVER_REGISTRY is a Site::$site, which this runner does not know" ;;
     esac
   done
+}
+# lever_probe <bin> <NAME=VALUE>...: `env <words> <bin> --levers`, the binary's own check of the words it will
+# run under (it refuses a lever it does not act on and a value its kind does not take, --levers included).
+# Returns 0 when it passes. Returns 1 when it refuses, with LEVER_PROBE_WHY the binary's last output line (the
+# empty string when the binary printed none; empty again after a pass). The output of a pass is dropped.
+LEVER_PROBE_WHY=
+lever_probe() {
+  local bin=$1 out
+  shift
+  LEVER_PROBE_WHY=
+  out=$(env "$@" "$bin" --levers 2>&1) && return 0
+  # shellcheck disable=SC2034 # read by the runner that sources this file
+  LEVER_PROBE_WHY=${out##*$'\n'}
+  return 1
 }
