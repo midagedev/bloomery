@@ -91,8 +91,8 @@ use bloomery_gpu_gates::engine::AnyEngine;
 use bloomery_gpu_gates::nodes::count_kinds;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{
-    ExactRow, GreedyClass, GreedyRow, compare_forced, compare_forced_exact, compare_greedy,
-    exact_covers, read_exact, read_greedy, sigma_forced,
+    ExactRow, GreedyClass, GreedyRow, MARGIN_FLOOR, compare_forced, compare_forced_exact,
+    compare_greedy, exact_covers, read_exact, read_greedy, sigma_forced,
 };
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, ref_model_path};
@@ -111,18 +111,6 @@ const GEN: usize = 32;
 /// between prompts.
 #[cfg(feature = "gpu")]
 const CTX_MAX: usize = 256;
-
-/// PIN(2026-09-21): the reference top1-top2 margin below which a first
-/// difference is a near-tie re-lottery rather than a fault. Derivation: the
-/// A2t round measured the reference's own margin distribution over this set
-/// — 216 of 1056 margins under 0.5, 43 under 0.1 — and ik's CPU and CUDA
-/// backends disagree with each other on 2 of the 33 prompts (5 and 24),
-/// both inside this floor. 0.5 is also the floor `prompts.rs`'s own
-/// classifier tests are written around. It is a classification threshold,
-/// not a band: raising it hides faults, and it is the one number this gate
-/// owns. The forced arm applies the same floor to the exact margin.
-#[cfg(feature = "gpu")]
-const MARGIN_FLOOR: f32 = 0.5;
 
 /// The forced path: ik CUDA's greedy continuations, `GEN` wide.
 #[cfg(feature = "gpu")]

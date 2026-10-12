@@ -242,6 +242,24 @@ pub struct GreedyReport {
     pub n_diverged: usize,
 }
 
+/// The reference top1-top2 margin below which a first difference is a
+/// near-tie re-lottery rather than a fault: the floor the e2e gates pass to
+/// the comparers here as `margin_floor`, and the forced arm applies to the
+/// exact margin.
+///
+/// PIN(2026-09-21): the V4.1 gate's floor (`gate_e2e`). Derivation: the A2t
+/// round measured the reference's own margin distribution over that set —
+/// 216 of 1056 margins under 0.5, 43 under 0.1 — and ik's CPU and CUDA
+/// backends disagree with each other on 2 of the 33 prompts (5 and 24),
+/// both inside this floor. 0.5 is also the floor this file's own classifier
+/// tests are written around.
+/// PIN(2026-09-21): the V2-Lite gate's floor (`gate_qwen3moe_e2e`): a first
+/// difference where the reference's own top1-top2 margin is below this is a
+/// near-tie re-lottery, not a fault.
+///
+/// It is a classification threshold, not a band: raising it hides faults.
+pub const MARGIN_FLOOR: f32 = 0.5;
+
 /// Judge our greedy continuations against the reference, prompt by prompt.
 ///
 /// `ours[i]` is our continuation for `reference[i]`, indexed like
