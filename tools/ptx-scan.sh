@@ -379,7 +379,7 @@ if ! "$EXTRACT" --norm "$PTX" "$MODS" >"$MODS/list"; then
 fi
 sed 's/^/ptx-scan: /' "$MODS/list" >&2
 NMOD=$(grep -c '^mod[0-9]' "$MODS/list")
-# The version names the assembler the last four columns come from: a toolkit move changes them.
+# The version names the assembler the regs, smem, spill and blk/SM(static) columns come from: a toolkit move changes them.
 if [ -x "$PTXAS" ]; then
   PTXAS_VER=$("$PTXAS" --version 2>/dev/null | sed -n 's/.*, V\([0-9][0-9.]*\)$/\1/p')
   TOOLS="ptxas=$PTXAS ptxas-version=${PTXAS_VER:-unknown} arch=$ARCH"

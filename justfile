@@ -2003,8 +2003,9 @@ gate-gpu-p8b *ARGS:
 # PTX 스캔(계측기, 게이트 아님): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
 # 바이너리의 cargo 피처는 `--features`로 준다(기본 gpu). V4.1 게이트 바이너리는 `--features deepseek41`.
-# 끝의 두 열(jit_regs·jit_local)은 드라이버 JIT가 실제로 잡은 값이다. oxart_jit가 모듈을 카드에 올려 읽으므로
-# 게이트 락(tools/gpu-gate.sh) 아래서 돈다.
+# The jit_regs and jit_local columns are the values the driver JIT actually assigned; the ld.global.scalar, ld.global.v2 and
+# ld.global.v4 columns follow them. oxart_jit loads the modules onto the card to read them, so a full scan runs under the
+# gate lock (tools/gpu-gate.sh).
 # `--no-jit`: the driver JIT is not built or run, so the scan takes no card lock and waits on no landing batch's GPU hold.
 # The banner names `jit=skipped(no-jit)` and both JIT columns read `skipped(no-jit)`. The md5 block and the ptxas columns
 # are as in a full scan: that proves a move (`just affected --narrow` reads such a pair as identical or refuses it by name).
