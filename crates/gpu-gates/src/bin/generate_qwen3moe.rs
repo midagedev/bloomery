@@ -96,8 +96,9 @@
 //! plan with no host expert loads the whole model on the plan's card when the
 //! whole-fit verdict takes it, else the placed load with no host expert; any
 //! other runs the decode step (graph or eager) through the host tier's step
-//! port and the prompt as eager passes of up to eight ids through its batch
-//! port (`auto` and `pass`; `--prefill gemm` refused by name), and in graph
+//! port and the prompt through its batch port (`auto` as wide units of up to
+//! the load's ubatch size past eight ids, one pass up to eight; `pass` as eager
+//! passes of up to eight ids; `--prefill gemm` refused by name), and in graph
 //! mode captures the step only. Unset, the load is the whole-card one on
 //! `a`'s card, the largest visible card, while that fits the card's free
 //! bytes — the plan's own test of the whole file's card bytes plus its KV,
@@ -1911,7 +1912,7 @@ mod cli {
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
     /// (`generate::Place`), refused by name beside `--prefill gemm` — a
-    /// placed prompt runs as passes through the host tier's batch port. The
+    /// placed prompt runs through the host tier's batch port. The
     /// common unset rule (`Place::choose_untiered`) prints its
     /// `place unset` record, set or unset; the flag goes on as given, so an
     /// unset one loads the census pick (`q3place::open_unplaced_qwen3`).
@@ -1925,7 +1926,7 @@ mod cli {
                 if prefill == Some("gemm") {
                     return Err(format!(
                         "--prefill gemm beside --place {word}: a placed qwen3moe or qwen35moe \
-                         prompt runs as passes through the host tier (auto or pass)"
+                         prompt runs through the host tier's batch port (auto or pass)"
                     )
                     .into());
                 }

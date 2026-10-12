@@ -43,11 +43,11 @@
 //! whole-card load folds the shared expert into its stacks as one more
 //! expert, which a card holding part of a layer's experts cannot).
 //!
-//! A load whose arena holds more than [`GEMV_COLS`] rows (`Body35`'s, at
-//! the host union's [`PLACED_ROWS`]) reads each host expert once a unit; the
-//! walk of `Body`'s plain router stays within [`GEMV_COLS`] rows (the wide
-//! arm refuses a plain router by name). The wide arm's tables see the shared
-//! expert kept apart on every layer ([`apart_plans`]).
+//! A load whose arena holds more than [`GEMV_COLS`] rows (both bodies', at
+//! the host union's [`PLACED_ROWS`]) reads each host expert once a unit. The
+//! wide arm splits by the plan: the plain router (`Body`'s) runs no shared
+//! expert, the gated one (`Body35`'s) sees it kept apart on every layer
+//! ([`apart_plans`]).
 //!
 //! Numerics: the routing is the whole-card chain's bit for bit (the step's
 //! norm and router are `norm_quant` and the router, which the whole-card
@@ -65,7 +65,7 @@ use super::plan::{
 use super::program::{Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
 use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, arena_bytes, route_bytes};
-use crate::gemm::GemmRoute;
+use crate::gemm::{Gemm32Kernels, GemmRoute};
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
@@ -267,11 +267,15 @@ impl PlacedRows {
 }
 
 /// The kernels of the host leg: the handoff into the page, the K-quant
-/// family's gate·up, and this family's places and combine (`hostleg`).
+/// family's gate·up, and this family's places and combine (`hostleg`); and,
+/// on a side whose units run the wide arm (past [`GEMV_COLS`] rows), the
+/// kernels that build a layer's routed table through its map, which a K-quant
+/// chain's kernel set does not hold.
 pub(super) struct PlacedKernels {
     handoff: HandoffKernels,
     kquant: KquantKernels,
     leg: HostLegKernels,
+    g32: Option<Gemm32Kernels>,
 }
 
 /// What every placed walk reads besides the arena: each layer's card
@@ -375,7 +379,7 @@ pub(super) struct PlacedOpen<'a> {
     /// The architecture the host run's refusals name.
     pub(super) arch: &'static str,
     /// The most rows a prompt unit holds: the arena's, [`PLACED_ROWS`] on a
-    /// load that runs the wide arm, [`GEMV_COLS`] on a plain router's.
+    /// load that runs the wide arm.
     pub(super) rows: usize,
 }
 
@@ -485,6 +489,9 @@ impl Placed {
             handoff: HandoffKernels::load(ctx)?,
             kquant: KquantKernels::load(ctx, gpu.fault_word())?,
             leg: HostLegKernels::load(ctx)?,
+            g32: (o.rows > GEMV_COLS)
+                .then(|| Gemm32Kernels::load(ctx))
+                .transpose()?,
         };
         let placed = Placed {
             hybrid,
@@ -1225,7 +1232,11 @@ fn card_wide(
             "a table of the card's experts for every layer of a wide unit",
         ))?
         .as_mut();
-    wide::ffn_card(c, &c.p.ffn, s, m, Some(CardRoute { map, table }))
+    let remap = side.k.g32.as_ref().ok_or(GpuError::state(
+        WHAT,
+        "the remap kernels of a side whose units run the wide arm",
+    ))?;
+    wide::ffn_card(c, &c.p.ffn, s, m, Some(CardRoute { map, table, remap }))
 }
 
 /// What a placed walk reads and writes: the chain's context, its stores,
@@ -1534,6 +1545,7 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
                 sel: &p.rows.sel,
                 hsum: port.hsum(),
                 n_card: f.n_card,
+                leg: &p.side.k.leg,
             };
             return wide::ffn_combine(&lc, &lc.p.ffn, p.s, p.m, Some(host), None);
         }

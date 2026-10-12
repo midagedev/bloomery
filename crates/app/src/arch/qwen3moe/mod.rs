@@ -6,8 +6,9 @@
 //! rows.
 //!
 //! The plain attention body of a qwen3moe file ([`Body`]) sits behind the
-//! same traits: its prompt schedule ([`GEMM_FROM`]) and its keep rule (every
-//! held position — the caches are per-position). So does the Qwen3.6 body
+//! same traits: its prompt schedule ([`GEMM_FROM`]; wide units on a placed
+//! load) and its keep rule (every held position — the caches are
+//! per-position). So does the Qwen3.6 body
 //! of a qwen35moe file ([`Body35`]): the same schedule's wide half
 //! (`PrefillPath::Wide`) and the checkpoints' keep rule — the nearest
 //! checkpoint a marked prompt call took at or below the cut.
@@ -95,15 +96,15 @@ impl Prompt for Body {
     /// The GEMM ubatch walk from [`GEMM_FROM`] rows on, passes below (the
     /// `Auto` of a prompt shorter than one ubatch, resolved without the
     /// tail pass): the argmax after the last id. A placed load has no GEMM
-    /// walk — its prompt runs as passes through the host tier's batch port,
-    /// and `prefill_plan` refuses the walk by name — so it takes passes at
-    /// every length.
+    /// walk (`prefill_plan` refuses it by name): its prompt runs the wide
+    /// units through the host tier's batch port from [`GEMM_FROM`] rows on, as
+    /// [`Body35`]'s does, and passes below.
     fn prompt(m: &mut Qwen3moeModel, ids: &[u32]) -> Result<u32, GpuError> {
         let placed = m.body("app::Prompt for Body")?.placed().is_some();
-        let path = if ids.len() >= GEMM_FROM && !placed {
-            PrefillPath::Gemm
-        } else {
-            PrefillPath::Pass
+        let path = match (ids.len() >= GEMM_FROM, placed) {
+            (false, _) => PrefillPath::Pass,
+            (true, false) => PrefillPath::Gemm,
+            (true, true) => PrefillPath::Wide,
         };
         m.prefill_with(ids, path)
     }

@@ -6,7 +6,10 @@
 use super::dispatch::{self, PassCtx};
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
-use super::placed::{Placed, PlacedOpen, StepWalk, WalkParts, placed_bytes};
+use super::placed::{
+    PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, counted_arena, placed_bytes,
+    placed_scratch,
+};
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy, down_entry,
     gate_up_entry,
@@ -27,8 +30,7 @@ use crate::host::StepLeg;
 use crate::host::swap_source::ResidencyGlue;
 use crate::linear::LinearKernels;
 use crate::model::{
-    ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, RowHeads, SlotRange, SlotRows,
-    Slots, block_count,
+    ChainBody, GpuModel, Instrumented, Rollback, RowHeads, SlotRange, SlotRows, Slots, block_count,
 };
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
@@ -383,19 +385,11 @@ pub(super) fn f32_site(w: &Weights, name: &str, rows: usize, k: usize) -> Result
     }
 }
 
-/// Layer `l`'s plan: attention at head 128, eight routed experts, every
-/// weight checked against the shape and type its launch takes — the routed
-/// stacks only when `stacks` (a placed load's are its placed side's to
-/// check, `placed`).
-fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPlan, GpuError> {
-    let (h, q, kv, ff) = (
-        hp.n_embd,
-        hp.n_head * hp.head_dim,
-        hp.n_head_kv * hp.head_dim,
-        hp.experts.ff,
-    );
-    let e = hp.experts.n_expert;
-    let mut g = GqaPlan {
+/// Layer `l`'s attention at head 128 and its FFN of eight routed experts,
+/// every site's type the Q4_K placeholder until the load or the header sets
+/// it.
+fn parts_of(l: usize) -> (GqaPlan, FfnPlan) {
+    let g = GqaPlan {
         kind: GqaKind::Neox128,
         flash: Flash::Group,
         attn_norm: names::attn_norm(l),
@@ -410,11 +404,10 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPla
         v_ty: SiteTy::Q4K,
         o_ty: SiteTy::Q4K,
     };
-    let router = names::ffn_gate_inp(l);
-    let mut f = FfnPlan {
+    let f = FfnPlan {
         ffn_norm: names::ffn_norm(l),
         route: FfnRoute::Router {
-            gate_inp: router.clone(),
+            gate_inp: names::ffn_gate_inp(l),
             shared: None,
         },
         gate: names::ffn_gate_exps(l),
@@ -424,6 +417,23 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPla
         up_ty: SiteTy::Q4K,
         down_ty: SiteTy::Q4K,
     };
+    (g, f)
+}
+
+/// Layer `l`'s plan: attention at head 128, eight routed experts, every
+/// weight checked against the shape and type its launch takes — the routed
+/// stacks only when `stacks` (a placed load's are its placed side's to
+/// check, `placed`).
+fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPlan, GpuError> {
+    let (h, q, kv, ff) = (
+        hp.n_embd,
+        hp.n_head * hp.head_dim,
+        hp.n_head_kv * hp.head_dim,
+        hp.experts.ff,
+    );
+    let e = hp.experts.n_expert;
+    let (mut g, mut f) = parts_of(l);
+    let router = names::ffn_gate_inp(l);
     for (name, len) in [
         (&g.attn_norm, h),
         (&f.ffn_norm, h),
@@ -450,20 +460,98 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPla
     })
 }
 
+/// Layer `l`'s routed stacks' types, read from `file`'s header before any
+/// upload and held to the card kernel table's entries ([`stack_entries`]).
+fn header_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<[SiteTy; 3], GpuError> {
+    const WHAT_H: &str = "qwen3moe::Body::load";
+    let (h, ff, e) = (hp.n_embd, hp.experts.ff, hp.experts.n_expert);
+    let site = |name: String, shape| site::file_site(file, WHAT_H, &name, shape, SiteTy::ALL);
+    let tys = [
+        site(names::ffn_gate_exps(l), (e * ff, h))?,
+        site(names::ffn_up_exps(l), (e * ff, h))?,
+        site(names::ffn_down_exps(l), (e * h, ff))?,
+    ];
+    stack_entries(tys, l)?;
+    Ok(tys)
+}
+
+/// Layer `l`'s plan read from `file`'s header alone: the four attention
+/// sites' and the three routed stacks' types as the header holds them, which
+/// are the types [`resolve`] finds resident. A placed load plans its card
+/// bytes from it before any weight is uploaded
+/// ([`GpuModel::placed_arena_bytes`]) and its wide arm reads the stacks'
+/// types from it, the resident stacks being the card's part of them.
+fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
+    const WHAT_H: &str = "qwen3moe::Body::load";
+    let (h, q, kv) = (
+        hp.n_embd,
+        hp.n_head * hp.head_dim,
+        hp.n_head_kv * hp.head_dim,
+    );
+    let site = |name: &str, shape| site::file_site(file, WHAT_H, name, shape, SiteTy::ALL);
+    let (mut g, mut f) = parts_of(l);
+    g.q_ty = site(&g.attn_q, (q, h))?;
+    g.k_ty = site(&g.attn_k, (kv, h))?;
+    g.v_ty = site(&g.attn_v, (kv, h))?;
+    g.o_ty = site(&g.attn_output, (h, q))?;
+    [f.gate_ty, f.up_ty, f.down_ty] = header_stacks(file, hp, l)?;
+    Ok(LayerPlan {
+        mixer: MixerPlan::Gqa(g),
+        ffn: f,
+    })
+}
+
+/// A placed load's plans: [`resolve`]d against the resident weights, with the
+/// routed stacks' types the header's ([`header_plan`]); a layer whose
+/// resident attention sites are not the header's is refused by name, so the
+/// plan the card bytes were counted from is the plan the load runs.
+fn placed_plans(
+    file: &Split,
+    w: &Weights,
+    hp: &Hparams,
+    layers: Range<usize>,
+) -> Result<Vec<LayerPlan>, GpuError> {
+    layers
+        .map(|l| {
+            let mut plan = resolve(w, hp, l, false)?;
+            let header = header_plan(file, hp, l)?;
+            let (got, want) = (
+                plan.gqa("qwen3moe::Body::load", l)?,
+                header.gqa("qwen3moe::Body::load", l)?,
+            );
+            let tys = |g: &GqaPlan| [g.q_ty, g.k_ty, g.v_ty, g.o_ty];
+            if tys(got) != tys(want) {
+                return Err(GpuError::shape(
+                    "qwen3moe::Body::load",
+                    format!(
+                        "layer {l}'s attention sites are resident as {:?}, the file's header \
+                         holds {:?}",
+                        tys(got),
+                        tys(want)
+                    ),
+                ));
+            }
+            [plan.ffn.gate_ty, plan.ffn.up_ty, plan.ffn.down_ty] =
+                [header.ffn.gate_ty, header.ffn.up_ty, header.ffn.down_ty];
+            Ok(plan)
+        })
+        .collect()
+}
+
 /// Whether a launch of the chain over `plans` and the token embedding
 /// resident in `w` reaches [`Kernels::q35`]: an attention site that is not
 /// one of the fused Q4_K groups (`dispatch::site_gemv`: its gemv, and on the
 /// prompt's wide arm its GEMM and quantizers), or a Q8_0 embedding
 /// (`dispatch::embed_into`), or a routed stack whose launch is the K-quant
-/// `_sel` family's ([`FfnPlan::kq_sel`]: [`Q35Kernels::ffn`]). A chain of
-/// fused Q4_K and Q6_K sites over K-quant rows and Q4_K or Q6_K stacks
-/// launches none of them.
-fn needs_site_kernels(w: &Weights, plans: &[LayerPlan]) -> bool {
+/// `_sel` family's ([`FfnPlan::kq_sel`]: [`Q35Kernels::ffn`]; a placed load's
+/// routed launches are its placed side's). A chain of fused Q4_K and Q6_K
+/// sites over K-quant rows and Q4_K or Q6_K stacks launches none of them.
+fn needs_site_kernels(w: &Weights, plans: &[LayerPlan], placed: bool) -> bool {
     let fused = plans
         .iter()
         .all(|p| matches!(&p.mixer, MixerPlan::Gqa(g) if g.qkv_fused() && g.o_fused()));
     !fused
-        || plans.iter().any(|p| p.ffn.kq_sel())
+        || (!placed && plans.iter().any(|p| p.ffn.kq_sel()))
         || matches!(w.get(&token_embd()), Some(DevWeight::Q8_0 { .. }))
 }
 
@@ -556,7 +644,8 @@ pub struct OpenOpts {
     /// KV rows the caches hold.
     pub ctx: usize,
     /// Tokens per ubatch of the GEMM prefill ([`Ubatch`]); a size outside
-    /// the arena's range is refused at load.
+    /// the arena's range is refused at load. A placed load's ubatch is the
+    /// placed units' rows, whatever this asks ([`GpuModel::open_placed`]).
     pub ubatch: usize,
     /// The decode flash pass.
     pub flash: FlashKind,
@@ -615,10 +704,12 @@ impl GpuModel<Body> {
     /// layer's card experts), the host set read in and locked as `host`
     /// asks, and the body over them with its placed side ([`Placed`]) and
     /// caches of `opts.ctx` rows, the plan's context. Its prompt runs as
-    /// eager passes through the host tier's batch port, so its ubatch arena
-    /// holds one row. Refused by name as [`GpuModel::open`] refuses, for a
-    /// plan of another context, and as the placed side refuses
-    /// ([`Placed::new`]).
+    /// eager units through the host tier's batch port — passes of up to
+    /// [`crate::model::MAX_PASS_ROWS`] rows, or wide units of up to [`PLACED_ROWS`] — so its
+    /// ubatch arena holds that many rows whatever `opts.ubatch` asks, held to
+    /// the bytes the plan counts ([`GpuModel::placed_arena_bytes`]). Refused
+    /// by name as [`GpuModel::open`] refuses, for a plan of another context,
+    /// and as the placed side refuses ([`Placed::new`]).
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -658,7 +749,7 @@ impl GpuModel<Body> {
                     set,
                     glue: ResidencyGlue::off(),
                     arch: "qwen3moe",
-                    rows: MAX_PASS_ROWS,
+                    rows: PLACED_ROWS,
                 };
                 Body::load(
                     gpu,
@@ -666,7 +757,7 @@ impl GpuModel<Body> {
                     w,
                     0..n_layers,
                     opts.ctx,
-                    1,
+                    PLACED_ROWS,
                     mma,
                     opts.kv,
                     Some((open, counted)),
@@ -675,11 +766,13 @@ impl GpuModel<Body> {
         )
     }
 
-    /// The card bytes a placed load of `file` holds past the m = 1 scratch
-    /// for its placed side ([`placed_bytes`]), at caches of `ctx` rows: what
-    /// the plan's machine counts in the card's scratch
-    /// (`model::arch::qwen3moe::place::machine`), and what
-    /// [`GpuModel::open_placed`] refuses to pass.
+    /// The card bytes a placed load of `file` holds past the m = 1 scratch,
+    /// at caches of `ctx` rows: its ubatch arena at the placed units' rows
+    /// and its placed side ([`placed_scratch`]) — what the plan's machine
+    /// counts in the card's scratch (`model::arch::qwen3moe::place::machine`),
+    /// and what [`GpuModel::open_placed`] refuses to pass. The arena's forms
+    /// are read from the file's header plan ([`header_plan`]), the plan the
+    /// load runs.
     pub fn placed_arena_bytes(file: &Split, ctx: usize) -> Result<u64, GpuError> {
         let what = "qwen3moe GpuModel::placed_arena_bytes";
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(what, e))?;
@@ -692,7 +785,10 @@ impl GpuModel<Body> {
             router,
             ctx,
         );
-        placed_bytes(&dims, hp.n_layer, MAX_PASS_ROWS)
+        let plans = (0..hp.n_layer)
+            .map(|l| header_plan(file, &hp, l))
+            .collect::<Result<Vec<_>, _>>()?;
+        placed_scratch(&dims, plans.len(), Forms::of(&plans, &dims))
     }
 
     /// What a whole load of `file` ([`GpuModel::open`]) holds past its
@@ -706,15 +802,8 @@ impl GpuModel<Body> {
     pub fn whole_load(file: &Split) -> Result<WholeLoad, GpuError> {
         const WHAT: &str = "qwen3moe::Body::load";
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
-        let (h, ff, e) = (hp.n_embd, hp.experts.ff, hp.experts.n_expert);
-        let site = |name: String, shape| site::file_site(file, WHAT, &name, shape, SiteTy::ALL);
         for l in 0..hp.n_layer {
-            let tys = [
-                site(names::ffn_gate_exps(l), (e * ff, h))?,
-                site(names::ffn_up_exps(l), (e * ff, h))?,
-                site(names::ffn_down_exps(l), (e * h, ff))?,
-            ];
-            stack_entries(tys, l)?;
+            header_stacks(file, &hp, l)?;
         }
         Ok(WholeLoad::Unchecked)
     }
@@ -738,9 +827,11 @@ impl Body {
     /// The body over the resident weights `w` of `file`'s `layers` (every
     /// layer), with caches of `ctx_max` rows in the `kv` format, ubatches of
     /// `ubatch` tokens and the flash `mma`; on a placed load (`placed`: its
-    /// placed side's inputs and the bytes its plan counts for that side) the
-    /// routed stacks are the placed side's to check, and the side is built
-    /// ([`Placed::new`]), its bytes held to the plan's count first.
+    /// placed side's inputs and the bytes its plan counts for the ubatch arena
+    /// and that side) the routed stacks are the placed side's to check, their
+    /// types in the plans the header's ([`placed_plans`]), the arena held to
+    /// the plan's count with the side's bytes ([`counted_arena`]) and the side
+    /// built ([`Placed::new`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "the load's card, file, weights, layers, cache and format, ubatch and flash, and the placed side (rust-quality R8)"
@@ -771,10 +862,14 @@ impl Body {
         if ctx_max == 0 {
             return Err(GpuError::shape(what, "a cache of 0 rows"));
         }
-        let plans = layers
-            .clone()
-            .map(|l| resolve(w, &hp, l, placed.is_none()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let plans = if placed.is_some() {
+            placed_plans(file, w, &hp, layers.clone())?
+        } else {
+            layers
+                .clone()
+                .map(|l| resolve(w, &hp, l, true))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let dims = Dims::qwen3(
             hp.n_embd,
             hp.n_head,
@@ -787,26 +882,21 @@ impl Body {
         let kv = layers
             .map(|_| KvPlanes::new(stream, &dims, kv))
             .collect::<Result<Vec<_>, _>>()?;
-        let k = Kernels::load(gpu, needs_site_kernels(w, &plans))?;
+        let k = Kernels::load(gpu, needs_site_kernels(w, &plans, placed.is_some()))?;
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
-        let placed = match placed {
-            None => None,
+        let forms = Forms::of(&plans, &dims);
+        let (ub, placed) = match placed {
+            None => (Ubatch::new(stream, dims, ubatch, Q32::of(&plans))?, None),
             Some((open, counted)) => {
-                let side = placed_bytes(&dims, plans.len(), MAX_PASS_ROWS)?;
-                if side > counted {
-                    return Err(GpuError::shape(
-                        what,
-                        format!(
-                            "the placed side needs {side} card bytes; the plan counts {counted}"
-                        ),
-                    ));
-                }
-                Some(Placed::new(gpu, w, &plans, &dims, open)?)
+                let side = placed_bytes(&dims, plans.len(), open.rows)?;
+                let arena = counted_arena(stream, (dims, forms), ubatch, counted, side)?;
+                let ub = Ubatch::placed(stream, arena, ubatch)?;
+                (ub, Some(Placed::new(gpu, w, &plans, &dims, open)?))
             }
         };
         Ok(Body {
-            prefill: Prefill::new(stream, dims, Forms::of(&plans, &dims))?,
-            ub: Ubatch::new(stream, dims, ubatch, Q32::of(&plans))?,
+            prefill: Prefill::new(stream, dims, forms)?,
+            ub,
             rope: RopeRows::new(stream, &rope, HEAD, dims.ctx)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream, false)?,
