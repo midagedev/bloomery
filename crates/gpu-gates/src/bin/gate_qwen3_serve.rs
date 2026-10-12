@@ -651,8 +651,27 @@ mod gate {
         server_log(err_log, record::BLOOMERY_SERVE_QWEN3)
     }
 
-    /// The whole-number field ` name=…` of a record line; `None` when the
-    /// line carries none.
+    /// A seat's stderr `text`, read at `err_log` by the seat's record kinds;
+    /// its errors name the file, whose path carries the arm's directory.
+    fn seat_records(text: &str, err_log: &Path) -> record::Log {
+        record::Log::of(text, record::BLOOMERY_SERVE_QWEN3).named(err_log.display().to_string())
+    }
+
+    /// A record read as a clause's input: a read that fails (the record
+    /// absent, repeated or broken, a field of another type) prints its named
+    /// error and is `None`, which the clause's own checks hold red.
+    fn or_named<T>(read: Result<T, record::ReadError>) -> Option<T> {
+        read.inspect_err(|e| println!("{e}")).ok()
+    }
+
+    /// The whole-number field `name` of `rec`, [`or_named`]; `None` for a record
+    /// that was not read.
+    fn u64_of(rec: Option<&Fields>, name: &str) -> Option<u64> {
+        rec.and_then(|r| or_named(r.u64(name)))
+    }
+
+    /// The whole-number field ` name=…` of a `ctx` line, which no record kind
+    /// owns; `None` when the line carries none.
     fn field_u64(line: &str, name: &str) -> Option<u64> {
         line.split(&format!(" {name}="))
             .nth(1)?
@@ -683,22 +702,6 @@ mod gate {
                 Some((probes.parse().ok()?, censuses.parse().ok()?))
             })
             .collect()
-    }
-
-    /// The seat's `load` record's line (`load arch=…`, not the host tier's
-    /// `load host_tier …` a placed load prints before it) and the
-    /// `listening` record's line of a server's stderr, each empty when the
-    /// server printed none.
-    fn load_and_listening(log: &str) -> (&str, &str) {
-        let load = log
-            .lines()
-            .find(|l| l.starts_with("load arch="))
-            .unwrap_or("");
-        let listening = log
-            .lines()
-            .find(|l| l.contains(" listening on http://"))
-            .unwrap_or("");
-        (load, listening)
     }
 
     /// The default `ctx` line of a server's stderr
@@ -799,11 +802,17 @@ mod gate {
         if exited.is_none() {
             println!("{name}: server stopped: {}", s.stop()?);
         }
-        Ok(PlanRun { said, exited })
+        Ok(PlanRun {
+            name: name.to_owned(),
+            said,
+            exited,
+        })
     }
 
     /// What a `--plan` run printed and how it ended ([`plan_run`]).
     struct PlanRun {
+        /// The run's name, its directory under the gate's.
+        name: String,
         /// The server's stderr.
         said: String,
         /// Whether it exited zero on its own; `None` when it was still up
@@ -817,23 +826,30 @@ mod gate {
             ctx_line(&self.said).and_then(|l| field_u64(l, name))
         }
 
-        /// The `ctx_max` of the `plan` record.
+        /// The run's stderr by the seat's record kinds.
+        fn records(&self) -> record::Log {
+            record::Log::of(&self.said, record::BLOOMERY_SERVE_QWEN3)
+                .named(format!("{}'s stderr", self.name))
+        }
+
+        /// The `ctx_max` of the one `plan` record; a run with none, two or a
+        /// broken line prints that error and has none.
         fn ctx_max(&self) -> Option<u64> {
-            let plan =
-                record::Log::of(&self.said, record::BLOOMERY_SERVE_QWEN3).first(&record::PLAN38);
-            match plan {
-                Ok(Some(p)) => p.u64("ctx_max").ok(),
-                _ => None,
-            }
+            u64_of(
+                or_named(self.records().one(&record::PLAN38)).as_ref(),
+                "ctx_max",
+            )
         }
 
         /// Whether the run stopped as `--plan` says: exit 0 with no `load`
-        /// or `listening` record, the `ctx` line's total the `plan`
-        /// record's `ctx_max`.
+        /// or `listening` record (a line that opens one and does not read
+        /// whole counts as one), the `ctx` line's total the `plan` record's
+        /// `ctx_max`.
         fn stopped_with_its_plan(&self) -> bool {
             let total = self.ctx_field("total");
-            let loaded = self.said.lines().any(|l| l.starts_with("load arch="))
-                || self.said.contains(" listening on http://");
+            let records = self.records();
+            let loaded = or_named(records.first(&record::LOAD_QWEN3)).is_none_or(|l| l.is_some())
+                || or_named(records.first(&record::LISTENING_QWEN3)).is_none_or(|l| l.is_some());
             self.exited == Some(true) && total.is_some() && total == self.ctx_max() && !loaded
         }
     }
@@ -1821,9 +1837,19 @@ mod gate {
         let url = |p: &str| format!("http://{addr}{p}");
         // (v4) The load names the split and /props the slot ctx.
         let log = std::fs::read_to_string(&err_log)?;
-        let (load, _) = load_and_listening(&log);
-        let field = |name: &str| field_u64(load, name);
-        let plan = log.lines().find(|l| l.starts_with("plan ")).unwrap_or("");
+        let records = seat_records(&log, &err_log);
+        let load = or_named(records.one(&record::LOAD_QWEN3));
+        let field = |name: &str| u64_of(load.as_ref(), name);
+        // The placed arm's total is its one `plan` record's `ctx_max`, so
+        // the record is due there; the whole arm makes no plan of its own
+        // and prints one only for a placed load, but a line that opens one
+        // and does not read whole is no read on either arm (`None`, the
+        // split's check red).
+        let plan = or_named(match arm.total {
+            Total::Plan => records.one(&record::PLAN38).map(Some),
+            Total::Verdict { .. } => records.first(&record::PLAN38),
+        });
+        let plan_line = plan.as_ref().and_then(Option::as_ref).map(Fields::line);
         // The load's decision, printed: the whole-fit verdicts the seat ran
         // (one, at the total, when it made one) and its plan record.
         let verdicts: Vec<&str> = log
@@ -1831,7 +1857,7 @@ mod gate {
             .filter(|l| l.starts_with("whole fit at ctx "))
             .collect();
         println!(
-            "{}: {} whole-fit verdict(s) {verdicts:?}; plan record {plan:?}",
+            "{}: {} whole-fit verdict(s) {verdicts:?}; plan record {plan_line:?}",
             arm.dir,
             verdicts.len()
         );
@@ -1853,15 +1879,16 @@ mod gate {
                 );
                 said
             }
-            Total::Plan => field_u64(plan, "ctx_max"),
+            Total::Plan => u64_of(plan.as_ref().and_then(Option::as_ref), "ctx_max"),
         };
         let (st, body) = curl(&url("/props"), None, false)?;
         let props = json_of("/props", st, &body)?;
         let n_ctx = props["n_ctx"].as_u64().unwrap_or(u64::MAX);
         println!(
-            "{}: {load}; the total {total:?} ({:?}), props n_ctx {n_ctx}, record slots={:?} \
+            "{}: {:?}; the total {total:?} ({:?}), props n_ctx {n_ctx}, record slots={:?} \
              slot_ctx={:?}",
             arm.dir,
+            load.as_ref().map(Fields::line),
             arm.total,
             field("slots"),
             field("slot_ctx"),
@@ -1869,7 +1896,9 @@ mod gate {
         check(
             ok,
             &named("slots_load_names_the_split"),
-            field("slots") == Some(2) && total.is_some_and(|t| field("slot_ctx") == Some(t / 2)),
+            plan.is_some()
+                && field("slots") == Some(2)
+                && total.is_some_and(|t| field("slot_ctx") == Some(t / 2)),
         );
         check(
             ok,
@@ -2347,15 +2376,17 @@ mod gate {
         dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
-        let log = std::fs::read_to_string(dir.join(PLACED_SLOTS.dir).join("server.err"))
-            .unwrap_or_default();
-        let plan = log.lines().find(|l| l.starts_with("plan ")).unwrap_or("");
+        let err_log = dir.join(PLACED_SLOTS.dir).join("server.err");
+        let log =
+            std::fs::read_to_string(&err_log).map_err(|e| format!("{}: {e}", err_log.display()))?;
+        let records = seat_records(&log, &err_log);
+        let plan = or_named(records.one(&record::PLAN38));
         let (host, card, total) = (
-            field_u64(plan, "host_experts"),
-            field_u64(plan, "card_experts"),
-            field_u64(plan, "ctx_max"),
+            u64_of(plan.as_ref(), "host_experts"),
+            u64_of(plan.as_ref(), "card_experts"),
+            u64_of(plan.as_ref(), "ctx_max"),
         );
-        let (load, _) = load_and_listening(&log);
+        let load = or_named(records.one(&record::LOAD_QWEN3));
         // `placed slots: N sequences of S rows hold H B of cache; the plan
         // at T positions counts K B`, then ` (its KV term V B and its
         // resident slots reserve R B)` where R is not 0
@@ -2377,7 +2408,7 @@ mod gate {
         println!(
             "placed slots: plan host_experts {host:?} card_experts {card:?} ctx_max {total:?}; \
              load resident_bytes {:?}; cache line {line:?}",
-            field_u64(load, "resident_bytes")
+            u64_of(load.as_ref(), "resident_bytes")
         );
         check(
             ok,
@@ -2528,10 +2559,10 @@ mod gate {
         let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
         let url = |p: &str| format!("http://{addr}{p}");
         let log = std::fs::read_to_string(&err_log)?;
-        let host = log
-            .lines()
-            .find(|l| l.starts_with("plan "))
-            .and_then(|l| field_u64(l, "host_experts"));
+        let host = u64_of(
+            or_named(seat_records(&log, &err_log).one(&record::PLAN38)).as_ref(),
+            "host_experts",
+        );
         let ids = tokenized(&url, PROSE)?;
         let body = json!({
             "prompt": ids, "n_predict": N, "temperature": 0,
