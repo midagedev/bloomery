@@ -674,14 +674,28 @@ fn target_tensors(
 }
 
 /// Cut `tensors` into shards of at most `cap` data bytes each (a larger
-/// tensor alone), named after `stem`, and set the split keys.
+/// tensor alone), named after `stem`, and set the split keys. An unsplit
+/// source (one file, no `split.*` key) gets the keys llama.cpp's splitter
+/// adds after a file's own (ik examples/gguf-split/gguf-split.cpp:244-248:
+/// `split.no` and `split.count` as u16, `split.tensors.count` as i32); a
+/// source with some of the three but not all is refused by name.
 fn shard(
     stem: &str,
     mut kvs: Vec<(String, Value)>,
-    split_keys: Vec<(String, Value)>,
+    mut split_keys: Vec<(String, Value)>,
     tensors: Vec<PlannedTensor>,
     cap: u64,
 ) -> Result<FilePlan, FixtureError> {
+    if split_keys.is_empty() {
+        for (k, v) in [
+            (SPLIT_NO, Value::U16(0)),
+            (SPLIT_COUNT, Value::U16(0)),
+            (SPLIT_TENSORS, Value::I32(0)),
+        ] {
+            split_keys.push((k.to_string(), v.clone()));
+            kvs.push((k.to_string(), v));
+        }
+    }
     let align = file_alignment(&kvs).map_err(|source| FixtureError::Alignment {
         set: "target",
         source,
@@ -796,4 +810,69 @@ fn plan_draft(
         split_keys: Vec::new(),
         align,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use gguf::{GgmlType, Value};
+
+    use super::{SPLIT_COUNT, SPLIT_NO, SPLIT_TENSORS, shard};
+    use crate::fixture::fill::Rule;
+    use crate::fixture::plan::PlannedTensor;
+
+    fn tensor(name: &str) -> PlannedTensor {
+        PlannedTensor {
+            name: name.to_string(),
+            source: name.to_string(),
+            layer: Some(0),
+            dims: vec![4],
+            ty: GgmlType::F32,
+            nbytes: 16,
+            rule: Rule::Const { value: 1.0 },
+        }
+    }
+
+    fn key(k: &str, v: Value) -> (String, Value) {
+        (k.to_string(), v)
+    }
+
+    /// An unsplit source's fixture is a split set all the same: the
+    /// splitter's three keys follow the source's own, at the set's figures
+    /// (two shards here, layer 0 spanning them), and every later shard
+    /// carries them. A source with some of the three
+    /// but not all is refused by name.
+    #[test]
+    fn an_unsplit_source_gets_the_splitters_keys() {
+        let own = vec![key("general.name", Value::String("t".into()))];
+        let plan = shard(
+            "t",
+            own.clone(),
+            Vec::new(),
+            vec![tensor("a"), tensor("b")],
+            16,
+        )
+        .expect("an unsplit source is planned");
+        assert_eq!(
+            plan.files,
+            ["t-00001-of-00002.gguf", "t-00002-of-00002.gguf"]
+        );
+        assert_eq!(
+            plan.kvs,
+            [
+                own[0].clone(),
+                key(SPLIT_NO, Value::U16(0)),
+                key(SPLIT_COUNT, Value::U16(2)),
+                key(SPLIT_TENSORS, Value::I32(2)),
+            ]
+        );
+        let layouts = plan.layouts().expect("the shards lay out");
+        assert_eq!(layouts.len(), 2);
+
+        let partial = vec![key(SPLIT_NO, Value::U16(0))];
+        let kvs = own.into_iter().chain(partial.clone()).collect();
+        let Err(err) = shard("t", kvs, partial, vec![tensor("a")], 16) else {
+            panic!("a partial split header is refused");
+        };
+        assert!(err.to_string().contains(SPLIT_COUNT), "{err}");
+    }
 }
