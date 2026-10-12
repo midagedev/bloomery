@@ -108,6 +108,13 @@ ref_step_variant() {
     d1k|u1s4|u1s5) STEP_TOKENS_FILE=$BLOOMERY_DATA/qwen35moe/corpus-prose.ids
                    STEP_TOKENS_SHA256=dca5f89b2903f9ffd2f4e20eec18a9fdf3561bcb531a721a114e4fab68e925be ;;
   esac
+  # The fixture tier's d1k set also holds ik's routes of the prefill's positions (dump_ref --prefill-routes), as
+  # qwen4exp.sh's long sets do: the picks, the raw gathered scores and the final weights a gate plants into a batch-fed run of
+  # the same ids. This graph normalizes and does not scale (build_qwen35.cpp:57, `LLM_FFN_SILU, true, false, 0.0f`, through
+  # llm_build_std_moe_ffn; ik 41b17995), so the final node is ffn_moe_weights_norm. The real tier's sets are as they were.
+  if [ "${BLOOMERY_TIER:-real}" = fixture ]; then
+    case $name in d1k) STEP_ARGS+=(--prefill-routes "ffn_moe_topk,ffn_moe_weights,ffn_moe_weights_norm") ;; esac
+  fi
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node
     STEP_ARGS+=(--prefill-every-node)

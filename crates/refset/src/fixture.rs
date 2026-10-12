@@ -46,6 +46,7 @@ const DIRS: &[(&str, &str)] = &[
     ("deepseek41", "v41"),
     ("glm5next", "glm5next"),
     ("nemotron_h", "nemotron"),
+    ("qwen35moe", "qwen35moe"),
 ];
 
 /// The prefix of every key the fixture generator writes (`bloomery_model`'s

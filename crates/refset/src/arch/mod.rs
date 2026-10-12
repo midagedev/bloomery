@@ -106,7 +106,7 @@ mod tests {
         );
     }
 
-    /// The fixture families are the table of six, each the mirror of one real
+    /// The fixture families are the table of seven, each the mirror of one real
     /// family: its name is `fx-` and the real family's, and it takes the real
     /// family's architecture, ik build and consumers, the fixture twin of its
     /// identity, a draft file when the real family has one and no per-file set
@@ -121,6 +121,7 @@ mod tests {
             ("fx-mtp-glm5next", 1),
             ("fx-ik-qwen4exp", 5),
             ("fx-mtp-qwen4exp", 1),
+            ("fx-ik-qwen35moe", 3),
             ("fx-ik-deepseek41", 4),
         ];
         let mut found: Vec<&str> = all()
@@ -175,7 +176,7 @@ mod tests {
                 );
             }
         }
-        for arch in ["glm5next", "qwen4exp", "deepseek41"] {
+        for arch in ["glm5next", "qwen4exp", "deepseek41", "qwen35moe"] {
             let node = node_dumps(arch).map(|f| f.name);
             assert_eq!(node, Some(&*format!("ik-{arch}")), "{arch}: node dumps");
         }

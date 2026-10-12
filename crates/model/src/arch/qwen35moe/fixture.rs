@@ -1,6 +1,14 @@
 //! The Qwen3.8 (`qwen4exp`) gate fixture's spec ([`spec`]): the facts of a
 //! Qwen3.8 file the common generator (`crate::fixture`) cannot know.
 //!
+//! The two architectures that share this module's reader (`hparams`) share
+//! what a fixture of either needs: the key rules ([`key_rule`]), the 1-D fills
+//! ([`const_value`]), the shared expert's gate value ([`shexp_gate`]), the
+//! planned card budget's plan (`card_experts_with`) and the layer-kind check
+//! ([`check_kinds_as`]). The Qwen3.6 (`qwen35moe`) spec is [`qwen35moe`]; what
+//! only Qwen3.8 has (PLE, the MTP draft, hyper-connections, compress ratios)
+//! is below.
+//!
 //! The fixture is four layers — one GDN without PLE, two QSA, and the GDN
 //! PLE site — and the source's globals:
 //!
@@ -45,8 +53,10 @@ use crate::fixture::{
     Budget, CardBudget, CardExperts, DEFAULT_SHARD_BYTES, DraftRules, DraftSpec, Family,
     FixtureError, FixtureSpec, KeyRule, Kvs, Tables, Window, int_like, items, meta, unsigned,
 };
-use crate::placement::PlanLevers;
 use crate::placement::workstation::RTX_3090;
+use crate::placement::{Machine, Plan, PlanLevers};
+
+pub mod qwen35moe;
 
 /// Fixture layer `f` holds source layer `LAYER_MAP[f]` (the table above).
 pub const LAYER_MAP: [usize; 4] = [2, 3, 1, 47];
@@ -57,8 +67,9 @@ pub const LAYER_MAP: [usize; 4] = [2, 3, 1, 47];
 pub const FIXTURE_RATIOS: [u64; 4] = [0, 4, 0, 4];
 
 /// The interval the fixture writes in place of the source's 4: with it the
-/// four layers' kinds re-derive as [GDN, QSA, GDN, QSA], the source layers'
-/// own (`hparams` reads the interval from the file).
+/// four layers' kinds re-derive as [recurrent, attending, recurrent,
+/// attending], the source layers' own (`hparams` reads the interval from the
+/// file). Qwen3.6's fixture writes it too.
 pub const FIXTURE_INTERVAL: u64 = 2;
 
 /// The d window, [2^-14, 2^-6]: normal f16 values wide enough for every Qwen3.8 type's scale at every K the file holds — the
@@ -72,8 +83,38 @@ pub const D_MAX: f32 = 1.0 / 64.0;
 /// the table at about this many bytes (the source's table is 28.8 GB).
 pub const PLE_TABLE_BYTES: u64 = 112 << 20;
 
-/// The shared expert's gate input, `1/√2560` (the model width).
-const SHEXP_GATE: f32 = 0.019_764_235;
+/// The Qwen3.8 model width: the length of the shared expert's gate vector
+/// (`ffn_gate_inp_shexp`), which the family's gate value derives from
+/// ([`shexp_gate`]) and its plan holds the source to ([`expect_hidden`]).
+const HIDDEN: u32 = 2560;
+
+/// The shared expert's gate vector for a model of width `hidden`: every
+/// element `1/√hidden`, computed in f64 and rounded once, so that a logit over
+/// a unit-RMS hidden state is about unit scale (a gain of 1 would saturate the
+/// sigmoid at about ±50).
+#[must_use]
+pub fn shexp_gate(hidden: u32) -> f32 {
+    (1.0 / f64::from(hidden).sqrt()) as f32
+}
+
+/// The source's `embedding_length` is `hidden`, the width the family's
+/// shared-expert gate value was derived from: a source of another width has
+/// a gate of another scale, which the plan refuses by name.
+/// (`Family::const_value` sees no source.)
+fn expect_hidden(source: &Split, hidden: u32) -> Result<(), FixtureError> {
+    let key = source.arch_key("embedding_length");
+    let v = source.value(&key).ok_or_else(|| meta(&key, "is absent"))?;
+    let got = unsigned(&key, v)?;
+    if got == u64::from(hidden) {
+        return Ok(());
+    }
+    Err(meta(
+        &key,
+        format!(
+            "is {got}, not the {hidden} this family's shared-expert gate 1/√{hidden} is derived from"
+        ),
+    ))
+}
 
 /// The positions the card budget's plan runs at: the e2e gate's context
 /// (`gate_qwen4exp_e2e.rs`, its `CTX`). A plan at another context moves the
@@ -137,9 +178,10 @@ fn default_mtp_source() -> Option<String> {
     Some(DEFAULT_MTP_MODEL.to_string())
 }
 
-/// The coverage table of the target's architecture keys; `None` is a key
-/// the map does not cover. The copy list is every key the qwen4exp readers
-/// read (`hparams`, `mtp`) that is not a function of the map.
+/// The coverage table of the target's architecture keys, for both
+/// architectures; `None` is a key the map does not cover. The copy list is
+/// every key the readers (`hparams`, `mtp`) read that is not a function of the
+/// map; a key the source file does not carry is not asked for.
 pub fn key_rule(suffix: &str) -> Option<KeyRule> {
     const COPY: [&str; 38] = [
         "context_length",
@@ -194,18 +236,22 @@ pub fn key_rule(suffix: &str) -> Option<KeyRule> {
 }
 
 /// The value of a 1-D F32 tensor, by its name without the `blk.N.` prefix:
-/// the norms 1 (the mixers', the indexers', the hyper-connection modules',
-/// the PLE site's, the head's, the MTP input's), the delta time step's bias
-/// 0, `ssm_a` −1, and the shared expert's gate input `1/√2560`.
+/// the norms 1 (the mixers', the blocks', the indexers', the hyper-connection
+/// modules', the PLE site's, the head's, the MTP input's), the delta time
+/// step's bias 0, `ssm_a` −1, and the shared expert's gate vector `gate`
+/// ([`shexp_gate`] of the family's width).
 ///
 /// `ssm_a` is `−e^A_log` as the converter folds it, so a decay
 /// `exp(softplus(a + dt)·ssm_a)` below 1 needs a negative value; −1 keeps the
-/// recurrent state bounded however long the run. The gate input's width is
-/// the model's `HIDDEN`, so its logit over unit-RMS hidden states is about
-/// unit scale (a gain of 1 would saturate the sigmoid at about ±50).
-pub fn const_value(leaf: &str) -> Option<f32> {
-    const RULES: [(&str, f32); 17] = [
+/// recurrent state bounded however long the run. `attn_norm`,
+/// `post_attention_norm` and `output_norm` are the Qwen3.6 file's; a Qwen3.8
+/// file carries none of them.
+pub fn const_value(leaf: &str, gate: f32) -> Option<f32> {
+    let rules: [(&str, f32); 20] = [
         ("ssm_norm.weight", 1.0),
+        ("attn_norm.weight", 1.0),
+        ("post_attention_norm.weight", 1.0),
+        ("output_norm.weight", 1.0),
         ("attn_q_norm.weight", 1.0),
         ("attn_k_norm.weight", 1.0),
         ("indexer.q_norm.weight", 1.0),
@@ -218,38 +264,62 @@ pub fn const_value(leaf: &str) -> Option<f32> {
         ("output_hc_norm.weight", 1.0),
         ("ssm_a", -1.0),
         ("ssm_dt.bias", 0.0),
-        ("ffn_gate_inp_shexp.weight", SHEXP_GATE),
+        ("ffn_gate_inp_shexp.weight", gate),
         ("nextn.enorm.weight", 1.0),
         ("nextn.hnorm.weight", 1.0),
         ("nextn.hc_head_norm.weight", 1.0),
     ];
-    RULES.iter().find(|(n, _)| *n == leaf).map(|&(_, v)| v)
+    rules.iter().find(|(n, _)| *n == leaf).map(|&(_, v)| v)
 }
 
-/// The written file's per-layer card expert counts, planned through the
-/// placement planner on the 3090's spec (`machine_for_experts` with the
-/// ubatch a [`BUDGET_CTX`]-position load runs) under `budget` bytes — the
-/// plan the qwen4exp gates make of a file they open at that context.
+/// A written file's per-layer card expert counts under `budget` bytes: the
+/// placement planner's plan of it, the plan the family's gates make of a file
+/// they open — `machine` lays out the card from the file's inputs and `plan`
+/// plans the file on it at the family's context and expert rule.
 /// `describe`, not `read`: the gates' own choice, so a chat-surface item
 /// `read` refuses plans here as it does there.
-fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, FixtureError> {
+fn card_experts_with(
+    split: &Split,
+    budget: Option<u64>,
+    machine: impl FnOnce(&place::PlanInputs) -> Machine,
+    plan: impl for<'a> FnOnce(
+        &'a place::PlanInputs,
+        &'a Machine,
+        &PlanLevers,
+    ) -> Result<Plan<'a>, place::PlaceError>,
+) -> Result<CardExperts, FixtureError> {
     let inputs = place::PlanInputs::describe(split)?;
-    let machine = place::machine_for_experts(
-        RTX_3090,
-        inputs.spec.layers.len(),
-        place::UBATCH_PLANNED.min(BUDGET_CTX),
-        place::Experts::Card,
-    );
+    let machine = machine(&inputs);
     let levers = PlanLevers {
         card_budget_bytes: budget,
     };
-    let plan = inputs
-        .plan_with(&machine, BUDGET_CTX, &levers, place::Experts::Card)
-        .map_err(|e| FixtureError::Budget(e.to_string()))?;
+    let plan = plan(&inputs, &machine, &levers).map_err(|e| FixtureError::Budget(e.to_string()))?;
     Ok(CardExperts {
         per_layer: plan.n_l,
         experts: inputs.model.experts,
     })
+}
+
+/// The Qwen3.8 file's [`card_experts_with`]: on the 3090's spec
+/// (`machine_for_experts` with the ubatch a [`BUDGET_CTX`]-position load runs),
+/// the routed experts where [`place::Experts::Card`] says — the plan the
+/// qwen4exp gates make of a file they open at that context.
+fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, FixtureError> {
+    card_experts_with(
+        split,
+        budget,
+        |inputs| {
+            place::machine_for_experts(
+                RTX_3090,
+                inputs.spec.layers.len(),
+                place::UBATCH_PLANNED.min(BUDGET_CTX),
+                place::Experts::Card,
+            )
+        },
+        |inputs, machine, levers| {
+            inputs.plan_with(machine, BUDGET_CTX, levers, place::Experts::Card)
+        },
+    )
 }
 
 /// Qwen3.8's rules.
@@ -261,7 +331,7 @@ impl Family for Qwen38 {
     }
 
     fn const_value(&self, leaf: &str) -> Option<f32> {
-        const_value(leaf)
+        const_value(leaf, shexp_gate(HIDDEN))
     }
 
     fn required_keys(&self) -> &'static [&'static str] {
@@ -269,6 +339,7 @@ impl Family for Qwen38 {
     }
 
     fn tables(&self, source: &Split, spec: &FixtureSpec) -> Result<Box<dyn Tables>, FixtureError> {
+        expect_hidden(source, HIDDEN)?;
         Ok(Box::new(Ple::read(source, &spec.layers)?))
     }
 
@@ -481,10 +552,21 @@ pub fn check_kinds(
     fixture: &Split,
     source: &Split,
 ) -> Result<Hparams, FixtureError> {
+    check_kinds_as(Variant::Qwen4Exp, spec, fixture, source)
+}
+
+/// [`check_kinds`] for the architecture `variant` names: both headers must
+/// read as that variant.
+pub fn check_kinds_as(
+    variant: Variant,
+    spec: &FixtureSpec,
+    fixture: &Split,
+    source: &Split,
+) -> Result<Hparams, FixtureError> {
     let fx = Hparams::read(fixture)?;
     let src = Hparams::read(source)?;
     let bad = |what: String, detail: String| FixtureError::Mismatch { what, detail };
-    if fx.variant != src.variant || fx.variant != Variant::Qwen4Exp {
+    if fx.variant != src.variant || fx.variant != variant {
         return Err(bad(
             "variant".into(),
             format!("{:?}, the source's {:?}", fx.variant, src.variant),
@@ -725,9 +807,42 @@ impl DraftRules for QwenMtp {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIXTURE_INTERVAL, check_kinds, spec};
+    use super::{FIXTURE_INTERVAL, HIDDEN, Qwen38, check_kinds, shexp_gate, spec};
     use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
     use crate::arch::synthetic::{V, header_shaped};
+    use crate::fixture::Family;
+
+    /// Qwen3.8's 1-D fills: each name's value, and the shared expert's gate
+    /// vector `1/√2560` equal, bit for bit, to the literal `0.019_764_235` the
+    /// Qwen3.8 fixture's bytes carry, so no byte of it depends on how the value
+    /// is computed.
+    #[test]
+    fn qwen38s_one_dimensional_fills_are_unmoved() {
+        let family = Qwen38;
+        for (leaf, want) in [
+            ("ssm_norm.weight", 1.0),
+            ("attn_q_norm.weight", 1.0),
+            ("attn_k_norm.weight", 1.0),
+            ("indexer.q_norm.weight", 1.0),
+            ("indexer.k_norm.weight", 1.0),
+            ("hc_attn_norm.weight", 1.0),
+            ("hc_ffn_norm.weight", 1.0),
+            ("ple_norm_key.weight", 1.0),
+            ("ple_norm_query.weight", 1.0),
+            ("ple_norm_conv.weight", 1.0),
+            ("output_hc_norm.weight", 1.0),
+            ("ssm_a", -1.0),
+            ("ssm_dt.bias", 0.0),
+            ("nextn.enorm.weight", 1.0),
+            ("nextn.hnorm.weight", 1.0),
+            ("nextn.hc_head_norm.weight", 1.0),
+            ("ffn_gate_inp_shexp.weight", 0.019_764_235),
+        ] {
+            let got = family.const_value(leaf);
+            assert_eq!(got.map(f32::to_bits), Some(f32::to_bits(want)), "{leaf}");
+        }
+        assert_eq!(shexp_gate(HIDDEN).to_bits(), 0.019_764_235_f32.to_bits());
+    }
 
     /// The map's layers are the fixture's trunk: a fixture that declares a
     /// next-token layer in its four blocks would read its last mapped layer
