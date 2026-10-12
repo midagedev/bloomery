@@ -986,12 +986,13 @@ fn hw_placement_card_budget_is_usable_bytes() {
             scratch,
             reserves,
             margin,
+            beside,
             ..
         }) => {
-            if floor != dense + kv + context + scratch + reserves + margin {
+            if floor != dense + kv + context + scratch + reserves + margin + beside {
                 bad.push(format!(
                     "floor {floor} is not dense {dense} + KV {kv} + context {context} + scratch \
-                     {scratch} + reserves {reserves} + margin {margin}"
+                     {scratch} + reserves {reserves} + margin {margin} + beside {beside}"
                 ));
             }
             floor

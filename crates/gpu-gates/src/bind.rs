@@ -3461,6 +3461,7 @@ mod tests {
                 scratch: 13,
                 reserves: 17,
                 margin: 19,
+                beside: 23,
             }
             .to_string()
         };
