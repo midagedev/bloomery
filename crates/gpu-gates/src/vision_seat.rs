@@ -111,14 +111,35 @@ impl Flags {
     }
 
     /// [`Flags::mmproj`], refused by name when a token limit is given with no encoder file to
-    /// bound.
+    /// bound: no `--mmproj`, and no `--hf` repo whose projector [`Flags::encoder`] could pick.
     pub fn wanted(&self) -> Result<Option<&Path>, GateError> {
         match self.mmproj()? {
-            None if self.sets_limits() => Err(
+            None if self.sets_limits() && !self.may_pick() => Err(
                 "--image-min-tokens/--image-max-tokens without --mmproj: no image input to bound"
                     .into(),
             ),
             file => Ok(file),
+        }
+    }
+
+    /// Whether [`Flags::encoder`] may take the `--hf` repo's projector: a build with the encoder,
+    /// a model file from `--hf`, and neither `--mmproj` nor `--no-mmproj`.
+    fn may_pick(&self) -> bool {
+        cfg!(feature = "vision")
+            && self.mmproj.is_none()
+            && !self.no_mmproj
+            && crate::model_file::hf_repo().is_some()
+    }
+
+    /// The encoder file the seat serves images with, as llama-server's `-hf` picks it:
+    /// `--mmproj`'s file, else, when the seat `takes` an image in this mode, the projector the
+    /// `--hf` repo holds beside the model ([`crate::model_file::hf_projector`]) unless
+    /// `--no-mmproj` says none. `None` serves no image.
+    pub fn encoder(&self, takes: bool) -> Result<Option<PathBuf>, GateError> {
+        match self.mmproj()? {
+            Some(file) => Ok(Some(file.to_owned())),
+            None if takes && self.may_pick() => crate::model_file::hf_projector(),
+            None => Ok(None),
         }
     }
 
@@ -396,12 +417,13 @@ pub struct Opened {
     pub limits: TokenLimits,
 }
 
-/// The seat's encoder: `file`, the encoder file the seat resolved (`--mmproj`'s, [`Flags::mmproj`],
-/// or one a seat picks itself, as the decide seat's `--hf` takes the repo's projector). `None`
+/// The seat's encoder: `file`, the encoder file the seat resolved ([`Flags::encoder`]: `--mmproj`'s,
+/// or the `--hf` repo's projector). `None`
 /// serves no image, and a limit given then is refused by name (no image input to bound); else the
 /// file opened ([`Projector::open`], its type one of `takes`, the limits from `flags`), held
 /// against the text model (`text`, `token` — [`Projector::check_text`]) and seated for a plan on
-/// `place` ([`encoder_seat`]). Every check runs before a card is touched.
+/// `place` ([`encoder_seat`]). Every check runs before a card is touched; whether a file the
+/// `--hf` repo picked stays is the plan's question ([`kept`]).
 pub fn open_seat(
     flags: &Flags,
     file: Option<&Path>,
@@ -411,14 +433,115 @@ pub fn open_seat(
     token: &dyn Fn(u32) -> Option<String>,
 ) -> Result<Option<Opened>, GateError> {
     let Some(path) = file else {
-        // With no file, `--mmproj` was not given either: `wanted` refuses a limit there.
+        // `wanted` refuses a limit with neither `--mmproj` nor an `--hf` repo; a repo that holds
+        // no projector leaves nothing to bound either.
         flags.wanted()?;
+        if flags.sets_limits() {
+            return Err(
+                "--image-min-tokens/--image-max-tokens with no encoder file (no --mmproj, and \
+                 no projector the --hf repo holds): no image input to bound"
+                    .into(),
+            );
+        }
         return Ok(None);
     };
     let projector = Projector::open(path, flags, takes)?;
     projector.check_text(text, token)?;
     let seat = encoder_seat(place, projector.card.total())?;
     Ok(Some(projector.seated(seat)))
+}
+
+/// What a plan gives the text model, for comparing a plan with the encoder's reserve and without:
+/// whether the model loads whole on a card, the experts a placed plan's cards hold, and the
+/// context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cost {
+    pub whole: bool,
+    pub card_experts: u64,
+    pub ctx: u64,
+}
+
+impl Cost {
+    /// A placed plan's: the experts its stage cards and tier cards hold, at `ctx` positions.
+    #[must_use]
+    pub fn of(plan: &model::placement::Plan<'_>, ctx: u64) -> Cost {
+        Cost {
+            whole: false,
+            card_experts: plan.n_l.iter().sum::<u64>()
+                + plan.tier_n_l.iter().flatten().sum::<u64>(),
+            ctx,
+        }
+    }
+
+    /// A load whole on one card, at `ctx` positions.
+    #[must_use]
+    pub fn whole(ctx: u64) -> Cost {
+        Cost {
+            whole: true,
+            card_experts: 0,
+            ctx,
+        }
+    }
+}
+
+/// `vision` as the seat's plan keeps it. A projector the `--hf` repo picked ([`Flags::encoder`])
+/// that sits as a stage-card reserve stays only when it is free: `cost`, the seat's plan with
+/// that encoder and without one, gives the text model the same experts and context. Otherwise it
+/// is dropped by a named line giving its bytes and what it would cost, and the seat serves text.
+/// An `--mmproj` file, a limit given (both ask for images) and a seat off the plan stay as they
+/// are. A plan that refuses the reserve is a cost; one that refuses without it is the seat's
+/// own refusal.
+pub fn kept(
+    vision: Option<Opened>,
+    flags: &Flags,
+    cost: impl Fn(Option<&Opened>) -> Result<Cost, GateError>,
+) -> Result<Option<Opened>, GateError> {
+    let Some(v) = vision else {
+        return Ok(None);
+    };
+    let Some(bytes) = v.seat.reserve else {
+        return Ok(Some(v));
+    };
+    if flags.mmproj()?.is_some() || flags.sets_limits() {
+        return Ok(Some(v));
+    }
+    let without = cost(None)?;
+    let Some(what) = cost_words(without, cost(Some(&v)).map_err(|e| e.to_string())) else {
+        return Ok(Some(v));
+    };
+    let line = format!(
+        "vision: the --hf repo's projector {} is not loaded: as a reserve of {bytes} B on the \
+         stage card ({}) it would cost {what}; --mmproj FILE loads it",
+        v.path.display(),
+        v.seat.name
+    );
+    // A seat plans a placement more than once (its offer, then the load): one line per verdict.
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID
+        .lock()
+        .map_err(|_| "the vision line's lock is poisoned")?;
+    if !said.contains(&line) {
+        eprintln!("{line}");
+        said.push(line);
+    }
+    Ok(None)
+}
+
+/// What the encoder's reserve costs the text model, `with` it against `without` it; `None` when
+/// it costs nothing.
+fn cost_words(without: Cost, with: Result<Cost, String>) -> Option<String> {
+    match with {
+        Ok(with) if with == without => None,
+        Ok(with) if with.whole != without.whole => {
+            Some("the whole load on one card (the plan would place the experts)".to_owned())
+        }
+        Ok(with) => Some(format!(
+            "{} card experts and {} positions of context",
+            without.card_experts.saturating_sub(with.card_experts),
+            without.ctx.saturating_sub(with.ctx)
+        )),
+        Err(e) => Some(format!("the plan, which refuses it ({e})")),
+    }
 }
 
 /// Where the image encoder sits under `--mmproj`: on a card this process holds that the
@@ -1037,6 +1160,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(gone.starts_with("--mmproj /nowhere/p.gguf: "), "{gone}");
+    }
+
+    /// `encoder` returns `--mmproj`'s file whatever the mode, and with no `--hf` model file (a
+    /// test process names none) no file at all; the contradiction stays refused by name.
+    #[test]
+    fn the_encoder_is_the_flags_file_without_an_hf_repo() {
+        let f = flags(&["--mmproj", "/m/p.gguf"]).unwrap();
+        assert_eq!(f.encoder(true).unwrap(), Some(PathBuf::from("/m/p.gguf")));
+        assert_eq!(f.encoder(false).unwrap(), Some(PathBuf::from("/m/p.gguf")));
+        assert_eq!(Flags::default().encoder(true).unwrap(), None);
+        assert_eq!(
+            flags(&["--no-mmproj"]).unwrap().encoder(true).unwrap(),
+            None
+        );
+        let both = flags(&["--mmproj", "/m/p.gguf", "--no-mmproj"]).unwrap();
+        assert!(both.encoder(true).is_err());
+    }
+
+    /// A reserve is free only when the plan gives the same load, experts and context with it; each
+    /// cost is named: experts and context lost, the whole load lost, a plan that refuses it.
+    #[test]
+    fn a_reserve_is_free_only_when_the_plan_is_unchanged() {
+        let placed = |card_experts, ctx| Cost {
+            whole: false,
+            card_experts,
+            ctx,
+        };
+        assert_eq!(cost_words(placed(940, 4096), Ok(placed(940, 4096))), None);
+        assert_eq!(cost_words(Cost::whole(4096), Ok(Cost::whole(4096))), None);
+        assert_eq!(
+            cost_words(placed(940, 4096), Ok(placed(727, 4096))).as_deref(),
+            Some("213 card experts and 0 positions of context")
+        );
+        assert_eq!(
+            cost_words(placed(940, 8192), Ok(placed(940, 4096))).as_deref(),
+            Some("0 card experts and 4096 positions of context")
+        );
+        assert_eq!(
+            cost_words(Cost::whole(4096), Ok(placed(900, 4096))).as_deref(),
+            Some("the whole load on one card (the plan would place the experts)")
+        );
+        assert_eq!(
+            cost_words(placed(940, 4096), Err("no room".to_owned())).as_deref(),
+            Some("the plan, which refuses it (no room)")
+        );
     }
 
     /// The projector-to-text checks of the qwen3vl type, each refused by name; the Qwen3.8 text

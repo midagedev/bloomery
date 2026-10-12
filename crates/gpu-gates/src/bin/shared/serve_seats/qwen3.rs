@@ -1109,7 +1109,8 @@ fn slot_ctx(ctx: usize, parallel: usize) -> Result<usize, GateError> {
 
 /// What `--mmproj` opened for the plans: the encoder file held against the text model's
 /// embedding width, its vocabulary's image ids and its IMROPE sections, and seated
-/// ([`vision_seat::open_seat`]); `None` without `--mmproj`. A qwen3moe file (Qwen3-30B-A3B)
+/// ([`vision_seat::open_seat`]); the file is `--mmproj`'s, else the `--hf` repo's projector
+/// ([`vision_seat::Flags::encoder`]), and `None` without either. A qwen3moe file (Qwen3-30B-A3B)
 /// has no image input, so `--mmproj` there is refused by name, and so is a build without the
 /// `vision` feature, whose tower is not built.
 fn vision_of(
@@ -1144,9 +1145,10 @@ fn vision_of(
         imrope: Some(hp.rope_sections),
         ple: PleImage::Absent,
     };
+    let file = a.vision.encoder(true)?;
     vision_seat::open_seat(
         &a.vision,
-        a.vision.mmproj()?,
+        file.as_deref(),
         a.place.unwrap_or(Place::A),
         &[vision::arch::qwen3vl::PROJECTOR_TYPE],
         &facts,
@@ -1201,6 +1203,26 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // `--parallel` is one request's context — one slot at the whole of it
     // (`placement::ctx::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, 2)?;
+    // A projector the `--hf` repo picked stays only where the load gives the text model the same
+    // experts and context with its reserve as without ([`vision_seat::kept`]).
+    let vision = vision_seat::kept(vision, &a.vision, |v| {
+        let ctx = match a.ctx {
+            Some(c) => c,
+            None => slots * default_ctx(&split, arch, a.place, slots, &levers, (kv, v))?.ctx,
+        };
+        let plan_levers = PlanLevers::from_levers(&levers)?;
+        let cost_ctx = u64::try_from(ctx)?;
+        Ok(
+            match decide(&split, arch, ctx, (a.place, &plan_levers), slots, (kv, v))? {
+                Q3Load::Whole(_) | Q3Load::Placed { whole: Some(_), .. } => {
+                    vision_seat::Cost::whole(cost_ctx)
+                }
+                Q3Load::Placed { q, total, .. } => {
+                    vision_seat::Cost::of(&q.plan(total, &plan_levers)?, cost_ctx)
+                }
+            },
+        )
+    })?;
     // The common unset rule, once, on one census reading: the load below
     // still takes `a`'s card (`PlaceQ3::unplaced_on`), the rule's own pick
     // for a body with no tier card; its `place unset` record is printed here.

@@ -156,7 +156,9 @@
 //! `--mmproj FILE` (with `--no-mmproj`, `--image-min-tokens` and `--image-max-tokens`:
 //! [`vision_seat::Flags`]) gives the seat image input (behind the `vision` feature) from GLM-5.3-Flash's
 //! own encoder file (projector type `glm5v`; a limit not given is the file's own budget, 16 to 8000
-//! tokens). The file is held against the text model — its row width, and its three image ids in the
+//! tokens); with no `--mmproj` and a model from `--hf`, the repo's own projector when the plan
+//! gives the text model the same experts and context with it as without
+//! ([`vision_seat::Flags::encoder`], [`vision_seat::kept`]), unless `--no-mmproj`. The file is held against the text model — its row width, and its three image ids in the
 //! vocabulary — before anything is planned ([`vision_seat::open_seat`]). The tower sits where the
 //! placement leaves room ([`vision_seat::encoder_seat`]): on a held card the plan leaves off (the 3090
 //! under `--place a`, the A6000 under `gate`), else as a named reserve of the stage card (`bp`) that every
@@ -518,18 +520,21 @@ fn plan_of<'a>(
     })
 }
 
-/// What `--mmproj` asks of a placement: the flags, and the text model's
-/// embedding width and vocabulary, which the encoder file is held against.
+/// What `--mmproj` asks of a placement: the flags, the encoder file they
+/// resolve to ([`vision_seat::Flags::encoder`]: `--mmproj`'s, else the `--hf`
+/// repo's projector), and the text model's embedding width and vocabulary,
+/// which the file is held against.
 struct Images<'a> {
     flags: &'a vision_seat::Flags,
+    file: Option<PathBuf>,
     n_embd: usize,
     token: &'a dyn Fn(u32) -> Option<String>,
 }
 
 impl Images<'_> {
     /// The encoder file opened, held against the text model and seated for
-    /// a plan on `place` ([`vision_seat::open_seat`]); `None` without
-    /// `--mmproj`. Where the tower sits depends on the placement, so each
+    /// a plan on `place` ([`vision_seat::open_seat`]); `None` without an
+    /// encoder file. Where the tower sits depends on the placement, so each
     /// placement the seat plans opens its own.
     fn seat(&self, place: Place) -> Result<Option<Opened>, GateError> {
         let facts = TextFacts {
@@ -539,7 +544,7 @@ impl Images<'_> {
         };
         vision_seat::open_seat(
             self.flags,
-            self.flags.mmproj()?,
+            self.file.as_deref(),
             place,
             &[glm5v::PROJECTOR_TYPE],
             &facts,
@@ -574,13 +579,28 @@ impl Placed {
         (set, slots): (Option<usize>, usize),
         images: &Images<'_>,
     ) -> Result<Placed, GateError> {
-        let vision = images.seat(place)?;
-        let reserve = vision.as_ref().and_then(|v| v.seat.reserve);
         let tier_batch = glm_place::tier_batch(place, &inputs.hp);
         // Every machine reserves its checkpoints at the slot context it is
         // laid for: the search's probes each at their own, the load's at the
         // context it is granted; and the encoder's reserve, as the printed plan does.
         let price = checkpoint_price(inputs)?;
+        // A projector the `--hf` repo picked stays only where the plan gives the text model the
+        // same experts and context with its reserve as without ([`vision_seat::kept`]).
+        let cost = |v: Option<&Opened>| -> Result<vision_seat::Cost, GateError> {
+            let reserve = v.and_then(|v| v.seat.reserve);
+            let machine_at = |ctx: u64| -> Result<Machine, GateError> {
+                Ok(vision_seat::with_reserve(
+                    glm_machine(place, tier_batch, slots, price, ctx)?,
+                    reserve,
+                )(inputs.model.layers))
+            };
+            let ctx = u64::try_from(ctx_of(inputs, &machine_at, levers, nextn, set, slots)?.ctx)?;
+            let machine = machine_at(ctx)?;
+            let plan = plan_of(inputs, &machine, ctx, levers, nextn, slots)?;
+            Ok(vision_seat::Cost::of(&plan, ctx))
+        };
+        let vision = vision_seat::kept(images.seat(place)?, images.flags, cost)?;
+        let reserve = vision.as_ref().and_then(|v| v.seat.reserve);
         let machine_at = |ctx: u64| -> Result<Machine, GateError> {
             Ok(vision_seat::with_reserve(
                 glm_machine(place, tier_batch, slots, price, ctx)?,
@@ -842,6 +862,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let token = |id| vocab.tokenizer().text(id).map(str::to_owned);
     let images = Images {
         flags: &a.vision,
+        // The `--hf` repo's projector is taken only where a span's rows can enter.
+        file: a.vision.encoder(a.prefill != PrefillMode::Steps)?,
         n_embd: inputs.hp.n_embd,
         token: &token,
     };
