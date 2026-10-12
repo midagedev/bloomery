@@ -1,0 +1,63 @@
+# Round mimotrace: the router trace of MiMo-V2.6-Flash over one real 512-token prose window, read as the share of a
+# layer's routed selections that its 62 hottest experts receive (the card's 62 slots a layer). tools/ref/router-trace.sh
+# under the mimo2 profile (tools/ref/models/mimo2.sh, ROUTER_TRACE_ARGS = --all-logits), set mimo2-p512.
+#
+# Decomposition of the run, one decode call of 512 tokens (everything [derived] unless marked; no MiMo router set and no
+# ik load time on this file exist yet):
+# - build of router_trace against the mimo2 ik tree: outside the lease, the same one-file link as every profile.
+# - load, --defer-experts: no MAP_POPULATE; the loader reads the trunk (the 5.84 GB dense set) and maps the 167.4 GB split
+#   set. Warm 5-20 s; the harness prints `loaded in N s`, the one term here derivation cannot fix and not the term measured.
+# - the call: 4,096 selections over 256 experts touch every expert of every routed layer (an expert untouched has
+#   p = (1 - 8/256)^512 = 8.7e-8 under uniform routing), so the call reads the whole 160.86 GB of experts once (12,032 x
+#   13,369,344 B). Resident in the page cache (the file fits it): ~2.45 M minor faults at 64 KiB fault-around, 2-5 s.
+#   Cold: 167.4 GB / R, R the NVMe's sequential rate (56 s at 3 GB/s, 167 s at 1 GB/s); the witness blocks' read-sectors and
+#   pgmajfault give R for free.
+# - compute: 8 x 47 routed experts x 25,165,824 values = 9.46e9 values a token plus ~4.9e9 of attention, the dense layer 0
+#   and the head = 14.4e9 values, 28.7 GFLOP a token, 14.7 TFLOP for 512 tokens. Anchor [measured, glmtrace.card]: V4.1's
+#   prose trace ran 66.5 tok/s with this harness and schedule; taking MiMo's active values as 1.1-1.3x V4.1's, as the GLM
+#   card did for GLM (an assumption, MiMo's ratio is not counted), 51-60 tok/s, widened to 40-65: 8-13 s for 512 tokens. --all-logits adds the head for every row, 512 x 0.625e9 values = 4 % of the call,
+#   +0.4 s.
+# Wall of the lease-held region: warm 5-20 + 2-5 + 8-13 = 15-40 s; cold adds 56-167 s. The bound is 1800 s.
+#
+# Resource timeline of one call (ms of each unit busy; the wall is the max of CPU compute and, cold, NVMe, never their sum
+# because a fault stalls the core that took it):
+#   host CPU, 32 threads   8,000-13,000 ms  expert GEMMs, attention, head: the step's cycles
+#   host DRAM              1,200 ms         167.4 GB once at 130-145 GB/s (mimo2-r5.card BW_host): 9-15 % of the step, under
+#                                           the compute's shadow, so a lever on it predicts 0
+#   NVMe                   0 ms resident; 56,000-167,000 ms cold, which then is the wall
+#   card SMs, PCIe         0 ms             -ngl 0, CUDA_VISIBLE_DEVICES empty
+# Flow: one call is the unit, nothing to batch or overlap further; the only flow lever is a page-cache preheat before the
+# lease, which moves the cold read out of the held window and does not shorten the sum.
+#
+# The term is the one derivation cannot fix. Uniform routing seen in-sample over 512 tokens already gives 32 % for the top
+# 62 of 256 [simulated: 8 distinct picks a token, 40 draws; the top quarter of noisy counts, uniform 24.2 %]; held-out
+# (list from the first 256 tokens, share on the next 256) gives 24.0 % there. A popularity spread (Plackett-Luce, lognormal
+# sigma, this simulation's own scale, not q38route-mstar.card's s) of 0.8 / 1.2 / 1.6 gives 54 / 69 / 79 % in-sample and
+# 51 / 66 / 78 % held-out. V4.1 and GLM held 57-80 % at 23.3 % of the experts (glmtrace.card), from lists learned on 25,000
+# tokens. MiMo's router is sigmoid-gated with a selection bias, which balances, so the band's low end sits at a spread of 0.5
+# (43.5 % in-sample), 11 points over the noise floor.
+#
+# Reading: router-coverage.py coverage $BLOOMERY_DATA/router/mimo2-p512 --n 62 --layers 1-47 (layer 0 is dense, so `--layers 0-47` is refused:
+# a listed layer the set lacks). The column n=62 of the in-sample table is the share of a layer's 4,096 selections that the
+# 62 experts with the highest counts in this window received; the `all` row is the mean over the 47 layers; `uniform` is
+# 62/256 = 24.2 %. The in-sample table is biased up by the lucky counts (+8 points at uniform routing); the held-out table is
+# what a list fixed on the first half serves on the second.
+kind: profile
+question: how skewed is MiMo-V2.6-Flash's router on a real 512-token prose window, as the share of a layer's routed
+  selections that the 62 hottest experts of that window receive?
+term: mean over layers 1-47 of the share of selections that the 62 hottest experts of the window receive, in-sample, the
+  first 512 ids of $BLOOMERY_DATA/mimo2/corpus-prose.ids (MiMo vocabulary, raw text, no chat template), ik CPU prefill, chunk
+  512, one decode call of 512 tokens, every-node schedule (router-coverage.py coverage $BLOOMERY_DATA/router/mimo2-p512 --n 62 --layers 1-47,
+  in-sample table, row all, column n=62)
+unit: %
+predict: 45..80 %
+condition: the run line reads `profile args --all-logits` and `chunk 512`; the harness runs under the CPU lease with its
+  witness blocks and its 1800 s bound and no other lease holder; the set's manifest has its complete trailer, arch mimo2,
+  512 tokens and 47 layers (1-47); the ids file's sha256 is the pin in tools/ref/models/mimo2.sh
+decide-in: put the per-layer shares of both tables into the seat round's cost model, with the layers whose in-sample share
+  is under 40 % named, and open the round
+decide-below: the window sits near the uniform noise floor (32 % in-sample): read the held-out column first; under 35 % held-out
+  the 62-slot window seat serves under 11 points more than the id prefix (24.2 %), so price the round with this s before
+  building it
+decide-above: routing is as sharp as V4.1 and GLM or sharper: the seat pays more than the planned band; re-derive the round's
+  gain with this s and move it ahead
