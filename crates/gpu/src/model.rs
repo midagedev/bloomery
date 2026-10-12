@@ -53,8 +53,8 @@ use gguf::Split;
 use model::arch::Arch;
 use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{self, HostNeed};
-use model::placement::{ExpertList, Plan};
+use model::placement::workstation::{self, ArenaGrant, HostNeed};
+use model::placement::{ARENA_COLUMNS, ArenaFloor, ExpertList, Plan};
 use model::r8file::R8Source;
 use std::ops::Range;
 use std::sync::Arc;
@@ -1739,7 +1739,8 @@ fn launch_served<B: ChainBody>(
 /// The NVMe expert tier of a paged load, the common chain's one build
 /// every family's host run attaches
 /// ([`HostRun::attach_tier`](crate::host::run::HostRun::attach_tier)):
-/// the arena the split dial reserved (`HostTotals::nvme_arena_bytes`)
+/// the arena `arena` grants (the split dial's `HostTotals::nvme_arena_bytes`,
+/// or what the host's reading left of it at load, [`HostResidency::arena`])
 /// over `file`'s shards, read `O_DIRECT` or — the lever's fallback —
 /// through the page cache ([`bloomery_levers::nvtier_levers`]). `None`
 /// on a plan that pages no routed expert or reserved no arena: the host
@@ -1751,6 +1752,7 @@ pub fn nvme_tier(
     plan: &Plan<'_>,
     file: &Arc<Split>,
     r8: bool,
+    arena: ArenaGrant,
 ) -> Result<Option<Arc<NvTier>>, GpuError> {
     const WHAT: &str = "GpuModel::nvme_tier";
     if plan.host.nvme_expert_bytes == 0 {
@@ -1767,25 +1769,26 @@ pub fn nvme_tier(
              reads the source: same bits)",
         ));
     }
-    NvTier::of_paged(plan, file, levers.direct).map(|t| t.map(Arc::new))
+    NvTier::of_paged(plan, file, levers.direct, arena).map(|t| t.map(Arc::new))
 }
 
 /// The host leg of a load on `plan`: the routed layers `first ..` built by
-/// `layers`, given the NVMe tier's arena when the plan pages routed experts
-/// and reserved one ([`nvme_tier`], then [`HostRun::build`], then
-/// [`HostRun::attach_tier`]). The one owner of a body's host-run build.
+/// `layers`, given the NVMe tier's arena `arena` grants when the plan pages
+/// routed experts and reserved one ([`nvme_tier`], then [`HostRun::build`],
+/// then [`HostRun::attach_tier`]). The one owner of a body's host-run build.
 pub fn host_run<E>(
     plan: &Plan<'_>,
     file: &Arc<Split>,
     first: usize,
     r8: bool,
+    arena: ArenaGrant,
     widths: HostWidths,
     layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
 ) -> Result<HostRun, GpuError>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    let arena = nvme_tier(plan, file, r8)?;
+    let arena = nvme_tier(plan, file, r8, arena)?;
     let mut run = HostRun::build(Arc::clone(file), first, r8, widths, layers)?;
     run.attach_tier(arena)?;
     Ok(run)
@@ -1824,8 +1827,18 @@ fn placed_pre(
     let gpu = Gpu::open_card(&spec.name, spec.device)?;
     let context = t.elapsed();
     let available = workstation::host_available().map_err(|e| GpuError::plan(what, e))?;
-    HostNeed::of(plan, extra_bytes)
-        .check(available)
+    // A plan with an arena may find the host short of its need by less than
+    // the arena's room above its floor: the tier is then built over what
+    // the reading leaves, never silently — the `nvtier` record names both.
+    let least = if plan.host.nvme_arena_bytes > 0 {
+        ArenaFloor::of(plan, ARENA_COLUMNS)
+            .map_err(|e| GpuError::plan(what, e))?
+            .bytes
+    } else {
+        0
+    };
+    let grant = HostNeed::of(plan, extra_bytes)
+        .grant(available, least)
         .map_err(|e| GpuError::plan(what, e))?;
     let t = Instant::now();
     let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
@@ -1834,7 +1847,8 @@ fn placed_pre(
     derive(gpu.stream(), file, layers.clone(), &mut weights)?;
     let derived = t.elapsed();
     let t = Instant::now();
-    let residency = HostResidency::at_load_with(file, plan, |_| true, host, extra)?;
+    let residency =
+        HostResidency::at_load_with(file, plan, |_| true, host, extra)?.with_arena(grant);
     let host_set = t.elapsed();
     Ok((
         PlacedPre {

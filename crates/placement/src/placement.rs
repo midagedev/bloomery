@@ -940,8 +940,10 @@ pub enum PlacementError {
          beside the routed experts {base} B + 3 × the heaviest layer's host-served experts \
          {layer} B: two layers' transient reads and one layer's resident experts{least}), the \
          plan's need being {need} B: free host memory, or load by a placement whose cards hold \
-         more of the model",
-        least = least_term(.arena.as_ref())
+         more of the model; a room read from the host is the reading less {drift} B, the host \
+         bytes the load's own start may take",
+        least = least_term(.arena.as_ref()),
+        drift = workstation::HOST_DRIFT
     )]
     HostRoomFloor {
         room: u64,

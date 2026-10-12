@@ -1622,6 +1622,7 @@ impl Body {
             &file,
             run.start,
             host.r8,
+            residency.arena(),
             HostWidths {
                 embd: hp.n_embd,
                 ff: hp.expert_ff,

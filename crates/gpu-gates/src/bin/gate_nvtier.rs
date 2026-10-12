@@ -242,7 +242,7 @@ use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
 use model::moe::UNION_BATCH_IDS;
 use model::placement::churn::ChurnPool;
 use model::placement::host_lock::page_bytes;
-use model::placement::workstation::{HostNeed, HostRead};
+use model::placement::workstation::{ArenaGrant, HostNeed, HostRead};
 use model::placement::{ARENA_COLUMNS, ArenaFloor, Machine, PlanLevers};
 use runtime::{Out, Target, Want};
 
@@ -2406,7 +2406,7 @@ fn refuse_clauses(
     let with_arena = |bytes: u64| {
         let mut p = plan.clone();
         p.host.nvme_arena_bytes = bytes;
-        NvTier::of_paged(&p, &split, true)
+        NvTier::of_paged(&p, &split, true, ArenaGrant::whole(bytes))
     };
     let slot = match with_arena(1) {
         Err(e) => e.to_string().contains("carves 0 slots"),

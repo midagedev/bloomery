@@ -45,6 +45,9 @@ pub struct PlanInputs {
     /// NVMe tier by their role at any room, so no row-table tier runs here. A
     /// gate that plans an arm by a room of its own sets it, read
     /// [`HostRead::Given`].
+    ///
+    /// The plan is made at [`workstation::plan_room`]: a read room less
+    /// [`workstation::HOST_DRIFT`], a given room as given.
     pub room: (u64, HostRead),
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
@@ -149,7 +152,7 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         let kv = self.seq_terms().slots_of(slots.get() as u64);
         let mut plan = placement::plan(&self.model, machine, ctx_max, &kv, levers)?;
-        placement::expert_nvme_tier(&mut plan, self.room.0, self.arena)?;
+        placement::expert_nvme_tier(&mut plan, workstation::plan_room(&self.room), self.arena)?;
         checked(plan).map_err(PlaceError::Broken)
     }
 

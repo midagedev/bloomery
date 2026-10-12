@@ -6,6 +6,7 @@ use crate::GpuError;
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::placement::host_lock::{HostLock, HostSet, Walk};
+use model::placement::workstation::ArenaGrant;
 use model::placement::{ExpertList, ModelTensor, Plan};
 use model::r8file::{HostR8, R8Source};
 
@@ -17,6 +18,7 @@ pub struct HostResidency {
     set: HostSet,
     populate: Option<Walk>,
     lock: Option<HostLock>,
+    arena: ArenaGrant,
 }
 
 impl HostResidency {
@@ -64,7 +66,17 @@ impl HostResidency {
             set,
             populate,
             lock,
+            arena: ArenaGrant::whole(plan.host.nvme_arena_bytes),
         })
+    }
+
+    /// This load with the NVMe tier arena `arena` the host's reading let it
+    /// take ([`HostNeed::grant`](model::placement::workstation::HostNeed::grant)),
+    /// in place of the plan's own.
+    #[must_use]
+    pub fn with_arena(mut self, arena: ArenaGrant) -> HostResidency {
+        self.arena = arena;
+        self
     }
 
     /// The host set the load walked.
@@ -83,5 +95,12 @@ impl HostResidency {
     #[must_use]
     pub fn lock(&self) -> Option<&HostLock> {
         self.lock.as_ref()
+    }
+
+    /// The NVMe tier arena the load builds: the plan's, or what the host's
+    /// reading left of it ([`HostResidency::with_arena`]).
+    #[must_use]
+    pub fn arena(&self) -> ArenaGrant {
+        self.arena
     }
 }
