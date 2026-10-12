@@ -5939,6 +5939,11 @@ mod gate {
         wide: usize,
         past_over: usize,
         past_worst: f64,
+        /// Of the flips first on their path, the largest pair error over the
+        /// cap and the widest gap over the margin bound: how near the held
+        /// ones sit to their rules.
+        first_worst: f64,
+        first_widest: f64,
         /// Flips whose reference margin (its eighth pick's ranked value less
         /// the best it left) lies past [`route_cap`], on any path (printed).
         margin_over: usize,
@@ -6021,6 +6026,7 @@ mod gate {
         }
         let (mut refused, mut first, mut wide, mut shown) = (0usize, 0usize, 0usize, 0usize);
         let (mut past_over, mut past_worst, mut past_shown) = (0usize, 0.0f64, 0usize);
+        let (mut first_worst, mut first_widest) = (0.0f64, 0.0f64);
         let (mut margin_over, mut margin_first) = (0usize, 0usize);
         let mut margins = Vec::with_capacity(flips.len());
         for (f, cap, bound) in &flips {
@@ -6036,12 +6042,14 @@ mod gate {
             let over = !f.allowed(*cap);
             let at_wide = !prior && (widest > *bound || widest.is_nan());
             let bad = !prior && (over || at_wide || wide_margin);
+            let err = f.pairs.iter().map(|p| p.3).fold(0.0f64, f64::max);
             if prior {
                 past_over += usize::from(over);
-                let err = f.pairs.iter().map(|p| p.3).fold(0.0f64, f64::max);
                 past_worst = past_worst.max(err / cap);
             } else {
                 first += 1;
+                first_worst = first_worst.max(err / cap);
+                first_widest = first_widest.max(widest / bound);
                 margin_first += usize::from(wide_margin);
                 refused += usize::from(over);
                 wide += usize::from(at_wide);
@@ -6082,6 +6090,8 @@ mod gate {
             wide,
             past_over,
             past_worst,
+            first_worst,
+            first_widest,
             margin_over,
             margin_first,
             margins: {
@@ -6168,7 +6178,8 @@ mod gate {
             && points == marks(p);
         println!(
             "prompt batch G=1 P={p}: against calls of {CHUNK}: {} flip(s); {} first on their path, \
-             {} of them past the pair rule's cap, {} at a wide margin; {} past an earlier flip, {} \
+             {} of them past the pair rule's cap (the worst at {:.3} of it), {} at a wide margin \
+             (the widest at {:.3} of the bound); {} past an earlier flip, {} \
              of them past the cap, the worst at {:.2} of it (printed); the reference's margins \
              over the cap at the flips: median {:.3}, 99th percentile {:.3}, largest {:.3}, {} \
              past it, {} of them first on their path (held); the stores of layers 0..={reach} (no flip's path) held to their bands, \
@@ -6181,7 +6192,9 @@ mod gate {
             tally.flips,
             tally.first,
             tally.refused,
+            tally.first_worst,
             tally.wide,
+            tally.first_widest,
             tally.flips - tally.first,
             tally.past_over,
             tally.past_worst,
