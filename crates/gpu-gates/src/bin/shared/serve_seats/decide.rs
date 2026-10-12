@@ -69,7 +69,7 @@ use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
 use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
 use bloomery_gpu_gates::generate::Place;
-use bloomery_gpu_gates::record::{self, Kind, Record};
+use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
 use cuda_core::CudaContext;
@@ -89,19 +89,6 @@ use crate::{clef_seat, lev_seat};
 
 /// The seat's record bin name, the `listening` record's head.
 const WHAT: &str = "bloomery-serve-decide";
-
-/// What this seat prints, all on stderr (its `--records-schema`): the lines of the fetch of a head
-/// or a projector under `--hf` (the model's own are the server's, printed before the seat
-/// registers), the `vision` record of a resident image encoder, then the `listening` record.
-static KINDS: &[&Kind] = &[
-    &record::HF_OFFLINE,
-    &record::HF_FILE,
-    &record::HF_PROGRESS,
-    &record::HF_DONE,
-    &record::VISION_SEAT,
-    &record::VISION,
-    &record::LISTENING_DECIDE,
-];
 
 const USAGE: &str = "usage: bloomery-serve [--model decide] (-m PATH | --hf <repo>[:<quant>]) \
                      [--head <weights> [--head-config <file>]] [--mmproj FILE | --no-mmproj] \
@@ -667,7 +654,7 @@ fn head_files(from: Pick) -> Result<HeadFiles, GateError> {
 /// file came from under `--hf`: the model's name, else its file name.
 pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, GateError> {
     bloomery_levers::at_main(&[])?;
-    record::at_main(WHAT, KINDS);
+    record::at_main(WHAT, record::BLOOMERY_SERVE_DECIDE);
     let a = parse_args(args)?;
     let (row, head) = head_files(from)?;
     let model = ref_model_path()?;

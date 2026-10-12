@@ -138,6 +138,14 @@ impl Flags {
     /// `--hf` repo holds beside the model ([`crate::model_file::hf_projector`]) unless
     /// `--no-mmproj` says none. `None` serves no image.
     pub fn encoder(&self, takes: bool) -> Result<Option<PathBuf>, GateError> {
+        record::require(
+            record::groups::vision_seat::RECORDS,
+            "vision_seat::Flags::encoder",
+        );
+        record::require(
+            record::groups::model_file::FETCH,
+            "vision_seat::Flags::encoder",
+        );
         match self.mmproj()? {
             Some(file) => Ok(Some(file.to_owned())),
             None if takes && self.may_pick() => crate::model_file::hf_projector(),

@@ -1407,6 +1407,7 @@ impl SeatEngine {
         S: Seat,
         F: FnOnce() -> Result<S, GateError> + Send + 'static,
     {
+        crate::record::require(crate::record::groups::bind::CACHE, "bind::spawn");
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let (opened, loaded) = mpsc::channel::<
@@ -1415,6 +1416,7 @@ impl SeatEngine {
                     usize,
                     usize,
                     usize,
+                    bool,
                     bool,
                     bool,
                     bool,
@@ -1443,6 +1445,7 @@ impl SeatEngine {
                         g.slot_drafts(),
                         g.drafts_sampled(),
                         g.snapshots_async(),
+                        g.step_stats() && g.slots() >= 2,
                         g.media_model(),
                         g.props(props),
                     )))
@@ -1585,13 +1588,18 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, slots, drafts, media, props) = match loaded.recv() {
-            Ok(Ok((c, rows, n, d, ds, sa, m, props))) => {
-                (c.min(defined), rows, n, [d, ds, sa], m, props)
+        let (ctx_max, rows, slots, drafts, media, props, counts) = match loaded.recv() {
+            Ok(Ok((c, rows, n, d, ds, sa, counts, m, props))) => {
+                (c.min(defined), rows, n, [d, ds, sa], m, props, counts)
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
+        // The seat counts its rounds and serves several slots: its `slots round` and `slot call`
+        // records print from now on.
+        if counts {
+            crate::record::require(crate::record::groups::bind::SLOTS, "bind::spawn");
+        }
         Ok(SeatEngine {
             link: Link {
                 tx: Some(tx),

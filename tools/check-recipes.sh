@@ -397,6 +397,7 @@ blk_pytools() {
     "tools/check-comment-only.py --self-test"
     "tools/check-defaults.py --self-test"
     "tools/check-ptx-names.py --self-test"
+    "tools/check-records.py --self-test"
     "tools/flow/ds41_prefill.py --self-test"
     "tools/flow/pplb.py --self-test"
     "tools/flow/q38_step.py --self-test"

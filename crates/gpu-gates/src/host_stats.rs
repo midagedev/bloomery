@@ -81,6 +81,7 @@ pub fn faults() -> Result<(u64, u64), GateError> {
 /// go waits of the step's services (the probe after the step holds them),
 /// zeros when it ran none.
 pub fn print_stats(probes: &[Probe], warm: usize) {
+    record::require(record::groups::host_stats::STATS, "host_stats::print_stats");
     let mut legs: Vec<f64> = Vec::with_capacity(probes.len());
     let (mut straggle_max, mut slots, mut majflt, mut minflt) = (0.0_f64, 0_u64, 0_u64, 0_u64);
     let mut vram_free_min = u64::MAX;

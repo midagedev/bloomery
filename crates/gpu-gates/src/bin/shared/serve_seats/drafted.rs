@@ -94,6 +94,8 @@ where
         log: &mut impl RowsLog,
         mut open: impl FnMut(&GpuModel<B>) -> Result<MtpDraft<B>, SessionError>,
     ) -> Result<Self, GateError> {
+        record::require(record::groups::drafted::PROMPT, "drafted::SlotDrafts::open");
+        record::require(record::groups::drafted::WIDTH, "drafted::SlotDrafts::open");
         if slots == 0 {
             return Err("the MTP drafts of no slot".into());
         }
@@ -433,6 +435,7 @@ fn print_join<B: MtpBody, const M: usize>(spec: &mut Spec<B, M>) {
 /// whose passes are the draft's own, and nothing for a request that ran no
 /// pass. The ds41 seat drains its own drafts the same way.
 pub(crate) fn print_widths<D, const M: usize>(spec: &mut Speculative<Choosing<D>, M>) {
+    record::require(record::groups::drafted::WIDTH, "drafted::print_widths");
     let choosing = spec.draft_mut();
     if choosing.mode() != WidthMode::Cost {
         return;
