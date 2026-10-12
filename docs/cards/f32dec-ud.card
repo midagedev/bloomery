@@ -1,0 +1,12 @@
+# A Qwen3.6 F32 site at one column runs f32_gemv instead of the one-block F32 tile (site::gemv). The UD-Q4_K_XL
+# decode window before: 8.633 ms @ depth 6 with f32_tile_gemm 60 launches, 1963.3 us at grid 1x1x1 (g3-nsys35 sitting).
+# f32_gemv for a 32 x 2048 f32 site: 4 blocks, a warp a row, 8 KB a warp: 2-5 us a launch [derived] -> 0.12-0.30 ms.
+kind: profile
+question: does the one-column F32 dispatch remove the one-block tile's 1.96 ms from the UD decode window?
+term: generate_qwen3moe window wall ms @ n=96, depth 6, UD-Q4_K_XL, A6000 (nsys seed form)
+unit: ms
+predict: 6.79..6.97 ms
+condition: lease held; seed form; the Q4_K_M window at depth 6 within 1 % of the g3-nsys35 sitting's 4.93 ms or the sitting is void
+decide-in: land f32dec; the UD serve row is re-measured in the release pass
+decide-below: land f32dec; read which other kernel moved
+decide-above: f32_gemv at 32 rows is slower than derived; read its per-launch time before landing

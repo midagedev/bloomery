@@ -11,9 +11,10 @@
 //! The launches by type and arm:
 //! - [`gemv`], a unit of at most eight columns over the f32 rows: Q8_0 the
 //!   q8f32 gemv (`q8_0_gemv` at one column, `q8_0_gemv_mcol` token-major
-//!   past it, the two bit for bit equal on a column), F32 the F32 tile
-//!   (`f32_tile_gemm`, token-major, bit for bit `f32_gemv` on every row and
-//!   column). A K-quant site's gemv is [`kgemv`].
+//!   past it, the two bit for bit equal on a column), F32 `f32_gemv` at one
+//!   column and the F32 tile past it (`f32_tile_gemm`, token-major, bit for
+//!   bit `f32_gemv` on every row and column). A K-quant site's gemv is
+//!   [`kgemv`].
 //! - [`kgemv`], a K-quant site at most eight columns over the q8_1 rows:
 //!   Q3_K, Q4_K and Q6_K their gemvs, row-major (`m` outputs a row); Q5_K
 //!   the K-quant down `_sel` over a stack of one expert, token-major (a slot
@@ -287,6 +288,12 @@ pub fn gemv(
                     },
                 )
             }
+        }
+        // One column runs `f32_gemv`, a warp a row: the tile gives the same bits in one block
+        // for a site of 32 rows or fewer.
+        SiteTy::F32 if m == 1 => {
+            gpu.q8f32()
+                .enqueue_f32_gemv(stream, w.f32_tensor(WHAT, name)?, x, 1, y)
         }
         SiteTy::F32 => g32.enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, x, m, y),
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => Err(GpuError::shape(
