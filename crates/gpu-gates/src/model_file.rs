@@ -10,7 +10,8 @@
 //! [`fetch_exact`]. A family's MTP draft ([`refset::arch::beside_drafts`], one
 //! row per family that keeps its draft in a file of its own) is fetched beside
 //! a set only when the plan's own rule says the set can run it
-//! ([`draft_usable`]).
+//! ([`draft_usable`]). A seat's image projector under `--hf` is the repo's own
+//! beside the model ([`hf_projector`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -26,6 +27,9 @@ use crate::record::{self, Record};
 
 /// The model file a server named on its command line, set once.
 static MODEL_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// The `--hf` repo the model file came from, set once beside it ([`name`]).
+static MODEL_REPO: OnceLock<String> = OnceLock::new();
 
 /// The process's model file is `path` from now on; a second call is
 /// refused by name.
@@ -45,6 +49,12 @@ pub fn set_model_file(path: PathBuf) -> Result<(), GateError> {
 /// The model file a server set, if one.
 pub(crate) fn model_file() -> Option<&'static PathBuf> {
     MODEL_FILE.get()
+}
+
+/// The `--hf` repo the process's model file came from; `None` for a file named by path.
+#[must_use]
+pub fn hf_repo() -> Option<&'static str> {
+    MODEL_REPO.get().map(String::as_str)
 }
 
 /// The model flags taken out of `args` ([`source::take`]: `path_flags`
@@ -202,6 +212,48 @@ pub fn name(flags: &Flags) -> Result<(), GateError> {
         && let Some(path) = resolve(flags, env.as_deref())?
     {
         set_model_file(path)?;
+        // A path flag wins over `--hf` ([`source::resolve`]), so the file is the repo's only
+        // without one.
+        if let (None, Some(h)) = (&flags.path, &flags.hf) {
+            let repo = hf::RepoRef::parse(h)?.repo;
+            MODEL_REPO.set(repo).map_err(|r| {
+                format!("the model's --hf repo is set already, and a second set names {r}")
+            })?;
+        }
     }
     Ok(())
+}
+
+/// The image projector the `--hf` repo holds beside the process's model file, a set's first
+/// shard in the cache (`<root>/<owner>/<name>/<path in the repo>`, which gives the cache root and
+/// the model's path in the repo): the listing's `mmproj` sibling of the model
+/// ([`hf::mmproj_sibling`], through [`Client::mmproj_path`]), fetched and checked. `None` when
+/// the model file was named by path, or the repo holds no projector.
+pub fn hf_projector() -> Result<Option<PathBuf>, GateError> {
+    let (Some(repo), Some(model)) = (hf_repo(), model_file()) else {
+        return Ok(None);
+    };
+    let in_repo = || {
+        format!(
+            "--hf {repo}: the model file {} is not under the repo's cache directory",
+            model.display()
+        )
+    };
+    let at = model
+        .ancestors()
+        .find(|a| a.ends_with(repo))
+        .ok_or_else(in_repo)?;
+    let rel = model
+        .strip_prefix(at)?
+        .to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", model.display()))?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let root = at
+        .ancestors()
+        .nth(repo.split('/').count())
+        .ok_or_else(in_repo)?;
+    let Some(path) = Client::new(root.to_path_buf())?.mmproj_path(repo, &rel)? else {
+        return Ok(None);
+    };
+    Ok(fetch_exact(repo, &[path.as_str()])?.into_iter().next())
 }

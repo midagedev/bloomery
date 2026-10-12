@@ -417,9 +417,11 @@ fn vision_of(
         imrope: None,
         ple: PleImage::Absent,
     };
+    // The `--hf` repo's projector is taken only where a span's rows can enter.
+    let file = a.vision.encoder(prefill == body::PrefillMode::Batch)?;
     vision_seat::open_seat(
         &a.vision,
-        a.vision.mmproj()?,
+        file.as_deref(),
         a.place,
         &[vision::arch::deepseek41v::PROJECTOR_TYPE],
         &facts,
@@ -519,8 +521,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // text model's embedding width and vocabulary.
     let n_embd = inputs.hp.n_embd;
     let token = |id| vocab.tokenizer().text(id).map(str::to_owned);
+    // A projector the `--hf` repo picked stays only where the plan gives the text model the same
+    // experts and context with its reserve as without ([`vision_seat::kept`]).
     #[cfg(feature = "vision")]
-    let vision = vision_of(&a, cfg.body.prefill, n_embd, &token)?;
+    let vision = vision_seat::kept(
+        vision_of(&a, cfg.body.prefill, n_embd, &token)?,
+        &a.vision,
+        |v| {
+            let mut machine = a.place.machine(reserve, tier_batch)?(inputs.model.layers);
+            vision_seat::reserve_on(&mut machine, v.and_then(|v| v.seat.reserve));
+            let ctx = u64::try_from(ctx)?;
+            reserve_checkpoints(&mut machine, Seqs::none(slots.get()), ctx)?;
+            let plan = inputs.plan_with_slots(&machine, ctx, &cfg.place, slots)?;
+            Ok(vision_seat::Cost::of(&plan, ctx))
+        },
+    )?;
     #[cfg(feature = "vision")]
     let vision_reserve = vision.as_ref().and_then(|v| v.seat.reserve);
     #[cfg(not(feature = "vision"))]
