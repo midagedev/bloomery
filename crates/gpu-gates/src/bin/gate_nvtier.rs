@@ -180,6 +180,18 @@
 //!   the reader ran victim jobs and prompt jobs (each kind counted alone),
 //!   flips landed, and the lane's copies read arena slots. The copies' reads
 //!   of the file mapping are printed, not judged.
+//! - `grant` (clause 13, two child processes of this binary): the load's
+//!   reading of the host is set by `BLOOMERY_HOST_ROOM` in the child's
+//!   environment, which a process reads when it loads and which this process
+//!   leaves unset. A load whose reading is short of the paged plan's need
+//!   by [`GRANT_SHORT`] or one slot set, the larger (half the arena's room
+//!   above its floor when that is less) takes the arena the plan reserved
+//!   less that shortfall — the tier's `arena_planned` is the plan's,
+//!   `arena_granted` the plan's less
+//!   the shortfall, and the slots a paged layer carved are the granted
+//!   budget's, fewer than the planned budget's — and decodes the arm's steps
+//!   bit for bit the paged arm's; a reading short by the room above the
+//!   floor and one byte is refused naming the floor.
 //!
 //! PIN(2026-10-11): clause 7 judges 0 interior pages after the prompt, where it judged at most `layers x cpus x 2R`. Derived, not measured: the prompt's union reads every tier id from its arena slot (`prefetch_pinned`), so it faults no page of a drop run, and no drop follows it (`release_union` is gone), so a page of a run read after the prompt would stay. The interiors leave out the edge bands where the host segment's own reads reach. The pre-change run (R4b-1, the same union) read 0 against the old bound of 196608. FAIL-first: a layer left unattached to the tier reads the mapping and its interior pages stay, turning the clause red.
 //!
@@ -221,6 +233,7 @@
 mod gate_card;
 
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -236,7 +249,9 @@ use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
-use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg, RESIDENCY38_SPARES};
+use bloomery_levers::{
+    CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HostCfg, RESIDENCY38_SPARES,
+};
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
 use model::moe::UNION_BATCH_IDS;
@@ -291,6 +306,20 @@ const PLAN_MARGIN: f64 = 1.5;
 /// prompt): printed beside the reading by `claim`, not judged — the replay
 /// runs a static card where the arm moves it.
 const STEP_MISSES_PREDICTED: u64 = 4_000;
+/// The `grant` clause's shortfall of the load's reading under the plan's
+/// need, in bytes (the 3060 host's), raised to one slot set when a slot set
+/// is larger, so the granted arena carves at least one slot fewer. A plan
+/// whose arena has less room above its floor takes half of that room
+/// instead.
+const GRANT_SHORT: u64 = 132_071_424;
+/// The argument that makes this binary one of the `grant` clause's children,
+/// followed by the child's role: [`GRANT_LOAD`] or [`GRANT_REFUSE`].
+const GRANT_CHILD: &str = "--grant-child";
+/// The child that loads the paged plan with the short reading and runs the
+/// paged arm's steps.
+const GRANT_LOAD: &str = "load";
+/// The child whose load is refused: a reading short past the arena's floor.
+const GRANT_REFUSE: &str = "refuse";
 
 fn main() -> std::process::ExitCode {
     exit_with(NAME, run())
@@ -1594,8 +1623,228 @@ fn plans_of(passes: &[PassReport]) -> Vec<Plan> {
         .collect()
 }
 
+/// The role this process runs as in the `grant` clause: `Some` of
+/// [`GRANT_LOAD`] or [`GRANT_REFUSE`] for a child of the gate, `None` for the
+/// gate itself.
+fn grant_role() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    args.find(|a| a == GRANT_CHILD)?;
+    args.next()
+}
+
+/// What the `grant` clause derives from the paged plan: the arena the plan
+/// reserved, its floor, the host need a load of the plan checks (the churn
+/// pool of the set residency inside it) and the shortfall the load's reading
+/// is given.
+struct GrantTerms {
+    planned: u64,
+    least: u64,
+    need: u64,
+    short: u64,
+}
+
+impl GrantTerms {
+    /// The terms of a plan that reserved `planned` bytes of arena over a
+    /// floor of `least`, carved in slot sets of `slot_set` bytes, and whose
+    /// load needs `need`. Refused by name: an arena with no room above its
+    /// floor to shrink into.
+    fn of(planned: u64, least: u64, slot_set: u64, need: u64) -> Result<GrantTerms, GateError> {
+        let room = planned
+            .checked_sub(least)
+            .filter(|&r| r > 1)
+            .ok_or_else(|| {
+                format!(
+                    "the grant clause's plan reserves an arena of {planned} B over a floor of \
+                     {least} B: no room above the floor to shrink into"
+                )
+            })?;
+        let wanted = GRANT_SHORT.max(slot_set);
+        let short = if wanted < room { wanted } else { room / 2 };
+        Ok(GrantTerms {
+            planned,
+            least,
+            need,
+            short,
+        })
+    }
+
+    /// The arena's room above its floor.
+    fn room(&self) -> u64 {
+        self.planned - self.least
+    }
+
+    /// The reading that leaves a load `short` bytes under its need.
+    fn reading(&self, short: u64) -> Result<u64, GateError> {
+        self.need.checked_sub(short).ok_or_else(|| {
+            format!(
+                "the grant clause's shortfall {short} B is past the load's need {} B",
+                self.need
+            )
+            .into()
+        })
+    }
+}
+
+/// What the `grant` clause's children answered: the load child's tier and
+/// run, the refuse child's text.
+struct GrantRun {
+    planned: u64,
+    granted: u64,
+    budget: u64,
+    slot_set: u64,
+    slots: u64,
+    tokens: Vec<u32>,
+    digests: Vec<u64>,
+    refusal: String,
+}
+
+/// The value of `key=` in a child's answer line.
+fn grant_field<'a>(line: &'a str, key: &str) -> Result<&'a str, GateError> {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+        .ok_or_else(|| format!("the grant child's line has no {key}: {line}").into())
+}
+
+/// The comma-joined values of `key=` in a child's answer line, parsed.
+fn grant_list<T>(line: &str, key: &str) -> Result<Vec<T>, GateError>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    Ok(grant_field(line, key)?
+        .split(',')
+        .map(str::parse::<T>)
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Runs this binary as a `grant` child of `role` with the load's reading of
+/// the host set to `reading` bytes, forwards its output and returns its
+/// stdout. A child that ends nonzero is an error by name.
+fn grant_spawn(role: &str, reading: u64) -> Result<String, GateError> {
+    let t = Instant::now();
+    let out = Command::new(std::env::current_exe()?)
+        .arg(GRANT_CHILD)
+        .arg(role)
+        .env(HOST_ROOM, reading.to_string())
+        .output()
+        .map_err(|e| format!("grant: run the {role} child: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    for line in stdout.lines() {
+        println!("[grant {role}] {line}");
+    }
+    for line in String::from_utf8_lossy(&out.stderr).lines() {
+        eprintln!("[grant {role}] {line}");
+    }
+    println!(
+        "grant {role}: the child at BLOOMERY_HOST_ROOM {reading} B ended {} in {:.1} s",
+        out.status,
+        t.elapsed().as_secs_f64()
+    );
+    if !out.status.success() {
+        return Err(format!("grant: the {role} child ended {}", out.status).into());
+    }
+    Ok(stdout)
+}
+
+/// The `grant` clause's two children: the load short of its need by
+/// `terms.short`, and the load short past the arena's floor.
+fn grant_run(terms: &GrantTerms) -> Result<GrantRun, GateError> {
+    let loaded = grant_spawn(GRANT_LOAD, terms.reading(terms.short)?)?;
+    let line = loaded
+        .lines()
+        .find_map(|l| l.strip_prefix("grant-load "))
+        .ok_or("the grant load child printed no grant-load line")?;
+    let refused = grant_spawn(GRANT_REFUSE, terms.reading(terms.room() + 1)?)?;
+    let refusal = refused
+        .lines()
+        .find_map(|l| l.strip_prefix("grant-refuse "))
+        .ok_or("the grant refuse child printed no grant-refuse line")?
+        .to_string();
+    Ok(GrantRun {
+        planned: grant_field(line, "planned")?.parse()?,
+        granted: grant_field(line, "granted")?.parse()?,
+        budget: grant_field(line, "budget")?.parse()?,
+        slot_set: grant_field(line, "slot_set")?.parse()?,
+        slots: grant_field(line, "slots")?.parse()?,
+        tokens: grant_list(line, "tokens")?,
+        digests: grant_list(line, "digests")?,
+        refusal,
+    })
+}
+
+/// A `grant` child: the paged plan loaded with the reading its environment
+/// sets, as the paged arm loads it — [`GRANT_LOAD`] runs the arm's steps and
+/// prints the tier's arena and slots with the tokens and digests, and
+/// [`GRANT_REFUSE`] prints the load's refusal (`loaded` when it was not
+/// refused). The gate reads the answer line.
+fn grant_child(
+    role: &str,
+    path: &Path,
+    machine: &Machine,
+    residency: Residency,
+    host: HostCfg,
+    ids: &[u32],
+    probe: &Split,
+) -> Result<(), GateError> {
+    let load = || {
+        arm(
+            path,
+            machine,
+            Some(ROOM),
+            residency,
+            host,
+            ids,
+            false,
+            probe,
+            None,
+        )
+    };
+    match role {
+        GRANT_LOAD => {
+            let run = load()?;
+            let tier = run
+                .tier
+                .as_deref()
+                .ok_or("the grant load child's load built no arena")?;
+            let arena = tier.arena();
+            let join = |v: Vec<String>| v.join(",");
+            println!(
+                "grant-load planned={} granted={} budget={} slot_set={} slots={} tokens={} \
+                 digests={}",
+                arena.planned,
+                arena.granted,
+                tier.budget(),
+                tier.slot_set(),
+                tier.stats().slots_per_layer,
+                join(run.tokens.iter().map(u32::to_string).collect()),
+                join(run.digests.iter().map(u64::to_string).collect()),
+            );
+            Ok(())
+        }
+        GRANT_REFUSE => {
+            let refusal = match load() {
+                Ok(_) => "loaded".to_string(),
+                Err(e) => e.to_string().replace('\n', " "),
+            };
+            println!("grant-refuse {refusal}");
+            Ok(())
+        }
+        other => {
+            Err(format!("{GRANT_CHILD} takes {GRANT_LOAD} or {GRANT_REFUSE}, not {other}").into())
+        }
+    }
+}
+
 fn run() -> Result<(), GateError> {
-    let levers = bloomery_levers::at_main(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
+    // A `grant` child reads `BLOOMERY_HOST_ROOM`, the reading the gate sets
+    // for it; the gate itself leaves it unset.
+    let role = grant_role();
+    let acts_on: &[&str] = if role.is_some() {
+        &[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, HOST_ROOM]
+    } else {
+        &[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED]
+    };
+    let levers = bloomery_levers::at_main(acts_on)?;
     record::at_main(NAME, record::GATE_NVTIER);
     let host = levers.host();
     let audit = std::env::args().any(|a| a == "--audit");
@@ -1610,6 +1859,18 @@ fn run() -> Result<(), GateError> {
         Experts::Card,
     );
     let plan = inputs.plan_with(&machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
+    if let Some(role) = &role {
+        let residency = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
+        return grant_child(
+            role,
+            path,
+            &machine,
+            residency,
+            host,
+            &prose38(PROMPT)?,
+            &probe,
+        );
+    }
     let mut pass = true;
 
     // `residency` (clause 5): the unset rule on the paged plan resolves
@@ -1649,6 +1910,12 @@ fn run() -> Result<(), GateError> {
     );
     pass &= refuse_clauses(path, &machine, &plan)?;
     let least = ArenaFloor::of(&plan, ARENA_COLUMNS)?;
+    let grant_terms = GrantTerms::of(
+        plan.host.nvme_arena_bytes,
+        least.bytes,
+        least.slot_set,
+        HostNeed::of(&plan, pool).bytes(),
+    )?;
     let (layers, experts) = (plan.model.layers, plan.model.experts as u32);
     drop(plan);
 
@@ -1661,6 +1928,9 @@ fn run() -> Result<(), GateError> {
         Some(readahead_pages(path)?)
     };
     let band = window.map(edge_band);
+    // `grant` (clause 13)'s children run before the paged arm holds its
+    // arena; their answer is read after the `bits` line.
+    let grant = grant_run(&grant_terms);
     let mut paged = arm(
         path,
         &machine,
@@ -1686,6 +1956,65 @@ fn run() -> Result<(), GateError> {
         verdict(bits)
     );
     pass &= bits;
+
+    // `grant` (clause 13): a load short of the paged plan's need took the
+    // arena the plan reserved less the shortfall, the slots carved are the
+    // granted budget's (`slots_of`'s own division, a crate-private fn) and
+    // fewer than the planned budget's, the steps are the paged arm's bit
+    // for bit, and a reading short past the floor is refused naming it.
+    let grant_ok = match &grant {
+        Ok(g) => {
+            let t = &grant_terms;
+            let (planned_slots, granted_slots) =
+                (g.planned / g.slot_set.max(1), g.granted / g.slot_set.max(1));
+            let arena_ok =
+                g.planned == t.planned && g.granted == t.planned - t.short && g.budget == g.granted;
+            let slots_ok =
+                g.slot_set > 0 && g.slots == granted_slots && granted_slots < planned_slots;
+            let steps_ok =
+                !g.tokens.is_empty() && g.tokens == paged.tokens && g.digests == paged.digests;
+            let floor_text = format!("under its floor {} B", t.least);
+            let refused_ok = g.refusal.contains(&floor_text);
+            println!(
+                "grant: the plan reserves {} B over a floor of {} B and the load needs {} B; a \
+                 reading short by {} B: the tier's arena planned {} B granted {} B (want {}) \
+                 budget {} B: {}; a slot set is {} B, the tier carved {} slots a paged layer (the \
+                 granted budget's {granted_slots}, the planned budget's {planned_slots}): {}; \
+                 {} tokens and logits rows bit for bit the paged arm's: {}; a reading short by {} \
+                 B is refused naming the floor ({floor_text}): {}{}",
+                t.planned,
+                t.least,
+                t.need,
+                t.short,
+                g.planned,
+                g.granted,
+                t.planned - t.short,
+                g.budget,
+                verdict(arena_ok),
+                g.slot_set,
+                g.slots,
+                verdict(slots_ok),
+                g.tokens.len(),
+                verdict(steps_ok),
+                t.room() + 1,
+                verdict(refused_ok),
+                if refused_ok {
+                    String::new()
+                } else {
+                    format!(" — the child answered: {}", g.refusal)
+                }
+            );
+            arena_ok && slots_ok && steps_ok && refused_ok
+        }
+        Err(e) => {
+            println!(
+                "grant: the children did not answer: {e}: {}",
+                verdict(false)
+            );
+            false
+        }
+    };
+    pass &= grant_ok;
 
     let refused = paged
         .split_walk
