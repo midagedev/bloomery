@@ -20,7 +20,7 @@ use gguf::{GgmlType, Split};
 use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{new_cache, step};
 use model::moe::{
-    Claim, HostLayer, HostScratch, PinRelease, PinToken, TierError, TierPin, TierSlots,
+    Claim, HostLayer, HostScratch, PinRelease, PinToken, Ticket, TierError, TierPin, TierSlots,
     UnionScratch,
 };
 use model::ops::{Lanes, ShardTensor, Tensor2};
@@ -222,11 +222,24 @@ fn hw_a_ccd_dispatch_allocates_no_more_than_a_flat_one() {
 /// filled, and a pin takes an id buffer from a pool and hands it back cleared
 /// when it drops, the way the gpu tier's arena lends them — four buffers cut
 /// at the build, each with the capacity a pin can need.
+///
+/// With `late` set ([`PoolTier::late`]) a claim holding one of those ids is a
+/// pending ticket, as a miss is: the id lends nothing until the ticket is
+/// waited for, and the other ids of the claim are lent at once.
 struct PoolTier {
     parts: Vec<Vec<u8>>,
     idle: Mutex<Vec<Vec<u32>>>,
     /// The `ensure_pinned` calls the legs made.
     pins: AtomicU64,
+    /// Bit `id` set: the id's fill ends at the ticket's wait.
+    late: u64,
+    /// The late ids of the claim in flight, by bit; zero once it is waited for.
+    flight: AtomicU64,
+    /// The pending tickets issued.
+    pending: AtomicU64,
+    /// The lends made while a claim was in flight: its hits read under the
+    /// misses' fill, the step's two-group path.
+    early_lends: AtomicU64,
 }
 
 impl PoolTier {
@@ -248,7 +261,18 @@ impl PoolTier {
             parts,
             idle: Mutex::new(idle),
             pins: AtomicU64::new(0),
+            late: 0,
+            flight: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+            early_lends: AtomicU64::new(0),
         }
+    }
+
+    /// The tier with `ids` late: their fill ends at the ticket's wait.
+    fn late(mut self, ids: &[u32]) -> PoolTier {
+        assert!(ids.iter().all(|&id| id < 64), "late ids are bits of a word");
+        self.late = ids.iter().fold(0, |m, &id| m | 1u64 << id);
+        self
     }
 
     fn pinned(&self, layer: usize, ids: &[u32]) -> TierPin<'_> {
@@ -288,7 +312,33 @@ impl TierSlots for PoolTier {
         Ok(self.pinned(layer, ids))
     }
 
+    fn prefetch_pinned<'a>(
+        &'a self,
+        layer: usize,
+        ids: &[u32],
+        claim: Claim,
+    ) -> Result<Ticket<'a>, TierError> {
+        let in_flight = ids.iter().fold(0, |m, &id| m | ((1u64 << id) & self.late));
+        if in_flight == 0 {
+            return self.ensure_pinned(layer, ids, claim).map(Ticket::ready);
+        }
+        let pin = self.pinned(layer, ids);
+        self.flight.store(in_flight, Relaxed);
+        self.pending.fetch_add(1, Relaxed);
+        Ok(Ticket::new(move || {
+            self.flight.store(0, Relaxed);
+            Ok(pin)
+        }))
+    }
+
     fn slot(&self, _layer: usize, id: u32, part: usize) -> Option<&[u8]> {
+        let in_flight = self.flight.load(Relaxed);
+        if in_flight & (1u64 << id) != 0 {
+            return None;
+        }
+        if in_flight != 0 {
+            self.early_lends.fetch_add(1, Relaxed);
+        }
         Some(&self.parts[3 * id as usize + part])
     }
 }
@@ -373,5 +423,91 @@ fn hw_a_tier_pin_adds_no_allocator_call_to_the_step_legs() {
     assert!(
         paged <= flat + PIN_CALLS * 2 * 8, // two pins a call, eight calls
         "the legs over a paged layer made {paged} allocator calls over 8 calls, {flat} over the same layer with no tier"
+    );
+}
+
+/// Allocator calls a step union adds when some ids of its claim are misses,
+/// per call of the arm's two legs, against the same layer with no tier.
+///
+/// PIN(2026-10-12): 1. Derived from the code: the pending ticket's boxed wait
+/// is the one allocation a miss layer's union makes here, the model side's
+/// two-group path makes none, and the one-column leg pins as before. The
+/// tier's own issue allocates on top (the reader's job, its picks and
+/// closures, the prompt path's shape reused) and is the gpu crate's side;
+/// making it allocation-free is a tracker item.
+const MISS_CALLS: u64 = 1;
+
+/// A steady step whose union claim holds misses takes the two-group path and
+/// makes no more allocator calls than [`MISS_CALLS`] a call over the same
+/// layer with no tier. The arm proves it took that path: every union call was
+/// issued a pending ticket and its hits were lent while the misses were in
+/// flight. Counts are the least of three repeats of eight calls after twenty.
+#[test]
+#[ignore = "hw: needs the box; reads no model file"]
+fn hw_a_step_with_misses_pins_the_allocator_calls_of_its_miss_path() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let layer = r8layer::Layer::write("alloc-miss", 512, 256, 16, GgmlType::Q4_K);
+    let (embd, ff) = (layer.embd, layer.ff);
+    let split = Split::open(&layer.source).unwrap();
+    let src = R8Source::rows(&split);
+    let mut host = HostLayer::build(src, &layer.spec()).unwrap();
+    let mut hs = HostScratch::new(embd, ff, 4).unwrap();
+    let mut us = UnionScratch::new_routed(embd, ff, 3, 4).unwrap();
+    let x = Tensor2::from_vec(
+        embd,
+        1,
+        (0..embd).map(|i| (i % 17) as f32 / 9.0 - 0.9).collect(),
+    );
+    let x3 = Tensor2::from_vec(
+        embd,
+        3,
+        (0..3 * embd)
+            .map(|i| (i % 23) as f32 / 11.0 - 1.0)
+            .collect(),
+    );
+    let list =
+        |j: u32| -> Vec<(u32, f32)> { (0..4).map(|i| ((j * 5 + i * 3) % 16, 0.25)).collect() };
+    let lists = [list(0), list(1), list(2)];
+    let refs: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+    let (mut out1, mut out3) = (vec![0.0f32; embd], vec![0.0f32; 3 * embd]);
+    IS_MAIN.with(|m| m.set(true));
+    let mut least = |host: &HostLayer| {
+        let mut calls = |n: usize| {
+            for _ in 0..n {
+                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs)
+                    .unwrap();
+                host.experts_step_union_into_on(Lanes::Flat, src, &x3, &refs, &mut out3, &mut us)
+                    .unwrap();
+            }
+        };
+        calls(20);
+        let mut least = u64::MAX;
+        for _ in 0..3 {
+            let c0 = CALLS.load(Relaxed);
+            calls(8);
+            least = least.min(CALLS.load(Relaxed) - c0);
+        }
+        least
+    };
+    let flat = least(&host);
+    // The union lists ids 0 3 5 6 8 9 10 11 13 14: four are late, six are hits.
+    let tier = Arc::new(PoolTier::of(&split, &host, 16).late(&[5, 8, 11, 14]));
+    host.attach_tier(0, 0..0, tier.clone());
+    let missed = least(&host);
+    eprintln!(
+        "step legs, 8 calls of one-column + 3-column step union: {flat} allocator calls with no tier, {missed} with misses"
+    );
+    assert_eq!(
+        tier.pending.load(Relaxed),
+        20 + 3 * 8,
+        "every union call of the arm was issued a pending ticket: the arm took the miss path"
+    );
+    assert!(
+        tier.early_lends.load(Relaxed) > 0,
+        "the arm's hits were never lent while the misses were in flight: it did not take the two-group path"
+    );
+    assert!(
+        missed <= flat + MISS_CALLS * 8, // one miss union a call, eight calls
+        "the legs over a layer with misses made {missed} allocator calls over 8 calls, {flat} over the same layer with no tier"
     );
 }

@@ -1295,10 +1295,11 @@ impl UnionBatches {
     /// `plan`'s experts cut for a step served in two groups: the early group
     /// — the ones `host` holds, then the arena's `lent` ones — and the late
     /// one, the arena's others, each run ascending by id. `lent` is the tier's
-    /// answer for an arena id (held by the claim, or in flight); it decides
-    /// the same for an id on each of its two walks, since nothing publishes a
-    /// fill before the wait. Returns the early group's host experts and its
-    /// all.
+    /// answer for an arena id (held by the claim, or in flight). It is asked
+    /// once per id and the answer is the id's class: a fill published between
+    /// two asks would leave the id in neither group and the late span short
+    /// of the plan. The late ids wait in `ids` until `order` takes them.
+    /// Returns the early group's host experts and its all.
     fn split_step(
         &mut self,
         plan: &UnionPlan,
@@ -1307,21 +1308,19 @@ impl UnionBatches {
     ) -> (usize, usize) {
         let (order, ids) = (&mut self.order, &mut self.ids);
         order.clear();
-        let ds = || (0..plan.n()).map(|d| (d, plan.ids[d]));
-        order.extend(
-            ds().filter(|&(_, e)| host.contains(&e))
-                .map(|(d, _)| d as u32),
-        );
+        ids.clear();
+        let ds = || plan.ids.iter().enumerate().map(|(d, &e)| (d as u32, e));
+        order.extend(ds().filter(|(_, e)| host.contains(e)).map(|(d, _)| d));
         let n_host = order.len();
-        order.extend(
-            ds().filter(|&(_, e)| !host.contains(&e) && lent(e))
-                .map(|(d, _)| d as u32),
-        );
+        for (d, e) in ds().filter(|(_, e)| !host.contains(e)) {
+            if lent(e) {
+                order.push(d);
+            } else {
+                ids.push(d);
+            }
+        }
         let early = order.len();
-        order.extend(
-            ds().filter(|&(_, e)| !host.contains(&e) && !lent(e))
-                .map(|(d, _)| d as u32),
-        );
+        order.extend_from_slice(ids);
         ids.clear();
         ids.extend(order.iter().map(|&d| plan.ids[d as usize]));
         (n_host, early)
