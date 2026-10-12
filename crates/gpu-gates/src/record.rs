@@ -1962,6 +1962,24 @@ pub static RESIDENCY_RESET: Kind = Kind {
     ],
 };
 
+/// A serve request's warm open (`serve::Engine::warm_open`).
+pub static WARM: Kind = Kind {
+    name: "warm",
+    head: "warm",
+    doc: "A serve request's warm open on its slot: why (the server's reuse outcome `hit`, `cut`, \
+          `miss`, `nosection` or `resume`; `shape` when the section is of another shape than the \
+          rule's and the stream opened fresh; `off` under BLOOMERY_WARM=off), the slot, the \
+          section's bytes (0 with none), the residency streams live after the open and the kept \
+          rows dropped as stale since the load.",
+    parts: &[
+        key("why", Word, ""),
+        key("slot", U64, ""),
+        key("bytes", U64, "B"),
+        key("live", U64, ""),
+        key("stale_rows", U64, ""),
+    ],
+};
+
 /// A prompt call's pick at one (group, layer)
 /// ([`bloomery_gpu::host::swap::CallPick`]).
 pub static CALL_STREAM: Kind = Kind {
@@ -3067,6 +3085,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &WARM,
     &RESIDENCY_LEAK,
     &MTP_WIDTH,
     &SLOTS_ROUND,
@@ -3091,6 +3110,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &CALL_STREAM_END,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &WARM,
     &SLOTS_ROUND,
     &SLOT_CALL,
     &MTP_WIDTH,
@@ -3171,6 +3191,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &MTP_PROMPT,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &WARM,
     &RESIDENCY_LEAK,
     &SLOTS_ROUND,
     &SLOT_CALL,
@@ -3815,6 +3836,16 @@ pub fn residency_reset(r: &ResetReport) -> Record {
         .u("copies", r.copies)
         .u("diff", r.diff)
         .u("dropped_bytes", r.dropped_bytes)
+}
+
+/// A serve request's warm open: `why` as the kind's doc words it.
+pub fn warm(why: &str, slot: usize, bytes: usize, live: usize, stale_rows: u64) -> Record {
+    Record::new(&WARM)
+        .w("why", why)
+        .u("slot", slot as u64)
+        .u("bytes", bytes as u64)
+        .u("live", live as u64)
+        .u("stale_rows", stale_rows)
 }
 
 #[cfg(test)]

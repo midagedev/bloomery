@@ -35,7 +35,7 @@ pub use registry::{
     HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM, LANE_PREFETCH,
     LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NVTIER_BYTES,
     NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX,
-    QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS, WARM,
 };
 pub use registry::{SPLIT_WALK, XSTREAM};
 
@@ -974,8 +974,16 @@ impl Levers {
         Levers::usize_of(GEN_SLOTS, n)
     }
 
+    /// `BLOOMERY_WARM`: the serve seats carry each slot's residency heat
+    /// across requests, and a qwen4exp prompt call keeps its placement unless
+    /// another live stream holds rows.
+    #[must_use]
+    pub fn warm(&self) -> bool {
+        self.flag(WARM)
+    }
+
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],
-    /// [`CARD_DONTNEED`] and [`R8`].
+    /// [`CARD_DONTNEED`], [`R8`] and [`WARM`].
     #[must_use]
     pub fn host(&self) -> HostCfg {
         HostCfg {
@@ -983,6 +991,7 @@ impl Levers {
             lock: self.flag(HOST_LOCK),
             card_dontneed: self.flag(CARD_DONTNEED),
             r8: self.flag(R8),
+            warm: self.flag(WARM),
         }
     }
 
@@ -2276,6 +2285,10 @@ pub struct HostCfg {
     /// sidecar when there is one; `false` reads the source's, the
     /// same-binary arm.
     pub r8: bool,
+    /// [`WARM`]: a qwen4exp prompt call keeps its placement when no other
+    /// live stream holds rows; `false` keeps it only when the rule holds no
+    /// decode history.
+    pub warm: bool,
 }
 
 /// How the host tier's row dispatch lays its units over the pool

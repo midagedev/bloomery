@@ -227,8 +227,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, Vocab, begin, bind_server, model_props, note_line, parallel_line, placement_of,
-    put_back, slots_given,
+    SlotStep, Vocab, WarmCalls, begin, bind_server, model_props, note_line, parallel_line,
+    placement_of, put_back, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -304,6 +304,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
     bloomery_levers::STEP_STATS,
+    bloomery_levers::WARM,
 ];
 
 /// The drafted window's verify: the target's next token and the draft's one
@@ -947,7 +948,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         machine.cards[0].name.clone(),
         props,
         cache.ram,
-    )?;
+    )?
+    .with_warm(levers.warm());
 
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together (the engine declares its
@@ -1471,6 +1473,11 @@ impl Seat for Glm {
     fn reset(&mut self) -> Result<(), GateError> {
         let sel = self.s.selected();
         self.drafted.reset(&mut self.s, sel)
+    }
+
+    /// The session's model, for the warm calls.
+    fn warm_calls(&mut self) -> Option<&mut dyn WarmCalls> {
+        Some(self.s.model_mut())
     }
 
     /// [`Session::residency_reset`], its `residency reset` record on stderr;

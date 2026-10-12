@@ -151,6 +151,7 @@ mod tests {
                 bloomery_levers::HOST_LOCK,
                 bloomery_levers::CARD_DONTNEED,
                 bloomery_levers::R8,
+                bloomery_levers::WARM,
             ],
         ),
         ("host_lanes", &[bloomery_levers::HOST_LANES]),
@@ -163,6 +164,7 @@ mod tests {
         ("residency", &[bloomery_levers::RESIDENCY]),
         ("route_trace", &[bloomery_levers::ROUTE_TRACE]),
         ("step_stats", &[bloomery_levers::STEP_STATS]),
+        ("warm", &[bloomery_levers::WARM]),
         ("xstream", &[bloomery_levers::XSTREAM]),
     ];
 

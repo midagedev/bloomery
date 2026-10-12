@@ -58,13 +58,16 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
-use bloomery_gpu::GpuError;
 use bloomery_gpu::checkpoint::saved::{Pending as Saving, SeqView};
 use bloomery_gpu::checkpoint::staging::NoRoom;
+use bloomery_gpu::host::WarmOpened;
+use bloomery_gpu::model::ChainBody;
+use bloomery_gpu::{GpuError, GpuModel};
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
 use model::placement::{Device, Machine, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
+use serve::engine::WarmWhy;
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER,
@@ -882,6 +885,16 @@ enum Cmd {
     Pos,
     /// The residency back to its seed.
     ResidencyReset,
+    /// Close `slot`'s residency stream and take its warm section
+    /// ([`Seat::warm_close`]).
+    WarmClose(usize),
+    /// Open `slot`'s residency stream from `section` or fresh
+    /// ([`Seat::warm_open`]).
+    WarmOpen {
+        slot: usize,
+        section: Option<Vec<u8>>,
+        expected: f64,
+    },
     /// Make `slot` the one every later command acts on ([`Seat::select`]).
     Select(usize),
     /// A step of several slots in one command ([`SeatEngine`]'s
@@ -952,6 +965,10 @@ enum Extra {
     },
     /// A `ResidencyReset`'s report; `None` for a seat with no residency.
     Residency(Option<ResidencyReset>),
+    /// A `WarmClose`'s section; `None` for a seat with no residency.
+    Section(Option<Vec<u8>>),
+    /// A `WarmOpen`'s outcome; `None` for a seat with no residency.
+    Warmed(Option<WarmOpened>),
     /// A `StepSlots`' rows, their answers set and their lent rows filled.
     StepSlots(Vec<SlotStep>),
     /// A `PassSlots`' rows, their kept ids and drafted counts set.
@@ -1209,10 +1226,91 @@ pub trait Seat: 'static {
     fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, GateError> {
         Ok(None)
     }
+    /// The seat's model for the warm calls ([`WarmCalls`]); `None`, the
+    /// default, for a seat with no residency. The one hook a seat gives: the
+    /// calls below are written once.
+    fn warm_calls(&mut self) -> Option<&mut dyn WarmCalls> {
+        None
+    }
+    /// Close serving slot `slot`'s residency stream at its request's end and
+    /// return its warm section ([`GpuModel::warm_close`]); `None` for a seat
+    /// with no residency.
+    fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, GateError> {
+        match self.warm_calls() {
+            Some(m) => Ok(m.warm_close(slot)?),
+            None => Ok(None),
+        }
+    }
+    /// Open serving slot `slot`'s residency stream at its request's start,
+    /// from `section` or fresh ([`GpuModel::warm_open`]); `None` for a seat
+    /// with no residency.
+    fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<Option<WarmOpened>, GateError> {
+        match self.warm_calls() {
+            Some(m) => Ok(m.warm_open(slot, section, expected)?),
+            None => Ok(None),
+        }
+    }
     /// Prints what the server's prompt cache did, as the binary's records.
     fn note(note: &CacheNote)
     where
         Self: Sized;
+}
+
+/// What a seat's model gives the warm calls, for any body: the residency
+/// stream's close and open ([`GpuModel::warm_close`], [`GpuModel::warm_open`]).
+pub trait WarmCalls {
+    fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, GpuError>;
+    fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<Option<WarmOpened>, GpuError>;
+}
+
+impl<B: ChainBody> WarmCalls for GpuModel<B> {
+    fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, GpuError> {
+        GpuModel::warm_close(self, slot)
+    }
+
+    fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<Option<WarmOpened>, GpuError> {
+        GpuModel::warm_open(self, slot, section, expected)
+    }
+}
+
+/// The word a `warm` record prints for a request's open: the host tier's
+/// refusal of the section's shape, else the server's reuse outcome.
+fn warm_why(why: WarmWhy, opened: &WarmOpened) -> &'static str {
+    if matches!(opened.opened, runtime::warmprof::Opened::Shape(_)) {
+        return "shape";
+    }
+    match why {
+        WarmWhy::Hit => "hit",
+        WarmWhy::Cut => "cut",
+        WarmWhy::Miss => "miss",
+        WarmWhy::NoSection => "nosection",
+        WarmWhy::Resume => "resume",
+    }
+}
+
+/// `BLOOMERY_WARM`'s gate on a warm call: `ask` runs only with the lever on;
+/// off, the engine thread is not asked and the call answers `off`.
+fn warm_gate<T>(
+    on: bool,
+    off: T,
+    ask: impl FnOnce() -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    if on { ask() } else { Ok(off) }
 }
 
 /// `serve::Engine` over a [`Seat`] that lives on its own thread. The
@@ -1241,6 +1339,8 @@ pub struct SeatEngine {
     /// The request's reply (`serve::Engine::will_reply`), which each keep
     /// query carries.
     reply: Option<usize>,
+    /// `BLOOMERY_WARM` ([`SeatEngine::with_warm`]).
+    warm: bool,
 }
 
 /// The handle's side of the engine thread: its channels and the logits buffer
@@ -1392,6 +1492,32 @@ impl SeatEngine {
                         Cmd::SaveWait(p) => {
                             (Ok(0), None, Extra::Polled(p.flight().wait().map(Some)))
                         }
+                        Cmd::WarmClose(slot) => match g.warm_close(slot) {
+                            Ok(section) => (Ok(0), None, Extra::Section(section)),
+                            Err(e) => (
+                                Err(format!(
+                                    "warm close of slot {slot} at position {}: {e}",
+                                    g.pos()
+                                )),
+                                None,
+                                Extra::None,
+                            ),
+                        },
+                        Cmd::WarmOpen {
+                            slot,
+                            section,
+                            expected,
+                        } => match g.warm_open(slot, section.as_deref(), expected) {
+                            Ok(opened) => (Ok(0), None, Extra::Warmed(opened)),
+                            Err(e) => (
+                                Err(format!(
+                                    "warm open of slot {slot} at position {}: {e}",
+                                    g.pos()
+                                )),
+                                None,
+                                Extra::None,
+                            ),
+                        },
                         Cmd::ResidencyReset => match g.residency_reset() {
                             Ok(r) => (Ok(0), None, Extra::Residency(r)),
                             Err(e) => (
@@ -1486,7 +1612,18 @@ impl SeatEngine {
             cache_ram,
             note: S::note,
             reply: None,
+            warm: false,
         })
+    }
+
+    /// Carry each slot's residency heat across requests (`BLOOMERY_WARM`,
+    /// parsed in the binary's `main`): the engine closes a request's stream
+    /// and opens the next one's from its section. Off, the default, it does
+    /// neither and prints a `warm` record naming that.
+    #[must_use]
+    pub fn with_warm(mut self, on: bool) -> SeatEngine {
+        self.warm = on;
+        self
     }
 
     /// The sequences the engine serves at once, the opened seat's answer
@@ -1993,9 +2130,12 @@ fn serve_cmd<S: Seat>(
         | Cmd::PassSampled { .. }
         | Cmd::StepSlots(..)
         | Cmd::PassSlots(..)
-        | Cmd::ResidencyReset => Err(
+        | Cmd::ResidencyReset
+        | Cmd::WarmClose(_)
+        | Cmd::WarmOpen { .. } => Err(
             "a keep, split, pass, step or pass of several slots, save, resume, slot file's save \
-             or restore, or residency reset reached the step loop; the engine thread answers it"
+             or restore, residency reset, or warm close or open reached the step loop; the \
+             engine thread answers it"
                 .to_owned(),
         ),
         Cmd::Pos => Ok(0),
@@ -2708,6 +2848,51 @@ impl Engine for SeatEngine {
         }
     }
 
+    fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, EngineError> {
+        warm_gate(self.warm, None, || {
+            let reply = self.link.ask(Cmd::WarmClose(slot))?;
+            reply.result.map_err(EngineError)?;
+            match reply.extra {
+                Extra::Section(section) => Ok(section),
+                _ => Err(EngineError(
+                    "the engine thread answered a warm close with no section".to_owned(),
+                )),
+            }
+        })
+    }
+
+    fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+        why: WarmWhy,
+    ) -> Result<(), EngineError> {
+        let bytes = section.map_or(0, <[u8]>::len);
+        if !self.warm {
+            crate::record::warm("off", slot, bytes, 0, 0).eprint();
+            return Ok(());
+        }
+        let cmd = Cmd::WarmOpen {
+            slot,
+            section: section.map(<[u8]>::to_vec),
+            expected,
+        };
+        let reply = self.link.ask(cmd)?;
+        reply.result.map_err(EngineError)?;
+        match reply.extra {
+            Extra::Warmed(Some(w)) => {
+                let word = warm_why(why, &w);
+                crate::record::warm(word, slot, bytes, w.live, w.stale_rows).eprint();
+                Ok(())
+            }
+            Extra::Warmed(None) => Ok(()),
+            _ => Err(EngineError(
+                "the engine thread answered a warm open with no outcome".to_owned(),
+            )),
+        }
+    }
+
     /// The body's rule for the request's reply, asked on the engine thread
     /// (`spawn`'s `keep_for`). A
     /// thread that does not answer grants nothing: the caller resets, and the
@@ -2852,6 +3037,47 @@ mod tests {
     use std::sync::mpsc;
 
     const N_VOCAB: usize = 8;
+
+    /// G-5: with `BLOOMERY_WARM` off a warm call never asks the engine
+    /// thread and answers its `off` value; on, it asks.
+    #[test]
+    fn the_warm_lever_gates_the_engine_thread() {
+        use super::warm_gate;
+        let off = warm_gate(false, None, || -> Result<Option<Vec<u8>>, _> {
+            panic!("a warm call asked the engine thread with the lever off")
+        });
+        assert_eq!(off.expect("off answers"), None);
+        let on = warm_gate(true, None, || Ok(Some(vec![7u8])));
+        assert_eq!(on.expect("on asks"), Some(vec![7u8]));
+    }
+
+    /// G-4b: the `warm` record's word is `shape` when the host tier refused
+    /// the section's shape, else the server's reuse outcome.
+    #[test]
+    fn the_warm_record_words_the_shape_refusal() {
+        use super::{WarmOpened, WarmWhy, warm_why};
+        use runtime::warmprof::{Opened, WarmError};
+        let opened = |opened| WarmOpened {
+            opened,
+            live: 1,
+            stale_rows: 0,
+        };
+        let shape = Opened::Shape(WarmError::Version { got: 9 });
+        for why in [WarmWhy::Hit, WarmWhy::Cut, WarmWhy::Resume] {
+            assert_eq!(warm_why(why, &opened(shape)), "shape");
+        }
+        let words = [
+            (WarmWhy::Hit, "hit"),
+            (WarmWhy::Cut, "cut"),
+            (WarmWhy::Miss, "miss"),
+            (WarmWhy::NoSection, "nosection"),
+            (WarmWhy::Resume, "resume"),
+        ];
+        for (why, word) in words {
+            assert_eq!(warm_why(why, &opened(Opened::Section)), word);
+            assert_eq!(warm_why(why, &opened(Opened::Fresh)), word);
+        }
+    }
 
     /// The factory's sampler is the sampler crate's chain over the request's
     /// parameters, and a parameter the chain refuses (a non-finite

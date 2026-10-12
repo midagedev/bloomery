@@ -367,9 +367,11 @@ fn accessors_read_their_rows() {
             populate: true,
             lock: false,
             card_dontneed: true,
-            r8: true
+            r8: true,
+            warm: false
         }
     );
+    assert!(!unset.warm());
 
     let set = read(
         &env(&[
@@ -402,6 +404,7 @@ fn accessors_read_their_rows() {
             (HOST_LANES, "flat"),
             (PREFILL_GROUP, "8"),
             (GEN_SLOTS, "2"),
+            (WARM, "on"),
         ]),
         Scope::Every,
     )
@@ -440,9 +443,11 @@ fn accessors_read_their_rows() {
             populate: false,
             lock: true,
             card_dontneed: false,
-            r8: false
+            r8: false,
+            warm: true
         }
     );
+    assert!(set.warm());
 
     let names: Vec<&str> = parsed().map(|r| r.name).collect();
     assert_eq!(
@@ -479,7 +484,8 @@ fn accessors_read_their_rows() {
             QWEN3_KV,
             LANE_PREFETCH,
             HOST_LANES,
-            GEN_SLOTS
+            GEN_SLOTS,
+            WARM
         ]
     );
 }

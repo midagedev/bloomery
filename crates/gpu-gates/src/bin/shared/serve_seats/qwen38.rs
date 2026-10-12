@@ -332,8 +332,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, Vocab, begin, bind_server, model_props, note_line, parallel_line, placement_of,
-    put_back,
+    SlotStep, Vocab, WarmCalls, begin, bind_server, model_props, note_line, parallel_line,
+    placement_of, put_back,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -1778,7 +1778,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         machine.cards[0].name.clone(),
         props,
         cache.ram,
-    )?;
+    )?
+    .with_warm(levers.warm());
 
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together (the engine declares its
@@ -2509,6 +2510,11 @@ impl Seat for Q38 {
     fn reset(&mut self) -> Result<(), GateError> {
         let sel = self.s.selected();
         self.drafts.reset(&mut self.s, sel)
+    }
+
+    /// The session's model, for the warm calls.
+    fn warm_calls(&mut self) -> Option<&mut dyn WarmCalls> {
+        Some(self.s.model_mut())
     }
 
     /// [`app::Session::residency_reset`], its `residency reset` record on

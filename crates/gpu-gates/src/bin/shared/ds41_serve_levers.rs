@@ -5,7 +5,7 @@
 use bloomery_levers::{
     CARD_BUDGET, CARD_DONTNEED, CED, DRAFT, ENGRAM_HELPER, HOST_LANES, HOST_LOCK, HOST_POPULATE,
     HOSTSTREAM, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE,
-    STEP_STATS,
+    STEP_STATS, WARM,
 };
 
 /// Besides the pool's two: how a prompt is fed, and the batched feed's CED
@@ -36,4 +36,5 @@ pub const ACTS_ON: &[&str] = &[
     RESIDENCY,
     HOSTSTREAM,
     STEP_STATS,
+    WARM,
 ];

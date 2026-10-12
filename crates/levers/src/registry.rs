@@ -13,6 +13,7 @@ use crate::{Class, HostLanes, InPlace, Kind, LeverSpec, Phase, Site, Unset};
 pub const THREADS: &str = "BLOOMERY_THREADS";
 pub const SPIN: &str = "BLOOMERY_SPIN";
 pub const CED: &str = "BLOOMERY_CED";
+pub const WARM: &str = "BLOOMERY_WARM";
 pub const PREFILL: &str = "BLOOMERY_PREFILL";
 pub const PREFILL_GROUP: &str = "BLOOMERY_PREFILL_GROUP";
 pub const ENGRAM_HELPER: &str = "BLOOMERY_ENGRAM_HELPER";
@@ -853,6 +854,23 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               resident sequences, runs each slot's window as the plain run's prompt call, prints \
               each slot's records in slot order, and refuses N ≥ 2 beside `BLOOMERY_DRAFT`, \
               `BLOOMERY_CHECK_FINITE`, `BLOOMERY_STEP_STATS` and `--logits`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: WARM,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("off"),
+        doc: "Serve seats with a residency machine: a request's end closes its slot's \
+              residency stream and the prompt-cache entry carries its heat as a warm section; \
+              a request's start opens the stream from the section of the entry it loaded, or \
+              fresh. A qwen4exp prompt call keeps its placement when no other live stream \
+              holds rows, where `off` keeps it only when the rule holds no decode history. \
+              Every request prints a `warm` record. `off` closes no stream and opens none, the \
+              same-binary arm.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

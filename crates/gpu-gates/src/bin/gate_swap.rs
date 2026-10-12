@@ -2624,6 +2624,47 @@ mod gate {
         Ok(ok)
     }
 
+    /// keep rule (BLOOMERY_WARM): a prompt call on slot 0 puts its placement
+    /// back when the lever is off and the rule holds any history, and when
+    /// the lever is on and another live stream holds rows; with the lever on
+    /// and no other stream holding rows it keeps it, whatever slot 0's own
+    /// history is.
+    fn keep_rule_clause(gpu: &Gpu) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mut tier = two_slot_tier(gpu)?;
+        let fresh = !tier.call_history(true) && !tier.call_history(false);
+
+        // Slot 0's own pass folds a row; no other stream holds one.
+        note_row(&mut tier, 0)?;
+        tier.keep_rows_by(
+            KeptRows::prefix(1),
+            PassKind::Slots,
+            [(0, 0..1)].into_iter(),
+        )?;
+        tier.swap_boundary(stream)?
+            .ok_or("gate_swap: the tier's boundary")?;
+        let own = tier.call_history(false) && !tier.call_history(true);
+
+        // Slot 1 folds a row too: slot 0's prompt call now puts it back.
+        note_row(&mut tier, 1)?;
+        tier.keep_rows_by(
+            KeptRows::prefix(1),
+            PassKind::Slots,
+            [(1, 0..1)].into_iter(),
+        )?;
+        let held = tier.swap_boundary(stream).is_ok();
+        let other = held && tier.call_history(true) && tier.call_history(false);
+
+        let ok = fresh && own && other;
+        println!(
+            "keep rule: no history keeps under either rule {fresh}; slot 0's own rows alone \
+             put back with the lever off, keep with it on {own}; slot 1's rows put back with \
+             it on {other} {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// broken: every stack destination of the first flip's layer fails, so
     /// its boundary fails after its first change.
     fn broken(
@@ -5227,6 +5268,7 @@ mod gate {
         ok &= ahead(&gpu, &pm, &trace, &a)?;
         ok &= keep_clause(&gpu)?;
         ok &= streams_clause(&gpu)?;
+        ok &= keep_rule_clause(&gpu)?;
         ok &= broken(&gpu, &pm, &trace, &a)?;
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;
         ok &= fault_code()?;

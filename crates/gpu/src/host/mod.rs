@@ -1517,12 +1517,20 @@ impl<H: HostExperts> HostTier<H> {
             .map_or(0, swap::SwapMachine::returns_owed)
     }
 
-    /// Whether the residency machine's rule holds any decode history
-    /// ([`swap::SwapMachine::has_history`]): what a prompt call's end reads
-    /// to keep its placement only when the decode has none of its own.
-    /// False without a machine.
-    pub fn call_history(&self) -> bool {
-        self.swap.as_ref().is_some_and(|m| m.has_history())
+    /// Whether a prompt call's end puts its placement back to the call's
+    /// start, read once before the call: with `warm`, when a live stream
+    /// other than the selected one holds rows
+    /// ([`swap::SwapMachine::others_hold_rows`]); without it, when the rule
+    /// holds any decode history ([`swap::SwapMachine::has_history`]). False
+    /// without a machine.
+    pub fn call_history(&self, warm: bool) -> bool {
+        self.swap.as_ref().is_some_and(|m| {
+            if warm {
+                m.others_hold_rows(self.selected as usize)
+            } else {
+                m.has_history()
+            }
+        })
     }
 
     /// End the open call ([`swap::SwapMachine::end_call`]), its placement

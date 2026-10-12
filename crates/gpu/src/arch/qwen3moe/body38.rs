@@ -1020,6 +1020,9 @@ pub struct Body38 {
     /// lever runs one, over `hybrid`'s slot map through `slots`; every call
     /// nothing without one.
     residency_glue: ResidencyGlue,
+    /// `BLOOMERY_WARM` ([`bloomery_levers::HostCfg::warm`]): a prompt call
+    /// keeps its placement unless another live stream holds rows.
+    warm: bool,
     /// The NVMe expert tier's arena, when the plan paged routed experts
     /// ([`Body38::nvme_tier`]).
     nvme_tier: Option<Arc<NvTier>>,
@@ -1626,6 +1629,7 @@ impl Body38 {
             plant: None,
             mtp: None,
             residency_glue,
+            warm: host.warm,
             nvme_tier,
             routed_gate: common_routed(&stacks),
             ckpt,
@@ -3291,11 +3295,14 @@ impl GpuModel<Body38> {
         // experts of its own, and the call's picks — the prompt's hottest —
         // put the pool back where they found it rather than leave the decode
         // to churn back at the flip cap. Without a history (a fresh server)
-        // the call's placement stays, the gain it was run for. The history
-        // is read once, here: the call keeps no row, so it does not move
-        // until the end, and the walk returns each layer in the call's last
-        // unit on it.
-        let history = self.body(WHAT_P)?.hybrid().call_history();
+        // the call's placement stays, the gain it was run for. Under
+        // `BLOOMERY_WARM` the history is the other live streams': the call's
+        // own stream opened at this request, so only rows another stream
+        // holds can be churned back. The history is read once, here: the
+        // call keeps no row, so it does not move until the end, and the walk
+        // returns each layer in the call's last unit on it.
+        let body = self.body(WHAT_P)?;
+        let history = body.hybrid().call_history(body.warm);
         let r = self
             .stream_begin(resolved, tokens.len(), history)
             .and_then(|()| self.feed_marked(tokens, resolved, sink));

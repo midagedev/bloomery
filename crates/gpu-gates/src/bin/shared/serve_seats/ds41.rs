@@ -199,7 +199,7 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, WarmCalls, bind_server,
     model_props, nvidia_smi_index, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
@@ -585,7 +585,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         #[cfg(feature = "vision")]
         vision,
     };
-    let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache.ram)?;
+    let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache.ram)?
+        .with_warm(levers.warm());
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together, no turns and no park.
     let server = bind_server(
@@ -1279,6 +1280,11 @@ impl Seat for V41 {
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
         self.moved();
         Ok(self.s.model_mut().rollback(pos)?)
+    }
+
+    /// The session's model, for the warm calls.
+    fn warm_calls(&mut self) -> Option<&mut dyn WarmCalls> {
+        Some(self.s.model_mut())
     }
 
     /// [`Session::residency_reset`], its `residency reset` record on
