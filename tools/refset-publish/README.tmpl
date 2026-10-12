@@ -30,6 +30,13 @@ from the headers of its source model's files (a few MB per shard); its table of 
 The DeepSeek V4.1 DSpark draft fixture cannot be fetched, so no set of it is here. The set
 `ref-mtp/fx_qwen4exp_prose64_n64_k1` also names the fixture's MTP draft file,
 `/models/fixtures/qwen38/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, which `fixture fetch` makes with the fixture.
+The GLM-5.3-Flash image-input sets (`fx_ref_glm5next_vis_*`) were dumped by llama.cpp mainline on a copy of the
+fixture whose header takes mainline's spelling (`tools/ref/gguf-respell.py`), with a projector that is not a fixture. Their
+`# respell` line names the fixture the copy was cut from, which is how they are placed in the `glm5next` family. The gates
+that read them open the projector at the path the sets state,
+`/models/mmproj/unsloth--GLM-5.3-Flash-GGUF/mmproj-BF16.gguf`: unsloth/GLM-5.3-Flash-GGUF at revision
+`a38483c8cd5df544f53d70fb281afe97369d5ab6`, sha256 `82b7adb44411dbb298b1c689567804e5ed0790d80f308ed8b5b6b8ac0527d2ac`
+(`tools/ref/qvis/mmproj-dl.sh` fetches it and checks both).
 
 ## The path is part of the identity
 

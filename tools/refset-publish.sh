@@ -17,7 +17,10 @@
 # naming of a fixture set, crates/refset/src/arch/*/fixture.rs). Its family is read from the set's own MANIFEST.tsv:
 # `# model` must be `<fixture root>/<dir>/<file>`, where the fixture root and the `(arch, dir)` rows are those of
 # crates/refset/src/fixture.rs (DEFAULT_ROOT, DIRS), `# arch` must be the arch of that dir, and `# fixture` must be
-# there; every set of a family must carry the same `# fixture` line. A name is never read for a family.
+# there; every set of a family must carry the same `# fixture` line. A name is never read for a family. A set dumped on a
+# respelled fixture copy (a `# respell` line, crates/refset/src/clefvis.rs `Respell`: an image-input seat's text model in
+# mainline's spelling, and its tower's sets beside it) is placed by the fixture the copy was cut from: the line's
+# `source` stands for `# model` and its `from` for `# arch`.
 # A set that cannot be placed is a named error (65) and nothing is hashed. Left out, by name with the reason: a fixture
 # variant (its `# model` is under fixture-variants/<tag>, a tag of tools/fixture-variants.tsv) and any set of the
 # DSpark draft (`dspark` or a `/draft/` directory in `# model` or `# draft_model`).
@@ -56,6 +59,9 @@ mline() {
 unplaced() { printf '%s\t%s\n' "$1" "$2" >> "$W/errors.tsv"; }
 leftout() { printf '%s\t%s\n' "$1" "$2" >> "$W/leftout.tsv"; }
 
+# rfield LINE KEY: the value of the `KEY <value>` field of a tab-separated `# respell` line; empty when it has none.
+rfield() { printf '%s\n' "$1" | tr '\t' '\n' | sed -n "s/^$2 //p" | head -1; }
+
 # The fixture root, the (arch, dir) rows and the variant tags, read from where the code owns them.
 read_rules() {
   local rs=$ROOT/crates/refset/src/fixture.rs tags=$ROOT/tools/fixture-variants.tsv
@@ -72,7 +78,7 @@ read_rules() {
 
 # Place one set (a path under $DATA): published with its family, left out with a reason, or unplaced.
 place() {
-  local set=$1 dir=$DATA/$1 model arch fixture draft low rest fdir file family tag
+  local set=$1 dir=$DATA/$1 model arch fixture draft respell low rest fdir file family tag what="'# model'" awhat="'# arch'"
   if [ ! -f "$dir/MANIFEST.tsv" ]; then
     unplaced "$set" "no MANIFEST.tsv: nothing states what the set was dumped from"
     return 0
@@ -81,11 +87,21 @@ place() {
   arch=$(mline "$dir" arch)
   fixture=$(mline "$dir" fixture)
   draft=$(mline "$dir" draft_model)
+  respell=$(mline "$dir" respell)
   if [ -z "$model" ]; then
     unplaced "$set" "no '# model' line"
     return 0
   fi
-  low=$(printf '%s %s' "$model" "$draft" | tr 'A-Z' 'a-z')
+  if [ -n "$respell" ]; then
+    model=$(rfield "$respell" source)
+    arch=$(rfield "$respell" from)
+    if [ -z "$model" ] || [ -z "$arch" ]; then
+      unplaced "$set" "'# respell' names no source or no from: '$respell'"
+      return 0
+    fi
+    what="'# respell' source" awhat="'# respell' from"
+  fi
+  low=$(printf '%s %s %s' "$(mline "$dir" model)" "$model" "$draft" | tr 'A-Z' 'a-z')
   case $low in
     *dspark* | */draft/*)
       leftout "$set" "a set of the DSpark draft ('# model' $model, '# draft_model' ${draft:-none}): its source is not verified"
@@ -97,7 +113,7 @@ place() {
       tag=${model#*/fixture-variants/}
       tag=${tag%%/*}
       if ! grep -qx "$tag" "$W/tags.txt"; then
-        unplaced "$set" "'# model' is under fixture-variants/$tag, which is no tag of tools/fixture-variants.tsv"
+        unplaced "$set" "$what is under fixture-variants/$tag, which is no tag of tools/fixture-variants.tsv"
         return 0
       fi
       leftout "$set" "a set of the fixture variant '$tag': the variant file is requantized on the box and cannot be made again byte for byte off it"
@@ -107,7 +123,7 @@ place() {
   case $model in
     "$FIXTURE_ROOT"/*/*) ;;
     *)
-      unplaced "$set" "'# model' $model is not $FIXTURE_ROOT/<dir>/<file>"
+      unplaced "$set" "$what $model is not $FIXTURE_ROOT/<dir>/<file>"
       return 0
       ;;
   esac
@@ -116,17 +132,17 @@ place() {
   file=${rest#*/}
   case $file in
     */*)
-      unplaced "$set" "'# model' $model is not $FIXTURE_ROOT/<dir>/<file>"
+      unplaced "$set" "$what $model is not $FIXTURE_ROOT/<dir>/<file>"
       return 0
       ;;
   esac
   family=$(awk -F'\t' -v d="$fdir" '$2 == d { print $1; exit }' "$W/dirs.tsv")
   if [ -z "$family" ]; then
-    unplaced "$set" "'# model' names the fixture dir '$fdir', which is no dir of crates/refset/src/fixture.rs DIRS"
+    unplaced "$set" "$what names the fixture dir '$fdir', which is no dir of crates/refset/src/fixture.rs DIRS"
     return 0
   fi
   if [ "$arch" != "$family" ]; then
-    unplaced "$set" "'# arch' is '${arch:-none}' but the fixture dir '$fdir' of '# model' belongs to the family '$family'"
+    unplaced "$set" "$awhat is '${arch:-none}' but the fixture dir '$fdir' of $what belongs to the family '$family'"
     return 0
   fi
   case $fixture in
@@ -350,7 +366,7 @@ self_test() {
   here=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
   T=$(mktemp -d)
   trap "rm -rf '$T'" EXIT
-  # set NAME MODEL ARCH [DRAFT]: a set of two files and a manifest under $T/data
+  # set NAME MODEL ARCH [DRAFT] [RESPELL]: a set of two files and a manifest under $T/data
   mkset() {
     local d=$T/data/$1
     mkdir -p "$d"
@@ -360,6 +376,7 @@ self_test() {
       printf '# dump_ref\n# model\t%s\n' "$2"
       printf '# fixture\tbloomery.fixture.seed=1 bloomery.fixture.source_header_sha256=ab\n'
       [ -z "${4:-}" ] || printf '# draft_model\t%s\n' "$4"
+      [ -z "${5:-}" ] || printf '# respell\t%s\n' "$5"
       printf '# arch\t%s\n' "$3"
     } > "$d/MANIFEST.tsv"
   }
@@ -374,6 +391,10 @@ self_test() {
   mkset fx_ref_qwen4exp /models/fixtures/qwen38/q-00001-of-00001.gguf qwen4exp
   mkset fx_iq4xs_ref_glm5next /models/fixture-variants/iq4xs/glm5next/g-iq4xs-00001-of-00002.gguf glm5next
   mkset fx_ref_deepseek41_dspark /models/fixtures/v41/v-00001-of-00004.gguf deepseek41 /models/fixtures/v41/draft/dspark-00001.gguf
+  # an image-input seat dumped on a respelled copy of the glm5next fixture: the copy's sets and the tower's beside them
+  local respell="source /models/fixtures/glm5next/g-00001-of-00002.gguf${TAB}source_sha256 ab${TAB}from glm5next${TAB}set -"
+  mkset fx_ref_glm5next_vis_hidden /models/fixtures-mainline/glm5next/g-00001-of-00002.gguf glm5-next "" "$respell"
+  mkset fx_ref_glm5next_vis_taps /models/mmproj/u/mmproj-BF16.gguf clip "" "$respell"
   mkdir -p "$T/data/glm5next" # a family's corpus dir is no candidate
   printf 'x' > "$T/data/glm5next/corpus-prose.ids"
 
@@ -381,8 +402,10 @@ self_test() {
   local o1 rc
   o1=$(run --out "$T/out1" --jobs 2 2>&1) && rc=0 || rc=$?
   want "the fake tree is placed (rc $rc)" "$rc"
-  case $o1 in *"glm5next/  sets=2 files=6 "*) rc=0 ;; *) rc=1 ;; esac
-  want "glm5next holds its two sets and six files" "$rc"
+  case $o1 in *"glm5next/  sets=4 files=12 "*) rc=0 ;; *) rc=1 ;; esac
+  want "glm5next holds its four sets and twelve files" "$rc"
+  grep -q "^glm5next$TAB""fx_ref_glm5next_vis_hidden/a.f32$TAB" "$T/out1/MANIFEST.tsv" && grep -q "^glm5next$TAB""fx_ref_glm5next_vis_taps/a.f32$TAB" "$T/out1/MANIFEST.tsv" && rc=0 || rc=1
+  want "a set on a respelled copy and its tower's are placed by the fixture their '# respell' names" "$rc"
   case $o1 in *"qwen4exp/  sets=1 files=3 "*) rc=0 ;; *) rc=1 ;; esac
   want "qwen4exp holds its set" "$rc"
   case $o1 in *"deepseek41/"*) rc=1 ;; *) rc=0 ;; esac
@@ -398,7 +421,7 @@ self_test() {
   grep -q "^[0-9a-f]\{64\}  ref-mtp/fx_prose64/a.f32$" "$T/out1/SHA256SUMS" && rc=0 || rc=1
   want "SHA256SUMS paths are relative to the data dir" "$rc"
   local want_bytes got_bytes
-  want_bytes=$( (find "$T/data/fx_ref_glm5next_a" "$T/data/ref-mtp/fx_prose64" "$T/data/fx_ref_qwen4exp" -type f -print0 | xargs -0 cat | wc -c) | tr -d ' ')
+  want_bytes=$( (find "$T/data/fx_ref_glm5next_a" "$T/data/ref-mtp/fx_prose64" "$T/data/fx_ref_qwen4exp" "$T/data/fx_ref_glm5next_vis_hidden" "$T/data/fx_ref_glm5next_vis_taps" -type f -print0 | xargs -0 cat | wc -c) | tr -d ' ')
   got_bytes=$(grep -v '^#' "$T/out1/MANIFEST.tsv" | awk -F'\t' '{ s += $4 } END { printf "%.0f", s }')
   [ "$want_bytes" = "$got_bytes" ] && rc=0 || rc=1
   want "the bytes total ($got_bytes, cat | wc -c says $want_bytes)" "$rc"
@@ -442,17 +465,19 @@ self_test() {
   mkset fx_ref_stray /models/fixtures/nosuchdir/x-00001-of-00001.gguf glm5next
   mkset fx_ref_archmix /models/fixtures/glm5next/g-00001-of-00002.gguf qwen4exp
   mkdir -p "$T/data/fx_ref_nomanifest"
+  mkset fx_ref_respell_nosource /models/fixtures-mainline/glm5next/g-00001-of-00002.gguf glm5-next "" "from glm5next${TAB}set -"
+  mkset fx_ref_respell_archmix /models/fixtures-mainline/glm5next/g-00001-of-00002.gguf glm5-next "" "${respell/from glm5next/from qwen4exp}"
   local o2
   o2=$(run --out "$T/out2" 2>&1) && rc=0 || rc=$?
   [ "$rc" = 65 ] && rc=0 || rc=1
   want "a set the rule cannot place ends 65" "$rc"
-  for n in fx_ref_stray fx_ref_archmix fx_ref_nomanifest; do
+  for n in fx_ref_stray fx_ref_archmix fx_ref_nomanifest fx_ref_respell_nosource fx_ref_respell_archmix; do
     case $o2 in *"$n: "*) rc=0 ;; *) rc=1 ;; esac
     want "the error names $n" "$rc"
   done
   [ ! -e "$T/out2/MANIFEST.tsv" ] && rc=0 || rc=1
   want "nothing was written on a named error" "$rc"
-  rm -rf "$T/data/fx_ref_stray" "$T/data/fx_ref_archmix" "$T/data/fx_ref_nomanifest"
+  rm -rf "$T/data/fx_ref_stray" "$T/data/fx_ref_archmix" "$T/data/fx_ref_nomanifest" "$T/data/fx_ref_respell_nosource" "$T/data/fx_ref_respell_archmix"
 
   # 3. two fixtures in one family
   mkset fx_ref_glm5next_b /models/fixtures/glm5next/g-00001-of-00002.gguf glm5next
