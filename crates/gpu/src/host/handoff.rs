@@ -32,9 +32,10 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 
+use super::page::HandoffLayout;
 use super::slots::HOST;
 use super::step::HandoffTarget;
-use super::tier::TierTarget;
+use super::tier::{TierImageLayout, TierTarget};
 use crate::card_slots::{CardSlotKernels, ColPlaces};
 use crate::{FaultSink, FaultSite, GpuError, launch_u32};
 
@@ -1060,8 +1061,8 @@ impl HandoffKernels {
     /// activation, `target.x`'s values `c·hidden ..`, into `target`'s image
     /// at the layout's offsets plus `c·n_used` and `c·hidden`, the region's
     /// sequence word, and each slot's place into `sel` (`10·m`). A layout of
-    /// another slot count, `m` of 0, and a pitch under ten are refused by
-    /// name. Asynchronous, allocation-free, capturable.
+    /// another slot count, `m` of 0, a pitch under ten and a `sel` shorter
+    /// than `10·m` are refused by name. Asynchronous, allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "one launch's routing, its pitch and width, the target, the sink and the places"
@@ -1078,16 +1079,7 @@ impl HandoffKernels {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "ds41_ffn_handoff_10_cols";
         let lay = target.layout;
-        if HandoffSlots::of(lay.n_used) != Ok(HandoffSlots::Ten) || m == 0 || pitch < SLOTS_10 {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "{} slots a column, {m} columns, a pitch of {pitch}: the entry is built for \
-                     ten slots, one column or more, a pitch of at least ten",
-                    lay.n_used
-                ),
-            });
-        }
+        check_cols(&lay, (pitch, m), sel.len())?;
         let n = lay.hidden;
         let grid = launch_u32(WHAT, "grid", (m * n).div_ceil(HANDOFF_THREADS as usize))?;
         let cfg = LaunchConfig1D::new(grid, HANDOFF_THREADS, 0);
@@ -1143,25 +1135,7 @@ impl HandoffKernels {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "ds41_ffn_handoff_10_cols_tier";
         let (lay, tl) = (target.layout, ttarget.layout);
-        if HandoffSlots::of(lay.n_used) != Ok(HandoffSlots::Ten)
-            || tl.n_used != SLOTS_10
-            || !(1..=tl.cols).contains(&m)
-            || pitch < SLOTS_10
-            || tl.x_len != tl.cols * lay.hidden
-            || tl.q3_words != 0
-            || tl.d8_len != 0
-        {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "the boundary carries {} slots of {} values, the tier image {} slots a column \
-                     over {} columns, {} f32, {} code words, {} scales, {m} columns at a pitch of \
-                     {pitch}; the entry hands over {SLOTS_10} slots and the activation in f32, one \
-                     column or more up to the tier image's, a pitch of at least ten",
-                    lay.n_used, lay.hidden, tl.n_used, tl.cols, tl.x_len, tl.q3_words, tl.d8_len
-                ),
-            });
-        }
+        check_cols_tier(&lay, &tl, (pitch, m), (sel.len(), tsel.len()))?;
         let n = lay.hidden;
         let grid = launch_u32(WHAT, "grid", (m * n).div_ceil(HANDOFF_THREADS as usize))?;
         let cfg = LaunchConfig1D::new(grid, HANDOFF_THREADS, 0);
@@ -1232,6 +1206,80 @@ impl HandoffKernels {
     }
 }
 
+/// [`HandoffKernels::enqueue_handoff_cols`]'s refusals, by name before the
+/// launch: a layout of another slot count, `m` of 0, a pitch under ten, and a
+/// `sel` of `sel_len` places shorter than `m` columns of ten.
+fn check_cols(
+    lay: &HandoffLayout,
+    (pitch, m): (usize, usize),
+    sel_len: usize,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "ds41_ffn_handoff_10_cols";
+    if HandoffSlots::of(lay.n_used) != Ok(HandoffSlots::Ten) || m == 0 || pitch < SLOTS_10 {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "{} slots a column, {m} columns, a pitch of {pitch}: the entry is built for \
+                 ten slots, one column or more, a pitch of at least ten",
+                lay.n_used
+            ),
+        });
+    }
+    check_places(WHAT, "sel", sel_len, m)
+}
+
+/// [`HandoffKernels::enqueue_handoff_cols_tier`]'s refusals, by name before
+/// the launch: a layout of another slot count or width, `m` of 0 or past the
+/// tier image's columns, a pitch under ten, a tier image of another form, and
+/// a `sel` or a `tsel` (`places` their lengths) shorter than `m` columns of
+/// ten: a page widened beside places cut for fewer columns would write past
+/// them.
+fn check_cols_tier(
+    lay: &HandoffLayout,
+    tl: &TierImageLayout,
+    (pitch, m): (usize, usize),
+    (sel_len, tsel_len): (usize, usize),
+) -> Result<(), GpuError> {
+    const WHAT: &str = "ds41_ffn_handoff_10_cols_tier";
+    if HandoffSlots::of(lay.n_used) != Ok(HandoffSlots::Ten)
+        || tl.n_used != SLOTS_10
+        || !(1..=tl.cols).contains(&m)
+        || pitch < SLOTS_10
+        || tl.x_len != tl.cols * lay.hidden
+        || tl.q3_words != 0
+        || tl.d8_len != 0
+    {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the boundary carries {} slots of {} values, the tier image {} slots a column \
+                 over {} columns, {} f32, {} code words, {} scales, {m} columns at a pitch of \
+                 {pitch}; the entry hands over {SLOTS_10} slots and the activation in f32, one \
+                 column or more up to the tier image's, a pitch of at least ten",
+                lay.n_used, lay.hidden, tl.n_used, tl.cols, tl.x_len, tl.q3_words, tl.d8_len
+            ),
+        });
+    }
+    check_places(WHAT, "sel", sel_len, m)?;
+    check_places(WHAT, "tsel", tsel_len, m)
+}
+
+/// `which` (a places buffer of `len` words) refused by name unless it holds
+/// `m` columns of ten places.
+fn check_places(what: &'static str, which: &str, len: usize, m: usize) -> Result<(), GpuError> {
+    let need = SLOTS_10 * m;
+    if len < need {
+        return Err(GpuError::Shape {
+            what,
+            detail: format!(
+                "{which} holds {len} places, {m} columns of {SLOTS_10} need {need}: the launch \
+                 writes every column's places"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// What [`HandoffKernels::enqueue_places_cols`] reads: the router's ids and
 /// the slot map's card copy with the layer's row at `row_off` (`n_expert`
 /// places a row).
@@ -1244,7 +1292,38 @@ pub struct Places<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HandoffRefused, HandoffSlots};
+    use super::{HandoffRefused, HandoffSlots, check_cols, check_cols_tier};
+    use crate::host::page::HandoffLayout;
+    use crate::host::tier::TierImageLayout;
+
+    const HIDDEN: usize = 16;
+
+    fn boundary() -> HandoffLayout {
+        HandoffLayout {
+            seq: 0,
+            ids: 1,
+            weights: 11,
+            x: 21,
+            n_used: 10,
+            hidden: HIDDEN,
+        }
+    }
+
+    /// A tier image of `cols` f32 columns of ten slots.
+    fn image(cols: usize) -> TierImageLayout {
+        TierImageLayout {
+            sel: 0,
+            q3: 0,
+            d8: 0,
+            x: 10 * cols,
+            n_used: 10,
+            q3_words: 0,
+            d8_len: 0,
+            x_len: cols * HIDDEN,
+            hidden: HIDDEN,
+            cols,
+        }
+    }
 
     #[test]
     fn slots_of_takes_six_eight_and_ten_only() {
@@ -1261,5 +1340,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A tier handoff of `m` columns over a page of 8 refuses, by name, a
+    /// `tsel` or a `sel` shorter than `10·m`, and takes ones of exactly that:
+    /// the launch writes every column's places.
+    #[test]
+    fn a_tier_handoff_refuses_places_shorter_than_its_columns() {
+        let (lay, tl) = (boundary(), image(8));
+        for m in 1..=8 {
+            let at = |sel, tsel| check_cols_tier(&lay, &tl, (11, m), (sel, tsel));
+            assert!(at(10 * m, 10 * m).is_ok(), "{m} columns, places of 10·m");
+            assert!(at(80, 80).is_ok(), "{m} columns, places of 80");
+            let e = at(10 * m, 10 * m - 1).expect_err("one place short in tsel");
+            assert!(e.to_string().contains("tsel holds"), "{m}: {e}");
+            let e = at(10 * m - 1, 10 * m).expect_err("one place short in sel");
+            assert!(e.to_string().contains("sel holds"), "{m}: {e}");
+        }
+        let e =
+            check_cols_tier(&lay, &tl, (11, 8), (80, 40)).expect_err("a tsel cut for 4 columns");
+        assert!(e.to_string().contains("tsel holds 40 places"), "{e}");
+        assert!(
+            check_cols_tier(&lay, &tl, (11, 9), (90, 90)).is_err(),
+            "past the image's columns"
+        );
+    }
+
+    /// The plain handoff of `m` columns refuses, by name, a `sel` shorter
+    /// than `10·m`.
+    #[test]
+    fn a_handoff_refuses_a_sel_shorter_than_its_columns() {
+        let lay = boundary();
+        for m in 1..=8 {
+            assert!(check_cols(&lay, (11, m), 10 * m).is_ok(), "{m} columns");
+            let e = check_cols(&lay, (11, m), 10 * m - 1).expect_err("one place short");
+            assert!(e.to_string().contains("sel holds"), "{m}: {e}");
+        }
+        assert!(check_cols(&lay, (11, 0), 80).is_err(), "no columns");
+        assert!(check_cols(&lay, (9, 2), 80).is_err(), "a pitch under ten");
     }
 }

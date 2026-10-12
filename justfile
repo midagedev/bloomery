@@ -1779,7 +1779,7 @@ gate-gpu-qwen38-residency:
 # solo, reason r2 (both cards, both gate locks; no host-memory pin): stays solo in the fixture tier, which runs it in lane X in seconds.
 [group('solo')]
 [group('v41-load')]
-gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
+gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard --bin generate_qwen3moe && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
 
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
