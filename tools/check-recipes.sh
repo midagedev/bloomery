@@ -54,18 +54,22 @@ fi
 # with no cargo target. The parser is tools/recipes.py, the one tools/affected-gates.sh uses; its own
 # tests (--self-test) run here too, so the parser the lead's batch lists come from is tested wherever
 # this check runs.
-python3 "$(dirname "$0")/recipes.py" check
+# The check of the recipes against the workspace is the first of the parallel blocks below (blk_recipescheck).
 # The blocks below are independent — each runs in its own subshell on fixtures in its own temp
 # directory — so they run as parallel background jobs and report in this file's order after a barrier:
 # each block's own output (its last line where the serial form printed only that), its full output and
-# its named error on failure, and the first red block's own rc ends the check. The serial form's
-# ~172 s wall was these blocks one after another (measured 2026-10-07); the barrier holds every
-# assertion the serial form held.
+# its named error on failure, and the first red block's own rc ends the check. The wall is the slowest block's:
+# ~140 s with the Mac at load 65-100 (measured 2026-10-12; ~780 s there before the long self-tests, recipes.py
+# and gate-batch.sh, ran their sections as parallel processes). The barrier holds every assertion the serial
+# form held.
 B=$(mktemp -d)
 trap 'rm -rf "$B"' EXIT
 
 # blk_NAME: one block. Its stdout is what the serial form printed; a failure prints its named error to
 # stderr and returns nonzero. `$(dirname "$0")` still names this script's directory inside a function.
+blk_recipescheck() {
+  python3 "$(dirname "$0")/recipes.py" check
+}
 blk_selftest() {
   if ! python3 "$(dirname "$0")/recipes.py" --self-test; then
     echo "check-recipes: the recipes.py self-test failed" >&2
@@ -665,11 +669,11 @@ print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{
 PY
 }
 
-BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
+BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh carry pytools boxqcodes fixturevariants
   refsetpublish orphan archowner)
 for b in "${BLOCKS[@]}"; do
-  ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
+  ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done
 wait
 rc=0
@@ -682,5 +686,10 @@ for b in "${BLOCKS[@]}"; do
     cat "$B/$b.out"
   fi
 done
+# The five slowest blocks, whole seconds each (the wall is the slowest block's own time under the load of
+# its siblings); a block killed before its wrapper wrote the time counts 0.
+slowest=$(for b in "${BLOCKS[@]}"; do echo "$(cat "$B/$b.t" 2> /dev/null || echo 0) $b"; done |
+  sort -rn | awk 'NR <= 5 {printf "%s%s %s s", (NR > 1 ? ", " : ""), $2, $1}')
+echo "check-recipes: slowest: $slowest"
 [ "$rc" = 0 ] || exit "$rc"
 echo "check-recipes: ok"

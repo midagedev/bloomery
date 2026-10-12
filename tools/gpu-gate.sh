@@ -348,8 +348,13 @@ pace() {
 # nvidia-smi on PATH (two cards, no compute process) and a stub target/release/ok that, when asked (STUB_READY, STUB_ORDER, STUB_HOLD), says it is
 # running, appends its STUB_ID to a marker file and holds until the test releases it. Concurrent runs are started with & and waited for by their $!. One line per case;
 # exit 0 iff none failed.
+# The cases wait on real bounds and events, so they run as SELFTEST_PARTS processes at once: each part is the cases between its
+# `if gg_part K; then … fi` guards (contiguous in the file; the helpers and locals between them run in every part). `--self-test`
+# starts every part and sums their counts; `--self-test --part K` runs one (K, or `all`: the parts one after another here).
+SELFTEST_PARTS=3
 self_test() {
-  local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc cap=50
+  local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc cap=50 part=${1:-all}
+  gg_part() { [ "$part" = all ] || [ "$part" = "$1" ]; }
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   # The cases pin the box's /root paths, so a lock directory from local mode is dropped; the local cases name their own.
   unset BLOOMERY_LOCK_DIR
@@ -492,6 +497,7 @@ PY
   proc 101 100 holder
   proc 300 1
   local NOREC='the lease holds no timing-card record'
+  if gg_part 1; then
   case_ 'lease held, no record: 3090 forced is refused, 75, named' 75 "BLOOMERY_GATE_CARD=3090 .*in doubt \\($NOREC \\(no readable .*a tree without the writer" 3090 "$t/lease"
   case_ '  … a6000 forced is refused too' 75 "BLOOMERY_GATE_CARD=a6000 .*in doubt \\($NOREC" a6000 "$t/lease"
   case_ '  … any waits on both cards (75 at the bound)' 75 'no gate lock \(any\) was free within 4 s' any "$t/lease"
@@ -527,8 +533,10 @@ PY
   rm -rf "$t/lease.card" "$t/proc/101/fd/9"
   record 100 "$GPU_A6000"
   case_ 'no holder readable: 3090 forced is refused, named' 75 "in doubt \\($NOREC that can be checked \\(no process holding" 3090 "$t/lease"
+  fi
   flock -u 7
   exec 7>&-
+  if gg_part 1; then
   record 101 "$GPU_3090"
   case_ 'lease free: the record is not read, 3090 forced runs' 0 'ran on $' 3090 "$t/lease"
   rm -rf "$t/lease.card" "$t/proc"
@@ -549,6 +557,7 @@ PY
   # A helper waiter's two bounds are a safety cap of $cap s (GATE_TEST_CAP), under gate()'s own 60 s so a waiter that hits it ends 75,
   # not 124: the test ends its life by an event, and one that hits the cap is a red by name (helper_cap). The cases that judge a bound
   # keep the runner's own 4 s and 6 s.
+  fi
   fifos() {
     exec 3>&- 4>&-
     rm -f "$t/ready" "$t/hold"
@@ -577,6 +586,7 @@ PY
     [ "$seen" = 1 ] || echo go >&"$fd"
     [ -z "$str2" ] || [ "$seen2" = 1 ] || echo go >&"$fd2"
   }
+  if gg_part 1; then
   # Two V4.1 loads at once, on the two cards: the second waits for the first, names it, and counts the wait. The first holds the load
   # lock until the second has scanned for its holder (lease_holders prints once its scan of /proc is done, so its first `[lease]   `
   # line); the second starts once the first holds it.
@@ -615,7 +625,9 @@ PY
   # the load lock, takes it once the test lets it go and then, holding it, waits for its card: each wait is one `waited` line of its own
   # (the load lock's seconds end where the card's begin), and the card wait says it holds the load lock.
   fifos
+  fi
   qreset() { rm -rf "$t/v41-queue.d" "$t/v41-queue.seq" "$t/order"; }
+  if gg_part 1; then
   qreset
   exec 6> "$t/v41-load.lock"
   flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
@@ -699,6 +711,7 @@ PY
   # an order a run that tried the lock whether or not it was the head would win by. Each grant ends with the loader's next sign on its ack
   # FIFO: `polled` (it waited) or `exit` (it took the locks, ran the stub, and ended); the stub's marker file says in what order.
   # pace_open <k>: loader k's FIFO pair, held open read-write here (descriptors 20+2k grants, 21+2k signs).
+  fi
   pace_open() {
     local g=$((20 + 2 * $1)) a=$((21 + 2 * $1))
     rm -f "$t/pc$1.go" "$t/pc$1.ack"
@@ -751,6 +764,7 @@ PY
   }
   # markers: the stub's markers in the order it wrote them, on one line.
   markers() { printf 'markers: %s\n' "$(tr '\n' ' ' < "$t/order" 2> /dev/null)"; }
+  if gg_part 2; then
   # Three loaders arrive in the order A, B, C while the test holds the load lock; the view lists them in order; once the lock is free the
   # polls are granted C, B, A, B, C: only the head may take it, so C and B poll in vain and the markers are A, B, C.
   qreset
@@ -1002,6 +1016,8 @@ PY
   judge_all '--v41-queue runs under BLOOMERY_BOX_READONLY=1 and syncs nothing' "$rc" 0 'rsync calls: 0$' 'last ssh: bash tools/gpu-gate\.sh --v41-queue$'
   case_ 'BLOOMERY_V41_CLASS other than 1 to 4: 64, named' 64 "BLOOMERY_V41_CLASS is 1 .* got '5'" 3090 "$t/lease" BLOOMERY_V41_CLASS=5
   case_ '  … a name is no class either' 64 "BLOOMERY_V41_CLASS is 1 .* got 'two'" 3090 "$t/lease" BLOOMERY_V41_CLASS=two
+  fi
+  if gg_part 3; then
   case_ 'BLOOMERY_V41_PRED_S not whole seconds: 64, named' 64 "BLOOMERY_V41_PRED_S is whole seconds .* got '2m'" 3090 "$t/lease" BLOOMERY_V41_PRED_S=2m
   # The tier. A fixture load takes no V4.1 load lock — only when its model is the file box.sh resolved: the lock file is not opened
   # (a directory stands there, which a real load refuses with 69), a held lock is not waited for, a request without the resolved
@@ -1046,6 +1062,7 @@ PY
   # The batch hold (the header). hold <owner> [age s] writes the file as the batch's writer leaves it, its mtime <age> seconds back
   # (python3's utime: BSD and GNU touch share no relative form); hold_age is the mtime's age; hrun <verb> <owner> runs the writer and
   # appends the file as it stands after (all three take a third argument, a directory: the hold of another --test-locks dir).
+  fi
   hold() {
     printf 'owner=%s since=%s\n' "$1" "$(($(date +%s) - ${2:-0}))" > "${3:-$t}/batch.gpuhold"
     python3 -c 'import os, sys, time; a = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (a, a))' "${3:-$t}/batch.gpuhold" "${2:-0}"
@@ -1066,6 +1083,7 @@ PY
       echo 'after: no hold' >> "$t/out"
     fi
   }
+  if gg_part 3; then
   rm -f "$t/batch.gpuhold"
   rc=0
   gate "$t/out" 3090 "$t/lease" || rc=$?
@@ -1202,7 +1220,9 @@ PY
   judge_all "the batch hold's name does not match the sittings' LEASE_HOLDS" 0 0 '^/root/bloomery-batch\.gpuhold sitting-hold-matches apart$'
   # box.sh's local mode (BLOOMERY_BOX_CARD=local, its lock directory the test's): one lock for this machine's card(s), apart from
   # the box's two, and the caller's CUDA_VISIBLE_DEVICES (the stub prints it); a held lease is waited for as the lock is.
+  fi
   local ON_LOCAL="ok on this machine's card\\(s\\), the local gate lock" LOC=(BLOOMERY_BOX_CARD=local "BLOOMERY_LOCK_DIR=$t")
+  if gg_part 3; then
   rc=0
   gate "$t/out" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller || rc=$?
   judge_all 'local: any takes the local lock and leaves CUDA_VISIBLE_DEVICES as it was' "$rc" 0 "$ON_LOCAL \\(asked any\\)$" '^ran on GPU-caller$'
@@ -1219,13 +1239,54 @@ PY
   exec 7> "$t/lease"
   flock -x 7 || { echo "FAIL: the test cannot hold its lease file"; return 1; }
   case_ '  … the lease held: it times the card, 75 at the bound' 75 'no gate lock \(local\) was free within 4 s' any "$t/lease" "${LOC[@]}"
+  fi
   exec 7>&-
   echo "gpu-gate self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }
+# --self-test: every part in a process of its own, their lines in part order, one summary of the counts. The guards in this file
+# must name exactly parts 1..SELFTEST_PARTS: a part with no guard would run no case, a guard past the last part would never run.
+self_test_parts() {
+  local self tmp k line a b ok=0 total=0 red=0 guards want='' slowest
+  self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+  guards=$(grep -o 'gg_part [0-9][0-9]*; then' "$self" | grep -o '[0-9][0-9]*' | sort -un | tr '\n' ' ')
+  for ((k = 1; k <= SELFTEST_PARTS; k++)); do want="$want$k "; done
+  if [ "$guards" != "$want" ]; then
+    echo "gpu-gate.sh: self-test: the guards name parts ${guards:-none}, not 1..$SELFTEST_PARTS" >&2
+    return 70
+  fi
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/gpu-gate-parts.XXXXXX") || return 70
+  # shellcheck disable=SC2064 # the path is fixed now
+  trap "rm -rf '$tmp'" EXIT
+  for ((k = 1; k <= SELFTEST_PARTS; k++)); do
+    ( set +e; s0=$SECONDS; bash "$self" --self-test --part "$k" > "$tmp/$k.out" 2>&1; echo $? > "$tmp/$k.rc"; echo $((SECONDS - s0)) > "$tmp/$k.s" ) &
+  done
+  wait
+  for ((k = 1; k <= SELFTEST_PARTS; k++)); do
+    cat "$tmp/$k.out"
+    line=$(tail -n 1 "$tmp/$k.out")
+    if [[ $line =~ ^gpu-gate\ self-test:\ ([0-9]+)\ of\ ([0-9]+)\ ok$ ]]; then
+      a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
+      ok=$((ok + a)) total=$((total + b))
+      [ "$a" = "$b" ] || red=1
+    else
+      red=1
+      echo "gpu-gate self-test: part $k ended without its count line"
+    fi
+    [ "$(cat "$tmp/$k.rc" 2> /dev/null)" = 0 ] || { red=1; echo "gpu-gate self-test: part $k ended rc $(cat "$tmp/$k.rc" 2> /dev/null || echo none)"; }
+  done
+  slowest=$(for ((k = 1; k <= SELFTEST_PARTS; k++)); do echo "$(cat "$tmp/$k.s" 2> /dev/null || echo 0) part $k"; done | sort -rn | awk 'NR <= 3 {printf "%s%s %s %s s", (NR > 1 ? ", " : ""), $2, $3, $1}')
+  echo "gpu-gate self-test: slowest parts: $slowest"
+  echo "gpu-gate self-test: $ok of $total ok"
+  [ "$red" = 0 ]
+}
 if [ "${1:-}" = --self-test ]; then
-  self_test
-  exit $?
+  case $# in
+    1) self_test_parts; exit $? ;;
+    3) [ "$2" = --part ] && { [ "$3" = all ] || { [ "$3" -ge 1 ] 2> /dev/null && [ "$3" -le "$SELFTEST_PARTS" ]; }; } || { echo "gpu-gate.sh: --self-test --part takes all or 1..$SELFTEST_PARTS" >&2; exit 64; }
+      self_test "$3"; exit $? ;;
+    *) echo "gpu-gate.sh: --self-test takes nothing else, or --part K|all" >&2; exit 64 ;;
+  esac
 fi
 if [ "${1:-}" = --test-locks ]; then
   [ $# -ge 3 ] && [ -d "$2" ] || { echo "usage: gpu-gate.sh --test-locks <dir> <binary> [args...] (the self-test's)" >&2; exit 64; }

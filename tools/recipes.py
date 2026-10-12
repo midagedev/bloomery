@@ -20,7 +20,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py combos           # every build shape a recipe compiles, one cargo check command each (tools/mac-check.sh combos)
     python3 tools/recipes.py orphan-tests      # every #[test] no gate-* or lab-* recipe runs on the box
     python3 tools/recipes.py expand [--justfile F]  # every recipe as just runs it, each top-level variable replaced by its value in this environment
-    python3 tools/recipes.py --self-test
+    python3 tools/recipes.py --self-test [--serial]  # its sections run as forked processes; --serial: one after another in this one
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
 `main`) compares the working tree, uncommitted and untracked files included, with the merge base of
@@ -206,7 +206,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -8013,10 +8013,8 @@ def module_gate_self_test(expect) -> None:
         expect(not side.tree.unresolved, f"module gate: unresolved {side.tree.unresolved[:2]}")
 
 
-def key_self_test(expect, real: Side) -> None:
-    """The ledger key: the detectors on the real tree, then a scratch copy where each input class is
-    changed in turn — the same inputs give the same key, each change moves exactly the keys that read it."""
-    meta = cargo_metadata(ROOT)
+def key_detectors_self_test(expect, real: Side) -> None:
+    """The ledger key's detectors on the real tree: which gates can skip, which are keyed on the whole tree."""
     settings = justfile_settings(os.path.join(ROOT, "justfile"))
     ctx = KeyContext(real, None, settings=settings)
     gates = [n for n in real.recipes if n.startswith(GATE_PREFIX)]
@@ -8055,6 +8053,12 @@ def key_self_test(expect, real: Side) -> None:
         hit = scan_lines(real.tree.read(s), TREE_WALK, s)
         expect(hit is None, f"the walk detector flags {hit}: every gate that runs it would be keyed on the whole tree")
 
+
+def key_self_test(expect, real: Side) -> None:
+    """The ledger key on a scratch copy where each input class is changed in turn — the same inputs give the
+    same key, each change moves exactly the keys that read it."""
+    meta = cargo_metadata(ROOT)
+    settings = justfile_settings(os.path.join(ROOT, "justfile"))
     with tempfile.TemporaryDirectory(prefix="recipes-keytest-") as tmp:
         roots = [os.path.join(tmp, "a")]
         for rel in shipped_files(ROOT):
@@ -9125,8 +9129,8 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
 
 
 def narrow_self_test(expect, side: Side) -> None:
-    """--narrow: the scan verdicts and their refusals, the four rules of narrow() on the real tree with rows of
-    the test's own, the table's checks, and the host group's guard."""
+    """--narrow: the scan verdicts and their refusals, and the four rules of narrow() on the real tree with rows of
+    the test's own."""
     header = "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local"
     h1, h2, h3 = "1" * 32, "2" * 32, "3" * 32
 
@@ -9388,6 +9392,14 @@ def narrow_self_test(expect, side: Side) -> None:
             fh.write("crates/x/**\tgate-x\tan old row\n")
         got = trigger_rows(SimpleNamespace(tree=SimpleNamespace(root=old)))
         expect([r.glob for r in got[0]] == ["crates/x/**"] and got[1] is None, f"weekly: the rows of the tree read, not the working tree's: {got}")
+
+
+def narrow_table_self_test(expect, side: Side) -> None:
+    """The gate-paths table's checks and the host group's guard on the real tree."""
+
+    def row(glob: str, names: list[str], line: int = 1) -> PathRow:
+        return PathRow(line, glob, names, "why", glob_regex(glob))
+
     # the table's checks: planted rows, each refused by name; the real table clean
     tree, recipes = side.tree, side.recipes
     got = gate_paths_problems(tree, recipes, [row("crates/nothing/**", ["gate-nope"])])
@@ -9534,12 +9546,65 @@ def bin_feature_self_test(expect) -> None:
     expect(problems(("a", call("glm5next,vision"))) == [], "bin features: a lone build refused")
 
 
-def self_test() -> int:
-    fails: list[str] = []
-
+def _expecting(fails: list[str]) -> Callable[[bool, str], None]:
     def expect(cond: bool, what: str) -> None:
         if not cond:
             fails.append(what)
+
+    return expect
+
+
+def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = False) -> tuple[list[str], list[tuple[str, float]]]:
+    """The failures of every job, in job order, and each job's wall seconds. Each job runs in a forked child of this process (`serial`: in this one), so
+    the parsed real tree is shared copy-on-write while each job's temp directories, environment and working directory stay
+    its own. A job that raises reports its traceback as a failure; a child that ends without a report is a failure naming it."""
+    import multiprocessing
+    import traceback
+
+    def run(name: str, job: Callable[[list[str]], None]) -> tuple[list[str], float]:
+        got: list[str] = []
+        t0 = time.monotonic()
+        try:
+            job(got)
+        except Exception:
+            got.append(f"{name}: raised\n{traceback.format_exc()}")
+        return got, time.monotonic() - t0
+
+    out: list[str] = []
+    times: list[tuple[str, float]] = []
+    if serial:
+        for name, job in jobs:
+            got, secs = run(name, job)
+            out.extend(got)
+            times.append((name, secs))
+        return out, times
+    ctx = multiprocessing.get_context("fork")
+    started = []
+    for name, job in jobs:
+        recv, send = ctx.Pipe(duplex=False)
+
+        def child(name: str = name, job: Callable[[list[str]], None] = job, send=send) -> None:
+            send.send(run(name, job))
+            send.close()
+
+        proc = ctx.Process(target=child)
+        proc.start()
+        send.close()
+        started.append((name, proc, recv))
+    for name, proc, recv in started:
+        try:
+            got, secs = recv.recv()
+            out.extend(got)
+            times.append((name, secs))
+        except EOFError:
+            proc.join()
+            out.append(f"{name}: its process ended without a report (exit code {proc.exitcode})")
+        proc.join()
+    return out, times
+
+
+def _st_basics(fails: list[str], side: Side) -> None:
+    expect = _expecting(fails)
 
     # shell splitting and the four command shapes
     rc = recipe_commands(
@@ -9701,7 +9766,7 @@ def self_test() -> int:
                 "f FEATURES:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin gate_p1 && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx'\n"
             )
         try:
-            shapes, skips, n = build_shapes(Tree(ROOT), load_justfile(p))
+            shapes, skips, n = build_shapes(side.tree, load_justfile(p))
         except RecipeError as err:
             shapes, skips, n = [], [], 0
             fails.append(f"combos: the synthetic justfile raised {err}")
@@ -9723,7 +9788,7 @@ def self_test() -> int:
         with open(p, "w", encoding="utf-8") as fh:
             fh.write("g:\n    ./tools/box.sh 'cargo build -p bloomery-gpu-gates --bin no_such_bin'\n")
         try:
-            build_shapes(Tree(ROOT), load_justfile(p))
+            build_shapes(side.tree, load_justfile(p))
             fails.append("combos: a call naming no target accepted")
         except RecipeError as err:
             expect("g: --bin no_such_bin" in str(err), f"combos: an unresolvable call refused without its name: {err}")
@@ -9758,8 +9823,10 @@ def self_test() -> int:
     except RecipeError as err:
         expect("--base" in str(err), f"combos: --ledger without --base refused without naming --base: {err}")
 
-    # the real tree
-    side = make_side(ROOT)
+
+
+def _st_real_tree(fails: list[str], side: Side) -> None:
+    expect = _expecting(fails)
     tree, recipes, graph = side.tree, side.recipes, side.graph
     gates = [n for n in recipes if n.startswith(GATE_PREFIX)]
     expect(len(gates) >= 80, f"only {len(gates)} gate-* recipes parsed")
@@ -9890,6 +9957,11 @@ def self_test() -> int:
         for view, name in ((lib, "lib"), (libtest, "lib tests"), (dep, "a dependent")):
             expect(("p/src/one_off.rs" in view) == ("p/src/two_off.rs" in view), f"cfg(test) walk: {name} reads a #[cfg(feature)] module on one line other than on two")
         expect(not st.unresolved, f"cfg(test) walk: unresolved {st.unresolved[:2]}")
+
+
+
+def _st_pure_crates(fails: list[str], side: Side) -> None:
+    expect = _expecting(fails)
 
     # pure crates: the cfg reader, then a synthetic workspace with a lock file — a device root reached
     # directly, through a workspace crate, through an external package, a git source and a dev
@@ -10051,6 +10123,12 @@ def self_test() -> int:
         ]:
             got = nightly_problems(pt, lock, linked, skips, checks, {})
             expect((not got) if want is None else any(want in g for g in got), f"host nightly: {want}: {got}")
+
+
+def _st_host_crates(fails: list[str], side: Side) -> None:
+    expect = _expecting(fails)
+    tree = side.tree
+
     # the real tree: the rule's selection is the set whose native `cargo test` passes (`just mac-test`), and a
     # rejected crate names a device root or a source line
     real = dict(pure_crates(tree, load_lock(tree.root)))
@@ -10084,6 +10162,12 @@ def self_test() -> int:
         "host nightly: a check script is neither a unit nor excluded",
     )
 
+
+
+def _st_mutations(fails: list[str], side: Side, part: int, parts: int) -> None:
+    """The mutated-justfile cases, `part` of `parts` (every parts-th typo, the required-features one in the last part)."""
+    expect = _expecting(fails)
+
     # FAIL-first on a mutated justfile: a typo'd --bin, --test, -p, feature and runner name
     with open(os.path.join(ROOT, "justfile"), encoding="utf-8") as fh:
         text = fh.read()
@@ -10103,23 +10187,31 @@ def self_test() -> int:
         bad = typo(m.group(1))
         mutations.append((m.start(1), m.end(1), bad))
     with tempfile.TemporaryDirectory(prefix="recipes-selftest-") as tmp:
-        for start, end, bad in mutations:
+        for start, end, bad in mutations[part::parts]:
             p = os.path.join(tmp, "justfile")
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write(text[:start] + bad + text[end:])
-            probs = check(Tree(ROOT), load_justfile(p))
+            probs = check(side.tree, load_justfile(p))
             expect(any(bad in x for x in probs), f"mutation {bad} not caught: {probs[:2]}")
         # a feature-gated bin built without its feature: cargo refuses it (required-features), and so
         # does the check, before the recipe runs
         m = re.search(r"--features deepseek41 (--release --bin generate_ds41)", text)
-        if m is None:
+        if part != parts - 1:
+            pass
+        elif m is None:
             fails.append("no mutation anchor for the generate_ds41 build")
         else:
             p = os.path.join(tmp, "justfile")
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write(text[: m.start()] + "--features gpu " + m.group(1) + text[m.end() :])
-            probs = check(Tree(ROOT), load_justfile(p))
+            probs = check(side.tree, load_justfile(p))
             expect(any("--bin generate_ds41: needs features ['deepseek41']" in x for x in probs), f"generate_ds41 without deepseek41 not caught: {probs[:2]}")
+
+
+
+def _st_selection(fails: list[str], side: Side) -> None:
+    expect = _expecting(fails)
+    recipes = side.recipes
 
     # a changed recipe text selects that recipe and no other
     import copy
@@ -10138,45 +10230,52 @@ def self_test() -> int:
     t, deps, root = parse_depinfo("/r/b/target/release/g: /r/b/crates/a\\ b.rs /r/b/crates/c.rs\n")
     expect(t.endswith("/g") and root == "/r/b" and "/r/b/crates/a b.rs" in deps, "dep-info parse")
 
-    # orphan-tests
-    orphan_self_test(expect, side)
 
-    # affected --narrow
-    narrow_self_test(expect, side)
-    variant_items_self_test(expect)
+def self_test(serial: bool = False) -> int:
+    side = make_side(ROOT)
+    gates = [n for n in side.recipes if n.startswith(GATE_PREFIX)]
 
-    # the scan set
-    scan_set_self_test(expect, side)
+    def small(f: list[str]) -> None:
+        expect = _expecting(f)
+        scan_set_self_test(expect, side)  # the scan set
+        manifest_self_test(expect)  # a package manifest read by table
+        root_manifest_self_test(expect)  # the root Cargo.toml read by table
+        range_base_self_test(expect)  # A..B read against the merge base
+        module_gate_self_test(expect)  # a module gated by a cargo feature
+        static_self_test(expect)  # the static tier compiles every feature-gated bin
+        ledger_self_test(expect)  # the green ledger's key, but for the key itself
+        manifest_rows_self_test(expect)
+        ref_paths_self_test(expect)
+        box_tier_self_test(expect)
+        oxide_rev_self_test(expect)
+        expand_self_test(expect)
+        opens_self_test(expect)  # opens: the targets that reach the fixture fence
 
-    # a package manifest read by table
-    manifest_self_test(expect)
+    def narrow(f: list[str]) -> None:
+        expect = _expecting(f)
+        narrow_self_test(expect, side)  # affected --narrow
+        variant_items_self_test(expect)
 
-    # the root Cargo.toml read by table
-    root_manifest_self_test(expect)
-
-    # A..B read against the merge base
-    range_base_self_test(expect)
-
-    # a module gated by a cargo feature
-    module_gate_self_test(expect)
-
-    # the static tier compiles every feature-gated bin
-    static_self_test(expect)
-
-    # the green ledger's key
-    key_self_test(expect, side)
-    ledger_self_test(expect)
-    manifest_rows_self_test(expect)
-    ref_paths_self_test(expect)
-    box_tier_self_test(expect)
-    oxide_rev_self_test(expect)
-    expand_self_test(expect)
-
-    # opens: the targets that reach the fixture fence
-    opens_self_test(expect)
-
+    # Independent sections, each on the same parsed real tree: they run side by side, the wall is the longest one.
+    jobs: list[tuple[str, Callable[[list[str]], None]]] = [
+        ("basics", lambda f: _st_basics(f, side)),
+        ("real tree", lambda f: _st_real_tree(f, side)),
+        ("pure crates", lambda f: _st_pure_crates(f, side)),
+        ("host crates", lambda f: _st_host_crates(f, side)),
+        ("mutations 1/2", lambda f: _st_mutations(f, side, 0, 2)),
+        ("mutations 2/2", lambda f: _st_mutations(f, side, 1, 2)),
+        ("selection", lambda f: _st_selection(f, side)),
+        ("orphan-tests", lambda f: orphan_self_test(_expecting(f), side)),
+        ("narrow", narrow),
+        ("narrow table", lambda f: narrow_table_self_test(_expecting(f), side)),
+        ("small tools", small),
+        ("key detectors", lambda f: key_detectors_self_test(_expecting(f), side)),
+        ("key", lambda f: key_self_test(_expecting(f), side)),
+    ]
+    fails, times = _forked(jobs, serial)
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
+    print("self-test: slowest sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in sorted(times, key=lambda x: -x[1])[:3]))
     print(f"self-test: {'FAIL' if fails else 'ok'} ({len(gates)} gate recipes, {len(fails)} failures)")
     return 1 if fails else 0
 
@@ -10184,6 +10283,7 @@ def self_test() -> int:
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--serial", action="store_true", help="with --self-test: run its sections one after another in this process (a debugger, a traceback in order)")
     sub = ap.add_subparsers(dest="cmd")
     c = sub.add_parser("check")
     c.add_argument("--justfile")
@@ -10242,7 +10342,7 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     try:
         if args.self_test:
-            return self_test()
+            return self_test(args.serial)
         if args.cmd == "check":
             return cmd_check(args)
         if args.cmd == "targets":

@@ -41,6 +41,12 @@ cp "$T/tools/box.sh" "$tmp/old/tools/box.sh"
 cp "$T/tools/box.sh" "$tmp/nocard/tools/box.sh"
 cp "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" "$tmp/nocard/tools/ref/"
 
+# The depth-serve runner's stub tests (arms, rotation, refusals, the servers' stop, the tables' math; a stub server, no lease) are one
+# long process that mostly waits on its stub servers, so it runs beside every test below and is judged at the end. The runner calls
+# lease_take, so gate-batch's walker refuses check-recipes for naming it; a *-tests directory is the harness the walker does not read.
+bash "$ROOT/tools/ref/depth-serve.sh" --self-test > "$tmp/depth-serve.out" 2>&1 &
+depth_pid=$!
+
 pass() { n=$((n + 1)); echo "ok $1"; }
 fail() {
   n=$((n + 1)) failed=$((failed + 1))
@@ -1261,9 +1267,16 @@ fi
 # The cpu guard (guard_cpu, cpu_busy_reading) on a stub /proc tree, and live where /proc exists.
 run 'the cpu guard tests (cpu-guard.sh)' 0 '^cpu-guard: [0-9]+ tests, 0 failed$' bash "$HERE/cpu-guard.sh"
 
-# The depth-serve runner's stub tests (arms, rotation, refusals, the servers' stop, the tables' math; a stub server, no lease). The runner
-# calls lease_take, so gate-batch's walker refuses check-recipes for naming it; a *-tests directory is the harness the walker does not read.
-run "the depth-serve runner's stub tests (depth-serve.sh --self-test)" 0 '^depth-serve\.sh self-test: [0-9]+ checks ok$' bash "$ROOT/tools/ref/depth-serve.sh" --self-test
+# The depth-serve runner's stub tests were started first (below the setup): their result is judged here, with the run() verdict.
+wait "$depth_pid"
+drc=$?
+if [ "$drc" != 0 ]; then
+  fail "the depth-serve runner's stub tests (depth-serve.sh --self-test)" "rc $drc, want 0" "$tmp/depth-serve.out"
+elif ! grep -Eq -- '^depth-serve\.sh self-test: [0-9]+ checks ok$' "$tmp/depth-serve.out"; then
+  fail "the depth-serve runner's stub tests (depth-serve.sh --self-test)" 'no line matches /^depth-serve\.sh self-test: [0-9]+ checks ok$/' "$tmp/depth-serve.out"
+else
+  pass "the depth-serve runner's stub tests (depth-serve.sh --self-test)"
+fi
 
 echo "card-tests: $n tests, $failed failed"
 [ "$failed" = 0 ]
