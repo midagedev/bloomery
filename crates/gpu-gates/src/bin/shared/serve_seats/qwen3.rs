@@ -766,6 +766,7 @@ impl<B: Body3> Q3<B> {
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let opened = t.elapsed();
         let mut m = B::open(file, ctx, slots, load, levers, (kv, vision.as_ref()))?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
@@ -788,6 +789,7 @@ impl<B: Body3> Q3<B> {
         if slots > 1 {
             s.add_slots(slots)?;
         }
+        let total = t.elapsed();
         Record::new(&record::LOAD_QWEN3)
             .w("arch", B::ARCH)
             .u("resident_bytes", s.model().resident_bytes())
@@ -798,8 +800,9 @@ impl<B: Body3> Q3<B> {
             .u("layers", s.model().layers().len())
             .u("ubatch", B::ubatch(s.model())?)
             .u("graph_nodes", nodes)
-            .f("load_s", t.elapsed().as_secs_f64())
+            .f("load_s", total.as_secs_f64())
             .eprint();
+        record::eprint_load_phases(s.model(), total, opened);
         // The tower after the model's captures, as the V4.1 seat opens its encoder.
         #[cfg(feature = "vision")]
         let vision = open_encoder(&s, vision)?;

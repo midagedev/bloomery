@@ -322,7 +322,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::Gpu;
@@ -2048,6 +2048,8 @@ impl Q38 {
         // The sequences the load makes pin the body's budget at this context;
         // the plan's machine must reserve at least that.
         let ckpt = checkpoint_budget38(gdn_layers(&inputs), ctx_ub.0)?;
+        // The wall before the loader's call, which the `load phases` record names.
+        let opened: Duration;
         let mut m = match a.mtp {
             false => {
                 let machine = a.place.machine(&inputs, ctx_ub, a.experts, None, a.slots)?;
@@ -2060,6 +2062,7 @@ impl Q38 {
                     a.slots,
                 )?;
                 a.plan.hold(&PlanKey::of(&plan)?)?;
+                opened = t.elapsed();
                 Body38::open_placed_residency(
                     file,
                     &plan,
@@ -2091,6 +2094,7 @@ impl Q38 {
                     a.slots,
                 )?;
                 a.plan.hold(&PlanKey::of(&plan.plan)?)?;
+                opened = t.elapsed();
                 Body38::open_placed_mtp_residency(
                     file,
                     &plan,
@@ -2107,6 +2111,7 @@ impl Q38 {
         };
         m.set_mode(StepMode::Graph);
         record::lane(a.lane.0, &a.lane.1).eprint();
+        let total = t.elapsed();
         eprintln!(
             "load arch=qwen4exp resident_bytes={} ctx={} slots={} slot_ctx={} ctx_max={cap} \
              ctx_train={} verified={VERIFIED_POSITIONS} layers={} mode=graph store_bytes={} \
@@ -2122,8 +2127,9 @@ impl Q38 {
             m.body(WHAT)?.ubatch_rows(),
             a.place.name(),
             m.body(WHAT)?.card_layers(),
-            t.elapsed().as_secs_f64()
+            total.as_secs_f64()
         );
+        record::eprint_load_phases(&m, total, opened);
         // The load's NVMe expert tier, when its plan paged routed experts
         // and the arena was built: the same `nvtier` record
         // `generate_qwen3moe` prints, at load — the arena's budget, the

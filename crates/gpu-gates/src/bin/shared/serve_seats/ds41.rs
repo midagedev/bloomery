@@ -188,7 +188,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use app::arch::deepseek41::{CardDraft, Ds41Cfg};
 use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
@@ -948,9 +948,15 @@ impl V41 {
         let vision_reserve = None;
         let machine =
             vision_seat::with_reserve(a.place.machine(a.reserve, a.tier_batch)?, vision_reserve);
+        let opened = t.elapsed();
         let mut m = body::open_slots(file, machine, a.ctx, &a.cfg, a.slots)?;
         m.set_mode(StepMode::Graph);
-        let mut log = Log { a: &a, pinned, t };
+        let mut log = Log {
+            a: &a,
+            pinned,
+            t,
+            opened,
+        };
         log.load(&m)?;
         let cfg = Ds41Cfg {
             feed: a.cfg.body.prefill,
@@ -1533,6 +1539,8 @@ struct Log<'a> {
     a: &'a SeatArgs,
     pinned: bool,
     t: Instant,
+    /// The wall from `t` to the loader's call: the phases record's `open_s`.
+    opened: Duration,
 }
 
 impl OpenLog<Body> for Log<'_> {
@@ -1559,6 +1567,7 @@ impl OpenLog<Body> for Log<'_> {
                 a.want_top_k
             )));
         }
+        let total = self.t.elapsed();
         let load = Record::new(&record::LOAD_GENERATOR)
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", a.ctx)
@@ -1575,8 +1584,9 @@ impl OpenLog<Body> for Log<'_> {
             .w("place", a.place.name())
             .w("pin_main", if a.pin_main { "on" } else { "off" })
             .w("pinned", self.pinned)
-            .f("load_s", self.t.elapsed().as_secs_f64())
+            .f("load_s", total.as_secs_f64())
             .eprint();
+        record::eprint_load_phases(m, total, self.opened);
         if let Some(h) = b.hybrid().residency() {
             for r in record::host_residency(h) {
                 r.eprint();

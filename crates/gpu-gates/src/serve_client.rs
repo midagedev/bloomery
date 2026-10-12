@@ -2,7 +2,8 @@
 //! `soak_ds41_serve` on `bloomery-serve-ds41`, `gate_qwen3_serve`,
 //! `gate_glm5next_serve` and `gate_mimo2_serve` on `bloomery-serve`): the
 //! server started beside the calling binary and killed by its handle on every
-//! way out, its address read from its stderr, one request through curl, a
+//! way out, its address read from its stderr (with the `server` record of the
+//! wall the spawn took to get there), one request through curl, a
 //! `/metrics` value, the server's stderr read by its binary's record kinds
 //! ([`server_log`]), and the requests the seat gates share: the chat turn's
 //! ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
@@ -17,16 +18,26 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::record::{Fields, Kind, Log};
+use crate::record::{self, Fields, Kind, Log, Record};
 use crate::{GateError, verdict};
+
+/// The longest gap between two reads of the server's stderr in
+/// [`Served::address`]: the `server` record's wall ends at the read that found
+/// the line, so a gate's own `poll` (seconds) must not set its resolution.
+const READ_GAP: Duration = Duration::from_millis(100);
 
 /// The server this binary started; killed and reaped on every way out.
 pub struct Served {
     pub child: Child,
+    /// The server binary's file name, as the `server` record names it.
+    exe: String,
+    /// The instant just before the child was spawned, until
+    /// [`Served::address`] prints the `server` record: it prints once.
+    spawned: Option<Instant>,
 }
 
 impl Served {
@@ -57,10 +68,18 @@ impl Served {
                 }
             });
         }
+        let spawned = Instant::now();
         let child = cmd
             .spawn()
             .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-        Ok(Served { child })
+        let exe = exe
+            .file_name()
+            .map_or_else(|| exe.display().to_string(), |n| n.to_string_lossy().into());
+        Ok(Served {
+            child,
+            exe,
+            spawned: Some(spawned),
+        })
     }
 
     /// The server's path: `bloomery-serve-ds41` beside this binary.
@@ -68,20 +87,35 @@ impl Served {
         Ok(std::env::current_exe()?.with_file_name("bloomery-serve-ds41"))
     }
 
-    /// Waits for the `listening on http://<addr>` line in the server's stderr,
-    /// `polls` reads `poll` apart.
+    /// Waits for the `listening on http://<addr>` line in the server's stderr:
+    /// `polls` polls of `poll` bound the wait, and the reads come at most
+    /// [`READ_GAP`] apart within them. The first time it finds the line it
+    /// prints the `server` record ([`record::SERVER_SPAWN`]) on stdout: the
+    /// wall from the spawn to the read that found the line.
     pub fn address(
         &mut self,
         err_log: &Path,
         polls: usize,
         poll: Duration,
     ) -> Result<String, GateError> {
-        for _ in 0..polls {
+        let gap = poll.min(READ_GAP);
+        let per_poll = poll.as_nanos().div_ceil(gap.as_nanos().max(1)).max(1);
+        let reads = usize::try_from(per_poll)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(polls);
+        for _ in 0..reads {
             let text = std::fs::read_to_string(err_log).unwrap_or_default();
             if let Some(addr) = text
                 .lines()
                 .find_map(|l| l.split_once("listening on http://").map(|(_, a)| a.trim()))
             {
+                if let Some(spawned) = self.spawned.take() {
+                    Record::new(&record::SERVER_SPAWN)
+                        .w("exe", &self.exe)
+                        .u("pid", self.child.id())
+                        .f("listening_s", spawned.elapsed().as_secs_f64())
+                        .print();
+                }
                 return Ok(addr.to_owned());
             }
             if let Some(status) = self.child.try_wait()? {
@@ -91,7 +125,7 @@ impl Served {
                 )
                 .into());
             }
-            std::thread::sleep(poll);
+            std::thread::sleep(gap);
         }
         Err(format!("the server did not listen within {polls} polls").into())
     }

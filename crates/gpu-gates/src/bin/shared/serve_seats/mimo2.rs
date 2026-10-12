@@ -113,7 +113,7 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use app::arch::mimo2::Mimo2Cfg;
 use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
@@ -356,6 +356,9 @@ struct OpenSeat {
 /// `load` record.
 struct Log {
     t: Instant,
+    /// The wall from `t` to the load, once the plan is made: the phases
+    /// record's `open_s`.
+    opened: Duration,
     ctx: usize,
     slots: usize,
     host_experts: u64,
@@ -379,6 +382,7 @@ impl OpenLog<Body> for Log {
     ) -> Result<bool, SessionError> {
         self.host_experts = plan.host.experts;
         self.card_experts = plan.cards[0].experts;
+        self.opened = self.t.elapsed();
         Ok(true)
     }
 
@@ -402,6 +406,7 @@ impl Log {
         if let Some((card, rate)) = &self.lane {
             record::lane(card, rate).eprint();
         }
+        let total = self.t.elapsed();
         Record::new(&record::LOAD_MIMO2)
             .w("arch", "mimo2")
             .u("resident_bytes", m.resident_bytes())
@@ -414,8 +419,9 @@ impl Log {
             .u("graph_nodes", self.graph_nodes)
             .w("pin_main", if self.pin_main { "on" } else { "off" })
             .w("pinned", self.pinned)
-            .f("load_s", self.t.elapsed().as_secs_f64())
+            .f("load_s", total.as_secs_f64())
             .eprint();
+        record::eprint_load_phases(m, total, self.opened);
         Ok(())
     }
 }
@@ -431,6 +437,7 @@ impl Mimo {
         let tier = (!a.place.tier_cards().is_empty()).then_some(NO_BATCH);
         let mut log = Log {
             t: Instant::now(),
+            opened: Duration::ZERO,
             ctx: a.ctx,
             slots: a.slots.get(),
             pin_main: a.pin_main,

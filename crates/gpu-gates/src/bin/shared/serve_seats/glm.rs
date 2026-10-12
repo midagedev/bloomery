@@ -245,7 +245,7 @@
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use app::arch::glm5next::{GlmCfg, open_nextn_slots, open_resident_slots};
 use app::mtp::{MtpBody, MtpDraft};
@@ -1252,6 +1252,7 @@ impl Glm {
             pin_main: a.pin_main,
             pinned,
             t,
+            opened: Duration::ZERO,
             draft_off: a.draft_off.clone(),
             draft_bytes: a.draft_bytes,
             lane: a.lane,
@@ -1442,6 +1443,9 @@ struct Log {
     pin_main: bool,
     pinned: bool,
     t: Instant,
+    /// The wall from `t` to the load, once the plan is made: the phases
+    /// record's `open_s`.
+    opened: Duration,
     /// Drafting nothing, why.
     draft_off: Option<String>,
     /// The plan's bytes for the NextN layer.
@@ -1461,11 +1465,13 @@ impl OpenLog<Body> for Log {
         _plan: &model::placement::Plan<'_>,
     ) -> Result<bool, app::SessionError> {
         self.top_k = inputs.hp.indexer.top_k;
+        self.opened = self.t.elapsed();
         Ok(true)
     }
 
     fn load(&mut self, m: &Glm5nextModel) -> Result<(), app::SessionError> {
         let b = m.body(WHAT)?;
+        let total = self.t.elapsed();
         let r = Record::new(&record::LOAD_GENERATOR)
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", self.ctx)
@@ -1483,8 +1489,9 @@ impl OpenLog<Body> for Log {
             .w("place", self.place)
             .w("pin_main", if self.pin_main { "on" } else { "off" })
             .w("pinned", self.pinned)
-            .f("load_s", self.t.elapsed().as_secs_f64())
+            .f("load_s", total.as_secs_f64())
             .eprint();
+        record::eprint_load_phases(m, total, self.opened);
         if let Some(h) = b.hybrid().residency() {
             for r in record::host_residency(h) {
                 r.eprint();
