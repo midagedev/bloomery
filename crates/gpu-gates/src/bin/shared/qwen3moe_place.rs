@@ -505,8 +505,9 @@ impl PlaceQ3 {
     /// The `plan` record of `plan`: the card, the architecture, the expert
     /// rule, the routed experts on the card and the host, the fewest and
     /// the most one layer keeps on the card, the card's free bytes when the
-    /// census read them, and its device. `why` names what made a run with
-    /// `--place` unset take this placed plan.
+    /// census read them, the host room the plan was made at when it had
+    /// one, and its device. `why` names what made a run with `--place`
+    /// unset take this placed plan.
     pub fn record(&self, plan: &Plan<'_>, why: Option<&str>) -> Record {
         let card = &plan.cards[0];
         let r = Record::new(&record::PLAN38)
@@ -529,6 +530,7 @@ impl PlaceQ3 {
             Some(free) => r.u("card_free", free),
             None => r,
         };
+        let r = record::with_room(r, plan.host.room);
         let r = match why {
             Some(w) => r.w("why", w),
             None => r,

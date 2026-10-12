@@ -1126,9 +1126,10 @@ mod cli {
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage
     /// card's experts, the tier card's when the plan has one, the stage
-    /// card's free bytes when the census read them, the PLE table's tier and
-    /// the reading of the host's room that chose it (`read`), and each plan
-    /// card's device (`record::plan_devices`). A plan whose PLE tier is not
+    /// card's free bytes when the census read them, the host room the plan
+    /// was made at when it had one, the PLE table's tier and the reading of
+    /// the host's room that chose it (`read`), and each plan card's device
+    /// (`record::plan_devices`). A plan whose PLE tier is not
     /// one the reader takes is refused by name (`Plan::row_tier`).
     fn plan38_line(
         place: Place,
@@ -1153,6 +1154,7 @@ mod cli {
             Some(free) => r.u("card_free", free),
             None => r,
         };
+        let r = record::with_room(r, plan.host.room);
         let r = match plan.row_tier()? {
             Some(Device::Host) => r.w("rows", "host"),
             Some(Device::Nvme) => r.w("rows", "nvme"),
