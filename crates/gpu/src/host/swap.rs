@@ -2286,7 +2286,7 @@ impl SwapMachine {
     /// of a layer noted and not all, and a noted row routing an id twice or
     /// past the experts. A failure of the fold itself breaks the machine.
     pub fn end_pass(&mut self, tally: &mut Tally, kept: KeptRows) -> Result<(), GpuError> {
-        self.end_pass_of(tally, kept, None, "SwapMachine::end_pass")
+        self.end_pass_of(tally, kept, None, None, "SwapMachine::end_pass")
     }
 
     /// [`SwapMachine::end_pass`] for a pass whose row `row` belongs to the
@@ -2302,16 +2302,48 @@ impl SwapMachine {
         kept: KeptRows,
         row_stream: &[u32],
     ) -> Result<(), GpuError> {
-        self.end_pass_of(tally, kept, Some(row_stream), "SwapMachine::end_pass_by")
+        self.end_pass_of(
+            tally,
+            kept,
+            Some(row_stream),
+            None,
+            "SwapMachine::end_pass_by",
+        )
     }
 
-    /// The body of both ends of a pass: `row_stream` is the row→stream map,
-    /// or `None` for the rule's stream 0.
+    /// [`SwapMachine::end_pass_by`] for rows tagged with the epoch of their
+    /// stream when they were kept ([`SwapMachine::stream_epoch`]): a kept row
+    /// of a stream that has closed or reopened since is dropped and counted
+    /// ([`SwapMachine::stale_rows`]), never folded into the request that
+    /// reopened it and never refused ([`SwapRule::end_pass_tagged`]). Refused
+    /// by name, the machine unchanged, besides what `end_pass` refuses: a map
+    /// shorter than the rows the tally noted, and a noted row whose stream is
+    /// past the rule's.
+    pub fn end_pass_tagged(
+        &mut self,
+        tally: &mut Tally,
+        kept: KeptRows,
+        row_stream: &[u32],
+        row_epoch: &[u32],
+    ) -> Result<(), GpuError> {
+        self.end_pass_of(
+            tally,
+            kept,
+            Some(row_stream),
+            Some(row_epoch),
+            "SwapMachine::end_pass_tagged",
+        )
+    }
+
+    /// The body of the ends of a pass: `row_stream` is the row→stream map,
+    /// or `None` for the rule's stream 0, and `row_epoch` the epoch each row
+    /// was kept in, when the map is tagged.
     fn end_pass_of(
         &mut self,
         tally: &mut Tally,
         kept: KeptRows,
         row_stream: Option<&[u32]>,
+        row_epoch: Option<&[u32]>,
         what: &'static str,
     ) -> Result<(), GpuError> {
         let start = Instant::now();
@@ -2353,13 +2385,19 @@ impl SwapMachine {
             ));
         }
         self.check_tally(tally, kept, what)?;
-        if let Some(map) = row_stream {
-            self.rule
+        match (row_stream, row_epoch) {
+            (Some(map), Some(epoch)) => self
+                .rule
+                .check_row_tags(map, epoch, tally.rows())
+                .map_err(|e| rule_err(what, e))?,
+            (Some(map), None) => self
+                .rule
                 .check_row_streams(map, tally.rows())
-                .map_err(|e| rule_err(what, e))?;
+                .map_err(|e| rule_err(what, e))?,
+            (None, _) => {}
         }
         let pass = self.rule.passes();
-        let folded = self.fold(tally, kept, row_stream, what);
+        let folded = self.fold(tally, kept, row_stream, row_epoch, what);
         self.after_change(folded, || format!("the end of pass {pass}"))?;
         tally.clear();
         self.kept = kept;
@@ -2421,6 +2459,7 @@ impl SwapMachine {
         t: &Tally,
         kept: KeptRows,
         row_stream: Option<&[u32]>,
+        row_epoch: Option<&[u32]>,
         what: &'static str,
     ) -> Result<(), GpuError> {
         let n = self.layers.len();
@@ -2436,9 +2475,10 @@ impl SwapMachine {
                     .map_err(|e| rule_err(what, e))?;
             }
         }
-        match row_stream {
-            Some(map) => self.rule.end_pass_by(kept, map),
-            None => self.rule.end_pass(kept),
+        match (row_stream, row_epoch) {
+            (Some(map), Some(epoch)) => self.rule.end_pass_tagged(kept, map, epoch),
+            (Some(map), None) => self.rule.end_pass_by(kept, map),
+            (None, _) => self.rule.end_pass(kept),
         }
         .map_err(|e| rule_err(what, e))
     }
@@ -3540,6 +3580,55 @@ impl SwapMachine {
         }
         self.write_changed(stream)?;
         self.agree(layer, slots, WHAT)
+    }
+
+    /// Stream `stream`'s epoch ([`SwapRule::stream_epoch`]), what rows kept
+    /// for it are tagged with; `None` for a stream past the rule's.
+    #[must_use]
+    pub fn stream_epoch(&self, stream: usize) -> Option<u32> {
+        self.rule.stream_epoch(stream)
+    }
+
+    /// Kept rows dropped as stale since the load ([`SwapRule::stale_rows`]).
+    #[must_use]
+    pub fn stale_rows(&self) -> u64 {
+        self.rule.stale_rows()
+    }
+
+    /// The streams that are live now ([`SwapRule::live_streams`]).
+    #[must_use]
+    pub fn live_streams(&self) -> usize {
+        self.rule.live_streams()
+    }
+
+    /// Close serving slot `slot`'s stream and append its warm section to
+    /// `out` ([`runtime::warmprof::close`]). Once per request. Refused by name, the
+    /// machine unchanged: a broken machine, a slot past the rule's streams
+    /// and one that is not live.
+    pub fn warm_close(&mut self, slot: usize, out: &mut Vec<u8>) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::warm_close";
+        self.refuse_if_broken(WHAT)?;
+        runtime::warmprof::close(&mut self.rule, slot, out).map_err(|e| rule_err(WHAT, e))
+    }
+
+    /// Open serving slot `slot`'s stream with `expected` tokens ahead, from
+    /// `section` or fresh ([`runtime::warmprof::open`]); a section of another shape
+    /// opens fresh and comes back as [`runtime::warmprof::Opened::Shape`].
+    /// Once per request. Refused by name, the machine unchanged: a broken
+    /// machine, a slot past the rule's streams or live, and a section the
+    /// codec refuses by anything but its shape.
+    pub fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<runtime::warmprof::Opened, GpuError> {
+        const WHAT: &str = "SwapMachine::warm_open";
+        self.refuse_if_broken(WHAT)?;
+        runtime::warmprof::open(&mut self.rule, slot, section, expected).map_err(|e| match e {
+            runtime::warmprof::OpenError::Rule(e) => rule_err(WHAT, e),
+            runtime::warmprof::OpenError::Section(e) => GpuError::shape(WHAT, e.to_string()),
+        })
     }
 
     /// Whether a live stream other than `stream` holds a count over 0

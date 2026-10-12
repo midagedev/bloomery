@@ -1,8 +1,8 @@
 //! The warm section: one stream's own routing, as a value with a byte codec.
 //!
 //! Two parts, both indexed `layer * experts + id`: `long`, how many times each
-//! routed expert was chosen over every position the stream covers, and
-//! `recent`, the stream's heat as [`crate::swaprule::SwapRule::stream_close`]
+//! routed expert was chosen over every position the stream covers (empty when
+//! the section does not collect it), and `recent`, the stream's heat as [`crate::swaprule::SwapRule::stream_close`]
 //! hands it over and [`crate::swaprule::SwapRule::stream_open`] takes it back,
 //! empty when the stream ran no decode. The section holds nothing that belongs
 //! to the card as a whole.
@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use crate::swaprule::valid_heat_cell;
+use crate::swaprule::{SwapRule, SwapRuleError, valid_heat_cell};
 
 const MAGIC: [u8; 4] = *b"BWRM";
 const VERSION: u16 = 1;
@@ -27,7 +27,8 @@ pub struct WarmSection {
     pub layers: u32,
     pub experts: u32,
     /// Counts per (layer, expert) over every position the stream covers:
-    /// `layers * experts` long.
+    /// `layers * experts` long, or empty when the section does not collect
+    /// them. An empty `long` says "not collected"; it is never zero counts.
     pub long: Vec<u32>,
     /// The stream's heat: `layers * experts` long, or empty when the stream
     /// ran no decode.
@@ -52,7 +53,7 @@ pub enum WarmError {
         want_layers: u32,
         want_experts: u32,
     },
-    /// A `long` that is not `layers * experts` long.
+    /// A `long` that is neither empty nor `layers * experts` long.
     LongLength { len: u32, want: u64 },
     /// A `recent` that is neither empty nor `layers * experts` long.
     RecentLength { len: u32, want: u64 },
@@ -94,7 +95,7 @@ impl fmt::Display for WarmError {
             WarmError::LongLength { len, want } => {
                 write!(
                     f,
-                    "warm section holds {len} long counts, not layers × experts = {want}"
+                    "warm section holds {len} long counts, neither none nor layers × experts = {want}"
                 )
             }
             WarmError::RecentLength { len, want } => write!(
@@ -148,8 +149,8 @@ impl WarmSection {
 
     /// The section `bytes` encode, of shape `layers × experts`. Refused by
     /// name: a bad magic, another version, a truncated or long body, another
-    /// shape, a `long` or `recent` length that does not fit the shape (`long`
-    /// must be full, `recent` full or empty), and a `recent` cell that is not
+    /// shape, a `long` or `recent` length that does not fit the shape (each
+    /// full or empty), and a `recent` cell that is not
     /// finite or is negative.
     pub fn decode(bytes: &[u8], layers: u32, experts: u32) -> Result<WarmSection, WarmError> {
         if bytes.len() < HEADER_BYTES {
@@ -180,7 +181,7 @@ impl WarmSection {
         }
         let (long_len, recent_len) = (word(14), word(18));
         let cells = u64::from(layers) * u64::from(experts);
-        if u64::from(long_len) != cells {
+        if long_len != 0 && u64::from(long_len) != cells {
             return Err(WarmError::LongLength {
                 len: long_len,
                 want: cells,
@@ -236,9 +237,85 @@ impl WarmSection {
     }
 }
 
+/// How [`open`] resolved a request's stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Opened {
+    /// The stream opened from the section's `recent`.
+    Section,
+    /// The stream opened with a zero heat: no section, or one that ran no
+    /// decode.
+    Fresh,
+    /// The section is of another shape than the rule's: refused by name, the
+    /// stream opened with a zero heat. Never a zero or partial prior.
+    Shape(WarmError),
+}
+
+/// A warm open the rule or the section refuses, the stream not opened.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpenError {
+    Rule(SwapRuleError),
+    /// A section that is not one, by anything but its shape.
+    Section(WarmError),
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenError::Rule(e) => write!(f, "{e}"),
+            OpenError::Section(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+/// Close `stream` of `rule` and append its warm section to `out`: `recent` is
+/// the stream's heat, `long` empty (not collected). Once per request: it
+/// allocates the heat's copy. Refused by name, nothing appended: what
+/// [`SwapRule::stream_close`] refuses.
+pub fn close(rule: &mut SwapRule, stream: usize, out: &mut Vec<u8>) -> Result<(), SwapRuleError> {
+    let mut recent = Vec::new();
+    rule.stream_close(stream, &mut recent)?;
+    let (layers, experts) = rule.heat_shape();
+    let (layers, experts) = (layers as u32, experts as u32);
+    WarmSection {
+        layers,
+        experts,
+        long: Vec::new(),
+        recent,
+    }
+    .encode(out);
+    Ok(())
+}
+
+/// Open `stream` of `rule` with `expected` tokens ahead, from `section`'s
+/// `recent` or, with none, fresh. A section of another shape opens fresh and
+/// says so ([`Opened::Shape`]); any other section the codec refuses, and the
+/// rule's own refusals, are an [`OpenError`] with the stream closed as it was.
+pub fn open(
+    rule: &mut SwapRule,
+    stream: usize,
+    section: Option<&[u8]>,
+    expected: f64,
+) -> Result<Opened, OpenError> {
+    let (layers, experts) = rule.heat_shape();
+    let (layers, experts) = (layers as u32, experts as u32);
+    let (prior, how) = match section.map(|b| WarmSection::decode(b, layers, experts)) {
+        None => (None, Opened::Fresh),
+        Some(Ok(s)) if s.recent.is_empty() => (None, Opened::Fresh),
+        Some(Ok(s)) => (Some(s.recent), Opened::Section),
+        Some(Err(e @ WarmError::Shape { .. })) => (None, Opened::Shape(e)),
+        Some(Err(e)) => return Err(OpenError::Section(e)),
+    };
+    rule.stream_open(stream, prior.as_deref(), expected)
+        .map_err(OpenError::Rule)?;
+    Ok(how)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HEADER_BYTES, WarmError, WarmSection};
+    use super::{HEADER_BYTES, OpenError, Opened, WarmError, WarmSection, close, open};
+    use crate::swaprule::{KeptRows, Shape, SwapParams, SwapRule};
 
     // The section's codec and its refusals. Header offsets: magic 0, version
     // 4, layers 6, experts 10, `long.len()` 14, `recent.len()` 18.
@@ -401,10 +478,10 @@ mod tests {
         }
     }
 
-    /// A `long` that is not full, short, empty or long, is refused.
+    /// A `long` that is neither empty nor full, short or long, is refused.
     #[test]
     fn a_long_that_is_not_full_is_refused() {
-        for len in [0u32, 11, 13] {
+        for len in [11u32, 13] {
             let mut bytes = encoded(&section());
             patch(&mut bytes, 14, &len.to_le_bytes());
             assert_eq!(
@@ -463,5 +540,91 @@ mod tests {
                 need
             })
         );
+    }
+    /// An empty `long` is "not collected": it round-trips as empty, never as
+    /// zero counts, and its bytes hold no `long` cells.
+    #[test]
+    fn an_empty_long_means_not_collected() {
+        let s = WarmSection {
+            long: Vec::new(),
+            ..section()
+        };
+        let bytes = encoded(&s);
+        assert_eq!(bytes.len(), HEADER_BYTES + 12 * 8);
+        let back = WarmSection::decode(&bytes, 3, 4).unwrap();
+        assert!(back.long.is_empty());
+        assert_eq!(bits(&back.recent), bits(&s.recent));
+    }
+
+    fn rule_3x4() -> SwapRule {
+        let params = SwapParams {
+            every: 1,
+            cap: 8,
+            margin: 0.0,
+            min_count: 0.0,
+            decay: 1.0,
+            spares: 1,
+            delay: 0,
+        };
+        let shape = Shape {
+            experts: 4,
+            top_k: 1,
+            max_rows: 1,
+        };
+        SwapRule::new(params, shape, &[&[0], &[0], &[0]], &[1, 1, 1]).unwrap()
+    }
+
+    /// Closing a stream writes its heat as `recent` with an empty `long`, and
+    /// opening it from those bytes gives the closed heat back bit for bit.
+    #[test]
+    fn close_then_open_gives_the_heat_back() {
+        let mut r = rule_3x4();
+        for ids in [[1, 2, 3], [1, 0, 3]] {
+            for (layer, id) in ids.into_iter().enumerate() {
+                r.observe(layer, 0, &[id]).unwrap();
+            }
+            r.end_pass(KeptRows::prefix(1)).unwrap();
+            r.plan(r.passes()).unwrap();
+        }
+        let mut bytes = Vec::new();
+        close(&mut r, 0, &mut bytes).unwrap();
+        let sec = WarmSection::decode(&bytes, 3, 4).unwrap();
+        assert!(sec.long.is_empty());
+        assert_eq!(sec.recent.len(), 12);
+        assert!(sec.recent.iter().any(|&c| c > 0.0));
+        assert_eq!(open(&mut r, 0, Some(&bytes), 5.0), Ok(Opened::Section));
+        let mut again = Vec::new();
+        close(&mut r, 0, &mut again).unwrap();
+        assert_eq!(again, bytes);
+    }
+
+    /// A section of another shape opens the stream fresh and says `Shape`; a
+    /// section that is no section at all is refused, the stream still closed.
+    #[test]
+    fn a_section_of_another_shape_opens_fresh_by_name() {
+        let mut r = rule_3x4();
+        let mut bytes = Vec::new();
+        close(&mut r, 0, &mut bytes).unwrap();
+        let other = WarmSection {
+            layers: 3,
+            experts: 5,
+            long: Vec::new(),
+            recent: vec![1.0; 15],
+        };
+        let mut wrong = Vec::new();
+        other.encode(&mut wrong);
+        let opened = open(&mut r, 0, Some(&wrong), 1.0).unwrap();
+        assert!(matches!(opened, Opened::Shape(WarmError::Shape { .. })));
+        assert_eq!(r.live_streams(), 1);
+        let mut fresh = Vec::new();
+        close(&mut r, 0, &mut fresh).unwrap();
+        let back = WarmSection::decode(&fresh, 3, 4).unwrap();
+        assert!(back.recent.iter().all(|&c| c == 0.0));
+        let bad = &bytes[..HEADER_BYTES - 1];
+        assert!(matches!(
+            open(&mut r, 0, Some(bad), 1.0),
+            Err(OpenError::Section(WarmError::Truncated { .. }))
+        ));
+        assert_eq!(r.live_streams(), 0);
     }
 }

@@ -16,7 +16,7 @@ use crate::Gpu;
 use crate::GpuError;
 use crate::fault::read_cards;
 use crate::host::HostExperts;
-use crate::host::PassKind;
+use crate::host::{PassKind, WarmOpened};
 use crate::host::swap::{BoundaryAt, ResetReport, Residency};
 use crate::host::swap_source::ResidencyGlue;
 use crate::hybrid::{Chain, HostResidency, Hybrid, Refusal};
@@ -144,6 +144,30 @@ impl<B: TierBody> HostServed for B {
         match self.residency_parts() {
             Some(ResidencyParts { glue, hybrid, .. }) => glue.select_stream(hybrid, slot),
             None => Ok(()),
+        }
+    }
+
+    /// Slot `slot`'s stream closed into its warm section
+    /// ([`ResidencyGlue::warm_close`]).
+    fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, GpuError> {
+        match self.residency_parts() {
+            Some(ResidencyParts { glue, hybrid, .. }) => glue.warm_close(hybrid, slot),
+            None => Ok(None),
+        }
+    }
+
+    /// Slot `slot`'s stream opened ([`ResidencyGlue::warm_open`]).
+    fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<Option<WarmOpened>, GpuError> {
+        match self.residency_parts() {
+            Some(ResidencyParts { glue, hybrid, .. }) => {
+                glue.warm_open(hybrid, slot, section, expected)
+            }
+            None => Ok(None),
         }
     }
 

@@ -789,6 +789,15 @@ impl Health {
     }
 }
 
+/// What a warm open did ([`HostTier::warm_open`]): how the stream opened,
+/// the streams live after it and the kept rows dropped as stale since the load.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WarmOpened {
+    pub opened: runtime::warmprof::Opened,
+    pub live: usize,
+    pub stale_rows: u64,
+}
+
 /// The host tier: the model's host computation and the two ports it is
 /// called through, with what they share.
 ///
@@ -838,6 +847,11 @@ pub struct HostTier<H> {
     /// into ([`HostTier::keep_rows`], [`HostTier::keep_rows_by`]): sized once
     /// at the machine's `max_rows`, refilled by every keep, never grown.
     swap_streams: Vec<u32>,
+    /// Per row of the open pass, the epoch its stream had when the row was
+    /// kept, filled by the calls that fill `swap_streams` and sized with it:
+    /// the fold drops a row whose stream has closed or reopened since
+    /// ([`swap::SwapMachine::end_pass_tagged`]).
+    swap_epochs: Vec<u32>,
     /// The serving slot every plain keep belongs to
     /// ([`HostTier::select_stream`]); 0 until one is selected.
     selected: u32,
@@ -910,6 +924,7 @@ impl<H: HostExperts> HostTier<H> {
             swap: None,
             swap_kept: None,
             swap_streams: Vec::new(),
+            swap_epochs: Vec::new(),
             selected: 0,
             swap_view: None,
             xstream: None,
@@ -942,6 +957,7 @@ impl<H: HostExperts> HostTier<H> {
         let machine =
             swap::SwapMachine::new(ctx, stream, &mut self.slots, view.buf(), source, cfg)?;
         self.swap_streams = vec![self.selected; rows];
+        self.swap_epochs = vec![0; rows];
         self.step.tally = machine.tally();
         self.step.window = Some(machine.window());
         self.swap = Some(machine);
@@ -986,9 +1002,27 @@ impl<H: HostExperts> HostTier<H> {
         if !self.can_keep(kept, kind, "HostTier::keep_rows")? {
             return Ok(());
         }
-        self.swap_streams.fill(self.selected);
+        self.tag_selected();
         self.swap_kept = Some((kept, kind));
         Ok(())
+    }
+
+    /// Every row of the map belongs to the selected slot, in the epoch its
+    /// stream has now.
+    fn tag_selected(&mut self) {
+        self.swap_streams.fill(self.selected);
+        let epoch = self.epoch_of(self.selected as usize);
+        self.swap_epochs.fill(epoch);
+    }
+
+    /// Slot `slot`'s stream's epoch now, what a row kept for it is tagged
+    /// with; 0 for a slot past the rule's streams, which the fold refuses by
+    /// name before it reads a tag.
+    fn epoch_of(&self, slot: usize) -> u32 {
+        self.swap
+            .as_ref()
+            .and_then(|m| m.stream_epoch(slot))
+            .unwrap_or(0)
     }
 
     /// [`HostTier::keep_rows`] for a pass of several slots: each row folds
@@ -1017,9 +1051,11 @@ impl<H: HostExperts> HostTier<H> {
                 ));
             }
         }
-        self.swap_streams.fill(self.selected);
+        self.tag_selected();
         for (slot, at) in ranges {
-            self.swap_streams[at].fill(slot as u32);
+            let epoch = self.epoch_of(slot);
+            self.swap_streams[at.clone()].fill(slot as u32);
+            self.swap_epochs[at].fill(epoch);
         }
         self.swap_kept = Some((kept, kind));
         Ok(())
@@ -1044,6 +1080,38 @@ impl<H: HostExperts> HostTier<H> {
             Some(m) => m.add_streams(n),
             None => Ok(()),
         }
+    }
+
+    /// Close serving slot `slot`'s residency stream at its request's end and
+    /// return its warm section, encoded ([`swap::SwapMachine::warm_close`]);
+    /// `None` without a machine. Once per request.
+    pub fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, GpuError> {
+        let Some(m) = self.swap.as_mut() else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        m.warm_close(slot, &mut out)?;
+        Ok(Some(out))
+    }
+
+    /// Open serving slot `slot`'s residency stream at its request's start,
+    /// from `section` or fresh ([`swap::SwapMachine::warm_open`]); `None`
+    /// without a machine. Once per request.
+    pub fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<Option<WarmOpened>, GpuError> {
+        let Some(m) = self.swap.as_mut() else {
+            return Ok(None);
+        };
+        let opened = m.warm_open(slot, section, expected)?;
+        Ok(Some(WarmOpened {
+            opened,
+            live: m.live_streams(),
+            stale_rows: m.stale_rows(),
+        }))
     }
 
     /// Whether a keep records: `false` without a machine. Refused by name
@@ -1133,7 +1201,12 @@ impl<H: HostExperts> HostTier<H> {
         m.refuse_if_ahead("HostTier::swap_boundary")?;
         let mut kind = PassKind::None;
         if let Some((rows, of)) = pass_kept(m.pass_open(), self.swap_kept.take())? {
-            m.end_pass_by(&mut self.step.tally, rows, &self.swap_streams)?;
+            m.end_pass_tagged(
+                &mut self.step.tally,
+                rows,
+                &self.swap_streams,
+                &self.swap_epochs,
+            )?;
             kind = of;
         }
         let report = match ahead {
@@ -2359,7 +2432,7 @@ impl<H: HostExperts> HostTier<H> {
             && self.swap_kept.is_none()
         {
             self.step.tally.clear();
-            self.swap_streams.fill(self.selected);
+            self.tag_selected();
             self.swap_kept = Some((KeptRows::prefix(0), PassKind::Abandoned));
         }
     }

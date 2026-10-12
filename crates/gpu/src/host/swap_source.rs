@@ -63,7 +63,7 @@ use super::nvtier::NvTier;
 use super::swap::{
     BoundaryAt, MachineCfg, PassReport, Piece, ResetReport, Residency, SwapSource, Transform,
 };
-use super::{HostTier, PassKind};
+use super::{HostTier, PassKind, WarmOpened};
 use crate::GpuError;
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
@@ -1057,6 +1057,28 @@ impl ResidencyGlue {
         n: usize,
     ) -> Result<(), GpuError> {
         tier.add_streams(n)
+    }
+
+    /// Slot `slot`'s stream closed into its warm section
+    /// ([`HostTier::warm_close`]); `None` without a machine.
+    pub fn warm_close<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        slot: usize,
+    ) -> Result<Option<Vec<u8>>, GpuError> {
+        tier.warm_close(slot)
+    }
+
+    /// Slot `slot`'s stream opened ([`HostTier::warm_open`]); `None` without
+    /// a machine.
+    pub fn warm_open<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<Option<WarmOpened>, GpuError> {
+        tier.warm_open(slot, section, expected)
     }
 
     /// The residency back to its seed at a quiet boundary

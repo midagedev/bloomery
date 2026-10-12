@@ -258,6 +258,27 @@ pub trait HostServed {
         Ok(())
     }
 
+    /// Close serving slot `slot`'s residency stream and return its warm
+    /// section, encoded ([`crate::host::HostTier::warm_close`]); `None` for a
+    /// body with no machine.
+    fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, GpuError> {
+        let _ = slot;
+        Ok(None)
+    }
+
+    /// Open serving slot `slot`'s residency stream from `section` or fresh
+    /// ([`crate::host::HostTier::warm_open`]); `None` for a body with no
+    /// machine.
+    fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<Option<crate::host::WarmOpened>, GpuError> {
+        let _ = (slot, section, expected);
+        Ok(None)
+    }
+
     /// The residency back to its seed at a quiet boundary, on `stream`
     /// ([`crate::host::swap::SwapMachine::reset`]); `None` for a body with no
     /// machine.
@@ -1216,6 +1237,31 @@ impl<B: ChainBody> GpuModel<B> {
                 host.keep_rows_by(kept, kind, ranges.iter().map(|r| (r.slot, r.rows.clone())))
             }
             None => Ok(()),
+        }
+    }
+
+    /// Close serving slot `slot`'s residency stream at its request's end and
+    /// return its warm section, encoded ([`HostServed::warm_close`]); `None`
+    /// for a body with no machine. Once per request.
+    pub fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, GpuError> {
+        match self.body.host() {
+            Some(host) => host.warm_close(slot),
+            None => Ok(None),
+        }
+    }
+
+    /// Open serving slot `slot`'s residency stream at its request's start,
+    /// from `section` or fresh ([`HostServed::warm_open`]); `None` for a body
+    /// with no machine. Once per request.
+    pub fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+    ) -> Result<Option<crate::host::WarmOpened>, GpuError> {
+        match self.body.host() {
+            Some(host) => host.warm_open(slot, section, expected),
+            None => Ok(None),
         }
     }
 

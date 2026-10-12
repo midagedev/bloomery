@@ -330,6 +330,11 @@ pub enum SwapRuleError {
         len: usize,
         rows: usize,
     },
+    /// A row→epoch map shorter than the pass's rows.
+    RowEpochLength {
+        len: usize,
+        rows: usize,
+    },
     /// Streams set on a rule that is not as built: another stream count,
     /// a pass ended, or a heat held.
     StreamsLate {
@@ -475,6 +480,10 @@ impl fmt::Display for SwapRuleError {
                 f,
                 "a row→stream map of {len} entries for a pass of {rows} rows"
             ),
+            SwapRuleError::RowEpochLength { len, rows } => write!(
+                f,
+                "a row→epoch map of {len} entries for a pass of {rows} rows"
+            ),
             SwapRuleError::StreamsLate { streams, passes } => write!(
                 f,
                 "streams set on a rule that is not as built ({streams} streams, {passes} passes \
@@ -502,6 +511,18 @@ enum Slot {
     Leaving,
 }
 
+/// Which stream each row of an ended pass folds into.
+#[derive(Clone, Copy)]
+enum RowMap<'a> {
+    /// Every row into stream 0.
+    Zero,
+    /// Row `row` into stream `stream[row]`, which must be live.
+    By(&'a [u32]),
+    /// Row `row` into stream `stream[row]` when it is live in epoch
+    /// `epoch[row]`, else dropped as stale.
+    Tagged { stream: &'a [u32], epoch: &'a [u32] },
+}
+
 /// One admissible pair of a planning pass.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Pair {
@@ -517,7 +538,19 @@ struct Pair {
 /// Every buffer the steady path touches is sized at [`SwapRule::new`]:
 /// observing, ending a pass and planning allocate nothing. Two rules are equal
 /// when everything their next calls read is: scratch and unobserved row cells
-/// do not count.
+/// do not count, nor do the epochs and the stale-row count, which name
+/// requests and tally drops and decide no plan.
+///
+/// A stream's rows fold at the end of the pass after the one that kept them,
+/// so a stream can close, and its serving slot reopen it for another request,
+/// while the last rows of the first request wait. Every stream therefore has
+/// an epoch, bumped at each [`SwapRule::stream_open`], and the caller tags
+/// each kept row with the epoch its stream had when the row was kept
+/// ([`SwapRule::stream_epoch`]). [`SwapRule::end_pass_tagged`] folds a kept
+/// row only into a stream that is live in that same epoch; any other kept
+/// row belongs to a request that is gone and is dropped, counted in
+/// [`SwapRule::stale_rows`], never folded into the request that reopened the
+/// stream and never refused.
 #[derive(Clone, Debug)]
 pub struct SwapRule {
     params: SwapParams,
@@ -544,6 +577,13 @@ pub struct SwapRule {
     /// Per stream: the tokens it is expected to run, its weight's numerator
     /// ([`SwapRule::stream_open`]); 1.0 while the stream is not live.
     expected: Vec<f64>,
+    /// Per stream: bumped at each open, wrapping. A kept row is tagged with
+    /// the epoch of its stream and lives one pass, so a wrap would need 2^32
+    /// reopenings inside that pass.
+    epoch: Vec<u32>,
+    /// Kept rows [`SwapRule::end_pass_tagged`] dropped because their request's
+    /// stream had closed or reopened, summed since the seed.
+    stale_rows: u64,
     /// `layer * experts + id`: the live streams' blend `Σ ω_s · heat_s`, in
     /// ascending stream order. Scratch: written at a planning pass right
     /// before `make_pairs` reads it, and read nowhere else.
@@ -815,6 +855,8 @@ impl SwapRule {
             heat: vec![0.0; layers * e],
             live: vec![true],
             expected: vec![1.0],
+            epoch: vec![0],
+            stale_rows: 0,
             counts: vec![0.0; layers * e],
             unrouted: vec![false; layers],
             in_flight: vec![0; layers],
@@ -879,6 +921,7 @@ impl SwapRule {
         self.heat.resize(cells, 0.0);
         self.live.resize(n, false);
         self.expected.resize(n, 1.0);
+        self.epoch.resize(n, 0);
         Ok(self)
     }
 
@@ -908,6 +951,7 @@ impl SwapRule {
         self.heat.resize(cells, 0.0);
         self.live.resize(n, true);
         self.expected.resize(n, 1.0);
+        self.epoch.resize(n, 0);
         Ok(())
     }
 
@@ -981,7 +1025,34 @@ impl SwapRule {
         }
         self.live[stream] = true;
         self.expected[stream] = expected;
+        self.epoch[stream] = self.epoch[stream].wrapping_add(1);
         Ok(())
+    }
+
+    /// Stream `stream`'s epoch, which a caller tags the rows it keeps for the
+    /// stream with ([`SwapRule::end_pass_tagged`]); `None` for a stream past
+    /// the rule's.
+    #[must_use]
+    pub fn stream_epoch(&self, stream: usize) -> Option<u32> {
+        self.epoch.get(stream).copied()
+    }
+
+    /// Kept rows [`SwapRule::end_pass_tagged`] dropped as stale, since the seed.
+    #[must_use]
+    pub fn stale_rows(&self) -> u64 {
+        self.stale_rows
+    }
+
+    /// The streams that are live now.
+    #[must_use]
+    pub fn live_streams(&self) -> usize {
+        self.live.iter().filter(|&&l| l).count()
+    }
+
+    /// The shape of one stream's heat: layers, then experts.
+    #[must_use]
+    pub fn heat_shape(&self) -> (usize, usize) {
+        (self.layers, self.shape.experts)
     }
 
     /// Close stream `stream`: its heat goes into `out`, a buffer the caller
@@ -1209,7 +1280,7 @@ impl SwapRule {
         if live > 1 {
             return Err(SwapRuleError::StreamsAmbiguous { live });
         }
-        self.fold_pass(kept, None)
+        self.fold_pass(kept, RowMap::Zero)
     }
 
     /// Whether `row_stream` names a live stream for each of a pass's first
@@ -1234,16 +1305,77 @@ impl SwapRule {
     /// rows, and a row, kept or dropped, whose stream is past the rule's or
     /// not live.
     pub fn end_pass_by(&mut self, kept: KeptRows, row_stream: &[u32]) -> Result<(), SwapRuleError> {
-        self.fold_pass(kept, Some(row_stream))
+        self.fold_pass(kept, RowMap::By(row_stream))
     }
 
-    /// The end of a pass, `row_stream` mapping each row to its stream, or every
-    /// row to stream 0 when `None`. Every refusal comes before the first fold.
-    fn fold_pass(
+    /// Whether `row_stream` and `row_epoch` name a stream of the rule for each
+    /// of a pass's first `rows` rows, the check [`SwapRule::end_pass_tagged`]
+    /// makes before it folds anything. A stream that is closed passes: its
+    /// rows are dropped, not refused. Refused by name: a map shorter than
+    /// `rows`, and a row whose stream is past the rule's.
+    pub fn check_row_tags(
+        &self,
+        row_stream: &[u32],
+        row_epoch: &[u32],
+        rows: usize,
+    ) -> Result<(), SwapRuleError> {
+        if row_stream.len() < rows {
+            return Err(SwapRuleError::RowStreamLength {
+                len: row_stream.len(),
+                rows,
+            });
+        }
+        if row_epoch.len() < rows {
+            return Err(SwapRuleError::RowEpochLength {
+                len: row_epoch.len(),
+                rows,
+            });
+        }
+        row_stream[..rows]
+            .iter()
+            .try_for_each(|&stream| self.check_stream(stream as usize))
+    }
+
+    /// [`SwapRule::end_pass_by`] for rows tagged with the epoch of their
+    /// stream when they were kept: row `row` folds into stream
+    /// `row_stream[row]` only while that stream is live in the epoch
+    /// `row_epoch[row]`. A kept row of a stream that has closed, or reopened
+    /// since, is dropped and counted ([`SwapRule::stale_rows`]); the drop
+    /// still counts toward the rows the plan cadence reads, so the plans fall
+    /// where they would had the stream stayed. Refused by name, the rule
+    /// unchanged: what [`SwapRule::check_row_tags`] refuses, and what
+    /// `end_pass_by` refuses except a stream that is not live.
+    pub fn end_pass_tagged(
         &mut self,
         kept: KeptRows,
-        row_stream: Option<&[u32]>,
+        row_stream: &[u32],
+        row_epoch: &[u32],
     ) -> Result<(), SwapRuleError> {
+        self.fold_pass(
+            kept,
+            RowMap::Tagged {
+                stream: row_stream,
+                epoch: row_epoch,
+            },
+        )
+    }
+
+    /// The stream row `row` folds into under `map`, `None` for a row dropped
+    /// as stale. Every stream `map` names has been checked.
+    fn fold_target(&self, map: RowMap<'_>, row: usize) -> Option<usize> {
+        match map {
+            RowMap::Zero => Some(0),
+            RowMap::By(stream) => Some(stream[row] as usize),
+            RowMap::Tagged { stream, epoch } => {
+                let s = stream[row] as usize;
+                (self.live[s] && self.epoch[s] == epoch[row]).then_some(s)
+            }
+        }
+    }
+
+    /// The end of a pass, `map` saying which stream each row folds into. Every
+    /// refusal comes before the first fold.
+    fn fold_pass(&mut self, kept: KeptRows, map: RowMap<'_>) -> Result<(), SwapRuleError> {
         if self.planned != self.passes {
             return Err(SwapRuleError::PlanSkipped {
                 boundary: self.passes,
@@ -1255,11 +1387,13 @@ impl SwapRule {
                 rows: self.pass_rows,
             });
         }
-        let stream_of = |row: usize| row_stream.map_or(0, |map| map[row] as usize);
-        match row_stream {
-            Some(map) => self.check_row_streams(map, self.pass_rows)?,
-            None if self.pass_rows > 0 => self.check_live(0)?,
-            None => {}
+        match map {
+            RowMap::By(stream) => self.check_row_streams(stream, self.pass_rows)?,
+            RowMap::Tagged { stream, epoch } => {
+                self.check_row_tags(stream, epoch, self.pass_rows)?;
+            }
+            RowMap::Zero if self.pass_rows > 0 => self.check_live(0)?,
+            RowMap::Zero => {}
         }
         let (l_n, top_k, e, cells) = (
             self.layers,
@@ -1281,7 +1415,11 @@ impl SwapRule {
             if !kept.keeps(row) {
                 continue;
             }
-            let heat = stream_of(row) * cells;
+            let Some(target) = self.fold_target(map, row) else {
+                self.stale_rows += 1;
+                continue;
+            };
+            let heat = target * cells;
             for layer in 0..l_n {
                 if self.unrouted[layer] {
                     continue;
@@ -3692,5 +3830,143 @@ mod tests {
         let mut b = a.clone();
         b.counts[0] = 99.0;
         assert_eq!(a, b, "the blend is scratch");
+    }
+
+    // Epochs: a stream closed and reopened while its last rows wait for the
+    // end of their pass.
+
+    /// Observe a pass of one row per entry of `row_stream` (routed as
+    /// `pass_by` does), and return each row's epoch tag, read now, as the
+    /// tier reads it when it keeps the rows.
+    fn observe_tagged(r: &mut SwapRule, boundary: u64, row_stream: &[u32]) -> Vec<u32> {
+        for (row, &s) in row_stream.iter().enumerate() {
+            for layer in 0..2 {
+                r.observe(layer, row, &[1 + (boundary as u32 + s) % 7])
+                    .unwrap();
+            }
+        }
+        row_stream
+            .iter()
+            .map(|&s| r.stream_epoch(s as usize).unwrap())
+            .collect()
+    }
+
+    /// The expert id `observe_tagged` routes stream `s` to at `boundary`.
+    fn routed(boundary: u64, s: u32) -> usize {
+        1 + (boundary as usize + s as usize) % 7
+    }
+
+    /// One stream: request A's last pass is observed, the stream closes and
+    /// reopens for request B, then the pass ends. A's rows are dropped and
+    /// counted; B's heat holds none of them, and B's own pass folds.
+    #[test]
+    fn a_reopened_stream_takes_none_of_the_old_requests_pending_rows() {
+        let mut r = streams_rule(2, 1.0);
+        r.stream_close(0, &mut Vec::new()).unwrap();
+        r.stream_open(0, None, 1.0).unwrap();
+        let a = observe_tagged(&mut r, 1, &[0]);
+        r.end_pass_tagged(KeptRows::prefix(1), &[0], &a).unwrap();
+        r.plan(1).unwrap();
+        assert_eq!(r.heat_of(0)[routed(1, 0)], 1.0);
+        let tail = observe_tagged(&mut r, 2, &[0]);
+        let mut section = Vec::new();
+        r.stream_close(0, &mut section).unwrap();
+        r.stream_open(0, None, 1.0).unwrap();
+        assert_eq!(r.stale_rows(), 0);
+        r.end_pass_tagged(KeptRows::prefix(1), &[0], &tail).unwrap();
+        r.plan(2).unwrap();
+        assert_eq!(r.stale_rows(), 1, "A's pending row is counted");
+        assert!(
+            r.heat_of(0).iter().all(|&h| h == 0.0),
+            "the reopened stream holds none of A's rows"
+        );
+        assert_eq!(section[routed(1, 0)], 1.0, "the close saw A's folded rows");
+        let b = observe_tagged(&mut r, 3, &[0]);
+        r.end_pass_tagged(KeptRows::prefix(1), &[0], &b).unwrap();
+        r.plan(3).unwrap();
+        assert_eq!(r.stale_rows(), 1);
+        assert_eq!(r.heat_of(0)[routed(3, 0)], 1.0);
+        assert_eq!(r.heat_of(0).iter().filter(|&&h| h > 0.0).count(), 2);
+    }
+
+    /// A stream closed and not reopened: its pending rows are dropped and
+    /// counted, where `end_pass_by` refuses the same map by name.
+    #[test]
+    fn a_closed_streams_pending_rows_are_dropped_not_refused() {
+        let mut r = streams_rule(2, 1.0);
+        r.stream_open(1, None, 1.0).unwrap();
+        let tags = observe_tagged(&mut r, 1, &[0, 1]);
+        r.stream_close(1, &mut Vec::new()).unwrap();
+        let mut by = r.clone();
+        assert_eq!(
+            by.end_pass_by(KeptRows::prefix(2), &[0, 1]),
+            Err(SwapRuleError::StreamNotLive { stream: 1 })
+        );
+        r.end_pass_tagged(KeptRows::prefix(2), &[0, 1], &tags)
+            .unwrap();
+        assert_eq!(r.stale_rows(), 1);
+        assert_eq!(r.heat_of(0)[routed(1, 0)], 1.0);
+        assert!(r.heat_of(1).iter().all(|&h| h == 0.0));
+        r.plan(1).unwrap();
+        observe_tagged(&mut r, 2, &[0]);
+        assert_eq!(
+            r.end_pass_tagged(KeptRows::prefix(1), &[5], &[0]),
+            Err(SwapRuleError::StreamOutOfRange {
+                stream: 5,
+                streams: 2
+            })
+        );
+        assert_eq!(
+            r.end_pass_tagged(KeptRows::prefix(1), &[0], &[]),
+            Err(SwapRuleError::RowEpochLength { len: 0, rows: 1 })
+        );
+    }
+
+    /// Two slots in one pass: slot 0's request ends and reopens before the
+    /// pass ends while slot 1 keeps decoding. Slot 1's heat is the heat of a
+    /// run where slot 0 never closed, bit for bit, plan after plan, and the
+    /// new slot 0 holds none of the old rows.
+    #[test]
+    fn a_reopened_slot_leaves_the_other_slots_heat_as_if_it_never_closed() {
+        let mk = || {
+            let mut r = rule(params(2, 96, 0.0, 0.5, 0.5), 8, 1, &[&[0], &[0]])
+                .with_streams(2)
+                .unwrap();
+            r.stream_open(1, Some(&prior(1)), 1.0).unwrap();
+            r
+        };
+        let (mut never, mut closed) = (mk(), mk());
+        for boundary in 1..=4_u64 {
+            let rows = [0_u32, 1];
+            let tags_never = observe_tagged(&mut never, boundary, &rows);
+            let tags_closed = observe_tagged(&mut closed, boundary, &rows);
+            if boundary == 3 {
+                closed.stream_close(0, &mut Vec::new()).unwrap();
+                closed.stream_open(0, None, 1.0).unwrap();
+            }
+            never
+                .end_pass_tagged(KeptRows::prefix(2), &rows, &tags_never)
+                .unwrap();
+            closed
+                .end_pass_tagged(KeptRows::prefix(2), &rows, &tags_closed)
+                .unwrap();
+            never.plan(boundary).unwrap();
+            closed.plan(boundary).unwrap();
+            assert_eq!(
+                bits(closed.heat_of(1)),
+                bits(never.heat_of(1)),
+                "slot 1's heat at boundary {boundary}"
+            );
+        }
+        assert_eq!(never.stale_rows(), 0);
+        assert_eq!(closed.stale_rows(), 1, "slot 0's pass-3 row");
+        let fresh = closed.heat_of(0);
+        for layer in 0..2 {
+            for id in 0..8 {
+                let want = if id == routed(4, 0) { 0.5 } else { 0.0 };
+                assert_eq!(fresh[layer * 8 + id], want, "layer {layer} id {id}");
+            }
+        }
+        assert!(never.heat_of(0)[routed(3, 0)] > 0.0, "the control folds it");
     }
 }
