@@ -61,9 +61,12 @@ use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, CardAccTier, FfnBatchKernels, Handoff, Places};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
+use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
-use model::arch::glm5next::place::{card_routed, card_tile_bytes};
+use model::arch::glm5next::place::{
+    TIER_CHUNK, card_leg_bytes, card_routed, card_tile_bytes, card_tiles_run,
+};
 use model::arch::names::routed_stacks;
 use models::{Ffn, LayerSpec};
 
@@ -126,6 +129,9 @@ pub(crate) struct CardExperts {
     batch: FfnBatchKernels,
     /// Per layer of the description, `None` without card experts.
     layers: Vec<Option<CardLayer>>,
+    /// A card layer's stacks are not [`card_tiles_run`]'s: a prompt batch
+    /// runs it on the card leg, whose buffers [`CardTiles`] then holds.
+    prompt_leg: bool,
     /// Routed expert width: a gate·up slot's rows.
     ff: usize,
     /// Each row's buffers, row 0 the step's: a row of the load's rows in
@@ -175,6 +181,7 @@ impl CardExperts {
         rows: usize,
     ) -> Result<CardExperts, GpuError> {
         let mut per = Vec::with_capacity(layers.len());
+        let mut prompt_leg = false;
         for (l, spec) in layers.iter().enumerate() {
             // A dense block is outside the host run and has no row: no card
             // experts, which the resident-rows check below holds it to. A
@@ -202,9 +209,10 @@ impl CardExperts {
                 });
             };
             let models::Act::SwiGlu { limit } = m.act;
-            // The family's type rule ([`card_routed`]): the card leg also runs MXFP4, which the
-            // grouped prompt path has no arm for.
-            CardStacks::of(w, l)?;
+            // The family's type rule ([`card_routed`]); a prompt batch runs a layer the tiles
+            // do not on the card leg.
+            let st = CardStacks::of(w, l)?;
+            prompt_leg |= !card_tiles_run(st.gate.ty, st.down.ty);
             let layer = CardLayer {
                 n_card,
                 limit: limit.unwrap_or(0.0),
@@ -219,6 +227,7 @@ impl CardExperts {
             tiles: KquantTileKernels::load(gpu.context(), gpu.fault_word())?,
             batch: FfnBatchKernels::load(gpu.context())?,
             layers: per,
+            prompt_leg,
             ff,
             rows: (0..rows)
                 .map(|_| CardRow::new(stream, n_embd, ff))
@@ -248,6 +257,11 @@ impl CardExperts {
     /// The stage card's side of the tier layers, on a load with a tier card.
     pub(crate) fn tier(&self) -> Option<&TierSide> {
         self.tier.as_ref()
+    }
+
+    /// A card layer runs a prompt batch on the card leg ([`card_tiles_run`]).
+    pub(crate) fn prompt_leg(&self) -> bool {
+        self.prompt_leg
     }
 
     /// The stage card's experts of layer `l`: 0 off the card.
@@ -332,7 +346,7 @@ impl<'w> CardStacks<'w> {
             _ => Err(GpuError::Tensor {
                 what: CARD,
                 name,
-                need: "a resident routed stack of a type the card experts read (Q4_K, Q5_K)",
+                need: "a resident routed stack of a type the card experts read (`card_routed`)",
             }),
         });
         let (gate, up, down) = (gate?, up?, down?);
@@ -587,23 +601,28 @@ pub(crate) struct CardRows<'a> {
 /// tiles — the gate·up rows by entry and their q8_1 form), the entries'
 /// gathered Walk A planes, and the downs by slot, slot-major from the
 /// batch's first slot (the tier layers' back reads them beside the tier's
-/// rows). Its bytes are [`card_tile_bytes`]'s, which the plan reserves.
+/// rows); on a load with a card layer the tiles do not run
+/// ([`card_tiles_run`]), the card leg's buffers for [`TIER_CHUNK`] tokens.
+/// Its bytes are [`card_tile_bytes`]'s plus, with the leg, [`card_leg_bytes`]'s,
+/// which the plan reserves.
 pub(crate) struct CardTiles {
     act_x: Q8Act,
     tile: TileScratch,
     ord: EntryPlanes,
     down: DeviceBuffer<f32>,
+    leg: Option<LegBufs>,
 }
 
 impl CardTiles {
-    /// The scratch for batches of up to `cap` tokens, refused by name when
-    /// its made bytes are not [`card_tile_bytes`]'s. Load-time or
-    /// first-prompt only.
+    /// The scratch for batches of up to `cap` tokens, with the card leg's
+    /// buffers when `leg`, refused by name when its made bytes are not the
+    /// plan's formula's. Load-time or first-prompt only.
     pub(crate) fn new(
         gpu: &Gpu,
         n_embd: usize,
         ff: usize,
         cap: usize,
+        leg: bool,
     ) -> Result<CardTiles, GpuError> {
         let stream = gpu.stream();
         let slots = cap * N_USED;
@@ -612,8 +631,25 @@ impl CardTiles {
             tile: TileScratch::new(stream, slots, ff)?,
             ord: EntryPlanes::new(stream, slots, n_embd)?,
             down: DeviceBuffer::zeroed(stream, slots * n_embd)?,
+            leg: match leg {
+                true => Some(LegBufs::new(
+                    stream,
+                    LegShape {
+                        cap: TIER_CHUNK as usize,
+                        slots_per_col: N_USED,
+                        n: n_embd,
+                        ff,
+                    },
+                )?),
+                false => None,
+            },
         };
-        let want = card_tile_bytes(n_embd, ff, N_USED, cap);
+        let want = card_tile_bytes(n_embd, ff, N_USED, cap)
+            + if leg {
+                card_leg_bytes(n_embd, ff, N_USED)
+            } else {
+                0
+            };
         if t.bytes() != want {
             return Err(GpuError::Shape {
                 what: CARD,
@@ -633,6 +669,7 @@ impl CardTiles {
             + self.tile.device_bytes()
             + self.ord.device_bytes()
             + self.down.num_bytes()
+            + self.leg.as_ref().map_or(0, LegBufs::bytes)
     }
 
     /// The downs of the last batch, by slot.
@@ -688,7 +725,49 @@ pub(crate) fn card_rows(
     )?;
     let sel: &DeviceBuffer<u32> = &*io.sel;
     let tl = &mut *io.tiles;
-    gpu.enqueue_quantize_q8_1_cols(io.normed, &mut tl.act_x, t, l)?;
+    if card_tiles_run(st.gate.ty, st.down.ty) {
+        card_tiles(gpu, k, cl, &st, l, n, io.normed, sel, t, tl)?;
+    } else {
+        card_leg_rows(gpu, w, k, cl, l, n, io.normed, sel, t, tl)?;
+    }
+    if io.tiered {
+        return Ok(());
+    }
+    let acc = CardAcc {
+        down: &tl.down,
+        w: io.weights,
+        sel,
+        n,
+        m: t,
+        n_card: cl.n_card,
+        n_used: N_USED,
+        w_pitch: N_USED,
+        fault,
+    };
+    k.batch.enqueue_card_acc(stream, &acc, &mut *io.acc)
+}
+
+/// [`card_rows`]'s card slots on the grouped tile kernels (a layer
+/// [`card_tiles_run`] names): the rows' q8_1 form, the table and its tiles,
+/// the entries' planes, the gate·up by tiles, its rows' q8_1 by entry and the
+/// down by tiles into `tl`'s downs by slot.
+#[allow(clippy::too_many_arguments)]
+fn card_tiles(
+    gpu: &Gpu,
+    k: &CardExperts,
+    cl: &CardLayer,
+    st: &CardStacks<'_>,
+    l: usize,
+    n: usize,
+    normed: &DeviceBuffer<f32>,
+    sel: &DeviceBuffer<u32>,
+    t: usize,
+    tl: &mut CardTiles,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let fault = gpu.layer_sink(l)?;
+    let slots = t * N_USED;
+    gpu.enqueue_quantize_q8_1_cols(normed, &mut tl.act_x, t, l)?;
     tl.tile.enqueue_table(gpu, sel, slots, cl.n_card, fault)?;
     let g = TileGather {
         x: &tl.act_x,
@@ -725,21 +804,53 @@ pub(crate) fn card_rows(
             .enqueue_gemv_q4k_tiles(stream, &d, fault, &mut tl.down)?,
         _ => return Err(unrun(&st.down)),
     }
-    if io.tiered {
-        return Ok(());
+    Ok(())
+}
+
+/// [`card_rows`]'s card slots on the card leg (a layer [`card_tiles_run`]
+/// does not name): the batch's `t` columns in runs of the leg buffers' `cap`
+/// tokens ([`CardLeg::enqueue_rows`]), each run's downs written to `tl`'s
+/// downs by slot at its first slot, where the card sums and the tier's back
+/// read them. Refused by name on a load that made no leg buffers.
+#[allow(clippy::too_many_arguments)]
+fn card_leg_rows(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &CardExperts,
+    cl: &CardLayer,
+    l: usize,
+    n: usize,
+    normed: &DeviceBuffer<f32>,
+    sel: &DeviceBuffer<u32>,
+    t: usize,
+    tl: &mut CardTiles,
+) -> Result<(), GpuError> {
+    const W: &str = "glm5next card_leg_rows";
+    let CardTiles { leg, down, .. } = tl;
+    let bufs = leg.as_mut().ok_or(GpuError::State {
+        what: W,
+        missing: "the card leg's prompt buffers (a card layer the tiles do not run)",
+    })?;
+    let stacks = LegStacks::of(w, cl.names())?;
+    let chunk = bufs.shape().cap;
+    for c0 in (0..t).step_by(chunk) {
+        let cn = chunk.min(t - c0);
+        let slots = cn * N_USED;
+        let x = span(W, normed, c0 * n, cn * n)?;
+        let s = span(W, sel, c0 * N_USED, slots)?;
+        let mut d = span_mut(W, &mut *down, c0 * N_USED * n, slots * n)?;
+        let run = LegRun {
+            layer: l,
+            stacks: &stacks,
+            normed: &x,
+            m: cn,
+            sel: &s,
+            n_card: cl.n_card,
+            rule: Act::SwigluClamp { limit: cl.limit },
+        };
+        k.leg.enqueue_rows(gpu, bufs, &run, &mut d)?;
     }
-    let acc = CardAcc {
-        down: &tl.down,
-        w: io.weights,
-        sel,
-        n,
-        m: t,
-        n_card: cl.n_card,
-        n_used: N_USED,
-        w_pitch: N_USED,
-        fault,
-    };
-    k.batch.enqueue_card_acc(stream, &acc, &mut *io.acc)
+    Ok(())
 }
 
 /// A stack whose type [`card_routed`] names but no launch here runs.
@@ -747,7 +858,7 @@ pub(crate) fn unrun(st: &Stack<'_>) -> GpuError {
     GpuError::Tensor {
         what: CARD,
         name: st.name.clone(),
-        need: "a type the card experts have an entry for in its place (gate·up Q4_K, Q5_K; down Q5_K, Q4_K)",
+        need: "a type the grouped tiles have an entry for (gate·up Q4_K, Q5_K; down Q5_K, Q4_K)",
     }
 }
 
