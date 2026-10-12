@@ -478,7 +478,8 @@ impl PlanInputs {
         if let Some(t) = plan.cards.first_mut() {
             t.grow_kv(beside);
         }
-        placement::expert_nvme_tier(&mut plan, workstation::plan_room(&self.room), self.arena)?;
+        let room = plan.host.plan_at(&self.room);
+        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         // The front stays beside the plan's terms (`refuse_front` holds it to
         // the card), so a unified pool counts it beside them.
         let plan = checked_beside(plan, front).map_err(PlaceError::Broken)?;
@@ -817,7 +818,7 @@ impl PlanInputs {
         // The draft layer's routed experts are the host's beside the trunk's,
         // a plan of their own: the trunk splits at the room they leave.
         let draft_host = draft.host.expert_bytes;
-        let planned_at = workstation::plan_room(&self.room);
+        let planned_at = plan.host.plan_at(&self.room);
         let room = planned_at.checked_sub(draft_host).ok_or_else(|| {
             PlacementError::HostRoom(format!(
                 "the NextN layer's routed experts, {draft_host} B, pass the host room {planned_at} B"

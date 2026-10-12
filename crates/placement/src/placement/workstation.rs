@@ -1024,11 +1024,11 @@ pub fn host_room(meminfo: &str, levels: &[CgroupLevel<'_>]) -> Result<(u64, Host
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, ArenaGrant, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceInfo, Host, HostNeed,
-        HostRead, Machine, PLAN_ROOM, PlacementError, RTX_3090, TIER_BATCH_HOST_RESERVE,
+        A6000, ArenaGrant, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceInfo, HOST_DRIFT, Host,
+        HostNeed, HostRead, Machine, PLAN_ROOM, PlacementError, RTX_3090, TIER_BATCH_HOST_RESERVE,
         TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room,
         cgroup_v2_path, host, host_room, mem_available, plan_a, plan_bp, plan_gate, plan_on,
-        plan_tiers, spec_of_device, tier, tier_batch_bytes, unified_of,
+        plan_room, plan_tiers, spec_of_device, tier, tier_batch_bytes, unified_of,
     };
 
     /// One plan room: `tools/ref/plan-room.sh --room`, the room
@@ -1582,5 +1582,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The numbers of the unpaged Qwen3.8 load that a 64 GB host refused:
+    /// the need's terms, with no arena to shrink.
+    fn unpaged_need() -> HostNeed {
+        HostNeed {
+            experts: 59_267_686_400,
+            tables: 0,
+            shadows: 0,
+            reserves: 8_533_127_168,
+            extra: 0,
+            arena: 0,
+            cards: 0,
+            os: 6_694_629_376,
+            card_budget: false,
+        }
+    }
+
+    const UNPAGED_AVAILABLE: u64 = 60_943_515_648;
+    const UNPAGED_SHORT: u64 = 162_668_544;
+
+    /// A load with no arena is held to its need exactly: the reading under
+    /// the need is refused, and `grant` has nothing to shrink.
+    #[test]
+    fn an_unpaged_load_short_of_its_need_is_refused() {
+        let need = unpaged_need();
+        assert_eq!(need.bytes(), 61_106_184_192);
+        assert_eq!(need.bytes() - UNPAGED_AVAILABLE, UNPAGED_SHORT);
+        let short = need
+            .check(UNPAGED_AVAILABLE)
+            .expect_err("the reading is short");
+        assert_eq!(short.floor, None);
+        assert_eq!(need.grant(UNPAGED_AVAILABLE, 0), Err(short));
+        assert_eq!(need.check(need.bytes()), Ok(()));
+    }
+
+    /// A plan made at a read room holds its need a margin under the
+    /// reading, so a load whose reading fell by the margin or less still
+    /// covers it: the plan of the unpaged need above is made only at a
+    /// reading of its need plus the margin, and the reading the load took
+    /// there is the need or more.
+    #[test]
+    fn a_plan_room_covers_a_load_that_drifted_by_the_margin() {
+        let need = unpaged_need().bytes();
+        let at = |read: u64| plan_room(&(read, HostRead::MemAvailable));
+        assert!(
+            at(need) < need,
+            "a reading of the need plans a room under it"
+        );
+        let planned_at = need + HOST_DRIFT;
+        assert!(
+            need <= at(planned_at),
+            "the least reading that holds the need"
+        );
+        assert!(at(planned_at - 1) < need, "one byte under pages");
+        assert_eq!(
+            unpaged_need().check(planned_at - UNPAGED_SHORT),
+            Ok(()),
+            "the reporter's drift is under the margin"
+        );
+        assert!(unpaged_need().check(planned_at - HOST_DRIFT - 1).is_err());
     }
 }

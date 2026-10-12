@@ -161,6 +161,7 @@ mod tests {
                 row_reserve_bytes: 0,
                 pool_card_bytes: 0,
                 headroom_bytes: headroom,
+                room: None,
             },
             nvme_bytes: 0,
             n_l: Vec::new(),
