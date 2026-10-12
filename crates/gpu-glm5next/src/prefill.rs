@@ -113,6 +113,7 @@ use bloomery_gpu::media::{MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::prompt_timing::{Mark, PromptStats, PromptTiming, nanos};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::qsa::list_width;
+use bloomery_gpu::site::Form;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{self, AttnArgs, SelectedRows};
@@ -185,6 +186,9 @@ pub(crate) struct PromptState {
     routes: Option<RouteTaps>,
     /// The batch walks' planted routes ([`plant_prompt_routes`]).
     plant_routes: Option<RoutePlant>,
+    /// The batch walks' feed-forward input taps ([`set_prompt_ffn_taps`]);
+    /// unarmed, a walk copies nothing.
+    ffn_in: Option<FfnTaps>,
     /// The id a media span's every position carries ([`set_prefill_media`]); `None` on a load
     /// that takes no media.
     media: Option<u32>,
@@ -202,15 +206,17 @@ impl PromptState {
             timing: None,
             routes: None,
             plant_routes: None,
+            ffn_in: None,
             media: None,
         }
     }
 
     /// Device bytes of the batch's buffers, 0 before they are made, and of
-    /// the route taps while armed.
+    /// the route and feed-forward taps while armed.
     pub(crate) fn bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, |b| b.bytes())
             + self.routes.as_ref().map_or(0, RouteTaps::bytes)
+            + self.ffn_in.as_ref().map_or(0, FfnTaps::bytes)
             + self.plant_routes.as_ref().map_or(0, |p| {
                 p.layers
                     .iter()
@@ -281,6 +287,118 @@ pub struct RouteTapRows {
     pub probs: Vec<f32>,
     pub ids: Vec<u32>,
     pub weights: Vec<f32>,
+}
+
+/// The batch walks' feed-forward input taps, for the gates: the normed input
+/// of each layer whose dense block or shared expert reads its gate·up input
+/// as q8_1 blocks of 128 values ([`Form::Q8x128`]), at every position below
+/// `rows` a batch ran, copied by the walk right after the norm; `None` for
+/// any other layer.
+struct FfnTaps {
+    rows: usize,
+    layers: Vec<Option<DeviceBuffer<f32>>>,
+    /// As [`RouteTaps::fed`].
+    fed: Range<usize>,
+}
+
+impl FfnTaps {
+    fn bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(DeviceBuffer::num_bytes)
+            .sum()
+    }
+}
+
+/// Arm the batch walks' feed-forward input taps for positions below `rows`,
+/// or disarm them with 0: the normed input of each layer whose dense block or
+/// shared expert reads q8_1 blocks of 128 values, at every position a batch
+/// runs, which [`prompt_ffn_taps`] reads back. A batch call past `rows` is
+/// refused by name before it runs. Load-time allocation, for the gates;
+/// refused inside a call.
+pub fn set_prompt_ffn_taps(m: &mut Glm5nextModel, rows: usize) -> Result<(), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    if body.prompt.in_call {
+        return Err(shape(format!(
+            "feed-forward taps of {rows} rows set inside a prompt call"
+        )));
+    }
+    body.prompt.ffn_in = None;
+    if rows == 0 {
+        return Ok(());
+    }
+    let stream = gpu.stream();
+    let n = body.dims.embd;
+    let layers = body
+        .cfg
+        .iter()
+        .map(|c| {
+            if c.block.types()[0].reads() != Form::Q8x128 {
+                return Ok(None);
+            }
+            Ok(Some(DeviceBuffer::zeroed(stream, rows * n)?))
+        })
+        .collect::<Result<Vec<_>, GpuError>>()?;
+    body.prompt.ffn_in = Some(FfnTaps {
+        rows,
+        layers,
+        fed: 0..0,
+    });
+    Ok(())
+}
+
+/// Each layer's feed-forward input taps for positions `0 .. n`
+/// ([`set_prompt_ffn_taps`]), position-major, `None` for a layer not
+/// tapped. Blocking. Refused by name while unarmed and for positions the
+/// batch calls since the arming did not write in one run from position 0.
+pub fn prompt_ffn_taps(m: &mut Glm5nextModel, n: usize) -> Result<Vec<Option<Vec<f32>>>, GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let embd = body.dims.embd;
+    let taps = body.prompt.ffn_in.as_ref().ok_or(GpuError::State {
+        what: WHAT,
+        missing: "armed feed-forward taps (set_prompt_ffn_taps)",
+    })?;
+    if taps.fed.start != 0 || n > taps.fed.end {
+        return Err(shape(format!(
+            "feed-forward taps of positions 0..{n}: the batch calls since the arming wrote {:?}",
+            taps.fed
+        )));
+    }
+    let stream = gpu.stream();
+    taps.layers
+        .iter()
+        .map(|t| {
+            let Some(t) = t else {
+                return Ok(None);
+            };
+            Ok(Some(span(WHAT, t, 0, n * embd)?.to_host_vec(stream)?))
+        })
+        .collect()
+}
+
+/// Copy the `t` rows of `n` values `src` holds into layer `l`'s
+/// feed-forward tap from position `p0`; a layer not tapped copies nothing.
+fn tap_ffn_in(
+    gpu: &Gpu,
+    taps: &mut FfnTaps,
+    l: usize,
+    p0: usize,
+    (t, n): (usize, usize),
+    src: &DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    match taps.layers.get_mut(l) {
+        Some(Some(tap)) => {
+            span_mut(WHAT, tap, p0 * n, t * n)?
+                .copy_from_device_async(&*span(WHAT, src, 0, t * n)?, gpu.stream())?;
+            Ok(())
+        }
+        Some(None) => Ok(()),
+        None => Err(GpuError::State {
+            what: WHAT,
+            missing: "a layer's feed-forward tap",
+        }),
+    }
 }
 
 /// Arm the batch walks' route taps for positions below `rows`, or disarm
@@ -1149,6 +1267,14 @@ fn prefill_units(
                 taps.rows
             )));
         }
+        if let Some(taps) = body.prompt.ffn_in.as_ref()
+            && to as usize > taps.rows
+        {
+            return Err(shape(format!(
+                "a prompt batch from {from} to {to} with feed-forward taps of {} rows",
+                taps.rows
+            )));
+        }
         if let Some(plant) = body.prompt.plant_routes.as_ref()
             && to as usize > plant.rows
         {
@@ -1165,13 +1291,17 @@ fn prefill_units(
     let r = call_groups(m, ids, from, to, sink, media);
     if let Ok(body) = m.body_parts(WHAT).map(|(_, _, b)| b) {
         body.prompt.in_call = false;
+        let (from, to) = (from as usize, to as usize);
+        let fed = |was: &Range<usize>| match &r {
+            Err(_) => 0..0,
+            Ok(_) if was.start <= from && from <= was.end => was.start..to,
+            Ok(_) => from..to,
+        };
         if let Some(taps) = body.prompt.routes.as_mut() {
-            let (from, to) = (from as usize, to as usize);
-            taps.fed = match &r {
-                Err(_) => 0..0,
-                Ok(_) if taps.fed.start <= from && from <= taps.fed.end => taps.fed.start..to,
-                Ok(_) => from..to,
-            };
+            taps.fed = fed(&taps.fed);
+        }
+        if let Some(taps) = body.prompt.ffn_in.as_mut() {
+            taps.fed = fed(&taps.fed);
         }
     }
     r
@@ -1686,6 +1816,7 @@ impl Body {
             sink,
             routes,
             plant_routes,
+            ffn_in,
             ..
         } = prompt;
         let Batch { bufs, units, hsum } = batch.as_deref_mut().ok_or(GpuError::State {
@@ -1762,6 +1893,7 @@ impl Body {
             plant,
             routes: routes.as_mut(),
             planted: plant_routes.as_ref(),
+            ffn_in: ffn_in.as_mut(),
         };
         let o = Overlap {
             units: g,
@@ -1885,6 +2017,9 @@ struct PromptProgram<'a> {
     routes: Option<&'a mut RouteTaps>,
     /// The planted routes, written over each router's picks and weights.
     planted: Option<&'a RoutePlant>,
+    /// The armed feed-forward input taps, which each tapped layer's normed
+    /// input is copied into.
+    ffn_in: Option<&'a mut FfnTaps>,
 }
 
 /// A group's open takes, one a unit ([`Body::enqueue_group`]), with what
@@ -2429,6 +2564,9 @@ impl PromptProgram<'_> {
         let n = d.embd;
         gpu.elem()
             .enqueue_rms_norm(stream, &b.x, f32v(w, norm)?, d.rms_eps, n, t, &mut b.xn)?;
+        if let Some(taps) = self.ffn_in.as_deref_mut() {
+            tap_ffn_in(gpu, taps, l, self.u[u].pos_host[0] as usize, (t, n), &b.xn)?;
+        }
         let blk = Block {
             plan: c.block,
             names: [gate, up, down],
@@ -2482,6 +2620,16 @@ impl PromptProgram<'_> {
             t,
             &mut b.normed,
         )?;
+        if let Some(taps) = self.ffn_in.as_deref_mut() {
+            tap_ffn_in(
+                gpu,
+                taps,
+                l,
+                ub.pos_host[0] as usize,
+                (t, d.embd),
+                &b.normed,
+            )?;
+        }
         let bias = if c.bias {
             f32v(w, nm.bias)?
         } else {

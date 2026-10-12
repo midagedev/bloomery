@@ -51,9 +51,9 @@ pub use body::nextn::{
 pub use body::prefill::{
     CHUNK, GEMM_FROM, GlmPromptSink, PrefillMode, PromptBytes, RouteTapRows, StoreDigest,
     StoreRows, T_MAX, batches_of, call_batches, feed, plant_prompt_routes, prefill, prefill_group,
-    prefill_media, prefill_mode, prompt_bytes, prompt_route_taps, prompt_with, set_prefill,
-    set_prefill_group, set_prefill_media, set_prompt_route_taps, set_prompt_stats, store_digests,
-    store_rows, take_prompt_stats,
+    prefill_media, prefill_mode, prompt_bytes, prompt_ffn_taps, prompt_route_taps, prompt_with,
+    set_prefill, set_prefill_group, set_prefill_media, set_prompt_ffn_taps, set_prompt_route_taps,
+    set_prompt_stats, store_digests, store_rows, take_prompt_stats,
 };
 pub use body::seq::{
     GlmSeq, seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
