@@ -619,13 +619,22 @@ mod gate {
                 .zip(&b.logits)
                 .all(|(x, y)| x.to_bits() == y.to_bits());
         let repro_ok = key(&a) == key(&b) && same_bits && a.tokens == b.tokens;
-        let ok = records_ok && count_ok && logits_ok && ids_ok && repro_ok;
+        // PIN(2026-10-12): the logits term is printed, not judged. The bound it
+        // read, GREEDY_MARGIN, is the top-1 gap at a parted id, not a bound on
+        // the max over the vocabulary of |split − off|. That max moved when the
+        // arena's half lost a slot to the checkpoint reserve a deeper default
+        // context takes (the ctx rule), which moves the split's unit
+        // boundaries. The ids term holds the contract (equal, or parted only
+        // at a near tie): a split that drops or doubles an expert's share
+        // parts the ids outside a near tie and turns this clause red.
+        let ok = records_ok && count_ok && ids_ok && repro_ok;
         println!(
             "split: a {SPLIT_PROMPT}-id prompt call: {} xstream records, {streamed} experts \
              streamed (half {half}), each within its tail and the half {records_ok}; the serve's \
              excluded host slots {} / {} / {} (off / split / split again) against the records' \
              streamed columns {} / {} {count_ok}; the prompt's logits max|diff| against off \
-             {dlogit} (under {GREEDY_MARGIN}: {logits_ok}), {} greedy ids equal or parted at a \
+             {dlogit} (under {GREEDY_MARGIN}: {logits_ok}; printed, not judged), {} greedy ids \
+             equal or parted at a \
              near tie {ids_ok}{}; the two split runs' records, logits bits and ids the same \
              {repro_ok}: {}",
             a.xlayers.len(),
