@@ -1308,11 +1308,16 @@ impl XStream {
                     .ok_or_else(|| GpuError::protocol(WHAT, "the fill threads have stopped"))?;
                 *jobs += 1;
                 let staged = shared.words.dev_at(2 * slot * WORD_STRIDE);
-                mem_batch(
-                    &copy,
-                    &mut [op_wait_geq(staged, ticket)],
-                    "xstream: wait for staging",
-                )?;
+                // SAFETY: slot `slot`'s staged word lies in the words (sized
+                // for `shared.slots` slots), which stay allocated until the
+                // copy stream has drained (the drop drains it, or leaks them).
+                unsafe {
+                    mem_batch(
+                        &copy,
+                        &mut [op_wait_geq(staged, ticket)],
+                        "xstream: wait for staging",
+                    )?;
+                }
                 let mut at = slot * shared.slot_bytes;
                 for (&len, &d) in parts.iter().zip(&dst) {
                     // SAFETY: the staging span [at, at + len) lies inside the
@@ -1333,11 +1338,15 @@ impl XStream {
                     at += len;
                 }
                 let drained = shared.words.dev_at((2 * slot + 1) * WORD_STRIDE);
-                mem_batch(
-                    &copy,
-                    &mut [op_write(drained, ticket)],
-                    "xstream: staging drained",
-                )?;
+                // SAFETY: slot `slot`'s drained word lies in the words, which
+                // stay allocated until the copy stream has drained, as above.
+                unsafe {
+                    mem_batch(
+                        &copy,
+                        &mut [op_write(drained, ticket)],
+                        "xstream: staging drained",
+                    )?;
+                }
             }
             Lane::Pageable { .. } => {
                 source.open_read(layer, id)?;

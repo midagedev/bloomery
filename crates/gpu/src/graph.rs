@@ -415,8 +415,10 @@ pub fn capturing(stream: &CudaStream) -> Result<bool, GpuError> {
 /// `host`, kernels, copies and stream memory operations at `dev`, from every
 /// context of the process. Zeroed at allocation, freed on drop. The one owner
 /// of mapped host memory: the host flags ([`HostFlags`]) and the host tier's
-/// page are views over it.
-pub(crate) struct MappedHost {
+/// page are views over it. Its owner keeps every stream and graph that
+/// addresses it from running past the drop: it drains the stream, drops the
+/// graph first, or ends the process without dropping it.
+pub struct MappedHost {
     host: *mut u8,
     dev: sys::CUdeviceptr,
     bytes: usize,
@@ -440,7 +442,7 @@ unsafe impl Sync for MappedHost {}
 impl MappedHost {
     /// `bytes` zeroed bytes of `ctx`'s mapped host memory. `what` names the
     /// allocation in a driver error. Load-time only.
-    pub(crate) fn new(
+    pub fn new(
         ctx: &Arc<CudaContext>,
         bytes: usize,
         what: &'static str,
@@ -478,13 +480,13 @@ impl MappedHost {
 
     /// The device address of byte `off`, which the caller's layout keeps
     /// inside the allocation.
-    pub(crate) fn dev_at(&self, off: usize) -> sys::CUdeviceptr {
+    pub fn dev_at(&self, off: usize) -> sys::CUdeviceptr {
         self.dev + off as u64
     }
 
     /// The host address of byte `off`. Computing it touches nothing; each
     /// access proves its own span.
-    pub(crate) fn host_at(&self, off: usize) -> *mut u8 {
+    pub fn host_at(&self, off: usize) -> *mut u8 {
         self.host.wrapping_add(off)
     }
 
@@ -498,7 +500,7 @@ impl MappedHost {
 
     /// The u32 at byte `off` as an atomic; `None` when it is not 4-aligned
     /// or passes the allocation.
-    pub(crate) fn atomic_u32(&self, off: usize) -> Option<&AtomicU32> {
+    pub fn atomic_u32(&self, off: usize) -> Option<&AtomicU32> {
         if !off.is_multiple_of(4) || off.checked_add(4).is_none_or(|end| end > self.bytes) {
             return None;
         }
@@ -541,9 +543,10 @@ impl Drop for MappedHost {
         // Freed under the context that allocated it, not whichever context
         // the thread last bound; an error is kept on that context.
         self.ctx.record_err(self.ctx.bind_to_thread());
-        // SAFETY: `host` came from cuMemHostAlloc and is freed once, here —
-        // after every graph that names it, since the graphs are declared
-        // before the bodies that own the views over it.
+        // SAFETY: `host` came from cuMemHostAlloc and is freed once, here,
+        // after every stream operation and graph that names it (the owner's
+        // contract on the type); the engine declares its graphs before the
+        // bodies that own the views over it.
         let rc = unsafe { sys::cuMemFreeHost(self.host.cast()) };
         self.ctx.record_err(driver(rc));
     }
@@ -558,8 +561,9 @@ fn op_zero() -> sys::CUstreamBatchMemOpParams {
     unsafe { std::mem::zeroed() }
 }
 
-/// Wait until the u32 at `addr` is at least `value`.
-pub(crate) fn op_wait_geq(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+/// Wait until the u32 at `addr` is at least `value` in the driver's cyclic
+/// order, `(int32_t)(*addr - value) >= 0`, not a plain unsigned `>=`.
+pub fn op_wait_geq(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
     let mut p = op_zero();
     p.waitValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st {
         operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WAIT_VALUE_32,
@@ -575,7 +579,7 @@ pub(crate) fn op_wait_geq(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBa
 }
 
 /// Write `value` to the u32 at `addr`.
-pub(crate) fn op_write(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+pub fn op_write(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
     let mut p = op_zero();
     p.writeValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st {
         operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WRITE_VALUE_32,
@@ -592,7 +596,7 @@ pub(crate) fn op_write(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatch
 
 /// A system-scope memory barrier: everything the stream wrote before it is
 /// visible system-wide before anything after it.
-pub(crate) fn op_barrier_sys() -> sys::CUstreamBatchMemOpParams {
+pub fn op_barrier_sys() -> sys::CUstreamBatchMemOpParams {
     let mut p = op_zero();
     p.memoryBarrier = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpMemoryBarrierParams_st {
         operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_BARRIER,
@@ -616,17 +620,25 @@ pub(crate) fn op_add(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMe
     p
 }
 
-/// Enqueue `ops` on `stream` as one batch of stream memory operations — one
+/// Enqueue `ops` on `stream` as one batch of stream memory operations: one
 /// graph node when captured.
-pub(crate) fn mem_batch(
+///
+/// # Safety
+///
+/// - Every operation's address must point at a 4-aligned u32 of memory the
+///   device reaches in `stream`'s context.
+/// - That memory must stay allocated and mapped until the batch has run, and
+///   for a captured batch until every launch of the graph has run: the graph
+///   bakes the addresses in.
+pub unsafe fn mem_batch(
     stream: &CudaStream,
     ops: &mut [sys::CUstreamBatchMemOpParams],
     what: &'static str,
 ) -> Result<(), GpuError> {
     let n = u32::try_from(ops.len()).map_err(|_| GpuError::shape(what, "batch too long"))?;
     // SAFETY: `ops` is a live array of `n` initialized operations the driver
-    // reads during the call (a capture copies them into the node); the flags
-    // must be 0.
+    // reads during the call (a capture copies them into the node), whose
+    // addresses are the caller's contract; the flags must be 0.
     let rc = unsafe { sys::cuStreamBatchMemOp_v2(stream.cu_stream(), n, ops.as_mut_ptr(), 0) };
     cu(rc, what)
 }
@@ -722,7 +734,10 @@ impl HostFlags {
         self.word(i, "HostFlags::enqueue_wait")?;
         let mut ops = [op_wait_geq(self.page.dev_at(i * FLAG_STRIDE), 1)];
         const _: () = assert!(FLAG_WAIT_OPS == 1);
-        mem_batch(stream, &mut ops, "cuStreamBatchMemOp_v2 (host flag wait)")
+        // SAFETY: flag `i`'s word lies in the page, 4-aligned (checked
+        // above); the page goes only with the flags, whose owner keeps every
+        // wait on them from running past that ([`MappedHost`]'s contract).
+        unsafe { mem_batch(stream, &mut ops, "cuStreamBatchMemOp_v2 (host flag wait)") }
     }
 }
 

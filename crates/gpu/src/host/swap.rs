@@ -2849,11 +2849,16 @@ impl SwapMachine {
             source.convert(l, part, dst, &copy)?;
             at += len;
         }
-        mem_batch(
-            &copy,
-            &mut [op_write(drained, d.ticket())],
-            "swap: ring drained",
-        )?;
+        // SAFETY: ring slot `d.ring()`'s drained word lies in the staging
+        // words, which stay allocated until the copy stream has drained (the
+        // machine's drop leaks them otherwise).
+        unsafe {
+            mem_batch(
+                &copy,
+                &mut [op_write(drained, d.ticket())],
+                "swap: ring drained",
+            )?;
+        }
         Ok(at as u64)
     }
 
@@ -2925,7 +2930,11 @@ impl SwapMachine {
                 let word = (l - start) * n + id as usize;
                 op_write(view + 4 * word as u64, entry)
             }));
-            mem_batch(stream, &mut self.ops, "swap: the card's map words")?;
+            // SAFETY: each word is a (layer, expert) of the machine's, inside
+            // `view` (its length checked in `new`), which the caller keeps
+            // allocated and in place until the machine is dropped
+            // ([`SwapMachine::new`]).
+            unsafe { mem_batch(stream, &mut self.ops, "swap: the card's map words")? };
         }
         self.changed.clear();
         Ok(())

@@ -194,7 +194,10 @@ gguf 9 2 0
 # PIN(2026-10-12): then 1718 -> 1719 blocks, new code, not old code relaxed: the IQ3_S card entries add the raw
 # super-block's word reads (iq_sel.rs Iq3S::sub, one block) and the grid lookup (iq.rs iq3s_group, one block), each
 # with its SAFETY line; the tree counted 1717 before them, one under the pin.
-gpu 1719 191 10
+# PIN(2026-10-12): gpu 1719 -> 1731 blocks, 191 -> 192 fns, not old code relaxed: mem_batch, opened outside the crate,
+# is an unsafe fn with a Safety section (1 fn), and its 12 calls in the crate each vouch for their addresses (12 blocks,
+# each with its SAFETY line), on the tree's 1719.
+gpu 1731 192 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -236,7 +239,11 @@ gpu-deepseek41 402 45 0
 # PIN(2026-10-11): on main's 61 5 1: 61 + 46 verbs (dlopen, dlsym and its cast 3, the 16 entries, 26 calls and reads,
 # link_probe's call of the registration 1) + 9 CUDA (the module load, the window, 4 driver calls, the page's zeroing and
 # word view, the memop zero) + 4 kernel accesses = 120 blocks, 5 + 19 fn pointer types + 2 unsafe fns = 26 fns.
-gpu-gates 120 26 1
+# PIN(2026-10-12): gpu-gates 120 -> 116 blocks, lowered to the tree's count: link_probe's page is bloomery_gpu's
+# MappedHost and its stream memory operations are the engine's builders and mem_batch, so the probe's own 4 driver
+# calls, the page's zeroing and word view and the memop zero go (7), and its 3 calls of mem_batch, an unsafe fn, each
+# vouch for their words (3, each with its SAFETY line).
+gpu-gates 116 26 1
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and

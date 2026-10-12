@@ -73,19 +73,14 @@ mod probe {
     use super::verbs::{
         Endpoint, Gid, Nic, Qp, Region, Verbs, WC_RDMA_WRITE, WC_RECV_RDMA_WITH_IMM, Wc, WriteKind,
     };
-    use bloomery_gpu::{Gpu, window};
+    use bloomery_gpu::{Gpu, MappedHost, mem_batch, op_barrier_sys, op_wait_geq, op_write, window};
     use bloomery_gpu_gates::{GateError, verdict};
-    use cuda_core::{
-        CudaContext, CudaEvent, CudaStream, DeviceBuffer, DriverError, LaunchConfig1D, sys,
-    };
+    use cuda_core::{CudaEvent, DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, debug, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
-    use std::ffi::c_void;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::panic::AssertUnwindSafe;
-    use std::ptr;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
@@ -351,12 +346,12 @@ mod probe {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let kernels = unsafe { bloomery_gpu::shared_module!(link_kernels, ctx)? };
-        let page = Page::new(ctx, layout.bytes())?;
+        let page = MappedHost::new(ctx, layout.bytes(), "cuMemHostAlloc (the probe's page)")?;
         let verbs = Verbs::load()?;
         let nic = Nic::open(&verbs, &o.dev, o.gid)?;
         // SAFETY: `page` is declared before `region`, so it drops after it:
         // the range stays allocated for the region's whole life.
-        let region = unsafe { nic.register(page.host, layout.bytes())? };
+        let region = unsafe { nic.register(page.host_at(0), layout.bytes())? };
         let peers = if o.rank == 0 { o.nodes - 1 } else { 1 };
         let qps = (0..peers)
             .map(|_| nic.queue_pair())
@@ -369,7 +364,7 @@ mod probe {
                 qpn: qp.qpn(),
                 psn: psn(o.rank, i),
                 gid: nic.gid(),
-                addr: page.host as u64,
+                addr: page.host_at(0) as u64,
                 rkey: region.rkey(),
             })
             .collect();
@@ -396,14 +391,18 @@ mod probe {
         );
         let mut stamps = DeviceBuffer::<u64>::zeroed(gpu.stream(), 2 * (total + 1))?;
         let mut stale = DeviceBuffer::<u64>::zeroed(gpu.stream(), THREADS as usize)?;
-        let flags: Vec<&AtomicU32> = (0..o.nodes).map(|r| page.word(layout.flag(r))).collect();
-        let sent = page.word(layout.sent());
+        let word = |off| {
+            page.atomic_u32(off)
+                .expect("every flag word and the sent word lie in the layout's page")
+        };
+        let flags: Vec<&AtomicU32> = (0..o.nodes).map(|r| word(layout.flag(r))).collect();
+        let sent = word(layout.sent());
         let card = Card {
             gpu: &gpu,
             kernels: &kernels,
             layout,
             rank: o.rank,
-            dev: page.dev,
+            dev: page.dev_at(0),
             total,
             deadline: o.deadline,
             flags: &flags,
@@ -419,7 +418,7 @@ mod probe {
             mode: o.flag,
             flag: flags[own],
             sent,
-            local: page.host as u64 + (layout.start(own) * LINE) as u64,
+            local: page.host_at(0) as u64 + (layout.start(own) * LINE) as u64,
             bytes: u32::try_from(match o.flag {
                 Flag::Write => (layout.data_lines(own) + 1) * LINE,
                 Flag::Imm => layout.data_lines(own) * LINE,
@@ -739,19 +738,41 @@ mod probe {
                         vec![op_barrier_sys(), op_write(self.dev + l.flag(0) as u64, seq)];
                     ops.extend((1..l.nodes).map(|r| op_wait_geq(self.dev + l.flag(r) as u64, seq)));
                     ops.push(op_wait_geq(sent, seq));
-                    mem_batch(stream, &mut ops)?;
+                    // SAFETY: every flag word and the sent word lie in the
+                    // page (the layout's own words), which outlives every
+                    // batch as in `span`.
+                    unsafe {
+                        mem_batch(
+                            stream,
+                            &mut ops,
+                            "link_probe: the image flag and the rows waits",
+                        )?;
+                    }
                 } else {
-                    mem_batch(stream, &mut [op_wait_geq(self.dev + l.flag(0) as u64, seq)])?;
+                    // SAFETY: the stage's flag word lies in the page, which
+                    // outlives every batch as in `span`.
+                    unsafe {
+                        mem_batch(
+                            stream,
+                            &mut [op_wait_geq(self.dev + l.flag(0) as u64, seq)],
+                            "link_probe: the image wait",
+                        )?;
+                    }
                     self.launch(stale, stamps, seq, seq, ROWS_LINES, g - 1)?;
                     let flag = self.dev + l.flag(self.rank) as u64;
-                    mem_batch(
-                        stream,
-                        &mut [
-                            op_barrier_sys(),
-                            op_write(flag, seq),
-                            op_wait_geq(sent, seq),
-                        ],
-                    )?;
+                    // SAFETY: this rank's flag word and the sent word lie in
+                    // the page, which outlives every batch as in `span`.
+                    unsafe {
+                        mem_batch(
+                            stream,
+                            &mut [
+                                op_barrier_sys(),
+                                op_write(flag, seq),
+                                op_wait_geq(sent, seq),
+                            ],
+                            "link_probe: the rows flag and the sent wait",
+                        )?;
+                    }
                 }
                 events[g % AHEAD].record(stream)?;
             }
@@ -948,138 +969,6 @@ mod probe {
             }
             std::hint::spin_loop();
         }
-    }
-
-    // ------------------------------------------------------------ the page
-
-    /// `bytes` zeroed bytes of mapped host memory (`cuMemHostAlloc` with
-    /// `PORTABLE | DEVICEMAP`): the host and the NIC reach it at `host`,
-    /// the card at `dev`. Freed on drop.
-    struct Page {
-        host: *mut u8,
-        dev: sys::CUdeviceptr,
-        bytes: usize,
-        ctx: Arc<CudaContext>,
-    }
-
-    impl Page {
-        fn new(ctx: &Arc<CudaContext>, bytes: usize) -> Result<Page, GateError> {
-            ctx.bind_to_thread()?;
-            let mut host: *mut c_void = ptr::null_mut();
-            let flags = sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP;
-            // SAFETY: the context is current (bound above); `host` is a local
-            // the call writes.
-            let rc = unsafe { sys::cuMemHostAlloc(&mut host, bytes, flags) };
-            if rc != sys::cudaError_enum_CUDA_SUCCESS {
-                return Err(format!("cuMemHostAlloc of {bytes} bytes: driver error {rc}").into());
-            }
-            let mut page = Page {
-                host: host.cast(),
-                dev: 0,
-                bytes,
-                ctx: Arc::clone(ctx),
-            };
-            // SAFETY: `host` is the mapped allocation just made; flags must be 0.
-            let rc = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut page.dev, host, 0) };
-            if rc != sys::cudaError_enum_CUDA_SUCCESS {
-                return Err(format!("cuMemHostGetDevicePointer_v2: driver error {rc}").into());
-            }
-            // SAFETY: the allocation holds `bytes` writable bytes and nothing
-            // else references it yet.
-            unsafe { ptr::write_bytes(page.host, 0, bytes) };
-            Ok(page)
-        }
-
-        /// The flag word at byte `off`.
-        fn word(&self, off: usize) -> &AtomicU32 {
-            assert!(
-                off.is_multiple_of(4) && off + 4 <= self.bytes,
-                "flag word {off} outside the page"
-            );
-            // SAFETY: the word is 4-aligned and inside the allocation
-            // (asserted; the allocation is page-aligned); `AtomicU32` has
-            // `u32`'s layout, and every host access to a flag goes through it.
-            unsafe { &*self.host.add(off).cast::<AtomicU32>() }
-        }
-    }
-
-    impl Drop for Page {
-        fn drop(&mut self) {
-            // Freed under the context that allocated it; an error is kept on
-            // that context.
-            self.ctx.record_err(self.ctx.bind_to_thread());
-            // SAFETY: `host` came from cuMemHostAlloc and is freed once, here,
-            // after the region that registered it and every launch over it.
-            let rc = unsafe { sys::cuMemFreeHost(self.host.cast()) };
-            if rc != sys::cudaError_enum_CUDA_SUCCESS {
-                self.ctx.record_err::<()>(Err(DriverError(rc)));
-            }
-        }
-    }
-
-    // --------------------------------------------- stream memory operations
-
-    fn op_zero() -> sys::CUstreamBatchMemOpParams {
-        // SAFETY: every member of the union is a plain C struct of integers,
-        // so all-zero bytes are a valid value.
-        unsafe { std::mem::zeroed() }
-    }
-
-    /// Wait until the u32 at `addr` is at least `value`.
-    fn op_wait_geq(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
-        let mut p = op_zero();
-        p.waitValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st {
-            operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WAIT_VALUE_32,
-            address: addr,
-            __bindgen_anon_1:
-                sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st__bindgen_ty_1 {
-                    value,
-                },
-            flags: sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
-            alias: 0,
-        };
-        p
-    }
-
-    /// Write `value` to the u32 at `addr`.
-    fn op_write(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
-        let mut p = op_zero();
-        p.writeValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st {
-            operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WRITE_VALUE_32,
-            address: addr,
-            __bindgen_anon_1:
-                sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st__bindgen_ty_1 {
-                    value,
-                },
-            flags: sys::CUstreamWriteValue_flags_enum_CU_STREAM_WRITE_VALUE_DEFAULT,
-            alias: 0,
-        };
-        p
-    }
-
-    /// A system-scope barrier: what the stream wrote before it is visible
-    /// system-wide before anything after it.
-    fn op_barrier_sys() -> sys::CUstreamBatchMemOpParams {
-        let mut p = op_zero();
-        p.memoryBarrier = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpMemoryBarrierParams_st {
-            operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_BARRIER,
-            flags: sys::CUstreamMemoryBarrier_flags_enum_CU_STREAM_MEMORY_BARRIER_TYPE_SYS,
-        };
-        p
-    }
-
-    fn mem_batch(
-        stream: &CudaStream,
-        ops: &mut [sys::CUstreamBatchMemOpParams],
-    ) -> Result<(), GateError> {
-        let n = u32::try_from(ops.len())?;
-        // SAFETY: `ops` holds `n` initialized operations the driver reads
-        // during the call; the flags must be 0.
-        let rc = unsafe { sys::cuStreamBatchMemOp_v2(stream.cu_stream(), n, ops.as_mut_ptr(), 0) };
-        if rc != sys::cudaError_enum_CUDA_SUCCESS {
-            return Err(format!("cuStreamBatchMemOp_v2: driver error {rc}").into());
-        }
-        Ok(())
     }
 
     // ------------------------------------------------------ control channel

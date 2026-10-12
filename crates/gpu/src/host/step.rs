@@ -428,17 +428,23 @@ impl Boundary {
 
     fn go_batch(&self, stream: &CudaStream, layer: u32, row: usize) -> Result<(), GpuError> {
         let seq = self.region.cu_deviceptr() + 4 * self.layout.handoff().seq as u64;
-        mem_batch(
-            stream,
-            &mut [
-                op_barrier_sys(),
-                op_write(self.page.dev_at(Word::Lyr(row).offset()), layer),
-                op_barrier_sys(),
-                op_add(self.page.dev_at(Word::Gen.offset()), 1),
-                op_add(seq, 1),
-            ],
-            "cuStreamBatchMemOp_v2 (hybrid go)",
-        )
+        // SAFETY: row `row`'s layer word and the generation word lie in the
+        // page and the sequence word in the region (the layout places them;
+        // the callers checked the row); both allocations live as long as the
+        // boundary, which outlives every graph that captured this batch.
+        unsafe {
+            mem_batch(
+                stream,
+                &mut [
+                    op_barrier_sys(),
+                    op_write(self.page.dev_at(Word::Lyr(row).offset()), layer),
+                    op_barrier_sys(),
+                    op_add(self.page.dev_at(Word::Gen.offset()), 1),
+                    op_add(seq, 1),
+                ],
+                "cuStreamBatchMemOp_v2 (hybrid go)",
+            )
+        }
     }
 
     /// Enqueue the wait: until the counter is at least one, then minus one.
@@ -451,11 +457,16 @@ impl Boundary {
     pub fn enqueue_back_of(&self, stream: &CudaStream, row: usize) -> Result<(), GpuError> {
         self.page_of(row, "Boundary::enqueue_back")?;
         let cnt = self.page.dev_at(Word::Cnt(row).offset());
-        mem_batch(
-            stream,
-            &mut [op_wait_geq(cnt, 1), op_add(cnt, u32::MAX)],
-            "cuStreamBatchMemOp_v2 (hybrid wait)",
-        )
+        // SAFETY: row `row`'s counter lies in the page (row checked above),
+        // which lives as long as the boundary, which outlives every graph
+        // that captured this batch.
+        unsafe {
+            mem_batch(
+                stream,
+                &mut [op_wait_geq(cnt, 1), op_add(cnt, u32::MAX)],
+                "cuStreamBatchMemOp_v2 (hybrid wait)",
+            )
+        }
     }
 
     /// The device addresses a go of row `row` writes: the row's layer word,

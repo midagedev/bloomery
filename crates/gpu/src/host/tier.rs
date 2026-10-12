@@ -670,11 +670,17 @@ impl TierPage {
         }
         ops[3 + k] = op_add(gen_, 1);
         ops[4 + k] = op_add(seq, 1);
-        mem_batch(
-            stream,
-            &mut ops[..5 + k],
-            "cuStreamBatchMemOp_v2 (hybrid go, tier)",
-        )
+        // SAFETY: the tiers' go words lie in this page (row and tiers checked
+        // above) and the rest in the boundary's page and region (`go_words`
+        // checked the row); each outlives every graph that captured this
+        // batch, as for the boundary's own go.
+        unsafe {
+            mem_batch(
+                stream,
+                &mut ops[..5 + k],
+                "cuStreamBatchMemOp_v2 (hybrid go, tier)",
+            )
+        }
     }
 
     /// Enqueue on the stage card's `stream` the wait of row `row` for a
@@ -703,11 +709,17 @@ impl TierPage {
             ops[1 + i] = op_wait_geq(cnt, 1);
             ops[2 + k + i] = op_add(cnt, u32::MAX);
         }
-        mem_batch(
-            stream,
-            &mut ops[..2 + 2 * k],
-            "cuStreamBatchMemOp_v2 (hybrid wait, tier)",
-        )
+        // SAFETY: the tiers' counters lie in this page (row and tiers checked
+        // above) and the host's in the boundary's page (`cnt_word` checked
+        // the row); each outlives every graph that captured this batch, as
+        // for the boundary's own wait.
+        unsafe {
+            mem_batch(
+                stream,
+                &mut ops[..2 + 2 * k],
+                "cuStreamBatchMemOp_v2 (hybrid wait, tier)",
+            )
+        }
     }
 
     /// The count of `tiers`, each a tier of the page, ascending, at least
@@ -1637,11 +1649,16 @@ impl Parts<'_> {
             ));
         }
         let go = page.dev(t, TWord::Go(row));
-        mem_batch(
-            stream,
-            &mut [op_wait_geq(go, 1), op_add(go, u32::MAX)],
-            "cuStreamBatchMemOp_v2 (tier go)",
-        )?;
+        // SAFETY: this tier's go word of row `row` lies in the page (row
+        // checked above), which the host tier drops after its tier cards and
+        // so after every graph that captured this batch.
+        unsafe {
+            mem_batch(
+                stream,
+                &mut [op_wait_geq(go, 1), op_add(go, u32::MAX)],
+                "cuStreamBatchMemOp_v2 (tier go)",
+            )?;
+        }
         let at = page.layout.image_off(row);
         let staged = match &*self.act {
             Staged::Q8(a) => a.q3.len() * 2 == img.q3_words && a.d8.len() == img.d8_len,
@@ -1723,15 +1740,20 @@ impl Parts<'_> {
             unsafe { drop(ManuallyDrop::take(&mut out).into_raw_parts()) };
             r?;
         }
-        mem_batch(
-            stream,
-            &mut [
-                op_barrier_sys(),
-                op_add(page.dev(t, TWord::Cnt(row)), 1),
-                op_add(page.dev(t, TWord::Prog), 1),
-            ],
-            "cuStreamBatchMemOp_v2 (tier signal)",
-        )
+        // SAFETY: this tier's counter of row `row` and its progress word lie
+        // in the page (row checked above), which the host tier drops after
+        // its tier cards and so after every graph that captured this batch.
+        unsafe {
+            mem_batch(
+                stream,
+                &mut [
+                    op_barrier_sys(),
+                    op_add(page.dev(t, TWord::Cnt(row)), 1),
+                    op_add(page.dev(t, TWord::Prog), 1),
+                ],
+                "cuStreamBatchMemOp_v2 (tier signal)",
+            )
+        }
     }
 }
 

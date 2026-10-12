@@ -263,11 +263,16 @@ pub(super) mod dispatch {
         d: &Dispatched,
     ) -> Result<(), GpuError> {
         let staged = words.dev_at(2 * d.ring * WORD_STRIDE);
-        mem_batch(
-            copy,
-            &mut [op_wait_geq(staged, d.ticket)],
-            "swap: wait for staging",
-        )
+        // SAFETY: ring slot `d.ring`'s staged word lies in `words`, which the
+        // machine keeps allocated until the copy stream has drained (its drop
+        // leaks them otherwise).
+        unsafe {
+            mem_batch(
+                copy,
+                &mut [op_wait_geq(staged, d.ticket)],
+                "swap: wait for staging",
+            )
+        }
     }
 }
 
