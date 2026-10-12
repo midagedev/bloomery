@@ -128,11 +128,32 @@ fn store(out: &mut [u8], acc: [i32; 3]) {
     }
 }
 
+/// The data bytes of a `width`×`height` frame, refused by its size when the count overflows.
+fn frame_bytes(width: usize, height: usize) -> Result<usize, VisionError> {
+    Rgb8::frame_len(width, height).ok_or_else(|| VisionError::Size {
+        width,
+        height,
+        detail: "the frame's byte count overflows".to_string(),
+    })
+}
+
+/// A `width`×`height` frame of zero bytes ([`frame_bytes`]).
+fn zeroed(width: usize, height: usize) -> Result<Rgb8, VisionError> {
+    let len = frame_bytes(width, height)?;
+    Ok(Rgb8 {
+        width,
+        height,
+        data: vec![0; len],
+    })
+}
+
 /// `Image.resize((width, height), Image.BICUBIC)` of an RGB image, as Pillow computes it. A size
 /// equal to the input's is a copy, as in Pillow. An image whose data is not its frame's bytes
-/// ([`Rgb8::check`]), or one with no pixels resized to a size with some, is refused by name.
+/// ([`Rgb8::check`]), a size whose byte count overflows ([`frame_bytes`]), and an image with no
+/// pixels resized to a size with some are refused by name.
 pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Result<Rgb8, VisionError> {
     src.check()?;
+    frame_bytes(width, height)?;
     if (width, height) == (src.width, src.height) {
         return Ok(src.clone());
     }
@@ -162,11 +183,7 @@ pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Result<
         for b in &mut vert.bounds {
             b.0 -= first;
         }
-        let mut out = Rgb8 {
-            width,
-            height: last - first,
-            data: vec![0; width * (last - first) * 3],
-        };
+        let mut out = zeroed(width, last - first)?;
         for yy in 0..last - first {
             let row = &src.data[(yy + first) * src.width * 3..(yy + first + 1) * src.width * 3];
             for xx in 0..width {
@@ -185,11 +202,7 @@ pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Result<
     let img = horizontal.as_ref().unwrap_or(src);
     if need_v {
         let w = img.width;
-        let mut out = Rgb8 {
-            width: w,
-            height,
-            data: vec![0; w * height * 3],
-        };
+        let mut out = zeroed(w, height)?;
         for yy in 0..height {
             let (ymin, k) = vert.taps(yy);
             for xx in 0..w {
@@ -358,13 +371,41 @@ pub fn pad_ceil(
 
 #[cfg(test)]
 mod tests {
-    use super::{Axis, PRECISION_BITS, PadGeometry, bicubic, pad, pad_ceil, resize_bicubic};
+    use super::{
+        Axis, PRECISION_BITS, PadGeometry, bicubic, pad, pad_ceil, resize_bicubic, zeroed,
+    };
     use crate::{Rgb8, VisionError};
 
     /// Two pad colours of the two projector types that call the pads; the pads themselves take
     /// whichever colour they are given.
     const GREY: [u8; 3] = [127, 127, 127];
     const BLACK: [u8; 3] = [0, 0, 0];
+
+    /// A resize to a size whose byte count overflows is refused by that size before any working
+    /// frame is sized from it, not wrapped to a shorter allocation or left to the allocator.
+    #[test]
+    fn a_working_frame_whose_byte_count_overflows_is_refused_by_name() {
+        let src = Rgb8::filled(2, 2, [9, 9, 9]);
+        for (w, h) in [
+            (usize::MAX, 2),
+            (usize::MAX / 3 + 1, 1),
+            (2, usize::MAX / 2),
+        ] {
+            match resize_bicubic(&src, w, h) {
+                Err(VisionError::Size {
+                    width,
+                    height,
+                    detail,
+                }) => {
+                    assert_eq!((width, height), (w, h));
+                    assert_eq!(detail, "the frame's byte count overflows");
+                }
+                other => panic!("{w}x{h}: {:?}", other.map(|f| f.data.len())),
+            }
+        }
+        let ok = zeroed(3, 2).expect("a small frame");
+        assert_eq!((ok.width, ok.height, ok.data), (3, 2, vec![0; 18]));
+    }
 
     /// The filter is 1 at 0, 0 at the other integers, and its taps at a half-pixel phase sum to 1.
     #[test]

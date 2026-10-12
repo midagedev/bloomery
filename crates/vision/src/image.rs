@@ -78,7 +78,7 @@ pub struct Rgb8 {
 
 impl Rgb8 {
     /// The data bytes of a `width`×`height` frame, `None` when the count overflows `usize`.
-    fn frame_len(width: usize, height: usize) -> Option<usize> {
+    pub(crate) fn frame_len(width: usize, height: usize) -> Option<usize> {
         width.checked_mul(height)?.checked_mul(3)
     }
 
@@ -112,9 +112,16 @@ impl Rgb8 {
     }
 
     /// An image of one colour.
+    ///
+    /// # Panics
+    ///
+    /// When the frame's `width * height * 3` bytes overflow `usize`: no such frame exists, and
+    /// the size is the caller's contract.
     #[must_use]
     pub fn filled(width: usize, height: usize, rgb: [u8; 3]) -> Rgb8 {
-        let mut data = Vec::with_capacity(width * height * 3);
+        let len = Rgb8::frame_len(width, height)
+            .expect("a frame whose byte count overflows usize cannot be filled");
+        let mut data = Vec::with_capacity(len);
         for _ in 0..width * height {
             data.extend_from_slice(&rgb);
         }
@@ -356,6 +363,14 @@ mod tests {
             e.to_string(),
             "image size 2x1: 5 data bytes where the frame has 6"
         );
+    }
+
+    /// A colour frame whose byte count overflows `usize` is a caller's error named at the call,
+    /// not a wrapped length.
+    #[test]
+    #[should_panic(expected = "byte count overflows usize cannot be filled")]
+    fn filled_refuses_a_frame_whose_byte_count_overflows() {
+        let _ = Rgb8::filled(usize::MAX / 3 + 1, 1, [1, 2, 3]);
     }
 
     /// A decoder library's refusal says which format's decoder it came from.
