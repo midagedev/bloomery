@@ -64,7 +64,7 @@ changes, run the first command again.
     ~/repo/bloomery-mr/.slot-<i>         the run slots (SLOTS in tools/mac-remote.sh, 2): a run holds one with `lockf`
                                          (/usr/bin/lockf takes flock(2) through O_EXLOCK, so the kernel frees the slot when
                                          its holder dies) from `just mac-static`'s start to its end; `.slot-<i>.holder` names
-                                         the track and start time of the holder, which a waiting run prints every 30 s
+                                         the track and start time of the holder, which a run prints at its start and, while it waits, every 5 min
     ~/.cache/bloomery/mac-static-ledger.tsv   the remote's own ledger (shared by the tracks, not seeded)
 
 A track's first run is a cold build; the next ones are warm. A retired track's clone and target/ are removed by hand
