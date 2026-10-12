@@ -1,0 +1,82 @@
+--- tools/ref/router_trace.cpp
++++ mainline-router-trace.cpp
+@@ -1 +1 @@
+-// router_trace — which experts ik_llama.cpp's MoE router picks, per layer, over a token stream.
++// router_trace — which experts mainline llama.cpp's MoE router picks, per layer, over a token stream.
+@@ -53,0 +54,2 @@
++#include "arg.h"
++#include "gguf.h"
+@@ -91 +93 @@
+-        (t->view_src->op == GGML_OP_ARGSORT || t->view_src->op == GGML_OP_ARGSORT_THRESH)) {
++        t->view_src->op == GGML_OP_ARGSORT) {
+@@ -94 +95,0 @@
+-    if (t->op == GGML_OP_GROUPED_TOPK) return SRC_GROUPED;
+@@ -215 +216 @@
+-static int on_tensor(struct ggml_tensor * t, bool ask, void * user_data) {
++static bool on_tensor(struct ggml_tensor * t, bool ask, void * user_data) {
+@@ -278 +279 @@
+-// Our own flags; everything else on the command line is gpt_params.
++// Our own flags; everything else on the command line is common_params.
+@@ -312 +313 @@
+-                        "                    [--max-tokens N] [--top-k-only | --every-node] [gpt_params...]\n");
++                        "                    [--max-tokens N] [--top-k-only | --every-node] [common_params...]\n");
+@@ -442 +443 @@
+-        llama_kv_cache_clear(ctx);
++        llama_memory_clear(llama_get_memory(ctx), true);
+@@ -452 +453,9 @@
+-            const int rc = llama_decode(ctx, llama_batch_get_one(ids.data() + p0, n, (llama_pos) (p0 - c0), 0));
++            common_batch batch = common_batch_get_one(ctx, ids.data() + p0, n);
++            llama_batch_ext * raw_batch = batch.get();
++            for (int i = 0; i < n; ++i) {
++                if (!llama_batch_ext_set_output_logits(raw_batch, i, true)) {
++                    fprintf(stderr, "router_trace: cannot request output for token %d\n", i);
++                    return false;
++                }
++            }
++            const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, raw_batch);
+@@ -515 +524 @@
+-static bool write_manifest(const fs::path & stage, const options & o, const gpt_params & params,
++static bool write_manifest(const fs::path & stage, const options & o, const common_params & params,
+@@ -524 +533 @@
+-    const char * slash = strrchr(params.model.c_str(), '/');
++    const char * slash = strrchr(params.model.path.c_str(), '/');
+@@ -527 +536 @@
+-    fprintf(m, "%s — ik_llama.cpp MoE router selections (ffn_moe_topk) by prefill, one row per token\n",
++    fprintf(m, "%s — mainline llama.cpp MoE router selections (ffn_moe_topk) by prefill, one row per token\n",
+@@ -529,2 +538,2 @@
+-    fprintf(m, "# model\t%s\n", params.model.c_str());
+-    fprintf(m, "# model_file\t%s\n", slash ? slash + 1 : params.model.c_str());
++    fprintf(m, "# model\t%s\n", params.model.path.c_str());
++    fprintf(m, "# model_file\t%s\n", slash ? slash + 1 : params.model.path.c_str());
+@@ -629,2 +638,2 @@
+-    gpt_params params;
+-    if (!gpt_params_parse((int) passthrough.size(), passthrough.data(), params)) {
++    common_params params;
++    if (!common_params_parse((int) passthrough.size(), passthrough.data(), params, LLAMA_EXAMPLE_COMMON)) {
+@@ -634 +643 @@
+-    if (!check_arch(params.model, o.expect_arch)) return 2;
++    if (!check_arch(params.model.path, o.expect_arch)) return 2;
+@@ -652,3 +661,5 @@
+-
+-    llama_init_result init = llama_init_from_gpt_params(params);
+-    if (!init.model || !init.context) {
++    params.no_kv_offload = true;
++    params.no_op_offload = true;
++
++    auto init = common_init_from_params(params);
++    if (!init || !init->model() || !init->context()) {
+@@ -658,2 +669,2 @@
+-    llama_model *   model = init.model;
+-    llama_context * ctx   = init.context;
++    llama_model *   model = init->model();
++    llama_context * ctx   = init->context();
+@@ -666 +677 @@
+-    tr.n_layer  = llama_n_layer(model);
++    tr.n_layer  = llama_model_n_layer(model);
+@@ -677 +688 @@
+-    const int n_vocab = llama_n_vocab(model);
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+@@ -707,2 +718 @@
+-    llama_free(ctx);
+-    llama_free_model(model);
++    init.reset();

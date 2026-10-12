@@ -2,6 +2,7 @@
 """How concentrated MoE routing is, per layer, from router sets (tools/ref/router_trace.cpp).
 
     tools/ref/router-coverage.py coverage <set> [<set>...] [--n 16,32,...] [--layers 3-10,13-43]
+    tools/ref/router-coverage.py locality <set> [<set>...]
     tools/ref/router-coverage.py transfer <set A> <set B> [--n 64]
     tools/ref/router-coverage.py compare <set A> <set B> [--tokens N]
     tools/ref/router-coverage.py oracle <set> <oracle set dir>
@@ -64,6 +65,7 @@ import struct
 import sys
 import tempfile
 from array import array
+from collections import OrderedDict
 from contextlib import redirect_stdout
 
 _spec = importlib.util.spec_from_file_location(
@@ -168,6 +170,67 @@ def held_split(s):
         return T // 2
     bounds = range(chunk, T, chunk)
     return min(bounds, key=lambda b: (abs(b - T // 2), b))
+
+
+def lru_hits(ids, n_used, capacity, reset_tokens=0):
+    """Replay ranked selections; hits refresh recency and misses insert then evict.
+    The second count checks membership before any selection of that token is inserted."""
+    cache = OrderedDict()
+    hits, start_hits = 0, 0
+    for p in range(0, len(ids), n_used):
+        if reset_tokens and (p // n_used) % reset_tokens == 0:
+            cache.clear()
+        row = ids[p:p + n_used]
+        start_hits += sum(e in cache for e in row)
+        for e in row:
+            if e in cache:
+                hits += 1
+                cache.move_to_end(e)
+            else:
+                cache[e] = None
+                if len(cache) > capacity:
+                    cache.popitem(last=False)
+    return hits, start_hits
+
+
+def locality(set_dirs):
+    for d in set_dirs:
+        s = read_manifest(d)
+        counts = read_counts(s)
+        E, T, K = s["n_expert"], s["tokens"], s["n_used"]
+        chunk = int(s["header"].get("chunk", 0) or 0)
+        half = held_split(s)
+        if E < 128 or K < 1 or T < 2 or not s["layers"]:
+            raise SetError(f"{d}: locality needs >=128 experts, positive top-k, >=2 tokens and a routed layer")
+        rows = []
+        for layer in s["layers"]:
+            ids = read_topk(s, layer)
+            for p in range(0, len(ids), K):
+                row = ids[p:p + K]
+                if any(e >= E for e in row) or len(set(row)) != K:
+                    raise SetError(f"{d}: layer {layer} token {p // K} has invalid or duplicate expert ids")
+            first = count(ids, E, 0, half, K)
+            second = count(ids, E, half, T, K)
+            if [a + b for a, b in zip(first, second)] != counts[layer]:
+                raise SetError(f"{d}: layer {layer} counts.tsv does not match topk-{layer}.u16")
+            h64, s64 = lru_hits(ids, K, 64)
+            h128, s128 = lru_hits(ids, K, 128)
+            cold64, _ = lru_hits(ids, K, 64, chunk)
+            cold128, _ = lru_hits(ids, K, 128, chunk)
+            total = T * K
+            rows.append((layer, [h64 / total, h128 / total, share(second, hot(first, 32)),
+                                 s64 / total, s128 / total, cold64 / total, cold128 / total]))
+        print(f"## {d}\n")
+        print(f"{T} tokens, {len(rows)} layers, {E} experts, top-{K}, chunk {chunk}. "
+              f"Static top-32 learns on [0, {half}) and is evaluated on [{half}, {T}).\n")
+        print("LRU starts empty, follows rank order, and persists across context resets. "
+              "Start columns check the cache before the token; cold columns reset it at every context. "
+              "All columns are percent of routed selections.\n")
+        print("| layer | LRU-64 | LRU-128 | static-32 held | start-64 | start-128 | cold-64 | cold-128 |")
+        print("|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for layer, values in rows:
+            print(f"| {layer} | " + " | ".join(pct(v) for v in values) + " |")
+        print("| all | " + " | ".join(pct(sum(v[i] for _, v in rows) / len(rows)) for i in range(7)) + " |\n")
 
 
 def coverage(set_dirs, asked=None, keep=None):
@@ -487,6 +550,12 @@ def self_test():
     """Synthetic sets with known answers: the math, the refusals and the oracle comparison."""
     E, K = 8, 2
     MODEL = "/models/q3/m-00001-of-00002.gguf"
+    # Refreshing a hit must evict the least recent expert, rather than the first inserted.
+    assert lru_hits([0, 1, 0, 2, 0, 1], 1, 2) == (2, 2)
+    # A miss can evict an expert that was present at the start of this token.
+    assert lru_hits([0, 1, 2, 1], 2, 2) == (1, 1)
+    assert lru_hits([0, 1, 2, 0], 2, 2) == (0, 1)
+    assert lru_hits([0, 1, 0, 1], 2, 2, 1) == (0, 0)
     with tempfile.TemporaryDirectory() as tmp:
         def make(name, rows_by_layer, complete=True, model=MODEL, chunk=None, n_expert=E):
             d = os.path.join(tmp, name)
@@ -536,6 +605,23 @@ def self_test():
         assert held_split({"tokens": 12, "header": {"chunk": "4"}}) == 4  # 4 and 8 tie around 6: the lower
         assert held_split({"tokens": 10, "header": {}}) == 5
         assert held_split({"tokens": 10, "header": {"chunk": "16"}}) == 5
+        local = make("local", {0: [[0, 1]] * 4 + [[126, 127]] * 4}, n_expert=128, chunk=4)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            locality([local])
+        assert "| 0 | 75.0 | 75.0 | 0.0 |" in buf.getvalue(), buf.getvalue()
+        # A counts file of the right size cannot hide duplicate ids or inconsistent contents.
+        for name, bad_rows in (("duplicate", [[0, 0]] * 2), ("mismatch", [[0, 1]] * 2)):
+            bad_local = make(name, {0: bad_rows}, n_expert=128)
+            if name == "mismatch":
+                with open(os.path.join(bad_local, "topk-0.u16"), "wb") as f:
+                    f.write(array("H", [2, 3, 2, 3]).tobytes())
+            try:
+                locality([bad_local])
+            except SetError:
+                pass
+            else:
+                raise AssertionError(f"locality accepted {name}")
         # bursts: routing that follows the set-wide rates everywhere reads phi 1 — 16 experts over 8
         # windows of 4 rows, every window every expert twice (K 8)
         flat = [[(t * 8 + j) % 16 for j in range(8)] for t in range(32)]
@@ -649,6 +735,9 @@ def main(argv):
     if argv[:1] == ["--self-test"]:
         return self_test()
     try:
+        if len(argv) >= 2 and argv[0] == "locality":
+            locality(argv[1:])
+            return 0
         if len(argv) >= 2 and argv[0] == "coverage":
             sets, opts = [], {}
             it = iter(argv[1:])

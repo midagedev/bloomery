@@ -1,0 +1,9 @@
+kind: profile
+question: What expert locality does the local Qwen3.8 Flash-Next IQ3_XXS model exhibit on dated technical prose and code?
+term: per-layer routed slots from 8192 input tokens per corpus, 512 experts and top-10, CPU evaluation callback
+unit: percent
+predict: 0..100 percent
+condition: Use the model's vocabulary, preserve strided top-k indices, require one selection per routed layer per call and a complete manifest; separate prose and code; train static top-32 only on the first half and evaluate on independent held-out contexts.
+decide-in: Report observed LRU-64, LRU-128 and static top-32 with corpus and schedule limits.
+decide-below: Reject the trace or analyzer as invalid.
+decide-above: Check repeated or misread tensor slots before interpreting the rate.
