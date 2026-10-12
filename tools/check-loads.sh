@@ -11,6 +11,8 @@
 #            loaded.as_cuda_module().clone())`, the body shared_module! and start_bundle_load's
 #            closures spell — and pure `//` comment lines; the macro's own `$module::load` is a
 #            metavariable and never matches a family name
+# The scan keeps the lines holding the fixed string `::load(` (grep -F) and runs the family alternation on
+# those lines alone, never on every source line.
 # Every other family load goes through `crate::shared_module!` (inside bloomery-gpu) or
 # `bloomery_gpu::shared_module!` (outside it), which binds to the slot's one module.
 # Exit: 0 no raw load (a line naming the family count). 1 each raw load, its file:line and the
@@ -54,7 +56,8 @@ while IFS= read -r hit; do
     status=1
 done < <(
     find crates -type f -name '*.rs' -path '*/src/*' -not -path 'crates/oxide-ice-unroll/*' | sort |
-        xargs grep -nE "(^|[^A-Za-z0-9_])(${pattern})::load\(" |
+        xargs grep -nF '::load(' |
+        grep -E "^[^:]+:[0-9]+:(.*[^A-Za-z0-9_])?(${pattern})::load\(" |
         grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' |
         grep -vE "$idiom" || true
 )
