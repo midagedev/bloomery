@@ -576,7 +576,7 @@ impl PlanInputs {
             )?,
         };
         let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
-        let room = plan.host.plan_at(&self.room);
+        let room = plan.plan_at(&self.room);
         placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
         plan.host
             .step_slots(beside.slots, placement::STEP_PORT_COLUMNS)?;

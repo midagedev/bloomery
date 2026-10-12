@@ -3,10 +3,13 @@
 # the dispatch-path A/B AGENTS.md asks for, two builds: this tree's generate_qwen3moe against main f9706dbd's, the base
 # built with `just build-decode` in its own worktree and remote dir.
 #
-# [derived, corrected 2026-10-13 by churn4's code read] The term BLOOMERY_HOST_ROOM moves on an unsplit plan is
-# mem_left = host_available() - need (workstation.rs:22): headroom does not track HOST_ROOM there (placement.rs:3295 is
-# machine_room - need; expert_nvme_tier returns early at :3034). Window: need < HOST_ROOM < need + pool(P=0). Card experts a
-# layer at plan a on the A6000 about 297 (docs/performance.md, mid-p148-s1 = fewest/2), 3.16 MB an expert
+# [derived, corrected 2026-10-13 by churn4's code read; headroom made to follow the room 2026-10-13 by round overhost] The
+# terms BLOOMERY_HOST_ROOM moves on an unsplit plan are mem_left = host_available() - need and, since overhost, the plan's
+# headroom = min(machine_room, HOST_ROOM) - need (Plan::plan_at; before it headroom stayed machine_room - need there and
+# only mem_left bound). A set word whose pool passes that headroom is refused by name (OverHost), not by the load's host
+# check (HostShort); the unset word reads both budgets, which a stated room makes equal. Window: need < HOST_ROOM < need
+# + pool(P=0). Card experts a layer at plan a on the A6000 about 297 (docs/performance.md, mid-p148-s1 = fewest/2),
+# 3.16 MB an expert
 # (refill-decode.card): pool(P=0) = 48 x 297 x 3.16 MB = 45 GB. HOST_ROOM is NOT a fixed 40G: at 40G the real plan may
 # split (page), and a paged stack's pool is 0 by rule, so no climb would arise; the room is derived as the fixture clause
 # churn_unhosted derives it -- one `--plan` run at HOST_ROOM=1048576M (M/G only; 2^40 B) reads the `cache` line's need and

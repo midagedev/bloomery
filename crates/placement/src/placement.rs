@@ -867,12 +867,14 @@ pub struct HostTotals {
     /// ([`workstation::HostNeed::cards`]), so the headroom below, the load's
     /// host check and the NVMe tier's split all leave the cards their share.
     pub pool_card_bytes: u64,
-    /// The room the machine's figure leaves
-    /// ([`workstation::HostNeed::machine_room`]) less the plan's host need
-    /// ([`workstation::HostNeed`]): usable − experts − tables − shadows −
-    /// reserves − the cards' share of a unified pool; on a plan the NVMe
-    /// expert tier split ([`expert_nvme_tier`]), the room the split read less
-    /// the arena and the plan's host need, since the room binds there.
+    /// What the plan's room leaves past its host need
+    /// ([`workstation::HostNeed::headroom`], the one definition): the room
+    /// the machine's figure leaves ([`workstation::HostNeed::machine_room`])
+    /// less usable − experts − tables − shadows − reserves − the cards' share
+    /// of a unified pool, the tighter of it and a room the caller stated
+    /// ([`Plan::plan_at`]); on a plan the NVMe expert tier split
+    /// ([`expert_nvme_tier`]), the room the split read less the arena and the
+    /// plan's host need, since the room binds there.
     pub headroom_bytes: i128,
     /// The host room the plan was made at: the reading it took and the
     /// room it was held to ([`workstation::plan_room`], the reading less
@@ -893,15 +895,6 @@ impl HostTotals {
         }
         self.arena_columns = slots.min(port) as u64;
         Ok(())
-    }
-
-    /// The room a plan with the host room `room` is made at, which this
-    /// plan then names ([`HostTotals::room`]): the one caller of
-    /// [`workstation::plan_room`] for a plan's tiers.
-    pub fn plan_at(&mut self, room: &(u64, workstation::HostRead)) -> u64 {
-        let planned = workstation::plan_room(room);
-        self.room = Some((room.0, planned));
-        planned
     }
 
     /// The load's refusal names the room its plan was made at, so a report
@@ -3285,8 +3278,7 @@ pub fn expert_nvme_tier(
     plan.nvme_bytes += moved;
     // The room binds a split plan: its headroom is what the room leaves
     // past the arena (`room` here) and the plan's host need.
-    plan.host.headroom_bytes =
-        i128::from(room) - i128::from(workstation::HostNeed::of(plan, 0).plan_bytes());
+    plan.host.headroom_bytes = workstation::HostNeed::of(plan, 0).headroom(room);
     Ok(())
 }
 
@@ -3395,11 +3387,9 @@ fn totals<'a>(
     };
     // The room the machine's figure leaves past the plan's host need, the
     // need's own arithmetic (`HostNeed`).
-    host.headroom_bytes = i128::from(workstation::HostNeed::machine_room(&machine.host))
-        - i128::from(
-            workstation::HostNeed::of_totals(&machine.host, &host, card_budget.is_some(), 0)
-                .bytes(),
-        );
+    host.headroom_bytes =
+        workstation::HostNeed::of_totals(&machine.host, &host, card_budget.is_some(), 0)
+            .headroom(workstation::HostNeed::machine_room(&machine.host));
     Plan {
         model,
         machine,
@@ -3415,6 +3405,35 @@ fn totals<'a>(
 }
 
 impl Plan<'_> {
+    /// The room a plan with the host room `room` is made at, which this
+    /// plan then names ([`HostTotals::room`]): the one caller of
+    /// [`workstation::plan_room`] for a plan's tiers, and the one place a
+    /// stated room reaches the plan's host headroom before a tier reads it.
+    ///
+    /// A [`workstation::HostRead::Given`] room is the caller's statement of
+    /// the host's room, so the plan's headroom is the tighter of it and the
+    /// machine's figure ([`workstation::HostNeed::machine_room`]) past the
+    /// plan's host terms ([`workstation::HostNeed::headroom`]), the same term
+    /// a split plan takes ([`expert_nvme_tier`]) — a churn pool beside a
+    /// plan that fits the room and not the pool is then refused by name
+    /// ([`churn::OverHost`]), not by the load's host check. A stated room
+    /// past the figure leaves the figure, which holds the plan whatever the
+    /// room ([`Plan::violations`]). A room that was read leaves the
+    /// headroom as it is, the machine's figure: a reading moves between a
+    /// plan and its load and is held at the load
+    /// ([`workstation::HostNeed::check`]). Naming a room again recomputes
+    /// the headroom from the plan's terms.
+    pub fn plan_at(&mut self, room: &(u64, workstation::HostRead)) -> u64 {
+        let planned = workstation::plan_room(room);
+        self.host.room = Some((room.0, planned));
+        if room.1 == workstation::HostRead::Given {
+            let figure = workstation::HostNeed::machine_room(&self.machine.host);
+            self.host.headroom_bytes =
+                workstation::HostNeed::of(self, 0).headroom(planned.min(figure));
+        }
+        planned
+    }
+
     /// The usable bytes `card` planned with: its own, capped by the device's
     /// free bytes at plan time and by the plan's card budget
     /// ([`capped`]'s one cap).

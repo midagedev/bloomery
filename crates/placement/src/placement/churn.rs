@@ -161,6 +161,7 @@ fn beside_text(beside: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placement::workstation::{HostNeed, HostRead};
     use crate::placement::{Host, HostTotals, Machine, ModelTensors};
 
     /// A plan whose host leaves `headroom` bytes, and nothing else: the
@@ -241,5 +242,65 @@ mod tests {
             .expect_err("the pool past it")
             .to_string();
         assert!(!text.contains("held"), "{text}");
+    }
+
+    /// A room the caller states binds an unsplit plan's host headroom, the
+    /// tighter of it and the machine's figure less the plan's host need: the
+    /// need fits a stated room and the pool beside it does not, so the pool
+    /// is refused by name with the room's headroom. A room that was read
+    /// leaves the machine's figure, and so does a stated room past it.
+    #[test]
+    fn a_stated_room_binds_an_unsplit_plans_headroom() {
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 1,
+            experts: 8,
+            experts_used: 2,
+        };
+        // The machine's figure is 1000 B and the plan's host terms 300 B:
+        // 700 B of headroom with no room named.
+        let machine = Machine {
+            cards: Vec::new(),
+            tiers: Vec::new(),
+            host: Host {
+                usable_bytes: 1000,
+                reserves: Vec::new(),
+            },
+            unified: None,
+        };
+        let pool = ChurnPool {
+            pinned: 0,
+            runs: Vec::new(),
+            experts: 10,
+            bytes: 100,
+        };
+        let made_at = |room: (u64, HostRead)| {
+            let mut plan = with_headroom(&model, &machine, 0);
+            plan.host.expert_bytes = 300;
+            plan.host.headroom_bytes = i128::from(HostNeed::machine_room(&machine.host))
+                - i128::from(HostNeed::of(&plan, 0).bytes());
+            plan.plan_at(&room);
+            plan
+        };
+        // A stated room of 350 B leaves 50 B past the need: 100 B of pool
+        // does not fit, and the refusal names the 50 B.
+        let stated = made_at((350, HostRead::Given));
+        let text = pool
+            .check(&stated)
+            .expect_err("the pool past the stated room's headroom")
+            .to_string();
+        assert!(text.contains("leaves the host 50 B"), "{text}");
+        assert_eq!(made_at((400, HostRead::Given)).host.headroom_bytes, 100);
+        assert_eq!(
+            pool.check(&made_at((400, HostRead::Given))).expect("fits"),
+            0
+        );
+        assert!(pool.check(&made_at((399, HostRead::Given))).is_err());
+        // A read room, and a stated one past the machine's figure, leave it.
+        for room in [(350, HostRead::MemAvailable), (u64::MAX, HostRead::Given)] {
+            let plan = made_at(room);
+            assert_eq!(plan.host.headroom_bytes, 700);
+            assert_eq!(pool.check(&plan).expect("the machine's figure"), 600);
+        }
     }
 }

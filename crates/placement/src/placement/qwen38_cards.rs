@@ -1137,14 +1137,14 @@ fn a_plan_names_the_room_it_was_made_at() {
     let mut plan = plan_given(&q4, &gate, 4096, 1, PLAN_ROOM, None).expect("the plan");
     assert_eq!(plan.host.room, None);
     assert_eq!(plan.host.room_clause(), "");
-    let planned = plan.host.plan_at(&(READ, HostRead::MemAvailable));
+    let planned = plan.plan_at(&(READ, HostRead::MemAvailable));
     assert_eq!(planned, READ - HOST_DRIFT);
     assert_eq!(plan.host.room, Some((READ, planned)));
     assert_eq!(
         plan.host.room_clause(),
         format!("; the plan was made at a reading of {READ} B (plan room {planned} B)")
     );
-    let given = plan.host.plan_at(&(READ, HostRead::Given));
+    let given = plan.plan_at(&(READ, HostRead::Given));
     assert_eq!(plan.host.room, Some((READ, given)));
     assert_eq!(given, READ);
 }

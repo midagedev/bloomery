@@ -613,7 +613,7 @@ impl PlanInputs {
         if let Some(t) = plan.cards.first_mut() {
             t.grow_kv(beside);
         }
-        let room = plan.host.plan_at(&self.room);
+        let room = plan.plan_at(&self.room);
         placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         // The front stays beside the plan's terms (`refuse_front` holds it to
         // the card), so a unified pool counts it beside them.
@@ -953,7 +953,7 @@ impl PlanInputs {
         // The draft layer's routed experts are the host's beside the trunk's,
         // a plan of their own: the trunk splits at the room they leave.
         let draft_host = draft.host.expert_bytes;
-        let planned_at = plan.host.plan_at(&self.room);
+        let planned_at = plan.plan_at(&self.room);
         let room = planned_at.checked_sub(draft_host).ok_or_else(|| {
             PlacementError::HostRoom(format!(
                 "the NextN layer's routed experts, {draft_host} B, pass the host room {planned_at} B"
@@ -965,7 +965,7 @@ impl PlanInputs {
         let limit = usable.saturating_sub(card.margin_bytes);
         // A split plan's headroom is what the room it ran at left, and that
         // room lost the draft's experts already; an unsplit plan's is the
-        // machine's figure, which has not.
+        // machine's figure or a stated room's, which have not.
         let host_headroom = if plan.host.nvme_expert_bytes > 0 {
             plan.host.headroom_bytes
         } else {

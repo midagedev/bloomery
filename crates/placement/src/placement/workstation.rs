@@ -637,6 +637,16 @@ impl HostNeed {
             .saturating_sub(self.os)
     }
 
+    /// What `room` leaves past [`HostNeed::plan_bytes`]: the plan's host
+    /// headroom, the one budget a churn pool beside the plan must fit. The
+    /// one definition — a plan at the machine's figure
+    /// ([`HostNeed::machine_room`]), at a stated room ([`Plan::plan_at`]) and
+    /// at the room a split read (`expert_nvme_tier`) all take it.
+    #[must_use]
+    pub fn headroom(&self, room: u64) -> i128 {
+        i128::from(room) - i128::from(self.plan_bytes())
+    }
+
     /// `available` bytes (the host's reading, [`host_room`]'s) cover the
     /// need, or the refusal that names both, each term and what lowers the
     /// need.

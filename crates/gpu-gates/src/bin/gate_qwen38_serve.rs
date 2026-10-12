@@ -354,14 +354,15 @@
 //!   the residency unset. The first stops at `--plan` under a room no plan
 //!   needs: its `cache` line gives the plan's host need, its `residency host`
 //!   record the pool at P 0 (hosted, pinned 0) and the plan's host
-//!   headroom. The host headroom of a plan whose need the room holds is the
-//!   machine's, not the room's, so the room cannot be read off it; the
-//!   unset rule reads the available bytes past the need too
-//!   (`BLOOMERY_HOST_ROOM` replaces the reading), and that is the term the
-//!   room sets. The second server runs under the room `need + pool / 2`,
+//!   headroom, the machine's there (the room asked is past its figure). A
+//!   stated room binds the headroom of a plan whose need it holds
+//!   (`Plan::plan_at`: the tighter of the room and the machine's figure, past
+//!   the need), and the unset rule reads the available bytes past the need
+//!   too (`BLOOMERY_HOST_ROOM` replaces the reading): both budgets are what
+//!   the room sets. The second server runs under the room `need + pool / 2`,
 //!   loads, and answers one greedy request of [`CHURN_PREDICT`] ids:
 //!   the `residency unset` record's why is `bloomery_levers::PoolUnhosted`'s
-//!   sentence at the pool, the plan's headroom and half the pool left
+//!   sentence at the pool and half the pool left in both budgets
 //!   (`churn_unhosted_why_names_the_pool_not_hosted`); the `residency host`
 //!   record reads `hosted=unhosted` at `pinned=0` with a pool that is not
 //!   empty (`churn_unhosted_host_record_keeps_p0_unhosted`); the request is
@@ -374,9 +375,10 @@
 //!   climb prints the climb's why (`p0→p<q> (host: the churn pool did not
 //!   fit, raised)`) and a `residency host` record `hosted=hosted` at a P
 //!   above 0, red on the first two; a seat that hands the load `Hosted`
-//!   beside an unhosted pick counts the pool in the load's host need, and the
-//!   load's refusal (`the host has <room> B available … this load needs by
-//!   <pool / 2> B … + residency churn pool <pool> B`) ends the server before
+//!   beside an unhosted pick holds the pool against the plan's headroom, and
+//!   the pool's refusal (`residency pinning 0 experts a layer: the churn
+//!   pool's <n> experts take <pool> B of host RAM, and the plan leaves the
+//!   host <pool / 2> B`, `ChurnPool::check_beside`) ends the server before
 //!   it listens, red on the last two.
 //!
 //! Held by another test, and not run here:
@@ -2564,7 +2566,9 @@ mod gate {
     struct ChurnRoom {
         /// The plan's host need (`HostNeed::bytes`), the `cache` line's.
         need: u64,
-        /// The plan's host headroom, the `residency host` record's.
+        /// The plan's host headroom at the plan-only room, the `residency
+        /// host` record's: the machine's figure less the need, that room
+        /// being past the figure.
         headroom: i64,
         /// The pool's bytes at P 0.
         churn: u64,
@@ -2573,10 +2577,18 @@ mod gate {
     impl ChurnRoom {
         /// The room that holds the plan's need and half the pool: the
         /// unset rule reads the host's available bytes past the need
-        /// (`BLOOMERY_HOST_ROOM` replaces that reading), so the pool finds
-        /// half of what it takes, whatever the file and the card.
+        /// (`BLOOMERY_HOST_ROOM` replaces that reading) and the plan's
+        /// headroom takes the room too, so the pool finds half of what it
+        /// takes, whatever the file and the card.
         fn room(&self) -> u64 {
             self.need + self.churn / 2
+        }
+
+        /// The plan's host headroom under [`ChurnRoom::room`]: the tighter
+        /// of the machine's, read off the plan-only run, and what the room
+        /// leaves past the need (`Plan::plan_at`).
+        fn headroom_under_room(&self) -> i128 {
+            i128::from(self.headroom).min(i128::from(self.room() - self.need))
         }
     }
 
@@ -2701,9 +2713,12 @@ mod gate {
         let asked = room.room();
         println!(
             "churn-unhosted: room asked {CHURN_PLAN_ROOM} B; the plan's host need {} B, host \
-             headroom {} B (the machine's, which a room that holds the need leaves as it is), \
-             churn pool at P 0 {} B; derived room {asked} B = need + pool / 2",
-            room.need, room.headroom, room.churn
+             headroom {} B (the machine's: that room is past its figure), churn pool at P 0 \
+             {} B; derived room {asked} B = need + pool / 2, host headroom there {} B",
+            room.need,
+            room.headroom,
+            room.churn,
+            room.headroom_under_room()
         );
         let own = dir.join("churn-unhosted");
         std::fs::create_dir_all(&own)?;
@@ -2740,14 +2755,15 @@ mod gate {
         let text = std::fs::read_to_string(&err_log)?;
         let log = seat_log(&err_log)?;
         // The why is the sentence of a pool that needs the plan-only run's
-        // pool, with the plan's headroom, and finds half of it past the need.
+        // pool and finds half of it past the need in both budgets: the plan's
+        // headroom under the derived room, and the available bytes.
         let why = log
             .first(&record::RESIDENCY_UNSET)?
             .map(|u| u.text("why").map(str::to_owned))
             .transpose()?;
         let want = bloomery_levers::PoolUnhosted {
             needs: room.churn,
-            headroom: i128::from(room.headroom),
+            headroom: room.headroom_under_room(),
             mem_left: i128::from(room.churn / 2),
         }
         .to_string();
