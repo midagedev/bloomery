@@ -78,10 +78,12 @@ impl ChatTemplate {
         // jinja2's lexer: every newline is `\n`, and one trailing newline is
         // not output (`keep_trailing_newline` off).
         let text = source.replace("\r\n", "\n").replace('\r', "\n");
-        let segs = segment(text.strip_suffix('\n').unwrap_or(&text))?;
+        let (segs, starts) = segment(text.strip_suffix('\n').unwrap_or(&text))?;
         let mut p = NodeParser {
             segs,
+            starts,
             at: 0,
+            depth: 0,
             loops: 0,
             in_macro: false,
         };
@@ -139,6 +141,8 @@ enum Seg {
 
 struct Piece {
     seg: Seg,
+    /// Where the piece starts in the source.
+    start: usize,
     /// A tag: `{%-`/`{{-` trims all whitespace before it.
     trim_left: bool,
     /// A block tag under `lstrip_blocks`: spaces and tabs back to the line start go.
@@ -150,11 +154,13 @@ struct Piece {
     is_tag: bool,
 }
 
-/// Splits the source into text and tags and applies whitespace control.
-fn segment(src: &str) -> Result<Vec<Seg>, TemplateError> {
+/// Splits the source into text and tags and applies whitespace control. Returns the segments and
+/// the byte offset at which each starts.
+fn segment(src: &str) -> Result<(Vec<Seg>, Vec<usize>), TemplateError> {
     let mut raw: Vec<Piece> = Vec::new();
-    let text = |t: &str| Piece {
+    let text = |t: &str, start: usize| Piece {
         seg: Seg::Text(t.to_owned()),
+        start,
         trim_left: false,
         lstrip: false,
         trim_right: false,
@@ -169,11 +175,11 @@ fn segment(src: &str) -> Result<Vec<Seg>, TemplateError> {
             .filter_map(|&(o, c)| src[i..].find(o).map(|at| (i + at, o, c)))
             .min_by_key(|t| t.0);
         let Some((at, o, c)) = open else {
-            raw.push(text(&src[i..]));
+            raw.push(text(&src[i..], i));
             break;
         };
         if at > i {
-            raw.push(text(&src[i..at]));
+            raw.push(text(&src[i..at], i));
         }
         let mut j = at + 2;
         let trim_left = b.get(j) == Some(&b'-');
@@ -196,6 +202,7 @@ fn segment(src: &str) -> Result<Vec<Seg>, TemplateError> {
         };
         raw.push(Piece {
             seg,
+            start: at,
             trim_left,
             lstrip: block && !keep_left,
             trim_right,
@@ -240,7 +247,7 @@ fn segment(src: &str) -> Result<Vec<Seg>, TemplateError> {
             }
         }
     }
-    Ok(raw.into_iter().map(|p| p.seg).collect())
+    Ok(raw.into_iter().map(|p| (p.seg, p.start)).unzip())
 }
 
 /// Python's `str.isspace`: Rust's `White_Space` and the four separators
@@ -354,9 +361,19 @@ enum BinOp {
     NotIn,
 }
 
+/// The deepest nesting the parser descends: template blocks, and apart from them one tag's
+/// expression, each counting its outermost level. A template past it is an error, not a stack
+/// overflow. 64 is 16x the deepest expression (4) and 6x the deepest blocks (11) of the repo's
+/// templates, and 1/32 of the 2050 levels at which a release build overflows 8 MiB (4.1 KB a level).
+const MAX_NESTING: usize = 64;
+
 struct NodeParser {
     segs: Vec<Seg>,
+    /// The byte offset in the source at which each segment starts.
+    starts: Vec<usize>,
     at: usize,
+    /// The [`NodeParser::block`] calls in progress.
+    depth: usize,
     /// `for` bodies around the tag being parsed, counted inside the
     /// innermost macro body (a `break` there cannot leave the macro).
     loops: usize,
@@ -365,8 +382,22 @@ struct NodeParser {
 }
 
 impl NodeParser {
-    /// Parses nodes until one of `ends` (a statement keyword) or the end.
+    /// Parses nodes until one of `ends` (a statement keyword) or the end. Every nesting of
+    /// statements (`if`, `for`, `macro` bodies) descends through here, under [`MAX_NESTING`].
     fn block(&mut self, ends: &[&str]) -> Result<(Vec<Node>, Option<String>), TemplateError> {
+        if self.depth == MAX_NESTING {
+            let at = self.starts[self.at.saturating_sub(1)];
+            return err(format!(
+                "template nesting deeper than {MAX_NESTING} at byte {at}"
+            ));
+        }
+        self.depth += 1;
+        let r = self.nodes(ends);
+        self.depth -= 1;
+        r
+    }
+
+    fn nodes(&mut self, ends: &[&str]) -> Result<(Vec<Node>, Option<String>), TemplateError> {
         let mut nodes = Vec::new();
         while self.at < self.segs.len() {
             let seg = std::mem::replace(&mut self.segs[self.at], Seg::Text(String::new()));
@@ -551,10 +582,14 @@ const OPS: [&str; 24] = [
 
 struct Lexer {
     toks: Vec<Tok>,
+    /// The byte offset in the source of each token, then the source's length.
+    offs: Vec<usize>,
     at: usize,
     /// The next primary is the right side of `in`/`not in`, the one place a
     /// tuple literal is read (as a list).
     tuple_in: bool,
+    /// The [`Lexer::nested`] steps in progress.
+    depth: usize,
 }
 
 /// One escape of a string literal after its backslash (`cs[at]` onwards), as
@@ -639,10 +674,16 @@ fn string_escape(cs: &[char], at: usize, s: &mut String) -> Result<usize, String
 impl Lexer {
     fn new(src: &str) -> Result<Self, TemplateError> {
         let mut toks = Vec::new();
+        let mut offs = Vec::new();
         let cs: Vec<char> = src.chars().collect();
+        let byte_at: Vec<usize> = src
+            .char_indices()
+            .map(|(b, _)| b)
+            .chain([src.len()])
+            .collect();
         let mut i = 0;
         while i < cs.len() {
-            let c = cs[i];
+            let (c, start, before) = (cs[i], i, toks.len());
             if py_space(c) {
                 i += 1;
             } else if c == '\'' || c == '"' {
@@ -665,7 +706,6 @@ impl Lexer {
                 }
                 toks.push(Tok::Str(s));
             } else if c.is_ascii_digit() {
-                let start = i;
                 while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '_') {
                     i += 1;
                 }
@@ -689,7 +729,6 @@ impl Lexer {
                     )
                 });
             } else if c.is_alphabetic() || c == '_' {
-                let start = i;
                 while i < cs.len() && (cs[i].is_alphanumeric() || cs[i] == '_') {
                     i += 1;
                 }
@@ -702,12 +741,37 @@ impl Lexer {
                 toks.push(Tok::Op(op));
                 i += op.chars().count();
             }
+            if toks.len() > before {
+                offs.push(byte_at[start]);
+            }
         }
+        offs.push(src.len());
         Ok(Lexer {
             toks,
+            offs,
             at: 0,
             tuple_in: false,
+            depth: 0,
         })
+    }
+
+    /// One step of the descent into a nested expression, under [`MAX_NESTING`]. Every cycle of the
+    /// grammar enters through this: `expr` (parentheses, brackets, braces, call and subscript
+    /// arguments, the `else` branch), `not` and unary `-`.
+    fn nested<T>(
+        &mut self,
+        step: impl FnOnce(&mut Self) -> Result<T, TemplateError>,
+    ) -> Result<T, TemplateError> {
+        if self.depth == MAX_NESTING {
+            let at = self.offs[self.at.min(self.toks.len())];
+            return err(format!(
+                "template nesting deeper than {MAX_NESTING} at byte {at} of the expression"
+            ));
+        }
+        self.depth += 1;
+        let r = step(self);
+        self.depth -= 1;
+        r
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -762,6 +826,10 @@ impl Lexer {
     }
 
     fn expr(&mut self) -> Result<Expr, TemplateError> {
+        self.nested(Self::conditional)
+    }
+
+    fn conditional(&mut self) -> Result<Expr, TemplateError> {
         let e = self.or()?;
         if self.eat_name("if") {
             let cond = self.or()?;
@@ -793,7 +861,7 @@ impl Lexer {
 
     fn not(&mut self) -> Result<Expr, TemplateError> {
         if self.eat_name("not") {
-            return Ok(Expr::Not(Box::new(self.not()?)));
+            return Ok(Expr::Not(Box::new(self.nested(Self::not)?)));
         }
         self.compare()
     }
@@ -868,7 +936,7 @@ impl Lexer {
 
     fn unary(&mut self) -> Result<Expr, TemplateError> {
         if self.eat_op("-") {
-            return Ok(Expr::Neg(Box::new(self.unary()?)));
+            return Ok(Expr::Neg(Box::new(self.nested(Self::unary)?)));
         }
         let mut e = self.postfix()?;
         loop {
@@ -3017,6 +3085,100 @@ mod tests {
             let e = render_err(src, json!({}));
             assert!(e.contains(want), "{src}: {e}");
         }
+    }
+
+    /// Parses on a thread with a fixed 2 MiB stack, the least a spawned thread gets by default,
+    /// so the result does not depend on the test harness's stack.
+    fn parse_on_small_stack(src: String) -> Result<(), String> {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                ChatTemplate::parse(&src)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+            .expect("spawns")
+            .join()
+            .expect("the parse returns")
+    }
+
+    /// A template nested past `MAX_NESTING` is a named error with its byte offset, never a stack
+    /// overflow. 2037 levels is where a release build overflowed an 8 MiB stack; each shape is
+    /// one way the parser recurses.
+    #[test]
+    fn nesting_past_the_limit_is_a_named_error() {
+        let n = 2037;
+        for (name, src) in [
+            (
+                "parentheses",
+                format!("{{{{ {}e{} }}}}", "(".repeat(n), ")".repeat(n)),
+            ),
+            (
+                "brackets",
+                format!("{{{{ {}e{} }}}}", "[".repeat(n), "]".repeat(n)),
+            ),
+            (
+                "braces",
+                format!("{{{{ {}e{} }}}}", "{0:".repeat(n), "}".repeat(n)),
+            ),
+            (
+                "call arguments",
+                format!("{{{{ {}e{} }}}}", "f(".repeat(n), ")".repeat(n)),
+            ),
+            (
+                "subscripts",
+                format!("{{{{ {}e{} }}}}", "a[".repeat(n), "]".repeat(n)),
+            ),
+            ("not", format!("{{{{ {}e }}}}", "not ".repeat(n))),
+            ("minus", format!("{{{{ {}e }}}}", "-".repeat(n))),
+            (
+                "else branches",
+                format!("{{{{ {}c }}}}", "a if b else ".repeat(n)),
+            ),
+            (
+                "if blocks",
+                format!("{}x{}", "{% if a %}".repeat(n), "{% endif %}".repeat(n)),
+            ),
+            (
+                "for blocks",
+                format!(
+                    "{}x{}",
+                    "{% for a in b %}".repeat(n),
+                    "{% endfor %}".repeat(n)
+                ),
+            ),
+        ] {
+            let e = parse_on_small_stack(src).expect_err(name);
+            assert!(
+                e.starts_with("chat template: template nesting deeper than 64 at byte "),
+                "{name}: {e}"
+            );
+        }
+    }
+
+    /// The limit is exact, counts bytes where a multibyte character comes first, and a template
+    /// at the limit still parses: 64 levels of expression (the tag's own included) and 64 of
+    /// blocks (the top level included).
+    #[test]
+    fn nesting_limit_is_64_levels_and_offsets_are_bytes() {
+        let parens = |k: usize| format!("{{{{ {}e{} }}}}", "(".repeat(k), ")".repeat(k));
+        parse_on_small_stack(parens(63)).expect("64 levels parse");
+        assert_eq!(
+            parse_on_small_stack(parens(64)).expect_err("65 levels"),
+            "chat template: template nesting deeper than 64 at byte 64 of the expression"
+        );
+        let ifs = |k: usize| format!("{}x{}", "{% if a %}".repeat(k), "{% endif %}".repeat(k));
+        parse_on_small_stack(ifs(63)).expect("64 blocks parse");
+        assert_eq!(
+            parse_on_small_stack(ifs(64)).expect_err("65 blocks"),
+            "chat template: template nesting deeper than 64 at byte 630"
+        );
+        // `'é' ~ ` is 7 bytes and 6 characters: the 65th level opens at the `e`.
+        let after_multibyte = format!("{{{{ 'é' ~ {}e{} }}}}", "(".repeat(64), ")".repeat(64));
+        assert_eq!(
+            parse_on_small_stack(after_multibyte).expect_err("65 levels"),
+            "chat template: template nesting deeper than 64 at byte 71 of the expression"
+        );
     }
 
     /// `capitalize`, `tojson(ensure_ascii=...)` and string subscripts as
