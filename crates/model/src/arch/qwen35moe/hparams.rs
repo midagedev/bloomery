@@ -158,6 +158,8 @@ pub struct Hparams {
     pub rope_dims: usize,
     /// `rope.dimension_sections`: pairs per position axis.
     pub rope_sections: [u32; 4],
+    /// `rope.section_order`: which position slot each of the sections reads on an image row.
+    pub rope_order: SectionOrder,
     /// `rope.freq_base`.
     pub rope_base: f32,
     /// `attention.layer_norm_rms_epsilon`.
@@ -268,6 +270,7 @@ impl Hparams {
             ));
         }
         let rope_sections = sections(split)?;
+        let rope_order = section_order(split)?;
         let conv = positive(split, "ssm.conv_kernel")?;
         let state = meta_usize(split, "ssm.state_size")?;
         let v_heads = meta_usize(split, "ssm.time_step_rank")?;
@@ -349,6 +352,7 @@ impl Hparams {
             head_dim,
             rope_dims,
             rope_sections,
+            rope_order,
             rope_base: meta_f32(split, "rope.freq_base")?,
             rms_eps: meta_f32(split, "attention.layer_norm_rms_epsilon")?,
             n_vocab,
@@ -864,6 +868,36 @@ pub(super) fn sections(split: &Split) -> Result<[u32; 4], PlacementError> {
     Ok(out)
 }
 
+/// How `rope.section_order` maps the four position slots `[t, h, w, z]` onto the rope sections of
+/// an image row (llama.cpp's `llama_rope_section_order`); a text row reads them in order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SectionOrder {
+    /// Section `i` reads slot `i`: Qwen3.6, Qwen3.8, and a file without the key.
+    #[default]
+    Tyxz,
+    /// Section 0 reads `z` and section 3 reads `t`: MiniCPM-V 4.7.
+    Zyxt,
+}
+
+/// `rope.section_order`, optional (`src/llama-model.cpp:1473`, default `tyxz`): `tyxz` or `zyxt`;
+/// any other value, or one that is not a string, is refused by name.
+pub(super) fn section_order(split: &Split) -> Result<SectionOrder, PlacementError> {
+    let key = "rope.section_order";
+    let Some(v) = split.value(&split.arch_key(key)) else {
+        return Ok(SectionOrder::Tyxz);
+    };
+    match v.as_str() {
+        Some("tyxz") => Ok(SectionOrder::Tyxz),
+        Some("zyxt") => Ok(SectionOrder::Zyxt),
+        Some(other) => Err(metadata(
+            split,
+            key,
+            format!("is \"{other}\"; the engine runs \"tyxz\" and \"zyxt\""),
+        )),
+        None => Err(metadata(split, key, "is not a string")),
+    }
+}
+
 /// Every trunk layer's kind from its tensors, cross-checked with the key that
 /// also says it: `attention.recurrent_layers` when the file carries it (an
 /// array of the trunk's or the file's layers, [`covers_trunk`]), else every
@@ -993,7 +1027,7 @@ pub(super) fn refuse_unless(
 pub(super) mod tests {
     use super::{
         ATTN_STEMS, EXP_LAYER_STEMS, EXP_MODEL_TENSORS, FfnKind, GDN_STEMS, Hparams, Kind,
-        NORM_STEMS, PLE_STEMS, Ple, Variant,
+        NORM_STEMS, PLE_STEMS, Ple, SectionOrder, Variant,
     };
     use crate::arch::synthetic::{V, header_shaped};
     use crate::arch::{coverage, qwen35moe::roles};
@@ -1125,6 +1159,44 @@ pub(super) mod tests {
         );
         // The router's three constants and the absent `nextn_predict_layers`.
         assert_eq!(hp.defaults.len(), 4, "{:?}", hp.defaults);
+    }
+
+    /// `rope.section_order` is a typed value beside `rope.dimension_sections`: absent is `tyxz`
+    /// (the loader's default), `zyxt` is MiniCPM-V 4.7's, and any other string, or a value that
+    /// is not a string, is refused by the key's name.
+    #[test]
+    fn the_rope_section_order_is_typed() {
+        let with_order = |v: Option<V>| {
+            let mut kv = keys();
+            kv.extend(v.map(|v| ("rope.section_order", v)));
+            read("q4x-order", "qwen4exp", &kv, &tensors())
+        };
+        assert_eq!(
+            with_order(None).expect("absent").rope_order,
+            SectionOrder::Tyxz
+        );
+        assert_eq!(
+            with_order(Some(V::Str("tyxz"))).expect("tyxz").rope_order,
+            SectionOrder::Tyxz
+        );
+        assert_eq!(
+            with_order(Some(V::Str("zyxt"))).expect("zyxt").rope_order,
+            SectionOrder::Zyxt
+        );
+        for (v, want) in [
+            (
+                V::Str("xyzt"),
+                "qwen4exp.rope.section_order: is \"xyzt\"; the engine runs",
+            ),
+            (
+                V::Str(""),
+                "qwen4exp.rope.section_order: is \"\"; the engine runs",
+            ),
+            (V::U32(1), "qwen4exp.rope.section_order: is not a string"),
+        ] {
+            let err = with_order(Some(v)).expect_err("refused");
+            assert!(err.contains(want), "want {want:?} in: {err}");
+        }
     }
 
     #[test]

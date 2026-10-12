@@ -100,7 +100,7 @@ mod gate {
     use refset::family::Family;
     use runtime::swaprule::KeptRows;
     use std::path::Path;
-    use vision::mrope::MropeSeq;
+    use vision::mrope::{MropeSeq, SectionOrder};
 
     /// The rotation table's values a row and the sets' cache rows; the text width is the seat's.
     const ROT: usize = 64;
@@ -668,7 +668,7 @@ mod gate {
         );
         let mut full = vec![0.0f32; CTX * ROT];
         saved
-            .rows_into(plain, ROT, SECTIONS, 0..CTX, &mut full)
+            .rows_into(plain, ROT, SECTIONS, SectionOrder::Tyxz, 0..CTX, &mut full)
             .map_err(|e| e.to_string())?;
         let ok_s1 = equal(
             &format!("S1 {}: the card table vs the host rebuild", c.name),

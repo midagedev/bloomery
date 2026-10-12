@@ -269,6 +269,7 @@ fn shape(e: vision::mrope::MropeError) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vision::mrope::SectionOrder;
 
     const SECTIONS: [u32; 4] = [11, 11, 10, 0];
     const ROT: usize = 64;
@@ -332,7 +333,7 @@ mod tests {
             seq.push(at, nx, ny).expect("push");
         }
         let mut full = vec![0.0; CTX * ROT];
-        seq.rows_into(base, ROT, SECTIONS, 0..CTX, &mut full)
+        seq.rows_into(base, ROT, SECTIONS, SectionOrder::Tyxz, 0..CTX, &mut full)
             .expect("the full rebuild");
         let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
         let bad =
