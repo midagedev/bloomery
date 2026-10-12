@@ -64,10 +64,9 @@ use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
-use model::arch::glm5next::place::{
-    TIER_CHUNK, card_leg_bytes, card_routed, card_tile_bytes, card_tiles_run,
-};
+use model::arch::glm5next::place::{TIER_CHUNK, card_leg_bytes, card_tile_bytes, card_tiles_run};
 use model::arch::names::routed_stacks;
+use model::placement::accepts::{self, Program};
 use models::{Ffn, LayerSpec};
 
 use crate::body::{Parts, f32t, f32v};
@@ -119,8 +118,9 @@ const fn leg_shape(n_embd: usize, ff: usize) -> LegShape {
 /// one-token buffers every card layer's shadow writes (a verify's or a pass's
 /// row reads its own card sum in its back, after the other rows' shadows). Made at load, after the weights,
 /// from the stacks they hold; a layer the map puts experts on holds its three
-/// stacks in a format [`card_routed`] names, at `n_card` experts each, and a
-/// layer it puts none on holds none — anything else is refused by name.
+/// stacks, each of a type the card leg's arms run ([`accepts::leg_arms`]), at
+/// `n_card` experts each, and a layer it puts none on holds none — anything
+/// else is refused by name.
 pub(crate) struct CardExperts {
     /// The card leg a step's card slots run on.
     leg: CardLeg,
@@ -209,8 +209,8 @@ impl CardExperts {
                 });
             };
             let models::Act::SwiGlu { limit } = m.act;
-            // The family's type rule ([`card_routed`]); a prompt batch runs a layer the tiles
-            // do not on the card leg.
+            // The card leg's arms ([`accepts::leg_arms`]); a prompt batch runs
+            // a layer the tiles do not on the card leg.
             let st = CardStacks::of(w, l)?;
             prompt_leg |= !card_tiles_run(st.gate.ty, st.down.ty);
             let layer = CardLayer {
@@ -329,8 +329,9 @@ pub(crate) struct Stack<'w> {
     pub(crate) w: &'w DeviceTensor<u32>,
 }
 
-/// A layer's three resident routed stacks, each in a format [`card_routed`]
-/// names and the gate and up of one type.
+/// A layer's three resident routed stacks: the gate and up of one type the
+/// card leg's gate·up arm runs, the down of a type its down arm runs
+/// ([`accepts::leg_arms`]).
 pub(crate) struct CardStacks<'w> {
     pub(crate) gate: Stack<'w>,
     pub(crate) up: Stack<'w>,
@@ -339,17 +340,26 @@ pub(crate) struct CardStacks<'w> {
 
 impl<'w> CardStacks<'w> {
     pub(crate) fn of(w: &'w Weights, l: usize) -> Result<CardStacks<'w>, GpuError> {
-        let [gate, up, down] = routed_stacks(l).map(|name| match w.get(&name) {
-            Some(DevWeight::KQuant { ty, w, .. }) if card_routed(*ty).is_some() => {
-                Ok(Stack { name, ty: *ty, w })
-            }
+        const GATE_UP: &str = "a resident routed gate or up stack of a type the card leg's \
+                                gate·up arm runs (`placement::accepts::leg_arms`)";
+        const DOWN: &str = "a resident routed down stack of a type the card leg's down arm \
+                            runs (`placement::accepts::leg_arms`)";
+        let arms = accepts::leg_arms(Program::Glm5nextBody).ok_or_else(|| GpuError::Shape {
+            what: CARD,
+            detail: format!("{:?} runs no card leg", Program::Glm5nextBody),
+        })?;
+        let of = |name: String, arm: fn(GgmlType) -> bool, need: &'static str| match w.get(&name) {
+            Some(DevWeight::KQuant { ty, w, .. }) if arm(*ty) => Ok(Stack { name, ty: *ty, w }),
             _ => Err(GpuError::Tensor {
                 what: CARD,
                 name,
-                need: "a resident routed stack of a type the card experts read (`card_routed`)",
+                need,
             }),
-        });
-        let (gate, up, down) = (gate?, up?, down?);
+        };
+        let [g, u, d] = routed_stacks(l);
+        let gate = of(g, arms.gate_up, GATE_UP)?;
+        let up = of(u, arms.gate_up, GATE_UP)?;
+        let down = of(d, arms.down, DOWN)?;
         if up.ty != gate.ty {
             return Err(GpuError::Tensor {
                 what: CARD,
@@ -853,7 +863,8 @@ fn card_leg_rows(
     Ok(())
 }
 
-/// A stack whose type [`card_routed`] names but no launch here runs.
+/// A stack whose type the card leg's arms ([`accepts::leg_arms`]) run but no
+/// launch here runs.
 pub(crate) fn unrun(st: &Stack<'_>) -> GpuError {
     GpuError::Tensor {
         what: CARD,

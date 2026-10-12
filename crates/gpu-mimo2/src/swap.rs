@@ -13,11 +13,10 @@
 //! - No layer is unrouted: [`model::arch::mimo2::place::PlanInputs::read`]
 //!   refuses a file whose next-token layers carry tensors, so the load has
 //!   no draft layer.
-//! - The card leg's types are the kernel table's
-//!   ([`model::arch::mimo2::place::card_routed`], from
-//!   `placement::kernels::card_runs`): a layer takes card slots only when
-//!   every one of its stacks is a type the leg runs, and the leg reads its gate
-//!   and up in one type ([`card_types`]).
+//! - A layer takes card slots by the plan's rule
+//!   (`placement::accepts::routed_rule(Program::Mimo2Body)`); the common leg's
+//!   `LegStacks::of` refuses, by name, a carded layer whose stacks it does not
+//!   run.
 //!
 //! **Parts.** An expert is three parts in stack order: gate and up (`ff` rows
 //! of `n_embd` values each) and down (`n_embd` rows of `ff`), each of its
@@ -29,8 +28,7 @@
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::host::swap_source::{PlanStacks, StackFacts};
-use gguf::GgmlType;
-use model::arch::mimo2::place::{PlanInputs, card_routed};
+use model::arch::mimo2::place::PlanInputs;
 use model::arch::names::routed_stacks;
 use runtime::layer::hosted;
 
@@ -45,27 +43,10 @@ const WHAT: &str = "mimo2::swap::stacks";
 /// several slots' rows ([`MAX_ROWS`]).
 pub const LOAD_ROWS: usize = MAX_ROWS;
 
-/// Layer `l`'s card-leg contract: a layer whose stacks are all types the leg
-/// runs ([`card_routed`]) holds its gate and up in one type (the leg refuses
-/// a pair of two at load); a layer with another type stays on the host.
-fn card_types(l: usize, [gate, up, down]: [GgmlType; 3]) -> Result<(), GpuError> {
-    let carded = [gate, up, down].iter().all(|&ty| card_routed(ty).is_some());
-    if carded && gate != up {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!(
-                "layer {l}'s gate {gate} and up {up}: the card leg runs a gate and an up of one type"
-            ),
-        });
-    }
-    Ok(())
-}
-
 /// The stacks of the layers `inputs` describes, their types read from its
 /// tensors, over MiMo's facts (module doc). Refused by name: a layer that
-/// holds some of its three stacks but not all, a layer [`card_types`]
-/// refuses, and a description whose routed layers are not one run.
-/// Load-time only.
+/// holds some of its three stacks but not all, and a description whose
+/// routed layers are not one run. Load-time only.
 pub fn stacks(inputs: &PlanInputs) -> Result<PlanStacks, GpuError> {
     let run = hosted(&inputs.spec.layers).map_err(|e| GpuError::Shape {
         what: WHAT,
@@ -76,7 +57,7 @@ pub fn stacks(inputs: &PlanInputs) -> Result<PlanStacks, GpuError> {
         StackFacts {
             what: WHAT,
             names: routed_stacks,
-            check: Some(card_types),
+            check: None,
             empty: true,
             map_layers: Some(run.len()),
             unrouted: Vec::new(),

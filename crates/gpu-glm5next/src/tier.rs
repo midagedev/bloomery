@@ -213,7 +213,7 @@ impl GlmTier {
                     detail: format!("layer {l}: tier experts off a routed block"),
                 });
             };
-            // The family's type rule ([`card_routed`]).
+            // The card leg's arms ([`accepts::leg_arms`]).
             CardStacks::of(w, l)?;
             let layer = TierLayer {
                 k,
