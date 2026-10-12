@@ -11,9 +11,10 @@
 #   bash tools/ref/plan-room.sh P C      on the box, the tree's built target/release/generate_ds41 --plan --depth P
 #                                        --place a under BLOOMERY_CED=C (on or off), once at BLOOMERY_HOST_ROOM=R and
 #                                        once at R + 64 GiB, each run's stderr passed through. Both exit 0 with the same
-#                                        stdout bytes: the first run's stdout. Else nothing on stdout and one line on
-#                                        stderr naming P, C, both rooms and the first line that differs, or the run that
-#                                        failed and its exit code.
+#                                        stdout bytes, the plan record's room= and plan_room= words aside (they name the
+#                                        room a plan was made at): the first run's stdout. Else nothing on stdout and
+#                                        one line on stderr naming P, C, both rooms and the first line that differs, or
+#                                        the run that failed and its exit code.
 #
 # R is the `pub const PLAN_ROOM` line of crates/placement/src/placement/workstation.rs, underscores dropped (the crate
 # holds it to HOST_USABLE − OS_OTHER at compile time); this file holds no copy of the number.
@@ -86,6 +87,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 one=$(mktemp "${TMPDIR:-/tmp}/plan-room.XXXXXX")
 two=$(mktemp "${TMPDIR:-/tmp}/plan-room.XXXXXX")
+oneb=$(mktemp "${TMPDIR:-/tmp}/plan-room.XXXXXX")
+twob=$(mktemp "${TMPDIR:-/tmp}/plan-room.XXXXXX")
 
 # plan ROOM OUT: the plan at BLOOMERY_HOST_ROOM=ROOM, its stdout to OUT, its stderr through. A run that fails ends the
 # script: one line naming it and its exit code, exit 1.
@@ -100,13 +103,16 @@ plan() {
 
 plan "$ROOM" "$one"
 plan "$LARGER" "$two"
+# The plan record names the room it was made at, so those two words differ by construction; every other byte counts.
+sed -E 's/ (room|plan_room)=[0-9]+/ \1=ROOM/g' "$one" > "$oneb"
+sed -E 's/ (room|plan_room)=[0-9]+/ \1=ROOM/g' "$two" > "$twob"
 
-if cmp -s "$one" "$two"; then
+if cmp -s "$oneb" "$twob"; then
   cat "$one"
   echo "plan-room.sh: $WHAT: the same $(wc -l < "$one" | tr -d ' ') lines at both rooms" >&2
   exit 0
 fi
-first=$(awk -v a="$one" -v b="$two" -v ra="$ROOM" -v rb="$LARGER" 'BEGIN {
+first=$(awk -v a="$oneb" -v b="$twob" -v ra="$ROOM" -v rb="$LARGER" 'BEGIN {
   for (n = 1; ; n++) {
     ga = (getline la < a) > 0
     gb = (getline lb < b) > 0
