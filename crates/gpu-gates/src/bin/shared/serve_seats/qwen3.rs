@@ -309,6 +309,14 @@ fn encoder_words(encoder: Option<u64>) -> String {
     })
 }
 
+/// The `vision_seat` record of the encoder `--mmproj` seated, nothing without one, so a load
+/// without `--mmproj` prints its lines as it did.
+fn print_seat(vision: Option<&Opened>) {
+    if let Some(v) = vision {
+        vision_seat::seat_record(v).eprint();
+    }
+}
+
 /// A qwen35moe file's `parallel` resident sequences: each takes the
 /// checkpoints the seat's kept prefixes come back to ([`Body3::open`] arms
 /// them), so each pins its own on the host, priced by the body's own
@@ -451,16 +459,17 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
     const ONE_PASS: bool = false;
     /// The model of `file` with a `ctx`-row cache by `load`, decided before
     /// the open at the total its `slots` sequences of that shape split
-    /// ([`decide`]), the `plan` record on stderr first when a plan loads it;
-    /// `planes` is the cache planes' format and whether `--mmproj` gave the load an image input
-    /// ([`open35`]'s `media`), which only a qwen35moe body takes.
+    /// ([`decide`]), the `plan` record on stderr first when a plan loads it, then the encoder's
+    /// `vision_seat` record; `planes` is the cache planes' format and the encoder `--mmproj`
+    /// seated, which gives the load an image input ([`open35`]'s `media`) and which only a
+    /// qwen35moe body takes.
     fn open(
         file: Split,
         ctx: usize,
         slots: usize,
         load: Q3Load,
         levers: &Levers,
-        planes: (KvQ8, bool),
+        planes: (KvQ8, Option<&Opened>),
     ) -> Result<GpuModel<Self>, GateError>;
     /// The load runs its routed experts on the host tier too.
     fn placed(m: &GpuModel<Self>) -> Result<bool, GateError>;
@@ -531,10 +540,10 @@ impl Body3 for Body {
         slots: usize,
         load: Q3Load,
         levers: &Levers,
-        (kv, media): (KvQ8, bool),
+        (kv, vision): (KvQ8, Option<&Opened>),
     ) -> Result<Qwen3moeModel, GateError> {
         // `vision_of` refuses `--mmproj` on this file before anything is planned.
-        if media {
+        if vision.is_some() {
             return Err("a qwen3moe load takes no image input".into());
         }
         let opts = Qwen3moeModel::lever_opts(ctx, kv)?;
@@ -615,11 +624,12 @@ impl Body3 for Body35 {
         slots: usize,
         load: Q3Load,
         levers: &Levers,
-        (kv, media): (KvQ8, bool),
+        (kv, vision): (KvQ8, Option<&Opened>),
     ) -> Result<Qwen35moeModel, GateError> {
-        let o = open35(ctx, kv, media)?;
+        let o = open35(ctx, kv, vision.is_some())?;
         let mut m = match load {
             Q3Load::Whole(card) => {
+                print_seat(vision);
                 Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
             }
             Q3Load::Placed {
@@ -630,6 +640,7 @@ impl Body3 for Body35 {
             } => {
                 let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, why).eprint();
+                print_seat(vision);
                 match whole {
                     Some(card) => {
                         Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
@@ -755,7 +766,7 @@ impl<B: Body3> Q3<B> {
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let mut m = B::open(file, ctx, slots, load, levers, (kv, vision.is_some()))?;
+        let mut m = B::open(file, ctx, slots, load, levers, (kv, vision.as_ref()))?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let placed = B::placed(&m)?;
@@ -979,12 +990,14 @@ enum Q3Load {
 
 impl Q3Load {
     /// The `plan` record a placed load prints before its open
-    /// ([`Body3::open`]); a whole load has none.
-    fn print_plan(&self, levers: &Levers) -> Result<(), GateError> {
+    /// ([`Body3::open`]); a whole load has none. The encoder's `vision_seat` record follows it
+    /// (a whole load's stands alone).
+    fn print_plan(&self, levers: &Levers, vision: Option<&Opened>) -> Result<(), GateError> {
         if let Q3Load::Placed { q, total, why, .. } = self {
             let plan = q.plan(*total, &PlanLevers::from_levers(levers)?)?;
             q.record(&plan, *why).eprint();
         }
+        print_seat(vision);
         Ok(())
     }
 
@@ -1285,7 +1298,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     if a.plan_only {
         // The records the load would print first are out; nothing was
         // opened on a card.
-        load.print_plan(&levers)?;
+        load.print_plan(&levers, vision.as_ref())?;
         std::process::exit(0);
     }
     drop(split);

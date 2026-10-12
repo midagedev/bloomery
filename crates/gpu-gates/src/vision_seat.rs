@@ -35,7 +35,9 @@
 //! * [`span_rows`] — the same on a tower and stream the caller holds ([`span_rows_of`] is its host
 //!   half, which takes the readback as a closure); every tower writes one row of `width` a cell of
 //!   the plan's token grid.
-//! * [`record`] — the `vision` line after the tower's load.
+//! * [`seat_record`] — the `vision_seat` line a seat prints with its plan, before any load (also the
+//!   projector [`kept`] drops, as `seat=not-loaded`); [`record`] — the `vision` line after the
+//!   tower's load.
 
 use std::fmt::Display;
 use std::ops::Range;
@@ -487,7 +489,8 @@ impl Cost {
 /// `vision` as the seat's plan keeps it. A projector the `--hf` repo picked ([`Flags::encoder`])
 /// that sits as a stage-card reserve stays only when it is free: `cost`, the seat's plan with
 /// that encoder and without one, gives the text model the same experts and context. Otherwise it
-/// is dropped by a named line giving its bytes and what it would cost, and the seat serves text.
+/// is dropped by a `vision_seat` record (`seat=not-loaded`) giving its bytes and what it would
+/// cost, and the seat serves text.
 /// An `--mmproj` file, a limit given (both ask for images) and a seat off the plan stay as they
 /// are. A plan that refuses the reserve is a cost; one that refuses without it is the seat's
 /// own refusal.
@@ -499,27 +502,19 @@ pub fn kept(
     let Some(v) = vision else {
         return Ok(None);
     };
-    let Some(bytes) = v.seat.reserve else {
-        return Ok(Some(v));
-    };
-    if flags.mmproj()?.is_some() || flags.sets_limits() {
+    if v.seat.reserve.is_none() || flags.mmproj()?.is_some() || flags.sets_limits() {
         return Ok(Some(v));
     }
     let without = cost(None)?;
-    let Some(what) = cost_words(without, cost(Some(&v)).map_err(|e| e.to_string())) else {
+    let Some(costs) = cost_of(without, cost(Some(&v)).map_err(|e| e.to_string())) else {
         return Ok(Some(v));
     };
-    let line = format!(
-        "vision: the --hf repo's projector {} is not loaded: as a reserve of {bytes} B on the \
-         stage card ({}) it would cost {what}; --mmproj FILE loads it",
-        v.path.display(),
-        v.seat.name
-    );
-    // A seat plans a placement more than once (its offer, then the load): one line per verdict.
+    let line = not_loaded(&v, &costs).line();
+    // A seat plans a placement more than once (its offer, then the load): one record per verdict.
     static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let mut said = SAID
         .lock()
-        .map_err(|_| "the vision line's lock is poisoned")?;
+        .map_err(|_| "the vision_seat record's lock is poisoned")?;
     if !said.contains(&line) {
         eprintln!("{line}");
         said.push(line);
@@ -527,20 +522,28 @@ pub fn kept(
     Ok(None)
 }
 
+/// What the encoder's reserve costs the text model.
+#[derive(Debug, PartialEq, Eq)]
+enum Costs {
+    /// The card experts and the context positions the plan gives up.
+    Plan { experts: u64, ctx: u64 },
+    /// The load that fits whole on one card is placed instead.
+    Whole,
+    /// The plan refuses the reserve, for this reason.
+    Refused(String),
+}
+
 /// What the encoder's reserve costs the text model, `with` it against `without` it; `None` when
 /// it costs nothing.
-fn cost_words(without: Cost, with: Result<Cost, String>) -> Option<String> {
+fn cost_of(without: Cost, with: Result<Cost, String>) -> Option<Costs> {
     match with {
         Ok(with) if with == without => None,
-        Ok(with) if with.whole != without.whole => {
-            Some("the whole load on one card (the plan would place the experts)".to_owned())
-        }
-        Ok(with) => Some(format!(
-            "{} card experts and {} positions of context",
-            without.card_experts.saturating_sub(with.card_experts),
-            without.ctx.saturating_sub(with.ctx)
-        )),
-        Err(e) => Some(format!("the plan, which refuses it ({e})")),
+        Ok(with) if with.whole != without.whole => Some(Costs::Whole),
+        Ok(with) => Some(Costs::Plan {
+            experts: without.card_experts.saturating_sub(with.card_experts),
+            ctx: without.ctx.saturating_sub(with.ctx),
+        }),
+        Err(e) => Some(Costs::Refused(e)),
     }
 }
 
@@ -796,6 +799,12 @@ impl Resident {
         self.media.clone()
     }
 
+    /// The model's image input, borrowed.
+    #[must_use]
+    pub fn media_ref(&self) -> &dyn MediaModel {
+        &*self.media
+    }
+
     /// The width of a row.
     #[must_use]
     pub fn n_embd(&self) -> usize {
@@ -918,6 +927,44 @@ pub fn record(
         .w("scratch_home", home.word())
         .u("cap", cap)
         .f("load_s", load_s)
+}
+
+/// The `seat` word of a projector [`kept`] drops.
+const NOT_LOADED: &str = "not-loaded";
+
+/// The `vision_seat` record of the encoder `at` seated for the plan: the card, which seat it is
+/// and the reserve it takes on the stage card (0 off the plan), the tower's card figure and the
+/// most image tokens one image takes. Printed with the plan, before any load.
+pub fn seat_record(at: &Opened) -> Record {
+    seat_line(at, at.seat.word(), None)
+}
+
+/// The `vision_seat` record of a projector [`kept`] drops: the seat it would have taken, the
+/// reserve it would have reserved and what that costs the plan.
+fn not_loaded(at: &Opened, costs: &Costs) -> Record {
+    seat_line(at, NOT_LOADED, Some(costs))
+}
+
+fn seat_line(at: &Opened, seat: &str, dropped: Option<&Costs>) -> Record {
+    let (experts, ctx) = match dropped {
+        Some(&Costs::Plan { experts, ctx }) => (experts, ctx),
+        _ => (0, 0),
+    };
+    let line = Record::new(&record::VISION_SEAT)
+        .w("card", at.seat.name.replace(' ', "_"))
+        .w("seat", seat)
+        .u("reserve", at.seat.reserve.unwrap_or(0))
+        .u("weights", at.card.weights)
+        .u("scratch", at.card.scratch)
+        .u("cap", at.cap)
+        .u("cost_experts", experts)
+        .u("cost_ctx", ctx);
+    match dropped {
+        None => line,
+        Some(Costs::Plan { .. }) => line.w("why", "plan-cost"),
+        Some(Costs::Whole) => line.w("why", "whole-load"),
+        Some(Costs::Refused(e)) => line.w("why", "plan-refused").w("refusal", e),
+    }
 }
 
 #[cfg(test)]
@@ -1081,6 +1128,48 @@ mod tests {
         );
     }
 
+    /// The encoder `seat` opened, with a card figure that sums to [`BYTES`].
+    fn opened(seat: EncoderSeat) -> Opened {
+        Opened {
+            path: PathBuf::from("/m/mmproj.gguf"),
+            seat,
+            media: Arc::new(Stub(1)),
+            cap: 4096,
+            card: CardBytes {
+                weights: 1_000_000_000,
+                scratch: 476_000_000,
+            },
+            limits: TokenLimits::DEFAULT,
+        }
+    }
+
+    /// The plan-time record: an off-plan seat names its card with reserve 0, a stage seat its
+    /// reserve in bytes (the tower's card figure), and both the figure the seat was sized from.
+    #[test]
+    fn the_seat_record_names_the_seat_and_its_reserve() {
+        let both = [
+            device(0, "NVIDIA RTX A6000", 48, 1),
+            device(1, "NVIDIA GeForce RTX 3090", 24, 2),
+        ];
+        let off = opened(seat_of(&both, &[on(A6000, 0, 1)], "a", BYTES).unwrap());
+        assert_eq!(
+            seat_record(&off).line(),
+            "vision_seat card=NVIDIA_GeForce_RTX_3090 seat=off-plan reserve=0 weights=1000000000 \
+             scratch=476000000 cap=4096 cost_experts=0 cost_ctx=0"
+        );
+        let bp = [on(A6000, 0, 1), on(RTX_3090, 1, 2)];
+        let stage = opened(seat_of(&both, &bp, "bp", BYTES).unwrap());
+        assert_eq!(
+            seat_record(&stage).line(),
+            format!(
+                "vision_seat card={} seat=stage-reserve reserve={BYTES} weights=1000000000 \
+                 scratch=476000000 cap=4096 cost_experts=0 cost_ctx=0",
+                A6000.name.replace(' ', "_")
+            )
+        );
+        assert_eq!(BYTES, stage.card.total());
+    }
+
     /// A media model of one image token.
     struct Stub(u32);
 
@@ -1179,7 +1268,8 @@ mod tests {
     }
 
     /// A reserve is free only when the plan gives the same load, experts and context with it; each
-    /// cost is named: experts and context lost, the whole load lost, a plan that refuses it.
+    /// cost is named: experts and context lost, the whole load lost, a plan that refuses it. The
+    /// dropped projector's record carries the seat it would have taken and the cost in its fields.
     #[test]
     fn a_reserve_is_free_only_when_the_plan_is_unchanged() {
         let placed = |card_experts, ctx| Cost {
@@ -1187,23 +1277,31 @@ mod tests {
             card_experts,
             ctx,
         };
-        assert_eq!(cost_words(placed(940, 4096), Ok(placed(940, 4096))), None);
-        assert_eq!(cost_words(Cost::whole(4096), Ok(Cost::whole(4096))), None);
-        assert_eq!(
-            cost_words(placed(940, 4096), Ok(placed(727, 4096))).as_deref(),
-            Some("213 card experts and 0 positions of context")
+        assert_eq!(cost_of(placed(940, 4096), Ok(placed(940, 4096))), None);
+        assert_eq!(cost_of(Cost::whole(4096), Ok(Cost::whole(4096))), None);
+        let one = [device(0, "NVIDIA RTX A6000", 48, 1)];
+        let at = opened(seat_of(&one, &[on(A6000, 0, 1)], "a", BYTES).unwrap());
+        let said = |costs: Option<Costs>| not_loaded(&at, &costs.unwrap()).line();
+        let head = format!(
+            "vision_seat card={} seat=not-loaded reserve={BYTES} weights=1000000000 \
+             scratch=476000000 cap=4096",
+            A6000.name.replace(' ', "_")
         );
         assert_eq!(
-            cost_words(placed(940, 8192), Ok(placed(940, 4096))).as_deref(),
-            Some("0 card experts and 4096 positions of context")
+            said(cost_of(placed(940, 4096), Ok(placed(727, 4096)))),
+            format!("{head} cost_experts=213 cost_ctx=0 why=plan-cost")
         );
         assert_eq!(
-            cost_words(Cost::whole(4096), Ok(placed(900, 4096))).as_deref(),
-            Some("the whole load on one card (the plan would place the experts)")
+            said(cost_of(placed(940, 8192), Ok(placed(940, 4096)))),
+            format!("{head} cost_experts=0 cost_ctx=4096 why=plan-cost")
         );
         assert_eq!(
-            cost_words(placed(940, 4096), Err("no room".to_owned())).as_deref(),
-            Some("the plan, which refuses it (no room)")
+            said(cost_of(Cost::whole(4096), Ok(placed(900, 4096)))),
+            format!("{head} cost_experts=0 cost_ctx=0 why=whole-load")
+        );
+        assert_eq!(
+            said(cost_of(placed(940, 4096), Err("no room".to_owned()))),
+            format!("{head} cost_experts=0 cost_ctx=0 why=plan-refused refusal=no room")
         );
     }
 
