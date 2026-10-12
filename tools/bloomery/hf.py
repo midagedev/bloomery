@@ -252,6 +252,11 @@ def http_status(stderr):
     return int(m.group(1)) if m else None
 
 
+# The shortest range read the hub serves as a range: its xet bridge answers a range of a few hundred bytes of a large
+# file with the whole file (HTTP 200), so a shorter read asks this much and keeps its own bytes.
+MIN_RANGE = 4096
+
+
 class Hub:
     """The hub's reads. curl, as crates/hf/src/fetch.rs: Python's own TLS can fail on a machine curl works on."""
 
@@ -307,23 +312,26 @@ class Hub:
                 return out
 
     def range(self, repo, path, start, end, revision="main"):
-        """The bytes [start, end) of `path` of `repo` at `revision`: one range read, checked to be a 206 of that
-        length (a server that sends the whole file is refused before the body, by --max-filesize)."""
+        """The bytes [start, end) of `path` of `repo` at `revision`: one range read of at least MIN_RANGE bytes (the
+        hub's xet bridge answers a shorter range with the whole file), checked to be a 206 holding them (a server
+        that sends the whole file is refused before the body, by --max-filesize); a range past the end of the file
+        comes back short, which is fine as long as it holds [start, end)."""
         want = end - start
+        ask = max(want, MIN_RANGE)
         url = resolve_url(repo, revision, path)
         part = os.path.join(self.scratch, "range.part")
-        out = self._curl(f"range {start}-{end - 1} of {url}",
-                         ["-r", f"{start}-{end - 1}", "--max-filesize", str(want + 1024), "-o", part,
+        out = self._curl(f"range {start}-{start + ask - 1} of {url}",
+                         ["-r", f"{start}-{start + ask - 1}", "--max-filesize", str(ask + 1024), "-o", part,
                           "-w", "%{http_code} %{size_download}", url])
         code, _, got = out.decode().partition(" ")
         with open(part, "rb") as f:
             data = f.read()
         os.unlink(part)
-        if code != "206" or int(got) != want or len(data) != want:
-            raise Red(f"{repo}: the range {start}-{end - 1} of {path} answered HTTP {code} with {len(data)} bytes, "
-                      f"not a 206 of {want}")
-        self.bytes += want
-        return data
+        if code != "206" or int(got) != len(data) or len(data) < want:
+            raise Red(f"{repo}: the range {start}-{start + ask - 1} of {path} answered HTTP {code} with {len(data)} "
+                      f"bytes, not a 206 holding the {want} asked for")
+        self.bytes += len(data)
+        return data[:want]
 
 
 # ------------------------------------------------------------------------------------------------

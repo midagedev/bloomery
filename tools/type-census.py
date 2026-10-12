@@ -653,20 +653,26 @@ class FakeHub:
 
 
 # A curl that answers the hub's reads from fixed text and logs each URL it is asked for to $STUB_LOG: the model info
-# (o/nosha has no sha), a listing of two pages (the first has a Link header), and a ranged read of four bytes.
+# (o/nosha has no sha), a listing of two pages (the first has a Link header), and a ranged read that, as the hub's xet
+# bridge, refuses a range under 1 KiB.
 STUB_CURL = r"""#!/bin/sh
-hdr=""; out=""; url=""
+hdr=""; out=""; url=""; range=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dump-header) hdr="$2" ;;
     -o) out="$2" ;;
+    -r) range="$2" ;;
   esac
   url="$1"
   shift
 done
 echo "$url" >> "$STUB_LOG"
 case "$url" in
-  */resolve/*) printf 'abcd' > "$out"; printf '206 4' ;;
+  */resolve/*)
+    n=$(( ${range#*-} - ${range%-*} + 1 ))
+    # The xet bridge answers a range under 1 KiB with the whole file, which curl's --max-filesize stops (63).
+    [ "$n" -ge 1024 ] || exit 63
+    { printf 'abcd'; head -c $((n - 4)) /dev/zero; } > "$out"; printf '206 %s' "$n" ;;
   https://h/next) : > "$hdr"; echo '[{"type":"file","path":"d/b.gguf","size":5,"oid":"@GIT@"},{"type":"directory","path":"d"}]' ;;
   */tree/*) printf 'Link: <https://h/next>; rel="next"\r\n' > "$hdr"; echo '[{"type":"file","path":"a.gguf","size":3,"lfs":{"oid":"@LFS@","size":3}}]' ;;
   */o/nosha) echo '{"id":"o/nosha"}' ;;
@@ -827,7 +833,7 @@ def self_test():
         os.chmod(os.path.join(stubdir, "curl"), 0o755)
         saved = dict(os.environ)
         try:
-            os.environ.update({"PATH": stubdir, "STUB_LOG": curl_log})
+            os.environ.update({"PATH": os.pathsep.join([stubdir, "/usr/bin", "/bin"]), "STUB_LOG": curl_log})
             stub_hub = hf.Hub(tmp)
             got_sha = stub_hub.main_sha("o/r")
             no_sha = _raises(lambda: stub_hub.main_sha("o/nosha"), hf.Red, "o/nosha: the API's model info has no commit sha")
@@ -844,6 +850,8 @@ def self_test():
         check("a listing of two pages is joined, files only, each with the digest its kind of file has",
               listed == [hf.Entry("a.gguf", 3, "sha256", lfs_oid), hf.Entry("d/b.gguf", 5, "git-sha1", git_oid)],
               str(listed))
+        check("a read of four bytes asks the hub's shortest served range and returns its own four",
+              pinned == b"abcd", repr(pinned[:16]))
         check("a read names its revision in the one URL form, and a read with no revision names main", pinned == b"abcd"
               and asked == ["https://huggingface.co/api/models/o/r", "https://huggingface.co/api/models/o/nosha",
                             f"https://huggingface.co/api/models/o/r/tree/{sha}?recursive=true", "https://h/next",
