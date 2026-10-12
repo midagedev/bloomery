@@ -14,6 +14,12 @@ precheck := 'bash tools/ref/card-precheck.sh'
 # same name through tools/arch.sh, which tools/box.sh forwards.
 arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')
 
+# A recipe that builds a shipped bin (tools/release/build.sh's BINS) builds it with that file's
+# feature list, spelled out: the gates of a shipped bin run the binary the release packs, a recipe parameter in a
+# `--features` hides the crates from the gate selection and the ledger key, and a bin takes one feature set across
+# the recipes (tools/recipes.py's bin check). A gate bin that needs other features goes on a cargo line of its own.
+# `just check-recipes` fails a recipe by name.
+
 # serve-qwen38's placement (a the A6000, gate the 3090) and the card it puts
 # in box.sh's view.
 serve_place := env_var_or_default('SERVE_PLACE', 'a')

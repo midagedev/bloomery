@@ -51,7 +51,8 @@ fi
 # Every recipe's cargo targets, features and runner binaries against the workspace (cargo metadata, no
 # build): a `--bin`, `--test` or `-p` that names nothing, a feature the package lacks, a gpu-gate.sh or
 # host-gate.sh name the recipe does not build, a named script that is not in the tree, a gate-* recipe
-# with no cargo target. The parser is tools/recipes.py, the one tools/affected-gates.sh uses; its own
+# with no cargo target, a build of a shipped bin (tools/release/build.sh's BINS) with a feature list
+# but that file's. The parser is tools/recipes.py, the one tools/affected-gates.sh uses; its own
 # tests (--self-test) run here too, so the parser the lead's batch lists come from is tested wherever
 # this check runs.
 # The check of the recipes against the workspace is the first of the parallel blocks below (blk_recipescheck).

@@ -9,6 +9,9 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
     python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...]
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
+    python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
+    python3 tools/recipes.py ship-scan [--rev REV] BASE_LOG HEAD_LOG...  # the shipped bins' ptx-scan pairs: a verdict line each; exit 0 only when every shipped bin has a pair and all are identical
+    python3 tools/recipes.py ship-bins [--rev REV]  # the shipped bins and the release features read from tools/release/build.sh: bin<TAB>features
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
     python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
@@ -178,9 +181,11 @@ hash-named file under deps/, and check and clippy write none. There is no exempt
 several sets in turn: the file is replaced under whichever lane runs it just the same (2026-10-13, gate-ptx-spill's
 oxart_jit, built three times; it now builds it once). An invocation whose package, features, targets or target dir come
 from a recipe parameter is left out (the ptx-scan, sass-scan and lds-scan recipes): their features are known at run time
-only. The fix is the union (each build gives the bin every feature any build gives it), or a target dir of its own for
-a bin no runner starts from target/release (tools/gpu-gate.sh runs `target/release/<bin>` only); `--arch` is not part of
-the key: cargo-oxide's only target-dir option is `--cargo-target-dir`, and the justfile passes one `{{arch}}` to every build.
+only. A bin tools/release/build.sh ships is held to that file's feature list instead, in any
+dir, and the one line that names a departure is that rule's (`bin_problems`). The fix is the union (each build gives the
+bin every feature any build gives it), or a target dir of its own for a bin no runner starts from target/release
+(tools/gpu-gate.sh runs `target/release/<bin>` only); `--arch` is not part of the key: cargo-oxide's only target-dir
+option is `--cargo-target-dir`, and the justfile passes one `{{arch}}` to every build.
 """
 
 from __future__ import annotations
@@ -1778,7 +1783,7 @@ def check(tree: Tree, recipes: dict[str, Recipe], prefix: str = GATE_PREFIX) -> 
             problems.append(f"{where}: a gate recipe that builds or tests no cargo target")
     for u in sorted(set(tree.unresolved)):
         problems.append(f"source walk: {u}")
-    problems += bin_feature_problems(tree, recipes)
+    problems += bin_problems(tree, recipes)
     return problems
 
 
@@ -4272,22 +4277,38 @@ def scan_shapes(side: Side) -> dict[str, set[tuple[str, ...]]]:
     return shapes
 
 
-def scan_set(side: Side) -> list[ScanPick]:
+def scan_set(side: Side, ship: bool = False) -> list[ScanPick]:
     """The minimal list of (bin, features) whose scans cover every kernel carrier of the tree, greedy: the scan that
     covers most uncovered carriers first, ties to fewer features, then to the bin's name. A carrier no bin of
-    SCAN_PACKAGE can cover is a named error, never dropped."""
+    SCAN_PACKAGE can cover is a named error, never dropped. With `ship`, the shipped bins at the release features
+    (tools/release/build.sh) are the first picks, so the set holds the scan tools/release/late-commit.sh reads."""
     gates = [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith(GATE_PREFIX)]
     carriers = kernel_carriers(side, gates)
     shapes = scan_shapes(side)
     pkg = side.tree.packages[SCAN_PACKAGE]
+
+    def covered_by(bin_name: str, feats: tuple[str, ...]) -> list[int]:
+        bundles = set(side.tree.closure(pkg, list(feats), False))
+        bundles |= {c.bundle for c in carriers if c.bundle == pkg.name and c.bin in (None, bin_name)}
+        return [i for i, c in enumerate(carriers) if carrier_covered(c, bin_name, bundles)]
+
     cands: list[tuple[str, tuple[str, ...], list[int]]] = []
     for bin_name in sorted(set(shapes) - set(CARRIER_SKIP)):
         for feats in sorted(shapes[bin_name]):
-            bundles = set(side.tree.closure(pkg, list(feats), False))
-            bundles |= {c.bundle for c in carriers if c.bundle == pkg.name and c.bin in (None, bin_name)}
-            cands.append((bin_name, feats, [i for i, c in enumerate(carriers) if carrier_covered(c, bin_name, bundles)]))
+            cands.append((bin_name, feats, covered_by(bin_name, feats)))
     uncovered = set(range(len(carriers)))
     picks: list[ScanPick] = []
+    if ship:
+        rb = read_release_build(side.tree.root)
+        if rb.package != SCAN_PACKAGE:
+            raise RecipeError(f"scan-set: {RELEASE_BUILD} builds package {rb.package}, and a ptx-scan reads the bins of {SCAN_PACKAGE} only")
+        for b in rb.bins:
+            if b not in shapes:
+                raise RecipeError(f"scan-set: {RELEASE_BUILD} ships {b}, which is no bin of {SCAN_PACKAGE}")
+            feats = tuple(sorted(set(rb.features)))
+            cov = covered_by(b, feats)
+            picks.append(ScanPick(b, feats, [carriers[i].label for i in cov]))
+            uncovered -= set(cov)
     while uncovered:
         best = max(cands, key=lambda c: (len(uncovered & set(c[2])), -len(c[1])), default=None)
         if best is None or not uncovered & set(best[2]):
@@ -4304,7 +4325,7 @@ def cmd_scan_set(args: argparse.Namespace) -> int:
     tmp = tempfile.mkdtemp(prefix="recipes-scanset-")
     try:
         side = make_side(archive(args.rev, tmp) if args.rev else ROOT)
-        picks = scan_set(side)
+        picks = scan_set(side, ship=args.ship or os.environ.get(SCAN_SHIP_ENV) == "1")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     for p in picks:
@@ -4593,6 +4614,434 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"check-recipes: {GATE_PATHS}: {held.get('rows', 0)} gate rows held to the derivation, {held.get('exceptions', 0)} rows "
           f"with exceptions naming {held.get('excepted', 0)} gates")
     return 1 if problems else 0
+
+
+# ----------------------------------------------------------------------------------------------
+# the shipped closure and the release feature list
+# ----------------------------------------------------------------------------------------------
+#
+# tools/release/build.sh says what ships: its BINS and the `--features` of its `cargo oxide build` line. Nothing
+# below copies either; every use reads that file (read_release_build). Three rules stand on it:
+#   - `ships FILE…` (tools/release/late-commit.sh's first test): a file is inside the shipped closure when a change to
+#     it can change the binary the release packs: the bins' module trees, the lib of the scan package, every workspace
+#     crate the build links at those features (its lib tree, manifest and build script), Cargo.lock,
+#     rust-toolchain.toml, the manifests, .cargo/, tools/release/ and the scripts build.sh names. The walk is the one
+#     `affected` reads (Graph.inputs over the build's own cargo line), so `mod`, `#[path]`, `include_str!` and the
+#     feature cfgs are followed the same way. A bin's own tree is read with its `#[cfg(test)]` modules, an
+#     over-selection that blocks and never one that lets a change through. With `--base REV` a file in REV's closure
+#     counts too, so a deleted or moved-away file is not read against a tree that no longer holds it.
+#   - `ship-scan BASE_LOG HEAD_LOG` (its second test): the ptx-scan pair of a shipped bin is identical.
+#   - check's release-feature rule (release_feature_problems, run by bin_problems): a recipe that builds a shipped bin
+#     builds it with that feature list. Two lanes that build one target/release/<bin> with two lists relink it under
+#     each other (measured 0.3.1: one lane's image arm read a binary the other lane had rebuilt without `vision`).
+#     It and the one-resolved-set rule (bin_feature_problems) each catch what the other lets by: that one holds every
+#     bin to one set whatever the set, this one holds the shipped bins to the release list even when one recipe builds
+#     them; bin_problems has the second step aside for the bins the first names, so a defect has one line.
+
+RELEASE_BUILD = "tools/release/build.sh"
+# Inputs of the shipped build besides its crates (rust-toolchain.toml, Cargo.lock and the root manifest are cargo
+# globals): the cargo config and the scripts that build and pack.
+SHIP_PREFIXES = {".cargo/": "cargo config (target-cpu, cuda-oxide)", "tools/release/": "the release build and pack scripts"}
+# `tools/recipes.py scan-set` adds the shipped bins at the release features to the scan set when this is `1`.
+SCAN_SHIP_ENV = "NARROW_SHIP"
+
+
+@dataclass
+class ReleaseBuild:
+    package: str
+    features: tuple[str, ...]  # build.sh's spelling and order
+    bins: tuple[str, ...]
+
+
+def read_release_build(root: str) -> ReleaseBuild:
+    try:
+        with open(os.path.join(root, RELEASE_BUILD), encoding="utf-8") as fh:
+            return parse_release_build(fh.read())
+    except OSError as err:
+        raise RecipeError(f"{RELEASE_BUILD}: {err.strerror or err} — the shipped bins and their features are read from it") from err
+
+
+def parse_release_build(text: str) -> ReleaseBuild:
+    """BINS and the `cargo oxide build -p P --features F` line of tools/release/build.sh's text. A file that has
+    not exactly one of each is a named error: what ships is never guessed."""
+    code = [ln for ln in text.split("\n") if not ln.lstrip().startswith("#")]
+    bins_lines = [ln for ln in code if ln.startswith("BINS=(")]
+    m = re.fullmatch(r"BINS=\(([^()]*)\)\s*(?:#.*)?", bins_lines[0]) if len(bins_lines) == 1 else None
+    if m is None or not m.group(1).split():
+        raise RecipeError(f"{RELEASE_BUILD}: not one one-line `BINS=(name …)` with a name in it ({len(bins_lines)} lines start `BINS=(`)")
+    builds = [ln for ln in code if re.search(r"\bcargo oxide build\b", ln)]
+    if len(builds) != 1:
+        raise RecipeError(f"{RELEASE_BUILD}: {len(builds)} `cargo oxide build` lines, not one")
+    words = shell_words(builds[0])
+    inv = parse_cargo(words[words.index("cargo") + 1:], builds[0])
+    if inv is None or inv.sub != "build" or not inv.oxide or len(inv.packages) != 1 or not inv.features:
+        raise RecipeError(f"{RELEASE_BUILD}: its `cargo oxide build` line is not one package (-p) with --features: {builds[0].strip()}")
+    return ReleaseBuild(inv.packages[0], tuple(inv.features), tuple(m.group(1).split()))
+
+
+def release_recipe(rb: ReleaseBuild) -> Recipe:
+    """The release build as a recipe of one cargo line, so Graph.inputs reads its closure as it reads a gate's."""
+    line = f"cargo oxide build --arch sm_86 -- -p {rb.package} --features {','.join(rb.features)} --release " + " ".join(f"--bin {b}" for b in rb.bins)
+    return Recipe("release-build", [line], [], line)
+
+
+@dataclass
+class ShipClosure:
+    build: ReleaseBuild
+    files: dict[str, str]  # file -> why it is inside
+    prefixes: dict[str, str]  # directory prefix "a/b/" -> why
+
+    def match(self, path: str) -> str | None:
+        if path in self.files:
+            return self.files[path]
+        for p, why in self.prefixes.items():
+            if path.startswith(p):
+                return why
+        return None
+
+
+def ship_closure(tree: Tree) -> ShipClosure:
+    rb = read_release_build(tree.root)
+    recipe = release_recipe(rb)
+    graph = Graph(tree, {recipe.name: recipe})
+    ri = graph.inputs(recipe.name)
+    if ri.errors:
+        raise RecipeError(f"{RELEASE_BUILD}: its build does not resolve in this tree: " + "; ".join(ri.errors))
+    if tree.unresolved:
+        raise RecipeError("the shipped closure has a source the walk cannot resolve (an incomplete closure would pass a change it should block): " + "; ".join(sorted(set(tree.unresolved))))
+    files = dict(ri.files)
+    prefixes = dict(ri.prefixes)
+    for f, why in graph.script_closure(RELEASE_BUILD).items():
+        if not f.startswith(tuple(SHIP_PREFIXES)):
+            (prefixes if f.endswith("/") else files).setdefault(f, f"{RELEASE_BUILD} names it ({why})")
+    for p, why in SHIP_PREFIXES.items():
+        prefixes.setdefault(p, why)
+    return ShipClosure(rb, files, prefixes)
+
+
+def ship_hits(closures: list[tuple[str, ShipClosure]], files: list[str]) -> list[tuple[str, str]]:
+    """(file, why) for each file inside the first closure that holds it; a label names a closure other than the head's."""
+    out: list[tuple[str, str]] = []
+    for raw in files:
+        f = _norm(raw)
+        for label, c in closures:
+            why = c.match(f)
+            if why is not None:
+                out.append((f, why + (f" [{label}]" if label else "")))
+                break
+    return out
+
+
+def _ship_closures(rev: str | None, base: str | None, tmp: str) -> list[tuple[str, ShipClosure]]:
+    """The head's closure (REV's tree, else this working tree) and, with BASE, that commit's tree."""
+    out = [("", ship_closure(Tree(archive(rev, os.path.join(tmp, "head")) if rev else ROOT)))]
+    if base:
+        out.append((f"in the closure of {base} only", ship_closure(Tree(archive(base, os.path.join(tmp, "base"))))))
+    return out
+
+
+def cmd_ships(args: argparse.Namespace) -> int:
+    tmp = tempfile.mkdtemp(prefix="recipes-ships-")
+    try:
+        closures = _ship_closures(args.rev, args.base, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    hits = ship_hits(closures, args.files)
+    for f, why in hits:
+        print(f"{f}\t{why}")
+    rb = closures[0][1].build
+    what = f"{' '.join(rb.bins)} at {','.join(rb.features)} ({args.rev or 'working tree'})"
+    print(f"ships: {len(hits)} of {len(args.files)} files are inside the shipped closure of {what}", file=sys.stderr)
+    return 1 if hits else 0
+
+
+def shipped_kernel_libs(tree: Tree, rb: ReleaseBuild) -> list[str]:
+    """The packages whose lib has kernels among those the release build links: the bundles its scan should name."""
+    pkg = tree.packages[rb.package]
+    out = []
+    for n in [pkg.name, *tree.closure(pkg, list(rb.features), False)]:
+        lib = tree.packages[n].lib()
+        if lib is not None and any(KERNEL_ATTR.search(rust_lex(tree.read(f))[0]) for f in tree.tree_of(lib.src)[0]):
+            out.append(n)
+    return sorted(out)
+
+
+def cmd_ship_bins(args: argparse.Namespace) -> int:
+    """The shipped bins and the release features, `bin<TAB>features` a line (tools/release/late-commit.sh prints the scan command from them)."""
+    if args.rev:
+        proc = subprocess.run(["git", "show", f"{args.rev}:{RELEASE_BUILD}"], cwd=ROOT, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RecipeError(f"git show {args.rev}:{RELEASE_BUILD} failed: {proc.stderr.strip()}")
+        rb = parse_release_build(proc.stdout)
+    else:
+        rb = read_release_build(ROOT)
+    for b in rb.bins:
+        print(f"{b}\t{','.join(rb.features)}")
+    return 0
+
+
+def cmd_ship_scan(args: argparse.Namespace) -> int:
+    if len(args.logs) % 2:
+        raise RecipeError("ship-scan: the logs come in pairs, BASE_LOG HEAD_LOG each")
+    pairs = [(read_scan(args.logs[k]), read_scan(args.logs[k + 1])) for k in range(0, len(args.logs), 2)]
+    tmp = tempfile.mkdtemp(prefix="recipes-shipscan-")
+    try:
+        tree = Tree(archive(args.rev, tmp) if args.rev else ROOT)
+        rb = read_release_build(tree.root)
+        kernel_libs = shipped_kernel_libs(tree, rb)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    scanned: set[str] = set()
+    ok = True
+    for base, head in pairs:
+        for log in (base, head):
+            if log.bin not in rb.bins:
+                raise RecipeError(f"scan log {log.path}: a scan of {log.bin}, not of a shipped bin ({' '.join(rb.bins)}): "
+                                  f"run {SCAN_SHIP_ENV}=1 tools/narrow-scan.sh BASE HEAD and pass <out>/<side>/{rb.bins[0]}.log")
+            missing = sorted(set(kernel_libs) - set(log.bundles))
+            if missing:
+                print(f"ship-scan: note: {log.path} names no bundle of {' '.join(missing)}, which the release features link: "
+                      f"a lib the bin never reaches has none, a scan taken at other features lacks it too", file=sys.stderr)
+        try:
+            v = scan_verdict(base, head)
+            line, same = v.line(), v.kind == "identical"
+        except RecipeError as err:
+            # a --no-jit pair that is not identical is refused by scan_verdict (the add and occupancy classes need the JIT
+            # columns); here any pair that is not identical blocks, so the refusal is the verdict
+            msg = str(err)
+            if " in a pair with a --no-jit scan" not in msg:
+                raise
+            line, same = "not identical: " + msg.split(" in a pair with a --no-jit scan")[0].split(f"{head.path}: ", 1)[-1], False
+        print(line)
+        scanned.add(base.bin)
+        ok = ok and same
+    left = [b for b in rb.bins if b not in scanned]
+    if left:
+        print(f"ship-scan: no scan pair for the shipped bin {' '.join(left)}", file=sys.stderr)
+        return 1
+    return 0 if ok else 1
+
+
+def release_feature_problems(rb: ReleaseBuild, tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
+    """A recipe whose build writes a shipped bin (tools/release/build.sh's BINS) with any feature list but the release one,
+    as a set: cargo reads the features of a build as a set, so the spelling and order are free. Only a build that
+    writes the bin counts (BIN_WRITING_SUBS): a `cargo check` replaces no file another lane runs. A call is read as
+    cargo reads it (resolve_call): a package with no `--bin` is every bin whose required features the list enables.
+    A bin built beside it on the same line takes the release list too; a gate bin that needs other features goes on a
+    cargo line of its own."""
+    want = set(rb.features)
+    out: list[str] = []
+    for rname, inv, _, _ in sorted(build_calls(recipes), key=lambda c: recipes[c[0]].line):
+        if inv.sub not in BIN_WRITING_SUBS:
+            continue
+        targets, _ = resolve_call(tree, inv)  # an unresolvable call is check()'s error, named there
+        shipped = [n for p, k, n, *_ in targets if k == "bin" and p == rb.package and n in rb.bins]
+        if not shipped:
+            continue
+        got = set(inv.features)
+        how = ""
+        if any("{{" in f for f in got):
+            how = "a feature list from a recipe parameter, which this check cannot read"
+        elif inv.no_default or inv.all_features:
+            how = "--no-default-features or --all-features"
+        elif got != want:
+            how = f"features {','.join(sorted(got)) or 'none'}"
+        if how:
+            out.append(f"justfile:{recipes[rname].line} {rname}: builds {' '.join(shipped)} with {how}, not the release list "
+                       f"{','.join(rb.features)} ({RELEASE_BUILD}): the gates of a shipped bin run the binary the release packs, and two lanes "
+                       f"at two lists relink target/release/{shipped[0]} under each other. Build it with the release list on a cargo line of its own")
+    return out
+
+
+def ships_self_test(expect) -> None:
+    """The shipped closure on a synthetic workspace: package bloomery-gpu-gates (lib, bin bloomery-serve behind `fa`, a gate
+    bin) with optional libs liba (behind fa, with a build script) and libb (behind fb, not a release feature) and an
+    unlinked libc. Each kind of input is inside, each look-alike beside it is not."""
+    build_sh = ("#!/usr/bin/env bash\nBINS=(bloomery-serve)\nsource \"$ROOT/tools/arch.sh\"\n"
+                "BLOOMERY_GIT_COMMIT=\"$COMMIT\" cargo oxide build --arch \"$ARCH\" -- -p bloomery-gpu-gates --features fa --release \"${bin_args[@]}\"\n")
+
+    def make(tmp: str, name: str, serve_mods: str = "#[path = \"shared/seat.rs\"]\nmod seat;\nmod walked;\n") -> Tree:
+        root = os.path.join(tmp, name)
+        files = {
+            "Cargo.toml": "", "Cargo.lock": "", "rust-toolchain.toml": "", ".cargo/config.toml": "", ".cargo/extra.toml": "",
+            "tools/release/build.sh": build_sh, "tools/release/publish.sh": "", "tools/arch.sh": "", "tools/gate-paths.tsv": "", "justfile": "",
+            "crates/gates/Cargo.toml": "", "crates/gates/src/lib.rs": "pub fn f() {}\n",
+            "crates/gates/src/bin/serve.rs": serve_mods + "fn main() {}\n",
+            "crates/gates/src/bin/walked.rs": "", "crates/gates/src/bin/shared/seat.rs": "",
+            "crates/gates/src/bin/gate_x.rs": "mod only;\nfn main() {}\n", "crates/gates/src/bin/only.rs": "",
+            "crates/liba/Cargo.toml": "", "crates/liba/src/lib.rs": "", "crates/liba/build.rs": "fn main() {}\n",
+            "crates/libb/Cargo.toml": "", "crates/libb/src/lib.rs": "", "crates/libc/Cargo.toml": "", "crates/libc/src/lib.rs": "",
+            "docs/x.md": "",
+        }
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        def pkg(n: str, d: str, targets: list[dict], features=None, deps=()) -> dict:
+            return {"id": n, "name": n, "manifest_path": os.path.join(root, f"crates/{d}/Cargo.toml"), "features": features or {},
+                    "dependencies": [{"name": x, "kind": None, "optional": True, "features": [], "uses_default_features": True} for x in deps],
+                    "targets": targets}
+
+        def tgt(kind: str, n: str, src: str, req=()) -> dict:
+            return {"kind": [kind], "name": n, "src_path": os.path.join(root, src), "required-features": list(req)}
+
+        meta = {"workspace_root": root, "workspace_members": ["liba", "libb", "libc", "bloomery-gpu-gates"], "packages": [
+            pkg("liba", "liba", [tgt("lib", "liba", "crates/liba/src/lib.rs"), tgt("custom-build", "build-script-build", "crates/liba/build.rs")]),
+            pkg("libb", "libb", [tgt("lib", "libb", "crates/libb/src/lib.rs")]),
+            pkg("libc", "libc", [tgt("lib", "libc", "crates/libc/src/lib.rs")]),
+            pkg("bloomery-gpu-gates", "gates", [tgt("lib", "bloomery-gpu-gates", "crates/gates/src/lib.rs"),
+                                              tgt("bin", "bloomery-serve", "crates/gates/src/bin/serve.rs", ["fa"]),
+                                              tgt("bin", "gate_x", "crates/gates/src/bin/gate_x.rs")],
+                {"fa": ["dep:liba"], "fb": ["dep:libb"]}, ["liba", "libb"]),
+        ]}
+        return Tree(root, meta)
+
+    def refused(fn, why: str) -> bool:
+        try:
+            fn()
+        except RecipeError as err:
+            return why in str(err)
+        return False
+
+    with tempfile.TemporaryDirectory(prefix="recipes-ships-") as tmp:
+        c = ship_closure(make(tmp, "t0"))
+        expect(c.build == ReleaseBuild("bloomery-gpu-gates", ("fa",), ("bloomery-serve",)), f"ships: build.sh read as {c.build}")
+        inside = {
+            "crates/gates/src/bin/serve.rs": "the bin's source",
+            "crates/gates/src/bin/walked.rs": "a `mod` file it reaches",
+            "crates/gates/src/bin/shared/seat.rs": "a #[path] file it reaches",
+            "crates/gates/src/lib.rs": "the bloomery-gpu-gates lib",
+            "crates/liba/src/lib.rs": "a workspace crate the release features link",
+            "crates/liba/build.rs": "that crate's build script",
+            "crates/liba/Cargo.toml": "that crate's manifest",
+            "crates/gates/Cargo.toml": "the scan package's manifest",
+            "Cargo.toml": "the root manifest",
+            "Cargo.lock": "Cargo.lock",
+            "rust-toolchain.toml": "rust-toolchain.toml",
+            ".cargo/config.toml": ".cargo/config.toml",
+            ".cargo/extra.toml": "a file under .cargo/",
+            "tools/release/publish.sh": "a file under tools/release/",
+            "tools/arch.sh": "a script build.sh names",
+        }
+        got = dict(ship_hits([("", c)], list(inside)))
+        for f, what in inside.items():
+            expect(f in got, f"ships: {f} ({what}) is not inside the shipped closure")
+        outside = ["crates/gates/src/bin/gate_x.rs", "crates/gates/src/bin/only.rs", "crates/libb/src/lib.rs", "crates/libb/Cargo.toml",
+                   "crates/libc/src/lib.rs", "docs/x.md", "justfile", "tools/gate-paths.tsv"]
+        stray = [f for f, _ in ship_hits([("", c)], outside)]
+        expect(stray == [], f"ships: {stray} are inside the shipped closure (a gate bin and its module, a crate the release features do not link, docs, the justfile)")
+        expect(ship_hits([("", c)], ["./crates/gates/src/bin/serve.rs"])[0][0] == "crates/gates/src/bin/serve.rs", "ships: a ./ path is not normalized")
+        why = dict(ship_hits([("", c)], ["crates/gates/src/bin/shared/seat.rs"]))["crates/gates/src/bin/shared/seat.rs"]
+        expect("bin bloomery-serve" in why, f"ships: the reason names the bin: {why}")
+        # a file only the base's closure holds (the head dropped the `mod`): a delete or a move is not read against a tree without it
+        head = ship_closure(make(tmp, "t1", serve_mods="mod walked;\n"))
+        f = "crates/gates/src/bin/shared/seat.rs"
+        expect(ship_hits([("", head)], [f]) == [], "ships: a file the head no longer reaches is inside its closure")
+        got = ship_hits([("", head), ("in the closure of BASE only", c)], [f])
+        expect(len(got) == 1 and "in the closure of BASE only" in got[0][1], f"ships: a file only the base's closure holds: {got}")
+        # a `-p` build with no --bin builds every bin whose required features the list enables, the shipped one among them
+        rb_syn = c.build
+
+        def implicit(line: str) -> list[str]:
+            return release_feature_problems(rb_syn, make(tmp, "t5"), {"r": Recipe("r", [line], [], "", 1)})
+
+        expect(implicit("cargo build --release -p bloomery-gpu-gates --features fa") == [], "release features: an implicit build at the release list is a problem")
+        got = implicit("cargo build --release -p bloomery-gpu-gates --features fa,fb")
+        expect(len(got) == 1 and "bloomery-serve" in got[0], f"release features: an implicit build at another list gives {got}")
+        expect(implicit("cargo build --release -p bloomery-gpu-gates") == [], "release features: an implicit build that cannot reach the shipped bin (its feature is off) is a problem")
+        # build.sh that cannot be read is a named error, never an empty closure
+        os.remove(os.path.join(tmp, "t0", RELEASE_BUILD))
+        expect(refused(lambda: read_release_build(os.path.join(tmp, "t0")), RELEASE_BUILD), "ships: a missing build.sh is not a named error")
+        for what, text, why in (("no BINS", build_sh.replace("BINS=(bloomery-serve)\n", ""), "BINS=("),
+                                ("an empty BINS", build_sh.replace("(bloomery-serve)", "()"), "BINS=("),
+                                ("no features", build_sh.replace(" --features fa", ""), "with --features")):
+            root = os.path.join(tmp, "bad")
+            os.makedirs(os.path.join(root, "tools/release"), exist_ok=True)
+            with open(os.path.join(root, RELEASE_BUILD), "w", encoding="utf-8") as fh:
+                fh.write(text)
+            expect(refused(lambda: read_release_build(root), why), f"ships: build.sh with {what} is not a named error")
+
+    # the release-feature rule and its overlap with the one-resolved-set rule, on a synthetic package that has the release
+    # bin (glm5next, clef, mimo2 required; vision optional), the V4.1 server and gate bin, and a gate bin with no requirement
+    rb = ReleaseBuild("bloomery-gpu-gates", ("glm5next", "clef", "vision", "mimo2"), ("bloomery-serve",))
+    with tempfile.TemporaryDirectory(prefix="recipes-relfeat-") as tmp:
+        root = os.path.join(tmp, "t")
+        os.makedirs(os.path.join(root, "tools/release"))
+        with open(os.path.join(root, RELEASE_BUILD), "w", encoding="utf-8") as fh:
+            fh.write("BINS=(bloomery-serve)\ncargo oxide build -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve\n")
+        feats = {"gpu": [], "deepseek41": ["gpu"], "glm5next": ["deepseek41"], "clef": ["gpu"], "vision": ["gpu"], "mimo2": ["gpu"]}
+        bins = {"bloomery-serve": ["glm5next", "clef", "mimo2"], "bloomery-serve-ds41": ["deepseek41"], "bloomery-serve-qwen38": ["deepseek41"],
+                "gate_ds41_serve": ["deepseek41"], "gate_x": []}
+        meta = {"workspace_root": root, "workspace_members": ["bloomery-gpu-gates"], "packages": [{
+            "id": "bloomery-gpu-gates", "name": "bloomery-gpu-gates", "manifest_path": os.path.join(root, "crates/gates/Cargo.toml"), "features": feats, "dependencies": [],
+            "targets": [{"kind": ["lib"], "name": "bloomery-gpu-gates", "src_path": os.path.join(root, "crates/gates/src/lib.rs"), "required-features": []}]
+                       + [{"kind": ["bin"], "name": n, "src_path": os.path.join(root, f"crates/gates/src/bin/{n}.rs"), "required-features": r} for n, r in bins.items()]}]}
+        rtree = Tree(root, meta)
+
+        def lines(*texts: str) -> dict[str, Recipe]:
+            return {f"r{i}": Recipe(f"r{i}", [ln], [], "", i + 1) for i, ln in enumerate(texts)}
+
+        def probs(*texts: str) -> list[str]:
+            return release_feature_problems(rb, rtree, lines(*texts))
+
+        def both(*texts: str) -> list[str]:
+            return bin_problems(rtree, lines(*texts))
+
+        def oxide(features: str, bins_: str, extra: str = "", sub: str = "build") -> str:
+            return f"./tools/box.sh 'cargo oxide {sub} --arch sm_86 -- -p bloomery-gpu-gates{extra} --features {features} --release {bins_}'"
+
+        release = oxide("glm5next,clef,vision,mimo2", "--bin bloomery-serve")
+        expect(probs(release) == [], "release features: the release list is a problem")
+        expect(probs(oxide("mimo2,vision,clef,glm5next", "--bin bloomery-serve --bin gate_x")) == [], "release features: the same set in another order is a problem")
+        got = probs(oxide("glm5next,clef,mimo2", "--bin bloomery-serve --bin gate_x"))
+        expect(len(got) == 1 and "r0" in got[0] and "bloomery-serve" in got[0] and "clef,glm5next,mimo2" in got[0], f"release features: a list without vision gives {got}")
+        got = probs(oxide("deepseek41,vision", "--bin bloomery-serve-ds41 --bin gate_ds41_serve"))
+        # 2026-10-13 (lead): bloomery-serve-ds41 is no bin of build.sh's BINS, so the release list is not its list (the first form of
+        # this rule held it to it and expected one problem here); the one-set rule still holds its builds to one set, see below
+        expect(got == [], f"release features: bloomery-serve-ds41 built with its own list gives {got}")
+        expect(probs(oxide("glm5next,clef,vision,mimo2", "--bin bloomery-serve-ds41")) == [], "release features: bloomery-serve-ds41 at the release list is a problem")
+        expect(probs(oxide("deepseek41", "--bin gate_ds41_serve --bin bloomery-serve-qwen38")) == [], "release features: a build of no shipped bin is a problem")
+        expect(len(probs(oxide("{{FEATURES}}", "--bin bloomery-serve"))) == 1, "release features: a recipe-parameter list on a shipped bin is not named")
+        expect(len(probs(oxide("glm5next,clef,vision,mimo2", "--bin bloomery-serve", " --no-default-features"))) == 1, "release features: --no-default-features on a shipped bin is not named")
+        expect(len(probs("cargo build --release -p bloomery-gpu-gates --features glm5next --bin bloomery-serve")) == 0,
+               "release features: a bin whose required features the list lacks is cargo's refusal and check()'s error, not this rule's")
+        expect(len(probs("cargo build --release -p bloomery-gpu-gates --features glm5next,clef,mimo2 --bin bloomery-serve")) == 1, "release features: a plain cargo build with another list is not named")
+        # a build that writes no bin replaces nothing another lane runs: the no-vision check shape is not named
+        no_vision = oxide("glm5next,clef,mimo2", "--bin bloomery-serve --bin bloomery-serve-ds41", sub="check").replace("oxide check --arch sm_86 -- ", "check ")
+        expect(probs(no_vision) == [] and both(no_vision) == [], f"release features: a cargo check of the shipped bin at another list is named: {probs(no_vision)} {both(no_vision)}")
+        expect(len(probs(no_vision.replace("cargo check", "cargo build"))) == 1, "release features: the same line as a cargo build is not named")
+
+        # the overlap with the one-resolved-set rule (bin_feature_problems): each catches what the other does not, and one
+        # defect is named once. B = bin_feature_problems, R = release_feature_problems.
+        narrow = oxide("glm5next,clef,mimo2", "--bin bloomery-serve")
+        gate_a, gate_b = oxide("deepseek41", "--bin gate_ds41_serve"), oxide("deepseek41,vision", "--bin gate_ds41_serve")
+        # B only: a gate bin at two sets (R holds the listed bins only)
+        expect(len(bin_feature_problems(rtree, lines(gate_a, gate_b))) == 1 and probs(gate_a, gate_b) == [] and len(both(gate_a, gate_b)) == 1,
+               f"bin rules: a gate bin at two sets is not named once, by the one-set rule: {both(gate_a, gate_b)}")
+        # B only: the V4.1 server is no shipped bin, so two sets of it are the one-set rule's
+        ds41_a, ds41_b = oxide("deepseek41", "--bin bloomery-serve-ds41"), oxide("deepseek41,vision", "--bin bloomery-serve-ds41")
+        got = both(ds41_a, ds41_b)
+        expect(len(got) == 1 and got[0].startswith("bloomery-serve-ds41 (bloomery-gpu-gates, release): ") and probs(ds41_a, ds41_b) == [],
+               f"bin rules: bloomery-serve-ds41 at two sets is not named once, by the one-set rule: {got}")
+        # R only: the shipped bin at one consistent set that is not the release list (B sees one set)
+        expect(bin_feature_problems(rtree, lines(narrow, narrow)) == [] and len(probs(narrow, narrow)) == 2 and len(both(narrow, narrow)) == 2,
+               f"bin rules: the shipped bin at one set that is not the release list is not named by the release rule alone: {both(narrow, narrow)}")
+        # one recipe narrowed among release ones: B alone would name it too; the pair names it once, and the line is R's
+        trio = (release, release, narrow)
+        got = both(*trio)
+        expect(len(bin_feature_problems(rtree, lines(*trio))) == 1 and len(got) == 1 and "r2" in got[0] and "not the release list" in got[0],
+               f"bin rules: one recipe narrowed among release ones is not named once, by the release rule: {got}")
+        # a target dir of its own exempts a build from the one-set rule (B), not a shipped bin from the release list (R)
+        own = oxide("glm5next,clef,mimo2", "--bin bloomery-serve", sub="build --cargo-target-dir target/b")
+        expect(bin_feature_problems(rtree, lines(release, own)) == [] and len(both(release, own)) == 1, f"bin rules: a shipped bin in a target dir of its own at another list: {both(release, own)}")
+        # the release rule green: every build spells the release list, one resolved set, so the one-set rule is green too
+        everything = (release, oxide("vision,mimo2,clef,glm5next", "--bin bloomery-serve --bin gate_x"), oxide("glm5next,clef,vision,mimo2", "--bin bloomery-serve-ds41"))
+        expect(bin_feature_problems(rtree, lines(*everything)) == [] and both(*everything) == [], f"bin rules: builds that all spell the release list are named: {both(*everything)}")
+        # a build.sh that cannot be read is a named error and leaves the one-set rule whole
+        os.remove(os.path.join(root, RELEASE_BUILD))
+        got = both(gate_a, gate_b)
+        expect(len(got) == 2 and RELEASE_BUILD in got[0] and "gate_ds41_serve" in got[1], f"bin rules: an unreadable build.sh is not a named error beside the one-set rule: {got}")
 
 
 # ----------------------------------------------------------------------------------------------
@@ -5273,7 +5722,7 @@ def build_dir(inv: Invocation) -> str:
     return "/".join(x for x in ("" if root == "target" else root, inv.target, _PROFILE_DIR.get(inv.profile, inv.profile)) if x)
 
 
-def bin_feature_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
+def bin_feature_problems(tree: Tree, recipes: dict[str, Recipe], skip: frozenset[tuple[str, str]] = frozenset()) -> list[str]:
     """A (package, bin, directory) that two builds give different resolved feature sets: they write one file,
     <dir>/<profile>/<bin>, and cuda-host reads the PTX bundle from `current_exe()` at each module load, so the
     later build replaces the file a running gate loads its kernels from (2026-10-12: gate_glm5next_e2e built
@@ -5283,7 +5732,7 @@ def bin_feature_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
     oxart_jit, built three times): the file is replaced under whichever lane runs it just the same, so a recipe's
     own order is no exemption. The key is the directory the call writes to, so builds that land in different
     directories pass. A call whose features or target directory come from a recipe parameter is left out: they
-    are known at run time only."""
+    are known at run time only. A (package, bin) in `skip` is another rule's to name (bin_problems)."""
     built: dict[tuple[str, str, str], dict[tuple[str, ...], list[str]]] = {}
     for rname, inv, _, param in build_calls(recipes):
         where = build_dir(inv)
@@ -5291,7 +5740,7 @@ def bin_feature_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
             continue
         targets, _ = resolve_call(tree, inv)  # an unresolvable call is check()'s error, named there
         for pname, kind, name, _, enabled, others in targets:
-            if kind == "bin":
+            if kind == "bin" and (pname, name or "") not in skip:
                 users = built.setdefault((pname, name or "", where), {}).setdefault(tuple(sorted(enabled + others)), [])
                 if rname not in users:
                     users.append(rname)
@@ -5306,6 +5755,22 @@ def bin_feature_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
             f"(one {name} file in {where}: a rebuild replaces the PTX bundle a running gate reads; build the union in each, or give a build its own target dir where no runner reads target/release)"
         )
     return problems
+
+
+def bin_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
+    """check()'s two bin rules, each defect named once. A bin tools/release/build.sh ships is held
+    to the release list by release_feature_problems, which names the recipe that departs from it; bin_feature_problems
+    steps aside for it. Where the first is green every build of the bin spells the release words with the default
+    features, which is one resolved set, so the second would be green as well; where it is red, the recipe it names is
+    the answer, and the second's advice (build the union, or give a build its own target dir) is wrong for a shipped bin.
+    Every other bin is held to one resolved set. A build.sh that cannot be read is a named error and leaves the second
+    rule whole."""
+    try:
+        rb = read_release_build(tree.root)
+    except RecipeError as err:
+        return [str(err)] + bin_feature_problems(tree, recipes)
+    owned = frozenset((rb.package, b) for b in rb.bins)
+    return release_feature_problems(rb, tree, recipes) + bin_feature_problems(tree, recipes, owned)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -7736,7 +8201,8 @@ def scan_set_self_test(expect, side: Side) -> None:
                  "crates/gates/src/lib.rs": plain, "crates/gates/src/bin/x.rs": "fn main() {}\n", "crates/gates/src/bin/y.rs": "fn main() {}\n",
                  "crates/gates/src/bin/z.rs": kernel + "fn main() {}\n", "crates/gates/src/bin/w.rs": "fn main() {}\n",
                  "crates/other/src/main.rs": kernel + "fn main() {}\n" if other else "fn main() {}\n",
-                 "justfile": "gate-gx:\n    ./tools/box.sh 'cargo oxide build -- -p bloomery-gpu-gates --features fa --release --bin x'\n" + recipe}
+                 "justfile": "gate-gx:\n    ./tools/box.sh 'cargo oxide build -- -p bloomery-gpu-gates --features fa --release --bin x'\n" + recipe,
+                 RELEASE_BUILD: "BINS=(x)\ncargo oxide build -- -p bloomery-gpu-gates --features fa --release\n"}
         for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
             files[f] = ""
         for rel, text in files.items():
@@ -7787,6 +8253,13 @@ def scan_set_self_test(expect, side: Side) -> None:
                "scan-set: a lib no bin links is not a named error")
         expect(refused(lambda: scan_set(build(tmp, "t3", other=True)), "no bin of bloomery-gpu-gates covers bin o"),
                "scan-set: a bin carrier outside the scan package is not a named error")
+        # the shipped bins at the release features come first: x (fa) covers liba, then y and z cover what is left
+        got = scan_set(fx, ship=True)
+        expect(shown(got) == [("x", ("fa",)), ("y", ("fb",)), ("z", ("fa",))] and got[0].covers == ["lib liba"],
+               f"scan-set: --ship does not put the shipped bin first: {shown(got)} {got[0].covers if got else got}")
+        no_build = build(tmp, "t4")
+        os.remove(os.path.join(tmp, "t4", RELEASE_BUILD))
+        expect(refused(lambda: scan_set(no_build, ship=True), RELEASE_BUILD), "scan-set: --ship without tools/release/build.sh is not a named error")
         # a bin's own scan does not vouch for a lib of its package: the bundle name is shared
         c = Carrier("lib p", "p", set(), [], siblings=frozenset({"b"}))
         expect(not carrier_covered(c, "b", ["p"]) and carrier_covered(c, "x", ["p"]) and not carrier_covered(c, "x", ["q"]),
@@ -10439,6 +10912,7 @@ def self_test(serial: bool = False) -> int:
     def small(f: list[str]) -> None:
         expect = _expecting(f)
         scan_set_self_test(expect, side)  # the scan set
+        ships_self_test(expect)  # the shipped closure and the release feature list
         manifest_self_test(expect)  # a package manifest read by table
         root_manifest_self_test(expect)  # the root Cargo.toml read by table
         range_base_self_test(expect)  # A..B read against the merge base
@@ -10501,6 +10975,16 @@ def main(argv: list[str]) -> int:
     a.add_argument("--scan", nargs=2, action="append", metavar=("BASE_LOG", "NEW_LOG"), help="a pair of `just ptx-scan <bin>` logs, the base tree's and the change's (repeatable)")
     ss = sub.add_parser("scan-set", help="the bins whose ptx-scans cover every kernel carrier, one line each: bin<TAB>features<TAB>the carriers it covers (tools/narrow-scan.sh scans them)")
     ss.add_argument("rev", nargs="?", help="the commit to read (a git archive of it); default the working tree")
+    ss.add_argument("--ship", action="store_true", help=f"the shipped bins at the release features (tools/release/build.sh) are the first picks; {SCAN_SHIP_ENV}=1 does the same")
+    sh = sub.add_parser("ships", help="the FILEs inside the shipped closure, one `file<TAB>why` line each; exit 1 when any is (tools/release/late-commit.sh)")
+    sh.add_argument("files", nargs="+", metavar="FILE")
+    sh.add_argument("--rev", help="read the closure at this commit (a git archive of it); default the working tree")
+    sh.add_argument("--base", help="a file in this commit's closure counts too (a deleted or moved-away file)")
+    sc = sub.add_parser("ship-scan", help="the ptx-scan pairs of the shipped bins: one verdict line each; exit 0 only when every shipped bin has a pair and every pair is identical (tools/release/late-commit.sh)")
+    sc.add_argument("logs", nargs="+", metavar="LOG", help="BASE_LOG HEAD_LOG, once per shipped bin")
+    sc.add_argument("--rev", help="read the shipped bins at this commit; default the working tree")
+    sb = sub.add_parser("ship-bins", help="the shipped bins and the release features: bin<TAB>features (tools/release/build.sh)")
+    sb.add_argument("--rev", help="read build.sh at this commit; default the working tree")
     w = sub.add_parser("why")
     w.add_argument("files", nargs="+")
     w.add_argument("--all-recipes", action="store_true")
@@ -10553,6 +11037,12 @@ def main(argv: list[str]) -> int:
             return cmd_affected(args)
         if args.cmd == "scan-set":
             return cmd_scan_set(args)
+        if args.cmd == "ships":
+            return cmd_ships(args)
+        if args.cmd == "ship-scan":
+            return cmd_ship_scan(args)
+        if args.cmd == "ship-bins":
+            return cmd_ship_bins(args)
         if args.cmd == "why":
             return cmd_why(args)
         if args.cmd == "reach":
