@@ -66,7 +66,7 @@
 //! is the total and each slot takes `total / N` positions rounded down
 //! (llama-server's `-np N` without `-kvu`) under a set `--parallel N` —
 //! alone it is one request's context, one slot at the whole of it
-//! (`placement::ctx::slots_of`; one line on stderr says so) — a slot
+//! (`bind::slots_of`; one line on stderr says so) — a slot
 //! under the body's floor
 //! refused by name before the plan — one position, or the MTP draft's
 //! window under `BLOOMERY_DRAFT=mtp` — and the plan refusing it by name past
@@ -120,8 +120,11 @@
 //! ([`SlotDrafts`]), so each request's tokens are its solo run's;
 //! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
 //! by name. `--parallel` naming no count, the seat serves one slot beside a
-//! set `--ctx` (the flag is one request's context, `placement::ctx::slots_of`) and its
-//! default two over the automatic context. The round's shape the open decided once, from the load and the
+//! set `--ctx` (the flag is one request's context, `bind::slots_of`) and its
+//! default two over the automatic context; when the plan refuses the default's
+//! second slot the seat plans one and says so (`bind::default_slots_fit`: one stderr
+//! line and `from=fit` on the `parallel` line), a count the flags set is never
+//! lowered. The round's shape the open decided once, from the load and the
 //! body's `SlotRows::MAX_ROWS`: a plain load (no NextN draft) runs a round of
 //! steps as one pass of the busy rows
 //! (`serve_seats::rounds::step_rows_one_pass`, cut at that bound); a NextN
@@ -251,8 +254,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, Vocab, begin, bind_server, model_props, note_line, parallel_line, placement_of,
-    put_back, slots_given,
+    SlotStep, Vocab, begin, bind_server, default_slots_fit, model_props, note_line, parallel_line,
+    placement_of, put_back, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -732,7 +735,7 @@ struct Args {
     plan_only: bool,
     /// `--parallel`: the resident sequences the seat serves; `None` takes
     /// one slot beside a set `--ctx`, else the default 2
-    /// ([`model::placement::ctx::slots_of`]).
+    /// (`bind::slots_of`).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// The image-input flags: `--mmproj` is GLM's own encoder file, whose
@@ -873,7 +876,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // window under `BLOOMERY_DRAFT=mtp` (unset, the rule below drafts only
     // where a window fits, and never refuses). The slot count itself: a set
     // `--ctx` with no `--parallel` is one request's context — one slot at
-    // the whole of it (`placement::ctx::slots_of`).
+    // the whole of it (`bind::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, 2)?;
     let (floor, why) = match levers.draft() {
         Some("mtp") => (
@@ -891,24 +894,27 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The split is `placement::slots::split_ctx`'s, ⌊total / slots⌋
     // (llama-server's `-np N` without `-kvu`); its refusal in the flags'
     // words.
-    let set = a
-        .ctx
-        .map(|total| {
-            let share = split_ctx(total as u64, slots as u64, floor).map_err(|e| match e {
-                SplitError::NoSlots { .. } => {
-                    format!("--ctx {total}: --parallel 0 splits it among no slot ({why})")
-                }
-                SplitError::BelowFloor { split, floor, .. } => format!(
-                    "--ctx {total}: --parallel {slots} splits it to {split} positions a slot, \
-                     under the {floor} a slot needs ({why})"
-                ),
-            })?;
-            usize::try_from(share).map_err(|_| format!("a slot's {share} positions"))
-        })
-        .transpose()?;
+    let ctx_share = |slots: usize| -> Result<Option<usize>, String> {
+        a.ctx
+            .map(|total| {
+                let share = split_ctx(total as u64, slots as u64, floor).map_err(|e| match e {
+                    SplitError::NoSlots { .. } => {
+                        format!("--ctx {total}: --parallel 0 splits it among no slot ({why})")
+                    }
+                    SplitError::BelowFloor { split, floor, .. } => format!(
+                        "--ctx {total}: --parallel {slots} splits it to {split} positions a \
+                         slot, under the {floor} a slot needs ({why})"
+                    ),
+                })?;
+                usize::try_from(share).map_err(|_| format!("a slot's {share} positions"))
+            })
+            .transpose()
+    };
+    let set = ctx_share(slots)?;
     // The unset rule's window bound reads a slot's floor context — a default
     // is never under it while the card holds it — and the context the rule
-    // chooses is asked again below.
+    // chooses is asked again below. A default count has no `--ctx`, so what
+    // this reads is the same at the one slot the load may fall to.
     let at_ctx = set.unwrap_or(CTX);
     // Whether the placement serves: an unset flag does (the common rule
     // never picks `gate`), and a set one does unless it is `gate`.
@@ -926,7 +932,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         None => Some(NextnInputs::read(&inputs)?),
         Some(_) => None,
     };
-    let plan_place = |p: Place| {
+    let plan_place = |p: Place, (set, slots): (Option<usize>, usize)| {
         Placed::of(
             p,
             &inputs,
@@ -942,12 +948,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // the offer runs `a`, the refusal named on stderr. Planning the chosen
     // placement again is milliseconds.
     let chosen = Place::choose(a.place, &census, glm_place::TIER_RULE, |p| {
-        Ok(plan_place(p)?.tier_experts)
+        Ok(plan_place(p, (set, slots))?.tier_experts)
     })?;
     chosen.record().eprint();
     // The lane's rate, taken before the plan reads the room (`lane_of`).
     let lane = lane_at(chosen.place)?;
-    let drafted = plan_place(chosen.place)?;
     // The unset draft's yield to the context (qwen38's module doc, the one
     // rule through `bloomery_levers::DraftYield`): the chosen placement's
     // search is the drafted load's own — its fit is the positions a slot
@@ -959,43 +964,50 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // fits together keeps the draft. A set `--ctx` or `BLOOMERY_DRAFT`
     // never asks, and the placement's own choice (`chosen`, planned with
     // the NextN layer) stands: a card small enough to yield holds no tier
-    // either way.
-    let (placed, draft_off) = if draft_off.is_none()
-        && a.ctx.is_none()
-        && levers.draft().is_none()
-        && drafted.rule.fit < CTX
-    {
-        let plain = Placed::of(
-            chosen.place,
-            &inputs,
-            &plan_levers,
-            None,
-            (set, slots),
-            &images,
-        )?;
-        let with = inputs.plan_nextn_slots(
-            &drafted.machine,
-            u64::try_from(drafted.rule.ctx)?,
-            &plan_levers,
-            nextn.as_ref().expect("a drafted load read the NextN layer"),
-            slots,
-        )?;
-        let bytes = with.nextn_card_bytes() + with.arena_bytes;
-        match bloomery_levers::DraftYield::of(
-            drafted.rule.ctx,
-            plain.rule.ctx,
-            CTX.min(plain.rule.fit),
-            bytes,
-        ) {
-            Some(y) => {
-                record::draft_yield(&y).eprint();
-                (plain, Some(y.to_string()))
+    // either way. The default's second slot that the plan refuses falls to
+    // one slot (`from=fit`), the placement stays the one chosen at the asked
+    // count; a count the flags set is never lowered. An attempt prints
+    // nothing: the record is returned and printed once the count stands.
+    let ((placed, draft_off, yield_record), slots, from) =
+        default_slots_fit(WHAT, chosen.place.name(), slots, from, |slots| {
+            let set = ctx_share(slots)?;
+            let drafted = plan_place(chosen.place, (set, slots))?;
+            if draft_off.is_none()
+                && a.ctx.is_none()
+                && levers.draft().is_none()
+                && drafted.rule.fit < CTX
+            {
+                let plain = Placed::of(
+                    chosen.place,
+                    &inputs,
+                    &plan_levers,
+                    None,
+                    (set, slots),
+                    &images,
+                )?;
+                let with = inputs.plan_nextn_slots(
+                    &drafted.machine,
+                    u64::try_from(drafted.rule.ctx)?,
+                    &plan_levers,
+                    nextn.as_ref().expect("a drafted load read the NextN layer"),
+                    slots,
+                )?;
+                let bytes = with.nextn_card_bytes() + with.arena_bytes;
+                if let Some(y) = bloomery_levers::DraftYield::of(
+                    drafted.rule.ctx,
+                    plain.rule.ctx,
+                    CTX.min(plain.rule.fit),
+                    bytes,
+                ) {
+                    let said = record::draft_yield(&y);
+                    return Ok::<_, GateError>((plain, Some(y.to_string()), Some(said)));
+                }
             }
-            None => (drafted, draft_off),
-        }
-    } else {
-        (drafted, draft_off)
-    };
+            Ok((drafted, draft_off.clone(), None))
+        })?;
+    if let Some(said) = yield_record {
+        said.eprint();
+    }
     // A width lever set on a server that drafts nothing is refused, with
     // why — after the yield said its last word.
     if let (Some(why), Some(_)) = (&draft_off, levers.mtp_width()) {

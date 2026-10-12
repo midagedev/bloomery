@@ -318,17 +318,99 @@ pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeErr
     Server::bind_with((l.host, l.port), Box::new(engine), config, slots)
 }
 
-/// The slots a seat serves and what set the count (`from`, as
-/// `model::placement::ctx::slots_of` words it); a set `--ctx` with no
+/// What set a seat's slot count, the word its `parallel` line's `from=` names:
+/// the one owner of those words, which the gates read as text. A seat holds the
+/// type, never the word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotsFrom {
+    /// `--parallel` as given.
+    Flag,
+    /// No `--parallel` beside a set `--ctx`: one slot at the whole context.
+    Ctx,
+    /// Neither flag: the seat's own default count over its automatic context.
+    Default,
+    /// The default's second slot did not fit the plan, so one slot is served.
+    Fit,
+    /// The default count's plan pages host experts through the NVMe tier, so
+    /// fewer slots are served.
+    Paged,
+    /// A route trace records one sequence's steps, so one slot is served.
+    RouteTrace,
+    /// The DSpark draft's window is one sequence's, so one slot is served.
+    Dspark,
+}
+
+impl SlotsFrom {
+    /// The `from=` word.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            SlotsFrom::Flag => "flag",
+            SlotsFrom::Ctx => "ctx",
+            SlotsFrom::Default => "default",
+            SlotsFrom::Fit => "fit",
+            SlotsFrom::Paged => "paged",
+            SlotsFrom::RouteTrace => "route-trace",
+            SlotsFrom::Dspark => "dspark",
+        }
+    }
+}
+
+impl std::fmt::Display for SlotsFrom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.word())
+    }
+}
+
+/// A slot count of none: a seat's own parse refuses `--parallel 0` before
+/// [`slots_of`], which refuses it too, so no call serves a count of no slot.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NoSlot;
+
+impl std::fmt::Display for NoSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("--parallel 0: the server serves no slot")
+    }
+}
+
+impl std::error::Error for NoSlot {}
+
+/// The resident sequences a seat serves and what set the count
+/// ([`SlotsFrom`]): `parallel` (`--parallel`) as given
+/// ([`SlotsFrom::Flag`]); unset beside a set `--ctx`, one slot at the whole
+/// context — a `--ctx-size` is what one request gets, as llama-server reads it
+/// ([`SlotsFrom::Ctx`]); unset with no context named, the seat's own default
+/// (`seat_default`) over its automatic context ([`SlotsFrom::Default`]).
+///
+/// # Errors
+/// [`NoSlot`] when the count comes out as zero.
+pub fn slots_of(
+    parallel: Option<usize>,
+    ctx_set: bool,
+    seat_default: usize,
+) -> Result<(usize, SlotsFrom), NoSlot> {
+    let (slots, from) = match parallel {
+        Some(n) => (n, SlotsFrom::Flag),
+        None if ctx_set => (1, SlotsFrom::Ctx),
+        None => (seat_default, SlotsFrom::Default),
+    };
+    if slots == 0 {
+        return Err(NoSlot);
+    }
+    Ok((slots, from))
+}
+
+/// The slots a seat serves and what set the count (`from`, as [`slots_of`]
+/// returns it); a set `--ctx` with no
 /// `--parallel` prints the one line that says the flag is one request's
 /// context.
 pub fn slots_given(
     parallel: Option<usize>,
     ctx: Option<usize>,
     default: usize,
-) -> Result<(usize, &'static str), GateError> {
-    let (slots, from) = model::placement::ctx::slots_of(parallel, ctx.is_some(), default)?;
-    if from == "ctx" {
+) -> Result<(usize, SlotsFrom), GateError> {
+    let (slots, from) = slots_of(parallel, ctx.is_some(), default)?;
+    if from == SlotsFrom::Ctx {
         eprintln!(
             "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
              once (they split it)",
@@ -341,12 +423,13 @@ pub fn slots_given(
 /// The plan of a load at the slot count `slots` names (`from`, as
 /// [`slots_given`] returns it), never costing a working load for a default's
 /// second slot: `plan(slots)` is tried first, and when it is refused while the
-/// count is the seat's default (`from == "default"`, more than one slot) the
+/// count is the seat's default ([`SlotsFrom::Default`], more than one slot) the
 /// load is planned again at one slot, on one stderr line naming `name`, the
 /// `place` and the refusal. Returns what `plan` built, the slots it was built
-/// for and `from` (`fit` after the fall to one slot). A set count (`flag`) or
-/// a count a `--ctx` made (`ctx`) is never lowered: its refusal stands, and so
-/// does the one-slot plan's when that too is refused.
+/// for and `from` ([`SlotsFrom::Fit`] after the fall to one slot). A set count
+/// ([`SlotsFrom::Flag`]) or a count a `--ctx` made ([`SlotsFrom::Ctx`]) is
+/// never lowered: its refusal stands, and so does the one-slot plan's when that
+/// too is refused.
 ///
 /// # Errors
 /// The refusal of the plan that was last tried.
@@ -354,20 +437,32 @@ pub fn default_slots_fit<T, E: std::fmt::Display>(
     name: &str,
     place: &str,
     slots: usize,
-    from: &'static str,
+    from: SlotsFrom,
     mut plan: impl FnMut(usize) -> Result<T, E>,
-) -> Result<(T, usize, &'static str), E> {
+) -> Result<(T, usize, SlotsFrom), E> {
     match plan(slots) {
         Ok(p) => Ok((p, slots, from)),
-        Err(e) if from == "default" && slots > 1 => {
+        Err(e) if from == SlotsFrom::Default && slots > 1 => {
             eprintln!(
                 "{name}: the default's second slot does not fit on --place {place} ({e}); serving \
                  one slot (--parallel {slots} requires it)"
             );
-            plan(1).map(|p| (p, 1, "fit"))
+            plan(1).map(|p| (p, 1, SlotsFrom::Fit))
         }
         Err(e) => Err(e),
     }
+}
+
+/// The floor in bytes that the refusal of a plan under the card budget
+/// `budget` names: `PlacementError::CardBudgetFloor`'s words `budget {budget}
+/// B is below its floor {N} B`, found anywhere in `text` (a seat's error, or
+/// the line that quotes it). `None` when `text` holds no such refusal at that
+/// budget.
+#[must_use]
+pub fn budget_floor(text: &str, budget: u64) -> Option<u64> {
+    let head = format!("budget {budget} B is below its floor ");
+    let rest = &text[text.find(&head)? + head.len()..];
+    rest.split_once(" B")?.0.parse().ok()
 }
 
 /// The shape a seat's round of several slots runs in, decided once at the
@@ -412,7 +507,7 @@ impl Pass {
 }
 
 /// The text of [`parallel_line`].
-fn parallel_text(slots: usize, slot_ctx: usize, from: &str, pass: Pass) -> String {
+fn parallel_text(slots: usize, slot_ctx: usize, from: SlotsFrom, pass: Pass) -> String {
     format!(
         "parallel rule=slots slots={slots} slot_ctx={slot_ctx} total={} from={from} pass={}",
         slots * slot_ctx,
@@ -423,7 +518,7 @@ fn parallel_text(slots: usize, slot_ctx: usize, from: &str, pass: Pass) -> Strin
 /// The `parallel` line a seat prints before its load: the slots, a slot's
 /// context, the total, what set the count (`from`), and the shape of a round
 /// of several slots (`pass`).
-pub fn parallel_line(slots: usize, slot_ctx: usize, from: &str, pass: Pass) {
+pub fn parallel_line(slots: usize, slot_ctx: usize, from: SlotsFrom, pass: Pass) {
     eprintln!("{}", parallel_text(slots, slot_ctx, from, pass));
 }
 
@@ -3208,7 +3303,7 @@ mod tests {
     /// size their rounds by.
     #[test]
     fn the_parallel_line_names_the_shape_of_a_round() {
-        use super::{Pass, parallel_text};
+        use super::{Pass, SlotsFrom, parallel_text};
         for (slots, one_pass, want) in [
             (1, true, Pass::One),
             (1, false, Pass::One),
@@ -3222,22 +3317,91 @@ mod tests {
         assert!(!Pass::Turns.together(2));
         assert_eq!(Pass::One.word(), "one");
         assert_eq!(Pass::Turns.word(), "turns");
+        // Every `from=` word the seats print, as the gates read it.
+        for (from, word) in [
+            (SlotsFrom::Flag, "flag"),
+            (SlotsFrom::Ctx, "ctx"),
+            (SlotsFrom::Default, "default"),
+            (SlotsFrom::Fit, "fit"),
+            (SlotsFrom::Paged, "paged"),
+            (SlotsFrom::RouteTrace, "route-trace"),
+            (SlotsFrom::Dspark, "dspark"),
+        ] {
+            assert_eq!(
+                parallel_text(2, 7, from, Pass::Turns),
+                format!("parallel rule=slots slots=2 slot_ctx=7 total=14 from={word} pass=turns")
+            );
+        }
         assert_eq!(
-            parallel_text(2, 4096, "flag", Pass::One),
+            parallel_text(2, 4096, SlotsFrom::Flag, Pass::One),
             "parallel rule=slots slots=2 slot_ctx=4096 total=8192 from=flag pass=one"
         );
-        assert_eq!(
-            parallel_text(2, 7, "default", Pass::Turns),
-            "parallel rule=slots slots=2 slot_ctx=7 total=14 from=default pass=turns"
-        );
+    }
+
+    /// The slot count and its word: `--parallel` as given, one slot at the
+    /// whole context beside a set `--ctx` (the flag is one request's
+    /// context, not a total the seat's slots split), the seat's own default
+    /// with neither, and a count of none refused by name.
+    #[test]
+    fn slots_of_rows() {
+        use super::{NoSlot, SlotsFrom, slots_of};
+        type Row = (Option<usize>, bool, usize, (usize, SlotsFrom));
+        let rows: [Row; 6] = [
+            (Some(3), false, 2, (3, SlotsFrom::Flag)),
+            (Some(3), true, 2, (3, SlotsFrom::Flag)),
+            (Some(1), true, 2, (1, SlotsFrom::Flag)),
+            (None, true, 2, (1, SlotsFrom::Ctx)),
+            (None, false, 2, (2, SlotsFrom::Default)),
+            (None, false, 1, (1, SlotsFrom::Default)),
+        ];
+        for (parallel, ctx_set, seat, want) in rows {
+            let got = slots_of(parallel, ctx_set, seat).expect("a count");
+            assert_eq!(got, want, "parallel {parallel:?}, ctx set {ctx_set}");
+        }
+        for (parallel, ctx_set, seat) in [(Some(0), false, 2), (Some(0), true, 2), (None, false, 0)]
+        {
+            let refused = slots_of(parallel, ctx_set, seat).expect_err("no slot");
+            assert_eq!(refused, NoSlot);
+            assert_eq!(
+                refused.to_string(),
+                "--parallel 0: the server serves no slot"
+            );
+        }
+    }
+
+    /// The `from=` words are read as text by the gates: each variant prints
+    /// its word, `Display` and [`SlotsFrom::word`] alike, and no two are one.
+    #[test]
+    fn slots_from_words() {
+        use super::SlotsFrom;
+        let words = [
+            (SlotsFrom::Flag, "flag"),
+            (SlotsFrom::Ctx, "ctx"),
+            (SlotsFrom::Default, "default"),
+            (SlotsFrom::Fit, "fit"),
+            (SlotsFrom::Paged, "paged"),
+            (SlotsFrom::RouteTrace, "route-trace"),
+            (SlotsFrom::Dspark, "dspark"),
+        ];
+        for (from, word) in words {
+            assert_eq!(from.word(), word);
+            assert_eq!(from.to_string(), word);
+        }
+        for (i, (_, a)) in words.iter().enumerate() {
+            for (_, b) in &words[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     /// A default's second slot falls to one slot when its plan is refused and
     /// the one-slot plan stands (`fit`); a set count is never lowered, and a
-    /// one-slot refusal ends the load with its own refusal.
+    /// one-slot refusal ends the load with its own refusal. Only the default
+    /// falls: every other word, the ones a seat gives a count it chose itself
+    /// included, keeps its refusal.
     #[test]
     fn a_defaults_second_slot_never_costs_a_working_load() {
-        use super::default_slots_fit;
+        use super::{SlotsFrom, default_slots_fit};
         let fits_one = |s: usize| {
             if s == 1 {
                 Ok(s * 10)
@@ -3250,15 +3414,71 @@ mod tests {
         let fit = |from, plan: &dyn Fn(usize) -> Result<usize, String>| {
             default_slots_fit("t", "a", 2, from, plan)
         };
-        assert_eq!(fit("default", &fits_one), Ok((10, 1, "fit")));
-        assert_eq!(fit("flag", &fits_one), Err("2 slots".to_owned()));
-        assert_eq!(fit("ctx", &fits_one), Err("2 slots".to_owned()));
-        assert_eq!(fit("default", &fits_all), Ok((2, 2, "default")));
-        assert_eq!(fit("default", &fits_none), Err("1 slots".to_owned()));
         assert_eq!(
-            default_slots_fit("t", "a", 1, "default", fits_one),
-            Ok((10, 1, "default"))
+            fit(SlotsFrom::Default, &fits_one),
+            Ok((10, 1, SlotsFrom::Fit))
         );
+        for held in [
+            SlotsFrom::Flag,
+            SlotsFrom::Ctx,
+            SlotsFrom::Fit,
+            SlotsFrom::Paged,
+            SlotsFrom::RouteTrace,
+            SlotsFrom::Dspark,
+        ] {
+            assert_eq!(fit(held, &fits_one), Err("2 slots".to_owned()), "{held}");
+        }
+        assert_eq!(
+            fit(SlotsFrom::Default, &fits_all),
+            Ok((2, 2, SlotsFrom::Default))
+        );
+        assert_eq!(
+            fit(SlotsFrom::Default, &fits_none),
+            Err("1 slots".to_owned())
+        );
+        assert_eq!(
+            default_slots_fit("t", "a", 1, SlotsFrom::Default, fits_one),
+            Ok((10, 1, SlotsFrom::Default))
+        );
+    }
+
+    /// The floor a card-budget refusal names is read from the placement's own
+    /// error text, alone or quoted in the default's fall line, and only for
+    /// the budget asked: another budget's refusal, an error of another kind
+    /// and a floor that is not a number name none.
+    #[test]
+    fn the_budget_floor_is_read_from_the_refusal_text() {
+        use super::budget_floor;
+        use model::placement::PlacementError;
+        let refusal = |budget, floor| {
+            PlacementError::CardBudgetFloor {
+                card: "gate".to_owned(),
+                budget,
+                floor,
+                dense: 5,
+                kv: 7,
+                context: 11,
+                scratch: 13,
+                reserves: 17,
+                margin: 19,
+            }
+            .to_string()
+        };
+        let text = refusal(268_435_456, 3_000_000_001);
+        assert_eq!(budget_floor(&text, 268_435_456), Some(3_000_000_001));
+        assert_eq!(budget_floor(&text, 268_435_457), None);
+        assert_eq!(
+            budget_floor(&refusal(1, u64::MAX), 1),
+            Some(u64::MAX),
+            "an overflowed floor is printed as u64::MAX"
+        );
+        let quoted = format!(
+            "t: the default's second slot does not fit on --place gate ({text}); serving one \
+             slot (--parallel 2 requires it)"
+        );
+        assert_eq!(budget_floor(&quoted, 268_435_456), Some(3_000_000_001));
+        assert_eq!(budget_floor("budget 5 B is below its floor x B", 5), None);
+        assert_eq!(budget_floor("no space for 5 B", 5), None);
     }
 
     /// The checkpoints a load's sequences pin grow one budget a sequence

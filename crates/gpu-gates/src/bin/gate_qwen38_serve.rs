@@ -3150,7 +3150,7 @@ mod gate {
     // one-sequence search (round q38rules). The refusal arm's own count moved
     // to one slot by the PIN(2026-10-07) below.
     // PIN(2026-10-07): the refusal arm and the one-slot arm take one slot — a set
-    // `--ctx-size` with no `--parallel` is one request's context now (`placement::ctx::slots_of`),
+    // `--ctx-size` with no `--parallel` is one request's context now (`bind::slots_of`),
     // so the arm's `at1` below is `plan_with_slots(1)` and its ask is one past the
     // one-slot fit.
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {

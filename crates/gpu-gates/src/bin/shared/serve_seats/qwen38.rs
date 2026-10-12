@@ -123,7 +123,7 @@
 //! and the open prints a line that says so. `--parallel 1` is exactly the
 //! one-sequence server, its rounds one pass a slot. `--parallel` naming no
 //! count, the seat serves one slot beside a set `--ctx-size` (the flag is
-//! one request's context, `placement::ctx::slots_of`; one line on stderr says so),
+//! one request's context, `bind::slots_of`; one line on stderr says so),
 //! one under the route trace (below), and its default two over the automatic
 //! context. Under more slots than one
 //! the context is split
@@ -337,8 +337,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, Vocab, begin, bind_server, model_props, note_line, parallel_line, placement_of,
-    put_back,
+    SlotStep, SlotsFrom, Vocab, begin, bind_server, model_props, note_line, parallel_line,
+    placement_of, put_back, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -1145,7 +1145,7 @@ struct Args {
     slot_save_path: Option<PathBuf>,
     /// `--parallel`: the resident sequences the seat serves; `None` takes
     /// one slot beside a set `--ctx-size`, else the default 2
-    /// ([`model::placement::ctx::slots_of`]).
+    /// (`bind::slots_of`).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// `--park-ram` in bytes; set is refused by name (resident slots park
@@ -1268,10 +1268,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // context search itself, and every plan the seat asks for, each counting
     // every sequence (`Plans::slots`). A set `--ctx-size` with no
     // `--parallel` is one request's context — one slot at the whole of it
-    // (`placement::ctx::slots_of`).
+    // (`bind::slots_of`).
     // The route trace records one sequence's steps, so its default is one.
-    let (slots, from) = match model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)? {
-        (_, "default") if feed.traced => (1, "route-trace"),
+    let (slots, from) = match slots_of(a.parallel, a.ctx.is_some(), 2)? {
+        (_, SlotsFrom::Default) if feed.traced => (1, SlotsFrom::RouteTrace),
         given => given,
     };
     // The draft's one context condition (a window's positions a slot) holds
@@ -1362,7 +1362,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     drop(split);
-    if from == "ctx" {
+    if from == SlotsFrom::Ctx {
         eprintln!(
             "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
              once (they split it)",
@@ -1421,7 +1421,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let paged_at = |arena: u64, slots: usize, mtp: bool| bloomery_levers::PagedAt {
         arena,
         slots,
-        slots_set: from == "flag",
+        slots_set: from == SlotsFrom::Flag,
         together: !a.place.tiered(),
         draft: mtp,
         draft_set: levers.draft().is_some(),
@@ -1456,7 +1456,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 ""
             }
         );
-        (if served < slots { "paged" } else { from }, draft_off)
+        (
+            if served < slots {
+                SlotsFrom::Paged
+            } else {
+                from
+            },
+            draft_off,
+        )
     };
     let early = match a.ctx.map(|c| c / slots) {
         Some(ctx) if ctx > 0 && (slots > 1 || mtp) => {
@@ -1490,7 +1497,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // pages. The one slot is the room's, not a column's, so it holds beside
     // a tier card too, where each slot steps alone and the column rule keeps
     // them (`bloomery_levers::paged_floor`; a set draft is refused by name).
-    let floor = if from == "default" && slots > 1 {
+    let floor = if from == SlotsFrom::Default && slots > 1 {
         let asked = Plans {
             inputs: &inputs,
             place: a.place,
