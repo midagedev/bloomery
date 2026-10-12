@@ -162,12 +162,13 @@
 //!   same plan), its `load` record `slots=2` and `ctx` [`CTX`], its
 //!   `listening` record `slots=2`, its `parallel` line the split with
 //!   `pass=one`, and its
-//!   resident bytes exceed the one-slot server's by more than one slot's
-//!   stores (the plan's own count, `KvLayout::bytes` over the layers at
-//!   [`CTX`]): a load of two sequences also holds a pass's buffers and the
-//!   card experts' buffers of two rows, which the plan's fixed scratch term
-//!   covers and a load of one sequence does not allocate; the line prints
-//!   that excess.
+//!   resident bytes outside its scratch (the `load` record's `scratch_bytes`)
+//!   exceed the one-slot server's by exactly one slot's stores (the plan's
+//!   own count, `KvLayout::bytes` over the layers at [`CTX`]), and its
+//!   scratch exceeds the one-slot server's: a load of two sequences also
+//!   holds a pass's buffers and the card experts' buffers of two rows, which
+//!   the plan's fixed scratch term covers and a load of one sequence does not
+//!   allocate.
 //!   Two rounds, each of two requests in flight together at
 //!   `cache_prompt: false` — the batch prompt with the prose prompt, then the
 //!   prose prompt with the batch prompt started first — answer each prompt's
@@ -1009,8 +1010,9 @@ mod gate {
         batch: Answer,
         prose: Answer,
         chat: Answer,
-        /// The one-slot server's `load` record's resident bytes.
+        /// The one-slot server's `load` record's resident and scratch bytes.
         resident: u64,
+        scratch: u64,
         /// The split of the one-slot server's `plan` record.
         planned: Planned,
     }
@@ -1123,6 +1125,7 @@ mod gate {
             prose,
             chat,
             resident: load.u64("resident_bytes")?,
+            scratch: load.u64("scratch_bytes")?,
             planned,
         }))
     }
@@ -1227,15 +1230,15 @@ mod gate {
             "parallel rule=slots slots=2 slot_ctx={CTX} total={} from=flag pass=one",
             2 * CTX
         );
-        let resident = load.u64("resident_bytes")?;
-        // PIN(2026-10-12): the two-slot load holds more than the one-slot
-        // load plus one slot's stores, not exactly that: a load of two
-        // sequences allocates a pass's buffers at `MAX_ROWS` rows and the card
-        // experts' buffers at two rows beside everything the one-slot load
-        // holds (gpu-mimo2 `Body::load`), all inside the plan's fixed scratch
-        // term. The excess was 6,512,144 B on the A6000 with the same plan
-        // and the same ids; it is printed here, its exact term is not held.
-        let excess = i128::from(resident) - i128::from(one.resident) - i128::from(store_bytes);
+        let (resident, scratch) = (load.u64("resident_bytes")?, load.u64("scratch_bytes")?);
+        // Outside the scratch, the second slot adds its stores and nothing
+        // else; inside it, a load of two sequences adds a pass's buffers and
+        // the card experts' second row (gpu-mimo2 `Body::load`).
+        let outside = |resident: u64, scratch: u64| i128::from(resident) - i128::from(scratch);
+        let past_stores = outside(resident, scratch)
+            - outside(one.resident, one.scratch)
+            - i128::from(store_bytes);
+        let pass_bytes = i128::from(scratch) - i128::from(one.scratch);
         let same_plan = planned == one.planned;
         let loaded = same_plan
             && load.u64("slots")? == 2
@@ -1243,16 +1246,19 @@ mod gate {
             && listen.u64("slots")? == 2
             && listen.u64("ctx")? == CTX as u64
             && stderr.lines().any(|l| l == line)
-            && excess > 0;
+            && past_stores == 0
+            && pass_bytes > 0;
         println!(
             "two-slot server at {addr}; plan {planned:?} against the one-slot server's {:?}: \
              {same_plan}; load record {:?}; listening record {:?}; resident {resident} B \
-             against the one-slot server's {} B and one slot's stores {store_bytes} B, a pass's \
-             buffers {excess} B (want more than 0): {loaded}",
+             (scratch {scratch} B) against the one-slot server's {} B (scratch {} B): outside \
+             the scratch, past one slot's stores {store_bytes} B, {past_stores} B (want 0); the \
+             scratch's pass buffers {pass_bytes} B (want more than 0): {loaded}",
             one.planned,
             load.line(),
             listen.line(),
-            one.resident
+            one.resident,
+            one.scratch
         );
         // Each round's two requests, and the one-slot answers each is held to.
         let by = [

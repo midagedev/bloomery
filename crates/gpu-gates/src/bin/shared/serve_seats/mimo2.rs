@@ -398,13 +398,14 @@ impl OpenLog<Body> for Log {
 
 impl Log {
     /// The `load` record of `m` with every slot parked.
-    fn record(&self, m: &Mimo2Model) {
+    fn record(&self, m: &Mimo2Model) -> Result<(), GateError> {
         if let Some((card, rate)) = &self.lane {
             record::lane(card, rate).eprint();
         }
         Record::new(&record::LOAD_MIMO2)
             .w("arch", "mimo2")
             .u("resident_bytes", m.resident_bytes())
+            .u("scratch_bytes", m.body("load record")?.scratch_bytes())
             .u("ctx", self.ctx)
             .u("slots", self.slots)
             .u("layers", m.layers().len())
@@ -415,6 +416,7 @@ impl Log {
             .w("pinned", self.pinned)
             .f("load_s", self.t.elapsed().as_secs_f64())
             .eprint();
+        Ok(())
     }
 }
 
@@ -458,7 +460,7 @@ impl Mimo {
         if a.slots.get() > 1 {
             s.add_slots(a.slots.get())?;
         }
-        log.record(s.model());
+        log.record(s.model())?;
         Ok(Mimo { s, ctx: a.ctx })
     }
 }
