@@ -2665,6 +2665,150 @@ mod gate {
         Ok(ok)
     }
 
+    /// warm round trip: a slot's section opened as the prior of its next
+    /// request and closed at once is the section it was opened from, byte
+    /// for byte, so the open seeds the stream with what the close wrote and
+    /// the close writes what the stream holds.
+    fn warm_roundtrip_clause(gpu: &Gpu) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mut tier = two_slot_tier(gpu)?;
+
+        // Slot 0 folds a row at each of three boundaries; slot 1 folds none.
+        for _ in 0..3 {
+            note_row(&mut tier, 0)?;
+            tier.keep_rows_by(
+                KeptRows::prefix(1),
+                PassKind::Slots,
+                [(0, 0..1)].into_iter(),
+            )?;
+            tier.swap_boundary(stream)?
+                .ok_or("gate_swap: the tier's boundary")?;
+        }
+        let a = tier
+            .warm_close(0)?
+            .ok_or("gate_swap: the tier's warm close")?;
+        let opened = tier
+            .warm_open(0, Some(&a), 1.0)?
+            .ok_or("gate_swap: the tier's warm open")?;
+        let b = tier
+            .warm_close(0)?
+            .ok_or("gate_swap: the tier's warm close")?;
+        // A stream that folded nothing: what a reopen that dropped its prior
+        // would close with.
+        let empty = tier
+            .warm_close(1)?
+            .ok_or("gate_swap: the tier's warm close")?;
+
+        let from_section = opened.opened == runtime::warmprof::Opened::Section;
+        let held = a != empty;
+        let same = a == b;
+        let ok = from_section && held && same;
+        println!(
+            "warm round trip: slot 0's section after three folded passes holds heat ({} bytes, \
+             unlike a stream that folded nothing) {held}; reopened from it the open reads it \
+             {from_section}, and the close at once writes the same bytes {same} {}",
+            a.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// What [`warm_epoch_run`] leaves: both slots' warm sections after the
+    /// second boundary, the kept rows the rule dropped as stale and the
+    /// count the run expects.
+    struct EpochRun {
+        slot0: Vec<u8>,
+        slot1: Vec<u8>,
+        stale: u64,
+        want_stale: u64,
+    }
+
+    /// Slots 0 and 1 keep a row each in the open pass. With `reopen`, slot
+    /// 0's request closes and a fresh one opens before the boundary that
+    /// folds those rows, while slot 1's are still pending; with
+    /// `keep_first_0`, slot 0's row of that first pass is kept at all. A
+    /// second pass of both slots follows, folded by the next boundary.
+    fn warm_epoch_run(gpu: &Gpu, reopen: bool, keep_first_0: bool) -> Result<EpochRun, GateError> {
+        let stream = gpu.stream();
+        let slot0: Range<usize> = 0..1;
+        let both = [(0, slot0.clone()), (1, 1..2)];
+        let mut tier = two_slot_tier(gpu)?;
+        note_row(&mut tier, 0)?;
+        note_row(&mut tier, 1)?;
+        let first = if keep_first_0 {
+            KeptRows::prefix(2)
+        } else {
+            KeptRows::of([1])
+        };
+        tier.keep_rows_by(first, PassKind::Slots, both.iter().cloned())?;
+        if reopen {
+            tier.warm_close(0)?
+                .ok_or("gate_swap: the tier's warm close")?;
+            tier.warm_open(0, None, 1.0)?
+                .ok_or("gate_swap: the tier's warm open")?;
+        }
+        tier.swap_boundary(stream)?
+            .ok_or("gate_swap: the tier's boundary")?;
+        note_row(&mut tier, 0)?;
+        note_row(&mut tier, 1)?;
+        tier.keep_rows_by(KeptRows::prefix(2), PassKind::Slots, both.iter().cloned())?;
+        tier.swap_boundary(stream)?
+            .ok_or("gate_swap: the tier's boundary")?;
+        let stale = tier
+            .swap()
+            .ok_or("gate_swap: the tier's machine")?
+            .stale_rows();
+        let want_stale = if reopen && keep_first_0 {
+            slot0.len() as u64
+        } else {
+            0
+        };
+        Ok(EpochRun {
+            slot0: tier
+                .warm_close(0)?
+                .ok_or("gate_swap: the tier's warm close")?,
+            slot1: tier
+                .warm_close(1)?
+                .ok_or("gate_swap: the tier's warm close")?,
+            stale,
+            want_stale,
+        })
+    }
+
+    /// warm epoch: a row kept for slot 0 before its request closed and a new
+    /// one opened is dropped and counted at the boundary that folds it, and
+    /// slot 1's rows pending beside it fold as if nothing had closed. Run X
+    /// reopens slot 0 with its first-pass row kept, run Y never reopens it,
+    /// run Z reopens it with that row never kept. Slot 1's section is X's
+    /// as in Y, slot 0's is X's as in Z (the kept counts differ, so the
+    /// plan's decay falls on other boundaries, but slot 0 holds no heat
+    /// until the second pass in either), and the rule counted the row X
+    /// dropped. X's slot 0 differs from Y's: the row was dropped, not
+    /// merely delayed.
+    fn warm_epoch_clause(gpu: &Gpu) -> Result<bool, GateError> {
+        let x = warm_epoch_run(gpu, true, true)?;
+        let y = warm_epoch_run(gpu, false, true)?;
+        let z = warm_epoch_run(gpu, true, false)?;
+
+        let other = x.slot1 == y.slot1;
+        let fresh = x.slot0 == z.slot0;
+        let dropped = x.slot0 != y.slot0;
+        let counted = [&x, &y, &z].iter().all(|r| r.stale == r.want_stale) && x.want_stale > 0;
+        let ok = other && fresh && dropped && counted;
+        println!(
+            "warm epoch: slot 1's section after slot 0 reopened with a row pending is the run \
+             that never reopened it {other}; slot 0's is the run that never kept the row \
+             {fresh}, not the run that never reopened {dropped}; stale rows counted {} of {} \
+             (never reopened {}, never kept {}) {counted} {}",
+            x.stale,
+            x.want_stale,
+            y.stale,
+            z.stale,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// broken: every stack destination of the first flip's layer fails, so
     /// its boundary fails after its first change.
     fn broken(
@@ -5269,6 +5413,8 @@ mod gate {
         ok &= keep_clause(&gpu)?;
         ok &= streams_clause(&gpu)?;
         ok &= keep_rule_clause(&gpu)?;
+        ok &= warm_roundtrip_clause(&gpu)?;
+        ok &= warm_epoch_clause(&gpu)?;
         ok &= broken(&gpu, &pm, &trace, &a)?;
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;
         ok &= fault_code()?;
