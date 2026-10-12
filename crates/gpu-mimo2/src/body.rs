@@ -6,18 +6,21 @@
 //! common per-slot pair, in the host leg's shadow) and on the host tier
 //! otherwise. Each layer is a GQA attention over a full plane of the stores' positions —
 //! its window bounds what a query reads, not what the layer holds — and a
-//! block; the step is [`crate::program`]'s walk, one token at a time (there is
-//! no verify pass of several rows and no draft). A prompt is fed by that step
-//! an id or in batches of up to a union's columns ([`prefill`]), which leave
-//! the model in the same state bit for bit. The embedding is a host row,
-//! dequantized per step and copied into `x` before the launch.
+//! block; the step is [`crate::program`]'s walk, one token at a time. A pass
+//! of several slots' rows, one row each, is `slots`'s walk over the same
+//! layers (there is no verify pass of several rows of one sequence and no
+//! draft). A prompt is fed by the step an id or in batches of up to a union's
+//! columns ([`prefill`]), which leave the model in the same state bit for bit.
+//! The embedding is a host row, dequantized per step and copied into `x`
+//! before the launch.
 //!
 //! The body serves resident sequence slots ([`Slots`]): a sequence is its
 //! layers' stores ([`Seq`]), and a select exchanges those handles while the
 //! model parks each slot's captured steps and position. Everything else is
-//! the load's, one for whichever slot is live: the step's buffers, the batch
-//! feed's arena (written and read inside one call), the rope tables, the
-//! host tier and the taps.
+//! the load's, one for whichever slot is live: the step's buffers (and, on a
+//! load of several sequences, the buffers of a pass of `slots::MAX_ROWS`
+//! rows), the batch feed's arena (written and read inside one call), the rope
+//! tables, the host tier and the taps.
 //!
 //! What the load refuses, by name: a plan of other than one card with no
 //! expert tier, card experts whose stacks are not resident in the rows the slot
@@ -67,6 +70,8 @@ use crate::swap;
 
 #[path = "prefill.rs"]
 pub mod prefill;
+#[path = "slots.rs"]
+pub(crate) mod slots;
 use prefill::PromptState;
 
 /// What the body's errors name.
@@ -174,7 +179,8 @@ impl RopeBase {
     }
 }
 
-/// Every buffer the step writes or reads besides the stores, one token's.
+/// Every buffer the step writes or reads besides the stores, one token's (or
+/// a pass's rows', [`Scratch::new`]).
 pub(crate) struct Scratch {
     /// The layer's input and output: the embedding writes it before the
     /// chain, and each layer's block writes it back (the last layer's output
@@ -206,37 +212,41 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
-    /// The buffers for a model of `d`, `qkv` rows of the widest layer and
-    /// `ff` the widest dense block, `blocks` the dense blocks' plans with
-    /// their widths. Load-time only.
-    fn new(
+    /// The buffers for `rows` tokens of a model of `d`, `qkv` values a token
+    /// of the widest layer and `ff` the widest dense block, `blocks` the dense
+    /// blocks' plans with their widths: the step's at one row, a pass's at its
+    /// rows (the flash's partials for that many rows, which its launches
+    /// share one after another; the K-quant dense block's buffers are one
+    /// row's, its columns run one after another). Load-time only.
+    pub(crate) fn new(
         stream: &CudaStream,
         d: &Dims,
         (qkv, ff): (usize, usize),
         blocks: impl IntoIterator<Item = (BlockPlan, usize)>,
+        rows: usize,
     ) -> Result<Scratch, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         Ok(Scratch {
-            x: z(d.embd)?,
-            x1: z(d.embd)?,
-            xn: z(d.embd)?,
-            out: z(d.embd)?,
-            qkv: z(qkv)?,
-            q: z(d.heads * HEAD_K192)?,
-            part_v: z(flash_gqa::partials_v_len(1, d.heads))?,
-            part_ms: z(flash_gqa::partials_ms_len(1, d.heads))?,
-            y: z(d.heads * HEAD)?,
-            h: z(ff.max(1))?,
+            x: z(rows * d.embd)?,
+            x1: z(rows * d.embd)?,
+            xn: z(rows * d.embd)?,
+            out: z(rows * d.embd)?,
+            qkv: z(rows * qkv)?,
+            q: z(rows * d.heads * HEAD_K192)?,
+            part_v: z(flash_gqa::partials_v_len(rows, d.heads))?,
+            part_ms: z(flash_gqa::partials_ms_len(rows, d.heads))?,
+            y: z(rows * d.heads * HEAD)?,
+            h: z((rows * ff).max(1))?,
             block: BlockScratch::new(stream, d.embd, blocks)?,
             rout: RouterOut::new(stream)?,
-            sel: DeviceBuffer::zeroed(stream, N_USED)?,
+            sel: DeviceBuffer::zeroed(stream, rows * N_USED)?,
             no_bias: z(N_EXPERT)?,
-            pos: DeviceBuffer::zeroed(stream, 1)?,
-            n_keys: DeviceBuffer::zeroed(stream, 1)?,
+            pos: DeviceBuffer::zeroed(stream, rows)?,
+            n_keys: DeviceBuffer::zeroed(stream, rows)?,
         })
     }
 
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         let f = [
             &self.x,
             &self.x1,
@@ -310,6 +320,9 @@ pub struct Body {
     dims: Dims,
     k: Kernels,
     s: Scratch,
+    /// The buffers of a pass of several slots' rows, on a load planned for
+    /// several sequences ([`slots`]).
+    pass: Option<slots::PassBufs>,
     /// The card's routed experts and the step's buffers they run in.
     card: CardExperts,
     stores: Vec<Store>,
@@ -662,7 +675,11 @@ impl Body {
             }
             check_layer(w, c, n, &dims)?;
         }
-        let card_experts = CardExperts::new(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff)?;
+        // A load planned for several sequences runs a pass of their rows
+        // through the step port's columns; a load for one sequence the step.
+        let rows = if seqs.get() > 1 { slots::MAX_ROWS } else { 1 };
+        let card_experts =
+            CardExperts::new(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff, rows)?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         // MiMo fact: only the window layers carry sinks, one per query head, file constants.
@@ -679,8 +696,11 @@ impl Body {
             .unwrap_or(0);
         let ff = cfg.iter().map(|c| c.ffn.ff).max().unwrap_or(0);
         let k_block = cfg.iter().any(|c| c.block.is_some_and(|p| !p.is_q8()));
-        let blocks = cfg.iter().filter_map(|c| c.block.map(|p| (p, c.ffn.ff)));
-        let s = Scratch::new(stream, &dims, (qkv, ff), blocks)?;
+        let blocks = || cfg.iter().filter_map(|c| c.block.map(|p| (p, c.ffn.ff)));
+        let s = Scratch::new(stream, &dims, (qkv, ff), blocks(), 1)?;
+        let pass = (rows > 1)
+            .then(|| slots::PassBufs::new(stream, &dims, (qkv, ff), blocks(), rows))
+            .transpose()?;
         let stores = cfg
             .iter()
             .map(|c| Store::new(stream, c.attn.kv_heads, ctx))
@@ -716,13 +736,15 @@ impl Body {
             run.len(),
             N_EXPERT,
         )?);
-        let boundary = Boundary::new(
+        let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
             BoundaryShape {
                 hidden: dims.embd,
                 n_used: N_USED,
             },
+            1,
+            rows,
         )?;
         let experts = HostRun::build(
             Arc::clone(&file),
@@ -754,6 +776,7 @@ impl Body {
             dims,
             k: Kernels::load(gpu, k_block)?,
             s,
+            pass,
             card: card_experts,
             stores,
             ropes,
@@ -772,8 +795,8 @@ impl Body {
             plan,
             card,
             body.scratch_bytes(),
-            "the step's buffers, the card experts' buffers, the rope tables, the host \
-             boundary, the slot map's copy",
+            "the step's buffers, a pass's buffers, the card experts' buffers, the rope \
+             tables, the host boundary, the slot map's copy",
         )?;
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.
@@ -843,12 +866,14 @@ impl Body {
     }
 
     /// Device bytes of the load's scratch, what the plan's card term
-    /// `scratch_bytes` sets aside: the step's buffers, the card experts'
+    /// `scratch_bytes` sets aside: the step's buffers, a pass of several
+    /// slots' buffers on a load of several sequences, the card experts'
     /// buffers, the rope tables, the host boundary and the slot map's card
     /// copy. A load past the term is refused by name.
     #[must_use]
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
+            + self.pass.as_ref().map_or(0, slots::PassBufs::bytes)
             + self.card.bytes()
             + self
                 .ropes
@@ -950,6 +975,15 @@ impl Body {
 
     /// The walk's parts, lent apart from the host tier.
     pub(crate) fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<HostRun>) {
+        self.parts_on(None)
+    }
+
+    /// [`Body::parts`] over the stores `stores` in place of the live
+    /// sequence's: a pass of one row of a slot that is not live.
+    pub(crate) fn parts_on<'a>(
+        &'a mut self,
+        stores: Option<&'a mut [Store]>,
+    ) -> (Parts<'a>, &'a mut Hybrid<HostRun>) {
         (
             Parts {
                 k: &self.k,
@@ -958,7 +992,7 @@ impl Body {
                 names: &self.names,
                 s: &mut self.s,
                 card: &mut self.card,
-                stores: &mut self.stores,
+                stores: stores.unwrap_or(self.stores.as_mut_slice()),
                 ropes: &self.ropes,
                 slots: &self.slots,
                 taps: self.taps.as_deref_mut(),

@@ -59,14 +59,21 @@
 //!   positions after the main load is dropped: the slot harness's contracts
 //!   (`slots_gate`: H1 interleave — two streams, each run solo and then
 //!   together on their own slots with a select between every token, every
-//!   slot's ids, last logits, store digest and position its solo run's —, H3
-//!   bytes, H4 reset, H5 poison, H6 refusals, H7 captures), through
-//!   [`MimoSlots`]; and (sp): a sequence past the plan's count refused by
+//!   slot's ids, last logits, store digest and position its solo run's —, H2
+//!   the pass of several slots' rows against the slots stepped one at a time
+//!   (the launches it adds a slot are [`SEQ_BOUND`] a layer, the body's own
+//!   counts held), H3 bytes, H4 reset, H5 poison, H6 refusals, H7 captures),
+//!   through [`MimoSlots`]; the captured nodes of a pass of one row (the
+//!   step's), of two rows of one slot and of one row on each of two slots
+//!   (`pass_nodes`: the step's nodes plus a slot's extra launches plus, for
+//!   the second row, one router launch and one handoff in each routed layer);
+//!   and (sp): a sequence past the plan's count refused by
 //!   name, the plan's kv class of two slots twice the stores of one slot's
 //!   (and the descriptor's bytes), and a load of two sequences by a plan of
 //!   one refused by name. FAIL-first: a `swap_seq` that exchanges nothing
 //!   leaves both slots on the live stores and H1 is red; a `seq_bytes` of 0
-//!   is red at H3.
+//!   is red at H3; a pass that binds its attention to the live stores for
+//!   every slot is red at H2.
 //!
 //! - (r) adaptive expert residency, the common machine on MiMo's slot map
 //!   (`bloomery_gpu::host::swap`, the stack table `bloomery_gpu_mimo2::swap`):
@@ -87,6 +94,13 @@
 //!   it. FAIL-first: `Body::residency_parts` of `None` leaves the machine
 //!   unstarted (the structure line, c1 and c7 red); a history that counts no
 //!   flip is red at c1; a reset that does nothing is red at the map's return.
+//! - (rp) the pass of two slots under the machine (`residency_pass`): a load
+//!   of two sequences at the serving word runs [`R_STEPS`] rounds through
+//!   `step_slots` and the same rounds a slot at a time; the ids are equal, the
+//!   logits equal bit for bit until the first flip lands and inside
+//!   [`FREE_WORST`] after it, a second pass repeats the first, and flips
+//!   land. FAIL-first: the load's tally rows left at 1 refuse the pass by
+//!   name at the first round (`Tally::note`) and the clause is red.
 //!
 //! `--only s|p|c|t|b|slots|r` runs one clause on the load (`slots` and `r` on
 //! their own loads); `--step-sets short` takes
@@ -152,13 +166,14 @@ mod gate {
     use std::time::Instant;
 
     use app::Session;
+    use bloomery_gpu::GpuError;
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{Residency, SwapSource};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::residency;
-    use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
+    use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
     use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode, feed, set_prefill, set_taps};
     use bloomery_levers::{CARD_BUDGET, ResidencyAt, ResidencyWhy};
@@ -618,6 +633,9 @@ mod gate {
         levers: &'a bloomery_levers::Levers,
         inputs: PlanInputs,
         prompts: [Vec<u32>; slots_gate::STREAMS],
+        /// The residency the load runs: off for the harness's contracts, the
+        /// serving word for (rp).
+        residency: Residency,
     }
 
     impl MimoSlots<'_> {
@@ -652,7 +670,7 @@ mod gate {
                 &self.inputs,
                 0,
                 self.levers.host(),
-                Residency::Off,
+                self.residency,
                 n,
             )?;
             set_prefill(&mut m, PrefillMode::Batch)?;
@@ -728,6 +746,14 @@ mod gate {
             Ok(true)
         }
 
+        /// H5's round of several slots: the body's one pass
+        /// ([`GpuModel::step_slots`], this body's `SlotRows`).
+        fn step_all(&self, m: &mut Mimo2Model, last: &[u32]) -> Result<Vec<u32>, GpuError> {
+            let ones: Vec<[u32; 1]> = last.iter().map(|&t| [t]).collect();
+            let rows: Vec<(usize, &[u32])> = ones.iter().map(|t| &t[..]).enumerate().collect();
+            Ok(m.step_slots(&rows)?.ids)
+        }
+
         /// H5's window: the tier's own refusal, read through the body's
         /// tier.
         fn tier_poisoned(&self, m: &mut Mimo2Model) -> Result<bool, GateError> {
@@ -737,6 +763,82 @@ mod gate {
                 .refuse_if_poisoned("slots H5")
                 .is_err())
         }
+    }
+
+    /// The launches an attention layer binds to one sequence's stores,
+    /// whatever the rows of its slot: the rope-and-append, the flash's segment
+    /// pass and its merge. Spelled here from the layer program's launch list,
+    /// apart from the body's own count.
+    const SEQ_BOUND: usize = 3;
+
+    impl PassAdapter for MimoSlots<'_> {
+        fn added_slot_launches(&self, m: &Mimo2Model) -> Result<Launches, GateError> {
+            let layers = m.body("slots")?.kinds().len();
+            Ok(Launches {
+                n: SEQ_BOUND * layers,
+                terms: format!(
+                    "the rope-and-append 1 + the flash's segment pass 1 + its merge 1 on each of \
+                     {layers} layers"
+                ),
+            })
+        }
+
+        fn slots_launches(
+            &self,
+            m: &Mimo2Model,
+            key: &[(usize, usize)],
+        ) -> Result<usize, GateError> {
+            Ok(m.body("slots")?.slots_launches(key))
+        }
+    }
+
+    /// The captured pass's node counts against the header's counts: a pass of
+    /// one row is the decode step's [`NODES_DECODE`] whichever slot runs it; a
+    /// pass of `m` rows over `s` busy slots is the step's nodes, plus
+    /// [`SEQ_BOUND`] a layer for each busy slot past the first, plus on each
+    /// routed layer the router's second launch and a handoff a column past
+    /// the first (`m` in all: the router over the rows is two launches, a
+    /// handoff a column one), and the dense block's columns past the step's
+    /// own launches: none on a q8_0 block, whose columns share its launches,
+    /// a whole block a column on a K-quant one.
+    fn pass_nodes(m: &mut Mimo2Model) -> Result<bool, GateError> {
+        let body = m.body("slots nodes")?;
+        let blocks = body.blocks();
+        let plans = body.block_plans();
+        let block_extra: usize = plans.iter().map(|p| p.extra_launches()).sum();
+        let card = blocks.iter().filter(|b| b.1).count();
+        let routed = blocks.iter().filter(|b| b.0 == FfnKind::Moe).count();
+        let step_nodes = NODES_DECODE + block_extra;
+        let step = NODES_HOST + block_extra + CARD_LAUNCHES * card;
+        let derived = |key: &[(usize, usize)]| -> usize {
+            let rows: usize = key.iter().map(|&(_, r)| r).sum();
+            if rows == 1 {
+                step
+            } else {
+                let dense: usize = plans
+                    .iter()
+                    .map(|p| p.column_launches(rows) - 2 - p.extra_launches())
+                    .sum();
+                step + N_LAYER * SEQ_BOUND * (key.len() - 1) + rows * routed + dense
+            }
+        };
+        let mut ok = step == step_nodes;
+        let mut line = String::new();
+        for key in [&[(0, 1)][..], &[(1, 1)], &[(0, 2)], &[(0, 1), (1, 1)]] {
+            let got = m.capture_slots(key)?;
+            let own = m.body("slots nodes")?.slots_launches(key);
+            let want = derived(key);
+            ok &= got == want && own == want;
+            line.push_str(&format!(
+                " {key:?} {got} nodes (derived {want}, body {own});"
+            ));
+        }
+        println!(
+            "check slots nodes:{line} the step {step_nodes}, {card} card layers and {routed} \
+             routed {}",
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// The prompt as the server feeds it: every id but the last in one call
@@ -816,11 +918,14 @@ mod gate {
             levers,
             inputs,
             prompts: [a.to_vec(), b.to_vec()],
+            residency: Residency::Off,
         };
         let t = Instant::now();
         let mut s = slots_gate::interleave(&body)?;
         elapsed("(slots) harness open (H1, H3, H6, H7)", &t);
+        s.one_pass();
         let mut ok = slots_plan(&body, s.model())?;
+        ok &= pass_nodes(s.model())?;
         let t = Instant::now();
         ok &= s.finish()?;
         elapsed("(slots) harness finish (H4, H5)", &t);
@@ -1038,6 +1143,162 @@ mod gate {
         Ok(ok && back)
     }
 
+    /// One arm of (rp): per round, each slot's greedy id and logits, and the
+    /// flips that landed at the round's boundaries.
+    struct PassArm {
+        ids: Vec<Vec<u32>>,
+        logits: Vec<Vec<Vec<f32>>>,
+        landed: Vec<usize>,
+    }
+
+    impl PassArm {
+        fn fnvs(&self, round: usize) -> Vec<u64> {
+            self.logits[round]
+                .iter()
+                .map(|row| Fnv1a64::default().f32s(row).value())
+                .collect()
+        }
+
+        /// The first round after whose boundary a flip had landed.
+        fn first_flip(&self) -> usize {
+            let mut seen = 0;
+            self.landed
+                .iter()
+                .position(|&n| {
+                    seen += n;
+                    seen > 0
+                })
+                .unwrap_or(R_STEPS)
+        }
+    }
+
+    /// (rp) one arm on `m`, a load of [`slots_gate::STREAMS`] sequences under
+    /// the machine: from the residency's seed, both slots prompted, then
+    /// [`R_STEPS`] rounds, as one pass of both rows (`one_pass`) or as a
+    /// select and a step a slot.
+    fn pass_arm(
+        body: &MimoSlots<'_>,
+        m: &mut Mimo2Model,
+        one_pass: bool,
+    ) -> Result<PassArm, GateError> {
+        const N: usize = slots_gate::STREAMS;
+        m.residency_reset()?;
+        let mut last = [0u32; N];
+        for (s, id) in last.iter_mut().enumerate() {
+            m.select_slot(s)?;
+            body.rewind(m)?;
+            *id = body.prompt(m, s)?;
+        }
+        m.body_parts("(rp)")?.2.take_residency_passes();
+        let mut arm = PassArm {
+            ids: Vec::with_capacity(R_STEPS),
+            logits: Vec::with_capacity(R_STEPS),
+            landed: Vec::with_capacity(R_STEPS),
+        };
+        for _ in 0..R_STEPS {
+            let (ids, logits) = if one_pass {
+                let ones: Vec<[u32; 1]> = last.iter().map(|&t| [t]).collect();
+                let rows: Vec<(usize, &[u32])> = ones.iter().map(|t| &t[..]).enumerate().collect();
+                let ids = m.step_slots(&rows)?.ids;
+                (ids, m.slots_logits()?)
+            } else {
+                let (mut ids, mut logits) = (Vec::new(), Vec::new());
+                for (s, &t) in last.iter().enumerate() {
+                    m.select_slot(s)?;
+                    ids.push(m.step(&[t])?);
+                    logits.push(m.logits()?);
+                }
+                (ids, logits)
+            };
+            last.copy_from_slice(&ids);
+            let passes = m.body_parts("(rp)")?.2.take_residency_passes();
+            arm.landed.push(passes.iter().map(|(_, r)| r.landed).sum());
+            arm.ids.push(ids);
+            arm.logits.push(logits);
+        }
+        Ok(arm)
+    }
+
+    /// (rp) a pass of two slots under the machine, on a load of two
+    /// sequences at `word`: [`R_STEPS`] rounds as one pass of both slots'
+    /// rows against the same rounds as a select and a step a slot, each from
+    /// the residency's seed with both prompts fed. Held: the pass's ids are
+    /// the turns' in every round; its logits are the turns' bit for bit in
+    /// every round up to the one after whose boundary a flip first landed in
+    /// either arm (the slot map is the seed's until then), and after it within
+    /// [`FREE_WORST`] of them relative to the turns' largest logit (the two
+    /// arms' maps move at other boundaries); the pass run again from the seed
+    /// repeats itself bit for bit; and a flip lands in the pass arm, so the
+    /// machine planned under the rows of two slots. A call that fails is the
+    /// clause's red with its error printed (a machine whose tally holds one
+    /// row refuses the first pass of two rows by name).
+    fn residency_pass(
+        levers: &bloomery_levers::Levers,
+        word: Residency,
+    ) -> Result<bool, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let inputs = PlanInputs::read(&file)?;
+        drop(file);
+        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
+        let (_, a, _) = man.step()?;
+        let (_, _, _, long, _) = set_open((D1K, &IK), None)?;
+        let b = long
+            .get(..R_PROMPT)
+            .ok_or("the 1,024-position prompt is short")?;
+        let body = MimoSlots {
+            levers,
+            inputs,
+            prompts: [a.to_vec(), b.to_vec()],
+            residency: word,
+        };
+        let mut m = body.open(slots_gate::STREAMS)?;
+        m.add_slots(slots_gate::STREAMS)?;
+        m.body_parts("(rp)")?.2.log_residency(0);
+        let arms = (|| -> Result<(PassArm, PassArm, PassArm), GateError> {
+            let pass = pass_arm(&body, &mut m, true)?;
+            let turns = pass_arm(&body, &mut m, false)?;
+            let again = pass_arm(&body, &mut m, true)?;
+            Ok((pass, turns, again))
+        })();
+        let (pass, turns, again) = match arms {
+            Ok(arms) => arms,
+            Err(e) => {
+                println!("(rp) a call failed: {e} {}", verdict(false));
+                return Ok(false);
+            }
+        };
+        let ids_ok = pass.ids == turns.ids;
+        let exact_to = pass.first_flip().min(turns.first_flip()).min(R_STEPS - 1);
+        let exact_ok = (0..=exact_to).all(|r| pass.fnvs(r) == turns.fnvs(r));
+        let mut rel = 0.0f64;
+        for r in exact_to + 1..R_STEPS {
+            for (p, t) in pass.logits[r].iter().zip(&turns.logits[r]) {
+                let top = t.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
+                let worst = p.iter().zip(t).fold(0.0f64, |m, (&p, &t)| {
+                    m.max((f64::from(p) - f64::from(t)).abs())
+                });
+                rel = rel.max(worst / top.max(f64::MIN_POSITIVE));
+            }
+        }
+        let band_ok = rel <= FREE_WORST;
+        let repeat_ok = pass.ids == again.ids
+            && (0..R_STEPS).all(|r| pass.fnvs(r) == again.fnvs(r))
+            && pass.landed == again.landed;
+        let flips = pass.landed.iter().sum::<usize>();
+        let ok = ids_ok && exact_ok && band_ok && repeat_ok && flips > 0;
+        println!(
+            "(rp) a pass of {} slots under {word:?}, {R_STEPS} rounds: ids equal the turns' \
+             {ids_ok}; logits bit for bit through round {exact_to} {exact_ok}, after it worst \
+             rel {rel:.3e} (want at most {FREE_WORST}) {band_ok}; the pass run again repeats \
+             {repeat_ok}; {flips} flips landed in the pass arm, {} in the turns' (want some in \
+             the pass arm) {}",
+            slots_gate::STREAMS,
+            turns.landed.iter().sum::<usize>(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// (r) on its own loads: the unset word on the gate placement's plan, then
     /// a load at it ([`residency_on`]).
     fn residency_arm(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
@@ -1050,6 +1311,7 @@ mod gate {
         let toks = toks.to_vec();
         if matches!(word, Residency::Mid { .. }) {
             ok &= residency_on(levers, word, &man, &toks)?;
+            ok &= residency_pass(levers, word)?;
         } else {
             println!(
                 "(r) on: the unset word is off, no machine to load {}",
