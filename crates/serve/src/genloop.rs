@@ -60,6 +60,7 @@ use crate::api::logprobs::{Ask, Collector, RowError};
 use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Landed, Pending, Sampler, SamplerFactory,
     SamplerRefused, SamplingParams, SaveInFlight, Saved, SlotPass, SlotRow, StateError, Tokenizer,
+    WarmWhy,
 };
 use crate::media::{Held, MediaFeed, MediaSpan, common_prefix, keep_whole_spans};
 use crate::promptcache::{PromptCache, Taken};
@@ -330,6 +331,64 @@ pub(crate) struct Slot {
     /// Each slot's state copy while it may still run ([`Slot::seal`]): its
     /// rows are not cut, reset or replaced before it has landed.
     saving: Vec<Option<Pending>>,
+    /// Each slot's residency stream: open for the request on it, closed
+    /// into its section while the request is parked.
+    streams: Vec<Stream>,
+    /// The warm section the last request on each slot closed its stream
+    /// into, for the cache entry that takes the slot's held state; dropped
+    /// where the slot's state is replaced or erased.
+    warm: Vec<Option<Arc<[u8]>>>,
+    /// The completed requests' generated-token counts.
+    lengths: Lengths,
+}
+
+/// A slot's residency stream, as the server drives it
+/// ([`Engine::warm_open`], [`Engine::warm_close`]).
+enum Stream {
+    Shut,
+    /// Open for the request on the slot; `expected` is its E.
+    Open {
+        expected: f64,
+    },
+    /// Closed at the park of the request that left the device slot, to open
+    /// again with `section` when the request comes back.
+    Parked {
+        section: Option<Vec<u8>>,
+        expected: f64,
+    },
+}
+
+/// How a request ended, as its stream is closed ([`Slot::warm_end`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Ended {
+    /// It finished, with this many generated tokens.
+    Completed(usize),
+    /// It ended for another reason than an engine failure: the client left,
+    /// or its input was refused.
+    Left,
+    /// The engine failed; its stream is not closed, since the engine is not
+    /// called again.
+    Failed,
+}
+
+/// The mean of the completed requests' generated-token counts (L̄).
+#[derive(Default)]
+struct Lengths {
+    n: u64,
+    sum: u64,
+}
+
+impl Lengths {
+    fn mean(&self) -> Option<f64> {
+        (self.n > 0).then(|| self.sum as f64 / self.n as f64)
+    }
+}
+
+/// What a request's start took from the prompt cache for its stream:
+/// the section of a full hit and why ([`Engine::warm_open`]).
+pub(crate) struct Opening {
+    section: Option<Arc<[u8]>>,
+    why: WarmWhy,
 }
 
 /// What a cache hit put back ([`Slot::load`]).
@@ -362,6 +421,9 @@ impl Slot {
             away: None,
             off: false,
             saving: vec![None; n],
+            streams: (0..n).map(|_| Stream::Shut).collect(),
+            warm: vec![None; n],
+            lengths: Lengths::default(),
         }
     }
 
@@ -541,8 +603,12 @@ impl Slot {
     /// it, and the engine takes it back only when the request keeps some of
     /// it. One the request keeps none of leaves the slot holding nothing, so
     /// no prefix it shared is noted.
-    fn reuse(&mut self, req: &Held, want: bool) -> Result<usize, EngineError> {
+    fn reuse(&mut self, req: &Held, want: bool) -> Result<(usize, Opening), EngineError> {
         let away = self.away.take();
+        let mut opening = Opening {
+            section: None,
+            why: WarmWhy::Miss,
+        };
         // The slot's own state copy lands before its rows are cut, reset or
         // replaced; the copies of the other slots that have landed leave
         // the cache free to evict them.
@@ -573,8 +639,24 @@ impl Slot {
         }
         if let Some((want_kept, taken)) = picked {
             let slot_kept = k;
+            let section = taken.warm.clone();
             if let Some(l) = self.load(taken, want_kept)? {
                 (common, ask, k) = self.keep_of(req, want, None);
+                opening = if k < ask {
+                    Opening {
+                        section: None,
+                        why: WarmWhy::Cut,
+                    }
+                } else {
+                    Opening {
+                        why: if section.is_some() {
+                            WarmWhy::Hit
+                        } else {
+                            WarmWhy::NoSection
+                        },
+                        section,
+                    }
+                };
                 self.engine.note(&CacheNote::Load {
                     positions: l.positions,
                     common,
@@ -611,7 +693,8 @@ impl Slot {
         }
         self.held = held;
         self.held.truncate(k);
-        Ok(k)
+        self.warm[self.cur] = None;
+        Ok((k, opening))
     }
 
     /// The engine, for a call that cuts, resets or replaces the selected
@@ -711,11 +794,12 @@ impl Slot {
             });
             return;
         }
+        let warm = self.warm[slot].take();
         let notes = match fallback {
             Some(fallback) => self
                 .cache
-                .insert_fallback(held, state, ms_since(t), fallback),
-            None => self.cache.insert(held, state, ms_since(t), copied),
+                .insert_fallback(held, state, warm, ms_since(t), fallback),
+            None => self.cache.insert(held, state, warm, ms_since(t), copied),
         };
         for note in notes {
             self.engine.note(&note);
@@ -817,7 +901,8 @@ impl Slot {
             });
             return self.discard(&pending);
         }
-        let notes = self.cache.insert_pending(held, pending.clone(), ms);
+        let warm = self.warm[slot].take();
+        let notes = self.cache.insert_pending(held, pending.clone(), warm, ms);
         let kept = matches!(notes.last(), Some(CacheNote::Save { .. }));
         for note in notes {
             self.engine.note(&note);
@@ -941,6 +1026,7 @@ impl Slot {
             mut held,
             state,
             pending,
+            ..
         } = taken;
         self.held = Held::default();
         let t = Instant::now();
@@ -1310,7 +1396,83 @@ impl Slot {
         let n = stored.len();
         self.held = stored;
         self.prompts[self.cur] = n;
+        self.warm[self.cur] = None;
         Ok((n, r.bytes))
+    }
+
+    /// The request about to start on the selected slot opens its residency
+    /// stream: from the section of a full hit, else fresh. `n_predict` is its
+    /// budget B; the expected tokens are set here, once.
+    fn warm_open(&mut self, n_predict: i64, opening: Opening) -> Result<(), EngineError> {
+        let slot = self.cur;
+        assert!(
+            matches!(self.streams[slot], Stream::Shut),
+            "slot {slot}'s residency stream was opened for a request while another's was open"
+        );
+        let expected = self.expected(n_predict);
+        self.engine
+            .warm_open(slot, opening.section.as_deref(), expected, opening.why)?;
+        self.streams[slot] = Stream::Open { expected };
+        Ok(())
+    }
+
+    /// The expected tokens E of a request of budget `n_predict` (B, unbounded
+    /// when negative): 1 until a request has completed, then B bounded by
+    /// the completed requests' mean length L̄ (L̄ alone when B is unbounded),
+    /// never below 1, so every stream's weight is finite and positive.
+    fn expected(&self, n_predict: i64) -> f64 {
+        let Some(mean) = self.lengths.mean() else {
+            return 1.0;
+        };
+        let bound = u64::try_from(n_predict).map_or(mean, |b| (b as f64).min(mean));
+        bound.max(1.0)
+    }
+
+    /// The request on `slot` ended: its stream closes
+    /// ([`Engine::warm_close`]) and its section waits for the cache entry
+    /// the slot's state goes into, dropped when the cache is off or the
+    /// state is replaced first. A request that completed adds to L̄. A stream
+    /// the request parked is closed already and is dropped.
+    pub(crate) fn warm_end(&mut self, slot: usize, how: Ended) -> Result<(), EngineError> {
+        if let Ended::Completed(n) = how {
+            self.lengths.n += 1;
+            self.lengths.sum += n as u64;
+        }
+        let stream = std::mem::replace(&mut self.streams[slot], Stream::Shut);
+        if matches!(stream, Stream::Open { .. }) && !matches!(how, Ended::Failed) {
+            let section = self.engine.warm_close(slot)?;
+            self.warm[slot] = section.filter(|_| self.cache.enabled()).map(Arc::from);
+        }
+        Ok(())
+    }
+
+    /// The live request on `slot` leaves the device slot with its state
+    /// parked: its stream closes and parks with it ([`Slot::warm_resume`]).
+    pub(crate) fn warm_park(&mut self, slot: usize) -> Result<(), EngineError> {
+        let stream = std::mem::replace(&mut self.streams[slot], Stream::Shut);
+        match stream {
+            Stream::Open { expected } => {
+                let section = self.engine.warm_close(slot)?;
+                self.streams[slot] = Stream::Parked { section, expected };
+            }
+            Stream::Shut => {}
+            Stream::Parked { .. } => panic!("slot {slot}'s request was parked twice"),
+        }
+        Ok(())
+    }
+
+    /// The parked request on `slot` is back on the device slot: its stream
+    /// opens again from its own section, with its own E. Nothing for a slot
+    /// whose request parked no stream.
+    pub(crate) fn warm_resume(&mut self, slot: usize) -> Result<(), EngineError> {
+        if let Stream::Parked { section, expected } =
+            std::mem::replace(&mut self.streams[slot], Stream::Shut)
+        {
+            self.engine
+                .warm_open(slot, section.as_deref(), expected, WarmWhy::Resume)?;
+            self.streams[slot] = Stream::Open { expected };
+        }
+        Ok(())
     }
 
     /// Drops the whole cache and the ids it held; returns how many it held.
@@ -1320,6 +1482,7 @@ impl Slot {
         }
         let held = std::mem::take(&mut self.held);
         self.prompts[self.cur] = 0;
+        self.warm[self.cur] = None;
         if !self.off {
             self.rows()?.reset()?;
         }
@@ -1729,11 +1892,10 @@ impl Gen {
             _ => Some(0),
         });
         let t = Instant::now();
-        let cache_n = slot.reuse(held, p.cache_prompt)?;
-        Ok(Kept {
-            cache_n,
-            cache_ms: ms_since(t),
-        })
+        let (cache_n, opening) = slot.reuse(held, p.cache_prompt)?;
+        let cache_ms = ms_since(t);
+        slot.warm_open(p.n_predict, opening)?;
+        Ok(Kept { cache_n, cache_ms })
     }
 
     /// The prompt after its opening in one go: `ids[cache_n..n-1]` fed as one
@@ -2070,7 +2232,11 @@ impl Gen {
         self.prompt(slot, held, media, p, sink)?;
         loop {
             match self.pump(sink, tick)? {
-                Need::Done => return self.finish(sink),
+                Need::Done => {
+                    let done = self.finish(sink)?;
+                    slot.warm_end(slot.cur, Ended::Completed(done.timings.predicted_n))?;
+                    return Ok(done);
+                }
                 Need::Step(t) => {
                     let g = slot.next(t, out(&mut self.logits))?;
                     self.stepped(g);

@@ -102,6 +102,9 @@ mod responses;
 #[cfg(test)]
 #[path = "testserve.rs"]
 mod testserve;
+#[cfg(test)]
+#[path = "warmtests.rs"]
+mod warmtests;
 
 /// What the server says about itself and how it samples.
 pub struct ServerConfig {

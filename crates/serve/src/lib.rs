@@ -48,9 +48,9 @@ pub use engine::{
     CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight,
     Landed, ModelProps, Pending, PlacementProps, ResidencyReset, Sampler, SamplerFactory,
     SamplerRefused, SamplingParams, SaveInFlight, Saved, SavedState, SlotPass, SlotRow, StateError,
-    Tokenizer,
+    Tokenizer, WarmWhy,
 };
 pub use jinja::{ChatTemplate, TemplateError};
-pub use mock::{DraftMock, MockEngine, MockTokenizer, SaveStats, ScriptedEngine};
+pub use mock::{DraftMock, MockEngine, MockTokenizer, SaveStats, ScriptedEngine, WarmCall};
 pub use sched::{FifoPicker, SlotConfig, SlotPicker, SlotSummary, WaitingRequest};
 pub use swap::{Park, QUANTUM, SwapEngine};

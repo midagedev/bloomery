@@ -56,8 +56,8 @@ use vision::{GridPlan, MediaModel, Patches, Prepared, Rgb8, VisionError};
 
 use crate::engine::{
     Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight, Landed, Pending,
-    ResidencyReset, Sampler, Saved, SavedState, SlotPass, StateError, Tokenizer, resume_bytes,
-    snapshot_bytes,
+    ResidencyReset, Sampler, Saved, SavedState, SlotPass, StateError, Tokenizer, WarmWhy,
+    resume_bytes, snapshot_bytes,
 };
 use crate::media::{MediaFeed, MediaSpan, SharedMediaModel};
 use crate::slotfile;
@@ -110,6 +110,32 @@ pub struct MockEngine {
     /// Its saves, when it copies its states off the request path and puts a
     /// prefix back ([`MockEngine::with_async_snapshots`]).
     saves: Option<AsyncSaves>,
+    /// The log of its warm calls, when it keeps a residency stream a slot
+    /// ([`MockEngine::with_warm`]).
+    warm: Option<Arc<Mutex<Vec<WarmCall>>>>,
+    /// The close, counted from 0, that returns no section
+    /// ([`MockEngine::with_warm_gap`]).
+    warm_gap: Option<usize>,
+    /// The step the engine keeps positions in ([`MockEngine::with_keep_step`]).
+    keep_step: usize,
+}
+
+/// One [`Engine::warm_close`] or [`Engine::warm_open`] call of a mock of
+/// [`MockEngine::with_warm`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum WarmCall {
+    /// The close of `slot`'s stream, and the section it returned.
+    Close {
+        slot: usize,
+        section: Option<Vec<u8>>,
+    },
+    /// The open of `slot`'s stream.
+    Open {
+        slot: usize,
+        section: Option<Vec<u8>>,
+        expected: f64,
+        why: WarmWhy,
+    },
 }
 
 /// The mock's copy stream: how long a copy takes, what the engine saw, and
@@ -259,6 +285,9 @@ impl MockEngine {
             prompt_quantum: None,
             media: None,
             saves: None,
+            warm: None,
+            warm_gap: None,
+            keep_step: 1,
         }
     }
 
@@ -324,6 +353,44 @@ impl MockEngine {
         assert!(quantum > 0, "a prompt quantum of 0 ids");
         MockEngine {
             prompt_quantum: NonZeroUsize::new(quantum),
+            ..self
+        }
+    }
+
+    /// The same mock with a residency stream a slot, and the log of its
+    /// warm calls: a close returns a section named by its slot and the
+    /// number of closes before it.
+    #[must_use]
+    pub fn with_warm(self) -> (Self, Arc<Mutex<Vec<WarmCall>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mock = MockEngine {
+            warm: Some(Arc::clone(&log)),
+            ..self
+        };
+        (mock, log)
+    }
+
+    /// The same mock whose `k`-th close of a stream (from 0) returns no
+    /// section, as an engine whose stream held nothing does.
+    #[must_use]
+    pub fn with_warm_gap(self, k: usize) -> Self {
+        MockEngine {
+            warm_gap: Some(k),
+            ..self
+        }
+    }
+
+    /// The same mock keeping positions in multiples of `step` only
+    /// ([`Engine::keepable`]), as an engine with marks does.
+    ///
+    /// # Panics
+    ///
+    /// When `step` is 0.
+    #[must_use]
+    pub fn with_keep_step(self, step: usize) -> Self {
+        assert!(step > 0, "a keep step of 0 positions");
+        MockEngine {
+            keep_step: step,
             ..self
         }
     }
@@ -589,7 +656,45 @@ impl Engine for MockEngine {
     }
 
     fn keepable(&self, n: usize) -> usize {
-        n.min(self.ctx.len())
+        n.min(self.ctx.len()) / self.keep_step * self.keep_step
+    }
+
+    fn warm_close(&mut self, slot: usize) -> Result<Option<Vec<u8>>, EngineError> {
+        let Some(log) = &self.warm else {
+            return Ok(None);
+        };
+        let mut log = log.lock().expect("the mock's warm log");
+        let closed = log
+            .iter()
+            .filter(|c| matches!(c, WarmCall::Close { .. }))
+            .count();
+        let section = (self.warm_gap != Some(closed))
+            .then(|| format!("section {closed} of slot {slot}").into_bytes());
+        log.push(WarmCall::Close {
+            slot,
+            section: section.clone(),
+        });
+        Ok(section)
+    }
+
+    fn warm_open(
+        &mut self,
+        slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+        why: WarmWhy,
+    ) -> Result<(), EngineError> {
+        if let Some(log) = &self.warm {
+            log.lock()
+                .expect("the mock's warm log")
+                .push(WarmCall::Open {
+                    slot,
+                    section: section.map(<[u8]>::to_vec),
+                    expected,
+                    why,
+                });
+        }
+        Ok(())
     }
 
     fn cut(&mut self, n: usize) -> Result<(), EngineError> {

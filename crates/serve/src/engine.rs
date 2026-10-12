@@ -881,10 +881,6 @@ impl std::fmt::Display for CacheNote {
     }
 }
 
-/// What a residency reset did ([`Engine::residency_reset`]): flips in flight
-/// cancelled, experts copied back onto the card, entries of the live map
-/// that still differ from the load's after it (0 when it worked), and host
-/// bytes released.
 /// How a request's start reused the prompt cache, as [`Engine::warm_open`]
 /// reads it: only a full hit carries a warm section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -901,6 +897,10 @@ pub enum WarmWhy {
     Resume,
 }
 
+/// What a residency reset did ([`Engine::residency_reset`]): flips in flight
+/// cancelled, experts copied back onto the card, entries of the live map
+/// that still differ from the load's after it (0 when it worked), and host
+/// bytes released.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResidencyReset {
     pub cancelled: u64,
