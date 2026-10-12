@@ -13,7 +13,6 @@ against `Sampler::sample` outside both timers on every call. The production
 sampler and its API are unchanged.
 
 ```sh
-cargo test -p bloomery-sampler --example sample_bench
 cargo run --release -p bloomery-sampler --example sample_bench -- --check-only
 cargo run --release -p bloomery-sampler --example sample_bench -- --threshold-only
 ```
@@ -36,9 +35,8 @@ The explicit check rows expose all three differences and print `false false`.
 No fallback hides these counterexamples.
 
 The pre-temperature, pre-min-p normalizer, nonfinite, all-NaN, greedy and empty
-check rows agree. The singleton-to-multiple-candidate test also checks RNG
-scheduling: greedy and singleton calls consume no random draw. These examples
-and the timed row checks do not prove equivalence for arbitrary inputs.
+check rows agree. These examples and the timed row checks do not prove
+equivalence for arbitrary inputs.
 
 ## Local CPU result, 2026-10-12
 
@@ -53,19 +51,19 @@ or end-to-end decode performance.
 
 | V | Row | Filters | Baseline median us | Cutoff median us | Paired saved us |
 |---:|---|---|---:|---:|---:|
-| 151936 | peaked | defaults | 47.4 | 1924.2 | -1875.2 |
+| 151936 | peaked | T0.8 k40 p0.95 m0.05 | 47.4 | 1924.2 | -1875.2 |
 | 151936 | peaked | top-k only | 47.9 | 1426.6 | -1376.4 |
 | 151936 | peaked | top-p + min-p | 598.3 | 1478.0 | -876.6 |
 | 151936 | peaked | min-p only | 127.3 | 542.0 | -414.1 |
-| 151936 | flat | defaults | 44.7 | 1908.8 | -1861.8 |
+| 151936 | flat | T0.8 k40 p0.95 m0.05 | 44.7 | 1908.8 | -1861.8 |
 | 151936 | flat | top-k only | 39.5 | 1390.3 | -1346.0 |
 | 151936 | flat | top-p + min-p | 970.1 | 1946.5 | -984.1 |
 | 151936 | flat | min-p only | 449.9 | 914.1 | -461.8 |
-| 154880 | peaked | defaults | 45.7 | 1947.3 | -1899.7 |
+| 154880 | peaked | T0.8 k40 p0.95 m0.05 | 45.7 | 1947.3 | -1899.7 |
 | 154880 | peaked | top-k only | 47.2 | 1463.1 | -1413.3 |
 | 154880 | peaked | top-p + min-p | 613.5 | 1517.7 | -902.5 |
 | 154880 | peaked | min-p only | 128.7 | 550.9 | -422.5 |
-| 154880 | flat | defaults | 43.8 | 1941.5 | -1894.6 |
+| 154880 | flat | T0.8 k40 p0.95 m0.05 | 43.8 | 1941.5 | -1894.6 |
 | 154880 | flat | top-k only | 40.2 | 1411.3 | -1369.4 |
 | 154880 | flat | top-p + min-p | 994.5 | 1986.5 | -999.2 |
 | 154880 | flat | min-p only | 462.2 | 929.5 | -470.1 |
@@ -74,7 +72,7 @@ All sixteen timed cells reported zero candidate and token differences across
 their 1,100 paired calls. None saved the issue's required 300 us; this radix
 implementation was slower by 414.1–1899.7 us per call at the paired median.
 Computing relative weights for every logit and repeatedly scanning histograms
-costs more here than the existing top-k scan and logit-space min-p filter.
+costs more here than the existing top-k scan and logit-space min-p filter [derived].
 
 Record the negative result without moving this arm into the engine. Any future
 implementation must address tie ordering and floating-point boundaries, then
