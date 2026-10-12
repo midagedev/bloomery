@@ -156,10 +156,14 @@ static void capture(trace_ctx * tr, const ggml_tensor * t, int layer) {
         return;
     }
     if (t->ne[0] != tr->n_used || t->ne[1] != tr->call_tokens || t->ne[2] != 1 || t->ne[3] != 1) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s: shape [%lld, %lld, %lld, %lld], expected [%d, %lld, 1, 1]", t->name,
+        char buf[384];
+        // One row of a call of several tokens: the graph hands this layer the output rows only (a
+        // graph that prunes before the last layer's FFN), and the default asks for the last token's.
+        const char * hint = t->ne[0] == tr->n_used && t->ne[1] == 1 && tr->call_tokens > 1 && t->ne[2] == 1 &&
+                            t->ne[3] == 1 ? " (the layer sees the output rows only: pass --all-logits)" : "";
+        snprintf(buf, sizeof(buf), "%s: shape [%lld, %lld, %lld, %lld], expected [%d, %lld, 1, 1]%s", t->name,
                  (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
-                 tr->n_used, (long long) tr->call_tokens);
+                 tr->n_used, (long long) tr->call_tokens, hint);
         fail(tr, buf);
         return;
     }

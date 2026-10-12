@@ -7,6 +7,7 @@
 #   just trace-router <corpus> [--name N] [args...]            (deepseek41)
 #   just trace-router-glm5next <corpus> [--name N] [args...]   (glm5next)
 #   just trace-router-qwen4exp <corpus> [--name N] [args...]   (qwen4exp)
+#   just trace-router-mimo2 <corpus> [--name N] [args...]      (mimo2)
 #
 #   <corpus>   a name    the profile's corpus file: deepseek41's $BLOOMERY_DATA/engram/corpus-<corpus>.ids
 #                        (engram-corpus.sh: code | prose | prose-all | ...), any other profile's
@@ -21,9 +22,10 @@
 #              names came first. A set is only ever replaced by a trace of its own architecture.
 #   --chunk C  tokens per independent context (default 2048; the oracle's REF_CTX for `oracle`). n_ctx
 #              is C, except for `oracle`, which keeps the dump's REF_CTX.
-#   args       passed to the harness after the defaults: --max-tokens N, --top-k-only (the fused
-#              schedule, whose ids the oracle cannot check — router_trace.cpp), gpt_params such as
-#              -ub (the fork dies at the end of a prefill at -ub 4096; stay at 2048 or below)
+#   args       passed to the harness after the defaults and the profile's ROUTER_TRACE_ARGS (an array
+#              in models/<profile>.sh, added to every trace of that model): --max-tokens N, --top-k-only
+#              (the fused schedule, whose ids the oracle cannot check — router_trace.cpp), gpt_params
+#              such as -ub (the fork dies at the end of a prefill at -ub 4096; stay at 2048 or below)
 #
 # The profile is picked on the Mac side: box.sh resolves the model under it, and a profile switch
 # inside the box command is refused with exit 64 by ref-paths.sh.
@@ -42,6 +44,8 @@ set -euo pipefail
 # MODEL, IK, BLOOMERY_DATA, MODEL_NAME, REF_TOKENS, REF_CTX and REF_SET_CPU come from the profile.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+# Harness arguments a profile adds to every trace of its model (models/mimo2.sh: --all-logits); empty otherwise.
+declare -p ROUTER_TRACE_ARGS > /dev/null 2>&1 || ROUTER_TRACE_ARGS=()
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
@@ -49,7 +53,7 @@ ROUTER=$BLOOMERY_DATA/router
 BIN=$ROUTER/bin/router_trace
 BOUND=${BLOOMERY_ROUTER_BOUND:-1800}
 
-usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" >&2; exit 64; }
+usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" >&2; exit 64; }
 [ $# -ge 1 ] || usage
 CORPUS=$1
 shift
@@ -121,7 +125,8 @@ MD5=$(md5sum "$IDS" | cut -d' ' -f1)
 
 LOG=$ROUTER/$NAME.log
 exec > >(tee "$LOG") 2>&1
-echo "router-trace.sh: corpus $CORPUS ($IDS, md5 $MD5) -> $ROUTER/$NAME, chunk $CHUNK, n_ctx $CTX, bound ${BOUND}s, ik $BUILD"
+PROFILE_ARGS_NOTE=${ROUTER_TRACE_ARGS[*]:+", profile args ${ROUTER_TRACE_ARGS[*]}"}
+echo "router-trace.sh: corpus $CORPUS ($IDS, md5 $MD5) -> $ROUTER/$NAME, chunk $CHUNK, n_ctx $CTX, bound ${BOUND}s, ik $BUILD$PROFILE_ARGS_NOTE"
 
 # dump.sh's witness fields: read-sectors is the model file's device, so the difference between the
 # two blocks is what this trace paged in.
@@ -138,7 +143,7 @@ rc=0
 BLOOMERY_ROUTER_WRITE=1 BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_ROUTER_IDS_MD5="$MD5" \
   timeout --kill-after=10 "$BOUND" \
   "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" --ids "$IDS" --out "$ROUTER/$NAME" --chunk "$CHUNK" \
-    -ngl 0 -c "$CTX" -t 32 --defer-experts "${ARGS[@]}" &
+    -ngl 0 -c "$CTX" -t 32 --defer-experts "${ROUTER_TRACE_ARGS[@]}" "${ARGS[@]}" &
 pid=$!
 echo "$pid" > "$PIDFILE"
 echo "router-trace.sh: harness under pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null || echo gone)), recorded in $PIDFILE"

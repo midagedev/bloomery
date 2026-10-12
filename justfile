@@ -801,6 +801,12 @@ trace-router-glm5next CORPUS *ARGS:
 trace-router-qwen4exp CORPUS *ARGS:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
 
+# MiMo-V2.6-Flash의 라우터 추적: trace-router와 같고, 코퍼스는 $BLOOMERY_DATA/mimo2/corpus-<이름>.ids(MiMo 토크나이저),
+# 세트 이름은 mimo2-<이름>이다. 0번 층이 dense라 세트는 1–47층을 담는다(router-coverage.py는 --layers 1-47).
+# 마지막 층의 attention이 출력 행만 남기고 FFN이 도므로 프로파일(models/mimo2.sh)이 --all-logits를 붙인다.
+trace-router-mimo2 CORPUS *ARGS:
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
+
 # ik 트리 하나의 wikitext-2 퍼플렉서티(c2048, 4청크, CPU만)를 서빙하는 V4.1 파일로 CPU 임대 아래서 잰다.
 # 두 트리를 연달아 돌리면 포트의 A/B다. ARGS: --chunks N.
 # 그 밖의 ARGS: --ctx N, --batch N, --ubatch N, --kld-base(KLD 기준 파일을 쓴다), --kld <기준 태그>(그 파일에 대한 KLD) — 러너 머리글.

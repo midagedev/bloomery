@@ -30,6 +30,8 @@
 #   REF_DUMP_LEASE  1: every ik reference run takes the machine-wide CPU lease, and the dump pages in
 #                   the whole 167.4 GB split set, most of the page cache — more than the machine can
 #                   share with a timed run. Not overridable from here.
+#   ROUTER_TRACE_ARGS  harness arguments every router trace of this model adds (router-trace.sh), an
+#                   array: --all-logits, below
 #   ref_step_variant  the decode-step variants, below
 #
 # No REF_DUMP_ARGS: without --defer-experts the loader populates the whole split set, which fits in
@@ -60,6 +62,16 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MX
 # id is 'The' and not a BOS id. Changing them invalidates the whole set.
 REF_TOKENS=785,6722,315,9625,374
 REF_DUMP_LEASE=1
+# The router trace (router_trace.cpp) reads every layer's `ffn_moe_topk-<layer>` for every token of a
+# decode call. ik's build_mimo2 hands the last layer's attention the output rows (src/graphs/
+# build_mimo2.cpp: attn_out_ids), so that layer's FFN, and its router, sees only the rows the call asks
+# logits for: one, the last token, by default. The graphs of the profiles traced so far (V4.1, glm5next,
+# qwen4exp) select the output rows after the last layer. --all-logits asks for every row (n_outputs =
+# n_tokens: the selection is the identity), so layer 47's selection covers the call's tokens; without it
+# the harness stops at that layer with a shape error. Layer 0 is dense, so the set holds layers 1-47
+# (the dense layer 0 and 47 routed, 256 experts and 8 used: crates/model/src/arch/mimo2/program.rs, its
+# tests' `real` and ROUTER).
+ROUTER_TRACE_ARGS=(--all-logits)
 
 # Decode-step variants, `dump.sh <variant>` (`just dump-ref-mimo2 <variant>`): one decode step
 # dumped after a quiet prefill (dump_ref.cpp, --decode-step), each into a set of its own — dump.sh
