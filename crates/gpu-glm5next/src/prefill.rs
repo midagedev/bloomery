@@ -600,7 +600,8 @@ impl Bufs {
     /// dense block's (0 for none) with the `forms` its sites read,
     /// `expert_ff` a routed expert's, over stores of `ctx` positions. The attention's partials
     /// cover `ctx` keys: a chunk selects only on stores past the dense
-    /// positions, which are a list's width, so they cover a list too.
+    /// positions, which are a list's width, so they cover a list too. The
+    /// card experts' scratch holds the card leg's buffers when `card_leg`.
     /// Load-time or first-prompt only.
     fn new(
         gpu: &Gpu,
@@ -609,6 +610,7 @@ impl Bufs {
         forms: DenseForms,
         ctx: usize,
         cap: usize,
+        card_leg: bool,
     ) -> Result<Bufs, GpuError> {
         let stream = gpu.stream();
         let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
@@ -661,7 +663,7 @@ impl Bufs {
             probs: z(cap * N_EXPERT)?,
             ids: zu(cap * N_USED)?,
             sel: zu(cap * N_USED)?,
-            tiles: CardTiles::new(gpu, n, expert_ff, cap)?,
+            tiles: CardTiles::new(gpu, n, expert_ff, cap, card_leg)?,
             front: GemmFront::open(
                 gpu,
                 FrontShape {
@@ -1498,6 +1500,7 @@ impl Body {
             forms,
             self.ctx,
             cap,
+            self.card.prompt_leg(),
         )?;
         self.refuse_unreserved(gpu, group_sets(self.prompt.group) - 1)?;
         let units = (0..group_sets(self.prompt.group))
