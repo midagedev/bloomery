@@ -38,11 +38,15 @@
 #
 # The slot pool bounds the runs at once on the remote: SLOTS files ~/repo/bloomery-mr/.slot-<i>, each held by
 # `lockf` (macOS's /usr/bin/lockf takes flock(2) through O_EXLOCK, so the kernel frees a slot when its holder
-# dies, however it dies). A run takes the first free slot just before `just mac-static`. At its start, before it
-# takes one, it prints one line naming each slot: its holder (track and seconds held), `free`, or `starting` (held,
-# the holder's file not written yet); `free` is read from the lock itself, never from a holder file a killed run left
-# behind. When all are held it polls every 3 s, prints the same line again every SLOT_SAY s (300, five minutes) and
-# waits, never failing: a slot's holder is a run that ends. Two at once cost a run 5-8 % (SETUP.md has the walls);
+# dies, however it dies). A run takes the first free slot just before `just mac-static`, in its turn: it first takes
+# the next ticket of the slot queue (~/repo/bloomery-mr/.slot-queue, one file a run, named by the ticket and holding
+# the run's pid and start time) and tries the slots only while no live ticket is older than its own, so runs get
+# slots in the order they came; a ticket whose run is gone (its pid dead, or now a process that started at another
+# time) is dropped by the next run that reads the queue. At its start, before it takes a slot, it prints one line
+# naming each slot: its holder (track and seconds held), `free`, or `starting` (held, the holder's file not written
+# yet), and how many runs are ahead of it in the queue when any are; `free` is read from the lock itself, never from
+# a holder file a killed run left behind. Until it has a slot it polls every SLOT_POLL s (3), prints the same line
+# again every SLOT_SAY s (300, five minutes) and waits, never failing: a slot's holder is a run that ends. Two at once cost a run 5-8 % (SETUP.md has the walls);
 # three at once is not measured.
 #
 # Exit: the remote run's code (mac-static's: the first red step's), or 0. 64: an argument, the config file
@@ -59,6 +63,7 @@ SSH_OPTS=(-o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=10 -o ServerAlive
 RBASE=repo/bloomery-mr # the clones' directory, relative to the remote home
 SLOTS=2 # runs at once on the remote; a further run waits for a slot
 SLOT_SAY=300 # seconds between two prints of the slots' line while a run waits for a slot
+SLOT_POLL=3 # seconds between a waiting run's two looks at the queue and the slots
 TRACK_WAIT=1800 # seconds a run waits for its track's lock held by a live run
 
 say() { printf '%s\n' "$*" >&2; }
@@ -279,7 +284,7 @@ exit 0
 
 RUN='{
 exec < /dev/null
-track=$1 basearg=$2 channel=$3 slots=$4 say=$5
+track=$1 basearg=$2 channel=$3 slots=$4 say=$5 poll=$6
 export PATH=$HOME/opt/bloomery-bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin
 base=$HOME/'"$RBASE"'
 echo $$ > "$base/.lock-$track/run-pid"
@@ -302,6 +307,7 @@ if [ -n "$basearg" ]; then cmd=(just mac-static "$basearg"); else cmd=(just mac-
 slot_inner() {
   local i=$1 waited=$2 holder=$3 rcf=$4
   shift 4
+  rm -f "$ticket"
   echo "$track $(date +%s)" > "$holder"
   echo "mac-remote: run slot $((i + 1)) of $slots taken after $waited s"
   "$@"
@@ -325,21 +331,56 @@ holders() {
 }
 rcf=$base/.slot-rc-$track
 rm -f "$rcf"
-echo "mac-remote: run slots:$(holders); $track"
+# The slot queue (header): the ticket is written whole under another name and renamed, so a reader never sees it empty.
+qd=$base/.slot-queue
+mkdir -p "$qd"
+started() { ps -o lstart= -p "$1" 2> /dev/null | tr -s " " | sed "s/^ //; s/ \$//"; }
+next_ticket() { local n; n=$(cat "$1" 2> /dev/null || echo 0); n=$((n + 1)); echo "$n" > "$1"; echo "$n"; }
+export -f next_ticket
+n=$(lockf -k -t 30 "$qd/.next.lock" bash -c "next_ticket \"\$1\"" _ "$qd/.next") || {
+  echo "mac-remote: the ticket lock of the slot queue on the remote was not taken in 30 s"
+  exit 69
+}
+ticket=$qd/$(printf "%012d" "$n").$track
+printf "%s %s\n" "$$" "$(started $$)" > "$qd/.new-$$"
+mv "$qd/.new-$$" "$ticket"
+export ticket
+trap "rm -f \"$base/.lock-$track/run-pid\" \"$ticket\"" EXIT
+# The live tickets older than the ticket of this run, counted; a ticket whose run is gone is removed.
+ahead() {
+  local f p s k=0
+  for f in "$qd"/[0-9]*; do
+    [ -e "$f" ] || continue
+    [ "$f" != "$ticket" ] || break
+    read -r p s < "$f" 2> /dev/null || continue
+    if [ -n "$p" ] && [ "$(started "$p")" = "$s" ]; then k=$((k + 1)); else rm -f "$f"; fi
+  done
+  echo "$k"
+}
+k=$(ahead)
+if [ "$k" = 0 ]; then q=; else q=", $k ahead of it in the slot queue"; fi
+echo "mac-remote: run slots:$(holders); $track$q"
 w0=$SECONDS last=$SECONDS
 while :; do
-  i=0
-  while [ "$i" -lt "$slots" ]; do
-    lockf -k -s -t 0 "$base/.slot-$i" bash -c "slot_inner \"\$@\"" _ "$i" "$((SECONDS - w0))" "$base/.slot-$i.holder" "$rcf" "${cmd[@]}"
-    lrc=$?
-    [ "$lrc" = 75 ] || break 2
-    i=$((i + 1))
-  done
+  k=$(ahead)
+  if [ "$k" = 0 ]; then
+    i=0
+    while [ "$i" -lt "$slots" ]; do
+      lockf -k -s -t 0 "$base/.slot-$i" bash -c "slot_inner \"\$@\"" _ "$i" "$((SECONDS - w0))" "$base/.slot-$i.holder" "$rcf" "${cmd[@]}"
+      lrc=$?
+      [ "$lrc" = 75 ] || break 2
+      i=$((i + 1))
+    done
+  fi
   if [ $((SECONDS - last)) -ge "$say" ]; then
-    echo "mac-remote: all $slots run slots are taken:$(holders); $track waits ($((SECONDS - w0)) s)"
+    if [ "$k" = 0 ]; then
+      echo "mac-remote: all $slots run slots are taken:$(holders); $track waits ($((SECONDS - w0)) s)"
+    else
+      echo "mac-remote: run slots:$(holders); $track waits ($((SECONDS - w0)) s), $k ahead of it in the slot queue"
+    fi
     last=$SECONDS
   fi
-  sleep 3
+  sleep "$poll"
 done
 if [ "$lrc" != 0 ] || [ ! -f "$rcf" ]; then
   echo "mac-remote: the run slot failed on the remote (lockf rc $lrc, ${rcf##*/} $([ -f "$rcf" ] && echo present || echo missing))"
@@ -491,7 +532,7 @@ remote_main() {
   scrub "$RHOME" "$RUSER" "$RHOST" < "$TMP/out" &
   SCPID=$!
   RUN_ACTIVE=1
-  ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$BASE_ARG" "$channel" "$SLOTS" "$SLOT_SAY")" < "$TMP/run.sh" > "$TMP/out" 2>&1 &
+  ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$BASE_ARG" "$channel" "$SLOTS" "$SLOT_SAY" "$SLOT_POLL")" < "$TMP/run.sh" > "$TMP/out" 2>&1 &
   SSHPID=$!
   ssh_rc=0
   wait "$SSHPID" || ssh_rc=$?
@@ -547,6 +588,7 @@ fake_remote() {
 [ "$1" != --version ] || { echo "just 9.9.9"; exit 0; }
 echo "$@" > "$HOME/just.args"
 echo "stub just in $(basename "$PWD")"
+basename "$PWD" >> "$HOME/just.order"
 if [ "${STUB_JUST_RC:-0}" != 0 ]; then
   mkdir -p target/mac-static
   echo "${STUB_JUST_RC}" > target/mac-static/fake-step.rc
@@ -813,6 +855,50 @@ STUB
   grep -q "run slot 1 of 2 taken after [1-9][0-9]* s" "$d/wait-slot.out" || fail "the freed slot 1 was not taken after a wait: $(cat "$d/wait-slot.out")"
   [ ! -e "$rh/repo/bloomery-mr/.slot-0.holder" ] || fail "the run left its holder file"
   [ ! -e "$rh/repo/bloomery-mr/.slot-rc-tree-one" ] || fail "the run left its rc file"
+  # the slot queue: a ticket whose run is gone does not hold a run back, and is dropped
+  sleep 0 & gp=$!
+  wait "$gp"
+  printf '%s %s\n' "$gp" "Thu Jan 1 00:00:00 1970" > "$sl/.slot-queue/000000000000.ghost"
+  rc=0; out=$(run) || rc=$?
+  [ "$rc" = 0 ] || fail "a run behind a dead ticket ended rc $rc: $out"
+  case $out in *"ahead of it"*) fail "a dead ticket was counted ahead of a run: $out" ;; esac
+  [ ! -e "$sl/.slot-queue/000000000000.ghost" ] || fail "the dead ticket was not dropped"
+  # three runs that start in that order, both slots held, get a slot in that order. When slot 1 frees, the first two
+  # are stopped (SIGSTOP to the pid each wrote into its ticket at its start) and only the third, the last to come,
+  # looks at the slots: it takes the free one unless the queue holds it back.
+  sed 's/^SLOT_POLL=.*/SLOT_POLL=1/' "$HERE/tools/mac-remote.sh" > "$d/mrq.sh"
+  grep -q '^SLOT_POLL=1$' "$d/mrq.sh" || fail "the SLOT_POLL=1 copy was not made"
+  runq() { PATH=$stub:$PATH STUB_HOME=$rh HOME=$fake bash "$d/mrq.sh" --tree "$1" 2>&1; }
+  for t in tree-two tree-three; do git clone -q "$repo" "$d/$t"; done
+  rm -f "$rh/just.order"
+  hold_slot 0 trackA
+  hold_slot 1 trackB
+  qpids=
+  for t in tree-one tree-two tree-three; do
+    runq "$d/$t" > "$d/queue-$t.out" &
+    qpids="$qpids $!"
+    n=0
+    until ls "$sl/.slot-queue/"*".$t" > /dev/null 2>&1 || [ "$n" -ge 600 ]; do sleep 0.2; n=$((n + 1)); done
+    [ "$n" -lt 600 ] || fail "$t's ticket did not appear within 120 s: $(cat "$d/queue-$t.out")"
+  done
+  stopped=
+  for t in tree-one tree-two; do
+    read -r p _ < "$(ls "$sl/.slot-queue/"*".$t")"
+    kill -STOP "$p" && stopped="$stopped $p"
+  done
+  sleep 0.5
+  : > "$d/stop-0"
+  sleep 3
+  grep -q "run slot [0-9]* of [0-9]* taken" "$d/queue-tree-three.out" && fail "the third run took the freed slot ahead of the two before it: $(cat "$d/queue-tree-three.out")"
+  [ -z "$stopped" ] || kill -CONT $stopped
+  rc=0
+  for p in $qpids; do wait "$p" || rc=$?; done
+  free_slots
+  [ "$rc" = 0 ] || fail "a queued run ended rc $rc: $(cat "$d"/queue-*.out)"
+  [ "$(tr '\n' ' ' < "$rh/just.order")" = "tree-one tree-two tree-three " ] || fail "the queued runs took slots in the order $(tr '\n' ' ' < "$rh/just.order"), not tree-one tree-two tree-three"
+  grep -Eq "^mac-remote: run slots: .*; tree-two, 1 ahead of it in the slot queue$" "$d/queue-tree-two.out" || fail "the second run's place is not named: $(cat "$d/queue-tree-two.out")"
+  grep -Eq "^mac-remote: run slots: .*; tree-three, 2 ahead of it in the slot queue$" "$d/queue-tree-three.out" || fail "the third run's place is not named: $(cat "$d/queue-tree-three.out")"
+  ! ls "$sl/.slot-queue/"[0-9]* > /dev/null 2>&1 || fail "the queue kept a ticket after its run: $(ls "$sl/.slot-queue")"
 
   rm -rf "$d"
   if [ "$fails" != 0 ]; then
