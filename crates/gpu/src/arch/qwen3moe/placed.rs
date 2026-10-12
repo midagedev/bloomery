@@ -990,6 +990,7 @@ fn gate_up_sel(
         GateUpEntry::Q8_0
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
+        | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
         | GateUpEntry::Mxfp4 => Err(GpuError::state(
             WHAT,
@@ -1034,7 +1035,11 @@ fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
         }
         // These read `Q8Act` columns (the i-quant downs of `iq_sel.rs`, MXFP4)
         // and have no launch on the placed side.
-        DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq4xs | DownEntry::Mxfp4 => {
+        DownEntry::Iq2xs
+        | DownEntry::Iq3xxs
+        | DownEntry::Iq3s
+        | DownEntry::Iq4xs
+        | DownEntry::Mxfp4 => {
             return Err(refuse(format!(
                 "its entry {entry:?} has no launch on the placed side"
             )));

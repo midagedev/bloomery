@@ -111,7 +111,7 @@ pub struct LegBufs {
 
 impl LegBufs {
     /// The buffers for runs of `shape` whose down entries read [`DownAct::
-    /// Q8Act`] (the K-quant, MXFP4 and IQ2_XS, IQ3_XXS and IQ4_XS downs).
+    /// Q8Act`] (the K-quant, MXFP4 and IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS downs).
     /// Load-time or first-prompt only.
     pub fn new(stream: &CudaStream, shape: LegShape) -> Result<LegBufs, GpuError> {
         LegBufs::for_down(stream, shape, DownAct::Q8Act)
@@ -494,7 +494,9 @@ impl CardLeg {
             Some(GateUpEntry::Q4k) => self.kquant.enqueue_gate_up_q4k(stream, &a, fault, h)?,
             Some(GateUpEntry::Q5k) => self.kquant.enqueue_gate_up_q5k(stream, &a, fault, h)?,
             Some(GateUpEntry::Mxfp4) => self.mxfp4.enqueue_gate_up(stream, &a, fault, h)?,
-            Some(GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs) => {
+            Some(
+                GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq3s | GateUpEntry::Iq4xs,
+            ) => {
                 let iq = IqGateUp {
                     ty: st.gate.ty,
                     wg: a.wg,
@@ -575,7 +577,10 @@ impl CardLeg {
                 self.q80.enqueue_gemv_q8_0_sel32(stream, &d, fault, down)?;
             }
             (
-                Some((DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq4xs, DownAct::Q8Act)),
+                Some((
+                    DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq3s | DownEntry::Iq4xs,
+                    DownAct::Q8Act,
+                )),
                 ActH::Q8Act(act),
             ) => {
                 let d = SelDown {
@@ -941,16 +946,17 @@ mod tests {
     /// The tokens of the wide test's runs: one, one past a group of eight
     /// columns, and the buffers' cap.
     const WIDE_RUNS: [usize; 3] = [1, 9, WIDE_CAP];
-    /// The wide test's cases, `(gate·up type, down type)`: the six types of
+    /// The wide test's cases, `(gate·up type, down type)`: the seven types of
     /// `kernels::card_gate_up_runs` each as a gate·up beside a down of its own
     /// type, then the three 32-value downs (`kernels::card_down_runs`) beside
     /// a gate·up that ran before.
-    const WIDE_CASES: [(GgmlType, GgmlType); 9] = [
+    const WIDE_CASES: [(GgmlType, GgmlType); 10] = [
         (GgmlType::Q4_K, GgmlType::Q4_K),
         (GgmlType::Q5_K, GgmlType::Q5_K),
         (GgmlType::MXFP4, GgmlType::MXFP4),
         (GgmlType::IQ2_XS, GgmlType::IQ2_XS),
         (GgmlType::IQ3_XXS, GgmlType::IQ3_XXS),
+        (GgmlType::IQ3_S, GgmlType::IQ3_S),
         (GgmlType::IQ4_XS, GgmlType::IQ4_XS),
         (GgmlType::Q4_K, GgmlType::Q5_1),
         (GgmlType::Q5_K, GgmlType::Q8_0),
@@ -1053,7 +1059,7 @@ mod tests {
 
     /// A slot's rows are what a one-token run writes for it, whatever `m`
     /// (the module doc), for every type [`kernels::card_gate_up_runs`] and
-    /// [`kernels::card_down_runs`] admit, in nine cases (`WIDE_CASES`). Runs of
+    /// [`kernels::card_down_runs`] admit, in ten cases (`WIDE_CASES`). Runs of
     /// `m` in `WIDE_RUNS` tokens of eight slots go through fresh buffers of
     /// `WIDE_CAP` tokens, so the run's columns beyond the eighth, and beyond a
     /// warp's 32, are read through the leg's own quantize steps and buffers;

@@ -1069,6 +1069,7 @@ fn slots_down(
             GateUpEntry::Q8_0
             | GateUpEntry::Iq2xs
             | GateUpEntry::Iq3xxs
+            | GateUpEntry::Iq3s
             | GateUpEntry::Iq4xs
             | GateUpEntry::Mxfp4 => {
                 return Err(GpuError::state(
@@ -1140,6 +1141,7 @@ fn slots_down(
             | DownEntry::Q8_0
             | DownEntry::Iq2xs
             | DownEntry::Iq3xxs
+            | DownEntry::Iq3s
             | DownEntry::Iq4nl
             | DownEntry::Iq4xs
             | DownEntry::Mxfp4 => {
@@ -1291,6 +1293,7 @@ fn apart_down(
         GateUpEntry::Q8_0
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
+        | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
         | GateUpEntry::Mxfp4 => {
             return Err(GpuError::state(
@@ -1337,6 +1340,7 @@ fn apart_down(
         | DownEntry::Q8_0
         | DownEntry::Iq2xs
         | DownEntry::Iq3xxs
+        | DownEntry::Iq3s
         | DownEntry::Iq4nl
         | DownEntry::Iq4xs
         | DownEntry::Mxfp4 => {

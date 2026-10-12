@@ -49,9 +49,9 @@
 //!   over two weight planes, with a fused weighted combine. The MXFP4 rows
 //!   below are that file's per-slot pair over the file's own blocks.
 //! - `crates/gpu/src/iq.rs`'s `IqFormat` plane row cores (IQ2_XS, IQ3_XXS,
-//!   IQ4_XS, Q2_K) are run by gates only; IQ2_XS, IQ3_XXS and IQ4_XS reach a
-//!   launch through `crates/gpu/src/iq_sel.rs`, the rows below. Q2_K has no
-//!   launcher of that shape.
+//!   IQ4_XS, Q2_K) are run by gates only; IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS
+//!   reach a launch through `crates/gpu/src/iq_sel.rs`, the rows below (IQ3_S
+//!   has no plane row core). Q2_K has no launcher of that shape.
 //! - V4.1's BF16 and Q3_K embedding rows (`chain/glue.rs` in
 //!   `crates/gpu-deepseek41`): the BF16 rows are that family's own; the
 //!   Q3_K rows have the common row below.
@@ -90,6 +90,9 @@ pub enum GateUpEntry {
     /// `IqSelKernels::enqueue_gate_up` (`iq3_xxs_gate_up_sel`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
+    /// `IqSelKernels::enqueue_gate_up` (`iq3_s_gate_up_sel`, the file's
+    /// 110-byte `block_iq3_s` stream) in `crates/gpu/src/iq_sel.rs`.
+    Iq3s,
     /// `IqSelKernels::enqueue_gate_up` (`iq4_xs_gate_up_sel`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4xs,
@@ -129,6 +132,9 @@ pub enum DownEntry {
     /// `IqSelKernels::enqueue_gemv_sel` (`iq3_xxs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
+    /// `IqSelKernels::enqueue_gemv_sel` (`iq3_s_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq3s,
     /// `IqSelKernels::enqueue_gemv_sel` (`iq4_xs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4xs,
@@ -247,6 +253,7 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         GgmlType::Q8_0 => Some(GateUpEntry::Q8_0),
         GgmlType::IQ2_XS => Some(GateUpEntry::Iq2xs),
         GgmlType::IQ3_XXS => Some(GateUpEntry::Iq3xxs),
+        GgmlType::IQ3_S => Some(GateUpEntry::Iq3s),
         GgmlType::IQ4_XS => Some(GateUpEntry::Iq4xs),
         GgmlType::MXFP4 => Some(GateUpEntry::Mxfp4),
         GgmlType::F32
@@ -260,7 +267,6 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::IQ2_XXS
         | GgmlType::IQ1_S
         | GgmlType::IQ4_NL
-        | GgmlType::IQ3_S
         | GgmlType::IQ2_S
         | GgmlType::I8
         | GgmlType::I16
@@ -289,6 +295,7 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         GgmlType::MXFP4 => Some((DownEntry::Mxfp4, DownAct::Q8Act)),
         GgmlType::IQ2_XS => Some((DownEntry::Iq2xs, DownAct::Q8Act)),
         GgmlType::IQ3_XXS => Some((DownEntry::Iq3xxs, DownAct::Q8Act)),
+        GgmlType::IQ3_S => Some((DownEntry::Iq3s, DownAct::Q8Act)),
         GgmlType::IQ4_XS => Some((DownEntry::Iq4xs, DownAct::Q8Act)),
         GgmlType::F32
         | GgmlType::F16
@@ -297,7 +304,6 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         | GgmlType::BF16
         | GgmlType::IQ2_XXS
         | GgmlType::IQ1_S
-        | GgmlType::IQ3_S
         | GgmlType::IQ2_S
         | GgmlType::I8
         | GgmlType::I16
@@ -470,6 +476,7 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
                 | GateUpEntry::Mxfp4
                 | GateUpEntry::Iq2xs
                 | GateUpEntry::Iq3xxs
+                | GateUpEntry::Iq3s
                 | GateUpEntry::Iq4xs
         )
     )
@@ -479,7 +486,7 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
 /// of type `ty`: the table's [`down`] row, for the entries whose launchers take
 /// an activation of more columns than a run uses, with the form the leg
 /// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, MXFP4,
-/// IQ2_XS, IQ3_XXS, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`] (Q5_1,
+/// IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`] (Q5_1,
 /// Q8_0, IQ4_NL). The Q6_K launcher takes such an activation and has no arm in
 /// the leg yet; the Q5_0 row reads the packed layout, not the file's blocks.
 #[must_use]
@@ -492,6 +499,7 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
                 | DownEntry::Mxfp4
                 | DownEntry::Iq2xs
                 | DownEntry::Iq3xxs
+                | DownEntry::Iq3s
                 | DownEntry::Iq4xs,
             DownAct::Q8Act
         )) | Some((
@@ -615,6 +623,9 @@ mod tests {
         }
     }
 
+    // PIN(2026-10-12): the gate·up, down and activation-form pairs and the leg's
+    // run sets gain IQ3_S (`iq3_s_gate_up_sel`, `iq3_s_gemv_sel`); every other
+    // pair is unchanged.
     #[test]
     fn gate_up_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -626,6 +637,7 @@ mod tests {
                 (GgmlType::MXFP4, GateUpEntry::Mxfp4),
                 (GgmlType::IQ2_XS, GateUpEntry::Iq2xs),
                 (GgmlType::IQ3_XXS, GateUpEntry::Iq3xxs),
+                (GgmlType::IQ3_S, GateUpEntry::Iq3s),
                 (GgmlType::IQ4_XS, GateUpEntry::Iq4xs),
             ]
         );
@@ -650,13 +662,14 @@ mod tests {
                 (GgmlType::IQ2_XS, DownEntry::Iq2xs),
                 (GgmlType::IQ3_XXS, DownEntry::Iq3xxs),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
+                (GgmlType::IQ3_S, DownEntry::Iq3s),
                 (GgmlType::IQ4_XS, DownEntry::Iq4xs),
             ]
         );
     }
 
-    /// The K-quant, MXFP4 and i-quant (IQ2_XS, IQ3_XXS, IQ4_XS) downs read the
-    /// 128-value `Q8Act`; every other down reads the 32-value `Q8Blocks32`.
+    /// The K-quant, MXFP4 and i-quant (IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) downs read
+    /// the 128-value `Q8Act`; every other down reads the 32-value `Q8Blocks32`.
     #[test]
     fn down_reads_the_activation_form_of_its_entry() {
         let forms: Vec<_> = ALL
@@ -676,6 +689,7 @@ mod tests {
                 (GgmlType::IQ2_XS, DownAct::Q8Act),
                 (GgmlType::IQ3_XXS, DownAct::Q8Act),
                 (GgmlType::IQ4_NL, DownAct::Q8Blocks32),
+                (GgmlType::IQ3_S, DownAct::Q8Act),
                 (GgmlType::IQ4_XS, DownAct::Q8Act),
             ]
         );
@@ -769,6 +783,7 @@ mod tests {
                 GgmlType::MXFP4,
                 GgmlType::IQ2_XS,
                 GgmlType::IQ3_XXS,
+                GgmlType::IQ3_S,
                 GgmlType::IQ4_XS,
             ]
         );
@@ -795,6 +810,7 @@ mod tests {
                 GgmlType::MXFP4,
                 GgmlType::IQ2_XS,
                 GgmlType::IQ3_XXS,
+                GgmlType::IQ3_S,
                 GgmlType::IQ4_XS
             ]
         );
@@ -809,6 +825,7 @@ mod tests {
                 GgmlType::IQ2_XS,
                 GgmlType::IQ3_XXS,
                 GgmlType::IQ4_NL,
+                GgmlType::IQ3_S,
                 GgmlType::IQ4_XS
             ]
         );
