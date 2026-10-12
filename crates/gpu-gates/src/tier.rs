@@ -30,6 +30,9 @@
 //!   a file whose routed layers that stay on the host are too few for the tier
 //!   to page any ([`host_clause`]). The real tier runs it; the fixture tier
 //!   leaves it to the real tier, by name.
+//! - [`Tag::NoLayoutLayer`]: a clause that reads a layer layout of which the file
+//!   it opens holds no layer ([`layout_clause`]). The real tier runs it; the
+//!   fixture tier leaves it to the real tier, by name.
 //!
 //! The `real` tier runs every clause except the fixture's oracle comparisons,
 //! tagged or not: nothing changes for a gate that declares no tags. Each of
@@ -88,7 +91,7 @@ pub enum Tier {
     Fixture,
 }
 
-/// What a clause answers (the module doc names the seven).
+/// What a clause answers (the module doc names the eight).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tag {
     /// Two arms of the engine under one plan agree.
@@ -110,11 +113,14 @@ pub enum Tag {
     /// the host are too few for the tier to page any: the clause has no input there, and the real
     /// file answers it.
     NoHostLayer,
+    /// A clause that reads a layer layout of which the file it opens holds no layer: the clause
+    /// has no input there, and a file that has one answers it.
+    NoLayoutLayer,
 }
 
 impl Tag {
     /// Every tag, in the order the module doc names them.
-    pub const ALL: [Tag; 7] = [
+    pub const ALL: [Tag; 8] = [
         Tag::SelfConsistency,
         Tag::Oracle,
         Tag::FileBound,
@@ -122,6 +128,7 @@ impl Tag {
         Tag::FixtureOracle,
         Tag::NoCardLayer,
         Tag::NoHostLayer,
+        Tag::NoLayoutLayer,
     ];
 
     /// The tag's name as a [`DEFERRED`] line prints it.
@@ -135,6 +142,7 @@ impl Tag {
             Tag::FixtureOracle => "fixture-oracle",
             Tag::NoCardLayer => "no-card-layer",
             Tag::NoHostLayer => "no-host-layer",
+            Tag::NoLayoutLayer => "no-layout-layer",
         }
     }
 }
@@ -560,6 +568,37 @@ fn host_clause_in(
         .into());
     }
     input_clause_in(tier, !host_enough, Tag::NoHostLayer, name, tally, out)
+}
+
+/// The clause `name` of a gate that reads a layer layout, on a file that has a layer of it when
+/// `holds` says so: the layers' own header, never the plan's placement. It is a self-consistency
+/// clause, run in both tiers, except on a file with no layer of the layout in the fixture tier:
+/// there it declares [`Tag::NoLayoutLayer`] and the fixture tier leaves it to the real tier, its
+/// [`DEFERRED`] line naming the tag. The real tier runs it whatever `holds` says. `Ok(false)`:
+/// the clause was left, skip it.
+///
+/// # Errors
+/// As [`run_clause`].
+pub fn layout_clause(name: &str, holds: bool) -> Result<bool, GateError> {
+    layout_clause_in(
+        Tier::from_env()?,
+        holds,
+        name,
+        &TALLY,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// [`layout_clause`] of its inputs: the tier, whether the file holds a layer of the layout, the
+/// tally and the sink.
+fn layout_clause_in(
+    tier: Tier,
+    holds: bool,
+    name: &str,
+    tally: &Tally,
+    out: &mut impl std::io::Write,
+) -> Result<bool, GateError> {
+    input_clause_in(tier, !holds, Tag::NoLayoutLayer, name, tally, out)
 }
 
 /// A self-consistency clause: it runs in both tiers, so a tier that deferred it is refused by name
@@ -995,10 +1034,10 @@ pub fn witness_card(derived: &model::placement::workstation::CardSpec) -> bool {
 mod tests {
     use super::*;
 
-    /// The seven tags are the seven kinds of clause the module doc names, once
+    /// The eight tags are the eight kinds of clause the module doc names, once
     /// each, and every name prints as one word.
     #[test]
-    fn seven_tags_in_the_docs_order() {
+    fn eight_tags_in_the_docs_order() {
         let names: Vec<&str> = Tag::ALL.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
@@ -1009,7 +1048,8 @@ mod tests {
                 "scale",
                 "fixture-oracle",
                 "no-card-layer",
-                "no-host-layer"
+                "no-host-layer",
+                "no-layout-layer"
             ]
         );
         assert!(names.iter().all(|n| !n.contains(' ')));
@@ -1052,7 +1092,7 @@ mod tests {
         }
     }
 
-    /// A clause's fate in each tier, the six tags and an untagged clause:
+    /// A clause's fate in each tier, the eight tags and an untagged clause:
     /// the real tier runs everything but a fixture-oracle clause, which it
     /// leaves to the fixture tier; the fixture tier runs self-consistency and
     /// fixture-oracle clauses, defers the other four with their tag, and
@@ -1078,6 +1118,11 @@ mod tests {
                 Tag::NoHostLayer,
                 Decision::Run,
                 Decision::Deferred(Tag::NoHostLayer),
+            ),
+            (
+                Tag::NoLayoutLayer,
+                Decision::Run,
+                Decision::Deferred(Tag::NoLayoutLayer),
             ),
         ];
         assert_eq!(table.len(), Tag::ALL.len());
@@ -1188,6 +1233,32 @@ mod tests {
                 (0, 1, 0)
             )
         );
+        assert_eq!(call(Tier::Real, true), (true, String::new(), (1, 0, 0)));
+    }
+
+    /// The layout clause runs as a self-consistency clause whenever the file holds a layer of its
+    /// layout; a fixture file with none leaves it by its own tag, and the real tier runs it
+    /// whatever the flag says. Mutant: `holds` taken in place of `!holds` (the clause that has its
+    /// layer left, the one without it run), the tag borrowed from another kind (the line names
+    /// it), or the real tier deferring.
+    #[test]
+    fn the_layout_clause_is_left_only_on_a_fixture_with_no_layer_of_its_layout() {
+        let call = |tier: Tier, holds: bool| {
+            let (tally, mut out) = (Tally::new(), Vec::new());
+            let runs = layout_clause_in(tier, holds, "(j) unjoined plan", &tally, &mut out)
+                .expect("a layout clause");
+            (runs, String::from_utf8(out).expect("UTF-8"), tally.counts())
+        };
+        assert_eq!(call(Tier::Fixture, true), (true, String::new(), (1, 0, 0)));
+        assert_eq!(
+            call(Tier::Fixture, false),
+            (
+                false,
+                "deferred(real) no-layout-layer: (j) unjoined plan\n".to_string(),
+                (0, 1, 0)
+            )
+        );
+        assert_eq!(call(Tier::Real, false), (true, String::new(), (1, 0, 0)));
         assert_eq!(call(Tier::Real, true), (true, String::new(), (1, 0, 0)));
     }
 
@@ -1378,7 +1449,7 @@ mod tests {
     }
 
     /// A clause with no tag in the fixture tier is an error that names the
-    /// clause and the four tags, not a run and not a deferral.
+    /// clause and every tag, not a run and not a deferral.
     /// Mutant: the `(Tier::Fixture, None)` arm returns `Ok(Decision::Run)`.
     #[test]
     fn an_untagged_clause_in_the_fixture_tier_is_a_named_error() {
