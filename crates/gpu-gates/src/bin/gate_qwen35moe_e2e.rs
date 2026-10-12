@@ -5,9 +5,15 @@
 //! the step after a 4-token prefill, the step after a 1,024-token prefill),
 //! all read in one process over one load.
 //!
+//! The layer counts, the Q6_K sites and the captured graphs' node counts below
+//! are the real file's; the gate derives each from the header of the file it
+//! opens (`q36_fixture::Shape`) and prints it beside that literal
+//! (`tier::witness`).
+//!
 //! What is asserted:
-//! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes,
-//!   all kernels; a captured pass of `m` rows holds [`NODES_PASS`] `+ 4m`
+//! - (s) structure: the captured decode step holds [`Shape::nodes_decode`]
+//!   nodes, all kernels; a captured pass of `m` rows holds
+//!   [`Shape::nodes_pass`] `+ 4m`
 //!   (`m` memcpys of a row into its head, the rest kernels), at `m` = 5 and
 //!   8; each count also equals the body's own launch count
 //!   (`Body35::pass_launches`) plus its heads. The layer stores' bytes equal
@@ -119,7 +125,7 @@
 //!   walk), [`SLOT_STEPS`] steps a stream, each slot's state digest every
 //!   attention layer's K/V rows below its position and every delta layer's
 //!   state and ring, `seq_bytes` held to [`store_bytes`], and H2's pass of
-//!   one row a slot holding [`NODES_PASS`] + [`NODES_SLOT`] + its head's
+//!   one row a slot holding [`Shape::nodes_pass`] + [`Shape::nodes_slot`] + its head's
 //!   five nodes. Between the harness's halves: a pass of nine rows, a slot
 //!   twice, a slot out of range, a slot of no token, an id past the
 //!   vocabulary and a pass with the layer taps armed are each refused by
@@ -138,8 +144,9 @@
 //!   layer's shared expert kept apart from its routed stacks exactly where
 //!   the header gives a part of another type than its stack's (here every
 //!   layer: q8_0 shared parts beside q4_K gate and up and q5_K or q6_K
-//!   downs); the captured decode step [`NODES_DECODE_UD`] nodes, all
-//!   kernels, and a pass of `m` rows [`NODES_PASS_UD`] `+ 4m`, each the
+//!   downs); the captured decode step [`Shape::nodes_decode`] of that file's
+//!   header (844 nodes on the real one), all kernels, and a pass of `m` rows
+//!   [`Shape::nodes_pass`] (841) `+ 4m`, each the
 //!   body's launch count plus its heads; (p) and (p′) on the batch set's
 //!   tokens; and (w)'s cut on the step-1,024 set's prompt (one ubatch of
 //!   [`U_GATE`] and two calls cut at [`W_CUT`], the wide arm's unjoined
@@ -166,7 +173,7 @@
 //!   same last logits bit for bit and the same argmax; the distance to the
 //!   f16 run prints as the quantization diagnostic.
 //! - (o) the placed load: the file planned on device 0 under a card budget
-//!   of [`PLACED_BUDGET`] (`shared/qwen3moe_place.rs`, the CLI's and the
+//!   of [`placed_budget`] (`shared/qwen3moe_place.rs`, the CLI's and the
 //!   seat's planner), which must leave routed experts both on the card and
 //!   on the host tier, then loaded by that plan (`open_placed`, the shared
 //!   expert its own one-expert stacks on the card): (o1) the batch set's
@@ -195,13 +202,15 @@
 //!   placed side, and (o7) names it.
 //!   `--placed-only` runs (o) and (o7) alone.
 //! - (o8) the unjoined shared expert on the placed load, on [`UNJOINED`]
-//!   (qwen35moe has no fixture family, so the clause is real tier only): the
+//!   (the real UD file: the family's fixture variants `unjoined` and
+//!   `unjoinedq6`, tools/fixture-variants.tsv, carry its layout on the
+//!   fixture's layers, and this clause opens the real file): the
 //!   file whose every layer keeps a q8_0 shared expert beside a K-quant
 //!   routed stack, planned on device 0 under the smallest card budget that
-//!   leaves at least [`N_LAYER`] / 2 routed experts on the card (a bisection
+//!   leaves at least half its layer count of routed experts on the card (a bisection
 //!   over the planner, which is host arithmetic: its expert rule fills the
 //!   layers in ascending order, so this budget leaves the later layers no
-//!   card expert at all, the mix [`PLACED_BUDGET`]'s even spread cannot give),
+//!   card expert at all, the mix [`placed_budget`]'s even spread cannot give),
 //!   then loaded by that plan (`open_placed`). Asserted on the opened body:
 //!   some layer holds no card expert and some holds at least one, the plan
 //!   holds host experts, the arena is the plan's count and every shared
@@ -271,8 +280,8 @@
 //!   FAIL-first, `flips`: the maps kept as the load built them
 //!   (`PlacedSide::refresh_maps` returning at once) reads the map line red
 //!   (the first prompt's maps name the spares the machine emptied at its
-//!   start, the second's miss the admitted experts). Real tier only: the
-//!   gate has no fixture conversion (qwen35moe's fixture row is `self`).
+//!   start, the second's miss the admitted experts). The clause opens the
+//!   file `ref_model_path` names and carries no tier tag.
 //!   `--residency-only` runs (e) alone.
 //!
 //! (m) the memory guard, `--memguard-only` (no model loaded): the census
@@ -371,18 +380,22 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError, GpuModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::q36_fixture::{Kind, Shape, Site};
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
         Fnv1a64, GREEDY_MARGIN, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed,
-        data_dir, ik_q8_2, q8_1_dequant, record, ref_ints, ref_tensor_logical_in, split_f32,
-        topk_ids_logical_within, verdict, widened_f16_rows_in,
+        data_dir, ik_q8_2, q8_1_dequant, record, ref_ints, ref_model_path, ref_tensor_logical_in,
+        split_f32, topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
-    use bloomery_levers::HostCfg;
+    use bloomery_levers::{CARD_BUDGET, HostCfg};
     use cuda_core::sys;
     use gguf::Split;
     use gguf::quant::half_to_f32;
     use model::arch::models::Mixer;
     use model::arch::models::shape::{AttnShape, MoeShape};
+    use model::arch::qwen35moe::hparams::{Hparams, Kind as HeaderKind};
+    use model::arch::qwen35moe::names;
     use model::placement::PlanLevers;
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
     use runtime::{Out, Target, Want};
@@ -463,16 +476,21 @@ mod gate {
     /// amplification replaces this pin.
     const PROMPT_RATIO: f64 = 2.5;
 
-    /// The file's shape, as the header states it (q35design §1): what the
-    /// derivations below are written against.
+    /// The file's widths, as the header states them (q35design §1): what the
+    /// derivations below are written against. The fixture keeps the real
+    /// widths, and `init` holds the file's embedding width to [`HIDDEN`] by
+    /// name.
     const HIDDEN: usize = 2048;
-    const N_LAYER: usize = 40;
-    const N_ATTN: usize = 10;
-    const N_DELTA: usize = 30;
+    /// The real file's layer counts and Q6_K sites, as its header states them
+    /// (q35design §1): the literals the shape the header gives ([`Cfg`]) is
+    /// witnessed against.
+    const REAL_N_LAYER: usize = 40;
+    const REAL_N_ATTN: usize = 10;
+    const REAL_N_DELTA: usize = 30;
     /// Delta layers whose `attn_qkv` is Q6_K, and attention layers whose
     /// `attn_v` is (3, 7, 19, 31, 35, 39).
-    const Q6_QKV: usize = 14;
-    const Q6_V: usize = 6;
+    const REAL_Q6_QKV: usize = 14;
+    const REAL_Q6_V: usize = 6;
     const C: usize = 8192;
     const N_V: usize = 32;
     const HEAD_V: usize = 128;
@@ -494,7 +512,7 @@ mod gate {
     /// the gated q8_1, the output projection with the residual), one more
     /// on the 6 layers whose `attn_v` is Q6_K, and 5 FFN; then the head's
     /// three: 1 + 30·13 + 10·12 + 6 + 3.
-    const NODES_DECODE: usize = 520;
+    const REAL_NODES_DECODE: usize = 520;
 
     /// PIN(2026-10-05): a captured pass of `m >= 2` rows without its heads,
     /// derived the same way at more than one row: each delta layer 8 + 5
@@ -503,14 +521,14 @@ mod gate {
     /// attention layer 7 + 5, two more on the 6 Q6_K `attn_v` layers (gemv
     /// and copy): 1 + 30·13 + 14 + 10·12 + 12. Each row's head adds a copy
     /// of the row's residual and three launches.
-    const NODES_PASS: usize = 537;
+    const REAL_NODES_PASS: usize = 537;
 
     /// PIN(2026-10-05): the launches one more busy slot adds to a captured
     /// pass of several slots (`step_slots`), derived from the launches that
     /// bind one sequence's stores or record: its embedding, each delta
     /// layer's conv and delta step, each attention layer's rope with the
     /// cache append and the flash's segment pass and merge: 1 + 30·2 + 10·3.
-    const NODES_SLOT: usize = 91;
+    const REAL_NODES_SLOT: usize = 91;
 
     /// The train-gate file of the unjoined shared expert: unsloth's
     /// `UD-Q4_K_M`, every layer's shared expert q8_0 beside q4_K gate and up
@@ -533,8 +551,8 @@ mod gate {
     /// head's three: 1 + 40·(10 + 11) + 3. No site here is row-major past
     /// one row (q8_0 and F32 gemvs are token-major), so a pass of `m >= 2`
     /// rows holds the same launches a row: 1 + 40·21.
-    const NODES_DECODE_UD: usize = 844;
-    const NODES_PASS_UD: usize = 841;
+    const REAL_NODES_DECODE_UD: usize = 844;
+    const REAL_NODES_PASS_UD: usize = 841;
 
     /// PIN(2026-10-10): (j)'s band on the FFN update against the host's f64
     /// FFN (`‖ours − host‖ / ‖host‖`, the update `l_out − ffn_inp`). The
@@ -550,16 +568,172 @@ mod gate {
     /// an order of its size.
     const UNJOINED_FFN_BAND: f64 = 5e-2;
 
-    const _: () = assert!(
-        NODES_DECODE_UD == 1 + N_LAYER * (10 + 11) + 3 && NODES_PASS_UD == 1 + N_LAYER * 21
-    );
+    /// The gate's one reading of what the run is made from: the model file
+    /// (`ref_model_path`, a whole fixture under the fixture tier), the host
+    /// load config and the plan's levers (the budget the header records in the
+    /// fixture tier, [`tier::plan_levers`]), the embedding width and the layer
+    /// kinds and site types the header names ([`Shape`]). Set once, first
+    /// thing in `run`, before any load.
+    struct Cfg {
+        path: std::path::PathBuf,
+        host: HostCfg,
+        plan_levers: PlanLevers,
+        shape: Shape,
+        n_embd: usize,
+    }
 
-    const _: () = assert!(
-        NODES_DECODE == 1 + N_DELTA * 13 + N_ATTN * 12 + Q6_V + 3
-            && NODES_PASS == 1 + N_DELTA * 13 + Q6_QKV + N_ATTN * 12 + 2 * Q6_V
-            && NODES_SLOT == 1 + N_DELTA * 2 + N_ATTN * 3
-            && N_DELTA + N_ATTN == N_LAYER
-    );
+    static CFG: std::sync::OnceLock<Cfg> = std::sync::OnceLock::new();
+
+    fn cfg() -> &'static Cfg {
+        CFG.get().expect("init runs before any clause")
+    }
+
+    /// The layer kinds and site types the header names ([`Shape`]): never read
+    /// off the loaded body, which the structure clause holds against them.
+    fn shape() -> &'static Shape {
+        &cfg().shape
+    }
+
+    fn n_layer() -> usize {
+        shape().n_layer()
+    }
+
+    fn n_attn() -> usize {
+        shape().n_attn()
+    }
+
+    fn n_delta() -> usize {
+        shape().n_delta()
+    }
+
+    fn nodes_decode() -> usize {
+        shape().nodes_decode()
+    }
+
+    fn nodes_pass() -> usize {
+        shape().nodes_pass()
+    }
+
+    /// The nodes one more busy slot adds to a captured pass: defined for the
+    /// joined layers of this gate's file only ([`Shape::nodes_slot`]).
+    fn nodes_slot() -> Result<usize, GateError> {
+        shape().nodes_slot()
+    }
+
+    /// The model file this gate runs on, opened.
+    fn open_model() -> Result<Split, GateError> {
+        let path = &cfg().path;
+        Ok(Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?)
+    }
+
+    /// The shape of `split` from its header: the layer kinds the model
+    /// crate's header reader gives (cross-checked there with the tensors and
+    /// the interval) and the type of each site the launch rules read, from the
+    /// split's tensor table. Returns the file's hyperparameters with it.
+    fn header_shape(split: &Split) -> Result<(Hparams, Shape), GateError> {
+        let hp = Hparams::read(split)?;
+        let kinds: Vec<Kind> = hp
+            .kinds
+            .iter()
+            .map(|k| match k {
+                HeaderKind::DeltaRule => Kind::Delta,
+                HeaderKind::Attention => Kind::Attention,
+            })
+            .collect();
+        let shape = Shape::from_header(&kinds, |l, site| {
+            let name = match site {
+                Site::AttnQkv => names::attn_qkv(l),
+                Site::AttnGate => names::attn_gate(l),
+                Site::SsmAlpha => names::ssm_alpha(l),
+                Site::SsmBeta => names::ssm_beta(l),
+                Site::SsmOut => names::ssm_out(l),
+                Site::AttnQ => names::attn_q(l),
+                Site::AttnK => names::attn_k(l),
+                Site::AttnV => names::attn_v(l),
+                Site::AttnOutput => names::attn_output(l),
+                Site::GateExps => names::ffn_gate_exps(l),
+                Site::UpExps => names::ffn_up_exps(l),
+                Site::DownExps => names::ffn_down_exps(l),
+                Site::GateShexp => names::ffn_gate_shexp(l),
+                Site::UpShexp => names::ffn_up_shexp(l),
+                Site::DownShexp => names::ffn_down_shexp(l),
+            };
+            split
+                .find(&name)
+                .map(|(_, t)| t.ty)
+                .ok_or_else(|| GateError::from(format!("the file holds no {name}")))
+        })?;
+        Ok((hp, shape))
+    }
+
+    /// Read the file's header once: the path the tier names, the levers, the
+    /// plan's budget and the layer kinds; print each derived value beside the
+    /// real file's literal it replaced ([`witnesses`]).
+    fn init() -> Result<bool, GateError> {
+        // A lever set to a value it does not take, or a retired name that is
+        // set, is refused by name before anything loads.
+        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
+        let path = ref_model_path()?;
+        let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let (hp, shape) = header_shape(&file)?;
+        if hp.n_embd != HIDDEN {
+            return Err(format!(
+                "{} has an embedding width of {}, the derivations here are written for {HIDDEN}",
+                path.display(),
+                hp.n_embd
+            )
+            .into());
+        }
+        let plan_levers = tier::plan_levers(&file, &levers, 0)?;
+        let cfg = Cfg {
+            path,
+            host: levers.host(),
+            plan_levers,
+            shape,
+            n_embd: hp.n_embd,
+        };
+        if CFG.set(cfg).is_err() {
+            return Err("the gate's configuration was read twice".into());
+        }
+        witnesses()
+    }
+
+    /// The move proof: each value the header gives, beside the literal the
+    /// real file's gate carried. In the real tier they are equal; the fixture
+    /// tier prints the fixture's own.
+    fn witnesses() -> Result<bool, GateError> {
+        let model = cfg().path.to_string_lossy().into_owned();
+        let mut ok = tier::witness("model file", model, MODEL.to_string());
+        ok &= tier::witness("HIDDEN", cfg().n_embd, HIDDEN);
+        ok &= tier::witness("N_LAYER", n_layer(), REAL_N_LAYER);
+        ok &= tier::witness("N_ATTN", n_attn(), REAL_N_ATTN);
+        ok &= tier::witness("N_DELTA", n_delta(), REAL_N_DELTA);
+        ok &= tier::witness("Q6_QKV", shape().q6_qkv(), REAL_Q6_QKV);
+        ok &= tier::witness("Q6_V", shape().q6_v(), REAL_Q6_V);
+        ok &= tier::witness("NODES_DECODE", nodes_decode(), REAL_NODES_DECODE);
+        ok &= tier::witness("NODES_PASS", nodes_pass(), REAL_NODES_PASS);
+        ok &= tier::witness("NODES_SLOT", nodes_slot()?, REAL_NODES_SLOT);
+        ok &= tier::witness("PLACED_BUDGET", placed_budget(), REAL_PLACED_BUDGET);
+        Ok(ok)
+    }
+
+    /// The unjoined file's shape from its header (`UNJOINED`), with its move
+    /// proof beside the literals the clauses carried: its layer count, and
+    /// with `counts` the node counts of its captured decode step and pass.
+    fn unjoined_shape(counts: bool) -> Result<(Shape, bool), GateError> {
+        let file = Split::open(UNJOINED).map_err(|e| format!("open {UNJOINED}: {e}"))?;
+        let (_, shape) = header_shape(&file)?;
+        let mut ok = tier::witness("N_LAYER (unjoined)", shape.n_layer(), REAL_N_LAYER);
+        if counts {
+            ok &= tier::witness(
+                "NODES_DECODE_UD",
+                shape.nodes_decode(),
+                REAL_NODES_DECODE_UD,
+            );
+            ok &= tier::witness("NODES_PASS_UD", shape.nodes_pass(), REAL_NODES_PASS_UD);
+        }
+        Ok((shape, ok))
+    }
 
     /// The nodes of a pass's one head of `rows` rows over the file's Q6_K
     /// lm_head: the copy of the rows into its input, then the fused head's
@@ -603,7 +777,8 @@ mod gate {
     /// each delta layer's state, `32 · 128 · 128` f32 (one lane), and conv
     /// ring, `RING_ROWS · 8192` f32.
     fn store_bytes() -> usize {
-        N_ATTN * 2 * N_KV * CTX * HEAD * 2 + N_DELTA * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4
+        n_attn() * 2 * N_KV * CTX * HEAD * 2
+            + n_delta() * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4
     }
 
     /// `‖a − b‖ / ‖base‖` over the zipped values in f64, the denominator's
@@ -694,13 +869,23 @@ mod gate {
     }
 
     fn open(ctx: usize, kv: KvQ8) -> Result<Qwen35moeModel, GateError> {
-        open_at(MODEL, ctx, kv)
+        open_at(&cfg().path, ctx, kv)
     }
 
-    fn open_at(path: &str, ctx: usize, kv: KvQ8) -> Result<Qwen35moeModel, GateError> {
-        let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    fn open_at(
+        path: impl AsRef<std::path::Path>,
+        ctx: usize,
+        kv: KvQ8,
+    ) -> Result<Qwen35moeModel, GateError> {
+        let path = path.as_ref();
+        let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         if file.architecture() != Some("qwen35moe") {
-            return Err(format!("{path} is {:?}, not qwen35moe", file.architecture()).into());
+            return Err(format!(
+                "{} is {:?}, not qwen35moe",
+                path.display(),
+                file.architecture()
+            )
+            .into());
         }
         let t = Instant::now();
         let m = Qwen35moeModel::open(
@@ -733,10 +918,12 @@ mod gate {
     /// one segment pass and one merge an attention layer ([`flash_grids`]).
     fn flash_grid_ok(nodes: &[NodeInfo]) -> Result<(bool, String), GateError> {
         let names = ["gqa_flash_seg_mma_256", "gqa_flash_merge_256"];
-        flash_grids(nodes, (1, N_KV, N_HEAD), N_ATTN, names)
+        flash_grids(nodes, (1, N_KV, N_HEAD), n_attn(), names)
     }
 
     fn structure(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
+        let (want_attn, want_layers) = (n_attn(), n_layer());
+        let (want_decode, want_pass) = (nodes_decode(), nodes_pass());
         let body = m.body("structure")?;
         let kinds = body.kinds();
         let n_attn = kinds
@@ -746,13 +933,15 @@ mod gate {
         let (launch_1, launch_m) = (body.pass_launches(1), body.pass_launches(2));
         let (stores, want_stores) = (body.store_bytes(), store_bytes());
         let apart = body.shared_apart().iter().filter(|a| **a).count();
-        let mut ok =
-            n_attn == N_ATTN && kinds.len() == N_LAYER && stores == want_stores && apart == 0;
+        let mut ok = n_attn == want_attn
+            && kinds.len() == want_layers
+            && stores == want_stores
+            && apart == 0;
         let attn_at: Vec<usize> = (0..kinds.len())
             .filter(|&l| kinds[l] == LayerKind35::Attention)
             .collect();
         println!(
-            "structure layers={} attention at {attn_at:?} ({n_attn}, want {N_ATTN}); store bytes \
+            "structure layers={} attention at {attn_at:?} ({n_attn}, want {want_attn}); store bytes \
              {stores} (want {want_stores}, derived); shared experts kept apart {apart} (want 0: \
              every part its stack's type) {}",
             kinds.len(),
@@ -762,9 +951,9 @@ mod gate {
         let memcpy = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY;
         let nodes = m.capture_step()?;
         let ([k, c], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memcpy]);
-        let pass = nodes == NODES_DECODE && k == nodes && launch_1 + 3 == nodes;
+        let pass = nodes == want_decode && k == nodes && launch_1 + 3 == nodes;
         println!(
-            "structure decode graph_nodes={nodes} (want {NODES_DECODE}; the body counts {} + 3) \
+            "structure decode graph_nodes={nodes} (want {want_decode}; the body counts {} + 3) \
              kernel={k} memcpy={c} other={other} {}",
             launch_1,
             verdict(pass)
@@ -778,7 +967,7 @@ mod gate {
             (8, m.capture_rows::<8>()?, m.rows_graph_nodes::<8>()?),
         ] {
             let ([k, c], other) = count_kinds(&list, [kernel, memcpy]);
-            let want = NODES_PASS + 4 * rows;
+            let want = want_pass + 4 * rows;
             let pass =
                 nodes == want && c == rows && k == nodes - rows && launch_m + 4 * rows == nodes;
             println!(
@@ -797,9 +986,9 @@ mod gate {
     /// shape fails here by name rather than under a slicing written for this
     /// one.
     fn file_shape() -> Result<bool, GateError> {
-        let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let split = open_model()?;
         let spec = model::arch::qwen35moe::spec::read(&split)
-            .map_err(|e| format!("{MODEL}: {e}"))?
+            .map_err(|e| format!("{}: {e}", cfg().path.display()))?
             .spec;
         let c = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
         let (mut ok, mut seen) = (true, Vec::new());
@@ -1046,14 +1235,14 @@ mod gate {
         }
 
         fn read(n: usize) -> Result<Gains, GateError> {
-            let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let split = open_model()?;
             let each = |stem: &str| -> Result<Vec<Vec<f32>>, GateError> {
                 (0..n)
                     .map(|l| split_f32(&split, &format!("blk.{l}.{stem}"), HIDDEN))
                     .collect()
             };
             let spec = model::arch::qwen35moe::spec::read(&split)
-                .map_err(|e| format!("{MODEL}: {e}"))?
+                .map_err(|e| format!("{}: {e}", cfg().path.display()))?
                 .spec;
             let moe = spec
                 .layers
@@ -2122,7 +2311,7 @@ mod gate {
         // call's end, under the copies 4 GiB fits. An exact pin, by the
         // budget's specification, not a relaxation.
         let c = m.body("gate_qwen35moe_e2e")?.checkpoints();
-        let want_bytes = N_DELTA * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4;
+        let want_bytes = n_delta() * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4;
         let every = m.ubatch()?;
         let fit = runtime::seqstate::capacity(runtime::seqstate::HOST_BUDGET, want_bytes as u64)
             .map_err(|e| e.to_string())?;
@@ -2370,8 +2559,10 @@ mod gate {
             Ok(Derived {
                 bytes: store_bytes(),
                 terms: format!(
-                    "{N_ATTN} x K/V planes of 2 x {N_KV} x {CTX} x {HEAD} f16 + {N_DELTA} x (state \
-                     {N_V} x {HEAD_V} x {HEAD_V} + ring {RING_ROWS} x {C}) f32"
+                    "{} x K/V planes of 2 x {N_KV} x {CTX} x {HEAD} f16 + {} x (state \
+                     {N_V} x {HEAD_V} x {HEAD_V} + ring {RING_ROWS} x {C}) f32",
+                    n_attn(),
+                    n_delta()
                 ),
             })
         }
@@ -2402,13 +2593,15 @@ mod gate {
     }
 
     impl PassAdapter for Q35Slots {
-        /// [`NODES_SLOT`].
+        /// [`nodes_slot`].
         fn added_slot_launches(&self, _m: &Qwen35moeModel) -> Result<Launches, GateError> {
             Ok(Launches {
-                n: NODES_SLOT,
+                n: nodes_slot()?,
                 terms: format!(
-                    "the embedding 1 + {N_DELTA} delta layers' conv and delta 2 + {N_ATTN} \
-                     attention layers' rope-append and flash segment pass and merge 3"
+                    "the embedding 1 + {} delta layers' conv and delta 2 + {} \
+                     attention layers' rope-append and flash segment pass and merge 3",
+                    n_delta(),
+                    n_attn()
                 ),
             })
         }
@@ -2627,29 +2820,6 @@ mod gate {
 
     // ------------------------------------ (j) the unjoined shared expert
 
-    /// Whether each layer's header gives a shared expert part of another
-    /// type than its routed stack's: the layers the plan keeps it apart on.
-    fn header_apart(path: &str) -> Result<Vec<bool>, GateError> {
-        let split = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
-        let ty = |name: String| -> Result<gguf::GgmlType, GateError> {
-            Ok(split
-                .find(&name)
-                .map(|(_, t)| t.ty)
-                .ok_or_else(|| format!("{path} holds no {name}"))?)
-        };
-        (0..N_LAYER)
-            .map(|l| {
-                let mut apart = false;
-                for part in ["gate", "up", "down"] {
-                    let exps = ty(format!("blk.{l}.ffn_{part}_exps.weight"))?;
-                    let sh = ty(format!("blk.{l}.ffn_{part}_shexp.weight"))?;
-                    apart |= exps != sh;
-                }
-                Ok(apart)
-            })
-            .collect()
-    }
-
     /// One of the file's matrices as the host reads it: its stored rows of
     /// `k` values, each `row_bytes` long.
     struct HostMat<'a> {
@@ -2722,7 +2892,11 @@ mod gate {
     /// (j)'s FFN clause (module doc): each FFN type combination's first
     /// layer run alone on each arm against the host's f64 FFN under the
     /// card's routing.
-    fn unjoined_ffn(m: &mut Qwen35moeModel, toks: &[u32]) -> Result<bool, GateError> {
+    fn unjoined_ffn(
+        m: &mut Qwen35moeModel,
+        toks: &[u32],
+        n_layer: usize,
+    ) -> Result<bool, GateError> {
         let split = Split::open(UNJOINED).map_err(|e| format!("open {UNJOINED}: {e}"))?;
         let parts = |l: usize| {
             ["gate", "up", "down"].map(|p| {
@@ -2733,7 +2907,7 @@ mod gate {
             })
         };
         let (mut seen, mut layers) = (Vec::new(), Vec::new());
-        for l in 0..N_LAYER {
+        for l in 0..n_layer {
             let tys: Vec<String> = parts(l)
                 .iter()
                 .flatten()
@@ -2747,7 +2921,7 @@ mod gate {
         }
         m.set_layer_taps(true)?;
         fresh(m)?;
-        let mut rows: Vec<Vec<f32>> = vec![Vec::new(); N_LAYER];
+        let mut rows: Vec<Vec<f32>> = vec![Vec::new(); n_layer];
         for &t in toks {
             m.step(&[t])?;
             for (r, tap) in rows.iter_mut().zip(m.layer_taps()?) {
@@ -2837,15 +3011,18 @@ mod gate {
 
     /// (j) (module doc): the unjoined file's plan, node counts and paths.
     fn unjoined(toks: &[u32]) -> Result<bool, GateError> {
-        let want = header_apart(UNJOINED)?;
+        let (ud, proof) = unjoined_shape(true)?;
+        let want = ud.apart();
+        let (want_layers, want_decode, want_pass) =
+            (ud.n_layer(), ud.nodes_decode(), ud.nodes_pass());
         let mut m = open_at(UNJOINED, CTX, KvQ8::F16)?;
         let body = m.body("unjoined")?;
         let got = body.shared_apart();
         let (launch_1, launch_m) = (body.pass_launches(1), body.pass_launches(2));
         let n_apart = got.iter().filter(|a| **a).count();
-        let mut ok = got == want && n_apart == N_LAYER;
+        let mut ok = got == want && n_apart == want_layers;
         println!(
-            "unjoined plan: shared experts kept apart on {n_apart} of {} layers (want {N_LAYER}, \
+            "unjoined plan: shared experts kept apart on {n_apart} of {} layers (want {want_layers}, \
              the header's {} layers of a part of another type) {}",
             got.len(),
             want.iter().filter(|a| **a).count(),
@@ -2855,9 +3032,9 @@ mod gate {
         let memcpy = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY;
         let nodes = m.capture_step()?;
         let ([k, c], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memcpy]);
-        let pass = nodes == NODES_DECODE_UD && k == nodes && launch_1 + 3 == nodes;
+        let pass = nodes == want_decode && k == nodes && launch_1 + 3 == nodes;
         println!(
-            "unjoined decode graph_nodes={nodes} (want {NODES_DECODE_UD}; the body counts {} + 3) \
+            "unjoined decode graph_nodes={nodes} (want {want_decode}; the body counts {} + 3) \
              kernel={k} memcpy={c} other={other} {}",
             launch_1,
             verdict(pass)
@@ -2868,7 +3045,7 @@ mod gate {
             (8, m.capture_rows::<8>()?, m.rows_graph_nodes::<8>()?),
         ] {
             let ([k, c], other) = count_kinds(&list, [kernel, memcpy]);
-            let want = NODES_PASS_UD + 4 * rows;
+            let want = want_pass + 4 * rows;
             let pass =
                 nodes == want && c == rows && k == nodes - rows && launch_m + 4 * rows == nodes;
             println!(
@@ -2882,7 +3059,7 @@ mod gate {
         let (p_ok, decode) = paths(&mut m, toks)?;
         ok &= p_ok;
         ok &= gemv_arm(&mut m, toks, &decode)?;
-        ok &= unjoined_ffn(&mut m, toks)?;
+        ok &= unjoined_ffn(&mut m, toks, want_layers)?;
         let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
         let (_, _, prompt) = man.step()?;
         let mut run = |cut: Option<usize>| -> Result<(u32, Vec<f32>, Vec<StoreHost>), GateError> {
@@ -2902,7 +3079,7 @@ mod gate {
             .filter(|&l| !stores0.get(l).is_some_and(|w| same_store(&st[l], w)))
             .collect();
         let same_logits = bits_equal(&logits, &logits0);
-        let pass = tok == tok0 && same_logits && differ.is_empty() && st.len() == N_LAYER;
+        let pass = tok == tok0 && same_logits && differ.is_empty() && st.len() == want_layers;
         println!(
             "unjoined wide arm: {} ids as one ubatch of {U_GATE} and as two calls of {W_CUT} and \
              {}: token {tok} vs {tok0}, last logits bit-identical={same_logits}, every store \
@@ -2912,6 +3089,7 @@ mod gate {
             verdict(pass)
         );
         ok &= pass;
+        ok &= proof;
         println!("unjoined: {}", verdict(ok));
         Ok(ok)
     }
@@ -2948,9 +3126,20 @@ mod gate {
 
     // ---------------------------------------------- (o) the placed load
 
-    /// (o)'s card budget: a 12 GiB card's, under which the file's routed
-    /// experts split between the card and the host tier.
-    const PLACED_BUDGET: u64 = 12 << 30;
+    /// (o)'s card budget in the real tier: a 12 GiB card's, under which the
+    /// file's routed experts split between the card and the host tier.
+    const REAL_PLACED_BUDGET: u64 = 12 << 30;
+
+    /// (o)'s card budget: the real tier's [`REAL_PLACED_BUDGET`] unless the
+    /// caller's plan lever names one; the fixture tier's is the budget the
+    /// fixture's header records ([`tier::plan_levers`]), which splits the
+    /// routed experts the same way on the fixture's card.
+    fn placed_budget() -> u64 {
+        cfg()
+            .plan_levers
+            .card_budget_bytes
+            .unwrap_or(REAL_PLACED_BUDGET)
+    }
 
     /// What the memguard clause leaves free of the card while it holds the
     /// rest: well under the trunk's smallest term, so the refusal is
@@ -2968,7 +3157,7 @@ mod gate {
     /// every arm red.
     fn memguard() -> Result<bool, GateError> {
         use bloomery_gpu_gates::gpu_census::census;
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = open_model()?;
         let d0 = census()?
             .into_iter()
             .find(|d| d.ordinal == 0)
@@ -3026,7 +3215,7 @@ mod gate {
 
     /// (o) (module doc): the model is dropped before the clause returns.
     fn placed(man: &RefManifest, toks: &[u32], host: HostCfg) -> Result<bool, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = open_model()?;
         let o = Open35 {
             ctx: CTX,
             mma: true,
@@ -3036,7 +3225,7 @@ mod gate {
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(PLACED_BUDGET),
+            card_budget_bytes: Some(placed_budget()),
         };
         let plan = q.plan(CTX, &levers)?;
         q.record(&plan, None).print();
@@ -3054,7 +3243,7 @@ mod gate {
         let scratch = GpuModel::<Body35>::placed_arena_bytes(&file, o)?;
         let card = plan.machine.cards.first().ok_or("a plan of no card")?;
         let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
-        let joined = header_apart(MODEL)?.iter().filter(|&&a| !a).count();
+        let joined = shape().apart().iter().filter(|&&a| !a).count();
         let t = Instant::now();
         let mut m = GpuModel::<Body35>::open_placed(file, &plan, o, host)?;
         let apart = m.body("gate_qwen35moe_e2e")?.shared_apart();
@@ -3063,8 +3252,9 @@ mod gate {
         println!(
             "placed scratch: the plan counts {counted} B, the arena and placed side the planner \
              counts {scratch} B {}; every layer's shared expert kept apart on the placed load \
-             {every} ({joined} of {N_LAYER} layers are folded in the file) {}",
+             {every} ({joined} of {} layers are folded in the file) {}",
             verdict(counts),
+            n_layer(),
             verdict(every)
         );
         let mut ok_scratch = counts && every;
@@ -3162,7 +3352,7 @@ mod gate {
             let mut m = open(CTX, KvQ8::F16)?;
             decode_run(&mut m, toks, false)?.tokens
         };
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = open_model()?;
         let o = Open35 {
             ctx: CTX,
             mma: true,
@@ -3214,10 +3404,10 @@ mod gate {
     /// least `want` routed experts on the card. The expert rule fills the
     /// layers in ascending order, one expert at a time, so a plan of fewer
     /// experts than the file has layers leaves the later layers none: the mix
-    /// of layers (o8) needs, which [`PLACED_BUDGET`]'s even spread does not
+    /// of layers (o8) needs, which [`placed_budget`]'s even spread does not
     /// give. Card experts only grow with the budget and the planner is host
     /// arithmetic, so the search is a bisection from a budget the planner
-    /// refuses as below the card's floor up to [`PLACED_BUDGET`], which must
+    /// refuses as below the card's floor up to [`placed_budget`], which must
     /// itself plan `want` experts; a refusal other than the floor's ends the
     /// search by name.
     fn budget_for_card_experts(q: &PlaceQ3, want: u64) -> Result<u64, GateError> {
@@ -3238,7 +3428,7 @@ mod gate {
                 Err(e) => Err(e),
             }
         };
-        let (mut lo, mut hi) = (0u64, PLACED_BUDGET);
+        let (mut lo, mut hi) = (0u64, placed_budget());
         if card_experts(lo)?.is_some() {
             return Err(
                 format!("a card budget of {lo} B plans: the card's floor is not read").into(),
@@ -3347,12 +3537,14 @@ mod gate {
                 prompt.len()
             )
         })?;
-        let apart = header_apart(UNJOINED)?;
+        let (ud, proof) = unjoined_shape(false)?;
+        let apart = ud.apart();
+        let want_layers = ud.n_layer();
         let n_apart = apart.iter().filter(|&&a| a).count();
-        let unjoined_file = apart.len() == N_LAYER && n_apart == N_LAYER;
+        let unjoined_file = n_apart == want_layers;
         println!(
             "placed unjoined file: shared experts of another type than their stacks' on {n_apart} \
-             of {} layers (want {N_LAYER}) {}",
+             of {} layers (want {want_layers}) {}",
             apart.len(),
             verdict(unjoined_file)
         );
@@ -3383,7 +3575,7 @@ mod gate {
             media: false,
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
-        let want = u64::try_from(N_LAYER / 2)?;
+        let (want, top) = (u64::try_from(want_layers / 2)?, placed_budget());
         let budget = budget_for_card_experts(&q, want)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget),
@@ -3393,7 +3585,7 @@ mod gate {
         let card_experts = plan.cards.first().ok_or("a plan of no card")?.experts;
         let split = plan.host.experts > 0 && card_experts >= want;
         println!(
-            "placed unjoined plan: card budget {budget} B (the smallest under {PLACED_BUDGET} B \
+            "placed unjoined plan: card budget {budget} B (the smallest under {top} B \
              that plans {want} card experts or more) card_experts={card_experts} host_experts={} \
              (both above 0) card experts per layer {:?} {}",
             plan.host.experts,
@@ -3496,6 +3688,7 @@ mod gate {
             (&[next], std::slice::from_ref(&next_logits)),
             (&[whole_wide.0], std::slice::from_ref(&whole_wide.1)),
         )?;
+        ok &= proof;
         println!("placed unjoined: {}", verdict(ok));
         Ok(ok)
     }
@@ -3579,7 +3772,7 @@ mod gate {
     /// session and the residency it ran (`None` when the plan leaves a layer
     /// no room for the machine).
     fn e_open(host: HostCfg, on: bool) -> Result<(Session<Body35>, Option<Residency>), GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = open_model()?;
         let o = Open35 {
             ctx: CTX,
             mma: true,
@@ -3589,7 +3782,7 @@ mod gate {
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(PLACED_BUDGET),
+            card_budget_bytes: Some(placed_budget()),
         };
         let plan = q.plan(CTX, &levers)?;
         let mid = residency_clauses::mid_of(&plan.n_l);
@@ -3789,8 +3982,8 @@ mod gate {
     ///   (`Placed::set_ring_check`) ([`e_split`]), the lever off again after
     ///   it.
     ///
-    /// Real tier: this gate has no fixture conversion (`qwen35moe`'s fixture
-    /// row is `self`).
+    /// The clause opens the file `ref_model_path` names and carries no tier
+    /// tag.
     fn residency(host: HostCfg) -> Result<bool, GateError> {
         let ids = e_ids()?;
         let (mut off, _) = e_open(host, false)?;
@@ -4209,12 +4402,14 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        // A lever set to a value it does not take, or a retired name that is
-        // set, is refused by name before anything loads.
-        let host = bloomery_levers::at_main(&[])?.host();
+        // The levers and the file's header are read, and each value the header
+        // gives printed beside the literal it replaced, before anything loads.
+        let proof = init()?;
+        let host = cfg().host;
         if std::env::args().any(|a| a == "--placed-only") {
             let (man, toks) = batch_set()?;
-            let mut ok = placed(&man, &toks, host)?;
+            let mut ok = proof;
+            ok &= placed(&man, &toks, host)?;
             ok &= placed_no_host(&man, &toks, host)?;
             println!("gate_qwen35moe_e2e --placed-only: {}", verdict(ok));
             if !ok {
@@ -4224,7 +4419,8 @@ mod gate {
         }
         if std::env::args().any(|a| a == "--unjoined-placed-only") {
             let (_, toks) = batch_set()?;
-            let ok = placed_unjoined(&toks, host)?;
+            let mut ok = proof;
+            ok &= placed_unjoined(&toks, host)?;
             println!("gate_qwen35moe_e2e --unjoined-placed-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
@@ -4232,7 +4428,8 @@ mod gate {
             return Ok(());
         }
         if std::env::args().any(|a| a == "--residency-only") {
-            let ok = residency(host)?;
+            let mut ok = proof;
+            ok &= residency(host)?;
             println!("gate_qwen35moe_e2e --residency-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
@@ -4241,7 +4438,8 @@ mod gate {
         }
         if std::env::args().any(|a| a == "--unjoined-only") {
             let (_, toks) = batch_set()?;
-            let ok = unjoined(&toks)?;
+            let mut ok = proof;
+            ok &= unjoined(&toks)?;
             println!("gate_qwen35moe_e2e --unjoined-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
@@ -4249,7 +4447,8 @@ mod gate {
             return Ok(());
         }
         if std::env::args().any(|a| a == "--memguard-only") {
-            let ok = memguard()?;
+            let mut ok = proof;
+            ok &= memguard()?;
             println!("gate_qwen35moe_e2e --memguard-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
@@ -4257,7 +4456,8 @@ mod gate {
             return Ok(());
         }
         let mut m = open(CTX, KvQ8::F16)?;
-        let mut ok = file_shape()?;
+        let mut ok = proof;
+        ok &= file_shape()?;
         ok &= structure(&mut m)?;
         let (man, toks) = batch_set()?;
         let (p_ok, decode) = paths(&mut m, &toks)?;
