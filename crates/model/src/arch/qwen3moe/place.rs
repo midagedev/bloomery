@@ -17,9 +17,7 @@ use gguf::Split;
 use super::hparams::Hparams;
 use super::roles;
 use crate::placement::accepts::{Program, routed_rule};
-use crate::placement::workstation::{
-    CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host_of, unified_of,
-};
+use crate::placement::workstation::{self, CardSpec, SCRATCH};
 use crate::placement::{
     self, Card, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation,
     checked, joined,
@@ -38,32 +36,10 @@ pub const PROGRAM: Program = Program::Qwen3moeBody;
 /// of `layers`, the head and the token embedding whole, with the
 /// workstation's context and margin, the m = 1 scratch plus `arena` bytes —
 /// what the load's prompt arenas hold beyond it, which the program sizes
-/// and its load refuses to pass — and the host the card's machine has
-/// ([`host_of`]: the workstation's, or the pool on a unified machine). The
-/// spec's free reading and its holders ride on the card
-/// ([`crate::placement::Card::free_bytes`]). No expert tier.
+/// and its load refuses to pass ([`workstation::placed_on`]).
 #[must_use]
 pub fn machine(card: CardSpec, layers: usize, arena: u64) -> Machine {
-    Machine {
-        cards: vec![Card {
-            name: card.name.to_string(),
-            device: card.device,
-            usable_bytes: card.usable_bytes(),
-            context_bytes: CONTEXT,
-            scratch_bytes: SCRATCH + arena,
-            margin_bytes: MARGIN,
-            granule_bytes: GRANULE,
-            free_bytes: card.free_bytes,
-            held_by: card.held_by,
-            layers: 0..layers,
-            head: true,
-            token_embedding: true,
-            reserves: Vec::new(),
-        }],
-        tiers: Vec::new(),
-        host: host_of(&card),
-        unified: unified_of(&card),
-    }
+    workstation::placed_on(card, layers, SCRATCH + arena)
 }
 
 /// The prompt-arena bytes a plan made on `card` by [`machine`] counts: its

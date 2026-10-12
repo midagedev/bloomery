@@ -27,7 +27,7 @@
 //! listed size with its header (fetched through the hf crate's client) at the front, in a
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
-//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `glm5next`)
+//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`)
 //! reads its row of [`SOURCES`]: repo, quant and revision; a `<repo>:<quant>` takes `main`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
@@ -55,6 +55,7 @@ use hf::{Entry, RepoRef};
 use model::arch::deepseek41::fixture as v41;
 use model::arch::glm5next::fixture as glm5;
 use model::arch::qwen35moe::fixture as qwen38;
+use model::arch::qwen35moe::fixture::qwen35moe as qwen36;
 use model::fixture::{
     self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, HeaderStat, Options, PlannedTensor,
     RemoteError, Sample, TensorStat, VARIANT_TABLE,
@@ -71,7 +72,7 @@ flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a
 flags of fetch: the same but --draft, and --rev R";
 
 /// Every family's spec, found by the architecture it declares.
-const SPECS: [fn() -> FixtureSpec; 3] = [v41::spec, qwen38::spec, glm5::spec];
+const SPECS: [fn() -> FixtureSpec; 4] = [v41::spec, qwen38::spec, qwen36::spec, glm5::spec];
 
 /// Where a family's draft fixture comes from on the hub.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +99,7 @@ struct Source {
 }
 
 /// One row per entry of [`SPECS`].
-const SOURCES: [Source; 3] = [
+const SOURCES: [Source; 4] = [
     Source {
         spec: v41::spec,
         family: "v41",
@@ -116,6 +117,16 @@ const SOURCES: [Source; 3] = [
         quant: "UD-Q4_K_XL",
         rev: None,
         draft: DraftSource::File("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
+    },
+    Source {
+        spec: qwen36::spec,
+        family: "qwen35moe",
+        repo: "lmstudio-community/Qwen3.6-35B-A3B-GGUF",
+        quant: "Q4_K_M",
+        // The commit whose header the spec's map was chosen from, pinned so a rewritten upstream
+        // file is a new fixture on purpose.
+        rev: Some("68a34855558af61cbef0324d31f411be8a506b08"),
+        draft: DraftSource::None,
     },
     Source {
         spec: glm5::spec,
@@ -807,5 +818,17 @@ mod tests {
             .find(|s| s.family == "glm5next")
             .expect("glm row");
         assert_eq!(glm.rev, Some("621d456e93"));
+        let q36 = SOURCES
+            .iter()
+            .find(|s| s.family == "qwen35moe")
+            .expect("qwen35moe row");
+        assert_eq!(
+            (q36.repo, q36.quant, q36.rev),
+            (
+                "lmstudio-community/Qwen3.6-35B-A3B-GGUF",
+                "Q4_K_M",
+                Some("68a34855558af61cbef0324d31f411be8a506b08")
+            )
+        );
     }
 }

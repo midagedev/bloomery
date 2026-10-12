@@ -673,7 +673,7 @@ dump-ref-glm5next *VARIANT:
 dump-ref-glm5next-cuda:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-glm5next-cuda && NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
-# ik's node dump of a family's fixture file (glm5next, qwen4exp, deepseek41), into $BLOOMERY_DATA/fx_<the real twin's set>
+# ik's node dump of a family's fixture file (glm5next, qwen4exp, qwen35moe, deepseek41), into $BLOOMERY_DATA/fx_<the real twin's set>
 # (refset's fixture families): the same dumper and profile as the family's real recipe, the fixture first shard as the model,
 # the fixture file's `# fixture` line in the header (refset-check --fixture-line), and in the long variants (d1k, d3k, d3kdsa,
 # d16kdsa) ik's routes for the prefill's positions (dump_ref --prefill-routes). No VARIANT is the batch set; a VARIANT is the
@@ -1120,7 +1120,9 @@ gate-r8:
 # subset files written, opened and verified end to end (under 1 GB each, removed), and the named refusals. The Qwen3.8 spec
 # (model::arch::qwen35moe::fixture) against the Qwen3.8 file's header and the shared MTP draft's, at the profile's paths:
 # the four-layer plan read back by the engine's hparams at interval 2, the planned card budget (the written file's plan
-# under it holds half the experts on every layer the card loads), and the ik-silent traps refused by name. The V4.1 spec's
+# under it holds half the experts on every layer the card loads), and the ik-silent traps refused by name. The Qwen3.6 spec
+# (model::arch::qwen35moe::fixture::qwen35moe, the lmstudio Q4_K_M file) is held here by the bin's source-row test alone: its
+# rules and its map's layer kinds are the model lib's tests (gate-ops), its plan against the real header is `fixture plan`. The V4.1 spec's
 # ff 512 (the plan, the draft's ff, the routed stacks and the r8 sidecar's stacks), its planned budget (half the experts
 # at the gate machine, ctx 32768) and its two router biases that differ between experts (the family's header check refuses
 # zeros, equal and a constant shift); the GLM-5.3-Flash spec (model::arch::glm5next::fixture) against the GLM file's

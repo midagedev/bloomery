@@ -96,7 +96,8 @@ case "${BLOOMERY_TIER:-real}" in
       qwen4exp) __fixture_dir=qwen38 ;;
       deepseek41) __fixture_dir=v41 ;;
       glm5next) __fixture_dir=glm5next ;;
-      deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;
+      qwen35moe) __fixture_dir=qwen35moe ;;
+      deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;
       *) __fixture_dir=none ;;
     esac
     case "$__fixture_dir" in
