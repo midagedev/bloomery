@@ -1472,8 +1472,13 @@ impl Body38 {
                 ),
             ));
         }
+        // A load planned for several sequences runs a pass of their rows
+        // through the step port's columns, up to the pass arena's rows; a
+        // load for one sequence the verify's. The expert tier's page, its
+        // places and its card leg are cut to the same columns.
+        let cols = if planned > 1 { PASS_ROWS } else { VERIFY_ROWS };
         let tier = (!tiers.is_empty())
-            .then(|| TierSide38::new(gpu, &map))
+            .then(|| TierSide38::new(gpu, &map, cols))
             .transpose()?;
         let mut wide = Wide38::new(stream, ub, &card, tier.is_some())?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
@@ -1485,10 +1490,6 @@ impl Body38 {
                 ),
             ));
         }
-        // A load planned for several sequences runs a pass of their rows
-        // through the step port's columns, up to the pass arena's rows; a
-        // load for one sequence the verify's.
-        let cols = if planned > 1 { PASS_ROWS } else { VERIFY_ROWS };
         let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
@@ -1504,7 +1505,7 @@ impl Body38 {
             ff: geo::FF,
             n_used: geo::N_USED,
         };
-        let arena = crate::model::nvme_tier(plan, file, host.r8)?;
+        let arena = crate::model::nvme_tier(plan, file, host.r8, set.arena())?;
         let mut experts = HostRun::build(Arc::clone(file), 0, host.r8, widths, |src| {
             model::arch::qwen35moe::host::layers(src, hp, run.clone())
         })?;
@@ -1534,11 +1535,24 @@ impl Body38 {
                     &map,
                     &stacks,
                     n,
+                    cols,
                     block,
                     host.card_dontneed,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let port_cols = boundary.layout().cols();
+        if let Some(t) = tier_cards.iter().find(|t| t.cols() != port_cols) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the expert tier {} opened for {} columns a row, the step port's {port_cols}: \
+                     a pass hands the tier one row of the port's columns",
+                    t.name(),
+                    t.cols()
+                ),
+            ));
+        }
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(set);
@@ -4530,8 +4544,7 @@ impl Body38 {
     /// order. Refused by name before anything moves: ranges that do not
     /// tile the pass from row 0, slot 0 busy and not first, a parked count
     /// other than the ranges past slot 0, a load planned for one sequence,
-    /// a load with an expert tier card, the layer taps armed, a route trace
-    /// attached, more rows than the step port's columns, a slot map with a
+    /// the layer taps armed, a route trace attached, more rows than the step port's columns, a slot map with a
     /// routed expert on a tier card ([`MapCheck::refuse`]), and for each
     /// slot on its own sequence a row count outside `1..=LANES`, a position
     /// other than its stores' or past them, a verify waiting, an id the
@@ -4551,12 +4564,6 @@ impl Body38 {
             return Err(GpuError::shape(
                 WHAT_SLOTS,
                 "a pass of several slots on a load planned for one sequence",
-            ));
-        }
-        if self.tier.is_some() {
-            return Err(GpuError::shape(
-                WHAT_SLOTS,
-                "a pass of several slots on a load with an expert tier card",
             ));
         }
         if self.taps.is_some() {

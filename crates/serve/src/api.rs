@@ -5644,6 +5644,11 @@ mod tests {
         /// measured walls dropped.
         fn pinned(mut v: Value) -> Value {
             fn walk(v: &mut Value) {
+                // An array's objects carry their own clock leaves (/v1/models' `data[].created`).
+                if let Value::Array(a) = v {
+                    a.iter_mut().for_each(walk);
+                    return;
+                }
                 let Value::Object(o) = v else { return };
                 o.remove("timings");
                 for leaf in ["created", "id"] {

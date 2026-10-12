@@ -14,11 +14,13 @@
 //! - (ii) slots: on every layer with card experts, at slots 0, n/2 and
 //!   n − 1, each resident stack's `_sel` at the slot is bit for bit the same
 //!   entry, or the plain gemv, over that expert's rows uploaded alone from
-//!   the file: the Q4_K gate and up by `q4k_gemv_sel` against `q4k_gemv`,
-//!   the Q5_K down by `q5k_gemv_sel` against itself on a one-expert stack at
-//!   id 0, and the gate·up entry the step runs (`kq_gate_up_act_q4k` or
-//!   `_q5k`, the layer's routed limit) against itself on the expert's own
-//!   pair. A list whose gather put another expert in a slot fails here.
+//!   the file: each stack by the one-stack `_sel` entry the common card
+//!   leg's table names for its type (`kernels::down`: Q4_K's `q4k_gemv_sel`
+//!   against the plain `q4k_gemv`, every other type against itself on a
+//!   one-expert stack at id 0), and the gate·up entry the step runs
+//!   (`kernels::gate_up`, the layer's routed limit) against itself on the
+//!   expert's own pair. A list whose gather put another expert in a slot
+//!   fails here.
 //! - (iii) card copy: read back from the card, the slot map's copy the
 //!   handoff reads holds each routed layer's host row at the map's
 //!   `row_offset(l)` — the offset the layer's handoff adds an id to — entry
@@ -27,7 +29,9 @@
 
 use app::Session;
 use bloomery_gpu::hybrid::HOST;
+use bloomery_gpu::iq_sel::{IqGateUp, IqSelKernels};
 use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels, SelDown};
+use bloomery_gpu::mxfp4_sel::Mxfp4SelKernels;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 use bloomery_gpu_gates::tier;
@@ -38,6 +42,15 @@ use gguf::{GgmlType, Split};
 use model::arch::glm5next::hparams::Hparams;
 use model::arch::glm5next::place::{PlanInputs, card_routed};
 use model::arch::names::routed_stacks;
+use model::placement::kernels::{self, DownEntry, GateUpEntry};
+
+/// The modules of the card leg's one-slot entries, by the common rule's
+/// entry for a type ([`kernels::gate_up`], [`kernels::down`]).
+struct SelKernels {
+    kq: KquantKernels,
+    iq: IqSelKernels,
+    mx: Mxfp4SelKernels,
+}
 
 /// The checks (i)–(iii) on `s`'s model, whose plan put `n_l[l]` card experts
 /// on layer `l`, of `experts` a layer; `budgeted` when the plan ran under a
@@ -264,15 +277,16 @@ fn resident<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, Gat
 }
 
 /// One stack's gemv at `slot` of the resident `stack` and at the
-/// expert's own upload: the Q4_K `_sel` against the plain Q4_K gemv, the
-/// Q5_K `_sel` against itself at id 0 of the one-expert upload.
+/// expert's own upload, by the one-stack entry [`kernels::down`] names for
+/// `ty`: the Q4_K `_sel` against the plain Q4_K gemv, every other entry
+/// against itself at id 0 of the one-expert upload.
 #[allow(
     clippy::too_many_arguments,
     reason = "the gate's card, kernels, both stacks and the launch's shape (rust-quality R8)"
 )]
 fn gemv_pair(
     gpu: &Gpu,
-    kq: &KquantKernels,
+    k: &SelKernels,
     ty: GgmlType,
     stack: &DeviceTensor<u32>,
     own: &DeviceTensor<u32>,
@@ -285,26 +299,30 @@ fn gemv_pair(
     let zero = DeviceBuffer::from_host(stream, &[0u32])?;
     let mut y_sel = DeviceBuffer::<f32>::zeroed(stream, rpe)?;
     let mut y_own = DeviceBuffer::<f32>::zeroed(stream, rpe)?;
-    match ty {
-        GgmlType::Q4_K => {
-            gpu.q4k_sel()
-                .enqueue_gemv_q4k_sel(stream, stack, act, &sel, 1, rpe, &mut y_sel)?;
-            gpu.enqueue_gemv_q4k(own, act, &mut y_own)?;
-        }
-        GgmlType::Q5_K => {
-            let sink = gpu.unlabelled_sink();
-            for (w, sel, y) in [(stack, &sel, &mut y_sel), (own, &zero, &mut y_own)] {
-                let a = SelDown {
-                    w,
-                    act,
-                    sel,
-                    n_slots: 1,
-                    rows_per_expert: rpe,
-                };
-                kq.enqueue_gemv_q5k_sel(stream, &a, sink, y)?;
+    let entry = kernels::down(ty).map(|(e, _)| e);
+    if entry == Some(DownEntry::Q4k) {
+        gpu.q4k_sel()
+            .enqueue_gemv_q4k_sel(stream, stack, act, &sel, 1, rpe, &mut y_sel)?;
+        gpu.enqueue_gemv_q4k(own, act, &mut y_own)?;
+    } else {
+        let sink = gpu.unlabelled_sink();
+        for (w, sel, y) in [(stack, &sel, &mut y_sel), (own, &zero, &mut y_own)] {
+            let a = SelDown {
+                w,
+                act,
+                sel,
+                n_slots: 1,
+                rows_per_expert: rpe,
+            };
+            match entry {
+                Some(DownEntry::Q5k) => k.kq.enqueue_gemv_q5k_sel(stream, &a, sink, y)?,
+                Some(DownEntry::Mxfp4) => k.mx.enqueue_down(stream, &a, sink, y)?,
+                Some(DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq3s | DownEntry::Iq4xs) => {
+                    k.iq.enqueue_gemv_sel(stream, ty, &a, sink, y)?
+                }
+                _ => return Err(format!("{ty} has no `_sel` gemv here").into()),
             }
         }
-        ty => return Err(format!("{ty} has no `_sel` gemv here").into()),
     }
     Ok((y_sel.to_host_vec(stream)?, y_own.to_host_vec(stream)?))
 }
@@ -317,7 +335,7 @@ fn gemv_pair(
 )]
 fn gate_up_pair(
     gpu: &Gpu,
-    kq: &KquantKernels,
+    k: &SelKernels,
     ty: GgmlType,
     pair: [&DeviceTensor<u32>; 2],
     own: [&DeviceTensor<u32>; 2],
@@ -343,10 +361,27 @@ fn gate_up_pair(
             slots_per_col: 1,
             rule: Act::SwigluClamp { limit },
         };
-        match ty {
-            GgmlType::Q4_K => kq.enqueue_gate_up_q4k(stream, &a, sink, h)?,
-            GgmlType::Q5_K => kq.enqueue_gate_up_q5k(stream, &a, sink, h)?,
-            ty => return Err(format!("{ty} has no gate·up entry here").into()),
+        match kernels::gate_up(ty) {
+            Some(GateUpEntry::Q4k) => k.kq.enqueue_gate_up_q4k(stream, &a, sink, h)?,
+            Some(GateUpEntry::Q5k) => k.kq.enqueue_gate_up_q5k(stream, &a, sink, h)?,
+            Some(GateUpEntry::Mxfp4) => k.mx.enqueue_gate_up(stream, &a, sink, h)?,
+            Some(
+                GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq3s | GateUpEntry::Iq4xs,
+            ) => {
+                let iq = IqGateUp {
+                    ty,
+                    wg: a.wg,
+                    wu: a.wu,
+                    act: a.act,
+                    sel: a.sel,
+                    n_slots: a.n_slots,
+                    rows_per_expert: a.rows_per_expert,
+                    slots_per_col: a.slots_per_col,
+                    rule: a.rule,
+                };
+                k.iq.enqueue_gate_up(stream, &iq, sink, h)?;
+            }
+            _ => return Err(format!("{ty} has no gate·up entry here").into()),
         }
     }
     Ok((h_sel.to_host_vec(stream)?, h_own.to_host_vec(stream)?))
@@ -362,7 +397,12 @@ fn check_slots(
     hp: &Hparams,
     experts: usize,
 ) -> Result<bool, GateError> {
-    let kq = KquantKernels::load(gpu.context(), gpu.fault_word())?;
+    let (ctx, word) = (gpu.context(), gpu.fault_word());
+    let sk = SelKernels {
+        kq: KquantKernels::load(ctx, word)?,
+        iq: IqSelKernels::load(ctx, word)?,
+        mx: Mxfp4SelKernels::load(ctx, word)?,
+    };
     let (mut pairs, mut layers, mut bad) = (0usize, 0usize, Vec::new());
     for (l, list) in lists.iter().enumerate() {
         if list.is_empty() {
@@ -389,7 +429,7 @@ fn check_slots(
             for (name, &stack) in names.iter().zip(&stacks) {
                 let (ty, rows, rpe, k) = own_rows(gpu, split, name, experts, id)?;
                 let act = activation(gpu, k)?;
-                let (a, b) = gemv_pair(gpu, &kq, ty, stack, &rows, &act, slot, rpe)?;
+                let (a, b) = gemv_pair(gpu, &sk, ty, stack, &rows, &act, slot, rpe)?;
                 pairs += 1;
                 if !bits_equal(&a, &b) {
                     bad.push(format!(
@@ -405,7 +445,7 @@ fn check_slots(
             let (ty, _, rpe, act) = &own[0];
             let (a, b) = gate_up_pair(
                 gpu,
-                &kq,
+                &sk,
                 *ty,
                 [stacks[0], stacks[1]],
                 [&own[0].1, &own[1].1],

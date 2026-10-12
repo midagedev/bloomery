@@ -22,7 +22,7 @@ use crate::arch::coverage;
 use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
-    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
+    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, Unimplemented, Violation,
     checked_beside, joined,
 };
 
@@ -60,16 +60,58 @@ impl KdaLanes {
     }
 }
 
-/// The routed stacks the program's card experts run, in their file bytes
-/// ([`CardFormat::KQuant`]): Q4_K (the gate·up) and Q5_K (a gate·up or the
-/// down `_sel`). A layer with a stack of any other type — the Q6_K downs —
-/// keeps its experts on the host.
+/// Whether a file tensor of type `ty` is one of the four K-quants a dense block's launches read.
+fn is_kquant(ty: GgmlType) -> bool {
+    matches!(
+        ty,
+        GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
+    )
+}
+
+/// The routed stacks the card experts read, each as the file stores it
+/// ([`CardFormat::KQuant`]): the types the common card leg runs
+/// ([`placement::kernels::card_runs`]). The rule reads a stack's type alone; a
+/// layer with a stack of any other type — the Q6_K downs — keeps its experts
+/// on the host.
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    match ty {
-        GgmlType::Q4_K | GgmlType::Q5_K => CardFormat::of(ty),
-        _ => None,
-    }
+    placement::kernels::card_runs(ty).then_some(CardFormat::KQuant)
+}
+
+/// Whether a card layer of gate·up type `gate` and down type `down` runs a
+/// prompt batch on the grouped tile kernels (Q4_K and Q5_K, either role); a
+/// card layer of any other [`card_routed`] type runs it on the card leg in
+/// chunks of [`TIER_CHUNK`] tokens ([`card_leg_bytes`]).
+#[must_use]
+pub const fn card_tiles_run(gate: GgmlType, down: GgmlType) -> bool {
+    matches!(gate, GgmlType::Q4_K | GgmlType::Q5_K)
+        && matches!(down, GgmlType::Q4_K | GgmlType::Q5_K)
+}
+
+/// Card bytes of the card leg's buffers a prompt batch's card layers run on
+/// when their stacks are not [`card_tiles_run`]'s: one run of
+/// [`TIER_CHUNK`] tokens of `n` values through experts of `ff` rows, `used`
+/// slots a token ([`workstation::tier_chunk_scratch_bytes`], the leg's
+/// buffers). The one formula of those bytes: the card body's scratch checks
+/// its made bytes against it.
+#[must_use]
+pub fn card_leg_bytes(n: usize, ff: usize, used: usize) -> usize {
+    let b = workstation::tier_chunk_scratch_bytes(n as u64, ff as u64, used as u64, TIER_CHUNK);
+    usize::try_from(b).unwrap_or(usize::MAX)
+}
+
+/// Whether the file holds a routed stack the card experts read
+/// ([`card_routed`]) that the tile kernels do not ([`card_tiles_run`]), so a
+/// card layer of it runs a prompt batch on the card leg and the plan reserves
+/// [`card_leg_bytes`] beside the tiles' scratch. Read from the headers alone;
+/// a load whose card layers are all tile layers makes no leg buffers.
+#[must_use]
+pub fn card_leg_needed(model: &ModelTensors) -> bool {
+    model.tensors.iter().any(|t| {
+        t.role == Role::RoutedExperts
+            && card_routed(t.ty).is_some()
+            && !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q5_K)
+    })
 }
 
 /// Tokens a chunk of the tier's prompt-batch service runs at most: the
@@ -99,6 +141,49 @@ pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
 pub const FRONT_TILE_COLS: usize = 64;
 pub const FRONT_STEP: usize = 64;
 
+/// Values one super-block of the K-quants' q8_1 activations spans.
+pub const FRONT_SUPER: usize = 256;
+
+/// The quantized forms a dense block's sites read, over the file's dense layers: the GEMM front quantizes the
+/// normed input and the SwiGLU rows into exactly these (q8 blocks of 32 values for a Q8_0 site, q8_1 blocks of
+/// 128 for a K-quant one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseForms {
+    /// A gate and up are K-quants: the normed input is also held as q8_1 blocks of 128 values.
+    pub in128: bool,
+    /// A down is Q8_0: the SwiGLU rows are held as q8 blocks of 32 values.
+    pub rows32: bool,
+    /// A down is a K-quant: the SwiGLU rows are held as q8_1 blocks of 128 values.
+    pub rows128: bool,
+}
+
+impl DenseForms {
+    /// No dense block.
+    pub const NONE: DenseForms = DenseForms {
+        in128: false,
+        rows32: false,
+        rows128: false,
+    };
+
+    /// Dense blocks of three Q8_0 matrices.
+    pub const Q8_0: DenseForms = DenseForms {
+        in128: false,
+        rows32: true,
+        rows128: false,
+    };
+
+    /// `self` with one more dense block, whose gate and up are K-quants when `gate_up_kquant` and whose down
+    /// is one when `down_kquant`.
+    #[must_use]
+    pub const fn with_block(self, gate_up_kquant: bool, down_kquant: bool) -> DenseForms {
+        DenseForms {
+            in128: self.in128 || gate_up_kquant,
+            rows32: self.rows32 || !down_kquant,
+            rows128: self.rows128 || down_kquant,
+        }
+    }
+}
+
 /// The widths, in values a column, a prompt batch's GEMM front is sized for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrontWidths {
@@ -119,6 +204,8 @@ pub struct FrontWidths {
     /// A dense block's width (`feed_forward_length`); 0 on a load with no
     /// dense block, which makes no feed-forward scratch.
     pub ff: usize,
+    /// The forms the dense block's sites read: what is held besides the normed input's q8 blocks of 32 values.
+    pub forms: DenseForms,
 }
 
 /// Card bytes of a GEMM front of `cols` token columns of widths `w`, four
@@ -128,47 +215,44 @@ pub struct FrontWidths {
 /// activation planes, twenty words a column's [`FRONT_STEP`]-value step
 /// (sixteen of codes, two scales, two code sums), over the normed input, the
 /// KDA gate's low-rank and gated rows, the latent query's low rank, the
-/// latent heads' outputs and the dense block's SwiGLU rows; and the f32 rows
-/// the front holds whole, a word a value: the latent query heads, the heads'
-/// outputs, and the dense block's gate and up rows. A width of 0 makes
-/// nothing. The one formula of those bytes: the card body's front checks its
-/// made bytes against it.
+/// latent heads' outputs and, for a Q8_0 down, the dense block's SwiGLU rows;
+/// the dense block's K-quant forms ([`DenseForms`]) in q8_1 blocks of 128
+/// values, a column's [`FRONT_SUPER`]-value super-block holding 256 words of
+/// codes at the q3 permutation's pairs and 256 at the q4 permutation's quads
+/// and 10 of sums and scales, over the normed input and a K-quant down's
+/// SwiGLU rows; and the f32 rows the front holds whole, a word a value: the
+/// latent query heads, the heads' outputs, and the dense block's gate and up
+/// rows. A width of 0 makes nothing (the dense block's forms none at an `ff` of 0). The one formula of those
+/// bytes: the card body's front checks its made bytes against it.
 #[must_use]
 pub fn front_bytes(cols: usize, w: FrontWidths) -> usize {
     let table = 2 * cols + 2 * (cols / FRONT_TILE_COLS + 1) + 2;
     let act = |k: usize| 20 * cols * k.div_ceil(FRONT_STEP);
-    let acts: usize = [w.embd, w.low, w.gated, w.q_low, w.heads_v, w.ff]
+    let act128 = |k: usize| {
+        let sb = k.div_ceil(FRONT_SUPER);
+        cols * (256 * sb.div_ceil(2) + 256 * sb.div_ceil(4) + 10 * sb)
+    };
+    let forms = if w.ff == 0 { DenseForms::NONE } else { w.forms };
+    let rows32 = if forms.rows32 { w.ff } else { 0 };
+    let acts: usize = [w.embd, w.low, w.gated, w.q_low, w.heads_v, rows32]
         .into_iter()
         .map(act)
         .sum();
+    let in128 = if forms.in128 { w.embd } else { 0 };
+    let rows128 = if forms.rows128 { w.ff } else { 0 };
+    let acts128: usize = [in128, rows128].into_iter().map(act128).sum();
     let rows = cols * (w.q + w.heads_v + 2 * w.ff);
-    4 * (table + acts + rows)
+    4 * (table + acts + acts128 + rows)
 }
 
-/// The widths of a load of `hp`'s prompt batch's GEMM front
-/// ([`FrontWidths`]): one head count for the KDA and latent heads
-/// (`attention.head_count`).
+/// The bytes of the GEMM front a prompt batch of a load `inputs` describes at
+/// `ctx_max` positions makes on the stage card ([`front_bytes`]): batches of
+/// up to the host union's columns or the context, whichever is fewer, at the
+/// load's widths ([`PlanInputs::front_widths`]). The plan reserves them on the
+/// stage card ([`prompt_reserve_bytes`], [`PlanInputs::plan_lanes`]).
 #[must_use]
-pub fn front_widths(hp: &Hparams) -> FrontWidths {
-    FrontWidths {
-        embd: hp.n_embd,
-        low: hp.kda_head_dim,
-        gated: hp.n_head * hp.kda_head_dim,
-        q_low: hp.q_lora,
-        q: hp.n_head * hp.head_k,
-        heads_v: hp.n_head * hp.head_v,
-        ff: hp.dense_ff,
-    }
-}
-
-/// The bytes of the GEMM front a prompt batch of a load of `hp` at `ctx_max`
-/// positions makes on the stage card ([`front_bytes`]): batches of up to the
-/// host union's columns or the context, whichever is fewer, at the load's
-/// widths ([`front_widths`]). The plan reserves them on the stage card
-/// ([`prompt_reserve_bytes`], [`PlanInputs::plan_lanes`]).
-#[must_use]
-pub fn prompt_front_bytes(hp: &Hparams, ctx_max: u64) -> u64 {
-    front_bytes(prompt_cols(ctx_max), front_widths(hp)) as u64
+pub fn prompt_front_bytes(inputs: &PlanInputs, ctx_max: u64) -> u64 {
+    front_bytes(prompt_cols(ctx_max), inputs.front_widths()) as u64
 }
 
 /// The columns a prompt batch of a load at `ctx_max` positions is made for:
@@ -208,19 +292,24 @@ pub fn card_tile_bytes(n: usize, ff: usize, used: usize, cap: usize) -> usize {
     usize::try_from(b).unwrap_or(usize::MAX)
 }
 
-/// The card bytes the plan reserves on the stage card for a load of `hp`'s
+/// The card bytes the plan reserves on the stage card for a load of `inputs`'s
 /// prompt batch at `ctx_max` positions: its GEMM front
 /// ([`prompt_front_bytes`]), the card experts' grouped scratch
-/// ([`card_tile_bytes`] at the front's columns) and the units a group of
+/// ([`card_tile_bytes`] at the front's columns, plus [`card_leg_bytes`] for a
+/// file [`card_leg_needed`] names) and the units a group of
 /// [`PROMPT_GROUP`] holds past the first ([`runtime::prompt::group_sets`], [`unit_bytes`] at
 /// the front's columns, the tier places when `tiered`). The first unit and
 /// the other buffers the units share come out of the card's margin.
 #[must_use]
-pub fn prompt_reserve_bytes(hp: &Hparams, ctx_max: u64, tiered: bool) -> u64 {
+pub fn prompt_reserve_bytes(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> u64 {
+    let hp = &inputs.hp;
     let cols = prompt_cols(ctx_max);
     let unit = unit_bytes(hp.n_embd, cols, hp.hc.streams, hp.n_used, tiered);
-    let tiles = card_tile_bytes(hp.n_embd, hp.expert_ff, hp.n_used, cols);
-    prompt_front_bytes(hp, ctx_max) + (tiles + (group_sets(PROMPT_GROUP) - 1) * unit) as u64
+    let mut tiles = card_tile_bytes(hp.n_embd, hp.expert_ff, hp.n_used, cols);
+    if card_leg_needed(&inputs.model) {
+        tiles += card_leg_bytes(hp.n_embd, hp.expert_ff, hp.n_used);
+    }
+    prompt_front_bytes(inputs, ctx_max) + (tiles + (group_sets(PROMPT_GROUP) - 1) * unit) as u64
 }
 
 /// What a plan of a glm5next file is made from, read from its headers.
@@ -241,6 +330,9 @@ pub struct PlanInputs {
     /// ([`placement::expert_nvme_tier`]); a NextN plan splits the trunk at
     /// the room less the draft layer's routed experts. A gate that plans an
     /// arm by a room of its own sets it, read [`HostRead::Given`].
+    ///
+    /// The plan is made at [`workstation::plan_room`]: a read room less
+    /// [`workstation::HOST_DRIFT`], a given room as given.
     pub room: (u64, HostRead),
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
@@ -391,6 +483,51 @@ impl PlanInputs {
         })
     }
 
+    /// The forms the file's dense blocks read ([`DenseForms`]), from the types of their gate and down in the
+    /// header: [`DenseForms::NONE`] for a file with no dense block.
+    #[must_use]
+    pub fn dense_forms(&self) -> DenseForms {
+        self.model
+            .tensors
+            .iter()
+            .filter(|t| t.role == Role::DenseFfn)
+            .fold(DenseForms::NONE, |forms, t| {
+                let kquant = is_kquant(t.ty);
+                if t.name.ends_with(roles::DENSE_GATE) {
+                    DenseForms {
+                        in128: forms.in128 || kquant,
+                        ..forms
+                    }
+                } else if t.name.ends_with(roles::DENSE_DOWN) {
+                    DenseForms {
+                        rows32: forms.rows32 || !kquant,
+                        rows128: forms.rows128 || kquant,
+                        ..forms
+                    }
+                } else {
+                    forms
+                }
+            })
+    }
+
+    /// The widths of a load's prompt batch's GEMM front ([`FrontWidths`]): one
+    /// head count for the KDA and latent heads (`attention.head_count`), the
+    /// dense block's forms from the header's types ([`PlanInputs::dense_forms`]).
+    #[must_use]
+    pub fn front_widths(&self) -> FrontWidths {
+        let hp = &self.hp;
+        FrontWidths {
+            embd: hp.n_embd,
+            low: hp.kda_head_dim,
+            gated: hp.n_head * hp.kda_head_dim,
+            q_low: hp.q_lora,
+            q: hp.n_head * hp.head_k,
+            heads_v: hp.n_head * hp.head_v,
+            ff: hp.dense_ff,
+            forms: self.dense_forms(),
+        }
+    }
+
     /// Every feature of the file the engine does not run, as
     /// [`coverage::check`] lists them. Empty for a file the program runs.
     pub fn unimplemented(&self) -> Vec<Unimplemented> {
@@ -460,7 +597,7 @@ impl PlanInputs {
         let terms = self.seq_terms(&kv, None);
         let n = slots as u64;
         let beside = terms.plan_beside(n);
-        let front = prompt_reserve_bytes(&self.hp, ctx_max, !machine.tiers.is_empty());
+        let front = prompt_reserve_bytes(self, ctx_max, !machine.tiers.is_empty());
         let mut plan = placement::plan_routed_reserving(
             &self.model,
             machine,
@@ -475,7 +612,8 @@ impl PlanInputs {
         if let Some(t) = plan.cards.first_mut() {
             t.grow_kv(beside);
         }
-        placement::expert_nvme_tier(&mut plan, self.room.0, self.arena)?;
+        let room = plan.host.plan_at(&self.room);
+        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         // The front stays beside the plan's terms (`refuse_front` holds it to
         // the card), so a unified pool counts it beside them.
         let plan = checked_beside(plan, front).map_err(PlaceError::Broken)?;
@@ -796,7 +934,7 @@ impl PlanInputs {
             &PlanLevers::default(),
         )?;
         let arena = NEXTN_ARENA_BYTES;
-        let front = prompt_reserve_bytes(&self.hp, ctx_max, !machine.tiers.is_empty());
+        let front = prompt_reserve_bytes(self, ctx_max, !machine.tiers.is_empty());
         let nextn_card = nextn_card_bytes(&draft.cards[0]);
         let reserve = (nextn_card + arena + front).saturating_add(beside);
         let mut plan = placement::plan_routed_reserving(
@@ -814,10 +952,10 @@ impl PlanInputs {
         // The draft layer's routed experts are the host's beside the trunk's,
         // a plan of their own: the trunk splits at the room they leave.
         let draft_host = draft.host.expert_bytes;
-        let room = self.room.0.checked_sub(draft_host).ok_or_else(|| {
+        let planned_at = plan.host.plan_at(&self.room);
+        let room = planned_at.checked_sub(draft_host).ok_or_else(|| {
             PlacementError::HostRoom(format!(
-                "the NextN layer's routed experts, {draft_host} B, pass the host room {} B",
-                self.room.0
+                "the NextN layer's routed experts, {draft_host} B, pass the host room {planned_at} B"
             ))
         })?;
         placement::expert_nvme_tier(&mut plan, room, self.arena)?;
@@ -1089,9 +1227,9 @@ fn beside_bytes(streams: usize, n_embd: usize, lanes: KdaLanes, nextn: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        KdaLanes, Kind, KvBytes, KvLayout, NEXTN_ARENA_BYTES, NextnKv, PROMPT_GROUP, PlaceError,
-        card_tile_bytes, group_sets, recurrent_bytes, refusal_text, row_bytes, seq_terms,
-        stage_term, unit_bytes,
+        DenseForms, FRONT_STEP, FrontWidths, KdaLanes, Kind, KvBytes, KvLayout, NEXTN_ARENA_BYTES,
+        NextnKv, PROMPT_GROUP, PlaceError, card_tile_bytes, front_bytes, group_sets,
+        recurrent_bytes, refusal_text, row_bytes, seq_terms, stage_term, unit_bytes,
     };
     use crate::placement::Violation;
 
@@ -1159,6 +1297,49 @@ mod tests {
         assert_eq!(unit_bytes(4096, 512, 4, 8, false), 67_182_592);
         assert_eq!(unit_bytes(4096, 512, 4, 8, true), 67_182_592 + 4 * 512 * 8);
         assert_eq!(group_sets(PROMPT_GROUP) - 1, 2);
+    }
+
+    /// The GEMM front's K-quant forms in bytes: a Q8_0 dense block makes the SwiGLU rows' q8 blocks of 32
+    /// values and nothing of 128; a K-quant down swaps them for q8_1 blocks of 128 over the same rows, and a
+    /// K-quant gate and up add the normed input's. A column of `k` values takes `256·⌈sb/2⌉ + 256·⌈sb/4⌉ +
+    /// 10·sb` words (`sb` = `k / 256` super-blocks); the 32-value rows twenty words a 64-value step.
+    #[test]
+    fn front_bytes_count_the_dense_blocks_forms() {
+        let cols = 64;
+        let w = |forms| FrontWidths {
+            embd: 2048,
+            low: 128,
+            gated: 8192,
+            q_low: 1536,
+            q: 16_384,
+            heads_v: 16_384,
+            ff: 6144,
+            forms,
+        };
+        let q8 = front_bytes(cols, w(DenseForms::Q8_0));
+        // 2048: sb 8 -> 256·4 + 256·2 + 80 = 1,616 words a column; 6144: sb 24 -> 256·12 + 256·6 + 240 = 4,848.
+        let (in128, rows128) = (4 * cols * 1_616, 4 * cols * 4_848);
+        let rows32 = 4 * 20 * cols * 6144usize.div_ceil(FRONT_STEP);
+        let down_k = DenseForms {
+            in128: false,
+            rows32: false,
+            rows128: true,
+        };
+        assert_eq!(front_bytes(cols, w(down_k)), q8 - rows32 + rows128);
+        let all_k = DenseForms {
+            in128: true,
+            ..down_k
+        };
+        assert_eq!(front_bytes(cols, w(all_k)), q8 - rows32 + rows128 + in128);
+        let mixed = DenseForms {
+            rows32: true,
+            ..all_k
+        };
+        assert_eq!(front_bytes(cols, w(mixed)), q8 + rows128 + in128);
+        // A load with no dense block makes no feed-forward rows or forms whatever the forms say.
+        let none = |forms| front_bytes(cols, FrontWidths { ff: 0, ..w(forms) });
+        assert_eq!(none(mixed), none(DenseForms::NONE));
+        assert_eq!(none(DenseForms::Q8_0), none(DenseForms::NONE));
     }
 
     /// The card experts' grouped scratch at GLM-5.3-Flash's sizes (4,096
@@ -1273,8 +1454,8 @@ mod tests {
 
         use super::super::super::hparams::{Hc, Hparams, Indexer};
         use super::super::{
-            KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
-            prompt_reserve_bytes, row_bytes,
+            DenseForms, KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
+            card_leg_bytes, card_leg_needed, card_routed, prompt_reserve_bytes, row_bytes,
         };
         use crate::placement::workstation::HostRead;
         use crate::placement::{
@@ -1452,6 +1633,113 @@ mod tests {
             }
         }
 
+        /// A dense layer's three tensors of types `tys` (gate, up, down) at layer `l`.
+        fn dense_layer(l: usize, tys: [GgmlType; 3]) -> Vec<ModelTensor> {
+            ["ffn_gate", "ffn_up", "ffn_down"]
+                .into_iter()
+                .zip(tys)
+                .map(|(stem, ty)| ModelTensor {
+                    name: format!("blk.{l}.{stem}.weight"),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::DenseFfn,
+                    ty,
+                    dims: vec![2048, 6144],
+                    file_bytes: 0,
+                    gathered_rows: None,
+                })
+                .collect()
+        }
+
+        /// The forms the front holds follow the dense tensors' types in the header, over every dense layer: Q8_0
+        /// tensors the 32-value SwiGLU rows alone, K-quant gate and up the input's q8_1 blocks, a K-quant down the
+        /// SwiGLU rows' q8_1 blocks, layers of both downs both rows; a shared expert's tensors and a file with no
+        /// dense block add none.
+        #[test]
+        fn the_dense_forms_follow_the_headers_types() {
+            use GgmlType::{Q5_K, Q6_K, Q8_0};
+            let with = |layers: &[[GgmlType; 3]]| {
+                let mut inputs = inputs();
+                for (l, tys) in layers.iter().enumerate() {
+                    inputs.model.tensors.extend(dense_layer(l, *tys));
+                }
+                inputs.model.tensors.push(ModelTensor {
+                    name: "blk.9.ffn_down_shexp.weight".to_string(),
+                    shard: 0,
+                    layer: Some(9),
+                    role: Role::SharedExpert,
+                    ty: Q6_K,
+                    dims: vec![2048, 4096],
+                    file_bytes: 0,
+                    gathered_rows: None,
+                });
+                (inputs.dense_forms(), inputs.front_widths())
+            };
+            assert_eq!(with(&[]).0, DenseForms::NONE);
+            assert_eq!(with(&[[Q8_0; 3]]).0, DenseForms::Q8_0);
+            let k = DenseForms {
+                in128: true,
+                rows32: false,
+                rows128: true,
+            };
+            assert_eq!(with(&[[Q6_K, Q6_K, Q5_K]]).0, k);
+            let (forms, widths) = with(&[[Q6_K, Q6_K, Q5_K], [Q8_0, Q8_0, Q8_0]]);
+            assert_eq!(forms, DenseForms { rows32: true, ..k });
+            assert_eq!(widths.forms, forms);
+        }
+
+        /// The card experts read every type the common card leg runs, and
+        /// only those; a file whose routed stacks are all Q4_K or Q5_K (or
+        /// host-only, as a Q6_K down) reserves the prompt batch's bytes it
+        /// reserved before, and one with a routed stack the tiles do not run
+        /// (an IQ3_S gate·up, an IQ4_XS down) reserves the card leg's
+        /// buffers beside them (mutant: the reserve without the leg term).
+        #[test]
+        fn the_card_leg_reserve_follows_the_routed_types() {
+            use GgmlType::{IQ3_S, IQ4_XS, Q4_K, Q5_K, Q6_K};
+            for id in 0..64 {
+                let ty = GgmlType::from_u32(id);
+                assert_eq!(
+                    card_routed(ty).is_some(),
+                    crate::placement::kernels::card_runs(ty),
+                    "{ty:?}"
+                );
+            }
+            let routed = |tys: [GgmlType; 3]| {
+                let mut i = inputs();
+                for (stem, ty) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                    .into_iter()
+                    .zip(tys)
+                {
+                    i.model.tensors.push(ModelTensor {
+                        name: format!("blk.1.{stem}.weight"),
+                        shard: 0,
+                        layer: Some(1),
+                        role: Role::RoutedExperts,
+                        ty,
+                        dims: vec![4096, 2048, 64],
+                        file_bytes: 0,
+                        gathered_rows: None,
+                    });
+                }
+                i
+            };
+            let plain = prompt_reserve_bytes(&inputs(), CTX, false);
+            for tys in [[Q4_K, Q4_K, Q5_K], [Q5_K, Q5_K, Q6_K], [Q4_K, Q4_K, Q4_K]] {
+                let i = routed(tys);
+                assert!(!card_leg_needed(&i.model), "{tys:?}");
+                assert_eq!(prompt_reserve_bytes(&i, CTX, false), plain, "{tys:?}");
+            }
+            let leg = card_leg_bytes(4096, 2048, 8) as u64;
+            // q8_1 of 8 rows of 4096, 64 slots' gate·up rows of 2048, their q8_1, their downs.
+            assert_eq!(leg, 103_424 + 524_288 + 413_696 + 1_048_576);
+            for tys in [[IQ3_S, IQ3_S, IQ4_XS], [Q4_K, Q4_K, IQ4_XS]] {
+                let i = routed(tys);
+                assert!(card_leg_needed(&i.model), "{tys:?}");
+                assert_eq!(prompt_reserve_bytes(&i, CTX, false), plain + leg, "{tys:?}");
+            }
+        }
+
         /// A card's headroom and its terms: the plan's `headroom_bytes`, and
         /// the card's usable bytes less every term the plan counts on it,
         /// written from the fields.
@@ -1503,7 +1791,7 @@ mod tests {
         fn slot_plans_on_one_pool_count_the_bytes_beside_once() {
             let (inputs, nextn) = (inputs(), nextn());
             let levers = PlanLevers::default();
-            let front = prompt_reserve_bytes(&inputs.hp, CTX, false);
+            let front = prompt_reserve_bytes(&inputs, CTX, false);
             let ample: u64 = 1 << 40;
             let check = |at: &str, plan: &dyn Fn(u64) -> Result<i128, PlaceError>, beside: u64| {
                 let room = plan(ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));

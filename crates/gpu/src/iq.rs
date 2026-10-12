@@ -1,7 +1,9 @@
 //! IQ2_XS, IQ3_XXS, IQ4_XS and Q2_K weights against q8_1 activations: the
 //! card layout of each format, one lane's share of a row's dot
 //! (device-callable, the [`crate::mxfp4`] shape), and the same rule on the
-//! host.
+//! host. IQ3_S has the host rule and the file format below only: its card
+//! layout is the file's own blocks ([`crate::iq_sel`]), so it has no planes,
+//! no repack and no row core.
 //!
 //! File formats (ggml's blocks, 256 values each; `gguf::quant` ports their
 //! dequant bit for bit):
@@ -17,6 +19,12 @@
 //!   `iq3xxs_grid`) and word `aux`: bits 28.. the scale `s`, bits `7l .. 7l+7`
 //!   the sign index of group `l` (values `8l ..`, index bytes `2l, 2l + 1`);
 //!   the factor is `d·(0.5 + s)/2`.
+//! - IQ3_S, 110 B: f16 `d` @0, 64 index bytes @2, 8 high-bit bytes `qh` @66, 32
+//!   sign bytes @74, 4 scale bytes @106. Sub-block `ib` has index bytes `8ib ..
+//!   8ib + 8`; index `m` (values `4m .. 4m + 4`) is its byte plus bit `m` of
+//!   `qh[ib]` as bit 8, into `iq3s_grid` (four magnitudes). The signs are raw:
+//!   bit `(4m + j) % 8` of `signs[4ib + m / 2]` negates value `4m + j`. The
+//!   scale `s` is nibble `ib & 1` of `scales[ib / 2]`, the factor `d·(2s + 1)`.
 //! - IQ4_XS, 136 B: f16 `d` @0, u16 `scales_h` @2, 4 bytes `scales_l` @4, 128
 //!   code bytes @8. Sub-block `ib`: 6-bit `ls` = nibble `ib & 1` of
 //!   `scales_l[ib/2]` | bits `2ib ..` of `scales_h` << 4, factor `d·(ls − 32)`;
@@ -66,7 +74,8 @@
 //!   Q2_K, per 16-value half `t`, `A_t = Σ q·x` and `B_t = Σ x`, `SA = Σ_t
 //!   (sc_t & 15)·A_t`, `SM = Σ_t (sc_t >> 4)·B_t`;
 //! - from `f = 0`: IQ2_XS `f = fma((d/8)·d_x, I, f)`, IQ3_XXS `f = fma((d/4)·d_x,
-//!   I, f)`, IQ4_XS `f = fma(d·d_x, I, f)`, Q2_K `f = fma(d·d_x, SA, f)` then
+//!   I, f)`, IQ3_S `f = fma(d·d_x, I, f)` with `I = (2s + 1)·S` over all 32,
+//!   IQ4_XS `f = fma(d·d_x, I, f)`, Q2_K `f = fma(d·d_x, SA, f)` then
 //!   `f = fma(−(dmin·d_x), SM, f)`, `d_x` the scale of the 128-value block
 //!   holding `b` (`d/8` and `d/4` are exact);
 //! - the caller sums the 32 lane values with the warp butterfly
@@ -85,7 +94,9 @@ use cuda_device::prmt::prmt;
 use cuda_device::vector::{U32x2, U32x4, as_vectors};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
-use gguf::iq_tables::{IQ2XS_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL};
+use gguf::iq_tables::{
+    IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+};
 use gguf::quant::{GgmlType, half_to_f32};
 use std::sync::Arc;
 
@@ -100,6 +111,8 @@ const SUBS: usize = SB_VALUES / SUB_VALUES;
 const GRID2: &[u64; 512] = &IQ2XS_GRID;
 /// The IQ3_XXS grid, likewise.
 pub(crate) const GRID3: &[u32; 256] = &IQ3XXS_GRID;
+/// The IQ3_S grid, likewise: 512 entries, a 9-bit index.
+pub(crate) const GRID3S: &[u32; 512] = &IQ3S_GRID;
 
 /// `KVALUES_IQ4NL` bytes `4i .. 4i + 4` as a little-endian word: the four
 /// `prmt` table words.
@@ -115,11 +128,13 @@ const KV1: u32 = kv_word(1);
 const KV2: u32 = kv_word(2);
 const KV3: u32 = kv_word(3);
 
-/// The four formats this module takes.
+/// The five formats this module takes. [`IqFormat::Iq3S`] has the host rule
+/// only ([`IqFormat::plane_words`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IqFormat {
     Iq2Xs,
     Iq3Xxs,
+    Iq3S,
     Iq4Xs,
     Q2K,
 }
@@ -131,6 +146,7 @@ impl IqFormat {
         match ty {
             GgmlType::IQ2_XS => Some(IqFormat::Iq2Xs),
             GgmlType::IQ3_XXS => Some(IqFormat::Iq3Xxs),
+            GgmlType::IQ3_S => Some(IqFormat::Iq3S),
             GgmlType::IQ4_XS => Some(IqFormat::Iq4Xs),
             GgmlType::Q2_K => Some(IqFormat::Q2K),
             _ => None,
@@ -143,6 +159,7 @@ impl IqFormat {
         match self {
             IqFormat::Iq2Xs => GgmlType::IQ2_XS,
             IqFormat::Iq3Xxs => GgmlType::IQ3_XXS,
+            IqFormat::Iq3S => GgmlType::IQ3_S,
             IqFormat::Iq4Xs => GgmlType::IQ4_XS,
             IqFormat::Q2K => GgmlType::Q2_K,
         }
@@ -159,22 +176,32 @@ impl IqFormat {
         usize::try_from(bytes).expect("a block size fits in usize")
     }
 
-    /// Words of the three planes for `n` super-blocks, in plane order (the
-    /// module doc's table; halves round up to whole words).
+    /// Whether the format has the plane layout and a row core (every format
+    /// but IQ3_S).
     #[must_use]
-    pub fn plane_words(self, n: usize) -> [usize; 3] {
+    pub fn has_planes(self) -> bool {
+        self.plane_words(1).is_some()
+    }
+
+    /// Words of the three planes for `n` super-blocks, in plane order (the
+    /// module doc's table; halves round up to whole words); `None` for a
+    /// format with no planes (IQ3_S).
+    #[must_use]
+    pub fn plane_words(self, n: usize) -> Option<[usize; 3]> {
         match self {
-            IqFormat::Iq2Xs => [16 * n, 2 * n, n.div_ceil(2)],
-            IqFormat::Iq3Xxs => [16 * n, 8 * n, n.div_ceil(2)],
-            IqFormat::Iq4Xs => [32 * n, 2 * n, 0],
-            IqFormat::Q2K => [16 * n, 4 * n, n],
+            IqFormat::Iq2Xs => Some([16 * n, 2 * n, n.div_ceil(2)]),
+            IqFormat::Iq3Xxs => Some([16 * n, 8 * n, n.div_ceil(2)]),
+            IqFormat::Iq3S => None,
+            IqFormat::Iq4Xs => Some([32 * n, 2 * n, 0]),
+            IqFormat::Q2K => Some([16 * n, 4 * n, n]),
         }
     }
 
     /// The card layout of `rows` rows of `k` values from their file bytes.
     /// `k` must be a positive multiple of 256 and `bytes` exactly the rows'
     /// `block_bytes · k / 256 · rows`; a non-finite `d` (or Q2_K `dmin`) is
-    /// refused, naming its row and super-block.
+    /// refused, naming its row and super-block. A format with no planes
+    /// ([`IqFormat::plane_words`]) is refused by name.
     pub fn repack(self, bytes: &[u8], rows: usize, k: usize) -> Result<[Vec<u32>; 3], GpuError> {
         let what = "iq::repack";
         if k == 0 || !k.is_multiple_of(SB_VALUES) {
@@ -196,7 +223,12 @@ impl IqFormat {
             ));
         }
         let n = rows * n_sb;
-        let [w0, w1, w2] = self.plane_words(n);
+        let Some([w0, w1, w2]) = self.plane_words(n) else {
+            return Err(GpuError::shape(
+                what,
+                format!("{self:?} has no plane layout: its card layout is the file's blocks"),
+            ));
+        };
         let (mut p0, mut p1, mut p2) = (
             Vec::with_capacity(w0),
             Vec::with_capacity(w1),
@@ -233,6 +265,7 @@ impl IqFormat {
                     p1.extend((0..8).map(|i| word(blk, 66 + 4 * i)));
                     p2[h / 2] |= u32::from(half(blk, 0)) << (16 * (h % 2));
                 }
+                IqFormat::Iq3S => unreachable!("plane_words refused IQ3_S above"),
                 IqFormat::Iq4Xs => {
                     p0.extend((0..32).map(|i| word(blk, 8 + 4 * i)));
                     p1.push(word(blk, 0));
@@ -271,7 +304,7 @@ pub(crate) fn signs_of(i: u32) -> u32 {
 
 /// Four unsigned magnitudes negated where `m` is `0xff`: `(g ^ m) + (m & 1)`
 /// per byte, with no carry between bytes because every grid magnitude is at
-/// least 4 (`!g + 1` stays below 256).
+/// least 1 (`!g + 1` stays below 256).
 #[inline(always)]
 pub(crate) fn signed4(g: u32, m: u32) -> u32 {
     (g ^ m).wrapping_add(m & 0x0101_0101)
@@ -303,6 +336,27 @@ pub(crate) fn iq3_group(i0: u32, i1: u32, si: u32) -> (u32, u32) {
     };
     let s = signs_of(si & 127);
     (signed4(g0, sign_mask4(s)), signed4(g1, sign_mask4(s >> 4)))
+}
+
+/// One IQ3_S group: grid indices `m` and `m + 1` (values `4m .. 4m + 8`) of a
+/// sub-block, each byte `m & 3` and `(m + 1) & 3` of the index word `c` with
+/// bit `m` and `m + 1` of the high-bit byte `qh` as bit 8, under the sign byte
+/// in the low 8 bits of `sb` (its low nibble the first four values), as two
+/// value-order words. `m` is even and a literal after inlining.
+#[inline(always)]
+pub(crate) fn iq3s_group(c: u32, qh: u32, m: u32, sb: u32) -> (u32, u32) {
+    let idx = |m: u32| ((c >> (8 * (m & 3))) & 255) | (((qh >> m) & 1) << 8);
+    // SAFETY: both indices are below 512, GRID3S's length.
+    let (g0, g1) = unsafe {
+        (
+            *GRID3S.get_unchecked(idx(m) as usize),
+            *GRID3S.get_unchecked(idx(m + 1) as usize),
+        )
+    };
+    (
+        signed4(g0, sign_mask4(sb)),
+        signed4(g1, sign_mask4(sb >> 4)),
+    )
 }
 
 /// The eight IQ4_XS codes of one word decoded to int8 values: the low
@@ -756,6 +810,25 @@ pub fn sub_sums_host(fmt: IqFormat, blk: &[u8], ib: usize, xq: &[i8; SUB_VALUES]
             }
             ((2 * (aux >> 28) as i32 + 1) * sum, 0)
         }
+        IqFormat::Iq3S => {
+            let qh = blk[66 + ib];
+            let scale = i32::from((blk[106 + ib / 2] >> (4 * (ib % 2))) & 0x0f);
+            let mut sum = 0i32;
+            for m in 0..8 {
+                let index = usize::from(blk[2 + 8 * ib + m]) | (usize::from((qh >> m) & 1) << 8);
+                let grid = IQ3S_GRID[index].to_le_bytes();
+                let signs = blk[74 + 4 * ib + m / 2];
+                for (j, &g) in grid.iter().enumerate() {
+                    let term = i32::from(g) * x(4 * m + j);
+                    sum += if (signs >> (4 * (m % 2) + j)) & 1 != 0 {
+                        -term
+                    } else {
+                        term
+                    };
+                }
+            }
+            ((2 * scale + 1) * sum, 0)
+        }
         IqFormat::Iq4Xs => {
             let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
             let ls = i32::from((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0x0f)
@@ -804,7 +877,7 @@ pub fn lane_partial_host(fmt: IqFormat, row: &[u8], xq: &[i8], d8: &[f32], lane:
         f = match fmt {
             IqFormat::Iq2Xs => (half_at(blk, 0) * 0.125 * dx).mul_add(i as f32, f),
             IqFormat::Iq3Xxs => (half_at(blk, 0) * 0.25 * dx).mul_add(i as f32, f),
-            IqFormat::Iq4Xs => (half_at(blk, 0) * dx).mul_add(i as f32, f),
+            IqFormat::Iq3S | IqFormat::Iq4Xs => (half_at(blk, 0) * dx).mul_add(i as f32, f),
             IqFormat::Q2K => {
                 let f = (half_at(blk, 80) * dx).mul_add(i as f32, f);
                 (-(half_at(blk, 82) * dx)).mul_add(m as f32, f)
@@ -1217,6 +1290,12 @@ impl IqKernels {
                 let prep = md.prepare_q2_k_rows(cfg)?;
                 md.q2_k_rows(stream, &prep, p0, p1, p2, rows, n_sb, n_grp, m, q, d8, y)?;
             }
+            IqFormat::Iq3S => {
+                return Err(GpuError::shape(
+                    what,
+                    "IQ3_S has no row core: its card layout is the file's blocks (iq_sel)",
+                ));
+            }
         }
         Ok(())
     }
@@ -1224,7 +1303,7 @@ impl IqKernels {
 
 #[cfg(test)]
 mod tests {
-    use super::{IQ2XS_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, sign_mask4, signed4, signs_of};
+    use super::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, sign_mask4, signed4, signs_of};
 
     /// The device's computed signs equal ggml's table, and the SWAR negation
     /// equals the scalar one on every grid word under every sign pattern.
@@ -1237,6 +1316,7 @@ mod tests {
             .iter()
             .flat_map(|g| [*g as u32, (*g >> 32) as u32])
             .chain(IQ3XXS_GRID)
+            .chain(IQ3S_GRID)
             .collect();
         for &g in &words {
             for s in 0..16u32 {

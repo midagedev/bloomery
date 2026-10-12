@@ -96,8 +96,9 @@
 //! plan with no host expert loads the whole model on the plan's card when the
 //! whole-fit verdict takes it, else the placed load with no host expert; any
 //! other runs the decode step (graph or eager) through the host tier's step
-//! port and the prompt as eager passes of up to eight ids through its batch
-//! port (`auto` and `pass`; `--prefill gemm` refused by name), and in graph
+//! port and the prompt through its batch port (`auto` as wide units of up to
+//! the load's ubatch size past eight ids, one pass up to eight; `pass` as eager
+//! passes of up to eight ids; `--prefill gemm` refused by name), and in graph
 //! mode captures the step only. Unset, the load is the whole-card one on
 //! `a`'s card, the largest visible card, while that fits the card's free
 //! bytes — the plan's own test of the whole file's card bytes plus its KV,
@@ -395,7 +396,7 @@ mod cli {
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_levers::{
         Draft38At, Draft38Off, Levers, Paged, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
-        SlotsBy, draft38_unset, paged_columns, paged_draft, residency38_unset,
+        draft38_unset, paged_columns, paged_draft, residency38_unset,
     };
     use cuda_core::sys;
     use gguf::Split;
@@ -1042,12 +1043,13 @@ mod cli {
         Ok(plan.plan.host.nvme_arena_bytes)
     }
 
-    /// The paged tier's one-column rule ([`bloomery_levers::paged_columns`])
-    /// asked once of the plan the run loads ([`arena38`]): on a plan that
-    /// pages host experts through the NVMe tier's RAM arena an unset draft
-    /// goes off (`Draft38Off::Paged`, the `load draft=off` record's why), and
-    /// `BLOOMERY_GEN_SLOTS` past one or `BLOOMERY_DRAFT=mtp` is refused by
-    /// name. The run's slots are the lever's alone: unset, one.
+    /// The paged tier's rule ([`bloomery_levers::paged_columns`]) asked once
+    /// of the plan the run loads ([`arena38`]): on a plan that pages host
+    /// experts through the NVMe tier's RAM arena an unset draft goes off
+    /// (`Draft38Off::Paged`, the `load draft=off` record's why), a set
+    /// `BLOOMERY_GEN_SLOTS` is served as one pass over the arena, and
+    /// `BLOOMERY_DRAFT=mtp` is refused by name. The run's slots are the
+    /// lever's alone: unset, one.
     fn paged38(
         file: &Split,
         levers: &Levers,
@@ -1063,7 +1065,7 @@ mod cli {
         let at = PagedAt {
             arena,
             slots,
-            slots_by: (slots > 1).then_some(SlotsBy::GenSlots),
+            slots_set: slots > 1,
             // `BLOOMERY_GEN_SLOTS` decodes its streams as one pass.
             together: true,
             draft: mtp,
@@ -1071,7 +1073,7 @@ mod cli {
         };
         Ok(match paged_columns(&at)? {
             Paged::AsAsked => (draft, off),
-            Paged::OneColumn { .. } => (Draft38::Off, paged_draft(mtp, off, arena).1),
+            Paged::Reduced { .. } => (Draft38::Off, paged_draft(mtp, off, arena).1),
         })
     }
 
@@ -1125,9 +1127,10 @@ mod cli {
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage
     /// card's experts, the tier card's when the plan has one, the stage
-    /// card's free bytes when the census read them, the PLE table's tier and
-    /// the reading of the host's room that chose it (`read`), and each plan
-    /// card's device (`record::plan_devices`). A plan whose PLE tier is not
+    /// card's free bytes when the census read them, the host room the plan
+    /// was made at when it had one, the PLE table's tier and the reading of
+    /// the host's room that chose it (`read`), and each plan card's device
+    /// (`record::plan_devices`). A plan whose PLE tier is not
     /// one the reader takes is refused by name (`Plan::row_tier`).
     fn plan38_line(
         place: Place,
@@ -1152,6 +1155,7 @@ mod cli {
             Some(free) => r.u("card_free", free),
             None => r,
         };
+        let r = record::with_room(r, plan.host.room);
         let r = match plan.row_tier()? {
             Some(Device::Host) => r.w("rows", "host"),
             Some(Device::Nvme) => r.w("rows", "nvme"),
@@ -1911,7 +1915,7 @@ mod cli {
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
     /// (`generate::Place`), refused by name beside `--prefill gemm` — a
-    /// placed prompt runs as passes through the host tier's batch port. The
+    /// placed prompt runs through the host tier's batch port. The
     /// common unset rule (`Place::choose_untiered`) prints its
     /// `place unset` record, set or unset; the flag goes on as given, so an
     /// unset one loads the census pick (`q3place::open_unplaced_qwen3`).
@@ -1925,7 +1929,7 @@ mod cli {
                 if prefill == Some("gemm") {
                     return Err(format!(
                         "--prefill gemm beside --place {word}: a placed qwen3moe or qwen35moe \
-                         prompt runs as passes through the host tier (auto or pass)"
+                         prompt runs through the host tier's batch port (auto or pass)"
                     )
                     .into());
                 }

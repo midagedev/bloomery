@@ -1,0 +1,15 @@
+# Round qw2c3b3 (card for the dump sitting): ik's CPU node dumps on the glmffnkq fixture variant
+# (/models/fixture-variants/glmffnkq/, GLM's fixture with the dense and shared-expert gate/up retyped q6_K and down q5_K,
+# NextN included: tools/fixture-variants.tsv), so gate_glm5next_e2e's FixtureOracle clauses on the variant have their sets.
+# The precedent is the iq4xs variant's three sets: fx_iq4xs_ref_glm5next, _step4 and _step4_every_node.
+# Three dumps, each `BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=glmffnkq just dump-ref-fixture glm5next [step4 |
+# step4-every-node]` under this card, one lease each. Nothing is timed. The dumpers are main's shared bin/ (the ik build
+# the real and fixture sets were dumped with); the variant changes the file, not the dumper.
+# Minutes [derived from fxoracle-dump.card's measured terms]: fixed 3-15 s a lease take x 3 = 0.15-0.75 min; GLM batch,
+# step4 and step4-every-node ~0.1 min each (fxprobe's GLM batch 4.3 s, CPU, -t 32) = 0.3 min; so 0.5-1.1 min, rounded up
+# to 1..4 for a cold file read.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads (CUDA hidden, no card); beside a timed run or a gate batch it would take their
+  cores and memory bandwidth, and the profile takes the lease for every dump; why now: the GLM K-quant dense/shared
+  block (qw2c3b2/b3) has no oracle sets on its variant, so its FixtureOracle clauses and the clamp/gate mutants cannot run
+minutes: 1..4

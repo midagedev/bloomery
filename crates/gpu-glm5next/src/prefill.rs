@@ -4,11 +4,13 @@
 //! reads: every KDA layer's state and conv ring, every latent layer's latent
 //! and index rows and pool plane, the checkpoints, and the last position's
 //! logits. A batch of at most [`CHUNK`] positions writes the steps' bits; one
-//! of [`GEMM_FROM`] or more runs its mixers' Q8_0 projections on the GEMM
-//! ([`GemmFront`]: a KDA mixer's input projections but the decay's pair and
-//! its output projection, a latent mixer's joined projection, query heads
-//! and output projection, a dense block), whose activations are quantized to 32-value int8 blocks, so it writes the
-//! GEMM's bits there. Either way a token's bits are a function of the ids
+//! of [`GEMM_FROM`] or more runs its mixers' Q8_0 projections and its dense
+//! blocks on the GEMM ([`GemmFront`]: a KDA mixer's input projections but the
+//! decay's pair and its output projection, a latent mixer's joined
+//! projection, query heads and output projection, a dense block of any
+//! types), whose activations are quantized to int8 blocks (of 32 values for a
+//! Q8_0 projection, q8_1 blocks of 128 for a K-quant dense block), so it
+//! writes the GEMM's bits there. Either way a token's bits are a function of the ids
 //! before it and of which side of [`GEMM_FROM`] each batch they ran in fell,
 //! not of the batches' cut otherwise: the GEMM's output for a column is that
 //! of any other column count, and every other launch writes a column what
@@ -68,8 +70,10 @@
 //! - the GEMM's projections over the batch's `T` rows from [`GEMM_FROM`];
 //! - chunks of up to [`CHUNK`] tokens where it takes at most that many: the
 //!   q8_0 gemvs (`q8_0_gemv_mcol`, `q8_0_gemv_heads_mcol`) the GEMM does
-//!   not take, the shared expert's
-//!   gate·up·SwiGLU (`ds41_shexp_gate_up_q8_0_mcol`), the k-pool selector,
+//!   not take, the shared expert's and, below [`GEMM_FROM`], the dense
+//!   block's gate·up·SwiGLU and down (a q8_0 block's multi-column launches,
+//!   `ds41_shexp_gate_up_q8_0_mcol` among them; a K-quant block's one-row
+//!   run on each column, [`enqueue_block_cols`]), the k-pool selector,
 //!   and the attention, each token over the
 //!   positions at and before its own — the batch's own rows and pools
 //!   written before the first chunk attends.
@@ -112,6 +116,7 @@ use bloomery_gpu::qsa::list_width;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{self, AttnArgs, SelectedRows};
+use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block_cols};
 use bloomery_gpu_deepseek41::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_STREAMS, HcPostArgs, HcPreScratch, HcQ8Params, HcQ8PreArgs,
 };
@@ -119,7 +124,7 @@ use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
 use model::arch::glm5next::names::Sub;
-use model::arch::glm5next::place::{self, FrontWidths};
+use model::arch::glm5next::place::{self, DenseForms, FrontWidths};
 use model::moe::UNION_MAX_COLS;
 use runtime::layer::{FfnKind, MixerKind};
 pub use runtime::prompt::PrefillMode;
@@ -133,11 +138,9 @@ use runtime::swaprule::KeptRows;
 use super::WHAT as BODY;
 use super::media::{CallRows, check_image_ids, stage_row};
 use super::nextn::GlmArena;
-use super::{
-    Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape, weight,
-};
+use super::{Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape};
 use crate::ffn::{self, CardRows, CardTiles};
-use crate::gemm::{DenseNames, FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
+use crate::gemm::{FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
 use crate::mla::{self, Select};
 use crate::tensors::{FfnNames, MixerNames, other_kind};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAccTier, Places};
@@ -594,17 +597,20 @@ struct Bufs {
 impl Bufs {
     /// The shared buffers for batches of up to `cap` tokens of `d`'s widths,
     /// `ff` the widest dense or shared-expert width, `dense_ff` the widest
-    /// dense block's (0 for none), `expert_ff` a routed expert's, over stores
-    /// of `ctx` positions. The attention's partials
+    /// dense block's (0 for none) with the `forms` its sites read,
+    /// `expert_ff` a routed expert's, over stores of `ctx` positions. The attention's partials
     /// cover `ctx` keys: a chunk selects only on stores past the dense
-    /// positions, which are a list's width, so they cover a list too.
+    /// positions, which are a list's width, so they cover a list too. The
+    /// card experts' scratch holds the card leg's buffers when `card_leg`.
     /// Load-time or first-prompt only.
     fn new(
         gpu: &Gpu,
         d: &Dims,
         [ff, dense_ff, expert_ff]: [usize; 3],
+        forms: DenseForms,
         ctx: usize,
         cap: usize,
+        card_leg: bool,
     ) -> Result<Bufs, GpuError> {
         let stream = gpu.stream();
         let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
@@ -657,7 +663,7 @@ impl Bufs {
             probs: z(cap * N_EXPERT)?,
             ids: zu(cap * N_USED)?,
             sel: zu(cap * N_USED)?,
-            tiles: CardTiles::new(gpu, n, expert_ff, cap)?,
+            tiles: CardTiles::new(gpu, n, expert_ff, cap, card_leg)?,
             front: GemmFront::open(
                 gpu,
                 FrontShape {
@@ -670,6 +676,7 @@ impl Bufs {
                         q: d.heads * d.head_k,
                         heads_v: d.heads * d.head_v,
                         ff: dense_ff,
+                        forms,
                     },
                 },
             )?,
@@ -766,12 +773,40 @@ fn check_call(m: &Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
 /// call is one residency pass ([`call`]); the steps feed is refused by name
 /// while a residency machine runs ([`refuse_steps_under_residency`]).
 pub fn feed(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
+    feed_as(m, ids, Pass::Own)
+}
+
+/// [`feed`], the batch call's residency pass opened as `pass` says.
+fn feed_as(m: &mut Glm5nextModel, ids: &[u32], pass: Pass) -> Result<u32, GpuError> {
     check_call(m, ids)?;
     match m.body(WHAT)?.prompt.mode {
-        PrefillMode::Batch => call(m, |m| prefill(m, ids)),
+        PrefillMode::Batch => pass.run(m, |m| prefill(m, ids)),
         PrefillMode::Steps => {
             super::refuse_steps_under_residency(m)?;
             prompt(m, ids)
+        }
+    }
+}
+
+/// Who opens a batch prompt call's residency pass: the call itself ([`call`]), or the caller that
+/// already opened it (`app::Session::prompt_media` runs [`MediaBody::prefill_media`] inside its
+/// own `call`). A second boundary inside an open pass is refused by the host tier, so exactly one
+/// of the two opens it.
+#[derive(Clone, Copy)]
+enum Pass {
+    Own,
+    Callers,
+}
+
+impl Pass {
+    fn run<T>(
+        self,
+        m: &mut Glm5nextModel,
+        run: impl FnOnce(&mut Glm5nextModel) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        match self {
+            Pass::Own => call(m, run),
+            Pass::Callers => run(m),
         }
     }
 }
@@ -864,12 +899,12 @@ pub fn prefill_mode(m: &Glm5nextModel) -> Result<PrefillMode, GpuError> {
 /// prompt allocates nothing. Returns whether it made any.
 pub fn set_prefill(m: &mut Glm5nextModel, mode: PrefillMode) -> Result<bool, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
-    body.prompt.mode = mode;
-    if mode == PrefillMode::Steps || body.prompt.batch.is_some() {
-        return Ok(false);
+    let made = mode == PrefillMode::Batch && body.prompt.batch.is_none();
+    if made {
+        body.make_batch(gpu)?;
     }
-    body.make_batch(gpu)?;
-    Ok(true)
+    body.prompt.mode = mode;
+    Ok(made)
 }
 
 /// The batches a prompt group of `m` runs layer by layer: `g` consecutive
@@ -977,6 +1012,18 @@ fn refuse_late_dense(cfg: &[super::LayerCfg], g: usize) -> Result<(), GpuError> 
         .map_err(|r| shape(r.to_string()))
 }
 
+/// The forms `cfg`'s dense blocks read ([`DenseForms`]), from the plans the file's types gave them: what the
+/// GEMM front is sized for, which the plan's reserve counts the same way
+/// ([`place::PlanInputs::dense_forms`]).
+pub(crate) fn dense_forms(cfg: &[super::LayerCfg]) -> DenseForms {
+    cfg.iter()
+        .filter(|c| c.kind.ffn == FfnKind::Dense)
+        .fold(DenseForms::NONE, |forms, c| {
+            let [gate, _, down] = c.block.types();
+            forms.with_block(gate.kquant(), down.kquant())
+        })
+}
+
 /// Feed `ids` from where `m` stands in batches (module doc) and return the
 /// argmax after the last. Refused by name before anything runs: on a
 /// poisoned model, past the stores' positions, with the taps armed (a tap
@@ -1027,9 +1074,19 @@ pub fn prefill_media(
     ids: &[u32],
     spans: &[MediaSpan<'_>],
 ) -> Result<u32, GpuError> {
+    media_as(m, ids, spans, Pass::Own)
+}
+
+/// [`prefill_media`], the batch call's residency pass opened as `pass` says.
+fn media_as(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    spans: &[MediaSpan<'_>],
+    pass: Pass,
+) -> Result<u32, GpuError> {
     check_call(m, ids)?;
     if spans.is_empty() {
-        return feed(m, ids);
+        return feed_as(m, ids, pass);
     }
     let body = m.body(WHAT)?;
     let image = media_token(body.prompt.mode, body.prompt.media, spans.len()).map_err(shape)?;
@@ -1040,7 +1097,7 @@ pub fn prefill_media(
     }
     let rows = CallRows::new(m.pos(), n_embd, spans.iter().map(|s| (&s.at, s.rows)))
         .map_err(|r| shape(r.to_string()))?;
-    call(m, |m| prefill_units(m, ids, None, Some(&rows)))
+    pass.run(m, |m| prefill_units(m, ids, None, Some(&rows)))
 }
 
 impl MediaBody for Body {
@@ -1055,13 +1112,14 @@ impl MediaBody for Body {
         media_token(body.prompt.mode, body.prompt.media, spans).err()
     }
 
-    /// [`prefill_media`].
+    /// [`prefill_media`] inside the caller's residency pass (`app::Session::prompt_media`'s
+    /// `call`): it opens no boundary of its own.
     fn prefill_media(
         m: &mut Glm5nextModel,
         ids: &[u32],
         spans: &[MediaSpan<'_>],
     ) -> Result<u32, GpuError> {
-        prefill_media(m, ids, spans)
+        media_as(m, ids, spans, Pass::Callers)
     }
 }
 
@@ -1473,7 +1531,16 @@ impl Body {
         let expert_ff = self.card.ff();
         let cap = T_MAX.min(self.ctx);
         let tiered = self.card.tier().is_some();
-        let bufs = Bufs::new(gpu, &self.dims, [ff, dense_ff, expert_ff], self.ctx, cap)?;
+        let forms = dense_forms(&self.cfg);
+        let bufs = Bufs::new(
+            gpu,
+            &self.dims,
+            [ff, dense_ff, expert_ff],
+            forms,
+            self.ctx,
+            cap,
+            self.card.prompt_leg(),
+        )?;
         self.refuse_unreserved(gpu, group_sets(self.prompt.group) - 1)?;
         let units = (0..group_sets(self.prompt.group))
             .map(|_| UnitBufs::new(gpu, self.dims.embd, cap, tiered))
@@ -2362,32 +2429,32 @@ impl PromptProgram<'_> {
         let n = d.embd;
         gpu.elem()
             .enqueue_rms_norm(stream, &b.x, f32v(w, norm)?, d.rms_eps, n, t, &mut b.xn)?;
+        let blk = Block {
+            plan: c.block,
+            names: [gate, up, down],
+            ff: c.ff,
+            limit: c.limit,
+            layer: l,
+        };
         if t >= GEMM_FROM {
-            return b.front.dense_ffn(
-                gpu,
-                w,
-                l,
-                t,
-                &b.xn,
-                DenseNames { gate, up, down },
-                c.limit,
-                &mut b.out,
-            );
+            return b.front.dense_ffn(gpu, w, t, &b.xn, &blk, &mut b.out);
         }
-        let (g, u) = (weight(w, gate)?, weight(w, up)?);
         for (c0, cn) in chunks(t, CHUNK) {
             let xs = span(W, &b.xn, c0 * n, cn * n)?;
-            self.p
-                .k
-                .experts
-                .enqueue_shexp_gate_up_mcol(stream, g, u, &xs, cn, c.limit, &mut b.h)?;
-            w.q8_gemv_mcol(
+            let mut out = span_mut(W, &mut b.out, c0 * n, cn * n)?;
+            let io = BlockIo {
+                x: &xs,
+                h: &mut b.h,
+                y: &mut out,
+            };
+            enqueue_block_cols(
                 gpu,
-                BODY,
-                down,
-                &b.h,
+                w,
+                &self.p.k.block_kernels(),
+                &mut self.p.s.block,
+                &blk,
                 cn,
-                &mut *span_mut(W, &mut b.out, c0 * n, cn * n)?,
+                io,
             )?;
         }
         Ok(())
@@ -2531,20 +2598,29 @@ impl PromptProgram<'_> {
             )?;
         }
         let nm = ffn::moe_names(&self.p, l)?;
-        let (g, u) = (weight(w, nm.sh_gate)?, weight(w, nm.sh_up)?);
+        let blk = Block {
+            plan: c.block,
+            names: [nm.sh_gate, nm.sh_up, nm.sh_down],
+            ff: c.ff,
+            limit: c.limit,
+            layer: l,
+        };
         for (c0, cn) in chunks(t, CHUNK) {
             let xs = span(W, &b.normed, c0 * n, cn * n)?;
-            self.p
-                .k
-                .experts
-                .enqueue_shexp_gate_up_mcol(stream, g, u, &xs, cn, c.limit, &mut b.h)?;
-            w.q8_gemv_mcol(
+            let mut out = span_mut(W, &mut b.sh_y, c0 * n, cn * n)?;
+            let io = BlockIo {
+                x: &xs,
+                h: &mut b.h,
+                y: &mut out,
+            };
+            enqueue_block_cols(
                 gpu,
-                BODY,
-                nm.sh_down,
-                &b.h,
+                w,
+                &self.p.k.block_kernels(),
+                &mut self.p.s.block,
+                &blk,
                 cn,
-                &mut *span_mut(W, &mut b.sh_y, c0 * n, cn * n)?,
+                io,
             )?;
         }
         if card && !tiered {

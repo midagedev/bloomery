@@ -199,7 +199,7 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, bind_server,
     model_props, nvidia_smi_index, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
@@ -228,7 +228,7 @@ use bloomery_gpu_gates::ds41_media;
 #[cfg(feature = "vision")]
 use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
-use vision_seat::{Opened, PleImage, SharedMedia, TextFacts};
+use vision_seat::{Opened, PleImage, TextFacts};
 
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
@@ -357,7 +357,7 @@ fn slot_count(
     parallel: Option<usize>,
     draft: Draft,
     traced: bool,
-) -> Result<(NonZeroUsize, &'static str), GateError> {
+) -> Result<(NonZeroUsize, SlotsFrom), GateError> {
     let (n, from) = match parallel {
         Some(n) if n > 1 && draft == Draft::Dspark => {
             return Err(format!(
@@ -367,10 +367,10 @@ fn slot_count(
             )
             .into());
         }
-        Some(n) => (n, "flag"),
-        None if draft == Draft::Dspark => (1, "dspark"),
-        None if traced => (1, "route-trace"),
-        None => (SLOTS, "default"),
+        Some(n) => (n, SlotsFrom::Flag),
+        None if draft == Draft::Dspark => (1, SlotsFrom::Dspark),
+        None if traced => (1, SlotsFrom::RouteTrace),
+        None => (SLOTS, SlotsFrom::Default),
     };
     let n = NonZeroUsize::new(n).ok_or("--parallel 0: the server serves no slot")?;
     Ok((n, from))
@@ -417,9 +417,11 @@ fn vision_of(
         imrope: None,
         ple: PleImage::Absent,
     };
+    // The `--hf` repo's projector is taken only where a span's rows can enter.
+    let file = a.vision.encoder(prefill == body::PrefillMode::Batch)?;
     vision_seat::open_seat(
         &a.vision,
-        a.vision.mmproj()?,
+        file.as_deref(),
         a.place,
         &[vision::arch::deepseek41v::PROJECTOR_TYPE],
         &facts,
@@ -519,8 +521,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // text model's embedding width and vocabulary.
     let n_embd = inputs.hp.n_embd;
     let token = |id| vocab.tokenizer().text(id).map(str::to_owned);
+    // A projector the `--hf` repo picked stays only where the plan gives the text model the same
+    // experts and context with its reserve as without ([`vision_seat::kept`]).
     #[cfg(feature = "vision")]
-    let vision = vision_of(&a, cfg.body.prefill, n_embd, &token)?;
+    let vision = vision_seat::kept(
+        vision_of(&a, cfg.body.prefill, n_embd, &token)?,
+        &a.vision,
+        |v| {
+            let mut machine = a.place.machine(reserve, tier_batch)?(inputs.model.layers);
+            vision_seat::reserve_on(&mut machine, v.and_then(|v| v.seat.reserve));
+            let ctx = u64::try_from(ctx)?;
+            reserve_checkpoints(&mut machine, Seqs::none(slots.get()), ctx)?;
+            let plan = inputs.plan_with_slots(&machine, ctx, &cfg.place, slots)?;
+            Ok(vision_seat::Cost::of(&plan, ctx))
+        },
+    )?;
     #[cfg(feature = "vision")]
     let vision_reserve = vision.as_ref().and_then(|v| v.seat.reserve);
     #[cfg(not(feature = "vision"))]
@@ -819,20 +834,14 @@ struct V41 {
     vision: Option<Vision>,
 }
 
-/// The seat's resident image encoder and the halves its spans splice from:
-/// the encoder on its card, the delimiter rows of its file, the model's
-/// embedding width (a row's width) and the media description the engine
-/// answers ([`Seat::media_model`]). Behind the `vision` feature.
+/// The seat's resident image encoder ([`vision_seat::Resident`], which holds the
+/// media description the engine answers, [`Seat::media_model`]) and the delimiter
+/// rows of its file that its spans splice around the aligner's. Behind the
+/// `vision` feature.
 #[cfg(feature = "vision")]
 struct Vision {
-    tower: Box<dyn bloomery_gpu_vision::Tower>,
-    /// The encoder's own stream: `encode` enqueues on it and the row
-    /// readback synchronizes it.
-    stream: Arc<cuda_core::CudaStream>,
+    resident: vision_seat::Resident,
     delims: ds41_media::Delims,
-    /// The model file's `n_embd`.
-    n_embd: usize,
-    media: SharedMedia,
 }
 
 #[cfg(feature = "vision")]
@@ -840,21 +849,17 @@ impl Vision {
     /// Every feed's image encoded on the resident encoder, its aligner rows read back as bf16
     /// and spliced ([`ds41_media::span_rows`]), all in one pair of buffers — the rows, the
     /// kinds, and each span's positions, rows and kinds as ranges of them
-    /// ([`vision_seat::span_rows`]). The aligner emits the plan's token grid, one row a cell.
+    /// ([`vision_seat::Resident::span_rows`]). The aligner emits the plan's token grid, one
+    /// row a cell.
     fn span_rows(
         &mut self,
         feeds: &[MediaFeed],
     ) -> Result<vision_seat::SpanRows<body::MediaKind>, GateError> {
-        let (n_embd, delims) = (self.n_embd, &self.delims);
-        vision_seat::span_rows(
-            &mut *self.tower,
-            &self.stream,
-            feeds.iter().map(|f| vision_seat::Image {
-                at: f.at,
-                patches: &f.prepared.patches,
-                span_len: f.prepared.span_len,
-            }),
-            n_embd,
+        let (n_embd, delims) = (self.resident.n_embd(), &self.delims);
+        self.resident.span_rows(
+            feeds
+                .iter()
+                .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
             |aligner, p| {
                 ds41_media::span_rows(aligner, (p.plan.n_llm_h, p.plan.n_llm_w), n_embd, delims)
             },
@@ -902,28 +907,15 @@ fn open_encoder(s: &mut Session<Body>, a: &SeatArgs) -> Result<Option<Vision>, G
         return Ok(None);
     };
     let t = Instant::now();
-    let (stream, tower) = vision_seat::open_tower(s.model().gpu().context(), v)?;
+    let resident = vision_seat::Resident::open(s.model().gpu().context(), v)?;
     let file =
         gguf::Gguf::open(&v.path).map_err(|e| format!("--mmproj {}: {e}", v.path.display()))?;
     let delims = ds41_media::delims(&file, a.n_embd)?;
     // The prompt batch's media half, beside the batch buffers the session's
     // own ready made.
     body::prepare_media(s.model_mut())?;
-    vision_seat::record(
-        &v.seat,
-        (tower.weight_bytes(), tower.scratch_bytes()),
-        vision_seat::ScratchHome::Own,
-        v.cap,
-        t.elapsed().as_secs_f64(),
-    )
-    .eprint();
-    Ok(Some(Vision {
-        tower,
-        stream,
-        delims,
-        n_embd: a.n_embd,
-        media: v.media.clone(),
-    }))
+    resident.announce(v, vision_seat::ScratchHome::Own, t);
+    Ok(Some(Vision { resident, delims }))
 }
 
 impl V41 {
@@ -1121,11 +1113,11 @@ impl Seat for V41 {
         Ok(next)
     }
 
-    /// The resident encoder's media description ([`Vision::media`]); `None`
+    /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
     /// without `--mmproj`, an engine that takes no image.
     #[cfg(feature = "vision")]
     fn media_model(&self) -> Option<serve::media::SharedMediaModel> {
-        self.vision.as_ref().map(|v| v.media.clone())
+        self.vision.as_ref().map(|v| v.resident.media())
     }
 
     /// Each feed's image encoded on the resident encoder, its aligner rows
@@ -1579,6 +1571,11 @@ impl OpenLog<Body> for Log<'_> {
             for r in record::host_residency(h) {
                 r.eprint();
             }
+        }
+        // The NVMe expert tier's arena as the load was granted it, beside
+        // the one its plan reserved; a load with no tier prints nothing.
+        if let Some(r) = record::nvtier_of(b.nvme_tier().map(|t| &**t)) {
+            r.eprint();
         }
         for h in threads::helper::helpers() {
             record::helper(&h.name, h.asked, h.pinned, h.cpus).eprint();

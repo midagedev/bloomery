@@ -24,6 +24,10 @@
 //!   32-value GEMM over the q8 blocks of 32 values ([`GemmAct32`]) on the
 //!   q8f32 planes, F32 the F32 tile over the f32 rows (one column a slot, on
 //!   the unit's one-expert table only).
+//! - [`gated`], a wide gate·up·down block over one table: the gate and up
+//!   [`gemm`]s, the gate·up rule's SwiGLU written into the form the down's
+//!   type reads (the down's activation), and the down [`gemm`] over those
+//!   rows, one column a slot.
 //!
 //! Which activation form a site reads is [`SiteTy::reads`]: a body
 //! quantizes a unit's rows into exactly the forms its sites read.
@@ -32,7 +36,7 @@ use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
     GemmRoute, GemmWeight,
 };
-use crate::kquant::{KquantKernels, SelDown};
+use crate::kquant::{Act, KquantKernels, SelDown};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
@@ -362,10 +366,21 @@ pub struct WideIn<'a> {
     pub f32: Option<&'a DeviceBuffer<f32>>,
 }
 
-/// The kernels a wide site launches.
+/// The kernels a wide site launches: the grouped GEMM over q8_1 blocks of
+/// 128 always, the 32-value kernels when the load holds them — a load whose
+/// sites are all K-quants holds none, and a Q8_0 or F32 site, or a SwiGLU into
+/// q8 blocks of 32, is refused by name there.
 pub struct WideKernels<'a> {
     pub gemm: &'a GemmKernels,
-    pub g32: &'a Gemm32Kernels,
+    pub g32: Option<&'a Gemm32Kernels>,
+}
+
+impl WideKernels<'_> {
+    /// The 32-value kernels, or a named refusal naming `missing`, what the
+    /// site needs them for.
+    fn g32(&self, what: &'static str, missing: &'static str) -> Result<&Gemm32Kernels, GpuError> {
+        self.g32.ok_or(GpuError::state(what, missing))
+    }
 }
 
 /// `y = W · x` for site `name` of type `ty`, `rows` rows an expert, over the
@@ -427,7 +442,11 @@ pub fn gemm(
         SiteTy::Q8_0 => {
             dense()?;
             let (qs, d) = w.q8_planes(WHAT, name)?;
-            k.g32.enqueue_gemm32(
+            k.g32(
+                WHAT,
+                "the 32-value kernels a Q8_0 site runs on (this load holds none)",
+            )?
+            .enqueue_gemm32(
                 stream,
                 Gemm32Args {
                     w: Gemm32Weight::Q8_0Plane { qs, d },
@@ -442,15 +461,203 @@ pub fn gemm(
         SiteTy::F32 => {
             dense()?;
             let rows = x.f32.ok_or_else(|| missing("f32 rows"))?;
-            k.g32
-                .enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, rows, m, y)
+            k.g32(
+                WHAT,
+                "the 32-value kernels an F32 site runs on (this load holds none)",
+            )?
+            .enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, rows, m, y)
+        }
+    }
+}
+
+/// One gated block over a table: the three sites, their shapes, the gate·up
+/// rule between them. The gate and up read the input rows through `input`;
+/// the down reads the SwiGLU rows, slot `s` its own column `s`
+/// ([`GemmInput::PerSlot`]).
+pub struct Gated<'a> {
+    pub w: &'a Weights,
+    pub route: &'a GemmRoute,
+    /// Gate, up and down: each site's type and tensor name.
+    pub gate: (SiteTy, &'a str),
+    pub up: (SiteTy, &'a str),
+    pub down: (SiteTy, &'a str),
+    /// Rows an expert of the gate and up: the SwiGLU's values a column.
+    pub ff: usize,
+    /// Rows an expert of the down.
+    pub hidden: usize,
+    pub rule: Act,
+    pub input: GemmInput,
+}
+
+impl<'a> Gated<'a> {
+    /// One of the block's sites as [`gemm`] takes it: type, weights, name.
+    fn at(&self, (ty, name): (SiteTy, &'a str)) -> (SiteTy, &'a Weights, &'a str) {
+        (ty, self.w, name)
+    }
+}
+
+/// Where a [`gated`] block's SwiGLU writes its rows: the form the down's type
+/// reads ([`SiteTy::reads`]). A form the down does not read may be absent.
+pub struct SwigluRows<'a> {
+    pub q128: Option<&'a mut GemmAct>,
+    pub q32: Option<&'a mut GemmAct32>,
+    pub f32: Option<&'a mut DeviceBuffer<f32>>,
+}
+
+/// A [`gated`] block's rows: the input in the forms the gate and up read,
+/// the gate and up outputs, the SwiGLU's rows and the down's output.
+pub struct GatedIo<'a> {
+    pub x: &'a WideIn<'a>,
+    pub gate: &'a mut DeviceBuffer<f32>,
+    pub up: &'a mut DeviceBuffer<f32>,
+    pub rows: SwigluRows<'a>,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The gated block `blk` over `m` input columns: the gate and up GEMMs, the
+/// rule's SwiGLU over the `n_slots` slot columns they wrote, and the down GEMM
+/// over those `n_slots` columns into `io.y`. On a one-expert table
+/// `n_slots == m`; on an expert table it is the slots of the `m` columns.
+/// The launches are those of the sites' types ([`gemm`] and the SwiGLU's
+/// quantizer into the down's form); a form a site reads that `io` lacks is
+/// refused by name.
+pub fn gated(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    blk: &Gated<'_>,
+    (m, n_slots): (usize, usize),
+    io: GatedIo<'_>,
+    fault: FaultSink,
+) -> Result<(), GpuError> {
+    let GatedIo {
+        x,
+        gate,
+        up,
+        mut rows,
+        y,
+    } = io;
+    let table = (blk.route, blk.input);
+    gemm(gpu, k, blk.at(blk.gate), blk.ff, x, table, m, gate)?;
+    gemm(gpu, k, blk.at(blk.up), blk.ff, x, table, m, up)?;
+    swiglu(gpu, k, blk, (&*gate, &*up), n_slots, &mut rows, fault)?;
+    let h = WideIn {
+        q128: rows.q128.as_deref(),
+        q32: rows.q32.as_deref(),
+        f32: rows.f32.as_deref(),
+    };
+    gemm(
+        gpu,
+        k,
+        blk.at(blk.down),
+        blk.hidden,
+        &h,
+        (blk.route, GemmInput::PerSlot),
+        n_slots,
+        y,
+    )
+}
+
+/// The launch a gated block's SwiGLU makes into the form its down's type
+/// reads, under the gate·up rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwigluLaunch {
+    /// `GemmKernels::enqueue_swiglu_act_quant` into q8_1 blocks of 128,
+    /// under either rule (`SiluMul` is the launch `enqueue_swiglu_quant`
+    /// makes).
+    Q128,
+    /// `Gemm32Kernels::enqueue_swiglu_quant32` into q8 blocks of 32 under
+    /// `SiluMul`: its entry has no rule switch.
+    Q32Plain,
+    /// `Gemm32Kernels::enqueue_swiglu_act_quant32` into q8 blocks of 32
+    /// under any other rule.
+    Q32Rule,
+    /// `ElemKernels::enqueue_swiglu` into f32 rows: `SiluMul` alone.
+    F32,
+}
+
+/// The launch of a SwiGLU into the form down site `(ty, name)` reads under
+/// `rule`; a rule the form's launch lacks is refused by name.
+fn swiglu_launch((ty, name): (SiteTy, &str), rule: Act) -> Result<SwigluLaunch, GpuError> {
+    match (ty.reads(), rule) {
+        (Form::Q8x128, Act::SiluMul | Act::SwigluClamp { .. }) => Ok(SwigluLaunch::Q128),
+        // `SiluMul` keeps the plain entry, which carries no rule switch; the
+        // rule's entry writes the same bytes under it.
+        (Form::Q8x32, Act::SiluMul) => Ok(SwigluLaunch::Q32Plain),
+        (Form::Q8x32, Act::SwigluClamp { .. }) => Ok(SwigluLaunch::Q32Rule),
+        (Form::F32, Act::SiluMul) => Ok(SwigluLaunch::F32),
+        (Form::F32, Act::SwigluClamp { limit }) => Err(GpuError::shape(
+            "site::swiglu",
+            format!(
+                "{name} is {ty}: its SwiGLU rows are f32 and only silu(gate) · up writes them, \
+                 not the clamp at {limit}"
+            ),
+        )),
+    }
+}
+
+/// The rule's SwiGLU of the first `cols` columns of the gate and up rows
+/// (`blk.ff` values each) into `rows`, in the form `blk`'s down reads: one
+/// launch with the quantizer for a q8 form, the f32 rows otherwise.
+fn swiglu(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    blk: &Gated<'_>,
+    (g, u): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
+    cols: usize,
+    rows: &mut SwigluRows<'_>,
+    fault: FaultSink,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "site::swiglu";
+    let (ty, name) = blk.down;
+    let stream = gpu.stream();
+    let lacks = |form: &'static str| {
+        GpuError::shape(
+            WHAT,
+            format!("{name} is {ty} and reads {form}, which the SwiGLU rows lack"),
+        )
+    };
+    match swiglu_launch(blk.down, blk.rule)? {
+        SwigluLaunch::Q128 => {
+            let a = rows
+                .q128
+                .as_deref_mut()
+                .ok_or_else(|| lacks("q8_1 blocks of 128"))?;
+            k.gemm
+                .enqueue_swiglu_act_quant(stream, g, u, blk.rule, cols, a, fault)
+        }
+        SwigluLaunch::Q32Plain => {
+            let a = rows
+                .q32
+                .as_deref_mut()
+                .ok_or_else(|| lacks("q8 blocks of 32"))?;
+            k.g32(
+                WHAT,
+                "the 32-value kernels a SwiGLU into q8 blocks of 32 runs on (this load holds none)",
+            )?
+            .enqueue_swiglu_quant32(stream, g, u, cols, a, fault)
+        }
+        SwigluLaunch::Q32Rule => {
+            let a = rows
+                .q32
+                .as_deref_mut()
+                .ok_or_else(|| lacks("q8 blocks of 32"))?;
+            k.g32(
+                WHAT,
+                "the 32-value kernels a SwiGLU into q8 blocks of 32 runs on (this load holds none)",
+            )?
+            .enqueue_swiglu_act_quant32(stream, g, u, blk.rule, cols, a, fault)
+        }
+        SwigluLaunch::F32 => {
+            let y = rows.f32.as_deref_mut().ok_or_else(|| lacks("f32 rows"))?;
+            gpu.elem().enqueue_swiglu(stream, g, u, cols * blk.ff, y)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SiteTy, file_site};
+    use super::{SiteTy, SwigluLaunch, file_site, swiglu_launch};
+    use crate::kquant::Act;
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
     use std::fs::File;
@@ -523,5 +730,42 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The SwiGLU's launch is the down's form under the rule: every K-quant
+    /// one launch into q8_1 blocks of 128, Q8_0 the plain 32-value entry
+    /// under `SiluMul` (the rule's entry for the clamp), F32 the f32 rows
+    /// under `SiluMul` alone, the clamp refused with the site's name.
+    #[test]
+    fn the_swiglu_launch_is_the_downs_form_under_the_rule() {
+        let clamp = Act::SwigluClamp { limit: 7.0 };
+        let launch = |ty, rule| swiglu_launch((ty, "down"), rule);
+        for ty in [SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K] {
+            for rule in [Act::SiluMul, clamp] {
+                assert_eq!(launch(ty, rule).ok(), Some(SwigluLaunch::Q128), "{ty}");
+            }
+        }
+        assert_eq!(
+            launch(SiteTy::Q8_0, Act::SiluMul).ok(),
+            Some(SwigluLaunch::Q32Plain)
+        );
+        assert_eq!(
+            launch(SiteTy::Q8_0, clamp).ok(),
+            Some(SwigluLaunch::Q32Rule)
+        );
+        assert_eq!(
+            launch(SiteTy::F32, Act::SiluMul).ok(),
+            Some(SwigluLaunch::F32)
+        );
+        match launch(SiteTy::F32, clamp) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("down is F32") && msg.contains("clamp"),
+                    "{msg}"
+                );
+            }
+            Ok(l) => panic!("an F32 down under the clamp launched {l:?}"),
+        }
     }
 }

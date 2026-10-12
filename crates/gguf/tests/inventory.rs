@@ -128,28 +128,29 @@ fn the_alignment_is_a_nonzero_u32() {
     std::fs::remove_file(&p).unwrap();
 }
 
-/// The contract this crate exists for: a tensor whose ggml type the engine
-/// has no size for (q4_0, id 2 — ggml.h:394) inventories with a size from
-/// ggml's table while `Gguf::open` refuses the file outright.
+/// The contract this crate exists for: a tensor whose type the strict reader
+/// refuses (q8_K, id 15, an activation form no weight is stored in)
+/// inventories with a size from the type table while `Gguf::open` refuses the
+/// file outright.
 #[test]
 fn inventory_carries_what_the_strict_reader_refuses() {
-    let p = tmp("q4_0.gguf");
-    // dims 32x4: one 18-byte block per row, four rows.
-    write_gguf(&p, &[("blk.0.attn_q.weight", &[32, 4], 2)], 72);
+    let p = tmp("q8_k.gguf");
+    // dims 256x4: one 296-byte block per row, four rows.
+    write_gguf(&p, &[("blk.0.attn_q.weight", &[256, 4], 15)], 1184);
 
     let inv = inventory_of(&p).expect("inventory");
     assert_eq!(inv.version, 3);
     assert_eq!(inv.tensors.len(), 1);
     let t = &inv.tensors[0];
     assert_eq!(t.name, "blk.0.attn_q.weight");
-    assert_eq!(t.dims, vec![32, 4]);
-    assert_eq!(t.type_id, 2);
-    assert_eq!(t.nbytes, Some(72));
+    assert_eq!(t.dims, vec![256, 4]);
+    assert_eq!(t.type_id, 15);
+    assert_eq!(t.nbytes, Some(1184));
 
     match Gguf::open(&p) {
-        Err(LoadError::UnsupportedType { ty, .. }) => assert_eq!(ty, GgmlType::Unknown(2)),
+        Err(LoadError::UnsupportedType { ty, .. }) => assert_eq!(ty, GgmlType::Unknown(15)),
         Err(other) => panic!("strict open refused with the wrong error: {other}"),
-        Ok(_) => panic!("strict open must refuse q4_0"),
+        Ok(_) => panic!("strict open must refuse q8_K"),
     }
 }
 

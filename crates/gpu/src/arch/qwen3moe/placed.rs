@@ -43,11 +43,11 @@
 //! whole-card load folds the shared expert into its stacks as one more
 //! expert, which a card holding part of a layer's experts cannot).
 //!
-//! A load whose arena holds more than [`GEMV_COLS`] rows (`Body35`'s, at
-//! the host union's [`PLACED_ROWS`]) reads each host expert once a unit; the
-//! walk of `Body`'s plain router stays within [`GEMV_COLS`] rows (the wide
-//! arm refuses a plain router by name). The wide arm's tables see the shared
-//! expert kept apart on every layer ([`apart_plans`]).
+//! A load whose arena holds more than [`GEMV_COLS`] rows (both bodies', at
+//! the host union's [`PLACED_ROWS`]) reads each host expert once a unit. The
+//! wide arm splits by the plan: the plain router (`Body`'s) runs no shared
+//! expert, the gated one (`Body35`'s) sees it kept apart on every layer
+//! ([`apart_plans`]).
 //!
 //! Numerics: the routing is the whole-card chain's bit for bit (the step's
 //! norm and router are `norm_quant` and the router, which the whole-card
@@ -63,9 +63,9 @@ use super::plan::{
     FfnPlan, FfnRoute, GateUpEntry, LayerPlan, SharedPlan, SharedSites, SiteTy, gate_up_entry,
 };
 use super::program::{Stores, Tail, enqueue_tail};
-use super::scratch::{Arena, Dims, Io};
-use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, route_bytes};
-use crate::gemm::GemmRoute;
+use super::scratch::{Arena, Dims, Forms, Io};
+use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, arena_bytes, route_bytes};
+use crate::gemm::{Gemm32Kernels, GemmRoute};
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
@@ -94,7 +94,10 @@ use std::sync::Arc;
 const WHAT: &str = "qwen3moe placed load";
 
 /// The rows of a placed prompt unit that reads each host expert once: the
-/// host union's most columns.
+/// host union's most columns. A placed load's prompt runs in units of up to
+/// this many positions through the host tier's batch port, so its ubatch
+/// arena holds that many rows ([`placed_scratch`]), whatever ubatch the
+/// caller asked.
 pub(super) const PLACED_ROWS: usize = UNION_MAX_COLS;
 
 /// The rows of a placed decode step: the step arena's one row.
@@ -264,11 +267,15 @@ impl PlacedRows {
 }
 
 /// The kernels of the host leg: the handoff into the page, the K-quant
-/// family's gate·up, and this family's places and combine (`hostleg`).
+/// family's gate·up, and this family's places and combine (`hostleg`); and,
+/// on a side whose units run the wide arm (past [`GEMV_COLS`] rows), the
+/// kernels that build a layer's routed table through its map, which a K-quant
+/// chain's kernel set does not hold.
 pub(super) struct PlacedKernels {
     handoff: HandoffKernels,
     kquant: KquantKernels,
     leg: HostLegKernels,
+    g32: Option<Gemm32Kernels>,
 }
 
 /// What every placed walk reads besides the arena: each layer's card
@@ -372,7 +379,7 @@ pub(super) struct PlacedOpen<'a> {
     /// The architecture the host run's refusals name.
     pub(super) arch: &'static str,
     /// The most rows a prompt unit holds: the arena's, [`PLACED_ROWS`] on a
-    /// load that runs the wide arm, [`GEMV_COLS`] on a plain router's.
+    /// load that runs the wide arm.
     pub(super) rows: usize,
 }
 
@@ -462,9 +469,15 @@ impl Placed {
         // The common chain's host-run build: a paged plan's NVMe expert tier
         // is attached before the run's first call, the plan's host segments
         // keep the mapping and every other id the arena serves.
-        let mut experts = crate::model::host_run(o.plan, &o.file, 0, o.host.r8, widths, |src| {
-            model::arch::qwen35moe::host::routed_layers(src, dims, 0..n, o.arch)
-        })?;
+        let mut experts = crate::model::host_run(
+            o.plan,
+            &o.file,
+            0,
+            o.host.r8,
+            o.set.arena(),
+            widths,
+            |src| model::arch::qwen35moe::host::routed_layers(src, dims, 0..n, o.arch),
+        )?;
         o.glue.attach_tier(experts.tier())?;
         experts.prepare_union(o.rows)?;
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
@@ -476,6 +489,9 @@ impl Placed {
             handoff: HandoffKernels::load(ctx)?,
             kquant: KquantKernels::load(ctx, gpu.fault_word())?,
             leg: HostLegKernels::load(ctx)?,
+            g32: (o.rows > GEMV_COLS)
+                .then(|| Gemm32Kernels::load(ctx))
+                .transpose()?,
         };
         let placed = Placed {
             hybrid,
@@ -641,6 +657,62 @@ fn placed_total(d: &Dims, layers: usize, rows: usize, tables: usize) -> Result<u
         + rows * s.hidden * 4
         + maps;
     u64::try_from(total).map_err(|_| GpuError::shape(WHAT, "the placed side's bytes pass u64"))
+}
+
+/// Rows of the ubatch arena for ubatches of `u` tokens on a `ctx`-row cache:
+/// at least a pass's [`GEMV_COLS`] (the plan's passes and tail walk it too),
+/// at most the cache.
+pub(super) fn prompt_rows(u: usize, ctx: usize) -> usize {
+    u.max(GEMV_COLS).min(ctx)
+}
+
+/// The card bytes a placed load of `layers` layers over arena dims `d` and
+/// forms `forms` holds past the m = 1 scratch: its ubatch arena at the placed
+/// units' rows ([`PLACED_ROWS`], [`arena_bytes`]) and its placed side
+/// ([`placed_bytes`]) — what the plan's machine counts in the card's scratch
+/// (`model::arch::qwen3moe::place::machine`), and what [`counted_arena`]
+/// holds the load to.
+pub(super) fn placed_scratch(d: &Dims, layers: usize, forms: Forms) -> Result<u64, GpuError> {
+    let arena = arena_bytes(d, prompt_rows(PLACED_ROWS, d.ctx), forms) as u64;
+    Ok(arena + placed_bytes(d, layers, PLACED_ROWS)?)
+}
+
+/// The ubatch arena of `d` for ubatches of `u` tokens on a placed load,
+/// after the check that it and the placed side's `side` bytes
+/// ([`placed_bytes`]) fit the `counted` bytes the load's plan holds for them
+/// in the card's scratch — not the card's free bytes, which a card budget
+/// (`BLOOMERY_CARD_BUDGET`) does not bound — else a named refusal with both
+/// terms, before anything is allocated. Load-time allocation.
+pub(super) fn counted_arena(
+    stream: &CudaStream,
+    (d, forms): (Dims, Forms),
+    u: usize,
+    counted: u64,
+    side: u64,
+) -> Result<Arena, GpuError> {
+    const WHAT_FIT: &str = "qwen3moe::placed::counted_arena";
+    let rows = prompt_rows(u, d.ctx);
+    let need = arena_bytes(&d, rows, forms) as u64;
+    if need + side > counted {
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the ubatch arena for ubatches of {u} tokens ({rows} rows) needs {need} bytes and \
+                 the placed side {side}; the plan counts {counted}"
+            ),
+        ));
+    }
+    let a = Arena::with(stream, d, rows, forms)?;
+    if a.bytes() as u64 != need {
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the ubatch arena holds {} bytes, its fit check counted {need}",
+                a.bytes()
+            ),
+        ));
+    }
+    Ok(a)
 }
 
 /// Each layer's map of the experts to their places in the card's stacks:
@@ -990,6 +1062,7 @@ fn gate_up_sel(
         GateUpEntry::Q8_0
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
+        | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
         | GateUpEntry::Mxfp4 => Err(GpuError::state(
             WHAT,
@@ -1034,7 +1107,11 @@ fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
         }
         // These read `Q8Act` columns (the i-quant downs of `iq_sel.rs`, MXFP4)
         // and have no launch on the placed side.
-        DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq4xs | DownEntry::Mxfp4 => {
+        DownEntry::Iq2xs
+        | DownEntry::Iq3xxs
+        | DownEntry::Iq3s
+        | DownEntry::Iq4xs
+        | DownEntry::Mxfp4 => {
             return Err(refuse(format!(
                 "its entry {entry:?} has no launch on the placed side"
             )));
@@ -1160,7 +1237,11 @@ fn card_wide(
             "a table of the card's experts for every layer of a wide unit",
         ))?
         .as_mut();
-    wide::ffn_card(c, &c.p.ffn, s, m, Some(CardRoute { map, table }))
+    let remap = side.k.g32.as_ref().ok_or(GpuError::state(
+        WHAT,
+        "the remap kernels of a side whose units run the wide arm",
+    ))?;
+    wide::ffn_card(c, &c.p.ffn, s, m, Some(CardRoute { map, table, remap }))
 }
 
 /// What a placed walk reads and writes: the chain's context, its stores,
@@ -1469,6 +1550,7 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
                 sel: &p.rows.sel,
                 hsum: port.hsum(),
                 n_card: f.n_card,
+                leg: &p.side.k.leg,
             };
             return wide::ffn_combine(&lc, &lc.p.ffn, p.s, p.m, Some(host), None);
         }

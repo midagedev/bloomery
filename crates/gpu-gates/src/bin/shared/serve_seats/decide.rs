@@ -44,7 +44,7 @@
 //!
 //! Image input is a row's own (`Decision::takes_images`: Clef's) and needs an
 //! encoder file: `--mmproj FILE`, or under `--hf` the repo's own projector
-//! (`hf::mmproj_sibling`) unless `--no-mmproj` says none. The file is opened
+//! (`model_file::hf_projector`) unless `--no-mmproj` says none. The file is opened
 //! and held against the backbone's embedding width, vocabulary and rope before
 //! any load ([`vision_seat::Projector`]), the tower is seated
 //! ([`vision_seat::encoder_seat`]: a card off the plan, else a reserve on the
@@ -423,10 +423,9 @@ struct Args {
     host: String,
     port: u16,
     ctx: Option<usize>,
-    /// The image-input flags: `--mmproj` is the encoder file whose images the seat serves.
+    /// The image-input flags: `--mmproj` is the encoder file whose images the seat serves, else
+    /// the `--hf` repo's projector unless `--no-mmproj`.
     vision: vision_seat::Flags,
-    /// `--no-mmproj`: no image input, though `--hf` has a projector to pick.
-    no_mmproj: bool,
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     api_keys: serve::flag::ApiKeys,
@@ -438,7 +437,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         port: 8080,
         ctx: None,
         vision: vision_seat::Flags::default(),
-        no_mmproj: false,
         api_keys: serve::flag::ApiKeys::default(),
     };
     let mut it = args.iter().map(String::as_str);
@@ -446,7 +444,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         if flag == "--help" || flag == "-h" {
             return Err(USAGE.into());
         }
-        a.no_mmproj |= flag == "--no-mmproj";
         if a.vision.take(flag, &mut it)? {
             continue;
         }
@@ -538,9 +535,6 @@ struct Load {
     /// The row's name, which a refusal names.
     row: &'static str,
     vision: vision_seat::Flags,
-    no_mmproj: bool,
-    /// The `--hf` repo the model file came from, whose projector a run with no image flag takes.
-    hf: Option<String>,
 }
 
 impl Load {
@@ -580,38 +574,6 @@ impl Decide for Seat {
     }
 }
 
-/// The image projector the `--hf` repo holds beside `model`, a set's first shard in the cache
-/// (`<root>/<owner>/<name>/<path in the repo>`, which gives the cache root and the model's path in
-/// the repo): the listing's `mmproj` sibling of the model ([`hf::mmproj_sibling`], through
-/// [`hf::fetch::Client::mmproj_path`]), fetched and checked; `None` when the repo holds none.
-fn hf_projector(repo: &str, model: &Path) -> Result<Option<PathBuf>, GateError> {
-    let in_repo = || {
-        format!(
-            "--hf {repo}: the model file {} is not under the repo's cache directory",
-            model.display()
-        )
-    };
-    let at = model
-        .ancestors()
-        .find(|a| a.ends_with(repo))
-        .ok_or_else(in_repo)?;
-    let rel = model
-        .strip_prefix(at)?
-        .to_str()
-        .ok_or_else(|| format!("{} is not UTF-8", model.display()))?
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    let root = at
-        .ancestors()
-        .nth(repo.split('/').count())
-        .ok_or_else(in_repo)?;
-    let Some(path) = hf::fetch::Client::new(root.to_path_buf())?.mmproj_path(repo, &rel)? else {
-        return Ok(None);
-    };
-    Ok(model_file::fetch_exact(repo, &[path.as_str()])?
-        .into_iter()
-        .next())
-}
-
 /// The encoder of the image input the flags ask for, opened and held against the backbone
 /// before any of it loads: `--mmproj`'s file, else (under `--hf`, with no `--no-mmproj`) the
 /// projector the repo holds beside the model. `None` serves no image. A row that takes no images
@@ -632,13 +594,7 @@ fn open_image(
         }
         return Ok(None);
     }
-    let file = match (given, &l.hf) {
-        (Some(file), _) => Some(file.to_owned()),
-        (None, Some(repo)) if !l.no_mmproj && cfg!(feature = "vision") => {
-            hf_projector(repo, &l.model)?
-        }
-        (None, _) => None,
-    };
+    let file = l.vision.encoder(true)?;
     let split = Split::open(&l.model).map_err(|e| format!("open {}: {e}", l.model.display()))?;
     let hp = Hparams::read(&split)?;
     // Every Qwen3.5 attention layer rotates by IMROPE over the file's sections.
@@ -796,8 +752,6 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         ctx,
         row: row.name,
         vision: a.vision,
-        no_mmproj: a.no_mmproj,
-        hf: hf.map(str::to_owned),
     };
     let (ready_tx, ready_rx) = mpsc::channel();
     let (jobs, jobs_rx) = mpsc::channel::<Job>();

@@ -565,6 +565,20 @@ struct TypePin {
     reads: &'static [GgmlType],
 }
 
+/// The types a gated block's matrices read: the q8_0 pair, or K-quants
+/// (`gpu-deepseek41/src/block.rs` `BLOCK_TYPES`, each a launch of
+/// `gpu/src/site.rs` or the fused K-quant gate·up).
+// PIN(2026-10-11): widened from `[Q8_0]` with the gated block's type dispatch,
+// for the mimo2 dense block and the glm5next dense block and shared expert;
+// derivation: each type is read by `site::kgemv` or the fused K-quant gate·up
+// in `enqueue_block`, at the decode sites.
+const GATED_BLOCK: &[GgmlType] = &[
+    GgmlType::Q8_0,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+];
+
 /// The per-tensor type pins of the programs, as lists (the qwen3moe body's
 /// dense FFN; `Body35`'s
 /// site types, its `PROJ`, `EMBED` and `HEAD_TY` in
@@ -674,16 +688,16 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::DenseFfn,
         matrices: true,
         names: None,
-        what: "dense block (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "dense block (the body reads q8_0, q4_K, q5_K and q6_K)",
+        reads: GATED_BLOCK,
     },
     TypePin {
         program: Program::Glm5nextBody,
         role: Role::SharedExpert,
         matrices: true,
         names: None,
-        what: "shared expert (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "shared expert (the body reads q8_0, q4_K, q5_K and q6_K)",
+        reads: GATED_BLOCK,
     },
     TypePin {
         program: Program::Glm5nextBody,
@@ -755,8 +769,8 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::DenseFfn,
         matrices: true,
         names: None,
-        what: "dense block (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "dense block (the body reads q8_0, q4_K, q5_K and q6_K)",
+        reads: GATED_BLOCK,
     },
     TypePin {
         program: Program::Mimo2Body,
@@ -902,6 +916,7 @@ pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         GateUpEntry::Q8_0
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
+        | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
         | GateUpEntry::Mxfp4 => None,
     }
@@ -925,6 +940,7 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
         | DownEntry::Q8_0
         | DownEntry::Iq2xs
         | DownEntry::Iq3xxs
+        | DownEntry::Iq3s
         | DownEntry::Iq4nl
         | DownEntry::Iq4xs
         | DownEntry::Mxfp4 => None,
@@ -1920,6 +1936,50 @@ mod tests {
                     .to_string()
             )]
         );
+    }
+
+    /// The dense block's pin (mimo2, glm5next) and glm5next's shared-expert pin
+    /// read the gated block's types (q8_0 and the K-quants `enqueue_block`
+    /// dispatches); any other type is an item naming the type.
+    // PIN(2026-10-11): q4_K, q5_K and q6_K joined the three pins' set (it was
+    // q8_0 alone) with the gated block's type dispatch; derivation: see
+    // `GATED_BLOCK`.
+    #[test]
+    fn the_gated_block_pins_read_the_gated_blocks_types() {
+        for (program, role, text) in [
+            (
+                Program::Mimo2Body,
+                Role::DenseFfn,
+                "dense block (the body reads q8_0, q4_K, q5_K and q6_K)",
+            ),
+            (
+                Program::Glm5nextBody,
+                Role::DenseFfn,
+                "dense block (the body reads q8_0, q4_K, q5_K and q6_K)",
+            ),
+            (
+                Program::Glm5nextBody,
+                Role::SharedExpert,
+                "shared expert (the body reads q8_0, q4_K, q5_K and q6_K)",
+            ),
+        ] {
+            let of = |ty: GgmlType| items(program, &matrix("ffn_gate.weight", role, ty));
+            for ty in [
+                GgmlType::Q8_0,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+            ] {
+                assert_eq!(of(ty), Vec::<String>::new(), "{program:?} {role:?} {ty}");
+            }
+            for ty in [GgmlType::Q3_K, GgmlType::IQ4_XS, GgmlType::F16] {
+                assert_eq!(
+                    of(ty),
+                    [format!("{ty} {text}")],
+                    "{program:?} {role:?} {ty}"
+                );
+            }
+        }
     }
 
     /// The glm5next and mimo2 embedding pins read the set the host row

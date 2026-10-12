@@ -992,7 +992,7 @@ use Ty::{Bool, Csv, F64, I64, List, Text, U64, Word};
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them.",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them.",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -1015,6 +1015,8 @@ pub static PLAN: Kind = Kind {
         key("paged", U64, "B"),
         key("arena", U64, "B"),
         key("arena_slots", U64, "slots"),
+        opt("room", U64, "B"),
+        opt("plan_room", U64, "B"),
         opt("card_free", U64, "B"),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
@@ -1026,7 +1028,7 @@ pub static PLAN: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read).",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -1039,6 +1041,8 @@ pub static PLAN38: Kind = Kind {
         opt("tier", Word, ""),
         opt("tier_experts", U64, "experts"),
         opt("card_free", U64, "B"),
+        opt("room", U64, "B"),
+        opt("plan_room", U64, "B"),
         opt("why", Word, ""),
         opt("rows", Word, ""),
         opt("read", Word, ""),
@@ -1661,9 +1665,11 @@ pub static CLEF_ROWS: Kind = Kind {
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled; and the wall the fill reader's jobs ran, the prompt batches' and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled; and the wall the fill reader's jobs ran, the prompt batches' and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
     parts: &[
         key("budget", U64, "B"),
+        key("arena_planned", U64, "B"),
+        key("arena_granted", U64, "B"),
         key("paged", U64, "B"),
         key("misses", U64, ""),
         key("fills", U64, ""),
@@ -3045,7 +3051,13 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
 
 /// What `bloomery-serve-ds41` prints, all on stderr, and the rounds of
 /// several slots and the calls of one a `BLOOMERY_STEP_STATS` run counts.
+/// The `hf` lines are the `--hf` repo's projector fetch, which runs after the
+/// seat registers ([`crate::model_file::hf_projector`]).
 pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
+    &HF_OFFLINE,
+    &HF_FILE,
+    &HF_PROGRESS,
+    &HF_DONE,
     &PLACE_UNSET,
     &PLAN,
     &CACHE_CONFIG,
@@ -3055,6 +3067,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &NVTIER,
     &HELPER,
     &LOAD_DRAFT,
     &CAPTURE,
@@ -3153,11 +3166,17 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = &[
 /// placed load, the draft's load line and its verify's capture, the
 /// listening line, the reuse records the checkpoint rule answers, the
 /// draft's joins, the residency machine's records, and the rounds of several
-/// slots and the calls of one a `BLOOMERY_STEP_STATS` run counts.
+/// slots and the calls of one a `BLOOMERY_STEP_STATS` run counts, and the image encoder's `vision`
+/// record under `--mmproj`. The `hf` lines are the `--hf` repo's projector fetch, which runs after
+/// the seat registers ([`crate::model_file::hf_projector`]).
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
     &DRAFT_YIELD,
+    &HF_OFFLINE,
+    &HF_FILE,
+    &HF_PROGRESS,
+    &HF_DONE,
     &PLACE_UNSET,
     &PLAN,
     &RESIDENCY_UNSET_GLM,
@@ -3167,6 +3186,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &NVTIER,
     &LOAD_DRAFT_GLM,
     &LOAD_DRAFT_OFF_GLM,
     &CAPTURE,
@@ -3180,6 +3200,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &SLOTS_ROUND,
     &SLOT_CALL,
     &MTP_WIDTH,
+    &VISION,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
@@ -3295,10 +3316,20 @@ pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Reco
 /// records of the paged plan and the tier census of each phase.
 pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST, &TIER_CENSUS];
 
+/// `r` with the host room's reading and the plan room when the plan was made at
+/// one (`HostTotals::room`), the two parts `plan` and `plan38` share; the
+/// caller has put every part the kind lists before `room`.
+pub fn with_room(r: Record, room: Option<(u64, u64)>) -> Record {
+    match room {
+        Some((read, planned)) => r.u("room", read).u("plan_room", planned),
+        None => r,
+    }
+}
+
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
 /// card counts' range, the budget, and the NVMe tier's terms (the bytes paged,
-/// the arena and its slots).
+/// the arena and its slots), and the host room it was made at when it had one.
 pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
     let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
     let card = &plan.cards[0];
@@ -3331,6 +3362,7 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
             "arena_slots",
             arena_slots(plan).expect("the arena's slots of a plan the split made"),
         );
+    let r = with_room(r, plan.host.room);
     let r = match machine.cards.first().and_then(|c| c.free_bytes) {
         Some(free) => r.u("card_free", free),
         None => r,
@@ -3424,8 +3456,9 @@ pub fn lane(card: &str, rate: &bloomery_gpu::lane::LaneRate) -> Record {
         .w("pinned", rate.pinned)
 }
 
-/// The `nvtier` record of a load's arena: its budget, the paged bytes it
-/// serves and the counters since the load. A load that attached no tier has
+/// The `nvtier` record of a load's arena: its budget (the granted bytes), the
+/// arena the plan reserved beside it, the paged bytes it serves and the
+/// counters since the load. A load that attached no tier has
 /// no record — honest absence, never a zeroed row.
 #[cfg(feature = "gpu")]
 #[must_use]
@@ -3433,9 +3466,12 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
     let tier = tier?;
     let s = tier.stats();
     let ran = tier.reader_stats();
+    let arena = tier.arena();
     Some(
         Record::new(&NVTIER)
             .u("budget", tier.budget())
+            .u("arena_planned", arena.planned)
+            .u("arena_granted", arena.granted)
             .u("paged", tier.paged_bytes())
             .u("misses", s.misses)
             .u("fills", s.fills)
@@ -3831,6 +3867,41 @@ pub fn residency_reset(r: &ResetReport) -> Record {
 mod tests {
     use super::*;
 
+    /// Every seat that takes `--mmproj` registers the `vision` record its tower's load prints:
+    /// an unregistered kind panics at the print.
+    #[test]
+    fn the_seats_that_take_images_register_the_vision_record() {
+        for (seat, set) in [
+            ("ds41", BLOOMERY_SERVE_DS41),
+            ("qwen3", BLOOMERY_SERVE_QWEN3),
+            ("glm", BLOOMERY_SERVE_GLM),
+        ] {
+            assert!(
+                set.iter().any(|k| k.name == VISION.name),
+                "the {seat} seat does not register the vision record"
+            );
+        }
+    }
+
+    /// Every seat whose `--hf` repo's projector is fetched after its `record::at_main`
+    /// ([`crate::model_file::hf_projector`]) registers each line that fetch prints.
+    #[test]
+    fn the_seats_that_fetch_the_hf_projector_register_its_lines() {
+        for (seat, set) in [
+            ("ds41", BLOOMERY_SERVE_DS41),
+            ("qwen3", BLOOMERY_SERVE_QWEN3),
+            ("glm", BLOOMERY_SERVE_GLM),
+        ] {
+            for kind in [&HF_OFFLINE, &HF_FILE, &HF_PROGRESS, &HF_DONE] {
+                assert!(
+                    set.iter().any(|k| k.name == kind.name),
+                    "the {seat} seat does not register the {} record",
+                    kind.name
+                );
+            }
+        }
+    }
+
     /// Every binary's kinds: names unique, each value part named once, a
     /// text part followed by a key, a literal or nothing (the parser reads it
     /// up to what comes next), and every head written.
@@ -3884,6 +3955,8 @@ mod tests {
     fn nvtier_ends_with_the_union_counters() {
         let line = Record::new(&NVTIER)
             .u("budget", 100)
+            .u("arena_planned", 101)
+            .u("arena_granted", 100)
             .u("paged", 200)
             .u("misses", 3)
             .u("fills", 4)
@@ -4333,6 +4406,48 @@ mod tests {
             ])
         );
         assert_eq!(bp.word("card_budget"), Ok("none"));
+    }
+
+    /// A plan made at a host room prints its reading and the plan room right
+    /// after the card's free bytes, and a plan made at none prints neither;
+    /// the parts after them keep their values, and a line from before the
+    /// parts reads as absent.
+    #[test]
+    fn a_plan38_names_the_host_room_it_was_made_at() {
+        let line = |room| {
+            let r = Record::new(&PLAN38)
+                .w("place", "cuda0")
+                .w("card", "5090")
+                .w("experts", "card")
+                .u("ctx_max", 4096)
+                .u("host_experts", 11_735)
+                .u("card_experts", 12_841)
+                .u("card_free", 31_000_000_000_u64);
+            with_room(r, room).w("why", "whole_does_not_fit").line()
+        };
+        let at = line(Some((60_943_515_648, 60_500_000_000)));
+        assert_eq!(
+            at,
+            "plan place=cuda0 card=5090 experts=card ctx_max=4096 host_experts=11735 \
+             card_experts=12841 card_free=31000000000 room=60943515648 plan_room=60500000000 \
+             why=whole_does_not_fit"
+        );
+        let none = line(None);
+        assert!(!none.contains("room"), "{none}");
+        let read = |text: &str| Log::of(text, BLOOMERY_SERVE_QWEN38).one(&PLAN38).unwrap();
+        let (at, none) = (read(&at), read(&none));
+        assert_eq!(at.opt_u64("room"), Ok(Some(60_943_515_648)));
+        assert_eq!(at.opt_u64("plan_room"), Ok(Some(60_500_000_000)));
+        assert_eq!(at.opt_word("why"), Ok(Some("whole_does_not_fit")));
+        assert_eq!(none.opt_u64("room"), Ok(None));
+        assert_eq!(none.opt_u64("plan_room"), Ok(None));
+        assert_eq!(none.opt_word("why"), Ok(Some("whole_does_not_fit")));
+        let old = read(PLAN38_PLACED);
+        assert_eq!(old.opt_u64("room"), Ok(None));
+        let with = PLAN_BP.replace("arena_slots=0 ", "arena_slots=0 room=7 plan_room=5 ");
+        let bp = Log::of(&with, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+        assert_eq!(bp.opt_u64("room"), Ok(Some(7)));
+        assert_eq!(bp.u64("card_free"), Ok(50_668_240_896));
     }
 
     /// Kinds that share a head are told apart by the whole line: a qwen3moe

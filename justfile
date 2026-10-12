@@ -1779,7 +1779,7 @@ gate-gpu-qwen38-residency:
 # solo, reason r2 (both cards, both gate locks; no host-memory pin): stays solo in the fixture tier, which runs it in lane X in seconds.
 [group('solo')]
 [group('v41-load')]
-gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
+gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard --bin generate_qwen3moe && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
 
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
@@ -1806,6 +1806,8 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
 # The build takes the deepseek41 feature, not the qwen family's plain gpu:
 # the server surface it links (gpu-gates' bind, serve_client; the serve and sampler crates) sits behind
 # that feature today — `just affected` and the recipes.py pins scope it so.
+# Stays solo, reason: the host set (tools/gate-batch-resources.tsv) loads under the big-load lock, and the seat's unset residency pick reads MemAvailable against the churn pool, so a neighbour's load moves it.
+# Never solo-real: the generate call and the two main servers pass `--place gate` (the card named 3090), the unset-place servers plan on the one card in view, and the gate plans on RTX_3090 directly (no shared/gate_card.rs); its gpu-gate.sh calls are 3090-only, and solo-real balances on `any`.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-serve:
@@ -2252,6 +2254,17 @@ gate-gpu-glm5next-stagger:
 gate-gpu-glm5next-media:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5next-media && bash tools/gate.sh --oxide -p bloomery-gpu-glm5next --release --lib && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media'
 
+# The serve seat's media call of the same fixture (`bloomery-serve --mmproj` on a GLM file), gate_glm5next_e2e's `--only media-seat`
+# ((sm), `shared/glm5next_media.rs`'s `seat`, built with the `vision` feature the other recipes leave out): the encoder file of
+# the fixture's image sets, seated as the seat seats it and loaded as its resident tower; two procedural images of known grids
+# encoded on it and spliced through the seat's own steps (`Resident::span_rows`, `Session::prompt_media`), held to
+# `prefill_media` called with spans put together from the images' sizes, the same argmax and a bit-identical last hidden row; a
+# control without the rows that lies away from it; and the tower's refusal by name of a grid past its cap. No oracle: the
+# numbers' quality is the tower's gate's and (im)'s. Fixture tier only: on the real tier the bin fails by name before any load
+# (0 clauses). Loads the fixture once, on either card.
+gate-gpu-glm5next-media-seat:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,vision --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media-seat'
+
 # The same gate's long step sets (`--only main --step-sets long`): the load at CTX and its clauses, with the 1,024-position
 # set and the 3,070-position `--dsa` set, the only comparisons with ik past 4 positions and the only end-to-end run past
 # the dense limit. Weekly: `just weekly` runs it, and `just affected` names it when a file its triggers in
@@ -2285,7 +2298,7 @@ gate-gpu-glm5next-mtp:
 # arm's, the room under the floor and the arena under its floor each refused by name, the NextN plan refused at the room the
 # draft layer's routed experts leave under the floor and planned above it, and the unset residency `off` with why `paged`.
 # Each arm's room and arena reach the plan through PlanInputs, so no environment crosses the tiers. The fixture tier runs on
-# the `iq4xs` variant (tools/fixture-variants.tsv: every routed layer on the host). Group solo-real, reason r1 (the real tier
+# the plain fixture, which leaves the clauses that read the paged experts to the real tier. Group solo-real, reason r1 (the real tier
 # loads the whole file twice), balanced over the cards in the fixture tier, under the big-load lock the V4.1 loads take.
 [group('solo-real')]
 [group('v41-load')]
@@ -2343,7 +2356,7 @@ gate-gpu-glm5next-residency:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-serve:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
 
 # The MiMo seat of `bloomery-serve` (gate_mimo2_serve): the refusals before any load (--plan's default context, the one
 # slot, the tier card), one server at --ctx 4160 --parallel 1 holding its load and listening records, the three prompts'

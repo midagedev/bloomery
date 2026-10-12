@@ -100,10 +100,10 @@ head instead of the file's own.
 llama-server reads it, and the startup line says so). The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
-all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
+all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
 request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows). A
 placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
-lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
+lookup draft step their slots in turn (Qwen3.8 under `--place bp` runs one pass since 0.3.1), a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
 llama-server splits it with `-np N` and no `-kvu`: the total (a set `--ctx-size`, or the automatic choice when no
@@ -170,10 +170,11 @@ MiMo and Qwen3 seats run no prompt cache: a request keeps the longest prefix the
 by name. `timings.cache_ms` and `/metrics`'
 `prompt_cache_seconds_total` count the cache's work.
 
-**Image input (V4.1, Qwen3.6, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,
+**Image input (V4.1, Qwen3.6, GLM-5.3, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,
 llama-server's flag, naming the model's encoder GGUF. On V4.1 the file is `mmproj-DeepSeek-V4.1-Flash-BF16.gguf`.
-On the Clef decide seat, `--hf` also fetches the repo's own projector beside the model, unless `--no-mmproj`
-says none; the Qwen3.6 and V4.1 seats fetch none under `--hf`, so they need `--mmproj <file>` too. Qwen3-30B-A3B has no encoder, and `--mmproj` there is refused by name. A file of
+Under `--hf` with no `--mmproj`, every image seat takes the repo's own projector beside the model, unless `--no-mmproj`
+says none. The V4.1, Qwen3.6 and GLM-5.3 seats load it only when the text model keeps the same card experts and
+context with the encoder's reserve; otherwise one vision line gives the projector's bytes and cost, and the seat serves text. Qwen3-30B-A3B has no encoder, and `--mmproj` there is refused by name. A file of
 another encoder is refused by name. Images travel inside the request as PNG or JPEG bytes: an OpenAI `image_url`
 part holding a `data:` URL, or an Anthropic `image` block with a base64 source; any other URL is refused, not
 fetched. The encoder loads once at start and stays resident: on a card the load's plan leaves off it, or, when every
@@ -201,7 +202,7 @@ binary's `--help`.
   `--parallel 2`); agent clients with long system prompts want the context to one request there (`--parallel 1`, or
   a set `--ctx-size` with no `--parallel`).
 - One model a server; one expert tier card at most (`--place bp`).
-- Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, GLM-5.3 and Qwen3.8; a placed
+- Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
   streams wait. The decide seat serves one request at a time; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.

@@ -18,7 +18,10 @@
 //! - (card) right after the load at [`CTX`], the card experts' slot map,
 //!   slots and card copy, checks (i)–(iii) of `shared/glm5next_card.rs`.
 //! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes
-//!   plus [`CARD_NODES`] for each routed layer the plan gives card experts
+//!   plus the launches a K-quant dense block or shared expert adds
+//!   (`BlockPlan::extra_launches`, read from the header and held equal to the
+//!   loaded body's plans) plus [`CARD_NODES`] for each routed layer the plan
+//!   gives card experts
 //!   (its `n_l`, which the host tier's slot map must hold layer for layer),
 //!   [`MEMOPS`] of them stream memory-operation batches (each routed layer's
 //!   go and wait) and the rest kernels, and the program's own count
@@ -392,6 +395,14 @@
 //! (`prefill_media`) fed mainline's own tower rows of the fixture's image sets, held on the last position's
 //! `result_norm` against the CUDA run within the CPU twin's distance, and the refusals by name. The real tier
 //! leaves it to the fixture tier before any load.
+//!
+//! `--only media-seat` is (sm), the serve seat's media call (`shared/glm5next_media.rs`'s `seat`, behind the
+//! `vision` feature, which the bin's `required-features` leave out): our tower's rows of two procedural
+//! images (the fixture's encoder file, seated as `bloomery-serve --mmproj` seats it), through the seat's own
+//! steps (`Resident::span_rows`, `Session::prompt_media`), held to `prefill_media` called with spans put
+//! together from the images' sizes — the same argmax and a bit-identical last hidden row — with a control
+//! that lies away from the media call and the tower's refusal of a grid past its cap by name. It declares
+//! no fixture-oracle clause, and the real tier fails it by name before any load (0 clauses).
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -455,6 +466,7 @@ mod gate {
     use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, POOL, pools_for};
     use bloomery_gpu::linear::RING_ROWS;
     use bloomery_gpu::model::{SlotsOut, StepMode};
+    use bloomery_gpu::site::{Form, SiteTy};
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::Arm;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
@@ -473,7 +485,7 @@ mod gate {
         RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
         plant_prompt_routes, prefill, prefill_mode, prompt_route_taps, seq_resume,
         seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prompt_route_taps,
-        set_taps, step_launches, store_digests, store_rows,
+        set_taps, step_launches, store_digests, store_rows, trunk_blocks,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -498,6 +510,11 @@ mod gate {
 
     /// (im): the media call against mainline's image-input sets of the fixture (`--only media`).
     const IM: &str = "(im) image rows in the prompt batch against mainline's sets";
+
+    /// (sm): the serve seat's media call against the body's, on our tower's rows
+    /// (`--only media-seat`).
+    #[cfg(feature = "vision")]
+    const SM: &str = "(sm) the serve seat's media call against the body's on the same rows";
 
     /// The prompt batch's load: every position the latent layers attend whole
     /// (`place::dense_positions`: the indexer's top-k in whole pools of 512,
@@ -800,16 +817,26 @@ mod gate {
         );
         ok &= card_ok;
         let (decode, memops) = (shape.nodes_decode(), shape.memops());
-        let want = decode + CARD_NODES * card_layers.len();
-        let counted = step_launches(&mixers, &ffns, &cards);
+        // The blocks' plans from the header, and the loaded body's: the launches a K-quant block
+        // adds are the plan's, and both sides count them.
+        let header_blocks = trunk_blocks(&glm5next_tier::open()?)?;
+        let block_extra: usize = header_blocks.iter().map(|b| b.extra_launches()).sum();
+        let want = decode + block_extra + CARD_NODES * card_layers.len();
+        let blocks_ok = header_blocks == body.blocks();
+        let counted = step_launches(&mixers, &ffns, &cards, &body.blocks());
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let pass =
-            nodes == want && counted == want && b == memops && k == want - memops && other == 0;
+        let pass = blocks_ok
+            && nodes == want
+            && counted == want
+            && b == memops
+            && k == want - memops
+            && other == 0;
         println!(
-            "structure decode graph_nodes={nodes} (want {want} = {decode} + {CARD_NODES} x {} \
-             card layers; the program counts {counted}) kernel={k} batch_mem_op={b} (want {memops}) \
+            "structure decode graph_nodes={nodes} (want {want} = {decode} + {block_extra} block \
+             launches + {CARD_NODES} x {} card layers; the program counts {counted}; the header's \
+             block plans are the body's {blocks_ok}) kernel={k} batch_mem_op={b} (want {memops}) \
              other={other} {}",
             card_layers.len(),
             verdict(pass)
@@ -4891,6 +4918,9 @@ mod gate {
         /// (im) alone, on a load at [`CTX`] on the batch feed: the fixture's media rows against
         /// mainline's sets.
         Media,
+        /// (sm) alone, on a load at [`CTX`] on the batch feed: the serve seat's media call on our
+        /// tower's rows against the body's own (the `vision` feature).
+        MediaSeat,
     }
 
     impl Only {
@@ -4957,7 +4987,7 @@ mod gate {
 
     /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, `--only
     /// keep`, `--only slots`, `--only stagger`, `--only stagger-draft`,
-    /// `--only media`, or every clause.
+    /// `--only media`, `--only media-seat`, or every clause.
     fn only() -> Result<Only, GateError> {
         match word_after("--only") {
             None => Ok(Only::All),
@@ -4971,9 +5001,10 @@ mod gate {
                 Some("stagger") => Ok(Only::Stagger),
                 Some("stagger-draft") => Ok(Only::StaggerDraft),
                 Some("media") => Ok(Only::Media),
+                Some("media-seat") => Ok(Only::MediaSeat),
                 other => Err(format!(
-                    "--only is main, pp, pplong, verify, keep, slots, stagger, stagger-draft or \
-                     media, not {other:?}"
+                    "--only is main, pp, pplong, verify, keep, slots, stagger, stagger-draft, \
+                     media or media-seat, not {other:?}"
                 )
                 .into()),
             },
@@ -5034,6 +5065,11 @@ mod gate {
                 ok = false;
             }
         }
+        if only == Only::MediaSeat {
+            let t = Instant::now();
+            ok &= media_seat(&levers)?;
+            elapsed("arm media-seat", &t);
+        }
         if matches!(only, Only::All | Only::Slots) {
             let t = Instant::now();
             ok &= slots(&levers)?;
@@ -5072,6 +5108,46 @@ mod gate {
         println!("gate_glm5next_e2e: {}", tier::tally_line());
         tier::expect_fixture_oracle("gate_glm5next_e2e", declared_fixture_oracle(only, sets))?;
         if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
+    /// (sm), the `--only media-seat` arm: the serve seat's media call on the fixture's load at
+    /// [`CTX`] on the batch feed, its tower the encoder file the fixture's image sets were dumped
+    /// with, held to the body's call on the same rows. Fixture tier only: on the real tier it fails
+    /// by name before any load, as `--only media` does (0 clauses).
+    #[cfg(feature = "vision")]
+    fn media_seat(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let tier = tier::Tier::from_env()?;
+        if tier != tier::Tier::Fixture {
+            println!(
+                "glm5next-media-seat: 0 clauses on the {} tier: (sm) pairs the fixture's text model \
+                 with the encoder file of the fixture's image sets",
+                tier.name()
+            );
+            return Ok(false);
+        }
+        if !tier::run_clause(SM, Tag::SelfConsistency)? {
+            return Ok(false);
+        }
+        let path = glm5next_tier::model_path()?;
+        let file = glm5next_tier::open()?;
+        let n_embd = PlanInputs::read(&file)?.hp.n_embd;
+        drop(file);
+        let tok = tokenizer::Tokenizer::from_gguf(&path)?;
+        let vocab = |id| tok.text(id).map(str::to_owned);
+        let t = Instant::now();
+        let (mut s, _) = open(levers, CTX, PrefillMode::Batch, KdaLanes::One)?;
+        let mmproj = PathBuf::from(refset::arch::glm5next::vis::PROFILE.mmproj);
+        let ok = crate::glm5next_media::seat::clauses(&mut s, &mmproj, n_embd, &vocab)?;
+        elapsed("(sm)", &t);
+        Ok(ok)
+    }
+
+    /// Built without the `vision` feature, the arm is refused by name.
+    #[cfg(not(feature = "vision"))]
+    fn media_seat(_: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        Err("--only media-seat: built without the vision feature \
+             (just gate-gpu-glm5next-media-seat)"
+            .into())
     }
 
     /// The batch set's manifest and ik's routing of every routed layer, opened by the clause that
@@ -5491,11 +5567,34 @@ mod gate {
     /// reads the stream after the layer's mixer, a routed block adding 0; the
     /// head reads all 45: q·√(34·4.1875 + 3·3.64 + 11·3) = 0.1755. From
     /// `kinds` (each layer's mixer and feed-forward block).
-    fn gemm_bands(kinds: &[Layer]) -> Bands {
+    ///
+    /// PIN(2026-10-12): a block whose gate·up or down reads q8_1 blocks of
+    /// 128 values (`SiteTy::reads`, a K-quant; `wide[l]`, [`wide_q8`]) quantizes
+    /// that input on both arms, from inputs that already differ by the
+    /// stream's error `e`. Two round-to-nearest quantizations of step `d`
+    /// differ by `e` plus whole steps where `e` crosses a rounding edge: over
+    /// a uniform position in the step, `e² + d²·f(1 − f)`, `f` the fractional
+    /// part of `|e|/d`, so at most `e² + d²/4`. The `e²` is the stream's
+    /// error the layers already carry; `d²/4` is 3 times `d²/12`, the
+    /// one-sided rounding's variance, and `d²/12` at 128 values is (2q)²
+    /// (the crest at most √128 = 2·√32): 12 per quantized input, in q² as
+    /// above. Such a block's input reaches the stream through the gate and
+    /// up (2.64 · 12 = 31.68) and its SwiGLU rows through the down (12):
+    /// 43.68, for a dense block in place of its 3.64 and for a routed
+    /// layer's shared expert in place of its 0. It is a bound at the largest
+    /// crest, far above what the mechanism adds at the fixture's crests. The
+    /// routed experts' stacks (K-quants in every GLM file, the fixture's
+    /// included) read q8_1 blocks of 128 on both arms too and are not
+    /// counted: a routed block stays at its 0 above, so a file whose dense
+    /// blocks and shared experts are q8_0 keeps the bands above. The GLM
+    /// fixture's glmffnkq variant (2 dense blocks and 4 shared experts of
+    /// Q6_K gate·up and Q5_K down) has the head at
+    /// q·√(4·4.1875 + 2·3 + 6·43.68) = 0.217.
+    fn gemm_bands(kinds: &[Layer], wide: &[[bool; 2]]) -> Bands {
         let q = q8_32_rel();
         let mut c = 0.0f64;
         let (mut stores, mut stream) = (Vec::new(), Vec::new());
-        for k in kinds {
+        for (k, &[gate_up, down]) in kinds.iter().zip(wide) {
             let (store, mixer) = if k.mixer == MixerKind::Latent {
                 (1.0, 3.0)
             } else {
@@ -5503,12 +5602,58 @@ mod gate {
             };
             stores.push(q * (c + store).sqrt());
             c += mixer;
-            if k.ffn == FfnKind::Dense {
-                c += 3.64;
-            }
+            let dense = k.ffn == FfnKind::Dense;
+            c += match (gate_up, dense) {
+                (true, _) => 2.64 * WIDE_Q8,
+                (false, true) => 2.64,
+                (false, false) => 0.0,
+            };
+            c += match (down, dense) {
+                (true, _) => WIDE_Q8,
+                (false, true) => 1.0,
+                (false, false) => 0.0,
+            };
             stream.push(q * c.sqrt());
         }
         Bands { stores, stream }
+    }
+
+    /// [`gemm_bands`]' term for one input both arms quantize to q8_1 blocks
+    /// of 128 values, in q²: `d²/4` with `d²/12` = (2q)².
+    const WIDE_Q8: f64 = 12.0;
+
+    /// Per layer, whether its dense block's (a dense layer) or shared
+    /// expert's (a routed layer) gate·up and down read q8_1 blocks of 128
+    /// values on both arms ([`SiteTy::reads`]), from the file's types. A
+    /// dense tensor not in the file is refused by name; a routed layer with
+    /// no shared expert reads none.
+    fn wide_q8(file: &Split, kinds: &[Layer]) -> Result<Vec<[bool; 2]>, GateError> {
+        let reads = |name: String, need: bool| -> Result<bool, GateError> {
+            match file.find(&name) {
+                Some((_, info)) => {
+                    Ok(SiteTy::of_ggml(info.ty).is_some_and(|t| t.reads() == Form::Q8x128))
+                }
+                None if need => Err(format!("{name}: not in the file").into()),
+                None => Ok(false),
+            }
+        };
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(l, k)| {
+                if k.ffn == FfnKind::Dense {
+                    Ok([
+                        reads(names::ffn_gate(l), true)?,
+                        reads(names::ffn_down(l), true)?,
+                    ])
+                } else {
+                    Ok([
+                        reads(names::ffn_gate_shexp(l), false)?,
+                        reads(names::ffn_down_shexp(l), false)?,
+                    ])
+                }
+            })
+            .collect()
     }
 
     /// PIN(2026-10-02): a flip between the GEMM batch's routing and the
@@ -6142,7 +6287,8 @@ mod gate {
         } = chunk_calls(m, &ids, &after)?;
         elapsed("(pb) chunk calls", &t);
         ok &= chunks_ok;
-        let bands = gemm_bands(&m.body("prompt batch")?.kinds());
+        let kinds = m.body("prompt batch")?.kinds();
+        let bands = gemm_bands(&kinds, &wide_q8(&glm5next_tier::open()?, &kinds)?);
         let bias = biases(m)?;
         println!(
             "prompt batch: the GEMM bands: stores at layers 0..=4 {:.3e} {:.3e} {:.3e} {:.3e} \

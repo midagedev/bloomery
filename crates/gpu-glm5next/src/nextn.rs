@@ -55,6 +55,7 @@ use bloomery_gpu::latent::{
 };
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel};
+use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockPlan, enqueue_block};
 use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -67,7 +68,8 @@ use runtime::sched::{At, Overlap, Port, PortKind};
 
 use super::WHAT as BODY;
 use super::prefill::PromptState;
-use super::{Body, Dims, Kernels, LANES, RowScratch, Scratch, f32t, f32v, gemv, weight};
+use super::{Body, Dims, Kernels, LANES, RowScratch, Scratch, f32t, f32v, weight};
+use crate::ffn::block_names;
 use crate::mla::{self, LatentStore};
 use crate::tensors::{FfnNames, LatentNames, LayerNames, MixerNames};
 
@@ -274,10 +276,45 @@ pub struct Nextn {
     /// The shared expert's SwiGLU limit, and whether the file holds the
     /// router's selection bias.
     limit: f32,
+    /// The shared expert's launches by its file's types, and its width.
+    block: BlockPlan,
+    block_ff: usize,
     bias: bool,
     /// Positions of this sequence the store holds: the end of its last walk.
     held: usize,
     ctx: usize,
+}
+
+/// The shared expert's plan and width of the NextN layer `nextn` describes,
+/// read from `file`'s header before any upload; the layer's own block is a
+/// routed one (the load refuses another kind by name).
+pub(super) fn block_plan(
+    file: &Split,
+    inputs: &PlanInputs,
+    nextn: &NextnInputs,
+    n: usize,
+) -> Result<(BlockPlan, usize), GpuError> {
+    let spec = inputs
+        .spec
+        .mtp
+        .first()
+        .ok_or_else(|| shape("the file's description has no next-token layer".to_string()))?;
+    let Ffn::Moe(moe) = &spec.ffn else {
+        return Err(shape(format!(
+            "layer {}: a routed block without its routing",
+            nextn.index
+        )));
+    };
+    let shared = moe.shared.ok_or_else(|| {
+        shape(format!(
+            "layer {}: a routed block without its shared expert",
+            nextn.index
+        ))
+    })?;
+    let ln = LayerNames::of(nextn.index, Layer::of(spec))?;
+    let ff = shared.ff as usize;
+    let plan = BlockPlan::of_file(file, BODY, block_names(&ln), (ff, n))?;
+    Ok((plan, ff))
 }
 
 impl Nextn {
@@ -404,6 +441,7 @@ impl Nextn {
         d: &Dims,
         (ctx, slots): (usize, usize),
         card_dontneed: bool,
+        (block, block_ff): (BlockPlan, usize),
     ) -> Result<Nextn, GpuError> {
         let index = nextn.index;
         let spec =
@@ -486,6 +524,12 @@ impl Nextn {
                 moe.router.bias
             )));
         }
+        block.check_resident(
+            &w,
+            BODY,
+            [&names.sh_gate, &names.sh_up, &names.sh_down],
+            (block_ff, d.embd),
+        )?;
         let head = Head::with_norm(gpu, tw, d.rms_eps, 1, HeadNorm::Mixed)?;
         if head.hidden() != d.embd {
             return Err(shape(format!(
@@ -502,11 +546,13 @@ impl Nextn {
             latent: DeviceTensor::zeroed(stream, ctx, LATENT)?,
             index_rows: DeviceTensor::zeroed(stream, ctx, INDEX_ROW)?,
             pooled: DeviceTensor::zeroed(stream, pools_for(ctx), INDEX_HEAD)?,
-            s: RowScratch::new(stream, d, shared.ff as usize, ctx)?,
+            s: RowScratch::new(stream, d, (shared.ff as usize, ctx), [(block, block_ff)])?,
             a: Arena::new(stream, n, d.stack())?,
             pair0: DeviceBuffer::zeroed(stream, HC_STREAMS * n)?,
             head,
             limit: shared.act.swiglu_limit(),
+            block,
+            block_ff,
             bias: moe.router.bias,
             held: 0,
             ctx,
@@ -1019,6 +1065,8 @@ impl Body {
             a,
             head,
             limit,
+            block,
+            block_ff,
             bias,
             held,
             index,
@@ -1202,15 +1250,19 @@ impl Body {
                 &row.rout.ids,
                 key,
             )?;
-            k.experts.enqueue_shexp_gate_up(
-                stream,
-                weight(w, &nm.sh_gate)?,
-                weight(w, &nm.sh_up)?,
-                &a.normed,
-                *limit,
-                &mut row.h,
-            )?;
-            gemv(gpu, w, &nm.sh_down, &row.h, &mut row.sh_y)?;
+            let blk = Block {
+                plan: *block,
+                names: [&nm.sh_gate, &nm.sh_up, &nm.sh_down],
+                ff: *block_ff,
+                limit: *limit,
+                layer: *index,
+            };
+            let io = BlockIo {
+                x: &a.normed,
+                h: &mut row.h,
+                y: &mut row.sh_y,
+            };
+            enqueue_block(gpu, w, &k.block_kernels(), &mut row.block, &blk, io)?;
             leg.serve(at)?;
             gpu.elem()
                 .enqueue_add(stream, leg.hsum(), &row.sh_y, n, &mut a.moe)?;

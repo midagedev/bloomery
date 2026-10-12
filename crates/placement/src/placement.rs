@@ -311,10 +311,11 @@ pub enum Device {
 pub enum CardFormat {
     /// The file's rows as they are stored, their byte stream as u32 words,
     /// zero-padded at its end to `rows · ceil(words / rows)` words: every
-    /// q3_K/q4_K/q5_K/q6_K tensor, and a routed q5_1, q8_0, iq3_xxs, iq4_xs,
-    /// iq4_nl or mxfp4 stack a
+    /// q3_K/q4_K/q5_K/q6_K tensor, and a routed q5_1, q8_0, iq3_xxs, iq3_s,
+    /// iq4_xs, iq4_nl or mxfp4 stack a
     /// program's card experts read in the file's `block_q5_1`, `block_q8_0`,
-    /// `block_iq3_xxs`, `block_iq4_xs`, `block_iq4_nl` or `block_mxfp4`
+    /// `block_iq3_xxs`, `block_iq3_s`, `block_iq4_xs`, `block_iq4_nl` or
+    /// `block_mxfp4`
     /// bytes (a program's [`RoutedFormat`] names it; [`CardFormat::of`] keeps
     /// q5_1 in [`CardFormat::Q5_1`] and q8_0 in [`CardFormat::Q8_0Planes`]).
     /// The kernels address a row by its byte offset in the stream, so a row
@@ -457,7 +458,7 @@ impl CardFormat {
     /// a K-quant ([`CardFormat::of_role`]'s engram gain),
     /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
     /// uses, or [`CardFormat::KQuant`] for q5_1, q8_0, iq2_xs, iq3_xxs,
-    /// iq4_xs, iq4_nl and mxfp4, the file's blocks,
+    /// iq3_s, iq4_xs, iq4_nl and mxfp4, the file's blocks,
     /// which only a program's [`RoutedFormat`] picks.
     #[must_use]
     pub fn holds(self, ty: GgmlType) -> bool {
@@ -471,6 +472,7 @@ impl CardFormat {
                         | GgmlType::Q8_0
                         | GgmlType::IQ2_XS
                         | GgmlType::IQ3_XXS
+                        | GgmlType::IQ3_S
                         | GgmlType::IQ4_XS
                         | GgmlType::IQ4_NL
                         | GgmlType::MXFP4
@@ -837,6 +839,11 @@ pub struct HostTotals {
     /// arena's floor ([`ArenaFloor`]). Beside the plan's own bytes: the
     /// arena is the tier's memory, not a segment.
     pub nvme_arena_bytes: u64,
+    /// The columns of the widest call the arena's floor counts
+    /// ([`ArenaFloor::of`]): the resident slots a load steps as one pass,
+    /// capped at the step port's width, set by the plan's maker before the
+    /// split runs; 1 for a plan that steps one column.
+    pub arena_columns: u64,
     /// Row-gathered tables held on the host.
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
@@ -865,6 +872,46 @@ pub struct HostTotals {
     /// expert tier split ([`expert_nvme_tier`]), the room the split read less
     /// the arena and the plan's host need, since the room binds there.
     pub headroom_bytes: i128,
+    /// The host room the plan was made at: the reading it took and the
+    /// room it was held to ([`workstation::plan_room`], the reading less
+    /// [`workstation::HOST_DRIFT`]); `None` for a plan made without one.
+    pub room: Option<(u64, u64)>,
+}
+
+impl HostTotals {
+    /// Counts `slots` resident sequences stepped as one pass of one row each
+    /// into the arena's floor: their columns, to the step port's `port`
+    /// width. Refused by name: no slot, or a port of no column.
+    pub fn step_slots(&mut self, slots: usize, port: usize) -> Result<(), PlacementError> {
+        if slots == 0 || port == 0 {
+            return Err(PlacementError::Metadata {
+                key: "the NVMe tier arena's columns".to_string(),
+                detail: format!("{slots} slots over a step port of {port} columns"),
+            });
+        }
+        self.arena_columns = slots.min(port) as u64;
+        Ok(())
+    }
+
+    /// The room a plan with the host room `room` is made at, which this
+    /// plan then names ([`HostTotals::room`]): the one caller of
+    /// [`workstation::plan_room`] for a plan's tiers.
+    pub fn plan_at(&mut self, room: &(u64, workstation::HostRead)) -> u64 {
+        let planned = workstation::plan_room(room);
+        self.room = Some((room.0, planned));
+        planned
+    }
+
+    /// The load's refusal names the room its plan was made at, so a report
+    /// shows how far the reading fell between the plan and the load:
+    /// `"; the plan was made at a reading of R B (plan room P B)"`, empty
+    /// for a plan made without a host room.
+    #[must_use]
+    pub fn room_clause(&self) -> String {
+        self.room.map_or_else(String::new, |(read, planned)| {
+            format!("; the plan was made at a reading of {read} B (plan room {planned} B)")
+        })
+    }
 }
 
 /// The placement of one model on one machine.
@@ -940,8 +987,10 @@ pub enum PlacementError {
          beside the routed experts {base} B + 3 × the heaviest layer's host-served experts \
          {layer} B: two layers' transient reads and one layer's resident experts{least}), the \
          plan's need being {need} B: free host memory, or load by a placement whose cards hold \
-         more of the model",
-        least = least_term(.arena.as_ref())
+         more of the model; a room read from the host is the reading less {drift} B, the host \
+         bytes the load's own start may take",
+        least = least_term(.arena.as_ref()),
+        drift = workstation::HOST_DRIFT
     )]
     HostRoomFloor {
         room: u64,
@@ -2617,11 +2666,10 @@ impl HostLayer {
 /// which the arena's crate holds equal to it at compile time).
 pub const ARENA_ALIGN: u64 = 4096;
 
-/// The columns of the widest call a load steps on a plan whose host experts
-/// page through the arena: one, the one-column rule's
-/// (`bloomery_levers::paged_columns`). A path that steps more columns asks
-/// [`ArenaFloor::of`] for its own.
-pub const ARENA_COLUMNS: u64 = 1;
+/// The step port's width: the columns past it do not enter the arena's floor
+/// ([`HostTotals::step_slots`]). The model crate's `ops::DEFER_MAX_COLS`
+/// holds it equal, by a compile-time assertion in the gpu crate's tier.
+pub const STEP_PORT_COLUMNS: usize = 8;
 
 /// The slots of a paged layer one residency lane holds at once beside the
 /// step's call: `4 + 1`. Four are open reads: each lane thread pins the slot
@@ -2719,14 +2767,14 @@ impl ArenaFloor {
         })
     }
 
-    /// `plan`'s floor for calls of `columns` columns: `k` the model's
-    /// routed width, the lane slots where a stage card holds a routed
+    /// `plan`'s floor for calls of [`HostTotals::arena_columns`] columns: `k`
+    /// the model's routed width, the lane slots where a stage card holds a routed
     /// expert, and the slot set over every layer whose routed stacks the
     /// host leg serves (a host or an NVMe segment) — on a plan the split
     /// has not run on yet, the layers it can page, a bound over the ones it
     /// does, so the arena's carve at load never falls under the slots the
     /// dial sized it for.
-    pub fn of(plan: &Plan<'_>, columns: u64) -> Result<ArenaFloor, PlacementError> {
+    pub fn of(plan: &Plan<'_>) -> Result<ArenaFloor, PlacementError> {
         let model = plan.model;
         let mut slot_set = 0u64;
         for r in &plan.rows {
@@ -2750,7 +2798,12 @@ impl ArenaFloor {
         } else {
             0
         };
-        ArenaFloor::new(model.experts_used, columns, lane_slots, slot_set)
+        ArenaFloor::new(
+            model.experts_used,
+            plan.host.arena_columns,
+            lane_slots,
+            slot_set,
+        )
     }
 }
 
@@ -2762,7 +2815,7 @@ pub fn arena_slots(plan: &Plan<'_>) -> Result<u64, PlacementError> {
     if arena == 0 {
         return Ok(0);
     }
-    let set = ArenaFloor::of(plan, ARENA_COLUMNS)?.slot_set;
+    let set = ArenaFloor::of(plan)?.slot_set;
     arena
         .checked_div(set)
         .ok_or_else(|| PlacementError::Metadata {
@@ -3019,7 +3072,7 @@ pub fn expert_nvme_tier(
         heavy,
         held,
         need: need.bytes(),
-        least: ArenaFloor::of(plan, ARENA_COLUMNS)?,
+        least: ArenaFloor::of(plan)?,
     };
     let arena = nvme_arena_of(&dial, given)?;
     let room = room - arena;
@@ -3181,6 +3234,7 @@ fn totals<'a>(
             .sum(),
         nvme_expert_bytes: nvme_experts,
         nvme_arena_bytes: 0,
+        arena_columns: 1,
         table_bytes: host_tables,
         shadow_bytes,
         reserve_bytes,
@@ -3191,6 +3245,7 @@ fn totals<'a>(
             0
         },
         headroom_bytes: 0,
+        room: None,
     };
     // The room the machine's figure leaves past the plan's host need, the
     // need's own arithmetic (`HostNeed`).

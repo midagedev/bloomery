@@ -52,9 +52,9 @@
 //! plan with no host expert loads the whole model on the plan's card when the
 //! whole-fit verdict takes it; any other runs the step graph through the
 //! host tier (a plan with no host expert whose whole load does not fit runs
-//! it with nothing to serve) and every prompt as eager passes of up to eight
-//! ids (`app::Prompt for Body` takes passes at every length on a placed
-//! load), no pass captured.
+//! it with nothing to serve) and every prompt as eager units through the
+//! host tier's batch port (`app::Prompt for Body`: the wide units from
+//! `GEMM_FROM` rows on a placed load, passes below), no pass captured.
 //!
 //! With `--place` unset the model opens as `generate_qwen3moe` opens it,
 //! on `a`'s card, the largest visible card: the whole file while the
@@ -91,8 +91,11 @@
 //! `Slot35` — its K/V planes, its delta layers' recurrent states and conv
 //! rings, its held count and its checkpoints). `--parallel` naming no
 //! count, the seat serves one slot beside a set `--ctx` (the flag is one
-//! request's context, `placement::ctx::slots_of`; one line on stderr says so) and its
-//! default two over the auto choice. Under more slots than one the context
+//! request's context, `bind::slots_of`; one line on stderr says so) and its
+//! default two over the auto choice; when the load of the default's second slot is
+//! refused the seat plans one and says so (`bind::default_slots_fit`: one stderr line
+//! and `from=fit` on the `parallel` line), a count the flags set is never lowered.
+//! Under more slots than one the context
 //! is split across them
 //! as llama-server splits it with `-np N` and no `-kvu`: the `--ctx` the
 //! flags named (or, when unset, the default slot context times N) is the
@@ -171,8 +174,8 @@ use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, note_line,
-    parallel_line, slots_given,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, default_slots_fit,
+    note_line, parallel_line, slots_given,
 };
 use bloomery_gpu_gates::generate::{CTX_GRAN, Place};
 use bloomery_gpu_gates::record::{self, Record};
@@ -328,7 +331,7 @@ struct Args {
     cache_type_k: Option<String>,
     /// `--parallel`: the slots the server serves, resident sequences on
     /// either file's load; `None` takes one slot beside a set `--ctx`, else
-    /// the default 2 ([`model::placement::ctx::slots_of`]).
+    /// the default 2 (`bind::slots_of`).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// The image-input flags: `--mmproj` is the encoder file whose images a
@@ -361,7 +364,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: None,
         place: None,
         cache_type_k: None,
-        // `None` resolves through `placement::ctx::slots_of`: one slot beside a set
+        // `None` resolves through `bind::slots_of`: one slot beside a set
         // `--ctx` (the flag is one request's context), else the fixed
         // default 2, not an elastic one — the second slot is a resident
         // sequence the context split bounds (no byte budget to size it
@@ -732,40 +735,7 @@ struct Q3<B: Body3> {
     stats: bool,
     /// The resident image encoder under `--mmproj` ([`open_encoder`]).
     #[cfg(feature = "vision")]
-    vision: Option<Vision>,
-}
-
-/// The resident image encoder of `--mmproj`: its tower on the card the plan seated it
-/// ([`vision_seat::open_tower`]), the stream its readbacks run on and the model's image input
-/// the server renders and expands image parts by ([`Seat::media_model`]).
-#[cfg(feature = "vision")]
-struct Vision {
-    tower: Box<dyn bloomery_gpu_vision::Tower>,
-    stream: Arc<cuda_core::CudaStream>,
-    /// The width of a row: the text model's embedding, which the tower writes.
-    n_embd: usize,
-    media: vision_seat::SharedMedia,
-}
-
-#[cfg(feature = "vision")]
-impl Vision {
-    /// Every feed's image encoded on the tower and read back as bf16, one row a cell of its grid
-    /// and nothing around them ([`vision_seat::merged_cells`]): the tokens carry the
-    /// delimiters. All in one pair of buffers, each span's positions and rows as ranges of
-    /// them ([`vision_seat::span_rows`]).
-    fn span_rows(&mut self, feeds: &[MediaFeed]) -> Result<vision_seat::SpanRows<()>, GateError> {
-        vision_seat::span_rows(
-            &mut *self.tower,
-            &self.stream,
-            feeds.iter().map(|f| vision_seat::Image {
-                at: f.at,
-                patches: &f.prepared.patches,
-                span_len: f.prepared.span_len,
-            }),
-            self.n_embd,
-            vision_seat::merged_cells,
-        )
-    }
+    vision: Option<vision_seat::Resident>,
 }
 
 impl<B: Body3> Q3<B> {
@@ -835,33 +805,21 @@ impl<B: Body3> Q3<B> {
     }
 }
 
-/// The resident image encoder of `--mmproj` ([`Vision`]), its tower loaded on the card the plan
-/// seated ([`vision_seat::open_tower`]); the `vision` record that follows the load names the
-/// card, which of the two seats it is and the tower's bytes.
+/// The resident image encoder of `--mmproj` ([`vision_seat::Resident`]), its tower loaded on the
+/// card the plan seated; the `vision` record that follows the load names the card, which of the
+/// two seats it is and the tower's bytes.
 #[cfg(feature = "vision")]
 fn open_encoder<B: Body3>(
     s: &app::Session<B>,
     at: Option<Opened>,
-) -> Result<Option<Vision>, GateError> {
+) -> Result<Option<vision_seat::Resident>, GateError> {
     let Some(v) = at else {
         return Ok(None);
     };
     let t = Instant::now();
-    let (stream, tower) = vision_seat::open_tower(s.model().gpu().context(), &v)?;
-    vision_seat::record(
-        &v.seat,
-        (tower.weight_bytes(), tower.scratch_bytes()),
-        vision_seat::ScratchHome::Own,
-        v.cap,
-        t.elapsed().as_secs_f64(),
-    )
-    .eprint();
-    Ok(Some(Vision {
-        n_embd: tower.out_dim(),
-        tower,
-        stream,
-        media: v.media,
-    }))
+    let resident = vision_seat::Resident::open(s.model().gpu().context(), &v)?;
+    resident.announce(&v, vision_seat::ScratchHome::Own, t);
+    Ok(Some(resident))
 }
 
 impl<B: Body3> Seat for Q3<B> {
@@ -877,24 +835,28 @@ impl<B: Body3> Seat for Q3<B> {
         <B as Body3>::prompt(self.s.model_mut(), ids)
     }
 
-    /// The resident encoder's media description ([`Vision::media`]); `None` without `--mmproj`,
-    /// a seat that takes no image.
+    /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
+    /// without `--mmproj`, a seat that takes no image.
     #[cfg(feature = "vision")]
     fn media_model(&self) -> Option<SharedMediaModel> {
-        self.vision.as_ref().map(|v| v.media.clone())
+        self.vision.as_ref().map(vision_seat::Resident::media)
     }
 
-    /// Each feed's image encoded on the resident encoder and read back as bf16
-    /// ([`Vision::span_rows`]), then one prompt call with the images spliced in
-    /// ([`Body3::prompt_media`]), the model's card bound back between the two
-    /// ([`vision_seat::on_encoder_card`]).
+    /// Each feed's image encoded on the resident encoder and read back as bf16, one row a cell of
+    /// its grid and nothing around them ([`vision_seat::merged_cells`]: the tokens carry the
+    /// delimiters; [`vision_seat::Resident::merged_rows`]), then one prompt call with the images
+    /// spliced in ([`Body3::prompt_media`]), the model's card bound back between the two.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
-        let vision_seat::SpanRows { rows, ats, .. } =
-            vision_seat::on_encoder_card(self.s.model().gpu().context(), || v.span_rows(feeds))?;
+        let vision_seat::SpanRows { rows, ats, .. } = v.merged_rows(
+            self.s.model().gpu().context(),
+            feeds
+                .iter()
+                .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
+        )?;
         // Each span borrows its own range of the call's one buffer of rows; its grid is the
         // image's merged-token plan, `nx` along a line (the width).
         let images: Vec<Placed<'_>> = ats
@@ -1150,7 +1112,8 @@ fn slot_ctx(ctx: usize, parallel: usize) -> Result<usize, GateError> {
 
 /// What `--mmproj` opened for the plans: the encoder file held against the text model's
 /// embedding width, its vocabulary's image ids and its IMROPE sections, and seated
-/// ([`vision_seat::open_seat`]); `None` without `--mmproj`. A qwen3moe file (Qwen3-30B-A3B)
+/// ([`vision_seat::open_seat`]); the file is `--mmproj`'s, else the `--hf` repo's projector
+/// ([`vision_seat::Flags::encoder`]), and `None` without either. A qwen3moe file (Qwen3-30B-A3B)
 /// has no image input, so `--mmproj` there is refused by name, and so is a build without the
 /// `vision` feature, whose tower is not built.
 fn vision_of(
@@ -1185,9 +1148,10 @@ fn vision_of(
         imrope: Some(hp.rope_sections),
         ple: PleImage::Absent,
     };
+    let file = a.vision.encoder(true)?;
     vision_seat::open_seat(
         &a.vision,
-        a.vision.mmproj()?,
+        file.as_deref(),
         a.place.unwrap_or(Place::A),
         &[vision::arch::qwen3vl::PROJECTOR_TYPE],
         &facts,
@@ -1240,48 +1204,77 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     )?;
     // The slot count before the context it sizes: a set `--ctx` with no
     // `--parallel` is one request's context — one slot at the whole of it
-    // (`placement::ctx::slots_of`).
+    // (`bind::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, 2)?;
+    // A projector the `--hf` repo picked stays only where the load gives the text model the same
+    // experts and context with its reserve as without ([`vision_seat::kept`]).
+    let vision = vision_seat::kept(vision, &a.vision, |v| {
+        let ctx = match a.ctx {
+            Some(c) => c,
+            None => slots * default_ctx(&split, arch, a.place, slots, &levers, (kv, v))?.ctx,
+        };
+        let plan_levers = PlanLevers::from_levers(&levers)?;
+        let cost_ctx = u64::try_from(ctx)?;
+        Ok(
+            match decide(&split, arch, ctx, (a.place, &plan_levers), slots, (kv, v))? {
+                Q3Load::Whole(_) | Q3Load::Placed { whole: Some(_), .. } => {
+                    vision_seat::Cost::whole(cost_ctx)
+                }
+                Q3Load::Placed { q, total, .. } => {
+                    vision_seat::Cost::of(&q.plan(total, &plan_levers)?, cost_ctx)
+                }
+            },
+        )
+    })?;
     // The common unset rule, once, on one census reading: the load below
     // still takes `a`'s card (`PlaceQ3::unplaced_on`), the rule's own pick
     // for a body with no tier card; its `place unset` record is printed here.
     let census = gpu_census::census()?;
-    q3place::choose(a.place, &census)?.record().eprint();
-    // A set `--ctx` is the total the slots split; the default is a slot's
-    // context, the load's total the slots of it.
-    let ctx = match a.ctx {
-        Some(c) => c,
-        None => {
-            let found = default_ctx(&split, arch, a.place, slots, &levers, (kv, vision.as_ref()))?;
-            eprintln!("{}", found.line(slots));
-            // The `ctx` line's words stay the rule's; the reserve the
-            // search counted is named on a line of its own.
-            let (_, encoder) = images_of(vision.as_ref());
-            eprintln!(
-                "{NAME}: --ctx defaults to {} positions a slot, {} in all{}",
-                found.ctx,
-                slots * found.ctx,
-                encoder_words(encoder)
-            );
-            slots * found.ctx
-        }
-    };
-    // Resident slots on both files: the model loads with a slot's share and
-    // parks the rest of the slots after its captures.
-    let slot_ctx = slot_ctx(ctx, slots)?;
-    // What the file loads as is decided here, once, at the total: the open
-    // makes no fit call of its own (`decide`).
-    let load = decide(
-        &split,
-        arch,
-        ctx,
-        (a.place, &PlanLevers::from_levers(&levers)?),
-        slots,
-        (kv, vision.as_ref()),
-    )?;
-    if matches!(arch, Arch::Qwen35moe) {
-        q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
-    }
+    let chosen = q3place::choose(a.place, &census)?;
+    chosen.record().eprint();
+    // The context and the load of `slots` slots, the plans a second slot can
+    // refuse: the default's second slot that the load refuses falls to one
+    // slot (`from=fit`); a count the flags set is never lowered.
+    let ((slot_ctx, load), slots, from) =
+        default_slots_fit(NAME, chosen.place.name(), slots, from, |slots| {
+            // A set `--ctx` is the total the slots split; the default is a slot's
+            // context, the load's total the slots of it.
+            let ctx = match a.ctx {
+                Some(c) => c,
+                None => {
+                    let found =
+                        default_ctx(&split, arch, a.place, slots, &levers, (kv, vision.as_ref()))?;
+                    eprintln!("{}", found.line(slots));
+                    // The `ctx` line's words stay the rule's; the reserve the
+                    // search counted is named on a line of its own.
+                    let (_, encoder) = images_of(vision.as_ref());
+                    eprintln!(
+                        "{NAME}: --ctx defaults to {} positions a slot, {} in all{}",
+                        found.ctx,
+                        slots * found.ctx,
+                        encoder_words(encoder)
+                    );
+                    slots * found.ctx
+                }
+            };
+            // Resident slots on both files: the model loads with a slot's share and
+            // parks the rest of the slots after its captures.
+            let slot_ctx = slot_ctx(ctx, slots)?;
+            // What the file loads as is decided here, once, at the total: the open
+            // makes no fit call of its own (`decide`).
+            let load = decide(
+                &split,
+                arch,
+                ctx,
+                (a.place, &PlanLevers::from_levers(&levers)?),
+                slots,
+                (kv, vision.as_ref()),
+            )?;
+            if matches!(arch, Arch::Qwen35moe) {
+                q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
+            }
+            Ok::<_, GateError>((slot_ctx, load))
+        })?;
     // The shape of a round of several slots, from the load's body
     // ([`Q3Load::placed_body`]); the open holds the opened body to it.
     let placed = load.placed_body();

@@ -144,6 +144,10 @@ pub fn host_only_reason(ty: GgmlType) -> Option<String> {
 struct Beside<'a> {
     reserve: u64,
     mtp: Option<&'a MtpInputs>,
+    /// The resident sequences the load steps as one pass; the plan's NVMe
+    /// tier arena is floored for their columns
+    /// ([`placement::HostTotals::step_slots`]).
+    slots: usize,
 }
 
 impl<'a> Beside<'a> {
@@ -154,7 +158,11 @@ impl<'a> Beside<'a> {
 
     /// A plan with no draft, `reserve` bytes set aside.
     const fn reserve(reserve: u64) -> Self {
-        Beside { reserve, mtp: None }
+        Beside {
+            reserve,
+            mtp: None,
+            slots: 1,
+        }
     }
 
     /// A plan of a load that carries `mtp`, `reserve` bytes set aside.
@@ -162,7 +170,13 @@ impl<'a> Beside<'a> {
         Beside {
             reserve,
             mtp: Some(mtp),
+            slots: 1,
         }
+    }
+
+    /// The same plan for a load that serves `slots` resident sequences.
+    const fn slots(self, slots: usize) -> Self {
+        Beside { slots, ..self }
     }
 }
 
@@ -193,6 +207,9 @@ pub struct PlanInputs {
     /// tier; the routed experts the room still cannot hold follow it there
     /// ([`placement::expert_nvme_tier`]). A gate that plans an arm by a room
     /// of its own sets it, read [`HostRead::Given`].
+    ///
+    /// The plan is made at [`workstation::plan_room`]: a read room less
+    /// [`workstation::HOST_DRIFT`], a given room as given.
     pub room: (u64, HostRead),
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
@@ -442,7 +459,7 @@ impl PlanInputs {
             ctx_max,
             levers,
             experts,
-            Beside::reserve(rows),
+            Beside::reserve(rows).slots(slots),
             &kv,
         )?;
         // The bytes a sequence holds beside its stores ride the card's kv
@@ -567,8 +584,11 @@ impl PlanInputs {
             )?,
         };
         let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
-        placement::row_table_tier(&mut plan, self.room.0, floor, UBATCH_PLANNED)?;
-        placement::expert_nvme_tier(&mut plan, self.room.0, self.arena)?;
+        let room = plan.host.plan_at(&self.room);
+        placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
+        plan.host
+            .step_slots(beside.slots, placement::STEP_PORT_COLUMNS)?;
+        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         Ok(plan)
     }
 
@@ -792,7 +812,7 @@ impl PlanInputs {
                 ctx_max,
                 levers,
                 experts,
-                Beside::draft(rows, mtp),
+                Beside::draft(rows, mtp).slots(slots),
                 &kv,
             )?;
             plan.cards[0].grow_kv(rows);
@@ -818,7 +838,7 @@ impl PlanInputs {
             ctx_max,
             levers,
             experts,
-            Beside::draft(reserve + rows, mtp),
+            Beside::draft(reserve + rows, mtp).slots(slots),
             &kv,
         )?;
         plan.cards[0].grow_kv(rows);
@@ -2894,13 +2914,15 @@ mod tests {
                 slots,
             };
             let levers = PlanLevers::default();
+            // The want steps its slots as one pass, as the plan under test
+            // does: the host totals count them as the arena floor's columns.
             let mut plan = inputs
                 .target_of(
                     machine,
                     CTX,
                     &levers,
                     Experts::Host,
-                    Beside::reserve(reserve + rows),
+                    Beside::reserve(reserve + rows).slots(slots as usize),
                     &kv,
                 )
                 .expect("the target's plan");

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GENERAL_ARCHITECTURE, GgmlType, Split, Value};
 
-use super::{Row, check, custom_q, expand, override_kv, parse_table, row};
+use super::{Row, Scope, check, custom_q, expand, override_kv, parse_table, row};
 use crate::fixture::{FixtureError, KEY_VARIANT};
 
 const TABLE_ROW: &str = "v1\tfam\ttrunk\tffn_gate_exps=iq3_s ffn_up_exps=iq3_s ffn_down_exps=iq4_xs\tgate-a gate-b\ta reason";
@@ -214,13 +214,30 @@ fn the_table_parses_and_refuses_by_name() {
     bad("v1\tfam\ttrunk\tx=q4_K", &["4 columns"]);
     bad(&format!("{TABLE_ROW}\n{TABLE_ROW}"), &["v1", "twice"]);
     bad("V1\tfam\ttrunk\ta=q4_K\tg\tr", &["lower-case"]);
-    bad("v1\tfam\tall\ta=q4_K\tg\tr", &["scope"]);
+    bad(
+        "v1\tfam\tpool\ta=q4_K\tg\tr",
+        &["scope", "`trunk` or `all`"],
+    );
+    let all = parse_table("v1\tfam\tall\ta=q4_K\tg\tr").expect("an all-scope row");
+    assert_eq!(all[0].scope, Scope::All);
     bad("v1\tfam\ttrunk\ta=q9_9\tg\tr", &["q9_9"]);
     bad("v1\tfam\ttrunk\ta\tg\tr", &["not role=type"]);
     bad("v1\tfam\ttrunk\ta=q4_K a=q5_K\tg\tr", &["twice"]);
     bad("v1\tfam\ttrunk\t\tg\tr", &["not empty"]);
     bad("v1\tfam\ttrunk\ta=q4_K\t\tr", &["not empty"]);
     bad("v1\tfam\ttrunk\ta=q4_K\tg\t ", &["not empty"]);
+}
+
+/// The shipped table is the one `fixture variant-rules` reads: every row parses, with each map word a type ggml names.
+#[test]
+fn the_shipped_table_parses() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/fixture-variants.tsv"
+    ))
+    .expect("tools/fixture-variants.tsv");
+    let rows = parse_table(&text).expect("the shipped table parses");
+    assert!(!rows.is_empty(), "the shipped table has no row");
 }
 
 /// A map reaches the trunk layers' tensors of its roles in the source's order, and the NextN layer keeps its types.
@@ -248,11 +265,32 @@ fn a_map_expands_to_the_trunk_tensors() {
     assert_eq!((got[2].from, got[2].to), (GgmlType::Q5_K, GgmlType::IQ4_XS));
 }
 
+/// The `all` scope reaches the NextN layer's tensors of the map's roles too, in the source's order; `trunk` leaves them.
+#[test]
+fn the_all_scope_reaches_the_nextn_layer() {
+    let d = Dir::new();
+    let src = open(&write(&d.0, "s", &source_kvs(), &source_tensors(), 2));
+    let all = Row {
+        scope: Scope::All,
+        ..the_row()
+    };
+    let names: Vec<String> = expand(&all, &src)
+        .expect("an expansion")
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    let want: Vec<String> = [1, 2, 3]
+        .into_iter()
+        .flat_map(|l| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| tn(l, r)))
+        .collect();
+    assert_eq!(names, want);
+}
+
 /// A row that changes nothing, names nothing, names another family or cannot be held is refused by name.
 #[test]
 fn a_map_that_bites_nothing_is_refused() {
     let d = Dir::new();
-    let src = open(&write(&d.0, "s", &source_kvs(), &source_tensors(), 1));
+    let src = open(&write(&d.0, "s", &source_kvs(), &source_tensors(), 2));
     let with = |map: &[(&str, GgmlType)]| Row {
         map: map.iter().map(|(r, t)| ((*r).to_string(), *t)).collect(),
         ..the_row()
@@ -263,7 +301,10 @@ fn a_map_that_bites_nothing_is_refused() {
     );
     red(
         expand(&with(&[("ffn_gate_exps", GgmlType::Q4_K)]), &src),
-        &[&tn(1, "ffn_gate_exps"), "already q4_K"],
+        &[
+            &format!("{}, {}", tn(1, "ffn_gate_exps"), tn(2, "ffn_gate_exps")),
+            "already at q4_K",
+        ],
     );
     red(
         expand(&with(&[("attn_q", GgmlType::IQ3_S)]), &src),
@@ -290,6 +331,36 @@ fn a_map_that_bites_nothing_is_refused() {
     red(
         expand(&the_row(), &carried),
         &[KEY_VARIANT, "the family's own fixture"],
+    );
+}
+
+/// A tensor already at the map's type, beside another of its role that is not, is left out of the
+/// expansion; the quantizer's argument keeps it at its own type.
+#[test]
+fn a_tensor_already_at_the_type_is_left_out() {
+    let d = Dir::new();
+    let mut tensors = source_tensors();
+    let two = tn(2, "ffn_down_exps");
+    let at = tensors
+        .iter()
+        .position(|t| t.name == two)
+        .expect("layer 2's down");
+    tensors[at] = t(two.clone(), &[256, 2, 3], GgmlType::IQ4_XS, 1, 8);
+    let src = open(&write(&d.0, "s", &source_kvs(), &tensors, 2));
+    let got = expand(&the_row(), &src).expect("an expansion");
+    let names: Vec<&str> = got.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        names.contains(&tn(1, "ffn_down_exps").as_str()),
+        "layer 1's down is retyped"
+    );
+    assert!(
+        !names.contains(&two.as_str()),
+        "layer 2's down is already iq4_xs: {names:?}"
+    );
+    let arg = custom_q("v1", &src, &got).expect("an argument");
+    assert!(
+        arg.contains(&format!("^{}$=iq4_xs", two.replace('.', "\\."))),
+        "layer 2's down at its own type in {arg}"
     );
 }
 

@@ -1,8 +1,7 @@
 //! GPU gate for GLM-5.3-Flash's attach of the NVMe expert tier (the split dial's arena, `Body::open_placed`'s host run
 //! through the common `host_run`): the five clauses of `shared/nvtier_family.rs` (`plan`, `attach`, `bits`, `refuse`,
-//! `residency`) on the gate placement — the `iq4xs` fixture variant in the fixture tier (`tools/fixture-variants.tsv`:
-//! the X-post's type map on a small file, every routed layer on the host), planned under its header's card budget — a
-//! paged arm against an all-RAM arm on the same file, the residency off.
+//! `residency`) on the gate placement, planned under the header's card budget — a paged arm against an all-RAM arm on
+//! the same file, the residency off.
 //!
 //! Each arm's host room and arena reach the plan through `PlanInputs` (`room`, `arena`), so the gate sets no
 //! environment: the all-RAM arm's room is the plan's need, the paged arm's is the split's floor F (read off the
@@ -17,8 +16,10 @@
 //!
 //! Tiers: every clause is self-consistency (the arms and the plan's own numbers), so it runs on a fixture and on the
 //! real file alike, except on a fixture that keeps no more than one routed layer on the host (the plain fixture): the
-//! clauses that read the paged experts are left to the real tier by name (`no-host-layer`, [`tier::host_clause`]),
-//! and the `iq4xs` variant, whose routed layers all stay on the host, runs them.
+//! clauses that read the paged experts are left to the real tier by name (`no-host-layer`, [`tier::host_clause`]). A
+//! variant whose routed layers the card reads (`iq4xs`, `q2kxl`) is refused by name there, and one whose four routed
+//! layers all stay on the host pages nothing at this gate's arena (the floor, which holds three times the heaviest
+//! layer's host-served experts, and the arena pass the all-RAM arm's room), so no variant lists this gate.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {

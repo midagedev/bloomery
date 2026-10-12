@@ -7,7 +7,7 @@
 //! A table row is `tag<TAB>family<TAB>scope<TAB>map<TAB>recipes<TAB>why`. The map is `role=type`
 //! words: `role` is a tensor name between `blk.<L>.` and `.weight`, `type` a ggml type name. The scope
 //! `trunk` is every layer but the NextN one (the layer that holds `nextn.*` tensors), which keeps the
-//! source's types.
+//! source's types; `all` is every layer, the NextN one included.
 //!
 //! The quantizer picks a type for every tensor it sees, so the argument names every tensor of the
 //! source by its exact name: the map's tensors at their new type, every other at its own, which the
@@ -35,6 +35,8 @@ const QUANTIZER_KEY_PREFIX: &str = "quantize.imatrix.";
 pub enum Scope {
     /// Every layer but the NextN one.
     Trunk,
+    /// Every layer, the NextN one included.
+    All,
 }
 
 /// One row of the table.
@@ -132,10 +134,11 @@ pub fn parse_table(text: &str) -> Result<Vec<Row>, FixtureError> {
         }
         let scope = match *scope {
             "trunk" => Scope::Trunk,
+            "all" => Scope::All,
             other => {
                 return Err(err(
                     tag,
-                    format!("line {at}: scope {other:?} is not `trunk`"),
+                    format!("line {at}: scope {other:?} is not `trunk` or `all`"),
                 ));
             }
         };
@@ -229,8 +232,10 @@ fn row_bytes(ty: GgmlType, dims: &[u64]) -> Option<u64> {
 ///
 /// # Errors
 /// The source is of another architecture than the row's family; a role no tensor of the scope has; a
-/// tensor already at the type the map gives it (a row that changes nothing is a mistake); a tensor the
-/// type cannot hold (its rows are not whole blocks).
+/// role whose every tensor in the scope is already at the type the map gives it (a row that changes
+/// nothing is a mistake); a tensor the type cannot hold (its rows are not whole blocks). A tensor of a
+/// role already at the map's type, beside others of the role that are not, is left out: the quantizer
+/// copies it as it is, as the source's own mix of types for that role holds it.
 pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
     let tag = &row.tag;
     if source.architecture() != Some(row.family.as_str()) {
@@ -256,22 +261,18 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
     for (role, to) in &row.map {
         let want = format!("{role}.weight");
         let mut found = 0usize;
+        let mut already = Vec::new();
         for (_, t) in source.iter_tensors() {
             let Some((layer, rest)) = layer_of(&t.name) else {
                 continue;
             };
-            if rest != want || nextn.contains(&layer) {
+            if rest != want || (row.scope == Scope::Trunk && nextn.contains(&layer)) {
                 continue;
             }
             found += 1;
             if t.ty == *to {
-                return Err(err(
-                    tag,
-                    format!(
-                        "tensor {}: the source is already {to}, the map changes nothing",
-                        t.name
-                    ),
-                ));
+                already.push(t.name.as_str());
+                continue;
             }
             if row_bytes(*to, &t.dims).is_none() {
                 return Err(err(
@@ -292,8 +293,19 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
             return Err(err(
                 tag,
                 format!(
-                    "the map names {role}, and the source has no blk.<L>.{want} outside the NextN \
-                     layer {nextn:?}"
+                    "the map names {role}, and the source has no blk.<L>.{want} in scope {:?} \
+                     (the NextN layers are {nextn:?})",
+                    row.scope
+                ),
+            ));
+        }
+        if already.len() == found {
+            return Err(err(
+                tag,
+                format!(
+                    "the source holds every blk.<L>.{want} in scope already at {to} ({}), the map \
+                     changes nothing",
+                    already.join(", ")
                 ),
             ));
         }

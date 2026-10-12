@@ -709,7 +709,7 @@ mod gate {
     }
 
     fn load_image(hp: &Hparams, name: &str) -> Result<Img, GateError> {
-        let patches = preprocess(&read_image(name)?, &hp.size_rule()?)?;
+        let patches = preprocess(&read_image(name)?, &hp.size_rule_at(hp.default_limits()?)?)?;
         let grid = (patches.n_vit_h, patches.n_vit_w);
         Ok(Img { patches, grid })
     }

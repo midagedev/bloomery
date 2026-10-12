@@ -11,8 +11,8 @@
 //! ([`TierAct::F32`]), a column a position: the gate·up `_sel` reads the
 //! q8_1 planes of Walk A, which the stage card makes in the shadow after the
 //! go, and the tier quantizes the same values with the same kernel. The
-//! page's row carries up to [`VERIFY_ROWS`] columns: the step's one and a
-//! verify's `Cols(m)`.
+//! page's row carries the step port's columns ([`TierSide38::new`]): the
+//! step's one, a verify's `Cols(m)` and a pass of several slots' rows.
 //!
 //! The tier's own layer ([`Tier38`], the architecture's [`TierExperts`]) is
 //! the stage card's card leg over the tier's stacks ([`SelRun`]: the q8_1 of
@@ -43,7 +43,7 @@
 use super::card38::{LegLayer, SelRun, leg_layers};
 use super::plan38::geo;
 use super::scratch::{f32_view, param_view};
-use super::scratch38::{ROUTE_ROWS, VERIFY_ROWS};
+use super::scratch38::ROUTE_ROWS;
 use super::swap38::Qwen38Stacks;
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
@@ -72,7 +72,7 @@ pub(super) const STAGE_TIER: usize = 0;
 
 /// The stage card's side of the tier layers: the slot map's tier view (a row
 /// of places per layer at the card copy's row offsets), the unit's tier
-/// places of its routed slots (ten a column, [`VERIFY_ROWS`] columns), and
+/// places of its routed slots (ten a column, the step port's columns), and
 /// per layer the experts the tier holds. Built once at load by a body with a
 /// tier card.
 pub(super) struct TierSide38 {
@@ -82,9 +82,10 @@ pub(super) struct TierSide38 {
 }
 
 impl TierSide38 {
-    /// The side for `map`'s tier [`STAGE_TIER`] over its layers. Load-time
-    /// only.
-    pub(super) fn new(gpu: &Gpu, map: &SlotMap) -> Result<TierSide38, GpuError> {
+    /// The side for `map`'s tier [`STAGE_TIER`] over its layers, its places
+    /// for `cols` columns (the step port's, which the tier card's page
+    /// carries too). Load-time only.
+    pub(super) fn new(gpu: &Gpu, map: &SlotMap, cols: usize) -> Result<TierSide38, GpuError> {
         let stream = gpu.stream();
         let run = map.layers();
         let k = run
@@ -98,7 +99,7 @@ impl TierSide38 {
                 run.len(),
                 map.n_expert(),
             )?,
-            tsel: DeviceBuffer::zeroed(stream, VERIFY_ROWS * geo::N_USED)?,
+            tsel: DeviceBuffer::zeroed(stream, cols * geo::N_USED)?,
             k,
         })
     }
@@ -133,8 +134,8 @@ impl TierSide38 {
 
 /// The Qwen3.8 tier card's computation ([`TierExperts`]): per tier layer the
 /// stage card's card-leg launches over the tier's stacks into the row's
-/// routed rows (module doc). Its scratch, for up to [`VERIFY_ROWS`]
-/// columns, is made at load.
+/// routed rows (module doc). Its scratch, for up to the step port's columns,
+/// is made at load.
 pub(super) struct Tier38 {
     run: SelRun,
     /// Per layer of the model, the tier's experts and stacks; `None` off
@@ -420,7 +421,8 @@ impl Tier38 {
     /// The tier's computation on `gpu` over `set`, whose stacks `w` holds
     /// (each tier layer's routed gate, up and down with its experts in tier
     /// slot order), each layer's types as `stacks` lists them, for a model of
-    /// `layers` layers; its block route for blocks of up to `cols` columns in
+    /// `layers` layers; its card leg's scratch for `step_cols` columns, the
+    /// step port's; its block route for blocks of up to `cols` columns in
     /// `reserve`, the plan's block scratch for the tier. A tier
     /// layer whose stacks are absent, of a type the leg does not run or of
     /// other rows than its experts', and a layer off the tier with resident
@@ -431,6 +433,7 @@ impl Tier38 {
         stacks: &Qwen38Stacks,
         set: &TierSet,
         layers: usize,
+        step_cols: usize,
         (cols, reserve): (usize, usize),
     ) -> Result<Tier38, GpuError> {
         let run = set.layers();
@@ -450,7 +453,7 @@ impl Tier38 {
         counts.sort_unstable();
         counts.dedup();
         Ok(Tier38 {
-            run: SelRun::new(gpu, VERIFY_ROWS)?,
+            run: SelRun::new(gpu, step_cols)?,
             block: BlockRoute38::new(gpu, cols, counts, reserve)?,
             layers: per,
         })
@@ -518,12 +521,12 @@ impl TierExperts for Tier38 {
 /// set the map's rows of that tier, Qwen3.8's tier computation over them
 /// (each layer's types as `stacks` lists them, `layers` layers, the plan's
 /// block route's columns and the plan's block scratch `block`), its page rows
-/// one of [`VERIFY_ROWS`] columns;
+/// one of `step_cols` columns, the step port's;
 /// `card_dontneed` as for the stage card's segments. The stage card's
 /// context is current again on return. Load-time only.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the stage card, the file, the plan, the tier and its index, the map, the stacks' types, the layers, the block scratch and the page lever (rust-quality R8)"
+    reason = "the stage card, the file, the plan, the tier and its index, the map, the stacks' types, the layers, the step port's columns, the block scratch and the page lever (rust-quality R8)"
 )]
 pub(super) fn open_tier(
     stage: &Gpu,
@@ -533,6 +536,7 @@ pub(super) fn open_tier(
     map: &SlotMap,
     stacks: &Qwen38Stacks,
     layers: usize,
+    step_cols: usize,
     block: (usize, usize),
     card_dontneed: bool,
 ) -> Result<TierCard, GpuError> {
@@ -549,7 +553,7 @@ pub(super) fn open_tier(
     let gpu = Gpu::open_card(&t.name, t.device)?;
     let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
     let set = TierSet::of_map(map, tier)?;
-    let experts = Tier38::new(&gpu, &w, stacks, &set, layers, block)?;
+    let experts = Tier38::new(&gpu, &w, stacks, &set, layers, step_cols, block)?;
     let card = TierCard::open_cols(
         gpu,
         t.name.clone(),
@@ -562,7 +566,7 @@ pub(super) fn open_tier(
             rows: 1,
             act: TierAct::F32,
         },
-        VERIFY_ROWS,
+        step_cols,
     )?;
     stage.context().bind_to_thread()?;
     Ok(card)

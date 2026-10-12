@@ -12,6 +12,8 @@
 //! - [`body`]: the load, the stores, the step's buffers and [`body::Body`]
 //!   behind `GpuModel`;
 //! - `program`: the step's walk and its host leg's port;
+//! - `body::slots`: the pass of several slots' rows, one walk over their
+//!   columns;
 //! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps;
 //! - `attn`: the attention sub-layer;
 //! - `ffn`: the dense block and the routed block around its host leg;

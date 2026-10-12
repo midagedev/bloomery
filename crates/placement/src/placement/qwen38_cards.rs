@@ -14,17 +14,17 @@ use bloomery_levers::{Residency38Pick, Residency38Why, residency38_at_plan};
 use gguf::GgmlType;
 
 use super::churn::ChurnPool;
-use super::ctx::{CtxError, within_cache};
+use super::ctx::{CtxError, NVME_SLACK_DIV, RULE_FIT, RULE_MARGIN, within_cache};
 use super::workstation::{
-    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HostNeed, HostRead,
-    MARGIN, MIB, PLAN_ROOM, Pick, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
-    census_usable, host, host_of, resolve, tier_batch_host_bytes, tier_batch_staging_bytes,
-    unified_of,
+    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
+    HostRead, MARGIN, MIB, PLAN_ROOM, Pick, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+    TIER_BATCH_RESERVE, census_usable, host, host_of, plan_room, resolve, tier_batch_host_bytes,
+    tier_batch_staging_bytes, unified_of,
 };
 use super::{
-    ARENA_ALIGN, ARENA_COLUMNS, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, CardFormat, Device,
-    KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role,
-    nvme_arena_of, plan_routed_reserving,
+    ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, CardFormat, Device, KvBytes,
+    Machine, ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, nvme_arena_of,
+    plan_routed_reserving,
 };
 use crate::slots::{SeqTerms, Stores};
 
@@ -362,6 +362,22 @@ fn plan_given<'a>(
     room: u64,
     split: Option<Option<u64>>,
 ) -> Result<Plan<'a>, PlacementError> {
+    let plan = planned(model, machine, ctx, slots, room, split)?;
+    let broken = plan.violations();
+    assert!(broken.is_empty(), "ctx {ctx} slots {slots}: {broken:?}");
+    Ok(plan)
+}
+
+/// [`plan_given`]'s plan before its invariants are read: what a seat's
+/// probe does with a plan that breaks one (it is refused at that context).
+fn planned<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx: u64,
+    slots: u64,
+    room: u64,
+    split: Option<Option<u64>>,
+) -> Result<Plan<'a>, PlacementError> {
     let terms = SeqTerms {
         layers: Stores {
             kv: &Kv38,
@@ -376,11 +392,13 @@ fn plan_given<'a>(
     let mut plan = plan_routed_reserving(model, machine, ctx, &kv, &levers, card_routed, rows)?;
     super::row_table_tier(&mut plan, room, 2 * state38(ctx, false), UBATCH_PLANNED)?;
     if let Some(given) = split {
+        plan.host.step_slots(
+            usize::try_from(slots).expect("slots"),
+            super::STEP_PORT_COLUMNS,
+        )?;
         super::expert_nvme_tier(&mut plan, room, given)?;
     }
     plan.cards[0].grow_kv(rows);
-    let broken = plan.violations();
-    assert!(broken.is_empty(), "ctx {ctx} slots {slots}: {broken:?}");
     Ok(plan)
 }
 
@@ -753,7 +771,7 @@ fn dial_of(twin: &Plan<'_>, room: u64) -> ArenaDial {
             .expect("layers"),
         held: twin.host.expert_bytes,
         need: need.bytes(),
-        least: ArenaFloor::of(twin, ARENA_COLUMNS).expect("the arena's floor"),
+        least: ArenaFloor::of(twin).expect("the arena's floor"),
     }
 }
 
@@ -1026,6 +1044,104 @@ fn a_paged_plans_load_check_counts_the_arena() {
     assert!(!text.contains("NVMe tier arena"), "{text}");
 }
 
+/// A deep split fills its room, so a plan made at the host's reading itself
+/// passes the load's check only while the reading holds. A plan made at
+/// [`plan_room`] of a read room keeps the drift margin and passes the check
+/// at a reading the process's own start has lowered by less than that
+/// margin.
+#[test]
+fn a_read_rooms_plan_holds_at_a_lowered_reading() {
+    const READ: u64 = 27_631_529_984;
+    const LOWERED: u64 = READ - 132_071_424;
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let room = plan_room(&(READ, HostRead::MemAvailable));
+    let plan = plan_at(&q4, &gate, 16384, 1, room).expect("the deep split plan");
+    let need = HostNeed::of(&plan, 0);
+    assert!(need.arena > 0, "the room is a deep split's");
+    assert_eq!(need.check(LOWERED), Ok(()));
+}
+
+/// A room the caller gave plans as given: the plan at [`plan_room`] of a
+/// given room is the plan at that room.
+#[test]
+fn a_given_room_plans_as_given() {
+    const GIVEN: u64 = 27_631_529_984;
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let room = plan_room(&(GIVEN, HostRead::Given));
+    assert_eq!(room, GIVEN);
+    let at = plan_at(&q4, &gate, 16384, 1, room).expect("the plan at the given room");
+    let direct = plan_at(&q4, &gate, 16384, 1, GIVEN).expect("the plan at the room");
+    assert_eq!(format!("{at:?}"), format!("{direct:?}"));
+}
+
+/// An unpaged plan keeps the drift margin too. The default context grows
+/// while no expert goes to the NVMe tier ([`super::ctx::default_slot_ctx`]),
+/// so a plan made at the reading itself ends with its need at the reading,
+/// and a load whose reading fell by a little less than the margin is
+/// refused with no arena to shrink. A plan made at [`plan_room`] of the
+/// reading pages the context whose need passes the margin, which stops the
+/// search a margin under the reading.
+#[test]
+fn an_unpaged_plans_search_stops_a_margin_under_the_reading() {
+    // The reading the load took less than the plan's, as a second host
+    // reported it.
+    const SHORT: u64 = 162_668_544;
+    // A room under the PLE table and over the experts: the table is on the
+    // NVMe tier already, as in the reporter's plan (tables 0), and no
+    // expert is.
+    const WHOLE: u64 = 70 << 30;
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let whole = plan_given(&q4, &gate, 4096, 1, WHOLE, Some(None)).expect("the plan at 4096");
+    assert_eq!(whole.host.table_bytes, 0, "the table is off the host");
+    assert_eq!(whole.host.nvme_expert_bytes, 0, "the room pages no expert");
+    let need = HostNeed::of(&whole, 0).bytes();
+    assert!(need < WHOLE, "the room holds the experts whole");
+
+    // A plan made at the reading itself fills it, and its load is refused.
+    let at_reading =
+        plan_given(&q4, &gate, 4096, 1, need, Some(None)).expect("the plan at its need");
+    assert_eq!(
+        at_reading.host.nvme_expert_bytes, 0,
+        "the reading holds it whole"
+    );
+    let filled = HostNeed::of(&at_reading, 0);
+    assert_eq!(filled.bytes(), need);
+    assert!(filled.check(need - SHORT).is_err(), "no arena to shrink");
+
+    // The plan at the reading's plan room pages, so the search stops there,
+    // and its load passes the lowered reading.
+    let room = plan_room(&(need, HostRead::MemAvailable));
+    let kept =
+        plan_given(&q4, &gate, 4096, 1, room, Some(None)).expect("the plan at the plan room");
+    assert!(
+        kept.host.nvme_expert_bytes > 0,
+        "the context passes the margin: it pages"
+    );
+    assert_eq!(HostNeed::of(&kept, 0).check(need - SHORT), Ok(()));
+}
+
+/// A plan names the room it was made at: the reading and the plan room, a
+/// read room's less the drift margin and a given room's as given; a plan
+/// made with no host room names none and adds nothing to the load's refusal.
+#[test]
+fn a_plan_names_the_room_it_was_made_at() {
+    const READ: u64 = 27_631_529_984;
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let mut plan = plan_given(&q4, &gate, 4096, 1, PLAN_ROOM, None).expect("the plan");
+    assert_eq!(plan.host.room, None);
+    assert_eq!(plan.host.room_clause(), "");
+    let planned = plan.host.plan_at(&(READ, HostRead::MemAvailable));
+    assert_eq!(planned, READ - HOST_DRIFT);
+    assert_eq!(plan.host.room, Some((READ, planned)));
+    assert_eq!(
+        plan.host.room_clause(),
+        format!("; the plan was made at a reading of {READ} B (plan room {planned} B)")
+    );
+    let given = plan.host.plan_at(&(READ, HostRead::Given));
+    assert_eq!(plan.host.room, Some((READ, given)));
+    assert_eq!(given, READ);
+}
+
 /// The seat's prompt-cache budget counts the arena once: `HostNeed::bytes`
 /// carries it, and `CacheRam::of_tier` no longer subtracts it by hand, so
 /// the budget's terms are the same bytes as the old by-hand subtraction —
@@ -1127,16 +1243,16 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
     }
 }
 
-/// The serving seats' one-column rule reads the plan's RAM arena
+/// The serving seats' paged rule reads the plan's RAM arena
 /// (`bloomery_levers::paged_columns`): the 3090 gate plan at a 27 GiB room
 /// pages its host experts through an arena at the seat's default two slots
-/// and at one, so the default falls to one column and `--parallel 2` is
-/// refused; at 40 GiB (over half the host leg, under its need) the tier
+/// and at one, so the default falls to one slot and `--parallel 2` is served
+/// as asked; at 40 GiB (over half the host leg, under its need) the tier
 /// pages experts with no arena (the mapping path), and the plan serves as
 /// asked — the serve gate's two rooms.
 #[test]
-fn the_one_column_rule_reads_the_arena() {
-    use bloomery_levers::{Paged, PagedAt, SlotsBy, paged_columns};
+fn the_paged_rule_reads_the_arena() {
+    use bloomery_levers::{Paged, PagedAt, paged_columns};
     let (q4, gate) = (model(false), machine_a(RTX_3090));
     let arena = |slots: u64, room: u64| {
         let plan = plan_at(&q4, &gate, 4096, slots, room).expect("the plan");
@@ -1145,7 +1261,7 @@ fn the_one_column_rule_reads_the_arena() {
     let at = |arena, slots, slots_set: bool| PagedAt {
         arena,
         slots,
-        slots_by: slots_set.then_some(SlotsBy::Parallel),
+        slots_set,
         together: true,
         draft: false,
         draft_set: false,
@@ -1156,15 +1272,48 @@ fn the_one_column_rule_reads_the_arena() {
     assert!(moved2 > 0 && deep2 > 0 && moved1 > 0 && deep1 > 0);
     assert_eq!(
         paged_columns(&at(deep2, 2, false)),
-        Ok(Paged::OneColumn { slots: 1 })
+        Ok(Paged::Reduced { slots: 1 })
     );
     assert_eq!(paged_columns(&at(deep1, 1, false)), Ok(Paged::AsAsked));
-    assert!(paged_columns(&at(deep2, 2, true)).is_err());
+    assert_eq!(paged_columns(&at(deep2, 2, true)), Ok(Paged::AsAsked));
     let (moved, shallow) = arena(2, 40 << 30);
     println!("40 GiB: two slots NVMe experts {moved} B, arena {shallow} B");
     assert!(moved > 0, "the 40 GiB room pages experts");
     assert_eq!(shallow, 0, "through the mapping, no arena");
     assert_eq!(paged_columns(&at(shallow, 2, true)), Ok(Paged::AsAsked));
+}
+
+/// The arena's floor counts a column a slot, to the step port's width: the
+/// paged gate plan at plans of 1, 2, 3, 4, 8 and 9 slots holds 37, 37, 37,
+/// 45, 85 and 85 slots a layer (`k = 10` ids a column beside the 5 lane
+/// slots, against the union's `2 × 16 + 5`), the dial's arena at least the
+/// floor.
+#[test]
+fn the_arena_floor_counts_the_plans_slots() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    for (slots, columns, want) in [
+        (1_u64, 1_u64, 37_u64),
+        (2, 2, 37),
+        (3, 3, 37),
+        (4, 4, 45),
+        (8, 8, 85),
+        (9, 8, 85),
+    ] {
+        let plan = plan_at(&q4, &gate, 1024, slots, 27 << 30).expect("the plan");
+        let floor = ArenaFloor::of(&plan).expect("the floor");
+        assert_eq!(
+            (floor.columns, floor.slots),
+            (columns, want),
+            "{slots} slots: {floor}"
+        );
+        assert_eq!(floor.bytes, want * floor.slot_set, "{slots} slots");
+        assert!(
+            plan.host.nvme_arena_bytes >= floor.bytes,
+            "{slots} slots: the arena {} B holds the floor {} B",
+            plan.host.nvme_arena_bytes,
+            floor.bytes
+        );
+    }
 }
 
 /// A host of 58 GiB (a 64 GB machine's room): the room covers over half the
@@ -1307,7 +1456,7 @@ fn a_room_that_leaves_under_the_floors_slots_is_refused_by_name() {
         }
     }
     let at = plan_at(&q4, &gate, 4096, 1, floor + least.bytes).expect("the floor's own room");
-    let carve = ArenaFloor::of(&at, ARENA_COLUMNS).expect("the split plan's floor");
+    let carve = ArenaFloor::of(&at).expect("the split plan's floor");
     assert_eq!(at.host.nvme_arena_bytes, least.bytes);
     assert_eq!(
         carve, least,
@@ -1770,5 +1919,103 @@ fn a_spark_defaults_to_the_context_its_prompt_cache_holds() {
             f.q3
         );
         assert!(state(ctx) <= ram, "q3 {}: the state holds the budget", f.q3);
+    }
+}
+
+/// A 12 GB card: 12,288 MiB beside a driver reserve of 774 MiB [assumed: the
+/// reserve at which this file's plan reproduces a 3060 12 GB host's ctx line
+/// to the byte — the line's `fit` and its `base_nvme_expert_bytes`].
+const CARD_12: CardSpec = CardSpec {
+    name: "12 GB",
+    total_bytes: 12_288 * MIB,
+    driver_reserve_bytes: 774 * MIB,
+    device: None,
+    free_bytes: None,
+    held_by: None,
+    integrated: false,
+};
+
+/// The room of the 32 GB host that line was made at [assumed: the reading
+/// less the drift margin, the room the seat's plan is made at].
+const ROOM_32: u64 = 27_294_000_000;
+
+/// The seat's base context a slot (`serve_seats::qwen38::CTX`) and the file's
+/// serving cap (`place::serve_ctx`).
+const SEAT_CTX: usize = 4096;
+const SEAT_CAP: usize = 262_144;
+
+/// The seat's default-context rule over the file's plan on [`CARD_12`] beside
+/// [`ROOM_32`] with no draft, for `slots` resident sequences and the split's
+/// arena `given` (`BLOOMERY_NVTIER_BYTES`): the plan's bytes at each context,
+/// a plan that breaks an invariant refused there.
+fn default_on_12(slots: u64, given: Option<u64>) -> super::ctx::SlotCtx {
+    let (q4, card) = (model(false), machine_a(CARD_12));
+    super::ctx::default_slot_ctx(SEAT_CAP, SEAT_CTX, CTX_STEP, MARGIN, &|ctx| {
+        let plan = planned(&q4, &card, ctx as u64, slots, ROOM_32, Some(given))?;
+        let broken = plan.violations();
+        if !broken.is_empty() {
+            return Err(PlacementError::Metadata {
+                key: "the plan".to_string(),
+                detail: format!("{broken:?}"),
+            });
+        }
+        Ok(super::ctx::ExpertBytes {
+            card: plan.cards[0].expert_bytes,
+            nvme: plan.host.nvme_expert_bytes,
+        })
+    })
+    .expect("the default context")
+}
+
+/// Flash-Next (this file's table) on a 12 GB card beside a 32 GB host pages
+/// most of its experts through the NVMe tier at the base context, and every
+/// deeper context pushes a few more there: the default grows while the extra
+/// paged bytes stay within a hundredth of the base's ([`NVME_SLACK_DIV`]),
+/// where the strict rule kept the base. The card clause cannot bind: at the
+/// base the card holds under 1 GiB of experts. The base's bytes and the fit
+/// are the reporter's, to the byte.
+#[test]
+fn flash_next_on_a_12_gb_card_defaults_past_the_base_when_it_pages() {
+    let one = default_on_12(1, None);
+    assert_eq!(
+        one.base.nvme, 74_413_158_400,
+        "the reported base's paged bytes"
+    );
+    assert_eq!(one.fit, 28_881, "the reported fit");
+    assert!(one.base.card < 1 << 30, "the card clause cannot bind");
+    assert_eq!(one.nvme_bound, one.base.nvme / NVME_SLACK_DIV);
+    assert!(
+        one.chosen.nvme - one.base.nvme <= one.nvme_bound,
+        "{} B paged past the base's {} B",
+        one.chosen.nvme - one.base.nvme,
+        one.base.nvme
+    );
+    assert_eq!((one.rule, one.ctx), (RULE_FIT, one.fit));
+    assert!(
+        one.ctx >= 8192,
+        "a prompt of ~6K tokens and its output fit: {}",
+        one.ctx
+    );
+}
+
+/// The same host's other cells [derived: the plan's bytes at each context
+/// against the bound]: two slots stop at the card's fit, 6,165 positions a
+/// slot, with the bound far from binding; one slot with no arena
+/// (`BLOOMERY_NVTIER_BYTES=0`) pages 608 MB more at its fit against a bound
+/// of 537 MB, so the bound binds at the last step within it.
+#[test]
+fn flash_next_on_a_12_gb_card_stops_at_the_fit_or_the_bound() {
+    for (slots, given, ctx, rule) in [
+        (2, None, 6165, RULE_FIT),
+        (2, Some(0), 6165, RULE_FIT),
+        (1, Some(0), 26_112, RULE_MARGIN),
+    ] {
+        let got = default_on_12(slots, given);
+        assert_eq!(
+            (got.ctx, got.rule),
+            (ctx, rule),
+            "{slots} slots, arena {given:?}"
+        );
+        assert!(got.chosen.nvme - got.base.nvme <= got.nvme_bound);
     }
 }

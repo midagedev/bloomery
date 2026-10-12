@@ -11,7 +11,9 @@
 //! live key count, the cache's key tiles staged once per block), the
 //! residual add, the router in two launches, SwiGLU with the down's
 //! quantizer in one launch (`GemmKernels::enqueue_swiglu_quant`), and the
-//! combine of the down rows with the router weights and the residual.
+//! combine of the down rows with the router weights and the residual. The
+//! attention half is the wide arm's head-128 half ([`wide::neox_128_rows`])
+//! over this arena's buffers.
 //!
 //! Numeric class. Every launch computes a token's values from that token's
 //! inputs alone, so a token's bits do not depend on the ubatch it lands in or
@@ -42,22 +44,27 @@
 //! router logits cut the tokens into blocks of 32 and the prefill flash into
 //! groups of eight, each guarding the last, and every other launch works per
 //! token or per slot.
+//!
+//! A placed load holds the wide arm's arena (`scratch::Arena`) at the placed
+//! units' rows instead ([`Ubatch::placed`]): its units run through the host
+//! tier's batch walk (`placed::BatchWalk`) over that arena, reading the same
+//! prompt image.
 
-use super::body::{ATTN_SCALE, Body, Kernels};
+use super::body::{Body, Kernels};
 use super::dispatch::embed_into;
 use super::experts::CombineArgs;
 pub use super::image::ImageWrite;
-use super::image::PromptImage;
+use super::image::{ImageWindows, PromptImage};
 use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
 use super::plan::{Form, MixerPlan};
 use super::router::RouterOut;
-use super::scratch::{Append128, Dims, KvPlanes, PrefillFlash, f32_view};
+use super::scratch::{Arena, Dims, KvPlanes, f32_view};
+use super::wide::{self, ActsMut, Neox128Rows};
 use crate::flash_gqa::HEAD;
 use crate::gemm::GemmAct32;
 use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
-use crate::site::{self, WideIn, WideKernels};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -297,12 +304,36 @@ pub struct UbPrologue {
     pub last: Option<ImageWrite>,
 }
 
+/// Err unless `pos` is the image's position for the first of `tokens`.
+fn check_start(img: &PromptImage, tokens: &Range<usize>, pos: u32) -> Result<(), GpuError> {
+    let want = u32::try_from(tokens.start)
+        .ok()
+        .and_then(|s| img.pos0.checked_add(s));
+    if want != Some(pos) {
+        return Err(GpuError::state(
+            WHAT,
+            "the ubatch's first position is the image's position for its first token",
+        ));
+    }
+    Ok(())
+}
+
+/// The arena of the GEMM prefill: the whole-card load's own, or a placed
+/// load's units' (the wide arm's, `wide`).
+enum UbRows {
+    /// The whole-card GEMM prefill's arena.
+    Whole(Box<UbArena>),
+    /// A placed load's arena of the placed units' rows, which `placed`'s
+    /// batch walk runs over.
+    Placed(Box<Arena>),
+}
+
 /// The GEMM prefill's resident state: the arena and the prompt image (the
 /// prefill flash is the chain's, [`Kernels`]).
 pub(super) struct Ubatch {
-    a: UbArena,
+    a: UbRows,
     img: PromptImage,
-    /// The ubatch size `U`; the arena holds `min(U, ctx)` rows.
+    /// The ubatch size `U`; a whole-card arena holds `min(U, ctx)` rows.
     size: NonZeroUsize,
     /// The q8 blocks of 32 the arena holds ([`Q32`]), kept for a resize.
     q32: Q32,
@@ -320,10 +351,25 @@ impl Ubatch {
     ) -> Result<Ubatch, GpuError> {
         let size = ubatch_of(u)?;
         Ok(Ubatch {
-            a: UbArena::new(stream, d, u.min(d.ctx), q32)?,
+            a: UbRows::Whole(Box::new(UbArena::new(stream, d, u.min(d.ctx), q32)?)),
             img: PromptImage::new(stream, d.ctx, false)?,
             size,
             q32,
+        })
+    }
+
+    /// A placed load's state: the wide arena `arena` its walks run over (the
+    /// plan's count held, `placed::counted_arena`), ubatches of `u` tokens
+    /// (`1..=UBATCH`, else refused) and an image for a prompt as long as the
+    /// cache. Load-time only.
+    pub(super) fn placed(stream: &CudaStream, arena: Arena, u: usize) -> Result<Ubatch, GpuError> {
+        let size = ubatch_of(u)?;
+        let ctx = arena.dims.ctx;
+        Ok(Ubatch {
+            a: UbRows::Placed(Box::new(arena)),
+            img: PromptImage::new(stream, ctx, false)?,
+            size,
+            q32: Q32::default(),
         })
     }
 
@@ -335,11 +381,18 @@ impl Ubatch {
     /// Reallocate the arena for ubatches of up to `u` (`1..=UBATCH`, else
     /// refused) tokens. The new arena is allocated before the old one is
     /// freed, so a refusal or a failed allocation leaves the old size in
-    /// place. Load-time allocation.
+    /// place. Load-time allocation. A placed load's arena is the plan's
+    /// count and is refused by name.
     pub(super) fn resize(&mut self, stream: &CudaStream, u: usize) -> Result<(), GpuError> {
         let size = ubatch_of(u)?;
-        let d = self.a.dims;
-        self.a = UbArena::new(stream, d, u.min(d.ctx), self.q32)?;
+        let UbRows::Whole(a) = &self.a else {
+            return Err(GpuError::state(
+                WHAT,
+                "a whole-card load (a placed load's arena is the plan's count)",
+            ));
+        };
+        let d = a.dims;
+        self.a = UbRows::Whole(Box::new(UbArena::new(stream, d, u.min(d.ctx), self.q32)?));
         self.size = size;
         Ok(())
     }
@@ -357,14 +410,19 @@ impl Ubatch {
 
     /// Device bytes of the arena and the image.
     pub(super) fn bytes(&self) -> usize {
-        self.a.bytes() + self.img.bytes()
+        let arena = match &self.a {
+            UbRows::Whole(a) => a.bytes(),
+            UbRows::Placed(a) => a.bytes(),
+        };
+        arena + self.img.bytes()
     }
 
     /// Enqueue the ubatch of the image's `tokens`, standing at position `pos`
     /// (the image's position for its first token, else refused): the
     /// embedding rows with their positions and live key counts, the
     /// one-expert table, then every layer. The last layer's output rows stay
-    /// in the arena's `x`.
+    /// in the arena's `x`. A placed load's units run through its batch walk
+    /// ([`Ubatch::placed_unit`]); this is refused by name there.
     pub(super) fn enqueue(
         &mut self,
         c: &UbCtx<'_>,
@@ -372,25 +430,23 @@ impl Ubatch {
         tokens: Range<usize>,
         pos: u32,
     ) -> Result<(), GpuError> {
-        let t = tokens.len();
-        if t > self.a.rows {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("a ubatch of {t} tokens on a {}-row arena", self.a.rows),
-            ));
-        }
-        let want = u32::try_from(tokens.start)
-            .ok()
-            .and_then(|s| self.img.pos0.checked_add(s));
-        if want != Some(pos) {
+        let UbRows::Whole(a) = &mut self.a else {
             return Err(GpuError::state(
                 WHAT,
-                "the ubatch's first position is the image's position for its first token",
+                "a whole-card load (a placed load's units run through its batch walk)",
+            ));
+        };
+        let t = tokens.len();
+        if t > a.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a ubatch of {t} tokens on a {}-row arena", a.rows),
             ));
         }
+        check_start(&self.img, &tokens, pos)?;
         let win = self.img.windows(tokens)?;
         let io = win.io();
-        let (gpu, a) = (c.gpu, &mut self.a);
+        let gpu = c.gpu;
         let stream = gpu.stream();
         embed_into(gpu, c.w, c.k, &io, (&mut a.x, &mut a.pos, &mut a.n_keys))?;
         c.k.gemm
@@ -403,20 +459,47 @@ impl Ubatch {
         Ok(())
     }
 
+    /// A placed load's unit of the image's `tokens`, standing at position
+    /// `pos`: the arena the batch walk runs over and the unit's windows onto
+    /// the image. The unit's first position is the image's position for its
+    /// first token, else refused; a unit past the arena's rows, and a
+    /// whole-card load, are refused by name.
+    pub(super) fn placed_unit(
+        &mut self,
+        tokens: Range<usize>,
+        pos: u32,
+    ) -> Result<(&mut Arena, ImageWindows), GpuError> {
+        let UbRows::Placed(a) = &mut self.a else {
+            return Err(GpuError::state(WHAT, "a placed load's arena"));
+        };
+        let t = tokens.len();
+        if t > a.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a unit of {t} tokens on a {}-row arena", a.rows),
+            ));
+        }
+        check_start(&self.img, &tokens, pos)?;
+        let win = self.img.windows(tokens)?;
+        Ok((&mut **a, win))
+    }
+
     /// Row `t − 1` of the arena's residual: the last token's output after
     /// the last layer, the head's input.
     pub(super) fn last_row(&self, t: usize) -> Result<ManuallyDrop<DeviceBuffer<f32>>, GpuError> {
-        let h = self.a.dims.hidden;
-        if t == 0 || t > self.a.rows {
+        let (x, rows, h) = match &self.a {
+            UbRows::Whole(a) => (&a.x, a.rows, a.dims.hidden),
+            UbRows::Placed(a) => (&a.x, a.rows, a.dims.hidden),
+        };
+        if t == 0 || t > rows {
             return Err(GpuError::shape(
                 WHAT,
-                format!("row {t} of a {}-row arena", self.a.rows),
+                format!("row {t} of a {rows}-row arena"),
             ));
         }
-        // SAFETY: row t − 1 < rows spans `hidden` values inside `x`
-        // (rows · hidden), which stays in place while the window lives (one
-        // copy).
-        Ok(unsafe { f32_view(&self.a.x, (t - 1) * h, h) })
+        // SAFETY: row t − 1 < rows spans `hidden` values inside `x` (rows ·
+        // hidden), which stays in place while the window lives (one copy).
+        Ok(unsafe { f32_view(x, (t - 1) * h, h) })
     }
 }
 
@@ -444,82 +527,11 @@ pub(super) struct UbCtx<'a> {
     pub(super) table: &'a DeviceBuffer<f32>,
 }
 
-/// `x`'s first `t` rows quantized into each form a site of `tys` reads: q8_1
-/// blocks of 128 into `q128`, q8 blocks of 32 into `q32`.
-fn quantize(
-    c: &UbCtx<'_>,
-    x: &DeviceBuffer<f32>,
-    t: usize,
-    (q128, q32): (&mut GemmAct, Option<&mut GemmAct32>),
-    tys: &[SiteTy],
-    sink: FaultSink,
-) -> Result<(), GpuError> {
-    let reads = |f: Form| tys.iter().any(|ty| ty.reads() == f);
-    if reads(Form::Q8x128) {
-        c.gpu.enqueue_quantize_gemm(x, t, q128, sink)?;
-    }
-    if reads(Form::Q8x32) {
-        let a = q32.ok_or(GpuError::state(
-            WHAT,
-            "the ubatch's q8 blocks of 32 (a Q8_0 site reads them)",
-        ))?;
-        c.k.q35(WHAT)?
-            .g32
-            .enqueue_quantize_gemm32(c.gpu.stream(), x, t, a, sink)?;
-    }
-    Ok(())
-}
-
-/// `y = W · x` for the dense site `name` of type `ty`, `rows` rows, over the
-/// ubatch's one-expert table `dense` and its `t` rows: a K-quant straight
-/// through the grouped GEMM over the q8_1 blocks of 128 (the one launch a
-/// chain of K-quant sites loads), any other type through `site::gemm`, which
-/// also needs the 32-value kernels.
-fn project(
-    c: &UbCtx<'_>,
-    (ty, name): (SiteTy, &str),
-    rows: usize,
-    (x, dense): (&WideIn<'_>, &GemmRoute),
-    t: usize,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
-    match ty.gemm_weight() {
-        Some(gw) => k.gemm.enqueue_gemm(
-            gpu.stream(),
-            GemmArgs {
-                ty: gw,
-                w: kq_weight(w, name)?,
-                rows_per_expert: rows,
-                act: x.q128.ok_or(GpuError::state(
-                    WHAT,
-                    "the ubatch's q8_1 blocks of 128 (a K-quant site reads them)",
-                ))?,
-                route: dense,
-                input: GemmInput::PerSlot,
-                y,
-            },
-        ),
-        None => site::gemm(
-            gpu,
-            &WideKernels {
-                gemm: &k.gemm,
-                g32: &k.q35(WHAT)?.g32,
-            },
-            (ty, w, name),
-            rows,
-            x,
-            (dense, GemmInput::PerSlot),
-            t,
-            y,
-        ),
-    }
-}
-
 /// The attention half at `t` rows: `x` in, `ffn_inp = x + attn_output(attn(x))`
 /// out; the ubatch's K/V rows appended to the layer's planes at the rows'
-/// positions. Each projection runs the launch its type picks ([`project`]);
-/// the rows are quantized into the forms those sites read.
+/// positions. The wide arm's head-128 half over this arena's rows
+/// ([`wide::neox_128_rows`]): each projection runs the launch its type
+/// picks, the rows are quantized into the forms those sites read.
 fn attention(
     c: &UbCtx<'_>,
     n: &GqaPlan,
@@ -529,8 +541,6 @@ fn attention(
     p0: usize,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
-    let stream = gpu.stream();
     let d = a.dims;
     if p0 + t > d.ctx {
         return Err(GpuError::shape(
@@ -538,93 +548,51 @@ fn attention(
             format!("rows {p0}..{} past the {}-row cache", p0 + t, d.ctx),
         ));
     }
-    let (q_len, kv_len) = (d.n_head * HEAD, d.n_kv * HEAD);
-    gpu.elem().enqueue_rms_norm(
-        stream,
-        &a.x,
-        f32_gain(w, &n.attn_norm)?,
-        c.eps,
-        d.hidden,
-        t,
-        &mut a.normed,
-    )?;
-    quantize(
-        c,
-        &a.normed,
-        t,
-        (&mut a.act_hid, a.act_hid32.as_mut()),
-        &[n.q_ty, n.k_ty, n.v_ty],
-        sink,
-    )?;
-    let hid = WideIn {
-        q128: Some(&a.act_hid),
-        q32: a.act_hid32.as_ref(),
-        f32: Some(&a.normed),
-    };
-    for (name, ty, rows, y) in [
-        (&n.attn_q, n.q_ty, q_len, &mut a.q),
-        (&n.attn_k, n.k_ty, kv_len, &mut a.k),
-        (&n.attn_v, n.v_ty, kv_len, &mut a.v),
-    ] {
-        project(c, (ty, name), rows, (&hid, &a.dense), t, y)?;
-    }
-    kv.append_128(
-        &k.neox,
-        stream,
-        Append128 {
-            q: &mut a.q,
-            k: &mut a.k,
-            v: &a.v,
-            gq: f32_gain(w, &n.attn_q_norm)?,
-            gk: f32_gain(w, &n.attn_k_norm)?,
-            table: c.table,
-            pos: &a.pos,
-            eps: c.eps,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m: t,
-            fault: sink,
+    let UbArena {
+        x,
+        pos,
+        n_keys,
+        normed,
+        act_hid,
+        act_hid32,
+        q,
+        k,
+        v,
+        attn,
+        act_attn,
+        act_attn32,
+        attn_o,
+        ffn_inp,
+        dense,
+        ..
+    } = a;
+    wide::neox_128_rows(
+        (c.gpu, c.w, c.k),
+        (c.table, c.eps, sink),
+        (n, kv),
+        (&d, t),
+        Neox128Rows {
+            x,
+            pos,
+            n_keys,
+            normed,
+            q,
+            k,
+            v,
+            attn,
+            attn_o,
+            ffn_inp,
+            hid: ActsMut {
+                q128: Some(act_hid),
+                q32: act_hid32.as_mut(),
+            },
+            out: ActsMut {
+                q128: Some(act_attn),
+                q32: act_attn32.as_mut(),
+            },
+            dense,
         },
-    )?;
-    kv.prefill_128(
-        &k.prefill,
-        stream,
-        PrefillFlash {
-            q: &a.q,
-            n_keys: &a.n_keys,
-            scale: ATTN_SCALE,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            t,
-            fault: sink,
-            y: &mut a.attn,
-        },
-    )?;
-    quantize(
-        c,
-        &a.attn,
-        t,
-        (&mut a.act_attn, a.act_attn32.as_mut()),
-        &[n.o_ty],
-        sink,
-    )?;
-    let attn = WideIn {
-        q128: Some(&a.act_attn),
-        q32: a.act_attn32.as_ref(),
-        f32: Some(&a.attn),
-    };
-    project(
-        c,
-        (n.o_ty, &n.attn_output),
-        d.hidden,
-        (&attn, &a.dense),
-        t,
-        &mut a.attn_o,
-    )?;
-    gpu.elem()
-        .enqueue_add(stream, &a.x, &a.attn_o, t * d.hidden, &mut a.ffn_inp)
+    )
 }
 
 /// The routed FFN half at `t` rows: `ffn_inp` in, `ffn_inp + Σ_s w_s ·

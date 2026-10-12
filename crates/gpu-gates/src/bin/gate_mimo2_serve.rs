@@ -26,8 +26,9 @@
 //! hand on a census of two prints `deferred(one card) …` for the two session
 //! clauses. A `deferred(…)` line is a half that did not run, never a pass.
 //!
-//! The seat serves resident slots (`--parallel N`), the routed experts the plan
-//! puts on the card and the rest on the host tier, the prompt fed in batches
+//! The seat serves resident slots (`--parallel N`, two unset), a round of
+//! several as one pass of the busy rows, the routed experts the plan puts on
+//! the card and the rest on the host tier, the prompt fed in batches
 //! (bit for bit the decode steps), and a later request keeps any prefix it
 //! shares with what its slot holds. Every server is `bloomery-serve --model
 //! mimo2 -m <file> …` beside this binary, `BLOOMERY_REF_MODEL` removed from its
@@ -50,14 +51,19 @@
 //! - `plan_only_names_its_default`: `--plan` with no `--place`, `--ctx` or
 //!   `--parallel` exits 0 and prints `place unset` (the word `a`), the plan
 //!   record and the `parallel` line, in that order, and no `load` or
-//!   `listening` record. The plan's `ctx_max` is the seat's default context:
-//!   at least 4096, at most the file's trained context, a multiple of 1024
-//!   or the trained context itself; the plan at that context stands
-//!   (`--ctx <ctx_max> --plan` exits 0 with the same `ctx_max`); and, unless
-//!   it is the trained context, the next step of 1024 does not
-//!   (`--ctx <ctx_max + 1024> --plan` is refused). FAIL-first: a seat that
-//!   defaults to 4096 regardless plans a `ctx_max` whose next step stands,
-//!   and the largest-plan hold is red.
+//!   `listening` record. The `parallel` line is the default's two slots, each
+//!   round one pass of the busy rows: `slots=2 slot_ctx=<ctx_max>
+//!   total=2·ctx_max from=default pass=one`. The plan's `ctx_max` is a slot's
+//!   share of the seat's default context, the total: at least 4096, at most
+//!   the file's trained context, a multiple of 1024 or the trained context
+//!   itself; the plan at that total stands (`--parallel 2 --ctx <total>
+//!   --plan` exits 0 with the same `ctx_max`); and, unless it is the trained
+//!   context, the next step of 1024 does not (`--parallel 2 --ctx <total +
+//!   1024> --plan` is refused). FAIL-first: a seat that defaults to 4096
+//!   regardless plans a total whose next step stands, and the largest-plan
+//!   hold is red; a seat left on turns (`Pass::of(slots, false)`) prints
+//!   `pass=turns`, and one on one slot prints `slots=1`, and the `parallel`
+//!   line hold is red.
 //! - `refusals_before_any_load`: `--ctx 1 --parallel 2` — a split that
 //!   leaves a slot no position — exits non-zero within [`REFUSE_WITHIN`],
 //!   its stderr names the split and no `load` record is printed. On a
@@ -68,15 +74,34 @@
 //!   position is still running at the bound and the clause is red; a tier
 //!   refusal that names another card or tier is red.
 //! - `slots_total_is_planned`: the plan counts every slot's positions. At
-//!   the default context `c` (the first clause's), `--parallel 2 --ctx c
-//!   --plan` exits 0 and its `parallel` line splits it (`slots=2
-//!   slot_ctx=⌊c/2⌋`); `--parallel 2 --ctx c + [`CTX_STEP`]`, a total the
+//!   the one-slot default context `c` (`--parallel 1 --plan`), `--parallel 2
+//!   --ctx c --plan` exits 0 and its `parallel` line splits it (`slots=2
+//!   slot_ctx=⌊c/2⌋ pass=one`); `--parallel 2 --ctx c + [`CTX_STEP`]`, a total the
 //!   one-slot plan refuses, exits non-zero within [`REFUSE_WITHIN`], its
 //!   stderr names the plan's refusal and no `load` record is printed (a file
 //!   whose default is its trained context has no step past it and the second
 //!   half is a named skip). FAIL-first: a seat whose plan counts one slot
 //!   (`plan_with_slots` at one, over a slot's share) loads and is still
 //!   running at the bound; the refusal half is red.
+//!
+//! - `default_second_slot_never_costs_a_load`: the default's second slot is
+//!   dropped, never the load. Two slots over a total hold the stores of one
+//!   slot over it (`KvLayout::layer_bytes` is linear in the positions) and
+//!   the plan counts nothing else a slot (`SeqTerms::beside` is 0; the pass
+//!   buffers sit in the plan's fixed `scratch_bytes` term), so no budget
+//!   refuses the default's two slots where one slot over the same total
+//!   stands: the fall to one slot (`parallel` line `from=fit`,
+//!   `bind::default_slots_fit`, whose unit test holds the branch that falls)
+//!   has no load to show on this model, and the wiring is pinned where it
+//!   ends in a refusal. `--plan` under `BLOOMERY_CARD_BUDGET`
+//!   [`NO_ROOM_BUDGET`], below the card's floor at any slot count: with no
+//!   `--parallel` it exits non-zero with the budget's refusal
+//!   (`PlacementError::CardBudgetFloor`) and one stderr line saying the
+//!   default's second slot did not fit and one slot is served; `--parallel 2`
+//!   at the same budget exits non-zero with the same refusal and no such line
+//!   (a set count is never lowered). FAIL-first: a seat that plans the
+//!   default at two slots with no fall prints no such line, and the first
+//!   half is red.
 //!
 //! One server, `--ctx` [`CTX`], `--parallel 1`, `--port 0`, its answers the one
 //! slot's. It plans at the gate card's bytes: `BLOOMERY_CARD_BUDGET` is
@@ -135,9 +160,14 @@
 //! - `two_slots_decode_as_one_slot_runs`: its `plan` record names the
 //!   one-slot server's `card_experts`, `host_experts` and `n_l` range (the
 //!   same plan), its `load` record `slots=2` and `ctx` [`CTX`], its
-//!   `listening` record `slots=2`, its `parallel` line the split, and its
-//!   resident bytes exceed the one-slot server's by exactly one slot's stores
-//!   (the plan's own count, `KvLayout::bytes` over the layers at [`CTX`]).
+//!   `listening` record `slots=2`, its `parallel` line the split with
+//!   `pass=one`, and its
+//!   resident bytes exceed the one-slot server's by more than one slot's
+//!   stores (the plan's own count, `KvLayout::bytes` over the layers at
+//!   [`CTX`]): a load of two sequences also holds a pass's buffers and the
+//!   card experts' buffers of two rows, which the plan's fixed scratch term
+//!   covers and a load of one sequence does not allocate; the line prints
+//!   that excess.
 //!   Two rounds, each of two requests in flight together at
 //!   `cache_prompt: false` — the batch prompt with the prose prompt, then the
 //!   prose prompt with the batch prompt started first — answer each prompt's
@@ -249,6 +279,9 @@ mod gate {
     const CTX_FLOOR: u64 = 4096;
     const CTX_STEP: u64 = 1024;
 
+    /// The slots a seat with no `--parallel` and no `--ctx` serves.
+    const DEFAULT_SLOTS: u64 = 2;
+
     /// The clauses the child of a census of two or more owes: each prints its
     /// own `check` line, and the parent's verdict needs every one.
     const CHILD_CLAUSES: [&str; 9] = [
@@ -276,6 +309,19 @@ mod gate {
         "--parallel 2 splits it to 0 positions a slot",
         "a slot holds at least one position",
     ];
+
+    /// A card budget under which no plan stands: the card's floor (the dense
+    /// tensors, the stores, the context, the scratch and the margin) passes
+    /// it, at one slot as at two.
+    const NO_ROOM_BUDGET: u64 = 1 << 30;
+
+    /// The words the refusal of a card budget below the card's floor names
+    /// (`PlacementError::CardBudgetFloor`).
+    const BUDGET_REFUSAL: [&str; 2] = ["is below its floor", "KV"];
+
+    /// The line the seat prints when the default's second slot does not fit
+    /// and it serves one slot.
+    const SECOND_SLOT_LINE: &str = "the default's second slot does not fit on --place";
 
     /// The words the plan's refusal of a total the card cannot hold names:
     /// the dense trunk's need, which the KV term counts every slot's stores
@@ -478,18 +524,24 @@ mod gate {
         (within, pin): (Duration, Option<&str>),
     ) -> Result<(Option<ExitStatus>, PathBuf), GateError> {
         let (mut s, d) = spawn_pinned(dir, name, file, args, pin)?;
+        let status = wait_exit(&mut s, within)?;
+        Ok((status, d.join("server.err")))
+    }
+
+    /// `s`'s exit status; a server still running at `within` is stopped and
+    /// gives `None`.
+    fn wait_exit(s: &mut Served, within: Duration) -> Result<Option<ExitStatus>, GateError> {
         let t = Instant::now();
-        let status = loop {
+        loop {
             if let Some(st) = s.child.try_wait()? {
-                break Some(st);
+                return Ok(Some(st));
             }
             if t.elapsed() > within {
                 let _ = s.stop()?;
-                break None;
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(200));
-        };
-        Ok((status, d.join("server.err")))
+        }
     }
 
     /// `--plan` of `args`: its exit status and the log of its stderr.
@@ -627,6 +679,7 @@ mod gate {
             .lines()
             .position(|l| l.starts_with("parallel "))
             .map(|i| i + 1);
+        let parallel_line = text.lines().find(|l| l.starts_with("parallel "));
         let in_order = matches!(
             (&place, &plan, parallel_at),
             (Some(a), Some(b), Some(c)) if a.at() < b.at() && b.at() < c
@@ -648,41 +701,62 @@ mod gate {
         };
         let mut default_ok = false;
         if let Some(c) = ctx_max {
-            let cap = trained.unwrap_or(CTX_FLOOR);
-            let grid = c % CTX_STEP == 0 || Some(c) == trained;
-            let bounded = c >= CTX_FLOOR && c <= cap.max(CTX_FLOOR);
-            println!(
-                "plan only: ctx_max {c} of trained {trained:?}; at least {CTX_FLOOR} and at most the \
-                 trained context {bounded}; a multiple of {CTX_STEP} or the trained context {grid}"
+            // `ctx_max` is a slot's share of the default total.
+            let total = DEFAULT_SLOTS * c;
+            // The default is two slots, each round one pass of the busy rows.
+            let want = format!(
+                "parallel rule=slots slots={DEFAULT_SLOTS} slot_ctx={c} total={total} \
+                 from=default pass=one"
             );
-            // The plan at that context stands: asked for by flag it exits 0
-            // and plans the same context.
-            let c_arg = c.to_string();
-            let (st, at_log, _) = plan_run(dir, "plan-at-default", file, &["--ctx", &c_arg])?;
+            let line_ok = parallel_line == Some(want.as_str());
+            println!("plan only: the parallel line {parallel_line:?} is {want:?} {line_ok}");
+            let cap = trained.unwrap_or(CTX_FLOOR);
+            let grid = total.is_multiple_of(CTX_STEP) || Some(total) == trained;
+            let bounded = total >= CTX_FLOOR && total <= cap.max(CTX_FLOOR);
+            println!(
+                "plan only: total {total} (ctx_max {c} a slot) of trained {trained:?}; at least \
+                 {CTX_FLOOR} and at most the trained context {bounded}; a multiple of {CTX_STEP} \
+                 or the trained context {grid}"
+            );
+            // The plan at that total stands: asked for by flag it exits 0
+            // and plans the same slot context.
+            let slots_arg = DEFAULT_SLOTS.to_string();
+            let total_arg = total.to_string();
+            let (st, at_log, _) = plan_run(
+                dir,
+                "plan-at-default",
+                file,
+                &["--parallel", &slots_arg, "--ctx", &total_arg],
+            )?;
             let stands = st.is_some_and(|s| s.success())
                 && match at_log.first(&record::PLAN)? {
                     Some(p) => p.u64("ctx_max")? == c,
                     None => false,
                 };
             // Past it, the next step does not: the default is the largest
-            // context whose plan stands, unless the file's trained context
+            // total whose plan stands, unless the file's trained context
             // ends the search.
-            let largest = if trained.is_some_and(|t| c + CTX_STEP > t) {
+            let largest = if trained.is_some_and(|t| total + CTX_STEP > t) {
                 println!(
                     "plan only: no step of {CTX_STEP} fits under the trained context past the \
                      default"
                 );
                 true
             } else {
-                let next = (c + CTX_STEP).to_string();
-                let (st, _, _) = plan_run(dir, "plan-past-default", file, &["--ctx", &next])?;
+                let next = (total + CTX_STEP).to_string();
+                let (st, _, _) = plan_run(
+                    dir,
+                    "plan-past-default",
+                    file,
+                    &["--parallel", &slots_arg, "--ctx", &next],
+                )?;
                 let refused = st.is_some_and(|s| !s.success());
                 println!(
-                    "plan only: ctx_max {c} stands {stands}; --ctx {next} is refused {refused}"
+                    "plan only: total {total} stands {stands}; --ctx {next} is refused {refused}"
                 );
                 refused
             };
-            default_ok = bounded && grid && stands && largest;
+            default_ok = line_ok && bounded && grid && stands && largest;
         }
         check(
             ok,
@@ -814,9 +888,9 @@ mod gate {
     /// `slots_total_is_planned` (the module header).
     fn slots_total_is_planned(dir: &Path, file: &Path, ok: &mut bool) -> Result<(), GateError> {
         let trained = trained_ctx(file)?;
-        let (_, log, _) = plan_run(dir, "plan-for-slots", file, &[])?;
+        let (_, log, _) = plan_run(dir, "plan-for-slots", file, &["--parallel", "1"])?;
         let Some(plan) = log.first(&record::PLAN)? else {
-            println!("slots_total_is_planned: the default plan printed no plan record");
+            println!("slots_total_is_planned: the one-slot plan printed no plan record");
             check(ok, "slots_total_is_planned", false);
             return Ok(());
         };
@@ -828,20 +902,22 @@ mod gate {
             file,
             &["--parallel", "2", "--ctx", &c_arg],
         )?;
-        // `pass=turns`: the seat's `Pass::of(slots, false)`, it overrides no `Seat::step_slots`.
+        // `pass=one`: the seat's round of several slots is one pass of the busy rows.
         let want = format!(
-            "parallel rule=slots slots=2 slot_ctx={} total={} from=flag pass=turns",
+            "parallel rule=slots slots=2 slot_ctx={} total={} from=flag pass=one",
             c / 2,
             2 * (c / 2)
         );
         let split = status.is_some_and(|s| s.success()) && text.lines().any(|l| l == want);
-        println!("two slots over the default context {c}: the parallel line {want:?} {split}");
+        println!(
+            "two slots over the one-slot default context {c}: the parallel line {want:?} {split}"
+        );
         // One step past the default the one-slot plan refuses; two slots plan
         // the same total, so the refusal is the total's, not a slot's share.
         let refused = if trained.is_some_and(|t| c >= t) {
             println!(
-                "skip slots_total_is_planned (refusal half): the default {c} is the trained \
-                 context, no step of {CTX_STEP} past it"
+                "skip slots_total_is_planned (refusal half): the one-slot default {c} is the \
+                 trained context, no step of {CTX_STEP} past it"
             );
             true
         } else {
@@ -855,6 +931,47 @@ mod gate {
             )?
         };
         check(ok, "slots_total_is_planned", split && refused);
+        Ok(())
+    }
+
+    /// `default_second_slot_never_costs_a_load` (the module header).
+    fn default_second_slot_never_costs_a_load(
+        dir: &Path,
+        file: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        // `--plan` under [`NO_ROOM_BUDGET`]: whether it is refused with the
+        // budget's words, and whether it says the second slot did not fit.
+        let plan_at_no_room = |name: &str, args: &[&str]| -> Result<(bool, bool), GateError> {
+            let mut all = args.to_vec();
+            all.push("--plan");
+            let (mut s, d) =
+                spawn_levered(dir, name, file, &all, (Some("off"), Some(NO_ROOM_BUDGET)))?;
+            let status = wait_exit(&mut s, PLAN_WITHIN)?;
+            let text = std::fs::read_to_string(d.join("server.err")).unwrap_or_default();
+            let refused = status.is_some_and(|st| !st.success())
+                && BUDGET_REFUSAL.iter().all(|w| text.contains(w));
+            let says = text.contains(SECOND_SLOT_LINE) && text.contains("serving one slot");
+            println!(
+                "{name}: {} --plan under {NO_ROOM_BUDGET} B: refused with the budget's words \
+                 {refused}; says the second slot did not fit {says}",
+                args.join(" ")
+            );
+            if !refused {
+                println!("{name} stderr:\n{text}");
+            }
+            Ok((refused, says))
+        };
+        // The default tries two slots, falls to one and the one-slot plan
+        // refuses; a set `--parallel 2` is refused at two with no fall.
+        let (default_refused, default_says) = plan_at_no_room("no-room-default", &[])?;
+        let (flag_refused, flag_says) =
+            plan_at_no_room("no-room-parallel-2", &["--parallel", "2"])?;
+        check(
+            ok,
+            "default_second_slot_never_costs_a_load",
+            default_refused && default_says && flag_refused && !flag_says,
+        );
         Ok(())
     }
 
@@ -1105,12 +1222,20 @@ mod gate {
         let listen = records.one(&record::LISTENING_MIMO2)?;
         let planned = Planned::of(&records.one(&record::PLAN)?)?;
         let stderr = std::fs::read_to_string(&err_log).unwrap_or_default();
-        // `pass=turns` as at `slots_total_is_planned`.
+        // `pass=one` as at `slots_total_is_planned`.
         let line = format!(
-            "parallel rule=slots slots=2 slot_ctx={CTX} total={} from=flag pass=turns",
+            "parallel rule=slots slots=2 slot_ctx={CTX} total={} from=flag pass=one",
             2 * CTX
         );
         let resident = load.u64("resident_bytes")?;
+        // PIN(2026-10-12): the two-slot load holds more than the one-slot
+        // load plus one slot's stores, not exactly that: a load of two
+        // sequences allocates a pass's buffers at `MAX_ROWS` rows and the card
+        // experts' buffers at two rows beside everything the one-slot load
+        // holds (gpu-mimo2 `Body::load`), all inside the plan's fixed scratch
+        // term. The excess was 6,512,144 B on the A6000 with the same plan
+        // and the same ids; it is printed here, its exact term is not held.
+        let excess = i128::from(resident) - i128::from(one.resident) - i128::from(store_bytes);
         let same_plan = planned == one.planned;
         let loaded = same_plan
             && load.u64("slots")? == 2
@@ -1118,11 +1243,12 @@ mod gate {
             && listen.u64("slots")? == 2
             && listen.u64("ctx")? == CTX as u64
             && stderr.lines().any(|l| l == line)
-            && resident == one.resident + store_bytes;
+            && excess > 0;
         println!(
             "two-slot server at {addr}; plan {planned:?} against the one-slot server's {:?}: \
              {same_plan}; load record {:?}; listening record {:?}; resident {resident} B \
-             against the one-slot server's {} B and one slot's stores {store_bytes} B: {loaded}",
+             against the one-slot server's {} B and one slot's stores {store_bytes} B, a pass's \
+             buffers {excess} B (want more than 0): {loaded}",
             one.planned,
             load.line(),
             listen.line(),
@@ -1297,7 +1423,8 @@ mod gate {
         if a.after_refusals {
             println!(
                 "plan_only_names_its_default, residency_default_is_the_machine, \
-                 refusals_before_any_load, slots_total_is_planned: run by the parent of this child"
+                 refusals_before_any_load, slots_total_is_planned, \
+                 default_second_slot_never_costs_a_load: run by the parent of this child"
             );
             after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
         } else {
@@ -1305,6 +1432,7 @@ mod gate {
             residency_default_is_the_machine(&a.dir, &file, &mut ok)?;
             refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
             slots_total_is_planned(&a.dir, &file, &mut ok)?;
+            default_second_slot_never_costs_a_load(&a.dir, &file, &mut ok)?;
             if cards >= 2 {
                 child_clauses(&a.dir, &mut ok)?;
             } else {

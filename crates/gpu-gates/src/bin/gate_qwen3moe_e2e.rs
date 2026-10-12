@@ -130,8 +130,14 @@
 //!   the argmax ik's; no greedy prompt diverging from ik where ik's margin
 //!   is at or above [`MARGIN_FLOOR`]; graph = eager; the pass prefill = the
 //!   one-token path, bit for bit (every unit a walk through the host tier's
-//!   batch port) — and the host tier served slots on both of its ports. The
-//!   bands are the card's: a host expert runs ik's own 8-bit rule (q8_2 per
+//!   batch port) — and the host tier served slots on both of its ports; the
+//!   plan's card scratch is the planner's count of the ubatch arena and the
+//!   placed side; the ubatch is the host union's columns, a prompt plans as
+//!   units wider than a pass (`auto` and `wide` the same plan, the GEMM walk
+//!   refused by name), and the wide prefill of [`WIDE_IDS`] ids continues the
+//!   pass prefill's tokens, or differs first only where the pass run's margin
+//!   is under [`MARGIN_FLOOR`]. FAIL-first: the wide combine leaving out the
+//!   host sum (mutant) turns the wide prefill red. The bands are the card's: a host expert runs ik's own 8-bit rule (q8_2 per
 //!   32 values for Q4_K-Q6_K and the 32-block types, Q8_K per 256 for the
 //!   rest) where the card runs q8_1, so no layer's error grows.
 //!   (o7) the file planned under no budget, a plan that keeps every routed
@@ -303,7 +309,7 @@ mod gate {
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
-    use bloomery_gpu::arch::qwen3moe::{Body, KvQ8, KvQ8Host, PrefillPath};
+    use bloomery_gpu::arch::qwen3moe::{Body, KvQ8, KvQ8Host, PrefillPath, PrefillStep};
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
@@ -313,7 +319,7 @@ mod gate {
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::prompts::{
-        GreedyClass, GreedyRow, PromptRow, compare_greedy, read_greedy, read_prompts,
+        GreedyClass, GreedyRow, MARGIN_FLOOR, PromptRow, compare_greedy, read_greedy, read_prompts,
     };
     use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
     use bloomery_gpu_gates::{
@@ -326,6 +332,7 @@ mod gate {
     use gguf::quant::GgmlType;
     use model::arch::Arch;
     use model::arch::qwen3moe::hparams::Hparams;
+    use model::moe::UNION_MAX_COLS;
     use model::placement::PlanLevers;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
@@ -465,11 +472,6 @@ mod gate {
     /// 4e-2 of a layer's update, whose norm is of the residual's order)
     /// added in quadrature over 48 layers, independent: √48 · 4e-2 ≈ 0.28.
     const FREE_BAND: f64 = 0.28;
-
-    /// PIN(2026-09-21): the V2-Lite gate's floor — a first difference where
-    /// the reference's own top1-top2 margin is below this is a near-tie
-    /// re-lottery, not a fault.
-    const MARGIN_FLOOR: f32 = 0.5;
 
     /// `‖a − b‖ / ‖base‖` over the zipped values in f64, the denominator's
     /// values from `base`: not `e2e::rel`, which divides by `‖b‖` and is
@@ -1428,13 +1430,82 @@ mod gate {
             plan.host.experts,
             verdict(split)
         );
-        if !split {
+        // The ubatch arena and placed side the planner counts are the bytes
+        // the plan holds in the card's scratch.
+        let scratch = Qwen3moeModel::placed_arena_bytes(&file, ctx)?;
+        let card = plan.machine.cards.first().ok_or("a plan of no card")?;
+        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let counts = scratch == counted;
+        println!(
+            "placed scratch: the plan counts {counted} B, the ubatch arena and placed side the \
+             planner counts {scratch} B {}",
+            verdict(counts)
+        );
+        if !split || !counts {
             return Ok(None);
         }
         let opts = Qwen3moeModel::lever_opts(ctx, KvQ8::F16)?;
         Ok(Some(GpuModel::<Body>::open_placed(
             file, &plan, opts, host,
         )?))
+    }
+
+    /// The ids (o)'s wide clause prefills: two whole units of the host
+    /// union's columns and a short third, which the base's context holds with
+    /// the greedy continuation.
+    const WIDE_IDS: usize = 2 * UNION_MAX_COLS + 37;
+
+    /// The ids (o)'s wide clause plans without running them: three whole units
+    /// and a short fourth.
+    const WIDE_PLAN_IDS: usize = 3 * UNION_MAX_COLS + 37;
+
+    /// (o)'s wide clause (module doc) on the placed model `m`: its ubatch is
+    /// the host union's columns; a prompt plans as units wider than a pass,
+    /// `auto` the same plan, the GEMM walk refused by name; and the wide
+    /// prefill of [`WIDE_IDS`] ids continues the pass prefill's tokens, or
+    /// differs from them first where the pass run's own margin is under
+    /// [`MARGIN_FLOOR`].
+    fn placed_wide(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        let ub = m.ubatch()?;
+        let sized = ub == UNION_MAX_COLS;
+        println!(
+            "placed ubatch: {ub} (the host union's {UNION_MAX_COLS}) {}",
+            verdict(sized)
+        );
+        let plan = m.prefill_plan(WIDE_PLAN_IDS, PrefillPath::Wide)?;
+        let wide = plan.ubatch_tokens() == WIDE_PLAN_IDS
+            && plan
+                .steps
+                .iter()
+                .all(|s| matches!(s, PrefillStep::Ubatch(t) if *t > MAX_TOKENS));
+        let auto = m.prefill_plan(WIDE_PLAN_IDS, PrefillPath::Auto)? == plan;
+        let gemm_refused = m.prefill_plan(WIDE_PLAN_IDS, PrefillPath::Gemm).is_err();
+        println!(
+            "placed prompt plan of {WIDE_PLAN_IDS} ids: {plan} (every unit above {MAX_TOKENS} \
+             rows) {}; auto = wide {}; gemm refused by name {}",
+            verdict(wide),
+            verdict(auto),
+            verdict(gemm_refused)
+        );
+        let ids = prose(WIDE_IDS)?;
+        let pass = long_run(m, &ids, Some(PrefillPath::Pass), None)?;
+        let wide_run = long_run(m, &ids, Some(PrefillPath::Wide), None)?;
+        let first_diff = pass
+            .tokens
+            .iter()
+            .zip(&wide_run.tokens)
+            .position(|(a, b)| a != b);
+        let near_tie = first_diff.is_none_or(|i| pass.margins[i] < MARGIN_FLOOR);
+        println!(
+            "placed wide prefill ({WIDE_IDS} ids in {}) vs the pass run: first difference \
+             {first_diff:?} (none, or at a margin under {MARGIN_FLOOR}) logits rel {:.3e} {}",
+            m.prefill_plan(WIDE_IDS, PrefillPath::Wide)?,
+            rel_base(&wide_run.logits, &pass.logits, |i| f64::from(
+                pass.logits[i]
+            )),
+            verdict(near_tie)
+        );
+        Ok(sized && wide && auto && gemm_refused && near_tie)
     }
 
     /// (o7) (module doc): the model is dropped before the clause returns.
@@ -1510,7 +1581,8 @@ mod gate {
             stats.batch_host_slots,
             verdict(served)
         );
-        Ok(ok && served)
+        let wide = placed_wide(&mut m)?;
+        Ok(ok && served && wide)
     }
 
     // ------------------------------------------- (y) the Q5_K routed path

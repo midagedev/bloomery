@@ -237,7 +237,7 @@
 //!   whatever the body or the placement, so the word holds on both files).
 //!   PIN(2026-10-07): the refusal's flag set gained its `--parallel 2` — a
 //!   set `--ctx` with no `--parallel` is one request's context now
-//!   (`placement::ctx::slots_of`), so the split refusal needs the count said, and the
+//!   (`bind::slots_of`), so the split refusal needs the count said, and the
 //!   unset flag set is the one-slot rule's own check. Re-pin by
 //!   specification, not a relaxation: the refusal holds its named message
 //!   at the same boundary, and the one-slot rule is a new check beside it.
@@ -302,6 +302,30 @@
 //!   record, whose `ctx_max` is the line's `total`, and the process exits 0
 //!   with no `load` or `listening` record. FAIL-first: a seat that ignores
 //!   the flag loads and listens, the clause red.
+//! - `default_second_slot_never_costs_a_load`, on both arms: five `--plan` runs of
+//!   the placed load on `a` (`--place a`: the census and the whole-fit verdict
+//!   read the card, not the budget) under a card budget at which the default's
+//!   two slots are refused and one slot is not. The default's first try is
+//!   `--parallel 2`'s: the context search, the floor of [`MAX_TOKENS`] rows a
+//!   slot loads at, the plan at the total of both slots and, on a qwen35moe
+//!   file, the checkpoints of both sequences. Two slots plan at least twice the
+//!   floor's rows, one slot at least the floor's, so the least budget of two
+//!   slots is the least of one plus those rows' cache bytes, and on a qwen35moe
+//!   file the second slot's fixed stores [derived]. Under a budget below every
+//!   floor, `--parallel 2` and `--parallel 1` with the floor's rows a slot as
+//!   their `--ctx` are refused with the floor of their plan
+//!   (`PlacementError::CardBudgetFloor`, read by `bind::budget_floor`): the
+//!   least budget of two slots, `F2`, and of one, `F1` (the default's own
+//!   refusal there is the plan at one position a slot, under the floor's
+//!   rows, so it names neither). At `F2 - 1`: the default prints
+//!   `parallel … slots=1 … from=fit` with the line that says the second slot
+//!   did not fit and exits 0, and `--parallel 2` is refused with the words
+//!   that line carries and prints no such line (a set count is never lowered);
+//!   at `F2` the default serves two slots (`from=default`) and prints no such
+//!   line; `F1` is under `F2` (`second_slot_window_is_open`). FAIL-first: a
+//!   seat that plans the default at two slots with no fall refuses the first
+//!   half (the mutant: the call to `bind::default_slots_fit` replaced by the
+//!   plan at the asked count).
 //! - `defaults_take_a_long_prompt_on_a_12gb_card`, on a qwen35moe file
 //!   alone: `--plan` with the seat's defaults — no `--ctx`, no `--parallel` —
 //!   under [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`], a 12 GB card in a
@@ -329,9 +353,12 @@
 //!   card budget is [`HOST_TIER_BUDGET`] (`--place a --parallel 1`): its
 //!   plan record puts routed experts on the host, and a greedy
 //!   `/completion` of [`PROSE`]'s ids (at least [`GEMM_FROM`]) answers 200
-//!   with tokens — a placed load's prompt call runs passes at every length.
+//!   with tokens — a placed load's prompt call runs the wide units from [`GEMM_FROM`] ids and passes below.
 //!   FAIL-first: a prompt call that asks a placed load for the GEMM walk is
 //!   refused by `prefill_plan` and the request answers no tokens.
+//!
+//! With `--only-second-slot`, `default_second_slot_never_costs_a_load` alone, on each file: its
+//! `--plan` runs open no card.
 //!
 //! With `--images` (the file's own clauses first) or `--only-images`, the image clauses on the
 //! Qwen3.6 file (`images`), against the oracle sets of `refset::arch::qwen35moe::vis` — llama.cpp
@@ -451,6 +478,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
+    use bloomery_gpu_gates::bind::budget_floor;
     use bloomery_gpu_gates::generate::{CTX_GRAN, Place};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
@@ -474,7 +502,7 @@ mod gate {
     use crate::q3place;
 
     const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> \
-                         [--images | --only-images]";
+                         [--images | --only-images | --only-second-slot]";
 
     /// The tokens each request makes.
     const N: usize = 64;
@@ -552,15 +580,20 @@ mod gate {
         images: bool,
         /// `--only-images`: the image clauses alone.
         only_images: bool,
+        /// `--only-second-slot`: `default_second_slot_never_costs_a_load`
+        /// alone, on each file.
+        only_second_slot: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut models, mut dir, mut images, mut only_images) = (Vec::new(), None, false, false);
+        let mut only_second_slot = false;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             match flag.as_str() {
                 "--images" => images = true,
                 "--only-images" => only_images = true,
+                "--only-second-slot" => only_second_slot = true,
                 "--model" | "--dir" => {
                     let v = it
                         .next()
@@ -580,6 +613,7 @@ mod gate {
                 dir,
                 images: images || only_images,
                 only_images,
+                only_second_slot,
             }),
             _ => Err(USAGE.into()),
         }
@@ -651,8 +685,27 @@ mod gate {
         server_log(err_log, record::BLOOMERY_SERVE_QWEN3)
     }
 
-    /// The whole-number field ` name=…` of a record line; `None` when the
-    /// line carries none.
+    /// A seat's stderr `text`, read at `err_log` by the seat's record kinds;
+    /// its errors name the file, whose path carries the arm's directory.
+    fn seat_records(text: &str, err_log: &Path) -> record::Log {
+        record::Log::of(text, record::BLOOMERY_SERVE_QWEN3).named(err_log.display().to_string())
+    }
+
+    /// A record read as a clause's input: a read that fails (the record
+    /// absent, repeated or broken, a field of another type) prints its named
+    /// error and is `None`, which the clause's own checks hold red.
+    fn or_named<T>(read: Result<T, record::ReadError>) -> Option<T> {
+        read.inspect_err(|e| println!("{e}")).ok()
+    }
+
+    /// The whole-number field `name` of `rec`, [`or_named`]; `None` for a record
+    /// that was not read.
+    fn u64_of(rec: Option<&Fields>, name: &str) -> Option<u64> {
+        rec.and_then(|r| or_named(r.u64(name)))
+    }
+
+    /// The whole-number field ` name=…` of a `ctx` line, which no record kind
+    /// owns; `None` when the line carries none.
     fn field_u64(line: &str, name: &str) -> Option<u64> {
         line.split(&format!(" {name}="))
             .nth(1)?
@@ -685,22 +738,6 @@ mod gate {
             .collect()
     }
 
-    /// The seat's `load` record's line (`load arch=…`, not the host tier's
-    /// `load host_tier …` a placed load prints before it) and the
-    /// `listening` record's line of a server's stderr, each empty when the
-    /// server printed none.
-    fn load_and_listening(log: &str) -> (&str, &str) {
-        let load = log
-            .lines()
-            .find(|l| l.starts_with("load arch="))
-            .unwrap_or("");
-        let listening = log
-            .lines()
-            .find(|l| l.contains(" listening on http://"))
-            .unwrap_or("");
-        (load, listening)
-    }
-
     /// The default `ctx` line of a server's stderr
     /// (`ctx rule=… ctx=… slots=… total=… cap=… fit=…`,
     /// `placement::ctx::SlotCtx::line`): the one line, `None` when there is
@@ -711,6 +748,21 @@ mod gate {
         lines.next().is_none().then_some(one)
     }
 
+    /// Whether a default `ctx` line's NVMe terms hold the rule's contract,
+    /// recomputed here from the line's `base_nvme_expert_bytes` (never
+    /// trusting its `nvme_bound`): the chosen plan pages at most a hundredth
+    /// of the base's bytes more, and the line names that hundredth. `None`
+    /// when a term is missing.
+    fn nvme_held(line: &str) -> Option<bool> {
+        let num = |k: &str| field_u64(line, k);
+        let (base, now, bound) = (
+            num("base_nvme_expert_bytes")?,
+            num("nvme_expert_bytes")?,
+            num("nvme_bound")?,
+        );
+        Some(bound == base / NVME_DIV && now <= base + base / NVME_DIV)
+    }
+
     /// `default_ctx_line_names_its_rule` (module header), on a server of
     /// `slots` slots whose `/props` named `props_n` and whose file's trained
     /// context is `trained`; `plan_total` the `ctx_max` of its `plan` record
@@ -718,8 +770,10 @@ mod gate {
     /// seat's base a slot ([`SEAT_FLOOR`]) and step ([`CTX_GRAN`]):
     /// `card` the fit under the base, `base` the base itself with the fit at
     /// least it, `margin` a multiple of the step past the base and under the
-    /// fit, `fit` the fit past the base. A named error when the line is
-    /// missing or one of its terms is.
+    /// fit, `fit` the fit past the base; and on every word the paged bytes
+    /// at most a hundredth of the base's past them, the line's `nvme_bound`
+    /// that hundredth. A named error when the line is missing or one of its
+    /// terms is.
     fn default_ctx_line_names_its_rule(
         log: &str,
         (slots, props_n, trained): (u64, u64, u64),
@@ -756,6 +810,7 @@ mod gate {
                     && margin == model::placement::workstation::MARGIN
                     && base_card.saturating_sub(card) == lost
                     && (rule == "card" || lost <= margin)
+                    && nvme_held(line)?
                     && props_n == ctx
                     && plan_total.is_none_or(|t| t == total),
             )
@@ -789,6 +844,8 @@ mod gate {
             said = std::fs::read_to_string(&err_log).unwrap_or_default();
             if let Some(status) = s.child.try_wait()? {
                 exited = Some(status.success());
+                // Its last lines may have come after the read above.
+                said = std::fs::read_to_string(&err_log).unwrap_or_default();
                 break;
             }
             if said.contains("listening on http://") {
@@ -799,11 +856,17 @@ mod gate {
         if exited.is_none() {
             println!("{name}: server stopped: {}", s.stop()?);
         }
-        Ok(PlanRun { said, exited })
+        Ok(PlanRun {
+            name: name.to_owned(),
+            said,
+            exited,
+        })
     }
 
     /// What a `--plan` run printed and how it ended ([`plan_run`]).
     struct PlanRun {
+        /// The run's name, its directory under the gate's.
+        name: String,
         /// The server's stderr.
         said: String,
         /// Whether it exited zero on its own; `None` when it was still up
@@ -817,23 +880,30 @@ mod gate {
             ctx_line(&self.said).and_then(|l| field_u64(l, name))
         }
 
-        /// The `ctx_max` of the `plan` record.
+        /// The run's stderr by the seat's record kinds.
+        fn records(&self) -> record::Log {
+            record::Log::of(&self.said, record::BLOOMERY_SERVE_QWEN3)
+                .named(format!("{}'s stderr", self.name))
+        }
+
+        /// The `ctx_max` of the one `plan` record; a run with none, two or a
+        /// broken line prints that error and has none.
         fn ctx_max(&self) -> Option<u64> {
-            let plan =
-                record::Log::of(&self.said, record::BLOOMERY_SERVE_QWEN3).first(&record::PLAN38);
-            match plan {
-                Ok(Some(p)) => p.u64("ctx_max").ok(),
-                _ => None,
-            }
+            u64_of(
+                or_named(self.records().one(&record::PLAN38)).as_ref(),
+                "ctx_max",
+            )
         }
 
         /// Whether the run stopped as `--plan` says: exit 0 with no `load`
-        /// or `listening` record, the `ctx` line's total the `plan`
-        /// record's `ctx_max`.
+        /// or `listening` record (a line that opens one and does not read
+        /// whole counts as one), the `ctx` line's total the `plan` record's
+        /// `ctx_max`.
         fn stopped_with_its_plan(&self) -> bool {
             let total = self.ctx_field("total");
-            let loaded = self.said.lines().any(|l| l.starts_with("load arch="))
-                || self.said.contains(" listening on http://");
+            let records = self.records();
+            let loaded = or_named(records.first(&record::LOAD_QWEN3)).is_none_or(|l| l.is_some())
+                || or_named(records.first(&record::LISTENING_QWEN3)).is_none_or(|l| l.is_some());
             self.exited == Some(true) && total.is_some() && total == self.ctx_max() && !loaded
         }
     }
@@ -873,7 +943,8 @@ mod gate {
     /// seat's defaults — no `--ctx`, no `--parallel` — planned under
     /// [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`] print a `ctx` line of at
     /// least two slots, each of at least [`LONG_PROMPT_SLOT_CTX`] positions,
-    /// and stop as `--plan` says ([`PlanRun::stopped_with_its_plan`]). The
+    /// and stop as `--plan` says ([`PlanRun::stopped_with_its_plan`]), the
+    /// line's NVMe terms within the rule's bound ([`nvme_held`]). The
     /// plan is asked for by name (`--place a`): the census and the whole-fit
     /// verdict read the card, not the budget, so a card that holds the file
     /// whole would not plan at all.
@@ -903,7 +974,139 @@ mod gate {
             "defaults_take_a_long_prompt_on_a_12gb_card",
             run.stopped_with_its_plan()
                 && ctx.is_some_and(|c| c >= LONG_PROMPT_SLOT_CTX)
-                && slots.is_some_and(|n| n >= 2),
+                && slots.is_some_and(|n| n >= 2)
+                && ctx_line(&run.said).and_then(nvme_held) == Some(true),
+        );
+        Ok(())
+    }
+
+    /// `default_second_slot_never_costs_a_load` (module header): five `--plan`
+    /// runs on `--place a`, none of them a load. Under a card budget below
+    /// every floor, a count's refusal names the floor of its plan
+    /// (`PlacementError::CardBudgetFloor`, read by [`budget_floor`]). The
+    /// default's own refusal there is the plan at one position a slot, which
+    /// is not the boundary: the seat refuses a slot under [`MAX_TOKENS`] rows
+    /// (`slot_ctx`), so the runs that name it are `--parallel 2` and
+    /// `--parallel 1` with the `--ctx` of those rows a slot, `F2` and `F1`,
+    /// the least budgets of two slots and of one. The default's window is the
+    /// budgets from `F1` to `F2 - 1`. The default and `--parallel 2` run at
+    /// `F2 - 1`, the default again at `F2`; a floor that is not the plan's
+    /// boundary turns the check red, the lines printed. A run ends planned
+    /// (exit 0, its `parallel` line printed) or refused (a non-zero exit, no
+    /// `parallel` line); any other ending is a named error, never a refusal.
+    fn default_second_slot_never_costs_a_load(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        // Every plan of either file is over this: a card's margin alone is a GiB.
+        const BELOW_ANY_FLOOR: usize = 256 << 20;
+        const FALL: &str = "the default's second slot does not fit on --place a (";
+        const FALL_END: &str = "); serving one slot";
+        let own = dir.join("second-slot");
+        std::fs::create_dir_all(&own)?;
+        let planned_at =
+            |name: &str, budget: usize, flags: &[&str]| -> Result<(bool, String), GateError> {
+                let budget = budget.to_string();
+                let mut args = vec!["--place", "a"];
+                args.extend_from_slice(flags);
+                let run = plan_run(
+                    name,
+                    (model, &own),
+                    &[(bloomery_levers::CARD_BUDGET, budget.as_str())],
+                    &args,
+                )?;
+                let printed = run.said.lines().any(|l| l.starts_with("parallel rule="));
+                match run.exited {
+                    Some(planned) if planned == printed => Ok((planned, run.said)),
+                    other => Err(format!(
+                        "--plan under {budget} B ({}) ended {other:?} and {} a `parallel` line: \
+                         neither planned nor refused; {name}'s stderr:\n{}",
+                        flags.join(" "),
+                        if printed { "printed" } else { "printed no" },
+                        run.said
+                    )
+                    .into()),
+                }
+            };
+        let floor_of = |name: &str, flags: &[&str]| -> Result<usize, GateError> {
+            let (planned, said) = planned_at(name, BELOW_ANY_FLOOR, flags)?;
+            let flags = flags.join(" ");
+            if planned {
+                return Err(format!(
+                    "--plan ({flags}) plans under {BELOW_ANY_FLOOR} B: the clause's budget is \
+                     over the file's floor"
+                )
+                .into());
+            }
+            budget_floor(&said, BELOW_ANY_FLOOR as u64)
+                .and_then(|floor| usize::try_from(floor).ok())
+                .ok_or_else(|| -> GateError {
+                    format!(
+                        "--plan ({flags}) under {BELOW_ANY_FLOOR} B names no `budget \
+                         {BELOW_ANY_FLOOR} B is below its floor N B`; {name}'s stderr:\n{said}"
+                    )
+                    .into()
+                })
+        };
+        let rows = MAX_TOKENS;
+        let (ctx2, ctx1) = ((2 * rows).to_string(), rows.to_string());
+        let floor2 = floor_of("floor-2", &["--parallel", "2", "--ctx", ctx2.as_str()])?;
+        let floor1 = floor_of("floor-1", &["--parallel", "1", "--ctx", ctx1.as_str()])?;
+        let below = floor2.checked_sub(1).ok_or("a floor of 0 B")?;
+        let least = floor2;
+        println!(
+            "second slot: --parallel 2 --ctx {ctx2} names the floor {floor2} B and --parallel 1 \
+             --ctx {ctx1} {floor1} B under {BELOW_ANY_FLOOR} B"
+        );
+        let (fell, fell_said) = planned_at("default-below", below, &[])?;
+        let (held, held_said) = planned_at("parallel-2-below", below, &["--parallel", "2"])?;
+        let (two, two_said) = planned_at("default-least", least, &[])?;
+        // The slots and the `from` word of the one `parallel` line.
+        fn counted(said: &str) -> Option<(Option<&str>, Option<&str>)> {
+            said.lines()
+                .find(|l| l.starts_with("parallel rule="))
+                .map(|l| (parallel_word(l, "slots"), parallel_word(l, "from")))
+        }
+        let line = |said: &str| {
+            said.lines()
+                .find(|l| l.starts_with("parallel rule="))
+                .map(str::to_owned)
+        };
+        // What the fall line quotes of the second slot's refusal, which a set
+        // count prints on its own.
+        let refusal = fell_said.find(FALL).and_then(|at| {
+            let rest = fell_said.get(at + FALL.len()..)?;
+            rest.find(FALL_END).map(|to| &rest[..to])
+        });
+        println!(
+            "second slot: default under {below} B: planned {fell}, {:?}, refusal {refusal:?}",
+            line(&fell_said)
+        );
+        println!(
+            "second slot: --parallel 2 under {below} B: planned {held}, says the fall {}",
+            held_said.contains(FALL)
+        );
+        println!(
+            "second slot: default under {least} B: planned {two}, {:?}, says the fall {}",
+            line(&two_said),
+            two_said.contains(FALL)
+        );
+        println!(
+            "second slot: the window is {} B wide (the floors {floor1} B and {floor2} B)",
+            floor2.abs_diff(floor1)
+        );
+        check(ok, "second_slot_window_is_open", floor1 < floor2);
+        check(
+            ok,
+            "default_second_slot_never_costs_a_load",
+            fell && counted(&fell_said) == Some((Some("1"), Some("fit")))
+                && refusal.is_some_and(|r| {
+                    !r.is_empty() && !held && held_said.contains(r) && !held_said.contains(FALL)
+                })
+                && two
+                && counted(&two_said) == Some((Some("2"), Some("default")))
+                && !two_said.contains(FALL),
         );
         Ok(())
     }
@@ -1110,6 +1313,12 @@ mod gate {
     /// `BASE_SLOT_CTX`): the context the margin counts against, the whole-fit
     /// verdict that picks the load, and the least default the card holds.
     const SEAT_FLOOR: u64 = 4096;
+
+    // PIN(2026-10-12): the default pages at most `base_nvme_expert_bytes / 100`
+    // bytes past the base's (the rule's `NVME_SLACK_DIV`), where it paged none
+    // past it: the gate holds the divisor as its own literal and recomputes
+    // the bound from the line's base, never trusting its `nvme_bound`.
+    const NVME_DIV: u64 = 100;
 
     /// The terms of one whole-fit line (`whole fit at ctx …: the whole load
     /// on …`): its `need`, that need less its cache term (the terms no
@@ -1821,9 +2030,19 @@ mod gate {
         let url = |p: &str| format!("http://{addr}{p}");
         // (v4) The load names the split and /props the slot ctx.
         let log = std::fs::read_to_string(&err_log)?;
-        let (load, _) = load_and_listening(&log);
-        let field = |name: &str| field_u64(load, name);
-        let plan = log.lines().find(|l| l.starts_with("plan ")).unwrap_or("");
+        let records = seat_records(&log, &err_log);
+        let load = or_named(records.one(&record::LOAD_QWEN3));
+        let field = |name: &str| u64_of(load.as_ref(), name);
+        // The placed arm's total is its one `plan` record's `ctx_max`, so
+        // the record is due there; the whole arm makes no plan of its own
+        // and prints one only for a placed load, but a line that opens one
+        // and does not read whole is no read on either arm (`None`, the
+        // split's check red).
+        let plan = or_named(match arm.total {
+            Total::Plan => records.one(&record::PLAN38).map(Some),
+            Total::Verdict { .. } => records.first(&record::PLAN38),
+        });
+        let plan_line = plan.as_ref().and_then(Option::as_ref).map(Fields::line);
         // The load's decision, printed: the whole-fit verdicts the seat ran
         // (one, at the total, when it made one) and its plan record.
         let verdicts: Vec<&str> = log
@@ -1831,7 +2050,7 @@ mod gate {
             .filter(|l| l.starts_with("whole fit at ctx "))
             .collect();
         println!(
-            "{}: {} whole-fit verdict(s) {verdicts:?}; plan record {plan:?}",
+            "{}: {} whole-fit verdict(s) {verdicts:?}; plan record {plan_line:?}",
             arm.dir,
             verdicts.len()
         );
@@ -1853,15 +2072,16 @@ mod gate {
                 );
                 said
             }
-            Total::Plan => field_u64(plan, "ctx_max"),
+            Total::Plan => u64_of(plan.as_ref().and_then(Option::as_ref), "ctx_max"),
         };
         let (st, body) = curl(&url("/props"), None, false)?;
         let props = json_of("/props", st, &body)?;
         let n_ctx = props["n_ctx"].as_u64().unwrap_or(u64::MAX);
         println!(
-            "{}: {load}; the total {total:?} ({:?}), props n_ctx {n_ctx}, record slots={:?} \
+            "{}: {:?}; the total {total:?} ({:?}), props n_ctx {n_ctx}, record slots={:?} \
              slot_ctx={:?}",
             arm.dir,
+            load.as_ref().map(Fields::line),
             arm.total,
             field("slots"),
             field("slot_ctx"),
@@ -1869,7 +2089,9 @@ mod gate {
         check(
             ok,
             &named("slots_load_names_the_split"),
-            field("slots") == Some(2) && total.is_some_and(|t| field("slot_ctx") == Some(t / 2)),
+            plan.is_some()
+                && field("slots") == Some(2)
+                && total.is_some_and(|t| field("slot_ctx") == Some(t / 2)),
         );
         check(
             ok,
@@ -2347,15 +2569,17 @@ mod gate {
         dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
-        let log = std::fs::read_to_string(dir.join(PLACED_SLOTS.dir).join("server.err"))
-            .unwrap_or_default();
-        let plan = log.lines().find(|l| l.starts_with("plan ")).unwrap_or("");
+        let err_log = dir.join(PLACED_SLOTS.dir).join("server.err");
+        let log =
+            std::fs::read_to_string(&err_log).map_err(|e| format!("{}: {e}", err_log.display()))?;
+        let records = seat_records(&log, &err_log);
+        let plan = or_named(records.one(&record::PLAN38));
         let (host, card, total) = (
-            field_u64(plan, "host_experts"),
-            field_u64(plan, "card_experts"),
-            field_u64(plan, "ctx_max"),
+            u64_of(plan.as_ref(), "host_experts"),
+            u64_of(plan.as_ref(), "card_experts"),
+            u64_of(plan.as_ref(), "ctx_max"),
         );
-        let (load, _) = load_and_listening(&log);
+        let load = or_named(records.one(&record::LOAD_QWEN3));
         // `placed slots: N sequences of S rows hold H B of cache; the plan
         // at T positions counts K B`, then ` (its KV term V B and its
         // resident slots reserve R B)` where R is not 0
@@ -2377,7 +2601,7 @@ mod gate {
         println!(
             "placed slots: plan host_experts {host:?} card_experts {card:?} ctx_max {total:?}; \
              load resident_bytes {:?}; cache line {line:?}",
-            field_u64(load, "resident_bytes")
+            u64_of(load.as_ref(), "resident_bytes")
         );
         check(
             ok,
@@ -2528,10 +2752,10 @@ mod gate {
         let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
         let url = |p: &str| format!("http://{addr}{p}");
         let log = std::fs::read_to_string(&err_log)?;
-        let host = log
-            .lines()
-            .find(|l| l.starts_with("plan "))
-            .and_then(|l| field_u64(l, "host_experts"));
+        let host = u64_of(
+            or_named(seat_records(&log, &err_log).one(&record::PLAN38)).as_ref(),
+            "host_experts",
+        );
         let ids = tokenized(&url, PROSE)?;
         let body = json!({
             "prompt": ids, "n_predict": N, "temperature": 0,
@@ -2567,7 +2791,7 @@ mod gate {
 
     /// The refusal clause (module header), two arms.
     /// PIN(2026-10-07): the refusal arm passes `--parallel 2` — a set `--ctx`
-    /// with no `--parallel` is one request's context now (`placement::ctx::slots_of`),
+    /// with no `--parallel` is one request's context now (`bind::slots_of`),
     /// so the two-slot split the floor refuses needs the count said — and
     /// the one-slot arm holds that unset-flag rule on the same `--ctx`: the
     /// server takes one slot at the whole flag and says so (`from=ctx`, the
@@ -3983,6 +4207,10 @@ mod gate {
                 images(model, &dir, &mut ok)?;
                 continue;
             }
+            if a.only_second_slot {
+                default_second_slot_never_costs_a_load(model, &dir, &mut ok)?;
+                continue;
+            }
             let Some((answers, arch, default_n)) = served(model, &dir, &mut ok)? else {
                 continue;
             };
@@ -3996,6 +4224,7 @@ mod gate {
             check(&mut ok, "completion_ids_are_the_cli_ids", agree_all);
             ctx_default(model, &dir, default_n, &mut ok)?;
             plan_flag_stops_before_the_load(model, &dir, &mut ok)?;
+            default_second_slot_never_costs_a_load(model, &dir, &mut ok)?;
             if arch == "qwen35moe" {
                 // The Qwen3.6 file alone: the defaults on the 12 GB card it
                 // is served from.

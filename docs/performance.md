@@ -13,10 +13,10 @@ the A6000's own rows, the measured history and the other engines' rows live on
 [rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md).
 
 - Qwen3.8 and GLM-5.3 ran with the MTP draft off and adaptive residency on.
-- Qwen3.6 runs two requests in turn today, so its total is one request's rate.
 - V4.1 on one 3090: a fixed placement with adaptive residency off: a server with the 3090 alone turns residency on,
   which that row does not count yet.
-- On two cards Qwen3.8 runs two requests in turn today; one pass of both over the second card is in progress.
+- On two cards Qwen3.8 ran two requests in turn in this measurement (0.3.0); 0.3.1 runs them in one pass, not
+  re-measured here.
 
 Each of two requests runs at 0.62–0.68× its speed alone, so one user waits longer and the machine serves more
 ([A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)).

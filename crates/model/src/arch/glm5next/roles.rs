@@ -58,12 +58,16 @@ pub(super) const LATENT: &[Stem] = &[
     req("indexer_compressor_ape.weight", Role::Attention),
 ];
 
+/// A dense layer's gate and down stems, which the front's forms read ([`DENSE`]).
+pub(super) const DENSE_GATE: &str = "ffn_gate.weight";
+pub(super) const DENSE_DOWN: &str = "ffn_down.weight";
+
 /// A dense layer's feed-forward block.
 pub(super) const DENSE: &[Stem] = &[
     req("ffn_norm.weight", Role::FfnNorm),
-    req("ffn_gate.weight", Role::DenseFfn),
+    req(DENSE_GATE, Role::DenseFfn),
     req("ffn_up.weight", Role::DenseFfn),
-    req("ffn_down.weight", Role::DenseFfn),
+    req(DENSE_DOWN, Role::DenseFfn),
 ];
 
 /// The router's selection bias, which ik loads when present: the spec's

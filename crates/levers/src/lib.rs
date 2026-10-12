@@ -1697,7 +1697,7 @@ impl fmt::Display for Draft38Off {
             Draft38Off::Paged { arena } => write!(
                 f,
                 "unset: the plan pages host experts through the NVMe tier's {arena} B RAM arena, \
-                 and a paged plan steps one column; a verify steps several"
+                 and a drafted verify's added columns are not shown to pay on a paged plan"
             ),
         }
     }
@@ -1778,31 +1778,6 @@ impl fmt::Display for DraftYield {
     }
 }
 
-/// How a binary names the slot count a user sets ([`PagedAt::slots_by`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SlotsBy {
-    /// A server's `--parallel N`.
-    Parallel,
-    /// `generate_qwen3moe`'s [`GEN_SLOTS`].
-    GenSlots,
-}
-
-impl SlotsBy {
-    fn named(self, n: usize) -> String {
-        match self {
-            SlotsBy::Parallel => format!("--parallel {n}"),
-            SlotsBy::GenSlots => format!("{GEN_SLOTS}={n}"),
-        }
-    }
-
-    fn way_out(self) -> String {
-        match self {
-            SlotsBy::Parallel => "serve --parallel 1 or leave --parallel unset".to_owned(),
-            SlotsBy::GenSlots => format!("leave {GEN_SLOTS} unset"),
-        }
-    }
-}
-
 /// What decides the columns a binary steps on a plan whose host experts
 /// page through the NVMe tier's RAM arena ([`paged_columns`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1810,12 +1785,13 @@ pub struct PagedAt {
     /// The plan's RAM arena (`HostTotals::nvme_arena_bytes`); 0 is a plan
     /// the tier does not page through an arena.
     pub arena: u64,
-    /// The resident slots the plan counts, and what set the count: `None`
-    /// the binary's own default.
+    /// The resident slots the plan counts.
     pub slots: usize,
-    pub slots_by: Option<SlotsBy>,
+    /// Whether the user set the count (`--parallel`, [`GEN_SLOTS`]); unset
+    /// it is the binary's own default.
+    pub slots_set: bool,
     /// Whether the slots step as one pass of their rows. Where each steps
-    /// alone (beside an expert tier card), slots add no column.
+    /// alone (beside an expert tier card), the default count is kept.
     pub together: bool,
     /// Whether the plan drafts, and whether [`DRAFT`] named the draft.
     pub draft: bool,
@@ -1825,74 +1801,60 @@ pub struct PagedAt {
 /// What a seat serves on the plan [`paged_columns`] read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Paged {
-    /// The plan as asked: no arena, or one column a step already.
+    /// The plan as asked.
     AsAsked,
-    /// One column a step: no draft, and `slots` — one where the slots step
-    /// together, every one asked where each steps alone.
-    OneColumn { slots: usize },
+    /// The plan with what the rule turns off: no draft, and `slots` — one
+    /// for a default count whose slots step together, else every one asked.
+    Reduced { slots: usize },
 }
 
-/// A paged plan's refusal of the set values that step several columns: a
-/// slot count past one, as the binary names it, and a set draft.
+/// A paged plan's refusal of a set draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagedRefused {
     pub arena: u64,
-    pub slots: Option<(SlotsBy, usize)>,
-    pub draft: bool,
 }
 
 impl fmt::Display for PagedRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut what = Vec::new();
-        let mut ways = Vec::new();
-        if let Some((by, n)) = self.slots {
-            what.push(by.named(n));
-            ways.push(by.way_out());
-        }
-        if self.draft {
-            what.push(format!("{DRAFT}=mtp"));
-            ways.push(format!("set {DRAFT}=off or leave it unset"));
-        }
         write!(
             f,
-            "{}: the plan pages host experts through the NVMe tier's {} B RAM arena, and a \
-             paged plan steps one column (a step of several reads the paged experts through the \
-             file mapping, whose page cache grows until the kernel swaps the arena out); {}",
-            what.join(" and "),
-            self.arena,
-            ways.join("; ")
+            "{DRAFT}=mtp: the plan pages host experts through the NVMe tier's {} B RAM arena, \
+             and a drafted verify's added columns are not shown to pay on a paged plan; set \
+             {DRAFT}=off or leave it unset",
+            self.arena
         )
     }
 }
 
 impl std::error::Error for PagedRefused {}
 
-/// A plan that pages host experts through the NVMe tier's RAM arena steps
-/// one column: slots stepped together or a drafted verify read the paged
-/// experts through the file mapping, and its page cache pushes the arena to
-/// swap. A plan with no arena, or no draft and slots that add no column (one,
-/// or several that each step alone), serves as asked; else the unset counts
-/// fall to no draft and, where the slots step together, one slot, and a set
-/// slot count that adds columns or a set draft is refused by name.
+/// A plan that pages host experts through the NVMe tier's RAM arena serves
+/// the slots it was asked for, a set count of them stepped as one pass over
+/// the arena (the placement's floor counts their columns, [`PagedAt::slots`]).
+/// A plan with no arena serves as asked. Else the draft goes off where unset
+/// (a drafted verify's added misses are not shown to pay on a paged plan; a
+/// set draft is refused by name) and a default count of slots that step
+/// together falls to one: a second slot's KV takes card bytes that experts
+/// would hold, and a later budget rule prices that trade.
 ///
 /// # Errors
-/// [`PagedRefused`], naming each set value that steps several columns.
+/// [`PagedRefused`] for a set draft.
 pub fn paged_columns(at: &PagedAt) -> Result<Paged, PagedRefused> {
-    let slot_cols = at.slots > 1 && at.together;
-    if at.arena == 0 || (!slot_cols && !at.draft) {
+    if at.arena == 0 {
         return Ok(Paged::AsAsked);
     }
-    let slots = at.slots_by.filter(|_| slot_cols).map(|by| (by, at.slots));
-    let draft = at.draft_set && at.draft;
-    if slots.is_some() || draft {
-        return Err(PagedRefused {
-            arena: at.arena,
-            slots,
-            draft,
-        });
+    if at.draft && at.draft_set {
+        return Err(PagedRefused { arena: at.arena });
     }
-    Ok(Paged::OneColumn {
-        slots: if at.together { 1 } else { at.slots },
+    let slots = if at.slots > 1 && at.together && !at.slots_set {
+        1
+    } else {
+        at.slots
+    };
+    Ok(if at.draft || slots != at.slots {
+        Paged::Reduced { slots }
+    } else {
+        Paged::AsAsked
     })
 }
 
@@ -1911,13 +1873,13 @@ pub fn paged_floor(at: &PagedAt) -> Result<Paged, PagedRefused> {
     }
     paged_columns(&PagedAt {
         slots: 1,
-        slots_by: None,
+        slots_set: false,
         ..*at
     })?;
-    Ok(Paged::OneColumn { slots: 1 })
+    Ok(Paged::Reduced { slots: 1 })
 }
 
-/// The draft a one-column load ([`Paged::OneColumn`]) runs without, as its
+/// The draft a reduced load ([`Paged::Reduced`]) runs without, as its
 /// `load draft=off` record names it, and whether it was asked: a draft that
 /// ran (`drafts`), or that only its yield to the context turned off — a
 /// verdict on the plan of several slots the load abandons — was asked, and

@@ -34,15 +34,16 @@ use model::arch::mimo2::place::{PlanInputs, card_routed};
 use model::arch::names::routed_stacks;
 use runtime::layer::hosted;
 
+use crate::body::slots::MAX_ROWS;
+
 pub use bloomery_gpu::host::swap_source::{DEADLINE, LIVE_DELAY};
 
 /// What the stack table's refusals name.
 const WHAT: &str = "mimo2::swap::stacks";
 
-/// The most rows one pass runs: the program steps one token a pass (no verify
-/// of several rows, no draft), so the machine's tally holds one row. A pass of
-/// more rows raises this with it.
-pub const LOAD_ROWS: usize = 1;
+/// The most rows one pass runs, which the machine's tally holds: the pass of
+/// several slots' rows ([`MAX_ROWS`]).
+pub const LOAD_ROWS: usize = MAX_ROWS;
 
 /// Layer `l`'s card-leg contract: a layer whose stacks are all types the leg
 /// runs ([`card_routed`]) holds its gate and up in one type (the leg refuses

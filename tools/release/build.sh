@@ -105,8 +105,13 @@ fi
 for b in "${BINS[@]}"; do
   v=$("$CARGO_TARGET_DIR/release/$b" --version)
   case "$v" in
-    *"$COMMIT"*) echo "release: $b --version: $v" ;;
+    *"$COMMIT"*) ;;
     *) echo "release: $b --version does not name the commit $COMMIT: $v" >&2; exit 1 ;;
+  esac
+  # The tarball's name says VERSION, so the binary must say it too (the serve crate's version is bumped first).
+  case "$v" in
+    *" $VERSION ("*) echo "release: $b --version: $v" ;;
+    *) echo "release: $b --version does not name the version $VERSION (bump crates/serve and crates/gpu-gates first): $v" >&2; exit 1 ;;
   esac
 done
 

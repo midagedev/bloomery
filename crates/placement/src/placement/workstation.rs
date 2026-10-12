@@ -647,8 +647,59 @@ impl HostNeed {
             Err(HostShort {
                 need: self,
                 available,
+                floor: None,
             })
         }
+    }
+
+    /// The load's check with an elastic arena: `available` bytes cover the
+    /// need and the arena is granted as planned, or the arena shrinks by the
+    /// shortfall to a grant of at least `least` (the arena's floor,
+    /// `ArenaFloor::bytes`), or the refusal [`HostNeed::check`] would give,
+    /// naming `least` when the plan has an arena that could not shrink past
+    /// it. A plan with no arena is held exactly as `check` holds it. The one
+    /// owner of the arena's shrink: the caller reads the grant, never
+    /// recomputes it.
+    pub fn grant(self, available: u64, least: u64) -> Result<ArenaGrant, HostShort> {
+        let planned = self.arena;
+        let Some(short) = self.bytes().checked_sub(available).filter(|&s| s > 0) else {
+            return Ok(ArenaGrant::whole(planned));
+        };
+        match planned.checked_sub(short) {
+            Some(granted) if planned > 0 && granted >= least => Ok(ArenaGrant { planned, granted }),
+            _ => Err(HostShort {
+                need: self,
+                available,
+                floor: (planned > 0).then_some(least),
+            }),
+        }
+    }
+}
+
+/// The NVMe tier arena a load builds: the bytes its plan reserved and the
+/// bytes the host's reading let the load take ([`HostNeed::grant`]). They
+/// differ only when the reading fell short of the plan's need by less than
+/// the arena's room above its floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaGrant {
+    pub planned: u64,
+    pub granted: u64,
+}
+
+impl ArenaGrant {
+    /// A load that takes the arena as its plan reserved it.
+    #[must_use]
+    pub fn whole(planned: u64) -> ArenaGrant {
+        ArenaGrant {
+            planned,
+            granted: planned,
+        }
+    }
+
+    /// Bytes the arena shrank by at load.
+    #[must_use]
+    pub fn shrunk(&self) -> u64 {
+        self.planned - self.granted
     }
 }
 
@@ -667,6 +718,10 @@ fn os_reserve(host: &Host) -> u64 {
 pub struct HostShort {
     pub need: HostNeed,
     pub available: u64,
+    /// On a refusal of [`HostNeed::grant`] for a plan with an arena: the
+    /// floor the arena could not shrink past. `None` from
+    /// [`HostNeed::check`], which never shrinks it.
+    pub floor: Option<u64>,
 }
 
 impl fmt::Display for HostShort {
@@ -691,6 +746,13 @@ impl fmt::Display for HostShort {
         }
         if n.arena > 0 {
             write!(f, " + NVMe tier arena {} B", n.arena)?;
+            if let Some(floor) = self.floor {
+                write!(
+                    f,
+                    " (the load shrinks the arena by the shortfall, and the shortfall leaves it \
+                     under its floor {floor} B)"
+                )?;
+            }
         }
         if n.cards > 0 {
             write!(f, " + the cards' share of the unified pool {} B", n.cards)?;
@@ -786,6 +848,25 @@ impl HostRead {
             HostRead::Cgroup { path } => format!("cgroup:{path}"),
             HostRead::Given => "given".to_string(),
         }
+    }
+}
+
+/// The host bytes a load's own start may take between the reading its plan
+/// is made at and the load's check ([`HostNeed::grant`]): a chosen bound,
+/// not a derived one. A plan made at a read room keeps it ([`plan_room`]),
+/// so a split that fills its room exactly still passes the check at the
+/// load.
+pub const HOST_DRIFT: u64 = 512 * MIB;
+
+/// The room a plan is made at, for the room `room` that [`host_room`] (or a
+/// caller) gave: a [`HostRead::Given`] room as given, a read room less
+/// [`HOST_DRIFT`] (to 0 at most). The one place a read room becomes a
+/// plan's room.
+#[must_use]
+pub fn plan_room(room: &(u64, HostRead)) -> u64 {
+    match room.1 {
+        HostRead::Given => room.0,
+        HostRead::MemAvailable | HostRead::Cgroup { .. } => room.0.saturating_sub(HOST_DRIFT),
     }
 }
 
@@ -943,11 +1024,11 @@ pub fn host_room(meminfo: &str, levels: &[CgroupLevel<'_>]) -> Result<(u64, Host
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceInfo, Host, HostNeed, HostRead, Machine,
-        PLAN_ROOM, PlacementError, RTX_3090, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
-        TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room, cgroup_v2_path, host, host_room,
-        mem_available, plan_a, plan_bp, plan_gate, plan_on, plan_tiers, spec_of_device, tier,
-        tier_batch_bytes, unified_of,
+        A6000, ArenaGrant, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceInfo, HOST_DRIFT, Host,
+        HostNeed, HostRead, Machine, PLAN_ROOM, PlacementError, RTX_3090, TIER_BATCH_HOST_RESERVE,
+        TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room,
+        cgroup_v2_path, host, host_room, mem_available, plan_a, plan_bp, plan_gate, plan_on,
+        plan_room, plan_tiers, spec_of_device, tier, tier_batch_bytes, unified_of,
     };
 
     /// One plan room: `tools/ref/plan-room.sh --room`, the room
@@ -1414,5 +1495,153 @@ mod tests {
         ] {
             assert!(text.contains(part), "{part:?} in {text}");
         }
+    }
+
+    /// The numbers of the paged Qwen3.8 load that a 32 GB host refused: the
+    /// need's terms, its arena, and the lowered reading the load took.
+    fn paged_need() -> HostNeed {
+        HostNeed {
+            experts: 2_035_302_400,
+            tables: 0,
+            shadows: 0,
+            reserves: 11_955_785_728,
+            extra: 0,
+            arena: 20_335_071_232,
+            cards: 0,
+            os: 6_694_629_376,
+            card_budget: false,
+        }
+    }
+
+    const PAGED_AVAILABLE: u64 = 27_499_458_560;
+
+    /// A reading under the need by less than the arena's room above its
+    /// floor shrinks the arena by the shortfall, and the shrunk need passes
+    /// the same reading.
+    #[test]
+    fn grant_shrinks_the_arena_by_the_shortfall() {
+        let need = paged_need();
+        assert_eq!(need.bytes(), 27_631_529_984);
+        let least = 1 << 30;
+        let grant = need
+            .grant(PAGED_AVAILABLE, least)
+            .expect("the arena shrinks");
+        assert_eq!(
+            grant,
+            ArenaGrant {
+                planned: 20_335_071_232,
+                granted: 20_335_071_232 - 132_071_424,
+            }
+        );
+        assert_eq!(grant.shrunk(), 132_071_424);
+        let shrunk = HostNeed {
+            arena: grant.granted,
+            ..need
+        };
+        assert_eq!(shrunk.check(PAGED_AVAILABLE), Ok(()));
+    }
+
+    /// A shortfall past the arena's room above its floor is refused, naming
+    /// the floor; the shortfall that leaves exactly the floor is granted; a
+    /// plan with no arena is refused exactly as `check` refuses it.
+    #[test]
+    fn grant_refuses_a_shortfall_past_the_floor() {
+        let need = paged_need();
+        let least = 4 << 30;
+        let room = need.arena - least;
+        let at_floor = need.grant(need.bytes() - room, least).expect("the floor");
+        assert_eq!(at_floor.granted, least);
+        let past = need
+            .grant(need.bytes() - room - 1, least)
+            .expect_err("one byte past the floor");
+        assert_eq!(past.floor, Some(least));
+        let text = past.to_string();
+        assert!(
+            text.contains(&format!("under its floor {least} B")),
+            "the floor in {text}"
+        );
+        let bare = HostNeed { arena: 0, ..need };
+        let short = bare.bytes() - 1;
+        let refused = bare.grant(short, least).expect_err("no arena to shrink");
+        assert_eq!(Some(refused), bare.check(short).err());
+        assert_eq!(refused.floor, None);
+        assert_eq!(bare.grant(bare.bytes(), least), Ok(ArenaGrant::whole(0)));
+    }
+
+    /// A reading that covers the need grants the arena as planned, whatever
+    /// the floor.
+    #[test]
+    fn grant_keeps_a_covered_arena_whole() {
+        let need = paged_need();
+        for available in [need.bytes(), need.bytes() + 1, u64::MAX] {
+            for least in [0, 1 << 30, need.arena + 1] {
+                assert_eq!(
+                    need.grant(available, least),
+                    Ok(ArenaGrant::whole(need.arena)),
+                    "available {available} floor {least}"
+                );
+            }
+        }
+    }
+
+    /// The numbers of the unpaged Qwen3.8 load that a 64 GB host refused:
+    /// the need's terms, with no arena to shrink.
+    fn unpaged_need() -> HostNeed {
+        HostNeed {
+            experts: 59_267_686_400,
+            tables: 0,
+            shadows: 0,
+            reserves: 8_533_127_168,
+            extra: 0,
+            arena: 0,
+            cards: 0,
+            os: 6_694_629_376,
+            card_budget: false,
+        }
+    }
+
+    const UNPAGED_AVAILABLE: u64 = 60_943_515_648;
+    const UNPAGED_SHORT: u64 = 162_668_544;
+
+    /// A load with no arena is held to its need exactly: the reading under
+    /// the need is refused, and `grant` has nothing to shrink.
+    #[test]
+    fn an_unpaged_load_short_of_its_need_is_refused() {
+        let need = unpaged_need();
+        assert_eq!(need.bytes(), 61_106_184_192);
+        assert_eq!(need.bytes() - UNPAGED_AVAILABLE, UNPAGED_SHORT);
+        let short = need
+            .check(UNPAGED_AVAILABLE)
+            .expect_err("the reading is short");
+        assert_eq!(short.floor, None);
+        assert_eq!(need.grant(UNPAGED_AVAILABLE, 0), Err(short));
+        assert_eq!(need.check(need.bytes()), Ok(()));
+    }
+
+    /// A plan made at a read room holds its need a margin under the
+    /// reading, so a load whose reading fell by the margin or less still
+    /// covers it: the plan of the unpaged need above is made only at a
+    /// reading of its need plus the margin, and the reading the load took
+    /// there is the need or more.
+    #[test]
+    fn a_plan_room_covers_a_load_that_drifted_by_the_margin() {
+        let need = unpaged_need().bytes();
+        let at = |read: u64| plan_room(&(read, HostRead::MemAvailable));
+        assert!(
+            at(need) < need,
+            "a reading of the need plans a room under it"
+        );
+        let planned_at = need + HOST_DRIFT;
+        assert!(
+            need <= at(planned_at),
+            "the least reading that holds the need"
+        );
+        assert!(at(planned_at - 1) < need, "one byte under pages");
+        assert_eq!(
+            unpaged_need().check(planned_at - UNPAGED_SHORT),
+            Ok(()),
+            "the reporter's drift is under the margin"
+        );
+        assert!(unpaged_need().check(planned_at - HOST_DRIFT - 1).is_err());
     }
 }
