@@ -39,17 +39,25 @@
 //! the total the N slots split): `/props`' `n_ctx` is a
 //! slot's number, a prompt that long is a 400 before it reaches the engine,
 //! and generation stops there with `truncated`. Unset, the context is
-//! `placement::ctx::default_slot_ctx`'s answer over a slot's share (the one
-//! rule every serving seat takes, [`CTX`] a slot, steps of [`CTX_STEP`], a
-//! margin of `MARGIN` card expert bytes): the largest multiple of
-//! [`CTX_STEP`] up to the fit (the largest a slot's N-slot plan holds on the
-//! card, at most the file's serving cap) whose plan holds at most the plan's
-//! own margin (`MARGIN`) fewer card expert bytes than the N-slot plan at
-//! [`CTX`] a slot and no more NVMe expert bytes, the fit when every context
-//! does — the largest the card holds when that is fewer than [`CTX`] — and
-//! at most what lets one session's sequence state with its two recurrent
-//! copies fit the prompt cache's budget (one session's whole slot context
-//! can be saved). Set, a total a slot's share of which passes the file's
+//! `placement::ctx::default_slot_ctx_by_card`'s answer over a slot's share
+//! (the one rule every serving seat takes, [`CTX`] a slot, steps of
+//! [`CTX_STEP`], a margin of `MARGIN` card expert bytes): the card decides it
+//! and the host room only vetoes it. The card's context is the largest
+//! multiple of [`CTX_STEP`] up to the fit (the largest a slot's N-slot plan
+//! holds on the card at an unbounded host room, at most the file's serving
+//! cap) whose plan holds at most the plan's own margin (`MARGIN`) fewer card
+//! expert bytes than the N-slot plan at [`CTX`] a slot, the fit when every
+//! context does — the largest the card holds when that is fewer than
+//! [`CTX`]. Where the plan at the room read pages no expert at [`CTX`], the
+//! card's context stands only if the plan at the room read pages none there
+//! either, else the answer is [`CTX`] (the `host` rule), so a reading of the
+//! room never picks a depth between the two. Where that plan pages already,
+//! the answer is the largest such context whose plan misses the arena on at
+//! most a hundredth of the base's missed expert bytes more
+//! (`placement::ctx::NVME_SLACK_DIV`). The answer is also at most what lets
+//! one session's sequence state with its two recurrent copies fit the prompt
+//! cache's budget (one session's whole slot context can be saved). Set, a
+//! total a slot's share of which passes the file's
 //! `context_length` (`place::serve_ctx`: YaRN scaling past it is not built),
 //! then one whose N-slot plan the card cannot hold beside the plan's dense
 //! weights — the largest slot context any N-slot plan of the file and the
@@ -61,12 +69,14 @@
 //! `verified`, the deepest context the reference sets hold our numbers to
 //! ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`, `/props`'
 //! `engine.ctx_verified`), which bounds nothing. A `ctx` line on stderr names
-//! the rule (`card`, `base`, `fit`, `margin`, or `cache` where the prompt
-//! cache's budget lowered it), the slot context, the slots and the total
-//! they serve, the cap, the largest context the card holds with its card
-//! expert bytes, and the largest whose plan holds at most the plan's own
-//! margin (`MARGIN`) fewer card expert bytes than the plan at [`CTX`] a slot
-//! (`margin_ctx`): more positions on the card push card experts to the host.
+//! the rule (`card`, `base`, `fit`, `margin`, `host` where the host room
+//! vetoed the card's context, or `cache` where the prompt cache's budget
+//! lowered it), the slot context, the slots and the total they serve, the
+//! cap, the largest context the card holds with its card expert bytes, and
+//! the largest whose plan holds at most the plan's own margin (`MARGIN`)
+//! fewer card expert bytes than the plan at [`CTX`] a slot (`margin_ctx`;
+//! under `host` the context the room vetoed): more positions on the card push
+//! card experts to the host.
 //! `--plan` prints the records the decisions before the load make (the `ctx`
 //! line, the `plan` and `residency` records) and exits 0 before the route
 //! trace's directory is made or any model is loaded.
@@ -360,7 +370,7 @@ use model::arch::qwen35moe::place::{
     tier_batch,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::ctx::{ExpertBytes, Refused, SlotCtx, default_slot_ctx, fit_of};
+use model::placement::ctx::{ExpertBytes, Refused, SlotCtx, default_slot_ctx_by_card, fit_of};
 use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN, host_available_read};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
@@ -991,9 +1001,10 @@ fn fit38(plans: &Plans<'_>) -> Result<usize, GateError> {
 /// when the file's serving cap takes a slot's share of the total
 /// (`place::serve_ctx`, refused by name past it) and it fits the card
 /// ([`fit38`]), else refused by name; unset, the common rule's answer
-/// (`placement::ctx::default_slot_ctx`: [`CTX`] a slot, [`CTX_STEP`], a
-/// margin of `MARGIN` card expert bytes). The prompt cache's bound comes
-/// after ([`Ctx38::host_bound`]).
+/// (`placement::ctx::default_slot_ctx_by_card`: [`CTX`] a slot, [`CTX_STEP`],
+/// a margin of `MARGIN` card expert bytes) over two probes of the same plan,
+/// the card's at an unbounded host room ([`room_free`]) and the load's at the
+/// room read. The prompt cache's bound comes after ([`Ctx38::host_bound`]).
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
     let n = plans.slots;
     if let Some(c) = set {
@@ -1050,11 +1061,39 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
             }
         };
     }
-    let found = default_slot_ctx(cap38(plans)?, CTX, CTX_STEP, MARGIN, &|c| {
-        plans.expert_bytes(c)
-    })
+    // The card decides, the host room only vetoes: the plan at an unbounded
+    // room is the card's probe, the plan at the room read the veto's.
+    let free = room_free(plans.inputs);
+    let card = Plans {
+        inputs: &free,
+        ..*plans
+    };
+    let found = default_slot_ctx_by_card(
+        cap38(plans)?,
+        CTX,
+        CTX_STEP,
+        MARGIN,
+        &|c| card.expert_bytes(c),
+        &|c| plans.expert_bytes(c),
+    )
     .map_err(refusal38)?;
     Ok(Ctx38::Rule { found, slots: n })
+}
+
+/// `inputs` with the host room unbounded (`HostRead::Given` of every byte):
+/// the plan it makes pages no expert to the NVMe tier and keeps the PLE table
+/// on the host, so what it holds on the card is the card's alone. A machine
+/// whose card shares the host's memory (a unified pool) has no such plan; the
+/// pool binds both probes alike.
+fn room_free(inputs: &PlanInputs) -> PlanInputs {
+    PlanInputs {
+        hp: inputs.hp.clone(),
+        model: inputs.model.clone(),
+        spec: inputs.spec.clone(),
+        kv: inputs.kv.clone(),
+        room: (u64::MAX, HostRead::Given),
+        arena: inputs.arena,
+    }
 }
 
 impl Ctx38 {

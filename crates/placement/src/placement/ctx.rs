@@ -1,7 +1,7 @@
 //! The serving seats' shared `--ctx` rules: the bisection the seats'
 //! searches run ([`largest`]), the context a slot takes when the flag names
-//! none ([`default_slot_ctx`], over [`fit_of`]'s largest context the plan
-//! holds), the prompt-cache guard that bounds it by the budget the plan
+//! none ([`default_slot_ctx_by_card`], over [`fit_of`]'s largest context the
+//! plan holds), the prompt-cache guard that bounds it by the budget the plan
 //! leaves at each context ([`within_cache`]), the search over a context grid
 //! the mimo2 default runs ([`searched`]) and the slot count a `--ctx` flag
 //! buys ([`slots_of`]) — more positions on the card push card experts to the
@@ -14,6 +14,25 @@
 //! are the terms the seats already share, and every model-specific input —
 //! the plan's bytes, the base a slot, the step, the margin, the cap — enters
 //! as an argument.
+//!
+//! A context the flag did not name is decided by the card; the host room may
+//! veto it, never choose it. On a plan that pages nothing at the base, a
+//! deeper context's missed bytes are its whole host need past the room, so a
+//! rule that asked only "does the deeper plan still fit the room read" would
+//! ride the room's slack one step at a time (a checkpoint a slot every few
+//! thousand positions, the KV positions' card experts moved to the host), and
+//! two readings of one machine a few hundred megabytes apart would give two
+//! defaults. A seat therefore plans each context twice: `card`, at an
+//! unbounded host room, and `probe`, at the room read. [`default_slot_ctx_by_card`]
+//! takes the context `c*` the margin rule gives over `card` (which pages
+//! nothing, so the card clause alone decides), and keeps it only when the
+//! `probe` plan at `c*` also pages no more than the base's: the answer is
+//! `c*` or the base, both fixed by the card and the file, and the room enters
+//! through one comparison, at the host bytes `c*` needs past the base. A base
+//! that pages already (the room is under its need) or a card that holds
+//! under the base runs the one-probe rule ([`default_slot_ctx`]) over `probe`
+//! alone: there the room cancels out of a deeper context's extra missed
+//! bytes, which are its extra host need, so the answer does not ride it.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -141,7 +160,8 @@ impl ExpertBytes {
     /// Whether this plan, a deeper context's, is within `margin` of `base`'s:
     /// at most `margin` fewer card expert bytes and at most
     /// [`ExpertBytes::nvme_bound`] more missed expert bytes. The one owner of
-    /// "within" for [`default_slot_ctx`].
+    /// "within" for the default rule ([`default_slot_ctx`],
+    /// [`default_slot_ctx_by_card`]).
     fn within(self, base: Self, margin: u64) -> bool {
         base.card.saturating_sub(self.card) <= margin
             && self.miss() <= base.miss().saturating_add(base.nvme_bound())
@@ -293,6 +313,9 @@ pub const RULE_BASE: &str = "base";
 pub const RULE_FIT: &str = "fit";
 /// The margin binds: the largest multiple of the step within it.
 pub const RULE_MARGIN: &str = "margin";
+/// The host room vetoed the card's deeper context: its plan at the room read
+/// pages more than the base's does, or is refused, so the base stands.
+pub const RULE_HOST: &str = "host";
 
 /// What [`default_slot_ctx`] chose and the terms it chose by: a seat prints
 /// them as one line ([`SlotCtx::line`]).
@@ -303,23 +326,26 @@ pub struct SlotCtx {
     /// [`SlotCtx::chosen`] at the new context, and leaves the scan's terms
     /// below as they are.
     pub ctx: usize,
-    /// What set it: [`RULE_CARD`], [`RULE_BASE`], [`RULE_FIT`] or
-    /// [`RULE_MARGIN`], or the seat's own word for a bound it applied.
+    /// What set it: [`RULE_CARD`], [`RULE_BASE`], [`RULE_FIT`],
+    /// [`RULE_MARGIN`] or [`RULE_HOST`], or the seat's own word for a bound it
+    /// applied.
     pub rule: &'static str,
     /// The most a slot may take, as the seat's model gives it (the trained
     /// context, capped where the engine's is).
     pub cap: usize,
     /// The largest context a slot holds up to `cap` ([`fit_of`]) and its
-    /// plan's bytes.
+    /// plan's bytes: the card's, at an unbounded host room, where the card
+    /// decided ([`default_slot_ctx_by_card`]).
     pub fit: usize,
     pub fit_bytes: ExpertBytes,
-    /// The scan's answer: `ctx` as [`default_slot_ctx`] returns it.
+    /// The scan's answer: `ctx` as the rule returns it, except under
+    /// [`RULE_HOST`], where it is the card's context the host room vetoed.
     pub margin_ctx: usize,
     /// The context the margin counts against, `base` or `fit` when that is
-    /// fewer, and its plan's bytes.
+    /// fewer, and its plan's bytes at the room read.
     pub base_ctx: usize,
     pub base: ExpertBytes,
-    /// The plan's bytes at `ctx`.
+    /// The plan's bytes at `ctx`, at the room read.
     pub chosen: ExpertBytes,
     /// The margin the rule held `chosen` to.
     pub margin: u64,
@@ -363,18 +389,127 @@ impl SlotCtx {
     }
 }
 
-/// The context a slot takes when the flag names none, every number a slot's:
-/// `fit` ([`fit_of`] up to `cap`) when it is under `base` ([`RULE_CARD`]:
-/// the card holds fewer than a base context), else the largest multiple of
-/// `step` up to `fit` whose plan holds at most `margin` fewer card expert
-/// bytes than the plan at `base` and misses the arena on at most
-/// [`ExpertBytes::nvme_bound`] more expert bytes — `fit` when its plan does ([`RULE_FIT`]), `base`
-/// when no step past it does ([`RULE_BASE`], and a fit at the base), else the
-/// step that binds ([`RULE_MARGIN`]). The miss clause stops a deeper context
-/// from buying positions with reads from a tier slower than the host's
-/// beyond [`NVME_SLACK_DIV`]'s fraction of the base's, whether it pays with
-/// experts moved to the tier or with the arena it gives up: none on a base
-/// that misses none.
+/// The terms every form of the default rule shares: the cap, the base a slot,
+/// the step the answer moves in and the card expert bytes it may trade.
+#[derive(Clone, Copy)]
+struct Rule {
+    cap: usize,
+    base: usize,
+    step: usize,
+    margin: u64,
+}
+
+impl Rule {
+    /// The answer over the one probe `probes`, given its fit and its plan at
+    /// the base (`min(base, fit)`).
+    fn over<E>(
+        self,
+        probes: &Probes<'_, E>,
+        (fit, fit_bytes): (usize, ExpertBytes),
+        at_base: ExpertBytes,
+    ) -> SlotCtx {
+        let Rule {
+            cap,
+            base,
+            step,
+            margin,
+        } = self;
+        let base_ctx = base.min(fit);
+        let (ctx, rule, chosen) = if fit < base {
+            (fit, RULE_CARD, at_base)
+        } else {
+            let (ctx, chosen) = scan(fit, base_ctx, at_base, step, margin, probes);
+            let rule = match ctx {
+                c if c == base_ctx => RULE_BASE,
+                c if c == fit => RULE_FIT,
+                _ => RULE_MARGIN,
+            };
+            (ctx, rule, chosen)
+        };
+        SlotCtx {
+            ctx,
+            rule,
+            cap,
+            fit,
+            fit_bytes,
+            margin_ctx: ctx,
+            base_ctx,
+            base: at_base,
+            chosen,
+            margin,
+            nvme_bound: at_base.nvme_bound(),
+        }
+    }
+
+    /// The answer where the base stands at the read room and pages nothing
+    /// and the card holds the base (`card_fit`, over `cards`): the margin
+    /// rule's context over `cards` if `probes`' plan there pages no more than
+    /// the base's, else the base ([`RULE_HOST`]).
+    fn by_card<E>(
+        self,
+        (probes, cards): (&Probes<'_, E>, &Probes<'_, E>),
+        (card_fit, card_fit_bytes): (usize, ExpertBytes),
+        at_base: ExpertBytes,
+    ) -> Result<SlotCtx, Refused<E>> {
+        let Rule {
+            cap,
+            base,
+            step,
+            margin,
+        } = self;
+        let card_base = cards.named(base)?;
+        let (star, _) = scan(card_fit, base, card_base, step, margin, cards);
+        let (ctx, rule, chosen) = if star == base {
+            (base, RULE_BASE, at_base)
+        } else {
+            match probes.at(star) {
+                Ok(plan) if plan.within(at_base, margin) => {
+                    let rule = if star == card_fit {
+                        RULE_FIT
+                    } else {
+                        RULE_MARGIN
+                    };
+                    (star, rule, plan)
+                }
+                _ => (base, RULE_HOST, at_base),
+            }
+        };
+        Ok(SlotCtx {
+            ctx,
+            rule,
+            cap,
+            fit: card_fit,
+            fit_bytes: card_fit_bytes,
+            margin_ctx: star,
+            base_ctx: base,
+            base: at_base,
+            chosen,
+            margin,
+            nvme_bound: at_base.nvme_bound(),
+        })
+    }
+}
+
+/// The context a slot takes when the flag names none, over one probe, every
+/// number a slot's: `fit` ([`fit_of`] up to `cap`) when it is under `base`
+/// ([`RULE_CARD`]: the card holds fewer than a base context), else the
+/// largest multiple of `step` up to `fit` whose plan holds at most `margin`
+/// fewer card expert bytes than the plan at `base` and misses the arena on at
+/// most [`ExpertBytes::nvme_bound`] more expert bytes — `fit` when its plan
+/// does ([`RULE_FIT`]), `base` when no step past it does ([`RULE_BASE`], and a
+/// fit at the base), else the step that binds ([`RULE_MARGIN`]). The miss
+/// clause stops a deeper context from buying positions with reads from a tier
+/// slower than the host's beyond [`NVME_SLACK_DIV`]'s fraction of the base's,
+/// whether it pays with experts moved to the tier or with the arena it gives
+/// up: none on a base that misses none.
+///
+/// A seat whose plan reads a host room does not call this form: over a probe
+/// at the room read, a base that misses none makes the miss clause "the
+/// deeper plan's whole host need fits the room", and the answer rides the
+/// room's reading. That seat plans a second probe at an unbounded room and
+/// calls [`default_slot_ctx_by_card`], which runs this form where the room
+/// cancels out (a base that pages, a card under the base). This form is the
+/// whole rule for a plan that reads no room.
 ///
 /// `probe` plans one context. A context past the base whose plan is refused
 /// is not within (a probe is never the seat's refusal), and each context is
@@ -406,32 +541,85 @@ pub fn default_slot_ctx<E>(
     assert!(step > 0, "a context step of 0");
     let probes = Probes::new(probe);
     let (fit, fit_bytes) = fit_probed(cap, &probes)?;
-    let base_ctx = base.min(fit);
-    let at_base = probes.named(base_ctx)?;
-    let (ctx, rule, chosen) = if fit < base {
-        (fit, RULE_CARD, at_base)
-    } else {
-        let (ctx, chosen) = scan(fit, base_ctx, at_base, step, margin, &probes);
-        let rule = match ctx {
-            c if c == base_ctx => RULE_BASE,
-            c if c == fit => RULE_FIT,
-            _ => RULE_MARGIN,
-        };
-        (ctx, rule, chosen)
-    };
-    Ok(SlotCtx {
-        ctx,
-        rule,
+    let at_base = probes.named(base.min(fit))?;
+    let rule = Rule {
         cap,
-        fit,
-        fit_bytes,
-        margin_ctx: ctx,
-        base_ctx,
-        base: at_base,
-        chosen,
+        base,
+        step,
         margin,
-        nvme_bound: at_base.nvme_bound(),
-    })
+    };
+    Ok(rule.over(&probes, (fit, fit_bytes), at_base))
+}
+
+/// The context a slot takes when the flag names none, decided by the card:
+/// the host room may veto it, never choose it. Two probes plan a context: `card`
+/// at an unbounded host room and `probe` at the room read.
+///
+/// 1. `probe`'s fit and its plan at the base come first, as in
+///    [`default_slot_ctx`]. If `probe` holds fewer than a base context
+///    ([`RULE_CARD`]), or its base plan misses any expert byte
+///    ([`ExpertBytes::miss`]: the room is under the base's need, so a deeper
+///    context's extra missed bytes are its extra host need and the room
+///    cancels out of the miss clause), the answer is [`default_slot_ctx`]'s
+///    over `probe` alone.
+/// 2. Otherwise the base stands at the room read and pages nothing. `card`'s
+///    fit is taken; if the card holds under the base the answer is again
+///    [`default_slot_ctx`]'s over `probe`.
+/// 3. Otherwise `c*` is [`default_slot_ctx`]'s scan over `card` (the fit and
+///    the margin from `card`; its plan pages nothing, so the card clause
+///    alone decides). When `c*` is the base the answer is the base
+///    ([`RULE_BASE`]). Else the `probe` plan at `c*` must stand and be within
+///    the margin of `probe`'s base plan, with no expert byte missed past it
+///    ([`ExpertBytes::within`]); then the answer is `c*` ([`RULE_FIT`] or
+///    [`RULE_MARGIN`]), else the base ([`RULE_HOST`], `c*` kept as
+///    [`SlotCtx::margin_ctx`]).
+///
+/// Stable by construction: in step 3 the answer is the base or `c*`, both
+/// fixed by the card and the file; the room enters through one comparison, at
+/// `need(c*) - need(base)`, so a reading's noise changes the answer only when
+/// the reading falls within that noise of that one threshold. A host whose
+/// slack lies between 0 and that threshold gets the base, where
+/// [`default_slot_ctx`] gave it an intermediate depth that moved with the
+/// reading.
+///
+/// `fit` and `fit_bytes` are `card`'s in step 3. Each probe plans a context at
+/// most once, and `card` is asked only in steps 2 and 3. A plan that reads no
+/// room gets [`default_slot_ctx`]'s answer from this form too (the same plan
+/// as `card` and `probe`), at twice the probes.
+///
+/// # Errors
+/// [`Refused`] as [`default_slot_ctx`]'s over `probe`; in steps 2 and 3 also
+/// `card`'s refusal at 1 or at the base while `probe`'s base stands (the
+/// probes disagree: a room cannot make a plan stand).
+///
+/// # Panics
+/// On a `cap` or a `step` of 0.
+pub fn default_slot_ctx_by_card<E>(
+    cap: usize,
+    base: usize,
+    step: usize,
+    margin: u64,
+    card: &dyn Fn(usize) -> Result<ExpertBytes, E>,
+    probe: &dyn Fn(usize) -> Result<ExpertBytes, E>,
+) -> Result<SlotCtx, Refused<E>> {
+    assert!(step > 0, "a context step of 0");
+    let rule = Rule {
+        cap,
+        base,
+        step,
+        margin,
+    };
+    let probes = Probes::new(probe);
+    let (fit, fit_bytes) = fit_probed(cap, &probes)?;
+    let at_base = probes.named(base.min(fit))?;
+    if fit >= base && at_base.miss() == 0 {
+        let cards = Probes::new(card);
+        let (card_fit, card_fit_bytes) = fit_probed(cap, &cards)?;
+        if card_fit >= base {
+            return rule.by_card((&probes, &cards), (card_fit, card_fit_bytes), at_base);
+        }
+    }
+    Ok(rule.over(&probes, (fit, fit_bytes), at_base))
 }
 
 /// The context a default keeps when the prompt cache must hold one sequence
@@ -745,20 +933,42 @@ mod tests {
         }
     }
 
-    /// The default up to `cap` over `probe`, with the probes it took.
+    /// `probe` at an unbounded host room: the same plan, with no expert on
+    /// the NVMe tier and no arena (a plan pages for want of room, and a given
+    /// room of every byte pages nothing); a refusal stays a refusal.
+    fn unbounded(
+        probe: &impl Fn(usize) -> Result<ExpertBytes, String>,
+    ) -> impl Fn(usize) -> Result<ExpertBytes, String> + '_ {
+        move |c| {
+            probe(c).map(|bytes| ExpertBytes {
+                nvme: 0,
+                arena: 0,
+                ..bytes
+            })
+        }
+    }
+
+    /// The default up to `cap` over `probe` and its unbounded twin
+    /// ([`unbounded`]), with the most probes either asked for (each probe is
+    /// held to the one-probe rule's bound alone).
     fn run(
         cap: usize,
         step: usize,
         margin: u64,
         probe: impl Fn(usize) -> Result<ExpertBytes, String>,
     ) -> (Result<SlotCtx, Refused<String>>, usize) {
-        let count = Count::new();
-        let counted = |c: usize| {
-            count.take();
+        let (read, card) = (Count::new(), Count::new());
+        let free = unbounded(&probe);
+        let counted_read = |c: usize| {
+            read.take();
             probe(c)
         };
-        let got = default_slot_ctx(cap, AT, step, margin, &counted);
-        (got, count.0.get())
+        let counted_card = |c: usize| {
+            card.take();
+            free(c)
+        };
+        let got = default_slot_ctx_by_card(cap, AT, step, margin, &counted_card, &counted_read);
+        (got, read.0.get().max(card.0.get()))
     }
 
     /// The probes a default may take over a context range: the fit search's
@@ -1027,29 +1237,53 @@ mod tests {
 
     /// NVMe expert bytes growing past the base's bound ([`NVME_SLACK_DIV`])
     /// stop the default below the context where they do, though the card's
-    /// margin holds there: a base that pages none keeps none, and bytes that
-    /// stay or fall are within.
+    /// margin holds there: a base that pages keeps its bound, and bytes that
+    /// stay or fall are within. A base that pages none has the card decide
+    /// and the room veto: the plan's NVMe bytes there are the room's, so the
+    /// card's context is kept whole or not at all.
     #[test]
     fn default_ctx_stops_where_nvme_grows() {
         let grows_past_6000 = |base: u64| move |c: usize| base + c.saturating_sub(6000) as u64 * 10;
-        // The margin never binds; the NVMe bytes grow at 6001 and the answer
-        // is the last multiple of 256 under it.
-        for base in [0, 500] {
-            let (got, probes) = run(
-                262_144,
-                STEP,
-                1 << 40,
-                plan(CARD, AT, 1, grows_past_6000(base)),
-            );
-            let got = got.expect("a plan");
-            assert_eq!((got.ctx, got.rule), (5888, "margin"), "base NVMe {base}");
-            assert_eq!(
-                (got.base.nvme, got.chosen.nvme),
-                (base, base),
-                "the base's NVMe bytes held"
-            );
-            assert!(probes <= probe_bound(262_144, STEP), "{probes} probes");
-        }
+        // A base that pages 500 B: the margin never binds, the NVMe bytes
+        // grow past the bound of 5 B at 6001 and the answer is the last
+        // multiple of 256 under it.
+        let (got, probes) = run(
+            262_144,
+            STEP,
+            1 << 40,
+            plan(CARD, AT, 1, grows_past_6000(500)),
+        );
+        let got = got.expect("a plan");
+        assert_eq!((got.ctx, got.rule), (5888, "margin"), "base NVMe 500");
+        assert_eq!(
+            (got.base.nvme, got.chosen.nvme),
+            (500, 500),
+            "the base's NVMe bytes held"
+        );
+        assert!(probes <= probe_bound(262_144, STEP), "{probes} probes");
+        // A base that pages none. PIN(2026-10-12): the base, by the host's
+        // veto, where the answer was 5888 by the margin rule. The card
+        // (an unbounded room) pages nothing at any context, so its context is
+        // the fit, 262,144, and the plan at the room read pages there: the
+        // room the NVMe bytes grew with decided the old answer. Re-pin by the
+        // rule of #46 (the card decides, the room only vetoes), not a
+        // relaxation: the one-probe form still gives 5888.
+        let grows = plan(CARD, AT, 1, grows_past_6000(0));
+        let (got, probes) = run(262_144, STEP, 1 << 40, &grows);
+        let got = got.expect("a plan");
+        assert_eq!(
+            (got.ctx, got.rule, got.margin_ctx),
+            (AT, "host", 262_144),
+            "base NVMe 0"
+        );
+        assert_eq!(
+            (got.base.nvme, got.chosen.nvme),
+            (0, 0),
+            "the base's NVMe bytes held"
+        );
+        assert!(probes <= probe_bound(262_144, STEP), "{probes} probes");
+        let one = default_slot_ctx(262_144, AT, STEP, 1 << 40, &grows).expect("a plan");
+        assert_eq!((one.ctx, one.rule), (5888, "margin"), "the one-probe form");
         // The same NVMe bytes at every context, or fewer, are within.
         let (got, _) = run(9000, STEP, 1 << 40, plan(CARD, AT, 1, |_| 500));
         assert_eq!(got.expect("a plan").ctx, 9000, "equal NVMe bytes");
@@ -1137,13 +1371,24 @@ mod tests {
 
     /// A base that pages nothing pages nothing deeper: its bound is 0 bytes,
     /// not a floor of some bytes, so the first byte the plan pages past the
-    /// base ends the search.
+    /// base ends the search. Over one probe the search stops at the context
+    /// before; the card's context (an unbounded room pages nothing) is kept
+    /// whole or vetoed to the base.
     #[test]
     fn default_ctx_pages_nothing_past_a_base_that_pages_none() {
         let probe = plan(CARD, AT, 1, |c: usize| c.saturating_sub(8192) as u64 * 100);
         let got = default_slot_ctx(20_000, AT, STEP, 1 << 40, &probe).expect("a plan");
         assert_eq!(got.nvme_bound, 0);
         assert_eq!((got.ctx, got.rule), (8192, RULE_MARGIN));
+        assert_eq!(got.chosen.nvme, 0, "no expert paged");
+        // PIN(2026-10-12): the base, by the host's veto, where the answer was
+        // 8192 by the margin rule. The card's context is the fit, 20,000, and
+        // the plan at the room read pages there. Re-pin by the rule of #46
+        // (the card decides, the room only vetoes), not a relaxation.
+        let (got, _) = run(20_000, STEP, 1 << 40, &probe);
+        let got = got.expect("a plan");
+        assert_eq!(got.nvme_bound, 0);
+        assert_eq!((got.ctx, got.rule, got.margin_ctx), (AT, RULE_HOST, 20_000));
         assert_eq!(got.chosen.nvme, 0, "no expert paged");
     }
 
@@ -1191,13 +1436,14 @@ mod tests {
     /// when the card holds fewer than a base context; else `base` when the
     /// answer is the base (no step past it within, or a fit at it), `fit` when
     /// the answer is the fit, `margin` when the margin or the NVMe tier binds
-    /// below it. A seat's own bound (a set `--ctx`, a prompt cache's room)
-    /// names itself.
+    /// below it, `host` when the card's deeper context is vetoed by the room
+    /// the plan was made at. A seat's own bound (a set `--ctx`, a prompt
+    /// cache's room) names itself.
     #[test]
     fn default_ctx_words() {
         assert_eq!(
-            [RULE_CARD, RULE_BASE, RULE_FIT, RULE_MARGIN],
-            ["card", "base", "fit", "margin"]
+            [RULE_CARD, RULE_BASE, RULE_FIT, RULE_MARGIN, RULE_HOST],
+            ["card", "base", "fit", "margin", "host"]
         );
         let word = |cap: usize, step: usize, margin: u64, nvme: fn(usize) -> u64| {
             run(cap, step, margin, plan(CARD, AT, 1, nvme))
@@ -1213,9 +1459,19 @@ mod tests {
             "no whole step past the base within the margin"
         );
         assert_eq!(
-            word(9000, STEP, 1 << 40, |c| if c > AT { 10 } else { 0 }),
+            word(9000, STEP, 1 << 40, |c| if c > AT { 510 } else { 500 }),
             "base",
-            "no step past the base holds the NVMe bytes"
+            "no step past a paging base holds the NVMe bytes"
+        );
+        // PIN(2026-10-12): `host`, where the row read `base` ("no step past
+        // the base holds the NVMe bytes"): over a base that pages none the
+        // card's context is the fit, and the plan at the room read pages
+        // there, which the room vetoes. The paged base's row above keeps the
+        // word. Re-pin by the rule of #46, not a relaxation.
+        assert_eq!(
+            word(9000, STEP, 1 << 40, |c| if c > AT { 10 } else { 0 }),
+            "host",
+            "the room pages the card's context"
         );
         assert_eq!(
             word(9000, STEP, 1 << 40, |_| 0),
@@ -1228,42 +1484,270 @@ mod tests {
             "the margin binds below the fit"
         );
         assert_eq!(
-            word(262_144, STEP, 1 << 40, |c| if c > 6000 { 10 } else { 0 }),
+            word(262_144, STEP, 1 << 40, |c| if c > 6000 { 510 } else { 500 }),
             "margin",
-            "the NVMe tier binds below the fit"
+            "the NVMe tier binds a paging base's default below the fit"
+        );
+        // PIN(2026-10-12): `host`, where the row read `margin` ("the NVMe tier
+        // binds below the fit"), over a base that pages none; as above.
+        assert_eq!(
+            word(262_144, STEP, 1 << 40, |c| if c > 6000 { 10 } else { 0 }),
+            "host",
+            "the room pages the card's context below the fit"
         );
     }
 
-    /// A context is planned once, however many of the rule's terms ask for
-    /// it: the fit's plan is the scan's first probe and the base's the
-    /// scan's, over a range, a refusing card and a whole-card load.
+    /// A context is planned once by each of the two probes, however many of
+    /// the rule's terms ask for it: the fit's plan is the scan's first probe
+    /// and the base's the scan's, over a range, a refusing card, a whole-card
+    /// load, a card context the room vetoes (the plan at the room read is the
+    /// veto's one more) and a base that pages or a card under the base, where
+    /// the card is never planned.
     #[test]
     fn default_ctx_plans_each_context_once() {
-        let rows: [(usize, u64, usize); 5] = [
-            (9000, MARGIN, usize::MAX),
-            (262_144, MARGIN, usize::MAX),
-            (262_144, 1 << 40, usize::MAX),
-            (9000, MARGIN, 4600),
-            (3000, MARGIN, usize::MAX),
+        // (cap, margin, refused past, pages past, the card probe is asked)
+        type Row = (usize, u64, usize, usize, bool);
+        let rows: [Row; 7] = [
+            (9000, MARGIN, usize::MAX, usize::MAX, true),
+            (262_144, MARGIN, usize::MAX, usize::MAX, true),
+            (262_144, 1 << 40, usize::MAX, usize::MAX, true),
+            (9000, MARGIN, 4600, usize::MAX, true),
+            (3000, MARGIN, usize::MAX, usize::MAX, false),
+            (262_144, 1 << 40, usize::MAX, 6000, true),
+            (262_144, 1 << 40, usize::MAX, 0, false),
         ];
-        for (cap, margin, refused_at) in rows {
-            let seen = RefCell::new(Vec::new());
-            let card = refused_past(refused_at, plan(CARD, AT, 1, |_| 0));
-            let probe = |c: usize| {
-                seen.borrow_mut().push(c);
-                card(c)
+        for (cap, margin, refused_at, pages_past, asks_card) in rows {
+            let (seen_read, seen_card) = (RefCell::new(Vec::new()), RefCell::new(Vec::new()));
+            let read = refused_past(
+                refused_at,
+                plan(CARD, AT, 1, |c| if c > pages_past { 10 } else { 0 }),
+            );
+            let free = unbounded(&read);
+            let counted_read = |c: usize| {
+                seen_read.borrow_mut().push(c);
+                read(c)
             };
-            default_slot_ctx(cap, AT, STEP, margin, &probe).expect("a plan");
-            let mut asked = seen.take();
-            let n = asked.len();
-            asked.sort_unstable();
-            asked.dedup();
+            let counted_card = |c: usize| {
+                seen_card.borrow_mut().push(c);
+                free(c)
+            };
+            default_slot_ctx_by_card(cap, AT, STEP, margin, &counted_card, &counted_read)
+                .expect("a plan");
+            for (which, seen) in [("read", seen_read), ("card", seen_card)] {
+                let mut asked = seen.take();
+                let n = asked.len();
+                asked.sort_unstable();
+                asked.dedup();
+                assert_eq!(
+                    asked.len(),
+                    n,
+                    "cap {cap}, margin {margin}, pages past {pages_past}: a context twice by \
+                     the {which} probe"
+                );
+                assert!(
+                    which == "read" || (n > 0) == asks_card,
+                    "cap {cap}, margin {margin}, pages past {pages_past}: the card probe asked \
+                     {n} times"
+                );
+            }
+        }
+    }
+
+    /// The report's machine as a probe model [derived, not fitted]: Qwen3.8
+    /// UD-Q4_K_XL, two slots, one card. The plan needs 59,660,632,064 B of
+    /// host at 4096 a slot and, deeper, one 130,162,688 B checkpoint a slot
+    /// for every 4096 positions (`⌈ctx / 4096⌉ + 1` points a slot: two at
+    /// 4096, four at 12288, one more at 4352) and 24,576 B a position a slot of
+    /// KV (12 GQA layers × K and V × 2 heads × 256 × f16, the model's
+    /// dimensions) whose card experts move to the host. The card holds
+    /// [`Q38_CARD`] of experts at 4096 and loses those 24,576 B a position a
+    /// slot. A plan at a room pages what the room cannot hold
+    /// (`need - room`, no arena); at an unbounded room, nothing.
+    const Q38_NEED: u64 = 59_660_632_064;
+    const Q38_CKPT: u64 = 130_162_688;
+    const Q38_KV: u64 = 24_576;
+    const Q38_SLOTS: u64 = 2;
+    const Q38_CARD: u64 = 24 << 30;
+    const GIB: u64 = 1 << 30;
+
+    /// The host bytes the model's plan needs at `c >= 4096` positions a slot.
+    fn q38_need(c: usize) -> u64 {
+        let points = c.div_ceil(4096) as u64 + 1;
+        Q38_NEED + Q38_SLOTS * Q38_CKPT * (points - 2) + Q38_SLOTS * Q38_KV * (c as u64 - 4096)
+    }
+
+    /// The model's plan at an unbounded room.
+    fn q38_card(c: usize) -> Result<ExpertBytes, String> {
+        Ok(ExpertBytes {
+            card: Q38_CARD - Q38_SLOTS * Q38_KV * (c as u64 - 4096),
+            nvme: 0,
+            arena: 0,
+        })
+    }
+
+    /// The model's plan at `room` bytes.
+    fn q38_read(room: u64) -> impl Fn(usize) -> Result<ExpertBytes, String> {
+        move |c| {
+            Ok(ExpertBytes {
+                nvme: q38_need(c).saturating_sub(room),
+                ..q38_card(c)?
+            })
+        }
+    }
+
+    /// The room that leaves `slack` bytes past the base's need.
+    fn q38_room(slack: i64) -> u64 {
+        Q38_NEED.checked_add_signed(slack).expect("a room")
+    }
+
+    /// The default of the card rule at `slack`, the cap of the trained 262,144.
+    fn q38_by_card(slack: i64) -> SlotCtx {
+        let read = q38_read(q38_room(slack));
+        default_slot_ctx_by_card(262_144, AT, STEP, GIB, &q38_card, &read).expect("a plan")
+    }
+
+    /// The default of the one-probe rule at `slack`: the room read alone.
+    fn q38_one_probe(slack: i64) -> SlotCtx {
+        let read = q38_read(q38_room(slack));
+        default_slot_ctx(262_144, AT, STEP, GIB, &read).expect("a plan")
+    }
+
+    /// The default context does not ride the host's slack [FAIL-first: the
+    /// room-read rule answers 4096 and 12288 at the report's two rooms]. The
+    /// room's slack past the base's need was 225,464,320 B in one run and
+    /// 1,003,790,336 B in the next of one command, 778,326,016 B of reading
+    /// between them. The card's context is 25,856 (a margin of 1 GiB over
+    /// 2 × 24,576 B a position), which the host holds from 2,631,499,776 B of
+    /// slack on: both rooms are under it, so both answer the base, by `host`.
+    #[test]
+    fn default_ctx_does_not_ride_the_hosts_slack() {
+        const NEAR: i64 = 225_464_320;
+        const FAR: i64 = 1_003_790_336;
+        const STAR: u64 = 2_631_499_776;
+        assert_eq!(
+            [q38_one_probe(NEAR).ctx, q38_one_probe(FAR).ctx],
+            [4096, 12_288],
+            "the model holds the report: the room-read rule rides the slack"
+        );
+        assert_eq!(q38_need(25_856) - q38_need(AT), STAR, "the threshold");
+        let (near, far) = (q38_by_card(NEAR), q38_by_card(FAR));
+        assert_eq!(
+            (near.ctx, near.rule),
+            (far.ctx, far.rule),
+            "the two readings answer alike"
+        );
+        assert_eq!(
+            (near.ctx, near.rule, near.margin_ctx),
+            (4096, RULE_HOST, 25_856)
+        );
+        assert_eq!((near.fit, near.base_ctx), (262_144, 4096));
+        assert_eq!(near.chosen, near.base, "the base's plan is the load's");
+        let line = near.line(2);
+        assert!(
+            line.starts_with("ctx rule=host ctx=4096 slots=2 total=8192 cap=262144 fit=262144 ")
+                && line.contains(" margin_ctx=25856 base=4096 "),
+            "{line}"
+        );
+        // The threshold is one comparison: the card's context at the byte it
+        // is held, the base a byte under it.
+        let held = q38_by_card(STAR as i64);
+        assert_eq!((held.ctx, held.rule), (25_856, RULE_MARGIN));
+        assert_eq!(held.chosen.nvme, 0, "no expert paged");
+        let under = q38_by_card(STAR as i64 - 1);
+        assert_eq!((under.ctx, under.rule), (4096, RULE_HOST));
+        // Any room past it answers the same.
+        assert_eq!(q38_by_card(64 << 30).ctx, 25_856);
+    }
+
+    /// The default moves only within one comparison of the host's slack
+    /// [FAIL-first]: over a slack from 0 to 6 GiB, the set where the answer
+    /// differs from the answer a reading of 778,326,016 B higher gives is the
+    /// one band under the threshold, at most that reading and one grid step
+    /// long, and every answer is the base or the card's context. The
+    /// room-read rule moves over several times that length.
+    #[test]
+    fn default_ctx_moves_only_across_one_threshold() {
+        const DRIFT: i64 = 778_326_016;
+        const GRID: i64 = 16 << 20;
+        let (mut by_card, mut one_probe) = (0, 0);
+        for slack in (0..=6 << 30).step_by(GRID as usize) {
+            let (low, high) = (q38_by_card(slack), q38_by_card(slack + DRIFT));
+            for got in [low, high] {
+                assert!(
+                    [AT, 25_856].contains(&got.ctx),
+                    "slack {slack}: {} is neither the base nor the card's context",
+                    got.ctx
+                );
+            }
+            by_card += i64::from(low.ctx != high.ctx) * GRID;
+            one_probe +=
+                i64::from(q38_one_probe(slack).ctx != q38_one_probe(slack + DRIFT).ctx) * GRID;
+        }
+        assert!(
+            by_card <= DRIFT + GRID,
+            "{by_card} B of slack answer differently across the reading"
+        );
+        assert!(
+            one_probe > 2 * DRIFT,
+            "{one_probe} B for the room-read rule: the model no longer shows the defect"
+        );
+    }
+
+    /// Where the room cancels out the card rule is the one-probe rule: a base
+    /// that pages (a room under its need, from 12 GB under) answers as the
+    /// room-read rule does, line for line, and so does a card that holds
+    /// under the base; and the probes' disagreements are refused by name: a
+    /// card plan refused at 1 or at the base while the plan at the room read
+    /// stands, and a card context the room cannot plan is the host's veto.
+    #[test]
+    fn default_ctx_is_the_one_probe_rule_where_the_room_cancels() {
+        for slack in (-(12i64 << 30)..0).step_by(64 << 20) {
             assert_eq!(
-                asked.len(),
-                n,
-                "cap {cap}, margin {margin}: a context twice"
+                q38_by_card(slack),
+                q38_one_probe(slack),
+                "a base that pages, slack {slack}"
             );
         }
+        assert_eq!(q38_by_card(-1), q38_one_probe(-1));
+        // The card holds 3000, the room-read plan stands to the cap.
+        let read = plan(CARD, AT, 1, |_| 0);
+        let card = refused_past(3000, plan(CARD, AT, 1, |_| 0));
+        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, &card, &read).expect("a plan");
+        let one = default_slot_ctx(9000, AT, STEP, MARGIN, &read).expect("a plan");
+        assert_eq!(got, one, "a card under the base");
+        // The card plan refused at 1 and at the base, the room-read plan standing.
+        let nothing = |c: usize| Err::<ExpertBytes, _>(format!("no card at {c}"));
+        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, &nothing, &read);
+        assert_eq!(
+            got,
+            Err(Refused {
+                at: 1,
+                source: "no card at 1".to_owned()
+            })
+        );
+        let no_base = |c: usize| {
+            if c == AT {
+                Err("no card base".to_owned())
+            } else {
+                plan(CARD, AT, 1, |_| 0)(c)
+            }
+        };
+        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, &no_base, &read);
+        assert_eq!(
+            got,
+            Err(Refused {
+                at: AT,
+                source: "no card base".to_owned()
+            })
+        );
+        // The room-read plan refused at the card's context: vetoed, not an error.
+        let tight = refused_past(4600, plan(CARD, AT, 1, |_| 0));
+        let got = default_slot_ctx_by_card(9000, AT, STEP, MARGIN, &read, &tight).expect("a plan");
+        assert_eq!(
+            (got.ctx, got.rule, got.margin_ctx, got.fit),
+            (AT, RULE_HOST, 4864, 9000)
+        );
+        assert_eq!(got.chosen, got.base, "the base's plan");
     }
 
     /// The `ctx` line the seats print: its field names are what the gates

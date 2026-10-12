@@ -70,7 +70,7 @@
 //! stderr line names a cap that binds. The routed experts the plan puts on
 //! the card take the room the stores leave, so a longer context leaves fewer
 //! of them there; the default caps at the plan's own fit and applies no
-//! expert margin (`placement::ctx::default_slot_ctx`, which the GLM seat
+//! expert margin (`placement::ctx::default_slot_ctx_by_card`, which the GLM seat
 //! takes).
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
@@ -293,7 +293,9 @@ struct CtxRule {
 /// else the file's trained context capped to the largest on the [`CTX_GRAN`]
 /// grid whose plan stands (`placement::ctx::searched`). The plan counts every
 /// slot's stores at a slot's share of the total
-/// ([`PlanInputs::plan_with_slots`]).
+/// ([`PlanInputs::plan_with_slots`]). The plan reads no host room (its inputs
+/// hold none and the machine's host is the workstation's figure), so no
+/// reading moves the search and there is no room for a second probe to veto.
 fn ctx_of(
     set: Option<usize>,
     split: &Split,

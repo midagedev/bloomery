@@ -49,8 +49,8 @@ use gguf::Split;
 use model::arch::qwen3moe::place::{self as q3, card_routed};
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
-use model::placement::ctx::{ExpertBytes, SlotCtx};
-use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
+use model::placement::ctx::{ExpertBytes, SlotCtx, default_slot_ctx, default_slot_ctx_by_card};
+use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE, HostRead};
 use model::placement::{
     self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
     WholeLoad, WholeNeed,
@@ -144,6 +144,60 @@ pub fn choose(flag: Option<Place>, census: &[DeviceInfo]) -> Result<PlaceWhy, Ga
 enum Inputs {
     Qwen3(q3::PlanInputs),
     Qwen35(Box<q35::PlanInputs>),
+}
+
+impl Inputs {
+    /// These inputs with the host room unbounded (`HostRead::Given` of every
+    /// byte), for the file whose plan reads a room: the plan they make pages
+    /// no expert to the NVMe tier, so what it holds on the card is the card's
+    /// alone. `None` for a qwen3moe file, whose plan reads no room.
+    fn room_free(&self) -> Option<Inputs> {
+        match self {
+            Inputs::Qwen3(_) => None,
+            Inputs::Qwen35(i) => Some(Inputs::Qwen35(Box::new(q35::PlanInputs {
+                hp: i.hp.clone(),
+                model: i.model.clone(),
+                spec: i.spec.clone(),
+                kv: i.kv.clone(),
+                room: (u64::MAX, HostRead::Given),
+                arena: i.arena,
+            }))),
+        }
+    }
+}
+
+/// The plan of `inputs` over `machine` at `ctx` positions (a total) under
+/// `levers`, every refusal by name with its terms.
+fn plan_inputs<'a>(
+    inputs: &'a Inputs,
+    machine: &'a Machine,
+    ctx: usize,
+    levers: &PlanLevers,
+) -> Result<Plan<'a>, GateError> {
+    let ctx = u64::try_from(ctx)?;
+    Ok(match inputs {
+        Inputs::Qwen3(i) => i.plan(machine, ctx, levers)?,
+        Inputs::Qwen35(i) => i.plan_rule(machine, ctx, levers, card_routed)?,
+    })
+}
+
+/// [`plan_inputs`]'s routed-expert bytes on the card and on the NVMe tier.
+fn expert_bytes_of(
+    inputs: &Inputs,
+    machine: &Machine,
+    ctx: usize,
+    levers: &PlanLevers,
+) -> Result<ExpertBytes, GateError> {
+    let plan = plan_inputs(inputs, machine, ctx, levers)?;
+    Ok(ExpertBytes {
+        card: plan
+            .cards
+            .first()
+            .ok_or("a plan with no card")?
+            .expert_bytes,
+        nvme: plan.host.nvme_expert_bytes,
+        arena: plan.host.nvme_arena_bytes,
+    })
 }
 
 /// What a placed load plans from: the placement on this process's devices,
@@ -415,11 +469,7 @@ impl PlaceQ3 {
         ctx: usize,
         levers: &PlanLevers,
     ) -> Result<Plan<'a>, GateError> {
-        let ctx = u64::try_from(ctx)?;
-        Ok(match &self.inputs {
-            Inputs::Qwen3(i) => i.plan(machine, ctx, levers)?,
-            Inputs::Qwen35(i) => i.plan_rule(machine, ctx, levers, card_routed)?,
-        })
+        plan_inputs(&self.inputs, machine, ctx, levers)
     }
 
     /// The same placed load's machine at a probe's context: the place, the
@@ -451,16 +501,7 @@ impl PlaceQ3 {
         ctx: usize,
         levers: &PlanLevers,
     ) -> Result<ExpertBytes, GateError> {
-        let plan = self.plan_over(machine, ctx, levers)?;
-        Ok(ExpertBytes {
-            card: plan
-                .cards
-                .first()
-                .ok_or("a plan with no card")?
-                .expert_bytes,
-            nvme: plan.host.nvme_expert_bytes,
-            arena: plan.host.nvme_arena_bytes,
-        })
+        expert_bytes_of(&self.inputs, machine, ctx, levers)
     }
 
     /// The layers the model loads ([`layers_of`]).
@@ -844,9 +885,9 @@ pub fn unplaced_qwen3_slots(
 pub use bloomery_gpu_gates::generate::trained_ctx;
 
 /// The constants of the unset `--ctx` rule a seat supplies
-/// (`placement::ctx::default_slot_ctx`): the base context a slot takes, the
-/// step the answer moves in and the card expert bytes it may trade for
-/// positions.
+/// (`placement::ctx::default_slot_ctx_by_card`): the base context a slot
+/// takes, the step the answer moves in and the card expert bytes it may trade
+/// for positions.
 #[derive(Clone, Copy, Debug)]
 pub struct SlotRule {
     pub base: usize,
@@ -886,15 +927,24 @@ struct Sizing<'a> {
 }
 
 /// The slot context a run with `--ctx` unset takes
-/// (`placement::ctx::default_slot_ctx` under `rule`, the file's `cap`): the
-/// probes plan `slots` resident sequences of a slot's context each, the load
-/// counted at the total they hold, over one resolved `probe` — its place,
-/// inputs and sequences taken once, the machine relaid per probe, one census
-/// reading for the whole search. The load is the whole model on `a`'s card
-/// while `whole` — no `--place`, and the whole-fit verdict at the base takes
-/// it ([`PlaceQ3::unplaced_on`]) — its every routed expert on the card at
-/// every context (the verdict bounds the fit alone); else the placed plan on
-/// the probe's card, whose card and NVMe expert bytes the margin counts.
+/// (`placement::ctx::default_slot_ctx_by_card` under `rule`, the file's
+/// `cap`): the probes plan `slots` resident sequences of a slot's context
+/// each, the load counted at the total they hold, over one resolved `probe` —
+/// its place, inputs and sequences taken once, the machine relaid per probe,
+/// one census reading for the whole search. The load is the whole model on
+/// `a`'s card while `whole` — no `--place`, and the whole-fit verdict at the
+/// base takes it ([`PlaceQ3::unplaced_on`]) — its every routed expert on the
+/// card at every context (the verdict bounds the fit alone); else the placed
+/// plan on the probe's card, whose card and NVMe expert bytes the margin
+/// counts.
+///
+/// The card decides and the host room only vetoes: a qwen35moe file's placed
+/// plan reads a room, so it is probed a second time at an unbounded one
+/// ([`Inputs::room_free`]). The two other loads read none and are one probe
+/// for both terms (`default_slot_ctx`, the same answer at half the probes):
+/// a qwen3moe plan has no NVMe tier, and the whole load's verdict is a
+/// whole-load fit, which on a machine whose card shares the host's memory is
+/// the room itself — a named exception, not an unbounded room.
 fn default_over(
     probe: &PlaceQ3,
     (cap, rule): (usize, SlotRule),
@@ -919,7 +969,23 @@ fn default_over(
         let machine = probe.machine_at((sizing.arena)(total)?, u64::try_from(ctx)?)?;
         probe.expert_bytes(&machine, total, levers)
     };
-    let slot = placement::ctx::default_slot_ctx(cap, rule.base, rule.step, rule.margin, &held)?;
+    let free = if whole {
+        None
+    } else {
+        probe.inputs.room_free()
+    };
+    let slot = match &free {
+        Some(free) => {
+            let card = |ctx: usize| -> Result<ExpertBytes, GateError> {
+                probed();
+                let total = ctx.saturating_mul(slots);
+                let machine = probe.machine_at((sizing.arena)(total)?, u64::try_from(ctx)?)?;
+                expert_bytes_of(free, &machine, total, levers)
+            };
+            default_slot_ctx_by_card(cap, rule.base, rule.step, rule.margin, &card, &held)?
+        }
+        None => default_slot_ctx(cap, rule.base, rule.step, rule.margin, &held)?,
+    };
     Ok(Defaulted {
         slot,
         basis: if whole { "whole" } else { "placed" },

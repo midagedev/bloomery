@@ -53,16 +53,21 @@
 //! number, a prompt that long is a 400 before it reaches the engine, and
 //! generation stops there with `truncated`. Unset, a slot's context is the
 //! file's trained context (`context_length`) capped to what the plan takes —
-//! the largest context whose plan of every slot stands, itself never past
-//! `place::ORACLE_POSITIONS` — pulled back to the largest multiple of
-//! `CTX_STEP` that stays within the plan's `MARGIN` of stage-card expert
-//! bytes and holds no more NVMe expert bytes than the plan at 2048 does
-//! (`placement::ctx::default_slot_ctx`, the one rule every serving seat
-//! takes: more positions on the card push card experts to the host, and
-//! decode crawls), and never under 2048 unless the card holds less than that
-//! (its `card` word); a `ctx` line on stderr names the rule (`card`, `base`,
-//! `fit` or `margin`), the chosen context, the slots and their total, the
-//! cap, the fit and the margin. Set, the flag
+//! the largest context whose plan of every slot stands on the card, itself
+//! never past `place::ORACLE_POSITIONS` — pulled back to the largest multiple
+//! of `CTX_STEP` that stays within the plan's `MARGIN` of stage-card expert
+//! bytes (`placement::ctx::default_slot_ctx_by_card`, the one rule every
+//! serving seat takes: more positions on the card push card experts to the
+//! host, and decode crawls), and never under 2048 unless the card holds less
+//! than that (its `card` word). The card decides it and the host room only
+//! vetoes it: where the plan at the room read pages no expert at 2048, that
+//! context stands only if the plan at the room read pages none there either,
+//! else the answer is 2048 (the `host` word), so a reading of the room never
+//! picks a depth between; where that plan pages already, the context is the
+//! largest that holds no more than a hundredth of the plan at 2048's missed
+//! NVMe expert bytes more. A `ctx` line on stderr names the rule (`card`,
+//! `base`, `fit`, `margin` or `host`), the chosen context, the slots and
+//! their total, the cap, the fit and the margin. Set, the flag
 //! is the total and each slot takes `total / N` positions rounded down
 //! (llama-server's `-np N` without `-kvu`) under a set `--parallel N` —
 //! alone it is one request's context, one slot at the whole of it
@@ -280,9 +285,9 @@ use model::arch::glm5next::place::{
     KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlaceError, PlanInputs, refusal_text,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::ctx::{ExpertBytes, SlotCtx, default_slot_ctx};
+use model::placement::ctx::{ExpertBytes, SlotCtx, default_slot_ctx_by_card};
 use model::placement::slots::{SplitError, split_ctx};
-use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes};
+use model::placement::workstation::{HostNeed, HostRead, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
 #[cfg(feature = "vision")]
@@ -448,12 +453,13 @@ fn draft_of(
 /// hold every slot, so does this, with the plan's own words and, with the
 /// draft, the NextN layer's bytes the plan counted ([`refusal_text`]); unset,
 /// the common rule's answer over the trained context capped to
-/// [`ORACLE_POSITIONS`] (`placement::ctx::default_slot_ctx`: [`CTX`] a slot,
-/// the largest multiple of [`CTX_STEP`] within [`MARGIN`] of stage-card
-/// expert bytes). The searches are planning-time only: one plan a probe of
-/// the bisections, none past the cap. A card whose plan stands nowhere, not
-/// even at one position a slot, refuses by name here, as the load's own plan
-/// would.
+/// [`ORACLE_POSITIONS`] (`placement::ctx::default_slot_ctx_by_card`: [`CTX`]
+/// a slot, the largest multiple of [`CTX_STEP`] within [`MARGIN`] of
+/// stage-card expert bytes), the card deciding it over a plan at an unbounded
+/// host room ([`room_free`]) and the plan at the room read only vetoing it.
+/// The searches are planning-time only: one plan a probe of the bisections,
+/// none past the cap. A card whose plan stands nowhere, not even at one
+/// position a slot, refuses by name here, as the load's own plan would.
 fn ctx_of(
     inputs: &PlanInputs,
     machine_at: &dyn Fn(u64) -> Result<Machine, GateError>,
@@ -462,7 +468,7 @@ fn ctx_of(
     set: Option<usize>,
     slots: usize,
 ) -> Result<SlotCtx, GateError> {
-    let expert_bytes = |ctx: usize| -> Result<ExpertBytes, GateError> {
+    let bytes_over = |inputs: &PlanInputs, ctx: usize| -> Result<ExpertBytes, GateError> {
         let ctx = u64::try_from(ctx)?;
         let machine = machine_at(ctx)?;
         let plan = plan_of(inputs, &machine, ctx, levers, nextn, slots)?;
@@ -476,11 +482,15 @@ fn ctx_of(
             arena: plan.host.nvme_arena_bytes,
         })
     };
+    let expert_bytes = |ctx: usize| bytes_over(inputs, ctx);
+    let free = room_free(inputs);
+    let card_bytes = |ctx: usize| bytes_over(&free, ctx);
     let cap = inputs
         .hp
         .n_ctx_train
         .min(usize::try_from(ORACLE_POSITIONS)?);
-    let mut rule = default_slot_ctx(cap, CTX, CTX_STEP, MARGIN, &expert_bytes)?;
+    let mut rule =
+        default_slot_ctx_by_card(cap, CTX, CTX_STEP, MARGIN, &card_bytes, &expert_bytes)?;
     if let Some(ctx) = set {
         rule.ctx = ctx;
         rule.rule = "set";
@@ -496,6 +506,21 @@ fn ctx_of(
             })?;
     }
     Ok(rule)
+}
+
+/// `inputs` with the host room unbounded (`HostRead::Given` of every byte):
+/// the plan it makes pages no expert to the NVMe tier, so what it holds on the
+/// card is the card's alone. A machine whose card shares the host's memory (a
+/// unified pool) has no such plan; the pool binds both probes alike.
+fn room_free(inputs: &PlanInputs) -> PlanInputs {
+    PlanInputs {
+        hp: inputs.hp.clone(),
+        model: inputs.model.clone(),
+        spec: inputs.spec.clone(),
+        kv: inputs.kv.clone(),
+        room: (u64::MAX, HostRead::Given),
+        arena: inputs.arena,
+    }
 }
 
 /// The target's plan of `slots` resident sequences at `ctx` positions a slot
