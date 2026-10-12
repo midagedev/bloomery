@@ -1663,8 +1663,9 @@ FP
   mutant_of ch-nofeed 's|^chain_feeds() { #.*$|chain_feeds() { return 1 # MUTANT ch-nofeed|' '# MUTANT ch-nofeed$'
   rc=$(MTAG=ch-nofeed steal_case ch-onlym "v41-any@FAKE_SLEEP=1	A	3090	2	$d" -- 'v41-any@FAKE_SLEEP=1')
   printf '%s' "$rc" > "$t/rc-ch-onlym"
-  if [ "$rc" = 70 ] && grep -q '1 items planned, 0 recorded' "$t/out-ch-onlym.log"; then pass 'chain only mutant: without the feed rule no lane starts and the count check names it'
-  else fail 'chain only mutant: without the feed rule no lane starts and the count check names it' "rc $rc, $(tail -1 "$t/out-ch-onlym.log" 2> /dev/null)"; fi
+  if [ "$rc" = 1 ] && grep -Eq '^DONE total=1 red=1 ' "$t/out-ch-onlym.log"; then pass 'chain only mutant: without the feed rule no lane starts and the batch ends red'
+  else fail 'chain only mutant: without the feed rule no lane starts and the batch ends red' "rc $rc, $(tail -1 "$t/out-ch-onlym.log" 2> /dev/null)"; fi
+  want '  … naming the member no lane took once the lanes ended' "$t/target/c-ch-onlym/run.log" '^v41-any rc=unclaimed lane=C tier=real$'
   rc=$(steal_case ch-only-a "v41-a@FAKE_SLEEP=1	A	3090	2	$d" -- 'v41-a@FAKE_SLEEP=1')
   printf '%s' "$rc" > "$t/rc-ch-only-a"
   rc_ok 'chain only: a list of one 3090-only member ends green' ch-only-a 1
@@ -2205,6 +2206,39 @@ FP
   want_absent 'variant chain: it fed no lane, so lane A never started' "$t/target/c-vr-chain/lane-A.pid"
   want 'variant chain: the DONE line carries laneA=0s' "$t/target/c-vr-chain/run.log" '^DONE total=2 red=0 .* laneA=0s .*variant=1( |$)'
   want_no_row 'variant chain: the batch never called the chain member' "$t/fake-state/box.log" '$2 ~ /gen_x$/'
+  # A deferred item ahead of a chain member (the 10-12 stall: a fixture-only item listed before a solo-real member). The K record
+  # names each member's index among the records the shell keeps; a deferred record counted there moved every later member one
+  # record late, so the chain ran the next record (an X item in the stall) and no lane took the member. The fixed plan lists the
+  # member in the chain and nothing else there; the index's mutant is refused by the balance's check; with both gone (dc-nok) the
+  # batch ends by name: the member is a rc=unclaimed red once the lanes end, and the pack's stall guard names the X item the
+  # chain claimed instead of sleeping on it.
+  out=$("${gb[@]}" --dry-run fo-any v41-any plain-any 2>&1) || fail 'deferred chain: the real dry run failed' "$out"
+  if grep -q '^lane C  v41-any ' <<< "$out" && ! grep -q '^lane C  plain-any ' <<< "$out"; then
+    pass 'deferred chain: a fixture-only item ahead of a chain member leaves the chain its member'
+  else fail 'deferred chain: a fixture-only item ahead of a chain member leaves the chain its member' "$(grep '^lane ' <<< "$out")"; fi
+  mutant_of dc-index 's|"X\\x1f", "D\\x1f"|"X\\x1f", "never\\x1f"|' '"never\\x1f"'
+  check 'deferred chain mutant: an index counting the deferred record is refused by the balance, nothing ran' 70 \
+    "the chain's order \(the K record\) names \[1\], but the chain members are \[0\] \(v41-any\)" \
+    bash "$t/tools/gate-batch-dc-index.sh" --dry-run fo-any v41-any plain-any
+  rc=$(steal_case dc-run "v41-any	A	3090	2	$d" "pk-a	A	3090	1	$d" -- fo-any v41-any pk-a)
+  printf '%s' "$rc" > "$t/rc-dc-run"
+  rc_ok 'deferred chain: a real batch of a fixture-only item, a chain member and a pack item ends green' dc-run 3
+  want '  … the member ran in a lane' "$t/target/c-dc-run/run.log" '^v41-any rc=0 [0-9]+s try=1 lane=[AB]( |$)'
+  want '  … and the pack item in lane X' "$t/target/c-dc-run/run.log" '^pk-a rc=0 [0-9]+s try=1 lane=X( |$)'
+  mutant_of dc-nok 's|"X\\x1f", "D\\x1f"|"X\\x1f", "never\\x1f"|; s|^if sorted(k_order) != c_recs:$|if False:|' '^if False:$'
+  rc=$(MTAG=dc-nok steal_case dc-stall "v41-any	A	3090	2	$d" "pk-a	A	3090	1	$d" -- fo-any v41-any pk-a)
+  printf '%s' "$rc" > "$t/rc-dc-stall"
+  if [ "$rc" = 70 ] && grep -Eq '^gate-batch: the pack stalled: nothing runs and nothing can launch; pk-a: claimed by chain-[AB], an X item the pack alone runs$' "$t/out-dc-stall.log"; then
+    pass 'deferred chain mutant: the pack names the X item the chain claimed and ends (70), never a sleep'
+  else fail 'deferred chain mutant: the pack names the X item the chain claimed and ends (70), never a sleep' "rc $rc, $(tail -1 "$t/out-dc-stall.log" 2> /dev/null)"; fi
+  want '  … run.log carries the stall' "$t/target/c-dc-stall/run.log" '^STALL pack: nothing runs and nothing can launch; pk-a: '
+  want '  … and the member no lane took, as a red line' "$t/target/c-dc-stall/run.log" '^v41-any rc=unclaimed lane=C tier=real$'
+  rc=$(MTAG=dc-nok steal_case dc-lanes "v41-any	A	3090	2	$d" "plain-any	B	a6000	1	$d" -- fo-any v41-any plain-any)
+  printf '%s' "$rc" > "$t/rc-dc-lanes"
+  if [ "$rc" = 1 ] && grep -Eq '^DONE total=3 red=1 ' "$t/out-dc-lanes.log"; then
+    pass 'deferred chain mutant: with no X item the batch ends red, the member counted'
+  else fail 'deferred chain mutant: with no X item the batch ends red, the member counted' "rc $rc, $(tail -1 "$t/out-dc-lanes.log" 2> /dev/null)"; fi
+  want '  … by name' "$t/target/c-dc-lanes/run.log" '^v41-any rc=unclaimed lane=C tier=real$'
   # real-file (the header's deferred paragraph, kind 3): a recipe of a family whose fixture row is `self` and whose targets reach the gate
   # fence is deferred in the fixture tier. The fake recipes.py answers `opens` from opens.tsv and logs each call. rf-q3 (qwen3moe) and
   # rf-def (the default profile) are self families the fake says open; rf-none is a self family it says reaches nothing; rf-q4 has a
@@ -4084,7 +4118,9 @@ xs = sorted((k for k, rec in enumerate(out) if rec.startswith("X\x1f")), key=lam
 # The chain's order (class C, D3): by family, the family lane X opens with LAST (X then starts on a
 # warm host set), the chain's other families in the reverse of X's family order, then families X
 # does not hold in first-appearance order; within a family, record order. Computed on the pre-sort
-# indices, like xs; the K record names each member's final index after the X records move to the tail.
+# indices, like xs; the K record names each member's final index: its place among the records the
+# shell's R_REC keeps, after the X records move to the tail and the deferred (D) records leave for
+# the shell's own list (a D record counted here sends every later member's index one record late).
 ck = [k for k, rec in enumerate(out) if rec.startswith("C\x1f")]
 chain_fams = list(dict.fromkeys(fams[k] for k in ck))
 x_fams = list(dict.fromkeys(fams[k] for k in xs))
@@ -4093,7 +4129,7 @@ fam_order = ([f for f in reversed(x_fams) if f != x_first and f in chain_fams]
              + [f for f in chain_fams if f not in x_fams and f != x_first]
              + ([x_first] if x_first in chain_fams else []))
 cs = sorted(ck, key=lambda k: (fam_order.index(fams[k]), k))
-final_of = {k: i for i, k in enumerate(k2 for k2 in range(len(out)) if not out[k2].startswith("X\x1f"))}
+final_of = {k: i for i, k in enumerate(k2 for k2 in range(len(out)) if not out[k2].startswith(("X\x1f", "D\x1f")))}
 out = [rec for rec in out if not rec.startswith("X\x1f")] + [out[k] for k in xs]
 print("\n".join(out))
 if cs:
@@ -4239,6 +4275,12 @@ recs = [ln.split("\x1f") for ln in sys.stdin.read().split("\n") if ln]
 k_order = []
 if recs and recs[0][0] == "K":  # the chain's order (PYPLAN's K record), fed first by the shell
     k_order = [int(x) for x in recs.pop(0)[1].split()]
+# The K record names every chain member once and no other record: an index that names another
+# item would run it as a member and leave the member it stands for unclaimed by every lane.
+c_recs = [i for i, f in enumerate(recs) if f[0] == "C"]
+if sorted(k_order) != c_recs:
+    fail(f"the chain's order (the K record) names {k_order}, but the chain members are {c_recs} "
+         f"({' '.join(recs[i][1] for i in c_recs) or 'none'}); the plan's indices are off, nothing ran")
 sums, placed, flex = {"A": 0, "B": 0, "X": 0, "C": 0}, {}, []
 for i, f in enumerate(recs):
     if len(f) != 17:
@@ -5312,9 +5354,10 @@ steal_pass() { # $1 = lane
 # longest-est eligible item of the current family — the family of the first unlaunched item in XP,
 # which is lane X's family order — and wait rather than open the next family while that one holds an
 # unlaunched item; a two-candidate item takes the free card (the A6000 first). Green skips claim and record at once at the green candidate's key. The loop always ends:
-# every turn launches, reaps, or sleeps a second.
+# every turn launches, reaps, or sleeps a second, and a turn that ends its launch pass with nothing
+# running and an item left ends the batch naming each (the stall guard: no later turn could launch).
 run_pack() {
-  local t0 i j k labels exp res card best be bc launched alldone p cards fam cfam
+  local t0 i j k labels exp res card best be bc launched alldone p cards fam cfam left
   t0=$(date +%s)
   local -a XP=()
   for i in ${ORDER[@]+"${ORDER[@]}"}; do [ "${P_LANE[$i]}" = X ] && XP+=("$i"); done
@@ -5412,6 +5455,24 @@ run_pack() {
       nrun=$((nrun + 1))
       launched=1
     done
+    # The stall guard: nothing running after the launch pass means it began with every card free and
+    # launched nothing, and no later turn differs from it. Each item left is named with why.
+    if [ "$nrun" = 0 ]; then
+      left=''
+      for i in "${XP[@]}"; do
+        [ "${R_PID[$i]}" != x ] || continue
+        rec_get "$i" labels
+        if claimed "$i"; then
+          left="$left; ${P_STEM[$i]}: claimed by $(cat "$OUT/claims/$i" 2> /dev/null), an X item the pack alone runs"
+        else
+          left="$left; ${P_STEM[$i]}: card labels '$labels', a form the pack takes none of"
+        fi
+      done
+      if [ -n "$left" ]; then
+        echo "STALL pack: nothing runs and nothing can launch$left" >> "$RUNLOG"
+        RC=70 die "the pack stalled: nothing runs and nothing can launch$left"
+      fi
+    fi
     # reaping: a dead child releases its card, its bytes and the m hold
     for i in "${XP[@]}"; do
       case ${R_PID[$i]} in '' | x) continue ;; esac
@@ -5527,6 +5588,16 @@ done
 # Every lane is waited for before any is judged: a lane that died must not leave the other running.
 for lane in $LANES_RUN; do
   [ -f "$OUT/lane-$lane.s" ] || RC=70 die "lane $lane ended without its sentinel ($OUT/lane-$lane.s) — see run.log"
+done
+# Every lane ended: an item outside lane X with no line in run.log was taken by no lane and will
+# never run. Each gets its line now, rc=unclaimed (a red), and the pack still runs; the DONE line
+# counts them.
+for ((i = 0; i < N; i++)); do
+  [ "${P_LANE[$i]}" != X ] || continue
+  awk -v s="${P_STEM[$i]}" '$1 == s && $2 ~ /^rc=/ { f = 1 } END { exit !f }' "$RUNLOG" && continue
+  echo "${P_STEM[$i]} rc=unclaimed lane=${P_LANE[$i]} tier=$TIER" >> "$RUNLOG"
+  board_event item name="${P_STEM[$i]}" rc=unclaimed secs=0 lane="${P_LANE[$i]}"
+  echo "gate-batch: ${P_STEM[$i]} (lane ${P_LANE[$i]}) was taken by no lane, and every lane has ended" >&2
 done
 if has_lane X; then run_pack; fi
 trap - INT TERM
