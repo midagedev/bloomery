@@ -58,7 +58,6 @@ use model::arch::dspark::{DraftHparams, names};
 use super::head::DraftHead;
 use super::kv::DraftRings;
 use super::load::{DraftWeights, EmbdRows, pack_words};
-use super::stage::{Inbox, put_f32};
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
 use crate::chain::glue::glue_kernels;
 use crate::experts::ExpertKernels;
@@ -67,6 +66,7 @@ use crate::hc::{HC_MIX, HC_STREAMS, HcKernels, HcPostArgs};
 use crate::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
 use crate::rope::{Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable, TailShape};
 use crate::span::span_mut;
+use bloomery_gpu::dspark::stage::{Inbox, put_f32};
 
 const WHAT: &str = "draft::block";
 

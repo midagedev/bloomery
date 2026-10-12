@@ -24,6 +24,7 @@
 use std::num::NonZeroU64;
 
 use gguf::{GgmlType, Split, Value};
+use runtime::dspark::{DraftVocab, DsparkShape};
 
 use super::deepseek41::hparams::HyperConnections;
 use super::{meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab};
@@ -170,6 +171,90 @@ impl DraftHparams {
     /// `streams` post weights and the `streams²` combine matrix.
     pub fn hc_mix(&self) -> usize {
         (2 + self.hc.streams) * self.hc.streams
+    }
+}
+
+/// The draft file's geometry as the common DSpark owner reads it. V4.1's
+/// target taps are the rows entering each `target_layers` entry (the mean of
+/// the four hyper-connection streams the layer before leaves), so its taps are
+/// the file's list as it stands. The head scores the target's own ids; the
+/// file carries `conf_proj` among its required tensors. Pass the result to
+/// `DsparkShape::check` before use.
+#[must_use]
+pub fn shape(hp: &DraftHparams) -> DsparkShape {
+    DsparkShape {
+        block: hp.block_size,
+        taps: hp.target_layers.clone(),
+        hidden: hp.n_embd,
+        vocab: DraftVocab::Full { n: hp.n_vocab },
+        mask_id: hp.mask_token,
+        window: Some(hp.window),
+        markov_rank: hp.markov_rank,
+        confidence: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DraftExperts, DraftHparams, shape};
+    use crate::arch::deepseek41::hparams::HyperConnections;
+    use runtime::dspark::DraftVocab;
+
+    /// A draft file's hyperparameters with the geometry the shape reads.
+    fn hparams() -> DraftHparams {
+        DraftHparams {
+            n_layer: 3,
+            n_embd: 4096,
+            n_head: 64,
+            n_head_kv: 1,
+            head_dim: 512,
+            q_lora_rank: 1024,
+            o_groups: 8,
+            o_lora_rank: 1024,
+            rope_dims: 64,
+            rope_base: 10000.0,
+            window: 128,
+            rms_eps: 1e-6,
+            n_vocab: 129_280,
+            n_ctx_train: 4096,
+            hc: HyperConnections {
+                streams: 4,
+                sinkhorn_iters: 20,
+                eps: 1e-6,
+            },
+            experts: DraftExperts {
+                n_expert: 128,
+                n_used: 3,
+                n_shared: 1,
+                ff: 2048,
+                routed_scale: 1.5,
+                weights_norm: true,
+            },
+            swiglu_limit: vec![10.0; 3],
+            swiglu_limit_shared: vec![10.0; 3],
+            block_size: 5,
+            target_layers: vec![2, 20, 38],
+            mask_token: 128_799,
+            markov_rank: 256,
+        }
+    }
+
+    /// Each shape field is the file's value, the taps unconverted, and the
+    /// result passes its own check; a V4.1 pair pass holds one id.
+    #[test]
+    fn the_shape_is_the_files_geometry() {
+        let hp = hparams();
+        let s = shape(&hp);
+        assert_eq!(s.block, 5);
+        assert_eq!(s.taps, [2, 20, 38]);
+        assert_eq!(s.hidden, 4096);
+        assert_eq!(s.vocab, DraftVocab::Full { n: 129_280 });
+        assert_eq!(s.mask_id, 128_799);
+        assert_eq!(s.window, Some(128));
+        assert_eq!(s.markov_rank, 256);
+        assert!(s.confidence);
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.width(2), 1);
     }
 }
 

@@ -30,8 +30,8 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::dspark::{DraftHparams, names};
 
 use super::load::DraftWeights;
-use super::stage::{Inbox, put_f32};
 use crate::rope::{Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable};
+use bloomery_gpu::dspark::stage::{Inbox, put_f32};
 
 const WHAT: &str = "draft::kv";
 
