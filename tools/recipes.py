@@ -564,6 +564,7 @@ class RecipeCommands:
     scripts: list[str] = field(default_factory=list)  # repository scripts executed or sourced
     paths: list[str] = field(default_factory=list)  # every repository-looking path the text names
     cargo_target_dir: str = ""  # the CARGO_TARGET_DIR an `export` earlier in the same shell (one recipe line, one box.sh call) left set
+    models: list[str | None] = field(default_factory=list)  # the BLOOMERY_MODEL prefix of each tools/box.sh call, in order (None: that call sets none); `env` keeps the last only
 
 
 def _norm(p: str) -> str:
@@ -639,6 +640,7 @@ def recipe_commands(recipe: Recipe) -> RecipeCommands:
             if rest and _norm(rest[0]) == "tools/box.sh":
                 rc.box = True
                 rc.env.update(env)
+                rc.models.append(env.get("BLOOMERY_MODEL"))
                 remote = " ".join(rest[1:])
                 for p in _PATHLIKE.findall(remote):
                     rc.paths.append(_norm(p))
@@ -5816,22 +5818,29 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #   mac-env   the Mac-side variables tools/box.sh carries or reads (BLOOMERY_REMOTE is not one: it
 #             names a track's directory, not an input) — among them BLOOMERY_TIER, unset and `real` the one value
 #             `real`, so a fixture-tier green never stands for the real file's — and the versions of just and python3
+#   variant   (an item that runs under BLOOMERY_FIXTURE_VARIANT) the tag and the sha256 of its row in tools/fixture-variants.tsv
+#   fixture   (the fixture tier only) the fixture directories the box part holds: the family's, `-` for a family with none, `*` for
+#             an item whose family cannot be told (every row of FIXTURE_ROOT)
 #   box       every line of the box manifest (`box-manifest`, fetched once per batch), its model rows
 #             only for the model directories the item can open (KeyContext.model_scope); the fixture
-#             directory's rows (FIXTURE_ROOT, every file under it) only for an item in the fixture tier
+#             rows (FIXTURE_ROOT) only for an item in the fixture tier, and of those only its family's
+#             fixture directory (KeyContext.fixture_dirs; every file under it)
 # Not in it: the binary (its paths are per track) and the commit.
 
 KEY_VERSION = "bloomery-gate-key 1"
 MANIFEST_VERSION = "box-manifest 1"
 MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_FIXTURE_VARIANT", "BLOOMERY_MODEL", "BLOOMERY_REF_MODEL", "BLOOMERY_TIER", "BLOOMERY_V41_MODEL")
 # The fixture tier's files (tools/ref/ref-paths.sh: one directory a family under it). Its rows belong to the keys of fixture-tier
-# items only: a real item must not rerun because a fixture was regenerated, and a fixture item must, whatever a fixture file's
-# directory is called — so the box manifest lists every file under it, subdirectories included, and no file's literal
-# brings it into a real item's key (KeyContext.literal_dirs).
+# items only, and of those to the items that open the directory: a real item must not rerun because a fixture was regenerated, and
+# a fixture item must when its family's fixture was, whatever a fixture file's directory is called — so the box manifest lists every
+# file under it, subdirectories included, and no file's literal brings it into a real item's key (KeyContext.literal_dirs). An item's
+# key holds its family's fixture directory only (KeyContext.fixture_dirs; the family's row of ref-paths.sh's fixture table, the one
+# owner), as a variant's below holds its tag's, so a fixture written for one family moves no other family's key. An item whose
+# family cannot be told keeps every row of FIXTURE_ROOT: never under-keyed.
 FIXTURE_ROOT = "/models/fixtures"
 # A fixture variant (tools/fixture-variants.tsv, tools/ref/ref-paths.sh): the family's fixture requantized to a tag's type map, its files
-# below VARIANT_ROOT/<tag>, beside the fixture root and not under it (every file under FIXTURE_ROOT is in every fixture-tier item's
-# key). An item's key holds no variant's rows unless it runs under that tag (BLOOMERY_FIXTURE_VARIANT=<tag>): then its own
+# below VARIANT_ROOT/<tag>, beside the fixture root and not under it (ref-paths.sh moves the root to the tag's directory, and a variant
+# written is not a fixture file of any family). An item's key holds no variant's rows unless it runs under that tag (BLOOMERY_FIXTURE_VARIANT=<tag>): then its own
 # directory's, and the tag's row of the table. A re-requant or an edit of the row moves that item's key and no other's, and a
 # variant written moves no other item's.
 VARIANT_ROOT = "/models/fixture-variants"
@@ -5911,6 +5920,54 @@ def own_variant_row(path: str, variant: str) -> bool:
     """Whether a manifest row of VARIANT_ROOT is `variant`'s own: the directory itself (an absent or empty one is named so), or a path
     in the tag's directory. The rows of the other tags' directories are not."""
     return path == VARIANT_ROOT or (path + "/").startswith(f"{VARIANT_ROOT}/{variant}/")
+
+
+# The fixture tier's family table and the default profile, read from tools/ref/ref-paths.sh (the one owner; the regexes are the ones
+# tools/gate-batch.sh's fixture_table() and default_profile() read the same text with):
+#     case "$BLOOMERY_MODEL" in
+#       qwen4exp) __fixture_dir=qwen38 ;;
+#       deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;
+#       *) __fixture_dir=none ;;
+#     esac
+REF_PATHS = "tools/ref/ref-paths.sh"
+FIXTURE_CASE = re.compile(r'^\s*case "\$BLOOMERY_MODEL" in\n((?:\s*[^\n]*\) __fixture_dir=[a-z0-9_-]+ ;;\n)+)\s*esac$', re.M)
+FIXTURE_ROW = re.compile(r"\s*(.*?)\) __fixture_dir=([a-z0-9_-]+) ;;")
+PROFILE_DEFAULT_LINE = re.compile(r'^: "\$\{BLOOMERY_MODEL:=\$\{BLOOMERY_REF_MODEL_PROFILE:-([A-Za-z0-9_]+)\}\}"$', re.M)
+FAMILY_NAME = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def fixture_table(text: str) -> tuple[dict[str, str], str]:
+    """({family: fixture directory}, default profile) of ref-paths.sh's text: the table's rows (`self` and `none` as they are; a family
+    the table does not name falls to its `*)` row, `none`) and the profile tools/box.sh loads when BLOOMERY_MODEL is unset. A text this
+    reader does not understand is a named error, never a guess: a glob in a row would be read as a family name and fall to `none`."""
+    m = FIXTURE_CASE.search(text)
+    if not m:
+        raise RecipeError(f"{REF_PATHS}: no fixture table (`case \"$BLOOMERY_MODEL\" in … ) __fixture_dir=<dir> ;; … esac`): an item's fixture directory is read there")
+    rows: dict[str, str] = {}
+    default = None
+    for row in m.group(1).strip().split("\n"):
+        r = FIXTURE_ROW.fullmatch(row)
+        if not r:
+            raise RecipeError(f"{REF_PATHS}: the fixture table row {row.strip()[:60]!r} is not `<families> ) __fixture_dir=<dir> ;;`")
+        for pat in (x.strip() for x in r.group(1).split("|")):
+            if pat == "*":
+                default = r.group(2)
+            elif FAMILY_NAME.fullmatch(pat):
+                rows[pat] = r.group(2)
+            else:
+                raise RecipeError(f"{REF_PATHS}: the fixture table pattern {pat!r} is neither a family name nor a lone `*`: a glob would be read as a name, and its families would fall to none")
+    if default != "none":
+        raise RecipeError(f"{REF_PATHS}: the fixture table's `*)` row is {default!r}, not none: a family without a row must be one with no fixture")
+    profile = PROFILE_DEFAULT_LINE.findall(text)
+    if len(profile) != 1:
+        raise RecipeError(f"{REF_PATHS} holds {len(profile)} default-profile lines, not one: an item with no BLOOMERY_MODEL runs under that default")
+    return rows, profile[0]
+
+
+def own_fixture_row(path: str, dirs: set[str]) -> bool:
+    """Whether a manifest row of FIXTURE_ROOT is in one of the family directories `dirs`: the directory itself or a path in it. The
+    root's own row (an absent or empty root) and the rows of the other families' directories are not; no directory, no row."""
+    return any((path + "/").startswith(f"{FIXTURE_ROOT}/{d}/") for d in dirs)
 
 
 KEY_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".cargo/cuda-oxide.toml"]
@@ -6638,6 +6695,7 @@ class KeyContext:
         self._sha: dict[str, str] = {}
         self._lit: dict[str, frozenset[str]] = {}
         self._tree: list[str] | None = None
+        self._fixture_table: tuple[dict[str, str], str] | None = None
 
     def tree_files(self) -> list[str]:
         if self._tree is None:
@@ -6663,13 +6721,14 @@ class KeyContext:
             self._lit[rel] = found - {FIXTURE_ROOT, VARIANT_ROOT}
         return self._lit[rel]
 
-    def model_scope(self, names: list[str], files: set[str], eff: list[str], envs: list[str], argv: list[str]) -> tuple[dict[str, str], set[str]]:
-        """The model directories the item can open, each with the first input that names it, and those of
-        them the box manifest must have rows for. They are the /models literals in its key's files (its
-        profile and tools/box.sh's among them) and its recipes' text, the profile the Mac's BLOOMERY_MODEL
+    def model_scope(self, names: list[str], files: set[str], eff: list[str], envs: list[str], argv: list[str]) -> tuple[dict[str, str], set[str], set[str] | None]:
+        """The model directories the item can open, each with the first input that names it, those of
+        them the box manifest must have rows for, and which rows of FIXTURE_ROOT the key holds. They are the /models literals in its
+        key's files (its profile and tools/box.sh's among them) and its recipes' text, the profile the Mac's BLOOMERY_MODEL
         picks for a box recipe that names none, and the /models values of BLOOMERY_BOX_ENV, the forwarded
         Mac environment, the item's env and its ARGS. The item's env and ARGS are outside the manifest's
-        reads (never-skip), so they need no rows."""
+        reads (never-skip), so they need no rows. The third value is the item's fixture directories under the fixture tier
+        (fixture_dirs), None for every row of FIXTURE_ROOT: the item names the root itself (an env value), or its family cannot be told."""
         recipes, tree = self.side.recipes, self.side.tree
         dirs: dict[str, str] = {}
         for rel in sorted(files | {g for g in KEY_GLOBALS if tree.exists(g)}):
@@ -6693,9 +6752,13 @@ class KeyContext:
             if d:
                 dirs.setdefault(d, f"the Mac's {k}")
         need = set(dirs)
+        fixture: set[str] | None = None
         if tier_of(eff, self.env.get("BLOOMERY_TIER")) == "fixture":
+            named = FIXTURE_ROOT in dirs
             dirs.setdefault(FIXTURE_ROOT, "the fixture tier")
             need.add(FIXTURE_ROOT)
+            if not named:
+                fixture = self.fixture_dirs(names, eff)
         if variant_of(eff, self.env.get("BLOOMERY_FIXTURE_VARIANT")):
             dirs.setdefault(VARIANT_ROOT, "BLOOMERY_FIXTURE_VARIANT")
             need.add(VARIANT_ROOT)
@@ -6704,7 +6767,41 @@ class KeyContext:
                 d = model_dir_of(v.split("=", 1)[-1])
                 if d and d not in dirs:
                     dirs[d] = "the item's env or ARGS"
-        return dirs, need
+        return dirs, need, fixture
+
+    def fixture_dirs(self, names: list[str], eff: list[str]) -> set[str] | None:
+        """The directories under FIXTURE_ROOT an item in the fixture tier can open: the fixture directory of each family it runs under,
+        from the fixture table of ref-paths.sh (fixture_table; `self` and `none` have none: the set may be empty). Its families are
+        the BLOOMERY_MODEL of each tools/box.sh call of its recipes, else the Mac's, else ref-paths.sh's default: tools/box.sh picks the
+        profile on the Mac side and a script on the box that picks another is refused (ref-paths.sh, exit 64), so the family names
+        the only fixture directory a box command opens. None — every row of FIXTURE_ROOT, never under-keyed — when the family cannot
+        be told: a value that is not a plain name (`{{FAMILY}}`, `${BLOOMERY_MODEL:-x}`), a BLOOMERY_MODEL in the item's env or
+        BLOOMERY_BOX_ENV, a dotenv file, or a recipe that runs a command on the Mac (it may call tools/box.sh with a profile of its own)."""
+        st = self.settings.get("settings", {})
+        if st.get("dotenv_load") or st.get("dotenv_filename") or st.get("dotenv_path"):
+            return None
+        if any(e.partition("=")[0] == "BLOOMERY_MODEL" for e in eff):
+            return None
+        calls: list[str | None] = []
+        for n in names:
+            if command_shape(self.side.recipes[n])[0]:
+                return None
+            calls += self.side.graph.inputs(n).commands.models
+        if not calls:
+            return set()
+        if self._fixture_table is None:
+            self._fixture_table = fixture_table(self.side.tree.read(REF_PATHS))
+        rows, default = self._fixture_table
+        mac = self.env.get("BLOOMERY_MODEL") or default
+        dirs: set[str] = set()
+        for m in calls:
+            family = mac if m is None else m
+            if not FAMILY_NAME.fullmatch(family):
+                return None
+            d = rows.get(family, "none")
+            if d not in ("self", "none"):
+                dirs.add(d)
+        return dirs
 
     def globals(self) -> list[str]:
         root = self.side.tree.root
@@ -6895,7 +6992,12 @@ class KeyContext:
             parts.append(f"variant\t{variant}\t{sha256_text(row)}")
         # The manifest lists every model directory any item can open; this item's key holds the rows of
         # its own only, so a directory another gate names (a fixture, a profile) does not move it.
-        dirs, need = self.model_scope(names, files, eff, envs, argv)
+        try:
+            dirs, need, fixture = self.model_scope(names, files, eff, envs, argv)
+        except RecipeError as err:
+            return [], str(err), None, ""
+        if tier_of(eff, self.env.get("BLOOMERY_TIER")) == "fixture":
+            parts.append(f"fixture\tdirs\t{'*' if fixture is None else ','.join(sorted(fixture)) or '-'}")
         listed: set[str] = set()
         for ln in self.manifest:
             f = ln.split("\t")
@@ -6905,6 +7007,10 @@ class KeyContext:
                     continue
                 if d == VARIANT_ROOT and not own_variant_row(f[1], variant):
                     continue
+                if d == FIXTURE_ROOT and fixture is not None:
+                    listed.add(d)  # the manifest names the root whether or not a row of it is this item's
+                    if not own_fixture_row(f[1], fixture):
+                        continue
                 listed.add(d)
             parts.append(f"box\t{ln}")
         missing = sorted(need - listed)
@@ -8081,16 +8187,126 @@ def key_self_test(expect, real: Side) -> None:
         # does, and the row of a file inside a family's directory is one (the manifest lists below a subdirectory there).
         fx_file = f"model\t{FIXTURE_ROOT}/qwen38/q-00001-of-00001.gguf\t100\t1\t2\t3"
         fixture_free = [ln for ln in manifest[:-1] if not ln.startswith(f"model-dir\t{FIXTURE_ROOT}\t")]
-        write_manifest(fixture_free + ["# end"])
-        real_before, fix_before = keys(sa), keys(sa, environ=fx_env)
+        # PIN(2026-10-13): re-pinned, not loosened — a key holds its family's fixture directory (KeyContext.fixture_dirs), so a
+        # fixture file moves the items of its family only; these items run under qwen4exp (no recipe of `items` names a
+        # BLOOMERY_MODEL), and a Mac-run item, whose family cannot be told, keeps every row. The base is the manifest with the root
+        # present, so every key is a key and not an error string. FAIL-first: the family clauses below fail on b1f2c3d1's code.
+        fx4 = {"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": "qwen4exp"}
+        write_manifest(manifest)
+        real_before, fix_before = keys(sa), keys(sa, environ=fx4)
+        expect(not any(v.startswith("error") for v in fix_before.values()), f"the fixture-tier keys on the base manifest: {fix_before}")
         write_manifest(fixture_free + [fx_file, "# end"])
         expect(not moved(keys(sa)), "a fixture file's manifest row moved a real-tier key")
-        expect(keys(sa, environ=fx_env) != fix_before and all(keys(sa, environ=fx_env)[k] != fix_before[k] for k in items),
-               "a fixture file's manifest row did not move every fixture-tier key")
+        fix_file = keys(sa, environ=fx4)
+        expect(not any(v.startswith("error") for v in fix_file.values()) and all(fix_file[k] != fix_before[k] for k in items),
+               "a fixture file's manifest row did not move every fixture-tier key of the family whose directory it is in")
         write_manifest(fixture_free + [fx_file.replace("\t100\t", "\t101\t"), "# end"])
-        expect(all(keys(sa, environ=fx_env)[k] != fix_before[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
+        expect(all(keys(sa, environ=fx4)[k] != fix_file[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
         write_manifest(manifest)
         expect(keys(sa) == base, "the base manifest, restored, keys another way")
+        # A fixture-tier item's key holds its family's fixture directory, from the family's row of ref-paths.sh's table (REF_PATHS, the
+        # one owner), as a variant's below holds its tag's: a file in a directory no family of the item maps to moves nothing of it.
+        rows, default = fixture_table(sa.tree.read(REF_PATHS))
+        expect(default == DEFAULT_PROFILE, f"ref-paths.sh's default profile {default} is not DEFAULT_PROFILE {DEFAULT_PROFILE}")
+        expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "self", "self"]
+               and "mimo2" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
+        fam = {
+            "q4": "gate-gpu-qwen4exp-e2e",  # BLOOMERY_MODEL=qwen4exp: qwen38
+            "glm": "gate-gpu-glm-sel",  # glm5next: glm5next
+            "ds41": "gate-gpu-ds41-hc",  # deepseek41: v41, its draft/ below it
+            "q35": "gate-gpu-qwen35moe-moe",  # qwen35moe: `self`, no fixture directory
+            "mimo": "gate-gpu-mimo2-flash",  # mimo2: no row, `none`
+            "envm": "gate-gpu-glm-sel@BLOOMERY_MODEL=qwen4exp",  # a BLOOMERY_MODEL in the item's env: no telling
+            "mac": "check-comments",  # a command run on the Mac: no telling
+        }
+        open_keys = {"envm", "mac"}
+
+        def fx_rows(sizes: dict[str, int]) -> list[str]:
+            out: list[str] = []
+            for d, size in sizes.items():
+                out += [f"model\t{FIXTURE_ROOT}/{d}\tdir", f"model\t{FIXTURE_ROOT}/{d}/{d}-00001-of-00001.gguf\t{size}\t1\t2\t3"]
+                if d == "v41":
+                    out += [f"model\t{FIXTURE_ROOT}/v41/draft\tdir", f"model\t{FIXTURE_ROOT}/v41/draft/d.gguf\t{size + 1}\t1\t2\t3"]
+            return out
+
+        def fam_keys(rows_: list[str], env: dict | None = None) -> dict[str, str]:
+            write_manifest(fixture_free + rows_ + ["# end"])
+            return keys(sa, environ=fx_env if env is None else env, only=fam)
+
+        sizes = {"qwen38": 30, "glm5next": 10, "v41": 50, "qwen35moe": 20}
+        kf = fam_keys(fx_rows(sizes))
+        expect(not any(v.startswith("error") for v in kf.values()), f"the family items under the fixture tier: {kf}")
+
+        def rewritten(rows_: list[str], env: dict | None = None, base_: dict[str, str] | None = None) -> set[str]:
+            now = fam_keys(rows_, env)
+            return {k for k in fam if now[k] != (kf if base_ is None else base_)[k]}
+
+        bump = lambda d: fx_rows({**sizes, d: sizes[d] + 1})  # noqa: E731
+        m = rewritten(bump("qwen35moe"))
+        expect("q4" not in m, f"a file under {FIXTURE_ROOT}/qwen35moe moved the key of a qwen4exp item")  # (a)
+        expect(m == open_keys, f"a file in a directory no family maps to (qwen35moe is `self`) moved {sorted(m)}, not only the items whose family cannot be told {sorted(open_keys)}")  # (b)
+        expect(rewritten(bump("qwen38")) == {"q4"} | open_keys, f"a file under qwen38 moved {sorted(rewritten(bump('qwen38')))}: the qwen4exp item and the unknown-family ones")  # (c)
+        expect(rewritten(bump("glm5next")) == {"glm"} | open_keys, f"a file under glm5next moved {sorted(rewritten(bump('glm5next')))}")
+        expect(rewritten(bump("v41")) == {"ds41"} | open_keys, f"a file under v41 moved {sorted(rewritten(bump('v41')))}")
+        expect(rewritten([r.replace("d.gguf\t51", "d.gguf\t52") for r in fx_rows(sizes)]) == {"ds41"} | open_keys, "v41's draft/ file (one level down) did not move exactly the deepseek41 item")
+        # (d) an item whose family cannot be told keeps every row: any file, a new family's directory included, moves it
+        newfam = fx_rows(sizes) + [f"model\t{FIXTURE_ROOT}/qwen38-old\tdir", f"model\t{FIXTURE_ROOT}/qwen38-old/n.gguf\t1\t1\t2\t3"]
+        expect(rewritten(newfam) == open_keys, f"a new directory (qwen38-old) moved {sorted(rewritten(newfam))}, not exactly the items whose family cannot be told")
+        # the root with no other family's directory, or with none, keys a told item the same: the root's own row is nobody's
+        only35 = fam_keys(fx_rows({"qwen35moe": 20}))
+        expect(not any(v.startswith("error") for v in only35.values()), f"a manifest with another family's directory only (no qwen38/): {only35}")
+        empty = fam_keys([f"model-dir\t{FIXTURE_ROOT}\tempty"])
+        expect(only35["q4"] == empty["q4"] and only35["mimo"] == empty["mimo"] and only35["mac"] != empty["mac"],
+               "a fixture root holding another family's directory only keys a told item another way than an empty root")
+        # the Mac's BLOOMERY_MODEL is the family of an item whose recipes name none (fmt-check: a box call with no BLOOMERY_MODEL); a name that
+        # is no plain family name cannot be told, and the item keeps every row
+        def fmt_moved(name: str) -> bool:
+            env = {"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": name}
+            write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
+            before = keys(sa, environ=env, only={"fmt": items["fmt"]})["fmt"]
+            write_manifest(fixture_free + bump("qwen38") + ["# end"])
+            return keys(sa, environ=env, only={"fmt": items["fmt"]})["fmt"] != before
+
+        got = {n: fmt_moved(n) for n in ("qwen4exp", "glm5next", "qwen35moe", "a b")}
+        expect(got == {"qwen4exp": True, "glm5next": False, "qwen35moe": False, "a b": True}, f"fmt-check, a qwen38 file rewritten, under the Mac's BLOOMERY_MODEL: moved {got}")
+        # (e) the real tier holds no fixture row: no rewrite moves a key
+        real_f = fam_keys(fx_rows(sizes), {})
+        expect(all(rewritten(bump(d), {}, real_f) == set() for d in sizes), "a fixture file's rewrite moved a real-tier key")
+        # the key part names what the fixture rows were taken from: the debuggability of "moved since"
+        fparts = lambda it, env: [p for p in KeyContext(sa, mf, "", env, settings=settings).parts(it)[0] if p.startswith("fixture\t")]  # noqa: E731
+        write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
+        expect([fparts(fam[k], fx_env) for k in ("q4", "ds41", "q35", "envm")] == [["fixture\tdirs\tqwen38"], ["fixture\tdirs\tv41"], ["fixture\tdirs\t-"], ["fixture\tdirs\t*"]]
+               and fparts(fam["q4"], {}) == [], "the fixture key part does not name the directories the key holds")
+        # (f) the table is ref-paths.sh's: moving qwen35moe's row to a directory of its own makes its item hold it, and the edit moves the
+        # keys of the box items (the file is a key part of every one of them: a row edit moves its family's keys, and others' with them)
+        rp = os.path.join(roots[0], REF_PATHS)
+        with open(rp, encoding="utf-8") as fh:
+            rp_old = fh.read()
+        two_rows = "deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;\n      qwen35moe) __fixture_dir=qwen35moe ;;"
+        refused = [
+            (rp_old.replace("*) __fixture_dir=none ;;", "*) __fixture_dir=self ;;"), "not none"),
+            (rp_old.replace("qwen4exp) __fixture_dir=qwen38 ;;", "qwen4*) __fixture_dir=qwen38 ;;"), "neither a family name nor a lone `*`"),
+            (rp_old.replace('case "$BLOOMERY_MODEL" in', 'case "$M" in'), "no fixture table"),
+        ]
+        try:
+            expect(two_rows.split("\n")[0] != "" and "deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;" in rp_old, "ref-paths.sh's `self` row is not the one this clause edits")
+            with open(rp, "w", encoding="utf-8") as fh:
+                fh.write(rp_old.replace("deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;", two_rows))
+            kf_row = fam_keys(fx_rows(sizes))
+            expect(kf_row["q4"] != kf["q4"] and kf_row["q35"] != kf["q35"] and kf_row["glm"] != kf["glm"], "an edit of ref-paths.sh's table moved no key of a box item")
+            m = rewritten(bump("qwen35moe"), None, kf_row)
+            expect(m == {"q35"} | open_keys, f"qwen35moe given a fixture directory by the table: a file in it moved {sorted(m)}, not its item and the unknown-family ones")
+            for text, why in refused:
+                with open(rp, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                got = fam_keys(fx_rows(sizes))["q4"]
+                expect(got.startswith("error") and why in got, f"a fixture table this reader does not understand ({why}) was keyed: {got}")
+        finally:
+            with open(rp, "w", encoding="utf-8") as fh:
+                fh.write(rp_old)
+        expect(fam_keys(fx_rows(sizes)) == kf, "ref-paths.sh restored keys another way")
+        write_manifest(manifest)
+        expect(keys(sa) == base, "the base manifest, restored after the family clauses, keys another way")
         # A fixture variant's files (VARIANT_ROOT, beside FIXTURE_ROOT) belong to the keys of the items that run under its tag: no other
         # item's key moves with them, an item under the tag moves with its own directory's rows and its table row, and not with another tag's.
         vdirs = lambda tag: [f"model\t{VARIANT_ROOT}/{tag}\tdir", f"model\t{VARIANT_ROOT}/{tag}/glm5next\tdir"]  # noqa: E731
