@@ -395,7 +395,7 @@ mod cli {
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_levers::{
         Draft38At, Draft38Off, Levers, Paged, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
-        SlotsBy, draft38_unset, paged_columns, paged_draft, residency38_unset,
+        draft38_unset, paged_columns, paged_draft, residency38_unset,
     };
     use cuda_core::sys;
     use gguf::Split;
@@ -1042,12 +1042,13 @@ mod cli {
         Ok(plan.plan.host.nvme_arena_bytes)
     }
 
-    /// The paged tier's one-column rule ([`bloomery_levers::paged_columns`])
-    /// asked once of the plan the run loads ([`arena38`]): on a plan that
-    /// pages host experts through the NVMe tier's RAM arena an unset draft
-    /// goes off (`Draft38Off::Paged`, the `load draft=off` record's why), and
-    /// `BLOOMERY_GEN_SLOTS` past one or `BLOOMERY_DRAFT=mtp` is refused by
-    /// name. The run's slots are the lever's alone: unset, one.
+    /// The paged tier's rule ([`bloomery_levers::paged_columns`]) asked once
+    /// of the plan the run loads ([`arena38`]): on a plan that pages host
+    /// experts through the NVMe tier's RAM arena an unset draft goes off
+    /// (`Draft38Off::Paged`, the `load draft=off` record's why), a set
+    /// `BLOOMERY_GEN_SLOTS` is served as one pass over the arena, and
+    /// `BLOOMERY_DRAFT=mtp` is refused by name. The run's slots are the
+    /// lever's alone: unset, one.
     fn paged38(
         file: &Split,
         levers: &Levers,
@@ -1063,7 +1064,7 @@ mod cli {
         let at = PagedAt {
             arena,
             slots,
-            slots_by: (slots > 1).then_some(SlotsBy::GenSlots),
+            slots_set: slots > 1,
             // `BLOOMERY_GEN_SLOTS` decodes its streams as one pass.
             together: true,
             draft: mtp,
@@ -1071,7 +1072,7 @@ mod cli {
         };
         Ok(match paged_columns(&at)? {
             Paged::AsAsked => (draft, off),
-            Paged::OneColumn { .. } => (Draft38::Off, paged_draft(mtp, off, arena).1),
+            Paged::Reduced { .. } => (Draft38::Off, paged_draft(mtp, off, arena).1),
         })
     }
 

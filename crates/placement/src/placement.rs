@@ -837,6 +837,11 @@ pub struct HostTotals {
     /// arena's floor ([`ArenaFloor`]). Beside the plan's own bytes: the
     /// arena is the tier's memory, not a segment.
     pub nvme_arena_bytes: u64,
+    /// The columns of the widest call the arena's floor counts
+    /// ([`ArenaFloor::of`]): the resident slots a load steps as one pass,
+    /// capped at the step port's width, set by the plan's maker before the
+    /// split runs; 1 for a plan that steps one column.
+    pub arena_columns: u64,
     /// Row-gathered tables held on the host.
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
@@ -872,6 +877,20 @@ pub struct HostTotals {
 }
 
 impl HostTotals {
+    /// Counts `slots` resident sequences stepped as one pass of one row each
+    /// into the arena's floor: their columns, to the step port's `port`
+    /// width. Refused by name: no slot, or a port of no column.
+    pub fn step_slots(&mut self, slots: usize, port: usize) -> Result<(), PlacementError> {
+        if slots == 0 || port == 0 {
+            return Err(PlacementError::Metadata {
+                key: "the NVMe tier arena's columns".to_string(),
+                detail: format!("{slots} slots over a step port of {port} columns"),
+            });
+        }
+        self.arena_columns = slots.min(port) as u64;
+        Ok(())
+    }
+
     /// The room a plan with the host room `room` is made at, which this
     /// plan then names ([`HostTotals::room`]): the one caller of
     /// [`workstation::plan_room`] for a plan's tiers.
@@ -2645,11 +2664,10 @@ impl HostLayer {
 /// which the arena's crate holds equal to it at compile time).
 pub const ARENA_ALIGN: u64 = 4096;
 
-/// The columns of the widest call a load steps on a plan whose host experts
-/// page through the arena: one, the one-column rule's
-/// (`bloomery_levers::paged_columns`). A path that steps more columns asks
-/// [`ArenaFloor::of`] for its own.
-pub const ARENA_COLUMNS: u64 = 1;
+/// The step port's width: the columns past it do not enter the arena's floor
+/// ([`HostTotals::step_slots`]). The model crate's `ops::DEFER_MAX_COLS`
+/// holds it equal, by a compile-time assertion in the gpu crate's tier.
+pub const STEP_PORT_COLUMNS: usize = 8;
 
 /// The slots of a paged layer one residency lane holds at once beside the
 /// step's call: `4 + 1`. Four are open reads: each lane thread pins the slot
@@ -2747,14 +2765,14 @@ impl ArenaFloor {
         })
     }
 
-    /// `plan`'s floor for calls of `columns` columns: `k` the model's
-    /// routed width, the lane slots where a stage card holds a routed
+    /// `plan`'s floor for calls of [`HostTotals::arena_columns`] columns: `k`
+    /// the model's routed width, the lane slots where a stage card holds a routed
     /// expert, and the slot set over every layer whose routed stacks the
     /// host leg serves (a host or an NVMe segment) — on a plan the split
     /// has not run on yet, the layers it can page, a bound over the ones it
     /// does, so the arena's carve at load never falls under the slots the
     /// dial sized it for.
-    pub fn of(plan: &Plan<'_>, columns: u64) -> Result<ArenaFloor, PlacementError> {
+    pub fn of(plan: &Plan<'_>) -> Result<ArenaFloor, PlacementError> {
         let model = plan.model;
         let mut slot_set = 0u64;
         for r in &plan.rows {
@@ -2778,7 +2796,12 @@ impl ArenaFloor {
         } else {
             0
         };
-        ArenaFloor::new(model.experts_used, columns, lane_slots, slot_set)
+        ArenaFloor::new(
+            model.experts_used,
+            plan.host.arena_columns,
+            lane_slots,
+            slot_set,
+        )
     }
 }
 
@@ -2790,7 +2813,7 @@ pub fn arena_slots(plan: &Plan<'_>) -> Result<u64, PlacementError> {
     if arena == 0 {
         return Ok(0);
     }
-    let set = ArenaFloor::of(plan, ARENA_COLUMNS)?.slot_set;
+    let set = ArenaFloor::of(plan)?.slot_set;
     arena
         .checked_div(set)
         .ok_or_else(|| PlacementError::Metadata {
@@ -3047,7 +3070,7 @@ pub fn expert_nvme_tier(
         heavy,
         held,
         need: need.bytes(),
-        least: ArenaFloor::of(plan, ARENA_COLUMNS)?,
+        least: ArenaFloor::of(plan)?,
     };
     let arena = nvme_arena_of(&dial, given)?;
     let room = room - arena;
@@ -3209,6 +3232,7 @@ fn totals<'a>(
             .sum(),
         nvme_expert_bytes: nvme_experts,
         nvme_arena_bytes: 0,
+        arena_columns: 1,
         table_bytes: host_tables,
         shadow_bytes,
         reserve_bytes,

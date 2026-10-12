@@ -54,7 +54,7 @@ use model::arch::Arch;
 use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
-use model::placement::{ARENA_COLUMNS, ArenaFloor, ExpertList, Plan};
+use model::placement::{ArenaFloor, ExpertList, Plan};
 use model::r8file::R8Source;
 use std::ops::Range;
 use std::sync::Arc;
@@ -1841,7 +1841,7 @@ fn placed_pre(
     // the arena's room above its floor: the tier is then built over what
     // the reading leaves, never silently — the `nvtier` record names both.
     let least = if plan.host.nvme_arena_bytes > 0 {
-        ArenaFloor::of(plan, ARENA_COLUMNS)
+        ArenaFloor::of(plan)
             .map_err(|e| GpuError::plan(what, e))?
             .bytes
     } else {

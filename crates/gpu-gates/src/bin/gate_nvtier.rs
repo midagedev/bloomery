@@ -260,7 +260,7 @@ use model::moe::UNION_BATCH_IDS;
 use model::placement::churn::ChurnPool;
 use model::placement::host_lock::page_bytes;
 use model::placement::workstation::{ArenaGrant, HostNeed, HostRead};
-use model::placement::{ARENA_COLUMNS, ArenaFloor, Machine, PlanLevers};
+use model::placement::{ArenaFloor, Machine, PlanLevers};
 use runtime::{Out, Target, Want};
 
 const NAME: &str = "gate_nvtier";
@@ -1019,6 +1019,8 @@ struct StepRun {
     union_hits: u64,
     /// The tier census of the passes.
     census: TierCensus,
+    /// The tier ids the passes read through the file mapping.
+    mapping_reads: u64,
     before: Pages,
     after: Pages,
     layers: usize,
@@ -1089,7 +1091,7 @@ fn stepunion_arm(
         .ok_or("the stepunion arm's two-slot plan built no arena")?;
     // The arena serves the arm's widest call, two columns a step: the
     // placement's floor at two columns against the slots the tier carved.
-    let wide = ArenaFloor::of(&plan, 2)?;
+    let wide = ArenaFloor::of(&plan)?;
     let carved = tier.stats().slots_per_layer;
     if carved < wide.slots {
         return Err(format!(
@@ -1160,6 +1162,7 @@ fn stepunion_arm(
         union_fills: t1.union_fills - t0.union_fills,
         union_hits: t1.union_hits - t0.union_hits,
         census,
+        mapping_reads: t1.mapping_reads - t0.mapping_reads,
         before,
         after,
         layers: regions.len(),
@@ -1170,7 +1173,7 @@ fn stepunion_arm(
 /// passes' tokens and logits-row digests; the flips that landed during the
 /// passes, how many were late and the experts found unresident or faulting
 /// over them; and, on a load with a tier, the arena's misses and fills over
-/// the passes and their tier census.
+/// the passes, their tier census and the file-mapping reads the tier made.
 struct MidRun {
     prompts: [u32; 2],
     tokens: Vec<u32>,
@@ -1179,7 +1182,7 @@ struct MidRun {
     late: usize,
     unresident: usize,
     faulting: usize,
-    served: Option<(u64, u64, TierCensus)>,
+    served: Option<(u64, u64, TierCensus, u64)>,
 }
 
 /// What the `refuse` clause's floor arm read: the slots a paged layer its arena
@@ -1285,7 +1288,7 @@ fn slots_mid_arm(
     s.model_mut().body_parts(NAME)?.2.log_residency(0);
     let tier = s.model().body(NAME)?.nvme_tier().cloned();
     if let Some(t) = &tier {
-        let wide = ArenaFloor::of(&plan, 2)?;
+        let wide = ArenaFloor::of(&plan)?;
         let carved = t.stats().slots_per_layer;
         if carved < wide.slots {
             return Err(format!(
@@ -1307,7 +1310,12 @@ fn slots_mid_arm(
             let census = census_of(&s)?
                 .ok_or("the stepunion mid arm's load took no census")?
                 .since(&c0);
-            Some((t1.misses - t0.misses, t1.fills - t0.fills, census))
+            Some((
+                t1.misses - t0.misses,
+                t1.fills - t0.fills,
+                census,
+                t1.mapping_reads - t0.mapping_reads,
+            ))
         }
         _ => None,
     };
@@ -1919,7 +1927,7 @@ fn run() -> Result<(), GateError> {
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
     );
     pass &= refuse_clauses(path, &machine, &plan)?;
-    let least = ArenaFloor::of(&plan, ARENA_COLUMNS)?;
+    let least = ArenaFloor::of(&plan)?;
     let grant_terms = GrantTerms::of(
         plan.host.nvme_arena_bytes,
         least.bytes,
@@ -2599,7 +2607,8 @@ fn run() -> Result<(), GateError> {
         && mid.tokens == mid_ram.tokens
         && mid.digests == mid_ram.digests
         && mid.flips == mid_ram.flips;
-    let (mid_misses, mid_fills, mid_census) = mid.served.ok_or("the paged mid arm took no tier")?;
+    let (mid_misses, mid_fills, mid_census, mid_mapping) =
+        mid.served.ok_or("the paged mid arm took no tier")?;
     let mid_flips = mid.flips > 0 && mid.unresident == 0 && mid.faulting == 0;
     let mid_served = mid_misses > 0 && mid_fills > 0;
     let stepmid = mid_bits && mid_flips && mid_served && mid_ram.served.is_none();
@@ -2679,6 +2688,27 @@ fn run() -> Result<(), GateError> {
         verdict(census_ok)
     );
     pass &= census_ok;
+
+    // The paged rule's pin: a paged step of two columns reads every tier id
+    // from an arena slot, so no tier id is read through the file mapping (the
+    // tier's `mapping_reads`; the census's `file` picks are the plan's host
+    // segment's, not tier ids). The bits are equal either way: the counter is
+    // what tells the arena path from the mapping path.
+    let two_col_ok = step.mapping_reads == 0
+        && mid_mapping == 0
+        && step.census.arena > 0
+        && mid_census.arena > 0;
+    println!(
+        "census two-column steps: {} and {} tier ids read through the file mapping over the \
+         stepunion and mid passes ({} and {} picks from arena slots; want 0 mapping reads, \
+         arena picks above 0): {}",
+        step.mapping_reads,
+        mid_mapping,
+        step.census.arena,
+        mid_census.arena,
+        verdict(two_col_ok)
+    );
+    pass &= two_col_ok;
 
     // `pool` (clause 10): no phase's dispatch waited for another caller's
     // job. The chain is the pool's one dispatcher: the lane's victim fills
@@ -2770,7 +2800,7 @@ fn refuse_clauses(
     // floor's terms; the floor's own bytes load, carve exactly its slots,
     // and carve the slot set the placement counts — the window geometry's
     // one owner.
-    let least = ArenaFloor::of(plan, ARENA_COLUMNS)?;
+    let least = ArenaFloor::of(plan)?;
     let named = |slots: u64| match with_arena(slots * least.slot_set) {
         Err(e) => {
             let text = e.to_string();

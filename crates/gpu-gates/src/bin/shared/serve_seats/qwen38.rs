@@ -148,16 +148,21 @@
 //!
 //! A plan that pages host experts through the NVMe tier's RAM arena (a room
 //! under half the host leg's experts, or `BLOOMERY_NVTIER_BYTES` set:
-//! `placement::nvme_arena_of`) steps one column (`bloomery_levers::paged_columns`): a step of several — two
-//! slots' rows, or a drafted verify's window — reads the paged experts
-//! through the file mapping, whose page cache grows until the kernel swaps
-//! the arena out. The unset counts fall to one slot (`from=paged`) and the
-//! draft off (`load draft=off (unset: the plan pages …)` — also for a draft
-//! whose yield to the context, judged on the plan of several slots the load
-//! abandons, had turned it off), one `paged` line on stderr naming the arena
-//! and what was asked (`asked_draft` the draft before that yield); a
-//! `--parallel` past one or `BLOOMERY_DRAFT=mtp` is refused by name before
-//! the load, with the way out. Under `--place bp` each slot steps alone (the
+//! `placement::nvme_arena_of`) serves its slots as one pass over the arena
+//! (`bloomery_levers::paged_columns`): the placement's floor counts a column
+//! a slot (`ArenaFloor::of`), so the paged experts of every slot's rows are
+//! read from the arena, not through the file mapping. A set `--parallel` is
+//! served as asked; an unset count falls to one slot (`from=paged`: a second
+//! slot's KV takes card bytes that experts would hold, and a later budget
+//! rule prices that trade) and the draft goes off (a drafted verify's added
+//! columns are not shown to pay on a paged plan; `load draft=off (unset: the
+//! plan pages …)` — also for a draft whose yield to the context, judged on
+//! the plan of several slots the load abandons, had turned it off), one
+//! `paged` line on stderr naming the arena and what was asked
+//! (`asked_draft` the draft before that yield); a set count the room's floor
+//! cannot hold is refused by name with the room and the floor, and
+//! `BLOOMERY_DRAFT=mtp` is refused by name before the load, with the way
+//! out. Under `--place bp` each slot steps alone (the
 //! rounds below), so slots add no column there: they are served as asked, and
 //! only the draft goes off. The rule reads the plan the flags name — a set
 //! context's plain plan before any search, else the plan the default's search
@@ -1404,20 +1409,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
         inputs.room = host_available_read()?;
     }
-    // The paged tier's one-column rule (`bloomery_levers::paged_columns`,
-    // the module doc), asked once of the plan the flags name: a set
-    // context's slot is known before any search, so its plain plan's arena
-    // decides ahead of the drafted plan, whose refusal would name a draft
-    // the rule turns off; the default's is asked below, of the plan its
-    // search and the draft's yield chose. Under the rule the plan serves no
-    // draft and, where the slots step together, one slot (`from=paged` when
-    // the count was the default's); beside an expert tier card each slot
-    // steps alone ([`Place38::tiered`], the rounds' own rule below), and the
-    // slots stay.
+    // The paged tier's rule (`bloomery_levers::paged_columns`, the module
+    // doc), asked once of the plan the flags name: a set context's slot is
+    // known before any search, so its plain plan's arena decides ahead of the
+    // drafted plan, whose refusal would name a draft the rule turns off; the
+    // default's is asked below, of the plan its search and the draft's yield
+    // chose. Under the rule the plan serves no draft, a set `--parallel` as
+    // asked, and a default count of slots that step together at one slot
+    // (`from=paged`); beside an expert tier card each slot steps alone
+    // ([`Place38::tiered`], the rounds' own rule below), and the slots stay.
     let paged_at = |arena: u64, slots: usize, mtp: bool| bloomery_levers::PagedAt {
         arena,
         slots,
-        slots_by: (from == "flag").then_some(bloomery_levers::SlotsBy::Parallel),
+        slots_set: from == "flag",
         together: !a.place.tiered(),
         draft: mtp,
         draft_set: levers.draft().is_some(),
@@ -1425,21 +1429,27 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let paged = |arena: u64, slots: usize, mtp: bool| {
         bloomery_levers::paged_columns(&paged_at(arena, slots, mtp))
     };
-    // The draft a one-column load runs without names the paged rule when
+    // The draft a reduced load runs without names the paged rule when
     // the draft was asked — on, or off only by its yield to the context on
     // the plan this load abandons (`bloomery_levers::paged_draft`) — at
     // either point.
-    let one_column = |arena: u64,
-                      (slots, served): (usize, usize),
-                      mtp: bool,
-                      draft_off: Option<Draft38Off>,
-                      floor: bool| {
+    let reduced = |arena: u64,
+                   (slots, served): (usize, usize),
+                   mtp: bool,
+                   draft_off: Option<Draft38Off>,
+                   floor: bool| {
         let (asked, draft_off) = bloomery_levers::paged_draft(mtp, draft_off, arena);
         eprintln!(
-            "paged rule=one-column arena={arena} asked_slots={slots} asked_draft={} \
+            "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
              slots={served} draft=off (the plan pages host experts through the NVMe tier's RAM \
-             arena: a step of several columns reads them through the file mapping{})",
+             arena; {}{})",
             if asked { "on" } else { "off" },
+            if served < slots {
+                "an unset count serves one slot: a second slot's KV takes card bytes that \
+                 experts would hold, and a later budget rule prices that trade"
+            } else {
+                "a set count is served as one pass over the arena"
+            },
             if floor {
                 "; the asked slots' plan leaves the room under the tier's floor"
             } else {
@@ -1469,9 +1479,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let (slots, from, mtp, head, draft_off) = match paged(early, slots, mtp)? {
         Paged::AsAsked => (slots, from, mtp, head, draft_off),
-        Paged::OneColumn { slots: served } => {
+        Paged::Reduced { slots: served } => {
             mtp_inputs = None;
-            let (from, draft_off) = one_column(early, (slots, served), mtp, draft_off, false);
+            let (from, draft_off) = reduced(early, (slots, served), mtp, draft_off, false);
             (served, from, false, None, draft_off)
         }
     };
@@ -1497,9 +1507,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (slots, from, mtp, head, draft_off) = match floor {
         Some(arena) => match bloomery_levers::paged_floor(&paged_at(arena, slots, mtp))? {
             Paged::AsAsked => (slots, from, mtp, head, draft_off),
-            Paged::OneColumn { slots: served } => {
+            Paged::Reduced { slots: served } => {
                 mtp_inputs = None;
-                let (from, draft_off) = one_column(arena, (slots, served), mtp, draft_off, true);
+                let (from, draft_off) = reduced(arena, (slots, served), mtp, draft_off, true);
                 (served, from, false, None, draft_off)
             }
         },
@@ -1559,15 +1569,25 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let host = plans.host(rule.ctx(), set)?;
     let (slots, from, mtp, head, draft_off, host, one) = match paged(host.2, slots, mtp)? {
-        Paged::AsAsked => (slots, from, mtp, head, draft_off, host, None),
-        Paged::OneColumn { slots: served } => {
+        Paged::AsAsked => {
+            if host.2 > 0 && slots > 1 {
+                eprintln!(
+                    "paged rule=served arena={} asked_slots={slots} slots={slots} (the plan \
+                     pages host experts through the NVMe tier's RAM arena; a set count is \
+                     served as one pass over it)",
+                    host.2
+                );
+            }
+            (slots, from, mtp, head, draft_off, host, None)
+        }
+        Paged::Reduced { slots: served } => {
             let one = Plans {
                 mtp: None,
                 slots: served,
                 ..plans
             };
             rule = ctx38(&one, a.ctx)?;
-            let (from, draft_off) = one_column(host.2, (slots, served), mtp, draft_off, false);
+            let (from, draft_off) = reduced(host.2, (slots, served), mtp, draft_off, false);
             let host = one.host(rule.ctx(), set)?;
             (served, from, false, None, draft_off, host, Some(one))
         }
