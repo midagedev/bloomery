@@ -1,0 +1,13 @@
+# The repos of the type census, one owner/name a line (tools/type-census.py pin reads them; stubs.tsv is its output).
+unsloth/Qwen3.6-35B-A3B-GGUF
+bartowski/Qwen_Qwen3.6-35B-A3B-GGUF
+ggml-org/Qwen3.6-35B-A3B-GGUF
+unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF
+unsloth/Qwen3.8-Flash-Next-GGUF
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
+unsloth/GLM-5.3-Flash-GGUF
+vcruz305/DeepSeek-V4.1-Flash-GGUF
+ggml-org/MiMo-V2.6-Flash-MOPD-GGUF
+ggml-org/MiMo-V2.6-Flash-RL-GGUF
+bartowski/Cloudflare_clef-flash-GGUF
+ggml-org/lev-GGUF

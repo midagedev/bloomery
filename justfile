@@ -1350,6 +1350,14 @@ gate-refset:
 refset-check *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh refset-check && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && cargo build --release -p bloomery-refset --bin refset-check && bash tools/host-gate.sh refset-check {{ARGS}}'
 
+# The type census's header stubs: from tools/census/stubs.tsv (`python3 tools/type-census.py pin` writes it), the first
+# header_bytes bytes of each real file are fetched from the hub at the row's revision, checked against header_sha256,
+# written at ROOT/<org>/<repo>/<file> as a sparse file of file_bytes, and read back and checked again. ROOT is a
+# directory on the box that does not exist or is empty (e.g. /models/census-stubs-<revision tag>): a rebuild goes to a
+# new one. It reads the hub only: no card, no lock, not timed.
+census-stubs ROOT:
+    ./tools/box.sh 'python3 tools/type-census.py build "{{ROOT}}" tools/census/stubs.tsv'
+
 # V4.1 호스트 스텝 계획: 디코드 걷기 단위 시험(위치 2,101개)을 돈 뒤, V4.1 오라클 세트(배치 세트와 디코드 스텝 세트)의
 # 그래프 입력 전부를 계획과 비트 단위로 대조한다. 어떤 검사도 맡지 않은 입력은 빨강이다. 호스트 전용(카드·게이트 락 없음).
 gate-ds41-plan:

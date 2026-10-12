@@ -1,11 +1,15 @@
 """The Hugging Face hub's reads, for the tools that look at the GGUF files users download: the listing of a repo, its
 GGUF sets, a ranged fetch, and the header of a GGUF file read by ranged fetches. Every read is curl's (as
-crates/hf/src/fetch.rs): Python's own TLS can fail on a machine curl works on.
+crates/hf/src/fetch.rs): Python's own TLS can fail on a machine curl works on. A read names its revision (a branch
+or a commit sha; `main` unless the caller pins one), and the three URL forms of the hub are built here and nowhere
+else.
 
 tools/ has no packages: a script imports this file by path, as tools/hf-arch-check.py and tools/type-census.py do.
 
-    Hub(scratch).listing(repo)           the files of the repo's main branch, as Entry
-    Hub(scratch).range(repo, path, a, b) the bytes [a, b) of one file
+    info_url / tree_url / resolve_url    the model info, the listing and a file of a repo at a revision
+    Hub(scratch).main_sha(repo)          the commit sha `main` points to now
+    Hub(scratch).listing(repo, revision) the files of the repo at the revision (main), as Entry
+    Hub(scratch).range(repo, path, a, b, revision) the bytes [a, b) of one file at the revision
     gguf_sets(repo, entries)             the GGUF sets of a listing (the hf crate's grouping)
     read_header(fetch, local, size, n)   a file's metadata and tensor list, ranged fetches until it parses
     ggml_type_name(id, file)             the ggml name of a tensor type id; an id the table lacks is a Red
@@ -208,6 +212,24 @@ def next_link(headers):
 
 
 # ------------------------------------------------------------------------------------------------
+# The hub's URL forms: the one owner, so a pinned read and a read of main differ by the revision alone.
+
+def info_url(repo):
+    """The model info of `repo` (its `sha` is the commit `main` points to now)."""
+    return f"{HUB}/api/models/{repo}"
+
+
+def tree_url(repo, revision):
+    """The recursive listing of `repo` at `revision`."""
+    return f"{HUB}/api/models/{repo}/tree/{urllib.parse.quote(revision, safe='')}?recursive=true"
+
+
+def resolve_url(repo, revision, path):
+    """The bytes of `path` of `repo` at `revision`."""
+    return f"{HUB}/{repo}/resolve/{urllib.parse.quote(revision, safe='')}/{urllib.parse.quote(path)}"
+
+
+# ------------------------------------------------------------------------------------------------
 # The hub, by curl.
 
 # crates/hf/src/fetch.rs:network_failure and hub_unavailable.
@@ -256,10 +278,22 @@ class Hub:
                              "not a row's refusal)")
         raise Red(f"curl {what}: {curl_why(done.returncode, err)}")
 
-    def listing(self, repo, follow=True):
-        """Every file of `repo`'s main branch, each page followed to its last; with `follow=False` a listing that
-        has a next page is a Red naming it, never a truncated list."""
-        url = f"{HUB}/api/models/{repo}/tree/main?recursive=true"
+    def main_sha(self, repo):
+        """The commit sha `main` of `repo` points to now, from the model info; an answer without one is a Red."""
+        url = info_url(repo)
+        body = self._curl(f"model info {url}", [url])
+        self.bytes += len(body)
+        try:
+            sha = hex_of(json.loads(body.decode("utf-8", "replace")).get("sha"), 40)
+        except (ValueError, AttributeError):
+            sha = None
+        if sha is None:
+            raise Red(f"{repo}: the API's model info has no commit sha this reads")
+        return sha
+
+    def listing(self, repo, revision="main"):
+        """Every file of `repo` at `revision`, each page followed to its last."""
+        url = tree_url(repo, revision)
         headers = os.path.join(self.scratch, "listing.headers")
         out = []
         while True:
@@ -271,14 +305,12 @@ class Hub:
             url = next_link(head)
             if url is None:
                 return out
-            if not follow:
-                raise Red(f"{repo}: the listing has a next page; this reader takes one")
 
-    def range(self, repo, path, start, end):
-        """The bytes [start, end) of `path` of `repo`: one range read, checked to be a 206 of that length (a
-        server that sends the whole file is refused before the body, by --max-filesize)."""
+    def range(self, repo, path, start, end, revision="main"):
+        """The bytes [start, end) of `path` of `repo` at `revision`: one range read, checked to be a 206 of that
+        length (a server that sends the whole file is refused before the body, by --max-filesize)."""
         want = end - start
-        url = f"{HUB}/{repo}/resolve/main/{urllib.parse.quote(path)}"
+        url = resolve_url(repo, revision, path)
         part = os.path.join(self.scratch, "range.part")
         out = self._curl(f"range {start}-{end - 1} of {url}",
                          ["-r", f"{start}-{end - 1}", "--max-filesize", str(want + 1024), "-o", part,
