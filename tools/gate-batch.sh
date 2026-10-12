@@ -116,8 +116,10 @@
 #      its flags and its host bytes, the plan's HostNeed derived per family (the fixture tier's
 #      loads are the tree's small files and reserve nothing — the pack reads 0 bytes there). A solo
 #      recipe with no row, or a row for a recipe that is not solo, is a named error: a recipe that
-#      runs in the pack declares its bytes. Launches take the longest-est eligible item; a single
-#      item always starts (the budget bounds pairs, and one load's own check is its own); the dry
+#      runs in the pack declares its bytes. Launches stay in the family of the first unlaunched item in
+#      lane X's order (by family, below), the longest-est eligible item of it first: the pack never opens
+#      the next family while the current one holds an unlaunched item, so each family's host set loads
+#      once (the chain's own rule above). A single item always starts (the budget bounds pairs, and one load's own check is its own); the dry
 #      run simulates the pack from the expected seconds and the predicted line's laneX= is that
 #      wall. --lanes 1 keeps today's serial lane.
 #   deferred (the fixture tier only; class D): a recipe the fixture tier cannot run, which the batch defers to the real tier instead
@@ -272,7 +274,7 @@
 # box — the item waits (up to 30 min, then rc 75, which retries below) and starts after the sitting.
 # The wait comes before the item's command, so the runners' 900 s bound does not count it; nor does the
 # item's times row: the final try's seconds less the waits its log names (box.sh's guard, gpu-gate.sh's card
-# lock and V4.1 load lock), which the item line prints as `waited=<s>s`.
+# lock and V4.1 load lock), which the item line prints as `waited=<s>s`, and by lock as `waited_on=` (try_waits_on).
 # --wait-hold [SECONDS] (default 3600) waits instead of refusing: before the batch's first box call (the ledger's manifest read
 # included) it polls the lease and the holds every 30 s, each poll a READONLY box.sh call that runs lease_guard with no wait of
 # its own (tools/ref/lease-probe.sh: lease_free, the shared-lock probe, and every hold but BLOOMERY_HOLD_OWNER's), so nothing is
@@ -539,6 +541,26 @@ try_waits() {
     END { print w + 0 }' "$1"
 }
 
+# try_waits_on <log> <try>: what try_waits summed, by what it waited on — `guard` (box.sh's guard),
+# `gate-lock-<card>`, `v41-load` and `batch-hold` — as `<name>:<s>s` joined by commas, the longest
+# first (ties in the order the log names them); empty when the try waited on nothing.
+try_waits_on() {
+  awk -v t="=== try $2 " '
+    function add(k, v) { if (!(k in w)) o[++n] = k; w[k] += v }
+    index($0, t) == 1 { on = 1; next }
+    /^=== try / { on = 0 }
+    on && match($0, /after [0-9]+ s: the command starts/) { split(substr($0, RSTART + 6), a, " "); add("guard", a[1]) }
+    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the gate lock \([^)]*\)/) {
+      split(substr($0, RSTART + 20), a, " "); c = substr($0, RSTART, RLENGTH); sub(/.*\(/, "", c); sub(/\)$/, "", c); add("gate-lock-" c, a[1])
+    }
+    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the V4\.1 load lock/) { split(substr($0, RSTART + 20), a, " "); add("v41-load", a[1]) }
+    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the batch hold/) { split(substr($0, RSTART + 20), a, " "); add("batch-hold", a[1]) }
+    END {
+      for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (w[o[j]] > w[o[i]]) { x = o[i]; o[i] = o[j]; o[j] = x }
+      for (i = 1; i <= n; i++) printf "%s%s:%ds", (i > 1 ? "," : ""), o[i], w[o[i]]
+    }' "$1"
+}
+
 # hold75_owner <log> <try>: the owner the try's rc 75 names when it ended on a GPU hold another batch put
 # up — tools/gpu-gate.sh's `the batch hold <path> (owner <owner>) was still up after N s (CARD_BOUND M s)`
 # line, printed only at that hold's bound (its once-a-minute `[batch-hold]` wait lines say `waits:` and
@@ -772,7 +794,7 @@ big-any:
     ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_bh'
 
 # The pack's cases (the header's «pack»): one-card items that fit the budget, a pair that does not,
-# an m-flagged item, a both-cards one; a second pool item beside pool-any; and a recipe whose bound
+# an m-flagged item, a both-cards one, three items of two families; a second pool item beside pool-any; and a recipe whose bound
 # lives two scripts deep (the budget scan follows the calls).
 [group('solo')]
 pk-a:
@@ -797,6 +819,18 @@ pk-m:
 [group('solo')]
 pk-both:
     BLOOMERY_CARD=both ./tools/box.sh 'bash tools/gpu-gate.sh gen_pt'
+
+[group('solo')]
+pk-f1l:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pf1l'
+
+[group('solo')]
+pk-f1s:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pf1s'
+
+[group('solo')]
+pk-f2m:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pf2m'
 
 [group('pool')]
 pool-two:
@@ -856,6 +890,9 @@ pk-big	-	9000
 pk-big2	-	9000
 pk-m	m	100
 pk-both	-	100
+pk-f1l	-	100
+pk-f1s	-	100
+pk-f2m	-	100
 RT
   # A bound two scripts deep: bt-deep -> bt-one.sh -> bt-two.sh holds the bounded call.
   printf '%s\n' '#!/usr/bin/env bash' 'bash tools/bt-two.sh' > "$t/tools/bt-one.sh"
@@ -1763,6 +1800,36 @@ FP
   rc_ok 'pack: a fixture pair over the budget ends green' pk-fx 2
   if overlap "$t/fake-state/seq.log" gen_pg gen_pg2; then pass 'pack: the fixture tier sums no bytes (its loads are the small fixtures)'
   else fail 'pack: the fixture tier sums no bytes (its loads are the small fixtures)' "the intervals did not cross"; fi
+  # (6b) family-major launches: the pack stays in the family of the first unlaunched item, so glm's long and short items
+  # start before qwen's mid one, though the mid one is the longer of the two that remain once the long one runs. The S lines
+  # are in seq.log in the order the fake wrote them (no clock); the mid one can start only when a card frees (2 s on).
+  started_before() { # <seq.log> <cmd-a> <cmd-b>: yes when a's start line precedes b's, no when it follows, absent when either is missing
+    awk -v a="$2" -v b="$3" '
+      $1 == "S" && $0 ~ (" " a "[ ]*$") && !as { as = NR }
+      $1 == "S" && $0 ~ (" " b "[ ]*$") && !bs { bs = NR }
+      END { print (!as || !bs ? "absent" : as < bs ? "yes" : "no") }' "$1" 2> /dev/null || echo absent
+  }
+  local pkfam=("pk-f1l@FAKE_SLEEP=5	A	3090	5	$d" "pk-f2m@FAKE_SLEEP=4	B	a6000	4	$d" "pk-f1s@FAKE_SLEEP=2	A	3090	2	$d" \
+    -- pk-f1l@FAKE_SLEEP=5 pk-f2m@FAKE_SLEEP=4 pk-f1s@FAKE_SLEEP=2)
+  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-fam "${pkfam[@]}")
+  printf '%s' "$rc" > "$t/rc-pk-fam"
+  rc_ok 'pack: three items of two families end green' pk-fam 3
+  out="$(started_before "$t/fake-state/seq.log" gen_pf1l gen_pf2m)/$(started_before "$t/fake-state/seq.log" gen_pf1s gen_pf2m)"
+  if [ "$out" = yes/yes ]; then pass 'pack: both glm items started before the qwen one (one family at a time)'
+  else fail 'pack: both glm items started before the qwen one (one family at a time)' "got $out, want yes/yes: $(grep -E '^S .*gen_pf' "$t/fake-state/seq.log" | tr '\n' ' ')"; fi
+  # shellcheck disable=SC2016 # a sed program: its dollars are its own
+  mutant_of pk-nofam 's|^        \[ "\$fam" = "\$cfam" \] \|\| continue$|        true # MUTANT pk-nofam|' '# MUTANT pk-nofam$'
+  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nofam steal_case pk-famm "${pkfam[@]}")
+  printf '%s' "$rc" > "$t/rc-pk-famm"
+  if [ "$(started_before "$t/fake-state/seq.log" gen_pf2m gen_pf1s)" = yes ]; then pass 'pack mutant: longest-est across families starts the qwen item before the short glm one'
+  else fail 'pack mutant: longest-est across families starts the qwen item before the short glm one' "$(grep -E '^S .*gen_pf' "$t/fake-state/seq.log" 2>&1 | tr '\n' ' ')"; fi
+  printf '%s\n' "pk-f1l	A	3090	5	$d" "pk-f2m	B	a6000	4	$d" "pk-f1s	A	3090	2	$d" > "$t/times-pkfam.tsv"
+  out=$(env BLOOMERY_GATE_TIMES=$t/times-pkfam.tsv BLOOMERY_PACK_BUDGET=10000 "${gb[@]}" --dry-run pk-f1l pk-f2m pk-f1s 2>&1) || fail 'pack: the dry run simulates one family at a time' "$out"
+  # each item is two lines: `lane X  <stem> …`, then its plan with the simulated take
+  took() { awk -v s="$1" '$1 == "lane" && $3 == s { getline; if (match($0, /the pack takes it at [0-9]+s/)) print substr($0, RSTART + 21, RLENGTH - 21) }' <<< "$out"; }
+  if [ "$(took pk-f1l)/$(took pk-f1s)/$(took pk-f2m)" = 0s/0s/2s ]; then
+    pass 'pack: the dry run simulates one family at a time (the qwen item at 2 s, the short glm one at 0 s)'
+  else fail 'pack: the dry run simulates one family at a time (the qwen item at 2 s, the short glm one at 0 s)' "takes $(took pk-f1l)/$(took pk-f1s)/$(took pk-f2m), want 0s/0s/2s"; fi
   # (7) the table's own errors: a solo recipe with no row, a row for a recipe that is not solo.
   cp "$t/justfile" "$t/justfile.pk"
   printf '%s\n' '' "[group('solo')]" 'pk-norow:' "    ./tools/box.sh 'bash tools/gpu-gate.sh gen_pn'" >> "$t/justfile"
@@ -2595,6 +2662,9 @@ IG
   out=$(try_waits "$t/waits.log" 2)
   if [ "$out" = 122 ]; then pass 'waits: the guard, the batch hold, the card lock and the V4.1 load lock of the final try'
   else fail 'waits: the guard, the batch hold, the card lock and the V4.1 load lock of the final try' "got $out, want 122"; fi
+  out="$(try_waits_on "$t/waits.log" 2)|$(try_waits_on "$t/waits.log" 1)|$(try_waits_on "$t/waits.log" 3)"
+  if [ "$out" = "guard:60s,v41-load:40s,gate-lock-3090:15s,batch-hold:7s|gate-lock-3090:99s|" ]; then pass 'waits: waited_on names each lock of the try, the longest first'
+  else fail 'waits: waited_on names each lock of the try, the longest first' "got '$out'"; fi
   # The hold a try's rc 75 names: only gpu-gate.sh's bound line, never its once-a-minute wait line, a
   # card-lock 75 or another try's section.
   printf '%s\n' '=== try 1 x' '[batch-hold] 2026-10-08T00:00:00Z gen_x waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner leadbatch, up 900 s, refreshed 0 s ago), holding no lock; 4 s so far' \
@@ -4253,7 +4323,8 @@ if k_order:
         clock[lane] += placed[pick][2]
         left -= 1
 # The pack's simulation (the header's «pack»): the X items placed onto the two cards by the driver's
-# own rule — the longest-est eligible item first (a one-card item takes a free card, the A6000 first
+# own rule — within the family of the first unlaunched item (the records are in lane X's family
+# order), the longest-est eligible item first (a one-card item takes a free card, the A6000 first
 # of the two), the running items' bytes within the budget (a lone item always starts), an m-flagged
 # item alone. Its wall is the predicted line's laneX=; each item's simulated take joins the chain's.
 budget = int(sys.argv[2])
@@ -4266,7 +4337,7 @@ while left or busy:
         launched = False
         sumb = sum(b[2] for b in busy)
         mrun = any(b[3] for b in busy)
-        for i in sorted(left, key=lambda i: (-placed[i][2], i)):
+        for i in sorted((i for i in left if recs[i][13] == recs[left[0]][13]), key=lambda i: (-placed[i][2], i)):
             rflags, rbytes = recs[i][15].split()
             mflag = rflags == "m"
             if busy and (mflag or mrun or sumb + int(rbytes) > budget):
@@ -4947,7 +5018,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     rcl=$rc
     line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane tier=$TIER"
   fi
-  [ "$waits" = 0 ] || line="$line waited=${waits}s"
+  [ "$waits" = 0 ] || line="$line waited=${waits}s waited_on=$(try_waits_on "$log" "$try")"
   ran=$((ran > waits ? ran - waits : 0))
   cold=$(cold_of "$log" "$try")
   [ "$cold" = 0 ] || line="$line cold=1"
@@ -5238,11 +5309,12 @@ steal_pass() { # $1 = lane
 # to lane-X-<i>.child (the stop trap's lane-*.child glob). One item a card; the running items' bytes
 # within PACK_BUDGET (a lone item always starts: the budget bounds pairs, and one load's own check is
 # its own); an m-flagged item alone; a both-cards item needs both cards. Launches take the
-# longest-est eligible item (the lanes' own rule), a two-candidate item the free card (the A6000
-# first). Green skips claim and record at once at the green candidate's key. The loop always ends:
+# longest-est eligible item of the current family — the family of the first unlaunched item in XP,
+# which is lane X's family order — and wait rather than open the next family while that one holds an
+# unlaunched item; a two-candidate item takes the free card (the A6000 first). Green skips claim and record at once at the green candidate's key. The loop always ends:
 # every turn launches, reaps, or sleeps a second.
 run_pack() {
-  local t0 i j k labels exp res card best be bc launched alldone p cards
+  local t0 i j k labels exp res card best be bc launched alldone p cards fam cfam
   t0=$(date +%s)
   local -a XP=()
   for i in ${ORDER[@]+"${ORDER[@]}"}; do [ "${P_LANE[$i]}" = X ] && XP+=("$i"); done
@@ -5286,13 +5358,16 @@ run_pack() {
       skip_item "$i" X
       R_PID[$i]=x
     done
-    # launches: the longest-est eligible item, again and again while one fits
+    # launches: the current family's longest-est eligible item, again and again while one fits
     launched=1
     while [ "$launched" = 1 ]; do
-      launched=0 best=-1 be=-1 bc=''
+      launched=0 best=-1 be=-1 bc='' cfam=''
       for i in "${XP[@]}"; do
         [ -z "${R_PID[$i]}" ] || continue
         claimed "$i" && continue
+        rec_get "$i" fam
+        [ -n "$cfam" ] || cfam=$fam # the first unlaunched item's family is the current one
+        [ "$fam" = "$cfam" ] || continue
         if [ "${R_M[$i]}" = 1 ]; then
           [ "$nrun" = 0 ] || continue # an m item starts with nothing else running
         else
