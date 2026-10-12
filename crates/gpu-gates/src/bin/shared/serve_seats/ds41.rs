@@ -537,11 +537,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         },
     )?;
     #[cfg(feature = "vision")]
-    let vision_reserve = vision.as_ref().and_then(|v| v.seat.reserve);
+    let seated = vision.as_ref();
     #[cfg(not(feature = "vision"))]
     vision_of(&a, cfg.body.prefill, n_embd, &token)?;
     #[cfg(not(feature = "vision"))]
-    let vision_reserve = None;
+    let seated: Option<&vision_seat::Opened> = None;
     let trace = route_trace(
         &levers,
         &cfg,
@@ -554,7 +554,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (card, placement, cache, residency) = print_plan(
         &inputs,
         a.place,
-        (reserve, tier_batch, vision_reserve),
+        (reserve, tier_batch, seated),
         (ctx, slots),
         &cfg.place,
         residency,
@@ -701,31 +701,38 @@ fn route_trace(
 
 /// The plan the engine is about to load under the placement's `levers`
 /// (with `reserve`, the DSpark draft's, and `tier_batch`, the tier's
-/// prompt-batch bytes, on its tier card, and `vision_reserve`, the image
-/// encoder's bytes, on the stage card when no held card sits off the plan),
+/// prompt-batch bytes, on its tier card, and `vision`, the image encoder
+/// `--mmproj` seated: its bytes are a reserve of the stage card when no held
+/// card sits off the plan, and its `vision_seat` record follows the plan's),
 /// `slots` resident sequences of `ctx` positions each
 /// (`PlanInputs::plan_with_slots`), on stderr. The
 /// unset residency word resolves against that plan first
 /// ([`residency::at_plan`]), its `residency lever` record — the plan-side
 /// detail on the line beside it when the plan moved or refused the word —
-/// before the plan's own record; under the word it resolved to the churn
-/// pool's record follows the plan's, a set word's pool refused by name when
-/// it does not fit. Returns its cards' names, the plan's placement for
-/// `/props` (`None`, and a line saying why, when a card's nvidia-smi index
-/// cannot be found), the prompt cache's budget of the real host's room
+/// before the plan's own record; the encoder's `vision_seat` record follows
+/// the plan's, then under the word it resolved to the churn pool's, a set
+/// word's pool refused by name when it does not fit. Returns its cards'
+/// names, the plan's placement for `/props` (`None`, and a line saying why,
+/// when a card's nvidia-smi index cannot be found), the prompt cache's
+/// budget of the real host's room
 /// ([`CacheRam::of`]) and the residency word the load runs by. A plan the
 /// vision reserve does not fit is the plan's own refusal with the reserve
 /// named before its terms.
 fn print_plan(
     inputs: &PlanInputs,
     place: Place,
-    (reserve, tier_batch, vision_reserve): (Option<u64>, Option<TierBatchBytes>, Option<u64>),
+    (reserve, tier_batch, vision): (
+        Option<u64>,
+        Option<TierBatchBytes>,
+        Option<&vision_seat::Opened>,
+    ),
     (ctx, slots): (usize, NonZeroUsize),
     levers: &PlanLevers,
     pick: ResidencyPick,
     cache_ram: Option<u64>,
 ) -> Result<(String, Option<PlacementProps>, CacheRam, ResidencyPick), GateError> {
     let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
+    let vision_reserve = vision.and_then(|v| v.seat.reserve);
     vision_seat::reserve_on(&mut machine, vision_reserve);
     // V4.1's body makes no checkpoints: its slots pin none.
     reserve_checkpoints(&mut machine, Seqs::none(slots.get()), u64::try_from(ctx)?)?;
@@ -738,6 +745,9 @@ fn print_plan(
         eprintln!("{d}");
     }
     record::plan(place.name(), &machine, &plan).eprint();
+    if let Some(v) = vision {
+        vision_seat::seat_record(v).eprint();
+    }
     let mut pool_bytes = 0;
     if let Some(pool) = swap::churn(&plan, 0, Residency::parse(pick.word)?)? {
         record::residency_host(pick.word, &pool, &plan).eprint();
