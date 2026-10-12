@@ -711,6 +711,21 @@ mod gate {
         lines.next().is_none().then_some(one)
     }
 
+    /// Whether a default `ctx` line's NVMe terms hold the rule's contract,
+    /// recomputed here from the line's `base_nvme_expert_bytes` (never
+    /// trusting its `nvme_bound`): the chosen plan pages at most a hundredth
+    /// of the base's bytes more, and the line names that hundredth. `None`
+    /// when a term is missing.
+    fn nvme_held(line: &str) -> Option<bool> {
+        let num = |k: &str| field_u64(line, k);
+        let (base, now, bound) = (
+            num("base_nvme_expert_bytes")?,
+            num("nvme_expert_bytes")?,
+            num("nvme_bound")?,
+        );
+        Some(bound == base / NVME_DIV && now <= base + base / NVME_DIV)
+    }
+
     /// `default_ctx_line_names_its_rule` (module header), on a server of
     /// `slots` slots whose `/props` named `props_n` and whose file's trained
     /// context is `trained`; `plan_total` the `ctx_max` of its `plan` record
@@ -718,8 +733,10 @@ mod gate {
     /// seat's base a slot ([`SEAT_FLOOR`]) and step ([`CTX_GRAN`]):
     /// `card` the fit under the base, `base` the base itself with the fit at
     /// least it, `margin` a multiple of the step past the base and under the
-    /// fit, `fit` the fit past the base. A named error when the line is
-    /// missing or one of its terms is.
+    /// fit, `fit` the fit past the base; and on every word the paged bytes
+    /// at most a hundredth of the base's past them, the line's `nvme_bound`
+    /// that hundredth. A named error when the line is missing or one of its
+    /// terms is.
     fn default_ctx_line_names_its_rule(
         log: &str,
         (slots, props_n, trained): (u64, u64, u64),
@@ -756,6 +773,7 @@ mod gate {
                     && margin == model::placement::workstation::MARGIN
                     && base_card.saturating_sub(card) == lost
                     && (rule == "card" || lost <= margin)
+                    && nvme_held(line)?
                     && props_n == ctx
                     && plan_total.is_none_or(|t| t == total),
             )
@@ -873,7 +891,8 @@ mod gate {
     /// seat's defaults — no `--ctx`, no `--parallel` — planned under
     /// [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`] print a `ctx` line of at
     /// least two slots, each of at least [`LONG_PROMPT_SLOT_CTX`] positions,
-    /// and stop as `--plan` says ([`PlanRun::stopped_with_its_plan`]). The
+    /// and stop as `--plan` says ([`PlanRun::stopped_with_its_plan`]), the
+    /// line's NVMe terms within the rule's bound ([`nvme_held`]). The
     /// plan is asked for by name (`--place a`): the census and the whole-fit
     /// verdict read the card, not the budget, so a card that holds the file
     /// whole would not plan at all.
@@ -903,7 +922,8 @@ mod gate {
             "defaults_take_a_long_prompt_on_a_12gb_card",
             run.stopped_with_its_plan()
                 && ctx.is_some_and(|c| c >= LONG_PROMPT_SLOT_CTX)
-                && slots.is_some_and(|n| n >= 2),
+                && slots.is_some_and(|n| n >= 2)
+                && ctx_line(&run.said).and_then(nvme_held) == Some(true),
         );
         Ok(())
     }
@@ -1110,6 +1130,12 @@ mod gate {
     /// `BASE_SLOT_CTX`): the context the margin counts against, the whole-fit
     /// verdict that picks the load, and the least default the card holds.
     const SEAT_FLOOR: u64 = 4096;
+
+    // PIN(2026-10-12): the default pages at most `base_nvme_expert_bytes / 100`
+    // bytes past the base's (the rule's `NVME_SLACK_DIV`), where it paged none
+    // past it: the gate holds the divisor as its own literal and recomputes
+    // the bound from the line's base, never trusting its `nvme_bound`.
+    const NVME_DIV: u64 = 100;
 
     /// The terms of one whole-fit line (`whole fit at ctx …: the whole load
     /// on …`): its `need`, that need less its cache term (the terms no
