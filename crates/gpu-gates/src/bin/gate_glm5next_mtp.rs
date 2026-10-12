@@ -600,6 +600,7 @@ mod gate {
                 tokens: &g.tokens[c0..c0 + rows],
                 pos0: g.pos[c0],
                 hidden: NextnHidden::Host(&g.states[c0 * hidden..(c0 + rows) * hidden]),
+                media: None,
             };
             if c0 + rows < n {
                 nextn_walk(m, f, NextnHead::Full, NextnMode::Store)?;
@@ -1383,6 +1384,7 @@ mod gate {
             tokens,
             pos0,
             hidden,
+            media: None,
         }
     }
 
@@ -1954,6 +1956,7 @@ mod gate {
                     tokens: &[1],
                     pos0: 0,
                     hidden: NextnHidden::Host(&vec![0.0; hidden]),
+                    media: None,
                 },
                 NextnHead::Full,
                 NextnMode::Eager,

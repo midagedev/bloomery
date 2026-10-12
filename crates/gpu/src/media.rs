@@ -15,6 +15,7 @@ use crate::model::ChainBody;
 use crate::tensor::WindowMut;
 use crate::{GpuError, GpuModel};
 use cuda_core::{CudaStream, DeviceBuffer};
+use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 use vision::mrope::{MropeSeq, RowRewrite, SeqRows};
@@ -47,6 +48,139 @@ impl<'a> MediaSpan<'a> {
         }
         let i = p - self.at.start;
         self.rows.get(i * n_embd..(i + 1) * n_embd)
+    }
+}
+
+/// What [`CallRows::new`] refuses.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RowsRefusal {
+    /// A span's positions do not fit the stores' position type.
+    Position { at: Range<usize>, first: u32 },
+    /// A span's rows are not `at.len()` rows of `n_embd`.
+    Rows {
+        at: Range<usize>,
+        values: usize,
+        want: usize,
+    },
+    /// The spans, as absolute positions, are not ascending and disjoint.
+    Order { spans: Vec<Range<u32>> },
+}
+
+impl fmt::Display for RowsRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RowsRefusal::Position { at, first } => write!(
+                f,
+                "a media span at {at:?} of a call from position {first}: its positions pass u32"
+            ),
+            RowsRefusal::Rows { at, values, want } => write!(
+                f,
+                "a media span at {at:?} with {values} row values, want {want}: one row of the \
+                 text width a position"
+            ),
+            RowsRefusal::Order { spans } => write!(
+                f,
+                "the media spans at positions {spans:?}: ascending and disjoint"
+            ),
+        }
+    }
+}
+
+/// The absolute positions of the span `at` of a call whose first position is `first`: one per row,
+/// consecutive, so a span of `n` rows ends `n` positions after it starts and the id after the span
+/// takes the position after its last row.
+fn span_positions(first: u32, at: &Range<usize>) -> Result<Range<u32>, RowsRefusal> {
+    let bound = |i: usize| {
+        u32::try_from(i)
+            .ok()
+            .and_then(|i| first.checked_add(i))
+            .ok_or_else(|| RowsRefusal::Position {
+                at: at.clone(),
+                first,
+            })
+    };
+    Ok(bound(at.start)?..bound(at.end)?)
+}
+
+/// A call's media spans at their absolute positions: the rows a walk or a batch stages by the
+/// position it writes, so a batch boundary that cuts a span reads the right rows. The one lookup
+/// of a span row by absolute position (a body's media call and the draft that walks beside it
+/// read the same rows through it) and the one widening of a bf16 row ([`widen_bf16`]).
+pub struct CallRows<'a> {
+    n_embd: usize,
+    /// Ascending, disjoint; each span's rows are `positions.len()` rows of `n_embd`.
+    spans: Vec<(Range<u32>, &'a [u16])>,
+}
+
+impl fmt::Debug for CallRows<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallRows")
+            .field("n_embd", &self.n_embd)
+            .field(
+                "spans",
+                &self.spans.iter().map(|(at, _)| at).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl<'a> CallRows<'a> {
+    /// The spans `(at, rows)` of a call whose first position is `first`: each one made whole
+    /// ([`RowsRefusal::Rows`]) and absolute ([`span_positions`]), and the spans ascending and
+    /// disjoint ([`RowsRefusal::Order`]), which [`CallRows::row`]'s search needs.
+    pub fn new(
+        first: u32,
+        n_embd: usize,
+        spans: impl IntoIterator<Item = (&'a Range<usize>, &'a [u16])>,
+    ) -> Result<CallRows<'a>, RowsRefusal> {
+        let spans = spans
+            .into_iter()
+            .map(|(at, rows)| {
+                let want = at.len() * n_embd;
+                if rows.len() != want {
+                    return Err(RowsRefusal::Rows {
+                        at: at.clone(),
+                        values: rows.len(),
+                        want,
+                    });
+                }
+                span_positions(first, at).map(|p| (p, rows))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if spans.windows(2).any(|p| p[0].0.end > p[1].0.start) {
+            return Err(RowsRefusal::Order {
+                spans: spans.into_iter().map(|(at, _)| at).collect(),
+            });
+        }
+        Ok(CallRows { n_embd, spans })
+    }
+
+    /// The width of a row, in values.
+    #[must_use]
+    pub fn n_embd(&self) -> usize {
+        self.n_embd
+    }
+
+    /// The row of position `p` (`n_embd` bf16 values); `None` off the spans.
+    #[must_use]
+    pub fn row(&self, p: u32) -> Option<&'a [u16]> {
+        let k = self.spans.partition_point(|(at, _)| at.end <= p);
+        let (at, rows) = self.spans.get(k).filter(|(at, _)| at.start <= p)?;
+        let i = usize::try_from(p - at.start).ok()? * self.n_embd;
+        rows.get(i..i + self.n_embd)
+    }
+}
+
+/// A bf16 row widened exactly into `out`: each value's bits over 16 zero bits. The two are the
+/// same width.
+pub fn widen_bf16(row: &[u16], out: &mut [f32]) {
+    assert_eq!(
+        row.len(),
+        out.len(),
+        "a bf16 row widened into its own width"
+    );
+    for (v, &b) in out.iter_mut().zip(row) {
+        *v = f32::from_bits(u32::from(b) << 16);
     }
 }
 
@@ -140,6 +274,9 @@ pub trait MediaBody: ChainBody {
     /// One span of a call as this body takes it: [`MediaSpan`] with what the body's rows and
     /// engine rules need beside it.
     type Span<'a>;
+
+    /// The common span of `s`: the positions and rows every body's span carries.
+    fn media_span<'s>(s: &'s Self::Span<'_>) -> &'s MediaSpan<'s>;
 
     /// Why a media call of `spans` spans on `m` is refused before it enters the body (a schedule
     /// with no place for a span's rows), `None` when it is taken.
@@ -380,5 +517,112 @@ mod tests {
             address,
             "the buffer never moves"
         );
+    }
+}
+
+#[cfg(test)]
+mod call_rows {
+    use super::{CallRows, RowsRefusal, span_positions, widen_bf16};
+
+    const N: usize = 3;
+
+    /// bf16 bits of a value whose low 16 f32 bits are zero.
+    fn bf16(x: f32) -> u16 {
+        (x.to_bits() >> 16) as u16
+    }
+
+    /// Two rows of `N` bf16 values, 1.5 2.5 3.5 then 4.5 5.5 6.5.
+    fn rows() -> Vec<u16> {
+        (0..2 * N).map(|i| bf16(1.5 + i as f32)).collect()
+    }
+
+    #[test]
+    fn span_positions_are_consecutive_and_save_none() {
+        // 3 rows from index 2 of a call at 10: positions 12, 13, 14; the id after takes 15.
+        assert_eq!(span_positions(10, &(2..5)), Ok(12..15));
+        let at = 2..5;
+        assert_eq!(
+            span_positions(10, &at).map(|p| p.end - p.start),
+            Ok(u32::try_from(at.len()).expect("small"))
+        );
+        // The first position past the span is the call's first plus the span's end index.
+        assert_eq!(span_positions(10, &at).map(|p| p.end), Ok(10 + 5));
+        assert_eq!(
+            span_positions(u32::MAX - 1, &(0..3)),
+            Err(RowsRefusal::Position {
+                at: 0..3,
+                first: u32::MAX - 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_position_reads_the_row_of_its_span_by_absolute_position() {
+        // A call from position 5 over five ids, the span at 2..4: positions 7 and 8.
+        let (at, media) = (2..4, rows());
+        let call = CallRows::new(5, N, [(&at, media.as_slice())]).expect("rows");
+        assert_eq!(call.n_embd(), N);
+        assert_eq!(call.row(7), Some(&media[..N]));
+        assert_eq!(call.row(8), Some(&media[N..]));
+        // Off the span, whichever side.
+        for p in [0, 5, 6, 9, 10] {
+            assert_eq!(call.row(p), None, "position {p}");
+        }
+    }
+
+    #[test]
+    fn several_spans_are_searched_in_order_and_a_gap_holds_no_row() {
+        let (a, b) = (0..1, 3..5);
+        let (ra, rb) = (rows()[..N].to_vec(), rows());
+        let call =
+            CallRows::new(0, N, [(&a, ra.as_slice()), (&b, rb.as_slice())]).expect("two spans");
+        assert_eq!(call.row(0), Some(&ra[..]));
+        assert_eq!(call.row(1), None);
+        assert_eq!(call.row(2), None);
+        assert_eq!(call.row(3), Some(&rb[..N]));
+        assert_eq!(call.row(4), Some(&rb[N..]));
+    }
+
+    #[test]
+    fn spans_that_do_not_fit_are_refused_by_name() {
+        let media = rows();
+        let short = CallRows::new(0, N, [(&(0..3), media.as_slice())]).err();
+        assert_eq!(
+            short,
+            Some(RowsRefusal::Rows {
+                at: 0..3,
+                values: 2 * N,
+                want: 3 * N
+            })
+        );
+        let (a, b) = (3..5, 0..2);
+        let out_of_order = CallRows::new(10, N, [(&a, media.as_slice()), (&b, media.as_slice())])
+            .expect_err("spans out of order");
+        assert_eq!(
+            out_of_order,
+            RowsRefusal::Order {
+                spans: vec![13..15, 10..12]
+            }
+        );
+        assert!(out_of_order.to_string().contains("ascending and disjoint"));
+    }
+
+    #[test]
+    fn a_bf16_row_widens_to_the_f32_of_its_bits() {
+        let media = rows();
+        let mut out = vec![0.0; N];
+        widen_bf16(&media[..N], &mut out);
+        assert_eq!(out, [1.5, 2.5, 3.5]);
+        assert!(
+            out.iter()
+                .zip(&media)
+                .all(|(v, &b)| v.to_bits() == u32::from(b) << 16)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a bf16 row widened into its own width")]
+    fn a_widening_into_another_width_is_refused() {
+        widen_bf16(&rows(), &mut [0.0; N]);
     }
 }

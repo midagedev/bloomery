@@ -626,6 +626,10 @@ fn feed_media(
 impl MediaBody for Body {
     type Span<'a> = Span41<'a>;
 
+    fn media_span<'s>(s: &'s Span41<'_>) -> &'s MediaSpan<'s> {
+        &s.span
+    }
+
     /// The steps feed: a span's rows have no step path, and the call's batches are the only
     /// place they enter.
     fn media_refusal(m: &Deepseek41Model, spans: usize) -> Option<String> {

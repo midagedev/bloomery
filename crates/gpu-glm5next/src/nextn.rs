@@ -10,7 +10,10 @@
 //! (ik's `result_mtp_embd`). Every launch is an entry the target's chain
 //! already has:
 //! - the store part, every row: the token's embedding row read from the file
-//!   on the host, position 0 included (ik's GLM MTP input masks no row);
+//!   on the host, position 0 included (ik's GLM MTP input masks no row), or,
+//!   at a position a media span holds ([`NextnFeed::media`]), the span's bf16
+//!   row widened exactly — the row the target consumed there, as the
+//!   reference's MTP draft adds the target's vision row at an image position;
 //!   the hidden rows — a target arena's streams' mean (`ds41_hc_mean`) then
 //!   the `output_norm` RMS, or rows from the host already normed; each row's
 //!   `[enorm(e) | hnorm(h)]`, two RMS norms into the halves of its packed
@@ -53,6 +56,7 @@ use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::latent::{
     INDEX_HEAD, INDEX_ROW, IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for,
 };
+use bloomery_gpu::media::{CallRows, widen_bf16};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockPlan, enqueue_block};
@@ -105,11 +109,15 @@ pub enum NextnHidden<'a> {
 }
 
 /// A walk's rows: `tokens` at positions `pos0 ..`, each beside its hidden row.
+/// `media` is the prompt call's span rows by absolute position: at a position
+/// it holds, the row stands in for the token's embedding row. A chain takes
+/// none.
 #[derive(Clone, Copy, Debug)]
 pub struct NextnFeed<'a> {
     pub tokens: &'a [u32],
     pub pos0: u32,
     pub hidden: NextnHidden<'a>,
+    pub media: Option<&'a CallRows<'a>>,
 }
 
 /// Which projection the draft's head runs: the target's `output`, the whole
@@ -987,8 +995,9 @@ impl Body {
     /// Refused by name before anything moves: a load without the layer, a
     /// captured walk, rows outside 1..=[`WALK_ROWS`], a token past the
     /// vocabulary, rows past the store, a walk from past [`Nextn::held`], a
-    /// hidden slice of other than the rows' values, target rows the arena
-    /// does not hold at the walk's positions ([`Wrote`]).
+    /// hidden slice of other than the rows' values, media rows of another
+    /// width than the model's, target rows the arena does not hold at the
+    /// walk's positions ([`Wrote`]).
     fn nextn_run(
         &mut self,
         gpu: &Gpu,
@@ -1046,6 +1055,14 @@ impl Body {
                 embd.n_vocab
             )));
         }
+        if let Some(rows) = feed.media
+            && rows.n_embd() != n
+        {
+            return Err(shape(format!(
+                "media rows of {} values a row in a walk whose embedding rows are {n} wide",
+                rows.n_embd()
+            )));
+        }
         let want = Want {
             hidden: feed.hidden,
             pos0: feed.pos0,
@@ -1076,7 +1093,10 @@ impl Body {
         for t in 0..m {
             let p = u32::try_from(pos0 + t).expect("a walk's positions are under the store's rows");
             let e = &mut a.e_host[t * n..(t + 1) * n];
-            embd.row_into(feed.tokens[t], e)?;
+            match feed.media.and_then(|rows| rows.row(p)) {
+                Some(row) => widen_bf16(row, e),
+                None => embd.row_into(feed.tokens[t], e)?,
+            }
             a.pos_host[t] = p;
             a.cnt_host[t] = p + 1;
         }
@@ -1304,8 +1324,8 @@ pub fn nextn_walk(
 /// One window's chain, one readback: `refresh` walked eager through the head,
 /// its last row's prediction the proposal's one id, written to `out[0]`; the
 /// count, 1. `own` walks past it are refused by name (a proposal holds one
-/// id), as are a store walk's mode, a captured one and an `out` with no
-/// place. A fault any launch raised is the chain's error and poisons the
+/// id), as are media rows in the refresh, a store walk's mode, a captured
+/// one and an `out` with no place. A fault any launch raised is the chain's error and poisons the
 /// model as the target's would.
 pub fn nextn_chain(
     m: &mut GpuModel<Body>,
@@ -1319,6 +1339,12 @@ pub fn nextn_chain(
         return Err(shape(format!(
             "a chain of {own} own walks; a GLM proposal holds one id"
         )));
+    }
+    if refresh.media.is_some() {
+        return Err(shape(
+            "a chain whose refresh holds media rows: only a prompt call's walks read them"
+                .to_string(),
+        ));
     }
     if mode == NextnMode::Store {
         return Err(shape(

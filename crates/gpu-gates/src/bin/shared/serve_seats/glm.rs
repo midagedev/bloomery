@@ -187,9 +187,10 @@
 //! planned and loaded as without `--mmproj`, and stays on for a request that holds an image: its
 //! prompt walk is the text call's over the media call's units (`app::mtp::MtpDraft::prompt_media`,
 //! [`SlotDrafts::prefill_media`]), the call a draft prompt of its own that opens its one
-//! residency pass. At a span's positions the draft reads the image token's own embedding, paired
-//! with the target's hidden row there (the row the target computed from the span's rows), as at
-//! any position of the text call; the target's span row is not the draft's input.
+//! residency pass. At a span's positions the draft reads the span's row, the row the target
+//! consumed there, in place of the image token's embedding, paired with the target's hidden row
+//! there (feed B, the reference's: llama.cpp's MTP draft adds the target's vision row at an image
+//! position).
 //!
 //! `BLOOMERY_DRAFT=mtp` loads the file's next-token layer beside the target
 //! (`app::arch::glm5next::open_nextn`, the plan `PlanInputs::plan_nextn`

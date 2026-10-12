@@ -96,7 +96,7 @@ use crate::host::xstream::{Costs, XLayer, XMode, XReport, XStreamBody};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
 use crate::linear::{self, LinearShape};
-use crate::media::{ImageSpan, MediaBody, SeqRope};
+use crate::media::{ImageSpan, MediaBody, MediaSpan, SeqRope};
 use crate::model::{
     ChainBody, GpuModel, HostServed, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
 };
@@ -2509,6 +2509,10 @@ impl XStreamBody for Body35 {
 
 impl MediaBody for Body35 {
     type Span<'a> = ImageSpan<'a>;
+
+    fn media_span<'s>(s: &'s ImageSpan<'_>) -> &'s MediaSpan<'s> {
+        &s.span
+    }
 
     /// Image spans on a text load.
     fn media_refusal(m: &GpuModel<Body35>, spans: usize) -> Option<String> {

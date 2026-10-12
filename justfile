@@ -2258,7 +2258,9 @@ weekly-gpu-mimo2-e2e *ARGS:
 # planted), forced and the two 4-token step sets, each a fixture-oracle clause the gate declares, held to bands counted
 # for the fixture's random weights, an argmax as a tie band; every other clause runs on the fixture. Loads the whole
 # model: alone in a batch in the real tier, under the big-load lock the V4.1 loads take; balanced over the cards in the
-# fixture tier, which takes no lock.
+# fixture tier, which takes no lock. The slots arm's (sdm) holds the NextN draft over a media call: at a span's positions
+# it reads the span's row, the row the target consumed there, in place of the image token's embedding (feed B, the
+# reference's: llama.cpp's MTP draft adds the target's vision row at an image position).
 # PIN(2026-10-09): its own bound, 1200 s. The measured median is 773 s (train028b/028c/028f's times rows), past 0.75 x
 # the default 900 the batch's budget refusal names; the gate's arms admit no smaller split (`--only` takes one arm and
 # `--only slots` runs the stagger's loads too, so main, pp and slots are three items). A split pays no cold load per

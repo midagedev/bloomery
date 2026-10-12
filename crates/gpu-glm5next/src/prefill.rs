@@ -110,7 +110,7 @@ use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_f
 use bloomery_gpu::linear::conv::KdaConvArgs;
 use bloomery_gpu::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
 use bloomery_gpu::linear::norm_gate::NormGateArgs;
-use bloomery_gpu::media::{MediaBody, MediaSpan, check_spans};
+use bloomery_gpu::media::{CallRows, MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::prompt_timing::{Mark, PromptStats, PromptTiming, nanos};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::qsa::list_width;
@@ -139,7 +139,7 @@ use runtime::prompt::{
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 use super::WHAT as BODY;
-use super::media::{CallRows, check_image_ids, stage_row};
+use super::media::{check_image_ids, stage_row};
 use super::nextn::GlmArena;
 use super::{Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape};
 use crate::ffn::{self, CardRows, CardTiles};
@@ -1358,7 +1358,8 @@ pub fn prefill_media(
 /// [`prompt_with`] calls it on a text prompt: the draft's walk over a prompt that holds an
 /// image. A unit's hidden rows are the target's, a span's position among them (the span's row
 /// stood in for the token's embedding); the id at that position is the image token, and what
-/// the sink does with the position is its own. Refused by name as [`prefill_media`] refuses;
+/// the sink does with the position is its own: the NextN draft reads the span's row there, as
+/// the target did ([`bloomery_gpu::media::CallRows`]). Refused by name as [`prefill_media`] refuses;
 /// no span is [`prompt_with`] by the load's feed ([`PrefillMode`]), the sink kept. The batch
 /// call is one residency pass ([`prompt_pass`]) opened here: a caller already inside one
 /// ([`MediaBody::prefill_media`]) never calls this, a second boundary inside an open call being
@@ -1399,6 +1400,10 @@ fn media_as(
 
 impl MediaBody for Body {
     type Span<'a> = MediaSpan<'a>;
+
+    fn media_span<'s>(s: &'s MediaSpan<'_>) -> &'s MediaSpan<'s> {
+        s
+    }
 
     /// [`media_token`]'s refusal on this load's feed and image token.
     fn media_refusal(m: &Glm5nextModel, spans: usize) -> Option<String> {

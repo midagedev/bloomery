@@ -11,13 +11,16 @@
 //! - the row's form: `n_embd` bf16 values, widened to f32 and repeated into the hyper-connection
 //!   streams as a token's embedding row is.
 //!
-//! The module holds no card type, so the engine's gather and its tests share one code path.
+//! The module holds no card type, so the engine's gather and its tests share one code path. The
+//! lookup of a row by absolute position is the common [`CallRows`], which the NextN draft reads
+//! beside the target's gather.
 
+use bloomery_gpu::media::{CallRows, widen_bf16};
 use std::fmt;
 use std::ops::Range;
 
 /// What a media call's own checks refuse; the common span checks
-/// ([`bloomery_gpu::media::check_spans`]) refuse the rest.
+/// ([`bloomery_gpu::media::check_spans`]) and the common lookup ([`CallRows::new`]) refuse the rest.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// A span's id is not the image token.
@@ -27,16 +30,8 @@ pub(crate) enum Refusal {
         id: u32,
         image: u32,
     },
-    /// A span's positions do not fit the stores' position type.
-    Position { at: Range<usize>, first: u32 },
     /// A span reaches past the call's ids.
     Outside { at: Range<usize>, n_ids: usize },
-    /// A span's rows are not `at.len()` rows of `n_embd`.
-    Rows {
-        at: Range<usize>,
-        values: usize,
-        want: usize,
-    },
 }
 
 impl fmt::Display for Refusal {
@@ -52,37 +47,12 @@ impl fmt::Display for Refusal {
                 "a media span at {at:?} holds id {id} at index {index}, not the image token \
                  {image}: every position of a span carries it"
             ),
-            Refusal::Position { at, first } => write!(
-                f,
-                "a media span at {at:?} of a call from position {first}: its positions pass u32"
-            ),
             Refusal::Outside { at, n_ids } => write!(
                 f,
                 "a media span at {at:?} of a call of {n_ids} ids: a span lies inside the call"
             ),
-            Refusal::Rows { at, values, want } => write!(
-                f,
-                "a media span at {at:?} with {values} row values, want {want}: one row of the \
-                 text width a position"
-            ),
         }
     }
-}
-
-/// The absolute positions of the span `at` of a call whose first position is `first`: one per row,
-/// consecutive, so a span of `n` rows ends `n` positions after it starts and the id after the span
-/// takes the position after its last row.
-pub(crate) fn span_positions(first: u32, at: &Range<usize>) -> Result<Range<u32>, Refusal> {
-    let bound = |i: usize| {
-        u32::try_from(i)
-            .ok()
-            .and_then(|i| first.checked_add(i))
-            .ok_or_else(|| Refusal::Position {
-                at: at.clone(),
-                first,
-            })
-    };
-    Ok(bound(at.start)?..bound(at.end)?)
 }
 
 /// `ids[at]` all the image token, or the first id that is not.
@@ -102,48 +72,6 @@ pub(crate) fn check_image_ids(ids: &[u32], at: &Range<usize>, image: u32) -> Res
     }
 }
 
-/// A call's checked media spans at their absolute positions: the rows a batch stages by the
-/// position it writes, so a batch boundary that cuts a span reads the right rows.
-pub(crate) struct CallRows<'a> {
-    n_embd: usize,
-    /// Ascending, disjoint; each span's rows are `positions.len()` rows of `n_embd`.
-    spans: Vec<(Range<u32>, &'a [u16])>,
-}
-
-impl<'a> CallRows<'a> {
-    /// The spans `(at, rows)` of a call whose first position is `first`, in order (the common span
-    /// checks) and each one made whole ([`Refusal::Rows`]) and absolute ([`span_positions`]).
-    pub(crate) fn new(
-        first: u32,
-        n_embd: usize,
-        spans: impl IntoIterator<Item = (&'a Range<usize>, &'a [u16])>,
-    ) -> Result<CallRows<'a>, Refusal> {
-        let spans = spans
-            .into_iter()
-            .map(|(at, rows)| {
-                let want = at.len() * n_embd;
-                if rows.len() != want {
-                    return Err(Refusal::Rows {
-                        at: at.clone(),
-                        values: rows.len(),
-                        want,
-                    });
-                }
-                span_positions(first, at).map(|p| (p, rows))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(CallRows { n_embd, spans })
-    }
-
-    /// The row of position `p` (`n_embd` bf16 values); `None` off the spans.
-    fn row(&self, p: u32) -> Option<&'a [u16]> {
-        let k = self.spans.partition_point(|(at, _)| at.end <= p);
-        let (at, rows) = self.spans.get(k).filter(|(at, _)| at.start <= p)?;
-        let i = usize::try_from(p - at.start).ok()? * self.n_embd;
-        rows.get(i..i + self.n_embd)
-    }
-}
-
 /// Stage position `p`'s embedding row into `out` (`out.len()` a multiple of `n_embd`, one copy of
 /// the row each): the call's media row where a span holds `p` (every row of a span is there,
 /// [`CallRows::new`]), otherwise what `text` fills for `token`.
@@ -157,11 +85,9 @@ pub(crate) fn stage_row<E>(
     let Some((media, row)) = media.and_then(|m| Some((m, m.row(p)?))) else {
         return text(token, out);
     };
-    let n = media.n_embd;
+    let n = media.n_embd();
     let (first, rest) = out.split_at_mut(n);
-    for (v, &b) in first.iter_mut().zip(row) {
-        *v = f32::from_bits(u32::from(b) << 16);
-    }
+    widen_bf16(row, first);
     for copy in rest.chunks_exact_mut(n) {
         copy.copy_from_slice(first);
     }
@@ -170,7 +96,8 @@ pub(crate) fn stage_row<E>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CallRows, Refusal, check_image_ids, span_positions, stage_row};
+    use super::{Refusal, check_image_ids, stage_row};
+    use bloomery_gpu::media::CallRows;
     use std::ops::Range;
 
     const IMG: u32 = 900;
@@ -194,26 +121,6 @@ mod tests {
     /// Two rows of `N` bf16 values, 1.5 2.5 3.5 then 4.5 5.5 6.5.
     fn rows() -> Vec<u16> {
         (0..2 * N).map(|i| bf16(1.5 + i as f32)).collect()
-    }
-
-    #[test]
-    fn span_positions_are_consecutive_and_save_none() {
-        // 3 rows from index 2 of a call at 10: positions 12, 13, 14; the id after takes 15.
-        assert_eq!(span_positions(10, &(2..5)), Ok(12..15));
-        let at = 2..5;
-        assert_eq!(
-            span_positions(10, &at).map(|p| p.end - p.start),
-            Ok(u32::try_from(at.len()).expect("small"))
-        );
-        // The first position past the span is the call's first plus the span's end index.
-        assert_eq!(span_positions(10, &at).map(|p| p.end), Ok(10 + 5));
-        assert_eq!(
-            span_positions(u32::MAX - 1, &(0..3)),
-            Err(Refusal::Position {
-                at: 0..3,
-                first: u32::MAX - 1
-            })
-        );
     }
 
     #[test]
@@ -295,17 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn spans_that_do_not_fit_are_refused_by_name() {
-        let media = rows();
-        let short = CallRows::new(0, N, [(&(0..3), media.as_slice())]).err();
-        assert_eq!(
-            short,
-            Some(Refusal::Rows {
-                at: 0..3,
-                values: 2 * N,
-                want: 3 * N
-            })
-        );
+    fn a_span_past_the_ids_is_refused_by_name() {
         assert_eq!(
             check_image_ids(&[IMG, IMG], &(1..3), IMG),
             Err(Refusal::Outside { at: 1..3, n_ids: 2 })

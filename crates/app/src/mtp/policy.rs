@@ -131,6 +131,7 @@ impl<A: Copy> Refresh<A> {
                 walk: self.walk,
                 first: self.first,
             },
+            media: None,
         }
     }
 }

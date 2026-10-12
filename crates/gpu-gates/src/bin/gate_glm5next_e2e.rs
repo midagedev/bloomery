@@ -252,13 +252,20 @@
 //! - (sdm) drafted media, last (the load set for media, then set back): a
 //!   head of `a`'s ids, a span of image-token positions whose rows are seeded
 //!   values (no tower: the clause holds the draft's walk over the media call),
-//!   and a tail. (sdm-a) the draft's store after the drafted media call is the
-//!   text call's (the same ids, no span) bit for bit below the span and
-//!   differs from it past the span's first position, every position held;
-//!   (sdm-b) the head as a text call, then the media call of the rest, joins
-//!   the draft with one row and no skip; (sdm-c) the drafted greedy ids are
-//!   the plain run's, with a proposal accepted and one rejected on the real
-//!   tier; the acceptance of the media and text runs is printed.
+//!   and a tail. At a span's position the draft reads the span's row, the
+//!   row the target consumed (feed B: the reference's, llama.cpp's MTP draft
+//!   adds the target's vision row at an image position), not the image
+//!   token's embedding. (sdm-a) the draft's store after the drafted media
+//!   call is the text call's (the same ids, no span) bit for bit below the
+//!   span and differs from it from the span's first position on (there the
+//!   span's row against the token's embedding beside the same hidden row),
+//!   every position held; (sdm-b) the head as a text call, then the media
+//!   call of the rest, joins the draft with one row and no skip, and the
+//!   store row at the span's first position, which the join walks, differs
+//!   between two seeds of the span's rows while every row below it is equal;
+//!   (sdm-c) the drafted greedy ids are the plain run's, with a proposal
+//!   accepted and one rejected on the real tier; the acceptance of the media
+//!   and text runs is printed.
 //!
 //! The harness's last clause, H5's one-slot case, runs after them on a load
 //! of one sequence of its own, the card holding one load at a time.
@@ -3388,12 +3395,16 @@ mod gate {
         (0..n).filter(|&q| row(a, q) != row(b, q)).collect()
     }
 
-    /// `n` bf16 values of a seeded xorshift64 stream: uniform in ±0.05 (an embedding row's
+    /// The two seeds of the span's rows: the first is the clauses' own, the second the other run
+    /// of (sdm-b)'s continuing call.
+    const SDM_SEEDS: [u64; 2] = [0x9E37_79B9_7F4A_7C15, 0xD1B5_4A32_D192_ED03];
+
+    /// `n` bf16 values of the xorshift64 stream of `seed`: uniform in ±0.05 (an embedding row's
     /// magnitude), the f32 truncated to bf16. They are not any token's embedding row, so a draft
-    /// that read the span's rows instead of the image token's would differ from a draft that does
-    /// not.
-    fn sdm_rows(n: usize) -> Vec<u16> {
-        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+    /// that read the span's rows instead of the image token's differs from a draft that does not,
+    /// and two seeds are two spans a draft that reads them tells apart.
+    fn sdm_rows(seed: u64, n: usize) -> Vec<u16> {
+        let mut x = seed;
         (0..n)
             .map(|_| {
                 x ^= x << 13;
@@ -3434,20 +3445,24 @@ mod gate {
     /// The ids are a head of [`SDM_HEAD`] text ids, [`SDM_SPAN`] image-token positions and a tail
     /// of [`SDM_TAIL`]; the span's rows are [`sdm_rows`]. The text call is the same ids with no
     /// span. The draft's row at position `q` pairs the token at `q` with the target's hidden row
-    /// at `q - 1`, and at a span's positions it reads the image token's own embedding (feed A), so
-    /// a position whose paired hidden row is a span position or later (`q > SDM_HEAD`) differs
-    /// from the text call's, the rows below `SDM_HEAD` are the text call's bit for bit, and the
-    /// row at `SDM_HEAD` (the first span position: the image token, the last head row's hidden
-    /// row) is the text call's under feed A and is printed, not held. The call walks the draft
-    /// over one unit (this load's whole call): position 0 with a zero hidden row, then every
-    /// position after it, so the store holds every position of the call (the last hidden row
-    /// waits for the generation's first token), and a call from position 0 records no join.
-    /// - (sdm-a) the rows below `SDM_HEAD` equal, every row past `SDM_HEAD` differing, no skipped
-    ///   join, the whole call's store held;
+    /// at `q - 1`, and at a span's positions it reads the span's row (feed B, the reference's:
+    /// llama.cpp's MTP draft adds the target's vision row at an image position) in place of the
+    /// image token's embedding, so a position whose paired hidden row is a span position or
+    /// later (`q > SDM_HEAD`) differs from the text call's, the rows below `SDM_HEAD` are the
+    /// text call's bit for bit, and the row at `SDM_HEAD` (the first span position: the span's
+    /// row against the image token's embedding, beside the last head row's hidden row) differs
+    /// from it too. The call walks the draft over one unit (this load's whole call): position 0
+    /// with a zero hidden row, then every position after it, so the store holds every position
+    /// of the call (the last hidden row waits for the generation's first token), and a call from
+    /// position 0 records no join.
+    /// - (sdm-a) the rows below `SDM_HEAD` equal, every row from `SDM_HEAD` on differing, no
+    ///   skipped join, the whole call's store held;
     /// - (sdm-b) a media call that continues a held sequence (a multi-turn chat whose later turn
     ///   holds the image): the head as a drafted text call, then the drafted media call of the
     ///   rest from `SDM_HEAD`, which joins the draft with the one row the head call left waiting
-    ///   and no skip, holds every position but the last, and gives the plain run's ids;
+    ///   and no skip, holds every position but the last, and gives the plain run's ids; run
+    ///   again with another seed of the span's rows, the store row at `SDM_HEAD` (the join's
+    ///   walk of the span's first row) differs between the two and every row below it is equal;
     /// - (sdm-c) the drafted greedy ids equal a plain run's (the session's media call, then
     ///   steps), a proposal accepted and a proposal rejected among the windows; the acceptance of
     ///   the media run and of the text run print.
@@ -3473,26 +3488,63 @@ mod gate {
             .chain([image; SDM_SPAN])
             .chain(tail.iter().copied())
             .collect();
-        let rows = sdm_rows(s.model().body("sdm")?.nextn_hidden_width() * SDM_SPAN);
+        let width = s.model().body("sdm")?.nextn_hidden_width() * SDM_SPAN;
+        let (rows, other) = (sdm_rows(SDM_SEEDS[0], width), sdm_rows(SDM_SEEDS[1], width));
         let spans = [MediaSpan {
             at: SDM_HEAD..SDM_HEAD + SDM_SPAN,
             rows: &rows,
         }];
         select_drafted(s, spec, parked, 0)?;
         set_prefill_media(s.model_mut(), Some(image))?;
-        let run = sdm_clauses(s, spec, &ids, &spans);
+        let run = sdm_clauses(s, spec, &ids, &spans, &other);
         let off = set_prefill_media(s.model_mut(), None);
         let ok = run?;
         off?;
         Ok(ok)
     }
 
-    /// [`slots_media`]'s runs on a load set for media.
+    /// What a continuing drafted call leaves ([`sdm_continue`]).
+    struct Continued {
+        /// The join of the head's text call, and of the media call of the rest.
+        joined_h: Option<app::mtp::Join>,
+        joined_k: Option<app::mtp::Join>,
+        /// The draft's store after the media call.
+        store: Store,
+        /// The media call's argmax.
+        first: u32,
+    }
+
+    /// A continuing drafted call: `head` as a drafted text call from a reset, then the drafted
+    /// media call of the rest `ids` from where it stopped, `spans` placed in that call.
+    fn sdm_continue(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        head: &[u32],
+        ids: &[u32],
+        spans: &[MediaSpan<'_>],
+    ) -> Result<Continued, GateError> {
+        reset_drafted(s, spec)?;
+        runtime::Draft::prompt(spec.draft_mut(), s, head)?;
+        let joined_h = spec.draft_mut().take_joined();
+        let first = spec.draft_mut().prompt_media(s, ids, spans)?;
+        let store = sdm_store(s)?;
+        let joined_k = spec.draft_mut().take_joined();
+        Ok(Continued {
+            joined_h,
+            joined_k,
+            store,
+            first,
+        })
+    }
+
+    /// [`slots_media`]'s runs on a load set for media; `other` is the second seed's rows of the
+    /// span ([`SDM_SEEDS`]).
     fn sdm_clauses(
         s: &mut Session<Body>,
         spec: &mut Spec,
         ids: &[u32],
         spans: &[MediaSpan<'_>],
+        other: &[u16],
     ) -> Result<bool, GateError> {
         let n = ids.len();
         // The text call: the same ids, no span.
@@ -3514,13 +3566,20 @@ mod gate {
             at: 0..SDM_SPAN,
             rows: spans.first().ok_or("(sdm) no span")?.rows,
         }];
-        reset_drafted(s, spec)?;
-        runtime::Draft::prompt(spec.draft_mut(), s, head)?;
-        let joined_h = spec.draft_mut().take_joined();
-        let first_k = spec.draft_mut().prompt_media(s, rest, &rest_spans)?;
-        let cont = sdm_store(s)?;
-        let joined_k = spec.draft_mut().take_joined();
+        let Continued {
+            joined_h,
+            joined_k,
+            store: cont,
+            first: first_k,
+        } = sdm_continue(s, spec, head, rest, &rest_spans)?;
         let (run_k, _, _) = sdm_passes(s, spec, rest, first_k)?;
+        // The same call with the other seed's rows: the join walks the span's first row at
+        // `SDM_HEAD`, so that store row follows the seed and the head's rows below it do not.
+        let other_spans = [MediaSpan {
+            at: 0..SDM_SPAN,
+            rows: other,
+        }];
+        let cont_o = sdm_continue(s, spec, head, rest, &other_spans)?.store;
         s.reset()?;
         s.prompt(head, Want::Argmax)?;
         let mut plain_k = vec![s.prompt_media(rest, &rest_spans, Want::Argmax)?.argmax()];
@@ -3538,18 +3597,24 @@ mod gate {
 
         let diff = differing_rows(&text, &media, text.0.min(media.0));
         let below_same = diff.iter().all(|&q| q >= SDM_HEAD);
-        let past_differ = (SDM_HEAD + 1..n).all(|q| diff.contains(&q));
-        let first_span_same = !diff.contains(&SDM_HEAD);
+        let from_differ = (SDM_HEAD..n).all(|q| diff.contains(&q));
         let held = [text.0, media.0] == [n; 2];
         let no_skip = joined_t.is_none() && joined_m.is_none_or(|j| j.skipped.is_none());
-        let a_ok = below_same && past_differ && held && no_skip;
+        let a_ok = below_same && from_differ && held && no_skip;
         let want_join = app::mtp::Join {
             start: SDM_HEAD as u32,
             caught_up: 1,
             skipped: None,
         };
-        let b_ok =
-            joined_h.is_none() && joined_k == Some(want_join) && cont.0 == n && run_k == plain_k;
+        let by_seed = differing_rows(&cont, &cont_o, cont.0.min(cont_o.0));
+        let seed_below_same = by_seed.iter().all(|&q| q >= SDM_HEAD);
+        let seed_head_differs = by_seed.contains(&SDM_HEAD);
+        let b_ok = joined_h.is_none()
+            && joined_k == Some(want_join)
+            && [cont.0, cont_o.0] == [n; 2]
+            && run_k == plain_k
+            && seed_below_same
+            && seed_head_differs;
         let ids_ok = run_m == plain;
         let covered = acc_m > 0 && acc_m < prop_m;
         let covered = tier::premise(
@@ -3560,11 +3625,13 @@ mod gate {
         let tier_name = tier::Tier::from_env()?.name();
         println!(
             "slots (sdm-a) drafted media: head {SDM_HEAD} + span {SDM_SPAN} + tail {SDM_TAIL} = {n} \
-             ids (feed A: the image token's embedding at a span position), the draft's store \
-             {} rows (text {}): rows below {SDM_HEAD} the text call's bit for bit {below_same}; \
-             every row past {SDM_HEAD} differs {past_differ}; the row at {SDM_HEAD} (the first \
-             span position) the text call's {first_span_same} (printed, not held); join \
-             records text {joined_t:?}, media {joined_m:?}; whole call's store held {held} {}",
+             ids (feed B, the reference's: llama.cpp's MTP draft adds the target's vision row at \
+             an image position; the span's row, not the image token's embedding), the draft's \
+             store {} rows (text {}): rows below {SDM_HEAD} the text call's bit for bit \
+             {below_same}; every row from {SDM_HEAD} on differs {from_differ} (the row at \
+             {SDM_HEAD}: the span's row against the token's embedding beside the same hidden \
+             row); join records text {joined_t:?}, media {joined_m:?}; whole call's store held \
+             {held} {}",
             media.0,
             text.0,
             verdict(a_ok)
@@ -3573,7 +3640,10 @@ mod gate {
             "slots (sdm-b) drafted media continuing a held sequence: the head's text call (join \
              {joined_h:?}), then the media call of the rest from {SDM_HEAD}: join {joined_k:?} \
              (want {want_join:?}), the store {} rows (want {}), {} ids from its argmax bit for \
-             bit the plain run's (the same two calls, then steps) {} {}",
+             bit the plain run's (the same two calls, then steps) {}; the same call with \
+             another seed of the span's rows: rows below {SDM_HEAD} equal {seed_below_same}, the \
+             row at {SDM_HEAD} (the join's walk of the span's first row) differs \
+             {seed_head_differs} {}",
             cont.0,
             n,
             run_k.len(),

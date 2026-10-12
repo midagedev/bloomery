@@ -61,7 +61,7 @@ impl MtpBody for Body38 {
         head: MtpHead,
         mode: WalkMode,
     ) -> Result<(), GpuError> {
-        m.mtp_walk(mtp_feed(feed), head, mtp_mode(mode))
+        m.mtp_walk(mtp_feed(feed)?, head, mtp_mode(mode))
     }
 
     fn chain(
@@ -73,7 +73,7 @@ impl MtpBody for Body38 {
         out: &mut [u32],
         p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError> {
-        let d = m.mtp_chain(mtp_feed(refresh), own, head, mtp_mode(mode))?;
+        let d = m.mtp_chain(mtp_feed(refresh)?, own, head, mtp_mode(mode))?;
         let n = d.tokens.len();
         let places = out.len();
         out.get_mut(..n)
@@ -101,16 +101,26 @@ const _: () = <Body38 as MtpBody>::FITS;
 const _: () = assert!(<Body38 as MtpBody>::VERIFY_ROWS <= MTP_GRAPH_ROWS);
 
 /// The shared feed as Qwen3.8's: always [`MtpFeed::Rows`], which the window
-/// builds; [`MtpFeed::Own`] is the chain's own.
-fn mtp_feed(f: Feed<'_, TargetRows>) -> MtpFeed<'_> {
-    MtpFeed::Rows {
+/// builds; [`MtpFeed::Own`] is the chain's own. Media rows are refused by
+/// name: the body has no media prompt call ([`Feed::media`] is a media call's
+/// alone), and a draft that dropped them would walk another feed than the
+/// target's.
+fn mtp_feed(f: Feed<'_, TargetRows>) -> Result<MtpFeed<'_>, GpuError> {
+    if f.media.is_some() {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: "a walk with media rows: this body's draft has no media prompt call"
+                .to_string(),
+        });
+    }
+    Ok(MtpFeed::Rows {
         tokens: f.tokens,
         pos0: f.pos0,
         hidden: match f.hidden {
             Hidden::Host(v) => MtpHidden::Host(v),
             Hidden::Target { walk, first } => MtpHidden::Target { walk, first },
         },
-    }
+    })
 }
 
 /// The walk mode as Qwen3.8's: each shared mode is one of the draft's own,
@@ -128,6 +138,7 @@ mod tests {
     use super::{mtp_feed, mtp_mode};
     use crate::mtp::{Feed, Hidden, WalkMode};
     use bloomery_gpu::arch::qwen3moe::{MtpFeed, MtpHidden, MtpMode, TargetRows};
+    use bloomery_gpu::media::CallRows;
 
     /// The shared walk mode and feed map onto Qwen3.8's one to one: each
     /// value comes back from its image as itself, and a variant added to
@@ -167,7 +178,9 @@ mod tests {
                 tokens: &tokens,
                 pos0: 5,
                 hidden: h,
-            });
+                media: None,
+            })
+            .expect("a feed with no media");
             let MtpFeed::Rows {
                 tokens: t,
                 pos0,
@@ -185,5 +198,29 @@ mod tests {
                 (h, hidden) => panic!("{h:?} mapped to {hidden:?}"),
             }
         }
+    }
+
+    /// A feed that holds media rows is refused by name, not walked without
+    /// them.
+    #[test]
+    fn media_rows_are_refused_by_name() {
+        let (at, rows) = (0..1, [0u16; 2]);
+        let media = CallRows::new(5, 2, [(&at, &rows[..])]).expect("one whole row");
+        let tokens = [7u32];
+        let e = mtp_feed(Feed {
+            tokens: &tokens,
+            pos0: 5,
+            hidden: Hidden::Target {
+                walk: TargetRows::Step,
+                first: 0,
+            },
+            media: Some(&media),
+        })
+        .expect_err("media rows");
+        assert!(
+            e.to_string()
+                .contains("this body's draft has no media prompt call"),
+            "{e}"
+        );
     }
 }

@@ -20,7 +20,8 @@
 //!   [`MtpDraft`'s `begin`](Draft::begin), whose walk is the next window's
 //!   anchor. A prompt that holds an image ([`MtpDraft::prompt_media`]) walks
 //!   the same way over the target's media call, a span's positions walked
-//!   like any other, each with its own token's embedding;
+//!   like any other but for the embedding: the row the target consumed
+//!   there, the span's own, in place of the image token's ([`Feed::media`]);
 //! - each window's [`MtpDraft`'s `propose`](Draft::propose) runs one chain
 //!   ([`MtpBody::chain`], one readback): the refresh — the rows the target
 //!   kept, at the positions after the verify's first, each with the hidden
@@ -73,7 +74,7 @@
 
 use std::fmt;
 
-use bloomery_gpu::media::MediaBody;
+use bloomery_gpu::media::{CallRows, MediaBody};
 use bloomery_gpu::model::{Rollback, Rows, SlotRows, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
 use runtime::{Draft, TapNeed, Target, accepted_rows};
@@ -156,12 +157,18 @@ pub enum Hidden<'a, A> {
 }
 
 /// A walk's rows: `tokens` at positions `pos0 ..`, each beside its hidden
-/// row (the target's at the position before it).
+/// row (the target's at the position before it). `media` is the prompt
+/// call's span rows by absolute position: a row the lookup holds replaces
+/// the token's embedding row at its position, as the target's media call
+/// took it. Only a prompt call that holds an image carries it
+/// ([`MtpDraft::prompt_media`]); a body whose walk cannot take it refuses it
+/// by name.
 #[derive(Clone, Copy, Debug)]
 pub struct Feed<'a, A> {
     pub tokens: &'a [u32],
     pub pos0: u32,
     pub hidden: Hidden<'a, A>,
+    pub media: Option<&'a CallRows<'a>>,
 }
 
 /// A prompt call's tap ([`MtpBody::prompt_with`]): called after each unit
@@ -403,11 +410,14 @@ pub struct MtpDraft<B: MtpBody> {
 }
 
 /// The card's side of a call's walks ([`Exec`]): the model, the head the load
-/// opened and the zero row, for the length of one call.
+/// opened, the zero row and the call's span rows (`None` on a text call),
+/// for the length of one call. Every walk of the call reads `media`: the
+/// join's and each unit's.
 struct Card<'a, B: MtpBody> {
     m: &'a mut GpuModel<B>,
     head: B::Head,
     zeros: &'a [f32],
+    media: Option<&'a CallRows<'a>>,
 }
 
 impl<B: MtpBody> Exec<B::Arena> for Card<'_, B> {
@@ -422,6 +432,7 @@ impl<B: MtpBody> Exec<B::Arena> for Card<'_, B> {
             tokens: w.tokens,
             pos0: w.pos0,
             hidden,
+            media: self.media,
         };
         B::walk(self.m, feed, self.head, w.mode)
     }
@@ -584,6 +595,7 @@ impl<B: MtpBody> MtpDraft<B> {
             m: t.model_mut(),
             head: self.head,
             zeros: &self.zeros,
+            media: None,
         };
         Ok(self.policy.before_step(&mut card, pos, last)?)
     }
@@ -747,11 +759,13 @@ impl<B: MtpBody> MtpDraft<B> {
     /// The prompt call's one core ([`Draft::prompt`], [`MtpDraft::prompt_media`]): `call` is the
     /// target's prompt call of `ids` on the model, handed the sink that walks the draft over
     /// each unit as it completes, or `None` when the draft cannot join and the call is the
-    /// target's alone.
+    /// target's alone. `media` is the call's span rows ([`CallRows`], `None` on a text call):
+    /// the join's walk and every unit's walk read it.
     fn prompt_joined(
         &mut self,
         t: &mut Session<B>,
         ids: &[u32],
+        media: Option<&CallRows<'_>>,
         call: impl FnOnce(&mut GpuModel<B>, Option<&mut UnitSink<'_, B>>) -> Result<u32, GpuError>,
     ) -> Result<u32, SessionError> {
         let head = self.head;
@@ -761,6 +775,7 @@ impl<B: MtpBody> MtpDraft<B> {
             m: t.model_mut(),
             head,
             zeros: &self.zeros,
+            media,
         };
         let Some(mut join) = self.policy.prompt_start(&mut card, start, ids)? else {
             return Ok(call(t.model_mut(), None)?);
@@ -771,7 +786,13 @@ impl<B: MtpBody> MtpDraft<B> {
                         first: u32,
                         rows: usize|
          -> Result<(), GpuError> {
-            policy.unit(&mut join, &mut Card { m, head, zeros }, walk, first, rows)
+            let mut card = Card {
+                m,
+                head,
+                zeros,
+                media,
+            };
+            policy.unit(&mut join, &mut card, walk, first, rows)
         };
         Ok(call(t.model_mut(), Some(&mut sink))?)
     }
@@ -781,11 +802,13 @@ impl<B: MtpBody + MediaBody> MtpDraft<B> {
     /// [`Draft::prompt`] of `ids` with `spans` spliced in (the module doc's prompt call, the
     /// target's media call in place of its text call): the draft is walked over the call's
     /// units as they complete, a span's positions included. At a span's position the draft
-    /// reads the image token's own embedding beside the target's hidden row there, the row the
-    /// target computed from the span's rows: the text call's feed, whatever the span holds. The
-    /// call is the body's own, one residency pass it opens ([`MtpBody::prompt_media_with`]), so
-    /// it never runs inside [`Session::prompt_media`]'s. Refused before anything runs as
-    /// [`Session::prompt_media`] refuses ([`MediaBody::media_refusal`]).
+    /// reads the span's row beside the target's hidden row there, the row the target consumed
+    /// in place of the image token's embedding, widened exactly: the reference's feed (its MTP
+    /// draft adds the target's vision row at an image position). The call is the body's own,
+    /// one residency pass it opens ([`MtpBody::prompt_media_with`]), so it never runs inside
+    /// [`Session::prompt_media`]'s. Refused before anything runs as [`Session::prompt_media`]
+    /// refuses ([`MediaBody::media_refusal`]), and for a span that is not whole rows of the
+    /// draft's width or that the others do not follow in order ([`CallRows::new`]).
     pub fn prompt_media(
         &mut self,
         t: &mut Session<B>,
@@ -795,7 +818,18 @@ impl<B: MtpBody + MediaBody> MtpDraft<B> {
         if let Some(why) = B::media_refusal(t.model(), spans.len()) {
             return Err(SessionError::Refused(why));
         }
-        self.prompt_joined(t, ids, |m, sink| B::prompt_media_with(m, ids, spans, sink))
+        let rows = CallRows::new(
+            t.pos(),
+            self.zeros.len(),
+            spans.iter().map(|s| {
+                let s = B::media_span(s);
+                (&s.at, s.rows)
+            }),
+        )
+        .map_err(|r| SessionError::Refused(format!("{WHAT}: {r}")))?;
+        self.prompt_joined(t, ids, Some(&rows), |m, sink| {
+            B::prompt_media_with(m, ids, spans, sink)
+        })
     }
 }
 
@@ -814,7 +848,7 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// cannot join skips: the target's call alone.
     fn prompt(&mut self, t: &mut Session<B>, ids: &[u32]) -> Result<u32, SessionError> {
         let path = self.path;
-        self.prompt_joined(t, ids, |m, sink| B::prompt_with(m, ids, path, sink))
+        self.prompt_joined(t, ids, None, |m, sink| B::prompt_with(m, ids, path, sink))
     }
 
     /// The next window's anchor: the target's own token `first` at the
@@ -906,6 +940,7 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
             m: t.model_mut(),
             head: self.head,
             zeros: &self.zeros,
+            media: None,
         };
         Ok(self.policy.stepped(&mut card, pos, last, next)?)
     }

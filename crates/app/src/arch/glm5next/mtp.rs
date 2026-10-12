@@ -67,7 +67,8 @@ impl MtpBody for Body {
     }
 
     /// [`bloomery_gpu_glm5next::prompt_media_with`]: the body's media call with the sink, its
-    /// residency pass its own.
+    /// residency pass its own. The draft's walks over its units read the span rows at a span's
+    /// positions ([`Feed::media`]).
     fn prompt_media_with(
         m: &mut GpuModel<Body>,
         ids: &[u32],
@@ -126,6 +127,7 @@ fn nextn_feed(f: Feed<'_, GlmArena>) -> NextnFeed<'_> {
             Hidden::Host(v) => NextnHidden::Host(v),
             Hidden::Target { walk, first } => NextnHidden::Target { walk, first },
         },
+        media: f.media,
     }
 }
 
