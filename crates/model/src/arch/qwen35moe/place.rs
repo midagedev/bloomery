@@ -2754,7 +2754,9 @@ mod tests {
             machine_bp, slot_resident_bytes, tier_batch_of,
         };
         use super::mtp::{draft, file};
-        use crate::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
+        use crate::arch::qwen35moe::hparams::{
+            Exp, FfnKind, Hparams, Kind, Ple, SectionOrder, Variant,
+        };
         use crate::placement::workstation::HostRead;
         use crate::placement::{
             self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Plan,
@@ -2777,6 +2779,7 @@ mod tests {
                 head_dim: 256,
                 rope_dims: 64,
                 rope_sections: [11, 11, 10, 0],
+                rope_order: SectionOrder::Tyxz,
                 rope_base: 1e7,
                 rms_eps: 1e-6,
                 n_vocab: 248_320,
