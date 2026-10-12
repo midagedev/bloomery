@@ -1025,6 +1025,10 @@ case "$*" in
     exec bash tools/gpu-gate.sh --test-locks "$st" ${*#bash tools/gpu-gate.sh } ;;
 esac
 [ "${BLOOMERY_BOX_READONLY:-0}" = 1 ] || : > "$st/dir-made"
+# This call's own pid, for the case that ends the batch it belongs to (reap_calls in the self-test): the file goes with the call.
+mkdir -p "$st/live"
+: > "$st/live/$$"
+trap 'rm -f "$st/live/$$"' EXIT
 for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
 word=${*##* }
 for d in ${FAKE_START_DELAY:-}; do [ "${d%%=*}" != "$word" ] || sleep "${d#*=}"; done
@@ -1154,6 +1158,38 @@ FP
     if [ -f "$2" ] && [ -n "$(awk -F'\t' "$3" "$2")" ]; then bad=$((bad + 1)); echo "FAIL $1: a row of $2 answers {$3}"
     else echo "ok $1"; fi
   }
+  # A case's fake box starts empty, and so does the box under it. A case that ends its batch by killing the batch's pids (the lanes, and
+  # each lane's `just`) leaves the call under that `just` running to the end of its hold on Linux (`just` does not take the sh and box.sh
+  # below it with it; on the Mac it does), and the call then writes its ran.log, seq.log and end.log lines into whatever fake-state stands
+  # at that moment: the next case's, whose counts then read one call too many. Every call registers its pid under
+  # fake-state/live/; fresh_state ends the calls still
+  # running before it removes the directory, so no call outlives the case it started in. NOREAP=1 skips the reap (the stray case's mutant).
+  call_alive() { # <pid>: running (a zombie its parent has not reaped yet is gone)
+    case $(ps -o state= -p "$1" 2> /dev/null) in
+      '' | *Z*) return 1 ;;
+    esac
+  }
+  reap_calls() { # TERM each registered call that is still a box.sh, and wait until it is gone
+    local f p k
+    [ "${NOREAP:-0}" != 1 ] || return 0
+    for f in "$t"/fake-state/live/*; do
+      [ -e "$f" ] || continue
+      p=${f##*/}
+      # the file of a call a signal ended stays, and a pid is reused: only a process that still is a box.sh is signalled
+      case $(ps -o args= -p "$p" 2> /dev/null) in *tools/box.sh*) ;; *) continue ;; esac
+      kill -TERM "$p" 2> /dev/null || true
+      k=0
+      while call_alive "$p" && [ "$k" -lt 50 ]; do
+        sleep 0.1
+        k=$((k + 1))
+      done
+      if call_alive "$p"; then kill -KILL "$p" 2> /dev/null || true; fi
+    done
+  }
+  fresh_state() { # <paths…>: the last case's box calls ended, then fake-state and the paths removed
+    reap_calls
+    rm -rf "$t/fake-state" "$@"
+  }
   steal_case() { # <tag> <times rows…> -- <items…>: one real batch run on the fixture, rc printed;
     # LEASE_UP=1 puts the fake lease up before the batch starts; GBFAST=1 runs the fast-retry copy above
     local tag=$1 rc=0 runner=("${gb[@]}")
@@ -1163,7 +1199,7 @@ FP
     while [ "$1" != -- ]; do rows+=("$1"); shift; done
     shift
     printf '%s\n' "${rows[@]}" > "$times"
-    rm -rf "$t/fake-state" "$t/target/c-$tag"
+    fresh_state "$t/target/c-$tag"
     if [ "${LEASE_UP:-0}" = 1 ]; then mkdir -p "$t/fake-state" && : > "$t/fake-state/lease-up"; fi
     # PRE_HOLD=<owner> [PRE_AGE=<s>]: another batch's GPU hold is already up on the fake box, last refreshed <s> seconds ago
     if [ -n "${PRE_HOLD:-}" ]; then
@@ -1289,7 +1325,7 @@ FP
   want 'chain: the ledger records it under the A6000 key' "$t/rounds-ch-laneb.tsv" "$(printf '^stub-v41-any@FAKE_SLEEP=2,BLOOMERY_GATE_CARD=a6000\tv41-any\t')"
   want_row 'chain: its box call carries the A6000 card' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_x$/'
   mutant_of ch-pina 's|^  local lane=\$1 i card cards$|  local lane=$1 i card cards; [ "$lane" = B ] \&\& return 1 # MUTANT ch-pina|' '# MUTANT ch-pina$'
-  rm -rf "$t/fake-state" "$t/target/c-ch-lanebm"
+  fresh_state "$t/target/c-ch-lanebm"
   BLOOMERY_GATE_TIMES=$t/times-ch-laneb.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-lanebm.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-lanebm.tsv \
     bash "$t/tools/gate-batch-ch-pina.sh" --out "$t/target/c-ch-lanebm" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=2' x-q > "$t/out-ch-lanebm.log" 2>&1 &
   sp=$!
@@ -1320,7 +1356,7 @@ FP
   want 'chain: the A6000-pick member runs in lane B' "$t/target/c-ch-cards/run.log" '^gate-gpu-ds41-residency-a rc=0 [0-9]+s try=1 lane=B( |$)'
   want_no_row 'chain: no card of the batch reached the pick member' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD/ && $2 ~ /gen_ra/'
   mutant_of ch-anywant 's|^  want=$(lane_card "$1")$|  want=3090 # MUTANT ch-anywant|' '# MUTANT ch-anywant$'
-  rm -rf "$t/fake-state" "$t/target/c-ch-cardsm"
+  fresh_state "$t/target/c-ch-cardsm"
   BLOOMERY_GATE_TIMES=$t/times-ch-cards.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-cardsm.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-cardsm.tsv \
     bash "$t/tools/gate-batch-ch-anywant.sh" --out "$t/target/c-ch-cardsm" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=2' 'v41-a@FAKE_SLEEP=4' x-q > "$t/out-ch-cardsm.log" 2>&1 &
   sp=$!
@@ -1430,7 +1466,7 @@ FP
   # line past one, or the batch still running after 20 s, stops it. lskip_case prints `<rc, 124 at the bound> <skip lines>`.
   lskip_case() { # <tag> <script>
     local tag=$1 script=$2 sp k=0 rc=0 cnt=0 f
-    rm -rf "$t/fake-state" "$t/target/c-$tag"
+    fresh_state "$t/target/c-$tag"
     printf '%s\n' "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	A	3090	2	$d" > "$t/times-$tag.tsv"
     FAKE_GREEN_FILE=$t/green-lskip.tsv BLOOMERY_GATE_TIMES=$t/times-$tag.tsv BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
       bash "$script" --out "$t/target/c-$tag" --round-ledger steal-fix plain-any 'v41-any@FAKE_SLEEP=2' > "$t/out-$tag.log" 2>&1 &
@@ -1466,7 +1502,7 @@ FP
   else fail 'chain mutant: without the claim a green lane item skips again and again' "the mutant batch ended with ${res#* } skip line(s) (rc ${res% *})"; fi
   # (10) a lane killed while it holds the mutex: the batch ends by name inside a bound, never a
   # wait without end. The deaf-watch mutant hangs instead and the case kills it.
-  rm -rf "$t/fake-state" "$t/target/c-ch-kill"
+  fresh_state "$t/target/c-ch-kill"
   BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill.tsv \
     "${gb[@]}" --out "$t/target/c-ch-kill" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-kill.log" 2>&1 &
   sp=$!
@@ -1494,7 +1530,7 @@ FP
     if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
   done
   mutant_of ch-deaf "s|^      \*) dead_now=\"\\\$dead_now \\\$lane\"; continue ;;\$|      *) continue ;; # MUTANT ch-deaf|" '# MUTANT ch-deaf$'
-  rm -rf "$t/fake-state" "$t/target/c-ch-killm"
+  fresh_state "$t/target/c-ch-killm"
   BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill.tsv \
     bash "$t/tools/gate-batch-ch-deaf.sh" --out "$t/target/c-ch-killm" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-killm.log" 2>&1 &
   sp=$!
@@ -1521,7 +1557,7 @@ FP
   # (10b) both lanes killed at once: each lane's sighting is its own, so the batch still ends by
   # name inside the bound. A watch that kept one list of sightings for both lanes would see them
   # alternate and never twice in a row, and wait without end.
-  rm -rf "$t/fake-state" "$t/target/c-ch-kill2"
+  fresh_state "$t/target/c-ch-kill2"
   BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill2.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill2.tsv \
     "${gb[@]}" --out "$t/target/c-ch-kill2" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-kill2.log" 2>&1 &
   sp=$!
@@ -1587,7 +1623,11 @@ FP
     n=$((n + 1))
     if [ -f "$2" ]; then c=$(grep -Ec -- "$3" "$2" || true); fi
     if [ "$c" = "$4" ]; then echo "ok $1"
-    else bad=$((bad + 1)); echo "FAIL $1: $c lines match /$3/ in $2, want $4"; fi
+    else
+      bad=$((bad + 1)); echo "FAIL $1: $c lines match /$3/ in $2, want $4"
+      # the lines themselves (a stray call's line reads as another's by its epochs and command: ran.log is "<start> <end> <command>")
+      if [ -f "$2" ]; then grep -E -- "$3" "$2" | sed 's/^/    | /' || true; fi
+    fi
   }
   want_absent() { # <name> <path>: nothing is there
     n=$((n + 1))
@@ -1629,6 +1669,37 @@ FP
   if [ "$rc" = 1 ] && grep -Eq '^DONE total=1 red=1 ' "$t/out-ch-onlym.log"; then pass 'chain only mutant: without the feed rule no lane starts and the batch ends red'
   else fail 'chain only mutant: without the feed rule no lane starts and the batch ends red' "rc $rc, $(tail -1 "$t/out-ch-onlym.log" 2> /dev/null)"; fi
   want '  … naming the member no lane took once the lanes ended' "$t/target/c-ch-onlym/run.log" '^v41-any rc=unclaimed lane=C tier=real$'
+  # A box call the last case left running (fresh_state's comment above): a lone fake call started from no batch, as a call under a killed
+  # `just` is, held until the one-member batch behind it logs its own member (the fake's FAKE_UNTIL: the event, not a clock, and the
+  # word only the new directory holds). The reap ends the call before that directory is made, so the batch's ran.log holds its member
+  # and nothing else; the NOREAP twin lets the call run on into the new directory and finds its line there (the line `chain only`
+  # above counted twice on the CI runner).
+  stray_case() { # <tag>: prints the batch's rc; the call's pid is in $t/stray-<tag>.pid
+    local tag=$1 k=0 p
+    fresh_state "$t/target/c-$tag" # a clean box first: the call must not find the last case's box.log
+    BLOOMERY_BOX_ENV='FAKE_SLEEP=30 FAKE_UNTIL=gen_x' sh "$t/tools/box.sh" 'bash tools/gpu-gate.sh gen_stray' > /dev/null 2>&1 &
+    p=$!
+    echo "$p" > "$t/stray-$tag.pid"
+    while [ ! -e "$t/fake-state/live/$p" ] && [ "$k" -lt 50 ]; do # the call has registered
+      sleep 0.1
+      k=$((k + 1))
+    done
+    steal_case "$tag" "v41-any@FAKE_SLEEP=3	A	3090	2	$d" -- 'v41-any@FAKE_SLEEP=3'
+  }
+  rc=$(stray_case stray)
+  printf '%s' "$rc" > "$t/rc-stray"
+  rc_ok 'stray: a batch after a case that left a box call running ends green' stray 1
+  want_count 'stray: the call the last case left is ended, and writes nothing into this case' "$t/fake-state/ran.log" ' gen_' 1
+  if call_alive "$(cat "$t/stray-stray.pid")"; then fail '  … the call is gone' "pid $(cat "$t/stray-stray.pid") still runs"
+  else pass '  … the call is gone'; fi
+  rc=$(NOREAP=1 stray_case stray-m)
+  printf '%s' "$rc" > "$t/rc-stray-m"
+  k=0
+  while call_alive "$(cat "$t/stray-stray-m.pid")" && [ "$k" -lt 100 ]; do # the call ends on the member's line; its own line is written before it does
+    sleep 0.1
+    k=$((k + 1))
+  done
+  want_count 'stray mutant: without the reap the left-over call writes its line into the next case' "$t/fake-state/ran.log" ' gen_' 2
   rc=$(steal_case ch-only-a "v41-a@FAKE_SLEEP=1	A	3090	2	$d" -- 'v41-a@FAKE_SLEEP=1')
   printf '%s' "$rc" > "$t/rc-ch-only-a"
   rc_ok 'chain only: a list of one 3090-only member ends green' ch-only-a 1
@@ -2452,7 +2523,7 @@ IG
   # INT/TERM (stop): TERM to the batch's own pid, once its item runs.
   local slow_s='steal-slow@FAKE_SLEEP=20'
   printf '%s\n' "$slow_s	A	3090	30	$d" > "$t/times-hold-stop.tsv"
-  rm -rf "$t/fake-state" "$t/target/c-hold-stop"
+  fresh_state "$t/target/c-hold-stop"
   BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-stop.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-stop.tsv \
     BLOOMERY_GPU_HOLD_BEAT=1 "${gb[@]}" --out "$t/target/c-hold-stop" --ledger "$slow_s" > "$t/out-hold-stop.log" 2>&1 &
   sp=$!
@@ -2472,7 +2543,7 @@ IG
   else fail '  … TERM to the batch ends it (130), takes the hold down and ends the heartbeat' "rc=$rc hold: $(cat "$t/fake-state/batch.gpuhold" 2>&1 | head -1) heartbeat pid $hp"; fi
   want '  … and says it stopped' "$t/out-hold-stop.log" '^gate-batch: stopped;'
   # die: a lane killed from outside (its pid, as written under DIR) ends the batch through die (70), and the hold still comes down.
-  rm -rf "$t/fake-state" "$t/target/c-hold-die"
+  fresh_state "$t/target/c-hold-die"
   BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-die.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-die.tsv \
     BLOOMERY_GPU_HOLD_BEAT=1 "${gb[@]}" --out "$t/target/c-hold-die" --ledger "$slow_s" > "$t/out-hold-die.log" 2>&1 &
   sp=$!
@@ -2490,7 +2561,7 @@ IG
   if [ -f "$t/target/c-hold-die/lane-A.child" ]; then kill -TERM "$(cat "$t/target/c-hold-die/lane-A.child")" 2> /dev/null || true; fi
   # An unclean death (KILL runs no trap): the hold is left up, but its heartbeat sees the batch gone and stops beating, so the box ages
   # the hold out instead of it staying fresh for ever.
-  rm -rf "$t/fake-state" "$t/target/c-hold-kill"
+  fresh_state "$t/target/c-hold-kill"
   BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-kill.tsv \
     BLOOMERY_GPU_HOLD_BEAT=1 "${gb[@]}" --out "$t/target/c-hold-kill" --ledger "$slow_s" > "$t/out-hold-kill.log" 2>&1 &
   sp=$!
@@ -2517,7 +2588,7 @@ IG
   done
   # A hold that vanishes (taken down by hand): the next beat finds it gone (3), logs it and the heartbeat stops — and no beat
   # creates the file again.
-  rm -rf "$t/fake-state" "$t/target/c-hold-gone"
+  fresh_state "$t/target/c-hold-gone"
   BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-gone.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-gone.tsv \
     BLOOMERY_GPU_HOLD_BEAT=1 "${gb[@]}" --out "$t/target/c-hold-gone" --ledger "$slow_s" > "$t/out-hold-gone.log" 2>&1 &
   sp=$!
