@@ -154,6 +154,21 @@
 #   slots-dry    the dry run of the twin and the aggregate arm: the aggregate arm's `slots=2 feed=12 twin=…`
 #                and its command line under env with both variables and the ids 50000..50011, the twin's
 #                with 50000..50005.
+# The context an arm runs at (the runner derives C per arm when BLOOMERY_GEN_CTX is unset, 2026-10-12; red on the runner
+# before it, whose one C is 2048 — the cases above that name a C run at BLOOMERY_GEN_CTX=2048, the path they were written
+# against, each with a dated comment):
+#   ctx-derived  unset, N 4, the dry run of ours:4096 oursmtp:4092 lcpp27754srv:4096 ours:6: --ctx 4352 for ours:4096 and
+#                oursmtp:4092 (4092 + 4 + 1 = 4097 is past 4096), -c 4352 for the server arm, --ctx 256 for ours:6, each
+#                line anchored by its arm's id range; the [dry] head and server lines say the rule; rc 0, no refusal.
+#   ctx-derived-slots  200 200@BLOOMERY_GEN_SLOTS=2 (dry): both arms --ctx 256, the aggregate arm's C its twin's (D + N
+#                rounded), not the 400 ids it feeds rounded (512).
+#   ctx-srv-edge  lcpp27754srv:4092: 4092 + 4 rounds to 4096 and its 4097 positions do not fit, so it is refused by name
+#                with the derived C (rc 64), where ours:4092 beside it (dry) fits --ctx 4096.
+#   ctx-bad      BLOOMERY_GEN_CTX=abc and =0: refused by name, rc 64.
+#   ctx-derived-run  ours:4096 through the stub generate (needs the prose ids, and 54096 of them): it is handed --ctx 4352
+#                (the stub logs it), its row names ctx=4352, and a load record naming ctx 4096 is a FAIL row naming both.
+#   ctx-derived-srv  ours:4096 oursmtp:4092 lcpp27754srv:4096 lcpp27754srvpp:4096: the oursmtp row at ctx=4352, both
+#                server arms started at -c 4352 and their rows say so; rc 0.
 # An ours arm's place= and the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090; depth-stub-cards.sh's
 # nvidia-smi and journalctl first on PATH; red on the runner before them, which has no two-card mode, refuses
 # place= as no lever row and BLOOMERY_GEN_PLACE=bp as no word):
@@ -321,7 +336,8 @@ cp "$T/pr27752/llama-server" "$T/pr27754/llama-server"
 # stead; the 3090 under gate; both under bp). --records-schema prints the checked-in schema; --levers prints a line, or
 # under STUB_GEN_NODRAFT=1 with BLOOMERY_DRAFT set refuses it (exit 1), as a run does then, and so for the
 # variable STUB_GEN_REFUSE names when it is set; a run appends
-# `draft=<BLOOMERY_DRAFT or none> depth=<ids>` to $TMPDIR/stub-gen-draft and `draft=<…> residency=<BLOOMERY_RESIDENCY
+# `draft=<BLOOMERY_DRAFT or none> depth=<ids>` to $TMPDIR/stub-gen-draft, `draft=<…> ctx=<its --ctx> depth=<ids>` to
+# $TMPDIR/stub-gen-ctx and `draft=<…> residency=<BLOOMERY_RESIDENCY
 # or none> depth=<ids>` to $TMPDIR/stub-gen-env; under BLOOMERY_RESIDENCY it prints a `residency lever`
 # record (why=set) before its plan (none under STUB_GEN_NORESLEVER=1), a `residency pass` of pass none before its feed and one of pass step
 # (kept 10, landed 1, late 0, made 1, bytes 100) after each timed step; it times its steps at half under
@@ -365,6 +381,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 echo "draft=${BLOOMERY_DRAFT:-none} depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-draft"
+echo "draft=${BLOOMERY_DRAFT:-none} ctx=$ctx depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-ctx"
 echo "draft=${BLOOMERY_DRAFT:-none} residency=${BLOOMERY_RESIDENCY:-none} depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-env"
 rp() { [ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=0 made=$4 in_flight=0 bytes=$5 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
 [ -z "${BLOOMERY_RESIDENCY:-}" ] || [ -n "${STUB_GEN_NORESLEVER:-}" ] || echo "residency lever residency=$BLOOMERY_RESIDENCY why=set"
@@ -613,18 +630,20 @@ elif want preheat-fail "$L" 1 '^FAIL r1 lcpp27752fit d=6 rc=2 \| its preheat fai
   pass preheat-fail
 fi
 
+# 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
 L=$tmp/srv-past.log
-stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- lcpp27754srv:2046
+stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 -- lcpp27754srv:2046
 if [ "$RC" != 64 ]; then
   fail srv-past "rc $RC, want 64" "$L"
 elif want srv-past "$L" 1 "^depth-glm5next.sh: arm 'lcpp27754srv:2046' is .* — the server's -c is ours' --ctx 2048 \(docs/fair-measure.md 1.5\), and 2046 ids \+ n_predict 4 \+ 1 take 2051 positions; raise BLOOMERY_GEN_CTX$"; then
   pass srv-past
 fi
+# 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
 L=$tmp/pair.log
-stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 BLOOMERY_GEN_PAIR=1 -- 6
+stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 BLOOMERY_GEN_PAIR=1 -- 6
 L2=$tmp/pair-bad.log
 RC1=$RC
-stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PAIR=yes -- 6
+stub_run "$L2" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PAIR=yes -- 6
 if [ "$RC1" != 0 ] || [ "$RC" != 64 ]; then
   fail pair "rc $RC1 (1) and $RC (yes), want 0 and 64" "$L2"
 elif want pair "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place a --time --pair $' &&
@@ -643,11 +662,12 @@ elif want srv-flags-refused "$L" 1 "^depth-glm5next.sh: arm 'lcpp27754srv\+x1:6'
   want srv-flags-refused "$L2" 1 "^depth-glm5next.sh: arm 'lcpp27754\+t16:6' is .* — \+t<N>, \+nopo<0\|1> and \+k<K> are a server arm's flags$"; then
   pass srv-flags-refused
 fi
+# 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
 L=$tmp/mtp-past.log
-stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- oursmtp:2044
+stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 -- oursmtp:2044
 L2=$tmp/mtp-past-dry.log
 RC1=$RC
-stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 2044 oursmtp:2043
+stub_run "$L2" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 2044 oursmtp:2043
 if [ "$RC1" != 64 ] || [ "$RC" != 0 ]; then
   fail mtp-past "rc $RC1 (2044) and $RC (the dry run beside it), want 64 and 0" "$L"
 elif want mtp-past "$L" 1 "^depth-glm5next.sh: arm 'oursmtp:2044' is .* — oursmtp needs 1 <= D and D \+ N \+ 1 <= C \(2044 \+ 4 \+ 1 = 2049 against --ctx 2048\): the verify's last window takes one position past the N-th token$" &&
@@ -665,8 +685,9 @@ elif want mtp-env "$L" 1 "^depth-glm5next.sh: BLOOMERY_DRAFT is set to 'mtp' in 
   want mtp-env "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]) '; then
   pass mtp-env
 fi
+# 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
 L=$tmp/mtp-dry.log
-stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 6 oursmtp:6
+stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 6 oursmtp:6
 if [ "$RC" != 0 ]; then
   fail mtp-dry "rc $RC, want 0" "$L"
 elif want mtp-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_DRAFT=mtp target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place a --time $' &&
@@ -675,6 +696,68 @@ elif want mtp-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_D
   want mtp-dry "$L" 1 "^\[dry\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares the mtp summary record: each oursmtp row carries its positions, passes and kept, and one that prints none is a FAIL row$" &&
   want mtp-dry "$L" 1 '^\[dry\] round 1 gguf order: 6 oursmtp:6 $'; then
   pass mtp-dry
+fi
+# The derived C (2026-10-12; red on the runner before it, whose one C is 2048): BLOOMERY_GEN_CTX unset, each arm's C is its
+# own, as depth-qwen3moe.sh's arm_ctx: D + N rounded up to 256 for ours and a server arm (ours' C at that D), D + N + 1
+# rounded for oursmtp (the verify's last window). N is 4 here (stub_run): ours:4096 is 4100 -> 4352, oursmtp:4092 is
+# 4097 -> 4352 (4096 would not hold it), the server at 4096 takes ours' 4352, ours:6 is 256. Anchored by each arm's id
+# range, so one arm's --ctx line cannot stand for another's.
+L=$tmp/ctx-derived.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- ours:4096 oursmtp:4092 lcpp27754srv:4096 ours:6
+if [ "$RC" != 0 ]; then
+  fail ctx-derived "rc $RC, want 0" "$L"
+elif want ctx-derived "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.54095> -n 4 --ctx 4352 --place a --time $' &&
+  want ctx-derived "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_DRAFT=mtp target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.54091> -n 4 --ctx 4352 --place a --time $' &&
+  want ctx-derived "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 256 --place a --time $' &&
+  want ctx-derived "$L" 1 "^\[dry\]     timeout --kill-after=10 60 env NVIDIA_TF32_OVERRIDE=0 [^ ]*/pr27754/llama-server -m [^ ]* -ngl 999 --n-cpu-moe 36 -fa off -t 32 --no-op-offload -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 4352 --host 127\.0\.0\.1 --port 0 \$" &&
+  want ctx-derived "$L" 1 "^\[dry\] lcpp27754srv:4096: row \"POST /completion: GLM_PROSE ids 50000\.\.54095, .*, -c 4352 \(ours' --ctx\)\"" &&
+  want ctx-derived "$L" 3 ' --ctx [0-9]+ --place ' &&
+  want ctx-derived "$L" 1 '^\[dry\] model=.* ctx=D\+N rounded up to 256 \(oursmtp: D\+N\+1\) place=' &&
+  want ctx-derived "$L" 1 "^\[dry\] server arms: -c D \+ N rounded up to 256 \(ours' --ctx at that D or P\), a discarded request then the timed one; " &&
+  want ctx-derived "$L" 0 '^depth-glm5next.sh: '; then
+  pass ctx-derived
+fi
+# The aggregate arm's C is its twin's: D + N rounded up to 256, not the N·D ids it feeds — 200 + 4 rounds to 256 where its 2 · 200
+# fed ids would round to 512; each slot holds its own window (depth-qwen3moe.sh's arm_ctx reads no slot count either, and
+# generate_glm5next's check is per slot: depth + n_gen - 1 against --ctx).
+L=$tmp/ctx-derived-slots.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 200 200@BLOOMERY_GEN_SLOTS=2
+if [ "$RC" != 0 ]; then
+  fail ctx-derived-slots "rc $RC, want 0" "$L"
+elif want ctx-derived-slots "$L" 1 '^\[dry\] 200@BLOOMERY_GEN_SLOTS=2: slots=2 feed=400 twin=ours$' &&
+  want ctx-derived-slots "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_GEN_SLOTS=2 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50399> -n 4 --ctx 256 --place a --time $' &&
+  want ctx-derived-slots "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50199> -n 4 --ctx 256 --place a --time $' &&
+  want ctx-derived-slots "$L" 0 '^depth-glm5next.sh: '; then
+  pass ctx-derived-slots
+fi
+# The server's edge: 4092 + 4 = 4096 rounds to 4096, and the server's 4092 + 4 + 1 = 4097 positions do not fit it, so the
+# arm is refused by name with the derived C (the base runner refuses it too, at its 2048, so the line pins 4096 and the
+# derived-C words); ours at 4092 fits its 4096 (dry, rc 0), and oursmtp:4092 took 4352 above.
+L=$tmp/ctx-srv-edge.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- lcpp27754srv:4092
+L2=$tmp/ctx-srv-edge-ours.log
+RC1=$RC
+stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- ours:4092
+if [ "$RC1" != 64 ] || [ "$RC" != 0 ]; then
+  fail ctx-srv-edge "rc $RC1 (the server arm) and $RC (ours:4092, dry), want 64 and 0" "$L"
+elif want ctx-srv-edge "$L" 1 "^depth-glm5next.sh: arm 'lcpp27754srv:4092' is .* — the server's -c is ours' --ctx 4096 \(D \+ N rounded up to 256, docs/fair-measure.md 1.5\), and 4092 ids \+ n_predict 4 \+ 1 take 4097 positions; raise BLOOMERY_GEN_CTX\$" &&
+  want ctx-srv-edge "$L" 0 '^(ROW|WARMUP|FAIL) ' &&
+  want ctx-srv-edge "$L2" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.54091> -n 4 --ctx 4096 --place a --time $'; then
+  pass ctx-srv-edge
+fi
+# BLOOMERY_GEN_CTX is a positive integer: refused rc 64 by its own name (the base runner named its internal CTX), for a
+# word and for 0.
+L=$tmp/ctx-bad.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_CTX=abc -- ours:6
+L2=$tmp/ctx-bad-zero.log
+RC1=$RC
+stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_CTX=0 -- ours:6
+if [ "$RC1" != 64 ] || [ "$RC" != 64 ]; then
+  fail ctx-bad "rc $RC1 (abc) and $RC (0), want 64 and 64" "$L"
+elif want ctx-bad "$L" 1 "^depth-glm5next.sh: BLOOMERY_GEN_CTX is a positive integer, got 'abc'\$" &&
+  want ctx-bad "$L2" 1 "^depth-glm5next.sh: BLOOMERY_GEN_CTX is a positive integer, got '0'\$" &&
+  want ctx-bad "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]) '; then
+  pass ctx-bad
 fi
 # The lever arms' refusals: each an arm beside a plain 512, refused by name before anything runs.
 REG=tools/ref/../../crates/levers/src/registry.rs
@@ -714,8 +797,9 @@ refuse_case no-row "512@$NOPE=1" "$NOPE is no row of the lever registry ($REG): 
 refuse_case ab-load '512@BLOOMERY_AB_LOAD=arm' "BLOOMERY_AB_LOAD is no lever: its row in $REG is a runner's, a harness's or a path's own variable, not a setting of the binary's"
 refuse_case runner-env '512@BLOOMERY_RESIDENCY=off' "BLOOMERY_RESIDENCY is set in the runner's own environment (BLOOMERY_RESIDENCY=off), which every arm inherits, so the plain arms' labels would not show it: give it per arm only" BLOOMERY_RESIDENCY=off
 
+# 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
 L=$tmp/lever-dry.log
-stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1,BLOOMERY_R8=off
+stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1,BLOOMERY_R8=off
 if [ "$RC" != 0 ]; then
   fail lever-dry "rc $RC, want 0" "$L"
 elif want lever-dry "$L" 1 '^\[dry\] 512@BLOOMERY_RESIDENCY=mid-p33-s1:$' &&
@@ -780,11 +864,12 @@ if [ -f "$PROSE_SRC" ]; then
   mkdir -p "$T/data/glm5next"
   cp "$PROSE_SRC" "$T/data/glm5next/"
   GPU_A=$STUB_GPU_A6000
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/ours-timed.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" "${PH_ENV[@]}" -- 6
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" "${PH_ENV[@]}" -- 6
   L2=$tmp/ours-nofed.log
   RC1=$RC
-  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NOFED=1 GLM_PROSE_FROM=0 -- 6
+  stub_run "$L2" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NOFED=1 GLM_PROSE_FROM=0 -- 6
   if [ "$RC1" != 0 ]; then
     fail ours-timed "rc $RC1, want 0" "$L"
   elif [ "$RC" != 0 ]; then
@@ -827,10 +912,11 @@ if [ -f "$PROSE_SRC" ]; then
   fi
 
   # The server arms (lcpp-warm.sh's): flags, context, the warm-up request, draft, prefill rows, cross-check.
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/srv.log
   : > "$tmp/tmp/stub-srv-argv"
   : > "$tmp/tmp/stub-srv-reqs"
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" -- 6 lcpp27754srv:6 lcpp27752mtp:6 lcpp27754srvpp:6
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" -- 6 lcpp27754srv:6 lcpp27752mtp:6 lcpp27754srvpp:6
   ids6=$(sed -n '50001,50006p' "$T/data/glm5next/corpus-prose.ids" | paste -sd, -)
   if [ "$RC" != 0 ]; then
     fail srv "rc $RC, want 0" "$L"
@@ -871,28 +957,31 @@ if [ -f "$PROSE_SRC" ]; then
       pass srv-xcheck
     fi
   fi
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/srv-ctx.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_SRV_NCTX=4096 -- lcpp27754srv:6
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_SRV_NCTX=4096 -- lcpp27754srv:6
   L2=$tmp/srv-loadctx.log
   RC1=$RC
-  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_LOAD_CTX=4096 -- 6
+  stub_run "$L2" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_LOAD_CTX=4096 -- 6
   if [ "$RC1" != 1 ] || [ "$RC" != 1 ]; then
     fail srv-ctx "rc $RC1 (server) and $RC (ours), want 1 and 1" "$L"
   elif want srv-ctx "$L" 1 '^FAIL r1 lcpp27754srv d=6 rc=0 \| the server made its context at n_ctx 4096, not the -c 2048 ours runs at \(docs/fair-measure.md 1.5\) \| ' &&
     want srv-ctx "$L2" 1 "^FAIL r1 ours d=6 rc=0 \| its load record names ctx=4096, and the server arms run at -c 2048 \(BLOOMERY_GEN_CTX, ours' --ctx\) \| "; then
     pass srv-ctx
   fi
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/srv-flags.log
   : > "$tmp/tmp/stub-srv-argv"
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- lcpp27754srv+t16+k40:6
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- lcpp27754srv+t16+k40:6
   if [ "$RC" != 0 ]; then
     fail srv-flags "rc $RC, want 0" "$L"
   elif want srv-flags "$L" 1 '^ROW r1 lcpp27754srv\+t16\+k40 d=6 n=4 \| ' &&
     want "srv-flags argv" "$tmp/tmp/stub-srv-argv" 1 ' -ngl 999 -fa off --no-op-offload -t 16 --n-cpu-moe 40 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 2048 '; then
     pass srv-flags
   fi
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/srv-dry.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- lcpp27754srv:6 lcpp27752mtp:6
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- lcpp27754srv:6 lcpp27752mtp:6
   if [ "$RC" != 0 ]; then
     fail srv-dry "rc $RC, want 0" "$L"
   elif want srv-dry "$L" 1 "^\[dry\]     timeout --kill-after=10 60 env NVIDIA_TF32_OVERRIDE=0 [^ ]*/pr27754/llama-server -m [^ ]* -ngl 999 --n-cpu-moe 36 -fa off -t 32 --no-op-offload -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 2048 --host 127\.0\.0\.1 --port 0 $" &&
@@ -908,11 +997,12 @@ if [ -f "$PROSE_SRC" ]; then
   elif want srv-probe "$L" 1 "^depth-glm5next.sh: arm lcpp27752mtp:6: [^ ]*/pr27752/llama-server --help lists no --spec-type$"; then
     pass srv-probe
   fi
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/srv-fail.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_SRV_NODRAFT=1 -- lcpp27752mtp:6
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_SRV_NODRAFT=1 -- lcpp27752mtp:6
   L2=$tmp/srv-exit.log
   RC1=$RC
-  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_SRV_EXIT=1 -- lcpp27754srv:6
+  stub_run "$L2" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_SRV_EXIT=1 -- lcpp27754srv:6
   if [ "$RC1" != 1 ] || [ "$RC" != 1 ]; then
     fail srv-fail "rc $RC1 (no draft) and $RC (exit), want 1 and 1" "$L"
   elif want srv-fail "$L" 1 '^FAIL r1 lcpp27752mtp d=6 rc=0 \| the MTP arm drafted nothing \(draft_n 0\) \| ' &&
@@ -921,9 +1011,10 @@ if [ -f "$PROSE_SRC" ]; then
   fi
 
   # The MTP arm: ours under BLOOMERY_DRAFT=mtp, its rows, preheat, xcheck and the ours / oursmtp table.
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/mtp.log
   : > "$tmp/tmp/stub-gen-draft"
-  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 "${PH_ENV[@]}" -- 6 oursmtp:6 lcpp27752srv:6
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=2 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 "${PH_ENV[@]}" -- 6 oursmtp:6 lcpp27752srv:6
   if [ "$RC" != 0 ]; then
     fail mtp "rc $RC, want 0" "$L"
   elif want mtp "$L" 1 '^WARMUP r0 oursmtp d=6 n=4 ctx=2048 \| ' &&
@@ -984,18 +1075,19 @@ if [ -f "$PROSE_SRC" ]; then
   # The lever arms on the checked-in schema, which declares the residency lever and pass records; for
   # lever-res-none a copy without the residency lever record, the schema as it was before generate_glm5next
   # registered it.
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/lever-pair.log
   : > "$tmp/tmp/stub-gen-env"
-  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
   cp "$tmp/tmp/stub-gen-env" "$tmp/lever-pair-env.txt"
   L2=$tmp/mtp-lever-arm.log
   RC1=$RC
   : > "$tmp/tmp/stub-gen-env"
-  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 -- 512 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1
+  stub_run "$L2" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 -- 512 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1
   cp "$tmp/tmp/stub-gen-env" "$tmp/mtp-lever-arm-env.txt"
   RC2=$RC
   L3=$tmp/lever-res-nolever.log
-  stub_run "$L3" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NORESLEVER=1 -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
+  stub_run "$L3" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NORESLEVER=1 -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
   RC3=$RC
   LV=ours@BLOOMERY_RESIDENCY=mid-p33-s1
   if [ "$RC1" != 0 ]; then
@@ -1075,9 +1167,10 @@ PY
   # The two-card mode (red on the runner before it, which has none: timing-card.sh refuses the mode and the
   # lever check refuses place=): a and bp arms in one run, each row the mode's card field and its place, the
   # a arm's load record the A6000 alone; the reference arm on the A6000 alone, its log one device.
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/twocard-place.log
   : > "$tmp/tmp/stub-bench-cvd"
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${TC[@]}" BLOOMERY_GEN_PLACE=bp STUB_GEN_CARDS_ON=1 \
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${TC[@]}" BLOOMERY_GEN_PLACE=bp STUB_GEN_CARDS_ON=1 \
     STUB_BENCH_DEVLINES=1 -- 6 6@place=a lcpp27752:6
   if [ "$RC" != 0 ]; then
     fail twocard-place "rc $RC, want 0" "$L"
@@ -1098,8 +1191,9 @@ PY
   fi
   # One drafted arm at two placements: oursmtp and oursmtp@place=a paired by round in the placement table,
   # decode and prefill, bp over a; ours and ours@place=a too.
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/twocard-place-mtp.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 "${TC[@]}" BLOOMERY_GEN_PLACE=bp STUB_GEN_CARDS_ON=1 \
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 "${TC[@]}" BLOOMERY_GEN_PLACE=bp STUB_GEN_CARDS_ON=1 \
     STUB_GEN_MTP_REC=1 -- 6 6@place=a oursmtp:6 oursmtp:6@place=a
   if [ "$RC" != 0 ]; then
     fail twocard-place-mtp "rc $RC, want 0" "$L"
@@ -1156,8 +1250,9 @@ PY
     pass twocard-nocards
   fi
   # The dry run: each ours arm's --place, the reference's CUDA_VISIBLE_DEVICES, the precheck, the placements.
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/twocard-place-dry.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 "${TC[@]}" BLOOMERY_GEN_PLACE=bp -- 6 6@place=a lcpp27752:6
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 "${TC[@]}" BLOOMERY_GEN_PLACE=bp -- 6 6@place=a lcpp27752:6
   if [ "$RC" != 0 ]; then
     fail twocard-place-dry "rc $RC, want 0" "$L"
   elif want twocard-place-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place bp --time $' &&
@@ -1172,9 +1267,10 @@ PY
   # rounds (2 · 3 · 1000 / 132 = 45.45 tok/s): 45.45 / 30.30 = 1.5000 in each round.
   RW=BLOOMERY_RESIDENCY=mid-p0-s1
   SL=ours@BLOOMERY_GEN_SLOTS=2,$RW TW=ours@$RW
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/slots.log
   : > "$tmp/tmp/stub-gen-slots"
-  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- "6@$RW" "6@BLOOMERY_GEN_SLOTS=2,$RW"
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- "6@$RW" "6@BLOOMERY_GEN_SLOTS=2,$RW"
   if [ "$RC" != 0 ]; then
     fail slots "rc $RC, want 0" "$L"
   elif [ "$(paste -sd' ' "$tmp/tmp/stub-gen-slots")" != "slots=none depth=6 slots=2 depth=12 slots=2 depth=12 slots=none depth=6" ]; then
@@ -1191,8 +1287,9 @@ PY
   fi
   # The residency off (generate_glm5next's unset): no residency record, no pass for the residency clause to read,
   # so the row stands on its time pass records alone.
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/slots-res-off.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 6@BLOOMERY_GEN_SLOTS=2
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 6@BLOOMERY_GEN_SLOTS=2
   if [ "$RC" != 0 ]; then
     fail slots-res-off "rc $RC, want 0" "$L"
   elif want slots-res-off "$L" 1 "^ROW r1 ours@BLOOMERY_GEN_SLOTS=2 d=6 n=4 ctx=2048 \\| tok/s\\(aggregate\\) 45\\.45 @ n=2·3, depth 6, A6000 \\(stub\\) \\| place a card_experts 2627 host_experts 9469 \\| prompt ids 50000\\.\\.50011 \\| slots 2 \\| tok/s\\(per stream, mean\\) 22\\.73 \\| p50 44\\.0000 ms/pass \\| mean 44\\.0000 ms/pass \\| .*\\| pp_tok/s 60\\.00 \\(n=6, passes=1, kind=batch\\) \\| " &&
@@ -1231,8 +1328,9 @@ PY
     pass slots-past
   fi
   # The dry run: the aggregate arm's facts and its command line, its N·D ids under its variables.
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/slots-dry.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 BLOOMERY_TIMING_GPU="$GPU_A" -- "6@$RW" "6@BLOOMERY_GEN_SLOTS=2,$RW"
+  stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 BLOOMERY_TIMING_GPU="$GPU_A" -- "6@$RW" "6@BLOOMERY_GEN_SLOTS=2,$RW"
   if [ "$RC" != 0 ]; then
     fail slots-dry "rc $RC, want 0" "$L"
   elif want slots-dry "$L" 1 "^\\[dry\\] 6@BLOOMERY_GEN_SLOTS=2,$RW: slots=2 feed=12 twin=$TW$" &&
@@ -1241,8 +1339,51 @@ PY
     want slots-dry "$L" 1 "^\\[dry\\]     timeout --kill-after=10 60 env $RW target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\\.\\.50005> -n 4 --ctx 2048 --place a --time $"; then
     pass slots-dry
   fi
+  # The derived C through a run (2026-10-12; the cases above are dry): ours:4096 at C 4352 (4100 rounded up), BLOOMERY_GEN_CTX
+  # unset. The stub generate logs the --ctx it is given: one run, one line `ctx=4352 depth=4096`; the row names ctx=4352,
+  # and the runner's load-record check holds against the arm's own C (the stub's load line names the --ctx it got), a load
+  # record naming another ctx is a FAIL row naming both. The box's prose file must hold the 54096 ids the arm feeds.
+  if [ "$(wc -l < "$PROSE_SRC")" -ge 54096 ]; then
+    L=$tmp/ctx-derived-run.log
+    : > "$tmp/tmp/stub-gen-ctx"
+    stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- ours:4096
+    cp "$tmp/tmp/stub-gen-ctx" "$tmp/ctx-derived-run-ctx.txt"
+    L2=$tmp/ctx-derived-load.log
+    RC1=$RC
+    stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_LOAD_CTX=4096 -- ours:4096
+    if [ "$RC1" != 0 ] || [ "$RC" != 1 ]; then
+      fail ctx-derived-run "rc $RC1 (the run) and $RC (a load record naming ctx 4096), want 0 and 1" "$L"
+    elif want ctx-derived-run "$L" 1 '^ROW r1 ours d=4096 n=4 ctx=4352 \| tok/s\(mean\) 30\.30 @ n=4, depth 4096, A6000 \(stub\) \| .*\| prompt ids 50000\.\.54095 \| ' &&
+      want ctx-derived-run "$L" 0 '^(FAIL|WARMUP) ' &&
+      want ctx-derived-run "$tmp/ctx-derived-run-ctx.txt" 1 '^draft=none ctx=4352 depth=4096$' &&
+      want ctx-derived-run "$tmp/ctx-derived-run-ctx.txt" 1 '.' &&
+      want ctx-derived-run "$L2" 1 "^FAIL r1 ours d=4096 rc=0 \| its load record names ctx=4096, and the runner passed --ctx 4352 \(D \+ N rounded up to 256, oursmtp D \+ N \+ 1\) \| "; then
+      pass ctx-derived-run
+    fi
+    # The server arms at the derived C: lcpp27754srv:4096 and lcpp27754srvpp:4096 take ours' C at that D, -c 4352 on their
+    # command lines and in their rows (the srvpp arm's P too: D + N rounded, not P + 1), their n_ctx check held against it;
+    # oursmtp:4092 runs at its own 4352 (the same D + N + 1 rounding the dry case pins).
+    L=$tmp/ctx-derived-srv.log
+    : > "$tmp/tmp/stub-srv-argv"
+    : > "$tmp/tmp/stub-gen-ctx"
+    stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 -- ours:4096 oursmtp:4092 lcpp27754srv:4096 lcpp27754srvpp:4096
+    cp "$tmp/tmp/stub-gen-ctx" "$tmp/ctx-derived-srv-ctx.txt"
+    if [ "$RC" != 0 ]; then
+      fail ctx-derived-srv "rc $RC, want 0" "$L"
+    elif want ctx-derived-srv "$L" 1 '^ROW r1 oursmtp d=4092 n=4 ctx=4352 \| ' &&
+      want ctx-derived-srv "$L" 1 '^ROW r1 lcpp27754srv d=4096 n=4 \| .*\| -c 4352 \| prompt_n 4096 ' &&
+      want ctx-derived-srv "$L" 1 '^ROW r1 lcpp27754srvpp p=4096 n=0 \| .*\| -c 4352 \| ub 512 b 2048 ' &&
+      want ctx-derived-srv "$L" 0 '^(FAIL|WARMUP) ' &&
+      want "ctx-derived-srv ctx" "$tmp/ctx-derived-srv-ctx.txt" 1 '^draft=none ctx=4352 depth=4096$' &&
+      want "ctx-derived-srv ctx" "$tmp/ctx-derived-srv-ctx.txt" 1 '^draft=mtp ctx=4352 depth=4092$' &&
+      want "ctx-derived-srv argv" "$tmp/tmp/stub-srv-argv" 2 ' -np 1 -ctxcp 0 --cache-ram 0 -c 4352 --host 127\.0\.0\.1 --port 0$'; then
+      pass ctx-derived-srv
+    fi
+  else
+    echo "skip ctx-derived-run, ctx-derived-srv: $PROSE_SRC holds fewer than the 54096 ids a depth-4096 arm feeds"
+  fi
 else
-  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none, lever-levers, twocard-place, twocard-place-mtp, twocard-place-order, twocard-place-3090, twocard-nocards, twocard-place-dry, slots, slots-res-off, slots-pos, slots-leak, slots-none, slots-res-step, slots-past and slots-dry: no prose ids at $PROSE_SRC (the profile pins their sha256)"
+  echo "skip ours-timed, cold-retry, ctx-derived-run, ctx-derived-srv, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none, lever-levers, twocard-place, twocard-place-mtp, twocard-place-order, twocard-place-3090, twocard-nocards, twocard-place-dry, slots, slots-res-off, slots-pos, slots-leak, slots-none, slots-res-step, slots-past and slots-dry: no prose ids at $PROSE_SRC (the profile pins their sha256)"
 fi
 
 # same_view: a dry run less the lines this runner changes on purpose (dry-same).
@@ -1253,13 +1394,14 @@ same_view() {
 if [ -n "$BASE" ]; then
   SAME_ARMS=(6 lcpp27752:6 lcpp27754:6 lcpp27752pp:4 lcpp27754pp:4 lcpp27752pp8:4 lcpp27754pp4096:4 lcpp27752srv:6 lcpp27754srv:6 lcpp27752mtp:6 lcpp27754mtp:6 exl3:256 exl3pp:256)
   cp "$BASE" "$T/tools/ref/depth-glm5next-base.sh"
+  # 2026-10-12: the default C is derived per arm now; this case pins the fixed-C path it was written against.
   L=$tmp/dry-same-base.log L2=$tmp/dry-same.log
   # The base runner's server arms read four profile strings this profile no longer holds (their lines are
   # left out of the comparison): given here, so the base runs.
-  RUNNER_FILE=tools/ref/depth-glm5next-base.sh stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_DRY=1 \
+  RUNNER_FILE=tools/ref/depth-glm5next-base.sh stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=2 BLOOMERY_DRY=1 \
     LCPP27752_SRV_FLAGS=base LCPP27754_SRV_FLAGS=base LCPP27752_MTP_FLAGS=base LCPP27754_MTP_FLAGS=base -- "${SAME_ARMS[@]}"
   RC1=$RC
-  stub_run "$L2" BLOOMERY_AB_ROUNDS=2 BLOOMERY_DRY=1 -- "${SAME_ARMS[@]}"
+  stub_run "$L2" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=2 BLOOMERY_DRY=1 -- "${SAME_ARMS[@]}"
   if [ "$RC1" != 0 ] || [ "$RC" != 0 ]; then
     fail dry-same "rc $RC1 (base) and $RC (tested), want 0 and 0" "$L2"
   elif ! diff <(same_view < "$L") <(same_view < "$L2") > "$tmp/dry-same.diff"; then
