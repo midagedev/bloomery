@@ -20,8 +20,10 @@ condition: one lease, 2 rounds; every ours row prints an mtp summary with propos
   equals the plain run's of the same 512 ids (the functional run on the 3090 before the lease prints both; (w)
   holds it on the set); no row carries [cpu-busy], [other-busy] or [cold]; the lcpp27754mtp arm in the same lease;
   the full output to a file first. Command: BLOOMERY_DECODE_N=96 BLOOMERY_AB_ROUNDS=2
-  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmwire-mtp.card BLOOMERY_DRAFT=mtp'
+  BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2048 BLOOMERY_LEASE_CARD=docs/cards/glmwire-mtp.card BLOOMERY_DRAFT=mtp'
   just depth-gpu-glm5next 512 lcpp27754mtp:512 > <log> 2>&1
+# 2026-10-12: written against the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX
+# derives C per arm, so its command pins BLOOMERY_GEN_CTX=2048 to keep the card's C.
 decide-in: land glmwire; the MTP row goes to rig-log beside the plain row; the accept-time chain overlap (the
   next window's row 0 under the chain, -1 to -2.5 ms [derived]) is the next lever
 decide-below: take the V2/S1 probe (docs/cards/glmpair-probe.card) if it has not sat; if it has and sits in its

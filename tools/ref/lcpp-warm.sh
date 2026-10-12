@@ -70,11 +70,12 @@
 # Context (docs/fair-measure.md 1.5). The server's -c is our arm's context. A runner states its rule by
 # defining srv_ctx_of <arm index> <n_predict> (the -c of that server arm) and SRV_CTX_SRC (where the value
 # comes from, printed on the dry line and in a FAIL row): depth-ds41.sh the plan's ctx_max, which
-# generate_ds41 --plan prints before any load; depth-qwen3moe.sh ours' --ctx rule at the arm's depth;
-# depth-glm5next.sh its --ctx C. Without one the -c is lcpp_srv_ctx's. A server arm whose prompt ids +
-# n_predict + 1 do not fit that -c is refused before the lease; a server whose log names another n_ctx, or
-# none, is a FAIL row; a server that exits before it answers names the -c and the log's allocation
-# failure (a -c the card's memory cannot hold fails there, by name).
+# generate_ds41 --plan prints before any load; depth-qwen3moe.sh ours' --ctx rule at the arm's depth.
+# depth-glm5next.sh defines neither: it hands lcpp_srv_cmd each server arm's A_CTX itself (ours' C at that D, D+N
+# rounded up to 256, or BLOOMERY_GEN_CTX). Without either the -c is lcpp_srv_ctx's. A server arm whose prompt ids
+# + n_predict + 1 do not fit that -c is refused before the lease; a server whose log names another n_ctx, or none,
+# is a FAIL row; a server that exits before it answers names the -c and the log's allocation failure (a -c the
+# card's memory cannot hold fails there, by name).
 #
 # Per-arm flags. A server engine word takes flags of its own after its name, each once and in any order,
 # so no value with a space crosses tools/box.sh's BLOOMERY_BOX_ENV: `+t<N>` sets -t N, `+nopo<0|1>` -nopo,

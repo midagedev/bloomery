@@ -59,8 +59,10 @@
 #   the copy stream; NVMe 0 when the host set is resident (the preheat), and the early excess's suspect when not.
 #
 # Sitting: the lead's, after the go, one lease run of 4 rounds:
-#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmslots-res.card' just depth-gpu-glm5next \
-#     6@BLOOMERY_RESIDENCY=mid-p0-s1 6@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=mid-p0-s1 > <log> 2>&1
+#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2048 BLOOMERY_LEASE_CARD=docs/cards/glmslots-res.card' \
+#     just depth-gpu-glm5next 6@BLOOMERY_RESIDENCY=mid-p0-s1 6@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=mid-p0-s1 > <log> 2>&1
+# 2026-10-12: written against the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX
+# derives C per arm, so its command pins BLOOMERY_GEN_CTX=2048 to keep the card's C.
 # The verdict reads `ratio slots d=6 ours@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=mid-p0-s1/ours@BLOOMERY_RESIDENCY=
 # mid-p0-s1`'s per-round list (python3 tools/ref/card.py verdict docs/cards/glmslots-res.card <the list>): the
 # 2-slot arm is the changed one. Check: python3 tools/ref/card.py check docs/cards/glmslots-res.card --rounds 4.

@@ -41,8 +41,10 @@
 #   with the ratio.
 #
 # Sitting: the lead's, after the go, as two lease runs of 2 rounds each:
-#   BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmslots-ab.card' just depth-gpu-glm5next \
-#     6 6@BLOOMERY_GEN_SLOTS=2 > <log> 2>&1
+#   BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2048 BLOOMERY_LEASE_CARD=docs/cards/glmslots-ab.card' \
+#     just depth-gpu-glm5next 6 6@BLOOMERY_GEN_SLOTS=2 > <log> 2>&1
+# 2026-10-12: written against the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX
+# derives C per arm, so its command pins BLOOMERY_GEN_CTX=2048 to keep the card's C.
 # The runner reads the 2-slot arm as the aggregate row (`ours@BLOOMERY_GEN_SLOTS=2`, fed GLM_PROSE ids 50000..50011,
 # slot 0 the twin's 6) and prints `ratio slots d=6 ours@BLOOMERY_GEN_SLOTS=2/ours`. Check at that count:
 # python3 tools/ref/card.py check docs/cards/glmslots-ab.card --rounds 2 (±2.6 % at 2 rounds; the two runs' rounds
