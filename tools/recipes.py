@@ -958,6 +958,35 @@ def _kind_of(kinds: list[str]) -> str:
     raise RecipeError(f"unknown cargo target kind {kinds}")
 
 
+# What `Tree.memo` keeps for the process: (root, key) -> (value, what the computation saw). The saw-map holds
+# ("r", rel) -> (the file's text, its stat identity or None), ("f", rel) / ("d", rel) -> whether the path is a file /
+# a directory, each as the run met it; a stored value is used again only while every entry still holds.
+_MEMO: dict[tuple, tuple[object, dict[tuple[str, str], object]]] = {}
+_TEXTS: dict[str, str] = {}  # one copy of each distinct file text, so entries that saw the same file share it
+
+
+def _read_text(path: str) -> str:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def _read_seen(path: str) -> tuple[str, tuple | None]:
+    """(text, the file's `HashCache.ident` after the read) — None for a file changed within `HashCache.RACY_NS`, whose
+    next write may land inside the same timestamp: such a file is compared by its text, never by its stat."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+        st = os.fstat(fh.fileno())
+    if max(st.st_mtime_ns, st.st_ctime_ns) > time.time_ns() - HashCache.RACY_NS:
+        return text, None
+    return text, HashCache.ident(st)
+
+
+def _copy_module_tree(w: ModuleTree) -> ModuleTree:
+    """`w` with its own containers: a cached walk is handed to each Tree as if it had walked itself, and a caller
+    that edits what it got must not edit another Tree's."""
+    return ModuleTree(set(w.files), list(w.literals), set(w.test_files), list(w.test_literals), dict(w.mods), dict(w.test_mods))
+
+
 class Tree:
     """One checkout of the repository: its packages and the files each target reads."""
 
@@ -1005,20 +1034,80 @@ class Tree:
         # (`_resolve_literals`); a .rs outside them (an excluded crate) stays an input.
         self.pkg_dirs = tuple(sorted(p.dir + "/" for p in self.packages.values() if p.dir not in ("", ".")))
         self._walk_cache: dict[tuple[str, frozenset[str] | None], ModuleTree] = {}
+        self._saw: list[dict[tuple[str, str], object]] = []  # the open `memo` runs, innermost last
         self.unresolved: list[str] = []
         self.depinfo: dict[str, tuple[set[str], float]] = {}  # bin name -> (files, mtime)
 
     # ---------------- file walk ----------------
 
     def exists(self, rel: str) -> bool:
-        return os.path.isfile(os.path.join(self.root, rel))
+        ok = os.path.isfile(os.path.join(self.root, rel))
+        if self._saw:
+            self._saw[-1].setdefault(("f", rel), ok)
+        return ok
 
     def isdir(self, rel: str) -> bool:
-        return os.path.isdir(os.path.join(self.root, rel))
+        ok = os.path.isdir(os.path.join(self.root, rel))
+        if self._saw:
+            self._saw[-1].setdefault(("d", rel), ok)
+        return ok
 
     def read(self, rel: str) -> str:
-        with open(os.path.join(self.root, rel), encoding="utf-8", errors="replace") as fh:
-            return fh.read()
+        path = os.path.join(self.root, rel)
+        if not self._saw or ("r", rel) in self._saw[-1]:
+            return _read_text(path)
+        text, ident = _read_seen(path)
+        self._saw[-1][("r", rel)] = (_TEXTS.setdefault(text, text), ident)
+        return text
+
+    def memo(self, key: tuple, compute: Callable[[], object]) -> tuple[object, bool]:
+        """(`compute()`, whether it came from an earlier run). `compute` is a function of `key` and of the files
+        it looks at through `read`, `exists` and `isdir`; its value is kept for the process, shared by every Tree
+        on this root, and used again while each of those files reads and each of those paths probes as it did
+        in the run that made it: a hit costs one stat per file seen (a read of a file changed within two seconds
+        of the run, as `HashCache` holds), never the parse. A file written between two Trees (a self-test case
+        that edits a scratch copy) makes the entries that saw it miss, so no site clears anything. The value is
+        shared: the caller copies what it hands on, and `compute` reads no Tree state but the files."""
+        full = (self.root, *key)
+        hit = _MEMO.get(full)
+        if hit is not None and self._holds(hit[1]):
+            self._note(hit[1])
+            return hit[0], True
+        saw: dict[tuple[str, str], object] = {}
+        self._saw.append(saw)
+        try:
+            value = compute()
+        finally:
+            self._saw.pop()
+        self._note(saw)
+        _MEMO[full] = (value, saw)
+        return value, False
+
+    def _note(self, saw: dict[tuple[str, str], object]) -> None:
+        """An enclosing `memo` run depends on everything a nested one saw."""
+        if self._saw:
+            for k, v in saw.items():
+                self._saw[-1].setdefault(k, v)
+
+    def _holds(self, saw: dict[tuple[str, str], object]) -> bool:
+        for (kind, rel), was in saw.items():
+            path = os.path.join(self.root, rel)
+            if kind == "f":
+                if os.path.isfile(path) != was:
+                    return False
+            elif kind == "d":
+                if os.path.isdir(path) != was:
+                    return False
+            else:
+                text, ident = was
+                try:
+                    if ident is not None and HashCache.ident(os.stat(path)) == ident:
+                        continue
+                    if _read_text(path) != text:
+                        return False
+                except OSError:
+                    return False
+        return True
 
     _MOD = re.compile(r"^(\s*)(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
     _INLINE = re.compile(r"^(\s*)(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$")
@@ -1229,13 +1318,26 @@ class Tree:
             return None, "", f"{rel}: mod {name} (neither {cand[0]} nor {cand[1]})"
         return hit, os.path.dirname(hit) if hit.endswith("mod.rs") else hit[: -len(".rs")], ""
 
+    def _walk_shared(self, src: str, features: frozenset[str] | None) -> ModuleTree:
+        """`walk`, from the process's memo when the files it read are as they were. The unresolved names the
+        walk adds to this Tree are stored with it and added again on a hit."""
+
+        def walked() -> tuple[ModuleTree, tuple[str, ...]]:
+            n = len(self.unresolved)
+            return self.walk(src, features), tuple(self.unresolved[n:])
+
+        (w, unresolved), hit = self.memo(("walk", src, features), walked)
+        if hit:
+            self.unresolved.extend(unresolved)
+        return _copy_module_tree(w)
+
     def tree_of(self, src: str, test: bool = False, features: frozenset[str] | None = None) -> tuple[set[str], list[tuple[str, str]]]:
         """`src`'s module tree as one build of it sees it: a test build (`test`) with its test-only
         modules, any other build without them; with `features`, without the modules those features
         switch off (`walk`)."""
         key = (src, features)
         if key not in self._walk_cache:
-            self._walk_cache[key] = self.walk(src, features)
+            self._walk_cache[key] = self._walk_shared(src, features)
         w = self._walk_cache[key]
         if test:
             return w.files | w.test_files, w.literals + w.test_literals
@@ -1549,10 +1651,13 @@ class Graph:
     def script_closure(self, rel: str) -> dict[str, str]:
         """Repository files a script names, transitively (comments skipped), and as `dir/` each tree
         directory a shell script walks with `find`."""
-        if rel in self._script_cache:
-            return self._script_cache[rel]
+        if rel not in self._script_cache:
+            closure, _ = self.tree.memo(("script", rel), lambda: self._script_closure(rel))
+            self._script_cache[rel] = dict(closure)
+        return self._script_cache[rel]
+
+    def _script_closure(self, rel: str) -> dict[str, str]:
         out: dict[str, str] = {}
-        self._script_cache[rel] = out
         stack = [rel]
         seen: set[str] = set()
         while stack:
@@ -7465,6 +7570,102 @@ def side_at(root: str, meta: dict) -> Side:
     return Side(tree, recipes, Graph(tree, recipes))
 
 
+def memo_self_test(expect) -> None:
+    """`Tree.memo` on a scratch root: a second Tree gets the first one's walk and script closure without
+    running them again, a file rewritten to the same size or a path that appears between two Trees makes
+    exactly the entries that saw it miss, and a caller that edits what it got edits nobody else's."""
+    with tempfile.TemporaryDirectory(prefix="recipes-memo-") as tmp:
+
+        def write(rel: str, text: str) -> None:
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        def fresh() -> Tree:
+            return Tree(tmp, {"workspace_root": tmp, "workspace_members": [], "packages": []})
+
+        write("lib.rs", "mod a;\nmod gone;\n")
+        write("a.rs", "")
+        write("tools/s.sh", "bash tools/t.sh\n")
+        write("tools/t.sh", "")
+        calls: list[str] = []
+
+        def probe(t: Tree, rel: str) -> tuple[object, bool]:
+            def compute() -> str:
+                calls.append(rel)
+                return t.read(rel)
+
+            return t.memo(("probe", rel), compute)
+
+        got = [probe(fresh(), "lib.rs"), probe(fresh(), "lib.rs")]
+        expect([h for _, h in got] == [False, True] and len(calls) == 1, f"memo: a second Tree reran the computation: hits {[h for _, h in got]}, runs {len(calls)}")
+        write("lib.rs", "mod b;\nmod gone;\n")  # the same size as before
+        write("b.rs", "")
+        got = probe(fresh(), "lib.rs")
+        expect(not got[1] and got[0] == "mod b;\nmod gone;\n", f"memo: a file rewritten to the same size was served from the memo: {got}")
+
+        # a file settled for the racy window is kept by its stat, so a hit does not read it; a different size
+        # misses. One written a moment ago (here: dated ahead) has no stat identity and is compared by its text.
+        settled = HashCache.RACY_NS
+        HashCache.RACY_NS = 0
+        try:
+            write("old.rs", "// one\n")
+            calls.clear()
+            got = [probe(fresh(), "old.rs"), probe(fresh(), "old.rs")]
+            expect([h for _, h in got] == [False, True] and len(calls) == 1, f"memo: a settled file was read again: hits {[h for _, h in got]}, runs {len(calls)}")
+            expect(_MEMO[(fresh().root, "probe", "old.rs")][1][("r", "old.rs")][1] is not None, "memo: a settled file kept no stat identity")
+            write("old.rs", "// longer\n")
+            got = probe(fresh(), "old.rs")
+            expect(not got[1] and got[0] == "// longer\n", f"memo: a settled file rewritten to another size was served from the memo: {got}")
+        finally:
+            HashCache.RACY_NS = settled
+        write("new.rs", "// one\n")
+        ahead = time.time_ns() + 3600 * 10**9
+        os.utime(os.path.join(tmp, "new.rs"), ns=(ahead, ahead))
+        probe(fresh(), "new.rs")
+        expect(_MEMO[(fresh().root, "probe", "new.rs")][1][("r", "new.rs")][1] is None, "memo: a file changed within the racy window kept a stat identity")
+
+        t = fresh()
+        value, _ = t.memo(("outer",), lambda: probe(t, "a.rs")[0])
+        write("a.rs", "// edited\n")
+        t = fresh()
+        value2, hit = t.memo(("outer",), lambda: probe(t, "a.rs")[0])
+        expect(value == "" and value2 == "// edited\n" and not hit, f"memo: a memo that read through another missed its change: {value!r} {value2!r} hit={hit}")
+
+        t1 = fresh()
+        files1 = set(t1.tree_of("lib.rs")[0])
+        expect(files1 == {"lib.rs", "b.rs"} and len(t1.unresolved) == 1, f"memo: the first walk gave {sorted(files1)}, unresolved {t1.unresolved}")
+        t2 = fresh()
+        files2, _ = t2.tree_of("lib.rs")
+        expect(files2 == files1 and t2.unresolved == t1.unresolved, f"memo: a second Tree's walk gave {sorted(files2)}, unresolved {t2.unresolved}")
+        files2.add("scribble")
+        t2.unresolved.clear()
+        t3 = fresh()
+        files3, _ = t3.tree_of("lib.rs")
+        expect(files3 == files1 and len(t3.unresolved) == 1, f"memo: a caller's edit of a walk reached another Tree: {sorted(files3)}, unresolved {t3.unresolved}")
+        write("gone.rs", "")  # the module that was missing appears
+        t4 = fresh()
+        files4, _ = t4.tree_of("lib.rs")
+        expect(files4 == {"lib.rs", "b.rs", "gone.rs"} and not t4.unresolved, f"memo: a path that appeared is not walked: {sorted(files4)}, unresolved {t4.unresolved}")
+
+        g1 = Graph(fresh(), {})
+        c1 = g1.script_closure("tools/s.sh")
+        expect(c1 == {"tools/s.sh": "script", "tools/t.sh": "script tools/s.sh"}, f"memo: script closure {c1}")
+        c1.pop("tools/t.sh")
+        c2 = Graph(fresh(), {}).script_closure("tools/s.sh")
+        expect(set(c2) == {"tools/s.sh", "tools/t.sh"}, f"memo: a caller's edit of a script closure reached another Graph: {c2}")
+        write("tools/s.sh", "bash tools/u.sh\n")  # the same size as before
+        write("tools/u.sh", "")
+        c3 = Graph(fresh(), {}).script_closure("tools/s.sh")
+        expect(set(c3) == {"tools/s.sh", "tools/u.sh"}, f"memo: a script rewritten to the same size kept its old closure: {c3}")
+        write("tools/w.sh", 'find "$ROOT/tools/dd" -name x\n')
+        c4 = Graph(fresh(), {}).script_closure("tools/w.sh")
+        expect(set(c4) == {"tools/w.sh"}, f"memo: script closure of a find over a missing directory {c4}")
+        os.makedirs(os.path.join(tmp, "tools/dd"))  # the directory the script walks appears
+        c5 = Graph(fresh(), {}).script_closure("tools/w.sh")
+        expect(set(c5) == {"tools/w.sh", "tools/dd/"}, f"memo: a directory that appeared is not in the script closure: {c5}")
+
+
 def static_self_test(expect) -> None:
     """static_problems on a synthetic workspace: package g with bins x (no feature) and y (`fy`). A static
     recipe without `fy` names y; enabling it by package path clears it; a recipe that is not one workspace
@@ -10242,6 +10443,7 @@ def self_test(serial: bool = False) -> int:
         root_manifest_self_test(expect)  # the root Cargo.toml read by table
         range_base_self_test(expect)  # A..B read against the merge base
         module_gate_self_test(expect)  # a module gated by a cargo feature
+        memo_self_test(expect)  # the process-wide memo of walks and script closures
         static_self_test(expect)  # the static tier compiles every feature-gated bin
         ledger_self_test(expect)  # the green ledger's key, but for the key itself
         manifest_rows_self_test(expect)
