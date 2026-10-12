@@ -680,17 +680,14 @@ impl CardTiles {
 
 /// Layer `l`'s card slots over a prompt batch's `t` tokens into the card
 /// sums `io.acc`: every slot's place from the slot map in one launch
-/// (`ds41_ffn_places`, the handoff's rule), the rows' q8_1 form, then the
-/// card slots by tile items — the table by expert (`grouped_buckets`) and
-/// its tiles (`grouped_tiles`, [`TileScratch::enqueue_table`]), the entries'
-/// planes gathered
-/// (`kq_card_gather`), the gate·up by tiles, the q8_1 of its rows by entry
-/// (`q8_1_quantize_ord`) and the down by tiles, which scatters each entry's
-/// rows to its slot — and the card sums (`ds41_ffn_card_acc_8`). Each slot
-/// and token is what the one-token launches write for it (the grouped
-/// entries are the `_sel`s' bit for bit), the host's slots left alone; each
-/// weight row is read once for up to eight of an expert's slots. Refused by
-/// name on a layer without card experts.
+/// (`ds41_ffn_places`, the handoff's rule), then the card slots' downs by
+/// slot — on a layer [`card_tiles_run`] names, by tile items
+/// ([`card_tiles`]: each weight row read once for up to eight of an expert's
+/// slots), on any other, on the card leg in runs of its buffers' tokens
+/// ([`card_leg_rows`]) — and the card sums (`ds41_ffn_card_acc_8`). Each
+/// slot and token is what the one-token launches write for it (the grouped
+/// entries are the `_sel`s' bit for bit, the leg runs the `_sel`s), the
+/// host's slots left alone. Refused by name on a layer without card experts.
 pub(crate) fn card_rows(
     gpu: &Gpu,
     w: &Weights,
@@ -748,9 +745,12 @@ pub(crate) fn card_rows(
 }
 
 /// [`card_rows`]'s card slots on the grouped tile kernels (a layer
-/// [`card_tiles_run`] names): the rows' q8_1 form, the table and its tiles,
-/// the entries' planes, the gate·up by tiles, its rows' q8_1 by entry and the
-/// down by tiles into `tl`'s downs by slot.
+/// [`card_tiles_run`] names): the rows' q8_1 form, the table by expert
+/// (`grouped_buckets`) and its tiles (`grouped_tiles`,
+/// [`TileScratch::enqueue_table`]), the entries' planes gathered
+/// (`kq_card_gather`), the gate·up by tiles, the q8_1 of its rows by entry
+/// (`q8_1_quantize_ord`) and the down by tiles, which scatters each entry's
+/// rows to its slot in `tl`'s downs.
 #[allow(clippy::too_many_arguments)]
 fn card_tiles(
     gpu: &Gpu,
