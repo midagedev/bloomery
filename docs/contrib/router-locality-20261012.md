@@ -25,6 +25,10 @@ Both mean LRU-64 rates exceed the issue's 60% criterion. Layer 0 is much less lo
 
 A static top-32 list learned from all prose tokens serves 17.2% of code selections. A list learned from all code tokens serves 14.0% of prose selections. These cross-genre evaluations use different learning and evaluation corpora; they are separate from the within-genre held-out rows above. Resetting LRU at each context changes the aggregate results by less than 0.3 percentage points.
 
+## Decision
+
+Issue #31 gates on LRU-64: 60% or more adopts the replay as the input to adaptive residency, and under 40% drops the premise. The all-layer means are 67.7% (prose) and 73.3% (code), so both corpora clear 60% and the premise stands. #31 does not say whether the thresholds read the mean or each layer. Per layer, layer 0 is 27.8% (prose) and 31.8% (code), under 40% on both, and 11 prose layers and 3 code layers are under 60%. The held-out static top-32 rates, 35.8% (prose) and 44.1% (code), are not a rate #31 gates on. Its prior for static top-32 was about 10%, so the measured rates are about 3.6 and 4.4 times the prior (derived), and they are below the LRU-64 rate on every layer row of both corpora. The collection card's 0..100% band was written before the measurement and carries none of these thresholds; it is unchanged.
+
 ## Schedule sensitivity and repeatability
 
 Both schedules process the same first 512 input tokens, with independent 2048-token contexts and the same CPU collector. Expert sets differ under floating-point schedule changes; agreement and locality are separate quantities.
