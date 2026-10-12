@@ -1806,6 +1806,8 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
 # The build takes the deepseek41 feature, not the qwen family's plain gpu:
 # the server surface it links (gpu-gates' bind, serve_client; the serve and sampler crates) sits behind
 # that feature today — `just affected` and the recipes.py pins scope it so.
+# Stays solo, reason: the host set (tools/gate-batch-resources.tsv) loads under the big-load lock, and the seat's unset residency pick reads MemAvailable against the churn pool, so a neighbour's load moves it.
+# Never solo-real: the generate call and the two main servers pass `--place gate` (the card named 3090), the unset-place servers plan on the one card in view, and the gate plans on RTX_3090 directly (no shared/gate_card.rs); its gpu-gate.sh calls are 3090-only, and solo-real balances on `any`.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-serve:
