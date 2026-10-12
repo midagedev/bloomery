@@ -1,0 +1,119 @@
+# The MTP draft at a fixed four-row verify against the width chooser and plain decode, one forced id stream, 16 GiB card budget.
+# Follows pageddraft16-forced.card (same shape, levers and stream). Its run, run16.log (the session scratchpad's abrun/; cited below by
+# line), measured the chooser at +5.6 % +- 3.5 % over off, E(4) falling 1.816 -> 1.391 and ms a pass 159 -> 131 across the six rounds.
+# This card asks what the fixed four-row pass costs and keeps (the card's original term), to say whether the chooser's narrowing is a defect.
+#
+# Lever words. BLOOMERY_MTP_WIDTH (registry.rs:460-475) takes `cost` (unset: the chooser, runtime::width) or `fixed`: every proposal
+# is verified whole, the draft's four-row window (row 0 + 3 ids; record doc, MTP_SUMMARY: "the draft's whole width on every pass under
+# fixed"). BLOOMERY_MTP_HEAD_ROWS (registry.rs:390) is the head's vocabulary row list (unset = the shipped 76,000-row list, the load line's
+# `head=rows=76000`), not the proposal's length; no arm sets it. The load line prints no width word (generate_qwen3moe.rs:1609 reads it
+# into the chooser's mode only), so a fixed arm is read from its `mtp summary`: widths=[0, 0, 0, N], N = passes, proposals = passes.
+# The lever is refused by name on a DRAFT=off arm (generate_qwen3moe.rs:1553): arm B carries none.
+#
+# [derived] What run16 measured, per round (mtp rows, `mtp summary` lines 1577 2326 3032 3850 4627 5510; kept[k-1] = passes that kept k rows,
+# plain steps included; widths[w-1] = passes that ran w rows; proposals = passes of 2+ rows; ms/pass = row's mean_ms x steps / passes):
+#   round  kept                widths              plain  ms/pass   | a1 = (k2+k3+k4)/(n2+n3+n4)   q2 = (k3+k4)/(n3+n4)   q3 = k4/n4
+#   r1     239 200 115  10     7 357 186  14       1 %   159.35    | .584   .625   .714
+#   r2     277 242  69  14    62 424  99  17      10 %   149.79    | .602   .716   .824
+#   r3     397 165  67  24   242 255 126  30      37 %   140.00    | .623   .583   .800
+#   r4     452 124  56  39   318 171  90  92      47 %   138.86    | .620   .522   .424
+#   r5     535 118  32  39   409 191  22 102      56 %   130.38    | .600   .573   .382
+#   r6     504 186  36  10   373 287  63  13      51 %   131.39    | .639   .605   .769
+#   pooled 2404 1035 375 136  1411 1685 586 268   36 %   141.63    | .609   .598   .508
+# a1, q2, q3 are the exact fractions of the windows that ran >= 2, >= 3, 4 rows and kept >= 2, >= 3, 4. They estimate a1, a1a2, a1a2a3 only if
+# acceptance does not depend on the width a window got. It does: the chooser picks each window's width on its own profile a_i = p_i g_i
+# (width.rs header), and the data show it: q2 > a1 in r1 and r2, q3 > q2 in r1, r2, r3 and r6, where the chain's products only fall with
+# depth, so the wider windows are the ones that accept more. So E_A = 1 + a1 + q2 + q3 = 2.715 pooled
+# (2.55..3.14 by round) is a CEILING for the unselected stream (selection only adds acceptance), and the chooser's own E, 1.816 in r1, the
+# round with 1 % plain steps, is a FLOOR (a fixed pass keeps at least what any narrower window at the same position kept; assumption: the
+# walks' positions share one depth profile). E_fixed(4) = 1 + a1 + a1a2 + a1a2a3 [derived: formula] is therefore in 1.82..2.72 with
+# midpoint 2.27, and the paper cannot narrow it: this is the one term the run measures, in the A rows' `mtp E(4)` (positions / passes).
+# Cross-check, the free-text 2.058 (n71-ab16.log, the jobs scratch copy, mtp rows r1..r4 = 2.075 1.943 2.309 1.905): those rows' own
+# widths (r1 [133, 53, 233, 74]) are chooser walks with 62 % of passes at 3+ rows, not fixed-4 passes, on text the draft matches better
+# (r1 a1 = .789 by the same estimator); it sits inside 1.82..2.72 and does not narrow it. The run16-derived band is the one trusted: same
+# stream, binary and chooser.
+#
+# [derived] t_pass(4). The chooser's per-round mean pass time is linear in its mean rows a pass (w = sum n_w w / passes: 2.367 2.118 1.914
+# 1.934 1.747 1.614 against the ms/pass above): t(w) = 102.9 + 40.8 (w - 1) ms, residuals within 3.4 ms, se of the slope 4.4 and of t(4) 9.1
+# (4 df). t(4) = 225.3 +- 25.3 ms (t 2.776 x 9.1), i.e. 200..251. Marginal row: 40.8 ms = 0.43 of the plain step (t_plain 95.47 ms,
+# the six off rows 95.49 95.00 96.62 95.54 95.50 94.67, sd 0.70 %: flat, so the fall in ms/pass is the width mix, not a warming base).
+# Weak points, stated: six points extrapolated from 1.6..2.4 rows to 4; mix and round order move together; a plain pass of the mtp arm
+# (the fit's 1 row, 102.9) runs 7.4 ms over the off arm's step (the draft's walks). The old card's F + H + C + walks at four rows is
+# 158..214 ms (pageddraft16-forced.card), an F that grows 13..23 ms a row ((130..160 - 91) / 3, 91 = 53.6 fills x 1.7 ms) against the fit's 41; a four-row pass below 200 ms (a free
+# four-parameter fit reads 182.5, 183.0 at three rows: a union that saturates) is the case `decide-above` reads.
+# Resource timeline of one fixed pass [derived, the old card's split]: NVMe fills 130..160 ms and host CPU 19..38 ms (union + walks) in a
+# sum, the card's SMs 9..16 ms, PCIe and host DRAM under the fills; wall = the sum. 4 rows fill 4.0..4.6 x a plain token's misses (216..245
+# against 53.6) with no hit sharing, so a row's fills do not hide under another's; the lever that exists is the chooser's cut, not a flow change.
+#
+# [derived] Ratio against off = E_fixed(4) x t_plain / t_pass(4). Break-even E = t_pass / t_plain = 225.3 / 95.47 = 2.36 (2.10..2.63 at
+# t_pass 200..251); against the chooser's measured gain (means 11.06 / 10.47 = 1.056, lines 5526-5527) E = 2.36 x 1.056 = 2.49.
+# A row pays when its added positions over the pass's E exceed its added time over the pass's time [derived]: row 3 needs
+# a1a2 > (40.8 / 143.7) x 1.609 = 0.46, row 4 needs a1a2a3 > (40.8 / 184.5) x E(3) = 0.46 (E(3) about 2.06), against a1 = 0.58..0.61 measured
+# on the chooser's windows. A chain that decays (a2, a3 about 0.7: a1a2 0.42, a1a2a3 0.29) fails both rows. Two rows on paper give
+# E(2) x t_plain / t(2) = 1.609 x 95.47 / 143.7 = 1.069, near the chooser's measured +5.6 %.
+#   effect on tok/s [derived, one term at its edge, the others at E 2.27, t_pass 225.3]:
+#     (A - B) / B: central -3.8 %; E 1.82 -22.9 %; E 2.72 +15.3 %; t_pass 200 +8.4 %; t_pass 251 -13.5 %.
+#     (A - C) / C, C = 1.056: central -8.9 %; E 1.82 -27.0 %; E 2.72 +9.1 %; t_pass 200 +2.6 %; t_pass 251 -18.1 %.
+#   Both bands hold 0, so the lease refuses a tok/s card here (CARD_UNDER_RULER, rc 68, checked on a copy at -22.9..+15.3): the sign of the
+#   effect rides on E_fixed, which the paper cannot fix. So this card pre-registers the term the paper does fix, the verify pass wall, and
+#   the tok/s verdict reads E_fixed(4) off the same rows against the break-evens above.
+#
+# What the card predicts [derived]: passes a second of A (fixed) over C (the chooser's mix) = t_C / t_A - 1, t_C = 141.63 (mean of six per-round
+# ms/pass, line 5538; range 130.4..159.3), t_A = 225.3 +- 25.3: central -37.1 %; t_A at its edge -29.2 % (200) and -43.5 % (251); t_C at its
+# edge -29.3 % (159.3) and -42.1 % (130.4). Band = the widest single-term excursion, -43.5..-29.2. Stacked unfavourable edges (t_C 159.3,
+# t_A 200) give -20.4 %, not excluded by paper; the opposite stack (t_C 130.4, t_A 251) -48.0 %.
+#
+# Ruler: sd 7.9 % (key below) gives h = 10.2 % at 6 rounds (card.py), the band's near edge 29.2 clears it 2.9 x. The tok/s ratios A/C and A/B
+# are read from the same rows and judged against h = 3.34 % at sd 2.6 % (as the sibling card); they are not this card's prediction.
+# Arms and walls [derived from run16: witness pre 2026-10-12T18:49:44Z, post 19:14:54Z = 25.2 min = 13 arm runs (warm-up + 6 x 2), 116 s a
+# run incl. a 13 s load; r0 ran 105 s; the mtp rows' mean_ms average 90.47 ms, 92.6 s of decode, so a run carries 24 s of load, prefill and
+# witness]. A run = 117 s (mtp, off) or 126 s for the fixed arm (1024 x t_pass / E = 1024 x 225.3 / 2.27 ms = 102 s + 24 s; 100..165 s over
+# t_pass 200..251 and E 1.82..2.72):
+#   three arms A, C, B  6 rounds: 126 + 6 x (126 + 117 + 117) = 38.1 min (35.0..42.7); 8 rounds 50.1 min (46.1..56.0). Fits under 60.
+#   two arms A, C       6 rounds: 126 + 6 x (126 + 117) = 26.4 min (23.3..31.0). The card's term needs only these two; B adds the in-window
+#                       tok/s read (A/B, and C/B against run16's +5.6 %); B's t_plain was flat over six rounds, so dropping B costs the A/B verdict only.
+#   Three arms are recommended (the verdict on the chooser is a tok/s verdict). Over 30 minutes: batch it into the sitting (AGENTS.md: no
+#   approval, the predicted wall printed first).
+# command (one line from the Mac, in a tree holding this card and 81564bb7; arm order A, C, B; `just depth-gpu-qwen4exp`; the BOX_ENV
+#   string splits on spaces; place=a in each list as the sibling; B carries no width lever, refused by name on a DRAFT=off arm):
+#   BLOOMERY_AB_ROUNDS=6 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pageddraft16-fixed.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DECODE_N=1024 BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' just depth-gpu-qwen4exp prose:512@place=a,BLOOMERY_DRAFT=mtp,BLOOMERY_MTP_WIDTH=fixed,BLOOMERY_FORCE_IDS=continue,BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=8G,BLOOMERY_CARD_BUDGET=16G prose:512@place=a,BLOOMERY_DRAFT=mtp,BLOOMERY_FORCE_IDS=continue,BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=8G,BLOOMERY_CARD_BUDGET=16G prose:512@place=a,BLOOMERY_DRAFT=off,BLOOMERY_FORCE_IDS=continue,BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=8G,BLOOMERY_CARD_BUDGET=16G
+#   two arms (A, C): the same line with its third arm removed.
+#   Runner tree: BLOOMERY_FORCE_IDS and the runner's `continue` are in 81564bb7 (main after train1013b), not in this tree (grep: 0 hits in
+#   registry.rs and depth-qwen3moe.sh); the command runs in a tree that holds both that commit and this file.
+kind: ab
+question: at a fixed four-row verify on one forced id stream, how long is a pass and how many positions does it keep, against the width
+  chooser's mix of widths, so that E_fixed(4) x t_plain / t_pass(4) says whether the chooser's narrowing leaves gain on the table?
+term: verify passes a second (1000 / ms a pass, ms a pass = the row's mean_ms x steps / passes) @ n=1024, prose 512 (the corpus's first 512
+  ids, the generated ids forced to the corpus's next ones), ctx 3072, A6000, plan a (place=a in each arm), BLOOMERY_HOST_ROOM=27G
+  BLOOMERY_NVTIER_BYTES=8G BLOOMERY_CARD_BUDGET=16G BLOOMERY_RESIDENCY=off, one slot; one generate_qwen3moe, lever arms, BLOOMERY_DRAFT=mtp
+  BLOOMERY_MTP_WIDTH=fixed (first arm) against BLOOMERY_DRAFT=mtp (the chooser; unset width), (fixed - chooser) / chooser = C_r / A_r - 1 per
+  round from the paired rows' ms a pass (the runner's ratio tables list only reference engines and print nothing for lever arms, run16.log
+  lines 5528-5537, so the effect is computed by hand from the six ROW pairs); BLOOMERY_DRAFT=off rides as the third arm for the tok/s read
+unit: %
+predict: -43.5..-29.2
+rounds: 6
+sd: 7.9 % run16.log lines 1579 2328 3034 3852 4629 5512, the six chooser rows' ms a pass (159.35 149.79 140.00 138.86 130.38 131.39, mean
+  141.63, sample sd 11.2 ms) [derived]; an upper bound, the chooser's drift in width mix across the rounds, which the fixed arm's passes do
+  not have (its width never moves); the tok/s rows' sd, 2.6 % as pageddraft-decode.card carries it, is the bound for the A/C and A/B reads
+condition: one lease; one binary with its Cargo.lock current; the same BLOOMERY_FORCE_IDS=continue in every arm's list (the log's `[parse]`
+  lines show the same `<corpus>:512` value in all three) and the runner's `tokens-differ rounds:` line reads 0 of 6 (a forced trio that parts
+  is a defect and a FAIL of the run); BLOOMERY_DECODE_N=1024 in BLOOMERY_BOX_ENV (the rows' `n=` reads 1024), every arm a fresh process
+  (BLOOMERY_AB_LOAD=arm), the order rotated each round, one warm-up round discarded (a `WARMUP r0` row); no [cpu-busy], [other-busy] or [cold]
+  row, no [loop] tag, no Xid in any witness. The arms' plan lines name equal arena and nvtier budget= fields (paged= differs by the draft's
+  card bytes between the draft arms and the off arm). The fixed arm's `mtp summary` reads widths=[0, 0, 0, N] with N = passes and
+  proposals = passes (any other widths: it did not run fixed); the chooser arm's widths are mixed; the off arm's log shows `load draft=off`.
+  Read beside the ratio, from the rows: A's `mtp E(4)` and kept vector, each arm's tok/s mean, and in a three-arm run C's tok/s over B's,
+  which run16 put at +5.6 % (0.3..8.8 % by round): outside 0..9 % the window moved and A/B and A/C are void
+decide-in: t_pass(4) is the six-round fit's (200..251 ms): read E_fixed(4) from the A rows and compute E x t_plain / t_pass, t_plain from the
+  B arm of the window (run16: 95.47 ms): under E 2.36 the fixed arm loses to plain decode and under 2.49 to the chooser (the paper's central
+  2.27); both: the chooser's narrowing was right on this stream, write the row to rig-log (tok/s of all three arms, ms a pass, E(4) of both draft
+  arms, the kept vectors) and close the question. At E_fixed(4) >= 2.49 with the A rows' tok/s above C's by more than h (3.34 % at 6 rounds) the
+  chooser leaves gain on the table at width 4 although the pass is as dear as the fit says: open the mechanism round on the chooser's calibrated
+  profile (the paper's ceiling E 2.72 is the selection-biased one: the chooser's p_i-picked windows over-accept)
+decide-below: under -43.5 %, a four-row pass costs more than 251 ms: the fit's 41 ms a row is too low (fills do not share, the union grows) and
+  the fixed arm loses to both others unless E_fixed(4) is above 2.63 (the break-even against off at 251 ms; against the chooser 2.77); read fills a pass and fill_ns a fill beside the ms a
+  pass; the chooser's cut of the wide widths is confirmed and the unset draft stays on the chooser
+decide-above: above -29.2 %, a four-row pass costs under 200 ms: the pass is cheaper than the fit's line (a union that saturates: the free fit
+  read 182.5 ms at four rows), so the chooser's cost median at 4 rows may have read high; compute E_fixed(4) x t_plain / t_pass from the rows: above
+  the chooser's +5.6 % by more than h is a chooser defect candidate and opens the mechanism round (its cost medians at 3 and 4 rows against these
+  rows' ms a pass); inside h of it the chooser is right and the fit's slope was the term that moved
