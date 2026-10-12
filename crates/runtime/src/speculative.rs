@@ -36,6 +36,10 @@ pub trait Tapped: Verify {
     fn taps(&mut self, rows: usize) -> Result<&[f32], Self::Error>;
 }
 
+/// Where [`TappedPrompt::prompt_tapped`] hands its rows: the first position
+/// they hold, then one tapped row a position.
+pub type TapSink<'a, E> = &'a mut dyn FnMut(u32, &[f32]) -> Result<(), E>;
+
 /// A target whose prompt calls hand a block draft its tapped rows.
 pub trait TappedPrompt: Tapped {
     /// Tap the rows entering these layers from the next call on;
@@ -53,7 +57,7 @@ pub trait TappedPrompt: Tapped {
         &mut self,
         ids: &[u32],
         window: usize,
-        sink: &mut dyn FnMut(u32, &[f32]) -> Result<(), Self::Error>,
+        sink: TapSink<'_, Self::Error>,
     ) -> Result<u32, Self::Error>;
 }
 
