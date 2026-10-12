@@ -881,11 +881,19 @@ fn check_private(private: &[PrivateType]) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// The ids of [`ggml_type_info`]'s table that a file stores as tensors and the
+/// strict pass sizes from it: q4_0 and q4_1. Their tensors keep
+/// `ty = GgmlType::Unknown(id)`, so a reader that needs their values refuses
+/// them by name, while the file opens. q8_1 and q8_K are ggml's activation
+/// forms, which no quantizer writes to a file, and q8_K's size is ik's
+/// (mainline's block differs), so a tensor of either is still refused.
+const FILE_TABLE_IDS: [u32; 2] = [2, 3];
+
 /// The strict pass over a parsed header's tensors: every tensor must be sized
-/// by this engine's `GgmlType`, or by its entry in `private`, and its first
-/// dim must be block-aligned; then every tensor must sit inside the
-/// `len`-byte file — the placement invariant the coverage gate re-checks per
-/// tensor.
+/// by this engine's `GgmlType`, by ggml's table for the ids in
+/// [`FILE_TABLE_IDS`], or by its entry in `private`, and its first dim must be
+/// block-aligned; then every tensor must sit inside the `len`-byte file — the
+/// placement invariant the coverage gate re-checks per tensor.
 fn strict_tensors(
     raw: Vec<RawTensorInfo>,
     data_base: u64,
@@ -896,20 +904,26 @@ fn strict_tensors(
     for t in raw {
         let ty = GgmlType::from_u32(t.type_id);
         let own = private.iter().find(|p| p.id == t.type_id);
-        let blck =
-            ty.blck_size()
-                .or(own.map(|p| p.blck))
-                .ok_or_else(|| LoadError::UnsupportedType {
-                    name: t.name.clone(),
-                    ty,
-                })?;
-        let tsz =
-            ty.type_size()
-                .or(own.map(|p| p.size))
-                .ok_or_else(|| LoadError::UnsupportedType {
-                    name: t.name.clone(),
-                    ty,
-                })?;
+        let table = FILE_TABLE_IDS
+            .contains(&t.type_id)
+            .then(|| ggml_type_info(t.type_id))
+            .flatten();
+        let blck = ty
+            .blck_size()
+            .or(table.map(|(_, b, _)| b))
+            .or(own.map(|p| p.blck))
+            .ok_or_else(|| LoadError::UnsupportedType {
+                name: t.name.clone(),
+                ty,
+            })?;
+        let tsz = ty
+            .type_size()
+            .or(table.map(|(_, _, s)| s))
+            .or(own.map(|p| p.size))
+            .ok_or_else(|| LoadError::UnsupportedType {
+                name: t.name.clone(),
+                ty,
+            })?;
         if t.dims[0] % blck != 0 {
             return Err(LoadError::UnalignedRow {
                 name: t.name,
@@ -1395,6 +1409,45 @@ mod private_tests {
         };
         write_file(path, &[], &[(f, vec![1; 16]), (t, q.clone())]);
         q
+    }
+
+    /// A q4_0 or q4_1 tensor opens, sized by ggml's table and kept as
+    /// `GgmlType::Unknown(id)`; a q8_K tensor (an activation form, its size
+    /// ik's) is still refused by name.
+    #[test]
+    fn q4_0_and_q4_1_open_and_q8_k_is_refused() {
+        let d = set_dir("table");
+        for (id, bytes) in [(2u32, 72u64), (3, 80)] {
+            let p = d.join(format!("t{id}.gguf"));
+            let t = TensorDecl {
+                name: "q".to_string(),
+                dims: vec![64, 2],
+                type_id: id,
+                nbytes: bytes,
+            };
+            write_file(&p, &[], &[(t, vec![5; usize::try_from(bytes).unwrap()])]);
+            let g = Gguf::open(&p).unwrap_or_else(|e| panic!("type {id} must open: {e}"));
+            let q = g.tensor(0).unwrap();
+            assert_eq!(
+                (q.ty, q.nbytes),
+                (GgmlType::Unknown(id), bytes),
+                "type {id}"
+            );
+        }
+        let p = d.join("t15.gguf");
+        let t = TensorDecl {
+            name: "k".to_string(),
+            dims: vec![256],
+            type_id: 15,
+            nbytes: 296,
+        };
+        write_file(&p, &[], &[(t, vec![0; 296])]);
+        let r = Gguf::open(&p);
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(
+            matches!(r, Err(LoadError::UnsupportedType { ref name, .. }) if name == "k"),
+            "q8_K must be refused by the tensor's name"
+        );
     }
 
     /// A file tagged with a private id opens only through a table that lists
