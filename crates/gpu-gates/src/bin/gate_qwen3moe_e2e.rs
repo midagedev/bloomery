@@ -319,7 +319,7 @@ mod gate {
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::prompts::{
-        GreedyClass, GreedyRow, PromptRow, compare_greedy, read_greedy, read_prompts,
+        GreedyClass, GreedyRow, MARGIN_FLOOR, PromptRow, compare_greedy, read_greedy, read_prompts,
     };
     use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
     use bloomery_gpu_gates::{
@@ -472,11 +472,6 @@ mod gate {
     /// 4e-2 of a layer's update, whose norm is of the residual's order)
     /// added in quadrature over 48 layers, independent: √48 · 4e-2 ≈ 0.28.
     const FREE_BAND: f64 = 0.28;
-
-    /// PIN(2026-09-21): the V2-Lite gate's floor — a first difference where
-    /// the reference's own top1-top2 margin is below this is a near-tie
-    /// re-lottery, not a fault.
-    const MARGIN_FLOOR: f32 = 0.5;
 
     /// `‖a − b‖ / ‖base‖` over the zipped values in f64, the denominator's
     /// values from `base`: not `e2e::rel`, which divides by `‖b‖` and is

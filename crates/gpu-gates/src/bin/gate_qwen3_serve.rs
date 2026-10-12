@@ -329,7 +329,7 @@
 //!   card budget is [`HOST_TIER_BUDGET`] (`--place a --parallel 1`): its
 //!   plan record puts routed experts on the host, and a greedy
 //!   `/completion` of [`PROSE`]'s ids (at least [`GEMM_FROM`]) answers 200
-//!   with tokens — a placed load's prompt call runs passes at every length.
+//!   with tokens — a placed load's prompt call runs the wide units from [`GEMM_FROM`] ids and passes below.
 //!   FAIL-first: a prompt call that asks a placed load for the GEMM walk is
 //!   refused by `prefill_plan` and the request answers no tokens.
 //!
