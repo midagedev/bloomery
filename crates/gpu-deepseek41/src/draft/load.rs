@@ -111,9 +111,8 @@ pub struct Loaded {
     pub group: Option<Group>,
     /// The layout: a `CardFormat` label, or `mxfp4_planes`.
     pub format: &'static str,
-    /// The device buffers in bytes, in allocation order: read from the
-    /// buffers, except an MXFP4 stack's two planes, which are derived from
-    /// its shape (codes 16 B and one scale byte per 32 values).
+    /// The device buffers in bytes, in allocation order, read from the
+    /// buffers themselves.
     pub buffers: Vec<u64>,
 }
 
@@ -132,6 +131,9 @@ pub struct DraftWeights {
     embd: EmbdRows,
     experts: Vec<LayerExperts>,
     table: Vec<Loaded>,
+    /// Every weight buffer in the order the load allocated them
+    /// ([`allocation_order`]).
+    buffers: Vec<u64>,
 }
 
 /// The file bytes of tensor `name` of `split` (any shard).
@@ -246,10 +248,9 @@ fn upload_stack(stream: &CudaStream, split: &Split, t: &DraftTensor) -> Result<M
     MxStack::upload(stream, file_bytes(split, &t.name)?, d(2)?, d(1)?, d(0)?)
 }
 
-/// An MXFP4 stack's two planes in bytes, derived from its shape.
+/// An MXFP4 stack's two planes in bytes, as allocated.
 fn stack_buffers(s: &MxStack) -> Vec<u64> {
-    let blocks = (s.n_experts() * s.rows_per_expert() * s.k() / 32) as u64;
-    vec![16 * blocks, blocks]
+    s.buffer_bytes().into_iter().map(|b| b as u64).collect()
 }
 
 fn format_label(f: CardFormat) -> &'static str {
@@ -422,6 +423,43 @@ impl Uploads {
     }
 }
 
+/// The weight buffers of `table` in the order the load allocated them: the
+/// GPU loader's tensors in file order, the head, then the Markov weights and
+/// the MXFP4 stacks in [`dspark::tensors`]' order, and the mask row last. A
+/// tensor with no row in the table is refused by name.
+fn allocation_order(
+    table: &[Loaded],
+    draft: &Split,
+    want: &[DraftTensor],
+    borrowed: &[dspark::Borrowed],
+) -> Result<Vec<u64>, GpuError> {
+    let by_loader =
+        |t: &DraftTensor| dspark::card_format(t).is_some_and(|f| CardFormat::of(t.ty) == Some(f));
+    let row = |name: &str| {
+        table
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.buffers.as_slice())
+            .ok_or_else(|| missing(name.to_string(), "in the load table"))
+    };
+    let mut out = Vec::new();
+    for (_, f) in draft.iter_tensors() {
+        if want.iter().any(|t| t.name == f.name && by_loader(t)) {
+            out.extend_from_slice(row(&f.name)?);
+        }
+    }
+    for b in borrowed.iter().filter(|b| b.borrow == Borrow::Copied) {
+        out.extend_from_slice(row(&b.name)?);
+    }
+    for t in want.iter().filter(|t| !by_loader(t)) {
+        out.extend_from_slice(row(&t.name)?);
+    }
+    for b in borrowed.iter().filter(|b| b.borrow == Borrow::RowSource) {
+        out.extend_from_slice(row(&b.name)?);
+    }
+    Ok(out)
+}
+
 impl DraftWeights {
     /// Check `draft` against the inventory with `target`'s borrowed tensors,
     /// then upload every tensor the draft reads on `stream`'s card. Refuses,
@@ -468,6 +506,7 @@ impl DraftWeights {
         let (mask_row, embd) = up
             .mask_row
             .ok_or_else(|| missing(target_names::token_embd(), "loaded"))?;
+        let buffers = allocation_order(&up.table, draft, &want, &inv.borrowed)?;
         Ok(DraftWeights {
             markov_w1: up.w1.ok_or_else(|| missing(names::markov_w1(), "loaded"))?,
             markov_w2: up.w2.ok_or_else(|| missing(names::markov_w2(), "loaded"))?,
@@ -478,6 +517,7 @@ impl DraftWeights {
             head,
             experts,
             table: up.table,
+            buffers,
         })
     }
 
@@ -492,6 +532,13 @@ impl DraftWeights {
     #[must_use]
     pub fn table(&self) -> &[Loaded] {
         &self.table
+    }
+
+    /// Every weight buffer in bytes, in allocation order, read from the
+    /// buffers themselves; the sum of the table's rows.
+    #[must_use]
+    pub fn buffers(&self) -> &[u64] {
+        &self.buffers
     }
 
     /// Layer `l`'s routed experts.

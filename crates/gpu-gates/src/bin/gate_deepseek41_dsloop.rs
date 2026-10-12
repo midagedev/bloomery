@@ -22,6 +22,15 @@
 //!   and both rows of a pair pass over the same two tokens replayed after a
 //!   rollback. A read of row 1 after a one-row step is refused.
 //!
+//! - `--draft-load LOG`: opens no card. `LOG` is a `generate_ds41` run under
+//!   `BLOOMERY_DRAFT=dspark` on a gate card under its gate lock, where no other process runs; its
+//!   `load draft=dspark` record is read (`record::Log`) and the card's loss around the load past
+//!   the draft's counted buffers, `taken - (resident - working)`, must be within
+//!   `SCRATCH_ALLOWANCE` (64 MiB): the captured graphs and the kernel modules fit the allowance
+//!   the plan's formula sets aside. The runtime refuses on the load's own count and never on
+//!   `taken`, so this clause is where that bound is held. A log with no record, more than one, or
+//!   one without `working` or `taken` fails by name.
+//!
 //! Every clause is self-consistency (the engine against its own prediction and its own eager
 //! step), so the fixture tier runs both arms; the prompt's ids and the greedy steps are inputs.
 
@@ -81,6 +90,7 @@ mod gate {
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, PAIR_ROWS, Seam};
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order};
+    use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
     use bloomery_levers::{
@@ -88,6 +98,7 @@ mod gate {
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::dspark::SCRATCH_ALLOWANCE;
     use model::placement::workstation;
     use runtime::swaprule::KeptRows;
 
@@ -113,25 +124,76 @@ mod gate {
     struct Args {
         structure: bool,
         tap: bool,
+        /// `--draft-load LOG`: the log of a `generate_ds41` DSpark run.
+        draft_load: Option<String>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_deepseek41_dsloop [--structure] [--tap]";
+        const USAGE: &str =
+            "usage: gate_deepseek41_dsloop [--structure] [--tap] | --draft-load LOG";
         let mut a = Args {
             structure: false,
             tap: false,
+            draft_load: None,
         };
-        for arg in std::env::args().skip(1) {
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--structure" => a.structure = true,
                 "--tap" => a.tap = true,
+                "--draft-load" => {
+                    a.draft_load = Some(
+                        args.next()
+                            .ok_or_else(|| format!("--draft-load takes a log: {USAGE}"))?,
+                    );
+                }
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.structure || a.tap) {
+        if a.draft_load.is_some() == (a.structure || a.tap) {
             return Err(USAGE.into());
         }
         Ok(a)
+    }
+
+    /// The card's loss around the load past the draft's counted buffers
+    /// (`resident` less the `working` buffers the pass and append hold, which
+    /// the scratch allowance covers with the graphs), signed: the allocator
+    /// can pack tighter than the plan's model.
+    fn past_counted(taken: u64, resident: u64, working: u64) -> Result<i128, GateError> {
+        let counted = resident.checked_sub(working).ok_or_else(|| {
+            format!("the record's working {working} B is past its resident {resident} B")
+        })?;
+        Ok(i128::from(taken) - i128::from(counted))
+    }
+
+    /// `--draft-load` (module doc): the clause on the `load draft=dspark`
+    /// record of `log`.
+    fn draft_load(log: &str) -> Result<bool, GateError> {
+        crate::ds41_tier::sc(
+            "--draft-load: the card's loss past the counted buffers is within the scratch allowance",
+        )?;
+        let text = std::fs::read_to_string(log).map_err(|e| format!("{log}: {e}"))?;
+        let rec = Log::of(&text, record::GENERATE_DS41)
+            .named(log)
+            .one(&record::LOAD_DRAFT)?;
+        let resident = rec.u64("resident")?;
+        let working = rec
+            .opt_u64("working")?
+            .ok_or_else(|| format!("{log}: the load draft record has no working"))?;
+        let taken = rec
+            .opt_u64("taken")?
+            .ok_or_else(|| format!("{log}: the load draft record has no taken"))?;
+        let past = past_counted(taken, resident, working)?;
+        let ok = past <= i128::from(SCRATCH_ALLOWANCE);
+        println!(
+            "{NAME}: draft-load | taken {taken} B less the counted buffers {} B (resident \
+             {resident} B less working {working} B) = {past} B, at most the scratch allowance \
+             {SCRATCH_ALLOWANCE} B: {}",
+            resident - working,
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// Prompt row 0's ids (`$BLOOMERY_DATA/greedy-ds41/prompt0.tsv`, written
@@ -155,6 +217,16 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let args = parse_args()?;
+        if let Some(log) = &args.draft_load {
+            let ok = draft_load(log)?;
+            println!("{NAME}: {}", tier::tally_line());
+            if !ok {
+                return Err(checks_failed());
+            }
+            println!("PASSED: {NAME}");
+            return Ok(());
+        }
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
             CARD_BUDGET,
@@ -163,7 +235,6 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        let args = parse_args()?;
         crate::gate_card::init()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         let (_, dhp) = dspark::draft_hparams()?;

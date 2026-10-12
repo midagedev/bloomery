@@ -82,6 +82,7 @@ use std::sync::Arc;
 
 use bloomery_gpu::{Gpu, GpuError, Graph};
 use gguf::Split;
+use model::arch::dspark::DraftHeld;
 
 use block::{BlockInput, BlockPass, MAX_WIDTH, Rule, embedding_row};
 use kv::{DraftRings, GROUP, KvAppend};
@@ -306,6 +307,19 @@ impl DraftBody {
         self.committed = 0;
         self.skipped = None;
         Ok(())
+    }
+
+    /// The device buffers the load allocated, counted from the buffers
+    /// themselves: the weights in allocation order, the rings, and the
+    /// pass's and append's working buffers. The captured graphs are not
+    /// buffers and are not in it.
+    #[must_use]
+    pub fn held(&self) -> DraftHeld {
+        DraftHeld {
+            weights: self.w.buffers().to_vec(),
+            rings: self.rings.ring_bytes(),
+            working: (self.kv.device_bytes() + self.pass.device_bytes()) as u64,
+        }
     }
 
     /// Positions committed so far.

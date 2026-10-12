@@ -17,6 +17,7 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::dspark::DraftHparams;
+use model::placement::workstation::GRANULE;
 
 use crate::dspark;
 
@@ -62,9 +63,13 @@ impl Draft {
 /// card under `place` ([`dspark::draft_card`]), its taps attached to `loaded`
 /// — the target opened from `target`, nothing captured yet — and its `load
 /// draft=dspark` record for the caller to print; `what` names the caller to
-/// the body. With `reserve`, the bytes the placement's plan set aside for the
-/// draft on its card ([`dspark::draft_reserve`]), a draft that took more is
-/// refused by name: it would sit in the tier's margin.
+/// the body. The load's own buffer count is held to the plan's formula term
+/// by term (`DraftCardBytes::check_held`) whatever the placement. With
+/// `reserve`, the bytes the placement's plan set aside for the draft on its
+/// card ([`dspark::draft_reserve`]), a draft whose resident bytes are more is
+/// refused by name: it would sit in the tier's margin. The card's loss around
+/// the load is recorded as `taken` and never refuses: another process's
+/// allocation on the card lands in it.
 pub fn open_dspark(
     loaded: &mut Loaded<Body>,
     file: &(Split, DraftHparams),
@@ -78,12 +83,19 @@ pub fn open_dspark(
     let (draft_split, hp) = file;
     let target =
         Arc::new(Split::open(target).map_err(|e| format!("open {}: {e}", target.display()))?);
-    let mut d = CardDraft::open(loaded, draft_split, hp, target, (card.name, card.device))?;
+    let mut d = CardDraft::open(
+        loaded,
+        draft_split,
+        hp,
+        Arc::clone(&target),
+        (card.name, card.device),
+    )?;
+    dspark::plan_bytes(draft_split, &target)?.check_held(d.held(), GRANULE, card.name)?;
     let (free, total) = d.mem_info()?;
     let resident = d.resident_bytes() as u64;
     if let Some(reserve) = reserve.filter(|&r| resident > r) {
         return Err(format!(
-            "the DSpark draft took {resident} B on {}, past the {reserve} B its plan reserved \
+            "the DSpark draft holds {resident} B on {}, past the {reserve} B its plan reserved \
              there under --place {}",
             card.name,
             place.name()
@@ -100,11 +112,13 @@ pub fn open_dspark(
         )
         .list("target_layers", b.feature_layers().unwrap_or_default())
         .u("feature_width", b.feature_width())
-        .u("resident", resident);
+        .u("resident", resident)
+        .u("working", d.held().working);
     if let Some(reserve) = reserve {
         r = r.u("reserve", reserve);
     }
     let r = r
+        .u("taken", d.taken_bytes() as u64)
         .u("draft_card_free", free)
         .u("draft_card_total", total)
         .f("load_s", t.elapsed().as_secs_f64());

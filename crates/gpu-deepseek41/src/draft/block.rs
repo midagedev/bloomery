@@ -232,6 +232,57 @@ impl Dims {
 }
 
 impl LayerBufs {
+    /// Device bytes of the layer's buffers, as allocated. Every field is
+    /// named, so a buffer added to the struct is counted or fails to build.
+    fn device_bytes(&self) -> usize {
+        let LayerBufs {
+            mix_a,
+            hc_a,
+            normed,
+            q_a,
+            q_a_n,
+            q,
+            kv,
+            kv_row,
+            block_kv,
+            no_shadow,
+            part_v,
+            part_ms,
+            y,
+            wo_a,
+            out_a,
+            streams_a,
+            fold_a,
+            mix_f,
+            hc_f,
+            normed_f,
+            router,
+            act_x,
+            h,
+            act_h,
+            moe,
+            sh_h,
+            sh_y,
+            ffn_out,
+            streams_f,
+            fold_f,
+        } = self;
+        let f32s = [
+            mix_a, hc_a, normed, q_a, q_a_n, q, kv, kv_row, part_v, part_ms, y, wo_a, out_a,
+            streams_a, fold_a, mix_f, hc_f, normed_f, h, moe, sh_h, sh_y, ffn_out, streams_f,
+            fold_f,
+        ];
+        f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + block_kv.buf().num_bytes()
+            + no_shadow.buf().num_bytes()
+            + router.device_bytes()
+            + act_x
+                .iter()
+                .chain(act_h)
+                .map(MxAct::device_bytes)
+                .sum::<usize>()
+    }
+
     fn new(stream: &CudaStream, d: &Dims) -> Result<LayerBufs, GpuError> {
         let b = MAX_WIDTH;
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
@@ -834,6 +885,37 @@ impl BlockPass {
             rule: Rule::Reference,
             d,
         })
+    }
+
+    /// Device bytes of every buffer the pass allocated, the image's card
+    /// side included, as allocated.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        let BlockPass {
+            layers,
+            head,
+            k: _,
+            d: _,
+            table: _,
+            streams0,
+            fold0,
+            inbox,
+            image: _,
+            embd: _,
+            slots,
+            route,
+            fwd: _,
+            back: _,
+            width: _,
+            rule: _,
+        } = self;
+        layers.iter().map(LayerBufs::device_bytes).sum::<usize>()
+            + head.device_bytes()
+            + streams0.num_bytes()
+            + fold0.num_bytes()
+            + inbox.device_bytes()
+            + slots.num_bytes()
+            + route.num_bytes()
     }
 
     /// Write one block's inputs — `id_last`'s row, the rope tables, the

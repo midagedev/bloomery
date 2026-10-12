@@ -316,6 +316,16 @@ impl DraftRouterOut {
     pub fn tickets(&self, stream: &CudaStream) -> Result<u32, GpuError> {
         Ok(self.done.to_host_vec(stream)?[0])
     }
+
+    /// Device bytes of the five buffers, as allocated.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.logits.num_bytes()
+            + self.probs.num_bytes()
+            + self.ids.num_bytes()
+            + self.weights.num_bytes()
+            + self.done.num_bytes()
+    }
 }
 
 /// One router launch ([`DraftRouterKernels::enqueue_router`]).

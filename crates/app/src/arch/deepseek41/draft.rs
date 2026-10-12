@@ -40,8 +40,8 @@ use bloomery_gpu_deepseek41::draft::load::DraftWeights;
 use cuda_core::CudaContext;
 use gguf::Split;
 use model::arch::deepseek41::spec::draft_of;
-use model::arch::dspark::DraftHparams;
-use model::placement::workstation::DeviceId;
+use model::arch::dspark::{DraftHeld, DraftHparams};
+use model::placement::workstation::{DeviceId, GRANULE};
 use runtime::{Draft, Program, TapNeed, Tapped, Target};
 
 use crate::{Loaded, Session, SessionError};
@@ -60,8 +60,12 @@ pub struct CardDraft<D> {
     width: usize,
     /// Every position the target ran since the draft's reset reached it.
     follows: bool,
-    /// The device bytes the draft's load took on its card.
+    /// The draft's own device buffers, counted by the load.
+    held: DraftHeld,
+    /// [`CardDraft::resident_bytes`].
     resident: usize,
+    /// [`CardDraft::taken_bytes`].
+    taken: usize,
 }
 
 impl CardDraft<DraftBody> {
@@ -95,7 +99,11 @@ impl CardDraft<DraftBody> {
             Ok::<_, GpuError>((body, free.saturating_sub(left)))
         })();
         ctx.bind_to_thread().map_err(GpuError::from)?;
-        let (body, resident) = loaded?;
+        let (body, taken) = loaded?;
+        let held = body.held();
+        let resident = usize::try_from(held.resident(GRANULE)).map_err(|_| {
+            SessionError::Refused("the draft's resident bytes pass usize".to_string())
+        })?;
         let reads = body.weights().hp().target_layers.len() * body.weights().hp().n_embd;
         if reads != width {
             return Err(SessionError::Refused(format!(
@@ -110,16 +118,33 @@ impl CardDraft<DraftBody> {
             pending: Vec::with_capacity(GROUP * width),
             width,
             follows: true,
+            held,
             resident,
+            taken,
         })
     }
 
-    /// The device bytes the draft's load took on its card: its weights, rings,
-    /// buffers and captured graphs, read as the card's free bytes before and
-    /// after it.
+    /// The draft's resident bytes on its card: the buffers its load
+    /// allocated, the weights then the rings through the plan's allocator
+    /// model, and the working buffers. The captured graphs are not buffers
+    /// and are not in it.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         self.resident
+    }
+
+    /// The buffers the load allocated, counted from the buffers themselves.
+    #[must_use]
+    pub fn held(&self) -> &DraftHeld {
+        &self.held
+    }
+
+    /// The bytes the card's free memory lost around the load, graphs and
+    /// kernel modules included. A diagnostic: any other process's allocation
+    /// on the card in that window lands in it, so no refusal reads it.
+    #[must_use]
+    pub fn taken_bytes(&self) -> usize {
+        self.taken
     }
 
     /// The target now stands elsewhere than the positions the draft was fed

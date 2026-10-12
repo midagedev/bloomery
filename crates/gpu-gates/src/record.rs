@@ -1284,7 +1284,7 @@ pub static HOST_LOCK: Kind = Kind {
 pub static LOAD_DRAFT: Kind = Kind {
     name: "load_draft",
     head: "load",
-    doc: "The DSpark draft's load: its card, width, the target's tapped layers, the device bytes it took, the reserve the placement made for it on a tier card, and the draft card's free bytes.",
+    doc: "The DSpark draft's load: its card, width, the target's tapped layers, the draft's own device buffers through the allocator model (the weights then the rings in allocation order, plus the working buffers; never the captured graphs) and the working buffers alone, the reserve the placement made for it on a tier card, the card's free-bytes loss around the load (another process's allocations land in it), and the draft card's free bytes after.",
     parts: &[
         key("draft", Word, ""),
         key("card", Word, ""),
@@ -1292,7 +1292,9 @@ pub static LOAD_DRAFT: Kind = Kind {
         key("target_layers", List, ""),
         key("feature_width", U64, ""),
         key("resident", U64, "B"),
+        opt("working", U64, "B"),
         opt("reserve", U64, "B"),
+        opt("taken", U64, "B"),
         key("draft_card_free", U64, "B"),
         lit(" of "),
         pos("draft_card_total", U64, "B"),

@@ -635,6 +635,116 @@ impl DraftCardBytes {
     pub fn total(&self) -> u64 {
         self.weights + self.kv + self.rounding + self.scratch
     }
+
+    /// What the allocator takes for the weight and ring buffers: the sum of
+    /// the first three terms.
+    #[must_use]
+    pub fn buffers(&self) -> u64 {
+        self.weights + self.kv + self.rounding
+    }
+
+    /// Hold `held`, the buffers a load counted of itself, to this formula
+    /// term by term on card `card`, on a card of allocation granule
+    /// `granule`: the weight bytes, the ring bytes, what the allocator takes
+    /// for both lists in allocation order, and the working buffers against
+    /// [`SCRATCH_ALLOWANCE`]. The first term that differs is refused by name.
+    pub fn check_held(
+        &self,
+        held: &DraftHeld,
+        granule: NonZeroU64,
+        card: &str,
+    ) -> Result<(), DraftHeldError> {
+        let term = |term: &'static str, held: u64, planned: u64| {
+            if held == planned {
+                Ok(())
+            } else {
+                Err(DraftHeldError::Term {
+                    term,
+                    card: card.to_string(),
+                    held,
+                    planned,
+                })
+            }
+        };
+        term("weights", held.weight_bytes(), self.weights)?;
+        term("kv", held.ring_bytes(), self.kv)?;
+        term("allocator total", held.buffers(granule), self.buffers())?;
+        if held.working > self.scratch {
+            return Err(DraftHeldError::Working {
+                card: card.to_string(),
+                held: held.working,
+                scratch: self.scratch,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The device buffers a draft's load allocated, counted from the buffers
+/// themselves and split as [`DraftCardBytes`] splits them. Zero-length
+/// buffers allocate nothing and are not listed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DraftHeld {
+    /// Every weight buffer in allocation order.
+    pub weights: Vec<u64>,
+    /// Every layer's ring, after the weights.
+    pub rings: Vec<u64>,
+    /// The block pass's and the append's working buffers, in all.
+    pub working: u64,
+}
+
+impl DraftHeld {
+    /// Bytes of the weight buffers.
+    #[must_use]
+    pub fn weight_bytes(&self) -> u64 {
+        self.weights.iter().sum()
+    }
+
+    /// Bytes of the rings.
+    #[must_use]
+    pub fn ring_bytes(&self) -> u64 {
+        self.rings.iter().sum()
+    }
+
+    /// What the allocator takes for the weight buffers, then the rings, in
+    /// that order, on a card of allocation granule `granule`.
+    #[must_use]
+    pub fn buffers(&self, granule: NonZeroU64) -> u64 {
+        crate::placement::allocator_bytes(granule, self.weights.iter().chain(&self.rings).copied())
+    }
+
+    /// The draft's resident bytes on its card: [`DraftHeld::buffers`] and the
+    /// working buffers.
+    #[must_use]
+    pub fn resident(&self, granule: NonZeroU64) -> u64 {
+        self.buffers(granule) + self.working
+    }
+}
+
+/// A load that does not hold to [`DraftCardBytes`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DraftHeldError {
+    /// A term of the load's own count that is not the formula's.
+    #[error(
+        "the DSpark draft's load holds {held} B of {term} on {card}, the plan's formula has \
+         {planned} B"
+    )]
+    Term {
+        term: &'static str,
+        card: String,
+        held: u64,
+        planned: u64,
+    },
+    /// Working buffers past the formula's scratch allowance.
+    #[error(
+        "the DSpark draft's working buffers hold {held} B on {card}, past the formula's scratch \
+         allowance of {scratch} B"
+    )]
+    Working {
+        card: String,
+        held: u64,
+        scratch: u64,
+    },
 }
 
 /// An MXFP4 stack's two card planes of `values` values: 16 code bytes and
@@ -823,4 +933,119 @@ fn markov_rank(split: &Split) -> Result<usize, PlacementError> {
         name,
         detail: format!("row length {} does not fit usize", t.dims[0]),
     })
+}
+
+#[cfg(test)]
+mod held_tests {
+    use std::num::NonZeroU64;
+
+    use super::{DraftCardBytes, DraftHeld, DraftHeldError};
+
+    const G: u64 = 4096;
+    const SCRATCH: u64 = 1000;
+
+    fn granule() -> NonZeroU64 {
+        NonZeroU64::new(G).expect("not zero")
+    }
+
+    /// Weights `[3G, 100]`, rings `[200, 200]` on a 4 KiB granule: the
+    /// 3G buffer takes three granules, the three small ones share a fourth.
+    fn planned() -> DraftCardBytes {
+        DraftCardBytes {
+            weights: 3 * G + 100,
+            kv: 400,
+            rounding: G - 500,
+            scratch: SCRATCH,
+        }
+    }
+
+    fn held() -> DraftHeld {
+        DraftHeld {
+            weights: vec![3 * G, 100],
+            rings: vec![200, 200],
+            working: SCRATCH,
+        }
+    }
+
+    fn refusal(plan: &DraftCardBytes, held: &DraftHeld) -> DraftHeldError {
+        plan.check_held(held, granule(), "A6000")
+            .expect_err("the load differs from the formula")
+    }
+
+    fn term(name: &'static str, held: u64, planned: u64) -> DraftHeldError {
+        DraftHeldError::Term {
+            term: name,
+            card: "A6000".to_string(),
+            held,
+            planned,
+        }
+    }
+
+    #[test]
+    fn a_load_that_is_the_formula_holds_with_working_at_the_allowance() {
+        assert_eq!(planned().check_held(&held(), granule(), "A6000"), Ok(()));
+        assert_eq!(held().resident(granule()), planned().buffers() + SCRATCH);
+    }
+
+    #[test]
+    fn a_weight_buffer_missing_from_the_count_is_refused_by_the_weights_term() {
+        let mut h = held();
+        h.weights.pop();
+        assert_eq!(refusal(&planned(), &h), term("weights", 3 * G, 3 * G + 100));
+    }
+
+    #[test]
+    fn a_ring_missing_from_the_count_is_refused_by_the_kv_term() {
+        let mut h = held();
+        h.rings.pop();
+        assert_eq!(refusal(&planned(), &h), term("kv", 200, 400));
+    }
+
+    #[test]
+    fn equal_sums_in_other_buffers_are_refused_by_the_allocator_total() {
+        let plan = DraftCardBytes {
+            weights: G,
+            kv: 0,
+            rounding: 0,
+            scratch: SCRATCH,
+        };
+        let same = DraftHeld {
+            weights: vec![G / 2, G / 2],
+            rings: Vec::new(),
+            working: 0,
+        };
+        assert_eq!(plan.check_held(&same, granule(), "A6000"), Ok(()));
+        let split = DraftHeld {
+            weights: vec![G / 2 + 1, G / 2 - 1],
+            ..same
+        };
+        assert_eq!(refusal(&plan, &split), term("allocator total", 2 * G, G));
+    }
+
+    #[test]
+    fn working_buffers_past_the_scratch_allowance_are_refused() {
+        let mut h = held();
+        h.working = SCRATCH + 1;
+        let err = refusal(&planned(), &h);
+        assert_eq!(
+            err,
+            DraftHeldError::Working {
+                card: "A6000".to_string(),
+                held: SCRATCH + 1,
+                scratch: SCRATCH,
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("A6000") && msg.contains("1001") && msg.contains("1000"));
+    }
+
+    #[test]
+    fn a_refusal_names_the_term_both_numbers_and_the_card() {
+        let mut h = held();
+        h.weights.pop();
+        let msg = refusal(&planned(), &h).to_string();
+        for part in ["weights", "12288", "12388", "A6000"] {
+            assert!(msg.contains(part), "{part} is not in {msg:?}");
+        }
+    }
 }

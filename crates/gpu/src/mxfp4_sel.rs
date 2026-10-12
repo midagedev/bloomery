@@ -674,6 +674,13 @@ impl MxStack {
     pub fn k(&self) -> usize {
         self.k
     }
+
+    /// Device bytes of the two planes, in allocation order: the codes, then
+    /// the scales.
+    #[must_use]
+    pub fn buffer_bytes(&self) -> [usize; 2] {
+        [self.qs.buf().num_bytes(), self.e.buf().num_bytes()]
+    }
 }
 
 /// q8_1 activation scratch for `n_cols` columns of `k` values, the buffers
@@ -719,6 +726,16 @@ impl MxAct {
     /// Values per column.
     pub fn k(&self) -> usize {
         self.k
+    }
+
+    /// Device bytes of the five planes, as allocated.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.q3.num_bytes()
+            + self.q4.num_bytes()
+            + self.q6.num_bytes()
+            + self.s8.num_bytes()
+            + self.d8.num_bytes()
     }
 
     /// The int8 codes in the Q4_K gemv's permutation: `256 · ceil(k / 1024)`

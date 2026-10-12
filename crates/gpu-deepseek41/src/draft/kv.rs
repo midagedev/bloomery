@@ -73,6 +73,16 @@ impl DraftRings {
         self.rings.iter().map(|r| r.buf().num_bytes()).sum()
     }
 
+    /// Device bytes of each layer's ring, in allocation order. The append's
+    /// shadow holds no rows and allocates nothing.
+    #[must_use]
+    pub fn ring_bytes(&self) -> Vec<u64> {
+        self.rings
+            .iter()
+            .map(|r| r.buf().num_bytes() as u64)
+            .collect()
+    }
+
     /// Zero every ring. Asynchronous.
     pub fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         for r in &mut self.rings {
@@ -214,7 +224,7 @@ impl KvAppend {
     /// Device bytes of the buffers, the image's device side included.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
-        4 * self.groups.len() * self.layout.words
+        self.inbox.device_bytes()
             + self
                 .groups
                 .iter()

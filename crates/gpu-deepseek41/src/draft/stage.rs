@@ -35,6 +35,11 @@ impl Inbox {
         })
     }
 
+    /// Device bytes of the image's card side.
+    pub(super) fn device_bytes(&self) -> usize {
+        self.dev.num_bytes()
+    }
+
     /// The host image, writable once the last copy has read it (blocks until
     /// then; an image never copied is writable at once).
     pub(super) fn host_mut(&mut self) -> Result<&mut [u32], GpuError> {

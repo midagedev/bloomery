@@ -90,6 +90,15 @@ impl DraftHead {
         self.n_vocab
     }
 
+    /// Device bytes of the head's buffers, as allocated.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.normed.num_bytes()
+            + self.acts.iter().map(Q8Act::device_bytes).sum::<usize>()
+            + self.logits.num_bytes()
+            + self.tok.num_bytes()
+    }
+
     /// Refuse a width the head holds no scratch for.
     fn check(&self, m: usize) -> Result<(), GpuError> {
         if (1..=self.acts.len()).contains(&m) {

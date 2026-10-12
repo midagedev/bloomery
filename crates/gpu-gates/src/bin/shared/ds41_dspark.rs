@@ -18,7 +18,7 @@ use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::tier::Tier;
 use gguf::{Gguf, Split};
-use model::arch::dspark::{self, DraftHparams};
+use model::arch::dspark::{self, DraftCardBytes, DraftHparams};
 use model::placement::workstation::{self, CardSpec};
 
 /// The draft file: `$BLOOMERY_DSPARK_MODEL`, which the recipes export from
@@ -78,7 +78,13 @@ pub fn draft_reserve(place: Place, draft: &Split, target: &Path) -> Result<Optio
         return Ok(None);
     }
     let t = Split::open(target).map_err(|e| format!("open {}: {e}", target.display()))?;
-    let bytes = dspark::card_bytes(draft, &t, workstation::GRANULE)
-        .map_err(|e| format!("the DSpark draft's card bytes: {e}"))?;
-    Ok(Some(bytes.total()))
+    Ok(Some(plan_bytes(draft, &t)?.total()))
+}
+
+/// The DSpark draft's card bytes from the two files' headers, on the plan's
+/// allocation granule ([`workstation::GRANULE`]): the one formula
+/// [`draft_reserve`] sums and a load is held to (`ds41_draft::open_dspark`).
+pub fn plan_bytes(draft: &Split, target: &Split) -> Result<DraftCardBytes, GateError> {
+    dspark::card_bytes(draft, target, workstation::GRANULE)
+        .map_err(|e| format!("the DSpark draft's card bytes: {e}").into())
 }
