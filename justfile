@@ -2294,11 +2294,12 @@ gate-gpu-glm5next-mtp:
 
 # glm5next (GLM-5.3-Flash)'s attach of the NVMe expert tier (shared/nvtier_family.rs, whose clauses V4.1's gate calls first): a
 # paged arm against an all-RAM arm on the same file on the gate placement, the residency off — the paged plan's arena is the
-# given slots, the tier built and covering every paged layer, one prompt call and greedy steps bit for bit the all-RAM
-# arm's, the room under the floor and the arena under its floor each refused by name, the NextN plan refused at the room the
-# draft layer's routed experts leave under the floor and planned above it, and the unset residency `off` with why `paged`.
+# given slots (sized from the file: at most 64, fewer where the need leaves less above the floor), the tier built and covering
+# every paged layer, one prompt call and greedy steps bit for bit the all-RAM arm's, the room under the floor and the arena
+# under its floor each refused by name, the NextN plan refused at the room the draft layer's routed experts leave under the
+# floor and planned above it, and the unset residency as the plan's numbers say, never why `paged`.
 # Each arm's room and arena reach the plan through PlanInputs, so no environment crosses the tiers. The fixture tier runs on
-# the plain fixture, which leaves the clauses that read the paged experts to the real tier. Group solo-real, reason r1 (the real tier
+# the `q6kdown` variant (tools/fixture-variants.tsv: every routed layer on the host). Group solo-real, reason r1 (the real tier
 # loads the whole file twice), balanced over the cards in the fixture tier, under the big-load lock the V4.1 loads take.
 [group('solo-real')]
 [group('v41-load')]

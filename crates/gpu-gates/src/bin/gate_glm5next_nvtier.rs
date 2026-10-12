@@ -1,12 +1,14 @@
 //! GPU gate for GLM-5.3-Flash's attach of the NVMe expert tier (the split dial's arena, `Body::open_placed`'s host run
 //! through the common `host_run`): the five clauses of `shared/nvtier_family.rs` (`plan`, `attach`, `bits`, `refuse`,
-//! `residency`) on the gate placement, planned under the header's card budget — a paged arm against an all-RAM arm on
-//! the same file, the residency off.
+//! `residency`) on the gate placement — in the fixture tier the `q6kdown` variant (`tools/fixture-variants.tsv`: Q6_K
+//! routed downs, every routed layer on the host), planned under the header's card budget — a paged arm against an
+//! all-RAM arm on the same file, the residency off.
 //!
 //! Each arm's host room and arena reach the plan through `PlanInputs` (`room`, `arena`), so the gate sets no
 //! environment: the all-RAM arm's room is the plan's need, the paged arm's is the split's floor F (read off the
-//! `HostRoomFloor` refusal) plus an arena of [`nvtier_family::SLOTS`] slot sets. One prompt call of [`PROMPT`]
-//! prose ids, then [`STEPS`] greedy steps, on each arm; one load at a time.
+//! `HostRoomFloor` refusal) plus an arena of the slot sets the family sizes from the file (`paged_slots`: at most
+//! [`nvtier_family::SLOTS`], fewer where the need leaves less above F). One prompt call of [`PROMPT`] prose ids, then
+//! [`STEPS`] greedy steps, on each arm; one load at a time.
 //!
 //! GLM's own refusal, beside the family's (`refuse nextn-room`): the draft layer's routed experts are the host's
 //! beside the trunk's, a plan of their own, so the NextN plan splits the trunk at the room less them
@@ -16,10 +18,11 @@
 //!
 //! Tiers: every clause is self-consistency (the arms and the plan's own numbers), so it runs on a fixture and on the
 //! real file alike, except on a fixture that keeps no more than one routed layer on the host (the plain fixture): the
-//! clauses that read the paged experts are left to the real tier by name (`no-host-layer`, [`tier::host_clause`]). A
-//! variant whose routed layers the card reads (`iq4xs`, `q2kxl`) is refused by name there, and one whose four routed
-//! layers all stay on the host pages nothing at this gate's arena (the floor, which holds three times the heaviest
-//! layer's host-served experts, and the arena pass the all-RAM arm's room), so no variant lists this gate.
+//! clauses that read the paged experts are left to the real tier by name (`no-host-layer`, [`tier::host_clause`]), and
+//! the `q6kdown` variant, whose four routed layers all stay on the host, runs them: its floor holds three times the
+//! heaviest layer's host-served experts, so its need leaves fewer than [`nvtier_family::SLOTS`] slot sets above it and
+//! the arena is what fits. A variant whose routed layers the card reads (`iq4xs`, `q2kxl`) is refused by name there,
+//! so no such variant lists this gate.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -72,7 +75,7 @@ mod gate {
     use runtime::{Out, Target, Want};
 
     use crate::glm5next_tier;
-    use crate::nvtier_family::{Arm, Family, PlanFacts, Pos, Refusal, SLOTS, Unset};
+    use crate::nvtier_family::{Arm, Family, PlanFacts, Pos, Refusal, Unset};
     use crate::quiet::Quiet;
 
     const NAME: &str = "gate_glm5next_nvtier";
@@ -158,7 +161,7 @@ mod gate {
         }
 
         /// `refuse nextn-room`: see the module doc.
-        fn nextn_room(&self, paged: Arm) -> Result<(), GateError> {
+        fn nextn_room(&self, paged: Arm, slots: u64) -> Result<(), GateError> {
             let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
             let nextn = NextnInputs::read(&PlanInputs::read(&file)?)?;
             let arena = paged.arena;
@@ -207,10 +210,10 @@ mod gate {
                  = {} B the plan pages {} B through an arena of {} B = {} slots",
                 paged.room, with.room, facts.paged, facts.arena, facts.arena_slots
             );
-            if facts.paged == 0 || facts.arena != a || facts.arena_slots != SLOTS {
+            if facts.paged == 0 || facts.arena != a || facts.arena_slots != slots {
                 return Err(format!(
                     "nextn room: the NextN plan at F_n + A + D pages {} B through an arena of {} B = {} slots, not \
-                     {a} B = {SLOTS} slots",
+                     {a} B = {slots} slots",
                     facts.paged, facts.arena, facts.arena_slots
                 )
                 .into());
@@ -352,11 +355,11 @@ mod gate {
             Ok(Glm::host_layers(&file, &hp) > 1)
         }
 
-        fn refusals(&self, paged: Arm) -> Vec<Refusal<'_>> {
+        fn refusals(&self, paged: Arm, slots: u64) -> Vec<Refusal<'_>> {
             vec![Refusal {
                 what: "nextn-room",
                 holds: "floor",
-                attempt: Box::new(move || self.nextn_room(paged)),
+                attempt: Box::new(move || self.nextn_room(paged, slots)),
             }]
         }
     }

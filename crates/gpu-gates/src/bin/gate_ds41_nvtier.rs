@@ -5,8 +5,9 @@
 //!
 //! Each arm's host room and arena reach the plan through `PlanInputs` (`room`, `arena`), so the gate sets no
 //! environment: the all-RAM arm's room is the plan's need, the paged arm's is the split's floor F (read off the
-//! `HostRoomFloor` refusal) plus an arena of [`nvtier_family::SLOTS`] slot sets. One prompt call of [`PROMPT`]
-//! prose ids, then [`STEPS`] greedy steps, on each arm; one load at a time.
+//! `HostRoomFloor` refusal) plus an arena of the slot sets the family sizes from the file (`paged_slots`: at most
+//! [`nvtier_family::SLOTS`], fewer where the need leaves less above F). One prompt call of [`PROMPT`] prose ids, then
+//! [`STEPS`] greedy steps, on each arm; one load at a time.
 //!
 //! V4.1's own refusal, beside the family's: an r8 pair that reads the file's sidecar on the paged plan, refused at
 //! the load (`bloomery_gpu::model::nvme_tier`).
@@ -180,7 +181,7 @@ mod gate {
             Unset::serving(&plan.room)
         }
 
-        fn refusals(&self, paged: Arm) -> Vec<Refusal<'_>> {
+        fn refusals(&self, paged: Arm, _slots: u64) -> Vec<Refusal<'_>> {
             vec![Refusal {
                 what: "r8",
                 holds: "a paged plan under an r8 pair that reads a sidecar",

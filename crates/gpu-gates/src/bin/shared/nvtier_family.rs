@@ -5,13 +5,15 @@
 //! them, the refusals only it has ([`Family::refusals`], a family without one returns none).
 //!
 //! The arms are planned from the file, never from a literal: the all-RAM plan at the room its need fits fixes the
-//! arena's slot set, the paged arm's arena is [`SLOTS`] slot sets, and its room is the split's floor F (read off the
-//! `HostRoomFloor` refusal at a [`PROBE_ROOM`] room under that arena) plus the arena. The two arms run one after the
-//! other on the same ids; the clauses are judged on what each snapshotted:
+//! arena's slot set, the paged arm's room is the split's floor F (read off the `HostRoomFloor` refusal at a
+//! [`PROBE_ROOM`] room under a given arena) plus the arena, and the arena is the slot sets [`paged_slots`] sizes from
+//! the file: [`SLOTS`], or fewer where the need leaves less above F. The two arms run one after the other on the same
+//! ids; the clauses are judged on what each snapshotted:
 //!
 //! - `plan`: the all-RAM plan pages nothing; the paged plan pages routed experts through an arena of exactly the
-//!   given bytes, [`SLOTS`] slots, which the tier carved too (`NvTierStats::slots_per_layer`). The room below the
-//!   floor is the probe's refusal, so a plan that never splits fails here.
+//!   given bytes and slots, which the tier carved too (`NvTierStats::slots_per_layer`). The room below the floor is
+//!   the probe's refusal, so a plan that never splits fails here, as does a file whose need leaves no arena of the
+//!   arena's floor under it.
 //! - `attach`: the load built a tier, it covers every paged layer, the carve is at least the arena's floor and under
 //!   the ids a paged layer serves (a layer that serves no more than it holds slots for never evicts), and a run's
 //!   misses, fills, evictions and prompt union claims are above 0 while no arena id was read through the file mapping.
@@ -31,8 +33,8 @@ use bloomery_levers::{RESIDENCY_SERVING, ResidencyWord, residency_word};
 use model::placement::workstation::HostNeed;
 use model::placement::{ArenaFloor, Device, PlacementError, Plan, Role, arena_slots};
 
-/// The slots a paged layer's arena holds, in the arm the gate pages: above the arena's floor, under the ids a layer
-/// serves, so evictions happen.
+/// The most slots a paged layer's arena holds in the arm the gate pages ([`paged_slots`]): above the arena's floor,
+/// under the ids a layer serves, so evictions happen.
 pub const SLOTS: u64 = 64;
 
 /// The room the floor is read at: under every file's floor.
@@ -342,8 +344,8 @@ pub trait Family {
     /// removed; it now follows `room_for`'s next clause (`crates/levers/src/lib.rs:1287-1362`).
     fn expected_residency(&self, plan: &PlanFacts) -> Unset;
 
-    /// The family's own refusals on the paged arm `paged`.
-    fn refusals(&self, _paged: Arm) -> Vec<Refusal<'_>> {
+    /// The family's own refusals on the paged arm `paged`, whose arena holds `slots` slots a paged layer.
+    fn refusals(&self, _paged: Arm, _slots: u64) -> Vec<Refusal<'_>> {
         Vec::new()
     }
 
@@ -357,6 +359,18 @@ pub trait Family {
     fn host_layers_enough(&self) -> Result<bool, GateError> {
         Ok(true)
     }
+}
+
+/// The paged arm's slots on a plan whose all-RAM need is `need` and whose split's floor is `floor`: [`SLOTS`], or
+/// the most whose arena keeps the room `floor + arena` under the need where fewer fit, so the split runs (a plan
+/// whose need the room holds is left as it is, `expert_nvme_tier`). At the split the host keeps the room less the
+/// terms beside the routed experts, the two layers' transient reads and the arena — one heaviest layer's experts
+/// (`base + 3 W + A − base − 2 W − A`), whatever the arena — so the arena's size moves which ids page, never whether.
+/// `None` where the arena's floor (`least`) does not fit under the need.
+fn paged_slots(need: u64, floor: u64, least: &ArenaFloor) -> Option<u64> {
+    let above = need.checked_sub(floor)?.checked_sub(1)?;
+    let slots = above.checked_div(least.slot_set)?.min(SLOTS);
+    (slots >= least.slots).then_some(slots)
 }
 
 /// What one arm left behind.
@@ -407,7 +421,7 @@ fn plan_clause(
     name: &str,
     ram: &PlanFacts,
     paged: &PlanFacts,
-    a: u64,
+    (a, slots): (u64, u64),
     tier: Option<&TierFacts>,
 ) -> bool {
     let slot_set = ram.floor.slot_set;
@@ -416,14 +430,14 @@ fn plan_clause(
         && ram.arena == 0
         && paged.paged > 0
         && paged.arena == a
-        && paged.arena_slots == SLOTS
-        && SLOTS >= ram.floor.slots
+        && paged.arena_slots == slots
+        && slots >= ram.floor.slots
         && carve;
     clause(
         name,
         &format!(
             "all-RAM pages {} B; the paged plan pages {} B through an arena of {} B = {} slots of {slot_set} B \
-             (given {a} B, {SLOTS} wanted, floor {}), the tier carved {:?}",
+             (given {a} B, {slots} wanted, floor {}), the tier carved {:?}",
             ram.paged,
             paged.paged,
             paged.arena,
@@ -516,19 +530,17 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
         arena: None,
     })?
     .map_err(|e| format!("{name}: the all-RAM plan: {e}"))?;
-    let a = SLOTS
-        .checked_mul(base.floor.slot_set)
-        .ok_or("the arena's bytes pass u64")?;
     let ram_arm = Arm {
         room: base.need,
         arena: None,
     };
     let ram_plan =
         probe(ram_arm)?.map_err(|e| format!("{name}: the all-RAM plan at its need: {e}"))?;
-    // F: the floor a room under the split's floor is refused by name with, under the given arena.
+    // F: the floor a room under the split's floor is refused by name with, under a given arena: the arena's floor,
+    // since a given arena takes no part in F (`ArenaDial::room_floor`).
     let low = Arm {
         room: PROBE_ROOM,
-        arena: Some(a),
+        arena: Some(base.floor.bytes),
     };
     let floor = match probe(low)? {
         Err(PlacementError::HostRoomFloor { floor, .. }) => Some(floor),
@@ -544,6 +556,28 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
         println!("{name}: {}", tier::tally_line());
         return Err(checks_failed());
     };
+    // A file whose need leaves no arena of the floor's slots above F pages nothing at any arena: a red clause where
+    // the paged clauses run, and [`SLOTS`] where they are left to the real tier (nothing pages, as on any arena).
+    let slots = match paged_slots(base.need, floor, &base.floor) {
+        Some(slots) => slots,
+        None if !host => SLOTS,
+        None => {
+            clause(
+                "plan",
+                &format!(
+                    "the all-RAM need {} B leaves no arena of the floor's {} slots of {} B above the floor F \
+                     {floor} B: no split runs on this file",
+                    base.need, base.floor.slots, base.floor.slot_set
+                ),
+                false,
+            );
+            println!("{name}: {}", tier::tally_line());
+            return Err(checks_failed());
+        }
+    };
+    let a = slots
+        .checked_mul(base.floor.slot_set)
+        .ok_or("the arena's bytes pass u64")?;
     let paged_arm = Arm {
         room: floor + a,
         arena: Some(a),
@@ -561,7 +595,8 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
         }
     };
     println!(
-        "{name}: floor F {floor} B, arena A {a} B ({SLOTS} slots of {} B), paged room {} B, all-RAM room {} B",
+        "{name}: floor F {floor} B, arena A {a} B ({slots} slots of {} B, at most {SLOTS}), paged room {} B, \
+         all-RAM room {} B",
         base.floor.slot_set, paged_arm.room, ram_arm.room
     );
     // One load at a time: the all-RAM arm's session is gone before the paged arm loads.
@@ -569,7 +604,13 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
     let paged = arm_run(f, name, paged_arm, paged_plan)?;
     let mut pass = true;
     if plan_runs {
-        pass &= plan_clause("plan", &ram.plan, &paged.plan, a, paged.tier.as_ref());
+        pass &= plan_clause(
+            "plan",
+            &ram.plan,
+            &paged.plan,
+            (a, slots),
+            paged.tier.as_ref(),
+        );
     }
     if tier::host_clause(
         "attach: the tier is built, covers every paged layer and counts a run's traffic",
@@ -599,7 +640,7 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
             .map(|_| ())
             .map_err(GateError::from),
         );
-        for r in f.refusals(paged_arm) {
+        for r in f.refusals(paged_arm, slots) {
             pass &= refused(r.what, r.holds, (r.attempt)());
         }
     }
