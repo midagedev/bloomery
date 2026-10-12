@@ -32,6 +32,16 @@ pub struct GridPlan {
     pub best_w: usize,
 }
 
+impl GridPlan {
+    /// The grid a span hands the prompt, `(nx, ny)`: tokens along a line (the width, `n_llm_w`)
+    /// and lines (the height, `n_llm_h`), the order `MropeSeq::push` and `ImageSpan::grid` read.
+    /// A serve seat takes an image's grid from here, never from the two fields.
+    #[must_use]
+    pub const fn span_grid(&self) -> (usize, usize) {
+        (self.n_llm_w, self.n_llm_h)
+    }
+}
+
 /// The ViT's input for one image: `n_vit_h * n_vit_w` patches of `patch_len` bf16 values each, as
 /// raw bf16 bits.
 #[derive(Clone, Debug, PartialEq, Eq)]
