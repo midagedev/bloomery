@@ -258,11 +258,11 @@ mod gate {
     use model::arch::models::{Borrows, MtpSource};
     use model::arch::qwen35moe::head_list::{HeadWhy, SHIPPED, head_rows_of};
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, MtpPlan, PlanInputs, machine, machine_for_experts,
+        Experts, MtpInputs, MtpPlan, PlaceError, PlanInputs, machine, machine_for_experts,
     };
     use model::fileio::hex;
-    use model::placement::PlanLevers;
     use model::placement::workstation::HostRead;
+    use model::placement::{PlacementError, PlanLevers};
     use refset::arch::qwen4exp::IK;
     use refset::arch::qwen4exp::MODEL;
     use refset::arch::qwen4exp::fixture;
@@ -4675,7 +4675,9 @@ mod gate {
     /// budget (`headroom_bytes`: the draft's card bytes come out of the
     /// context's — the seat's yield trade). Acceptance is not pinned here:
     /// a fixture's generated draft has every proposal rejected, tau = 1, as
-    /// (z) says.
+    /// (z) says. Where the dial gives the file's host leg no arena at any room
+    /// the clause has no input: the fixture tier leaves it to the real tier by
+    /// name, the real tier is red on it.
     fn drafted_paged_run(
         inputs: &PlanInputs,
         mtp: &MtpInputs,
@@ -4686,12 +4688,12 @@ mod gate {
         let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
         let extra = mtp.card_bytes(CTX)?;
         // The room halves until the plan pages through an arena; a room the
-        // tier's floor refuses ends the search with the last room that
-        // planned, and the clause is red naming it.
+        // tier's floor refuses ends the search, and the clause is red there.
         let (file, draft_file) = (open_target()?, open_draft()?);
         let mut paged_inputs = PlanInputs::describe(&file)?;
         let mut room = paged_inputs.room.0;
         let mut paged = None;
+        let mut refused = None;
         for _ in 0..24 {
             paged_inputs.room = (room, HostRead::Given);
             match paged_inputs.plan_mtp_with(
@@ -4706,10 +4708,40 @@ mod gate {
                     break;
                 }
                 Ok(_) => room /= 2,
-                Err(_) => break,
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
             }
         }
         let Some(plan) = paged else {
+            // The split dial gives an arena only where half the host leg lies above the floor
+            // and the arena's least (`ArenaDial::peak`); the fixture's four layers, half of
+            // each one's experts on the host, lie under it at any room. The search then ends
+            // at the floor with a refusal that counts no arena's least, and the fixture tier
+            // leaves the clause to the real tier by name. Any other end of the search, and the
+            // real tier, are red.
+            let no_deep_side = paged_inputs.arena.is_none()
+                && matches!(
+                    refused,
+                    Some(PlaceError::Placement(PlacementError::HostRoomFloor {
+                        arena: None,
+                        ..
+                    }))
+                );
+            println!(
+                "(pg) the search ended at room {room} B: {}",
+                refused.map_or_else(|| "24 halvings".to_string(), |e| e.to_string())
+            );
+            if no_deep_side
+                && !tier::run_clause(
+                    "(pg) a room above the tier's floor pages this file's host experts through \
+                     an arena",
+                    Tag::FileBound,
+                )?
+            {
+                return Ok(true);
+            }
             println!(
                 "(pg) no room above the tier's floor pages this file's host experts {}",
                 verdict(false)
