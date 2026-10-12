@@ -875,6 +875,7 @@ impl Plans<'_> {
                 .ok_or("a plan with no card")?
                 .expert_bytes,
             nvme: plan.host.nvme_expert_bytes,
+            arena: plan.host.nvme_arena_bytes,
         })
     }
 

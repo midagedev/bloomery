@@ -59,9 +59,10 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 
 ### Known issues and limits (0.3.1)
 
-- **A paged load's default context costs NVMe reads it does not print.** The context grows to the card's fit, and
-  the per-slot checkpoint reserve grows with it and comes out of the NVMe arena: about 0.9 GB at 28,881 positions on a
-  12 GB card, about 2.8 % more NVMe reads [derived]. Set `--ctx-size` to keep the arena. 0.3.2 counts and prints it.
+- **A paged load's default context counts the NVMe arena it gives up.** The context grows while the misses a step
+  (the experts it moves to NVMe, plus the arena the per-slot checkpoint reserve takes) stay within 1 % of the base's,
+  and the `ctx` line prints `arena=` and `base_arena=`. On a 12 GB card the one-slot default is 12,288 positions
+  under that bound [derived on the Flash-Next fixture]; `--ctx-size` sets it by hand.
 - **Qwen3.8's MTP draft:** a request that keeps a cached prefix runs with the draft off. The prompt-state save after a
   request adds 100–160 ms to the next request's first token ([#46](https://github.com/midagedev/bloomery/issues/46)).
 - **Quant types not loaded yet:** Q2_0, IQ2_S, IQ2_XXS and IQ1_M routed experts

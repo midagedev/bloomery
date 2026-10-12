@@ -6,9 +6,10 @@
 //! the mimo2 default runs ([`searched`]) and the slot count a `--ctx` flag
 //! buys ([`slots_of`]) — more positions on the card push card experts to the
 //! host, and decode crawls, so a context the flag did not name never trades
-//! away more than the margin of stage-card expert bytes, and never pages more
-//! than [`NVME_SLACK_DIV`]'s fraction of the base's NVMe expert bytes past
-//! them: no expert at all on a plan whose base pages none. The plan a seat
+//! away more than the margin of stage-card expert bytes, and never misses the
+//! arena on more than [`NVME_SLACK_DIV`]'s fraction of the base's missed
+//! expert bytes past them ([`ExpertBytes::miss`]): none at all on a plan whose
+//! base misses none. The plan a seat
 //! probes at each context is its own (the models' placements differ); these
 //! are the terms the seats already share, and every model-specific input —
 //! the plan's bytes, the base a slot, the step, the margin, the cap — enters
@@ -98,38 +99,52 @@ pub struct ExpertBytes {
     pub card: u64,
     /// Experts the plan leaves on the NVMe tier.
     pub nvme: u64,
+    /// The RAM arena the plan leaves that tier ([`ExpertBytes::miss`]'s
+    /// other term): the plan's `nvme_arena_bytes`, 0 on a plan that pages
+    /// nothing or holds no arena.
+    pub arena: u64,
 }
 
-/// The divisor of the NVMe expert bytes a deeper default context may page
-/// past the base's: at most `base.nvme / NVME_SLACK_DIV`.
+/// The divisor of the missed expert bytes a deeper default context may add
+/// to the base's: at most `miss(base) / NVME_SLACK_DIV`.
 ///
-/// When NVMe reads bound the decode step, paging `Δ` more bytes slows it by
-/// at most `Δ / base.nvme`: routing spreads uniformly over the paged experts
-/// and the tier's arena does not hit more often, so every paged byte adds
-/// its share of the step's reads and no more. A hundredth is a decode cost
-/// under the A/B ruler (same-binary SD 0.6 %, a 95 % interval of ±1.0 % at
-/// four rounds), so the default buys positions at a price no A/B can see,
-/// and a plan that pages nothing at the base pages nothing at a deeper
-/// context (`0 / NVME_SLACK_DIV`). The arena's own shrink as the context
-/// grows is not counted here ([`ExpertBytes`] carries no arena).
+/// When NVMe reads bound the decode step, reading `Δ` more bytes from the
+/// tier slows it by at most `Δ / miss(base)`: routing spreads uniformly over
+/// the paged experts, the arena holds its share of them, and every missed
+/// byte adds its share of the step's reads and no more. A deeper context
+/// moves the missed bytes by two terms that add: the experts the plan moves
+/// to the tier (`Δnvme`), and the arena it gives up (`-Δarena`), because the
+/// KV positions and the checkpoints a slot reserves on the host (one more
+/// point for each ubatch of the prompt) come out of the room the arena is
+/// carved from. A hundredth is a decode cost under the A/B ruler (same-binary
+/// SD 0.6 %, a 95 % interval of ±1.0 % at four rounds), so the default buys
+/// positions at a price no A/B can see, and a plan that misses nothing at the
+/// base misses nothing at a deeper context (`0 / NVME_SLACK_DIV`).
 pub const NVME_SLACK_DIV: u64 = 100;
 
 impl ExpertBytes {
-    /// The NVMe expert bytes a plan deeper than this one (the base's) may
-    /// page more than it does: [`NVME_SLACK_DIV`]'s fraction, 0 when the
-    /// base pages none.
+    /// The expert bytes a step reads from the NVMe tier past the arena: the
+    /// tier's bytes less the arena that holds a share of them.
+    #[must_use]
+    pub fn miss(self) -> u64 {
+        self.nvme.saturating_sub(self.arena)
+    }
+
+    /// The missed expert bytes a plan deeper than this one (the base's) may
+    /// add: [`NVME_SLACK_DIV`]'s fraction of [`ExpertBytes::miss`], 0 when
+    /// the base misses none.
     #[must_use]
     pub fn nvme_bound(self) -> u64 {
-        self.nvme / NVME_SLACK_DIV
+        self.miss() / NVME_SLACK_DIV
     }
 
     /// Whether this plan, a deeper context's, is within `margin` of `base`'s:
     /// at most `margin` fewer card expert bytes and at most
-    /// [`ExpertBytes::nvme_bound`] more NVMe expert bytes. The one owner of
+    /// [`ExpertBytes::nvme_bound`] more missed expert bytes. The one owner of
     /// "within" for [`default_slot_ctx`].
     fn within(self, base: Self, margin: u64) -> bool {
         base.card.saturating_sub(self.card) <= margin
-            && self.nvme <= base.nvme.saturating_add(base.nvme_bound())
+            && self.miss() <= base.miss().saturating_add(base.nvme_bound())
     }
 }
 
@@ -308,7 +323,7 @@ pub struct SlotCtx {
     pub chosen: ExpertBytes,
     /// The margin the rule held `chosen` to.
     pub margin: u64,
-    /// The NVMe expert bytes the rule let `chosen` page past the base's
+    /// The missed expert bytes the rule let `chosen` add to the base's
     /// ([`ExpertBytes::nvme_bound`] of `base`).
     pub nvme_bound: u64,
 }
@@ -317,15 +332,16 @@ impl SlotCtx {
     /// The `ctx` line a seat prints on stderr: every context a slot's,
     /// `total` the sum of the `slots`', `base` the context the margin counts
     /// against, `lost_bytes` the card expert bytes the chosen plan holds
-    /// fewer than the base's, `nvme_bound` the NVMe expert bytes it may page
-    /// past the base's (`nvme_expert_bytes` against `base_nvme_expert_bytes`).
+    /// fewer than the base's, `nvme_bound` the missed expert bytes it may add
+    /// to the base's: `nvme_expert_bytes` less `arena` against
+    /// `base_nvme_expert_bytes` less `base_arena`.
     #[must_use]
     pub fn line(&self, slots: usize) -> String {
         format!(
             "ctx rule={} ctx={} slots={slots} total={} cap={} fit={} fit_card_expert_bytes={} \
              margin_ctx={} base={} base_card_expert_bytes={} base_nvme_expert_bytes={} \
-             card_expert_bytes={} nvme_expert_bytes={} nvme_bound={} lost_bytes={} \
-             margin_bytes={}",
+             card_expert_bytes={} nvme_expert_bytes={} arena={} base_arena={} nvme_bound={} \
+             lost_bytes={} margin_bytes={}",
             self.rule,
             self.ctx,
             slots * self.ctx,
@@ -338,6 +354,8 @@ impl SlotCtx {
             self.base.nvme,
             self.chosen.card,
             self.chosen.nvme,
+            self.chosen.arena,
+            self.base.arena,
             self.nvme_bound,
             self.base.card.saturating_sub(self.chosen.card),
             self.margin
@@ -349,13 +367,14 @@ impl SlotCtx {
 /// `fit` ([`fit_of`] up to `cap`) when it is under `base` ([`RULE_CARD`]:
 /// the card holds fewer than a base context), else the largest multiple of
 /// `step` up to `fit` whose plan holds at most `margin` fewer card expert
-/// bytes than the plan at `base` and pages at most [`ExpertBytes::nvme_bound`]
-/// more NVMe expert bytes — `fit` when its plan does ([`RULE_FIT`]), `base`
+/// bytes than the plan at `base` and misses the arena on at most
+/// [`ExpertBytes::nvme_bound`] more expert bytes — `fit` when its plan does ([`RULE_FIT`]), `base`
 /// when no step past it does ([`RULE_BASE`], and a fit at the base), else the
-/// step that binds ([`RULE_MARGIN`]). The NVMe clause stops a deeper context
-/// from buying positions with experts a tier slower than the host's beyond
-/// [`NVME_SLACK_DIV`]'s fraction of the base's: none on a base that pages
-/// none.
+/// step that binds ([`RULE_MARGIN`]). The miss clause stops a deeper context
+/// from buying positions with reads from a tier slower than the host's
+/// beyond [`NVME_SLACK_DIV`]'s fraction of the base's, whether it pays with
+/// experts moved to the tier or with the arena it gives up: none on a base
+/// that misses none.
 ///
 /// `probe` plans one context. A context past the base whose plan is refused
 /// is not within (a probe is never the seat's refusal), and each context is
@@ -364,7 +383,8 @@ impl SlotCtx {
 /// The scan is a bisection over the multiples of `step`, after the probes of
 /// the fit search, where a linear scan would take one probe a step: it
 /// assumes `probe` is monotone in the context — card expert bytes never
-/// rise, NVMe expert bytes never fall and a refused plan stays refused as
+/// rise, missed expert bytes never fall (the NVMe bytes never fall and the
+/// arena never grows) and a refused plan stays refused as
 /// the context deepens, the solver trading experts for positions only one
 /// way — so the contexts within are a prefix. A probe is a plan solve: past
 /// the fit search's and the base's, the `n` multiples of `step` between the
@@ -706,6 +726,7 @@ mod tests {
             Ok(ExpertBytes {
                 card: card.saturating_sub((c.saturating_sub(at) as u64) * per),
                 nvme: nvme(c),
+                arena: 0,
             })
         }
     }
@@ -759,6 +780,7 @@ mod tests {
                 Ok(ExpertBytes {
                     card: CARD - c as u64,
                     nvme: 0,
+                    arena: 0,
                 })
             } else {
                 Err(format!("past {edge}"))
@@ -994,6 +1016,7 @@ mod tests {
                 Ok(ExpertBytes {
                     card: CARD,
                     nvme: 0,
+                    arena: 0,
                 })
             });
             let got = got.expect("a plan");
@@ -1063,6 +1086,53 @@ mod tests {
             "{}",
             got.line(1)
         );
+    }
+
+    /// The miss clause counts both terms of the trade: a deeper context whose
+    /// NVMe bytes equal the base's but whose arena is smaller by more than a
+    /// hundredth of the base's missed bytes is refused (the NVMe-bytes clause
+    /// alone passes it), one inside the bound is accepted, the bound itself
+    /// is within, and the card clause still binds.
+    #[test]
+    fn within_counts_the_arena_a_deeper_context_gives_up() {
+        const NVME: u64 = 10_000_000;
+        const ARENA: u64 = 4_000_000;
+        let base = ExpertBytes {
+            card: CARD,
+            nvme: NVME,
+            arena: ARENA,
+        };
+        let bound = (NVME - ARENA) / NVME_SLACK_DIV;
+        assert_eq!((base.miss(), base.nvme_bound()), (6_000_000, 60_000));
+        let deeper = |nvme: u64, arena: u64, card: u64| ExpertBytes { card, nvme, arena };
+        // The arena alone gives up the bound and one byte: refused, though
+        // the NVMe bytes are the base's and a hundredth of them is 100,000 B.
+        let refused = deeper(NVME, ARENA - bound - 1, CARD);
+        assert!(refused.nvme <= NVME + NVME / NVME_SLACK_DIV);
+        assert!(!refused.within(base, 0), "the arena's shrink passes unseen");
+        assert!(
+            deeper(NVME, ARENA - bound, CARD).within(base, 0),
+            "the bound"
+        );
+        assert!(deeper(NVME, ARENA - bound / 2, CARD).within(base, 0));
+        // Both terms add: experts moved to the tier and arena given up.
+        assert!(!deeper(NVME + 30_000, ARENA - 30_001, CARD).within(base, 0));
+        assert!(deeper(NVME + 30_000, ARENA - 30_000, CARD).within(base, 0));
+        // An arena that grows pays for experts moved to the tier.
+        assert!(deeper(NVME + 100_000, ARENA + 100_000, CARD).within(base, 0));
+        // The card clause is the margin's, whatever the miss.
+        assert!(!deeper(NVME, ARENA, CARD - 1).within(base, 0));
+        assert!(deeper(NVME, ARENA, CARD - 1).within(base, 1));
+        // A base that misses nothing (its arena holds every paged byte, or it
+        // pages none) misses nothing deeper.
+        let covered = ExpertBytes {
+            card: CARD,
+            nvme: NVME,
+            arena: NVME,
+        };
+        assert_eq!(covered.nvme_bound(), 0);
+        assert!(deeper(NVME, NVME, CARD).within(covered, 0));
+        assert!(!deeper(NVME, NVME - 1, CARD).within(covered, 0));
     }
 
     /// A base that pages nothing pages nothing deeper: its bound is 0 bytes,
@@ -1197,7 +1267,10 @@ mod tests {
     }
 
     /// The `ctx` line the seats print: its field names are what the gates
-    /// read, in this order — the margin rule's line (an example plan whose
+    /// read, in this order. PIN(2026-10-12): `arena=` and `base_arena=` join
+    /// the line beside `nvme_bound=`, whose bound is now the missed bytes'
+    /// hundredth; every other field and its order are the line's before.
+    /// The margin rule's line (an example plan whose
     /// card loses 48 KiB a position past the base, for a margin of 1 GiB) and
     /// the card rule's.
     #[test]
@@ -1211,8 +1284,8 @@ mod tests {
             "ctx rule=margin ctx=25856 slots=2 total=51712 cap=262144 fit=100000 \
              fit_card_expert_bytes=4286126592 margin_ctx=25856 base=4096 \
              base_card_expert_bytes=9000000000 base_nvme_expert_bytes=0 \
-             card_expert_bytes=7930452480 nvme_expert_bytes=0 nvme_bound=0 \
-             lost_bytes=1069547520 margin_bytes=1073741824"
+             card_expert_bytes=7930452480 nvme_expert_bytes=0 arena=0 base_arena=0 \
+             nvme_bound=0 lost_bytes=1069547520 margin_bytes=1073741824"
         );
         let got = default_slot_ctx(3000, AT, STEP, 1 << 30, &probe).expect("a plan");
         assert_eq!(
@@ -1220,8 +1293,8 @@ mod tests {
             "ctx rule=card ctx=3000 slots=1 total=3000 cap=3000 fit=3000 \
              fit_card_expert_bytes=9000000000 margin_ctx=3000 base=3000 \
              base_card_expert_bytes=9000000000 base_nvme_expert_bytes=0 \
-             card_expert_bytes=9000000000 nvme_expert_bytes=0 nvme_bound=0 lost_bytes=0 \
-             margin_bytes=1073741824"
+             card_expert_bytes=9000000000 nvme_expert_bytes=0 arena=0 base_arena=0 \
+             nvme_bound=0 lost_bytes=0 margin_bytes=1073741824"
         );
     }
 

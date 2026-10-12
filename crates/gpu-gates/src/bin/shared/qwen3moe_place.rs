@@ -459,6 +459,7 @@ impl PlaceQ3 {
                 .ok_or("a plan with no card")?
                 .expert_bytes,
             nvme: plan.host.nvme_expert_bytes,
+            arena: plan.host.nvme_arena_bytes,
         })
     }
 
@@ -912,6 +913,7 @@ fn default_over(
             return Ok(ExpertBytes {
                 card: routed_bytes(inputs_model(&probe.inputs)),
                 nvme: 0,
+                arena: 0,
             });
         }
         let machine = probe.machine_at((sizing.arena)(total)?, u64::try_from(ctx)?)?;

@@ -977,14 +977,15 @@ mod gate {
         Ok(free)
     }
 
-    /// The plan's stage-card expert bytes on the gate card at `ctx`, plain,
-    /// as the server makes it; `None` when no plan takes the context.
+    /// The plan's stage-card expert bytes, NVMe expert bytes and NVMe arena
+    /// on the gate card at `ctx`, plain, as the server makes it; `None` when
+    /// no plan takes the context.
     fn card_at(
         inputs: &PlanInputs,
         levers: &PlanLevers,
         ctx: usize,
         free: Option<u64>,
-    ) -> Result<Option<(u64, u64)>, GateError> {
+    ) -> Result<Option<(u64, u64, u64)>, GateError> {
         // The seat's ctx rule probes a machine per context, its checkpoints reserved at that probe's.
         let mut machine = workstation::plan_gate(inputs.model.layers);
         reserve_checkpoints(
@@ -997,9 +998,13 @@ mod gate {
             .plan(&machine, u64::try_from(ctx)?, levers)
             .ok()
             .and_then(|p| {
-                p.cards
-                    .first()
-                    .map(|c| (c.expert_bytes, p.host.nvme_expert_bytes))
+                p.cards.first().map(|c| {
+                    (
+                        c.expert_bytes,
+                        p.host.nvme_expert_bytes,
+                        p.host.nvme_arena_bytes,
+                    )
+                })
             }))
     }
 
@@ -1105,22 +1110,28 @@ mod gate {
         let plan_levers = PlanLevers::from_levers(levers)?;
         let free = Some(server_card_free(&err_log)?);
         let at = |c: usize| card_at(&inputs, &plan_levers, c, free);
-        let (base, base_nvme) = at(CTX)?.ok_or("no plan at the base context")?;
+        let (base, base_nvme, base_arena) = at(CTX)?.ok_or("no plan at the base context")?;
+        let base_miss = base_nvme.saturating_sub(base_arena);
         let margin = model::placement::workstation::MARGIN;
         // Whether the plan at `c` is within the rule's margin of the base's:
         // at most `margin` fewer card expert bytes and at most a hundredth of
-        // the base's NVMe expert bytes more, re-derived from the gate's own
-        // plans; `None` when no plan takes the context.
+        // the base's missed expert bytes (the NVMe bytes less the arena) more,
+        // re-derived from the gate's own plans; `None` when no plan takes the
+        // context.
         //
-        // PIN(2026-10-12): the default pages at most `base_nvme / 100` bytes
-        // past the base's (the rule's `NVME_SLACK_DIV`), where it paged none
-        // past it: the gate holds the divisor as its own literal, never the
-        // line's `nvme_bound`.
+        // PIN(2026-10-12): the default misses at most `base_miss / 100` bytes
+        // past the base's (the rule's `NVME_SLACK_DIV`), the arena a deeper
+        // context gives up counted beside the experts it moves to the tier,
+        // where it paged none past it: the gate holds the divisor as its own
+        // literal, never the line's `nvme_bound`. Tightens the NVMe-bytes
+        // clause it replaces: an arena that never grows with the context
+        // makes the NVMe bytes' growth no more than the misses'.
         const NVME_DIV: u64 = 100;
-        let slack = base_nvme / NVME_DIV;
+        let slack = base_miss / NVME_DIV;
         let within = |c: usize| -> Result<Option<bool>, GateError> {
-            Ok(at(c)?.map(|(card, nvme)| {
-                base.saturating_sub(card) <= margin && nvme <= base_nvme + slack
+            Ok(at(c)?.map(|(card, nvme, arena)| {
+                base.saturating_sub(card) <= margin
+                    && nvme.saturating_sub(arena) <= base_miss + slack
             }))
         };
         let here = within(margin_ctx)?;
@@ -1179,9 +1190,21 @@ mod gate {
         check(
             &mut ok,
             "ctx_line_prints_the_nvme_bound",
+            // The arena is the host room's (read when the server starts), so
+            // the line's own terms carry it: the bound is a hundredth of the
+            // base's missed bytes as the line states them, and the chosen
+            // plan's missed bytes are inside it; the NVMe bytes are the plan's.
             bytes("base_nvme_expert_bytes") == Some(base_nvme)
-                && bytes("nvme_bound") == Some(slack)
-                && at_ctx.is_some_and(|e| e.1 <= base_nvme + slack),
+                && bytes("nvme_bound")
+                    == bytes("base_arena").map(|a| base_nvme.saturating_sub(a) / NVME_DIV)
+                && bytes("nvme_expert_bytes")
+                    .zip(bytes("arena"))
+                    .zip(bytes("base_arena"))
+                    .is_some_and(|((nvme, arena), base_arena)| {
+                        nvme.saturating_sub(arena)
+                            <= base_nvme.saturating_sub(base_arena)
+                                + base_nvme.saturating_sub(base_arena) / NVME_DIV
+                    }),
         );
 
         // The flag arm: below the floor, the flag wins.

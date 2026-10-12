@@ -759,15 +759,16 @@ mod gate {
     }
 
     /// Whether a default `ctx` line's NVMe terms hold the rule's contract,
-    /// recomputed here from the line's `base_nvme_expert_bytes` (never
-    /// trusting its `nvme_bound`): the chosen plan pages at most a hundredth
-    /// of the base's bytes more, and the line names that hundredth. `None`
+    /// recomputed here from the line's `base_nvme_expert_bytes` and
+    /// `base_arena` (never trusting its `nvme_bound`): the chosen plan misses
+    /// the arena on at most a hundredth of the base's missed bytes (the NVMe
+    /// bytes less the arena) more, and the line names that hundredth. `None`
     /// when a term is missing.
     fn nvme_held(line: &str) -> Option<bool> {
         let num = |k: &str| field_u64(line, k);
         let (base, now, bound) = (
-            num("base_nvme_expert_bytes")?,
-            num("nvme_expert_bytes")?,
+            num("base_nvme_expert_bytes")?.saturating_sub(num("base_arena")?),
+            num("nvme_expert_bytes")?.saturating_sub(num("arena")?),
             num("nvme_bound")?,
         );
         Some(bound == base / NVME_DIV && now <= base + base / NVME_DIV)
@@ -1361,10 +1362,14 @@ mod gate {
     /// verdict that picks the load, and the least default the card holds.
     const SEAT_FLOOR: u64 = 4096;
 
-    // PIN(2026-10-12): the default pages at most `base_nvme_expert_bytes / 100`
-    // bytes past the base's (the rule's `NVME_SLACK_DIV`), where it paged none
-    // past it: the gate holds the divisor as its own literal and recomputes
-    // the bound from the line's base, never trusting its `nvme_bound`.
+    // PIN(2026-10-12): the default misses at most `(base_nvme_expert_bytes -
+    // base_arena) / 100` bytes past the base's (the rule's `NVME_SLACK_DIV`),
+    // the arena a deeper context gives up counted beside the experts it moves
+    // to the tier, where it paged none past it: the gate holds the divisor as
+    // its own literal and recomputes the bound from the line's base, never
+    // trusting its `nvme_bound`. Tightens the NVMe-bytes clause it replaces:
+    // an arena that never grows with the context makes the NVMe bytes' growth
+    // no more than the misses'.
     const NVME_DIV: u64 = 100;
 
     /// The terms of one whole-fit line (`whole fit at ctx …: the whole load

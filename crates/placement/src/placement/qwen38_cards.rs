@@ -240,9 +240,20 @@ const BESIDE: u64 = 9 * 4 * 2560 * 4 + 4;
 /// position) and the arena rows ([`BESIDE`] less its lane word).
 fn state38(ctx: u64, drafts: bool) -> u64 {
     let attention = 12 * (ctx * 2304 + ctx.div_ceil(4) * 256);
-    let checkpoint = 36 * 3_596_288 + 17 * 4 * 2560 * 4;
     let draft = if drafts { ctx * 2048 + BESIDE - 4 } else { 0 };
-    attention + 2 * checkpoint + draft
+    attention + 2 * CHECKPOINT_38 + draft
+}
+
+/// One checkpoint's host bytes: the 36 delta layers' committed state lane
+/// and conv ring, and the PLE ring ([`state38`]'s term).
+const CHECKPOINT_38: u64 = 36 * 3_596_288 + 17 * 4 * 2560 * 4;
+
+/// The checkpoints a slot reserves on the host in a load of `ctx` positions
+/// a slot (`runtime::seqstate::Price::budget`, whose crate this one does not
+/// see): the points one prompt call over the whole context takes, one at
+/// each ubatch of 4,096 positions and one at its end, and one more.
+fn points_38(ctx: u64) -> u64 {
+    ctx.div_ceil(4096) + 1
 }
 
 /// The stage card of `qwen35moe::place::machine_for_experts(spec, 48, 4096,
@@ -1944,38 +1955,56 @@ const ROOM_32: u64 = 27_294_000_000;
 const SEAT_CTX: usize = 4096;
 const SEAT_CAP: usize = 262_144;
 
-/// The seat's default-context rule over the file's plan on [`CARD_12`] beside
+/// The plan the seat probes at `ctx` positions a slot on [`CARD_12`] beside
 /// [`ROOM_32`] with no draft, for `slots` resident sequences and the split's
-/// arena `given` (`BLOOMERY_NVTIER_BYTES`): the plan's bytes at each context,
-/// a plan that breaks an invariant refused there.
+/// arena `given` (`BLOOMERY_NVTIER_BYTES`): its bytes by tier, the arena the
+/// host room leaves after the checkpoints every slot reserves at that
+/// context ([`points_38`]), a plan that breaks an invariant refused there.
+fn expert_bytes_on_12(
+    slots: u64,
+    given: Option<u64>,
+    ctx: usize,
+) -> Result<super::ctx::ExpertBytes, PlacementError> {
+    let q4 = model(false);
+    let mut card = machine_a(CARD_12);
+    let ctx = ctx as u64;
+    card.host.reserves.push((
+        "checkpoints".to_string(),
+        slots * points_38(ctx) * CHECKPOINT_38,
+    ));
+    let plan = planned(&q4, &card, ctx, slots, ROOM_32, Some(given))?;
+    let broken = plan.violations();
+    if !broken.is_empty() {
+        return Err(PlacementError::Metadata {
+            key: "the plan".to_string(),
+            detail: format!("{broken:?}"),
+        });
+    }
+    Ok(super::ctx::ExpertBytes {
+        card: plan.cards[0].expert_bytes,
+        nvme: plan.host.nvme_expert_bytes,
+        arena: plan.host.nvme_arena_bytes,
+    })
+}
+
+/// The seat's default-context rule over [`expert_bytes_on_12`]'s plans.
 fn default_on_12(slots: u64, given: Option<u64>) -> super::ctx::SlotCtx {
-    let (q4, card) = (model(false), machine_a(CARD_12));
     super::ctx::default_slot_ctx(SEAT_CAP, SEAT_CTX, CTX_STEP, MARGIN, &|ctx| {
-        let plan = planned(&q4, &card, ctx as u64, slots, ROOM_32, Some(given))?;
-        let broken = plan.violations();
-        if !broken.is_empty() {
-            return Err(PlacementError::Metadata {
-                key: "the plan".to_string(),
-                detail: format!("{broken:?}"),
-            });
-        }
-        Ok(super::ctx::ExpertBytes {
-            card: plan.cards[0].expert_bytes,
-            nvme: plan.host.nvme_expert_bytes,
-        })
+        expert_bytes_on_12(slots, given, ctx)
     })
     .expect("the default context")
 }
 
 /// Flash-Next (this file's table) on a 12 GB card beside a 32 GB host pages
 /// most of its experts through the NVMe tier at the base context, and every
-/// deeper context pushes a few more there: the default grows while the extra
-/// paged bytes stay within a hundredth of the base's ([`NVME_SLACK_DIV`]),
-/// where the strict rule kept the base. The card clause cannot bind: at the
-/// base the card holds under 1 GiB of experts. The base's bytes and the fit
-/// are the reporter's, to the byte.
+/// deeper context both pushes a few more there and gives up arena to the
+/// checkpoints a slot reserves: the default grows while the missed bytes
+/// (the tier's less the arena) stay within a hundredth of the base's
+/// ([`NVME_SLACK_DIV`]), where the strict rule kept the base. The card clause
+/// cannot bind: at the base the card holds under 1 GiB of experts. The base's
+/// bytes and the fit are the reporter's, to the byte.
 #[test]
-fn flash_next_on_a_12_gb_card_defaults_past_the_base_when_it_pages() {
+fn flash_next_on_a_12_gb_card_one_slot_stops_where_the_miss_bound_binds() {
     let one = default_on_12(1, None);
     assert_eq!(
         one.base.nvme, 74_413_158_400,
@@ -1983,32 +2012,51 @@ fn flash_next_on_a_12_gb_card_defaults_past_the_base_when_it_pages() {
     );
     assert_eq!(one.fit, 28_881, "the reported fit");
     assert!(one.base.card < 1 << 30, "the card clause cannot bind");
-    assert_eq!(one.nvme_bound, one.base.nvme / NVME_SLACK_DIV);
+    assert_eq!(one.nvme_bound, one.base.miss() / NVME_SLACK_DIV);
     assert!(
-        one.chosen.nvme - one.base.nvme <= one.nvme_bound,
-        "{} B paged past the base's {} B",
-        one.chosen.nvme - one.base.nvme,
-        one.base.nvme
+        one.chosen.miss() - one.base.miss() <= one.nvme_bound,
+        "{} B missed past the base's {} B",
+        one.chosen.miss() - one.base.miss(),
+        one.base.miss()
     );
-    assert_eq!((one.rule, one.ctx), (RULE_FIT, one.fit));
-    assert!(
-        one.ctx >= 8192,
-        "a prompt of ~6K tokens and its output fit: {}",
-        one.ctx
-    );
+    // PIN(2026-10-12): the default stops at 12,288, not at the fit. Derived:
+    // the arena is the room less the base's host need, the checkpoints
+    // (⌈ctx/4096⌉ + 1 points a slot) and the run-ahead window; the bound is
+    // miss(base) / 100 = 540,026,010 B. 12,288 holds 4 points and misses
+    // 498,917,376 B more than the base (41,108,634 B inside the bound);
+    // 12,544 holds the 5th point and misses 635,224,064 B more (95,198,054 B
+    // out). The fit's 28,881 holds 9 points and misses a fiftieth more than
+    // the base, which the rule used to take for the NVMe bytes alone.
+    assert_eq!((one.rule, one.ctx), (RULE_MARGIN, 12_288));
+    assert_eq!(one.base.arena, 20_410_557_312);
+    assert_eq!(one.chosen.arena, 20_138_251_136);
+    assert_eq!(one.chosen.miss() - one.base.miss(), 498_917_376);
+    let next = expert_bytes_on_12(1, None, 12_544).expect("a plan");
+    assert_eq!(next.miss() - one.base.miss(), 635_224_064);
+    assert!(next.miss() - one.base.miss() > one.nvme_bound);
+    assert_eq!([4096, 12_288, 12_544, 28_881].map(points_38), [2, 4, 5, 9]);
 }
 
 /// The same host's other cells [derived: the plan's bytes at each context
 /// against the bound]: two slots stop at the card's fit, 6,165 positions a
 /// slot, with the bound far from binding; one slot with no arena
-/// (`BLOOMERY_NVTIER_BYTES=0`) pages 608 MB more at its fit against a bound
-/// of 537 MB, so the bound binds at the last step within it.
+/// (`BLOOMERY_NVTIER_BYTES=0`) misses every paged byte, the checkpoints'
+/// points reaching the NVMe bytes, so the bound binds at the last step
+/// within it.
 #[test]
 fn flash_next_on_a_12_gb_card_stops_at_the_fit_or_the_bound() {
     for (slots, given, ctx, rule) in [
         (2, None, 6165, RULE_FIT),
         (2, Some(0), 6165, RULE_FIT),
-        (1, Some(0), 26_112, RULE_MARGIN),
+        // PIN(2026-10-12): 12,288, not 26,112. The probe reserves the
+        // checkpoints a slot holds at each context ([`points_38`]), which the
+        // fixture did not; with no arena they reach the NVMe bytes. Derived:
+        // the bound is 54,002,790,400 / 100 = 540,027,904 B; 12,288 holds 4
+        // points and pages 498,380,800 B more than the base (41,647,104 B
+        // inside), 12,544 holds the 5th and pages 633,446,400 B more (93,418,496
+        // B out). Re-pin by the fixture, not a relaxation: the rule is the
+        // shipped one on an arena of 0.
+        (1, Some(0), 12_288, RULE_MARGIN),
     ] {
         let got = default_on_12(slots, given);
         assert_eq!(
@@ -2016,6 +2064,6 @@ fn flash_next_on_a_12_gb_card_stops_at_the_fit_or_the_bound() {
             (ctx, rule),
             "{slots} slots, arena {given:?}"
         );
-        assert!(got.chosen.nvme - got.base.nvme <= got.nvme_bound);
+        assert!(got.chosen.miss() - got.base.miss() <= got.nvme_bound);
     }
 }
