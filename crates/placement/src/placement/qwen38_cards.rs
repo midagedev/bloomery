@@ -18,8 +18,8 @@ use super::ctx::{CtxError, within_cache};
 use super::workstation::{
     A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HostNeed, HostRead,
     MARGIN, MIB, PLAN_ROOM, Pick, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
-    census_usable, host, host_of, resolve, tier_batch_host_bytes, tier_batch_staging_bytes,
-    unified_of,
+    census_usable, host, host_of, plan_room, resolve, tier_batch_host_bytes,
+    tier_batch_staging_bytes, unified_of,
 };
 use super::{
     ARENA_ALIGN, ARENA_COLUMNS, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, CardFormat, Device,
@@ -1024,6 +1024,36 @@ fn a_paged_plans_load_check_counts_the_arena() {
         .expect_err("one byte short")
         .to_string();
     assert!(!text.contains("NVMe tier arena"), "{text}");
+}
+
+/// A deep split fills its room, so a plan made at the host's reading itself
+/// passes the load's check only while the reading holds. A plan made at
+/// [`plan_room`] of a read room keeps the drift margin and passes the check
+/// at a reading the process's own start has lowered by less than that
+/// margin.
+#[test]
+fn a_read_rooms_plan_holds_at_a_lowered_reading() {
+    const READ: u64 = 27_631_529_984;
+    const LOWERED: u64 = READ - 132_071_424;
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let room = plan_room(&(READ, HostRead::MemAvailable));
+    let plan = plan_at(&q4, &gate, 16384, 1, room).expect("the deep split plan");
+    let need = HostNeed::of(&plan, 0);
+    assert!(need.arena > 0, "the room is a deep split's");
+    assert_eq!(need.check(LOWERED), Ok(()));
+}
+
+/// A room the caller gave plans as given: the plan at [`plan_room`] of a
+/// given room is the plan at that room.
+#[test]
+fn a_given_room_plans_as_given() {
+    const GIVEN: u64 = 27_631_529_984;
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let room = plan_room(&(GIVEN, HostRead::Given));
+    assert_eq!(room, GIVEN);
+    let at = plan_at(&q4, &gate, 16384, 1, room).expect("the plan at the given room");
+    let direct = plan_at(&q4, &gate, 16384, 1, GIVEN).expect("the plan at the room");
+    assert_eq!(format!("{at:?}"), format!("{direct:?}"));
 }
 
 /// The seat's prompt-cache budget counts the arena once: `HostNeed::bytes`
