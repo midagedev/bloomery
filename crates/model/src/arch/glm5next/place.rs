@@ -68,16 +68,50 @@ fn is_kquant(ty: GgmlType) -> bool {
     )
 }
 
-/// The routed stacks the program's card experts run, in their file bytes
-/// ([`CardFormat::KQuant`]): Q4_K (the gate·up) and Q5_K (a gate·up or the
-/// down `_sel`). A layer with a stack of any other type — the Q6_K downs —
-/// keeps its experts on the host.
+/// The routed stacks the card experts read, each as the file stores it
+/// ([`CardFormat::KQuant`]): the types the common card leg runs
+/// ([`placement::kernels::card_runs`]). The rule reads a stack's type alone; a
+/// layer with a stack of any other type — the Q6_K downs — keeps its experts
+/// on the host.
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    match ty {
-        GgmlType::Q4_K | GgmlType::Q5_K => CardFormat::of(ty),
-        _ => None,
-    }
+    placement::kernels::card_runs(ty).then_some(CardFormat::KQuant)
+}
+
+/// Whether a card layer of gate·up type `gate` and down type `down` runs a
+/// prompt batch on the grouped tile kernels (Q4_K and Q5_K, either role); a
+/// card layer of any other [`card_routed`] type runs it on the card leg in
+/// chunks of [`TIER_CHUNK`] tokens ([`card_leg_bytes`]).
+#[must_use]
+pub const fn card_tiles_run(gate: GgmlType, down: GgmlType) -> bool {
+    matches!(gate, GgmlType::Q4_K | GgmlType::Q5_K)
+        && matches!(down, GgmlType::Q4_K | GgmlType::Q5_K)
+}
+
+/// Card bytes of the card leg's buffers a prompt batch's card layers run on
+/// when their stacks are not [`card_tiles_run`]'s: one run of
+/// [`TIER_CHUNK`] tokens of `n` values through experts of `ff` rows, `used`
+/// slots a token ([`workstation::tier_chunk_scratch_bytes`], the leg's
+/// buffers). The one formula of those bytes: the card body's scratch checks
+/// its made bytes against it.
+#[must_use]
+pub fn card_leg_bytes(n: usize, ff: usize, used: usize) -> usize {
+    let b = workstation::tier_chunk_scratch_bytes(n as u64, ff as u64, used as u64, TIER_CHUNK);
+    usize::try_from(b).unwrap_or(usize::MAX)
+}
+
+/// Whether the file holds a routed stack the card experts read
+/// ([`card_routed`]) that the tile kernels do not ([`card_tiles_run`]), so a
+/// card layer of it runs a prompt batch on the card leg and the plan reserves
+/// [`card_leg_bytes`] beside the tiles' scratch. Read from the headers alone;
+/// a load whose card layers are all tile layers makes no leg buffers.
+#[must_use]
+pub fn card_leg_needed(model: &ModelTensors) -> bool {
+    model.tensors.iter().any(|t| {
+        t.role == Role::RoutedExperts
+            && card_routed(t.ty).is_some()
+            && !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q5_K)
+    })
 }
 
 /// Tokens a chunk of the tier's prompt-batch service runs at most: the
@@ -261,7 +295,8 @@ pub fn card_tile_bytes(n: usize, ff: usize, used: usize, cap: usize) -> usize {
 /// The card bytes the plan reserves on the stage card for a load of `inputs`'s
 /// prompt batch at `ctx_max` positions: its GEMM front
 /// ([`prompt_front_bytes`]), the card experts' grouped scratch
-/// ([`card_tile_bytes`] at the front's columns) and the units a group of
+/// ([`card_tile_bytes`] at the front's columns, plus [`card_leg_bytes`] for a
+/// file [`card_leg_needed`] names) and the units a group of
 /// [`PROMPT_GROUP`] holds past the first ([`runtime::prompt::group_sets`], [`unit_bytes`] at
 /// the front's columns, the tier places when `tiered`). The first unit and
 /// the other buffers the units share come out of the card's margin.
@@ -270,7 +305,10 @@ pub fn prompt_reserve_bytes(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> 
     let hp = &inputs.hp;
     let cols = prompt_cols(ctx_max);
     let unit = unit_bytes(hp.n_embd, cols, hp.hc.streams, hp.n_used, tiered);
-    let tiles = card_tile_bytes(hp.n_embd, hp.expert_ff, hp.n_used, cols);
+    let mut tiles = card_tile_bytes(hp.n_embd, hp.expert_ff, hp.n_used, cols);
+    if card_leg_needed(&inputs.model) {
+        tiles += card_leg_bytes(hp.n_embd, hp.expert_ff, hp.n_used);
+    }
     prompt_front_bytes(inputs, ctx_max) + (tiles + (group_sets(PROMPT_GROUP) - 1) * unit) as u64
 }
 
@@ -1417,7 +1455,7 @@ mod tests {
         use super::super::super::hparams::{Hc, Hparams, Indexer};
         use super::super::{
             DenseForms, KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
-            prompt_reserve_bytes, row_bytes,
+            card_leg_bytes, card_leg_needed, card_routed, prompt_reserve_bytes, row_bytes,
         };
         use crate::placement::workstation::HostRead;
         use crate::placement::{
@@ -1648,6 +1686,58 @@ mod tests {
             let (forms, widths) = with(&[[Q6_K, Q6_K, Q5_K], [Q8_0, Q8_0, Q8_0]]);
             assert_eq!(forms, DenseForms { rows32: true, ..k });
             assert_eq!(widths.forms, forms);
+        }
+
+        /// The card experts read every type the common card leg runs, and
+        /// only those; a file whose routed stacks are all Q4_K or Q5_K (or
+        /// host-only, as a Q6_K down) reserves the prompt batch's bytes it
+        /// reserved before, and one with a routed stack the tiles do not run
+        /// (an IQ3_S gate·up, an IQ4_XS down) reserves the card leg's
+        /// buffers beside them (mutant: the reserve without the leg term).
+        #[test]
+        fn the_card_leg_reserve_follows_the_routed_types() {
+            use GgmlType::{IQ3_S, IQ4_XS, Q4_K, Q5_K, Q6_K};
+            for id in 0..64 {
+                let ty = GgmlType::from_u32(id);
+                assert_eq!(
+                    card_routed(ty).is_some(),
+                    crate::placement::kernels::card_runs(ty),
+                    "{ty:?}"
+                );
+            }
+            let routed = |tys: [GgmlType; 3]| {
+                let mut i = inputs();
+                for (stem, ty) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                    .into_iter()
+                    .zip(tys)
+                {
+                    i.model.tensors.push(ModelTensor {
+                        name: format!("blk.1.{stem}.weight"),
+                        shard: 0,
+                        layer: Some(1),
+                        role: Role::RoutedExperts,
+                        ty,
+                        dims: vec![4096, 2048, 64],
+                        file_bytes: 0,
+                        gathered_rows: None,
+                    });
+                }
+                i
+            };
+            let plain = prompt_reserve_bytes(&inputs(), CTX, false);
+            for tys in [[Q4_K, Q4_K, Q5_K], [Q5_K, Q5_K, Q6_K], [Q4_K, Q4_K, Q4_K]] {
+                let i = routed(tys);
+                assert!(!card_leg_needed(&i.model), "{tys:?}");
+                assert_eq!(prompt_reserve_bytes(&i, CTX, false), plain, "{tys:?}");
+            }
+            let leg = card_leg_bytes(4096, 2048, 8) as u64;
+            // q8_1 of 8 rows of 4096, 64 slots' gate·up rows of 2048, their q8_1, their downs.
+            assert_eq!(leg, 103_424 + 524_288 + 413_696 + 1_048_576);
+            for tys in [[IQ3_S, IQ3_S, IQ4_XS], [Q4_K, Q4_K, IQ4_XS]] {
+                let i = routed(tys);
+                assert!(card_leg_needed(&i.model), "{tys:?}");
+                assert_eq!(prompt_reserve_bytes(&i, CTX, false), plain + leg, "{tys:?}");
+            }
         }
 
         /// A card's headroom and its terms: the plan's `headroom_bytes`, and

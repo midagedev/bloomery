@@ -44,10 +44,10 @@
 //!   stride, which the load's stack-size check, the byte check and `c1` all
 //!   pass, and the header's down size does not).
 //!   PIN(2026-10-01): the file's card layers share one part layout —
-//!   `card_routed` admits Q4_K and Q5_K alone and `eligible` needs every
-//!   stack of a layer routable, so the one Q5_K gate/up layer, whose down is
-//!   Q6_K, has no card slot — and per-layer part sizes are not exercised by
-//!   this file.
+//!   `card_routed` admits the common card leg's types, not Q6_K, and
+//!   `eligible` needs every stack of a layer routable, so the one Q5_K
+//!   gate/up layer, whose down is Q6_K, has no card slot — and per-layer part
+//!   sizes are not exercised by this file.
 //! - `steps` (the steps feed refused under the machine): a prompt fed one
 //!   decode step an id is refused by name while the machine runs, and the
 //!   batch feed still serves after it (mutant: the steps arm of the feed
