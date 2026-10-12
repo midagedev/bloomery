@@ -32,7 +32,7 @@ pub mod body;
 mod card;
 mod ffn;
 mod program;
-mod swap;
+pub mod swap;
 
 pub use body::prefill::{
     FLASH_ROWS, PrefillMode, PromptBytes, T_MAX, feed, prefill, prefill_group, prefill_mode,

@@ -41,7 +41,7 @@ mod scratch38;
 mod slot_pass;
 mod swap;
 mod swap35;
-mod swap38;
+pub mod swap38;
 mod taps;
 mod taps35;
 mod tier38;

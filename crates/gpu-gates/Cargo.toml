@@ -477,7 +477,7 @@ required-features = ["gpu"]
 
 [[bin]]
 name = "gate_routed_legs"
-required-features = ["gpu"]
+required-features = ["glm5next", "mimo2"]
 
 [[bin]]
 name = "gate_mimo2_flash"

@@ -1,16 +1,22 @@
 //! The common owner of gate_routed_legs: the census reading and checking,
 //! the arch → family dispatch, the card-room derivation, the retype sweep
-//! and the checks L1–L5. A family is added by one adapter file
+//! and the checks L1–L6. A family is added by one adapter file
 //! (`routed_legs/<family>.rs`, holding only what the family forces — how its
-//! production `--place`-unset defaults plan one split) and one row in
-//! [`family_of`]; no check and no per-family branch lives here. Every stub
-//! is planned from its header alone — the census writer's tensor bytes are
-//! all zero — so no planner step that reads data changes an answer.
+//! production `--place`-unset defaults plan one split, the loader's plan-time
+//! stack table where it has one, a leg-adjacent sweep triple where its leg is
+//! exact) and one row in [`family_of`]; no check and no per-family branch
+//! lives here. Every stub is planned from its header alone — the census
+//! writer's tensor bytes are all zero — so no planner step that reads data
+//! changes an answer.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::{checks_failed, verdict};
@@ -21,6 +27,7 @@ use model::arch::models::Arch;
 use model::arch::qwen3moe::place::PlaceError as Place3Error;
 use model::arch::qwen35moe::place::PlaceError as Place35Error;
 use model::placement::accepts::{Program, leg_arms, leg_runs, program_of};
+use model::placement::workstation::DeviceInfo;
 use model::placement::{PlacementError, Plan, PlanLevers};
 use refset::census::{Manifest, StubSet};
 
@@ -38,8 +45,28 @@ mod q3place;
 )]
 mod q38place;
 
+#[path = "glm5next_place.rs"]
+#[allow(
+    dead_code,
+    reason = "the glm5next arms read the family's unset-place rule and tier bytes; the module's other half serves the CLI and the seat"
+)]
+mod glmplace;
+
+#[path = "ds41_place.rs"]
+#[allow(
+    dead_code,
+    reason = "the deepseek41 arms read the family's unset-place rule and tier bytes; the module's other half serves the binaries"
+)]
+mod ds41place;
+
 // A file the bin loads by `#[path]` owns its directory, so the adapters'
 // paths are named here rather than resolved under `routed_legs/`.
+#[path = "routed_legs/deepseek41.rs"]
+mod deepseek41;
+#[path = "routed_legs/glm5next.rs"]
+mod glm5next;
+#[path = "routed_legs/mimo2.rs"]
+mod mimo2;
 #[path = "routed_legs/qwen35moe.rs"]
 mod qwen35moe;
 #[path = "routed_legs/qwen38.rs"]
@@ -47,31 +74,40 @@ mod qwen38;
 #[path = "routed_legs/qwen3moe.rs"]
 mod qwen3moe;
 
-/// The families this round plans, by the file's architecture (read with the
+/// The families the gate plans, by the file's architecture (read with the
 /// planners' own reader, `model::arch::spec`, which reads `glm5-next` and
-/// `clef` too). Part 2 adds glm5next, mimo2 and deepseek41 rows.
+/// `clef` too). V4 and V4.1 files run one program and one planner.
 fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
     match arch {
         Arch::Qwen3Moe => Some(&qwen3moe::ADAPTER),
         Arch::Qwen35Moe => Some(&qwen35moe::ADAPTER),
         Arch::Qwen4Exp => Some(&qwen38::ADAPTER),
-        Arch::Qwen35 | Arch::Glm5Next | Arch::MiMo2 | Arch::Deepseek41 | Arch::Deepseek4 => None,
+        Arch::Glm5Next => Some(&glm5next::ADAPTER),
+        Arch::MiMo2 => Some(&mimo2::ADAPTER),
+        Arch::Deepseek41 | Arch::Deepseek4 => Some(&deepseek41::ADAPTER),
+        Arch::Qwen35 => None,
     }
 }
 
 /// Why a set the gate does not plan is skipped: the Qwen3.5 dense trunk
-/// routes nothing, the part 2 families land in a later round, and an
-/// architecture no program runs is never planned as a model.
+/// routes nothing, and an architecture no adapter plans is never planned as
+/// a model.
 fn skip_of(arch: Arch) -> &'static str {
     match arch {
         Arch::Qwen35 => "dense trunk",
-        Arch::Glm5Next | Arch::MiMo2 | Arch::Deepseek41 | Arch::Deepseek4 => "part 2's arch",
-        Arch::Qwen3Moe | Arch::Qwen35Moe | Arch::Qwen4Exp => "no program",
+        Arch::Qwen3Moe
+        | Arch::Qwen35Moe
+        | Arch::Qwen4Exp
+        | Arch::Glm5Next
+        | Arch::MiMo2
+        | Arch::Deepseek41
+        | Arch::Deepseek4 => "no program",
     }
 }
 
 /// One plan the gate holds: the layers' card counts and the byte terms the
 /// rooms derive from.
+#[derive(Clone)]
 struct PlanView {
     /// Per layer: the experts the plan's stage card holds.
     n_l: Vec<u64>,
@@ -83,11 +119,24 @@ struct PlanView {
     /// pages through the NVMe tier.
     host_experts: u64,
     nvme_expert_bytes: u64,
+    /// What the family's loader-side stack table said of this plan (L6):
+    /// `None` where the family has no plan-time table.
+    loader: Option<Result<(), String>>,
+}
+
+impl PlanView {
+    /// `self` with the loader table's answer for this plan: `Ok` when the
+    /// table took the plan's header, else the refusal's text.
+    fn with_loader<E: std::fmt::Display>(mut self, answer: Result<(), E>) -> PlanView {
+        self.loader = Some(answer.map_err(|e| e.to_string()));
+        self
+    }
 }
 
 /// A named planner refusal — an outcome L2 counts by kind, never red. Its
 /// `floor` is the refusal's own where it carries one (a
 /// `CardBudgetFloor`), which the room derivation reads.
+#[derive(Clone)]
 struct Refusal {
     kind: &'static str,
     floor: Option<u64>,
@@ -95,11 +144,24 @@ struct Refusal {
 }
 
 /// One plan attempt's outcome.
+#[derive(Clone)]
 enum Outcome {
     Plan(PlanView),
     Refused(Refusal),
     /// Any other error: red, with its text.
     Red(String),
+}
+
+impl std::fmt::Display for Outcome {
+    /// The text of a refusal or a red outcome, where a search probe or the
+    /// seat's slot fit reads it as an error.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Plan(_) => f.write_str("a plan, where an error was read"),
+            Outcome::Refused(r) => f.write_str(&r.text),
+            Outcome::Red(text) => f.write_str(text),
+        }
+    }
 }
 
 /// One arm of a family's production default: the unbudgeted answer and the
@@ -118,13 +180,28 @@ struct Arm {
 }
 
 /// A family's adapter: how its production `--place`-unset defaults plan one
-/// split, one arm per binary that opens the family's files.
-trait Adapter {
+/// split, one arm per binary that opens the family's files. An adapter is a
+/// unit struct shared by the worker threads.
+trait Adapter: Sync {
     /// The family word the lines carry.
     fn name(&self) -> &'static str;
     /// The arms on `split`, each its own attempt (one arm's refusal does not
     /// stop the other).
     fn arms(&self, split: &Split) -> Vec<Result<Arm, Outcome>>;
+    /// The name of the family's loader-side stack table that a plan's header
+    /// must take (L6), where the loader reads the header at plan time
+    /// without a card; `None` where the family has none. An adapter that
+    /// names one attaches its answer to every plan it makes
+    /// ([`PlanView::with_loader`]).
+    fn loader_table(&self) -> Option<&'static str> {
+        None
+    }
+    /// Sweep triples beside the common ones, for a family whose card leg is
+    /// exact and so shares no triple with them: the leg itself and its
+    /// nearest neighbours.
+    fn extra_triples(&self) -> Vec<[GgmlType; 3]> {
+        Vec::new()
+    }
 }
 
 /// Where a plan line sits: the family word, the set, the arm and the room
@@ -144,7 +221,17 @@ struct Counts {
     partial: u64,
     whole: u64,
     floors: u64,
+    /// Arms whose rooms did not derive because the planner refuses the file
+    /// at every card budget, by one named kind ([`Rooms::Standing`]).
+    standing: u64,
     retyped: u64,
+    /// The planner calls the gate made: one a plan line, one a floor probe and
+    /// one a probe of an adapter's context search (a qwen3moe or qwen35moe
+    /// default's own probes are in `q3place::reads`, not here).
+    calls: u64,
+    /// Plans L6 asked the loader table about, and the ones it refused.
+    loader_asked: u64,
+    loader_refused: u64,
     refusals: BTreeMap<&'static str, u64>,
 }
 
@@ -154,8 +241,25 @@ impl Counts {
         *self.refusals.entry(kind).or_default() += 1;
     }
 
+    /// `other`'s counts added to these.
+    fn add(&mut self, other: &Counts) {
+        self.sets += other.sets;
+        self.plans += other.plans;
+        self.partial += other.partial;
+        self.whole += other.whole;
+        self.floors += other.floors;
+        self.standing += other.standing;
+        self.retyped += other.retyped;
+        self.calls += other.calls;
+        self.loader_asked += other.loader_asked;
+        self.loader_refused += other.loader_refused;
+        for (kind, n) in &other.refusals {
+            *self.refusals.entry(kind).or_default() += n;
+        }
+    }
+
     /// The family's counts line.
-    fn line(&self, family: &str, traps: usize) -> String {
+    fn line(&self, family: &str, traps: usize, loader: Option<&str>) -> String {
         let refusals = self
             .refusals
             .iter()
@@ -166,23 +270,79 @@ impl Counts {
         } else {
             refusals.join(" ")
         };
+        let loader = loader.map_or(String::new(), |table| {
+            format!(
+                " loader {table} asked {} refused {}",
+                self.loader_asked, self.loader_refused
+            )
+        });
         format!(
-            "legs: {family}: sets {} plans {} partial {} whole {} floors {} refusals {refusals} \
-             retyped {} traps {traps}",
-            self.sets, self.plans, self.partial, self.whole, self.floors, self.retyped
+            "legs: {family}: sets {} plans {} partial {} whole {} floors {} standing {} \
+             refusals {refusals} retyped {} traps {traps}{loader}",
+            self.sets,
+            self.plans,
+            self.partial,
+            self.whole,
+            self.floors,
+            self.standing,
+            self.retyped
         )
     }
+}
+
+/// What one unit of work (a set, or one swept header) printed and counted:
+/// its lines, in the order it made them, and its counts. A worker thread
+/// builds one; the main thread prints them in the manifest's order.
+struct Out {
+    lines: Vec<String>,
+    counts: Counts,
+    ok: bool,
+}
+
+impl Out {
+    fn new() -> Out {
+        Out {
+            lines: Vec::new(),
+            counts: Counts::default(),
+            ok: true,
+        }
+    }
+
+    /// One more line of the unit's output.
+    fn say(&mut self, line: String) {
+        self.lines.push(line);
+    }
+
+    /// A line that passed or failed, with its verdict word; a failure marks
+    /// the unit red.
+    fn judged(&mut self, line: String, held: bool) {
+        self.ok &= held;
+        self.lines.push(format!("{line} {}", verdict(held)));
+    }
+}
+
+/// What a family's checks read of it: its adapter and the program its files
+/// run.
+#[derive(Clone, Copy)]
+struct Who {
+    adapter: &'static dyn Adapter,
+    program: Program,
 }
 
 /// One family's state across the run: its counts, the program its files run
 /// and its sweep seed.
 struct Family {
+    who: Who,
     counts: Counts,
-    program: Program,
     /// The smallest set with a carded layer, that layer and its arms' rooms.
     seed: Option<Seed>,
     /// The sweep triples the retyping wrote (the trap count's domain).
     swept: Vec<[GgmlType; 3]>,
+    /// Seconds of worker time the sets and the sweep took, and the plan
+    /// calls the sets made (the rest are the sweep's).
+    sets_secs: f64,
+    sweep_secs: f64,
+    sets_calls: u64,
 }
 
 /// The retype sweep's seed: the family's smallest planned set, a layer its
@@ -197,10 +357,286 @@ struct Seed {
     rooms: Vec<(&'static str, [u64; 3])>,
 }
 
-/// The gate's run: read the census, plan every B1 family's sets through its
-/// production defaults at derived rooms, sweep one set's retyped headers,
-/// and answer green only when every carded layer is one its file's
-/// architecture runs and every family's sweep holds a trap.
+/// The most worker threads the gate plans on. The planners are host work on
+/// headers alone; the box's cores are shared with other tracks' builds.
+const WORKERS: usize = 8;
+
+thread_local! {
+    /// The probes of context searches the adapters made on this thread
+    /// ([`probed`]); a unit of work runs on one thread, so its share is the
+    /// difference across it.
+    static PROBES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One plan an adapter's context search probed, counted for the unit of work
+/// running on this thread.
+fn probed() {
+    PROBES.with(|p| p.set(p.get() + 1));
+}
+
+/// The probes counted on this thread so far.
+fn probes() -> u64 {
+    PROBES.with(Cell::get)
+}
+
+/// This process's census, read once: the gate holds one card for its whole
+/// run and plans from headers alone, so the free bytes the arms resolve a
+/// placement against are one reading, not one per arm (each reading asks the
+/// driver and spawns nvidia-smi). The qwen3moe and qwen35moe defaults read
+/// their own (`q3place`).
+fn census() -> Result<&'static [DeviceInfo], Outcome> {
+    static CENSUS: OnceLock<Result<Vec<DeviceInfo>, String>> = OnceLock::new();
+    CENSUS
+        .get_or_init(|| bloomery_gpu_gates::gpu_census::census().map_err(|e| e.to_string()))
+        .as_ref()
+        .map(Vec::as_slice)
+        .map_err(|e| Outcome::Red(format!("the device census: {e}")))
+}
+
+/// `work(0..count)` on up to [`WORKERS`] threads, the results in index order:
+/// the order the lines print in is the manifest's, not the threads'.
+fn map_ordered<T: Send>(count: usize, work: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let next = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<T>>> = Mutex::new((0..count).map(|_| None).collect());
+    let workers = WORKERS.min(count).max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            // A planner may recurse over a large header: a worker takes the
+            // stack the main thread's default is not the measure of.
+            std::thread::Builder::new()
+                .stack_size(16 << 20)
+                .spawn_scoped(scope, || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= count {
+                            break;
+                        }
+                        let done = work(i);
+                        slots.lock().expect("a worker panicked holding the results")[i] =
+                            Some(done);
+                    }
+                })
+                .expect("a worker thread starts");
+        }
+    });
+    slots
+        .into_inner()
+        .expect("a worker panicked holding the results")
+        .into_iter()
+        .map(|done| done.expect("every item ran"))
+        .collect()
+}
+
+/// What planning one census set produced: its output, why it was skipped or
+/// the family it was planned as, and the terms the sweep's seed is picked by.
+struct SetDone {
+    out: Out,
+    /// Why the set is not planned (counted and printed in `out`).
+    skip: Option<&'static str>,
+    /// The family and program of a planned set.
+    who: Option<Who>,
+    /// The first layer a plan of the set gave card experts.
+    carded: Option<usize>,
+    /// Per arm name: its three rooms.
+    rooms: Vec<(&'static str, [u64; 3])>,
+    /// Seconds of worker time.
+    secs: f64,
+}
+
+/// Plan one census set through its family's arms at derived rooms: the
+/// manifest check, the header's reading, then each arm's unbudgeted plan,
+/// floor probe and three rooms, with the checks (L1, L2, L3's partial count,
+/// L6) over each plan.
+fn plan_set(set: &StubSet, root: &Path) -> Result<SetDone, String> {
+    let started = Instant::now();
+    let before = probes();
+    let mut done = SetDone {
+        out: Out::new(),
+        skip: None,
+        who: None,
+        carded: None,
+        rooms: Vec::new(),
+        secs: 0.0,
+    };
+    plan_set_into(set, root, &mut done).map_err(|e| e.to_string())?;
+    done.out.counts.calls += probes() - before;
+    done.secs = started.elapsed().as_secs_f64();
+    Ok(done)
+}
+
+fn plan_set_into(set: &StubSet, root: &Path, done: &mut SetDone) -> Result<(), GateError> {
+    let name = set.name();
+    let out = &mut done.out;
+    // A draft set's first shard's basename — the census writer's naming.
+    // Drafts carry their model's architecture but are never planned as a
+    // model.
+    let first_shard = set.shards[0].file.rsplit('/').next().unwrap_or("");
+    if first_shard.starts_with("mtp-") || first_shard.starts_with("dflash-") {
+        done.skip = Some("draft");
+        out.say(format!("legs: skip {name}: draft"));
+        return Ok(());
+    }
+    let first = match set.check(root) {
+        Ok(first) => first,
+        Err(e) => {
+            out.judged(format!("legs: census {name}: {e}"), false);
+            return Ok(());
+        }
+    };
+    let split = match Split::open(&first) {
+        Ok(split) => split,
+        Err(e) => {
+            // A stub that checks against its row but the reader cannot
+            // open (a quant type this build's table does not size) is a
+            // read refusal, not a gate defect: the census holds users'
+            // files of every quant.
+            done.skip = Some("no reader");
+            out.say(format!("legs: skip {name}: no reader: {e}"));
+            return Ok(());
+        }
+    };
+    let arch = match model::arch::spec(&split) {
+        Ok(read) => read.spec.arch,
+        Err(e) => {
+            done.skip = Some("no reader");
+            out.say(format!("legs: skip {name}: no reader: {e}"));
+            return Ok(());
+        }
+    };
+    let Some(adapter) = family_of(arch) else {
+        done.skip = Some(skip_of(arch));
+        out.say(format!("legs: skip {name}: {}", skip_of(arch)));
+        return Ok(());
+    };
+    let program = program_of(arch).expect("every architecture the dispatch plans has a program");
+    let who = Who { adapter, program };
+    done.who = Some(who);
+    out.counts.sets += 1;
+    let stacks = routed_stacks(&split)?;
+    for attempt in adapter.arms(&split) {
+        let arm = match attempt {
+            Ok(arm) => arm,
+            Err(Outcome::Refused(r)) => {
+                out.counts.refused(r.kind);
+                out.judged(
+                    format!(
+                        "legs: {} {name}: refused {}: {}",
+                        adapter.name(),
+                        r.kind,
+                        r.text
+                    ),
+                    true,
+                );
+                continue;
+            }
+            Err(Outcome::Red(text)) => {
+                out.judged(format!("legs: {} {name}: {text}", adapter.name()), false);
+                continue;
+            }
+            // An adapter's construction error is a refusal or red,
+            // never a plan.
+            Err(Outcome::Plan(_)) => {
+                unreachable!("an arm's construction error holds no plan")
+            }
+        };
+        let at = At {
+            family: adapter.name(),
+            set: &name,
+            arm: arm.name,
+            room: "-",
+        };
+        // The unbudgeted answer first: the default as it is.
+        if arm.whole {
+            out.counts.whole += 1;
+            out.judged(
+                format!(
+                    "legs: {} {name} {}: room -: whole load",
+                    adapter.name(),
+                    arm.name
+                ),
+                true,
+            );
+        } else if let Some(outcome) = &arm.unbudgeted {
+            plan_line(out, who, &at, outcome, &stacks, &mut done.carded);
+        } else {
+            out.judged(
+                format!(
+                    "legs: {} {name} {}: an arm that answered neither whole nor a plan",
+                    adapter.name(),
+                    arm.name
+                ),
+                false,
+            );
+        }
+        // The rooms: the floor from the placed planner's own refusal,
+        // then floor + f·E.
+        let e = expert_span(&arm, &stacks);
+        let unbudgeted_kind = match &arm.unbudgeted {
+            Some(Outcome::Refused(r)) => Some(r.kind),
+            _ => None,
+        };
+        out.counts.calls += 1;
+        let (floor, arm_rooms) = match rooms_of(arm.placed.as_ref(), e, unbudgeted_kind) {
+            Ok(Rooms::Floor(floor, rooms)) => (floor, rooms),
+            Ok(Rooms::Standing(r)) => {
+                out.counts.standing += 1;
+                out.judged(
+                    format!(
+                        "legs: {} {name} {}: no rooms: the planner refuses the file at a zero \
+                         card budget as it does unbudgeted, {}: {}",
+                        adapter.name(),
+                        arm.name,
+                        r.kind,
+                        r.text
+                    ),
+                    true,
+                );
+                continue;
+            }
+            Err(text) => {
+                out.judged(
+                    format!(
+                        "legs: {} {name} {}: the rooms did not derive: {text}",
+                        adapter.name(),
+                        arm.name
+                    ),
+                    false,
+                );
+                continue;
+            }
+        };
+        out.counts.floors += 1;
+        out.say(format!(
+            "legs: {} {name} {}: floor {floor}",
+            adapter.name(),
+            arm.name
+        ));
+        done.rooms.push((arm.name, arm_rooms));
+        for &bytes in &arm_rooms {
+            let outcome = (arm.placed)(&budget(bytes));
+            let room = bytes.to_string();
+            let at = At { room: &room, ..at };
+            plan_line(out, who, &at, &outcome, &stacks, &mut done.carded);
+        }
+    }
+    Ok(())
+}
+
+/// The seconds per call of a family's work, `-` for no call.
+fn per_call(secs: f64, calls: u64) -> String {
+    if calls == 0 {
+        "-".to_string()
+    } else {
+        format!("{:.3}", secs / calls as f64)
+    }
+}
+
+/// The gate's run: read the census, plan every family's sets through its
+/// production defaults at derived rooms, sweep one set's retyped headers per
+/// family, and answer green only when every carded layer is one its file's
+/// architecture runs, every loader table takes the plans, and every family's
+/// sweep holds a trap. The sets and the swept headers are planned on
+/// [`WORKERS`] threads and printed in the manifest's order.
 pub(super) fn run() -> Result<(), GateError> {
     bloomery_levers::at_main(&[])?;
     let (manifest, root) = args()?;
@@ -212,177 +648,125 @@ pub(super) fn run() -> Result<(), GateError> {
         manifest.display(),
         root.display()
     );
+    let started = Instant::now();
+    // The driver and the census cache are brought up before any worker.
+    let _ = census();
+    let all = sets.sets();
+    let planned = map_ordered(all.len(), |i| plan_set(&all[i], &root));
     let mut ok = true;
-    let mut skips: BTreeMap<String, u64> = BTreeMap::new();
+    let mut skips: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut families: BTreeMap<&'static str, Family> = BTreeMap::new();
-    for set in sets.sets() {
-        let name = set.name();
-        // A draft set's first shard's basename — the census writer's naming.
-        // Drafts carry their model's architecture but are never planned as a
-        // model.
-        let first_shard = set.shards[0].file.rsplit('/').next().unwrap_or("");
-        if first_shard.starts_with("mtp-") || first_shard.starts_with("dflash-") {
-            *skips.entry("draft".to_string()).or_default() += 1;
-            println!("legs: skip {name}: draft");
-            continue;
+    for (set, done) in all.iter().zip(planned) {
+        let done = done?;
+        for line in &done.out.lines {
+            println!("{line}");
         }
-        let first = match set.check(&root) {
-            Ok(first) => first,
-            Err(e) => {
-                println!("legs: census {name}: {e} {}", verdict(false));
-                ok = false;
-                continue;
-            }
-        };
-        let split = match Split::open(&first) {
-            Ok(split) => split,
-            Err(e) => {
-                // A stub that checks against its row but the reader cannot
-                // open (a quant type this build's table does not size) is a
-                // read refusal, not a gate defect: the census holds users'
-                // files of every quant.
-                *skips.entry("no reader".to_string()).or_default() += 1;
-                println!("legs: skip {name}: no reader: {e}");
-                continue;
-            }
-        };
-        let arch = match model::arch::spec(&split) {
-            Ok(read) => read.spec.arch,
-            Err(e) => {
-                *skips.entry("no reader".to_string()).or_default() += 1;
-                println!("legs: skip {name}: no reader: {e}");
-                continue;
-            }
-        };
-        let Some(adapter) = family_of(arch) else {
-            *skips.entry(skip_of(arch).to_string()).or_default() += 1;
-            println!("legs: skip {name}: {}", skip_of(arch));
+        ok &= done.out.ok;
+        if let Some(why) = done.skip {
+            *skips.entry(why).or_default() += 1;
+        }
+        let Some(who) = done.who else {
             continue;
         };
-        let program =
-            program_of(arch).expect("every architecture the dispatch plans has a program");
-        let family = families.entry(adapter.name()).or_insert_with(|| Family {
-            counts: Counts::default(),
-            program,
-            seed: None,
-            swept: Vec::new(),
-        });
-        family.counts.sets += 1;
-        let stacks = routed_stacks(&split)?;
-        let mut rooms: Vec<(&'static str, [u64; 3])> = Vec::new();
-        let mut carded: Option<usize> = None;
-        for attempt in adapter.arms(&split) {
-            let arm = match attempt {
-                Ok(arm) => arm,
-                Err(Outcome::Refused(r)) => {
-                    family.counts.refused(r.kind);
-                    println!(
-                        "legs: {} {name}: refused {}: {} {}",
-                        adapter.name(),
-                        r.kind,
-                        r.text,
-                        verdict(true)
-                    );
-                    continue;
-                }
-                Err(Outcome::Red(text)) => {
-                    println!(
-                        "legs: {} {name}: {} {}",
-                        adapter.name(),
-                        text,
-                        verdict(false)
-                    );
-                    ok = false;
-                    continue;
-                }
-                // An adapter's construction error is a refusal or red,
-                // never a plan.
-                Err(Outcome::Plan(_)) => {
-                    unreachable!("an arm's construction error holds no plan")
-                }
-            };
-            let at = At {
-                family: adapter.name(),
-                set: &name,
-                arm: arm.name,
-                room: "-",
-            };
-            // The unbudgeted answer first: the default as it is.
-            if arm.whole {
-                family.counts.whole += 1;
-                println!(
-                    "legs: {} {name} {}: room -: whole load {}",
-                    adapter.name(),
-                    arm.name,
-                    verdict(true)
-                );
-            } else if let Some(outcome) = &arm.unbudgeted {
-                ok &= plan_line(family, &at, outcome, &stacks, &mut carded);
-            } else {
-                println!(
-                    "legs: {} {name} {}: an arm that answered neither whole nor a plan {}",
-                    adapter.name(),
-                    arm.name,
-                    verdict(false)
-                );
-                ok = false;
-            }
-            // The rooms: the floor from the placed planner's own refusal,
-            // then floor + f·E.
-            let e = expert_span(&arm, &stacks);
-            let (floor, arm_rooms) = match rooms_of(arm.placed.as_ref(), e) {
-                Ok(rooms) => rooms,
-                Err(text) => {
-                    println!(
-                        "legs: {} {name} {}: the rooms did not derive: {text} {}",
-                        adapter.name(),
-                        arm.name,
-                        verdict(false)
-                    );
-                    ok = false;
-                    continue;
-                }
-            };
-            family.counts.floors += 1;
-            println!(
-                "legs: {} {name} {}: floor {floor}",
-                adapter.name(),
-                arm.name
-            );
-            rooms.push((arm.name, arm_rooms));
-            for &bytes in &arm_rooms {
-                let outcome = (arm.placed)(&budget(bytes));
-                let room = bytes.to_string();
-                let at = At { room: &room, ..at };
-                ok &= plan_line(family, &at, &outcome, &stacks, &mut carded);
-            }
-        }
+        let family = families
+            .entry(who.adapter.name())
+            .or_insert_with(|| Family {
+                who,
+                counts: Counts::default(),
+                seed: None,
+                swept: Vec::new(),
+                sets_secs: 0.0,
+                sweep_secs: 0.0,
+                sets_calls: 0,
+            });
+        family.counts.add(&done.out.counts);
+        family.sets_secs += done.secs;
         // The sweep seed: the smallest set that cards a layer.
-        if let Some(layer) = carded {
+        if let Some(layer) = done.carded {
             let total = set.shards.iter().map(|s| s.file_bytes).sum();
             if family.seed.as_ref().is_none_or(|seed| total < seed.total) {
                 family.seed = Some(Seed {
                     set: set.clone(),
                     total,
                     layer,
-                    rooms,
+                    rooms: done.rooms,
                 });
             }
         }
     }
-    // The retype sweep, then L3 and L5 per family.
-    for (_, family) in families.iter_mut() {
+    for (name, family) in families.iter_mut() {
+        family.sets_calls = family.counts.calls;
+        println!(
+            "legs: time {name} sets: {} plan calls in {:.1} s of work ({} s a call)",
+            family.sets_calls,
+            family.sets_secs,
+            per_call(family.sets_secs, family.sets_calls)
+        );
+    }
+    // The retype sweep: every family's seed written once per triple, planned
+    // through its arms; then L3, L5 and the loader table's vacuity per
+    // family.
+    let mut sweeps = Vec::new();
+    for (&name, family) in families.iter_mut() {
         if let Some(seed) = family.seed.take() {
-            ok &= sweep(family, seed, &root)?;
+            sweeps.push(Sweep::prepare(name, family.who, seed, &root)?);
         }
-        let name = family_name(family.program);
-        let traps = trap_count(family.program, &family.swept);
+    }
+    let dir =
+        std::env::temp_dir().join(format!("bloomery-routedlegs-{}-sweep", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let jobs: Vec<(usize, [GgmlType; 3])> = sweeps
+        .iter()
+        .enumerate()
+        .flat_map(|(j, sweep)| sweep.triples.iter().map(move |&triple| (j, triple)))
+        .collect();
+    let headers = map_ordered(jobs.len(), |n| {
+        let (j, triple) = jobs[n];
+        sweeps[j].header(triple, n, &root, &dir)
+    });
+    for (&(j, triple), done) in jobs.iter().zip(headers) {
+        let done = done?;
+        for line in &done.out.lines {
+            println!("{line}");
+        }
+        ok &= done.out.ok;
+        let family = families
+            .get_mut(sweeps[j].name)
+            .expect("a sweep's family ran");
+        family.counts.add(&done.out.counts);
+        family.sweep_secs += done.secs;
+        if done.wrote {
+            family.swept.push(triple);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    for (name, family) in &families {
+        let calls = family.counts.calls - family.sets_calls;
+        println!(
+            "legs: time {name} sweep: {calls} plan calls in {:.1} s of work ({} s a call)",
+            family.sweep_secs,
+            per_call(family.sweep_secs, calls)
+        );
+    }
+    for (_, family) in families.iter() {
+        let name = family_name(family.who.program);
+        let traps = trap_count(family.who.program, &family.swept);
         if traps == 0 {
             println!("legs: {name}: the sweep has no trap {}", verdict(false));
             ok = false;
         }
         if family.counts.partial == 0 {
             println!("legs: {name}: vacuous: no partial plan {}", verdict(false));
+            ok = false;
+        }
+        if let Some(table) = family.who.adapter.loader_table()
+            && family.counts.loader_asked == 0
+        {
+            println!(
+                "legs: {name}: vacuous: the loader table {table} was never asked {}",
+                verdict(false)
+            );
             ok = false;
         }
     }
@@ -395,11 +779,23 @@ pub(super) fn run() -> Result<(), GateError> {
     for (name, family) in &families {
         println!(
             "{}",
-            family
-                .counts
-                .line(name, trap_count(family.program, &family.swept))
+            family.counts.line(
+                name,
+                trap_count(family.who.program, &family.swept),
+                family.who.adapter.loader_table()
+            )
         );
     }
+    let work: f64 = families.values().map(|f| f.sets_secs + f.sweep_secs).sum();
+    let reads = q3place::reads();
+    println!(
+        "legs: wall {:.1} s, {:.1} s of work on up to {WORKERS} workers; the qwen3moe and \
+         qwen35moe defaults made {} census reads and {} probes of their own",
+        started.elapsed().as_secs_f64(),
+        work,
+        reads.censuses,
+        reads.probes
+    );
     println!("gate_routed_legs: {}", verdict(ok));
     if !ok {
         return Err(checks_failed());
@@ -438,45 +834,57 @@ fn args() -> Result<(PathBuf, PathBuf), GateError> {
     ))
 }
 
-/// One plan's line (L1 over it, L3's partial count, the carded-layer pick):
-/// `legs: <family> <set> <arm> room <room>: <what> PASS|FAIL`, each FAIL
-/// line naming family, set, arm, room, layer and the three types. Returns
-/// whether the plan held.
+/// One plan's line (L1 over it, L6 over the loader's answer, L3's partial
+/// count, the carded-layer pick): `legs: <family> <set> <arm> room <room>:
+/// <what> PASS|FAIL`, each FAIL line naming family, set, arm, room, layer and
+/// the three types. A failure marks the unit of work red.
 fn plan_line(
-    family: &mut Family,
+    out: &mut Out,
+    who: Who,
     at: &At<'_>,
     outcome: &Outcome,
     stacks: &Stacks,
     carded: &mut Option<usize>,
-) -> bool {
+) {
+    out.counts.calls += 1;
     match outcome {
         Outcome::Refused(r) => {
-            family.counts.refused(r.kind);
-            println!(
-                "legs: {} {} {}: room {}: refused {} {}",
-                at.family,
-                at.set,
-                at.arm,
-                at.room,
-                r.kind,
-                verdict(true)
+            out.counts.refused(r.kind);
+            out.judged(
+                format!(
+                    "legs: {} {} {}: room {}: refused {}",
+                    at.family, at.set, at.arm, at.room, r.kind
+                ),
+                true,
             );
-            true
         }
         Outcome::Red(text) => {
-            println!(
-                "legs: {} {} {}: room {}: {} {}",
-                at.family,
-                at.set,
-                at.arm,
-                at.room,
-                text,
-                verdict(false)
+            out.judged(
+                format!(
+                    "legs: {} {} {}: room {}: {}",
+                    at.family, at.set, at.arm, at.room, text
+                ),
+                false,
             );
-            false
         }
         Outcome::Plan(view) => {
-            let fails = l1(at, view, stacks, family.program);
+            let mut fails = l1(at, view, stacks, who.program);
+            if let Some(answer) = &view.loader {
+                out.counts.loader_asked += 1;
+                // L6 asks the loader's table about the plans L1 passes: a
+                // carded layer the leg refuses is the table's to refuse.
+                if let (Err(text), true) = (answer, fails.is_empty()) {
+                    out.counts.loader_refused += 1;
+                    fails.push(format!(
+                        "{} {} {} room {}: the loader table {} refuses a plan the leg runs: {text}",
+                        at.family,
+                        at.set,
+                        at.arm,
+                        at.room,
+                        who.adapter.loader_table().unwrap_or("-")
+                    ));
+                }
+            }
             let routed = (0..view.n_l.len())
                 .filter(|&l| stacks.types.get(l).is_some_and(Option::is_some))
                 .count();
@@ -484,7 +892,7 @@ fn plan_line(
                 .filter(|&l| carded_layer(view, l))
                 .count();
             if held > 0 && held < routed {
-                family.counts.partial += 1;
+                out.counts.partial += 1;
             }
             if held > 0 && carded.is_none() {
                 *carded = Some(
@@ -493,19 +901,17 @@ fn plan_line(
                         .expect("held > 0 names a carded layer"),
                 );
             }
-            family.counts.plans += 1;
-            println!(
-                "legs: {} {} {}: room {}: placed {held} of {routed} routed layers carded {}",
-                at.family,
-                at.set,
-                at.arm,
-                at.room,
-                verdict(fails.is_empty())
+            out.counts.plans += 1;
+            out.judged(
+                format!(
+                    "legs: {} {} {}: room {}: placed {held} of {routed} routed layers carded",
+                    at.family, at.set, at.arm, at.room
+                ),
+                fails.is_empty(),
             );
             for fail in &fails {
-                println!("legs:   {fail} {}", verdict(false));
+                out.say(format!("legs:   {fail} {}", verdict(false)));
             }
-            fails.is_empty()
         }
     }
 }
@@ -568,13 +974,41 @@ fn expert_span(arm: &Arm, stacks: &Stacks) -> u64 {
     }
 }
 
+/// What an arm's room derivation answered.
+enum Rooms {
+    /// The card budget floor and the three rooms above it.
+    Floor(u64, [u64; 3]),
+    /// The planner refuses the file by one named kind that no card budget
+    /// moves: the unbudgeted plan and the zero-budget probe state the same
+    /// kind and neither a `CardBudgetFloor` — a tensor of a role a card
+    /// holds with no device format, say. No room exists to force.
+    Standing(Refusal),
+}
+
 /// The rooms an arm plans at: the card budget floor — read off the
 /// `CardBudgetFloor` refusal the placed planner states at a zero budget —
 /// and `floor + f·E` for f ∈ {1/4, 1/2, 3/4}. Derived from the planner's
-/// own refusal and the plan's own bytes, never from a constant.
-fn rooms_of(placed: &dyn Fn(&PlanLevers) -> Outcome, e: u64) -> Result<(u64, [u64; 3]), String> {
+/// own refusal and the plan's own bytes, never from a constant. A zero
+/// budget refused by the kind the unbudgeted plan was refused by
+/// (`unbudgeted_kind`), and by no floor, is [`Rooms::Standing`]; any other
+/// refusal without a floor is an error naming it.
+fn rooms_of(
+    placed: &dyn Fn(&PlanLevers) -> Outcome,
+    e: u64,
+    unbudgeted_kind: Option<&'static str>,
+) -> Result<Rooms, String> {
     let floor = match placed(&budget(0)) {
-        Outcome::Refused(r) => r.floor,
+        Outcome::Refused(r) => match (r.floor, unbudgeted_kind) {
+            (Some(floor), _) => floor,
+            (None, Some(kind)) if kind == r.kind => return Ok(Rooms::Standing(r)),
+            (None, _) => {
+                return Err(format!(
+                    "the zero-budget refusal names no floor: not the planner's own \
+                     CardBudgetFloor ({}: {})",
+                    r.kind, r.text
+                ));
+            }
+        },
         Outcome::Plan(_) => {
             return Err(
                 "a zero card budget planned: the floor refusal is missing — the placed planner \
@@ -584,13 +1018,10 @@ fn rooms_of(placed: &dyn Fn(&PlanLevers) -> Outcome, e: u64) -> Result<(u64, [u6
         }
         Outcome::Red(text) => return Err(text),
     };
-    let Some(floor) = floor else {
-        return Err(
-            "the zero-budget refusal names no floor: not the planner's own CardBudgetFloor"
-                .to_string(),
-        );
-    };
-    Ok((floor, [floor + e / 4, floor + e / 2, floor + 3 * e / 4]))
+    Ok(Rooms::Floor(
+        floor,
+        [floor + e / 4, floor + e / 2, floor + 3 * e / 4],
+    ))
 }
 
 /// The levers of a forced room: one card budget, everything else default.
@@ -686,66 +1117,135 @@ fn routed_stacks(split: &Split) -> Result<Stacks, GateError> {
     Ok(stacks)
 }
 
-/// The retype sweep (L4): `seed`'s set with its carded layer's three routed
-/// stacks set to each sweep triple, planned through both arms at the rooms
-/// the original stub derived. Every retyped split goes into a fresh temp
-/// directory — the shards holding the layer rewritten (their kvs and
-/// tensors verbatim but the three stacks' type and recomputed bytes, over a
-/// sparse file of the layout's length), every other shard a symlink to its
-/// stub, the file names kept so `Split::open` finds them. Returns whether
-/// every swept plan held.
-fn sweep(family: &mut Family, seed: Seed, root: &Path) -> Result<bool, GateError> {
-    let name = family_name(family.program);
-    let set = seed.set.name();
-    let first = seed
-        .set
-        .check(root)
-        .map_err(|e| format!("legs: the sweep's set {set} re-checked: {e}"))?;
-    let split = Split::open(&first)?;
-    let stacks = routed_stacks(&split)?;
-    let Some(tys) = stacks.types.get(seed.layer).copied().flatten() else {
-        return Err(format!(
-            "legs: {name} {set}: the sweep's layer {} holds no routed stacks",
-            seed.layer
-        )
-        .into());
-    };
-    let dir =
-        std::env::temp_dir().join(format!("bloomery-routedlegs-{}-sweep", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    let adapter = sweep_adapter(family.program);
-    let mut ok = true;
-    for triple in sweep_triples() {
-        let Some(retyped) = retype_split(&seed.set, root, &split, seed.layer, triple, &dir)? else {
-            // The named skip line was printed by the writer.
-            continue;
+/// One family's retype sweep (L4), prepared: the seed's set opened once, its
+/// carded layer's types and the triples to write. The shards holding the
+/// layer are rewritten per triple (their kvs and tensors verbatim but the
+/// three stacks' type and recomputed bytes, over a sparse file of the
+/// layout's length), every other shard a symlink to its stub, the file names
+/// kept so `Split::open` finds them; each triple has a directory of its own,
+/// removed once it is planned, so the headers are planned at once.
+struct Sweep {
+    name: &'static str,
+    who: Who,
+    seed: Seed,
+    set_name: String,
+    split: Split,
+    tys: [GgmlType; 3],
+    triples: Vec<[GgmlType; 3]>,
+}
+
+/// What one swept header produced.
+struct HeaderDone {
+    out: Out,
+    /// Whether the header was written (a block-mis-dividing triple is
+    /// skipped by name).
+    wrote: bool,
+    /// Seconds of worker time.
+    secs: f64,
+}
+
+impl Sweep {
+    /// `seed`'s set re-checked against the manifest and opened, its layer's
+    /// types read.
+    fn prepare(name: &'static str, who: Who, seed: Seed, root: &Path) -> Result<Sweep, GateError> {
+        let set_name = seed.set.name();
+        let first = seed
+            .set
+            .check(root)
+            .map_err(|e| format!("legs: the sweep's set {set_name} re-checked: {e}"))?;
+        let split = Split::open(&first)?;
+        let stacks = routed_stacks(&split)?;
+        let Some(tys) = stacks.types.get(seed.layer).copied().flatten() else {
+            return Err(format!(
+                "legs: {name} {set_name}: the sweep's layer {} holds no routed stacks",
+                seed.layer
+            )
+            .into());
         };
-        family.counts.retyped += 1;
-        family.swept.push(triple);
+        Ok(Sweep {
+            name,
+            who,
+            set_name,
+            split,
+            tys,
+            triples: sweep_triples(who.adapter),
+            seed,
+        })
+    }
+
+    /// The `n`th swept header, `triple`, written under `dir` and planned
+    /// through both arms at the rooms the original stub derived.
+    fn header(
+        &self,
+        triple: [GgmlType; 3],
+        n: usize,
+        root: &Path,
+        dir: &Path,
+    ) -> Result<HeaderDone, String> {
+        let started = Instant::now();
+        let before = probes();
+        let mut done = self
+            .header_into(triple, n, root, dir)
+            .map_err(|e| e.to_string())?;
+        done.out.counts.calls += probes() - before;
+        done.secs = started.elapsed().as_secs_f64();
+        Ok(done)
+    }
+
+    fn header_into(
+        &self,
+        triple: [GgmlType; 3],
+        n: usize,
+        root: &Path,
+        dir: &Path,
+    ) -> Result<HeaderDone, GateError> {
+        let mut done = HeaderDone {
+            out: Out::new(),
+            wrote: false,
+            secs: 0.0,
+        };
+        let out = &mut done.out;
+        let (name, set, tys) = (self.name, &self.set_name, self.tys);
+        let here = dir.join(n.to_string());
+        std::fs::create_dir_all(&here)?;
+        let retyped = retype_split(
+            &self.seed.set,
+            root,
+            &self.split,
+            self.seed.layer,
+            triple,
+            &here,
+            &mut out.lines,
+        )?;
+        // A skipped triple's named line was made by the writer.
+        let Some(retyped) = retyped else {
+            std::fs::remove_dir_all(&here)?;
+            return Ok(done);
+        };
+        done.wrote = true;
+        out.counts.retyped += 1;
         let split = Split::open(&retyped)?;
         let stacks = routed_stacks(&split)?;
         let mut pick = None;
-        for attempt in adapter.arms(&split) {
+        for attempt in self.who.adapter.arms(&split) {
             let arm = match attempt {
                 Ok(arm) => arm,
                 Err(Outcome::Refused(r)) => {
-                    family.counts.refused(r.kind);
-                    println!(
-                        "legs: {name} {set} [{tys:?} → {triple:?}]: refused {}: {} {}",
-                        r.kind,
-                        r.text,
-                        verdict(true)
+                    out.counts.refused(r.kind);
+                    out.judged(
+                        format!(
+                            "legs: {name} {set} [{tys:?} → {triple:?}]: refused {}: {}",
+                            r.kind, r.text
+                        ),
+                        true,
                     );
                     continue;
                 }
                 Err(Outcome::Red(text)) => {
-                    println!(
-                        "legs: {name} {set} [{tys:?} → {triple:?}]: {} {}",
-                        text,
-                        verdict(false)
+                    out.judged(
+                        format!("legs: {name} {set} [{tys:?} → {triple:?}]: {text}"),
+                        false,
                     );
-                    ok = false;
                     continue;
                 }
                 // An adapter's construction error is a refusal or red,
@@ -757,39 +1257,29 @@ fn sweep(family: &mut Family, seed: Seed, root: &Path) -> Result<bool, GateError
             let word = format!("{}[{tys:?} → {triple:?}]", arm.name);
             let at = At {
                 family: name,
-                set: &set,
+                set,
                 arm: &word,
                 room: "-",
             };
             if !arm.whole {
                 if let Some(outcome) = &arm.unbudgeted {
-                    ok &= plan_line(family, &at, outcome, &stacks, &mut pick);
+                    plan_line(out, self.who, &at, outcome, &stacks, &mut pick);
                 }
             }
-            let Some((_, rooms)) = seed.rooms.iter().find(|(word, _)| *word == arm.name) else {
+            let Some((_, rooms)) = self.seed.rooms.iter().find(|(word, _)| *word == arm.name)
+            else {
                 continue;
             };
             for &bytes in rooms {
                 let outcome = (arm.placed)(&budget(bytes));
                 let room = bytes.to_string();
                 let at = At { room: &room, ..at };
-                ok &= plan_line(family, &at, &outcome, &stacks, &mut pick);
+                plan_line(out, self.who, &at, &outcome, &stacks, &mut pick);
             }
         }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(ok)
-}
-
-/// The adapter of `program`'s family, for the sweep's arm construction.
-fn sweep_adapter(program: Program) -> &'static dyn Adapter {
-    match program {
-        Program::Qwen3moeBody => &qwen3moe::ADAPTER,
-        Program::Qwen35Body => &qwen35moe::ADAPTER,
-        Program::Qwen38Body => &qwen38::ADAPTER,
-        Program::Glm5nextBody | Program::Mimo2Body | Program::Deepseek41Chain => {
-            unreachable!("part 2's families have no adapter this round")
-        }
+        drop(split);
+        std::fs::remove_dir_all(&here)?;
+        Ok(done)
     }
 }
 
@@ -804,9 +1294,10 @@ const SWEEP_TYPES: [GgmlType; 5] = [
     GgmlType::IQ4_XS,
 ];
 
-/// L4's triples: every T×T×T of [`SWEEP_TYPES`] (125) and the two gate≠up
-/// mixed triples, 127 in all.
-fn sweep_triples() -> Vec<[GgmlType; 3]> {
+/// L4's triples: every T×T×T of [`SWEEP_TYPES`] (125), the two gate≠up
+/// mixed triples (127 in all) and the family's own
+/// ([`Adapter::extra_triples`]) that the others do not hold.
+fn sweep_triples(adapter: &dyn Adapter) -> Vec<[GgmlType; 3]> {
     let mut triples = Vec::new();
     for &g in &SWEEP_TYPES {
         for &u in &SWEEP_TYPES {
@@ -817,6 +1308,11 @@ fn sweep_triples() -> Vec<[GgmlType; 3]> {
     }
     triples.push([GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q4_K]);
     triples.push([GgmlType::Q5_K, GgmlType::Q4_K, GgmlType::Q4_K]);
+    for triple in adapter.extra_triples() {
+        if !triples.contains(&triple) {
+            triples.push(triple);
+        }
+    }
     triples
 }
 
@@ -831,6 +1327,7 @@ fn retype_split(
     l: usize,
     triple: [GgmlType; 3],
     dir: &Path,
+    lines: &mut Vec<String>,
 ) -> Result<Option<PathBuf>, GateError> {
     let parts = ["gate", "up", "down"];
     let mut retype: Vec<(String, GgmlType)> = Vec::new();
@@ -843,12 +1340,12 @@ fn retype_split(
             return Err(format!("{ty}: no block info, which a retype needs").into());
         };
         if !t.dims.first().copied().unwrap_or(0).is_multiple_of(blck) {
-            println!(
+            lines.push(format!(
                 "legs: retype {} {triple:?} skipped: {} dims {:?} hold no {ty} block",
                 set.name(),
                 name,
                 t.dims
-            );
+            ));
             return Ok(None);
         }
         retype.push((name, ty));
@@ -921,6 +1418,7 @@ fn view_of(plan: &Plan) -> PlanView {
         card_expert_bytes: plan.cards.first().map_or(0, |c| c.expert_bytes),
         host_experts: plan.host.experts,
         nvme_expert_bytes: plan.host.nvme_expert_bytes,
+        loader: None,
     }
 }
 

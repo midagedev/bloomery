@@ -11,15 +11,21 @@
 //! step over the plans' expert bytes) for two slots whose checkpoints are
 //! priced (`checkpoint_price38` of the file's delta layers) and reserved.
 //! Drafts are off in both (the draft levers unset).
+//!
+//! The loader's plan-time stack table (`swap38::stacks`, L6) is asked of every
+//! plan with the plan in hand: it checks each layer the plan gives card
+//! experts, on the stage card or a tier, against the body's own arms.
+
+use std::sync::Arc;
 
 use super::q38place;
-use super::{Adapter, Arm, Outcome, outcome_of, view_of};
+use super::{Adapter, Arm, Outcome, census, outcome_of, probed, view_of};
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::checkpoint_price38;
+use bloomery_gpu::arch::qwen3moe::swap38;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
-use bloomery_gpu_gates::gpu_census;
 use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use gguf::Split;
 use model::arch::models::Mixer;
@@ -50,19 +56,30 @@ impl Adapter for ADAPTER {
     }
 
     fn arms(&self, split: &Split) -> Vec<Result<Arm, Outcome>> {
-        vec![cli_arm(split), serve_arm(split)]
+        match describe(split) {
+            Ok(inputs) => {
+                let inputs = Arc::new(inputs);
+                vec![cli_arm(&inputs), serve_arm(&inputs)]
+            }
+            // The file is read once; a refusal of it is each arm's.
+            Err(refusal) => vec![Err(refusal.clone()), Err(refusal)],
+        }
+    }
+
+    fn loader_table(&self) -> Option<&'static str> {
+        Some("swap38::stacks")
     }
 }
 
 /// The CLI's default: the unset placement by the family's rule, the plan of
 /// one sequence at the CLI's 4096.
-fn cli_arm(split: &Split) -> Result<Arm, Outcome> {
+fn cli_arm(inputs: &Arc<PlanInputs>) -> Result<Arm, Outcome> {
     let ctx = u64::try_from(CLI_CTX).expect("the CLI's context is a u64");
     let ub = ub_of(CLI_CTX)?;
-    let place = choose(split, ctx, Seqs::none(1))?;
-    let inputs = describe(split)?;
-    let machine = machine(place, &inputs, (ctx, ub), Seqs::none(1))?;
-    let unbudgeted = planned(&inputs, &machine, ctx, &PlanLevers::default(), 1);
+    let place = choose(inputs, ctx, Seqs::none(1))?;
+    let machine = machine(place, inputs, (ctx, ub), Seqs::none(1))?;
+    let unbudgeted = planned(inputs, &machine, ctx, &PlanLevers::default(), 1);
+    let inputs = Arc::clone(inputs);
     Ok(Arm {
         name: "cli",
         whole: false,
@@ -74,30 +91,30 @@ fn cli_arm(split: &Split) -> Result<Arm, Outcome> {
 /// The serve seat's default: the unset placement by the family's rule, its
 /// `--ctx` search over the plans' expert bytes for two checkpointing slots,
 /// then the load's plan at the context it answered.
-fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
-    let inputs = describe(split)?;
-    let seqs = seqs38(&inputs, SERVE_PARALLEL);
+fn serve_arm(inputs: &Arc<PlanInputs>) -> Result<Arm, Outcome> {
+    let seqs = seqs38(inputs, SERVE_PARALLEL);
     let ctx = u64::try_from(SEAT_CTX).expect("the seat's base context is a u64");
-    let place = choose(split, ctx, seqs)?;
+    let place = choose(inputs, ctx, seqs)?;
     // The seat's search: `serve_ctx`'s cap, the seat's base and step, the
     // margin over the plans' card expert bytes.
     let cap = usize::try_from(serve_ctx(1, &inputs.hp).map_err(|e| outcome_of(&e))?)
         .map_err(|e| Outcome::Red(format!("the file's serving cap: {e}")))?;
     let found = default_slot_ctx(cap, SEAT_CTX, SEAT_CTX_STEP, MARGIN, &|c| {
-        probe(&inputs, place, seqs, c)
+        probe(inputs, place, seqs, c)
     })
     .map_err(|refused| outcome_of(refused.source.as_ref()))?;
     let ctx =
         u64::try_from(found.ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?;
     let ub = ub_of(found.ctx)?;
-    let machine = machine(place, &inputs, (ctx, ub), seqs)?;
+    let machine = machine(place, inputs, (ctx, ub), seqs)?;
     let unbudgeted = planned(
-        &inputs,
+        inputs,
         &machine,
         ctx,
         &PlanLevers::default(),
         SERVE_PARALLEL,
     );
+    let inputs = Arc::clone(inputs);
     Ok(Arm {
         name: "serve",
         whole: false,
@@ -114,6 +131,7 @@ fn probe(
     seqs: Seqs,
     c: usize,
 ) -> Result<ExpertBytes, GateError> {
+    probed();
     let ctx = u64::try_from(c).expect("a context the search probed is a u64");
     let ub = ub_of(c).map_err(text_of)?;
     let machine = machine(place, inputs, (ctx, ub), seqs).map_err(text_of)?;
@@ -134,28 +152,23 @@ fn probe(
 /// at the run's context — the CLI's plain plan (`Seqs::none` of its slots)
 /// or the seat's checkpointing ones. Under the gate's one-card census the
 /// offer is `a` alone and the question is never asked.
-fn choose(split: &Split, ctx: u64, seqs: Seqs) -> Result<Place, Outcome> {
+fn choose(inputs: &PlanInputs, ctx: u64, seqs: Seqs) -> Result<Place, Outcome> {
     let at = usize::try_from(ctx).expect("the run's context is a usize");
     let ub = ub_of(at)?;
-    q38place::choose(
-        None,
-        &gpu_census::census().map_err(|e| outcome_of(e.as_ref()))?,
-        |offer| {
-            let inputs = describe(split).map_err(text_of)?;
-            let specs = offer.card_specs()?;
-            q38place::tier_experts(
-                &inputs,
-                (specs[0], specs[1]),
-                (ctx, ub),
-                Experts::Card,
-                &PlanLevers::default(),
-                // The default runs carry no MTP draft: the draft levers
-                // unset.
-                None,
-                seqs,
-            )
-        },
-    )
+    q38place::choose(None, census()?, |offer| {
+        let specs = offer.card_specs()?;
+        q38place::tier_experts(
+            inputs,
+            (specs[0], specs[1]),
+            (ctx, ub),
+            Experts::Card,
+            &PlanLevers::default(),
+            // The default runs carry no MTP draft: the draft levers
+            // unset.
+            None,
+            seqs,
+        )
+    })
     .map(|chosen| chosen.place)
     .map_err(|e| outcome_of(e.as_ref()))
 }
@@ -219,7 +232,9 @@ fn planned(
     slots: usize,
 ) -> Outcome {
     match plan_of(inputs, machine, ctx, levers, slots) {
-        Ok(plan) => Outcome::Plan(view_of(&plan)),
+        Ok(plan) => Outcome::Plan(
+            view_of(&plan).with_loader(swap38::stacks(&inputs.model, &plan).map(drop)),
+        ),
         Err(outcome) => outcome,
     }
 }
