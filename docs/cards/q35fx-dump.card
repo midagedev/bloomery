@@ -1,0 +1,17 @@
+# Round q35fx F1 (card for the dump sitting): ik's CPU node dumps on the Qwen3.6 fixture
+# (/models/fixtures/qwen35moe/, the lmstudio Q4_K_M at layers [5, 11, 0, 39]) and its two variants
+# (/models/fixture-variants/{unjoined,unjoinedq6}/qwen35moe/, the UD-Q4_K_M layout with a Q5_K and a Q6_K routed down:
+# tools/fixture-variants.tsv), so the refset family fx-ik-qwen35moe's three sets exist on each file and the e2e's
+# FixtureOracle clauses have them in the base item and in both variant items. Nine dumps, each
+# `BLOOMERY_TIER=fixture [BLOOMERY_FIXTURE_VARIANT=<tag>] just dump-ref-fixture qwen35moe [step4-every-node | d1k]` under
+# this card, one lease each, file by file so each file is read from the device once. Nothing is timed. The dumpers are
+# main's shared bin/; the variants change the file, not the dumper.
+# Minutes [derived from fxoracle-dump.card's measured terms]: fixed 3-15 s a lease take x 9 = 0.45-2.25 min; batch and
+# step4-every-node ~0.1 min each (fxprobe's Qwen3.8 batch 4.4 s on 4 layers, CPU, -t 32) = 0.6 min; d1k 1,024 positions at
+# 2-6 ms (4 of 40 layers of the real dump's per-token cost, with the prefill routes) = 0.1-0.3 min each, 0.3-0.9 min;
+# so 1.4-3.8 min, rounded up to 2..8 for three cold file reads.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads (CUDA hidden, no card); beside a timed run or a gate batch it would take their
+  cores and memory bandwidth, and the profile takes the lease for every dump; why now: the Qwen3.6 fixture family (F1)
+  lands with its gate conversion (F2), whose FixtureOracle clauses need these sets in the base and both variant items
+minutes: 2..8
