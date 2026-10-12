@@ -166,7 +166,8 @@
 //! placement leaves room ([`vision_seat::encoder_seat`]): on a held card the plan leaves off (the 3090
 //! under `--place a`, the A6000 under `gate`), else as a named reserve of the stage card (`bp`) that every
 //! plan this seat makes counts, the offer's, the context rule's, the printed `plan` line's and the
-//! load's, so they all see one stage card. The `vision` record follows the `load` record. The server
+//! load's, so they all see one stage card. The `vision_seat` record follows the `plan` record, the `vision`
+//! record the `load` record. The server
 //! renders an image part as `<|begin_of_image|><|image|><|end_of_image|>` and expands the middle id to the
 //! merged-token count of the image's grid, positions normal (`serve::media` over [`Seat::media_model`]);
 //! a prompt call that holds an image encodes it on the tower and feeds the rows in place of their
@@ -1056,6 +1057,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     record::plan(place.name(), &machine, &plan).eprint();
+    if let Some(v) = &vision {
+        vision_seat::seat_record(v).eprint();
+    }
     let residency = residency_at(&plan, lever, beside)?;
     let pool = match residency {
         Residency::Mid { pinned, .. } => {

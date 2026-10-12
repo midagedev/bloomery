@@ -517,6 +517,11 @@ pub fn kept(
         .map_err(|_| "the vision_seat record's lock is poisoned")?;
     if !said.contains(&line) {
         eprintln!("{line}");
+        eprintln!(
+            "vision: images are off: the --hf repo's projector would cost the plan what the record above \
+             says; --mmproj {} loads it anyway",
+            v.path.display()
+        );
         said.push(line);
     }
     Ok(None)
