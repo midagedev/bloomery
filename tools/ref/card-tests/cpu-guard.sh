@@ -9,7 +9,7 @@
 # reading is exact — the runner's own busy arm left out, a foreign cargo and a rustc started inside the
 # interval counted, a reused pid counted from its own start, a reading under a second only starting the
 # next interval, a tree that cannot be read a named exit. Runs on the Mac (bash 3.2) and on the box.
-# Live, where /proc/self/stat exists (the box): two busy copies of `yes` under names of their own (so no
+# Live, where /proc/self/stat exists (the box): two busy shell scripts under names of their own (so no
 # real build on the box counts), one the test shell's child (its own arm: never tagged) and one
 # reparented away from it (foreign: tagged), each started and killed by the pid this test recorded.
 # One line per test, `ok <name>`, `FAIL <name>: <why>` or `skip <name>: <why>`; exit 0 iff none failed.
@@ -96,9 +96,12 @@ expect 'strict mode aborts on a foreign cargo' 75 'witness abort-cpu' \
 
 if [ -r /proc/self/stat ]; then
   unset BLOOMERY_LEASE_PROC
-  yes=$(command -v yes)
-  cp "$yes" "$tmp/bin/gends41-own"
-  cp "$yes" "$tmp/bin/cargo-foreign"
+  # A busy loop picks no program by argv[0] (a copy of a multicall `yes` would exit), and the kernel names the
+  # process by the script's file.
+  for name in gends41-own cargo-foreign; do
+    printf '#!/bin/sh\nwhile :; do :; done\n' > "$tmp/bin/$name"
+    chmod 755 "$tmp/bin/$name"
+  done
   export CPU_TEST_TMP=$tmp
   # The test shell starts its own arm and records its pid; the foreign one is started by a subshell that
   # exits at once, so its parent is no longer under the test shell.

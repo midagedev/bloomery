@@ -6712,14 +6712,20 @@ mod ccd_tests {
             "needs a pool of 8 or more threads"
         );
         let map = CcdMap::new(pool.threads(), ccds, 0);
+        // The first lane whose participant is neither the lane nor its CCD number: a table indexed
+        // by sorted position or by CCD puts the time under another index.
+        // Lane 1 (CCD 0's rank 1, participant 4) is one once CCD 0 holds two: from 5 threads.
+        let (lane, t) = (0..map.threads())
+            .map(|lane| {
+                let t = (0..map.threads())
+                    .find(|&t| map.lane_of(t) == lane)
+                    .expect("a lane is some participant's");
+                (lane, t)
+            })
+            .find(|&(lane, t)| t != lane && t != map.ccd_of(t))
+            .expect("a lane whose participant is neither the lane nor its CCD number");
         let mut set = Pairs::new(&[8 * pool.threads()], &[1], true);
         let cut = CcdCut::of(&set, map, true);
-        // The lane of CCD 1's second rank, and the participant that owns it.
-        let lane = map.first_lane(1) + 1;
-        let t = (0..map.threads())
-            .find(|&t| map.lane_of(t) == lane)
-            .expect("a lane is some participant's");
-        assert_ne!(t, lane, "in lane order and in participant order apart");
         let slow = cut.first_unit(&set, lane, 0);
         set.heavy = Some((slow, Duration::from_millis(40)));
         profile::reset();
