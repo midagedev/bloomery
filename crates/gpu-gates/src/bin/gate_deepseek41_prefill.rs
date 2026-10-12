@@ -191,14 +191,6 @@
 //! tokens whose streams differ among those the batch ran and the largest
 //! difference, up to the first seams that differ.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_prefill: built without the `deepseek41` feature; see `just gate-gpu-ds41-prefill`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_prefill", gate::run())

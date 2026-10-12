@@ -289,12 +289,6 @@
 //! counters would count the probe's step too). Unset, the probe does not
 //! run.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!("generate_ds41: built without the `deepseek41` feature; see `just gen-ds41`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("generate_ds41", drive::run())

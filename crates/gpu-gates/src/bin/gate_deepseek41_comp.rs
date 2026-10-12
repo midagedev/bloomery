@@ -43,14 +43,6 @@
 //! order (`RefManifest::first_touched_by`; `docs/oracle.md`, 「상태는 input
 //! 행이다」).
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_comp: built without the `deepseek41` feature; see `just gate-gpu-ds41-comp`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_comp", gate::run())

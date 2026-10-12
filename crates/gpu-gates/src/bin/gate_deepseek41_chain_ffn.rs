@@ -96,15 +96,6 @@
 //! name with nothing launched. The `_8` entries, the handoff's among them,
 //! and the handoff's `_10` compile with no local depot.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_chain_ffn: built without the `deepseek41` feature; see `just \
-         gate-gpu-ds41-chain-ffn`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_chain_ffn", gate::run())

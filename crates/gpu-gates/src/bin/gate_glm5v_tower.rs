@@ -36,14 +36,6 @@
 //! clamp over g and u on both sides of the limit, NaN lanes included), the card bytes, and an
 //! encode does not depend on the larger image encoded before it in the reused buffers.
 
-#[cfg(not(feature = "vision"))]
-fn main() {
-    eprintln!(
-        "gate_glm5v_tower: built without the `vision` feature; see `just gate-gpu-glm5v-tower`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "vision")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5v_tower", gate::run())

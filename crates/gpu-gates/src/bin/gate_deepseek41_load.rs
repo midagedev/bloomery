@@ -58,14 +58,6 @@
 //! Before any upload the card is found by name and must have free what the
 //! plan puts on it besides the context; a short card refuses the run.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_load: built without the `deepseek41` feature; see `just gate-ds41-load`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_load", gate::run())

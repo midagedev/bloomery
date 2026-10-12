@@ -86,12 +86,6 @@
 //! known differences). Without the glm5next reference family, or with it and a set,
 //! tap or tensor missing, it fails by name.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_linear: built without the `gpu` feature; see `just gate-gpu-linear`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_linear", gate::run())

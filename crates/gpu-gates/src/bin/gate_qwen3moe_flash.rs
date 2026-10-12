@@ -136,14 +136,6 @@
 //! 65,537, and one launch of [`ROWS`] rows at counts straddling the
 //! threshold each row bit for bit its one-row launch.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen3moe_flash: built without the `gpu` feature; see `just gate-gpu-qwen3moe-flash`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen3moe_flash", gate::run())

@@ -45,14 +45,6 @@
 //! The decode flash is the scalar segment pass (`mma` false); the prompt's
 //! flash is the pairs' prefill body.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_clef_hidden: built without the `gpu` feature; see `just gate-gpu-clef-hidden`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_clef_hidden", gate::run())

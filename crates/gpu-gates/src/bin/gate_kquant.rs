@@ -130,12 +130,6 @@
 //!     fault; the launchers refuse a Q6_K gate stack, an up stack of another
 //!     shape and a table of more experts than the stack holds.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_kquant: built without the `gpu` feature; see `just gate-gpu-kquant`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_kquant", gate::run())

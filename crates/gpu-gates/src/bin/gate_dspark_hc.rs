@@ -35,14 +35,6 @@
 //!    logits equal the host's bit for bit, and the probabilities equal the
 //!    host transcription of `argmax_p_rows_fault`'s softmax.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_dspark_hc: built without the `deepseek41` feature; see `just gate-gpu-dspark-hc`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_dspark_hc", gate::run())

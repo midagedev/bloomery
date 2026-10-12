@@ -37,14 +37,6 @@
 //! `(|x_0| + |x_1|)·(8u·pos + 8u)` (both tables' angle rounding); ik stores f16,
 //! so its value is at most half an f16 ulp from its f32.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_dspark_kv: built without the `deepseek41` feature; see `just gate-gpu-dspark-kv`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_dspark_kv", gate::run())

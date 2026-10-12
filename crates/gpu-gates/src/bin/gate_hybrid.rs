@@ -100,12 +100,6 @@
 //! difference) ≤ √(3h) · SIGMA_OURS` with `h` the host's measured share of
 //! the routed weight², and the flip band is `TAIL_FACTOR` times that bound.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_hybrid: built without the `gpu` feature; see `just gate-gpu-hybrid`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_hybrid", gate::run())

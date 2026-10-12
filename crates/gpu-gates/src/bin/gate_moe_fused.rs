@@ -16,12 +16,6 @@
 //! asserted: `ik_rel` of y against dump `l_out-1`'s last column and of the
 //! op-path weighted sum against `ffn_moe_out-1`'s.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_moe_fused: built without the `gpu` feature; see `just gate-gpu-moe`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::oracle::deepseek2::L_OUT_1;
 #[cfg(feature = "gpu")]

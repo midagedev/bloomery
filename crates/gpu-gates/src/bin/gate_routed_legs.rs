@@ -30,15 +30,6 @@
 //! last `legs: wall` line the run's wall: the gate holds the card's lock the
 //! whole run, and its recipe's bound is 900 s.
 
-#[cfg(not(all(feature = "glm5next", feature = "mimo2")))]
-fn main() {
-    eprintln!(
-        "gate_routed_legs: built without the `glm5next` and `mimo2` features; see \
-         `just gate-gpu-routed-legs`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(all(feature = "glm5next", feature = "mimo2"))]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_routed_legs", routed_legs::run())

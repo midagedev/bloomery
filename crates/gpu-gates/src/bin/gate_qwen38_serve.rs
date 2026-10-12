@@ -440,14 +440,6 @@
 //! the arm names the draft (a set `BLOOMERY_MTP_DRAFT` needs the drafted
 //! arm), and every server holds the unset `xstream=` rule.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen38_serve: built without the `deepseek41` feature; see `just gate-gpu-qwen38-serve`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen38_serve", gate::run())

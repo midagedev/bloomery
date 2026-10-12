@@ -14,12 +14,6 @@
 //! reference value is `code × scale` as the block is written — the product
 //! `dequant_row`'s Q8_0 arm computes, exact in f32.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p3: built without the `gpu` feature; see `just gate-gpu-p3`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::GateError;
 

@@ -45,12 +45,6 @@
 //! raise it from the down and leave that tile's (that entry's) slots
 //! untouched.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_q4k_sel: built without the `gpu` feature; see `just gate-gpu-q4k-sel`.");
-    std::process::exit(2);
-}
-
 // Module-level because the stack and check helpers below `run` share them.
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HOST;

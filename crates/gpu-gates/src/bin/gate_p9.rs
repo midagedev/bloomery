@@ -19,12 +19,6 @@
 //! `FaultSite::ExpertId` for id 64 and nothing for u32::MAX (`hybrid::HOST`,
 //! a host-served slot), and so does `q5_0_gemv_sel`.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p9: built without the `gpu` feature; see `just gate-gpu-p9`.");
-    std::process::exit(2);
-}
-
 // Module-level because the reference helpers below `main` share them.
 #[cfg(feature = "gpu")]
 use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0};

@@ -105,14 +105,6 @@
 //!   per token, all BIT-EQUAL.
 //! - `shape`: the seven entries compile with no local depot.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen35moe_moe: built without the `gpu` feature; see `just gate-gpu-qwen35moe-moe`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen35moe_moe", gate::run())

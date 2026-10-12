@@ -34,14 +34,6 @@
 //! `qwen35moe` / `qwen4exp` vision families; a set that is not there ends its arm with a named
 //! `deferred(<set>)` line and the run says how many arms it deferred. A deferral is not a pass.
 
-#[cfg(not(feature = "vision"))]
-fn main() {
-    eprintln!(
-        "gate_qwen3vl_tower: built without the `vision` feature; see `just gate-gpu-qwen3vl-tower`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "vision")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen3vl_tower", gate::run())

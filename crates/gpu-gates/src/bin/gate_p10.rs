@@ -37,12 +37,6 @@
 //!    block's f16 bits and the code plane its codes, so plane equality is
 //!    block-bytes equality).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p10: built without the `gpu` feature; see `just gate-gpu-p10`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::arch::deepseek2::Body;
 #[cfg(feature = "gpu")]

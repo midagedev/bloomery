@@ -20,12 +20,6 @@
 //! (the block-layer bands are pinned by the lead from these numbers, not
 //! here).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p0b: built without the `gpu` feature; see `just gate-gpu-p0b`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::oracle::deepseek2::L_OUT_0;
 #[cfg(feature = "gpu")]

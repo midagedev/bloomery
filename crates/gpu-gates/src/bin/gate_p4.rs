@@ -31,12 +31,6 @@
 //! are the logical tensors, read through `load_ref_logical_in` (the v2
 //! `.logical.f32` twins).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p4: built without the `gpu` feature; see `just gate-gpu-p4`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::oracle::deepseek2::{L_OUT_0, L_OUT_1, L_OUT_26};
 #[cfg(feature = "gpu")]

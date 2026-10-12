@@ -64,14 +64,6 @@
 //! with every other block and both whole K planes the clean run's bits, and
 //! the word clean after a clean rerun.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen3moe_rope: built without the `gpu` feature; see `just gate-gpu-qwen3moe-rope`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen3moe_rope", gate::run())

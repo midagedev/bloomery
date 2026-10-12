@@ -47,12 +47,6 @@
 //!    launch, the streams as they went in — planes of another shape and a
 //!    one-expert table filled for fewer slots than the mix's columns.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_hc_gated: built without the `gpu` feature; see `just gate-gpu-hc-gated`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_hc_gated", gate::run())

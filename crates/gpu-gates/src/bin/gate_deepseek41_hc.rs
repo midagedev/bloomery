@@ -64,14 +64,6 @@
 //! named when they are not; `ds41_hc_pre` takes at most 8 tokens a launch,
 //! so a longer prefill is split by its caller and no set covers that split.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_hc: built without the `deepseek41` feature; see `just gate-gpu-ds41-hc`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_hc", gate::run())

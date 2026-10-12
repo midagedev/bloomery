@@ -24,12 +24,6 @@
 //! A flag given twice takes its last value; an unknown flag, a missing
 //! value, or one of the row flags without the other is refused by name.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("clef_hidden: built without the `gpu` feature; see `just clef-hidden`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::record::at_main("clef_hidden", bloomery_gpu_gates::record::CLEF_HIDDEN_BIN);

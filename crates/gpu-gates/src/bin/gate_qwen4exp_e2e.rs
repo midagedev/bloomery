@@ -298,14 +298,6 @@
 //! pool that ours, which keeps 512 whole pools and the tail, does not (the
 //! difference q38sel measured), its logits printed.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen4exp_e2e: built without the `gpu` feature; see `just gate-gpu-qwen4exp-e2e`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen4exp_e2e", gate::run())

@@ -81,14 +81,6 @@
 //! (eight where the shared down reads q8_1) captured as a graph and
 //! replayed.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_moe: built without the `deepseek41` feature; see `just gate-gpu-ds41-moe`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_moe", gate::run())

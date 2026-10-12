@@ -41,14 +41,6 @@
 //! clauses 1 and 2); a red clause 1 skips the width-1 child, and a child that ends nonzero is red.
 //! Loads the whole host set: alone in a batch, under the big-load lock.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen4exp_iqleg: built without the `gpu` feature; see `just gate-gpu-qwen4exp-iqleg`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen4exp_iqleg", gate::run())

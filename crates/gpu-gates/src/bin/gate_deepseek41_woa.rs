@@ -43,14 +43,6 @@
 //!    the two rules' distance bounded through ik's reconstruction of the
 //!    activations, which layer 2 proves.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_woa: built without the `deepseek41` feature; see `just gate-gpu-ds41-woa`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_woa", gate::run())

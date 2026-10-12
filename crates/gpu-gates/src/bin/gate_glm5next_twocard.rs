@@ -135,14 +135,6 @@
 //! tier size) are `Tag::FileBound` and the fixture tier defers them to the real tier by name; every bit-for-bit clause
 //! runs on the fixture.
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!(
-        "gate_glm5next_twocard: built without the `glm5next` feature; see `just gate-gpu-glm5next-twocard`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_twocard", gate::run())

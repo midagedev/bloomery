@@ -32,14 +32,6 @@
 //! after block 0 is held to a multiple of the reference's distance from itself under one-ulp
 //! noise (the set's `# sensitivity` rows), since the network amplifies a last-bit difference.
 
-#[cfg(not(feature = "vision"))]
-fn main() {
-    eprintln!(
-        "gate_vision_encoder: built without the `vision` feature; see `just gate-gpu-vision`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "vision")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_vision_encoder", gate::run())

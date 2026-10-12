@@ -67,12 +67,6 @@
 //! round trip — a defect that changes no output and no band, so nothing else
 //! here can see it.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p5: built without the `gpu` feature; see `just gate-gpu-p5`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::flash::{
     FlashGeom, FlashInputs, FlashKernels, FlashLatentArgs, FlashLatentQ8Args, FlashMergeArgs,

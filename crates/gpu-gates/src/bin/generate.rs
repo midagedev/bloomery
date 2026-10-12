@@ -60,12 +60,6 @@
 //! (`StepProbe`): the run is then a timing instrument, and its footer says
 //! so.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("generate: built without the `gpu` feature; see `just generate`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]

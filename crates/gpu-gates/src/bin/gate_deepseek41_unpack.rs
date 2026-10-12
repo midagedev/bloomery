@@ -16,15 +16,6 @@
 //!   shared group and a part that is not a whole number of groups are each a
 //!   named error, and the part is unchanged.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_unpack: built without the `deepseek41` feature; see `just \
-         gate-gpu-ds41-unpack`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_unpack", gate::run())

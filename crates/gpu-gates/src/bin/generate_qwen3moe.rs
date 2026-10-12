@@ -339,12 +339,6 @@
 //! sets hold our numbers to ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`),
 //! which bounds nothing.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("generate_qwen3moe: built without the `gpu` feature; see `just gen-qwen3moe`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("generate_qwen3moe", cli::run())

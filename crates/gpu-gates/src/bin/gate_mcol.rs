@@ -31,12 +31,6 @@
 //! own activations. Every check prints an `m1=` digest of its m = 1 outputs,
 //! so two trees' decode bits compare line by line.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!("gate_mcol: built without the `deepseek41` feature; see `just gate-gpu-mcol`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_mcol", gate::run())

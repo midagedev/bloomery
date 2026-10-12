@@ -51,14 +51,6 @@
 //!
 //! The serve prompt cache and slot file are R4a's.
 
-#[cfg(not(feature = "vision"))]
-fn main() {
-    eprintln!(
-        "gate_qwen35_media: built without the `vision` feature; see `just gate-gpu-qwen35-media`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "vision")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen35_media", gate::run())

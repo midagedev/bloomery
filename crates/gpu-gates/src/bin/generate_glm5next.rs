@@ -187,12 +187,6 @@
 //! `BLOOMERY_STEP_STATS=1` and the shared diagnosis flags (`generate::Diag`),
 //! which this arm does not run.
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!("generate_glm5next: built without the `glm5next` feature; see `just gen-glm5next`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("generate_glm5next", cli::run())

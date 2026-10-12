@@ -56,14 +56,6 @@
 //!   `DECODE_INPUT`, a lost card); the flag is then
 //!   raised and both streams drain.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_twocard: built without the `deepseek41` feature; see `just gate-gpu-ds41-twocard`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_twocard", gate::run())

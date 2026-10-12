@@ -34,12 +34,6 @@
 //! which is the operand pair the fused store consumes — the table marks that
 //! row `recombined`.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p8b: built without the `gpu` feature; see `just gate-gpu-p8b`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]

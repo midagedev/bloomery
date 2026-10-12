@@ -259,14 +259,6 @@
 //! chunk from a reset, one step per id, at every scored position our NLL,
 //! ik's, KL(ik‖ours) and the top-1 agreement. Printed, not judged.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen3moe_e2e: built without the `gpu` feature; see `just gate-gpu-qwen3moe-e2e`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen3moe_e2e", gate::run())

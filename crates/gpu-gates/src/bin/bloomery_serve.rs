@@ -55,14 +55,6 @@
 //! module's doc; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are this
 //! binary's ds41 and qwen38 seats alone.
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!(
-        "bloomery-serve: built without the `glm5next` feature, which links every seat's device bundle."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     // Before any x86-64-v3 code: `drive::run` is not inlined, so `main` holds

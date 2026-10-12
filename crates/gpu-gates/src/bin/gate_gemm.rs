@@ -168,12 +168,6 @@
 //!   rule-taking SwiGLU, an empty map and slots past the table for the remap, and the
 //!   F32 tile's K, short `x` and an `x` off a 16-byte boundary.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_gemm: built without the `gpu` feature; see `just gate-gpu-gemm`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_gemm", gate::run())

@@ -40,14 +40,6 @@
 //!
 //! Logs per server in `<dir>/<clause>/` (`server.out`, `server.err`, the bodies).
 
-#[cfg(not(all(feature = "deepseek41", feature = "clef")))]
-fn main() {
-    eprintln!(
-        "gate_lev_serve: built without the `deepseek41` and `clef` features; see `just gate-gpu-lev-serve`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(all(feature = "deepseek41", feature = "clef"))]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_lev_serve", gate::run())

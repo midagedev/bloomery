@@ -16,12 +16,6 @@
 //! `{2048, 1}`) — the same tensor the CPU head gate feeds
 //! (`crates/model/tests/head.rs`).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_head_gpu: built without the `gpu` feature; see `just gate-gpu-head`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Gpu;
 #[cfg(feature = "gpu")]

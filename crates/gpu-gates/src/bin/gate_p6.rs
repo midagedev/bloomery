@@ -44,12 +44,6 @@
 //! can see — it was the router's whole defect, and the assertion is what
 //! keeps it closed.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p6: built without the `gpu` feature; see `just gate-gpu-p6`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{Fnv1a64, GateError, ptx_shapes, verdict};
 

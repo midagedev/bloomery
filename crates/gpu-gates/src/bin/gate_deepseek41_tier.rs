@@ -78,14 +78,6 @@
 //! same file fed another way), so the fixture tier runs all of them; each names its tag once
 //! through `crate::ds41_tier::sc` before it runs, and the closing line counts them.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_tier: built without the `deepseek41` feature; see `just gate-gpu-ds41-tier`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_tier", gate::run())

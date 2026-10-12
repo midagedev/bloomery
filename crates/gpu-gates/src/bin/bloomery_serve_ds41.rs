@@ -3,14 +3,6 @@
 //! the records, the prompt cache and the exit codes). `bloomery-serve --model
 //! ds41` serves the same seat.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "bloomery-serve-ds41: built without the `deepseek41` feature; see `just weekly-gpu-ds41-serve`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

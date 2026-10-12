@@ -264,14 +264,6 @@
 //! are the server's (`serve_levers::ACTS_ON`): one the server would refuse is
 //! refused here, at `main`, before the server starts.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_ds41_serve: built without the `deepseek41` feature; see `just weekly-gpu-ds41-serve`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_ds41_serve", gate::run())

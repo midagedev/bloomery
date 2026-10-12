@@ -39,12 +39,6 @@
 //!    word is clean after a clean launch.
 //! 6. `shape`: the two new entries compile with no local depot.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!("gate_glm_mla: built without the `deepseek41` feature; see `just gate-gpu-glm-mla`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm_mla", gate::run())

@@ -89,14 +89,6 @@
 //! non-square image), a span given the other image's rows, and the control's call
 //! carrying the spans.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_ds41_media: built without the `deepseek41` feature; see `just gate-gpu-ds41-media`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_ds41_media", gate::run())

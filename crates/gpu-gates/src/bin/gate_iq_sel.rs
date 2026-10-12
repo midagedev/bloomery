@@ -133,12 +133,6 @@
 //! about 0.4 % of a typical dot whatever the format, since the weights
 //! enter both sides alike.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_iq_sel: built without the `gpu` feature; see `just gate-gpu-iq-sel`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_iq_sel", gate::run())

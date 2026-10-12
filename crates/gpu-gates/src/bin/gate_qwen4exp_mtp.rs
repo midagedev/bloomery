@@ -228,14 +228,6 @@
 //! - (tfx) the pairing of (t) against the fixture set's warmup hidden rows: the shift 1 reads
 //!   closer than 0 and 2, its distance printed (the prompt's last rows lie on a flip's path).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen4exp_mtp: built without the `gpu` feature; see `just gate-gpu-qwen4exp-mtp`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen4exp_mtp", gate::run())

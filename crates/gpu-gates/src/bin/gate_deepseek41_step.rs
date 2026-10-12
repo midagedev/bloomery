@@ -186,14 +186,6 @@
 //! does not hold, so the pins stop there and the lines after it print only;
 //! what the swap alone does to the streams prints beside the flip.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_step: built without the `deepseek41` feature; see `just gate-gpu-ds41-step`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_step", gate::run())

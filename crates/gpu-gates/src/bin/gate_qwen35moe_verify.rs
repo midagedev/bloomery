@@ -65,15 +65,6 @@
 //!   - (ti) taps past the layer count or out of order are refused by name,
 //!     and a refused call leaves taps off.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen35moe_verify: built without the `gpu` feature; see \
-         `just gate-gpu-qwen35moe-verify`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen35moe_verify", gate::run())

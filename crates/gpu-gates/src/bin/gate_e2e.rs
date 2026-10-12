@@ -71,12 +71,6 @@
 //! The classifiers, the reference reader and the three classes are
 //! `gpu_gates::prompts`; this gate does not re-implement them.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_e2e: built without the `gpu` feature; see `just gate-gpu-e2e`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]

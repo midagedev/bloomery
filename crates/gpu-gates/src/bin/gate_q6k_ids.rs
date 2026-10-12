@@ -33,12 +33,6 @@
 //! turns (a)'s per-column comparison red; (iii) the kernel's id check
 //! removed turns (c) red.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_q6k_ids: built without the `gpu` feature; see `just gate-gpu-q6k-ids`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
 #[cfg(feature = "gpu")]

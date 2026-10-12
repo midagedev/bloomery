@@ -14,12 +14,6 @@
 //! replays, one synchronize a round, and one `cnode` line with the fastest and
 //! the mean round's µs per replay and the fastest round's µs per node.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("cnode_probe: built without the `gpu` feature; see `just time-gpu-cnode`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("cnode_probe", probe::run())

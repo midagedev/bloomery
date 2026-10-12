@@ -309,14 +309,6 @@
 //! and `BLOOMERY_MTP_WIDTH` set in this binary's environment are refused by
 //! name (the arms set them, and the unset server leaves them to the seat).
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!(
-        "gate_glm5next_serve: built without the `glm5next` feature; see `just gate-gpu-glm5next-serve`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_serve", gate::run())

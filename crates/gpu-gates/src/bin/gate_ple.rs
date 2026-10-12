@@ -36,12 +36,6 @@
 //!    dilation, no stream, no token, a ring or key shorter than the call's.
 //! 9. `shape`: both entries compile with no local depot.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_ple: built without the `gpu` feature; see `just gate-gpu-ple`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_ple", gate::run())

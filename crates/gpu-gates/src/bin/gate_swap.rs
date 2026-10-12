@@ -288,12 +288,6 @@
 //! which finds each not resident: the pick refused by name, the boundary's
 //! victims and the end's expert sent on, none read in again).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_swap: built without the `gpu` feature; see `just gate-gpu-swap`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_swap", gate::run())

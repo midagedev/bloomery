@@ -76,12 +76,6 @@
 //! `body::open` in `bloomery_gpu_deepseek41` refuses a placement on more than
 //! one. Plan (a) is the one-card plan.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_load_v41: built without the `gpu` feature; see `just stage-gpu-load-v41`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_load_v41", gate::run())

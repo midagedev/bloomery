@@ -421,14 +421,6 @@
 //! that lies away from the media call and the tower's refusal of a grid past its cap by name. It declares
 //! no fixture-oracle clause, and the real tier fails it by name before any load (0 clauses).
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!(
-        "gate_glm5next_e2e: built without the `glm5next` feature; see `just gate-gpu-glm5next-e2e`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_e2e", gate::run())

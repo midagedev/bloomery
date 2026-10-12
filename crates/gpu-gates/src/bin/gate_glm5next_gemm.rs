@@ -41,14 +41,6 @@
 //! Tiers (`BLOOMERY_TIER`): every clause is a self-consistency clause (`tier::sc`) on the layers of the opened file
 //! (layer 0 dense, layer 4 KDA, layer 3 latent), so the fixture tier runs them all on the fixture.
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!(
-        "gate_glm5next_gemm: built without the `glm5next` feature; see `just gate-gpu-glm5next-gemm`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_gemm", gate::run())

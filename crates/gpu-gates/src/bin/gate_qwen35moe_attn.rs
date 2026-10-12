@@ -182,14 +182,6 @@
 //!     launch, the fault, the captured launch (one node), a head count
 //!     refused.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen35moe_attn: built without the `gpu` feature; see `just gate-gpu-qwen35moe-attn`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen35moe_attn", gate::run())

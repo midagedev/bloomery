@@ -49,14 +49,6 @@
 //! over a synthetic token stream of `HELPER_STEPS` steps — each step's rows
 //! are the ones it waited for, not the other buffer of the helper's pair.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_engram: built without the `deepseek41` feature; see `just gate-gpu-ds41-engram`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_engram", gate::run())

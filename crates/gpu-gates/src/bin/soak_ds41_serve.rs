@@ -39,12 +39,6 @@
 //! size says nothing about a leak. A leak on that side is a mapping that is
 //! never unmapped, which the mapping count catches.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!("soak_ds41_serve: built without the `deepseek41` feature; see `just soak-ds41`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("soak_ds41_serve", soak::run())

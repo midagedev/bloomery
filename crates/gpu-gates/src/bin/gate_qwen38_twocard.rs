@@ -108,14 +108,6 @@
 //! child takes this gate's environment less the placed levers — a run with
 //! no `--place` refuses them by name.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen38_twocard: built without the `gpu` feature; see `just gate-gpu-qwen38-twocard`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen38_twocard", gate::run())

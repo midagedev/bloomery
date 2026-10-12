@@ -15,14 +15,6 @@
 //!
 //!     gate_qwen35_dspark [--draft <dir>]    # else $BLOOMERY_DSPARK_MODEL, else the box's copy
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen35_dspark: built without the `gpu` feature; see `just gate-gpu-qwen35-dspark`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen35_dspark", gate::run())

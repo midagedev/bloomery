@@ -54,12 +54,6 @@
 //! effective GB/s of the whole chain and the two references of
 //! docs/roofline.md so a reader sees where each op sits between them.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p8: built without the `gpu` feature; see `just gate-gpu-p8`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]

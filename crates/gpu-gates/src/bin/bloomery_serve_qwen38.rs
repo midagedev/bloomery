@@ -3,14 +3,6 @@
 //! holds the contract (the flags, the records, the keep rule and the exit
 //! codes). `bloomery-serve --model qwen38` serves the same seat.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "bloomery-serve-qwen38: built without the `deepseek41` feature; see `just gate-gpu-qwen38-serve`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

@@ -70,14 +70,6 @@
 //! lines are records of the kinds `bloomery_gpu_gates::record` declares;
 //! `--records-schema` prints those kinds and exits.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "bloomery-chat: built without the `deepseek41` feature; see `just gate-gpu-ds41-chat`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("bloomery-chat", drive::run())

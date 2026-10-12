@@ -20,12 +20,6 @@
 //! It creates a context and JIT-compiles, so it runs on a card: through
 //! `tools/gpu-gate.sh` (the gate lock and its bound), never bare.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("oxart_jit: built without the `gpu` feature; see `just ptx-scan`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("oxart_jit", run())

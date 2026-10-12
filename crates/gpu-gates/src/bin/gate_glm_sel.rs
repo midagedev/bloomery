@@ -83,12 +83,6 @@
 //! and our rules, not from the weights. The gate declares one such clause for each of those sets
 //! (`tier::expect_fixture_oracle`).
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!("gate_glm_sel: built without the `deepseek41` feature; see `just gate-gpu-glm-sel`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm_sel", gate::run())

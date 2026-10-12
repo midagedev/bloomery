@@ -20,12 +20,6 @@
 //! The two q8_1 quantizers store a refused block with a NaN scale, so the
 //! q3_K gemv over the planted column is NaN in every row.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p1: built without the `gpu` feature; see `just gate-gpu-p1`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::GateError;
 

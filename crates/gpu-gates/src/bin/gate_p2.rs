@@ -20,12 +20,6 @@
 //! On real activations (Q5_0 moe_down) the same
 //! deviation measures 1.3–1.4e-2.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_p2: built without the `gpu` feature; see `just gate-gpu-p2`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, bits_equal, verdict};
 

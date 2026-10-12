@@ -308,14 +308,6 @@
 //!
 //! The chain runs the tensor-core flash pass, the engine's.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen35moe_e2e: built without the `gpu` feature; see `just gate-gpu-qwen35moe-e2e`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen35moe_e2e", gate::run())

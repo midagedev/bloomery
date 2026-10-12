@@ -151,15 +151,6 @@
 //!   just before its slot's keep, so slot 0 keeps its row before slot 1's
 //!   count is refused).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen38_residency: built without the `gpu` feature; see `just \
-         gate-gpu-qwen38-residency`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen38_residency", gate::run())

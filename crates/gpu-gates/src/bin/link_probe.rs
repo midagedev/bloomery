@@ -53,12 +53,6 @@
 //! No lease runner runs this probe, so its numbers are contributor evidence
 //! (the list in CONTRIBUTING.md), never numbers for our tables.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("link_probe: built without the `gpu` feature");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 #[path = "shared/verbs.rs"]
 mod verbs;

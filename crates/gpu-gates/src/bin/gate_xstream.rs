@@ -80,12 +80,6 @@
 //!   never returns, and the clause ends the process red past
 //!   [`DROP_BOUND`]).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_xstream: built without the `gpu` feature; see `just gate-gpu-xstream`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_xstream", gate::run())

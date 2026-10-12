@@ -54,12 +54,6 @@
 //! runners (`just time-gpu-h2d`, `just time-dma-dram`) is a runtime value of
 //! whatever else the box was doing.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("h2d_probe: built without the `gpu` feature; see `just time-gpu-h2d`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("h2d_probe", probe::run())

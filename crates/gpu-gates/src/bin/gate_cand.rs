@@ -52,12 +52,6 @@
 //!    and 4 alone for that reason.
 //! 9. shape: the four entries compile with no local depot.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("gate_cand: built without the `gpu` feature; see `just gate-gpu-cand`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_cand", gate::run())

@@ -133,14 +133,6 @@
 //! landed and an expert admitted: `Tag::FileBound`), which the fixture tier defers to the real tier by name. The prompt
 //! is the prose corpus's first ids in both tiers, witnessed equal to the MTP set's in the real tier.
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!(
-        "gate_glm5next_residency: built without the `glm5next` feature; see the lead's recipe."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_residency", gate::run())

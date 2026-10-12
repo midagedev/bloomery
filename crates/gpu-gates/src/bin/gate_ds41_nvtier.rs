@@ -15,14 +15,6 @@
 //! Tiers: every clause is self-consistency (the arms and the plan's own numbers), so it runs on a fixture and on the
 //! real file alike.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_ds41_nvtier: built without the `deepseek41` feature; see `just gate-gpu-ds41-nvtier`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_ds41_nvtier", gate::run())

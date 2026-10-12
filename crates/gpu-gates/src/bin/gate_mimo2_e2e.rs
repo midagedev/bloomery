@@ -137,14 +137,6 @@
 //! (`inp_out_ids`), so layer 47's output is compared at the last position
 //! alone.
 
-#[cfg(not(feature = "mimo2"))]
-fn main() {
-    eprintln!(
-        "gate_mimo2_e2e: built without the `mimo2` feature; see `just weekly-gpu-mimo2-e2e`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "mimo2")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_mimo2_e2e", gate::run())

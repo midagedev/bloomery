@@ -29,14 +29,6 @@
 //! load's entry check (`header_stacks`), (a) and (b) are red on every type but
 //! Q4_K and Q5_K.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_qwen3moe_types: built without the `gpu` feature; see `just gate-gpu-qwen3moe-types`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen3moe_types", gate::run())

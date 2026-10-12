@@ -136,14 +136,6 @@
 //! replay in `propose_as_with`, or in `append_as_with`, turns the refusal
 //! row red.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_dspark_graph: built without the `deepseek41` feature; see `just gate-gpu-dspark-graph`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_dspark_graph", gate::run())

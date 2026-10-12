@@ -234,14 +234,6 @@
 //!   short answers the session's short run, and `server_ids_are_the_session_ids`
 //!   is red on the prompt whose ids move.
 
-#[cfg(not(all(feature = "mimo2", feature = "glm5next")))]
-fn main() {
-    eprintln!(
-        "gate_mimo2_serve: built without the `mimo2` and `glm5next` features; see `just weekly-gpu-mimo2-serve`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(all(feature = "mimo2", feature = "glm5next"))]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_mimo2_serve", gate::run())

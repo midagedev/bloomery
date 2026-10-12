@@ -20,12 +20,6 @@
 //! for the logits. Both write the same cache row at the same position, so the
 //! second run's answer is the forced arm's answer.
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!("forced_probe: built without the `gpu` feature; see `just exact-taps`.");
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]

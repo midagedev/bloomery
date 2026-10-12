@@ -24,14 +24,6 @@
 //! the arena is what fits. A variant whose routed layers the card reads (`iq4xs`, `q2kxl`) is refused by name there,
 //! so no such variant lists this gate.
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!(
-        "gate_glm5next_nvtier: built without the `glm5next` feature; see `just gate-gpu-glm5next-nvtier`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_nvtier", gate::run())

@@ -109,14 +109,6 @@
 //! `gate_glm5next_e2e`'s flips are (each exchanged pair's gap within our error, the error within `flip::flip_cap` at
 //! the router's band), its logits printed, not held, its argmax still a tie band; a flip not allowed fails.
 
-#[cfg(not(feature = "glm5next"))]
-fn main() {
-    eprintln!(
-        "gate_glm5next_mtp: built without the `glm5next` feature; see `just gate-gpu-glm5next-mtp`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_mtp", gate::run())

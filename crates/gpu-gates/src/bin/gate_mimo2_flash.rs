@@ -51,14 +51,6 @@
 //!   (bits), and the flash on ik's `q-L`/`k-L`/`v-L` with the layer's window and
 //!   the file's sinks against `fa-L` (both bands).
 
-#[cfg(not(feature = "gpu"))]
-fn main() {
-    eprintln!(
-        "gate_mimo2_flash: built without the `gpu` feature; see `just gate-gpu-mimo2-flash`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_mimo2_flash", gate::run())

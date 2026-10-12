@@ -456,14 +456,6 @@
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
 //! the responses).
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_qwen3_serve: built without the `deepseek41` feature; see `just gate-gpu-qwen3-serve`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen3_serve", gate::run())

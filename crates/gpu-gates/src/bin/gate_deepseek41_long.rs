@@ -59,14 +59,6 @@
 //! that EOS itself. A run that differs from ik's within the margin rule does
 //! not have to reach ik's EOS; the case says whether and where it stopped.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_deepseek41_long: built without the `deepseek41` feature; see `just gate-gpu-ds41-long`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_long", gate::run())

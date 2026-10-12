@@ -81,15 +81,6 @@
 //! `on` call admits — is a file-bound premise (`tier::premise`) the fixture tier defers: its
 //! generated router has no skew, and the arms' equalities hold the rest of each clause.
 
-#[cfg(not(feature = "deepseek41"))]
-fn main() {
-    eprintln!(
-        "gate_ds41_callstream: built without the `deepseek41` feature; see `just \
-         gate-gpu-ds41-callstream`."
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_ds41_callstream", gate::run())
