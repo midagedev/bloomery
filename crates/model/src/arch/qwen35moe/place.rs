@@ -2914,13 +2914,15 @@ mod tests {
                 slots,
             };
             let levers = PlanLevers::default();
+            // The want steps its slots as one pass, as the plan under test
+            // does: the host totals count them as the arena floor's columns.
             let mut plan = inputs
                 .target_of(
                     machine,
                     CTX,
                     &levers,
                     Experts::Host,
-                    Beside::reserve(reserve + rows),
+                    Beside::reserve(reserve + rows).slots(slots as usize),
                     &kv,
                 )
                 .expect("the target's plan");
