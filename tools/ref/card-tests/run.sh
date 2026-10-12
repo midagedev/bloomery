@@ -605,7 +605,8 @@ sys.exit(int(os.environ.get("STUB_BOXQ_RC", "0")))
 PYSTUB
 chmod +x "$tmp/stub/ssh" "$tmp/stub/rsync"
 # The caller's own box.sh variables are dropped (a batch run with BLOOMERY_HOLD_OWNER set runs these
-# tests too); a test that wants one sets it after `box`.
+# tests too), and HOME is a fresh one, so a Mac-side hold under ~/.cache/bloomery/box-hold does not refuse
+# them; a test that wants one sets it after `box`.
 box() {
   : > "$tmp/ssh.log"
   rm -f "$tmp/rsync.log" "$tmp/rsync.sync-id" "$tmp/rsync.sync-path" "$tmp/boxq.args" "$tmp/boxq.job"
@@ -614,7 +615,7 @@ box() {
     -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S -u STUB_RSYNC_RC -u STUB_PROBE_RC -u STUB_BOXQ_RC \
     -u BLOOMERY_BOX_LOCAL -u BLOOMERY_ENV_FILE -u BLOOMERY_LOCK_DIR \
     STUB_BOXQ_ARGS="$tmp/boxq.args" STUB_BOXQ_JOB="$tmp/boxq.job" \
-    PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
+    HOME="$tmp/home" PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
 }
 sshlog() {
   if grep -Eq -- "$2" "$tmp/ssh.log"; then pass "$1"; else fail "$1" "no ssh line matches /$2/" "$tmp/ssh.log"; fi

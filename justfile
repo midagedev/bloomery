@@ -497,6 +497,12 @@ box-gc *ARGS='--kill':
 refset-publish-dry:
     ./tools/box.sh 'bash tools/refset-publish.sh --dry-run --out /tmp/refset-publish-dry'
 
+# The hold on this side: `just box-hold up <owner> [reason]` makes ~/.cache/bloomery/box-hold/<owner>, `just box-hold down <owner>` removes it. While
+# it is up, a tools/box.sh call that is not a read (BLOOMERY_BOX_READONLY=1) and not that owner's (BLOOMERY_HOLD_OWNER) ends 75 before it syncs or
+# sends anything. The rule is tools/box.sh's header; this recipe reaches no box.
+box-hold ACTION OWNER *REASON:
+    ./tools/box.sh --hold {{quote(ACTION)}} {{quote(OWNER)}} {{quote(REASON)}}
+
 # 박스에 남은 트랙 디렉터리를 로컬 워크트리와 대조한다. 인자 없이 목록, `just box-tracks --remove NAME…`로 준 이름만 삭제(그때도 stale일 때).
 box-tracks *ARGS:
     ./tools/box-tracks.sh {{ARGS}}

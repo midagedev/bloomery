@@ -5,6 +5,9 @@
 # 데이터·참조 바이너리 디렉터리는 BLOOMERY_DATA 하나가 소유한다. 병렬 트랙은 이 값과 REMOTE만 바꾼다.
 #   tools/box.sh cargo oxide doctor
 #   tools/box.sh cargo oxide run q3k_gemv --arch sm_86
+#   tools/box.sh --hold up <owner> [reason…] | down <owner>   the hold on this side (below); `just box-hold`
+#   tools/box.sh --self-test [SCRIPT]                        the hold's rules against a stub ssh and rsync, no box;
+#                                                            SCRIPT (default: this one) is the box.sh under test
 #
 # The guard. Before the command, on the box and in the same ssh, lease_guard (tools/ref/lease-probe.sh)
 # reads the timing lease (/root/bloomery-cpu.lock, through lease_free: a shared-lock probe) and every
@@ -20,7 +23,8 @@
 #   BLOOMERY_HOLD_OWNER=<o>   this call belongs to the owner of /root/bloomery-<o>-hold and passes that
 #                             hold — a sitting script puts its hold up and runs its runners through
 #                             box.sh; the lease and every other hold still stop it, and with its own
-#                             hold up and another that went up first it gives way at once (75)
+#                             hold up and another that went up first it gives way at once (75). It
+#                             passes the owner's hold on this side (below) the same way
 #   BLOOMERY_TIER=real|fixture  the tier the command runs in (unset: real, and every byte of the remote command as before). It
 #                             names the tier the model file comes from: tools/ref/ref-paths.sh resolves BLOOMERY_REF_MODEL
 #                             to the family's fixture under `fixture`, exports the fixture's card budget as BLOOMERY_CARD_BUDGET
@@ -43,8 +47,8 @@
 #                             unset): the arch is named in the environment, where the recipes read it. Unset with no such
 #                             entry: every byte of the remote command as before, and tools/arch.sh is not read.
 #   BLOOMERY_BOX_READONLY=1   a read — ps, cat, tail, ls, nvidia-smi, a status probe — runs without the
-#                             guard: the way to read a sitting's log, the owner's own included, while it
-#                             runs. Refused (64) when the command names cargo, just, make, cmake, ninja
+#                             guard and the hold on this side: the way to read a sitting's log, the owner's own
+#                             included, while it runs. Refused (64) when the command names cargo, just, make, cmake, ninja
 #                             or target/, so the opt-in cannot carry a build or one of our binaries. It
 #                             syncs nothing and creates nothing: the command runs in the remote directory
 #                             as it is, and a remote directory that is not there is refused (66) — a
@@ -73,6 +77,16 @@
 #                             box), and where /root/bloomery-cpu.lock exists: on the box its locks under BLOOMERY_LOCK_DIR
 #                             would not keep it off the box's sittings and gates
 #
+# The hold on this side. A hold is also a file on this machine, ~/.cache/bloomery/box-hold/<owner>
+# (`just box-hold up <owner> [reason]` makes it and `down <owner>` removes it; its content is an optional
+# one-line reason). While one is up, a call that is not a read ends 75 before anything is synced, queued or
+# sent over ssh, naming the owner, the file's mtime and how to pass. 75 is contention, not a failure: the
+# call did not run. Every call reads the directory afresh, so a caller that loops on 75 stops running its
+# command at its next call. BLOOMERY_HOLD_OWNER=<o> passes the hold of <o>, BLOOMERY_BOX_READONLY=1 passes
+# every hold, and the box-side guard above is unchanged. A file in the directory that is no owner's name,
+# or no regular file, ends the call with 64 naming it: a hold that does not hold is never silent. The hold on
+# this side refuses new calls; a call already waiting in the guard above waits on the box-side holds.
+#
 # The box queue. BLOOMERY_BOX_QUEUE=1 makes the command a job of the box's signalbox daemon (unset or 0:
 # the path above, byte for byte). The daemon waits on the timing lease and the holds, so the job carries
 # no guard; tools/boxq.py runs it (submit, follow its out and err apart, exit with its rc, cancel it on
@@ -98,6 +112,238 @@
 #                             and the job goes without one. The queue line `box.sh: queue <class> card=<lane>
 #                             predicted <s> remote=<dir>` goes to stderr before the submit
 set -euo pipefail
+# The hold on this side (the header): one file a holder.
+BOX_HOLD_DIR=$HOME/.cache/bloomery/box-hold
+
+# hold_stamp <epoch>: the UTC stamp of an epoch second (BSD date -r on the Mac, GNU date -d elsewhere).
+hold_stamp() {
+  local f=+%Y-%m-%dT%H:%M:%SZ
+  { [ "$(uname -s)" = Darwin ] && date -u -r "$1" "$f" 2> /dev/null; } || date -u -d "@$1" "$f"
+}
+
+# hold_since <file>: when the hold went up (its mtime, GNU stat then BSD stat) and how long ago.
+hold_since() {
+  local m s
+  m=$(stat -c %Y "$1" 2> /dev/null || stat -f %m "$1" 2> /dev/null || true)
+  case $m in
+    '' | *[!0-9]*) printf 'at a time that could not be read' ;;
+    *)
+      s=$(($(date +%s) - m))
+      [ "$s" -ge 0 ] || s=0
+      printf 'since %s (%dh%02dm%02ds ago)' "$(hold_stamp "$m")" $((s / 3600)) $((s % 3600 / 60)) $((s % 60))
+      ;;
+  esac
+}
+
+# hold_reason <file>: the hold's first line (the optional reason), without control characters, at most 200 of them.
+hold_reason() {
+  head -n 1 "$1" 2> /dev/null | tr -d '\000-\037' | cut -c1-200 || true
+}
+
+# hold_check <owner>: 0 when no hold on this side other than <owner>'s is up. Else each hold is a line on stderr and the
+# result is 75; a file of the directory that is no hold's file is 64, naming it.
+hold_check() {
+  local mine=$1 f o why lines=
+  [ -d "$BOX_HOLD_DIR" ] || return 0
+  for f in "$BOX_HOLD_DIR"/*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue # the pattern itself: the directory is empty
+    o=${f##*/}
+    case $o in
+      *[!A-Za-z0-9_]*)
+        echo "box.sh: $f is in the hold directory and is no owner's name (a hold is a file named <owner>: letters, digits, _): remove it" >&2
+        return 64
+        ;;
+    esac
+    if [ ! -f "$f" ]; then
+      echo "box.sh: $f is in the hold directory and is no regular file: remove it" >&2
+      return 64
+    fi
+    [ "$o" != "$mine" ] || continue
+    why=$(hold_reason "$f")
+    lines="${lines}box.sh: the box is on hold for $o $(hold_since "$f")${why:+: $why} — rc 75, contention, not a failure: the call did not run, and nothing was synced, queued or sent. $o passes with BLOOMERY_HOLD_OWNER=$o, a read passes with BLOOMERY_BOX_READONLY=1, and \`just box-hold down $o\` lifts it ($f)
+"
+  done
+  [ -z "$lines" ] || { printf '%s' "$lines" >&2; return 75; }
+  return 0
+}
+
+# hold_cmd up <owner> [reason…] | down <owner>: make or remove the hold's file. An owner that is no name is 64, an `up` of a hold
+# that is up leaves it as it is (its time stays the time it went up), and a `down` of a hold that is not there is a named no-op.
+hold_cmd() {
+  local act=${1:-} o=${2:-} f reason cur
+  case $act in
+    up | down) ;;
+    *) echo "usage: tools/box.sh --hold up <owner> [reason…] | down <owner>" >&2; return 64 ;;
+  esac
+  case $o in
+    '' | *[!A-Za-z0-9_]*) echo "box-hold: an owner is letters, digits and _ (the file $BOX_HOLD_DIR/<owner>), got '$o'" >&2; return 64 ;;
+  esac
+  f=$BOX_HOLD_DIR/$o
+  if [ "$act" = down ]; then
+    if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+      echo "box-hold: no hold for $o ($f is not there): nothing to take down"
+      return 0
+    fi
+    rm "$f" || return 73
+    echo "box-hold: the hold for $o is down"
+    return 0
+  fi
+  shift 2
+  reason="$*"
+  reason=$(printf '%s' "$reason" | tr '\n\r\t' '   ' | tr -d '\000-\037' | cut -c1-200)
+  mkdir -p "$BOX_HOLD_DIR" || return 73
+  if (set -C && printf '%s\n' "$reason" > "$f") 2> /dev/null; then
+    echo "box-hold: the hold for $o is up ($f): a box.sh call that is not a read ends 75, but BLOOMERY_HOLD_OWNER=$o passes; \`just box-hold down $o\` lifts it"
+  elif [ -e "$f" ] || [ -L "$f" ]; then
+    cur=$(hold_reason "$f")
+    echo "box-hold: the hold for $o is already up $(hold_since "$f")${cur:+, reason: $cur}: left as it is${reason:+ (the reason given now was not written: take it down first to change it)}"
+  else
+    echo "box-hold: $f cannot be made" >&2
+    return 73
+  fi
+}
+
+# self_test [SCRIPT]: the hold's rules (the header) on a copy of SCRIPT (default: this file) in a scratch tree, under a fake HOME,
+# with ssh and rsync stubs ahead on PATH that record their arguments and reach nothing: a call the hold refuses leaves both logs empty.
+self_test() {
+  local script=${1:-$0} d t box hd fails=0 rc=0 out= n=0 lrc=0 lpid i
+  [ -f "$script" ] || { echo "box.sh: --self-test: '$script' is no file" >&2; return 64; }
+  d=$(mktemp -d "${TMPDIR:-/tmp}/box-selftest.XXXXXX")
+  box=$d/tree/tools/box.sh hd=$d/home/.cache/bloomery/box-hold
+  mkdir -p "$d/tree/tools" "$d/stub" "$d/home"
+  cp "$script" "$box"
+  printf '%s\n' 'cuda-device = { git = "x", rev = "0123456789ab" }' > "$d/tree/Cargo.toml"
+  for t in ssh rsync; do
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/%s.log"\n' "$d" "$t" > "$d/stub/$t"
+    chmod +x "$d/stub/$t"
+  done
+  if [ "$(PATH="$d/stub:/usr/bin:/bin"; command -v ssh)" != "$d/stub/ssh" ]; then
+    echo "box.sh: --self-test: the ssh stub is not first on PATH: nothing was run" >&2
+    rm -rf "$d"
+    return 70
+  fi
+  fail() { echo "box.sh: self-test: $*" >&2; fails=$((fails + 1)); }
+  # call [VAR=value…] -- ARGS…: the scratch box.sh with ARGS, in an environment of PATH, HOME, TZ and the VARs only; rc and out are its result.
+  call() {
+    local envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done
+    shift
+    : > "$d/ssh.log"
+    : > "$d/rsync.log"
+    rc=0
+    out=$(env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' ${envs[@]+"${envs[@]}"} bash "$box" "$@" 2>&1) || rc=$?
+  }
+  want() { [ "$rc" = "$1" ] || fail "$2: rc $rc, want $1: $out"; }
+  has() { case $out in *"$1"*) ;; *) fail "$2: no '$1' in: $out" ;; esac; }
+  hasnt() { case $out in *"$1"*) fail "$2: '$1' in: $out" ;; esac; }
+  untouched() { { [ ! -s "$d/ssh.log" ] && [ ! -s "$d/rsync.log" ]; } || fail "$1: ssh or rsync was reached: $(cat "$d/ssh.log" "$d/rsync.log" | head -c 160)"; }
+  reached() { grep -q -- 'echo hi' "$d/ssh.log" || fail "$1: the command never reached ssh"; }
+
+  call -- 'echo hi'
+  want 0 'no hold directory'; reached 'no hold directory'
+  mkdir -p "$hd"
+  call -- 'echo hi'
+  want 0 'an empty hold directory'; reached 'an empty hold directory'
+  call -- --hold up aa 'sitting 3'
+  want 0 'hold up aa'; has 'the hold for aa is up' 'hold up aa'; untouched 'hold up aa'
+  [ "$(cat "$hd/aa" 2> /dev/null)" = 'sitting 3' ] || fail "hold up aa: the file holds '$(cat "$hd/aa" 2> /dev/null)', not the reason"
+  TZ=UTC touch -t 202610110530.00 "$hd/aa"
+  # another owner's call ends 75 before any rsync or ssh, naming the owner, since when, the reason and how to pass
+  call -- 'echo hi'
+  want 75 'a hold'; untouched 'a hold'
+  has 'the box is on hold for aa since 2026-10-11T05:30:00Z (' 'a hold names owner and time'
+  has '): sitting 3 — rc 75, contention, not a failure' 'a hold says contention and its reason'
+  has 'BLOOMERY_HOLD_OWNER=aa' 'a hold says how its owner passes'; has 'BLOOMERY_BOX_READONLY=1' 'a hold says how a read passes'
+  has 'just box-hold down aa' 'a hold says how it ends'
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 75 'a queued call'; untouched 'a queued call'
+  call BLOOMERY_HOLD_OWNER=aa -- 'echo hi'
+  want 0 'the owner'; reached 'the owner'
+  call BLOOMERY_HOLD_OWNER=bb -- 'echo hi'
+  want 75 'another owner'; untouched 'another owner'; has 'on hold for aa' 'another owner'
+  call BLOOMERY_BOX_READONLY=1 -- 'echo hi'
+  want 0 'a read'; reached 'a read'
+  # two holds: the caller's own is passed, the other is named
+  call -- --hold up cc
+  want 0 'hold up cc'
+  call BLOOMERY_HOLD_OWNER=aa -- 'echo hi'
+  want 75 'two holds'; untouched 'two holds'; has 'on hold for cc' 'two holds'; hasnt 'on hold for aa' 'two holds'; has ' ago) — rc 75' 'a hold with no reason'
+  call -- --hold down cc
+  want 0 'hold down cc'
+  # up again leaves the hold as it is; a reason of several lines or with control characters is one clean line
+  call -- --hold up aa 'asked again'
+  want 0 'hold up again'; has 'already up since 2026-10-11T05:30:00Z' 'hold up again'; has 'reason: sitting 3' 'hold up again'
+  [ "$(cat "$hd/aa")" = 'sitting 3' ] || fail "hold up again: the file holds '$(cat "$hd/aa")'"
+  call -- --hold down aa
+  call -- --hold up aa $'x\ny\001z'
+  [ "$(cat "$hd/aa")" = 'x yz' ] || fail "hold up with a messy reason: the file holds '$(cat "$hd/aa")', want one line 'x yz'"
+  # down, and down of a hold that is not there
+  call -- --hold down aa
+  want 0 'hold down aa'; has 'the hold for aa is down' 'hold down aa'
+  [ ! -e "$hd/aa" ] || fail 'hold down aa: the file is still there'
+  call -- --hold down aa
+  want 0 'hold down of nothing'; has 'no hold for aa' 'hold down of nothing'; has 'nothing to take down' 'hold down of nothing'
+  call -- 'echo hi'
+  want 0 'no hold again'; reached 'no hold again'
+  # an owner that is no name: refused, nothing made
+  for t in 'a b' 'a/b' '../x' 'a.b' ''; do
+    call -- --hold up "$t"
+    want 64 "hold up '$t'"; has 'letters, digits and _' "hold up '$t'"
+    call -- --hold down "$t"
+    want 64 "hold down '$t'"
+  done
+  [ -z "$(ls -A "$hd")" ] || fail "a refused hold up made $(ls -A "$hd")"
+  call BLOOMERY_HOLD_OWNER='a b' -- 'echo hi'
+  want 64 'a malformed BLOOMERY_HOLD_OWNER'; untouched 'a malformed BLOOMERY_HOLD_OWNER'; has 'letters, digits' 'a malformed BLOOMERY_HOLD_OWNER'
+  # a file or directory of the hold directory that is no hold: 64 naming it; a dotfile is not looked at
+  : > "$hd/stray.txt"
+  call -- 'echo hi'
+  want 64 'a stray file'; untouched 'a stray file'; has "$hd/stray.txt" 'a stray file'; has 'no owner' 'a stray file'
+  rm "$hd/stray.txt"
+  mkdir "$hd/dd"
+  call -- 'echo hi'
+  want 64 'a directory'; untouched 'a directory'; has 'no regular file' 'a directory'
+  rmdir "$hd/dd"
+  : > "$hd/.DS_Store"
+  call -- 'echo hi'
+  want 0 'a dotfile'; reached 'a dotfile'
+  rm "$hd/.DS_Store"
+  # a caller that loops on its command: the call after the hold goes up is the first one refused, and nothing runs after it
+  : > "$d/ssh.log"
+  (
+    n=0
+    lrc=0
+    while [ "$n" -lt 15 ]; do
+      env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' bash "$box" 'echo hi' > /dev/null 2>&1 || { lrc=$?; break; }
+      n=$((n + 1))
+      sleep 0.2
+    done
+    echo "$lrc $n" > "$d/loop"
+  ) &
+  lpid=$!
+  i=0
+  until grep -q 'echo hi' "$d/ssh.log"; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || break
+    sleep 0.1
+  done
+  printf '%s\n' 'loop' > "$hd/aa"
+  wait "$lpid" || true
+  read -r lrc n < "$d/loop" || { lrc=?; n=?; }
+  [ "$lrc" = 75 ] || fail "a looping caller ended $lrc after $n runs, not 75 at its next call"
+  [ "$n" = "$(grep -c 'echo hi' "$d/ssh.log")" ] || fail "a looping caller ran $n times and ssh got the command $(grep -c 'echo hi' "$d/ssh.log") times"
+  rm -rf "$d"
+  if [ "$fails" != 0 ]; then
+    echo "box.sh: self-test $fails failed" >&2
+    return 1
+  fi
+  echo "box.sh: self-test ok"
+}
+
+case ${1:-} in
+  --hold) shift; rc=0; hold_cmd "$@" || rc=$?; exit "$rc" ;;
+  --self-test) shift; rc=0; self_test "$@" || rc=$?; exit "$rc" ;;
+esac
 HOST=${BLOOMERY_BOX:-ws}
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$(cd "$(dirname "$0")/.." && pwd)")"}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -267,6 +513,12 @@ if [ "$QUEUE" = 1 ]; then
     fi
     QLANE=$BLOOMERY_Q_CARD
   fi
+fi
+# The hold on this side (the header): a read passes it, and a refused call has synced, queued and sent nothing.
+if [ "$READONLY" = 0 ]; then
+  hold_rc=0
+  hold_check "$HOLD_OWNER" || hold_rc=$?
+  [ "$hold_rc" = 0 ] || exit "$hold_rc"
 fi
 if [ "$LOCAL" = 1 ]; then
   :
