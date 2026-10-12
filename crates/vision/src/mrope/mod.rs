@@ -7,15 +7,23 @@
 //! mtmd's `mtmd_image_tokens_get_decoder_pos` and `mtmd_image_tokens_get_n_pos` for a `MROPE`
 //! projector.
 //!
-//! The rotation of a row takes each pair of the rotated head from one axis' position. ggml's
+//! MiniCPM-V 4.7 positions an image differently ([`Canvas`]): one group of the overview, the
+//! slices and the separators between them, laid on a shared 2D canvas whose origin is the `<image>`
+//! token before the group (`MropeSeq::push_canvas`).
+//!
+//! A row's position is four slots `[t, h, w, z]` ([`MropeSeq::slots`]; a text row is `[p, p, p, 0]`).
+//! The rotation of a row takes each pair of the rotated head from one section's slot. ggml's
 //! `ggml_mrope_cache_init` in its interleaved mode (the one `qwen3vl`, `qwen35moe` and `qwen4exp`
 //! run) gives pair `s`, with `sector = s mod Σ sections`:
 //!
-//! * `sector mod 3 = 1` and `sector < 3·sections[1]`: the `h` position;
-//! * `sector mod 3 = 2` and `sector < 3·sections[2]`: the `w` position;
-//! * `sector mod 3 = 0` and `sector < 3·sections[0]`: the `t` position;
-//! * any other sector: the extra position, which is 0 on every row (a text row is
-//!   `[p, p, p, 0]` and an image row's fourth component is unused).
+//! * `sector mod 3 = 1` and `sector < 3·sections[1]`: section 1;
+//! * `sector mod 3 = 2` and `sector < 3·sections[2]`: section 2;
+//! * `sector mod 3 = 0` and `sector < 3·sections[0]`: section 0;
+//! * any other sector: section 3.
+//!
+//! Which slot a section reads is the text file's `rope.section_order` ([`SectionOrder`]): in
+//! `tyxz`, section `i` reads slot `i` (section 0 is the time, section 3 the extra slot, which is 0
+//! on every row but a canvas group's); in `zyxt` section 0 reads `z` and section 3 reads `t`.
 //!
 //! The sections are data (the text file's `rope.dimension_sections`); nothing here fixes them.
 //! [`MropeSeq::rows_into`] reads a rope table of plain positions (`row q` is the table at
@@ -39,6 +47,12 @@ pub enum MropeError {
     /// A cut that lands strictly inside an image: its rows are one unit.
     #[error("cut at row {row}: inside the image at rows {at}..{end}")]
     CutInsideSpan { row: usize, at: usize, end: usize },
+    /// A `rope.section_order` this crate does not run.
+    #[error("rope.section_order is \"{value}\"; this crate runs \"tyxz\" and \"zyxt\"")]
+    SectionOrder { value: String },
+    /// An image group (canvas) whose tiles or origin cannot be placed.
+    #[error("canvas group: {detail}")]
+    Canvas { detail: &'static str },
     /// Rope sections that cannot select a pair, or a table or output of the wrong length.
     #[error("rows_into: {0}")]
     Shape(String),
@@ -50,9 +64,13 @@ pub enum MropeError {
     PastSequence { at: usize, end: usize, ctx: usize },
 }
 
+mod canvas;
+mod order;
 mod rows;
 mod seq;
 
+pub use canvas::{Canvas, Tile};
+pub use order::{SLOTS, SectionOrder};
 pub use rows::{RowRewrite, SeqRows};
 pub use seq::MropeSeq;
 

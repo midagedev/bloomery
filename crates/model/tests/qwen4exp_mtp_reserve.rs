@@ -26,7 +26,7 @@ use model::arch::models::{
     Act, Arch, Borrows, ChatSpec, Ffn, Gqa, HcKind, HcSpec, LayerSpec, Mixer, ModelSpec, Moe,
     MtpDraft, MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode, Router, Score, Shared,
 };
-use model::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
+use model::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, SectionOrder, Variant};
 use model::arch::qwen35moe::mtp::BorrowedHead;
 use model::arch::qwen35moe::place::{
     Experts, FileTensor, KvLayout, MtpInputs, PlaceError, PlanInputs, mtp_head_act_bytes,
@@ -58,6 +58,7 @@ fn hparams() -> Hparams {
         head_dim: 256,
         rope_dims: 64,
         rope_sections: [11, 11, 10, 0],
+        rope_order: SectionOrder::Tyxz,
         rope_base: 1e7,
         rms_eps: 1e-6,
         n_vocab: 248_320,

@@ -1,5 +1,7 @@
 //! [`SeqRows`]: the rotation table of one sequence and the rows a change of its images rewrites.
 
+use super::canvas::Canvas;
+use super::order::SectionOrder;
 use super::{MropeError, MropeSeq};
 
 /// The rows of a sequence's rotation table that a change of its images rewrites: rows
@@ -24,6 +26,7 @@ pub struct SeqRows {
     base: std::sync::Arc<[f32]>,
     rot: usize,
     sections: [u32; 4],
+    order: SectionOrder,
     ctx: usize,
     seq: MropeSeq,
 }
@@ -31,10 +34,22 @@ pub struct SeqRows {
 impl SeqRows {
     /// A sequence of `ctx` rows over the plain table `base` (`ctx` rows of `rot` values, the
     /// rope table of positions `0..ctx`); `sections` are the text file's
-    /// `rope.dimension_sections`. A shape [`MropeSeq::rows_into`] would refuse is refused here.
+    /// `rope.dimension_sections`. The sections read the slots in [`SectionOrder::Tyxz`], the order
+    /// of every model but MiniCPM-V 4.7 ([`SeqRows::with_order`]). A shape
+    /// [`MropeSeq::rows_into`] would refuse is refused here.
     pub fn new(
         base: std::sync::Arc<[f32]>,
         sections: [u32; 4],
+        ctx: usize,
+    ) -> Result<SeqRows, MropeError> {
+        SeqRows::with_order(base, sections, SectionOrder::Tyxz, ctx)
+    }
+
+    /// [`SeqRows::new`] for a text file whose `rope.section_order` is `order`.
+    pub fn with_order(
+        base: std::sync::Arc<[f32]>,
+        sections: [u32; 4],
+        order: SectionOrder,
         ctx: usize,
     ) -> Result<SeqRows, MropeError> {
         if ctx == 0 || base.is_empty() || !base.len().is_multiple_of(ctx) {
@@ -44,11 +59,12 @@ impl SeqRows {
             )));
         }
         let rot = base.len() / ctx;
-        MropeSeq::new().rows_into(&base, rot, sections, 0..0, &mut [])?;
+        MropeSeq::new().rows_into(&base, rot, sections, order, 0..0, &mut [])?;
         Ok(SeqRows {
             base,
             rot,
             sections,
+            order,
             ctx,
             seq: MropeSeq::new(),
         })
@@ -91,7 +107,24 @@ impl SeqRows {
         let mut next = self.seq.clone();
         for &(at, nx, ny) in spans {
             next.push(at, nx, ny)?;
-            self.fit(at, nx, ny)?;
+            self.fit(at, nx * ny)?;
+        }
+        self.install(next, from)
+    }
+
+    /// Add image groups, each `(first row, canvas)` in ascending order after the ones held, as
+    /// [`SeqRows::push_spans`] does for raster images.
+    pub fn push_canvases(
+        &mut self,
+        groups: &[(usize, Canvas)],
+    ) -> Result<Option<RowRewrite>, MropeError> {
+        let Some(&(from, _)) = groups.first() else {
+            return Ok(None);
+        };
+        let mut next = self.seq.clone();
+        for &(at, canvas) in groups {
+            next.push_canvas(at, canvas)?;
+            self.fit(at, canvas.rows())?;
         }
         self.install(next, from)
     }
@@ -113,28 +146,17 @@ impl SeqRows {
     /// the first image that differs from the held ones change; the same images change nothing.
     pub fn restore(&mut self, seq: MropeSeq) -> Result<Option<RowRewrite>, MropeError> {
         for (at, nx, ny) in seq.spans() {
-            self.fit(at, nx, ny)?;
+            self.fit(at, nx * ny)?;
         }
-        let from = {
-            let (mut old, mut new) = (self.seq.spans(), seq.spans());
-            loop {
-                match (old.next(), new.next()) {
-                    (None, None) => return Ok(None),
-                    (Some(a), Some(b)) if a == b => {}
-                    (a, b) => {
-                        break a
-                            .map_or(usize::MAX, |s| s.0)
-                            .min(b.map_or(usize::MAX, |s| s.0));
-                    }
-                }
-            }
-        };
-        self.install(seq, from)
+        match self.seq.first_difference(&seq) {
+            None => Ok(None),
+            Some(from) => self.install(seq, from),
+        }
     }
 
-    /// Refuse an image whose rows `at..at + nx·ny` reach past the sequence's rows.
-    fn fit(&self, at: usize, nx: usize, ny: usize) -> Result<(), MropeError> {
-        let end = at + nx * ny;
+    /// Refuse an image whose `rows` rows from `at` reach past the sequence's rows.
+    fn fit(&self, at: usize, rows: usize) -> Result<(), MropeError> {
+        let end = at + rows;
         if end > self.ctx {
             return Err(MropeError::PastSequence {
                 at,
@@ -161,6 +183,7 @@ impl SeqRows {
             &self.base,
             self.rot,
             self.sections,
+            self.order,
             from..self.ctx,
             &mut values,
         )?;
@@ -172,6 +195,7 @@ impl SeqRows {
 mod tests {
     use super::{MropeError, MropeSeq, RowRewrite, SeqRows};
     use crate::mrope::fixture::{ROT, SECTIONS, table};
+    use crate::mrope::{Canvas, SectionOrder};
     use std::sync::Arc;
 
     const CTX: usize = 300;
@@ -179,7 +203,7 @@ mod tests {
     /// The rows of `seq` over the whole sequence, rebuilt from scratch.
     fn full(base: &[f32], seq: &MropeSeq) -> Vec<f32> {
         let mut out = vec![0.0; CTX * ROT];
-        seq.rows_into(base, ROT, SECTIONS, 0..CTX, &mut out)
+        seq.rows_into(base, ROT, SECTIONS, SectionOrder::Tyxz, 0..CTX, &mut out)
             .expect("the full rebuild");
         out
     }
@@ -337,5 +361,59 @@ mod tests {
             SeqRows::new(base, SECTIONS, 0),
             Err(MropeError::Shape(_))
         ));
+    }
+
+    /// A canvas group pushed, cut and restored rewrites from its first row and leaves the table a
+    /// rebuild from scratch makes, under `zyxt` as under `tyxz`; two groups of the same row count
+    /// but another layout are different images to a restore.
+    #[test]
+    fn a_canvas_group_rewrites_like_an_image() {
+        let base: Arc<[f32]> = table(CTX, ROT).into();
+        for order in [SectionOrder::Tyxz, SectionOrder::Zyxt] {
+            let mut rows = SeqRows::with_order(base.clone(), SECTIONS, order, CTX).expect("rows");
+            let mut copy = base.to_vec();
+            let full = |seq: &MropeSeq| {
+                let mut out = vec![0.0; CTX * ROT];
+                seq.rows_into(&base, ROT, SECTIONS, order, 0..CTX, &mut out)
+                    .expect("rebuild");
+                out
+            };
+            let group = Canvas::new((3, 2), (2, 1), (2, 2)).expect("canvas");
+            let rw = rows.push_canvases(&[(5, group)]).expect("push");
+            assert_eq!(rw.as_ref().map(|r| r.from), Some(5));
+            apply(&mut copy, &rw);
+            assert!(copy == full(rows.seq()), "{order:?}: pushed");
+            let held = rows.seq().clone();
+            // The group is (6 + 2) + (4 + 2) + (4 + 1) = 19 rows, rows 5..24.
+            assert_eq!(rows.seq().spans().collect::<Vec<_>>(), [(5, 19, 1)]);
+            assert!(matches!(
+                rows.push_canvases(&[(23, group)]),
+                Err(MropeError::Overlap { .. })
+            ));
+            assert!(matches!(
+                rows.push_canvases(&[(290, group)]),
+                Err(MropeError::PastSequence { .. })
+            ));
+            assert!(matches!(
+                rows.cut(10),
+                Err(MropeError::CutInsideSpan { .. })
+            ));
+            // Another layout with the same 19 rows is another image to a restore.
+            let other = Canvas::new((3, 2), (2, 1), (1, 4)).expect("canvas");
+            assert_eq!(other.rows(), group.rows());
+            let mut seq = MropeSeq::new();
+            seq.push_canvas(5, other).expect("other");
+            let rw = rows.restore(seq).expect("restore");
+            assert_eq!(rw.as_ref().map(|r| r.from), Some(5));
+            apply(&mut copy, &rw);
+            assert!(copy == full(rows.seq()), "{order:?}: restored");
+            assert_eq!(rows.restore(rows.seq().clone()), Ok(None));
+            let rw = rows.cut(5).expect("cut at the group");
+            apply(&mut copy, &rw);
+            assert!(copy == *base, "{order:?}: no image, the plain table");
+            let rw = rows.restore(held).expect("restore the first");
+            apply(&mut copy, &rw);
+            assert!(copy == full(rows.seq()), "{order:?}: restored again");
+        }
     }
 }

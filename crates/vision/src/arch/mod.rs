@@ -14,6 +14,7 @@ pub mod card;
 pub mod deepseek41v;
 pub mod glm5v;
 pub(crate) mod header;
+pub mod minicpmv;
 pub(crate) mod naming;
 pub mod narrow;
 pub mod qwen3vl;
@@ -41,6 +42,11 @@ pub type Opened = (CardBytes, Arc<dyn MediaModel + Send + Sync>);
 /// them from the projector: [`TokenLimits::DEFAULT`] for `qwen3vl_merger`, the file's own budget
 /// ([`glm5v::Hparams::default_limits`]) for `glm5v`.
 ///
+/// A `minicpmv4_7` file is read (its header refused by name when it is not the one this crate
+/// runs) and then refused: its group's ids come from the text model's tokenizer, which the
+/// encoder file does not carry, so the seat builds [`minicpmv::Media`] from [`minicpmv::Hparams`]
+/// and the tokenizer's marks itself.
+///
 /// The text model's width is the seat's to check (`qwen3vl::Hparams::check_text_width`), and the
 /// tensors are checked where the tower loads them.
 pub fn open(file: &Gguf, limits: TokenLimits) -> Result<Opened, VisionError> {
@@ -66,6 +72,18 @@ pub fn open(file: &Gguf, limits: TokenLimits) -> Result<Opened, VisionError> {
             let media = qwen3vl::Media::new(hp.size_rule(limits)?);
             Ok((qwen3vl::card::of(&hp, limits), Arc::new(media)))
         }
+        Projector::Minicpmv47 => {
+            minicpmv::Hparams::read(file)?;
+            Err(refusal(
+                KEY_PROJECTOR,
+                format!(
+                    "is \"{}\"; its image ids come from the text model's tokenizer, which the \
+                     encoder file does not carry: read it with minicpmv::Hparams::read and build \
+                     minicpmv::Media::new",
+                    minicpmv::PROJECTOR_TYPE
+                ),
+            ))
+        }
     }
 }
 
@@ -75,6 +93,7 @@ enum Projector {
     Deepseek41v,
     Glm5v,
     Qwen3vl,
+    Minicpmv47,
 }
 
 /// The file's `clip.projector_type`, refused by name when it is a tower this crate does not run.
@@ -84,12 +103,14 @@ fn projector(m: &impl Meta) -> Result<Projector, VisionError> {
         Some(deepseek41v::PROJECTOR_TYPE) => Ok(Projector::Deepseek41v),
         Some(glm5v::PROJECTOR_TYPE) => Ok(Projector::Glm5v),
         Some(qwen3vl::PROJECTOR_TYPE) => Ok(Projector::Qwen3vl),
+        Some(minicpmv::PROJECTOR_TYPE) => Ok(Projector::Minicpmv47),
         Some(other) => Err(refusal(
             KEY_PROJECTOR,
             format!(
-                "is \"{other}\"; this crate reads \"{}\", \"{}\" and \"{}\"",
+                "is \"{other}\"; this crate reads \"{}\", \"{}\", \"{}\" and \"{}\"",
                 deepseek41v::PROJECTOR_TYPE,
                 glm5v::PROJECTOR_TYPE,
+                minicpmv::PROJECTOR_TYPE,
                 qwen3vl::PROJECTOR_TYPE
             ),
         )),
@@ -113,7 +134,7 @@ mod tests {
     }
 
     /// The projector type picks the module; a stranger is refused by its name, which lists the
-    /// three this crate reads.
+    /// four this crate reads.
     #[test]
     fn the_projector_type_picks_the_tower() {
         assert_eq!(
@@ -126,9 +147,13 @@ mod tests {
         );
         assert_eq!(projector(&table("glm5v")).unwrap(), Projector::Glm5v);
         assert_eq!(
+            projector(&table("minicpmv4_7")).unwrap(),
+            Projector::Minicpmv47
+        );
+        assert_eq!(
             projector(&table("qwen2vl_merger")).unwrap_err().to_string(),
             "metadata clip.projector_type: is \"qwen2vl_merger\"; this crate reads \
-             \"deepseek41v\", \"glm5v\" and \"qwen3vl_merger\""
+             \"deepseek41v\", \"glm5v\", \"minicpmv4_7\" and \"qwen3vl_merger\""
         );
         assert_eq!(
             projector(&clef().with("clip.projector_type", Value::U32(7)))
@@ -201,6 +226,22 @@ mod tests {
         assert!((16..=100).contains(&span(100)), "{}", span(100));
     }
 
+    /// A MiniCPM-V 4.7 file is refused by name once its header reads, and by its own key when it
+    /// does not.
+    #[test]
+    fn a_minicpm_file_is_read_then_refused_for_its_ids() {
+        use crate::arch::minicpmv::hparams::tests::minicpm;
+        let refused = |t: &Table| open_table(t, "clip").err().expect("refused").to_string();
+        assert!(refused(&minicpm()).starts_with(
+            "metadata clip.projector_type: is \"minicpmv4_7\"; its image ids come from the text \
+             model's tokenizer"
+        ));
+        assert_eq!(
+            refused(&minicpm().with("clip.vision.block_count", Value::U32(24))),
+            "metadata clip.vision.block_count: is 24; minicpmv4_7 runs 27 (the mmproj header)"
+        );
+    }
+
     /// V4.1's file opens to its own figure and its own join rule; a stranger's and a file of another
     /// architecture are refused by name, and a limit that does not fit GLM's pixel count with it.
     #[test]
@@ -214,7 +255,7 @@ mod tests {
         assert_eq!(
             refused(&table("qwen2vl_merger"), "clip"),
             "metadata clip.projector_type: is \"qwen2vl_merger\"; this crate reads \
-             \"deepseek41v\", \"glm5v\" and \"qwen3vl_merger\""
+             \"deepseek41v\", \"glm5v\", \"minicpmv4_7\" and \"qwen3vl_merger\""
         );
         assert!(refused(&table("qwen3vl_merger"), "llama").starts_with("metadata architecture:"));
         let huge = TokenLimits::new(16, 3_000_000).expect("limits");
