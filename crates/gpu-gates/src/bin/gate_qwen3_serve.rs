@@ -411,8 +411,10 @@
 //!   the prompts `c1` and `c2` equal set F's CUDA ids over the prefix on which the set's CPU twin
 //!   (a second reading of mainline) gives the same ids, at least [`F_MIN_PREFIX`] long and
 //!   printed; at the first difference the oracle's id must be the server's own runner-up within
-//!   [`F_NEAR_TIE`] of its top ([`follows`]). FAIL-first: an image's grid taken as `(ny, nx)`,
-//!   which `c2`'s two images of other proportions show; the clause's precondition,
+//!   [`F_NEAR_TIE`] of its top ([`follows`]). FAIL-first: the span's rows zeroed in the seat's
+//!   `prefill_media`. The grid's order is not this clause's pin (a grid taken as `(ny, nx)` stays
+//!   inside the near-tie band): the vision crate's `a_spans_grid_runs_along_the_images_width`
+//!   holds it. The clause's precondition,
 //!   `mmproj_set_f_server_keeps_every_expert_on_the_card`, reads that server's load by record kind
 //!   (its `load` record, then its `plan` record or, with none, a whole-fit verdict that says
 //!   `fits`) and refuses by name a plan that keeps a routed expert on the host (a server at the
@@ -3306,10 +3308,16 @@ mod gate {
 
     /// The widest gap between the server's top two logprobs at which an id that parts from the
     /// oracle's counts as a near tie, in nats.
-    // PIN(2026-10-11): the Qwen3.6 image seat's own band, under the V4.1 `GREEDY_MARGIN` of 1.5, which
-    // let a grid taken as `(ny, nx)` pass: the clean `c2` run's first difference has a gap of 0.032
-    // (step 26), that defect's 0.36 (step 19).
-    const F_NEAR_TIE: f64 = 0.1;
+    // PIN(2026-10-12): the near-tie floor of the reference gates (`MARGIN_FLOOR` of `gate_e2e`), from
+    // this set's spread: two configurations of this server (the 3090 with every expert on the card,
+    // the A6000, a placed plan) differ in the gap between the top two logprobs by 0.15-0.23 nats rms
+    // where that gap is under 1 (8-9 steps a pair, `c1` and `c2`). The server-to-oracle spread is at
+    // least that. At that spread a harmless first difference has a gap above 0.1 in 38-55 % of runs
+    // and above 0.5 in 0.03-1.3 % [derived: the gap uniform on (0, |d|), d ~ N(0, spread^2), one
+    // flip a run]. Not the grid's pin: a grid taken as `(ny, nx)` read 0.23-0.41 here (0.4134 on the
+    // 3090, 0.2288 placed), inside this band; the vision crate's
+    // `a_spans_grid_runs_along_the_images_width` holds that order.
+    const F_NEAR_TIE: f64 = 0.5;
 
     /// The fewest ids a prompt's CUDA and CPU oracle runs must agree on for set F to hold the
     /// server to them: a shorter prefix says too little of the image to be a clause.
