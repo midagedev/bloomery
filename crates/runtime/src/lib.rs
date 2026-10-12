@@ -26,6 +26,7 @@
 //! that pin it must agree on.
 
 pub mod combine;
+pub mod dspark;
 pub mod hc_gated;
 pub mod layer;
 mod lookup;
@@ -48,7 +49,8 @@ pub mod xsplit;
 pub use lookup::Lookup;
 pub use speculative::{
     Argmax, Draft, Exhausted, Forced, NotAnId, NotBuilt, Pick, Picked, Picking, Program, RowLogits,
-    Sample, Speculative, TapNeed, Tapped, Width, Widths, Window, accepted_rows, ids_from, program,
+    Sample, Speculative, TapNeed, Tapped, TappedPrompt, Width, Widths, Window, accepted_rows,
+    ids_from, program,
 };
 pub use stop::{NoTokens, Stop, StopReason};
 pub use width::{Choosing, Chosen, Rule, Tally, WidthError};

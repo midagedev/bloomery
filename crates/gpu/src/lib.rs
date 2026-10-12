@@ -35,6 +35,7 @@ pub mod card_leg;
 pub mod card_slots;
 pub mod checkpoint;
 pub mod cores;
+pub mod dspark;
 pub mod elem;
 pub mod fault;
 pub mod flash;

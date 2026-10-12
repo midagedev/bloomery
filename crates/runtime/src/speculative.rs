@@ -36,6 +36,25 @@ pub trait Tapped: Verify {
     fn taps(&mut self, rows: usize) -> Result<&[f32], Self::Error>;
 }
 
+/// A target whose prompt calls hand a block draft its tapped rows.
+pub trait TappedPrompt: Tapped {
+    /// Tap the rows entering these layers from the next call on;
+    /// [`Tapped::tap_width`] becomes `layers.len()` times the hidden width.
+    /// Refused by name past the target's layer count.
+    fn set_taps(&mut self, layers: &[usize]) -> Result<(), Self::Error>;
+
+    /// [`Target::prompt`] with the tapped rows of the call's last `window`
+    /// positions handed to `sink` (the first position they hold, then one
+    /// row a position) as each batch or step finishes. The argmax after the
+    /// last id.
+    fn prompt_tapped(
+        &mut self,
+        ids: &[u32],
+        window: usize,
+        sink: &mut dyn FnMut(u32, &[f32]) -> Result<(), Self::Error>,
+    ) -> Result<u32, Self::Error>;
+}
+
 /// A source of proposals for a target `T`.
 pub trait Draft<T: Verify> {
     /// The most ids a proposal holds; a verify of `n` of them runs `n + 1`
