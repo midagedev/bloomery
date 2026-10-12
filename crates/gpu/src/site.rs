@@ -366,10 +366,21 @@ pub struct WideIn<'a> {
     pub f32: Option<&'a DeviceBuffer<f32>>,
 }
 
-/// The kernels a wide site launches.
+/// The kernels a wide site launches: the grouped GEMM over q8_1 blocks of
+/// 128 always, the 32-value kernels when the load holds them — a load whose
+/// sites are all K-quants holds none, and a Q8_0 or F32 site, or a SwiGLU into
+/// q8 blocks of 32, is refused by name there.
 pub struct WideKernels<'a> {
     pub gemm: &'a GemmKernels,
-    pub g32: &'a Gemm32Kernels,
+    pub g32: Option<&'a Gemm32Kernels>,
+}
+
+impl WideKernels<'_> {
+    /// The 32-value kernels, or a named refusal naming `missing`, what the
+    /// site needs them for.
+    fn g32(&self, what: &'static str, missing: &'static str) -> Result<&Gemm32Kernels, GpuError> {
+        self.g32.ok_or(GpuError::state(what, missing))
+    }
 }
 
 /// `y = W · x` for site `name` of type `ty`, `rows` rows an expert, over the
@@ -431,7 +442,11 @@ pub fn gemm(
         SiteTy::Q8_0 => {
             dense()?;
             let (qs, d) = w.q8_planes(WHAT, name)?;
-            k.g32.enqueue_gemm32(
+            k.g32(
+                WHAT,
+                "the 32-value kernels a Q8_0 site runs on (this load holds none)",
+            )?
+            .enqueue_gemm32(
                 stream,
                 Gemm32Args {
                     w: Gemm32Weight::Q8_0Plane { qs, d },
@@ -446,8 +461,11 @@ pub fn gemm(
         SiteTy::F32 => {
             dense()?;
             let rows = x.f32.ok_or_else(|| missing("f32 rows"))?;
-            k.g32
-                .enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, rows, m, y)
+            k.g32(
+                WHAT,
+                "the 32-value kernels an F32 site runs on (this load holds none)",
+            )?
+            .enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, rows, m, y)
         }
     }
 }
@@ -612,15 +630,22 @@ fn swiglu(
                 .q32
                 .as_deref_mut()
                 .ok_or_else(|| lacks("q8 blocks of 32"))?;
-            k.g32.enqueue_swiglu_quant32(stream, g, u, cols, a, fault)
+            k.g32(
+                WHAT,
+                "the 32-value kernels a SwiGLU into q8 blocks of 32 runs on (this load holds none)",
+            )?
+            .enqueue_swiglu_quant32(stream, g, u, cols, a, fault)
         }
         SwigluLaunch::Q32Rule => {
             let a = rows
                 .q32
                 .as_deref_mut()
                 .ok_or_else(|| lacks("q8 blocks of 32"))?;
-            k.g32
-                .enqueue_swiglu_act_quant32(stream, g, u, blk.rule, cols, a, fault)
+            k.g32(
+                WHAT,
+                "the 32-value kernels a SwiGLU into q8 blocks of 32 runs on (this load holds none)",
+            )?
+            .enqueue_swiglu_act_quant32(stream, g, u, blk.rule, cols, a, fault)
         }
         SwigluLaunch::F32 => {
             let y = rows.f32.as_deref_mut().ok_or_else(|| lacks("f32 rows"))?;
