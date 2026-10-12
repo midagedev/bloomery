@@ -9,6 +9,7 @@ pub use draft::CardDraft;
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu_deepseek41::body::{
     self, Body, BodyMeta, FeatureRows, FeatureSink, OpenCfg, PrefillMode, TierOpen,
 };
@@ -17,7 +18,7 @@ use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, Plan};
 use runtime::{Tapped, Target};
 
-use crate::{Keep, Open, Prompt, Session, SessionError, call};
+use crate::{Keep, Open, Prompt, Session, SessionError};
 
 const WHAT: &str = "deepseek41 session";
 
@@ -105,7 +106,7 @@ impl Open for Body {
 
 impl Prompt for Body {
     /// Under the body's `BLOOMERY_PREFILL`: the prompt call's batches
-    /// ([`body::prefill`], one residency pass: [`call`]), or one step per id
+    /// ([`body::prefill`], one residency pass: [`prompt_pass`]), or one step per id
     /// with one readback after the last, the host tier's route trace told the
     /// call's positions first. A batched call while a route trace is attached
     /// is refused by name.
@@ -117,7 +118,7 @@ impl Prompt for Body {
                          records the step feed (BLOOMERY_PREFILL=steps)"
                     .to_string(),
             }),
-            PrefillMode::Batch => call(m, |m| body::prefill(m, ids)),
+            PrefillMode::Batch => prompt_pass(m, |m| body::prefill(m, ids)),
             PrefillMode::Steps => {
                 let pos = m.pos();
                 m.body_parts(WHAT)?
@@ -172,7 +173,7 @@ impl Session<Body> {
         match self.model().body(WHAT)?.prefill_mode() {
             PrefillMode::Batch => {
                 let rows = FeatureRows { window, sink };
-                Ok(call(self.model_mut(), |m| {
+                Ok(prompt_pass(self.model_mut(), |m| {
                     body::prefill_with(m, ids, Some(rows))
                 })?)
             }

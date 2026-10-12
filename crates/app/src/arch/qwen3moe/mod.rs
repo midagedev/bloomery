@@ -28,12 +28,13 @@ use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
 use bloomery_gpu::arch::qwen3moe::{
     Body, Body35, Body38, PrefillPath, Prompt38, Qwen35moeModel, Qwen38Model, TargetRows,
 };
+use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::model::StepMode;
 use runtime::seqstate::Kept;
 use runtime::{Speculative, Tapped};
 
 use crate::mtp::{MtpBody, MtpDraft};
-use crate::{Keep, Prompt, Session, SessionError, call, cut_positions, keep_positions};
+use crate::{Keep, Prompt, Session, SessionError, cut_positions, keep_positions};
 mod mtp;
 
 const WHAT: &str = "qwen4exp session";
@@ -133,7 +134,7 @@ impl Prompt for Body35 {
     /// to one step a row. The model takes the checkpoints of the call's
     /// marks only while a caller armed them
     /// ([`Body35::set_checkpoints`](bloomery_gpu::arch::qwen3moe::Body35)).
-    /// The call is one residency pass ([`call`]): a load with a machine takes
+    /// The call is one residency pass ([`prompt_pass`]): a load with a machine takes
     /// its boundary before the first unit, none inside.
     fn prompt(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<u32, GpuError> {
         let path = if ids.len() >= GEMM_FROM {
@@ -141,7 +142,7 @@ impl Prompt for Body35 {
         } else {
             PrefillPath::Pass
         };
-        call(m, |m| m.prefill_with(ids, path))
+        prompt_pass(m, |m| m.prefill_with(ids, path))
     }
 }
 
