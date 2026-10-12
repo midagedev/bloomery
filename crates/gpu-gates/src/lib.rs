@@ -39,6 +39,7 @@ pub mod nodes;
 pub mod oracle;
 pub mod prompts;
 pub mod ptx;
+pub mod q36_fixture;
 pub mod q38_fixture;
 pub mod qwen3moe;
 pub mod record;
