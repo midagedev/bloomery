@@ -1661,9 +1661,11 @@ pub static CLEF_ROWS: Kind = Kind {
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled; and the wall the fill reader's jobs ran, the prompt batches' and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled; and the wall the fill reader's jobs ran, the prompt batches' and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
     parts: &[
         key("budget", U64, "B"),
+        key("arena_planned", U64, "B"),
+        key("arena_granted", U64, "B"),
         key("paged", U64, "B"),
         key("misses", U64, ""),
         key("fills", U64, ""),
@@ -3424,8 +3426,9 @@ pub fn lane(card: &str, rate: &bloomery_gpu::lane::LaneRate) -> Record {
         .w("pinned", rate.pinned)
 }
 
-/// The `nvtier` record of a load's arena: its budget, the paged bytes it
-/// serves and the counters since the load. A load that attached no tier has
+/// The `nvtier` record of a load's arena: its budget (the granted bytes), the
+/// arena the plan reserved beside it, the paged bytes it serves and the
+/// counters since the load. A load that attached no tier has
 /// no record — honest absence, never a zeroed row.
 #[cfg(feature = "gpu")]
 #[must_use]
@@ -3433,9 +3436,12 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
     let tier = tier?;
     let s = tier.stats();
     let ran = tier.reader_stats();
+    let arena = tier.arena();
     Some(
         Record::new(&NVTIER)
             .u("budget", tier.budget())
+            .u("arena_planned", arena.planned)
+            .u("arena_granted", arena.granted)
             .u("paged", tier.paged_bytes())
             .u("misses", s.misses)
             .u("fills", s.fills)
@@ -3884,6 +3890,8 @@ mod tests {
     fn nvtier_ends_with_the_union_counters() {
         let line = Record::new(&NVTIER)
             .u("budget", 100)
+            .u("arena_planned", 101)
+            .u("arena_granted", 100)
             .u("paged", 200)
             .u("misses", 3)
             .u("fills", 4)

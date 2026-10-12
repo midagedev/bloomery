@@ -90,6 +90,7 @@ use gguf::Split;
 use model::moe::{Claim, PinRelease, PinToken, Ticket, TierError, TierPin, TierSlots};
 use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
+use model::placement::workstation::ArenaGrant;
 use model::placement::{
     ARENA_ALIGN, ARENA_COLUMNS, ArenaFloor, Device, Plan, Role, arena_window_bytes,
 };
@@ -1184,7 +1185,9 @@ pub struct NvTier {
     /// `ensure`.
     books: Mutex<Books>,
     stats: Stats,
-    budget: u64,
+    /// The arena the plan reserved and the load took ([`NvTier::budget`] is
+    /// the second).
+    arena: ArenaGrant,
     /// The slots each paged layer holds.
     slots: usize,
     /// One slot of every paged layer, the carve's bytes.
@@ -1244,10 +1247,12 @@ struct Books {
 impl NvTier {
     /// The arena of `plan`'s NVMe expert tier over `split`'s shards, read
     /// `O_DIRECT` (`direct`) or through the page cache: `None` on a plan
-    /// that pages no routed expert or reserved no arena bytes
-    /// (`HostTotals::nvme_arena_bytes` 0 — the mapping path as it stands).
-    /// The slots' budget is the arena the dial reserved, the same count a
-    /// paged layer. Refused by name: a layer whose host segment's ids are
+    /// that pages no routed expert or took no arena bytes (`arena.granted`
+    /// 0 — the mapping path as it stands). The slots' budget is the arena
+    /// the load was granted (`plan.host.nvme_arena_bytes` less what the
+    /// host's reading cut, [`HostNeed::grant`](model::placement::workstation::HostNeed::grant);
+    /// a build without a placed load passes [`ArenaGrant::whole`] of the
+    /// plan's), the same count a paged layer. Refused by name: a layer whose host segment's ids are
     /// not one run, whose routed stacks are not three rows the split holds,
     /// a stack whose experts do not cut its bytes evenly, a stack in a shard
     /// that is not its file's mapping ([`gguf::Gguf::file_backed`]: a drop
@@ -1258,9 +1263,10 @@ impl NvTier {
         plan: &Plan<'_>,
         split: &Arc<Split>,
         direct: bool,
+        arena: ArenaGrant,
     ) -> Result<Option<NvTier>, GpuError> {
         const WHAT: &str = "NvTier::of_paged";
-        if plan.host.nvme_expert_bytes == 0 || plan.host.nvme_arena_bytes == 0 {
+        if plan.host.nvme_expert_bytes == 0 || arena.granted == 0 {
             return Ok(None);
         }
         let model = plan.model;
@@ -1441,8 +1447,8 @@ impl NvTier {
             });
         }
         let least = ArenaFloor::of(plan, ARENA_COLUMNS).map_err(|e| GpuError::plan(WHAT, e))?;
-        let count = slots_of(plan.host.nvme_arena_bytes, &slot_sizes, &least)
-            .map_err(|e| GpuError::shape(WHAT, e))?;
+        let count =
+            slots_of(arena.granted, &slot_sizes, &least).map_err(|e| GpuError::shape(WHAT, e))?;
         let page = page_bytes().map_err(|e| GpuError::plan(WHAT, e))?;
         let bytes = count * slot_sizes.iter().sum::<usize>();
         let map = AnonMap::new(bytes)
@@ -1489,7 +1495,7 @@ impl NvTier {
             by_layer: arenas,
             books: Mutex::new(Books::default()),
             stats: Stats::default(),
-            budget: plan.host.nvme_arena_bytes,
+            arena,
             slots: count,
             slot_set: slot_sizes.iter().sum::<usize>() as u64,
             paged: plan.host.nvme_expert_bytes,
@@ -1652,10 +1658,17 @@ impl NvTier {
         }
     }
 
-    /// The arena's budget in bytes.
+    /// The arena's budget in bytes: what the load was granted.
     #[must_use]
     pub fn budget(&self) -> u64 {
-        self.budget
+        self.arena.granted
+    }
+
+    /// The arena the plan reserved and the load took; they differ when the
+    /// host's reading cut the arena at load.
+    #[must_use]
+    pub fn arena(&self) -> ArenaGrant {
+        self.arena
     }
 
     /// One slot of every paged layer as the arena carved it: the bytes

@@ -422,7 +422,7 @@ nv() {
   [ -n "${STUB_GEN_NVTIER:-}" ] || return 0
   tf=$((tf + $1))
   [ "$STUB_GEN_NVTIER" != old ] || [ "$k" -eq $((${#arms[@]} - 1)) ] || return 0
-  echo "nvtier budget=1 paged=1 misses=$tf fills=$tf fill_bytes=$((tf * 100)) fill_ns=$((tf * 10)) evictions=$((tf / 6)) resident_bytes=1 buffered_reads=$tf buffered_bytes=$tf drops=$tf drop_bytes=$tf drop_ns=$tf union_small=$tf union_batched=$tf union_fills=$tf union_hits=$tf keep_claims=$tf transient_claims=$tf"
+  echo "nvtier budget=1 arena_planned=1 arena_granted=1 paged=1 misses=$tf fills=$tf fill_bytes=$((tf * 100)) fill_ns=$((tf * 10)) evictions=$((tf / 6)) resident_bytes=1 buffered_reads=$tf buffered_bytes=$tf drops=$tf drop_bytes=$tf drop_ns=$tf union_small=$tf union_batched=$tf union_fills=$tf union_hits=$tf keep_claims=$tf transient_claims=$tf"
 }
 for k in "${!arms[@]}"; do
   depth=$(count "${arms[$k]}")
@@ -1251,7 +1251,7 @@ L=$tmp/tier-arm.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_NVTIER=1 -- 6 12
 if [ "$RC" != 0 ]; then
   fail tier-arm "rc $RC, want 0" "$L"
-elif want tier-arm "$L" 2 '^nvtier budget=1 paged=1 ' &&
+elif want tier-arm "$L" 2 '^nvtier budget=1 arena_planned=1 arena_granted=1 paged=1 ' &&
   want tier-arm "$L" 1 '^    tier-arm r1 ours d=6: fills=6 fill_ns=60 evictions=1 union_fills=6$' &&
   want tier-arm "$L" 1 '^    tier-arm r1 ours d=12: fills=12 fill_ns=120 evictions=2 union_fills=12$' &&
   want tier-arm "$L" 2 '^    tier-arm ' &&
@@ -1264,7 +1264,7 @@ stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_NVTIER=old -- 6 12
 if [ "$RC" != 0 ]; then
   fail tier-total "rc $RC, want 0" "$L"
 elif want tier-total "$L" 2 '^ROW r1 ours d=(6|12) ' &&
-  want tier-total "$L" 1 '^nvtier budget=1 paged=1 ' &&
+  want tier-total "$L" 1 '^nvtier budget=1 arena_planned=1 arena_granted=1 paged=1 ' &&
   want tier-total "$L" 1 '^    tier-arm r1 ours d=12: no per-arm record \(a process total: run with BLOOMERY_AB_LOAD=arm\)$' &&
   want tier-total "$L" 1 '^    tier-arm '; then
   pass tier-total
@@ -1274,7 +1274,7 @@ L=$tmp/tokens-check.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=2 STUB_GEN_NVTIER=1 -- 6 6@STUB_GEN_TOKEN0=7
 if [ "$RC" != 0 ]; then
   fail tokens-check "rc $RC, want 0" "$L"
-elif want tokens-check "$L" 4 '^nvtier budget=1 paged=1 ' &&
+elif want tokens-check "$L" 4 '^nvtier budget=1 arena_planned=1 arena_granted=1 paged=1 ' &&
   want tokens-check "$L" 2 '^tokens r[12]: differ lcg6 (ours=[0-9a-f]{12} ours@STUB_GEN_TOKEN0=7=[0-9a-f]{12}|ours@STUB_GEN_TOKEN0=7=[0-9a-f]{12} ours=[0-9a-f]{12})$' &&
   want tokens-check "$L" 1 '^tokens-differ rounds: 2 of 2 \(arms on one prompt, P and n whose greedy ids differ\)$'; then
   L=$tmp/tokens-equal.log
