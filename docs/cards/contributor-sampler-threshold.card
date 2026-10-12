@@ -1,0 +1,9 @@
+kind: profile
+question: Can a literal relative-probability cutoff preserve candidates and seeded tokens while saving 300 us per CPU sampling call?
+term: paired baseline minus threshold sampling time at V=151936 and 154880, four peaked or flat synthetic rows, i5-12600K CPU
+unit: us
+predict: -20000..0 us
+condition: Alternate arm order over 100 warm-up and 1000 recorded calls per cell; compare candidates and seeded tokens outside each timer; pin one permitted CPU; run after builds and fuzzing finish under the local CPU lease.
+decide-in: Record this CPU result without changing the production sampler; reject every cell with a semantic mismatch.
+decide-below: Investigate excess histogram or candidate ordering costs before making any speed claim.
+decide-above: Review semantic equality and timing scatter before proposing an engine change; 300 us is the issue's minimum saving.

@@ -14,6 +14,15 @@
 //! copy that drifts from the source stops the run. The same copy is the "before" arm of
 //! the interleaved table: its call and the real call alternate in one process, so a
 //! load that moves between runs moves both arms.
+//!
+//! The relative-weight arm uses byte-radix count/mass cutoffs and the benchmark
+//! chain's draw with the production RNG sequence. Its table checks candidates and
+//! tokens on every call;
+//! mismatches are reported and disqualify a cell regardless of its timing.
+//! `--check-only` prints semantic boundaries; `--threshold-only` measures only the new pair.
+
+#[path = "sample_bench/threshold.rs"]
+mod threshold;
 
 use sampler::{Candidate, Sampler, SamplerParams};
 use std::cmp::Ordering;
@@ -291,6 +300,17 @@ fn sweep(flush: &mut [u64]) {
 }
 
 fn main() {
+    let (check_only, threshold_only) = match std::env::args().skip(1).collect::<Vec<_>>().as_slice()
+    {
+        [] => (false, false),
+        [arg] if arg == "--check-only" => (true, false),
+        [arg] if arg == "--threshold-only" => (false, true),
+        _ => panic!("usage: sample_bench [--check-only | --threshold-only]"),
+    };
+    threshold_checks();
+    if check_only {
+        return;
+    }
     let mut flush = vec![0u64; FLUSH_WORDS];
     println!(
         "sample_bench: {} {}",
@@ -303,12 +323,17 @@ fn main() {
     );
     let mut breakdown: Vec<String> = Vec::new();
     let mut interleaved: Vec<String> = Vec::new();
+    let mut thresholds: Vec<String> = Vec::new();
     for &n in &SIZES {
         for kind in [Kind::Peaked, Kind::Flat] {
             let rows: Vec<Vec<f32>> = (0..ROWS_PER_KIND as u64)
                 .map(|s| kind.row(n, 0xB100_0000 + s))
                 .collect();
             for set in sets() {
+                if threshold_only {
+                    thresholds.push(threshold_pair(n, kind, &set, &rows));
+                    continue;
+                }
                 for cold in [false, true] {
                     let mut s = Sampler::new(set.params).expect("the bench's parameters are valid");
                     let calls = if cold { COLD_CALLS } else { WARM_CALLS };
@@ -343,32 +368,169 @@ fn main() {
                 }
                 breakdown.push(passes(n, kind, &set, &rows));
                 interleaved.push(interleave(n, kind, &set, &rows));
+                thresholds.push(threshold_pair(n, kind, &set, &rows));
             }
         }
     }
+    if !threshold_only {
+        println!(
+            "\nper-pass medians over {WARM_CALLS} warm calls, us (frozen pre-scan chain; survivors checked against Sampler::candidates)"
+        );
+        println!(
+            "{:<8} {:<7} {:<36} {}",
+            "V",
+            "row",
+            "params",
+            PASS_NAMES.map(|p| format!("{p:>8}")).join(" ")
+        );
+        for line in breakdown {
+            println!("{line}");
+        }
+        println!(
+            "\nbefore/after, calls interleaved in one process (frozen pre-scan chain vs Sampler::sample), warm rows, median us"
+        );
+        println!(
+            "{:<8} {:<7} {:<36} {:>9} {:>9} {:>7}",
+            "V", "row", "params", "before", "after", "ratio"
+        );
+        for line in interleaved {
+            println!("{line}");
+        }
+    }
+    println!("\nrelative-weight cutoff vs Sampler::sample, alternating order, warm rows, us");
     println!(
-        "\nper-pass medians over {WARM_CALLS} warm calls, us (frozen pre-scan chain; survivors checked against Sampler::candidates)"
+        "V row params real_us threshold_us paired_saved_us p90_saved_us candidate_bad token_bad status"
     );
-    println!(
-        "{:<8} {:<7} {:<36} {}",
-        "V",
-        "row",
-        "params",
-        PASS_NAMES.map(|p| format!("{p:>8}")).join(" ")
-    );
-    for line in breakdown {
+    for line in thresholds {
         println!("{line}");
     }
-    println!(
-        "\nbefore/after, calls interleaved in one process (frozen pre-scan chain vs Sampler::sample), warm rows, median us"
-    );
-    println!(
-        "{:<8} {:<7} {:<36} {:>9} {:>9} {:>7}",
-        "V", "row", "params", "before", "after", "ratio"
-    );
-    for line in interleaved {
-        println!("{line}");
+}
+
+/// Known boundaries are printed as comparison rows, including counterexamples
+/// which must remain visible instead of silently becoming a fallback.
+fn threshold_checks() {
+    println!("relative-weight contract rows: name candidate_equal token_equal");
+    let defaults = SamplerParams::default();
+    for (name, row, params) in [
+        (
+            "top-k-tie",
+            vec![0.0; 4],
+            SamplerParams {
+                top_k: 2,
+                top_p: 1.0,
+                min_p: 0.0,
+                ..defaults
+            },
+        ),
+        (
+            "top-p-tie",
+            vec![0.0; 4],
+            SamplerParams {
+                top_k: 0,
+                top_p: 0.5,
+                min_p: 0.0,
+                ..defaults
+            },
+        ),
+        (
+            "min-p-rounded-floor",
+            vec![1.0, 1.0 + 0.05f32.ln()],
+            SamplerParams {
+                top_k: 0,
+                top_p: 1.0,
+                ..defaults
+            },
+        ),
+        (
+            "pre-temperature",
+            vec![0.0, -1.0, -2.0],
+            SamplerParams {
+                top_k: 0,
+                temperature: 0.1,
+                ..defaults
+            },
+        ),
+        (
+            "pre-min-p-normalizer",
+            vec![0.0, -0.1, -1.5],
+            SamplerParams {
+                top_k: 0,
+                min_p: 0.5,
+                top_p: 0.8,
+                ..defaults
+            },
+        ),
+        (
+            "nonfinite",
+            vec![f32::NAN, f32::INFINITY, f32::INFINITY],
+            defaults,
+        ),
+        ("all-nan", vec![f32::NAN; 4], defaults),
+        ("greedy", vec![0.0, 2.0, 2.0], SamplerParams::greedy()),
+        ("empty", vec![], defaults),
+    ] {
+        let mut real = Sampler::new(params).expect("valid check parameters");
+        let mut trial = threshold::Threshold::new(params);
+        let (mut candidate_equal, mut token_equal) = (true, true);
+        for _ in 0..64 {
+            let expected = real.sample(&row, &[]);
+            let actual = trial.sample(&row);
+            candidate_equal &= trial.candidates() == real.candidates();
+            token_equal &= actual == expected;
+        }
+        println!("{name} {candidate_equal} {token_equal}");
     }
+}
+
+fn threshold_pair(n: usize, kind: Kind, set: &Set, rows: &[Vec<f32>]) -> String {
+    let mut real = Sampler::new(set.params).expect("valid benchmark parameters");
+    let mut trial = threshold::Threshold::new(set.params);
+    let (mut real_ns, mut trial_ns, mut saved) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut candidate_bad, mut token_bad) = (0, 0);
+    for i in 0..WARMUP + WARM_CALLS {
+        let row = black_box(&rows[i % rows.len()]);
+        let mut baseline = || {
+            let t = Instant::now();
+            let id = black_box(real.sample(row, &[]));
+            (id, ns_since(t))
+        };
+        let mut experiment = || {
+            let t = Instant::now();
+            let id = black_box(trial.sample(row));
+            (id, ns_since(t))
+        };
+        let (b, e) = if i % 2 == 0 {
+            let b = baseline();
+            (b, experiment())
+        } else {
+            let e = experiment();
+            (baseline(), e)
+        };
+        candidate_bad += usize::from(trial.candidates() != real.candidates());
+        token_bad += usize::from(b.0 != e.0);
+        if i >= WARMUP {
+            real_ns.push(b.1);
+            trial_ns.push(e.1);
+            saved.push(b.1 as f64 / 1e3 - e.1 as f64 / 1e3);
+        }
+    }
+    saved.sort_by(f64::total_cmp);
+    let med = saved[saved.len() / 2];
+    let p90 = saved[(saved.len() - 1) * 9 / 10];
+    let status = if candidate_bad + token_bad > 0 {
+        "INVALID"
+    } else if med >= 300.0 {
+        "LOCAL_GAIN_REQUIRES_CONTRACT_REVIEW"
+    } else {
+        "BELOW_300US"
+    };
+    format!(
+        "{n} {} {} {:.1} {:.1} {med:.1} {p90:.1} {candidate_bad} {token_bad} {status}",
+        kind.name(),
+        set.name,
+        stats(real_ns).0,
+        stats(trial_ns).0
+    )
 }
 
 /// The frozen chain and the real sampler on alternating calls over the same rows.
