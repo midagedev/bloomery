@@ -1283,15 +1283,15 @@ fn the_paged_rule_reads_the_arena() {
     assert!(moved2 > 0 && deep2 > 0 && moved1 > 0 && deep1 > 0);
     assert_eq!(
         paged_columns(&at(deep2, 2, false)),
-        Ok(Paged::Reduced { slots: 1 })
+        Paged::Reduced { slots: 1 }
     );
-    assert_eq!(paged_columns(&at(deep1, 1, false)), Ok(Paged::AsAsked));
-    assert_eq!(paged_columns(&at(deep2, 2, true)), Ok(Paged::AsAsked));
+    assert_eq!(paged_columns(&at(deep1, 1, false)), Paged::AsAsked);
+    assert_eq!(paged_columns(&at(deep2, 2, true)), Paged::AsAsked);
     let (moved, shallow) = arena(2, 40 << 30);
     println!("40 GiB: two slots NVMe experts {moved} B, arena {shallow} B");
     assert!(moved > 0, "the 40 GiB room pages experts");
     assert_eq!(shallow, 0, "through the mapping, no arena");
-    assert_eq!(paged_columns(&at(shallow, 2, true)), Ok(Paged::AsAsked));
+    assert_eq!(paged_columns(&at(shallow, 2, true)), Paged::AsAsked);
 }
 
 /// The arena's floor counts a column a slot, to the step port's width: the

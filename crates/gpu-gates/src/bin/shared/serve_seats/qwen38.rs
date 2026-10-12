@@ -154,17 +154,17 @@
 //! read from the arena, not through the file mapping. A set `--parallel` is
 //! served as asked; an unset count falls to one slot (`from=paged`: a second
 //! slot's KV takes card bytes that experts would hold, and a later budget
-//! rule prices that trade) and the draft goes off (a drafted verify's added
-//! columns are not shown to pay on a paged plan; `load draft=off (unset: the
-//! plan pages …)` — also for a draft whose yield to the context, judged on
-//! the plan of several slots the load abandons, had turned it off), one
-//! `paged` line on stderr naming the arena and what was asked
-//! (`asked_draft` the draft before that yield); a set count the room's floor
-//! cannot hold is refused by name with the room and the floor, and
-//! `BLOOMERY_DRAFT=mtp` is refused by name before the load, with the way
-//! out. Under `--place bp` each slot steps alone (the
+//! rule prices that trade) and an unset draft goes off (`load draft=off
+//! (unset: the plan pages …)` — also for a draft whose yield to the context,
+//! judged on the plan of several slots the load abandons, had turned it off;
+//! whether a drafted verify pays on a paged plan is the machine's drive, not
+//! the rule's, to answer, so a set `BLOOMERY_DRAFT=mtp` runs), one `paged`
+//! line on stderr naming the arena and what was asked (`asked_draft` the
+//! draft before that yield, `draft` what the plan serves); a set count the
+//! room's floor cannot hold is refused by name with the room and the floor.
+//! Under `--place bp` each slot steps alone (the
 //! rounds below), so slots add no column there: they are served as asked, and
-//! only the draft goes off. The rule reads the plan the flags name — a set
+//! only an unset draft goes off. The rule reads the plan the flags name — a set
 //! context's plain plan before any search, else the plan the default's search
 //! and the draft's yield chose — and the load's own plan is held to it: the
 //! engine thread plans from the room the main thread read
@@ -1413,12 +1413,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The paged tier's rule (`bloomery_levers::paged_columns`, the module
     // doc), asked once of the plan the flags name: a set context's slot is
     // known before any search, so its plain plan's arena decides ahead of the
-    // drafted plan, whose refusal would name a draft the rule turns off; the
-    // default's is asked below, of the plan its search and the draft's yield
-    // chose. Under the rule the plan serves no draft, a set `--parallel` as
-    // asked, and a default count of slots that step together at one slot
-    // (`from=paged`); beside an expert tier card each slot steps alone
-    // ([`Place38::tiered`], the rounds' own rule below), and the slots stay.
+    // drafted plan; the default's is asked below, of the plan its search and
+    // the draft's yield chose. Under the rule the plan serves a set draft, an
+    // unset one off, a set `--parallel` as asked, and a default count of
+    // slots that step together at one slot (`from=paged`); beside an expert
+    // tier card each slot steps alone ([`Place38::tiered`], the rounds' own
+    // rule below), and the slots stay.
     let paged_at = |arena: u64, slots: usize, mtp: bool| bloomery_levers::PagedAt {
         arena,
         slots,
@@ -1430,21 +1430,23 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let paged = |arena: u64, slots: usize, mtp: bool| {
         bloomery_levers::paged_columns(&paged_at(arena, slots, mtp))
     };
-    // The draft a reduced load runs without names the paged rule when
-    // the draft was asked — on, or off only by its yield to the context on
-    // the plan this load abandons (`bloomery_levers::paged_draft`) — at
-    // either point.
+    // The draft a reduced load runs ([`bloomery_levers::paged_draft`]): a set
+    // one runs, and an unset one the plan would draft — or that only its
+    // yield to the context turned off on the plan this load abandons — goes
+    // off naming the paged rule, at either point.
     let reduced = |arena: u64,
                    (slots, served): (usize, usize),
                    mtp: bool,
                    draft_off: Option<Draft38Off>,
                    floor: bool| {
-        let (asked, draft_off) = bloomery_levers::paged_draft(mtp, draft_off, arena);
+        let (drafts, draft_off) =
+            bloomery_levers::paged_draft(&paged_at(arena, slots, mtp), draft_off);
         eprintln!(
             "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
-             slots={served} draft=off (the plan pages host experts through the NVMe tier's RAM \
+             slots={served} draft={} (the plan pages host experts through the NVMe tier's RAM \
              arena; {}{})",
-            if asked { "on" } else { "off" },
+            if mtp { "on" } else { "off" },
+            if drafts { "on" } else { "off" },
             if served < slots {
                 "an unset count serves one slot: a second slot's KV takes card bytes that \
                  experts would hold, and a later budget rule prices that trade"
@@ -1463,6 +1465,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             } else {
                 from
             },
+            drafts,
             draft_off,
         )
     };
@@ -1485,19 +1488,27 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
         _ => 0,
     };
-    let (slots, from, mtp, head, draft_off) = match paged(early, slots, mtp)? {
+    let (slots, from, mtp, head, draft_off) = match paged(early, slots, mtp) {
         Paged::AsAsked => (slots, from, mtp, head, draft_off),
         Paged::Reduced { slots: served } => {
-            mtp_inputs = None;
-            let (from, draft_off) = reduced(early, (slots, served), mtp, draft_off, false);
-            (served, from, false, None, draft_off)
+            let (from, drafts, draft_off) = reduced(early, (slots, served), mtp, draft_off, false);
+            if !drafts {
+                mtp_inputs = None;
+            }
+            (
+                served,
+                from,
+                drafts,
+                if drafts { head } else { None },
+                draft_off,
+            )
         }
     };
     // A default count whose plan the room leaves under the tier's floor
-    // ([`floor_fallback`]) falls to one slot, and no draft, where that plan
-    // pages. The one slot is the room's, not a column's, so it holds beside
-    // a tier card too, where each slot steps alone and the column rule keeps
-    // them (`bloomery_levers::paged_floor`; a set draft is refused by name).
+    // ([`floor_fallback`]) falls to one slot, and no draft where unset, on
+    // the plan that pages. The one slot is the room's, not a column's, so it
+    // holds beside a tier card too, where each slot steps alone and the
+    // column rule keeps them (`bloomery_levers::paged_floor`).
     let floor = if from == SlotsFrom::Default && slots > 1 {
         let asked = Plans {
             inputs: &inputs,
@@ -1513,12 +1524,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         None
     };
     let (slots, from, mtp, head, draft_off) = match floor {
-        Some(arena) => match bloomery_levers::paged_floor(&paged_at(arena, slots, mtp))? {
+        Some(arena) => match bloomery_levers::paged_floor(&paged_at(arena, slots, mtp)) {
             Paged::AsAsked => (slots, from, mtp, head, draft_off),
             Paged::Reduced { slots: served } => {
-                mtp_inputs = None;
-                let (from, draft_off) = reduced(arena, (slots, served), mtp, draft_off, true);
-                (served, from, false, None, draft_off)
+                let (from, drafts, draft_off) =
+                    reduced(arena, (slots, served), mtp, draft_off, true);
+                if !drafts {
+                    mtp_inputs = None;
+                }
+                (
+                    served,
+                    from,
+                    drafts,
+                    if drafts { head } else { None },
+                    draft_off,
+                )
             }
         },
         None => (slots, from, mtp, head, draft_off),
@@ -1576,7 +1596,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         (drafted, mtp, head, draft_off)
     };
     let host = plans.host(rule.ctx(), set)?;
-    let (slots, from, mtp, head, draft_off, host, one) = match paged(host.2, slots, mtp)? {
+    let (slots, from, mtp, head, draft_off, host, one) = match paged(host.2, slots, mtp) {
         Paged::AsAsked => {
             if host.2 > 0 && slots > 1 {
                 eprintln!(
@@ -1589,15 +1609,23 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             (slots, from, mtp, head, draft_off, host, None)
         }
         Paged::Reduced { slots: served } => {
+            let (from, drafts, draft_off) = reduced(host.2, (slots, served), mtp, draft_off, false);
             let one = Plans {
-                mtp: None,
+                mtp: if drafts { plans.mtp } else { None },
                 slots: served,
                 ..plans
             };
             rule = ctx38(&one, a.ctx)?;
-            let (from, draft_off) = reduced(host.2, (slots, served), mtp, draft_off, false);
             let host = one.host(rule.ctx(), set)?;
-            (served, from, false, None, draft_off, host, Some(one))
+            (
+                served,
+                from,
+                drafts,
+                if drafts { head } else { None },
+                draft_off,
+                host,
+                Some(one),
+            )
         }
     };
     refuse_mtp_levers(&draft_off)?;
@@ -1638,7 +1666,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     } else {
         cache_of(live.host(rule.ctx(), set)?)?
     };
-    if paged_one {
+    if paged_one && !mtp {
         mtp_inputs = None;
     }
     rule.print();

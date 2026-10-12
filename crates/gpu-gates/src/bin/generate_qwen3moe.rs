@@ -174,8 +174,8 @@
 //! `BLOOMERY_DRAFT=off` is the plain path with the same record. A plan that
 //! pages host experts through the NVMe tier's RAM arena steps one column
 //! (`bloomery_levers::paged_columns`, asked of the plan the run loads): an
-//! unset draft goes off there (`unset: the plan pages …`), and
-//! `BLOOMERY_DRAFT=mtp` or `BLOOMERY_GEN_SLOTS` past one is refused by name.
+//! unset draft goes off there (`unset: the plan pages …`), a set one runs,
+//! and `BLOOMERY_GEN_SLOTS` past one is refused by name.
 //!
 //! Drafting (`BLOOMERY_DRAFT=mtp`, or unset as above; a qwen4exp file only,
 //! every other family and word refused by name) the decode runs through the runtime's
@@ -395,8 +395,8 @@ mod cli {
     use bloomery_gpu_gates::residency38::{CARD38, Lever38, Seqs, residency38};
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_levers::{
-        Draft38At, Draft38Off, Levers, Paged, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
-        draft38_unset, paged_columns, paged_draft, residency38_unset,
+        Draft38At, Draft38Off, Levers, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
+        draft38_unset, paged_draft, residency38_unset,
     };
     use cuda_core::sys;
     use gguf::Split;
@@ -1043,13 +1043,13 @@ mod cli {
         Ok(plan.plan.host.nvme_arena_bytes)
     }
 
-    /// The paged tier's rule ([`bloomery_levers::paged_columns`]) asked once
-    /// of the plan the run loads ([`arena38`]): on a plan that pages host
+    /// The paged tier's draft rule ([`bloomery_levers::paged_draft`], asked
+    /// of the plan the run loads, [`arena38`]): on a plan that pages host
     /// experts through the NVMe tier's RAM arena an unset draft goes off
-    /// (`Draft38Off::Paged`, the `load draft=off` record's why), a set
-    /// `BLOOMERY_GEN_SLOTS` is served as one pass over the arena, and
-    /// `BLOOMERY_DRAFT=mtp` is refused by name. The run's slots are the
-    /// lever's alone: unset, one.
+    /// (`Draft38Off::Paged`, the `load draft=off` record's why) and a set
+    /// `BLOOMERY_DRAFT=mtp` runs. The run's slots are the lever's alone:
+    /// unset, one; a set count past one is refused by the load's own
+    /// one-column check below, a plain path on a paged plan.
     fn paged38(
         file: &Split,
         levers: &Levers,
@@ -1057,24 +1057,21 @@ mod cli {
         (ctx, slots): (usize, usize),
         (draft, off): (Draft38, Option<Draft38Off>),
     ) -> Result<(Draft38, Option<Draft38Off>), GateError> {
-        let mtp = draft == Draft38::Mtp;
-        if slots <= 1 && !mtp {
+        if draft != Draft38::Mtp {
             return Ok((draft, off));
         }
-        let arena = arena38(file, levers, (place, experts, room), (ctx, slots), mtp)?;
+        let arena = arena38(file, levers, (place, experts, room), (ctx, slots), true)?;
         let at = PagedAt {
             arena,
             slots,
             slots_set: slots > 1,
             // `BLOOMERY_GEN_SLOTS` decodes its streams as one pass.
             together: true,
-            draft: mtp,
+            draft: true,
             draft_set: levers.draft().is_some(),
         };
-        Ok(match paged_columns(&at)? {
-            Paged::AsAsked => (draft, off),
-            Paged::Reduced { .. } => (Draft38::Off, paged_draft(mtp, off, arena).1),
-        })
+        let (drafts, off) = paged_draft(&at, off);
+        Ok((if drafts { Draft38::Mtp } else { Draft38::Off }, off))
     }
 
     /// The stage card is the A6000: the placement the Qwen3.8 defaults
@@ -2207,7 +2204,8 @@ mod cli {
             experts,
             slots,
         )?;
-        // The one-column rule ([`paged38`]) read this plan.
+        // A paged plan steps one column (the module doc's rule): several
+        // slots at an arena is a plan the rule does not serve.
         if plan.host.nvme_arena_bytes > 0 && slots > 1 {
             return Err(format!(
                 "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
@@ -2304,8 +2302,10 @@ mod cli {
             &mtp,
             experts,
         )?;
-        // The one-column rule ([`paged38`]) read this plan.
-        if plan.plan.host.nvme_arena_bytes > 0 {
+        // A paged plan steps one column ([`paged38`]'s rule, the module
+        // doc): an unset draft this load still drafts was a plan the rule
+        // read another way, and a set one runs on the paged plan it read.
+        if plan.plan.host.nvme_arena_bytes > 0 && levers.draft().is_none() {
             return Err(format!(
                 "the drafted load's plan pages host experts through the NVMe tier's {} B RAM \
                  arena: the one-column rule read another plan",

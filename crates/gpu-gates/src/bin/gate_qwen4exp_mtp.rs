@@ -262,6 +262,7 @@ mod gate {
     };
     use model::fileio::hex;
     use model::placement::PlanLevers;
+    use model::placement::workstation::HostRead;
     use refset::arch::qwen4exp::IK;
     use refset::arch::qwen4exp::MODEL;
     use refset::arch::qwen4exp::fixture;
@@ -4658,6 +4659,113 @@ mod gate {
         Ok(ok)
     }
 
+    /// (pg) a set draft on a paged plan: the paged tier's draft rule
+    /// ([`bloomery_levers::paged_draft`]) runs a set `BLOOMERY_DRAFT=mtp`
+    /// where the plan pages host experts through the NVMe tier's RAM arena
+    /// (the rule turned it off before PIN(2026-10-12)), so this clause loads
+    /// a second, paged model — the same target, draft and head as the load
+    /// above, its host room halved until the plan pages (the dial carves the
+    /// arena, never under its own floor; the room that crossed the floor
+    /// ends the search) — and holds three things: the drafted greedy ids are
+    /// the plain run's on that load (the draft moves no bit); the arena
+    /// filled over the drafted run (`fills` past 0) and the verify's step
+    /// port took its union call (`step_fills` past 0: the ids the four rows'
+    /// union claimed, counted apart from the plain steps'); and the drafted
+    /// plan's stage card holds less room than the plain plan's at the same
+    /// budget (`headroom_bytes`: the draft's card bytes come out of the
+    /// context's — the seat's yield trade). Acceptance is not pinned here:
+    /// a fixture's generated draft has every proposal rejected, tau = 1, as
+    /// (z) says.
+    fn drafted_paged_run(
+        inputs: &PlanInputs,
+        mtp: &MtpInputs,
+        ub: usize,
+        prompt: &[u32],
+    ) -> Result<bool, GateError> {
+        const N: usize = 32;
+        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let extra = mtp.card_bytes(CTX)?;
+        // The room halves until the plan pages through an arena; a room the
+        // tier's floor refuses ends the search with the last room that
+        // planned, and the clause is red naming it.
+        let (file, draft_file) = (open_target()?, open_draft()?);
+        let mut paged_inputs = PlanInputs::describe(&file)?;
+        let mut room = paged_inputs.room.0;
+        let mut paged = None;
+        for _ in 0..24 {
+            paged_inputs.room = (room, HostRead::Given);
+            match paged_inputs.plan_mtp_with(
+                &machine,
+                CTX,
+                &plan_levers(extra)?,
+                mtp,
+                Experts::Card,
+            ) {
+                Ok(p) if p.plan.host.nvme_expert_bytes > 0 && p.plan.host.nvme_arena_bytes > 0 => {
+                    paged = Some(p);
+                    break;
+                }
+                Ok(_) => room /= 2,
+                Err(_) => break,
+            }
+        }
+        let Some(plan) = paged else {
+            println!(
+                "(pg) no room above the tier's floor pages this file's host experts {}",
+                verdict(false)
+            );
+            return Ok(false);
+        };
+        let plain = paged_inputs.plan_with(&machine, CTX, &plan_levers(extra)?, Experts::Card)?;
+        let fit = plan.plan.cards[0].headroom_bytes < plain.cards[0].headroom_bytes;
+        println!(
+            "(pg) room {room} B: the plan pages {} B of host experts through a {} B arena; the              drafted plan's stage card holds {} B less room than the plain plan's at the same              budget {}",
+            plan.plan.host.nvme_expert_bytes,
+            plan.plan.host.nvme_arena_bytes,
+            plain.cards[0].headroom_bytes - plan.plan.cards[0].headroom_bytes,
+            verdict(fit)
+        );
+        let m = Body38::open_placed_mtp(
+            file,
+            &plan,
+            &paged_inputs,
+            0,
+            cfg().host,
+            ub,
+            &draft_file,
+            mtp,
+        )?;
+        let tier = m
+            .body("(pg)")?
+            .nvme_tier()
+            .cloned()
+            .ok_or("(pg) the paged load built no NVMe tier")?;
+        let (m, plain_ids, _) = plain_to(m, prompt, Prompt38::Auto, N)?;
+        let mid = tier.stats();
+        let ctx = m.body("(pg)")?.ctx() as u32;
+        let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+        let first = spec.prompt(&mut s, prompt)?;
+        let out = runtime::generate(
+            &mut s,
+            &mut spec,
+            prompt,
+            first,
+            &runtime::Stop::new(N, ctx)?,
+            &mut Kept::default(),
+        )?;
+        let after = tier.stats();
+        let ids_ok = out.tokens[..N] == plain_ids[..N];
+        let fills = after.fills - mid.fills;
+        let step_fills = after.step_fills - mid.step_fills;
+        let counters_ok = fills > 0 && step_fills > 0;
+        println!(
+            "(pg) the drafted run's {N} ids = the plain run's {} (tau is not pinned: a              fixture's draft has every proposal rejected); the drafted run filled {fills} slots,              its verify's step port {step_fills} {}",
+            verdict(ids_ok),
+            verdict(counters_ok)
+        );
+        Ok(ids_ok && counters_ok && fit)
+    }
+
     pub(super) fn run() -> Result<(), GateError> {
         let witnessed = init()?;
         let dir = MTP.path(MTP_SET);
@@ -4874,6 +4982,8 @@ mod gate {
         let deep = deep_prompt()?;
         tier::sc("(y)(z) two drafted sequences resident: interleaved and as one pass")?;
         ok &= slots_windows(&inputs, &mtp, ub, &prompt, &deep[1000..])?;
+        tier::sc("(pg) a set draft on a paged plan: the ids the plain load's, the arena's fills")?;
+        ok &= drafted_paged_run(&inputs, &mtp, ub, &prompt)?;
         println!("{}", tier::tally_line());
         tier::expect_fixture_oracle("gate_qwen4exp_mtp", FX_ORACLE)?;
         if ok { Ok(()) } else { Err(checks_failed()) }

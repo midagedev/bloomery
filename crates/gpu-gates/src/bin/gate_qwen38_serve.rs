@@ -283,8 +283,8 @@
 //!   plan and its server's end is printed, not judged (PIN(2026-10-12):
 //!   the clause `paged_parallel_serves_one_pass` returns when the server's
 //!   named error after the plan is fixed), and
-//!   `BLOOMERY_DRAFT=mtp` is refused by name before the load
-//!   (`paged_draft_is_refused_by_name`);
+//!   `BLOOMERY_DRAFT=mtp` serves one slot with the draft on
+//!   (`paged_draft_mtp_serves_one_slot`);
 //!   at 40 GiB, where the tier pages experts with no arena, `--parallel 2`
 //!   serves its two slots (`unpaged_parallel_serves_as_asked`). The small
 //!   card's case last: a server with no `--place` (the box pin's one card,
@@ -3707,9 +3707,11 @@ mod gate {
     /// `the_paged_rule_reads_the_arena` derives both rooms on the Mac):
     /// the flagless server serves one slot (`from=paged`), its `paged` line
     /// naming the arena and the two slots asked; `--parallel 2` serves two
-    /// slots as one pass over the arena, and `BLOOMERY_DRAFT=mtp` is refused
-    /// by name (`PagedRefused`'s own text at the arena the refusal names, its
-    /// own plan's). At 40 GiB the tier
+    /// slots as one pass over the arena, and `BLOOMERY_DRAFT=mtp` serves
+    /// one slot with the draft on (PIN(2026-10-12): the rule refused it by
+    /// name; a paged step reads its columns' ids from the arena in one union
+    /// call, so the machine's drive, not the rule, answers whether the draft
+    /// pays — its `paged` line names `draft=on`). At 40 GiB the tier
     /// pages experts with no arena (the mapping path), and `--parallel 2`
     /// serves its two slots (`from=flag`, no `paged` line). At 27 GiB too,
     /// the checkpoints of the resident sequences sit outside the room the
@@ -3747,7 +3749,8 @@ mod gate {
     /// `off` as well never reaches the `plan` record, red on the acceptance
     /// clause; a seat that plans the asked two slots with
     /// no floor fallback refuses the flagless band server by the floor, red
-    /// on the fallback clause.
+    /// on the fallback clause; one that turns a set draft off on a paged plan
+    /// serves it plain, red on the drafted clause's `draft=on`.
     fn paged(
         dir: &Path,
         levers: &bloomery_levers::Levers,
@@ -3949,23 +3952,6 @@ mod gate {
             },
         );
 
-        // A refusal's arena, read off its own line (the plan the refused
-        // server read, whose context rides the card's free bytes at its
-        // start), and whether the line is `PagedRefused`'s text at it.
-        let refused = |text: &str, head: &str| {
-            let arena = text.lines().find_map(|l| {
-                let tail = &l[l.find(head)? + head.len()..];
-                tail.split_once(" B RAM arena")?.0.parse::<u64>().ok()
-            });
-            let named = arena.is_some_and(|arena| {
-                let want = bloomery_levers::PagedRefused { arena }.to_string();
-                arena > 0 && text.contains(&want)
-            });
-            println!("paged: refused at arena {arena:?}, by name {named}");
-            named
-        };
-        let tier = ": the plan pages host experts through the NVMe tier's ";
-
         // PIN(2026-10-12): `paged_parallel_is_refused_by_name` became
         // this clause. The refusal's cause is gone — a paged step of several
         // columns reads its ids from the arena (the placement's floor counts a
@@ -4007,6 +3993,15 @@ mod gate {
             println!("paged:   {l}");
         }
 
+        // PIN(2026-10-12): `paged_draft_is_refused_by_name` became this
+        // clause. The refusal is gone by rule: a paged step of several
+        // columns reads its ids from the arena in one union call (the
+        // placement's floor counts a column a slot, `gate_nvtier`'s census
+        // clause), so whether the draft pays on a paged plan is the
+        // machine's drive, not the rule's, to answer — a set
+        // `BLOOMERY_DRAFT=mtp` runs, and a user the refusal stopped now
+        // runs, possibly slower on a drive flat in queue depth. Stopped at
+        // the `parallel` line, before its load.
         let (line, failed, text) = run(
             &[
                 (bloomery_levers::HOST_ROOM, "27G"),
@@ -4014,13 +4009,23 @@ mod gate {
             ],
             &[],
         )?;
+        let drafted = paged_line(&text);
+        println!("paged: {}", drafted.as_deref().unwrap_or("no paged line"));
         check(
             &mut ok,
-            "paged_draft_is_refused_by_name",
-            failed
-                && line.is_none()
-                && refused(&text, &format!("BLOOMERY_DRAFT=mtp{tier}"))
-                && !listened(&text)?,
+            "paged_draft_mtp_serves_one_slot",
+            !failed
+                && line.as_deref().is_some_and(|l| {
+                    field(l, "slots").as_deref() == Some("1")
+                        && field(l, "from").as_deref() == Some("paged")
+                })
+                && drafted.as_deref().is_some_and(|l| {
+                    field(l, "rule").as_deref() == Some("reduced")
+                        && field(l, "asked_slots").as_deref() == Some("2")
+                        && field(l, "asked_draft").as_deref() == Some("on")
+                        && field(l, "slots").as_deref() == Some("1")
+                        && field(l, "draft").as_deref() == Some("on")
+                }),
         );
 
         // A residency word set on a plan that pages through the arena is

@@ -1670,7 +1670,10 @@ pub enum Draft38Off {
     /// ([`DraftYield::of`]'s answer, the seats' plan-side rule).
     Yield(DraftYield),
     /// Unset on the Qwen3.8 seat, and the plan pages host experts through
-    /// the NVMe tier's RAM arena of `arena` bytes ([`paged_columns`]).
+    /// the NVMe tier's RAM arena of `arena` bytes ([`paged_columns`]): the
+    /// draft is off by default there (whether it pays depends on the
+    /// machine's drive scaling with the queue depth a verify's fills run
+    /// at); a set [`DRAFT`] runs.
     Paged { arena: u64 },
 }
 
@@ -1698,7 +1701,7 @@ impl fmt::Display for Draft38Off {
             Draft38Off::Paged { arena } => write!(
                 f,
                 "unset: the plan pages host experts through the NVMe tier's {arena} B RAM arena, \
-                 and a drafted verify's added columns are not shown to pay on a paged plan"
+                 and the draft is off by default there; set {DRAFT}=mtp to draft on a paged plan"
             ),
         }
     }
@@ -1804,100 +1807,68 @@ pub struct PagedAt {
 pub enum Paged {
     /// The plan as asked.
     AsAsked,
-    /// The plan with what the rule turns off: no draft, and `slots` — one
+    /// The plan with the rule applied: the draft off where unset
+    /// ([`paged_draft`] names why; a set [`DRAFT`] runs), and `slots` — one
     /// for a default count whose slots step together, else every one asked.
     Reduced { slots: usize },
 }
-
-/// A paged plan's refusal of a set draft.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PagedRefused {
-    pub arena: u64,
-}
-
-impl fmt::Display for PagedRefused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{DRAFT}=mtp: the plan pages host experts through the NVMe tier's {} B RAM arena, \
-             and a drafted verify's added columns are not shown to pay on a paged plan; set \
-             {DRAFT}=off or leave it unset",
-            self.arena
-        )
-    }
-}
-
-impl std::error::Error for PagedRefused {}
 
 /// A plan that pages host experts through the NVMe tier's RAM arena serves
 /// the slots it was asked for, a set count of them stepped as one pass over
 /// the arena (the placement's floor counts their columns, [`PagedAt::slots`]).
 /// A plan with no arena serves as asked. Else the draft goes off where unset
-/// (a drafted verify's added misses are not shown to pay on a paged plan; a
-/// set draft is refused by name) and a default count of slots that step
-/// together falls to one: a second slot's KV takes card bytes that experts
-/// would hold, and a later budget rule prices that trade.
-///
-/// # Errors
-/// [`PagedRefused`] for a set draft.
-pub fn paged_columns(at: &PagedAt) -> Result<Paged, PagedRefused> {
+/// and a default count of slots that step together falls to one: a second
+/// slot's KV takes card bytes that experts would hold, and a later budget
+/// rule prices that trade. A set draft runs — whether a drafted verify pays
+/// on a paged plan is the machine's drive, not the rule's, to answer
+/// ([`DRAFT`]'s doc names the trade; `pageddraft-decode.card` holds the
+/// measurement).
+pub fn paged_columns(at: &PagedAt) -> Paged {
     if at.arena == 0 {
-        return Ok(Paged::AsAsked);
-    }
-    if at.draft && at.draft_set {
-        return Err(PagedRefused { arena: at.arena });
+        return Paged::AsAsked;
     }
     let slots = if at.slots > 1 && at.together && !at.slots_set {
         1
     } else {
         at.slots
     };
-    Ok(if at.draft || slots != at.slots {
+    if (at.draft && !at.draft_set) || slots != at.slots {
         Paged::Reduced { slots }
     } else {
         Paged::AsAsked
-    })
+    }
 }
 
 /// The rule asked of a default slot count whose plan the host room leaves
 /// under the NVMe tier's floor, where the one-slot plan pages: that plan
-/// serves one slot, and its draft is [`paged_columns`]'s on it. The one slot
+/// serves one slot, and its draft is [`paged_draft`]'s on it. The one slot
 /// is the room's, not a column's, so it holds where the slots step alone too
 /// ([`PagedAt::together`] is not read). With no arena the asked plan stands,
 /// for the floor's own refusal to name.
-///
-/// # Errors
-/// [`PagedRefused`] for a set draft, as [`paged_columns`] names it.
-pub fn paged_floor(at: &PagedAt) -> Result<Paged, PagedRefused> {
+pub fn paged_floor(at: &PagedAt) -> Paged {
     if at.arena == 0 {
-        return Ok(Paged::AsAsked);
+        Paged::AsAsked
+    } else {
+        Paged::Reduced { slots: 1 }
     }
-    paged_columns(&PagedAt {
-        slots: 1,
-        slots_set: false,
-        ..*at
-    })?;
-    Ok(Paged::Reduced { slots: 1 })
 }
 
-/// The draft a reduced load ([`Paged::Reduced`]) runs without, as its
-/// `load draft=off` record names it, and whether it was asked: a draft that
-/// ran (`drafts`), or that only its yield to the context turned off — a
-/// verdict on the plan of several slots the load abandons — was asked, and
-/// the paged rule is why it is off; any other reason (set, the placement,
-/// the file, a window past the context) holds whatever the plan, and stays.
-/// The Qwen3.8 seat's and `generate_qwen3moe`'s one owner.
+/// The draft a paged plan ([`PagedAt::arena`] above 0) runs, and why a
+/// reduced load ([`Paged::Reduced`]) runs without it, as its `load draft=off`
+/// record names it: a set draft runs as asked; unset, a draft that would run
+/// (`at.draft`), or that only its yield to the context turned off — a
+/// verdict on the plan of several slots the load abandons — goes off with
+/// [`Draft38Off::Paged`]; any other reason (set, the placement, the file, a
+/// window past the context) holds whatever the plan, and stays. A plan that
+/// would not draft is untouched. The Qwen3.8 seat's and `generate_qwen3moe`'s
+/// one owner.
 #[must_use]
-pub fn paged_draft(
-    drafts: bool,
-    off: Option<Draft38Off>,
-    arena: u64,
-) -> (bool, Option<Draft38Off>) {
-    let asked = drafts || matches!(off, Some(Draft38Off::Yield(_)));
+pub fn paged_draft(at: &PagedAt, off: Option<Draft38Off>) -> (bool, Option<Draft38Off>) {
+    let asked = at.draft || matches!(off, Some(Draft38Off::Yield(_)));
     (
-        asked,
-        if asked {
-            Some(Draft38Off::Paged { arena })
+        at.draft && at.draft_set,
+        if asked && !at.draft_set {
+            Some(Draft38Off::Paged { arena: at.arena })
         } else {
             off
         },

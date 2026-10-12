@@ -1183,7 +1183,7 @@ fn draft_yields_to_the_context_only_under_the_base() {
 /// A paged plan serves the slots it was asked for ([`paged_columns`]): with
 /// no arena, or a draft that is off and a count that is set or one, the plan
 /// serves as asked; the unset default count falls to one slot and the unset
-/// draft goes off; a set draft is refused by name.
+/// draft goes off; a set draft runs, whatever the count.
 ///
 /// The arena is the 3090 gate plan's at a 27 GiB room [derived on the Mac:
 /// `crates/placement` `a_27_gib_room_puts_the_overflow_on_the_nvme_tier`].
@@ -1200,48 +1200,40 @@ fn a_paged_plan_serves_its_asked_slots() {
     };
     for (at, want) in [
         // No arena: every count as asked, set or not.
-        (at(0, 2, false, true, false), Ok(Paged::AsAsked)),
-        (at(0, 4, true, true, true), Ok(Paged::AsAsked)),
+        (at(0, 2, false, true, false), Paged::AsAsked),
+        (at(0, 4, true, true, true), Paged::AsAsked),
         // One slot, no draft: as asked.
-        (at(arena, 1, false, false, false), Ok(Paged::AsAsked)),
-        (at(arena, 1, true, false, true), Ok(Paged::AsAsked)),
+        (at(arena, 1, false, false, false), Paged::AsAsked),
+        (at(arena, 1, true, false, true), Paged::AsAsked),
         // A set count is served, whatever it is.
-        (at(arena, 2, true, false, false), Ok(Paged::AsAsked)),
-        (at(arena, 4, true, false, false), Ok(Paged::AsAsked)),
-        (at(arena, 8, true, false, false), Ok(Paged::AsAsked)),
+        (at(arena, 2, true, false, false), Paged::AsAsked),
+        (at(arena, 4, true, false, false), Paged::AsAsked),
+        (at(arena, 8, true, false, false), Paged::AsAsked),
         // The unset default count falls to one slot.
         (
             at(arena, 2, false, false, false),
-            Ok(Paged::Reduced { slots: 1 }),
+            Paged::Reduced { slots: 1 },
         ),
         (
             at(arena, 2, false, true, false),
-            Ok(Paged::Reduced { slots: 1 }),
+            Paged::Reduced { slots: 1 },
         ),
         // The unset draft goes off, a set count kept.
         (
             at(arena, 1, false, true, false),
-            Ok(Paged::Reduced { slots: 1 }),
+            Paged::Reduced { slots: 1 },
         ),
-        (
-            at(arena, 3, true, true, false),
-            Ok(Paged::Reduced { slots: 3 }),
-        ),
-        // A set draft is refused, whatever the count.
-        (at(arena, 1, false, true, true), Err(PagedRefused { arena })),
-        (at(arena, 2, true, true, true), Err(PagedRefused { arena })),
-        (at(arena, 3, false, true, true), Err(PagedRefused { arena })),
+        (at(arena, 3, true, true, false), Paged::Reduced { slots: 3 }),
+        // A set draft runs: as asked at one slot or a set count, and the
+        // unset default count still falls to one.
+        (at(arena, 1, false, true, true), Paged::AsAsked),
+        (at(arena, 2, true, true, true), Paged::AsAsked),
+        (at(arena, 3, false, true, true), Paged::Reduced { slots: 1 }),
     ] {
         assert_eq!(paged_columns(&at), want, "{at:?}");
     }
-    assert_eq!(
-        PagedRefused { arena }.to_string(),
-        "BLOOMERY_DRAFT=mtp: the plan pages host experts through the NVMe tier's \
-         23434203136 B RAM arena, and a drafted verify's added columns are not shown to pay on \
-         a paged plan; set BLOOMERY_DRAFT=off or leave it unset"
-    );
     // Beside an expert tier card each slot steps alone: the default count is
-    // kept, and only the draft goes off.
+    // kept, and only the unset draft goes off.
     let bp = |slots, slots_set: bool, draft, draft_set| PagedAt {
         arena,
         slots,
@@ -1251,25 +1243,38 @@ fn a_paged_plan_serves_its_asked_slots() {
         draft_set,
     };
     for (at, want) in [
-        (bp(2, false, false, false), Ok(Paged::AsAsked)),
-        (bp(3, true, false, false), Ok(Paged::AsAsked)),
-        (bp(2, false, true, false), Ok(Paged::Reduced { slots: 2 })),
-        (bp(3, true, true, false), Ok(Paged::Reduced { slots: 3 })),
-        (bp(1, false, true, false), Ok(Paged::Reduced { slots: 1 })),
-        (bp(2, true, true, true), Err(PagedRefused { arena })),
+        (bp(2, false, false, false), Paged::AsAsked),
+        (bp(3, true, false, false), Paged::AsAsked),
+        (bp(2, false, true, false), Paged::Reduced { slots: 2 }),
+        (bp(3, true, true, false), Paged::Reduced { slots: 3 }),
+        (bp(1, false, true, false), Paged::Reduced { slots: 1 }),
+        (bp(2, true, true, true), Paged::AsAsked),
+        (bp(2, false, true, true), Paged::AsAsked),
     ] {
         assert_eq!(paged_columns(&at), want, "{at:?}");
     }
-    // The reduced load's draft: a draft that ran, or that only its yield to
-    // the context turned off (judged on the plan of several slots the load
-    // abandons), is off by the paged rule; every other reason holds whatever
-    // the plan, and stays.
+    // The paged plan's draft ([`paged_draft`]): a set draft runs; unset, a
+    // draft that would run, or that only its yield to the context turned
+    // off (judged on the plan of several slots the load abandons), goes off
+    // by the paged rule; every other reason holds whatever the plan, and
+    // stays.
     let paged = Some(Draft38Off::Paged { arena });
     let y = DraftYield::of(702, 6165, 4096, 2_842_413_228).expect("the 3060's yield");
-    assert_eq!(paged_draft(true, None, arena), (true, paged.clone()));
     assert_eq!(
-        paged_draft(false, Some(Draft38Off::Yield(y)), arena),
-        (true, paged.clone()),
+        paged_draft(&at(arena, 2, true, true, true), None),
+        (true, None),
+        "a set draft runs on a paged plan"
+    );
+    assert_eq!(
+        paged_draft(&at(arena, 2, true, true, false), None),
+        (false, paged.clone())
+    );
+    assert_eq!(
+        paged_draft(
+            &at(arena, 2, true, false, false),
+            Some(Draft38Off::Yield(y))
+        ),
+        (false, paged.clone()),
         "a yield judged on the abandoned plan"
     );
     let file = Path::new("/models/q/mtp.gguf");
@@ -1286,7 +1291,7 @@ fn a_paged_plan_serves_its_asked_slots() {
         },
     ] {
         assert_eq!(
-            paged_draft(false, Some(stays.clone()), arena),
+            paged_draft(&at(arena, 2, true, false, false), Some(stays.clone())),
             (false, Some(stays.clone())),
             "{stays:?}"
         );
@@ -1294,15 +1299,15 @@ fn a_paged_plan_serves_its_asked_slots() {
     assert_eq!(
         Draft38Off::Paged { arena }.to_string(),
         "unset: the plan pages host experts through the NVMe tier's 23434203136 B RAM arena, \
-         and a drafted verify's added columns are not shown to pay on a paged plan"
+         and the draft is off by default there; set BLOOMERY_DRAFT=mtp to draft on a paged plan"
     );
 }
 
 /// A default count whose plan the room leaves under the NVMe tier's floor
 /// ([`paged_floor`]) serves one slot where the one-slot plan pages, beside
 /// an expert tier card too, where [`paged_columns`] keeps every slot: the
-/// one slot is the room's. Its draft goes off unset and is refused set; with
-/// no arena the asked plan stands.
+/// one slot is the room's. Its draft goes off unset and runs set; with no
+/// arena the asked plan stands.
 #[test]
 fn a_floor_fallback_serves_one_slot_where_slots_step_alone() {
     let arena = 23_434_203_136_u64;
@@ -1318,17 +1323,17 @@ fn a_floor_fallback_serves_one_slot_where_slots_step_alone() {
         for (at, want) in [
             (
                 at(arena, 2, together, false, false),
-                Ok(Paged::Reduced { slots: 1 }),
+                Paged::Reduced { slots: 1 },
             ),
             (
                 at(arena, 3, together, true, false),
-                Ok(Paged::Reduced { slots: 1 }),
+                Paged::Reduced { slots: 1 },
             ),
             (
                 at(arena, 2, together, true, true),
-                Err(PagedRefused { arena }),
+                Paged::Reduced { slots: 1 },
             ),
-            (at(0, 2, together, true, false), Ok(Paged::AsAsked)),
+            (at(0, 2, together, true, false), Paged::AsAsked),
         ] {
             assert_eq!(paged_floor(&at), want, "{at:?}");
         }
