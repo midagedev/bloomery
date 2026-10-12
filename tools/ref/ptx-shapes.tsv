@@ -183,6 +183,8 @@ generate_ds41   index_pool                               0           0
 generate_ds41   iq2_xs_gate_up_sel                       0           0
 generate_ds41   iq2_xs_gemv_sel                          0           0
 generate_ds41   iq2_xs_rows                              0           0
+generate_ds41   iq3_s_gate_up_sel                        0           0
+generate_ds41   iq3_s_gemv_sel                           0           0
 generate_ds41   iq3_xxs_gate_up_sel                      0           0
 generate_ds41   iq3_xxs_gemv_sel                         0           0
 generate_ds41   iq3_xxs_rows                             0           0
@@ -418,6 +420,8 @@ gate_e2e   index_pool                               0           0
 gate_e2e   iq2_xs_gate_up_sel                       0           0
 gate_e2e   iq2_xs_gemv_sel                          0           0
 gate_e2e   iq2_xs_rows                              0           0
+gate_e2e   iq3_s_gate_up_sel                        0           0
+gate_e2e   iq3_s_gemv_sel                           0           0
 gate_e2e   iq3_xxs_gate_up_sel                      0           0
 gate_e2e   iq3_xxs_gemv_sel                         0           0
 gate_e2e   iq3_xxs_rows                             0           0

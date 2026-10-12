@@ -1,8 +1,14 @@
 //! GPU gate for the i-quant expert-select entries over raw blocks
-//! (`bloomery_gpu::iq_sel`) on one card: the IQ2_XS, IQ3_XXS and IQ4_XS
+//! (`bloomery_gpu::iq_sel`) on one card: the IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS
 //! gate·ups, the IQ4_NL down `_sel32` (Qwen3.8 UD-Q3_K_XL's card-leg formats)
-//! and the IQ2_XS, IQ3_XXS and IQ4_XS downs over `Q8Act` (GLM-5.3-Flash
-//! UD-Q2_K_XL's).
+//! and the IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS downs over `Q8Act`
+//! (GLM-5.3-Flash UD-Q2_K_XL's and UD-IQ4_XS's).
+//!
+//! IQ3_S has no plane kernels (`IqFormat::has_planes`), so clause 2 and the
+//! plane half of clause 10 do not apply to it. Its rule is held by clause 1
+//! (`iq.rs`'s host rule, written from `dequant_iq3_s`'s layout: index, high
+//! bit, raw sign byte and scale nibble), clause 3 (`gguf::dequant_row`, ggml's
+//! decode) and the rest, each at K = 4,096 and 2,304.
 //!
 //! Weights. The gate·up formats take the synthetic rows `dequant_ref
 //! --synthetic` writes (`$BLOOMERY_DATA/ref-synth/<type>.blocks`: 64 rows
@@ -180,8 +186,20 @@ mod gate {
     /// The `Q8Act` downs' widths: GLM's down K and a partial last lane
     /// iteration (nine super-blocks).
     const KS_DOWN: [usize; 2] = [2048, 2304];
+    /// The formats of the gate·ups.
+    const GU_FMTS: [IqFormat; 4] = [
+        IqFormat::Iq2Xs,
+        IqFormat::Iq3Xxs,
+        IqFormat::Iq3S,
+        IqFormat::Iq4Xs,
+    ];
     /// The formats of the `Q8Act` downs.
-    const Q8_FMTS: [IqFormat; 3] = [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs];
+    const Q8_FMTS: [IqFormat; 4] = [
+        IqFormat::Iq2Xs,
+        IqFormat::Iq3Xxs,
+        IqFormat::Iq3S,
+        IqFormat::Iq4Xs,
+    ];
     /// The down's clause-3 row sampling (every 128th row of its stacks).
     const NL_BAND_STRIDE: usize = 128;
 
@@ -195,7 +213,10 @@ mod gate {
     /// 4,096 and 2,304, IQ3_XXS at 4,096), the first run's larger-of-sweep
     /// values 1.43e-2, 1.13e-2 and 1.14e-2 rounded up the way the rows above
     /// were; the assertion is the composed bound, as for them.
-    const REL_PIN_GU: [(IqFormat, usize, f64); 7] = [
+    /// PIN(2026-10-12): the two IQ3_S rows (K = 4,096 and 2,304), the first
+    /// run's larger-of-sweep values 1.2379e-2 and 7.5603e-3 rounded up as the
+    /// rows above (to 1.5e-2 and 9.0e-3); the assertion is the composed bound.
+    const REL_PIN_GU: [(IqFormat, usize, f64); 9] = [
         (IqFormat::Iq3Xxs, 2560, 1.2e-2),
         (IqFormat::Iq3Xxs, 2304, 2.0e-2),
         (IqFormat::Iq3Xxs, 4096, 1.4e-2),
@@ -203,6 +224,8 @@ mod gate {
         (IqFormat::Iq4Xs, 2304, 1.1e-2),
         (IqFormat::Iq2Xs, 4096, 1.7e-2),
         (IqFormat::Iq2Xs, 2304, 1.4e-2),
+        (IqFormat::Iq3S, 4096, 1.5e-2),
+        (IqFormat::Iq3S, 2304, 9.0e-3),
     ];
     /// PIN(2026-10-06): the down's, both K, the dot-level 0.4 % class
     /// widened by the sampled rows' spread.
@@ -1234,7 +1257,11 @@ mod gate {
                 verdict(bits),
                 verdict(rerun),
                 verdict(sentinel),
-                verdict(cross_bits),
+                if cross && m == MS[3] {
+                    verdict(cross_bits)
+                } else {
+                    "n/a"
+                },
                 verdict(in_bound),
                 shown(&fault),
                 mismatch("host_rule", &h, &host),
@@ -1390,7 +1417,7 @@ mod gate {
     fn check_ids_and_nan(c: &Ctx) -> Result<bool, GateError> {
         let s = c.gpu.stream();
         let mut ok = true;
-        for fmt in [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
+        for fmt in GU_FMTS {
             // Clause 5, gate·up: an id past the stack and HOST slots.
             let st = gu_stack(fmt, KS[0], 4, 80)?;
             let (wg, wu) = (st.upload(s, false)?, st.upload(s, true)?);
@@ -1478,7 +1505,7 @@ mod gate {
         }
         // Clause 6: a NaN `d` block and an inf-`d` row (two super-blocks,
         // one row, identical bytes, opposite `d`) in every gate·up entry.
-        for fmt in [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
+        for fmt in GU_FMTS {
             let st = gu_stack(fmt, KS[0], 4, 80)?;
             let (mut gb, mut ub) = (st.g.clone(), st.u.clone());
             let (rb, bb) = (st.row_bytes(), fmt.block_bytes());
@@ -1989,6 +2016,7 @@ mod gate {
         match fmt {
             IqFormat::Iq2Xs => &[4096, 2304],
             IqFormat::Iq3Xxs => &[2560, 2304, 4096],
+            IqFormat::Iq3S => &[4096, 2304],
             IqFormat::Iq4Xs | IqFormat::Q2K => &KS,
         }
     }
@@ -2268,6 +2296,8 @@ mod gate {
         let s = c.gpu.stream();
         let gu = gu_stack(IqFormat::Iq2Xs, 4096, 4, 80)?;
         let (wg, wu) = (gu.upload(s, false)?, gu.upload(s, true)?);
+        let gu3 = gu_stack(IqFormat::Iq3S, 4096, 4, 80)?;
+        let (wg3, wu3) = (gu3.upload(s, false)?, gu3.upload(s, true)?);
         let m = 2usize;
         let xd = DeviceBuffer::from_host(s, &seeded(m * gu.k, 9201, -2.0, 4.0))?;
         let mut act = Q8Act::with_k(s, m, gu.k)?;
@@ -2288,6 +2318,7 @@ mod gate {
         let sink = c.gpu.unlabelled_sink();
         let eager = |st: &CudaStream,
                      h: &mut DeviceBuffer<f32>,
+                     h3: &mut DeviceBuffer<f32>,
                      ys: &mut [DeviceBuffer<f32>]|
          -> Result<(), GpuError> {
             c.iqsel.enqueue_gate_up(
@@ -2305,6 +2336,22 @@ mod gate {
                 },
                 sink,
                 h,
+            )?;
+            c.iqsel.enqueue_gate_up(
+                st,
+                &IqGateUp {
+                    ty: GgmlType::IQ3_S,
+                    wg: &wg3,
+                    wu: &wu3,
+                    act: &act,
+                    sel: &sel_dev,
+                    n_slots: sel.len(),
+                    rows_per_expert: gu3.rpe,
+                    slots_per_col: SLOTS,
+                    rule: CLAMP0,
+                },
+                sink,
+                h3,
             )?;
             for ((ty, rpe, w, a), y) in downs.iter().zip(ys.iter_mut()) {
                 c.iqsel.enqueue_gemv_sel(
@@ -2326,39 +2373,43 @@ mod gate {
         let bufs = |s: &CudaStream| {
             Ok::<_, GateError>((
                 DeviceBuffer::from_host(s, &vec![SENT; sel.len() * gu.rpe])?,
+                DeviceBuffer::from_host(s, &vec![SENT; sel.len() * gu3.rpe])?,
                 (0..downs.len())
                     .map(|_| DeviceBuffer::from_host(s, &vec![SENT; n * 80]))
                     .collect::<Result<Vec<_>, _>>()?,
             ))
         };
-        let read = |h: &DeviceBuffer<f32>, ys: &[DeviceBuffer<f32>]| {
-            let mut all = vec![h.to_host_vec(s)?];
+        let read = |h: &DeviceBuffer<f32>, h3: &DeviceBuffer<f32>, ys: &[DeviceBuffer<f32>]| {
+            let mut all = vec![h.to_host_vec(s)?, h3.to_host_vec(s)?];
             for y in ys {
                 all.push(y.to_host_vec(s)?);
             }
             Ok::<_, GateError>(all)
         };
-        let (mut eh, mut eys) = bufs(s)?;
-        eager(s, &mut eh, &mut eys)?;
+        let (mut eh, mut eh3, mut eys) = bufs(s)?;
+        eager(s, &mut eh, &mut eh3, &mut eys)?;
         s.synchronize()?;
-        let first = read(&eh, &eys)?;
-        let (mut fh, mut fys) = bufs(s)?;
-        eager(s, &mut fh, &mut fys)?;
+        let first = read(&eh, &eh3, &eys)?;
+        let (mut fh, mut fh3, mut fys) = bufs(s)?;
+        eager(s, &mut fh, &mut fh3, &mut fys)?;
         s.synchronize()?;
-        let second = read(&fh, &fys)?;
-        let (mut gh, mut gys) = bufs(s)?;
-        let graph = c.gpu.capture(|cap| eager(cap, &mut gh, &mut gys))?;
+        let second = read(&fh, &fh3, &fys)?;
+        let (mut gh, mut gh3, mut gys) = bufs(s)?;
+        let graph = c
+            .gpu
+            .capture(|cap| eager(cap, &mut gh, &mut gh3, &mut gys))?;
         let nodes = graph.node_count();
         graph.launch(s)?;
         s.synchronize()?;
-        let replayed = read(&gh, &gys)?;
+        let replayed = read(&gh, &gh3, &gys)?;
         drop(graph);
         let same = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).all(|(x, y)| bits_equal(x, y));
         let (second_ok, replay_ok) = (same(&first, &second), same(&first, &replayed));
         let no_fault = c.gpu.take_fault()?.is_none();
-        let pass = nodes == 4 && second_ok && replay_ok && no_fault;
+        let want = 2 + Q8_FMTS.len();
+        let pass = nodes == want && second_ok && replay_ok && no_fault;
         println!(
-            "capture_q8 graph_nodes={nodes} (want 4) replay_bits={} second_eager_bits={} \
+            "capture_q8 graph_nodes={nodes} (want {want}) replay_bits={} second_eager_bits={} \
              fault=none {}",
             verdict(replay_ok),
             verdict(second_ok),
@@ -2378,11 +2429,11 @@ mod gate {
         let s = c.gpu.stream();
         let mut ok = true;
         let mut rels: Vec<(IqFormat, usize, f64)> = Vec::new();
-        for fmt in [IqFormat::Iq2Xs, IqFormat::Iq3Xxs, IqFormat::Iq4Xs] {
+        for fmt in GU_FMTS {
             for &k in gu_ks(fmt) {
                 let st = gu_stack(fmt, k, 4, 80)?;
                 let (wg, wu) = (st.upload(s, false)?, st.upload(s, true)?);
-                let (pass, rel) = check_gu(&c, &st, &wg, &wu, true, true)?;
+                let (pass, rel) = check_gu(&c, &st, &wg, &wu, fmt.has_planes(), true)?;
                 ok &= pass;
                 rels.push((fmt, k, rel));
             }
@@ -2435,7 +2486,7 @@ mod gate {
             for &k in &KS_DOWN {
                 let st = gu_stack(fmt, k, 4, 80)?;
                 let w = st.upload(s, false)?;
-                ok &= check_q8_down(&c, &st, &w, true)?;
+                ok &= check_q8_down(&c, &st, &w, fmt.has_planes())?;
             }
             // GLM's down rows (4,096 an expert) beside the dots above.
             let st = gu_stack(fmt, KS_DOWN[0], 2, 4096)?;
