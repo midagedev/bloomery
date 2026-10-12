@@ -47,7 +47,7 @@ pub struct DraftHead {
 }
 
 /// The target's Q6_K projection as the loader holds it.
-fn projection(w: &DraftWeights) -> Result<&DeviceTensor<u32>, GpuError> {
+pub(super) fn projection(w: &DraftWeights) -> Result<&DeviceTensor<u32>, GpuError> {
     let name = target_names::output();
     match w.head().get(&name) {
         Some(DevWeight::KQuant {

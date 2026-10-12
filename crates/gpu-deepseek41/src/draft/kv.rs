@@ -67,6 +67,11 @@ impl DraftRings {
         self.rings.get_mut(l)
     }
 
+    /// Every ring, writable, and the append's empty shadow beside them.
+    pub(super) fn split_mut(&mut self) -> (&mut [DeviceTensor<u16>], &mut DeviceTensor<u16>) {
+        (&mut self.rings, &mut self.none)
+    }
+
     /// Device bytes of every ring.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
@@ -89,6 +94,80 @@ impl DraftRings {
             r.buf_mut().zero_async(stream)?;
         }
         Ok(())
+    }
+}
+
+/// The widths and epsilon of a group's per-layer launches.
+#[derive(Clone, Copy)]
+pub(super) struct AppendDims {
+    pub n_embd: usize,
+    pub head_dim: usize,
+    pub rope_dims: usize,
+    pub eps: f32,
+}
+
+/// One group's inputs to a layer's append: its `rows` context rows `x`
+/// (token-major, `n_embd` a row), and the group's rope tables and ring
+/// slots in the append's image.
+pub(super) struct GroupRows<'a> {
+    pub x: &'a DeviceBuffer<f32>,
+    pub rows: usize,
+    pub cs: &'a DeviceBuffer<f32>,
+    pub slots: &'a DeviceBuffer<u32>,
+}
+
+/// What a layer's append reads besides its own buffers.
+pub(super) struct AppendCx<'a> {
+    pub gpu: &'a Gpu,
+    pub rope: &'a RopeKernels,
+    pub w: &'a DraftWeights,
+    pub dims: AppendDims,
+}
+
+impl AppendCx<'_> {
+    /// Layer `l`'s launches for one group, in this order: `attn_kv` over the
+    /// group's rows (`kv`), then the norm, the plain tail rope and the append
+    /// of each row into the layer's `ring` (`out` holds the normed, turned
+    /// rows; `shadow` is the append's empty shadow). The one body both
+    /// appends run: [`KvAppend`] over its own `main_x`, and the common DSpark
+    /// owner's layers over the owner's rows.
+    pub(super) fn enqueue_layer(
+        &self,
+        l: usize,
+        group: &GroupRows<'_>,
+        (kv, out): (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+        (ring, shadow): (&mut DeviceTensor<u16>, &mut DeviceTensor<u16>),
+    ) -> Result<(), GpuError> {
+        let (gpu, dims) = (self.gpu, &self.dims);
+        let s = gpu.stream();
+        let (qs, d) = self.w.q8(&names::attn_kv(l), dims.n_embd, dims.head_dim)?;
+        let gain = self.w.gain(&names::attn_kv_a_norm(l), dims.head_dim)?;
+        gpu.q8f32().enqueue_q8_0_gemv_mcol(
+            s,
+            Q8_0GemvMcolArgs {
+                qs,
+                d,
+                x: group.x,
+                m: group.rows,
+                out: GemvOut::TokenMajor,
+                y: kv,
+            },
+        )?;
+        self.rope.enqueue_kv_norm_rope_append(
+            s,
+            KvAppendArgs {
+                kv,
+                gain,
+                cs: group.cs,
+                pos: group.slots,
+                eps: dims.eps,
+                n_dims: dims.rope_dims,
+                m: group.rows,
+                out,
+                cache: ring,
+                shadow,
+            },
+        )
     }
 }
 
@@ -380,7 +459,6 @@ impl KvAppend {
         w: &DraftWeights,
         rings: &mut DraftRings,
     ) -> Result<(), GpuError> {
-        let s = gpu.stream();
         if rings.rings.len() != self.n_layer {
             return Err(GpuError::Shape {
                 what: WHAT,
@@ -388,9 +466,18 @@ impl KvAppend {
             });
         }
         let lay = self.layout;
+        let cx = AppendCx {
+            gpu,
+            rope: &self.rope,
+            w,
+            dims: AppendDims {
+                n_embd: self.n_embd,
+                head_dim: self.head_dim,
+                rope_dims: self.rope_dims,
+                eps: self.eps,
+            },
+        };
         for (l, ring) in rings.rings.iter_mut().enumerate() {
-            let (qs, d) = w.q8(&names::attn_kv(l), self.n_embd, self.head_dim)?;
-            let gain = w.gain(&names::attn_kv_a_norm(l), self.head_dim)?;
             for (gi, g) in self
                 .groups
                 .iter_mut()
@@ -400,31 +487,17 @@ impl KvAppend {
                 let at = gi * lay.words;
                 let cs = self.inbox.f32s(at + lay.cs, GROUP * self.rope_dims)?;
                 let slots = self.inbox.u32s(at + lay.slots, GROUP)?;
-                gpu.q8f32().enqueue_q8_0_gemv_mcol(
-                    s,
-                    Q8_0GemvMcolArgs {
-                        qs,
-                        d,
-                        x: &g.main,
-                        m: g.rows,
-                        out: GemvOut::TokenMajor,
-                        y: &mut g.kv[l],
-                    },
-                )?;
-                self.rope.enqueue_kv_norm_rope_append(
-                    s,
-                    KvAppendArgs {
-                        kv: &g.kv[l],
-                        gain,
-                        cs: &cs,
-                        pos: &slots,
-                        eps: self.eps,
-                        n_dims: self.rope_dims,
-                        m: g.rows,
-                        out: &mut g.out[l],
-                        cache: ring,
-                        shadow: &mut rings.none,
-                    },
+                let group = GroupRows {
+                    x: &g.main,
+                    rows: g.rows,
+                    cs: &cs,
+                    slots: &slots,
+                };
+                cx.enqueue_layer(
+                    l,
+                    &group,
+                    (&mut g.kv[l], &mut g.out[l]),
+                    (ring, &mut rings.none),
                 )?;
             }
         }
