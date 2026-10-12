@@ -1220,6 +1220,16 @@ gate-jinja:
 lab-engram:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram-lab --test lab -- --include-ignored --nocapture'
 
+# The parser fuzz crate (fuzz/, excluded from the workspace): its own tests, then each target for 60 s on its
+# seeds, as fuzz/README.md runs them (tools/fuzz-lab.sh). The name is lab-, not gate-, so `just affected` never
+# selects it, and a finding is a bug to fix, not a landing's red. Needs `cargo install cargo-fuzz --locked` on
+# the box (the pinned nightly and a C++ compiler it has); derived wall ~6 min of fuzzing (six 60 s targets) plus
+# the test build and one sanitizer build, cold. `just deny` does not scan fuzz/, so fuzz/Cargo.lock is outside
+# its advisory and license check; libfuzzer-sys is NCSA, which deny.toml does not allow, and nothing ships from
+# fuzz/.
+lab-fuzz:
+    ./tools/box.sh 'bash tools/fuzz-lab.sh'
+
 # engram-rate 바이너리. 측정은 tools/ref/engram-rate.sh가 임대 안에서 돌린다 —
 # 이 레시피는 빌드만 한다(러너가 낡은 바이너리를 재는 것을 막는 단계).
 build-engram:
