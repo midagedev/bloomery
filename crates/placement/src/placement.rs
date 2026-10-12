@@ -1072,6 +1072,22 @@ pub enum PlacementError {
          card is outside the plan"
     )]
     DraftOffPlan { on: usize, tiers: usize },
+    /// A layer the plan's per-layer expert counts ([`Plan::n_l`],
+    /// [`Plan::tier_n_l`]) do not reach: `layers` is how many they hold.
+    #[error("layer {layer} is past the plan's per-layer expert counts ({layers} layers)")]
+    LayerPastCounts { layer: usize, layers: usize },
+    /// A layer whose stage card and tier cards hold more experts than the
+    /// model has on it: the counts the plan holds, and the model's.
+    #[error(
+        "layer {layer}: the stage card holds {stage} experts and the tier cards {tiers}, past \
+         the model's {experts}"
+    )]
+    LayerOverHeld {
+        layer: usize,
+        stage: u64,
+        tiers: u64,
+        experts: u64,
+    },
     /// The tiers' prompt-batch host rows, one set a tier, summed past u64.
     #[error("{tiers} tier cards' prompt-batch host rows of {bytes} B each pass u64 bytes")]
     TierBatchHost { tiers: usize, bytes: u64 },
@@ -3407,6 +3423,34 @@ impl Plan<'_> {
         capped(card, self.card_budget)
     }
 
+    /// The experts the host serves on layer `l`, resident or paged from the
+    /// NVMe tier: the model's per layer, less the stage card's
+    /// ([`Plan::n_l`]) and each tier card's ([`Plan::tier_n_l`]). A layer the
+    /// host serves none of is 0. A layer without routed stacks reads as the
+    /// model's expert count; ask it only of a routed layer. Refused by name:
+    /// a layer past the plan's counts, and cards that hold more of the layer
+    /// than the model has.
+    pub fn host_experts(&self, l: usize) -> Result<u64, PlacementError> {
+        let past = || PlacementError::LayerPastCounts {
+            layer: l,
+            layers: self.n_l.len(),
+        };
+        let stage = *self.n_l.get(l).ok_or_else(past)?;
+        let mut tiers = 0u64;
+        for tier in &self.tier_n_l {
+            tiers = tiers.saturating_add(*tier.get(l).ok_or_else(past)?);
+        }
+        let experts = self.model.experts;
+        experts
+            .checked_sub(stage.saturating_add(tiers))
+            .ok_or(PlacementError::LayerOverHeld {
+                layer: l,
+                stage,
+                tiers,
+                experts,
+            })
+    }
+
     /// Every invariant the rows break, re-derived from the rows themselves:
     /// each tensor placed once; an expert stack's segments cover every expert
     /// once and a whole tensor is one segment; a card segment's buffers sum to
@@ -3840,6 +3884,55 @@ mod tests {
             ),
             Err(e) => panic!("{e}, not HostRoutedTier"),
             Ok(_) => panic!("the host-routed planner accepted a tier card"),
+        }
+    }
+
+    /// A layer's host experts are the model's less the stage card's and the
+    /// tier's, they sum to the plan's host experts, a layer the two cards
+    /// hold whole hosts none, and a layer past the plan's counts or cards
+    /// that hold more than the model has are refused by name.
+    #[test]
+    fn a_layers_host_experts_are_the_models_less_the_cards() {
+        let model = layered(3);
+        let machine = |stage: u64, tier: u64| Machine {
+            cards: vec![bytes_card("stage", HEAD + stage * EXPERT, 0..3)],
+            tiers: vec![bytes_card("tier", tier * EXPERT, 0..0)],
+            host: host(),
+            unified: None,
+        };
+        let hosted = |plan: &Plan<'_>| -> Vec<u64> {
+            (0..model.layers)
+                .map(|l| plan.host_experts(l).expect("a layer of the plan"))
+                .collect()
+        };
+        let (small, big) = (machine(5, 4), machine(20, 4));
+        let part = plan_with(&model, &small, 4096, &NoKv, None).expect("a tier with work");
+        let want: Vec<u64> = (0..model.layers)
+            .map(|l| model.experts - part.n_l[l] - part.tier_n_l[0][l])
+            .collect();
+        assert_eq!(hosted(&part), want);
+        assert_eq!(hosted(&part).iter().sum::<u64>(), part.host.experts);
+        assert!(part.host.experts > 0);
+        let whole = plan_with(&model, &big, 4096, &NoKv, None).expect("two cards");
+        assert_eq!(hosted(&whole), vec![0; model.layers]);
+        assert_eq!(whole.host.experts, 0);
+        match part.host_experts(model.layers) {
+            Err(e @ PlacementError::LayerPastCounts { .. }) => assert_eq!(
+                e.to_string(),
+                "layer 3 is past the plan's per-layer expert counts (3 layers)"
+            ),
+            other => panic!("{other:?}, not LayerPastCounts"),
+        }
+        let mut over = part.clone();
+        over.n_l[1] = 5;
+        over.tier_n_l[0][1] = 4;
+        match over.host_experts(1) {
+            Err(e @ PlacementError::LayerOverHeld { .. }) => assert_eq!(
+                e.to_string(),
+                "layer 1: the stage card holds 5 experts and the tier cards 4, past the \
+                 model's 8"
+            ),
+            other => panic!("{other:?}, not LayerOverHeld"),
         }
     }
 

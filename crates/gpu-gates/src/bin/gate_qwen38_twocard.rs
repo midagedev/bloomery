@@ -539,23 +539,6 @@ mod gate {
             .unwrap_or_default()
     }
 
-    /// The experts the host serves on layer `l` of `plan`: the model's per
-    /// layer, less the stage card's and each tier's.
-    fn host_experts(plan: &Plan<'_>, l: usize) -> Result<u64, GateError> {
-        let past = || format!("layer {l} is past the plan's per-layer expert counts");
-        let mut held = *plan.n_l.get(l).ok_or_else(past)?;
-        for tier in &plan.tier_n_l {
-            held += *tier.get(l).ok_or_else(past)?;
-        }
-        plan.model.experts.checked_sub(held).ok_or_else(|| {
-            format!(
-                "layer {l}: the cards hold {held} experts of the model's {}",
-                plan.model.experts
-            )
-            .into()
-        })
-    }
-
     /// `--union`'s structure and precondition lines over the tier load `s`
     /// and the two runs; `reference` is the plan the reference loaded.
     fn structure(
@@ -571,8 +554,8 @@ mod gate {
         // fewer than all its experts and keeps the leg.
         let hosted = layers
             .iter()
-            .map(|&l| host_experts(reference, l))
-            .collect::<Result<Vec<u64>, GateError>>()?;
+            .map(|&l| reference.host_experts(l))
+            .collect::<Result<Vec<u64>, _>>()?;
         let unhosted = hosted.iter().filter(|&&n| n == 0).count();
         let stage: Vec<usize> = want
             .stage_nodes
