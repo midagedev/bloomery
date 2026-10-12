@@ -177,13 +177,16 @@ impl DraftHparams {
 /// The draft file's geometry as the common DSpark owner reads it. V4.1's
 /// target taps are the rows entering each `target_layers` entry (the mean of
 /// the four hyper-connection streams the layer before leaves), so its taps are
-/// the file's list as it stands. The head scores the target's own ids; the
-/// file carries `conf_proj` among its required tensors. Pass the result to
+/// the file's list as it stands. The block is `[id_last, mask × (w − 1)]`
+/// and row 0's output drafts id 0, so `w` ids take `w` rows
+/// (`row0_drafts`). The head scores the target's own ids; the file carries
+/// `conf_proj` among its required tensors. Pass the result to
 /// `DsparkShape::check` before use.
 #[must_use]
 pub fn shape(hp: &DraftHparams) -> DsparkShape {
     DsparkShape {
         block: hp.block_size,
+        row0_drafts: true,
         taps: hp.target_layers.clone(),
         hidden: hp.n_embd,
         vocab: DraftVocab::Full { n: hp.n_vocab },
@@ -246,6 +249,9 @@ mod tests {
         let hp = hparams();
         let s = shape(&hp);
         assert_eq!(s.block, 5);
+        assert!(s.row0_drafts);
+        assert_eq!(s.ids_per_block(), 5);
+        assert_eq!(s.rows(3), 3);
         assert_eq!(s.taps, [2, 20, 38]);
         assert_eq!(s.hidden, 4096);
         assert_eq!(s.vocab, DraftVocab::Full { n: 129_280 });
