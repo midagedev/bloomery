@@ -976,6 +976,9 @@ pub struct Plan<'a> {
     /// The card byte budget the plan was made under: every card planned
     /// with `min(usable, budget)` usable bytes ([`Plan::usable_bytes`]).
     pub card_budget: Option<u64>,
+    /// The card budget is the one [`plan_in_pool`] lowered to the NVMe
+    /// expert tier's floor, not one the caller gave.
+    pub budget_from_pool: bool,
 }
 
 /// Why a placement could not be built; each variant names what it refused.
@@ -1050,6 +1053,19 @@ pub enum PlacementError {
          (the arena takes at most room − floor): lower the arena, or free host memory"
     )]
     NvTierArena { arena: u64, room: u64, floor: u64 },
+    /// A unified machine's plan the NVMe expert tier's floor refused at the
+    /// cards' full share, planned again under lowered card budgets
+    /// ([`plan_in_pool`]) and refused at the last: the rounds, the last
+    /// budget and the last refusal.
+    #[error(
+        "on a unified pool the cards' share was lowered {rounds} times, to a card budget of \
+         {budget} B, and the plan is still refused: {last}"
+    )]
+    PoolBudget {
+        rounds: u32,
+        budget: u64,
+        last: Box<PlacementError>,
+    },
     /// An arena the lever `BLOOMERY_NVTIER_BYTES` names under the arena's
     /// floor ([`ArenaFloor`]): a call would name more distinct ids of a
     /// paged layer than it has slots.
@@ -1948,12 +1964,14 @@ fn footprint(
 
 /// The placement's levers, which a binary parses once
 /// ([`PlanLevers::from_levers`]): the card budget `BLOOMERY_CARD_BUDGET`
-/// sets. The default is none: each card's own usable bytes.
+/// sets. The default is none: each card's own usable bytes, or on a unified
+/// pool the budget [`plan_in_pool`] lowers to the NVMe expert tier's floor.
 #[derive(Clone, Debug, Default)]
 pub struct PlanLevers {
     /// The card budget `BLOOMERY_CARD_BUDGET` sets, in bytes: every card of
     /// the plan plans with `min(usable, budget)`; `None` unset, each card's
-    /// own usable bytes.
+    /// own usable bytes, or on a unified pool the budget [`plan_in_pool`]
+    /// lowers to the NVMe expert tier's floor.
     pub card_budget_bytes: Option<u64>,
 }
 
@@ -3326,6 +3344,85 @@ pub fn expert_nvme_tier(
     Ok(())
 }
 
+/// The rounds [`plan_in_pool`] lowers the card budget before it refuses by
+/// name. A round lowers the budget by at least a [`workstation::GRANULE`],
+/// and a shortfall under one expert's card bytes takes a round a granule
+/// until an expert leaves the card, so the rounds cover an expert of 128 MiB;
+/// a plan still short past them meets a floor that falls too slowly for a
+/// load to wait on.
+const POOL_ROUNDS: u32 = 64;
+
+/// The plan `make` builds under `levers` (the placement, then the NVMe
+/// expert tier's split, [`expert_nvme_tier`]); on a unified machine whose
+/// cards' share leaves the host's room under the tier's floor
+/// ([`PlacementError::HostRoomFloor`]), the same plan under a card budget
+/// lowered until the floor holds, marked [`Plan::budget_from_pool`]. The
+/// cards and the host read one pool, and the cards' share is a host term of
+/// the floor ([`HostTotals::pool_card_bytes`]); the experts the cards give
+/// up are the host's, so the floor falls by less than the budget does. Each
+/// round lowers the budget by the shortfall its refusal names, at least a
+/// [`workstation::GRANULE`]. The card keeps each layer's id prefix, as under
+/// any budget.
+///
+/// A plan under a given budget (`BLOOMERY_CARD_BUDGET`), a plan of a machine
+/// whose cards have memory of their own, and a shortfall past the card's
+/// whole budget are the first plan's result. A lowered budget the plan
+/// refuses for another reason, a budget that runs out, and a floor still
+/// unmet after [`POOL_ROUNDS`] rounds are refused by name
+/// ([`PlacementError::PoolBudget`]).
+pub fn plan_in_pool<'a>(
+    machine: &Machine,
+    levers: &PlanLevers,
+    mut make: impl FnMut(&PlanLevers) -> Result<Plan<'a>, PlacementError>,
+) -> Result<Plan<'a>, PlacementError> {
+    let first = make(levers);
+    let (Some(_), None, Some(card)) = (
+        machine.unified,
+        levers.card_budget_bytes,
+        machine.cards.first(),
+    ) else {
+        return first;
+    };
+    let mut short = match &first {
+        Err(PlacementError::HostRoomFloor { room, floor, .. }) => floor.saturating_sub(*room),
+        _ => return first,
+    };
+    let mut budget = capped(card, None);
+    let mut last = None;
+    for round in 1..=POOL_ROUNDS {
+        let Some(lower) = budget.checked_sub(short.max(workstation::GRANULE.get())) else {
+            break;
+        };
+        budget = lower;
+        let refused = match make(&PlanLevers {
+            card_budget_bytes: Some(budget),
+        }) {
+            Ok(mut plan) => {
+                plan.budget_from_pool = true;
+                return Ok(plan);
+            }
+            Err(e) => e,
+        };
+        let PlacementError::HostRoomFloor { room, floor, .. } = refused else {
+            return Err(PlacementError::PoolBudget {
+                rounds: round,
+                budget,
+                last: Box::new(refused),
+            });
+        };
+        short = floor.saturating_sub(room);
+        last = Some((round, refused));
+    }
+    match last {
+        None => first,
+        Some((rounds, refused)) => Err(PlacementError::PoolBudget {
+            rounds,
+            budget,
+            last: Box::new(refused),
+        }),
+    }
+}
+
 /// The per-device sums of a finished set of rows; `kv_bytes` is, per card of
 /// [`Machine::all_cards`], its layers' cache and their ring shadows, which
 /// the host holds; `counts` the stage cards' `n_l` and the tiers'.
@@ -3445,6 +3542,7 @@ fn totals<'a>(
         n_l,
         tier_n_l,
         card_budget,
+        budget_from_pool: false,
     }
 }
 
@@ -3774,6 +3872,166 @@ mod tests {
         // The call's term moves with the lane's slots too: k ids and the lane.
         let call = ArenaFloor::new(40, 1, ARENA_LANE_SLOTS, 1).expect("a floor");
         assert_eq!(call.slots, 40 + lane_threads + 1);
+    }
+
+    /// A plan of no rows under `budget`, for a planner [`plan_in_pool`]
+    /// calls: only its budget is read.
+    fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -> Plan<'a> {
+        Plan {
+            model,
+            machine,
+            ctx_max: 1,
+            rows: Vec::new(),
+            cards: Vec::new(),
+            host: HostTotals {
+                expert_bytes: 0,
+                experts: 0,
+                nvme_expert_bytes: 0,
+                nvme_arena_bytes: 0,
+                arena_columns: 1,
+                table_bytes: 0,
+                shadow_bytes: 0,
+                reserve_bytes: 0,
+                row_reserve_bytes: 0,
+                pool_card_bytes: 0,
+                headroom_bytes: 0,
+                room: None,
+            },
+            nvme_bytes: 0,
+            n_l: Vec::new(),
+            tier_n_l: Vec::new(),
+            card_budget: Some(budget),
+            budget_from_pool: false,
+        }
+    }
+
+    /// [`plan_in_pool`] on a planner whose floor passes the room by
+    /// `short(budget)` B: on a unified machine with no given budget each
+    /// round lowers the budget by the shortfall the last refusal named, at
+    /// least a granule, and the plan that fits is marked as the pool's, so
+    /// the host's refusal does not name a lever no one set. A discrete card,
+    /// a given budget and a shortfall past the card's whole budget are the
+    /// first plan's result; a lowered budget refused for another reason, a
+    /// budget that runs out and a floor unmet after [`POOL_ROUNDS`] rounds
+    /// are refused by name, with the rounds, the budget and the last refusal.
+    #[test]
+    fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
+        const ROOM: u64 = 100 << 30;
+        const POOL: u64 = 64 << 30;
+        let granule = workstation::GRANULE.get();
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 1,
+            experts: 1,
+            experts_used: 1,
+        };
+        let pool = |unified: bool| {
+            let mut c = card("GB10", 0..1, true, true);
+            c.usable_bytes = 120 << 30;
+            c.free_bytes = Some(POOL);
+            Machine {
+                cards: vec![c],
+                tiers: Vec::new(),
+                host: Host {
+                    usable_bytes: POOL,
+                    reserves: Vec::new(),
+                },
+                unified: unified.then_some(UnifiedPool { bytes: POOL }),
+            }
+        };
+        let floor = |short: u64| PlacementError::HostRoomFloor {
+            room: ROOM,
+            floor: ROOM + short,
+            base: 0,
+            layer: 0,
+            need: 0,
+            arena: None,
+        };
+        // Every budget the planner is called with, and its result: refused
+        // by `short(budget)` B over the room, or for another reason at and
+        // under `other_at`.
+        let run = |m: &Machine, levers: &PlanLevers, short: &dyn Fn(u64) -> u64, other_at: u64| {
+            let mut calls = Vec::new();
+            let got = plan_in_pool(m, levers, |l| {
+                let budget = capped(&m.cards[0], l.card_budget_bytes);
+                calls.push(l.card_budget_bytes);
+                if budget <= other_at {
+                    return Err(PlacementError::HostRoom("other".to_string()));
+                }
+                match short(budget) {
+                    0 => Ok(budget_plan(&model, m, budget)),
+                    s => Err(floor(s)),
+                }
+            });
+            (got.map(|p| (p.card_budget, p.budget_from_pool)), calls)
+        };
+        let (on, off) = (pool(true), pool(false));
+        let unset = PlanLevers::default();
+        let full = capped(&on.cards[0], None);
+        assert_eq!(full, POOL + on.cards[0].context_in_free());
+
+        // A shortfall that falls by half the bytes the budget gives up: the
+        // first round lowers by it, the next by the half left, and a
+        // shortfall under a granule by a granule.
+        let fit = full - (8 << 30);
+        let halves = |b: u64| b.saturating_sub(fit).div_ceil(2);
+        let (got, calls) = run(&on, &unset, &halves, 0);
+        let mut want = vec![None];
+        let mut b = full;
+        while halves(b) > 0 {
+            b -= halves(b).max(granule);
+            want.push(Some(b));
+        }
+        assert_eq!(calls, want);
+        assert!(calls.len() > 3, "{calls:?}");
+        assert_eq!(got.expect("the lowered plan"), (Some(b), true));
+        let need = |from_pool| {
+            let mut p = budget_plan(&model, &on, b);
+            p.budget_from_pool = from_pool;
+            workstation::HostNeed::of(&p, 0).card_budget
+        };
+        assert!(!need(true) && need(false));
+
+        // The first plan's result: a discrete card, a given budget, a
+        // shortfall past the card's whole budget.
+        let given = PlanLevers {
+            card_budget_bytes: Some(96 << 30),
+        };
+        for (m, levers, short) in [(&off, &unset, 1), (&on, &given, 1), (&on, &unset, full + 1)] {
+            let (got, calls) = run(m, levers, &|_| short, 0);
+            assert!(matches!(got, Err(PlacementError::HostRoomFloor { .. })));
+            assert_eq!(calls.len(), 1);
+        }
+
+        // Refused by name: another refusal of a lowered budget, a budget
+        // that runs out, a floor still unmet after the rounds.
+        let pooled = |got: Result<_, PlacementError>| match got {
+            Err(PlacementError::PoolBudget {
+                rounds,
+                budget,
+                last,
+            }) => (rounds, budget, *last),
+            other => panic!("not refused by name: {other:?}"),
+        };
+        let (rounds, budget, last) = pooled(run(&on, &unset, &|_| 1 << 30, full - (1 << 30)).0);
+        assert_eq!((rounds, budget), (1, full - (1 << 30)));
+        assert!(matches!(last, PlacementError::HostRoom(_)));
+        let (rounds, budget, last) = pooled(run(&on, &unset, &|b| b / 2 + 1, 0).0);
+        assert!(rounds > 1 && budget < full, "{rounds} {budget}");
+        assert!(matches!(last, PlacementError::HostRoomFloor { .. }));
+        let (got, calls) = run(&on, &unset, &|_| 1, 0);
+        let (rounds, budget, last) = pooled(got);
+        assert_eq!(rounds, POOL_ROUNDS);
+        assert_eq!(budget, full - u64::from(POOL_ROUNDS) * granule);
+        assert_eq!(calls.len(), 1 + POOL_ROUNDS as usize);
+        assert!(matches!(last, PlacementError::HostRoomFloor { .. }));
+        let text = PlacementError::PoolBudget {
+            rounds,
+            budget,
+            last: Box::new(last),
+        }
+        .to_string();
+        assert!(text.contains("lowered 64 times"), "{text}");
     }
 
     /// A card running `layers`, with the head and the token embedding as

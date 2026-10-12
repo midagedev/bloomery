@@ -621,22 +621,25 @@ impl PlanInputs {
         let n = slots as u64;
         let beside = terms.plan_beside(n);
         let front = prompt_reserve_bytes(self, ctx_max, !machine.tiers.is_empty());
-        let mut plan = placement::plan_routed_reserving(
-            &self.model,
-            machine,
-            ctx_max,
-            &terms.slots_of(n),
-            levers,
-            routed_rule(Program::Glm5nextBody),
-            front.saturating_add(beside),
-        )?;
-        // The bytes beside the stores ride the stage card's KV term, out of
-        // the budget reserved above, so the card's bound holds them.
-        if let Some(t) = plan.cards.first_mut() {
-            t.grow_kv(beside);
-        }
-        let room = plan.plan_at(&self.room);
-        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+        let plan = placement::plan_in_pool(machine, levers, |levers| {
+            let mut plan = placement::plan_routed_reserving(
+                &self.model,
+                machine,
+                ctx_max,
+                &terms.slots_of(n),
+                levers,
+                routed_rule(Program::Glm5nextBody),
+                front.saturating_add(beside),
+            )?;
+            // The bytes beside the stores ride the stage card's KV term, out
+            // of the budget reserved above, so the card's bound holds them.
+            if let Some(t) = plan.cards.first_mut() {
+                t.grow_kv(beside);
+            }
+            let room = plan.plan_at(&self.room);
+            placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+            Ok(plan)
+        })?;
         // The front stays beside the plan's terms (`refuse_front` holds it to
         // the card), so a unified pool counts it beside them.
         let plan = checked_beside(plan, front).map_err(PlaceError::Broken)?;
@@ -963,35 +966,38 @@ impl PlanInputs {
         let front = prompt_reserve_bytes(self, ctx_max, !machine.tiers.is_empty());
         let nextn_card = nextn_card_bytes(&draft.cards[0]);
         let reserve = (nextn_card + arena + front).saturating_add(beside);
-        let mut plan = placement::plan_routed_reserving(
-            &self.model,
-            machine,
-            ctx_max,
-            &terms.slots_of(n),
-            levers,
-            routed_rule(Program::Glm5nextBody),
-            reserve,
-        )?;
-        // The bytes beside the stores ride the stage card's KV term, as
-        // [`PlanInputs::plan_slots`] counts them.
-        plan.cards[0].grow_kv(beside);
         // The draft layer's routed experts are the host's beside the trunk's,
         // a plan of their own: the trunk splits at the room they leave.
         let draft_host = draft.host.expert_bytes;
-        let planned_at = plan.plan_at(&self.room);
-        let room = planned_at.checked_sub(draft_host).ok_or_else(|| {
-            PlacementError::HostRoom(format!(
-                "the NextN layer's routed experts, {draft_host} B, pass the host room {planned_at} B"
-            ))
+        let plan = placement::plan_in_pool(machine, levers, |levers| {
+            let mut plan = placement::plan_routed_reserving(
+                &self.model,
+                machine,
+                ctx_max,
+                &terms.slots_of(n),
+                levers,
+                routed_rule(Program::Glm5nextBody),
+                reserve,
+            )?;
+            // The bytes beside the stores ride the stage card's KV term, as
+            // [`PlanInputs::plan_slots`] counts them.
+            plan.cards[0].grow_kv(beside);
+            let planned_at = plan.plan_at(&self.room);
+            let room = planned_at.checked_sub(draft_host).ok_or_else(|| {
+                PlacementError::HostRoom(format!(
+                    "the NextN layer's routed experts, {draft_host} B, pass the host room {planned_at} B"
+                ))
+            })?;
+            placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+            // A split plan's headroom is what the room it ran at left, a room
+            // short of the draft's experts. An unsplit plan's headroom never
+            // took them out; the split one's gets them back, so the load,
+            // which hosts them beside the plan, takes them out once.
+            if plan.host.nvme_expert_bytes > 0 {
+                plan.host.headroom_bytes += i128::from(draft_host);
+            }
+            Ok(plan)
         })?;
-        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
-        // A split plan's headroom is what the room it ran at left, a room
-        // short of the draft's experts. An unsplit plan's headroom never took
-        // them out; the split one's gets them back, so the load, which hosts
-        // them beside the plan, takes them out once.
-        if plan.host.nvme_expert_bytes > 0 {
-            plan.host.headroom_bytes += i128::from(draft_host);
-        }
         let total = card_terms(&plan.cards[0]) + nextn_card + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
@@ -1486,8 +1492,8 @@ mod tests {
         use crate::placement::churn::ChurnPool;
         use crate::placement::workstation::{HostNeed, HostRead};
         use crate::placement::{
-            Card, Host, Machine, ModelTensor, ModelTensors, Node, Plan, PlanLevers, Role,
-            UnifiedPool, Violation,
+            Card, Host, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers,
+            Role, UnifiedPool, Violation,
         };
 
         const LAYERS: usize = 4;
@@ -1929,6 +1935,84 @@ mod tests {
                     .and_then(|pool| pool.check_beside(&np.plan, beside))
                     .map_err(|e| e.to_string());
                 assert_eq!((np.host_headroom_bytes, left), (want, Ok(want)), "{room} B");
+            }
+        }
+
+        /// On one pool whose card fill leaves the host under the NVMe tier's
+        /// floor, the plain plan and the plan with the next-token layer, at
+        /// one and two slots, are made under a card budget lowered to the
+        /// floor ([`crate::placement::plan_in_pool`]): the card keeps fewer
+        /// experts, the rest page through the tier, and the budget is marked
+        /// as the pool's. The same room under the card's whole bytes as a
+        /// given budget is the floor's refusal, and a room under the
+        /// next-token layer's routed experts is refused by name before any
+        /// budget is tried.
+        #[test]
+        fn slot_plans_on_one_pool_lower_the_card_budget_to_the_tiers_floor() {
+            let unset = PlanLevers::default();
+            let whole = PlanLevers {
+                card_budget_bytes: Some(u64::MAX),
+            };
+            let nextn = nextn();
+            let draft = nextn.model.tensors[1].file_bytes;
+            let pool: u64 = 15 << 29;
+            let lowered =
+                |at: &str, plan: Result<Plan<'_>, PlaceError>, floor: &dyn Fn() -> Option<u64>| {
+                    let plan = plan.unwrap_or_else(|e| panic!("{at}: {e}"));
+                    assert!(plan.budget_from_pool, "{at}: the pool's budget");
+                    assert!(plan.host.nvme_expert_bytes > 0, "{at}: paged experts");
+                    assert!(plan.n_l.iter().any(|&n| n > 0), "{at}: card experts");
+                    let budget = plan.card_budget.expect("a card budget");
+                    assert!(budget < pool, "{at}: {budget} B, not under the pool");
+                    assert!(
+                        floor().is_some(),
+                        "{at}: the whole budget's plan is not the floor's refusal"
+                    );
+                };
+            let refused = |p: Result<u64, PlaceError>| match p {
+                Err(PlaceError::Placement(PlacementError::HostRoomFloor {
+                    room, floor, ..
+                })) => {
+                    assert!(floor > room);
+                    Some(floor)
+                }
+                _ => None,
+            };
+            for n in [1, 2] {
+                let m = unified(pool);
+                let i = routed(pool);
+                lowered(
+                    &format!("{n} slot(s)"),
+                    i.plan_slots(&m, CTX, &unset, KdaLanes::One, n),
+                    &|| {
+                        refused(
+                            i.plan_slots(&m, CTX, &whole, KdaLanes::One, n)
+                                .map(|p| p.ctx_max),
+                        )
+                    },
+                );
+                let m = unified(pool + draft);
+                let i = routed(pool + draft);
+                lowered(
+                    &format!("{n} slot(s) with the next-token layer"),
+                    i.plan_nextn_slots(&m, CTX, &unset, &nextn, n)
+                        .map(|p| p.plan),
+                    &|| {
+                        refused(
+                            i.plan_nextn_slots(&m, CTX, &whole, &nextn, n)
+                                .map(|p| p.plan.ctx_max),
+                        )
+                    },
+                );
+                match routed(draft - 1).plan_nextn_slots(&m, CTX, &unset, &nextn, n) {
+                    Err(PlaceError::Placement(PlacementError::HostRoom(e))) => {
+                        assert!(e.contains(&draft.to_string()), "{e}");
+                    }
+                    other => panic!(
+                        "a room under the draft's experts: {:?}",
+                        other.map(|p| p.plan.card_budget)
+                    ),
+                }
             }
         }
     }

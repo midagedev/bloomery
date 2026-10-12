@@ -251,7 +251,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: CARD_BUDGET,
         class: Class::C,
         kind: Kind::Bytes,
-        default: Unset::Means("each card's own usable bytes"),
+        default: Unset::Means(
+            "each card's own usable bytes, or on a unified pool the budget that leaves the NVMe \
+             tier's floor",
+        ),
         doc: "Placement: every card of a plan plans with `min(usable, budget)` usable \
               bytes, so a large card stands in for a smaller one; a budget below a card's \
               floor is refused with each term. `M` and `G` are binary units. The `plan` \

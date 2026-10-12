@@ -195,6 +195,7 @@ mod tests {
             n_l: Vec::new(),
             tier_n_l: Vec::new(),
             card_budget: None,
+            budget_from_pool: false,
         }
     }
 

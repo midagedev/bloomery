@@ -572,7 +572,9 @@ pub struct HostNeed {
     /// has memory of its own.
     pub cards: u64,
     pub os: u64,
-    /// The plan was made under a card budget.
+    /// The plan was made under a card budget the caller gave
+    /// (`BLOOMERY_CARD_BUDGET`), not one [`crate::placement::plan_in_pool`]
+    /// lowered to the NVMe expert tier's floor.
     pub card_budget: bool,
 }
 
@@ -584,7 +586,7 @@ impl HostNeed {
         HostNeed::of_totals(
             plan.machine.host(),
             &plan.host,
-            plan.card_budget.is_some(),
+            plan.card_budget.is_some() && !plan.budget_from_pool,
             extra,
         )
     }

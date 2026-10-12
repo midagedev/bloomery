@@ -174,9 +174,13 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         let kv = self.seq_terms().slots_of(slots.get() as u64);
         let rule = routed_rule(Program::Deepseek41Chain);
-        let mut plan = placement::plan_routed(&self.model, machine, ctx_max, &kv, levers, rule)?;
-        let room = plan.plan_at(&self.room);
-        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+        let plan = placement::plan_in_pool(machine, levers, |levers| {
+            let mut plan =
+                placement::plan_routed(&self.model, machine, ctx_max, &kv, levers, rule)?;
+            let room = plan.plan_at(&self.room);
+            placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+            Ok(plan)
+        })?;
         checked(plan).map_err(PlaceError::Broken)
     }
 

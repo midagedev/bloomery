@@ -17,6 +17,10 @@
 //! A6000 under the 3090's budget plans the gate placement's experts, and a
 //! budget below the dense floor is refused.
 //!
+//! A fourth plans the file on a DGX Spark's unified pool, where the card's
+//! full share leaves the host under the NVMe expert tier's floor: the plan is
+//! made under a card budget lowered to that floor.
+//!
 //! Synthetic contracts need no file and run in the fast loop: a tensor
 //! its role puts on a card, of a type with no card format, is refused by
 //! name, while a routed stack of such a type stays on the host; a dense FFN
@@ -31,13 +35,16 @@
 //! gate (`gate_load_v41`) plans from too.
 
 use std::fmt::Write as _;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::Range;
 
 use gguf::{GgmlType, Split, Value};
+use model::arch::deepseek41::place::{PlaceError, PlanInputs as V41Inputs};
 use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
 use model::arch::dspark::{self, DraftCardBytes};
 use model::placement::accepts::{Program, routed_rule};
+use model::placement::devices::{DeviceInfo, spec_of_device};
+use model::placement::workstation::HostRead;
 use model::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, KvBytes, Machine, ModelTensor,
     ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, workstation,
@@ -1045,6 +1052,71 @@ fn hw_placement_card_budget_is_usable_bytes() {
         bad.len(),
         bad.join("\n  ")
     );
+}
+
+/// A DGX Spark's GB10 as the census read it at a V4.1 load's start: its
+/// free bytes, the pool the card and the host share [measured].
+const GB10_FREE: u64 = 124_228_505_600;
+
+/// The file on a GB10's pool ([`GB10_FREE`]), its room that pool less the
+/// drift a read room is planned at: at the card's full share the host's room
+/// is under the NVMe expert tier's floor, and the load of one and of two
+/// resident sequences is planned under a card budget lowered to the floor
+/// ([`placement::plan_in_pool`]), clean, the card keeping experts and the
+/// rest paging through the tier. The same room under the card's whole bytes
+/// as a given budget is the floor's refusal.
+#[test]
+#[ignore = "hw: needs the V4.1 shards on the box"]
+fn hw_placement_unified_pool_lowers_the_card_budget() {
+    let (split, _, _) = open();
+    let free = GB10_FREE;
+    let spec = spec_of_device(&DeviceInfo {
+        ordinal: 0,
+        name: "NVIDIA GB10".to_string(),
+        total_bytes: 130_661_761_024,
+        free_bytes: free,
+        integrated: true,
+        uuid: [0x10; 16],
+        pci_bus: "000f:01:00.0".to_string(),
+        held_by: None,
+    });
+    let room = (free - workstation::HOST_DRIFT, HostRead::Given);
+    let inputs =
+        V41Inputs::describe_in(&split, room).unwrap_or_else(|e| panic!("plan inputs: {e}"));
+    let machine = workstation::plan_on(spec, inputs.model.layers);
+    let whole = PlanLevers {
+        card_budget_bytes: Some(u64::MAX),
+    };
+    let mut bad = Vec::new();
+    for slots in [NonZeroUsize::MIN, NonZeroUsize::new(2).expect("two")] {
+        let ctx = workstation::CTX_MAX;
+        match inputs.plan_with_slots(&machine, ctx, &whole, slots) {
+            Err(PlaceError::Placement(PlacementError::HostRoomFloor { room, floor, .. })) => {
+                println!("{slots} slot(s), the card's whole bytes: room {room} B, floor {floor} B");
+            }
+            other => bad.push(format!(
+                "{slots} slot(s), the card's whole bytes: not the floor's refusal: {:?}",
+                other.map(|p| p.card_budget)
+            )),
+        }
+        match inputs.plan_with_slots(&machine, ctx, &PlanLevers::default(), slots) {
+            Ok(plan) => {
+                let experts = plan.cards[0].experts;
+                println!(
+                    "{slots} slot(s): card_budget {:?} card experts {experts} paged {} B",
+                    plan.card_budget, plan.host.nvme_expert_bytes
+                );
+                if !plan.budget_from_pool || experts == 0 || plan.host.nvme_expert_bytes == 0 {
+                    bad.push(format!(
+                        "{slots} slot(s): from the pool {}, card experts {experts}, paged {} B",
+                        plan.budget_from_pool, plan.host.nvme_expert_bytes
+                    ));
+                }
+            }
+            Err(e) => bad.push(format!("{slots} slot(s): {e}")),
+        }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }
 
 /// No KV cache: the synthetic models' cards hold only their tensors.
