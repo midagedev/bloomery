@@ -1471,7 +1471,7 @@ mod gate {
                 census
                     .iter()
                     .find(|d| s.device.is_some_and(|dev| dev.uuid == d.uuid))
-                    .map(|d| d.name.replace(' ', "_"))
+                    .map(|d| bloomery_gpu_gates::record::name_token(&d.name))
                     .ok_or_else(|| format!("{}: no census device is the plan's", s.name).into())
             })
             .collect()

@@ -773,7 +773,7 @@ impl Gate {
         );
         ok &= check(
             &format!("{tag}_vision_record_is_the_towers"),
-            rec.word("card")? == want.name.replace(' ', "_")
+            rec.word("card")? == bloomery_gpu_gates::record::name_token(&want.name)
                 && rec.word("seat")? == want.word()
                 && rec.u64("weights")? == im.proj.card.weights
                 && rec.u64("scratch")? == im.proj.card.scratch

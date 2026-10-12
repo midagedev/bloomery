@@ -1786,8 +1786,11 @@ mod gate {
                 .filter(|d| !on_plan(&d.uuid))
                 .min_by_key(|d| (d.total_bytes, d.ordinal))
             {
-                Some(d) => (d.name.replace(' ', "_"), "off-plan"),
-                None => (specs[0].name.replace(' ', "_"), "stage-reserve"),
+                Some(d) => (bloomery_gpu_gates::record::name_token(&d.name), "off-plan"),
+                None => (
+                    bloomery_gpu_gates::record::name_token(specs[0].name),
+                    "stage-reserve",
+                ),
             },
         )
     }

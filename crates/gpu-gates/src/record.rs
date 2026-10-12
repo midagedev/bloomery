@@ -3716,6 +3716,14 @@ pub fn with_room(r: Record, room: Option<(u64, u64)>) -> Record {
     }
 }
 
+/// A name as one record token: each space becomes `_`, so the name stays one
+/// value of a `key=value` line or one file name (`NVIDIA RTX A6000` →
+/// `NVIDIA_RTX_A6000`). The one rule for every record and file name that
+/// carries a card's device name, and for the rope gate's tensor-row names.
+pub fn name_token(name: &str) -> String {
+    name.replace(' ', "_")
+}
+
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
 /// card counts' range, the budget, and the NVMe tier's terms (the bytes paged,
@@ -4929,6 +4937,12 @@ mod tests {
     }
 
     // ------------------------------------------------------------ the reader
+
+    #[test]
+    fn a_name_token_is_its_name_with_underscores() {
+        assert_eq!(super::name_token("NVIDIA RTX A6000"), "NVIDIA_RTX_A6000");
+        assert_eq!(super::name_token("3090"), "3090");
+    }
 
     /// Lines the servers printed, as the serve gates' logs carry them.
     const PLAN38_PLACED: &str = "plan place=cuda0 card=3090 arch=qwen35moe experts=card \

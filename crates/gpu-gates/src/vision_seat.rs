@@ -1040,7 +1040,7 @@ pub fn record(
     load_s: f64,
 ) -> Record {
     Record::new(&record::VISION)
-        .w("card", seat.name.replace(' ', "_"))
+        .w("card", record::name_token(&seat.name))
         .w("seat", seat.word())
         .u("weights", weights)
         .u("scratch", scratch)
@@ -1071,7 +1071,7 @@ fn seat_line(at: &Opened, seat: &str, dropped: Option<&Costs>) -> Record {
         _ => (0, 0),
     };
     let line = Record::new(&record::VISION_SEAT)
-        .w("card", at.seat.name.replace(' ', "_"))
+        .w("card", record::name_token(&at.seat.name))
         .w("seat", seat)
         .u("reserve", at.seat.reserve.unwrap_or(0))
         .u("weights", at.card.weights)
@@ -1284,7 +1284,7 @@ mod tests {
             format!(
                 "vision_seat card={} seat=stage-reserve reserve={BYTES} weights=1000000000 \
                  scratch=476000000 cap=4096 cost_experts=0 cost_ctx=0",
-                A6000.name.replace(' ', "_")
+                record::name_token(A6000.name)
             )
         );
         assert_eq!(BYTES, stage.card.total());
@@ -1405,7 +1405,7 @@ mod tests {
         let head = format!(
             "vision_seat card={} seat=not-loaded reserve={BYTES} weights=1000000000 \
              scratch=476000000 cap=4096",
-            A6000.name.replace(' ', "_")
+            record::name_token(A6000.name)
         );
         assert_eq!(
             said(cost_of(placed(940, 4096), Ok(placed(727, 4096)))),

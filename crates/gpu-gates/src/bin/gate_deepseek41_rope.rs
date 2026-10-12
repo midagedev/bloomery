@@ -374,7 +374,7 @@ mod gate {
         let name = match site {
             Site::IndexKey => format!(
                 "{}/{}->{}",
-                row.name.trim().replace(' ', "_"),
+                bloomery_gpu_gates::record::name_token(row.name.trim()),
                 row.occurrence,
                 consumer(man, at)
             ),

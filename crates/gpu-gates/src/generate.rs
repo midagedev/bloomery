@@ -644,7 +644,7 @@ pub fn card_words(
         )
         .into());
     }
-    Ok(devices.iter().map(|d| d.replace(' ', "_")).collect())
+    Ok(devices.iter().map(|d| record::name_token(d)).collect())
 }
 
 /// `r`, a `load` record ([`record::LOAD_GENERATOR`]) written up to its
