@@ -16,10 +16,14 @@
 //! The file is checked against [`dspark::inventory`] before anything is
 //! uploaded: an absent, misshapen or unread tensor is refused by name.
 
+use std::sync::Arc;
+
+use bloomery_gpu::dspark::head::HeadWeights;
+use bloomery_gpu::dspark::{EmbedSource, FcWeights, HeadSource, Q8Rows, TargetHead};
 use bloomery_gpu::mxfp4_sel::MxStack;
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, GpuError};
-use cuda_core::{CudaStream, DeviceBuffer};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
+use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::names as target_names;
@@ -28,6 +32,8 @@ use model::arch::models::shape::{MoeShape, rules, select_router};
 use model::embed::RowLayout;
 use model::placement::CardFormat;
 
+use super::head::projection;
+use super::layers::V41Layers;
 use crate::experts_mxfp4::ROUTER_ROW;
 use crate::markov::MARKOV_ROW_WORDS;
 
@@ -541,6 +547,19 @@ impl DraftWeights {
         &self.buffers
     }
 
+    /// Card bytes of the tensors the layers keep: every tensor of
+    /// [`DraftWeights::table`] but the ones the common owner holds
+    /// ([`owner_held`]).
+    #[must_use]
+    pub fn layer_bytes(&self) -> u64 {
+        let held = owner_held();
+        self.table
+            .iter()
+            .filter(|t| !held.contains(&t.name))
+            .flat_map(|t| t.buffers.iter())
+            .sum()
+    }
+
     /// Layer `l`'s routed experts.
     #[must_use]
     pub fn experts(&self, l: usize) -> Option<&LayerExperts> {
@@ -624,6 +643,79 @@ impl DraftWeights {
     pub fn gain(&self, name: &str, len: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
         Ok(self.f32(name, len)?.buf())
     }
+}
+
+/// The tensors of the draft the common DSpark owner holds: fc and the hidden
+/// norm, the head's norm, projection and Markov tables.
+fn owner_held() -> [String; 6] {
+    [
+        names::fc(),
+        names::enc_output_norm(),
+        names::output_norm(),
+        names::markov_w1(),
+        names::markov_w2(),
+        target_names::output(),
+    ]
+}
+
+/// A copy of `t` on `stream`'s card, complete once the stream is. The one
+/// place the owner's inputs are made from `DraftWeights`' own tensors: a
+/// `Weights` that gave its tensors up would turn each copy into a move.
+fn copy_tensor<T: DeviceCopy>(
+    stream: &CudaStream,
+    t: &DeviceTensor<T>,
+) -> Result<DeviceTensor<T>, GpuError> {
+    let mut out = DeviceTensor::zeroed(stream, t.rows(), t.cols())?;
+    out.buf_mut().copy_from_device_async(t.buf(), stream)?;
+    Ok(out)
+}
+
+/// `w`'s share of the common owner's inputs: fc and the hidden norm; the
+/// head's norm, the target's Q6_K projection and the Markov tables; the
+/// target as the block's embedding source. Load-time only.
+pub fn owner_inputs(
+    stream: &CudaStream,
+    w: &DraftWeights,
+) -> Result<(FcWeights, HeadWeights, EmbedSource), GpuError> {
+    let hp = w.hp();
+    let (qs, d) = w.q8(&names::fc(), hp.target_layers.len() * hp.n_embd, hp.n_embd)?;
+    let fc = FcWeights {
+        fc: Q8Rows {
+            qs: copy_tensor(stream, qs)?,
+            d: copy_tensor(stream, d)?,
+        },
+        norm: copy_tensor(stream, w.f32(&names::enc_output_norm(), hp.n_embd)?)?,
+        eps: hp.rms_eps,
+    };
+    let (w1, w2) = w.markov();
+    let head = HeadWeights {
+        norm: copy_tensor(stream, w.f32(&names::output_norm(), hp.n_embd)?)?,
+        eps: hp.rms_eps,
+        source: HeadSource::Target(TargetHead {
+            w: copy_tensor(stream, projection(w)?)?,
+            ty: GgmlType::Q6_K,
+        }),
+        markov_w1: copy_tensor(stream, w1)?,
+        markov_w2: copy_tensor(stream, w2)?,
+        to_target: None,
+        conf: None,
+    };
+    stream.synchronize()?;
+    Ok((fc, head, EmbedSource::Target))
+}
+
+/// Open V4.1's draft as the common owner's inputs: the layers over `weights`
+/// (the target's file `target` serves each block's first-id embedding row)
+/// and the owner's fc, head and embedding source ([`owner_inputs`]).
+/// Load-time only.
+pub fn open(
+    gpu: &Gpu,
+    weights: DraftWeights,
+    target: Arc<Split>,
+) -> Result<(V41Layers, FcWeights, HeadWeights, EmbedSource), GpuError> {
+    let (fc, head, embed) = owner_inputs(gpu.stream(), &weights)?;
+    let layers = V41Layers::new(gpu, weights, target)?;
+    Ok((layers, fc, head, embed))
 }
 
 /// Row `id` of the embedding `name` of `split`, `k` values: its file bytes

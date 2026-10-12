@@ -3,6 +3,8 @@
 //! target's committed hidden states into each draft layer's window ring
 //! ([`kv`]), the block pass over `[id_last, mask × (w − 1)]` ([`block`]) and
 //! its head with the Markov loop ([`head`]); [`DraftBody`] drives them.
+//! [`layers::V41Layers`] is the same layers without fc and the head, for the
+//! common DSpark owner, and [`open`] splits the weights into its inputs.
 //!
 //! The draft is `model::arch::dspark`'s file: three window-only V4.1-shaped
 //! blocks behind `fc`, which projects the target's hidden states at
@@ -75,7 +77,11 @@
 pub mod block;
 pub mod head;
 pub mod kv;
+pub mod layers;
 pub mod load;
+
+pub use layers::V41Layers;
+pub use load::open;
 
 use std::sync::Arc;
 

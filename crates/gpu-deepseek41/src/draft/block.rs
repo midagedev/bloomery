@@ -539,8 +539,16 @@ fn enqueue_attn(
     )
 }
 
-/// Layer `l`'s ffn sub-layer: steps 8–11 of the module comment.
-fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError> {
+/// Layer `l`'s ffn sub-layer: steps 8–11 of the module comment. Its fold is
+/// written to `fold` when one is given, in place of the layer's own
+/// `fold_f`: the last layer's output goes straight to the caller's rows,
+/// with no copy launch after it.
+fn enqueue_ffn(
+    cx: &Cx<'_>,
+    l: usize,
+    b: &mut LayerBufs,
+    fold: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
     let (d, w, s, m) = (cx.d, cx.w, cx.gpu.stream(), cx.m);
     let elem = cx.gpu.elem();
     cx.hc_pre(
@@ -664,7 +672,7 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
             tokens: m,
         },
         &mut b.streams_f,
-        &mut b.fold_f,
+        fold.unwrap_or(&mut b.fold_f),
     )
 }
 
@@ -994,6 +1002,25 @@ impl BlockPass {
         w: &DraftWeights,
         rings: &DraftRings,
     ) -> Result<(), GpuError> {
+        self.enqueue_layers(gpu, w, rings, None)?;
+        let last = self.layers.last().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a layer",
+        })?;
+        self.head.enqueue_logits(gpu, w, &last.fold_f, self.width)
+    }
+
+    /// Enqueue the decode of row 0 and every layer over the staged block,
+    /// reading `rings`: the body without the head. The last layer's fold
+    /// lands in `out` when one is given (`m · n_embd` values), else in its
+    /// own `fold_f`. Asynchronous, allocation-free, capturable.
+    pub(super) fn enqueue_layers(
+        &mut self,
+        gpu: &Gpu,
+        w: &DraftWeights,
+        rings: &DraftRings,
+        mut out: Option<&mut DeviceBuffer<f32>>,
+    ) -> Result<(), GpuError> {
         let m = self.width;
         if m == 0 {
             return Err(GpuError::State {
@@ -1031,7 +1058,8 @@ impl BlockPass {
             route: &self.route,
             clamp: self.rule == Rule::Reference,
         };
-        for l in 0..self.layers.len() {
+        let n_layer = self.layers.len();
+        for l in 0..n_layer {
             let (done, rest) = self.layers.split_at_mut(l);
             let b = &mut rest[0];
             let (streams, fold) = match done.last() {
@@ -1043,13 +1071,15 @@ impl BlockPass {
                 missing: "a ring per layer",
             })?;
             enqueue_attn(&cx, l, streams, fold, ring, b)?;
-            enqueue_ffn(&cx, l, b)?;
+            enqueue_ffn(&cx, l, b, if l + 1 == n_layer { out.take() } else { None })?;
         }
-        let last = self.layers.last().ok_or(GpuError::State {
-            what: WHAT,
-            missing: "a layer",
-        })?;
-        self.head.enqueue_logits(gpu, w, &last.fold_f, m)
+        if out.is_some() {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a layer",
+            });
+        }
+        Ok(())
     }
 
     /// Enqueue the head's Markov loop over the logits the body left.
