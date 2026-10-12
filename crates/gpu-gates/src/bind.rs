@@ -338,6 +338,38 @@ pub fn slots_given(
     Ok((slots, from))
 }
 
+/// The plan of a load at the slot count `slots` names (`from`, as
+/// [`slots_given`] returns it), never costing a working load for a default's
+/// second slot: `plan(slots)` is tried first, and when it is refused while the
+/// count is the seat's default (`from == "default"`, more than one slot) the
+/// load is planned again at one slot, on one stderr line naming `name`, the
+/// `place` and the refusal. Returns what `plan` built, the slots it was built
+/// for and `from` (`fit` after the fall to one slot). A set count (`flag`) or
+/// a count a `--ctx` made (`ctx`) is never lowered: its refusal stands, and so
+/// does the one-slot plan's when that too is refused.
+///
+/// # Errors
+/// The refusal of the plan that was last tried.
+pub fn default_slots_fit<T, E: std::fmt::Display>(
+    name: &str,
+    place: &str,
+    slots: usize,
+    from: &'static str,
+    mut plan: impl FnMut(usize) -> Result<T, E>,
+) -> Result<(T, usize, &'static str), E> {
+    match plan(slots) {
+        Ok(p) => Ok((p, slots, from)),
+        Err(e) if from == "default" && slots > 1 => {
+            eprintln!(
+                "{name}: the default's second slot does not fit on --place {place} ({e}); serving \
+                 one slot (--parallel {slots} requires it)"
+            );
+            plan(1).map(|p| (p, 1, "fit"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The shape a seat's round of several slots runs in, decided once at the
 /// open: the busy slots' rows as one pass of the body, or a select and a
 /// step (a pass, drafted) a slot in turn ([`step_rows_in_turn`],
@@ -3197,6 +3229,35 @@ mod tests {
         assert_eq!(
             parallel_text(2, 7, "default", Pass::Turns),
             "parallel rule=slots slots=2 slot_ctx=7 total=14 from=default pass=turns"
+        );
+    }
+
+    /// A default's second slot falls to one slot when its plan is refused and
+    /// the one-slot plan stands (`fit`); a set count is never lowered, and a
+    /// one-slot refusal ends the load with its own refusal.
+    #[test]
+    fn a_defaults_second_slot_never_costs_a_working_load() {
+        use super::default_slots_fit;
+        let fits_one = |s: usize| {
+            if s == 1 {
+                Ok(s * 10)
+            } else {
+                Err(format!("{s} slots"))
+            }
+        };
+        let fits_all = |s: usize| Ok::<_, String>(s);
+        let fits_none = |s: usize| Err::<usize, _>(format!("{s} slots"));
+        let fit = |from, plan: &dyn Fn(usize) -> Result<usize, String>| {
+            default_slots_fit("t", "a", 2, from, plan)
+        };
+        assert_eq!(fit("default", &fits_one), Ok((10, 1, "fit")));
+        assert_eq!(fit("flag", &fits_one), Err("2 slots".to_owned()));
+        assert_eq!(fit("ctx", &fits_one), Err("2 slots".to_owned()));
+        assert_eq!(fit("default", &fits_all), Ok((2, 2, "default")));
+        assert_eq!(fit("default", &fits_none), Err("1 slots".to_owned()));
+        assert_eq!(
+            default_slots_fit("t", "a", 1, "default", fits_one),
+            Ok((10, 1, "default"))
         );
     }
 

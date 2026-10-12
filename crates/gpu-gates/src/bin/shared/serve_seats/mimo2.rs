@@ -1,8 +1,9 @@
 //! `bloomery-serve --model mimo2` — the llama-server-compatible HTTP API on
-//! the MiMo-V2.6-Flash engine: a mimo2 file, its layers on one card with
-//! every routed expert on the host tier (`model::placement::plan_host_routed`:
-//! the program runs no card expert), opened as `gate_mimo2_e2e` opens it
-//! (`app::Loaded`, in graph mode with the step captured).
+//! the MiMo-V2.6-Flash engine: a mimo2 file, its layers on one card, the
+//! routed experts the plan puts on the card and the rest on the host tier
+//! (`placement::plan_routed` through `PlanInputs::plan_with_slots`), opened as
+//! `gate_mimo2_e2e` opens it (`app::Loaded`, in graph mode with the step
+//! captured).
 //!
 //!     bloomery-serve --model mimo2 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
@@ -22,16 +23,20 @@
 //! Two facts of the architecture set this seat's shape, and nothing else
 //! does: the program runs no verify pass of several rows, and no draft is
 //! read. So the server feeds the prompt less its last id as one prompt call,
-//! then steps the last, as `bloomery-serve --model qwen3` does, and a round
-//! of several slots is a select and a step a row (`Seat::step_slots`'
-//! default); a prompt cache is refused by name, and a tier card has no expert
-//! to hold.
+//! then steps the last, as `bloomery-serve --model qwen3` does; a round of
+//! several slots is one pass of every busy slot's row (`GpuModel::step_slots`,
+//! the body's `SlotRows`, through `serve_seats::rounds::step_rows_one_pass`),
+//! the `parallel` line's `pass=one`; a prompt cache is refused by name, and
+//! the load refuses an expert tier card.
 //!
 //! `--parallel N` serves N resident sequences (`app::Session::add_slots`):
 //! the model loads one slot's stores and parks the other N − 1 after its step
 //! capture, each slot capturing its own step on first use. `--parallel`
-//! unset takes one slot (a set `--ctx` with no `--parallel` is one request's
-//! context). The slot count is read before the context, which the slots
+//! unset takes two slots (a set `--ctx` with no `--parallel` is one request's
+//! context: one slot), and when the plan refuses the default's second slot
+//! the seat plans one and says so (`bind::default_slots_fit`: one stderr line
+//! and `from=fit` on the `parallel` line); a count the flags set is never
+//! lowered. The slot count is read before the context, which the slots
 //! split: each slot holds ⌊`--ctx` / N⌋ positions
 //! (`placement::slots::split_ctx`, the split the qwen3 and GLM seats take) and
 //! a split that leaves a slot no position is refused by name. The plan counts
@@ -53,28 +58,29 @@
 //! (`Place::choose_untiered`: the body serves no tier card), on one census
 //! reading: a `place unset` record names the word `a` and why. A placement
 //! that hangs an expert tier card (`bp`, a two-card list) is refused before
-//! any load by the plan's own refusal, which names the card and the all-host
-//! plan; the tier serves no prompt batch here, so its batch reserve is zero
-//! bytes.
+//! any load by the plan's own refusal (`PlaceError::Tier`), which names the
+//! card and its tier; the tier serves no prompt batch here, so its batch
+//! reserve is zero bytes.
 //!
 //! `--ctx` is the total the slots split (`--ctx 0` is refused); with one slot
 //! it is one request's context. Unset, it is the file's trained context
 //! (`<arch>.context_length`) capped to the largest total whose plan stands,
 //! searched on a grid of `generate::CTX_GRAN` positions from the floor
 //! [`CTX`]; a file that states no trained context takes the floor, and one
-//! stderr line names a cap that binds. Every routed expert sits on the host,
-//! so no card-expert bytes trade against the context and the expert-margin
-//! rule (`placement::ctx::default_slot_ctx`) has nothing to bound; the plan's
-//! own fit is the cap.
+//! stderr line names a cap that binds. The routed experts the plan puts on
+//! the card take the room the stores leave, so a longer context leaves fewer
+//! of them there; the default caps at the plan's own fit and applies no
+//! expert margin (`placement::ctx::default_slot_ctx`, which the GLM seat
+//! takes).
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
 //! line (the rule — `set`, `trained`, `card` or `floor` —, a slot's context,
 //! the slots, the total and the trained context), the `plan` record (its
 //! `ctx_max` a slot's), the `parallel` line (`rule=slots slots=N slot_ctx=C
-//! total=N·C from=<word>`); then the `load` record (architecture, resident
-//! bytes of every slot, a slot's context, slots, layers, the routed experts
-//! the plan keeps on the host and on the card, the step graph's nodes and the
-//! load's wall) and, once the port is bound, the `listening` record
+//! total=N·C from=<word> pass=one`); then the `load` record (architecture,
+//! resident bytes of every slot, a slot's context, slots, layers, the routed
+//! experts the plan keeps on the host and on the card, the step graph's nodes
+//! and the load's wall) and, once the port is bound, the `listening` record
 //! (`record::BLOOMERY_SERVE_MIMO2`). `--plan` ends the process after
 //! the `parallel` line, nothing loaded. An engine error ends the process with
 //! the crash block and exit code 70, as every seat's.
@@ -114,8 +120,8 @@ use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, Vocab, bind_server, model_props, note_line,
-    parallel_line, placement_of, slots_given,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, default_slots_fit,
+    model_props, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::{CTX_GRAN, Lane, Place, lane_at, trained_ctx};
 use bloomery_gpu_gates::record::{self, Record};
@@ -133,6 +139,8 @@ use runtime::Target as _;
 use serve::flag::number;
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
+
+use super::rounds;
 
 const NAME: &str = "bloomery-serve-mimo2";
 
@@ -159,12 +167,21 @@ pub const ACTS_ON: &[&str] = &[
 /// The floor of the searched default context.
 const CTX: usize = 4096;
 
+/// The slots a seat with no `--parallel` and no `--ctx` serves.
+const SLOTS: usize = 2;
+
+/// Whether a round of several slots runs as one pass of the busy rows
+/// (`GpuModel::step_slots`, the body's `SlotRows`): the `parallel` line's
+/// `pass=` word and [`Seat::step_slots`] read this one value.
+const ONE_PASS: bool = true;
+
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the mimo2 seat runs no prompt cache";
 
-/// MiMo fact: the program runs no card expert, so a tier card holds nothing
-/// and serves no prompt batch. Planning a placement that names one with zero
-/// batch bytes reaches the plan's own refusal.
+/// MiMo fact: the load refuses any expert tier card (`Body::load`,
+/// `PlanInputs::plan_with_slots`), so a tier card serves no prompt batch here.
+/// Planning a placement that names one with zero batch bytes reaches the
+/// plan's own refusal.
 const NO_BATCH: TierBatchBytes = TierBatchBytes {
     staging: 0,
     scratch: 0,
@@ -477,6 +494,19 @@ impl Seat for Mimo {
         Ok(self.s.model_mut().step(&[last])?)
     }
 
+    /// One round of several slots' steps ([`rounds::step_round`]): the busy
+    /// rows as one pass of the body ([`rounds::step_rows_one_pass`]), laid in
+    /// slot order, each row's answer and lent logits row its own.
+    fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
+        rounds::step_round(
+            self,
+            ONE_PASS,
+            rows,
+            |m, rows| rounds::step_rows_one_pass(&mut m.s, rows),
+            |_| Ok(()),
+        )
+    }
+
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
         Ok(self.s.model().logits_into(row)?)
     }
@@ -551,7 +581,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The slot count before the context it splits: a set `--ctx` with no
     // `--parallel` is one request's context, one slot at the whole of it
     // (`placement::ctx::slots_of`).
-    let (slots, from) = slots_given(a.parallel, a.ctx, 1)?;
+    let (slots, from) = slots_given(a.parallel, a.ctx, SLOTS)?;
     // The common unset rule, once, on one census reading.
     let census = gpu_census::census()?;
     let chosen = Place::choose_untiered(a.place, &census, "mimo2")?;
@@ -582,17 +612,23 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     let tier = (!place.tier_cards().is_empty()).then_some(NO_BATCH);
     let machine = place.machine(None, tier)?(inputs.model.layers);
+    // The context and the plan of every slot: each layer's stores `slots`
+    // times at a slot's positions. A tier card, a total the card cannot hold
+    // and a budget that binds are refused here by name, before any load; the
+    // load plans the same. The default's second slot that does not fit falls
+    // to one slot (`from=fit`); a count the flags set is never lowered.
+    let ((rule, slot_ctx, plan), slots, from) =
+        default_slots_fit(NAME, place.name(), slots, from, |slots| {
+            let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
+            let rule = ctx_of(a.ctx, &split, &inputs, &machine, &plan_levers, n)?;
+            let slot_ctx = slot_ctx_of(rule.ctx, slots)?;
+            let plan = inputs
+                .plan_with_slots(&machine, u64::try_from(slot_ctx)?, &plan_levers, n)
+                .map_err(|e| format!("--place {}: {e}", place.name()))?;
+            Ok::<_, GateError>((rule, slot_ctx, plan))
+        })?;
     let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
-    let rule = ctx_of(a.ctx, &split, &inputs, &machine, &plan_levers, n)?;
     let ctx = rule.ctx;
-    let slot_ctx = slot_ctx_of(ctx, slots)?;
-    // The plan of every slot: each layer's stores `slots` times at a slot's
-    // positions. A tier card, a total the card cannot hold and a budget that
-    // binds are refused here by name, before any load; the load plans the
-    // same.
-    let plan = inputs
-        .plan_with_slots(&machine, u64::try_from(slot_ctx)?, &plan_levers, n)
-        .map_err(|e| format!("--place {}: {e}", place.name()))?;
     if let (Some(trained), "card") = (rule.trained, rule.rule) {
         eprintln!(
             "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions (the plan \
@@ -617,7 +653,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         residency_room(&plan, residency, pick.word)?;
     }
     residency_set(&plan, 0, residency, pick.word, 0, Record::eprint)?;
-    parallel_line(slots, slot_ctx, from, Pass::of(slots, false));
+    parallel_line(slots, slot_ctx, from, Pass::of(slots, ONE_PASS));
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
         std::process::exit(0);
