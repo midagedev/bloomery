@@ -4506,6 +4506,62 @@ mod tests {
             assert_eq!((still.ram, still.why), (0, why));
         }
 
+        /// The default budget counts a load's checkpoint reserve once: the
+        /// plan's need holds the machine's `checkpoints` row, so the room
+        /// past the need is the reading less the plan's own terms less that
+        /// row, the budget half of it, and `checkpoints` is the term the
+        /// `cache` line prints, not a second subtraction. One Qwen3.8 slot
+        /// at a context of 16,384 positions pins five points of 130,162,688
+        /// B spaced 4,096 apart (650,813,440 B) inside the need of
+        /// 27,631,529,984 B: the same plan with no reserve leaves that much
+        /// more room, and half of it more budget. The line's own terms
+        /// (`available`, `need`, `pool`) reproduce the budget it prints.
+        #[test]
+        fn a_default_budget_counts_the_checkpoint_reserve_once() {
+            const Q38: Price = Price {
+                point_bytes: 130_162_688,
+                every: 4_096,
+            };
+            let mut m = machine(0);
+            reserve_checkpoints(&mut m, Seqs::priced(1, Q38), 16_384).expect("a reserve");
+            let reserved = checkpoints_reserved(&m);
+            assert_eq!(reserved, 5 * 130_162_688);
+            let (terms, pool, available) = (26_980_716_544u64, 0u64, 40_000_000_000u64);
+            let need = terms + reserved;
+            assert_eq!(need, 27_631_529_984);
+            let at = |need: u64, checkpoints: u64| {
+                CacheRam::at(
+                    None,
+                    (available, HostRead::Given),
+                    need,
+                    pool,
+                    (0, 0),
+                    checkpoints,
+                )
+                .expect("the budget")
+            };
+            let (with, without) = (at(need, reserved), at(terms, 0));
+            assert_eq!(with.ram, (available - need - pool) / 2);
+            assert_eq!(without.ram, (available - terms - pool) / 2);
+            assert_eq!(without.ram - with.ram, reserved / 2);
+            assert_eq!(with.why, None);
+            let line = with.line();
+            let term = |key: &str| -> u64 {
+                line.split(' ')
+                    .find_map(|w| w.strip_prefix(&format!("{key}=")))
+                    .unwrap_or_else(|| panic!("{key} in {line}"))
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{key} is a number in {line}"))
+            };
+            assert_eq!(term("checkpoints"), reserved, "{line}");
+            assert_eq!(term("need"), need, "{line}");
+            assert_eq!(
+                term("ram"),
+                (term("available") - term("need") - term("pool")) / 2,
+                "{line}"
+            );
+        }
+
         /// The checkpoint reserve is each load's declaration
         /// (`reserve_checkpoints`): V4.1's body makes no checkpoints, so its
         /// seat declares none and its machine carries no row and reserves 0;
