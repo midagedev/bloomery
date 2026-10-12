@@ -98,11 +98,13 @@ condition: one lease, two rounds, the GGUF arms rotated each round after a disca
   to fit is a FAIL row the runner goes past, rerun at BLOOMERY_BOX_ENV='GLM_NCMOE=37 …' (the profile
   keeps a caller's value), and a fit twin whose fit failed is a FAIL row naming it; the full output to a file first. Command:
   BLOOMERY_HOLD_OWNER=<the sitting's> BLOOMERY_AB_ROUNDS=2
-  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glm-public.card' just depth-gpu-glm5next <the arms
+  BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2048 BLOOMERY_LEASE_CARD=docs/cards/glm-public.card' just depth-gpu-glm5next <the arms
   above> > <log> 2>&1. Wall 40..53 min [derived]: 35..44 for the arms before the fit twins, and 5..9
   for the four fit twins' eight runs, each 33..58 s (the glmtime smoke's lcpp27754:6 row read `wall
   18s` for a load and 16 steps; here the 512-id depth or prompt and the steps, 11..16 s, and the fit's ~10
   measuring loads, 5..25 s); without the five depth-1024 arms, 29..42
+# 2026-10-12: written against the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX
+# derives C per arm, so its command pins BLOOMERY_GEN_CTX=2048 to keep the card's C.
 reason: sets every row of the public GLM-5.3-Flash table (llama.cpp's two PR branches beside ours,
   exllamav3 in its own table) from one window; why now: the release sitting takes every model's
   table in one window, and GLM has had no timed row

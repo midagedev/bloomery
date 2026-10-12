@@ -52,9 +52,11 @@
 # Sitting: one runner invocation serves both cards (its bp/a pair prints `ratio place d=512` and
 # `ratio place pp p=512`); lease_take checks one card, this one, so glmbp-pp.card is checked with card.py check
 # before the sitting and read from the same log. From the tree that holds both cards in docs/cards:
-#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_TIMING_CARDS=a6000+3090
+#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2048 BLOOMERY_TIMING_CARDS=a6000+3090
 #   BLOOMERY_LEASE_CARD=docs/cards/glmbp-ab.card' just depth-gpu-glm5next
 #   oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1,place=a oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1,place=bp > <log> 2>&1
+# 2026-10-12: ran at the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX derives C per arm,
+# so a re-run sets BLOOMERY_GEN_CTX=2048 to reproduce this card.
 # Wall [derived]: 2 arms x (4 rounds + 1 warm-up) = 10 processes at 1.1..2.1 min (a load at 45..75 s, the glmnext
 # and glmlane2 cards; the bp load uploads ~22.8 GB more; each arm's preheat, which after a bp arm re-reads the
 # ~63 GB its load dropped; 512 prompt ids, 96 generated): 12..22 min; at 3 rounds 10..18.

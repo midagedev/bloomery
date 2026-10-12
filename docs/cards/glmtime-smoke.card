@@ -17,8 +17,10 @@ condition: one lease, one round, no warm-up (BLOOMERY_AB_WARMUP=0: the load read
   its timer), arms 6 lcpp27754:6 lcpp27754mtp:6 (the server path and the MTP load at --n-cpu-moe 37,
   its acceptance line carried); no row carries [cpu-busy] or [other-busy]; the full output to a file
   first. Command: BLOOMERY_DECODE_N=16 BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmtime-smoke.card
-  BLOOMERY_AB_WARMUP=0 BLOOMERY_DECODE_N=16' just depth-gpu-glm5next 6 lcpp27754:6 lcpp27754mtp:6 > <log>
-  2>&1
+  BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_WARMUP=0 BLOOMERY_DECODE_N=16' just depth-gpu-glm5next 6 lcpp27754:6
+  lcpp27754mtp:6 > <log> 2>&1
+# 2026-10-12: ran at the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX derives C per arm,
+# so a re-run sets BLOOMERY_GEN_CTX=2048 to reproduce this card.
 reason: the runner's first live pair; why now: the release sitting's GLM segment runs it next
 decide-in: hand the segment line to the sitting as written; glm-public.card's host-only band stands
 decide-below: read the step series: first10 far above last10 is the capture and first-touch term,
