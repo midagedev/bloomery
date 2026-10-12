@@ -146,6 +146,11 @@ check-unsafe:
 check-waits:
     ./tools/check-waits.sh
 
+# `$?` read after a command substitution in the same command (Mac, text only, no build): tools/*.sh and the
+# justfile's recipe bodies; the shapes it reads, its blind spots and exit codes are tools/check-rc.sh's header.
+check-rc:
+    bash tools/check-rc.sh
+
 # The one-bundle-load ratchet (Mac, grep only, no build): a `#[cuda_module]` family's raw `load` outside the
 # shared_module! slot — the rule and exit codes are tools/check-loads.sh's header.
 check-loads:
@@ -1280,7 +1285,7 @@ dump-ref-dequant:
     ./tools/box.sh 'bash tools/ref/dump-dequant.sh'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-waits check-loads check-ptx-names fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
+gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-waits check-rc check-loads check-ptx-names fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
 
 # The smoke tier (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
