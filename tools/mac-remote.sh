@@ -742,15 +742,40 @@ STUB
   [ "$rc" = 0 ] || fail "a run that waited for its track's lock ended rc $rc: $(cat "$d/wait-track.out")"
   grep -q "locked on the remote by $me/$$.*waiting" "$d/wait-track.out" || fail "the track-lock wait is not announced: $(cat "$d/wait-track.out")"
   # the slot pool: both slots held (real lockf, holders named in the holder files) — the run says who holds them, waits, and goes
-  # on once a slot frees; a third arrival is the same case
+  # on once a slot frees; a third arrival is the same case. Each slot is held until the test removes its hold file, and slot 1
+  # is freed only after the run has announced its wait, so the order holds under any load.
   mkdir -p "$rh/repo/bloomery-mr"
-  lockf -k -s -t 0 "$rh/repo/bloomery-mr/.slot-0" sleep 6 & s0=$!
-  lockf -k -s -t 0 "$rh/repo/bloomery-mr/.slot-1" sleep 9 & s1=$!
+  : > "$d/hold-0"; : > "$d/hold-1"
+  # shellcheck disable=SC2016 # the holder's own shell expands them
+  hold='touch "$2"; while [ -e "$1" ]; do sleep 0.2; done'
+  lockf -k -s -t 0 "$rh/repo/bloomery-mr/.slot-0" sh -c "$hold" _ "$d/hold-0" "$d/held-0" & s0=$!
+  lockf -k -s -t 0 "$rh/repo/bloomery-mr/.slot-1" sh -c "$hold" _ "$d/hold-1" "$d/held-1" & s1=$!
   printf '%s\n' "trackA $(date +%s)" > "$rh/repo/bloomery-mr/.slot-0.holder"
   printf '%s\n' "trackB $(date +%s)" > "$rh/repo/bloomery-mr/.slot-1.holder"
-  sleep 1
+  # both holds taken before the run starts (each writes its held file under the lock): a slot the run finds free would end
+  # the case before it waits
+  n=0
+  until [ -e "$d/held-0" ] && [ -e "$d/held-1" ]; do
+    n=$((n + 1))
+    if [ "$n" -gt 600 ] || ! kill -0 "$s0" 2> /dev/null || ! kill -0 "$s1" 2> /dev/null; then
+      fail "the two slot holds were not taken within 120 s"
+      break
+    fi
+    sleep 0.2
+  done
   run > "$d/wait-slot.out" & pid=$!
+  n=0
+  until grep -q "all 2 run slots are taken" "$d/wait-slot.out" 2> /dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 600 ] || ! kill -0 "$pid" 2> /dev/null; then
+      fail "the run did not announce its wait within 120 s"
+      break
+    fi
+    sleep 0.2
+  done
+  rm -f "$d/hold-0"
   rc=0; wait "$pid" || rc=$?
+  rm -f "$d/hold-1"
   [ "$rc" = 0 ] || fail "a run that waited for a slot ended rc $rc: $(cat "$d/wait-slot.out")"
   grep -q "all 2 run slots are taken: \[slot 1: trackA for [0-9]* s\] \[slot 2: trackB for [0-9]* s\]; tree-one waits" "$d/wait-slot.out" ||
     fail "the busy slots' holders are not named: $(cat "$d/wait-slot.out")"
