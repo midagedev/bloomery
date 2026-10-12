@@ -509,7 +509,7 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
 
 /// One image of a media call as a body takes it: the positions its span holds in the call's ids,
 /// its rows (`n_embd` bf16 values a position) and its token grid `(nx, ny)`, `nx` tokens along a
-/// line and `ny` lines (the merger's `n_llm_w` by `n_llm_h`).
+/// line and `ny` lines (`vision::GridPlan::span_grid` holds the order).
 #[cfg(feature = "vision")]
 struct Placed<'a> {
     at: Range<usize>,
@@ -858,17 +858,14 @@ impl<B: Body3> Seat for Q3<B> {
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
         )?;
         // Each span borrows its own range of the call's one buffer of rows; its grid is the
-        // image's merged-token plan, `nx` along a line (the width).
+        // image's merged-token plan (`vision::GridPlan::span_grid`).
         let images: Vec<Placed<'_>> = ats
             .iter()
             .zip(feeds)
-            .map(|(a, f)| {
-                let plan = &f.prepared.patches.plan;
-                Placed {
-                    at: a.positions.clone(),
-                    rows: &rows[a.rows.clone()],
-                    grid: (plan.n_llm_w, plan.n_llm_h),
-                }
+            .map(|(a, f)| Placed {
+                at: a.positions.clone(),
+                rows: &rows[a.rows.clone()],
+                grid: f.prepared.patches.plan.span_grid(),
             })
             .collect();
         B::prompt_media(&mut self.s, ids, &images)
