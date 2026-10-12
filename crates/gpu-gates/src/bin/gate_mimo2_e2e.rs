@@ -96,11 +96,17 @@
 //!   flip is red at c1; a reset that does nothing is red at the map's return.
 //! - (rp) the pass of two slots under the machine (`residency_pass`): a load
 //!   of two sequences at the serving word runs [`R_STEPS`] rounds through
-//!   `step_slots` and the same rounds a slot at a time; the ids are equal, the
-//!   logits equal bit for bit until the first flip lands and inside
-//!   [`FREE_WORST`] after it, a second pass repeats the first, and flips
-//!   land. FAIL-first: the load's tally rows left at 1 refuse the pass by
-//!   name at the first round (`Tally::note`) and the clause is red.
+//!   `step_slots` and the same rounds a slot at a time; the logits and ids are
+//!   equal bit for bit until the first flip lands, after it the ids are equal
+//!   until a round where the pass's id trails the turns' by less than
+//!   [`MARGIN_FLOOR`] in the turns' logits (a near tie: the two arms' maps
+//!   hold other experts on the card) and the logits are inside
+//!   [`FREE_WORST`] through that round, a second pass repeats the first, and
+//!   flips land. FAIL-first: the load's tally rows left at 1 refuse the pass
+//!   by name at the first round (`Tally::note`) and the clause is red; the
+//!   pass's id at the first round past the bit-for-bit ones replaced by the
+//!   turns' least likely id is a first difference at a confident gap and the
+//!   clause is red.
 //!
 //! `--only s|p|c|t|b|slots|r` runs one clause on the load (`slots` and `r` on
 //! their own loads); `--step-sets short` takes
@@ -171,6 +177,7 @@ mod gate {
     use bloomery_gpu::host::swap::{Residency, SwapSource};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::prompts::MARGIN_FLOOR;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::residency;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
@@ -1172,6 +1179,16 @@ mod gate {
         }
     }
 
+    /// The turns' logit of their own id less their logit of the pass's id:
+    /// how far the turns preferred their id. NaN when an id is past the row
+    /// or a logit is NaN, which no margin floor takes.
+    fn gap(row: &[f32], own: u32, other: u32) -> f32 {
+        match (row.get(own as usize), row.get(other as usize)) {
+            (Some(&own), Some(&other)) => own - other,
+            _ => f32::NAN,
+        }
+    }
+
     /// (rp) one arm on `m`, a load of [`slots_gate::STREAMS`] sequences under
     /// the machine: from the residency's seed, both slots prompted, then
     /// [`R_STEPS`] rounds, as one pass of both rows (`one_pass`) or as a
@@ -1222,12 +1239,18 @@ mod gate {
     /// (rp) a pass of two slots under the machine, on a load of two
     /// sequences at `word`: [`R_STEPS`] rounds as one pass of both slots'
     /// rows against the same rounds as a select and a step a slot, each from
-    /// the residency's seed with both prompts fed. Held: the pass's ids are
-    /// the turns' in every round; its logits are the turns' bit for bit in
-    /// every round up to the one after whose boundary a flip first landed in
-    /// either arm (the slot map is the seed's until then), and after it within
-    /// [`FREE_WORST`] of them relative to the turns' largest logit (the two
-    /// arms' maps move at other boundaries); the pass run again from the seed
+    /// the residency's seed with both prompts fed. Held: the pass's logits
+    /// are the turns' bit for bit in every round up to the one after whose
+    /// boundary a flip first landed in either arm (the slot map is the
+    /// seed's until then), so are its ids; past it the two arms' maps move at
+    /// other boundaries (the pass plans its tally under both rows, the turns
+    /// under one at a time) and hold other experts on the card, so the
+    /// pass's ids are the turns' until a round where the pass's id trails the
+    /// turns' by less than [`MARGIN_FLOOR`] in the turns' logits (a near
+    /// tie: the e2e gates' rule on the reference's top two, which a swap of
+    /// the top two meets), and its logits within [`FREE_WORST`] of the turns'
+    /// relative to their largest logit through that round — the arms feed
+    /// other ids after it; the pass run again from the seed
     /// repeats itself bit for bit; and a flip lands in the pass arm, so the
     /// machine planned under the rows of two slots. A call that fails is the
     /// clause's red with its error printed (a machine whose tally holds one
@@ -1267,11 +1290,28 @@ mod gate {
                 return Ok(false);
             }
         };
-        let ids_ok = pass.ids == turns.ids;
         let exact_to = pass.first_flip().min(turns.first_flip()).min(R_STEPS - 1);
         let exact_ok = (0..=exact_to).all(|r| pass.fnvs(r) == turns.fnvs(r));
+        // The first round and slot whose id is not the turns', and how far the
+        // turns' logits preferred their id there. Past the bit-for-bit rounds
+        // the two arms' maps hold other experts on the card, so an id may
+        // differ only at a near tie; from the round after it the arms feed
+        // other ids and their logits are no longer compared.
+        let first_diff = (0..R_STEPS).find_map(|r| {
+            (0..slots_gate::STREAMS)
+                .find(|&s| pass.ids[r][s] != turns.ids[r][s])
+                .map(|s| {
+                    (
+                        r,
+                        s,
+                        gap(&turns.logits[r][s], turns.ids[r][s], pass.ids[r][s]),
+                    )
+                })
+        });
+        let ids_ok = first_diff.is_none_or(|(r, _, gap)| r > exact_to && gap < MARGIN_FLOOR);
+        let fed_same_to = first_diff.map_or(R_STEPS - 1, |(r, _, _)| r);
         let mut rel = 0.0f64;
-        for r in exact_to + 1..R_STEPS {
+        for r in exact_to + 1..=fed_same_to {
             for (p, t) in pass.logits[r].iter().zip(&turns.logits[r]) {
                 let top = t.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
                 let worst = p.iter().zip(t).fold(0.0f64, |m, (&p, &t)| {
@@ -1286,12 +1326,16 @@ mod gate {
             && pass.landed == again.landed;
         let flips = pass.landed.iter().sum::<usize>();
         let ok = ids_ok && exact_ok && band_ok && repeat_ok && flips > 0;
+        let diff = first_diff.map_or("none".to_owned(), |(r, s, gap)| {
+            format!("round {r} slot {s}, {gap:.4} under the turns' id")
+        });
         println!(
-            "(rp) a pass of {} slots under {word:?}, {R_STEPS} rounds: ids equal the turns' \
-             {ids_ok}; logits bit for bit through round {exact_to} {exact_ok}, after it worst \
-             rel {rel:.3e} (want at most {FREE_WORST}) {band_ok}; the pass run again repeats \
-             {repeat_ok}; {flips} flips landed in the pass arm, {} in the turns' (want some in \
-             the pass arm) {}",
+            "(rp) a pass of {} slots under {word:?}, {R_STEPS} rounds: the first id not the \
+             turns' {diff} (want none, or past round {exact_to} under {MARGIN_FLOOR}) {ids_ok}; \
+             logits bit for bit through round {exact_to} {exact_ok}, after it through round \
+             {fed_same_to} worst rel {rel:.3e} (want at most {FREE_WORST}) {band_ok}; the pass \
+             run again repeats {repeat_ok}; {flips} flips landed in the pass arm, {} in the \
+             turns' (want some in the pass arm) {}",
             slots_gate::STREAMS,
             turns.landed.iter().sum::<usize>(),
             verdict(ok)
