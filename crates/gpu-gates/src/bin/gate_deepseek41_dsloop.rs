@@ -77,6 +77,7 @@ mod ds41_tier;
 #[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::head::Head;
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, PAIR_ROWS, Seam};
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order};
@@ -88,6 +89,7 @@ mod gate {
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::placement::workstation;
+    use runtime::swaprule::KeptRows;
 
     use crate::{dspark, finite};
 
@@ -483,6 +485,8 @@ mod gate {
         );
         m.rollback(p)?;
         let [ta, tb] = m.step_rows([t, t1])?;
+        // Both rows stay, as `step_rows` asks of every caller; the next check's pair opens its own call.
+        m.keep_rows(KeptRows::prefix(PAIR_ROWS), PassKind::Pair)?;
         let tokens = ta == t1 && tb == seq[p as usize + 2];
         println!(
             "{NAME}: tap | pos {p}: pair over [{t}, {t1}] gives [{ta}, {tb}], the run's [{t1}, {}]: {}",
