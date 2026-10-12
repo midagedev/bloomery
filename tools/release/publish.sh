@@ -54,6 +54,11 @@ for c in serve gpu-gates; do
     [ "$v" = "$VERSION" ] || fail "crates/$c says version $v, not $VERSION — bump it, commit, re-tag, release-build again"
 done
 
+# 2b. the README names this release: its status heading, the tarball it unpacks and the release link
+for want in "## Status ($VERSION)" "$NAME.tar.gz" "releases/tag/$TAG)"; do
+    grep -qF -- "$want" README.md || fail "README.md does not name '$want' — update its status heading and install lines, commit, re-tag"
+done
+
 # 3. the artifacts, verified on the box (readelf/objdump and the ELF binary are Linux's)
 bash tools/box.sh "set -e; cd $REMOTE/target/release-dist; \
 sha256sum -c $NAME.tar.gz.sha256 > /dev/null; \

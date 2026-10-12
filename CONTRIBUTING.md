@@ -72,6 +72,12 @@ quality, and that it works.
 the machine (`--version`, card, driver, CPU, RAM) and what you ran on it, and let the new path follow from what the
 machine reports rather than a flag only you would set.
 
+**A lab for hardware we do not have** (today: AMD GPUs, `labs/hip-native/`) lives under `labs/`, outside the workspace,
+so the CUDA build, the gates and the release do not change. Your card is its gate. The lab carries a `verify.sh` that
+runs its checks and writes a result JSON: the source tree hash, the binary hashes, the card, the runtime version, and
+each case's result. Every PR to the lab attaches that JSON from its head commit. We check that the hash matches the
+PR, and run the format, lint and comment checks on our side. The lab's owner is the contributor who opened it.
+
 ## Code shape
 
 Comments and anything that goes upstream are in English; a comment states what is true now, and history belongs in the
