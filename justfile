@@ -2358,6 +2358,20 @@ gate-gpu-glm5next-residency:
 gate-gpu-glm5next-serve:
     BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
 
+# The GLM seat's image input beside its draft (gate_glm5next_serve --arm media): one server of --parallel 2 under
+# BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off with --mmproj, the GLM-5.3 projector, then an image chat on one slot and a
+# text chat on the other. (m1) the `vision` record names the card the gate placement leaves off (the A6000), seat=off-plan;
+# (m2) the image chat is a 200 and the seat prints exactly one `mtp prompt` record naming why the slot's draft is off
+# (the seat's MEDIA_DRAFT_OFF_WHY); (m3) the text chat is a 200 that drafts; (m4) it prints no `mtp prompt` record naming
+# the media why. Logs in target/glm-media-gate/media/. One load of the whole host set: alone in a batch, under the
+# big-load lock. Real-only: the gate states its clauses against the real file and the real projector, so the fixture tier
+# defers the recipe by name (tools/ref/real-only.sh); a weekly, selected by its trigger rows in tools/gate-paths.tsv and
+# its own text, and not part of gate-gpu-glm5next-serve. BLOOMERY_CARD=both: both gate locks, the tower on the A6000.
+[group('solo')]
+[group('v41-load')]
+weekly-gpu-glm5next-media-serve:
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-glm5next-media-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-media-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm media --dir $D --mmproj /models/mmproj/unsloth--GLM-5.3-Flash-GGUF/mmproj-BF16.gguf'
+
 # The MiMo seat of `bloomery-serve` (gate_mimo2_serve): the refusals before any load (--plan's default context, the one
 # slot, the tier card), one server at --ctx 4160 --parallel 1 holding its load and listening records, the three prompts'
 # ids (the batch set's, a prose, the chat turn rendered by the server's template), the chat answer inside those ids, the

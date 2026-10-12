@@ -4,6 +4,7 @@
 //! lock.
 //!
 //!     gate_glm5next_serve --arm plain|drafted|slots|unset|prefix|second-slot --dir <out>
+//!     gate_glm5next_serve --arm media --dir <out> --mmproj <file>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
 //! 127.0.0.1 --port 0 --place gate --ctx 2048 --slot-save-path /tmp
@@ -22,7 +23,9 @@
 //! those clauses by name; the recipe runs them inside `drafted`. `unset`
 //! runs the plain arm's last server alone the same way, `prefix` the plain
 //! arm's first server with the shared-prefix clause alone and `second-slot`
-//! the plain arm's `--plan` runs on the default's second slot alone.
+//! the plain arm's `--plan` runs on the default's second slot alone. `media` is the weekly
+//! recipe's (`weekly-gpu-glm5next-media-serve`, not part of `gate-gpu-glm5next-serve`): the
+//! GLM seat's image input beside its draft, on two slots (below).
 //!
 //! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after four runs of
 //! the seat with both levers unset and `--plan`, which print the unset rule's
@@ -273,6 +276,28 @@
 //!   clauses hold counts and passes equal across two runs, which a chooser
 //!   its clock drives does not promise.
 //!
+//! `media` (`--mmproj FILE`, the GLM-5.3 projector the recipe names): one server of `--parallel 2`
+//! under the draft-only levers (`BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off`, the rounds counted)
+//! with `--mmproj`, then one chat request that holds [`MEDIA_PNG`] as a `data:` URL and, after it,
+//! one text-only chat request, [`MEDIA_TEXT`], long enough that its shared head with the first
+//! prompt is under the slot rule's similarity floor, so it takes the other slot:
+//!
+//! - (m1) the `vision` record after the load names a card other than the plan's stage card, with
+//!   `seat=off-plan` (under `--place gate` the plan is the 3090 and the tower sits on the A6000);
+//! - (m2) the image chat is a 200 with completion tokens and text (`content` or
+//!   `reasoning_content`: the template opens the reply with the think span, so a short reply is
+//!   all reasoning, as in the unset load's chat clause), and the seat prints exactly one `mtp
+//!   prompt` record whose why is the seat's `MEDIA_DRAFT_OFF_WHY` ([`media_why`]): a request that
+//!   holds an image turns its slot's draft off until the slot's next reset;
+//! - (m3) the text chat, sent while that slot is off, is a 200 whose timings carry draft counts
+//!   (`draft_n` above 0) on a slot the image chat's `slot call` records do not name: a text slot
+//!   beside an image slot keeps drafting;
+//! - (m4) the text chat prints no `mtp prompt` record naming the media why: its slot is not the
+//!   off one.
+//!
+//! Mutant: the seat's media call not turning the slot's draft off (`prefill_media`'s `turn_off`
+//! skipped): no record names the why, red on (m2).
+//!
 //! A request that extends the held sequence (the prompt and the ids it
 //! generated) is printed with its `cache_n` and the draft's `mtp prompt`
 //! records, not held: the checkpoint rule keeps every fed position only for
@@ -311,8 +336,8 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
-        self, PrefixRestore, agree, beside, check, completion, curl, ids_of, json_of, metric,
-        parse_ids, prefix_restore, rendered, server_log, stage_usable, tokenized,
+        self, PrefixRestore, agree, base64, beside, check, completion, curl, ids_of, json_of,
+        metric, parse_ids, prefix_restore, rendered, server_log, sha256, stage_usable, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -342,8 +367,8 @@ mod gate {
         bloomery_levers::STEP_STATS,
     ];
 
-    const USAGE: &str =
-        "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix|second-slot --dir <out>";
+    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix|second-slot \
+                         --dir <out> | --arm media --dir <out> --mmproj <file>";
 
     /// The stores both engines size, the seat's floor and the CLI's default.
     const CTX: usize = 2048;
@@ -436,6 +461,27 @@ mod gate {
     /// off before a round of one pass (`serve_seats::glm`'s turn-off why).
     const SKIP_AT_JOIN: &str = "do not end at the call's first position";
     const SKIP_TURNED_OFF: &str = "a NextN pass of several slots takes each slot's whole verify";
+    /// The `media` arm's image, one of the clef images: 448 × 448, a multiple of the GLM tower's
+    /// 28-pixel align, so the tower takes it whole as 16 × 16 merged tokens, well inside a slot's
+    /// half of [`CTX`]. Its digest is `sha256sum` of the checked-in file.
+    const MEDIA_PNG: &str = "free-448x448.png";
+    const MEDIA_PNG_SHA256: &str =
+        "4646fb28084e9f52640ae7ab2ca1bbd48409aaeeb35c916299edb56196f2c4c2";
+    /// The images' directory from this crate's root.
+    const IMAGE_DIR: &str = "../../tools/ref/clefvis/images";
+    /// The image request's question.
+    const MEDIA_ASK: &str = "Describe this image in one short sentence.";
+    /// The text-only request beside it: well over ten times the ids the two prompts can share
+    /// (the template's head), so the slot rule (`serve::sched`'s similarity floor, 0.1 of the
+    /// request's ids) gives it the empty slot, not the one that holds the image.
+    const MEDIA_TEXT: &str = "Explain in plain words, step by step, how a lighthouse works. Say \
+        how the lamp makes its light, how the lens gathers that light into one narrow beam, how the \
+        beam sweeps across the sea as the lens turns, how a sailor tells one lighthouse from \
+        another by the pattern of its flashes, and why such a tower stands on a rocky headland or \
+        a reef instead of in the harbour. Then say what changed when electric lamps replaced oil \
+        lamps, and why most lighthouses now run without a keeper. Finally, compare a lighthouse \
+        with a buoy and a radio beacon, and say when each one is the better aid to a ship that is \
+        crossing a wide strait at night in heavy fog.";
     /// The drafted arm's residency word: no seed expert pinned, one spare a
     /// layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
@@ -460,6 +506,7 @@ mod gate {
         Unset,
         Prefix,
         SecondSlot,
+        Media,
     }
 
     impl Arm {
@@ -471,10 +518,19 @@ mod gate {
                 "unset" => Ok(Arm::Unset),
                 "prefix" => Ok(Arm::Prefix),
                 "second-slot" => Ok(Arm::SecondSlot),
+                "media" => Ok(Arm::Media),
                 other => Err(format!(
-                    "--arm is plain, drafted, slots, unset, prefix or second-slot, not {other}"
+                    "--arm is plain, drafted, slots, unset, prefix, second-slot or media, not {other}"
                 )
                 .into()),
+            }
+        }
+
+        /// The recipe whose gate this arm is, as its PASS line names it.
+        fn recipe(self) -> &'static str {
+            match self {
+                Arm::Media => "weekly-gpu-glm5next-media-serve",
+                _ => "gate-gpu-glm5next-serve",
             }
         }
     }
@@ -555,10 +611,12 @@ mod gate {
     struct Args {
         arm: Arm,
         dir: PathBuf,
+        /// The projector file, the `media` arm's alone.
+        mmproj: Option<PathBuf>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        let (mut arm, mut dir) = (None, None);
+        let (mut arm, mut dir, mut mmproj) = (None, None, None);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let v = it
@@ -567,11 +625,18 @@ mod gate {
             match flag.as_str() {
                 "--arm" => arm = Some(Arm::parse(&v)?),
                 "--dir" => dir = Some(PathBuf::from(v)),
+                "--mmproj" => mmproj = Some(PathBuf::from(v)),
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        match (arm, dir) {
-            (Some(arm), Some(dir)) => Ok(Args { arm, dir }),
+        match (arm, dir, mmproj) {
+            (Some(Arm::Media), Some(_), None) => {
+                Err(format!("--arm media needs --mmproj FILE: {USAGE}").into())
+            }
+            (Some(arm), Some(_), Some(_)) if arm != Arm::Media => {
+                Err(format!("--mmproj is the media arm's: {USAGE}").into())
+            }
+            (Some(arm), Some(dir), mmproj) => Ok(Args { arm, dir, mmproj }),
             _ => Err(USAGE.into()),
         }
     }
@@ -3166,6 +3231,217 @@ mod gate {
         Ok(ok)
     }
 
+    /// The text of the seat's `MEDIA_DRAFT_OFF_WHY`, read from its source: `serve_seats/glm.rs` is
+    /// a module of `bloomery-serve`, another crate than this binary, so its constant cannot be
+    /// named here. A source that no longer declares it in this form is refused by name. The
+    /// constant moves into the lib, and this reader goes with it.
+    fn media_why() -> Result<String, GateError> {
+        const SEAT: &str = include_str!("shared/serve_seats/glm.rs");
+        const HEAD: &str = "const MEDIA_DRAFT_OFF_WHY: &str = \"";
+        let at = SEAT.find(HEAD).ok_or(
+            "serve_seats/glm.rs declares no `const MEDIA_DRAFT_OFF_WHY: &str = \"...\"`, the text \
+             the media arm holds the `mtp prompt` record to",
+        )?;
+        let mut chars = SEAT[at + HEAD.len()..].chars().peekable();
+        let mut why = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => return Ok(why),
+                // A backslash at a line's end joins the next line, its indent dropped.
+                '\\' => match chars.next() {
+                    Some('\n') => while chars.next_if(|c| c.is_whitespace()).is_some() {},
+                    Some(e @ ('"' | '\'' | '\\')) => why.push(e),
+                    other => {
+                        return Err(format!(
+                            "MEDIA_DRAFT_OFF_WHY holds the escape \\{other:?}, which the media \
+                             arm's reader does not take"
+                        )
+                        .into());
+                    }
+                },
+                c => why.push(c),
+            }
+        }
+        Err("MEDIA_DRAFT_OFF_WHY's string is not closed".into())
+    }
+
+    /// [`MEDIA_PNG`] as a `data:` URL, held to its digest: a file that is not the one the clauses
+    /// were written against is refused by name.
+    fn png_url() -> Result<String, GateError> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(IMAGE_DIR)
+            .join(MEDIA_PNG);
+        let got = sha256(&path)?;
+        if got != MEDIA_PNG_SHA256 {
+            return Err(format!(
+                "{} is {got}, not the image the media arm was written against ({MEDIA_PNG_SHA256})",
+                path.display()
+            )
+            .into());
+        }
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(format!("data:image/png;base64,{}", base64(&bytes)))
+    }
+
+    /// The `mtp prompt` records past line `after` of the server's stderr whose why is `why`.
+    fn told_why(err_log: &Path, why: &str, after: usize) -> Result<usize, GateError> {
+        let log = seat_log(&lines_from(err_log, 0)?);
+        let mut told = 0;
+        for f in log.all(&record::MTP_PROMPT)? {
+            if f.at() > after && f.text("skipped")? == why {
+                told += 1;
+            }
+        }
+        Ok(told)
+    }
+
+    /// The slots the `slot call` records past line `after` name, once each, ascending.
+    fn called_slots(err_log: &Path, after: usize) -> Result<Vec<u64>, GateError> {
+        let mut slots = records_past(err_log, after)?
+            .iter()
+            .filter(|r| std::ptr::eq(r.kind(), &record::SLOT_CALL))
+            .map(|r| r.u64("slot"))
+            .collect::<Result<Vec<_>, _>>()?;
+        slots.sort_unstable();
+        slots.dedup();
+        Ok(slots)
+    }
+
+    /// One chat request: its status and answer. A request the server did not answer (it died under
+    /// it) is status 0 with the error printed, so the clause that sent it ends FAIL by name.
+    fn media_post(url: &dyn Fn(&str) -> String, what: &str, body: &Value) -> (u16, Value) {
+        match curl(&url("/v1/chat/completions"), Some(body), false) {
+            Ok((st, text)) => {
+                let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                if st != 200 {
+                    println!("{what}: HTTP {st}: {text}");
+                }
+                (st, v)
+            }
+            Err(e) => {
+                println!("{what}: no answer: {e}");
+                (0, Value::Null)
+            }
+        }
+    }
+
+    /// The media arm (the module header): one server of two slots with the projector, an image chat
+    /// and then a text chat.
+    fn media(dir: &Path, mmproj: &Path) -> Result<bool, GateError> {
+        let why = media_why()?;
+        let image = png_url()?;
+        let mmproj = mmproj
+            .to_str()
+            .ok_or_else(|| format!("--mmproj {}: not UTF-8", mmproj.display()))?;
+        let own = dir.join("media");
+        std::fs::create_dir_all(&own)?;
+        // SERVER_ARGS ends in the one-slot `--parallel 1`; this server takes two slots of the same
+        // total context, one for each request.
+        let mut args: Vec<&str> = SERVER_ARGS.to_vec();
+        let parallel = args.len() - 1;
+        args[parallel] = "2";
+        args.extend(["--mmproj", mmproj]);
+        let err_log = own.join("server.err");
+        let mut served = Served::spawn(&args, &own, DRAFT_ONLY_STATS)?;
+        println!("media server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = true;
+
+        // (m1) the tower's seat, from the records after the load.
+        let log = server_log(&err_log, record::BLOOMERY_SERVE_GLM)?;
+        let plan = log
+            .first(&record::PLAN)?
+            .ok_or("the media server printed no `plan` record")?;
+        let stage = plan
+            .csv("devices")?
+            .first()
+            .and_then(|d| d.split(':').nth(1))
+            .map(str::to_owned)
+            .ok_or_else(|| format!("the `plan` record names no stage card: {}", plan.line()))?;
+        let seen = match log.first(&record::VISION)? {
+            Some(f) => Some((f.word("card")?.to_owned(), f.word("seat")?.to_owned())),
+            None => None,
+        };
+        println!("media vision record (card, seat) {seen:?}; the plan's stage card {stage}");
+        check(
+            &mut ok,
+            "media_tower_sits_off_the_plan",
+            seen.as_ref().is_some_and(|(card, seat)| {
+                seat == "off-plan" && !card.to_lowercase().contains(&stage.to_lowercase())
+            }),
+        );
+
+        // (m2) the image chat on one slot.
+        let after_load = lines_from(&err_log, 0)?.len();
+        let body = json!({
+            "messages": [{ "role": "user", "content": [
+                { "type": "image_url", "image_url": { "url": image } },
+                { "type": "text", "text": MEDIA_ASK },
+            ] }],
+            "temperature": 0, "max_tokens": N_PREDICT, "cache_prompt": false,
+        });
+        let (st, reply) = media_post(&url, "media chat", &body);
+        let message = &reply["choices"][0]["message"];
+        let text: String = ["content", "reasoning_content"]
+            .iter()
+            .filter_map(|k| message[*k].as_str())
+            .collect();
+        let completion = reply["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+        let told = told_why(&err_log, &why, after_load)?;
+        let image_slots = called_slots(&err_log, after_load)?;
+        println!(
+            "media chat: HTTP {st}, {completion} completion tokens, {} chars of content and \
+             reasoning_content, prompt tokens {}, draft_n={}; `mtp prompt` records naming the media \
+             why: {told}; slots called {image_slots:?}",
+            text.chars().count(),
+            reply["usage"]["prompt_tokens"],
+            reply["timings"]["draft_n"],
+        );
+        check(
+            &mut ok,
+            "media_chat_is_served_and_names_the_draft_off_once",
+            st == 200 && completion > 0 && !text.is_empty() && told == 1,
+        );
+
+        // (m3) the text chat on the other slot, while the image slot is off.
+        let text_ids = rendered(&url, json!([{ "role": "user", "content": MEDIA_TEXT }]))?;
+        let after_media = lines_from(&err_log, 0)?.len();
+        let body = json!({
+            "messages": [{ "role": "user", "content": MEDIA_TEXT }],
+            "temperature": 0, "max_tokens": N_PREDICT, "cache_prompt": false,
+        });
+        let (st, reply) = media_post(&url, "text chat", &body);
+        let drafted = reply["timings"]["draft_n"].as_u64().unwrap_or(0);
+        let told = told_why(&err_log, &why, after_media)?;
+        let text_slots = called_slots(&err_log, after_media)?;
+        println!(
+            "text chat: a prompt of {} ids, HTTP {st}, draft_n={drafted} draft_n_accepted={}; \
+             `mtp prompt` records naming the media why: {told}; slots called {text_slots:?}",
+            text_ids.len(),
+            reply["timings"]["draft_n_accepted"],
+        );
+        // The scheduler seats a request that clears no slot's prefix floor on a slot that holds no
+        // ids, so the text chat takes the slot the image chat left empty.
+        let other_slot = !image_slots.is_empty()
+            && !text_slots.is_empty()
+            && text_slots.iter().all(|s| !image_slots.contains(s));
+        check(
+            &mut ok,
+            "media_text_slot_keeps_drafting",
+            st == 200 && drafted > 0 && other_slot,
+        );
+
+        // (m4) the text request's slot never prints the media why.
+        check(
+            &mut ok,
+            "media_text_slot_never_prints_the_media_why",
+            st == 200 && told == 0,
+        );
+        println!("media server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         for (name, set) in [
@@ -3191,9 +3467,15 @@ mod gate {
             Arm::Unset => unset_load(&a.dir)?,
             Arm::Prefix => prefix_alone(&a.dir)?,
             Arm::SecondSlot => second_slot(&a.dir)?,
+            Arm::Media => media(
+                &a.dir,
+                a.mmproj
+                    .as_deref()
+                    .ok_or("--arm media needs --mmproj FILE")?,
+            )?,
         };
         if ok {
-            println!("gate-gpu-glm5next-serve: PASS");
+            println!("{}: PASS", a.arm.recipe());
             Ok(())
         } else {
             Err(checks_failed())
