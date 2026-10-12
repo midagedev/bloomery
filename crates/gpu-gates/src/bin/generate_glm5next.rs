@@ -1292,14 +1292,19 @@ mod cli {
             kept[k - 1] += 1;
             widths[rows - 1] += 1;
         }
-        Record::new(&record::MTP_SUMMARY)
-            .u("proposals", sink.passes.iter().filter(|p| p.0).count())
-            .list("kept", &kept)
-            .list("widths", &widths)
-            .u("positions", sink.passes.iter().map(|p| p.1).sum::<usize>())
-            .u("passes", sink.passes.len())
-            .f("tok/s(positions)", rate)
-            .print();
+        let proposals = sink.passes.iter().filter(|p| p.0).count();
+        record::mtp_stats(
+            Record::new(&record::MTP_SUMMARY)
+                .u("proposals", proposals)
+                .list("kept", &kept)
+                .list("widths", &widths)
+                .u("positions", sink.passes.iter().map(|p| p.1).sum::<usize>())
+                .u("passes", sink.passes.len())
+                .f("tok/s(positions)", rate),
+            spec.draft().stats().as_ref(),
+            proposals,
+        )?
+        .print();
         if a.timed {
             let mut sorted = counted.clone();
             sorted.sort_by(f64::total_cmp);

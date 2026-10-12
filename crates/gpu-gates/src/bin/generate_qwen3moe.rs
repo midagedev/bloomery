@@ -419,7 +419,7 @@ mod cli {
     use model::placement::{Device, Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
-    use runtime::width::{Choosing, Chosen as _, Mode as WidthMode};
+    use runtime::width::{Choosing, Chosen as _, Mode as WidthMode, Stats};
     use runtime::{
         Advance, Committed, Exhausted, Forced, PassSink, Picked, Speculative, Stop, Target,
     };
@@ -2845,7 +2845,11 @@ mod cli {
         if let Some(t) = &run.tok {
             println!("text {:?}", t.decode(&tokens));
         }
-        mtp_summary(&sink.passes, warm);
+        // The chooser outlives the arm: its account is read here and the
+        // count starts over for the next arm.
+        let stats = spec.draft().stats();
+        let _ = spec.draft_mut().take_tally();
+        mtp_summary(&sink.passes, warm, stats.as_ref())?;
         if run.windows {
             mtp_windows(&sink.passes, &spec.draft_mut().draft_mut().take_windows())?;
         }
@@ -2879,8 +2883,13 @@ mod cli {
 
     /// The `mtp summary` record: the windows' proposals, the kept lengths'
     /// and the verified widths' histograms, the positions and their rate
-    /// over the counted passes.
-    fn mtp_summary(passes: &[(bool, usize, usize, f64, Duration)], warm: usize) {
+    /// over the counted passes, and the width chooser's account of the arm
+    /// (`record::mtp_stats`).
+    fn mtp_summary(
+        passes: &[(bool, usize, usize, f64, Duration)],
+        warm: usize,
+        stats: Option<&Stats>,
+    ) -> Result<(), GateError> {
         let mut kept = [0u64; 4];
         let mut widths = [0u64; 4];
         let mut positions = 0usize;
@@ -2899,14 +2908,19 @@ mod cli {
             .iter()
             .map(|&(_, _, _, _, w)| w.as_secs_f64() * 1e3)
             .sum();
-        Record::new(&record::MTP_SUMMARY)
-            .u("proposals", proposals)
-            .list("kept", &kept)
-            .list("widths", &widths)
-            .u("positions", positions)
-            .u("passes", passes.len())
-            .f("tok/s(positions)", counted_positions as f64 * 1e3 / ms)
-            .print();
+        record::mtp_stats(
+            Record::new(&record::MTP_SUMMARY)
+                .u("proposals", proposals)
+                .list("kept", &kept)
+                .list("widths", &widths)
+                .u("positions", positions)
+                .u("passes", passes.len())
+                .f("tok/s(positions)", counted_positions as f64 * 1e3 / ms),
+            stats,
+            proposals,
+        )?
+        .print();
+        Ok(())
     }
 
     /// The `mtp window` records: each drafted window beside its pass, which

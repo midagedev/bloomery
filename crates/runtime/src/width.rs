@@ -29,11 +29,13 @@
 //! rotate the widths, widest first, and nothing is decided. Past that two
 //! choices are made, each on its own profile:
 //!
-//! - the gate, on the mean profile: an open chooser closes as soon as the
-//!   plain step's rate is above every drafted width's, a closed one opens
-//!   only once a drafted width beats the plain step by [`Rule::margin`],
-//!   and an open one's width moves to a rival only past the margin — one
-//!   window's profile never moves it;
+//! - the gate, on the mean profile: an open chooser closes only once the
+//!   plain step's rate is above every drafted width's by
+//!   [`Rule::margin_close`] and, when it opened after a close, every width's
+//!   cost holds [`Rule::dwell`] readings taken since; a closed one opens only
+//!   once a drafted width beats the plain step by [`Rule::margin`], and an
+//!   open one's width moves to a rival only past the margin — one window's
+//!   profile never moves it;
 //! - while open, each window's width, on that window's own profile: the
 //!   gate's width, or another its profile rates above it by the margin.
 //!
@@ -145,6 +147,42 @@ pub struct Rule {
     /// incumbent's by this factor, and a drafted width opens a closed
     /// chooser when it beats the plain step's by it; 1 is no hysteresis.
     pub margin: f64,
+    /// An open chooser closes only when the plain step's rate beats the best
+    /// drafted width's by this factor: the close half of the band, the open
+    /// half being [`Rule::margin`]; 1 closes the moment the plain step is
+    /// ahead.
+    ///
+    /// Derivation: the gate compares `ρ = E · t̃₀ / t̃_w`, two medians of
+    /// [`Rule::timings`] readings and `E` from the calibration. A median of 8
+    /// readings of relative spread `c` has spread `m · c`, `m ≈ 0.41` (the
+    /// median of 8 of a CV-`c` distribution, simulated for `c ≤ 0.3`;
+    /// 0.443 asymptotically), so `σ² = (m c₀)² + (m c_w)² + σ_E²`, `σ_E` the
+    /// calibration's own spread. The band is one σ: `margin_close = exp σ`, a
+    /// drafted width closed only when the plain step leads by more than the
+    /// comparison's noise. The floor of the readings' spread is the spread
+    /// across rounds of a forced-id run: ranges of 2 % (the plain step) and
+    /// 15 % (a window) over 2.53, the expected range of 6 normal draws in σ,
+    /// give `c₀ = 0.8 %`, `c_w = 6.0 %`, and the kept rows' 12 % gives
+    /// `σ_E = 4.6 %`: `σ = 5.2 %`, `exp σ = 1.05`.
+    /// PIN(2026-10-13): 1.05. Two things the floor leaves out: a paged plan's
+    /// pass walls spread by `c ≈ 0.25` within a run (σ 15 %, 1.16), and the
+    /// gate looks at nearly every pass, about one independent look in 8, so
+    /// no close in 1024 passes takes `z ≈ 3.35` σ (1.19 at the floor); both
+    /// are past the 1.073 the warm-up gate test's close ratio allows, and
+    /// [`Rule::dwell`] carries the rest.
+    pub margin_close: f64,
+    /// Readings of every width's cost, taken since the gate last opened, an
+    /// open chooser needs before it may close; 0 closes on the rings as they
+    /// stand. The gate that opened rested on the rings as they stood then, so
+    /// a close on them is the same evidence read again: a median stops
+    /// resting on a reading from before the open when most of its ring is
+    /// new, `timings / 2 + 1`. While open only the held width reads every
+    /// pass; each other width, the plain step among them, reads once a
+    /// probe, and the probes take the widths in turn, so the dwell lasts at
+    /// least `dwell · probe_every · (widths − 1)` passes. A chooser that
+    /// starts open has no such evidence to wait out: the dwell follows a
+    /// close that opened again.
+    pub dwell: usize,
     /// Readings a width's cost median holds.
     pub timings: usize,
     /// Readings of every width's cost before the chooser compares rates.
@@ -172,6 +210,8 @@ impl Rule {
     /// in 256 passes once its first two probes are spent.
     pub const DEFAULT: Rule = Rule {
         margin: 1.03,
+        margin_close: 1.05,
+        dwell: 5,
         timings: 8,
         min_timings: 4,
         calibrate: 0.05,
@@ -190,10 +230,14 @@ impl Rule {
     pub fn check(&self) -> Result<(), WidthError> {
         let refused = if !(self.margin.is_finite() && self.margin >= 1.0) {
             "the margin must be finite and at least 1"
+        } else if !(self.margin_close.is_finite() && self.margin_close >= 1.0) {
+            "the close margin must be finite and at least 1"
         } else if self.min_timings == 0 {
             "a cost of zero readings"
         } else if self.timings < self.min_timings {
             "a cost's readings fewer than its decision minimum"
+        } else if self.dwell > self.timings {
+            "a dwell of more readings than a cost holds"
         } else if !(self.calibrate > 0.0 && self.calibrate <= 1.0) {
             "the calibration's step must be inside (0, 1]"
         } else if self.probe_every == 0 || self.probe_closed == 0 || self.shadow_every == 0 {
@@ -359,6 +403,9 @@ struct Flight {
     /// A closed chooser's probe: its reading may start its width's
     /// readings over.
     probe: bool,
+    /// `E` of the width a verify runs over the window's own profile; 0 for a
+    /// plain step.
+    predicted: f64,
 }
 
 /// What this pass's proposal left for its accept or step to tell.
@@ -385,7 +432,7 @@ struct Shadow {
 
 /// The passes since the last take ([`Choosing::take_tally`]): what a
 /// per-request draft record holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tally {
     /// Passes that verified a proposal.
     pub windows: u64,
@@ -397,6 +444,15 @@ pub struct Tally {
     /// The chooser's own passes counted while the gate stood closed, its
     /// probes among them; a round's pass ([`Choosing::round_ran`]) is none.
     pub closed: u64,
+    /// The windows the chooser itself proposed and verified: the ones the
+    /// next two fields cover (a round's window, [`Choosing::round_ran`], has
+    /// no prediction and is in `windows` only).
+    pub scored: u64,
+    /// The rows those windows kept, summed.
+    pub scored_rows: u64,
+    /// `E` of the width each of them ran, over the window's own profile at
+    /// its proposal, summed.
+    pub predicted: f64,
 }
 
 impl Tally {
@@ -406,6 +462,9 @@ impl Tally {
             kept: vec![0; widths],
             widths: vec![0; widths],
             closed: 0,
+            scored: 0,
+            scored_rows: 0,
+            predicted: 0.0,
         }
     }
 
@@ -439,6 +498,29 @@ pub struct GateState {
     /// The mean acceptance profile the gate rates the widths by, `a_i` one a
     /// proposal index.
     pub a: Vec<f64>,
+}
+
+/// What the chooser measured of itself ([`Choosing::stats`]): its
+/// calibration now, and over the passes since the last take
+/// ([`Choosing::take_tally`]) the passes it ran closed and the rows a window
+/// was predicted to keep against the rows it kept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stats {
+    /// The calibration `g_i`, one a proposal index.
+    pub gains: Vec<f64>,
+    /// The running mean of the draft's own `p_i`, before the calibration: the
+    /// gate rates the widths by `mean_i · g_i`.
+    pub mean: Vec<f64>,
+    /// The chooser's own passes counted while the gate stood closed
+    /// ([`Tally::closed`]).
+    pub closed: u64,
+    /// The windows the two means below cover ([`Tally::scored`]).
+    pub windows: u64,
+    /// The mean over those windows of `E` of the width each ran, over the
+    /// window's own profile; `None` with no window.
+    pub predicted_e: Option<f64>,
+    /// The mean rows those windows kept; `None` with no window.
+    pub realized_e: Option<f64>,
 }
 
 /// A draft behind the width chooser (see the module): its proposals
@@ -477,6 +559,10 @@ pub struct Choosing<D, C = Wall> {
     medians: Vec<Option<f64>>,
     /// The pass each width's cost was last read at.
     read_at: Vec<u64>,
+    /// Readings of each width's cost since the gate last opened, and whether
+    /// that open's dwell ([`Rule::dwell`]) is still running.
+    fresh: Vec<usize>,
+    dwelling: bool,
     /// The widths whose readings are not all in: the warm-up's rotation,
     /// or a width a closed probe started over.
     warm: VecDeque<usize>,
@@ -545,6 +631,8 @@ where
                 .collect(),
             medians: vec![None; widths],
             read_at: vec![0; widths],
+            fresh: vec![0; widths],
+            dwelling: false,
             warm: (0..widths).rev().collect(),
             ids: vec![0; D::WIDTH],
             p: vec![0.0; D::WIDTH],
@@ -592,6 +680,27 @@ impl<D, C: Clock> Choosing<D, C> {
     #[must_use]
     pub fn gains(&self) -> &[f64] {
         &self.gains
+    }
+
+    /// The chooser's calibration and what it predicted against what its
+    /// windows kept, over the passes since the last take; `None` under
+    /// [`Mode::Fixed`], which counts nothing. A read: the count starts over
+    /// with [`Choosing::take_tally`].
+    #[must_use]
+    pub fn stats(&self) -> Option<Stats> {
+        if self.mode == Mode::Fixed {
+            return None;
+        }
+        let t = &self.tally;
+        let mean_of = |sum: f64| (t.scored > 0).then(|| sum / t.scored as f64);
+        Some(Stats {
+            gains: self.gains.clone(),
+            mean: self.mean.clone(),
+            closed: t.closed,
+            windows: t.scored,
+            predicted_e: mean_of(t.predicted),
+            realized_e: mean_of(t.scored_rows as f64),
+        })
     }
 
     /// The passes since the last take, and the count started over.
@@ -663,6 +772,7 @@ impl<D, C: Clock> Choosing<D, C> {
             self.costs[k].push(ms)?;
         }
         self.read_at[k] = self.passes;
+        self.fresh[k] += 1;
         self.medians[k] = if self.costs[k].len() >= self.rule.min_timings {
             self.costs[k].median()
         } else {
@@ -723,6 +833,9 @@ impl<D, C: Clock> Choosing<D, C> {
                 self.since_shadow = 0;
                 if next == 0 {
                     self.closed_period = self.rule.first_closed_probe();
+                } else {
+                    self.fresh.fill(0);
+                    self.dwelling = true;
                 }
             }
             self.width = next;
@@ -746,6 +859,8 @@ impl<D, C: Clock> Choosing<D, C> {
             *a = (p * g).clamp(0.0, 1.0);
         }
         let held = self.rate(&mean, self.width);
+        self.dwelling = self.dwelling && self.fresh.iter().any(|&n| n < self.rule.dwell);
+        let dwelling = self.dwelling;
         let decided = self
             .rate(&mean, 0)
             .zip(self.best(&mean))
@@ -754,7 +869,7 @@ impl<D, C: Clock> Choosing<D, C> {
                 match held.filter(|_| self.width > 0) {
                     None if best > plain * margin => b,
                     None => 0,
-                    Some(_) if best < plain => 0,
+                    Some(_) if best * self.rule.margin_close < plain && !dwelling => 0,
                     Some(r) if b != self.width && best > r * margin => b,
                     Some(_) => self.width,
                 }
@@ -871,6 +986,7 @@ impl<D, C: Clock> Choosing<D, C> {
             at,
             ends: None,
             probe: false,
+            predicted: 0.0,
         });
         self.turn = Some(Turn::Plain);
         0
@@ -887,6 +1003,7 @@ impl<D, C: Clock> Choosing<D, C> {
             at,
             ends: None,
             probe,
+            predicted: expected(&self.a, k),
         });
         self.turn = Some(Turn::Verify { k });
         k
@@ -1025,7 +1142,11 @@ where
                 if chose == k && f.kind == Kind::Verify && f.ends.is_none() =>
             {
                 f.ends = u32::try_from(accepted).ok().map(|a| f.pos + a);
+                let predicted = f.predicted;
                 self.calibrate(k, kept);
+                self.tally.scored += 1;
+                self.tally.scored_rows += accepted as u64;
+                self.tally.predicted += predicted;
             }
             _ => self.drop_flight(),
         }
@@ -1361,6 +1482,10 @@ mod tests {
 
     impl PairRig {
         fn new(acc: f64) -> PairRig {
+            PairRig::with(acc, Rule::DEFAULT)
+        }
+
+        fn with(acc: f64, rule: Rule) -> PairRig {
             let clock = Clockwork::new(PLAIN_US, PAIR_US);
             let acc = Rc::new(Cell::new(acc));
             let draft = Single {
@@ -1368,7 +1493,7 @@ mod tests {
                 draws: 0,
             };
             let choosing = draft
-                .choosing_by(Mode::Cost, Rule::DEFAULT, Rc::clone(&clock))
+                .choosing_by(Mode::Cost, rule, Rc::clone(&clock))
                 .unwrap();
             let mut spec = Speculative::new(choosing);
             let mut t = Mock::new()
@@ -1484,6 +1609,229 @@ mod tests {
         );
     }
 
+    /// The chooser's stats are what it predicted and what it kept: over a
+    /// calibrated draft's windows the mean `E` it predicted for the width
+    /// each ran is the mean rows they kept (the acceptances drawn exactly, so
+    /// the two agree within the calibration's own spread, 3 %), the realized
+    /// mean is the tally's `E`, the calibration and the mean profile are one
+    /// a proposal index; a losing draft's closed passes are the tally's; a
+    /// take starts the count over (no window, no `E`); and `Mode::Fixed`
+    /// counts nothing.
+    #[test]
+    fn the_stats_hold_what_was_predicted_and_kept() {
+        let mut r = Rig::of([0.80, 0.8125, 0.846], &LINEAR);
+        r.run(1_000);
+        let s = r.choosing().stats().expect("a cost chooser has stats");
+        let t = r.choosing().take_tally();
+        let (predicted, realized) = (s.predicted_e.unwrap(), s.realized_e.unwrap());
+        assert_eq!(s.windows, t.windows, "{s:?}");
+        assert!((realized - t.e()).abs() < 1e-12, "{s:?} {t:?}");
+        assert!(
+            (predicted / realized - 1.0).abs() < 0.03,
+            "predicted {predicted} against kept {realized}"
+        );
+        assert_eq!((s.gains.len(), s.mean.len()), (3, 3), "{s:?}");
+        assert!(s.mean.iter().all(|&p| (0.7..0.9).contains(&p)), "{s:?}");
+        let s = r.choosing().stats().unwrap();
+        assert_eq!((s.windows, s.predicted_e, s.realized_e), (0, None, None));
+        let mut r = Rig::of([0.40, 0.20, 0.10], &[71_000, 95_000, 118_000]);
+        r.run(400);
+        let s = r.choosing().stats().unwrap();
+        let t = r.choosing().take_tally();
+        assert!(s.closed > 0 && s.closed == t.closed, "{s:?} {t:?}");
+        let mut r = Rig::with([0.8; 3], [0.8; 3], &LINEAR, Mode::Fixed, Rule::DEFAULT);
+        r.run(50);
+        assert_eq!(r.choosing().stats(), None);
+    }
+
+    /// A seeded stream of values in `[-1, 1]` (xorshift64).
+    struct Noise(u64);
+
+    impl Noise {
+        fn next(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+        }
+    }
+
+    /// The rig's step and verify walls each scaled by `1 + j·u`, `u` a fresh
+    /// draw in `[-1, 1]` per wall: readings of standard deviation `j / √3`
+    /// about their wall, and no reading outside it by more than `j`.
+    fn jitter(r: &Rig, by_rows: [u64; 3], j: f64, noise: &mut Noise) {
+        let mut wall = |us: u64| (us as f64 * (1.0 + j * noise.next())).round() as u64;
+        r.clock.step.set(wall(STEP_US));
+        r.clock
+            .verify_rows(&[wall(by_rows[0]), wall(by_rows[1]), wall(by_rows[2])]);
+    }
+
+    /// Passes of `n` at which the gate stood closed, the rig's walls
+    /// jittered by `j` ([`jitter`]) before each pass.
+    fn closed_passes(r: &mut Rig, by_rows: [u64; 3], j: f64, seed: u64, n: usize) -> usize {
+        let mut noise = Noise(seed);
+        let mut closed = 0;
+        for _ in 0..n {
+            jitter(r, by_rows, j, &mut noise);
+            r.run(1);
+            closed += usize::from(r.choosing().width() == 0);
+        }
+        closed
+    }
+
+    /// A drafted width ahead of the plain step by 2 % at the rig's walls
+    /// (width 1 of acceptance 0.4244: E 1.4244 over the verify of two rows
+    /// and the draft's walk, against the step) and the others behind it
+    /// [derived]: 1.4244 · 37 450 / 52 300 = 1.0198.
+    const THIN: [f64; 3] = [0.4244, 0.10, 0.05];
+
+    /// Noise inside the close band does not close an open draft: the best
+    /// width ahead of the plain step by 2 %, under the margin that opens a
+    /// closed one, with each wall jittered by the spread the margin is
+    /// derived from ([`Rule::margin_close`]), stays open over 1024 passes on
+    /// each of 8 seeds. Closing at the first median that puts the plain step
+    /// ahead closes it on the first unlucky draw.
+    #[test]
+    fn noise_inside_the_band_does_not_close_the_draft() {
+        for seed in 1..=8u64 {
+            let mut r = Rig::of(THIN, &LINEAR);
+            let closed = closed_passes(
+                &mut r,
+                LINEAR,
+                JITTER,
+                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                1_024,
+            );
+            assert_eq!(
+                closed, 0,
+                "seed {seed}: the gate stood closed for {closed} passes"
+            );
+        }
+    }
+
+    /// A drafted width ahead of the plain step by 15 % [derived]: acceptance
+    /// 0.606 on width 1, 1.606 · 37 450 / 52 300 = 1.150; the others behind.
+    const AHEAD: [f64; 3] = [0.606, 0.10, 0.05];
+
+    /// The readings' spread within a run of the paged plan, as a standard
+    /// deviation of the walls about their means, and the jitter that makes
+    /// it: uniform `±j` has a standard deviation of `j / √3`.
+    const SPREAD: f64 = 0.25;
+
+    /// A draft that pays by 15 % under the spread the run's pass walls show
+    /// is closed for 8 % of 1024 passes at most. The gate looks at nearly
+    /// every pass and its medians of 8 spread by ten percent, so no rule
+    /// keeps it open through a run: the one that closes on the first median
+    /// that puts the plain step ahead, or on the close band alone, leaves it
+    /// closed for more than that; the dwell, which makes a close that follows
+    /// a reopen rest on readings taken since, keeps it under.
+    /// PIN(2026-10-13): 8 % of the passes, between the close band alone and
+    /// the band with the dwell on these 40 seeds.
+    #[test]
+    fn a_draft_that_pays_under_the_runs_spread_is_closed_for_8_percent_at_most() {
+        let (seeds, passes) = (40u64, 1_024usize);
+        let mut closed = 0;
+        for seed in 1..=seeds {
+            let mut r = Rig::of(AHEAD, &LINEAR);
+            let jitter = SPREAD * 3f64.sqrt();
+            let noise = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            closed += closed_passes(&mut r, LINEAR, jitter, noise, passes);
+        }
+        let total = seeds as usize * passes;
+        assert!(
+            closed * 100 <= total * 8,
+            "closed for {closed} of {total} passes: over 8 %"
+        );
+    }
+
+    /// The passes between a reopen and the close that follows it, the draft
+    /// turning bad at the reopen: the gate closes on a slow warm-up's
+    /// readings, opens again on the first probe's, and then the draft's
+    /// acceptance falls to 0.05 and its verify to 1.5 of its cost.
+    fn shut_after_reopen(rule: Rule) -> u32 {
+        let warm = u32::try_from(rule.min_timings).unwrap();
+        let mut r = PairRig::with(0.25, rule);
+        r.clock.verify.set(PAIR_US * 5 / 4);
+        for _ in 0..warm {
+            r.pass();
+        }
+        r.clock.verify.set(PAIR_US);
+        r.acc.set(0.9);
+        let (mut closed, mut reopen) = (false, None);
+        for i in warm + 1..=3_000u32 {
+            let w = r.pass().0;
+            match (closed, reopen) {
+                (false, _) => closed = w == 0,
+                (true, None) if w > 0 => {
+                    reopen = Some(i);
+                    r.acc.set(0.05);
+                    r.clock.verify.set(PAIR_US * 3 / 2);
+                }
+                (true, Some(at)) if w == 0 => return i - at,
+                _ => {}
+            }
+        }
+        panic!("the gate did not close, reopen and close again: reopened at {reopen:?}");
+    }
+
+    /// A close that follows a reopen waits for the readings since it: on the
+    /// band alone the bad draft is closed within a probe period of the
+    /// reopen; with the dwell, once the plain step's ring and the pair's hold
+    /// [`Rule::dwell`] readings taken since the reopen, and the plain step
+    /// reads once a probe while open, so at least `dwell · probe_every`
+    /// passes after it. The dwell is a majority of the ring.
+    #[test]
+    fn a_close_after_a_reopen_waits_for_the_readings_since() {
+        let rule = Rule::DEFAULT;
+        assert_eq!(rule.dwell, rule.timings / 2 + 1, "a majority of the ring");
+        let bare = shut_after_reopen(Rule { dwell: 0, ..rule });
+        let held = shut_after_reopen(rule);
+        let at_least = u32::try_from(rule.dwell).unwrap() * rule.probe_every;
+        assert!(
+            bare < rule.probe_every,
+            "without the dwell the close came {bare} passes after the reopen"
+        );
+        assert!(
+            held >= at_least,
+            "closed {held} passes after the reopen: the dwell is {at_least}"
+        );
+    }
+
+    /// The jitter of the band test: walls scaled by up to ±`JITTER`, a
+    /// standard deviation of `JITTER / √3`.
+    const JITTER: f64 = 0.035;
+
+    /// A uniform speed-up does not move the choice: every step and verify
+    /// wall halves at one pass (the draft's walk stays), and the gate and its
+    /// width stay where the rates put them, for each of the settled cases of
+    /// [`picks_the_width_that_pays`]. The rings of the widths the incumbent
+    /// does not run hold the old walls until their probes, and the choice
+    /// holds meanwhile.
+    #[test]
+    fn a_uniform_speed_up_keeps_the_choice() {
+        let losing = [71_000, 95_000, 118_000];
+        for (acc, by_rows, what) in [
+            ([0.80, 0.8125, 0.846], LINEAR, "prose"),
+            ([0.95, 0.90, 0.30], LINEAR, "a losing third id"),
+            ([0.75, 0.55, 0.35], LINEAR, "chat"),
+            ([0.40, 0.20, 0.10], losing, "a losing draft"),
+        ] {
+            let mut r = Rig::of(acc, &by_rows);
+            r.run(1_000);
+            let before = r.choosing().width();
+            r.clock.step.set(STEP_US / 2);
+            r.clock.verify_rows(&by_rows.map(|us| us / 2));
+            for i in 0..2_000 {
+                r.run(1);
+                assert_eq!(
+                    r.choosing().width(),
+                    before,
+                    "{what}: the choice left {before} at pass {i} after the speed-up"
+                );
+            }
+        }
+    }
+
     /// The gate a long run settles on, the passes by width, and the
     /// positions a microsecond of the mock's clock over its last 500 passes.
     fn settles(r: &mut Rig, n: usize) -> (usize, Vec<u64>, f64) {
@@ -1562,14 +1910,23 @@ mod tests {
             c.width
         };
         // The best drafted width 1 % above the plain step: open stays open,
-        // closed stays closed; 1 % below it, open closes.
+        // closed stays closed; 1 % below it, open stays open (inside the
+        // close band); 6 % below it, past 1 / `margin_close`, open closes.
+        // PIN(2026-10-13): the 1 % case closed before the close band; the
+        // 6 % mean is E 1.504 / 1.6 = 0.94 of the plain step's rate, under
+        // 1 / 1.05 = 0.952.
         let thin = [0.616, 0.0, 0.0];
         assert_eq!(gate(&mut c, 1, thin), 1, "closed while a width still paid");
         assert_eq!(gate(&mut c, 0, thin), 0, "opened inside the margin");
         assert_eq!(
             gate(&mut c, 1, [0.584, 0.0, 0.0]),
+            1,
+            "closed inside the close band"
+        );
+        assert_eq!(
+            gate(&mut c, 1, [0.504, 0.0, 0.0]),
             0,
-            "stayed open while it lost"
+            "stayed open past the close band"
         );
         assert_eq!(
             gate(&mut c, 0, [0.70, 0.0, 0.0]),
@@ -1913,6 +2270,27 @@ mod tests {
             ),
             (
                 Rule {
+                    dwell: 9,
+                    ..Rule::DEFAULT
+                },
+                "a dwell of more readings than a cost holds",
+            ),
+            (
+                Rule {
+                    margin_close: 0.99,
+                    ..Rule::DEFAULT
+                },
+                "the close margin must be finite and at least 1",
+            ),
+            (
+                Rule {
+                    margin_close: f64::NAN,
+                    ..Rule::DEFAULT
+                },
+                "the close margin must be finite and at least 1",
+            ),
+            (
+                Rule {
                     min_timings: 0,
                     ..Rule::DEFAULT
                 },
@@ -2033,6 +2411,7 @@ mod tests {
             kept: vec![1, 1, 0, 1],
             widths: vec![5, 0, 1, 2],
             closed: 0,
+            ..Tally::new(4)
         };
         assert!((t.e() - 7.0 / 3.0).abs() < 1e-12);
         assert_eq!(t.passes(), 8);

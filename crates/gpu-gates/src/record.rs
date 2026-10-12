@@ -2492,7 +2492,13 @@ pub static MTP_SUMMARY: Kind = Kind {
           length, 1 to the window's rows: 4 for Qwen3.8, 2 for GLM-5.3), every pass by the ids \
           it verified (one count a width, 0 a plain step; the draft's whole width on every pass \
           under `BLOOMERY_MTP_WIDTH=fixed`), the positions and passes over the run, and the \
-          kept passes' positions per second.",
+          kept passes' positions per second; under `BLOOMERY_MTP_WIDTH=cost` the width \
+          chooser's own account of the arm: its calibration a proposal index (`gains`), the \
+          mean of the draft's own probabilities a proposal index before the calibration \
+          (`mean`, the gate rates the widths by `mean · gains`), its own passes it ran with the \
+          gate closed (`closed`) and, with a window, the mean rows it predicted the windows' \
+          widths to keep over each window's own profile (`predicted_e`) against the mean rows \
+          they kept (`realized_e`).",
     parts: &[
         key("proposals", U64, ""),
         key("kept", List, "windows"),
@@ -2500,6 +2506,11 @@ pub static MTP_SUMMARY: Kind = Kind {
         key("positions", U64, "positions"),
         key("passes", U64, ""),
         key("tok/s(positions)", F64(2), "tok/s"),
+        opt("gains", Csv, ""),
+        opt("mean", Csv, ""),
+        opt("closed", U64, "passes"),
+        opt("predicted_e", F64(3), ""),
+        opt("realized_e", F64(3), ""),
     ],
 };
 
@@ -3632,6 +3643,36 @@ pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Reco
         .csv("costs", costs)
         .csv("a", s.a.iter().map(|a| format!("{a:.3}")))
         .u("closed", closed)
+}
+
+/// The width chooser's account of an arm on `r`, an `mtp summary`: its
+/// calibration, the mean of the draft's probabilities and its closed passes,
+/// and, when a window ran, the rows it predicted against the rows kept. A
+/// chooser that counts nothing (`BLOOMERY_MTP_WIDTH=fixed`, `None`) leaves
+/// the parts out. The chooser's windows are the passes' own: `proposals`, the
+/// passes that verified a proposal, must equal them, or the counts are of two
+/// different arms and the record is refused by name.
+#[cfg(feature = "gpu")]
+pub fn mtp_stats(
+    r: Record,
+    s: Option<&runtime::width::Stats>,
+    proposals: usize,
+) -> Result<Record, String> {
+    let Some(s) = s else { return Ok(r) };
+    if s.windows != proposals as u64 {
+        return Err(format!(
+            "mtp summary: the width chooser counted {} windows, the passes proposed {proposals}",
+            s.windows
+        ));
+    }
+    let r = r
+        .csv("gains", s.gains.iter().map(|g| format!("{g:.4}")))
+        .csv("mean", s.mean.iter().map(|p| format!("{p:.4}")))
+        .u("closed", s.closed);
+    Ok(match (s.predicted_e, s.realized_e) {
+        (Some(p), Some(e)) => r.f("predicted_e", p).f("realized_e", e),
+        _ => r,
+    })
 }
 
 /// `gate_nvtier`'s rows: the tier's counters, the residency rule's two
