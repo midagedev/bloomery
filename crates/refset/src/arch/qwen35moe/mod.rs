@@ -1,10 +1,12 @@
 //! The Qwen3.6-35B-A3B families. The node dumps are dumped from lmstudio's
 //! Q4_K_M file, [`MODEL`], by the ik tree [`IK_BUILD`]
-//! (`tools/ref/models/qwen35moe.sh`).
+//! (`tools/ref/models/qwen35moe.sh`). The fixture tier's mirror of the node
+//! dumps is in [`fixture`].
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
+pub mod fixture;
 pub mod vis;
 
 /// The file every qwen35moe set is dumped from and the tree runs. The
@@ -53,6 +55,7 @@ pub static IK: Family = Family {
 /// The architecture's families, in the order `refset-check` lists them.
 pub static FAMILIES: &[&Family] = &[
     &IK,
+    &fixture::IK,
     &vis::TAPS,
     &vis::CHATIDS,
     &vis::HIDDEN,
