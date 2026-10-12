@@ -353,11 +353,14 @@ prereqs() {
 # setup MODE TOOLCHAIN_BIN ROOT: the environment a run of MODE gets — the env file for check, lint and
 # combos, the pinned toolchain first on PATH, the prerequisites, the disk floor, and for check, lint,
 # test and combos the tree's own CARGO_TARGET_DIR, whatever the environment held (a line names what
-# it replaces). Runs in the caller's shell.
+# it replaces). check, lint and combos also get BLOOMERY_GIT_COMMIT=static-check unless the caller set
+# one. Runs in the caller's shell.
 setup() {
   case $1 in check | lint | combos) load_env || return $? ;; esac
   export PATH="$2:$PATH"
   prereqs "$1" "$2" || return $?
+  # No binary runs here, so serve's commit word is never shown; a fixed one keeps a HEAD move from rebuilding its dependents.
+  case $1 in check | lint | combos) export BLOOMERY_GIT_COMMIT=${BLOOMERY_GIT_COMMIT:-static-check} ;; esac
   case $1 in
     check | lint | test | combos)
       local own
@@ -398,9 +401,9 @@ verdict() {
 }
 
 self_test() {
-  # the cases are written for the default target, whatever BLOOMERY_CHECK_TARGET the caller exported
+  # the cases are written for the default target and an unset commit word, whatever the caller exported
   local fails=0 out t m cmd fake tc ch host a b tab why drc TARGET=$BOX_TARGET
-  unset BLOOMERY_CHECK_TARGET
+  unset BLOOMERY_CHECK_TARGET BLOOMERY_GIT_COMMIT
   fail() { say "mac-check self-test FAIL: $*"; fails=$((fails + 1)); }
 
   # the derivation from the real justfile: each mode's recipe gives `cargo <verb> …`, the cross
@@ -579,7 +582,7 @@ EOF
   }
   probe() { # MODE -> setup's rc and lines, then what each tool resolves to and the target directory
     (HOME=$fake && PATH=$fake/brew/bin:/usr/bin:/bin && unset CARGO_TARGET_DIR RUSTC && setup "$1" "$tc" /x/bloomery-foo &&
-      for t in cargo cargo-clippy rustfmt; do echo "resolved $t $(command -v "$t")"; done && echo "target ${CARGO_TARGET_DIR:-none}") 2>&1
+      for t in cargo cargo-clippy rustfmt; do echo "resolved $t $(command -v "$t")"; done && echo "target ${CARGO_TARGET_DIR:-none}" && echo "commit ${BLOOMERY_GIT_COMMIT:-none}") 2>&1
   }
   write_env
   for m in check lint fmt fmt-check test combos; do
@@ -594,6 +597,17 @@ EOF
   case $out in *"CARGO_TARGET_DIR=$fake/tgt from the environment is overridden"*) ;; *) fail "the override of an inherited CARGO_TARGET_DIR is not named: $out" ;; esac
   out=$(probe fmt) || true
   case $out in *"target none"*) ;; *) fail "fmt sets a target directory: $out" ;; esac
+  # the commit word serve's build script exports: a fixed one for the modes that run no binary, the caller's own kept, none for the rest
+  for m in check lint combos; do
+    out=$(probe "$m") || true
+    case $out in *"commit static-check"*) ;; *) fail "$m does not pin the commit word: $out" ;; esac
+    out=$(BLOOMERY_GIT_COMMIT=abc12345 probe "$m") || true
+    case $out in *"commit abc12345"*) ;; *) fail "$m replaces the caller's commit word: $out" ;; esac
+  done
+  for m in test fmt fmt-check; do
+    out=$(probe "$m") || true
+    case $out in *"commit none"*) ;; *) fail "$m sets a commit word: $out" ;; esac
+  done
   out=$(probe test) || true
   case $out in *"target /x/bloomery-foo/target"*) ;; *) fail "test does not build in the tree's own target directory: $out" ;; esac
   # the disk floor: the modes that write target/ print the verdict line and stop below the floor

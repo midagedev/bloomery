@@ -391,6 +391,17 @@ blk_boxsh() {
   fi
   echo "${bxs##*$'\n'}"
 }
+# seed-target.sh clones a warm tree's target/ into a new worktree and restores the seed's mtime on the files that are equal:
+# its refusals (a DST with a target, a SRC without one, two volumes, a host that cannot clone) and the mtime pass (only
+# equal files) are tested on two scratch trees, no cargo.
+blk_seedtarget() {
+  if ! stt=$(bash "$(dirname "$0")/seed-target.sh" --self-test 2>&1); then
+    echo "$stt" >&2
+    echo "check-recipes: the seed-target self-test failed" >&2
+    return 1
+  fi
+  echo "${stt##*$'\n'}"
+}
 # carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
 # pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
 # its box command: a recipe that stops calling it ends the check silently, so the call is held here.
@@ -666,7 +677,7 @@ PY
 }
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh carry pytools boxqcodes fixturevariants
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry pytools boxqcodes fixturevariants
   refsetpublish orphan archowner)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
