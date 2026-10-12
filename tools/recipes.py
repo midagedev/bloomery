@@ -5,7 +5,7 @@ Runs on the Mac: it reads the justfile through `just --dump --dump-format json` 
 the workspace through `cargo metadata --format-version 1 --no-deps --offline --locked` (no build, no
 network, never rewrites Cargo.lock), and the sources as text. It builds nothing and runs no gate.
 
-    python3 tools/recipes.py check            # the target checks of `just check-recipes`, and the plan files records-refresh writes (presence)
+    python3 tools/recipes.py check            # the target checks of `just check-recipes`, one feature set a bin, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
     python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...]
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
@@ -165,6 +165,22 @@ the list for a round's loop (a shape whose inputs — shape_inputs — hold no f
 whose input key is green in the `--ledger`, skips with why; a run's combo lines gain the key as a fourth
 field, which `tools/mac-check.sh combos --ledger` appends to the ledger green), so a loop that edited one
 crate checks only the shapes that read it; without the flags the list is the full one the lead's landing uses.
+
+Bin feature sets (`check`). A build writes its bin to `<target dir>/<profile>/<bin>` (`--release`, `--profile`, else
+dev; below `--target`; the target dir is `--target-dir`, cargo-oxide's `--cargo-target-dir`, the `CARGO_TARGET_DIR` of the
+call's prefix or an `export` before it, else `target`), and cuda-host reads the PTX bundle from `current_exe()` at each
+module load, so a second build with another feature set replaces the file a running gate loads its kernels from
+(2026-10-12: gate_glm5next_e2e, `glm5next,vision` against `glm5next`). `check` refuses a (package, bin, directory) that
+two builds give different resolved sets — the enabled features after the package's closure plus its `dep/feature` words,
+so `gpu,deepseek41` and `deepseek41` agree — and prints the bin, its package and directory, and every recipe grouped by
+the set it resolves to, the widest first. Only `build`, `run` and `rustc` write the bin: a test or bench build writes a
+hash-named file under deps/, and check and clippy write none. There is no exemption for one recipe building a bin with
+several sets in turn: the file is replaced under whichever lane runs it just the same (2026-10-13, gate-ptx-spill's
+oxart_jit, built three times; it now builds it once). An invocation whose package, features, targets or target dir come
+from a recipe parameter is left out (the ptx-scan, sass-scan and lds-scan recipes): their features are known at run time
+only. The fix is the union (each build gives the bin every feature any build gives it), or a target dir of its own for
+a bin no runner starts from target/release (tools/gpu-gate.sh runs `target/release/<bin>` only); `--arch` is not part of
+the key: cargo-oxide's only target-dir option is `--cargo-target-dir`, and the justfile passes one `{{arch}}` to every build.
 """
 
 from __future__ import annotations
@@ -190,7 +206,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -392,6 +408,9 @@ class Invocation:
     no_default: bool = False
     all_features: bool = False
     all_targets: bool = False
+    profile: str = "dev"  # `--release`/`-r` or `--profile <name>`; no flag is cargo's dev
+    target: str = ""  # `--target <triple>`: the build writes under target/<triple>/
+    target_dir: str = ""  # where the call puts target/: `--target-dir`, oxide's `--cargo-target-dir`, else the `CARGO_TARGET_DIR` the shell holds (the flag wins)
     raw: str = ""
     names: list[str] = field(default_factory=list)  # positional test-name filters before `--` (`cargo test <filter>`)
     test_args: list[str] = field(default_factory=list)  # the test binary's arguments, after `--`
@@ -402,6 +421,7 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
     if not args:
         raise RecipeError(f"bare `cargo` in: {raw}")
     oxide = False
+    oxide_words: list[str] = []
     if via_gate_sh:
         sub = "test"
         rest = list(args)
@@ -415,14 +435,23 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
         sub = args[1]
         rest = args[2:]
         if "--" in rest:
+            oxide_words = rest[: rest.index("--")]
             rest = rest[rest.index("--") + 1 :]
         else:
+            oxide_words = rest
             rest = []
     else:
         sub = args[0]
         rest = args[1:]
     if sub not in BUILD_SUBS:
         return None
+    # cargo-oxide sets CARGO_TARGET_DIR for cargo from its own `--cargo-target-dir`, before the `--`
+    oxide_dir = ""
+    for k, w in enumerate(oxide_words if oxide else []):
+        if w == "--cargo-target-dir" and k + 1 < len(oxide_words):
+            oxide_dir = oxide_words[k + 1]
+        elif w.startswith("--cargo-target-dir="):
+            oxide_dir = w.split("=", 1)[1]
     test_args: list[str] = []
     if "--" in rest:
         test_args = rest[rest.index("--") + 1 :]
@@ -444,6 +473,12 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
                 inv.packages.append(val)
             elif opt in ("--features", "-F"):
                 inv.features.extend(f for f in re.split(r"[,\s]+", val) if f)
+            elif opt == "--profile":
+                inv.profile = val
+            elif opt == "--target":
+                inv.target = val
+            elif opt == "--target-dir":
+                inv.target_dir = val
             elif opt == "--bin":
                 inv.selectors.append(("bin", val))
             elif opt == "--test":
@@ -453,7 +488,9 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
             elif opt == "--bench":
                 inv.selectors.append(("bench", val))
         elif opt in _CARGO_FLAG:
-            if opt == "--lib":
+            if opt in ("--release", "-r"):
+                inv.profile = "release"
+            elif opt == "--lib":
                 inv.selectors.append(("lib", None))
             elif opt == "--doc":
                 inv.selectors.append(("doc", None))
@@ -479,6 +516,7 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
             # a positional word is a test-name filter (`cargo test <filter>`); it selects no target
             inv.names.append(w)
         i += 1
+    inv.target_dir = inv.target_dir or oxide_dir
     return inv
 
 
@@ -525,6 +563,7 @@ class RecipeCommands:
     runs: list[str] = field(default_factory=list)  # target/release binaries executed
     scripts: list[str] = field(default_factory=list)  # repository scripts executed or sourced
     paths: list[str] = field(default_factory=list)  # every repository-looking path the text names
+    cargo_target_dir: str = ""  # the CARGO_TARGET_DIR an `export` earlier in the same shell (one recipe line, one box.sh call) left set
 
 
 def _norm(p: str) -> str:
@@ -537,9 +576,21 @@ def _classify(cmd: list[str], rc: RecipeCommands, raw: str) -> None:
     if not cmd:
         return
     head, args = cmd[0], cmd[1:]
+    # A target dir reaches cargo from a flag, from a prefix on its own call, or from an `export` before it (a bare
+    # assignment is not exported, so it does not count); the flag wins, then the prefix, then the export.
+    if head == "export":
+        for w in args:
+            if w.startswith("CARGO_TARGET_DIR="):
+                rc.cargo_target_dir = w.split("=", 1)[1]
+        return
+    if head == "unset" and "CARGO_TARGET_DIR" in args:
+        rc.cargo_target_dir = ""
+        return
+    held = env.get("CARGO_TARGET_DIR") or rc.cargo_target_dir
     if head == "cargo":
         inv = parse_cargo(args, raw)
         if inv is not None:
+            inv.target_dir = inv.target_dir or held
             rc.invocations.append(inv)
         return
     script = None
@@ -561,6 +612,7 @@ def _classify(cmd: list[str], rc: RecipeCommands, raw: str) -> None:
     if s == "tools/gate.sh":
         inv = parse_cargo(sargs, raw, via_gate_sh=True)
         if inv is not None:
+            inv.target_dir = inv.target_dir or held
             rc.invocations.append(inv)
     elif s in BIN_RUNNERS and sargs:
         rc.runs.append(sargs[0])
@@ -572,6 +624,7 @@ def recipe_commands(recipe: Recipe) -> RecipeCommands:
         stripped = line.lstrip("@-").strip()
         if not stripped or stripped.startswith("#"):
             continue
+        rc.cargo_target_dir = ""  # just runs each line in a shell of its own: an `export` does not outlive its line
         local = shell_words(stripped)
         # A repository file on a Mac-side `<` is read by the command (a script over ssh's stdin:
         # `tools/box.sh 'bash -s' < tools/box-gc.sh`); simple_commands drops redirect targets.
@@ -589,8 +642,10 @@ def recipe_commands(recipe: Recipe) -> RecipeCommands:
                 remote = " ".join(rest[1:])
                 for p in _PATHLIKE.findall(remote):
                     rc.paths.append(_norm(p))
+                outer, rc.cargo_target_dir = rc.cargo_target_dir, ""  # a box.sh call is a remote shell of its own
                 for rcmd in simple_commands(shell_words(remote)):
                     _classify(rcmd, rc, remote)
+                rc.cargo_target_dir = outer
             else:
                 for p in _PATHLIKE.findall(" ".join(cmd)):
                     rc.paths.append(_norm(p))
@@ -1616,6 +1671,7 @@ def check(tree: Tree, recipes: dict[str, Recipe], prefix: str = GATE_PREFIX) -> 
             problems.append(f"{where}: a gate recipe that builds or tests no cargo target")
     for u in sorted(set(tree.unresolved)):
         problems.append(f"source walk: {u}")
+    problems += bin_feature_problems(tree, recipes)
     return problems
 
 
@@ -5032,6 +5088,27 @@ def _has_param(inv: Invocation) -> bool:
     return any("{{" in w for w in inv.packages + inv.features + [n or "" for _, n in inv.selectors])
 
 
+def build_calls(recipes: dict[str, Recipe]) -> Iterator[tuple[str, Invocation, str, bool]]:
+    """(recipe, invocation, the call as a skip line prints it, whether a recipe parameter decides it) of every
+    cargo call, recipes in name order: the one reader of what the recipes build, for `combos` and the bin check."""
+    for rname in sorted(recipes):
+        for inv in recipe_commands(recipes[rname]).invocations:
+            call = " ".join(["cargo"] + ["oxide"] * inv.oxide + [inv.sub] + ["--workspace"] * inv.workspace + [f"-p {p}" for p in inv.packages] + [f"--features {','.join(inv.features)}"] * bool(inv.features))
+            yield rname, inv, call, _has_param(inv)
+
+
+def resolve_call(tree: Tree, inv: Invocation) -> tuple[list[tuple[str, str, str | None, list[str], tuple[str, ...], tuple[str, ...]]], list[str]]:
+    """[(package, kind, name, the package's own --features words, enabled features after the closure, `dep/feature`
+    words for other packages)] and the errors, of one call the tree can resolve."""
+    out = []
+    targets, errs = tree.resolve(inv)
+    for pname, kind, name, feats in targets:
+        enabled, _, _ = tree.feature_closure(tree.packages[pname], feats, not inv.no_default, inv.all_features)
+        others = tuple(sorted({f for f in inv.features if "/" in f and f.split("/", 1)[0] != pname}))
+        out.append((pname, kind, name, feats, tuple(sorted(enabled)), others))
+    return out, errs
+
+
 def build_shapes(tree: Tree, recipes: dict[str, Recipe]) -> tuple[list[Combo], list[tuple[str, str]], int]:
     """(the shapes in package and mode order, [(recipe, why)] left out by name, the count of distinct
     (package, target, mode, features) tuples). A call the tree cannot resolve is a RecipeError naming it."""
@@ -5039,38 +5116,89 @@ def build_shapes(tree: Tree, recipes: dict[str, Recipe]) -> tuple[list[Combo], l
     skips: list[tuple[str, str]] = []
     tuples: set[tuple] = set()
     errors: list[str] = []
-    for rname in sorted(recipes):
-        for inv in recipe_commands(recipes[rname]).invocations:
-            call = " ".join(["cargo"] + ["oxide"] * inv.oxide + [inv.sub] + ["--workspace"] * inv.workspace + [f"-p {p}" for p in inv.packages] + [f"--features {','.join(inv.features)}"] * bool(inv.features))
-            if rname in MAC_CHECKED:
-                skips.append((rname, f"{call}: {MAC_CHECKED[rname]} runs this recipe's command"))
-                continue
-            if _has_param(inv):
-                skips.append((rname, f"{call}: a recipe parameter ({{{{…}}}}) decides its package, features or targets at run time"))
-                continue
-            targets, errs = tree.resolve(inv)
-            errors += [f"{rname}: {e}" for e in errs]
-            for pname, kind, name, feats in targets:
-                pkg = tree.packages[pname]
-                enabled, _, _ = tree.feature_closure(pkg, feats, not inv.no_default, inv.all_features)
-                others = tuple(sorted({f for f in inv.features if "/" in f and f.split("/", 1)[0] != pname}))
-                if kind == "doctest":
-                    skips.append((rname, f"doctests of {pname}: rustdoc compiles them and cargo check has no doctest mode; the lib they import is checked in {pname}'s build shape"))
-                    kind = "lib"
-                test = kind in ("libtest", "test", "bench") or (kind == "bin" and inv.sub in ("test", "bench"))
-                sel = ("lib", None) if kind in ("lib", "libtest") else (kind, name)
-                key = (pname, test, tuple(sorted(enabled)), others, inv.no_default, inv.all_features)
-                c = shapes.get(key)
-                if c is None:
-                    c = shapes[key] = Combo(pname, test, key[2], others, sorted(feats), inv.no_default, inv.all_features)
-                c.selectors.add(sel)
-                if rname not in c.recipes:
-                    c.recipes.append(rname)
-                tuples.add(key + (sel,))
+    for rname, inv, call, param in build_calls(recipes):
+        if rname in MAC_CHECKED:
+            skips.append((rname, f"{call}: {MAC_CHECKED[rname]} runs this recipe's command"))
+            continue
+        if param:
+            skips.append((rname, f"{call}: a recipe parameter ({{{{…}}}}) decides its package, features or targets at run time"))
+            continue
+        targets, errs = resolve_call(tree, inv)
+        errors += [f"{rname}: {e}" for e in errs]
+        for pname, kind, name, feats, enabled, others in targets:
+            if kind == "doctest":
+                skips.append((rname, f"doctests of {pname}: rustdoc compiles them and cargo check has no doctest mode; the lib they import is checked in {pname}'s build shape"))
+                kind = "lib"
+            test = kind in ("libtest", "test", "bench") or (kind == "bin" and inv.sub in ("test", "bench"))
+            sel = ("lib", None) if kind in ("lib", "libtest") else (kind, name)
+            key = (pname, test, enabled, others, inv.no_default, inv.all_features)
+            c = shapes.get(key)
+            if c is None:
+                c = shapes[key] = Combo(pname, test, key[2], others, sorted(feats), inv.no_default, inv.all_features)
+            c.selectors.add(sel)
+            if rname not in c.recipes:
+                c.recipes.append(rname)
+            tuples.add(key + (sel,))
     if errors:
         raise RecipeError("combos: calls the tree cannot resolve (just check-recipes names them too): " + "; ".join(sorted(set(errors))[:8]))
     order = sorted(shapes, key=lambda k: (k[0], k[1], len(k[2]), k[2], k[3], k[4], k[5]))
     return [shapes[k] for k in order], skips, len(tuples)
+
+
+# ----------------------------------------------------------------------------------------------
+# one binary, one feature set: two recipes that build a bin to one path build it the same way
+# ----------------------------------------------------------------------------------------------
+# The rule is the module docstring's «bin feature sets» paragraph; `just check-recipes` runs it.
+
+# The subcommands that write the bin to <target dir>/<profile>/<bin>. A test or bench build writes a
+# hash-named file under deps/, and check and clippy write none, so none of them replaces a bin.
+BIN_WRITING_SUBS = ("build", "run", "rustc")
+# cargo's two profiles that inherit another write to that one's directory.
+_PROFILE_DIR = {"test": "dev", "bench": "release"}
+
+
+def build_dir(inv: Invocation) -> str:
+    """The directory a build writes its bins to, as the call sets it: the target dir (`--target-dir`,
+    oxide's `--cargo-target-dir`, the `CARGO_TARGET_DIR` of the call's prefix or an `export` before it;
+    `target` when none, left out of the name), below it `--target <triple>`, then the profile (`--release`,
+    `--profile`, else dev). Spellings of one directory (`target`, `./target/`) are one name."""
+    root = os.path.normpath(inv.target_dir) if inv.target_dir else "target"
+    return "/".join(x for x in ("" if root == "target" else root, inv.target, _PROFILE_DIR.get(inv.profile, inv.profile)) if x)
+
+
+def bin_feature_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
+    """A (package, bin, directory) that two builds give different resolved feature sets: they write one file,
+    <dir>/<profile>/<bin>, and cuda-host reads the PTX bundle from `current_exe()` at each module load, so the
+    later build replaces the file a running gate loads its kernels from (2026-10-12: gate_glm5next_e2e built
+    with `glm5next,vision` by one recipe and with `glm5next` by another, while the first ran). The set is the
+    enabled features after the package's closure plus its `dep/feature` words, so `gpu,deepseek41` and
+    `deepseek41` agree. The two builds may be one recipe's, one after the other (2026-10-13: gate-ptx-spill's
+    oxart_jit, built three times): the file is replaced under whichever lane runs it just the same, so a recipe's
+    own order is no exemption. The key is the directory the call writes to, so builds that land in different
+    directories pass. A call whose features or target directory come from a recipe parameter is left out: they
+    are known at run time only."""
+    built: dict[tuple[str, str, str], dict[tuple[str, ...], list[str]]] = {}
+    for rname, inv, _, param in build_calls(recipes):
+        where = build_dir(inv)
+        if inv.sub not in BIN_WRITING_SUBS or param or "{{" in where:
+            continue
+        targets, _ = resolve_call(tree, inv)  # an unresolvable call is check()'s error, named there
+        for pname, kind, name, _, enabled, others in targets:
+            if kind == "bin":
+                users = built.setdefault((pname, name or "", where), {}).setdefault(tuple(sorted(enabled + others)), [])
+                if rname not in users:
+                    users.append(rname)
+    problems: list[str] = []
+    for (pname, name, where), sets in sorted(built.items()):
+        if len(sets) < 2:
+            continue
+        # the widest set first (the union's candidate), the recipes of a set sorted: one line whatever the order
+        groups = " vs ".join(f"{', '.join(sorted(rs))} {{{','.join(fs)}}}" for fs, rs in sorted(sets.items(), key=lambda kv: (-len(kv[0]), kv[0])))
+        problems.append(
+            f"{name} ({pname}, {where}): {groups} "
+            f"(one {name} file in {where}: a rebuild replaces the PTX bundle a running gate reads; build the union in each, or give a build its own target dir where no runner reads target/release)"
+        )
+    return problems
 
 
 # ----------------------------------------------------------------------------------------------
@@ -9094,6 +9222,102 @@ def narrow_self_test(expect, side: Side) -> None:
            f"host: a host recipe that is solo and runs a card gate not refused: {got}")
 
 
+def bin_feature_self_test(expect) -> None:
+    """The bin check on synthetic justfiles over the real tree's gate_glm5next_e2e (requires glm5next; `vision` is the
+    feature the 2026-10-12 incident differed by). Goes through check(), the entry check-recipes runs."""
+
+    def call(feats: str, flags: str = "--release", sub: str = "cargo oxide build --arch sm_86 --", bin_: str = "gate_glm5next_e2e") -> str:
+        return f"{sub} -p bloomery-gpu-gates --features {feats} {flags} --bin {bin_}"
+
+    def problems(*recipes: tuple[str, ...]) -> list[str]:
+        with tempfile.TemporaryDirectory(prefix="recipes-binfeat-") as tmp:
+            p = os.path.join(tmp, "justfile")
+            with open(p, "w", encoding="utf-8") as fh:
+                for name, *cmds in recipes:
+                    # a recipe's commands are one `./tools/box.sh '…'` line; "---" starts the next recipe line, "+++" the
+                    # next box.sh call on the same line, and a line that opens with "local" runs its commands on the Mac
+                    lines: list[list[str]] = [[]]
+                    for c in cmds:
+                        lines.append([]) if c == "---" else lines[-1].append(c)
+                    fh.write(f"{name}:\n")
+                    for ln in lines:
+                        local = ln[:1] == ["local"]
+                        groups: list[list[str]] = [[]]
+                        for c in ln[local:]:
+                            groups.append([]) if c == "+++" else groups[-1].append(c)
+                        words = [" && ".join(g) if local and i == 0 else f"./tools/box.sh '{' && '.join(g)}'" for i, g in enumerate(groups) if g]
+                        fh.write(f"    {' && '.join(words)}\n")
+            try:
+                return [x for x in check(Tree(ROOT), load_justfile(p)) if "gate_glm5next_e2e" in x]
+            except RecipeError as err:
+                return [f"raised {err}"]
+
+    base = "gate_glm5next_e2e (bloomery-gpu-gates, release): "
+    wide, narrow = "{deepseek41,glm5next,gpu,vision}", "{deepseek41,glm5next,gpu}"
+    got = problems(("a", call("glm5next")), ("b", call("glm5next,vision")))
+    expect(len(got) == 1 and got[0].startswith(f"{base}b {wide} vs a {narrow} "), f"bin features: glm5next vs glm5next,vision not refused by name: {got}")
+    # the recipes' order and names do not move the line; a set shared by recipes lists them all, sorted
+    got2 = problems(("z", call("glm5next,vision")), ("y", call("glm5next")), ("x", call("glm5next")))
+    expect(len(got2) == 1 and got2[0].startswith(f"{base}z {wide} vs x, y {narrow} "), f"bin features: recipes of one set not grouped and sorted: {got2}")
+    expect(problems(("a", call("glm5next,vision")), ("b", call("vision,glm5next"))) == [], "bin features: one set in another order refused")
+    # resolved, not spelled: glm5next closes over deepseek41 and gpu
+    expect(problems(("a", call("glm5next")), ("b", call("deepseek41,glm5next,gpu"))) == [], "bin features: two spellings of one closure refused")
+    # the profile is the directory the bin lands in: dev beside release is two files, `--profile release` is release
+    expect(problems(("a", call("glm5next")), ("b", call("glm5next,vision", flags=""))) == [], "bin features: dev and release refused")
+    got = problems(("a", call("glm5next")), ("b", call("glm5next,vision", flags="--profile release")))
+    expect(len(got) == 1 and got[0].startswith(base), f"bin features: --profile release not read as release: {got}")
+    got = problems(("a", call("glm5next", flags="--release --target x86_64-unknown-linux-gnu")), ("b", call("glm5next,vision")))
+    expect(got == [], f"bin features: a --target build refused beside a host build: {got}")
+    # only a build that writes <dir>/<profile>/<bin> counts: a check or a test of the bin writes another file
+    expect(problems(("a", call("glm5next")), ("b", call("glm5next,vision", sub="cargo check"))) == [], "bin features: a cargo check refused")
+    expect(problems(("a", call("glm5next")), ("b", call("glm5next,vision", sub="cargo test"))) == [], "bin features: a cargo test refused")
+    # 2026-10-13: a recipe building a bin with two sets in turn is refused too (round 1 exempted it as «its own serial
+    # order»: that case read `== []`). Derivation: the recipe's order protects nothing, because the file it replaces is
+    # the one every other lane runs from the same path (cargo relinks target/release/oxart_jit under a running ptx-scan;
+    # ptx-scan has overwritten a binary 4 times), so one recipe's second build is the same defect as a second recipe's.
+    # FAIL-first: the round-1 check, with its single-recipe exemption, returns [] for these two.
+    got = problems(("a", call("glm5next"), call("glm5next,vision")))
+    expect(len(got) == 1 and got[0].startswith(f"{base}a {wide} vs a {narrow} "), f"bin features: one recipe's serial builds of one file, two sets, not refused: {got}")
+    got = problems(("a", call("glm5next"), call("glm5next,vision")), ("b", call("glm5next")))
+    expect(len(got) == 1 and f"a {wide} vs a, b {narrow} " in got[0], f"bin features: a serial recipe and a second one on its bin not one line: {got}")
+    # the key is the directory the call writes to (2026-10-13): the same bin with two sets in two directories is two files
+    def to(d: str) -> str:
+        return f"--release --target-dir {d}"
+
+    expect(problems(("a", call("glm5next")), ("b", call("glm5next,vision", flags=to("target/b")))) == [], "bin features: a --target-dir build refused beside the default dir")
+    got = problems(("a", call("glm5next", flags=to("target/b"))), ("b", call("glm5next,vision", flags=to("target/b"))))
+    expect(len(got) == 1 and got[0].startswith("gate_glm5next_e2e (bloomery-gpu-gates, target/b/release): "), f"bin features: two sets in one --target-dir not refused, or not named by it: {got}")
+    expect(problems(("a", call("glm5next", flags=to("target/a")), call("glm5next,vision", flags=to("target/b")))) == [], "bin features: one recipe's builds in two target dirs refused")
+    got = problems(("a", call("glm5next")), ("b", call("glm5next,vision", flags=to("./target/"))))
+    expect(len(got) == 1 and got[0].startswith(base), f"bin features: `./target/` not read as the default dir: {got}")
+    expect(problems(("a", call("glm5next")), ("b", "CARGO_TARGET_DIR=target/b " + call("glm5next,vision"))) == [], "bin features: a CARGO_TARGET_DIR prefix on the call refused")
+    expect(problems(("a", call("glm5next")), ("b", "export CARGO_TARGET_DIR=target/b", call("glm5next,vision"))) == [], "bin features: an exported CARGO_TARGET_DIR refused")
+    got = problems(("a", call("glm5next")), ("b", call("glm5next,vision"), "export CARGO_TARGET_DIR=target/b"))
+    expect(len(got) == 1, f"bin features: an export read back onto the build before it: {got}")
+    got = problems(("a", call("glm5next")), ("b", "export CARGO_TARGET_DIR=target/b", "unset CARGO_TARGET_DIR", call("glm5next,vision")))
+    expect(len(got) == 1, f"bin features: an unset CARGO_TARGET_DIR still read: {got}")
+    # an export holds in its own shell only: just runs each recipe line in a shell, and each box.sh call is a remote shell
+    got = problems(("a", call("glm5next")), ("b", "local", "export CARGO_TARGET_DIR=target/b", "---", "local", call("glm5next,vision")))
+    expect(len(got) == 1, f"bin features: an export read onto the next recipe line: {got}")
+    got = problems(("a", call("glm5next")), ("b", "local", "export CARGO_TARGET_DIR=target/b", "+++", call("glm5next,vision")))
+    expect(len(got) == 1, f"bin features: a local export read into a box.sh call: {got}")
+    got = problems(("a", call("glm5next")), ("b", "export CARGO_TARGET_DIR=target/b", "+++", call("glm5next,vision")))
+    expect(len(got) == 1, f"bin features: an export read onto the next box.sh call: {got}")
+    expect(problems(("a", call("glm5next")), ("b", "local", "export CARGO_TARGET_DIR=target/b", call("glm5next,vision"))) == [], "bin features: a local export beside its own build refused")
+    expect(problems(("a", call("glm5next")), ("b", call("glm5next,vision", sub="cargo oxide build --arch sm_86 --cargo-target-dir target/b --"))) == [], "bin features: oxide's --cargo-target-dir refused")
+    expect(problems(("a", call("glm5next")), ("b", call("glm5next,vision", sub="cargo oxide build --arch sm_86 --cargo-target-dir=target/b --"))) == [], "bin features: oxide's --cargo-target-dir=<dir> refused")
+    # the flag beats the environment, cargo's `--target-dir` over oxide's flag over a prefix over an export
+    got = problems(("a", call("glm5next", flags=to("target/x"))), ("b", "CARGO_TARGET_DIR=target/elsewhere " + call("glm5next,vision", flags=to("target/x"))))
+    expect(len(got) == 1, f"bin features: a CARGO_TARGET_DIR prefix read over the call's --target-dir: {got}")
+    got = problems(("a", call("glm5next", flags=to("target/x"))), ("b", call("glm5next,vision", flags=to("target/x"), sub="cargo oxide build --arch sm_86 --cargo-target-dir target/elsewhere --")))
+    expect(len(got) == 1, f"bin features: oxide's --cargo-target-dir read over cargo's --target-dir: {got}")
+    # a parameter decides the features or the directory at run time: left out, not guessed
+    expect(problems(("a", call("glm5next")), ("b FEATURES", call("{{FEATURES}}"))) == [], "bin features: a parameter's features refused")
+    expect(problems(("a DIR", call("glm5next", flags="--release --target-dir {{DIR}}")), ("b DIR", call("glm5next,vision", flags="--release --target-dir {{DIR}}"))) == [], "bin features: a parameter's target dir refused")
+    # no feature set differs for a bin built once
+    expect(problems(("a", call("glm5next,vision"))) == [], "bin features: a lone build refused")
+
+
 def self_test() -> int:
     fails: list[str] = []
 
@@ -9287,6 +9511,9 @@ def self_test() -> int:
             fails.append("combos: a call naming no target accepted")
         except RecipeError as err:
             expect("g: --bin no_such_bin" in str(err), f"combos: an unresolvable call refused without its name: {err}")
+
+    # one binary, one feature set
+    bin_feature_self_test(expect)
 
     # the shape input key: content-only (the memo's hash, not any mtime), stable for the same inputs,
     # moved by a command or an input's content; the ledger reader takes only green 64-key lines

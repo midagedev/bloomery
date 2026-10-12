@@ -86,8 +86,9 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   runner with 64), and returns the binary's code (124/137 timed out, 75 lock contention, 69 a lock file it cannot open).
   `just check-recipes` fails on a test recipe with `||` or a bare `cargo test`, on a `--bin`/`--test`/`-p`/feature
   that names nothing, a script not in the tree, a `gate-*` recipe with no cargo target or one that runs its binary with
-  `cargo run`, a bin built without its `required-features`, a recipe that takes a lock itself, and on a Python tool
-  under `tools/` whose self-test is not listed.
+  `cargo run`, a bin built without its `required-features`, a bin two recipes build into one target dir with different
+  resolved feature sets (one set a bin, so no build replaces the binary another lane runs), a recipe that takes a lock
+  itself, and on a Python tool under `tools/` whose self-test is not listed.
 - **Card locks.** `/root/bloomery-gate.lock` (3090) and `/root/bloomery-gate-a6000.lock`. Under
   `BLOOMERY_CARD=a6000|both` the runner takes that card's lock, or both for `both` (the 3090's first, then the A6000's;
   every other run holds one, so the order cannot deadlock), and refuses (64) a `BLOOMERY_GATE_CARD` naming another card.
