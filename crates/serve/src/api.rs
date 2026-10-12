@@ -11,9 +11,10 @@
 //!
 //! No request takes the engine past [`Engine::ctx_max`], as llama-server's
 //! slots do not pass `n_ctx`: a prompt of `ctx_max` tokens or more is a 400
-//! before it reaches the engine, and generation stops at `ctx_max` with
-//! `truncated`, whatever `max_tokens` asked. Every slot has the whole
-//! `ctx_max`; it is not split among them.
+//! before it reaches the engine, naming the one `--ctx-size` that would hold
+//! it ([`ctx_hint`]), and generation stops at `ctx_max` with `truncated`,
+//! whatever `max_tokens` asked. Every slot has the whole `ctx_max`; it is not
+//! split among them.
 //!
 //! At most [`MAX_CONNECTIONS`] connections are served at once, one thread each;
 //! a connection past them gets a 503 with `Retry-After` and is closed. A
@@ -2669,6 +2670,35 @@ fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
     media::expand_prompt(&ids, &urls, &**model).map_err(|e| media_error(&e))
 }
 
+/// What the 400 for a prompt past the context adds to its two numbers: the
+/// one flag that serves it, `--ctx-size` of the smallest power of two that
+/// holds the prompt and what the request asks to generate (`n_predict`, when
+/// it is positive; one token when it sets none or `0`, the least a prompt that
+/// fits can still produce). With more than one slot the flag is also given for
+/// a seat whose slots split it under `--parallel` (the others give each slot
+/// the whole flag, and the clause says where it applies). Empty when no power
+/// of two fits a `usize`.
+fn ctx_hint(prompt_tokens: usize, n_predict: i64, slots: usize) -> String {
+    let generated = usize::try_from(n_predict)
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(1);
+    let Some(size) = prompt_tokens
+        .saturating_add(generated)
+        .checked_next_power_of_two()
+    else {
+        return String::new();
+    };
+    let mut hint = format!("; serve it with --ctx-size {size}");
+    if slots > 1 {
+        hint.push_str(&format!(
+            " (under --parallel {slots}, where the slots split the flag: --ctx-size {})",
+            size.saturating_mul(slots)
+        ));
+    }
+    hint
+}
+
 /// Validates the prompt and builds the request's sampler (its factory's
 /// refusal is a 400), hands the request to the engine thread, and passes its
 /// events to `sink` with the slot it took. `input` is what the engine is
@@ -2699,9 +2729,10 @@ fn run_gen(
             code: 400,
             kind: "exceed_context_size_error",
             message: format!(
-                "the prompt has {} tokens and the context holds {}",
+                "the prompt has {} tokens and the context holds {}{}",
                 ids.len(),
-                state.info.ctx_max
+                state.info.ctx_max,
+                ctx_hint(ids.len(), p.n_predict, state.parallel)
             ),
         });
     }
@@ -3788,6 +3819,45 @@ mod tests {
     use std::io::{self, Read};
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
+
+    /// The 400 for a prompt past the context names the `--ctx-size` that
+    /// holds the prompt and the generation asked [FAIL-first: the message
+    /// ends at the context's number]: the smallest power of two at least the
+    /// prompt plus the request's positive `n_predict` (one token when it sets
+    /// none or 0), and under several slots the flag a seat that splits it
+    /// needs.
+    #[test]
+    fn the_over_context_hint_names_the_flag_that_holds_the_request() {
+        use super::ctx_hint;
+        let rows: [(usize, i64, usize, &str); 8] = [
+            (5600, -1, 1, "; serve it with --ctx-size 8192"),
+            (5600, 4000, 1, "; serve it with --ctx-size 16384"),
+            (4096, -1, 1, "; serve it with --ctx-size 8192"),
+            (4096, 0, 1, "; serve it with --ctx-size 8192"),
+            (4095, -1, 1, "; serve it with --ctx-size 4096"),
+            (4095, 1, 1, "; serve it with --ctx-size 4096"),
+            (4095, 2, 1, "; serve it with --ctx-size 8192"),
+            (
+                5600,
+                -1,
+                2,
+                "; serve it with --ctx-size 8192 (under --parallel 2, where the slots split the \
+                 flag: --ctx-size 16384)",
+            ),
+        ];
+        for (prompt, n_predict, slots, want) in rows {
+            assert_eq!(
+                ctx_hint(prompt, n_predict, slots),
+                want,
+                "{prompt} tokens, n_predict {n_predict}, {slots} slots"
+            );
+        }
+        assert_eq!(
+            ctx_hint(usize::MAX, i64::MAX, 1),
+            "",
+            "no power of two fits"
+        );
+    }
 
     /// Text parts join by newline, as one string `content` would carry them.
     /// Every other part is refused by name, wherever it stands in the array:

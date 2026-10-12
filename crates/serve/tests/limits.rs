@@ -214,6 +214,9 @@ fn hw_requests_stop_at_the_context() {
         for n in [len, CTX] {
             assert!(m.contains(&n.to_string()), "{n} is not in {m:?}");
         }
+        // The flag that serves it: the power of two at or past the prompt and
+        // the 4 tokens asked (CTX + 4 and CTX + 5 positions: 128).
+        assert!(m.contains("--ctx-size 128"), "no flag to serve it in {m:?}");
     }
     // One position short of it is served: the first token, and one fed at CTX - 1.
     let edge: Vec<u32> = cycle.iter().copied().cycle().take(CTX - 1).collect();
