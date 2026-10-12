@@ -63,7 +63,8 @@ that does not parse is CARD_MALFORMED.
                 the run sets, and why now; for exclusive, why the job needs the box to itself, and
                 why now
   minutes       exclusive only, required: the expected hold in minutes, `n` or `lo..hi`, optionally
-                followed by `min`; a hold past 30 minutes is printed as needing the user's approval
+                followed by `min`; a hold past 30 minutes is printed with a note to batch it into one sitting
+                (it needs no approval, only its predicted wall: AGENTS.md 「Never」, 2026-10-10)
 
 An exclusive card takes kind, reason and minutes and nothing else: it predicts nothing, so it has no
 prediction, decision or ruler check. Every other kind takes kind, question, term, unit, predict,
@@ -143,7 +144,7 @@ ROUNDS_CAP = 100000
 NUM = r'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'
 BAND = re.compile(rf'({NUM})\s*\.\.\s*({NUM})\s*(\S+)?')
 MINUTES = re.compile(rf'({NUM})(?:\s*\.\.\s*({NUM}))?\s*(?:min)?')
-APPROVAL_MINUTES = 30
+LONG_HOLD_MINUTES = 30
 SD = re.compile(r'(\d+(?:\.\d+)?)\s*(%?)\s*(.*)')
 KEY_LINE = re.compile(r'([a-z][a-z-]*)\s*:\s*(.*)')
 CARD_PATH = re.compile(r'docs/cards/[A-Za-z0-9][A-Za-z0-9._-]*\.card')
@@ -379,9 +380,10 @@ def check(text, runner_rounds, round_minutes):
     if card['kind'] == 'exclusive':
         lo, hi = card['minutes']
         notes = []
-        if hi > APPROVAL_MINUTES:
-            notes.append(f'note: an expected hold over {APPROVAL_MINUTES} minutes needs the user\'s approval before '
-                         'it starts (AGENTS.md 「Never」)')
+        if hi > LONG_HOLD_MINUTES:
+            notes.append(f'note: an expected hold over {LONG_HOLD_MINUTES} minutes is a long box job: it needs no approval, '
+                         'only its predicted wall printed before it starts, batched with the other long jobs into one '
+                         'sitting (AGENTS.md 「Never」, 2026-10-10)')
         held = f'{lo:g}' if lo == hi else f'{lo:g}..{hi:g}'
         return notes, f'ok kind=exclusive minutes={held} (no prediction: the lease is held for the box, not a measurement)'
     if len({fold(card['value'][k]) for k in DECISIONS}) < 2:

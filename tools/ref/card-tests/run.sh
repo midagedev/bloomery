@@ -245,7 +245,9 @@ card profile.card 0 'ok kind=profile'
 card profile.card 0 'ok kind=profile' --rounds 3
 card profile-rounds.card 65 'kind profile takes no `rounds`'
 card exclusive.card 0 'ok kind=exclusive minutes=5\.\.15'
-card exclusive-long.card 0 'over 30 minutes needs the user.s approval'
+# 2026-10-12: AGENTS.md retired the 30-minute approval rule on 2026-10-10 (a box job's length needs no approval,
+# only its predicted wall); the note now says so.
+card exclusive-long.card 0 'over 30 minutes is a long box job: it needs no approval, only its predicted wall'
 card exclusive-no-minutes.card 65 'no `minutes` \(kind exclusive requires it\)'
 card exclusive-predict.card 65 'kind exclusive takes no `predict`'
 card unknown-key.card 65 "unknown key 'owner'"
