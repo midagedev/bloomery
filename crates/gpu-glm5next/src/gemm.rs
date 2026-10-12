@@ -510,7 +510,7 @@ impl GemmFront {
         };
         let k = WideKernels {
             gemm: &*route_k,
-            g32: &*k32,
+            g32: Some(&*k32),
         };
         site::gated(gpu, &k, &block, (m, m), io, fault)?;
         stats.quantize += 2;
