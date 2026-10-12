@@ -17,7 +17,8 @@
 //! with and waits for it, then runs `generate_glm5next --place gate --ctx
 //! 2048 --tokens <those ids> -n 16` beside this binary under the same levers
 //! and holds the ids the server served against it. The loads run one after
-//! the other (five in `plain`, two in `drafted`); the recipe runs the arms
+//! the other (in `plain` two servers that stop before their load, four
+//! servers and the CLI; in `drafted` three servers and the CLI); the recipe runs the arms
 //! as two processes, each under its own bound. `slots` runs the drafted
 //! arm's (s5) alone — its server and clauses, nothing else — for a run of
 //! those clauses by name; the recipe runs them inside `drafted`. `unset`
