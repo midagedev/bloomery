@@ -339,9 +339,15 @@ impl GgmlType {
     }
 }
 
+/// ggml's name for a type this enum names, or for an id ggml's table sizes
+/// ([`crate::ggml_type_info`]: q4_0, q4_1, q8_1, q8_K), so a refusal of such a
+/// tensor names its type; `ggml-type-<id>` for any other id.
 impl fmt::Display for GgmlType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.name() {
+        match self
+            .name()
+            .or_else(|| crate::ggml_type_info(self.as_u32()).map(|(n, _, _)| n))
+        {
             Some(n) => write!(f, "{n}"),
             None => write!(f, "ggml-type-{}", self.as_u32()),
         }
@@ -1339,7 +1345,8 @@ mod tests {
                 (ty.name(), ty.blck_size(), ty.type_size()),
                 (None, None, None)
             );
-            assert_eq!(ty.to_string(), format!("ggml-type-{id}"));
+            let shown = crate::ggml_type_info(id).map_or_else(|| format!("ggml-type-{id}"), |(n, _, _)| n.to_owned());
+            assert_eq!(ty.to_string(), shown, "id {id}: Display");
         }
     }
 
