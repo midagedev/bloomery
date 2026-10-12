@@ -85,6 +85,7 @@ mod gate {
     use super::q3place::{self, Unplaced};
     use super::qwen35_open;
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, PrefillPath, Qwen35moeModel};
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
@@ -97,6 +98,7 @@ mod gate {
     use refset::arch::qwen35moe::{MODEL as MODEL_Q36, vis as q36};
     use refset::clefvis::{ClefvisSet, EMBD, IMAGE_PAD_ID, Span};
     use refset::family::Family;
+    use runtime::swaprule::KeptRows;
     use std::path::Path;
     use vision::mrope::MropeSeq;
 
@@ -1338,6 +1340,7 @@ mod gate {
         let mut route_bad = Vec::new();
         for (j, pair) in f.ids.as_chunks::<2>().0.iter().enumerate() {
             m.step_rows([pair[0], pair[1]])?;
+            m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
             let got = m.rows_logits::<2>()?;
             for (r, row) in got.iter().enumerate() {
                 if first_diff(row, &logits[2 * j + r]).is_some() {
