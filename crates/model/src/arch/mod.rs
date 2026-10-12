@@ -14,6 +14,7 @@ mod classify;
 pub mod coverage;
 pub mod deepseek2;
 pub mod deepseek41;
+pub mod draft;
 pub mod dspark;
 pub mod glm5next;
 pub mod mimo2;

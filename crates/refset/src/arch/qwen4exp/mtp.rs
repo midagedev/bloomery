@@ -12,6 +12,7 @@ use super::{ARCH, MODEL};
 use crate::RefError;
 use crate::arch::BesideDraft;
 pub use crate::arch::DraftFrom;
+use crate::arch::draft::DraftFile;
 use crate::family::{Build, Family, Identity};
 
 /// The shared MTP draft file every set of the family is dumped with and
@@ -22,7 +23,7 @@ pub const DRAFT: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-share
 /// that declare [`ARCH`]).
 pub static BESIDE: BesideDraft = BesideDraft {
     arch: ARCH,
-    path: DRAFT,
+    file: DraftFile::Fixed(DRAFT),
 };
 
 /// The MTP draft file a run of `target` opens: [`BESIDE`]'s pick
