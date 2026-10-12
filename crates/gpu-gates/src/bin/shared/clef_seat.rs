@@ -26,7 +26,7 @@ use decision::request::Request;
 use decision::rows::output_rows;
 use gguf::Split;
 use serve::decide::{DecideError, Decided, HeadSource};
-use serve::media::{self, MediaError, MediaModel, Prepared};
+use serve::media::{self, ExpandError, MediaError, MediaModel, Prepared};
 
 use crate::serve_seats::decide::{Backbone, Decision, Placed};
 
@@ -67,7 +67,7 @@ fn classify(e: DError) -> DecideError {
 fn media_error(i: usize, e: &MediaError) -> DecideError {
     let m = format!("images[{i}]: {e}");
     match e {
-        MediaError::EmptySpan(_) => DecideError::Engine(m),
+        MediaError::Expand(ExpandError::EmptySpan(_)) => DecideError::Engine(m),
         _ => DecideError::Refused(m),
     }
 }

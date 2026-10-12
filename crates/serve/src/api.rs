@@ -74,7 +74,7 @@ use crate::flag::ApiKeys;
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
 use crate::http::{self, EventStream, Request};
-use crate::media::{self, MediaError, Prompt, SharedMediaModel};
+use crate::media::{self, ExpandError, MediaError, Prompt, SharedMediaModel};
 use crate::qwenxml::ParamKinds;
 use crate::reasoning::{ReasoningFormat, ThinkEntry};
 use crate::sampling;
@@ -2655,7 +2655,7 @@ fn engine_gone(state: &State, started: bool) -> ApiError {
 /// span is empty, the model's 500.
 fn media_error(e: &MediaError) -> ApiError {
     match e {
-        MediaError::EmptySpan(_) => engine_error(e),
+        MediaError::Expand(ExpandError::EmptySpan(_)) => engine_error(e),
         _ => invalid(e.to_string()),
     }
 }
@@ -3781,11 +3781,12 @@ mod tests {
     use super::{
         ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, End, Engine, EngineProps, Park,
         ServeError, SlotConfig, SlotQueue, Stop, ThinkingOff, after_accept_error, argv_redacted,
-        carries_media, check_slots, content_text, deny_line, engine_object, id_half,
+        carries_media, check_slots, content_text, deny_line, engine_object, id_half, media_error,
         needs_object_arguments, probe_thinking_off, shutdown_allowed,
     };
     use crate::engine::{DeviceProps, PlacementProps, SamplerRefused, SamplingParams};
     use crate::flag::ApiKeys;
+    use crate::media::{ExpandError, MediaError};
     use jinja::ChatTemplate;
     use serde_json::{Value, json};
     use std::io::{self, Read};
@@ -7068,5 +7069,27 @@ mod tests {
             off["content"].as_str().is_some_and(|s| !s.is_empty()),
             "thinking off: the whole output is content: {off}"
         );
+    }
+
+    /// The media part's refusals are the request's 400 with the error's own text; an empty span
+    /// is the model's fault, a 500.
+    #[test]
+    fn an_empty_span_is_the_models_500_and_the_rest_the_requests_400() {
+        let empty = media_error(&MediaError::Expand(ExpandError::EmptySpan(0)));
+        assert_eq!(
+            (empty.code, empty.kind, empty.message.as_str()),
+            (500, "server_error", "image 0 has an empty span")
+        );
+        for e in [
+            MediaError::Expand(ExpandError::PlaceholderCount {
+                placeholders: 1,
+                images: 0,
+            }),
+            MediaError::ImageLast,
+        ] {
+            let got = media_error(&e);
+            assert_eq!((got.code, got.kind), (400, "invalid_request_error"));
+            assert_eq!(got.message, e.to_string());
+        }
     }
 }

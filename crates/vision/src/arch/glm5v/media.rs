@@ -30,15 +30,15 @@ pub const PAD_BLACK: [u8; 3] = [0, 0, 0];
 
 /// The image on its canvas: resized to the canvas's content size (bicubic, Pillow's arithmetic as
 /// mtmd's `resize_pillow` computes it) and placed at pixel (0, 0) over [`PAD_BLACK`].
-fn canvas_image(image: &Rgb8, canvas: &Canvas) -> Rgb8 {
-    let content = resize_bicubic(image, canvas.content_w, canvas.content_h);
+fn canvas_image(image: &Rgb8, canvas: &Canvas) -> Result<Rgb8, VisionError> {
+    let content = resize_bicubic(image, canvas.content_w, canvas.content_h)?;
     let mut out = Rgb8::filled(canvas.width, canvas.height, PAD_BLACK);
     for y in 0..canvas.content_h {
         let from = &content.data[y * canvas.content_w * 3..(y + 1) * canvas.content_w * 3];
         let at = y * canvas.width * 3;
         out.data[at..at + from.len()].copy_from_slice(from);
     }
-    out
+    Ok(out)
 }
 
 /// An image to the encoder's input: planned onto a canvas by the size rule, resized and placed at
@@ -59,7 +59,7 @@ pub fn preprocess(image: &Rgb8, rule: &SizeRule) -> Result<Patches, VisionError>
         merge: rule.merge(),
         frames: TEMPORAL_FRAMES,
     };
-    patchify_with(&canvas_image(image, &canvas), plan, layout, &CLIP)
+    patchify_with(&canvas_image(image, &canvas)?, plan, layout, &CLIP)
 }
 
 /// GLM-5.3-Flash's [`MediaModel`]: the size rule of its encoder file at the seat's token limits,
@@ -149,7 +149,7 @@ mod tests {
         let img = image(1000, 600, bright);
         let canvas = rule().canvas(1000, 600).unwrap();
         assert_eq!((canvas.width, canvas.height), (1008, 616));
-        let out = canvas_image(&img, &canvas);
+        let out = canvas_image(&img, &canvas).unwrap();
         assert_eq!((out.width, out.height), (1008, 616));
         assert_eq!(pixel(&out, 0, 0), pixel(&img, 0, 0));
         assert_eq!(pixel(&out, 999, 599), pixel(&img, 999, 599));
@@ -175,7 +175,7 @@ mod tests {
             ),
             (392, 252, 378, 252)
         );
-        let out = canvas_image(&Rgb8::filled(450, 300, [200, 100, 50]), &canvas);
+        let out = canvas_image(&Rgb8::filled(450, 300, [200, 100, 50]), &canvas).unwrap();
         assert_eq!(pixel(&out, 0, 0), [200, 100, 50]);
         assert_eq!(pixel(&out, 377, 251), [200, 100, 50]);
         assert_eq!(pixel(&out, 378, 0), PAD_BLACK);
@@ -214,6 +214,20 @@ mod tests {
             .flat_map(|_| black.iter().flat_map(|&v| [v; 196]))
             .collect();
         assert_eq!(last, want.as_slice());
+    }
+
+    /// A hand-built image whose data is short is refused by name, before the resize slices it.
+    #[test]
+    fn a_short_image_is_refused_by_name() {
+        let mut img = image(450, 300, bright);
+        img.data.truncate(img.data.len() - 3);
+        let Err(e) = preprocess(&img, &rule()) else {
+            panic!("a short 450x300 image was preprocessed");
+        };
+        assert_eq!(
+            e.to_string(),
+            "image size 450x300: 404997 data bytes where the frame has 405000"
+        );
     }
 
     /// The marker ids are the text model's (`<|begin_of_image|>`, `<|image|>`, `<|end_of_image|>`).

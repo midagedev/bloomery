@@ -77,6 +77,40 @@ pub struct Rgb8 {
 }
 
 impl Rgb8 {
+    /// The data bytes of a `width`×`height` frame, `None` when the count overflows `usize`.
+    fn frame_len(width: usize, height: usize) -> Option<usize> {
+        width.checked_mul(height)?.checked_mul(3)
+    }
+
+    /// [`Rgb8::frame_len`] of a decoder's header size, its overflow refused by the frame's size.
+    fn decoded_frame_len(width: usize, height: usize) -> Result<usize, VisionError> {
+        Rgb8::frame_len(width, height).ok_or_else(|| {
+            VisionError::Decode(format!(
+                "a {width}x{height} frame's RGB byte count overflows"
+            ))
+        })
+    }
+
+    /// Refuse an image whose `data` is not its frame's `height * width * 3` bytes. The fields are
+    /// `pub`, so every consumer of a hand-built image checks here before it slices `data`.
+    pub fn check(&self) -> Result<(), VisionError> {
+        let size_err = |detail: String| VisionError::Size {
+            width: self.width,
+            height: self.height,
+            detail,
+        };
+        let Some(frame) = Rgb8::frame_len(self.width, self.height) else {
+            return Err(size_err("the frame's byte count overflows".to_string()));
+        };
+        if self.data.len() != frame {
+            return Err(size_err(format!(
+                "{} data bytes where the frame has {frame}",
+                self.data.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// An image of one colour.
     #[must_use]
     pub fn filled(width: usize, height: usize, rgb: [u8; 3]) -> Rgb8 {
@@ -175,7 +209,7 @@ impl Rgb8 {
             )));
         }
         let rows = buf.chunks_exact(info.line_size).take(height);
-        let mut data = Vec::with_capacity(width * height * 3);
+        let mut data = Vec::with_capacity(Rgb8::decoded_frame_len(width, height)?);
         match info.color_type {
             png::ColorType::Rgb => rows.for_each(|r| data.extend_from_slice(&r[..width * 3])),
             png::ColorType::Rgba => rows.for_each(|r| {
@@ -206,9 +240,11 @@ impl Rgb8 {
         Rgb8::from_decoded(width, height, data)
     }
 
-    /// A decoder's output as an image, refused when its byte count is not the frame's.
+    /// A decoder's output as an image, refused when the frame's byte count overflows or is not
+    /// the data's.
     fn from_decoded(width: usize, height: usize, data: Vec<u8>) -> Result<Rgb8, VisionError> {
-        if data.len() != width * height * 3 {
+        let frame = Rgb8::decoded_frame_len(width, height)?;
+        if data.len() != frame {
             return Err(VisionError::Decode(format!(
                 "{} RGB bytes for a {width}x{height} frame",
                 data.len()
@@ -281,6 +317,45 @@ mod tests {
                 other => panic!("{name}: {other:?}"),
             }
         }
+    }
+
+    /// A frame whose byte count overflows is refused by its size, not wrapped to a count the data
+    /// can match; `check` says the same of a hand-built image, and refuses data that is not the
+    /// frame's bytes.
+    #[test]
+    fn a_frame_size_that_overflows_is_refused_by_name() {
+        for (w, h) in [(usize::MAX, 2), (1 << 62, 2), (2, usize::MAX / 2)] {
+            match Rgb8::from_decoded(w, h, Vec::new()) {
+                Err(VisionError::Decode(msg)) => {
+                    assert_eq!(msg, format!("a {w}x{h} frame's RGB byte count overflows"));
+                }
+                other => panic!("{w}x{h}: {other:?}"),
+            }
+            let hand_built = Rgb8 {
+                width: w,
+                height: h,
+                data: Vec::new(),
+            };
+            assert!(
+                matches!(hand_built.check(), Err(VisionError::Size { .. })),
+                "{w}x{h}"
+            );
+        }
+        let ok = Rgb8::from_decoded(2, 1, vec![0; 6]).unwrap();
+        assert!(ok.check().is_ok());
+        let Err(VisionError::Decode(msg)) = Rgb8::from_decoded(2, 1, vec![0; 5]) else {
+            panic!("a short decode was accepted");
+        };
+        assert_eq!(msg, "5 RGB bytes for a 2x1 frame");
+        let mut short = ok.clone();
+        short.data.pop();
+        let Err(e) = short.check() else {
+            panic!("a short image passed the check");
+        };
+        assert_eq!(
+            e.to_string(),
+            "image size 2x1: 5 data bytes where the frame has 6"
+        );
     }
 
     /// A decoder library's refusal says which format's decoder it came from.

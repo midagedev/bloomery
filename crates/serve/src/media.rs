@@ -19,8 +19,9 @@ use std::sync::Arc;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub use vision::media::ExpandError;
 pub use vision::media::PartJoin;
-use vision::media::{ExpandError, expand_spans};
+use vision::media::expand_spans;
 pub use vision::{FileKind, MediaModel, Prepared, Rgb8, VisionError};
 
 /// A [`MediaModel`] the server holds across its threads: the request threads prepare images on
@@ -207,7 +208,7 @@ impl From<Vec<u32>> for Prompt {
     }
 }
 
-/// Everything the media part refuses, each naming what it refused. All but [`MediaError::EmptySpan`]
+/// Everything the media part refuses, each naming what it refused. All but [`ExpandError::EmptySpan`]
 /// are the request's fault.
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
@@ -279,30 +280,13 @@ pub enum MediaError {
     /// The model refused the decoded image.
     #[error("image: {0}")]
     Prepare(VisionError),
-    /// The prompt's image placeholders and the request's images do not pair up.
-    #[error("{placeholders} image placeholder(s) in the prompt for {images} image(s)")]
-    PlaceholderCount { placeholders: usize, images: usize },
-    /// A prepared image whose span is empty (the model's fault, not the request's).
-    #[error("image {0} has an empty span")]
-    EmptySpan(usize),
+    /// The prompt's placeholders and the request's images do not pair up, or a prepared image's
+    /// span is empty ([`ExpandError::EmptySpan`], the model's fault, not the request's).
+    #[error(transparent)]
+    Expand(#[from] ExpandError),
     /// A prompt whose last position is an image's: the reply is read after a text position.
     #[error("the prompt ends with an image; its last position must be text")]
     ImageLast,
-}
-
-impl From<ExpandError> for MediaError {
-    fn from(e: ExpandError) -> MediaError {
-        match e {
-            ExpandError::PlaceholderCount {
-                placeholders,
-                images,
-            } => MediaError::PlaceholderCount {
-                placeholders,
-                images,
-            },
-            ExpandError::EmptySpan(i) => MediaError::EmptySpan(i),
-        }
-    }
 }
 
 impl fmt::Display for ImageKey {
@@ -438,10 +422,10 @@ pub fn expand_prompt(
     let token = model.image_token();
     let placeholders = ids.iter().filter(|&&t| t == token).count();
     if placeholders != urls.len() {
-        return Err(MediaError::PlaceholderCount {
+        return Err(MediaError::Expand(ExpandError::PlaceholderCount {
             placeholders,
             images: urls.len(),
-        });
+        }));
     }
     if ids.last() == Some(&token) {
         return Err(MediaError::ImageLast);
@@ -1057,24 +1041,32 @@ mod tests {
         ));
     }
 
-    /// The expansion's refusals keep their variants here: `EmptySpan` is the model's 500, the
-    /// placeholder count the request's 400 (`api::media_error`).
+    /// The expansion's refusals reach the client as `ExpandError` wrote them: the text is the
+    /// one message, and the variants stay apart for `api::media_error`'s split (`EmptySpan` the
+    /// model's 500, the placeholder count the request's 400).
     #[test]
-    fn expansion_refusals_keep_their_variants() {
+    fn expansion_refusals_keep_their_text_and_variants() {
+        let empty = MediaError::from(ExpandError::EmptySpan(1));
         assert!(matches!(
-            MediaError::from(ExpandError::EmptySpan(1)),
-            MediaError::EmptySpan(1)
+            empty,
+            MediaError::Expand(ExpandError::EmptySpan(1))
         ));
+        assert_eq!(empty.to_string(), "image 1 has an empty span");
+        let count = MediaError::from(ExpandError::PlaceholderCount {
+            placeholders: 2,
+            images: 1,
+        });
         assert!(matches!(
-            MediaError::from(ExpandError::PlaceholderCount {
+            count,
+            MediaError::Expand(ExpandError::PlaceholderCount {
                 placeholders: 2,
                 images: 1
-            }),
-            MediaError::PlaceholderCount {
-                placeholders: 2,
-                images: 1
-            }
+            })
         ));
+        assert_eq!(
+            count.to_string(),
+            "2 image placeholder(s) in the prompt for 1 image(s)"
+        );
     }
 
     #[test]
@@ -1251,10 +1243,10 @@ mod tests {
             (&[1, 2][..], &[png.as_str()][..], (0, 1)),
         ] {
             match err(expand_prompt(ids, urls, &PLAIN)) {
-                MediaError::PlaceholderCount {
+                MediaError::Expand(ExpandError::PlaceholderCount {
                     placeholders,
                     images,
-                } => assert_eq!((placeholders, images), want, "{ids:?}"),
+                }) => assert_eq!((placeholders, images), want, "{ids:?}"),
                 e => panic!("{ids:?}: {e}"),
             }
         }

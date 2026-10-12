@@ -1882,7 +1882,7 @@ mod gate {
 
         // The span's end in the served prompt: the rendered prompt holds the
         // image's one placeholder token, which the server expands to the grid
-        // plan's span (serve::media::expand_spans) — the prompt it evaluates
+        // plan's span (vision::media::expand_spans) — the prompt it evaluates
         // is the rendered one less the placeholder plus the span.
         let ids = rendered(&url, &chat["messages"], &chat["chat_template_kwargs"])?;
         let at = ids

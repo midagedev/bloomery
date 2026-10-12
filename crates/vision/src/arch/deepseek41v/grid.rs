@@ -110,6 +110,14 @@ fn safe_resize(
 /// When `p` has no plan: `patch` or `downsample` 0, or `max_tokens` below the tokens of the
 /// smallest grid, one cell ([`num_image_tokens`] of 1×1). [`super::Hparams`] only builds legal
 /// params; a hand-built [`GridParams`] is the caller's contract.
+///
+/// # Contract
+///
+/// An image of no pixels (`width` or `height` 0) has no plan: the plan returned for one is
+/// meaningless, and the caller refuses the image first. The decoders never yield such a frame
+/// (PNG's IHDR and the JPEG's SOF refuse a zero side), and the one path that takes a hand-built
+/// [`crate::Rgb8`], [`super::media::preprocess`], plans first and then pads, and
+/// [`crate::resample::PadGeometry::of`] refuses an empty image by name.
 #[must_use]
 pub fn plan_image_grid(width: usize, height: usize, p: &GridParams) -> GridPlan {
     assert!(

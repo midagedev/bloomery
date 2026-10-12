@@ -129,18 +129,26 @@ fn store(out: &mut [u8], acc: [i32; 3]) {
 }
 
 /// `Image.resize((width, height), Image.BICUBIC)` of an RGB image, as Pillow computes it. A size
-/// equal to the input's is a copy, as in Pillow.
-#[must_use]
-pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Rgb8 {
+/// equal to the input's is a copy, as in Pillow. An image whose data is not its frame's bytes
+/// ([`Rgb8::check`]), or one with no pixels resized to a size with some, is refused by name.
+pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Result<Rgb8, VisionError> {
+    src.check()?;
     if (width, height) == (src.width, src.height) {
-        return src.clone();
+        return Ok(src.clone());
     }
-    if width == 0 || height == 0 || src.width == 0 || src.height == 0 {
-        return Rgb8 {
+    if width == 0 || height == 0 {
+        return Ok(Rgb8 {
             width,
             height,
             data: Vec::new(),
-        };
+        });
+    }
+    if src.width == 0 || src.height == 0 {
+        return Err(VisionError::Size {
+            width: src.width,
+            height: src.height,
+            detail: format!("an empty image has no pixels to resize to {width}x{height}"),
+        });
     }
     let horiz = Axis::bicubic(src.width, width);
     let mut vert = Axis::bicubic(src.height, height);
@@ -194,9 +202,9 @@ pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Rgb8 {
                 store(&mut out.data[o..o + 3], acc);
             }
         }
-        return out;
+        return Ok(out);
     }
-    horizontal.unwrap_or_else(|| src.clone())
+    Ok(horizontal.unwrap_or_else(|| src.clone()))
 }
 
 /// A pad needs pixels to place and room to place them: an empty image or canvas is refused as a
@@ -305,10 +313,16 @@ impl PadGeometry {
 
 /// Resize `src` to the geometry's size and paste it at its offset on a `canvas_w`×`canvas_h`
 /// canvas of `fill`; a size equal to the canvas is the resized image itself.
-fn paste(src: &Rgb8, g: PadGeometry, canvas_w: usize, canvas_h: usize, fill: [u8; 3]) -> Rgb8 {
-    let resized = resize_bicubic(src, g.resized_w, g.resized_h);
+fn paste(
+    src: &Rgb8,
+    g: PadGeometry,
+    canvas_w: usize,
+    canvas_h: usize,
+    fill: [u8; 3],
+) -> Result<Rgb8, VisionError> {
+    let resized = resize_bicubic(src, g.resized_w, g.resized_h)?;
     if (g.resized_w, g.resized_h) == (canvas_w, canvas_h) {
-        return resized;
+        return Ok(resized);
     }
     let mut out = Rgb8::filled(canvas_w, canvas_h, fill);
     for y in 0..g.resized_h {
@@ -316,14 +330,14 @@ fn paste(src: &Rgb8, g: PadGeometry, canvas_w: usize, canvas_h: usize, fill: [u8
         let at = ((y + g.off_y) * canvas_w + g.off_x) * 3;
         out.data[at..at + from.len()].copy_from_slice(from);
     }
-    out
+    Ok(out)
 }
 
 /// `ImageOps.pad(image, (best_w, best_h), color=fill)` with the default bicubic filter and
 /// centering.
 pub fn pad(src: &Rgb8, best_w: usize, best_h: usize, fill: [u8; 3]) -> Result<Rgb8, VisionError> {
     let g = PadGeometry::of(src.width, src.height, best_w, best_h)?;
-    Ok(paste(src, g, best_w, best_h, fill))
+    paste(src, g, best_w, best_h, fill)
 }
 
 /// llama.cpp's `PAD_CEIL` resize of an image to a `target_w`×`target_h` canvas: a size equal to
@@ -339,12 +353,12 @@ pub fn pad_ceil(
         return Ok(src.clone());
     }
     let g = PadGeometry::ceil_of(src.width, src.height, target_w, target_h)?;
-    Ok(paste(src, g, target_w, target_h, fill))
+    paste(src, g, target_w, target_h, fill)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Axis, PRECISION_BITS, PadGeometry, bicubic, pad, pad_ceil};
+    use super::{Axis, PRECISION_BITS, PadGeometry, bicubic, pad, pad_ceil, resize_bicubic};
     use crate::{Rgb8, VisionError};
 
     /// Two pad colours of the two projector types that call the pads; the pads themselves take
@@ -479,6 +493,53 @@ mod tests {
                 "{w}x{h} on {tw}x{th}"
             );
         }
+    }
+
+    /// An image whose data is not its frame's bytes is refused by name, at every size the resize
+    /// is asked for (the same size is a copy of nothing sound), and so by both pads. An image with
+    /// no pixels resized to a size with some has nothing to resample.
+    #[test]
+    fn resize_refuses_a_short_image_and_an_empty_source() {
+        let mut short = Rgb8::filled(8, 6, [1, 2, 3]);
+        short.data.truncate(short.data.len() - 3);
+        for (w, h) in [(8, 6), (4, 3), (16, 12), (8, 3), (0, 3)] {
+            assert!(
+                matches!(resize_bicubic(&short, w, h), Err(VisionError::Size { .. })),
+                "{w}x{h}"
+            );
+        }
+        assert!(matches!(
+            pad(&short, 16, 16, GREY),
+            Err(VisionError::Size { .. })
+        ));
+        assert!(matches!(
+            pad_ceil(&short, 16, 16, GREY),
+            Err(VisionError::Size { .. })
+        ));
+        let empty = Rgb8::filled(0, 0, [0; 3]);
+        assert!(matches!(
+            resize_bicubic(&empty, 4, 4),
+            Err(VisionError::Size { .. })
+        ));
+        let to_nothing = resize_bicubic(&empty, 0, 4).unwrap();
+        assert_eq!(
+            (to_nothing.width, to_nothing.height, to_nothing.data.len()),
+            (0, 4, 0)
+        );
+    }
+
+    /// A pad of an image with no pixels is refused by name, the guard of a plan made for one.
+    #[test]
+    fn pad_refuses_an_empty_image() {
+        let empty = Rgb8::filled(0, 0, [0; 3]);
+        assert!(matches!(
+            pad(&empty, 546, 546, GREY),
+            Err(VisionError::Size { .. })
+        ));
+        assert!(matches!(
+            PadGeometry::of(0, 0, 546, 546),
+            Err(VisionError::Size { .. })
+        ));
     }
 
     /// Both pads resize and paste through one function: the grey pad of an image the canvas

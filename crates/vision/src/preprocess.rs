@@ -165,13 +165,7 @@ pub fn patchify_with(
         height: image.height,
         detail,
     };
-    let frame = image.width.saturating_mul(image.height).saturating_mul(3);
-    if image.data.len() != frame {
-        return Err(size_err(format!(
-            "{} data bytes where the frame has {frame}",
-            image.data.len()
-        )));
-    }
+    image.check()?;
     let group = s * m;
     if image.width != plan.best_w
         || image.height != plan.best_h
