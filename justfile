@@ -99,7 +99,7 @@ contrib-check *ARGS:
 check-recipes:
     ./tools/check-recipes.sh
 
-# BASE(기본 main)나 A..B 사이에 바뀐 파일을 입력으로 읽는 gate-* 레시피 목록 — 맥에서, 빌드 없이, 아무것도 돌리지 않는다(tools/affected-gates.sh).
+# The gate-* recipes that read a file changed since the merge-base with BASE (default main), or in A..B (from merge-base(A, B) to B, as `git diff A...B`) — on the Mac, no build, runs nothing (tools/affected-gates.sh).
 # `--narrow --scan BASE_LOG NEW_LOG …` (ptx-scan logs of the base and the change): the gates that run the changed host path.
 affected BASE='main' *ARGS:
     ./tools/affected-gates.sh {{BASE}} {{ARGS}}

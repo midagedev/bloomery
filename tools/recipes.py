@@ -24,8 +24,9 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
 `main`) compares the working tree, uncommitted and untracked files included, with the merge base of
-BASE and HEAD — a round's tree is never committed. `A..B` compares two commits exactly; both sides
-are read from `git archive` copies, so the graph is the one those commits had.
+BASE and HEAD — a round's tree is never committed. `A..B` compares B with the merge base of A and B
+(`git diff A...B`; A itself when it is an ancestor of B), the `affected:` line naming the base it
+used; both sides are read from `git archive` copies, so the graph is the one those commits had.
 
 A recipe that a row of tools/fixture-variants.tsv lists also prints its variant item, `NAME@BLOOMERY_FIXTURE_VARIANT=<tag>`, as a line of
 its own and in the `recipes:` line (a batch `--list` takes the first word of the line). A row that was added or edited prints the items of its
@@ -61,7 +62,11 @@ A recipe's inputs are:
     tools/ref/models/deepseek41.sh and the recipe's profile (`BLOOMERY_MODEL=x` on the line, else
     deepseek2);
   - for a cargo recipe, Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/config.toml, and
-    .cargo/cuda-oxide.toml when the recipe runs `cargo oxide`;
+    .cargo/cuda-oxide.toml when the recipe runs `cargo oxide`. A virtual workspace's Cargo.toml is read by
+    table too (`root_moves`): of [workspace], `members`/`exclude` select the recipes that read a package that
+    entered or left the workspace (an exclude of a path that held no member selects nothing) and
+    `default-members` the recipes with a cargo line naming no `-p` and no `--workspace`; every other table, and
+    Cargo.lock, rust-toolchain.toml and .cargo/config.toml, select every cargo recipe;
   - its own text in the justfile (a recipe whose text changed is selected), and its dependencies'
     inputs.
 
@@ -197,6 +202,9 @@ WEEKLY_PREFIX = "weekly-"
 # The checks the lead's batches always run; the diff does not pick them.
 ALWAYS = ["check-recipes", "check-rustflags", "check-comments", "check-levers", "check-arch", "check", "fmt-check", "lint"]
 CARGO_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]
+# The workspace's root manifest: a cargo global every cargo recipe reads, narrowed by table (`root_moves`) where it is a
+# virtual manifest; as a package's own manifest it stays whole.
+ROOT_MANIFEST = "Cargo.toml"
 OXIDE_GLOBALS = [".cargo/cuda-oxide.toml"]
 BOX_GLOBALS = ["tools/box.sh", "tools/ref/ref-paths.sh", "tools/ref/models/deepseek41.sh"]
 DEFAULT_PROFILE = "deepseek2"
@@ -768,6 +776,72 @@ def view_moves(da: dict | None, db: dict | None, pkg_dir: str, wants: frozenset[
     return out
 
 
+# ---- the root manifest, read by table ----
+#
+# A virtual workspace's root Cargo.toml is every cargo recipe's input, and a change of it names the recipes it reaches
+# by table, as a package manifest does:
+#   - [workspace] `members` and `exclude` decide which packages are members. The reach is the recipes that read a
+#     package that entered or left (TableReads.delta: both sides' `cargo metadata` member sets, which hold cargo's own
+#     rules — globs, an explicit member against an exclude, a path dependency inside the root being a member — and
+#     are not recomputed here): its own recipes and its dependents', through the mapping every file uses. A member
+#     set equal on both sides moves no recipe (`exclude = [..., "fuzz"]` where fuzz was no member, a reorder, a glob).
+#   - [workspace] `default-members` decides the build that names no `-p` and no `--workspace`: the recipes with such
+#     an invocation (RecipeInputs.bare_cargo), none while every cargo line names its packages.
+#   - everything else is whole: every recipe that reads the file, as before. [workspace.dependencies], .package,
+#     .lints and .metadata, `resolver`, [profile.*], [patch.*], [replace], a key this code does not know, a manifest
+#     that does not parse, a file added or removed, a `workspace` that is not a table on both sides.
+# A recipe that reads the file as a file is whole whatever moved (ManifestUse.whole). Today only a bin's box dep-info
+# can say so: a script names a path under tools/ or crates/ (_SCRIPT_PATH) and a literal one under tools/, crates/ or
+# docs/ (Tree._LITERAL), so a script that opens Cargo.toml by its bare name is not seen, here or anywhere in the mapping.
+# The ledger key still hashes the file whole (KEY_GLOBALS): a recipe this selects has its key moved.
+ROOT_MEMBERSHIP = ("members", "exclude")
+ROOT_DEFAULT_MEMBERS = "default-members"
+
+
+class Unparsed(dict):
+    """A root manifest that does not parse: a side no table can be read from."""
+
+
+UNPARSED = Unparsed()
+
+
+def _str_list(v) -> bool:
+    return isinstance(v, list) and all(isinstance(e, str) for e in v)
+
+
+def root_moves(da: dict | None, db: dict | None) -> list[tuple[str, str]]:
+    """What moved between two parses of the root manifest, one (label, kind) per table: `members` for [workspace]
+    members and exclude, `default` for default-members, `whole` for every other table. A side with no file or one
+    that does not parse is the whole file. Empty when no table moved (a comment, the layout)."""
+    if da is None or db is None or isinstance(da, Unparsed) or isinstance(db, Unparsed):
+        if da is None and db is None:
+            return []
+        what = "does not parse" if isinstance(da, Unparsed) or isinstance(db, Unparsed) else "added" if da is None else "removed"
+        return [(f"the whole file ({what})", "whole")]
+    out: list[tuple[str, str]] = []
+    for k in sorted(set(da) | set(db)):
+        x, y = da.get(k), db.get(k)
+        if canon(x) == canon(y):
+            continue
+        if k != "workspace" or not isinstance(x, dict) or not isinstance(y, dict):
+            out.append((f"[{k}]", "whole"))
+            continue
+        for s in sorted(set(x) | set(y)):
+            u, v = x.get(s), y.get(s)
+            if canon(u) == canon(v):
+                continue
+            listed = all(w is None or _str_list(w) for w in (u, v))
+            if s in ROOT_MEMBERSHIP and listed:
+                out.append((f"[workspace] {s}", "members"))
+            elif s == ROOT_DEFAULT_MEMBERS and listed:
+                out.append((f"[workspace] {s}", "default"))
+            elif any(isinstance(w, dict) for w in (u, v)):
+                out.append((f"[workspace.{s}]", "whole"))
+            else:
+                out.append((f"[workspace] {s}", "whole"))
+    return out
+
+
 @dataclass
 class ManifestUse:
     """How a recipe's targets read the package manifests of their closure: `views` maps a manifest to
@@ -1274,7 +1348,7 @@ class Tree:
             for q in [pkg_name, *linked]:
                 use.views.setdefault(self.packages[q].manifest, set())
                 read |= set(self._lib_reads(q))
-            use.whole |= read & self.manifest_paths
+            use.whole |= read & (self.manifest_paths | {ROOT_MANIFEST})
         return out
 
     # ---------------- invocation -> targets ----------------
@@ -1389,6 +1463,7 @@ class RecipeInputs:
     errors: list[str]
     commands: RecipeCommands
     manifests: ManifestUse = field(default_factory=ManifestUse)  # how the targets read their package manifests
+    bare_cargo: bool = False  # a cargo line (or a dependency's) names no `-p` and no `--workspace`: [workspace] default-members decides it
 
     def match(self, path: str) -> str | None:
         if path in self.files:
@@ -1463,6 +1538,7 @@ class Graph:
         prefixes: dict[str, str] = {}
         targets: list[tuple[str, str, str | None, list[str]]] = []
         use = ManifestUse()
+        bare = any(not inv.packages and not inv.workspace for inv in rc.invocations)
         for inv in rc.invocations:
             tl, errs = self.tree.resolve(inv)
             errors.extend(errs)
@@ -1509,6 +1585,7 @@ class Graph:
             for p, why in di.prefixes.items():
                 prefixes.setdefault(p, f"{why} (via {dep})")
             use.merge(di.manifests)
+            bare = bare or di.bare_cargo
             built |= {t for (_, k, t, _) in di.targets if k == "bin"}
         for b in rc.runs:
             if "{{" in b or b.startswith("$"):
@@ -1517,7 +1594,7 @@ class Graph:
                 errors.append(f"runs target/release/{b}, which the recipe does not build")
         # a manifest that is a cargo global, or lies under a directory a script walks, is read whole
         use.whole |= {m for m in self.tree.manifest_paths if m in CARGO_GLOBALS or any(m.startswith(p) for p in prefixes)}
-        ri = RecipeInputs(files, prefixes, targets, errors, rc, use)
+        ri = RecipeInputs(files, prefixes, targets, errors, rc, use, bare)
         self._inputs[name] = ri
         return ri
 
@@ -1651,19 +1728,91 @@ class Selection:
 class TableReads:
     """The package manifests of one diff, each parsed on both sides, and what moved in each recipe's view
     of them (manifest_view). One reader for every place a changed file picks recipes (select, narrow); the
-    key reads the same view. `hit` records each answer, which `lines` prints."""
+    key reads the same view. `hit` records each answer, which `lines` prints. The root Cargo.toml of a virtual
+    workspace is read here too (`root`), by the tables `root_moves` names; a root that is a package's own
+    manifest is a package manifest and a cargo global, whole."""
 
     def __init__(self, changed: list[str], a: Side | None, b: Side):
         self.a, self.b = a, b
         self.docs: dict[str, tuple[dict | None, dict | None]] = {}
+        self.root: str | None = None
+        self._delta: tuple[dict[str, str], dict[str, str]] | None = None
         for f in changed:
             if a is not None and (f in b.tree.manifest_paths or f in a.tree.manifest_paths):
                 self.docs[f] = (self._doc(a, f), self._doc(b, f))
+            elif a is not None and f == ROOT_MANIFEST:
+                self.root = f
+                self.docs[f] = (self._root_doc(a), self._root_doc(b))
         self.seen: dict[str, dict[str, list[tuple[str, bool]] | None]] = {f: {} for f in self.docs}
 
     @staticmethod
     def _doc(side: Side, f: str) -> dict | None:
         return read_manifest(side.tree.root, f) if side.tree.exists(f) else None
+
+    @staticmethod
+    def _root_doc(side: Side) -> dict | None:
+        """The root manifest of `side`: a parse failure is a side no table reads (every cargo recipe reads the file
+        whole), not the error a package manifest's is."""
+        if not side.tree.exists(ROOT_MANIFEST):
+            return None
+        try:
+            return read_manifest(side.tree.root, ROOT_MANIFEST)
+        except RecipeError:
+            return UNPARSED
+
+    def delta(self) -> tuple[dict[str, str], dict[str, str]]:
+        """(entered, left): manifest -> package name for each package that is a workspace member on one side only. The
+        members are the ones each side's `cargo metadata` names (Tree.packages): cargo's own answer to members,
+        exclude, globs and path dependencies, so a path an exclude names where no package lived is no change."""
+        if self._delta is None:
+            assert self.a is not None
+            pa = {p.manifest: p.name for p in self.a.tree.packages.values()}
+            pb = {p.manifest: p.name for p in self.b.tree.packages.values()}
+            self._delta = ({m: x for m, x in pb.items() if m not in pa}, {m: x for m, x in pa.items() if m not in pb})
+        return self._delta
+
+    def _reach(self, n: str) -> list[str]:
+        """The packages that entered (`+name`, read on B) or left (`-name`, read on A) the workspace that recipe `n`
+        builds or reads: its own, and those it links."""
+        assert self.a is not None
+        entered, left = self.delta()
+        out = []
+        if n in self.b.recipes:
+            ib = self.b.graph.inputs(n)
+            out += [f"+{x}" for m, x in entered.items() if ib.match(m) is not None]
+        if n in self.a.recipes:
+            ia = self.a.graph.inputs(n)
+            out += [f"-{x}" for m, x in left.items() if ia.match(m) is not None]
+        return out
+
+    def _root_moves(self, n: str, f: str) -> list[tuple[str, bool]] | None:
+        """moves() for the root manifest: None (read as a file) when a table that stays whole moved or the recipe
+        reads the file as a file; else the membership and default-members moves that reach `n`."""
+        sides = [s for s in (self.a, self.b) if s is not None and n in s.recipes]
+        reads = [s for s in sides if s.graph.inputs(n).match(f) is not None]
+        if not reads:
+            return None
+        kinds = root_moves(*self.docs[f])
+        if any(k == "whole" for _, k in kinds) or any(f in s.graph.inputs(n).manifests.whole for s in reads):
+            self.seen[f][n] = None
+            return None
+        reach = self._reach(n)
+        bare = any(s.graph.inputs(n).bare_cargo for s in reads)
+        mv: list[tuple[str, bool]] = []
+        for label, kind in kinds:
+            if kind == "members" and reach:
+                mv.append((f"{label} ({', '.join(reach)})", False))
+            elif kind == "default" and bare:
+                mv.append((label, False))
+        self.seen[f][n] = mv
+        return mv
+
+    def moved(self, f: str) -> list[tuple[str, bool]]:
+        """The tables of manifest `f` that moved whatever recipe reads it, (label, whether a named entry of a target)."""
+        da, db = self.docs[f]
+        if f == self.root:
+            return [(label, False) for label, _ in root_moves(da, db)]
+        return view_moves(da, db, os.path.dirname(f), None)
 
     def moves(self, n: str, f: str) -> list[tuple[str, bool]] | None:
         """What moved in recipe `n`'s view of manifest `f`, its own entries taken from both sides (an entry
@@ -1671,6 +1820,8 @@ class TableReads:
         None when `f` is not a manifest of the diff or `n` reads it whole on either side (the file rule)."""
         if f not in self.docs:
             return None
+        if f == self.root:
+            return self._root_moves(n, f)
         wants: set[Entry] = set()
         read = False
         for side in (self.a, self.b):
@@ -1716,11 +1867,22 @@ class TableReads:
             by_table = {n: mv for n, mv in seen.items() if mv is not None}
             whole = sorted(n for n, mv in seen.items() if mv is None)
             out.append(f"  {f}: {len(by_table)} recipes read it by table, {len(whole)} whole")
-            for label, _ in view_moves(da, db, os.path.dirname(f), None) or [("nothing (comments or layout only)", False)]:
-                sel = [n for n, mv in by_table.items() if any(m == label for m, _ in mv)]
-                every = len(sel) == len(by_table) and len(sel) > 3
+            root = f == self.root
+            kinds = root_moves(da, db) if root else [(label, "table") for label, _ in self.moved(f)]
+            for label, kind in kinds or [("nothing (comments or layout only)", "table")]:
+                if kind == "whole":  # a root table that stays whole: every recipe that reads the file
+                    sel, pool = whole, whole
+                else:
+                    pool = list(by_table)
+                    sel = [n for n, mv in by_table.items() if any(m == label or m.startswith(label + " (") for m, _ in mv)]
+                every = len(sel) == len(pool) and len(sel) > 3
                 out.append(f"    {label} -> " + (f"every reader ({len(sel)})" if every else " ".join(sel) if sel else "no recipe"))
-            if whole:
+            if root and any(k == "members" for _, k in kinds):
+                entered, left = self.delta()
+                assert self.a is not None
+                out.append(f"    workspace members: {len(self.a.tree.packages)} before, {len(self.b.tree.packages)} after; "
+                           f"entered {', '.join(sorted(entered.values())) or 'none'}, left {', '.join(sorted(left.values())) or 'none'}")
+            if whole and not any(k == "whole" for _, k in kinds):
                 out.append("    read whole -> " + " ".join(whole))
         return out
 
@@ -1799,18 +1961,27 @@ def orphan_hint(side: Side, f: str) -> str:
     return "read by " + ", ".join(sorted(set(users))[:4]) + (" …" if len(users) > 4 else "") + " — no gate-* recipe builds it"
 
 
-def changed_files(spec: str) -> tuple[list[str], str | None, str | None]:
-    """(files, A rev, B rev or None for the working tree)."""
+def changed_files(spec: str) -> tuple[list[str], str | None, str | None, str]:
+    """(files, the rev the A side is read at, B rev or None for the working tree, how the A side is printed). `A..B` is B
+    against merge-base(A, B), as `git diff A...B` reads it: a branch forked behind its target has not changed what the
+    target gained since, and a tree-to-tree diff would select every one of those commits' files too. When A is an
+    ancestor of B the merge-base is A and the range is read as written."""
     if ".." in spec:
         a, b = spec.split("..", 1)
         a = a or "HEAD"
         b = b or "HEAD"
-        files = git("diff", "--name-only", "--no-renames", a, b).split()
-        return sorted(set(files)), a, b
+        try:
+            mb = git("merge-base", a, b).strip()
+        except RecipeError as err:
+            raise RecipeError(f"{a} and {b} have no merge base to read {spec} against: {err}") from err
+        files = git("diff", "--name-only", "--no-renames", mb, b).split()
+        if mb == git("rev-parse", "--verify", f"{a}^{{commit}}").strip():
+            return sorted(set(files)), a, b, a[:9]
+        return sorted(set(files)), mb, b, f"{mb[:9]} (merge-base of {a} and {b})"
     base = git("merge-base", spec, "HEAD").strip()
     files = git("diff", "--name-only", "--no-renames", base).split()
     files += git("ls-files", "--others", "--exclude-standard").split()
-    return sorted(set(files)), base, None
+    return sorted(set(files)), base, None, base[:9]
 
 
 def cmd_affected(args: argparse.Namespace) -> int:
@@ -1819,7 +1990,7 @@ def cmd_affected(args: argparse.Namespace) -> int:
     # Every scan log and the table are read before the diff: one the tool cannot vouch for is refused first.
     scans = [(read_scan(x), read_scan(y)) for x, y in args.scan or []]
     rows = load_gate_paths() if args.narrow else []
-    changed, a_rev, b_rev = changed_files(args.base)
+    changed, a_rev, b_rev, a_label = changed_files(args.base)
     prefix = "" if args.all_recipes else GATE_PREFIX
     tmp = tempfile.mkdtemp(prefix="recipes-affected-")
     try:
@@ -1843,7 +2014,7 @@ def cmd_affected(args: argparse.Namespace) -> int:
         n_weekly = sum(1 for n in b.recipes if n.startswith(WEEKLY_PREFIX))
         weekly = f", {len(trig)} of {n_weekly} weekly-recipes by a trigger" if prefix == GATE_PREFIX else ""
         total = sum(1 for n in b.recipes if n.startswith(prefix))
-        rng = f"{a_rev[:9]}..{b_rev[:9]}" if b_rev else f"{a_rev[:9]}..(working tree)"
+        rng = f"{a_label}..{b_rev[:9]}" if b_rev else f"{a_label}..(working tree)"
         nar = narrow(changed, a, b, scans, rows, tables) if args.narrow else None
         narrowed = nar is not None and not nar.full
         vitems = variant_items(list(nar.picks) if narrowed else [s.recipe for s in sels], a, b, changed, prefix) if prefix == GATE_PREFIX else []
@@ -3860,7 +4031,7 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
             rule.append("no gate reads it")
         # a manifest whose diff moved only named entries changes no kernel: the bins whose entries moved
         # are picked above as their own targets
-        entries_only = f in tables.docs and all(own for _, own in view_moves(*tables.docs[f], os.path.dirname(f), None))
+        entries_only = f in tables.docs and all(own for _, own in tables.moved(f))
         for c in carriers:
             if f in c.files and not entries_only and not any(carrier_covered(c, v.bin, v.bundles) for v in res.verdicts):
                 for n in c.recipes:
@@ -4981,11 +5152,11 @@ def cmd_combos(args: argparse.Namespace) -> int:
     base_note = ""
     if scoped:
         try:
-            files, a_rev, b_rev = changed_files(args.base)
+            files, a_rev, b_rev, a_label = changed_files(args.base)
         except RecipeError as err:
             raise RecipeError(f"combos --base {args.base}: {err}")
         changed = set(files)
-        base_note = f" since {a_rev[:9]}" + ("" if b_rev is None else f"..{b_rev[:9]}")
+        base_note = f" since {a_label}" + ("" if b_rev is None else f"..{b_rev[:9]}")
         if args.ledger:
             green, bad = read_shape_ledger(args.ledger)
             if bad:
@@ -7328,6 +7499,213 @@ def manifest_self_test(expect) -> None:
                f"tables: a manifest that does not parse, in the key: {kb}")
 
 
+def root_manifest_self_test(expect) -> None:
+    """The root Cargo.toml read by table, on a synthetic virtual workspace (g; user, which links g; h, which a case
+    makes a member or not; a root manifest of [workspace] alone). Only a change of the packages that are members
+    selects by what reads them (2026-10-12, PR #64: `exclude` gaining `fuzz` selected all 149 gates); the two
+    ways the file stays whole are pinned beside it: any other table, and a bin whose box dep-info lists the file
+    (the one route a read of the root manifest reaches the tool: no script regex or path literal names it). The
+    ledger key still hashes the file whole, so a selected recipe's key must move."""
+    base = (
+        '[workspace]\nresolver = "3"\nmembers = ["crates/g", "crates/user"]\n# the reproducer is not a member\n'
+        'exclude = ["crates/repro"]\n\n[workspace.dependencies]\nserde = "1"\n\n[profile.release]\nopt-level = 3\n'
+    )
+    members = 'members = ["crates/g", "crates/user"]\n'
+    with_h = base.replace(members, 'members = ["crates/g", "crates/user", "crates/h"]\n')
+    glob = base.replace(members, 'members = ["crates/*"]\n')
+    pkgs = {"g": [], "user": ["g"], "h": []}
+    just = (
+        "gate-g:\n    ./tools/box.sh 'cargo test -p g --lib'\n"
+        "gate-user:\n    ./tools/box.sh 'cargo build -p user --bin user'\n"
+        "gate-h:\n    ./tools/box.sh 'cargo test -p h --lib'\n"
+        "gate-ws:\n    ./tools/box.sh 'cargo test --workspace'\n"
+        "gate-bare:\n    ./tools/box.sh 'cargo build'\n"
+    )
+    names = ["gate-g", "gate-user", "gate-h", "gate-ws", "gate-bare"]
+    every = set(names)
+    with tempfile.TemporaryDirectory(prefix="recipes-root-") as tmp:
+        mf = os.path.join(tmp, "box-manifest.txt")
+        with open(mf, "w", encoding="utf-8") as fh:
+            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\n# end\n")
+        made: list[str] = []
+
+        def build(root_toml: str, member: tuple[str, ...] = ("g", "user"), justfile: str = just, depinfo: set[str] | None = None) -> Side:
+            root = os.path.join(tmp, f"t{len(made)}")
+            made.append(root)
+            files = {
+                "Cargo.toml": root_toml,
+                "justfile": justfile,
+                "fuzz/Cargo.toml": '[package]\nname = "fuzz"\nversion = "0.0.0"\n',
+                "fuzz/src/lib.rs": "",
+            }
+            for n, deps in pkgs.items():
+                toml = f'[package]\nname = "{n}"\nversion = "0.1.0"\n'
+                if deps:
+                    toml += "\n[dependencies]\n" + "".join(f'{d} = {{ path = "../{d}" }}\n' for d in deps)
+                files[f"crates/{n}/Cargo.toml"] = toml
+                files[f"crates/{n}/src/" + ("main.rs" if n == "user" else "lib.rs")] = "fn main() {}\n" if n == "user" else ""
+            for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
+                files[f] = ""
+            for rel, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            packages = [
+                {"id": n, "name": n, "manifest_path": os.path.join(root, f"crates/{n}/Cargo.toml"), "features": {},
+                 "dependencies": [{"name": d, "kind": None, "optional": False, "features": [], "uses_default_features": True} for d in pkgs[n]],
+                 "targets": [{"kind": ["bin" if n == "user" else "lib"], "name": n,
+                              "src_path": os.path.join(root, f"crates/{n}/src/" + ("main.rs" if n == "user" else "lib.rs"))}]}
+                for n in member
+            ]
+            side = side_at(root, {"workspace_root": root, "workspace_members": list(member), "packages": packages})
+            if depinfo:
+                side.tree.depinfo["user"] = ({"crates/user/src/main.rs", *depinfo}, 0.0)
+            return side
+
+        def keys(side: Side) -> dict[str, str]:
+            ctx = KeyContext(side, mf, environ={})
+            out = {}
+            for n in names:
+                parts, err, _, _ = ctx.parts(n)
+                out[n] = item_key(parts) if err is None else "error: " + err
+            return out
+
+        a0 = build(base)
+        pr64 = base.replace('"crates/repro"]', '"crates/repro", "fuzz"]')
+        h_less = a0
+        h_in = build(with_h, ("g", "user", "h"))
+        h_only = {"gate-h", "gate-ws", "gate-bare"}
+        cases = [
+            # PR #64's shape: `exclude` gains a path that held no member (fuzz, a separate crate)
+            ("pr64-exclude", a0, build(base.replace('exclude = ["crates/repro"]', 'exclude = ["crates/repro", "fuzz"]')), set()),
+            ("members in another order", a0, build(base.replace(members, 'members = ["crates/user", "crates/g"]\n')), set()),
+            ("a comment", a0, build(base.replace("# the reproducer is not a member", "# not a member")), set()),
+            ("a glob that makes the same members", h_in, build(glob, ("g", "user", "h")), set()),
+            ("a member added", h_less, h_in, h_only),
+            ("a member removed", h_in, h_less, h_only),
+            ("a glob with a member excluded", build(glob, ("g", "user", "h")), build(glob.replace('["crates/repro"]', '["crates/repro", "crates/h"]'), ("g", "user")), h_only),
+            # user links g: its dependents read it too
+            ("a member that another links, removed", a0, build(base.replace(members, 'members = ["crates/user"]\n'), ("user",)),
+             {"gate-g", "gate-user", "gate-ws", "gate-bare"}),
+            # default-members decides a build with no -p and no --workspace only: gate-bare is the one
+            ("default-members added", a0, build(base.replace(members, members + 'default-members = ["crates/g"]\n')), {"gate-bare"}),
+            ("default-members added, no recipe builds without -p", build(base, justfile=just.replace("gate-bare:\n    ./tools/box.sh 'cargo build'\n", "")),
+             build(base.replace(members, members + 'default-members = ["crates/g"]\n'), justfile=just.replace("gate-bare:\n    ./tools/box.sh 'cargo build'\n", "")), set()),
+            # every other table: the conservative path holds
+            ("[workspace.dependencies]", a0, build(base.replace('serde = "1"', 'serde = "2"')), every),
+            ("[profile.release]", a0, build(base.replace("opt-level = 3", "opt-level = 2")), every),
+            ("[workspace] resolver", a0, build(base.replace('resolver = "3"', 'resolver = "2"')), every),
+            ("[workspace.package]", a0, build(base + '\n[workspace.package]\nedition = "2024"\n'), every),
+            ("[patch]", a0, build(base + '\n[patch.crates-io]\nfoo = { path = "foo" }\n'), every),
+            ("members and [workspace.dependencies] together", h_less, build(with_h.replace('serde = "1"', 'serde = "2"'), ("g", "user", "h")), every),
+            ("a manifest that does not parse", a0, build(base + "[profile\n", member=("g", "user")), every),
+            # the file read as a file: a script naming it, a path literal in a linked lib
+            ("pr64-exclude, a bin's dep-info lists the file", build(base, depinfo={"Cargo.toml"}), build(pr64, depinfo={"Cargo.toml"}),
+             {"gate-user", "gate-ws", "gate-bare"}),
+        ]
+        ka_cache: dict[int, dict[str, str]] = {}
+        for what, a, b, want in cases:
+            ka = ka_cache.setdefault(id(a), keys(a))
+            sels, unmapped, _ = select(["Cargo.toml"], a, b, GATE_PREFIX)
+            got = {x.recipe for x in sels}
+            expect(got == want, f"root: {what} selects {sorted(got)}, not {sorted(want)}")
+            kb = keys(b)
+            # a recipe that names a package outside the workspace on one side has no key there (gate-h, h not a member)
+            kept = {n for n in want if not ka[n].startswith("error") and not kb[n].startswith("error")}
+            moved = {n for n in kept if kb[n] != ka[n]}
+            expect(kept == moved, f"root: {what} selects {sorted(kept - moved)}, whose key did not move (the key hashes the file whole)")
+            if not want:
+                expect(len(unmapped) == 1 and unmapped[0].startswith("Cargo.toml") and "read by table" in unmapped[0],
+                       f"root: {what} selects nothing and prints {unmapped} under unmapped, not a Cargo.toml read by table")
+        # the manifests: block names the change by table, what each selects, and the members on both sides
+        a, b = a0, build(base.replace('exclude = ["crates/repro"]', 'exclude = ["crates/repro", "fuzz"]'))
+        tables = TableReads(["Cargo.toml", "fuzz/Cargo.toml", "fuzz/src/lib.rs"], a, b)
+        select(["Cargo.toml", "fuzz/Cargo.toml", "fuzz/src/lib.rs"], a, b, GATE_PREFIX, tables)
+        block = "\n".join(tables.lines())
+        expect("[workspace] exclude -> no recipe" in block and "2 before, 2 after" in block, f"root: the manifests: block of pr64-exclude is\n{block}")
+        tables = TableReads(["Cargo.toml"], h_less, h_in)
+        select(["Cargo.toml"], h_less, h_in, GATE_PREFIX, tables)
+        block = "\n".join(tables.lines())
+        expect("[workspace] members -> gate-h gate-ws gate-bare" in block and "entered h, left none" in block and "2 before, 3 after" in block,
+               f"root: the manifests: block of a member added is\n{block}")
+        tables = TableReads(["Cargo.toml"], a0, build(base.replace('serde = "1"', 'serde = "2"')))
+        select(["Cargo.toml"], a0, build(base.replace('serde = "1"', 'serde = "2"')), GATE_PREFIX, tables)
+        expect("[workspace.dependencies] -> every reader (5)" in "\n".join(tables.lines()), f"root: the manifests: block of a whole table is\n" + "\n".join(tables.lines()))
+        # --narrow with an identical scan pair: the exclude of pr64 picks nothing and no longer holds the full list; a whole table still does
+        lines = ["ptx-scan: mod1 bundle=bloomery-gpu bytes=100",
+                 "ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 modules=1 "
+                 "jit-card=NVIDIA_RTX_A6000 jit-cc=8.6 jit-cuda=13.4",
+                 "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local",
+                 f"{'alpha':<24} 256 no 0 0 0 0 12 0 0 6 12 0", "ptx-scan-md5: method=decl1", f"alpha {'1' * 32} 41"]
+        log = os.path.join(tmp, "scan.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        pair = (read_scan(log), read_scan(log))
+        nar = narrow(["Cargo.toml"], a, b, [pair], [])
+        expect(not nar.full and not nar.picks, f"root: --narrow on pr64-exclude gives full {nar.full}, picks {sorted(nar.picks)}")
+        nar = narrow(["Cargo.toml"], a0, build(base.replace('serde = "1"', 'serde = "2"')), [pair], [])
+        expect(any("Cargo.toml" in r for r in nar.full), f"root: --narrow on [workspace.dependencies] gives full {nar.full}, not the full list")
+
+
+def range_base_self_test(expect) -> None:
+    """`A..B` is B against merge-base(A, B), on a fixture repository that runs this file as its own tools/recipes.py:
+    `main` moves on with a change that touches gate-x, and `feature` forked earlier and touches gate-y. A tree-to-tree
+    diff of main..feature selected gate-x as well (2026-10-12, PR #45, 58 commits behind main: 149 gates from main's
+    own commits, 137 from its own); the merge base selects gate-y alone and the `affected:` line names it. A range whose
+    A is an ancestor of B is read as written."""
+    with tempfile.TemporaryDirectory(prefix="recipes-range-") as repo:
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def run(*cmd: str) -> subprocess.CompletedProcess:
+            return subprocess.run(cmd, cwd=repo, env=env, capture_output=True, text=True)
+
+        files = {
+            "Cargo.toml": '[workspace]\nresolver = "3"\nmembers = ["crates/x", "crates/y"]\n',
+            "justfile": "gate-x:\n    ./tools/box.sh 'cargo test -p x --lib'\ngate-y:\n    ./tools/box.sh 'cargo test -p y --lib'\n",
+            "crates/x/Cargo.toml": '[package]\nname = "x"\nversion = "0.1.0"\n',
+            "crates/x/src/lib.rs": "pub fn x() {}\n",
+            "crates/y/Cargo.toml": '[package]\nname = "y"\nversion = "0.1.0"\n',
+            "crates/y/src/lib.rs": "pub fn y() {}\n",
+        }
+        for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
+            files[f] = ""
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(repo, rel)), exist_ok=True)
+            with open(os.path.join(repo, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        shutil.copyfile(os.path.abspath(__file__), os.path.join(repo, "tools/recipes.py"))
+        steps = [("git", "init", "-q", "-b", "main"), ("cargo", "generate-lockfile", "--offline", "-q"), ("git", "add", "-A"),
+                 ("git", "commit", "-q", "-m", "base"), ("git", "tag", "base"), ("git", "branch", "feature")]
+        for step in steps:
+            done = run(*step)
+            if done.returncode != 0:
+                expect(False, f"range: fixture `{' '.join(step)}` failed: {done.stderr.strip()[-300:]}")
+                return
+        for branch, rel in (("main", "crates/x/src/lib.rs"), ("feature", "crates/y/src/lib.rs")):
+            run("git", "switch", "-q", branch)
+            with open(os.path.join(repo, rel), "a", encoding="utf-8") as fh:
+                fh.write("// moved\n")
+            run("git", "commit", "-q", "-am", f"{branch} moves {rel}")
+
+        def affected(spec: str) -> tuple[str, list[str]]:
+            done = run(sys.executable, "tools/recipes.py", "affected", spec, "--no-box")
+            if done.returncode != 0:
+                expect(False, f"range: affected {spec} failed (rc {done.returncode}): {done.stderr.strip()[-300:]}")
+            lines = done.stdout.splitlines()
+            return (lines[0] if lines else ""), sorted(m.group(1) for ln in lines if (m := re.match(r"^  (gate-\S+)", ln)))
+
+        head, got = affected("main..feature")
+        expect(got == ["gate-y"], f"range: main..feature selects {got}, not ['gate-y'] (main's own commit moved gate-x's lib)")
+        expect("(merge-base of main and feature)..feature" in head and " — 1 changed files," in head,
+               f"range: the affected: line of main..feature does not name the merge base and one changed file: {head}")
+        head, got = affected("base..feature")
+        expect(got == ["gate-y"] and head.startswith("affected: base..") and "merge-base" not in head,
+               f"range: base..feature (A an ancestor of B) gives {got}, `{head}`")
+        head, got = affected("feature..main")
+        expect(got == ["gate-x"] and "(merge-base of feature and main)" in head, f"range: feature..main gives {got}, `{head}`")
+
+
 def module_gate_self_test(expect) -> None:
     """A module gated by a cargo feature is read by the recipes that build with that feature only, on a synthetic
     workspace (package g: features fy and fz, a lib with a plain module, one under `feature = "fy"`, one under
@@ -9327,6 +9705,12 @@ def self_test() -> int:
 
     # a package manifest read by table
     manifest_self_test(expect)
+
+    # the root Cargo.toml read by table
+    root_manifest_self_test(expect)
+
+    # A..B read against the merge base
+    range_base_self_test(expect)
 
     # a module gated by a cargo feature
     module_gate_self_test(expect)

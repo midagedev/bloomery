@@ -3,7 +3,8 @@
 # nothing and runs no gate: it prints the list the lead pastes into a batch.
 #   tools/affected-gates.sh              # the working tree (uncommitted and untracked too) vs main
 #   tools/affected-gates.sh <base>       # the working tree vs the merge base of <base> and HEAD
-#   tools/affected-gates.sh A..B         # two commits, each read from its own `git archive`
+#   tools/affected-gates.sh A..B         # B against merge-base(A, B) (A itself when it is an ancestor of B), each read from its own
+#                                        # `git archive`; the `affected:` line says `<mb> (merge-base of A and B)..B` when it moved
 #   tools/affected-gates.sh … --no-box   # skip the box's dep-info (read-only ssh otherwise)
 #   tools/affected-gates.sh … --narrow --scan BASE_LOG NEW_LOG [--scan …]
 #                                        # narrowed by ptx-scan pairs (base, change) and tools/gate-paths.tsv:
@@ -22,8 +23,12 @@
 # gate-* recipe builds is named there — a gate binary without a recipe shows up), and notes: how old
 # each selected bin's dep-info is, and which selected bins have none. A package manifest is read by table
 # (its shared tables and the recipe's own target entries: a new [[bin]] selects the recipes that build it,
-# not every reader of the file); the `manifests:` block prints, per changed manifest, what changed by table
-# and the recipes each change selects, and the recipes that read it whole.
+# not every reader of the file), and so is the root Cargo.toml of a virtual workspace: [workspace] members and
+# exclude select the recipes that read a package that entered or left the workspace (`exclude = [.., "fuzz"]`
+# where fuzz held no member selects nothing), default-members the recipes with a cargo line naming no -p and
+# no --workspace, and every other table (workspace.dependencies, profile, patch, ...), Cargo.lock and the
+# toolchain files select every cargo recipe. The `manifests:` block prints, per changed manifest, what changed
+# by table and the recipes each change selects, and the recipes that read it whole.
 #
 # The mapping (tools/recipes.py, shared with tools/check-recipes.sh) is the crate graph, feature-aware,
 # plus the module tree of each target, the scripts the recipe names, box.sh's profile files and the
