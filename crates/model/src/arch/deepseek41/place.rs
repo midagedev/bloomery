@@ -152,7 +152,8 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         let kv = self.seq_terms().slots_of(slots.get() as u64);
         let mut plan = placement::plan(&self.model, machine, ctx_max, &kv, levers)?;
-        placement::expert_nvme_tier(&mut plan, workstation::plan_room(&self.room), self.arena)?;
+        let room = plan.host.plan_at(&self.room);
+        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         checked(plan).map_err(PlaceError::Broken)
     }
 

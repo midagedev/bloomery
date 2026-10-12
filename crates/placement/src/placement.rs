@@ -865,6 +865,32 @@ pub struct HostTotals {
     /// expert tier split ([`expert_nvme_tier`]), the room the split read less
     /// the arena and the plan's host need, since the room binds there.
     pub headroom_bytes: i128,
+    /// The host room the plan was made at: the reading it took and the
+    /// room it was held to ([`workstation::plan_room`], the reading less
+    /// [`workstation::HOST_DRIFT`]); `None` for a plan made without one.
+    pub room: Option<(u64, u64)>,
+}
+
+impl HostTotals {
+    /// The room a plan with the host room `room` is made at, which this
+    /// plan then names ([`HostTotals::room`]): the one caller of
+    /// [`workstation::plan_room`] for a plan's tiers.
+    pub fn plan_at(&mut self, room: &(u64, workstation::HostRead)) -> u64 {
+        let planned = workstation::plan_room(room);
+        self.room = Some((room.0, planned));
+        planned
+    }
+
+    /// The load's refusal names the room its plan was made at, so a report
+    /// shows how far the reading fell between the plan and the load:
+    /// `"; the plan was made at a reading of R B (plan room P B)"`, empty
+    /// for a plan made without a host room.
+    #[must_use]
+    pub fn room_clause(&self) -> String {
+        self.room.map_or_else(String::new, |(read, planned)| {
+            format!("; the plan was made at a reading of {read} B (plan room {planned} B)")
+        })
+    }
 }
 
 /// The placement of one model on one machine.
@@ -3193,6 +3219,7 @@ fn totals<'a>(
             0
         },
         headroom_bytes: 0,
+        room: None,
     };
     // The room the machine's figure leaves past the plan's host need, the
     // need's own arithmetic (`HostNeed`).

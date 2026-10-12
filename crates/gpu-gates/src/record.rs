@@ -992,7 +992,7 @@ use Ty::{Bool, Csv, F64, I64, List, Text, U64, Word};
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them.",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them.",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -1015,6 +1015,8 @@ pub static PLAN: Kind = Kind {
         key("paged", U64, "B"),
         key("arena", U64, "B"),
         key("arena_slots", U64, "slots"),
+        opt("room", U64, "B"),
+        opt("plan_room", U64, "B"),
         opt("card_free", U64, "B"),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
@@ -3300,7 +3302,7 @@ pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST,
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
 /// card counts' range, the budget, and the NVMe tier's terms (the bytes paged,
-/// the arena and its slots).
+/// the arena and its slots), and the host room it was made at when it had one.
 pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
     let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
     let card = &plan.cards[0];
@@ -3333,6 +3335,10 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
             "arena_slots",
             arena_slots(plan).expect("the arena's slots of a plan the split made"),
         );
+    let r = match plan.host.room {
+        Some((read, planned)) => r.u("room", read).u("plan_room", planned),
+        None => r,
+    };
     let r = match machine.cards.first().and_then(|c| c.free_bytes) {
         Some(free) => r.u("card_free", free),
         None => r,
