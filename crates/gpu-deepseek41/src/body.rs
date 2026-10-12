@@ -2529,6 +2529,7 @@ impl Body {
             &file,
             first,
             cfg.host.r8,
+            residency.arena(),
             host_widths(hp),
             |src| host::layers(src, hp, first..layers.end),
         )?;

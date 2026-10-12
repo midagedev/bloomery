@@ -241,6 +241,9 @@ pub struct PlanInputs {
     /// ([`placement::expert_nvme_tier`]); a NextN plan splits the trunk at
     /// the room less the draft layer's routed experts. A gate that plans an
     /// arm by a room of its own sets it, read [`HostRead::Given`].
+    ///
+    /// The plan is made at [`workstation::plan_room`]: a read room less
+    /// [`workstation::HOST_DRIFT`], a given room as given.
     pub room: (u64, HostRead),
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
@@ -475,7 +478,7 @@ impl PlanInputs {
         if let Some(t) = plan.cards.first_mut() {
             t.grow_kv(beside);
         }
-        placement::expert_nvme_tier(&mut plan, self.room.0, self.arena)?;
+        placement::expert_nvme_tier(&mut plan, workstation::plan_room(&self.room), self.arena)?;
         // The front stays beside the plan's terms (`refuse_front` holds it to
         // the card), so a unified pool counts it beside them.
         let plan = checked_beside(plan, front).map_err(PlaceError::Broken)?;
@@ -814,10 +817,10 @@ impl PlanInputs {
         // The draft layer's routed experts are the host's beside the trunk's,
         // a plan of their own: the trunk splits at the room they leave.
         let draft_host = draft.host.expert_bytes;
-        let room = self.room.0.checked_sub(draft_host).ok_or_else(|| {
+        let planned_at = workstation::plan_room(&self.room);
+        let room = planned_at.checked_sub(draft_host).ok_or_else(|| {
             PlacementError::HostRoom(format!(
-                "the NextN layer's routed experts, {draft_host} B, pass the host room {} B",
-                self.room.0
+                "the NextN layer's routed experts, {draft_host} B, pass the host room {planned_at} B"
             ))
         })?;
         placement::expert_nvme_tier(&mut plan, room, self.arena)?;

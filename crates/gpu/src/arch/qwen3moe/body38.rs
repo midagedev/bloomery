@@ -1504,7 +1504,7 @@ impl Body38 {
             ff: geo::FF,
             n_used: geo::N_USED,
         };
-        let arena = crate::model::nvme_tier(plan, file, host.r8)?;
+        let arena = crate::model::nvme_tier(plan, file, host.r8, set.arena())?;
         let mut experts = HostRun::build(Arc::clone(file), 0, host.r8, widths, |src| {
             model::arch::qwen35moe::host::layers(src, hp, run.clone())
         })?;

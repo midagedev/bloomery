@@ -193,6 +193,9 @@ pub struct PlanInputs {
     /// tier; the routed experts the room still cannot hold follow it there
     /// ([`placement::expert_nvme_tier`]). A gate that plans an arm by a room
     /// of its own sets it, read [`HostRead::Given`].
+    ///
+    /// The plan is made at [`workstation::plan_room`]: a read room less
+    /// [`workstation::HOST_DRIFT`], a given room as given.
     pub room: (u64, HostRead),
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
@@ -567,8 +570,9 @@ impl PlanInputs {
             )?,
         };
         let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
-        placement::row_table_tier(&mut plan, self.room.0, floor, UBATCH_PLANNED)?;
-        placement::expert_nvme_tier(&mut plan, self.room.0, self.arena)?;
+        let room = workstation::plan_room(&self.room);
+        placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
+        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         Ok(plan)
     }
 
