@@ -750,23 +750,34 @@ STUB
   rc=0; wait "$pid" || rc=$?
   [ "$rc" = 0 ] || fail "a run that waited for its track's lock ended rc $rc: $(cat "$d/wait-track.out")"
   grep -q "locked on the remote by $me/$$.*waiting" "$d/wait-track.out" || fail "the track-lock wait is not announced: $(cat "$d/wait-track.out")"
-  # the slot pool (real lockf; a held slot stays held until its stop file appears, so no wall-clock guess decides a case). Before it
+  # the slot pool (real lockf; a slot is taken when hold_slot returns and stays held until its stop file appears, so no wall-clock
+  # guess decides a case, however late a loaded Mac starts the holder). Before it
   # takes a slot the run prints each slot's holder, `starting` (held, no holder file) or `free` (the lock is free, whatever a killed
   # holder's file says); with every slot held it repeats that line no sooner than SLOT_SAY seconds after the last print, and goes on
   # once a slot frees.
   sl=$rh/repo/bloomery-mr
   held=
   mkdir -p "$sl"
-  hold_slot() { # hold_slot N [TRACK]: slot N is held until $d/stop-N exists; with a TRACK, its holder file is there too
-    rm -f "$d/stop-$1"
-    lockf -k -s -t 0 "$sl/.slot-$1" bash -c 'while [ ! -e "$1" ]; do sleep 0.2; done' _ "$d/stop-$1" &
-    held="$held $!"
+  hold_slot() { # hold_slot N [TRACK]: slot N is held when this returns, until $d/stop-N exists; with a TRACK, its holder file is there too
+    rm -f "$d/stop-$1" "$d/held-$1"
+    # the holder writes held-N under the lock, so its existence is the lock taken
+    lockf -k -s -t 0 "$sl/.slot-$1" bash -c ': > "$2"; while [ ! -e "$1" ]; do sleep 0.2; done' _ "$d/stop-$1" "$d/held-$1" &
+    hp=$!
+    held="$held $hp"
+    n=0
+    until [ -e "$d/held-$1" ]; do
+      n=$((n + 1))
+      if [ "$n" -gt 600 ] || ! kill -0 "$hp" 2> /dev/null; then
+        fail "slot $1's hold was not taken within 120 s"
+        break
+      fi
+      sleep 0.2
+    done
     [ -z "${2:-}" ] || printf '%s\n' "$2 $(date +%s)" > "$sl/.slot-$1.holder"
   }
-  free_slots() { : > "$d/stop-0"; : > "$d/stop-1"; wait $held 2> /dev/null || true; held=; rm -f "$sl"/.slot-*.holder "$d"/stop-?; }
+  free_slots() { : > "$d/stop-0"; : > "$d/stop-1"; wait $held 2> /dev/null || true; held=; rm -f "$sl"/.slot-*.holder "$d"/stop-? "$d"/held-?; }
   [ "$(sed -n 's/^SLOT_SAY=\([0-9]*\).*/\1/p' "$HERE/tools/mac-remote.sh")" = 300 ] || fail "SLOT_SAY is not 300 (five minutes)"
   hold_slot 0 trackA
-  sleep 1
   rc=0; out=$(run) || rc=$?
   free_slots
   [ "$rc" = 0 ] || fail "a run beside one held slot ended rc $rc: $out"
@@ -775,7 +786,6 @@ STUB
   case $out in *"run slots are taken"*) fail "a run that found a free slot said all were taken: $out" ;; esac
   hold_slot 0
   printf '%s\n' "ghost $(date +%s)" > "$sl/.slot-1.holder"
-  sleep 1
   rc=0; out=$(run) || rc=$?
   free_slots
   [ "$rc" = 0 ] || fail "a run beside a held slot with no holder file ended rc $rc: $out"
@@ -785,7 +795,6 @@ STUB
   run4() { PATH=$stub:$PATH STUB_HOME=$rh HOME=$fake bash "$d/mr4.sh" --tree "$repo" "$@" 2>&1; }
   hold_slot 0 trackA
   hold_slot 1 trackB
-  sleep 1
   run4 > "$d/wait-slot.out" & pid=$!
   n=0
   until [ "$(grep -c '^mac-remote: all 2 run slots are taken' "$d/wait-slot.out")" -ge 2 ] || [ "$n" -ge 300 ]; do sleep 0.2; n=$((n + 1)); done
