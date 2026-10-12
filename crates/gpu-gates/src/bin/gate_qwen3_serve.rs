@@ -341,6 +341,16 @@
 //!   default is the base context as the total its slots split, taken whenever
 //!   the plan keeps fewer card experts than the base's, names a slot of half
 //!   the base and the clause is red.
+//! - `paged_default_grows_past_the_base`, on the same arm's `ctx` line when
+//!   its base pages NVMe expert bytes (`base_nvme_expert_bytes` above 0): the
+//!   rule word is not `base` and the line pages more bytes than the base
+//!   (`nvme_expert_bytes` above it), so a rule that lets the default page
+//!   nothing past the base is red. With no NVMe bytes at the base the line
+//!   `skip paged_default_grows_past_the_base: no NVMe bytes at base: the
+//!   growth clause did not run` is printed in place of a verdict, and a `ctx`
+//!   line without its terms is a failed clause. FAIL-first: a rule whose NVMe
+//!   slack is zero pages nothing past the base and turns the second term red;
+//!   the printed line names the rule and the base and chosen NVMe bytes.
 //! - `placed_slots_are_resident`, `ctx_default`'s placed arm (`--place a
 //!   --parallel 2`, no budget), on both arms: the placed load holds its two
 //!   slots resident — its plan made at the total, which counts every slot's
@@ -763,6 +773,40 @@ mod gate {
         Some(bound == base / NVME_DIV && now <= base + base / NVME_DIV)
     }
 
+    /// `paged_default_grows_past_the_base` (module header) on a default
+    /// `ctx` line: with NVMe expert bytes at the base, the rule word is not
+    /// `base` and the line pages more than the base does. A line with no
+    /// NVMe bytes at the base prints the skip in place of a verdict, and a
+    /// line without the terms is a failed clause. The terms are recomputed
+    /// from the line, never from its `nvme_bound`.
+    fn paged_default_grows_past_the_base(line: Option<&str>, ok: &mut bool) {
+        const NAME: &str = "paged_default_grows_past_the_base";
+        let terms = line.and_then(|l| {
+            let rule = l.split_whitespace().find_map(|w| w.strip_prefix("rule="))?;
+            let num = |k: &str| field_u64(l, k);
+            Some((
+                rule,
+                num("base_nvme_expert_bytes")?,
+                num("nvme_expert_bytes")?,
+            ))
+        });
+        match terms {
+            None => {
+                println!("{NAME}: the ctx line is missing or has no rule or NVMe terms: {line:?}");
+                check(ok, NAME, false);
+            }
+            Some((_, 0, _)) => {
+                println!("skip {NAME}: no NVMe bytes at base: the growth clause did not run");
+            }
+            Some((rule, base_nvme, now)) => {
+                println!(
+                    "{NAME}: rule={rule} base_nvme_expert_bytes={base_nvme} nvme_expert_bytes={now}"
+                );
+                check(ok, NAME, rule != "base" && now > base_nvme);
+            }
+        }
+    }
+
     /// `default_ctx_line_names_its_rule` (module header), on a server of
     /// `slots` slots whose `/props` named `props_n` and whose file's trained
     /// context is `trained`; `plan_total` the `ctx_max` of its `plan` record
@@ -944,7 +988,9 @@ mod gate {
     /// [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`] print a `ctx` line of at
     /// least two slots, each of at least [`LONG_PROMPT_SLOT_CTX`] positions,
     /// and stop as `--plan` says ([`PlanRun::stopped_with_its_plan`]), the
-    /// line's NVMe terms within the rule's bound ([`nvme_held`]). The
+    /// line's NVMe terms within the rule's bound ([`nvme_held`]), and a base
+    /// that pages NVMe expert bytes grown past
+    /// ([`paged_default_grows_past_the_base`]). The
     /// plan is asked for by name (`--place a`): the census and the whole-fit
     /// verdict read the card, not the budget, so a card that holds the file
     /// whole would not plan at all.
@@ -977,6 +1023,7 @@ mod gate {
                 && slots.is_some_and(|n| n >= 2)
                 && ctx_line(&run.said).and_then(nvme_held) == Some(true),
         );
+        paged_default_grows_past_the_base(ctx_line(&run.said), ok);
         Ok(())
     }
 

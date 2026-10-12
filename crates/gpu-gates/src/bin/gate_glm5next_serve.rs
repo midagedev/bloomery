@@ -44,7 +44,11 @@
 //!   default's `ctx` line against this gate's own plans of the file — the
 //!   rule's context, its fit and its margin — the flag winning below the
 //!   floor, and a context past `place::ORACLE_POSITIONS` refused by name
-//!   before it listens;
+//!   before it listens; and, on the same plan, `--plan` under a
+//!   `BLOOMERY_HOST_ROOM` that makes the base plan page NVMe expert bytes
+//!   (`ctx_paged_default_grows_within_the_bound`): the line's `nvme_bound`
+//!   is above 0 and a hundredth of its base NVMe bytes, its rule word is not
+//!   `base`, and it pages more than the base and at most a hundredth more;
 //!
 //! - the load prints `load draft=off (BLOOMERY_DRAFT=off)` and the word as a
 //!   `residency lever` record (`why=set`), no `residency host` and no verify
@@ -326,6 +330,13 @@ mod gate {
     const FLAG_CTX: usize = 1536;
     /// A context past `ORACLE_POSITIONS`, the refusal the clause asks for.
     const OVER_CTX: usize = 99_999;
+    /// The paged arm's host room: under the gate plan's host need and over
+    /// half its host experts, so the base plan pages through the NVMe tier
+    /// with no RAM arena, and far enough under the need that the base's
+    /// hundredth clears several checkpoint points. Past the base every host
+    /// need byte is an NVMe byte, the card expert a context pushes off and
+    /// each checkpoint point a longer context pins.
+    const PAGED_HOST_ROOM: &str = "120G";
     /// The `ctx` clause's polls for the seat's pre-load lines, 1 s apart:
     /// the lines print at plan time, before the load's first-start JIT.
     const LINE_POLLS: usize = 90;
@@ -1014,7 +1025,10 @@ mod gate {
     /// names the wrong word. Mutants: the default taking the trained
     /// context past the fit (the server's own plan refuses it by name
     /// before any line); the search giving up (the line's `margin_ctx`
-    /// keeps the floor while a step past it stays within it).
+    /// keeps the floor while a step past it stays within it). A `--plan`
+    /// run under [`PAGED_HOST_ROOM`] holds the NVMe terms of the rule on a
+    /// base that pages (the arm's own comment says which change of the rule
+    /// turns which term red).
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -1230,6 +1244,78 @@ mod gate {
             !status.success()
                 && text.contains(&format!("ctx_max {OVER_CTX}"))
                 && text.contains(&ORACLE_POSITIONS.to_string()),
+        );
+
+        // The paged arm: `--plan` alone, so no load, under a host room that
+        // pages the base plan. The terms are the rule's contract read off
+        // the line, each red on a different change of the rule: the bound
+        // is the base's hundredth (another divisor); the rule word is not
+        // `base` and the chosen plan pages more than the base (a rule with
+        // no slack pages nothing past it: the first step past a checkpoint
+        // mark adds a point to the host need, which is NVMe bytes here); and
+        // at most a hundredth more (a wider slack reaches a longer context,
+        // whose points page far more). A room that pages nothing leaves
+        // `base_nvme_expert_bytes` at 0 and the clause red by name.
+        let paged_err = own.join("paged.err");
+        let status = Command::new(beside("bloomery-serve")?)
+            .args([
+                "--model",
+                "glm",
+                "--place",
+                "gate",
+                "--parallel",
+                "1",
+                "--plan",
+            ])
+            .env_remove(bloomery_levers::DRAFT)
+            .env_remove(bloomery_levers::RESIDENCY)
+            .env(bloomery_levers::HOST_ROOM, PAGED_HOST_ROOM)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&paged_err)?)
+            .status()
+            .map_err(|e| format!("spawn bloomery-serve: {e}"))?;
+        let text = std::fs::read_to_string(&paged_err)?;
+        let ctx_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("ctx rule="))
+            .collect();
+        let held = (|| {
+            let [line] = ctx_lines.as_slice() else {
+                return None;
+            };
+            let b = |k: &str| field(line, k).and_then(|v| v.parse::<u64>().ok());
+            let rule = field(line, "rule")?;
+            let (base_nvme, now, bound) = (
+                b("base_nvme_expert_bytes")?,
+                b("nvme_expert_bytes")?,
+                b("nvme_bound")?,
+            );
+            println!(
+                "ctx paged arm (BLOOMERY_HOST_ROOM={PAGED_HOST_ROOM}): exit {status}, rule={rule} \
+                 base_nvme_expert_bytes={base_nvme} nvme_expert_bytes={now} nvme_bound={bound}"
+            );
+            Some(
+                status.success()
+                    && base_nvme > 0
+                    && bound > 0
+                    && bound == base_nvme / NVME_DIV
+                    && rule != "base"
+                    && now > base_nvme
+                    && now <= base_nvme + bound,
+            )
+        })();
+        if held.is_none() {
+            println!(
+                "ctx paged arm: {} ctx line(s), or one without its terms; {}",
+                ctx_lines.len(),
+                paged_err.display()
+            );
+        }
+        check(
+            &mut ok,
+            "ctx_paged_default_grows_within_the_bound",
+            held == Some(true),
         );
         Ok(ok)
     }

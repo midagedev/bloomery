@@ -1579,8 +1579,9 @@ pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
 /// at P pinned, `headroom` the plan's host headroom and `mem_left` what the
 /// host's available bytes leave past the plan's own host need and whatever
 /// the caller counts beside it (the load's check before any upload; the
-/// Qwen3.8 room subtracts the checkpoints the load holds, gpu-gates'
-/// `mem_left_38`). P is 0, no seed expert pinned — where the churn pool at 0
+/// Qwen3.8 room is gpu-gates' `mem_left_38`, the available bytes less the
+/// plan's host need, which already counts the checkpoints the load holds).
+/// P is 0, no seed expert pinned — where the churn pool at 0
 /// fits neither budget, the first P above it whose does ([`room_for`]'s
 /// upward probe); `off` when no layer holds a card expert, when the host
 /// holds none (the pool would serve nothing), when the fewest leave no room
