@@ -1121,8 +1121,11 @@ gate-r8:
 # (model::arch::qwen35moe::fixture) against the Qwen3.8 file's header and the shared MTP draft's, at the profile's paths:
 # the four-layer plan read back by the engine's hparams at interval 2, the planned card budget (the written file's plan
 # under it holds half the experts on every layer the card loads), and the ik-silent traps refused by name. The Qwen3.6 spec
-# (model::arch::qwen35moe::fixture::qwen35moe, the lmstudio Q4_K_M file) is held here by the bin's source-row test alone: its
-# rules and its map's layer kinds are the model lib's tests (gate-ops), its plan against the real header is `fixture plan`. The V4.1 spec's
+# (model::arch::qwen35moe::fixture::qwen35moe, the lmstudio Q4_K_M file) against its header: the four-layer plan read back by
+# the engine's hparams at interval 2 (the shared expert's gate at 1/sqrt(2048), the split keys of the one-file source, a draft
+# refused by name), the planned card budget (the written file's plan under it holds 128 of the 256 experts on every layer)
+# and the source traps its rules refuse by name (no interval, another width, an uncovered key); its rules and its map's layer
+# kinds are also the model lib's tests (gate-ops). The V4.1 spec's
 # ff 512 (the plan, the draft's ff, the routed stacks and the r8 sidecar's stacks), its planned budget (half the experts
 # at the gate machine, ctx 32768) and its two router biases that differ between experts (the family's header check refuses
 # zeros, equal and a constant shift); the GLM-5.3-Flash spec (model::arch::glm5next::fixture) against the GLM file's
