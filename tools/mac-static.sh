@@ -126,7 +126,7 @@ summarize() {
 }
 
 self_test() {
-  local fails=0 d out rc t k
+  local fails=0 d out rc k
   local -a pids=()
   fail() { say "mac-static self-test FAIL: $*"; fails=$((fails + 1)); }
 
@@ -138,18 +138,22 @@ self_test() {
   out=$(combos_argv 'HEAD~3..HEAD' "$HOME/x.tsv" | tr '\n' ' ')
   [ "$out" = "combos --base HEAD~3..HEAD --ledger $HOME/x.tsv " ] || fail "a base and a ledger derive '$out'"
 
-  # the lanes: two sleeping steps overlap (their serial sum is far more than the wall), rcs and walls
-  # land, a failing step is red and named, a step with no rc file is red as `no rc`
+  # the lanes: two steps that each mark their start and wait for the other's mark (they ran at once;
+  # on serial lanes the first waits out its bound, 120 s, and ends rc 9), whatever the load delays
+  # either start by; rcs and walls land, a failing step is red and named, a step with no rc file is
+  # red as `no rc`
   d=$(mktemp -d)
   T0=$SECONDS
   np=0
-  ( step_inner sleep-a "$d" bash -c 'sleep 2' ) & pids[$np]=$!; np=$((np + 1))
-  ( step_inner sleep-b "$d" bash -c 'sleep 2' ) & pids[$np]=$!; np=$((np + 1))
+  # shellcheck disable=SC2016 # the step's own shell expands them
+  meet='touch "$1/$2.on"; n=0; until [ -e "$1/$3.on" ]; do n=$((n + 1)); [ "$n" -le 600 ] || exit 9; sleep 0.2; done'
+  ( step_inner meet-a "$d" bash -c "$meet" _ "$d" a b ) & pids[$np]=$!; np=$((np + 1))
+  ( step_inner meet-b "$d" bash -c "$meet" _ "$d" b a ) & pids[$np]=$!; np=$((np + 1))
   ( step_inner false-step "$d" bash -c 'exit 3' ) & pids[$np]=$!; np=$((np + 1))
   ( step_inner true-step "$d" bash -c 'echo ok' ) & pids[$np]=$!; np=$((np + 1))
   wait "${pids[@]}" || true
-  t=$((SECONDS - T0))
-  [ "$t" -lt 4 ] || fail "two 2 s steps took $t s serial, not parallel"
+  [ "$(cat "$d/meet-a.rc")" = 0 ] && [ "$(cat "$d/meet-b.rc")" = 0 ] \
+    || fail "two steps that wait for each other did not meet within 120 s: the lanes ran one after another"
   [ "$(cat "$d/true-step.rc")" = 0 ] || fail "a true step's rc is not 0"
   [ "$(cat "$d/false-step.rc")" = 3 ] || fail "an exit-3 step's rc is not 3"
   [ "$(cat "$d/true-step.wall")" -lt 3 ] || fail "a true step's wall is not its own"
