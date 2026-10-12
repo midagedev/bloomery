@@ -580,7 +580,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let plan_levers = PlanLevers::from_levers(&levers)?;
     // The slot count before the context it splits: a set `--ctx` with no
     // `--parallel` is one request's context, one slot at the whole of it
-    // (`placement::ctx::slots_of`).
+    // (`bind::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, SLOTS)?;
     // The common unset rule, once, on one census reading.
     let census = gpu_census::census()?;

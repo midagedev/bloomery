@@ -91,8 +91,11 @@
 //! `Slot35` — its K/V planes, its delta layers' recurrent states and conv
 //! rings, its held count and its checkpoints). `--parallel` naming no
 //! count, the seat serves one slot beside a set `--ctx` (the flag is one
-//! request's context, `placement::ctx::slots_of`; one line on stderr says so) and its
-//! default two over the auto choice. Under more slots than one the context
+//! request's context, `bind::slots_of`; one line on stderr says so) and its
+//! default two over the auto choice; when the load of the default's second slot is
+//! refused the seat plans one and says so (`bind::default_slots_fit`: one stderr line
+//! and `from=fit` on the `parallel` line), a count the flags set is never lowered.
+//! Under more slots than one the context
 //! is split across them
 //! as llama-server splits it with `-np N` and no `-kvu`: the `--ctx` the
 //! flags named (or, when unset, the default slot context times N) is the
@@ -171,8 +174,8 @@ use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, note_line,
-    parallel_line, slots_given,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, default_slots_fit,
+    note_line, parallel_line, slots_given,
 };
 use bloomery_gpu_gates::generate::{CTX_GRAN, Place};
 use bloomery_gpu_gates::record::{self, Record};
@@ -328,7 +331,7 @@ struct Args {
     cache_type_k: Option<String>,
     /// `--parallel`: the slots the server serves, resident sequences on
     /// either file's load; `None` takes one slot beside a set `--ctx`, else
-    /// the default 2 ([`model::placement::ctx::slots_of`]).
+    /// the default 2 (`bind::slots_of`).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// The image-input flags: `--mmproj` is the encoder file whose images a
@@ -361,7 +364,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: None,
         place: None,
         cache_type_k: None,
-        // `None` resolves through `placement::ctx::slots_of`: one slot beside a set
+        // `None` resolves through `bind::slots_of`: one slot beside a set
         // `--ctx` (the flag is one request's context), else the fixed
         // default 2, not an elastic one — the second slot is a resident
         // sequence the context split bounds (no byte budget to size it
@@ -1201,7 +1204,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     )?;
     // The slot count before the context it sizes: a set `--ctx` with no
     // `--parallel` is one request's context — one slot at the whole of it
-    // (`placement::ctx::slots_of`).
+    // (`bind::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, 2)?;
     // A projector the `--hf` repo picked stays only where the load gives the text model the same
     // experts and context with its reserve as without ([`vision_seat::kept`]).
@@ -1227,42 +1230,51 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // still takes `a`'s card (`PlaceQ3::unplaced_on`), the rule's own pick
     // for a body with no tier card; its `place unset` record is printed here.
     let census = gpu_census::census()?;
-    q3place::choose(a.place, &census)?.record().eprint();
-    // A set `--ctx` is the total the slots split; the default is a slot's
-    // context, the load's total the slots of it.
-    let ctx = match a.ctx {
-        Some(c) => c,
-        None => {
-            let found = default_ctx(&split, arch, a.place, slots, &levers, (kv, vision.as_ref()))?;
-            eprintln!("{}", found.line(slots));
-            // The `ctx` line's words stay the rule's; the reserve the
-            // search counted is named on a line of its own.
-            let (_, encoder) = images_of(vision.as_ref());
-            eprintln!(
-                "{NAME}: --ctx defaults to {} positions a slot, {} in all{}",
-                found.ctx,
-                slots * found.ctx,
-                encoder_words(encoder)
-            );
-            slots * found.ctx
-        }
-    };
-    // Resident slots on both files: the model loads with a slot's share and
-    // parks the rest of the slots after its captures.
-    let slot_ctx = slot_ctx(ctx, slots)?;
-    // What the file loads as is decided here, once, at the total: the open
-    // makes no fit call of its own (`decide`).
-    let load = decide(
-        &split,
-        arch,
-        ctx,
-        (a.place, &PlanLevers::from_levers(&levers)?),
-        slots,
-        (kv, vision.as_ref()),
-    )?;
-    if matches!(arch, Arch::Qwen35moe) {
-        q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
-    }
+    let chosen = q3place::choose(a.place, &census)?;
+    chosen.record().eprint();
+    // The context and the load of `slots` slots, the plans a second slot can
+    // refuse: the default's second slot that the load refuses falls to one
+    // slot (`from=fit`); a count the flags set is never lowered.
+    let ((slot_ctx, load), slots, from) =
+        default_slots_fit(NAME, chosen.place.name(), slots, from, |slots| {
+            // A set `--ctx` is the total the slots split; the default is a slot's
+            // context, the load's total the slots of it.
+            let ctx = match a.ctx {
+                Some(c) => c,
+                None => {
+                    let found =
+                        default_ctx(&split, arch, a.place, slots, &levers, (kv, vision.as_ref()))?;
+                    eprintln!("{}", found.line(slots));
+                    // The `ctx` line's words stay the rule's; the reserve the
+                    // search counted is named on a line of its own.
+                    let (_, encoder) = images_of(vision.as_ref());
+                    eprintln!(
+                        "{NAME}: --ctx defaults to {} positions a slot, {} in all{}",
+                        found.ctx,
+                        slots * found.ctx,
+                        encoder_words(encoder)
+                    );
+                    slots * found.ctx
+                }
+            };
+            // Resident slots on both files: the model loads with a slot's share and
+            // parks the rest of the slots after its captures.
+            let slot_ctx = slot_ctx(ctx, slots)?;
+            // What the file loads as is decided here, once, at the total: the open
+            // makes no fit call of its own (`decide`).
+            let load = decide(
+                &split,
+                arch,
+                ctx,
+                (a.place, &PlanLevers::from_levers(&levers)?),
+                slots,
+                (kv, vision.as_ref()),
+            )?;
+            if matches!(arch, Arch::Qwen35moe) {
+                q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
+            }
+            Ok::<_, GateError>((slot_ctx, load))
+        })?;
     // The shape of a round of several slots, from the load's body
     // ([`Q3Load::placed_body`]); the open holds the opened body to it.
     let placed = load.placed_body();

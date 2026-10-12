@@ -199,7 +199,7 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, bind_server,
     model_props, nvidia_smi_index, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
@@ -357,7 +357,7 @@ fn slot_count(
     parallel: Option<usize>,
     draft: Draft,
     traced: bool,
-) -> Result<(NonZeroUsize, &'static str), GateError> {
+) -> Result<(NonZeroUsize, SlotsFrom), GateError> {
     let (n, from) = match parallel {
         Some(n) if n > 1 && draft == Draft::Dspark => {
             return Err(format!(
@@ -367,10 +367,10 @@ fn slot_count(
             )
             .into());
         }
-        Some(n) => (n, "flag"),
-        None if draft == Draft::Dspark => (1, "dspark"),
-        None if traced => (1, "route-trace"),
-        None => (SLOTS, "default"),
+        Some(n) => (n, SlotsFrom::Flag),
+        None if draft == Draft::Dspark => (1, SlotsFrom::Dspark),
+        None if traced => (1, SlotsFrom::RouteTrace),
+        None => (SLOTS, SlotsFrom::Default),
     };
     let n = NonZeroUsize::new(n).ok_or("--parallel 0: the server serves no slot")?;
     Ok((n, from))
