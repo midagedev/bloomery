@@ -674,6 +674,9 @@ impl fmt::Display for FixtureSetError {
                         "fixture oracle {clause}: the fixture file is missing: {error}"
                     )
                 }
+                RefError::StubSet { .. } | RefError::StubDiffers { .. } => {
+                    write!(f, "fixture oracle {clause}: a census refusal: {error}")
+                }
             },
         }
     }

@@ -26,6 +26,9 @@
 //! - [`tokenizer`]: `llama-tokenize`'s ids per vocabulary
 //!   (`crates/tokenizer/tools/oracle.sh`).
 //! - [`dequant`]: ggml's dequantized rows (`tools/ref/dump-dequant.sh`).
+//! - [`census`]: the census stubs — header-only copies of many users' model
+//!   files, pinned by `tools/census/stubs.tsv` (the writer
+//!   `tools/type-census.py --stubs`) and checked against it.
 //!
 //! Every manifest row is read by the column names its header line gives
 //! that kind of row, never by position.
@@ -33,6 +36,7 @@
 use std::path::PathBuf;
 
 pub mod arch;
+pub mod census;
 pub mod clefvis;
 mod columns;
 pub mod dequant;
@@ -80,6 +84,19 @@ pub enum RefError {
     /// file that disagrees with the row that names it.
     #[error("{at}: {what}")]
     Malformed { at: String, what: String },
+    /// A census set whose manifest rows disagree: two revisions, or shards
+    /// missing, named twice or of two counts.
+    #[error("census set {set}: {what}")]
+    StubSet { set: String, what: String },
+    /// A census stub file that differs from its manifest row: its length or
+    /// its header digest.
+    #[error("census stub {stub}: {what} want {want}, got {got}")]
+    StubDiffers {
+        stub: PathBuf,
+        what: &'static str,
+        want: String,
+        got: String,
+    },
 }
 
 impl RefError {
