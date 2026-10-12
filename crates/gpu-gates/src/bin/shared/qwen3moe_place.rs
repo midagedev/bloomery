@@ -510,6 +510,10 @@ impl PlaceQ3 {
     /// one, and its device. `why` names what made a run with `--place`
     /// unset take this placed plan.
     pub fn record(&self, plan: &Plan<'_>, why: Option<&str>) -> Record {
+        record::require(
+            record::groups::qwen3moe_place::PLAN,
+            "qwen3moe_place::PlaceQ3::record",
+        );
         let card = &plan.cards[0];
         let r = Record::new(&record::PLAN38)
             .w("place", self.place.name())
@@ -958,6 +962,10 @@ pub fn default_ctx_qwen3(
     (slots, levers): (usize, &PlanLevers),
     kv: KvQ8,
 ) -> Result<Defaulted, GateError> {
+    record::require(
+        record::groups::qwen3moe_place::PLAN,
+        "qwen3moe_place::default_ctx_qwen3",
+    );
     let census = census()?;
     let at_base = rule.base.saturating_mul(slots);
     let on = PlaceQ3::unplaced_on(&census)?;
@@ -989,6 +997,10 @@ pub fn default_ctx_qwen35(
     rule: SlotRule,
     (seqs, levers, encoder): (Seqs, &PlanLevers, Option<u64>),
 ) -> Result<Defaulted, GateError> {
+    record::require(
+        record::groups::qwen3moe_place::PLAN,
+        "qwen3moe_place::default_ctx_qwen35",
+    );
     let census = census()?;
     let slots = seqs.slots;
     let at_base = rule.base.saturating_mul(slots);

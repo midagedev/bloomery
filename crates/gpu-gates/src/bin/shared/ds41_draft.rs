@@ -35,6 +35,10 @@ impl Draft {
     /// `BLOOMERY_DRAFT` as the levers hold it: unset is the plain path,
     /// `lookup` and `dspark` the served drafts.
     pub fn from_levers(levers: &Levers) -> Result<Draft, GateError> {
+        record::require(
+            record::groups::ds41_draft::LOAD,
+            "ds41_draft::Draft::from_levers",
+        );
         match levers.draft() {
             None => Ok(Draft::Off),
             Some("lookup") => Ok(Draft::Lookup),

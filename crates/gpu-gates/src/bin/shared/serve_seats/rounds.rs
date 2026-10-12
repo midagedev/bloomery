@@ -40,6 +40,7 @@ pub fn step_round<S: Seat>(
     let passes = run(seat, rows).map_err(|e| e.to_string())?;
     after(seat).map_err(|e| e.to_string())?;
     if seat.step_stats() {
+        record::require(record::groups::rounds::ROUND, "rounds::step_round");
         record::slots_round("step", rows.len(), passes, seat.slots()).eprint();
     }
     Ok(())
@@ -69,6 +70,7 @@ pub fn pass_round<S: Seat>(
     let passes = run(seat, rows).map_err(|e| e.to_string())?;
     after(seat).map_err(|e| e.to_string())?;
     if seat.step_stats() {
+        record::require(record::groups::rounds::ROUND, "rounds::pass_round");
         record::slots_round("pass", rows.len(), passes, seat.slots()).eprint();
     }
     Ok(())

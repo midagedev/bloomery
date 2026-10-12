@@ -156,6 +156,8 @@ fn draft_usable(row: &BesideDraft, first: &Path) -> Result<(), String> {
 /// when the repo holds the file and the set can run it ([`draft_usable`]; an
 /// `hf draft skipped` record says why not). `None` when nothing names one.
 pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<PathBuf>, GateError> {
+    record::require(record::groups::model_file::FETCH, "model_file::resolve");
+    record::require(record::groups::model_file::SET, "model_file::resolve");
     match source::resolve(flags, env)? {
         None => Ok(None),
         Some(Source::File(p)) => Ok(Some(PathBuf::from(p))),
@@ -184,6 +186,7 @@ pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<PathBuf>, Gate
 /// The files of `repo` at exactly `paths`, fetched and checked; their local
 /// paths in that order.
 pub fn fetch_exact(repo: &str, paths: &[&str]) -> Result<Vec<PathBuf>, GateError> {
+    record::require(record::groups::model_file::FETCH, "model_file::fetch_exact");
     Ok(client()?.resolve_exact(repo, paths, &mut print)?)
 }
 
@@ -191,6 +194,10 @@ pub fn fetch_exact(repo: &str, paths: &[&str]) -> Result<Vec<PathBuf>, GateError
 /// as any file of it) says `repo` quantizes ([`hf::card::quantizes`]);
 /// `None` when the repo has no card or its card says no such thing.
 pub fn quantized_from(repo: &str) -> Result<Option<String>, GateError> {
+    record::require(
+        record::groups::model_file::FETCH,
+        "model_file::quantized_from",
+    );
     let card = match client()?.resolve_exact(repo, &["README.md"], &mut print) {
         Ok(paths) => paths
             .into_iter()
@@ -207,6 +214,8 @@ pub fn quantized_from(repo: &str) -> Result<Option<String>, GateError> {
 /// ([`resolve`]) and set as the process's ([`set_model_file`]) when they
 /// name one.
 pub fn name(flags: &Flags) -> Result<(), GateError> {
+    record::require(record::groups::model_file::FETCH, "model_file::name");
+    record::require(record::groups::model_file::SET, "model_file::name");
     let env = std::env::var("BLOOMERY_REF_MODEL").ok();
     if *flags != Flags::default()
         && let Some(path) = resolve(flags, env.as_deref())?

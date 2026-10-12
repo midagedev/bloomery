@@ -13,6 +13,7 @@ use bloomery_gpu_gates::record::{self, Record};
 /// layer-batch counts where `s` covers one call, holds `s` to them first
 /// ([`PromptCounts::check_split`]): its records are what a reader sums.
 pub fn split(s: &PrefillStats, counts: Option<&PromptCounts>) -> Result<Record, GpuError> {
+    record::require(record::groups::ds41_split::SPLIT, "ds41_split::split");
     if let Some(c) = counts {
         c.check_split(s)?;
     }
