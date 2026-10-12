@@ -84,7 +84,7 @@ impl OpenLog<Body> for Log {
 
 /// The session of `file` at `ctx` positions on the gate placement
 /// (`crate::gate_card::plan_gate`), its prompts fed one step an id, no
-/// residency machine.
+/// residency machine, the prompt group `levers` gives (`prefill_group`).
 pub fn open(
     file: &Path,
     levers: &bloomery_levers::Levers,
@@ -94,7 +94,8 @@ pub fn open(
 }
 
 /// [`open`] with its prompts fed as `prefill` says, under `residency`: the
-/// steps feed is refused by name beside a machine.
+/// steps feed is refused by name beside a machine. The load runs the prompt
+/// group of `levers.prefill_group()`, as the seat does.
 pub fn open_with(
     file: &Path,
     levers: &bloomery_levers::Levers,
@@ -108,7 +109,7 @@ pub fn open_with(
         host: levers.host(),
         prefill,
         residency,
-        group: 1,
+        group: levers.prefill_group(),
         slots: NonZeroUsize::MIN,
     };
     let mut log = Log {

@@ -50,7 +50,7 @@ pub const SCREEN: &str = "BLOOMERY_SCREEN";
 pub const PREFILL_GROUP_MAX: u64 = 8;
 
 /// `BLOOMERY_PREFILL_GROUP` unset: the row's default, the group GLM-5.3's
-/// plan reserves a prompt batch's units for.
+/// plan reserves a prompt batch's units for and MiMo-V2.6-Flash's load runs.
 pub const PREFILL_GROUP_DEFAULT: u64 = 2;
 
 /// `BLOOMERY_LANE_PREFETCH` unset: the row's default, which the host
@@ -183,15 +183,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             trim: false,
         },
         default: Unset::Is("2"),
-        doc: "V4.1 and GLM-5.3: the batches a prompt group runs layer by layer, each \
-              layer-batch's route enqueued ahead of the previous one's host serve; 1 runs \
-              each batch alone, the same-binary arm, and both write the same bits. The \
-              `load` line prints `group=`. GLM-5.3's plan reserves the units a group of 2 \
-              holds (each about two stream buffers); a group past 2 takes its further units \
-              out of the card's margin, refused by name past its free bytes; the `prefill \
-              units` line prints what they took and what stayed free. GLM-5.3 changes it \
-              between calls through `set_prefill_group`; V4.1 fixes it at load, so the row's \
-              phase is `load` until both families carry a setter.",
+        doc: "V4.1, GLM-5.3 and MiMo-V2.6-Flash: the batches a prompt group runs layer by \
+              layer, each layer-batch's route enqueued ahead of the previous one's host \
+              serve; 1 runs each batch alone, the same-binary arm, and both write the same \
+              bits. The `load` line prints `group=`. GLM-5.3's plan reserves the units a \
+              group of 2 holds (each about two stream buffers); a group past 2 takes its \
+              further units out of the card's margin, refused by name past its free bytes; \
+              the `prefill units` line prints what they took and what stayed free. \
+              MiMo-V2.6-Flash's plan reserves none: every unit of its group, the default's \
+              too, comes out of the card's margin and is refused by name past its free \
+              bytes. GLM-5.3 and MiMo-V2.6-Flash change it between calls through \
+              `set_prefill_group`; V4.1 fixes it at load, so the row's phase is `load` until \
+              every family carries a setter.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

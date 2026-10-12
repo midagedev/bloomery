@@ -88,7 +88,7 @@
 //! slots=N slot_ctx=C total=N·C from=<word> pass=one`); then the `load`
 //! record (architecture, resident bytes of every slot, a slot's context,
 //! slots, layers, the routed experts the plan keeps on the host and on the
-//! card, the step graph's nodes and the load's wall) and, once the port is
+//! card, the step graph's nodes, the prompt group and the load's wall) and, once the port is
 //! bound, the `listening` record (`record::BLOOMERY_SERVE_MIMO2`). `--plan`
 //! ends the process after the `parallel` line, nothing loaded. An engine error ends the process with
 //! the crash block and exit code 70, as every seat's.
@@ -111,9 +111,14 @@
 //!
 //! The levers this seat acts on ([`ACTS_ON`]) are parsed once, at `main`
 //! (`bloomery_levers::at_main`), which refuses by name a lever set outside
-//! them: the plan's card budget, the host set's load settings, and
-//! `BLOOMERY_PIN_MAIN` with `BLOOMERY_HOST_LANES` (the engine thread pinned to
-//! the dispatcher's cpu slot, which gives the host legs the pool's CCD map). The seat
+//! them: the plan's card budget, the host set's load settings,
+//! `BLOOMERY_PREFILL_GROUP` (the batches a prompt group runs layer by layer:
+//! unset, the row's default, 2; the `load` record's `group` is what the body
+//! holds), and `BLOOMERY_PIN_MAIN` with `BLOOMERY_HOST_LANES` (the engine
+//! thread pinned to the dispatcher's cpu slot, which gives the host legs the
+//! pool's CCD map). The plan reserves no card bytes for the prompt batch, so
+//! the batch's units, a group of 2's included, come out of the card's margin
+//! and are refused by name past its free bytes. The seat
 //! sits behind the `deepseek41` feature beside `mimo2`: the server surface it
 //! binds through (`bind`, the `serve` and `sampler` crates) is scoped to
 //! `deepseek41`; it runs no V4.1 code.
@@ -160,11 +165,13 @@ const USAGE: &str = "usage: bloomery-serve --model mimo2 [-m PATH | --hf <repo>[
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
-/// `Levers::host`), the residency machine's word, the engine thread's pin,
-/// the host legs' lane rule and the start screen.
+/// `Levers::host`), the residency machine's word, the batches a prompt group
+/// runs, the engine thread's pin, the host legs' lane rule and the start
+/// screen.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::RESIDENCY,
+    bloomery_levers::PREFILL_GROUP,
     bloomery_levers::HOST_POPULATE,
     bloomery_levers::HOST_LOCK,
     bloomery_levers::CARD_DONTNEED,
@@ -377,6 +384,9 @@ struct OpenSeat {
     prefill: PrefillMode,
     /// The residency the load runs, resolved against the plan.
     residency: Residency,
+    /// The batches a prompt group runs layer by layer
+    /// (`BLOOMERY_PREFILL_GROUP`, the row's default when unset).
+    group: usize,
 }
 
 /// The open's records: the plan's expert counts are kept until the slots are
@@ -445,6 +455,7 @@ impl Log {
             .u("host_experts", self.host_experts)
             .u("card_experts", self.card_experts)
             .u("graph_nodes", self.graph_nodes)
+            .u("group", bloomery_gpu_mimo2::prefill_group(m)?)
             .w("pin_main", if self.pin_main { "on" } else { "off" })
             .w("pinned", self.pinned)
             .f("load_s", total.as_secs_f64())
@@ -485,7 +496,7 @@ impl Mimo {
                 host: a.host,
                 prefill: a.prefill,
                 residency: a.residency,
-                group: 1,
+                group: a.group,
                 slots: a.slots,
             },
         };
@@ -736,6 +747,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         pin_main: levers.pin_main(),
         prefill: a.prefill,
         residency,
+        group: levers.prefill_group(),
     };
     let engine = SeatEngine::spawn(move || Mimo::open(open), slot_ctx, vocab, card, props, 0)?;
     let server = bind_server(
