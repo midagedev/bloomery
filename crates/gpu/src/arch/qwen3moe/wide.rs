@@ -6,9 +6,10 @@
 //! columns.
 //!
 //! A wide op reads each weight once for the unit: every projection runs
-//! through the GEMM its file type picks (`crate::site::gemm`: a K-quant the
-//! grouped int8 GEMM over q8_1 blocks of 128, a Q8_0 the 32-value GEMM over
-//! q8 blocks of 32, an F32 the F32 tile) over a one-expert table
+//! through the GEMM its file type picks ([`gemm_site`]: a K-quant the grouped
+//! int8 GEMM over q8_1 blocks of 128, a Q8_0 the 32-value GEMM over q8 blocks
+//! of 32, an F32 the F32 tile, the last two through `crate::site::gemm`) over
+//! a one-expert table
 //! ([`route_dense`], filled once per unit after its embedding), the routed
 //! experts through one table per layer (gate and up reading each token's
 //! column, down each slot's own), a dense FFN's three matrices through the
@@ -20,6 +21,12 @@
 //! gated norm are the gemv arm's own launches: they already take any row
 //! count.
 //!
+//! The attention half splits by the plan's kind, as the gemv arm does: head
+//! 256 with its gate ([`GqaKind::Gated256`]) and head 128
+//! ([`GqaKind::Neox128`]), whose half ([`neox_128_rows`]) runs over buffer
+//! views, so the arena of this arm and the whole-card GEMM prefill's
+//! (`ubatch.rs`) both lend it their rows.
+//!
 //! Numeric class. A wide op computes a token's values from that token's
 //! inputs alone — the GEMM accumulates each (slot, row) on its own, the
 //! flash walks a row's keys in fixed tiles whatever the rows beside it — so
@@ -29,7 +36,7 @@
 //! the attention weighs the values with f16 weights, so the two arms agree
 //! to the error of those sums and are not bit-equal.
 
-use super::body::ATTN_SCALE_256;
+use super::body::{ATTN_SCALE, ATTN_SCALE_256, Kernels};
 use super::body35::Body35;
 use super::dispatch::Ctx;
 use super::experts::CombineArgs;
@@ -37,22 +44,24 @@ use super::hostleg::HostCombineArgs;
 use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Form, GqaKind, GqaPlan, SiteTy};
 use super::router::MAX_TOKENS;
 use super::scratch::{
-    ApartForms, Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Route, Wants,
+    ApartForms, Append128, Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Route,
+    Wants,
 };
 use super::taps35::Ffn35Run;
-use crate::GpuError;
-use crate::flash_gqa::{HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
+use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
 use crate::gemm::{
     GEMM_BN, GEMM_MAX_SLOTS, GEMM32_STEP, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute,
 };
 use crate::hybrid::HOST;
 use crate::linear::{self, LinearShape};
-use crate::model::lookup::{f32_gain, f32_tensor};
+use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::OutGateArgs;
 use crate::site::{self, WideIn, WideKernels};
 use crate::tensor::{DeviceTensor, WindowMut};
+use crate::weights::Weights;
+use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 
 /// The most rows an op runs through its gemv arm — ik's matrix-vector cut
@@ -97,25 +106,15 @@ impl Acts {
         m: usize,
         tys: &[SiteTy],
     ) -> Result<(), GpuError> {
-        const WHAT_Q: &str = "qwen3moe::wide::quantize";
-        let reads = |f: Form| tys.iter().any(|t| t.reads() == f);
-        if reads(Form::Q8x128) {
-            let a = self.q128.as_mut().ok_or(GpuError::state(
-                WHAT_Q,
-                "the wide part's q8_1 blocks of 128 (a K-quant site reads them)",
-            ))?;
-            c.gpu.enqueue_quantize_gemm(x, m, a, c.sink)?;
+        self.views_mut().quantize((c.gpu, c.k), x, m, tys, c.sink)
+    }
+
+    /// The forms as views.
+    pub(super) fn views_mut(&mut self) -> ActsMut<'_> {
+        ActsMut {
+            q128: self.q128.as_mut(),
+            q32: self.q32.as_mut(),
         }
-        if reads(Form::Q8x32) {
-            let a = self.q32.as_mut().ok_or(GpuError::state(
-                WHAT_Q,
-                "the wide part's q8 blocks of 32 (a Q8_0 site reads them)",
-            ))?;
-            c.k.q35(WHAT_Q)?
-                .g32
-                .enqueue_quantize_gemm32(c.gpu.stream(), x, m, a, c.sink)?;
-        }
-        Ok(())
     }
 
     /// The forms beside the f32 rows `f32` a site picks from.
@@ -123,6 +122,56 @@ impl Acts {
         WideIn {
             q128: self.q128.as_ref(),
             q32: self.q32.as_ref(),
+            f32: Some(f32),
+        }
+    }
+}
+
+/// One wide input's quantized forms as views: those of an [`Acts`], or of an
+/// arena that holds them as plain buffers (the whole-card GEMM prefill's), so
+/// one launch sequence ([`neox_128_rows`]) runs over either.
+pub(super) struct ActsMut<'a> {
+    pub(super) q128: Option<&'a mut GemmAct>,
+    pub(super) q32: Option<&'a mut GemmAct32>,
+}
+
+impl ActsMut<'_> {
+    /// The forms `x`'s first `m` columns are quantized into for sites of
+    /// types `tys`: each form one of them reads, and nothing else.
+    fn quantize(
+        &mut self,
+        (gpu, k): (&Gpu, &Kernels),
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        tys: &[SiteTy],
+        sink: FaultSink,
+    ) -> Result<(), GpuError> {
+        const WHAT_Q: &str = "qwen3moe::wide::quantize";
+        let reads = |f: Form| tys.iter().any(|t| t.reads() == f);
+        if reads(Form::Q8x128) {
+            let a = self.q128.as_deref_mut().ok_or(GpuError::state(
+                WHAT_Q,
+                "the unit's q8_1 blocks of 128 (a K-quant site reads them)",
+            ))?;
+            gpu.enqueue_quantize_gemm(x, m, a, sink)?;
+        }
+        if reads(Form::Q8x32) {
+            let a = self.q32.as_deref_mut().ok_or(GpuError::state(
+                WHAT_Q,
+                "the unit's q8 blocks of 32 (a Q8_0 site reads them)",
+            ))?;
+            k.q35(WHAT_Q)?
+                .g32
+                .enqueue_quantize_gemm32(gpu.stream(), x, m, a, sink)?;
+        }
+        Ok(())
+    }
+
+    /// The forms beside the f32 rows `f32` a site picks from.
+    fn input<'a>(&'a self, f32: &'a DeviceBuffer<f32>) -> WideIn<'a> {
+        WideIn {
+            q128: self.q128.as_deref(),
+            q32: self.q32.as_deref(),
             f32: Some(f32),
         }
     }
@@ -400,11 +449,56 @@ fn gemm(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let k = WideKernels {
-        gemm: &c.k.gemm,
-        g32: &c.k.q35(WHAT)?.g32,
-    };
-    site::gemm(c.gpu, &k, (ty, c.w, name), rows, x, (route, input), m, y)
+    gemm_site((c.gpu, c.w, c.k), (ty, name), rows, x, (route, input), m, y)
+}
+
+/// [`gemm`] over the pieces it reads: a K-quant site straight through the
+/// grouped GEMM over the q8_1 blocks of 128 (the one launch a chain of
+/// K-quant sites loads, which holds no 32-value kernels), any other type
+/// through `site::gemm`, which also needs those kernels.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one site's device, weights, kernels, weight, rows, inputs, table, width and output (rust-quality R8)"
+)]
+pub(super) fn gemm_site(
+    (gpu, w, k): (&Gpu, &Weights, &Kernels),
+    (ty, name): (SiteTy, &str),
+    rows: usize,
+    x: &WideIn<'_>,
+    (route, input): (&GemmRoute, GemmInput),
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    match ty.gemm_weight() {
+        Some(gw) => k.gemm.enqueue_gemm(
+            gpu.stream(),
+            GemmArgs {
+                ty: gw,
+                w: kq_weight(w, name)?,
+                rows_per_expert: rows,
+                act: x.q128.ok_or(GpuError::state(
+                    WHAT,
+                    "the unit's q8_1 blocks of 128 (a K-quant site reads them)",
+                ))?,
+                route,
+                input,
+                y,
+            },
+        ),
+        None => site::gemm(
+            gpu,
+            &WideKernels {
+                gemm: &k.gemm,
+                g32: &k.q35(WHAT)?.g32,
+            },
+            (ty, w, name),
+            rows,
+            x,
+            (route, input),
+            m,
+            y,
+        ),
+    }
 }
 
 /// The one-expert table of a unit of `m` rows: `m` slots on expert 0, slot
@@ -416,13 +510,9 @@ pub(super) fn route_dense(c: &Ctx<'_>, s: &mut Arena, m: usize) -> Result<(), Gp
         .enqueue_route_dense(c.gpu.stream(), m, &mut w.dense, c.gpu.unlabelled_sink())
 }
 
-/// The attention half at `m` rows: `x` in, `ffn_inp = x + W_o · (flash ⊙
-/// σ(gate))` out, the unit's K/V rows appended to the layer's planes at the
-/// rows' positions. A K-quant `attn_output` reads the gated rows quantized
-/// in one launch; any other type reads them as f32 rows (the out gate into
-/// the free query buffer), quantized as it takes them. Qwen3's head-128
-/// attention takes its wide rows through `ubatch.rs` and is refused here by
-/// name.
+/// The attention half at `m` rows: `x` in, `ffn_inp` out, the unit's K/V
+/// rows appended to the layer's planes at the rows' positions; the plan's
+/// kind picks the half ([`gated_256`], [`neox_128`]).
 pub(super) fn attention(
     c: &Ctx<'_>,
     n: &GqaPlan,
@@ -430,17 +520,24 @@ pub(super) fn attention(
     s: &mut Arena,
     m: usize,
 ) -> Result<(), GpuError> {
-    const WHAT_ATTN: &str = "qwen3moe::wide::attention";
-    if n.kind != GqaKind::Gated256 {
-        return Err(GpuError::shape(
-            WHAT_ATTN,
-            format!(
-                "layer {}: head-128 attention at {m} rows (Qwen3 runs more than GEMV_COLS rows \
-                 through ubatch.rs)",
-                c.layer
-            ),
-        ));
+    match n.kind {
+        GqaKind::Gated256 => gated_256(c, n, kv, s, m),
+        GqaKind::Neox128 => neox_128(c, n, kv, s, m),
     }
+}
+
+/// The head-256 attention half ([`GqaKind::Gated256`]): `ffn_inp = x + W_o ·
+/// (flash ⊙ σ(gate))`. A K-quant `attn_output` reads the gated rows quantized
+/// in one launch; any other type reads them as f32 rows (the out gate into
+/// the free query buffer), quantized as it takes them.
+fn gated_256(
+    c: &Ctx<'_>,
+    n: &GqaPlan,
+    kv: &mut KvPlanes,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    const WHAT_ATTN: &str = "qwen3moe::wide::attention";
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let q35 = k.q35(WHAT_ATTN)?;
     let stream = gpu.stream();
@@ -569,6 +666,187 @@ pub(super) fn attention(
     )?;
     gpu.elem()
         .enqueue_add(stream, x, attn_o, m * d.hidden, ffn_inp)
+}
+
+/// The head-128 attention half ([`GqaKind::Neox128`]) of the arena's `m`
+/// rows: `ffn_inp = x + W_o · flash(x)`, over [`neox_128_rows`].
+fn neox_128(
+    c: &Ctx<'_>,
+    n: &GqaPlan,
+    kv: &mut KvPlanes,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    const WHAT_ATTN: &str = "qwen3moe::wide::neox_128";
+    let d = s.dims;
+    let Arena {
+        x,
+        normed,
+        pos,
+        n_keys,
+        q,
+        k,
+        v,
+        attn,
+        ffn_inp,
+        wide,
+        ..
+    } = s;
+    let Wide {
+        act_hid,
+        act_attn,
+        dense,
+        attn_o,
+        ..
+    } = wide_of(wide, WHAT_ATTN)?;
+    neox_128_rows(
+        (c.gpu, c.w, c.k),
+        (c.table, c.eps, c.sink),
+        (n, kv),
+        (&d, m),
+        Neox128Rows {
+            x,
+            pos,
+            n_keys,
+            normed,
+            q,
+            k,
+            v,
+            attn,
+            attn_o,
+            ffn_inp,
+            hid: act_hid.views_mut(),
+            out: act_attn.views_mut(),
+            dense,
+        },
+    )
+}
+
+/// The buffers of a head-128 attention half ([`neox_128_rows`]) as views, each
+/// holding `t` rows: the unit's residual `x` and its rows' positions and live
+/// key counts, the normed rows with the forms the q·k·v projections read
+/// (`hid`), the projections' rows `q`, `k` and `v`, the flash output `attn`
+/// with the forms the output projection reads (`out`), that projection's rows
+/// `attn_o`, the half's output `ffn_inp`, and the unit's one-expert table.
+pub(super) struct Neox128Rows<'a> {
+    pub(super) x: &'a DeviceBuffer<f32>,
+    pub(super) pos: &'a DeviceBuffer<u32>,
+    pub(super) n_keys: &'a DeviceBuffer<u32>,
+    pub(super) normed: &'a mut DeviceBuffer<f32>,
+    pub(super) q: &'a mut DeviceBuffer<f32>,
+    pub(super) k: &'a mut DeviceBuffer<f32>,
+    pub(super) v: &'a mut DeviceBuffer<f32>,
+    pub(super) attn: &'a mut DeviceBuffer<f32>,
+    pub(super) attn_o: &'a mut DeviceBuffer<f32>,
+    pub(super) ffn_inp: &'a mut DeviceBuffer<f32>,
+    pub(super) hid: ActsMut<'a>,
+    pub(super) out: ActsMut<'a>,
+    pub(super) dense: &'a GemmRoute,
+}
+
+/// The head-128 attention half at `t` rows over `b`'s views: `x` in, `ffn_inp
+/// = x + attn_output(attn(x))` out; the unit's K/V rows appended to the
+/// layer's planes at the rows' positions. Each projection runs the launch
+/// its type picks ([`gemm_site`]) over the one-expert table; the rows are
+/// quantized into the forms those sites read. The one launch sequence of the
+/// wide arm and of the whole-card GEMM prefill.
+pub(super) fn neox_128_rows(
+    (gpu, w, k): (&Gpu, &Weights, &Kernels),
+    (table, eps, sink): (&DeviceBuffer<f32>, f32, FaultSink),
+    (n, kv): (&GqaPlan, &mut KvPlanes),
+    (d, t): (&Dims, usize),
+    b: Neox128Rows<'_>,
+) -> Result<(), GpuError> {
+    const WHAT_N: &str = "qwen3moe::wide::neox_128_rows";
+    if d.head != HEAD {
+        return Err(GpuError::shape(
+            WHAT_N,
+            format!("a head of {} values in a head-{HEAD} attention", d.head),
+        ));
+    }
+    let stream = gpu.stream();
+    let (q_len, kv_len) = (d.n_head * HEAD, d.n_kv * HEAD);
+    let Neox128Rows {
+        x,
+        pos,
+        n_keys,
+        normed,
+        q,
+        k: kr,
+        v,
+        attn,
+        attn_o,
+        ffn_inp,
+        mut hid,
+        mut out,
+        dense,
+    } = b;
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        x,
+        f32_gain(w, &n.attn_norm)?,
+        eps,
+        d.hidden,
+        t,
+        normed,
+    )?;
+    hid.quantize((gpu, k), normed, t, &[n.q_ty, n.k_ty, n.v_ty], sink)?;
+    let input = hid.input(normed);
+    for (name, ty, rows, y) in [
+        (&n.attn_q, n.q_ty, q_len, &mut *q),
+        (&n.attn_k, n.k_ty, kv_len, &mut *kr),
+        (&n.attn_v, n.v_ty, kv_len, &mut *v),
+    ] {
+        let one = (dense, GemmInput::PerSlot);
+        gemm_site((gpu, w, k), (ty, name), rows, &input, one, t, y)?;
+    }
+    kv.append_128(
+        &k.neox,
+        stream,
+        Append128 {
+            q: &mut *q,
+            k: &mut *kr,
+            v: &*v,
+            gq: f32_gain(w, &n.attn_q_norm)?,
+            gk: f32_gain(w, &n.attn_k_norm)?,
+            table,
+            pos,
+            eps,
+            n_head: d.n_head,
+            n_kv: d.n_kv,
+            ctx: d.ctx,
+            m: t,
+            fault: sink,
+        },
+    )?;
+    kv.prefill_128(
+        &k.prefill,
+        stream,
+        PrefillFlash {
+            q: &*q,
+            n_keys,
+            scale: ATTN_SCALE,
+            n_head: d.n_head,
+            n_kv: d.n_kv,
+            ctx: d.ctx,
+            t,
+            fault: sink,
+            y: &mut *attn,
+        },
+    )?;
+    out.quantize((gpu, k), attn, t, &[n.o_ty], sink)?;
+    let input = out.input(attn);
+    gemm_site(
+        (gpu, w, k),
+        (n.o_ty, &n.attn_output),
+        d.hidden,
+        &input,
+        (dense, GemmInput::PerSlot),
+        t,
+        attn_o,
+    )?;
+    gpu.elem()
+        .enqueue_add(stream, x, attn_o, t * d.hidden, ffn_inp)
 }
 
 /// A delta layer's input half at `m` rows: `x` normed and quantized into the

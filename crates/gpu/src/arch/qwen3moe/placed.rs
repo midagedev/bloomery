@@ -63,8 +63,10 @@ use super::plan::{
     FfnPlan, FfnRoute, GateUpEntry, LayerPlan, SharedPlan, SharedSites, SiteTy, gate_up_entry,
 };
 use super::program::{Stores, Tail, enqueue_tail};
-use super::scratch::{Arena, Dims, Io};
-use super::wide::{self, CardRoute, GEMV_COLS, HostSide, RingStacks, act_col_bytes, route_bytes};
+use super::scratch::{Arena, Dims, Forms, Io};
+use super::wide::{
+    self, CardRoute, GEMV_COLS, HostSide, RingStacks, act_col_bytes, arena_bytes, route_bytes,
+};
 use crate::gemm::GemmRoute;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::prompt_stream::PromptStream;
@@ -95,7 +97,10 @@ use std::sync::Arc;
 const WHAT: &str = "qwen3moe placed load";
 
 /// The rows of a placed prompt unit that reads each host expert once: the
-/// host union's most columns.
+/// host union's most columns. A placed load's prompt runs in units of up to
+/// this many positions through the host tier's batch port, so its ubatch
+/// arena holds that many rows ([`placed_scratch`]), whatever ubatch the
+/// caller asked.
 pub(super) const PLACED_ROWS: usize = UNION_MAX_COLS;
 
 /// The rows of a placed decode step: the step arena's one row.
@@ -766,6 +771,62 @@ fn placed_total(d: &Dims, layers: usize, rows: usize, tables: usize) -> Result<u
         + rows * s.hidden * 4
         + maps;
     u64::try_from(total).map_err(|_| GpuError::shape(WHAT, "the placed side's bytes pass u64"))
+}
+
+/// Rows of the ubatch arena for ubatches of `u` tokens on a `ctx`-row cache:
+/// at least a pass's [`GEMV_COLS`] (the plan's passes and tail walk it too),
+/// at most the cache.
+pub(super) fn prompt_rows(u: usize, ctx: usize) -> usize {
+    u.max(GEMV_COLS).min(ctx)
+}
+
+/// The card bytes a placed load of `layers` layers over arena dims `d` and
+/// forms `forms` holds past the m = 1 scratch: its ubatch arena at the placed
+/// units' rows ([`PLACED_ROWS`], [`arena_bytes`]) and its placed side
+/// ([`placed_bytes`]) — what the plan's machine counts in the card's scratch
+/// (`model::arch::qwen3moe::place::machine`), and what [`counted_arena`]
+/// holds the load to.
+pub(super) fn placed_scratch(d: &Dims, layers: usize, forms: Forms) -> Result<u64, GpuError> {
+    let arena = arena_bytes(d, prompt_rows(PLACED_ROWS, d.ctx), forms) as u64;
+    Ok(arena + placed_bytes(d, layers, PLACED_ROWS)?)
+}
+
+/// The ubatch arena of `d` for ubatches of `u` tokens on a placed load,
+/// after the check that it and the placed side's `side` bytes
+/// ([`placed_bytes`]) fit the `counted` bytes the load's plan holds for them
+/// in the card's scratch — not the card's free bytes, which a card budget
+/// (`BLOOMERY_CARD_BUDGET`) does not bound — else a named refusal with both
+/// terms, before anything is allocated. Load-time allocation.
+pub(super) fn counted_arena(
+    stream: &CudaStream,
+    (d, forms): (Dims, Forms),
+    u: usize,
+    counted: u64,
+    side: u64,
+) -> Result<Arena, GpuError> {
+    const WHAT_FIT: &str = "qwen3moe::placed::counted_arena";
+    let rows = prompt_rows(u, d.ctx);
+    let need = arena_bytes(&d, rows, forms) as u64;
+    if need + side > counted {
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the ubatch arena for ubatches of {u} tokens ({rows} rows) needs {need} bytes and \
+                 the placed side {side}; the plan counts {counted}"
+            ),
+        ));
+    }
+    let a = Arena::with(stream, d, rows, forms)?;
+    if a.bytes() as u64 != need {
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the ubatch arena holds {} bytes, its fit check counted {need}",
+                a.bytes()
+            ),
+        ));
+    }
+    Ok(a)
 }
 
 /// `map`'s first `n` words brought to the `n` words of `src` from word `at`

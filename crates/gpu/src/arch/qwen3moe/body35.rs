@@ -67,8 +67,8 @@ use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::image::{ImageWrite, MediaRows, PromptImage};
 use super::placed::{
-    BatchWalk, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans, placed_bytes,
-    tally_shape,
+    BatchWalk, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans, counted_arena,
+    placed_bytes, placed_scratch, prompt_rows, tally_shape,
 };
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
@@ -160,17 +160,8 @@ pub struct Open35 {
     pub media: bool,
 }
 
-/// Rows of the ubatch arena for ubatches of `u` tokens on a `ctx`-row cache:
-/// at least a pass's [`GEMV_COLS`] (the plan's passes and tail walk it too),
-/// at most the cache.
-fn prompt_rows(u: usize, ctx: usize) -> usize {
-    u.max(GEMV_COLS).min(ctx)
-}
-
-/// `o` as a placed load opens it: its prompt runs in units of up to
-/// [`PLACED_ROWS`] positions through the host tier's batch port, each host
-/// expert read once a unit, so its ubatch arena holds that many rows,
-/// whatever `o.ubatch` asks.
+/// `o` as a placed load opens it: its ubatch is [`PLACED_ROWS`], whatever
+/// `o.ubatch` asks.
 fn placed_open(o: Open35) -> Open35 {
     Open35 {
         ubatch: PLACED_ROWS,
@@ -289,44 +280,6 @@ fn ubatch_arena(
     }
     let a = Arena::with(stream, d, rows, forms)?;
     if a.bytes() != need {
-        return Err(GpuError::shape(
-            WHAT_FIT,
-            format!(
-                "the ubatch arena holds {} bytes, its fit check counted {need}",
-                a.bytes()
-            ),
-        ));
-    }
-    Ok(a)
-}
-
-/// The ubatch arena of `d` for ubatches of `u` tokens on a placed load,
-/// after the check that it and the placed side's `side` bytes
-/// ([`placed_bytes`]) fit the `counted` bytes the load's plan holds for them
-/// in the card's scratch — not the card's free bytes, which a card budget
-/// (`BLOOMERY_CARD_BUDGET`) does not bound — else a named refusal with both
-/// terms, before anything is allocated. Load-time allocation.
-fn counted_arena(
-    stream: &CudaStream,
-    (d, forms): (Dims, Forms),
-    u: usize,
-    counted: u64,
-    side: u64,
-) -> Result<Arena, GpuError> {
-    const WHAT_FIT: &str = "qwen35moe::counted_arena";
-    let rows = prompt_rows(u, d.ctx);
-    let need = arena_bytes(&d, rows, forms) as u64;
-    if need + side > counted {
-        return Err(GpuError::shape(
-            WHAT_FIT,
-            format!(
-                "the ubatch arena for ubatches of {u} tokens ({rows} rows) needs {need} bytes and \
-                 the placed side {side}; the plan counts {counted}"
-            ),
-        ));
-    }
-    let a = Arena::with(stream, d, rows, forms)?;
-    if a.bytes() as u64 != need {
         return Err(GpuError::shape(
             WHAT_FIT,
             format!(
@@ -1230,11 +1183,8 @@ impl GpuModel<Body35> {
     /// (`model::arch::qwen3moe::place::machine`), and what
     /// [`GpuModel::open_placed`] refuses to pass.
     pub fn placed_arena_bytes(file: &Split, o: Open35) -> Result<u64, GpuError> {
-        let o = placed_open(o);
-        let pre = Pre35::read_placed(file, o)?;
-        let forms = Forms::of(&pre.plans, &pre.d);
-        let arena = arena_bytes(&pre.d, prompt_rows(o.ubatch, o.ctx), forms) as u64;
-        Ok(arena + placed_bytes(&pre.d, pre.plans.len(), PLACED_ROWS)?)
+        let pre = Pre35::read_placed(file, placed_open(o))?;
+        placed_scratch(&pre.d, pre.plans.len(), Forms::of(&pre.plans, &pre.d))
     }
 
     /// What a whole load of `file` opened with `o` ([`GpuModel::open`])
