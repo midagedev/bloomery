@@ -1,0 +1,123 @@
+# 16 GiB variant of pageddraft-decode.card (2026-10-12): on a 12 GiB budget the mtp arm does not load — its floor
+# 13.49 GB (dense 5.94 + KV 0.56 + ctx 0.54 + scratch 2.53 + margin 1.07 + the draft's 2.85 GB of Q8_0 routed experts,
+# every one of them the card's, mtp38.rs) is above 12 GiB = 12.88 GB; the off arm loads. At 16 GiB = 17.18 GB the arms
+# hold [derived from the refusal's floor terms at 3.16 MB an expert]: off 2,070 card experts (43 a layer), mtp 1,168
+# (24 a layer): the mtp arm pays the draft's 2.85 GB out of its card experts, the comparison a user at this budget sees.
+# Mac dial replay (dial16.py over the q38-prose engine trace, resident host 180 a layer, S 54 = the 8 GiB arena):
+# off arm plain 53.6 fills a token (12G reference 51.8); mtp arm's plain-equivalent 60.7 (paged 308 vs 289 a layer);
+# a 4-row pass 4.5 / 5.1 fills a layer (p90 9 / 11): rho = pass fills over 48 layers / (4 x plain) = 1.01 both arms,
+# so the drafted arm reads 4.5-5.1 picks a miss layer at once (QD gain s = 2.0-2.3 from the qdsweep, QD1 2.51 to
+# QD4-8 5.67-6.48 GB/s) against the plain arm's ~1 a layer. Per token [derived]: off F = 53.6 x 3.16 MB at 2.5-3.3 GB/s
+# = 51-68 ms, H 6-10, card 8-14: 65-92 ms; mtp F a pass = 216 fills x 3.16 MB at 5.7-6.5 GB/s = 105-120 ms, /tau 3.6 =
+# 29-33 ms a token, H x0.78-1.10 = 5-11, card x1.15/tau = 2.5-4.7, draft walks 0.6-1.1: 37-50 ms a token: x1.3..x2.5.
+# The mtp arm's 13 % larger paged share takes the lower edge under the 12G card's.
+# Anchor [m, the lead's 12G run, 2026-10-12]: the off arm at the 12 GiB emulation (8 GiB arena) decodes 8.64 tok/s
+# [8.54..8.79] over 6 rounds = 116 ms a token, under the 12G card's plain band 9.4..12.8: with 51.8 fills a token that is
+# ~1.7 ms a fill, the refill card's whole pick (dontneed 0.07-0.10 + ~772 zero-page faults 0.30-0.50 + a 3.16 MB read
+# 1.13-1.44 ms), not the read alone. Re-derived with 1.7 ms a fill at QD ~1: off at 16G = 53.6 x 1.7 = 91 ms + H 6-10 +
+# card 8-14 = 105-115 ms (8.7-9.5 tok/s); mtp a pass = 48 miss layers x (4.5 picks in flight: 3.16 MB x 4.5 at 5.7-6.5
+# GB/s = 2.2-2.5 ms + page work ~0.5 ms, in parallel) = 130-145 ms, /tau 3.6 = 36-40 ms a token, + H 5-11 + card 2.5-4.7 +
+# walks 0.6-1.1 = 44-57 ms: x1.8..x2.6 on the fill chain alone; the band below keeps its lower edge at +40 for the case
+# that the pool's sync preads do not reach the drive's QD curve (the term the A/B decides: read fill_ns a fill both arms).
+# The MTP draft on a paged plan, small arena: the plain token's per-layer fills run one deep (a
+# layer holds ~1 miss a token), while a 4-row verify's union call fills a layer's several misses
+# together — the box drive scales 2.5 → 5.7 GB/s from QD 1 to 4 (qdsweep), so the fill chain
+# compresses. The rule change that makes this measurable is n71's: a set BLOOMERY_DRAFT=mtp runs
+# on a paged plan (the refusal is gone; the unset draft stays off, so the default ships off).
+# Shape (a) of the 2026-10-12 decision: a small arena, the entry-PC emulation (2-channel DDR,
+# 32-64 GB RAM class) — BLOOMERY_NVTIER_BYTES=8G beside BLOOMERY_HOST_ROOM=27G and
+# BLOOMERY_CARD_BUDGET=16G, both arms of the same binary (env arms), so the card prices the
+# draft on the shape whose plain arm is fill-chain-bound. The 20 G refill-decode shape runs only
+# if this card shows a gain (the lead's condition): there s collapses (a verify pass holds ~0.3
+# fills a layer, QD ~1.2) and the honest question is only whether H cancels tau.
+#
+# [derived, Mac replay 2026-10-12] The H term first, on the engine's own q38-prose routing trace
+# (q38-prose-trace-09300532: the real Qwen3.8-Flash-Next file, 6,144 positions in step order, 48
+# layers, top-10, per-id slots; PR #66's teacher-forced CPU traces are contributor-local and not
+# on this Mac, so the engine trace stands in — same router, same top-10, and the stream is the
+# one a verify pass actually reads; one corpus, prose): the union of the top-10 over every window
+# of 4 consecutive positions, per layer, is mean 27.71 of 40 picks, p90 34 (the plan's band was
+# 19.7..38.8); host-served union 12.86 against 4.60 host picks a token at the traced placement.
+# H a token under the draft = union / (tau x plain picks) = 27.71 / (3.6 x 10) = x0.78 (x0.90 at
+# tau 3.1; x1.10 at the p90 union) — the placement cancels: the ratio counts distinct ids against
+# the same served set both sides. So H does not cancel the gain on this stream; the plan's
+# x0.53..x1.25 band becomes x0.78 central, x1.10 the tail.
+#
+# [derived, Mac replay 2026-10-12] The fill side, through claim_replay.py's arena books (the
+# refill card's instrument) at this card's own dial (card 49, resident host 180, paged 283 a
+# layer, S 54 = the 8 GiB arena): one P 512 prompt union (rule c, B 16) then 1,024 positions.
+# Plain: 51.8 fills a token (first 96: 67.0; the anchor dial S 141 replays 4.07 against the
+# refill sitting's 3..5, the harness's calibration). Drafted, verify passes of 4 consecutive
+# positions: 3.3 fills a layer a pass (158 a pass over 48 layers), rho = a pass's fills /
+# (stride x plain's) = 1.02 — NVMe bytes a token are x1.0 plain, and each miss layer holds ~3
+# fills in the pass, so its reads run at QD 3..4 where the drive gives 5.67 GB/s against the
+# plain token's QD 1..2 at 2.5..4.2 GB/s.
+#
+# [derived] Per token (A6000 plan a, both arms at the shape above; tau 3.59..3.69 @ P 512
+# [m: rig-log 10-01#q38hol-ab]): plain = F 59..73 (33 miss layers of f 51.8, 1.8..2.2 ms a
+# layer's serial pick chain [m: refill card]) + H 11..19 (434 host picks, the 230-pick anchor's
+# 26..43 us) + card 8..14 = 78..106 ms (9.4..12.8 tok/s; the 42.21 tok/s anchor is the 20 G
+# shape, f 4). Drafted, per pass / tau: F 26..36 (158 fills, 47 miss layers x 2.1..2.6 ms at QD
+# 3..4) + H x0.78..x1.10 = 8.6..20.6 + card x1.15/tau = 2.6..4.5 + 3 draft walks 0.6..1.1 =
+# 38..62 ms (16..26 tok/s). Central 92/47 = x1.96. Near edge (+55): F_p 59, H_p 11.3, C_p 8;
+# F_d 34 (QD gain only 2.3x), H_d x1.05, C_d 3.3, walks 1.1. The failure tail the card cannot
+# exclude: a drive flat in QD (s = 1) reads the pass's layer at 2.5 GB/s, F_d 58/token, ratio
+# x1.06 — the same +6 tail decide-below reads. The lever's sign is the machine's drive, which is
+# why the unset draft ships off.
+#
+# Ruler: sd 2.6 % (refill-decode.card's, rig-log 09-30#q38seed-ab — measured at 42 tok/s; at
+# this shape's 10..26 tok/s the scatter may sit higher, unmeasured, so the interval is read as a
+# floor). At 6 rounds h = 2.228 x 2.6 x sqrt(2/6) = 3.35 %; the band's near edge +55 clears it.
+# Wall [derived, assumption: load 60..90 s an arm]: a round is plain 1,024 x ~92 ms + drafted
+# 1,024 x ~47 ms + two loads ~ 5 min; 6 rounds + the discarded warm-up ~ 33 min.
+#
+# Runner (the lead; output to a file first; every variable but the arms' own inside the env
+# lists and BLOOMERY_BOX_ENV):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pageddraft-decode.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DECODE_N=1024 BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' \
+#   just depth-gpu-qwen4exp \
+#     prose:512@BLOOMERY_DRAFT=mtp,BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=8G,BLOOMERY_CARD_BUDGET=16G \
+#     prose:512@BLOOMERY_DRAFT=off,BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=8G,BLOOMERY_CARD_BUDGET=16G
+kind: ab
+question: does the MTP draft speed the plain decode on a paged plan whose small arena makes the
+  plain token's fill chain the wall, by reading each verify's four rows' union once at a deeper
+  queue and serving tau positions a pass, against the host union's growth and the draft's own
+  walks?
+term: decode tok/s @ n=1024, prose 512 (the corpus's first 512 ids), ctx 3072, A6000, plan a, at
+  BLOOMERY_HOST_ROOM=27G BLOOMERY_NVTIER_BYTES=8G (a 7.9 GiB arena, S ~54 slots a layer)
+  BLOOMERY_CARD_BUDGET=16G BLOOMERY_RESIDENCY=off, one slot; this tree's generate_qwen3moe both
+  arms (same binary, lever arms, each arm's list carrying place=a — CARD_BUDGET acts only under --place), BLOOMERY_DRAFT=mtp against off, (mtp - off) / off, paired by
+  round
+unit: %
+predict: +40..+110
+rounds: 6
+sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair 1.056 ± 0.059 over 4 rounds,
+  as refill-decode.card and r4b-decode.card carry it; measured at 42 tok/s n = 96, taken here as
+  a floor (this shape runs 10..26 tok/s, its scatter unmeasured)
+condition: one lease; both arms built with their Cargo.lock current; BLOOMERY_DECODE_N=1024 in
+  BLOOMERY_BOX_ENV (the runner's `n=` field reads 1024 in both arms) and every arm a fresh
+  process (BLOOMERY_AB_LOAD=arm; a BLOOMERY_DRAFT arm runs alone in any case), the order rotated
+  each round, one warm-up round discarded (a `WARMUP r0` row in the log); no [cpu-busy],
+  [other-busy] or [cold] row and no Xid in either witness. Both arms' plan lines name a paged
+  plan with an arena and equal nvtier budget= fields (paged= differs by the draft's card bytes: the mtp arm holds ~900 fewer card experts, stated above, read beside the ratio); the mtp arm's log shows its
+  `load draft=mtp` record and the off arm's its `load draft=off` (why: unset, the plan pages);
+  both arms print the same greedy tokens (the draft moves no bit; the runner's
+  `tokens-differ rounds:` line reads 0 of 6). Read beside the ratio, from the arms' records, not
+  judged: tau (the windows' kept rows over their passes), fills a pass and fill_ns over fills
+  both arms (s, the pass's per-layer queue: 158 fills a pass over ~47 layers is the paper's
+  QD 3..4), and each arm's pp tok/s at P 512
+decide-in: land the structural change it rests on (the rule, the one owner, the (pg) pin —
+  already this tree's) and write the row to rig-log (decode tok/s both arms, the ratio and its
+  interval, tau, fills a pass and fill_ns a fill both arms) with the window named; the 20 G
+  arm (refill-decode.card's shape) then runs as the follow-up the decision note names, asking
+  whether H cancels tau where s cannot help
+decide-below: under +15 means s or rho was wrong, or the union sits above x3.4 of the plain
+  picks. Read tau, the fills a pass and fill_ns a fill first: a pass holding under ~2 fills a
+  miss layer (fill_ns a fill near the plain arm's) is the QD gain absent — the arena ran bigger
+  than the dial's at load (read arena_planned against paged); a tau under 3 on this stream is
+  acceptance, not flow; a union above x3.4 re-derives H from the arms' own host counters. The
+  rule keeps the unset draft off either way: the structural change stands, and the finding goes
+  to BLOOMERY_DRAFT's doc as the machine class where the set word pays
+decide-above: above +135 means the plain arm measured thrash, not the trade (its fills a token
+  past ~90: the arena under-sized past paper, the 4 GiB floor edge) or tau above 3.69 on this
+  stream; re-read the plain arm's fills by window before the ratio is claimed as the draft's,
+  and price the 6 GiB dial (S 40, just over the arena floor's 37 slots a layer) as the next card
