@@ -8978,9 +8978,11 @@ def self_test() -> int:
     # a whole-string .rs literal of a workspace package is documentation, not a run-time read: levers'
     # registry names the in-place lever files, and only the targets that compile such a file select it
     dspark = sel("crates/gpu-gates/src/bin/shared/ds41_dspark.rs")
+    # the bloomery-serve builders: the four seat gates and the two serve-start gates (each builds the whole bin)
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-glm5next-serve",
-                      "gate-gpu-lev-serve", "gate-gpu-qwen3-serve", "gate-ptx-spill"},
+                      "gate-gpu-lev-serve", "gate-gpu-qwen3-serve", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm",
+                      "gate-ptx-spill"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")
     expect("gate-gpu-e2e" in hybrid and "gate-ops" not in hybrid and len(hybrid) < len(gates) - 20,

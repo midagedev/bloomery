@@ -2358,6 +2358,32 @@ gate-gpu-glm5next-residency:
 gate-gpu-glm5next-serve:
     BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
 
+# The shipped `bloomery-serve` started once per image flag on the GLM-5.3 fixture (gate_serve_start's header has the clauses): (s1)
+# `-m <fixture>` with the serving defaults and one text chat; (s2) `--place a --mmproj <unsloth's mmproj-BF16.gguf>`, the tower's
+# `vision` record and one image chat (free-448x448.png) answered with its 16 x 16 + 2 positions; (s3) `--hf bloomery-fixture/glm5next:fixture`
+# offline from a cache of symlinks to the fixture and the projector, each beside a `.verified` marker holding the file's sha256; (s4) no
+# server stderr of the run holds "does not print this kind" or "panicked". Each start is preceded by a `--plan` run of its arguments.
+# It holds the image-flag starts at the fixture tier, which the real-tier seat gates do not. The bloomery-serve built is the release's
+# (--features glm5next,clef,vision,mimo2). Both cards in view
+# (BLOOMERY_CARD=both: both gate locks, alone in a batch): with `--place a` the other card is off the plan, so the tower sits there and no
+# fixture card budget has to hold its reserve; one card in view would drop the repo's projector or refuse the reserve. Fixture-only
+# (tools/ref/fixture-only.sh): the real tier would hash the real shards and start the real model three times, so a real-tier batch
+# defers the recipe by name. Predicted wall [derived from gate-times.tsv: glm5next-twocard at the fixture tier is 49 s median over eight
+# loads, qwen38-serve 89 s over ten-plus spawns]: three starts of about 8 s, three `--plan` runs of about 2 s, a warm build, the sha256 of the
+# 8.6 GB set and the 1.2 GB projector in threads beside the first two starts: 45 to 90 s warm; the bound is the runner's 900 s.
+[group('solo')]
+gate-gpu-serve-start-glm:
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/glm && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family glm --dir $D'
+
+# The same gate on the V4.1 fixture (the file's architecture picks the seat, which has no `--plan`, so its plan is read from each
+# start's own log). The projector is the `# mmproj` line of the V4.1 vision set ($BLOOMERY_DATA/ref-vision/deepseek41v, `just dump-ref-vision`),
+# the file the V4.1 image gates load. The serving defaults are the seat's own (context 32768, two slots), planned under the fixture's
+# card budget. Predicted wall [derived, as above]: three starts of about 12 s over the 15 GB host set, the sha256 of the set and the
+# projector in threads beside the first two starts, a warm build: 60 to 120 s warm; the bound is the runner's 900 s.
+[group('solo')]
+gate-gpu-serve-start-ds41:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/ds41 && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family ds41 --dir $D'
+
 # The MiMo seat of `bloomery-serve` (gate_mimo2_serve): the refusals before any load (--plan's default context, the one
 # slot, the tier card), one server at --ctx 4160 --parallel 1 holding its load and listening records, the three prompts'
 # ids (the batch set's, a prose, the chat turn rendered by the server's template), the chat answer inside those ids, the

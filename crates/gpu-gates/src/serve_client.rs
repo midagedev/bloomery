@@ -1,10 +1,11 @@
 //! The HTTP side of the binaries that drive a server (`gate_ds41_serve`,
 //! `soak_ds41_serve` on `bloomery-serve-ds41`, `gate_qwen3_serve`,
-//! `gate_glm5next_serve` and `gate_mimo2_serve` on `bloomery-serve`): the
-//! server started beside the calling binary and killed by its handle on every
-//! way out, its address read from its stderr, one request through curl, a
-//! `/metrics` value, the server's stderr read by its binary's record kinds
-//! ([`server_log`]), and the requests the seat gates share: the chat turn's
+//! `gate_glm5next_serve`, `gate_mimo2_serve` and `gate_serve_start` on
+//! `bloomery-serve`): the server started beside the calling binary and killed
+//! by its handle on every way out, its address read from its stderr, one
+//! request through curl, a `/metrics` value, the server's stderr read by its
+//! binary's record kinds ([`server_log`]), an image's base64 ([`base64`]), and
+//! the requests the seat gates share: the chat turn's
 //! ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
 //! chat answer held to a completion's ids ([`chat_is_those_ids`]) and the
 //! prefix clauses of a seat that keeps a shared prefix
@@ -236,6 +237,27 @@ pub fn parse_ids(s: &str) -> Result<Vec<u32>, GateError> {
 pub fn check(ok: &mut bool, name: &str, pass: bool) {
     println!("check {name}: {}", verdict(pass));
     *ok &= pass;
+}
+
+/// Standard base64 with padding (RFC 4648 section 4): the alphabet the server's strict decoder reads for an
+/// image's `data:` URL.
+pub fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// The binary `name` beside the running one.

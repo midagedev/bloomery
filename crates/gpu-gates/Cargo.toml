@@ -323,6 +323,10 @@ name = "gate_glm5next_serve"
 required-features = ["glm5next"]
 
 [[bin]]
+name = "gate_serve_start"
+required-features = ["deepseek41", "vision"]
+
+[[bin]]
 name = "gate_mimo2_e2e"
 required-features = ["mimo2"]
 

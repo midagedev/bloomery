@@ -44,3 +44,8 @@ gate-gpu-glm5next-nvtier	-	173015891968
 gate-gpu-glm5next-mtp	-	173015891968
 gate-gpu-glm5next-residency	-	173015891968
 gate-gpu-glm5next-stagger	-	173015891968
+# The fixture-only serve-start gates (gate-gpu-serve-start-*) never run in the real tier, so their row is the fixture's own host set, not
+# the real file's HostNeed: glm5next fixture about 8.6e9 B, deepseek41 fixture about 15e9 B (the fixture generators' size notes, model
+# crate fixture/glm5next and fixture/deepseek41 shard-size comments), one server at a time.
+gate-gpu-serve-start-glm	-	8600000000
+gate-gpu-serve-start-ds41	-	15000000000
