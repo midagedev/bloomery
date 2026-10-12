@@ -108,10 +108,11 @@ use crate::{Gpu, GpuError, launch_u32};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
+use gguf::quant::GgmlType;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, RopeMode};
-use model::placement::{Plan, WholeLoad};
+use model::placement::{Plan, WholeLoad, accepts};
 use runtime::seqstate::{Kept, Price};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
@@ -522,7 +523,8 @@ fn joint(l: usize, part: &str) -> String {
 /// embedding Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K,
 /// Q4_K or Q8_0 (`Head`). A routed layer's stacks and its shared expert are
 /// read at any site type ([`FFN_READ`]) and admitted by the card kernel
-/// table's entries ([`plan_ffn`]).
+/// table's entries ([`plan_ffn`]); under a placed read the stacks of a layer
+/// the card leg does not run are the host tier's instead ([`card_runs`]).
 const PROJ: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
@@ -566,21 +568,105 @@ fn ty_of(
     file_site(file, WHAT, name, (rows, k), allowed)
 }
 
+/// What a read of the file holds a layer's routed stacks to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read35 {
+    /// A whole load: every routed stack runs on the card, so each is read at
+    /// a site type and admitted by the card kernel table's entries.
+    Whole,
+    /// A placed load: a layer whose stacks the card leg does not run is the
+    /// host tier's, and its stacks are read as [`HOSTED`] — each stack still
+    /// refused by name when no tier runs its type.
+    Placed,
+}
+
+/// The type a placed plan holds a host layer's routed stacks as. No launch
+/// reads them: the layer has no card expert (the open refuses card experts of
+/// a layer the leg does not run, [`swap35::stacks`]), and an F32 site reads no
+/// quantized form (`SiteTy::reads`), so neither the arena's forms
+/// ([`Forms::of`]) nor the wide arm's front (`wide::ffn_front`) counts a form
+/// for them: the layer's card work is its shared expert's alone.
+const HOSTED: SiteTy = SiteTy::F32;
+
+/// The file type of routed stack `name` of `rows` rows of `k` values, from
+/// its header entry: the type itself, where `file_site` names only the types
+/// a card site launches. A missing tensor or another shape is refused by
+/// name.
+fn stack_ty(file: &Split, name: &str, (rows, k): (usize, usize)) -> Result<GgmlType, GpuError> {
+    let (_, t) = file
+        .find(name)
+        .ok_or_else(|| GpuError::tensor(WHAT, name, "in the file"))?;
+    let got_k = t.dims.first().copied().unwrap_or(0);
+    let got_rows: u64 = t.dims.iter().skip(1).product();
+    if usize::try_from(got_k).ok() != Some(k) || usize::try_from(got_rows).ok() != Some(rows) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "{name} is {:?} in the file; the stack takes {rows} rows of {k}",
+                t.dims
+            ),
+        ));
+    }
+    Ok(t.ty)
+}
+
+/// Whether the card leg runs layer `l`'s routed stacks (`n` experts of `ff`
+/// rows of `h` values), read from `file`'s header before any upload: the
+/// planner's own verdict ([`accepts::leg_runs`]). A stack of a type that
+/// neither the card leg's arm for its part ([`accepts::leg_arms`]) nor the
+/// host tier's fused rows ([`model::ops::host_stack_runs`]) runs is refused
+/// by name, with the layer: no plan can place it.
+fn card_runs(file: &Split, l: usize, (ff, h, n): (usize, usize, usize)) -> Result<bool, GpuError> {
+    let program = accepts::Program::Qwen35Body;
+    let arms = accepts::leg_arms(program)
+        .ok_or_else(|| GpuError::shape(WHAT, "the qwen35moe body runs no card leg"))?;
+    let stack = |part: &str,
+                 (rows, k): (usize, usize),
+                 (kind, arm): (&str, fn(GgmlType) -> bool)|
+     -> Result<GgmlType, GpuError> {
+        let name = blk(l, &format!("ffn_{part}_exps.weight"));
+        let ty = stack_ty(file, &name, (n * rows, k))?;
+        if !arm(ty) {
+            model::ops::host_stack_runs("the host tier", &name, ty, k).map_err(|e| {
+                GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l}: the {part} stack is {ty}, which runs on no tier: the card \
+                         leg's {kind} launches read none; {e}"
+                    ),
+                )
+            })?;
+        }
+        Ok(ty)
+    };
+    let gate_up = ("gate·up", arms.gate_up);
+    let tys = [
+        stack("gate", (ff, h), gate_up)?,
+        stack("up", (ff, h), gate_up)?,
+        stack("down", (h, ff), ("down", arms.down))?,
+    ];
+    Ok(accepts::leg_runs(program, tys) == Some(true))
+}
+
 /// The types of routed part `part` of layer `l` from `file`'s header: its
-/// experts' stack (`experts` experts of `rows` rows of `k` values) and its
-/// shared expert's matrix (`rows` of `k`).
+/// experts' stack (`experts` experts of `rows` rows of `k` values; [`HOSTED`]
+/// for a layer the host tier runs) and its shared expert's matrix (`rows` of
+/// `k`).
 fn part_tys(
     file: &Split,
     l: usize,
     part: &str,
     (rows, k, experts): (usize, usize, usize),
+    hosted: bool,
 ) -> Result<(SiteTy, SiteTy), GpuError> {
     let exps = blk(l, &format!("ffn_{part}_exps.weight"));
     let sh = blk(l, &format!("ffn_{part}_shexp.weight"));
-    Ok((
-        ty_of(file, &exps, experts * rows, k, FFN_READ)?,
-        ty_of(file, &sh, rows, k, FFN_READ)?,
-    ))
+    let routed = if hosted {
+        HOSTED
+    } else {
+        ty_of(file, &exps, experts * rows, k, FFN_READ)?
+    };
+    Ok((routed, ty_of(file, &sh, rows, k, FFN_READ)?))
 }
 
 /// Layer `l`'s FFN by its description `spec`, every site's type from
@@ -591,26 +677,39 @@ fn part_tys(
 /// as row `n` (the routed count, [`join_ffn`]); and the shared expert folded
 /// into the stacks as expert `n` when its gate, up and down are each its
 /// stack's type ([`SharedPlan::Joined`]), else kept apart at its own types
-/// ([`SharedPlan::Apart`]). A dense one: its three matrices a stack of one
+/// ([`SharedPlan::Apart`]). Under a placed read ([`Read35::Placed`]) a layer
+/// whose stacks the card leg does not run ([`card_runs`]) is the host
+/// tier's: its stacks are read as [`HOSTED`] and no card entry is asked of
+/// them, its shared expert kept apart at its own types, which the card runs
+/// whatever the stacks are. A dense one: its three matrices a stack of one
 /// expert on the arena's fixed route.
-fn plan_ffn(file: &Split, d: &Dims, spec: &LayerSpec, l: usize) -> Result<FfnPlan, GpuError> {
+fn plan_ffn(
+    file: &Split,
+    d: &Dims,
+    spec: &LayerSpec,
+    l: usize,
+    read: Read35,
+) -> Result<FfnPlan, GpuError> {
     let (h, ff) = (d.hidden, d.ff);
     let ffn_norm = blk(l, "post_attention_norm.weight");
     match &spec.ffn {
         Ffn::Moe(m) => {
             let n = m.experts as usize;
-            let (gate_ty, sh_gate) = part_tys(file, l, "gate", (ff, h, n))?;
-            let (up_ty, sh_up) = part_tys(file, l, "up", (ff, h, n))?;
-            let (down_ty, sh_down) = part_tys(file, l, "down", (h, ff, n))?;
+            let hosted = read == Read35::Placed && !card_runs(file, l, (ff, h, n))?;
+            let (gate_ty, sh_gate) = part_tys(file, l, "gate", (ff, h, n), hosted)?;
+            let (up_ty, sh_up) = part_tys(file, l, "up", (ff, h, n), hosted)?;
+            let (down_ty, sh_down) = part_tys(file, l, "down", (h, ff, n), hosted)?;
             let at = |e: GpuError| GpuError::shape(WHAT, format!("layer {l}: {e}"));
-            gate_up_entry(gate_ty, up_ty, WHAT).map_err(at)?;
-            down_entry(down_ty, WHAT).map_err(at)?;
+            if !hosted {
+                gate_up_entry(gate_ty, up_ty, WHAT).map_err(at)?;
+                down_entry(down_ty, WHAT).map_err(at)?;
+            }
             for ty in [sh_gate, sh_up, sh_down] {
                 shared_entry(ty, WHAT).map_err(at)?;
             }
             let routed = |part: &str| blk(l, &format!("ffn_{part}_exps.weight"));
             let (shared, [gate, up, down]) =
-                if (gate_ty, up_ty, down_ty) == (sh_gate, sh_up, sh_down) {
+                if !hosted && (gate_ty, up_ty, down_ty) == (sh_gate, sh_up, sh_down) {
                     let stacks = ["gate", "up", "down"].map(|part| joint(l, part));
                     (SharedPlan::Joined, stacks)
                 } else {
@@ -927,17 +1026,21 @@ struct Pre35 {
 }
 
 impl Pre35 {
-    /// [`Pre35::read`] for a placed load: the plans with every routed layer's
-    /// shared expert kept apart from the stacks ([`apart_plans`]).
+    /// [`Pre35::read`] for a placed load ([`Read35::Placed`]): a layer whose
+    /// stacks the card leg does not run is read as the host tier's, and the
+    /// plans keep every routed layer's shared expert apart from the stacks
+    /// ([`apart_plans`]).
     fn read_placed(file: &Split, o: Open35) -> Result<Pre35, GpuError> {
-        let pre = Pre35::read(file, o)?;
+        let pre = Pre35::read(file, o, Read35::Placed)?;
         Ok(Pre35 {
             plans: apart_plans(pre.plans),
             ..pre
         })
     }
 
-    fn read(file: &Split, o: Open35) -> Result<Pre35, GpuError> {
+    /// The load's description from `file`'s header, its routed stacks held as
+    /// `mode` says ([`Read35`]).
+    fn read(file: &Split, o: Open35, mode: Read35) -> Result<Pre35, GpuError> {
         let Open35 {
             ctx,
             mma,
@@ -1015,7 +1118,7 @@ impl Pre35 {
                 };
                 Ok(LayerPlan {
                     mixer,
-                    ffn: plan_ffn(file, &d, layer, l)?,
+                    ffn: plan_ffn(file, &d, layer, l, mode)?,
                 })
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
@@ -1161,7 +1264,7 @@ impl GpuModel<Body35> {
     /// takes the file.
     pub fn open(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
         let n_layers = trunk_count(&file, "qwen35moe GpuModel::open")?;
-        let pre = Pre35::read(&file, o)?;
+        let pre = Pre35::read(&file, o, Read35::Whole)?;
         if pre.layers.len() != n_layers {
             return Err(GpuError::shape(
                 WHAT,
@@ -1182,6 +1285,11 @@ impl GpuModel<Body35> {
     /// what the plan's machine counts in the card's scratch
     /// (`model::arch::qwen3moe::place::machine`), and what
     /// [`GpuModel::open_placed`] refuses to pass.
+    ///
+    /// Read as a placed load reads the file ([`Read35::Placed`]): a layer
+    /// whose routed stacks the card leg does not run holds no card expert,
+    /// so its stacks size no scratch, and a stack of a type no tier runs is
+    /// refused by name here, before any plan.
     pub fn placed_arena_bytes(file: &Split, o: Open35) -> Result<u64, GpuError> {
         let pre = Pre35::read_placed(file, placed_open(o))?;
         placed_scratch(&pre.d, pre.plans.len(), Forms::of(&pre.plans, &pre.d))
@@ -1194,7 +1302,7 @@ impl GpuModel<Body35> {
     /// keeps free past it. Read through the load's own description, so a
     /// file or options the load refuses are refused here by the same name.
     pub fn whole_load(file: &Split, o: Open35) -> Result<WholeLoad, GpuError> {
-        let pre = Pre35::read(file, o)?;
+        let pre = Pre35::read(file, o, Read35::Whole)?;
         let forms = Forms::of(&pre.plans, &pre.d);
         Ok(WholeLoad::Checked {
             arena: ubatch_need(&pre.d, forms, pre.ubatch.get()).1 as u64,
@@ -1216,9 +1324,11 @@ impl GpuModel<Body35> {
     /// ([`checkpoint_every`]) is the one part that reads `o.ubatch`. The load
     /// runs no residency machine ([`Residency::Off`]): the plan's slot map is
     /// the model's for its life. Refused by name as [`GpuModel::open`]
-    /// refuses, for a plan of another context, as the placed side refuses
-    /// ([`Placed::new`]), and as the family's stack table refuses a layer's
-    /// types ([`swap35::stacks`]).
+    /// refuses, except that a layer whose routed stacks the card leg does not
+    /// run is the host tier's ([`Read35::Placed`]) and a routed stack of a
+    /// type no tier runs is refused instead; for a plan of another context,
+    /// as the placed side refuses ([`Placed::new`]), and as the family's
+    /// stack table refuses a layer's types ([`swap35::stacks`]).
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,

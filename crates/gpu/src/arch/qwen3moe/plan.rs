@@ -138,7 +138,8 @@ pub(super) struct FfnPlan {
     pub(super) gate: String,
     pub(super) up: String,
     pub(super) down: String,
-    /// The file's types of the three stacks.
+    /// The file's types of the three stacks; a placed plan's host layer
+    /// holds `body35::HOSTED`, which no launch reads.
     pub(super) gate_ty: SiteTy,
     pub(super) up_ty: SiteTy,
     pub(super) down_ty: SiteTy,
