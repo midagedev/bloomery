@@ -3160,7 +3160,8 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = &[
 /// placed load, the draft's load line and its verify's capture, the
 /// listening line, the reuse records the checkpoint rule answers, the
 /// draft's joins, the residency machine's records, and the rounds of several
-/// slots and the calls of one a `BLOOMERY_STEP_STATS` run counts.
+/// slots and the calls of one a `BLOOMERY_STEP_STATS` run counts, and the image encoder's `vision`
+/// record under `--mmproj`.
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
@@ -3188,6 +3189,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &SLOTS_ROUND,
     &SLOT_CALL,
     &MTP_WIDTH,
+    &VISION,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
@@ -3853,6 +3855,22 @@ pub fn residency_reset(r: &ResetReport) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every seat that takes `--mmproj` registers the `vision` record its tower's load prints:
+    /// an unregistered kind panics at the print.
+    #[test]
+    fn the_seats_that_take_images_register_the_vision_record() {
+        for (seat, set) in [
+            ("ds41", BLOOMERY_SERVE_DS41),
+            ("qwen3", BLOOMERY_SERVE_QWEN3),
+            ("glm", BLOOMERY_SERVE_GLM),
+        ] {
+            assert!(
+                set.iter().any(|k| k.name == VISION.name),
+                "the {seat} seat does not register the vision record"
+            );
+        }
+    }
 
     /// Every binary's kinds: names unique, each value part named once, a
     /// text part followed by a key, a literal or nothing (the parser reads it
