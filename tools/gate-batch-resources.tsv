@@ -35,6 +35,7 @@ weekly-gpu-ds41-cand	-	237600000000
 weekly-gpu-ds41-lost	-	237600000000
 weekly-gpu-ds41-serve	-	237600000000
 weekly-gpu-glm5next-e2e-long	-	173015891968
+weekly-gpu-glm5next-media-serve	-	173015891968
 weekly-gpu-mimo2-e2e	-	161600000000
 weekly-gpu-mimo2-serve	-	161600000000
 gate-gpu-ds41-residency-a	-	237600000000

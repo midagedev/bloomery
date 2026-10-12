@@ -183,6 +183,9 @@ crates/gpu-gates/src/bin/gate_mimo2_e2e.rs	weekly-gpu-mimo2-e2e	the MiMo end-to-
 crates/gpu-gates/src/bin/shared/mimo2_open.rs	weekly-gpu-mimo2-e2e weekly-gpu-mimo2-serve	the MiMo open both MiMo gates load the model through
 crates/gpu/src/{card_slots,card_leg}.rs	weekly-gpu-mimo2-e2e	the card slots' places and sum, which MiMo's card leg runs
 crates/gpu-gates/src/bin/{gate_mimo2_serve.rs,shared/serve_seats/mimo2.rs,shared/serve_seats/rounds.rs}	weekly-gpu-mimo2-serve	the MiMo serve gate's own bin, the seat it serves through and the round pass the seat steps its slots with
+crates/gpu-gates/src/bin/{gate_glm5next_serve.rs,shared/serve_seats/glm.rs}	weekly-gpu-glm5next-media-serve	the GLM serve gate's media arm and the seat's image path and draft turn-off, whose why the arm reads from the seat's source
+crates/gpu-gates/src/vision_seat.rs	weekly-gpu-glm5next-media-serve	the vision seat the GLM seat opens its tower through, whose `vision` record the arm reads
+crates/vision/src/arch/glm5v/**	weekly-gpu-glm5next-media-serve	the GLM-5V projector's hyperparameters, tensors and image rules the seat plans the tower with
 tools/flow/**	weekly-gpu-ds41-flowcounts	the flow model and its plans, which --counts holds to the engine's
 crates/gpu-deepseek41/src/body/prefill*.rs	weekly-gpu-ds41-flowcounts	the prompt call's counters (stat prefill front, stat prefill lb)
 crates/gpu-gates/src/record.rs	weekly-gpu-ds41-flowcounts	the record kinds, the prefill stats' among them

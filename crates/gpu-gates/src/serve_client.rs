@@ -6,7 +6,8 @@
 //! `/metrics` value, the server's stderr read by its binary's record kinds
 //! ([`server_log`]), and the requests the seat gates share: the chat turn's
 //! ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
-//! chat answer held to a completion's ids ([`chat_is_those_ids`]) and the
+//! chat answer held to a completion's ids ([`chat_is_those_ids`]), an image
+//! file held to its digest and sent as base64 ([`sha256`], [`base64`]) and the
 //! prefix clauses of a seat that keeps a shared prefix
 //! ([`edit_and_extension`]) and of one whose prompt cache holds a saved
 //! state's checkpoints ([`prefix_restore`]).
@@ -230,6 +231,41 @@ pub fn parse_ids(s: &str) -> Result<Vec<u32>, GateError> {
                 .map_err(|e| format!("id {t:?}: {e}").into())
         })
         .collect()
+}
+
+/// The bytes as standard base64 with padding, the alphabet `serve::media`'s strict decoder
+/// reads.
+pub fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            A[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            A[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// The sha256 of the file at `path`, as `sha256sum` prints it; a failed `sha256sum` is an error
+/// naming the file.
+pub fn sha256(path: &Path) -> Result<String, GateError> {
+    let out = Command::new("sha256sum").arg(path).output()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    match text.split_whitespace().next() {
+        Some(h) if out.status.success() => Ok(h.to_owned()),
+        _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
+    }
 }
 
 /// One clause's line, `check <name>: PASS|FAIL`, folded into `ok`.
