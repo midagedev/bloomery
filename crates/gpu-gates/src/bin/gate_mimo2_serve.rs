@@ -200,7 +200,21 @@
 //!   of 0 leaves the resident bytes short of the stores; a budget without
 //!   the added stores plans another split and the plan line is red.
 //!
-//! Then, with both servers stopped:
+//! Then one server more of the one-slot shape (`--parallel 1` at [`CTX`], the
+//! one-slot server's budget), under `BLOOMERY_PREFILL_GROUP=1`:
+//!
+//! - `load_group_follows_the_lever`: the one-slot server's `load` record, run
+//!   with the lever unset, holds `group` the row's default
+//!   (`bloomery_levers::PREFILL_GROUP_DEFAULT`, 2); this server's holds 1, on
+//!   the one-slot server's plan (the plan reserves none of the prompt batch's
+//!   units) and with fewer resident bytes (a group of one holds one unit of
+//!   the batch's buffers, the default's group more, and the load makes them
+//!   once). FAIL-first: a seat that pins the group to 1 records `group=1` for
+//!   the default server and the clause is red; a seat that does not act on the
+//!   lever refuses `BLOOMERY_PREFILL_GROUP=1` by name at `main`, never
+//!   listens, and the clause is red.
+//!
+//! Then, with every server stopped:
 //!
 //! - `server_ids_are_the_session_ids`: the session opened in process at [`CTX`]
 //!   on the gate card (`shared/mimo2_open.rs`) plans the split of the
@@ -470,6 +484,11 @@ mod gate {
         /// host's own reading, for the lever also replaces the load's
         /// host-need check.
         room: Option<u64>,
+        /// `BLOOMERY_PREFILL_GROUP`: only `load_group_follows_the_lever`'s
+        /// second server sets it; every other server runs it unset, the
+        /// row's default, since this gate's own `at_main` refuses the lever
+        /// in the environment its servers inherit.
+        group: Option<&'a str>,
     }
 
     /// The residency machine `off`, nothing else pinned.
@@ -477,6 +496,7 @@ mod gate {
         residency: Some("off"),
         budget: None,
         room: None,
+        group: None,
     };
 
     /// `bloomery-serve --model mimo2 -m <file> <args>` beside this binary, its
@@ -520,6 +540,9 @@ mod gate {
         }
         if let Some(bytes) = pins.room {
             cmd.env(bloomery_levers::HOST_ROOM, bytes.to_string());
+        }
+        if let Some(group) = pins.group {
+            cmd.env(bloomery_levers::PREFILL_GROUP, group);
         }
         Ok((Served::spawn_cmd(cmd, &all, &d)?, d))
     }
@@ -1218,6 +1241,8 @@ mod gate {
         /// The one-slot server's `load` record's resident and scratch bytes.
         resident: u64,
         scratch: u64,
+        /// The prompt group of its `load` record, the lever unset.
+        group: u64,
         /// The split of the one-slot server's `plan` record.
         planned: Planned,
     }
@@ -1255,6 +1280,7 @@ mod gate {
                     "edit_resend_keeps_the_row_where_it_diverges",
                     "edit_resend_ids_are_a_fresh_runs",
                     "extension_keeps_every_held_position",
+                    "load_group_follows_the_lever",
                     "server_ids_are_the_session_ids",
                     "ids_see_an_id_short",
                 ] {
@@ -1331,6 +1357,7 @@ mod gate {
             chat,
             resident: load.u64("resident_bytes")?,
             scratch: load.u64("scratch_bytes")?,
+            group: load.u64("group")?,
             planned,
         }))
     }
@@ -1531,6 +1558,66 @@ mod gate {
         Ok((ids, first_logits))
     }
 
+    /// `load_group_follows_the_lever` (the module header): the one-slot
+    /// server's `load` record, the lever unset, holds the row's default group,
+    /// and a server of the same shape under `BLOOMERY_PREFILL_GROUP=1` holds
+    /// 1, on the same plan and with fewer resident bytes (a group of one
+    /// holds one unit of the prompt batch's buffers, the default's group
+    /// more).
+    fn load_group_follows_the_lever(
+        dir: &Path,
+        file: &Path,
+        one: &Answers,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        const NAME: &str = "load_group_follows_the_lever";
+        let ctx = CTX.to_string();
+        let pins = Pins {
+            budget: Some(gate_budget()),
+            group: Some("1"),
+            ..OFF
+        };
+        let (mut s, d) = spawn_levered(
+            dir,
+            "serve-group-one",
+            file,
+            &["--ctx", &ctx, "--parallel", "1", "--port", "0"],
+            pins,
+        )?;
+        let err_log = d.join("server.err");
+        if let Err(e) = s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
+            println!("the group-one server never listened: {e}");
+            println!(
+                "server stderr:\n{}",
+                std::fs::read_to_string(&err_log).unwrap_or_default()
+            );
+            check(ok, NAME, false);
+            return Ok(());
+        }
+        let records = server_log(&err_log, record::BLOOMERY_SERVE_MIMO2)?;
+        let load = records.one(&record::LOAD_MIMO2)?;
+        let planned = Planned::of(&records.one(&record::PLAN)?)?;
+        let default = bloomery_levers::PREFILL_GROUP_DEFAULT;
+        let (group, resident) = (load.u64("group")?, load.u64("resident_bytes")?);
+        let fewer = i128::from(one.resident) - i128::from(resident);
+        println!(
+            "load groups: the default server's {}, the lever's default {default}; the server under \
+             {}=1 {group}; resident {} B against {resident} B: {fewer} B fewer at group 1 (want \
+             more than 0); plan {planned:?} against {:?}",
+            one.group,
+            bloomery_levers::PREFILL_GROUP,
+            one.resident,
+            one.planned
+        );
+        println!("server stopped: {}", s.stop()?);
+        check(
+            ok,
+            NAME,
+            one.group == default && group == 1 && fewer > 0 && planned == one.planned,
+        );
+        Ok(())
+    }
+
     /// `server_ids_are_the_session_ids` and `ids_see_an_id_short` (the module
     /// header), the server already stopped.
     fn server_ids_are_the_session_ids(
@@ -1608,6 +1695,7 @@ mod gate {
         let answers = served(dir, file, batch, ok)?;
         if let Some(one) = &answers {
             two_slots_decode_as_one_slot_runs(dir, file, one, ok)?;
+            load_group_follows_the_lever(dir, file, one, ok)?;
         }
         match answers {
             Some(answers) if cards == 1 => {

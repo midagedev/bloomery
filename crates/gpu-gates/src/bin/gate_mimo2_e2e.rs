@@ -54,6 +54,17 @@
 //!   bit — (t)'s run, or its own when (b) runs without (t). The 1,024-position
 //!   prefill is two batches and the 4,096-position one eight, so the cut at a
 //!   batch's end and a flash over a window of real keys are both on the path.
+//!   The open runs the prompt group of the lever's default
+//!   (`Levers::prefill_group`, 2: the seat's), held to it here, and each set is
+//!   fed at that group (the 1,024-position set one group of two batches, the
+//!   4,096-position one four) and again at groups of one, each the steps' bits;
+//!   the batch's units hold the group (`group_sets`). A call of three batches
+//!   (`JOIN_IDS` ids of the 4,096-position set) is fed at groups of two, the
+//!   lone last batch joined to the group before it, and at groups of one: the
+//!   argmax, the step's logits and its layer outputs bit for bit the same.
+//!   FAIL-first: an open that pins the group to 1 prints `the open's prompt
+//!   group is 1, the lever's default 2` red; a `group_sets` that holds `g`
+//!   units for a group of `g` refuses the call of three batches by name.
 //!
 //! - (slots) resident sequence slots, on loads of their own at [`SLOT_CTX`]
 //!   positions after the main load is dropped: the slot harness's contracts
@@ -182,7 +193,10 @@ mod gate {
     use bloomery_gpu_gates::residency;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
-    use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode, feed, set_prefill, set_taps};
+    use bloomery_gpu_mimo2::{
+        Body, Mimo2Model, PrefillMode, T_MAX, feed, prefill_group, prompt_bytes, set_prefill,
+        set_prefill_group, set_taps,
+    };
     use bloomery_levers::{CARD_BUDGET, ResidencyAt, ResidencyWhy};
     use cuda_core::sys;
     use gguf::Split;
@@ -194,6 +208,7 @@ mod gate {
     use refset::arch::mimo2::{BATCH, D1K, D4096, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::FfnKind;
+    use runtime::prompt::{call_batches, group_sets, groups};
     use runtime::{Out, Target as _, Want};
 
     use crate::mimo2_open::open_with;
@@ -569,9 +584,36 @@ mod gate {
 
     // -------------------------------------------------------- (b) batch feed
 
+    /// `prefill` fed by batches from a reset, then the step of `tok`: the
+    /// prefill's argmax, the step's layer outputs and its logits, and the
+    /// wall of the prefill.
+    fn fed_by_batches(
+        m: &mut Mimo2Model,
+        prefill: &[u32],
+        tok: u32,
+    ) -> Result<(Fed, f64), GateError> {
+        m.reset()?;
+        let t = Instant::now();
+        let prefill_argmax = bloomery_gpu_mimo2::prefill(m, prefill)?;
+        let fed_s = t.elapsed().as_secs_f64();
+        let (taps, logits) = run_last(m, tok)?;
+        Ok((
+            Fed {
+                prefill_argmax,
+                taps,
+                logits,
+            },
+            fed_s,
+        ))
+    }
+
     /// The step of set `name` after its prefill fed by batches from a reset,
     /// held bit for bit to `steps`, the same set fed by our steps: the
-    /// prefill's argmax, the step's logits and its layer outputs.
+    /// prefill's argmax, the step's logits and its layer outputs. The open's
+    /// prompt group is the lever's default, which the seat runs (held to it
+    /// here); the set is fed at that group and again at groups of one, each
+    /// the steps' bits, so the 1,024-position set is one group of two
+    /// batches and the 4,096-position one four.
     fn batch_set(
         m: &mut Mimo2Model,
         (name, family): (&str, &Family),
@@ -590,28 +632,88 @@ mod gate {
                 f
             }
         };
-        m.reset()?;
-        let t = Instant::now();
-        let prefill_argmax = bloomery_gpu_mimo2::prefill(m, &prefill)?;
-        let fed_s = t.elapsed().as_secs_f64();
-        if let Some(b) = bloomery_gpu_mimo2::prompt_bytes(m)? {
-            println!(
-                "batch {name}: the batch's buffers take {} B over {} unit(s), and the card has {} B \
-                 free after them (runtime value)",
-                b.total, b.units, b.free
-            );
-        }
-        let (taps, logits) = run_last(m, tok)?;
-        let argmax_ok = prefill_argmax == steps.prefill_argmax;
-        let logits_ok = same_bits(&logits, &steps.logits);
-        let taps_ok = same_bits(&taps, &steps.taps);
-        let ok = argmax_ok && logits_ok && taps_ok;
+        let default = usize::try_from(bloomery_levers::PREFILL_GROUP_DEFAULT)?;
+        let held = prefill_group(m)?;
+        let mut ok = held == default;
         println!(
-            "batch {name}: position {pos} after {} fed by batches ({fed_s:.1} s, runtime value); \
-             the prefill's argmax {prefill_argmax} (steps {}); logits bit for bit {logits_ok}; \
-             layer outputs bit for bit {taps_ok} {}",
-            prefill.len(),
-            steps.prefill_argmax,
+            "batch {name}: the open's prompt group is {held}, the lever's default {default} {}",
+            verdict(ok)
+        );
+        for g in [default, 1] {
+            set_prefill_group(m, g)?;
+            let (fed, fed_s) = fed_by_batches(m, &prefill, tok)?;
+            let units = prompt_bytes(m)?.map(|b| {
+                println!(
+                    "batch {name}: the batch's buffers take {} B over {} unit(s), and the card has \
+                     {} B free after them (runtime value)",
+                    b.total, b.units, b.free
+                );
+                b.units
+            });
+            let argmax_ok = fed.prefill_argmax == steps.prefill_argmax;
+            let logits_ok = same_bits(&fed.logits, &steps.logits);
+            let taps_ok = same_bits(&fed.taps, &steps.taps);
+            let units_ok = units.is_some_and(|u| u >= group_sets(g));
+            let arm_ok = argmax_ok && logits_ok && taps_ok && units_ok;
+            println!(
+                "batch {name}: position {pos} after {} fed by batches at groups of {g} ({fed_s:.1} \
+                 s, runtime value); the prefill's argmax {} (steps {}); logits bit for bit \
+                 {logits_ok}; layer outputs bit for bit {taps_ok}; units {units:?} hold the group \
+                 ({} at least) {units_ok} {}",
+                prefill.len(),
+                fed.prefill_argmax,
+                steps.prefill_argmax,
+                group_sets(g),
+                verdict(arm_ok)
+            );
+            ok &= arm_ok;
+        }
+        set_prefill_group(m, held)?;
+        Ok(ok)
+    }
+
+    /// Positions of (b)'s call of three batches: a group of three at groups
+    /// of two, where the call's lone last batch joins the group before it
+    /// (`runtime::prompt::groups`) — a call of 1,025 to 1,536 positions, cut
+    /// by `runtime::prompt::call_batches` at [`T_MAX`], on the path of every
+    /// prompt of an odd count of batches.
+    const JOIN_IDS: usize = 1300;
+
+    /// A call of [`JOIN_IDS`] ids of the 4,096-position set fed at groups of
+    /// two (one group of three batches) and at groups of one from a reset,
+    /// each followed by the step of the next id: the prefill's argmax, the
+    /// step's logits and its layer outputs bit for bit the same.
+    fn join_group(m: &mut Mimo2Model) -> Result<bool, GateError> {
+        let (_, _, _, ids, _) = set_open((D4096, &IK), None)?;
+        let end = u32::try_from(JOIN_IDS)?;
+        let cut = call_batches(0, end, &[end], T_MAX);
+        let walks = groups(cut.len(), 2);
+        let premise = cut.len() == 3 && walks.len() == 1 && walks[0].len() == 3;
+        println!(
+            "join: {JOIN_IDS} ids cut into {} batches, walked at groups of two as {} group(s) of \
+             {:?} batches {}",
+            cut.len(),
+            walks.len(),
+            walks.iter().map(|r| r.len()).collect::<Vec<_>>(),
+            verdict(premise)
+        );
+        let (prefix, tok) = (&ids[..JOIN_IDS], ids[JOIN_IDS]);
+        let held = prefill_group(m)?;
+        set_prefill_group(m, 1)?;
+        let (one, one_s) = fed_by_batches(m, prefix, tok)?;
+        set_prefill_group(m, 2)?;
+        let (two, two_s) = fed_by_batches(m, prefix, tok)?;
+        set_prefill_group(m, held)?;
+        let argmax_ok = one.prefill_argmax == two.prefill_argmax;
+        let logits_ok = same_bits(&one.logits, &two.logits);
+        let taps_ok = same_bits(&one.taps, &two.taps);
+        let ok = premise && argmax_ok && logits_ok && taps_ok;
+        println!(
+            "join: {JOIN_IDS} ids at groups of one ({one_s:.1} s) and of two ({two_s:.1} s, \
+             runtime value); the prefill's argmax {} ({}); logits bit for bit {logits_ok}; layer \
+             outputs bit for bit {taps_ok} {}",
+            two.prefill_argmax,
+            one.prefill_argmax,
             verdict(ok)
         );
         Ok(ok)
@@ -1575,6 +1677,9 @@ mod gate {
                 .into());
             }
             println!("batch feed ({}): {} ran", sets.name(), ran.join(" "));
+            let t = Instant::now();
+            ok &= join_group(m)?;
+            elapsed("(b) join", &t);
         }
         if only == Only::All {
             ok &= residency_off(s.model())?;

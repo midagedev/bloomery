@@ -1,0 +1,84 @@
+# Round mimog2's card: MiMo-V2.6-Flash MXFP4 prompt at the serving defaults on plan (a), the A6000 alone, with the prompt
+# group the row's default (2: two batches in flight, the seat's) against groups of one (BLOOMERY_PREFILL_GROUP=1), one
+# binary, both writing the same bits (gate_mimo2_e2e clause (b), both groups and a call of three batches).
+# Decomposition [derived, from promptcost's paper round and the gate logs of 2026-10-13]. A prompt of P ids is cut into
+# ceil(P / 512) near-equal batches (runtime::prompt::batches, T_MAX 512), each walked layer by layer: 47 routed layers
+# (layer 0 is dense), 256 experts a layer. promptcost's run, 5,620 ids = 11 batches, 53.9 s to the first token (104 tok/s),
+# is 517 layer-batches x 102.4 ms + 0.96 s fixed (the dense layer, the head, the uploads) [derived: 11 x 47 = 517;
+# 53.9 - 517 x 0.1024 = 0.96]. Per layer-batch the resources are, in ms (promptcost's figures):
+#   host cores  the routed-expert union 66..75: 229.5 host experts a layer at 13.37 MB (3 x 4,096 x 2,048 x 17/32) is
+#               3.08 GB, so 41..47 GB/s, a third of the 130..145 GB/s the decode leg reads (docs/cards/mimo2-r5.card):
+#               compute-bound on the MXFP4 tile, not DRAM-bound [derived]
+#   host DRAM   3.08 GB at ~140 GB/s = ~22 busy, under the union
+#   card SMs    the attention front 27..35 (the card experts' shadow runs under the union)
+#   PCIe        8.4 MB rows down + 8.4 MB sums up + 33 KB ids and weights at 12..26 GB/s: 0.65..1.4 in all
+#   NVMe        0 (the host set is resident, plan (a) has no tier)
+# Group of one: the walk is serial (front, download, union, upload and back), so the wall is the SUM, 27..35 + 66..75 + ~1
+# = 94..111, the 102.4 measured. Group of two: layer-batch x's host serve runs under layer-batch x+1's card front
+# (runtime::sched's batch order), so the wall is the MAX, the union, plus the join's exposed upload and back, e <= 3 ms: the
+# card front, 27..35 ms, is under the host's shadow and worth 0 after this flow change. The flow lever (asynchrony across two
+# batches) comes before any term is shortened: the front's GEMM lift or a faster front would predict 0 at group 2, and the
+# union's tile rate is the bound that remains (a bulk union over a group's batches does not cut a compute-bound term).
+# At P = 4096: 8 batches, 4 groups of 2, 376 layer-batches. Group of one 376 x 102.4 + 0.96 = 39.5 s, pp 103.7 tok/s.
+# Group of two 376 x (66..75) + 0.96 = 25.8..29.2 s, pp 140..159, centre 150: effect (g2 - g1)/g1 = +35..+53 %. The
+# lead's band, pp 142..158 against 104, is +37..+52 % and sits inside it (a union of 66.3..74.1 ms, e = 0); it is the card's.
+# Its wall is -27..-34 % (-26..-35 % on the arithmetic above); the spec's "-28..-38 %" does not convert from its own pp band. The first token at 5,620 ids (517 layer-batches): 517 x (66..75) + 0.96 = 35.1..39.7 s
+# against 53.9 s, the lead's 35.5..40; that is a second term, read only when the sitting raises DEPTH_SERVE_CTX to 5,760 for
+# every arm (the ids file must hold 5,620; the plan, and so the card experts, move by 27 experts of ~3,100 with 1,600
+# positions more of stores, under 1 %) and adds the D = 5620 arms: its rows are D = 5620's own table, never compared with
+# D = 4096's. A prompt of one batch (P <= 512) is one group of one: pp @ 512 predicts 0 and is not run.
+# The 102.4 ms split is not recorded: the MiMo seat does not act on BLOOMERY_STEP_STATS (it is not in its ACTS_ON, so the
+# server refuses it by name) and gpu-mimo2's prefill carries no prompt timing (GLM's pattern is set_prompt_stats /
+# take_prompt_stats with `stat prompt lb` and `stat prompt split`, whose fields union_ms, serve_ms, card_front_ms,
+# card_down_ms, card_shadow_ms, card_upload_ms and card_back_ms would carry it). The pair of rates reads both terms
+# instead: with r1 and r2 the pp of the two arms, lb_g = (4096 / r_g - 0.96) / 376 s a layer-batch, the union is ~lb_2 and
+# the front lb_1 - lb_2. The smallest addition for a recorded split: MiMo's set/take_prompt_stats beside the existing
+# `stat prompt` kinds, STEP_STATS in the seat's ACTS_ON and the seat's `Seat::step_stats`; not built here.
+# One more risk, named: the MiMo plan reserves no card bytes for the prompt batch, so the default group's two extra units
+# come out of the card's margin. The unit is 2 x 512 x 4,096 x 4 + 2 x 512 x 4 = 16,781,312 B [derived: UnitBufs::planned],
+# so group 2 holds 2 units more than group 1: 33,562,624 B, against the batch's 316,919,808 B at group 1 (gate log
+# 2026-10-13, measured); the plan's own margin is 1,024 MiB (mimo2-r5.card). A load the card cannot hold refuses by name
+# with its free bytes. The two arms' `load` records are read for it: resident_bytes should differ by that 33,562,624 B.
+# Sitting [the lead's]: one lease, 3 rounds, two arms, six fresh servers. Per server DEPTH_SERVE_LOAD_EST 41 s (the lead's
+# figure; the gate logs of 2026-10-13 read 15.7..18.7 s to listening with the host set warm) + 5 s runner overhead + the
+# request: 39.5 s at group 1, 25.8..29.2 s at group 2. A round is 2 x 46 + 39.5 + 27.5 = 159 s with the 41 s load, 111 s
+# with a 17 s one: 3 rounds 5.5..8 min [derived], plus the recipe's own build of bloomery-serve in the tree (outside the
+# lease) and the host set's page cache warm (a row marked [cold] is void). Run BLOOMERY_DRY=1 on the exact command first.
+# GLM's priced term, for the same sitting [derived, not a card of its own: it takes the lease and so needs one]: the
+# stats run of promptcost, one ours arm at P = 4096, plan (b'), a process of WARMUP r0 and two rounds (the runner's
+# default), so three processes: each a load 51.9 s (the glm5next e2e-long gate's load at the gate plan, ctx 3,136, a proxy:
+# the batch log of 2026-10-13, not this plan's) + the prompt 4096 / 172 tok/s = 23.8 s (promptcost's bp rate at 5,548 ids)
+# + 2 decode steps + ~5 s runner overhead = ~81 s: three of them 4.1 min, 4..5 min with the host set's preheat. Command:
+#   BLOOMERY_REMOTE='~/repo/bloomery-<tree>' BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_TIMING_CARDS=a6000+3090
+#   BLOOMERY_GEN_PLACE=bp BLOOMERY_DECODE_N=3 BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/<its>.card'
+#   just depth-gpu-glm5next 4096
+# Its records are GLM's `stat prompt lb` (per layer-batch) and `stat prompt split` (summed) with the fields above.
+kind: ab
+question: does MiMo-V2.6-Flash's prompt at 4,096 ids run faster with two batches in flight (the row's default group) than
+  with groups of one, by the card front the host union's shadow now hides?
+term: pp tok/s @ P = 4096 prose ids (first 4,096 of the model's corpus-prose.ids), n_predict 2, ctx 4160, plan (a), A6000
+  alone (the 3090 idle), bloomery-serve --model mimo2 at the serving defaults, group 2 (the lever unset) against
+  BLOOMERY_PREFILL_GROUP=1, same binary, paired by round: the runner's arm minus first arm, in percent
+unit: %
+predict: +37..+52
+rounds: 3
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, per-round pp ratios of two binaries' prompt windows, the larger of the two runs'
+  SD (carried from docs/cards/b1-pp.card, not re-derived for MiMo)
+condition: one lease, one binary from the tree bloomery-mimog2, the arms in this order, so the first is the base and + is the
+  default arm faster: BLOOMERY_REMOTE='~/repo/bloomery-mimog2' BLOOMERY_MODEL=mimo2 BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_BOX_ENV='DEPTH_SERVE_N=2 BLOOMERY_LEASE_CARD=docs/cards/m2-group2-pp.card' just depth-serve
+  env=BLOOMERY_PREFILL_GROUP=1:bloomery-mimog2:4096 bloomery-mimog2:4096. Each arm's server log (the runner's LOGDIR
+  r<k>-<label>-D4096.log) holds a `load` record with group=1 for the lever arm and group=2 for the bare arm, the same
+  `plan` record card_experts in both arms (the plan reserves nothing for the units); no refusal naming free bytes; a row
+  marked [cold], [cpu-busy] or [other-busy] is void; the witness blocks show no Xid; BLOOMERY_STEP_STATS is not set (the
+  seat refuses it)
+decide-in: group 2 pays as derived: the default stays; read lb_1 and lb_2 from the two rates and write the union and front
+  into the MiMo model table; the first token at 5.6K (the D = 5620 arms at DEPTH_SERVE_CTX 5760) goes in the README's MiMo
+  row; the next prompt term is the host union's tile rate (it is now the wall)
+decide-below: below +37 the host union runs slower with two batches in flight than alone (the enqueue thread shares the
+  cores) or the join exposes more than 3 ms: between +20 and +37 add MiMo's prompt timing (set/take_prompt_stats, STEP_STATS
+  in the seat) and read union_ms and card_back_ms per layer-batch at group 2 before the default is judged; below +20 or a
+  lower bound under +10 revert the default to 1 (the lever and the group path stay)
+decide-above: above +52 the front is larger than 35 ms or the group-of-one union under 66 ms: re-derive u and f from the two
+  rates (f = lb_1 - lb_2) before the front's GEMM lift opens, since the front is then the larger share and its lift has
+  a band of its own
