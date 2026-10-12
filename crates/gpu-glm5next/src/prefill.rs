@@ -773,12 +773,40 @@ fn check_call(m: &Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
 /// call is one residency pass ([`call`]); the steps feed is refused by name
 /// while a residency machine runs ([`refuse_steps_under_residency`]).
 pub fn feed(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
+    feed_as(m, ids, Pass::Own)
+}
+
+/// [`feed`], the batch call's residency pass opened as `pass` says.
+fn feed_as(m: &mut Glm5nextModel, ids: &[u32], pass: Pass) -> Result<u32, GpuError> {
     check_call(m, ids)?;
     match m.body(WHAT)?.prompt.mode {
-        PrefillMode::Batch => call(m, |m| prefill(m, ids)),
+        PrefillMode::Batch => pass.run(m, |m| prefill(m, ids)),
         PrefillMode::Steps => {
             super::refuse_steps_under_residency(m)?;
             prompt(m, ids)
+        }
+    }
+}
+
+/// Who opens a batch prompt call's residency pass: the call itself ([`call`]), or the caller that
+/// already opened it (`app::Session::prompt_media` runs [`MediaBody::prefill_media`] inside its
+/// own `call`). A second boundary inside an open pass is refused by the host tier, so exactly one
+/// of the two opens it.
+#[derive(Clone, Copy)]
+enum Pass {
+    Own,
+    Callers,
+}
+
+impl Pass {
+    fn run<T>(
+        self,
+        m: &mut Glm5nextModel,
+        run: impl FnOnce(&mut Glm5nextModel) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        match self {
+            Pass::Own => call(m, run),
+            Pass::Callers => run(m),
         }
     }
 }
@@ -1046,9 +1074,19 @@ pub fn prefill_media(
     ids: &[u32],
     spans: &[MediaSpan<'_>],
 ) -> Result<u32, GpuError> {
+    media_as(m, ids, spans, Pass::Own)
+}
+
+/// [`prefill_media`], the batch call's residency pass opened as `pass` says.
+fn media_as(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    spans: &[MediaSpan<'_>],
+    pass: Pass,
+) -> Result<u32, GpuError> {
     check_call(m, ids)?;
     if spans.is_empty() {
-        return feed(m, ids);
+        return feed_as(m, ids, pass);
     }
     let body = m.body(WHAT)?;
     let image = media_token(body.prompt.mode, body.prompt.media, spans.len()).map_err(shape)?;
@@ -1059,7 +1097,7 @@ pub fn prefill_media(
     }
     let rows = CallRows::new(m.pos(), n_embd, spans.iter().map(|s| (&s.at, s.rows)))
         .map_err(|r| shape(r.to_string()))?;
-    call(m, |m| prefill_units(m, ids, None, Some(&rows)))
+    pass.run(m, |m| prefill_units(m, ids, None, Some(&rows)))
 }
 
 impl MediaBody for Body {
@@ -1074,13 +1112,14 @@ impl MediaBody for Body {
         media_token(body.prompt.mode, body.prompt.media, spans).err()
     }
 
-    /// [`prefill_media`].
+    /// [`prefill_media`] inside the caller's residency pass (`app::Session::prompt_media`'s
+    /// `call`): it opens no boundary of its own.
     fn prefill_media(
         m: &mut Glm5nextModel,
         ids: &[u32],
         spans: &[MediaSpan<'_>],
     ) -> Result<u32, GpuError> {
-        prefill_media(m, ids, spans)
+        media_as(m, ids, spans, Pass::Callers)
     }
 }
 

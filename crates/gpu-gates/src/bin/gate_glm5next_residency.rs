@@ -78,6 +78,12 @@
 //!   byte (`dropped_bytes` 0: the churn pool stays in the host set for the
 //!   model's life) (mutant: the reset copies only the first seed expert
 //!   back).
+//! - `media` (an image prompt under the machine is one residency pass): a
+//!   call with one span of image positions through `Session::prompt_media`,
+//!   the serve seat's call, returns a token and a step after it is served;
+//!   the span's rows are any rows of the text width, the pass is the
+//!   contract (mutant: GLM's `MediaBody::prefill_media` opens its own pass
+//!   inside the session's, `bloomery_gpu_glm5next::prefill_media`).
 //!
 //! On the NextN load, whose slot map is the host run and the next-token
 //! layer after it (every expert of that layer on the host):
@@ -170,6 +176,7 @@ mod gate {
     use app::{Loaded, OpenArgs, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::media::MediaSpan;
     use bloomery_gpu::host::swap::{Residency, SlotState, SwapMachine, SwapSource};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::{Residence, place_table};
@@ -177,9 +184,12 @@ mod gate {
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
-    use bloomery_gpu_glm5next::{Body, PrefillMode, checkpoint_price, feed, set_prefill};
+    use bloomery_gpu_glm5next::{
+        Body, PrefillMode, checkpoint_price, feed, set_prefill, set_prefill_media,
+    };
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8};
     use gguf::Split;
+    use refset::arch::glm5next::vis::PROFILE;
     use gguf::quant::GgmlType;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{
@@ -639,6 +649,52 @@ mod gate {
             verdict(named && served)
         );
         Ok(named && served)
+    }
+
+    /// `media` (module header): one image span through `Session::prompt_media`
+    /// under the machine, then a step; the image id set for the call and
+    /// taken back after it.
+    fn media_clause(
+        s: &mut Session<Body>,
+        ids: &[u32],
+        width: usize,
+    ) -> Result<bool, GateError> {
+        const SPAN: Range<usize> = 4..8;
+        // bf16 0.0625: the pass, not the rows' numbers, is the contract.
+        const ROW_BITS: u16 = 0x3d80;
+        s.clear()?;
+        set_prefill_media(s.model_mut(), Some(PROFILE.image_pad_id))?;
+        let mut call = ids[..12].to_vec();
+        call[SPAN].fill(PROFILE.image_pad_id);
+        let rows = vec![ROW_BITS; SPAN.len() * width];
+        let spans = [MediaSpan {
+            at: SPAN,
+            rows: &rows,
+        }];
+        let called = s
+            .prompt_media(&call, &spans, Want::Argmax)
+            .map(|o| o.argmax());
+        let stepped = match &called {
+            Ok(t) => s.step(*t, Want::Argmax).map(|o| o.argmax()),
+            Err(e) => Err(SessionError::Refused(format!("no step after a failed call: {e}"))),
+        };
+        let unset = set_prefill_media(s.model_mut(), None);
+        let pass = called.is_ok() && stepped.is_ok() && unset.is_ok();
+        let said = |r: &Result<u32, SessionError>| match r {
+            Ok(t) => format!("token {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        println!(
+            "media: under the machine, {} ids with {} image positions through \
+             Session::prompt_media: {}; a step after it: {}; the image id taken back: {}: {}",
+            call.len(),
+            SPAN.len(),
+            said(&called),
+            said(&stepped),
+            verdict(unset.is_ok()),
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// The residency views of `s`'s body ([`Residence`]): its stage card's
@@ -1336,6 +1392,8 @@ mod gate {
         record::residency_reset(&r).print();
         tier::sc("c7: a residency reset brings every live set back to its seed")?;
         pass &= crate::residency_clauses::c7_clause(&r, machine_of(&s)?, &seeds);
+        tier::sc("media: an image prompt under the machine is one residency pass")?;
+        pass &= media_clause(&mut s, &ids, inputs.hp.n_embd)?;
         drop(s);
 
         pass &= held("static", static_clause(&path, &machine, &levers, &probe));
