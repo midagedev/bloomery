@@ -53,6 +53,7 @@ use crate::gated_quant::GateLayout;
 use crate::gemm::{
     GEMM_BN, GEMM_MAX_SLOTS, GEMM32_STEP, Gemm32Kernels, GemmAct, GemmAct32, GemmInput, GemmRoute,
 };
+use crate::host::xstream::RingLayer;
 use crate::hybrid::HOST;
 use crate::kquant::Act;
 use crate::linear::{self, LinearShape};
@@ -63,7 +64,9 @@ use crate::site::{self, Gated, GatedIo, SiteWeight, SwigluRows, WideIn, WideKern
 use crate::tensor::{DeviceTensor, WindowMut};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
-use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
+use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
 
 /// The most rows an op runs through its gemv arm — ik's matrix-vector cut
 /// (`ne[1] <= 8`), and the rows of a captured pass. Past it, the wide arm.
@@ -1399,6 +1402,47 @@ pub(super) struct RingStacks<'a> {
     pub(super) gate: &'a DeviceTensor<u32>,
     pub(super) up: &'a DeviceTensor<u32>,
     pub(super) down: &'a DeviceTensor<u32>,
+}
+
+/// Layer `r`'s stream on the card for the length of `f`: its union map of
+/// `n_expert` words, and its half's gate, up and down ([`RingStacks`]),
+/// `half_slots` experts of `rows[p]` rows of `cols[p]` words in each part
+/// `p`; the windows are given back after `f` on every path.
+pub(super) fn with_ring_windows<T>(
+    r: &RingLayer,
+    ctx: &Arc<CudaContext>,
+    n_expert: usize,
+    rows: [usize; 3],
+    cols: [usize; 3],
+    f: impl FnOnce(&DeviceBuffer<u32>, &RingStacks<'_>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    // SAFETY: the stream's union row is `n_expert` words of its mapped host
+    // rows, and its half holds `half_slots` experts of the layer's part bytes
+    // in each part from the half's first slot — its gate and up rows of the
+    // card stacks' words, its down rows likewise (`XStream::ring_layer`); all
+    // stay allocated while the stream lives, past `f`'s launches, and the
+    // windows are given back below.
+    let (union_map, gate, up, down) = unsafe {
+        (
+            crate::tensor::window::<u32>(r.union_map, n_expert, ctx),
+            DeviceTensor::<u32>::window(r.parts[0], r.half_slots * rows[0], cols[0], ctx),
+            DeviceTensor::<u32>::window(r.parts[1], r.half_slots * rows[1], cols[1], ctx),
+            DeviceTensor::<u32>::window(r.parts[2], r.half_slots * rows[2], cols[2], ctx),
+        )
+    };
+    let ran = f(
+        &union_map,
+        &RingStacks {
+            gate: &gate,
+            up: &up,
+            down: &down,
+        },
+    );
+    drop(ManuallyDrop::into_inner(union_map).into_raw_parts());
+    for w in [gate, up, down] {
+        DeviceTensor::release(w);
+    }
+    ran
 }
 
 /// The ring's part of the apart arm of [`ffn`] over `m` rows, after
