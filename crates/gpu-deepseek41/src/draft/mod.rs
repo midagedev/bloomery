@@ -76,7 +76,6 @@ pub mod block;
 pub mod head;
 pub mod kv;
 pub mod load;
-mod stage;
 
 use std::sync::Arc;
 
