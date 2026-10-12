@@ -79,12 +79,12 @@ mod qwen3moe;
 /// `clef` too). V4 and V4.1 files run one program and one planner.
 fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
     match arch {
-        Arch::Qwen3Moe => Some(&qwen3moe::ADAPTER),
-        Arch::Qwen35Moe => Some(&qwen35moe::ADAPTER),
-        Arch::Qwen4Exp => Some(&qwen38::ADAPTER),
-        Arch::Glm5Next => Some(&glm5next::ADAPTER),
-        Arch::MiMo2 => Some(&mimo2::ADAPTER),
-        Arch::Deepseek41 | Arch::Deepseek4 => Some(&deepseek41::ADAPTER),
+        Arch::Qwen3Moe => Some(&qwen3moe::Row),
+        Arch::Qwen35Moe => Some(&qwen35moe::Row),
+        Arch::Qwen4Exp => Some(&qwen38::Row),
+        Arch::Glm5Next => Some(&glm5next::Row),
+        Arch::MiMo2 => Some(&mimo2::Row),
+        Arch::Deepseek41 | Arch::Deepseek4 => Some(&deepseek41::Row),
         Arch::Qwen35 => None,
     }
 }
@@ -749,7 +749,7 @@ pub(super) fn run() -> Result<(), GateError> {
             per_call(family.sweep_secs, calls)
         );
     }
-    for (_, family) in families.iter() {
+    for family in families.values() {
         let name = family_name(family.who.program);
         let traps = trap_count(family.who.program, &family.swept);
         if traps == 0 {
@@ -1028,7 +1028,6 @@ fn rooms_of(
 fn budget(bytes: u64) -> PlanLevers {
     PlanLevers {
         card_budget_bytes: Some(bytes),
-        ..PlanLevers::default()
     }
 }
 
@@ -1261,10 +1260,10 @@ impl Sweep {
                 arm: &word,
                 room: "-",
             };
-            if !arm.whole {
-                if let Some(outcome) = &arm.unbudgeted {
-                    plan_line(out, self.who, &at, outcome, &stacks, &mut pick);
-                }
+            if !arm.whole
+                && let Some(outcome) = &arm.unbudgeted
+            {
+                plan_line(out, self.who, &at, outcome, &stacks, &mut pick);
             }
             let Some((_, rooms)) = self.seed.rooms.iter().find(|(word, _)| *word == arm.name)
             else {

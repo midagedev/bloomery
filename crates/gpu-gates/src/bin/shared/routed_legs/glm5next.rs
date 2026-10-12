@@ -52,9 +52,9 @@ const SERVE_PARALLEL: usize = 2;
 const NEED: usize = <Body as MtpBody>::VERIFY_ROWS + 1;
 
 /// The family's adapter, one row of the gate's dispatch.
-pub(super) struct ADAPTER;
+pub(super) struct Row;
 
-impl Adapter for ADAPTER {
+impl Adapter for Row {
     fn name(&self) -> &'static str {
         "glm5next"
     }

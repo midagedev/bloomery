@@ -32,9 +32,9 @@ use model::placement::{Machine, Plan, PlanLevers};
 const SERVE_PARALLEL: usize = 2;
 
 /// The family's adapter, one row of the gate's dispatch.
-pub(super) struct ADAPTER;
+pub(super) struct Row;
 
-impl Adapter for ADAPTER {
+impl Adapter for Row {
     fn name(&self) -> &'static str {
         "deepseek41"
     }

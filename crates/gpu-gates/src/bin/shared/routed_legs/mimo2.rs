@@ -46,9 +46,9 @@ const SLOTS: usize = 2;
 const LOADER: &str = "mimo2::swap::stacks";
 
 /// The family's adapter, one row of the gate's dispatch.
-pub(super) struct ADAPTER;
+pub(super) struct Row;
 
-impl Adapter for ADAPTER {
+impl Adapter for Row {
     fn name(&self) -> &'static str {
         "mimo2"
     }
