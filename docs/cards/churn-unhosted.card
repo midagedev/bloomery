@@ -1,7 +1,9 @@
 # Churn: an unset residency keeps its P when the unpaged churn pool does not fit the host, and the pool is unhosted (its
 # victims served from the file mapping, counted in rereads and unresident). Host-only rule (no kernel moved), so this is
-# the dispatch-path A/B AGENTS.md asks for, two builds: this tree's generate_qwen3moe against main f9706dbd's, the base
-# built with `just build-decode` in its own worktree and remote dir.
+# the dispatch-path A/B AGENTS.md asks for, two builds on one forced id stream: ours = train1013c's tip (churn and hostless
+# landed; <train1013c tip>), base = main at the forceids tip (train1013b's; <train1013b tip>). Each is a generate_qwen3moe built
+# with the depth recipe's own `cargo oxide build` line (`just build-decode` builds the CPU bloomery-decode, not this bin), the
+# base in its own worktree and remote dir (bloomery-churnbase), ours by the recipe in the tree that holds this card.
 #
 # [derived, corrected 2026-10-13 by churn4's code read] The term BLOOMERY_HOST_ROOM moves on an unsplit plan is
 # mem_left = host_available() - need (workstation.rs:22): headroom does not track HOST_ROOM there (placement.rs:3295 is
@@ -14,35 +16,55 @@
 # an unpaged (unsplit) plan. The base arm then climbs to the first P whose pool fits (about mid-p231..270-s1, or turns off
 # as pool_unhostable where none fits; both are the old rule), the change arm keeps mid-p0-s1 with the pool unhosted.
 #
-# The two arms CAN decode different text: both run residency at different P, a move decides whether an expert's rows run
-# on the card or the host, and the two sides sum in different orders, so the ids follow the moves (refill-decode.card's own
-# note on the r4d sitting). On a paged or churning plan the text sets the cost, so this card runs under the forced id
-# stream (forceids, the next train) or not at all as a ratio: without forceids the sitting is a structural check only --
-# the base arm's `residency unset` shows the climb, the change arm's shows pool_unhosted at P 0 with `residency pass`
-# moves landed and rereads + unresident > 0 -- and the tok/s ratio is not claimed.
+# Unforced, the two arms would decode different text: both run residency at different P, a move decides whether an expert's
+# rows run on the card or the host, and the two sides sum in different orders, so the ids follow the moves (refill-decode.card's
+# own note on the r4d sitting). BLOOMERY_FORCE_IDS=continue (commit 81564bb7, on main after train1013b; the runner expands it to
+# <corpus-prose.ids>:512 in each arm's list) removes that: both arms decode the corpus's next ids, so the text no longer sets
+# the cost and the tok/s ratio is claimed. [derived] The forced stream changes no term of the prediction below: the base arm's
+# climbed P, the change arm's P 0 with the pool unhosted, and the victim reads' price are properties of the plan and the file
+# mapping, not of the ids. predict stays +15..+50. Without the lever the sitting is the structural check it was: the base arm's
+# `residency unset` shows the climb, the change arm's pool_unhosted at P 0 with rereads + unresident > 0, and no ratio.
 #
 # [derived] #46 (a 64 GB host, RTX 5090, Qwen3.8 UD-Q4_K_XL): P 0 with the pool out decoded 99.0 tok/s against 54.4 at the
 # climbed P 114 (x1.82). The box's plan a holds about 58 % of the experts on the card (297/512) against #46's 24 %, so the
 # moves matter less, and BLOOMERY_CARD_DONTNEED's default drops the card segments' pages at load, so the change arm's first
 # victim reads come from NVMe (about 1.3 ms per 3.16 MB on the machine's thread): +15..+50 (churn.md, the advisor's band).
+# wall [derived]: warm-up (the first arm once: one load + 1024 tokens) + 6 rounds x (2 loads + base 1024 tokens + ours 1024 tokens) +
+#   the witness blocks (not measured). Loads 60..90 s an arm [assumption: pageddraft-decode.card's wall line; no batch log of this
+#   load's time is readable on the Mac]. The base's rate is the refill sitting's 42.21 tok/s (the 20 G shape, rig-log 10-12#refill-ab,
+#   via pageddraft-decode.card line 39), a different room, taken as the order of magnitude [assumption]: 1024 / 42.21 = 24.3 s; ours
+#   at +15..+50 % = 48.5..63.3 tok/s = 16.2..21.1 s. Round = 120..180 + 24.3 + 16.2..21.1 = 2.7..3.8 min; warm-up 1.3..1.9 min;
+#   total 18..25 min (the 6 rounds' 16..23 min). Outside the lease and the wall: the base's box build (one cargo oxide build, not
+#   measured) and the room's plan print (below).
+# ROOM: generate_qwen3moe has no --plan flag (grep of the forceids tree), so the lead reads need (the `cache` line) and churn_bytes
+#   (the `residency host` record) from the plan-only server print the fixture clause uses (gate_qwen38_serve.rs churn_unhosted: a plan
+#   at HOST_ROOM=1048576M), sets ROOM = need + churn_bytes / 2 in M units, and checks that the plan at ROOM prints unsplit, before the lease.
+# command (one line, from the Mac, in the tree at <train1013c tip> that holds this card; BLOOMERY_AB_ROUNDS rides the recipe, the
+#   runner's default is 4; BLOOMERY_BOX_ENV splits on spaces; the ratio line reads first arm / second arm = ours / base). Base build,
+#   before the lease, in a worktree at <train1013b tip> with BLOOMERY_REMOTE='~/repo/bloomery-churnbase':
+#   tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe'
+#   BLOOMERY_AB_ROUNDS=6 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/churn-unhosted.card BLOOMERY_DECODE_N=1024 BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' just depth-gpu-qwen4exp prose:512@BLOOMERY_DRAFT=off,BLOOMERY_FORCE_IDS=continue,BLOOMERY_HOST_ROOM=<ROOM> bin:/root/repo/bloomery-churnbase/target/release/generate_qwen3moe:prose:512@BLOOMERY_DRAFT=off,BLOOMERY_FORCE_IDS=continue,BLOOMERY_HOST_ROOM=<ROOM>
+#   Placeholders: <train1013b tip>, <train1013c tip>, <ROOM>.
 kind: ab
 question: does an unset residency that keeps P 0 with the churn pool unhosted decode faster than the same word raised to
   the first P whose hosted pool fits the plan's host headroom, on a plan a whose headroom takes the plan and not the pool?
 term: decode tok/s @ n=1024, prose 512 (the corpus's first 512 ids), A6000, plan a, BLOOMERY_RESIDENCY unset,
-  BLOOMERY_HOST_ROOM=40G, BLOOMERY_DRAFT=off, one slot; this tree's generate_qwen3moe against main f9706dbd's,
-  (ours - base) / base, paired by round
+  BLOOMERY_HOST_ROOM=<ROOM> (derived as above), BLOOMERY_DRAFT=off, one slot, BLOOMERY_FORCE_IDS=continue in both arms; ours
+  (train1013c's generate_qwen3moe) against base (train1013b's, a bin: arm), (ours - base) / base, paired by round
 unit: %
 predict: +15..+50
 rounds: 6
 sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair 1.056 ± 0.059 over 4 rounds (paired SD 3.7 %,
   / sqrt 2), as refill-decode.card; Qwen3.8's plain decode under the residency scatters past the 0.6 % default
-condition: forceids on in both arms (the same id stream; without it the run is the structural check above and no ratio is written); one lease; both builds with their Cargo.lock current; BLOOMERY_DECODE_N=1024 in BLOOMERY_BOX_ENV (the runner's
+condition: BLOOMERY_FORCE_IDS=continue in both arms' lists (the `[parse]` lines show the same `<corpus>:512` value) and the runner's
+  `tokens-differ rounds:` line reads 0 of 6, now required (without the lever the run is the structural check above and no ratio is
+  written); no [loop] tag; one lease; both builds with their Cargo.lock current; BLOOMERY_DECODE_N=1024 in BLOOMERY_BOX_ENV (the runner's
   `n=` field reads 1024 in both arms) and every arm a fresh process (BLOOMERY_AB_LOAD=arm), the order rotated each round,
   one warm-up round discarded (a `WARMUP r0` row in the log); no [cpu-busy], [other-busy] or [cold] row and no Xid in either
   witness. The base arm's `residency unset` record names a word mid-p<P>-s1 with P above 0 and the climb's why (the plan's
   room moves the word's pinned experts p0→p<P>); the change arm's names mid-p0-s1 with the pool not hosted, and its
   `residency host` record reads hosted=unhosted. The change arm's `residency pass` records sum unresident > 0 and
-  rereads > 0, and neither arm ends on an Unresident error. Same greedy tokens are not required (the word differs)
+  rereads > 0, and neither arm ends on an Unresident error. The same forced ids are required (the word differs, the text does not)
 decide-in: land the rule with its fixture batch and write the row to rig-log (decode tok/s both arms, the ratio and its
   interval, the base arm's P, the change arm's rereads and unresident sums and wait_us)
 decide-above: past +50 the climbed P cost more than the moves' share at plan a predicts: read the base arm's P and
