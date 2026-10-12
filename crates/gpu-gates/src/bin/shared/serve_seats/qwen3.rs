@@ -52,9 +52,9 @@
 //! plan with no host expert loads the whole model on the plan's card when the
 //! whole-fit verdict takes it; any other runs the step graph through the
 //! host tier (a plan with no host expert whose whole load does not fit runs
-//! it with nothing to serve) and every prompt as eager passes of up to eight
-//! ids (`app::Prompt for Body` takes passes at every length on a placed
-//! load), no pass captured.
+//! it with nothing to serve) and every prompt as eager units through the
+//! host tier's batch port (`app::Prompt for Body`: the wide units from
+//! `GEMM_FROM` rows on a placed load, passes below), no pass captured.
 //!
 //! With `--place` unset the model opens as `generate_qwen3moe` opens it,
 //! on `a`'s card, the largest visible card: the whole file while the

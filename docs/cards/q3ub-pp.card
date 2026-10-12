@@ -1,0 +1,28 @@
+# Round q3ub2 (Q3UB-R2): Qwen3-30B-A3B's placed prompt on the common wide arm in units of 512 rows
+# (auto) against the passes of up to 8 rows it ran before (pass), one binary. The values are the
+# design's (specs/common/q3ub/report.md section 3, [derived]): the pass path 103 tok/s at about
+# 5.6K ids, 77.7 ms a pass, host DRAM-bound at about 54 GB/s; a 512-row unit's host leg
+# 1.18-1.55 s over 48 layers (1,115 GFLOP at 0.72-0.95 TFLOP/s, its 10.55 GB of expert bytes
+# under it), the card's serial part 50-70 ms (P = 512) and 90-120 ms (P = 4096) a unit, PCIe
+# 16-34 ms; wall = their sum, one unit at a time. P = 512: about 370 tok/s, band 300-410; P = 4096:
+# about 355, band 290-395; both over 103: +191..+298 % and +182..+283 %. The one term derivation
+# cannot close is the host union's FLOP rate on this shape against Body35's (expected 1.0-1.25
+# times, which puts the value up to about 480).
+kind: ab
+question: does the placed prompt on the wide units (auto) run 2.9-4.0 times the pass path's
+  prompt tok/s on one binary, and which term moves it where it does not?
+term: pp tok/s @ P = 512 and 4096 (the prose ids), the 3060 host (12 GB), place a, Qwen3-30B-A3B
+  Q4_K_M at serving defaults - (auto - pass) / pass, paired by round, each length on its own
+unit: %
+predict: +182..+298
+rounds: 3
+condition: the pass arm and the auto arm are one binary and differ only in the prompt path
+  (--prefill pass, --prefill auto); they alternate in one lease, the order rotated every round,
+  each length a block of its own; the two arms load the same plan (card experts 2,451 on the
+  12 GB split, derived) and no row carries [cpu-busy] or [other-busy] or a majflt count
+decide-in: land q3ub2 as it is; the wide units carry the placed prompt, and the next lever is the
+  host experts streamed to the card (the design's split rule, 800-1,100 tok/s derived)
+decide-below: read the unit's host time over its FLOP with BLOOMERY_PROFILE=1 on the same
+  binary (the host union's rate on this shape is the term), before any stream work
+decide-above: the host union's rate per FLOP is above Body35's; re-derive the band from that rate
+  and move the stream round up

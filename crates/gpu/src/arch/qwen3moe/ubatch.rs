@@ -44,16 +44,21 @@
 //! router logits cut the tokens into blocks of 32 and the prefill flash into
 //! groups of eight, each guarding the last, and every other launch works per
 //! token or per slot.
+//!
+//! A placed load holds the wide arm's arena (`scratch::Arena`) at the placed
+//! units' rows instead ([`Ubatch::placed`]): its units run through the host
+//! tier's batch walk (`placed::BatchWalk`) over that arena, reading the same
+//! prompt image.
 
 use super::body::{Body, Kernels};
 use super::dispatch::embed_into;
 use super::experts::CombineArgs;
 pub use super::image::ImageWrite;
-use super::image::PromptImage;
+use super::image::{ImageWindows, PromptImage};
 use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
 use super::plan::{Form, MixerPlan};
 use super::router::RouterOut;
-use super::scratch::{Dims, KvPlanes, f32_view};
+use super::scratch::{Arena, Dims, KvPlanes, f32_view};
 use super::wide::{self, ActsMut, Neox128Rows};
 use crate::flash_gqa::HEAD;
 use crate::gemm::GemmAct32;
@@ -299,12 +304,36 @@ pub struct UbPrologue {
     pub last: Option<ImageWrite>,
 }
 
+/// Err unless `pos` is the image's position for the first of `tokens`.
+fn check_start(img: &PromptImage, tokens: &Range<usize>, pos: u32) -> Result<(), GpuError> {
+    let want = u32::try_from(tokens.start)
+        .ok()
+        .and_then(|s| img.pos0.checked_add(s));
+    if want != Some(pos) {
+        return Err(GpuError::state(
+            WHAT,
+            "the ubatch's first position is the image's position for its first token",
+        ));
+    }
+    Ok(())
+}
+
+/// The arena of the GEMM prefill: the whole-card load's own, or a placed
+/// load's units' (the wide arm's, `wide`).
+enum UbRows {
+    /// The whole-card GEMM prefill's arena.
+    Whole(Box<UbArena>),
+    /// A placed load's arena of the placed units' rows, which `placed`'s
+    /// batch walk runs over.
+    Placed(Box<Arena>),
+}
+
 /// The GEMM prefill's resident state: the arena and the prompt image (the
 /// prefill flash is the chain's, [`Kernels`]).
 pub(super) struct Ubatch {
-    a: UbArena,
+    a: UbRows,
     img: PromptImage,
-    /// The ubatch size `U`; the arena holds `min(U, ctx)` rows.
+    /// The ubatch size `U`; a whole-card arena holds `min(U, ctx)` rows.
     size: NonZeroUsize,
     /// The q8 blocks of 32 the arena holds ([`Q32`]), kept for a resize.
     q32: Q32,
@@ -322,10 +351,25 @@ impl Ubatch {
     ) -> Result<Ubatch, GpuError> {
         let size = ubatch_of(u)?;
         Ok(Ubatch {
-            a: UbArena::new(stream, d, u.min(d.ctx), q32)?,
+            a: UbRows::Whole(Box::new(UbArena::new(stream, d, u.min(d.ctx), q32)?)),
             img: PromptImage::new(stream, d.ctx, false)?,
             size,
             q32,
+        })
+    }
+
+    /// A placed load's state: the wide arena `arena` its walks run over (the
+    /// plan's count held, `placed::counted_arena`), ubatches of `u` tokens
+    /// (`1..=UBATCH`, else refused) and an image for a prompt as long as the
+    /// cache. Load-time only.
+    pub(super) fn placed(stream: &CudaStream, arena: Arena, u: usize) -> Result<Ubatch, GpuError> {
+        let size = ubatch_of(u)?;
+        let ctx = arena.dims.ctx;
+        Ok(Ubatch {
+            a: UbRows::Placed(Box::new(arena)),
+            img: PromptImage::new(stream, ctx, false)?,
+            size,
+            q32: Q32::default(),
         })
     }
 
@@ -337,11 +381,18 @@ impl Ubatch {
     /// Reallocate the arena for ubatches of up to `u` (`1..=UBATCH`, else
     /// refused) tokens. The new arena is allocated before the old one is
     /// freed, so a refusal or a failed allocation leaves the old size in
-    /// place. Load-time allocation.
+    /// place. Load-time allocation. A placed load's arena is the plan's
+    /// count and is refused by name.
     pub(super) fn resize(&mut self, stream: &CudaStream, u: usize) -> Result<(), GpuError> {
         let size = ubatch_of(u)?;
-        let d = self.a.dims;
-        self.a = UbArena::new(stream, d, u.min(d.ctx), self.q32)?;
+        let UbRows::Whole(a) = &self.a else {
+            return Err(GpuError::state(
+                WHAT,
+                "a whole-card load (a placed load's arena is the plan's count)",
+            ));
+        };
+        let d = a.dims;
+        self.a = UbRows::Whole(Box::new(UbArena::new(stream, d, u.min(d.ctx), self.q32)?));
         self.size = size;
         Ok(())
     }
@@ -359,14 +410,19 @@ impl Ubatch {
 
     /// Device bytes of the arena and the image.
     pub(super) fn bytes(&self) -> usize {
-        self.a.bytes() + self.img.bytes()
+        let arena = match &self.a {
+            UbRows::Whole(a) => a.bytes(),
+            UbRows::Placed(a) => a.bytes(),
+        };
+        arena + self.img.bytes()
     }
 
     /// Enqueue the ubatch of the image's `tokens`, standing at position `pos`
     /// (the image's position for its first token, else refused): the
     /// embedding rows with their positions and live key counts, the
     /// one-expert table, then every layer. The last layer's output rows stay
-    /// in the arena's `x`.
+    /// in the arena's `x`. A placed load's units run through its batch walk
+    /// ([`Ubatch::placed_unit`]); this is refused by name there.
     pub(super) fn enqueue(
         &mut self,
         c: &UbCtx<'_>,
@@ -374,25 +430,23 @@ impl Ubatch {
         tokens: Range<usize>,
         pos: u32,
     ) -> Result<(), GpuError> {
-        let t = tokens.len();
-        if t > self.a.rows {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("a ubatch of {t} tokens on a {}-row arena", self.a.rows),
-            ));
-        }
-        let want = u32::try_from(tokens.start)
-            .ok()
-            .and_then(|s| self.img.pos0.checked_add(s));
-        if want != Some(pos) {
+        let UbRows::Whole(a) = &mut self.a else {
             return Err(GpuError::state(
                 WHAT,
-                "the ubatch's first position is the image's position for its first token",
+                "a whole-card load (a placed load's units run through its batch walk)",
+            ));
+        };
+        let t = tokens.len();
+        if t > a.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a ubatch of {t} tokens on a {}-row arena", a.rows),
             ));
         }
+        check_start(&self.img, &tokens, pos)?;
         let win = self.img.windows(tokens)?;
         let io = win.io();
-        let (gpu, a) = (c.gpu, &mut self.a);
+        let gpu = c.gpu;
         let stream = gpu.stream();
         embed_into(gpu, c.w, c.k, &io, (&mut a.x, &mut a.pos, &mut a.n_keys))?;
         c.k.gemm
@@ -405,20 +459,47 @@ impl Ubatch {
         Ok(())
     }
 
+    /// A placed load's unit of the image's `tokens`, standing at position
+    /// `pos`: the arena the batch walk runs over and the unit's windows onto
+    /// the image. The unit's first position is the image's position for its
+    /// first token, else refused; a unit past the arena's rows, and a
+    /// whole-card load, are refused by name.
+    pub(super) fn placed_unit(
+        &mut self,
+        tokens: Range<usize>,
+        pos: u32,
+    ) -> Result<(&mut Arena, ImageWindows), GpuError> {
+        let UbRows::Placed(a) = &mut self.a else {
+            return Err(GpuError::state(WHAT, "a placed load's arena"));
+        };
+        let t = tokens.len();
+        if t > a.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a unit of {t} tokens on a {}-row arena", a.rows),
+            ));
+        }
+        check_start(&self.img, &tokens, pos)?;
+        let win = self.img.windows(tokens)?;
+        Ok((&mut **a, win))
+    }
+
     /// Row `t − 1` of the arena's residual: the last token's output after
     /// the last layer, the head's input.
     pub(super) fn last_row(&self, t: usize) -> Result<ManuallyDrop<DeviceBuffer<f32>>, GpuError> {
-        let h = self.a.dims.hidden;
-        if t == 0 || t > self.a.rows {
+        let (x, rows, h) = match &self.a {
+            UbRows::Whole(a) => (&a.x, a.rows, a.dims.hidden),
+            UbRows::Placed(a) => (&a.x, a.rows, a.dims.hidden),
+        };
+        if t == 0 || t > rows {
             return Err(GpuError::shape(
                 WHAT,
-                format!("row {t} of a {}-row arena", self.a.rows),
+                format!("row {t} of a {rows}-row arena"),
             ));
         }
-        // SAFETY: row t − 1 < rows spans `hidden` values inside `x`
-        // (rows · hidden), which stays in place while the window lives (one
-        // copy).
-        Ok(unsafe { f32_view(&self.a.x, (t - 1) * h, h) })
+        // SAFETY: row t − 1 < rows spans `hidden` values inside `x` (rows ·
+        // hidden), which stays in place while the window lives (one copy).
+        Ok(unsafe { f32_view(x, (t - 1) * h, h) })
     }
 }
 
