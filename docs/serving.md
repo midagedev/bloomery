@@ -118,9 +118,9 @@ on its plan line; no flag is needed (`--place a` asks for that split on any card
 
 **A plan that fits the card you have.** The load reads each card's free bytes and the host's available RAM
 before anything uploads; the expert share sizes to them, and a plan that cannot fit is refused by name with
-every term (dense, KV, context, scratch, margin) and the processes holding the card — before minutes of
-loading, not after. Inside a container the host's RAM is the smaller of `MemAvailable` and the cgroup's own
-memory limit (`docker run --memory`, a systemd scope's `MemoryMax`), read the same way.
+every term (dense, KV, context, scratch, margin, and what the load holds beside the plan) and the processes holding
+the card — before minutes of loading, not after. Inside a container the host's RAM is the smaller of `MemAvailable`
+and the cgroup's own memory limit (`docker run --memory`, a systemd scope's `MemoryMax`), read the same way.
 
 **When the host cannot hold its experts either.** A Qwen3.8, GLM-5.3 or V4.1 plan whose host need passes the
 host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file. The

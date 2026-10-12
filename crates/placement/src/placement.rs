@@ -174,7 +174,8 @@ impl Card {
 
     /// The card's floor under `dense` bytes of uploads and `kv` bytes of
     /// cache: those, its set-aside, and `past` — what the load keeps beside
-    /// them: a plan's margin, or a whole load's own arena and reserve
+    /// them: a plan's margin and what its caller holds beside the plan
+    /// (`plan_floor` sums those), or a whole load's own arena and reserve
     /// ([`WholeLoad::past_bytes`]). The one owner of that sum: the budget
     /// floor, the free floor and the whole fit ([`whole_need`]) all take it
     /// from here. `None` past u64 bytes.
@@ -1082,11 +1083,14 @@ pub enum PlacementError {
     /// ([`churn::ChurnPool`]), take more than the plan's host headroom.
     #[error("{0}")]
     ResidencyOverHost(Box<churn::OverHost>),
-    /// A card budget below what the card needs with no expert on it.
+    /// A card budget below what the card needs with no expert on it: the
+    /// floor counts what the caller holds beside the plan
+    /// ([`plan_routed_reserving`]) as the expert rule's budget does.
     #[error(
         "card {card}: budget {budget} B is below its floor {floor} B = dense {dense} B (the \
          allocator's granules) + KV {kv} B + context {context} B + scratch {scratch} B + \
-         reserves {reserves} B + margin {margin} B"
+         reserves {reserves} B + margin {margin} B + beside {beside} B (what the caller holds \
+         beside the plan)"
     )]
     CardBudgetFloor {
         card: String,
@@ -1098,11 +1102,13 @@ pub enum PlacementError {
         scratch: u64,
         reserves: u64,
         margin: u64,
+        beside: u64,
     },
     /// A card whose device another process holds: what it had free at plan
-    /// time is below the card's floor — the dense tensors, KV, set-aside and
-    /// margin, before any expert moved to the host. [`CardFreeFloor`]'s
-    /// terms, boxed to keep the error small.
+    /// time is below the card's floor — the dense tensors, KV, set-aside,
+    /// margin and what the caller holds beside the plan, before any expert
+    /// moved to the host. [`CardFreeFloor`]'s terms, boxed to keep the error
+    /// small.
     #[error("{}", .0.as_ref())]
     CardFreeFloor(Box<CardFreeFloor>),
 }
@@ -1117,7 +1123,8 @@ pub struct CardFreeFloor {
     pub free: u64,
     /// The card's usable bytes.
     pub usable: u64,
-    /// The dense trunk's floor: dense, KV, set-aside and margin summed.
+    /// The dense trunk's floor: dense, KV, set-aside, margin and what the
+    /// caller holds beside the plan summed.
     pub floor: u64,
     /// How far the floor passes the free bytes.
     pub over: u64,
@@ -1129,6 +1136,9 @@ pub struct CardFreeFloor {
     pub scratch: u64,
     pub reserves: u64,
     pub margin: u64,
+    /// What the caller holds beside the plan on the card
+    /// ([`plan_routed_reserving`]).
+    pub beside: u64,
     /// "" or " (held by …)", the census's holder list.
     pub held: String,
 }
@@ -1147,6 +1157,7 @@ impl fmt::Display for CardFreeFloor {
             scratch,
             reserves,
             margin,
+            beside,
             held,
         } = self;
         write!(
@@ -1154,8 +1165,9 @@ impl fmt::Display for CardFreeFloor {
             "card {card}: the device had {free} B free of its usable {usable} B at plan \
              time{held}, and the plan's dense trunk alone needs {floor} B = dense {dense} B (the \
              allocator's granules) + KV {kv} B + context {context} B + scratch {scratch} B + \
-             reserves {reserves} B + margin {margin} B, past the {free} B by {over} B: free the \
-             card, or plan a placement on a card with room"
+             reserves {reserves} B + margin {margin} B + beside {beside} B (what the caller holds \
+             beside the plan), past the {free} B by {over} B: free the card, or plan a placement \
+             on a card with room"
         )
     }
 }
@@ -1907,9 +1919,11 @@ pub fn plan_routed<'a>(
 /// [`plan_routed`] with `reserve` bytes of every card kept for what the
 /// caller plans beside this plan on the same card — an MTP draft's granules
 /// and store: the expert rule spreads within the card's budget less
-/// `reserve`, and nothing else on the card sees it. The plan's usable bytes,
-/// card budget, headroom and violations are its own; the caller checks the
-/// card's bound on the sum. On a unified machine the host's need counts it
+/// `reserve`, and so does the card's floor, so the floor a refusal names
+/// ([`PlacementError::CardBudgetFloor`], [`PlacementError::CardFreeFloor`])
+/// is the least budget that plans. Nothing else on the card sees it: the
+/// plan's usable bytes, card budget, headroom and violations are its own; the
+/// caller checks the card's bound on the sum. On a unified machine the host's need counts it
 /// in the cards' share of the pool ([`HostTotals::pool_card_bytes`]).
 pub fn plan_routed_reserving<'a>(
     model: &'a ModelTensors,
@@ -1948,9 +1962,9 @@ pub fn plan_host_routed<'a>(
 
 /// [`plan_host_routed`] with `reserve` bytes of every card kept for what the
 /// caller plans beside this plan on the same card, as
-/// [`plan_routed_reserving`] keeps them: no expert fill sees them here, and
-/// on a unified machine the host's need counts them in the cards' share of
-/// the pool ([`HostTotals::pool_card_bytes`]).
+/// [`plan_routed_reserving`] keeps them: no expert fill sees them here, the
+/// card's floor counts them, and on a unified machine the host's need counts
+/// them in the cards' share of the pool ([`HostTotals::pool_card_bytes`]).
 pub fn plan_host_routed_reserving<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -2191,15 +2205,17 @@ struct Fill<'m, 'r> {
     card_budget: Option<u64>,
     kv: u64,
     /// What the caller plans beside this plan on the card
-    /// ([`plan_routed_reserving`]).
+    /// ([`plan_routed_reserving`]): out of the expert budget, and in the
+    /// floor.
     reserve: u64,
 }
 
 impl Fill<'_, '_> {
     /// Fill `n_l` ([`spread`]) beside the counts `held` on other devices;
-    /// under a card budget, refuse a card whose floor passes it first, and
-    /// under a free reading below the card's usable bytes, refuse a card
-    /// whose floor passes what the device had free.
+    /// under a card budget, refuse a card whose floor — `reserve` among its
+    /// terms — passes it first, and under a free reading below the card's
+    /// usable bytes, refuse a card whose floor passes what the device had
+    /// free.
     fn run(&self, n_l: &mut [u64], held: &[u64]) -> Result<(), PlacementError> {
         let card = self.card;
         let format = self.routed.unwrap_or(CardFormat::of_routed);
@@ -2211,11 +2227,11 @@ impl Fill<'_, '_> {
             - i128::from(self.reserve);
         if let Some(b) = self.card_budget {
             let dense = footprint(card.granule_bytes, &uploads, n_l)?;
-            check_floor(card, b, dense, self.kv)?;
+            check_floor(card, b, dense, self.kv, self.reserve)?;
         }
         if let Some(free) = card.free_bytes.filter(|&f| f < card.usable_bytes) {
             let dense = footprint(card.granule_bytes, &uploads, n_l)?;
-            check_free_floor(card, free, dense, self.kv)?;
+            check_free_floor(card, free, dense, self.kv, self.reserve)?;
         }
         spread(n_l, held, self.eligible, self.model.experts, budget, |n| {
             footprint(card.granule_bytes, &uploads, n)
@@ -2223,13 +2239,33 @@ impl Fill<'_, '_> {
     }
 }
 
+/// `card`'s floor in a plan whose caller holds `beside` bytes of it beside
+/// the plan ([`Fill::reserve`]): [`Card::floor_bytes`] with the margin and
+/// those as its `past`. Both floor checks ([`check_floor`],
+/// [`check_free_floor`]) take it from here, so the floor they name is the
+/// least budget at which the expert rule's own budget (usable less KV,
+/// set-aside, margin and `beside`, in [`Fill::run`]) reaches the dense
+/// uploads. `None` past u64 bytes.
+fn plan_floor(card: &Card, dense: u64, kv: u64, beside: u64) -> Option<u64> {
+    card.margin_bytes
+        .checked_add(beside)
+        .and_then(|past| card.floor_bytes(dense, kv, past))
+}
+
 /// Refuse `card` under the card budget `budget` when its floor — the
 /// granules of its dense uploads `dense`, its KV `kv`, context, scratch,
-/// reserves and margin — passes the budget. A floor within a budget above the card's own
+/// reserves, margin and `beside`, what the caller holds beside the plan —
+/// passes the budget. A floor within a budget above the card's own
 /// usable bytes but past those shows up in [`Plan::violations`], as without
 /// a budget: the card, not the budget, is too small.
-fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), PlacementError> {
-    let floor = card.floor_bytes(dense, kv, card.margin_bytes);
+fn check_floor(
+    card: &Card,
+    budget: u64,
+    dense: u64,
+    kv: u64,
+    beside: u64,
+) -> Result<(), PlacementError> {
+    let floor = plan_floor(card, dense, kv, beside);
     match floor {
         Some(floor) if floor <= budget => Ok(()),
         _ => Err(PlacementError::CardBudgetFloor {
@@ -2242,6 +2278,7 @@ fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), Plac
             scratch: card.scratch_bytes,
             reserves: card.reserve_bytes(),
             margin: card.margin_bytes,
+            beside,
         }),
     }
 }
@@ -2252,11 +2289,15 @@ fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), Plac
 /// plan time: another process holds enough of it that no expert rule can save
 /// the plan, because the dense tensors alone do not fit. A floor within the
 /// free bytes of a card whose census read none plans as before.
-fn check_free_floor(card: &Card, free: u64, dense: u64, kv: u64) -> Result<(), PlacementError> {
+fn check_free_floor(
+    card: &Card,
+    free: u64,
+    dense: u64,
+    kv: u64,
+    beside: u64,
+) -> Result<(), PlacementError> {
     let context = card.context_bytes - card.context_in_free();
-    let floor = card
-        .floor_bytes(dense, kv, card.margin_bytes)
-        .map(|f| f - card.context_in_free());
+    let floor = plan_floor(card, dense, kv, beside).map(|f| f - card.context_in_free());
     match floor {
         Some(floor) if floor <= free => Ok(()),
         floor => Err(PlacementError::CardFreeFloor(Box::new(CardFreeFloor {
@@ -2271,6 +2312,7 @@ fn check_free_floor(card: &Card, free: u64, dense: u64, kv: u64) -> Result<(), P
             scratch: card.scratch_bytes,
             reserves: card.reserve_bytes(),
             margin: card.margin_bytes,
+            beside,
             held: card
                 .held_by
                 .map_or(String::new(), |h| format!(" (held by {h})")),
@@ -3966,6 +4008,186 @@ mod tests {
         let mut quiet = machine(HEAD);
         quiet.cards[0].held_by = None;
         plan_with(&model, &quiet, 4096, &NoKv, None).expect("a trunk at the free bytes");
+    }
+
+    /// A plan whose caller keeps `BESIDE` bytes of the card beside it
+    /// ([`plan_routed_reserving`]) names a budget floor that counts them, as
+    /// the expert rule's budget does: the floor is the least budget that
+    /// plans, so the plan at the floor leaves the margin and the reserve both
+    /// unspent (the caller's bound on the sum), and one byte under it is
+    /// refused naming that floor, whatever the card's own reserves, context,
+    /// scratch and margin are.
+    #[test]
+    fn the_budget_floor_counts_what_the_caller_holds_beside_the_plan() {
+        const CONTEXT: u64 = 1_000;
+        const SCRATCH: u64 = 2_000;
+        const MARGIN: u64 = 3_000;
+        const CARD_RESERVE: u64 = 4_000;
+        const BESIDE: u64 = 5_000;
+        let model = layered(3);
+        let machine = Machine {
+            cards: vec![Card {
+                context_bytes: CONTEXT,
+                scratch_bytes: SCRATCH,
+                margin_bytes: MARGIN,
+                reserves: vec![("draft".to_string(), CARD_RESERVE)],
+                ..bytes_card("stage", HEAD + 24 * EXPERT + 100_000, 0..3)
+            }],
+            tiers: Vec::new(),
+            host: host(),
+            unified: None,
+        };
+        let plan_at = |budget: u64, beside: u64| {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(budget),
+            };
+            plan_routed_reserving(
+                &model,
+                &machine,
+                4096,
+                &NoKv,
+                &levers,
+                CardFormat::of_routed,
+                beside,
+            )
+        };
+        let floor_of = |beside: u64| match plan_at(1, beside) {
+            Err(PlacementError::CardBudgetFloor { floor, .. }) => floor,
+            Err(e) => panic!("{e}, not CardBudgetFloor"),
+            Ok(_) => panic!("a budget of 1 B planned"),
+        };
+        let trunk = HEAD + CONTEXT + SCRATCH + CARD_RESERVE + MARGIN;
+        assert_eq!(floor_of(0), trunk, "a plan with nothing beside it");
+        let floor = floor_of(BESIDE);
+        let mut bad = Vec::new();
+        if floor != trunk + BESIDE {
+            bad.push(format!(
+                "the floor beside {BESIDE} B is {floor} B, not the trunk's {trunk} B plus them"
+            ));
+        }
+        match plan_at(floor, BESIDE) {
+            Ok(plan) => {
+                let card = &plan.cards[0];
+                let left = card.headroom_bytes - i128::from(MARGIN);
+                if left < i128::from(BESIDE) {
+                    bad.push(format!(
+                        "at the floor {floor} B the plan leaves {left} B past the margin, under \
+                         the {BESIDE} B beside it"
+                    ));
+                }
+                if card.experts != 0 || !plan.violations().is_empty() {
+                    bad.push(format!(
+                        "at the floor {floor} B: {} experts, violations {:?}",
+                        card.experts,
+                        plan.violations()
+                    ));
+                }
+            }
+            Err(e) => bad.push(format!("at the floor {floor} B: {e}")),
+        }
+        match plan_at(floor - 1, BESIDE) {
+            Err(e @ PlacementError::CardBudgetFloor { .. }) => {
+                let want = format!(
+                    "budget {} B is below its floor {floor} B = dense {HEAD} B (the allocator's \
+                     granules) + KV 0 B + context {CONTEXT} B + scratch {SCRATCH} B + reserves \
+                     {CARD_RESERVE} B + margin {MARGIN} B + beside {BESIDE} B (what the caller \
+                     holds beside the plan)",
+                    floor - 1
+                );
+                if !e.to_string().contains(&want) {
+                    bad.push(format!("one byte under the floor: {e}, not {want:?}"));
+                }
+            }
+            Err(e) => bad.push(format!("one byte under the floor {floor} B: {e}")),
+            Ok(_) => bad.push(format!("one byte under the floor {floor} B planned")),
+        }
+        // A reserve that takes the sum past u64 bytes is refused with the floor
+        // printed as u64::MAX, never wrapped.
+        match plan_at(u64::MAX, u64::MAX) {
+            Err(PlacementError::CardBudgetFloor { floor, beside, .. })
+                if (floor, beside) == (u64::MAX, u64::MAX) => {}
+            other => bad.push(format!("a reserve of u64::MAX: {:?}", other.map(|p| p.n_l))),
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// The free floor counts what the caller keeps beside the plan the same
+    /// way ([`the_budget_floor_counts_what_the_caller_holds_beside_the_plan`]):
+    /// a card whose device had its floor free plans with the margin and the
+    /// reserve both left, and one byte under it is refused naming that floor.
+    #[test]
+    fn the_free_floor_counts_what_the_caller_holds_beside_the_plan() {
+        const MARGIN: u64 = 3_000;
+        const BESIDE: u64 = 5_000;
+        let model = layered(3);
+        let context = workstation::CONTEXT;
+        let own = workstation::CONTEXT_SELF;
+        let usable = HEAD + 24 * EXPERT + context + 100_000;
+        let machine = |free: u64| Machine {
+            cards: vec![Card {
+                context_bytes: context,
+                margin_bytes: MARGIN,
+                free_bytes: Some(free),
+                ..bytes_card("held", usable, 0..3)
+            }],
+            tiers: Vec::new(),
+            host: host(),
+            unified: None,
+        };
+        let plan_at = |free: u64, beside: u64| {
+            plan_routed_reserving(
+                &model,
+                &machine(free),
+                4096,
+                &NoKv,
+                &PlanLevers::default(),
+                CardFormat::of_routed,
+                beside,
+            )
+            .map(|plan| (plan.cards[0].headroom_bytes, plan.cards[0].experts))
+        };
+        let floor_of = |beside: u64| match plan_at(1, beside) {
+            Err(PlacementError::CardFreeFloor(terms)) => terms.floor,
+            Err(e) => panic!("{e}, not CardFreeFloor"),
+            Ok(_) => panic!("a reading of 1 B planned"),
+        };
+        let trunk = HEAD + context - own + MARGIN;
+        assert_eq!(floor_of(0), trunk, "a plan with nothing beside it");
+        let floor = floor_of(BESIDE);
+        let mut bad = Vec::new();
+        if floor != trunk + BESIDE {
+            bad.push(format!(
+                "the floor beside {BESIDE} B is {floor} B, not the trunk's {trunk} B plus them"
+            ));
+        }
+        match plan_at(floor, BESIDE) {
+            Ok((headroom, experts)) => {
+                let left = headroom - i128::from(MARGIN);
+                if left < i128::from(BESIDE) || experts != 0 {
+                    bad.push(format!(
+                        "at the floor {floor} B the plan leaves {left} B past the margin, under \
+                         the {BESIDE} B beside it, and keeps {experts} experts"
+                    ));
+                }
+            }
+            Err(e) => bad.push(format!("at the floor {floor} B: {e}")),
+        }
+        match plan_at(floor - 1, BESIDE) {
+            Err(PlacementError::CardFreeFloor(terms)) => {
+                if (terms.free, terms.floor, terms.beside) != (floor - 1, floor, BESIDE) {
+                    bad.push(format!("one byte under the floor {floor} B: {terms:?}"));
+                }
+                let want = format!(
+                    "+ margin {MARGIN} B + beside {BESIDE} B (what the caller holds beside the plan)"
+                );
+                if !terms.to_string().contains(&want) {
+                    bad.push(format!("one byte under the floor: {terms}, not {want:?}"));
+                }
+            }
+            Err(e) => bad.push(format!("one byte under the floor {floor} B: {e}")),
+            Ok(_) => bad.push(format!("one byte under the floor {floor} B planned")),
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
     }
 
     /// The whole fit counts what the whole load asks for: every tensor's

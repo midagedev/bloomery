@@ -3,7 +3,7 @@
 //! `generate_glm5next` on the same card, as one process under the GPU gate
 //! lock.
 //!
-//!     gate_glm5next_serve --arm plain|drafted|slots|unset|prefix --dir <out>
+//!     gate_glm5next_serve --arm plain|drafted|slots|unset|prefix|second-slot --dir <out>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
 //! 127.0.0.1 --port 0 --place gate --ctx 2048 --slot-save-path /tmp
@@ -20,8 +20,9 @@
 //! as two processes, each under its own bound. `slots` runs the drafted
 //! arm's (s5) alone — its server and clauses, nothing else — for a run of
 //! those clauses by name; the recipe runs them inside `drafted`. `unset`
-//! runs the plain arm's last server alone the same way, and `prefix` the plain
-//! arm's first server with the shared-prefix clause alone.
+//! runs the plain arm's last server alone the same way, `prefix` the plain
+//! arm's first server with the shared-prefix clause alone and `second-slot`
+//! the plain arm's `--plan` runs on the default's second slot alone.
 //!
 //! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after four runs of
 //! the seat with both levers unset and `--plan`, which print the unset rule's
@@ -49,6 +50,28 @@
 //!   (`ctx_paged_default_grows_within_the_bound`): the line's `nvme_bound`
 //!   is above 0 and a hundredth of its base NVMe bytes, its rule word is not
 //!   `base`, and it pages more than the base and at most a hundredth more;
+//!
+//! - `default_second_slot_never_costs_a_load` ([`second_slot`], five `--plan`
+//!   runs under `--place gate`, no load): a card budget at which the default's
+//!   two slots are refused and one slot is not. A slot's card bytes in the
+//!   plan are its stores at the context (the KDA layers' recurrent state
+//!   whole, a position of the attention layers') and the bytes beside them
+//!   (`PlanInputs::kv_term`); the plan stands from the budget its other terms
+//!   take plus the slots' own, so the least budget of two slots is one slot's
+//!   bytes past the least of one [derived]. Under a budget below every floor
+//!   `--parallel 2` and `--parallel 1` are refused with the floor of their
+//!   count (`PlacementError::CardBudgetFloor`, read by
+//!   `bind::budget_floor`): the least budget of two slots, `F2`, and of one,
+//!   `F1`. At `F2 - 1`: the default prints `parallel … slots=1 … from=fit`
+//!   with the line that says the second slot did not fit and exits 0, and
+//!   `--parallel 2` is refused with the words that line carries and prints no
+//!   such line (a set count is never lowered); at `F2` the default serves two
+//!   slots (`from=default`) and prints no such line. FAIL-first: a seat that
+//!   plans the default at two slots with no fall refuses the first half (the
+//!   mutant: the call to `bind::default_slots_fit` replaced by the plan at
+//!   the asked count). `second_slot_window_is_the_slots_bytes` holds the
+//!   derivation, from the same two floors: `F2 - F1` is `kv_term`'s second
+//!   slot.
 //!
 //! - the load prints `load draft=off (BLOOMERY_DRAFT=off)` and the word as a
 //!   `residency lever` record (`why=set`), no `residency host` and no verify
@@ -284,6 +307,7 @@ mod gate {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
+    use bloomery_gpu_gates::bind::budget_floor;
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
@@ -319,7 +343,7 @@ mod gate {
     ];
 
     const USAGE: &str =
-        "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix --dir <out>";
+        "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix|second-slot --dir <out>";
 
     /// The stores both engines size, the seat's floor and the CLI's default.
     const CTX: usize = 2048;
@@ -425,7 +449,9 @@ mod gate {
 
     /// The arms, one a process: `slots` is the drafted arm's (s5) alone,
     /// its server and clauses, which `drafted` runs too; `unset` is the plain
-    /// arm's last server alone ([`unset_load`]), which `plain` runs too.
+    /// arm's last server alone ([`unset_load`]), which `plain` runs too;
+    /// `second-slot` is the plain arm's `--plan` clauses on the second slot
+    /// alone ([`second_slot`]), which `plain` runs too.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Arm {
         Plain,
@@ -433,6 +459,7 @@ mod gate {
         Slots,
         Unset,
         Prefix,
+        SecondSlot,
     }
 
     impl Arm {
@@ -443,8 +470,9 @@ mod gate {
                 "slots" => Ok(Arm::Slots),
                 "unset" => Ok(Arm::Unset),
                 "prefix" => Ok(Arm::Prefix),
+                "second-slot" => Ok(Arm::SecondSlot),
                 other => Err(format!(
-                    "--arm is plain, drafted, slots, unset or prefix, not {other}"
+                    "--arm is plain, drafted, slots, unset, prefix or second-slot, not {other}"
                 )
                 .into()),
             }
@@ -1339,6 +1367,185 @@ mod gate {
             &mut ok,
             "ctx_paged_default_grows_within_the_bound",
             held == Some(true),
+        );
+        Ok(ok)
+    }
+
+    /// One `--plan` run of the seat on the gate card under `BLOOMERY_CARD_BUDGET`
+    /// `budget` and both unset levers, `flags` beside `--place gate`: it is
+    /// planned (exit 0, its `parallel` line printed) or refused (a non-zero
+    /// exit, no `parallel` line); any other ending is a named error, never a
+    /// refusal. The run's stderr goes to `<dir>/<name>.err`.
+    fn plan_under(
+        dir: &Path,
+        name: &str,
+        budget: usize,
+        flags: &[&str],
+    ) -> Result<(bool, Vec<String>), GateError> {
+        let exe = beside("bloomery-serve")?;
+        let err = dir.join(format!("{name}.err"));
+        let status = Command::new(&exe)
+            .args(["--model", "glm", "--place", "gate"])
+            .args(flags)
+            .arg("--plan")
+            .env_remove(bloomery_levers::DRAFT)
+            .env_remove(bloomery_levers::RESIDENCY)
+            .env(bloomery_levers::CARD_BUDGET, budget.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&err)?)
+            .status()
+            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
+        let lines = lines_from(&err, 0)?;
+        let printed = lines.iter().any(|l| l.starts_with("parallel rule="));
+        if status.success() != printed {
+            return Err(format!(
+                "--plan under {budget} B ({}) ended {status} and {} a `parallel` line: neither \
+                 planned nor refused; {}:\n{}",
+                flags.join(" "),
+                if printed { "printed" } else { "printed no" },
+                err.display(),
+                lines.join("\n")
+            )
+            .into());
+        }
+        Ok((status.success(), lines))
+    }
+
+    /// The `default_second_slot_never_costs_a_load` clause (module header),
+    /// five `--plan` runs of the seat on the gate card's plan under a card
+    /// budget, none of them a load.
+    ///
+    /// Under a budget below every floor, each count's refusal names its own
+    /// (`PlacementError::CardBudgetFloor`, read by [`budget_floor`]):
+    /// `--parallel 2`'s is the least budget of two slots, `F2`, and
+    /// `--parallel 1`'s that of one, `F1`; the seat's rule plans one position
+    /// first, and its refusal is that plan's. The default's window is the
+    /// budgets from `F1` to `F2 - 1`, where the second slot is the plan's
+    /// refusal and one slot stands. The runs at `F2 - 1` (the default, then
+    /// `--parallel 2`) and at `F2` (the default) hold it; a floor that is not
+    /// the plan's boundary turns them red, their lines printed. The window is
+    /// one slot's card bytes ([`PlanInputs::kv_term`] of two slots less one, at
+    /// the one position), which the second clause holds with no run of its
+    /// own: `F2 - F1` is those bytes.
+    fn second_slot(dir: &Path) -> Result<bool, GateError> {
+        // Every plan of the file is over this: a card's margin alone is a GiB.
+        const BELOW_ANY_FLOOR: usize = 256 << 20;
+        let own = dir.join("second-slot");
+        std::fs::create_dir_all(&own)?;
+        let planned_at =
+            |name: &str, budget: usize, flags: &[&str]| plan_under(&own, name, budget, flags);
+        // The floor the refusal of `flags` names under the budget below every
+        // floor.
+        let floor_of = |name: &str, flags: &[&str]| -> Result<usize, GateError> {
+            let (planned, lines) = planned_at(name, BELOW_ANY_FLOOR, flags)?;
+            let flags = flags.join(" ");
+            if planned {
+                return Err(format!(
+                    "--plan ({flags}) plans under {BELOW_ANY_FLOOR} B: the clause's budget is \
+                     over the file's floor"
+                )
+                .into());
+            }
+            budget_floor(&lines.join("\n"), BELOW_ANY_FLOOR as u64)
+                .and_then(|floor| usize::try_from(floor).ok())
+                .ok_or_else(|| -> GateError {
+                    format!(
+                        "--plan ({flags}) under {BELOW_ANY_FLOOR} B names no `budget \
+                         {BELOW_ANY_FLOOR} B is below its floor N B`; {name}'s stderr:\n{}",
+                        lines.join("\n")
+                    )
+                    .into()
+                })
+        };
+        let floor2 = floor_of("floor-2", &["--parallel", "2"])?;
+        let floor1 = floor_of("floor-1", &["--parallel", "1"])?;
+        let below = floor2.checked_sub(1).ok_or("a floor of 0 B")?;
+        let least = floor2;
+        println!(
+            "second slot: --parallel 2 names the floor {floor2} B and --parallel 1 {floor1} B \
+             under {BELOW_ANY_FLOOR} B"
+        );
+
+        const FALL: &str = "the default's second slot does not fit on --place gate (";
+        const FALL_END: &str = "); serving one slot";
+        let (fell, fell_lines) = planned_at("default-below", below, &[])?;
+        let (held, held_lines) = planned_at("parallel-2-below", below, &["--parallel", "2"])?;
+        let (two, two_lines) = planned_at("default-least", least, &[])?;
+        let (fell_text, held_text, two_text) = (
+            fell_lines.join("\n"),
+            held_lines.join("\n"),
+            two_lines.join("\n"),
+        );
+        // The slots and the `from` word of the one `parallel` line.
+        let counted = |lines: &[String]| {
+            lines
+                .iter()
+                .find(|l| l.starts_with("parallel rule="))
+                .map(|l| {
+                    (
+                        field(l, "slots").map(str::to_owned),
+                        field(l, "from").map(str::to_owned),
+                    )
+                })
+        };
+        let words = |slots: &str, from: &str| Some((Some(slots.to_owned()), Some(from.to_owned())));
+        let line = |lines: &[String]| {
+            lines
+                .iter()
+                .find(|l| l.starts_with("parallel rule="))
+                .cloned()
+        };
+        // What the fall line quotes of the second slot's refusal, which a
+        // set count prints on its own.
+        let refusal = fell_text.find(FALL).and_then(|at| {
+            let from = at + FALL.len();
+            fell_text
+                .get(from..)
+                .and_then(|rest| rest.find(FALL_END).map(|to| &rest[..to]))
+        });
+        println!(
+            "second slot: default under {below} B: planned {fell}, {:?}, refusal {refusal:?}",
+            line(&fell_lines)
+        );
+        println!(
+            "second slot: --parallel 2 under {below} B: planned {held}, says the fall {}",
+            held_text.contains(FALL)
+        );
+        println!(
+            "second slot: default under {least} B: planned {two}, {:?}, says the fall {}",
+            line(&two_lines),
+            two_text.contains(FALL)
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "default_second_slot_never_costs_a_load",
+            fell && counted(&fell_lines) == words("1", "fit")
+                && refusal.is_some_and(|r| {
+                    !r.is_empty() && !held && held_text.contains(r) && !held_text.contains(FALL)
+                })
+                && two
+                && counted(&two_lines) == words("2", "default")
+                && !two_text.contains(FALL),
+        );
+
+        // The window's derivation: one slot's card bytes.
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let layers = 0..inputs.model.layers;
+        let kv = |slots: usize| inputs.kv_term(layers.clone(), 1, KdaLanes::One, None, slots);
+        let slot_bytes = usize::try_from(kv(2)? - kv(1)?)?;
+        println!(
+            "second slot [derived]: a slot is {slot_bytes} B of card at one position; the floors \
+             are {floor1} B and {floor2} B, {} B apart",
+            floor2.abs_diff(floor1)
+        );
+        check(
+            &mut ok,
+            "second_slot_window_is_the_slots_bytes",
+            floor1 < floor2 && floor2 - floor1 == slot_bytes,
         );
         Ok(ok)
     }
@@ -2664,6 +2871,7 @@ mod gate {
     fn plain(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let mut ok = unset_rule(dir)?;
         ok &= ctx(dir, levers)?;
+        ok &= second_slot(dir)?;
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&SERVER_ARGS, dir, PLAIN)?;
         println!("plain server pid {}", served.child.id());
@@ -2982,6 +3190,7 @@ mod gate {
             Arm::Slots => slots_flow_together(&a.dir)?,
             Arm::Unset => unset_load(&a.dir)?,
             Arm::Prefix => prefix_alone(&a.dir)?,
+            Arm::SecondSlot => second_slot(&a.dir)?,
         };
         if ok {
             println!("gate-gpu-glm5next-serve: PASS");
