@@ -543,13 +543,29 @@ impl Hparams {
 }
 
 /// `nextn_predict_layers`, optional (:2301); believed only when the first
-/// next-token layer carries `nextn.eh_proj`, as ik does (:2302-2308).
+/// next-token layer carries `nextn.eh_proj`, as ik does (:2302-2308). This
+/// family's readers take every block past the trunk as a carried next-token
+/// layer (`n_layer - n_trunk`), so a file that stripped the layer's tensors is
+/// refused by name.
 fn nextn(
     split: &Split,
     n_layer: usize,
     defaults: &mut Vec<String>,
 ) -> Result<usize, PlacementError> {
-    nextn_layers(split, n_layer, ":2301", ":2302-2308", defaults)
+    let n = nextn_layers(split, n_layer, ":2301", ":2302-2308", defaults)?;
+    if n.past_trunk != n.carried {
+        return Err(metadata(
+            split,
+            "nextn_predict_layers",
+            format!(
+                "is {}, and blk.{} carries no tensor: a block past the trunk is a carried \
+                 next-token layer here",
+                n.past_trunk,
+                n_layer - n.past_trunk
+            ),
+        ));
+    }
+    Ok(n.carried)
 }
 
 /// The token-pool indexer's keys, required: a latent layer without the
@@ -921,7 +937,7 @@ pub(super) mod tests {
         );
         let bare: Vec<_> = tensors()
             .into_iter()
-            .filter(|n| !n.contains("nextn.eh_proj"))
+            .filter(|n| !n.contains("nextn."))
             .collect();
         let (n, defaults) = nextn("glm5next-nx-probe", &keys(), &bare);
         assert_eq!(n, 0);
@@ -930,6 +946,22 @@ pub(super) mod tests {
             [
                 "nextn_predict_layers = 0 (blk.4.nextn.eh_proj.weight is not in the file, :2302-2308)"
             ]
+        );
+    }
+
+    /// A declared next-token layer whose block holds no tensor is refused by
+    /// name: this family's readers take a block past the trunk as carried.
+    #[test]
+    fn a_stripped_next_token_layer_is_refused() {
+        let stripped: Vec<_> = tensors()
+            .into_iter()
+            .filter(|n| !n.starts_with("blk.4."))
+            .collect();
+        refused(
+            "glm5next-stripped",
+            &keys(),
+            &stripped,
+            "glm5next.nextn_predict_layers: is 1, and blk.4 carries no tensor",
         );
     }
 

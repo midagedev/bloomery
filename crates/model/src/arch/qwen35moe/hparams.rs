@@ -140,11 +140,15 @@ impl Ple {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hparams {
     pub variant: Variant,
-    /// `block_count`: the trunk's layers and the next-token layers after them.
+    /// `block_count`: the trunk's layers and the blocks after them, which
+    /// carry next-token tensors or, in a file that stripped them, none.
     pub n_layer: usize,
-    /// `block_count` less `nextn_predict_layers` (absent: 0): the layers the
-    /// description runs. [`Hparams::kinds`], [`Hparams::ffns`] and
-    /// [`Exp::ratios`] hold one value per trunk layer.
+    /// `block_count` less the declared next-token layers (`nextn_predict_layers`,
+    /// absent: 0) where the file carries them or stripped every tensor of
+    /// their blocks: the layers the description runs. `n_layer - n_trunk` is
+    /// not the layers carried; a reader of next-token tensors finds them by
+    /// name. [`Hparams::kinds`], [`Hparams::ffns`] and [`Exp::ratios`] hold
+    /// one value per trunk layer.
     pub n_trunk: usize,
     /// `embedding_length`.
     pub n_embd: usize,
@@ -213,7 +217,8 @@ impl Hparams {
                 "llama-hparams.cpp:725,818",
                 "the probe of llama-hparams.cpp:1662-1666",
                 &mut defaults,
-            )?;
+            )?
+            .past_trunk;
         let n_embd = meta_usize(split, "embedding_length")?;
         let n_head = meta_usize(split, "attention.head_count")?;
         let n_head_kv = match optional_usize(split, "attention.head_count_kv")? {
@@ -1771,38 +1776,73 @@ pub(super) mod tests {
         }
     }
 
-    /// The owner of `nextn_predict_layers` (`arch::nextn_layers`): an absent
-    /// key and a declared count whose first next-token layer has no
-    /// `nextn.eh_proj` are each a recorded 0, and a count the tensors back is
-    /// believed.
+    /// The owner of `nextn_predict_layers` (`arch::nextn_layers`) as this
+    /// family's files meet it: an absent key and a declared count whose
+    /// blocks are trunk layers are each a recorded 0, a count the tensors back
+    /// is believed, and a count whose blocks hold no tensor is a stripped
+    /// layer past the trunk, none carried.
     #[test]
     fn a_declared_count_is_believed_only_where_its_probe_tensor_is() {
-        let read_n = |tag: &str, kv: &[(&str, V)], t: &[(String, Vec<u64>)], probe_note: &str| {
+        let read_n = |tag: &str,
+                      kv: &[(&str, V)],
+                      n_layer: usize,
+                      t: &[(String, Vec<u64>)],
+                      probe_note: &str| {
             let path = header_shaped(tag, "qwen35moe", kv, &[], t);
             let split = gguf::Split::open(&path).expect("the synthetic header opens");
             let mut defaults = Vec::new();
-            let n = crate::arch::nextn_layers(&split, 5, "absent", probe_note, &mut defaults);
+            let n = crate::arch::nextn_layers(&split, n_layer, "absent", probe_note, &mut defaults);
             let _ = std::fs::remove_file(&path);
-            (n.expect("a count below block_count"), defaults)
+            let n = n.expect("a count below block_count");
+            ((n.past_trunk, n.carried), defaults)
         };
         let kv = with_next_token_layer(qwen35moe_keys());
-        let (n, defaults) = read_n("q35n-pr-ok", &kv, &qwen35moe_next_token_layer(4), "");
-        assert_eq!((n, defaults.len()), (1, 0));
-        let (n, defaults) = read_n("q35n-pr-no", &kv, &qwen35moe_tensors(), "probe");
-        assert_eq!(n, 0);
+        let (n, defaults) = read_n("q35n-pr-ok", &kv, 5, &qwen35moe_next_token_layer(4), "");
+        assert_eq!((n, defaults.len()), ((1, 1), 0));
+        let (n, defaults) = read_n("q35n-pr-strip", &kv, 5, &qwen35moe_tensors(), "probe");
+        assert_eq!(n, (1, 0));
         assert_eq!(
             defaults,
-            ["nextn_predict_layers = 0 (blk.4.nextn.eh_proj.weight is not in the file, probe)"]
+            [
+                "nextn_predict_layers = 1 (blk.4 carries no tensor: a stripped next-token layer; the trunk is 4)"
+            ]
         );
-        let (_, defaults) = read_n("q35n-pr-nn", &kv, &qwen35moe_tensors(), "");
+        let kept = set(qwen35moe_keys(), "nextn_predict_layers", V::U32(1));
+        let (n, defaults) = read_n("q35n-pr-no", &kept, 4, &qwen35moe_tensors(), "probe");
+        assert_eq!(n, (0, 0));
         assert_eq!(
             defaults,
-            ["nextn_predict_layers = 0 (blk.4.nextn.eh_proj.weight is not in the file)"]
+            ["nextn_predict_layers = 0 (blk.3.nextn.eh_proj.weight is not in the file, probe)"]
         );
-        let kv = set(qwen35moe_keys(), "block_count", V::U32(5));
-        let (n, defaults) = read_n("q35n-pr-abs", &kv, &qwen35moe_tensors(), "");
-        assert_eq!(n, 0);
+        let (_, defaults) = read_n("q35n-pr-nn", &kept, 4, &qwen35moe_tensors(), "");
+        assert_eq!(
+            defaults,
+            ["nextn_predict_layers = 0 (blk.3.nextn.eh_proj.weight is not in the file)"]
+        );
+        let (n, defaults) = read_n(
+            "q35n-pr-abs",
+            &qwen35moe_keys(),
+            5,
+            &qwen35moe_tensors(),
+            "",
+        );
+        assert_eq!(n, (0, 0));
         assert_eq!(defaults, ["nextn_predict_layers = 0 (absent)"]);
+    }
+
+    /// A MiniCPM-V file's shape: `block_count` counts the declared next-token
+    /// layer and its block holds no tensor. The trunk is the blocks before it.
+    #[test]
+    fn a_stripped_next_token_layer_leaves_the_trunk_before_it() {
+        let kv = with_next_token_layer(qwen35moe_keys());
+        let hp = read("q35n-stripped", "qwen35moe", &kv, &qwen35moe_tensors())
+            .expect("a stripped next-token layer is no trunk layer");
+        assert_eq!((hp.n_layer, hp.n_trunk), (5, 4));
+        assert_eq!(hp.kinds, KINDS);
+        assert_eq!(
+            hp.defaults[0],
+            "nextn_predict_layers = 1 (blk.4 carries no tensor: a stripped next-token layer; the trunk is 4)"
+        );
     }
 
     /// A next-token stem is the next-token layer's alone: on a trunk layer, or

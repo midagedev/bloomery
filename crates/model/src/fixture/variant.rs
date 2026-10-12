@@ -210,8 +210,10 @@ fn layer_of(name: &str) -> Option<(usize, &str)> {
     Some((layer.parse().ok()?, rest))
 }
 
-/// The layers of `source` that carry `nextn.*` tensors.
-fn nextn_layers(source: &Split) -> BTreeSet<usize> {
+/// The layers of `source` that carry `nextn.*` tensors, whatever `nextn_predict_layers` says: the
+/// layers a trunk scope leaves out. `arch::nextn_layers` decides another fact, how many layers the
+/// header's count puts past the trunk.
+fn blocks_with_nextn_tensors(source: &Split) -> BTreeSet<usize> {
     source
         .iter_tensors()
         .filter_map(|(_, t)| layer_of(&t.name))
@@ -256,7 +258,7 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
             ),
         ));
     }
-    let nextn = nextn_layers(source);
+    let nextn = blocks_with_nextn_tensors(source);
     let mut out = Vec::new();
     for (role, to) in &row.map {
         let want = format!("{role}.weight");

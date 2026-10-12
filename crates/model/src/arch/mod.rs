@@ -248,24 +248,87 @@ fn meta_arr<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], Placement
         .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
 }
 
-/// The next-token layers a file carries, from `nextn_predict_layers`: the
-/// count, believed only when the first of them (`blk.{n_layer - n}`) carries
-/// `nextn.eh_proj`. Every default taken is recorded in `defaults`: an absent
-/// key (`absent_note`, the line that defaults it) and a declared count whose
-/// probe tensor is not in the file (`probe_note`, the line that probes it, or
-/// empty). A count that leaves no trunk layer is refused by name.
+/// What `nextn_predict_layers` settles about the blocks past the trunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NextnLayers {
+    /// The blocks of `block_count` that are no trunk layer: the trunk is
+    /// `block_count` less this. The declared count when the file carries the
+    /// layers or stripped them (their blocks hold no tensor), else 0.
+    past_trunk: usize,
+    /// The next-token layers the file carries tensors for: the declared count
+    /// only where `nextn.eh_proj` backs it, else 0. A reader of next-token
+    /// tensors takes this, never `past_trunk`.
+    carried: usize,
+}
+
+impl NextnLayers {
+    /// No block past the trunk.
+    const NONE: NextnLayers = NextnLayers {
+        past_trunk: 0,
+        carried: 0,
+    };
+}
+
+/// One block's tensors, counted for [`nextn_layers`].
+#[derive(Clone, Copy, Default)]
+struct BlockTensors {
+    /// Tensors named `blk.<this block>.*`.
+    all: usize,
+    /// Of them, the `nextn.*` ones.
+    nextn: usize,
+}
+
+/// The tensors of each block `first..end`, in one pass over the file's names.
+fn block_tensors(split: &Split, first: usize, end: usize) -> Vec<BlockTensors> {
+    let mut blocks = vec![BlockTensors::default(); end - first];
+    for (_, t) in split.iter_tensors() {
+        let Some((block, stem)) = t
+            .name
+            .strip_prefix("blk.")
+            .and_then(|rest| rest.split_once('.'))
+        else {
+            continue;
+        };
+        let Some(b) = block
+            .parse::<usize>()
+            .ok()
+            .and_then(|l| l.checked_sub(first))
+            .and_then(|i| blocks.get_mut(i))
+        else {
+            continue;
+        };
+        b.all += 1;
+        b.nextn += usize::from(stem.starts_with("nextn."));
+    }
+    blocks
+}
+
+/// The blocks past the trunk and the next-token layers a file carries, from
+/// `nextn_predict_layers` (n) and the tensors of the blocks `n_layer - n ..
+/// n_layer`. Every default taken or shape read is recorded in `defaults`: an
+/// absent key (`absent_note`, the line that defaults it). Where the first of
+/// the blocks carries `nextn.eh_proj`, the count is believed. Where it does
+/// not, the blocks are read by their tensors:
+/// - none carries any tensor: a stripped next-token layer, the trunk is
+///   `n_layer - n` and none is carried;
+/// - each carries trunk tensors and none a `nextn.*` one: they are trunk
+///   layers under a kept key, the count is 0 (`probe_note`, the line that
+///   probes it, or empty);
+/// - any other mix is refused by name, listing each block's tensors.
+///
+/// A count that leaves no trunk layer is refused by name.
 fn nextn_layers(
     split: &Split,
     n_layer: usize,
     absent_note: &str,
     probe_note: &str,
     defaults: &mut Vec<String>,
-) -> Result<usize, PlacementError> {
+) -> Result<NextnLayers, PlacementError> {
     let key = "nextn_predict_layers";
     let n = match split.value(&split.arch_key(key)) {
         None => {
             defaults.push(format!("{key} = 0 ({absent_note})"));
-            return Ok(0);
+            return Ok(NextnLayers::NONE);
         }
         Some(_) => meta_usize(split, key)?,
     };
@@ -276,17 +339,54 @@ fn nextn_layers(
             format!("is {n}, not below block_count {n_layer}"),
         ));
     }
-    let probe = format!("blk.{}.nextn.eh_proj.weight", n_layer - n);
-    if n > 0 && split.find(&probe).is_none() {
+    if n == 0 {
+        return Ok(NextnLayers::NONE);
+    }
+    let first = n_layer - n;
+    let probe = format!("blk.{first}.nextn.eh_proj.weight");
+    if split.find(&probe).is_some() {
+        return Ok(NextnLayers {
+            past_trunk: n,
+            carried: n,
+        });
+    }
+    let blocks = block_tensors(split, first, n_layer);
+    if blocks.iter().all(|b| b.all == 0) {
+        let named = if n == 1 {
+            format!("blk.{first} carries")
+        } else {
+            format!("blk.{first}..blk.{} carry", n_layer - 1)
+        };
+        defaults.push(format!(
+            "{key} = {n} ({named} no tensor: a stripped next-token layer; the trunk is {first})"
+        ));
+        return Ok(NextnLayers {
+            past_trunk: n,
+            carried: 0,
+        });
+    }
+    if blocks.iter().all(|b| b.all > 0 && b.nextn == 0) {
         let note = if probe_note.is_empty() {
             String::new()
         } else {
             format!(", {probe_note}")
         };
         defaults.push(format!("{key} = 0 ({probe} is not in the file{note})"));
-        return Ok(0);
+        return Ok(NextnLayers::NONE);
     }
-    Ok(n)
+    let states: Vec<String> = (first..n_layer)
+        .zip(&blocks)
+        .map(|(l, b)| format!("blk.{l}: {} tensors, {} of them nextn.*", b.all, b.nextn))
+        .collect();
+    Err(metadata(
+        split,
+        key,
+        format!(
+            "is {n} and {probe} is not in the file, and its blocks are neither all empty (a \
+             stripped next-token layer) nor all trunk layers without nextn.* tensors: {}",
+            states.join("; ")
+        ),
+    ))
 }
 
 /// `tokenizer.ggml.pre`.
@@ -530,7 +630,8 @@ pub(crate) mod synthetic {
 
 #[cfg(test)]
 mod tests {
-    use super::Arch;
+    use super::synthetic::{V, header_shaped};
+    use super::{Arch, NextnLayers};
 
     #[test]
     fn known_names_round_trip() {
@@ -632,6 +733,148 @@ mod tests {
         assert!(
             err.to_string().contains("llama"),
             "the error must name the string the file held, got {err}"
+        );
+    }
+
+    /// `nextn_layers` on a header of `n_layer` blocks declaring `declared`
+    /// next-token layers and holding `tensors` (one value each): the result
+    /// or its error's text, and the defaults recorded.
+    fn nextn_of(
+        tag: &str,
+        n_layer: u32,
+        declared: u32,
+        tensors: &[&str],
+        probe_note: &str,
+    ) -> (Result<NextnLayers, String>, Vec<String>) {
+        let kv = [
+            ("block_count", V::U32(n_layer)),
+            ("nextn_predict_layers", V::U32(declared)),
+        ];
+        let t: Vec<(String, Vec<u64>)> = tensors
+            .iter()
+            .map(|n| ((*n).to_string(), vec![1]))
+            .collect();
+        let path = header_shaped(tag, "qwen35moe", &kv, &[], &t);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let mut defaults = Vec::new();
+        let got = super::nextn_layers(
+            &split,
+            n_layer as usize,
+            "absent",
+            probe_note,
+            &mut defaults,
+        )
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&path);
+        (got, defaults)
+    }
+
+    const TRUNK: [&str; 5] = [
+        "token_embd.weight",
+        "blk.0.attn_norm.weight",
+        "blk.1.attn_norm.weight",
+        "blk.2.attn_norm.weight",
+        "blk.3.attn_norm.weight",
+    ];
+
+    /// Shape A: `block_count` is the trunk and the declared layers, and those
+    /// blocks hold no tensor (MiniCPM-V 4.7's file). The trunk is the blocks
+    /// before them and no next-token layer is carried.
+    #[test]
+    fn a_declared_layer_stripped_of_every_tensor_is_no_trunk_layer() {
+        let (got, defaults) = nextn_of("nx-strip-1", 5, 1, &TRUNK, "probe");
+        assert_eq!(
+            got,
+            Ok(NextnLayers {
+                past_trunk: 1,
+                carried: 0
+            })
+        );
+        assert_eq!(
+            defaults,
+            [
+                "nextn_predict_layers = 1 (blk.4 carries no tensor: a stripped next-token layer; the trunk is 4)"
+            ]
+        );
+        let (got, defaults) = nextn_of("nx-strip-2", 6, 2, &TRUNK, "probe");
+        assert_eq!(
+            got,
+            Ok(NextnLayers {
+                past_trunk: 2,
+                carried: 0
+            })
+        );
+        assert_eq!(
+            defaults,
+            [
+                "nextn_predict_layers = 2 (blk.4..blk.5 carry no tensor: a stripped next-token layer; the trunk is 4)"
+            ]
+        );
+    }
+
+    /// Shape B: `block_count` is the trunk with the key kept, so the last
+    /// blocks are trunk layers; the recorded line is ik's probe line. A layer
+    /// backed by `nextn.eh_proj` is believed.
+    #[test]
+    fn a_kept_key_over_trunk_layers_records_the_probe_line() {
+        let (got, defaults) = nextn_of("nx-kept", 4, 1, &TRUNK, "probe");
+        assert_eq!(got, Ok(NextnLayers::NONE));
+        assert_eq!(
+            defaults,
+            ["nextn_predict_layers = 0 (blk.3.nextn.eh_proj.weight is not in the file, probe)"]
+        );
+        let (_, defaults) = nextn_of("nx-kept-bare", 4, 1, &TRUNK, "");
+        assert_eq!(
+            defaults,
+            ["nextn_predict_layers = 0 (blk.3.nextn.eh_proj.weight is not in the file)"]
+        );
+        let mut backed = TRUNK.to_vec();
+        backed.push("blk.4.nextn.eh_proj.weight");
+        let (got, defaults) = nextn_of("nx-backed", 5, 1, &backed, "probe");
+        assert_eq!(
+            got,
+            Ok(NextnLayers {
+                past_trunk: 1,
+                carried: 1
+            })
+        );
+        assert!(defaults.is_empty(), "{defaults:?}");
+    }
+
+    /// Blocks that are some empty and some not, or that carry `nextn.*`
+    /// without the first one's `eh_proj`, are refused with each block's state.
+    #[test]
+    fn mixed_next_token_blocks_are_refused_by_name() {
+        let with = |extra: &[&'static str]| {
+            let mut t = TRUNK.to_vec();
+            t.extend_from_slice(extra);
+            t
+        };
+        let refused = |tag: &str, n_layer: u32, declared: u32, t: &[&str], want: &str| {
+            let (got, _) = nextn_of(tag, n_layer, declared, t, "probe");
+            let err = got.expect_err("the blocks are not one shape");
+            assert!(err.contains(want), "want {want:?} in: {err}");
+        };
+        refused(
+            "nx-mix-late",
+            6,
+            2,
+            &with(&["blk.5.nextn.enorm.weight"]),
+            "blk.4: 0 tensors, 0 of them nextn.*; blk.5: 1 tensors, 1 of them nextn.*",
+        );
+        refused(
+            "nx-mix-empty-last",
+            6,
+            2,
+            &with(&["blk.4.attn_norm.weight"]),
+            "blk.4: 1 tensors, 0 of them nextn.*; blk.5: 0 tensors, 0 of them nextn.*",
+        );
+        refused(
+            "nx-mix-no-eh",
+            5,
+            1,
+            &with(&["blk.4.attn_norm.weight", "blk.4.nextn.enorm.weight"]),
+            "blk.4: 2 tensors, 1 of them nextn.*",
         );
     }
 }
