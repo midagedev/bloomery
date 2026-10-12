@@ -2829,6 +2829,25 @@ pub static VISION: Kind = Kind {
     ],
 };
 
+/// A serve seat's image encoder as the plan seats it, before any load (`vision_seat::seat_record`).
+pub static VISION_SEAT: Kind = Kind {
+    name: "vision_seat",
+    head: "vision_seat",
+    doc: "The image encoder as the plan seats it, printed with the plan under --mmproj: the card it sits on and whether that card is off the plan (reserve 0) or the stage card's reserve in bytes, the tower's weight and activation bytes the seat was sized from, and the most image tokens one image takes. seat=not-loaded is a projector the --hf repo picked that the plan drops because its reserve costs the text model: reserve is what it would have taken, cost_experts and cost_ctx what it would have cost (0 when loaded), why the kind of cost (plan-cost: card experts and context positions; whole-load: the load that fits whole on one card would be placed; plan-refused: the plan refuses the reserve, refusal its reason).",
+    parts: &[
+        key("card", Word, ""),
+        key("seat", Word, ""),
+        key("reserve", U64, "B"),
+        key("weights", U64, "B"),
+        key("scratch", U64, "B"),
+        key("cap", U64, "tokens"),
+        key("cost_experts", U64, "experts"),
+        key("cost_ctx", U64, "positions"),
+        opt("why", Word, ""),
+        opt("refusal", Text, ""),
+    ],
+};
+
 /// The server's prompt cache: its budget, the host headroom it was derived
 /// from, and the token a prompt call is cut at.
 pub static CACHE_CONFIG: Kind = Kind {
@@ -3066,6 +3085,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,
+    &VISION_SEAT,
     &VISION,
     &LISTENING,
     &CACHE_REUSE,
@@ -3114,8 +3134,9 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf`
 /// fetch's lines (printed by the server before the seat registers), the
-/// load, the image encoder's after it under `--mmproj`, the address and each
-/// request's note of the prefix it kept none of.
+/// load, the image encoder's seat with the plan and its record after the load
+/// under `--mmproj`, the address and each request's note of the prefix it kept
+/// none of.
 pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
     &PLACE_UNSET,
     &PLAN38,
@@ -3125,6 +3146,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
     &HF_PROGRESS,
     &HF_DONE,
     &LOAD_QWEN3,
+    &VISION_SEAT,
     &VISION,
     &LISTENING_QWEN3,
     &CACHE_REUSE,
@@ -3180,6 +3202,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &LOAD_DRAFT_OFF_GLM,
     &CAPTURE,
     &CAPTURE_PAIR,
+    &VISION_SEAT,
     &LISTENING_GLM,
     &CACHE_REUSE,
     &MTP_PROMPT,

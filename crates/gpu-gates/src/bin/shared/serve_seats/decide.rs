@@ -48,9 +48,10 @@
 //! and held against the backbone's embedding width, vocabulary and rope before
 //! any load ([`vision_seat::Projector`]), the tower is seated
 //! ([`vision_seat::encoder_seat`]: a card off the plan, else a reserve on the
-//! backbone's card that the backbone's whole-fit verdict counts), the backbone
-//! opens with sequences that take a media call, and the tower loads after it:
-//! the `vision` record follows. A request with images then runs the tower,
+//! backbone's card that the backbone's whole-fit verdict counts; the
+//! `vision_seat` record names the seat), the backbone opens with sequences
+//! that take a media call, and the tower loads after it: the `vision` record
+//! follows. A request with images then runs the tower,
 //! reads its rows back and runs the backbone's media call
 //! ([`Backbone::hidden_media`]); a request with none runs the text call, as
 //! on a server with no encoder. `--mmproj` or an image limit beside a row that
@@ -97,6 +98,7 @@ static KINDS: &[&Kind] = &[
     &record::HF_FILE,
     &record::HF_PROGRESS,
     &record::HF_DONE,
+    &record::VISION_SEAT,
     &record::VISION,
     &record::LISTENING_DECIDE,
 ];
@@ -264,7 +266,7 @@ impl Backbone {
     /// The model's image input, by which a request's images are prepared and laid out in its
     /// ids; `None` on a server with no encoder.
     pub fn media(&self) -> Option<&dyn MediaModel> {
-        self.vision.as_ref().map(image::Vision::media)
+        self.vision.as_ref().map(image::Vision::media_ref)
     }
 
     /// [`Backbone::hidden`] of `ids` whose image spans `images` place: each image encoded on the
@@ -281,8 +283,12 @@ impl Backbone {
             .ok_or("an image request on a server with no encoder (--mmproj)")?;
         self.body.reset()?;
         let t = Instant::now();
-        let vision_seat::SpanRows { rows, ats, .. } =
-            tower.span_rows(self.body.context(), images)?;
+        let vision_seat::SpanRows { rows, ats, .. } = tower.merged_rows(
+            self.body.context(),
+            images
+                .iter()
+                .map(|i| vision_seat::Image::of(i.at, i.prepared)),
+        )?;
         let tower_ms = t.elapsed().as_secs_f64() * 1e3;
         // Each span borrows its own range of the call's one buffer of rows; its grid is the
         // image's merged-token plan (`vision::GridPlan::span_grid`).
@@ -304,80 +310,12 @@ impl Backbone {
 }
 
 /// The seat's image encoder: the encoder file opened and seated before the backbone loads
-/// ([`vision_seat::open_seat`], in [`open_image`]), its tower loaded after ([`image::Vision::open`]).
+/// ([`vision_seat::open_seat`], in [`open_image`]), its tower loaded after
+/// ([`vision_seat::Resident::open`]). The row width is the tower's: [`open_image`] holds the
+/// encoder's aligner rows to the backbone's embedding width.
 #[cfg(feature = "vision")]
 mod image {
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    use bloomery_gpu_gates::GateError;
-    use bloomery_gpu_gates::vision_seat::{self, Opened, ScratchHome, SharedMedia, SpanRows};
-    use cuda_core::{CudaContext, CudaStream};
-    use serve::media::MediaModel;
-
-    use super::Placed;
-
-    /// The tower of `--mmproj` on its seat's card: its readbacks' stream, and the width of a row.
-    pub struct Vision {
-        tower: Box<dyn bloomery_gpu_vision::Tower>,
-        stream: Arc<CudaStream>,
-        n_embd: usize,
-        media: SharedMedia,
-    }
-
-    impl Vision {
-        /// The tower of `at`'s file on its seat's card ([`vision_seat::open_tower`]), `model` (the
-        /// backbone's own context) bound back; the `vision` record names the card, the seat and the
-        /// bytes.
-        pub fn open(model: &CudaContext, at: &Opened, n_embd: usize) -> Result<Vision, GateError> {
-            let t = Instant::now();
-            let (stream, tower) = vision_seat::open_tower(model, at)?;
-            vision_seat::record(
-                &at.seat,
-                (tower.weight_bytes(), tower.scratch_bytes()),
-                ScratchHome::Own,
-                at.cap,
-                t.elapsed().as_secs_f64(),
-            )
-            .eprint();
-            Ok(Vision {
-                tower,
-                stream,
-                n_embd,
-                media: at.media.clone(),
-            })
-        }
-
-        /// The model's image input.
-        pub fn media(&self) -> &dyn MediaModel {
-            &*self.media
-        }
-
-        /// Every image encoded on the tower and read back as bf16, one row a cell of its grid
-        /// and nothing around them (the tokens carry the delimiters), in one pair of buffers
-        /// ([`vision_seat::span_rows`], [`vision_seat::merged_cells`]); the model's card (`model`)
-        /// bound back after.
-        pub fn span_rows(
-            &mut self,
-            model: &CudaContext,
-            images: &[Placed<'_>],
-        ) -> Result<SpanRows<()>, GateError> {
-            let n_embd = self.n_embd;
-            vision_seat::on_encoder_card(model, || {
-                vision_seat::span_rows(
-                    &mut *self.tower,
-                    &self.stream,
-                    images.iter().map(|i| vision_seat::Image {
-                        at: i.at,
-                        patches: &i.prepared.patches,
-                        span_len: i.prepared.span_len,
-                    }),
-                    n_embd,
-                    vision_seat::merged_cells,
-                )
-            })
-        }
-    }
+    pub use bloomery_gpu_gates::vision_seat::Resident as Vision;
 }
 
 /// The seat of a build with no `vision` feature: no tower is ever loaded ([`open_image`] refuses
@@ -385,27 +323,31 @@ mod image {
 #[cfg(not(feature = "vision"))]
 mod image {
     use bloomery_gpu_gates::GateError;
-    use bloomery_gpu_gates::vision_seat::{Opened, SpanRows};
+    use std::time::Instant;
+
+    use bloomery_gpu_gates::vision_seat::{Image, Opened, ScratchHome, SpanRows};
     use cuda_core::CudaContext;
     use serve::media::MediaModel;
-
-    use super::Placed;
 
     pub enum Vision {}
 
     impl Vision {
-        pub fn open(_: &CudaContext, _: &Opened, _: usize) -> Result<Vision, GateError> {
+        pub fn open(_: &CudaContext, _: &Opened) -> Result<Vision, GateError> {
             Err(NO_IMAGES.into())
         }
 
-        pub fn media(&self) -> &dyn MediaModel {
+        pub fn announce(&self, _: &Opened, _: ScratchHome, _: Instant) {
             match *self {}
         }
 
-        pub fn span_rows(
+        pub fn media_ref(&self) -> &dyn MediaModel {
+            match *self {}
+        }
+
+        pub fn merged_rows<'a>(
             &mut self,
             _: &CudaContext,
-            _: &[Placed<'_>],
+            _: impl IntoIterator<Item = Image<'a>>,
         ) -> Result<SpanRows<()>, GateError> {
             match *self {}
         }
@@ -614,6 +556,15 @@ fn open_image(
     )
 }
 
+/// The tower of `at`'s file on its seat's card, `model` (the backbone's own context) bound back;
+/// the `vision` record names the card, the seat and the bytes.
+fn open_encoder(model: &CudaContext, at: &vision_seat::Opened) -> Result<image::Vision, GateError> {
+    let t = Instant::now();
+    let tower = image::Vision::open(model, at)?;
+    tower.announce(at, vision_seat::ScratchHome::Own, t);
+    Ok(tower)
+}
+
 /// Opens the head, checks its width, opens the tokenizer and the backbone on
 /// this thread, reports the open (the quant word, or why not) on `ready`,
 /// then answers `jobs` until the server drops its sender.
@@ -632,6 +583,9 @@ fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) 
         }
         let tokenizer = Tokenizer::from_gguf(&l.model)?;
         let image = open_image(l, &*head, &tokenizer)?;
+        if let Some(at) = &image {
+            vision_seat::seat_record(at).eprint();
+        }
         let (_, open_body) = BODIES
             .iter()
             .find(|(opens, _)| opens(&l.arch))
@@ -639,7 +593,7 @@ fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) 
         let (body, file) = open_body(&l.model, l.ctx, image.as_ref().map(|o| &o.seat))?;
         let vision = image
             .as_ref()
-            .map(|at| image::Vision::open(body.context(), at, usize::try_from(l.width)?))
+            .map(|at| open_encoder(body.context(), at))
             .transpose()?;
         let q = quant(&file);
         let on = Backbone {
