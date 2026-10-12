@@ -1,0 +1,89 @@
+# The MTP draft on the paged Qwen4exp load at the 12 GiB card budget, both arms on one forced id stream: pageddraft-decode.card's
+# shape (HOST_ROOM 27G, NVTIER_BYTES 8G, CARD_BUDGET 12G, residency off, ctx 3072, n 1024, prose 512) with
+# BLOOMERY_FORCE_IDS=continue in both arms (the runner expands it to <corpus-prose.ids>:512; registry.rs FORCE_IDS: "a corpus
+# runner's `continue` is its prompt's length"; commit 81564bb7).
+#
+# BLOCKER, read first [derived from the refusal the lead's first run met, 2026-10-12; pageddraft16-decode.card (branch n71)
+# lines 1-3]: at CARD_BUDGET=12G the mtp arm does not load. Its floor 13.49 GB (dense 5.94 + KV 0.56 + ctx 0.54 + scratch 2.53 +
+# margin 1.07 + the draft's 512 Q8_0 routed experts 2.85 GB, all on the card) is above 12 GiB = 12.88 GB; the off arm loads. The
+# first A/B was void on that, and on a missing place=a. This card is written as specified and its band is the prediction for a
+# 12G run where the mtp arm LOADS (hosting the draft's experts, the lead's "12 GB lever", is a proposed round only). On
+# today's code the run ends the mtp arm a FAIL row at its load, no ratio: decide-below names that first. Recommended: do not
+# take a lease for this card until the floor moves; pageddraft16-forced.card is the measurable shape.
+#
+# [derived] ratio = E x t_plain / t_pass, t_pass a verify pass of 4 rows; terms cited to this tree's pageddraft-decode.card
+# (12G) and the n71 tree's pageddraft16-decode.card (16G):
+#   E = 2.058 [m: lead, n71-ab16.log lines 1325/1999/2495/3179 = 2.075, 1.943, 2.309, 1.905, round 0's 2.357 excluded; range
+#       1.905..2.309]: the unforced text of the 16G run whose off arm looped (93 distinct of 1024); E on the forced prose stream
+#       is NOT measured, this A/B reads it. The 12G card's tau 3.6 is retired here.
+#   t_plain = 111..121 ms: the lead's 12G off arm 8.64 tok/s [8.54..8.79] over 6 rounds = 116 ms (16G card lines 14-17), x (1 +-
+#       0.045) [derived: the 16G card's own relative width 105..115 on its anchor; one measurement on unforced text]. The anchor
+#       is 51.8 fills a token x 1.7 ms + H and card 28 ms (12G card lines 36-39: H 11..19, card 8..14).
+#   t_pass = F + H + C + walks = 141..195 ms [derived]:
+#       F 99..122 = 47 miss layers x 2.1..2.6 ms (12G card lines 29-31, 39-40: 158 fills a pass, 3.3 a layer at QD 3..4; the 16G card's
+#       form, 3.16 MB x 3.3 / 5.7..6.5 GB/s + 0.5 ms = 2.1..2.3 ms a layer, lands inside it).
+#       H 30..53 = union 27.71 picks / 10 per row = 2.771 token-equivalents x H_plain 11..19 (12G card lines 17-20, 36).
+#       C 9.2..16.1 = 1.15 x 8..14 (12G card lines 36, 40). walks 2.2..4.0 = 0.6..1.1 a token at tau 3.6 x 3.6 [assumption: per
+#       token, 12G card line 40].
+# Central 2.058 x 116 / 167.75 = 1.423 = +42 %. One term at its edge, the others central: t_pass 195 -> +22.5, 141 -> +69.8;
+# E 1.905 -> +31.7, 2.309 -> +59.7; t_plain 111 -> +36.2, 121 -> +48.4. Band = the widest single-term excursion: +22..+70
+# (every unfavourable edge stacked: 1.905 x 111 / 194.9 = +8.5 %, the favourable stack +99 %). Failure tail, QD gain absent:
+# the pass's 158 fills at 1.7 ms = 269 ms, t_pass 326 ms, ratio 238.7 / 326 = 0.732 = -27 %. Rejected rows' fills (half the 4 rows
+# are off stream at E 2.06) are not in the stride-4 replay: one-sided, toward the low edge.
+#
+# Break-even [derived]: the draft pays only above E = 167.75 / 116 = 1.45 positions a pass. E on the forced stream likely skews LOW
+# against the 2.06 (scored on the model's own greedy text; a forced run keeps a proposal only while it matches the corpus's id)
+# [assumption: direction only, no measurement]; decide-below reads E first.
+#
+# Resource timeline of one verify pass [derived, the same terms]: NVMe and host CPU in a sum: NVMe 99..122 ms (158 fills, 3.3 a
+# miss layer), host CPU 30..53 (union) + 2..4 (walks) + the page work inside F, card SMs 9..16 ms; wall = sum, 141..195 ms for E
+# 2.06 positions against the plain token's 116 ms. No flow lever beyond the one the card prices.
+#
+# Ruler: sd 2.6 % as pageddraft-decode.card carries it, an upper bound here (sd line). At 6 rounds h = 3.34 %; the near edge
+# +22 clears it.
+# wall [derived]: if both arms load: warm-up (one load + one arm) + 6 rounds x (2 loads + off 1024 x 111..121 ms + mtp 1024 x
+#   t_pass / E = 61..102 ms a token) + the witness blocks. Loads 60..90 s an arm [assumption: pageddraft-decode.card's wall line;
+#   no batch log of this load's time is readable on the Mac]. Round = 120..180 + 114..124 + 62..105 s = 5.0..6.8 min;
+#   warm-up (one load + one arm) 2.1..3.6 min; total 32..44 min, central ~38 min. On today's code (the mtp arm refuses at its load,
+#   BLOCKER) the runner does NOT stop: depth-qwen3moe.sh's Failures contract prints a FAIL row for the refused arm and goes on, so the
+#   warm-up (the mtp arm is first in the list) and every round's mtp arm are refused and the off arm runs 6 times: 6 x (off load
+#   60..90 + 114..124 s + a refused load 0..90 s [assumption: the refusal comes at the plan, before the weights load]) = 17..30 min,
+#   + the warm-up's 0..1.5 min = 17..32 min of lease for a known void. DO NOT SCHEDULE THIS CARD ON CURRENT CODE.
+# command (one line, from the Mac, in the tree that holds this card; BLOOMERY_AB_ROUNDS rides the recipe, the runner's default is
+#   4; BLOOMERY_BOX_ENV splits on spaces; `just ab-decode` runs the CPU bloomery-decode and cannot take these arms; place=a is in
+#   each list because CARD_BUDGET acts only under --place; the ratio line reads first arm / second arm):
+#   BLOOMERY_AB_ROUNDS=6 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pageddraft12-forced.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DECODE_N=1024 BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' just depth-gpu-qwen4exp prose:512@place=a,BLOOMERY_DRAFT=mtp,BLOOMERY_FORCE_IDS=continue,BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=8G,BLOOMERY_CARD_BUDGET=12G prose:512@place=a,BLOOMERY_DRAFT=off,BLOOMERY_FORCE_IDS=continue,BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=8G,BLOOMERY_CARD_BUDGET=12G
+#   Runner tree: BLOOMERY_FORCE_IDS and the runner's `continue` are in commit 81564bb7 (branch forceids, on main after train1013b),
+#   not in this tree's eca061f0 (grep: 0 hits in registry.rs and depth-qwen3moe.sh). The command runs in a tree that holds both
+#   81564bb7 and this card (lease_take reads the card from the runner's own tree), e.g. main after train1013b with this file added.
+#   Placeholders: none (the ids file is the runner's `continue`).
+kind: ab
+question: on one forced id stream, would the MTP draft speed the plain decode on a paged plan at the 12 GiB card budget (a small
+  arena, the plain token's fill chain the wall), if the draft loads there, by filling a pass's four rows' misses together at a
+  deeper queue and keeping E rows a pass, against the union's host work and the draft's walks?
+term: decode tok/s @ n=1024, prose 512 (the corpus's first 512 ids, the generated ids forced to the corpus's next ones), ctx 3072,
+  A6000, plan a (place=a in each arm), BLOOMERY_HOST_ROOM=27G BLOOMERY_NVTIER_BYTES=8G (a 7.9 GiB arena, S ~54 slots a layer)
+  BLOOMERY_CARD_BUDGET=12G BLOOMERY_RESIDENCY=off, one slot; one generate_qwen3moe, lever arms, BLOOMERY_DRAFT=mtp against off,
+  (mtp - off) / off, paired by round; the band holds only where the mtp arm loads (BLOCKER above)
+unit: %
+predict: +22..+70
+rounds: 6
+sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair 1.056 ± 0.059 over 4 rounds, as pageddraft-decode.card carries
+  it; measured at 42 tok/s n = 96; this shape's own scatter is bracketed by the lead's 12G off arm, 8.54..8.79 tok/s over 6 rounds
+  (a 2.9 % range, ~1.1 % sd [derived: range / 2.53 for n = 6]), so 2.6 % is taken as an upper bound
+condition: the mtp arm LOADS at CARD_BUDGET=12G (its `load draft=mtp` record present; a refusal by name at the load, its floor
+  above 12.88 GB, is the BLOCKER's outcome and no ratio is written); one lease; one binary with its Cargo.lock current; the same
+  BLOOMERY_FORCE_IDS=continue in both arms' lists (the `[parse]` lines show the same `<corpus>:512` value) and the runner's
+  `tokens-differ rounds:` line reads 0 of 6, now required; BLOOMERY_DECODE_N=1024 in BLOOMERY_BOX_ENV (the rows' `n=` reads 1024)
+  and every arm a fresh process (BLOOMERY_AB_LOAD=arm), the order rotated each round, one warm-up round discarded (a `WARMUP r0`
+  row); no [cpu-busy], [other-busy] or [cold] row, no [loop] tag, and no Xid in either witness. The two arms' plan lines name a
+  paged plan with an arena and equal arena and nvtier budget= fields. Read beside the ratio, from the arms' records: the mtp
+  summary's E(4), fills a pass and fill_ns a fill in both arms, the arms' ms a pass
+decide-in: write the row to rig-log (decode tok/s both arms, the ratio and its interval, E(4) on the forced stream, fills a pass
+  and fill_ns a fill) with the window named; the 12 GB lever's case is then the measured ratio at this card budget
+decide-below: first read whether the mtp arm loaded: a refusal at the load (floor 13.49 GB above 12.88 GB) means no measurement,
+  the card is void as the first run was, and the next card is pageddraft16-forced.card; if it loaded and the ratio is under +22,
+  read E(4) (under ~1.9 is acceptance on this stream, not flow), then fills a pass (above 3.3 a layer: rejected rows polluted the
+  arena) and fill_ns a fill against the off arm's (equal means the queue gain is absent, the -27 % tail [derived above])
+decide-above: above +70 means t_pass sat under 141 ms or E(4) above 2.31 on this stream, or the off arm measured thrash (its
+  fills a token past ~90); read the arms' fills and E(4) before the ratio is claimed as the queue's
