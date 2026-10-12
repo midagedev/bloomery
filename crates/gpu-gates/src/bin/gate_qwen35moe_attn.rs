@@ -3,7 +3,7 @@
 //! (group 8) of 256 values, a NEOX rope over the first 64 values at θ 1e7,
 //! RMS eps 1e-6, and a sigmoid output gate carried beside each query head in
 //! the q projection's rows (`[q 256 | gate 256]` a head). Inputs are seeded
-//! ([`activations`]); nothing is read from a model file.
+//! ([`activations`]); only clause 6 reads a model file and ik's set.
 //!
 //! 1. Rope (`rope_neox::head_norm_neox_append_256`), against this binary's
 //!    transcription of its rule: the norm (each thread's two squares added in
@@ -181,6 +181,15 @@
 //!     [`SEED_Q8`]: bit for bit the f16 twin, a rerun, each row its one-row
 //!     launch, the fault, the captured launch (one node), a head count
 //!     refused.
+//!
+//! Tiers (`BLOOMERY_TIER`): the gate reads a model file and a set of ik's in clause 6 alone. Clauses 1–5 and 7–16 run
+//! on synthetic inputs and are self-consistency clauses (`tier::sc`), run on either tier. Clause 6 is `Tag::Oracle` on
+//! the real batch set and the Q4_K_M file in the real tier, which the fixture tier leaves to the real tier by name, and
+//! `Tag::FixtureOracle` in the fixture tier, on the batch set of ik's dumped on the fixture file (refset's
+//! `fx-ik-qwen35moe`, opened through `tier::fixture_set`) and the gains of that file, which the real tier leaves to the
+//! fixture tier by name. [`MODEL_LAYER`] is an attention layer of both files. The bands are unchanged: they are derived
+//! per value from ik's inputs and our rules, not from the weights. The gate declares the one fixture-oracle clause
+//! (`tier::expect_fixture_oracle`).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -221,14 +230,17 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError, Q8Act, window};
     use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
     use bloomery_gpu_gates::rounding::{U, U_F32, butterfly, gamma};
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RowKind, activations, bits_equal, checks_failed, data_dir,
-        no_local_depot, ref_ints, ref_tensor_logical_in, split_f32, verdict,
+        no_local_depot, ref_ints, ref_model_path, ref_tensor_logical_in, split_f32, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::{Q8Block, f32_to_f16_bits, half_to_f32};
     use model::arch::deepseek2::attn::quantize_q8_0;
+    use model::arch::qwen35moe::hparams::{Hparams, Kind};
+    use refset::arch::qwen35moe::fixture as fx;
     use refset::arch::qwen35moe::{BATCH, IK, MODEL};
     use runtime::qsa::{Qsa, select as qsa_select};
     use std::mem::ManuallyDrop;
@@ -379,8 +391,16 @@ mod gate {
     const QK: usize = N_HEAD * HEAD;
     /// The layer the fault checks label their launches with.
     const LAYER: usize = 13;
-    /// The full-attention layer the model clauses read.
+    /// The full-attention layer the model clause reads: an attention layer of the real file (every
+    /// fourth layer attends) and of the fixture (its layer 3 is source layer 39, and the fixture's
+    /// interval of 2 makes its odd layers attend). [`model_check`] holds the file's header to it.
     const MODEL_LAYER: usize = 3;
+    /// The fixture-oracle clauses the gate declares (`tier::expect_fixture_oracle`): clause 6.
+    const FIXTURE_ORACLE: usize = 1;
+    /// Clause 6, as the tier prints it: the real tier's `Oracle` clause adds " on ik's real set", the
+    /// fixture tier's `FixtureOracle` clause " on ik's fixture set".
+    const MODEL_CLAUSE: &str =
+        "6 ik taps: the rope launch and the gated quantizer on ik's batch set";
     /// `gate_qwen3moe_rope`'s band on a turned value against ik's, of its
     /// head's largest value: the norm's scale may round one ulp apart (`2u`
     /// of the scale, `4u` with the gain), the inner products round on both
@@ -2704,17 +2724,41 @@ mod gate {
         (worst, same, n)
     }
 
-    /// Clause 6 (module doc).
+    /// Clause 6 (module doc): the real tier's `Oracle` clause on the real batch set and the real file,
+    /// the fixture tier's `FixtureOracle` clause on the fixture's batch set and file.
     fn model_check(
         gpu: &Gpu,
         rope: &RopeNeoxKernels,
         gq: &GatedQuantKernels,
     ) -> Result<bool, GateError> {
         let stream = gpu.stream();
-        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
-        let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        tier::run_clause(&format!("{MODEL_CLAUSE} on ik's real set"), Tag::Oracle)?;
+        let fixture_clause = format!("{MODEL_CLAUSE} on ik's fixture set");
+        let man = if tier::run_clause(&fixture_clause, Tag::FixtureOracle)? {
+            let set = tier::fixture_set(&fixture_clause, &fx::IK, fx::BATCH)?;
+            RefManifest::open(&set, &fx::IK)?
+        } else {
+            RefManifest::open(&data_dir().join(BATCH), &IK)?
+        };
+        let path = ref_model_path()?;
+        let mut ok = tier::witness("model file", path.display().to_string(), MODEL.to_string());
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         if split.architecture() != Some("qwen35moe") {
-            return Err(format!("{MODEL} is {:?}, not qwen35moe", split.architecture()).into());
+            return Err(format!(
+                "{} is {:?}, not qwen35moe",
+                path.display(),
+                split.architecture()
+            )
+            .into());
+        }
+        let kind = Hparams::read(&split)?.kinds.get(MODEL_LAYER).copied();
+        if kind != Some(Kind::Attention) {
+            return Err(format!(
+                "layer {MODEL_LAYER} of {} is {kind:?}, not an attention layer: the clause reads \
+                 its Qaux, Kcur and fa taps",
+                path.display()
+            )
+            .into());
         }
         let l = MODEL_LAYER;
         let tensor = |name: String| -> Result<Vec<f32>, GateError> {
@@ -2763,7 +2807,6 @@ mod gate {
             ("Kcur_roped", head_rel(&out.k, &k_roped, 0..ROT)),
             ("Kcur_normed", head_rel(&out.k, &k_normed, ROT..HEAD)),
         ];
-        let mut ok = true;
         for (tap, (rel, same, n)) in parts {
             let pass = rel <= ROPE_BAND;
             println!(
@@ -4187,67 +4230,90 @@ mod gate {
             scale()
         );
         let mut ok = true;
+        tier::sc("1 rope-256: the rope launch against the host rule")?;
         let r = rope_check(&gpu, &rope)?;
         println!("rope-256 {}", verdict(r));
         ok &= r;
+        tier::sc("1 rope-256 q8: the q8_0 append against the f16 entry")?;
         let r = rope_q8_check(&gpu, &rope)?;
         println!("rope-256 q8 {}", verdict(r));
         ok &= r;
+        tier::sc("2 decode flash 256: both passes against the exact attention")?;
         let d = decode_check(&gpu, &k, Q36, &DEC_KEYS)?;
         println!("decode flash 256 {}", verdict(d));
         ok &= d;
+        tier::sc("7 decode flash 256 p4: Qwen3.8's layout through the pack-of-four entries")?;
         let d = decode_check(&gpu, &k, Q38, &DEC_KEYS_Q38)?;
         println!("decode flash 256 p4 {}", verdict(d));
         ok &= d;
+        tier::sc("2 decode flash grid: the segment grid at two heights")?;
         let g = grid_heights_check(&gpu, &k)?;
         println!("decode flash grid at two heights {}", verdict(g));
         ok &= g;
+        tier::sc("8 cross geometry: the pack-of-four entries against the eight-head entries")?;
         let x = cross_check(&gpu, &k, &kp)?;
         println!("cross geometry {}", verdict(x));
         ok &= x;
+        tier::sc("16 decode flash 256 q8: the q8_0 read path against its f16 twin")?;
         let q = decode_q8_check(&gpu, &k, &DEC_KEYS_Q8)?;
         println!("decode flash 256 q8 {}", verdict(q));
         ok &= q;
+        tier::sc("3 score order: the two kernels' one score order")?;
         let t = tie_check(&gpu, &k, &kp)?;
         println!("score order {}", verdict(t));
         ok &= t;
+        tier::sc("5 gated quantizer: against the plain quantizer")?;
         let g = gated_check(&gpu, &gq)?;
         println!("gated quantizer {}", verdict(g));
         ok &= g;
         let i = model_check(&gpu, &rope, &gq)?;
         println!("ik taps, layer {MODEL_LAYER} {}", verdict(i));
         ok &= i;
+        tier::sc("14 qsa shapes: the new entries compile with no local depot")?;
         let s = sel_shapes()?;
         println!("qsa shapes {}", verdict(s));
         ok &= s;
+        tier::sc("9 qsa pool: the pool pass against its transcription")?;
         let s = pool_check(&gpu, &qk)?;
         println!("qsa pool {}", verdict(s));
         ok &= s;
+        tier::sc("10 qsa select: the score pass and the top-k")?;
         let s = select_check(&gpu, &qk)?;
         println!("qsa select {}", verdict(s));
         ok &= s;
+        tier::sc("11-13 qsa selected flash: against the dense flash and the exact attention")?;
         let s = sel_flash_check(&gpu, &k, &qk)?;
         println!("qsa selected flash {}", verdict(s));
         ok &= s;
+        tier::sc("15 qsa deep: the selector and the flashes at a cache of 262,144 rows")?;
         let s = deep_check(&gpu, &k, &qk)?;
         println!("qsa deep {}", verdict(s));
         ok &= s;
+        tier::sc("4 prefill flash 256: against the exact attention")?;
         let (p, win36) = prefill_check(&gpu, &kp, Q36, &[])?;
         println!("prefill flash 256 {}", verdict(p));
         ok &= p;
+        tier::sc("7 prefill flash 256 p4: Qwen3.8's layout through the pack-of-four entry")?;
         let (p, win38) = prefill_check(&gpu, &kp, Q38, &SEED_Q38)?;
         println!("prefill flash 256 p4 {}", verdict(p));
         ok &= p;
+        tier::sc("16 prefill flash 256 q8: the q8_0 read path against its f16 twin")?;
         let q = prefill_q8_check(&gpu, &kp, &SEED_Q8)?;
         println!("prefill flash 256 q8 {}", verdict(q));
         ok &= q;
         // Last: the window refusals, whose failure would be a sticky error.
         for (sh, win) in [(Q36, &win36), (Q38, &win38)] {
+            tier::sc(&format!(
+                "4 prefill windows{}: misaligned windows refused by name",
+                sh.tag()
+            ))?;
             let m = misaligned(&kp, &gpu, sh, win)?;
             println!("prefill windows{} {}", sh.tag(), verdict(m));
             ok &= m;
         }
         println!("gate_qwen35moe_attn: {}", verdict(ok));
+        println!("gate_qwen35moe_attn: {}", tier::tally_line());
+        tier::expect_fixture_oracle("gate_qwen35moe_attn", FIXTURE_ORACLE)?;
         if !ok {
             return Err(checks_failed());
         }

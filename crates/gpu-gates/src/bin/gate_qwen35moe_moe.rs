@@ -36,8 +36,9 @@
 //!   five with a NaN: both raise `NormQuant` and `Router`, write the same
 //!   q8_1 bytes with row 1's scales NaN, refuse token 1 with its ids kept,
 //!   and leave every other token the clean run's.
-//! - `fault`: each launch labelled with layer 5. The routing alone on a NaN
-//!   expert logit and on a NaN and a +inf gate logit; the fused launch at
+//! - `fault`: each launch labelled with the Q4_K layer (the real file's
+//!   5). The routing alone on a NaN expert logit and on a NaN and a +inf
+//!   gate logit; the fused launch at
 //!   five tokens with a NaN in router row 17 and in row 256, and the ubatch
 //!   pair at nine tokens with a NaN in row 256 — every token refused; the
 //!   ubatch pair with token 8's column overflowing row 256's logit to +inf —
@@ -104,6 +105,24 @@
 //!   routing alone, and the ubatch pair over 70 against the fused launch
 //!   per token, all BIT-EQUAL.
 //! - `shape`: the seven entries compile with no local depot.
+//!
+//! Tiers (`BLOOMERY_TIER`): `shape`, `wide512`, `picks`, `join` and `routing`'s constructed ties read no set of ik's
+//! and run on either file (`tier::sc`). Every other case takes its inputs from ik's sets (the logits, `ffn_inp_normed`,
+//! `ssm_output`, the SwiGLU values), and each such clause is `Tag::Oracle` on the real sets in the real tier, which the
+//! fixture tier leaves to the real tier by name, and `Tag::FixtureOracle` on the sets of ik's dumped on the fixture file
+//! (refset's `fx-ik-qwen35moe`: its batch, step-4 and 1,024-position sets, each opened through `tier::fixture_set`) in
+//! the fixture tier, which the real tier leaves to the fixture tier by name. Those clauses are `routing` (ik's logits of
+//! every layer of every set), `ik`, `fault` (the Q4_K layer), and `logits`, `norm`, `down512`, `ffn`, `graph` and
+//! `ubatch` once for each real-weight layer. The bands are unchanged: they are derived per value from ik's inputs and
+//! our rules, not from the weights. The gate declares how many fixture-oracle clauses it runs
+//! (`tier::expect_fixture_oracle`), as many as the cases `--case` selects.
+//!
+//! The real-weight layers are read from the file, by kind: the first delta layer whose down stack is Q6_K, then the
+//! first whose down stack is Q4_K (a delta layer, because `ssm_output` is the delta-net's tap). The real file's are 0
+//! and 5, held by a `tier::witness` of the old literals; the fixture's are its layers 2 and 0, source layers 0 and 5.
+//! The ik columns a case reads past the last layer come from the first again (`ffn_inp_normed`, five tokens a layer:
+//! the real file's reads end at layer 18 of 40, the four-layer fixture repeats its twenty columns), and the
+//! `ssm_output` columns come from the delta layers in order, wrapping the same way.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -131,6 +150,7 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::act_rule::q4k_scales;
     use bloomery_gpu_gates::rounding::{butterfly, gamma};
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
         GateError, RefManifest, bits_equal, bytes_to_words, checks_failed, data_dir,
         no_local_depot, ref_model_path, ref_tensor_logical_in, route_ref_within,
@@ -140,7 +160,9 @@ mod gate {
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
     use model::arch::models::shape::{MoeShape, rules};
+    use model::arch::qwen35moe::hparams::{Hparams, Kind};
     use refset::arch::qwen35moe as oracle;
+    use refset::arch::qwen35moe::fixture as fx;
 
     /// The narrow instance's experts, its row's; the routed slots the
     /// clauses run at, Qwen3.6's `expert_used_count` (`run` holds the file
@@ -189,12 +211,66 @@ mod gate {
     /// the ruler. The value is the qwen3moe e2e gate's `GEMM_SPREAD_RATIO`.
     const SPREAD_RATIO: f64 = 3.0;
 
-    /// The layers the real-weight cases run: layer 0's down is Q6_K, layer
-    /// 5's Q4_K.
-    const LAYERS: [usize; 2] = [0, 5];
+    /// The real file's literals the cases were written against, each now read from the file
+    /// ([`pick_layers`], the header) and held to its old value by a `tier::witness`: the trunk's
+    /// layers, the layers the real-weight cases run (layer 0's down is Q6_K, layer 5's Q4_K) and the
+    /// layer the fault case runs (the Q4_K one).
+    const REAL_N_LAYER: usize = 40;
+    const REAL_LAYERS: [usize; 2] = [0, 5];
+    const REAL_FAULT_LAYER: usize = 5;
 
-    /// The layer the refusal cases label their launches with.
-    const FAULT_LAYER: usize = 5;
+    /// The layer the synthetic refusal cases label their launches with: a value of the fault word,
+    /// not a layer of any file.
+    const LABEL_LAYER: usize = 5;
+
+    /// ik's sets by position: the batch, step-4 and 1,024-position sets of the real family and of the
+    /// fixture's.
+    const REAL_SETS: [&str; 3] = [oracle::BATCH, oracle::STEP4, oracle::D1K];
+    const FIXTURE_SETS: [&str; 3] = [fx::BATCH, fx::STEP4, fx::D1K];
+
+    /// Where a case that reads ik's sets runs its clause.
+    #[derive(Clone, Copy)]
+    enum At {
+        /// Once, over the sets.
+        Sets,
+        /// Once for each real-weight layer ([`Ctx::layers`]).
+        Layers,
+        /// Once, on the Q4_K layer.
+        FaultLayer,
+    }
+
+    /// The cases that read ik's sets, by `--case` name: each is one `Tag::Oracle` clause in the real
+    /// tier and one `Tag::FixtureOracle` clause in the fixture tier wherever it runs.
+    const ORACLE_CASES: [(&str, At); 9] = [
+        ("routing", At::Sets),
+        ("ik", At::Sets),
+        ("logits", At::Layers),
+        ("norm", At::Layers),
+        ("fault", At::FaultLayer),
+        ("down512", At::Layers),
+        ("ffn", At::Layers),
+        ("graph", At::Layers),
+        ("ubatch", At::Layers),
+    ];
+
+    /// Whether `case` runs under `filter` (`--case`): no filter, or a comma-separated part of it that
+    /// the case's name holds.
+    fn wanted(filter: Option<&str>, case: &str) -> bool {
+        filter.is_none_or(|f| f.split(',').any(|p| case.contains(p)))
+    }
+
+    /// The fixture-oracle clauses a run under `filter` declares (`tier::expect_fixture_oracle`):
+    /// [`ORACLE_CASES`], those selected, once or for each of the `layers` real-weight layers.
+    fn declared_fixture_oracle(filter: Option<&str>, layers: usize) -> usize {
+        ORACLE_CASES
+            .iter()
+            .filter(|(case, _)| wanted(filter, case))
+            .map(|(_, at)| match at {
+                At::Sets | At::FaultLayer => 1,
+                At::Layers => layers,
+            })
+            .sum()
+    }
 
     /// Values of the hidden state.
     const HIDDEN: usize = 2048;
@@ -251,17 +327,28 @@ mod gate {
         gemm: GemmKernels,
         norm: FusedKernels,
         eps: f32,
+        /// The trunk's layers, from the header.
+        n_layer: usize,
+        /// The layers the real-weight cases run: the first delta layer whose down stack is Q6_K,
+        /// then the first whose down stack is Q4_K ([`pick_layers`]).
+        layers: [usize; 2],
+        /// The file's delta layers in order: the layers that carry `ssm_output`.
+        delta: Vec<usize>,
+        /// ik's sets of this tier by position ([`REAL_SETS`], [`FIXTURE_SETS`]); empty when no
+        /// selected case reads them.
         sets: Vec<(&'static str, RefManifest)>,
         filter: Option<String>,
     }
 
     impl Ctx {
-        /// Whether `case` runs: no filter, or a comma-separated part of it
-        /// that the case's name holds.
+        /// Whether `case` runs ([`wanted`]).
         fn want(&self, case: &str) -> bool {
-            self.filter
-                .as_deref()
-                .is_none_or(|f| f.split(',').any(|p| case.contains(p)))
+            wanted(self.filter.as_deref(), case)
+        }
+
+        /// The layer the fault case runs: the Q4_K one.
+        fn fault_layer(&self) -> usize {
+            self.layers[1]
         }
 
         fn stream(&self) -> &CudaStream {
@@ -311,7 +398,13 @@ mod gate {
 
         /// Tap `name` of set `set` as logical f32.
         fn tap(&self, set: usize, name: &str) -> Result<Vec<f32>, GateError> {
-            let man = &self.sets[set].1;
+            let man = &self
+                .sets
+                .get(set)
+                .ok_or_else(|| {
+                    format!("{name}: ik's set {set} is not open (no selected case reads it)")
+                })?
+                .1;
             Ok(ref_tensor_logical_in(&man.dir, man.tensor(name, 0)?)?)
         }
     }
@@ -323,6 +416,71 @@ mod gate {
             format!("blk.{l}.ffn_{part}_shexp.weight"),
             format!("derived.blk.{l}.ffn_{part}_exps_sh"),
         )
+    }
+
+    /// The layers the real-weight cases run and the file's delta layers, by kind: the first delta layer
+    /// whose down stack is Q6_K, then the first whose down stack is Q4_K (a delta layer, because the cases
+    /// read `ssm_output`, the delta-net's tap).
+    fn pick_layers(split: &Split, hp: &Hparams) -> Result<([usize; 2], Vec<usize>), GateError> {
+        let delta: Vec<usize> = hp
+            .kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| **kind == Kind::DeltaRule)
+            .map(|(l, _)| l)
+            .collect();
+        let first = |ty: GgmlType| -> Result<usize, GateError> {
+            for &l in &delta {
+                let name = format!("blk.{l}.ffn_down_exps.weight");
+                let (_, info) = split
+                    .find(&name)
+                    .ok_or_else(|| format!("{name} is not in the model file"))?;
+                if info.ty == ty {
+                    return Ok(l);
+                }
+            }
+            Err(format!("the file has no delta layer whose down stack is {ty:?}").into())
+        };
+        let layers = [first(GgmlType::Q6_K)?, first(GgmlType::Q4_K)?];
+        Ok((layers, delta))
+    }
+
+    /// The set of ik's `what` reads, in this tier: ik's sets of the real family in the real tier; in the
+    /// fixture tier the fixture family's, each opened through `tier::fixture_set`, which ends the gate by
+    /// name for a set that is missing, stale, foreign or unfinished.
+    fn open_sets(what: &str) -> Result<Vec<(&'static str, RefManifest)>, GateError> {
+        let mut sets = Vec::new();
+        match Tier::from_env()? {
+            Tier::Real => {
+                for name in REAL_SETS {
+                    let man = RefManifest::open(&data_dir().join(name), &oracle::IK)?;
+                    sets.push((name, man));
+                }
+            }
+            Tier::Fixture => {
+                for name in FIXTURE_SETS {
+                    let path = tier::fixture_set(what, &fx::IK, name)?;
+                    sets.push((name, RefManifest::open(&path, &fx::IK)?));
+                }
+            }
+        }
+        Ok(sets)
+    }
+
+    /// The clause `what`, which reads the first `sets` of ik's sets: `Tag::Oracle` on the real sets in the
+    /// real tier, `Tag::FixtureOracle` on the fixture's in the fixture tier. A tier decides both and prints
+    /// the other's line (`fixture-only(oracle)`, `deferred(real)`), so the tally counts the clause on either
+    /// side; the fixture tier opens the sets it reads again under the clause's name, which a set it
+    /// refuses ends by name.
+    fn ik_clause(what: &str, sets: usize) -> Result<(), GateError> {
+        tier::run_clause(&format!("{what} on ik's real sets"), Tag::Oracle)?;
+        let fixture = format!("{what} on ik's fixture sets");
+        if tier::run_clause(&fixture, Tag::FixtureOracle)? {
+            for name in FIXTURE_SETS.iter().take(sets) {
+                tier::fixture_set(&fixture, &fx::IK, name)?;
+            }
+        }
+        Ok(())
     }
 
     /// One real layer on the card.
@@ -541,6 +699,7 @@ mod gate {
         Ok((out, m))
     }
 
+    /// The routing alone on ik's logits of every layer of every set, against the host rule.
     fn routing_case(c: &Ctx, n_layer: usize) -> Result<bool, GateError> {
         let sink = c.gpu.unlabelled_sink();
         let mut out = RouterOut::with_tokens(c.stream(), narrow()?, 1)?;
@@ -596,9 +755,14 @@ mod gate {
             "routing gate: w[8] vs sigmoid(logit_256) err={worst_g:.3e} (band {BAND:.0e}) {}",
             verdict(gate_ok)
         );
-        let mut ok = ids_ok && w_ok && gate_ok && rerun_ok;
+        Ok(ids_ok && w_ok && gate_ok && rerun_ok)
+    }
 
-        // Constructed ties.
+    /// The routing alone on constructed ties, against the host rule: no set of ik's.
+    fn routing_ties_case(c: &Ctx) -> Result<bool, GateError> {
+        let sink = c.gpu.unlabelled_sink();
+        let mut out = RouterOut::with_tokens(c.stream(), narrow()?, 1)?;
+        let mut ok = true;
         let mut cases: Vec<(&str, Vec<f32>, Vec<u32>)> = Vec::new();
         let mut l = vec![0.5f32; ROWS];
         l[SHARED] = 0.25;
@@ -1225,8 +1389,8 @@ mod gate {
         want: &[Vec<f32>],
     ) -> Result<bool, GateError> {
         let stream = c.stream();
-        let sink = c.gpu.layer_sink(FAULT_LAYER)?;
-        let want_word = Some(Fault::at(u32::try_from(FAULT_LAYER)?, FaultSite::Router));
+        let sink = c.gpu.layer_sink(LABEL_LAYER)?;
+        let want_word = Some(Fault::at(u32::try_from(LABEL_LAYER)?, FaultSite::Router));
         let show = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
         let mut ok = true;
 
@@ -1320,12 +1484,17 @@ mod gate {
 
     // ------------------------------------------------------------ logits
 
-    /// `m` columns of `ffn_inp_normed` from layers `l0 ..`, five per layer.
+    /// `m` columns of `ffn_inp_normed` from layers `l0 ..`, five per layer, and from layer 0 on past
+    /// the last layer (the real file's reads end before it).
     fn normed_cols(c: &Ctx, l0: usize, m: usize) -> Result<Vec<f32>, GateError> {
         let mut cols = Vec::with_capacity(m * HIDDEN);
         let mut l = l0;
         while cols.len() < m * HIDDEN {
-            cols.extend(c.tap(0, &format!("ffn_inp_normed-{l}"))?);
+            let tap = c.tap(0, &format!("ffn_inp_normed-{}", l % c.n_layer))?;
+            if tap.is_empty() {
+                return Err(format!("ffn_inp_normed-{} holds no value", l % c.n_layer).into());
+            }
+            cols.extend(tap);
             l += 1;
         }
         cols.truncate(m * HIDDEN);
@@ -1470,14 +1639,24 @@ mod gate {
         a.q3 == b.q3 && a.q4 == b.q4 && a.q6 == b.q6 && a.s8 == b.s8 && bits_equal(&a.d8, &b.d8)
     }
 
-    /// The FFN input residual of layer `l` (its `ssm_output`), `m` rows
-    /// from layers `l ..`.
+    /// The FFN input residual of the delta layer `l` (its `ssm_output`), `m` rows from the delta layers
+    /// `l ..` in order, and from the first again past the last.
     fn resid_rows(c: &Ctx, l: usize, m: usize) -> Result<Vec<f32>, GateError> {
+        let first = c
+            .delta
+            .iter()
+            .position(|&d| d == l)
+            .ok_or_else(|| format!("layer {l} is not a delta layer: it has no ssm_output"))?;
         let mut rows = Vec::with_capacity(m * HIDDEN);
-        let mut at = l;
+        let mut i = first;
         while rows.len() < m * HIDDEN {
-            rows.extend(c.tap(0, &format!("ssm_output-{at}"))?);
-            at += 1;
+            let at = c.delta[i % c.delta.len()];
+            let tap = c.tap(0, &format!("ssm_output-{at}"))?;
+            if tap.is_empty() {
+                return Err(format!("ssm_output-{at} holds no value").into());
+            }
+            rows.extend(tap);
+            i += 1;
         }
         rows.truncate(m * HIDDEN);
         Ok(rows)
@@ -1674,8 +1853,8 @@ mod gate {
 
     fn fault_case(c: &Ctx, ly: &Layer) -> Result<bool, GateError> {
         let stream = c.stream();
-        let sink = c.gpu.layer_sink(FAULT_LAYER)?;
-        let want = Some(Fault::at(u32::try_from(FAULT_LAYER)?, FaultSite::Router));
+        let sink = c.gpu.layer_sink(ly.l)?;
+        let want = Some(Fault::at(u32::try_from(ly.l)?, FaultSite::Router));
         let show = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
         let mut ok = true;
 
@@ -2787,15 +2966,17 @@ mod gate {
         let eps = split
             .arch_get_f32("attention.layer_norm_rms_epsilon")
             .ok_or("no attention.layer_norm_rms_epsilon")?;
+        let (layers, delta) = pick_layers(&split, &Hparams::read(&split)?)?;
         let gpu = Gpu::new()?;
         let ctx = gpu.context().clone();
-        let mut sets = Vec::new();
-        for name in [oracle::BATCH, oracle::STEP4, oracle::D1K] {
-            sets.push((
-                name,
-                RefManifest::open(&data_dir().join(name), &oracle::IK)?,
-            ));
-        }
+        let reads_sets = ORACLE_CASES
+            .iter()
+            .any(|(case, _)| wanted(filter.as_deref(), case));
+        let sets = if reads_sets {
+            open_sets("the cases that read ik's sets")?
+        } else {
+            Vec::new()
+        };
         let c = Ctx {
             router: RouterKernels::load(&ctx)?,
             experts: ExpertKernels::load(&ctx)?,
@@ -2805,6 +2986,9 @@ mod gate {
             gpu,
             split,
             eps,
+            n_layer,
+            layers,
+            delta,
             sets,
             filter,
         };
@@ -2813,8 +2997,11 @@ mod gate {
             c.gpu.device_name()?,
             path.display()
         );
-        let mut ok = true;
+        let mut ok = tier::witness("N_LAYER", n_layer, REAL_N_LAYER);
+        ok &= tier::witness("LAYERS", c.layers, REAL_LAYERS);
+        ok &= tier::witness("FAULT_LAYER", c.fault_layer(), REAL_FAULT_LAYER);
         if c.want("shape") {
+            tier::sc("shape: the seven entries compile with no local depot")?;
             ok &= no_local_depot(&[
                 "qwen35moe_router_fused",
                 "qwen35moe_router_norm",
@@ -2826,50 +3013,95 @@ mod gate {
             ])?;
         }
         if c.want("routing") {
+            ik_clause("routing: the routing alone on ik's logits", REAL_SETS.len())?;
             ok &= routing_case(&c, n_layer)?;
+            tier::sc("routing ties: the routing alone on constructed ties")?;
+            ok &= routing_ties_case(&c)?;
         }
         if c.want("wide512") {
+            tier::sc("wide512: the second instance, on synthetic inputs")?;
             ok &= wide_case(&c)?;
         }
         if c.want("picks") {
+            tier::sc("picks: the routed slot count as a launch argument")?;
             ok &= picks_case(&c)?;
         }
         if c.want("ik") {
+            ik_clause(
+                "ik: the fused router on ik's ffn_inp_normed, against ik",
+                REAL_SETS.len(),
+            )?;
             ok &= ik_case(&c, n_layer)?;
         }
         let per_layer = [
             "logits", "norm", "fault", "join", "down512", "ffn", "graph", "ubatch",
         ];
         if per_layer.iter().any(|k| c.want(k)) {
-            for &l in &LAYERS {
+            for l in c.layers {
                 let ly = load_layer(&c, l)?;
                 if c.want("logits") {
+                    ik_clause(
+                        &format!("logits layer={l}: fused router on ik's ffn_inp_normed"),
+                        1,
+                    )?;
                     ok &= logits_case(&c, &ly)?;
                 }
                 if c.want("norm") {
+                    ik_clause(
+                        &format!("norm layer={l}: norm-fused router on ik's ssm_output"),
+                        1,
+                    )?;
                     ok &= norm_case(&c, &ly)?;
                 }
-                if c.want("fault") && l == FAULT_LAYER {
+                if c.want("fault") && l == c.fault_layer() {
+                    ik_clause(
+                        &format!("fault layer={l}: refusals on ik's logits and ffn_inp_normed"),
+                        1,
+                    )?;
                     ok &= fault_case(&c, &ly)?;
                 }
                 if c.want("join") {
+                    tier::sc(&format!(
+                        "join layer={l}: the joined stacks and router are the file's bytes"
+                    ))?;
                     ok &= join_case(&c, &ly)?;
                 }
                 if c.want("down512") {
+                    ik_clause(
+                        &format!("down512 layer={l}: down _sel on ik's SwiGLU values"),
+                        1,
+                    )?;
                     ok &= down512_case(&c, &ly)?;
                 }
                 if c.want("ffn") {
+                    ik_clause(
+                        &format!("ffn layer={l}: nine-slot FFN on ik's ssm_output"),
+                        1,
+                    )?;
                     ok &= ffn_case(&c, &ly)?;
                 }
                 if c.want("graph") {
+                    ik_clause(
+                        &format!("graph layer={l}: captured nine-slot FFN on ik's ssm_output"),
+                        1,
+                    )?;
                     ok &= graph_case(&c, &ly)?;
                 }
                 if c.want("ubatch") {
+                    ik_clause(
+                        &format!("ubatch layer={l}: ubatch path on ik's ffn_inp_normed"),
+                        1,
+                    )?;
                     ok &= ubatch_case(&c, &ly)?;
                 }
             }
         }
         println!("gate_qwen35moe_moe: {}", verdict(ok));
+        println!("gate_qwen35moe_moe: {}", tier::tally_line());
+        tier::expect_fixture_oracle(
+            "gate_qwen35moe_moe",
+            declared_fixture_oracle(c.filter.as_deref(), c.layers.len()),
+        )?;
         if !ok {
             return Err(checks_failed());
         }
