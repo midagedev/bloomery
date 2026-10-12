@@ -21,7 +21,8 @@
 //!   (`refset::arch::qwen35moe::fixture`, each opened by `tier::fixture_set`, resolved to the variant's own sets under
 //!   `BLOOMERY_FIXTURE_VARIANT`); the real tier prints a `fixture-only(oracle)` line for each, and the gate's end holds
 //!   the count it decided to [`FX_ORACLE`] (`tier::expect_fixture_oracle`). The bands are the real tier's: they are
-//!   per value, from ik's inputs and our rules.
+//!   per value, from ik's inputs and our rules. One form differs by tier: the free-running argmax of (c), (o2), (o7)
+//!   and (t1) is equality with ik's in the real tier and [`flip::head_tie`] in the fixture tier ([`head_argmax`]).
 //! - `no-layout-layer` (`tier::layout_clause`): (n) reads joined layers (the node count of a slot,
 //!   [`Shape::nodes_slot`]), (j) and (o8) apart ones. (j) and (o8) open [`UNJOINED`] in the real tier and the tier's file
 //!   in the fixture tier, so they run on a variant and are left on the base fixture; (n) the other way round.
@@ -54,7 +55,10 @@
 //!   `reset` that keeps state reddens the last line of this clause alone.
 //! - (c) free-running on the batch set: the five decode steps' every layer
 //!   output against ik's `l_out-L` within [`FREE_BAND`], and the last
-//!   position's argmax equal to ik's `result_output` argmax.
+//!   position's argmax equal to ik's `result_output` argmax in the real tier;
+//!   in the fixture tier a tie ([`head_argmax`]): ik's own logit at our argmax
+//!   within [`flip::head_cap`] of its top, at the run's last layer output's
+//!   relative distance from ik's.
 //! - (f) teacher-forced, per layer, on the batch set as one pass of five
 //!   rows from a reset: each layer run alone on ik's own input rows
 //!   (`inp_embd` for layer 0, `l_out-(L−1)` after), its mixer's taps against
@@ -69,8 +73,10 @@
 //!   loaded from the set's inputs (`cache_s_lL` — conv then ssm —,
 //!   `cache_k_lL`, `cache_v_lL`) into every layer's store, the model stood at
 //!   the set's position, then (t1) the step free-running: every layer
-//!   output within [`FREE_BAND`], the argmax equal to ik's, every delta
-//!   layer's new state within [`RATIO_BAND`] of the input gap; and (t2) each
+//!   output within [`FREE_BAND`], the argmax as (c) takes it (equal in the
+//!   real tier, a tie in the fixture tier), every delta layer's new state
+//!   within [`RATIO_BAND`] of the larger of the input gap and the layer
+//!   input's own distance from ik's ([`state_ratio`]); and (t2) each
 //!   layer teacher-forced at one row on its reloaded store, its taps as (f).
 //! - (p′) the ubatch arena's gemv arm: the batch set's five tokens through
 //!   the prompt call (`prefill_with`) from zero stores — on the pass path
@@ -395,6 +401,7 @@ mod gate {
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::route_core::sigmoid;
     use bloomery_gpu::{Gpu, GpuError, GpuModel};
+    use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::q36_fixture::{Kind, Shape, Site};
@@ -1290,6 +1297,77 @@ mod gate {
 
     // --------------------------------------------------- (c) free-running
 
+    /// A free-running clause's argmax verdict and the text its line prints for
+    /// it, `ours` being our last position's argmax over `ik_row` (ik's logits
+    /// there) and `head_in` the run's head input's own relative distance from
+    /// ik's (its last layer output's). The real tier holds `ours` equal to ik's
+    /// argmax. The fixture tier holds [`flip::head_tie`] at `head_in`: ik's own
+    /// logit at our argmax within [`flip::head_cap`] of its top, which reads
+    /// the same as equality where ik's row has one clear top. A `head_in` that
+    /// is not finite is no tie (the layer clause is red on it as well).
+    ///
+    /// PIN(2026-10-13): the fixture tier's tie form. Derivation: the fixture's
+    /// random weights leave ik's step-1,024 row near flat (rms 0.999, five
+    /// logits within 0.123 of its top) and our row 0.123 of its norm off ik's,
+    /// so a logit carries an error σ_e ≈ 0.123 and ik's logit at our pick lies
+    /// 0.138 = 1.1 σ_e under its top: exact equality holds there with
+    /// probability 0.3 to 0.5, a coin the weights threw. The real file's row
+    /// has its top 1.25 = 13 σ_e clear (rms 2.45, distance 0.038), where
+    /// equality is deterministic and stays the assertion. The cap is 6 ·
+    /// `head_in` · rms of ik's row, three deviations each for our logit and
+    /// ik's: 0.73 on the fixture's row. A fault upstream of the head moves
+    /// `head_in` past [`FREE_BAND`], which the layer clause reddens first (and
+    /// the cap stays under 1.6 rms); a fault in the head leaves `head_in` as
+    /// it is and puts our pick far under ik's top, a gap of several caps.
+    fn head_argmax(ik_row: &[f32], ours: u32, head_in: f64) -> (bool, String) {
+        let ik_top = argmax(ik_row);
+        match cfg().tier {
+            Tier::Real => (
+                ours == ik_top,
+                format!("argmax ours={ours} ik={ik_top} strict (real tier)"),
+            ),
+            Tier::Fixture => {
+                let (gap, cap) = (
+                    flip::head_gap(ik_row, ours),
+                    flip::head_cap(head_in, ik_row),
+                );
+                let tie = head_in.is_finite() && flip::head_tie(ik_row, ours, head_in);
+                let cmp = if tie { "≤" } else { "past" };
+                (
+                    tie,
+                    format!(
+                        "argmax ours={ours} ik={ik_top} tie: gap {gap:.3} {cmp} cap {cap:.3} \
+                         (fixture tier: head_tie at the run's head error {head_in:.4})"
+                    ),
+                )
+            }
+        }
+    }
+
+    /// A delta layer's free-running new-state term: the state's relative
+    /// distance from ik's, `state_rel`, over the larger of `gap` (the two
+    /// sides' 8-bit activations of ik's normed input) and `in_rel` (our layer
+    /// input's own relative distance from ik's: 0 at layer 0, whose input is
+    /// the exact embedding). A gap or an input distance that is not finite makes
+    /// the ratio infinite.
+    ///
+    /// PIN(2026-10-13): the free state term charges a layer for the stack's
+    /// upstream error as well as its own. Derivation: to first order the
+    /// state carries its input's relative error through a linear update, so
+    /// `state_rel` ≈ g · `in_rel` with a gain g of 0.73: the fixture's layer 0,
+    /// whose input is exact and so carries the 8-bit gap alone, reads
+    /// 3.94e-3 / 5.40e-3 = 0.73, and its layer 2, whose input is 1.48e-1 off,
+    /// reads 1.08e-1 / 1.48e-1 = 0.73, where the ratio over the gap alone
+    /// read 14.26. A layer whose input is off by more than the gap is held to
+    /// that gain, not to the gap; (t2) is the wiring catcher on ik's own input
+    /// and is unchanged.
+    fn state_ratio(state_rel: f64, gap: f64, in_rel: f64) -> f64 {
+        if !gap.is_finite() || !in_rel.is_finite() {
+            return f64::INFINITY;
+        }
+        state_rel / gap.max(in_rel).max(f64::MIN_POSITIVE)
+    }
+
     fn free(
         m: &mut Qwen35moeModel,
         which: &str,
@@ -1325,17 +1403,21 @@ mod gate {
         m.set_layer_taps(false)?;
         m.set_mode(StepMode::Graph);
         let ours = decode.logits.last().ok_or("no decode logits")?;
-        let (top, ik_top) = (argmax(ours), argmax(ik_last));
+        let top = argmax(ours);
         let worst = per_layer.iter().copied().fold(0.0f64, worse);
+        // The head reads the last position of the last layer's output, the one
+        // row ik keeps of that layer.
+        let head_in = *per_layer.last().ok_or("the model holds no layer")?;
+        let (argmax_ok, argmax_line) = head_argmax(ik_last, top, head_in);
         for (l, &e) in per_layer.iter().enumerate() {
             if l % 8 == 0 || l == n - 1 || e > FREE_BAND {
                 println!("free layer={l} l_out_rel={e:.3e}");
             }
         }
-        let ok = worst <= FREE_BAND && top == ik_top;
+        let ok = worst <= FREE_BAND && argmax_ok;
         println!(
             "free: {t_n} tokens {toks:?}, worst l_out_rel={worst:.3e} (band {FREE_BAND:.2}); last \
-             position argmax ours={top} ik={ik_top} logits_rel={:.3e} (printed) {}",
+             position {argmax_line} logits_rel={:.3e} (printed) {}",
             rel_to(ours, ik_last),
             verdict(ok)
         );
@@ -1977,8 +2059,11 @@ mod gate {
         let ik_logits = tap(&man, "result_output")?;
         let vocab = m.body("step_set")?.vocab();
         let ik_last = last_rows(&ik_logits, vocab, 1).ok_or("result_output")?;
-        let ik_top = argmax(ik_last);
         let (mut worst, mut worst_state) = (0.0f64, 0.0f64);
+        // Layer l's input is layer l − 1's output; layer 0's is the exact
+        // embedding. After the loop it holds the last layer's output distance,
+        // the head's input.
+        let mut in_rel = 0.0f64;
         for (l, got) in taps.iter().enumerate() {
             let want = tap(&man, &format!("l_out-{l}"))?;
             let want = last_rows(&want, HIDDEN, 1).ok_or("l_out")?;
@@ -2002,17 +2087,25 @@ mod gate {
                 };
                 let x_in = last_rows(&x_in, HIDDEN, 1).ok_or("input")?;
                 let gap = quant_gap_two_sided(&normed(x_in, &gains.attn_norm[l], HIDDEN), HIDDEN);
-                worst_state = worse(worst_state, rel_to(state, &t) / gap.max(f64::MIN_POSITIVE));
+                let state_rel = rel_to(state, &t);
+                let ratio = state_ratio(state_rel, gap, in_rel);
+                println!(
+                    "step {name} free layer={l} new_state: state_rel={state_rel:.3e} gap={gap:.3e} \
+                     in_rel={in_rel:.3e} ratio={ratio:.2}"
+                );
+                worst_state = worse(worst_state, ratio);
             }
             if l % 8 == 0 || l == taps.len() - 1 || e > FREE_BAND {
                 println!("step {name} free layer={l} l_out_rel={e:.3e}");
             }
+            in_rel = e;
         }
-        let mut ok = worst <= FREE_BAND && top == ik_top && worst_state <= RATIO_BAND;
+        let (argmax_ok, argmax_line) = head_argmax(ik_last, top, in_rel);
+        let mut ok = worst <= FREE_BAND && argmax_ok && worst_state <= RATIO_BAND;
         println!(
             "step {name} free: worst l_out_rel={worst:.3e} (band {FREE_BAND:.2}); worst new_state \
-             ratio {worst_state:.2} (band {RATIO_BAND}); argmax ours={top} ik={ik_top} \
-             logits_rel={:.3e} (printed) {}",
+             ratio {worst_state:.2} (band {RATIO_BAND}); {argmax_line} logits_rel={:.3e} \
+             (printed) {}",
             rel_to(&logits, ik_last),
             verdict(ok)
         );
