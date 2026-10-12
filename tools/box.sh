@@ -719,10 +719,14 @@ fi
 # release/build.sh --check는 바이너리만 읽고 빌드하지 않으므로 거치지 않는다. 그 부분만 빼고 보므로,
 # 같은 명령 안의 다른 release/build.sh 빌드는 여전히 확인을 거친다.
 # 확인은 BLOOMERY_BOX_ENV 뒤에 돈다: 거기서 CARGO_HOME이나 PATH를 바꾸면 빌드가 쓰는 그 설치를 확인한다.
+# The same commands take their llc from tools/oxide-llc.sh, which holds the LLVM major (21) and the pick: it is exported as
+# CUDA_OXIDE_LLC and named in one line, and an llc of another major, the Rust toolchain's own above all, is refused by
+# name (rc 70) before cuda-oxide's own order can reach it. Local mode runs the same check on this machine.
+OXLLC='{ __l=$(bash tools/oxide-llc.sh) || exit $?; export CUDA_OXIDE_LLC=$__l; unset __l; } && '
 OXCHECK=
 OXCMD=$*
 case "${OXCMD//release\/build.sh --check/}" in
-  *"cargo oxide"* | *"gate.sh --oxide"* | *"release/build.sh"*) OXCHECK=$OXCLI ;;
+  *"cargo oxide"* | *"gate.sh --oxide"* | *"release/build.sh"*) OXCHECK=$OXCLI$OXLLC ;;
 esac
 # serve의 build.rs가 `/props`의 version에 새기는 커밋. 박스 사본에는 .git이 없어서(rsync가 뺀다) 여기서 넘긴다.
 # 이 트리에 커밋에 없는 변경이 있으면 `-dirty`를 붙인다 — 그 바이너리는 그 커밋의 것이 아니다.

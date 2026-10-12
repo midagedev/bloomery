@@ -382,6 +382,16 @@ blk_checkrc() {
   fi
   echo "${crc##*$'\n'}"
 }
+# oxide-llc.sh is the llc a device build's PTX comes from (box.sh exports it as CUDA_OXIDE_LLC): its pick order and its
+# refusals of another LLVM major, a missing llc and one without NVPTX, on stub llcs in a temp dir, no build.
+blk_oxidellc() {
+  if ! olc=$(bash "$(dirname "$0")/oxide-llc.sh" --self-test 2>&1); then
+    echo "$olc" >&2
+    echo "check-recipes: the oxide-llc self-test failed" >&2
+    return 1
+  fi
+  echo "${olc##*$'\n'}"
+}
 # carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
 # pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
 # its box command: a recipe that stops calling it ends the check silently, so the call is held here.
@@ -654,7 +664,7 @@ PY
 }
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh checkrc carry pytools boxqcodes fixturevariants
+  maccheck gatebatch gpugate stackwatch ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh checkrc oxidellc carry pytools boxqcodes fixturevariants
   refsetpublish orphan archowner)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc

@@ -11,7 +11,7 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 | Rust | `nightly-2026-08-28`, with `rust-src`, `rustc-dev`, `llvm-tools`, `clippy`, `rustfmt` | `rust-toolchain.toml` |
 | cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `1691162ab9204ef21b0329c2e8059815420dfd5a` (upstream: NVIDIA/cuda-rust), source rev `87bc951864b79f723b4da9c11fa229f5600aefcb` | `[workspace.dependencies]` in `Cargo.toml` (NVIDIA/cuda-rust), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
 | `cargo-oxide` | 0.2.1, from the same fork and rev | the install command below; `cargo oxide doctor` must pass |
-| LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | on `PATH`, or `CUDA_OXIDE_LLC` |
+| LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | `CUDA_OXIDE_LLC`; `tools/oxide-llc.sh` holds the major and refuses another |
 | Clang | 21 with its resource headers (`clang-21` or `libclang-common-21-dev` on Ubuntu), for bindgen | on `PATH` |
 | CUDA toolkit | 13.3, with the cuRAND headers (`libcurand-dev` on Ubuntu) | `CUDA_TOOLKIT_PATH` |
 | NVIDIA driver | 615.71.09 on the development machine | — |
@@ -35,11 +35,12 @@ An environment like this one works on the development machine. Adjust the paths 
 
 ```sh
 export PATH=$HOME/.cargo/bin:$HOME/opt/LLVM-21.1.8-Linux-X64/bin:/usr/local/cuda-13.3/bin:$PATH
+export CUDA_OXIDE_LLC=$HOME/opt/LLVM-21.1.8-Linux-X64/bin/llc
 export CUDA_TOOLKIT_PATH=/usr/local/cuda-13.3
 cargo oxide doctor
 ```
 
-cuda-oxide's README says the pipeline prefers the `llc` of the Rust toolchain, then `llc-23`, `llc-22` and `llc-21` on `PATH`; `CUDA_OXIDE_LLC=/path/to/llc` pins one. Which `llc` the development machine's builds pick is set in its environment file, which is not in this repository.
+Set `CUDA_OXIDE_LLC` to LLVM 21's `llc`. Without it, cuda-oxide takes the Rust toolchain's own `llc` first (the `llvm-tools` component that `rust-toolchain.toml` installs, LLVM 23 on the pinned nightly), then `llc-23`, `llc-22` and `llc-21` on `PATH`. LLVM 23's PTX fuses one more multiply-add into the K-quant walks than LLVM 21's, so `gate-gpu-kquant`'s walks no longer agree bit for bit ([#54](https://github.com/midagedev/bloomery/issues/54)). Every command `tools/box.sh` runs that builds device code, on the box and in local mode, takes its `llc` from `tools/oxide-llc.sh`: `CUDA_OXIDE_LLC` when set, else `llc-21` on `PATH`, else `llc` on `PATH`. It names the one it picked in one line (`oxide-llc: <path> (LLVM 21.1.8)`), exports it as `CUDA_OXIDE_LLC`, and refuses an `llc` of another major or without the NVPTX target by name (rc 70). A `cargo oxide` you run yourself gets no such check, so set the variable in your environment.
 
 ## The CPU flag
 

@@ -587,7 +587,7 @@ run 'BLOOMERY_LOCK_DIR moves the lease and the holds' 0 "^$tmp/ld/bloomery-cpu\\
 # the last.
 B=$tmp/boxtree
 mkdir -p "$B/tools" "$tmp/stub"
-cp "$ROOT/tools/box.sh" "$B/tools/"
+cp "$ROOT/tools/box.sh" "$ROOT/tools/oxide-llc.sh" "$B/tools/"
 cp "$ROOT/Cargo.toml" "$B/"
 # The ssh stub answers the queue's one probe (flock -n -x on the dir lock) with $STUB_PROBE_RC, 0 where unset; the rsync stub
 # records its arguments and the .sync-id it was handed, and ends with $STUB_RSYNC_RC, 0 where unset.
@@ -912,7 +912,7 @@ chmod +x "$tmp/uname/uname"
 L=$tmp/locks-local
 SHOW='echo "pwd=$PWD card=$BLOOMERY_BOX_CARD locks=$BLOOMERY_LOCK_DIR oxide=${CUDA_OXIDE_BACKEND-unset} data=$BLOOMERY_DATA jobs=${CARGO_BUILD_JOBS-unset}"'
 boxl() {
-  box env -u CUDA_OXIDE_BACKEND -u CARGO_BUILD_JOBS PATH="$tmp/uname:$tmp/stub:$PATH" BLOOMERY_BOX_LOCAL=1 \
+  box env -u CUDA_OXIDE_BACKEND -u CUDA_OXIDE_LLC -u CARGO_BUILD_JOBS PATH="$tmp/uname:$tmp/stub:$PATH" BLOOMERY_BOX_LOCAL=1 \
     BLOOMERY_ENV_FILE="$tmp/local-env.sh" BLOOMERY_LOCK_DIR="$L" BLOOMERY_DATA="$tmp/data" "$@"
 }
 unreached() {
@@ -932,8 +932,21 @@ else
   mkdir -p "$tmp/oxpin"
   printf '#!/bin/sh\necho "cargo-oxide v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=x#%s):"\n' "${PIN:0:8}" > "$tmp/oxpin/cargo"
   chmod +x "$tmp/oxpin/cargo"
+  # ... and the llc pick (tools/oxide-llc.sh): a stub llc-21 on PATH passes it and is exported, one of LLVM 23 is refused.
+  llc_stub() { # llc_stub PATH VERSION
+    printf '#!/bin/sh\nprintf "  LLVM version %s\\n    nvptx64 - NVIDIA PTX 64-bit\\n"\n' "$2" > "$1"
+    chmod +x "$1"
+  }
+  llc_stub "$tmp/oxpin/llc-21" 21.1.8
+  mkdir -p "$tmp/llc23" && llc_stub "$tmp/llc23/llc" 23.1.0-rust-1.100.0-nightly
   run 'box.sh: local mode unsets the environment file'"'"'s CUDA_OXIDE_BACKEND and adds no backend check to cargo oxide' 0 'oxide=unset data=' \
-    boxl PATH="$tmp/oxpin:$tmp/uname:$tmp/stub:$PATH" BLOOMERY_ENV_FILE="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW"
+    boxl PATH="$tmp/oxpin:$tmp/uname:$tmp/stub:$PATH" BLOOMERY_ENV_FILE="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW && echo \"llc=\$CUDA_OXIDE_LLC\""
+  has 'box.sh: a cargo oxide command names its llc and exports it as CUDA_OXIDE_LLC' "^oxide-llc: $tmp/oxpin/llc-21 \\(LLVM 21\\.1\\.8\\)\$"
+  has 'box.sh: the command sees the picked llc' "^llc=$tmp/oxpin/llc-21\$"
+  printf 'export CUDA_OXIDE_LLC=%s/llc23/llc\n' "$tmp" > "$tmp/llc23-env.sh"
+  run 'box.sh: a cargo oxide command whose llc reports LLVM 23 is refused by name' 70 'reports LLVM 23\.1\.0-rust' \
+    boxl PATH="$tmp/oxpin:$tmp/uname:$tmp/stub:$PATH" BLOOMERY_ENV_FILE="$tmp/llc23-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && echo ran"
+  if grep -q '^ran$' "$tmp/out"; then fail 'box.sh: the refused llc ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the refused llc ran no command'; fi
   printf 'export BLOOMERY_LOCK_DIR=%s/elsewhere\n' "$tmp" > "$tmp/lockdir-env.sh"
   run "box.sh: local mode refuses an environment file that moves the lock directory after the guard" 64 \
     'the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode.s guard probed the lock directory' \
