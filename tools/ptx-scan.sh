@@ -55,8 +55,13 @@
 #   (tools/ptx-spill-check.sh) read the JIT columns and need the full scan. Every reader of a scan
 #   (tools/ref/ptx-canon.py, tools/recipes.py `affected --narrow`, tools/ptx-spill-check.sh) reads the
 #   banner's `jit=` and the cell, and never takes the marker for a value.
+#   tools/ptx-scan.sh --self-test exercises synthetic PTX with stub tools, no CUDA toolkit or card.
 # Output puts entries that have a depot first, then by name ascending — a depot is the defect and
 # the rest is context.
+# The appended ld.global.scalar, ld.global.v2 and ld.global.v4 columns count disjoint global
+# `ld` instructions, including .nc, .volatile and .acquire/.relaxed qualifiers and predication.
+# Scalar means no .vN qualifier. Comments, other spaces, `ldu` and device functions are excluded;
+# these are static instruction counts, not bytes or a count of memory transactions at runtime.
 #
 # After the table, a second block: a `ptx-scan-md5: method=<m>` line, then `<entry> <md5> <lines>` per
 # row of the table (the same filter), by name ascending. The md5 is of the entry's normalized body and
@@ -112,7 +117,7 @@
 # A spill in SASS is not a PTX local round-trip — an entry can show ld.local/st.local here and 0
 # spill bytes.
 #
-# The last two columns are what the card runs. The kernels reach it as PTX and the driver JITs
+# The jit_regs and jit_local columns are what the card runs. The kernels reach it as PTX and the driver JITs
 # them at load with its own compiler, which need not be the toolkit's ptxas; oxart_jit loads every
 # module the way cuda-core does (cuModuleLoadData, default JIT options) and reads, per entry:
 #   jit_regs   CU_FUNC_ATTRIBUTE_NUM_REGS — the registers a launch of the entry occupies
@@ -122,6 +127,192 @@
 # while another GPU gate holds it. Under --no-jit both columns read `skipped(no-jit)` and the banner's
 # three fields are the one field `jit=skipped(no-jit)`.
 set -uo pipefail
+
+# Synthetic PTX through the real scan, with extraction, assembly and JIT stubs;
+# no device or CUDA toolkit is opened. check-recipes runs this on every host.
+self_test() {
+  local self
+  self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
+  python3 - "$self" << 'PY'
+import importlib.util
+from contextlib import redirect_stdout
+import io
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+scanner = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("ptx_canon", scanner.parent / "ref/ptx-canon.py")
+canon = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(canon)
+
+with tempfile.TemporaryDirectory(prefix="ptx-scan-test.") as tmp:
+    root = Path(tmp)
+    fixture, binaries, tree = (root / name for name in ("fixture", "bin", "tree"))
+    for path in (fixture, binaries, tree / "target/release", tree / "tools"):
+        path.mkdir(parents=True)
+
+    def executable(path, text):
+        path.write_text("#!/bin/sh\n" + text, encoding="utf-8")
+        path.chmod(0o755)
+
+    executable(tree / "target/release/gate_x", "exit 0\n")
+    executable(binaries / "objcopy", 'for arg; do out=$arg; done\nprintf section > "$out"\n')
+    executable(binaries / "extract", '''
+mkdir -p "$3/norm"
+cp "$PTX_FIXTURE"/mod*.ptx "$3/"
+printf 'fixture\n' > "$3/norm-method"
+for entry in q4k_gemv zero_loads next_module; do
+    printf '%s\n' "$entry" > "$3/norm/$entry"
+done
+printf 'mod1 bundle=fixture bytes=1\nmod2 bundle=fixture bytes=1\n'
+''')
+    executable(binaries / "ptxas", '''
+case $1 in --version) echo 'Cuda compilation tools, release 13.3, V13.3.73'; exit 0 ;; esac
+[ "${PTX_FIX_FAIL:-0}" = 0 ] || { echo 'fixture assembly failure' >&2; exit 1; }
+for arg; do case $arg in *.ptx) module=${arg##*/} ;; esac; done
+case $module in
+    mod1.ptx)
+        printf "ptxas info : Compiling entry function 'q4k_gemv' for 'sm_86'\nptxas info : 4 bytes spill stores, 4 bytes spill loads\nptxas info : Used 32 registers, 256 bytes smem\n"
+        printf "ptxas info : Compiling entry function 'zero_loads' for 'sm_86'\nptxas info : 0 bytes spill stores, 0 bytes spill loads\nptxas info : Used 12 registers\n" ;;
+    mod2.ptx)
+        printf "ptxas info : Compiling entry function 'next_module' for 'sm_86'\nptxas info : 0 bytes spill stores, 0 bytes spill loads\nptxas info : Used 16 registers, 128 bytes smem\n" ;;
+esac >&2
+''')
+    executable(tree / "tools/gpu-gate.sh", '''
+printf '# card=fixture cc=86 cuda_driver=13030\n'
+printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t0\t128\t64\n'
+''')
+    (fixture / "mod1.ptx").write_text('''
+.version 8.0
+.visible .entry q4k_gemv()
+.reqntid 128, 1, 1
+{
+    .local .b8 __local_depot0[8];
+    ld.local.u32 %r1, [%rd1];
+    st.local.u32 [%rd1], %r1;
+    fma.rn.f32 %f1, %f2, %f3, %f4;
+    cvt.f32.f16 %f1, %h1;
+    ld.global.u32 %r1, [%rd1];
+    ld.global.nc.f32 %f1, [%rd1];
+    ld.volatile.global.u64 %rd2, [%rd1];
+    ld.acquire.gpu.global.u32 %r1, [%rd1];
+    ld.relaxed.sys.global.u32 %r1, [%rd1];
+    @%p1 ld.global.L1::evict_last.L2::128B.u32 %r1, [%rd1];
+    ld.global.v2.u32 {%r1, %r2}, [%rd1];
+    ld.global.nc.v2.u32 {%r1, %r2}, [%rd1];
+    ld.volatile.global.v2.u32 {%r1, %r2}, [%rd1];
+    ld.global.v4.u32 {%r1, %r2, %r3, %r4}, [%rd1];
+    ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%r1, %r2, %r3, %r4}, [%rd1];
+    @!%p1 ld.global.L2::128B.v4.u32 {%r1, %r2, %r3, %r4}, [%rd1];
+    ld.global.u32 %r1, [%rd1];ld.global.v2.u32 {%r1, %r2}, [%rd1];
+    ld.shared.v4.u32 {%r1, %r2, %r3, %r4}, [%rd1];
+    ld.v4.u32 {%r1, %r2, %r3, %r4}, [%rd1];
+    ldu.global.v4.u32 {%r1, %r2, %r3, %r4}, [%rd1];
+    st.global.v4.u32 [%rd1], {%r1, %r2, %r3, %r4};
+    // ld.global.v2.u32 %r1, [%rd1]; ld.global.v4.u32 %r1, [%rd1];
+    /* ld.global.u32 %r1, [%rd1];
+       ld.global.v4.u32 %r1, [%rd1]; */
+    ret; // ld.global.u32 %r1, [%rd1];
+}
+.func helper()
+{
+    ld.global.v4.u32 {%r1, %r2, %r3, %r4}, [%rd1];
+    fma.rn.f32 %f1, %f2, %f3, %f4;
+}
+.visible .entry zero_loads()
+{
+    ret;
+}
+''', encoding="utf-8")
+    (fixture / "mod2.ptx").write_text('''
+.visible .entry next_module()
+.reqntid 64, 1, 1
+{
+    ld.global.v2.u32 {%r1, %r2}, [%rd1];
+}
+''', encoding="utf-8")
+    env = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ["PATH"],
+               PTX_FIXTURE=str(fixture), PTX_SCAN_PTXAS=str(binaries / "ptxas"),
+               PTX_SCAN_EXTRACT=str(binaries / "extract"), PTX_SCAN_ARCH="sm_86")
+    failures, cases = [], 0
+
+    def check(name, ok):
+        global cases
+        cases += 1
+        print(("ok " if ok else "FAIL ") + name)
+        if not ok:
+            failures.append(name)
+
+    def scan(args, extra=None):
+        return subprocess.run(["bash", str(scanner), *args], cwd=tree,
+                              env=dict(env, **(extra or {})), capture_output=True, text=True)
+
+    def parsed(result):
+        path = root / "scan"
+        path.write_text(result.stdout, encoding="utf-8")
+        return canon.parse_scan(path)
+
+    result = scan(["--no-jit", "gate_x"])
+    check("fixture scan succeeds", result.returncode == 0)
+    if result.returncode:
+        print(result.stdout + result.stderr)
+        sys.exit(1)
+    method, header, rows, digests, nojit = parsed(result)
+    added = ["ld.global.scalar", "ld.global.v2", "ld.global.v4"]
+    legacy = "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local".split()
+    check("global-load columns appended", header == legacy + added)
+    if header != legacy + added:
+        print("got columns:", " ".join(header))
+        sys.exit(1)
+    check("scalar/vector widths, qualifiers, predicates and comments",
+          rows["q4k_gemv"][-3:] == ["7", "4", "3"])
+    check("device function excluded and next entry reset", rows["zero_loads"][-3:] == ["0", "0", "0"])
+    check("module boundary resets counts", rows["next_module"][-3:] == ["0", "1", "0"])
+    check("legacy counts, occupancy and no-jit cells preserved",
+          rows["q4k_gemv"][:-3] == "128 YES 1 1 1 1 32 256 8 12 skipped(no-jit) skipped(no-jit)".split()
+          and rows["zero_loads"][:-3] == "- no 0 0 0 0 12 0 0 - skipped(no-jit) skipped(no-jit)".split()
+          and rows["next_module"][:-3] == "64 no 0 0 0 0 16 128 0 16 skipped(no-jit) skipped(no-jit)".split())
+    check("depot-first row order and digest coverage", list(rows) == ["q4k_gemv", "next_module", "zero_loads"]
+          and set(digests) == set(rows) and method == "fixture" and nojit)
+    selected = scan(["gate_x", "q4k", "--no-jit"])
+    _, sh, sr, sd, _ = parsed(selected)
+    check("entry filter preserves row and digest", selected.returncode == 0 and sh == header
+          and sr == {"q4k_gemv": rows["q4k_gemv"]} and sd == {"q4k_gemv": digests["q4k_gemv"]})
+    assembled = scan(["gate_x"])
+    _, ah, ar, ad, an = parsed(assembled)
+    check("full scan layout and JIT columns", assembled.returncode == 0 and ah == header and not an
+          and ar["q4k_gemv"] == rows["q4k_gemv"][:10] + ["32", "0"] + ["7", "4", "3"]
+          and ad == digests)
+    missing = scan(["--no-jit", "gate_x", "absent"])
+    check("empty filter remains a failed scan", missing.returncode == 1
+          and "rows=0 scan=failed" in missing.stdout and "entry " not in missing.stdout)
+    rejected = scan(["--no-jit", "gate_x"], {"PTX_FIX_FAIL": "1"})
+    check("assembler failure prints no rows", rejected.returncode == 1
+          and "ptxas-failed=mod1,mod2 scan=failed" in rejected.stdout and "entry " not in rejected.stdout)
+    before, after = root / "before.scan", root / "after.scan"
+    before.write_text(result.stdout, encoding="utf-8")
+    after.write_text(result.stdout, encoding="utf-8")
+    with redirect_stdout(io.StringIO()):
+        same = canon.compare_scans(before, after)
+    check("scan comparison accepts added columns", not same)
+    path = fixture / "mod2.ptx"
+    path.write_text(path.read_text(encoding="utf-8").replace("ld.global.v2.u32", "ld.global.v4.u32"), encoding="utf-8")
+    changed = scan(["--no-jit", "gate_x"])
+    after.write_text(changed.stdout, encoding="utf-8")
+    with redirect_stdout(io.StringIO()):
+        moved = canon.compare_scans(before, after)
+    check("scan comparison sees a load-width change", changed.returncode == 0 and moved)
+    print(f"ptx-scan: self-test {'FAIL' if failures else 'ok'} ({cases} cases, {len(failures)} failed)")
+    sys.exit(bool(failures))
+PY
+}
+if [ "$#" = 1 ] && [ "$1" = --self-test ]; then
+  self_test
+  exit $?
+fi
 NOJIT=0
 WORDS=()
 for W in "$@"; do
@@ -273,7 +464,7 @@ if ! LC_ALL=C awk -v filter="$FILTER" -v tbl="$TBL" -v unread="$UNREAD" -v jit="
   -v jitunread="$JITUNREAD" -v callsf="$CALLS" -v nojit="$NOJIT" '
 BEGIN {
   # A skipped cell is a word, not a number: the JIT columns widen to hold it.
-  fmt = "%d\t%-28s %8s %6s %9d %9d %6d %8d %6s %6s %6s %14s " (nojit ? "%15s %15s" : "%8s %9s") "\n"
+  fmt = "%d\t%-28s %8s %6s %9d %9d %6d %8d %6s %6s %6s %14s " (nojit ? "%15s %15s" : "%8s %9s") " %16d %12d %12d\n"
   while ((getline line < tbl) > 0) {
     split(line, f, "\t"); R[f[1]] = f[2]; S[f[1]] = f[3]; P[f[1]] = f[4]
   }
@@ -312,12 +503,13 @@ function flush(   have, hj) {
            (ntid == "" ? "-" : ntid), (depot ? "YES" : "no"), ldl, stl, fma, cvt,
            (have ? R[name] : "-"), (have ? S[name] : "-"), (have ? P[name] : "-"),
            (have ? blocks(ntid, R[name], S[name]) : "-"),
-           (nojit ? "skipped(no-jit)" : (hj ? JR[name] : "-")), (nojit ? "skipped(no-jit)" : (hj ? JL[name] : "-"))
+           (nojit ? "skipped(no-jit)" : (hj ? JR[name] : "-")), (nojit ? "skipped(no-jit)" : (hj ? JL[name] : "-")),
+           ldg, ldg2, ldg4
     if (calls > 0) printf "%s:%d\n", name, calls > callsf
   }
   name = ""
 }
-function reset() { ntid = ""; depot = 0; ldl = 0; stl = 0; fma = 0; cvt = 0; calls = 0 }
+function reset() { ntid = ""; depot = 0; ldl = 0; stl = 0; fma = 0; cvt = 0; calls = 0; ldg = 0; ldg2 = 0; ldg4 = 0 }
 function tally(line, needle,   n, s) { n = 0; s = line
   while ((i = index(s, needle)) > 0) { n++; s = substr(s, i + length(needle)) }
   return n }
@@ -326,8 +518,38 @@ function tally(line, needle,   n, s) { n = 0; s = line
 function tally_call(line,   n, s) { n = 0; s = line
   while (match(s, /(^|[ \t{;])call[. \t]/)) { n++; s = substr(s, RSTART + RLENGTH - 1) }
   return n }
+# Strip comments only for the new columns; the legacy columns keep their own reading.
+function global_code(line,   out, p, q) {
+  out = ""
+  while (line != "") {
+    if (comment) {
+      q = index(line, "*/")
+      if (!q) return out
+      line = substr(line, q + 2); comment = 0
+      continue
+    }
+    p = index(line, "/*"); q = index(line, "//")
+    if (q && (!p || q < p)) return out substr(line, 1, q - 1)
+    if (!p) return out line
+    out = out substr(line, 1, p - 1) " "
+    line = substr(line, p + 2); comment = 1
+  }
+  return out
+}
+# Read the whole mnemonic: state space and vector width need not follow ld immediately.
+function tally_global(line,   op) {
+  while (match(line, /(^|[ \t{;])ld\.[[:alnum:]_.:]+/)) {
+    op = substr(line, RSTART, RLENGTH); sub(/^[ \t{;]/, "", op)
+    line = substr(line, RSTART + RLENGTH)
+    if (op !~ /(^|\.)global(\.|$)/) continue
+    if (op ~ /\.v2(\.|$)/) ldg2++
+    else if (op ~ /\.v4(\.|$)/) ldg4++
+    else if (op !~ /\.v[0-9]+(\.|$)/) ldg++
+  }
+}
 # An entry body ends at the next entry or at the end of its module, never in the next module.
-FNR == 1 { flush(); reset() }
+FNR == 1 { flush(); reset(); comment = 0 }
+{ global_line = global_code($0) }
 /\.visible \.entry / {
   flush(); reset()
   name = $0
@@ -348,6 +570,7 @@ name != "" {
   fma += tally($0, "fma.")
   cvt += tally($0, "cvt.f32.f16")
   calls += tally_call($0)
+  tally_global(global_line)
 }
 END { flush() }
 ' "${MODFILES[@]}" | LC_ALL=C sort -k1,1n -k2,2 | cut -f2- >"$ROWS"; then
@@ -393,8 +616,9 @@ fi
 echo "ptx-scan bin=$BIN $SEC $TOOLS modules=$NMOD${FILTER:+ filter=$FILTER} $JITS${CALLERS:+ calls=$CALLERS}"
 JFMT='%8s %9s'
 [ "$NOJIT" = 1 ] && JFMT='%15s %15s'
-printf "%-28s %8s %6s %9s %9s %6s %8s %6s %6s %6s %14s $JFMT\n" \
-  entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill 'blk/SM(static)' jit_regs jit_local
+printf "%-28s %8s %6s %9s %9s %6s %8s %6s %6s %6s %14s $JFMT %16s %12s %12s\n" \
+  entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill 'blk/SM(static)' jit_regs jit_local \
+  ld.global.scalar ld.global.v2 ld.global.v4
 cat "$ROWS"
 echo "ptx-scan-md5: method=$METHOD"
 cat "$DIGESTS"
