@@ -17,12 +17,12 @@
 //! loads, the same iteration pairs ([`Q4K_ITER_UNROLL`]) and the same
 //! rounding ([`q4k_acc`]), so [`Q4k`] through this walk is `q4k_gemv_sel`'s
 //! arithmetic bit for bit, and column `c` of [`row_dot`] is [`row_dot_1col`]
-//! on that column bit for bit, for every format. Keep the pair-unrolled
-//! loop and the term's expression as they are: the backend's contraction
-//! of the term into its accumulator follows the basic blocks around it
-//! (`cores::q4k_acc` says which terms fuse).
+//! on that column bit for bit, for every format. Both walks form every term
+//! by [`q4k_sub_value`] and fold it with [`q4k_acc`]'s rounding, each
+//! operation spelled, so their sums cannot be contracted differently.
 
 use crate::cores::{Q4K_ITER_UNROLL, q4k_a_chain, q4k_acc, q4k_sb_decode, q4k_sub_value};
+use cuda_device::float::{add_rn_f32, mul_rn_f32};
 
 /// One K-quant format's super-block decode for Walk A.
 pub trait SbDecode {
@@ -58,9 +58,10 @@ impl SbDecode for Q4k {
 
 /// One iteration's term of the single-column walk: super-block `4·it +
 /// grp`'s decode, the A chain against the column whose planes start at
-/// `qb0`/`s8b0`/`d8b0`, and the sub-block's value times its block scale —
-/// the one value [`row_dot_1col`] adds. Every load the iteration makes is
-/// here and none of the walk's accumulation is.
+/// `qb0`/`s8b0`/`d8b0`, and the sub-block's value ([`q4k_sub_value`]) and
+/// block scale, the pair [`row_dot_1col`] folds with [`q4k_acc`]'s
+/// rounding. Every load the iteration makes is here and none of the walk's
+/// accumulation is.
 ///
 /// # Safety
 ///
@@ -85,7 +86,7 @@ pub unsafe fn iter_term<D: SbDecode>(
     s: usize,
     grp: usize,
     lane: usize,
-) -> f32 {
+) -> (f32, f32) {
     let sbp = 4 * it as usize + grp;
     // SAFETY: sbp < n_sb by this fn's contract, so the super-block's words
     // are inside row `row_abs` of `w`.
@@ -98,7 +99,7 @@ pub unsafe fn iter_term<D: SbDecode>(
     let b = unsafe { *s8.get_unchecked(s8b0 + s8b) };
     // SAFETY: sbp < n_sb keeps d8b < 2·n_sb inside the column's d8 words.
     let e0 = unsafe { *d8.get_unchecked(d8b0 + d8b) };
-    (a as f32 * cda + b as f32 * cdb) * e0
+    (q4k_sub_value(a, b, cda, cdb), e0)
 }
 
 /// One row's dot with one q8_1 column, lane `lane`'s partial (the caller
@@ -144,13 +145,15 @@ pub unsafe fn row_dot_1col<D: SbDecode>(
     while it + Q4K_ITER_UNROLL <= full {
         // SAFETY: it + Q4K_ITER_UNROLL <= full, so each term's super-block
         // is inside the row; the rest is this fn's contract.
-        let t0 = unsafe {
+        let (x0, e0) = unsafe {
             iter_term::<D>(
                 w, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
             )
         };
-        // SAFETY: as t0, at it + 1.
-        let t1 = unsafe {
+        // `q4k_acc`'s split, its product formed before the second term.
+        let t0 = mul_rn_f32(e0, x0);
+        // SAFETY: as the first term, at it + 1.
+        let (x1, e1) = unsafe {
             iter_term::<D>(
                 w,
                 q,
@@ -167,8 +170,8 @@ pub unsafe fn row_dot_1col<D: SbDecode>(
                 lane,
             )
         };
-        f0 += t0;
-        f0 += t1;
+        f0 = add_rn_f32(f0, t0);
+        f0 = q4k_acc(f0, x1, e1, false);
         it += Q4K_ITER_UNROLL;
     }
     while it < iters {
@@ -177,11 +180,12 @@ pub unsafe fn row_dot_1col<D: SbDecode>(
         // when n_sb is a multiple of 4.
         if sbp < n_sb {
             // SAFETY: the guard is this term's super-block bound.
-            f0 += unsafe {
+            let (x, e) = unsafe {
                 iter_term::<D>(
                     w, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
                 )
             };
+            f0 = q4k_acc(f0, x, e, false);
         }
         it += 1;
     }

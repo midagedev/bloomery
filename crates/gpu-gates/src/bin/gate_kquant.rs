@@ -435,7 +435,7 @@ mod gate {
             if sbp < n_sb {
                 // SAFETY: sbp < n_sb keeps the super-block inside row
                 // `row_abs` and the term's plane reads inside column `col`.
-                let ((vi, cda, cdb), term) = unsafe {
+                let ((vi, cda, cdb), (x, e)) = unsafe {
                     (
                         D::decode(w, row * D::WORDS * n_sb + D::WORDS * sbp, s),
                         iter_term::<D>(
@@ -469,7 +469,7 @@ mod gate {
                     *out.get_unchecked_mut(b + 7) = vi[7];
                     *out.get_unchecked_mut(b + 8) = cda.to_bits();
                     *out.get_unchecked_mut(b + 9) = cdb.to_bits();
-                    *out.get_unchecked_mut(b + 10) = term.to_bits();
+                    *out.get_unchecked_mut(b + 10) = (x * e).to_bits();
                 }
             }
             it += 1;

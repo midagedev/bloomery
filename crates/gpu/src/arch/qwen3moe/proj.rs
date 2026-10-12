@@ -16,8 +16,8 @@
 //! `qwen3moe_o_resid_q4k_mcol`) run the pass (m = 2..=8), one
 //! `cores::q4k_row_dot` a row for all `m` columns, so each weight word is
 //! read once instead of `m` times; that walk's column c is the one-column
-//! body on that column bit for bit — it follows the body's compiled
-//! rounding term for term (`cores::q4k_acc`), a property `gate_mcol` pins
+//! body on that column bit for bit — both fold every term by
+//! `cores::q4k_acc`'s rule, a property `gate_mcol` pins
 //! on the shared `q4k_gemv` pair up to K = 8192 — so each output, from
 //! either entry, is bit for bit the value the per-matrix `q4k_gemv` launch
 //! writes at one column, and the residual output is that value plus the

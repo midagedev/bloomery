@@ -224,25 +224,24 @@ pub(crate) fn q4k_coeff(d: f32, dmin: f32, sc: i32, mi: i32) -> (f32, f32) {
     (cda, cdb)
 }
 
-/// One sub-block's dot before its q8_1 block scale, as the m-column walk
-/// forms it: fma(cda, A, cdb·B), the B product rounded first — the
-/// contraction the backend gives [`q4k_row_dot_1col`]'s `a*cda + b*cdb`.
+/// One sub-block's dot before its q8_1 block scale: fma(cda, A, cdb·B), the
+/// B product rounded first, both operations spelled. Both Q4_K walks form
+/// every term here.
 #[inline(always)]
 pub(crate) fn q4k_sub_value(a: i32, b: i32, cda: f32, cdb: f32) -> f32 {
     fma_rn_f32(cda, a as f32, mul_rn_f32(cdb, b as f32))
 }
 
-/// One step of the m-column Q4_K walk's accumulator: `f + round(e·x)` when
-/// `split`, else `fma(e, x, f)`, every operation spelled. This is the
-/// rounding [`q4k_row_dot_1col`]'s `+=` compiles to: in each pair of
-/// iterations `2j, 2j + 1` of its guard-free prefix (`2j + 2 <= n_sb / 4`)
-/// the first term's product and its add sit in different basic blocks —
-/// the second super-block's decode branches between them — so they stay
-/// two rounded operations, while the pair's second term and each term of
-/// the guarded tail contract to one fused multiply-add. The m-column walk splits
-/// exactly those terms, so column c of an m-column launch is the
-/// one-column launch of that column bit for bit; `gate_mcol` pins it on
-/// every K the step runs.
+/// One step of a Q4_K row walk's accumulator: `f + round(e·x)` when
+/// `split`, else `fma(e, x, f)`, every operation spelled. In each pair of
+/// iterations `2j, 2j + 1` of the guard-free prefix (`2j + 2 <= n_sb / 4`)
+/// the first term splits, while the pair's second term and each term of the
+/// guarded tail take one fused multiply-add. Which terms split is a sum
+/// order, as [`Q4K_ITER_UNROLL`] is: every Q4_K bit pin and the host mirror
+/// (`qdot`'s `card_q4k_lane_walk`) hold this one. The m-column walk folds
+/// every term here and [`q4k_row_dot_1col`] spells the same steps, so column
+/// c of an m-column launch is the one-column launch of that column bit for
+/// bit; `gate_mcol` pins it on every K the step runs.
 #[inline(always)]
 pub(crate) fn q4k_acc(f: f32, x: f32, e: f32, split: bool) -> f32 {
     if split {
@@ -305,10 +304,11 @@ pub(crate) fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f
 
 /// One iteration's term of a single-column Q4_K row walk: the super-block
 /// `sbp`'s decode, this lane's A chain against column `col0`'s q8 window,
-/// and the sub-block sum, as the one value the walk adds to its
-/// accumulator. Every load the iteration makes is in here, and none of the
-/// walk's accumulation is — which is what lets the walk issue several
-/// iterations' loads before the first add.
+/// and the sub-block sum, as the sub-block value ([`q4k_sub_value`]) and
+/// block scale the walk folds with [`q4k_acc`]'s rounding. Every load the
+/// iteration makes is in here, and none of the walk's accumulation is —
+/// which is what lets the walk issue several iterations' loads before the
+/// first add.
 ///
 /// SAFETY: callers guarantee `sbp < n_sb` and the buffer lengths of
 /// [`q4k_row_dot`] at `m_cols` 1.
@@ -331,7 +331,7 @@ fn q4k_iter_term(
     s: usize,
     grp: usize,
     lane: usize,
-) -> f32 {
+) -> (f32, f32) {
     let sbp = 4 * it as usize + grp;
     // SAFETY: sbp < n_sb by this fn's contract, so the super-block's words
     // wk..wk+35 are inside row `row_abs` of `w`.
@@ -346,7 +346,7 @@ fn q4k_iter_term(
     // SAFETY: sbp < n_sb keeps d8b < 2*n_sb, and d8.len() >=
     // (col0+1)*2*n_sb by the contract.
     let e0 = unsafe { *d8.get_unchecked(d8b0 + d8b) };
-    (a as f32 * cda + b as f32 * cdb) * e0
+    (q4k_sub_value(a, b, cda, cdb), e0)
 }
 
 /// Iterations of the single-column Q4_K walk whose loads are issued before
@@ -414,10 +414,12 @@ pub(crate) fn q4k_row_dot_1col(
     while it + Q4K_ITER_UNROLL <= full {
         // SAFETY: it + Q4K_ITER_UNROLL <= full, so each term's `sbp < n_sb`;
         // the rest of the contract is this fn's.
-        let t0 = q4k_iter_term(
+        let (x0, e0) = q4k_iter_term(
             w, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
         );
-        let t1 = q4k_iter_term(
+        // `q4k_acc`'s split, its product formed before the second term.
+        let t0 = mul_rn_f32(e0, x0);
+        let (x1, e1) = q4k_iter_term(
             w,
             q,
             s8,
@@ -432,8 +434,8 @@ pub(crate) fn q4k_row_dot_1col(
             grp,
             lane,
         );
-        f0 += t0;
-        f0 += t1;
+        f0 = add_rn_f32(f0, t0);
+        f0 = q4k_acc(f0, x1, e1, false);
         it += Q4K_ITER_UNROLL;
     }
     while it < iters {
@@ -442,9 +444,10 @@ pub(crate) fn q4k_row_dot_1col(
         // and is always true when n_sb is a multiple of 4.
         if sbp < n_sb {
             // SAFETY: the guard is this term's `sbp < n_sb` precondition.
-            f0 += q4k_iter_term(
+            let (x, e) = q4k_iter_term(
                 w, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
             );
+            f0 = q4k_acc(f0, x, e, false);
         }
 
         it += 1;
