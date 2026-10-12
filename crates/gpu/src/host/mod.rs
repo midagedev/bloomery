@@ -567,10 +567,24 @@ impl OpenCall {
         }
     }
 
-    /// The state after the pass that ran keeps its rows: an open pass is
-    /// closed. A keep with no pass open changes nothing (a step's keep on a
-    /// load that opened no boundary), and a boundary made ahead stays for its
-    /// launch to take.
+    /// Refused by name, as the machine refuses it
+    /// ([`swap::SwapMachine::refuse_if_ahead`]): kept rows while a boundary
+    /// made ahead waits for its launch, whose pass has not run. Nothing
+    /// else is refused, a keep with no call open included.
+    fn refuse_keep(self) -> Result<(), GpuError> {
+        match self {
+            OpenCall::Ahead => Err(GpuError::protocol(
+                "HostTier::keep_rows",
+                "a boundary was made ahead of its pass and no launch has taken it \
+                 (SwapMachine::take_ahead): the pass it opened has not run",
+            )),
+            OpenCall::Closed | OpenCall::Open => Ok(()),
+        }
+    }
+
+    /// The state after the pass that ran keeps its rows ([`OpenCall::refuse_keep`]
+    /// passed): an open pass is closed. A keep with no pass open changes
+    /// nothing (a step's keep on a load that opened no boundary).
     fn after_keep(self) -> OpenCall {
         match self {
             OpenCall::Open => OpenCall::Closed,
@@ -1037,11 +1051,14 @@ impl<H: HostExperts> HostTier<H> {
     /// Refused by name — the write side of the refusal the
     /// next boundary makes ([`pass_kept`]) — rows kept with no pass
     /// open, and ones kept while a boundary made ahead waits for its launch
-    /// (the pass it opened has not run). Without a machine nothing is
-    /// refused: the keep closes the open call ([`OpenCall::after_keep`]).
+    /// (the pass it opened has not run). Without a machine only the second
+    /// is refused ([`OpenCall::refuse_keep`]): the keep closes the open call
+    /// ([`OpenCall::after_keep`]), and a keep with no call open is a step's
+    /// keep on a load that opened no boundary.
     pub fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::keep_rows";
         let Some(m) = self.swap.as_ref() else {
+            self.call_open.refuse_keep()?;
             self.call_open = self.call_open.after_keep();
             return Ok(());
         };
@@ -3200,8 +3217,9 @@ mod tests {
     /// A step's order without a machine: launch, keep, the next pass's
     /// boundary made ahead, then the next launch takes it without a refusal
     /// and its keep closes the call. A boundary made ahead while another
-    /// waits is refused by name, and a keep leaves the waiting one for its
-    /// launch.
+    /// waits is refused by name, and the state a keep leaves the waiting one
+    /// in is for its launch ([`HostTier::keep_rows`] refuses that keep
+    /// first).
     #[test]
     fn a_boundary_made_ahead_is_taken_by_the_next_launch_without_a_machine() {
         let mut call = OpenCall::Closed;
@@ -3226,5 +3244,30 @@ mod tests {
             call = call.after_boundary(true).expect("the next ahead");
         }
         assert_eq!(call, OpenCall::Ahead);
+    }
+
+    /// A keep while a boundary made ahead waits for its launch is refused by
+    /// name without a machine, as the machine refuses it; a keep in any other
+    /// state is not, and the launch that takes the boundary lets the keep
+    /// through.
+    #[test]
+    fn a_keep_while_a_boundary_waits_ahead_is_refused_by_name_without_a_machine() {
+        let ahead = OpenCall::Closed
+            .after_boundary(true)
+            .expect("a boundary made ahead");
+        let err = ahead
+            .refuse_keep()
+            .expect_err("a keep while a boundary waits ahead");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("HostTier::keep_rows: ")
+                && text.contains("was made ahead of its pass and no launch has taken it")
+                && text.contains("the pass it opened has not run"),
+            "{text}"
+        );
+        let open = ahead.after_boundary(false).expect("the launch takes it");
+        assert_eq!(open, OpenCall::Open);
+        assert!(open.refuse_keep().is_ok());
+        assert!(OpenCall::Closed.refuse_keep().is_ok());
     }
 }

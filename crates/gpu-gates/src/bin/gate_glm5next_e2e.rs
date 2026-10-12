@@ -4133,6 +4133,7 @@ mod gate {
             "a pass of several slots: a call at position",
         );
         m.rollback(pos + 2)?;
+        m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
         let recaptured = m.capture_rows::<2>()?;
         let out = m.step_slots(&[(0, &[sa.ids[2]]), (1, &[runs[1].ids[0]])])?;
         let pass_logits: Vec<u64> = m
@@ -4829,6 +4830,7 @@ mod gate {
             .map(|l| Fnv1a64::default().f32s(l).value())
             .collect();
         m.rollback(pos + u32::try_from(PAIR)?)?;
+        m.keep_rows(KeptRows::prefix(PAIR), PassKind::Pair)?;
         let recaptured = m.capture_rows::<PAIR>()?;
         let rows = [[sa.ids[2], sa.ids[3]], [g[1].ids[0], sb.ids[1]]];
         let replay = match m.verify_slots(&[(0, &rows[0][..]), (1, &rows[1][..])]) {

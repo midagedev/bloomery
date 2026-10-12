@@ -346,6 +346,7 @@ mod gate {
         TargetRows, seq38_bytes,
     };
     use bloomery_gpu::head::Head;
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::batch::HOT_COLS;
     use bloomery_gpu::host::handoff::{HandoffKernels, Places};
     use bloomery_gpu::host::swap::Residency;
@@ -373,6 +374,7 @@ mod gate {
     use model::placement::{Device, PlanLevers};
     use refset::arch::qwen4exp::fixture;
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
+    use runtime::swaprule::KeptRows;
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
@@ -1761,6 +1763,7 @@ mod gate {
             after.cols_served - before.cols_served,
         ];
         m.rollback(pos0 + k as u32)?;
+        m.keep_rows(KeptRows::prefix(k), PassKind::Pair)?;
         m.set_mode(StepMode::Graph);
         let (stores, ple_ring) = stores(m)?;
         let lane = m.body("verify")?.lane();
@@ -2141,6 +2144,7 @@ mod gate {
             verdict(named)
         );
         m.rollback(PREFIX as u32 + 2)?;
+        m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
         let got = m.rollback(PREFIX as u32);
         let named = matches!(&got, Err(e) if e.to_string().contains("with no verify waiting"));
         ok &= named;
@@ -2303,6 +2307,7 @@ mod gate {
             Call::Verify => {
                 let [_, last] = m.rows_logits::<2>()?;
                 m.rollback(PREFIX as u32 + 2)?;
+                m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
                 last
             }
             Call::Step | Call::Pass => m.logits()?,
@@ -4394,6 +4399,7 @@ mod gate {
             verdict(pending_ok)
         );
         m.rollback(at + 2)?;
+        m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
         // The rollback of slot 1 leaves slot 0's continuation its solo run's.
         let iso_ok = s.continues(0)?;
         println!(

@@ -838,11 +838,10 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
     }
 
     fn commit(&mut self, accepted: usize) -> Result<(), SessionError> {
-        let r = self.rows.take().ok_or_else(|| {
+        let r = self.rows.ok_or_else(|| {
             SessionError::Refused(format!("a commit of {accepted} rows with no verify"))
         })?;
         if !(1..=r.m).contains(&accepted) {
-            self.rows = Some(r);
             return Err(SessionError::Refused(format!(
                 "a commit of {accepted} rows of a verify of {}",
                 r.m
@@ -855,9 +854,15 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
         let back = r.first
             + u32::try_from(accepted)
                 .map_err(|_| SessionError::Refused(format!("{accepted} accepted rows pass u32")))?;
+        // The rows stay in flight until the rollback and the keep have both
+        // taken: a failed one leaves the verify's call open, so the session
+        // still refuses every other call by name, and the way out is this
+        // commit again (a rollback to the position the body stands at takes
+        // nothing back) or `reset`, which abandons the pass at 0 rows kept.
         self.model.rollback(back)?;
         self.model
             .keep_rows(KeptRows::prefix(accepted), PassKind::Pair)?;
+        self.rows = None;
         Ok(())
     }
 }

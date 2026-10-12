@@ -115,6 +115,7 @@ mod ds41_tier;
 mod gate {
     use std::time::Instant;
 
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::batch::TierBatchStats;
     use bloomery_gpu::hybrid::{BEGIN_GROUP, Chain, PoisonKind};
     use bloomery_gpu::model::StepMode;
@@ -135,6 +136,7 @@ mod gate {
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::place::tier_batch;
     use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row, workstation};
+    use runtime::swaprule::KeptRows;
 
     use crate::dspark;
 
@@ -467,6 +469,7 @@ mod gate {
             let second = prompt[k % prompt.len()];
             let [a, b] = m.step_rows([tok, second])?;
             let [la, lb] = m.rows_logits::<2>()?;
+            m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
             run.push(a, la);
             run.push(b, lb);
             tok = b;

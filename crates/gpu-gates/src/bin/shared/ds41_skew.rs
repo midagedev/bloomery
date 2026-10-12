@@ -55,6 +55,7 @@ use crate::shadow;
 use std::collections::BTreeMap;
 
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::PassKind;
 use bloomery_gpu::hybrid::Chain;
 use bloomery_gpu::model::{ChainBody, HostServed, StepMode};
 use bloomery_gpu::weights::Weights;
@@ -73,6 +74,7 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::placement::workstation;
 use refset::arch::deepseek41::fixture as fx;
+use runtime::swaprule::KeptRows;
 
 use crate::ds41_tier;
 use crate::finite;
@@ -1077,6 +1079,7 @@ fn api(m: &mut Deepseek41Model, split: &Split, hp: &Hparams) -> Result<bool, Gat
         m.step(prompt)?;
         m.step_rows([t, t1])?;
         m.rollback(p + 1)?;
+        m.keep_rows(KeptRows::prefix(1), PassKind::Pair)?;
         let r_tok = m.step(&[t2])?;
         let r = lbits(m)?;
         let ok_rb = r_tok == c_tok && r == c && m.pos() == p + 2;
