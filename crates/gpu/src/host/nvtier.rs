@@ -91,11 +91,11 @@ use model::moe::{Claim, PinRelease, PinToken, Ticket, TierError, TierPin, TierSl
 use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
 use model::placement::workstation::ArenaGrant;
-use model::placement::{
-    ARENA_ALIGN, ARENA_COLUMNS, ArenaFloor, Device, Plan, Role, arena_window_bytes,
-};
+use model::placement::{ARENA_ALIGN, ArenaFloor, Device, Plan, Role, arena_window_bytes};
 
 use crate::GpuError;
+
+const _: () = assert!(model::placement::STEP_PORT_COLUMNS == model::ops::DEFER_MAX_COLS);
 
 mod reader;
 use reader::{Job, Kind, Reader};
@@ -1446,7 +1446,7 @@ impl NvTier {
                 idle: Mutex::new(Vec::new()),
             });
         }
-        let least = ArenaFloor::of(plan, ARENA_COLUMNS).map_err(|e| GpuError::plan(WHAT, e))?;
+        let least = ArenaFloor::of(plan).map_err(|e| GpuError::plan(WHAT, e))?;
         let count =
             slots_of(arena.granted, &slot_sizes, &least).map_err(|e| GpuError::shape(WHAT, e))?;
         let page = page_bytes().map_err(|e| GpuError::plan(WHAT, e))?;

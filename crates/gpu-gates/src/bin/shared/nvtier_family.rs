@@ -29,9 +29,7 @@ use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::{GateError, checks_failed, record, tier, verdict};
 use bloomery_levers::{RESIDENCY_SERVING, ResidencyWord, residency_word};
 use model::placement::workstation::HostNeed;
-use model::placement::{
-    ARENA_COLUMNS, ArenaFloor, Device, PlacementError, Plan, Role, arena_slots,
-};
+use model::placement::{ArenaFloor, Device, PlacementError, Plan, Role, arena_slots};
 
 /// The slots a paged layer's arena holds, in the arm the gate pages: above the arena's floor, under the ids a layer
 /// serves, so evictions happen.
@@ -238,7 +236,7 @@ impl PlanFacts {
             arena: plan.host.nvme_arena_bytes,
             arena_slots: arena_slots(plan)?,
             need: HostNeed::of(plan, 0).bytes(),
-            floor: ArenaFloor::of(plan, ARENA_COLUMNS)?,
+            floor: ArenaFloor::of(plan)?,
             paged_layers,
             experts: u32::try_from(model.experts)?,
             room: RoomFacts::of(plan, card)?,

@@ -1180,84 +1180,72 @@ fn draft_yields_to_the_context_only_under_the_base() {
     );
 }
 
-/// A paged plan steps one column ([`paged_columns`]): with no arena, or one
-/// slot and no draft, the plan serves as asked; else the unset counts fall
-/// to one slot and no draft, and a `--parallel` past one or a set draft is
-/// refused by name, each set value named with its way out.
+/// A paged plan serves the slots it was asked for ([`paged_columns`]): with
+/// no arena, or a draft that is off and a count that is set or one, the plan
+/// serves as asked; the unset default count falls to one slot and the unset
+/// draft goes off; a set draft is refused by name.
 ///
 /// The arena is the 3090 gate plan's at a 27 GiB room [derived on the Mac:
 /// `crates/placement` `a_27_gib_room_puts_the_overflow_on_the_nvme_tier`].
 #[test]
-fn a_paged_plan_steps_one_column() {
+fn a_paged_plan_serves_its_asked_slots() {
     let arena = 23_434_203_136_u64;
     let at = |arena, slots, slots_set: bool, draft, draft_set| PagedAt {
         arena,
         slots,
-        slots_by: slots_set.then_some(SlotsBy::Parallel),
+        slots_set,
         together: true,
         draft,
         draft_set,
-    };
-    let refused = |parallel: Option<usize>, draft| {
-        Err(PagedRefused {
-            arena,
-            slots: parallel.map(|n| (SlotsBy::Parallel, n)),
-            draft,
-        })
     };
     for (at, want) in [
         // No arena: every count as asked, set or not.
         (at(0, 2, false, true, false), Ok(Paged::AsAsked)),
         (at(0, 4, true, true, true), Ok(Paged::AsAsked)),
-        // One column already.
+        // One slot, no draft: as asked.
         (at(arena, 1, false, false, false), Ok(Paged::AsAsked)),
         (at(arena, 1, true, false, true), Ok(Paged::AsAsked)),
-        // The unset counts fall to one column.
+        // A set count is served, whatever it is.
+        (at(arena, 2, true, false, false), Ok(Paged::AsAsked)),
+        (at(arena, 4, true, false, false), Ok(Paged::AsAsked)),
+        (at(arena, 8, true, false, false), Ok(Paged::AsAsked)),
+        // The unset default count falls to one slot.
         (
             at(arena, 2, false, false, false),
-            Ok(Paged::OneColumn { slots: 1 }),
-        ),
-        (
-            at(arena, 1, false, true, false),
-            Ok(Paged::OneColumn { slots: 1 }),
+            Ok(Paged::Reduced { slots: 1 }),
         ),
         (
             at(arena, 2, false, true, false),
-            Ok(Paged::OneColumn { slots: 1 }),
+            Ok(Paged::Reduced { slots: 1 }),
+        ),
+        // The unset draft goes off, a set count kept.
+        (
+            at(arena, 1, false, true, false),
+            Ok(Paged::Reduced { slots: 1 }),
         ),
         (
-            at(arena, 1, true, true, false),
-            Ok(Paged::OneColumn { slots: 1 }),
+            at(arena, 3, true, true, false),
+            Ok(Paged::Reduced { slots: 3 }),
         ),
-        // A set value that steps several columns is refused, each named.
-        (at(arena, 2, true, false, false), refused(Some(2), false)),
-        (at(arena, 2, true, true, false), refused(Some(2), false)),
-        (at(arena, 1, false, true, true), refused(None, true)),
-        (at(arena, 2, false, true, true), refused(None, true)),
-        (at(arena, 3, true, true, true), refused(Some(3), true)),
+        // A set draft is refused, whatever the count.
+        (at(arena, 1, false, true, true), Err(PagedRefused { arena })),
+        (at(arena, 2, true, true, true), Err(PagedRefused { arena })),
+        (at(arena, 3, false, true, true), Err(PagedRefused { arena })),
     ] {
         assert_eq!(paged_columns(&at), want, "{at:?}");
     }
     assert_eq!(
-        PagedRefused {
-            arena,
-            slots: Some((SlotsBy::Parallel, 3)),
-            draft: true
-        }
-        .to_string(),
-        "--parallel 3 and BLOOMERY_DRAFT=mtp: the plan pages host experts through the NVMe \
-         tier's 23434203136 B RAM arena, and a paged plan steps one column (a step of several \
-         reads the paged experts through the file mapping, whose page cache grows until the \
-         kernel swaps the arena out); serve --parallel 1 or leave --parallel unset; set \
-         BLOOMERY_DRAFT=off or leave it unset"
+        PagedRefused { arena }.to_string(),
+        "BLOOMERY_DRAFT=mtp: the plan pages host experts through the NVMe tier's \
+         23434203136 B RAM arena, and a drafted verify's added columns are not shown to pay on \
+         a paged plan; set BLOOMERY_DRAFT=off or leave it unset"
     );
-    // Beside an expert tier card each slot steps alone: slots add no
-    // column, so they are served as asked, set or not, and only the draft —
-    // its verify still steps several — goes off, every slot kept.
+    // Beside an expert tier card each slot steps alone: the default count is
+    // kept, and only the draft goes off.
     let bp = |slots, slots_set: bool, draft, draft_set| PagedAt {
         arena,
         slots,
-        slots_by: slots_set.then_some(SlotsBy::Parallel),
+        slots_set,
         together: false,
         draft,
         draft_set,
@@ -1265,36 +1253,17 @@ fn a_paged_plan_steps_one_column() {
     for (at, want) in [
         (bp(2, false, false, false), Ok(Paged::AsAsked)),
         (bp(3, true, false, false), Ok(Paged::AsAsked)),
-        (bp(2, false, true, false), Ok(Paged::OneColumn { slots: 2 })),
-        (bp(3, true, true, false), Ok(Paged::OneColumn { slots: 3 })),
-        (bp(1, false, true, false), Ok(Paged::OneColumn { slots: 1 })),
-        (bp(2, true, true, true), refused(None, true)),
+        (bp(2, false, true, false), Ok(Paged::Reduced { slots: 2 })),
+        (bp(3, true, true, false), Ok(Paged::Reduced { slots: 3 })),
+        (bp(1, false, true, false), Ok(Paged::Reduced { slots: 1 })),
+        (bp(2, true, true, true), Err(PagedRefused { arena })),
     ] {
         assert_eq!(paged_columns(&at), want, "{at:?}");
     }
-    // The CLI's own count, named as it is set.
-    let cli = PagedAt {
-        arena,
-        slots: 2,
-        slots_by: Some(SlotsBy::GenSlots),
-        together: true,
-        draft: false,
-        draft_set: false,
-    };
-    assert_eq!(
-        paged_columns(&cli).map_err(|e| e.to_string()),
-        Err(
-            "BLOOMERY_GEN_SLOTS=2: the plan pages host experts through the NVMe tier's \
-             23434203136 B RAM arena, and a paged plan steps one column (a step of several \
-             reads the paged experts through the file mapping, whose page cache grows until \
-             the kernel swaps the arena out); leave BLOOMERY_GEN_SLOTS unset"
-                .to_owned()
-        )
-    );
-    // The one-column load's draft: a draft that ran, or that only its yield
-    // to the context turned off (judged on the plan of several slots the
-    // load abandons), is off by the paged rule; every other reason holds
-    // whatever the plan, and stays.
+    // The reduced load's draft: a draft that ran, or that only its yield to
+    // the context turned off (judged on the plan of several slots the load
+    // abandons), is off by the paged rule; every other reason holds whatever
+    // the plan, and stays.
     let paged = Some(Draft38Off::Paged { arena });
     let y = DraftYield::of(702, 6165, 4096, 2_842_413_228).expect("the 3060's yield");
     assert_eq!(paged_draft(true, None, arena), (true, paged.clone()));
@@ -1325,7 +1294,7 @@ fn a_paged_plan_steps_one_column() {
     assert_eq!(
         Draft38Off::Paged { arena }.to_string(),
         "unset: the plan pages host experts through the NVMe tier's 23434203136 B RAM arena, \
-         and a paged plan steps one column; a verify steps several"
+         and a drafted verify's added columns are not shown to pay on a paged plan"
     );
 }
 
@@ -1340,7 +1309,7 @@ fn a_floor_fallback_serves_one_slot_where_slots_step_alone() {
     let at = |arena, slots, together, draft, draft_set| PagedAt {
         arena,
         slots,
-        slots_by: None,
+        slots_set: false,
         together,
         draft,
         draft_set,
@@ -1349,19 +1318,15 @@ fn a_floor_fallback_serves_one_slot_where_slots_step_alone() {
         for (at, want) in [
             (
                 at(arena, 2, together, false, false),
-                Ok(Paged::OneColumn { slots: 1 }),
+                Ok(Paged::Reduced { slots: 1 }),
             ),
             (
                 at(arena, 3, together, true, false),
-                Ok(Paged::OneColumn { slots: 1 }),
+                Ok(Paged::Reduced { slots: 1 }),
             ),
             (
                 at(arena, 2, together, true, true),
-                Err(PagedRefused {
-                    arena,
-                    slots: None,
-                    draft: true,
-                }),
+                Err(PagedRefused { arena }),
             ),
             (at(0, 2, together, true, false), Ok(Paged::AsAsked)),
         ] {
