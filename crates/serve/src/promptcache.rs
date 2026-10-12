@@ -29,6 +29,20 @@ struct Entry {
     state: Arc<dyn Saved>,
     /// The copy of `state` while it may still run.
     pending: Option<Pending>,
+    /// The warm section the request that left `state` closed its residency
+    /// stream into ([`crate::Engine::warm_close`]).
+    warm: Option<Arc<[u8]>>,
+}
+
+impl Entry {
+    /// The host bytes the entry holds: the state's and the warm section's.
+    fn bytes(&self) -> u64 {
+        entry_bytes(&self.state, self.warm.as_deref())
+    }
+}
+
+fn entry_bytes(state: &Arc<dyn Saved>, warm: Option<&[u8]>) -> u64 {
+    state.n_bytes() + warm.map_or(0, |w| w.len() as u64)
 }
 
 /// What [`PromptCache::take`] hands back: a state, the ids it holds, and its
@@ -37,6 +51,8 @@ pub(crate) struct Taken {
     pub held: Held,
     pub state: Arc<dyn Saved>,
     pub pending: Option<Pending>,
+    /// The entry's warm section, if the request that left it closed one.
+    pub warm: Option<Arc<[u8]>>,
 }
 
 /// The cached state a request is best served by ([`PromptCache::best`]).
@@ -67,9 +83,9 @@ impl PromptCache {
         self.budget > 0
     }
 
-    /// The host bytes the states hold.
+    /// The host bytes the entries hold, their warm sections included.
     pub(crate) fn bytes(&self) -> u64 {
-        self.entries.iter().map(|e| e.state.n_bytes()).sum()
+        self.entries.iter().map(Entry::bytes).sum()
     }
 
     #[cfg(test)]
@@ -103,6 +119,7 @@ impl PromptCache {
             held: e.held.clone(),
             state: Arc::clone(&e.state),
             pending: e.pending.clone(),
+            warm: e.warm.clone(),
         };
         self.entries.push(e);
         got
@@ -143,19 +160,27 @@ impl PromptCache {
             .any(|e| e.held.starts_with(req) && e.state.keepable(req.ids.len()) == req.ids.len())
     }
 
-    /// Keeps `state` of `held` (as many ids as it holds positions): the
-    /// states it keeps all of leave, then the oldest until it fits. Returns
-    /// what happened, in order, the `Save` carrying `ms` and `copied`
-    /// ([`CacheNote::Save`]); a state over the whole budget is refused (a
-    /// `Skip`), and the cache is then as it was.
+    /// Keeps `state` of `held` (as many ids as it holds positions) with its
+    /// warm section `warm`, whose length counts against the budget with the
+    /// state's: the entries it keeps all of leave, then the oldest until it
+    /// fits. Returns what happened, in order, the `Save` carrying `ms` and
+    /// `copied` ([`CacheNote::Save`]); an entry over the whole budget is
+    /// refused (a `Skip`), and the cache is then as it was.
     pub(crate) fn insert(
         &mut self,
         held: Held,
         state: Arc<dyn Saved>,
+        warm: Option<Arc<[u8]>>,
         ms: f64,
         copied: bool,
     ) -> Vec<CacheNote> {
-        self.place(held, state, None, ms, copied, None)
+        let entry = Entry {
+            held,
+            state,
+            pending: None,
+            warm,
+        };
+        self.place(entry, ms, copied, None)
     }
 
     /// Keeps `state` of `held` as [`PromptCache::insert`] does, a snapshot
@@ -166,10 +191,17 @@ impl PromptCache {
         &mut self,
         held: Held,
         state: Arc<dyn Saved>,
+        warm: Option<Arc<[u8]>>,
         ms: f64,
         fallback: &'static str,
     ) -> Vec<CacheNote> {
-        self.place(held, state, None, ms, true, Some(fallback))
+        let entry = Entry {
+            held,
+            state,
+            pending: None,
+            warm,
+        };
+        self.place(entry, ms, true, Some(fallback))
     }
 
     /// The oldest entry whose copy has landed leaves, for the room its
@@ -181,7 +213,7 @@ impl PromptCache {
         let e = self.entries.remove(i);
         Some(CacheNote::Evict {
             positions: e.held.ids.len(),
-            bytes: e.state.n_bytes(),
+            bytes: e.bytes(),
             why: "the engine's staging pool had no room",
         })
     }
@@ -195,22 +227,33 @@ impl PromptCache {
         &mut self,
         held: Held,
         pending: Pending,
+        warm: Option<Arc<[u8]>>,
         ms: f64,
     ) -> Vec<CacheNote> {
         let state = Arc::clone(pending.state());
-        self.place(held, state, Some(pending), ms, true, None)
+        let entry = Entry {
+            held,
+            state,
+            pending: Some(pending),
+            warm,
+        };
+        self.place(entry, ms, true, None)
     }
 
     fn place(
         &mut self,
-        held: Held,
-        state: Arc<dyn Saved>,
-        pending: Option<Pending>,
+        entry: Entry,
         ms: f64,
         copied: bool,
         fallback: Option<&'static str>,
     ) -> Vec<CacheNote> {
-        let bytes = state.n_bytes();
+        let Entry {
+            held,
+            state,
+            pending,
+            warm,
+        } = entry;
+        let bytes = entry_bytes(&state, warm.as_deref());
         let positions = held.ids.len();
         if bytes > self.budget {
             return vec![CacheNote::Skip {
@@ -232,7 +275,7 @@ impl PromptCache {
                 && state.keepable(e.held.ids.len()) >= e.state.keepable(e.held.ids.len());
             if covered {
                 gone.push((i, "a newer state keeps all of it"));
-                held_bytes -= e.state.n_bytes();
+                held_bytes -= e.bytes();
             }
         }
         for (i, e) in self.entries.iter().enumerate() {
@@ -241,7 +284,7 @@ impl PromptCache {
             }
             if e.pending.is_none() && !gone.iter().any(|&(g, _)| g == i) {
                 gone.push((i, "the budget"));
-                held_bytes -= e.state.n_bytes();
+                held_bytes -= e.bytes();
             }
         }
         if held_bytes + bytes > self.budget {
@@ -259,7 +302,7 @@ impl PromptCache {
             let e = &self.entries[i];
             notes.push(CacheNote::Evict {
                 positions: e.held.ids.len(),
-                bytes: e.state.n_bytes(),
+                bytes: e.bytes(),
                 why,
             });
         }
@@ -273,6 +316,7 @@ impl PromptCache {
             held,
             state,
             pending,
+            warm,
         });
         notes.push(CacheNote::Save {
             positions,
@@ -372,6 +416,31 @@ mod tests {
         }
     }
 
+    /// An entry's bytes against the budget are its state's and its warm
+    /// section's; the section leaves with the entry, nothing else moving.
+    #[test]
+    fn an_entry_counts_its_warm_section_and_drops_it_on_eviction() {
+        let mut c = PromptCache::new(100);
+        let section: Arc<[u8]> = Arc::from(vec![7u8; 30]);
+        let kept = Arc::clone(&section);
+        let notes = c.insert(ids(10, 1), state(10, 50, None), Some(section), 0.0, true);
+        assert!(matches!(
+            notes.last(),
+            Some(CacheNote::Save { bytes: 80, .. })
+        ));
+        assert_eq!(c.bytes(), 80);
+        assert_eq!(Arc::strong_count(&kept), 2);
+        // 80 + 40 passes the budget: the entry leaves for the next one.
+        let notes = c.insert(ids(10, 2), state(10, 40, None), None, 0.0, true);
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, CacheNote::Evict { bytes: 80, .. }))
+        );
+        assert_eq!((c.len(), c.bytes()), (1, 40));
+        assert_eq!(Arc::strong_count(&kept), 1);
+    }
+
     /// The pick is by what a state keeps, not by what it shares: a state
     /// sharing more ids inside its hole loses to one sharing fewer it keeps;
     /// the request's last id is never counted; `floor` must be beaten.
@@ -381,8 +450,8 @@ mod tests {
         let a = ids(100, 1);
         let mut b = head(&a, 60);
         b.ids.extend(ids(40, 1000).ids);
-        c.insert(a.clone(), state(100, 10, Some(10)), 0.0, true);
-        c.insert(b.clone(), state(100, 10, None), 0.0, true);
+        c.insert(a.clone(), state(100, 10, Some(10)), None, 0.0, true);
+        c.insert(b.clone(), state(100, 10, None), None, 0.0, true);
         let mut req = head(&a, 80);
         req.push(5);
         let p = c.best(&req, 0).expect("a pick");
@@ -401,8 +470,8 @@ mod tests {
         let mut c = PromptCache::new(1 << 20);
         let tail: Vec<u32> = (100..116).collect();
         let a = imaged(1, &tail);
-        c.insert(a.clone(), state(30, 10, None), 0.0, true);
-        c.insert(imaged(2, &tail), state(30, 10, None), 0.0, true);
+        c.insert(a.clone(), state(30, 10, None), None, 0.0, true);
+        c.insert(imaged(2, &tail), state(30, 10, None), None, 0.0, true);
         let mut req = a.clone();
         req.push(5);
         let p = c.best(&req, 0).expect("a pick");
@@ -417,7 +486,7 @@ mod tests {
         assert!(c.covers(&a));
         assert!(!c.covers(&imaged(3, &tail)), "another image is not covered");
         let mut c = PromptCache::new(1 << 20);
-        c.insert(a.clone(), Arc::new(Fours(30)), 0.0, true);
+        c.insert(a.clone(), Arc::new(Fours(30)), None, 0.0, true);
         let p = c.best(&imaged(1, &[200, 201]), 0).expect("a pick");
         assert_eq!(
             (p.common, p.kept),
@@ -432,15 +501,15 @@ mod tests {
     fn insert_prunes_then_evicts_the_oldest() {
         let mut c = PromptCache::new(100);
         let a = ids(50, 1);
-        c.insert(head(&a, 20), state(20, 30, None), 0.0, true);
-        c.insert(ids(30, 9), state(30, 30, None), 0.0, true);
-        let notes = c.insert(a.clone(), state(50, 30, None), 0.0, true);
+        c.insert(head(&a, 20), state(20, 30, None), None, 0.0, true);
+        c.insert(ids(30, 9), state(30, 30, None), None, 0.0, true);
+        let notes = c.insert(a.clone(), state(50, 30, None), None, 0.0, true);
         assert!(
             matches!(notes[0], CacheNote::Evict { positions: 20, why, .. }
                 if why == "a newer state keeps all of it")
         );
         assert_eq!(c.len(), 2);
-        let notes = c.insert(ids(40, 77), state(40, 60, None), 0.0, true);
+        let notes = c.insert(ids(40, 77), state(40, 60, None), None, 0.0, true);
         assert!(
             matches!(
                 notes[0],
@@ -453,7 +522,7 @@ mod tests {
             "{notes:?}"
         );
         assert_eq!((c.len(), c.bytes()), (2, 90));
-        let notes = c.insert(ids(10, 5), state(10, 101, None), 0.0, true);
+        let notes = c.insert(ids(10, 5), state(10, 101, None), None, 0.0, true);
         assert!(matches!(notes[..], [CacheNote::Skip { positions: 10, .. }]));
         assert_eq!((c.len(), c.bytes()), (2, 90));
     }
@@ -464,8 +533,8 @@ mod tests {
     fn insert_keeps_what_the_newer_state_cannot_keep() {
         let mut c = PromptCache::new(1 << 20);
         let a = ids(100, 3);
-        c.insert(head(&a, 40), state(40, 1, None), 0.0, true);
-        c.insert(a.clone(), state(100, 1, Some(10)), 0.0, true);
+        c.insert(head(&a, 40), state(40, 1, None), None, 0.0, true);
+        c.insert(a.clone(), state(100, 1, Some(10)), None, 0.0, true);
         assert_eq!(c.len(), 2);
         assert!(c.covers(&head(&a, 40)));
         assert!(!c.covers(&head(&a, 60)), "the newer state keeps 0 of 60");
@@ -499,7 +568,7 @@ mod tests {
         let mut c = PromptCache::new(100);
         let a = ids(50, 1);
         let p = running(50, 60);
-        let notes = c.insert_pending(a.clone(), p.clone(), 0.0);
+        let notes = c.insert_pending(a.clone(), p.clone(), None, 0.0);
         assert!(
             matches!(
                 notes[..],
@@ -512,7 +581,7 @@ mod tests {
             "{notes:?}"
         );
         // The budget needs its bytes: 60 + 60 > 100, and the only state is in flight.
-        let notes = c.insert(ids(30, 9), state(30, 60, None), 0.0, true);
+        let notes = c.insert(ids(30, 9), state(30, 60, None), None, 0.0, true);
         assert!(
             matches!(&notes[..], [CacheNote::Skip { positions: 30, why }] if why.contains("copies still run")),
             "{notes:?}"
@@ -521,7 +590,7 @@ mod tests {
         // A newer state that keeps all of it: it stays while the copy runs.
         let mut longer = a.clone();
         longer.ids.extend(ids(10, 5).ids);
-        let notes = c.insert(longer.clone(), state(60, 30, None), 0.0, true);
+        let notes = c.insert(longer.clone(), state(60, 30, None), None, 0.0, true);
         assert!(
             notes.iter().all(|n| !matches!(n, CacheNote::Evict { .. })),
             "the in-flight state was pruned: {notes:?}"
@@ -531,7 +600,7 @@ mod tests {
         // Landed, it leaves for the budget like any other.
         assert!(c.settle(&p));
         assert!(c.in_flight().is_empty());
-        let notes = c.insert(ids(30, 9), state(30, 60, None), 0.0, true);
+        let notes = c.insert(ids(30, 9), state(30, 60, None), None, 0.0, true);
         assert!(
             matches!(
                 notes[0],
@@ -553,9 +622,9 @@ mod tests {
         let mut c = PromptCache::new(1000);
         assert!(c.evict_oldest_landed().is_none(), "an empty cache");
         let p = running(10, 20);
-        c.insert_pending(ids(10, 1), p.clone(), 0.0);
-        c.insert(ids(11, 2), state(11, 20, None), 0.0, true);
-        c.insert(ids(12, 3), state(12, 20, None), 0.0, true);
+        c.insert_pending(ids(10, 1), p.clone(), None, 0.0);
+        c.insert(ids(11, 2), state(11, 20, None), None, 0.0, true);
+        c.insert(ids(12, 3), state(12, 20, None), None, 0.0, true);
         for positions in [11, 12] {
             assert!(
                 matches!(
@@ -587,8 +656,8 @@ mod tests {
     fn a_pick_hands_back_the_copy_still_running() {
         let mut c = PromptCache::new(100);
         let p = running(10, 20);
-        c.insert_pending(ids(10, 1), p.clone(), 0.0);
-        c.insert(ids(10, 2), state(10, 20, None), 0.0, true);
+        c.insert_pending(ids(10, 1), p.clone(), None, 0.0);
+        c.insert(ids(10, 2), state(10, 20, None), None, 0.0, true);
         let pick = c.best(&ids(10, 1), 0).expect("the first state");
         let taken = c.take(pick);
         assert!(taken.pending.as_ref().is_some_and(|q| q.is(&p)));
@@ -600,12 +669,12 @@ mod tests {
     #[test]
     fn take_makes_the_state_the_most_recent() {
         let mut c = PromptCache::new(60);
-        c.insert(ids(10, 1), state(10, 20, None), 0.0, true);
-        c.insert(ids(10, 2), state(10, 20, None), 0.0, true);
+        c.insert(ids(10, 1), state(10, 20, None), None, 0.0, true);
+        c.insert(ids(10, 2), state(10, 20, None), None, 0.0, true);
         let p = c.best(&ids(10, 1), 0).expect("the first state");
         let got = c.take(p).held;
         assert_eq!(got, ids(10, 1));
-        c.insert(ids(10, 3), state(10, 30, None), 0.0, true);
+        c.insert(ids(10, 3), state(10, 30, None), None, 0.0, true);
         assert!(
             c.best(&ids(10, 1), 0).is_some(),
             "the taken state was evicted"

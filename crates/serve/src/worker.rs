@@ -53,7 +53,8 @@ use crate::engine::{
     Drafted, EngineError, Sampler, SamplerFactory, Saved, SlotPass, SlotRow, StateError,
 };
 use crate::genloop::{
-    Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
+    Ended, Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings,
+    ms_since,
 };
 use crate::media::{Held, MediaFeed};
 use crate::sched::{Board, Reserve, SlotView};
@@ -680,11 +681,11 @@ impl Worker {
             }
             Err(GenError::Engine(e)) => {
                 let f = self.fail(&e);
-                self.end_request(a, Err(GenError::Engine(e)));
+                self.end_request(a, Err(GenError::Engine(e)))?;
                 Err(self.end(f))
             }
             Err(e) => {
-                self.end_request(a, Err(e));
+                self.end_request(a, Err(e))?;
                 Ok(false)
             }
         }
@@ -734,12 +735,12 @@ impl Worker {
                 Err(GenError::Engine(e)) => {
                     let f = self.fail(&e);
                     let p = self.prompting.remove(k);
-                    self.end_request(p.a, Err(GenError::Engine(e)));
+                    self.end_request(p.a, Err(GenError::Engine(e)))?;
                     return Err(self.end(f));
                 }
                 Err(e) => {
                     let p = self.prompting.remove(k);
-                    self.end_request(p.a, Err(e));
+                    self.end_request(p.a, Err(e))?;
                 }
             }
         }
@@ -760,7 +761,7 @@ impl Worker {
                 Ok(Need::Done) => {
                     let mut a = self.active.remove(k);
                     let r = a.job.finish(&mut sink_of(&a.events));
-                    self.end_request(a, r);
+                    self.end_request(a, r)?;
                 }
                 Ok(need) => {
                     needs.push(need);
@@ -768,7 +769,7 @@ impl Worker {
                 }
                 Err(e) => {
                     let a = self.active.remove(k);
-                    self.end_request(a, Err(e));
+                    self.end_request(a, Err(e))?;
                 }
             }
         }
@@ -884,7 +885,8 @@ impl Worker {
         let mut ended = std::mem::take(&mut self.active);
         ended.extend(std::mem::take(&mut self.prompting).into_iter().map(|p| p.a));
         for a in ended {
-            self.end_request(a, Err(GenError::Engine(EngineError(e.0.clone()))));
+            // A failed end calls the engine no more: it cannot fail again.
+            let _ = self.end_request(a, Err(GenError::Engine(EngineError(e.0.clone()))));
         }
         self.end(f)
     }
@@ -912,11 +914,25 @@ impl Worker {
         s.n_draft_passes_total += t.draft_passes as u64;
     }
 
-    /// Books a request's counters and view, releases its slot, and sends its
-    /// last message.
-    fn end_request(&mut self, a: Active, r: Result<Outcome, GenError>) {
+    /// Books a request's counters and view, closes its residency stream,
+    /// releases its slot, and sends its last message. A failure to close the
+    /// stream is the engine's: the request ends with it, and the server with
+    /// it ([`Worker::fail`]).
+    fn end_request(&mut self, a: Active, r: Result<Outcome, GenError>) -> Result<(), Dead> {
         let t = a.job.timings();
         self.book(t);
+        let how = match &r {
+            Ok(_) => Ended::Completed(t.predicted_n),
+            Err(GenError::Engine(_)) => Ended::Failed,
+            Err(_) => Ended::Left,
+        };
+        let (r, failed) = match self.slot.warm_end(a.slot, how) {
+            Ok(()) => (r, None),
+            Err(e) => (
+                Err(GenError::Engine(EngineError(e.0.clone()))),
+                Some(self.fail(&e)),
+            ),
+        };
         // An engine failure leaves no state to save; any other end leaves the
         // slot holding what it fed.
         if self.turns.is_none() && !matches!(r, Err(GenError::Engine(_))) {
@@ -940,6 +956,7 @@ impl Worker {
             self.show_turns();
         }
         let _ = a.events.send(Msg::Done(r));
+        failed.map_or(Ok(()), |f| Err(self.end(f)))
     }
 }
 
@@ -1032,7 +1049,7 @@ impl Worker {
     fn turn(&mut self) -> Result<(), Dead> {
         if let Some(i) = self.t().running.and_then(|r| self.index_of(r))
             && self.active[i].need.is_none()
-            && let Some(need) = self.pump_at(i)
+            && let Some(need) = self.pump_at(i)?
         {
             self.active[i].need = Some(need);
         }
@@ -1121,7 +1138,7 @@ impl Worker {
                 self.t_mut().running = None;
                 if let Some(i) = self.index_of(to) {
                     let a = self.active.remove(i);
-                    self.end_request(a, Err(GenError::Engine(EngineError(why))));
+                    self.end_request(a, Err(GenError::Engine(EngineError(why))))?;
                 }
             }
             Switched::Done => {
@@ -1138,7 +1155,7 @@ impl Worker {
 
     /// Takes the tokens request `i` holds; its next engine call, or `None`
     /// when it ended (and is booked).
-    fn pump_at(&mut self, i: usize) -> Option<Need> {
+    fn pump_at(&mut self, i: usize) -> Result<Option<Need>, Dead> {
         let a = &mut self.active[i];
         let pumped = a
             .job
@@ -1149,16 +1166,16 @@ impl Worker {
                 let r = a.job.finish(&mut sink_of(&a.events));
                 Some((a, r))
             }
-            Ok(need) => return Some(need),
+            Ok(need) => return Ok(Some(need)),
             Err(e) => Some((self.active.remove(i), Err(e))),
         };
         if let Some((a, r)) = ended {
             if self.t().running == Some(a.slot) {
                 self.t_mut().running = None;
             }
-            self.end_request(a, r);
+            self.end_request(a, r)?;
         }
-        None
+        Ok(None)
     }
 
     /// The running request's next engine call.
@@ -1168,7 +1185,7 @@ impl Worker {
         };
         let need = match self.active[i].need.take() {
             Some(n) => n,
-            None => match self.pump_at(i) {
+            None => match self.pump_at(i)? {
                 Some(n) => n,
                 None => return Ok(()),
             },
@@ -1292,6 +1309,11 @@ impl Worker {
                 None => {}
             }
         }
+        // The engine leaves `from`: a live request's residency stream goes
+        // with its parked state; an ended request's closed at its end.
+        if live_from && let Err(e) = self.slot.warm_park(from) {
+            return Err(self.die(&e));
+        }
         if let Some(i) = self.index_of(from) {
             let t = self.t_mut();
             t.clock += 1;
@@ -1331,7 +1353,11 @@ impl Worker {
             Some(Entry::State { state, .. }) => {
                 moved = true;
                 match self.slot.engine.resume(&state) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Err(e) = self.slot.warm_resume(to) {
+                            return Err(self.die(&e));
+                        }
+                    }
                     Err(StateError::Engine(e)) => return Err(self.die(&e)),
                     Err(e) => {
                         if let Err(e) = self.slot.erase() {
@@ -1362,7 +1388,7 @@ impl Worker {
                         held.media.len()
                     )))
                 };
-                if let Err(e) = fed {
+                if let Err(e) = fed.and_then(|()| self.slot.warm_resume(to)) {
                     return Err(self.die(&e));
                 }
                 fed_ms = ms_since(t1);

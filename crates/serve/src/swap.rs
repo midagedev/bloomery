@@ -42,7 +42,7 @@ use std::sync::Arc;
 use crate::api::ServeError;
 use crate::engine::{
     CacheNote, Drafted, Engine, EngineError, EngineProps, ResidencyReset, Saved, SavedState,
-    SlotRow, StateError, Tokenizer,
+    SlotRow, StateError, Tokenizer, WarmWhy,
 };
 
 /// Tokens a request takes on the engine before the next live request's turn:
@@ -180,6 +180,20 @@ impl Engine for SwapEngine {
     }
     fn prefill_splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
         self.inner.prefill_splits(first, end, marks)
+    }
+    /// The inner engine serves slot 0 alone, and only one request's stream
+    /// is open on it at a time: the server closes a request's at its park.
+    fn warm_close(&mut self, _slot: usize) -> Result<Option<Vec<u8>>, EngineError> {
+        self.inner.warm_close(0)
+    }
+    fn warm_open(
+        &mut self,
+        _slot: usize,
+        section: Option<&[u8]>,
+        expected: f64,
+        why: WarmWhy,
+    ) -> Result<(), EngineError> {
+        self.inner.warm_open(0, section, expected, why)
     }
     fn note(&self, note: &CacheNote) {
         self.inner.note(note);
