@@ -6,6 +6,7 @@
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::media::MediaSpan;
 use bloomery_gpu::model::Rows;
 use bloomery_gpu_glm5next::{
     Body, GlmArena, Nextn, NextnFeed, NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS,
@@ -63,6 +64,17 @@ impl MtpBody for Body {
         sink: Option<&mut UnitSink<'_, Body>>,
     ) -> Result<u32, GpuError> {
         bloomery_gpu_glm5next::prompt_with(m, ids, path, sink)
+    }
+
+    /// [`bloomery_gpu_glm5next::prompt_media_with`]: the body's media call with the sink, its
+    /// residency pass its own.
+    fn prompt_media_with(
+        m: &mut GpuModel<Body>,
+        ids: &[u32],
+        spans: &[MediaSpan<'_>],
+        sink: Option<&mut UnitSink<'_, Body>>,
+    ) -> Result<u32, GpuError> {
+        bloomery_gpu_glm5next::prompt_media_with(m, ids, spans, sink)
     }
 
     fn walk(

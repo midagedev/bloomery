@@ -699,7 +699,7 @@ pub fn plant_prompt_routes(
     Ok(())
 }
 
-/// A prompt call's tap ([`prompt_with`]): called after each unit the call
+/// A prompt call's tap ([`prompt_with`], [`prompt_media_with`]): called after each unit the call
 /// runs — a batch, or a step — with the arena its rows' final streams sit in,
 /// the unit's first position and its rows, before the next unit overwrites
 /// them.
@@ -1053,17 +1053,42 @@ fn check_call(m: &Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
 /// call is one residency pass ([`prompt_pass`]); the steps feed is refused by name
 /// while a residency machine runs ([`refuse_steps_under_residency`]).
 pub fn feed(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
-    feed_as(m, ids, Pass::Own)
+    feed_as(m, ids, Pass::Own, None)
 }
 
-/// [`feed`], the batch call's residency pass opened as `pass` says.
-fn feed_as(m: &mut Glm5nextModel, ids: &[u32], pass: Pass) -> Result<u32, GpuError> {
+/// [`feed`] with `sink` called after each unit ([`prompt_with`]), the batch call's residency
+/// pass opened as `pass` says.
+fn feed_as(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    pass: Pass,
+    sink: Option<&mut GlmPromptSink<'_>>,
+) -> Result<u32, GpuError> {
     check_call(m, ids)?;
-    match m.body(WHAT)?.prompt.mode {
-        PrefillMode::Batch => pass.run(m, |m| prefill(m, ids)),
-        PrefillMode::Steps => {
+    let mode = m.body(WHAT)?.prompt.mode;
+    call_by(m, ids, mode, pass, sink)
+}
+
+/// A checked call of `ids` by `mode`, `sink` called after each unit it runs: the batch walk in
+/// one residency pass opened as `pass` says, or the steps (refused by name while a residency
+/// machine runs). The one owner of what a prompt call is by mode, for [`prompt_with`] and
+/// [`feed`].
+fn call_by(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    mode: PrefillMode,
+    pass: Pass,
+    sink: Option<&mut GlmPromptSink<'_>>,
+) -> Result<u32, GpuError> {
+    match (mode, sink) {
+        (PrefillMode::Batch, sink) => pass.run(m, |m| prefill_units(m, ids, sink, None)),
+        (PrefillMode::Steps, None) => {
             super::refuse_steps_under_residency(m)?;
             prompt(m, ids)
+        }
+        (PrefillMode::Steps, Some(sink)) => {
+            super::refuse_steps_under_residency(m)?;
+            steps_with(m, ids, sink)
         }
     }
 }
@@ -1104,17 +1129,7 @@ pub fn prompt_with(
     sink: Option<&mut GlmPromptSink<'_>>,
 ) -> Result<u32, GpuError> {
     check_call(m, ids)?;
-    match (mode, sink) {
-        (PrefillMode::Batch, sink) => prompt_pass(m, |m| prefill_units(m, ids, sink, None)),
-        (PrefillMode::Steps, None) => {
-            super::refuse_steps_under_residency(m)?;
-            prompt(m, ids)
-        }
-        (PrefillMode::Steps, Some(sink)) => {
-            super::refuse_steps_under_residency(m)?;
-            steps_with(m, ids, sink)
-        }
-    }
+    call_by(m, ids, mode, Pass::Own, sink)
 }
 
 /// [`prompt`]'s steps one position each, `sink` called after each with the
@@ -1336,19 +1351,39 @@ pub fn prefill_media(
     ids: &[u32],
     spans: &[MediaSpan<'_>],
 ) -> Result<u32, GpuError> {
-    media_as(m, ids, spans, Pass::Own)
+    media_as(m, ids, spans, Pass::Own, None)
 }
 
-/// [`prefill_media`], the batch call's residency pass opened as `pass` says.
+/// [`prefill_media`] with `sink` called after each unit the call runs ([`GlmPromptSink`]), as
+/// [`prompt_with`] calls it on a text prompt: the draft's walk over a prompt that holds an
+/// image. A unit's hidden rows are the target's, a span's position among them (the span's row
+/// stood in for the token's embedding); the id at that position is the image token, and what
+/// the sink does with the position is its own. Refused by name as [`prefill_media`] refuses;
+/// no span is [`prompt_with`] by the load's feed ([`PrefillMode`]), the sink kept. The batch
+/// call is one residency pass ([`prompt_pass`]) opened here: a caller already inside one
+/// ([`MediaBody::prefill_media`]) never calls this, a second boundary inside an open call being
+/// refused by the host tier.
+pub fn prompt_media_with(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    spans: &[MediaSpan<'_>],
+    sink: Option<&mut GlmPromptSink<'_>>,
+) -> Result<u32, GpuError> {
+    media_as(m, ids, spans, Pass::Own, sink)
+}
+
+/// [`prefill_media`] with `sink` ([`prompt_media_with`]), the batch call's residency pass opened
+/// as `pass` says.
 fn media_as(
     m: &mut Glm5nextModel,
     ids: &[u32],
     spans: &[MediaSpan<'_>],
     pass: Pass,
+    sink: Option<&mut GlmPromptSink<'_>>,
 ) -> Result<u32, GpuError> {
     check_call(m, ids)?;
     if spans.is_empty() {
-        return feed_as(m, ids, pass);
+        return feed_as(m, ids, pass, sink);
     }
     let body = m.body(WHAT)?;
     let image = media_token(body.prompt.mode, body.prompt.media, spans.len()).map_err(shape)?;
@@ -1359,7 +1394,7 @@ fn media_as(
     }
     let rows = CallRows::new(m.pos(), n_embd, spans.iter().map(|s| (&s.at, s.rows)))
         .map_err(|r| shape(r.to_string()))?;
-    pass.run(m, |m| prefill_units(m, ids, None, Some(&rows)))
+    pass.run(m, |m| prefill_units(m, ids, sink, Some(&rows)))
 }
 
 impl MediaBody for Body {
@@ -1381,7 +1416,7 @@ impl MediaBody for Body {
         ids: &[u32],
         spans: &[MediaSpan<'_>],
     ) -> Result<u32, GpuError> {
-        media_as(m, ids, spans, Pass::Callers)
+        media_as(m, ids, spans, Pass::Callers, None)
     }
 }
 

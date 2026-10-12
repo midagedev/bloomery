@@ -184,11 +184,12 @@
 //! positions' embeddings ([`Seat::prefill_media`], `bloomery_gpu_glm5next::prefill_media`; the load is
 //! set for media). Refused by name: `--mmproj` beside `--prefill steps` (a span's rows enter only
 //! through the batched call) and in a build without the `vision` feature. The NextN draft is
-//! planned and loaded as without `--mmproj`: text drafts. The draft's prompt walk has no twin of
-//! the media call, so a request that holds an image turns its slot's draft off until the slot's
-//! next reset ([`SlotDrafts::turn_off`], [`MEDIA_DRAFT_OFF_WHY`]; the slot's first step after the
-//! call prints the `mtp prompt` record naming why, once), and the slot's passes are plain steps
-//! while another slot keeps drafting.
+//! planned and loaded as without `--mmproj`, and stays on for a request that holds an image: its
+//! prompt walk is the text call's over the media call's units (`app::mtp::MtpDraft::prompt_media`,
+//! [`SlotDrafts::prefill_media`]), the call a draft prompt of its own that opens its one
+//! residency pass. At a span's positions the draft reads the image token's own embedding, paired
+//! with the target's hidden row there (the row the target computed from the span's rows), as at
+//! any position of the text call; the target's span row is not the draft's input.
 //!
 //! `BLOOMERY_DRAFT=mtp` loads the file's next-token layer beside the target
 //! (`app::arch::glm5next::open_nextn`, the plan `PlanInputs::plan_nextn`
@@ -405,14 +406,6 @@ impl Rounds {
 const NEED: usize = VERIFY_ROWS + 1;
 /// [`NEED`] as the least a slot of a split holds under the draft.
 const NEED_FLOOR: NonZeroU64 = NonZeroU64::new(NEED as u64).expect("a window of at least one row");
-
-/// Why a slot's draft is off for a media request: an image's rows enter the target's prompt call
-/// alone, and the NextN draft's prompt walk has no twin of it. The draft stays off until the
-/// slot's next reset ([`SlotDrafts::turn_off`]); the slot's first step after the media call (or
-/// its next text prompt call) prints it as an `mtp prompt` record.
-#[cfg(feature = "vision")]
-const MEDIA_DRAFT_OFF_WHY: &str = "an image's rows enter the target's prompt call alone, and the \
-                                   NextN draft's prompt walk has no twin of the media call";
 
 /// `BLOOMERY_DRAFT` on stores of `ctx` positions, `unset` the seat's rule
 /// for it: `None` drafts with the NextN layer; `Some` runs the plain path,
@@ -1676,11 +1669,11 @@ impl Seat for Glm {
 
     /// Each feed's image encoded on the resident encoder and read back as bf16, one row a cell of
     /// its grid and nothing around them ([`vision_seat::Resident::encode`]: the ids carry the
-    /// delimiters), then the selected slot's draft turned off ([`MEDIA_DRAFT_OFF_WHY`]; a slot
-    /// already off stays as it is, its reason and its record told once; an image the tower
-    /// refuses leaves the draft on), then one prompt call with the rows in place of their
-    /// positions' embeddings ([`vision_seat::Encoded::prompt`], the body's `prefill_media`); the
-    /// encode binds the model's card back before the prompt call.
+    /// delimiters), then one prompt call with the rows in place of their positions' embeddings
+    /// ([`vision_seat::Encoded::prompt_by`]): under the draft the draft's own media prompt call
+    /// ([`SlotDrafts::prefill_media`]), its store walked over the call's units like a text
+    /// prompt's; without it, or while it is off, the session's ([`app::Session::prompt_media`]).
+    /// The encode binds the model's card back before the prompt call.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
@@ -1693,10 +1686,10 @@ impl Seat for Glm {
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
         )?;
         let sel = self.s.selected();
-        if !self.drafted.is_off(sel) {
-            self.drafted.turn_off(sel, MEDIA_DRAFT_OFF_WHY)?;
-        }
-        let next = encoded.prompt(&mut self.s, ids, |rows| rows.media_spans())?;
+        let next = encoded.prompt_by::<Body, _, _>(
+            |rows| rows.media_spans(),
+            |spans| self.drafted.prefill_media(&mut self.s, sel, ids, spans),
+        )?;
         self.print_passes()?;
         Ok(next)
     }

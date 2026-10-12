@@ -928,9 +928,26 @@ impl<K> Encoded<K> {
         B: MediaBody,
         F: for<'r> FnOnce(&'r SpanRows<K>) -> Vec<B::Span<'r>>,
     {
+        self.prompt_by::<B, _, _>(build, |spans| {
+            Ok(s.prompt_media(ids, spans, runtime::Want::Argmax)?.argmax())
+        })
+    }
+
+    /// [`Encoded::prompt`] with the call the seat's own: `build` makes the body's spans of the
+    /// rows, and `call` is the one prompt call over them, which returns the greedy token after
+    /// the last id (the session's [`app::Session::prompt_media`], or a draft's media prompt call
+    /// that opens the residency pass itself). The rows are consumed, as in [`Encoded::prompt`]:
+    /// `call` is the only reader of them. The body `B` is named by the caller (`prompt_by::<B, _,
+    /// _>`): a span type does not name its body.
+    pub fn prompt_by<B, F, C>(self, build: F, call: C) -> Result<u32, GateError>
+    where
+        B: MediaBody,
+        F: for<'r> FnOnce(&'r SpanRows<K>) -> Vec<B::Span<'r>>,
+        C: for<'r> FnOnce(&[B::Span<'r>]) -> Result<u32, GateError>,
+    {
         let rows = self.rows;
         let spans = build(&rows);
-        Ok(s.prompt_media(ids, &spans, runtime::Want::Argmax)?.argmax())
+        call(&spans)
     }
 }
 

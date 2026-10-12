@@ -573,6 +573,16 @@ impl<D, C: Clock> Choosing<D, C> {
         &mut self.draft
     }
 
+    /// A prompt call of the draft's own, `f` run on the draft with the chooser's flight forgotten
+    /// first, as [`Draft::prompt`] forgets it: the prompt starts a generation, so nothing in
+    /// flight before it is read as a pass of this one. [`Draft::prompt`] is this call with the
+    /// draft's own prompt; a call with another shape of prompt (a media prompt: the draft's
+    /// prompt over the same ids with spans spliced in) goes through it, so the two have one owner.
+    pub fn prompt_by<R>(&mut self, f: impl FnOnce(&mut D) -> R) -> R {
+        self.drop_flight();
+        f(&mut self.draft)
+    }
+
     /// The chooser's mode.
     #[must_use]
     pub fn mode(&self) -> Mode {
@@ -905,8 +915,7 @@ where
     const TAPS: TapNeed = D::TAPS;
 
     fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error> {
-        self.drop_flight();
-        self.draft.prompt(t, ids)
+        self.prompt_by(|d| d.prompt(t, ids))
     }
 
     fn begin(&mut self, t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error> {
@@ -1886,6 +1895,38 @@ mod tests {
             (t.windows, t.widths[3], t.kept[1], t.closed),
             (1, 1, 1, 0),
             "{t:?}"
+        );
+    }
+
+    /// A prompt call of the draft's own shape ([`Choosing::prompt_by`]) forgets the pass in flight
+    /// and a pending shadow as [`Draft::prompt`] does, and returns what the call returns.
+    #[test]
+    fn a_prompt_by_drops_the_flight() {
+        let mut r = Rig::with(
+            [0.40, 0.20, 0.10],
+            [0.6, 0.5, 0.4],
+            &[71_000, 95_000, 118_000],
+            Mode::Cost,
+            Rule {
+                shadow_every: 1,
+                ..Rule::DEFAULT
+            },
+        );
+        r.run(200);
+        for _ in 0..50 {
+            if r.choosing().shadow.n > 0 {
+                break;
+            }
+            r.run(1);
+        }
+        assert!(r.choosing().shadow.n > 0, "no shadow pending");
+        assert!(r.choosing().flight.is_some(), "no pass in flight");
+        let got = r.choosing().prompt_by(|_| 7_u32);
+        assert_eq!(got, 7);
+        assert_eq!(r.choosing().shadow.n, 0, "the prompt left the shadow up");
+        assert!(
+            r.choosing().flight.is_none(),
+            "the prompt left a pass in flight"
         );
     }
 

@@ -286,17 +286,16 @@
 //!   `seat=off-plan` (under `--place gate` the plan is the 3090 and the tower sits on the A6000);
 //! - (m2) the image chat is a 200 with completion tokens and text (`content` or
 //!   `reasoning_content`: the template opens the reply with the think span, so a short reply is
-//!   all reasoning, as in the unset load's chat clause), and the seat prints exactly one `mtp
-//!   prompt` record whose why is the seat's `MEDIA_DRAFT_OFF_WHY` ([`media_why`]): a request that
-//!   holds an image turns its slot's draft off until the slot's next reset;
-//! - (m3) the text chat, sent while that slot is off, is a 200 whose timings carry draft counts
-//!   (`draft_n` above 0) on a slot the image chat's `slot call` records do not name: a text slot
-//!   beside an image slot keeps drafting;
-//! - (m4) the text chat prints no `mtp prompt` record naming the media why: its slot is not the
-//!   off one.
+//!   all reasoning, as in the unset load's chat clause), its timings carry draft counts
+//!   (`draft_n` above 0), and the seat prints no `mtp prompt` record naming a skipped why for
+//!   it: a request that holds an image keeps its slot's draft (the draft's media prompt call,
+//!   `app::mtp::MtpDraft::prompt_media`); `draft_n_accepted / draft_n` prints;
+//! - (m3) the text chat is a 200 whose timings carry draft counts (`draft_n` above 0) on a slot
+//!   the image chat's `slot call` records do not name: a text slot beside an image slot drafts;
+//!   `draft_n_accepted / draft_n` prints;
+//! - (m4) no `mtp prompt` record in the scenario names a skipped why.
 //!
-//! Mutant: the seat's media call not turning the slot's draft off (`prefill_media`'s `turn_off`
-//! skipped): no record names the why, red on (m2).
+//! Mutant: the seat's media call turning the slot's draft off again: (m2) red.
 //!
 //! A request that extends the held sequence (the prompt and the ids it
 //! generated) is printed with its `cache_n` and the draft's `mtp prompt`
@@ -3251,40 +3250,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// The text of the seat's `MEDIA_DRAFT_OFF_WHY`, read from its source: `serve_seats/glm.rs` is
-    /// a module of `bloomery-serve`, another crate than this binary, so its constant cannot be
-    /// named here. A source that no longer declares it in this form is refused by name. The
-    /// constant moves into the lib, and this reader goes with it.
-    fn media_why() -> Result<String, GateError> {
-        const SEAT: &str = include_str!("shared/serve_seats/glm.rs");
-        const HEAD: &str = "const MEDIA_DRAFT_OFF_WHY: &str = \"";
-        let at = SEAT.find(HEAD).ok_or(
-            "serve_seats/glm.rs declares no `const MEDIA_DRAFT_OFF_WHY: &str = \"...\"`, the text \
-             the media arm holds the `mtp prompt` record to",
-        )?;
-        let mut chars = SEAT[at + HEAD.len()..].chars().peekable();
-        let mut why = String::new();
-        while let Some(c) = chars.next() {
-            match c {
-                '"' => return Ok(why),
-                // A backslash at a line's end joins the next line, its indent dropped.
-                '\\' => match chars.next() {
-                    Some('\n') => while chars.next_if(|c| c.is_whitespace()).is_some() {},
-                    Some(e @ ('"' | '\'' | '\\')) => why.push(e),
-                    other => {
-                        return Err(format!(
-                            "MEDIA_DRAFT_OFF_WHY holds the escape \\{other:?}, which the media \
-                             arm's reader does not take"
-                        )
-                        .into());
-                    }
-                },
-                c => why.push(c),
-            }
-        }
-        Err("MEDIA_DRAFT_OFF_WHY's string is not closed".into())
-    }
-
     /// [`MEDIA_PNG`] as a `data:` URL, held to its digest: a file that is not the one the clauses
     /// were written against is refused by name.
     fn png_url() -> Result<String, GateError> {
@@ -3303,16 +3268,18 @@ mod gate {
         Ok(format!("data:image/png;base64,{}", base64(&bytes)))
     }
 
-    /// The `mtp prompt` records past line `after` of the server's stderr whose why is `why`.
-    fn told_why(err_log: &Path, why: &str, after: usize) -> Result<usize, GateError> {
+    /// The `skipped` texts of the `mtp prompt` records past line `after` of the server's stderr
+    /// that say the draft skips (their `skipped` not `none`).
+    fn skips_past(err_log: &Path, after: usize) -> Result<Vec<String>, GateError> {
         let log = seat_log(&lines_from(err_log, 0)?);
-        let mut told = 0;
+        let mut whys = Vec::new();
         for f in log.all(&record::MTP_PROMPT)? {
-            if f.at() > after && f.text("skipped")? == why {
-                told += 1;
+            let why = f.text("skipped")?;
+            if f.at() > after && why != "none" {
+                whys.push(why.to_owned());
             }
         }
-        Ok(told)
+        Ok(whys)
     }
 
     /// The slots the `slot call` records past line `after` name, once each, ascending.
@@ -3348,7 +3315,6 @@ mod gate {
     /// The media arm (the module header): one server of two slots with the projector, an image chat
     /// and then a text chat.
     fn media(dir: &Path, mmproj: &Path) -> Result<bool, GateError> {
-        let why = media_why()?;
         let image = png_url()?;
         let mmproj = mmproj
             .to_str()
@@ -3408,20 +3374,27 @@ mod gate {
             .filter_map(|k| message[*k].as_str())
             .collect();
         let completion = reply["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-        let told = told_why(&err_log, &why, after_load)?;
+        let skipped = skips_past(&err_log, after_load)?;
         let image_slots = called_slots(&err_log, after_load)?;
+        let image_drafted = reply["timings"]["draft_n"].as_u64().unwrap_or(0);
         println!(
             "media chat: HTTP {st}, {completion} completion tokens, {} chars of content and \
-             reasoning_content, prompt tokens {}, draft_n={}; `mtp prompt` records naming the media \
-             why: {told}; slots called {image_slots:?}",
+             reasoning_content, prompt tokens {}, draft_n={image_drafted} \
+             draft_n_accepted={} (accepted / proposed {}/{image_drafted}); `mtp prompt` records \
+             naming a skipped why: {skipped:?}; slots called {image_slots:?}",
             text.chars().count(),
             reply["usage"]["prompt_tokens"],
-            reply["timings"]["draft_n"],
+            reply["timings"]["draft_n_accepted"],
+            reply["timings"]["draft_n_accepted"].as_u64().unwrap_or(0),
         );
         check(
             &mut ok,
-            "media_chat_is_served_and_names_the_draft_off_once",
-            st == 200 && completion > 0 && !text.is_empty() && told == 1,
+            "media_chat_is_served_and_drafts",
+            st == 200
+                && completion > 0
+                && !text.is_empty()
+                && image_drafted > 0
+                && skipped.is_empty(),
         );
 
         // (m3) the text chat on the other slot, while the image slot is off.
@@ -3433,13 +3406,13 @@ mod gate {
         });
         let (st, reply) = media_post(&url, "text chat", &body);
         let drafted = reply["timings"]["draft_n"].as_u64().unwrap_or(0);
-        let told = told_why(&err_log, &why, after_media)?;
         let text_slots = called_slots(&err_log, after_media)?;
         println!(
-            "text chat: a prompt of {} ids, HTTP {st}, draft_n={drafted} draft_n_accepted={}; \
-             `mtp prompt` records naming the media why: {told}; slots called {text_slots:?}",
+            "text chat: a prompt of {} ids, HTTP {st}, draft_n={drafted} draft_n_accepted={} \
+             (accepted / proposed {}/{drafted}); slots called {text_slots:?}",
             text_ids.len(),
             reply["timings"]["draft_n_accepted"],
+            reply["timings"]["draft_n_accepted"].as_u64().unwrap_or(0),
         );
         // The scheduler seats a request that clears no slot's prefix floor on a slot that holds no
         // ids, so the text chat takes the slot the image chat left empty.
@@ -3452,12 +3425,10 @@ mod gate {
             st == 200 && drafted > 0 && other_slot,
         );
 
-        // (m4) the text request's slot never prints the media why.
-        check(
-            &mut ok,
-            "media_text_slot_never_prints_the_media_why",
-            st == 200 && told == 0,
-        );
+        // (m4) no `mtp prompt` record of the scenario names a skipped why.
+        let skipped = skips_past(&err_log, 0)?;
+        println!("media scenario: `mtp prompt` records naming a skipped why: {skipped:?}");
+        check(&mut ok, "media_scenario_skips_no_draft", skipped.is_empty());
         println!("media server stopped: {}", served.stop()?);
         Ok(ok)
     }

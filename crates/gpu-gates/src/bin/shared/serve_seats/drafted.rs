@@ -197,18 +197,70 @@ where
         slot: usize,
         ids: &[u32],
     ) -> Result<u32, GateError> {
+        self.prefill_by(
+            s,
+            slot,
+            |s| Ok(s.prompt(ids, Want::Argmax)?.argmax()),
+            |spec, s| Ok(Advance::prompt(spec, s, ids)?),
+        )
+    }
+
+    /// [`SlotDrafts::prefill`] of a prompt that holds an image: `spans` are the
+    /// body's spans of the image's rows, spliced in place of their positions'
+    /// embeddings. Under the draft the draft's own media prompt call
+    /// ([`MtpDraft::prompt_media`]: its store walked over the call's units, a
+    /// span's positions included), then its join record; without it, or while
+    /// it is off, the session's ([`Session::prompt_media`]).
+    #[cfg(feature = "vision")]
+    #[allow(
+        dead_code,
+        reason = "only the GLM seat's media call names it; the qwen38 serving binary compiles this file without that seat"
+    )]
+    pub(crate) fn prefill_media(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        ids: &[u32],
+        spans: &[<B as bloomery_gpu::media::MediaBody>::Span<'_>],
+    ) -> Result<u32, GateError>
+    where
+        B: bloomery_gpu::media::MediaBody,
+    {
+        self.prefill_by(
+            s,
+            slot,
+            |s| Ok(s.prompt_media(ids, spans, Want::Argmax)?.argmax()),
+            |spec, s| {
+                Ok(spec
+                    .draft_mut()
+                    .prompt_by(|d| d.prompt_media(s, ids, spans))?)
+            },
+        )
+    }
+
+    /// The prompt call's order, the one owner of it: the off slot's record
+    /// and the session's own call, else under the draft the chooser's passes
+    /// closed out, `drafted` (the window's prompt call) and the join record,
+    /// else `plain`.
+    fn prefill_by(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        plain: impl FnOnce(&mut Session<B>) -> Result<u32, GateError>,
+        drafted: impl FnOnce(&mut Spec<B, M>, &mut Session<B>) -> Result<u32, GateError>,
+    ) -> Result<u32, GateError> {
         if self.is_off(slot) {
             self.print_off(s, slot);
-            return Ok(s.prompt(ids, Want::Argmax)?.argmax());
+            return plain(s);
         }
         match self.spec_mut(slot)? {
             Some(spec) => {
                 print_widths(spec);
-                let next = Advance::prompt(spec, s, ids)?;
+                let next = drafted(spec, s)?;
                 print_join(spec);
                 Ok(next)
             }
-            None => Ok(s.prompt(ids, Want::Argmax)?.argmax()),
+            None => plain(s),
         }
     }
 

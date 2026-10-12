@@ -2266,7 +2266,7 @@ weekly-gpu-mimo2-e2e *ARGS:
 # arm of 316 s); a later process's first load there took 18.2-24.9 s (residency, stagger) against 16.0-18.9 s for a warm
 # load inside one process, so the two added items cost at most 2 x (24.9 - 16.0) = 17.8 s [derived] of load plus their
 # process starts, and the chain, which runs one item at a time under the V4.1 load lock, takes nothing back: one item
-# stays. The slots arm's (sd) and (s3) run on the harness's load, 16.4 s of load less (the same log), so about
+# stays. The slots arm's (sd), (s3) and (sdm) run on the harness's load, 16.4 s of load less (the same log), so about
 # 773 - 16.4 = 757 s [derived], still past 675 s. 1200 keeps the kill at 1.55 x the median while the budget check reads
 # 900 s, the default bound itself.
 [group('solo-real')]
@@ -2405,9 +2405,10 @@ gate-gpu-glm5next-serve:
 # The GLM seat's image input beside its draft (gate_glm5next_serve --arm media): one server of --parallel 2 under
 # BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off with --mmproj, the GLM-5.3 projector, then an image chat on one slot and a
 # text chat on the other. (m1) the `vision` record names the card the gate placement leaves off (the A6000), seat=off-plan;
-# (m2) the image chat is a 200 and the seat prints exactly one `mtp prompt` record naming why the slot's draft is off
-# (the seat's MEDIA_DRAFT_OFF_WHY); (m3) the text chat is a 200 that drafts; (m4) it prints no `mtp prompt` record naming
-# the media why. Logs in target/glm-media-gate/media/. One load of the whole host set: alone in a batch, under the
+# (m2) the image chat is a 200 whose timings carry draft counts (the draft's media prompt call keeps its slot's draft on)
+# and the seat prints no `mtp prompt` record naming a skipped why for it; (m3) the text chat is a 200 that drafts; (m4) no
+# `mtp prompt` record of the scenario names a skipped why. Both chats print draft_n_accepted / draft_n. Logs in
+# target/glm-media-gate/media/. One load of the whole host set: alone in a batch, under the
 # big-load lock. Real-only: the gate states its clauses against the real file and the real projector, so the fixture tier
 # defers the recipe by name (tools/ref/real-only.sh); a weekly, selected by its trigger rows in tools/gate-paths.tsv and
 # its own text, and not part of gate-gpu-glm5next-serve. BLOOMERY_CARD=both: both gate locks, the tower on the A6000.

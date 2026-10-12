@@ -228,7 +228,7 @@
 //! Then, on the harness's own load once its H4 and H5 have run (the MTP draft
 //! drives a session, which owns its model: the harness hands its model over,
 //! and each clause resets every slot it uses before it reads it), three
-//! prompts:
+//! prompts, then a prompt that holds an image:
 //! - (sd) drafted: under the MTP draft (each slot's side of it parked and put
 //!   back around a select, as the seat's table does), the two prompts on
 //!   slots 0 and 1, a select between every pass, [`SLOT_PASSES`] passes and
@@ -249,6 +249,16 @@
 //!   [`KP_STEPS`] steps from there, the ids and every step's logits bit for
 //!   bit the same both ways and the unbroken run's, the prefix restore
 //!   returning the point.
+//! - (sdm) drafted media, last (the load set for media, then set back): a
+//!   head of `a`'s ids, a span of image-token positions whose rows are seeded
+//!   values (no tower: the clause holds the draft's walk over the media call),
+//!   and a tail. (sdm-a) the draft's store after the drafted media call is the
+//!   text call's (the same ids, no span) bit for bit below the span and
+//!   differs from it past the span's first position, every position held;
+//!   (sdm-b) the head as a text call, then the media call of the rest, joins
+//!   the draft with one row and no skip; (sdm-c) the drafted greedy ids are
+//!   the plain run's, with a proposal accepted and one rejected on the real
+//!   tier; the acceptance of the media and text runs is printed.
 //!
 //! The harness's last clause, H5's one-slot case, runs after them on a load
 //! of one sequence of its own, the card holding one load at a time.
@@ -465,6 +475,7 @@ mod gate {
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, POOL, pools_for};
     use bloomery_gpu::linear::RING_ROWS;
+    use bloomery_gpu::media::MediaSpan;
     use bloomery_gpu::model::{SlotsOut, StepMode};
     use bloomery_gpu::site::{Form, SiteTy};
     use bloomery_gpu::weights::DevWeight;
@@ -484,8 +495,9 @@ mod gate {
         Body, CHECKPOINT_EVERY, CHUNK, FfnTapRows, GEMM_FROM, Glm5nextModel, GlmArena, Plant,
         PrefillMode, RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
         plant_prompt_routes, prefill, prefill_mode, prompt_ffn_taps, prompt_route_taps, seq_resume,
-        seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prompt_ffn_taps,
-        set_prompt_route_taps, set_taps, step_launches, store_digests, store_rows, trunk_blocks,
+        seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prefill_media,
+        set_prompt_ffn_taps, set_prompt_route_taps, set_taps, step_launches, store_digests,
+        store_rows, trunk_blocks,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -3329,7 +3341,254 @@ mod gate {
             }
         }
         ok &= clause_timed("slots", "(kp) prefix restore", || slots_prefix(s, a));
+        // Last: (sdm) sets the load for media and sets it back.
+        ok &= clause_timed("slots", "(sdm) drafted media", || {
+            slots_media(s, &mut spec, &mut parked, (a, c))
+        });
         Ok(ok)
+    }
+
+    // ------------------------------------------ (sdm) drafted media
+
+    /// (sdm)'s prompt on the NextN load ([`SLOT_CTX`] positions, so one batch a call: the batch is
+    /// at most `T_MAX` positions and the load's checkpoint spacing is past the context, hence one
+    /// sink unit): a text head of two chunks, one span of one chunk of image-token positions, a
+    /// text tail. The span starts on a chunk boundary, so the head's chunks are the text call's
+    /// chunks and its rows stay the text call's bit for bit.
+    const SDM_HEAD: usize = 2 * CHUNK;
+    const SDM_SPAN: usize = CHUNK;
+    const SDM_TAIL: usize = 9;
+    /// The drafted passes (sdm-c) compares with the plain run.
+    const SDM_PASSES: usize = 16;
+    const _: () = assert!(SDM_HEAD + SDM_SPAN + SDM_TAIL + 1 < SLOT_CTX);
+
+    /// The draft's store after a prompt call: the positions it holds and its latent and index
+    /// rows of them.
+    type Store = (usize, Vec<u16>, Vec<u16>);
+
+    fn sdm_store(s: &mut Session<Body>) -> Result<Store, GateError> {
+        let m = s.model_mut();
+        let held = m
+            .body("sdm")?
+            .nextn()
+            .ok_or("the drafted slots' load holds no NextN layer")?
+            .held();
+        let (lat, idx) = nextn_store(m, held)?;
+        Ok((held, lat, idx))
+    }
+
+    /// The positions below `n` whose store row (latent or index) differs between two stores.
+    fn differing_rows(a: &Store, b: &Store, n: usize) -> Vec<usize> {
+        let row = |s: &Store, q: usize| {
+            (
+                s.1[q * LATENT..(q + 1) * LATENT].to_vec(),
+                s.2[q * INDEX_ROW..(q + 1) * INDEX_ROW].to_vec(),
+            )
+        };
+        (0..n).filter(|&q| row(a, q) != row(b, q)).collect()
+    }
+
+    /// `n` bf16 values of a seeded xorshift64 stream: uniform in ±0.05 (an embedding row's
+    /// magnitude), the f32 truncated to bf16. They are not any token's embedding row, so a draft
+    /// that read the span's rows instead of the image token's would differ from a draft that does
+    /// not.
+    fn sdm_rows(n: usize) -> Vec<u16> {
+        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let u = (x >> 40) as f32 / (1u64 << 24) as f32;
+                (((u - 0.5) * 0.1).to_bits() >> 16) as u16
+            })
+            .collect()
+    }
+
+    /// A drafted run past a prompt call that returned `first`: the draft told, then
+    /// [`SDM_PASSES`] passes; the ids from `first` on, the windows that proposed and those among
+    /// them that kept both rows.
+    fn sdm_passes(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        ids: &[u32],
+        first: u32,
+    ) -> Result<(Vec<u32>, usize, usize), GateError> {
+        runtime::Draft::begin(spec.draft_mut(), s, ids, first)?;
+        let mut run = vec![first];
+        let (mut proposed, mut accepted) = (0, 0);
+        let mut out = Vec::new();
+        for _ in 0..SDM_PASSES {
+            out.clear();
+            let last = *run.last().ok_or("a run with no id")?;
+            let c = runtime::Advance::pass(spec, s, last, &mut out)?;
+            proposed += usize::from(c.proposed);
+            accepted += usize::from(c.proposed && c.kept == PAIR);
+            run.extend_from_slice(&out);
+        }
+        Ok((run, proposed, accepted))
+    }
+
+    /// (sdm) drafted media: a prompt that holds an image, under the MTP draft, on slot 0 of the
+    /// NextN harness load set for media (`set_prefill_media`, set back after).
+    /// The ids are a head of [`SDM_HEAD`] text ids, [`SDM_SPAN`] image-token positions and a tail
+    /// of [`SDM_TAIL`]; the span's rows are [`sdm_rows`]. The text call is the same ids with no
+    /// span. The draft's row at position `q` pairs the token at `q` with the target's hidden row
+    /// at `q - 1`, and at a span's positions it reads the image token's own embedding (feed A), so
+    /// a position whose paired hidden row is a span position or later (`q > SDM_HEAD`) differs
+    /// from the text call's, the rows below `SDM_HEAD` are the text call's bit for bit, and the
+    /// row at `SDM_HEAD` (the first span position: the image token, the last head row's hidden
+    /// row) is the text call's under feed A and is printed, not held. The call walks the draft
+    /// over one unit (this load's whole call): position 0 with a zero hidden row, then every
+    /// position after it, so the store holds every position of the call (the last hidden row
+    /// waits for the generation's first token), and a call from position 0 records no join.
+    /// - (sdm-a) the rows below `SDM_HEAD` equal, every row past `SDM_HEAD` differing, no skipped
+    ///   join, the whole call's store held;
+    /// - (sdm-b) a media call that continues a held sequence (a multi-turn chat whose later turn
+    ///   holds the image): the head as a drafted text call, then the drafted media call of the
+    ///   rest from `SDM_HEAD`, which joins the draft with the one row the head call left waiting
+    ///   and no skip, holds every position but the last, and gives the plain run's ids;
+    /// - (sdm-c) the drafted greedy ids equal a plain run's (the session's media call, then
+    ///   steps), a proposal accepted and a proposal rejected among the windows; the acceptance of
+    ///   the media run and of the text run print.
+    fn slots_media(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        parked: &mut [Parked<GlmArena>],
+        (a, c): (&[u32], &[u32]),
+    ) -> Result<bool, GateError> {
+        let head = a
+            .get(..SDM_HEAD)
+            .ok_or("(sdm): the head is past the first prompt")?;
+        let tail = a
+            .get(SDM_HEAD..SDM_HEAD + SDM_TAIL)
+            .ok_or("(sdm): the tail is past the first prompt")?;
+        let image = *c
+            .iter()
+            .find(|id| !head.contains(id) && !tail.contains(id))
+            .ok_or("(sdm): no image token distinct from the head and tail ids")?;
+        let ids: Vec<u32> = head
+            .iter()
+            .copied()
+            .chain([image; SDM_SPAN])
+            .chain(tail.iter().copied())
+            .collect();
+        let rows = sdm_rows(s.model().body("sdm")?.nextn_hidden_width() * SDM_SPAN);
+        let spans = [MediaSpan {
+            at: SDM_HEAD..SDM_HEAD + SDM_SPAN,
+            rows: &rows,
+        }];
+        select_drafted(s, spec, parked, 0)?;
+        set_prefill_media(s.model_mut(), Some(image))?;
+        let run = sdm_clauses(s, spec, &ids, &spans);
+        let off = set_prefill_media(s.model_mut(), None);
+        let ok = run?;
+        off?;
+        Ok(ok)
+    }
+
+    /// [`slots_media`]'s runs on a load set for media.
+    fn sdm_clauses(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        ids: &[u32],
+        spans: &[MediaSpan<'_>],
+    ) -> Result<bool, GateError> {
+        let n = ids.len();
+        // The text call: the same ids, no span.
+        reset_drafted(s, spec)?;
+        let first_t = runtime::Draft::prompt(spec.draft_mut(), s, ids)?;
+        let text = sdm_store(s)?;
+        let joined_t = spec.draft_mut().take_joined();
+        let (_, prop_t, acc_t) = sdm_passes(s, spec, ids, first_t)?;
+        // The drafted media call at groups of one batch.
+        reset_drafted(s, spec)?;
+        let first_m = spec.draft_mut().prompt_media(s, ids, spans)?;
+        let media = sdm_store(s)?;
+        let joined_m = spec.draft_mut().take_joined();
+        let (run_m, prop_m, acc_m) = sdm_passes(s, spec, ids, first_m)?;
+        // The continuing call: the head as a drafted text call of its own, then the drafted
+        // media call of the rest from where it stopped, the span's place in that call.
+        let (head, rest) = ids.split_at(SDM_HEAD);
+        let rest_spans = [MediaSpan {
+            at: 0..SDM_SPAN,
+            rows: spans.first().ok_or("(sdm) no span")?.rows,
+        }];
+        reset_drafted(s, spec)?;
+        runtime::Draft::prompt(spec.draft_mut(), s, head)?;
+        let joined_h = spec.draft_mut().take_joined();
+        let first_k = spec.draft_mut().prompt_media(s, rest, &rest_spans)?;
+        let cont = sdm_store(s)?;
+        let joined_k = spec.draft_mut().take_joined();
+        let (run_k, _, _) = sdm_passes(s, spec, rest, first_k)?;
+        s.reset()?;
+        s.prompt(head, Want::Argmax)?;
+        let mut plain_k = vec![s.prompt_media(rest, &rest_spans, Want::Argmax)?.argmax()];
+        while plain_k.len() < run_k.len() {
+            let last = *plain_k.last().ok_or("a run with no id")?;
+            plain_k.push(s.step(last, Want::Argmax)?.argmax());
+        }
+        // The plain run: the session's media call, then steps, as many as the drafted run took.
+        s.reset()?;
+        let mut plain = vec![s.prompt_media(ids, spans, Want::Argmax)?.argmax()];
+        while plain.len() < run_m.len() {
+            let last = *plain.last().ok_or("a run with no id")?;
+            plain.push(s.step(last, Want::Argmax)?.argmax());
+        }
+
+        let diff = differing_rows(&text, &media, text.0.min(media.0));
+        let below_same = diff.iter().all(|&q| q >= SDM_HEAD);
+        let past_differ = (SDM_HEAD + 1..n).all(|q| diff.contains(&q));
+        let first_span_same = !diff.contains(&SDM_HEAD);
+        let held = [text.0, media.0] == [n; 2];
+        let no_skip = joined_t.is_none() && joined_m.is_none_or(|j| j.skipped.is_none());
+        let a_ok = below_same && past_differ && held && no_skip;
+        let want_join = app::mtp::Join {
+            start: SDM_HEAD as u32,
+            caught_up: 1,
+            skipped: None,
+        };
+        let b_ok =
+            joined_h.is_none() && joined_k == Some(want_join) && cont.0 == n && run_k == plain_k;
+        let ids_ok = run_m == plain;
+        let covered = acc_m > 0 && acc_m < prop_m;
+        let covered = tier::premise(
+            "(sdm) the drafted media run accepts and rejects a proposal",
+            Tag::FileBound,
+            covered,
+        )?;
+        let tier_name = tier::Tier::from_env()?.name();
+        println!(
+            "slots (sdm-a) drafted media: head {SDM_HEAD} + span {SDM_SPAN} + tail {SDM_TAIL} = {n} \
+             ids (feed A: the image token's embedding at a span position), the draft's store \
+             {} rows (text {}): rows below {SDM_HEAD} the text call's bit for bit {below_same}; \
+             every row past {SDM_HEAD} differs {past_differ}; the row at {SDM_HEAD} (the first \
+             span position) the text call's {first_span_same} (printed, not held); join \
+             records text {joined_t:?}, media {joined_m:?}; whole call's store held {held} {}",
+            media.0,
+            text.0,
+            verdict(a_ok)
+        );
+        println!(
+            "slots (sdm-b) drafted media continuing a held sequence: the head's text call (join \
+             {joined_h:?}), then the media call of the rest from {SDM_HEAD}: join {joined_k:?} \
+             (want {want_join:?}), the store {} rows (want {}), {} ids from its argmax bit for \
+             bit the plain run's (the same two calls, then steps) {} {}",
+            cont.0,
+            n,
+            run_k.len(),
+            run_k == plain_k,
+            verdict(b_ok)
+        );
+        println!(
+            "slots (sdm-c) drafted media: {} ids from the prompt's argmax bit for bit the plain \
+             run's {ids_ok}; windows that proposed and kept both rows: media {acc_m}/{prop_m}, \
+             text {acc_t}/{prop_t} ({SDM_PASSES} passes, k = {SDM_SPAN}, {tier_name} tier, NextN \
+             harness load at {SLOT_CTX} positions); a proposal accepted and one rejected {covered} {}",
+            run_m.len(),
+            verdict(ids_ok && covered)
+        );
+        Ok(a_ok && b_ok && ids_ok && covered)
     }
 
     /// The prose set's prefill ids the slot clauses cut their prompts from.
