@@ -1002,7 +1002,8 @@ mod gate {
     /// to that cap — this gate's own plan taken, the one past it refused when
     /// the card bounds it, else the cap itself — with that plan's stage-card
     /// expert bytes; its `margin_ctx` at most `workstation::MARGIN` fewer of
-    /// them than the plan at [`CTX`] and no more NVMe expert bytes, and the
+    /// them than the plan at [`CTX`] and at most a hundredth of the base's NVMe
+    /// expert bytes more (`NVME_DIV` in `ctx`), and the
     /// next multiple of [`CTX_STEP`] past it more of either (or it is the
     /// fit). A
     /// server asked for [`FLAG_CTX`] takes it (below the floor, a value no
@@ -1093,11 +1094,20 @@ mod gate {
         let (base, base_nvme) = at(CTX)?.ok_or("no plan at the base context")?;
         let margin = model::placement::workstation::MARGIN;
         // Whether the plan at `c` is within the rule's margin of the base's:
-        // at most `margin` fewer card expert bytes and no more NVMe expert
-        // bytes, re-derived from the gate's own plans; `None` when no plan
-        // takes the context.
+        // at most `margin` fewer card expert bytes and at most a hundredth of
+        // the base's NVMe expert bytes more, re-derived from the gate's own
+        // plans; `None` when no plan takes the context.
+        //
+        // PIN(2026-10-12): the default pages at most `base_nvme / 100` bytes
+        // past the base's (the rule's `NVME_SLACK_DIV`), where it paged none
+        // past it: the gate holds the divisor as its own literal, never the
+        // line's `nvme_bound`.
+        const NVME_DIV: u64 = 100;
+        let slack = base_nvme / NVME_DIV;
         let within = |c: usize| -> Result<Option<bool>, GateError> {
-            Ok(at(c)?.map(|(card, nvme)| base.saturating_sub(card) <= margin && nvme <= base_nvme))
+            Ok(at(c)?.map(|(card, nvme)| {
+                base.saturating_sub(card) <= margin && nvme <= base_nvme + slack
+            }))
         };
         let here = within(margin_ctx)?;
         let past = within(margin_ctx + CTX_STEP)?;
@@ -1150,6 +1160,14 @@ mod gate {
                 && margin_ctx <= fit
                 && (margin_ctx == fit
                     || (margin_ctx.is_multiple_of(CTX_STEP) && past != Some(true))),
+        );
+
+        check(
+            &mut ok,
+            "ctx_line_prints_the_nvme_bound",
+            bytes("base_nvme_expert_bytes") == Some(base_nvme)
+                && bytes("nvme_bound") == Some(slack)
+                && at_ctx.is_some_and(|e| e.1 <= base_nvme + slack),
         );
 
         // The flag arm: below the floor, the flag wins.
