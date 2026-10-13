@@ -14,6 +14,7 @@ pub mod dequant;
 pub mod draft;
 pub mod glm5next;
 pub mod mimo2;
+pub mod minicpmv4_7;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen4exp;
@@ -27,6 +28,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (qwen35::ARCH, qwen35::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
     (mimo2::ARCH, mimo2::FAMILIES),
+    (minicpmv4_7::ARCH, minicpmv4_7::FAMILIES),
     (qwen4exp::ARCH, qwen4exp::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),

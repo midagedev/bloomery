@@ -6,23 +6,30 @@
 #   BLOOMERY_REMOTE='~/repo/bloomery-<track>' tools/box.sh 'setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
 #   BLOOMERY_BOX_READONLY=1 tools/box.sh 'cat /root/lcpp-qvis/pid; tail -n 3 /root/lcpp-qvis/log; cat /root/lcpp-qvis/rc'
 #
-# A clone of the box's local clone /home/user/llama.cpp (objects shared, `git clone --shared`) at /home/user/llama.cpp-36a73916,
-# the pin fetched from GitHub and checked out detached. Every git and build step runs as the trees' owner `user`. The
+# One script builds every mainline oracle tree; the pin, the tree and the sentinel directory come by environment, and the
+# defaults below are the Qwen tree. MiniCPM-V 4.7's tree (`just build-mc47-lcpp`) is the same build at another pin:
+#   LCPP_BUILD_PIN    the full 40-hex commit (default 36a73916ee0cb3b457f356066afabd47cce68884); anything else is refused (rc 64)
+#   LCPP_BUILD_TREE   the tree (default /home/user/llama.cpp-36a73916)
+#   LCPP_BUILD_DIR    where pid, log and rc go (default /root/lcpp-qvis); one directory a tree, so a build never overwrites
+#                     another tree's rc
+#
+# A clone of the box's local clone /home/user/llama.cpp (objects shared, `git clone --shared`) at the tree, the pin fetched from
+# GitHub and checked out detached. Every git and build step runs as the trees' owner `user`. The
 # flags are mainline's (/home/user/llama.cpp-mainline/build/CMakeCache.txt: GGML_CUDA=ON, CMAKE_CUDA_ARCHITECTURES=86,
 # LLAMA_CURL=OFF, Release, nvcc from cuda-13.3), the targets the oracle links: llama, mtmd and llama-common (the chat
 # templates the E sets run). The build runs under `taskset -c 0-31 nice -n 19` with 16 jobs and a 29-minute bound, and
 # starts only while the timing lease is free (rc 75). A tree at another commit is refused (rc 65), never moved; a tree with
 # tracked changes is refused too: the oracle is the commit's build. Writes pid, log and rc (last; absent = running or
-# killed) under /root/lcpp-qvis.
+# killed) under the sentinel directory.
 set -uo pipefail
 HERE=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
-TREE=/home/user/llama.cpp-36a73916
-PIN=36a73916ee0cb3b457f356066afabd47cce68884
+TREE=${LCPP_BUILD_TREE:-/home/user/llama.cpp-36a73916}
+PIN=${LCPP_BUILD_PIN:-36a73916ee0cb3b457f356066afabd47cce68884}
 SRC=/home/user/llama.cpp
 MAINLINE=/home/user/llama.cpp-mainline
 NVCC=/usr/local/cuda-13.3/bin/nvcc
 USER_PATH=/usr/local/cuda-13.3/bin:/usr/bin:/bin
-DIR=/root/lcpp-qvis
+DIR=${LCPP_BUILD_DIR:-/root/lcpp-qvis}
 as_user() { sudo -u user env HOME=/home/user "PATH=$USER_PATH" "$@"; }
 ugit() { as_user git -c safe.directory="$TREE" -C "$TREE" "$@"; }
 
@@ -37,6 +44,7 @@ fail() {
   echo "${2:-2}" > "$DIR/rc"
   exit "${2:-2}"
 }
+[[ $PIN =~ ^[0-9a-f]{40}$ ]] || fail "LCPP_BUILD_PIN='$PIN' is not a full commit id (40 lower-case hex digits)" 64
 # Every git and build step from /: the track directory holds a .git file naming the Mac's worktree, which git would find
 # from there, and the user `user` cannot enter /root.
 cd / || fail "cannot cd /"
