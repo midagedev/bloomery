@@ -1,6 +1,6 @@
 //! Where the DSpark draft a V4.1 run serves comes from: its file
 //! (`BLOOMERY_DSPARK_MODEL`) and its card (`BLOOMERY_DSPARK_CARD`). The draft
-//! itself is the session's (`app::arch::deepseek41::CardDraft`).
+//! itself is the session's (`app::arch::deepseek41::Ds41Draft`).
 //!
 //! The draft's card is one card as a `--place` list word names it, found
 //! among this process's visible devices (`Place::draft_spec`): unset, the

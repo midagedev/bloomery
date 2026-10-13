@@ -190,13 +190,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use app::arch::deepseek41::{CardDraft, Ds41Cfg};
+use app::arch::deepseek41::{Ds41Cfg, Ds41Draft};
 use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{Slots, StepMode};
 use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqSnapshot};
-use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
@@ -830,7 +829,7 @@ enum Served {
     /// the lookup is the size of its rings, as the DSpark draft's is.
     Lookup(Box<Speculative<Choosing<Lookup>, PAIR_ROWS>>, bool),
     /// Boxed: the draft body is the size of its graphs and buffers.
-    Dspark(Box<Speculative<Choosing<CardDraft<DraftBody>>, PAIR_ROWS>>),
+    Dspark(Box<Speculative<Choosing<Ds41Draft>, PAIR_ROWS>>),
 }
 
 /// The V4.1 session on the engine thread, and its draft.
@@ -1005,12 +1004,9 @@ impl V41 {
                 )?),
                 false,
             ),
-            (Draft::Dspark, Some(d)) => Served::Dspark(Box::new(s.with_draft::<Choosing<
-                CardDraft<DraftBody>,
-            >, PAIR_ROWS>(
-                behind(d, a.width)?,
-                &mut log,
-            )?)),
+            (Draft::Dspark, Some(d)) => Served::Dspark(Box::new(
+                s.with_draft::<Choosing<Ds41Draft>, PAIR_ROWS>(behind(d, a.width)?, &mut log)?,
+            )),
             (Draft::Dspark, None) => {
                 return Err("bloomery-serve-ds41: the DSpark draft did not load".into());
             }
@@ -1046,7 +1042,12 @@ impl V41 {
     /// the draft over feeds it before its first proposal.
     fn window(&self) -> usize {
         match &self.draft {
-            Served::Dspark(d) => d.draft().draft().window(),
+            // V4.1's draft file always carries a window (its shape's `window`).
+            Served::Dspark(d) => d
+                .draft()
+                .draft()
+                .window()
+                .expect("V4.1's DSpark draft has a window"),
             Served::Off | Served::Lookup(..) => 0,
         }
     }

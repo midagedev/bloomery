@@ -231,7 +231,7 @@
 //! is. `BLOOMERY_STEP_STATS` reads once per pass.
 //!
 //! `BLOOMERY_DRAFT=dspark` serves the DSpark draft at width 1
-//! (`app::arch::deepseek41::CardDraft`): the draft file is
+//! (`app::arch::deepseek41::Ds41Draft`): the draft file is
 //! `$BLOOMERY_DSPARK_MODEL`, its card `BLOOMERY_DSPARK_CARD` (the 3090 when
 //! unset; `shared/ds41_dspark.rs`), and the target carries the feature tap
 //! of the draft's `target_layers`, built before the capture. The fed ids go

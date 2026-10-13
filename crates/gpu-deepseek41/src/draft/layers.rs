@@ -17,22 +17,18 @@
 //!   (the 4-stream broadcast), runs the layers and leaves the last layer's
 //!   fold in the owner's `x`: the last ffn's HC post writes it there, so no
 //!   copy follows ([`BlockPass::enqueue_layers`]).
-//!
-//! The block pass is [`BlockPass`] as it is: its head is built and never
-//! launched here, and goes with the owner's wiring.
 
 use std::mem::size_of;
 use std::sync::Arc;
 
 use bloomery_gpu::dspark::DraftLayers;
 use bloomery_gpu::dspark::stage::{Inbox, put_f32};
-use bloomery_gpu::{Gpu, GpuError, Window};
+use bloomery_gpu::{Gpu, GpuError, Window, capturing};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::dspark::DraftHparams;
 
 use super::block::{BlockInput, BlockPass, MAX_WIDTH, Rule, embedding_row};
-use super::head::DraftHead;
 use super::kv::{AppendCx, AppendDims, DraftRings, GROUP, GroupRows};
 use super::load::DraftWeights;
 use crate::rope::{Direction, RopeKernels, RopeSpec, RopeTable};
@@ -92,8 +88,6 @@ impl Layout {
 struct Group {
     kv: Vec<DeviceBuffer<f32>>,
     out: Vec<DeviceBuffer<f32>>,
-    /// Rows the last [`Append::stage`] put in the group.
-    rows: usize,
 }
 
 /// The context append's buffers and constants.
@@ -110,7 +104,7 @@ struct Append {
     dims: AppendDims,
     n_layer: usize,
     window: usize,
-    /// Rows the last stage wrote.
+    /// Rows the last stage wrote; 0 before the first.
     staged: usize,
 }
 
@@ -129,7 +123,6 @@ impl Append {
                 Ok(Group {
                     kv: per_layer()?,
                     out: per_layer()?,
-                    rows: 0,
                 })
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
@@ -158,6 +151,18 @@ impl Append {
         self.groups.len() * GROUP
     }
 
+    /// Device bytes of the buffers, the image's card side included, as
+    /// allocated.
+    fn device_bytes(&self) -> usize {
+        self.inbox.device_bytes()
+            + self
+                .groups
+                .iter()
+                .flat_map(|g| g.kv.iter().chain(&g.out))
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
+    }
+
     /// Write the slots and rope tables of `n` rows at positions
     /// `first .. first + n` — row `i` in ring slot `(first % window) + i`,
     /// turned at `first + i` — and enqueue the image's one copy on `stream`.
@@ -181,17 +186,17 @@ impl Append {
         let first_slot = first % window;
         let lay = self.layout;
         let host = self.inbox.host_mut()?;
-        for (gi, g) in self.groups.iter_mut().enumerate() {
+        for gi in 0..self.groups.len() {
             let r0 = gi * GROUP;
-            g.rows = n.saturating_sub(r0).min(GROUP);
-            if g.rows == 0 {
+            let rows = n.saturating_sub(r0).min(GROUP);
+            if rows == 0 {
                 continue;
             }
             let img = &mut host[gi * lay.words..(gi + 1) * lay.words];
             let (slots, cs) = img.split_at_mut(lay.cs);
             self.cs.clear();
             for (i, slot) in slots.iter_mut().enumerate() {
-                if i >= g.rows {
+                if i >= rows {
                     *slot = 0;
                     continue;
                 }
@@ -207,8 +212,11 @@ impl Append {
         Ok(())
     }
 
-    /// Every layer's `attn_kv` and append of the staged `n` rows of `x`
-    /// (token-major, `n_embd` a row) into `rings`. Capturable.
+    /// Every layer's `attn_kv` and append of `n` rows of `x` (token-major,
+    /// `n_embd` a row) into `rings`, the launches of `n` rows whatever was
+    /// staged: a capture before any stage records the same ones a replay
+    /// after a stage of `n` rows runs. Eager, `n` is the staged count.
+    /// Capturable.
     fn enqueue(
         &mut self,
         gpu: &Gpu,
@@ -219,7 +227,13 @@ impl Append {
     ) -> Result<(), GpuError> {
         let shape = |detail: String| GpuError::Shape { what: WHAT, detail };
         let n_embd = self.dims.n_embd;
-        if n != self.staged {
+        if n == 0 || n > self.capacity() {
+            return Err(shape(format!(
+                "an append of {n} rows; 1..={}",
+                self.capacity()
+            )));
+        }
+        if n != self.staged && !(self.staged == 0 && capturing(gpu.stream())?) {
             return Err(shape(format!(
                 "an append of {n} rows after a stage of {}",
                 self.staged
@@ -247,20 +261,16 @@ impl Append {
         };
         let lay = self.layout;
         for (l, ring) in ring_set.iter_mut().enumerate() {
-            for (gi, g) in self
-                .groups
-                .iter_mut()
-                .enumerate()
-                .filter(|(_, g)| g.rows > 0)
-            {
+            for (gi, g) in self.groups.iter_mut().enumerate().take(n.div_ceil(GROUP)) {
+                let rows = (n - gi * GROUP).min(GROUP);
                 let at = gi * lay.words;
                 let cs = self.inbox.f32s(at + lay.cs, GROUP * lay.rope_dims)?;
                 let slots = self.inbox.u32s(at + lay.slots, GROUP)?;
-                let rows =
-                    Window::<f32>::of(x, gi * GROUP * n_embd * size_of::<f32>(), g.rows * n_embd)?;
+                let window =
+                    Window::<f32>::of(x, gi * GROUP * n_embd * size_of::<f32>(), rows * n_embd)?;
                 let group = GroupRows {
-                    x: &rows,
-                    rows: g.rows,
+                    x: &window,
+                    rows,
                     cs: &cs,
                     slots: &slots,
                 };
@@ -294,29 +304,15 @@ pub struct V41Layers {
     rule: Rule,
     /// An oracle set's positions for the next staged blocks, when one is set.
     oracle: Option<OracleBlock>,
-    /// Card bytes the layers hold: the weights they keep and their buffers.
-    bytes: u64,
 }
 
 impl V41Layers {
-    /// The widest block the layers hold scratch for. The trait's
-    /// `MAX_ROWS` takes this value; the integration moves it into the impl.
-    pub const MAX_ROWS: usize = MAX_WIDTH;
-
-    /// The most context rows one append graph takes. The trait's
-    /// `APPEND_GROUP` takes this value; the integration moves it into the
-    /// impl.
-    pub const APPEND_GROUP: usize = GROUP;
-
     /// Rings, the append's scratch and the block pass over `w`'s draft.
     /// Load-time only.
     pub fn new(gpu: &Gpu, w: DraftWeights, target: Arc<Split>) -> Result<V41Layers, GpuError> {
-        let (free, _) = gpu.mem_info()?;
         let rings = DraftRings::new(gpu.stream(), w.hp())?;
         let append = Append::new(gpu, w.hp())?;
         let pass = BlockPass::new(gpu, &w)?;
-        let (left, _) = gpu.mem_info()?;
-        let bytes = w.layer_bytes() + free.saturating_sub(left) as u64;
         Ok(V41Layers {
             w,
             rings,
@@ -325,8 +321,15 @@ impl V41Layers {
             target,
             rule: Rule::Reference,
             oracle: None,
-            bytes,
         })
+    }
+
+    /// Device bytes of the layers' working buffers, as allocated: the
+    /// append's scratch and image and the block pass's buffers. The weights
+    /// and the rings are counted apart.
+    #[must_use]
+    pub fn working_bytes(&self) -> u64 {
+        (self.append.device_bytes() + self.pass.device_bytes()) as u64
     }
 
     /// The weights.
@@ -353,6 +356,13 @@ impl V41Layers {
         &mut self.rings
     }
 
+    /// The block pass, writable: the gates' way to stage a row of their own
+    /// into it. A replay or an eager pass then runs over what is staged,
+    /// until the owner's next [`DraftLayers::stage_block`] writes it again.
+    pub fn pass_mut(&mut self) -> &mut BlockPass {
+        &mut self.pass
+    }
+
     /// The rule the next staged block follows.
     #[must_use]
     pub fn rule(&self) -> Rule {
@@ -360,17 +370,9 @@ impl V41Layers {
     }
 
     /// Follow `rule` from the next staged block on. Only the pass of
-    /// [`Rule::Reference`] is a graph's: see [`V41Layers::replayable`].
+    /// [`Rule::Reference`] is a graph's: see [`DraftLayers::replayable`].
     pub fn set_rule(&mut self, rule: Rule) {
         self.rule = rule;
-    }
-
-    /// Whether a graph captured under [`Rule::Reference`] is the pass the
-    /// next staged block asks for: the rule's clamp limits are launch scalars
-    /// of the capture, so a block under [`Rule::Ik`] runs eager.
-    #[must_use]
-    pub fn replayable(&self) -> bool {
-        self.rule == Rule::Reference
     }
 
     /// Stage the next blocks at `oracle`'s positions instead of the ones the
@@ -390,7 +392,7 @@ impl V41Layers {
     /// the head chain the owner holds.
     #[must_use]
     pub fn launches(&self, m: usize) -> usize {
-        self.pass.launches(m) - DraftHead::LOGIT_LAUNCHES - DraftHead::markov_launches(m)
+        self.pass.launches(m)
     }
 
     /// Kernel launches one append of `n` rows makes: per group, per layer,
@@ -402,6 +404,9 @@ impl V41Layers {
 }
 
 impl DraftLayers for V41Layers {
+    const MAX_ROWS: usize = MAX_WIDTH;
+    const APPEND_GROUP: usize = GROUP;
+
     fn hidden(&self) -> usize {
         self.w.hp().n_embd
     }
@@ -429,7 +434,6 @@ impl DraftLayers for V41Layers {
         self.pass.stage(
             gpu.stream(),
             &BlockInput {
-                id_last: last,
                 row,
                 width: m,
                 first_pos,
@@ -446,13 +450,11 @@ impl DraftLayers for V41Layers {
         m: usize,
     ) -> Result<(), GpuError> {
         let n_embd = self.w.hp().n_embd;
-        if m != self.pass.width() {
+        let staged = self.pass.width();
+        if m != staged && !(staged == 0 && capturing(gpu.stream())?) {
             return Err(GpuError::Shape {
                 what: WHAT,
-                detail: format!(
-                    "a block pass of {m} rows after a stage of {}",
-                    self.pass.width()
-                ),
+                detail: format!("a block pass of {m} rows after a stage of {staged}"),
             });
         }
         if x.len() < m * n_embd {
@@ -461,7 +463,7 @@ impl DraftLayers for V41Layers {
                 detail: format!("{m} rows of {n_embd} in a buffer of {} values", x.len()),
             });
         }
-        self.pass.enqueue_layers(gpu, &self.w, &self.rings, Some(x))
+        self.pass.enqueue_layers(gpu, &self.w, &self.rings, m, x)
     }
 
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
@@ -470,9 +472,22 @@ impl DraftLayers for V41Layers {
         Ok(())
     }
 
-    /// The rings are the draft's window whatever `ctx` is, so the bytes do
-    /// not depend on it.
+    /// The captures are the pass of [`Rule::Reference`]: its clamp limits are
+    /// launch scalars, so a block staged under another rule runs eager.
+    fn replayable(&self) -> Result<(), GpuError> {
+        if self.rule == Rule::Reference {
+            return Ok(());
+        }
+        Err(GpuError::State {
+            what: WHAT,
+            missing: "the reference rule for a graph pass (ik's rule runs eager)",
+        })
+    }
+
+    /// The weights the layers keep, the rings and the working buffers. The
+    /// rings are the draft's window whatever `ctx` is, so the bytes do not
+    /// depend on it.
     fn card_bytes(&self, _ctx: usize) -> u64 {
-        self.bytes
+        self.w.layer_bytes() + self.rings.device_bytes() as u64 + self.working_bytes()
     }
 }

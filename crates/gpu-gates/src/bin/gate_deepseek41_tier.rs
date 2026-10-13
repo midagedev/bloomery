@@ -65,7 +65,7 @@
 //!   `target_layers`, header only: no draft is loaded) attached after the
 //!   tiered load made the prompt batch's buffers, then `body::prepare_prefill`
 //!   again — the order `--place bp` opens a draft in (`app::Loaded::open`,
-//!   `CardDraft::open`, `Loaded::ready`). Then the [`FEAT_P`] prose ids fed
+//!   `open_draft`, `Loaded::ready`). Then the [`FEAT_P`] prose ids fed
 //!   one decode step each, each position's features read after its step
 //!   (`Body::read_features`); against them, a prompt call of the same ids
 //!   (`body::prefill_with`) handing over its last `window` positions' rows,

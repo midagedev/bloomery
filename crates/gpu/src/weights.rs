@@ -597,6 +597,14 @@ impl Weights {
         self.by_name.get(name)
     }
 
+    /// Move the weight `name` out of the resident set: the caller owns its
+    /// buffers and [`Weights::get`] no longer finds it. `None` when no entry
+    /// has exactly that name (a tied head is the embedding's entry, not its
+    /// own); the caller names the error.
+    pub fn take(&mut self, name: &str) -> Option<DevWeight> {
+        self.by_name.remove(name)
+    }
+
     /// The resident weight `name`, refused by name as `what`'s when absent.
     pub fn resident(&self, what: &'static str, name: &str) -> Result<&DevWeight, GpuError> {
         self.get(name)
