@@ -123,6 +123,13 @@
 //! window. Without a window and without sinks the merge is
 //! [`flash_gqa_kernels::gqa_flash_merge`].
 //!
+//! The `_k192_ring` pass ([`FlashGqaKernels::enqueue_pass_k192_ring`]) reads a
+//! window layer's planes as a ring of `rows <= ctx` rows a key head: key
+//! position `p` is row `p mod rows`. It is `seg_scalar_kv` with the row rule
+//! in each staged key's address, `row0 + (key − first)` less `rows` once when
+//! it reaches `rows` (a window never exceeds the ring, so one compare
+//! suffices); `ctx` stays the bound of the live count and the merge.
+//!
 //! Both merges skip a segment whose partial is neutral (`s = 0`). Over a
 //! finite row that skip is unreachable: a row's segments are cut from its
 //! first key (windowed or not), so each of its `⌈n / span⌉` live segments
@@ -2396,6 +2403,17 @@ unsafe fn merge_body<const HEAD: usize>(
 // width, the block map `seg_block`, the cut [`seg_span`] over the window's
 // keys ([`window_cut`]).
 
+/// The row of key position `pos` in a ring of `rows` rows whose row `row0`
+/// holds position `first`: the positions from `first` take consecutive rows
+/// from `row0`, wrapping once. `pos − first < rows`, so one subtraction
+/// suffices.
+#[inline(always)]
+#[must_use]
+const fn ring_row(pos: usize, first: usize, row0: usize, rows: usize) -> usize {
+    let r = row0 + (pos - first);
+    if r >= rows { r - rows } else { r }
+}
+
 /// The scalar segment pass of [`flash_gqa_kernels::gqa_flash_seg_k192`] in
 /// blocks of `PACK` query heads ([`seg_block`], `packs` of them per key
 /// head): [`seg_scalar_p`]'s grid, partial index, neutral segment, tile
@@ -2406,7 +2424,15 @@ unsafe fn merge_body<const HEAD: usize>(
 /// scores key `t0 + j` over the 96 key words (partial `p` takes the word
 /// pairs `p, p + 4, …`), lane `l` holds value dims `4l .. 4l + 3`.
 ///
-/// SAFETY: the entry's launch contract (every buffer bound it names), a block
+/// The planes hold `plane_rows` rows a key head: `ctx` of them in the plane
+/// entry (key position `p` is row `p`), and under `RING` a ring of
+/// `plane_rows <= ctx` rows (position `p` is row `p mod plane_rows`, taken as
+/// `row0 + (p − first)` with `row0 = first mod plane_rows` once a block and one
+/// subtraction by `plane_rows`). `ctx` stays the bound of the live count.
+///
+/// SAFETY: the entry's launch contract (every buffer bound it names, the
+/// planes of `n_kv · plane_rows` rows, `plane_rows >= 1`, and under `RING` `plane_rows >=
+/// window`, with every key the row reads resident in the ring), a block
 /// of `PACK · 32` threads, and the four tiles this block's shared memory as
 /// the entry declared them: the pack's query rows (`PACK · HEAD_K192` f32),
 /// the key tile at stride `K_STRIDE_K192` words, the value tile (`KEY_TILE ·
@@ -2416,7 +2442,7 @@ unsafe fn merge_body<const HEAD: usize>(
     clippy::too_many_arguments,
     reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
 )]
-unsafe fn seg_scalar_kv<const PACK: usize>(
+unsafe fn seg_scalar_kv<const PACK: usize, const RING: bool>(
     q: &[f32],
     kc: &[u16],
     vc: &[u16],
@@ -2424,6 +2450,7 @@ unsafe fn seg_scalar_kv<const PACK: usize>(
     scale: f32,
     n_kv: u32,
     ctx: u32,
+    plane_rows: u32,
     segs: u32,
     seg_keys: u32,
     m: u32,
@@ -2475,6 +2502,12 @@ unsafe fn seg_scalar_kv<const PACK: usize>(
     }
     let lo = first + lo_rel;
     let hi = first + (lo_rel + span).min(n_w);
+    // The ring row of key `first`, once a block.
+    let row0 = if RING {
+        (first as u32 % plane_rows) as usize
+    } else {
+        0
+    };
 
     // Row t's pack of query rows: thread `tid` stages values
     // `per_thread·tid ..` of the pack's PACK·HEAD_K192.
@@ -2487,8 +2520,9 @@ unsafe fn seg_scalar_kv<const PACK: usize>(
         i += 1;
     }
 
-    let k_plane = kh * ctx * HEAD_K192;
-    let v_plane = kh * ctx * HEAD;
+    let nrows = plane_rows as usize;
+    let k_plane = kh * nrows * HEAD_K192;
+    let v_plane = kh * nrows * HEAD;
     let k64 = kc.as_ptr() as *const u64;
     let v64 = vc.as_ptr() as *const u64;
     let mut mx = f32::NEG_INFINITY;
@@ -2505,11 +2539,17 @@ unsafe fn seg_scalar_kv<const PACK: usize>(
             let key = e / ROW_QWORDS_K192;
             let word = e - key * ROW_QWORDS_K192;
             let kw = if t0 + key < hi {
-                // SAFETY: t0 + key < hi <= ctx, so the row is inside key head
-                // kh's key plane; a row is HEAD_K192 u16 = 48 u64 and the
-                // plane starts 8-byte aligned (a device allocation), so the
-                // u64 read is aligned and inside the plane.
-                unsafe { *k64.add((k_plane + (t0 + key) * HEAD_K192) / 4 + word) }
+                let at = if RING {
+                    ring_row(t0 + key, first, row0, nrows)
+                } else {
+                    t0 + key
+                };
+                // SAFETY: t0 + key < hi <= ctx, so `at` is a row of key head
+                // kh's key plane (below ctx = rows, or the ring's one
+                // subtraction below rows); a row is HEAD_K192 u16 = 48 u64 and
+                // the plane starts 8-byte aligned (a device allocation), so
+                // the u64 read is aligned and inside the plane.
+                unsafe { *k64.add((k_plane + at * HEAD_K192) / 4 + word) }
             } else {
                 0u64
             };
@@ -2526,9 +2566,14 @@ unsafe fn seg_scalar_kv<const PACK: usize>(
             let key = e / ROW_QWORDS;
             let word = e - key * ROW_QWORDS;
             let vw = if t0 + key < hi {
+                let at = if RING {
+                    ring_row(t0 + key, first, row0, nrows)
+                } else {
+                    t0 + key
+                };
                 // SAFETY: as the key row, in the value plane of HEAD u16 =
                 // 32 u64 a row.
-                unsafe { *v64.add((v_plane + (t0 + key) * HEAD) / 4 + word) }
+                unsafe { *v64.add((v_plane + at * HEAD) / 4 + word) }
             } else {
                 0u64
             };
@@ -3955,7 +4000,7 @@ mod flash_gqa_kernels {
         // allocation, sized for HEAD_K192 and GROUP; the raw form reaches it
         // without a reference. The launch contract is `seg_scalar_kv`'s.
         unsafe {
-            seg_scalar_kv::<GROUP>(
+            seg_scalar_kv::<GROUP, false>(
                 q,
                 kc,
                 vc,
@@ -3963,6 +4008,85 @@ mod flash_gqa_kernels {
                 scale,
                 n_kv,
                 ctx,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                packs as usize,
+                window as usize,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
+    /// [`gqa_flash_seg_k192`] over a window layer's planes held as a ring of
+    /// `rows <= ctx` rows a key head: key position `p` is row `p mod rows`
+    /// (`seg_scalar_kv` under `RING`). `ctx` stays the bound of the live
+    /// count; the keys a row reads, `limit − window .. limit`, are resident
+    /// in the ring, which the host holds by `rows >= window + m − 1` over the
+    /// rows of a pass.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            rows >= 1,
+            rows <= ctx,
+            q.len() >= m * n_kv * packs * 8 * 192,
+            kc.len() >= n_kv * rows * 192,
+            vc.len() >= n_kv * rows * 128,
+            part_v.len() >= m * n_kv * packs * 8 * segs * 128,
+            part_ms.len() >= m * n_kv * packs * 8 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_k192_ring(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        packs: u32,
+        window: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { GROUP * HEAD_K192 }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE_K192 }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { GROUP * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD_K192 and GROUP; the raw form reaches it
+        // without a reference. The launch contract is `seg_scalar_kv`'s over
+        // a ring of `rows` rows.
+        unsafe {
+            seg_scalar_kv::<GROUP, true>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                rows,
                 segs,
                 seg_keys,
                 m,
@@ -4132,7 +4256,8 @@ pub(crate) struct GqaRowsArgs<'a> {
 /// query heads of [`HEAD_K192`] values (roped, unscaled, token-major), the
 /// layer's key plane of `n_kv · ctx` rows of [`HEAD_K192`] and value plane of
 /// `n_kv · ctx` rows of [`HEAD`] (the f16 planes
-/// `RopeNeoxKernels::enqueue_neox_append_k192` writes), each row's live key
+/// `RopeNeoxKernels::enqueue_neox_append_k192` writes; `n_kv · rows` for
+/// [`FlashGqaKernels::enqueue_pass_k192_ring`]), each row's live key
 /// count on the device (`m` of them), the layer's window in positions (0:
 /// every live key) and its per-head sinks (`n_head` f32, or none), the
 /// partials scratch (`m · n_head ·` [`window_segments`]`(window)` rows, the
@@ -4891,7 +5016,47 @@ impl FlashGqaKernels {
         args: GqaK192Args<'_>,
         n_head: usize,
     ) -> Result<(), GpuError> {
-        let what = "flash_gqa::enqueue_k192";
+        self.enqueue_k192_pass(stream, args, n_head, None)
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass_k192`] over a window layer's planes
+    /// held as a ring of `rows` rows a key head (`gqa_flash_seg_k192_ring`):
+    /// key position `p` is row `p mod rows`, `args.kc` and `args.vc` hold `n_kv
+    /// · rows` rows, and `args.ctx` stays the bound of the live count (a count
+    /// of zero or past it raises [`FaultSite::KeyCount`], the merge's rule).
+    /// The merge is unchanged. The caller holds every key a row reads resident:
+    /// the `m` rows of a pass are consecutive positions `p0 ..` appended to
+    /// the ring before the pass, which then holds positions `p0 + m − rows ..`
+    /// while the first row reads from `p0 − window + 1`, so `rows >= window +
+    /// m − 1` keeps them. Refused by name before the launch, besides the plane
+    /// pass's: `rows == 0`, `rows > ctx`, a layer with no window and `rows !=
+    /// ctx` (a full layer cannot ring), a window with `rows < ctx` and `rows <
+    /// window + m − 1`, and a plane shorter than `n_kv · rows` rows. Two
+    /// launches. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pass_k192_ring(
+        &self,
+        stream: &CudaStream,
+        args: GqaK192Args<'_>,
+        n_head: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        self.enqueue_k192_pass(stream, args, n_head, Some(rows))
+    }
+
+    /// The launch of both passes; `rows` is the ring's height, none for the
+    /// planes of `ctx` rows.
+    fn enqueue_k192_pass(
+        &self,
+        stream: &CudaStream,
+        args: GqaK192Args<'_>,
+        n_head: usize,
+        rows: Option<usize>,
+    ) -> Result<(), GpuError> {
+        let what = if rows.is_some() {
+            "flash_gqa::enqueue_k192_ring"
+        } else {
+            "flash_gqa::enqueue_k192"
+        };
         let GqaK192Args {
             q,
             kc,
@@ -4938,12 +5103,47 @@ impl FlashGqaKernels {
                 ),
             ));
         }
+        let plane_rows = rows.unwrap_or(ctx);
+        if rows.is_some() {
+            if plane_rows == 0 {
+                return Err(GpuError::shape(
+                    what,
+                    format!("a ring needs rows >= 1, got rows={plane_rows}"),
+                ));
+            }
+            if plane_rows > ctx {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "a ring of rows={plane_rows} is taller than the position bound ctx={ctx}"
+                    ),
+                ));
+            }
+            if window == 0 && plane_rows != ctx {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "a layer with no window cannot ring: rows={plane_rows} must equal ctx={ctx}"
+                    ),
+                ));
+            }
+            if window > 0 && plane_rows < ctx && plane_rows < window + m - 1 {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "a ring of rows={plane_rows} is too short for {m} rows over a window of \
+                         {window} positions: need rows >= window + m - 1 = {}",
+                        window + m - 1
+                    ),
+                ));
+            }
+        }
         let packs = n_head / (n_kv * GROUP);
         let segs = window_segments(window);
         let lens = [
             ("q", q.len(), m * n_head * HEAD_K192),
-            ("kc", kc.len(), n_kv * ctx * HEAD_K192),
-            ("vc", vc.len(), n_kv * ctx * HEAD),
+            ("kc", kc.len(), n_kv * plane_rows * HEAD_K192),
+            ("vc", vc.len(), n_kv * plane_rows * HEAD),
             ("n_keys", n_keys.len(), m),
             ("part_v", part_v.len(), partials_len(m, n_head, segs, HEAD)),
             ("part_ms", part_ms.len(), partials_len(m, n_head, segs, 2)),
@@ -4965,25 +5165,52 @@ impl FlashGqaKernels {
         let m_u = launch_u32(what, "m", m)?;
         let window_u = launch_u32(what, "window", window)?;
         let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
-        let prep = self.module.prepare_gqa_flash_seg_k192(cfg)?;
-        self.module.gqa_flash_seg_k192(
-            stream,
-            &prep,
-            q,
-            kc,
-            vc,
-            n_keys,
-            scale,
-            n_kv_u,
-            ctx_u,
-            segs,
-            seg_keys,
-            m_u,
-            packs,
-            window_u,
-            &mut *part_v,
-            &mut *part_ms,
-        )?;
+        match rows {
+            None => {
+                let prep = self.module.prepare_gqa_flash_seg_k192(cfg)?;
+                self.module.gqa_flash_seg_k192(
+                    stream,
+                    &prep,
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_kv_u,
+                    ctx_u,
+                    segs,
+                    seg_keys,
+                    m_u,
+                    packs,
+                    window_u,
+                    &mut *part_v,
+                    &mut *part_ms,
+                )?;
+            }
+            Some(_) => {
+                let rows_u = launch_u32(what, "rows", plane_rows)?;
+                let prep = self.module.prepare_gqa_flash_seg_k192_ring(cfg)?;
+                self.module.gqa_flash_seg_k192_ring(
+                    stream,
+                    &prep,
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_kv_u,
+                    ctx_u,
+                    rows_u,
+                    segs,
+                    seg_keys,
+                    m_u,
+                    packs,
+                    window_u,
+                    &mut *part_v,
+                    &mut *part_ms,
+                )?;
+            }
+        }
         self.enqueue_merge_k192(
             stream,
             GqaK192MergeArgs {

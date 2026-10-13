@@ -50,6 +50,32 @@
 //!   `Qcur_roped-L`, `Kcur_roped-L`, `cache_k` and `v_cache_view` of every layer
 //!   (bits), and the flash on ik's `q-L`/`k-L`/`v-L` with the layer's window and
 //!   the file's sinks against `fa-L` (both bands).
+//!
+//! The ring entries (`neox_append_k192_ring`, `gqa_flash_seg_k192_ring`): a window
+//! layer's planes held as a ring of `rows <= ctx` rows a key head, key position
+//! `p` in row `p mod rows`, `ctx` still the position bound. They read the same
+//! keys in the same order as the plane entries and only the address changes, so
+//! each clause is bitwise against the plane entries:
+//!
+//! - identity (W1): at `rows == ctx` the append on A1's grid, the position bound
+//!   (also in a ring of 768 rows: a position at `ctx` raises `cache_pos`, one
+//!   below it lands in row `p mod rows`), the flash on F1's full-layer counts,
+//!   row launches and refused counts, and F2, F3 and F4's window cases equal the
+//!   plane entries;
+//! - wrap, prompt (W2): a ring of 768 rows over four prompt passes of exactly
+//!   512 rows from position 0 to 2,048, each appending all its rows and then
+//!   attending (passes two to four wrap the ring): every row's flash output equals
+//!   the plane entries' on a plane holding the same keys, and after each pass ring
+//!   row `p mod 768` is plane row `p` for the last 768 positions; a ring one row
+//!   too short for the pass moves one key of one row, and the clause sees it;
+//! - wrap, decode and capture (W3): decode steps (m = 1) at positions 760 ..= 780
+//!   across the wrap at 768 equal the plane entries, and a graph captured over
+//!   the ring entries and replayed at every step (766 ..= 769 among them) equals
+//!   the eager ring step;
+//! - refusals (W4): `rows == 0`, `rows > ctx`, a layer with no window and `rows !=
+//!   ctx`, a window with `rows < window + m - 1`, an append with `rows < m` and a
+//!   plane shorter than `n_kv * rows` rows, each by name before any launch, the
+//!   far side of each boundary launching.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -297,6 +323,23 @@ mod gate {
         planes: (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
         sinks: Option<&[f32]>,
     ) -> Result<Vec<f32>, GateError> {
+        flash_launch(k, gpu, fault, sh, None, q, counts, planes, sinks)
+    }
+
+    /// [`flash_with`] through the plane entries (`rows` none) or the ring
+    /// entries over planes of `rows` rows a key head.
+    #[allow(clippy::too_many_arguments, reason = "a test harness's flat arguments")]
+    fn flash_launch(
+        k: &FlashGqaKernels,
+        gpu: &Gpu,
+        fault: FaultSink,
+        sh: Shape,
+        rows: Option<usize>,
+        q: &[f32],
+        counts: &[u32],
+        planes: (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        sinks: Option<&[f32]>,
+    ) -> Result<Vec<f32>, GateError> {
         let stream = gpu.stream();
         let m = counts.len();
         let segs = window_segments(sh.window);
@@ -308,26 +351,26 @@ mod gate {
         let mut pv = DeviceBuffer::<f32>::zeroed(stream, plen(m, sh.n_head, segs, HEAD))?;
         let mut pms = DeviceBuffer::<f32>::zeroed(stream, plen(m, sh.n_head, segs, 2))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * sh.n_head * HEAD)?;
-        k.enqueue_pass_k192(
-            stream,
-            GqaK192Args {
-                q: &qd,
-                kc: planes.0,
-                vc: planes.1,
-                n_keys: &nk,
-                scale: score_scale(),
-                n_kv: sh.n_kv,
-                ctx: sh.ctx,
-                m,
-                window: sh.window,
-                sinks: sk.as_ref(),
-                part_v: &mut pv,
-                part_ms: &mut pms,
-                fault,
-                y: &mut y,
-            },
-            sh.n_head,
-        )?;
+        let args = GqaK192Args {
+            q: &qd,
+            kc: planes.0,
+            vc: planes.1,
+            n_keys: &nk,
+            scale: score_scale(),
+            n_kv: sh.n_kv,
+            ctx: sh.ctx,
+            m,
+            window: sh.window,
+            sinks: sk.as_ref(),
+            part_v: &mut pv,
+            part_ms: &mut pms,
+            fault,
+            y: &mut y,
+        };
+        match rows {
+            None => k.enqueue_pass_k192(stream, args, sh.n_head)?,
+            Some(rows) => k.enqueue_pass_k192_ring(stream, args, sh.n_head, rows)?,
+        }
         stream.synchronize()?;
         Ok(y.to_host_vec(stream)?)
     }
@@ -1372,7 +1415,24 @@ mod gate {
         a: &RopeNeoxKernels,
         gpu: &Gpu,
         fault: FaultSink,
+        g: (usize, usize, usize),
+        qkv: &[f32],
+        table: &[f32],
+        pos: &[u32],
+        v_scale: f32,
+    ) -> Result<Appended, GateError> {
+        append_launch(a, gpu, fault, g, None, qkv, table, pos, v_scale)
+    }
+
+    /// [`append_once`] through the plane entry (`rows` none) or the ring
+    /// entry into planes of `rows` rows a key head, sentinel before.
+    #[allow(clippy::too_many_arguments, reason = "a test harness's flat arguments")]
+    fn append_launch(
+        a: &RopeNeoxKernels,
+        gpu: &Gpu,
+        fault: FaultSink,
         (n_head, n_kv, ctx): (usize, usize, usize),
+        rows: Option<usize>,
         qkv: &[f32],
         table: &[f32],
         pos: &[u32],
@@ -1380,29 +1440,32 @@ mod gate {
     ) -> Result<Appended, GateError> {
         let stream = gpu.stream();
         let m = pos.len();
+        let plane_rows = rows.unwrap_or(ctx);
         let mut qkv_d = DeviceBuffer::from_host(stream, qkv)?;
         let mut q_d = DeviceBuffer::<f32>::zeroed(stream, m * n_head * HEAD_K192)?;
         let table_d = DeviceBuffer::from_host(stream, table)?;
         let pos_d = DeviceBuffer::from_host(stream, pos)?;
-        let mut kc = DeviceBuffer::from_host(stream, &vec![SENTINEL; n_kv * ctx * HEAD_K192])?;
-        let mut vc = DeviceBuffer::from_host(stream, &vec![SENTINEL; n_kv * ctx * HEAD])?;
-        a.enqueue_neox_append_k192(
-            stream,
-            K192Args {
-                qkv: &mut qkv_d,
-                q: &mut q_d,
-                table: &table_d,
-                pos: &pos_d,
-                v_scale,
-                n_head,
-                n_kv,
-                ctx,
-                m,
-                fault,
-                cache_k: &mut kc,
-                cache_v: &mut vc,
-            },
-        )?;
+        let mut kc =
+            DeviceBuffer::from_host(stream, &vec![SENTINEL; n_kv * plane_rows * HEAD_K192])?;
+        let mut vc = DeviceBuffer::from_host(stream, &vec![SENTINEL; n_kv * plane_rows * HEAD])?;
+        let args = K192Args {
+            qkv: &mut qkv_d,
+            q: &mut q_d,
+            table: &table_d,
+            pos: &pos_d,
+            v_scale,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+            cache_k: &mut kc,
+            cache_v: &mut vc,
+        };
+        match rows {
+            None => a.enqueue_neox_append_k192(stream, args)?,
+            Some(rows) => a.enqueue_neox_append_k192_ring(stream, args, rows)?,
+        }
         stream.synchronize()?;
         Ok(Appended {
             q: q_d.to_host_vec(stream)?,
@@ -1607,6 +1670,910 @@ mod gate {
         );
         ok &= r_ok;
         Ok(ok)
+    }
+
+    // ------------------------------------------------------------------ W1 W2 W3 W4
+
+    /// The ring of the wrap clauses: `pad256(WINDOW + 512 − 1)` rows a key head.
+    const W2_ROWS: usize = 768;
+    const W3_ROWS: usize = 768;
+    /// The wrap clauses' position bound, and the rows of one prompt pass.
+    const W_CTX: usize = 4096;
+    const W_PASS: usize = 512;
+    /// W3's decode positions: both caches hold `[0, W3_FIRST)` before the first
+    /// step, and the last step is `W3_LAST`.
+    const W3_FIRST: usize = 760;
+    const W3_LAST: usize = 780;
+
+    /// The ring entries' flash at `rows == ctx` and the plane entries' on the same
+    /// planes, bit for bit.
+    fn same_flash(
+        k: &FlashGqaKernels,
+        gpu: &Gpu,
+        sh: Shape,
+        q: &[f32],
+        counts: &[u32],
+        planes: (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        sinks: Option<&[f32]>,
+    ) -> Result<bool, GateError> {
+        let plane = flash(k, gpu, sh, q, counts, planes, sinks)?;
+        let fault = gpu.unlabelled_sink();
+        let ring = flash_launch(k, gpu, fault, sh, Some(sh.ctx), q, counts, planes, sinks)?;
+        Ok(bits_equal(&plane, &ring))
+    }
+
+    /// A plane of `ctx` rows a key head of `width` values folded into a ring of
+    /// `rows`: row `p mod rows` takes the plane's row `p` for each written
+    /// position, every other row the sentinel.
+    fn fold_ring(
+        plane: &[u16],
+        width: usize,
+        (n_kv, ctx, rows): (usize, usize, usize),
+        written: &[usize],
+    ) -> Vec<u16> {
+        let mut ring = vec![SENTINEL; n_kv * rows * width];
+        for j in 0..n_kv {
+            for &p in written {
+                ring[(j * rows + p % rows) * width..][..width]
+                    .copy_from_slice(&plane[(j * ctx + p) * width..][..width]);
+            }
+        }
+        ring
+    }
+
+    /// W1: at `rows == ctx` the ring entries are the plane entries, bit for bit:
+    /// the append on A1's grid, the position bound (at `rows == ctx` and in a
+    /// ring of 768 rows), and the flash on F1's full-layer counts, its row
+    /// launches and refused counts and F2, F3 and F4's window cases.
+    fn w1(k: &FlashGqaKernels, a: &RopeNeoxKernels, gpu: &Gpu) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let ctx = 4352usize;
+        let table = table_for(1.0e7, ctx)?;
+        let mut ok = true;
+
+        // The append.
+        let mut launches = 0usize;
+        let mut app = true;
+        for n_kv in [KV_FULL, KV_SWA] {
+            for m in [1usize, 5, 64] {
+                for p0 in [0u32, 127, 128, 129, 4095, 4096] {
+                    let pos: Vec<u32> = (0..m as u32).map(|t| p0 + t).collect();
+                    let g = (N_HEAD, n_kv, ctx);
+                    let (qkv, ..) = fused(m, N_HEAD, n_kv, 17 + p0);
+                    let fault = gpu.unlabelled_sink();
+                    let plane = append_launch(a, gpu, fault, g, None, &qkv, &table, &pos, V_SCALE)?;
+                    let fault = gpu.unlabelled_sink();
+                    let ring =
+                        append_launch(a, gpu, fault, g, Some(ctx), &qkv, &table, &pos, V_SCALE)?;
+                    let same = appended_equal(&plane, &ring);
+                    launches += 1;
+                    if !same {
+                        println!("W1 append n_kv={n_kv} m={m} p0={p0}: ring != plane FAIL");
+                    }
+                    app &= same;
+                }
+            }
+        }
+        println!(
+            "W1 append at rows == ctx: {launches} launches (m = 1, 5, 64; positions 0, 127, 128, 129, 4095, 4096; \
+             4 and 8 key heads) = the plane entry bit for bit (turned query, key in place, both planes) {}",
+            verdict(app)
+        );
+        ok &= app;
+
+        // The position bound is ctx, not rows.
+        let layer = 13usize;
+        let g = (N_HEAD, KV_FULL, ctx);
+        let pos = [5u32, 600, ctx as u32, 7];
+        let written = [5usize, 600, 7];
+        let (qkv, ..) = fused(pos.len(), N_HEAD, KV_FULL, 23);
+        let sink = gpu.layer_sink(layer)?;
+        let plane = append_launch(a, gpu, sink, g, None, &qkv, &table, &pos, V_SCALE)?;
+        let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::CachePos));
+        let mut bound = gpu.take_fault()? == want;
+        for rows in [ctx, W2_ROWS] {
+            let sink = gpu.layer_sink(layer)?;
+            let ring = append_launch(a, gpu, sink, g, Some(rows), &qkv, &table, &pos, V_SCALE)?;
+            let raised = gpu.take_fault()?;
+            let shape = (KV_FULL, ctx, rows);
+            let this = raised == want
+                && bits_equal(&ring.q, &plane.q)
+                && bits_equal(&ring.qkv, &plane.qkv)
+                && ring.kc == fold_ring(&plane.kc, HEAD_K192, shape, &written)
+                && ring.vc == fold_ring(&plane.vc, HEAD, shape, &written);
+            if !this {
+                println!(
+                    "W1 position {ctx} at rows={rows}: word {raised:?} (want {want:?}), ring = the plane's rows \
+                     folded {} FAIL",
+                    ring.kc == fold_ring(&plane.kc, HEAD_K192, shape, &written)
+                );
+            }
+            bound &= this;
+        }
+        println!(
+            "W1 position bound: a position at ctx = {ctx} raises cache_pos, NaNs its token and appends nothing, \
+             at rows = ctx and rows = {W2_ROWS}; positions 5, 600, 7 land in ring row p mod rows {}",
+            verdict(bound)
+        );
+        ok &= bound;
+
+        // The flash on F1's full-layer counts: single rows, a row launch, refused counts.
+        let sh = Shape::full(5248);
+        let cache = Cache::seeded(sh.n_kv, sh.ctx, 11);
+        let dev = cache.up(stream)?;
+        let q = seeded_q(1, sh.n_head, 3);
+        let mut full = true;
+        for &n in &F1_COUNTS {
+            let same = same_flash(k, gpu, sh, &q, &[n as u32], (&dev.0, &dev.1), None)?;
+            if !same {
+                println!("W1 full layer n={n}: ring != plane FAIL");
+            }
+            full &= same;
+        }
+        let qs = rotated_rows(&q, sh.n_head);
+        for &n in &[65usize, 1025, 5121] {
+            let same = same_flash(k, gpu, sh, &qs, &spread_counts(n), (&dev.0, &dev.1), None)?;
+            if !same {
+                println!("W1 full layer {ROWS} rows spread to {n}: ring != plane FAIL");
+            }
+            full &= same;
+        }
+        let clean = spread_counts(1025);
+        let mut bad = clean.clone();
+        bad[3] = u32::try_from(sh.ctx + 1)?;
+        bad[5] = 0;
+        let sink = gpu.layer_sink(layer)?;
+        let y_plane = flash_with(k, gpu, sink, sh, &qs, &bad, (&dev.0, &dev.1), None)?;
+        let word_plane = gpu.take_fault()?;
+        let sink = gpu.layer_sink(layer)?;
+        let y_ring = flash_launch(
+            k,
+            gpu,
+            sink,
+            sh,
+            Some(sh.ctx),
+            &qs,
+            &bad,
+            (&dev.0, &dev.1),
+            None,
+        )?;
+        let word_ring = gpu.take_fault()?;
+        let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::KeyCount));
+        let refused_same = bits_equal(&y_plane, &y_ring) && word_plane == want && word_ring == want;
+        if !refused_same {
+            println!(
+                "W1 refused counts: words {word_plane:?} / {word_ring:?} (want {want:?}), rows bit-identical {} FAIL",
+                bits_equal(&y_plane, &y_ring)
+            );
+        }
+        full &= refused_same;
+        println!(
+            "W1 full layer 64/4 at rows == ctx: {} counts up to 5121, {ROWS} rows spread to 65, 1025, 5121, and the \
+             refused counts (word and NaN rows) = the plane entry bit for bit {}",
+            F1_COUNTS.len(),
+            verdict(full)
+        );
+        ok &= full;
+
+        // The window layer: F2's counts, F3's edge, F4's chunks.
+        let small = Cache::seeded(KV_SWA, 4352, 21);
+        let small_dev = small.up(stream)?;
+        let big = Cache::seeded(KV_SWA, TALL_CTX, 22);
+        let big_dev = big.up(stream)?;
+        let q = seeded_q(1, N_HEAD, 4);
+        let sinks = seeded_sinks(N_HEAD);
+        let mut win = true;
+        for &n in &F2_COUNTS {
+            let (dev, ctx) = if n > 4352 {
+                (&big_dev, TALL_CTX)
+            } else {
+                (&small_dev, 4352)
+            };
+            let same = same_flash(
+                k,
+                gpu,
+                Shape::swa(ctx),
+                &q,
+                &[n as u32],
+                (&dev.0, &dev.1),
+                Some(&sinks),
+            )?;
+            if !same {
+                println!("W1 window layer n={n}: ring != plane FAIL");
+            }
+            win &= same;
+        }
+        let one = seeded_q(1, 1, 5);
+        let q3: Vec<f32> = (0..N_HEAD).flat_map(|_| one.iter().copied()).collect();
+        let (hi, lo) = (boost(&one, 30.3), boost(&one, 30.0));
+        for &n in &[129usize, 161, 1000, 4097] {
+            let first = n - WINDOW;
+            let mut edge = Cache::seeded(KV_SWA, 4352, 31);
+            for j in 0..KV_SWA {
+                edge.set_k(j, first - 1, &hi);
+                edge.set_k(j, first, &lo);
+            }
+            let dev = edge.up(stream)?;
+            let same = same_flash(
+                k,
+                gpu,
+                Shape::swa(edge.ctx),
+                &q3,
+                &[n as u32],
+                (&dev.0, &dev.1),
+                Some(&sinks),
+            )?;
+            if !same {
+                println!("W1 window edge n={n}: ring != plane FAIL");
+            }
+            win &= same;
+        }
+        let chunk = Cache::seeded(KV_SWA, 4352, 41);
+        let chunk_dev = chunk.up(stream)?;
+        let m = 70usize;
+        let qc = seeded_q(m, N_HEAD, 6);
+        for &b in &[90usize, 4030] {
+            let counts: Vec<u32> = (0..m).map(|t| (b + t + 1) as u32).collect();
+            let same = same_flash(
+                k,
+                gpu,
+                Shape::swa(chunk.ctx),
+                &qc,
+                &counts,
+                (&chunk_dev.0, &chunk_dev.1),
+                Some(&sinks),
+            )?;
+            if !same {
+                println!("W1 chunk m={m} b={b}: ring != plane FAIL");
+            }
+            win &= same;
+        }
+        println!(
+            "W1 window layer 64/8 window {WINDOW} with sinks at rows == ctx: {} counts up to 65536, the window edge \
+             at n = 129, 161, 1000, 4097, and 70-row chunks at b = 90, 4030 = the plane entry bit for bit {}",
+            F2_COUNTS.len(),
+            verdict(win)
+        );
+        ok &= win;
+        Ok(ok)
+    }
+
+    /// W2: a ring of `rows` rows over four prompt passes of exactly
+    /// [`W_PASS`] rows from position 0 to 2,048, each appending all its rows and
+    /// then attending, against the plane entries on a plane of [`W_CTX`] rows
+    /// holding the same keys: every row's flash output is the plane's bit for
+    /// bit, and after each pass ring row `p mod rows` is plane row `p` for the
+    /// last `rows` positions. Bitwise: one overwritten key of one row moves it.
+    fn w2(
+        k: &FlashGqaKernels,
+        a: &RopeNeoxKernels,
+        gpu: &Gpu,
+        rows: usize,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (ctx, n_kv, m) = (W_CTX, KV_SWA, W_PASS);
+        let table = DeviceBuffer::from_host(stream, &table_for(1.0e7, ctx)?)?;
+        let sinks = DeviceBuffer::from_host(stream, &seeded_sinks(N_HEAD))?;
+        let segs = window_segments(WINDOW);
+        let mut plane = (
+            DeviceBuffer::from_host(stream, &vec![SENTINEL; n_kv * ctx * HEAD_K192])?,
+            DeviceBuffer::from_host(stream, &vec![SENTINEL; n_kv * ctx * HEAD])?,
+        );
+        let mut ring = (
+            DeviceBuffer::from_host(stream, &vec![SENTINEL; n_kv * rows * HEAD_K192])?,
+            DeviceBuffer::from_host(stream, &vec![SENTINEL; n_kv * rows * HEAD])?,
+        );
+        let w = N_HEAD * HEAD;
+        let mut ok = true;
+        let mut end = 0usize;
+        for pass in 0..4usize {
+            let p0 = pass * m;
+            end = p0 + m;
+            let pos = DeviceBuffer::from_host(
+                stream,
+                &(0..m).map(|t| (p0 + t) as u32).collect::<Vec<_>>(),
+            )?;
+            let counts = DeviceBuffer::from_host(
+                stream,
+                &(0..m).map(|t| (p0 + t + 1) as u32).collect::<Vec<_>>(),
+            )?;
+            let (qkv, ..) = fused(m, N_HEAD, n_kv, 300 + pass as u32);
+            let mut qkv_p = DeviceBuffer::from_host(stream, &qkv)?;
+            let mut qkv_r = DeviceBuffer::from_host(stream, &qkv)?;
+            let mut q_p = DeviceBuffer::<f32>::zeroed(stream, m * N_HEAD * HEAD_K192)?;
+            let mut q_r = DeviceBuffer::<f32>::zeroed(stream, m * N_HEAD * HEAD_K192)?;
+            let mut pv_p = DeviceBuffer::<f32>::zeroed(stream, plen(m, N_HEAD, segs, HEAD))?;
+            let mut pv_r = DeviceBuffer::<f32>::zeroed(stream, plen(m, N_HEAD, segs, HEAD))?;
+            let mut pms_p = DeviceBuffer::<f32>::zeroed(stream, plen(m, N_HEAD, segs, 2))?;
+            let mut pms_r = DeviceBuffer::<f32>::zeroed(stream, plen(m, N_HEAD, segs, 2))?;
+            let mut y_p = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
+            let mut y_r = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
+            a.enqueue_neox_append_k192(
+                stream,
+                K192Args {
+                    qkv: &mut qkv_p,
+                    q: &mut q_p,
+                    table: &table,
+                    pos: &pos,
+                    v_scale: V_SCALE,
+                    n_head: N_HEAD,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault: gpu.unlabelled_sink(),
+                    cache_k: &mut plane.0,
+                    cache_v: &mut plane.1,
+                },
+            )?;
+            if let Err(e) = a.enqueue_neox_append_k192_ring(
+                stream,
+                K192Args {
+                    qkv: &mut qkv_r,
+                    q: &mut q_r,
+                    table: &table,
+                    pos: &pos,
+                    v_scale: V_SCALE,
+                    n_head: N_HEAD,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault: gpu.unlabelled_sink(),
+                    cache_k: &mut ring.0,
+                    cache_v: &mut ring.1,
+                },
+                rows,
+            ) {
+                println!("W2 pass p0={p0}: the ring append was refused: {e} FAIL");
+                return Ok(false);
+            }
+            k.enqueue_pass_k192(
+                stream,
+                GqaK192Args {
+                    q: &q_p,
+                    kc: &plane.0,
+                    vc: &plane.1,
+                    n_keys: &counts,
+                    scale: score_scale(),
+                    n_kv,
+                    ctx,
+                    m,
+                    window: WINDOW,
+                    sinks: Some(&sinks),
+                    part_v: &mut pv_p,
+                    part_ms: &mut pms_p,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut y_p,
+                },
+                N_HEAD,
+            )?;
+            if let Err(e) = k.enqueue_pass_k192_ring(
+                stream,
+                GqaK192Args {
+                    q: &q_r,
+                    kc: &ring.0,
+                    vc: &ring.1,
+                    n_keys: &counts,
+                    scale: score_scale(),
+                    n_kv,
+                    ctx,
+                    m,
+                    window: WINDOW,
+                    sinks: Some(&sinks),
+                    part_v: &mut pv_r,
+                    part_ms: &mut pms_r,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut y_r,
+                },
+                N_HEAD,
+                rows,
+            ) {
+                println!("W2 pass p0={p0}: the ring flash was refused: {e} FAIL");
+                return Ok(false);
+            }
+            stream.synchronize()?;
+            let (yp, yr) = (y_p.to_host_vec(stream)?, y_r.to_host_vec(stream)?);
+            let queries = bits_equal(&q_p.to_host_vec(stream)?, &q_r.to_host_vec(stream)?);
+            let bad =
+                (0..m).find(|&t| !bits_equal(&yp[t * w..(t + 1) * w], &yr[t * w..(t + 1) * w]));
+            let (pk, pvv) = (plane.0.to_host_vec(stream)?, plane.1.to_host_vec(stream)?);
+            let (rk, rv) = (ring.0.to_host_vec(stream)?, ring.1.to_host_vec(stream)?);
+            let stale = (end.saturating_sub(rows)..end)
+                .filter(|&p| {
+                    (0..n_kv).any(|j| {
+                        rk[(j * rows + p % rows) * HEAD_K192..][..HEAD_K192]
+                            != pk[(j * ctx + p) * HEAD_K192..][..HEAD_K192]
+                            || rv[(j * rows + p % rows) * HEAD..][..HEAD]
+                                != pvv[(j * ctx + p) * HEAD..][..HEAD]
+                    })
+                })
+                .count();
+            let this = bad.is_none() && queries && stale == 0 && finite(&yr);
+            if !this {
+                println!(
+                    "W2 pass p0={p0}: first differing output row {:?} (position {:?}), turned queries equal \
+                     {queries}, ring rows != plane rows at {stale} of the last {} positions, finite {} FAIL",
+                    bad,
+                    bad.map(|t| p0 + t),
+                    rows.min(end),
+                    finite(&yr)
+                );
+            }
+            ok &= this;
+        }
+        println!(
+            "W2 prompt passes: ring rows={rows}, ctx={ctx}, 4 passes of {m} rows from position 0 to {end}, window \
+             {WINDOW}, 64/8 heads with sinks: every row's flash output = the plane entries' bit for bit, ring row p \
+             mod {rows} = plane row p for the last {rows} positions after each pass {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// One decode step's device state on a plane (`rows` none) or a ring,
+    /// every buffer the step's append and flash name, so that a captured graph
+    /// replays over them.
+    struct Decode {
+        rows: Option<usize>,
+        table: DeviceBuffer<f32>,
+        sinks: DeviceBuffer<f32>,
+        pos: DeviceBuffer<u32>,
+        nk: DeviceBuffer<u32>,
+        qkv: DeviceBuffer<f32>,
+        q: DeviceBuffer<f32>,
+        kc: DeviceBuffer<u16>,
+        vc: DeviceBuffer<u16>,
+        pv: DeviceBuffer<f32>,
+        pms: DeviceBuffer<f32>,
+        y: DeviceBuffer<f32>,
+    }
+
+    impl Decode {
+        fn new(
+            gpu: &Gpu,
+            rows: Option<usize>,
+            table: &[f32],
+            sinks: &[f32],
+            planes: &Cache,
+        ) -> Result<Decode, GateError> {
+            let s = gpu.stream();
+            let segs = window_segments(WINDOW);
+            let (kc, vc) = planes.up(s)?;
+            Ok(Decode {
+                rows,
+                table: DeviceBuffer::from_host(s, table)?,
+                sinks: DeviceBuffer::from_host(s, sinks)?,
+                pos: DeviceBuffer::from_host(s, &[0u32])?,
+                nk: DeviceBuffer::from_host(s, &[1u32])?,
+                qkv: DeviceBuffer::zeroed(s, N_HEAD * HEAD_K192 + KV_SWA * (HEAD_K192 + HEAD))?,
+                q: DeviceBuffer::zeroed(s, N_HEAD * HEAD_K192)?,
+                kc,
+                vc,
+                pv: DeviceBuffer::zeroed(s, plen(1, N_HEAD, segs, HEAD))?,
+                pms: DeviceBuffer::zeroed(s, plen(1, N_HEAD, segs, 2))?,
+                y: DeviceBuffer::zeroed(s, N_HEAD * HEAD)?,
+            })
+        }
+
+        /// The step at position `p` with the token's fused row `qkv`.
+        fn set(&mut self, gpu: &Gpu, p: usize, qkv: &[f32]) -> Result<(), GateError> {
+            let s = gpu.stream();
+            self.pos.copy_from_host(s, &[p as u32])?;
+            self.nk.copy_from_host(s, &[(p + 1) as u32])?;
+            self.qkv.copy_from_host(s, qkv)?;
+            Ok(())
+        }
+
+        /// The step: the token's append, then its attention.
+        fn enqueue(
+            &mut self,
+            k: &FlashGqaKernels,
+            a: &RopeNeoxKernels,
+            gpu: &Gpu,
+            s: &CudaStream,
+        ) -> Result<(), GpuError> {
+            let args = K192Args {
+                qkv: &mut self.qkv,
+                q: &mut self.q,
+                table: &self.table,
+                pos: &self.pos,
+                v_scale: V_SCALE,
+                n_head: N_HEAD,
+                n_kv: KV_SWA,
+                ctx: W_CTX,
+                m: 1,
+                fault: gpu.unlabelled_sink(),
+                cache_k: &mut self.kc,
+                cache_v: &mut self.vc,
+            };
+            match self.rows {
+                None => a.enqueue_neox_append_k192(s, args)?,
+                Some(rows) => a.enqueue_neox_append_k192_ring(s, args, rows)?,
+            }
+            let args = GqaK192Args {
+                q: &self.q,
+                kc: &self.kc,
+                vc: &self.vc,
+                n_keys: &self.nk,
+                scale: score_scale(),
+                n_kv: KV_SWA,
+                ctx: W_CTX,
+                m: 1,
+                window: WINDOW,
+                sinks: Some(&self.sinks),
+                part_v: &mut self.pv,
+                part_ms: &mut self.pms,
+                fault: gpu.unlabelled_sink(),
+                y: &mut self.y,
+            };
+            match self.rows {
+                None => k.enqueue_pass_k192(s, args, N_HEAD),
+                Some(rows) => k.enqueue_pass_k192_ring(s, args, N_HEAD, rows),
+            }
+        }
+
+        /// The turned query, the step's output and both planes, read back.
+        #[allow(clippy::type_complexity, reason = "a test harness's four readbacks")]
+        fn read(
+            &self,
+            s: &CudaStream,
+        ) -> Result<(Vec<f32>, Vec<f32>, Vec<u16>, Vec<u16>), GateError> {
+            Ok((
+                self.q.to_host_vec(s)?,
+                self.y.to_host_vec(s)?,
+                self.kc.to_host_vec(s)?,
+                self.vc.to_host_vec(s)?,
+            ))
+        }
+    }
+
+    /// W3: decode steps (m = 1) at positions [`W3_FIRST`] ..= [`W3_LAST`] across
+    /// the ring's wrap at 768, each appending its token and attending, equal the
+    /// plane entries bit for bit; and a graph captured over the ring entries,
+    /// replayed at every step (the wrap's edge, 766 ..= 769, among them), equals
+    /// the eager ring step's output and planes.
+    fn w3(k: &FlashGqaKernels, a: &RopeNeoxKernels, gpu: &Gpu) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let rows = W3_ROWS;
+        let sinks = seeded_sinks(N_HEAD);
+        let table = table_for(1.0e7, W_CTX)?;
+        let seeded = Cache::seeded(KV_SWA, W_CTX, 51);
+        let plane_host = seeded.masked(0..W3_FIRST);
+        let ring_host = seeded.with_ctx(rows, W3_FIRST);
+        let mut plane = Decode::new(gpu, None, &table, &sinks, &plane_host)?;
+        let mut eager = Decode::new(gpu, Some(rows), &table, &sinks, &ring_host)?;
+        let mut cap = Decode::new(gpu, Some(rows), &table, &sinks, &ring_host)?;
+        let graph = gpu.capture(|s| cap.enqueue(k, a, gpu, s))?;
+        let (mut dec, mut cut, mut row_ok) = (true, true, true);
+        for p in W3_FIRST..=W3_LAST {
+            let (qkv, ..) = fused(1, N_HEAD, KV_SWA, 400 + p as u32);
+            plane.set(gpu, p, &qkv)?;
+            eager.set(gpu, p, &qkv)?;
+            cap.set(gpu, p, &qkv)?;
+            plane.enqueue(k, a, gpu, stream)?;
+            eager.enqueue(k, a, gpu, stream)?;
+            graph.launch(stream)?;
+            stream.synchronize()?;
+            let (qp, yp, kp, vp) = plane.read(stream)?;
+            let (qe, ye, ke, ve) = eager.read(stream)?;
+            let (qc, yc, kcap, vcap) = cap.read(stream)?;
+            let same = bits_equal(&yp, &ye) && bits_equal(&qp, &qe);
+            let graphed = bits_equal(&yc, &ye) && bits_equal(&qc, &qe) && kcap == ke && vcap == ve;
+            let row = (0..KV_SWA).all(|j| {
+                ke[(j * rows + p % rows) * HEAD_K192..][..HEAD_K192]
+                    == kp[(j * W_CTX + p) * HEAD_K192..][..HEAD_K192]
+                    && ve[(j * rows + p % rows) * HEAD..][..HEAD]
+                        == vp[(j * W_CTX + p) * HEAD..][..HEAD]
+            });
+            if !(same && row) {
+                println!(
+                    "W3 step p={p}: ring output = plane output {same}, ring row {} = plane row {p} {row} FAIL",
+                    p % rows
+                );
+            }
+            if !graphed {
+                println!("W3 step p={p}: graph replay != eager ring step FAIL");
+            }
+            dec &= same;
+            row_ok &= row;
+            cut &= graphed;
+        }
+        // The ring after the last step holds the last `rows` positions of the plane.
+        let (_, _, kp, vp) = plane.read(stream)?;
+        let (_, _, ke, ve) = eager.read(stream)?;
+        let end = W3_LAST + 1;
+        let held = (end - rows..end).all(|p| {
+            (0..KV_SWA).all(|j| {
+                ke[(j * rows + p % rows) * HEAD_K192..][..HEAD_K192]
+                    == kp[(j * W_CTX + p) * HEAD_K192..][..HEAD_K192]
+                    && ve[(j * rows + p % rows) * HEAD..][..HEAD]
+                        == vp[(j * W_CTX + p) * HEAD..][..HEAD]
+            })
+        });
+        if !held {
+            println!("W3 the ring after step {W3_LAST} != the plane's last {rows} positions FAIL");
+        }
+        println!(
+            "W3 decode: {} steps m=1 at positions {W3_FIRST}..={W3_LAST} (ring rows={rows}, wrap at {rows}) = the plane \
+             entries bit for bit (output, turned query, the step's row) {}; the ring holds the plane's last {rows} \
+             positions {}",
+            W3_LAST - W3_FIRST + 1,
+            verdict(dec && row_ok),
+            verdict(held)
+        );
+        println!(
+            "W3 graph: the captured ring step replayed at every position {W3_FIRST}..={W3_LAST} (766, 767, 768, 769 \
+             among them) = the eager ring step (output, query, both planes) bit for bit {}",
+            verdict(cut)
+        );
+        Ok(dec && row_ok && held && cut)
+    }
+
+    /// The flash ring pass's inputs and scratch for W4's calls, built for `m`
+    /// rows: the rows' counts are 600 and the layer is a window layer over
+    /// 64 heads.
+    struct FlashRig {
+        q: DeviceBuffer<f32>,
+        nk: DeviceBuffer<u32>,
+        sinks: DeviceBuffer<f32>,
+        pv: DeviceBuffer<f32>,
+        pms: DeviceBuffer<f32>,
+        y: DeviceBuffer<f32>,
+    }
+
+    impl FlashRig {
+        fn new(gpu: &Gpu, m: usize) -> Result<FlashRig, GateError> {
+            let s = gpu.stream();
+            let segs = window_segments(WINDOW);
+            Ok(FlashRig {
+                q: DeviceBuffer::from_host(s, &seeded_q(m, N_HEAD, 7))?,
+                nk: DeviceBuffer::from_host(s, &vec![600u32; m])?,
+                sinks: DeviceBuffer::from_host(s, &seeded_sinks(N_HEAD))?,
+                pv: DeviceBuffer::zeroed(s, plen(m, N_HEAD, segs, HEAD))?,
+                pms: DeviceBuffer::zeroed(s, plen(m, N_HEAD, segs, 2))?,
+                y: DeviceBuffer::zeroed(s, m * N_HEAD * HEAD)?,
+            })
+        }
+
+        /// The ring pass over `planes` of `n_kv` key heads, `m <=` the rig's rows.
+        #[allow(clippy::too_many_arguments, reason = "a test harness's flat arguments")]
+        fn call(
+            &mut self,
+            k: &FlashGqaKernels,
+            gpu: &Gpu,
+            planes: (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+            (n_kv, ctx, m): (usize, usize, usize),
+            window: usize,
+            rows: usize,
+        ) -> Result<(), GpuError> {
+            k.enqueue_pass_k192_ring(
+                gpu.stream(),
+                GqaK192Args {
+                    q: &self.q,
+                    kc: planes.0,
+                    vc: planes.1,
+                    n_keys: &self.nk,
+                    scale: score_scale(),
+                    n_kv,
+                    ctx,
+                    m,
+                    window,
+                    sinks: Some(&self.sinks),
+                    part_v: &mut self.pv,
+                    part_ms: &mut self.pms,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut self.y,
+                },
+                N_HEAD,
+                rows,
+            )
+        }
+
+        /// Whether the outputs and scratch are still the zeros they were built as.
+        fn untouched(&self, gpu: &Gpu) -> Result<bool, GateError> {
+            let s = gpu.stream();
+            s.synchronize()?;
+            Ok(bits_zero(&self.y.to_host_vec(s)?)
+                && bits_zero(&self.pv.to_host_vec(s)?)
+                && bits_zero(&self.pms.to_host_vec(s)?))
+        }
+    }
+
+    /// The ring append's inputs and planes for W4's calls: 8 key heads over
+    /// `ctx` rows, 5 tokens at positions 3 ..= 7, the planes the sentinel, and a
+    /// key and a value plane each one value short of 700 rows.
+    struct AppendRig {
+        table: DeviceBuffer<f32>,
+        pos: DeviceBuffer<u32>,
+        qkv: DeviceBuffer<f32>,
+        q: DeviceBuffer<f32>,
+        ck: DeviceBuffer<u16>,
+        cv: DeviceBuffer<u16>,
+        short_ck: DeviceBuffer<u16>,
+        short_cv: DeviceBuffer<u16>,
+    }
+
+    impl AppendRig {
+        fn new(gpu: &Gpu, ctx: usize) -> Result<AppendRig, GateError> {
+            let s = gpu.stream();
+            let (qkv, ..) = fused(5, N_HEAD, KV_SWA, 63);
+            Ok(AppendRig {
+                table: DeviceBuffer::from_host(s, &table_for(1.0e7, ctx)?)?,
+                pos: DeviceBuffer::from_host(s, &[3u32, 4, 5, 6, 7])?,
+                qkv: DeviceBuffer::from_host(s, &qkv)?,
+                q: DeviceBuffer::zeroed(s, 5 * N_HEAD * HEAD_K192)?,
+                ck: DeviceBuffer::from_host(s, &vec![SENTINEL; KV_SWA * ctx * HEAD_K192])?,
+                cv: DeviceBuffer::from_host(s, &vec![SENTINEL; KV_SWA * ctx * HEAD])?,
+                short_ck: DeviceBuffer::zeroed(s, 700 * KV_SWA * HEAD_K192 - 1)?,
+                short_cv: DeviceBuffer::zeroed(s, 700 * KV_SWA * HEAD - 1)?,
+            })
+        }
+
+        /// The ring append of `m` tokens at `rows`; `short` 1 hands the short key
+        /// plane, 2 the short value plane.
+        fn call(
+            &mut self,
+            a: &RopeNeoxKernels,
+            gpu: &Gpu,
+            ctx: usize,
+            (rows, m): (usize, usize),
+            short: u8,
+        ) -> Result<(), GpuError> {
+            let (cache_k, cache_v) = match short {
+                1 => (&mut self.short_ck, &mut self.cv),
+                2 => (&mut self.ck, &mut self.short_cv),
+                _ => (&mut self.ck, &mut self.cv),
+            };
+            a.enqueue_neox_append_k192_ring(
+                gpu.stream(),
+                K192Args {
+                    qkv: &mut self.qkv,
+                    q: &mut self.q,
+                    table: &self.table,
+                    pos: &self.pos,
+                    v_scale: V_SCALE,
+                    n_head: N_HEAD,
+                    n_kv: KV_SWA,
+                    ctx,
+                    m,
+                    fault: gpu.unlabelled_sink(),
+                    cache_k,
+                    cache_v,
+                },
+                rows,
+            )
+        }
+
+        /// Whether the query output is still zero and both planes the sentinel.
+        fn untouched(&self, gpu: &Gpu) -> Result<bool, GateError> {
+            let s = gpu.stream();
+            s.synchronize()?;
+            Ok(bits_zero(&self.q.to_host_vec(s)?)
+                && self.ck.to_host_vec(s)?.iter().all(|&v| v == SENTINEL)
+                && self.cv.to_host_vec(s)?.iter().all(|&v| v == SENTINEL))
+        }
+    }
+
+    /// W4: the ring entries' host refusals by name, with nothing launched: the
+    /// outputs keep their zeros and sentinels. Each refusal is one side of a
+    /// boundary; the other side launches.
+    fn w4(k: &FlashGqaKernels, a: &RopeNeoxKernels, gpu: &Gpu) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let ctx = 1024usize;
+        let m = 512usize;
+        let mut ok = true;
+        let mut check = |name: &str, got: bool| {
+            if !got {
+                println!("W4 {name}: FAIL");
+            }
+            ok &= got;
+        };
+
+        // The flash.
+        let (kc, vc) = Cache::seeded(KV_SWA, ctx, 61).up(stream)?;
+        let (fkc, fvc) = Cache::seeded(KV_FULL, ctx, 62).up(stream)?;
+        let short_k = DeviceBuffer::<u16>::zeroed(stream, 700 * KV_SWA * HEAD_K192 - 1)?;
+        let short_v = DeviceBuffer::<u16>::zeroed(stream, 700 * KV_SWA * HEAD - 1)?;
+        let mut rig = FlashRig::new(gpu, m)?;
+        let swa = (&kc, &vc);
+        let full = (&fkc, &fvc);
+        let g = |n_kv: usize, m: usize| (n_kv, ctx, m);
+        check(
+            "flash rows = 0 not refused by name",
+            refused(rig.call(k, gpu, swa, g(KV_SWA, 1), WINDOW, 0), "rows >= 1"),
+        );
+        check(
+            "flash rows > ctx not refused by name",
+            refused(
+                rig.call(k, gpu, swa, g(KV_SWA, 1), WINDOW, ctx + 1),
+                "taller than",
+            ),
+        );
+        check(
+            "flash no window with rows != ctx not refused by name",
+            refused(
+                rig.call(k, gpu, full, g(KV_FULL, 1), 0, ctx - 1),
+                "cannot ring",
+            ),
+        );
+        check(
+            "flash rows < window + m - 1 not refused by name",
+            refused(
+                rig.call(k, gpu, swa, g(KV_SWA, m), WINDOW, WINDOW + m - 2),
+                "too short",
+            ),
+        );
+        check(
+            "flash key plane shorter than n_kv * rows rows not refused by name",
+            refused(
+                rig.call(k, gpu, (&short_k, &vc), g(KV_SWA, 1), WINDOW, 700),
+                "kc.len()",
+            ),
+        );
+        check(
+            "flash value plane shorter than n_kv * rows rows not refused by name",
+            refused(
+                rig.call(k, gpu, (&kc, &short_v), g(KV_SWA, 1), WINDOW, 700),
+                "vc.len()",
+            ),
+        );
+        check("flash: a refused call launched", rig.untouched(gpu)?);
+        // The boundaries' far sides launch.
+        check(
+            "flash rows = window + m - 1 refused",
+            rig.call(k, gpu, swa, g(KV_SWA, m), WINDOW, WINDOW + m - 1)
+                .is_ok(),
+        );
+        check(
+            "flash rows = ctx with a window refused",
+            rig.call(k, gpu, swa, g(KV_SWA, m), WINDOW, ctx).is_ok(),
+        );
+        check(
+            "flash no window with rows = ctx refused",
+            rig.call(k, gpu, full, g(KV_FULL, 1), 0, ctx).is_ok(),
+        );
+        stream.synchronize()?;
+
+        // The append.
+        let mut app = AppendRig::new(gpu, ctx)?;
+        check(
+            "append rows = 0 not refused by name",
+            refused(app.call(a, gpu, ctx, (0, 5), 0), "rows >= 1"),
+        );
+        check(
+            "append rows > ctx not refused by name",
+            refused(app.call(a, gpu, ctx, (ctx + 1, 5), 0), "taller than"),
+        );
+        check(
+            "append rows < m not refused by name",
+            refused(app.call(a, gpu, ctx, (4, 5), 0), "cannot hold"),
+        );
+        check(
+            "append key plane shorter than n_kv * rows rows not refused by name",
+            refused(app.call(a, gpu, ctx, (700, 5), 1), "cache_k.len()"),
+        );
+        check(
+            "append value plane shorter than n_kv * rows rows not refused by name",
+            refused(app.call(a, gpu, ctx, (700, 5), 2), "cache_v.len()"),
+        );
+        check("append: a refused call launched", app.untouched(gpu)?);
+        check(
+            "append rows = m refused",
+            app.call(a, gpu, ctx, (5, 5), 0).is_ok(),
+        );
+        stream.synchronize()?;
+        println!(
+            "W4 refusals by name before any launch: the flash (rows = 0, rows > ctx, no window with rows != ctx, rows < \
+             window + m - 1, a key and a value plane too short), the append (rows = 0, rows > ctx, rows < m, a key and \
+             a value plane too short), every refused call leaving its outputs untouched, and the far side of each \
+             boundary launching {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// Whether every value is a +0.0 bit pattern.
+    fn bits_zero(v: &[f32]) -> bool {
+        v.iter().all(|x| x.to_bits() == 0)
     }
 
     // -------------------------------------------------------------- ik's sets
@@ -1960,7 +2927,7 @@ mod gate {
             [flag, list] if flag == "--only" => Some(list.split(',').map(str::to_owned).collect()),
             _ => {
                 return Err(format!(
-                    "usage: gate_mimo2_flash [--only F0,A,F1..F9,G]; got {args:?}"
+                    "usage: gate_mimo2_flash [--only F0,A,F1..F9,G,W1..W4]; got {args:?}"
                 )
                 .into());
             }
@@ -2002,6 +2969,18 @@ mod gate {
         }
         if want("G") {
             ok &= ik_sets(&k, &a, &gpu)?;
+        }
+        if want("W1") {
+            ok &= w1(&k, &a, &gpu)?;
+        }
+        if want("W2") {
+            ok &= w2(&k, &a, &gpu, W2_ROWS)?;
+        }
+        if want("W3") {
+            ok &= w3(&k, &a, &gpu)?;
+        }
+        if want("W4") {
+            ok &= w4(&k, &a, &gpu)?;
         }
         if let Some(o) = &only {
             println!("gate_mimo2_flash: PARTIAL run, clauses {o:?} only — not the gate");
