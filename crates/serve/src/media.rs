@@ -1156,7 +1156,7 @@ mod tests {
 
     /// The expansion's refusals reach the client as `ExpandError` wrote them: the text is the
     /// one message, and the variants stay apart for `api::media_error`'s split (`EmptySpan` the
-    /// model's 500, the placeholder count the request's 400).
+    /// model's 500, `ImageNumber` and the placeholder count the request's 400).
     #[test]
     fn expansion_refusals_keep_their_text_and_variants() {
         let empty = MediaError::from(ExpandError::EmptySpan(1));
