@@ -844,7 +844,11 @@ impl Spark<Body> for Ds41Draft {
     }
 
     fn window(&self) -> usize {
-        // V4.1's draft file always carries a window (its shape's `window`).
+        // V4.1's draft file always carries a window. `DraftHparams::read`
+        // refuses a missing `attention.sliding_window` by name, and
+        // `dspark::shape` stores that count as `Some`. A window of 0 fails
+        // `DsparkShape::check` (`Window`) when the body opens, before this
+        // seat runs. The expect is that invariant, not a second check.
         Ds41Draft::window(self).expect("V4.1's DSpark draft has a window")
     }
 

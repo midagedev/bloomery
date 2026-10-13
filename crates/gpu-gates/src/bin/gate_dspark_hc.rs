@@ -860,22 +860,30 @@ mod gate {
             conf: None,
         };
         let mut head = Head::new(cx.gpu, w, HEAD_HIDDEN, m)?;
-        // The weights and the buffers, from the shapes: the head's norm gain,
-        // own rows, both tables and the map, then its scratch.
+        // One count, the same one `DsparkBody::own_held` adds: each weight
+        // buffer, then the scratch. The shapes below are that count with no
+        // q8_1 term. An own head's row kernel reads the f32 rows, so `new`
+        // allocates no `Q8Act` and the scratch stays this. A Q6_K target
+        // head allocates one `Q8Act` per row count, and `scratch_bytes`
+        // counts those planes.
         let words = |n: usize| 4 * n;
-        let want_bytes = words(HEAD_HIDDEN)
+        let want_weights = words(HEAD_HIDDEN)
             + words(RED_HEAD * HEAD_HIDDEN / 4)
             + 2 * RED_HEAD * HEAD_HIDDEN / 32
             + words(RED_PREV * MARKOV_ROW_WORDS)
             + words(RED_HEAD * MARKOV_ROW_WORDS)
-            + words(RED_HEAD)
-            + words(m * HEAD_HIDDEN)
+            + words(RED_HEAD);
+        let want_scratch = words(m * HEAD_HIDDEN)
             + words(m * RED_HEAD)
             + words(m + 2)
             + words(2 * m + 2)
             + words(1)
             + words(1);
-        let bytes = head.card_bytes();
+        // 587008 + 6264 = 593272. Acts are 0, so the old total stays.
+        let want_bytes = want_weights + want_scratch;
+        let weights: u64 = head.weight_buffers().iter().sum();
+        let scratch = head.scratch_bytes();
+        let bytes = weights + scratch;
         let host_x = streams(m * HEAD_HIDDEN, 53);
         let x = DeviceBuffer::from_host(s, &host_x)?;
         let fd = DeviceBuffer::from_host(s, &[HEAD_FIRST])?;
@@ -900,6 +908,8 @@ mod gate {
         let pass = finite
             && ratio <= 1.0
             && head.n_vocab() == RED_HEAD
+            && weights == want_weights as u64
+            && scratch == want_scratch as u64
             && bytes == want_bytes as u64
             && toks == want
             && rows
@@ -908,7 +918,7 @@ mod gate {
         println!(
             "head own reduced hidden={HEAD_HIDDEN} n_head={RED_HEAD} n_prev={RED_PREV} m={m} first={HEAD_FIRST}: \
              projection worst ratio to bound {ratio:.3e}; head ids {toks:?} want {want:?} tokens_equal={} rows_bit_identical={rows} tokens_p ids_equal={} \
-             p_bit_identical={p_bits} (p {p:?}) card_bytes {bytes} want {want_bytes} {}",
+             p_bit_identical={p_bits} (p {p:?}) weights {weights} want {want_weights} scratch {scratch} want {want_scratch} bytes {bytes} want {want_bytes} {}",
             toks == want,
             ids_p == want,
             verdict(pass)
