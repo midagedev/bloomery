@@ -5414,9 +5414,11 @@ mod gate {
     /// filled over the drafted run (`fills` past 0) and the verify's step
     /// port took its union call (`step_fills` past 0: the ids the four rows'
     /// union claimed, counted apart from the plain steps'); and the drafted
-    /// plan's stage card holds less room than the plain plan's at the same
-    /// budget (`headroom_bytes`: the draft's card bytes come out of the
-    /// context's — the seat's yield trade). Acceptance is not pinned here:
+    /// plan's room (`MtpPlan::headroom_bytes`) is the plain stage card's less
+    /// the draft's reserve, give or take what the expert rule moved off the
+    /// card, within one expert's slack of either sign (the draft's card bytes
+    /// come out of the context's — the seat's yield trade). Acceptance is not
+    /// pinned here:
     /// a fixture's generated draft has every proposal rejected, tau = 1, as
     /// (z) says. Where the dial gives the file's host leg no arena at any room
     /// the clause has no input: the fixture tier leaves it to the real tier by
@@ -5428,7 +5430,12 @@ mod gate {
         prompt: &[u32],
     ) -> Result<bool, GateError> {
         const N: usize = 32;
-        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine_for_experts(
+            card()?,
+            inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+            Experts::Card,
+        );
         let extra = mtp.card_bytes(CTX)?;
         // The room halves until the plan pages through an arena; a room the
         // tier's floor refuses ends the search, and the clause is red there.
@@ -5492,12 +5499,72 @@ mod gate {
             return Ok(false);
         };
         let plain = paged_inputs.plan_with(&machine, CTX, &plan_levers(extra)?, Experts::Card)?;
-        let fit = plan.plan.cards[0].headroom_bytes < plain.cards[0].headroom_bytes;
+        // The fit: the drafted plan's room is `MtpPlan::headroom_bytes`, the field that
+        // subtracts the draft's reserve R — its card bytes with its program's arena, the lever's
+        // `extra` (the stage card's own headroom does not see R);
+        // its partner is the plain plan's stage-card headroom at the same lever. The
+        // expected relation, term by term: both stage cards hold the same fixed terms; the
+        // planner's identity `MtpPlan::headroom = T.headroom + T.reserves - R` holds; the expert
+        // rule took `moved` bytes (experts and their rounding) off the card to make room for R,
+        // and the remainder R - moved is the slack of a rule that moves whole experts: under one
+        // expert's card bytes plus a granule for each of a layer's three routed stacks. The
+        // slack's sign follows the packing at the room, not the draft, so which plan holds
+        // less room is printed, not held.
+        let (p, t) = (&plain.cards[0], &plan.plan.cards[0]);
+        let r = extra;
+        let fixed = |c: &model::placement::CardTotals| {
+            (
+                c.dense_bytes,
+                c.kv_bytes,
+                c.stage_rows_bytes,
+                c.scratch_bytes,
+                c.context_bytes,
+                c.reserve_bytes,
+            )
+        };
+        let same_terms = fixed(p) == fixed(t);
+        let identity =
+            plan.headroom_bytes == t.headroom_bytes + i128::from(t.reserve_bytes) - i128::from(r);
+        let moved = i128::from(p.expert_bytes + p.rounding_bytes)
+            - i128::from(t.expert_bytes + t.rounding_bytes);
+        let remainder = i128::from(r) - moved;
+        // One expert's card bytes in a layer: the layer's routed stacks' card segments, each
+        // one's bytes over its experts; the largest layer's, with a granule a stack.
+        let mut per_layer = vec![0u64; plain.model.layers];
+        for row in &plain.rows {
+            let Some(l) = plain.model.tensors[row.tensor].layer else {
+                continue;
+            };
+            for s in &row.segments {
+                if let (model::placement::Device::Card(0), Some(list)) = (&s.device, &s.experts)
+                    && !list.is_empty()
+                {
+                    per_layer[l] += s.resident_bytes.div_ceil(list.len());
+                }
+            }
+        }
+        let one = i128::from(
+            per_layer.iter().copied().max().unwrap_or(0)
+                + 3 * model::placement::workstation::GRANULE.get(),
+        );
+        let less = plan.headroom_bytes < p.headroom_bytes;
+        // PIN(2026-10-15): the fit is the relation above, not "the drafted plan holds less room
+        // than the plain plan": the expert rule moves whole experts, so the sign follows the
+        // packing [A6000 real, gate-gpu-qwen4exp-mtp: remainder +2,091,180 B at room
+        // 30,796,775,936 (fde6499f) and -2,103,124 B at room 31,139,464,192 (cee6e7e4), bound
+        // 10,285,056 B; identity true and fixed terms equal at both].
+        let fit = same_terms && identity && remainder.abs() < one;
         println!(
-            "(pg) room {room} B: the plan pages {} B of host experts through a {} B arena; the              drafted plan's stage card holds {} B less room than the plain plan's at the same              budget {}",
+            "(pg) room {room} B: the plan pages {} B of host experts through a {} B arena; \
+             the drafted plan's headroom {} B (MtpPlan) against the plain plan's {} B, {} B less \
+             (the drafted plan holds less: {less}, printed); \
+             R {r} B, moved {moved} B, remainder {remainder} B (bound {one}); fixed terms equal \
+             {same_terms}, identity {identity} {}",
             plan.plan.host.nvme_expert_bytes,
             plan.plan.host.nvme_arena_bytes,
-            plain.cards[0].headroom_bytes - plan.plan.cards[0].headroom_bytes,
+            plan.headroom_bytes,
+            p.headroom_bytes,
+            p.headroom_bytes - plan.headroom_bytes,
             verdict(fit)
         );
         let m = Body38::open_placed_mtp(
