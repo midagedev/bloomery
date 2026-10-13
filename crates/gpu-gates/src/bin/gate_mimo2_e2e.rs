@@ -39,10 +39,12 @@
 //!   equal bit for bit at the prompt's last row (position 4,095) and at
 //!   every step (positions 4,096..4,159).
 //! - (o) also, on that load: a feed of 1,600 ids, a cut to 960, then a cut
-//!   to 950. The second cut is refused, and it is refused again after the
-//!   ring sequence is swapped out and back. The written end stays 1,600, so
-//!   the depth is 650, past the ring's slack. FAIL-first: a rollback that
-//!   lowers the written end accepts the second cut.
+//!   to 950. The second cut is refused. The ring sequence is swapped out, the
+//!   temporary live body is reset, and the parked sequence is swapped back;
+//!   the written end is 1,600 again, so the depth is 650, past the ring's
+//!   slack, and the second cut is refused again. FAIL-first: a rollback that
+//!   lowers the written end accepts the second cut. A swap that omits the
+//!   written end leaves 0 after that reset, and the second cut is accepted.
 //! - (c) free-running on the batch set: its five tokens as eager steps from a
 //!   reset, the last position's argmax equal to ik's `result_output` argmax,
 //!   or — named and counted, never silently — ours ik's runner-up with ik's
@@ -553,13 +555,15 @@ mod gate {
 
     /// A feed of 1,600 writes through that position. The cut to 960 is depth
     /// 640, inside the ring's slack. The written end stays 1,600, so the cut
-    /// to 950 is depth 650 and is refused. Swapping the ring sequence out
-    /// and back parks that end with the stores, and the cut to 950 is refused
-    /// again. The session's cut records the model's position first
+    /// to 950 is depth 650 and is refused. The ring sequence is swapped out,
+    /// the temporary live body is reset, and the parked sequence is swapped
+    /// back, which restores that end, and the cut to 950 is refused again.
+    /// The session's cut records the model's position first
     /// ([`Body::stand_for_cut`]) and then rolls back.
     ///
     /// FAIL-first: a rollback that lowers the written end accepts the second
-    /// cut, and a swap that drops it accepts the cut after the swap.
+    /// cut. A swap that omits the written end leaves 0 after the reset; the
+    /// session's cut raises that to 960, and the cut to 950 is accepted.
     fn second_cut_is_refused(m: &mut Mimo2Model) -> Result<bool, GateError> {
         const FED: u32 = 1_600;
         const FIRST: u32 = 960;
@@ -583,6 +587,7 @@ mod gate {
             let (gpu, _, body) = m.body_parts("second cut")?;
             let mut seq = body.new_seq_rows(gpu, Rows::Ring)?;
             body.swap_seq(gpu, &mut seq)?;
+            bloomery_gpu::model::ChainBody::reset(body, gpu)?;
             seq
         };
         {

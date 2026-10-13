@@ -968,11 +968,22 @@ impl Body {
     /// sequences the load's plan counts, so it does not move
     /// [`Slots::new_seq`]'s count. Refused by name when the card has fewer
     /// free bytes than the stores take.
-    pub fn new_seq_rows(&self, gpu: &Gpu, rows: Rows) -> Result<Seq, GpuError> {
-        let need: usize = self
+    pub fn new_seq_rows(&self, gpu: &Gpu, choice: Rows) -> Result<Seq, GpuError> {
+        let rows: Vec<_> = self
             .cfg
             .iter()
-            .map(|c| store_device_bytes(c.attn.kv_heads, rows_for(rows, c.attn.window, self.ctx)))
+            .map(|c| rows_for(choice, c.attn.window, self.ctx))
+            .collect();
+        self.new_seq_for(gpu, &rows)
+    }
+
+    /// The stores of one sequence, `rows` a layer, and a written end of 0.
+    /// Refused by name when the card has fewer free bytes than the stores take.
+    fn new_seq_for(&self, gpu: &Gpu, rows: &[usize]) -> Result<Seq, GpuError> {
+        let need: usize = rows
+            .iter()
+            .zip(&self.cfg)
+            .map(|(&rows, c)| store_device_bytes(c.attn.kv_heads, rows))
             .sum();
         let free = gpu.alloc_room()?;
         if need > free {
@@ -981,16 +992,10 @@ impl Body {
             )));
         }
         let stream = gpu.stream();
-        let stores = self
-            .cfg
+        let stores = rows
             .iter()
-            .map(|c| {
-                Store::new(
-                    stream,
-                    c.attn.kv_heads,
-                    rows_for(rows, c.attn.window, self.ctx),
-                )
-            })
+            .zip(&self.cfg)
+            .map(|(&rows, c)| Store::new(stream, c.attn.kv_heads, rows))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Seq { stores, at: 0 })
     }
@@ -1314,28 +1319,10 @@ impl Slots for Body {
                 self.slots_planned
             )));
         }
-        let need: usize = self
-            .seq_rows
-            .iter()
-            .zip(&self.cfg)
-            .map(|(&rows, c)| store_device_bytes(c.attn.kv_heads, rows))
-            .sum();
-        let free = gpu.alloc_room()?;
-        if need > free {
-            return Err(shape(format!(
-                "a sequence of {need} B of stores, and the card has {free} B free"
-            )));
-        }
-        let stream = gpu.stream();
-        let stores = self
-            .seq_rows
-            .iter()
-            .zip(&self.cfg)
-            .map(|(&rows, c)| Store::new(stream, c.attn.kv_heads, rows))
-            .collect::<Result<Vec<_>, _>>()?;
+        let seq = self.new_seq_for(gpu, &self.seq_rows)?;
         // Last, so a sequence whose allocation failed is not counted.
         self.slots_made += 1;
-        Ok(Seq { stores, at: 0 })
+        Ok(seq)
     }
 
     /// Exchange the live sequence's stores with `seq`'s: pointer moves, no
