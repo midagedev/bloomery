@@ -3,7 +3,9 @@
 # libllama and libggml in the profile's ORACLE tree (tools/ref/clefvis/profile.sh): mainline has `qwen3vl_merger` natively, so no
 # fork. Clef-Flash's seat (BLOOMERY_MODEL=qwen35) links the tree hidden_ref links (53ed051ce) into $BLOOMERY_DATA/bin/dump_mtmd;
 # the Qwen seats (qwen35moe, qwen4exp) one binary between them, from the tree beside it (36a73916e, tools/ref/qvis/build-lcpp-qvis.sh)
-# into dump_mtmd_qvis, with the chat mode (DUMP_MTMD_CHAT: it links libllama-common for the model's chat template and parser). The
+# into dump_mtmd_qvis, with the chat mode (DUMP_MTMD_CHAT: it links libllama-common for the model's chat template and parser);
+# MiniCPM-V 4.7's seat (minicpmv47: the tower only, no chat mode) from mainline 358a420e (`just build-mc47-lcpp`, the tree with
+# `minicpmv4_7`) into dump_mtmd_mc47. The
 # post-decode callback of the helper changed with that tree's header (mtmd_helper_embd_batch): the build defines
 # DUMP_MTMD_EMBD_BATCH when the header has it.
 #

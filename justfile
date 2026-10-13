@@ -666,6 +666,10 @@ dump-ref-clefvis *ARGS:
 build-qvis-lcpp:
     ./tools/box.sh 'setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
 
+# MiniCPM-V 4.7 image input, the oracle's tree: llama.cpp mainline at 358a420e in /home/user/llama.cpp-358a420e, the same script as the Qwen tree (tools/ref/qvis/build-lcpp-qvis.sh) with the pin, tree and sentinel directory by environment; detached, pid, log and rc under /root/lcpp-mc47. Mainline gained `minicpmv4_7` at 69f201a20; the Qwen tree (36a73916e) has none.
+build-mc47-lcpp:
+    BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=358a420ec4ed59b6b0be08b1d1f71dd478b99a99 LCPP_BUILD_TREE=/home/user/llama.cpp-358a420e LCPP_BUILD_DIR=/root/lcpp-mc47' ./tools/box.sh 'setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
+
 # Qwen3.6 / Qwen3.8 / GLM-5.3-Flash image input, the oracle's binary: dump_mtmd linked against that tree's libmtmd and libllama-common, with its chat mode (tools/ref/clefvis/build-clefvis.sh). One binary, $BLOOMERY_DATA/bin/dump_mtmd_qvis, serves all three seats; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test.
 build-qvis-ref:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
@@ -673,6 +677,14 @@ build-qvis-ref:
 # Qwen3.6 (MODEL qwen35moe) or Qwen3.8 (qwen4exp) image input, the oracle sets (tools/ref/clefvis/clefvis.sh, tools/ref/qvis/cases.tsv): the tower's output end (ref_<arch>_vis_taps), hidden states of three chat prompts (…_hidden_c*, with the prose control …_prose_c* and the bf16-rows control …_bf16rows_c*) and 32 greedy decode steps after two of them (…_decode_c*) into $BLOOMERY_DATA; SETS names base sets, `--cpu-twin` writes the CPU twins (<set>.cpu) and `--ids` the chat ids of every request by llama-server's own path (…_chatids_*, both without a card). The card runs go through the card's gate lock (CLEFVIS_BOUND is the whole call's bound); no lease.
 dump-ref-qvis MODEL *ARGS:
     case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL={{MODEL}} ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
+
+# MiniCPM-V 4.7 image input, the oracle's binary: dump_mtmd (tower only, no chat mode) linked against the 358a420e tree's libmtmd (tools/ref/clefvis/build-clefvis.sh, the minicpmv47 row of tools/ref/clefvis/profile.sh) into $BLOOMERY_DATA/bin/dump_mtmd_mc47; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test.
+build-mc47-ref:
+    BLOOMERY_MODEL=minicpmv47 ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+
+# MiniCPM-V 4.7 image input, the oracle sets (tools/ref/clefvis/clefvis.sh, the minicpmv47 seat of profile.sh, images tools/ref/clefvis/images-minicpmv47.tsv): the tiles' preprocess (ref_minicpmv47_vis_preproc) and the tower's graph nodes of every tile (ref_minicpmv47_vis_taps; a row <image>/t<k>/<node>, k = 0 the overview, 1.. the slices) into $BLOOMERY_DATA; SETS names base sets, `--cpu-twin` writes the CPU twin (taps.cpu, no card). The card run goes through the card's gate lock (CLEFVIS_BOUND is the whole call's bound); no lease.
+dump-ref-mcvis *ARGS:
+    case " {{ARGS}} " in *" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=minicpmv47 ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
 
 # GLM-5.3-Flash image input (mtmd `glm5v`), the oracle sets on the fixture tier (tools/ref/clefvis/clefvis.sh, the glm5next seat of profile.sh): the preprocess (fx_ref_glm5next_vis_preproc) and the tower's output nodes (…_taps), hidden states of three chat prompts (…_hidden_c*) and 32 greedy decode steps after two of them (…_decode_c*), the chat ids (…_chatids_*, with --ids), into $BLOOMERY_DATA. The text model is the fixture's copy in mainline's spelling, /models/fixtures-mainline/glm5next (tools/ref/gguf-respell.py); SETS names base sets, `--cpu-twin` writes the CPU twins and `--ids` the chat ids (both without a card). The card runs go through the card's gate lock; no lease.
 dump-ref-glmv *ARGS:
