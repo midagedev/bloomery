@@ -28,6 +28,8 @@
 //! a later call could read before writing it; it never lifts a fault.
 
 pub mod arch;
+// `cuda-core` names the target's context here, and comes with a model feature.
+#[cfg(feature = "deepseek41")]
 pub mod dspark;
 pub mod mtp;
 
