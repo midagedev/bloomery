@@ -224,14 +224,15 @@ impl BesideDraft {
         let name = Path::new(path).file_name();
         if let (Some(name), Some(dir)) = (name, target.parent()) {
             out.push(dir.join(name));
+            // One condition, so this is not a nested if. The lint ratchet
+            // counts the warning, and it is not raised for this.
             if let Some(resolved) = target
                 .canonicalize()
                 .ok()
                 .and_then(|p| p.parent().map(Path::to_path_buf))
+                .filter(|resolved| resolved.as_path() != dir)
             {
-                if resolved.as_path() != dir {
-                    out.push(resolved.join(name));
-                }
+                out.push(resolved.join(name));
             }
         }
         let family = PathBuf::from(path);
