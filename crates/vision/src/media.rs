@@ -12,6 +12,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
+use crate::arch::minicpmv::Group;
 use crate::{Patches, Rgb8, VisionError};
 
 /// How a message's content parts are flattened into one text before the chat template sees it.
@@ -32,8 +33,47 @@ pub struct Prepared {
     /// The positions the image's placeholder token is expanded to: the image's rows, and the
     /// delimiter positions too when the model's span carries them as positions of the same id.
     pub span_len: usize,
-    /// The encoder's input, with the plan it was cut to.
-    pub patches: Patches,
+    /// The encoder's input: one patch grid, or the tiles of one image.
+    pub input: EncoderInput,
+}
+
+impl Prepared {
+    /// An image of one patch grid, which `span_len` positions of the prompt stand for.
+    #[must_use]
+    pub fn of_grid(span_len: usize, patches: Patches) -> Prepared {
+        Prepared {
+            span_len,
+            input: EncoderInput::Grid(patches),
+        }
+    }
+
+    /// The image's one patch grid, for a reader that encodes a grid ([`EncoderInput::grid`]).
+    pub fn grid(&self) -> Result<&Patches, VisionError> {
+        self.input.grid()
+    }
+}
+
+/// What the encoder is handed for one image, by the shape the model cuts an image into.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EncoderInput {
+    /// The image as one grid of patches, with the plan it was cut to.
+    Grid(Patches),
+    /// The image as a group of tiles of their own sizes (an overview and slices), with the
+    /// layout that places them in the prompt.
+    Tiles(Group),
+}
+
+impl EncoderInput {
+    /// The one patch grid, or [`VisionError::NotAGrid`] for a group of tiles: a reader that runs
+    /// one grid per image refuses a model's tiles by name instead of encoding a part of them.
+    pub fn grid(&self) -> Result<&Patches, VisionError> {
+        match self {
+            EncoderInput::Grid(patches) => Ok(patches),
+            EncoderInput::Tiles(group) => Err(VisionError::NotAGrid {
+                tiles: group.tiles.len(),
+            }),
+        }
+    }
 }
 
 /// A model's image input, as data plus one prepare.
@@ -47,6 +87,14 @@ pub trait MediaModel {
     /// image token: the whole placeholder for a model that does not number its images. A message's
     /// own text may not carry it, for it would make an image slot no image pairs with.
     fn image_marker(&self) -> &str;
+
+    /// The ids that precede image `index`'s token in the tokenized prompt, for a model whose
+    /// placeholder numbers its images in ids: the number the template wrote must be the image's
+    /// position, which the server checks before it decodes anything. `None` for a model whose
+    /// placeholder carries no number.
+    fn image_head(&self, _index: usize) -> Option<Vec<u32>> {
+        None
+    }
 
     /// The id [`expand_spans`] finds in the tokenized prompt and expands to one copy
     /// per position of the image ([`Prepared::span_len`]): the one id V4.1's placeholder
@@ -126,6 +174,9 @@ pub fn expand_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GridPlan;
+    use crate::arch::minicpmv::group::preprocess_group;
+    use crate::arch::minicpmv::hparams::tests::hp;
 
     #[test]
     fn spans_expand_in_order() {
@@ -163,6 +214,40 @@ mod tests {
         assert_eq!(
             expand_spans(&[7, 7], 7, &[1, 0]).unwrap_err(),
             ExpandError::EmptySpan(1)
+        );
+    }
+
+    /// A reader that runs one patch grid gets it from a grid and a named refusal from a group of
+    /// tiles, which says how many tiles the image was cut into.
+    #[test]
+    fn a_group_of_tiles_is_not_a_grid() {
+        let plan = GridPlan {
+            n_llm_h: 1,
+            n_llm_w: 1,
+            best_h: 14,
+            best_w: 14,
+        };
+        let patches = Patches {
+            plan,
+            n_vit_h: 1,
+            n_vit_w: 1,
+            patch_len: 3,
+            bf16: vec![0; 3],
+        };
+        let grid = Prepared::of_grid(2, patches.clone());
+        assert_eq!(grid.grid().expect("a grid"), &patches);
+
+        let group = preprocess_group(&Rgb8::filled(1000, 700, [1, 2, 3]), &hp()).expect("group");
+        let tiles = Prepared {
+            span_len: group.rows(),
+            input: EncoderInput::Tiles(group),
+        };
+        let e = tiles.grid().expect_err("tiles are not a grid");
+        assert!(matches!(e, VisionError::NotAGrid { tiles: 5 }), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "the image is a group of 5 tiles, not one patch grid; \
+             this encoder runs one grid per image"
         );
     }
 }

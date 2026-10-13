@@ -91,10 +91,10 @@ impl MediaModel for Media {
 
     fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
         let patches = preprocess(image, &self.rule)?;
-        Ok(Prepared {
-            span_len: patches.plan.n_llm_h * patches.plan.n_llm_w,
+        Ok(Prepared::of_grid(
+            patches.plan.n_llm_h * patches.plan.n_llm_w,
             patches,
-        })
+        ))
     }
 }
 
@@ -140,13 +140,14 @@ mod tests {
         let p = media()
             .prepare(&Rgb8::filled(448, 448, [10, 200, 30]))
             .expect("prepare");
+        let patches = p.grid().expect("one grid");
         assert_eq!(p.span_len, 196);
-        assert_eq!((p.patches.plan.best_w, p.patches.plan.best_h), (448, 448));
-        assert_eq!((p.patches.plan.n_llm_w, p.patches.plan.n_llm_h), (14, 14));
-        assert_eq!((p.patches.n_vit_h, p.patches.n_vit_w), (28, 28));
-        assert_eq!(p.patches.patch_len, 1536);
-        assert_eq!(p.patches.bf16.len(), 784 * 1536);
-        let patch = &p.patches.bf16[..1536];
+        assert_eq!((patches.plan.best_w, patches.plan.best_h), (448, 448));
+        assert_eq!((patches.plan.n_llm_w, patches.plan.n_llm_h), (14, 14));
+        assert_eq!((patches.n_vit_h, patches.n_vit_w), (28, 28));
+        assert_eq!(patches.patch_len, 1536);
+        assert_eq!(patches.bf16.len(), 784 * 1536);
+        let patch = &patches.bf16[..1536];
         for (frame, c, v) in [
             (0, 0, 10),
             (0, 1, 200),
@@ -172,11 +173,12 @@ mod tests {
         let p = media()
             .prepare(&Rgb8::filled(96, 64, [255, 255, 255]))
             .expect("prepare");
+        let patches = p.grid().expect("one grid");
         assert_eq!(p.span_len, 12);
-        assert_eq!((p.patches.plan.best_w, p.patches.plan.best_h), (128, 96));
-        assert_eq!((p.patches.n_vit_h, p.patches.n_vit_w), (6, 8));
+        assert_eq!((patches.plan.best_w, patches.plan.best_h), (128, 96));
+        assert_eq!((patches.n_vit_h, patches.n_vit_w), (6, 8));
         let (black, white) = (f32_to_bf16(-1.0), f32_to_bf16(1.0));
-        let plane = |patch: usize, c: usize| &p.patches.bf16[patch * 1536 + c * 256..][..256];
+        let plane = |patch: usize, c: usize| &patches.bf16[patch * 1536 + c * 256..][..256];
         let first = plane(0, 0);
         for py in 0..16 {
             let want = if py < 5 { black } else { white };
@@ -215,7 +217,8 @@ mod tests {
             let p = media()
                 .prepare(&Rgb8::filled(w, h, [10, 200, 30]))
                 .expect("prepare");
-            let (nx, ny) = p.patches.plan.span_grid();
+            let patches = p.grid().expect("one grid");
+            let (nx, ny) = patches.plan.span_grid();
             assert_eq!((nx, ny), (across, down), "{w}x{h}");
             assert_eq!(nx > ny, w > h, "{w}x{h}: wider than tall");
             let mut seq = MropeSeq::new();
