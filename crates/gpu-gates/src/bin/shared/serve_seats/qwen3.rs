@@ -905,18 +905,9 @@ impl<B: Body3> Seat for Q3<B> {
             return Err("no --mmproj: this seat serves no image".into());
         };
         self.draft.refuse_media()?;
-        let tiles = feeds
-            .iter()
-            .filter(|f| matches!(f.prepared.input, vision::media::EncoderInput::Tiles(_)))
-            .count();
-        if tiles != 0 && tiles != feeds.len() {
-            return Err(format!(
-                "{tiles} tile groups among {} images: a call's images are all grids or all \
-                 canvas groups",
-                feeds.len()
-            )
-            .into());
-        }
+        let inputs: Vec<&vision::media::EncoderInput> =
+            feeds.iter().map(|f| &f.prepared.input).collect();
+        let tiles = vision_seat::tile_group_count(&inputs)?;
         if tiles != 0 {
             let ctx = Arc::clone(self.s.model().gpu().context());
             let mut groups = Vec::with_capacity(feeds.len());
