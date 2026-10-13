@@ -44,6 +44,14 @@
 //! word is read once for all `m` columns. `q8_0_gemv_heads_mcol` is the same
 //! body over per-head activation windows.
 //!
+//! `q8_0_gemv_q32` is the one entry here whose activations are not f32 in the
+//! multiply: it quantizes its columns to the 32-value form a Q8_0 site reads
+//! (a scale `amax/127` and int8 codes a block, the wide arm's
+//! `quantize_gemm32` bytes) into shared memory once a block, and each lane
+//! takes one `dp4a` per code word, so a site's gemv and its GEMM read the same
+//! codes. Its lane walk and butterfly are `q8_0_gemv`'s; its term per word is
+//! the exact integer sum times `d_w · d_a`.
+//!
 //! `q8_0_gemv_sel_f32` is the expert-select form over a stack of experts in
 //! the two planes: slot `s` dots the rows of expert `sel[s]` with activation
 //! column `s / slots_per_col`, each row `q8_0_gemv`'s lane walk and
@@ -59,13 +67,17 @@
 //! rows raises [`FaultSite::TokenId`] and writes its row NaN.
 
 use crate::GpuError;
-use crate::fault::{FaultSink, FaultSite};
+use crate::cores::q8_quad;
+use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::flash::half_bits_to_f32;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::dotprod::dp4a_s32;
 use cuda_device::vector::{F32x4, as_vectors};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
@@ -1101,6 +1113,135 @@ unsafe fn store_sums(
     }
 }
 
+// ------------------------------------------------ 8-bit/32 activations
+//
+// `q8_0_gemv_q32` reads the activation form a Q8_0 site declares
+// (`site::Form::Q8x32`): per 32-value block a scale `d = amax/127` (1.0 for
+// an all-zero block) and the codes `round(x/d)` clamped to ±127 — the bytes
+// `Gemm32Kernels::enqueue_quantize_gemm32` writes for the wide arm's GEMM, from
+// the same bodies, so a site reads one set of codes on both arms.
+
+/// 128-value steps of the activation columns one pass of the 8-bit gemv
+/// stages in shared memory; a longer row runs in several passes, the lane
+/// walk unchanged.
+const Q32_CHUNK_STEPS: usize = 16;
+/// Code words of one staged column of a pass: one per lane and step.
+const Q32_CHUNK_WORDS: usize = 32 * Q32_CHUNK_STEPS;
+/// 32-value blocks, one scale each, of one staged column of a pass.
+const Q32_CHUNK_BLOCKS: usize = 4 * Q32_CHUNK_STEPS;
+/// The most columns a launch takes, the gemvs' `m_cols` bound.
+const Q32_COLS: usize = 8;
+
+/// Lane `lane`'s code word and its block's scale for the four values `v` of
+/// its code word: the block is the lane's octet, whose maximum is the
+/// 1-2-4 xor butterfly, and a block holding a non-finite value is refused —
+/// zero codes, NaN scale, `true`. The body of `act32::quant32_group`.
+///
+/// All 32 lanes of the warp call it together.
+#[inline(always)]
+fn q32_quad(v: [f32; 4], lane: usize) -> (u32, f32, bool) {
+    let bad = warp::ballot(!quad_finite(v));
+    let refused = (bad >> (8 * (lane >> 3))) & 0xff != 0;
+    let mut amax = v[0].abs().max(v[1].abs()).max(v[2].abs()).max(v[3].abs());
+    amax = amax.max(warp::shuffle_xor_f32(amax, 1));
+    amax = amax.max(warp::shuffle_xor_f32(amax, 2));
+    amax = amax.max(warp::shuffle_xor_f32(amax, 4));
+    let dv = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+    let (word, _) = q8_quad(v, dv);
+    if refused {
+        (0, f32::NAN, true)
+    } else {
+        (word, dv, false)
+    }
+}
+
+/// Column `c`'s term of the lane's step: the lane's code word `q` of the
+/// weight row against the column's code word at `word`, the exact `dp4a`
+/// sum scaled by the weight block's `dw` and the activation block's scale at
+/// `block`, added to `acc` by one f32 multiply-add.
+///
+/// # Safety
+///
+/// `aq` and `ad` address the staged planes of the pass, and column `c`'s
+/// `word` and `block` are inside them and written.
+#[inline(always)]
+unsafe fn q32_term(
+    acc: f32,
+    (q, dw): (u32, f32),
+    (aq, ad): (*const u32, *const f32),
+    (c, word, block): (usize, usize, usize),
+) -> f32 {
+    // SAFETY: this fn's contract.
+    let (a, da) = unsafe {
+        (
+            *aq.add(c * Q32_CHUNK_WORDS + word),
+            *ad.add(c * Q32_CHUNK_BLOCKS + block),
+        )
+    };
+    f32::mul_add(dp4a_s32(a, q, 0) as f32, dw * da, acc)
+}
+
+/// `f` plus step `ss`'s term of each of the first `m` staged columns
+/// ([`q32_term`]).
+///
+/// # Safety
+///
+/// `aq` and `ad` address the staged planes of the pass, `m` columns of
+/// [`Q32_CHUNK_WORDS`] words and [`Q32_CHUNK_BLOCKS`] scales, all written
+/// for step `ss`; `ss < Q32_CHUNK_STEPS`, `1 <= m <= 8`, `lane < 32`.
+#[inline(always)]
+unsafe fn q32_terms(
+    f: [f32; 8],
+    m: usize,
+    w: (u32, f32),
+    a: (*const u32, *const f32),
+    (ss, lane): (usize, usize),
+) -> [f32; 8] {
+    let (word, block) = (32 * ss + lane, 4 * ss + (lane >> 3));
+    // SAFETY: each column below is guarded by c < m <= 8, and the step's word
+    // and block are inside every column's pass planes by this fn's contract.
+    unsafe {
+        [
+            q32_term(f[0], w, a, (0, word, block)),
+            if m > 1 {
+                q32_term(f[1], w, a, (1, word, block))
+            } else {
+                f[1]
+            },
+            if m > 2 {
+                q32_term(f[2], w, a, (2, word, block))
+            } else {
+                f[2]
+            },
+            if m > 3 {
+                q32_term(f[3], w, a, (3, word, block))
+            } else {
+                f[3]
+            },
+            if m > 4 {
+                q32_term(f[4], w, a, (4, word, block))
+            } else {
+                f[4]
+            },
+            if m > 5 {
+                q32_term(f[5], w, a, (5, word, block))
+            } else {
+                f[5]
+            },
+            if m > 6 {
+                q32_term(f[6], w, a, (6, word, block))
+            } else {
+                f[6]
+            },
+            if m > 7 {
+                q32_term(f[7], w, a, (7, word, block))
+            } else {
+                f[7]
+            },
+        ]
+    }
+}
+
 // -------------------------------------------------------------- kernels
 
 #[cuda_module]
@@ -1571,6 +1712,385 @@ mod q8f32_kernels {
             unsafe { store_sums(&mut y, row * m_cols as usize, 1, m_cols as usize, &sums) };
         }
     }
+
+    /// Q8_0 gemv against one column of 8-bit/32 activations, `y[r] = Σ_k'
+    /// w[r, k'] · x̂[k']`, the decode shape: the product the wide arm's
+    /// 32-value GEMM makes of the same codes, for the gemv arm's rows. The
+    /// block quantizes the f32 column `x` once into shared memory — per
+    /// 32-value block `d = amax/127` and the codes, `act32::quant32_group`'s
+    /// body, so the bytes `enqueue_quantize_gemm32` writes — then its eight
+    /// warps, one weight row each, walk the row as `q8_0_gemv` does (lane L the
+    /// code words L, L + 32, …) with one `dp4a` a word: the word's exact
+    /// integer sum times the weight block's `dw` and the column's block scale,
+    /// one f32 multiply-add per term, the 32 lane sums combined by the fixed
+    /// five-step butterfly. A row longer than [`Q32_CHUNK_STEPS`] steps stages
+    /// its column in several passes with the walk unchanged. A block holding a
+    /// non-finite value is refused, the outputs NaN, and raises
+    /// [`FaultSite::QuantColumn`]. No warp leaves before the last barrier:
+    /// rows past `n_rows` only skip the walk. Its shared arrays hold one
+    /// column, the `q8_0_gemv` kernel's occupancy being the decode shape's.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_rows * k,
+            32 * d.len() >= n_rows * k,
+            x.len() >= k,
+            y.len() >= n_rows
+        )
+    )]
+    pub fn q8_0_gemv_q32(
+        qs: &[u32],
+        d: &[u16],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        // The pass's activation column: code words, then block scales.
+        static mut AQ: SharedArray<u32, Q32_CHUNK_WORDS> = SharedArray::UNINIT;
+        static mut AD: SharedArray<f32, Q32_CHUNK_BLOCKS> = SharedArray::UNINIT;
+
+        let wid = thread::threadIdx_x() as usize / 32;
+        let lane = warp::lane_id() as usize;
+        let row = thread::blockIdx_x() as usize * 8 + wid;
+        let live = row < n_rows as usize; // warp-uniform
+        let k = k as usize;
+        let (words, blocks) = (k >> 2, k >> 5);
+        let full = k / 128;
+        let total = k.div_ceil(128);
+        // SAFETY: the block-shared statics; the raw form reaches them
+        // without a reference, and every access below is bounded and
+        // barrier-ordered.
+        let (aq, ad) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut AQ),
+                SharedArray::as_raw_mut_ptr(&raw mut AD),
+            )
+        };
+        let (wq, wd) = (row * words + lane, row * blocks + (lane >> 3));
+        // The first four steps' weight words and scales, issued before the
+        // staging so their latency runs under it.
+        let pre = if live && full >= Q8_STEP_UNROLL {
+            // SAFETY: the steps 0 .. 3 are whole (3 < full), so every lane's
+            // word in them is below k/4.
+            unsafe {
+                (
+                    q8_0_code(qs, d, wq, wd, 0),
+                    q8_0_code(qs, d, wq, wd, 1),
+                    q8_0_code(qs, d, wq, wd, 2),
+                    q8_0_code(qs, d, wq, wd, 3),
+                )
+            }
+        } else {
+            ((0, 0.0), (0, 0.0), (0, 0.0), (0, 0.0))
+        };
+        let mut f = 0.0f32;
+        let mut c0 = 0usize;
+        while c0 < total {
+            let n_st = (total - c0).min(Q32_CHUNK_STEPS);
+            // ---- stage the pass: warp `wid` takes the steps `wid, wid + 8`,
+            // lane L the four values of word 32·step + L.
+            let mut ss = wid;
+            while ss < n_st {
+                let w = 32 * (c0 + ss) + lane;
+                let v = if w < words {
+                    // SAFETY: 4w + 3 < k <= x.len() by the launch contract.
+                    unsafe {
+                        [
+                            *x.get_unchecked(4 * w),
+                            *x.get_unchecked(4 * w + 1),
+                            *x.get_unchecked(4 * w + 2),
+                            *x.get_unchecked(4 * w + 3),
+                        ]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let (word, dv, refused) = q32_quad(v, lane);
+                if w < words {
+                    // SAFETY: ss < n_st <= Q32_CHUNK_STEPS keeps both stores
+                    // inside the planes; this lane alone writes the word,
+                    // lane 0 of its octet the scale.
+                    unsafe {
+                        *aq.add(32 * ss + lane) = word;
+                        if lane & 7 == 0 {
+                            *ad.add(4 * ss + (lane >> 3)) = dv;
+                        }
+                    }
+                    if refused && lane & 7 == 0 {
+                        fault.raise(FaultSite::QuantColumn);
+                    }
+                }
+                ss += 8;
+            }
+            thread::sync_threads();
+            if live {
+                let (aq, ad) = (aq.cast_const(), ad.cast_const());
+                let nf = if c0 >= full { 0 } else { (full - c0).min(n_st) };
+                let mut ss = 0usize;
+                while ss + Q8_STEP_UNROLL <= nf {
+                    let g = c0 + ss;
+                    let (w0, w1, w2, w3) = if g == 0 {
+                        pre
+                    } else {
+                        // SAFETY: the steps g .. g + 3 are whole (g + 3 <
+                        // full), so every lane's word in them is below k/4.
+                        unsafe {
+                            (
+                                q8_0_code(qs, d, wq, wd, g),
+                                q8_0_code(qs, d, wq, wd, g + 1),
+                                q8_0_code(qs, d, wq, wd, g + 2),
+                                q8_0_code(qs, d, wq, wd, g + 3),
+                            )
+                        }
+                    };
+                    // SAFETY: steps ss .. ss + 3 of the pass are staged by the
+                    // barrier above.
+                    unsafe {
+                        f = q32_term(f, w0, (aq, ad), (0, 32 * ss + lane, 4 * ss + (lane >> 3)));
+                        f = q32_term(
+                            f,
+                            w1,
+                            (aq, ad),
+                            (0, 32 * (ss + 1) + lane, 4 * (ss + 1) + (lane >> 3)),
+                        );
+                        f = q32_term(
+                            f,
+                            w2,
+                            (aq, ad),
+                            (0, 32 * (ss + 2) + lane, 4 * (ss + 2) + (lane >> 3)),
+                        );
+                        f = q32_term(
+                            f,
+                            w3,
+                            (aq, ad),
+                            (0, 32 * (ss + 3) + lane, 4 * (ss + 3) + (lane >> 3)),
+                        );
+                    }
+                    ss += Q8_STEP_UNROLL;
+                }
+                while ss < nf {
+                    // SAFETY: step c0 + ss is whole, and staged by the
+                    // barrier above.
+                    unsafe {
+                        let w0 = q8_0_code(qs, d, wq, wd, c0 + ss);
+                        f = q32_term(f, w0, (aq, ad), (0, 32 * ss + lane, 4 * ss + (lane >> 3)));
+                    }
+                    ss += 1;
+                }
+                if nf < n_st && 32 * (c0 + nf) + lane < words {
+                    // SAFETY: the guard is the step helper's bound for the
+                    // partial last step, staged by the barrier above.
+                    unsafe {
+                        let w0 = q8_0_code(qs, d, wq, wd, c0 + nf);
+                        f = q32_term(f, w0, (aq, ad), (0, 32 * nf + lane, 4 * nf + (lane >> 3)));
+                    }
+                }
+            }
+            thread::sync_threads();
+            c0 += Q32_CHUNK_STEPS;
+        }
+        if live {
+            let sum = warp::reduce_sum_f32(f);
+            if lane == 0 {
+                // SAFETY: row < n_rows <= y.len() by the launch contract, and
+                // only lane 0 of the row's warp writes slot row.
+                unsafe { *y.get_unchecked_mut(row) = sum };
+            }
+        }
+    }
+
+    /// [`q8_0_gemv_q32`] for `m_cols` in 1..=8 columns, written
+    /// token-major (`y[c·n_rows + r]`): the product the wide arm's 32-value
+    /// GEMM makes of the same codes, for the gemv arm's rows. The block
+    /// quantizes the f32 columns `x` once into shared memory — per 32-value
+    /// block `d = amax/127` and the codes, `act32::quant32_group`'s body, so
+    /// the bytes `enqueue_quantize_gemm32` writes — then its eight warps,
+    /// one weight row each, walk the row as `q8_0_gemv` does (lane L the
+    /// code words L, L + 32, …) with one `dp4a` per word and column: the
+    /// word's exact integer sum times the weight block's `dw` and the
+    /// column's block scale, one f32 multiply-add per term, the 32 lane sums
+    /// combined by the fixed five-step butterfly. A row longer than
+    /// [`Q32_CHUNK_STEPS`] steps stages its columns in several passes with
+    /// the walk unchanged, so the sum is a function of (k, m) only and
+    /// column c of an `m`-column launch is bit for bit the `m = 1` launch of
+    /// that column. A block holding a non-finite value is refused, its
+    /// column's outputs NaN, and raises [`FaultSite::QuantColumn`]. No warp
+    /// leaves before the last barrier: rows past `n_rows` only skip the walk.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_rows * k,
+            32 * d.len() >= n_rows * k,
+            x.len() >= m_cols * k,
+            y.len() >= n_rows * m_cols
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn q8_0_gemv_q32_mcol(
+        qs: &[u32],
+        d: &[u16],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        m_cols: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        // The pass's activation columns: code words, then block scales.
+        static mut AQ: SharedArray<u32, { Q32_COLS * Q32_CHUNK_WORDS }> = SharedArray::UNINIT;
+        static mut AD: SharedArray<f32, { Q32_COLS * Q32_CHUNK_BLOCKS }> = SharedArray::UNINIT;
+
+        let wid = thread::threadIdx_x() as usize / 32;
+        let lane = warp::lane_id() as usize;
+        let row = thread::blockIdx_x() as usize * 8 + wid;
+        let live = row < n_rows as usize; // warp-uniform
+        let (k, m) = (k as usize, m_cols as usize);
+        let (words, blocks) = (k >> 2, k >> 5);
+        let full = k / 128;
+        let total = k.div_ceil(128);
+        // SAFETY: the block-shared statics; the raw form reaches them
+        // without a reference, and every access below is bounded and
+        // barrier-ordered.
+        let (aq, ad) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut AQ),
+                SharedArray::as_raw_mut_ptr(&raw mut AD),
+            )
+        };
+        let (wq, wd) = (row * words + lane, row * blocks + (lane >> 3));
+        // The first four steps' weight words and scales, issued before the
+        // staging so their latency runs under it.
+        let pre = if live && full >= Q8_STEP_UNROLL {
+            // SAFETY: the steps 0 .. 3 are whole (3 < full), so every lane's
+            // word in them is below k/4.
+            unsafe {
+                (
+                    q8_0_code(qs, d, wq, wd, 0),
+                    q8_0_code(qs, d, wq, wd, 1),
+                    q8_0_code(qs, d, wq, wd, 2),
+                    q8_0_code(qs, d, wq, wd, 3),
+                )
+            }
+        } else {
+            ((0, 0.0), (0, 0.0), (0, 0.0), (0, 0.0))
+        };
+        let mut f = [0.0f32; 8];
+        let mut c0 = 0usize;
+        while c0 < total {
+            let n_st = (total - c0).min(Q32_CHUNK_STEPS);
+            // ---- stage the pass: warp `wid` takes the (column, step) pairs
+            // `wid, wid + 8, …`, lane L the four values of word 32·step + L.
+            let items = m * n_st;
+            let mut it = wid;
+            while it < items {
+                let col = it / n_st;
+                let ss = it - col * n_st;
+                let w = 32 * (c0 + ss) + lane;
+                let v = if w < words {
+                    // SAFETY: 4w + 3 < k, so col·k + 4w + 3 < m·k <= x.len()
+                    // by the launch contract.
+                    unsafe {
+                        let b = col * k + 4 * w;
+                        [
+                            *x.get_unchecked(b),
+                            *x.get_unchecked(b + 1),
+                            *x.get_unchecked(b + 2),
+                            *x.get_unchecked(b + 3),
+                        ]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let (word, dv, refused) = q32_quad(v, lane);
+                if w < words {
+                    // SAFETY: col < m <= 8 and ss < n_st <= Q32_CHUNK_STEPS
+                    // keep both stores inside the planes; this lane alone
+                    // writes the word, lane 0 of its octet the scale.
+                    unsafe {
+                        *aq.add(col * Q32_CHUNK_WORDS + 32 * ss + lane) = word;
+                        if lane & 7 == 0 {
+                            *ad.add(col * Q32_CHUNK_BLOCKS + 4 * ss + (lane >> 3)) = dv;
+                        }
+                    }
+                    if refused && lane & 7 == 0 {
+                        fault.raise(FaultSite::QuantColumn);
+                    }
+                }
+                it += 8;
+            }
+            thread::sync_threads();
+            if live {
+                let (aq, ad) = (aq.cast_const(), ad.cast_const());
+                let nf = if c0 >= full { 0 } else { (full - c0).min(n_st) };
+                let mut ss = 0usize;
+                while ss + Q8_STEP_UNROLL <= nf {
+                    let g = c0 + ss;
+                    let (w0, w1, w2, w3) = if g == 0 {
+                        pre
+                    } else {
+                        // SAFETY: the steps g .. g + 3 are whole (g + 3 <
+                        // full), so every lane's word in them is below k/4.
+                        unsafe {
+                            (
+                                q8_0_code(qs, d, wq, wd, g),
+                                q8_0_code(qs, d, wq, wd, g + 1),
+                                q8_0_code(qs, d, wq, wd, g + 2),
+                                q8_0_code(qs, d, wq, wd, g + 3),
+                            )
+                        }
+                    };
+                    // SAFETY: steps ss .. ss + 3 of the pass are staged for
+                    // m columns by the barrier above.
+                    unsafe {
+                        f = q32_terms(f, m, w0, (aq, ad), (ss, lane));
+                        f = q32_terms(f, m, w1, (aq, ad), (ss + 1, lane));
+                        f = q32_terms(f, m, w2, (aq, ad), (ss + 2, lane));
+                        f = q32_terms(f, m, w3, (aq, ad), (ss + 3, lane));
+                    }
+                    ss += Q8_STEP_UNROLL;
+                }
+                while ss < nf {
+                    // SAFETY: step c0 + ss is whole, and staged by the
+                    // barrier above.
+                    unsafe {
+                        let w0 = q8_0_code(qs, d, wq, wd, c0 + ss);
+                        f = q32_terms(f, m, w0, (aq, ad), (ss, lane));
+                    }
+                    ss += 1;
+                }
+                if nf < n_st && 32 * (c0 + nf) + lane < words {
+                    // SAFETY: the guard is the step helper's bound for the
+                    // partial last step, staged by the barrier above.
+                    unsafe {
+                        let w0 = q8_0_code(qs, d, wq, wd, c0 + nf);
+                        f = q32_terms(f, m, w0, (aq, ad), (nf, lane));
+                    }
+                }
+            }
+            thread::sync_threads();
+            c0 += Q32_CHUNK_STEPS;
+        }
+        if live {
+            let sums = gemv_lane_sums(f, m_cols);
+            if lane == 0 {
+                // SAFETY: the slots c·n_rows + row, c < m <= 8, are below
+                // m·n_rows <= y.len() by the launch contract, and only lane
+                // 0 of the row's warp writes them.
+                unsafe { store_sums(&mut y, row, n_rows as usize, m, &sums) };
+            }
+        }
+    }
 }
 
 /// The loaded P3 device module: `f32_gemv`, `q8_0_gemv` and the two
@@ -1694,6 +2214,54 @@ impl Q8F32Kernels {
             m,
             y_row,
             y_col,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue `y = W · x` for a Q8_0 weight in the module doc's device
+    /// layout against `m` (1..=8) f32 activation columns of `k = d.cols() *
+    /// 32` values, read as 8-bit codes and a scale per 32 values
+    /// (`q8_0_gemv_q32`): the rule of the wide arm's 32-value GEMM, so a
+    /// site reads one set of codes on both arms. One launch, no scratch; `y`
+    /// is token-major (`y[c·rows + r]`). Column c of the output is the `m =
+    /// 1` launch of column c bit for bit. Asynchronous, allocation-free,
+    /// capturable. One column runs `q8_0_gemv_q32`, `m > 1` runs
+    /// `q8_0_gemv_q32_mcol`, the same sums.
+    pub fn enqueue_q8_0_gemv_q32(
+        &self,
+        stream: &CudaStream,
+        a: Q8_0GemvQ32Args<'_>,
+    ) -> Result<(), GpuError> {
+        let Q8_0GemvQ32Args {
+            qs,
+            d,
+            x,
+            m,
+            fault,
+            y,
+        } = a;
+        let what = "enqueue_q8_0_gemv_q32";
+        let (n_rows, k) = q8_0_launch_dims(what, qs, d, x.len(), m, y.len())?;
+        let cfg = LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0);
+        if m == 1 {
+            let prep = self.module.prepare_q8_0_gemv_q32(cfg)?;
+            self.module
+                .q8_0_gemv_q32(stream, &prep, qs.buf(), d.buf(), x, n_rows, k, fault, y)?;
+            return Ok(());
+        }
+        let m = launch_u32(what, "m", m)?;
+        let prep = self.module.prepare_q8_0_gemv_q32_mcol(cfg)?;
+        self.module.q8_0_gemv_q32_mcol(
+            stream,
+            &prep,
+            qs.buf(),
+            d.buf(),
+            x,
+            n_rows,
+            k,
+            m,
+            fault,
             y,
         )?;
         Ok(())
@@ -2027,6 +2595,19 @@ pub struct Q8_0GemvMcolArgs<'a> {
     pub x: &'a DeviceBuffer<f32>,
     pub m: usize,
     pub out: GemvOut,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`Q8F32Kernels::enqueue_q8_0_gemv_q32`]'s arguments: the Q8_0 planes as
+/// [`Q8F32Kernels::enqueue_q8_0_gemv`] takes them, `m` f32 activation
+/// columns (1..=8) the launch quantizes itself, and the sink a refused block
+/// raises [`FaultSite::QuantColumn`] on. The output is token-major.
+pub struct Q8_0GemvQ32Args<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub d: &'a DeviceTensor<u16>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub fault: FaultSink,
     pub y: &'a mut DeviceBuffer<f32>,
 }
 

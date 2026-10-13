@@ -1,0 +1,47 @@
+# Round q35fx-f2f (B1): one activation rule for the Q8_0 sites of the qwen3moe family. A Q8_0 pass site
+# (site::gemv) reads 8-bit/32 activations like its GEMM, through one new entry (q8_0_gemv_q32) that quantizes the
+# f32 rows into shared memory in its own launch: delta N = 0 against the f32-row gemv it replaces, no scratch.
+# The alternative - a quantize launch per distinct input - is +160 launches a step (4 a layer x 40), 136 us at
+# c_node 0.852 us before the quantizers' own time [derived], and is not built.
+# Measured term (the lead's Qwen3.6 UD decode sitting, A6000): q8_0_gemv runs 251 launches a step for 3.68 ms, 42.7 %
+# of an 8.63 ms window, on grids of 64/256/512 blocks, a warp a row. B1's sites are 250 of the 251 [derived from the
+# file's header: 30 delta layers x (attn_qkv, attn_gate, ssm_out) + 10 attention layers x (attn_q, k, v, output) + 40
+# shared experts x (gate, up, down)]; the 251st is not a head (output.weight is Q6_K, token_embd is a Q8_0 gather),
+# so B1 carries at least 99.6 % of the launches and of the 3.68 ms; the MTP head and the selections the round leaves
+# (mtp38.rs) are not in a Qwen3.6 decode step.
+# Timeline per step [derived]: the sites' weights are 1.49 GB = 2.13 ms at 700 GB/s, so the measured 3.68 ms is 1.73x
+# the DRAM time: the old kernel is not at the roofline, it is latency (14.7 us a launch on average; a launch floor of
+# about 3 us on the 140 small grids of 64 blocks, 1.1 MB each). Demands against the 3.68 ms: DRAM 2.13 ms; issue
+# 186 M warp instructions before = 0.31 ms, 233 M after = 0.38 ms at 605 G/s; L1/LSU 5.6 GB of f32-row reads = 0.29
+# ms before, 0.7 GB L1 + 1.6 GB staged codes = 0.12 ms after. Every unit is well under the step, so the issue and
+# LSU savings predict 0 (AGENTS.md: a lever on a unit far under the step's cycles). What B1 adds is a latency term:
+# the per-block staging (an L2 read of the row, the quantize, one barrier; the first four steps' weight loads are
+# issued before it) about 0.15-0.3 us a launch where the grid is one wave, hidden where it is several: 250 launches
+# x 0.15-0.3 us = 38-75 us = 0.4-0.9 % of the 8.63 ms window [derived]. Sign: slower, size inside 1 %.
+# Occupancy (ptxas, sm_86; the decode entry q8_0_gemv_q32 keeps one column's 2,304 B shared array, the m-column entry
+# q8_0_gemv_q32_mcol 18,432 B is not on the decode path): 55 registers and 4 blocks an SM against q8_0_gemv's 40 and 6.
+# In flight per SM 4 blocks x 8 warps x 512 B = 16 KB, against about 5 KB that 700 GB/s over 84 SMs at 600 ns needs
+# [derived, latency assumed], so the 6 -> 4 step is not a DRAM bound; it adds a wave on the 1024-block grids (40
+# launches, 25 us each at the roofline), inside the staging estimate's size.
+kind: noninf
+question: does the 8-bit/32 gemv for Q8_0 sites (q8_0_gemv_q32, delta N = 0) leave UD decode within the margin of
+  the f32-row gemv it replaces?
+term: decode tok/s @ n = 1, depth 6, A6000, Qwen3.6-35B-A3B UD-Q4_K_M (all Q8_0 mixer, attention and shared-expert
+  sites), graph replay - (B1 - base) / base, paired by round
+unit: %
+predict: -1.0..+0.2
+rounds: 6
+sd: 0.6 % AGENTS.md "Know the ruler", same-binary decode scatter
+margin: 2.0 % the price the lead accepts for one activation rule at 250 launches a step: 2.0 % of the 8.63 ms window
+  is 170 us, 0.7 us a launch, about twice the derived staging latency
+condition: the base tree (build-decode in a worktree before the lease) and this tree alternate in one lease,
+  just ab-decode, order rotated every round, both on the UD file with the same prompt; no row carries
+  [cpu-busy] or [other-busy]. The witness blocks open with the card name and power limit. Decode only: the
+  m = 2..8 columns (verify) share the entry and are read from the fixture e2e's bit-for-bit pins, not timed here
+decide-in: land B1; the staging barrier is the whole difference, nothing to chase
+decide-below: nsys the step with the base and this tree: if the 64-block sites (attn_k, attn_v, shared gate and up,
+  140 launches a step) carry the loss, the staging latency is it and the next lever is a second row tile a block
+  (16 rows share one staging); if the 1024-block sites carry it, read registers and the 18 KB shared array against
+  the base's four blocks an SM
+decide-above: the f32-row reads were part of the old kernel's latency after all (B1 faster than the 3.68 ms
+  account): write the K-quant gemvs' activation reads against the same account before any further Q8_0 lever

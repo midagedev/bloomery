@@ -743,6 +743,24 @@ mod gate {
             && bits(&a.logits) == bits(&b.logits)
     }
 
+    /// `x` in the form a Q8_0 site reads (`site::Form::Q8x32`, the bytes of
+    /// the card's `quantize_gemm32`): per block of 32 values the scale `d =
+    /// amax/127` (1 for a zero block) and the codes `round(x/d)` clamped to
+    /// ±127, as the values `code · d`. The attention output projection and the
+    /// shared expert's down are sites; their launches multiply these.
+    fn q8_rule32(x: &[f64]) -> Vec<f64> {
+        let mut out = vec![0.0f64; x.len()];
+        for (blk, o) in x.chunks(32).zip(out.chunks_mut(32)) {
+            let v: Vec<f32> = blk.iter().map(|&v| v as f32).collect();
+            let amax = v.iter().fold(0.0f32, |a, &t| a.max(t.abs()));
+            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            for (o, &t) in o.iter_mut().zip(&v) {
+                *o = f64::from((t / d).round().clamp(-127.0, 127.0)) * f64::from(d);
+            }
+        }
+        out
+    }
+
     /// A Q8_0 matrix's rows on the host, `k` values a row.
     struct HostQ8<'a> {
         bytes: &'a [u8],
@@ -1216,7 +1234,7 @@ mod gate {
             &label,
         );
         let gated = f64s(node(MtpNode::AttnGated));
-        let (y, abs) = h.out.apply_abs(&gated, 0..HIDDEN);
+        let (y, abs) = h.out.apply_abs(&q8_rule32(&gated), 0..HIDDEN);
         let (d, a) = dot_pin(node(MtpNode::AttnOut), &y, &abs);
         p.attn_out
             .hold(d, gamma(dot_depth(gated.len())) * a, &label);
@@ -1266,7 +1284,7 @@ mod gate {
         let b = bound.iter().map(|v| v * v).sum::<f64>().sqrt();
         p.routed.hold(nan_inf(num / den), b / den, &label);
         let x = f64s(&taps.shared_h[t * FF..(t + 1) * FF]);
-        let (y, abs) = h.down_s.apply_abs(&x, 0..HIDDEN);
+        let (y, abs) = h.down_s.apply_abs(&q8_rule32(&x), 0..HIDDEN);
         let (d, a) = dot_pin(node(MtpNode::Shared), &y, &abs);
         p.shared.hold(d, gamma(dot_depth(FF)) * a, &label);
         // `q38_shared_add`: the product rounded, then the sum rounded.

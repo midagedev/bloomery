@@ -10,8 +10,9 @@
 //!
 //! The launches by type and arm:
 //! - [`gemv`], a unit of at most eight columns over the f32 rows: Q8_0 the
-//!   q8f32 gemv (`q8_0_gemv` at one column, `q8_0_gemv_mcol` token-major
-//!   past it, the two bit for bit equal on a column), F32 the F32 tile
+//!   q8f32 gemv over 8-bit codes (`q8_0_gemv_q32`, token-major, quantizing
+//!   the f32 rows into blocks of 32 values inside its launch, the GEMM's
+//!   bytes; column c bit for bit the one-column launch of c), F32 the F32 tile
 //!   (`f32_tile_gemm`, token-major, bit for bit `f32_gemv` on every row and
 //!   column). A K-quant site's gemv is [`kgemv`].
 //! - [`kgemv`], a K-quant site at most eight columns over the q8_1 rows:
@@ -39,7 +40,7 @@ use crate::gemm::{
     GemmRoute, GemmWeight,
 };
 use crate::kquant::{Act, KquantKernels, SelDown};
-use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
+use crate::q8f32::Q8_0GemvQ32Args;
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
@@ -65,8 +66,9 @@ pub enum Form {
     /// q8_1 blocks of 128 values (the K-quant gemv's `Q8Act`, the grouped
     /// GEMM's `GemmAct`).
     Q8x128,
-    /// The f32 rows on the gemv arm; q8 blocks of 32 values (`GemmAct32`) on
-    /// the wide arm.
+    /// q8 blocks of 32 values, a scale `amax/127` and int8 codes each: the
+    /// wide arm's `GemmAct32`, and the gemv arm's own quantization of the
+    /// f32 rows inside its launch ([`gemv`]), the same bytes.
     Q8x32,
     /// The f32 rows on both arms.
     F32,
@@ -256,8 +258,11 @@ fn kq<'w>(
 }
 
 /// `y = W · x` for site `name` of type `ty` over the first `m` (1..=8)
-/// columns of the f32 rows `x`, token-major (module doc). A K-quant site is
-/// the body's launch and is refused here by name.
+/// columns of the f32 rows `x`, token-major (module doc). A Q8_0 site reads
+/// `x` in the form it declares ([`SiteTy::reads`]), quantized in the launch
+/// with a refused block raised on the engine's unlabelled sink; an F32 site
+/// multiplies the rows. A K-quant site is the body's launch and is refused
+/// here by name.
 pub fn gemv(
     gpu: &Gpu,
     g32: &Gemm32Kernels,
@@ -271,22 +276,17 @@ pub fn gemv(
     match ty {
         SiteTy::Q8_0 => {
             let (qs, d) = w.q8_planes(WHAT, name)?;
-            let q = gpu.q8f32();
-            if m == 1 {
-                q.enqueue_q8_0_gemv(stream, qs, d, x, 1, y)
-            } else {
-                q.enqueue_q8_0_gemv_mcol(
-                    stream,
-                    Q8_0GemvMcolArgs {
-                        qs,
-                        d,
-                        x,
-                        m,
-                        out: GemvOut::TokenMajor,
-                        y,
-                    },
-                )
-            }
+            gpu.q8f32().enqueue_q8_0_gemv_q32(
+                stream,
+                Q8_0GemvQ32Args {
+                    qs,
+                    d,
+                    x,
+                    m,
+                    fault: gpu.unlabelled_sink(),
+                    y,
+                },
+            )
         }
         SiteTy::F32 => g32.enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, x, m, y),
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => Err(GpuError::shape(

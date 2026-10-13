@@ -88,9 +88,12 @@
 //!   step-1,024 set prefilled on the pass path (128 units of eight, bit for
 //!   bit the one-token path) and as one ubatch of 1,024 (the wide arm), each
 //!   from zero stores: layer 0's recurrent state and conv ring within
-//!   [`U_L0_REL`] of the pass run's; every layer's store distance and the
-//!   prefill's last logits printed, and (d) prints each layer's store
-//!   distance between the two runs beside its distances from ik.
+//!   [`U_L0_REL`] of the pass run's, and each run's conv ring rows within
+//!   [`HOST_RULE_REL`] of the host's rule for the `attn_qkv` site's declared
+//!   form (a Q8_0 site's 8-bit codes of 32 values, on both arms); every
+//!   layer's store distance and the prefill's last logits printed, and (d)
+//!   prints each layer's store distance between the two runs beside its
+//!   distances from ik.
 //! - (d) both prefills against ik's state after its 1,024-token prompt batch
 //!   (the set's `cache_s_lL`, `cache_k_lL`, `cache_v_lL`): each layer's
 //!   store distance from ik's, the ubatch run's over the pass run's, within
@@ -447,7 +450,10 @@ mod gate {
     /// against the pass run's (`‖ubatch − pass‖ / ‖pass‖`). Layer 0's input is
     /// the same bits on both paths (the embedding rows; `rms_norm` then the
     /// GEMM quantizer write the bytes `norm_quant` writes, gate_qwen3moe's
-    /// premise for the same kernels), so only its four projections differ,
+    /// premise for the same kernels), and every site of layer 0 reads its
+    /// declared activation form on both arms (`SiteTy::reads`: q8_1 blocks of
+    /// 128 for a K-quant, q8 blocks of 32 for a Q8_0 site; the host-rule
+    /// clause below holds the premise), so only its four projections differ,
     /// each within its sum's rounding of the exact dot of the same codes:
     /// about 1.2e-6 of `Σ |terms|` at K = 2,048, some four times a value, so
     /// Δ ≤ 1e-5 of a row (gate_qwen3moe's GEMM_L0_REL note). The ring holds
@@ -460,6 +466,21 @@ mod gate {
     /// fault in layer 0 (β read from α's weights, a token's position off)
     /// reads an error of order one.
     const U_L0_REL: f64 = 1e-4;
+
+    /// PIN(2026-10-13): the band of (u)'s host-rule clause, a conv ring row of
+    /// layer 0 against the host's f64 dot of the file's `attn_qkv` rows with
+    /// the 8-bit/32 form of the normed embedding (a scale `amax/127` and codes
+    /// `round(x/d)` a block of 32), each run's own rows (`‖run − host‖ /
+    /// ‖host‖`). Each arm's launch evaluates that dot as exact integer sums
+    /// per block times two scales in f32, so it differs from the host's by the
+    /// f32 sum's rounding: some 1e-7 of the rows' norm (udnarrow measured
+    /// 1.1e-7 and 1.4e-7 on the UD file, layer 0's ring of the last four
+    /// positions), at most a few 1e-6 of a value where terms cancel by four.
+    /// The other rule (the f32 rows) sits 3.0e-3 from the 8-bit one on the
+    /// same rows: a path that reads its sites in another form than the other
+    /// reads 3e-3 and fails this band by three orders; 1e-6 is ten times the
+    /// measured error.
+    const HOST_RULE_REL: f64 = 1e-6;
 
     /// PIN(2026-09-27): (d)'s bound on the step at position 1,024 free-running
     /// from each run's own state — each layer's output distance from ik's and
@@ -1368,11 +1389,240 @@ mod gate {
         state_rel / gap.max(in_rel).max(f64::MIN_POSITIVE)
     }
 
+    /// The router test the forced arm and the free clause read: a token whose
+    /// chosen set differs from ik's is a near tie when ik's own margin between
+    /// its eighth pick and the best expert it left lies within twice our
+    /// logits' largest error at that token.
+    fn router_tie(margin: f32, err: f32) -> bool {
+        margin <= 2.0 * err
+    }
+
+    /// The router decisions of a free-running chain, read by a probe: the
+    /// chain's own layer outputs `rows` (`[layer][token · HIDDEN]`, from the
+    /// layer taps) fed to a whole-card load's layers, each layer's pass over
+    /// the five rows from a zero state on the chain's input to it (ik's
+    /// embedding for layer 0, the chain's previous output above). The probe's
+    /// mixer and router run the chain's kernels on the chain's own input, so
+    /// its slots and logits are the chain's; a placed load differs from the
+    /// probe in its experts' arithmetic alone.
+    struct Routes {
+        moe: Vec<MoeShape>,
+        t_n: usize,
+        /// Per layer, the router's slots `[t][top_k + 1]`.
+        ids: Vec<Vec<u32>>,
+        /// Per layer, the router's logits `[t][experts + 1]`.
+        logits: Vec<Vec<f32>>,
+        /// The probe's layer outputs against the chain's: worst distance,
+        /// layers bit for bit, layers.
+        agree: (f64, usize, usize),
+    }
+
+    fn route_probe(t_n: usize, rows: &[Vec<f32>]) -> Result<Routes, GateError> {
+        let mut m = open(CTX, KvQ8::F16)?;
+        m.set_mode(StepMode::Eager);
+        fresh(&mut m)?;
+        let man = ik_set("free: our router decisions on the chain's rows", Set::Batch)?;
+        let embd = tap(&man, "inp_embd")?;
+        let embd =
+            last_rows(&embd, HIDDEN, t_n).ok_or("inp_embd holds fewer rows than the batch")?;
+        let n = m.layers().len();
+        let Gains { moe, .. } = Gains::read(n)?;
+        let mut r = Routes {
+            moe,
+            t_n,
+            ids: Vec::new(),
+            logits: Vec::new(),
+            agree: (0.0, 0, 0),
+        };
+        for l in 0..n {
+            let x_in: &[f32] = if l == 0 { embd } else { &rows[l - 1] };
+            let run = m.layer_rows(l, x_in, 0)?;
+            let want = &rows[l];
+            r.agree.0 = worse(r.agree.0, rel_to(&run.ffn.l_out, want));
+            r.agree.1 += usize::from(
+                run.ffn
+                    .l_out
+                    .iter()
+                    .zip(want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+            );
+            r.agree.2 += 1;
+            r.ids.push(run.ffn.ids);
+            r.logits.push(run.ffn.logits);
+        }
+        Ok(r)
+    }
+
+    /// A router site of a chain whose chosen set differs from ik's.
+    struct RouteFlip {
+        layer: usize,
+        token: usize,
+        ours: Vec<u32>,
+        theirs: Vec<i32>,
+        margin: f32,
+        err: f32,
+        tie: bool,
+    }
+
+    /// A chain's router sites against ik's, over the rows ik kept.
+    struct RouteSites {
+        sites: usize,
+        flips: Vec<RouteFlip>,
+        /// Sites whose ids are not the top set of the chain's own logits.
+        inconsistent: Vec<(usize, usize)>,
+    }
+
+    fn route_sites(man: &RefManifest, c: &Routes) -> Result<RouteSites, GateError> {
+        let mut out = RouteSites {
+            sites: 0,
+            flips: Vec::new(),
+            inconsistent: Vec::new(),
+        };
+        for (l, shape) in c.moe.iter().enumerate() {
+            let (n_expert, n_used) = (shape.experts as usize, shape.top_k as usize);
+            let (slots, row) = (n_used + 1, n_expert + 1);
+            let logits = tap(man, &format!("ffn_moe_logits-{l}"))?;
+            let kept = logits.len() / n_expert;
+            let trow = man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
+            let ids = topk_ids_logical_within(man, trow, shape.experts)?;
+            if kept == 0
+                || kept > c.t_n
+                || kept * n_expert != logits.len()
+                || ids.len() != kept * n_used
+            {
+                return Err(format!(
+                    "layer {l}: {} router logits and {} ids for {} rows",
+                    logits.len(),
+                    ids.len(),
+                    c.t_n
+                )
+                .into());
+            }
+            for k in 0..kept {
+                let t = c.t_n - kept + k;
+                let ours_lg = &c.logits[l][t * row..t * row + n_expert];
+                let ours = &c.ids[l][t * slots..t * slots + n_used];
+                let theirs = &ids[k * n_used..(k + 1) * n_used];
+                let lg = &logits[k * n_expert..(k + 1) * n_expert];
+                out.sites += 1;
+                let low = ours
+                    .iter()
+                    .map(|&e| ours_lg.get(e as usize).copied().unwrap_or(f32::NAN))
+                    .fold(f32::INFINITY, f32::min);
+                let high = (0..n_expert)
+                    .filter(|&e| !ours.contains(&(e as u32)))
+                    .map(|e| ours_lg[e])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let consistent = low >= high;
+                if !consistent {
+                    out.inconsistent.push((l, t));
+                }
+                if ours.iter().all(|&e| theirs.contains(&(e as i32))) {
+                    continue;
+                }
+                let min_in = theirs
+                    .iter()
+                    .map(|&e| lg[e as usize])
+                    .fold(f32::INFINITY, f32::min);
+                let max_out = (0..n_expert)
+                    .filter(|&e| !theirs.contains(&(e as i32)))
+                    .map(|e| lg[e])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let err = ours_lg
+                    .iter()
+                    .zip(lg)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                out.flips.push(RouteFlip {
+                    layer: l,
+                    token: t,
+                    ours: ours.to_vec(),
+                    theirs: theirs.to_vec(),
+                    margin: min_in - max_out,
+                    err,
+                    tie: router_tie(min_in - max_out, err),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The rows `[layer][token]` a near-tie flip leaves unheld: the flipped
+    /// token from its layer's output on, and every later token at the deeper
+    /// layers (their mixers read the flipped token's state and keys); earlier
+    /// tokens never see it.
+    fn held_rows(n: usize, t_n: usize, flips: &[RouteFlip]) -> Vec<Vec<bool>> {
+        let mut held = vec![vec![true; t_n]; n];
+        for f in flips.iter().filter(|f| f.tie) {
+            for row in &mut held[f.layer..] {
+                row[f.token] = false;
+            }
+            for row in held.iter_mut().skip(f.layer + 1) {
+                for h in &mut row[f.token + 1..] {
+                    *h = false;
+                }
+            }
+        }
+        held
+    }
+
+    /// PIN(2026-10-13): the fixture tier's free clause leaves unheld the rows a
+    /// router near-tie flip carries ([`held_rows`]); three bounds keep it a bug
+    /// catcher. [`router_tie`] is necessary for any flip the logits' error
+    /// explains: for an exchanged pair (a ours only, b ik's only) ik's gap
+    /// ik[b] − ik[a] is at least its margin, and at most |Δa| + |Δb| when
+    /// ours[a] ≥ ours[b], which holds when our ids are the top set of our
+    /// logits; so margin ≤ 2 · our largest error. That proviso is checked: a
+    /// site whose ids are not the top set of its own logits is red, which
+    /// keeps a lane swap red where the margin is small. Derivation of the
+    /// bounds, from
+    /// today's nine free runs (the batch set, 4 layers × 5 tokens, 16 rows and
+    /// sites ik kept; the base fixture and the variants `unjoined` and
+    /// `unjoinedq6`, each at the whole-card, the placed and the placed no-host
+    /// load): the base fixture holds 11, 12 and 11 of 16 rows with 5, 4 and 5
+    /// flips; both variants hold 4 of 16 (25 %: layer 0 of tokens 1 to 4) with
+    /// 8 flips on all three loads, token 0's flip at layer 0 (ik's margin
+    /// 1.77e-3 under our logits' error 2.66e-2, a coin the 8-bit/32 rule threw
+    /// where the f32-row rule held 15 of 16 with 1 flip) carrying every later
+    /// row. A broken router flips about every site (16: a wrong set shares
+    /// about 0.25 of its 8 experts with ik's), today's worst is 8, so the cap
+    /// is 12, three quarters of the sites. The floor is 20 %: 25 % is the least
+    /// the rule leaves (a layer-0 flip of token 0 keeps four rows), 20 % refuses
+    /// one row less (3 of 16) and a 25 % floor would leave no room. The cost:
+    /// on the variants the clause holds layer 0 alone; layers 1 to 3 are held
+    /// by the forced arm, per layer on ik's own input. The real tier holds
+    /// every row.
+    const FREE_COVER_MIN: f64 = 0.20;
+    /// The most near-tie flips a set may carry (see [`FREE_COVER_MIN`]).
+    const FREE_FLIPS_MAX: usize = 12;
+    /// PIN(2026-10-13): the probe's layer outputs against a card-only load's
+    /// chain: the same kernels on the same input, bit for bit on the
+    /// whole-card load and 4.5e-8 on the placed no-host load of the base
+    /// fixture (its sums run in the placed walk's order) in today's runs; 1e-6
+    /// is twenty times the larger.
+    const FREE_PROBE_CARD: f64 = 1e-6;
+    /// PIN(2026-10-13): the same against a load whose host tier runs experts:
+    /// their arithmetic is the host's own, 5.1e-3 to 5.5e-3 in today's six
+    /// runs; 2e-2 is four times the larger.
+    const FREE_PROBE_HOST: f64 = 2e-2;
+
+    /// The free-running clause: every layer's output of the one-token
+    /// chain against ik's `l_out-L` within [`FREE_BAND`], and the last
+    /// position's argmax. In the fixture tier the rows a near-tie router flip
+    /// carries are not held ([`held_rows`]; the flip is read from the chain's
+    /// own router decisions by [`route_probe`], tested by [`router_tie`],
+    /// printed, and counted against [`FREE_FLIPS_MAX`]); the clause is red when
+    /// a flip is no near tie, when a site's ids are not the top set of its own
+    /// logits, when the held rows fall below [`FREE_COVER_MIN`] of the
+    /// rows ik kept, or when the probe does not replay the chain's layers
+    /// within `probe_rel` ([`FREE_PROBE_EXACT`], [`FREE_PROBE_HOST`]). The real
+    /// tier holds every row.
     fn free(
         m: &mut Qwen35moeModel,
         which: &str,
         toks: &[u32],
         decode: &PathRun,
+        probe_rel: f64,
     ) -> Result<bool, GateError> {
         let man = &ik_oracle(
             &format!("{which}free: every layer's output and the last argmax"),
@@ -1388,33 +1638,131 @@ mod gate {
         m.set_layer_taps(true)?;
         fresh(m)?;
         let t_n = toks.len();
-        let mut per_layer = vec![0.0f64; n];
+        let mut rel = vec![vec![None::<f64>; t_n]; n];
+        let mut chain_rows: Vec<Vec<f32>> = vec![Vec::new(); n];
         for (t, &tok) in toks.iter().enumerate() {
             m.step(&[tok])?;
             let taps = m.layer_taps()?;
-            for ((worst, ik), got) in per_layer.iter_mut().zip(&ik_out).zip(&taps) {
+            for (l, (ik, got)) in ik_out.iter().zip(&taps).enumerate() {
+                chain_rows[l].extend_from_slice(got);
                 let kept = ik.len() / HIDDEN;
                 let Some(i) = (t + kept).checked_sub(t_n) else {
                     continue;
                 };
-                *worst = worse(*worst, rel_to(got, &ik[i * HIDDEN..(i + 1) * HIDDEN]));
+                rel[l][t] = Some(rel_to(got, &ik[i * HIDDEN..(i + 1) * HIDDEN]));
             }
         }
         m.set_layer_taps(false)?;
         m.set_mode(StepMode::Graph);
         let ours = decode.logits.last().ok_or("no decode logits")?;
         let top = argmax(ours);
-        let worst = per_layer.iter().copied().fold(0.0f64, worse);
+        let all_rows = |l: usize| rel[l].iter().flatten().copied().fold(0.0f64, worse);
+        let per_layer: Vec<f64> = (0..n).map(all_rows).collect();
         // The head reads the last position of the last layer's output, the one
         // row ik keeps of that layer.
         let head_in = *per_layer.last().ok_or("the model holds no layer")?;
         let (argmax_ok, argmax_line) = head_argmax(ik_last, top, head_in);
-        for (l, &e) in per_layer.iter().enumerate() {
+        let chain = match cfg().tier {
+            Tier::Real => None,
+            Tier::Fixture => Some(route_probe(t_n, &chain_rows)?),
+        };
+        let sites = chain.as_ref().map(|c| route_sites(man, c)).transpose()?;
+        let held = match &sites {
+            Some(s) => held_rows(n, t_n, &s.flips),
+            None => vec![vec![true; t_n]; n],
+        };
+        let held_worst: Vec<f64> = (0..n)
+            .map(|l| {
+                (0..t_n)
+                    .filter(|&t| held[l][t])
+                    .filter_map(|t| rel[l][t])
+                    .fold(0.0f64, worse)
+            })
+            .collect();
+        let counts = |keep: &dyn Fn(usize, usize) -> bool| -> Vec<usize> {
+            (0..n)
+                .map(|l| {
+                    (0..t_n)
+                        .filter(|&t| rel[l][t].is_some() && keep(l, t))
+                        .count()
+                })
+                .collect()
+        };
+        let (all_n, held_n) = (counts(&|_, _| true), counts(&|l, t| held[l][t]));
+        for (l, &e) in held_worst.iter().enumerate() {
             if l % 8 == 0 || l == n - 1 || e > FREE_BAND {
                 println!("free layer={l} l_out_rel={e:.3e}");
             }
         }
-        let ok = worst <= FREE_BAND && argmax_ok;
+        let worst = held_worst.iter().copied().fold(0.0f64, worse);
+        let mut ok = worst <= FREE_BAND && argmax_ok;
+        if let (Some(s), Some(c)) = (&sites, &chain) {
+            let set = Set::Batch.name();
+            for f in &s.flips {
+                let only_ours: Vec<u32> = f
+                    .ours
+                    .iter()
+                    .copied()
+                    .filter(|&e| !f.theirs.contains(&(e as i32)))
+                    .collect();
+                let only_ik: Vec<i32> = f
+                    .theirs
+                    .iter()
+                    .copied()
+                    .filter(|&e| !f.ours.contains(&(e as u32)))
+                    .collect();
+                println!(
+                    "free {which}flip set={set} layer={} token={}: ours {only_ours:?} ik {only_ik:?} \
+                     (sets {:?} / {:?}), ik margin {:.3e}, our logits' error {:.3e}: {}",
+                    f.layer,
+                    f.token,
+                    f.ours,
+                    f.theirs,
+                    f.margin,
+                    f.err,
+                    if f.tie {
+                        "a near tie (counted)"
+                    } else {
+                        "FAIL: not a near tie"
+                    }
+                );
+                ok &= f.tie;
+            }
+            for &(l, t) in &s.inconsistent {
+                println!(
+                    "free {which}route layer={l} token={t}: the ids are not the top set of the \
+                     chain's own logits FAIL"
+                );
+            }
+            ok &= s.inconsistent.is_empty();
+            let (held_all, rows_all) = (held_n.iter().sum::<usize>(), all_n.iter().sum::<usize>());
+            let cover = held_all as f64 / rows_all.max(1) as f64;
+            let ties = s.flips.iter().filter(|f| f.tie).count();
+            let (cover_ok, cap_ok, probe_ok) = (
+                cover >= FREE_COVER_MIN,
+                ties <= FREE_FLIPS_MAX,
+                c.agree.0 <= probe_rel,
+            );
+            println!(
+                "free {which}coverage set={set}: held {held_all} of {rows_all} rows ({:.0} %, floor \
+                 {:.0} %) {}; per layer held {held_n:?} of {all_n:?}; route sites {}, flips {} \
+                 (cap {FREE_FLIPS_MAX}) {}, inconsistent {}; the probe's layer outputs against \
+                 the chain's: worst rel {:.3e} (band {probe_rel:.0e}), {} of {} layers bit \
+                 for bit {}",
+                100.0 * cover,
+                100.0 * FREE_COVER_MIN,
+                verdict(cover_ok),
+                s.sites,
+                s.flips.len(),
+                verdict(cap_ok),
+                s.inconsistent.len(),
+                c.agree.0,
+                c.agree.1,
+                c.agree.2,
+                verdict(probe_ok),
+            );
+            ok &= cover_ok && cap_ok && probe_ok;
+        }
         println!(
             "free: {t_n} tokens {toks:?}, worst l_out_rel={worst:.3e} (band {FREE_BAND:.2}); last \
              position {argmax_line} logits_rel={:.3e} (printed) {}",
@@ -1787,7 +2135,7 @@ mod gate {
                     .zip(lg)
                     .map(|(&a, &b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
-                let tie = min_in - max_out <= 2.0 * err;
+                let tie = router_tie(min_in - max_out, err);
                 ok &= tie;
                 flipped.push(t);
                 println!(
@@ -2233,6 +2581,115 @@ mod gate {
         }
     }
 
+    /// (u)'s host-rule clause: layer 0's conv ring rows (its `attn_qkv`
+    /// projection of the last [`RING_ROWS`] positions of `prompt`) from the
+    /// pass run and the ubatch run, each against the host's dot of the file's
+    /// rows with the normed embedding in the form the site declares, within
+    /// [`HOST_RULE_REL`]; the host's other form (the f32 rows) is printed
+    /// beside. Run on a Q8_0 site (the 8-bit rule of 32 values, both arms);
+    /// a K-quant site reads blocks of 128 and is named, not run.
+    fn l0_host_rule(
+        label: &str,
+        prompt: &[u32],
+        (pass, ub): (&StoreHost, &StoreHost),
+    ) -> Result<bool, GateError> {
+        let split = open_model()?;
+        let wqkv = HostMat::of(&split, "blk.0.attn_qkv.weight")?;
+        if wqkv.ty != gguf::GgmlType::Q8_0 {
+            println!(
+                "{label}wide layer=0 host rule: attn_qkv is {}, read as q8_1 blocks of 128 on \
+                 both arms; the 8-bit/32 rule is not run (printed)",
+                wqkv.ty
+            );
+            return Ok(true);
+        }
+        let (StoreHost::Rec { ring: ring_p, .. }, StoreHost::Rec { ring: ring_u, .. }) = (pass, ub)
+        else {
+            return Err("layer 0 holds no recurrent store".into());
+        };
+        let embd = HostMat::of(&split, &names::token_embd())?;
+        let gain = split_f32(&split, "blk.0.attn_norm.weight", HIDDEN)?;
+        let eps = f64::from(Hparams::read(&split)?.rms_eps);
+        let n = prompt.len();
+        let ch = ring_p.len() / RING_ROWS;
+        if n < RING_ROWS
+            || embd.k != HIDDEN
+            || wqkv.k != HIDDEN
+            || ring_u.len() != ring_p.len()
+            || wqkv.data.len() / wqkv.row_bytes != ch
+        {
+            return Err(format!(
+                "host rule: {n} ids, embedding rows of {}, attn_qkv {} x {} rows, rings of {} and \
+                 {} values over {ch} channels",
+                embd.k,
+                wqkv.k,
+                wqkv.data.len() / wqkv.row_bytes,
+                ring_p.len(),
+                ring_u.len()
+            )
+            .into());
+        }
+        // Each slot's position, its normed row as f32 (the form of the f32
+        // rows) and as 32-value 8-bit codes times their scale.
+        let (mut xf, mut xq) = (Vec::new(), Vec::new());
+        let mut row = vec![0.0f32; HIDDEN];
+        for s in 0..RING_ROWS {
+            let p = (n - RING_ROWS..n)
+                .find(|p| p % RING_ROWS == s)
+                .ok_or("host rule: a ring slot with no position")?;
+            let t = prompt[p] as usize;
+            let bytes = embd
+                .data
+                .get(t * embd.row_bytes..(t + 1) * embd.row_bytes)
+                .ok_or("host rule: a token past the embedding")?;
+            gguf::quant::dequant_row(embd.ty, bytes, &mut row)
+                .map_err(|e| format!("dequant {}: {e}", embd.ty))?;
+            let ss = row.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / HIDDEN as f64;
+            let r = 1.0 / (ss + eps).sqrt();
+            let xn: Vec<f32> = row
+                .iter()
+                .zip(&gain)
+                .map(|(&v, &g)| (f64::from(v) * r * f64::from(g)) as f32)
+                .collect();
+            let mut q = vec![0.0f64; HIDDEN];
+            for (blk, qb) in xn.chunks(32).zip(q.chunks_mut(32)) {
+                let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                for (o, &v) in qb.iter_mut().zip(blk) {
+                    *o = f64::from((v / d).round().clamp(-127.0, 127.0)) * f64::from(d);
+                }
+            }
+            xf.push(xn.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>());
+            xq.push(q);
+        }
+        let mut yf = vec![0.0f32; RING_ROWS * ch];
+        let mut yq = vec![0.0f32; RING_ROWS * ch];
+        let mut w = vec![0.0f32; HIDDEN];
+        for r in 0..ch {
+            let bytes = &wqkv.data[r * wqkv.row_bytes..(r + 1) * wqkv.row_bytes];
+            gguf::quant::dequant_row(wqkv.ty, bytes, &mut w)
+                .map_err(|e| format!("dequant {}: {e}", wqkv.ty))?;
+            for s in 0..RING_ROWS {
+                let dot =
+                    |x: &[f64]| -> f64 { w.iter().zip(x).map(|(&a, &b)| f64::from(a) * b).sum() };
+                yf[s * ch + r] = dot(&xf[s]) as f32;
+                yq[s * ch + r] = dot(&xq[s]) as f32;
+            }
+        }
+        let (pq, uq) = (rel_to(ring_p, &yq), rel_to(ring_u, &yq));
+        let ok = worse(pq, uq) <= HOST_RULE_REL;
+        println!(
+            "{label}wide layer=0 host rule (attn_qkv {}, {RING_ROWS} ring rows of {ch}): pass \
+             {pq:.3e} ubatch {uq:.3e} against the host's 8-bit/32 rule (band {HOST_RULE_REL:.0e}) \
+             {}; against the host's f32-rows rule pass {:.3e} ubatch {:.3e} (printed)",
+            wqkv.ty,
+            verdict(ok),
+            rel_to(ring_p, &yf),
+            rel_to(ring_u, &yf)
+        );
+        Ok(ok)
+    }
+
     /// (u) and (d) on `m`, whose ubatch is `ubatch`: the step set's prompt on
     /// the pass path (the one-token path's bits) and as the ubatch walk, whose
     /// units are all wide (`label` prefixes the clause's lines). The whole
@@ -2281,6 +2738,7 @@ mod gate {
                 );
             }
         }
+        ok &= l0_host_rule(label, prompt, (&pass.stores[0], &ub.stores[0]))?;
         println!(
             "{label}wide prefill: token ours ubatch={} pass={}, last logits_rel={:.3e} (printed)",
             ub.next,
@@ -3552,7 +4010,7 @@ mod gate {
             &decode,
         );
         // (o2)
-        ok &= free(&mut m, "(o2) ", toks, &decode)?;
+        ok &= free(&mut m, "(o2) ", toks, &decode, FREE_PROBE_HOST)?;
         m.set_mode(StepMode::Graph);
         fresh(&mut m)?;
         let plan_p = m.prefill_plan(toks.len(), PrefillPath::Auto)?;
@@ -3663,7 +4121,7 @@ mod gate {
             decode.tokens,
             verdict(same)
         );
-        let banded = free(&mut m, "(o7) ", toks, &decode)?;
+        let banded = free(&mut m, "(o7) ", toks, &decode, FREE_PROBE_CARD)?;
         Ok(same && banded)
     }
 
@@ -4758,7 +5216,7 @@ mod gate {
         let toks = batch_ids()?;
         let (p_ok, decode) = paths(&mut m, &toks)?;
         ok &= p_ok;
-        ok &= free(&mut m, "(c) ", &toks, &decode)?;
+        ok &= free(&mut m, "(c) ", &toks, &decode, FREE_PROBE_CARD)?;
         let gains = Gains::read(m.layers().len())?;
         m.set_mode(StepMode::Eager);
         fresh(&mut m)?;

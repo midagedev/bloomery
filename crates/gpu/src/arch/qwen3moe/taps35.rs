@@ -13,6 +13,7 @@ use crate::model::{GpuModel, MAX_PASS_ROWS, StepMode};
 use crate::tensor::WindowMut;
 use crate::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
+use std::cell::RefCell;
 
 /// What an attention layer's mixer leaves for its `m` rows, token-major:
 /// the query projection's `[q | gate]` rows (`m · 16 · 512`), the normed and
@@ -177,21 +178,42 @@ impl Body35 {
     }
 
     /// The pass arena's first `m` rows of every intermediate the last layer
-    /// run left, read back, and its output residual (`x`).
-    fn read_run(&self, gpu: &Gpu, l: usize, m: usize) -> Result<Layer35Run, GpuError> {
+    /// run left, read back, and its output residual (`x`). An attention
+    /// layer's queries are `q_tap`, the rows the layer run took before its out
+    /// gate: once `attn_output` is not a K-quant the gate writes `fa · σ(gate)`
+    /// over the arena's `q_out`, so that buffer is no longer the queries and
+    /// is not read here; a run that took no tap is refused by name.
+    fn read_run(
+        &self,
+        gpu: &Gpu,
+        l: usize,
+        m: usize,
+        q_tap: Option<Vec<f32>>,
+    ) -> Result<Layer35Run, GpuError> {
         const WHAT: &str = "qwen35moe::read_run";
         let stream = gpu.stream();
         let a = &self.a;
         let d = a.dims;
         let mixer = match &self.plans[l].mixer {
             MixerPlan::Gqa(_) => {
-                let q_out = a
-                    .q_out
-                    .as_ref()
-                    .ok_or(GpuError::state(WHAT, "the gated queries' buffer"))?;
+                let q = q_tap.ok_or(GpuError::state(
+                    WHAT,
+                    "the attention layer's queries from before its out gate (q_out holds \
+                     fa · σ(gate) once the gate ran; the run takes them through Ctx::q_tap)",
+                ))?;
+                if q.len() != m * d.attn_len() {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{} query values tapped; {m} rows of {} were run",
+                            q.len(),
+                            d.attn_len()
+                        ),
+                    ));
+                }
                 Mixer35Run::Attention(Gqa35Run {
                     qg: head_of(stream, &a.q, m * d.q_rows)?,
-                    q: head_of(stream, q_out, m * d.attn_len())?,
+                    q,
                     k: head_of(stream, &a.k, m * d.kv_len())?,
                     v: head_of(stream, &a.v, m * d.kv_len())?,
                     fa: head_of(stream, &a.attn, m * d.attn_len())?,
@@ -292,8 +314,13 @@ impl GpuModel<Body35> {
             rope_table(&b.rope, b.seq_rope.as_ref()),
         )?;
         let io = b.rp.io(m)?;
+        let q_tap = RefCell::new(None);
+        let c = Ctx {
+            q_tap: Some(&q_tap),
+            ..c
+        };
         dispatch::layer(&c, b.stores[slot].as_mut(), &mut b.a, &io, m, false, None)?;
-        b.read_run(gpu, slot, m)
+        b.read_run(gpu, slot, m, q_tap.into_inner())
     }
 
     /// Run layer `l`'s FFN half alone eagerly at the rows of `ffn_inp` (1 to

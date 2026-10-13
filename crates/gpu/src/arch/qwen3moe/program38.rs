@@ -80,12 +80,12 @@ use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::MtpKernels;
 use crate::ple::{PleConvArgs, PleGateArgs, PleKernels};
-use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::q38::{
     CardSharedAddArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
 };
 use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
 use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
+use crate::site::{self, SiteTy};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
@@ -276,7 +276,8 @@ pub(super) struct Ctx38<'a> {
 }
 
 impl Ctx38<'_> {
-    /// `y = W · x` for the Q8_0 weight `name` over `m` columns, token-major.
+    /// `y = W · x` for the Q8_0 weight `name` over `m` columns, token-major:
+    /// the Q8_0 site's gemv (`site::gemv`).
     pub(super) fn q8_gemv(
         &self,
         name: &str,
@@ -284,23 +285,7 @@ impl Ctx38<'_> {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let (qs, d) = q8(self.w, name)?;
-        let (q, stream) = (self.gpu.q8f32(), self.gpu.stream());
-        if m == 1 {
-            q.enqueue_q8_0_gemv(stream, qs, d, x, 1, y)
-        } else {
-            q.enqueue_q8_0_gemv_mcol(
-                stream,
-                Q8_0GemvMcolArgs {
-                    qs,
-                    d,
-                    x,
-                    m,
-                    out: GemvOut::TokenMajor,
-                    y,
-                },
-            )
-        }
+        site::gemv(self.gpu, &self.k.g32, (SiteTy::Q8_0, self.w, name), x, m, y)
     }
 
     /// `y = W · x` for the F32 weight `name` over `m` columns, row-major

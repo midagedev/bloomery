@@ -43,6 +43,7 @@ use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
 use model::arch::qwen3moe::names::token_embd;
+use std::cell::RefCell;
 
 /// What every launch of one layer reads besides the arena and the store:
 /// the engine, the weights, the layer's plan, the kernels, the flash pass,
@@ -59,6 +60,10 @@ pub(super) struct Ctx<'a> {
     pub(super) table: &'a DeviceBuffer<f32>,
     pub(super) layer: usize,
     pub(super) sink: FaultSink,
+    /// Where [`gated_256`] leaves the queries as the flash read them, before
+    /// the out gate writes over their buffer: set by a gate's eager layer
+    /// run (`GpuModel::layer_rows`), `None` on every other path.
+    pub(super) q_tap: Option<&'a RefCell<Option<Vec<f32>>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -82,6 +87,7 @@ impl<'a> Ctx<'a> {
             table,
             layer,
             sink: gpu.layer_sink(layer)?,
+            q_tap: None,
         })
     }
 }
@@ -909,6 +915,13 @@ fn gated_256(
         n.flash,
         c.mma,
     )?;
+    if let Some(tap) = c.q_tap {
+        // The out gate below writes over `q_out` for any `attn_output` that is
+        // not a K-quant; the queries are read here, once the flash has them.
+        let mut q = q_out.to_host_vec(stream)?;
+        q.truncate(m * d.attn_len());
+        *tap.borrow_mut() = Some(q);
+    }
     if !n.o_ty.kquant() {
         return q35.q38.enqueue_out_gate(
             stream,
