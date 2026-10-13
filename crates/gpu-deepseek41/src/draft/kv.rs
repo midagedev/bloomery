@@ -208,7 +208,12 @@ pub(super) fn used_words(
     row_words: usize,
 ) -> usize {
     let (full, rest) = (rows / GROUP, rows % GROUP);
-    full * group_words + if rest == 0 { 0 } else { tail_word + rest * row_words }
+    full * group_words
+        + if rest == 0 {
+            0
+        } else {
+            tail_word + rest * row_words
+        }
 }
 
 impl Layout {
