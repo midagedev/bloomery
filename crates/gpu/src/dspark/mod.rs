@@ -271,12 +271,34 @@ impl<L: DraftLayers> DsparkBody<L> {
                 shape.markov_rank
             )));
         }
-        if let DraftVocab::Reduced { .. } = shape.vocab {
-            return Err(refuse(
-                "a reduced vocabulary: the Markov entry for a head of other rows than the \
-                 target's is not written"
-                    .into(),
-            ));
+        // The owner maps the head's ids through the shape's map and the head's
+        // Markov step through its device map: the two must be one map.
+        match (&shape.vocab, &head.to_target) {
+            (DraftVocab::Full { .. }, None) => {}
+            (DraftVocab::Reduced { to_target, n_target }, Some(map)) => {
+                if head.markov_w1.rows() != *n_target {
+                    return Err(refuse(format!(
+                        "markov_w1 of {} rows for a reduced vocabulary over the target's {n_target} \
+                         ids",
+                        head.markov_w1.rows()
+                    )));
+                }
+                if map.to_host_vec(gpu.stream())? != *to_target {
+                    return Err(refuse(
+                        "the head's draft-to-target map differs from the shape's".into(),
+                    ));
+                }
+            }
+            (DraftVocab::Full { .. }, Some(_)) => {
+                return Err(refuse(
+                    "a draft-to-target map on the head of a full vocabulary".into(),
+                ));
+            }
+            (DraftVocab::Reduced { .. }, None) => {
+                return Err(refuse(
+                    "a reduced vocabulary whose head carries no draft-to-target map".into(),
+                ));
+            }
         }
         if shape.rows(1) > L::MAX_ROWS {
             return Err(refuse(format!(
