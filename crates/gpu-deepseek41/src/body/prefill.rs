@@ -121,7 +121,7 @@ use model::moe::UNION_MAX_COLS;
 use bloomery_gpu::COL_GROUP;
 use bloomery_gpu::host::swap::{CallCfg, CallPick, CallReport};
 use bloomery_gpu::hybrid::BatchKey;
-use bloomery_gpu::media::{MediaBody, MediaSpan, check_spans};
+use bloomery_gpu::media::{CallRows, MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::weights::DevWeight;
 
 use super::ced::{Ced, Mode};
@@ -211,29 +211,28 @@ impl fmt::Debug for Span41<'_> {
 /// the rows the batches stage and the dead ranges every plan of the call
 /// takes.
 pub(crate) struct CallMedia<'a> {
-    /// The file's `n_embd`, the width of a row.
-    n_embd: usize,
-    /// Per span: its absolute positions and the common span over them, whose
-    /// `at` is absolute too.
-    spans: Vec<(Range<u32>, MediaSpan<'a>)>,
+    /// The spans' rows by absolute position: the common lookup, which the
+    /// batches stage by and which says whether a position is a media one.
+    rows: CallRows<'a>,
+    /// The spans' absolute position ranges, ascending and disjoint.
+    dead: Vec<Range<u32>>,
 }
 
 impl CallMedia<'_> {
     /// The spans' absolute position ranges, as the planner takes them: the
     /// call's dead positions.
     fn dead(&self) -> Vec<Range<u32>> {
-        self.spans.iter().map(|(at, _)| at.clone()).collect()
+        self.dead.clone()
     }
 
     /// Whether position `p` carries a media row.
     fn is_media(&self, p: u32) -> bool {
-        self.spans.iter().any(|(at, _)| at.contains(&p))
+        self.rows.row(p).is_some()
     }
 
     /// The row of position `p` (`n_embd` bf16 values); `None` off the spans.
     fn row(&self, p: u32) -> Option<&[u16]> {
-        let (_, span) = self.spans.iter().find(|(at, _)| at.contains(&p))?;
-        span.row(p as usize, self.n_embd)
+        self.rows.row(p)
     }
 }
 
@@ -616,7 +615,7 @@ fn feed_media(
     features: Option<FeatureRows<'_>>,
     observe: &mut BatchObserver<'_>,
 ) -> Result<u32, GpuError> {
-    let first = m.pos() as usize;
+    let first = m.pos();
     let call = m
         .body_parts(WHAT)
         .and_then(|(_, _, body)| body.check_media(first, ids, media))?;
@@ -1450,9 +1449,9 @@ impl Body {
     /// here: a span's rows come with its call or not at all.
     fn check_media<'a>(
         &self,
-        first: usize,
+        first: u32,
         ids: &[u32],
-        media: &[Span41<'a>],
+        media: &'a [Span41<'a>],
     ) -> Result<CallMedia<'a>, GpuError> {
         const MEDIA: &str = "deepseek41 prefill_media";
         if self.levers.prefill != PrefillMode::Batch {
@@ -1481,9 +1480,10 @@ impl Body {
             });
         }
         let n_embd = self.hp.n_embd;
+        let base = first as usize;
         let common: Vec<MediaSpan<'a>> = media.iter().map(|s| s.span.clone()).collect();
         check_spans(MEDIA, &common, ids.len(), n_embd)?;
-        let mut spans = Vec::with_capacity(media.len());
+        let mut dead = Vec::with_capacity(media.len());
         for Span41 { span, kinds } in media {
             let at = &span.at;
             if kinds.len() != at.len() {
@@ -1523,24 +1523,26 @@ impl Body {
                     ),
                 });
             }
-            let absolute = u32::try_from(first + at.start).map_err(|_| GpuError::Shape {
-                what: MEDIA,
-                detail: format!("a media position {} passes u32", first + at.start),
-            })?..u32::try_from(first + at.end).map_err(|_| {
-                GpuError::Shape {
+            let absolute =
+                u32::try_from(base + at.start).map_err(|_| GpuError::Shape {
                     what: MEDIA,
-                    detail: format!("a media position {} passes u32", first + at.end),
-                }
-            })?;
-            spans.push((
-                absolute,
-                MediaSpan {
-                    at: first + at.start..first + at.end,
-                    rows: span.rows,
-                },
-            ));
+                    detail: format!("a media position {} passes u32", base + at.start),
+                })?..u32::try_from(base + at.end).map_err(|_| GpuError::Shape {
+                    what: MEDIA,
+                    detail: format!("a media position {} passes u32", base + at.end),
+                })?;
+            dead.push(absolute);
         }
-        Ok(CallMedia { n_embd, spans })
+        let rows = CallRows::new(
+            first,
+            n_embd,
+            media.iter().map(|s| (&s.span.at, s.span.rows)),
+        )
+        .map_err(|r| GpuError::Shape {
+            what: MEDIA,
+            detail: r.to_string(),
+        })?;
+        Ok(CallMedia { rows, dead })
     }
 
     /// Give every batch set of the held buffers that has no feature rows the

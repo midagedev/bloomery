@@ -617,6 +617,178 @@ mod gate {
 
     // ------------------------------------------------------------ host rules
 
+    /// The host's f32 to bf16 rounding (the preprocessing's), the one the device's [`f32_bf16`]
+    /// is held equal to.
+    fn rne_host(x: f32) -> u16 {
+        vision::preprocess::f32_to_bf16(x)
+    }
+
+    /// Whether bf16 bits `b` are a NaN.
+    fn bf16_nan(b: u16) -> bool {
+        b & 0x7FFF > 0x7F80
+    }
+
+    /// Whether the device's result `dev` and the host's `host` are the same rounding: equal bits,
+    /// or both NaN. A NaN differs in bits by design: the host returns the canonical 0x7FC0, the
+    /// device keeps the sign and the payload with the quiet bit set (0x0040).
+    fn rne_same(dev: u16, host: u16) -> bool {
+        dev == host || (bf16_nan(dev) && bf16_nan(host))
+    }
+
+    /// What a value of the edge set must round to.
+    enum Rne {
+        Bits(u16),
+        Nan,
+    }
+
+    /// The f32 to bf16 rounding of [`f32_bf16`] (the device's `f32_to_bf16_rne`, plain integer
+    /// code, run here on the host) against the host's [`rne_host`], on the host and with no
+    /// launch: the named edge values each against the result they must have, then every f32 bit
+    /// pattern (2³² of them) through both, stopping at the first that differs in bits and is not
+    /// a NaN on both sides.
+    fn rne_sweep() -> bool {
+        let edges: [(&str, u32, Rne); 8] = [
+            ("+0", 0x0000_0000, Rne::Bits(0x0000)),
+            ("-0", 0x8000_0000, Rne::Bits(0x8000)),
+            (
+                "NaN with its payload in the low 16 bits",
+                0x7F80_0001,
+                Rne::Nan,
+            ),
+            ("negative NaN", 0xFFC0_0001, Rne::Nan),
+            ("+inf", 0x7F80_0000, Rne::Bits(0x7F80)),
+            ("-inf", 0xFF80_0000, Rne::Bits(0xFF80)),
+            (
+                "largest finite, which rounds to +inf",
+                0x7F7F_FFFF,
+                Rne::Bits(0x7F80),
+            ),
+            ("smallest subnormal", 0x0000_0001, Rne::Bits(0x0000)),
+        ];
+        let mut edge_bad = 0usize;
+        for (name, bits, want) in &edges {
+            let x = f32::from_bits(*bits);
+            let (dev, host) = (f32_bf16(x), rne_host(x));
+            let ok = match want {
+                Rne::Bits(w) => dev == *w && host == *w,
+                Rne::Nan => bf16_nan(dev) && bf16_nan(host),
+            };
+            if !ok {
+                edge_bad += 1;
+                println!(
+                    "rule rne edge            {name} ({bits:#010x}): device {dev:#06x}, host {host:#06x} {}",
+                    verdict(false)
+                );
+            }
+        }
+        let mut first = None;
+        for bits in 0..=u32::MAX {
+            let x = f32::from_bits(bits);
+            let (dev, host) = (f32_bf16(x), rne_host(x));
+            if !rne_same(dev, host) {
+                first = Some((bits, dev, host));
+                break;
+            }
+        }
+        if let Some((bits, dev, host)) = first {
+            println!(
+                "rule rne sweep           first difference at f32 bits {bits:#010x}: device {dev:#06x}, host {host:#06x}"
+            );
+        }
+        let ok = edge_bad == 0 && first.is_none();
+        println!(
+            "rule rne host            {} named edges, then 2^32 f32 bit patterns through the device rule and the host's: {edge_bad} edges off, {} {}",
+            edges.len(),
+            first.map_or("every pattern equal (NaN as both NaN)".to_string(), |_| {
+                "first difference above".to_string()
+            }),
+            verdict(ok)
+        );
+        ok
+    }
+
+    /// The device rounds as the host does, on the card: `vis_rne_bits` maps raw f32 bit patterns
+    /// to `f32_to_bf16_rne` with no floating-point operation in front of it, so every branch of
+    /// the rounding sees the pattern as given (a NaN whose payload sits in the low 16 bits, a
+    /// subnormal). One launch over, in this order: the ties (a tie and the pattern one past it,
+    /// with the retained bit 0 and 1 and the carry into the exponent, under every finite
+    /// exponent but the subnormal one, both signs), ±0, the subnormals (smallest, largest and
+    /// their ties), the largest finite values, ±inf, NaNs with payloads in the low and the high
+    /// bits, then about a million bit patterns at a prime stride. Each result against
+    /// [`rne_host`], bits equal or both NaN, the first difference named. The host sweep holds the
+    /// source; this holds the code cuda-oxide made of it.
+    fn rne_device(
+        ctx: &std::sync::Arc<CudaContext>,
+        stream: &cuda_core::CudaStream,
+    ) -> Result<bool, GateError> {
+        use bloomery_gpu_vision::rope2d::RneBitsKernels;
+        use cuda_core::DeviceBuffer;
+        /// A prime, odd so `i · STRIDE` (mod 2³²) is distinct for every `i`; the products
+        /// spread over every exponent.
+        const STRIDE: u32 = 4093;
+        const STRIDED: u32 = 1_049_322;
+        const NEG: u32 = 0x8000_0000;
+        let mut bits: Vec<u32> = Vec::new();
+        for sign in [0, NEG] {
+            for exp in 1..=254u32 {
+                for hi in [0x00u32, 0x01, 0x7E, 0x7F] {
+                    for low in [0x8000u32, 0x8001] {
+                        bits.push(sign | (exp << 23) | (hi << 16) | low);
+                    }
+                }
+            }
+        }
+        let n_ties = bits.len();
+        bits.extend([0x0000_0000, NEG]);
+        for sign in [0, NEG] {
+            bits.extend([0x0000_0001u32, 0x007F_FFFF, 0x0000_8000, 0x0001_8000].map(|b| sign | b));
+        }
+        for sign in [0, NEG] {
+            bits.extend([0x7F7F_FFFFu32, 0x7F7F_8000, 0x7F7F_7FFF].map(|b| sign | b));
+        }
+        bits.extend([0x7F80_0000, 0xFF80_0000]);
+        bits.extend([
+            0x7F80_0001,
+            0x7F80_FFFF,
+            0x7FBF_0000,
+            0x7FC0_0000,
+            0xFFC0_0001,
+            0xFF80_0001,
+        ]);
+        let n_named = bits.len() - n_ties;
+        bits.extend((0..STRIDED).map(|i| i.wrapping_mul(STRIDE)));
+        let n = bits.len();
+        let dx = DeviceBuffer::from_host(stream, &bits)?;
+        let mut dy = DeviceBuffer::from_host(stream, &vec![0u16; n])?;
+        RneBitsKernels::load(ctx)?.enqueue(stream, n, &dx, &mut dy)?;
+        stream.synchronize()?;
+        let out = dy.to_host_vec(stream)?;
+        let first = bits
+            .iter()
+            .zip(&out)
+            .enumerate()
+            .find_map(|(i, (&b, &dev))| {
+                let host = rne_host(f32::from_bits(b));
+                (!rne_same(dev, host)).then_some((i, b, dev, host))
+            });
+        if let Some((i, b, dev, host)) = first {
+            println!(
+                "rule rne device          first difference at value {i} (f32 bits {b:#010x}): device {dev:#06x}, host {host:#06x}"
+            );
+        }
+        let ok = first.is_none();
+        println!(
+            "rule rne device          {n_ties} tie values, {n_named} named values and {STRIDED} strided bit patterns (stride {STRIDE}) rounded by one launch: {} {}",
+            if ok {
+                "every one equal to the host's (NaN as both NaN)"
+            } else {
+                "first difference above"
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// The GELU epilogue on every normal bf16 value in [−8, 8]: a GEMM of `K = 2` whose A rows
     /// are `(x, 0)` and whose B row 0 is `(1, 0)` puts each `x` exactly into column 0 of its row,
     /// so the epilogue sees every input once; column 0 against the host rule, `pin` values allowed
@@ -1053,7 +1225,9 @@ mod gate {
             want_launches
         );
         let hw = host_w(&file)?;
-        let mut ok = gelu_sweep(&ctx, &stream)?;
+        let mut ok = rne_sweep();
+        ok &= rne_device(&ctx, &stream)?;
+        ok &= gelu_sweep(&ctx, &stream)?;
         let images_dir =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/vision/images");
         let mut widest: HashMap<String, Stats> = HashMap::new();

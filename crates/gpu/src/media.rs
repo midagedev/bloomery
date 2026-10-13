@@ -39,18 +39,6 @@ impl std::fmt::Debug for MediaSpan<'_> {
     }
 }
 
-impl<'a> MediaSpan<'a> {
-    /// The row of position `p` (`n_embd` bf16 values); `None` off the span.
-    #[must_use]
-    pub fn row(&self, p: usize, n_embd: usize) -> Option<&'a [u16]> {
-        if !self.at.contains(&p) {
-            return None;
-        }
-        let i = p - self.at.start;
-        self.rows.get(i * n_embd..(i + 1) * n_embd)
-    }
-}
-
 /// What [`CallRows::new`] refuses.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RowsRefusal {

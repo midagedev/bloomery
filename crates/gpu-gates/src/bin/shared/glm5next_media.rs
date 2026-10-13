@@ -198,7 +198,7 @@ pub mod seat {
     use std::path::Path;
 
     use app::Session;
-    use bloomery_gpu::media::MediaSpan;
+    use bloomery_gpu::media::{MediaSpan, widen_bf16};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::vision_seat::{
         self, Flags, Image, Opened, PleImage, Resident, TextFacts,
@@ -296,11 +296,6 @@ pub mod seat {
         (ids, at)
     }
 
-    /// The bf16 value of `bits` as f32.
-    fn bf16(bits: u16) -> f32 {
-        f32::from_bits(u32::from(bits) << 16)
-    }
-
     /// `‖a − b‖ / ‖b‖`.
     fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
         let (mut num, mut den) = (0.0_f64, 0.0_f64);
@@ -382,8 +377,10 @@ pub mod seat {
                 .map(|(p, &start)| Image::of(start, p)),
         )?;
         let rows = encoded.rows();
-        let finite = rows.rows.iter().all(|&b| bf16(b).is_finite());
-        let alive = rows.rows.iter().any(|&b| bf16(b) != 0.0);
+        let mut wide = vec![0.0_f32; rows.rows.len()];
+        widen_bf16(&rows.rows, &mut wide);
+        let finite = wide.iter().all(|v| v.is_finite());
+        let alive = wide.iter().any(|&v| v != 0.0);
         println!(
             "(sm) tower rows: {} values ({} positions of {n_embd}), finite {finite}, not all zero \
              {alive} {}",

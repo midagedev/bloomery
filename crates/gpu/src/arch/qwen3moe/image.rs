@@ -18,7 +18,7 @@
 //! copies over the embeddings it just wrote.
 
 use super::scratch::{IN_IDS, IN_POS0, Inbox, Io, LANE, param_view, put_input};
-use crate::media::ImageSpan;
+use crate::media::{ImageSpan, widen_bf16};
 use crate::tensor::{Window, WindowMut};
 use crate::{GpuError, capturing};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
@@ -285,10 +285,7 @@ impl MediaRows {
         let mut from = 0;
         for s in spans {
             let rows = s.span.rows;
-            let dst = &mut self.host.as_mut_slice()[from..from + rows.len()];
-            for (d, &b) in dst.iter_mut().zip(rows) {
-                *d = f32::from_bits(u32::from(b) << 16);
-            }
+            widen_bf16(rows, &mut self.host.as_mut_slice()[from..from + rows.len()]);
             self.spans.push(Staged {
                 at: first + s.span.at.start..first + s.span.at.end,
                 from,

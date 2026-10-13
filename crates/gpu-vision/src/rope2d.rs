@@ -11,6 +11,9 @@
 //! `y1 = (x1·c) − (x2·s)`, `y2 = (x2·c) + (x1·s)`, from the bf16 inputs widened exactly, each
 //! result rounded once to bf16. The kernel uses the `_rn` forms, which are never contracted, so
 //! kernel and host rule ([`rope_ref`]) agree bit for bit on the same table.
+//!
+//! The file also holds `vis_rne_bits` ([`RneBitsKernels`]): the rounding every kernel of the crate
+//! ends in, read bit for bit from raw f32 patterns, which the gate holds equal to the host's.
 
 use bloomery_gpu::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -488,6 +491,75 @@ impl Rope72Kernels {
             launch_u32(what, "n_heads", n_heads)?,
             x,
         )?;
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------- the rounding, read bit for bit
+
+#[cuda_module]
+mod rne_bits_kernels {
+    use super::*;
+
+    /// `y[i] = f32_to_bf16_rne(f32::from_bits(x[i]))` for `i < n`. The input is raw f32 bits and
+    /// no floating-point operation touches it, so each branch of the rounding sees the pattern as
+    /// given: a NaN whose payload sits in the low 16 bits is not quieted first, a subnormal is
+    /// not flushed. One thread per value.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= n, y.len() >= n)
+    )]
+    pub fn vis_rne_bits(x: &[u32], n: u32, mut y: DisjointSlice<u16>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= x.len() and i < n <= y.len() (contract); one thread per value.
+        unsafe {
+            *y.get_unchecked_mut(i) = f32_to_bf16_rne(f32::from_bits(*x.get_unchecked(i)));
+        }
+    }
+}
+
+/// The loaded rounding-read module.
+pub struct RneBitsKernels {
+    module: rne_bits_kernels::LoadedModule,
+}
+
+impl RneBitsKernels {
+    /// Load this file's device bundle into `ctx`. Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<RneBitsKernels, GpuError> {
+        // SAFETY: this crate owns the embedded device bundle produced for the module above; the
+        // launcher checks its launch contract.
+        let module = unsafe { bloomery_gpu::shared_module!(rne_bits_kernels, ctx)? };
+        Ok(RneBitsKernels { module })
+    }
+
+    /// Enqueue the rounding of the first `n` f32 bit patterns of `x` into the first `n` bf16 of
+    /// `y`. Asynchronous.
+    pub fn enqueue(
+        &self,
+        stream: &CudaStream,
+        n: usize,
+        x: &DeviceBuffer<u32>,
+        y: &mut DeviceBuffer<u16>,
+    ) -> Result<(), GpuError> {
+        let what = "RneBitsKernels::enqueue";
+        if n == 0 || x.len() < n || y.len() < n {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!("n {n} values: x.len() {}, y.len() {}", x.len(), y.len()),
+            });
+        }
+        let grid = launch_u32(what, "grid", n.div_ceil(BLOCK as usize))?;
+        let prep = self
+            .module
+            .prepare_vis_rne_bits(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module
+            .vis_rne_bits(stream, &prep, x, launch_u32(what, "n", n)?, y)?;
         Ok(())
     }
 }
