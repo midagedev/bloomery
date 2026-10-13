@@ -13,6 +13,7 @@
 //! of an `image_url` part. Every refusal is one [`MediaError`] variant that names what it refused;
 //! nothing is skipped, repaired or fetched.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
@@ -27,6 +28,32 @@ pub use vision::{FileKind, MediaModel, Prepared, Rgb8, VisionError};
 /// A [`MediaModel`] the server holds across its threads: the request threads prepare images on
 /// it while the engine runs elsewhere.
 pub type SharedMediaModel = Arc<dyn MediaModel + Send + Sync>;
+
+/// A model that numbers its images, as MiniCPM-V's template does: the placeholder of image `i` is
+/// `<image_id>i</image_id><image><unk>`, and `<image><unk>` is what every placeholder carries.
+#[cfg(test)]
+pub(crate) struct NumberedMedia;
+
+#[cfg(test)]
+impl MediaModel for NumberedMedia {
+    fn image_placeholder(&self, index: usize) -> Cow<'_, str> {
+        Cow::Owned(format!("<image_id>{index}</image_id><image><unk>"))
+    }
+
+    fn image_marker(&self) -> &str {
+        "<image><unk>"
+    }
+
+    fn image_token(&self) -> u32 {
+        7
+    }
+
+    fn prepare(&self, _: &Rgb8) -> Result<Prepared, VisionError> {
+        Err(VisionError::Limits {
+            detail: "the numbered test model prepares nothing".into(),
+        })
+    }
+}
 
 /// One part of a message's `content` array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,11 +360,14 @@ pub fn parse_part(part: &Value) -> Result<Part<'_>, MediaError> {
 /// two parts, or llama-server's rule (a `\n` before a text part unless it is the first text or
 /// follows a placeholder, and none around a placeholder). Only a `user` message carries images:
 /// the template may move other roles' text (V4.1's gathers system messages first), and the i-th
-/// placeholder of the prompt must be the i-th image.
+/// placeholder of the prompt must be the i-th image. `first_image` is the index of the first image
+/// this message places, the count of the images the messages before it placed; the model writes
+/// each image's index into its placeholder ([`MediaModel::image_placeholder`]).
 pub fn flatten<'a>(
     role: &str,
     parts: &'a [Value],
     model: &dyn MediaModel,
+    first_image: usize,
 ) -> Result<Flat<'a>, MediaError> {
     let join = model.part_join();
     let mut text = String::new();
@@ -347,12 +377,13 @@ pub fn flatten<'a>(
         let (piece, is_image) = match parse_part(part)? {
             Part::Text(t) => {
                 check_text(t, model)?;
-                (t, false)
+                (Cow::Borrowed(t), false)
             }
             Part::Image(_) if role != "user" => return Err(MediaError::ImageRole(short(role))),
             Part::Image(url) => {
+                let piece = model.image_placeholder(first_image + images.len());
                 images.push(url);
-                (model.image_placeholder(), true)
+                (piece, true)
             }
         };
         match join {
@@ -362,17 +393,18 @@ pub fn flatten<'a>(
             }
             _ => {}
         }
-        text.push_str(piece);
+        text.push_str(&piece);
         after_image = is_image;
     }
     Ok(Flat { text, images })
 }
 
-/// Refuse message text that carries the model's image placeholder: only an image part makes one.
+/// Refuse message text that carries the model's image marker ([`MediaModel::image_marker`]), the
+/// part of a placeholder that makes an image slot whatever its index: only an image part makes one.
 pub fn check_text(text: &str, model: &dyn MediaModel) -> Result<(), MediaError> {
-    let placeholder = model.image_placeholder();
-    if text.contains(placeholder) {
-        return Err(MediaError::PlaceholderInText(placeholder.to_owned()));
+    let marker = model.image_marker();
+    if text.contains(marker) {
+        return Err(MediaError::PlaceholderInText(marker.to_owned()));
     }
     Ok(())
 }
@@ -574,13 +606,15 @@ fn short(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use serde_json::{Value, json};
     use vision::{GridPlan, Patches};
 
     use super::{
-        ExpandError, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, Part, PartJoin,
-        Prepared, Rgb8, VisionError, common_prefix, expand_prompt, flatten, keep_whole_spans, load,
-        parse_part, prepare,
+        ExpandError, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, NumberedMedia,
+        Part, PartJoin, Prepared, Rgb8, VisionError, common_prefix, expand_prompt, flatten,
+        keep_whole_spans, load, parse_part, prepare,
     };
 
     /// A 2×1 RGB PNG of the colour (200, 100, 50).
@@ -595,7 +629,11 @@ mod tests {
     }
 
     impl MediaModel for Stub {
-        fn image_placeholder(&self) -> &str {
+        fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+            Cow::Borrowed("<img>")
+        }
+
+        fn image_marker(&self) -> &str {
             "<img>"
         }
 
@@ -722,21 +760,21 @@ mod tests {
             json!({"type": "text", "text": "and"}),
             json!({"type": "image_url", "image_url": "data:b"}),
         ];
-        let flat = flatten("user", &parts, &PLAIN).unwrap();
+        let flat = flatten("user", &parts, &PLAIN, 0).unwrap();
         assert_eq!(flat.text, "look\n<img>\nand\n<img>");
         assert_eq!(flat.images, ["data:a", "data:b"]);
         let wide = Stub {
             join: PartJoin::Uniform("\n\n"),
         };
         assert_eq!(
-            flatten("user", &parts, &wide).unwrap().text,
+            flatten("user", &parts, &wide, 0).unwrap().text,
             "look\n\n<img>\n\nand\n\n<img>"
         );
         let text_only = [
             json!({"type": "text", "text": "a"}),
             json!({"type": "text", "text": "b"}),
         ];
-        let flat = flatten("system", &text_only, &PLAIN).unwrap();
+        let flat = flatten("system", &text_only, &PLAIN, 0).unwrap();
         assert_eq!((flat.text.as_str(), flat.images.len()), ("a\nb", 0));
     }
 
@@ -763,7 +801,7 @@ mod tests {
             (vec!["<img>", "", "b"], "<img>\nb"),
         ] {
             let json: Vec<Value> = parts.iter().map(|p| part(p)).collect();
-            let flat = flatten("user", &json, &LLAMA).unwrap();
+            let flat = flatten("user", &json, &LLAMA, 0).unwrap();
             assert_eq!(flat.text, want, "{parts:?}");
             let n = parts.iter().filter(|&&p| p == "<img>").count();
             assert_eq!(flat.images.len(), n, "{parts:?}");
@@ -778,7 +816,7 @@ mod tests {
             let body = match content {
                 Value::String(t) => t.clone(),
                 Value::Array(parts) => {
-                    let flat = flatten(role, parts, model).unwrap();
+                    let flat = flatten(role, parts, model, urls.len()).unwrap();
                     urls.extend(flat.images.iter().map(|u| (*u).to_owned()));
                     flat.text
                 }
@@ -856,14 +894,14 @@ mod tests {
     fn flatten_refusals_are_named() {
         let image = [json!({"type": "image_url", "image_url": "data:a"})];
         for role in ["system", "assistant", "tool", "developer"] {
-            match err(flatten(role, &image, &PLAIN)) {
+            match err(flatten(role, &image, &PLAIN, 0)) {
                 MediaError::ImageRole(r) => assert_eq!(r, role),
                 e => panic!("{role}: {e}"),
             }
         }
         let text = [json!({"type": "text", "text": "an <img> by hand"})];
         assert!(matches!(
-            err(flatten("user", &text, &PLAIN)),
+            err(flatten("user", &text, &PLAIN, 0)),
             MediaError::PlaceholderInText(_)
         ));
         let bad = [
@@ -871,9 +909,55 @@ mod tests {
             json!({"type": "video_url"}),
         ];
         assert!(matches!(
-            err(flatten("user", &bad, &PLAIN)),
+            err(flatten("user", &bad, &PLAIN, 0)),
             MediaError::PartType(_)
         ));
+    }
+
+    /// A model that numbers its images gets each placeholder's index from the images before it:
+    /// the first image of a message is `first_image`, the next one more.
+    #[test]
+    fn flatten_numbers_the_images_it_places() {
+        let image = |u: &str| json!({"type": "image_url", "image_url": u});
+        let parts = [
+            json!({"type": "text", "text": "look"}),
+            image("data:a"),
+            image("data:b"),
+        ];
+        for first in [0, 5] {
+            let flat = flatten("user", &parts, &NumberedMedia, first).unwrap();
+            let (a, b) = (first, first + 1);
+            assert_eq!(
+                flat.text,
+                format!(
+                    "look\n<image_id>{a}</image_id><image><unk>\n<image_id>{b}</image_id><image><unk>"
+                )
+            );
+            assert_eq!(flat.images, ["data:a", "data:b"]);
+        }
+    }
+
+    /// A typed placeholder is refused by name whatever its index, for it carries the marker every
+    /// placeholder carries: the one the next image would get, another, and the marker alone.
+    #[test]
+    fn a_typed_numbered_placeholder_is_refused_by_name() {
+        for typed in [
+            "an <image_id>0</image_id><image><unk> by hand",
+            "an <image_id>9</image_id><image><unk> by hand",
+            "an <image><unk> by hand",
+        ] {
+            let parts = [json!({"type": "text", "text": typed})];
+            match err(flatten("user", &parts, &NumberedMedia, 0)) {
+                MediaError::PlaceholderInText(m) => assert_eq!(m, "<image><unk>", "{typed}"),
+                e => panic!("{typed}: {e}"),
+            }
+        }
+        let tag = [json!({"type": "text", "text": "the <image_id>0</image_id> tag"})];
+        assert_eq!(
+            flatten("user", &tag, &NumberedMedia, 0).unwrap().text,
+            "the <image_id>0</image_id> tag",
+            "the index tag alone makes no slot"
+        );
     }
 
     #[test]

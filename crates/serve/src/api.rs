@@ -2245,8 +2245,10 @@ struct Rendered {
 
 /// Renders the chat template for an OpenAI `messages` body. An array content
 /// becomes one text: on an engine that takes images, its parts flattened by
-/// the model's rule ([`media::flatten`]), each image the model's placeholder;
-/// on one that takes none, its text parts joined, any other part refused by
+/// the model's rule ([`media::flatten`]), each image the model's placeholder,
+/// numbered by its place among the request's images, across messages
+/// (`images`, in the order of the placeholders, is the count); on one that
+/// takes none, its text parts joined, any other part refused by
 /// name ([`content_text`]); a content that is neither a string, an array nor
 /// `null` is refused too, as is a `tools` that is not an array. Nothing is
 /// dropped. A `developer` message reaches the template as `system`, as
@@ -2286,8 +2288,8 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
                 let text = match &state.media {
                     None => content_text(parts)?,
                     Some(model) => {
-                        let f =
-                            media::flatten(role, parts, &**model).map_err(|e| media_error(&e))?;
+                        let f = media::flatten(role, parts, &**model, images.len())
+                            .map_err(|e| media_error(&e))?;
                         images.extend(f.images.into_iter().map(str::to_owned));
                         f.text
                     }
@@ -7162,5 +7164,73 @@ mod tests {
             assert_eq!((got.code, got.kind), (400, "invalid_request_error"));
             assert_eq!(got.message, e.to_string());
         }
+    }
+
+    /// The mock engine behind a model that numbers its images
+    /// ([`crate::media::NumberedMedia`]); only the render is asked of it.
+    struct NumberedEngine(crate::MockEngine);
+
+    impl Engine for NumberedEngine {
+        fn tokenizer(&self) -> Arc<dyn crate::engine::Tokenizer> {
+            self.0.tokenizer()
+        }
+
+        fn media_model(&self) -> Option<crate::media::SharedMediaModel> {
+            Some(Arc::new(crate::media::NumberedMedia))
+        }
+
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), crate::engine::EngineError> {
+            self.0.prefill(ids)
+        }
+
+        fn next(
+            &mut self,
+            last: u32,
+            logits_out: Option<&mut [f32]>,
+        ) -> Result<u32, crate::engine::EngineError> {
+            self.0.next(last, logits_out)
+        }
+
+        fn reset(&mut self) -> Result<(), crate::engine::EngineError> {
+            self.0.reset()
+        }
+
+        fn ctx_max(&self) -> usize {
+            self.0.ctx_max()
+        }
+
+        fn describe(&self) -> String {
+            self.0.describe()
+        }
+    }
+
+    /// One counter runs through the whole request: a model that numbers its images gets image 0 in
+    /// the first user message and image 1 in the second, and the images are handed on in that
+    /// order [FAIL-first: a count that restarts at each message renders both as 0].
+    #[test]
+    fn images_are_numbered_across_the_messages_of_a_request() {
+        let (_addr, state, _ended) = super::testserve::spawn(
+            Box::new(NumberedEngine(crate::MockEngine::new(64))),
+            super::testserve::mock_config(),
+        );
+        let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+        let body = json!({"messages": [
+            {"role": "user", "content": [image("data:a")]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": [{"type": "text", "text": "and"}, image("data:b")]},
+        ]});
+        let Value::Object(body) = body else {
+            unreachable!("an object literal")
+        };
+        let rendered =
+            super::render_chat(&state, &body).unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(
+            rendered.text,
+            "<user>\n<image_id>0</image_id><image><unk>\
+             <assistant>\nok\
+             <user>\nand\n<image_id>1</image_id><image><unk>\
+             <assistant>\n"
+        );
+        assert_eq!(rendered.images, ["data:a", "data:b"]);
     }
 }

@@ -4,6 +4,8 @@
 //! top-left corner over black, CLIP normalize, merge-order patches), the rule of mtmd's
 //! `mtmd_image_preprocessor_glm5v`.
 
+use std::borrow::Cow;
+
 use super::size::{Canvas, SizeRule};
 use super::{CLIP, TEMPORAL_FRAMES};
 use crate::media::{MediaModel, PartJoin, Prepared};
@@ -80,7 +82,11 @@ impl Media {
 }
 
 impl MediaModel for Media {
-    fn image_placeholder(&self) -> &str {
+    fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+        Cow::Borrowed(IMAGE_PLACEHOLDER)
+    }
+
+    fn image_marker(&self) -> &str {
         IMAGE_PLACEHOLDER
     }
 
@@ -103,6 +109,8 @@ impl MediaModel for Media {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::{
         BEGIN_OF_IMAGE_ID, END_OF_IMAGE_ID, IMAGE_PLACEHOLDER, IMAGE_TOKEN_ID, Media, PAD_BLACK,
         canvas_image, preprocess,
@@ -248,7 +256,12 @@ mod tests {
     #[test]
     fn the_media_data_is_glms() {
         let m = Media::new(rule());
-        assert_eq!(m.image_placeholder(), IMAGE_PLACEHOLDER);
+        assert_eq!(m.image_placeholder(0), IMAGE_PLACEHOLDER);
+        assert!(matches!(
+            m.image_placeholder(5),
+            Cow::Borrowed(IMAGE_PLACEHOLDER)
+        ));
+        assert_eq!(m.image_marker(), IMAGE_PLACEHOLDER);
         assert_eq!(m.image_token(), IMAGE_TOKEN_ID);
         assert_eq!(m.part_join(), PartJoin::LlamaServer);
         assert_eq!(m.part_separator(), "\n");
