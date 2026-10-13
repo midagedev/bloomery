@@ -44,6 +44,7 @@ use bloomery_gpu::hybrid::HostResidency;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::prompt_timing::PromptStats;
 use bloomery_levers::ChurnHosting;
+use model::placement::workstation::{HostRead, plan_room};
 use model::placement::{Machine, Plan, arena_slots};
 
 /// The schema's version, the first line of `--records-schema`.
@@ -2056,9 +2057,20 @@ pub static RESIDENCY_UNSET: Kind = Kind {
           by (off, or mid-p<P>-s1 on plan (a), P half the plan's fewest card experts a layer) \
           and why, the condition that picked it (the placement, the flags, the file, or the plan: \
           no card expert, no room, or the churn pool past the plan's host headroom or past what \
-          MemAvailable leaves: P raised to the first count whose pool fits, or off where none \
-          does).",
-    parts: &[key("residency", Word, ""), key("why", Text, "")],
+          the host's room leaves: P raised to the first count whose pool fits, or off where none \
+          does). A pick the plan decided also names the climb's own host reading: its kind \
+          (read: MemAvailable, cgroup:<path>, or given), its bytes (room), the room the climb \
+          budgeted from (plan_room: a read reading less the drift margin, a given one as given) \
+          and what that room leaves past the plan's host need (mem_left), the bytes the churn \
+          pool's fit was held to.",
+    parts: &[
+        key("residency", Word, ""),
+        key("why", Text, ""),
+        opt("read", Word, ""),
+        opt("room", U64, "B"),
+        opt("plan_room", U64, "B"),
+        opt("mem_left", I64, "B"),
+    ],
 };
 
 /// Adaptive residency's host share at the plan
@@ -2914,9 +2926,18 @@ pub static RESIDENCY_UNSET_GLM: Kind = Kind {
     doc: "What BLOOMERY_RESIDENCY unset resolved to on the GLM seat, after the plan line: the word \
           the load runs by and why (--place a, or what left it off: --place gate, stores short of \
           a window, the step feed, or the plan: no card expert, no room, or — the word kept at P — \
-          the churn pool past the plan's host headroom or past what MemAvailable leaves: the pool \
-          is not hosted, its victims are served from the file).",
-    parts: &[key("residency", Word, ""), key("why", Text, "")],
+          the churn pool past the plan's host headroom or past what the host's room leaves: the \
+          pool is not hosted, its victims are served from the file). A word the plan kept or \
+          moved also names the climb's own host reading, as `residency unset` of \
+          generate_qwen3moe does (read, room, plan_room, mem_left).",
+    parts: &[
+        key("residency", Word, ""),
+        key("why", Text, ""),
+        opt("read", Word, ""),
+        opt("room", U64, "B"),
+        opt("plan_room", U64, "B"),
+        opt("mem_left", I64, "B"),
+    ],
 };
 
 /// A round of several slots the seat served, under `BLOOMERY_STEP_STATS`.
@@ -3959,12 +3980,55 @@ pub fn slot_call(cmd: &str, slot: usize, slots: usize) -> Record {
         .u("slots", slots)
 }
 
+/// The host reading an unset residency climb budgeted from, and what the
+/// room it was held to left past the plan's host need
+/// (`PlanRoom::climb_read`).
+#[derive(Clone, Debug)]
+pub struct ClimbRead {
+    pub reading: (u64, HostRead),
+    pub mem_left: i128,
+}
+
+/// `r` with the climb's reading when a plan decided the pick: its kind, its
+/// bytes, the room it was held to ([`plan_room`], the one owner of the drift
+/// margin) and the room's bytes past the plan's host need; the caller has put
+/// every part the kind lists before `read`. A pick made before any plan reads
+/// nothing and prints none.
+fn with_climb(r: Record, climb: Option<&ClimbRead>) -> Record {
+    match climb {
+        Some(ClimbRead { reading, mem_left }) => r
+            .w("read", reading.1.word())
+            .u("room", reading.0)
+            .u("plan_room", plan_room(reading))
+            .u("mem_left", mem_left),
+        None => r,
+    }
+}
+
 /// The record of what the residency lever unset resolved to in
-/// `generate_qwen3moe`.
-pub fn residency_unset(pick: &bloomery_levers::Residency38Pick) -> Record {
-    Record::new(&RESIDENCY_UNSET)
-        .w("residency", pick.word())
-        .w("why", pick.why)
+/// `generate_qwen3moe`, with the climb's host reading when the plan decided
+/// the pick.
+pub fn residency_unset(
+    pick: &bloomery_levers::Residency38Pick,
+    climb: Option<&ClimbRead>,
+) -> Record {
+    with_climb(
+        Record::new(&RESIDENCY_UNSET)
+            .w("residency", pick.word())
+            .w("why", pick.why),
+        climb,
+    )
+}
+
+/// The record of what the residency lever unset resolved to on the GLM seat,
+/// with the climb's host reading when the word asked for the plan's room.
+pub fn residency_unset_glm(word: &str, why: impl Display, climb: Option<&ClimbRead>) -> Record {
+    with_climb(
+        Record::new(&RESIDENCY_UNSET_GLM)
+            .w("residency", word)
+            .w("why", why),
+        climb,
+    )
 }
 
 /// The churn pool's record under the residency word `residency`, against

@@ -278,7 +278,7 @@
 //! plan the load runs (the plain or the MTP plan, at `--ctx-size`); `off`
 //! under `--place gate`, when the plan holds no card expert or its fewest
 //! leave no room, and when the churn pool does not fit the plan's host
-//! headroom or what `MemAvailable` leaves past the plan's host need — never
+//! headroom or what the host's room leaves past the plan's host need — never
 //! a refusal. Running `mid-p<P>-s<S>` (plain or drafted, either `--place`),
 //! the load runs the common residency machine over the card's routed stacks
 //! (`Body38::open_placed_residency`, `open_placed_mtp_residency`): a

@@ -5,14 +5,14 @@
 //! families' rules differ by clause and record (`residency38`, the GLM seat,
 //! the V4.1 and MiMo seats print their own whys); the inputs they read of the
 //! plan are these four: the card experts a layer, the churn pool's bytes at a
-//! pinned count, the host headroom and what `MemAvailable` leaves past the
-//! plan's host need.
+//! pinned count, the host headroom and what the host's room leaves past the
+//! plan's host need (the reading less the drift margin, [`PlanRoom::mem_left`]).
 
 use crate::GateError;
-use crate::residency38::mem_left_38;
+use crate::record::ClimbRead;
 use bloomery_levers::{ResidencyPick, UnhostedPool, residency_at_plan};
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{HostNeed, host_available};
+use model::placement::workstation::{HostNeed, HostRead, host_available_read};
 use model::placement::{PlacementError, Plan};
 
 /// `plan`'s room for the churn pool of card `card`'s experts, with `beside`
@@ -43,16 +43,33 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
         self.plan.host.headroom_bytes - i128::from(self.beside)
     }
 
-    /// What the host's `MemAvailable` leaves past the plan's host need
-    /// ([`HostNeed::bytes`], the load's checkpoints and `beside` inside it):
-    /// the term the load's own check (`HostNeed::check`, the churn pool as
-    /// its extra bytes) uses, so a word this keeps passes the load. Reads
-    /// `/proc/meminfo`.
+    /// What the host's room leaves past the plan's host need
+    /// ([`HostNeed::bytes`], the load's checkpoints and `beside` inside it),
+    /// from a fresh reading ([`host_available_read`]): the term the load's own
+    /// check (`HostNeed::check`, the churn pool as its extra bytes) uses, so a
+    /// word this keeps passes the load even when the reading falls by
+    /// [`HOST_DRIFT`](model::placement::workstation::HOST_DRIFT) or less before
+    /// the check ([`PlanRoom::mem_left_at`]).
     pub fn mem_left(&self) -> Result<i128, GateError> {
-        Ok(mem_left_38(
-            host_available()?,
-            HostNeed::of(self.plan, self.beside).bytes(),
-        ))
+        Ok(self.climb_read()?.mem_left)
+    }
+
+    /// A fresh reading of the host ([`host_available_read`]) and the room
+    /// it leaves ([`PlanRoom::mem_left_at`]): what an unset climb budgets
+    /// from, kept whole for the `residency unset` record to print.
+    pub fn climb_read(&self) -> Result<ClimbRead, GateError> {
+        let reading = host_available_read()?;
+        let mem_left = self.mem_left_at(&reading);
+        Ok(ClimbRead { reading, mem_left })
+    }
+
+    /// [`PlanRoom::mem_left`] at a reading a caller took: the room the plan is
+    /// made at ([`HostNeed::room_left`], `plan_room`'s one rule) less the
+    /// need, so every unset climb keeps the margin off a read room and takes
+    /// a given room as given.
+    #[must_use]
+    pub fn mem_left_at(&self, reading: &(u64, HostRead)) -> i128 {
+        HostNeed::of(self.plan, self.beside).room_left(reading)
     }
 
     /// The churn pool's bytes at `pinned` seed experts a layer: card
@@ -66,7 +83,7 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
 /// `BLOOMERY_RESIDENCY` against `plan` on the pair rule
 /// ([`residency_at_plan`]): `pick` as it is unless it is the serving word
 /// the plan has not yet seen, which the plan's card slots, host headroom and
-/// `MemAvailable` then keep, move or turn `off` with why, on every body (an
+/// the host's room then keep, move or turn `off` with why, on every body (an
 /// unset word never asks for its pool unhosted; `carry` is the loading body's
 /// `ChainBody::UNHOSTED_POOL`, a value, so this module reaches no body). The
 /// churn pool's bytes are card `card`'s.

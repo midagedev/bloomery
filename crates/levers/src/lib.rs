@@ -1352,7 +1352,7 @@ fn hosting(unhosted: bool) -> ChurnHosting {
 /// A word that asks for its churn pool unhosted ([`UNHOSTED_SUFFIX`]) on a
 /// load that carries it: the word keeps its P and the load does not host the
 /// pool ([`ChurnHosting::Unhosted`]). `needs` the pool's bytes at P,
-/// `headroom` the plan's host headroom, `mem_left` what `MemAvailable`
+/// `headroom` the plan's host headroom, `mem_left` what the host's room
 /// leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolUnhosted {
@@ -1370,7 +1370,7 @@ impl fmt::Display for PoolUnhosted {
         } = *self;
         write!(
             f,
-            "the churn pool needs {needs} B, the plan leaves {headroom} B and MemAvailable \
+            "the churn pool needs {needs} B, the plan leaves {headroom} B and the host's room \
              {mem_left} B: the word asks for the pool unhosted, its victims are served from the \
              file"
         )
@@ -1380,8 +1380,8 @@ impl fmt::Display for PoolUnhosted {
 /// An unset word on a load that hosts every churn pool it runs
 /// ([`UnhostedPool::NotCarried`]) whose pool fits neither budget at any P up
 /// to what the card slots hold: `needs` the pool's bytes at the last P
-/// probed, `headroom` the plan's host headroom, `mem_left` what
-/// `MemAvailable` leaves.
+/// probed, `headroom` the plan's host headroom, `mem_left` what the host's
+/// room leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolUnhostable {
     pub needs: u64,
@@ -1399,7 +1399,7 @@ impl fmt::Display for PoolUnhostable {
         write!(
             f,
             "unset: the churn pool needs {needs} B at the highest P the card slots hold, the plan \
-             leaves {headroom} B and MemAvailable {mem_left} B, and this load hosts its pool"
+             leaves {headroom} B and the host's room {mem_left} B, and this load hosts its pool"
         )
     }
 }
@@ -1453,7 +1453,7 @@ pub enum Room {
 /// the plan's card experts a layer (a layer holding none left out),
 /// `pool_bytes` the churn pool's bytes at a pinned count (it shrinks as the
 /// count grows), `headroom` the plan's host headroom and `mem_left` what the
-/// host's `MemAvailable` leaves past the plan's own host need. The word runs
+/// host's room leaves past the plan's own host need. The word runs
 /// at its target while its card slots hold it, its spares and one that
 /// moves; where they do not, at
 /// half the plan's fewest card experts a layer, never under
@@ -1502,7 +1502,7 @@ pub fn room_for<E>(
         half
     };
     // The host side at P: the churn pool there fits the plan's host headroom
-    // and what MemAvailable leaves past the plan's own host need.
+    // and what the host's room leaves past the plan's own host need.
     let fits = |needs: u64| headroom >= i128::from(needs) && mem_left >= i128::from(needs);
     let needs = pool_bytes(p)?;
     if unhosted {
@@ -1778,10 +1778,11 @@ pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
 /// experts a layer (a layer holding none left out), `host_experts` the
 /// routed experts it leaves on no card, `pool_bytes` the churn pool's bytes
 /// at P pinned, `headroom` the plan's host headroom and `mem_left` what the
-/// host's available bytes leave past the plan's own host need and whatever
-/// the caller counts beside it (the load's check before any upload; the
-/// Qwen3.8 room is gpu-gates' `mem_left_38`, the available bytes less the
-/// plan's host need, which already counts the checkpoints the load holds).
+/// host's room leaves past the plan's own host need and whatever the caller
+/// counts beside it (the load's check before any upload; the Qwen3.8 room is
+/// the placement crate's `HostNeed::room_left`: the room a plan is made at,
+/// a read reading less the drift margin, past the plan's host need, which
+/// already counts the checkpoints the load holds).
 /// P is 0, no seed expert pinned — where the churn pool at 0 fits neither
 /// budget, the first P whose pool fits ([`room_for`], on every body: an
 /// unset word never asks for its pool unhosted); `off` when no layer holds a
@@ -2281,7 +2282,7 @@ pub fn glm_unset(at: GlmAt) -> GlmUnset {
 /// layer holding none left out) or when its fewest leave no room for the
 /// word's pinned experts, its spares and one that moves; when the churn pool
 /// there (`pool_bytes`) fits neither `headroom` (the plan's host headroom
-/// less what the load hosts beside it) nor `mem_left` (what `MemAvailable`
+/// less what the load hosts beside it) nor `mem_left` (what the host's room
 /// leaves past the load's host need): the first P whose pool fits
 /// ([`GlmWhy::PoolShrunk`]), or `off` where none does ([`room_for`], on
 /// every body: an unset word never asks for its pool unhosted) — a default

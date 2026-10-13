@@ -647,6 +647,17 @@ impl HostNeed {
         i128::from(room) - i128::from(self.plan_bytes())
     }
 
+    /// What the room a plan is made at on `reading` ([`plan_room`]) leaves
+    /// past [`HostNeed::bytes`]: the budget an unset residency climb fits its
+    /// churn pool to, the pool being the `extra` of the load's own check
+    /// ([`HostNeed::check`]). A read room keeps [`HOST_DRIFT`] off, so a pool
+    /// that fits still passes the check at a reading the load's own start has
+    /// lowered by the margin or less; a given room is held as given.
+    #[must_use]
+    pub fn room_left(&self, reading: &(u64, HostRead)) -> i128 {
+        i128::from(plan_room(reading)) - i128::from(self.bytes())
+    }
+
     /// `available` bytes (the host's reading, [`host_room`]'s) cover the
     /// need, or the refusal that names both, each term and what lowers the
     /// need.
@@ -865,7 +876,8 @@ impl HostRead {
 /// is made at and the load's check ([`HostNeed::grant`]): a chosen bound,
 /// not a derived one. A plan made at a read room keeps it ([`plan_room`]),
 /// so a split that fills its room exactly still passes the check at the
-/// load.
+/// load, and so does an unset residency climb's room
+/// ([`HostNeed::room_left`]), so a churn pool that fills it exactly does.
 pub const HOST_DRIFT: u64 = 512 * MIB;
 
 /// The room a plan is made at, for the room `room` that [`host_room`] (or a

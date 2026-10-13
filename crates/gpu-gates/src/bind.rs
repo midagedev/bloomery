@@ -3577,7 +3577,7 @@ mod tests {
     }
 
     /// The unset residency rule's room is what the reading leaves past the
-    /// plan's host need ([`mem_left_38`]), the need holding the checkpoints
+    /// plan's host need ([`HostNeed::room_left`]), the need holding the checkpoints
     /// the load's machine reserves ([`reserve_checkpoints`]) once: a churn
     /// pool that fits past the need of a load that declares none does not
     /// fit past the same plan's need on a machine that reserves two slots',
@@ -3585,7 +3585,8 @@ mod tests {
     /// word climbs on every body, and this pool fits at no P.
     #[test]
     fn the_residency38_room_reads_the_reserved_need() {
-        use crate::residency38::{Seqs, checkpoints_reserved, mem_left_38, reserve_checkpoints};
+        use crate::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
+        use model::placement::workstation::{HostNeed, HostRead};
         use model::placement::{Host, Machine};
         use runtime::seqstate::Price;
         // Points of 1 GiB spaced 512 apart: a slot of 4,096 positions takes
@@ -3623,17 +3624,32 @@ mod tests {
             reserve_checkpoints(&mut machine, seqs, 4_096).expect("a reserve");
             checkpoints_reserved(&machine)
         };
-        // The plan's own terms, 12 GiB, and the reserve the need adds.
+        // The plan's own terms, 12 GiB, and the reserve the need adds; the
+        // reading is a given room, which the climb holds as given.
         let (available, terms) = (24u64 << 30, 12u64 << 30);
+        let mem_left = |bytes: u64| {
+            HostNeed {
+                experts: bytes,
+                tables: 0,
+                shadows: 0,
+                reserves: 0,
+                extra: 0,
+                arena: 0,
+                cards: 0,
+                os: 0,
+                card_budget: false,
+            }
+            .room_left(&(available, HostRead::Given))
+        };
         let none = terms + declared(Seqs::none(2));
-        assert_eq!(pick(mem_left_38(available, none)).pinned, Some(0));
+        assert_eq!(pick(mem_left(none)).pinned, Some(0));
         let two = terms + declared(Seqs::priced(2, price));
         assert_eq!(two - none, 2 * slot);
         // PIN(2026-10-13): the pool past the reserved need turns the word
         // `off` (`PoolUnhostable`): the pool is the same at every P here, so
         // the climb finds no count that fits. An unset word that kept P 0
         // with the pool unhosted decoded far slower than the climb.
-        let short = pick(mem_left_38(available, two));
+        let short = pick(mem_left(two));
         assert_eq!(short.pinned, None);
         assert_eq!(short.pool(), bloomery_levers::ChurnHosting::Hosted);
         let bloomery_levers::Residency38Why::PoolUnhostable(pool) = short.why else {
