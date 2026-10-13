@@ -203,8 +203,8 @@ fn hw_mimo2_spec() {
 // (`ring_rows(128, 4160)`), and one sequence is 4,160 × 23,040 + 768 × 199,680 = 249,200,640 B
 // [derived]. The plane term stays 4,160 × 222,720 = 926,515,200 B. The window bytes the ring
 // frees are (4,160 − 768) × 199,680 = 677,314,560, which is 50 experts of 13,369,344 plus a
-// remainder 8,847,360. That remainder crosses one more expert on both of the 2026-10-10
-// numerators, so the floors rise by 51, to 1,315 and 3,230, not by 50. The granule band stays
+// remainder 8,847,360. That remainder crosses one more expert on both plane
+// numerators above, so the floors rise by 51, to 1,315 and 3,230, not by 50. The granule band stays
 // the same 61: the ring shrinks the window buffers and does not drop an upload, so the lows
 // are 1,254 and 3,169. The plane bounds above are not replaced.
 /// The plan of the RL file onto the gate machine and onto the A6000's: what
