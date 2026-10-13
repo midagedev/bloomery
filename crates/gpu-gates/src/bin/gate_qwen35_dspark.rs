@@ -751,8 +751,8 @@ mod gate {
             dir.display()
         );
         let t0 = Instant::now();
-        let mut parts = dspark_hf::open(&gpu, &dir, CTX)?;
-        let bytes = dspark_hf::card_bytes(&dir, CTX)?;
+        let mut parts = dspark_hf::open(&gpu, dir, CTX)?;
+        let bytes = dspark_hf::card_bytes(dir, CTX)?;
         println!(
             "loader: {:?}; {} taps {:?}, block {}, window {:?}, {} draft ids of {}; card bytes {} \
              ({} MiB) as the reserve {:?}; layers hold {} B at {CTX} positions",
@@ -783,7 +783,7 @@ mod gate {
             parts.layers.dims().hidden,
         );
         ok &= sized;
-        let file = HfFile::open(&dir)?;
+        let file = HfFile::open(dir)?;
         ok &= loader_check(&parts, &file, gpu.stream())?;
         ok &= staging_clause(&gpu, &mut parts.layers)?;
         let mask_id = usize::try_from(parts.shape.mask_id)?;
