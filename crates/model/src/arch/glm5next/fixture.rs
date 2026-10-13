@@ -375,16 +375,6 @@ impl Tables for MapTables {
         }
     }
 
-    fn dims(
-        &self,
-        _name: &str,
-        _layer: Option<usize>,
-        _leaf: &str,
-        _dims: &[u64],
-    ) -> Result<Option<Vec<u64>>, FixtureError> {
-        Ok(None)
-    }
-
     fn lines(&self) -> Vec<String> {
         vec![format!(
             "glm map: {} dense layers, {} routed, then the NextN layer (source layer {})",

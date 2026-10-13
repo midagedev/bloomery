@@ -222,19 +222,24 @@ pub trait Family: Sync {
 /// State a family reads from the source for one plan.
 pub trait Tables {
     /// The value of the [`KeyRule::Table`] key `key` (`<arch>.<suffix>`),
-    /// whose source value is `v`.
-    fn key(&self, key: &str, suffix: &str, v: &Value) -> Result<Value, FixtureError>;
+    /// whose source value is `v`. A family with no tables refuses the key.
+    fn key(&self, key: &str, _suffix: &str, _v: &Value) -> Result<Value, FixtureError> {
+        Err(meta(key, "is a table key of a family with no tables"))
+    }
 
     /// The fixture dims of source tensor `name` (in source layer `layer`,
     /// `None` for a global; `leaf` its name past `blk.N.`) whose source dims
-    /// are `dims`; `None` keeps them.
+    /// are `dims`; `None` keeps them. A family with no tables keeps the source
+    /// dims.
     fn dims(
         &self,
-        name: &str,
-        layer: Option<usize>,
-        leaf: &str,
-        dims: &[u64],
-    ) -> Result<Option<Vec<u64>>, FixtureError>;
+        _name: &str,
+        _layer: Option<usize>,
+        _leaf: &str,
+        _dims: &[u64],
+    ) -> Result<Option<Vec<u64>>, FixtureError> {
+        Ok(None)
+    }
 
     /// One line per table for a plan's print.
     fn lines(&self) -> Vec<String>;
@@ -246,20 +251,6 @@ pub trait Tables {
 pub(crate) struct NoTables;
 
 impl Tables for NoTables {
-    fn key(&self, key: &str, _suffix: &str, _v: &Value) -> Result<Value, FixtureError> {
-        Err(meta(key, "is a table key of a family with no tables"))
-    }
-
-    fn dims(
-        &self,
-        _name: &str,
-        _layer: Option<usize>,
-        _leaf: &str,
-        _dims: &[u64],
-    ) -> Result<Option<Vec<u64>>, FixtureError> {
-        Ok(None)
-    }
-
     fn lines(&self) -> Vec<String> {
         Vec::new()
     }

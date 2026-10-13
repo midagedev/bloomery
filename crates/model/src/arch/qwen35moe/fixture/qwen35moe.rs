@@ -38,7 +38,7 @@ use super::{
 };
 use crate::fixture::{
     Budget, CardBudget, CardExperts, DEFAULT_SHARD_BYTES, Family, FixtureError, FixtureSpec,
-    KeyRule, Tables, Window, meta,
+    KeyRule, Tables, Window,
 };
 use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::workstation::{self, RTX_3090, SCRATCH};
@@ -166,20 +166,6 @@ impl Family for Qwen36 {
 struct Gate;
 
 impl Tables for Gate {
-    fn key(&self, key: &str, _suffix: &str, _v: &gguf::Value) -> Result<gguf::Value, FixtureError> {
-        Err(meta(key, "is a table key of a family with no tables"))
-    }
-
-    fn dims(
-        &self,
-        _name: &str,
-        _layer: Option<usize>,
-        _leaf: &str,
-        _dims: &[u64],
-    ) -> Result<Option<Vec<u64>>, FixtureError> {
-        Ok(None)
-    }
-
     fn lines(&self) -> Vec<String> {
         vec![format!(
             "shared-expert gate 1/sqrt({HIDDEN}) = {}",
