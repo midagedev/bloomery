@@ -356,33 +356,33 @@ mod gate {
     use super::q3place::{self, PlaceQ3};
     use super::residency_clauses;
     use app::Session;
+    use bloomery_gpu::NodeInfo;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
         Body35, Delta35Run, Gqa35Run, KvQ8, LayerKind35, Mixer35Run, Open35, PrefillPath,
         PrefillStep, Qwen35moeModel, StoreHost, WIDE_FROM,
     };
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode};
-    use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::linear::{expf_ik, Q_SCALE, RING_ROWS};
+    use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::route_core::sigmoid;
-    use bloomery_gpu::NodeInfo;
     use bloomery_gpu::{Gpu, GpuError, GpuModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::{
-        bits_equal, checks_failed, data_dir, ik_q8_2, q8_1_dequant, record, ref_ints,
-        ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict, widened_f16_rows_in,
-        Fnv1a64, GateError, Layout, RefManifest, RowKind, GREEDY_MARGIN,
+        Fnv1a64, GREEDY_MARGIN, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed,
+        data_dir, ik_q8_2, q8_1_dequant, record, ref_ints, ref_tensor_logical_in, split_f32,
+        topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
     use bloomery_levers::HostCfg;
     use cuda_core::sys;
-    use gguf::quant::half_to_f32;
     use gguf::Split;
-    use model::arch::models::shape::{AttnShape, MoeShape};
+    use gguf::quant::half_to_f32;
     use model::arch::models::Mixer;
+    use model::arch::models::shape::{AttnShape, MoeShape};
     use model::placement::PlanLevers;
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
     use runtime::{Out, Target, Want};
@@ -496,7 +496,7 @@ mod gate {
     /// three: 1 + 30·13 + 10·12 + 6 + 3.
     const NODES_DECODE: usize = 520;
 
-    /// Q4_K routed downs on this file (header census, 2026-10-14): layers
+    /// Q4_K routed downs on this file (header census): layers
     /// 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30,
     /// 32, 33. Gate and up are Q4_K on every layer, and the shared expert
     /// matches the stacks, so these twenty join and take the tile entry.
@@ -504,7 +504,7 @@ mod gate {
     const TILE_DOWN: usize = 20;
 
     /// PIN(2026-10-14): a captured pass of `m >= 2` rows without its heads.
-    /// The 2026-10-05 count was 537: each delta layer 8 + 5, one more on the
+    /// The previous count was 537: each delta layer 8 + 5, one more on the
     /// 14 whose `attn_qkv` is Q6_K; each attention layer 7 + 5, two more on
     /// the 6 Q6_K `attn_v` layers: 1 + 30·13 + 14 + 10·12 + 12. A joined
     /// routed layer whose gate, up and down are Q4_K replaces the gate·up,
@@ -3929,11 +3929,7 @@ mod gate {
             .map(|(a, b)| e_distance(a, b))
             .enumerate()
             .fold((0usize, 0.0f64, 0.0f32), |w, (i, (rel, abs))| {
-                if rel > w.1 {
-                    (i, rel, abs)
-                } else {
-                    w
-                }
+                if rel > w.1 { (i, rel, abs) } else { w }
             });
         let parted = run.tokens.iter().zip(&off.tokens).position(|(a, b)| a != b);
         let near = match parted {

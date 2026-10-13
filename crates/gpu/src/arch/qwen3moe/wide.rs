@@ -36,7 +36,7 @@
 //! the attention weighs the values with f16 weights, so the two arms agree
 //! to the error of those sums and are not bit-equal.
 
-use super::body::{Kernels, ATTN_SCALE, ATTN_SCALE_256};
+use super::body::{ATTN_SCALE, ATTN_SCALE_256, Kernels};
 use super::body35::Body35;
 use super::dispatch::Ctx;
 use super::experts::CombineArgs;
@@ -44,14 +44,14 @@ use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Form, GqaKind, GqaPlan, SharedPlan, SiteTy};
 use super::router::MAX_TOKENS;
 use super::scratch::{
-    tile_bytes, ApartForms, Append128, Append256, Arena, Dims, Forms, GdnArena, KvPlanes,
-    PrefillFlash, Route, Wants,
+    ApartForms, Append128, Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Route,
+    Wants, tile_bytes,
 };
 use super::taps35::Ffn35Run;
-use crate::flash_gqa::{partials_ms_len, partials_v_len, partials_v_len_256, HEAD, HEAD_256};
+use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
 use crate::gemm::{
-    Gemm32Kernels, GemmAct, GemmAct32, GemmInput, GemmRoute, GEMM32_STEP, GEMM_BN, GEMM_MAX_SLOTS,
+    GEMM_BN, GEMM_MAX_SLOTS, GEMM32_STEP, Gemm32Kernels, GemmAct, GemmAct32, GemmInput, GemmRoute,
 };
 use crate::host::xstream::RingLayer;
 use crate::hybrid::HOST;
@@ -1625,7 +1625,7 @@ impl GpuModel<Body35> {
 #[cfg(test)]
 mod tests {
     use super::GEMV_COLS;
-    use crate::flash_gqa::{partials_ms_len, partials_v_len, partials_v_len_256, HEAD, HEAD_256};
+    use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
     use model::placement::workstation::SCRATCH;
 
     /// The decode flash's partials a load's step arena (one row) and pass

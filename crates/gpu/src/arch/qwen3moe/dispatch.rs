@@ -16,14 +16,14 @@
 //! into the projection beside them, the work lands in every block of a grid
 //! that already streams its weights at the card's bandwidth.
 
-use super::body::{Body, Kernels, ATTN_SCALE, ATTN_SCALE_256};
+use super::body::{ATTN_SCALE, ATTN_SCALE_256, Body, Kernels};
 use super::delta;
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{
-    down_entry, gate_up_entry, DownEntry, FfnPlan, FfnRoute, Form, GateUpEntry, GqaKind, GqaPlan,
-    LayerPlan, MixerPlan, SharedPlan, SharedSites, SiteTy,
+    DownEntry, FfnPlan, FfnRoute, Form, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan,
+    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry,
 };
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
@@ -36,11 +36,11 @@ use crate::kquant::{
     Act, GateUpAct, KquantKernels, SelDown, TileGather, TileTable, TiledDown, TiledGateUpAct,
 };
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
+use crate::q4k_sel::{BUCKET_EXPERTS, QuantSel};
 use crate::q38::{EmbedQ8Args, OutGateArgs};
-use crate::q4k_sel::{QuantSel, BUCKET_EXPERTS};
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
-use crate::weights::{DevWeight, Weights, HEAD_TENSOR};
+use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;

@@ -83,11 +83,11 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use app::{RowsLog, Session, SessionError};
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, PrefillPath, Qwen35moeModel};
-    use bloomery_gpu::model::{StepMode, MAX_PASS_ROWS};
+    use bloomery_gpu::model::{MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuError};
-    use bloomery_gpu_gates::{checks_failed, data_dir, verdict, GateError, RefManifest};
-    use gguf::quant::dequant_row;
+    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
     use gguf::Split;
+    use gguf::quant::dequant_row;
     use model::arch::qwen35moe::place::PlanInputs;
     use model::placement::KvBytes;
     use refset::arch::qwen35moe::{D1K, IK, MODEL};
@@ -1250,10 +1250,6 @@ mod gate {
         let r = taps_refusals(&mut s);
         ok &= clause("(ti)", &mut s, r);
         println!("{WHAT}: {}", verdict(ok));
-        if ok {
-            Ok(())
-        } else {
-            Err(checks_failed())
-        }
+        if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

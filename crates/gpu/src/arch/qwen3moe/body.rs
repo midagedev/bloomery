@@ -7,34 +7,34 @@ use super::dispatch::{self, PassCtx};
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
 use super::placed::{
-    counted_arena, placed_bytes, placed_scratch, Placed, PlacedOpen, StepWalk, WalkParts,
-    PLACED_ROWS,
+    PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, counted_arena, placed_bytes,
+    placed_scratch,
 };
 use super::plan::{
-    down_entry, gate_up_entry, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan,
-    SiteTy,
+    FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy, down_entry,
+    gate_up_entry,
 };
 use super::prefill::Prefill;
 use super::program::Tail;
 use super::proj::ProjKernels;
-use super::router::{gated, RouterDims, RouterKernels};
-use super::scratch::{f32_view, Arena, Dims, Forms, KvPlanes, RopeRows, StepParams};
+use super::router::{RouterDims, RouterKernels, gated};
+use super::scratch::{Arena, Dims, Forms, KvPlanes, RopeRows, StepParams, f32_view};
 use super::slot_pass::{SlotIn, SlotPass};
-use super::ubatch::{ubatch_size, Ubatch, Q32};
+use super::ubatch::{Q32, Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gated_quant::GatedQuantKernels;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
-use crate::host::swap_source::ResidencyGlue;
 use crate::host::StepLeg;
+use crate::host::swap_source::ResidencyGlue;
 use crate::kquant::KquantTileKernels;
 use crate::linear::LinearKernels;
 use crate::model::{
-    block_count, ChainBody, GpuModel, Instrumented, Rollback, RowHeads, SlotRange, SlotRows, Slots,
+    ChainBody, GpuModel, Instrumented, Rollback, RowHeads, SlotRange, SlotRows, Slots, block_count,
 };
-use crate::q38::Q38Kernels;
 use crate::q6k_sel::Q6kSelKernels;
+use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, KGemvKernels};
@@ -43,12 +43,12 @@ use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, Graph};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::quant::GgmlType;
 use gguf::Split;
-use model::arch::models::shape::{rules, MoeShape};
+use gguf::quant::GgmlType;
+use model::arch::Arch;
+use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names::{self, token_embd};
-use model::arch::Arch;
 use model::placement::kernels::{self, SiteEntry};
 use model::placement::{Plan, WholeLoad};
 use std::mem::ManuallyDrop;

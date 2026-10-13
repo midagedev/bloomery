@@ -17,26 +17,26 @@
 use super::body::KvQ8;
 use super::image::MediaRows;
 use super::plan::Flash;
-use super::router::{RouterDims, RouterOut, MAX_TOKENS};
+use super::router::{MAX_TOKENS, RouterDims, RouterOut};
 use super::ubatch::UBATCH;
-use super::wide::{Wide, GEMV_COLS};
+use super::wide::{GEMV_COLS, Wide};
+use crate::GpuError;
 use crate::fault::FaultSink;
 use crate::flash_gqa::{
-    partials_ms_len, partials_v_len, partials_v_len_256, FlashGqaKernels, GqaArgs, GqaQ8Args,
-    GqaRowsArgs, RowTable, HEAD, HEAD_256,
+    FlashGqaKernels, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable, partials_ms_len,
+    partials_v_len, partials_v_len_256,
 };
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::kquant::EntryPlanes;
 use crate::linear::{self, LinearShape};
-use crate::q4k_sel::{tile_cap, BUCKET_EXPERTS};
+use crate::q4k_sel::{BUCKET_EXPERTS, tile_cap};
 use crate::rope_neox::{
-    q8_plane_lens, NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args,
-    RopeNeoxKernels,
+    NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
+    q8_plane_lens,
 };
-use crate::tensor::{window, Q8Act};
+use crate::tensor::{Q8Act, window};
 use crate::weights::q8_0_planes;
-use crate::GpuError;
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
 use gguf::quant::f32_to_f16_bits;
 use model::quant::quantize_q8_0;
