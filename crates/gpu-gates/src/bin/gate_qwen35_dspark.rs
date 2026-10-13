@@ -67,7 +67,7 @@ mod gate {
     use model::quant::quantize_q8_0;
     use refset::arch::qwen35moe::MODEL;
     use runtime::dspark::DraftVocab;
-    use runtime::{Advance, Draft, Speculative, Verify, Want};
+    use runtime::{Advance, Draft, Speculative, Target, Verify, Want};
 
     use crate::dspark_hf::{self, HfFile, Parts};
 
@@ -115,7 +115,6 @@ mod gate {
 
     /// The draft's compile-time width is the clause's proposal width.
     const _: () = assert!(<Spark as Draft<Seat>>::WIDTH == PROPOSAL);
-
 
     /// A seeded stream of standard normals (xorshift64*, Box–Muller).
     struct Normals(u64);
