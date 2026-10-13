@@ -2243,14 +2243,26 @@ gate-gpu-vision:
 gate-gpu-qwen3vl-tower:
     ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3vl-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3vl_tower'
 
-# The MiniCPM-V image tower on the card: today the two kernels its vit_merger adds to the Qwen3-VL block set, each against its
-# host rule on seeded synthetic inputs (no file is read): the windowed attention (16 heads of 72 inside consecutive windows of
-# rows, every value inside the f32 bound of attn_bound around the exact attention of its own window, the count over it pinned at
-# 0) and the group mean (f32, ((p0 + p1) + p2) + p3 then x 0.25, bit for bit, with a control that the inputs exercise the sum's
-# order), swept over 4, 64 and 1024 rows; the named refusal of a row count that is not a whole number of windows. The tower's
-# own clauses join this bin as it is assembled. The gate lock.
+# The MiniCPM-V image tower on the card (the mmproj of MiniCPM-V 4.7: the Qwen3-VL block set plus a vit_merger of windowed attention and a
+# 2x2 mean-residual down-sample, and a 2x2 MLP merger). The two kernels it adds, each against its host rule on seeded synthetic inputs:
+# the windowed attention (16 heads of 72 inside consecutive windows of rows, every value inside the f32 bound of attn_bound around the
+# exact attention of its own window, the count over it pinned at 0) and the group mean (bf16 in and out, ((p0 + p1) + p2) + p3 then
+# x 0.25 then one rounding, bit for bit, with a control that the inputs exercise the sum's order), swept over 4, 64 and 1024 rows;
+# the named refusal of a row count that is not a whole number of windows. Then the tower on the real mmproj: the card bytes (weights
+# 1,101,559,552 B, scratch per patch of a tile), 230 launches a tile, the narrowed tensor; the vit_merger and the final merger
+# teacher-forced against their f32 host twins on a real image's own taps (the erf GELU inside its libm bound); three images (448x448,
+# a sliced 1000x700, 200x200) with finite rows, the rows each grid gives and reuse after the largest bit for bit. The clauses against
+# mainline's reference sets are the media round's. Real file only; the gate lock.
 gate-gpu-minicpmv-tower:
-    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_minicpmv_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minicpmv_tower'
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minicpmv-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_minicpmv_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minicpmv_tower'
+
+# The image-tower crate's host tests (crates/gpu-vision, a device-linked crate, so cargo oxide test): the MiniCPM-V tower's merge-order
+# rows and position buckets, the host twins of its two mergers, and its card bytes held equal to the plan's figure. They open no card
+# (host group).
+[group('canary')]
+[group('host')]
+gate-gpu-vision-lib:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-vision --release --lib'
 
 # The glm5v image tower on the card (the mmproj of GLM-5.3-Flash: llama.cpp's `glm4v` graph with a per-head q/k norm, a clamped
 # SwiGLU and an erf GELU; 24 blocks of heads of 64, a 2x2 convolution merger) against the glm5next vision seat's tap set B
