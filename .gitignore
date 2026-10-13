@@ -1,2 +1,5 @@
 target/
 __pycache__/
+
+# Session handoff notes stay local.
+specs/handoff/
