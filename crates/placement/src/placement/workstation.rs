@@ -1666,4 +1666,73 @@ mod tests {
         );
         assert!(unpaged_need().check(planned_at - HOST_DRIFT - 1).is_err());
     }
+
+    /// An unset residency climb that fills its room exactly still passes the
+    /// load after the reading falls by [`HOST_DRIFT`] or less. The climb
+    /// budgets [`HostNeed::room_left`] at a read room ([`HostRead::MemAvailable`]);
+    /// the load grants [`HostNeed::grant`] with that pool as `extra` and no
+    /// arena to shrink, the call a placed load makes. One byte past the
+    /// margin is refused. A given room is held as given, so the same fill
+    /// is refused after one byte: a climb under a given room never sees the
+    /// margin.
+    #[test]
+    fn an_unset_climb_that_fills_its_room_passes_the_load_after_drift() {
+        let climb = unpaged_need();
+        assert_eq!(climb.extra, 0);
+        assert_eq!(climb.arena, 0);
+        // One byte of pool past the margin, so the fill is exact either way.
+        let reading_bytes = climb
+            .bytes()
+            .checked_add(HOST_DRIFT)
+            .and_then(|b| b.checked_add(1))
+            .expect("the reading stays in range");
+        let reading = (reading_bytes, HostRead::MemAvailable);
+        let mem_left = climb.room_left(&reading);
+        let pool = u64::try_from(mem_left).expect("a read room leaves a pool");
+        assert!(pool > 0, "the room leaves a pool to fill");
+        let load = HostNeed {
+            extra: pool,
+            ..climb
+        };
+        let grants = |drop: u64| {
+            let available = reading_bytes - drop;
+            assert_eq!(
+                load.check(available),
+                load.grant(available, 0).map(|_| ()),
+                "with no arena, grant is check"
+            );
+            load.grant(available, 0)
+        };
+        assert_eq!(
+            grants(HOST_DRIFT),
+            Ok(ArenaGrant::whole(0)),
+            "a drop of the margin still grants"
+        );
+        assert_eq!(
+            grants(HOST_DRIFT - 1),
+            Ok(ArenaGrant::whole(0)),
+            "a drop of one byte under the margin still grants"
+        );
+        assert_eq!(
+            grants(1),
+            Ok(ArenaGrant::whole(0)),
+            "a drop of one byte still grants"
+        );
+        assert!(
+            grants(HOST_DRIFT + 1).is_err(),
+            "one byte past the margin is refused"
+        );
+
+        let given = (reading_bytes, HostRead::Given);
+        let given_pool =
+            u64::try_from(climb.room_left(&given)).expect("a given room leaves a pool");
+        let given_load = HostNeed {
+            extra: given_pool,
+            ..climb
+        };
+        assert!(
+            given_load.grant(reading_bytes - 1, 0).is_err(),
+            "a given room keeps no margin"
+        );
+    }
 }
