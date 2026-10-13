@@ -1,5 +1,6 @@
 //! GPU gate for the DSpark draft's two kernels the target lacks
-//! (`bloomery_gpu_deepseek41::hc_f32` and `::markov`), on one card.
+//! (`bloomery_gpu_deepseek41::hc_f32` and `::markov`) and the common head
+//! chain over the Markov kernel, on one card.
 //!
 //! 1. **HC_PRE, F32 weights** (`ds41_hc_pre_f32`): block 0's `hc_attn_fn` and
 //!    `hc_ffn_fn` against pseudo-random streams in ±2 for m = 1, 3, 5 tokens;
@@ -17,6 +18,22 @@
 //!    HC_PRE rows, and our Markov step on ik's pre-Markov logits against ik's
 //!    deltas, corrected rows and draft tokens. Printed as max|diff|; they do
 //!    not fail the gate.
+//! 4. **Reduced Markov head** (`ds41_markov` with the map on), no model file:
+//!    seeded tables of 1000 target rows and 128 head rows, an injective map
+//!    from head id to target id, base logits of m = 8 rows and a target id
+//!    `first`. The reduced step's eight tokens and rows equal the host
+//!    transcription of the layout doc's rule bit for bit; the guard words past
+//!    the logits (a block's threads beyond `n_head`) are untouched. A previous
+//!    head id at or past `n_head` raises `FaultSite::TokenId` and makes its
+//!    row NaN, the other row unchanged.
+//! 5. **Own head over a reduced vocabulary** (`dspark::head::Head`), no model
+//!    file: the clause-4 tables behind a draft's own Q8_0 rows (hidden 64,
+//!    128 head ids, rows of m = 8). The card's projection logits are read
+//!    back, checked against the host's f64 norm and Q8_0 dot within the f32
+//!    bound, and taken through the host's reduced Markov loop and argmax;
+//!    `tokens` and `tokens_p` return the host's head ids, the corrected
+//!    logits equal the host's bit for bit, and the probabilities equal the
+//!    host transcription of `argmax_p_rows_fault`'s softmax.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -35,20 +52,22 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::path::{Path, PathBuf};
 
-    use bloomery_gpu::{DeviceTensor, FAULT_NONE, Gpu};
+    use bloomery_gpu::dspark::head::{Head, HeadWeights, ReducedMarkovWeights};
+    use bloomery_gpu::dspark::{HeadSource, Q8Rows};
+    use bloomery_gpu::{DeviceTensor, FAULT_NONE, Fault, FaultSite, Gpu, LAYER_NONE};
     use bloomery_gpu_deepseek41::hc::HC_MIX;
     use bloomery_gpu_deepseek41::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
     use bloomery_gpu_deepseek41::markov::{
         MARKOV_RANK, MARKOV_ROW_WORDS, MarkovKernels, MarkovWeights,
     };
     use bloomery_gpu_gates::hc_host::{self, exp_ours, hc_pre_f32};
-    use bloomery_gpu_gates::rounding::butterfly;
+    use bloomery_gpu_gates::rounding::{butterfly, gamma};
     use bloomery_gpu_gates::{
         GateError, bits_equal, bytes_to_words, checks_failed, data_dir, verdict,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
-    use gguf::quant::GgmlType;
+    use gguf::quant::{GgmlType, f32_to_f16_bits, half_to_f32};
     use model::arch::dspark::{DraftHparams, names};
     use refset::arch::deepseek41::{DSREF, DSREF_SET};
     use refset::dsref::{DsRow, Dsref, Graph};
@@ -58,6 +77,14 @@ mod gate {
     const CORPUS_IDS: usize = 64;
     /// Rows of the chained Markov check (the dsref set's block width).
     const CHAIN: usize = 3;
+    /// The reduced head's synthetic shapes: target rows of `w1`, head rows of
+    /// `w2` and the logits, and the rows of its chained step.
+    const RED_PREV: usize = 1000;
+    const RED_HEAD: usize = 128;
+    const RED_M: usize = 8;
+    /// Rows past `n_head` the reduced check's logits carry: the rest of the
+    /// kernel's block of 256 threads, whose writes would land there.
+    const RED_GUARD_ROWS: usize = 256 - RED_HEAD;
     // The host rule's layout is the kernel's.
     const _: () = assert!(hc_host::HC_MIX == HC_MIX);
 
@@ -473,6 +500,423 @@ mod gate {
         Ok(())
     }
 
+    // ------------------------------------- reduced Markov, synthetic tables
+
+    /// The reduced head's tables: `w1` of [`RED_PREV`] rows and `w2` of
+    /// [`RED_HEAD`] rows as bf16 words, `w2` widened, the head-to-target map,
+    /// and the same on the card (the map with a spare word after it, a valid
+    /// target id, so a bound missing in the kernel reads a row and raises
+    /// nothing).
+    struct Reduced {
+        w1: Vec<u32>,
+        w2: Vec<u32>,
+        w2f: Vec<f32>,
+        to_target: Vec<u32>,
+        w1d: DeviceTensor<u32>,
+        w2d: DeviceTensor<u32>,
+        mapd: DeviceBuffer<u32>,
+    }
+
+    impl Reduced {
+        fn weights(&self) -> ReducedMarkovWeights<'_> {
+            ReducedMarkovWeights {
+                w1: &self.w1d,
+                w2: &self.w2d,
+                to_target: &self.mapd,
+            }
+        }
+    }
+
+    /// `rows` rank-long bf16 rows from the seeded stream, as the file's words.
+    fn bf16_words(rows: usize, seed: u32) -> Vec<u32> {
+        let v: Vec<f32> = streams(rows * MARKOV_RANK, seed)
+            .into_iter()
+            .map(bf16_round)
+            .collect();
+        v.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| (p[0].to_bits() >> 16) | (p[1].to_bits() & 0xffff_0000))
+            .collect()
+    }
+
+    /// An injective map of the head ids into the target ids from `RED_HEAD`
+    /// up (no head id maps to itself), from the seeded stream: a partial
+    /// shuffle of the candidates.
+    fn head_to_target(seed: u32) -> Vec<u32> {
+        let mut s = seed;
+        let mut pool: Vec<u32> = (RED_HEAD as u32..RED_PREV as u32).collect();
+        for i in 0..RED_HEAD {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let j = i + (s >> 8) as usize % (pool.len() - i);
+            pool.swap(i, j);
+        }
+        pool.truncate(RED_HEAD);
+        pool
+    }
+
+    fn reduced_tables(gpu: &Gpu) -> Result<Reduced, GateError> {
+        let s = gpu.stream();
+        let w1 = bf16_words(RED_PREV, 41);
+        let w2 = bf16_words(RED_HEAD, 42);
+        let w2f: Vec<f32> = w2
+            .iter()
+            .flat_map(|&x| [f32::from_bits(x << 16), f32::from_bits(x & 0xffff_0000)])
+            .collect();
+        let to_target = head_to_target(43);
+        let mut listed = to_target.clone();
+        listed.push(0);
+        Ok(Reduced {
+            w1d: DeviceTensor::upload(s, &w1, RED_PREV, MARKOV_ROW_WORDS)?,
+            w2d: DeviceTensor::upload(s, &w2, RED_HEAD, MARKOV_ROW_WORDS)?,
+            mapd: DeviceBuffer::from_host(s, &listed)?,
+            w1,
+            w2,
+            w2f,
+            to_target,
+        })
+    }
+
+    /// `-0.0`: any add moves its bits (`-0 + +0 = +0`), so a store the kernel
+    /// makes into a guard word shows whatever it adds.
+    const GUARD: f32 = -0.0;
+
+    /// The logits `base` (`[v * m + c]`, `n_head` rows) with the guard rows after.
+    fn guarded(base: &[f32], m: usize) -> Vec<f32> {
+        let mut l = base.to_vec();
+        l.resize(base.len() + RED_GUARD_ROWS * m, GUARD);
+        l
+    }
+
+    fn guard_intact(l: &[f32], m: usize) -> bool {
+        l[RED_HEAD * m..]
+            .iter()
+            .all(|x| x.to_bits() == GUARD.to_bits())
+    }
+
+    /// The reduced chain on the card from `base` and `first`: the tokens, the
+    /// `n_head` rows and whether the guard rows stayed.
+    fn run_reduced_chain(
+        cx: &Ctx<'_>,
+        rd: &Reduced,
+        base: &[f32],
+        m: usize,
+        first: u32,
+    ) -> Result<(Vec<u32>, Vec<f32>, bool), GateError> {
+        let s = cx.gpu.stream();
+        let fd = DeviceBuffer::from_host(s, &[first])?;
+        let mut tok = DeviceBuffer::<u32>::zeroed(s, m + 2)?;
+        let mut logits = DeviceBuffer::from_host(s, &guarded(base, m))?;
+        for row in 0..m {
+            cx.mk.enqueue_step_reduced(
+                s,
+                cx.gpu.elem(),
+                &rd.weights(),
+                &fd,
+                &mut tok,
+                m,
+                row,
+                cx.gpu.unlabelled_sink(),
+                &mut logits,
+            )?;
+        }
+        s.synchronize()?;
+        let mut toks = tok.to_host_vec(s)?;
+        let (Some(sites), Some(word)) = (toks.pop(), toks.pop()) else {
+            return Err("no fault words after the tokens".into());
+        };
+        if word != FAULT_NONE || sites != 0 {
+            return Err(format!(
+                "the reduced Markov chain's fault word is {word:#x} with site mask {sites:#x}, not clean"
+            )
+            .into());
+        }
+        let mut l = logits.to_host_vec(s)?;
+        let guard = guard_intact(&l, m);
+        l.truncate(RED_HEAD * m);
+        Ok((toks, l, guard))
+    }
+
+    /// The host chain of the layout doc's rule: row 0's previous token is the
+    /// target id `first`, row `c`'s the target id of row `c - 1`'s argmax.
+    fn host_reduced_chain(
+        rd: &Reduced,
+        base: &[f32],
+        m: usize,
+        first: u32,
+    ) -> (Vec<u32>, Vec<f32>) {
+        let mut l = base.to_vec();
+        let (mut prev, mut toks) = (first as usize, Vec::new());
+        for c in 0..m {
+            let d = delta_host(&rd.w1, &rd.w2f, prev);
+            let mut row = vec![0.0f32; RED_HEAD];
+            for v in 0..RED_HEAD {
+                l[v * m + c] += d[v];
+                row[v] = l[v * m + c];
+            }
+            let t = argmax(&row);
+            toks.push(t);
+            prev = rd.to_target[t as usize] as usize;
+        }
+        (toks, l)
+    }
+
+    fn check_reduced(cx: &mut Ctx<'_>) -> Result<(), GateError> {
+        let rd = reduced_tables(cx.gpu)?;
+        let base = streams(RED_HEAD * RED_M, 44);
+        let first = 777u32;
+        let (kt, kl, guard) = run_reduced_chain(cx, &rd, &base, RED_M, first)?;
+        let (ht, hl) = host_reduced_chain(&rd, &base, RED_M, first);
+        let rows = bits_equal(&kl, &hl);
+        let pass = kt == ht && rows && guard;
+        println!(
+            "markov reduced n_prev={RED_PREV} n_head={RED_HEAD} m={RED_M} first={first}: tokens kernel {kt:?} \
+             host {ht:?} rows_bit_identical={rows} guard_rows_intact={guard} {}",
+            verdict(pass)
+        );
+        cx.ok &= pass;
+
+        // A previous head id one past the head's rows, row 1 of two. The
+        // map's spare word is a valid target id: only the kernel's bound on
+        // the head id raises.
+        let s = cx.gpu.stream();
+        let m = 2;
+        let want = Fault::at(LAYER_NONE, FaultSite::TokenId);
+        let base2 = streams(RED_HEAD * m, 45);
+        let fd = DeviceBuffer::from_host(s, &[first])?;
+        let mut tok = DeviceBuffer::from_host(s, &[RED_HEAD as u32, u32::MAX, u32::MAX, u32::MAX])?;
+        let mut logits = DeviceBuffer::from_host(s, &guarded(&base2, m))?;
+        let clean = cx.gpu.take_fault()?.is_none();
+        cx.mk.enqueue_step_reduced(
+            s,
+            cx.gpu.elem(),
+            &rd.weights(),
+            &fd,
+            &mut tok,
+            m,
+            1,
+            cx.gpu.unlabelled_sink(),
+            &mut logits,
+        )?;
+        let t = tok.to_host_vec(s)?;
+        let word = Fault::from_words(t[m], t[m + 1]);
+        let fault = cx.gpu.take_fault()?;
+        let l = logits.to_host_vec(s)?;
+        let nan = (0..RED_HEAD).filter(|v| l[v * m + 1].is_nan()).count();
+        let col0: Vec<f32> = (0..RED_HEAD).map(|v| l[v * m]).collect();
+        let want0: Vec<f32> = (0..RED_HEAD).map(|v| base2[v * m]).collect();
+        let pass = clean
+            && fault == Some(want)
+            && word == Some(want)
+            && nan == RED_HEAD
+            && bits_equal(&col0, &want0)
+            && guard_intact(&l, m);
+        let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+        println!(
+            "markov reduced fault: previous head id {RED_HEAD} (n_head) at row 1 of {m}: raised \"{}\" \
+             readback \"{}\" want \"{want}\"; row 1 NaN {nan} of {RED_HEAD}, row 0 unchanged={}, \
+             guard_rows_intact={} {}",
+            shown(fault),
+            shown(word),
+            bits_equal(&col0, &want0),
+            guard_intact(&l, m),
+            verdict(pass)
+        );
+        cx.ok &= pass;
+        Ok(())
+    }
+
+    // --------------------------------- the own and reduced Head, synthetic
+
+    /// The own head's width: its Q8_0 rows are this many values long.
+    const HEAD_HIDDEN: usize = 64;
+    /// The target id row 0 of the whole-head check follows.
+    const HEAD_FIRST: u32 = 777;
+    /// The own head's norm epsilon.
+    const EPS: f32 = 1e-6;
+
+    /// `vals` as Q8_0 rows in `bloomery_gpu::q8f32`'s device layout: per 32
+    /// values the scale `d = f16(amax / 127)` and the codes `round_half_even(v
+    /// / d)`, four codes to a word (the first in the low byte).
+    fn q8_0_rows(vals: &[f32]) -> (Vec<u32>, Vec<u16>) {
+        let (mut qs, mut ds) = (Vec::new(), Vec::new());
+        for block in vals.as_chunks::<32>().0 {
+            let amax = block.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let d16 = f32_to_f16_bits(amax / 127.0);
+            let d = half_to_f32(d16);
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            ds.push(d16);
+            qs.extend(
+                block.as_chunks::<4>().0.iter().map(|q| {
+                    u32::from_le_bytes(q.map(|v| ((v * id).round_ties_even() as i8) as u8))
+                }),
+            );
+        }
+        (qs, ds)
+    }
+
+    /// The largest probability of a row of logits by `argmax_p_rows_fault`'s
+    /// order: `fv` the row's maximum; thread `t` of 1024 sums `exp(x_i - fv)`
+    /// over `i = t, t + 1024, ..` from 0; each warp's 32 lanes by the xor
+    /// butterfly; the 32 warps' sums added from 0 in order; `1 / total`.
+    fn host_p(row: &[f32]) -> f32 {
+        const THREADS: usize = 1024;
+        let fv = row.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+        let lane = |t: usize| {
+            let mut z = 0.0f32;
+            let mut i = t;
+            while i < row.len() {
+                z += exp_ours(row[i] - fv);
+                i += THREADS;
+            }
+            z
+        };
+        let mut total = 0.0f32;
+        for w in 0..THREADS / 32 {
+            total += butterfly(std::array::from_fn(|l| lane(32 * w + l)));
+        }
+        1.0 / total
+    }
+
+    /// The card's projection logits (`[v * m + c]`) against the host's f64
+    /// norm `x · gain / sqrt(mean(x²) + eps)` and dot with the dequantized
+    /// codes, as the worst ratio of the difference to `γ(4 · HEAD_HIDDEN)`
+    /// times the sum of the absolute terms: the norm's and the dot's f32
+    /// roundings are each about `HEAD_HIDDEN` operations deep. At most 1 holds.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the head's seeded inputs and the card's output, each its own role"
+    )]
+    fn projection_ratio(
+        x: &[f32],
+        gain: &[f32],
+        eps: f32,
+        qs: &[u32],
+        d: &[u16],
+        card: &[f32],
+        m: usize,
+    ) -> f64 {
+        let k = HEAD_HIDDEN;
+        let normed: Vec<Vec<f64>> = (0..m)
+            .map(|c| {
+                let row = &x[c * k..(c + 1) * k];
+                let ms = row
+                    .iter()
+                    .map(|&v| f64::from(v) * f64::from(v))
+                    .sum::<f64>()
+                    / k as f64;
+                let r = 1.0 / (ms + f64::from(eps)).sqrt();
+                row.iter()
+                    .zip(gain)
+                    .map(|(&v, &g)| f64::from(v) * r * f64::from(g))
+                    .collect()
+            })
+            .collect();
+        let bound = gamma(4 * k);
+        let mut worst = 0.0f64;
+        for v in 0..RED_HEAD {
+            let w: Vec<f64> = (0..k)
+                .map(|i| {
+                    let scale = f64::from(half_to_f32(d[v * (k / 32) + i / 32]));
+                    let code = (qs[v * (k / 4) + i / 4] >> (8 * (i % 4))) as u8 as i8;
+                    scale * f64::from(code)
+                })
+                .collect();
+            for (c, n) in normed.iter().enumerate() {
+                let terms = w.iter().zip(n).map(|(a, b)| a * b);
+                let (sum, abs) = terms.fold((0.0f64, 0.0f64), |(s, a), t| (s + t, a + t.abs()));
+                let ratio = (f64::from(card[v * m + c]) - sum).abs() / (bound * abs);
+                worst = if ratio.is_nan() {
+                    f64::INFINITY
+                } else {
+                    worst.max(ratio)
+                };
+            }
+        }
+        worst
+    }
+
+    /// An own head over a reduced vocabulary on seeded weights: the card's
+    /// projection against the host's f64, then the Markov loop, the argmax and
+    /// the probabilities against the host rules, taking the projection's
+    /// logits as the card made them. The head returns head ids.
+    fn check_head_reduced(cx: &mut Ctx<'_>) -> Result<(), GateError> {
+        let (rd, s, m) = (reduced_tables(cx.gpu)?, cx.gpu.stream(), RED_M);
+        let (qs, d) = q8_0_rows(&streams(RED_HEAD * HEAD_HIDDEN, 51));
+        let gain: Vec<f32> = streams(HEAD_HIDDEN, 52)
+            .iter()
+            .map(|g| 1.0 + g / 4.0)
+            .collect();
+        let w = HeadWeights {
+            norm: DeviceTensor::upload(s, &gain, 1, HEAD_HIDDEN)?,
+            eps: EPS,
+            source: HeadSource::Own(Q8Rows {
+                qs: DeviceTensor::upload(s, &qs, RED_HEAD, HEAD_HIDDEN / 4)?,
+                d: DeviceTensor::upload(s, &d, RED_HEAD, HEAD_HIDDEN / 32)?,
+            }),
+            markov_w1: DeviceTensor::upload(s, &rd.w1, RED_PREV, MARKOV_ROW_WORDS)?,
+            markov_w2: DeviceTensor::upload(s, &rd.w2, RED_HEAD, MARKOV_ROW_WORDS)?,
+            to_target: Some(DeviceBuffer::from_host(s, &rd.to_target)?),
+            conf: None,
+        };
+        let mut head = Head::new(cx.gpu, w, HEAD_HIDDEN, m)?;
+        // The weights and the buffers, from the shapes: the head's norm gain,
+        // own rows, both tables and the map, then its scratch.
+        let words = |n: usize| 4 * n;
+        let want_bytes = words(HEAD_HIDDEN)
+            + words(RED_HEAD * HEAD_HIDDEN / 4)
+            + 2 * RED_HEAD * HEAD_HIDDEN / 32
+            + words(RED_PREV * MARKOV_ROW_WORDS)
+            + words(RED_HEAD * MARKOV_ROW_WORDS)
+            + words(RED_HEAD)
+            + words(m * HEAD_HIDDEN)
+            + words(m * RED_HEAD)
+            + words(m + 2)
+            + words(2 * m + 2)
+            + words(1)
+            + words(1);
+        let bytes = head.card_bytes();
+        let host_x = streams(m * HEAD_HIDDEN, 53);
+        let x = DeviceBuffer::from_host(s, &host_x)?;
+        let fd = DeviceBuffer::from_host(s, &[HEAD_FIRST])?;
+
+        head.enqueue_logits(cx.gpu, &x, m)?;
+        let base = head.logits(s, m)?;
+        head.enqueue_markov(cx.gpu, m, &fd)?;
+        let toks = head.tokens(s, m)?;
+        let corrected = head.logits(s, m)?;
+        head.enqueue_p(cx.gpu, m)?;
+        let (ids_p, p) = head.tokens_p(s, m)?;
+
+        let (heads, hl) = host_reduced_chain(&rd, &base, m, HEAD_FIRST);
+        let want = heads;
+        let want_p: Vec<f32> = (0..m)
+            .map(|c| host_p(&(0..RED_HEAD).map(|v| hl[v * m + c]).collect::<Vec<_>>()))
+            .collect();
+        let ratio = projection_ratio(&host_x, &gain, EPS, &qs, &d, &base, m);
+        let finite = base.len() == RED_HEAD * m && base.iter().all(|x| x.is_finite());
+        let rows = bits_equal(&corrected, &hl);
+        let p_bits = bits_equal(&p, &want_p);
+        let pass = finite
+            && ratio <= 1.0
+            && head.n_vocab() == RED_HEAD
+            && bytes == want_bytes as u64
+            && toks == want
+            && rows
+            && ids_p == want
+            && p_bits;
+        println!(
+            "head own reduced hidden={HEAD_HIDDEN} n_head={RED_HEAD} n_prev={RED_PREV} m={m} first={HEAD_FIRST}: \
+             projection worst ratio to bound {ratio:.3e}; head ids {toks:?} want {want:?} tokens_equal={} rows_bit_identical={rows} tokens_p ids_equal={} \
+             p_bit_identical={p_bits} (p {p:?}) card_bytes {bytes} want {want_bytes} {}",
+            toks == want,
+            ids_p == want,
+            verdict(pass)
+        );
+        cx.ok &= pass;
+        Ok(())
+    }
+
     // ------------------------------------------------- oracle diagnostics
 
     /// The draft set's block 0 (`refset::dsref`): its block-pass rows, the
@@ -739,13 +1183,16 @@ mod gate {
         let mut ids = read_ids(&data_dir().join("engram/corpus-code.ids"), CORPUS_IDS)?;
         ids.extend([0, 1, (n - 1) as u32]);
         check_markov(&mut cx, &mk, &ids)?;
+        check_reduced(&mut cx)?;
+        check_head_reduced(&mut cx)?;
 
         oracle(&cx, &attn, &mk)?;
 
         if cx.ok {
             println!(
                 "PASSED: {NAME} — ds41_hc_pre_f32 (m 1/3/5, attn and ffn) and ds41_markov (67 ids, \
-                 3-row chain) bit-identical to the host rules; oracle rows printed, not pinned"
+                 3-row chain; reduced head, 8-row chain and its fault; own reduced Head chain) bit-identical \
+                 to the host rules; oracle rows printed, not pinned"
             );
             Ok(())
         } else {
