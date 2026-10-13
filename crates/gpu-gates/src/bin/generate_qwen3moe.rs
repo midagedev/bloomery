@@ -178,7 +178,8 @@
 //! and `BLOOMERY_GEN_SLOTS` past one is refused by name.
 //!
 //! Drafting (`BLOOMERY_DRAFT=mtp`, or unset as above; a qwen4exp file only,
-//! every other family and word refused by name) the decode runs through the runtime's
+//! every other family and word refused by name — `dspark` on a qwen35moe file
+//! too, whose card draft this build does not carry yet) the decode runs through the runtime's
 //! speculative loop with the file's MTP draft (`app::arch::qwen4exp`'s
 //! `MtpDraft` over the shared draft file beside the target or
 //! `BLOOMERY_MTP_DRAFT`'s, its head `BLOOMERY_MTP_HEAD_ROWS`'s: unset the
@@ -1858,10 +1859,26 @@ mod cli {
         }
     }
 
-    /// `BLOOMERY_DRAFT` on the other families: no word of it drafts them.
+    /// `BLOOMERY_DRAFT` on the other families: no word of it drafts them,
+    /// `dspark` on a qwen35moe file apart (one slot; its load is refused at the
+    /// open unless whole-card, and then while the card draft is not carried),
+    /// and on a qwen3moe file, which the draft does not serve.
     fn draft_refused_on_other(levers: &Levers, family: Family) -> Result<(), GateError> {
         match levers.draft() {
             None => Ok(()),
+            Some("dspark") if family == Family::Qwen35 && levers.gen_slots() > 1 => Err(format!(
+                "BLOOMERY_GEN_SLOTS={} under BLOOMERY_DRAFT=dspark: a verifying load serves one \
+                 resident slot",
+                levers.gen_slots()
+            )
+            .into()),
+            // The load is decided at the open (`open_qwen35`), which refuses a placed one.
+            Some("dspark") if family == Family::Qwen35 => Ok(()),
+            Some("dspark") => Err(
+                "BLOOMERY_DRAFT=dspark: the DSpark draft serves a qwen35moe file \
+                 (Qwen3.6-35B-A3B); this is a qwen3moe file"
+                    .into(),
+            ),
             Some(word) => Err(format!(
                 "BLOOMERY_DRAFT={word}: only a qwen4exp file runs a draft (mtp); this is a {} \
                  file",
@@ -1872,6 +1889,25 @@ mod cli {
                 }
             )
             .into()),
+        }
+    }
+
+    /// The refusal of `BLOOMERY_DRAFT=dspark` on a qwen35moe load: a load placed
+    /// on the host tier (`placed` is the placement it resolved to and why) is
+    /// refused, since the draft needs the whole-card verifying load; a
+    /// whole-card load is refused only while the card draft is not carried.
+    /// The leading phrase is the release pass's key.
+    fn dspark_refusal(placed: Option<(String, String)>) -> GateError {
+        match placed {
+            Some((placement, why)) => format!(
+                "BLOOMERY_DRAFT=dspark needs the whole-card load: {placement} resolved to a \
+                 placed load, {why}; the Qwen3.6 DSpark draft runs only on a model held whole \
+                 on the card - serve a load that holds the whole model there, or no draft"
+            )
+            .into(),
+            None => "BLOOMERY_DRAFT=dspark: the Qwen3.6 DSpark draft opens through CardDspark, \
+                     which this build does not carry yet"
+                .into(),
         }
     }
 
@@ -2121,17 +2157,45 @@ mod cli {
             kv,
             media: false,
         };
+        let dspark = levers.draft() == Some("dspark");
         let mut m = match place {
-            None => q3place::open_unplaced_qwen35(file, o, levers, Record::print)?,
+            None => {
+                if dspark {
+                    let placed = matches!(
+                        q3place::unplaced_qwen35(&file, &o)?,
+                        q3place::Unplaced::Placed(_)
+                    );
+                    return Err(dspark_refusal(placed.then(|| {
+                        (
+                            "--place unset".to_owned(),
+                            "the whole model does not fit the card's free bytes, so the plan \
+                             puts routed experts on the host tier"
+                                .to_owned(),
+                        )
+                    })));
+                }
+                q3place::open_unplaced_qwen35(file, o, levers, Record::print)?
+            }
             Some((p, levers)) => {
                 let q = PlaceQ3::qwen35(&file, p, o)?;
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, None).print();
                 match q.whole_card_qwen35(&file, &plan, (ctx, 1), o)? {
                     Some(card) => {
+                        if dspark {
+                            return Err(dspark_refusal(None));
+                        }
                         Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
                     }
-                    None => q3place::open_qwen35(file, &plan, o, levers.host())?,
+                    None => {
+                        if dspark {
+                            return Err(dspark_refusal(Some((
+                                format!("--place {}", p.name()),
+                                "its plan puts routed experts on the host tier".to_owned(),
+                            ))));
+                        }
+                        q3place::open_qwen35(file, &plan, o, levers.host())?
+                    }
                 }
             }
         };

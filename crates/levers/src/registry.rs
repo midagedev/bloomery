@@ -352,7 +352,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         ),
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
-              two-row pass; `generate_qwen3moe` and `bloomery-serve-qwen38` on a qwen4exp \
+              two-row pass; the qwen3 seat of `bloomery-serve` and `generate_qwen3moe` on a \
+              qwen35moe file: `dspark` serves the HF DSpark draft (`$BLOOMERY_DSPARK_MODEL`) \
+              on a whole-card load of one slot, while `lookup`, `dspark` on a qwen3moe file and \
+              on a placed load, and several slots under it, are refused by name, and the seat \
+              (not the CLI) takes `off` as the plain path; `generate_qwen3moe` and \
+              `bloomery-serve-qwen38` on a qwen4exp \
               file: `mtp` serves the file's MTP draft (`BLOOMERY_MTP_DRAFT`, else the shared \
               draft file beside the target, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`) \
               through a four-row window; `generate_glm5next` and the GLM seat of `bloomery-serve` on a \
@@ -388,7 +393,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               and `/props`' `engine.draft` names it; the plain path prints `load draft=off \
               (<why>)`; `mtp` set is refused by name with stores too short for one window. Every \
               other binary and \
-              family refuses each word by name, `off` included.",
+              family refuses each word by name, `off` included (the qwen3 seat's apart).",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

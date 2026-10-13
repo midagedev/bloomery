@@ -50,6 +50,11 @@ mod rounds;
 )]
 mod drafted;
 
+// The owner of the draft the seat serves (`super::served`).
+#[cfg(feature = "deepseek41")]
+#[path = "shared/serve_seats/served.rs"]
+mod served;
+
 // The shared files the seat names at the crate root (`crate::dspark` and
 // kin), as `generate_ds41` includes them.
 #[cfg(feature = "deepseek41")]

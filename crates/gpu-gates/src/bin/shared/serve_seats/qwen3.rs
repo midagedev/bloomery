@@ -154,6 +154,17 @@
 //! prompt with the rows in place of their positions' embeddings ([`Seat::prefill_media`]). An image
 //! with no `--mmproj` is the server's own 400 for every seat that takes none.
 //!
+//! `BLOOMERY_DRAFT` unset or `off` is the plain path, one token a step.
+//! `dspark` is the draft a qwen35moe file serves (`$BLOOMERY_DSPARK_MODEL`),
+//! held by the seat as the serve seats' one owner of a served draft
+//! (`serve_seats::served`): one slot while `--parallel` names none, several
+//! refused by name, every greedy token after a request's first out of a pass.
+//! The draft needs the whole-card verifying load, so a placed load (routed
+//! experts on the host tier) is refused by name once the load is decided;
+//! a whole-card load is refused by name while the card draft is not part of
+//! this build. On a qwen3moe file the word is refused by name before any
+//! plan, and so is `lookup` on either file.
+//!
 //! The seat sits behind the `deepseek41` feature, the server surface's
 //! scope (`bind`, the `serve` and `sampler` crates); it runs no V4.1 code;
 //! a placed load acts on the plan's and the host tier's levers
@@ -191,8 +202,11 @@ use model::placement::workstation::CardSpec;
 use runtime::Target as _;
 #[cfg(feature = "vision")]
 use serve::media::{MediaFeed, SharedMediaModel};
-use serve::{CacheNote, EngineProps, Saved, ServeError};
+use serve::{CacheNote, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
+
+use super::served::{self, ServedDraft};
+use crate::draft::Draft;
 
 const NAME: &str = "bloomery-serve-qwen3";
 
@@ -705,6 +719,9 @@ impl Body3 for Body35 {
 /// round of several slots as one pass, and whether it counts those rounds.
 struct Q3<B: Body3> {
     s: app::Session<B>,
+    /// The DSpark draft the seat serves ([`ServedDraft`], the serve seats'
+    /// one owner of it): off on the plain path.
+    draft: ServedDraft<B>,
     ctx: usize,
     /// Whether a round of several slots runs as one pass of the busy rows
     /// ([`Q3::step_slots`]): a whole-card load of more than one resident
@@ -782,6 +799,7 @@ impl<B: Body3> Q3<B> {
         let _ = vision;
         Ok(Q3 {
             s,
+            draft: ServedDraft::off(),
             ctx,
             one_pass: ran.together(slots),
             stats: levers.step_stats(),
@@ -818,7 +836,10 @@ impl<B: Body3> Seat for Q3<B> {
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        <B as Body3>::prompt(self.s.model_mut(), ids)
+        match self.draft.prefill(&mut self.s, ids)? {
+            Some(next) => Ok(next),
+            None => <B as Body3>::prompt(self.s.model_mut(), ids),
+        }
     }
 
     /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
@@ -838,6 +859,7 @@ impl<B: Body3> Seat for Q3<B> {
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
+        self.draft.refuse_media()?;
         let encoded = v.encode(
             self.s.model().gpu().context(),
             feeds
@@ -848,7 +870,24 @@ impl<B: Body3> Seat for Q3<B> {
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
-        Ok(self.s.model_mut().step(&[last])?)
+        let next = self.s.model_mut().step(&[last])?;
+        self.draft.stepped(&mut self.s, last, next)?;
+        Ok(next)
+    }
+
+    /// The draft's pass ([`ServedDraft::pass`]), else one plain step.
+    fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
+        match self.draft.pass(&mut self.s, last, out)? {
+            Some(drafted) => Ok(drafted),
+            None => {
+                out.push(self.step(last)?);
+                Ok(Drafted::default())
+            }
+        }
+    }
+
+    fn pass_rows(&self) -> usize {
+        self.draft.rows()
     }
 
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
@@ -862,9 +901,15 @@ impl<B: Body3> Seat for Q3<B> {
     }
 
     /// The session's slot (`app::Session::select_slot`): the model exchanges
-    /// its live sequence with the slot's parked state — pointer moves.
+    /// its live sequence with the slot's parked state — pointer moves. The
+    /// target then stands on another sequence than the draft was fed.
     fn select(&mut self, slot: usize) -> Result<(), GateError> {
-        Ok(self.s.select_slot(slot)?)
+        let changed = slot != self.s.selected();
+        self.s.select_slot(slot)?;
+        if changed {
+            self.draft.moved();
+        }
+        Ok(())
     }
 
     /// The lever the binary parsed ([`Q3::stats`]).
@@ -891,23 +936,33 @@ impl<B: Body3> Seat for Q3<B> {
         )
     }
 
-    /// The model's reset ([`GpuModel::reset`]): these bodies never hold a
-    /// verify's rows, so the session's own reset adds nothing to it.
+    /// The model's reset ([`GpuModel::reset`]; no pass is open between
+    /// requests, so the session's own reset adds nothing to it), the draft
+    /// starting over with it.
     fn reset(&mut self) -> Result<(), GateError> {
-        Ok(self.s.model_mut().reset()?)
+        self.s.model_mut().reset()?;
+        self.draft.reset()
     }
 
     /// The session's cut (`app::Keep`), which takes only a position
     /// [`Seat::keep`] granted; any other is refused by name.
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
+        self.draft.moved();
         Ok(self.s.cut(pos)?)
     }
 
     /// The body's rule: every held position, or for a body with checkpoints
     /// the nearest at or below `n`, with the rule's sentence when it keeps
-    /// less.
+    /// less; under the DSpark draft, also the window the draft's start over
+    /// leaves the prompt call ([`ServedDraft::keep`]).
     fn keep(&self, n: usize) -> (usize, Option<String>) {
-        self.s.keep_query(n)
+        self.draft.keep(n, self.s.pos(), |m| self.s.keep_query(m))
+    }
+
+    /// `engine.draft` and the draft's bytes, when one is served
+    /// ([`ServedDraft::props`]).
+    fn props(&self, p: EngineProps) -> EngineProps {
+        self.draft.props(p)
     }
 
     fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
@@ -1134,6 +1189,51 @@ fn vision_of(
     )
 }
 
+/// Why `BLOOMERY_DRAFT=dspark` on a qwen35moe file is refused: the card
+/// draft that serves it is not part of this build.
+const DSPARK_NOT_CARRIED: &str = "BLOOMERY_DRAFT=dspark: the Qwen3.6 DSpark draft opens through \
+     CardDspark, which this build does not carry yet";
+
+/// The refusal of `BLOOMERY_DRAFT=dspark` on a qwen35moe load: a load placed
+/// on the host tier (`placed` is the placement it resolved to and why) is
+/// refused, since the draft needs the whole-card verifying load; a whole-card
+/// load is refused only while the card draft is not carried
+/// ([`DSPARK_NOT_CARRIED`]). The leading phrase is the release pass's key.
+fn dspark_refusal(placed: Option<(String, String)>) -> GateError {
+    match placed {
+        Some((placement, why)) => format!(
+            "BLOOMERY_DRAFT=dspark needs the whole-card load: {placement} resolved to a placed \
+             load, {why}; the Qwen3.6 DSpark draft runs only on a model held whole on the card \
+             - serve a load that holds the whole model there, or no draft"
+        )
+        .into(),
+        None => DSPARK_NOT_CARRIED.into(),
+    }
+}
+
+/// The draft `BLOOMERY_DRAFT` names for the `arch` file at `path`: unset and
+/// `off` are the plain path ([`served::word`]), `dspark` is the draft a
+/// qwen35moe file serves, refused by name on a qwen3moe file, and `lookup`
+/// is refused on both (it reads the V4.1 body's token history).
+fn draft_of(arch: Arch, levers: &Levers, path: &Path) -> Result<Draft, GateError> {
+    let draft = served::word(levers)?;
+    match (draft, arch) {
+        (Draft::Lookup, _) => Err(
+            "BLOOMERY_DRAFT=lookup: the lookup draft reads the V4.1 body's token history, so \
+             it serves the V4.1 seat only; this seat serves the DSpark draft on a qwen35moe \
+             file, or none"
+                .into(),
+        ),
+        (Draft::Dspark, Arch::Qwen3moe) => Err(format!(
+            "BLOOMERY_DRAFT=dspark: the DSpark draft serves a qwen35moe file (Qwen3.6-35B-A3B); \
+             {} is a qwen3moe file",
+            path.display()
+        )
+        .into()),
+        (draft, _) => Ok(draft),
+    }
+}
+
 /// Loads the model and serves until the listener or the engine fails;
 /// `Ok` carries why the server ended.
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
@@ -1141,6 +1241,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // an unplaced one, they are refused by name.
     let placed = args.iter().any(|a| a == "--place");
     let mut acts_on = vec![
+        bloomery_levers::DRAFT,
         bloomery_levers::QWEN3_KV,
         bloomery_levers::STEP_STATS,
         bloomery_levers::SCREEN,
@@ -1167,6 +1268,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         )
         .into());
     }
+    // The draft word, before anything is planned or loaded.
+    let draft = draft_of(arch, &levers, &path)?;
     // The vocabulary before the plans: `--mmproj`'s encoder is held against it, and its bytes
     // are a reserve of every plan that follows.
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
@@ -1186,6 +1289,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // `--parallel` is one request's context — one slot at the whole of it
     // (`bind::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, 2)?;
+    // The DSpark draft's window is one sequence's: several slots are refused by name.
+    let (slots, from) = served::draft_slots(a.parallel, draft, false)?.unwrap_or((slots, from));
     // A projector the `--hf` repo picked stays only where the load gives the text model the same
     // experts and context with its reserve as without ([`vision_seat::kept`]).
     let vision = vision_seat::kept(vision, &a.vision, |v| {
@@ -1258,6 +1363,22 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The shape of a round of several slots, from the load's body
     // ([`Q3Load::placed_body`]); the open holds the opened body to it.
     let placed = load.placed_body();
+    if draft == Draft::Dspark {
+        return Err(dspark_refusal(placed.then(|| {
+            match a.place {
+                Some(p) => (
+                    format!("--place {}", p.name()),
+                    "its plan puts routed experts on the host tier".to_owned(),
+                ),
+                None => (
+                    format!("--place unset on {}", chosen.place.name()),
+                    "the whole model does not fit the card's free bytes, so the plan puts routed \
+                 experts on the host tier"
+                        .to_owned(),
+                ),
+            }
+        })));
+    }
     let pass = match arch {
         Arch::Qwen3moe => pass_of::<Body>(slots, placed),
         _ => pass_of::<Body35>(slots, placed),
