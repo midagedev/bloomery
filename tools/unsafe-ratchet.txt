@@ -202,7 +202,9 @@ gguf 9 2 0
 # over a value becomes a block for each load and each store (the first pass's residual load, y load and residual store,
 # the second pass's residual load, gamma load and output store), each with its SAFETY line, and the two entries' copies
 # of the body become one call each (#45, merged onto the tree's 1731).
-gpu 1733 193 10
+# PIN(2026-10-13): gpu 1733 -> 1734 blocks, a new kernel entry, not old code relaxed: gqa_flash_seg_k192_ring's
+# call into seg_scalar_kv (the ring pass of a window layer's keys and values), with its SAFETY line.
+gpu 1734 193 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
