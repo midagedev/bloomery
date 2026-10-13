@@ -254,14 +254,21 @@ pub fn plan_a(layers: usize) -> Machine {
 /// Plan (a) asked for the DSpark draft's resident bytes.
 ///
 /// The plan is one stage card and no tier ([`plan_a`]). A draft asked here
-/// either is named [`DRAFT_RESERVE`] on that stage card, or is
-/// [`PlacementError::DraftOffPlan`], before any device alloc. `None` is
-/// [`plan_a`].
+/// is [`plan_tiers`] of that card over no tier, so [`check_tiers`] either
+/// names [`DRAFT_RESERVE`] or returns [`PlacementError::DraftOffPlan`],
+/// before any device alloc. `None` is [`plan_a`].
 pub fn plan_a_draft(layers: usize, draft_bytes: Option<u64>) -> Result<Machine, PlacementError> {
-    if draft_bytes.is_some() {
-        return Err(PlacementError::DraftOffPlan { on: 0, tiers: 0 });
-    }
-    Ok(plan_a(layers))
+    plan_tiers(
+        layers,
+        A6000,
+        &[],
+        draft_bytes.map(|bytes| TierDraft { on: 0, bytes }),
+        TierBatchBytes {
+            staging: 0,
+            scratch: 0,
+            host: 0,
+        },
+    )
 }
 
 /// Design §5 (b): the A6000 runs the layers below [`CUT`], the 3090 the rest
@@ -1171,19 +1178,10 @@ mod tests {
     /// A one-card plan asked for the DSpark draft either names
     /// [`DRAFT_RESERVE`] on the stage card or refuses
     /// [`PlacementError::DraftOffPlan`] before any device alloc.
-    /// [`plan_bp`] keeps that reserve on its tier.
     #[test]
     fn place_a_names_the_draft_or_refuses() {
         let bytes = 7;
         assert_eq!(plan_a_draft(43, None).expect("no draft"), plan_a(43));
-        let batch = tier_batch_bytes(5120, 2304, 6, 512);
-        let bp = plan_bp(43, Some(bytes), batch);
-        assert!(
-            bp.tiers[0]
-                .reserves
-                .iter()
-                .any(|(n, b)| n == DRAFT_RESERVE && *b == bytes)
-        );
         match plan_a_draft(43, Some(bytes)) {
             Ok(m) => {
                 let on_stage = m.cards.iter().any(|c| {

@@ -70,7 +70,9 @@
 //! batch's reserves, which this gate does not load.
 //!
 //! `--plan a|b` picks design §5's plan, b by default: plan (b) splits the
-//! layers over both cards (`workstation::plan_b`), and this gate is the tree's
+//! layers over both cards (`workstation::plan_b`). A `--draft` on plan (a)
+//! or plan (b) is refused by name before any device alloc: neither plan has
+//! a tier card. This gate is the tree's
 //! one run of that two-card staging, the exercise ahead of the two-card tier
 //! (T2 of <https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>'s target profile). The engine itself opens one card:
 //! `body::open` in `bloomery_gpu_deepseek41` refuses a placement on more than
@@ -226,7 +228,25 @@ mod gate {
                     workstation::plan_a(inputs.model.layers)
                 }
             }
-            PlanId::B => workstation::plan_b(inputs.model.layers),
+            PlanId::B => {
+                // A draft file asked of plan (b) is refused by name before
+                // any device alloc. Plan (b) has no tier card. The byte
+                // count is not read.
+                workstation::check_tiers(
+                    workstation::A6000,
+                    &[],
+                    args.draft
+                        .as_ref()
+                        .map(|_| workstation::TierDraft { on: 0, bytes: 0 }),
+                    workstation::TierBatchBytes {
+                        staging: 0,
+                        scratch: 0,
+                        host: 0,
+                    },
+                )
+                .map_err(|e| format!("plan (b): {e}"))?;
+                workstation::plan_b(inputs.model.layers)
+            }
             PlanId::Bp => workstation::plan_bp(
                 inputs.model.layers,
                 Some(draft_reserve(args.draft.as_deref(), &split)?),
