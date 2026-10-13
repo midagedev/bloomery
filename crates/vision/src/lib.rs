@@ -65,7 +65,9 @@ pub enum VisionError {
     #[error("tensor {name}: {detail}")]
     Tensor { name: String, detail: String },
     /// An image prepared as a group of tiles, handed to a reader that runs one patch grid.
-    #[error("the image is a group of {tiles} tiles, not one patch grid; this encoder runs one grid per image")]
+    #[error(
+        "the image is a group of {tiles} tiles, not one patch grid; this encoder runs one grid per image"
+    )]
     NotAGrid { tiles: usize },
     /// The encoder file itself did not open.
     #[error(transparent)]

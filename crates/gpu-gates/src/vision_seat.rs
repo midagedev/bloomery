@@ -61,7 +61,7 @@ use vision::arch::minicpmv::{self, Group};
 use vision::arch::qwen3vl::TokenLimits;
 use vision::arch::{deepseek41v, glm5v, qwen3vl};
 use vision::mrope::Canvas;
-use vision::{MediaModel, Patches, Prepared, VisionError};
+use vision::{EncoderInput, MediaModel, Patches, Prepared, VisionError};
 
 use crate::GateError;
 use crate::generate::Place;
@@ -722,12 +722,13 @@ fn open_tower(
     })
 }
 
-/// One image of a media call: where its span starts in the call's ids, the patches the tower
-/// encodes, and the positions its span takes (what the model's prepare said).
+/// One image of a media call: where its span starts in the call's ids, the encoder input the
+/// tower reads, and the positions its span takes (what the model's prepare said). A reader that
+/// encodes one grid takes [`EncoderInput::grid`]; a tile group is refused by name there.
 #[derive(Clone, Copy, Debug)]
 pub struct Image<'a> {
     pub at: usize,
-    pub patches: &'a Patches,
+    pub input: &'a EncoderInput,
     pub span_len: usize,
 }
 
@@ -737,7 +738,7 @@ impl<'a> Image<'a> {
     pub fn of(at: usize, prepared: &'a Prepared) -> Image<'a> {
         Image {
             at,
-            patches: &prepared.patches,
+            input: &prepared.input,
             span_len: prepared.span_len,
         }
     }
@@ -1012,10 +1013,13 @@ pub fn span_rows_of<'a, K, E: Display>(
     };
     for Image {
         at,
-        patches,
+        input,
         span_len,
     } in images
     {
+        let patches = input
+            .grid()
+            .map_err(|e| format!("the image at {at}: {e}"))?;
         let (h, w) = (patches.plan.n_llm_h, patches.plan.n_llm_w);
         let all = encode(patches).map_err(|e| format!("the image at {at}: {e}"))?;
         let want = h * w * width;
@@ -1928,16 +1932,13 @@ mod tests {
     }
 
     /// An image of a media call reads its three facts off the prepare: the position its span starts
-    /// at, the patches it encodes (those, not a copy) and the positions it takes.
+    /// at, the encoder input it reads (that one, not a copy) and the positions it takes.
     #[test]
     fn an_image_is_read_off_its_prepare() {
-        let prepared = Prepared {
-            span_len: 7,
-            patches: patches(2, 3),
-        };
+        let prepared = Prepared::of_grid(7, patches(2, 3));
         let image = Image::of(5, &prepared);
         assert_eq!((image.at, image.span_len), (5, 7));
-        assert!(std::ptr::eq(image.patches, &prepared.patches));
+        assert!(std::ptr::eq(image.input, &prepared.input));
     }
 
     /// The `vision` record: the line the old eprintln printed, with the home and the cap added,
@@ -2006,6 +2007,11 @@ mod tests {
         }
     }
 
+    /// One image's encoder input: the patch grid `patches` builds.
+    fn grid_input(h: usize, w: usize) -> EncoderInput {
+        EncoderInput::Grid(patches(h, w))
+    }
+
     /// The rows a tower writes for a plan's grid, one row a cell.
     fn cells(p: &Patches) -> usize {
         p.plan.n_llm_h * p.plan.n_llm_w
@@ -2025,16 +2031,16 @@ mod tests {
     /// over its own values of the one buffer of rows.
     #[test]
     fn merged_spans_are_plain_media_spans_over_the_one_buffer() {
-        let (a, b) = (patches(1, 2), patches(2, 1));
+        let (a, b) = (grid_input(1, 2), grid_input(2, 1));
         let images = [
             Image {
                 at: 3,
-                patches: &a,
+                input: &a,
                 span_len: 2,
             },
             Image {
                 at: 9,
-                patches: &b,
+                input: &b,
                 span_len: 2,
             },
         ];
@@ -2061,16 +2067,16 @@ mod tests {
     /// the plain spans, each with the grid of its own image.
     #[test]
     fn image_spans_are_the_media_spans_with_each_spans_grid() {
-        let (a, b) = (patches(1, 2), patches(2, 1));
+        let (a, b) = (grid_input(1, 2), grid_input(2, 1));
         let images = [
             Image {
                 at: 3,
-                patches: &a,
+                input: &a,
                 span_len: 2,
             },
             Image {
                 at: 9,
-                patches: &b,
+                input: &b,
                 span_len: 2,
             },
         ];
@@ -2095,23 +2101,26 @@ mod tests {
     /// given another image's grid, still holds `nx · ny` positions, so `ImageSpan::check` passes it.
     #[test]
     fn equal_area_images_keep_their_own_swapped_grids_in_feed_order() {
-        let (a, b) = (patches(2, 3), patches(3, 2));
+        let (a, b) = (grid_input(2, 3), grid_input(3, 2));
         let images = [
             Image {
                 at: 3,
-                patches: &a,
+                input: &a,
                 span_len: 6,
             },
             Image {
                 at: 12,
-                patches: &b,
+                input: &b,
                 span_len: 6,
             },
         ];
         let got = span_rows_of(images, W, ramp, merged_cells).unwrap();
         let spans = got.image_spans();
         assert_eq!(spans.len(), 2);
-        let grid = |p: &Patches| ImageShape::Grid(p.plan.span_grid().0, p.plan.span_grid().1);
+        let grid = |input: &EncoderInput| {
+            let p = input.grid().expect("a grid");
+            ImageShape::Grid(p.plan.span_grid().0, p.plan.span_grid().1)
+        };
         assert_eq!(spans[0].shape, grid(&a));
         assert_eq!(spans[1].shape, grid(&b));
         assert_eq!(
@@ -2143,16 +2152,16 @@ mod tests {
 
     #[test]
     fn two_images_come_back_in_one_pair_of_buffers_with_each_spans_ranges() {
-        let (a, b) = (patches(2, 2), patches(1, 3));
+        let (a, b) = (grid_input(2, 2), grid_input(1, 3));
         let images = [
             Image {
                 at: 5,
-                patches: &a,
+                input: &a,
                 span_len: 8,
             },
             Image {
                 at: 20,
-                patches: &b,
+                input: &b,
                 span_len: 6,
             },
         ];
@@ -2217,11 +2226,11 @@ mod tests {
 
     #[test]
     fn a_short_window_a_wrong_span_and_a_failed_encode_are_refused_by_name() {
-        let p = patches(2, 2);
+        let p = grid_input(2, 2);
         let image = |span_len| {
             [Image {
                 at: 5,
-                patches: &p,
+                input: &p,
                 span_len,
             }]
         };
