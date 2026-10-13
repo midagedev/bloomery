@@ -904,16 +904,16 @@ impl MediaModel for MockMedia {
             best_h: image.height,
             best_w: image.width,
         };
-        Ok(Prepared {
-            span_len: image.width * image.height,
-            patches: Patches {
+        Ok(Prepared::of_grid(
+            image.width * image.height,
+            Patches {
                 plan,
                 n_vit_h: 0,
                 n_vit_w: 0,
                 patch_len: 0,
                 bf16: Vec::new(),
             },
-        })
+        ))
     }
 }
 
