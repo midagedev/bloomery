@@ -286,8 +286,13 @@ blk_gatebatch() {
 # gpu-gate.sh's card choice, its lease refusals and the V4.1 load lock, against lock files of its own and
 # a stub nvidia-smi (flock and timeout stand-ins where the host has none, as on the Mac), no card.
 blk_gpugate() {
-  if ! ggt=$(bash "$(dirname "$0")/gpu-gate.sh" --self-test 2>&1); then
-    echo "$ggt" >&2
+  # The full transcript stays for the proc-leg read after the barrier. The block's own line is still the
+  # last line, as the other blocks print.
+  local ggt rc=0
+  ggt=$(bash "$(dirname "$0")/gpu-gate.sh" --self-test 2>&1) || rc=$?
+  printf '%s\n' "$ggt" > "$B/gpugate.full"
+  if [ "$rc" != 0 ]; then
+    printf '%s\n' "$ggt" >&2
     echo "check-recipes: the gpu-gate self-test failed" >&2
     return 1
   fi
@@ -700,6 +705,63 @@ print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{
 PY
 }
 
+# The cpu-guard live pair reads a real /proc. It runs here, before the blocks, so it does not share the
+# runner with them (on CI's two cores a foreign busy loop inside the 36-wide block can miss its window).
+# No /proc is a printed skip. The product cpu threshold stays 50 %; only the pair sets CPU_BUSY_PCT=1.
+# The wall is whole seconds, the same unit as the block times below.
+proc_leg() {
+  local t0=$SECONDS out nlive
+  if [ ! -r /proc/self/stat ]; then
+    echo "proc-leg: skipped, no /proc/self/stat"
+    echo "proc-leg: wall $((SECONDS - t0)) s"
+    return 0
+  fi
+  out=$(CPU_GUARD_PROC_LEG=1 bash "$(dirname "$0")/ref/card-tests/cpu-guard.sh" 2>&1) || {
+    printf '%s\n' "$out" >&2
+    echo "check-recipes: proc-leg: cpu-guard failed" >&2
+    echo "proc-leg: wall $((SECONDS - t0)) s" >&2
+    return 1
+  }
+  printf '%s\n' "$out"
+  nlive=$(grep -c '^ok live:' <<< "$out" || true)
+  if ! grep -Fxq 'cpu-guard: 11 tests, 0 failed' <<< "$out" \
+    || [ "$nlive" != 2 ] \
+    || grep -Eq 'skip live' <<< "$out"; then
+    echo "check-recipes: proc-leg: want 'cpu-guard: 11 tests, 0 failed', both 'ok live:' lines, and no 'skip live'" >&2
+    echo "proc-leg: wall $((SECONDS - t0)) s" >&2
+    return 1
+  fi
+  echo "proc-leg: wall $((SECONDS - t0)) s"
+}
+
+# The holder judge already ran inside blk_gpugate. Linux: its success line, and not the /proc skip.
+# A host with no /proc/self/stat: the skip line gpu-gate.sh prints (the judge name, then that echo).
+proc_leg_gpu() {
+  local log=$B/gpugate.full
+  if [ ! -f "$log" ]; then
+    echo "check-recipes: proc-leg: no gpu-gate log" >&2
+    return 1
+  fi
+  if [ -r /proc/self/stat ]; then
+    if grep -Fq 'ok   … its wait line names the first run as the holder' "$log" \
+      && ! grep -Fq 'no /proc here' "$log"; then
+      echo "proc-leg: gpu-gate holder named"
+      return 0
+    fi
+    echo "check-recipes: proc-leg: the gpu-gate log must name the holder and must not skip /proc" >&2
+    return 1
+  fi
+  if grep -Fq 'skip   … its wait line names the first run as the holder: no /proc here (lease_holders reads it)' "$log"; then
+    echo "proc-leg: gpu-gate skip, no /proc"
+    return 0
+  fi
+  echo "check-recipes: proc-leg: the gpu-gate log must print the /proc skip" >&2
+  return 1
+}
+
+proc_leg
+unset CPU_GUARD_PROC_LEG
+
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry pytools boxqcodes fixturevariants
   refsetpublish orphan archowner wt)
@@ -717,6 +779,9 @@ for b in "${BLOCKS[@]}"; do
     cat "$B/$b.out"
   fi
 done
+if ! proc_leg_gpu; then
+  [ "$rc" != 0 ] || rc=1
+fi
 # The five slowest blocks, whole seconds each (the wall is the slowest block's own time under the load of
 # its siblings); a block killed before its wrapper wrote the time counts 0.
 slowest=$(for b in "${BLOCKS[@]}"; do echo "$(cat "$B/$b.t" 2> /dev/null || echo 0) $b"; done |

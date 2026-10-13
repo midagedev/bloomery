@@ -9,9 +9,11 @@
 # reading is exact — the runner's own busy arm left out, a foreign cargo and a rustc started inside the
 # interval counted, a reused pid counted from its own start, a reading under a second only starting the
 # next interval, a tree that cannot be read a named exit. Runs on the Mac (bash 3.2) and on the box.
-# Live, where /proc/self/stat exists (the box): two busy shell scripts under names of their own (so no
-# real build on the box counts), one the test shell's child (its own arm: never tagged) and one
-# reparented away from it (foreign: tagged), each started and killed by the pid this test recorded.
+# Live, where /proc/self/stat exists and CPU_GUARD_PROC_LEG=1 (check-recipes' prologue, alone on the
+# runner): two busy shell scripts under names of their own (so no real build on the box counts), one
+# the test shell's child (its own arm: never tagged) and one reparented away from it (foreign: tagged),
+# each started and killed by the pid this test recorded. Without that flag the loops do not start and
+# the line is `skip live: proc-leg runs this pair`. Without /proc the line is the Mac skip below.
 # One line per test, `ok <name>`, `FAIL <name>: <why>` or `skip <name>: <why>`; exit 0 iff none failed.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -94,7 +96,12 @@ expect 'a process tree that cannot be read is a named exit' 70 '^guard_cpu: pre:
 expect 'strict mode aborts on a foreign cargo' 75 'witness abort-cpu' \
   'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 201 cargo 1 1100 1300; witness() { echo "witness $1"; }; BLOOMERY_OTHER_STRICT=1 guard_cpu post'
 
-if [ -r /proc/self/stat ]; then
+if [ ! -r /proc/self/stat ]; then
+  echo "skip live: no /proc/self/stat here (the box runs it)"
+elif [ "${CPU_GUARD_PROC_LEG:-}" != 1 ]; then
+  # The nine stubs above are the parallel card-tests call. The live pair runs once, in the prologue.
+  echo "skip live: proc-leg runs this pair"
+else
   unset BLOOMERY_LEASE_PROC
   # A busy loop picks no program by argv[0] (a copy of a multicall `yes` would exit), and the kernel names the
   # process by the script's file.
@@ -105,8 +112,8 @@ if [ -r /proc/self/stat ]; then
   export CPU_TEST_TMP=$tmp
   # The test shell starts its own arm and records its pid; the foreign one is started by a subshell that
   # exits at once, so its parent is no longer under the test shell. The cases set a threshold of 1 % of one cpu: they
-  # judge which process is counted, and a busy loop on a loaded two-core host (check-recipes' parallel blocks) gets
-  # well under the default 50 %.
+  # judge which process is counted. The product threshold stays 50 %. A busy loop on a loaded two-core host gets
+  # well under that, which is why this pair is 1 % and why it runs alone in the prologue.
   expect 'live: the runner'\''s own busy arm does not tag its row' 0 '!\[cpu-busy\]' \
     'CPU_BUSY_COMMS="gends41-own cargo-foreign" CPU_BUSY_PCT=1
      "$CPU_TEST_TMP/bin/gends41-own" > /dev/null & echo $! > "$CPU_TEST_TMP/own.pid"
@@ -117,8 +124,6 @@ if [ -r /proc/self/stat ]; then
      ( "$CPU_TEST_TMP/bin/cargo-foreign" > /dev/null & echo $! > "$CPU_TEST_TMP/foreign.pid" )
      guard_cpu pre; sleep 1.5; guard_cpu post
      kill "$(cat "$CPU_TEST_TMP/foreign.pid")"; [ "$CPU_BUSY_TAG" = " [cpu-busy]" ]'
-else
-  echo "skip live: no /proc/self/stat here (the box runs it)"
 fi
 echo "cpu-guard: $n tests, $failed failed"
 [ "$failed" = 0 ]
