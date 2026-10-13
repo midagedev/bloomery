@@ -16,8 +16,13 @@
 //   minicpmv4_7     the canvas layout: an image is one chunk of tiles, [overview, slices row by row], each tile its own tower graph
 //                   (mtmd encodes them one by one), the rows of a tile followed by its separator rows; the text model is a
 //                   qwen35moe with rope.section_order zyxt, so mtmd's position type is M-RoPE and the chunk's is mtmd's canvas.
-//                   Tower mode only (`tower --seat minicpmv4_7`): the sets are `canvas-preproc` and `canvas-taps`, a row
-//                   `<image>/t<k>/<node>` (k = 0 the overview, 1.. the slices), the nodes minicpmv.cpp's `cb()` names.
+//                   The tower arm (`tower --seat minicpmv4_7`) writes `canvas-preproc` and `canvas-taps`, a row
+//                   `<image>/t<k>/<node>` (k = 0 the overview, 1.. the slices), the nodes minicpmv.cpp's `cb()` names. The
+//                   prompt arms are their own cases, not the grid path with a flag: `hidden` writes `canvas-hidden` (the image
+//                   span is one pad run of the chunk's n_tokens ids, tower rows and separator rows, the image token the text
+//                   model's `<unk>`; `mrope_pos` is [4, ids], lanes t y x z, a text row fed [p p p 0] as llama_batch_allocr
+//                   expands it) and `chat` writes `canvas-chatids` (the template, then mtmd's `<image_id>N</image_id><image>`
+//                   text before each chunk). No prose, bf16 or decode arm.
 // A set of a Qwen seat is byte-identical to what this tool wrote before the glm5v seat existed.
 //
 //   dump_mtmd tower  --mmproj <gguf> -m <text gguf> --image <name>=<png> ... [--out-preproc <dir>] --out-taps <dir>
@@ -379,12 +384,12 @@ struct seat_t {
     const char * projector;
     const char * pad_text;   // the vocabulary's text of the image-token id
     bool         mrope;      // M-RoPE positions (4 arrays of n_tokens), else normal (one)
-    bool         canvas;     // an image is one chunk of tiles on a shared canvas (MiniCPM-V 4.7); tower mode only
+    bool         canvas;     // an image is one chunk of tiles on a shared canvas (MiniCPM-V 4.7): tower, hidden and chat modes
 };
 static const seat_t SEATS[] = {
     {"qwen3vl_merger", "<|image_pad|>", true,  false},
     {"glm5v",          "<|image|>",     false, false},
-    {"minicpmv4_7",    "",              true,  true},
+    {"minicpmv4_7",    "<unk>",         true,  true},
 };
 static const seat_t * g_seat  = nullptr;
 static int            g_align = 32;
@@ -876,13 +881,17 @@ static std::vector<int> canvas_suffix(int tile, int grid_x, int grid_y) {
     return {2, 1};
 }
 
-static void canvas_lines(set_writer & w, const std::vector<canvas_image> & imgs) {
+static void canvas_image_lines(set_writer & w, const std::vector<canvas_image> & imgs) {
     w.line("# image columns\tname png_sha256 rgb8_sha256 w h grid_x grid_y n_tiles n_tokens n_pos");
     for (const auto & i : imgs) {
         w.line("# image\t" + i.name + "\t" + i.png_sha + "\t" + i.rgb_sha + "\t" + std::to_string(i.w) + "\t" + std::to_string(i.h) + "\t" +
                std::to_string(i.grid_x) + "\t" + std::to_string(i.grid_y) + "\t" + std::to_string(i.tiles.size()) + "\t" +
                std::to_string(i.n_tokens) + "\t" + std::to_string(i.n_pos));
     }
+}
+
+static void canvas_lines(set_writer & w, const std::vector<canvas_image> & imgs) {
+    canvas_image_lines(w, imgs);
     w.line("# tile columns\timage k kind row col w h nx ny merger_rows suffix row0 rows");
     for (const auto & i : imgs) {
         for (size_t k = 0; k < i.tiles.size(); ++k) {
@@ -893,6 +902,90 @@ static void canvas_lines(set_writer & w, const std::vector<canvas_image> & imgs)
                    std::to_string(t.merger_rows) + "\t" + join_ints(t.suffix) + "\t" + std::to_string(t.row0) + "\t" + std::to_string(t.rows));
         }
     }
+}
+
+// What a canvas chunk is, read off mtmd's decoder positions alone (the positions the helper feeds, so the layout the prompt
+// sets state is the one the decode saw): a tile's rows carry z = pos_0 - 1, the `<image>` token's position (the canvas
+// origin), and share one t; a separator row takes the next t after its tile, the same in every lane. The tiles are the
+// maximal runs of origin rows, the separators the rows after each; the slice grid follows from the separator rows as in
+// run_tower_canvas (S slices in gy lines hold 2S + gy of them) and each tile's separators must be what canvas_suffix gives.
+struct canvas_layout {
+    int              tiles = 0, grid_x = 0, grid_y = 0, n_pos = 0;
+    std::vector<int> tile_rows;   // the token rows of each tile
+    std::vector<int> tile_seps;   // the separator rows after each tile
+};
+
+static canvas_layout canvas_layout_of(const mtmd_image_tokens * it, llama_pos pos_0, const std::string & name) {
+    if (pos_0 < 1) DIE("%s: a canvas chunk sits after its <image> token, not at position %d", name.c_str(), (int) pos_0);
+    canvas_layout l;
+    l.n_pos = (int) mtmd_image_tokens_get_n_pos(it);
+    const int n = (int) mtmd_image_tokens_get_n_tokens(it);
+    const llama_pos origin = pos_0 - 1;
+    llama_pos tile_t = pos_0;   // the t of the tile being read
+    int sep_j = 0;
+    bool in_tile = false;
+    for (int i = 0; i < n; ++i) {
+        const mtmd_decoder_pos d = mtmd_image_tokens_get_decoder_pos(it, pos_0, (size_t) i);
+        if ((llama_pos) d.z == origin) {
+            if (!in_tile) {
+                if (!l.tile_rows.empty()) tile_t += 1 + l.tile_seps.back();
+                l.tile_rows.push_back(0);
+                l.tile_seps.push_back(0);
+                sep_j = 0;
+            }
+            if ((llama_pos) d.t != tile_t) DIE("%s: row %d of tile %zu has t %d, the tile's is %d", name.c_str(), i, l.tile_rows.size() - 1, (int) d.t, (int) tile_t);
+            ++l.tile_rows.back();
+            in_tile = true;
+        } else {
+            if (l.tile_rows.empty()) DIE("%s: row %d is a separator before any tile", name.c_str(), i);
+            const llama_pos p = tile_t + 1 + sep_j;
+            if ((llama_pos) d.t != p || (llama_pos) d.y != p || (llama_pos) d.x != p || (llama_pos) d.z != p) {
+                DIE("%s: separator row %d is (t %d, y %d, x %d, z %d), not %d in every lane", name.c_str(), i, (int) d.t, (int) d.y, (int) d.x, (int) d.z, (int) p);
+            }
+            ++sep_j;
+            ++l.tile_seps.back();
+            in_tile = false;
+        }
+    }
+    l.tiles = (int) l.tile_rows.size();
+    int seps = 0;
+    for (int v : l.tile_seps) seps += v;
+    if (l.tiles < 1 || l.n_pos != l.tiles + seps) DIE("%s: n_pos %d is not %d tiles and %d separator rows", name.c_str(), l.n_pos, l.tiles, seps);
+    const int slices = l.tiles - 1;
+    if (slices > 0) {
+        l.grid_y = seps - 2 * slices;
+        if (l.grid_y < 1 || slices % l.grid_y != 0) DIE("%s: %d separator rows for %d slices fit no grid", name.c_str(), seps, slices);
+        l.grid_x = slices / l.grid_y;
+    } else if (seps != 1) {
+        DIE("%s: an overview alone has one separator row, the chunk has %d", name.c_str(), seps);
+    }
+    for (int k = 0; k < l.tiles; ++k) {
+        if ((size_t) l.tile_seps[k] != canvas_suffix(k, l.grid_x, l.grid_y).size()) {
+            DIE("%s: tile %d has %d separator rows, a %d x %d grid gives it %zu", name.c_str(), k, l.tile_seps[k], l.grid_x, l.grid_y, canvas_suffix(k, l.grid_x, l.grid_y).size());
+        }
+    }
+    return l;
+}
+
+// The span lines of the prompt sets of the canvas seat: an image span is one pad run of the whole chunk.
+static const char * CANVAS_SPAN_COLUMNS = "# span columns\tindex image at len n_tiles grid_x grid_y n_pos start_pos end_pos\n";
+
+static void canvas_span_line(std::string & out, size_t index, const std::string & image, size_t at, size_t len, const canvas_layout & l,
+                             llama_pos start, llama_pos end) {
+    char b[256];
+    snprintf(b, sizeof(b), "# span\t%zu\t%s\t%zu\t%zu\t%d\t%d\t%d\t%d\t%d\t%d\n", index, image.c_str(), at, len, l.tiles, l.grid_x, l.grid_y, l.n_pos,
+             (int) start, (int) end);
+    out += b;
+}
+
+// The image of a prompt set: no tile lines (the taps set holds the tiles), the tile count and the slice grid the positions gave.
+static canvas_image canvas_image_of(const image_chunk & ic, const std::string & name, const std::string & png_sha, const canvas_layout & l) {
+    canvas_image info;
+    info.name = name; info.png_sha = png_sha; info.rgb_sha = ic.rgb_sha;
+    info.w = ic.w; info.h = ic.h; info.grid_x = l.grid_x; info.grid_y = l.grid_y;
+    info.n_tokens = ic.n_tokens; info.n_pos = l.n_pos;
+    info.tiles.resize((size_t) l.tiles);
+    return info;
 }
 
 static int run_tower_canvas(const std::string & mmproj, const std::string & text_model, const std::vector<image_arg> & images,
@@ -1478,6 +1571,160 @@ static int run_hidden(const std::string & mmproj, const std::string & text_model
     return 0;
 }
 
+// ---- hidden, the canvas seat ---------------------------------------------------------------------------------------
+
+// A canvas chunk is its own case: one pad run of n_tokens ids (the tiles' merger rows and their separator rows), positions in
+// four lanes, one decode of the chunk at the position after the `<image>` token. The text rows are llama_decode's, which the
+// batch allocator expands from one position p to [p, p, p, 0]; the image rows' are the helper's, read from each batch view
+// (t, y, x, z, section-major) and checked against mtmd_image_tokens_get_decoder_pos row by row.
+#ifdef DUMP_MTMD_EMBD_BATCH
+struct canvas_cb {
+    row_sink *             sink;
+    std::vector<int32_t> * posz;
+};
+
+static int32_t after_canvas_batch(const mtmd_helper_embd_batch * batch, void * user) {
+    auto * c = static_cast<canvas_cb *>(user);
+    if (batch->n_pos != 4) DIE("an image batch view of %d position arrays, the %s seat's has 4", (int) batch->n_pos, g_seat->projector);
+    const size_t at = c->sink->at;
+    take_image_batch(c->sink, batch->n_tokens, batch->pos, 4);
+    for (int j = 0; j < batch->n_tokens; ++j) (*c->posz)[at + j] = batch->pos[(size_t) 3 * batch->n_tokens + j];
+    return 0;
+}
+#endif
+
+static int run_hidden_canvas(const std::string & mmproj, const std::string & text_model, const std::string & ids_path,
+                             const std::vector<image_arg> & images, const std::string & out, int pad_id, int n_ctx, int n_ubatch, int ngl,
+                             int ncmoe, bool cpu, int threads, int min_tokens, int max_tokens, const std::string & flags) {
+#ifndef DUMP_MTMD_EMBD_BATCH
+    DIE("the %s seat's hidden arm needs a tree that has mtmd_helper_embd_batch", g_seat->projector);
+    (void) mmproj; (void) text_model; (void) ids_path; (void) images; (void) out; (void) pad_id; (void) n_ctx; (void) n_ubatch; (void) ngl;
+    (void) ncmoe; (void) cpu; (void) threads; (void) min_tokens; (void) max_tokens; (void) flags;
+    return 1;
+#else
+    std::string ids_sha;
+    std::vector<llama_token> ids = read_ids(ids_path, &ids_sha);
+    const size_t n_ids = ids.size();
+    if (n_ids == 0) DIE("%s holds no ids", ids_path.c_str());
+    if ((int) n_ids > n_ctx) DIE("%zu ids do not fit in -c %d", n_ids, n_ctx);
+    std::vector<std::pair<size_t, size_t>> spans;   // (at, len) of each maximal run of the image pad id: one image each
+    for (size_t i = 0; i < n_ids;) {
+        if (ids[i] != pad_id) { ++i; continue; }
+        size_t j = i;
+        while (j < n_ids && ids[j] == pad_id) ++j;
+        spans.emplace_back(i, j - i);
+        i = j;
+    }
+    if (spans.size() != images.size()) DIE("%zu image span(s) in %s, %zu --image given", spans.size(), ids_path.c_str(), images.size());
+
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = ngl;
+    keep_experts_on_host(mp, ngl > 0 ? ncmoe : 0);
+    llama_model * model = llama_model_load_from_file(text_model.c_str(), mp);
+    if (!model) DIE("failed to load %s", text_model.c_str());
+    const int n_embd = llama_model_n_embd_inp(model);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const char * pad_text = llama_vocab_get_text(vocab, pad_id);
+    if (!pad_text || strcmp(pad_text, g_seat->pad_text) != 0) DIE("id %d is %s, not %s", pad_id, pad_text ? pad_text : "(none)", g_seat->pad_text);
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = (uint32_t) n_ctx;
+    cp.n_batch = (uint32_t) n_ctx;
+    cp.n_ubatch = (uint32_t) std::min(n_ubatch, n_ctx);
+    cp.n_seq_max = 1;
+    cp.embeddings = true;
+    cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    if (threads > 0) { cp.n_threads = threads; cp.n_threads_batch = threads; }
+    llama_context * lctx = llama_init_from_model(model, cp);
+    if (!lctx) DIE("failed to make the context");
+    mtmd_context * mctx = make_mtmd(mmproj, model, cpu, threads > 0 ? threads : 4, min_tokens, max_tokens, nullptr);
+    check_pos_type(mctx);
+
+    std::vector<float> rows((size_t) n_ids * n_embd);
+    std::vector<int32_t> pos3(n_ids * 3), posz(n_ids, 0);   // a text row's z is 0
+    row_sink sink;
+    sink.lctx = lctx; sink.n_embd = n_embd; sink.rows = &rows; sink.pos3 = &pos3; sink.limit = n_ids;
+    canvas_cb cb = {&sink, &posz};
+
+    std::vector<canvas_image> infos;
+    std::string span_lines = CANVAS_SPAN_COLUMNS;
+    llama_pos n_past = 0;
+    size_t i = 0;
+    for (size_t k = 0; k <= spans.size(); ++k) {
+        const size_t stop = k < spans.size() ? spans[k].first : n_ids;
+        if (stop > i) {
+            decode_text(lctx, &sink, ids, i, stop, n_ctx, n_past);
+            i = stop;
+        }
+        if (k == spans.size()) break;
+        const size_t len = spans[k].second;
+        const image_arg & a = images[k];
+        std::vector<uint8_t> png;
+        if (!read_file(a.path, png)) DIE("cannot read %s", a.path.c_str());
+        const std::string png_sha = sha256_of(png.data(), png.size());
+        const llama_pos start = n_past;
+        image_chunk ic;
+        tokenize_image(mctx, a, ic);
+        if ((size_t) ic.n_tokens != len) DIE("%s: mtmd gives %d tokens, the prompt's span %zu holds %zu image pad ids", a.name.c_str(), ic.n_tokens, k, len);
+        const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(ic.chunk);
+        const canvas_layout lay = canvas_layout_of(it, start, a.name);
+        std::vector<float> embd;
+        encode_image(mctx, ic, n_embd, embd);
+        llama_pos new_past = start;
+        sink.fed = 0;
+        const int32_t r = mtmd_helper_decode_image_chunk(mctx, lctx, ic.chunk, embd.data(), start, 0, n_ctx, &new_past, after_canvas_batch, &cb);
+        if (r != 0) DIE("mtmd_helper_decode_image_chunk failed (%d)", (int) r);
+        if (sink.fed != ic.n_tokens) DIE("the helper fed %d rows of %d", sink.fed, ic.n_tokens);
+        if (new_past != start + lay.n_pos) DIE("%s: the helper advanced %d positions, the chunk's n_pos is %d", a.name.c_str(), (int) (new_past - start), lay.n_pos);
+        if (sink.at != i + len) DIE("span %zu: %zu rows collected, the span ends at %zu", k, sink.at, i + len);
+        for (size_t row = 0; row < len; ++row) {   // the batches carried the positions mtmd names, in all four lanes
+            const mtmd_decoder_pos d = mtmd_image_tokens_get_decoder_pos(it, start, row);
+            const size_t at = i + row;
+            if (pos3[at * 3 + 0] != (int32_t) d.t || pos3[at * 3 + 1] != (int32_t) d.y || pos3[at * 3 + 2] != (int32_t) d.x || posz[at] != (int32_t) d.z) {
+                DIE("%s: row %zu was fed (t %d, y %d, x %d, z %d), mtmd names (t %d, y %d, x %d, z %d)", a.name.c_str(), row, pos3[at * 3], pos3[at * 3 + 1],
+                    pos3[at * 3 + 2], posz[at], (int) d.t, (int) d.y, (int) d.x, (int) d.z);
+            }
+        }
+        n_past = new_past;
+        canvas_span_line(span_lines, k, a.name, i, len, lay, start, n_past);
+        infos.push_back(canvas_image_of(ic, a.name, png_sha, lay));
+        i += len;
+    }
+    if (sink.at != n_ids) DIE("%zu rows collected of %zu ids", sink.at, n_ids);
+
+    set_writer w(out);
+    char arch[128];
+    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0) snprintf(arch, sizeof(arch), "unknown");
+    header_common(w, "canvas-hidden", text_model, arch, text_model, mmproj, cpu, threads, min_tokens, max_tokens, flags,
+                  "dump_mtmd hidden — llama.cpp mainline result_norm of every position of a MiniCPM-V 4.7 prompt, raw f32, little-endian");
+    w.line("# tokens_file\t" + ids_path);
+    w.line("# tokens_file_sha256\t" + ids_sha);
+    w.line("# tokens_count\t" + std::to_string(n_ids));
+    w.line("# rows\tmtmd");
+    w.line("# image_pad_id\t" + std::to_string(pad_id));
+    w.line("# pos_lanes\tt y x z\ta text row is fed p p p 0");
+    w.line("# ctx\t" + std::to_string(n_ctx) + "\tubatch\t" + std::to_string(cp.n_ubatch) + "\tn_pos_end\t" + std::to_string((int) n_past));
+    w.head += span_lines;
+    canvas_image_lines(w, infos);
+    const int64_t ne_r[4] = {n_embd, (int64_t) n_ids, 1, 1};
+    w.tensor_f32("result_norm", "RMS_NORM", ne_r, rows.data());
+    std::vector<int32_t> pos4(n_ids * 4);
+    for (size_t r = 0; r < n_ids; ++r) {
+        for (int c = 0; c < 3; ++c) pos4[r * 4 + c] = pos3[r * 3 + c];
+        pos4[r * 4 + 3] = posz[r];
+    }
+    const int64_t ne_p[4] = {4, (int64_t) n_ids, 1, 1};
+    w.tensor_i32("mrope_pos", "INPUT", ne_p, pos4);
+    w.finish();
+    mtmd_free(mctx);
+    llama_free(lctx);
+    llama_model_free(model);
+    llama_backend_free();
+    return 0;
+#endif
+}
+
 // ---- chat ----------------------------------------------------------------------------------------------------------
 
 #ifdef DUMP_MTMD_CHAT
@@ -1593,7 +1840,8 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
 
         std::vector<int32_t> ids;
         std::vector<image_info> infos;
-        std::string span_lines = "# span columns\tindex image at len nx ny n_pos start_pos end_pos\n";
+        std::vector<canvas_image> cinfos;
+        std::string span_lines = g_seat->canvas ? CANVAS_SPAN_COLUMNS : "# span columns\tindex image at len nx ny n_pos start_pos end_pos\n";
         llama_pos n_past = 0;
         size_t n_img = 0;
         for (size_t i = 0; i < mtmd_input_chunks_size(chunks); ++i) {
@@ -1615,7 +1863,15 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
                 info.w = bw[n_img]; info.h = bh[n_img];
                 info.n_tokens = (int) n;
                 info.n_pos = (int) mtmd_input_chunk_get_n_pos(c);
-                if (g_seat->mrope) {
+                if (g_seat->canvas) {
+                    // one chunk of tiles: its layout from the positions it will be fed at n_past, the image token's successor
+                    const canvas_layout lay = canvas_layout_of(it, n_past, info.name);
+                    if (info.n_pos != lay.n_pos) DIE("request %s: n_pos %d, the layout's %d", id.c_str(), info.n_pos, lay.n_pos);
+                    image_chunk shape;
+                    shape.w = info.w; shape.h = info.h; shape.n_tokens = (int) n; shape.rgb_sha = info.rgb_sha;
+                    cinfos.push_back(canvas_image_of(shape, info.name, info.png_sha, lay));
+                    canvas_span_line(span_lines, n_img, info.name, ids.size(), n, lay, n_past, n_past + info.n_pos);
+                } else if (g_seat->mrope) {
                     const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, n - 1);
                     info.nx = (int) last.x + 1; info.ny = (int) last.y + 1;
                     if ((size_t) info.nx * info.ny != n) DIE("request %s: grid %d x %d is not %zu tokens", id.c_str(), info.nx, info.ny, n);
@@ -1633,11 +1889,13 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
                     info.nx = canvases[info.name].first; info.ny = canvases[info.name].second;
                     if ((size_t) info.nx * info.ny != n) DIE("request %s: grid %d x %d is not %zu tokens", id.c_str(), info.nx, info.ny, n);
                 }
-                info.best_w = info.nx * g_align; info.best_h = info.ny * g_align;
-                char b[256];
-                snprintf(b, sizeof(b), "# span\t%zu\t%s\t%zu\t%zu\t%d\t%d\t%d\t%d\t%d\n", n_img, info.name.c_str(), ids.size(), n, info.nx,
-                         info.ny, info.n_pos, (int) n_past, (int) n_past + info.n_pos);
-                span_lines += b;
+                if (!g_seat->canvas) {
+                    info.best_w = info.nx * g_align; info.best_h = info.ny * g_align;
+                    char b[256];
+                    snprintf(b, sizeof(b), "# span\t%zu\t%s\t%zu\t%zu\t%d\t%d\t%d\t%d\t%d\n", n_img, info.name.c_str(), ids.size(), n, info.nx,
+                             info.ny, info.n_pos, (int) n_past, (int) n_past + info.n_pos);
+                    span_lines += b;
+                }
                 ids.insert(ids.end(), n, pad_id);
                 n_past += info.n_pos;
                 infos.push_back(info);
@@ -1657,7 +1915,7 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
             write_raw(out + "/" + id + ".ids", txt.data(), txt.size());
         }
         set_writer w(out + "/" + id);
-        header_common(w, "chatids", text_model, arch, text_model, mmproj, true, threads, min_tokens, max_tokens, flags,
+        header_common(w, g_seat->canvas ? "canvas-chatids" : "chatids", text_model, arch, text_model, mmproj, true, threads, min_tokens, max_tokens, flags,
                       "dump_mtmd chat — llama.cpp mainline's llama-server ids of a chat request, one id a row");
         w.line("# request_sha256\t" + sha256_of((const uint8_t *) line.data(), line.size()));
         w.line("# chat\ttemplate_sha256 " + tmpl_sha + "\tuse_jinja 1\tenable_thinking " + std::to_string((int) enable_thinking) +
@@ -1670,7 +1928,8 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
         w.line("# image_pad_id\t" + std::to_string(pad_id));
         positions_line(w);
         w.head += span_lines;
-        image_lines(w, infos);
+        if (g_seat->canvas) canvas_image_lines(w, cinfos);
+        else image_lines(w, infos);
         const int64_t ne_i[4] = {(int64_t) ids.size(), 1, 1, 1};
         w.tensor_i32("ids", "TOKENS", ne_i, ids);
         w.finish();
@@ -1752,13 +2011,17 @@ int main(int argc, char ** argv) {
     // a hidden run with no --image is a text prompt (its ids hold no image span: run_hidden refuses a span without an image)
     if (mmproj.empty() || model.empty() || out.empty() || (images.empty() && mode != "hidden")) DIE("--mmproj, -m, --out and at least one --image are required");
     select_seat(mmproj, seat);
-    if (g_seat->canvas && mode != "tower") DIE("the %s seat dumps the tower only (tower mode): its prompt arms are not built", g_seat->projector);
+    if (g_seat->canvas && mode != "tower" && mode != "hidden" && mode != "chat") DIE("the %s seat has the tower, hidden and chat modes, got %s", g_seat->projector, mode.c_str());
     if (mode == "tower" && g_seat->canvas) return run_tower_canvas(mmproj, model, images, out_pre, out, cpu, threads > 0 ? threads : 4, min_t, max_t, flags);
     if (mode == "tower") return run_tower(mmproj, model, images, out_pre, out, cpu, threads > 0 ? threads : 4, min_t, max_t, tap_patches, taps_final, flags);
     if (mode == "hidden") {
         if (ids.empty()) DIE("hidden needs --ids");
         if (decode_steps < 0 || (decode_steps > 0) != !out_decode.empty()) DIE("--decode <steps> and --out-decode <dir> go together");
         if (decode_steps > 0 && rows != "mtmd") DIE("--decode follows the tower's own rows: --rows mtmd");
+        if (g_seat->canvas) {
+            if (rows != "mtmd" || !prose.empty() || decode_steps > 0 || rows_node) DIE("the %s seat's hidden arm is --rows mtmd, with no prose, decode or node rows", g_seat->projector);
+            return run_hidden_canvas(mmproj, model, ids, images, out, pad, ctx, ub, ngl, ncmoe, cpu, threads, min_t, max_t, flags);
+        }
         return run_hidden(mmproj, model, ids, images, out, rows, prose, pad, ctx, ub, ngl, ncmoe, cpu, threads, min_t, max_t, decode_steps, out_decode, rows_node, flags);
     }
     if (mode == "chat") {
