@@ -3133,16 +3133,16 @@ mod media_tests {
         let feed = MediaFeed {
             at,
             key: ImageKey([key; 32]),
-            prepared: Arc::new(Prepared {
-                span_len: len,
-                patches: Patches {
+            prepared: Arc::new(Prepared::of_grid(
+                len,
+                Patches {
                     plan,
                     n_vit_h: 0,
                     n_vit_w: 0,
                     patch_len: 0,
                     bf16: Vec::new(),
                 },
-            }),
+            )),
         };
         Prompt {
             held: Held {

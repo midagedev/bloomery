@@ -100,10 +100,10 @@ impl MediaModel for Media {
 
     fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
         let patches = preprocess(image, &self.rule)?;
-        Ok(Prepared {
-            span_len: patches.plan.n_llm_h * patches.plan.n_llm_w,
+        Ok(Prepared::of_grid(
+            patches.plan.n_llm_h * patches.plan.n_llm_w,
             patches,
-        })
+        ))
     }
 }
 
@@ -279,18 +279,19 @@ mod tests {
             ((1000, 600), ((1008, 616), (36, 22), 792)),
         ] {
             let p = m.prepare(&image(w, h, bright)).expect("prepare");
+            let patches = p.grid().expect("one grid");
             let c = rule.canvas(w, h).expect("canvas");
             assert_eq!((c.width, c.height), canvas, "{w}x{h}");
             assert_eq!(rule.grid(&c), grid, "{w}x{h}");
             assert_eq!(p.span_len, span, "{w}x{h}");
             assert_eq!(p.span_len, rule.grid(&c).0 * rule.grid(&c).1, "{w}x{h}");
             assert_eq!(
-                (p.patches.plan.n_llm_w, p.patches.plan.n_llm_h),
+                (patches.plan.n_llm_w, patches.plan.n_llm_h),
                 grid,
                 "{w}x{h}"
             );
             assert_eq!(
-                (p.patches.plan.best_w, p.patches.plan.best_h),
+                (patches.plan.best_w, patches.plan.best_h),
                 canvas,
                 "{w}x{h}"
             );

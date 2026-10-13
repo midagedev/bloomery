@@ -374,7 +374,7 @@ mod gate {
                         at: s.at - from..s.at + s.len - from,
                         rows,
                     },
-                    grid: (s.nx, s.ny),
+                    shape: bloomery_gpu::media::ImageShape::Grid(s.nx, s.ny),
                 })
                 .collect()
         }
@@ -849,7 +849,7 @@ mod gate {
                 at: after..after + 4,
                 rows: &c.rows[0][..4 * c.width],
             },
-            grid: (2, 2),
+            shape: bloomery_gpu::media::ImageShape::Grid(2, 2),
         };
         let want = "inside the image";
         let mut ok = true;

@@ -309,6 +309,9 @@ impl crate::Tower for Encoder {
     fn scratch_bytes(&self) -> u64 {
         Encoder::scratch_bytes(self)
     }
+    fn separators(&self) -> Option<&[f32]> {
+        Some(Encoder::separators(self))
+    }
 }
 
 fn err(what: &'static str, e: impl std::error::Error + Send + Sync + 'static) -> GpuError {

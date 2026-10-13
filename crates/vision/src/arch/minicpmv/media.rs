@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use super::Hparams;
 use super::group::{Group, Marks, preprocess_group};
-use crate::media::{MediaModel, PartJoin, Prepared};
+use crate::media::{EncoderInput, MediaModel, PartJoin, Prepared};
 use crate::{Rgb8, VisionError};
 
 /// An image to its group of tiles (see [`super::group`]).
@@ -69,15 +69,17 @@ impl MediaModel for Media {
         PartJoin::LlamaServer
     }
 
-    /// A group is several tiles of several sizes, and [`Prepared`] holds one patch tensor: this
-    /// model's image is prepared by [`Media::group`], whose `rows()` is the span length.
+    fn image_head(&self, index: usize) -> Option<Vec<u32>> {
+        Some(self.marks.head(index))
+    }
+
+    /// The image as its group of tiles; the span is the group's rows, the tiles' tokens and the
+    /// separators between them.
     fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
-        Err(VisionError::Size {
-            width: image.width,
-            height: image.height,
-            detail: "a MiniCPM-V 4.7 image is a group of tiles, not one patch tensor; \
-                     prepare it with minicpmv::Media::group"
-                .into(),
+        let group = self.group(image)?;
+        Ok(Prepared {
+            span_len: group.rows(),
+            input: EncoderInput::Tiles(group),
         })
     }
 }
@@ -88,17 +90,17 @@ mod tests {
     use crate::Rgb8;
     use crate::arch::minicpmv::group::Marks;
     use crate::arch::minicpmv::hparams::tests::hp;
-    use crate::media::{MediaModel, PartJoin, expand_spans};
+    use crate::media::{EncoderInput, MediaModel, PartJoin, expand_spans};
 
     fn media() -> Media {
         let marks = Marks::lookup(|s| Some(1000 + s.len() as u32)).expect("marks");
         Media::new(hp(), marks, "<unk>", 248_077)
     }
 
-    /// The data a server reads, and the one thing `prepare` refuses by name; the span a prompt's
-    /// placeholder expands to is the group's rows.
+    /// The data a server reads: the numbered placeholder, its marker, the token it expands, the
+    /// join rule and the ids that precede the token.
     #[test]
-    fn the_media_data_and_the_group_span() {
+    fn the_media_data_a_server_reads() {
         let m = media();
         assert_eq!(m.image_placeholder(0), "<image_id>0</image_id><image><unk>");
         assert_eq!(
@@ -108,17 +110,34 @@ mod tests {
         assert_eq!(m.image_marker(), "<image><unk>");
         assert_eq!(m.image_token(), 248_077);
         assert_eq!(m.part_join(), PartJoin::LlamaServer);
-        let image = Rgb8::filled(1000, 700, [1, 2, 3]);
-        assert!(
-            m.prepare(&image)
-                .unwrap_err()
-                .to_string()
-                .contains("Media::group")
-        );
-        let rows = m.group(&image).expect("group").rows();
-        assert_eq!(rows, 360);
-        let ids = expand_spans(&[5, 248_077, 6], m.image_token(), &[rows]).expect("expand");
-        assert_eq!(ids.spans.len(), 1);
-        assert_eq!(ids.spans[0], 1..361);
+        // `<image_id>`, the digits, `</image_id>`, `<image>`.
+        let head = m.image_head(12).expect("a numbered model has a head");
+        assert_eq!(head, m.marks().head(12));
+        assert_eq!(head.len(), 5);
+    }
+
+    /// `prepare` gives the group's rows, the tiles' tokens and the separators, as its span, and
+    /// the group itself as the encoder's input. 448×448 and 200×200 are one overview of 8×8
+    /// tokens and its `</image>` (64 + 1); 1000×700 is an overview and four slices of 10×7
+    /// tokens, 5 × 70 = 350 tokens and 2 + 2 + 3 + 2 + 1 = 10 separators. A prompt's placeholder
+    /// expands to that many positions.
+    #[test]
+    fn prepare_gives_the_groups_rows_as_the_span() {
+        let m = media();
+        for ((w, h), span, tiles) in [
+            ((448, 448), 65, 1),
+            ((1000, 700), 360, 5),
+            ((200, 200), 65, 1),
+        ] {
+            let p = m.prepare(&Rgb8::filled(w, h, [1, 2, 3])).expect("prepare");
+            assert_eq!(p.span_len, span, "{w}x{h}");
+            let EncoderInput::Tiles(group) = &p.input else {
+                panic!("{w}x{h}: a MiniCPM-V image is a group of tiles");
+            };
+            assert_eq!((group.tiles.len(), group.rows()), (tiles, span), "{w}x{h}");
+            let ids =
+                expand_spans(&[5, 248_077, 6], m.image_token(), &[p.span_len]).expect("expand");
+            assert_eq!(ids.spans, [1..1 + span], "{w}x{h}");
+        }
     }
 }

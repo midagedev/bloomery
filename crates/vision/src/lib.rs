@@ -33,7 +33,7 @@ pub mod preprocess;
 pub mod resample;
 
 pub use image::{FileKind, Rgb8};
-pub use media::{MediaModel, Prepared};
+pub use media::{EncoderInput, MediaModel, Prepared};
 pub use mrope::{MropeError, MropeSeq};
 pub use preprocess::{GridPlan, PatchLayout, Patches, patchify};
 
@@ -64,6 +64,11 @@ pub enum VisionError {
     /// A tensor of the encoder file that is unknown, duplicated, missing or of another shape or type.
     #[error("tensor {name}: {detail}")]
     Tensor { name: String, detail: String },
+    /// An image prepared as a group of tiles, handed to a reader that runs one patch grid.
+    #[error(
+        "the image is a group of {tiles} tiles, not one patch grid; this encoder runs one grid per image"
+    )]
+    NotAGrid { tiles: usize },
     /// The encoder file itself did not open.
     #[error(transparent)]
     Load(#[from] gguf::LoadError),

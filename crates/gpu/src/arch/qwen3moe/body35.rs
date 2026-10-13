@@ -514,10 +514,12 @@ pub struct Slot35 {
 
 /// What a media load makes each sequence's rotation table from
 /// ([`SeqRope::new`]): the plain table's host rows, shared by every table,
-/// and the file's IMROPE sections.
+/// the file's IMROPE sections and the order they read an image row's
+/// position slots in (`rope.section_order`).
 struct RopeBase {
     base: Arc<[f32]>,
     sections: [u32; 4],
+    order: vision::mrope::SectionOrder,
 }
 
 /// The table the rope launches of a sequence read: its own on a media load,
@@ -1090,8 +1092,9 @@ struct Pre35 {
     d: Dims,
     ubatch: NonZeroUsize,
     base: f32,
-    /// The file's IMROPE sections, read when the load takes media.
-    sections: Option<[u32; 4]>,
+    /// The file's IMROPE sections and `rope.section_order`, read when the
+    /// load takes media.
+    sections: Option<([u32; 4], vision::mrope::SectionOrder)>,
 }
 
 impl Pre35 {
@@ -1155,6 +1158,18 @@ impl Pre35 {
                     "a media load of a file with no IMROPE attention layer: an image's positions \
                      have no sections to follow",
                 ))
+            })
+            .transpose()?
+            .map(|sections| {
+                use model::arch::qwen35moe::hparams::{Hparams, SectionOrder as Named};
+                let order = match Hparams::read(file)
+                    .map_err(|e| GpuError::plan(WHAT, e))?
+                    .rope_order
+                {
+                    Named::Tyxz => vision::mrope::SectionOrder::Tyxz,
+                    Named::Zyxt => vision::mrope::SectionOrder::Zyxt,
+                };
+                Ok::<_, GpuError>((sections, order))
             })
             .transpose()?;
         if mma && kinds.contains(&Kind35::Gqa(Flash::Pairs)) {
@@ -1608,11 +1623,18 @@ impl Body35 {
         let table = RopeTable::new(&RopeSpec::window(base, q35::ROPE_DIMS as usize))?;
         let rope = RopeRows::new(stream, &table, q35::ROPE_DIMS as usize, ctx)?;
         let (seq_rope, rope_base) = match sections {
-            Some(sections) => {
+            Some((sections, order)) => {
                 let base: Arc<[f32]> =
                     RopeRows::host_rows(&table, q35::ROPE_DIMS as usize, ctx)?.into();
-                let own = SeqRope::new(stream, base.clone(), sections, ctx)?;
-                (Some(own), Some(RopeBase { base, sections }))
+                let own = SeqRope::new(stream, base.clone(), sections, order, ctx)?;
+                (
+                    Some(own),
+                    Some(RopeBase {
+                        base,
+                        sections,
+                        order,
+                    }),
+                )
             }
             None => (None, None),
         };
@@ -2885,7 +2907,7 @@ fn media_call<T>(
             return Err(GpuError::state(what, "the media load's table and staging"));
         };
         rows.begin(stream, first, spans)?;
-        if let Err(e) = rope.push_spans(stream, &ImageSpan::rows_of(first, spans)) {
+        if let Err(e) = rope.push_images(stream, first, spans) {
             rows.end();
             return Err(e);
         }
@@ -3139,7 +3161,7 @@ impl Slots for Body35 {
         let rope = self
             .rope_base
             .as_ref()
-            .map(|b| SeqRope::new(stream, b.base.clone(), b.sections, d.ctx))
+            .map(|b| SeqRope::new(stream, b.base.clone(), b.sections, b.order, d.ctx))
             .transpose()?;
         Ok(Slot35 {
             stores,

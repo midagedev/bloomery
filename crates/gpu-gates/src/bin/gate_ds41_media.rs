@@ -213,7 +213,8 @@ mod gate {
         let bytes = std::fs::read(&png).map_err(|e| format!("{}: {e}", png.display()))?;
         let media = Media::new(EncoderHparams::read(mmproj)?.grid());
         let prepared = media.prepare(&Rgb8::from_png(&bytes)?)?;
-        let (plan, p) = (prepared.patches.plan, &prepared.patches);
+        let p = prepared.grid()?;
+        let plan = p.plan;
         if (plan.n_llm_h, plan.n_llm_w, prepared.span_len)
             != (img.n_llm_h, img.n_llm_w, img.n_tokens)
             || (p.n_vit_h, p.n_vit_w) != (img.n_vit_h, img.n_vit_w)
@@ -805,10 +806,8 @@ mod gate {
         text: &[u32],
     ) -> Result<bool, GateError> {
         let [(first, _), (second, source)] = images;
-        let (h, w) = (
-            source.prepared.patches.plan.n_llm_h,
-            source.prepared.patches.plan.n_llm_w,
-        );
+        let p = source.prepared.grid()?;
+        let (h, w) = (p.plan.n_llm_h, p.plan.n_llm_w);
         let (first_len, second_len) = (first.len(), second.len());
         if h == w || first_len == second_len {
             return Err(format!(

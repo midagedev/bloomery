@@ -106,6 +106,11 @@ pub trait Tower {
     fn weight_bytes(&self) -> u64;
     /// Bytes of activations on the card.
     fn scratch_bytes(&self) -> u64;
+    /// The projector's separator rows (`v.tok_embd_sep`), `out_dim` f32 values each, which a
+    /// prompt carries after a tile's rows; `None` for a tower whose prompt carries none.
+    fn separators(&self) -> Option<&[f32]> {
+        None
+    }
 }
 
 impl Tower for encoder::Encoder {

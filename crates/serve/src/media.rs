@@ -44,6 +44,10 @@ impl MediaModel for NumberedMedia {
         "<image><unk>"
     }
 
+    fn image_head(&self, index: usize) -> Option<Vec<u32>> {
+        Some(vec![100, 200 + index as u32, 300])
+    }
+
     fn image_token(&self) -> u32 {
         7
     }
@@ -314,6 +318,13 @@ pub enum MediaError {
     /// A prompt whose last position is an image's: the reply is read after a text position.
     #[error("the prompt ends with an image; its last position must be text")]
     ImageLast,
+    /// A numbered placeholder whose number in the prompt's ids is not its image's position: the
+    /// ids before image `index`'s token are not [`MediaModel::image_head`]`(index)`.
+    #[error(
+        "image {index}: the ids before its token do not carry its number; \
+         the template must render each image's placeholder with the image's position"
+    )]
+    ImageNumber { index: usize },
 }
 
 impl fmt::Display for ImageKey {
@@ -462,6 +473,7 @@ pub fn expand_prompt(
     if ids.last() == Some(&token) {
         return Err(MediaError::ImageLast);
     }
+    check_image_numbers(ids, token, model)?;
     let files = urls
         .iter()
         .map(|url| load(url))
@@ -489,6 +501,22 @@ pub fn expand_prompt(
         },
         feeds,
     })
+}
+
+/// For a model whose placeholder numbers its images ([`MediaModel::image_head`]): the ids before
+/// the i-th image token end with the head of image `i`, so a template that numbered the images
+/// otherwise than by position is refused before any image is decoded.
+fn check_image_numbers(ids: &[u32], token: u32, model: &dyn MediaModel) -> Result<(), MediaError> {
+    let tokens = ids.iter().enumerate().filter(|&(_, &t)| t == token);
+    for (index, (at, _)) in tokens.enumerate() {
+        let Some(head) = model.image_head(index) else {
+            continue;
+        };
+        if !ids[..at].ends_with(&head) {
+            return Err(MediaError::ImageNumber { index });
+        }
+    }
+    Ok(())
 }
 
 /// A `data:` URL's declared format and its data. Scheme and media type are matched without case
@@ -652,16 +680,16 @@ mod tests {
                 best_h: image.height,
                 best_w: image.width,
             };
-            Ok(Prepared {
-                span_len: image.width * image.height,
-                patches: Patches {
+            Ok(Prepared::of_grid(
+                image.width * image.height,
+                Patches {
                     plan,
                     n_vit_h: 0,
                     n_vit_w: 0,
                     patch_len: 0,
                     bf16: Vec::new(),
                 },
-            })
+            ))
         }
     }
 
@@ -1116,7 +1144,8 @@ mod tests {
         let f = load(&data("image/png", PNG_B64)).unwrap();
         let p = prepare(&f, &PLAIN).unwrap();
         assert_eq!(p.span_len, 2);
-        assert_eq!((p.patches.plan.best_w, p.patches.plan.best_h), (2, 1));
+        let patches = p.grid().unwrap();
+        assert_eq!((patches.plan.best_w, patches.plan.best_h), (2, 1));
         let jpeg = [0xFF, 0xD8, 0xFF, 0xDB, 0, 4, 0, 0];
         let broken = load(&data("image/jpeg", &encode(&jpeg))).unwrap();
         assert!(matches!(
@@ -1341,6 +1370,28 @@ mod tests {
         assert!(matches!(
             err(expand_prompt(&[1, 7, 2], &["https://x/a.png"], &PLAIN)),
             MediaError::Scheme(_)
+        ));
+    }
+
+    /// A model that numbers its images finds each number in the ids before the image's token,
+    /// before any image is decoded: a second image that carries the first's number, or a first
+    /// with no head before it, is refused by name, and the right numbers reach the prepare, which
+    /// the numbered test model then refuses.
+    #[test]
+    fn a_numbered_placeholder_must_carry_its_images_position() {
+        let png = data("image/png", PNG_B64);
+        let head = |i: u32| [100, 200 + i, 300];
+        let ids = |a: u32, b: u32| [&[1][..], &head(a), &[7, 2], &head(b), &[7, 3]].concat();
+        for (ids, index) in [(ids(0, 0).to_vec(), 1), (vec![7, 2], 0)] {
+            let urls = vec![png.as_str(); if index == 1 { 2 } else { 1 }];
+            match err(expand_prompt(&ids, &urls, &NumberedMedia)) {
+                MediaError::ImageNumber { index: got } => assert_eq!(got, index, "{ids:?}"),
+                e => panic!("{ids:?}: {e}"),
+            }
+        }
+        assert!(matches!(
+            err(expand_prompt(&ids(0, 1), &[&png, &png], &NumberedMedia)),
+            MediaError::Prepare(_)
         ));
     }
 }

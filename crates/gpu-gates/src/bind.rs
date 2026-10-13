@@ -3684,9 +3684,9 @@ mod tests {
             MediaFeed {
                 at,
                 key: ImageKey([key; 32]),
-                prepared: Arc::new(vision::Prepared {
-                    span_len: 2,
-                    patches: vision::Patches {
+                prepared: Arc::new(vision::Prepared::of_grid(
+                    2,
+                    vision::Patches {
                         plan: vision::GridPlan {
                             n_llm_h: 1,
                             n_llm_w: 1,
@@ -3698,7 +3698,7 @@ mod tests {
                         patch_len: 3,
                         bf16: vec![0; 3],
                     },
-                }),
+                )),
             }
         }
 

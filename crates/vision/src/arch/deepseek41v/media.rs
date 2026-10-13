@@ -75,10 +75,10 @@ impl MediaModel for Media {
 
     fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
         let patches = preprocess(image, &self.grid)?;
-        Ok(Prepared {
-            span_len: num_image_tokens(patches.plan.n_llm_h, patches.plan.n_llm_w),
+        Ok(Prepared::of_grid(
+            num_image_tokens(patches.plan.n_llm_h, patches.plan.n_llm_w),
             patches,
-        })
+        ))
     }
 }
 
@@ -125,12 +125,13 @@ mod tests {
         let p = m
             .prepare(&Rgb8::filled(448, 448, [10, 200, 30]))
             .expect("prepare");
+        let patches = p.grid().expect("one grid");
         assert_eq!(p.span_len, 184);
-        assert_eq!((p.patches.plan.best_w, p.patches.plan.best_h), (546, 546));
-        assert_eq!((p.patches.n_vit_h, p.patches.n_vit_w), (39, 39));
-        assert_eq!(p.patches.bf16.len(), 39 * 39 * 3 * 14 * 14);
+        assert_eq!((patches.plan.best_w, patches.plan.best_h), (546, 546));
+        assert_eq!((patches.n_vit_h, patches.n_vit_w), (39, 39));
+        assert_eq!(patches.bf16.len(), 39 * 39 * 3 * 14 * 14);
         assert_eq!(
-            image_span(&p.patches.plan, m.image_token()).ids.len(),
+            image_span(&patches.plan, m.image_token()).ids.len(),
             p.span_len
         );
     }
