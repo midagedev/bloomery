@@ -57,7 +57,7 @@ use cuda_core::CudaContext;
 use gguf::Gguf;
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
-use vision::arch::minicpmv::{self, Group};
+use vision::arch::minicpmv::{self, Group, PROJECTOR_TYPE};
 use vision::arch::qwen3vl::TokenLimits;
 use vision::arch::{deepseek41v, glm5v, qwen3vl};
 use vision::mrope::Canvas;
@@ -274,7 +274,7 @@ fn tile_bound() -> VisionError {
         detail: format!(
             "the {} projector sizes its tower for the largest tile of its own slice plan; the \
              seat states that bound",
-            minicpmv::PROJECTOR_TYPE
+            PROJECTOR_TYPE
         ),
     }
 }
@@ -2255,9 +2255,12 @@ mod tests {
         assert_eq!(refused(failed), "the image at 5: device lost");
     }
 
+    use vision::arch::minicpmv::group::preprocess_group;
+    use vision::arch::minicpmv::{Hparams, Marks, Sep};
+
     /// MiniCPM-V 4.7's mmproj figures (35B-A3B): the slice size is the file's 448.
-    fn minicpm_hp() -> minicpmv::Hparams {
-        minicpmv::Hparams {
+    fn minicpm_hp() -> Hparams {
+        Hparams {
             n_layer: 27,
             dim: 1152,
             n_head: 16,
@@ -2274,8 +2277,8 @@ mod tests {
 
     const PAD: u32 = 900;
 
-    fn marks() -> minicpmv::Marks {
-        minicpmv::Marks {
+    fn marks() -> Marks {
+        Marks {
             image_id_open: 101,
             image_id_close: 102,
             image_open: 103,
@@ -2310,16 +2313,11 @@ mod tests {
                 cell += 1;
             } else {
                 in_run = false;
-                let row = [
-                    minicpmv::Sep::ImageEnd,
-                    minicpmv::Sep::SliceStart,
-                    minicpmv::Sep::SliceEnd,
-                    minicpmv::Sep::RowEnd,
-                ]
-                .into_iter()
-                .find(|&s| marks.sep(s) == id)
-                .expect("a separator mark")
-                .row();
+                let row = [Sep::ImageEnd, Sep::SliceStart, Sep::SliceEnd, Sep::RowEnd]
+                    .into_iter()
+                    .find(|&s| marks.sep(s) == id)
+                    .expect("a separator mark")
+                    .row();
                 out.extend(
                     seps[row * W..(row + 1) * W]
                         .iter()
@@ -2350,8 +2348,7 @@ mod tests {
         let hp = minicpm_hp();
         for (w, h, rows, tiles) in [(200, 200, 65, 1), (1000, 700, 360, 5)] {
             let group =
-                minicpmv::group::preprocess_group(&vision::Rgb8::filled(w, h, [10, 20, 30]), &hp)
-                    .expect("group");
+                preprocess_group(&vision::Rgb8::filled(w, h, [10, 20, 30]), &hp).expect("group");
             assert_eq!((group.rows(), group.tiles.len()), (rows, tiles), "{w}x{h}");
             let (got, canvas) =
                 group_rows_of(&group, W, Some(&separator_rows()), fake_tower(&group))
@@ -2368,8 +2365,7 @@ mod tests {
     fn a_group_without_its_separators_or_cells_is_refused_by_name() {
         let hp = minicpm_hp();
         let group =
-            minicpmv::group::preprocess_group(&vision::Rgb8::filled(200, 200, [1, 2, 3]), &hp)
-                .expect("group");
+            preprocess_group(&vision::Rgb8::filled(200, 200, [1, 2, 3]), &hp).expect("group");
         let refused = |separators: Option<&[f32]>, cells: usize| {
             group_rows_of(&group, W, separators, move |_: &Patches| {
                 Ok::<_, String>(vec![1u16; cells])
