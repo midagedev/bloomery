@@ -11,9 +11,13 @@
 //! live key count, the cache's key tiles staged once per block), the
 //! residual add, the router in two launches, SwiGLU with the down's
 //! quantizer in one launch (`GemmKernels::enqueue_swiglu_quant`), and the
-//! combine of the down rows with the router weights and the residual. The
-//! attention half is the wide arm's head-128 half ([`wide::neox_128_rows`])
-//! over this arena's buffers.
+//! combine of the down rows with the router weights and the residual. Both
+//! halves are the wide arm's, over this arena's buffers: the attention half
+//! its head-128 half ([`wide::neox_128_rows`]), the FFN its routed front and
+//! joined parts ([`wide::ffn_front_rows`], [`wide::ffn_joined_rows`]) — one
+//! owner of the prompt FFN for this body and the wide arm's bodies. What stays
+//! here is the arena that lends the views, and the refusal of a dense FFN,
+//! which this arena's route cannot hold.
 //!
 //! Numeric class. Every launch computes a token's values from that token's
 //! inputs alone, so a token's bits do not depend on the ubatch it lands in or
@@ -52,19 +56,18 @@
 
 use super::body::{Body, Kernels};
 use super::dispatch::embed_into;
-use super::experts::CombineArgs;
 pub use super::image::ImageWrite;
 use super::image::{ImageWindows, PromptImage};
 use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
 use super::plan::{Form, MixerPlan};
 use super::router::RouterOut;
 use super::scratch::{Arena, Dims, KvPlanes, f32_view};
-use super::wide::{self, ActsMut, Neox128Rows};
+use super::wide::{self, ActsMut, FfnFront, FfnJoined, Neox128Rows};
 use crate::flash_gqa::HEAD;
 use crate::gemm::GemmAct32;
-use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
+use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmRoute};
 use crate::model::GpuModel;
-use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
+use crate::site::{SwigluRows, WideIn};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -121,17 +124,6 @@ pub fn ubatch_for(ctx: usize) -> Result<usize, GpuError> {
 
 // The default ubatch is the one a default qwen4exp machine counts.
 const _: () = assert!(UBATCH as u64 == model::arch::qwen35moe::place::UBATCH_PLANNED);
-
-/// The GEMM's type for a qwen3moe projection, a K-quant (the qwen3moe load
-/// admits no other); another type is refused by name.
-fn gemm_ty(ty: SiteTy) -> Result<GemmWeight, GpuError> {
-    ty.gemm_weight().ok_or_else(|| {
-        GpuError::shape(
-            "qwen3moe::ubatch",
-            format!("a {ty} projection; the qwen3moe ubatch runs K-quants"),
-        )
-    })
-}
 
 /// The ubatch arena, in chain order: every intermediate of one layer for up
 /// to `rows` tokens, token-major (slot-major for the expert rows), shared by
@@ -454,7 +446,7 @@ impl Ubatch {
         for (slot, (p, kv)) in c.plans.iter().zip(kv.iter_mut()).enumerate() {
             let sink = gpu.layer_sink(slot)?;
             attention(c, p.gqa(WHAT, slot)?, kv, a, t, pos as usize, sink)?;
-            ffn(c, &p.ffn, a, t, sink)?;
+            ffn_rows(c, &p.ffn, a, t, sink)?;
         }
         Ok(())
     }
@@ -597,87 +589,80 @@ fn attention(
 
 /// The routed FFN half at `t` rows: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
 /// down_s(swiglu(gate_s, up_s))` over each token's `k` experts out, into
-/// `x`.
-fn ffn(
+/// `x`. The wide arm's front and joined parts over this arena's rows
+/// ([`wide::ffn_front_rows`], [`wide::ffn_joined_rows`]); a dense FFN is
+/// refused by name, since this arena's route holds the router's slots and no
+/// fixed weight-1 slot.
+fn ffn_rows(
     c: &UbCtx<'_>,
     n: &FfnPlan,
     a: &mut UbArena,
     t: usize,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    const WHAT_FFN: &str = "qwen3moe::ubatch::ffn";
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
-    let stream = gpu.stream();
-    let d = a.dims;
-    let slots = t * d.slots();
-    let FfnRoute::Router { gate_inp, .. } = &n.route else {
+    if matches!(n.route, FfnRoute::Dense) {
         return Err(GpuError::shape(
-            WHAT_FFN,
+            "qwen3moe::ubatch::ffn",
             "a dense FFN (Qwen3's ubatch routes every layer)",
         ));
-    };
-    let used = d.routed(WHAT_FFN)?.used();
-    gpu.elem().enqueue_rms_norm(
-        stream,
-        &a.ffn_inp,
-        f32_gain(w, &n.ffn_norm)?,
-        c.eps,
-        d.hidden,
-        t,
-        &mut a.normed,
-    )?;
-    gpu.enqueue_quantize_gemm(&a.normed, t, &mut a.act_hid, sink)?;
-    k.router.enqueue_ubatch(
-        stream,
-        f32_tensor(w, gate_inp)?,
-        &a.normed,
-        t,
-        sink,
-        &mut a.route,
-    )?;
-    k.gemm
-        .enqueue_route(stream, &a.route.ids, slots, &mut a.moe, sink)?;
-    for (ty, name, y) in [
-        (n.gate_ty, &n.gate, &mut a.gate),
-        (n.up_ty, &n.up, &mut a.up),
-    ] {
-        k.gemm.enqueue_gemm(
-            stream,
-            GemmArgs {
-                ty: gemm_ty(ty)?,
-                w: kq_weight(w, name)?,
-                rows_per_expert: d.ff,
-                act: &a.act_hid,
-                route: &a.moe,
-                input: GemmInput::Shared { top_k: used },
-                y,
-            },
-        )?;
     }
-    k.gemm
-        .enqueue_swiglu_quant(stream, &a.gate, &a.up, slots, &mut a.act_h, sink)?;
-    k.gemm.enqueue_gemm(
-        stream,
-        GemmArgs {
-            ty: gemm_ty(n.down_ty)?,
-            w: kq_weight(w, &n.down)?,
-            rows_per_expert: d.hidden,
-            act: &a.act_h,
-            route: &a.moe,
-            input: GemmInput::PerSlot,
-            y: &mut a.down,
+    let at = (c.gpu, c.w, c.k);
+    let d = a.dims;
+    let UbArena {
+        normed,
+        act_hid,
+        act_hid32,
+        ffn_inp,
+        route,
+        dense,
+        moe,
+        gate,
+        up,
+        act_h,
+        down,
+        x,
+        ..
+    } = a;
+    wide::ffn_front_rows(
+        at,
+        (c.eps, sink),
+        n,
+        (&d, t),
+        FfnFront {
+            ffn_inp,
+            normed,
+            hid: ActsMut {
+                q128: Some(&mut *act_hid),
+                q32: act_hid32.as_mut(),
+            },
+            router: Some(&mut *route),
         },
     )?;
-    k.experts.enqueue_combine_tokens(
-        stream,
-        CombineArgs {
-            down: &a.down,
-            w: &a.route.weights,
-            resid: &a.ffn_inp,
-            rows: d.hidden,
-            n_slots: d.slots(),
-            m: t,
-            y: &mut a.x,
+    wide::ffn_joined_rows(
+        at,
+        sink,
+        n,
+        (&d, t),
+        FfnJoined {
+            ffn_inp,
+            hid: WideIn {
+                q128: Some(&*act_hid),
+                q32: act_hid32.as_ref(),
+                f32: Some(&*normed),
+            },
+            ids: &route.ids,
+            weights: &route.weights,
+            dense,
+            moe: Some(moe),
+            gate,
+            up,
+            act_h: SwigluRows {
+                q128: Some(act_h),
+                q32: None,
+                f32: None,
+            },
+            down,
+            y: x,
         },
     )
 }

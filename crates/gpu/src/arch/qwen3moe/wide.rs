@@ -27,6 +27,10 @@
 //! views, so the arena of this arm and the whole-card GEMM prefill's
 //! (`ubatch.rs`) both lend it their rows.
 //!
+//! The routed FFN's front and joined parts ([`ffn_front_rows`],
+//! [`ffn_joined_rows`]) run over views the same way: one prompt FFN for the
+//! arena of this arm and for the whole-card GEMM prefill's.
+//!
 //! Numeric class. A wide op computes a token's values from that token's
 //! inputs alone — the GEMM accumulates each (slot, row) on its own, the
 //! flash walks a row's keys in fixed tiles whatever the rows beside it — so
@@ -42,7 +46,7 @@ use super::dispatch::Ctx;
 use super::experts::CombineArgs;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Form, GqaKind, GqaPlan, SharedPlan, SiteTy};
-use super::router::MAX_TOKENS;
+use super::router::{MAX_TOKENS, RouterOut};
 use super::scratch::{
     ApartForms, Append128, Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Route,
     Wants,
@@ -950,10 +954,11 @@ pub(super) fn delta_out(
 /// `((routed + 0) + resid) + σ · shared`, the host's routed sum zero on a
 /// whole-card load. That arm is three parts ([`ffn_front`], [`ffn_card`],
 /// [`ffn_combine`]) with the slots' card list between the first two
-/// ([`card_list`]). A plain router (no shared expert) takes its wide rows
-/// through the whole-card GEMM prefill (`ubatch.rs`) or a placed load's walk
-/// (the three parts with the card route and host sums of `placed`); this
-/// whole-card entry refuses it by name.
+/// ([`card_list`]). A plain router (no shared expert) joins nothing: on a
+/// whole-card arena it is the front and the joined part, the launches the
+/// whole-card GEMM prefill runs over its own rows (`ubatch.rs`); a placed
+/// load's walk runs the three parts with the card route and host sums of
+/// `placed`.
 pub(super) fn ffn(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -961,16 +966,6 @@ pub(super) fn ffn(
     m: usize,
     out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
-    if let FfnRoute::Router { shared: None, .. } = n.route {
-        return Err(GpuError::shape(
-            "qwen3moe::wide::ffn",
-            format!(
-                "layer {}: the plain router at {m} rows on the whole-card wide arm (it runs \
-                 through ubatch.rs, or a placed load's walk)",
-                c.layer
-            ),
-        ));
-    }
     ffn_front(c, n, s, m)?;
     if n.apart().is_none() {
         return ffn_joined(c, n, s, m, out);
@@ -983,11 +978,10 @@ pub(super) fn ffn(
 /// The FFN's front at `m` rows ([`ffn`]): `ffn_inp` RMS-normed into `normed`,
 /// its forms every site of the layer reads, and the router over the normed
 /// rows (ids and weights in the arena's route): the gated router with a
-/// shared expert, the plain one without.
+/// shared expert, the plain one without. The arena's rows through
+/// [`ffn_front_rows`].
 pub(super) fn ffn_front(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     const WHAT_FFN: &str = "qwen3moe::wide::ffn";
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
-    let stream = gpu.stream();
     let d = s.dims;
     let slots = d.slots();
     let used = d.router.map_or(0, |r| r.used());
@@ -1009,13 +1003,66 @@ pub(super) fn ffn_front(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Re
         ..
     } = s;
     let wd = wide_of(wide, WHAT_FFN)?;
+    let router = match &n.route {
+        FfnRoute::Router {
+            shared: Some(_), ..
+        } => Some(route.gated(WHAT_FFN)?),
+        FfnRoute::Router { shared: None, .. } => Some(route.plain(WHAT_FFN)?),
+        FfnRoute::Dense => None,
+    };
+    ffn_front_rows(
+        (c.gpu, c.w, c.k),
+        (c.eps, c.sink),
+        n,
+        (&d, m),
+        FfnFront {
+            ffn_inp,
+            normed,
+            hid: wd.act_hid.views_mut(),
+            router,
+        },
+    )
+}
+
+/// The buffers of an FFN's front ([`ffn_front_rows`]) as views, each holding
+/// `t` rows: the half's input `ffn_inp`, the normed rows with the forms every
+/// site of the layer reads (`hid`), and the router's outputs (`None` on a
+/// dense FFN, which launches no router).
+pub(super) struct FfnFront<'a> {
+    pub(super) ffn_inp: &'a DeviceBuffer<f32>,
+    pub(super) normed: &'a mut DeviceBuffer<f32>,
+    pub(super) hid: ActsMut<'a>,
+    pub(super) router: Option<&'a mut RouterOut>,
+}
+
+/// The FFN's front at `t` rows over `b`'s views: `ffn_inp` RMS-normed into
+/// `normed`, quantized into the forms the layer's gate and up sites read, and
+/// the router over the normed rows — the gated one with a shared expert, the
+/// plain one without. The one launch sequence of the wide arm and of the
+/// whole-card GEMM prefill; the caller holds `b.router` cut for the plan's
+/// slots a token.
+pub(super) fn ffn_front_rows(
+    (gpu, w, k): (&Gpu, &Weights, &Kernels),
+    (eps, sink): (f32, FaultSink),
+    n: &FfnPlan,
+    (d, t): (&Dims, usize),
+    b: FfnFront<'_>,
+) -> Result<(), GpuError> {
+    const WHAT_FFN: &str = "qwen3moe::wide::ffn";
+    let stream = gpu.stream();
+    let FfnFront {
+        ffn_inp,
+        normed,
+        mut hid,
+        router,
+    } = b;
     gpu.elem().enqueue_rms_norm(
         stream,
         ffn_inp,
         f32_gain(w, &n.ffn_norm)?,
-        c.eps,
+        eps,
         d.hidden,
-        m,
+        t,
         normed,
     )?;
     let sh = n.apart();
@@ -1025,22 +1072,33 @@ pub(super) fn ffn_front(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Re
         sh.map_or(n.gate_ty, |a| a.gate_ty),
         sh.map_or(n.up_ty, |a| a.up_ty),
     ];
-    wd.act_hid.quantize(c, normed, m, &hid_tys)?;
+    hid.quantize((gpu, k), normed, t, &hid_tys, sink)?;
     if let FfnRoute::Router { gate_inp, shared } = &n.route {
+        let out = router.ok_or(GpuError::state(WHAT_FFN, "the router's buffers"))?;
         let gate = f32_tensor(w, gate_inp)?;
         match shared {
-            Some(_) => k.q35(WHAT_FFN)?.router.enqueue_ubatch(
-                stream,
-                gate,
-                normed,
-                m,
-                c.sink,
-                route.gated(WHAT_FFN)?,
-            )?,
-            None => {
-                k.router
-                    .enqueue_ubatch(stream, gate, normed, m, c.sink, route.plain(WHAT_FFN)?)?
-            }
+            Some(_) => k
+                .q35(WHAT_FFN)?
+                .router
+                .enqueue_ubatch(stream, gate, normed, t, sink, out)?,
+            None => k
+                .router
+                .enqueue_ubatch(stream, gate, normed, t, sink, out)?,
+        }
+    }
+    Ok(())
+}
+
+/// Err unless the routed stacks of `n` are K-quants: the grouped expert GEMM
+/// runs no other type, so a layer whose gate, up or down stack is Q8_0 or F32
+/// is refused by name before the joined part's first launch.
+fn refuse_expert_types(n: &FfnPlan, what: &'static str) -> Result<(), GpuError> {
+    for (ty, name) in [(n.gate_ty, &n.gate), (n.up_ty, &n.up), (n.down_ty, &n.down)] {
+        if !ty.kquant() {
+            return Err(GpuError::shape(
+                what,
+                format!("{name} is {ty}: the routed experts' grouped GEMM runs K-quants"),
+            ));
         }
     }
     Ok(())
@@ -1048,7 +1106,8 @@ pub(super) fn ffn_front(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Re
 
 /// The rest of [`ffn`] for a layer whose shared expert is folded into the
 /// stacks (or a dense FFN) after [`ffn_front`]: the slots through the
-/// layer's one table and the combine of their rows.
+/// layer's one table and the combine of their rows. The arena's rows through
+/// [`ffn_joined_rows`].
 fn ffn_joined(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -1057,10 +1116,7 @@ fn ffn_joined(
     out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
     const WHAT_FFN: &str = "qwen3moe::wide::ffn";
-    let (gpu, k) = (c.gpu, c.k);
-    let stream = gpu.stream();
     let d = s.dims;
-    let slots = d.slots();
     let Arena {
         x,
         normed,
@@ -1080,34 +1136,104 @@ fn ffn_joined(
         moe,
         ..
     } = wd;
-    let hid = act_hid.input(normed);
-    let rows = (act_h, &mut *h, &mut *up, &mut *down);
     let y = match out {
         Some(y) => y,
         None => x,
     };
+    ffn_joined_rows(
+        (c.gpu, c.w, c.k),
+        c.sink,
+        n,
+        (&d, m),
+        FfnJoined {
+            ffn_inp,
+            hid: act_hid.input(normed),
+            ids: route.ids(),
+            weights: route.weights(),
+            dense,
+            moe: moe.as_mut(),
+            gate: h,
+            up,
+            act_h: act_h.swiglu_rows(None),
+            down,
+            y,
+        },
+    )
+}
+
+/// The buffers of an FFN's joined part ([`ffn_joined_rows`]) as views, each
+/// holding the rows of the unit: the half's input `ffn_inp` (the combine's
+/// residual), the normed rows beside the forms the gate and up read (`hid`),
+/// the router's slot ids and weights, the layer's expert table (`moe`, `None`
+/// on a dense chain) and the unit's one-expert table (`dense`), the gate and up
+/// rows, the SwiGLU's forms the down reads (`act_h`), the down rows and the
+/// half's output `y`.
+pub(super) struct FfnJoined<'a> {
+    pub(super) ffn_inp: &'a DeviceBuffer<f32>,
+    pub(super) hid: WideIn<'a>,
+    pub(super) ids: &'a DeviceBuffer<u32>,
+    pub(super) weights: &'a DeviceBuffer<f32>,
+    pub(super) dense: &'a GemmRoute,
+    pub(super) moe: Option<&'a mut GemmRoute>,
+    pub(super) gate: &'a mut DeviceBuffer<f32>,
+    pub(super) up: &'a mut DeviceBuffer<f32>,
+    pub(super) act_h: SwigluRows<'a>,
+    pub(super) down: &'a mut DeviceBuffer<f32>,
+    pub(super) y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The joined part at `t` rows over `b`'s views, after [`ffn_front`]'s
+/// router: the slots' ids into the layer's expert table (a routed chain; a
+/// dense FFN reads the one-expert table), gate and up reading each token's
+/// column and the down each slot's own ([`slots_gemm`]), then the combine of
+/// the down rows with the slots' weights and the residual into `b.y`. The
+/// one launch sequence of the wide arm and of the whole-card GEMM prefill.
+pub(super) fn ffn_joined_rows(
+    (gpu, w, k): (&Gpu, &Weights, &Kernels),
+    sink: FaultSink,
+    n: &FfnPlan,
+    (d, t): (&Dims, usize),
+    b: FfnJoined<'_>,
+) -> Result<(), GpuError> {
+    const WHAT_FFN: &str = "qwen3moe::wide::ffn";
+    let stream = gpu.stream();
+    let slots = d.slots();
+    let FfnJoined {
+        ffn_inp,
+        hid,
+        ids,
+        weights,
+        dense,
+        moe,
+        gate,
+        up,
+        act_h,
+        down,
+        y,
+    } = b;
     let table = match &n.route {
         FfnRoute::Router { .. } => {
-            let moe = moe.as_mut().ok_or(GpuError::state(
+            refuse_expert_types(n, WHAT_FFN)?;
+            let moe = moe.ok_or(GpuError::state(
                 WHAT_FFN,
                 "the wide part's expert table (a routed chain's)",
             ))?;
-            k.gemm
-                .enqueue_route(stream, route.ids(), m * slots, moe, c.sink)?;
+            k.gemm.enqueue_route(stream, ids, t * slots, moe, sink)?;
             (&*moe, GemmInput::Shared { top_k: slots })
         }
-        FfnRoute::Dense => (&*dense, GemmInput::PerSlot),
+        FfnRoute::Dense => (dense, GemmInput::PerSlot),
     };
-    slots_gemm(c, (n, None), &d, table, &hid, rows, m)?;
+    let rows = (act_h, &mut *gate, &mut *up, &mut *down);
+    slots_gemm((gpu, w, k), sink, (n, None), (d, t), table, &hid, rows)?;
     k.experts.enqueue_combine_tokens(
         stream,
         CombineArgs {
             down,
-            w: route.weights(),
+            w: weights,
             resid: ffn_inp,
             rows: d.hidden,
             n_slots: slots,
-            m,
+            m: t,
             y,
         },
     )
@@ -1226,7 +1352,6 @@ pub(super) fn ffn_card(
         ..
     } = wd;
     let hid = act_hid.input(normed);
-    let rows = (act_h, &mut *h, &mut *up, &mut *down);
     let own = apart.as_mut().map(|a| {
         let WideApart {
             map,
@@ -1264,7 +1389,16 @@ pub(super) fn ffn_card(
     if let Some(table) = table {
         remap.enqueue_route_remap(stream, route.ids(), map, m * slots, table, c.sink)?;
         let list = (&*table, GemmInput::Shared { top_k: slots });
-        slots_gemm(c, (n, None), &d, list, &hid, rows, m)?;
+        let rows = (act_h.swiglu_rows(None), &mut *h, &mut *up, &mut *down);
+        slots_gemm(
+            (gpu, c.w, c.k),
+            c.sink,
+            (n, None),
+            (&d, m),
+            list,
+            &hid,
+            rows,
+        )?;
     }
     let Some(sh) = n.apart() else {
         return Ok(());
@@ -1493,7 +1627,9 @@ pub(super) fn ffn_ring(
     }
     let hid = act_hid.input(normed);
     let list = (&*table, GemmInput::Shared { top_k: slots });
-    slots_gemm(c, (n, Some(ring)), &d, list, &hid, (act_h, h, up, down), m)
+    let rows = (act_h.swiglu_rows(None), h, up, down);
+    let at = (c.gpu, c.w, c.k);
+    slots_gemm(at, c.sink, (n, Some(ring)), (&d, m), list, &hid, rows)
 }
 
 /// The slots' half of the FFN at `m` rows: the gated block over `table`
@@ -1504,21 +1640,21 @@ pub(super) fn ffn_ring(
 /// with `ring` a half of the expert stream's ring at the plan's types. A
 /// slot the table lists in no tile keeps its rows.
 fn slots_gemm(
-    c: &Ctx<'_>,
+    (gpu, w, k): (&Gpu, &Weights, &Kernels),
+    sink: FaultSink,
     (n, ring): (&FfnPlan, Option<&RingStacks<'_>>),
-    d: &Dims,
+    (d, m): (&Dims, usize),
     (table, input): (&GemmRoute, GemmInput),
     hid: &WideIn<'_>,
     (act_h, h, up, down): (
-        &mut Acts,
+        SwigluRows<'_>,
         &mut DeviceBuffer<f32>,
         &mut DeviceBuffer<f32>,
         &mut DeviceBuffer<f32>,
     ),
-    m: usize,
 ) -> Result<(), GpuError> {
     let slots = Gated {
-        w: c.w,
+        w,
         route: table,
         gate: slot_site((n.gate_ty, &n.gate), ring.map(|r| r.gate)),
         up: slot_site((n.up_ty, &n.up), ring.map(|r| r.up)),
@@ -1532,17 +1668,10 @@ fn slots_gemm(
         x: hid,
         gate: h,
         up,
-        rows: act_h.swiglu_rows(None),
+        rows: act_h,
         y: down,
     };
-    site::gated(
-        c.gpu,
-        &wide_kernels(c.k),
-        &slots,
-        (m, m * d.slots()),
-        io,
-        c.sink,
-    )
+    site::gated(gpu, &wide_kernels(k), &slots, (m, m * d.slots()), io, sink)
 }
 
 /// Site `name` of type `ty` as [`slots_gemm`]'s block reads its weight: the
