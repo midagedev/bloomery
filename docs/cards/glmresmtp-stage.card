@@ -22,12 +22,10 @@
 # landing boundary [derived]. It spans two decisions — up to 30 ms the paper's rate, past it the
 # in-tree one-thread rate — and the run picks between them.
 # Runner: tools/ref/depth-glm5next.sh's lever arm on the drafted arm, n = 192 at depth 512, one round:
-#   BLOOMERY_DECODE_N=192 BLOOMERY_GEN_WARM=96 BLOOMERY_AB_ROUNDS=1
-#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmresmtp-stage.card BLOOMERY_DECODE_N=192
-#   BLOOMERY_GEN_CTX=2048 BLOOMERY_GEN_WARM=96 BLOOMERY_AB_ROUNDS=1' just depth-gpu-glm5next
-#   oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1 > <log> 2>&1
-# 2026-10-12: written against the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX
-# derives C per arm, so its command pins BLOOMERY_GEN_CTX=2048 to keep the card's C.
+#   BLOOMERY_AB_ROUNDS=1 \
+#     BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2048 BLOOMERY_LEASE_CARD=docs/cards/glmresmtp-stage.card BLOOMERY_DECODE_N=192 BLOOMERY_GEN_WARM=96 BLOOMERY_AB_ROUNDS=1' \
+#     just depth-gpu-glm5next oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1 > <log> 2>&1
+# Reruns use BLOOMERY_GEN_CTX=2048 to keep this card's context fixed.
 # The runner lacks one knob: an ok row carries the residency sums (passes, kept, landed, late, made,
 # bytes) but neither wait_us nor the per-boundary `residency pass` lines, and it keeps an arm's full
 # output only on a FAIL row. The run needs either the arm's output kept (a runner knob) or a wait_us

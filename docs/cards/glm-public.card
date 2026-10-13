@@ -103,8 +103,7 @@ condition: one lease, two rounds, the GGUF arms rotated each round after a disca
   for the four fit twins' eight runs, each 33..58 s (the glmtime smoke's lcpp27754:6 row read `wall
   18s` for a load and 16 steps; here the 512-id depth or prompt and the steps, 11..16 s, and the fit's ~10
   measuring loads, 5..25 s); without the five depth-1024 arms, 29..42
-# 2026-10-12: written against the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX
-# derives C per arm, so its command pins BLOOMERY_GEN_CTX=2048 to keep the card's C.
+# Reruns use BLOOMERY_GEN_CTX=2048 to keep this card's context fixed.
 reason: sets every row of the public GLM-5.3-Flash table (llama.cpp's two PR branches beside ours,
   exllamav3 in its own table) from one window; why now: the release sitting takes every model's
   table in one window, and GLM has had no timed row

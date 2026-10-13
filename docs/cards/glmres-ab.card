@@ -24,10 +24,9 @@
 # threads, swap.rs's own rate) 98 ms, the last job due at the landing: wait_us 0..3,000 there [derived].
 # Runner (prerequisite: the `<D>@NAME=VALUE` lever arm in tools/ref/depth-glm5next.sh, depth-qwen3moe.sh's
 # grammar; without it the second arm is refused, rc 64, before the lease):
-#   BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2048 BLOOMERY_LEASE_CARD=docs/cards/glmres-ab.card'
-#   just depth-gpu-glm5next 512 512@BLOOMERY_RESIDENCY=mid-p0-s1 > <log> 2>&1
-# 2026-10-12: ran at the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX derives C per arm,
-# so a re-run sets BLOOMERY_GEN_CTX=2048 to reproduce this card.
+#   BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2048 BLOOMERY_LEASE_CARD=docs/cards/glmres-ab.card' \
+#     just depth-gpu-glm5next 512 512@BLOOMERY_RESIDENCY=mid-p0-s1 > <log> 2>&1
+# Reruns use BLOOMERY_GEN_CTX=2048 to keep this card's context fixed.
 # Wall [derived]: 2 arms x (3 rounds + 1 warm-up), each a load plus 512 ids and 95 steps: 10..18 min.
 kind: ab
 question: at the replay's ramp (hit 23.1 -> 39.5 % over 95 steps, 5.75 flips a step), what does one

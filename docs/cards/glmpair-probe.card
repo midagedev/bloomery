@@ -31,8 +31,7 @@ condition: one lease, one process, 96 plain steps then 48 verifies of two rows a
   which appends --pair to the ours arm, and generate_glm5next's records CAPTURE_PAIR and TIME_PASS):
   BLOOMERY_DECODE_N=97 BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmpair-probe.card
   BLOOMERY_GEN_CTX=2048 BLOOMERY_DECODE_N=97 BLOOMERY_GEN_PAIR=1' just depth-gpu-glm5next 512 > <log> 2>&1
-# 2026-10-12: written against the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX
-# derives C per arm, so its command pins BLOOMERY_GEN_CTX=2048 to keep the card's C.
+# Reruns use BLOOMERY_GEN_CTX=2048 to keep this card's context fixed.
 reason: the one term of the MTP plan the derivation cannot close (glmmtp design); why now: the verify
   exists, and the glmmtpload and glmmtp rounds are sized by it
 decide-in: open glmmtpload then glmmtp as planned; write V2/S1 into the MTP speed ratio (1 + alpha) /

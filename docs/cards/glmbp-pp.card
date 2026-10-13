@@ -33,8 +33,7 @@
 # Sitting: glmbp-ab.card's (one invocation, both cards' terms; the lease checks that card), this card checked first:
 #   PYTHONDONTWRITEBYTECODE=1 python3 tools/ref/card.py check docs/cards/glmbp-pp.card --rounds 4
 # then read from the same log's `ratio place pp p=512` line. No box minutes of its own.
-# 2026-10-12: ran at the runner's then-default C 2048; since 2d1362a4 an unset BLOOMERY_GEN_CTX derives C per arm,
-# so a re-run sets BLOOMERY_GEN_CTX=2048 to reproduce this card.
+# Reruns use BLOOMERY_GEN_CTX=2048 to keep this card's context fixed.
 kind: ab
 question: on the serving defaults, does plan (b′) prefill a 512-id prose prompt faster than plan (a) by the host
   union the tier takes, less the tier's serial costs?
