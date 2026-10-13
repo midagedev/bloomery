@@ -40,6 +40,9 @@
 # under test: build-clefvis.sh writes there too), QVIS_REF moves the ids: a re-dump compared with an installed set touches none.
 # The GLM seat (BLOOMERY_MODEL=glm5next, BLOOMERY_TIER=fixture) dumps on the respelled copy of the fixture the profile names; its sets
 # carry the fixture's `# fixture` line (refset-check --fixture-line, built here) and the copy's `# respell` line.
+# MiniCPM-V 4.7 (`just dump-ref-mcvis`, BLOOMERY_MODEL=minicpmv47, FAMILY mcvis in profile.sh) is the canvas seat: sets A and B only,
+# one row a tile (`<image>/t<k>/<node>`, dump_mtmd.cpp's header), the images of its own list (IMAGES_LIST), no case, no prompt arm and
+# no ids (`--ids` is refused, exit 64); its refset family is crates/refset/src/arch/minicpmv4_7.
 set -euo pipefail
 REAL=$(readlink -f "${BASH_SOURCE[0]}")
 HERE=$(cd "$(dirname "$REAL")/../../.." && pwd)
@@ -99,6 +102,7 @@ seat_args=()
 tower_seat_args=()
 fixture_args() {
   [ -z "$RESPELL_SOURCE" ] || tower_seat_args=(--fixture-line "$(fixture_line clefvis.sh)" --respell-source "$RESPELL_SOURCE")
+  [ -z "$SEAT" ] || tower_seat_args+=(--seat "$SEAT")
   seat_args=("${tower_seat_args[@]}")
   [ -z "$IMAGE_PAD_ID" ] || seat_args+=(--image-pad-id "$IMAGE_PAD_ID")
 }
@@ -113,7 +117,7 @@ set_images() {
     img_args+=(--image "$n=$IMG/$n.png")
   done
 }
-all_images() { awk -F'\t' '!/^#/ && NF { print $1 }' tools/ref/clefvis/images.tsv ${IMAGES_EXTRA:+"$IMAGES_EXTRA"} | paste -sd, -; }
+all_images() { awk -F'\t' '!/^#/ && NF { print $1 }' "$IMAGES_LIST" ${IMAGES_EXTRA:+"$IMAGES_EXTRA"} | paste -sd, -; }
 
 publish() { # <staging> <final>
   rm -rf "$2"
@@ -126,6 +130,7 @@ fail() { echo "clefvis.sh: $1 failed (rc $2); the old set, if any, stays" >&2; r
 # chatids set and the ids file of every request; the set is moved into place, the ids to $REF/<case>.ids.
 write_ids() {
   if [ "$FAMILY" = clef ]; then ref_d --encode-only "$@"; return $?; fi
+  [ "$FAMILY" != mcvis ] || { echo "clefvis.sh: the $SEAT seat dumps the tower only (sets A and B): it has no chat ids" >&2; exit 64; }
   check_inputs
   fixture_args
   export BLOOMERY_REF_BUILD=$BUILD_COMMIT
@@ -190,6 +195,7 @@ else
   where=(-ngl 99)
   run=(env)
   suffix=
+  [ "$FAMILY" != mcvis ] || where+=(-t "$THREADS")
   if [ "$FAMILY" = qvis ]; then
     where+=(-t "$THREADS")
     ncmoe=$NCMOE_3090
@@ -213,7 +219,7 @@ if [ "$tower" = 1 ]; then
   rm -rf "$taps.staging" "$pre.staging"
   pre_args=() tap_args=()
   [ "$twin" = 1 ] || [ "$PREPROC" != 1 ] || pre_args=(--out-preproc "$pre.staging")
-  [ "$FAMILY" != qvis ] || tap_args=(--taps final)
+  [ "$FAMILY" != qvis ] || tap_args=(--taps final) # mcvis: every tile's full taps
   SECONDS=0
   if "${run[@]}" timeout --kill-after=10 "$BOUND" "$BIN" tower --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
       --card "$device" "${img_args[@]}" "${pre_args[@]}" "${tap_args[@]}" "${tower_seat_args[@]}" --out-taps "$taps.staging" "${where[@]}"; then
