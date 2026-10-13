@@ -6,11 +6,12 @@
 //!
 //! A request's images join the prompt as one media piece between `STATE:\n` and the state: the
 //! model's image placeholder ([`MediaModel::image_placeholder`], Clef's
-//! `<|vision_start|><|image_pad|><|vision_end|>`) once per image and a newline, tokenized in one
-//! call. Each image's pad id is expanded to the image's token count ([`encode_media`]; the
-//! expansion is `vision::media::expand_spans`, the server's), and those ids count in what the
-//! schema leaves for the state, as the release's `fixed_length` counts them. [`encode`] is the
-//! entry of a server with no image input: it refuses a request that carries one, by name.
+//! `<|vision_start|><|image_pad|><|vision_end|>`, numbered by the image's place for a model that
+//! numbers its images) once per image and a newline, tokenized in one call. Each image's pad id
+//! is expanded to the image's token count ([`encode_media`]; the expansion is
+//! `vision::media::expand_spans`, the server's), and those ids count in what the schema leaves
+//! for the state, as the release's `fixed_length` counts them. [`encode`] is the entry of a
+//! server with no image input: it refuses a request that carries one, by name.
 
 use tokenizer::Tokenizer;
 use vision::MediaModel;
@@ -103,16 +104,20 @@ pub(crate) fn encode_media_with(
         )));
     }
     let images = Images {
-        placeholder: media.image_placeholder(),
+        placeholders: (0..image_tokens.len())
+            .map(|i| media.image_placeholder(i))
+            .collect(),
         token: media.image_token(),
         counts: image_tokens,
     };
     encode_inner(tokens, req, Some(images), max_length)
 }
 
-/// The image input of one encode: a model's placeholder text and pad id, and each image's count.
+/// The image input of one encode: the model's placeholders of the request's images in order
+/// (image `i`'s is `MediaModel::image_placeholder(i)`) as one text, its pad id, and each image's
+/// count.
 struct Images<'a> {
-    placeholder: &'a str,
+    placeholders: String,
     token: u32,
     counts: &'a [usize],
 }
@@ -250,7 +255,7 @@ fn media_piece(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let piece = tokens(&format!("{}\n", images.placeholder.repeat(n)));
+    let piece = tokens(&format!("{}\n", images.placeholders));
     let pads = piece.iter().filter(|&&t| t == images.token).count();
     if pads != n {
         return Err(Error::Images(format!(
@@ -263,6 +268,8 @@ fn media_piece(
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use crate::json::parse;
 
@@ -365,7 +372,11 @@ mod tests {
     struct Fake;
 
     impl MediaModel for Fake {
-        fn image_placeholder(&self) -> &str {
+        fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+            Cow::Borrowed(PLACEHOLDER)
+        }
+
+        fn image_marker(&self) -> &str {
             PLACEHOLDER
         }
 
@@ -454,6 +465,64 @@ mod tests {
             q.option_spans,
             p.option_spans.iter().map(|&s| shift(s)).collect::<Vec<_>>()
         );
+    }
+
+    /// A model that numbers its images gets each image's own placeholder in the media piece, in
+    /// the order of the images: the number follows the image, the pad id's expansion is unchanged.
+    #[test]
+    fn a_numbering_model_gets_each_images_own_placeholder() {
+        struct Numbered;
+
+        impl MediaModel for Numbered {
+            fn image_placeholder(&self, index: usize) -> Cow<'_, str> {
+                Cow::Owned(format!(
+                    "<|vision_start|>#{index}<|image_pad|><|vision_end|>"
+                ))
+            }
+
+            fn image_marker(&self) -> &str {
+                "<|image_pad|>"
+            }
+
+            fn image_token(&self) -> u32 {
+                PAD
+            }
+
+            fn prepare(&self, _: &vision::Rgb8) -> Result<vision::Prepared, vision::VisionError> {
+                Err(vision::VisionError::Limits {
+                    detail: "a test model prepares nothing".into(),
+                })
+            }
+        }
+
+        let hash = u32::from(b'#');
+        let e = encode_media_with(
+            &mut with_media,
+            &with_images("S", 2),
+            &Numbered,
+            &[3, 2],
+            MAX_LENGTH,
+        )
+        .unwrap();
+        let at = start();
+        let media = [
+            START,
+            hash,
+            u32::from(b'0'),
+            PAD,
+            PAD,
+            PAD,
+            END,
+            START,
+            hash,
+            u32::from(b'1'),
+            PAD,
+            PAD,
+            END,
+            10,
+        ];
+        assert_eq!(e.ids[at..at + media.len()], media);
+        assert_eq!(e.image_spans, [(at + 3, at + 6), (at + 10, at + 12)]);
     }
 
     /// A request with no image gets no media piece, not even its newline, and the text entry and the

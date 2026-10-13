@@ -1,8 +1,10 @@
 //! MiniCPM-V 4.7's image input as the server's media layer sees it, and the preprocessing of an
 //! image ([`preprocess`]): the group of tiles.
 //!
-//! The placeholder is `<image_id>0</image_id><image>` and the pad token whose copies the group's
-//! rows replace; the image index is 0 in the placeholder text, as one image prompt has it.
+//! The placeholder of the prompt's image `i` is `<image_id>i</image_id><image>` and the pad token
+//! whose copies the group's rows replace.
+
+use std::borrow::Cow;
 
 use super::Hparams;
 use super::group::{Group, Marks, preprocess_group};
@@ -20,7 +22,7 @@ pub struct Media {
     hp: Hparams,
     marks: Marks,
     pad: u32,
-    placeholder: String,
+    marker: String,
 }
 
 impl Media {
@@ -31,7 +33,7 @@ impl Media {
     #[must_use]
     pub fn new(hp: Hparams, marks: Marks, pad_text: &str, pad: u32) -> Media {
         Media {
-            placeholder: format!("<image_id>0</image_id><image>{pad_text}"),
+            marker: format!("<image>{pad_text}"),
             hp,
             marks,
             pad,
@@ -51,8 +53,12 @@ impl Media {
 }
 
 impl MediaModel for Media {
-    fn image_placeholder(&self) -> &str {
-        &self.placeholder
+    fn image_placeholder(&self, index: usize) -> Cow<'_, str> {
+        Cow::Owned(format!("<image_id>{index}</image_id>{}", self.marker))
+    }
+
+    fn image_marker(&self) -> &str {
+        &self.marker
     }
 
     fn image_token(&self) -> u32 {
@@ -94,7 +100,12 @@ mod tests {
     #[test]
     fn the_media_data_and_the_group_span() {
         let m = media();
-        assert_eq!(m.image_placeholder(), "<image_id>0</image_id><image><unk>");
+        assert_eq!(m.image_placeholder(0), "<image_id>0</image_id><image><unk>");
+        assert_eq!(
+            m.image_placeholder(12),
+            "<image_id>12</image_id><image><unk>"
+        );
+        assert_eq!(m.image_marker(), "<image><unk>");
         assert_eq!(m.image_token(), 248_077);
         assert_eq!(m.part_join(), PartJoin::LlamaServer);
         let image = Rgb8::filled(1000, 700, [1, 2, 3]);

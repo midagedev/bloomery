@@ -46,6 +46,7 @@
 //! Its saved state is its context: [`MOCK_STATE`], a u32 version, a u64 count
 //! and the ids, little-endian.
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -884,7 +885,11 @@ impl Decoder for MediaDecoder {
 pub struct MockMedia;
 
 impl MediaModel for MockMedia {
-    fn image_placeholder(&self) -> &str {
+    fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+        Cow::Borrowed(IMAGE_SPECIAL)
+    }
+
+    fn image_marker(&self) -> &str {
         IMAGE_SPECIAL
     }
 
