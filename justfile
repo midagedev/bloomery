@@ -902,6 +902,16 @@ gate-gpu-qwen35moe-moe *ARGS:
 gate-gpu-qwen35moe-e2e:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
 
+# The same bin on the MiniCPM-V 4.7 35B-A3B text model (a qwen35moe file with its own vocabulary and a declared, stripped next-token
+# layer; profile minicpmv47). ik refuses the file as it is and no ik set was dumped from it, so the gate takes its text path: the
+# clauses that read no set (node-count pins, decode = pass = eager = reset bit for bit, the gemv arm, the wide plan, refusals,
+# checkpoints, resident slots, the q8_0 cache arm) on the file, the first 32 greedy ids of three prompts (English, Korean, code)
+# against ik's on a header-corrected copy, and a `SKIPPED (<clause>)` line for every clause that reads a set. Real file only (no
+# fixture of it); the gate lock.
+[group('pool')]
+gate-gpu-minicpm-text:
+    BLOOMERY_MODEL=minicpmv47 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minicpm-text && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e --model-file "$BLOOMERY_REF_MODEL"'
+
 # The Clef backbone (Qwen3.5 dense, qwen35) gate: the tensor-core decode flash refused at group 6 before any upload,
 # then the prompt call's final-norm hidden states (Tail::Hidden) of the first 64, 600 and 4,096 prose ids, each from a
 # reset as one GEMM ubatch (the 64 also as eight passes: the gemv arm), against llama.cpp mainline's result_norm on the

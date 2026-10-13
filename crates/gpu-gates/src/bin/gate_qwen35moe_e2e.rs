@@ -307,6 +307,13 @@
 //! `l_out`, which is the only tap past that add.
 //!
 //! The chain runs the tensor-core flash pass, the engine's.
+//!
+//! The text path: the gate opens `--model-file <path>` (the text recipe passes the profile's file), else the oracle's. On a qwen35moe file that is not
+//! [`refset::arch::qwen35moe::MODEL`] (MiniCPM-V 4.7's text model, profile `minicpmv47`) no ik set exists, so
+//! `text_run` runs the clauses that read none — (s), (p) on [`TEXT_TOKENS`], (p′), (w′), (r), (k), (n), (v) — and a
+//! greedy cross-check (g): 32 greedy ids of three prompts against ik's on a header-corrected copy, equal, or
+//! differing only at near ties ([`GREEDY_MARGIN`]). Every clause that reads a set prints `SKIPPED (<clause>)`,
+//! and the verdict line counts them. `just gate-gpu-minicpm-text`.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -387,6 +394,7 @@ mod gate {
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
     use runtime::{Out, Target, Want};
     use std::time::Instant;
+    use tokenizer::Tokenizer;
 
     /// Cache rows: the 1,024-token set's step at position 1,024, with room.
     const CTX: usize = 1088;
@@ -693,8 +701,30 @@ mod gate {
         }
     }
 
+    /// The file the gate opens: `--model-file <path>` (the profile's file; the
+    /// text recipe passes `$BLOOMERY_REF_MODEL`), else [`MODEL`], the file ik's
+    /// sets were dumped from. Any other qwen35moe file runs [`text_run`]. A
+    /// flag, not the environment variable: the oracle recipe opens [`MODEL`]
+    /// whatever the tier, as it always has.
+    fn model() -> Result<String, GateError> {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(i) = args.iter().position(|a| a == "--model-file") else {
+            return Ok(MODEL.to_string());
+        };
+        match args.get(i + 1) {
+            Some(p) if !p.is_empty() && !p.starts_with("--") => Ok(p.clone()),
+            _ => Err("--model-file wants the path of the file to open".into()),
+        }
+    }
+
+    fn open_file() -> Result<(String, Split), GateError> {
+        let path = model()?;
+        let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        Ok((path, file))
+    }
+
     fn open(ctx: usize, kv: KvQ8) -> Result<Qwen35moeModel, GateError> {
-        open_at(MODEL, ctx, kv)
+        open_at(&model()?, ctx, kv)
     }
 
     fn open_at(path: &str, ctx: usize, kv: KvQ8) -> Result<Qwen35moeModel, GateError> {
@@ -797,9 +827,9 @@ mod gate {
     /// shape fails here by name rather than under a slicing written for this
     /// one.
     fn file_shape() -> Result<bool, GateError> {
-        let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let (path, split) = open_file()?;
         let spec = model::arch::qwen35moe::spec::read(&split)
-            .map_err(|e| format!("{MODEL}: {e}"))?
+            .map_err(|e| format!("{path}: {e}"))?
             .spec;
         let c = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
         let (mut ok, mut seen) = (true, Vec::new());
@@ -1046,14 +1076,14 @@ mod gate {
         }
 
         fn read(n: usize) -> Result<Gains, GateError> {
-            let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let (path, split) = open_file()?;
             let each = |stem: &str| -> Result<Vec<Vec<f32>>, GateError> {
                 (0..n)
                     .map(|l| split_f32(&split, &format!("blk.{l}.{stem}"), HIDDEN))
                     .collect()
             };
             let spec = model::arch::qwen35moe::spec::read(&split)
-                .map_err(|e| format!("{MODEL}: {e}"))?
+                .map_err(|e| format!("{path}: {e}"))?
                 .spec;
             let moe = spec
                 .layers
@@ -2968,7 +2998,7 @@ mod gate {
     /// every arm red.
     fn memguard() -> Result<bool, GateError> {
         use bloomery_gpu_gates::gpu_census::census;
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let (_, file) = open_file()?;
         let d0 = census()?
             .into_iter()
             .find(|d| d.ordinal == 0)
@@ -3026,7 +3056,7 @@ mod gate {
 
     /// (o) (module doc): the model is dropped before the clause returns.
     fn placed(man: &RefManifest, toks: &[u32], host: HostCfg) -> Result<bool, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let (_, file) = open_file()?;
         let o = Open35 {
             ctx: CTX,
             mma: true,
@@ -3054,7 +3084,7 @@ mod gate {
         let scratch = GpuModel::<Body35>::placed_arena_bytes(&file, o)?;
         let card = plan.machine.cards.first().ok_or("a plan of no card")?;
         let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
-        let joined = header_apart(MODEL)?.iter().filter(|&&a| !a).count();
+        let joined = header_apart(&model()?)?.iter().filter(|&&a| !a).count();
         let t = Instant::now();
         let mut m = GpuModel::<Body35>::open_placed(file, &plan, o, host)?;
         let apart = m.body("gate_qwen35moe_e2e")?.shared_apart();
@@ -3162,7 +3192,7 @@ mod gate {
             let mut m = open(CTX, KvQ8::F16)?;
             decode_run(&mut m, toks, false)?.tokens
         };
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let (_, file) = open_file()?;
         let o = Open35 {
             ctx: CTX,
             mma: true,
@@ -3579,7 +3609,7 @@ mod gate {
     /// session and the residency it ran (`None` when the plan leaves a layer
     /// no room for the machine).
     fn e_open(host: HostCfg, on: bool) -> Result<(Session<Body35>, Option<Residency>), GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let (_, file) = open_file()?;
         let o = Open35 {
             ctx: CTX,
             mma: true,
@@ -4102,6 +4132,228 @@ mod gate {
         Ok((man, toks))
     }
 
+    // ------------------------------------------------ the text path
+
+    /// "The capital of France is" under the vocabulary of every qwen35moe
+    /// file this path has run on (`REF_TOKENS` of the profiles,
+    /// `tools/ref/models/{qwen35moe,minicpmv47}.sh`: ik's `llama-tokenize`, no
+    /// BOS); [`text_vocab`] holds the file's own tokenizer to them.
+    const TEXT_TOKENS: [u32; 5] = [760, 6511, 314, 9338, 369];
+
+    /// Greedy tokens each prompt of [`GREEDY_CASES`] generates.
+    const GREEDY_N: usize = 32;
+
+    /// One prompt of the greedy cross-check and what the reference generated
+    /// from it.
+    struct GreedyCase {
+        name: &'static str,
+        prompt: &'static str,
+        /// The prompt's ids as the reference tokenized it (`tokenizer.ggml.add_bos_token`
+        /// is false in the files this holds for, so no BOS).
+        prompt_ids: &'static [u32],
+        /// The reference's first [`GREEDY_N`] greedy ids.
+        ids: &'static [u32],
+    }
+
+    /// The clauses of [`run`] that read ik's sets, which are dumped from
+    /// [`MODEL`] alone: letter, name.
+    const SET_CLAUSES: [(&str, &str); 9] = [
+        ("c", "free-running"),
+        ("f", "teacher-forced taps"),
+        ("t", "the decode step after each step set's prefill"),
+        ("u/d", "the wide arm against the gemv arm and ik's state"),
+        ("w", "the ubatch size"),
+        ("o", "the placed load"),
+        ("j", "the unjoined shared expert"),
+        ("o8", "the unjoined shared expert on the placed load"),
+        ("e", "the residency machine"),
+    ];
+
+    /// The size of the file the reference below was cut from: MiniCPM-V 4.7
+    /// 35B-A3B at Q4_K_M (`tools/ref/models/minicpmv47.sh`).
+    const GREEDY_FILE_BYTES: u64 = 21_166_255_040;
+
+    /// PIN(2026-10-13): the greedy cross-check's reference, mainline llama.cpp
+    /// 358a420ec: `llama-completion -m FILE -f PROMPT --temp 0 --top-k 1 -n 32
+    /// -ngl 99 -c 512 -fa on -no-cnv --no-display-prompt --special` on the A6000,
+    /// on the file itself (mainline loads it). ik_llama.cpp (version 4906,
+    /// db517b69) refuses the file (it reads `nextn_predict_layers` 1 and asks for
+    /// the stripped `blk.40`); on a header-corrected copy it gives the same ids
+    /// as mainline on all three prompts. The copy is `tools/ref/gguf-respell.py
+    /// respell FILE OUT --from qwen35moe --to qwen35moe --set
+    /// qwen35moe.block_count=41:40 --set qwen35moe.nextn_predict_layers=1:0`:
+    /// source sha256 c729ae6c7bb16dd5b362cdb925c7fb09d744c95601f62b0f45ce51efb55bfe95
+    /// (the file, [`GREEDY_FILE_BYTES`] bytes), copy sha256
+    /// 840a959b75cc67f28774f04812f962bb69345f9fd4a437eadad75d42f7d7578e, the data
+    /// region equal byte for byte. The driver prints text, not ids: `ids` are
+    /// `llama-tokenize --ids` of that text (mainline's, `--no-escape`; the
+    /// driver's trailing newline pair dropped), equal to ik's re-tokenized ids
+    /// and to ours on the first 20 positions of "english", 24 of "korean" and all
+    /// 32 of "code". The prompts' ids are `llama-tokenize`'s of the prompt text.
+    const GREEDY_CASES: [GreedyCase; 3] = [
+        GreedyCase {
+            name: "english",
+            prompt: "What is the capital of France, and what is it famous for?",
+            prompt_ids: &[
+                3710, 369, 279, 6511, 314, 9338, 11, 321, 1092, 369, 424, 10919, 364, 30,
+            ],
+            ids: &[
+                271, 248068, 198, 77264, 11, 279, 1156, 369, 9859, 264, 29350, 57879, 3296, 883,
+                279, 6511, 314, 9338, 321, 1141, 10919, 57902, 13, 1061, 369, 264, 4047, 3134, 11,
+                748, 279, 1965,
+            ],
+        },
+        GreedyCase {
+            name: "korean",
+            prompt: "한국의 수도는 어디이고, 그곳에서 가장 유명한 것은 무엇인가요?",
+            prompt_ids: &[
+                22836, 154735, 159951, 16072, 162634, 153572, 11, 239069, 54581, 170945, 204464,
+                171362, 154029, 209495, 30,
+            ],
+            ids: &[
+                271, 248068, 271, 248069, 271, 22836, 154735, 159951, 16072, 2972, 176490, 318,
+                1460, 10644, 31230, 151396, 13, 271, 176490, 54581, 170945, 195492, 149789, 215926,
+                178728, 16072, 2972, 63100, 94457, 169050, 318, 38,
+            ],
+        },
+        GreedyCase {
+            name: "code",
+            prompt: "Write a Python function that returns the n-th Fibonacci number.",
+            prompt_ids: &[
+                7734, 264, 12654, 709, 421, 4523, 279, 307, 7324, 76938, 1324, 13,
+            ],
+            ids: &[
+                271, 760, 76938, 8240, 369, 4364, 430, 25, 198, 12, 426, 7, 15, 8, 283, 220, 15,
+                198, 12, 426, 7, 16, 8, 283, 220, 16, 198, 12, 426, 1393, 8, 283,
+            ],
+        },
+    ];
+
+    /// The profile's file holds the vocabulary [`TEXT_TOKENS`] was printed
+    /// under: its own tokenizer encodes the prompt to those ids.
+    fn text_vocab(path: &str) -> Result<bool, GateError> {
+        let tok =
+            Tokenizer::from_gguf(path).map_err(|e| format!("the vocabulary of {path}: {e}"))?;
+        let got = tok.encode("The capital of France is", false, false);
+        let pass = got == TEXT_TOKENS;
+        println!(
+            "text vocabulary: \"The capital of France is\" encodes to {got:?} (want {TEXT_TOKENS:?}) {}",
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The greedy cross-check: each prompt of [`GREEDY_CASES`], tokenized by
+    /// the file's own tokenizer and prefilled, then [`GREEDY_N`] steps fed the
+    /// reference's own ids (teacher-forced, so the history is ik's after any
+    /// difference): at each step our argmax must equal the reference's id,
+    /// or the reference's token must lie within [`GREEDY_MARGIN`] below ours
+    /// in our own logits row (the V4.1 free arm's rule: a near tie, where
+    /// ik's 8-bit activation rule and ours round to either side). Until the
+    /// first difference this is the free-running greedy run; past it a
+    /// run that followed its own argmax would be another history, and a
+    /// prompt fed one id late reads a gap past the margin at some step.
+    fn greedy_cross(m: &mut Qwen35moeModel, path: &str) -> Result<bool, GateError> {
+        let tok =
+            Tokenizer::from_gguf(path).map_err(|e| format!("the vocabulary of {path}: {e}"))?;
+        m.set_mode(StepMode::Graph);
+        let mut ok = true;
+        for case in GREEDY_CASES {
+            let prompt = tok.encode(case.prompt, true, false);
+            let same_prompt = prompt == case.prompt_ids;
+            let fed = &prompt[..];
+            m.reset()?;
+            let mut next = m.prefill_with(fed, PrefillPath::Auto)?;
+            let mut flips = Vec::new();
+            for (i, &want) in case.ids.iter().enumerate() {
+                if next != want {
+                    let row = m.logits()?;
+                    let at = |t: u32| row.get(t as usize).copied().unwrap_or(f32::NAN);
+                    let rank = row.iter().filter(|&&v| v > at(want)).count() + 1;
+                    flips.push((i, next, want, at(next) - at(want), rank));
+                }
+                if i + 1 < case.ids.len() {
+                    next = m.step(&[want])?;
+                }
+            }
+            let worst = flips.iter().map(|f| f.3).fold(0.0f32, f32::max);
+            let near = flips.iter().all(|f| f.3 < GREEDY_MARGIN);
+            let pass = same_prompt && case.ids.len() == GREEDY_N && near;
+            let shown: Vec<String> = flips
+                .iter()
+                .map(|(i, ours, want, gap, rank)| {
+                    format!("step {i}: ours {ours}, reference {want}, our logit gap {gap:.4}, the reference's token ranks {rank}")
+                })
+                .collect();
+            println!(
+                "greedy {}: prompt ids {} ({}); {GREEDY_N} steps on the reference's ids, {} argmax equal, {} differ [{}], worst gap {worst:.4} (margin {GREEDY_MARGIN}) {}",
+                case.name,
+                fed.len(),
+                if same_prompt {
+                    "as the reference's"
+                } else {
+                    "NOT the reference's"
+                },
+                GREEDY_N - flips.len(),
+                flips.len(),
+                shown.join("; "),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
+    /// A qwen35moe file that is not [`MODEL`]: the clauses that read no ik
+    /// set, on the file's own tokenizer's prompt, and the greedy
+    /// cross-check against [`GREEDY_CASES`]; every clause that reads a set
+    /// is named as skipped, never dropped silently.
+    fn text_run() -> Result<(), GateError> {
+        let path = model()?;
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map_or(path.clone(), |n| n.to_string_lossy().into_owned());
+        println!("text path: {name} is not {MODEL}; no ik set was dumped from it");
+        let toks = TEXT_TOKENS.to_vec();
+        let mut m = open(CTX, KvQ8::F16)?;
+        let mut ok = text_vocab(&path)?;
+        ok &= file_shape()?;
+        ok &= structure(&mut m)?;
+        let (p_ok, decode) = paths(&mut m, &toks)?;
+        ok &= p_ok;
+        m.set_mode(StepMode::Graph);
+        ok &= gemv_arm(&mut m, &toks, &decode)?;
+        ok &= wide_plan(&mut m)?;
+        ok &= refusals(&mut m)?;
+        let mut skipped = SET_CLAUSES.len();
+        let bytes = std::fs::metadata(&path)?.len();
+        if bytes == GREEDY_FILE_BYTES {
+            ok &= greedy_cross(&mut m, &path)?;
+        } else {
+            skipped += 1;
+            println!(
+                "SKIPPED (g) greedy cross-check: its reference was cut from a file of \
+                 {GREEDY_FILE_BYTES} bytes, {name} has {bytes}"
+            );
+        }
+        let slots = Q35Slots::new(m.body("gate_qwen35moe_e2e")?.vocab());
+        drop(m);
+        ok &= checkpoints()?;
+        ok &= slots_two(&slots)?;
+        ok &= q8_cache(&toks)?;
+        for (letter, what) in SET_CLAUSES {
+            println!("SKIPPED ({letter}) {what}: no ik reference set for {name}");
+        }
+        println!(
+            "gate_qwen35moe_e2e (text path): {skipped} clauses skipped by name: {}",
+            verdict(ok)
+        );
+        if !ok {
+            return Err(checks_failed());
+        }
+        Ok(())
+    }
+
     /// The q8_0 cache arm (`BLOOMERY_QWEN3_KV=q8_0`, the seat's
     /// `--cache-type-k q8_0`), on its own models dropped before the clause
     /// returns: the attention layers' planes hold the two-plane layout (the
@@ -4116,9 +4368,8 @@ mod gate {
     /// clause holds the logits and tokens). Asking the q8 model for the
     /// scalar pass is refused by name at the call, and its next step still
     /// runs.
-    fn q8_cache() -> Result<bool, GateError> {
+    fn q8_cache(toks: &[u32]) -> Result<bool, GateError> {
         const Q8_N: usize = 96;
-        let (_, toks) = batch_set()?;
         let ids: Vec<u32> = toks.iter().take(Q8_N).copied().collect();
         let mut f16 = open(CTX, KvQ8::F16)?;
         let (f16_resident, f16_store) = (f16.resident_bytes(), f16.body("q8")?.store_bytes());
@@ -4212,6 +4463,19 @@ mod gate {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
         let host = bloomery_levers::at_main(&[])?.host();
+        if model()? != MODEL {
+            if let Some(flag) = std::env::args()
+                .skip(1)
+                .find(|a| a.starts_with("--") && a != "--model-file")
+            {
+                return Err(format!(
+                    "{flag}: a clause that reads ik's sets, which are dumped from {MODEL}, not from {}",
+                    model()?
+                )
+                .into());
+            }
+            return text_run();
+        }
         if std::env::args().any(|a| a == "--placed-only") {
             let (man, toks) = batch_set()?;
             let mut ok = placed(&man, &toks, host)?;
@@ -4286,7 +4550,7 @@ mod gate {
         ok &= placed_no_host(&man, &toks, host)?;
         ok &= placed_unjoined(&toks, host)?;
         ok &= residency(host)?;
-        ok &= q8_cache()?;
+        ok &= q8_cache(&toks)?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

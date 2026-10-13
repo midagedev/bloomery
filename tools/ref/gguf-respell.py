@@ -15,6 +15,10 @@
     fourth key, `bloomery.respell.set`, records every set as `key=OLDVAL->NEWVAL`, comma-joined. A `--set` that no
     rewritten shard holds, or whose key is not a u32 reading OLDVAL, is refused by name. Tensor offsets are relative to the data start, so the
     tensor-info block is copied byte for byte and the data region is copied after the header's new padding.
+OLD may equal NEW (a copy that keeps the architecture and only changes u32 values): at least one `--set` is then required,
+and the three records are appended as for any copy (`bloomery.respell.from` reads the unchanged name):
+`respell <file> <out dir> --from qwen35moe --to qwen35moe --set qwen35moe.block_count=41:40 --set qwen35moe.nextn_predict_layers=1:0`
+cuts the declared next-token layer off a header whose tensors never held it.
 The copy is held to its source before it is moved into place, and anything else that differs is refused by name (65): the
 same keys apart from the respelled ones and the three appended, the same tensor names, shapes, types and offsets, and the
 same data bytes (the sha256 of the data region of both files, the output's read back from disk). The output directory
@@ -212,6 +216,8 @@ def rewrite(src, dst, old, new, source, sets=(), applied=None):
 
 
 def respell(first, out, old, new, sets=()):
+    if old == new and not sets:
+        raise Refusal(64, "--from and --to are the same name: a copy that changes nothing but the records needs a --set")
     first = os.path.abspath(first)
     out = os.path.abspath(out)
     if os.path.lexists(out):
@@ -333,6 +339,27 @@ def self_test():
               main(["respell", first, os.path.join(d, "o5"), "--from", "oldarch", "--to", "old-arch", "--set", "old-arch.block_count=7:9"]) == 0
               and main(["respell", first, os.path.join(d, "o6"), "--from", "oldarch", "--to", "old-arch", "--set", "block_count=7:9"]) == 64
               and main(["respell", first, os.path.join(d, "o6"), "--from", "oldarch", "--to", "old-arch", "--set", "old-arch.block_count=7:7"]) == 64)
+        # OLD == NEW: the same architecture, u32 values changed (the MiniCPM next-token cut)
+        out3 = os.path.join(d, "out3")
+        respell(first, out3, "oldarch", "oldarch", [("oldarch.block_count", 7, 5)])
+        m3, t3, st3, sz3, _ = R.header(os.path.join(out3, "m-00001-of-00003.gguf"))
+        check("a same-name copy changes the --set value, keeps the architecture, records source, from and set",
+              m3["general.architecture"] == b"oldarch" and m3["oldarch.block_count"] == 5 and m3["oldarch.rope.scale"] == 0.5
+              and m3["bloomery.respell.from"] == b"oldarch" and m3["bloomery.respell.set"] == b"oldarch.block_count=7->5"
+              and m3["bloomery.respell.source"] == first.encode() and t3 == src_tensors
+              and open(os.path.join(out3, "m-00001-of-00003.gguf"), "rb").read()[st3:] == open(first, "rb").read()[src_start:], m3)
+        for what, fn, frag in (
+            ("a same-name respell with no --set", lambda: respell(first, os.path.join(d, "o7"), "oldarch", "oldarch"), "needs a --set"),
+        ):
+            try:
+                fn()
+                check(f"refuses {what}", False, "no refusal")
+            except Refusal as e:
+                check(f"refuses {what}", e.code == 64 and frag in str(e), str(e))
+        check("the command line takes --from == --to with a --set and refuses it without one",
+              main(["respell", first, os.path.join(d, "o8"), "--from", "oldarch", "--to", "oldarch", "--set", "oldarch.block_count=7:5"]) == 0
+              and main(["respell", first, os.path.join(d, "o9"), "--from", "oldarch", "--to", "oldarch"]) == 64
+              and not os.path.exists(os.path.join(d, "o9")))
         # FAIL-first of the copy's check: a flipped data byte, a changed tensor offset, a dropped key
         src_version, src_kvs, *_ = raw_header(first)
         want = respelled(first, src_kvs, "oldarch", "old-arch", first, hashlib.sha256(open(first, "rb").read()).hexdigest())
@@ -371,8 +398,8 @@ def main(argv):
             return 0 if self_test() else 1
         if argv[:1] == ["respell"] and len(argv) >= 7 and argv[3] == "--from" and argv[5] == "--to":
             _, first, out, _, old, _, new, *rest = argv
-            if not old or not new or old == new or "." in old + new:
-                raise Refusal(64, "--from and --to are two different names without a dot")
+            if not old or not new or "." in old + new:
+                raise Refusal(64, "--from and --to are names without a dot")
             sets = []
             while rest:
                 if rest[0] != "--set" or len(rest) < 2:
@@ -383,6 +410,8 @@ def main(argv):
                     raise Refusal(64, f"--set wants <{new}.key>=<old u32>:<new u32>, two different values, got {rest[1]!r}")
                 sets.append((key, int(o), int(n)))
                 rest = rest[2:]
+            if old == new and not sets:
+                raise Refusal(64, "--from and --to are the same name: give a --set, or two different names")
             for line in respell(first, out, old, new, sets):
                 print(f"respell: {line}")
             print(f"respell: {out}")
