@@ -476,6 +476,9 @@ blk_pytools() {
     "tools/ref/router-residency.py --self-test"
     "tools/ref/set-diff.py --self-test"
     "tools/ref/window-union.py --self-test"
+    "tools/review/diagnostics.py --self-test"
+    "tools/review/post.py --self-test"
+    "tools/review/usage.py --self-test"
     "tools/type-census.py --self-test"
     "tools/verdict-diff.py --self-test"
   )

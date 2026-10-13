@@ -104,14 +104,16 @@ if [ -r /proc/self/stat ]; then
   done
   export CPU_TEST_TMP=$tmp
   # The test shell starts its own arm and records its pid; the foreign one is started by a subshell that
-  # exits at once, so its parent is no longer under the test shell.
+  # exits at once, so its parent is no longer under the test shell. The cases set a threshold of 1 % of one cpu: they
+  # judge which process is counted, and a busy loop on a loaded two-core host (check-recipes' parallel blocks) gets
+  # well under the default 50 %.
   expect 'live: the runner'\''s own busy arm does not tag its row' 0 '!\[cpu-busy\]' \
-    'CPU_BUSY_COMMS="gends41-own cargo-foreign"
+    'CPU_BUSY_COMMS="gends41-own cargo-foreign" CPU_BUSY_PCT=1
      "$CPU_TEST_TMP/bin/gends41-own" > /dev/null & echo $! > "$CPU_TEST_TMP/own.pid"
      sleep 1.5; guard_cpu pre; sleep 1.5; guard_cpu post
      kill "$(cat "$CPU_TEST_TMP/own.pid")"; echo "own: $CPU_BUSY_OWN"'
   expect 'live: a foreign busy process tags the row' 0 '^\[cpu-busy\] .* post: .* \[cargo-foreign [0-9.]+%;\]' \
-    'CPU_BUSY_COMMS="gends41-own cargo-foreign"
+    'CPU_BUSY_COMMS="gends41-own cargo-foreign" CPU_BUSY_PCT=1
      ( "$CPU_TEST_TMP/bin/cargo-foreign" > /dev/null & echo $! > "$CPU_TEST_TMP/foreign.pid" )
      guard_cpu pre; sleep 1.5; guard_cpu post
      kill "$(cat "$CPU_TEST_TMP/foreign.pid")"; [ "$CPU_BUSY_TAG" = " [cpu-busy]" ]'

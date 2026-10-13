@@ -31,7 +31,7 @@ use bloomery_gpu::arch::qwen3moe::{
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::model::StepMode;
 use runtime::seqstate::Kept;
-use runtime::{Speculative, Tapped};
+use runtime::{Speculative, TapSink, Tapped, TappedPrompt, Want};
 
 use crate::mtp::{MtpBody, MtpDraft};
 use crate::{Keep, Prompt, Session, SessionError, cut_positions, keep_positions};
@@ -137,25 +137,33 @@ impl Prompt for Body35 {
     /// The call is one residency pass ([`prompt_pass`]): a load with a machine takes
     /// its boundary before the first unit, none inside.
     fn prompt(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<u32, GpuError> {
-        let path = if ids.len() >= GEMM_FROM {
-            PrefillPath::Wide
-        } else {
-            PrefillPath::Pass
-        };
-        prompt_pass(m, |m| m.prefill_with(ids, path))
+        prompt_pass(m, |m| m.prefill_with(ids, path35(ids.len())))
+    }
+}
+
+/// The units a Qwen3.6 prompt call of `n` ids runs as: the wide ubatch walk
+/// from [`GEMM_FROM`] ids on, passes below.
+fn path35(n: usize) -> PrefillPath {
+    if n >= GEMM_FROM {
+        PrefillPath::Wide
+    } else {
+        PrefillPath::Pass
     }
 }
 
 impl Keep for Body35 {
     /// [`Body35::kept`]'s position: every position, the empty model, or the
-    /// nearest checkpoint a marked prompt call took at or below `n`.
+    /// nearest checkpoint a marked prompt call took at or below `n` — and,
+    /// on a load that verifies drafted rows, any position past the first of
+    /// the verify waiting for its commit.
     fn keepable(m: &Qwen35moeModel, n: u32) -> u32 {
         <Body35 as Keep>::kept(m, n).at
     }
 
     /// [`Body35::kept`]: what a cut keeps and why — a checkpoint's
-    /// position, or nothing with the reason a delta layer holds no earlier
-    /// state but a copy.
+    /// position, a waiting verify's row (the commit moves the lane word and
+    /// copies nothing), or nothing with the reason a delta layer holds no
+    /// earlier state but a copy.
     fn kept(m: &Qwen35moeModel, n: u32) -> Kept {
         m.body(WHAT)
             .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
@@ -163,7 +171,8 @@ impl Keep for Body35 {
 
     /// Back to empty at 0 — a reset; else the model's rollback
     /// ([`Rollback`](bloomery_gpu::model::Rollback)): the checkpoint at
-    /// `n`, any other position refused by name.
+    /// `n`, a row of the verify waiting on a load of several lanes (its
+    /// commit), any other position refused by name.
     fn cut(m: &mut Qwen35moeModel, n: u32) -> Result<(), GpuError> {
         cut_positions(m, n)
     }
@@ -182,6 +191,66 @@ impl Tapped for Session<Body38> {
         let v = self.taps_at(walk, rows)?;
         self.tapped = v;
         Ok(&self.tapped)
+    }
+}
+
+impl Tapped for Session<Body35> {
+    /// The tapped layers ([`TappedPrompt::set_taps`]) times the model's
+    /// width; 0 with no taps set.
+    fn tap_width(&self) -> usize {
+        self.model().draft_tap_width()
+    }
+
+    /// The last call's first `rows` positions' rows entering the tapped
+    /// layers, in the order they were named: a verify's rows, or a step's
+    /// one. Blocking.
+    /// Refused by name for more rows than the last walk laid in.
+    fn taps(&mut self, rows: usize) -> Result<&[f32], SessionError> {
+        self.tapped = self.model_mut().draft_taps(rows)?;
+        Ok(&self.tapped)
+    }
+}
+
+impl TappedPrompt for Session<Body35> {
+    /// Tap the rows entering `layers` from the next call on, in every walk
+    /// of the call: the step, a verify's pass, each prompt unit. The
+    /// captured chains are dropped and recaptured with the copies at their
+    /// next graph run. Empty stops tapping. Refused by name on a placed
+    /// load, past the layer count, and for a card without the bytes.
+    fn set_taps(&mut self, layers: &[usize]) -> Result<(), SessionError> {
+        self.idle("set_taps")?;
+        Ok(self.model_mut().set_draft_taps(layers)?)
+    }
+
+    /// [`Target::prompt`]'s units (`Prompt for Body35`) with the tapped
+    /// rows of the call's last `window` positions handed to `sink` after
+    /// each unit that holds any of them: the cache, the recurrent state and
+    /// the argmax are the plain call's, bit for bit.
+    fn prompt_tapped(
+        &mut self,
+        ids: &[u32],
+        window: usize,
+        sink: TapSink<'_, SessionError>,
+    ) -> Result<u32, SessionError> {
+        self.idle("prompt_tapped")?;
+        let _busy = self.model.prompt_busy();
+        let mut refused = None;
+        let ran = prompt_pass(&mut self.model, |m| {
+            m.prefill_tapped(ids, path35(ids.len()), window, &mut |first, rows| {
+                sink(first, rows).map_err(|e| {
+                    refused = Some(e);
+                    GpuError::State {
+                        what: WHAT,
+                        missing: "a tap sink that takes the rows (its error follows)",
+                    }
+                })
+            })
+        });
+        // The sink's own error first: the call's echo of it is a placeholder.
+        if let Some(e) = refused {
+            return Err(e);
+        }
+        Ok(self.read(ran?, Want::Argmax)?.argmax())
     }
 }
 

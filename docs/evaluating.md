@@ -37,8 +37,8 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
 11. **When something fails**, the error names the cause (a plan that does not fit lists every term and the
     processes holding the card). Open an issue with `bloomery-serve --version`, `nvidia-smi`, the command and the log.
 
-`AGENTS.md`, the `justfile`'s `gate-*` recipes and `tools/` are the maintainers' development contract. They run on
-the maintainers' workstation with its cards and reference dumps, and they are not a test suite for an evaluator.
+`AGENTS.md`, the `justfile`'s `gate-*` recipes and `tools/` are the development contract. They need a card, the
+model files and the reference dumps, and they are not a test suite for an evaluator.
 
 ## Help wanted: hardware we have not run
 

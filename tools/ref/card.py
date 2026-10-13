@@ -64,7 +64,7 @@ that does not parse is CARD_MALFORMED.
                 why now
   minutes       exclusive only, required: the expected hold in minutes, `n` or `lo..hi`, optionally
                 followed by `min`; a hold past 30 minutes is printed with a note to batch it into one sitting
-                (it needs no approval, only its predicted wall: AGENTS.md 「Never」, 2026-10-10)
+                (it needs no approval, only its predicted wall printed before it starts)
 
 An exclusive card takes kind, reason and minutes and nothing else: it predicts nothing, so it has no
 prediction, decision or ruler check. Every other kind takes kind, question, term, unit, predict,
@@ -383,7 +383,7 @@ def check(text, runner_rounds, round_minutes):
         if hi > LONG_HOLD_MINUTES:
             notes.append(f'note: an expected hold over {LONG_HOLD_MINUTES} minutes is a long box job: it needs no approval, '
                          'only its predicted wall printed before it starts, batched with the other long jobs into one '
-                         'sitting (AGENTS.md 「Never」, 2026-10-10)')
+                         'sitting')
         held = f'{lo:g}' if lo == hi else f'{lo:g}..{hi:g}'
         return notes, f'ok kind=exclusive minutes={held} (no prediction: the lease is held for the box, not a measurement)'
     if len({fold(card['value'][k]) for k in DECISIONS}) < 2:

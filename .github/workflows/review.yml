@@ -1,0 +1,323 @@
+# The review bot: one advisory review on every ready pull request, posted as a COMMENT review (it never approves or
+# blocks). Instructions: .github/review/reviewer.md and validator.md; the patterns it learns from:
+# .github/review/escape-catalog.md; design and knobs: .github/review/README.md.
+#
+# pull_request_target, so a fork's pull request gets the API key, and the trust rules that follow from it:
+# - This file, the instructions and tools/review/ come from the base branch. A pull request cannot change what
+#   reviews it.
+# - Nothing from the PR head is executed. Its tree is checked out as data; the diagnostics parse it, the reviewer
+#   reads it with Read/Grep/Glob only (no Bash, no web).
+# - The API key and the write token never share a job: `review` holds the key with a read-only token, `post` holds
+#   pull-requests and issues write and no key. post.py refuses to post output that carries the key or a token-shaped
+#   string, and files at most two issues a run.
+name: PR review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to review (a full review, past the re-review cap)
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+env:
+  CLAUDE_CODE_VERSION: 2.1.284
+  REVIEW_MODEL: claude-sonnet-5-5
+  # The automatic reviews a pull request gets before it needs a workflow_dispatch run.
+  REVIEW_CAP: 5
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+      pr: ${{ steps.g.outputs.pr }}
+      base_sha: ${{ steps.g.outputs.base_sha }}
+      head_sha: ${{ steps.g.outputs.head_sha }}
+      head_repo: ${{ steps.g.outputs.head_repo }}
+      prev_sha: ${{ steps.g.outputs.prev_sha }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR" > pr.json
+          draft=$(jq -r .draft pr.json)
+          state=$(jq -r .state pr.json)
+          author_type=$(jq -r .user.type pr.json)
+          skip_label=$(jq -r '[.labels[].name] | index("no-review") != null' pr.json)
+          {
+            echo "pr=$PR"
+            echo "base_sha=$(jq -r .base.sha pr.json)"
+            echo "head_sha=$(jq -r .head.sha pr.json)"
+            echo "head_repo=$(jq -r .head.repo.full_name pr.json)"
+          } >> "$GITHUB_OUTPUT"
+          # The bot's earlier reviews carry a footer marker with the head they reviewed.
+          gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .body' > prev-bodies.txt || true
+          count=$(grep -c '<!-- bloomery-review head_sha=' prev-bodies.txt || true)
+          prev=$(grep -o '<!-- bloomery-review head_sha=[0-9a-f]*' prev-bodies.txt | tail -1 | sed 's/.*head_sha=//' || true)
+          run=true; why=""
+          if [ "$state" != open ]; then run=false; why="the pull request is $state"; fi
+          if [ "$EVENT" != workflow_dispatch ]; then
+            if [ "$draft" = true ]; then run=false; why="draft"; fi
+            if [ "$author_type" = Bot ]; then run=false; why="opened by a bot"; fi
+            if [ "$skip_label" = true ]; then run=false; why="labelled no-review"; fi
+            if [ "$count" -ge "$REVIEW_CAP" ]; then run=false; why="$count automatic reviews (cap $REVIEW_CAP); run the workflow by hand for another"; fi
+          else
+            prev=""   # a dispatched run is a full review
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "prev_sha=$prev" >> "$GITHUB_OUTPUT"
+          echo "review: run=$run ${why:+($why)} earlier=$count prev=${prev:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  diagnostics:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # No secret here: the tools parse the PR's source as data, and their own code is pinned by commit.
+    permissions:
+      contents: read
+    steps:
+      # The tools come from the branch this workflow runs from (github.sha), never from the pull request's base
+      # commit: a pull request opened before a tools change has an older base.
+      - name: Checkout the tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          sparse-checkout: tools/review
+          persist-credentials: false
+      - name: Checkout the pull request's base (the before side of the comparison)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.base_sha }}
+          path: base
+          persist-credentials: false
+      - name: Checkout the PR head (data only)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.gate.outputs.head_repo }}
+          ref: ${{ needs.gate.outputs.head_sha }}
+          path: pr
+          persist-credentials: false
+      # dryer and crapper (github.com/unclebob), pinned by commit; their dependencies (tree-sitter) from PyPI. The
+      # built venv is cached by the two commits: only our own steps write it, never anything from the PR.
+      - name: Cache dryer and crapper
+        id: ubcache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bloomery-review/ub
+          key: ub-${{ runner.os }}-66ff6d21a42c04afcad89c78a80066176d1294b0-9f1bead298b5a9d576bdd6319289fcf426e5b18a
+      - name: Install dryer and crapper
+        if: steps.ubcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          DRYER_SHA: 66ff6d21a42c04afcad89c78a80066176d1294b0
+          CRAPPER_SHA: 9f1bead298b5a9d576bdd6319289fcf426e5b18a
+        run: |
+          set -euo pipefail
+          ub="$HOME/.cache/bloomery-review/ub"
+          mkdir -p "$ub"
+          for t in dryer:$DRYER_SHA crapper:$CRAPPER_SHA; do
+            name=${t%%:*}; sha=${t#*:}
+            git init -q "$ub/$name"
+            git -C "$ub/$name" fetch -q --depth 1 "https://github.com/unclebob/$name" "$sha"
+            git -C "$ub/$name" checkout -q FETCH_HEAD
+          done
+          python3 -m venv "$ub/venv"
+          "$ub/venv/bin/pip" install -q "$ub/dryer" "$ub/crapper"
+      - name: Run the diagnostics
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.gate.outputs.pr }}
+        run: |
+          set -euo pipefail
+          mkdir -p diag
+          gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | select(.status != "removed") | .filename' > diag/changed.txt
+          # Never fails the job: a tool that cannot run is named in diagnostics.md, which the reviewer reads.
+          gh api "repos/$REPO/pulls/$PR" -H 'Accept: application/vnd.github.diff' > diag/diff.patch
+          ub="$HOME/.cache/bloomery-review/ub/venv/bin"
+          s=$(date +%s)
+          python3 trusted/tools/review/diagnostics.py --base "$PWD/base" --pr "$PWD/pr" --changed diag/changed.txt \
+            --diff diag/diff.patch --out diag/diagnostics.md --dryer "$ub/dryer" --crapper "$ub/crapper" > /dev/null || true
+          echo "diagnostics: $(( $(date +%s) - s )) s" >> "$GITHUB_STEP_SUMMARY"
+          test -s diag/diagnostics.md || echo "The diagnostics did not run (diagnostics.py wrote nothing)." > diag/diagnostics.md
+          cat diag/diagnostics.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: diag/diagnostics.md
+
+  review:
+    needs: [gate, diagnostics]
+    if: always() && needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # Instructions, contracts and tools at the head of the branch this workflow runs from, not the pull request's
+      # base commit: the review holds a PR to today's contract, and an older base may predate the tools.
+      - name: Checkout the base (instructions, contracts, tools)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: base
+          persist-credentials: false
+      - name: Checkout the PR head (data only)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.gate.outputs.head_repo }}
+          ref: ${{ needs.gate.outputs.head_sha }}
+          path: pr
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: diagnostics
+          path: ctx-diag
+      - name: Build the review context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.gate.outputs.pr }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          PREV_SHA: ${{ needs.gate.outputs.prev_sha }}
+          TREE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p ctx out trace
+          gh api "repos/$REPO/pulls/$PR" > ctx/pr-full.json
+          mode=full
+          # An incremental review only when the last reviewed head is an ancestor of this one (a force-push is full).
+          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$HEAD_SHA" ]; then
+            status=$(gh api "repos/$REPO/compare/$PREV_SHA...$HEAD_SHA" --jq .status 2>/dev/null || echo error)
+            if [ "$status" = ahead ]; then
+              gh api "repos/$REPO/compare/$PREV_SHA...$HEAD_SHA" -H 'Accept: application/vnd.github.diff' > ctx/diff.patch
+              gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
+                --jq '[.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("<!-- bloomery-review head_sha='"$PREV_SHA"'"))] | last | .body' > ctx/prev-review.md
+              mode=incremental
+            fi
+          fi
+          if [ "$mode" = full ]; then
+            gh api "repos/$REPO/pulls/$PR" -H 'Accept: application/vnd.github.diff' > ctx/diff.patch
+          fi
+          gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.status)\t+\(.additions)\t-\(.deletions)\t\(.filename)"' > ctx/files.txt
+          gh api --paginate "repos/$REPO/issues?labels=review-bot&state=open&per_page=100" --jq '.[] | "#\(.number) \(.title)"' > ctx/open-issues.txt
+          # tree_sha: the commit BASE_TREE is checked out at, which issue evidence links point into.
+          jq --arg mode "$mode" --arg repo "$REPO" --arg tree "$TREE_SHA" '{number, title, body, author: .user.login,
+              repo: $repo, base_sha: .base.sha, head_sha: .head.sha, tree_sha: $tree, mode: $mode}' ctx/pr-full.json > ctx/pr.json
+          rm ctx/pr-full.json
+          if [ -f ctx-diag/diagnostics.md ]; then cp ctx-diag/diagnostics.md ctx/; else
+            echo "The diagnostics job did not finish; no dryer or crapper results for this review." > ctx/diagnostics.md; fi
+          echo "context: mode=$mode diff=$(wc -l < ctx/diff.patch) lines files=$(wc -l < ctx/files.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}
+      - name: Install Claude Code
+        run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+      - name: Review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+        run: bash base/tools/review/run-claude.sh reviewer "$PWD/base" "$PWD/pr" "$PWD/ctx" "$PWD/out" "$PWD/trace"
+      - name: Validate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+        run: bash base/tools/review/run-claude.sh validator "$PWD/base" "$PWD/pr" "$PWD/ctx" "$PWD/out" "$PWD/trace"
+      - name: Check the output
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 base/tools/review/post.py check --out out --diff ctx/diff.patch --pr-json ctx/pr.json \
+            --base "$PWD/base" --secret-env ANTHROPIC_API_KEY \
+            --usage trace/reviewer.usage.json --usage trace/validator.usage.json
+      # Token and tool accounting for later optimization: the summary lines here, the full transcripts and
+      # tools/review/usage.py's JSON in the review-trace artifact (also on a failed run).
+      - name: Record usage
+        if: always()
+        run: |
+          for r in reviewer validator; do
+            [ -f "trace/$r.usage.json" ] && python3 -c "import json,sys;u=json.load(open(sys.argv[1]));print(f\"{u['role']}: turns={u['num_turns']} requests={u['requests']} cost_usd={u['cost_usd']} ctx_max={u['context_max']} ctx_sum={u['context_sum']} out={u['tokens']['output']} tools={u['tools']} denied={u['denied']} reads={u['reads_distinct']}\")" "trace/$r.usage.json"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          wc -l ctx/diff.patch | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: review-trace
+          path: trace/
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review
+          path: |
+            out/review.md
+            out/decision.txt
+            out/comments.json
+            out/head_sha.txt
+            out/usage.txt
+            out/issues.json
+            out/base_sha.txt
+            ctx/diff.patch
+            ctx/pr.json
+
+  post:
+    needs: [gate, review]
+    if: needs.review.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout the base (post.py)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: tools/review
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: review
+          path: art
+      - name: Post the review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.gate.outputs.pr }}
+        run: |
+          set -euo pipefail
+          # The head may have moved while the review ran; a review of an old head is not posted (the next run covers it).
+          now=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          reviewed=$(cat art/out/head_sha.txt)
+          if [ "$now" != "$reviewed" ]; then
+            echo "head moved from $reviewed to $now; not posting" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 tools/review/post.py check --out art/out --diff art/ctx/diff.patch --pr-json art/ctx/pr.json
+          # Defects the reviewer proved outside this PR become issues labelled review-bot (deduplicated by title).
+          python3 tools/review/post.py issues --out art/out --repo "$REPO" --pr "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 tools/review/post.py post --out art/out --repo "$REPO" --pr "$PR" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -850,6 +850,20 @@ pub const fn row_lane(c: u32, j: u32, lanes: u32) -> u32 {
     (c + j) % lanes
 }
 
+/// The lane word after a verify from the committed lane `c` keeps its first
+/// `k` rows (`k >= 1`): the lane row `k − 1` wrote, `row_lane(c, k − 1)`.
+/// A kept count of 0 has no lane (the verify's row 0 always stays), and is
+/// refused by name.
+///
+/// # Panics
+///
+/// On `k == 0`, by name (in a const context, a compile error).
+#[must_use]
+pub const fn kept_lane(c: u32, k: u32, lanes: u32) -> u32 {
+    assert!(k >= 1, "kept_lane: a verify keeps at least its first row");
+    row_lane(c, k - 1, lanes)
+}
+
 /// The lane row `row` of a verify reads when the verify's lanes start from
 /// the committed lane `c`: the lane the row before it wrote, `c` itself for
 /// row 0.
@@ -1261,7 +1275,7 @@ pub fn lanes_refusal(m: usize, lanes: usize, each: bool, row: usize) -> Option<S
 
 #[cfg(test)]
 mod tests {
-    use super::{delta_host, kda_delta_host, lanes_refusal, read_lane, row_lane};
+    use super::{delta_host, kda_delta_host, kept_lane, lanes_refusal, read_lane, row_lane};
     use crate::linear::{HEAD, KHeadMap, LinearShape};
 
     /// Knuth's MMIX LCG, the high 24 bits as a float in `[lo, hi)`.
@@ -1355,6 +1369,32 @@ mod tests {
         // Two lanes, committed lane 1: row 0 in place on 1, row 1 reads 1
         // and writes 0; keeping both moves the word to 0.
         assert_eq!((read_lane(1, 1, 2), row_lane(1, 1, 2)), (1, 0));
+    }
+
+    /// Keeping `k` of a verify's rows leaves the word at the lane row `k − 1`
+    /// wrote, for every committed lane and every kept count, at the lane
+    /// counts of the bodies that verify (1 for a store that cannot, 4 for
+    /// Qwen3.8's, 8 for Qwen3.6's): `k = 1` is the committed lane's row 0 in
+    /// place, `k = lanes` the lane before the committed one, and the word
+    /// stays below `lanes`.
+    #[test]
+    fn keeping_k_rows_leaves_the_word_at_the_last_kept_rows_lane() {
+        for lanes in [1u32, 4, 8] {
+            for c in 0..lanes {
+                assert_eq!(kept_lane(c, 1, lanes), c, "lanes {lanes} c {c}");
+                for k in 1..=lanes {
+                    let w = kept_lane(c, k, lanes);
+                    assert_eq!(w, row_lane(c, k - 1, lanes), "lanes {lanes} c {c} k {k}");
+                    assert_eq!(w, (c + k - 1) % lanes);
+                    assert!(w < lanes);
+                }
+                assert_eq!(kept_lane(c, lanes, lanes), (c + lanes - 1) % lanes);
+            }
+        }
+        // Eight lanes, committed lane 5, all eight kept: row 7 wrote lane 4.
+        assert_eq!(kept_lane(5, 8, 8), 4);
+        // Four lanes, committed lane 3, two kept: row 1 wrote lane 0.
+        assert_eq!(kept_lane(3, 2, 4), 0);
     }
 
     /// The launcher's refusals: no token or lane, a row past the lanes, a

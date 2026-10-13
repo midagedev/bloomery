@@ -10,6 +10,7 @@
 
 use super::body::{Kernels, TapRows};
 use super::dispatch::{self, Ctx, PassCtx};
+use super::draft_taps::{DraftTaps, Tapping};
 use super::head_argmax::HeadArgmaxState;
 use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, f32_view};
 use crate::head::Head;
@@ -91,7 +92,14 @@ pub(super) struct Program<'a, S: Stores + ?Sized> {
 impl<S: Stores + ?Sized> Program<'_, S> {
     /// Enqueue the walk `(1, m, Step)` over every layer of the plans; a
     /// chain of no layer is refused by name.
-    pub(super) fn walk(mut self) -> Result<(), GpuError> {
+    pub(super) fn walk(self) -> Result<(), GpuError> {
+        self.walk_with(None)
+    }
+
+    /// [`Program::walk`], and with `draft` the walk also lays the rows
+    /// entering the layers it taps into its buffer ([`DraftTaps`]): one
+    /// device copy a tapped layer, none otherwise.
+    pub(super) fn walk_with(mut self, draft: Option<&mut DraftTaps>) -> Result<(), GpuError> {
         if self.c.plans.is_empty() {
             return Err(GpuError::shape(WHAT, "a chain of no layer"));
         }
@@ -100,18 +108,28 @@ impl<S: Stores + ?Sized> Program<'_, S> {
             cols: self.m,
             port: PortKind::Step,
         };
+        let layers = self.c.plans.len();
         let mut port = NoLeg { rows: self.s.rows };
-        sched::walk(o, self.c.plans.len(), &mut port, &mut self)
+        match draft {
+            None => sched::walk(o, layers, &mut port, &mut self),
+            Some(taps) => {
+                let mut walk = Tapping::new(&mut self, taps);
+                sched::walk(o, layers, &mut port, &mut walk)
+            }
+        }
     }
-}
 
-impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
-    type Port = NoLeg;
-
-    /// The whole layer at `m` rows, the embedding in front of layer 0; on
-    /// the decode step the last layer into the head's input, and the
-    /// layer's output into its tap row.
-    fn front(&mut self, _: &mut NoLeg, at: At) -> Result<(), GpuError> {
+    /// Layer `l` at `m` rows. With `entering` (the layer's slot in `taps`),
+    /// `taps` copies the layer's input rows between its mixer and its FFN:
+    /// the mixer reads `x` and writes `ffn_inp`, and the FFN's combine is
+    /// the first launch to write `x` (or the head's input, on a step's last
+    /// layer), so `x` holds the rows entering the layer there, layer 0's
+    /// embedding rows included.
+    pub(super) fn layer(
+        &mut self,
+        l: usize,
+        entering: Option<(&mut DraftTaps, usize)>,
+    ) -> Result<(), GpuError> {
         let Program {
             c,
             stores,
@@ -120,7 +138,6 @@ impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
             m,
             tail,
         } = self;
-        let l = at.layer;
         let (p, st) = c
             .plans
             .get(l)
@@ -132,7 +149,14 @@ impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
             Tail::Step { head, .. } if last => Some(head.input_mut()),
             _ => None,
         };
-        dispatch::layer(&lc, st, s, io, *m, l == 0, out)?;
+        match entering {
+            None => dispatch::layer(&lc, st, s, io, *m, l == 0, out)?,
+            Some((taps, slot)) => {
+                dispatch::mixer(&lc, st, s, io, *m, l == 0)?;
+                taps.enter(c.gpu.stream(), slot, &s.x, *m)?;
+                dispatch::ffn(&lc, &lc.p.ffn, s, *m, out)?;
+            }
+        }
         if let Tail::Step {
             head,
             taps: Some(t),
@@ -143,6 +167,17 @@ impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
             t.rows[l].copy_from_device_async(src, c.gpu.stream())?;
         }
         Ok(())
+    }
+}
+
+impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
+    type Port = NoLeg;
+
+    /// The whole layer at `m` rows, the embedding in front of layer 0; on
+    /// the decode step the last layer into the head's input, and the
+    /// layer's output into its tap row.
+    fn front(&mut self, _: &mut NoLeg, at: At) -> Result<(), GpuError> {
+        self.layer(at.layer, None)
     }
 
     /// The walk's [`Tail`].

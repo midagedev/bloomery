@@ -1,8 +1,9 @@
 # Contributing
 
 Thank you for looking. Issues and pull requests are welcome. A plain statement of where the project stands first:
-every gate runs on the maintainers' one workstation, so a pull request is verified by a maintainer there. What you
-can check on your own machine, and what you cannot, is below. A Korean version: [`CONTRIBUTING.ko.md`](CONTRIBUTING.ko.md).
+the gates need an NVIDIA card and the model files, and the full set runs on the maintainers' workstation. A run on your
+own card counts. What you can check on your own machine, and what you cannot, is below. A Korean version:
+[`CONTRIBUTING.ko.md`](CONTRIBUTING.ko.md).
 
 ## Build
 
@@ -32,12 +33,19 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
   [`docs/contrib/local-check.md`](docs/contrib/local-check.md). CI runs `just contrib-check --tier t0` on every pull
   request (`.github/workflows/pr.yml`); that is a smoke test for your change, not landing evidence.
 
-## How a pull request is verified
+## How a pull request is verified and merged
 
-The `just gate-*` recipes reach the workstation through `tools/box.sh` (ssh and rsync to one host), so they do not run
-on yours. After your change is green on what you can run, a maintainer runs the gates `just affected` selects on the
-box and lands the change in a batch. A label on a pull request that starts that run through the box queue is planned,
-not built. Say in the pull request which commands you ran and paste their output.
+- **CI.** `just contrib-check --tier t0` runs on every pull request (`.github/workflows/pr.yml`); `main` requires it
+  green.
+- **Review.** Every ready pull request gets one advisory review from Claude (`.github/workflows/review.yml`; how it
+  works: [`.github/review/README.md`](.github/review/README.md)). It comments and never blocks a merge. A draft, the
+  `no-review` label or five automatic reviews stop it. A proven defect it finds outside your change becomes a
+  `review-bot` issue.
+- **Gates.** Run the `just gate-*` recipes `just affected` selects on your own card if you can
+  (`BLOOMERY_BOX_LOCAL=1 just gate-<name>` on a Linux machine with a card; the header of `tools/box.sh` has the
+  setup), and paste the commands and their output: we trust a run on your card. A maintainer runs what you could not on the workstation.
+- **Merge.** `main` takes changes only through a pull request, by rebase (linear history). A contributor with write
+  access merges their own pull request once CI is green and the evidence is in it.
 
 ## Two tracks we hope for
 
@@ -54,13 +62,12 @@ move, move it with a dated `PIN(YYYY-MM-DD):` comment and the reason. A new gate
 defect it guards.
 
 **Numbers carry their conditions.** Write `tok/s @ n=96, depth 4096, RTX A6000`, not `29 tok/s`; a derived number says
-[derived]. Our own numbers come from the lease runners in `tools/ref/`, which run only on the maintainers' box today
-(they take a lease under `/root` and pick the timing card by name). A number from your own NVIDIA card counts as
-evidence for your PR on that card when it carries: the `nvidia-smi` line (card and driver), both commit hashes, the
-model file, and the commands with their output. For a small difference, running each side twice in turn helps. Such a
-number decides your PR on that card. It stays in your PR, in a table of its own, never mixed into ours; where we measure
-another card differently, both stand, and the change is gated by the card fact that separates them. The Spark map has
-the plan for timing on another machine (`docs/contrib/dgx-spark.md`).
+[derived]. The lease runners in `tools/ref/` produce the maintainers' numbers. A number from your own NVIDIA card counts
+when it carries: the `nvidia-smi` line (card and driver), both commit hashes, the model file, and the commands with
+their output. For a small difference, running each side twice in turn helps. Such a number decides your PR on that
+card, and it can be published (the README, the docs, a release note) in a table of its own for that card: a table never
+mixes cards. Where two cards measure a change differently, both stand, and the change is gated by the card fact that
+separates them. The Spark map has the plan for timing on another machine (`docs/contrib/dgx-spark.md`).
 
 **Use AI freely, for the code and for talking with us.** Much of bloomery was written with AI help, and the
 maintainers write every reply, review and issue with AI help too. Assume everything here is AI-assisted, on both sides;
@@ -82,5 +89,5 @@ PR, and run the format, lint and comment checks on our side. The lab's owner is 
 
 Comments and anything that goes upstream are in English; a comment states what is true now, and history belongs in the
 commit message. Code shape is judged by [`docs/rust-quality.md`](docs/rust-quality.md) (the rules are numbered
-R1 to R29 and reviews cite the number). `AGENTS.md` is the full working contract, written for the maintainers and their
-AI rounds: read its "Never" list before your first change.
+R1 to R29 and reviews cite the number). `AGENTS.md` is the working contract for everyone, people and agents: read its
+"Never" list before your first change.

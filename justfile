@@ -902,6 +902,16 @@ gate-gpu-qwen35moe-moe *ARGS:
 gate-gpu-qwen35moe-e2e:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
 
+# The Qwen3.6 verify gate (one card): a load opened to verify drafted rows (`open_verifying`: 8 stamped lanes a delta layer)
+# commits every `accepted` in 1..=m of a verify of m = 4 and 8 rows with no re-feed and no copy, and the 16 steps after it
+# give the plain load's ids and last logits bit for bit (graph and eager, a chain of commits too); a lookup draft over
+# `Session<Body35>` emits the plain run's 64 ids with partial commits; the plain load's store bytes, plan layout bytes and
+# graph node counts equal their header derivation and the verifying load adds exactly the lanes (420 MiB + 960 B of
+# stamps); a cut to a checkpoint after a commit; the refusals by name. The real Qwen3.6 file.
+[group('pool')]
+gate-gpu-qwen35moe-verify:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_verify'
+
 # The Clef backbone (Qwen3.5 dense, qwen35) gate: the tensor-core decode flash refused at group 6 before any upload,
 # then the prompt call's final-norm hidden states (Tail::Hidden) of the first 64, 600 and 4,096 prose ids, each from a
 # reset as one GEMM ubatch (the 64 also as eight passes: the gemv arm), against llama.cpp mainline's result_norm on the

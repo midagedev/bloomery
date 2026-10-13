@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bloomery — a contributor's off-box check: the tests a machine with no workstation, no card and no model file can run.
 # The design and what is left is docs/contrib/local-check.md; the result is a contributor's evidence in a pull request,
-# never landing evidence (the maintainers' box record decides, AGENTS.md "Never run a gate on the Mac").
+# never landing evidence (the maintainers' box record decides, AGENTS.md "Never run a gate where it cannot run").
 #
 #   tools/contrib-check.sh [--tier t0|t1] [--only REGEX]   (`just contrib-check`; default t1 on x86_64 Linux, else t0)
 #       --only REGEX  runs just the units whose name matches the extended regex (a red unit again, say `--only '^fmt$'`)

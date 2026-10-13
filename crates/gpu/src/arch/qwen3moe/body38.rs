@@ -69,7 +69,7 @@
 //! positions on until its commit ([`Rollback`], `GpuModel::rollback` to the
 //! first position not kept) keeps the first `k`: every delta layer's state
 //! after each row is in a lane of its own, so the commit moves the lane
-//! word to row `k − 1`'s ([`kept_lane`]) and copies nothing; the PLE hash's
+//! word to row `k − 1`'s ([`LaneWord::keep`]) and copies nothing; the PLE hash's
 //! history is replayed over the kept rows. Every other store is by
 //! position, and nothing reads a row past the count: a pooled key a
 //! rejected row completed is read only at a count that completes it again,
@@ -106,10 +106,10 @@ use super::program38::{
     Ctx38, Kernels38, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38, Step38, Verify38,
     seq_launches, step_launches, verify_launches,
 };
-use super::scratch::{Io, LANE, RecStore, RopeRows, StepParams, f32_view};
+use super::scratch::{Io, LANE, LaneWord, RecStore, RopeRows, StepParams, f32_view, stamps_at};
 use super::scratch38::{
-    Arena38, LANES, LaneWord, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, WideRecord,
-    dims, kept_lane, store_rule_bytes,
+    Arena38, LANES, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, WideRecord, dims,
+    store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
 use super::swap38::{self, DEADLINE, LIVE_DELAY};
@@ -1667,7 +1667,7 @@ impl Body38 {
             wide_timing: None,
             stream: PromptStream::default(),
             card_leg,
-            lane: LaneWord::new(stream)?,
+            lane: LaneWord::new(stream, LANES)?,
             pending: None,
             taps: None,
             eps: spec.rms_eps,
@@ -2326,9 +2326,7 @@ impl Body38 {
     /// Every delta layer's stamps: lane `lane` at position `at`, every other
     /// never written. Synchronizes; never inside a capture.
     fn restamp(&mut self, stream: &CudaStream, lane: u32, at: u32) -> Result<(), GpuError> {
-        let mut st = [crate::linear::delta::NEVER; LANES];
-        *st.get_mut(lane as usize)
-            .ok_or_else(|| GpuError::shape(WHAT, format!("lane {lane} of {LANES}")))? = at;
+        let st = stamps_at(LANES, lane, at)?;
         for s in &mut self.stores {
             if let Store38::Rec { stamp, .. } = s {
                 stamp.copy_from_host(stream, &st)?;
@@ -4305,7 +4303,7 @@ impl Slots for Body38 {
         let seq = Slot38 {
             stores,
             ple_ring: DeviceBuffer::zeroed(stream, ple::ring_len(geo::STREAMS))?,
-            lane: LaneWord::new(stream)?,
+            lane: LaneWord::new(stream, LANES)?,
             pending: None,
             ckpt,
             ple_points: Vec::new(),
@@ -4566,7 +4564,7 @@ impl Body38 {
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit
     /// and take the rest back: the lane word to the last kept row's lane
-    /// ([`kept_lane`]), the PLE history over the kept rows, and the MTP
+    /// ([`LaneWord::keep`]), the PLE history over the kept rows, and the MTP
     /// draft's records — the arenas' held rows and the store's held
     /// positions — cut to `pos`, the rejected rows no longer any walk's to
     /// read. With no verify
@@ -4598,7 +4596,7 @@ impl Body38 {
         };
         let kept = (pos - p.pos0) as usize;
         let stream = gpu.stream();
-        self.lane.set(stream, kept_lane(self.lane.lane(), kept))?;
+        self.lane.keep(stream, kept)?;
         if kept < rows {
             self.ple.keep(p.hist, p.pos0, &p.tokens[..kept])?;
         }
