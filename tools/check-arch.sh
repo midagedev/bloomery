@@ -136,6 +136,9 @@ dispatch=(
   # its span carries, the text rope it needs, the row width and the image-token cap are that module's own facts.
   'crates/gpu-gates/src/vision_seat.rs use'
   'crates/gpu-gates/src/vision_seat.rs fn rules'
+  # The shared prepared image holds one MiniCPM tile group (`EncoderInput::Tiles`). Prepare stays in the model's
+  # own module; this file only names that group.
+  'crates/vision/src/media.rs use'
   # CPU 디코드 바이너리: Arch::detect 로 다른 아키텍처를 거절한 뒤 deepseek2 순전파를 돈다.
   'crates/model/src/bin/bloomery-decode.rs use'
   # r8 사이드카 변환기: Hparams::read 가 deepseek41 이 아닌 파일을 이름 붙여 거절한 뒤 V4.1 의 routed 술어를 쓴다.

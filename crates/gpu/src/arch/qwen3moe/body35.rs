@@ -1161,13 +1161,16 @@ impl Pre35 {
             })
             .transpose()?
             .map(|sections| {
-                use model::arch::qwen35moe::hparams::{Hparams, SectionOrder as Named};
-                let order = match Hparams::read(file)
+                let order = match model::arch::qwen35moe::hparams::Hparams::read(file)
                     .map_err(|e| GpuError::plan(WHAT, e))?
                     .rope_order
                 {
-                    Named::Tyxz => vision::mrope::SectionOrder::Tyxz,
-                    Named::Zyxt => vision::mrope::SectionOrder::Zyxt,
+                    model::arch::qwen35moe::hparams::SectionOrder::Tyxz => {
+                        vision::mrope::SectionOrder::Tyxz
+                    }
+                    model::arch::qwen35moe::hparams::SectionOrder::Zyxt => {
+                        vision::mrope::SectionOrder::Zyxt
+                    }
                 };
                 Ok::<_, GpuError>((sections, order))
             })
