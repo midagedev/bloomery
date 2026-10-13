@@ -1501,16 +1501,40 @@ FP
   # (9b) a ledger skip of a lane item, not a member: a balanced item green on one key. Either lane may take it (take_next hands a
   # green skip out first), so a lane claims it before it records the skip: one `rc=skip` line, the other lane goes on, the batch
   # ends. Unclaimed, the same item came back to both lanes without end, so the case runs the batch under a bound: the lanes' skip
-  # line past one, or the batch still running after 20 s, stops it. lskip_case prints `<rc, 124 at the bound> <skip lines>`.
+  # line past one, or the batch still running after the cap, stops it. The cap is 20 s at one load point per cpu and grows
+  # with the 1-minute load per cpu (load_cap), so a loaded check-recipes run can finish the green batch. lskip_case prints
+  # `<rc, 124 at the bound> <skip lines>`.
   fi
+  # load_cap <idle seconds>: that many seconds when the 1-minute load is at most one per cpu, else the cap times load/cpu,
+  # whole seconds. Same rule as boxq.py's self-test pid wait. A host with no load reading keeps the idle cap.
+  load_cap() {
+    local cpus=1 load=0
+    cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    case $cpus in ''|*[!0-9]*) cpus=1 ;; esac
+    if [ -r /proc/loadavg ]; then
+      read -r load _ < /proc/loadavg || load=0
+    else
+      load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{gsub(/[{}]/, ""); print $1}' || true)
+    fi
+    awk -v cap="$1" -v load="${load:-0}" -v cpus="$cpus" 'BEGIN {
+      if (cap+0 < 1) cap = 1
+      if (cpus+0 < 1) cpus = 1
+      f = load + 0
+      if (f < 0) f = 0
+      f = f / cpus
+      if (f < 1) f = 1
+      printf "%d\n", int(cap * f + 0.999)
+    }'
+  }
   lskip_case() { # <tag> <script>
-    local tag=$1 script=$2 sp k=0 rc=0 cnt=0 f
+    local tag=$1 script=$2 sp k=0 rc=0 cnt=0 f cap
+    cap=$(load_cap 20)
     fresh_state "$t/target/c-$tag"
     printf '%s\n' "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	A	3090	2	$d" > "$t/times-$tag.tsv"
     FAKE_GREEN_FILE=$t/green-lskip.tsv BLOOMERY_GATE_TIMES=$t/times-$tag.tsv BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
       bash "$script" --out "$t/target/c-$tag" --round-ledger steal-fix plain-any 'v41-any@FAKE_SLEEP=2' > "$t/out-$tag.log" 2>&1 &
     sp=$!
-    while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 20 ]; do
+    while kill -0 "$sp" 2> /dev/null && [ "$k" -lt "$cap" ]; do
       cnt=$(grep -c '^plain-any rc=skip ' "$t/target/c-$tag/run.log" 2> /dev/null || true)
       [ "${cnt:-0}" -lt 2 ] || break
       sleep 1
