@@ -225,13 +225,22 @@ impl Body35 {
 
     /// Refused by name on a placed load: its prompt runs through the host
     /// tier's batch port and its step through the placed chain, one
-    /// sequence each, and neither runs a pass of several slots.
+    /// sequence each, and neither runs a pass of several slots; and on a
+    /// load that verifies drafted rows, whose delta stores keep their lanes
+    /// for one sequence's verify.
     fn whole_card(&self) -> Result<(), GpuError> {
         if self.placed.is_some() {
             return Err(GpuError::shape(
                 WHAT,
                 "a pass of several slots on a placed load: its host tier's batch port and its \
                  placed chain run one sequence",
+            ));
+        }
+        if self.lanes() > 1 {
+            return Err(GpuError::shape(
+                WHAT,
+                "a pass of several slots on a load that verifies drafted rows: its delta stores \
+                 keep their lanes for one sequence's verify",
             ));
         }
         Ok(())
