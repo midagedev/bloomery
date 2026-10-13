@@ -8,7 +8,9 @@
 //!    block causal in its sliding layers). The context rows are appended in chunks of changing size,
 //!    so one append runs past the ring's end. The captured block pass replays to the eager bits.
 //!    The loader opens the whole draft (fc, head, Markov tables, id map, embedding table) and the
-//!    card bytes it reports are the header-only count.
+//!    card bytes it reports are the header-only count. Staging: on fresh layers an eager block pass
+//!    and an eager append, run before their stage call, are refused by name; a capture before any
+//!    stage call records (the owner captures at load).
 //!
 //! The target-side clauses (the draft run's ids equal the plain run's, and the acceptance floor with
 //! its mutants) need the draft wired to the target and are not in this binary yet.
@@ -37,11 +39,11 @@ mod gate {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use bloomery_gpu::Gpu;
     use bloomery_gpu::dspark::dense::{DenseDims, DenseLayers};
     use bloomery_gpu::dspark::{DraftLayers, HeadSource, Q8Rows};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::weights::q8_0_planes;
+    use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::rounding::U;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -659,6 +661,32 @@ mod gate {
         Ok(arith && model && q8 && wrapped && replayed)
     }
 
+    /// Staging, on layers that no stage call has run on (a reset): the eager block pass and the
+    /// eager append are refused, each naming the stage call it needs; the same passes captured, as
+    /// the owner captures them at load, record.
+    fn staging_clause(gpu: &Gpu, layers: &mut DenseLayers) -> Result<bool, GateError> {
+        layers.reset(gpu)?;
+        let rows = vec![0.0f32; BLOCK.max(APPEND) * layers.dims().hidden];
+        let mut x = DeviceBuffer::from_host(gpu.stream(), &rows)?;
+        let names = |r: Result<(), GpuError>, call: &str| {
+            r.err().is_some_and(|e| e.to_string().contains(call))
+        };
+        let block = names(layers.enqueue_block(gpu, &mut x, BLOCK), "stage_block");
+        let append = names(layers.append_kv(gpu, &x, APPEND), "stage_kv");
+        let block_captured = gpu
+            .capture(|_| layers.enqueue_block(gpu, &mut x, BLOCK))
+            .is_ok();
+        let append_captured = gpu.capture(|_| layers.append_kv(gpu, &x, APPEND)).is_ok();
+        println!(
+            "staging: the eager block pass before stage_block is refused by name {}; the eager \
+             append before stage_kv {}; the captures before any stage call record {}",
+            verdict(block),
+            verdict(append),
+            verdict(block_captured && append_captured)
+        );
+        Ok(block && append && block_captured && append_captured)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let mut args = std::env::args().skip(1);
         let mut dir = dspark_hf::default_dir();
@@ -711,6 +739,7 @@ mod gate {
         ok &= sized;
         let file = HfFile::open(&dir)?;
         ok &= loader_check(&parts, &file, gpu.stream())?;
+        ok &= staging_clause(&gpu, &mut parts.layers)?;
         let mask_id = usize::try_from(parts.shape.mask_id)?;
         for r in CASES {
             let case = run_case(&gpu, &mut parts.layers, &file, mask_id, r)?;
