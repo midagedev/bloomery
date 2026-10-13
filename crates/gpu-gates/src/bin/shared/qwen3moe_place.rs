@@ -563,7 +563,7 @@ impl PlaceQ3 {
             .w("place", self.place.name())
             .w("card", &self.machine.cards[0].name)
             .w("arch", self.arch)
-            .w("experts", "card")
+            .w("experts", if card.experts == 0 { "host" } else { "card" })
             .u("ctx_max", plan.ctx_max)
             .u("host_experts", plan.host.experts)
             .u("card_experts", card.experts)

@@ -1318,6 +1318,41 @@ fi
 NAME=${1:-}
 [ -n "$NAME" ] || { echo "usage: gpu-gate.sh <target/release binary> [args...]" >&2; exit 64; }
 shift
+# generate_qwen3moe counts its sources inside the binary, after this script has the card lock.
+# A count other than one, and a source flag with no following word, are usage (the binary's own
+# sentence) and exit 64 here, before any lock file is opened. --records-schema (record::at_main,
+# exit 0) and --dump-taps (it returns before the source check) stay the binary's, lock and all.
+# Exact flag names only: --prompt=foo is not a source. Repeated --arm is one source.
+qwen3moe_sources() {
+  local a prompt=0 tokens=0 seed=0 arm=0
+  for a in "$@"; do
+    case $a in
+      --records-schema | --dump-taps) return 0 ;;
+    esac
+  done
+  while [ $# -gt 0 ]; do
+    a=$1
+    shift
+    case $a in
+      --prompt) prompt=1 ;;
+      --tokens) tokens=1 ;;
+      --seed-depth) seed=1 ;;
+      --arm) arm=1 ;;
+      *) continue ;;
+    esac
+    if [ $# -eq 0 ]; then
+      echo "generate_qwen3moe: $a needs a value" >&2
+      exit 64
+    fi
+  done
+  if [ $((prompt + tokens + seed + arm)) != 1 ]; then
+    echo "generate_qwen3moe: give exactly one of --prompt, --tokens, --seed-depth, --arm" >&2
+    exit 64
+  fi
+}
+if [ "$NAME" = generate_qwen3moe ]; then
+  qwen3moe_sources "$@"
+fi
 # shellcheck source=tools/gate-bound.sh
 source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
 gate_bound gpu-gate.sh || exit $?
