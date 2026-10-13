@@ -7,9 +7,7 @@
 //! dense Qwen3-shaped layer in [`dense`]. The draft's geometry is
 //! [`bloomery_runtime::dspark::DsparkShape`].
 
-pub use cuda_core::CudaContext;
 use cuda_core::DeviceBuffer;
-use gguf::GgmlType;
 use runtime::dspark::{DraftVocab, DsparkShape};
 
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
@@ -105,6 +103,14 @@ pub trait DraftLayers {
     /// Forget every context row: a new generation.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError>;
 
+    /// Whether the captured graphs replay what the layers would enqueue now.
+    /// The owner asks before every graph replay, block and append, and never
+    /// before an eager pass. Layers whose captures bake in a setting a caller
+    /// can change refuse by name; the default says the captures always hold.
+    fn replayable(&self) -> Result<(), GpuError> {
+        Ok(())
+    }
+
     /// Card bytes these layers hold at `ctx` positions.
     fn card_bytes(&self, ctx: usize) -> u64;
 }
@@ -133,13 +139,15 @@ pub struct HostEmbed {
 }
 
 /// The target's output matrix as the draft's head borrows it: a copy on the
-/// draft's card in the target file's type.
-pub struct TargetHead {
-    /// The matrix's words.
-    pub w: DeviceTensor<u32>,
-    /// Its type: the owner runs the types it has a row kernel for and refuses
-    /// any other by name.
-    pub ty: GgmlType,
+/// draft's card in the target file's type, each arm holding exactly its
+/// planes. The owner runs the types it has a row kernel for and refuses any
+/// other by name.
+pub enum TargetHead {
+    /// Q6_K superblocks: the matrix's words.
+    Q6K(DeviceTensor<u32>),
+    /// Q8_0 rows in the form the row kernel takes. Refused by name until a
+    /// family's borrowed head needs it.
+    Q8_0(Q8Rows),
 }
 
 /// Where the head's projection comes from.
@@ -483,13 +491,20 @@ impl<L: DraftLayers> DsparkBody<L> {
             ));
         }
         self.positions.check_append(first, n)?;
+        let graph = match submit {
+            Submit::Graph => self.graphs.append.get(n - 1),
+            Submit::Eager => None,
+        };
+        if graph.is_some() {
+            self.layers.replayable()?;
+        }
         let s = gpu.stream();
         put_f32(&mut self.feats.host_mut()?[..n * self.feat], taps);
         self.feats.upload(s, n * self.feat)?;
         self.layers.stage_kv(gpu, first, n)?;
-        match (submit, self.graphs.append.get(n - 1)) {
-            (Submit::Graph, Some(g)) => g.launch(s)?,
-            _ => self.enqueue_append(gpu, n)?,
+        match graph {
+            Some(g) => g.launch(s)?,
+            None => self.enqueue_append(gpu, n)?,
         }
         self.positions.append(first, n)?;
         Ok(n)
@@ -558,6 +573,13 @@ impl<L: DraftLayers> DsparkBody<L> {
                 "the token {last} before a block, past the target's {n_target} ids"
             )));
         }
+        let graph = match submit {
+            Submit::Graph => self.graphs.block.get(m - 1),
+            Submit::Eager => None,
+        };
+        if graph.is_some() {
+            self.layers.replayable()?;
+        }
         let s = gpu.stream();
         let host = self.block_in.host_mut()?;
         host[0] = last;
@@ -577,9 +599,9 @@ impl<L: DraftLayers> DsparkBody<L> {
             let mut x = WindowMut::of_mut(&mut self.x, 0, m * self.hidden)?;
             x.copy_from_device_async(&rows, s)?;
         }
-        match (submit, self.graphs.block.get(m - 1)) {
-            (Submit::Graph, Some(g)) => g.launch(s)?,
-            _ => self.enqueue_block(gpu, m)?,
+        match graph {
+            Some(g) => g.launch(s)?,
+            None => self.enqueue_block(gpu, m)?,
         }
         let asked = !p.is_empty();
         let (ids, probs) = if asked {
