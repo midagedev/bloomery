@@ -1223,12 +1223,16 @@ fn slot_ctx(ctx: usize, parallel: usize) -> Result<usize, GateError> {
 /// ([`vision_seat::open_seat`]); the file is `--mmproj`'s, else the `--hf` repo's projector
 /// ([`vision_seat::Flags::encoder`]), and `None` without either. A qwen3moe file (Qwen3-30B-A3B)
 /// has no image input, so `--mmproj` there is refused by name, and so is a build without the
-/// `vision` feature, whose tower is not built.
+/// `vision` feature, whose tower is not built. A `minicpmv4_7` file is read here
+/// ([`open_minicpm`]): its image ids come from the text tokenizer, which the encoder file does
+/// not carry. The seat does not state that file's tile bound, so the open stops before a tower
+/// is sized.
 fn vision_of(
     a: &Args,
     arch: Arch,
     (path, split): (&Path, &Split),
     token: &dyn Fn(u32) -> Option<String>,
+    one: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<Option<Opened>, GateError> {
     if matches!(arch, Arch::Qwen3moe) {
         return match a.vision.wanted()? {
@@ -1257,6 +1261,11 @@ fn vision_of(
         ple: PleImage::Absent,
     };
     let file = a.vision.encoder(true)?;
+    if let Some(enc) = file.as_deref()
+        && is_minicpm_projector(enc)
+    {
+        return open_minicpm(enc, &a.vision, &facts, token, one).map(Some);
+    }
     vision_seat::open_seat(
         &a.vision,
         file.as_deref(),
@@ -1265,6 +1274,113 @@ fn vision_of(
         &facts,
         token,
     )
+}
+
+/// Whether `path` opens as a `minicpmv4_7` encoder. A file that does not open, or whose projector
+/// type is absent, is left to [`vision_seat::open_seat`], which reports that failure.
+fn is_minicpm_projector(path: &Path) -> bool {
+    let Ok(file) = gguf::Gguf::open(path) else {
+        return false;
+    };
+    file.value("clip.projector_type")
+        .and_then(gguf::Value::as_str)
+        == Some(vision::arch::minicpmv::PROJECTOR_TYPE)
+}
+
+/// A `minicpmv4_7` encoder: the file's hyperparameters, the text tokenizer's marks and the `<unk>`
+/// pad ([`vision::arch::minicpmv::Media::new`]), held against the text model. The tower is not
+/// sized. The seat does not state the tile bound, so the file is refused by name before a card
+/// figure or a seat exists. `one` is a string that tokenizes to exactly one id.
+fn open_minicpm(
+    path: &Path,
+    flags: &vision_seat::Flags,
+    text: &TextFacts,
+    token: &dyn Fn(u32) -> Option<String>,
+    one: &dyn Fn(&str) -> Option<u32>,
+) -> Result<Opened, GateError> {
+    use vision::MediaModel;
+    use vision::arch::minicpmv::{self, Hparams, Marks, Media};
+
+    let at =
+        |detail: &str| -> GateError { format!("--mmproj {}: {detail}", path.display()).into() };
+    let file = gguf::Gguf::open(path).map_err(|e| at(&e.to_string()))?;
+    let rule = vision_seat::rules()
+        .iter()
+        .find(|r| r.projector == minicpmv::PROJECTOR_TYPE)
+        .ok_or_else(|| {
+            at(&format!(
+                "projector type {:?} has no rule in the vision seat's table",
+                minicpmv::PROJECTOR_TYPE
+            ))
+        })?;
+    if flags.sets_limits() && !rule.takes_limits {
+        return Err(at(&format!(
+            "the {} projector plans an image from its file's own grid; \
+             --image-min-tokens and --image-max-tokens steer only the projectors whose \
+             size rule they bound",
+            minicpmv::PROJECTOR_TYPE
+        )));
+    }
+    let hp = Hparams::read(&file).map_err(|e| at(&e.to_string()))?;
+    hp.check_text_width(text.n_embd)
+        .map_err(|e| at(&e.to_string()))?;
+    let marks = Marks::lookup(one).map_err(|e| at(&e.to_string()))?;
+    // The pad the group's rows expand to: the vocabulary's `<unk>`, one token.
+    const PAD_TEXT: &str = "<unk>";
+    let pad = one(PAD_TEXT).ok_or_else(|| {
+        at(&format!(
+            "the pad {PAD_TEXT:?} does not tokenize to exactly one token"
+        ))
+    })?;
+    let media = Media::new(hp, marks, PAD_TEXT, pad);
+    for &(id, want) in rule.ids {
+        match token(id) {
+            Some(got) if got == want => {}
+            got => {
+                return Err(at(&format!(
+                    "the {} projector's image id {id} is {want:?}, and the model's \
+                     vocabulary holds {}",
+                    rule.projector,
+                    got.map_or("no such token".to_owned(), |g| format!("{g:?}"))
+                )));
+            }
+        }
+    }
+    if let Some(want) = rule.text_rope
+        && text.imrope != Some(want)
+    {
+        return Err(at(&format!(
+            "the {} projector places image rows by IMROPE sections {want:?}, and the text \
+             model's rope is {}",
+            rule.projector,
+            text.imrope.map_or("not IMROPE".to_owned(), |s| format!(
+                "IMROPE sections {s:?}"
+            ))
+        )));
+    }
+    let image = media.image_token();
+    match text.ple {
+        PleImage::Absent => {}
+        PleImage::NoKey => {
+            return Err(at(
+                "the text model carries per-layer embeddings and no ple.image_token_id, \
+                 which must be the projector's image token",
+            ));
+        }
+        PleImage::Id(id) if id != image => {
+            return Err(at(&format!(
+                "the text model's ple.image_token_id is {id}, the projector's image token \
+                 is {image}"
+            )));
+        }
+        PleImage::Id(_) => {}
+    }
+    // No tile bound is stated, so the tower is not sized and the encoder is not seated.
+    Err(at(&format!(
+        "the {} projector sizes its tower for the largest tile of its own slice plan; the \
+         seat does not state that bound yet",
+        minicpmv::PROJECTOR_TYPE
+    )))
 }
 
 /// Why `BLOOMERY_DRAFT=dspark` on a qwen35moe file is refused: the card
@@ -1351,8 +1467,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The vocabulary before the plans: `--mmproj`'s encoder is held against it, and its bytes
     // are a reserve of every plan that follows.
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
-    let token = |id| vocab.tokenizer().text(id).map(str::to_owned);
-    let vision = vision_of(&a, arch, (&path, &split), &token)?;
+    let tok = vocab.tokenizer();
+    let token = |id| tok.text(id).map(str::to_owned);
+    // A string that is exactly one token: MiniCPM's marks and its `<unk>` pad.
+    let one = |text: &str| {
+        let ids = tok.encode(text, false, true);
+        (ids.len() == 1).then(|| ids[0])
+    };
+    let vision = vision_of(&a, arch, (&path, &split), &token, &one)?;
     let ChatSurface {
         template,
         name: alias,
