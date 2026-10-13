@@ -8,7 +8,9 @@
 //! expert rule on the routed layers whose stacks the card experts read
 //! ([`card_routed`]) and keeps the rest of every layer's experts on the host
 //! ([`placement::plan_routed`], the path the other hybrid families plan by),
-//! every layer's KV planes full whatever its window, and refuses by name a
+//! a window layer's KV a ring of [`ring_rows`] under [`Rows::Ring`] and a
+//! full plane under [`Rows::Plane`], a full layer a plane either way, and
+//! refuses by name a
 //! machine that hangs an expert tier card, a context of no position and a
 //! host room that cannot hold the host experts: the body serves no NVMe
 //! expert tier, so a plan that pages one ([`PlaceError::NoNvmeTier`]) would
@@ -20,7 +22,7 @@ use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::{GgmlType, Split};
 use models::ModelSpec;
 
-use super::hparams::Hparams;
+use super::hparams::{Hparams, Kind};
 use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
@@ -267,27 +269,66 @@ impl PlanInputs {
     }
 }
 
-/// One file's per-layer KV bytes: every trunk layer, whatever its window
-/// kind, holds a plane of every position — its KV-head count's key and value
-/// rows in f16 — for the attention design keeps full planes with no ring; a
-/// layer's window bounds what a query reads, not what the layer holds.
+/// How many rows a window layer holds. A full layer holds `ctx_max` under
+/// either choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rows {
+    /// The engine's default: [`ring_rows`] rows.
+    Ring,
+    /// Every position. The default-context search and the oracle sequence
+    /// use this term.
+    Plane,
+}
+
+/// Rows a window of `window` positions holds at `ctx_max`: the window plus
+/// one prompt batch, padded up to a multiple of 256, and never past
+/// `ctx_max`. The batch is [`crate::moe::UNION_MAX_COLS`].
+#[must_use]
+pub fn ring_rows(window: u64, ctx_max: u64) -> u64 {
+    let span = window.saturating_add(crate::moe::UNION_MAX_COLS as u64 - 1);
+    ctx_max.min(span.div_ceil(256) * 256)
+}
+
+/// One file's per-layer KV bytes. A full layer holds a plane of every
+/// position. A window layer holds that plane under [`Rows::Plane`], and
+/// [`ring_rows`] rows under [`Rows::Ring`]. Each row is the layer's KV-head
+/// count's key and value rows in f16.
 #[derive(Clone, Debug)]
 pub struct KvLayout {
     /// Per trunk layer: its KV-head count (`attention.head_count_kv`).
     kv_heads: Vec<usize>,
+    /// Per trunk layer: the sliding window, or none for a full layer.
+    windows: Vec<Option<u64>>,
     /// One KV head's key and value rows a position, in bytes: the key and
     /// value head widths (`attention.key_length`,
     /// `attention.value_length`) in f16.
     row: u64,
+    /// Which row count a window layer uses.
+    rows: Rows,
 }
 
 impl KvLayout {
-    /// The layout `hp` describes.
+    /// The layout `hp` describes, window layers on the ring.
     #[must_use]
     pub fn of(hp: &Hparams) -> KvLayout {
+        KvLayout::with_rows(hp, Rows::Ring)
+    }
+
+    /// [`KvLayout::of`] with the window layers on `rows`.
+    #[must_use]
+    pub fn with_rows(hp: &Hparams, rows: Rows) -> KvLayout {
+        let n = hp.n_trunk;
         KvLayout {
-            kv_heads: hp.kv_heads[..hp.n_trunk].to_vec(),
+            kv_heads: hp.kv_heads[..n].to_vec(),
+            windows: hp.kinds[..n]
+                .iter()
+                .map(|k| match k {
+                    Kind::Swa => Some(hp.window as u64),
+                    Kind::Full => None,
+                })
+                .collect(),
             row: (hp.head_k + hp.head_v) as u64 * F16_BYTES,
+            rows,
         }
     }
 
@@ -297,13 +338,26 @@ impl KvLayout {
     pub fn bytes(&self, layers: std::ops::Range<usize>, ctx_max: u64) -> u64 {
         layers.map(|l| self.layer_bytes(l, ctx_max)).sum()
     }
+
+    /// The rows layer `layer` holds at `ctx_max`. A layer past the trunk
+    /// holds none.
+    #[must_use]
+    pub fn rows_at(&self, layer: usize, ctx_max: u64) -> u64 {
+        if self.kv_heads.get(layer).is_none() {
+            return 0;
+        }
+        match (self.rows, self.windows.get(layer).copied().flatten()) {
+            (Rows::Ring, Some(window)) => ring_rows(window, ctx_max),
+            _ => ctx_max,
+        }
+    }
 }
 
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         self.kv_heads
             .get(layer)
-            .map_or(0, |&kv| ctx_max * kv as u64 * self.row)
+            .map_or(0, |&kv| self.rows_at(layer, ctx_max) * kv as u64 * self.row)
     }
 }
 
@@ -313,30 +367,51 @@ mod tests {
 
     use super::super::hparams::tests::{keys, tensors};
     use super::{
-        CardFormat, F16_BYTES, KvBytes, KvLayout, PlaceError, PlanInputs, PlanLevers, SeqTerms,
-        Stores, card_routed,
+        CardFormat, F16_BYTES, KvBytes, KvLayout, PlaceError, PlanInputs, PlanLevers, Rows,
+        SeqTerms, Stores, card_routed,
     };
     use crate::arch::synthetic::{V, header_shaped};
     use crate::placement::workstation::{self, HostRead};
 
-    /// A layer's plane: its own KV-head count's key and value rows in f16 a
-    /// position — a window layer's plane is as full as a full layer's, and at
-    /// 9 positions, past the small header's window of 8, a ring would already
-    /// differ — and a layer past the trunk nothing. The widths are the
+    /// A layer's rows: its own KV-head count's key and value rows in f16 a
+    /// position. Layers 1 and 2 are a window of 8; 0 and 3 are full. At 9
+    /// positions the ring still holds every position, because
+    /// [`super::ring_rows`] pads the window plus one prompt batch past 9.
+    /// Past that pad the ring stays at the pad and the plane grows with the
+    /// context. A layer past the trunk holds nothing. The widths are the
     /// `hparams` tests' small header's: key 16 and value 8 values, 2 KV heads
     /// on a full layer and 1 on a window one.
+    fn layout(rows: Rows) -> KvLayout {
+        KvLayout {
+            kv_heads: vec![2, 1, 1, 2],
+            windows: vec![None, Some(8), Some(8), None],
+            row: (16 + 8) as u64 * F16_BYTES,
+            rows,
+        }
+    }
+
     #[test]
     fn layer_bytes() {
-        let kv = KvLayout {
-            kv_heads: vec![2, 1, 1, 2],
-            row: (16 + 8) as u64 * F16_BYTES,
-        };
-        assert_eq!(kv.row, 48);
-        assert_eq!(kv.layer_bytes(0, 9), 9 * 2 * 48);
-        assert_eq!(kv.layer_bytes(1, 9), 9 * 48);
-        assert_eq!(kv.layer_bytes(4, 9), 0);
-        assert_eq!(kv.bytes(0..4, 1), 6 * 48);
-        assert_eq!(kv.bytes(0..4, 9), 9 * 6 * 48);
+        let pad = super::ring_rows(8, u64::MAX);
+        assert!(pad > 9, "the ring pad is past the 9-position case");
+        for rows in [Rows::Ring, Rows::Plane] {
+            let kv = layout(rows);
+            assert_eq!(kv.row, 48);
+            assert_eq!(kv.layer_bytes(0, 9), 9 * 2 * 48);
+            assert_eq!(kv.layer_bytes(1, 9), 9 * 48);
+            assert_eq!(kv.layer_bytes(4, 9), 0);
+            assert_eq!(kv.bytes(0..4, 1), 6 * 48);
+            assert_eq!(kv.bytes(0..4, 9), 9 * 6 * 48);
+        }
+        let ring = layout(Rows::Ring);
+        let plane = layout(Rows::Plane);
+        let past = pad + 32;
+        assert_eq!(ring.rows_at(1, past), pad);
+        assert_eq!(plane.rows_at(1, past), past);
+        assert_eq!(ring.layer_bytes(1, past), pad * 48);
+        assert_eq!(plane.layer_bytes(1, past), past * 48);
+        assert_eq!(ring.layer_bytes(0, past), past * 2 * 48);
+        assert_eq!(plane.layer_bytes(0, past), past * 2 * 48);
     }
 
     /// One sequence's terms are the layout's stores over the trunk with
@@ -344,10 +419,7 @@ mod tests {
     /// times — the card's kv class of a load that serves them.
     #[test]
     fn seq_terms_count_every_sequence() {
-        let kv = KvLayout {
-            kv_heads: vec![2, 1, 1, 2],
-            row: (16 + 8) as u64 * F16_BYTES,
-        };
+        let kv = layout(Rows::Ring);
         let terms = SeqTerms {
             layers: Stores { kv: &kv, count: 4 },
             draft: None,

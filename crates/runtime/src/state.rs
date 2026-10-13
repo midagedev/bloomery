@@ -64,7 +64,11 @@ pub enum Store {
 pub fn stores(layer: &LayerSpec) -> Vec<(Store, StoreRule)> {
     let mut v = Vec::new();
     match &layer.mixer {
-        Mixer::Gqa(_) => v.push((Store::Kv, StoreRule::Positional)),
+        Mixer::Gqa(g) => v.push((
+            Store::Kv,
+            g.window
+                .map_or(StoreRule::Positional, |slots| StoreRule::Window { slots }),
+        )),
         Mixer::DeltaRule(d) => {
             v.push((
                 Store::Conv,
@@ -121,22 +125,28 @@ pub fn every_position(layer: &LayerSpec) -> bool {
     stores(layer).iter().any(|&(_, r)| r.reads_past_window())
 }
 
-/// Whether a checkpoint copies layer `layer`'s stores: a layer with a
-/// recurrent store keeps its history nowhere else, so every store of it (the
-/// state and the conv inputs it reads) is copied whole. Every other layer's
-/// stores are cut by position, under the body's own window and ratio rules.
+/// Whether a checkpoint copies layer `layer`'s stores. A layer is copied
+/// when one of its stores keeps its history nowhere else: a [`StoreRule::Recurrent`]
+/// store, copied whole, or a [`StoreRule::Window`] store that no shadow holds,
+/// copied as its last `slots` rows. `shadowed` is the caller's
+/// `KvBytes::shadow_bytes(layer, ctx) > 0`. Runtime takes that fact as an
+/// argument and gains no placement dependency.
 #[must_use]
-pub fn copied(layer: &LayerSpec) -> bool {
-    stores(layer)
-        .iter()
-        .any(|&(_, r)| r == StoreRule::Recurrent)
+pub fn copied(layer: &LayerSpec, shadowed: bool) -> bool {
+    stores(layer).iter().any(|&(_, r)| match r {
+        StoreRule::Recurrent => true,
+        StoreRule::Window { .. } => !shadowed,
+        StoreRule::Positional | StoreRule::Ratio { .. } => false,
+    })
 }
 
-/// The layers a checkpoint copies ([`copied`]), ascending: none for a model
-/// every store of which is cut by position.
+/// The layers a checkpoint copies ([`copied`]), ascending. `shadowed(layer)`
+/// is that layer's `KvBytes::shadow_bytes(layer, ctx) > 0`.
 #[must_use]
-pub fn copied_layers(layers: &[LayerSpec]) -> Vec<usize> {
-    (0..layers.len()).filter(|&l| copied(&layers[l])).collect()
+pub fn copied_layers(layers: &[LayerSpec], shadowed: &dyn Fn(usize) -> bool) -> Vec<usize> {
+    (0..layers.len())
+        .filter(|&l| copied(&layers[l], shadowed(l)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -383,6 +393,25 @@ mod tests {
         assert_eq!(stores(&q[3]), [(Store::Kv, StoreRule::Positional)]);
     }
 
+    /// A GQA window is a `Window` store: not every position, and copied only
+    /// while no shadow holds it. A full GQA layer stays positional.
+    #[test]
+    fn a_gqa_window_is_copied_when_nothing_shadows_it() {
+        let mut q = qwen36();
+        let Mixer::Gqa(g) = &mut q[3].mixer else {
+            panic!("layer 3 is the GQA layer");
+        };
+        g.window = Some(128);
+        assert_eq!(
+            stores(&q[3]),
+            [(Store::Kv, StoreRule::Window { slots: 128 })]
+        );
+        assert!(!every_position(&q[3]));
+        assert!(copied(&q[3], false));
+        assert!(!copied(&q[3], true));
+        assert!(copied_layers(&q, &|l| l == 3).iter().all(|&l| l != 3));
+    }
+
     /// A GLM-5.3-Flash-like trunk: KDA layers, every fourth a latent layer
     /// with its own index keys.
     fn glm() -> Vec<LayerSpec> {
@@ -430,18 +459,23 @@ mod tests {
         q
     }
 
-    /// The checkpoint copies exactly the delta-rule layers, whatever the
-    /// model: none of V4.1's (its rings are cut by position), Qwen3.6's and
-    /// Qwen3.8's thirty GDN layers, GLM's thirty-four KDA layers.
+    /// The checkpoint copies a recurrent store whatever the shadow, and a
+    /// window only when nothing shadows it. V4.1's latent windows are
+    /// shadowed, so none of its layers are copied. Qwen3.6's and Qwen3.8's
+    /// thirty GDN layers and GLM's thirty-four KDA layers are copied for
+    /// their state. A Qwen GQA layer has no window here, so it is not.
     #[test]
     fn copied_layers_are_the_recurrent_ones() {
-        assert!(copied_layers(&v41()).is_empty());
+        let shadow = |_: usize| true;
+        let bare = |_: usize| false;
+        assert!(copied_layers(&v41(), &shadow).is_empty());
+        assert_eq!(copied_layers(&v41(), &bare), (0..40).collect::<Vec<_>>());
         let delta: Vec<usize> = (0..40).filter(|l| l % 4 != 3).collect();
-        assert_eq!(copied_layers(&qwen36()), delta);
-        assert_eq!(copied_layers(&qwen38()), delta);
+        assert_eq!(copied_layers(&qwen36(), &bare), delta);
+        assert_eq!(copied_layers(&qwen38(), &shadow), delta);
         let kda: Vec<usize> = (0..45).filter(|l| l % 4 != 3).collect();
         assert_eq!(kda.len(), 34);
-        assert_eq!(copied_layers(&glm()), kda);
+        assert_eq!(copied_layers(&glm(), &bare), kda);
         let g = glm();
         assert_eq!(
             stores(&g[3]),
