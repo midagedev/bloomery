@@ -52,13 +52,15 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
+use bloomery_gpu::media::{ImageShape, ImageSpan, MediaBody, MediaSpan};
 use cuda_core::CudaContext;
 use gguf::Gguf;
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
+use vision::arch::minicpmv::{self, Group};
 use vision::arch::qwen3vl::TokenLimits;
 use vision::arch::{deepseek41v, glm5v, qwen3vl};
+use vision::mrope::Canvas;
 use vision::{MediaModel, Patches, Prepared, VisionError};
 
 use crate::GateError;
@@ -249,8 +251,32 @@ pub fn rules() -> &'static [Rule] {
             default_limits: |f| glm5v::Hparams::read(f)?.default_limits(),
             cap: |_, limits| Ok(limits.max()),
         },
+        Rule {
+            projector: minicpmv::PROJECTOR_TYPE,
+            // The marks around a group are the text tokenizer's ([`minicpmv::Marks::lookup`]),
+            // not ids of the projector.
+            ids: &[],
+            // The sections are the text file's own, read in its `rope.section_order`.
+            text_rope: None,
+            takes_limits: false,
+            out_dim: |f| Ok(minicpmv::Hparams::read(f)?.out_dim),
+            default_limits: |_| Err(tile_bound()),
+            cap: |_, _| Err(tile_bound()),
+        },
     ];
     RULES
+}
+
+/// What a MiniCPM-V file's image-token limits are refused with: its tower is sized by the largest
+/// tile its slice plan can make, which the seat derives; no flag steers it.
+fn tile_bound() -> VisionError {
+    VisionError::Limits {
+        detail: format!(
+            "the {} projector sizes its tower for the largest tile of its own slice plan; the \
+             seat states that bound",
+            minicpmv::PROJECTOR_TYPE
+        ),
+    }
 }
 
 /// What the text model's file says that its projector must agree with.
@@ -749,7 +775,10 @@ impl<K> SpanRows<K> {
         self.media_spans()
             .into_iter()
             .zip(&self.ats)
-            .map(|(span, a)| ImageSpan { span, grid: a.grid })
+            .map(|(span, a)| ImageSpan {
+                span,
+                shape: ImageShape::Grid(a.grid.0, a.grid.1),
+            })
             .collect()
     }
 }
@@ -883,6 +912,18 @@ impl Resident {
     ) -> Result<Encoded, GateError> {
         self.encode_with(model, images, merged_cells)
     }
+
+    /// The rows of one image group ([`group_rows`]) with the tower's card bound for the calls and
+    /// `model`, the context the seat's body runs on, bound back after them
+    /// ([`on_encoder_card`]): the span's rows and the canvas that places them, which the seat's
+    /// `ImageSpan` takes as its shape ([`ImageShape::Canvas`]).
+    pub fn group_rows(
+        &mut self,
+        model: &CudaContext,
+        group: &Group,
+    ) -> Result<(Vec<u16>, Canvas), GateError> {
+        on_encoder_card(model, || group_rows(&mut *self.tower, &self.stream, group))
+    }
 }
 
 /// The rows of one media call, read back by [`Resident::encode_with`] ([`Resident::encode`] for a
@@ -1009,6 +1050,106 @@ pub fn span_rows_of<'a, K, E: Display>(
 pub fn merged_cells(rows: &[u16], patches: &Patches) -> Result<(Vec<u16>, Vec<()>), GateError> {
     let cells = patches.plan.n_llm_h * patches.plan.n_llm_w;
     Ok((rows.to_vec(), vec![(); cells]))
+}
+
+/// The rows of `v.tok_embd_sep` a group's tiles draw their separators from: `</image>`,
+/// `<slice>`, `</slice>` and `\n`.
+const SEPARATOR_ROWS: usize = 4;
+
+/// The rows of one MiniCPM-V image group in the order of its prompt span, whose positions are the
+/// group's canvas: for each tile of `group` in canvas order, the tile's cells as the tower wrote
+/// them (`encode` reads one back, a row of `width` a cell) and then the separator rows the tile
+/// names ([`vision::mrope::Tile::seps`]), each a row of `separators` (the tower's four f32 rows of
+/// `v.tok_embd_sep`) rounded to bf16 as the cells are. The span the rows make holds
+/// `canvas.rows()` positions, `Marks::rows` of the same canvas; the canvas is returned beside them
+/// for the span's shape. A tower with no separator rows, separators of another width, a tile whose
+/// grid is not its canvas tile's and a total off the canvas's rows are refused by name.
+pub fn group_rows_of<E: Display>(
+    group: &Group,
+    width: usize,
+    separators: Option<&[f32]>,
+    mut encode: impl FnMut(&Patches) -> Result<Vec<u16>, E>,
+) -> Result<(Vec<u16>, Canvas), GateError> {
+    let canvas = *group.canvas();
+    let separators = separators.ok_or_else(|| {
+        GateError::from("the tower has no separator rows: an image group needs the projector's")
+    })?;
+    if separators.len() != SEPARATOR_ROWS * width {
+        return Err(format!(
+            "{} separator values for {SEPARATOR_ROWS} rows of {width}",
+            separators.len()
+        )
+        .into());
+    }
+    if group.tiles.len() != canvas.tiles() {
+        return Err(format!(
+            "a group of {} tiles for a canvas of {}",
+            group.tiles.len(),
+            canvas.tiles()
+        )
+        .into());
+    }
+    let mut out = Vec::with_capacity(canvas.rows() * width);
+    for (k, patches) in group.tiles.iter().enumerate() {
+        let tile = canvas.tile(k);
+        if patches.plan.span_grid() != (tile.nx, tile.ny) {
+            return Err(format!(
+                "tile {k} of the group: a {:?} token grid for a canvas tile of {}x{}",
+                patches.plan.span_grid(),
+                tile.nx,
+                tile.ny
+            )
+            .into());
+        }
+        let all = encode(patches).map_err(|e| format!("tile {k} of the group: {e}"))?;
+        let want = tile.nx * tile.ny * width;
+        let cells = all.get(..want).ok_or_else(|| {
+            format!(
+                "tile {k} of the group: {} encoded values for a {}x{} grid, want {want}",
+                all.len(),
+                tile.ny,
+                tile.nx
+            )
+        })?;
+        out.extend_from_slice(cells);
+        for &row in tile.seps {
+            let at = usize::from(row) * width;
+            out.extend(
+                separators[at..at + width]
+                    .iter()
+                    .map(|&x| cuda_device::convert::f32_to_bf16_rne(x)),
+            );
+        }
+    }
+    if out.len() != canvas.rows() * width {
+        return Err(format!(
+            "the group's rows are {} values, the canvas's {} rows of {width}",
+            out.len(),
+            canvas.rows()
+        )
+        .into());
+    }
+    Ok((out, canvas))
+}
+
+/// [`group_rows_of`] of `group` on `tower`, each tile encoded in turn and read back on `stream`,
+/// the stream the tower was opened with; the separator rows are the tower's
+/// ([`bloomery_gpu_vision::Tower::separators`]).
+#[cfg(feature = "vision")]
+pub fn group_rows<T: bloomery_gpu_vision::Tower + ?Sized>(
+    tower: &mut T,
+    stream: &Arc<cuda_core::CudaStream>,
+    group: &Group,
+) -> Result<(Vec<u16>, Canvas), GateError> {
+    let (width, separators) = (tower.out_dim(), tower.separators().map(<[f32]>::to_vec));
+    group_rows_of(group, width, separators.as_deref(), |patches| {
+        let encoded = tower.encode(patches).map_err(|e| e.to_string())?;
+        encoded
+            .rows
+            .buf()
+            .to_host_vec(stream)
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// Where a tower's activations live.
@@ -1936,8 +2077,14 @@ mod tests {
         let got = span_rows_of(images, W, ramp, merged_cells).unwrap();
         let spans = got.image_spans();
         assert_eq!(spans.len(), 2);
-        assert_eq!((spans[0].span.at.clone(), spans[0].grid), (3..5, (2, 1)));
-        assert_eq!((spans[1].span.at.clone(), spans[1].grid), (9..11, (1, 2)));
+        assert_eq!(
+            (spans[0].span.at.clone(), spans[0].shape),
+            (3..5, ImageShape::Grid(2, 1))
+        );
+        assert_eq!(
+            (spans[1].span.at.clone(), spans[1].shape),
+            (9..11, ImageShape::Grid(1, 2))
+        );
         let plain = got.media_spans();
         assert_eq!(spans[0].span.rows, plain[0].rows);
         assert_eq!(spans[1].span.rows, plain[1].rows);
@@ -1964,10 +2111,14 @@ mod tests {
         let got = span_rows_of(images, W, ramp, merged_cells).unwrap();
         let spans = got.image_spans();
         assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].grid, a.plan.span_grid());
-        assert_eq!(spans[1].grid, b.plan.span_grid());
-        assert_eq!([spans[0].grid, spans[1].grid], [(3, 2), (2, 3)]);
-        assert!(spans.iter().all(|s| s.grid.0 * s.grid.1 == s.span.at.len()));
+        let grid = |p: &Patches| ImageShape::Grid(p.plan.span_grid().0, p.plan.span_grid().1);
+        assert_eq!(spans[0].shape, grid(&a));
+        assert_eq!(spans[1].shape, grid(&b));
+        assert_eq!(
+            [spans[0].shape, spans[1].shape],
+            [ImageShape::Grid(3, 2), ImageShape::Grid(2, 3)]
+        );
+        assert!(ImageSpan::check("test", &spans, 30, W).is_ok());
         assert_eq!(
             ImageSpan::rows_of(0, &spans),
             [(3, 3, 2), (12, 2, 3)],
@@ -2093,5 +2244,167 @@ mod tests {
             delimited,
         );
         assert_eq!(refused(failed), "the image at 5: device lost");
+    }
+
+    /// MiniCPM-V 4.7's mmproj figures (35B-A3B): the slice size is the file's 448.
+    fn minicpm_hp() -> minicpmv::Hparams {
+        minicpmv::Hparams {
+            n_layer: 27,
+            dim: 1152,
+            n_head: 16,
+            ff: 4304,
+            patch: 14,
+            slice_size: 448,
+            merge: 4,
+            max_slices: 9,
+            merger_after: 6,
+            out_dim: 2048,
+            eps: 1e-6,
+        }
+    }
+
+    const PAD: u32 = 900;
+
+    fn marks() -> minicpmv::Marks {
+        minicpmv::Marks {
+            image_id_open: 101,
+            image_id_close: 102,
+            image_open: 103,
+            image_close: 104,
+            slice_open: 105,
+            slice_close: 106,
+            row_end: 107,
+            digits: std::array::from_fn(|d| 200 + d as u32),
+        }
+    }
+
+    /// Four distinct separator rows of `W` f32, the last value of the first not a bf16 value.
+    fn separator_rows() -> Vec<f32> {
+        let mut rows: Vec<f32> = (0..4 * W).map(|i| 1.0 + i as f32 / 4.0).collect();
+        rows[W - 1] = 1.0 + 1.0 / 1024.0;
+        rows
+    }
+
+    /// The rows the prompt's span carries, read off `Marks::rows` of the canvas alone: a run of
+    /// pad ids is one tile's cells (the tower's rows of tile `k`), and every other id is the
+    /// separator row its mark names. A tower writes `1000·(k + 1) + i` as value `i` of tile `k`.
+    fn rows_by_marks(canvas: &Canvas) -> Vec<u16> {
+        let (marks, seps) = (marks(), separator_rows());
+        let ids = marks.rows(canvas, PAD);
+        let (mut out, mut tile, mut cell, mut in_run) = (Vec::new(), 0u16, 0usize, false);
+        for id in ids {
+            if id == PAD {
+                if !in_run {
+                    (tile, cell, in_run) = (tile + 1, 0, true);
+                }
+                out.extend((0..W).map(|j| 1000 * tile + (cell * W + j) as u16));
+                cell += 1;
+            } else {
+                in_run = false;
+                let row = [
+                    minicpmv::Sep::ImageEnd,
+                    minicpmv::Sep::SliceStart,
+                    minicpmv::Sep::SliceEnd,
+                    minicpmv::Sep::RowEnd,
+                ]
+                .into_iter()
+                .find(|&s| marks.sep(s) == id)
+                .expect("a separator mark")
+                .row();
+                out.extend(
+                    seps[row * W..(row + 1) * W]
+                        .iter()
+                        .map(|&x| vision::preprocess::f32_to_bf16(x)),
+                );
+            }
+        }
+        out
+    }
+
+    /// A fake tower: tile `k` (in call order) gets `cells · W + 2` values `1000·(k + 1) + i`, a
+    /// window wider than its grid as a tower's buffer is.
+    fn fake_tower(group: &Group) -> impl FnMut(&Patches) -> Result<Vec<u16>, String> + use<> {
+        let mut k = 0u16;
+        let cells: Vec<usize> = group.tiles.iter().map(cells).collect();
+        move |_| {
+            let n = cells[usize::from(k)] * W + 2;
+            k += 1;
+            Ok((0..n as u16).map(|i| 1000 * k + i).collect())
+        }
+    }
+
+    /// A group's rows are, per tile in canvas order, the tower's cells then the separator rows the
+    /// tile names, rounded to bf16 as the cells are: the order `Marks::rows` gives the prompt's
+    /// ids, for the overview alone and for the 1000x700 image's overview and four slices.
+    #[test]
+    fn a_groups_rows_are_each_tiles_cells_then_its_separator_rows() {
+        let hp = minicpm_hp();
+        for (w, h, rows, tiles) in [(200, 200, 65, 1), (1000, 700, 360, 5)] {
+            let group =
+                minicpmv::group::preprocess_group(&vision::Rgb8::filled(w, h, [10, 20, 30]), &hp)
+                    .expect("group");
+            assert_eq!((group.rows(), group.tiles.len()), (rows, tiles), "{w}x{h}");
+            let (got, canvas) =
+                group_rows_of(&group, W, Some(&separator_rows()), fake_tower(&group))
+                    .expect("the group's rows");
+            assert_eq!(canvas, *group.canvas(), "{w}x{h}");
+            assert_eq!(got.len(), rows * W, "{w}x{h}: one row a position");
+            assert_eq!(got, rows_by_marks(&canvas), "{w}x{h}: rows in Marks order");
+        }
+    }
+
+    /// A group needs its tower's separator rows, whole; a tile reads as many cells as its canvas
+    /// tile holds.
+    #[test]
+    fn a_group_without_its_separators_or_cells_is_refused_by_name() {
+        let hp = minicpm_hp();
+        let group =
+            minicpmv::group::preprocess_group(&vision::Rgb8::filled(200, 200, [1, 2, 3]), &hp)
+                .expect("group");
+        let refused = |separators: Option<&[f32]>, cells: usize| {
+            group_rows_of(&group, W, separators, move |_: &Patches| {
+                Ok::<_, String>(vec![1u16; cells])
+            })
+            .unwrap_err()
+            .to_string()
+        };
+        let need = 64 * W;
+        assert_eq!(
+            refused(None, need),
+            "the tower has no separator rows: an image group needs the projector's"
+        );
+        assert_eq!(
+            refused(Some(&separator_rows()[..4 * W - 1]), need),
+            format!("{} separator values for 4 rows of {W}", 4 * W - 1)
+        );
+        assert_eq!(
+            refused(Some(&separator_rows()), need - 1),
+            format!(
+                "tile 0 of the group: {} encoded values for a 8x8 grid, want {need}",
+                need - 1
+            )
+        );
+    }
+
+    /// MiniCPM-V's row asks nothing of the text rope or the vocabulary's ids, takes no limit
+    /// flag, and refuses a file's limits by naming the tile bound the seat states.
+    #[test]
+    fn a_minicpmv_projector_names_the_tile_bound_the_seat_states() {
+        let row = &rules()[3];
+        assert_eq!(row.projector, "minicpmv4_7");
+        assert!(row.ids.is_empty());
+        assert_eq!((row.text_rope, row.takes_limits), (None, false));
+        let c = Clip::new(Some("minicpmv4_7"));
+        let file = Gguf::open(&c.0).expect("opens");
+        for e in [
+            (row.default_limits)(&file).unwrap_err(),
+            (row.cap)(&file, TokenLimits::DEFAULT).unwrap_err(),
+        ] {
+            assert!(
+                e.to_string()
+                    .contains("the largest tile of its own slice plan"),
+                "{e}"
+            );
+        }
     }
 }
