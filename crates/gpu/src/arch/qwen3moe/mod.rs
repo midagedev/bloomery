@@ -23,6 +23,7 @@ mod body38;
 mod card38;
 mod delta;
 mod dispatch;
+mod draft_taps;
 pub mod experts;
 pub mod head_argmax;
 mod hostleg;
@@ -58,6 +59,7 @@ pub use body38::{
     Seq38, Store38Host, XSTREAM_COSTS, checkpoint_budget38, checkpoint_bytes, checkpoint_price38,
     point_row_budget38, seq_positional_bytes, seq38_bytes,
 };
+pub use draft_taps::TapRowsSink;
 pub use mtp38::{
     BorrowedPlanes, DraftRows38, Held38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
     MtpFeed, MtpHead, MtpHidden, MtpMode, MtpNode, MtpTaps, TargetRows, walk_launches,

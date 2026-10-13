@@ -102,6 +102,12 @@ impl SlotRows for Body35 {
                 "layer taps off (a pass of several slots writes none)",
             ));
         }
+        if self.draft.is_some() {
+            return Err(GpuError::state(
+                WHAT,
+                "draft taps off (a pass of several slots lays none in)",
+            ));
+        }
         let total = slot_rows(rows, parked.len())?;
         if ids.len() != total {
             return Err(GpuError::shape(

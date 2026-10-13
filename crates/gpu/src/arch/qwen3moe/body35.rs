@@ -76,6 +76,7 @@
 
 use super::body::{Kernels, KvQ8, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
+use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
 use super::image::{ImageWrite, MediaRows, PromptImage};
 use super::placed::{
@@ -458,6 +459,9 @@ pub struct Body35 {
     /// The flash pass the chain runs: the tensor-core pass from load on.
     pub(super) mma: bool,
     pub(super) taps: Option<TapRows>,
+    /// The rows entering the layers a block draft reads, which every walk of
+    /// a whole-card load lays in ([`GpuModel::set_draft_taps`]).
+    pub(super) draft: Option<DraftTaps>,
     /// A placed load's placed side ([`Placed`]): the host tier and what the
     /// walks over its legs read; `None` on a whole-card load.
     pub(super) placed: Option<Placed>,
@@ -1674,6 +1678,7 @@ impl Body35 {
             head_state,
             mma: o.mma,
             taps: None,
+            draft: None,
             placed,
             lanes,
             lane,
@@ -2182,6 +2187,7 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
         head_state,
         mma,
         taps,
+        draft,
         placed,
         ..
     } = b;
@@ -2229,7 +2235,7 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
             taps: taps.as_mut(),
         },
     }
-    .walk()
+    .walk_with(draft.as_mut())
 }
 
 /// Enqueue a pass of `heads.len()` rows from the pass record: every layer
@@ -2269,6 +2275,7 @@ fn enqueue_rows(
         k,
         head_state,
         mma,
+        draft,
         ..
     } = b;
     let c = PassCtx {
@@ -2291,8 +2298,13 @@ fn enqueue_rows(
             state: head_state,
         },
     }
-    .walk()
+    .walk_with(draft.as_mut())
 }
+
+/// What a prompt call runs after each unit: the unit's first position and
+/// its rows.
+pub(super) type UnitHook<'h> =
+    dyn FnMut(&mut GpuModel<Body35>, u32, usize) -> Result<(), GpuError> + 'h;
 
 /// What a prompt unit's walk ends in.
 enum UnitEnd<'a> {
@@ -2332,6 +2344,9 @@ impl Body35 {
         if let Some(rows) = self.u.media.as_mut() {
             rows.plan(pos as usize..pos as usize + m);
         }
+        if let Some(d) = self.draft.as_mut() {
+            d.plan(m);
+        }
         self.prompt_walks += 1;
         let Body35 {
             eps,
@@ -2343,6 +2358,7 @@ impl Body35 {
             k,
             head_state,
             mma,
+            draft,
             placed,
             stream,
             ..
@@ -2398,7 +2414,7 @@ impl Body35 {
             m,
             tail,
         }
-        .walk()
+        .walk_with(draft.as_mut())
     }
 }
 
@@ -2464,6 +2480,19 @@ impl GpuModel<Body35> {
     /// be below the vocabulary; a prompt past the cache is refused before any
     /// launch.
     pub fn prefill_with(&mut self, tokens: &[u32], path: PrefillPath) -> Result<u32, GpuError> {
+        self.prefill_hooked(tokens, path, None)
+    }
+
+    /// [`GpuModel::prefill_with`], and with `unit` called after each unit
+    /// with the unit's first position and rows (the unit's walk enqueued, its
+    /// head read when it is the last): where [`GpuModel::prefill_tapped`]
+    /// reads its taps back.
+    pub(super) fn prefill_hooked(
+        &mut self,
+        tokens: &[u32],
+        path: PrefillPath,
+        unit: Option<&mut UnitHook<'_>>,
+    ) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen35moe::prefill";
         if tokens.is_empty() {
             return Err(GpuError::shape(WHAT_P, "empty token slice"));
@@ -2499,7 +2528,7 @@ impl GpuModel<Body35> {
             .is_some_and(|p| p.hybrid.call_history());
         let r = self
             .stream_begin(path, tokens.len(), history)
-            .and_then(|()| self.feed_marks(tokens, path, &marks, marked));
+            .and_then(|()| self.feed_marks(tokens, path, &marks, marked, unit));
         // The call's own error first: an end refused after a failed call is
         // its echo. A failed call's streaming ends with each layer back at
         // the set it started with too.
@@ -2518,6 +2547,7 @@ impl GpuModel<Body35> {
         path: PrefillPath,
         marks: &[u32],
         marked: bool,
+        mut unit: Option<&mut UnitHook<'_>>,
     ) -> Result<u32, GpuError> {
         const WHAT_M: &str = "qwen35moe::prefill";
         let pos0 = self.pos();
@@ -2525,7 +2555,7 @@ impl GpuModel<Body35> {
         for &mark in marks {
             if mark > at {
                 let run = &tokens[(at - pos0) as usize..(mark - pos0) as usize];
-                next = Some(self.feed35(run, path)?);
+                next = Some(self.feed35(run, path, unit.as_deref_mut())?);
                 at = mark;
             }
             if marked {
@@ -2584,7 +2614,12 @@ impl GpuModel<Body35> {
     /// stands: the image written for the run's ids, then each unit of the
     /// run's plan one walk, the last ending in its last row's head. The
     /// argmax after the last id.
-    fn feed35(&mut self, run: &[u32], path: PrefillPath) -> Result<u32, GpuError> {
+    fn feed35(
+        &mut self,
+        run: &[u32],
+        path: PrefillPath,
+        mut hook: Option<&mut UnitHook<'_>>,
+    ) -> Result<u32, GpuError> {
         const WHAT_F: &str = "qwen35moe::prefill::run";
         let plan = self.prefill_plan(run.len(), path)?;
         {
@@ -2601,6 +2636,7 @@ impl GpuModel<Body35> {
             let last = i + 1 == n_steps;
             let unit = at..at + t;
             at += t;
+            let first = self.pos();
             next = self.run_rows(t, WHAT_F, |gpu, w, body, head, pos| {
                 let end = if last {
                     UnitEnd::Head(head)
@@ -2611,6 +2647,9 @@ impl GpuModel<Body35> {
                 body.stream.walk_done();
                 Ok(last)
             })?;
+            if let Some(h) = hook.as_deref_mut() {
+                h(self, first, t)?;
+            }
         }
         next.ok_or(GpuError::state(WHAT_F, "a token read after the last unit"))
     }
@@ -2953,6 +2992,9 @@ impl ChainBody for Body35 {
         self.settle(stream)?;
         self.stores_at(pos)?;
         self.held = pos + 1;
+        if let Some(d) = self.draft.as_mut() {
+            d.plan(1);
+        }
         self.sp.write(stream, token, pos)
     }
 
@@ -3031,6 +3073,7 @@ impl ChainBody for Body35 {
             + self.img.bytes()
             + self.head_state.bytes()
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
+            + self.draft.as_ref().map_or(0, DraftTaps::bytes)
             + self.placed.as_ref().map_or(0, Placed::device_bytes)
     }
 
@@ -3198,6 +3241,9 @@ impl Rows for Body35 {
         self.refuse_inside_image("qwen35moe::rows", pos)?;
         self.stand_held(stream, pos, tokens.len())?;
         self.rp.write(stream, tokens, pos)?;
+        if let Some(d) = self.draft.as_mut() {
+            d.plan(tokens.len());
+        }
         if self.lanes > PLAIN_LANES {
             self.pending = Some(Pending35 {
                 pos0: pos,
