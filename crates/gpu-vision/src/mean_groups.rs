@@ -1,20 +1,23 @@
-//! The mean of consecutive groups of `g` f32 rows (`g` = 4 for MiniCPM-V's vit_merger down-sample,
-//! where the rows lie in merge order and a group is a 2×2 window): one output row per group,
-//! `out[r] = (((p0 + p1) + p2) + p3) · (1/g)` for the group's rows `p0 .. p3` of `src`.
+//! The mean of consecutive groups of `g` bf16 rows (`g` = 4 for MiniCPM-V's vit_merger down-sample,
+//! where the rows lie in merge order and a group is a 2×2 window): one bf16 output row per group,
+//! `out[r] = bf16((((p0 + p1) + p2) + p3) · (1/g))` for the group's rows `p0 .. p3` of `src`.
 //!
-//! Numeric rule, per value: f32, the sum in the group's row order with every add rounded on its
-//! own (mainline's chain of `ggml_add`), then one multiply by the f32 `1/g` (`0.25` for `g` = 4,
-//! exact), never contracted: this order is the gate. [`mean_groups_ref`] is the same expression
-//! on the host, and the kernel equals it bit for bit.
+//! Numeric rule, per value: the bf16 inputs widen exactly to f32; the sum runs in the group's row
+//! order with every add rounded on its own (mainline's chain of `ggml_add`); then one multiply by
+//! the f32 `1/g` (`0.25` for `g` = 4, exact); then one rounding to bf16, to nearest even. Nothing
+//! is contracted: this order is the gate. The rows are the chain's dtype, so the output is the
+//! GEMM's residual operand as it stands. [`mean_groups_ref`] is the same expression on the host,
+//! and the kernel equals it bit for bit.
 //!
 //! Geometry: one thread per output value, [`BLOCK`] threads per block, `rows/g · width` threads in
-//! all; ptxas gives 20 registers and no spill, so six blocks fit an SM by the thread limit.
-//! Adjacent threads read adjacent values of every row of the group, so a warp's loads are whole
-//! 128-byte segments; there is no shared state and no barrier. The kernel moves `(g + 1)/g` of
-//! the input in bytes, so its time is the card's memory time for that.
+//! all. Adjacent threads read adjacent values of every row of the group, so a warp's loads are
+//! whole 64-byte segments; there is no shared state and no barrier. The kernel moves `(g + 1)/g`
+//! of the input in bytes, so its time is the card's memory time for that.
 
+use crate::{bf16_f32, f32_bf16};
 use bloomery_gpu::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::convert::{bf16_to_f32, f32_to_bf16_rne};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
@@ -23,19 +26,19 @@ use std::sync::Arc;
 /// Threads per block.
 pub const BLOCK: u32 = 256;
 
-/// The rule on the host: the means of the consecutive groups of `group` rows of `rows` (rows of
-/// `width` f32), in the module's order. `group` divides the row count.
+/// The rule on the host: the means of the consecutive groups of `group` rows of `rows` (bf16 rows
+/// of `width` values), in the module's order. `group` divides the row count.
 #[must_use]
-pub fn mean_groups_ref(rows: &[f32], width: usize, group: usize) -> Vec<f32> {
+pub fn mean_groups_ref(rows: &[u16], width: usize, group: usize) -> Vec<u16> {
     let scale = 1.0f32 / group as f32;
     rows.chunks_exact(group * width)
         .flat_map(|g| {
             (0..width).map(move |d| {
-                let mut acc = g[d];
+                let mut acc = bf16_f32(g[d]);
                 for j in 1..group {
-                    acc += g[j * width + d];
+                    acc += bf16_f32(g[j * width + d]);
                 }
-                acc * scale
+                f32_bf16(acc * scale)
             })
         })
         .collect()
@@ -55,12 +58,12 @@ mod mean_groups_kernels {
         requires = (src.len() >= n_out * group * width, out.len() >= n_out * width)
     )]
     pub fn vis_mean_groups(
-        src: &[f32],
+        src: &[u16],
         n_out: u32,
         group: u32,
         width: u32,
         scale: f32,
-        mut out: DisjointSlice<f32>,
+        mut out: DisjointSlice<u16>,
     ) {
         let idx = thread::index_1d();
         let e = idx.get();
@@ -70,14 +73,14 @@ mod mean_groups_kernels {
         }
         let r = e / w;
         let base = r * group as usize * w + (e - r * w);
-        let mut acc = src[base];
+        let mut acc = bf16_to_f32(src[base]);
         let mut j = 1usize;
         while j < group as usize {
-            acc = add_rn_f32(acc, src[base + j * w]);
+            acc = add_rn_f32(acc, bf16_to_f32(src[base + j * w]));
             j += 1;
         }
         if let Some(o) = out.get_mut(idx) {
-            *o = mul_rn_f32(acc, scale);
+            *o = f32_to_bf16_rne(mul_rn_f32(acc, scale));
         }
     }
 }
@@ -97,7 +100,7 @@ impl MeanGroupsKernels {
     }
 
     /// Enqueue the means of the consecutive groups of `group` of the first `n` rows of `src`
-    /// (`width` f32 each) into the first `n / group` rows of `out`. A `group` that does not
+    /// (`width` bf16 each) into the first `n / group` rows of `out`. A `group` that does not
     /// divide `n` is refused by name. Asynchronous.
     pub fn enqueue(
         &self,
@@ -105,8 +108,8 @@ impl MeanGroupsKernels {
         n: usize,
         group: usize,
         width: usize,
-        src: &DeviceBuffer<f32>,
-        out: &mut DeviceBuffer<f32>,
+        src: &DeviceBuffer<u16>,
+        out: &mut DeviceBuffer<u16>,
     ) -> Result<(), GpuError> {
         let what = "MeanGroupsKernels::enqueue";
         if group == 0 || n == 0 || !n.is_multiple_of(group) {
