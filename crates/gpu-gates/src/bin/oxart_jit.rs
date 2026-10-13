@@ -60,7 +60,7 @@ fn run() -> Result<(), bloomery_gpu_gates::GateError> {
     let (cc_major, cc_minor) = ctx.compute_capability()?;
     println!(
         "# card={} cc={}.{} cuda_driver={}.{}",
-        bloomery_gpu_gates::record::name_token(&ctx.device_name()?),
+        ctx.device_name()?.replace(' ', "_"),
         cc_major,
         cc_minor,
         version / 1000,

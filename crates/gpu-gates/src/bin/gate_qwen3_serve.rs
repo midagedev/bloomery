@@ -3723,7 +3723,7 @@ mod gate {
         let vision = log.first(&record::VISION)?;
         let seat = &img.seat;
         let figure = (
-            bloomery_gpu_gates::record::name_token(&seat.name),
+            seat.name.replace(' ', "_"),
             seat.word(),
             img.bytes.weights,
             img.bytes.scratch,
