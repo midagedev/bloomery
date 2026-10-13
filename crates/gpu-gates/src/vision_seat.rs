@@ -1294,7 +1294,10 @@ mod tests {
     struct Stub(u32);
 
     impl MediaModel for Stub {
-        fn image_placeholder(&self) -> &str {
+        fn image_placeholder(&self, _index: usize) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed("<img>")
+        }
+        fn image_marker(&self) -> &str {
             "<img>"
         }
         fn image_token(&self) -> u32 {

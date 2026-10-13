@@ -2,6 +2,8 @@
 //! and its token, `"\n\n"` between flattened content parts, and the reference `load_image` (plan,
 //! pad or resize, normalize, patch) as the prepare.
 
+use std::borrow::Cow;
+
 use super::IMAGE_TOKEN_ID;
 use super::grid::{GridParams, num_image_tokens, plan_image_grid};
 use crate::media::{MediaModel, PartJoin, Prepared};
@@ -51,7 +53,11 @@ impl Media {
 }
 
 impl MediaModel for Media {
-    fn image_placeholder(&self) -> &str {
+    fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+        Cow::Borrowed(IMAGE_PLACEHOLDER)
+    }
+
+    fn image_marker(&self) -> &str {
         IMAGE_PLACEHOLDER
     }
 
@@ -78,6 +84,8 @@ impl MediaModel for Media {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::{IMAGE_PLACEHOLDER, Media, PAD_GREY, padded, preprocess, to_patches};
     use crate::arch::deepseek41v::grid::{GridParams, plan_image_grid};
     use crate::arch::deepseek41v::span::image_span;
@@ -96,8 +104,13 @@ mod tests {
     #[test]
     fn data_is_v41s() {
         let m = Media::new(V41);
-        assert_eq!(m.image_placeholder(), IMAGE_PLACEHOLDER);
-        assert_eq!(m.image_placeholder(), "<\u{FF5C}deepseek_image\u{FF5C}>");
+        assert_eq!(m.image_placeholder(0), IMAGE_PLACEHOLDER);
+        assert_eq!(m.image_placeholder(0), "<\u{FF5C}deepseek_image\u{FF5C}>");
+        assert!(matches!(
+            m.image_placeholder(5),
+            Cow::Borrowed(IMAGE_PLACEHOLDER)
+        ));
+        assert_eq!(m.image_marker(), IMAGE_PLACEHOLDER);
         assert_eq!(m.image_token(), 129_264);
         assert_eq!(m.part_separator(), "\n\n");
         assert_eq!(m.part_join(), PartJoin::Uniform("\n\n"));

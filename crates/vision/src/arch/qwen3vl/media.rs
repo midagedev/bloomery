@@ -4,6 +4,8 @@
 //! of an image (size plan, pad on this projector's colour, normalize, merge-order patches) as the
 //! prepare. Its content parts join by llama-server's rule ([`PartJoin::LlamaServer`]).
 
+use std::borrow::Cow;
+
 use super::TEMPORAL_FRAMES;
 use super::size::SizeRule;
 use crate::GridPlan;
@@ -71,7 +73,11 @@ impl Media {
 }
 
 impl MediaModel for Media {
-    fn image_placeholder(&self) -> &str {
+    fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+        Cow::Borrowed(IMAGE_PLACEHOLDER)
+    }
+
+    fn image_marker(&self) -> &str {
         IMAGE_PLACEHOLDER
     }
 
@@ -94,6 +100,8 @@ impl MediaModel for Media {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::{IMAGE_PLACEHOLDER, Media, PAD_BLACK, VISION_END_ID, VISION_START_ID};
     use crate::MropeSeq;
     use crate::Rgb8;
@@ -108,11 +116,16 @@ mod tests {
     #[test]
     fn data_is_clefs() {
         let m = media();
-        assert_eq!(m.image_placeholder(), IMAGE_PLACEHOLDER);
+        assert_eq!(m.image_placeholder(0), IMAGE_PLACEHOLDER);
         assert_eq!(
-            m.image_placeholder(),
+            m.image_placeholder(0),
             "<|vision_start|><|image_pad|><|vision_end|>"
         );
+        assert!(matches!(
+            m.image_placeholder(5),
+            Cow::Borrowed(IMAGE_PLACEHOLDER)
+        ));
+        assert_eq!(m.image_marker(), IMAGE_PLACEHOLDER);
         assert_eq!(m.image_token(), 248_056);
         assert_eq!((VISION_START_ID, VISION_END_ID), (248_053, 248_054));
         assert_eq!(PAD_BLACK, [0, 0, 0]);
