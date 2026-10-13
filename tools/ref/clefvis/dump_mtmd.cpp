@@ -13,12 +13,18 @@
 //                   mode (probe_canvas); the image token is `<|image|>`; a set's `pos` is [1, ids]; the tower's output nodes
 //                   are glm4v's `vit_out`, `after_fc_proj`, `after_ffn_proj`; the sets add the `# projector` line, and for
 //                   a text model that is a respelled copy (tools/ref/gguf-respell.py) its `# respell` line.
+//   minicpmv4_7     the canvas layout: an image is one chunk of tiles, [overview, slices row by row], each tile its own tower graph
+//                   (mtmd encodes them one by one), the rows of a tile followed by its separator rows; the text model is a
+//                   qwen35moe with rope.section_order zyxt, so mtmd's position type is M-RoPE and the chunk's is mtmd's canvas.
+//                   Tower mode only (`tower --seat minicpmv4_7`): the sets are `canvas-preproc` and `canvas-taps`, a row
+//                   `<image>/t<k>/<node>` (k = 0 the overview, 1.. the slices), the nodes minicpmv.cpp's `cb()` names.
 // A set of a Qwen seat is byte-identical to what this tool wrote before the glm5v seat existed.
 //
 //   dump_mtmd tower  --mmproj <gguf> -m <text gguf> --image <name>=<png> ... [--out-preproc <dir>] --out-taps <dir>
 //                    [--cpu] [-t <threads>] [--image-min-tokens <n>] [--image-max-tokens <n>] [--tap-patches <n>]
 //                    [--taps full|final] [--mmproj-sha256 <hex>] [--card <name>]
 //                    [--fixture-line <# fixture line>] [--respell-source <first shard>]
+//                    [--seat <projector>]   (the run refuses an mmproj of another projector than the seat it was handed)
 //                    (both modes: the header's `# mmproj` digest and `# device` card; the glm5v seat's `# fixture` line
 //                    and the file its text model's bloomery.respell.source must name)
 //   dump_mtmd hidden --mmproj <gguf> -m <text gguf> --ids <file> --image <name>=<png> ... --out <dir>
@@ -373,10 +379,12 @@ struct seat_t {
     const char * projector;
     const char * pad_text;   // the vocabulary's text of the image-token id
     bool         mrope;      // M-RoPE positions (4 arrays of n_tokens), else normal (one)
+    bool         canvas;     // an image is one chunk of tiles on a shared canvas (MiniCPM-V 4.7); tower mode only
 };
 static const seat_t SEATS[] = {
-    {"qwen3vl_merger", "<|image_pad|>", true},
-    {"glm5v",          "<|image|>",     false},
+    {"qwen3vl_merger", "<|image_pad|>", true,  false},
+    {"glm5v",          "<|image|>",     false, false},
+    {"minicpmv4_7",    "",              true,  true},
 };
 static const seat_t * g_seat  = nullptr;
 static int            g_align = 32;
@@ -392,12 +400,44 @@ static std::string gguf_str(const std::string & path, const std::string & key, b
     return v;
 }
 
-static void select_seat(const std::string & mmproj) {
+// A u32 key the file may leave out.
+static uint32_t gguf_u32_or(const std::string & path, const std::string & key, uint32_t dflt) {
+    gguf_init_params gp = {true, nullptr};
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) DIE("cannot read the gguf header of %s", path.c_str());
+    const int64_t k = gguf_find_key(g, key.c_str());
+    const uint32_t v = k >= 0 ? gguf_get_val_u32(g, k) : dflt;
+    gguf_free(g);
+    return v;
+}
+
+// The first element of an int32 or uint32 array key.
+static int64_t gguf_arr_first(const std::string & path, const std::string & key) {
+    gguf_init_params gp = {true, nullptr};
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) DIE("cannot read the gguf header of %s", path.c_str());
+    const int64_t k = gguf_find_key(g, key.c_str());
+    if (k < 0) DIE("%s has no key %s", path.c_str(), key.c_str());
+    if (gguf_get_kv_type(g, k) != GGUF_TYPE_ARRAY || gguf_get_arr_n(g, k) < 1) DIE("%s: %s is not a non-empty array", path.c_str(), key.c_str());
+    const gguf_type t = gguf_get_arr_type(g, k);
+    const void * d = gguf_get_arr_data(g, k);
+    int64_t v = 0;
+    if (t == GGUF_TYPE_INT32) v = ((const int32_t *) d)[0];
+    else if (t == GGUF_TYPE_UINT32) v = ((const uint32_t *) d)[0];
+    else DIE("%s: %s is not an int array", path.c_str(), key.c_str());
+    gguf_free(g);
+    return v;
+}
+
+static void select_seat(const std::string & mmproj, const std::string & requested) {
     const std::string proj = gguf_str(mmproj, "clip.projector_type", true);
     for (const seat_t & s : SEATS) {
         if (proj == s.projector) g_seat = &s;
     }
-    if (!g_seat) DIE("%s: no seat for the projector '%s' (qwen3vl_merger or glm5v)", mmproj.c_str(), proj.c_str());
+    if (!g_seat) DIE("%s: no seat for the projector '%s' (qwen3vl_merger, glm5v or minicpmv4_7)", mmproj.c_str(), proj.c_str());
+    if (!requested.empty() && requested != g_seat->projector) {
+        DIE("%s: the projector is '%s', this run was handed the seat '%s'", mmproj.c_str(), proj.c_str(), requested.c_str());
+    }
     if (!g_seat->mrope) g_align = (int) (gguf_u32(mmproj, "clip.vision.patch_size") * gguf_u32(mmproj, "clip.vision.spatial_merge_size"));
 }
 
@@ -444,7 +484,7 @@ struct image_info {
 };
 
 static mtmd_context * make_mtmd(const std::string & mmproj, llama_model * model, bool cpu, int threads, int min_tokens,
-                                int max_tokens, tap_state * taps) {
+                                int max_tokens, void * taps, ggml_backend_sched_eval_callback cb_eval = on_node) {
     mtmd_context_params mp = mtmd_context_params_default();
     mp.use_gpu          = !cpu;
     mp.print_timings    = false;
@@ -454,7 +494,7 @@ static mtmd_context * make_mtmd(const std::string & mmproj, llama_model * model,
     mp.image_min_tokens = min_tokens;
     mp.image_max_tokens = max_tokens;
     if (taps) {
-        mp.cb_eval           = on_node;
+        mp.cb_eval           = cb_eval;
         mp.cb_eval_user_data = taps;
     }
     mtmd_context * c = mtmd_init_from_file(mmproj.c_str(), model, mp);
@@ -500,7 +540,11 @@ static void tokenize_image(mtmd_context * ctx, const image_arg & a, image_chunk 
     if (!out.chunk) DIE("%s tokenized to no image chunk", a.path.c_str());
     out.n_tokens = (int) mtmd_input_chunk_get_n_tokens(out.chunk);
     const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(out.chunk);
-    if (g_seat->mrope) {
+    if (g_seat->canvas) {
+        // one chunk of tiles, no one grid: the tiles and their rows come from the tower graphs (run_tower_canvas)
+        out.nx = 0;
+        out.ny = 0;
+    } else if (g_seat->mrope) {
         // the grid from the last token's decoder position: (row ny-1, column nx-1) of a raster grid
         const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) out.n_tokens - 1);
         out.nx = (int) last.x + 1;
@@ -516,7 +560,10 @@ static void tokenize_image(mtmd_context * ctx, const image_arg & a, image_chunk 
 }
 
 // The positions an image advances by: M-RoPE's max(nx, ny), else one a token.
-static int n_pos_of(const image_chunk & ic) { return g_seat->mrope ? std::max(ic.nx, ic.ny) : ic.n_tokens; }
+static int n_pos_of(const image_chunk & ic) {
+    if (g_seat->canvas) return (int) mtmd_image_tokens_get_n_pos(mtmd_input_chunk_get_tokens_image(ic.chunk));
+    return g_seat->mrope ? std::max(ic.nx, ic.ny) : ic.n_tokens;
+}
 
 static void encode_image(mtmd_context * ctx, const image_chunk & ic, int n_embd, std::vector<float> & out) {
     if (mtmd_encode_chunk(ctx, ic.chunk) != 0) DIE("mtmd_encode_chunk failed");
@@ -557,6 +604,16 @@ static void probe_canvas(mtmd_context * tapc, tap_state & taps, const image_arg 
 
 // The seat's lines every set carries beyond the common header (a Qwen seat has none: its sets are as they were).
 static void seat_lines(set_writer & w, const std::string & text_model, const std::string & mmproj) {
+    if (g_seat->canvas) {
+        const std::string tarch = gguf_arch(text_model);
+        w.line(std::string("# projector\t") + g_seat->projector + "\tpatch_size " + std::to_string(gguf_u32(mmproj, "clip.vision.patch_size")) +
+               "\timage_size " + std::to_string(gguf_u32(mmproj, "clip.vision.image_size")) + "\tn_merge " +
+               std::to_string(gguf_u32_or(mmproj, "clip.vision.projector.scale_factor", 4)) + "\tprojection_dim " +
+               std::to_string(gguf_u32(mmproj, "clip.vision.projection_dim")) + "\tblocks " + std::to_string(gguf_u32(mmproj, "clip.vision.block_count")) +
+               "\tinsert_layer_id " + std::to_string(gguf_arr_first(mmproj, "clip.vision.wa_layer_indexes")));
+        w.line("# positions\tcanvas\t" + tarch + ".rope.section_order " + gguf_str(text_model, tarch + ".rope.section_order", false));
+        return;
+    }
     if (g_seat->mrope) return;
     w.line(std::string("# projector\t") + g_seat->projector + "\tpatch_size " + std::to_string(gguf_u32(mmproj, "clip.vision.patch_size")) +
            "\tspatial_merge_size " + std::to_string(gguf_u32(mmproj, "clip.vision.spatial_merge_size")) + "\talign " + std::to_string(g_align) +
@@ -733,6 +790,275 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
         tw.line("# taps\tblocks 0,1,13,26 of ln1 Qcur_rope attn_out ffn_inp ffn_out layer_out; inp_pos_emb; norm_b-27 (the post-LN output); embd (the clean pass)");
     }
     image_lines(tw, infos);
+    for (size_t p = 0, q; p < effect.size(); p = q + 1) {
+        q = effect.find('\n', p);
+        tw.line(effect.substr(p, q - p));
+    }
+    tw.finish();
+    mtmd_free(tapc);
+    mtmd_free(clean);
+    llama_model_free(model);
+    llama_backend_free();
+    return 0;
+}
+
+// ---- the canvas seat's tower (MiniCPM-V 4.7) ----------------------------------------------------------------------
+
+// An image is one chunk of tiles, [overview, slices row by row], and mtmd encodes them one graph at a time (mtmd_encode_impl)
+// with nothing to say which tile a node belongs to; it exposes no tile list either. The tap pass reads the tiles off the
+// graphs: the first consumer of `inp_raw` is a graph's patch conv (the tile's planned size, before its `pos_embed`), and
+// `pos_embed`, the first named node after it, opens the tile; a row is `<image>/t<k>/<node>`.
+struct tile_state {
+    tap_state     ts;          // ts.got holds `<tile>/<node>` and `<tile>/inp_raw`, ts.want the node names as the graph spells them
+    int           opened = 0;  // tiles whose `pos_embed` has been asked: a node after it belongs to tile opened - 1
+    std::set<int> inp_done;
+};
+
+static bool on_node_tile(struct ggml_tensor * t, bool ask, void * user) {
+    auto * s = static_cast<tile_state *>(user);
+    if (!s->ts.armed) return false;
+    const ggml_tensor * inp = src_named(t, "inp_raw");
+    if (inp && !s->inp_done.count(s->opened)) {
+        if (ask) return true;
+        const std::string key = std::to_string(s->opened) + "/inp_raw";
+        capture(&s->ts, key, inp);
+        s->ts.got[key].op = "NONE";
+        s->inp_done.insert(s->opened);
+        return true;
+    }
+    if (ask && strcmp(t->name, "pos_embed") == 0) ++s->opened;
+    if (s->opened == 0 || !s->ts.want.count(t->name)) return false;
+    const std::string key = std::to_string(s->opened - 1) + "/" + t->name;
+    if (s->ts.got.count(key)) return false;
+    if (ask) return true;
+    capture(&s->ts, key, t);
+    return true;
+}
+
+// The blocks tapped: the first and last before the ViT merger (insert_layer_id 6) and after it (block_count 27), at 1,024
+// and 256 tokens a 448 tile; the nodes are minicpmv.cpp's `cb()` names (clip_graph_minicpmv4_6::build), `-<block>` after a
+// block's.
+static const int CANVAS_BLOCKS[] = {0, 6, 7, 26};
+static const char * CANVAS_BLOCK_NODES[] = {"layer_inp_normed", "Qcur", "attn_out", "ffn_inp", "ffn_out", "layer_out"};
+static const char * CANVAS_NODES[] = {"pos_embed", "vit_merger_attn_inp_normed", "vit_merger_window_reorder", "vit_merger_Qcur",
+                                      "vit_merger_Kcur", "vit_merger_Vcur", "vit_merger_attn_out", "vit_merger_attn_residual",
+                                      "vit_merger_ds_mean_res", "vit_merger_ds_normed", "vit_merger_ds_mlp_out", "vit_merger_ds_out",
+                                      "post_ln", "merger_normed", "merger_out"};
+
+struct canvas_tile {
+    int              w = 0, h = 0, nx = 0, ny = 0;  // planned size (inp_raw) and the token grid of the tile's rows
+    int              merger_rows = 0;                // merger_out rows
+    int              row = -1, col = -1;             // the slice's cell; -1: the overview
+    std::vector<int> suffix;                         // rows of tok_embd_sep after the tile's rows
+    int              row0 = 0, rows = 0;             // first row in the image's embeddings, and the tile's rows with its suffix
+};
+
+struct canvas_image {
+    std::string name, png_sha, rgb_sha;
+    int w = 0, h = 0, grid_x = 0, grid_y = 0, n_tokens = 0, n_pos = 0;
+    std::vector<canvas_tile> tiles;
+};
+
+static std::string join_ints(const std::vector<int> & v) {
+    std::string r;
+    for (size_t i = 0; i < v.size(); ++i) r += (i ? "," : "") + std::to_string(v[i]);
+    return r;
+}
+
+// mtmd's add_canvas_chunk and clip_suffix_rows, spelled out: the overview closes with `</image>` (and opens the slices with
+// `<slice>` when there are some), a slice with `</slice>` and the next `<slice>`, the last of a row with `</slice>`, `\n`,
+// `<slice>`, the very last with `</slice>` only. Rows 0..3 of tok_embd_sep: </image>, <slice>, </slice>, \n.
+static std::vector<int> canvas_suffix(int tile, int grid_x, int grid_y) {
+    if (tile == 0) return grid_x > 0 ? std::vector<int>{0, 1} : std::vector<int>{0};
+    const int s = tile - 1, x = s % grid_x, y = s / grid_x;
+    if (y == grid_y - 1 && x == grid_x - 1) return {2};
+    if (x == grid_x - 1) return {2, 3, 1};
+    return {2, 1};
+}
+
+static void canvas_lines(set_writer & w, const std::vector<canvas_image> & imgs) {
+    w.line("# image columns\tname png_sha256 rgb8_sha256 w h grid_x grid_y n_tiles n_tokens n_pos");
+    for (const auto & i : imgs) {
+        w.line("# image\t" + i.name + "\t" + i.png_sha + "\t" + i.rgb_sha + "\t" + std::to_string(i.w) + "\t" + std::to_string(i.h) + "\t" +
+               std::to_string(i.grid_x) + "\t" + std::to_string(i.grid_y) + "\t" + std::to_string(i.tiles.size()) + "\t" +
+               std::to_string(i.n_tokens) + "\t" + std::to_string(i.n_pos));
+    }
+    w.line("# tile columns\timage k kind row col w h nx ny merger_rows suffix row0 rows");
+    for (const auto & i : imgs) {
+        for (size_t k = 0; k < i.tiles.size(); ++k) {
+            const canvas_tile & t = i.tiles[k];
+            w.line("# tile\t" + i.name + "\t" + std::to_string(k) + "\t" + (k == 0 ? "overview" : "slice") + "\t" +
+                   (k == 0 ? std::string("-") : std::to_string(t.row)) + "\t" + (k == 0 ? std::string("-") : std::to_string(t.col)) + "\t" +
+                   std::to_string(t.w) + "\t" + std::to_string(t.h) + "\t" + std::to_string(t.nx) + "\t" + std::to_string(t.ny) + "\t" +
+                   std::to_string(t.merger_rows) + "\t" + join_ints(t.suffix) + "\t" + std::to_string(t.row0) + "\t" + std::to_string(t.rows));
+        }
+    }
+}
+
+static int run_tower_canvas(const std::string & mmproj, const std::string & text_model, const std::vector<image_arg> & images,
+                            const std::string & out_pre, const std::string & out_taps, bool cpu, int threads, int min_tokens,
+                            int max_tokens, const std::string & flags) {
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.vocab_only = true;
+    llama_model * model = llama_model_load_from_file(text_model.c_str(), mp);
+    if (!model) DIE("cannot load the vocabulary of %s", text_model.c_str());
+    const int n_embd = (int) gguf_u32(mmproj, "clip.vision.projection_dim");
+    const std::string tarch = gguf_arch(text_model);
+    if ((int) gguf_u32(text_model, tarch + ".embedding_length") != n_embd) {
+        DIE("the mmproj projects to %d, the text model %s is %d wide", n_embd, text_model.c_str(), (int) gguf_u32(text_model, tarch + ".embedding_length"));
+    }
+    // the canvas positions put time last in the rope's sections; a text model that does not say so is another layout
+    const std::string order = gguf_str(text_model, tarch + ".rope.section_order", false);
+    if (order != "zyxt") {
+        DIE("the text model's %s.rope.section_order is '%s', the %s seat's canvas positions are laid out for zyxt", tarch.c_str(),
+            order.empty() ? "(unset)" : order.c_str(), g_seat->projector);
+    }
+    const int patch = (int) gguf_u32(mmproj, "clip.vision.patch_size");
+    const int n_merge = (int) gguf_u32_or(mmproj, "clip.vision.projector.scale_factor", 4);
+    const int n_block = (int) gguf_u32(mmproj, "clip.vision.block_count");
+    const int insert = (int) gguf_arr_first(mmproj, "clip.vision.wa_layer_indexes");
+    if (insert != 6 || n_block != 27) {
+        DIE("the tapped blocks 0, 6, 7, 26 are for insert_layer_id 6 of 27 blocks; this mmproj says %d of %d", insert, n_block);
+    }
+
+    tile_state st;
+    mtmd_context * clean = make_mtmd(mmproj, model, cpu, threads, min_tokens, max_tokens, nullptr);
+    mtmd_context * tapc  = make_mtmd(mmproj, model, cpu, threads, min_tokens, max_tokens, &st, on_node_tile);
+    check_pos_type(clean);
+
+    const std::string arch = gguf_arch(mmproj);
+    std::unique_ptr<set_writer> pre;
+    if (!out_pre.empty()) pre.reset(new set_writer(out_pre));
+    set_writer tw(out_taps);
+    std::vector<canvas_image> infos;
+    std::string effect;
+    std::vector<std::string> wanted(std::begin(CANVAS_NODES), std::end(CANVAS_NODES));
+    for (int b : CANVAS_BLOCKS) for (const char * n : CANVAS_BLOCK_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
+
+    for (const auto & a : images) {
+        fprintf(stderr, "dump_mtmd: tower %s\n", a.name.c_str());
+        std::vector<uint8_t> png;
+        if (!read_file(a.path, png)) DIE("cannot read %s", a.path.c_str());
+        canvas_image info;
+        info.name = a.name;
+        info.png_sha = sha256_of(png.data(), png.size());
+
+        image_chunk ic;
+        tokenize_image(clean, a, ic);
+        info.w = ic.w; info.h = ic.h; info.rgb_sha = ic.rgb_sha; info.n_tokens = ic.n_tokens; info.n_pos = n_pos_of(ic);
+        std::vector<float> embd_clean;
+        encode_image(clean, ic, n_embd, embd_clean);
+
+        image_chunk it;
+        tokenize_image(tapc, a, it);
+        if (it.n_tokens != ic.n_tokens || it.w != ic.w || it.h != ic.h) DIE("%s: the two contexts disagree on the plan", a.name.c_str());
+        st.ts.got.clear();
+        st.ts.want.clear();
+        st.ts.want.insert(wanted.begin(), wanted.end());
+        st.opened = 0;
+        st.inp_done.clear();
+        st.ts.armed = true;
+        std::vector<float> embd_tap;
+        encode_image(tapc, it, n_embd, embd_tap);
+        st.ts.armed = false;
+        const int ntiles = st.opened;
+        if (ntiles < 1 || (int) st.inp_done.size() != ntiles) DIE("%s: %d tiles opened, %zu inputs seen", a.name.c_str(), ntiles, st.inp_done.size());
+        for (int k = 0; k < ntiles; ++k) {
+            const std::string tp = std::to_string(k) + "/";
+            if (!st.ts.got.count(tp + "inp_raw")) DIE("%s: tile %d has no inp_raw", a.name.c_str(), k);
+            for (const auto & n : wanted) if (!st.ts.got.count(tp + n)) DIE("%s: tile %d never showed %s", a.name.c_str(), k, n.c_str());
+        }
+
+        // the tiles: planned size from inp_raw, rows from merger_out, the grid from the planned size
+        long merger_sum = 0;
+        info.tiles.resize(ntiles);
+        for (int k = 0; k < ntiles; ++k) {
+            canvas_tile & t = info.tiles[k];
+            const tap_data & inp = st.ts.got[std::to_string(k) + "/inp_raw"];
+            const tap_data & mo  = st.ts.got[std::to_string(k) + "/merger_out"];
+            if (inp.ne[2] != 3 || inp.ne[3] != 1) DIE("%s: tile %d inp_raw is not [W, H, 3, 1]", a.name.c_str(), k);
+            if (mo.ne[0] != n_embd || mo.ne[2] != 1 || mo.ne[3] != 1) DIE("%s: tile %d merger_out is not [%d, rows]", a.name.c_str(), k, n_embd);
+            t.w = (int) inp.ne[0]; t.h = (int) inp.ne[1];
+            t.merger_rows = (int) mo.ne[1];
+            if (t.w % (patch * n_merge) != 0 || t.h % (patch * n_merge) != 0) DIE("%s: tile %d is %d x %d, not a multiple of %d", a.name.c_str(), k, t.w, t.h, patch * n_merge);
+            t.nx = t.w / (patch * n_merge);
+            t.ny = t.h / (patch * n_merge);
+            if (t.nx * t.ny != t.merger_rows) DIE("%s: tile %d is %d x %d tokens, merger_out has %d rows", a.name.c_str(), k, t.nx, t.ny, t.merger_rows);
+            merger_sum += t.merger_rows;
+        }
+        // the slice grid from the separator rows: with S slices in gy rows the suffixes hold 2 + sum(slice) = 2S + gy rows
+        const int n_slices = ntiles - 1;
+        const long suffix_total = (long) ic.n_tokens - merger_sum;
+        if (n_slices > 0) {
+            info.grid_y = (int) (suffix_total - 2L * n_slices);
+            if (info.grid_y < 1 || n_slices % info.grid_y != 0) DIE("%s: %ld separator rows for %d slices fit no grid", a.name.c_str(), suffix_total, n_slices);
+            info.grid_x = n_slices / info.grid_y;
+        } else if (suffix_total != 1) {
+            DIE("%s: an overview alone has one separator row, the chunk has %ld", a.name.c_str(), suffix_total);
+        }
+        if (info.n_pos != ntiles + (int) suffix_total) DIE("%s: n_pos %d is not %d tiles and %ld separator rows", a.name.c_str(), info.n_pos, ntiles, suffix_total);
+        int row0 = 0;
+        for (int k = 0; k < ntiles; ++k) {
+            canvas_tile & t = info.tiles[k];
+            t.suffix = canvas_suffix(k, info.grid_x, info.grid_y);
+            if (k > 0) { t.row = (k - 1) / info.grid_x; t.col = (k - 1) % info.grid_x; }
+            t.row0 = row0;
+            t.rows = t.merger_rows + (int) t.suffix.size();
+            row0 += t.rows;
+        }
+        if (row0 != ic.n_tokens) DIE("%s: tiles hold %d rows, the chunk %d", a.name.c_str(), row0, ic.n_tokens);
+        if (n_slices > 0) {
+            // the grid by an independent path: mtmd's decoder position of the last slice's first row sits at its cell of the canvas
+            const canvas_tile & last = info.tiles.back();
+            const mtmd_decoder_pos p = mtmd_image_tokens_get_decoder_pos(mtmd_input_chunk_get_tokens_image(ic.chunk), 1, (size_t) last.row0);
+            if ((int) p.y != last.row * last.ny || (int) p.x != last.col * last.nx) {
+                DIE("%s: mtmd puts the last slice at (x %u, y %u), the %d x %d grid at (%d, %d)", a.name.c_str(), p.x, p.y, info.grid_x, info.grid_y,
+                    last.col * last.nx, last.row * last.ny);
+            }
+        }
+
+        if (embd_clean.size() != embd_tap.size()) DIE("%s: the two passes' embeddings differ in size", a.name.c_str());
+        size_t diff = 0;
+        double maxd = 0.0;
+        for (size_t i = 0; i < embd_clean.size(); ++i) {
+            if (memcmp(&embd_clean[i], &embd_tap[i], 4) != 0) diff++;
+            maxd = std::max(maxd, (double) std::fabs(embd_clean[i] - embd_tap[i]));
+        }
+        char b[256];
+        snprintf(b, sizeof(b), "# tap_effect\t%s\tembd values %zu\tdiffering %zu\tmax_abs_diff %.9g\ttaps full\n", a.name.c_str(), embd_clean.size(), diff, maxd);
+        effect += b;
+
+        for (int k = 0; k < ntiles; ++k) {
+            const std::string tp = std::to_string(k) + "/";
+            const std::string row = a.name + "/t" + std::to_string(k) + "/";
+            if (pre) {
+                const tap_data & inp = st.ts.got[tp + "inp_raw"];
+                pre->tensor_f32(row + "inp_raw", inp.op.c_str(), inp.ne, inp.v.data());
+            }
+            for (const auto & n : wanted) {
+                const tap_data & d = st.ts.got[tp + n];
+                tw.tensor_f32(row + n, d.op.c_str(), d.ne, d.v.data());
+            }
+            const canvas_tile & t = info.tiles[k];
+            const int64_t ne_e[4] = {n_embd, t.rows, 1, 1};
+            tw.tensor_f32(row + "embd", "OUTPUT", ne_e, embd_clean.data() + (size_t) t.row0 * n_embd);
+        }
+        infos.push_back(std::move(info));
+    }
+
+    if (pre) {
+        header_common(*pre, "canvas-preproc", mmproj, arch, text_model, mmproj, cpu, threads, min_tokens, max_tokens, flags,
+                      "dump_mtmd tower — mtmd's preprocessed tiles (the graph input inp_raw of each tile), raw f32 channel-planar [W, H, 3, 1], little-endian");
+        canvas_lines(*pre, infos);
+        pre->finish();
+    }
+    header_common(tw, "canvas-taps", mmproj, arch, text_model, mmproj, cpu, threads, min_tokens, max_tokens, flags,
+                  std::string("dump_mtmd tower — mtmd's ") + g_seat->projector + " graph nodes of every tile and the final embeddings, raw f32, little-endian");
+    tw.line("# taps\t<image>/t<k>/<node> of tile k (0 the overview, 1.. the slices row by row): pos_embed; blocks 0,6,7,26 of layer_inp_normed Qcur attn_out ffn_inp ffn_out layer_out; "
+            "vit_merger_{attn_inp_normed,window_reorder,Qcur,Kcur,Vcur,attn_out,attn_residual,ds_mean_res,ds_normed,ds_mlp_out,ds_out}; post_ln; merger_normed; merger_out; "
+            "embd (the clean pass: the tile's rows then its separator rows)");
+    canvas_lines(tw, infos);
     for (size_t p = 0, q; p < effect.size(); p = q + 1) {
         q = effect.find('\n', p);
         tw.line(effect.substr(p, q - p));
@@ -1367,7 +1693,7 @@ int main(int argc, char ** argv) {
     int ctx = 4096, ub = 512, ngl = 99, ncmoe = 0, threads = 0, pad = 248056, min_t = -1, max_t = -1, decode_steps = 0;
     long tap_patches = 4096;
     bool cpu = false, taps_final = false, rows_node = false;
-    std::string flags;
+    std::string flags, seat;
     for (int i = 1; i < argc; ++i) {
         // the `# fixture` line holds tabs: it has its own header line, and the flags line stays one field
         const bool fixture_line = i > 1 && std::string(argv[i - 1]) == "--fixture-line";
@@ -1419,12 +1745,15 @@ int main(int argc, char ** argv) {
             if (g_fixture_line.rfind("# fixture\t", 0) != 0) DIE("--fixture-line wants a '# fixture<TAB>…' line, got '%s'", g_fixture_line.c_str());
         }
         else if (a == "--respell-source" && more) g_respell_expect = argv[++i];
+        else if (a == "--seat" && more) seat = argv[++i];
         else if (a == "--cpu") { cpu = true; ngl = 0; }
         else DIE("unknown or incomplete argument '%s'", a.c_str());
     }
     // a hidden run with no --image is a text prompt (its ids hold no image span: run_hidden refuses a span without an image)
     if (mmproj.empty() || model.empty() || out.empty() || (images.empty() && mode != "hidden")) DIE("--mmproj, -m, --out and at least one --image are required");
-    select_seat(mmproj);
+    select_seat(mmproj, seat);
+    if (g_seat->canvas && mode != "tower") DIE("the %s seat dumps the tower only (tower mode): its prompt arms are not built", g_seat->projector);
+    if (mode == "tower" && g_seat->canvas) return run_tower_canvas(mmproj, model, images, out_pre, out, cpu, threads > 0 ? threads : 4, min_t, max_t, flags);
     if (mode == "tower") return run_tower(mmproj, model, images, out_pre, out, cpu, threads > 0 ? threads : 4, min_t, max_t, tap_patches, taps_final, flags);
     if (mode == "hidden") {
         if (ids.empty()) DIE("hidden needs --ids");
