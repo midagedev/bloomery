@@ -2566,7 +2566,9 @@ fn read_part(mem: &ArenaMem, r: &PickRead, part: usize) -> Result<(), GpuError> 
 /// eviction handed over keeps its pages: the reads overwrite the bytes they
 /// place and no page is returned and faulted in again, and the bytes of a
 /// window beside the read stay the evicted expert's, which no reader touches
-/// (a part's `need` is every byte the slot lends).
+/// (a part's `need` is every byte the slot lends). The refill test is the
+/// only caller.
+#[cfg(test)]
 fn read_pick(mem: &ArenaMem, r: &PickRead) -> Result<(), GpuError> {
     for part in 0..PARTS {
         read_part(mem, r, part)?;
@@ -2681,11 +2683,12 @@ impl<'a> Inflight<'a> {
             job: None,
         };
         if units > 0 {
-            match inflight.tier.reader.submit(Job::new(
-                Kind::of_claim(kind),
-                units,
-                move |unit| read(unit / PARTS, unit % PARTS),
-            )) {
+            match inflight
+                .tier
+                .reader
+                .submit(Job::new(Kind::of_claim(kind), units, move |unit| {
+                    read(unit / PARTS, unit % PARTS)
+                })) {
                 Ok(job) => inflight.job = Some(job),
                 Err(e) => {
                     free_picks(inflight.tier.arena, &inflight.picks);
@@ -3763,7 +3766,7 @@ mod tests {
                     (r.victim.jobs, r.victim.units),
                 )
             },
-            ((1, 2 * PARTS), (0, 0)),
+            ((1, 2 * PARTS as u64), (0, 0)),
             "the reader ran the batch as a prompt fill, three parts a pick"
         );
         drop(pin);
@@ -3798,7 +3801,7 @@ mod tests {
         let pin = step.finish().ok().expect("the step's fill ended");
         assert_eq!(
             counted(&reader),
-            ((1, 2 * PARTS), (0, 0)),
+            ((1, 2 * PARTS as u64), (0, 0)),
             "a step claim's misses ran as a step fill, three parts a pick"
         );
         assert_eq!(
@@ -3819,7 +3822,7 @@ mod tests {
         drop(keep.finish().ok().expect("the keep claim's fill ended"));
         assert_eq!(
             counted(&reader),
-            ((1, 2 * PARTS), (1, PARTS)),
+            ((1, 2 * PARTS as u64), (1, PARTS as u64)),
             "a keep claim's as a prompt fill, three parts a pick"
         );
     }
@@ -3860,7 +3863,7 @@ mod tests {
                 (ran.victim.jobs, ran.victim.units),
                 (ran.prompt.jobs, ran.prompt.units)
             ),
-            ((1, PARTS), (0, 0)),
+            ((1, PARTS as u64), (0, 0)),
             "the reader ran it as a victim fill, three parts a pick"
         );
         let failed = claim_of(6);
