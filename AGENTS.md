@@ -137,6 +137,8 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   and every lever unset, a typical `--ctx-size`), on each placement a user picks (`a`, `bp`), with a short and a
   ≥ 4K-token prompt (toktape tapes). It is read before the tag, and the release message states its numbers and
   every off cell (a feature off on a placement, model or binary). A bench sitting with set levers is not this pass.
+  A commit after the release batch that `tools/release/late-commit.sh` passes does not block the tag; its owning
+  gates run after the pass.
 - `just gate` excludes the measure targets (they need a quiet machine and a lock) and `just deny`. Build artifacts land
   in the workspace root `target/`; the measure runners read only from there.
 
