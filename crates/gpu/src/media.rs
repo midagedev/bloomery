@@ -18,7 +18,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
-use vision::mrope::{MropeSeq, RowRewrite, SeqRows};
+use vision::mrope::{Canvas, MropeSeq, RowRewrite, SectionOrder, SeqRows};
 
 /// One media span of a prompt call: its positions `at` in the call's ids and the bf16 row of each
 /// of them (`n_embd` values).
@@ -220,18 +220,26 @@ pub fn check_spans(
     Ok(())
 }
 
-/// One image of a call whose rows lie on a grid: `nx` tokens along a line, `ny` lines, in raster
-/// order, `nx · ny` positions. The grid is what an image's M-RoPE positions come from.
+/// How an image's rows lie on the sequence's positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageShape {
+    /// `nx` tokens along a line, `ny` lines, in raster order: `nx · ny` positions.
+    Grid(usize, usize),
+    /// One image group of tiles, each followed by its separator rows: `canvas.rows()` positions,
+    /// placed on a shared canvas whose origin is the token just before the span.
+    Canvas(Canvas),
+}
+
+/// One image of a call: its rows and the shape its M-RoPE positions come from.
 #[derive(Clone, Debug)]
 pub struct ImageSpan<'a> {
     pub span: MediaSpan<'a>,
-    /// `(nx, ny)`.
-    pub grid: (usize, usize),
+    pub shape: ImageShape,
 }
 
 impl ImageSpan<'_> {
-    /// [`check_spans`] over `spans` and the grid of each: positive, and as many positions as the
-    /// span holds.
+    /// [`check_spans`] over `spans` and the shape of each: a grid or a canvas holds as many
+    /// positions as the span does, and the call's images are all grids or all canvases.
     pub fn check(
         what: &'static str,
         spans: &[ImageSpan<'_>],
@@ -241,30 +249,83 @@ impl ImageSpan<'_> {
         let plain: Vec<MediaSpan<'_>> = spans.iter().map(|s| s.span.clone()).collect();
         check_spans(what, &plain, n_ids, n_embd)?;
         for s in spans {
-            let (nx, ny) = s.grid;
-            if nx.checked_mul(ny) != Some(s.span.at.len()) {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "an image span of {} positions at {:?} on a {nx}x{ny} grid: a grid holds \
-                         nx·ny positions",
-                        s.span.at.len(),
-                        s.span.at
-                    ),
-                ));
+            let len = s.span.at.len();
+            match s.shape {
+                ImageShape::Grid(nx, ny) => {
+                    if nx.checked_mul(ny) != Some(len) {
+                        return Err(GpuError::shape(
+                            what,
+                            format!(
+                                "an image span of {len} positions at {:?} on a {nx}x{ny} grid: a \
+                                 grid holds nx·ny positions",
+                                s.span.at
+                            ),
+                        ));
+                    }
+                }
+                ImageShape::Canvas(canvas) => {
+                    if canvas.rows() != len {
+                        return Err(GpuError::shape(
+                            what,
+                            format!(
+                                "an image span of {len} positions at {:?} on a canvas group of {} \
+                                 rows: a group holds its tiles' tokens and their separators",
+                                s.span.at,
+                                canvas.rows()
+                            ),
+                        ));
+                    }
+                }
             }
         }
-        Ok(())
+        ImageSpan::canvas_count(what, spans).map(|_| ())
     }
 
-    /// The images as the sequence's rotation table takes them, `(first row, nx, ny)`, for a call
-    /// whose first position is `first`.
+    /// The grid spans as the sequence's rotation table takes them, `(first row, nx, ny)`, for a
+    /// call whose first position is `first`; a canvas span is not among them.
     #[must_use]
     pub fn rows_of(first: usize, spans: &[ImageSpan<'_>]) -> Vec<(usize, usize, usize)> {
         spans
             .iter()
-            .map(|s| (first + s.span.at.start, s.grid.0, s.grid.1))
+            .filter_map(|s| match s.shape {
+                ImageShape::Grid(nx, ny) => Some((first + s.span.at.start, nx, ny)),
+                ImageShape::Canvas(_) => None,
+            })
             .collect()
+    }
+
+    /// The canvas spans as the sequence's rotation table takes them, `(first row, canvas)`, for a
+    /// call whose first position is `first`; a grid span is not among them.
+    #[must_use]
+    pub fn canvases_of(first: usize, spans: &[ImageSpan<'_>]) -> Vec<(usize, Canvas)> {
+        spans
+            .iter()
+            .filter_map(|s| match s.shape {
+                ImageShape::Canvas(c) => Some((first + s.span.at.start, c)),
+                ImageShape::Grid(..) => None,
+            })
+            .collect()
+    }
+
+    /// How many of `spans` are canvases: none or all of them, a call that mixes the two shapes is
+    /// refused by name (a text file's images are of one kind, and the table takes a call's images
+    /// in one change).
+    fn canvas_count(what: &'static str, spans: &[ImageSpan<'_>]) -> Result<usize, GpuError> {
+        let n = spans
+            .iter()
+            .filter(|s| matches!(s.shape, ImageShape::Canvas(_)))
+            .count();
+        if n != 0 && n != spans.len() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n} canvas image spans among {}: a call's images are all grids or all \
+                     canvas groups",
+                    spans.len()
+                ),
+            ));
+        }
+        Ok(n)
     }
 }
 
@@ -326,15 +387,17 @@ const WHAT: &str = "SeqRope";
 
 impl SeqRope {
     /// A text sequence of `ctx` rows over the plain table `base` (the rope table of positions
-    /// `0..ctx`, `ctx` rows of equal width) with the text file's `rope.dimension_sections`,
-    /// copied to a card buffer of its own. `base` is shared by every sequence of a model.
+    /// `0..ctx`, `ctx` rows of equal width) with the text file's `rope.dimension_sections` read in
+    /// its `rope.section_order`, copied to a card buffer of its own. `base` is shared by every
+    /// sequence of a model.
     pub fn new(
         stream: &CudaStream,
         base: Arc<[f32]>,
         sections: [u32; 4],
+        order: SectionOrder,
         ctx: usize,
     ) -> Result<SeqRope, GpuError> {
-        let rows = SeqRows::new(base, sections, ctx).map_err(shape)?;
+        let rows = SeqRows::with_order(base, sections, order, ctx).map_err(shape)?;
         let table = DeviceBuffer::from_host(stream, rows.base())?;
         Ok(SeqRope { table, rows })
     }
@@ -349,6 +412,33 @@ impl SeqRope {
     ) -> Result<(), GpuError> {
         let rewrite = self.rows.push_spans(spans).map_err(shape)?;
         self.write(stream, rewrite)
+    }
+
+    /// [`SeqRope::push_spans`] for image groups, each `(first row, canvas)` where the first row
+    /// is the one after the group's origin token.
+    pub fn push_canvases(
+        &mut self,
+        stream: &CudaStream,
+        groups: &[(usize, Canvas)],
+    ) -> Result<(), GpuError> {
+        let rewrite = self.rows.push_canvases(groups).map_err(shape)?;
+        self.write(stream, rewrite)
+    }
+
+    /// Add the images of a call whose first position is `first`: the grids by
+    /// [`SeqRope::push_spans`], the canvases by [`SeqRope::push_canvases`]. A call that mixes the
+    /// two is refused by name and changes nothing.
+    pub fn push_images(
+        &mut self,
+        stream: &CudaStream,
+        first: usize,
+        spans: &[ImageSpan<'_>],
+    ) -> Result<(), GpuError> {
+        if ImageSpan::canvas_count(WHAT, spans)? == 0 {
+            self.push_spans(stream, &ImageSpan::rows_of(first, spans))
+        } else {
+            self.push_canvases(stream, &ImageSpan::canvases_of(first, spans))
+        }
     }
 
     /// Keep the first `row` rows: the images from `row` on go and the rows after it are rewritten
@@ -406,17 +496,21 @@ fn shape(e: vision::mrope::MropeError) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vision::mrope::SectionOrder;
 
     const SECTIONS: [u32; 4] = [11, 11, 10, 0];
     const ROT: usize = 64;
     const CTX: usize = 300;
 
-    /// A table whose value says where it came from: row `q`, value `k` is `1000·q + k`.
-    fn base() -> Arc<[f32]> {
-        (0..CTX * ROT)
+    /// A table of `ctx` rows whose value says where it came from: row `q`, value `k` is
+    /// `1000·q + k`.
+    fn table(ctx: usize) -> Arc<[f32]> {
+        (0..ctx * ROT)
             .map(|i| (1000 * (i / ROT) + i % ROT) as f32)
             .collect()
+    }
+
+    fn base() -> Arc<[f32]> {
+        table(CTX)
     }
 
     /// The rotation row of sequence row `r` from the rule alone, written out here and not taken
@@ -489,7 +583,8 @@ mod tests {
     fn hw_the_card_table_is_the_host_rows() {
         let (_ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let base = base();
-        let mut rope = SeqRope::new(&stream, base.clone(), SECTIONS, CTX).expect("a text sequence");
+        let mut rope = SeqRope::new(&stream, base.clone(), SECTIONS, SectionOrder::Tyxz, CTX)
+            .expect("a text sequence");
         let address = rope.table().cu_deviceptr();
         expect(&stream, &rope, &base, &[], "text sequence");
         let a = (3, 14, 14);
@@ -518,6 +613,169 @@ mod tests {
             address,
             "the buffer never moves"
         );
+    }
+
+    /// The sections of a text file whose fourth section reads the slot the order puts last.
+    const SECTIONS_Z: [u32; 4] = [10, 10, 10, 2];
+    const CANVAS_CTX: usize = 400;
+
+    /// The 1000x700 image's group: an overview and a 2x2 grid of slices, 10x7 tokens each, 360
+    /// rows.
+    fn group_1000x700() -> Canvas {
+        let canvas = Canvas::new((10, 7), (2, 2), (10, 7)).expect("the 2x2 group");
+        assert_eq!((canvas.rows(), canvas.tiles()), (360, 5));
+        canvas
+    }
+
+    /// The table `order` gives a sequence holding `group` at `at`, from [`SeqRows`] alone: the
+    /// plain table with the rewrite of `push_canvases` spliced in.
+    fn table_of(base: &Arc<[f32]>, order: SectionOrder, at: usize, group: Canvas) -> Vec<f32> {
+        let mut rows =
+            SeqRows::with_order(base.clone(), SECTIONS_Z, order, CANVAS_CTX).expect("rows");
+        let rewrite = rows
+            .push_canvases(&[(at, group)])
+            .expect("the group")
+            .expect("a rewrite");
+        let mut table = base.to_vec();
+        table[rewrite.from * ROT..rewrite.from * ROT + rewrite.values.len()]
+            .copy_from_slice(&rewrite.values);
+        table
+    }
+
+    fn same(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// The card table of a sequence opened in `zyxt` that takes the 1000x700 group through
+    /// `push_images` equals the rows `SeqRows::push_canvases` makes, bit for bit, and differs from
+    /// the `tyxz` rows of the same group; the table keeps its address; a save, a cut of the group
+    /// and a restore give the host's rows.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_canvas_groups_card_table_is_the_host_rows_in_zyxt() {
+        let (_ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let base = table(CANVAS_CTX);
+        let group = group_1000x700();
+        // A call that starts at row 3 holds the group at its ids 2..362: sequence rows 5..365, the
+        // origin token at row 4.
+        let (first, at) = (3, 2..2 + group.rows());
+        let want = table_of(&base, SectionOrder::Zyxt, first + at.start, group);
+        let tyxz = table_of(&base, SectionOrder::Tyxz, first + at.start, group);
+        assert!(
+            !same(&want, &tyxz),
+            "the two orders give the group other rows"
+        );
+
+        let mut rope = SeqRope::new(
+            &stream,
+            base.clone(),
+            SECTIONS_Z,
+            SectionOrder::Zyxt,
+            CANVAS_CTX,
+        )
+        .expect("a text sequence");
+        let address = rope.table().cu_deviceptr();
+        let span = ImageSpan {
+            span: MediaSpan { at, rows: &[] },
+            shape: ImageShape::Canvas(group),
+        };
+        rope.push_images(&stream, first, std::slice::from_ref(&span))
+            .expect("the group");
+        let got = rope.table().to_host_vec(&stream).expect("the table");
+        assert!(same(&got, &want), "the card table is the host rows in zyxt");
+
+        // The host's own record of the same changes: its cut gives the rows the card's must.
+        let mut host =
+            SeqRows::with_order(base.clone(), SECTIONS_Z, SectionOrder::Zyxt, CANVAS_CTX)
+                .expect("rows");
+        host.push_canvases(&[(first + 2, group)])
+            .expect("the group");
+        let cut = host.cut(5).expect("a cut at the group").expect("a rewrite");
+        let mut after_cut = want.clone();
+        after_cut[cut.from * ROT..cut.from * ROT + cut.values.len()].copy_from_slice(&cut.values);
+        let held = rope.saved();
+        rope.cut(&stream, 5).expect("a cut at the group");
+        let got = rope.table().to_host_vec(&stream).expect("the table");
+        assert!(same(&got, &after_cut), "the group cut away: the host rows");
+        rope.restore(&stream, held).expect("a restore");
+        let got = rope.table().to_host_vec(&stream).expect("the table");
+        assert!(same(&got, &want), "the restored group's rows");
+        assert_eq!(
+            rope.table().cu_deviceptr(),
+            address,
+            "the buffer never moves"
+        );
+    }
+}
+
+#[cfg(test)]
+mod image_spans {
+    use super::{ImageShape, ImageSpan, MediaSpan};
+    use vision::mrope::Canvas;
+
+    const N_EMBD: usize = 2;
+
+    fn canvas() -> Canvas {
+        Canvas::new((10, 7), (2, 2), (10, 7)).expect("the 1000x700 group")
+    }
+
+    /// A span of `len` positions from id `from` with its rows.
+    fn span(rows: &[u16], from: usize, len: usize, shape: ImageShape) -> ImageSpan<'_> {
+        ImageSpan {
+            span: MediaSpan {
+                at: from..from + len,
+                rows: &rows[..len * N_EMBD],
+            },
+            shape,
+        }
+    }
+
+    /// A canvas span holds as many positions as its group has rows (tokens and separators): 360
+    /// for the 1000x700 group. Any other length is refused by name, a grid's rule is as it was.
+    #[test]
+    fn a_canvas_span_of_the_wrong_length_is_refused_by_name() {
+        let rows = vec![0u16; 400 * N_EMBD];
+        let check = |len: usize, shape| {
+            let spans = [span(&rows, 1, len, shape)];
+            ImageSpan::check("test", &spans, 1 + len, N_EMBD).map_err(|e| e.to_string())
+        };
+        let group = ImageShape::Canvas(canvas());
+        assert_eq!(check(360, group), Ok(()));
+        for len in [359, 361, 280] {
+            let e = check(len, group).expect_err("a span off the group's rows");
+            assert!(
+                e.contains(&format!("an image span of {len} positions"))
+                    && e.contains("canvas group of 360 rows"),
+                "{e}"
+            );
+        }
+        assert_eq!(check(6, ImageShape::Grid(3, 2)), Ok(()));
+        let e = check(7, ImageShape::Grid(3, 2)).expect_err("a grid off nx·ny");
+        assert!(
+            e.contains("on a 3x2 grid: a grid holds nx·ny positions"),
+            "{e}"
+        );
+    }
+
+    /// A call's images are all grids or all canvases; the table takes each kind by its own list,
+    /// at the call's first position.
+    #[test]
+    fn a_call_is_all_grids_or_all_canvases() {
+        let rows = vec![0u16; 400 * N_EMBD];
+        let grid = span(&rows, 1, 6, ImageShape::Grid(3, 2));
+        let group = span(&rows, 7, 360, ImageShape::Canvas(canvas()));
+        let mixed = [grid.clone(), group.clone()];
+        let e = ImageSpan::check("test", &mixed, 367, N_EMBD).expect_err("grids with a canvas");
+        assert!(
+            e.to_string().contains("1 canvas image spans among 2"),
+            "{e}"
+        );
+        let grids = [grid.clone(), span(&rows, 9, 6, ImageShape::Grid(2, 3))];
+        assert_eq!(ImageSpan::rows_of(10, &grids), [(11, 3, 2), (19, 2, 3)]);
+        assert!(ImageSpan::canvases_of(10, &grids).is_empty());
+        let groups = [group];
+        assert_eq!(ImageSpan::canvases_of(10, &groups), [(17, canvas())]);
+        assert!(ImageSpan::rows_of(10, &groups).is_empty());
     }
 }
 
