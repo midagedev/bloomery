@@ -3,17 +3,26 @@
 //! `logits_i[v] += markov_w2[v] · markov_w1[p]`, and its argmax is position
 //! `i + 1`'s previous token. Serial over `i` by construction.
 //!
-//! Layouts. Both weights are the file's bf16 `[rank, n_vocab]` as u32 words:
-//! token `t`'s rank-long row starts at word `t * rank / 2`, value `r` in word
-//! `r / 2`, the low half for even `r` (little-endian). The logits are the
-//! head gemv's `m`-row layout, `logits[v * m + c]` for row `c` (one row is
-//! `m = 1`). A position's previous token is read on the device: row 0's from
-//! `first[0]` (the block's last accepted token), row `c > 0`'s from `tok[c -
-//! 1]`, the argmax the step wrote for row `c - 1`. An id at or past
-//! `n_vocab` (only `first[0]` can hold one: the argmax's are below the
-//! vocabulary) raises `FaultSite::TokenId`, reads no `w1` word, and makes
-//! the row's correction NaN, so every logit of that row is NaN — no value the
-//! pass could take for a draft; the pass's readback carries the fault.
+//! Layouts. Both weights are the file's bf16 `[rank, rows]` as u32 words:
+//! row `t` is `rank / 2` words long and starts at word `t * rank / 2`, value
+//! `r` in word `r / 2`, the low half for even `r` (little-endian).
+//! `markov_w1` has `n_prev` rows, one per previous token, in the target's
+//! vocabulary; `markov_w2` has `n_head` rows, one per logit, in the head's.
+//! V4.1's draft has one vocabulary (`n_prev = n_head`, [`MarkovWeights`]); a
+//! reduced head has `n_head < n_prev` and a map `to_target` from each head id
+//! to its target id ([`ReducedMarkovWeights`]). The logits are the head
+//! gemv's `m`-row layout, `logits[v * m + c]` for row `c` and `v < n_head`
+//! (one row is `m = 1`). A position's previous token is read on the device:
+//! row 0's from `first[0]` (the block's last accepted token, a target id
+//! already), row `c > 0`'s from `tok[c - 1]`, the argmax the step wrote for
+//! row `c - 1`, a head id. With the map off that id is the `w1` row; with it
+//! on the row is `to_target[tok[c - 1]]`, and row 0 never maps. A previous
+//! token outside its table — a `w1` row at or past `n_prev`, and with the map
+//! on a `tok[c - 1]` at or past `n_head` — raises `FaultSite::TokenId`,
+//! reads no `w1` word, and makes the row's correction NaN, so every logit of
+//! that row is NaN — no value the pass could take for a draft; the pass's
+//! readback carries the fault. In a step only `first[0]` or a map entry can
+//! be one: the argmax's are below `n_head`.
 //!
 //! The numeric rule `ds41_markov` holds, and the gate transcribes on the host:
 //! bf16 widens to f32 as `bits << 16` (exact), and the dot for entry `v` is
@@ -23,7 +32,8 @@
 //! the logit once, `logit + delta`. One thread per `v`.
 //!
 //! A step is `ds41_markov` then `bloomery_gpu`'s `argmax_rows_fault` over
-//! all `m` rows ([`MarkovKernels::enqueue_step`]): rows below `c` are
+//! all `m` rows of `n_head` ([`MarkovKernels::enqueue_step`],
+//! [`MarkovKernels::enqueue_step_reduced`]): rows below `c` are
 //! unchanged since their own step and give the same tokens again; rows above
 //! `c` write a token their own step overwrites. The argmax copies the card's
 //! fault to `tok[m]` (the first-layer word) and `tok[m + 1]` (its layer's
@@ -98,9 +108,12 @@ mod markov_kernels {
 
     /// Row `row`'s Markov correction (the module doc's rule): every block
     /// gathers the previous token's `w1` row into shared memory, widened, and
-    /// thread `v` adds `w2[v] · e` into `logits[v * m + row]`. A previous
-    /// token past the vocabulary raises [`FaultSite::TokenId`] on `fault`
-    /// (thread 0 of the grid) and gathers NaN instead of a row.
+    /// thread `v < n_head` adds `w2[v] · e` into `logits[v * m + row]`. With
+    /// `map` on and `row > 0` the previous token `tok[row - 1]` is a head id
+    /// and `to_target` gives its `w1` row; `map` off reads no `to_target`
+    /// word, and any buffer stands in for it. A previous token outside its
+    /// table raises [`FaultSite::TokenId`] on `fault` (thread 0 of the grid)
+    /// and gathers NaN instead of a row.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -111,23 +124,29 @@ mod markov_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            w1.len() >= 128 * n_vocab,
-            w2.len() >= 128 * n_vocab,
+            w1.len() >= 128 * n_prev,
+            w2.len() >= 128 * n_head,
+            to_target.len() >= n_head * map,
             first.len() >= 1,
             tok.len() >= m,
-            logits.len() >= n_vocab * m,
+            logits.len() >= n_head * m,
             row < m,
-            n_vocab >= 1
+            n_prev >= 1,
+            n_head >= 1,
+            map <= 1
         )
     )]
     pub fn ds41_markov(
         w1: &[u32],
         w2: &[u32],
+        to_target: &[u32],
         first: &[u32],
         tok: &[u32],
-        n_vocab: u32,
+        n_prev: u32,
+        n_head: u32,
         m: u32,
         row: u32,
+        map: u32,
         fault: FaultSink,
         mut logits: DisjointSlice<f32>,
     ) {
@@ -138,17 +157,28 @@ mod markov_kernels {
         // 128 alone writes slots 2tid and 2tid + 1 before the barrier.
         let e = unsafe { SharedArray::as_raw_mut_ptr(&raw mut E) };
         if tid < MARKOV_ROW_WORDS {
+            // The `w1` row: the previous token itself, or with the map on a
+            // head id's target; `listed` is false for a head id past the map.
+            //
             // SAFETY: first.len() >= 1 and row - 1 < m <= tok.len() by the
-            // launch contract.
-            let p = unsafe {
-                if row == 0 {
+            // launch contract; to_target.len() >= n_head * map = n_head when
+            // the map is on, and the read is of q < n_head.
+            let (listed, p) = unsafe {
+                let q = if row == 0 {
                     *first.get_unchecked(0)
                 } else {
                     *tok.get_unchecked(row as usize - 1)
+                };
+                if map == 0 || row == 0 {
+                    (true, q)
+                } else if q < n_head {
+                    (true, *to_target.get_unchecked(q as usize))
+                } else {
+                    (false, q)
                 }
             };
-            let (lo, hi) = if p < n_vocab {
-                // SAFETY: p < n_vocab, so word p*128 + tid < 128*n_vocab <=
+            let (lo, hi) = if listed && p < n_prev {
+                // SAFETY: p < n_prev, so word p*128 + tid < 128*n_prev <=
                 // w1.len().
                 bf16_pair(unsafe { *w1.get_unchecked(p as usize * MARKOV_ROW_WORDS + tid) })
             } else {
@@ -165,14 +195,14 @@ mod markov_kernels {
         }
         thread::sync_threads();
         let v = thread::index_1d().get();
-        if v >= n_vocab as usize {
+        if v >= n_head as usize {
             return;
         }
-        // SAFETY: v < n_vocab, w2.len() >= 128*n_vocab; e holds 256 values
+        // SAFETY: v < n_head, w2.len() >= 128*n_head; e holds 256 values
         // written before the barrier.
         let delta = unsafe { markov_dot(w2, v, e) };
         let at = v * m as usize + row as usize;
-        // SAFETY: at < n_vocab*m <= logits.len(); one thread per v.
+        // SAFETY: at < n_head*m <= logits.len(); one thread per v.
         unsafe {
             let l = logits.get_unchecked_mut(at);
             *l += delta;
@@ -180,12 +210,34 @@ mod markov_kernels {
     }
 }
 
-/// The Markov head's weights on the card, the file's bf16 bits as words.
+/// The Markov head's weights on the card, the file's bf16 bits as words,
+/// for a draft with one vocabulary (V4.1's): no map, `n_prev = n_head`.
 pub struct MarkovWeights<'a> {
     /// `markov_w1`: `n_vocab` rows of [`MARKOV_ROW_WORDS`] words.
     pub w1: &'a DeviceTensor<u32>,
     /// `markov_w2`: the same shape.
     pub w2: &'a DeviceTensor<u32>,
+}
+
+/// The Markov head's weights of a reduced head, whose logits cover the head's
+/// vocabulary but whose previous token is a target id.
+pub struct ReducedMarkovWeights<'a> {
+    /// `markov_w1`: `n_prev` rows of [`MARKOV_ROW_WORDS`] words, one per
+    /// target id.
+    pub w1: &'a DeviceTensor<u32>,
+    /// `markov_w2`: `n_head` rows of [`MARKOV_ROW_WORDS`] words, one per head
+    /// id (the logits' rows).
+    pub w2: &'a DeviceTensor<u32>,
+    /// Each head id's target id, `d + d2t[d]` in the file's terms: at least
+    /// `n_head` words, the first `n_head` each below `n_prev`.
+    pub to_target: &'a DeviceBuffer<u32>,
+}
+
+/// The tables of one launch; `to_target` is `None` for one vocabulary.
+struct Tables<'a> {
+    w1: &'a DeviceTensor<u32>,
+    w2: &'a DeviceTensor<u32>,
+    to_target: Option<&'a DeviceBuffer<u32>>,
 }
 
 /// The loaded Markov module. Owns no stream.
@@ -222,53 +274,137 @@ impl MarkovKernels {
         fault: FaultSink,
         logits: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "MarkovKernels::enqueue_add";
-        let n = w.w2.rows();
-        if w.w1.rows() != n
-            || w.w1.cols() != MARKOV_ROW_WORDS
-            || w.w2.cols() != MARKOV_ROW_WORDS
-            || n == 0
+        let t = Tables {
+            w1: w.w1,
+            w2: w.w2,
+            to_target: None,
+        };
+        self.launch_add(
+            "MarkovKernels::enqueue_add",
+            stream,
+            &t,
+            first,
+            tok,
+            m,
+            row,
+            fault,
+            logits,
+        )
+    }
+
+    /// [`Self::enqueue_add`] for a reduced head: `w1` has `n_prev` rows and
+    /// `w2` and the logits `n_head`, row `c > 0`'s previous token `tok[c - 1]`
+    /// is a head id and indexes `w1` through `to_target`, and row 0's
+    /// `first[0]` is a target id. A head id at or past `n_head`, or a target
+    /// id at or past `n_prev`, raises [`FaultSite::TokenId`] on `fault`.
+    /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one launch's buffers, its row and the fault word, all distinct roles"
+    )]
+    pub fn enqueue_add_reduced(
+        &self,
+        stream: &CudaStream,
+        w: &ReducedMarkovWeights<'_>,
+        first: &DeviceBuffer<u32>,
+        tok: &DeviceBuffer<u32>,
+        m: usize,
+        row: usize,
+        fault: FaultSink,
+        logits: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let t = Tables {
+            w1: w.w1,
+            w2: w.w2,
+            to_target: Some(w.to_target),
+        };
+        self.launch_add(
+            "MarkovKernels::enqueue_add_reduced",
+            stream,
+            &t,
+            first,
+            tok,
+            m,
+            row,
+            fault,
+            logits,
+        )
+    }
+
+    /// One launch of `ds41_markov`: `n_prev` is `w1`'s rows and `n_head`
+    /// `w2`'s; without a map they are one vocabulary.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one launch's buffers, its row and the fault word, all distinct roles"
+    )]
+    fn launch_add(
+        &self,
+        what: &'static str,
+        stream: &CudaStream,
+        t: &Tables<'_>,
+        first: &DeviceBuffer<u32>,
+        tok: &DeviceBuffer<u32>,
+        m: usize,
+        row: usize,
+        fault: FaultSink,
+        logits: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let (n_prev, n_head) = (t.w1.rows(), t.w2.rows());
+        let map_len = t.to_target.map(DeviceBuffer::len);
+        if (map_len.is_none() && n_prev != n_head)
+            || map_len.is_some_and(|len| len < n_head)
+            || t.w1.cols() != MARKOV_ROW_WORDS
+            || t.w2.cols() != MARKOV_ROW_WORDS
+            || n_prev == 0
+            || n_head == 0
             || first.is_empty()
             || m == 0
             || row >= m
             || tok.len() < m
-            || logits.len() < n * m
+            || logits.len() < n_head * m
         {
             return Err(GpuError::Shape {
                 what,
                 detail: format!(
-                    "w1 {}x{} w2 {}x{} (need n_vocab x {MARKOV_ROW_WORDS}), first {}, m {m} row {row}, \
-                     tok {}, logits {} (need {})",
-                    w.w1.rows(),
-                    w.w1.cols(),
-                    w.w2.rows(),
-                    w.w2.cols(),
+                    "w1 {}x{} w2 {}x{} (need n_prev x {MARKOV_ROW_WORDS}, n_head x {MARKOV_ROW_WORDS}; \
+                     one vocabulary without a map), map {map_len:?} (need {n_head}), first {}, \
+                     m {m} row {row}, tok {}, logits {} (need {})",
+                    t.w1.rows(),
+                    t.w1.cols(),
+                    t.w2.rows(),
+                    t.w2.cols(),
                     first.len(),
                     tok.len(),
                     logits.len(),
-                    n * m
+                    n_head * m
                 ),
             });
         }
-        let grid = launch_u32(what, "grid", n.div_ceil(MARKOV_THREADS as usize))?;
-        let (nv, mm, r) = (
-            launch_u32(what, "n_vocab", n)?,
+        let grid = launch_u32(what, "grid", n_head.div_ceil(MARKOV_THREADS as usize))?;
+        let (np, nh, mm, r) = (
+            launch_u32(what, "n_prev", n_prev)?,
+            launch_u32(what, "n_head", n_head)?,
             launch_u32(what, "m", m)?,
             launch_u32(what, "row", row)?,
         );
+        // Map off: the kernel reads no `to_target` word, so `first` stands in.
+        let (map, to_target) = t.to_target.map_or((0, first), |d| (1, d));
         let prep = self
             .module
             .prepare_ds41_markov(LaunchConfig1D::new(grid, MARKOV_THREADS, 0))?;
         self.module.ds41_markov(
             stream,
             &prep,
-            w.w1.buf(),
-            w.w2.buf(),
+            t.w1.buf(),
+            t.w2.buf(),
+            to_target,
             first,
             tok,
-            nv,
+            np,
+            nh,
             mm,
             r,
+            map,
             fault,
             logits,
         )?;
@@ -298,6 +434,30 @@ impl MarkovKernels {
         logits: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         self.enqueue_add(stream, w, first, tok, m, row, fault, logits)?;
+        elem.enqueue_argmax_rows_fault(stream, logits, w.w2.rows(), m, fault, tok)
+    }
+
+    /// [`Self::enqueue_step`] for a reduced head: [`Self::enqueue_add_reduced`]
+    /// for row `row`, then the argmax over the `n_head` rows of each of the
+    /// `m` columns — `tok[row]` is a head id, the next row's previous token
+    /// through `to_target`. Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one step's buffers, its row and the fault word, all distinct roles"
+    )]
+    pub fn enqueue_step_reduced(
+        &self,
+        stream: &CudaStream,
+        elem: &ElemKernels,
+        w: &ReducedMarkovWeights<'_>,
+        first: &DeviceBuffer<u32>,
+        tok: &mut DeviceBuffer<u32>,
+        m: usize,
+        row: usize,
+        fault: FaultSink,
+        logits: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_add_reduced(stream, w, first, tok, m, row, fault, logits)?;
         elem.enqueue_argmax_rows_fault(stream, logits, w.w2.rows(), m, fault, tok)
     }
 }
