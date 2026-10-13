@@ -491,10 +491,10 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
 /// Whether the common card leg launches the down entry of a routed down stack
 /// of type `ty`: the table's [`down`] row, for the entries whose launchers take
 /// an activation of more columns than a run uses, with the form the leg
-/// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, MXFP4,
-/// IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`] (Q5_1,
-/// Q8_0, IQ4_NL). The Q6_K launcher takes such an activation and has no arm in
-/// the leg yet; the Q5_0 row reads the packed layout, not the file's blocks.
+/// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, Q6_K,
+/// MXFP4, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`]
+/// (Q5_1, Q8_0, IQ4_NL). The Q5_0 row reads the packed layout, not the file's
+/// blocks.
 #[must_use]
 pub const fn card_down_runs(ty: GgmlType) -> bool {
     matches!(
@@ -502,6 +502,7 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
         Some((
             DownEntry::Q4k
                 | DownEntry::Q5k
+                | DownEntry::Q6k
                 | DownEntry::Mxfp4
                 | DownEntry::Iq2xs
                 | DownEntry::Iq3xxs
@@ -802,7 +803,7 @@ mod tests {
 
     /// The leg checks each role by its own rule: the gate·up and down sets
     /// differ (Q5_1, Q8_0 and IQ4_NL run only as downs; Q8_0's gate·up row has
-    /// no arm), and the Q6_K and Q5_0 down rows have no arm.
+    /// no arm), and the Q5_0 down row has no arm.
     #[test]
     fn the_leg_admits_each_role_by_its_own_rule() {
         let gate_up_runs: Vec<GgmlType> = ALL
@@ -829,6 +830,7 @@ mod tests {
                 GgmlType::Q8_0,
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,
+                GgmlType::Q6_K,
                 GgmlType::MXFP4,
                 GgmlType::IQ2_XS,
                 GgmlType::IQ3_XXS,
@@ -838,9 +840,7 @@ mod tests {
             ]
         );
         assert!(gate_up(GgmlType::Q8_0).is_some() && !card_gate_up_runs(GgmlType::Q8_0));
-        for ty in [GgmlType::Q6_K, GgmlType::Q5_0] {
-            assert!(down(ty).is_some() && !card_down_runs(ty), "{ty:?}");
-        }
+        assert!(down(GgmlType::Q5_0).is_some() && !card_down_runs(GgmlType::Q5_0));
     }
 
     /// A type id the enum does not name has no row in any operation.

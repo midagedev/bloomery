@@ -47,6 +47,7 @@ use crate::mxfp4_sel::Mxfp4SelKernels;
 use crate::q4k_sel::QuantSel;
 use crate::q5::Q8Blocks32;
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
+use crate::q6k_sel::Q6kSelKernels;
 use crate::q8_0_sel32::{Q80SelDown, Q80SelKernels};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
@@ -324,6 +325,7 @@ pub struct LegSum<'a> {
 /// The modules the leg's launches run on.
 pub struct CardLeg {
     kquant: KquantKernels,
+    q6k: Q6kSelKernels,
     mxfp4: Mxfp4SelKernels,
     q51: Q51SelKernels,
     q80: Q80SelKernels,
@@ -345,6 +347,7 @@ impl CardLeg {
         let (ctx, word) = (gpu.context(), gpu.fault_word());
         Ok(CardLeg {
             kquant: KquantKernels::load(ctx, word)?,
+            q6k: Q6kSelKernels::load(ctx, word)?,
             mxfp4: Mxfp4SelKernels::load(ctx, word)?,
             q51: Q51SelKernels::load(ctx, word)?,
             q80: Q80SelKernels::load(ctx, word)?,
@@ -546,6 +549,10 @@ impl CardLeg {
                 };
                 self.kquant.enqueue_gemv_q5k_sel(stream, &d, fault, down)?;
             }
+            (Some((DownEntry::Q6k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
+                self.q6k
+                    .enqueue_gemv_q6k_sel(stream, w, act, sel, slots, rows_per_expert, down)?;
+            }
             (Some((DownEntry::Mxfp4, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 let d = SelDown {
                     w,
@@ -656,8 +663,9 @@ mod tests {
     /// `rows` rows of `k` values of `ty` in the file's block bytes: every
     /// byte random but each block's scales, which are finite and small, so no
     /// dot is NaN or infinite — the f16 `d` (and `dmin` of Q4_K and Q5_K, `m`
-    /// of Q5_1) or MXFP4's E8M0 byte. Every other byte of these types is a
-    /// valid code, so any draw is a valid block.
+    /// of Q5_1; Q6_K's `d` is the block's last f16) or MXFP4's E8M0 byte.
+    /// Every other byte of these types is a valid code, so any draw is a
+    /// valid block.
     fn stack_bytes(ty: GgmlType, rows: usize, k: usize, seed: u64) -> Vec<u8> {
         let block = usize::try_from(ty.type_size().expect("a block size")).expect("a size");
         let width = usize::try_from(ty.blck_size().expect("a block width")).expect("a width");
@@ -677,7 +685,13 @@ mod tests {
                 b[0] = 118 + u8::try_from(next(&mut state) % 4).expect("a byte");
                 continue;
             }
-            for scale in b[..2 * f16s].chunks_mut(2) {
+            // Q6_K's d is the block's last f16; the other types' scales lead it.
+            let (at, n) = if ty == GgmlType::Q6_K {
+                (block - 2, 2)
+            } else {
+                (0, 2 * f16s)
+            };
+            for scale in b[at..at + n].chunks_mut(2) {
                 let (exp, mant) = (5 + next(&mut state) % 4, next(&mut state) & 0x3ff);
                 let half = u16::try_from(exp << 10 | mant).expect("an f16");
                 scale.copy_from_slice(&half.to_le_bytes());
@@ -720,8 +734,8 @@ mod tests {
     /// leg runs the type in — gate and up `N_CARD · ff` rows of `n`, the down
     /// `N_CARD · n` rows of `ff` — resident in a [`Weights`] as
     /// `DevWeight::KQuant`, named by [`stack_name`]. The types the loader
-    /// keeps as the file's rows (Q4_K, Q5_K) come through a file written for
-    /// them, so `tys` holds one; the other types' rows are the same word
+    /// keeps as the file's rows (Q4_K, Q5_K, Q6_K) come through a file written
+    /// for them, so `tys` holds one; the other types' rows are the same word
     /// stream, filed as derived weights.
     fn weights(gpu: &Gpu, shape: LegShape, tys: &[GgmlType]) -> Weights {
         let LegShape { n, ff, .. } = shape;
@@ -792,11 +806,11 @@ mod tests {
 
     /// The leg's K-quant arms against the launches the table names, run by
     /// hand on buffers of exactly the run's slots: for each type, a run of
-    /// every token its buffers hold and of fewer. The down of a run of fewer
-    /// reads an activation of more columns than the run has slots. A slot the
-    /// card serves must hold a finite value the run wrote, a slot it does not
-    /// must still hold what it held, and the rows are the hand launches' bit
-    /// for bit.
+    /// every token its buffers hold and of fewer, and a Q4_K gate·up beside a
+    /// Q6_K down. The down of a run of fewer reads an activation of more
+    /// columns than the run has slots. A slot the card serves must hold a
+    /// finite value the run wrote, a slot it does not must still hold what it
+    /// held, and the rows are the hand launches' bit for bit.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_the_leg_runs_the_kquant_arms_as_their_sel_launches() {
@@ -804,8 +818,13 @@ mod tests {
         let stream = gpu.stream();
         let leg = CardLeg::load(&gpu).expect("the leg");
         let kq = KquantKernels::load(gpu.context(), gpu.fault_word()).expect("the kquant module");
+        let q6 = Q6kSelKernels::load(gpu.context(), gpu.fault_word()).expect("the q6k module");
         let tys = [GgmlType::Q4_K, GgmlType::Q5_K];
-        let w = weights(&gpu, SHAPE, &tys);
+        let w = weights(
+            &gpu,
+            SHAPE,
+            &[GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K],
+        );
         let host_normed: Vec<f32> = (0..CAP * N)
             .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
             .collect();
@@ -887,45 +906,131 @@ mod tests {
                 }
                 .unwrap_or_else(|e| panic!("{case}: the down: {e}"));
 
-                let want = want.to_host_vec(stream).expect("the hand rows");
-                let got = bufs.down.to_host_vec(stream).expect("the leg's rows");
+                judge(&gpu, &case, &want, &bufs.down, slots);
+            }
+        }
+        // A gate·up of one type beside a down of another: Q4_K beside Q6_K.
+        for (gu, dn) in [(GgmlType::Q4_K, GgmlType::Q6_K)] {
+            let names = [
+                stack_name("gate", gu),
+                stack_name("up", gu),
+                stack_name("down", dn),
+            ];
+            let stacks = LegStacks::of(&w, [&names[0], &names[1], &names[2]]).expect("the stacks");
+            stacks.check(N_CARD, shape).expect("the stacks' shape");
+            let mut bufs = LegBufs::new(stream, shape).expect("the leg's buffers");
+            for m in [CAP, CAP - 1] {
+                let case = format!("gate·up {gu}, down {dn}, {m} tokens");
+                let slots = m * SPC;
+                bufs.down
+                    .copy_from_host(stream, &vec![SENT; CAP * SPC * N])
+                    .expect("the sentinel");
+                let run = LegRun {
+                    layer: 0,
+                    stacks: &stacks,
+                    normed: &normed,
+                    m,
+                    sel: &sel,
+                    n_card: N_CARD,
+                    rule,
+                };
+                leg.enqueue(&gpu, &mut bufs, &run, None)
+                    .unwrap_or_else(|e| panic!("{case}: the leg: {e}"));
+
+                let mut act_x = Q8Act::with_tier_cols(stream, m, N).expect("act_x");
+                let mut h = DeviceBuffer::<f32>::zeroed(stream, slots * FF).expect("h");
+                let mut act_h = Q8Act::with_slots(stream, slots, FF).expect("act_h");
+                let mut want =
+                    DeviceBuffer::from_host(stream, &vec![SENT; slots * N]).expect("the rows");
+                let sink = gpu.layer_sink(0).expect("a sink");
+                gpu.enqueue_quantize_q8_1_cols(&normed, &mut act_x, m, 0)
+                    .expect("q8_1");
+                let a = GateUpAct {
+                    wg: words(&w, &names[0]),
+                    wu: words(&w, &names[1]),
+                    act: &act_x,
+                    sel: &sel,
+                    n_slots: slots,
+                    rows_per_expert: FF,
+                    slots_per_col: SPC,
+                    rule,
+                };
+                kq.enqueue_gate_up_q4k(stream, &a, sink, &mut h)
+                    .unwrap_or_else(|e| panic!("{case}: the gate·up: {e}"));
+                let q = QuantSel {
+                    x: &h,
+                    cols: 0..slots,
+                    sel: &sel,
+                    n_card: N_CARD,
+                };
+                gpu.q4k_sel()
+                    .enqueue_quantize_sel(stream, &q, sink, &mut act_h)
+                    .unwrap_or_else(|e| panic!("{case}: the quantizer: {e}"));
+                q6.enqueue_gemv_q6k_sel(
+                    stream,
+                    words(&w, &names[2]),
+                    &act_h,
+                    &sel,
+                    slots,
+                    N,
+                    &mut want,
+                )
+                .unwrap_or_else(|e| panic!("{case}: the down: {e}"));
+
+                judge(&gpu, &case, &want, &bufs.down, slots);
+            }
+        }
+    }
+
+    /// The K-quant test's verdict on one case: the fault word is clear, a slot
+    /// the card serves holds a finite row the run wrote and a host slot still
+    /// holds the sentinel, the rows are the hand launch's bit for bit, and
+    /// nothing past the run's slots is written.
+    fn judge(
+        gpu: &Gpu,
+        case: &str,
+        want: &DeviceBuffer<f32>,
+        got: &DeviceBuffer<f32>,
+        slots: usize,
+    ) {
+        let stream = gpu.stream();
+        let want = want.to_host_vec(stream).expect("the hand rows");
+        let got = got.to_host_vec(stream).expect("the leg's rows");
+        assert!(
+            gpu.take_fault().expect("the fault word").is_none(),
+            "{case}"
+        );
+        for (s, &place) in SEL[..slots].iter().enumerate() {
+            let rows = s * N..(s + 1) * N;
+            if place == HOST {
                 assert!(
-                    gpu.take_fault().expect("the fault word").is_none(),
-                    "{case}"
+                    got[rows.clone()].iter().all(|v| *v == SENT),
+                    "{case}: slot {s} (HOST) was written"
                 );
-                for (s, &place) in SEL[..slots].iter().enumerate() {
-                    let rows = s * N..(s + 1) * N;
-                    if place == HOST {
-                        assert!(
-                            got[rows.clone()].iter().all(|v| *v == SENT),
-                            "{case}: slot {s} (HOST) was written"
-                        );
-                    } else {
-                        assert!(
-                            got[rows.clone()]
-                                .iter()
-                                .all(|v| v.is_finite() && *v != SENT),
-                            "{case}: slot {s} (expert {place}) holds no finite row the run wrote"
-                        );
-                    }
-                    if let Some(r) = rows
-                        .clone()
-                        .find(|&r| got[r].to_bits() != want[r].to_bits())
-                    {
-                        panic!(
-                            "{case}: slot {s} row {}: leg {:#010x}, hand {:#010x}",
-                            r - rows.start,
-                            got[r].to_bits(),
-                            want[r].to_bits()
-                        );
-                    }
-                }
+            } else {
                 assert!(
-                    got[slots * N..].iter().all(|v| *v == SENT),
-                    "{case}: the leg wrote past its run's slots"
+                    got[rows.clone()]
+                        .iter()
+                        .all(|v| v.is_finite() && *v != SENT),
+                    "{case}: slot {s} (expert {place}) holds no finite row the run wrote"
+                );
+            }
+            if let Some(r) = rows
+                .clone()
+                .find(|&r| got[r].to_bits() != want[r].to_bits())
+            {
+                panic!(
+                    "{case}: slot {s} row {}: leg {:#010x}, hand {:#010x}",
+                    r - rows.start,
+                    got[r].to_bits(),
+                    want[r].to_bits()
                 );
             }
         }
+        assert!(
+            got[slots * N..].iter().all(|v| *v == SENT),
+            "{case}: the leg wrote past its run's slots"
+        );
     }
 
     /// Tokens the wide test's buffers hold: more than a warp's 32 columns.
@@ -948,9 +1053,9 @@ mod tests {
     const WIDE_RUNS: [usize; 3] = [1, 9, WIDE_CAP];
     /// The wide test's cases, `(gate·up type, down type)`: the seven types of
     /// `kernels::card_gate_up_runs` each as a gate·up beside a down of its own
-    /// type, then the three 32-value downs (`kernels::card_down_runs`) beside
-    /// a gate·up that ran before.
-    const WIDE_CASES: [(GgmlType, GgmlType); 10] = [
+    /// type, then a Q4_K gate·up beside a Q6_K down, then the three 32-value
+    /// downs (`kernels::card_down_runs`) beside a gate·up that ran before.
+    const WIDE_CASES: [(GgmlType, GgmlType); 11] = [
         (GgmlType::Q4_K, GgmlType::Q4_K),
         (GgmlType::Q5_K, GgmlType::Q5_K),
         (GgmlType::MXFP4, GgmlType::MXFP4),
@@ -958,6 +1063,7 @@ mod tests {
         (GgmlType::IQ3_XXS, GgmlType::IQ3_XXS),
         (GgmlType::IQ3_S, GgmlType::IQ3_S),
         (GgmlType::IQ4_XS, GgmlType::IQ4_XS),
+        (GgmlType::Q4_K, GgmlType::Q6_K),
         (GgmlType::Q4_K, GgmlType::Q5_1),
         (GgmlType::Q5_K, GgmlType::Q8_0),
         (GgmlType::IQ4_XS, GgmlType::IQ4_NL),
@@ -1059,7 +1165,7 @@ mod tests {
 
     /// A slot's rows are what a one-token run writes for it, whatever `m`
     /// (the module doc), for every type [`kernels::card_gate_up_runs`] and
-    /// [`kernels::card_down_runs`] admit, in ten cases (`WIDE_CASES`). Runs of
+    /// [`kernels::card_down_runs`] admit, in eleven cases (`WIDE_CASES`). Runs of
     /// `m` in `WIDE_RUNS` tokens of eight slots go through fresh buffers of
     /// `WIDE_CAP` tokens, so the run's columns beyond the eighth, and beyond a
     /// warp's 32, are read through the leg's own quantize steps and buffers;
@@ -1070,9 +1176,9 @@ mod tests {
     /// past the run's slots may be written. Every case and `m` is judged, and
     /// the failures are listed together, each naming the slot and its column.
     ///
-    /// The K-quant test above holds the leg's Q4_K and Q5_K arms to the launches
-    /// the table names at one `m`; this one holds each arm's slots to the
-    /// one-token run across `m`.
+    /// The K-quant test above holds the leg's Q4_K and Q5_K arms, and a Q4_K
+    /// gate·up beside a Q6_K down, to the launches the table names at one `m`;
+    /// this one holds each arm's slots to the one-token run across `m`.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_the_leg_writes_each_slots_one_token_rows_at_any_m() {
