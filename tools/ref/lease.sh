@@ -1036,8 +1036,8 @@ EOF
     export BLOOMERY_LEASE_TRACE BLOOMERY_LEASE_CARD
     trace_take
     id=${OUT##*id=}
-    # The waiter can write the free line before this count. The take itself is one line.
-    tlines=$(grep -c ' take id=' "$t/trace1.log" || true)
+    # The header's example also contains "take id=", and the waiter can write free first.
+    tlines=$(grep -Ec '^[^#].* take id=' "$t/trace1.log" || true)
     check trace-take-one-line "$tlines" 1
     matches trace-header '^# The machine lease.s trace' "$(head -n 1 "$t/trace1.log")"
     take=$(grep ' take id=' "$t/trace1.log")
