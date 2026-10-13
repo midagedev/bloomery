@@ -211,7 +211,7 @@
 # ahead of the lane's other items, and the first canary item that ends red (any rc but 0 or a round batch's yield) stops
 # the batch: the lanes and every running item are signalled as for INT/TERM, and the batch ends rc 1 with
 # `DONE total=<n> red=<n> tier=<t> canary=red <item>[,<item>] unrun=<n> wall=<s>s` (unrun: the items no line records, killed
-# or never started; a box process a killed item left behind is `just box-gc`'s). The canary items are the batch's own
+# or never started; their box.sh calls are ended as for INT/TERM, and a remote command a killed item left behind is `just box-gc`'s). The canary items are the batch's own
 # items (one run, one times row, one ledger record each, a ledger skip passes at 0 s); the lanes and the balance are
 # unchanged, so a green stage costs nothing and no lane waits for the other's canary item. A canary item on a lane
 # class of its own (solo, solo-real, v41-load) is a named error. `--no-canary` runs the batch with no stage, as
@@ -388,8 +388,14 @@
 # yielded=), so a round never starts in the first gap the lead's batch leaves — the gap the lead's own next step needs.
 # --dry-run prints the hold it
 # would take and touches nothing.
-# Stopping a batch (INT/TERM): the trap signals only the pids written at spawn under DIR (lane-*.pid,
-# lane-*.child). A box process a killed item left behind is `just box-gc`'s to clear.
+# Stopping a batch (INT/TERM, and a lane found dead): the trap signals only the pids written at spawn under DIR (lane-*.pid,
+# lane-*.child), then the box.sh calls the items registered. `just` does not take the box.sh under it with it on Linux (dash keeps a
+# sh between them; the Mac's sh execs it), so each item's `just` runs with BLOOMERY_BOX_PIDDIR=DIR/lane-<L>.box (the pack's:
+# lane-X-<i>.box): tools/box.sh files its pid there while it runs. reap_boxes sends TERM to each registered pid that still reads as a
+# box.sh in ps, waits REAP_TICKS × 0.1 s, then KILL, and names what it ended on stderr. That ends the local box.sh and not the ssh
+# under it (bash dies and leaves its foreground child, on the Mac too), so the remote command is still `just box-gc`'s to clear.
+# A pid is never signalled for being in a file alone: a KILLed call leaves its file and pids are reused. Local and queue mode
+# (BLOOMERY_BOX_LOCAL, BLOOMERY_BOX_QUEUE) exec box.sh away and register nothing.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 JUST=(just --justfile "$ROOT/justfile" --working-directory "$ROOT")
@@ -404,6 +410,7 @@ TRIES_MAX=11
 RETRY_WAIT=30
 # --wait-hold's period between polls
 WAIT_POLL=30
+REAP_TICKS=50 # reap_boxes: 0.1 s ticks a box.sh gets after TERM before KILL (the header's «Stopping a batch»)
 STEAL_WAIT=$RETRY_WAIT # a held timing lease: the steal's re-probe bound, waited in 1 s slices
 DEFAULT_S=45 # the expected seconds of an item with no row in the times file (the header says why 45)
 MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/ (tools/mac-check.sh), rounded up to a whole GiB
@@ -913,12 +920,13 @@ DF
     else pass "$name"; fi
   }
   local gb=(bash "$t/tools/gate-batch.sh")
-  # The rc 75 and --wait-hold cases below run a copy of the fixture script whose retry wait and poll period are 1 s, not 30 — a sed of
-  # the two constants, the way gpu-gate.sh's --test-locks shrinks its bounds. No BLOOMERY_* name exists
+  # The rc 75 and --wait-hold cases below run a copy of the fixture script whose retry wait and poll period are 1 s, not 30, and whose reap
+  # bound (the deaf-call case) is 5 ticks, not 50 — a sed of the constants, the way gpu-gate.sh's --test-locks shrinks its bounds. No BLOOMERY_* name exists
   # for it: every such name is a row of the lever registry (tools/check-levers.sh holds tools/ to it).
-  sed -e 's/^RETRY_WAIT=30$/RETRY_WAIT=1/' -e 's/^WAIT_POLL=30$/WAIT_POLL=1/' "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-fast.sh"
+  sed -e 's/^RETRY_WAIT=30$/RETRY_WAIT=1/' -e 's/^WAIT_POLL=30$/WAIT_POLL=1/' -e 's/^REAP_TICKS=50 /REAP_TICKS=5 /' "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-fast.sh"
   grep -q '^RETRY_WAIT=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-retry copy did not patch (RETRY_WAIT's line moved?)" >&2; return 70; }
   grep -q '^WAIT_POLL=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-poll copy did not patch (WAIT_POLL's line moved?)" >&2; return 70; }
+  grep -q '^REAP_TICKS=5 ' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-reap copy did not patch (REAP_TICKS's line moved?)" >&2; return 70; }
   export BLOOMERY_GATE_TIMES=$t/times.tsv
   check 'classes: an any-form v41-load recipe is a chain member over both cards' 0 \
     "^v41-any	C	chain	3090,a6000	v41-any: \[group\('v41-load'\)\]" "${gb[@]}" --classes
@@ -1025,11 +1033,15 @@ case "$*" in
     exec bash tools/gpu-gate.sh --test-locks "$st" ${*#bash tools/gpu-gate.sh } ;;
 esac
 [ "${BLOOMERY_BOX_READONLY:-0}" = 1 ] || : > "$st/dir-made"
-# This call's own pid, for the case that ends the batch it belongs to (reap_calls in the self-test): the file goes with the call.
-mkdir -p "$st/live"
-: > "$st/live/$$"
-trap 'rm -f "$st/live/$$"' EXIT
+# This call's own pid, filed where the real tools/box.sh files its own: BLOOMERY_BOX_PIDDIR, which gate-batch sets for an item's `just`.
+# reap_boxes ends the call by it, and reap_calls in the self-test finds a call a case left by it; the file goes with the call.
+if [ -n "${BLOOMERY_BOX_PIDDIR:-}" ]; then
+  mkdir -p "$BLOOMERY_BOX_PIDDIR"
+  : > "$BLOOMERY_BOX_PIDDIR/$$"
+  trap 'rm -f "$BLOOMERY_BOX_PIDDIR/$$"' EXIT
+fi
 for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
+[ "${FAKE_DEAF:-0}" != 1 ] || trap '' TERM # a call that ignores TERM, for reap_boxes' KILL
 word=${*##* }
 for d in ${FAKE_START_DELAY:-}; do [ "${d%%=*}" != "$word" ] || sleep "${d#*=}"; done
 printf '%s\t%s\n' "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/box.log"
@@ -1161,8 +1173,8 @@ FP
   # A case's fake box starts empty, and so does the box under it. A case that ends its batch by killing the batch's pids (the lanes, and
   # each lane's `just`) leaves the call under that `just` running to the end of its hold on Linux (`just` does not take the sh and box.sh
   # below it with it; on the Mac it does), and the call then writes its ran.log, seq.log and end.log lines into whatever fake-state stands
-  # at that moment: the next case's, whose counts then read one call too many. Every call registers its pid under
-  # fake-state/live/; fresh_state ends the calls still
+  # at that moment: the next case's, whose counts then read one call too many. Every call of a batch's item registers its pid under
+  # BLOOMERY_BOX_PIDDIR (DIR/lane-<L>.box, as tools/box.sh does); fresh_state ends the calls still
   # running before it removes the directory, so no call outlives the case it started in. NOREAP=1 skips the reap (the stray case's mutant).
   call_alive() { # <pid>: running (a zombie its parent has not reaped yet is gone)
     case $(ps -o state= -p "$1" 2> /dev/null) in
@@ -1172,9 +1184,9 @@ FP
   reap_calls() { # TERM each registered call that is still a box.sh, and wait until it is gone
     local f p k
     [ "${NOREAP:-0}" != 1 ] || return 0
-    for f in "$t"/fake-state/live/*; do
-      [ -e "$f" ] || continue
+    while read -r f; do
       p=${f##*/}
+      rm -f "$f"
       # the file of a call a signal ended stays, and a pid is reused: only a process that still is a box.sh is signalled
       case $(ps -o args= -p "$p" 2> /dev/null) in *tools/box.sh*) ;; *) continue ;; esac
       kill -TERM "$p" 2> /dev/null || true
@@ -1184,7 +1196,7 @@ FP
         k=$((k + 1))
       done
       if call_alive "$p"; then kill -KILL "$p" 2> /dev/null || true; fi
-    done
+    done < <(find "$t" "$h" -path '*/lane-*.box/*' -type f 2> /dev/null)
   }
   fresh_state() { # <paths…>: the last case's box calls ended, then fake-state and the paths removed
     reap_calls
@@ -1677,10 +1689,10 @@ FP
   stray_case() { # <tag>: prints the batch's rc; the call's pid is in $t/stray-<tag>.pid
     local tag=$1 k=0 p
     fresh_state "$t/target/c-$tag" # a clean box first: the call must not find the last case's box.log
-    BLOOMERY_BOX_ENV='FAKE_SLEEP=30 FAKE_UNTIL=gen_x' sh "$t/tools/box.sh" 'bash tools/gpu-gate.sh gen_stray' > /dev/null 2>&1 &
+    BLOOMERY_BOX_PIDDIR="$t/target/c-$tag/lane-S.box" BLOOMERY_BOX_ENV='FAKE_SLEEP=30 FAKE_UNTIL=gen_x' sh "$t/tools/box.sh" 'bash tools/gpu-gate.sh gen_stray' > /dev/null 2>&1 &
     p=$!
     echo "$p" > "$t/stray-$tag.pid"
-    while [ ! -e "$t/fake-state/live/$p" ] && [ "$k" -lt 50 ]; do # the call has registered
+    while [ ! -e "$t/target/c-$tag/lane-S.box/$p" ] && [ "$k" -lt 50 ]; do # the call has registered
       sleep 0.1
       k=$((k + 1))
     done
@@ -2559,6 +2571,127 @@ IG
     pass 'hold: a batch that ends through die (a lane killed: 70) takes it down'
   else fail 'hold: a batch that ends through die (a lane killed: 70) takes it down' "rc=$rc hold file: $(ls "$t/fake-state/batch.gpuhold" 2>&1)"; fi
   if [ -f "$t/target/c-hold-die/lane-A.child" ]; then kill -TERM "$(cat "$t/target/c-hold-die/lane-A.child")" 2> /dev/null || true; fi
+  # reap (the header's «Stopping a batch»): a stopped batch, and a batch that finds a lane dead, end the box.sh call under the item's `just`.
+  # TERM to `just` takes the sh above box.sh and leaves box.sh when that sh stays between them: always on Linux (dash), and on the Mac for
+  # the recipe below, whose trailing `; true` keeps the sh there where bash would exec a last command; the pack's items are cut from `just`
+  # whatever the sh (lane-X-<i>.child is the run_item subshell). So the call outlives the stop unless reap_boxes ends it. The call is held
+  # until a release line reaches box.log (FAKE_UNTIL: an event, not a clock); one that outlived the stop then writes its end line, and
+  # one that did not cannot. reap_case prints: <batch rc> <call: gone|alive> <end lines the call wrote after the release> <the batch's
+  # reap line names the call: yes|no>.
+  cp "$t/justfile" "$t/justfile.rp"
+  printf '%s\n' '' 'reap-slow:' "    ./tools/box.sh 'bash tools/gpu-gate.sh gen_rp'; true" >> "$t/justfile"
+  reap_case() { # <tag> <stop|die> <item> [<script>]: one item held by its call, the batch stopped (TERM to it) or its lane killed (die)
+    local tag=$1 how=$2 item=$3 script=${4:-$t/tools/gate-batch.sh} o f sp k=0 rc=0 reg='' bp state=alive ends=0 named=no seen=''
+    o="$t/target/c-$tag"
+    printf '%s\n' "$item	A	3090	30	$d" > "$t/times-$tag.tsv"
+    fresh_state "$o"
+    BLOOMERY_PACK_BUDGET=10000 BLOOMERY_GATE_TIMES=$t/times-$tag.tsv BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
+      bash "$script" --out "$o" --round-ledger "$item" > "$t/out-$tag.log" 2>&1 &
+    sp=$!
+    while [ "$k" -lt 200 ]; do # the call has registered and is in its hold
+      for f in "$o"/lane-*.box/*; do
+        if [ -e "$f" ]; then reg=${f##*/}; break; fi
+      done
+      seen=$(grep -Ec '(gen_rp|gen_pa)$' "$t/fake-state/seen.log" 2> /dev/null || true)
+      [ -z "$reg" ] || [ "${seen:-0}" -lt 1 ] || break
+      sleep 0.1
+      k=$((k + 1))
+    done
+    bp=$reg
+    case $how in
+      stop) kill -TERM "$sp" ;;
+      die) kill -TERM "$(cat "$o/lane-A.pid")" ;;
+    esac
+    k=0
+    while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 400 ]; do
+      sleep 0.1
+      k=$((k + 1))
+    done
+    if kill -0 "$sp" 2> /dev/null; then kill -TERM "$sp" 2> /dev/null || true; fi
+    wait "$sp" 2> /dev/null || rc=$?
+    if [ -z "$bp" ]; then state=unregistered # the call never filed its pid: nothing to end it by
+    elif call_alive "$bp"; then state=alive
+    else state=gone; fi
+    printf 'x\tbash tools/gpu-gate.sh gen_rel\n' >> "$t/fake-state/box.log" # the release
+    k=0
+    while [ "$k" -lt 25 ]; do # a call that outlived the stop ends on its next tick
+      ends=$(grep -Ec '^E .*(gen_rp|gen_pa)$' "$t/fake-state/seq.log" 2> /dev/null || true)
+      [ "${ends:-0}" -lt 1 ] || break
+      sleep 0.1
+      k=$((k + 1))
+    done
+    if [ -n "$bp" ] && grep -Eq "^gate-batch: ended the box.sh calls of the lanes \(lane/pid\): .*lane-[A-Z0-9-]+/$bp( |;|$)" "$t/out-$tag.log"; then named=yes; fi
+    printf '%s %s %s %s' "$rc" "$state" "${ends:-0}" "$named"
+    [ "$state" != alive ] || kill -KILL "$bp" 2> /dev/null || true
+  }
+  reap_want() { # <name> <got> <want rc>: the case's four answers are a stopped batch whose call is gone, wrote no end line, and is named
+    local got=$2
+    if [ "$got" = "$3 gone 0 yes" ]; then pass "$1"
+    else fail "$1" "rc, call, end lines after the release, named: '$got' (want '$3 gone 0 yes')"; fi
+  }
+  reap_alive() { # <name> <got> <want rc>: the mutant's: the batch ends as before and the call is up and writes its end line
+    local got=$2
+    case $got in
+      "$3 alive "[1-9]*) pass "$1" ;;
+      *) fail "$1" "rc, call, end lines, named: '$got' (want '$3 alive <n> …')" ;;
+    esac
+  }
+  slow_r='reap-slow@FAKE_SLEEP=60,FAKE_UNTIL=gen_rel'
+  res=$(reap_case reap-stop stop "$slow_r")
+  reap_want 'reap: TERM to the batch ends the box.sh call under the lane'"'"'s just (130), which writes no end line' "$res" 130
+  mutant_of reap-off 's|^\( *\)reap_boxes$|\1: # MUTANT reap-off|' '# MUTANT reap-off$'
+  res=$(reap_case reap-stop-m stop "$slow_r" "$t/tools/gate-batch-reap-off.sh")
+  reap_alive 'reap mutant: without the reap the call outlives the stop and writes its end line' "$res" 130
+  res=$(reap_case reap-die die "$slow_r")
+  reap_want 'reap: a lane found dead (70) ends the box.sh call as well' "$res" 70
+  res=$(reap_case reap-die-m die "$slow_r" "$t/tools/gate-batch-reap-off.sh")
+  reap_alive 'reap mutant: without the reap a dead lane'"'"'s call outlives the batch and writes its end line' "$res" 70
+  # the pack's item: its child pid is the subshell, never just
+  res=$(reap_case reap-pack stop 'pk-a@FAKE_SLEEP=60,FAKE_UNTIL=gen_rel')
+  reap_want 'reap: the pack lane'"'"'s item (lane-X-<i>.box) is ended too' "$res" 130
+  res=$(reap_case reap-pack-m stop 'pk-a@FAKE_SLEEP=60,FAKE_UNTIL=gen_rel' "$t/tools/gate-batch-reap-off.sh")
+  reap_alive 'reap mutant: without the reap the pack item'"'"'s call outlives the stop' "$res" 130
+  # a call that ignores TERM is KILLed after the bound (the fast copy: 5 ticks), and the line says so
+  res=$(reap_case reap-deaf stop 'reap-slow@FAKE_SLEEP=60,FAKE_UNTIL=gen_rel,FAKE_DEAF=1' "$t/tools/gate-batch-fast.sh")
+  reap_want 'reap: a call that ignores TERM is KILLed after the bound' "$res" 130
+  want '  … and the reap line says it was KILLed' "$t/out-reap-deaf.log" 'still up after 5 ticks, KILLed: [0-9]+'
+  mutant_of reap-nokill 's|kill -KILL "\$p" 2> /dev/null \|\| true; killed=|: ; killed=|' ': ; killed='
+  sed -i.bak -e 's/^REAP_TICKS=50 /REAP_TICKS=5 /' "$t/tools/gate-batch-reap-nokill.sh" && rm -f "$t/tools/gate-batch-reap-nokill.sh.bak"
+  res=$(reap_case reap-deaf-m stop 'reap-slow@FAKE_SLEEP=60,FAKE_UNTIL=gen_rel,FAKE_DEAF=1' "$t/tools/gate-batch-reap-nokill.sh")
+  reap_alive 'reap mutant: without the KILL a call that ignores TERM outlives the stop' "$res" 130
+  cp "$t/justfile.rp" "$t/justfile"
+  # The registration the reap relies on, on the real tools/box.sh beside this script (stub ssh and rsync, a scratch tree, the way box.sh's
+  # own self-test runs it): with BLOOMERY_BOX_PIDDIR set the call's pid is filed there while ssh runs (the stub lists the directory, and
+  # its parent is the box.sh) and the file is gone when the call ends; unset, nothing is filed.
+  local rb bxd="$t/boxreal" bxo
+  rb=$(dirname "$self")/box.sh
+  mkdir -p "$bxd/tree/tools" "$bxd/stub" "$bxd/home"
+  if [ -f "$rb" ]; then
+    cp "$rb" "$bxd/tree/tools/box.sh"
+    printf '%s\n' 'cuda-device = { git = "x", rev = "0123456789ab" }' > "$bxd/tree/Cargo.toml"
+    printf '#!/bin/sh\nexit 0\n' > "$bxd/stub/rsync"
+    cat > "$bxd/stub/ssh" << EOS
+#!/bin/sh
+case "\$*" in *"test -d"* | *"mkdir -p"*) exit 0 ;; esac
+echo "ppid=\$PPID dir=\$(ls "$bxd/pids" 2>&1 | tr '\\n' ' ')" >> "$bxd/ssh.seen"
+EOS
+    chmod +x "$bxd/stub/ssh" "$bxd/stub/rsync"
+    : > "$bxd/ssh.seen"
+    bxo=0
+    env -i PATH="$bxd/stub:/usr/bin:/bin" HOME="$bxd/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' BLOOMERY_BOX_PIDDIR="$bxd/pids" \
+      bash "$bxd/tree/tools/box.sh" 'echo hi' > "$bxd/o.log" 2>&1 || bxo=$?
+    if [ "$bxo" = 0 ] && grep -Eq '^ppid=([0-9]+) dir=\1 $' "$bxd/ssh.seen" && [ -z "$(ls "$bxd/pids")" ]; then
+      pass 'box.sh: with BLOOMERY_BOX_PIDDIR set its pid is filed while ssh runs, and the file is gone when the call ends'
+    else fail 'box.sh: with BLOOMERY_BOX_PIDDIR set its pid is filed while ssh runs, and the file is gone when the call ends' "rc $bxo, ssh saw: $(cat "$bxd/ssh.seen"), left: [$(ls "$bxd/pids" 2>&1)] $(head -c 200 "$bxd/o.log")"; fi
+    : > "$bxd/ssh.seen"
+    bxo=0
+    env -i PATH="$bxd/stub:/usr/bin:/bin" HOME="$bxd/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' \
+      bash "$bxd/tree/tools/box.sh" 'echo hi' > "$bxd/o.log" 2>&1 || bxo=$?
+    if [ "$bxo" = 0 ] && grep -Eq '^ppid=[0-9]+ dir=$' "$bxd/ssh.seen" && [ -z "$(ls "$bxd/pids")" ]; then pass '  … and unset, nothing is filed'
+    else fail '  … and unset, nothing is filed' "rc $bxo, ssh saw: $(cat "$bxd/ssh.seen"), left: [$(ls "$bxd/pids" 2>&1)] $(head -c 200 "$bxd/o.log")"; fi
+  else
+    fail 'box.sh: the registration' "$rb is not there"
+  fi
   # An unclean death (KILL runs no trap): the hold is left up, but its heartbeat sees the batch gone and stops beating, so the box ages
   # the hold out instead of it staying fresh for ever.
   fresh_state "$t/target/c-hold-kill"
@@ -4868,20 +5001,64 @@ canary_done() { # a canary item ended red (DIR/canary.red names it): the batch's
     while read -r stem _; do echo "red: $stem  $OUT/g-$stem.log"; done
 }
 
+# box_live <pid>: running and still a box.sh (a zombie its parent has not reaped yet is gone; a reused pid reads as another program)
+box_live() {
+  local line st args
+  line=$(ps -o state= -o args= -p "$1" 2> /dev/null) || return 1
+  read -r st args <<< "$line"
+  case $st in '' | *Z*) return 1 ;; esac
+  case $args in *tools/box.sh*) return 0 ;; esac
+  return 1
+}
+
+# reap_boxes: end the box.sh calls the items registered (the header's «Stopping a batch»): TERM to each pid filed under
+# DIR/lane-*.box that is still a box.sh, then a pass per 0.1 s until none is (a box.sh that registers meanwhile — a recipe's next
+# call, once the sh above its dead predecessor goes on — is met by the next pass), and KILL for what is left at REAP_TICKS. One
+# line on stderr names what it ended (lane/pid), nothing when it found none.
+reap_boxes() {
+  local f p d live ticks=0 termed=' ' said='' killed=''
+  while :; do
+    live=''
+    for f in "$OUT"/lane-*.box/*; do
+      [ -e "$f" ] || continue
+      p=${f##*/}
+      box_live "$p" || continue
+      live="$live $p"
+      case $termed in *" $p "*) continue ;; esac
+      kill -TERM "$p" 2> /dev/null || continue
+      termed="$termed$p "
+      d=${f%/*}
+      d=${d##*/}
+      said="$said ${d%.box}/$p"
+    done
+    [ -n "$live" ] || break
+    if [ "$ticks" -ge "$REAP_TICKS" ]; then
+      for p in $live; do
+        if box_live "$p"; then kill -KILL "$p" 2> /dev/null || true; killed="$killed $p"; fi
+      done
+      break
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  [ -z "$said" ] || echo "gate-batch: ended the box.sh calls of the lanes (lane/pid):$said${killed:+; still up after $REAP_TICKS ticks, KILLed:$killed}" >&2
+}
+
 stop() {
   local f
   trap '' INT TERM # a second canary item ending red meanwhile signals this shell again
   board_event stop
-  # The lanes first, so none starts its next item, then the items they were running.
+  # The lanes first, so none starts its next item, then the items they were running, then the box.sh calls under them.
   for f in "$OUT"/lane-*.pid "$OUT"/lane-*.child; do
     if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
   done
+  reap_boxes
   if [ -s "$OUT/canary.red" ]; then
     canary_done
-    echo "gate-batch: stopped by a red canary item (above); a box process a killed item left behind is cleared by 'just box-gc'; --no-canary runs the batch without the stage" >&2
+    echo "gate-batch: stopped by a red canary item (above); the remote command of an item that was running is cleared by 'just box-gc'; --no-canary runs the batch without the stage" >&2
     exit 1
   fi
-  echo "gate-batch: stopped; a box process a killed item left behind is cleared by 'just box-gc'" >&2
+  echo "gate-batch: stopped; the remote command of an item that was running is cleared by 'just box-gc'" >&2
   exit 130
 }
 
@@ -4970,6 +5147,7 @@ fi
 # run.log exists from here on (a refused start leaves none, so the same --out can be retried).
 : > "$RUNLOG"
 rm -f "$OUT/canary.red" # a retried --out holds no earlier run's stop
+rm -rf "$OUT"/lane-*.box # ... nor an earlier run's registered pids (a KILLed call's file, its pid reused by another batch's box.sh)
 mkdir -p "$OUT/claims" # one claim per item: the owner's start and the thief's steal agree on it
 T0=$(date +%s)
 echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" >> "$RUNLOG"
@@ -5014,6 +5192,8 @@ fi
 
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
   local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0 cold=0 deferred=0 yowner='' rcl
+  local pdir="$OUT/lane-$lane.box" # the box.sh calls this item's `just` starts file their pids here (reap_boxes; the pack's items each have their own)
+  [ "$lane" != X ] || pdir="$OUT/lane-X-$i.box"
   local argv=()
   eval "argv=(${P_ARGS[$i]})"
   benv=$(box_env_of "$i")
@@ -5027,7 +5207,8 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     echo "=== try $try $(date '+%F %T') lane=$lane: $(cmd_of "$i")" >> "$log"
     rc=0
     t1=$(date +%s)
-    BLOOMERY_BOX_ENV="$benv" "${JUST[@]}" "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null &
+    rm -rf "$pdir" # the last try's calls ended (a KILLed one leaves its file, and its pid may be reused)
+    BLOOMERY_BOX_PIDDIR="$pdir" BLOOMERY_BOX_ENV="$benv" "${JUST[@]}" "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null &
     [ "$lane" = X ] || echo $! > "$OUT/lane-$lane.child" # the pack's driver owns its children's pids
     wait $! || rc=$?
     ran=$(($(date +%s) - t1))
@@ -5574,6 +5755,7 @@ while :; do
     for f in "$OUT"/lane-*.pid "$OUT"/lane-*.child; do
       if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
     done
+    reap_boxes
     RC=70 die "lane $lane ended without its sentinel ($OUT/lane-$lane.s) — see run.log"
   done
   dead_prev=$dead_now

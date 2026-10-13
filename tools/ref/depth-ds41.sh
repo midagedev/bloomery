@@ -302,9 +302,10 @@
 # row would be, and the runner goes on with the next arm. That label at that depth or P drops out of
 # the means and the ratios (the tables name what they dropped), and the runner ends with `failed arms:
 # …` and exits 1 (cold-blocks.sh's arm_fail, failed_tally and failed_end, depth-qwen3moe.sh's too). A
-# warm-up that fails is `FAIL r0 …` and counts in that list. An arm that fails in a
-# load shared with other arms ends that process: the arms after it in the round re-run in a fresh load
-# (Loads below), never on the failed one.
+# warm-up that fails is `FAIL r0 …` and counts in that list; the rounds still run, unless its last line is the binary's
+# lever refusal (`<NAME>="<value>" is refused: …`): then the run stops there with a `stopped:` line and exits 1
+# (cold-blocks.sh's header). An arm that fails in a load shared with other arms ends that process: the arms after
+# it in the round re-run in a fresh load (Loads below), never on the failed one.
 #
 # Loads. A round's ours, corpus and bin: arms that share a load key — the arm's binary (this tree's, or a
 # bin: arm's), --place and the arm's NAME=VALUE list, every variable of which the binary consumes at its
@@ -394,7 +395,8 @@
 # the card's clocks and the page cache across that gap.
 # Discard. Before a block's rounds the runner runs one discard process, its row printed as `DISCARD r0
 # …` between its own witness blocks and in no mean, ratio or row count, as the warm-up's is; a discard
-# that fails is `FAIL r0 …` and counts in the failed list. It is the block's arm that reads the most of
+# that fails is `FAIL r0 …` and counts in the failed list (a lever refusal as its last line stops the run, as the
+# warm-up's does). It is the block's arm that reads the most of
 # what the others will:
 #   a reference block: the arm with the most token draws, at the block's largest --n-cpu-moe (the
 #     `[block]` line names it when that is not the arm's own). llama-bench seeds no generator, so every

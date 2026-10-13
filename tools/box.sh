@@ -217,6 +217,10 @@ self_test() {
     printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/%s.log"\n' "$d" "$t" > "$d/stub/$t"
     chmod +x "$d/stub/$t"
   done
+  # The ssh stub also writes what BLOOMERY_BOX_PIDDIR holds while the call runs, and its parent (the box.sh that runs it), into pid.log;
+  # STUB_SLEEP=<s> holds it there, its own pid in ssh.pid, for the TERM case.
+  printf '[ -z "${BLOOMERY_BOX_PIDDIR:-}" ] || echo "$PPID $(ls "$BLOOMERY_BOX_PIDDIR" 2> /dev/null | tr "\\n" " ")" >> "%s/pid.log"\n' "$d" >> "$d/stub/ssh"
+  printf '[ -z "${STUB_SLEEP:-}" ] || { echo $$ > "%s/ssh.pid"; sleep "$STUB_SLEEP"; }\n' "$d" >> "$d/stub/ssh"
   if [ "$(PATH="$d/stub:/usr/bin:/bin"; command -v ssh)" != "$d/stub/ssh" ]; then
     echo "box.sh: --self-test: the ssh stub is not first on PATH: nothing was run" >&2
     rm -rf "$d"
@@ -332,6 +336,35 @@ self_test() {
   read -r lrc n < "$d/loop" || { lrc=?; n=?; }
   [ "$lrc" = 75 ] || fail "a looping caller ended $lrc after $n runs, not 75 at its next call"
   [ "$n" = "$(grep -c 'echo hi' "$d/ssh.log")" ] || fail "a looping caller ran $n times and ssh got the command $(grep -c 'echo hi' "$d/ssh.log") times"
+  rm -f "$hd/aa"
+  # BLOOMERY_BOX_PIDDIR (tools/gate-batch.sh's reap): a call files its own pid there while it runs and removes it on exit, TERM included;
+  # queue mode files nothing (it execs this shell away), and unset, nothing is filed anywhere.
+  local pd=$d/pids line bpid spid
+  : > "$d/pid.log"
+  call BLOOMERY_BOX_PIDDIR="$pd" -- 'echo hi'
+  want 0 'a registered call'; reached 'a registered call'
+  read -r line < "$d/pid.log" || line=
+  bpid=${line%% *}
+  [ -n "$bpid" ] && [ "$line" = "$bpid $bpid" ] || fail "a registered call: the ssh stub read '<its parent> <the directory>' as '$line', want '$bpid $bpid'"
+  [ -z "$(ls "$pd" 2> /dev/null)" ] || fail "a registered call: its pid file outlived it: $(ls "$pd")"
+  rm -rf "$pd"
+  call BLOOMERY_BOX_PIDDIR="$pd" BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  [ ! -e "$pd" ] || fail "a queued call filed a pid: $(ls "$pd")"
+  rm -f "$d/ssh.pid"
+  env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' BLOOMERY_BOX_PIDDIR="$pd" STUB_SLEEP=30 \
+    bash "$box" 'echo hi' > /dev/null 2>&1 &
+  bpid=$!
+  i=0
+  until [ -s "$d/ssh.pid" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || break
+    sleep 0.1
+  done
+  [ -e "$pd/$bpid" ] || fail "a running call: no pid file $pd/$bpid (the directory holds '$(ls "$pd" 2> /dev/null)')"
+  kill -TERM "$bpid" 2> /dev/null || true
+  wait "$bpid" 2> /dev/null || true
+  [ ! -e "$pd/$bpid" ] || fail "a call ended by TERM left its pid file $pd/$bpid"
+  spid=$(cat "$d/ssh.pid" 2> /dev/null) && kill "$spid" 2> /dev/null || true
   rm -rf "$d"
   if [ "$fails" != 0 ]; then
     echo "box.sh: self-test $fails failed" >&2
@@ -344,6 +377,17 @@ case ${1:-} in
   --hold) shift; rc=0; hold_cmd "$@" || rc=$?; exit "$rc" ;;
   --self-test) shift; rc=0; self_test "$@" || rc=$?; exit "$rc" ;;
 esac
+# The registration tools/gate-batch.sh reaps by (its stop and dead-lane paths): BLOOMERY_BOX_PIDDIR names a directory, and a call that finds
+# it set files its own pid there while it runs, an empty file named <pid>, removed on exit, TERM included (a KILLed call leaves its file, so the
+# reader checks the process still reads as box.sh). Unset: nothing happens. Not in local or queue mode, which exec this shell away (the pid would be
+# bash -c's or boxq.py's).
+BOX_PIDFILE=
+if [ -n "${BLOOMERY_BOX_PIDDIR:-}" ] && [ "${BLOOMERY_BOX_LOCAL:-0}" != 1 ] && [ "${BLOOMERY_BOX_QUEUE:-0}" != 1 ]; then
+  if { mkdir -p "$BLOOMERY_BOX_PIDDIR" && : > "$BLOOMERY_BOX_PIDDIR/$$"; } 2> /dev/null; then
+    BOX_PIDFILE=$BLOOMERY_BOX_PIDDIR/$$
+    trap 'rm -f "$BOX_PIDFILE"' EXIT
+  fi
+fi
 HOST=${BLOOMERY_BOX:-ws}
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$(cd "$(dirname "$0")/.." && pwd)")"}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
