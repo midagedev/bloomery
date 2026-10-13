@@ -24,7 +24,7 @@ question: on a whole-card Qwen3.6 Q4_K_M, does one m=5 prefill on the tile arm f
 term: median of (_sel time-prompt ms minus tile time-prompt ms) over four prefills of five ids, --prefill pass, no BLOOMERY_STEP_STATS
 unit: ms
 predict: 0.15..0.35
-condition: gate_qwen35moe_verify passed on the tile binary (argmaxes and last logits bit for bit against the plain _sel steps). The timed row is `time prompt` of --tokens 760,6511,314,9338,369 --prefill pass -n 0, kind=prefill, one pass. The _sel arm is a second release build of the same tree with the m>1 tile branch forced off in dispatch, so its graph keeps the _sel launches. Load and graph capture sit outside that row.
+condition: gate_qwen35moe_verify passed on the tile binary (argmaxes and last logits bit for bit against the plain _sel steps). The timed row is `time prompt` of --tokens 760,6511,314,9338,369 --prefill pass -n 1, kind=prefill, one pass. The binary refuses -n 0. The one generated step sits after that row. The _sel arm is a second release build of the same tree with the m>1 tile branch forced off in dispatch, so its graph keeps the _sel launches. Load and graph capture sit outside that row.
 decide-in: the median is inside 0.15..0.35 ms. Record it. The mechanism matches the certain-to-uniform band. No lever and no default change.
 decide-below: the median is under 0.15 ms, including a slower tile arm. The certain shared-expert term did not show. Report the four pairs and stop. Do not add a switch.
 decide-above: the median is over 0.35 ms. Routing overlapped more than the uniform draw. Record the ms. Do not widen the edit.
