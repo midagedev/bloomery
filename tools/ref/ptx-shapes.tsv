@@ -338,6 +338,7 @@ gate_e2e   ds41_ffn_handoff_10_cols_tier            0           0
 gate_e2e   ds41_ffn_handoff_8                       0           0
 gate_e2e   ds41_ffn_handoff_8_tier                  0           0
 gate_e2e   ds41_ffn_places                          0           0
+gate_e2e   ds41_markov                              0           0
 gate_e2e   embed_rows                               0           0
 gate_e2e   embed_rows_q3k                           0           0
 gate_e2e   embed_rows_q4k                           0           0
