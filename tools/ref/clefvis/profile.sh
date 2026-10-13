@@ -19,8 +19,9 @@
 # `# build` lines against them.
 #
 #   FAMILY          clef | qvis | mcvis: which arms the seat has. clef: set A (preproc), the release's ids (clef_ref.py), set D;
-#                   qvis: the chat ids (E) and the decode steps (F), the tower tapped to its output end; mcvis: the tower only,
-#                   sets A and B per tile (dump_mtmd's canvas seat), no ids, no prompt arms
+#                   qvis: the chat ids (E) and the decode steps (F), the tower tapped to its output end; mcvis: sets A and B per
+#                   tile (dump_mtmd's canvas seat), the chat ids (E, kind canvas-chatids) and the hidden rows (C, canvas-hidden),
+#                   no prose, bf16 or decode arm
 #   PREPROC         1: the tower arm writes set A (preproc, the card run only): Clef and the GLM seat; 0: the Qwen seats
 #   ARMS            the prompt kinds a case dumps: hidden (C), prose (C', with PROSE_IDS), bf16rows (C''); the GLM seat's is hidden
 #   IMAGES_EXTRA    a file of more image rows (images.tsv's format) the tower arm takes after images.tsv: the GLM seat's cap case
@@ -28,6 +29,8 @@
 #   SEAT            the projector the seat is for, passed to dump_mtmd as --seat: it refuses another projector's mmproj by name
 #                   (empty: the seat is whatever the mmproj's projector says, as the Qwen and GLM seats have always run)
 #   IMAGE_PAD_ID    the id of the text model's image token, passed to dump_mtmd as --image-pad-id (empty: its Qwen default)
+#   STAGE_NAME      the name of the chat run's staging directory (empty: MODEL_NAME): MiniCPM's text profile is a qwen35moe file, and
+#                   Qwen3.6's chat run stages under that name
 #   RESPELL_SOURCE  the fixture's first shard the text model is a respelled copy of (tools/ref/gguf-respell.py): the set's
 #                   `# fixture` line is that file's, and dump_mtmd refuses a copy whose bloomery.respell.source names another
 #   SETPFX          the sets' common name
@@ -52,7 +55,7 @@ DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 # CLEFVIS_OUT moves the binary's directory, as build-clefvis.sh reads it (a scratch build under test).
 BINDIR=${CLEFVIS_OUT:-$DATA/bin}
 NCMOE_A6000=0 NCMOE_3090=0 ROWS_FROM=embd THREADS=16 CASES=tools/ref/clefvis/cases.tsv REQUESTS=
-PREPROC=0 ARMS="hidden prose bf16rows" IMAGES_EXTRA="" IMAGE_PAD_ID="" RESPELL_SOURCE="" SEAT="" IMAGES_LIST=tools/ref/clefvis/images.tsv
+PREPROC=0 ARMS="hidden prose bf16rows" IMAGES_EXTRA="" IMAGE_PAD_ID="" RESPELL_SOURCE="" SEAT="" IMAGES_LIST=tools/ref/clefvis/images.tsv STAGE_NAME=""
 case ${BLOOMERY_MODEL:-} in
   qwen35)
     FAMILY=clef PREPROC=1 SETPFX=ref_clefvis ORACLE=$LCPP BIN=$BINDIR/dump_mtmd
@@ -107,14 +110,18 @@ case ${BLOOMERY_MODEL:-} in
     THREADS=16
     ;;
   minicpmv47)
-    # the text model is a qwen35moe file with its own vocabulary (models/minicpmv47.sh); only the tower runs: it loads the
-    # vocabulary, never the weights, so no experts stay on the host
-    FAMILY=mcvis PREPROC=1 ARMS="" SEAT=minicpmv4_7 SETPFX=ref_minicpmv47_vis ORACLE=$MC47_LCPP BIN=$BINDIR/dump_mtmd_mc47
+    # the text model is a qwen35moe file with its own vocabulary (models/minicpmv47.sh): the tower and chat arms load the
+    # vocabulary only, the hidden arm the whole 21.2 GB file, which a 48 GB card holds with the tower and a 4,096 context (the
+    # 24 GB card does not: NCMOE_3090 keeps the experts of that many blocks on the host). The image token is `<unk>`, id 248077
+    # (llama-tokenize of the file). The sets: preproc and taps per tile, chatids_mc1..3 (--ids) and hidden_mc1..3
+    FAMILY=mcvis PREPROC=1 ARMS="hidden" SEAT=minicpmv4_7 SETPFX=ref_minicpmv47_vis ORACLE=$MC47_LCPP BIN=$BINDIR/dump_mtmd_mc47
+    IMAGE_PAD_ID=248077 STAGE_NAME=minicpmv47 REF=${MCVIS_REF:-$DATA/mcvis/minicpmv47}
+    NCMOE_3090=${MCVIS_NCMOE_3090:-4}
     MMPROJ=/models/MiniCPM-V-4.7-35B-A3B/mmproj-model-f16.gguf
     MMPROJ_SHA256=bff3b688e14c300eca273092c37c50a0ddfcc2054e079af1a0480edeed5d20f1
     TEXT=/models/MiniCPM-V-4.7-35B-A3B/MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf
     IMAGES_LIST=tools/ref/clefvis/images-minicpmv47.tsv
-    CASES=/dev/null
+    CASES=tools/ref/clefvis/cases-minicpmv47.tsv REQUESTS=tools/ref/clefvis/requests-minicpmv47.jsonl
     THREADS=16
     ;;
   *)

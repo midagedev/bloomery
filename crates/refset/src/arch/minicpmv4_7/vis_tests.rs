@@ -153,12 +153,20 @@ fn replace(extra: &mut [String], from: &str, to: &str) {
 }
 
 #[test]
-fn the_families_are_the_tower_kinds_of_the_projector() {
+fn the_families_are_the_tower_kinds_and_the_prompt_kinds_of_the_seat() {
     let names: Vec<&str> = crate::arch::families(super::ARCH)
         .iter()
         .map(|f| f.name)
         .collect();
-    assert_eq!(names, ["minicpmv47-vis-preproc", "minicpmv47-vis-taps"]);
+    assert_eq!(
+        names,
+        [
+            "minicpmv47-vis-preproc",
+            "minicpmv47-vis-taps",
+            "minicpmv47-vis-hidden",
+            "minicpmv47-vis-chatids"
+        ]
+    );
     for (kind, family) in [(Kind::Preproc, &PREPROC), (Kind::Taps, &TAPS)] {
         assert!(std::ptr::eq(kind.family(), family));
         assert_eq!(family.arch, Some("clip"));
