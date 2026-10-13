@@ -244,6 +244,19 @@
 //! under `cost` with its state at the run's end. The rows and lines are the
 //! lookup's; a `load draft=dspark` line follows the `load` line.
 //!
+//! `--accept-profile W` (W in 2 to the block pass's `MAX_WIDTH`; under
+//! `BLOOMERY_DRAFT=dspark` with `BLOOMERY_MTP_WIDTH=fixed`, and refused
+//! beside `--time` and an `--arm` list) measures the draft's acceptance by
+//! block position beside the width-1 run: each proposal is a W-wide block
+//! (`CardDraft::propose_block`), its first id is the proposal the loop
+//! verifies and the whole block is logged with the position it followed.
+//! The run's tokens are the plain greedy stream, as at width 1. After the
+//! run each block is compared with the output ids at its positions, and one
+//! `draft profile` line prints the counts per position (`tried`, `hit`; the
+//! acceptance at position i is hit / tried). The block's first id is the
+//! served proposal, so `id0` equals the `draft summary`'s `accepts` when the
+//! run's last pass kept all of its rows.
+//!
 //! `BLOOMERY_GEN_SLOTS=N` (unset or 1 is the one-sequence run above, line
 //! for line) decodes N streams in one pass (`GpuModel::step_slots`, the
 //! body's `SlotRows` pass of a row a slot; N past its `MAX_ROWS` is refused
@@ -334,7 +347,7 @@ mod drive {
     use std::ops::Range;
     use std::time::{Duration, Instant};
 
-    use app::arch::deepseek41::Ds41Cfg;
+    use app::arch::deepseek41::{CardDraft, Ds41Cfg};
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::head::Head;
@@ -345,13 +358,15 @@ mod drive {
         self, Body, BodyMeta, Deepseek41Model, PAIR_ROWS, TierOpen,
     };
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
+    use bloomery_gpu_deepseek41::draft::DraftBody;
+    use bloomery_gpu_deepseek41::draft::block::MAX_WIDTH;
     use bloomery_gpu_deepseek41::swap;
     use bloomery_gpu_gates::generate::{
         Diag, Lane, NoEog, Place, PlaceWhy, Residence, ServeFeed, TopRows, before_path, card_table,
         dump_table, lane_at, mode_name, place_table, read_table, repeat_runs, seed_path,
         slot_table, write_table,
     };
-    use bloomery_gpu_gates::record::{self, Record};
+    use bloomery_gpu_gates::record::{self, AcceptProfile, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LANES,
@@ -378,7 +393,7 @@ mod drive {
         format!(
             "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N] [--ctx C] \
              [--place a|gate|bp|<stage>[+<tier>…]] [--mode eager|graph] [--time [--warm W]] \
-             [--plan] [--logits] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] in place of \
+             [--plan] [--logits] [--accept-profile W] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] in place of \
              the prompt flags",
             Diag::USAGE
         )
@@ -468,6 +483,8 @@ mod drive {
         sync: bool,
         /// `--logits`: the `logits` record after the loop.
         logits: bool,
+        /// `--accept-profile`: the block width the DSpark draft proposes at.
+        accept_profile: Option<usize>,
         /// The shared diagnosis flags ([`Diag`]).
         diag: Diag,
         /// Whether this run is the one `--dump-table` reads.
@@ -489,6 +506,7 @@ mod drive {
             arms: Vec::new(),
             sync: false,
             logits: false,
+            accept_profile: None,
             diag: Diag::default(),
             dump_now: false,
         };
@@ -532,6 +550,7 @@ mod drive {
                 "-n" => a.n_gen = v.parse()?,
                 "--ctx" => a.ctx = v.parse()?,
                 "--warm" => a.warm = Some(v.parse()?),
+                "--accept-profile" => a.accept_profile = Some(profile_width(&v)?),
                 "--place" => place_flag = Some(place::parse(&v)?),
                 "--mode" => {
                     a.mode = match v.as_str() {
@@ -568,6 +587,15 @@ mod drive {
         } else if a.sync {
             return Err("--arm-sync paces the arms of an --arm list, and none is given".into());
         }
+        if a.accept_profile.is_some() {
+            let beside = [(a.timed, "--time"), (!a.arms.is_empty(), "--arm")];
+            if let Some((_, what)) = beside.iter().find(|(set, _)| *set) {
+                return Err(format!(
+                    "--accept-profile counts a functional run's blocks: it does not mix with {what}"
+                )
+                .into());
+            }
+        }
         if a.diag.repeat > 1 && !a.arms.is_empty() {
             return Err(
                 "--repeat runs the prompt flags' run again; --arm names its own runs".into(),
@@ -581,6 +609,19 @@ mod drive {
         let placed = place::choose(place_flag)?;
         a.place = placed.place;
         Ok((a, placed))
+    }
+
+    /// `--accept-profile`'s width: a block of 2 to the block pass's widest.
+    fn profile_width(v: &str) -> Result<usize, GateError> {
+        let w: usize = v.parse()?;
+        if (2..=MAX_WIDTH).contains(&w) {
+            Ok(w)
+        } else {
+            Err(format!(
+                "--accept-profile {w}: a block of 2 to {MAX_WIDTH} ids (width 1 is the plain run)"
+            )
+            .into())
+        }
     }
 
     impl Args {
@@ -748,6 +789,13 @@ mod drive {
             return Err(
                 "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
                  BLOOMERY_DRAFT=off runs the plain path"
+                    .into(),
+            );
+        }
+        if a.accept_profile.is_some() && (draft != Draft::Dspark || width != WidthMode::Fixed) {
+            return Err(
+                "--accept-profile logs the blocks of the DSpark draft, one for every \
+                        pass: it takes BLOOMERY_DRAFT=dspark with BLOOMERY_MTP_WIDTH=fixed"
                     .into(),
             );
         }
@@ -1080,16 +1128,19 @@ mod drive {
                     s.with_draft::<_, PAIR_ROWS>(behind(Lookup::new(), width)?, &mut log)?;
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
-                let ran = decode_draft(&mut s, a, &fed, &mut spec, "steps", "lookup", |_| Ok(()));
+                let ran = decode_draft(&mut s, a, &fed, &mut spec, "steps", "lookup", |_| Ok(()))
+                    .map(|_| ());
                 after_passes(&mut s, ran)
             }
             (Draft::Dspark, Some(d), _) => {
+                let d = Profiled::new(d, a.accept_profile);
                 let mut spec = s.with_draft::<_, PAIR_ROWS>(behind(d, width)?, &mut log)?;
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
                 let ran = decode_draft(&mut s, a, &fed, &mut spec, "dspark", "dspark", |d| {
                     Ok(d.draft_mut().draft_mut().check_fault()?)
-                });
+                })
+                .and_then(|run| print_accept_profile(spec.draft_mut().draft_mut(), &run));
                 after_passes(&mut s, ran)
             }
             (Draft::Dspark, None, _) => Err("generate_ds41: the DSpark draft did not load".into()),
@@ -1116,6 +1167,163 @@ mod drive {
         mode: WidthMode,
     ) -> Result<Choosing<D>, SessionError> {
         Ok(d.choosing(mode)?)
+    }
+
+    /// What a draft pass run produced: token 0 and the ids after it.
+    struct Generated {
+        /// Generated token 0, the argmax after the prompt.
+        first: u32,
+        /// (position the token is the argmax after, token), past token 0.
+        emitted: Vec<(u32, u32)>,
+    }
+
+    /// A block the draft proposed: the target's position when it was asked,
+    /// the token there, and the ids.
+    struct Block {
+        pos: u32,
+        last: u32,
+        ids: Vec<u32>,
+    }
+
+    /// The DSpark draft behind the width-1 loop. Under `--accept-profile W`
+    /// each proposal is a W-wide block: its first id is the proposal the pass
+    /// verifies, and the block is logged for [`print_accept_profile`]. With no
+    /// width it is the draft itself.
+    struct Profiled {
+        inner: CardDraft<DraftBody>,
+        width: Option<usize>,
+        blocks: Vec<Block>,
+    }
+
+    impl Profiled {
+        fn new(inner: CardDraft<DraftBody>, width: Option<usize>) -> Profiled {
+            Profiled {
+                inner,
+                width,
+                blocks: Vec::new(),
+            }
+        }
+
+        /// The draft card's fault word, as [`CardDraft::check_fault`].
+        fn check_fault(&mut self) -> Result<(), GpuError> {
+            self.inner.check_fault()
+        }
+    }
+
+    type Inner = CardDraft<DraftBody>;
+
+    impl runtime::Draft<Session<Body>> for Profiled {
+        const WIDTH: usize = <Inner as runtime::Draft<Session<Body>>>::WIDTH;
+        const TAPS: runtime::TapNeed = <Inner as runtime::Draft<Session<Body>>>::TAPS;
+
+        fn prompt(&mut self, t: &mut Session<Body>, ids: &[u32]) -> Result<u32, SessionError> {
+            runtime::Draft::<Session<Body>>::prompt(&mut self.inner, t, ids)
+        }
+
+        fn begin(
+            &mut self,
+            t: &Session<Body>,
+            prompt: &[u32],
+            first: u32,
+        ) -> Result<(), SessionError> {
+            runtime::Draft::<Session<Body>>::begin(&mut self.inner, t, prompt, first)
+        }
+
+        fn propose(
+            &mut self,
+            t: &mut Session<Body>,
+            last: u32,
+            out: &mut [u32],
+        ) -> Result<usize, SessionError> {
+            let Some(width) = self.width else {
+                return runtime::Draft::<Session<Body>>::propose(&mut self.inner, t, last, out);
+            };
+            let pos = t.pos();
+            let ids = self.inner.propose_block(t, last, width)?;
+            let (Some(&first), Some(slot)) = (ids.first(), out.first_mut()) else {
+                return Err(SessionError::Refused(
+                    "--accept-profile: a block with no id to serve".into(),
+                ));
+            };
+            *slot = first;
+            self.blocks.push(Block { pos, last, ids });
+            Ok(1)
+        }
+
+        fn accept(
+            &mut self,
+            t: &mut Session<Body>,
+            rows: &[u32],
+            out: &[u32],
+            accepted: usize,
+        ) -> Result<(), SessionError> {
+            runtime::Draft::<Session<Body>>::accept(&mut self.inner, t, rows, out, accepted)
+        }
+
+        fn stepped(
+            &mut self,
+            t: &mut Session<Body>,
+            last: u32,
+            next: u32,
+        ) -> Result<(), SessionError> {
+            runtime::Draft::<Session<Body>>::stepped(&mut self.inner, t, last, next)
+        }
+    }
+
+    /// The `draft profile` line of a `--accept-profile` run: each logged block
+    /// against the output's ids at its positions ([`AcceptProfile`]). A block
+    /// proposed with the target at position `p` predicts the ids that are the
+    /// argmax after positions `p`, `p + 1`, …; its `last` token must be the
+    /// output's own at `p`, which holds the positions to the output.
+    fn print_accept_profile(p: &Profiled, run: &Generated) -> Result<(), GateError> {
+        let Some(width) = p.width else {
+            return Ok(());
+        };
+        let Some(&(pos0, _)) = run.emitted.first() else {
+            return Err("--accept-profile: the run emitted no token past token 0".into());
+        };
+        let mut ids = Vec::with_capacity(run.emitted.len());
+        for (k, &(pos, tok)) in (0u32..).zip(&run.emitted) {
+            if pos != pos0 + k {
+                return Err(format!(
+                    "--accept-profile: output token {} is the argmax after position {pos}, not \
+                     {}: the output has a gap",
+                    k + 1,
+                    pos0 + k
+                )
+                .into());
+            }
+            ids.push(tok);
+        }
+        let mut profile = AcceptProfile::new(width);
+        for b in &p.blocks {
+            let at = b
+                .pos
+                .checked_sub(pos0)
+                .and_then(|d| usize::try_from(d).ok())
+                .ok_or_else(|| format!("--accept-profile: a block at position {}, before the output's first pass at {pos0}", b.pos))?;
+            let before = match at.checked_sub(1) {
+                None => Some(run.first),
+                Some(k) => ids.get(k).copied(),
+            };
+            if before != Some(b.last) {
+                return Err(format!(
+                    "--accept-profile: a block at position {} followed token {}, the output has \
+                     {before:?} there",
+                    b.pos, b.last
+                )
+                .into());
+            }
+            let ahead = ids.get(at..).ok_or_else(|| {
+                format!(
+                    "--accept-profile: a block at position {} past the output",
+                    b.pos
+                )
+            })?;
+            profile.count(&b.ids, ahead)?;
+        }
+        profile.record().print();
+        Ok(())
     }
 
     /// The residency views of `s`'s body ([`Residence`]): its stage card's
@@ -2453,7 +2661,7 @@ mod drive {
     /// position's features, from the batches' feature rows or one step per
     /// id); `after` runs once the passes are done. `steps` is the `time
     /// prompt` row's kind of a feed that is not a batch, `kind` the `draft
-    /// summary`'s.
+    /// summary`'s. The run's output comes back for [`print_accept_profile`].
     fn decode_draft<D: runtime::Draft<Session<Body>>>(
         s: &mut Session<Body>,
         a: &Args,
@@ -2462,7 +2670,7 @@ mod drive {
         steps: &'static str,
         kind: &'static str,
         after: impl FnOnce(&mut Speculative<Choosing<D>, PAIR_ROWS>) -> Result<(), GateError>,
-    ) -> Result<(), GateError> {
+    ) -> Result<Generated, GateError> {
         let depth = f.ids.len();
         let (first, feed_time) = feed(s, spec, f, steps)?;
         let mut sink = Passes {
@@ -2495,7 +2703,10 @@ mod drive {
             print_stats(&sink.probes, warm);
         }
         print_draft_summary(a, &passes, f.prompt_len, depth, kind, spec.draft_mut());
-        Ok(())
+        Ok(Generated {
+            first,
+            emitted: sink.emitted,
+        })
     }
 
     /// The `step` lines of the first `-n` tokens, the `time pass` rows when

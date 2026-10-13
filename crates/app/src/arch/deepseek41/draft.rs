@@ -287,6 +287,27 @@ impl CardDraft<DraftBody> {
         self.on_card(|gpu, body| body.append(gpu, feats).map(|_| ()))
     }
 
+    /// The draft's `width` ids after `last`, the token at the target's
+    /// position: the proposal path of [`Draft::propose`] at a width of the
+    /// caller's pick, every id returned. Changes no state the next proposal
+    /// reads.
+    pub fn propose_block(
+        &mut self,
+        t: &mut Session<Body>,
+        last: u32,
+        width: usize,
+    ) -> Result<Vec<u32>, SessionError> {
+        self.following(t)?;
+        let ids = self.on_card(|gpu, body| body.propose(gpu, last, width))?;
+        if ids.len() != width {
+            return Err(SessionError::Gpu(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a block of width {width} returned {} ids", ids.len()),
+            }));
+        }
+        Ok(ids)
+    }
+
     /// The draft card's fault word, read after the last append: raised is
     /// the draft's `GpuError::Fault`.
     pub fn check_fault(&mut self) -> Result<(), GpuError> {

@@ -2464,6 +2464,95 @@ pub static DRAFT_SUMMARY: Kind = Kind {
     ],
 };
 
+/// The DSpark draft's acceptance by block position.
+pub static DRAFT_PROFILE: Kind = Kind {
+    name: "draft_profile",
+    head: "draft profile",
+    doc: "--accept-profile W under BLOOMERY_DRAFT=dspark: the block width, the rounds whose \
+          whole block lies inside the run's output (rounds), the blocks left out for lying past \
+          its end (cut), the rounds whose block id 0 matched the output (id0, over rounds and \
+          cut), and per block position 1..W the rounds that reached it (tried: the ids before \
+          it matched) and the rounds that matched through it (hit). Acceptance at position i is \
+          hit[i] / tried[i].",
+    parts: &[
+        key("width", U64, "ids"),
+        key("rounds", U64, "rounds"),
+        key("cut", U64, "rounds"),
+        key("id0", U64, "rounds"),
+        key("tried", Csv, "rounds"),
+        key("hit", Csv, "rounds"),
+    ],
+};
+
+/// The blocks a draft proposed, counted against the output the run produced:
+/// per block position, the rounds that reached it and the rounds that matched
+/// through it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptProfile {
+    rounds: usize,
+    cut: usize,
+    id0: usize,
+    tried: Vec<usize>,
+    hit: Vec<usize>,
+}
+
+impl AcceptProfile {
+    /// A profile of blocks `width` ids wide.
+    #[must_use]
+    pub fn new(width: usize) -> AcceptProfile {
+        AcceptProfile {
+            rounds: 0,
+            cut: 0,
+            id0: 0,
+            tried: vec![0; width],
+            hit: vec![0; width],
+        }
+    }
+
+    /// Count one round: `block` against `ahead`, the output's ids from the
+    /// first one the block predicts, in order. A block with an id past
+    /// `ahead`'s end is counted as cut and in no position. Otherwise position
+    /// `i` is tried when ids `0..i` matched and hit when id `i` matches too,
+    /// so the count stops at the first mismatch.
+    pub fn count(&mut self, block: &[u32], ahead: &[u32]) -> Result<(), String> {
+        let width = self.tried.len();
+        if block.len() != width {
+            return Err(format!(
+                "a block of {} ids in a profile of width {width}",
+                block.len()
+            ));
+        }
+        let Some(&first) = ahead.first() else {
+            return Err("a block with no output id after its last token".to_owned());
+        };
+        self.id0 += usize::from(block[0] == first);
+        if ahead.len() < width {
+            self.cut += 1;
+            return Ok(());
+        }
+        self.rounds += 1;
+        for (i, (b, a)) in block.iter().zip(ahead).enumerate() {
+            self.tried[i] += 1;
+            if b != a {
+                break;
+            }
+            self.hit[i] += 1;
+        }
+        Ok(())
+    }
+
+    /// The `draft profile` line.
+    pub fn record(&self) -> Record {
+        Record::new(&DRAFT_PROFILE)
+            .u("width", self.tried.len())
+            .u("rounds", self.rounds)
+            .u("cut", self.cut)
+            .u("id0", self.id0)
+            .csv("tried", &self.tried)
+            .csv("hit", &self.hit)
+    }
+}
+
 /// The MTP draft's join to a held sequence a prompt call continues.
 pub static MTP_PROMPT: Kind = Kind {
     name: "mtp_prompt",
@@ -3336,6 +3425,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &STAT_FINITE_FED,
     &STAT_FINITE_SUMMARY,
     &DRAFT_SUMMARY,
+    &DRAFT_PROFILE,
     &SMOKE,
     &RESIDENCY_LEVER,
     &RESIDENCY_HOST,
@@ -4211,6 +4301,42 @@ pub fn residency_reset(r: &ResetReport) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The profile counts a block's matching prefix only: a position is tried when the ids
+    /// before it matched, a block with an id past the output's end is cut, and position 1 is
+    /// tried by every counted round.
+    #[test]
+    fn accept_profile_counts_the_matching_prefix_of_blocks_inside_the_output() {
+        let mut p = AcceptProfile::new(3);
+        // All three ids match.
+        p.count(&[5, 6, 7], &[5, 6, 7, 9]).unwrap();
+        // Id 1 misses; id 2 would match, and is not counted.
+        p.count(&[5, 0, 7], &[5, 6, 7]).unwrap();
+        // Id 0 misses; ids 1 and 2 would match, and are not counted.
+        p.count(&[0, 6, 7], &[5, 6, 7]).unwrap();
+        // Past the output's end: cut, in no position.
+        p.count(&[5, 6, 7], &[5, 6]).unwrap();
+        p.count(&[5, 6, 7], &[5]).unwrap();
+        assert_eq!((p.rounds, p.cut, p.id0), (3, 2, 4));
+        assert_eq!(
+            p.tried[0], p.rounds,
+            "position 1 is tried by every counted round"
+        );
+        assert_eq!(
+            p.tried,
+            [3, 2, 1],
+            "a position is tried when the ids before it matched"
+        );
+        assert_eq!(p.hit, [2, 1, 1], "hits stop at the first mismatch");
+        assert!(
+            p.count(&[5, 6], &[5, 6, 7]).is_err(),
+            "a block of another width is refused"
+        );
+        assert!(
+            p.count(&[5, 6, 7], &[]).is_err(),
+            "a block with no output id after it is refused"
+        );
+    }
 
     /// `missing` names exactly the kinds of the group a list lacks, in the group's order.
     #[test]
