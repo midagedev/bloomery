@@ -20,10 +20,17 @@ def load_cap(idle_s):
         cpus = os.cpu_count() or 1
     else:
         load_avg = float(forced)
+        if not math.isfinite(load_avg) or load_avg < 0:
+            raise ValueError("BLOOMERY_SELFTEST_LOAD must be finite and nonnegative")
         ncpu = os.environ.get("BLOOMERY_SELFTEST_NCPU")
         cpus = int(ncpu) if ncpu is not None else (os.cpu_count() or 1)
+        if cpus <= 0:
+            raise ValueError("BLOOMERY_SELFTEST_NCPU must be positive")
     # PIN(2026-10-13): scale self-test caps with load per CPU to accommodate CPU contention.
-    return idle_s * max(1.0, load_avg / (cpus or 1))
+    cap = idle_s * max(1.0, load_avg / cpus)
+    if not math.isfinite(cap):
+        raise ValueError("self-test cap must be finite")
+    return cap
 
 
 def _constant_factor(idle_s):
@@ -74,6 +81,34 @@ def self_test():
         assert load_cap(10) == 10
     finally:
         os.getloadavg, os.cpu_count = real_load, real_cpus
+
+    def rejects(load, ncpu, idle, text):
+        saved = {key: os.environ.get(key) for key in ("BLOOMERY_SELFTEST_LOAD", "BLOOMERY_SELFTEST_NCPU")}
+        os.environ["BLOOMERY_SELFTEST_LOAD"] = load
+        if ncpu is None:
+            os.environ.pop("BLOOMERY_SELFTEST_NCPU", None)
+        else:
+            os.environ["BLOOMERY_SELFTEST_NCPU"] = ncpu
+        try:
+            try:
+                got = load_cap(idle)
+            except ValueError as err:
+                assert text in str(err), err
+                return
+            raise AssertionError("load_cap accepted %r ncpu %r -> %r" % (load, ncpu, got))
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    rejects("nan", "10", 20, "BLOOMERY_SELFTEST_LOAD must be finite and nonnegative")
+    rejects("inf", "10", 20, "BLOOMERY_SELFTEST_LOAD must be finite and nonnegative")
+    rejects("-1", "10", 20, "BLOOMERY_SELFTEST_LOAD must be finite and nonnegative")
+    rejects("80", "0", 20, "BLOOMERY_SELFTEST_NCPU must be positive")
+    rejects("80", "-3", 20, "BLOOMERY_SELFTEST_NCPU must be positive")
+    rejects("1e308", "1", 1e308, "self-test cap must be finite")
     print("selftest: self-test ok")
     return 0
 
