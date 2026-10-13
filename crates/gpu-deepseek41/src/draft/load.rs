@@ -666,29 +666,18 @@ impl DraftWeights {
     /// [`DraftWeights::q8`]'s planes, moved out: the layers no longer find
     /// them.
     fn take_q8(&mut self, name: String, k: usize, rows: usize) -> Result<Q8Rows, GpuError> {
+        self.q8(&name, k, rows)?;
         match self.dense.take(&name) {
-            Some(DevWeight::Q8_0 { qs, d, k: wk }) if wk == k && d.rows() == rows => {
-                Ok(Q8Rows { qs, d })
-            }
-            Some(DevWeight::Q8_0 { d, k: wk, .. }) => Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "{name} is {} rows of {wk}, the draft reads {rows} of {k}",
-                    d.rows()
-                ),
-            }),
+            Some(DevWeight::Q8_0 { qs, d, .. }) => Ok(Q8Rows { qs, d }),
             _ => Err(missing(name, "Q8_0 planes")),
         }
     }
 
-    /// [`DraftWeights::f32`]'s plane, moved out.
+    /// [`DraftWeights::f32`]'s plane, moved out. The shape check is `f32`'s.
     fn take_f32(&mut self, name: String, len: usize) -> Result<DeviceTensor<f32>, GpuError> {
+        self.f32(&name, len)?;
         match self.dense.take(&name) {
-            Some(DevWeight::F32 { w, .. }) if w.buf().len() == len => Ok(w),
-            Some(DevWeight::F32 { w, .. }) => Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!("{name} holds {} f32, the draft reads {len}", w.buf().len()),
-            }),
+            Some(DevWeight::F32 { w, .. }) => Ok(w),
             _ => Err(missing(name, "an f32 plane")),
         }
     }

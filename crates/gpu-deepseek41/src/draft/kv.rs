@@ -200,6 +200,17 @@ struct Layout {
     words: usize,
 }
 
+/// Words through the last used row of a grouped image's final field.
+pub(super) fn used_words(
+    rows: usize,
+    group_words: usize,
+    tail_word: usize,
+    row_words: usize,
+) -> usize {
+    let (full, rest) = (rows / GROUP, rows % GROUP);
+    full * group_words + if rest == 0 { 0 } else { tail_word + rest * row_words }
+}
+
 impl Layout {
     fn of(features: usize, rope_dims: usize) -> Layout {
         let slots = 0;
@@ -217,13 +228,7 @@ impl Layout {
     /// Words of the image an append of `n` rows reads: every full group,
     /// then the last group up to its last feature row.
     fn used(&self, n: usize) -> usize {
-        let (full, rest) = (n / GROUP, n % GROUP);
-        full * self.words
-            + if rest == 0 {
-                0
-            } else {
-                self.feat + rest * self.features
-            }
+        used_words(n, self.words, self.feat, self.features)
     }
 }
 

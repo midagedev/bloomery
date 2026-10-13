@@ -73,13 +73,7 @@ impl Layout {
     /// Words of the image an append of `n` rows reads: every full group,
     /// then the last group up to its last row's rope table.
     fn used(&self, n: usize) -> usize {
-        let (full, rest) = (n / GROUP, n % GROUP);
-        full * self.words
-            + if rest == 0 {
-                0
-            } else {
-                self.cs + rest * self.rope_dims
-            }
+        super::kv::used_words(n, self.words, self.cs, self.rope_dims)
     }
 }
 
