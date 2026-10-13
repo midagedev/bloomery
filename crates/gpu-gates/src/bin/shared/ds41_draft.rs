@@ -7,10 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use app::arch::deepseek41::CardDraft;
+use app::arch::deepseek41::{Ds41Draft, open_draft};
 use app::{Loaded, Session};
 use bloomery_gpu_deepseek41::body::Body;
-use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
@@ -77,13 +76,13 @@ pub fn open_dspark(
     what: &'static str,
     place: Place,
     reserve: Option<u64>,
-) -> Result<(CardDraft<DraftBody>, Record), GateError> {
+) -> Result<(Ds41Draft, Record), GateError> {
     let t = Instant::now();
     let card = dspark::draft_card(place)?;
     let (draft_split, hp) = file;
     let target =
         Arc::new(Split::open(target).map_err(|e| format!("open {}: {e}", target.display()))?);
-    let mut d = CardDraft::open(
+    let mut d = open_draft(
         loaded,
         draft_split,
         hp,
@@ -106,10 +105,7 @@ pub fn open_dspark(
     let mut r = Record::new(&record::LOAD_DRAFT)
         .w("draft", "dspark")
         .w("card", d.card())
-        .u(
-            "width",
-            <CardDraft<DraftBody> as runtime::Draft<Session<Body>>>::WIDTH,
-        )
+        .u("width", <Ds41Draft as runtime::Draft<Session<Body>>>::WIDTH)
         .list("target_layers", b.feature_layers().unwrap_or_default())
         .u("feature_width", b.feature_width())
         .u("resident", resident)

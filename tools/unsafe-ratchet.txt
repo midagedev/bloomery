@@ -220,6 +220,8 @@ gpu 1743 194 10
 # went to the gpu crate's mxfp4_sel.rs; the draft's router stays.
 # PIN(2026-10-11): gpu-deepseek41 412 -> 402 blocks and 46 -> 45 fns, the move above: the card sum and places entries
 # went to the gpu crate's card_slots.rs; the tier sums stay.
+# PIN(2026-10-13): gpu-deepseek41 402 -> 392 blocks and 45 -> 44 fns, the move above: the Markov kernel went to the gpu
+# crate's dspark/head.rs.
 gpu-deepseek41 392 44 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the

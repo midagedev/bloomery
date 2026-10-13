@@ -87,7 +87,7 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_cont
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
-use super::{HeadSource, Q8Rows, TargetHead};
+use super::{HeadSource, TargetHead};
 
 const WHAT: &str = "dspark::head";
 
@@ -702,30 +702,40 @@ impl Head {
         Head::LOGIT_LAUNCHES + 2 * m
     }
 
-    /// Device bytes of the weights and the buffers.
+    /// Device bytes of each weight buffer, as allocated: the norm's gain, the
+    /// projection (its planes, for a Q8_0 matrix), the two Markov tables,
+    /// then the draft-to-target map and the confidence projection when
+    /// present.
     #[must_use]
-    pub fn card_bytes(&self) -> u64 {
-        let tensor = |t: &DeviceTensor<u32>| t.buf().num_bytes();
-        let rows = |q: &Q8Rows| q.qs.buf().num_bytes() + q.d.buf().num_bytes();
-        let source = match &self.w.source {
-            HeadSource::Target(TargetHead::Q6K(w)) => tensor(w),
-            HeadSource::Target(TargetHead::Q8_0(q)) | HeadSource::Own(q) => rows(q),
-        };
-        let conf = self.w.conf.as_ref().map_or(0, |(c, _)| c.buf().num_bytes());
-        let to_target = self.w.to_target.as_ref().map_or(0, DeviceBuffer::num_bytes);
-        let own = self.normed.num_bytes()
+    pub fn weight_buffers(&self) -> Vec<u64> {
+        let tensor = |t: &DeviceTensor<u32>| t.buf().num_bytes() as u64;
+        let mut out = vec![self.w.norm.buf().num_bytes() as u64];
+        match &self.w.source {
+            HeadSource::Target(TargetHead::Q6K(w)) => out.push(tensor(w)),
+            HeadSource::Target(TargetHead::Q8_0(q)) | HeadSource::Own(q) => {
+                out.push(q.qs.buf().num_bytes() as u64);
+                out.push(q.d.buf().num_bytes() as u64);
+            }
+        }
+        out.push(tensor(&self.w.markov_w1));
+        out.push(tensor(&self.w.markov_w2));
+        out.extend(self.w.to_target.iter().map(|m| m.num_bytes() as u64));
+        out.extend(self.w.conf.iter().map(|(c, _)| c.buf().num_bytes() as u64));
+        out
+    }
+
+    /// Device bytes of the scratch, as allocated: the normed rows, the q8_1
+    /// rows of every row count, the logits, the argmax and probability
+    /// words and the ticket and stand-in words.
+    #[must_use]
+    pub fn scratch_bytes(&self) -> u64 {
+        (self.normed.num_bytes()
+            + self.acts.iter().map(Q8Act::device_bytes).sum::<usize>()
             + self.logits.num_bytes()
             + self.tok.num_bytes()
             + self.probs.num_bytes()
             + self.done.num_bytes()
-            + self.no_map.num_bytes();
-        (self.w.norm.buf().num_bytes()
-            + source
-            + tensor(&self.w.markov_w1)
-            + tensor(&self.w.markov_w2)
-            + conf
-            + to_target
-            + own) as u64
+            + self.no_map.num_bytes()) as u64
     }
 
     /// Refuse a row count the head holds no scratch for.
@@ -864,6 +874,12 @@ impl Head {
                 done: &mut self.done,
             },
         )
+    }
+
+    /// The `m` rows' normed input, token-major. Blocking; gate use.
+    pub fn normed_to_host(&self, stream: &CudaStream, m: usize) -> Result<Vec<f32>, GpuError> {
+        self.check(m)?;
+        Ok(self.normed.to_host_vec(stream)?[..m * self.hidden].to_vec())
     }
 
     /// The first `m` columns of the logits as the last launch left them:

@@ -16,14 +16,12 @@
 //! The file is checked against [`dspark::inventory`] before anything is
 //! uploaded: an absent, misshapen or unread tensor is refused by name.
 
-use std::sync::Arc;
-
 use bloomery_gpu::dspark::head::HeadWeights;
 use bloomery_gpu::dspark::{EmbedSource, FcWeights, HeadSource, Q8Rows, TargetHead};
 use bloomery_gpu::mxfp4_sel::MxStack;
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
-use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
+use bloomery_gpu::{DeviceTensor, GpuError};
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::names as target_names;
@@ -32,8 +30,6 @@ use model::arch::models::shape::{MoeShape, rules, select_router};
 use model::embed::RowLayout;
 use model::placement::CardFormat;
 
-use super::head::projection;
-use super::layers::V41Layers;
 use crate::experts_mxfp4::ROUTER_ROW;
 use crate::markov::MARKOV_ROW_WORDS;
 
@@ -123,14 +119,18 @@ pub struct Loaded {
 }
 
 /// The draft's weights on its card. See the module comment.
+///
+/// [`owner_inputs`] moves the tensors the common owner holds out of it: fc
+/// and the norms, the target's projection and the Markov tables. What stays
+/// is the layers' own.
 pub struct DraftWeights {
     hp: DraftHparams,
     /// Every draft tensor the GPU loader formats, by name.
     dense: Weights,
     /// The target's `output.weight`.
     head: Weights,
-    markov_w1: DeviceTensor<u32>,
-    markov_w2: DeviceTensor<u32>,
+    /// `markov_w1` and `markov_w2`; `None` once the owner holds them.
+    markov: Option<(DeviceTensor<u32>, DeviceTensor<u32>)>,
     /// The mask token's embedding row, the file's bytes as words
     /// ([`EmbdRows`]).
     mask_row: DeviceTensor<u32>,
@@ -513,9 +513,12 @@ impl DraftWeights {
             .mask_row
             .ok_or_else(|| missing(target_names::token_embd(), "loaded"))?;
         let buffers = allocation_order(&up.table, draft, &want, &inv.borrowed)?;
+        let markov = (
+            up.w1.ok_or_else(|| missing(names::markov_w1(), "loaded"))?,
+            up.w2.ok_or_else(|| missing(names::markov_w2(), "loaded"))?,
+        );
         Ok(DraftWeights {
-            markov_w1: up.w1.ok_or_else(|| missing(names::markov_w1(), "loaded"))?,
-            markov_w2: up.w2.ok_or_else(|| missing(names::markov_w2(), "loaded"))?,
+            markov: Some(markov),
             mask_row,
             embd,
             hp,
@@ -552,10 +555,24 @@ impl DraftWeights {
     /// ([`owner_held`]).
     #[must_use]
     pub fn layer_bytes(&self) -> u64 {
+        self.table_bytes(false)
+    }
+
+    /// Card bytes of the tensors [`owner_inputs`] hands the common owner, as
+    /// the load recorded them: what [`DraftWeights::layer_bytes`] leaves of
+    /// [`DraftWeights::buffers`]' sum.
+    #[must_use]
+    pub fn owner_bytes(&self) -> u64 {
+        self.table_bytes(true)
+    }
+
+    /// The bytes of the table's rows the owner holds (`owned`) or the layers
+    /// keep (`!owned`).
+    fn table_bytes(&self, owned: bool) -> u64 {
         let held = owner_held();
         self.table
             .iter()
-            .filter(|t| !held.contains(&t.name))
+            .filter(|t| held.contains(&t.name) == owned)
             .flat_map(|t| t.buffers.iter())
             .sum()
     }
@@ -567,9 +584,17 @@ impl DraftWeights {
     }
 
     /// `markov_w1` and `markov_w2`: `n_vocab` rows of `MARKOV_ROW_WORDS` words each.
+    ///
+    /// # Panics
+    ///
+    /// After [`owner_inputs`] moved the tables to the owner: nothing reads
+    /// them from here once the owner holds them.
     #[must_use]
     pub fn markov(&self) -> (&DeviceTensor<u32>, &DeviceTensor<u32>) {
-        (&self.markov_w1, &self.markov_w2)
+        match &self.markov {
+            Some((w1, w2)) => (w1, w2),
+            None => panic!("DraftWeights::markov: the Markov tables moved to the DSpark owner"),
+        }
     }
 
     /// The mask token's embedding row, [`EmbdRows::row_words`] words.
@@ -583,12 +608,6 @@ impl DraftWeights {
     #[must_use]
     pub fn embd_rows(&self) -> EmbdRows {
         self.embd
-    }
-
-    /// The target's head projection, resident as the GPU loader holds it.
-    #[must_use]
-    pub fn head(&self) -> &Weights {
-        &self.head
     }
 
     /// Draft tensor `name` as the GPU loader holds it; `None` for a tensor
@@ -643,6 +662,56 @@ impl DraftWeights {
     pub fn gain(&self, name: &str, len: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
         Ok(self.f32(name, len)?.buf())
     }
+
+    /// [`DraftWeights::q8`]'s planes, moved out: the layers no longer find
+    /// them.
+    fn take_q8(&mut self, name: String, k: usize, rows: usize) -> Result<Q8Rows, GpuError> {
+        match self.dense.take(&name) {
+            Some(DevWeight::Q8_0 { qs, d, k: wk }) if wk == k && d.rows() == rows => {
+                Ok(Q8Rows { qs, d })
+            }
+            Some(DevWeight::Q8_0 { d, k: wk, .. }) => Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "{name} is {} rows of {wk}, the draft reads {rows} of {k}",
+                    d.rows()
+                ),
+            }),
+            _ => Err(missing(name, "Q8_0 planes")),
+        }
+    }
+
+    /// [`DraftWeights::f32`]'s plane, moved out.
+    fn take_f32(&mut self, name: String, len: usize) -> Result<DeviceTensor<f32>, GpuError> {
+        match self.dense.take(&name) {
+            Some(DevWeight::F32 { w, .. }) if w.buf().len() == len => Ok(w),
+            Some(DevWeight::F32 { w, .. }) => Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("{name} holds {} f32, the draft reads {len}", w.buf().len()),
+            }),
+            _ => Err(missing(name, "an f32 plane")),
+        }
+    }
+
+    /// The target's Q6_K projection as the loader holds it, moved out.
+    fn take_projection(&mut self) -> Result<DeviceTensor<u32>, GpuError> {
+        let name = target_names::output();
+        match self.head.take(&name) {
+            Some(DevWeight::KQuant {
+                ty: GgmlType::Q6_K,
+                w,
+                ..
+            }) => Ok(w),
+            _ => Err(missing(name, "a resident Q6_K projection")),
+        }
+    }
+
+    /// The Markov tables, moved out.
+    fn take_markov(&mut self) -> Result<(DeviceTensor<u32>, DeviceTensor<u32>), GpuError> {
+        self.markov
+            .take()
+            .ok_or_else(|| missing(names::markov_w1(), "resident, not yet moved to the owner"))
+    }
 }
 
 /// The tensors of the draft the common DSpark owner holds: fc and the hidden
@@ -658,64 +727,32 @@ fn owner_held() -> [String; 6] {
     ]
 }
 
-/// A copy of `t` on `stream`'s card, complete once the stream is. The one
-/// place the owner's inputs are made from `DraftWeights`' own tensors: a
-/// `Weights` that gave its tensors up would turn each copy into a move.
-fn copy_tensor<T: DeviceCopy>(
-    stream: &CudaStream,
-    t: &DeviceTensor<T>,
-) -> Result<DeviceTensor<T>, GpuError> {
-    let mut out = DeviceTensor::zeroed(stream, t.rows(), t.cols())?;
-    out.buf_mut().copy_from_device_async(t.buf(), stream)?;
-    Ok(out)
-}
-
-/// `w`'s share of the common owner's inputs: fc and the hidden norm; the
-/// head's norm, the target's Q6_K projection and the Markov tables; the
-/// target as the block's embedding source. Load-time only.
+/// `w`'s share of the common owner's inputs, moved out of it: fc and the
+/// hidden norm; the head's norm, the target's Q6_K projection and the Markov
+/// tables; the target as the block's embedding source. The tensors stay on
+/// the card once, where the loader put them. A second call finds them gone
+/// and refuses by name. Load-time only.
 pub fn owner_inputs(
-    stream: &CudaStream,
-    w: &DraftWeights,
+    w: &mut DraftWeights,
 ) -> Result<(FcWeights, HeadWeights, EmbedSource), GpuError> {
-    let hp = w.hp();
-    let (qs, d) = w.q8(&names::fc(), hp.target_layers.len() * hp.n_embd, hp.n_embd)?;
+    let (n_embd, eps) = (w.hp.n_embd, w.hp.rms_eps);
+    let feat = w.hp.target_layers.len() * n_embd;
     let fc = FcWeights {
-        fc: Q8Rows {
-            qs: copy_tensor(stream, qs)?,
-            d: copy_tensor(stream, d)?,
-        },
-        norm: copy_tensor(stream, w.f32(&names::enc_output_norm(), hp.n_embd)?)?,
-        eps: hp.rms_eps,
+        fc: w.take_q8(names::fc(), feat, n_embd)?,
+        norm: w.take_f32(names::enc_output_norm(), n_embd)?,
+        eps,
     };
-    let (w1, w2) = w.markov();
+    let (markov_w1, markov_w2) = w.take_markov()?;
     let head = HeadWeights {
-        norm: copy_tensor(stream, w.f32(&names::output_norm(), hp.n_embd)?)?,
-        eps: hp.rms_eps,
-        source: HeadSource::Target(TargetHead {
-            w: copy_tensor(stream, projection(w)?)?,
-            ty: GgmlType::Q6_K,
-        }),
-        markov_w1: copy_tensor(stream, w1)?,
-        markov_w2: copy_tensor(stream, w2)?,
+        norm: w.take_f32(names::output_norm(), n_embd)?,
+        eps,
+        source: HeadSource::Target(TargetHead::Q6K(w.take_projection()?)),
+        markov_w1,
+        markov_w2,
         to_target: None,
         conf: None,
     };
-    stream.synchronize()?;
     Ok((fc, head, EmbedSource::Target))
-}
-
-/// Open V4.1's draft as the common owner's inputs: the layers over `weights`
-/// (the target's file `target` serves each block's first-id embedding row)
-/// and the owner's fc, head and embedding source ([`owner_inputs`]).
-/// Load-time only.
-pub fn open(
-    gpu: &Gpu,
-    weights: DraftWeights,
-    target: Arc<Split>,
-) -> Result<(V41Layers, FcWeights, HeadWeights, EmbedSource), GpuError> {
-    let (fc, head, embed) = owner_inputs(gpu.stream(), &weights)?;
-    let layers = V41Layers::new(gpu, weights, target)?;
-    Ok((layers, fc, head, embed))
 }
 
 /// Row `id` of the embedding `name` of `split`, `k` values: its file bytes

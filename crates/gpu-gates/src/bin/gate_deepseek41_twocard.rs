@@ -95,7 +95,7 @@ mod gate {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use app::arch::deepseek41::{CardDraft, Ds41Cfg};
+    use app::arch::deepseek41::{Ds41Cfg, Ds41Draft, open_draft};
     use app::{Loaded, OpenArgs, Session};
     use bloomery_gpu::host::batch::TierBatchStats;
     use bloomery_gpu::hybrid::PoisonKind;
@@ -104,7 +104,6 @@ mod gate {
     use bloomery_gpu_deepseek41::body::{
         Body, BodyMeta, DECODE_INPUT, Deepseek41Model, OpenCfg, PAIR_ROWS, PrefillMode,
     };
-    use bloomery_gpu_deepseek41::draft::DraftBody;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, ref_model_path};
     use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8};
@@ -259,7 +258,7 @@ mod gate {
         Ok(out)
     }
 
-    type Spec = Speculative<CardDraft<DraftBody>, PAIR_ROWS>;
+    type Spec = Speculative<Ds41Draft, PAIR_ROWS>;
 
     /// A load: the session and its draft.
     struct Opened {
@@ -361,7 +360,7 @@ mod gate {
     ) -> Result<Opened, GateError> {
         let target =
             Arc::new(Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?);
-        let d = CardDraft::open(
+        let d = open_draft(
             &mut loaded,
             &draft.0,
             &draft.1,

@@ -36,7 +36,8 @@ use bloomery_gpu::dspark::{DraftLayers, DsparkBody};
 use bloomery_gpu::model::ChainBody;
 use bloomery_gpu::{Gpu, GpuError};
 use cuda_core::CudaContext;
-use model::placement::workstation::DeviceId;
+use model::arch::dspark::DraftHeld;
+use model::placement::workstation::{DeviceId, GRANULE};
 use runtime::dspark::DsparkShape;
 use runtime::{Draft, TapNeed, Tapped, TappedPrompt, Target, Verify};
 
@@ -59,15 +60,21 @@ pub struct CardDspark<L: DraftLayers> {
     width: usize,
     /// Every position the target ran since the draft's reset reached it.
     follows: bool,
-    /// The device bytes the draft's load took on its card.
+    /// The draft's own device buffers, counted by the load.
+    held: DraftHeld,
+    /// [`CardDspark::resident_bytes`].
     resident: usize,
+    /// [`CardDspark::taken_bytes`].
+    taken: usize,
 }
 
 impl<L: DraftLayers> CardDspark<L> {
     /// The draft `body` on `gpu`, its card `card`, drafting for a target `B`
     /// whose context is `target` and whose verify pass runs
-    /// [`Verify::MAX_ROWS`] rows. `resident` is what the load took on the
-    /// card. Refused by name when a proposal that fills that verify is a
+    /// [`Verify::MAX_ROWS`] rows. `held` is the buffers the load allocated,
+    /// counted from the buffers themselves, and `taken` the card's free-bytes
+    /// loss around the load. Refused by name when a proposal that fills that
+    /// verify is a
     /// block wider than the layers hold, or the target's verify holds no
     /// proposal. `body` is built from `shape`; the target's taps are set at
     /// the first prompt call.
@@ -77,7 +84,8 @@ impl<L: DraftLayers> CardDspark<L> {
         target: Arc<CudaContext>,
         card: &'static str,
         shape: DsparkShape,
-        resident: usize,
+        held: DraftHeld,
+        taken: usize,
     ) -> Result<CardDspark<L>, SessionError>
     where
         B: ChainBody,
@@ -93,6 +101,9 @@ impl<L: DraftLayers> CardDspark<L> {
                 L::MAX_ROWS
             )));
         }
+        let resident = usize::try_from(held.resident(GRANULE)).map_err(|_| {
+            SessionError::Refused(format!("{WHAT}: the draft's resident bytes pass usize"))
+        })?;
         let tap = shape.taps.len() * shape.hidden;
         Ok(CardDspark {
             body,
@@ -103,16 +114,33 @@ impl<L: DraftLayers> CardDspark<L> {
             pending: Vec::with_capacity(L::APPEND_GROUP * tap),
             width: tap,
             follows: true,
+            held,
             resident,
+            taken,
         })
     }
 
-    /// The device bytes the draft's load took on its card: its weights,
-    /// buffers and captured graphs, read as the card's free bytes before and
-    /// after it.
+    /// The draft's resident bytes on its card: the buffers its load
+    /// allocated, the weights then the rings through the plan's allocator
+    /// model, and the working buffers. The captured graphs are not buffers
+    /// and are not in it.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         self.resident
+    }
+
+    /// The buffers the load allocated, counted from the buffers themselves.
+    #[must_use]
+    pub fn held(&self) -> &DraftHeld {
+        &self.held
+    }
+
+    /// The bytes the card's free memory lost around the load, graphs and
+    /// kernel modules included. A diagnostic: any other process's allocation
+    /// on the card in that window lands in it, so no refusal reads it.
+    #[must_use]
+    pub fn taken_bytes(&self) -> usize {
+        self.taken
     }
 
     /// The target now stands elsewhere than the positions the draft was fed
