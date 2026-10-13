@@ -29,7 +29,15 @@
 //!   [`THETA_WINDOW`], [`V_SCALE`]).
 //! - (p) one chain: the batch set's five tokens as five graph steps and as
 //!   five eager steps (the per-layer taps armed), each from a reset, leave
-//!   the same per-position tokens and logits bit for bit.
+//!   the same per-position tokens and logits bit for bit. Then 766 ids
+//!   prefilled and four decode steps, graph and eager each from a reset:
+//!   the logits equal bit for bit at positions 766, 767, 768 and 769.
+//! - (o) the oracle, in the one load: a `Rows::Plane` sequence
+//!   (`Body::new_seq_rows`) and the loaded ring take the same ids, the
+//!   stores exchanged by `swap_seq`, each run from a reset. The prompt is
+//!   4,096 ids in batches of [`T_MAX`], then 64 decode steps. The logits are
+//!   equal bit for bit at the prompt's last row (position 4,095) and at
+//!   every step (positions 4,096..4,159).
 //! - (c) free-running on the batch set: its five tokens as eager steps from a
 //!   reset, the last position's argmax equal to ik's `result_output` argmax,
 //!   or — named and counted, never silently — ours ik's runner-up with ik's
@@ -120,7 +128,7 @@
 //!   turns' least likely id is a first difference at a confident gap and the
 //!   clause is red.
 //!
-//! `--only s|p|c|t|b|slots|r` runs one clause on the load (`slots` and `r` on
+//! `--only s|p|o|c|t|b|slots|r` runs one clause on the load (`slots` and `r` on
 //! their own loads); `--step-sets short` takes
 //! (t)'s two 4-token sets only, `--step-sets long` the 1,024- and
 //! 4,096-position sets only, `--step-sets d1k` the 1,024-position one,
@@ -176,10 +184,10 @@ mod gate {
     use std::time::Instant;
 
     use app::Session;
-    use bloomery_gpu::GpuError;
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{Residency, SwapSource};
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::{GpuError, Slots};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::prompts::MARGIN_FLOOR;
     use bloomery_gpu_gates::record;
@@ -187,13 +195,13 @@ mod gate {
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
     use bloomery_gpu_mimo2::{
-        Body, Mimo2Model, PrefillMode, T_MAX, feed, prefill_group, prompt_bytes, set_prefill,
-        set_prefill_group, set_taps,
+        Body, Mimo2Model, PrefillMode, T_MAX, feed, prefill, prefill_group, prompt_bytes,
+        set_prefill, set_prefill_group, set_taps,
     };
     use bloomery_levers::{CARD_BUDGET, ResidencyAt, ResidencyWhy};
     use cuda_core::sys;
     use gguf::Split;
-    use model::arch::mimo2::place::PlanInputs;
+    use model::arch::mimo2::place::{PlanInputs, Rows};
     use model::arch::mimo2::program::{AttnArgs, step_launches};
     use model::arch::models::Mixer;
     use model::placement::PlanLevers;
@@ -469,6 +477,151 @@ mod gate {
             verdict(ok)
         );
         ok
+    }
+
+    /// Ids `1..=n`. Both arms of a compare take this sequence. It is not an
+    /// oracle shard: (o) and the wrap compare our two runs with each other.
+    fn seq_ids(n: usize) -> Vec<u32> {
+        (1..=n).map(|i| i as u32).collect()
+    }
+
+    /// Positions prefilled before (p)'s wrap. The next four decode steps are
+    /// 766, 767, 768 and 769, and 768 is the first whose key row is
+    /// `p mod 768 = 0`.
+    const WRAP_PREFILL: usize = 766;
+
+    /// Graph against eager across the ring wrap. The prefill is batches, not
+    /// the step graph. One step graph is captured on the first decode step
+    /// and replayed for the next three; the position is written outside the
+    /// capture and the ring kernel reads it. The window at 768 is positions
+    /// 641..=768, which does not read the key from position 0 that row 0
+    /// then holds. Predicted before the gate runs: the four logit rows are
+    /// equal bit for bit.
+    fn wrap_chain(m: &mut Mimo2Model) -> Result<bool, GateError> {
+        let ids = seq_ids(WRAP_PREFILL + 4);
+        // A step graph captured on the five-token chain addresses that
+        // chain. Drop it so the wrap records its own, on these stores.
+        m.set_mode(StepMode::Eager);
+        let graph = run_wrap(m, &ids, StepMode::Graph)?;
+        let eager = run_wrap(m, &ids, StepMode::Eager)?;
+        let rows = graph.len() == 4
+            && eager.len() == 4
+            && graph.iter().zip(&eager).all(|(a, b)| same_bits(a, b));
+        println!(
+            "wrap: {WRAP_PREFILL} ids prefilled, then decode positions 766 767 768 769; graph \
+             and eager logits bit for bit {rows} {}",
+            verdict(rows)
+        );
+        Ok(rows)
+    }
+
+    /// `ids` from a reset: the first [`WRAP_PREFILL`] as one prefill, then
+    /// one decode step per id after it. Taps stay off; a prompt batch
+    /// refuses them. The mode on return is graph, captures dropped when this
+    /// run was eager.
+    fn run_wrap(
+        m: &mut Mimo2Model,
+        ids: &[u32],
+        mode: StepMode,
+    ) -> Result<Vec<Vec<f32>>, GateError> {
+        m.reset()?;
+        set_taps(m, false)?;
+        m.set_mode(mode);
+        prefill(m, &ids[..WRAP_PREFILL])?;
+        let at = m.pos();
+        if at != WRAP_PREFILL as u32 {
+            return Err(format!("wrap: a prefill of {WRAP_PREFILL} stands at {at}").into());
+        }
+        let mut logits = Vec::with_capacity(4);
+        for &t in &ids[WRAP_PREFILL..] {
+            m.step(&[t])?;
+            logits.push(m.logits()?);
+        }
+        set_taps(m, false)?;
+        m.set_mode(StepMode::Graph);
+        Ok(logits)
+    }
+
+    /// The oracle's prompt, then its decode steps. 4,096 + 64 = [`CTX`].
+    const ORACLE_PROMPT: usize = 4_096;
+    const ORACLE_STEPS: usize = 64;
+
+    /// (o). One load. The live sequence is the ring. `new_seq_rows(Plane)`
+    /// is the other sequence, outside the plan's held count (`new_seq`
+    /// refuses past the one sequence this load plans). `swap_seq` exchanges
+    /// store pointers and not the position, so each run resets first. Both
+    /// runs are eager: a captured step replays the stores it recorded, and a
+    /// swap would leave that graph on the other sequence.
+    ///
+    /// Predicted before the gate runs: the 65 logit rows are equal bit for
+    /// bit. A window flash of a 512-row batch needs `rows >= 128 + 512 - 1`
+    /// = 639. The ring is 768, so the oldest key it keeps (`p0 + 512 - 768`)
+    /// is at or before the first row's read (`p0 - 127`). Full layers have
+    /// `rows == ctx` on both sequences and stay on the plane kernels.
+    ///
+    /// A ring of 638 rows (`window + batch - 2`) is refused by name on the
+    /// first window flash of the first batch, `need rows >= window + m - 1 =
+    /// 639`, before any logit. The check does not look at the position.
+    /// Position 512 is the first row that would lose a key if that refusal
+    /// were absent: the second batch would keep from 386 while its first row
+    /// reads 385. Comparing the prompt's last row and the decode steps would
+    /// stay green under that mutant, because the lost key has scrolled out
+    /// of the window by then. The refusal stays.
+    fn oracle(m: &mut Mimo2Model) -> Result<bool, GateError> {
+        let ids = seq_ids(ORACLE_PROMPT + ORACLE_STEPS);
+        let (prompt, steps) = ids.split_at(ORACLE_PROMPT);
+        m.set_mode(StepMode::Eager);
+        set_taps(m, false)?;
+        let ring = run_oracle(m, prompt, steps)?;
+        let mut parked = {
+            let (gpu, _, body) = m.body_parts("(o)")?;
+            let mut seq = body.new_seq_rows(gpu, Rows::Plane)?;
+            body.swap_seq(gpu, &mut seq)?;
+            seq
+        };
+        let plane = run_oracle(m, prompt, steps);
+        {
+            let (gpu, _, body) = m.body_parts("(o)")?;
+            body.swap_seq(gpu, &mut parked)?;
+        }
+        m.set_mode(StepMode::Graph);
+        let plane = plane?;
+        let n = 1 + ORACLE_STEPS;
+        let rows = ring.len() == n
+            && plane.len() == n
+            && ring.iter().zip(&plane).all(|(a, b)| same_bits(a, b));
+        println!(
+            "oracle: one load, plane beside the ring, {ORACLE_PROMPT} ids in batches of {T_MAX} \
+             then {ORACLE_STEPS} steps; logits bit for bit at position {} and the {ORACLE_STEPS} \
+             steps ({n} rows) {rows} {}",
+            ORACLE_PROMPT - 1,
+            verdict(rows)
+        );
+        Ok(rows)
+    }
+
+    /// The prompt's last-row logits, then one row per decode step, from a
+    /// reset. Eager, taps off.
+    fn run_oracle(
+        m: &mut Mimo2Model,
+        prompt: &[u32],
+        steps: &[u32],
+    ) -> Result<Vec<Vec<f32>>, GateError> {
+        m.reset()?;
+        set_taps(m, false)?;
+        m.set_mode(StepMode::Eager);
+        prefill(m, prompt)?;
+        let at = m.pos();
+        if at != ORACLE_PROMPT as u32 {
+            return Err(format!("oracle: a prefill of {ORACLE_PROMPT} stands at {at}").into());
+        }
+        let mut logits = Vec::with_capacity(1 + steps.len());
+        logits.push(m.logits()?);
+        for &t in steps {
+            m.step(&[t])?;
+            logits.push(m.logits()?);
+        }
+        Ok(logits)
     }
 
     /// The set holds every tensor the gate compares with ik's: each layer's
@@ -1502,6 +1655,8 @@ mod gate {
         All,
         S,
         P,
+        /// The plane-beside-ring oracle ([`oracle`]).
+        O,
         C,
         T,
         B,
@@ -1546,19 +1701,22 @@ mod gate {
         }
     }
 
-    /// `--only s|p|c|t|b|slots|r`, or every clause.
+    /// `--only s|p|o|c|t|b|slots|r`, or every clause.
     fn only() -> Result<Only, GateError> {
         match word_after("--only") {
             None => Ok(Only::All),
             Some(w) => match w.as_deref() {
                 Some("s") => Ok(Only::S),
                 Some("p") => Ok(Only::P),
+                Some("o") => Ok(Only::O),
                 Some("c") => Ok(Only::C),
                 Some("t") => Ok(Only::T),
                 Some("b") => Ok(Only::B),
                 Some("slots") => Ok(Only::Slots),
                 Some("r") => Ok(Only::Residency),
-                other => Err(format!("--only is s, p, c, t, b, slots or r, not {other:?}").into()),
+                other => {
+                    Err(format!("--only is s, p, o, c, t, b, slots or r, not {other:?}").into())
+                }
             },
         }
     }
@@ -1623,7 +1781,13 @@ mod gate {
             let graph = run_steps(m, &toks, StepMode::Graph)?;
             let eager = run_steps(m, &toks, StepMode::Eager)?;
             ok &= one_chain(&graph, &eager);
+            ok &= wrap_chain(m)?;
             elapsed("(p)", &t);
+        }
+        if matches!(only, Only::All | Only::O) {
+            let t = Instant::now();
+            ok &= oracle(m)?;
+            elapsed("(o)", &t);
         }
         if matches!(only, Only::All | Only::C) {
             let t = Instant::now();
