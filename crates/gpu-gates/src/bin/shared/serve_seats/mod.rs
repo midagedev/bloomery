@@ -13,7 +13,8 @@
 //! `generate_qwen3moe` opens them; [`mimo2`] the MiMo-V2.6-Flash seat, whose
 //! every routed expert sits on the host, opened as `gate_mimo2_e2e` opens it.
 //! `drafted` is the
-//! seats' shared MTP draft driver, one file a seat's per-model binary
+//! seats' shared MTP draft driver and `served` the owner of the DSpark draft
+//! the V4.1 and qwen3 seats serve, each one file a seat's per-model binary
 //! includes beside the seat. The seats' shared `--ctx` rules (the search
 //! bisection, the default slot context — the fit and the expert margin — and
 //! the slot count a set `--ctx` buys: one slot at the whole context while
@@ -21,10 +22,14 @@
 
 #[cfg(feature = "deepseek41")]
 mod drafted;
+// The seats' one owner of the draft a seat serves besides the MTP one: the
+// DSpark draft, its slot rule and the draft word (`served::ServedDraft`).
 #[cfg(feature = "deepseek41")]
 pub mod ds41;
 #[cfg(feature = "glm5next")]
 pub mod glm;
+#[cfg(feature = "deepseek41")]
+mod served;
 // The qwen38 seat runs no V4.1 code, but the server surface it sits on —
 // `bind` and the `serve` and `sampler` crates — is scoped to `deepseek41`,
 // as its per-model binary's doc says.
