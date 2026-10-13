@@ -78,8 +78,8 @@ const TENSORS: &[&str] = &[
 
 // PIN(2026-10-07): the KV cache the description asks a layer to hold, in values a position: the
 // full layers' 4 heads of 320 (key 192 + value 128; 2 B/value in the f16 cache) and the window
-// layers' 8 — every layer a plane of the whole context, its window bounding what a query reads,
-// not what the layer holds.
+// layers' 8. The values a position stay these. How many rows a window layer holds is the ring
+// pin on the plan, not this list.
 const KV: &[&str] = &[
     "kv 4x320 values: 0,5,11,17,23,29,35,41,47",
     "kv 8x320 values: 1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46",
@@ -147,6 +147,25 @@ fn hw_mimo2_spec() {
         &spec_view::items(&list),
         COVERAGE,
     );
+    // PIN(2026-10-13): a prompt call writes every position on the nine full layers and only the
+    // window on the other thirty-nine. The full layers are 0, 5, 11, 17, 23, 29, 35, 41, 47.
+    // Mapping a window layer's GQA store back to a positional store turns this list into every layer.
+    let full = vec![0usize, 5, 11, 17, 23, 29, 35, 41, 47];
+    let every: Vec<usize> = read
+        .spec
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, layer)| runtime::state::every_position(layer))
+        .map(|(i, _)| i)
+        .collect();
+    row(
+        &mut o,
+        &mut b,
+        "layers written at every position",
+        every,
+        full,
+    );
     println!("{o}");
     assert!(
         b.is_empty(),
@@ -178,12 +197,24 @@ fn hw_mimo2_spec() {
 // experts fewer (the allocator's 2 MiB granules over the 391 or so uploads, 782 MiB at their worst):
 // 1,203 and 3,118. The count the plan makes is printed, and the card's and the host's expert bytes
 // are N and 12,032 − N experts of the bytes above.
+// PIN(2026-10-13): the engine default is the ring. A full layer is 23,040 B a position
+// (9 × 4 heads × 320 × 2) and a window layer 199,680 B (39 × 8 × 320 × 2). At one position
+// the ring is the context, so the 222,720 B pin holds. At context 4,160 the ring is 768 rows
+// (`ring_rows(128, 4160)`), and one sequence is 4,160 × 23,040 + 768 × 199,680 = 249,200,640 B
+// [derived]. The plane term stays 4,160 × 222,720 = 926,515,200 B. The window bytes the ring
+// frees are (4,160 − 768) × 199,680 = 677,314,560, which is 50 experts of 13,369,344 plus a
+// remainder 8,847,360. That remainder crosses one more expert on both of the 2026-10-10
+// numerators, so the floors rise by 51, to 1,315 and 3,230, not by 50. The granule band stays
+// the same 61: the ring shrinks the window buffers and does not drop an upload, so the lows
+// are 1,254 and 3,169. The plane bounds above are not replaced.
 /// The plan of the RL file onto the gate machine and onto the A6000's: what
 /// `arch::mimo2::place::PlanInputs` resolves for the file the spec test
 /// reads — the routed experts on the card as far as its budget holds them
-/// (every routed layer's prefix) and the rest on the host, every layer's KV
-/// planes full — and the plan's named refusals: a machine that hangs an
-/// expert tier card and a context of no position.
+/// (every routed layer's prefix) and the rest on the host. The engine default
+/// keeps a window layer on the ring and a full layer on the plane; the same
+/// plan with `Rows::Plane` keeps today's full-plane KV pins. The named
+/// refusals stay: a machine that hangs an expert tier card, and a context of
+/// no position.
 #[test]
 #[ignore = "needs the MiMo-V2.6-Flash-RL shards on the box (just gate-mimo2-meta)"]
 fn hw_mimo2_plan() {
@@ -205,6 +236,9 @@ fn hw_mimo2_plan() {
     let layers = inputs.hp.n_trunk;
     let ctx: u64 = 4160;
     let _ = writeln!(o, "file {MIMO}, {layers} trunk layers, ctx {ctx}");
+    // `describe` leaves the ring on. At one position that ring is the context, so dropping
+    // `ring_rows`'s `min(ctx, …)` turns this pin red. At the gate context the ring is the
+    // two-term figure, and the plane term is today's product.
     row(
         &mut o,
         &mut b,
@@ -212,79 +246,102 @@ fn hw_mimo2_plan() {
         inputs.kv.bytes(0..layers, 1),
         222_720,
     );
-    for (name, machine, bound) in [
-        (
-            "gate machine (the 3090's bytes)",
-            workstation::plan_gate(layers),
-            1_203..=1_264,
-        ),
-        (
-            "A6000 (the default place)",
-            workstation::plan_a(layers),
-            3_118..=3_179,
-        ),
-    ] {
-        let plan = inputs
-            .plan(&machine, ctx, &PlanLevers::default())
-            .unwrap_or_else(|e| panic!("plan on the {name} at ctx {ctx}: {e}"));
-        let card = &plan.cards[0];
-        let n: u64 = plan.n_l.iter().sum();
-        let _ = writeln!(o, "{name}: n_l {:?}", plan.n_l);
-        row(
-            &mut o,
-            &mut b,
-            "card dense bytes",
-            card.dense_bytes,
-            5_839_528_704,
-        );
-        row(
-            &mut o,
-            &mut b,
-            "card kv bytes",
-            card.kv_bytes,
-            ctx * 222_720,
-        );
-        let held = (bound.contains(&n), format!("{n} in {bound:?}"));
-        row(
-            &mut o,
-            &mut b,
-            "card experts inside the budget's bound",
-            held.0,
-            true,
-        );
-        let _ = writeln!(o, "  card experts {}", held.1);
-        let spread = plan.n_l[0] == 0
-            && plan.n_l[1..].windows(2).all(|w| w[0] >= w[1])
-            && plan.n_l[1] - plan.n_l[layers - 1] <= 1
-            && plan.n_l[layers - 1] >= 1;
-        row(
-            &mut o,
-            &mut b,
-            "dense layer none, routed counts even",
-            spread,
-            true,
-        );
-        row(
-            &mut o,
-            &mut b,
-            "card expert bytes",
-            card.expert_bytes,
-            n * EXPERT_BYTES,
-        );
-        row(
-            &mut o,
-            &mut b,
-            "host routed bytes",
-            plan.host.expert_bytes,
-            (ROUTED - n) * EXPERT_BYTES,
-        );
-        row(
-            &mut o,
-            &mut b,
-            "host table bytes (the embedding)",
-            plan.host.table_bytes,
-            664_010_752,
-        );
+    row(
+        &mut o,
+        &mut b,
+        "ring kv bytes at the gate context",
+        inputs.kv.bytes(0..layers, ctx),
+        249_200_640,
+    );
+    let mut plane = inputs.clone();
+    plane.kv = model::arch::mimo2::place::KvLayout::with_rows(
+        &inputs.hp,
+        model::arch::mimo2::place::Rows::Plane,
+    );
+    row(
+        &mut o,
+        &mut b,
+        "plane kv bytes at the gate context",
+        plane.kv.bytes(0..layers, ctx),
+        ctx * 222_720,
+    );
+    {
+        let mut check = |term: &model::arch::mimo2::place::PlanInputs,
+                         which: &str,
+                         kv_want: u64,
+                         gate_bound: std::ops::RangeInclusive<u64>,
+                         a6000_bound: std::ops::RangeInclusive<u64>| {
+            for (name, machine, bound) in [
+                (
+                    format!("gate machine (the 3090's bytes), {which}"),
+                    workstation::plan_gate(layers),
+                    gate_bound,
+                ),
+                (
+                    format!("A6000 (the default place), {which}"),
+                    workstation::plan_a(layers),
+                    a6000_bound,
+                ),
+            ] {
+                let plan = term
+                    .plan(&machine, ctx, &PlanLevers::default())
+                    .unwrap_or_else(|e| panic!("plan on the {name} at ctx {ctx}: {e}"));
+                let card = &plan.cards[0];
+                let n: u64 = plan.n_l.iter().sum();
+                let _ = writeln!(o, "{name}: n_l {:?}", plan.n_l);
+                row(
+                    &mut o,
+                    &mut b,
+                    "card dense bytes",
+                    card.dense_bytes,
+                    5_839_528_704,
+                );
+                row(&mut o, &mut b, "card kv bytes", card.kv_bytes, kv_want);
+                let held = (bound.contains(&n), format!("{n} in {bound:?}"));
+                row(
+                    &mut o,
+                    &mut b,
+                    "card experts inside the budget's bound",
+                    held.0,
+                    true,
+                );
+                let _ = writeln!(o, "  card experts {}", held.1);
+                let spread = plan.n_l[0] == 0
+                    && plan.n_l[1..].windows(2).all(|w| w[0] >= w[1])
+                    && plan.n_l[1] - plan.n_l[layers - 1] <= 1
+                    && plan.n_l[layers - 1] >= 1;
+                row(
+                    &mut o,
+                    &mut b,
+                    "dense layer none, routed counts even",
+                    spread,
+                    true,
+                );
+                row(
+                    &mut o,
+                    &mut b,
+                    "card expert bytes",
+                    card.expert_bytes,
+                    n * EXPERT_BYTES,
+                );
+                row(
+                    &mut o,
+                    &mut b,
+                    "host routed bytes",
+                    plan.host.expert_bytes,
+                    (ROUTED - n) * EXPERT_BYTES,
+                );
+                row(
+                    &mut o,
+                    &mut b,
+                    "host table bytes (the embedding)",
+                    plan.host.table_bytes,
+                    664_010_752,
+                );
+            }
+        };
+        check(&plane, "plane", ctx * 222_720, 1_203..=1_264, 3_118..=3_179);
+        check(&inputs, "ring", 249_200_640, 1_254..=1_315, 3_169..=3_230);
     }
     let machine = workstation::plan_gate(layers);
     let mut tiered = workstation::plan_gate(layers);

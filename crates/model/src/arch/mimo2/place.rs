@@ -449,6 +449,36 @@ mod tests {
         assert!(super::cut_depth_keeps(1_000, filled, 9, 8));
     }
 
+    /// The published MiMo trunk: nine full layers of 4 KV heads and thirty-nine
+    /// window layers of 8, each value 320 f16 bytes a head. A position is
+    /// 222,720 B on either term, because the ring is the context. At the gate
+    /// context the plane is that figure times 4,160 and the ring is the full
+    /// layers' plane plus 768 window rows.
+    #[test]
+    fn the_ring_bytes_at_the_gate_context() {
+        let full = [0usize, 5, 11, 17, 23, 29, 35, 41, 47];
+        let mut kv_heads = vec![8usize; 48];
+        let mut windows = vec![Some(128u64); 48];
+        for &layer in &full {
+            kv_heads[layer] = 4;
+            windows[layer] = None;
+        }
+        let row = (192 + 128) as u64 * super::F16_BYTES;
+        let layout = |rows: Rows| KvLayout {
+            kv_heads: kv_heads.clone(),
+            windows: windows.clone(),
+            row,
+            rows,
+        };
+        let plane = layout(Rows::Plane);
+        let ring = layout(Rows::Ring);
+        assert_eq!(plane.bytes(0..48, 1), 222_720);
+        assert_eq!(ring.bytes(0..48, 1), 222_720);
+        assert_eq!(plane.bytes(0..48, 4_160), 4_160 * 222_720);
+        assert_eq!(ring.bytes(0..48, 4_160), 249_200_640);
+        assert_eq!(super::ring_rows(128, 4_160), 768);
+    }
+
     /// One sequence's terms are the layout's stores over the trunk with
     /// nothing beside them, and `slots` sequences count each layer `slots`
     /// times — the card's kv class of a load that serves them.
