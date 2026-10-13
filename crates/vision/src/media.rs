@@ -9,6 +9,7 @@
 //! code holds no branch per model. The expansion of a tokenized prompt's placeholders into spans
 //! ([`expand_spans`]) is common too: the server's chat path and Clef's decision encoder share it.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::{Patches, Rgb8, VisionError};
@@ -37,8 +38,15 @@ pub struct Prepared {
 
 /// A model's image input, as data plus one prepare.
 pub trait MediaModel {
-    /// The placeholder text the chat template carries for one image.
-    fn image_placeholder(&self) -> &str;
+    /// The placeholder text the chat template carries for the image at `index`: its position
+    /// among all the images of the prompt, from 0, in the order of the images. A model that
+    /// numbers its images writes the number into the text; one that does not ignores it.
+    fn image_placeholder(&self, index: usize) -> Cow<'_, str>;
+
+    /// The text every placeholder carries whatever its index, which the tokenizer reads as the
+    /// image token: the whole placeholder for a model that does not number its images. A message's
+    /// own text may not carry it, for it would make an image slot no image pairs with.
+    fn image_marker(&self) -> &str;
 
     /// The id [`expand_spans`] finds in the tokenized prompt and expands to one copy
     /// per position of the image ([`Prepared::span_len`]): the one id V4.1's placeholder
