@@ -220,27 +220,32 @@ impl BesideDraft {
                 self.arch
             ),
         };
-        let mut out = Vec::new();
-        let name = Path::new(path).file_name();
-        if let (Some(name), Some(dir)) = (name, target.parent()) {
-            out.push(dir.join(name));
-            // One condition, so this is not a nested if. The lint ratchet
-            // counts the warning, and it is not raised for this.
-            if let Some(resolved) = target
-                .canonicalize()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-                .filter(|resolved| resolved.as_path() != dir)
-            {
-                out.push(resolved.join(name));
-            }
-        }
+        let mut out: Vec<_> = beside_paths(path, target).collect();
         let family = PathBuf::from(path);
-        if !out.iter().any(|p| p == &family) {
+        if !out.contains(&family) {
             out.push(family);
         }
         out
     }
+}
+
+/// Beside paths in the pick's order: the draft's name in the target's
+/// directory, then that name in the resolved directory when it differs.
+/// [`BesideDraft::places`] and [`pick_path`] both walk this, so a search
+/// change is one edit and the off line names the paths the pick checks.
+fn beside_paths<'a>(path: &'static str, target: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
+    let name = Path::new(path).file_name();
+    let unresolved = target.parent();
+    let first = unresolved.and_then(|dir| name.map(|n| dir.join(n)));
+    let resolved = std::iter::once_with(move || {
+        let resolved = target.canonicalize().ok()?;
+        resolved
+            .parent()
+            .filter(|dir| Some(*dir) != unresolved)
+            .and_then(|dir| name.map(|n| dir.join(n)))
+    })
+    .flatten();
+    first.into_iter().chain(resolved)
 }
 
 /// [`BesideDraft::pick`]'s rule over one path.
@@ -248,17 +253,7 @@ fn pick_path(path: &'static str, set: Option<&Path>, target: &Path) -> (PathBuf,
     if let Some(p) = set {
         return (p.to_path_buf(), DraftFrom::Lever);
     }
-    let name = Path::new(path).file_name();
-    let named_in = |dir: &Path| name.map(|n| dir.join(n)).filter(|p| p.is_file());
-    let unresolved = target.parent();
-    let beside = unresolved.and_then(named_in).or_else(|| {
-        let resolved = target.canonicalize().ok()?;
-        resolved
-            .parent()
-            .filter(|dir| Some(*dir) != unresolved)
-            .and_then(named_in)
-    });
-    match beside {
+    match beside_paths(path, target).find(|p| p.is_file()) {
         Some(p) => (p, DraftFrom::Beside),
         None => (PathBuf::from(path), DraftFrom::Family),
     }

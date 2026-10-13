@@ -1155,6 +1155,16 @@ fn draft38_unset_follows_the_place_and_the_file() {
     ] {
         assert_eq!(draft38_unset(&at), want, "{at:?}");
     }
+    // A caller that already walked the pick supplies that list. An empty
+    // `looked` is the one-path fallback above; this is the other branch.
+    let paths = vec![PathBuf::from("/links/mtp.gguf"), file.to_path_buf()];
+    assert_eq!(
+        draft38_unset(&Draft38At {
+            looked: &paths,
+            ..at(true, false, false, false, 1)
+        }),
+        Some(Draft38Off::NoFile(paths.clone()))
+    );
     assert_eq!(
         Draft38Off::NoFile(vec![file.to_path_buf()]).to_string(),
         "no file at /models/q/mtp.gguf"
