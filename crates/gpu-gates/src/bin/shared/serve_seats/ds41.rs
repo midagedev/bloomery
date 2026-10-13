@@ -149,6 +149,9 @@
 //! `/metrics` their sums,
 //! and `/props`' `engine.draft` names the draft (its kind, file and device),
 //! whose card's placement row holds its resident bytes as the class `draft`.
+//! The DSpark arm of every one of these calls, the draft word and the slot
+//! rule are `served`'s, the serve seats' one owner of the draft; the lookup
+//! arm stays here, since it reads the V4.1 body's token history.
 //!
 //! The prompt cache under the DSpark draft: the draft keeps no state of its
 //! own worth saving — its window ring is a function of the last
@@ -192,6 +195,7 @@ use std::time::{Duration, Instant};
 
 use app::arch::deepseek41::{CardDraft, Ds41Cfg};
 use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
+use bloomery_gpu::GpuError;
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{Slots, StepMode};
@@ -200,7 +204,7 @@ use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
-    bind_server, model_props, nvidia_smi_index, parallel_line, placement_of,
+    bind_server, model_props, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -211,15 +215,15 @@ use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::dspark::DraftHparams;
-use model::placement::workstation::{self, HostNeed, TierBatchBytes};
+use model::placement::workstation::{self, DeviceId, HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
-use runtime::width::{Choosing, Chosen, Mode as WidthMode};
-use runtime::{Committed, Draft as RtDraft, Lookup, Speculative, Target, Want};
+use runtime::width::{Choosing, Mode as WidthMode};
+use runtime::{Lookup, Speculative, Target, Want};
 use serve::flag::{CTX, number};
 use serve::{
-    CacheNote, DeviceProps, DraftProps, Drafted, EngineError, EngineProps, PlacementProps,
-    ResidencyReset, Saved, ServeError, StateError,
+    CacheNote, DraftProps, Drafted, EngineError, EngineProps, PlacementProps, ResidencyReset,
+    Saved, ServeError, StateError,
 };
 use tokenizer::Tokenizer;
 
@@ -232,6 +236,7 @@ use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
 use vision_seat::{Opened, PleImage, TextFacts};
 
+use super::served::{self, ServedDraft, Spark};
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
 
@@ -252,9 +257,6 @@ pub const USER_START: &str = "<｜User｜>";
 /// start: below it the cut's second call costs more than the prefix a
 /// later request keeps saves.
 const SPLIT_MIN: usize = 64;
-
-/// The class `/props` files the draft's resident bytes under.
-const DRAFT_CLASS: &str = "draft";
 
 struct Args {
     host: String,
@@ -351,28 +353,22 @@ fn mib_bytes(flag: &str, v: &str) -> Result<u64, GateError> {
 
 /// The resident sequences the seat serves and what set the count:
 /// `parallel` (`--parallel`) as given, else [`SLOTS`] — one under the DSpark
-/// draft, whose window is one sequence's on its own card, and one under a
-/// route trace (`traced`), which records one sequence's steps. Several under
-/// the DSpark draft are refused by name here; under a route trace,
-/// [`route_trace`] refuses them.
+/// draft, whose window is one sequence's on its own card
+/// ([`served::draft_slots`], which refuses several under it by name), and one
+/// under a route trace (`traced`), which records one sequence's steps; under a
+/// route trace, [`route_trace`] refuses several.
 fn slot_count(
     parallel: Option<usize>,
     draft: Draft,
     traced: bool,
 ) -> Result<(NonZeroUsize, SlotsFrom), GateError> {
-    let (n, from) = match parallel {
-        Some(n) if n > 1 && draft == Draft::Dspark => {
-            return Err(format!(
-                "--parallel {n} under BLOOMERY_DRAFT=dspark: the draft's window is one \
-                 sequence's, on its own card, and a select would start it over; serve one \
-                 slot, or the lookup draft"
-            )
-            .into());
-        }
-        Some(n) => (n, SlotsFrom::Flag),
-        None if draft == Draft::Dspark => (1, SlotsFrom::Dspark),
-        None if traced => (1, SlotsFrom::RouteTrace),
-        None => (SLOTS, SlotsFrom::Default),
+    let (n, from) = match served::draft_slots(parallel, draft, true)? {
+        Some(decided) => decided,
+        None => match parallel {
+            Some(n) => (n, SlotsFrom::Flag),
+            None if traced => (1, SlotsFrom::RouteTrace),
+            None => (SLOTS, SlotsFrom::Default),
+        },
     };
     let n = NonZeroUsize::new(n).ok_or("--parallel 0: the server serves no slot")?;
     Ok((n, from))
@@ -823,14 +819,50 @@ struct SeatArgs {
 /// The draft the seat serves, verified by the pair pass, behind the width
 /// chooser `BLOOMERY_MTP_WIDTH` names (its width 1: the chooser's cut of 0
 /// is the gate, the pair pass against the plain step).
-enum Served {
-    Off,
+enum Served41 {
+    /// None, or the DSpark draft: the serve seats' one owner of it
+    /// ([`ServedDraft`]).
+    Owned(ServedDraft<Body>),
     /// The lookup, and whether its context is the target's token history
     /// and the token the target stands before. Boxed: the chooser beside
-    /// the lookup is the size of its rings, as the DSpark draft's is.
+    /// the lookup is the size of its rings.
     Lookup(Box<Speculative<Choosing<Lookup>, PAIR_ROWS>>, bool),
-    /// Boxed: the draft body is the size of its graphs and buffers.
-    Dspark(Box<Speculative<Choosing<CardDraft<DraftBody>>, PAIR_ROWS>>),
+}
+
+/// The DSpark draft of the V4.1 body: the card draft the session drives, as
+/// the owner calls it.
+impl Spark<Body> for CardDraft<DraftBody> {
+    fn feed_call(&mut self, s: &mut Session<Body>, ids: &[u32]) -> Result<u32, SessionError> {
+        CardDraft::feed_call(self, s, ids)
+    }
+
+    fn forget(&mut self) {
+        CardDraft::forget(self);
+    }
+
+    fn restart(&mut self) -> Result<(), GpuError> {
+        CardDraft::restart(self)
+    }
+
+    fn window(&self) -> usize {
+        CardDraft::window(self)
+    }
+
+    fn follows(&self, pos: u32) -> bool {
+        CardDraft::follows(self, pos)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        CardDraft::resident_bytes(self)
+    }
+
+    fn device(&self) -> Result<DeviceId, GpuError> {
+        CardDraft::device(self)
+    }
+
+    fn card(&self) -> &'static str {
+        CardDraft::card(self)
+    }
 }
 
 /// The V4.1 session on the engine thread, and its draft.
@@ -838,7 +870,7 @@ struct V41 {
     s: Session<Body>,
     /// The positions served (`--ctx`).
     ctx: usize,
-    draft: Served,
+    draft: Served41,
     /// Whether a round of several slots runs as one pass of the busy rows
     /// ([`V41::step_slots`]): a load of more than one resident slot with no
     /// draft. Every other load keeps the fallback loop: one slot (a round of
@@ -997,20 +1029,21 @@ impl V41 {
             s.model_mut().body_parts(WHAT)?.2.log_residency(0);
         }
         let draft = match (a.draft, spark) {
-            (Draft::Off, _) => Served::Off,
-            (Draft::Lookup, _) => Served::Lookup(
+            (Draft::Off, _) => Served41::Owned(ServedDraft::off()),
+            (Draft::Lookup, _) => Served41::Lookup(
                 Box::new(s.with_draft::<Choosing<Lookup>, PAIR_ROWS>(
-                    behind(Lookup::new(), a.width)?,
+                    served::behind::<Body, _>(Lookup::new(), a.width)?,
                     &mut log,
                 )?),
                 false,
             ),
-            (Draft::Dspark, Some(d)) => Served::Dspark(Box::new(s.with_draft::<Choosing<
-                CardDraft<DraftBody>,
-            >, PAIR_ROWS>(
-                behind(d, a.width)?,
+            (Draft::Dspark, Some(d)) => Served41::Owned(ServedDraft::dspark::<_, PAIR_ROWS>(
+                &mut s,
+                d,
+                a.width,
                 &mut log,
-            )?)),
+                dspark::draft_path().ok(),
+            )?),
             (Draft::Dspark, None) => {
                 return Err("bloomery-serve-ds41: the DSpark draft did not load".into());
             }
@@ -1046,8 +1079,8 @@ impl V41 {
     /// the draft over feeds it before its first proposal.
     fn window(&self) -> usize {
         match &self.draft {
-            Served::Dspark(d) => d.draft().draft().window(),
-            Served::Off | Served::Lookup(..) => 0,
+            Served41::Owned(d) => d.window(),
+            Served41::Lookup(..) => 0,
         }
     }
 
@@ -1069,9 +1102,8 @@ impl V41 {
     /// The target stands elsewhere than its drafts were fed.
     fn moved(&mut self) {
         match &mut self.draft {
-            Served::Off => {}
-            Served::Lookup(_, follows) => *follows = false,
-            Served::Dspark(d) => d.draft_mut().draft_mut().forget(),
+            Served41::Owned(d) => d.moved(),
+            Served41::Lookup(_, follows) => *follows = false,
         }
     }
 
@@ -1079,7 +1111,7 @@ impl V41 {
     /// the token the target stands before, unless it is that already.
     fn lookup_follows(&mut self, next: u32) -> Result<(), GateError> {
         let V41 { s, draft, .. } = self;
-        if let Served::Lookup(spec, follows) = draft
+        if let Served41::Lookup(spec, follows) = draft
             && !*follows
         {
             let l = spec.draft_mut().draft_mut();
@@ -1094,24 +1126,6 @@ impl V41 {
     }
 }
 
-/// `d` behind the width chooser of `mode` ([`runtime::width`]): the seat's
-/// drafts are the chooser's, whatever their own width.
-fn behind<D: RtDraft<Session<Body>>>(d: D, mode: WidthMode) -> Result<Choosing<D>, SessionError> {
-    Ok(d.choosing(mode)?)
-}
-
-/// A pass's draft counts: the proposal's ids, the ones kept.
-fn drafted(c: Committed) -> Drafted {
-    if c.proposed {
-        Drafted {
-            proposed: c.rows - 1,
-            accepted: c.kept - 1,
-        }
-    } else {
-        Drafted::default()
-    }
-}
-
 impl Seat for V41 {
     fn pos(&self) -> usize {
         self.s.pos() as usize
@@ -1123,16 +1137,15 @@ impl Seat for V41 {
 
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         let next = match &mut self.draft {
-            Served::Dspark(d) => {
-                super::drafted::print_widths(&mut **d);
-                d.draft_mut().draft_mut().feed_call(&mut self.s, ids)?
-            }
-            Served::Lookup(spec, follows) => {
+            Served41::Owned(d) => match d.prefill(&mut self.s, ids)? {
+                Some(next) => next,
+                None => self.s.prompt(ids, Want::Argmax)?.argmax(),
+            },
+            Served41::Lookup(spec, follows) => {
                 super::drafted::print_widths(spec);
                 *follows = false;
                 self.s.prompt(ids, Want::Argmax)?.argmax()
             }
-            Served::Off => self.s.prompt(ids, Want::Argmax)?.argmax(),
         };
         self.print_passes()?;
         Ok(next)
@@ -1164,16 +1177,8 @@ impl Seat for V41 {
             return Err("no --mmproj: this seat serves no image".into());
         };
         match draft {
-            Served::Dspark(_) => {
-                return Err(
-                    "an image under BLOOMERY_DRAFT=dspark: the draft's window is fed by the \
-                     prompt call's features, which a media call hands none; serve the lookup \
-                     draft, or none"
-                        .into(),
-                );
-            }
-            Served::Lookup(_, follows) => *follows = false,
-            Served::Off => {}
+            Served41::Owned(d) => d.refuse_media()?,
+            Served41::Lookup(_, follows) => *follows = false,
         }
         let encoded = v.encode(s.model().gpu().context(), feeds)?;
         // Each span borrows its own ranges of the call's one pair of buffers.
@@ -1186,11 +1191,9 @@ impl Seat for V41 {
         let next = self.s.step(last, Want::Argmax)?.argmax();
         self.print_passes()?;
         match &mut self.draft {
-            Served::Lookup(spec, true) => spec.draft_mut().draft_mut().push(next),
-            Served::Dspark(d) => {
-                runtime::Draft::stepped(d.draft_mut(), &mut self.s, last, next)?;
-            }
-            Served::Lookup(_, false) | Served::Off => {}
+            Served41::Lookup(spec, true) => spec.draft_mut().draft_mut().push(next),
+            Served41::Owned(d) => d.stepped(&mut self.s, last, next)?,
+            Served41::Lookup(_, false) => {}
         }
         self.lookup_follows(next)?;
         Ok(next)
@@ -1202,22 +1205,25 @@ impl Seat for V41 {
 
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
         self.lookup_follows(last)?;
-        let c = match &mut self.draft {
-            Served::Lookup(spec, _) => runtime::Advance::pass(&mut **spec, &mut self.s, last, out)?,
-            Served::Dspark(spec) => runtime::Advance::pass(&mut **spec, &mut self.s, last, out)?,
-            Served::Off => {
-                out.push(self.step(last)?);
-                return Ok(Drafted::default());
+        let counts = match &mut self.draft {
+            Served41::Lookup(spec, _) => {
+                let c = runtime::Advance::pass(&mut **spec, &mut self.s, last, out)?;
+                Some(served::drafted(c))
             }
+            Served41::Owned(d) => d.pass(&mut self.s, last, out)?,
+        };
+        let Some(counts) = counts else {
+            out.push(self.step(last)?);
+            return Ok(Drafted::default());
         };
         self.print_passes()?;
-        Ok(drafted(c))
+        Ok(counts)
     }
 
     fn pass_rows(&self) -> usize {
-        match self.draft {
-            Served::Off => 1,
-            Served::Lookup(..) | Served::Dspark(_) => PAIR_ROWS,
+        match &self.draft {
+            Served41::Owned(d) => d.rows(),
+            Served41::Lookup(..) => PAIR_ROWS,
         }
     }
 
@@ -1245,7 +1251,7 @@ impl Seat for V41 {
     /// rebuilt at each select ([`V41::select`]): a slot's drafted passes are
     /// the passes it would run alone. The DSpark draft serves one slot.
     fn slot_drafts(&self) -> bool {
-        matches!(self.draft, Served::Lookup(..))
+        matches!(self.draft, Served41::Lookup(..))
     }
 
     /// The lever the binary parsed ([`V41::stats`]).
@@ -1277,9 +1283,8 @@ impl Seat for V41 {
     fn reset(&mut self) -> Result<(), GateError> {
         self.s.reset()?;
         match &mut self.draft {
-            Served::Off => {}
-            Served::Lookup(_, follows) => *follows = false,
-            Served::Dspark(d) => d.draft_mut().draft_mut().restart()?,
+            Served41::Owned(d) => d.reset()?,
+            Served41::Lookup(_, follows) => *follows = false,
         }
         Ok(())
     }
@@ -1312,25 +1317,14 @@ impl Seat for V41 {
             Ok(b) => b,
             Err(e) => return (0, Some(e.to_string())),
         };
-        let continues = match &self.draft {
-            Served::Dspark(d) => {
-                u32::try_from(n).is_ok_and(|n| n == self.s.pos() && d.draft().draft().follows(n))
-            }
-            Served::Off | Served::Lookup(..) => true,
+        let body = |m| {
+            let (k, why) = b.keep_why(m);
+            (k, why.map(|w| w.to_string()))
         };
-        if continues {
-            let (k, why) = b.keep_why(n);
-            return (k, why.map(|w| w.to_string()));
+        match &self.draft {
+            Served41::Owned(d) => d.keep(n, self.s.pos(), body),
+            Served41::Lookup(..) => body(n),
         }
-        let window = self.window();
-        let (k, why) = b.keep_why(n.saturating_sub(window));
-        let why = format!(
-            "the DSpark draft starts over, so the prompt call carries its window of \
-             {window} positions: cut to at most {}{}",
-            n.saturating_sub(window),
-            why.map(|w| format!(", then {w}")).unwrap_or_default()
-        );
-        (k, Some(why))
     }
 
     /// The body's cuts under the batched feed; the step feed leaves no
@@ -1379,42 +1373,20 @@ impl Seat for V41 {
     /// `engine.draft`, and the draft's resident bytes in its card's
     /// placement row, the class `draft` (a row of its own when the target
     /// has no layer there). The card's index missing leaves the device out.
-    fn props(&self, mut p: EngineProps) -> EngineProps {
+    fn props(&self, p: EngineProps) -> EngineProps {
         match &self.draft {
-            Served::Off => {}
-            Served::Lookup(..) => {
+            Served41::Owned(d) => d.props(p),
+            Served41::Lookup(..) => {
+                let mut p = p;
                 p.draft = Some(DraftProps {
                     model: Draft::Lookup.name().to_owned(),
                     n_max: Some(1),
                     kind: Some(Draft::Lookup.name().to_owned()),
                     ..DraftProps::default()
                 });
-            }
-            Served::Dspark(spec) => {
-                let d = spec.draft().draft();
-                let device = d
-                    .device()
-                    .ok()
-                    .and_then(|dev| nvidia_smi_index(d.card(), Some(dev)).ok())
-                    .map(|i| format!("GPU{i}"));
-                let path = dspark::draft_path().ok();
-                let file = path
-                    .as_deref()
-                    .and_then(Path::file_name)
-                    .map(|f| f.to_string_lossy().into_owned());
-                if let (Some(dev), Some(pl)) = (&device, p.placement.as_mut()) {
-                    add_draft_bytes(pl, dev, d.resident_bytes() as u64);
-                }
-                p.draft = Some(DraftProps {
-                    model: file.unwrap_or_else(|| Draft::Dspark.name().to_owned()),
-                    n_max: Some(1),
-                    kind: Some(Draft::Dspark.name().to_owned()),
-                    path: path.map(|p| p.display().to_string()),
-                    device,
-                });
+                p
             }
         }
-        p
     }
 
     fn note(note: &CacheNote) {
@@ -1509,28 +1481,6 @@ fn state_error(e: body::StateFail) -> StateError {
         body::StateFail::Io(e) => StateError::Io(e),
         body::StateFail::Card(e) => StateError::Engine(EngineError(e.to_string())),
     }
-}
-
-/// `bytes` of the draft on `device`: into that card's row, or a row of its
-/// own before the host's.
-fn add_draft_bytes(p: &mut PlacementProps, device: &str, bytes: u64) {
-    if let Some(d) = p.devices.iter_mut().find(|d| d.device == device) {
-        *d.class_bytes.entry(DRAFT_CLASS.to_owned()).or_default() += bytes;
-        return;
-    }
-    let at = p
-        .devices
-        .iter()
-        .position(|d| d.device == "CPU")
-        .unwrap_or(p.devices.len());
-    p.devices.insert(
-        at,
-        DeviceProps {
-            device: device.to_owned(),
-            class_bytes: [(DRAFT_CLASS.to_owned(), bytes)].into(),
-            layers: None,
-        },
-    );
 }
 
 /// What the open prints and checks: the body's selection against the
