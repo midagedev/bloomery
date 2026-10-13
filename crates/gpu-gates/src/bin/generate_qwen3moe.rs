@@ -177,9 +177,19 @@
 //! unset draft goes off there (`unset: the plan pages …`), a set one runs,
 //! and `BLOOMERY_GEN_SLOTS` past one is refused by name.
 //!
+//! `BLOOMERY_DRAFT=dspark` on a qwen35moe file (one slot, `--prefill auto`; `--time`,
+//! `--logits`, `--last-step`, `--seed-depth` and `BLOOMERY_FORCE_IDS` refused by name) decodes
+//! through the runtime's speculative loop with the HF DSpark draft (`$BLOOMERY_DSPARK_MODEL`,
+//! refused by name when unset) on the whole-card verifying load
+//! (`GpuModel::open_verifying`), the draft opened on the target's card. The draft's bytes —
+//! its load, the verifying lanes and the tap buffer (`shared/dspark_q36.rs`) — are a reserve
+//! of the whole-fit verdict, so a card that holds the model and not the draft takes the placed
+//! plan, which the draft refuses by name (`BLOOMERY_DRAFT=dspark needs the whole-card load:`).
+//! The greedy ids are the plain run's; the arm ends with a `draft dspark` line: the passes, the
+//! ids proposed and the ids kept.
+//!
 //! Drafting (`BLOOMERY_DRAFT=mtp`, or unset as above; a qwen4exp file only,
-//! every other family and word refused by name — `dspark` on a qwen35moe file
-//! too, whose card draft this build does not carry yet) the decode runs through the runtime's
+//! every other family and word refused by name) the decode runs through the runtime's
 //! speculative loop with the file's MTP draft (`app::arch::qwen4exp`'s
 //! `MtpDraft` over the shared draft file beside the target or
 //! `BLOOMERY_MTP_DRAFT`'s, its head `BLOOMERY_MTP_HEAD_ROWS`'s: unset the
@@ -359,6 +369,18 @@ mod taps;
 mod q3place;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/dspark_hf.rs"]
+#[allow(
+    dead_code,
+    reason = "the draft's reader serves several binaries; the CLI opens and sizes it"
+)]
+mod dspark_hf;
+
+#[cfg(feature = "gpu")]
+#[path = "shared/dspark_q36.rs"]
+mod dspark_q36;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/qwen38_place.rs"]
 mod q38place;
 
@@ -376,6 +398,7 @@ mod route_trace38;
 
 #[cfg(feature = "gpu")]
 mod cli {
+    use super::dspark_q36;
     use super::gen_slots;
     use super::q3place::{self, PlaceQ3};
     use super::q38place;
@@ -416,7 +439,7 @@ mod cli {
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
     };
-    use model::placement::workstation::HostRead;
+    use model::placement::workstation::{CardSpec, HostRead};
     use model::placement::{Device, Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
@@ -1450,6 +1473,16 @@ mod cli {
             }
             Family::Qwen35 => {
                 draft_refused_on_other(&levers, family)?;
+                if levers.draft() == Some("dspark") {
+                    dspark_flags_refused(&[
+                        ("--time", timed),
+                        ("--logits", logits),
+                        ("--last-step", last_step),
+                        ("--seed-depth", seed_depth.is_some()),
+                        ("--prefill", prefill.is_some_and(|p| p != "auto")),
+                        ("BLOOMERY_FORCE_IDS", levers.force_ids().is_some()),
+                    ])?;
+                }
                 let (place, lane) = place_q3(place.as_deref(), prefill)?;
                 (Chosen::Qwen35(Body35::path(prefill)?, place), None, lane)
             }
@@ -1660,16 +1693,27 @@ mod cli {
                 }
             }
             Chosen::Qwen35(path, place) => {
-                let m = open_qwen35(
+                // The DSpark draft's directory and its bytes, priced before the target opens.
+                let dir = (levers.draft() == Some("dspark"))
+                    .then(dspark_q36::dir)
+                    .transpose()?;
+                let extra = dir
+                    .as_deref()
+                    .map(|d| dspark_q36::extra(&file, d, ctx, ubatch_size()?))
+                    .transpose()?;
+                let (m, card) = open_qwen35(
                     file,
                     (ctx, mode),
                     place.map(|p| (p, &levers)),
                     &levers,
-                    kv,
+                    (kv, extra),
                     lane,
                     t,
                 )?;
-                if slots > 1 {
+                if let Some(dir) = dir {
+                    let card = card.ok_or("BLOOMERY_DRAFT=dspark: the load names no whole card")?;
+                    drive35_dspark(m, (&dir, card), &run, &arms, listed, sync)
+                } else if slots > 1 {
                     drive_slots(m, &run, path, &arms, listed, sync)
                 } else {
                     drive(m, &run, path, &arms, listed, sync)
@@ -1892,22 +1936,31 @@ mod cli {
         }
     }
 
-    /// The refusal of `BLOOMERY_DRAFT=dspark` on a qwen35moe load: a load placed
-    /// on the host tier (`placed` is the placement it resolved to and why) is
-    /// refused, since the draft needs the whole-card verifying load; a
-    /// whole-card load is refused only while the card draft is not carried.
-    /// The leading phrase is the release pass's key.
-    fn dspark_refusal(placed: Option<(String, String)>) -> GateError {
-        match placed {
-            Some((placement, why)) => format!(
-                "BLOOMERY_DRAFT=dspark needs the whole-card load: {placement} resolved to a \
-                 placed load, {why}; the Qwen3.6 DSpark draft runs only on a model held whole \
-                 on the card - serve a load that holds the whole model there, or no draft"
+    /// The refusal of `BLOOMERY_DRAFT=dspark` on a qwen35moe load placed on the
+    /// host tier (`placement` is the placement it resolved to, `why`): the
+    /// draft needs the whole-card verifying load. The leading phrase is the
+    /// release pass's key.
+    fn dspark_refusal(placement: &str, why: &str) -> GateError {
+        format!(
+            "BLOOMERY_DRAFT=dspark needs the whole-card load: {placement} resolved to a \
+             placed load, {why}; the Qwen3.6 DSpark draft runs only on a model held whole \
+             on the card - serve a load that holds the whole model there, or no draft"
+        )
+        .into()
+    }
+
+    /// The flags a DSpark run does not take, by name: it prints its passes'
+    /// ids and the draft's counts, with no per-step wall, logits row, seeded
+    /// depth, forced id or prompt path of its own choosing.
+    fn dspark_flags_refused(flags: &[(&str, bool)]) -> Result<(), GateError> {
+        match flags.iter().find(|(_, set)| *set) {
+            Some((flag, _)) => Err(format!(
+                "{flag} under BLOOMERY_DRAFT=dspark: the drafted run walks the prompt by the \
+                 session's schedule and prints the passes' ids and the draft's counts, not a \
+                 per-step wall, a logits row, a seeded depth or forced ids"
             )
-            .into(),
-            None => "BLOOMERY_DRAFT=dspark: the Qwen3.6 DSpark draft opens through CardDspark, \
-                     which this build does not carry yet"
-                .into(),
+            .into()),
+            None => Ok(()),
         }
     }
 
@@ -2140,16 +2193,20 @@ mod cli {
     /// card while that fits the card's free bytes, else the placed plan on
     /// that card with its why — its `load` line, and in graph
     /// mode the step captured and, unplaced, the passes of 2 to
-    /// [`MAX_PASS_ROWS`] rows, with their `capture` lines.
+    /// [`MAX_PASS_ROWS`] rows, with their `capture` lines. With `extra`, the
+    /// DSpark draft's bytes (`dspark_q36::Extra`) are a reserve of the
+    /// whole-fit verdict, the load is the whole-card load that verifies
+    /// drafted rows, and a placed resolution is refused by name; the card a
+    /// whole-card load opened on is returned beside the model.
     fn open_qwen35(
         file: Split,
         (ctx, mode): (usize, StepMode),
         place: Option<(Place, &Levers)>,
         levers: &Levers,
-        kv: KvQ8,
+        (kv, extra): (KvQ8, Option<dspark_q36::Extra>),
         lane: Lane,
         t: Instant,
-    ) -> Result<Qwen35moeModel, GateError> {
+    ) -> Result<(Qwen35moeModel, Option<&'static str>), GateError> {
         let o = Open35 {
             ctx,
             mma: true,
@@ -2157,42 +2214,54 @@ mod cli {
             kv,
             media: false,
         };
-        let dspark = levers.draft() == Some("dspark");
+        let reserve = extra.map(|e| e.total());
+        if let Some(e) = &extra {
+            println!("draft dspark plan ctx={ctx} adds {}", e.words());
+        }
+        let whole = |card: CardSpec, file: Split| -> Result<Qwen35moeModel, GateError> {
+            let gpu = Gpu::open_card(card.name, card.device)?;
+            Ok(if extra.is_some() {
+                Qwen35moeModel::open_verifying(gpu, file, o)?
+            } else {
+                Qwen35moeModel::open(gpu, file, o)?
+            })
+        };
+        let mut card_name = None;
         let mut m = match place {
-            None => {
-                if dspark {
-                    let placed = matches!(
-                        q3place::unplaced_qwen35(&file, &o)?,
-                        q3place::Unplaced::Placed(_)
-                    );
-                    return Err(dspark_refusal(placed.then(|| {
-                        (
-                            "--place unset".to_owned(),
-                            "the whole model does not fit the card's free bytes, so the plan \
-                             puts routed experts on the host tier"
-                                .to_owned(),
-                        )
-                    })));
-                }
-                q3place::open_unplaced_qwen35(file, o, levers, Record::print)?
-            }
+            None => match extra {
+                Some(_) => match q3place::unplaced_qwen35_slots(&file, &o, Seqs::ONE, reserve)? {
+                    q3place::Unplaced::Whole(card) => {
+                        card_name = Some(card.name);
+                        whole(card, file)?
+                    }
+                    q3place::Unplaced::Placed(_) => {
+                        return Err(dspark_refusal(
+                            "--place unset",
+                            "the whole model and the draft's bytes do not fit the card's free \
+                             bytes, so the plan puts routed experts on the host tier",
+                        ));
+                    }
+                },
+                None => q3place::open_unplaced_qwen35(file, o, levers, Record::print)?,
+            },
             Some((p, levers)) => {
-                let q = PlaceQ3::qwen35(&file, p, o)?;
+                let q = match reserve {
+                    Some(_) => PlaceQ3::qwen35_seqs(&file, p, o, Seqs::ONE, reserve)?,
+                    None => PlaceQ3::qwen35(&file, p, o)?,
+                };
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, None).print();
                 match q.whole_card_qwen35(&file, &plan, (ctx, 1), o)? {
                     Some(card) => {
-                        if dspark {
-                            return Err(dspark_refusal(None));
-                        }
-                        Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
+                        card_name = Some(card.name);
+                        whole(card, file)?
                     }
                     None => {
-                        if dspark {
-                            return Err(dspark_refusal(Some((
-                                format!("--place {}", p.name()),
-                                "its plan puts routed experts on the host tier".to_owned(),
-                            ))));
+                        if extra.is_some() {
+                            return Err(dspark_refusal(
+                                &format!("--place {}", p.name()),
+                                "its plan puts routed experts on the host tier",
+                            ));
                         }
                         q3place::open_qwen35(file, &plan, o, levers.host())?
                     }
@@ -2222,7 +2291,7 @@ mod cli {
             let step = m.capture_step()?;
             println!("capture graph_nodes={step}");
             if placed {
-                return Ok(m);
+                return Ok((m, card_name));
             }
             let (free0, _) = m.gpu().mem_info()?;
             let t = Instant::now();
@@ -2230,7 +2299,7 @@ mod cli {
             nodes.extend(capture35_rows(&mut m)?);
             capture_line(&nodes, t, free0, m.gpu())?;
         }
-        Ok(m)
+        Ok((m, card_name))
     }
 
     /// `BLOOMERY_QWEN38_EXPERTS` as a qwen4exp plan's expert rule: as set,
@@ -2713,6 +2782,137 @@ mod cli {
             let ran = run_arm38_mtp(&mut s, &mut spec, path, run, arm);
             end_arm(s.model_mut(), ran)?;
         }
+        Ok(())
+    }
+
+    /// Every arm on the loaded verifying model `m` through the DSpark draft
+    /// of `dir`, opened on `card` beside it (the verify passes of 2 to
+    /// [`dspark_q36::ROWS`] rows captured in graph mode, each width's nodes
+    /// printed) behind the width chooser `BLOOMERY_MTP_WIDTH` names; each arm
+    /// after the first from the session's clear, the draft started over by
+    /// its prompt call.
+    fn drive35_dspark(
+        m: Qwen35moeModel,
+        (dir, card): (&Path, &'static str),
+        run: &Run,
+        arms: &[Arm],
+        listed: bool,
+        sync: bool,
+    ) -> Result<(), GateError> {
+        let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
+        let t = Instant::now();
+        let draft = dspark_q36::open(&s, dir, card, run.ctx)?;
+        println!(
+            "load draft=dspark {} card={card} width={} resident={} in {:.1} s (runtime value)",
+            dir.display(),
+            dspark_q36::ROWS - 1,
+            draft.resident_bytes(),
+            t.elapsed().as_secs_f64()
+        );
+        let mut spec = s.with_draft::<Choosing<dspark_q36::Draft36>, { dspark_q36::ROWS }>(
+            draft.choosing(run.width)?,
+            &mut VerifyCaptures,
+        )?;
+        let count = arms.len();
+        for (i, arm) in arms.iter().enumerate() {
+            if i > 0 {
+                s.clear()?;
+                if let Some(c) = s.take_cleared() {
+                    record::residency_reset(&c).print();
+                }
+            }
+            if listed {
+                arm_head(i, count, arm, sync)?;
+            }
+            run_arm35_dspark(&mut s, &mut spec, run, arm)?;
+        }
+        Ok(())
+    }
+
+    /// A DSpark run's passes: every kept id with its position, and what the
+    /// draft proposed and what the target kept of it.
+    #[derive(Default)]
+    struct DraftCounts {
+        emitted: Vec<(u32, u32)>,
+        passes: usize,
+        proposed: usize,
+        accepted: usize,
+    }
+
+    impl PassSink<Session<Body35>> for DraftCounts {
+        type Error = GateError;
+
+        fn begin(&mut self, _t: &Session<Body35>) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _t: &Session<Body35>,
+            c: &Committed,
+            tokens: &[u32],
+            _wall: Duration,
+        ) -> Result<(), GateError> {
+            for (r, &tok) in (0u32..).zip(tokens) {
+                self.emitted.push((c.pos + r, tok));
+            }
+            self.passes += 1;
+            if c.proposed {
+                self.proposed += c.rows - 1;
+                self.accepted += c.kept - 1;
+            }
+            Ok(())
+        }
+    }
+
+    /// One arm through the DSpark draft: the prompt — the session's schedule,
+    /// the draft fed the tapped rows of its window — then the passes until
+    /// `-n` tokens are out, every kept token the target's own argmax. The
+    /// arm ends with the draft's counts.
+    fn run_arm35_dspark(
+        s: &mut Session<Body35>,
+        spec: &mut Speculative<Choosing<dspark_q36::Draft36>, { dspark_q36::ROWS }>,
+        run: &Run,
+        arm: &Arm,
+    ) -> Result<(), GateError> {
+        let (ids, n_gen) = (&arm.ids, arm.n_gen);
+        let t = Instant::now();
+        let next = spec.prompt(s, ids)?;
+        let prefill_wall = t.elapsed();
+        println!(
+            "step 0 {} {next} (the {} prompt ids through the DSpark draft, {:.2} s, runtime value)",
+            s.pos() - 1,
+            ids.len(),
+            prefill_wall.as_secs_f64()
+        );
+        let mut sink = DraftCounts::default();
+        let stop = Stop::new(n_gen, s.ctx())?;
+        let out = runtime::generate(s, spec, ids, next, &stop, &mut sink)?;
+        if out.tokens.len() < n_gen {
+            return Err(format!(
+                "generate_qwen3moe: the generation stopped at {} after {} tokens, before -n",
+                out.stop.name(),
+                out.tokens.len()
+            )
+            .into());
+        }
+        for (k, &(pos, tok)) in sink.emitted[..n_gen - 1].iter().enumerate() {
+            println!("step {} {pos} {tok}", k + 1);
+        }
+        let tokens = &out.tokens[..n_gen];
+        println!("tokens {tokens:?}");
+        if let Some(t) = &run.tok {
+            println!("text {:?}", t.decode(tokens));
+        }
+        // The chooser outlives the arm: its tally starts over for the next.
+        let _ = spec.draft_mut().take_tally();
+        println!(
+            "draft dspark passes={} proposed={} accepted={} width={}",
+            sink.passes,
+            sink.proposed,
+            sink.accepted,
+            dspark_q36::ROWS - 1
+        );
         Ok(())
     }
 

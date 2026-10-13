@@ -59,6 +59,7 @@ use super::{DraftLayers, Q8Rows};
 use crate::flash_gqa::{
     FlashGqaKernels, GROUP, GqaArgs, HEAD_256, PACK_4, partials_ms_len, partials_v_len_256,
 };
+use crate::graph::capturing;
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::rope_table::{Direction, RopeSpec, RopeTable};
 use crate::weights::q8_0_planes;
@@ -658,7 +659,9 @@ impl DraftLayers for DenseLayers {
     }
 
     fn append_kv(&mut self, gpu: &Gpu, x: &DeviceBuffer<f32>, n: usize) -> Result<(), GpuError> {
-        if self.staged_rows != Some(n) {
+        // The owner records its graphs at load, before any stage call: the launches read the staged
+        // words from device addresses at replay. Only an eager launch needs its stage call first.
+        if self.staged_rows != Some(n) && !capturing(gpu.stream())? {
             return Err(GpuError::State {
                 what: WHAT,
                 missing: "an append of the rows stage_kv staged",
@@ -771,7 +774,8 @@ impl DraftLayers for DenseLayers {
         x: &mut DeviceBuffer<f32>,
         m: usize,
     ) -> Result<(), GpuError> {
-        if self.staged_block != Some(m) {
+        // As in `append_kv`: a capture runs before any stage call, an eager launch after its own.
+        if self.staged_block != Some(m) && !capturing(gpu.stream())? {
             return Err(GpuError::State {
                 what: WHAT,
                 missing: "a block of the rows stage_block staged",

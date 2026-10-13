@@ -20,15 +20,17 @@
 
 use std::path::{Path, PathBuf};
 
+use app::dspark::CardDspark;
 use app::{Keep, Prompt, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuError;
+use bloomery_gpu::dspark::DraftLayers;
 use bloomery_gpu::model::{ChainBody, Rollback, Rows};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{SlotsFrom, nvidia_smi_index};
 use bloomery_levers::Levers;
 use model::placement::workstation::DeviceId;
 use runtime::width::{Choosing, Chosen, Mode as WidthMode};
-use runtime::{Advance, Committed, Draft as RtDraft, Speculative, Widths, Window};
+use runtime::{Advance, Committed, Draft as RtDraft, Speculative, TappedPrompt, Widths, Window};
 use serve::{DeviceProps, DraftProps, Drafted, EngineProps, PlacementProps};
 
 use crate::draft::Draft;
@@ -74,6 +76,50 @@ where
 
     /// The card the draft runs on.
     fn card(&self) -> &'static str;
+}
+
+/// The HF DSpark draft of a body that taps its rows ([`CardDspark`]), as the
+/// owner calls it. Its window is the file's `Option`: a draft that keeps
+/// every position has no window to feed a restart, so a cut anywhere but
+/// where it stands leaves nothing of the prompt to the cut ([`ServedDraft::keep`]
+/// takes the whole context as the window).
+impl<B, L> Spark<B> for CardDspark<L>
+where
+    B: ChainBody + Prompt + Keep + Rows + Rollback,
+    Session<B>: TappedPrompt<Error = SessionError>,
+    L: DraftLayers + 'static,
+{
+    fn feed_call(&mut self, s: &mut Session<B>, ids: &[u32]) -> Result<u32, SessionError> {
+        CardDspark::feed_call(self, s, ids)
+    }
+
+    fn forget(&mut self) {
+        CardDspark::forget(self);
+    }
+
+    fn restart(&mut self) -> Result<(), GpuError> {
+        CardDspark::restart(self)
+    }
+
+    fn window(&self) -> usize {
+        CardDspark::window(self).unwrap_or_else(|| usize::try_from(u32::MAX).unwrap_or(usize::MAX))
+    }
+
+    fn follows(&self, pos: u32) -> bool {
+        CardDspark::follows(self, pos)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        CardDspark::resident_bytes(self)
+    }
+
+    fn device(&self) -> Result<DeviceId, GpuError> {
+        CardDspark::device(self)
+    }
+
+    fn card(&self) -> &'static str {
+        CardDspark::card(self)
+    }
 }
 
 /// A draft's window behind the width chooser, as the owner drives it. One
