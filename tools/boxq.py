@@ -56,6 +56,8 @@ import tempfile
 import threading
 import time
 
+from bloomery.selftest import load_cap
+
 USAGE = 64
 LANES = ("3090", "a6000", "both", "any", "none")
 CLASSES = ("lead", "round", "sitting", "fill")
@@ -704,22 +706,8 @@ class Fix:
         except OSError:
             return []
 
-    def load_factor(self):
-        """Stretch an idle self-test cap by the 1-minute load per cpu. The factor is 1 when that
-        load is at most one per cpu, else load/cpu. A host with no load reading keeps 1. The wait
-        still returns when its condition holds; only a miss lasts the stretched cap. Product waits
-        (BOXQ_CANCEL_WAIT_S 150, BOXQ_POLL_S 5) are not this."""
-        try:
-            load = os.getloadavg()[0]
-        except OSError:
-            return 1.0
-        cpus = os.cpu_count() or 1
-        return max(1.0, load / cpus)
-
     def wait_pids(self, path, n, secs=10):
-        # secs is the idle cap. check-recipes' other blocks delay the tail stub past a fixed 10 s,
-        # and the case then fails before it sends the signal (int-cancel).
-        secs *= self.load_factor()
+        secs = load_cap(secs)
         end = time.monotonic() + secs
         while len(self.pids(path)) < n:
             check(time.monotonic() < end,
