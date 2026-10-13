@@ -1042,7 +1042,12 @@ impl V41 {
     /// the draft over feeds it before its first proposal.
     fn window(&self) -> usize {
         match &self.draft {
-            Served::Dspark(d) => d.draft().draft().window(),
+            // V4.1's draft file always carries a window (its shape's `window`).
+            Served::Dspark(d) => d
+                .draft()
+                .draft()
+                .window()
+                .expect("V4.1's DSpark draft has a window"),
             Served::Off | Served::Lookup(..) => 0,
         }
     }
