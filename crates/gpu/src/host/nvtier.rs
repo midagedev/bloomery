@@ -1298,7 +1298,8 @@ impl Stats {
 
     /// Host compute of a step's hit group while its miss fill was in flight.
     fn note_hits_under_read(&self, ns: u64) {
-        self.step_hits_under_read_ns.fetch_add(ns, Ordering::Relaxed);
+        self.step_hits_under_read_ns
+            .fetch_add(ns, Ordering::Relaxed);
     }
 }
 
@@ -3690,8 +3691,16 @@ mod tests {
         s.note_step_wall(Claim::Step, 9);
         s.note_step_wall(Claim::Transient, 4);
         s.note_hits_under_read(7);
-        assert_eq!(load(&s.step_miss_layers), 2, "a keep claim is not a step layer");
-        assert_eq!(load(&s.step_fill_wall_ns), 9, "a transient wall is not a step's");
+        assert_eq!(
+            load(&s.step_miss_layers),
+            2,
+            "a keep claim is not a step layer"
+        );
+        assert_eq!(
+            load(&s.step_fill_wall_ns),
+            9,
+            "a transient wall is not a step's"
+        );
         assert_eq!(load(&s.step_hits_under_read_ns), 7);
     }
 
