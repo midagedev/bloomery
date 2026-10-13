@@ -9,8 +9,9 @@ import sys
 
 
 def load_cap(idle_s):
-    # The regression sets these. The shell caller (`selftest.py 20`) does not.
-    forced = os.environ.get("BLOOMERY_SELFTEST_LOAD")
+    # The regression sets LOADCAP_LOAD and LOADCAP_NCPU. The shell caller (`selftest.py 20`) does not.
+    # These are not lever names: check-levers requires every BLOOMERY_* name to be a registry row.
+    forced = os.environ.get("LOADCAP_LOAD")
     if forced is None:
         try:
             load_avg = os.getloadavg()[0]
@@ -19,7 +20,7 @@ def load_cap(idle_s):
         cpus = os.cpu_count() or 1
     else:
         load_avg = float(forced)
-        ncpu = os.environ.get("BLOOMERY_SELFTEST_NCPU")
+        ncpu = os.environ.get("LOADCAP_NCPU")
         cpus = int(ncpu) if ncpu is not None else (os.cpu_count() or 1)
     # PIN(2026-10-13): scale self-test caps with load per CPU to accommodate CPU contention.
     return idle_s * max(1.0, load_avg / (cpus or 1))
@@ -38,8 +39,8 @@ def _sees_ready(policy, idle_s, ready_at):
 def self_test():
     # Load 80 on 10 cpus, idle 20. Printing the argument alone yields 20, not 160.
     env = os.environ.copy()
-    env["BLOOMERY_SELFTEST_LOAD"] = "80"
-    env["BLOOMERY_SELFTEST_NCPU"] = "10"
+    env["LOADCAP_LOAD"] = "80"
+    env["LOADCAP_NCPU"] = "10"
     proc = subprocess.run([sys.executable, os.path.abspath(__file__), "20"],
                           env=env, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr

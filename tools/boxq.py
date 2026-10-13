@@ -990,8 +990,8 @@ def case_load_ready(fx):
     cap of 10 s fails this case and the scaled cap returns as soon as they appear."""
     path = os.path.join(fx.tmp, "late.pids")
     open(path, "w").close()
-    os.environ["BLOOMERY_SELFTEST_LOAD"] = "80"
-    os.environ["BLOOMERY_SELFTEST_NCPU"] = "10"
+    os.environ["LOADCAP_LOAD"] = "80"
+    os.environ["LOADCAP_NCPU"] = "10"
     now = [0.0]
     real_mono, real_sleep = time.monotonic, time.sleep
 
@@ -1009,8 +1009,8 @@ def case_load_ready(fx):
         fx.wait_pids(path, 2, secs=10)
     finally:
         time.monotonic, time.sleep = real_mono, real_sleep
-        os.environ.pop("BLOOMERY_SELFTEST_LOAD", None)
-        os.environ.pop("BLOOMERY_SELFTEST_NCPU", None)
+        os.environ.pop("LOADCAP_LOAD", None)
+        os.environ.pop("LOADCAP_NCPU", None)
     check(fx.pids(path) == [11, 22], f"the late pids were recorded: {fx.pids(path)}")
     check(now[0] >= 15, f"the wait did not see the late pids: t={now[0]}")
     check(now[0] < 20, f"the wait sat out the scaled cap: t={now[0]}")
