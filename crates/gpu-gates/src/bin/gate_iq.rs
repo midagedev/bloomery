@@ -157,7 +157,7 @@ mod gate {
             mag += match fmt {
                 IqFormat::Iq2Xs => (h(0) / 8.0 * dx * f64::from(i)).abs(),
                 IqFormat::Iq3Xxs => (h(0) / 4.0 * dx * f64::from(i)).abs(),
-                IqFormat::Iq4Xs => (h(0) * dx * f64::from(i)).abs(),
+                IqFormat::Iq3S | IqFormat::Iq4Xs => (h(0) * dx * f64::from(i)).abs(),
                 IqFormat::Q2K => {
                     (h(80) * dx * f64::from(i)).abs() + (h(82) * dx * f64::from(m)).abs()
                 }

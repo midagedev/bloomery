@@ -315,6 +315,8 @@ mod tests {
     // PIN(2026-10-11): card_runs now runs Q4_K/Q5_K through the common leg.
     // PIN(2026-10-11): the leg also runs IQ2_XS, IQ3_XXS and IQ4_XS (the
     // raw-block entries of `iq_sel.rs`), so those three are card-routed too.
+    // PIN(2026-10-12): the leg also runs IQ3_S (`iq3_s_gate_up_sel`,
+    // `iq3_s_gemv_sel`), so it is card-routed too.
     #[test]
     fn only_the_stacks_the_leg_runs_are_card_routed() {
         for ty in [
@@ -323,6 +325,7 @@ mod tests {
             GgmlType::Q5_K,
             GgmlType::IQ2_XS,
             GgmlType::IQ3_XXS,
+            GgmlType::IQ3_S,
             GgmlType::IQ4_XS,
         ] {
             assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");

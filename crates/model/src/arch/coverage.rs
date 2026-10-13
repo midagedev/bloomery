@@ -902,6 +902,7 @@ pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         GateUpEntry::Q8_0
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
+        | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
         | GateUpEntry::Mxfp4 => None,
     }
@@ -925,6 +926,7 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
         | DownEntry::Q8_0
         | DownEntry::Iq2xs
         | DownEntry::Iq3xxs
+        | DownEntry::Iq3s
         | DownEntry::Iq4nl
         | DownEntry::Iq4xs
         | DownEntry::Mxfp4 => None,
