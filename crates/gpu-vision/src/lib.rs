@@ -1,5 +1,5 @@
 //! bloomery-gpu-vision — the image encoders on the card: from the bf16 patch tensor of
-//! [`vision::arch`] to the bf16 rows the text model reads in place of an image's tokens. Three
+//! [`vision::arch`] to the bf16 rows the text model reads in place of an image's tokens. Four
 //! towers, one per projector type of the encoder file (an mmproj GGUF):
 //!
 //! * `deepseek41v` — DeepSeek-V4.1-Flash's ViT (32 blocks, 2D RoPE, full bidirectional
@@ -11,7 +11,10 @@
 //! * `glm5v` — GLM-5.3-Flash's ViT (24 blocks of RMS norm, a per-head RMS norm on query and key, a
 //!   SwiGLU MLP with bias, 2D RoPE, no position table, a Conv3d patch embedding) and its merger (a
 //!   2×2 convolution, a linear, LayerNorm, GELU and a SwiGLU MLP to the text model's width)
-//!   ([`glm5v`]).
+//!   ([`glm5v`]);
+//! * `minicpmv4_7` — MiniCPM-V 4.7's ViT (27 blocks of heads of 72, LayerNorm with bias, learned
+//!   70×70 positions gathered by nearest bucket, no RoPE) with a windowed-attention merger after
+//!   block 6 and a final merger, 16 patches to a token ([`minicpmv`]).
 //!
 //! [`open`] reads the file's projector type and loads the tower; [`Tower`] is what a seat holds.
 //!
@@ -39,7 +42,7 @@
 //! * [`pos_bilinear`] — the Qwen3-VL tower's learned position rows resized to the image's grid.
 //! * [`aligner`] — the 3×3 unfold of V4.1's ViT grid into the aligner's input rows.
 //! * [`chain`] — what both chains share: weight reading, taps, the rows an encode returns.
-//! * [`encoder`], [`qwen3vl`], [`glm5v`] — each tower's weights on the card and whole chain.
+//! * [`encoder`], [`qwen3vl`], [`glm5v`], [`minicpmv`] — each tower's weights on the card and whole chain.
 //!
 //! Like `bloomery-gpu`, this crate is built with `cargo oxide` only.
 
@@ -51,6 +54,7 @@ pub mod gelu_tanh;
 pub mod gemm_bf16;
 pub mod glm5v;
 pub mod layer_norm;
+pub mod minicpmv;
 pub mod mlp;
 pub mod norm;
 pub mod pos_bilinear;
@@ -79,7 +83,9 @@ use gguf::Gguf;
 use std::sync::Arc;
 use vision::Patches;
 use vision::arch::qwen3vl::TokenLimits;
-use vision::arch::{deepseek41v, glm5v as glm5v_host, qwen3vl as qwen3vl_host};
+use vision::arch::{
+    deepseek41v, glm5v as glm5v_host, minicpmv as minicpmv_host, qwen3vl as qwen3vl_host,
+};
 
 /// One image tower on the card, whichever projector type its file declares. A call takes
 /// `&mut self`: one image at a time owns the tower's activations, which are allocated at load, and
@@ -114,7 +120,9 @@ impl Tower for encoder::Encoder {
 /// Open the tower the file's `clip.projector_type` names and load it onto the card: V4.1's sizes
 /// its activations from its own grid plan and ignores `limits`; the Qwen3-VL and GLM towers size
 /// them for images of at most `limits`' token count. A projector type with no tower here, or none
-/// at all, is refused by name. Load-time only.
+/// at all, is refused by name. A MiniCPM-V file's tower is sized for tiles of `16 · limits.max()`
+/// patches: its caller passes the bound of one tile (a 448 slice is 64 tokens), not an image's.
+/// Load-time only.
 pub fn open(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
@@ -137,13 +145,20 @@ pub fn open(
         Some(qwen3vl_host::PROJECTOR_TYPE) => {
             Ok(Box::new(qwen3vl::Encoder::load(ctx, stream, file, limits)?))
         }
+        Some(minicpmv_host::PROJECTOR_TYPE) => Ok(Box::new(minicpmv::Encoder::load(
+            ctx,
+            stream,
+            file,
+            minicpmv::PATCHES_PER_TOKEN * limits.max(),
+        )?)),
         other => Err(GpuError::Shape {
             what: "gpu_vision::open",
             detail: format!(
-                "clip.projector_type is {other:?}; this build has a tower for \"{}\", \"{}\" and \"{}\"",
+                "clip.projector_type is {other:?}; this build has a tower for \"{}\", \"{}\", \"{}\" and \"{}\"",
                 deepseek41v::PROJECTOR_TYPE,
                 glm5v_host::PROJECTOR_TYPE,
-                qwen3vl_host::PROJECTOR_TYPE
+                qwen3vl_host::PROJECTOR_TYPE,
+                minicpmv_host::PROJECTOR_TYPE
             ),
         }),
     }
