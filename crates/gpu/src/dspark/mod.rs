@@ -104,9 +104,10 @@ pub trait DraftLayers {
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError>;
 
     /// Whether the captured graphs replay what the layers would enqueue now.
-    /// The owner asks before every graph replay, block and append, and never
-    /// before an eager pass. Layers whose captures bake in a setting a caller
-    /// can change refuse by name; the default says the captures always hold.
+    /// The owner stages that replay's rows, asks, then launches, and never
+    /// asks before an eager pass. Layers whose captures bake in a setting a
+    /// caller can change refuse by name; a replay no stage call has prepared
+    /// refuses by name. The default says the captures always hold.
     fn replayable(&self) -> Result<(), GpuError> {
         Ok(())
     }
@@ -525,15 +526,15 @@ impl<L: DraftLayers> DsparkBody<L> {
             Submit::Graph => self.graphs.append.get(n - 1),
             Submit::Eager => None,
         };
-        if graph.is_some() {
-            self.layers.replayable()?;
-        }
         let s = gpu.stream();
         put_f32(&mut self.feats.host_mut()?[..n * self.feat], taps);
         self.feats.upload(s, n * self.feat)?;
         self.layers.stage_kv(gpu, first, n)?;
         match graph {
-            Some(g) => g.launch(s)?,
+            Some(g) => {
+                self.layers.replayable()?;
+                g.launch(s)?;
+            }
             None => self.enqueue_append(gpu, n)?,
         }
         self.positions.append(first, n)?;
@@ -607,9 +608,6 @@ impl<L: DraftLayers> DsparkBody<L> {
             Submit::Graph => self.graphs.block.get(m - 1),
             Submit::Eager => None,
         };
-        if graph.is_some() {
-            self.layers.replayable()?;
-        }
         let s = gpu.stream();
         let host = self.block_in.host_mut()?;
         host[0] = last;
@@ -630,7 +628,10 @@ impl<L: DraftLayers> DsparkBody<L> {
             x.copy_from_device_async(&rows, s)?;
         }
         match graph {
-            Some(g) => g.launch(s)?,
+            Some(g) => {
+                self.layers.replayable()?;
+                g.launch(s)?;
+            }
             None => self.enqueue_block(gpu, m)?,
         }
         let asked = !p.is_empty();
