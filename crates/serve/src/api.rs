@@ -2654,15 +2654,13 @@ fn engine_gone(state: &State, started: bool) -> ApiError {
     }
 }
 
-/// A refusal of the media part: the request's 400, but a prepare whose span is
-/// empty, or a numbered placeholder whose ids are not its image's position, is
-/// the model's 500. The user cannot write that number: message text that
-/// carries the marker is refused before the prompt is tokenized.
+/// A refusal of the media part: the request's 400. An empty span is the model's
+/// 500, because message text that carries the marker is refused before the
+/// prompt is tokenized. A numbered placeholder whose ids are not its image's
+/// position is the request's 400, with the placeholder-count and image-last faults.
 fn media_error(e: &MediaError) -> ApiError {
     match e {
-        MediaError::Expand(ExpandError::EmptySpan(_)) | MediaError::ImageNumber { .. } => {
-            engine_error(e)
-        }
+        MediaError::Expand(ExpandError::EmptySpan(_)) => engine_error(e),
         _ => invalid(e.to_string()),
     }
 }
@@ -7149,17 +7147,17 @@ mod tests {
     }
 
     /// The media part's refusals are the request's 400 with the error's own text. An empty span
-    /// and a numbered placeholder whose ids are not its image's position are the model's fault,
-    /// a 500.
+    /// is the model's 500. A numbered placeholder whose ids are not its image's position is
+    /// the request's 400, with the other pairing faults.
     #[test]
-    fn an_empty_span_and_a_wrong_image_number_are_the_models_500() {
+    fn an_empty_span_is_500_and_a_wrong_image_number_is_400() {
         let empty = media_error(&MediaError::Expand(ExpandError::EmptySpan(0)));
         assert_eq!(
             (empty.code, empty.kind, empty.message.as_str()),
             (500, "server_error", "image 0 has an empty span")
         );
         let number = media_error(&MediaError::ImageNumber { index: 2 });
-        assert_eq!((number.code, number.kind), (500, "server_error"));
+        assert_eq!((number.code, number.kind), (400, "invalid_request_error"));
         assert_eq!(
             number.message,
             MediaError::ImageNumber { index: 2 }.to_string()

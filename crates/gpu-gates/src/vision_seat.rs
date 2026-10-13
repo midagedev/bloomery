@@ -57,7 +57,7 @@ use cuda_core::CudaContext;
 use gguf::Gguf;
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
-use vision::arch::minicpmv::{self, Group, PROJECTOR_TYPE};
+use vision::arch::minicpmv::{self, Group};
 use vision::arch::qwen3vl::TokenLimits;
 use vision::arch::{deepseek41v, glm5v, qwen3vl};
 use vision::mrope::Canvas;
@@ -72,6 +72,16 @@ use crate::record::{self, Record};
 
 /// A [`MediaModel`] the server holds across its threads (`serve::media::SharedMediaModel`).
 pub type SharedMedia = Arc<dyn MediaModel + Send + Sync>;
+
+/// The MiniCPM-V 4.7 tower is sized for one tile of this many tokens. A 1000×700
+/// slice is 10×7. A larger tile is the tower's existing buffer refusal. The slice
+/// plan is unchanged. One is the floor [`TokenLimits`] requires; the plan, not this
+/// floor, decides a small tile.
+pub const MINICPM_TILE_TOKENS: usize = 70;
+
+/// Patches in one merged MiniCPM-V token. Both mergers fold 2×2, the same figure
+/// `bloomery_gpu_vision::minicpmv::PATCHES_PER_TOKEN` is, so 70 tokens are 1120 patches.
+pub const MINICPM_PATCHES_PER_TOKEN: usize = 16;
 
 /// The image-input flags of a serve seat, llama-server's spelling.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -260,23 +270,12 @@ pub fn rules() -> &'static [Rule] {
             text_rope: None,
             takes_limits: false,
             out_dim: |f| Ok(minicpmv::Hparams::read(f)?.out_dim),
-            default_limits: |_| Err(tile_bound()),
-            cap: |_, _| Err(tile_bound()),
+            // The tower is sized for [`MINICPM_TILE_TOKENS`]. Flags do not steer it.
+            default_limits: |_| TokenLimits::new(1, MINICPM_TILE_TOKENS),
+            cap: |_, limits| Ok(limits.max()),
         },
     ];
     RULES
-}
-
-/// What a MiniCPM-V file's image-token limits are refused with: its tower is sized by the largest
-/// tile its slice plan can make, which the seat derives; no flag steers it.
-fn tile_bound() -> VisionError {
-    VisionError::Limits {
-        detail: format!(
-            "the {} projector sizes its tower for the largest tile of its own slice plan; the \
-             seat states that bound",
-            PROJECTOR_TYPE
-        ),
-    }
 }
 
 /// What the text model's file says that its projector must agree with.
@@ -2467,24 +2466,18 @@ mod tests {
     }
 
     /// MiniCPM-V's row asks nothing of the text rope or the vocabulary's ids, takes no limit
-    /// flag, and refuses a file's limits by naming the tile bound the seat states.
+    /// flag, and sizes the tower for a 70-token tile.
     #[test]
-    fn a_minicpmv_projector_names_the_tile_bound_the_seat_states() {
+    fn a_minicpmv_projector_sizes_a_70_token_tile() {
         let row = &rules()[3];
         assert_eq!(row.projector, "minicpmv4_7");
         assert!(row.ids.is_empty());
         assert_eq!((row.text_rope, row.takes_limits), (None, false));
         let c = Clip::new(Some("minicpmv4_7"));
         let file = Gguf::open(&c.0).expect("opens");
-        for e in [
-            (row.default_limits)(&file).unwrap_err(),
-            (row.cap)(&file, TokenLimits::DEFAULT).unwrap_err(),
-        ] {
-            assert!(
-                e.to_string()
-                    .contains("the largest tile of its own slice plan"),
-                "{e}"
-            );
-        }
+        let limits = (row.default_limits)(&file).expect("70-token bound");
+        assert_eq!((limits.min(), limits.max()), (1, MINICPM_TILE_TOKENS));
+        assert_eq!((row.cap)(&file, limits).expect("cap"), MINICPM_TILE_TOKENS);
+        assert_eq!(MINICPM_TILE_TOKENS * MINICPM_PATCHES_PER_TOKEN, 1120);
     }
 }

@@ -137,7 +137,10 @@ mod tests {
             assert_eq!((group.tiles.len(), group.rows()), (tiles, span), "{w}x{h}");
             let ids =
                 expand_spans(&[5, 248_077, 6], m.image_token(), &[p.span_len]).expect("expand");
-            assert_eq!(ids.spans, [1..1 + span], "{w}x{h}");
+            // One span, the range itself. `[1..1 + span]` is a one-element array of a
+            // range, which is the lint's single-range init, not the positions inside it.
+            assert_eq!(ids.spans.len(), 1, "{w}x{h}");
+            assert_eq!(ids.spans[0], 1..1 + span, "{w}x{h}");
         }
     }
 }

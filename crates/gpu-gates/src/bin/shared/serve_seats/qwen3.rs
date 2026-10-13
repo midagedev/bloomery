@@ -1216,8 +1216,7 @@ fn slot_ctx(ctx: usize, parallel: usize) -> Result<usize, GateError> {
 /// has no image input, so `--mmproj` there is refused by name, and so is a build without the
 /// `vision` feature, whose tower is not built. A `minicpmv4_7` file is read here
 /// ([`open_minicpm`]): its image ids come from the text tokenizer, which the encoder file does
-/// not carry. The seat does not state that file's tile bound, so the open stops before a tower
-/// is sized.
+/// not carry. The tower is sized for [`vision_seat::MINICPM_TILE_TOKENS`] and seated.
 fn vision_of(
     a: &Args,
     arch: Arch,
@@ -1255,7 +1254,15 @@ fn vision_of(
     if let Some(enc) = file.as_deref()
         && is_minicpm_projector(enc)
     {
-        return open_minicpm(enc, &a.vision, &facts, token, one).map(Some);
+        return open_minicpm(
+            enc,
+            &a.vision,
+            a.place.unwrap_or(Place::A),
+            &facts,
+            token,
+            one,
+        )
+        .map(Some);
     }
     vision_seat::open_seat(
         &a.vision,
@@ -1279,18 +1286,21 @@ fn is_minicpm_projector(path: &Path) -> bool {
 }
 
 /// A `minicpmv4_7` encoder: the file's hyperparameters, the text tokenizer's marks and the `<unk>`
-/// pad ([`vision::arch::minicpmv::Media::new`]), held against the text model. The tower is not
-/// sized. The seat does not state the tile bound, so the file is refused by name before a card
-/// figure or a seat exists. `one` is a string that tokenizes to exactly one id.
+/// pad ([`vision::arch::minicpmv::Media::new`]), held against the text model. The tower is
+/// sized for [`vision_seat::MINICPM_TILE_TOKENS`] (1120 patches) and seated on `place`.
+/// `one` is a string that tokenizes to exactly one id.
+#[cfg(feature = "vision")]
 fn open_minicpm(
     path: &Path,
     flags: &vision_seat::Flags,
+    place: Place,
     text: &TextFacts,
     token: &dyn Fn(u32) -> Option<String>,
     one: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<Opened, GateError> {
     use vision::MediaModel;
     use vision::arch::minicpmv::{self, Hparams, Marks, Media};
+    use vision::arch::qwen3vl::TokenLimits;
 
     let at =
         |detail: &str| -> GateError { format!("--mmproj {}: {detail}", path.display()).into() };
@@ -1315,6 +1325,11 @@ fn open_minicpm(
     let hp = Hparams::read(&file).map_err(|e| at(&e.to_string()))?;
     hp.check_text_width(text.n_embd)
         .map_err(|e| at(&e.to_string()))?;
+    // The card borrows `hp`. `Media::new` takes `hp` after that.
+    let limits =
+        TokenLimits::new(1, vision_seat::MINICPM_TILE_TOKENS).map_err(|e| at(&e.to_string()))?;
+    let patches = vision_seat::MINICPM_TILE_TOKENS * vision_seat::MINICPM_PATCHES_PER_TOKEN;
+    let card = minicpmv::card::of(&hp, patches);
     let marks = Marks::lookup(one).map_err(|e| at(&e.to_string()))?;
     // The pad the group's rows expand to: the vocabulary's `<unk>`, one token.
     const PAD_TEXT: &str = "<unk>";
@@ -1366,12 +1381,31 @@ fn open_minicpm(
         }
         PleImage::Id(_) => {}
     }
-    // No tile bound is stated, so the tower is not sized and the encoder is not seated.
-    Err(at(&format!(
-        "the {} projector sizes its tower for the largest tile of its own slice plan; the \
-         seat does not state that bound yet",
-        minicpmv::PROJECTOR_TYPE
-    )))
+    let seat = vision_seat::encoder_seat(place, card.total())?;
+    Ok(vision_seat::Opened {
+        path: path.to_owned(),
+        seat,
+        media: Arc::new(media),
+        cap: limits.max(),
+        card,
+        limits,
+    })
+}
+
+/// The same open on a build whose tower is not compiled. The file is refused by name. No card
+/// figure and no seat: [`vision_seat::encoder_seat`] reads the census, and this build has no tower
+/// to put there.
+#[cfg(not(feature = "vision"))]
+fn open_minicpm(
+    path: &Path,
+    flags: &vision_seat::Flags,
+    place: Place,
+    text: &TextFacts,
+    token: &dyn Fn(u32) -> Option<String>,
+    one: &dyn Fn(&str) -> Option<u32>,
+) -> Result<Opened, GateError> {
+    let _ = (path, flags, place, text, token, one);
+    Err("--mmproj: this build takes no images (built without the vision feature)".into())
 }
 
 /// Why `BLOOMERY_DRAFT=dspark` on a qwen35moe file is refused: the card
