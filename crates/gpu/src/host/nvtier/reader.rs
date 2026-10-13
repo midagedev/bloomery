@@ -15,7 +15,7 @@
 //! time and the threads that find it taken go on to the next.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -62,6 +62,14 @@ impl Kind {
         }
     }
 
+    fn from_rank(rank: u8) -> Kind {
+        match rank {
+            0 => Kind::Step,
+            1 => Kind::Prompt,
+            _ => Kind::Victim,
+        }
+    }
+
     /// The kind of the fill of a batch claimed as `claim`: the one mapping of
     /// a claim to a rank.
     pub(super) fn of_claim(claim: Claim) -> Kind {
@@ -75,8 +83,13 @@ impl Kind {
 /// A fill in flight: `units` units of work, each run once on some reader
 /// thread, and the latch [`Reader::wait`] blocks on.
 pub(super) struct Job {
-    kind: Kind,
-    units: usize,
+    /// The kind's rank. Written by [`Job::rearm`] only while the job is not
+    /// queued, and read by the reader once it is.
+    kind: AtomicU8,
+    /// Units this submission runs. Same rule as `kind`: a reader copies the
+    /// value onto its queue entry at insert, so a later rearm does not race
+    /// the threads that already hold the job.
+    units: AtomicUsize,
     run: Unit,
     state: Mutex<JobState>,
     done: Condvar,
@@ -102,8 +115,8 @@ impl Job {
         run: impl Fn(usize) -> Result<(), GpuError> + Send + Sync + 'static,
     ) -> Job {
         Job {
-            kind,
-            units,
+            kind: AtomicU8::new(kind.rank()),
+            units: AtomicUsize::new(units),
             run: Box::new(run),
             state: Mutex::new(JobState {
                 left: units,
@@ -114,6 +127,27 @@ impl Job {
             }),
             done: Condvar::new(),
         }
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::from_rank(self.kind.load(Ordering::Relaxed))
+    }
+
+    fn units(&self) -> usize {
+        self.units.load(Ordering::Relaxed)
+    }
+
+    /// Arm this job for another submission. The caller has waited it out, and
+    /// has not queued it again: the closure stays the one [`Job::new`] boxed.
+    pub(super) fn rearm(&self, kind: Kind, units: usize) {
+        self.kind.store(kind.rank(), Ordering::Relaxed);
+        self.units.store(units, Ordering::Relaxed);
+        let mut s = self.lock();
+        s.left = units;
+        s.failed = None;
+        s.first = None;
+        s.last = None;
+        s.run_counted = false;
     }
 
     fn lock(&self) -> MutexGuard<'_, JobState> {
@@ -140,7 +174,7 @@ impl Job {
     /// Units `from ..` will never run, the tier having stopped: they finish
     /// as the failure `error` names, so a waiter is released.
     fn cancel(&self, from: usize, error: impl Fn() -> GpuError) {
-        for unit in from..self.units {
+        for unit in from..self.units() {
             self.finish_unit(unit, Err(error()), None);
         }
     }
@@ -226,6 +260,9 @@ struct Entry {
     rank: u8,
     job: Arc<Job>,
     next: usize,
+    /// Copied from the job at insert, so the queue does not read `job.units`
+    /// while a later rearm stores a new count.
+    units: usize,
 }
 
 struct Queue {
@@ -270,7 +307,7 @@ impl Shared {
             let unit = front.next;
             front.next += 1;
             let job = Arc::clone(&front.job);
-            if front.next == job.units {
+            if front.next == front.units {
                 q.jobs.pop_front();
             }
             drop(q);
@@ -392,9 +429,21 @@ impl Reader {
     /// lower or equal rank (its kind's) already queued. Refused by name once
     /// the reader has stopped.
     pub(super) fn submit(&self, job: Job) -> Result<Arc<Job>, GpuError> {
-        let rank = job.kind.rank();
-        let units = job.units;
         let job = Arc::new(job);
+        self.enqueue(&job)?;
+        Ok(job)
+    }
+
+    /// Queue `job` again. [`Job::rearm`] has set its kind and its units, and
+    /// the job is the one a previous wait finished: the open list drops that
+    /// arc before this submission is pushed, so one job is not open twice.
+    pub(super) fn resubmit(&self, job: &Arc<Job>) -> Result<(), GpuError> {
+        self.enqueue(job)
+    }
+
+    fn enqueue(&self, job: &Arc<Job>) -> Result<(), GpuError> {
+        let rank = job.kind().rank();
+        let units = job.units();
         let mut q = self.shared.queue();
         if q.stop {
             return Err(GpuError::protocol(
@@ -402,13 +451,13 @@ impl Reader {
                 "a fill queued after the tier's fill reader stopped".to_string(),
             ));
         }
-        let c = self.shared.counters.of(job.kind);
+        let c = self.shared.counters.of(job.kind());
         c.jobs.fetch_add(1, Ordering::Relaxed);
         c.units.fetch_add(units as u64, Ordering::Relaxed);
         {
             let mut open = self.shared.open.lock().unwrap_or_else(|e| e.into_inner());
-            open.retain(|j| j.is_open());
-            open.push(Arc::clone(&job));
+            open.retain(|j| !Arc::ptr_eq(j, job) && j.is_open());
+            open.push(Arc::clone(job));
         }
         if units > 0 {
             let at = q.jobs.partition_point(|e| e.rank <= rank);
@@ -416,14 +465,15 @@ impl Reader {
                 at,
                 Entry {
                     rank,
-                    job: Arc::clone(&job),
+                    job: Arc::clone(job),
                     next: 0,
+                    units,
                 },
             );
             drop(q);
             self.shared.work.notify_all();
         }
-        Ok(job)
+        Ok(())
     }
 
     /// Block until every unit of `job` has finished: the job's wall (ns, its
@@ -431,7 +481,7 @@ impl Reader {
     /// jobs' own failures reach the caller here, never as a panic on a
     /// reader.
     pub(super) fn wait(&self, job: &Job) -> Result<u64, Failure> {
-        let c = self.shared.counters.of(job.kind);
+        let c = self.shared.counters.of(job.kind());
         let mut s = job.lock();
         if s.left > 0 {
             let t0 = Instant::now();

@@ -193,7 +193,7 @@ fn legs(layer: &r8layer::Layer, split: &Split, lanes: Lanes) -> Vec<Vec<f32>> {
     for j in 0..COLS {
         let xj = Tensor2::from_vec(embd, 1, x[j * embd..(j + 1) * embd].to_vec());
         let mut out = vec![f32::NAN; embd];
-        host.experts_into_on(lanes, src, &xj, &lists[j], &mut out, &mut hs)
+        host.experts_into_on(lanes, src, &xj, &lists[j], &mut out, &mut hs, None)
             .unwrap();
         all.push(out);
     }

@@ -2232,17 +2232,34 @@ impl Drop for TierPin<'_> {
     }
 }
 
+/// What a [`Ticket`] waits on without boxing the wait. The tier that issued
+/// the ticket is the value, and the ticket only borrows it: a steady step
+/// issues one of these and allocates nothing for the handle. [`Ticket::wait`]
+/// calls [`TicketWait::finish_ticket`]; a ticket dropped first calls
+/// [`TicketWait::abandon_ticket`], which settles the claim the way a dropped
+/// boxed wait does.
+pub trait TicketWait<'a>: Sync {
+    /// Join the fill and return the batch's pin.
+    fn finish_ticket(&'a self) -> Result<TierPin<'a>, TierError>;
+    /// The ticket was dropped. Settle the claim and drop the pin.
+    fn abandon_ticket(&'a self);
+}
+
 /// A batch's claim in flight ([`TierSlots::prefetch_pinned`]): the batch's
 /// slots are taken in the tier's books and being filled, and
 /// [`Ticket::wait`] returns once every one is filled, with the batch pinned.
-/// The ticket owns its completion — a boxed handle, not a borrow of the
-/// tier's threads — so whoever fills may run anywhere. A claim with nothing
+/// A boxed handle ([`Ticket::new`]) owns a completion the tier's threads can
+/// run anywhere. A bound handle ([`Ticket::bound`]) borrows the tier instead,
+/// so the steady one-column miss allocates no wait. A claim with nothing
 /// to fill is a ready ticket, which holds its pin and allocates nothing. A
 /// ticket dropped without a wait gives its claim back: the batch is unpinned,
 /// once its fill has ended.
 #[must_use = "the claim lasts until the ticket is waited for or dropped"]
 pub struct Ticket<'a> {
     state: TicketState<'a>,
+    /// A bound ticket still owns the tier's claim. Cleared before the wait
+    /// runs, so dropping the ticket afterwards does not settle twice.
+    open: bool,
 }
 
 enum TicketState<'a> {
@@ -2250,6 +2267,10 @@ enum TicketState<'a> {
     Ready(TierPin<'a>),
     /// The fill ends as the handle returns.
     Pending(Box<dyn FnOnce() -> Result<TierPin<'a>, TierError> + Send + 'a>),
+    /// The fill ends as the borrowed tier says.
+    Bound(&'a dyn TicketWait<'a>),
+    /// [`Ticket::wait`] has taken the state.
+    Spent,
 }
 
 impl<'a> Ticket<'a> {
@@ -2258,6 +2279,7 @@ impl<'a> Ticket<'a> {
     pub fn new(wait: impl FnOnce() -> Result<TierPin<'a>, TierError> + Send + 'a) -> Ticket<'a> {
         Ticket {
             state: TicketState::Pending(Box::new(wait)),
+            open: false,
         }
     }
 
@@ -2265,6 +2287,15 @@ impl<'a> Ticket<'a> {
     pub fn ready(pin: TierPin<'a>) -> Ticket<'a> {
         Ticket {
             state: TicketState::Ready(pin),
+            open: false,
+        }
+    }
+
+    /// A ticket whose wait is `wait`, borrowed, not boxed.
+    pub fn bound(wait: &'a dyn TicketWait<'a>) -> Ticket<'a> {
+        Ticket {
+            state: TicketState::Bound(wait),
+            open: true,
         }
     }
 
@@ -2275,10 +2306,24 @@ impl<'a> Ticket<'a> {
     }
 
     /// Block until the batch is filled; its pin, or the fill's refusal.
-    pub fn wait(self) -> Result<TierPin<'a>, TierError> {
-        match self.state {
+    pub fn wait(mut self) -> Result<TierPin<'a>, TierError> {
+        self.open = false;
+        match std::mem::replace(&mut self.state, TicketState::Spent) {
             TicketState::Ready(pin) => Ok(pin),
             TicketState::Pending(wait) => wait(),
+            TicketState::Bound(wait) => wait.finish_ticket(),
+            TicketState::Spent => unreachable!("a ticket is waited for once"),
+        }
+    }
+}
+
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            self.open = false;
+            if let TicketState::Bound(wait) = &self.state {
+                (*wait).abandon_ticket();
+            }
         }
     }
 }
@@ -2598,11 +2643,42 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut HostScratch,
     ) -> Result<(), ModelError> {
-        self.experts_into_on(Lanes::host_tier(), src, x, experts, out, scratch)
+        self.experts_into_on(Lanes::host_tier(), src, x, experts, out, scratch, None)
+    }
+
+    /// [`HostLayer::experts_into`] on a load that prepared union slabs: a
+    /// tiered layer's one column prefetches its misses and, when that ticket
+    /// is still in flight and the one-column plan fits the slabs, computes
+    /// the hits through [`serve_step_split`] while they fill. A ready ticket
+    /// keeps today's [`serve`] on `scratch`. A layer with no tier, or a call
+    /// that passes no slabs, is [`HostLayer::experts_into`].
+    pub fn experts_into_resident(
+        &self,
+        src: R8Source<'_>,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+        scratch: &mut HostScratch,
+        union: &mut UnionScratch,
+    ) -> Result<(), ModelError> {
+        self.experts_into_on(
+            Lanes::host_tier(),
+            src,
+            x,
+            experts,
+            out,
+            scratch,
+            Some(union),
+        )
     }
 
     /// [`HostLayer::experts_into`] with its two row dispatches laid over the
     /// pool as `lanes` says: the same values, bit for bit, whichever lanes.
+    /// `union` is the load's slabs. With them, a tiered call's claim is
+    /// [`TierSlots::prefetch_pinned`]: a ready ticket, or a plan that does
+    /// not fit, waits and then runs today's [`serve`]; a pending ticket whose
+    /// plan fits runs the one-list split. Without them the claim is
+    /// [`TierSlots::ensure_pinned`] and the serve is today's, as before.
     pub fn experts_into_on(
         &self,
         lanes: Lanes,
@@ -2611,10 +2687,16 @@ impl HostLayer {
         experts: &[(u32, f32)],
         out: &mut [f32],
         scratch: &mut HostScratch,
+        union: Option<&mut UnionScratch>,
     ) -> Result<(), ModelError> {
         self.read_beside(src)?;
         let split = src.split();
         check_host_call(x, experts, out, scratch.n_used)?;
+        if self.tier.is_some()
+            && let Some(union) = union
+        {
+            return self.serve_column_resident(lanes, split, x, experts, out, scratch, union);
+        }
         // The call's ids stay pinned until the leg's reads end: no claim of
         // a lane's victim takes one of their slots between the fill and the
         // read, whatever the slot count.
@@ -2629,6 +2711,20 @@ impl HostLayer {
             }
             None => None,
         };
+        self.serve_column(lanes, split, x, experts, out, scratch)
+    }
+
+    /// Today's one-column leg: `out` is the list-order sum, each expert read
+    /// from the mapping or from a slot the caller already pinned.
+    fn serve_column(
+        &self,
+        lanes: Lanes,
+        split: &Split,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+        scratch: &mut HostScratch,
+    ) -> Result<(), ModelError> {
         out.fill(0.0);
         if experts.is_empty() {
             return Ok(());
@@ -2651,6 +2747,58 @@ impl HostLayer {
             lanes,
         };
         serve(weights, run, x, experts, out, scratch)
+    }
+
+    /// The one-column resident path. A ready ticket, a plan that does not fit
+    /// the slabs, or a call with no arena id waits and runs [`serve_column`].
+    /// A pending ticket whose plan fits computes hits while the misses fill.
+    fn serve_column_resident(
+        &self,
+        lanes: Lanes,
+        split: &Split,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+        scratch: &mut HostScratch,
+        union: &mut UnionScratch,
+    ) -> Result<(), ModelError> {
+        let lists: [&[(u32, f32)]; 1] = [experts];
+        union.plan.build(&lists, union.per_list)?;
+        if let Some(&e) = union.plan.ids.last()
+            && e as usize >= self.n_expert
+        {
+            return Err(ModelError::MissingTensor(format!(
+                "expert {e} of {}",
+                self.gate.source().info().name
+            )));
+        }
+        let tier = self.tier.as_ref().expect("a resident column has a tier");
+        union.tier_ids.clear();
+        union.tier_ids.extend(
+            union
+                .plan
+                .ids
+                .iter()
+                .copied()
+                .filter(|e| !tier.host.contains(e)),
+        );
+        if union.tier_ids.is_empty() {
+            return self.serve_column(lanes, split, x, experts, out, scratch);
+        }
+        let ticket = tier
+            .slots
+            .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step)?;
+        if ticket.is_ready() || !union.plan.fits(union.max_slots) {
+            let _pin = ticket.wait()?;
+            return self.serve_column(lanes, split, x, experts, out, scratch);
+        }
+        let mut stacks = self.stacks_of(split)?;
+        tier.lend(&mut stacks);
+        let run = LegRun {
+            limit: Some(self.limit),
+            lanes,
+        };
+        serve_step_split(stacks, run, x.view(), &lists, out, union, tier, ticket)
     }
 
     /// [`experts_union_into`] for this layer: up to the columns `scratch`
@@ -4509,6 +4657,93 @@ mod tests {
                 PinEvent::Unpinned(vec![0, 2, 5]),
             ],
             "the claim is let go whole"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// One column of a decode step, the resident path: the hits compute while
+    /// the misses fill, and the list-order sum is the plain leg's, bit for
+    /// bit. A ready ticket is not this case; the mock's ticket stays pending
+    /// so the split runs.
+    #[test]
+    fn a_one_column_step_computes_its_hits_under_the_misses_fill() {
+        let (embd, ff, n_expert) = (256, 256, 8);
+        let tys = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q4_K];
+        let path = layer_file("stepcol", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        // Host id 1. Tier ids 0, 2, 5; 0 is in flight, 2 and 5 are hits.
+        // The weights differ enough that a sum in another order moves bits.
+        let list = [(5u32, 0.9), (1, 1e-3), (2, 0.25), (0, 40.0)];
+        let (late, hits) = ([0u32], [2u32, 5]);
+        let src = R8Source::rows(&split);
+        let mut hs = HostScratch::new(embd, ff, 4).unwrap();
+        let mut us = UnionScratch::new_routed(embd, ff, 1, 4).unwrap();
+        let plain = build_layer(&split, embd, ff, n_expert).unwrap();
+        let mut want = vec![f32::NAN; embd];
+        plain
+            .experts_into(src, &x, &list, &mut want, &mut hs)
+            .unwrap();
+
+        let mut tier = MockTier::of(&split, &layer, true);
+        tier.slots = 2 * super::UNION_BATCH_IDS + 8;
+        tier.late = Some(late.to_vec());
+        let tier = std::sync::Arc::new(tier);
+        layer.attach_tier(4, 1..2, tier.clone());
+        let mut got = vec![f32::NAN; embd];
+        let passes = us.passes();
+        layer
+            .experts_into_on(
+                crate::ops::Lanes::Flat,
+                src,
+                &x,
+                &list,
+                &mut got,
+                &mut hs,
+                Some(&mut us),
+            )
+            .unwrap();
+        let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "the one-column split writes the plain leg's bits"
+        );
+        assert_eq!(us.passes() - passes, 4, "two groups of two claiming passes");
+        let trail = tier.trail.lock().unwrap().clone();
+        let wait = trail
+            .iter()
+            .position(|t| *t == Trail::Wait)
+            .expect("the ticket was waited for");
+        let before = |id: u32, part: usize| {
+            trail[..wait]
+                .iter()
+                .filter(|t| **t == Trail::Lent(id, part))
+                .count()
+        };
+        for id in late {
+            assert_eq!(
+                (0..3).map(|part| before(id, part)).sum::<usize>(),
+                0,
+                "expert {id} lent a part before its fill ended"
+            );
+        }
+        for id in hits {
+            assert!(
+                before(id, 2) >= 2,
+                "expert {id}'s down was read before the wait"
+            );
+        }
+        assert!(
+            tier.pins.lock().unwrap().loose.is_empty(),
+            "every slot the step read was pinned"
         );
         std::fs::remove_file(&path).unwrap();
     }

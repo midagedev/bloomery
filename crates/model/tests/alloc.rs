@@ -20,8 +20,8 @@ use gguf::{GgmlType, Split};
 use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{new_cache, step};
 use model::moe::{
-    Claim, HostLayer, HostScratch, PinRelease, PinToken, Ticket, TierError, TierPin, TierSlots,
-    UnionScratch,
+    Claim, HostLayer, HostScratch, PinRelease, PinToken, Ticket, TicketWait, TierError, TierPin,
+    TierSlots, UnionScratch,
 };
 use model::ops::{Lanes, ShardTensor, Tensor2};
 use model::r8file::R8Source;
@@ -189,7 +189,7 @@ fn hw_a_ccd_dispatch_allocates_no_more_than_a_flat_one() {
     let (mut out1, mut out3) = (vec![0.0f32; embd], vec![0.0f32; 3 * embd]);
     let mut calls = |lanes: Lanes, n: usize| {
         for _ in 0..n {
-            host.experts_into_on(lanes, src, &x, &lists[0], &mut out1, &mut hs)
+            host.experts_into_on(lanes, src, &x, &lists[0], &mut out1, &mut hs, None)
                 .unwrap();
             host.experts_step_union_into_on(lanes, src, &x3, &refs, &mut out3, &mut us)
                 .unwrap();
@@ -240,6 +240,10 @@ struct PoolTier {
     /// The lends made while a claim was in flight: its hits read under the
     /// misses' fill, the step's two-group path.
     early_lends: AtomicU64,
+    /// The pin of the one ticket in flight, when the wait is borrowed rather
+    /// than boxed. A second ticket that arrives while this is set takes the
+    /// boxed wait.
+    stash: Mutex<Option<PinToken>>,
 }
 
 impl PoolTier {
@@ -265,6 +269,7 @@ impl PoolTier {
             flight: AtomicU64::new(0),
             pending: AtomicU64::new(0),
             early_lends: AtomicU64::new(0),
+            stash: Mutex::new(None),
         }
     }
 
@@ -286,6 +291,26 @@ impl PinRelease for PoolTier {
     fn release(&self, mut token: PinToken) {
         token.ids.clear();
         self.idle.lock().unwrap().push(token.ids);
+    }
+}
+
+impl<'a> TicketWait<'a> for PoolTier {
+    fn finish_ticket(&'a self) -> Result<TierPin<'a>, TierError> {
+        self.flight.store(0, Relaxed);
+        let token = self
+            .stash
+            .lock()
+            .unwrap()
+            .take()
+            .expect("a step ticket settles once");
+        Ok(TierPin::new(self, token))
+    }
+
+    fn abandon_ticket(&'a self) {
+        self.flight.store(0, Relaxed);
+        if let Some(token) = self.stash.lock().unwrap().take() {
+            self.release(token);
+        }
     }
 }
 
@@ -322,13 +347,21 @@ impl TierSlots for PoolTier {
         if in_flight == 0 {
             return self.ensure_pinned(layer, ids, claim).map(Ticket::ready);
         }
-        let pin = self.pinned(layer, ids);
-        self.flight.store(in_flight, Relaxed);
         self.pending.fetch_add(1, Relaxed);
-        Ok(Ticket::new(move || {
-            self.flight.store(0, Relaxed);
-            Ok(pin)
-        }))
+        if self.stash.lock().unwrap().is_some() {
+            let pin = self.pinned(layer, ids);
+            self.flight.store(in_flight, Relaxed);
+            return Ok(Ticket::new(move || {
+                self.flight.store(0, Relaxed);
+                Ok(pin)
+            }));
+        }
+        let mut held = self.idle.lock().unwrap().pop().unwrap_or_default();
+        held.clear();
+        held.extend_from_slice(ids);
+        *self.stash.lock().unwrap() = Some(PinToken { layer, ids: held });
+        self.flight.store(in_flight, Relaxed);
+        Ok(Ticket::bound(self))
     }
 
     fn slot(&self, _layer: usize, id: u32, part: usize) -> Option<&[u8]> {
@@ -392,7 +425,7 @@ fn hw_a_tier_pin_adds_no_allocator_call_to_the_step_legs() {
     let mut least = |host: &HostLayer| {
         let mut calls = |n: usize| {
             for _ in 0..n {
-                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs)
+                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs, None)
                     .unwrap();
                 host.experts_step_union_into_on(Lanes::Flat, src, &x3, &refs, &mut out3, &mut us)
                     .unwrap();
@@ -429,13 +462,11 @@ fn hw_a_tier_pin_adds_no_allocator_call_to_the_step_legs() {
 /// Allocator calls a step union adds when some ids of its claim are misses,
 /// per call of the arm's two legs, against the same layer with no tier.
 ///
-/// PIN(2026-10-12): 1. Derived from the code: the pending ticket's boxed wait
-/// is the one allocation a miss layer's union makes here, the model side's
-/// two-group path makes none, and the one-column leg pins as before. The
-/// tier's own issue allocates on top (the reader's job, its picks and
-/// closures, the prompt path's shape reused) and is the gpu crate's side;
-/// making it allocation-free is a tracker item.
-const MISS_CALLS: u64 = 1;
+/// PIN(2026-10-14): 0. The pending ticket borrows the tier (`Ticket::bound`);
+/// the boxed wait is only the overlap, which this arm does not issue. The
+/// one-column miss takes the same borrowed ticket. The tier double's id
+/// buffer is the pin pool's.
+const MISS_CALLS: u64 = 0;
 
 /// A steady step whose union claim holds misses takes the two-group path and
 /// makes no more allocator calls than [`MISS_CALLS`] a call over the same
@@ -474,7 +505,7 @@ fn hw_a_step_with_misses_pins_the_allocator_calls_of_its_miss_path() {
     let mut least = |host: &HostLayer| {
         let mut calls = |n: usize| {
             for _ in 0..n {
-                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs)
+                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs, None)
                     .unwrap();
                 host.experts_step_union_into_on(Lanes::Flat, src, &x3, &refs, &mut out3, &mut us)
                     .unwrap();
@@ -509,5 +540,76 @@ fn hw_a_step_with_misses_pins_the_allocator_calls_of_its_miss_path() {
     assert!(
         missed <= flat + MISS_CALLS * 8, // one miss union a call, eight calls
         "the legs over a layer with misses made {missed} allocator calls over 8 calls, {flat} over the same layer with no tier"
+    );
+}
+
+/// A one-column step whose list holds a miss takes the resident split and
+/// adds no allocator call over the same layer with no tier. The arm's list
+/// is a hit and a late id, so the ticket is pending and the hit is lent
+/// while the miss is in flight.
+#[test]
+#[ignore = "hw: needs the box; reads no model file"]
+fn hw_a_one_column_miss_allocates_nothing() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let layer = r8layer::Layer::write("alloc-col", 512, 256, 16, GgmlType::Q4_K);
+    let (embd, ff) = (layer.embd, layer.ff);
+    let split = Split::open(&layer.source).unwrap();
+    let src = R8Source::rows(&split);
+    let mut host = HostLayer::build(src, &layer.spec()).unwrap();
+    let mut hs = HostScratch::new(embd, ff, 4).unwrap();
+    let mut us = UnionScratch::new_routed(embd, ff, 1, 4).unwrap();
+    let x = Tensor2::from_vec(
+        embd,
+        1,
+        (0..embd).map(|i| (i % 17) as f32 / 9.0 - 0.9).collect(),
+    );
+    let list = [(0u32, 0.25), (5, 0.25)];
+    let mut out = vec![0.0f32; embd];
+    IS_MAIN.with(|m| m.set(true));
+    let mut least = |host: &HostLayer, resident: bool| {
+        let mut calls = |n: usize| {
+            for _ in 0..n {
+                if resident {
+                    host.experts_into_on(
+                        Lanes::Flat,
+                        src,
+                        &x,
+                        &list,
+                        &mut out,
+                        &mut hs,
+                        Some(&mut us),
+                    )
+                    .unwrap();
+                } else {
+                    host.experts_into_on(Lanes::Flat, src, &x, &list, &mut out, &mut hs, None)
+                        .unwrap();
+                }
+            }
+        };
+        calls(20);
+        let mut least = u64::MAX;
+        for _ in 0..3 {
+            let c0 = CALLS.load(Relaxed);
+            calls(8);
+            least = least.min(CALLS.load(Relaxed) - c0);
+        }
+        least
+    };
+    let flat = least(&host, false);
+    let tier = Arc::new(PoolTier::of(&split, &host, 16).late(&[5]));
+    host.attach_tier(0, 0..0, tier.clone());
+    let missed = least(&host, true);
+    assert_eq!(
+        tier.pending.load(Relaxed),
+        20 + 3 * 8,
+        "every one-column call was issued a pending ticket"
+    );
+    assert!(
+        tier.early_lends.load(Relaxed) > 0,
+        "the hit was never lent while the miss was in flight"
+    );
+    assert!(
+        missed <= flat,
+        "the one-column miss made {missed} allocator calls over 8 calls, {flat} with no tier"
     );
 }

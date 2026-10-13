@@ -219,13 +219,46 @@ impl HostExperts for HostRun {
         experts: &[(u32, f32)],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        let view = layer
-            .checked_sub(self.first)
-            .and_then(|i| self.layers.get(i))
-            .ok_or(GpuError::State {
+        let index = layer.checked_sub(self.first).ok_or(GpuError::State {
+            what: "HostRun::experts_into",
+            missing: "the layer's routed stacks: it is outside the host run",
+        })?;
+        if self.layers.get(index).is_none() {
+            return Err(GpuError::State {
                 what: "HostRun::experts_into",
                 missing: "the layer's routed stacks: it is outside the host run",
-            })?;
+            });
+        }
+        // A tiered load prepares union slabs of at least one column. That
+        // call is the resident path: hits compute while a miss fills. A load
+        // with no slabs keeps today's fill-then-serve.
+        if self.tier.is_some() && self.union.is_some() {
+            let HostRun {
+                file,
+                layers,
+                scratch,
+                union,
+                reads,
+                tier,
+                ..
+            } = self;
+            let view = &layers[index];
+            view.experts_into_resident(
+                file.source(),
+                x,
+                experts,
+                out,
+                scratch,
+                union.as_mut().expect("the branch found the slabs"),
+            )?;
+            reads.arena_or_file(
+                tier.as_deref(),
+                layer,
+                experts.iter().map(|&(id, _)| id),
+            );
+            return Ok(());
+        }
+        let view = &self.layers[index];
         view.experts_into(self.file.source(), x, experts, out, &mut self.scratch)?;
         self.reads.arena_or_file(
             self.tier.as_deref(),

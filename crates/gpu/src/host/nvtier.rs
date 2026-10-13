@@ -90,7 +90,7 @@
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -99,7 +99,9 @@ use bloomery_levers::NvTierMem;
 use cuda_core::CudaContext;
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
-use model::moe::{Claim, PinRelease, PinToken, Ticket, TierError, TierPin, TierSlots};
+use model::moe::{
+    Claim, PinRelease, PinToken, Ticket, TicketWait, TierError, TierPin, TierSlots,
+};
 use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
 use model::placement::workstation::ArenaGrant;
@@ -495,6 +497,35 @@ fn claim_with(
     kind: Claim,
     pin: bool,
 ) -> Result<Claimed, GpuError> {
+    let mut picks = Vec::new();
+    let mut evicted = Vec::new();
+    let mut pinned = Vec::new();
+    let misses = claim_fill(
+        layer, arena, books, ids, kind, pin, &mut picks, &mut evicted, &mut pinned,
+    )?;
+    Ok(Claimed {
+        picks,
+        evicted,
+        misses,
+        pinned,
+    })
+}
+
+/// [`claim_with`] into the caller's buffers. A `pinned` buffer that already
+/// has capacity is the pin's id buffer; a fresh empty one takes a buffer from
+/// the arena's pool, as the allocating claim always did. On a refusal the
+/// picks are given back and cleared, and the pin drops.
+fn claim_fill(
+    layer: usize,
+    arena: &LayerArena,
+    books: &mut Books,
+    ids: &[u32],
+    kind: Claim,
+    pin: bool,
+    picks: &mut Vec<Pick>,
+    evicted: &mut Vec<usize>,
+    pinned: &mut Vec<u32>,
+) -> Result<u64, GpuError> {
     const WHAT: &str = "NvTier::ensure";
     let n = arena.n_expert as usize;
     for marks in [&mut books.seen, &mut books.named] {
@@ -524,17 +555,26 @@ fn claim_with(
             },
         )));
     }
-    let mut claim = Claimed {
-        picks: Vec::new(),
-        evicted: Vec::new(),
-        misses: 0,
-        pinned: Vec::new(),
+    picks.clear();
+    evicted.clear();
+    let pin_ids = if pin {
+        if pinned.capacity() > 0 {
+            let mut buf = std::mem::take(pinned);
+            buf.clear();
+            buf
+        } else {
+            arena.take_ids()
+        }
+    } else {
+        Vec::new()
     };
+    pinned.clear();
+    let mut misses = 0u64;
     // Closes the hits' pins when the claim is refused.
     let mut held = BatchPin {
         arena,
         layer,
-        ids: if pin { arena.take_ids() } else { Vec::new() },
+        ids: pin_ids,
     };
     for &id in ids {
         let at = id as usize;
@@ -553,14 +593,15 @@ fn claim_with(
             }
             continue;
         }
-        claim.misses += 1;
+        misses += 1;
         let own = |s: &SlotBook| {
             kind == Claim::Transient && books.named[s.id.load(Ordering::Relaxed) as usize]
         };
         let slot = match pick_slot(&arena.slots, |s| arena.pins(s) || own(s)) {
             Ok(slot) => slot,
             Err(why) => {
-                unclaim(arena, &claim.picks);
+                unclaim(arena, picks);
+                picks.clear();
                 return Err(match why {
                     NoSlot::Filling => {
                         GpuError::shape(WHAT, "every slot is filling: two ensures raced a layer")
@@ -581,16 +622,16 @@ fn claim_with(
         let gone = (book.state.load(Ordering::Relaxed) == FILLED).then(|| {
             let gone = book.id.load(Ordering::Relaxed);
             arena.of_id[gone as usize].store(0, Ordering::Relaxed);
-            claim.evicted.push(slot);
+            evicted.push(slot);
             gone
         });
         book.state.store(FILLING, Ordering::Relaxed);
         book.id.store(id, Ordering::Relaxed);
         arena.of_id[at].store(slot as u32 + 1, Ordering::Relaxed);
-        claim.picks.push(Pick { slot, id, gone });
+        picks.push(Pick { slot, id, gone });
     }
-    claim.pinned = std::mem::take(&mut held.ids);
-    Ok(claim)
+    *pinned = std::mem::take(&mut held.ids);
+    Ok(misses)
 }
 
 /// Give back what a refused claim took, last pick first: a slot that held an
@@ -1326,6 +1367,67 @@ impl DropShared {
     }
 }
 
+/// The reads of the one reused step fill. The job's closure clones one part
+/// out and drops the lock before the read.
+struct StepBuf {
+    mem: Arc<ArenaMem>,
+    reads: Mutex<Vec<PickRead>>,
+}
+
+/// The pin a step ticket holds until it is waited for or dropped.
+struct HeldClaim {
+    layer: usize,
+    ids: Vec<u32>,
+}
+
+/// One step fill, reused. A steady decode issues one prefetch at a time, so
+/// one slot covers it and the issue allocates nothing after the first build.
+/// A second prefetch that arrives while this one is open takes the allocating
+/// path instead of sharing the slot.
+struct StepSlot {
+    active: AtomicBool,
+    buf: Arc<StepBuf>,
+    job: Mutex<Arc<Job>>,
+    picks: Mutex<Vec<Pick>>,
+    evicted: Mutex<Vec<usize>>,
+    held: Mutex<Option<HeldClaim>>,
+    kind: Mutex<Claim>,
+    layer: AtomicUsize,
+}
+
+impl StepSlot {
+    fn new(mem: Arc<ArenaMem>, slots: usize) -> StepSlot {
+        let buf = Arc::new(StepBuf {
+            mem,
+            reads: Mutex::new(Vec::with_capacity(slots)),
+        });
+        let job_buf = Arc::clone(&buf);
+        let job = Arc::new(Job::new(Kind::Step, 0, move |unit| {
+            step_read(&job_buf, unit)
+        }));
+        StepSlot {
+            active: AtomicBool::new(false),
+            buf,
+            job: Mutex::new(job),
+            picks: Mutex::new(Vec::with_capacity(slots)),
+            evicted: Mutex::new(Vec::with_capacity(slots)),
+            held: Mutex::new(None),
+            kind: Mutex::new(Claim::Step),
+            layer: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_begin(&self) -> bool {
+        self.active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn release(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
 /// The RAM arena of the NVMe expert tier ([`NvTier::of_paged`]).
 pub struct NvTier {
     /// The arena's mapping, shared with the fills' reads.
@@ -1352,6 +1454,8 @@ pub struct NvTier {
     /// The threads a decode step's misses and a prompt batch's fill run on
     /// ([`NvTier::prefetch_pinned`]).
     reader: Reader,
+    /// The one-column step's reused fill. See [`StepSlot`].
+    step: StepSlot,
     /// The split whose shards' mappings the readers read and the drops
     /// advise.
     split: Arc<Split>,
@@ -1656,6 +1760,8 @@ impl NvTier {
             arena.idle = id_pool(count);
         }
         let reader = Reader::start(NVTIER_FILL_THREADS, "nvtier-fill")?;
+        let mem = Arc::new(mem);
+        let step = StepSlot::new(Arc::clone(&mem), count);
         let drops = Arc::new(DropShared {
             split: Arc::clone(split),
             queue: Mutex::new(DropQueue {
@@ -1679,8 +1785,9 @@ impl NvTier {
             })
             .map_err(|e| GpuError::shape(WHAT, format!("the dropper thread: {e}")))?;
         Ok(NvTier {
-            mem: Arc::new(mem),
+            mem,
             reader,
+            step,
             by_layer: arenas,
             books: Mutex::new(Books::default()),
             stats: Stats::default(),
@@ -2460,6 +2567,193 @@ impl NvTier {
             .map_or(Ok(()), Err)
     }
 
+    /// The step slot's claim. `Ok(Some(pin))` is a batch with nothing to fill.
+    /// `Ok(None)` has queued the reused job; [`NvTier::step_finish`] joins it.
+    /// A refusal gives the claim back and leaves the slot's buffers empty.
+    fn issue_step(
+        &self,
+        layer: usize,
+        ids: &[u32],
+        kind: Claim,
+    ) -> Result<Option<TierPin<'_>>, TierError> {
+        const WHAT: &str = "NvTier::ensure";
+        let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
+            return Err(seam_error(
+                layer,
+                ids,
+                GpuError::state(WHAT, "the layer's arena"),
+            ));
+        };
+        let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut evicted = self.step.evicted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pinned = Vec::new();
+        let filled = {
+            let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+            claim_fill(
+                layer,
+                arena,
+                &mut books,
+                ids,
+                kind,
+                true,
+                &mut picks,
+                &mut evicted,
+                &mut pinned,
+            )
+        };
+        let misses = match filled {
+            Ok(misses) => misses,
+            Err(e) => {
+                picks.clear();
+                evicted.clear();
+                return Err(seam_error(layer, ids, e));
+            }
+        };
+        self.stats.misses.fetch_add(misses, Ordering::Relaxed);
+        self.stats
+            .pinned_claim(kind, pinned.len() as u64, misses);
+        let n_evict = evicted.len() as u64;
+        evicted.clear();
+        drop(evicted);
+        if n_evict > 0 {
+            self.stats.evictions.fetch_add(n_evict, Ordering::Relaxed);
+            self.stats
+                .resident_bytes
+                .fetch_sub(n_evict * arena.slot_bytes as u64, Ordering::Relaxed);
+        }
+        if picks.is_empty() {
+            drop(picks);
+            return Ok(Some(TierPin::new(
+                arena,
+                PinToken { layer, ids: pinned },
+            )));
+        }
+        {
+            let mut reads = self
+                .step
+                .buf
+                .reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            reads.clear();
+            for p in picks.iter() {
+                reads.push(read_of(arena, p));
+            }
+        }
+        let units = picks.len() * PARTS;
+        drop(picks);
+        *self.step.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(HeldClaim {
+            layer,
+            ids: pinned,
+        });
+        *self.step.kind.lock().unwrap_or_else(|e| e.into_inner()) = kind;
+        self.step.layer.store(layer, Ordering::Relaxed);
+        let job = Arc::clone(&self.step.job.lock().unwrap_or_else(|e| e.into_inner()));
+        job.rearm(Kind::of_claim(kind), units);
+        if let Err(e) = self.reader.resubmit(&job) {
+            let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
+            free_picks(arena, &picks);
+            picks.clear();
+            if let Some(held) = self
+                .step
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                drop(BatchPin {
+                    arena,
+                    layer: held.layer,
+                    ids: held.ids,
+                });
+            }
+            return Err(seam_error(layer, ids, e));
+        }
+        Ok(None)
+    }
+
+    /// Join the step slot's fill, publish it, and return the pin. On a
+    /// failure the picks are freed and the pin dropped.
+    fn step_finish(&self) -> Result<TierPin<'_>, TierError> {
+        let layer = self.step.layer.load(Ordering::Relaxed);
+        let kind = *self.step.kind.lock().unwrap_or_else(|e| e.into_inner());
+        let job = Arc::clone(&self.step.job.lock().unwrap_or_else(|e| e.into_inner()));
+        let wall = match self.reader.wait(&job) {
+            Ok(wall) => wall,
+            Err(f) => {
+                let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
+                let id = picks
+                    .get(f.unit / PARTS)
+                    .map(|p| p.id)
+                    .unwrap_or(u32::MAX);
+                if let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) {
+                    free_picks(arena, &picks);
+                }
+                picks.clear();
+                if let Some(held) = self
+                    .step
+                    .held
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    if let Some(arena) = self.by_layer.get(held.layer).and_then(|l| l.as_ref()) {
+                        drop(BatchPin {
+                            arena,
+                            layer: held.layer,
+                            ids: held.ids,
+                        });
+                    }
+                }
+                return Err(fill_error(
+                    layer,
+                    FillFailed { id, error: f.error },
+                ));
+            }
+        };
+        let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
+        let held = self
+            .step
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("a step fill holds its pin");
+        let arena = self
+            .by_layer
+            .get(held.layer)
+            .and_then(|l| l.as_ref())
+            .expect("a step fill's layer has an arena");
+        let mut batch = BatchPin {
+            arena,
+            layer: held.layer,
+            ids: held.ids,
+        };
+        if let Err(error) = {
+            let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+            publish_pinned(arena, &mut books, &picks, kind, &mut batch)
+        } {
+            let id = picks.first().map(|p| p.id).unwrap_or(u32::MAX);
+            free_picks(arena, &picks);
+            picks.clear();
+            drop(batch);
+            return Err(fill_error(held.layer, FillFailed { id, error }));
+        }
+        if self.audit.get().is_some()
+            && let Err(e) = self.audit_slots(batch.layer, &batch.ids)
+        {
+            let ids: Vec<u32> = batch.ids.clone();
+            drop(batch);
+            picks.clear();
+            return Err(seam_error(layer, &ids, e));
+        }
+        if !picks.is_empty() {
+            count_fill(&self.stats, arena, &picks, wall, Some(kind));
+        }
+        picks.clear();
+        Ok(TierPin::new(arena, batch.into_token()))
+    }
+
     /// [`NvTier::ensure_pinned`] as a claim in flight: the batch is claimed
     /// and its hits pinned on the caller, its misses' reads queued on the
     /// tier's reader at the rank its claim sets, and the [`Inflight`] returned
@@ -2511,6 +2805,8 @@ struct PickRead {
 
 /// One part's read: the file's aligned span from `start` into `span` bytes
 /// of the mapping at `at`, of which the part needs the first `need`.
+/// Cloning clones the file's `Arc`, not the file.
+#[derive(Clone)]
 struct PartRead {
     file: Arc<DirectFile>,
     at: usize,
@@ -2544,8 +2840,11 @@ fn read_of(arena: &LayerArena, p: &Pick) -> PickRead {
 /// writes only this part's window of it. The three parts are disjoint, so
 /// they run together.
 fn read_part(mem: &ArenaMem, r: &PickRead, part: usize) -> Result<(), GpuError> {
+    read_part_of(mem, r.id, &r.parts[part])
+}
+
+fn read_part_of(mem: &ArenaMem, id: u32, part: &PartRead) -> Result<(), GpuError> {
     const WHAT: &str = "NvTier::fill";
-    let part = &r.parts[part];
     let got = mem
         .read_into(&part.file, part.start, part.at, part.span)
         .map_err(|e| GpuError::plan(WHAT, e))?;
@@ -2553,12 +2852,31 @@ fn read_part(mem: &ArenaMem, r: &PickRead, part: usize) -> Result<(), GpuError> 
         return Err(GpuError::shape(
             WHAT,
             format!(
-                "expert {}: the run ends {got} B in, its part needs {} B at {}",
-                r.id, part.need, part.start
+                "expert {id}: the run ends {got} B in, its part needs {} B at {}",
+                part.need, part.start
             ),
         ));
     }
     Ok(())
+}
+
+/// One unit of the reused step job. The pick's part is cloned out of the
+/// buffer before the read, so the three parts of a fill do not share the lock.
+fn step_read(buf: &StepBuf, unit: usize) -> Result<(), GpuError> {
+    let (id, part) = {
+        let reads = buf.reads.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(read) = reads.get(unit / PARTS) else {
+            return Err(GpuError::protocol(
+                "NvTier::fill",
+                format!(
+                    "unit {unit} is past the step fill's {} picks",
+                    reads.len()
+                ),
+            ));
+        };
+        (read.id, read.parts[unit % PARTS].clone())
+    };
+    read_part_of(&buf.mem, id, &part)
 }
 
 /// One pick's three parts, read one after another on this thread. The pool
@@ -2850,6 +3168,29 @@ impl TierSlots for NvTier {
         ids: &[u32],
         claim: Claim,
     ) -> Result<Ticket<'a>, TierError> {
+        // The steady step reuses one slot and boxes nothing. A prefetch that
+        // arrives while that slot is open keeps the allocating path.
+        if self.step.try_begin() {
+            match self.issue_step(layer, ids, claim) {
+                Ok(Some(pin)) => {
+                    if self.audit.get().is_some() {
+                        let audit_ids = pin.ids().to_vec();
+                        if let Err(e) = self.audit_slots(layer, &audit_ids) {
+                            drop(pin);
+                            self.step.release();
+                            return Err(seam_error(layer, &audit_ids, e));
+                        }
+                    }
+                    self.step.release();
+                    return Ok(Ticket::ready(pin));
+                }
+                Ok(None) => return Ok(Ticket::bound(self)),
+                Err(e) => {
+                    self.step.release();
+                    return Err(e);
+                }
+            }
+        }
         let inflight = match self
             .prefetch(layer, ids, claim)
             .map_err(|e| seam_error(layer, ids, e))?
@@ -2888,6 +3229,20 @@ impl TierSlots for NvTier {
                 books.resize(layer + 1, None);
             }
             books[layer] = Some(book);
+        }
+    }
+}
+
+impl<'a> TicketWait<'a> for NvTier {
+    fn finish_ticket(&'a self) -> Result<TierPin<'a>, TierError> {
+        let pin = self.step_finish();
+        self.step.release();
+        pin
+    }
+
+    fn abandon_ticket(&'a self) {
+        if let Ok(pin) = self.finish_ticket() {
+            drop(pin);
         }
     }
 }
