@@ -114,7 +114,7 @@ mod gate {
     use decision::head::HeadConfig;
     use decision::json::{self, Json};
     use decision::render::dumps;
-    use decision::safetensors::write;
+    use hf::safetensors::write;
     use serde_json::Value;
 
     use crate::decide_gate::{

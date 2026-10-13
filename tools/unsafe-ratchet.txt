@@ -258,7 +258,10 @@ gpu-mimo2 0 0 0
 # and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_head_rms_norm 2,
 # vis_silu_mul_clamp 2, vis_gelu_erf 1.
 gpu-vision 91 0 0
-hf 0 0 0
+# PIN(2026-10-13): hf 0 -> 2 blocks, new code, not old code relaxed: the DSpark draft's 1.9 GB safetensors file is read
+# through a read-only mapping (Safetensors::open) instead of into memory, and a bf16 tensor's bytes are viewed as u16
+# (Safetensors::bf16, a misaligned file refused), each block with its SAFETY line.
+hf 2 0 0
 jinja 0 0 0
 levers 0 0 0
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes

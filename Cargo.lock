@@ -87,6 +87,7 @@ name = "bloomery-decision"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-hf",
  "bloomery-jinja",
  "bloomery-tokenizer",
  "bloomery-vision",
@@ -235,6 +236,9 @@ dependencies = [
 name = "bloomery-hf"
 version = "0.1.0"
 dependencies = [
+ "bloomery-gguf",
+ "bloomery-runtime",
+ "memmap2",
  "serde_json",
  "sha1",
  "sha2",

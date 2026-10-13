@@ -496,6 +496,10 @@ name = "gate_linear"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen35_dspark"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_qwen35moe_attn"
 required-features = ["gpu"]
 

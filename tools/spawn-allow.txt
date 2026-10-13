@@ -37,6 +37,7 @@ crates/gpu-gates/src/bin/gate_dspark_experts.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_dspark_hc.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_gemm.rs 2 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_linear.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_qwen35_dspark.rs 1 a gate binary, never pinned: the host reference's scoped workers
 crates/gpu-gates/src/bin/gate_qwen35moe_attn.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_qwen35moe_moe.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_qwen3moe_flash.rs 1 a gate binary, never pinned
