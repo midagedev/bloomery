@@ -1443,12 +1443,6 @@ struct StepBuf {
     reads: Mutex<Vec<PickRead>>,
 }
 
-/// The pin a step ticket holds until it is waited for or dropped.
-struct HeldClaim {
-    layer: usize,
-    ids: Vec<u32>,
-}
-
 /// One step fill, reused. A steady decode issues one prefetch at a time, so
 /// one slot covers it and the issue allocates nothing after the first build.
 /// A second prefetch that arrives while this one is open takes the allocating
@@ -1459,7 +1453,9 @@ struct StepSlot {
     job: Mutex<Arc<Job>>,
     picks: Mutex<Vec<Pick>>,
     evicted: Mutex<Vec<usize>>,
-    held: Mutex<Option<HeldClaim>>,
+    /// The pin a step ticket holds until it is waited for or dropped: the
+    /// same layer and ids a [`PinToken`] carries.
+    held: Mutex<Option<PinToken>>,
     kind: Mutex<Claim>,
     layer: AtomicUsize,
 }
@@ -2705,7 +2701,7 @@ impl NvTier {
         let units = picks.len() * PARTS;
         drop(picks);
         *self.step.held.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(HeldClaim { layer, ids: pinned });
+            Some(PinToken { layer, ids: pinned });
         *self.step.kind.lock().unwrap_or_else(|e| e.into_inner()) = kind;
         self.step.layer.store(layer, Ordering::Relaxed);
         let job = Arc::clone(&self.step.job.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2738,33 +2734,6 @@ impl NvTier {
         let layer = self.step.layer.load(Ordering::Relaxed);
         let kind = *self.step.kind.lock().unwrap_or_else(|e| e.into_inner());
         let job = Arc::clone(&self.step.job.lock().unwrap_or_else(|e| e.into_inner()));
-        let wall = match self.reader.wait(&job) {
-            Ok(wall) => wall,
-            Err(f) => {
-                let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
-                let id = picks.get(f.unit / PARTS).map(|p| p.id).unwrap_or(u32::MAX);
-                if let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) {
-                    free_picks(arena, &picks);
-                }
-                picks.clear();
-                if let Some(held) = self
-                    .step
-                    .held
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
-                    && let Some(arena) = self.by_layer.get(held.layer).and_then(|l| l.as_ref())
-                {
-                    drop(BatchPin {
-                        arena,
-                        layer: held.layer,
-                        ids: held.ids,
-                    });
-                }
-                return Err(fill_error(layer, FillFailed { id, error: f.error }));
-            }
-        };
-        let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
         let held = self
             .step
             .held
@@ -2777,35 +2746,38 @@ impl NvTier {
             .get(held.layer)
             .and_then(|l| l.as_ref())
             .expect("a step fill's layer has an arena");
-        let mut batch = BatchPin {
+        let held = BatchPin {
             arena,
             layer: held.layer,
             ids: held.ids,
         };
-        if let Err(error) = {
-            let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            publish_pinned(arena, &mut books, &picks, kind, &mut batch)
-        } {
-            let id = picks.first().map(|p| p.id).unwrap_or(u32::MAX);
-            free_picks(arena, &picks);
-            picks.clear();
-            drop(batch);
-            return Err(fill_error(held.layer, FillFailed { id, error }));
-        }
-        if self.audit.get().is_some()
-            && let Err(e) = self.audit_slots(batch.layer, &batch.ids)
-        {
-            let ids: Vec<u32> = batch.ids.clone();
-            drop(batch);
-            picks.clear();
-            return Err(seam_error(layer, &ids, e));
-        }
-        if !picks.is_empty() {
-            count_fill(&self.stats, arena, &picks, wall, Some(kind));
-            self.stats.note_step_wall(kind, wall);
-        }
+        let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
+        let filled = settle_fill(
+            TierParts {
+                arena,
+                books: &self.books,
+                stats: &self.stats,
+                reader: &self.reader,
+            },
+            kind,
+            &picks,
+            held,
+            Some(job),
+        );
+        let result = (|| {
+            let (held, wall) = filled.map_err(|f| fill_error(layer, f))?;
+            if self.audit.get().is_some() {
+                self.audit_slots(layer, &held.ids)
+                    .map_err(|e| seam_error(layer, &held.ids, e))?;
+            }
+            if !picks.is_empty() {
+                count_fill(&self.stats, arena, &picks, wall, Some(kind));
+                self.stats.note_step_wall(kind, wall);
+            }
+            Ok(TierPin::new(arena, held.into_token()))
+        })();
         picks.clear();
-        Ok(TierPin::new(arena, batch.into_token()))
+        result
     }
 
     /// [`NvTier::ensure_pinned`] as a claim in flight: the batch is claimed
@@ -3012,6 +2984,37 @@ struct FillFailed {
     error: GpuError,
 }
 
+/// Wait for `job`, then publish `picks` under the books lock. A failed wait
+/// or a failed publish frees the picks; the pin drops with this call's
+/// error. The sync claim and the reused step job share it.
+fn settle_fill<'a>(
+    tier: TierParts<'a>,
+    kind: Claim,
+    picks: &[Pick],
+    mut held: BatchPin<'a>,
+    job: Option<Arc<Job>>,
+) -> Result<(BatchPin<'a>, u64), FillFailed> {
+    let first = picks.first().map_or(u32::MAX, |p| p.id);
+    let wall = match job {
+        Some(job) => tier.reader.wait(&job).map_err(|f| {
+            free_picks(tier.arena, picks);
+            FillFailed {
+                id: picks[f.unit / PARTS].id,
+                error: f.error,
+            }
+        })?,
+        None => 0,
+    };
+    {
+        let mut books = tier.books.lock().unwrap_or_else(|e| e.into_inner());
+        publish_pinned(tier.arena, &mut books, picks, kind, &mut held).map_err(|error| {
+            free_picks(tier.arena, picks);
+            FillFailed { id: first, error }
+        })?;
+    }
+    Ok((held, wall))
+}
+
 /// A batch's claim whose misses are read on the reader ([`NvTier::prefetch`]),
 /// at the rank its claim sets ([`Kind::of_claim`]). It holds the hits' pins
 /// and the picks' slots, filling; [`Inflight::finish`] joins the fill and publishes the picks under
@@ -3078,36 +3081,17 @@ impl<'a> Inflight<'a> {
     }
 
     fn settle(&mut self) -> Result<BatchPin<'a>, FillFailed> {
-        let TierParts {
-            arena,
-            books,
-            stats,
-            reader,
-        } = self.tier;
-        let mut held = self.held.take().expect("a claim settles once");
-        let first = self.picks.first().map_or(u32::MAX, |p| p.id);
-        let wall = match self.job.take() {
-            Some(job) => reader.wait(&job).map_err(|f| {
-                free_picks(arena, &self.picks);
-                FillFailed {
-                    id: self.picks[f.unit / PARTS].id,
-                    error: f.error,
-                }
-            })?,
-            None => 0,
-        };
-        {
-            let mut books = books.lock().unwrap_or_else(|e| e.into_inner());
-            publish_pinned(arena, &mut books, &self.picks, self.kind, &mut held).map_err(
-                |error| {
-                    free_picks(arena, &self.picks);
-                    FillFailed { id: first, error }
-                },
-            )?;
-        }
+        let held = self.held.take().expect("a claim settles once");
+        let (held, wall) = settle_fill(self.tier, self.kind, &self.picks, held, self.job.take())?;
         if !self.picks.is_empty() {
-            count_fill(stats, arena, &self.picks, wall, Some(self.kind));
-            stats.note_step_wall(self.kind, wall);
+            count_fill(
+                self.tier.stats,
+                self.tier.arena,
+                &self.picks,
+                wall,
+                Some(self.kind),
+            );
+            self.tier.stats.note_step_wall(self.kind, wall);
         }
         Ok(held)
     }
