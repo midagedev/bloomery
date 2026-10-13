@@ -193,14 +193,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use app::arch::deepseek41::{CardDraft, Ds41Cfg};
+use app::arch::deepseek41::{Ds41Cfg, Ds41Draft};
 use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuError;
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{Slots, StepMode};
 use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqSnapshot};
-use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
@@ -831,37 +830,38 @@ enum Served41 {
 
 /// The DSpark draft of the V4.1 body: the card draft the session drives, as
 /// the owner calls it.
-impl Spark<Body> for CardDraft<DraftBody> {
+impl Spark<Body> for Ds41Draft {
     fn feed_call(&mut self, s: &mut Session<Body>, ids: &[u32]) -> Result<u32, SessionError> {
-        CardDraft::feed_call(self, s, ids)
+        Ds41Draft::feed_call(self, s, ids)
     }
 
     fn forget(&mut self) {
-        CardDraft::forget(self);
+        Ds41Draft::forget(self);
     }
 
     fn restart(&mut self) -> Result<(), GpuError> {
-        CardDraft::restart(self)
+        Ds41Draft::restart(self)
     }
 
     fn window(&self) -> usize {
-        CardDraft::window(self)
+        // V4.1's draft file always carries a window (its shape's `window`).
+        Ds41Draft::window(self).expect("V4.1's DSpark draft has a window")
     }
 
     fn follows(&self, pos: u32) -> bool {
-        CardDraft::follows(self, pos)
+        Ds41Draft::follows(self, pos)
     }
 
     fn resident_bytes(&self) -> usize {
-        CardDraft::resident_bytes(self)
+        Ds41Draft::resident_bytes(self)
     }
 
     fn device(&self) -> Result<DeviceId, GpuError> {
-        CardDraft::device(self)
+        Ds41Draft::device(self)
     }
 
     fn card(&self) -> &'static str {
-        CardDraft::card(self)
+        Ds41Draft::card(self)
     }
 }
 

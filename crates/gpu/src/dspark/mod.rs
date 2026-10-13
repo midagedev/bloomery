@@ -7,7 +7,7 @@
 //! dense Qwen3-shaped layer in [`dense`]. The draft's geometry is
 //! [`bloomery_runtime::dspark::DsparkShape`].
 
-use cuda_core::DeviceBuffer;
+use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::dspark::{DraftVocab, DsparkShape};
 
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
@@ -162,9 +162,10 @@ pub enum HeadSource {
 /// How a [`DsparkBody`] call reaches the card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Submit {
-    /// A replay of the graph captured at load for the call's shape. An
-    /// append of more than [`DraftLayers::APPEND_GROUP`] rows has no graph
-    /// and runs eager either way.
+    /// A replay of the graph captured at load for the call's shape, after
+    /// [`DraftLayers::replayable`] says the captures hold. An append of more
+    /// than [`DraftLayers::APPEND_GROUP`] rows has no graph and runs eager
+    /// either way.
     Graph,
     /// Every launch enqueued one by one: the gates' twin of a replay.
     Eager,
@@ -186,6 +187,17 @@ enum Embed {
     Layers,
     /// The owner gathers rows of the draft's own table.
     Host(HostEmbed),
+}
+
+/// The owner's own device buffers ([`DsparkBody::own_held`]), split as a
+/// load's held count splits them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnHeld {
+    /// Every weight buffer, in bytes: fc's quants and scales, its norm,
+    /// then the head's ([`Head::weight_buffers`]).
+    pub weights: Vec<u64>,
+    /// The working buffers, in all.
+    pub working: u64,
 }
 
 /// The common draft over a family's layers `L`: fc over the target's tapped
@@ -234,8 +246,6 @@ pub struct DsparkBody<L: DraftLayers> {
     /// A block's inputs: the id after which it runs at word 0, then under
     /// [`EmbedSource::OwnHost`] its `hidden`-wide embedded rows.
     block_in: Inbox,
-    /// Device bytes of the owner's weights and buffers.
-    own_bytes: u64,
 }
 
 impl<L: DraftLayers> DsparkBody<L> {
@@ -370,13 +380,6 @@ impl<L: DraftLayers> DsparkBody<L> {
         let fc_out = DeviceBuffer::zeroed(s, group * hidden)?;
         let feats = Inbox::new(gpu, capacity * feat)?;
         let block_in = Inbox::new(gpu, block_words)?;
-        let own_bytes = (x.num_bytes()
-            + fc_out.num_bytes()
-            + 4 * (capacity * feat + block_words)
-            + qs.buf().num_bytes()
-            + d.buf().num_bytes()
-            + fc.norm.buf().num_bytes()) as u64
-            + head.card_bytes();
         let mut body = DsparkBody {
             graphs: Graphs {
                 block: Vec::new(),
@@ -395,7 +398,6 @@ impl<L: DraftLayers> DsparkBody<L> {
             fc_out,
             feats,
             block_in,
-            own_bytes,
         };
         for m in 1..=L::MAX_ROWS {
             let g = gpu.capture(|_| body.enqueue_block(gpu, m))?;
@@ -649,6 +651,26 @@ impl<L: DraftLayers> DsparkBody<L> {
         Ok(width)
     }
 
+    /// The gate's seat: commit `committed` positions as if that many rows
+    /// had been appended, with no launch, for a gate that seats the layers'
+    /// context from an oracle ([`DsparkBody::layers_mut`]) instead of
+    /// appending it. Refused by name unless nothing is committed, and for 0.
+    pub fn seat_positions(&mut self, committed: u32) -> Result<(), GpuError> {
+        let held = self.positions.committed();
+        if held != 0 || committed == 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a seat of {committed} positions after {held} committed; a seat takes a \
+                     reset draft and 1.. positions"
+                ),
+            ));
+        }
+        let n = usize::try_from(committed)
+            .map_err(|_| GpuError::shape(WHAT, format!("a seat of {committed} positions")))?;
+        self.positions.append(0, n)
+    }
+
     /// Forget the sequence: no committed position, the layers' context
     /// cleared. Waits for the card.
     pub fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
@@ -668,7 +690,27 @@ impl<L: DraftLayers> DsparkBody<L> {
     /// owner's weights and buffers. Captured graphs are not counted.
     #[must_use]
     pub fn card_bytes(&self, ctx: usize) -> u64 {
-        self.layers.card_bytes(ctx) + self.own_bytes
+        let own = self.own_held();
+        self.layers.card_bytes(ctx) + own.weights.iter().sum::<u64>() + own.working
+    }
+
+    /// The owner's own device buffers, counted from the buffers themselves
+    /// where they live: fc and the head's weights, the row buffers, the
+    /// inboxes' card sides and the head's scratch. The layers' are theirs.
+    #[must_use]
+    pub fn own_held(&self) -> OwnHeld {
+        let mut weights = vec![
+            self.fc.fc.qs.buf().num_bytes() as u64,
+            self.fc.fc.d.buf().num_bytes() as u64,
+            self.fc.norm.buf().num_bytes() as u64,
+        ];
+        weights.extend(self.head.weight_buffers());
+        let working = (self.x.num_bytes()
+            + self.fc_out.num_bytes()
+            + self.feats.device_bytes()
+            + self.block_in.device_bytes()) as u64
+            + self.head.scratch_bytes();
+        OwnHeld { weights, working }
     }
 
     /// The layers.
@@ -682,6 +724,30 @@ impl<L: DraftLayers> DsparkBody<L> {
     /// seated.
     pub fn layers_mut(&mut self) -> &mut L {
         &mut self.layers
+    }
+
+    /// The head, for the gates' readouts.
+    #[must_use]
+    pub fn head(&self) -> &Head {
+        &self.head
+    }
+
+    /// The head, writable: the gates' way to run its launches over rows of
+    /// their own.
+    pub fn head_mut(&mut self) -> &mut Head {
+        &mut self.head
+    }
+
+    /// The `m` rows the layers left in the owner's `x`, before the head's
+    /// norm, token-major. Blocking; gate use.
+    pub fn block_rows_to_host(&self, stream: &CudaStream, m: usize) -> Result<Vec<f32>, GpuError> {
+        if !(1..=L::MAX_ROWS).contains(&m) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a readout of {m} rows; the layers hold 1..={}", L::MAX_ROWS),
+            ));
+        }
+        Ok(self.x.to_host_vec(stream)?[..m * self.hidden].to_vec())
     }
 
     /// The captured block pass of `m` rows.

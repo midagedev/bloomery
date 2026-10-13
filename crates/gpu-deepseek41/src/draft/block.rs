@@ -1,6 +1,6 @@
 //! The draft's block pass: `w` rows `[id_last, mask × (w − 1)]` through the
-//! three draft layers and the head, attending each layer's window ring and
-//! the block's own rows.
+//! three draft layers, attending each layer's window ring and the block's own
+//! rows. The head after the last layer is the common owner's.
 //!
 //! Input. Each row's embedding is the target's `token_embd` row as its file
 //! stores it ([`EmbdRows`]: bf16, or Q3_K super-blocks), decoded on the card
@@ -11,9 +11,9 @@
 //! initial `pre`). Rows `1..` are the mask token's, the same every block:
 //! decoded once at load by the same entry and written then. Row 0 is
 //! `id_last`'s: [`BlockPass::stage`] writes its file bytes, each row's rope
-//! tables, the visible counts and the head's first id into one pinned image
-//! and copies it in one transfer ([`Inbox`]), and the pass's first launch
-//! decodes the row on the card. The pass itself reads only device memory, so
+//! tables and the visible counts into one pinned image and copies it in one
+//! transfer ([`Inbox`]), and the pass's first launch decodes the row on the
+//! card. The pass itself reads only device memory, so
 //! a captured pass replays against the same image every block.
 //!
 //! Per layer, `m = w` rows per launch:
@@ -37,9 +37,10 @@
 //!     rows; its sum with the routed output;
 //! 11. HC_POST and the next fold.
 //!
-//! After the last layer its fold is the head's input ([`DraftHead`]).
-//! Launches per pass: the row's decode, `(14 + 9 + 2m)` per layer, the head's
-//! three and its Markov loop's `2m` ([`BlockPass::launches`]).
+//! After the last layer its fold is the pass's output: the last ffn's HC post
+//! writes it into the buffer [`BlockPass::enqueue_layers`] is given, the
+//! head's input. Launches per pass: the row's decode and `(14 + 9 + 2m)` per
+//! layer ([`BlockPass::launches`]).
 //!
 //! Every buffer is per layer and allocated at load, so a pass leaves each
 //! layer's intermediates in place for the gate to read, and a captured pass
@@ -49,13 +50,12 @@ use std::mem::size_of;
 
 use bloomery_gpu::mxfp4_sel::{DownArgs, GateUpArgs, MxAct, MxExpertKernels, concat_route};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, Window, launch_u32};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use gguf::Split;
 use model::arch::deepseek41::names as target_names;
 use model::arch::dspark::{DraftHparams, names};
 
-use super::head::DraftHead;
 use super::kv::DraftRings;
 use super::load::{DraftWeights, EmbdRows, pack_words};
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
@@ -91,10 +91,9 @@ pub enum Rule {
 
 /// One block's inputs ([`BlockPass::stage`]).
 pub struct BlockInput<'a> {
-    /// The block's first id: the last accepted token.
-    pub id_last: u32,
-    /// `id_last`'s row of the target's `token_embd`, its file bytes in the
-    /// draft's [`EmbdRows`] format ([`embedding_row`]).
+    /// The row of the block's first id (the last accepted token) of the
+    /// target's `token_embd`, its file bytes in the draft's [`EmbdRows`]
+    /// format ([`embedding_row`]).
     pub row: &'a [u8],
     /// Rows, `1..=MAX_WIDTH`.
     pub width: usize,
@@ -786,8 +785,6 @@ struct Image {
     back: usize,
     /// Per row `t`: `vis[2t]` ring rows, `vis[2t + 1]` block rows.
     vis: usize,
-    /// The head's first id.
-    first: usize,
     words: usize,
 }
 
@@ -797,14 +794,12 @@ impl Image {
         let fwd = row + rows.row_words(d.n_embd);
         let back = fwd + MAX_WIDTH * d.rope_dims;
         let vis = back + MAX_WIDTH * d.rope_dims;
-        let first = vis + 2 * MAX_WIDTH;
         Image {
             row,
             fwd,
             back,
             vis,
-            first,
-            words: first + 1,
+            words: vis + 2 * MAX_WIDTH,
         }
     }
 }
@@ -812,7 +807,6 @@ impl Image {
 /// The block pass's buffers and constants. See the module comment.
 pub struct BlockPass {
     layers: Vec<LayerBufs>,
-    head: DraftHead,
     k: Kernels,
     d: Dims,
     table: RopeTable,
@@ -868,7 +862,6 @@ impl BlockPass {
             layers: (0..hp.n_layer)
                 .map(|_| LayerBufs::new(s, &d))
                 .collect::<Result<_, _>>()?,
-            head: DraftHead::new(gpu, w, b)?,
             k: Kernels {
                 embed,
                 attn: AttnKernels::load(ctx)?,
@@ -896,12 +889,11 @@ impl BlockPass {
     }
 
     /// Device bytes of every buffer the pass allocated, the image's card
-    /// side included, as allocated.
+    /// side included, as allocated. The head's are the owner's.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
         let BlockPass {
             layers,
-            head,
             k: _,
             d: _,
             table: _,
@@ -918,7 +910,6 @@ impl BlockPass {
             rule: _,
         } = self;
         layers.iter().map(LayerBufs::device_bytes).sum::<usize>()
-            + head.device_bytes()
             + streams0.num_bytes()
             + fold0.num_bytes()
             + inbox.device_bytes()
@@ -926,9 +917,9 @@ impl BlockPass {
             + route.num_bytes()
     }
 
-    /// Write one block's inputs — `id_last`'s row, the rope tables, the
-    /// visible counts, the head's first id — into the pinned image and
-    /// enqueue its one copy to the card on `stream`. Asynchronous, except
+    /// Write one block's inputs — the first id's row, the rope tables and
+    /// the visible counts — into the pinned image and enqueue its one copy
+    /// to the card on `stream`. Asynchronous, except
     /// that it waits for the previous block's copy to have read the image;
     /// never inside a capture.
     pub fn stage(&mut self, stream: &CudaStream, input: &BlockInput<'_>) -> Result<(), GpuError> {
@@ -943,13 +934,6 @@ impl BlockPass {
                 input.row.len(),
                 self.embd,
                 self.embd.row_bytes(n)
-            )));
-        }
-        if input.id_last as usize >= self.head.n_vocab() {
-            return Err(shape(format!(
-                "id_last {} past the vocabulary of {}",
-                input.id_last,
-                self.head.n_vocab()
             )));
         }
         if input.ring_rows == 0 || input.ring_rows > self.d.window {
@@ -975,7 +959,7 @@ impl BlockPass {
         pack_words(input.row, &mut host[im.row..im.fwd]);
         put_f32(&mut host[im.fwd..im.back], &self.fwd);
         put_f32(&mut host[im.back..im.vis], &self.back);
-        for (t, v) in (0..MAX_WIDTH).zip(host[im.vis..im.first].as_chunks_mut::<2>().0) {
+        for (t, v) in (0..MAX_WIDTH).zip(host[im.vis..im.words].as_chunks_mut::<2>().0) {
             *v = if t < m {
                 let block = match input.rule {
                     Rule::Reference => rows,
@@ -986,46 +970,30 @@ impl BlockPass {
                 [0, 0]
             };
         }
-        host[im.first] = input.id_last;
         self.inbox.upload(stream, im.words)?;
         self.width = m;
         self.rule = input.rule;
         Ok(())
     }
 
-    /// Enqueue the decode of row 0, every layer and the head's logits over
-    /// the staged block, reading `rings`. Asynchronous, allocation-free,
-    /// capturable.
-    pub fn enqueue_body(
+    /// Enqueue the decode of row 0 and every layer over a block of `m` rows
+    /// (`1..=MAX_WIDTH`), reading `rings`: the launches of `m` rows whatever
+    /// was staged, so a capture before any stage records what a replay after
+    /// a stage of `m` rows runs. The last layer's fold lands in `out`
+    /// (`m · n_embd` values), where the head reads it. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_layers(
         &mut self,
         gpu: &Gpu,
         w: &DraftWeights,
         rings: &DraftRings,
+        m: usize,
+        out: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        self.enqueue_layers(gpu, w, rings, None)?;
-        let last = self.layers.last().ok_or(GpuError::State {
-            what: WHAT,
-            missing: "a layer",
-        })?;
-        self.head.enqueue_logits(gpu, w, &last.fold_f, self.width)
-    }
-
-    /// Enqueue the decode of row 0 and every layer over the staged block,
-    /// reading `rings`: the body without the head. The last layer's fold
-    /// lands in `out` when one is given (`m · n_embd` values), else in its
-    /// own `fold_f`. Asynchronous, allocation-free, capturable.
-    pub(super) fn enqueue_layers(
-        &mut self,
-        gpu: &Gpu,
-        w: &DraftWeights,
-        rings: &DraftRings,
-        mut out: Option<&mut DeviceBuffer<f32>>,
-    ) -> Result<(), GpuError> {
-        let m = self.width;
-        if m == 0 {
-            return Err(GpuError::State {
+        if !(1..=MAX_WIDTH).contains(&m) {
+            return Err(GpuError::Shape {
                 what: WHAT,
-                missing: "a staged block",
+                detail: format!("a pass of {m} rows; 1..={MAX_WIDTH}"),
             });
         }
         let (d, im) = (self.d, self.image);
@@ -1059,6 +1027,12 @@ impl BlockPass {
             clamp: self.rule == Rule::Reference,
         };
         let n_layer = self.layers.len();
+        if n_layer == 0 {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a layer",
+            });
+        }
         for l in 0..n_layer {
             let (done, rest) = self.layers.split_at_mut(l);
             let b = &mut rest[0];
@@ -1071,67 +1045,17 @@ impl BlockPass {
                 missing: "a ring per layer",
             })?;
             enqueue_attn(&cx, l, streams, fold, ring, b)?;
-            enqueue_ffn(&cx, l, b, if l + 1 == n_layer { out.take() } else { None })?;
-        }
-        if out.is_some() {
-            return Err(GpuError::State {
-                what: WHAT,
-                missing: "a layer",
-            });
+            enqueue_ffn(&cx, l, b, (l + 1 == n_layer).then_some(&mut *out))?;
         }
         Ok(())
     }
 
-    /// Enqueue the head's Markov loop over the logits the body left.
-    /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_markov(&mut self, gpu: &Gpu, w: &DraftWeights) -> Result<(), GpuError> {
-        let first = self.inbox.u32s(self.image.first, 1)?;
-        self.head.enqueue_markov(gpu, w, self.width, &first)
-    }
-
-    /// [`BlockPass::enqueue_body`] then [`BlockPass::enqueue_markov`].
-    pub fn enqueue(
-        &mut self,
-        gpu: &Gpu,
-        w: &DraftWeights,
-        rings: &DraftRings,
-    ) -> Result<(), GpuError> {
-        self.enqueue_body(gpu, w, rings)?;
-        self.enqueue_markov(gpu, w)
-    }
-
-    /// Capture the whole pass of `m` rows under [`Rule::Reference`] over
-    /// `rings`: [`BlockPass::enqueue`] with the staging left out, so a
-    /// replay after any [`BlockPass::stage`] of `m` rows under that rule is
-    /// that block's pass. The graph names this pass's buffers, `w` and
-    /// `rings`: the caller keeps all three alive and in place while it holds
-    /// the graph. Leaves the pass staged as `m` rows of whatever the image
-    /// holds. Load-time only.
-    pub fn capture(
-        &mut self,
-        gpu: &Gpu,
-        w: &DraftWeights,
-        rings: &DraftRings,
-        m: usize,
-    ) -> Result<Graph, GpuError> {
-        if !(1..=MAX_WIDTH).contains(&m) {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!("a capture of {m} rows; 1..={MAX_WIDTH}"),
-            });
-        }
-        self.width = m;
-        self.rule = Rule::Reference;
-        gpu.capture(|_| self.enqueue(gpu, w, rings))
-    }
-
-    /// Kernel launches one pass of `m` rows makes: the row's decode, per layer
-    /// the attention sub-layer's 14 and the ffn's `9 + 2m`, then the head's.
+    /// Kernel launches one pass of `m` rows makes: the row's decode, and per
+    /// layer the attention sub-layer's 14 and the ffn's `9 + 2m`. The head's
+    /// are the owner's.
     #[must_use]
     pub fn launches(&self, m: usize) -> usize {
         1 + self.layers.len() * (14 + 9 + 2 * m)
-            + DraftHead::LOGIT_LAUNCHES
-            + DraftHead::markov_launches(m)
     }
 
     /// Rows the last stage wrote.
@@ -1169,16 +1093,5 @@ impl BlockPass {
     #[must_use]
     pub fn layer(&self, l: usize) -> Option<&LayerBufs> {
         self.layers.get(l)
-    }
-
-    /// The head.
-    #[must_use]
-    pub fn head(&self) -> &DraftHead {
-        &self.head
-    }
-
-    /// The block's proposal after the Markov loop. Blocking.
-    pub fn tokens(&self, stream: &CudaStream) -> Result<Vec<u32>, GpuError> {
-        self.head.tokens(stream, self.width)
     }
 }
