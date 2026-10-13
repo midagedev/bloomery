@@ -1386,6 +1386,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     let levers = bloomery_levers::at_main(&acts_on)?;
     record::at_main(NAME, record::BLOOMERY_SERVE_QWEN3);
+    super::drafted::serves_widths();
     arm_screen(levers.screen());
     let a = parse_args(args)?;
     let kv = cache_k(&a, &levers)?;

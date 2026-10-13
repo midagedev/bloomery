@@ -3485,8 +3485,8 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
 /// placement and why (`place unset`), a `--hf` repo's resolve and fetch
 /// lines (the server prints the resolve before the seat registers), the
 /// load and its phases, the image encoder's seat with the plan and its record
-/// after them under `--mmproj`, the address and each request's note of the
-/// prefix it kept none of.
+/// after them under `--mmproj`, the address, the draft width chooser's
+/// `mtp width` record, and each request's note of the prefix it kept none of.
 pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
     &[&PLACE_UNSET],
     groups::qwen3moe_place::PLAN,
@@ -3497,6 +3497,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
     &[&LISTENING_QWEN3],
     groups::bind::CACHE,
     groups::bind::SLOTS,
+    groups::drafted::WIDTH,
 ];
 
 /// What the MiMo seat of `bloomery-serve` prints, all on stderr: the
@@ -4425,13 +4426,14 @@ mod tests {
                 ],
             ),
             (
-                "qwen3 seat: Flags::encoder, default_ctx_qwen3, bind::spawn",
+                "qwen3 seat: Flags::encoder, default_ctx_qwen3, print_widths, bind::spawn",
                 BLOOMERY_SERVE_QWEN3,
                 &[
                     model_file::FETCH,
                     model_file::SET,
                     vision_seat::RECORDS,
                     qwen3moe_place::PLAN,
+                    drafted::WIDTH,
                     bind::CACHE,
                     bind::SLOTS,
                 ],
