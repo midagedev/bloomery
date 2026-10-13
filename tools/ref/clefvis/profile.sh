@@ -2,24 +2,31 @@
 # shellcheck shell=bash
 # The seat the image-input oracle runs for: what clefvis.sh and build-clefvis.sh need that is a property of the seat, not of
 # the machine. Sourced after tools/ref/ref-paths.sh, which has picked the model profile (BLOOMERY_MODEL); never executed,
-# and it exports nothing. A seat is a family of the Qwen3-VL tower (mtmd `qwen3vl_merger`) and its text model, or of the GLM
-# tower (`glm5v`) and its:
+# and it exports nothing. A seat is a family of the Qwen3-VL tower (mtmd `qwen3vl_merger`) and its text model, of the GLM
+# tower (`glm5v`) and its, or of the MiniCPM-V 4.7 tower (`minicpmv4_7`) and its:
 #
 #   qwen35     Clef-Flash         sets ref_clefvis_*             mainline 53ed051ce (the model profile's LCPP)
 #   qwen35moe  Qwen3.6-35B-A3B    sets ref_qwen35moe_vis_*       mainline 36a73916e (QVIS_LCPP)
 #   qwen4exp   Qwen3.8-Flash-Next sets ref_qwen4exp_vis_*        mainline 36a73916e (QVIS_LCPP)
 #   glm5next   GLM-5.3-Flash      sets fx_ref_glm5next_vis_*     mainline 36a73916e (QVIS_LCPP), the fixture tier only
+#   minicpmv47 MiniCPM-V 4.7      sets ref_minicpmv47_vis_*      mainline 358a420ec (MC47_LCPP), the tower arm only
 #
-# The Qwen seats and the GLM seat share the mainline tree and so the binary; the Clef seat keeps its own tree and binary, so
-# its sets' bytes do not move with the Qwen seats' pin. The values below are the ones crates/refset names for the same seat
+# The row is picked by BLOOMERY_MODEL, the model profile's name: MiniCPM-V 4.7's text profile (models/minicpmv47.sh) is a
+# qwen35moe file and says MODEL_NAME=qwen35moe, which is Qwen3.6's row. The Qwen seats and the GLM seat share the mainline tree
+# and so the binary; the Clef seat keeps its own tree and binary, so its sets' bytes do not move with the Qwen seats' pin, and
+# MiniCPM's tree (mainline gained `minicpmv4_7` at 69f201a20, after 36a73916e) has its own, dump_mtmd_mc47. The values below are the ones crates/refset names for the same seat
 # (arch/qwen35/clefvis.rs, arch/qwen35moe/vis.rs, arch/qwen4exp/vis.rs): the family checks a set's `# model`, `# mmproj`,
 # `# build` lines against them.
 #
-#   FAMILY          clef | qvis: which arms the seat has. clef: set A (preproc), the release's ids (clef_ref.py), set D;
-#                   qvis: the chat ids (E) and the decode steps (F), the tower tapped to its output end
+#   FAMILY          clef | qvis | mcvis: which arms the seat has. clef: set A (preproc), the release's ids (clef_ref.py), set D;
+#                   qvis: the chat ids (E) and the decode steps (F), the tower tapped to its output end; mcvis: the tower only,
+#                   sets A and B per tile (dump_mtmd's canvas seat), no ids, no prompt arms
 #   PREPROC         1: the tower arm writes set A (preproc, the card run only): Clef and the GLM seat; 0: the Qwen seats
 #   ARMS            the prompt kinds a case dumps: hidden (C), prose (C', with PROSE_IDS), bf16rows (C''); the GLM seat's is hidden
 #   IMAGES_EXTRA    a file of more image rows (images.tsv's format) the tower arm takes after images.tsv: the GLM seat's cap case
+#   IMAGES_LIST     the file of image rows the tower arm takes (images.tsv's format; default images.tsv): MiniCPM's three images
+#   SEAT            the projector the seat is for, passed to dump_mtmd as --seat: it refuses another projector's mmproj by name
+#                   (empty: the seat is whatever the mmproj's projector says, as the Qwen and GLM seats have always run)
 #   IMAGE_PAD_ID    the id of the text model's image token, passed to dump_mtmd as --image-pad-id (empty: its Qwen default)
 #   RESPELL_SOURCE  the fixture's first shard the text model is a respelled copy of (tools/ref/gguf-respell.py): the set's
 #                   `# fixture` line is that file's, and dump_mtmd refuses a copy whose bloomery.respell.source names another
@@ -39,12 +46,14 @@
 # SC2034: every name here is read by the files that source this one.
 # shellcheck disable=SC2034
 : "${QVIS_LCPP:=/home/user/llama.cpp-36a73916}"
+# MiniCPM-V 4.7's tree: mainline at 358a420e (just build-mc47-lcpp), the first one this seat's sets were dumped from
+: "${MC47_LCPP:=/home/user/llama.cpp-358a420e}"
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 # CLEFVIS_OUT moves the binary's directory, as build-clefvis.sh reads it (a scratch build under test).
 BINDIR=${CLEFVIS_OUT:-$DATA/bin}
 NCMOE_A6000=0 NCMOE_3090=0 ROWS_FROM=embd THREADS=16 CASES=tools/ref/clefvis/cases.tsv REQUESTS=
-PREPROC=0 ARMS="hidden prose bf16rows" IMAGES_EXTRA="" IMAGE_PAD_ID="" RESPELL_SOURCE=""
-case ${MODEL_NAME:-} in
+PREPROC=0 ARMS="hidden prose bf16rows" IMAGES_EXTRA="" IMAGE_PAD_ID="" RESPELL_SOURCE="" SEAT="" IMAGES_LIST=tools/ref/clefvis/images.tsv
+case ${BLOOMERY_MODEL:-} in
   qwen35)
     FAMILY=clef PREPROC=1 SETPFX=ref_clefvis ORACLE=$LCPP BIN=$BINDIR/dump_mtmd
     MMPROJ=/root/models/clef-flash/mmproj-Cloudflare_clef-flash-bf16.gguf
@@ -97,8 +106,19 @@ case ${MODEL_NAME:-} in
     # the 8 GB fixture fits a card whole with the tower and a 4,096 context: no experts stay on the host
     THREADS=16
     ;;
+  minicpmv47)
+    # the text model is a qwen35moe file with its own vocabulary (models/minicpmv47.sh); only the tower runs: it loads the
+    # vocabulary, never the weights, so no experts stay on the host
+    FAMILY=mcvis PREPROC=1 ARMS="" SEAT=minicpmv4_7 SETPFX=ref_minicpmv47_vis ORACLE=$MC47_LCPP BIN=$BINDIR/dump_mtmd_mc47
+    MMPROJ=/models/MiniCPM-V-4.7-35B-A3B/mmproj-model-f16.gguf
+    MMPROJ_SHA256=bff3b688e14c300eca273092c37c50a0ddfcc2054e079af1a0480edeed5d20f1
+    TEXT=/models/MiniCPM-V-4.7-35B-A3B/MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf
+    IMAGES_LIST=tools/ref/clefvis/images-minicpmv47.tsv
+    CASES=/dev/null
+    THREADS=16
+    ;;
   *)
-    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${MODEL_NAME:-}' (qwen35, qwen35moe, qwen4exp or glm5next)" >&2
+    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next or minicpmv47)" >&2
     exit 2
     ;;
 esac

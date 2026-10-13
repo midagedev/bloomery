@@ -1,0 +1,4 @@
+# name	w	h	branch of mtmd minicpmv4_7 preprocessing (slice size 448, patch 14, align 56, at most 9 slices); the file is images/<name>.png. The tiles are what the dump measured at mainline 358a420ec (the set's # tile lines).
+free-448x448	448	448	ratio 1.0: the overview alone, one 448x448 tile (8x8 = 64 merger rows + the </image> row = 65)
+pad-1000x700	1000	700	ratio 3.49: an overview and a 2x2 slice grid, five 560x392 tiles (10x7 = 70 merger rows each; 72, 72, 73, 72, 71 rows with their separators = 360)
+small-200x200	200	200	ratio 0.2: the overview alone, stretched to 448x448 (65 rows)

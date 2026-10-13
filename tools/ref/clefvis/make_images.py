@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the nine test images of the image-input oracle (eight of the Qwen3-VL seats' tower sets, one glm5v-only) into images/ beside this file.
+"""Write the ten test images of the image-input oracle (eight of the Qwen3-VL seats' tower sets, one glm5v-only, one MiniCPM-only) into images/ beside this file.
 
 The pixels are a pure function of the coordinates (integer arithmetic, no RNG), so the set can be
 rebuilt anywhere with numpy and Pillow. The PNG bytes also depend on the zlib that writes them, so
@@ -23,6 +23,10 @@ resize), with the aligned size computed by `plan()` below in f32, op for op:
 One more file is for the glm5v seat only (images-glm5v.tsv; images.tsv, which every Qwen seat's tower sets follow, does
 not list it): cap-3000x2200.png, 3000x2200, whose 28-aligned canvas 3024x2212 is over glm5v's image_max_pixels (6,272,000),
 so mtmd's glm5v preprocess takes its budget branch. `main()` writes it with the others and states no Qwen plan for it.
+
+One more is for the MiniCPM-V 4.7 seat only (images-minicpmv47.tsv, which also names free-448x448.png and pad-1000x700.png
+from above): small-200x200.png, 200x200, below one 448 slice, so mtmd's minicpmv preprocess keeps the overview alone and stretches
+it to 448x448. Neither images.tsv nor images-glm5v.tsv lists it.
 
 The content is smooth colour ramps, rings and coarse checkers, so each file compresses to a few
 kilobytes and a resize still meets edges and every one of the 256 levels.
@@ -138,8 +142,10 @@ IMAGES = {
     "max-2600x1800.png": lambda: mixed(2600, 1800, 130, 600000),
     "strip-1000x1.png": lambda: strip(1000),
     "cap-3000x2200.png": lambda: mixed(3000, 2200, 150, 800000),
+    "small-200x200.png": lambda: mixed(200, 200, 25, 3000),
 }
 GLM_ONLY = {"cap-3000x2200.png"}
+MC_ONLY = {"small-200x200.png"}
 
 
 def main():
@@ -155,8 +161,9 @@ def main():
         path = OUT / name
         img.save(path, optimize=True)
         total += path.stat().st_size
-        if name in GLM_ONLY:
-            print(f"{name}\t{w}x{h}\t{path.stat().st_size} B\t(glm5v only: no Qwen plan)")
+        if name in GLM_ONLY or name in MC_ONLY:
+            seat = "glm5v" if name in GLM_ONLY else "minicpmv4_7"
+            print(f"{name}\t{w}x{h}\t{path.stat().st_size} B\t({seat} only: no Qwen plan)")
             continue
         w_bar, h_bar = plan(w, h)
         nw, nh, ox, oy = pad_ceil(w, h, w_bar, h_bar)
