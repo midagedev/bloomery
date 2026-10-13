@@ -2036,6 +2036,14 @@ pub struct PagedAt {
     pub draft_set: bool,
 }
 
+impl PagedAt {
+    /// Whether the plan drafted before yielding to the context.
+    #[must_use]
+    pub fn asked_draft(&self, off: Option<&Draft38Off>) -> bool {
+        self.draft || matches!(off, Some(Draft38Off::Yield(_)))
+    }
+}
+
 /// What a seat serves on the plan [`paged_columns`] read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Paged {
@@ -2098,7 +2106,7 @@ pub fn paged_floor(at: &PagedAt) -> Paged {
 /// one owner.
 #[must_use]
 pub fn paged_draft(at: &PagedAt, off: Option<Draft38Off>) -> (bool, Option<Draft38Off>) {
-    let asked = at.draft || matches!(off, Some(Draft38Off::Yield(_)));
+    let asked = at.asked_draft(off.as_ref());
     (
         at.draft && at.draft_set,
         if asked && !at.draft_set {

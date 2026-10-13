@@ -1539,9 +1539,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                    mtp: bool,
                    draft_off: Option<Draft38Off>,
                    floor: bool| {
-        let asked_on = mtp || matches!(draft_off, Some(Draft38Off::Yield(_)));
-        let (drafts, draft_off) =
-            bloomery_levers::paged_draft(&paged_at(arena, slots, mtp), draft_off);
+        let at = paged_at(arena, slots, mtp);
+        let asked_on = at.asked_draft(draft_off.as_ref());
+        let (drafts, draft_off) = bloomery_levers::paged_draft(&at, draft_off);
         eprintln!(
             "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
              slots={served} draft={} (the plan pages host experts through the NVMe tier's RAM \
