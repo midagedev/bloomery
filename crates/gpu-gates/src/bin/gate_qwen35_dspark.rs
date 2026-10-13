@@ -10,10 +10,20 @@
 //!    The loader opens the whole draft (fc, head, Markov tables, id map, embedding table) and the
 //!    card bytes it reports are the header-only count.
 //!
-//! The target-side clauses (the draft run's ids equal the plain run's, and the acceptance floor with
-//! its mutants) need the draft wired to the target and are not in this binary yet.
+//! 1. Lossless. Greedy from one fixed prompt, the first 64 ids of
+//!    `$BLOOMERY_DATA/qwen35moe/corpus-prose.ids` (Qwen3.6's own vocabulary). The draft run's first
+//!    256 decoded ids equal a plain `Qwen35moeModel::open` of the same file with no draft. The line
+//!    is `ids identical 256`, or the first index where the two runs differ.
 //!
-//!     gate_qwen35_dspark [--draft <dir>]    # else $BLOOMERY_DSPARK_MODEL, else the box's copy
+//! 2. Acceptance floor, over the first 512 ids of that file as the prompt walk, decoding 128 tokens
+//!    at proposal width 7. E is the committed tokens per verify pass, and the clause holds at
+//!    E ≥ 2.0. RedHat's card reports the acceptance its training reached; a port that misreads the
+//!    taps, the map or the mask falls near E ≈ 1.
+//!
+//!     gate_qwen35_dspark [--draft <dir>] [--only 0|1|2]...
+//!
+//! `--draft` defaults to the box's copy. With no `--only`, every clause runs; each `--only` selects
+//! one clause.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -34,22 +44,29 @@ mod dspark_hf;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::Instant;
 
+    use app::dspark::CardDspark;
+    use app::{RowsLog, Session, SessionError};
     use bloomery_gpu::Gpu;
+    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel};
     use bloomery_gpu::dspark::dense::{DenseDims, DenseLayers};
-    use bloomery_gpu::dspark::{DraftLayers, HeadSource, Q8Rows};
+    use bloomery_gpu::dspark::{DraftLayers, DsparkBody, HeadSource, Q8Rows};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu_gates::rounding::U;
-    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
+    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, prose_ids, verdict};
     use cuda_core::{CudaStream, DeviceBuffer};
+    use gguf::Split;
     use gguf::quant::{f32_to_f16_bits, half_to_f32};
     use model::quant::quantize_q8_0;
+    use refset::arch::qwen35moe::MODEL;
+    use runtime::dspark::DraftVocab;
+    use runtime::{Advance, Draft, Speculative, Target, Verify, Want};
 
     use crate::dspark_hf::{self, HfFile, Parts};
-    use runtime::dspark::DraftVocab;
 
     /// The context rows of the two cases: a ring that is nearly empty and one past the window.
     const CASES: [usize; 2] = [3, 2100];
@@ -69,6 +86,32 @@ mod gate {
     /// `decision`'s Q8_0 head bound has the same two terms): the rounding `d/2`, and the scale's own
     /// rounding to f16, `|q| · |d − f16(d)| <= 127 · d · 2^-11`.
     const Q8_ERR: f64 = 0.5 + 127.0 / 2048.0;
+
+    /// Clause 1's prompt: the first ids of the Qwen3.6 prose file, one ubatch.
+    const PROMPT_FIXED: usize = 64;
+    /// Clause 1 compares this many decoded ids.
+    const DECODE_LOSSLESS: usize = 256;
+    /// Clause 2's prompt, the first ids of the same file.
+    const PROSE: usize = 512;
+    /// Clause 2 decodes this many tokens with the draft.
+    const DECODE_FLOOR: usize = 128;
+    /// Clause 2's proposal width. The target verifies 8 rows, so a draft proposes 7.
+    const PROPOSAL: usize = 7;
+    /// A verify of the proposal: the token already at the target's position, then the 7 drafted ids.
+    const VERIFY_ROWS: usize = PROPOSAL + 1;
+    /// Clause 2 holds when the committed tokens per verify pass reach this.
+    const FLOOR: f64 = 2.0;
+    /// The target's context: a 512-id prompt plus the decoded tokens and one verify of 8 rows.
+    const TARGET_CTX: usize = 768;
+    /// The prompt call's ubatch, the same one the verifying gate opens with.
+    const UBATCH: usize = 64;
+
+    type Seat = Session<Body35>;
+    type Spark = CardDspark<DenseLayers>;
+    type Spec = Speculative<Spark, VERIFY_ROWS>;
+
+    /// The draft's compile-time width is the clause's proposal width.
+    const _: () = assert!(<Spark as Draft<Seat>>::WIDTH == PROPOSAL);
 
     /// A seeded stream of standard normals (xorshift64*, Box–Muller).
     struct Normals(u64);
@@ -659,17 +702,8 @@ mod gate {
         Ok(arith && model && q8 && wrapped && replayed)
     }
 
-    pub fn run() -> Result<(), GateError> {
-        let mut args = std::env::args().skip(1);
-        let mut dir = dspark_hf::default_dir();
-        while let Some(a) = args.next() {
-            match a.as_str() {
-                "--draft" => {
-                    dir = PathBuf::from(args.next().ok_or("--draft needs a directory")?);
-                }
-                other => return Err(format!("unknown argument {other:?}").into()),
-            }
-        }
+    /// Clause 0. The draft `Gpu` drops with this function, before a target load.
+    fn dense(dir: &Path) -> Result<bool, GateError> {
         let gpu = Gpu::new()?;
         println!(
             "gate_qwen35_dspark: device {} — draft {}",
@@ -716,6 +750,286 @@ mod gate {
             let case = run_case(&gpu, &mut parts.layers, &file, mask_id, r)?;
             println!("dense layers, R={r} {}", verdict(case));
             ok &= case;
+        }
+        Ok(ok)
+    }
+
+    /// `with_draft` tells this of each capture. The first prompt drops those graphs (`set_taps`),
+    /// and the next pass captures again, so a count printed here would not be the one that ran.
+    struct Quiet;
+
+    impl RowsLog for Quiet {
+        fn capture_rows(&mut self, _rows: usize, _nodes: usize) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    /// A plain or verifying load of the Qwen3.6 file, whole card, context [`TARGET_CTX`].
+    fn open_seat(verifying: bool) -> Result<Seat, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        if file.architecture() != Some("qwen35moe") {
+            return Err(format!("{MODEL} is {:?}, not qwen35moe", file.architecture()).into());
+        }
+        let o = Open35 {
+            ctx: TARGET_CTX,
+            mma: true,
+            ubatch: UBATCH,
+            kv: KvQ8::F16,
+            media: false,
+        };
+        let gpu = Gpu::new()?;
+        let m = if verifying {
+            Qwen35moeModel::open_verifying(gpu, file, o)?
+        } else {
+            Qwen35moeModel::open(gpu, file, o)?
+        };
+        println!(
+            "load verifying={verifying} resident_bytes={} ctx={TARGET_CTX}",
+            m.resident_bytes()
+        );
+        Ok(Seat::from_model(m, u32::try_from(TARGET_CTX)?))
+    }
+
+    /// The draft beside `seat`, proposing [`PROPOSAL`] ids. Refused by name when this file's block
+    /// cannot.
+    fn attach(seat: &mut Seat, dir: &Path) -> Result<Spec, GateError> {
+        let gpu = Gpu::new()?;
+        let (free0, _) = gpu.mem_info()?;
+        let Parts {
+            shape,
+            layers,
+            fc,
+            head,
+            embed,
+        } = dspark_hf::open(&gpu, dir, CTX)?;
+        let verify_rows = <Seat as Verify>::MAX_ROWS;
+        let width = shape.width(verify_rows);
+        if width != PROPOSAL {
+            return Err(format!(
+                "clause 2 asks for a proposal of {PROPOSAL}; this file's block {} (row 0 drafts \
+                 {}) proposes {width} against a verify of {verify_rows} rows",
+                shape.block, shape.row0_drafts
+            )
+            .into());
+        }
+        let taps = shape.taps.clone();
+        let mask_id = shape.mask_id;
+        let body = DsparkBody::new(&gpu, &shape, layers, fc, head, embed)?;
+        let (free1, _) = gpu.mem_info()?;
+        let resident = free0.saturating_sub(free1);
+        println!(
+            "draft: taps {taps:?}, mask {mask_id}, proposal width {width}, resident {resident} B"
+        );
+        let target = Arc::clone(seat.model().gpu().context());
+        let card = CardDspark::new::<Body35>(body, gpu, target, "gate", shape, resident)?;
+        // Capture reads the stream's current context and does not bind it. The draft's load left
+        // its own context current.
+        seat.model().gpu().context().bind_to_thread()?;
+        Ok(seat.with_draft::<Spark, VERIFY_ROWS>(card, &mut Quiet)?)
+    }
+
+    /// `n` greedy ids from `prompt`. Id 0 is the prompt's argmax; each later id is the argmax
+    /// after feeding the one before it.
+    fn greedy(s: &mut Seat, prompt: &[u32], n: usize) -> Result<Vec<u32>, GateError> {
+        s.reset()?;
+        let mut ids = Vec::with_capacity(n);
+        ids.push(s.prompt(prompt, Want::Argmax)?.argmax());
+        while ids.len() < n {
+            let last = ids[ids.len() - 1];
+            ids.push(s.step(last, Want::Argmax)?.argmax());
+        }
+        if ids.len() < n {
+            return Err(format!("the plain run decoded {} ids, {n} asked for", ids.len()).into());
+        }
+        Ok(ids)
+    }
+
+    /// Committed tokens of clause 2, and how often draft slot `k` (1-based) was kept.
+    struct Accept {
+        passes: usize,
+        kept: usize,
+        /// `slot[k - 1]` counts the passes that kept draft slot `k`.
+        slot: [usize; PROPOSAL],
+    }
+
+    /// `n` drafted ids from `prompt`. A pass may run past `n`; the caller reads the first `n`.
+    /// With `acc`, every pass is a proposal of [`PROPOSAL`] ids or the run stops by name.
+    fn draft_n(
+        spec: &mut Spec,
+        seat: &mut Seat,
+        prompt: &[u32],
+        n: usize,
+        mut acc: Option<&mut Accept>,
+    ) -> Result<Vec<u32>, GateError> {
+        seat.reset()?;
+        let first = Advance::prompt(spec, seat, prompt)?;
+        Advance::begin(spec, seat, prompt, first)?;
+        let mut tokens = vec![first];
+        while tokens.len() < n {
+            let before = tokens.len();
+            let last = tokens[tokens.len() - 1];
+            let c = Advance::pass(spec, seat, last, &mut tokens)?;
+            let appended = tokens.len() - before;
+            if appended != c.kept {
+                return Err(format!("a pass kept {} and appended {appended}", c.kept).into());
+            }
+            if let Some(acc) = acc.as_mut() {
+                if !c.proposed || c.rows != VERIFY_ROWS {
+                    return Err(format!(
+                        "clause 2 is a proposal of {PROPOSAL}: a pass proposed {} over {} rows",
+                        c.proposed, c.rows
+                    )
+                    .into());
+                }
+                acc.passes += 1;
+                acc.kept += c.kept;
+                for k in 1..=PROPOSAL {
+                    if c.kept > k {
+                        acc.slot[k - 1] += 1;
+                    }
+                }
+            }
+        }
+        spec.draft_mut().check_fault()?;
+        if tokens.len() < n {
+            return Err(
+                format!("the draft run decoded {} ids, {n} asked for", tokens.len()).into(),
+            );
+        }
+        Ok(tokens)
+    }
+
+    /// Clause 1: the first `n` ids, or the first index that differs.
+    fn same_prefix(plain: &[u32], draft: &[u32], n: usize) -> Result<bool, GateError> {
+        if plain.len() < n || draft.len() < n {
+            return Err(format!(
+                "clause 1 compares {n} ids: the plain run holds {}, the draft {}",
+                plain.len(),
+                draft.len()
+            )
+            .into());
+        }
+        match (0..n).find(|&i| plain[i] != draft[i]) {
+            None => {
+                println!("clause 1: ids identical {n} {}", verdict(true));
+                Ok(true)
+            }
+            Some(i) => {
+                println!(
+                    "clause 1: first divergence at {i} (plain {} draft {}) {}",
+                    plain[i],
+                    draft[i],
+                    verdict(false)
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Clause 2's line. No verify pass is a named error, not an E of 0. `decoded` is the run's
+    /// ids, prompt argmax included; E is over the verify passes only.
+    fn floor_line(acc: &Accept, decoded: usize) -> Result<bool, GateError> {
+        if acc.passes == 0 {
+            return Err("clause 2: no verify pass".into());
+        }
+        let e = acc.kept as f64 / acc.passes as f64;
+        let ok = e >= FLOOR;
+        let slots = (0..PROPOSAL)
+            .map(|k| format!("{}:{}", k + 1, acc.slot[k]))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "clause 2: E={e:.3} over {} verify passes, {} committed tokens, {decoded} decoded; \
+             accept {slots} (floor {FLOOR}) {}",
+            acc.passes,
+            acc.kept,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// Clauses 1 and 2. The plain load is dropped before the verifying load.
+    fn target(dir: &Path, c1: bool, c2: bool) -> Result<bool, GateError> {
+        let mut ok = true;
+        let fixed = prose_ids("qwen35moe", PROMPT_FIXED)?;
+        let plain = if c1 {
+            let mut seat = open_seat(false)?;
+            let ids = greedy(&mut seat, &fixed, DECODE_LOSSLESS)?;
+            drop(seat);
+            Some(ids)
+        } else {
+            None
+        };
+        let prose = if c2 {
+            prose_ids("qwen35moe", PROSE)?
+        } else {
+            Vec::new()
+        };
+        let mut seat = open_seat(true)?;
+        let mut spec = attach(&mut seat, dir)?;
+        if let Some(plain) = plain {
+            let drafted = draft_n(&mut spec, &mut seat, &fixed, DECODE_LOSSLESS, None)?;
+            ok &= same_prefix(&plain, &drafted, DECODE_LOSSLESS)?;
+        }
+        if c2 {
+            let mut acc = Accept {
+                passes: 0,
+                kept: 0,
+                slot: [0; PROPOSAL],
+            };
+            let drafted = draft_n(&mut spec, &mut seat, &prose, DECODE_FLOOR, Some(&mut acc))?;
+            if drafted.len() < DECODE_FLOOR {
+                return Err(format!(
+                    "clause 2 decoded {} ids, {DECODE_FLOOR} asked for",
+                    drafted.len()
+                )
+                .into());
+            }
+            ok &= floor_line(&acc, drafted.len())?;
+        }
+        Ok(ok)
+    }
+
+    /// `--draft <dir>` (else the box's copy) and `--only 0|1|2`, repeatable. No `--only` runs all.
+    fn parse_args() -> Result<(PathBuf, [bool; 3]), GateError> {
+        let mut dir = dspark_hf::default_dir();
+        let mut only = [false; 3];
+        let mut named = false;
+        let mut args = std::env::args().skip(1);
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "--draft" => {
+                    dir = PathBuf::from(args.next().ok_or("--draft needs a directory")?);
+                }
+                "--only" => {
+                    let n: usize = args
+                        .next()
+                        .ok_or("--only needs 0, 1 or 2")?
+                        .parse()
+                        .map_err(|_| -> GateError { "--only needs 0, 1 or 2".into() })?;
+                    if n > 2 {
+                        return Err(format!("--only {n}: clauses are 0, 1 and 2").into());
+                    }
+                    only[n] = true;
+                    named = true;
+                }
+                other => return Err(format!("unknown argument {other:?}").into()),
+            }
+        }
+        if !named {
+            only = [true, true, true];
+        }
+        Ok((dir, only))
+    }
+
+    pub fn run() -> Result<(), GateError> {
+        let (dir, only) = parse_args()?;
+        let mut ok = true;
+        if only[0] {
+            ok &= dense(&dir)?;
+        }
+        if only[1] || only[2] {
+            ok &= target(&dir, only[1], only[2])?;
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
