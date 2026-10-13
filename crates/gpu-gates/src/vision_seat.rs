@@ -1056,6 +1056,25 @@ pub fn merged_cells(rows: &[u16], patches: &Patches) -> Result<(Vec<u16>, Vec<()
     Ok((rows.to_vec(), vec![(); cells]))
 }
 
+/// How many of `inputs` are tile groups, when every image is that kind or none is. A mix of a
+/// patch grid and a tile group is refused by name: one call is one shape, and the table takes a
+/// call's images in one change.
+pub fn tile_group_count(inputs: &[&EncoderInput]) -> Result<usize, GateError> {
+    let n = inputs
+        .iter()
+        .filter(|input| matches!(input, EncoderInput::Tiles(_)))
+        .count();
+    if n != 0 && n != inputs.len() {
+        return Err(format!(
+            "{n} tile groups among {} images: a call's images are all grids or all \
+             canvas groups",
+            inputs.len()
+        )
+        .into());
+    }
+    Ok(n)
+}
+
 /// The rows of `v.tok_embd_sep` a group's tiles draw their separators from: `</image>`,
 /// `<slice>`, `</slice>` and `\n`.
 const SEPARATOR_ROWS: usize = 4;
@@ -2388,6 +2407,62 @@ mod tests {
                 "tile 0 of the group: {} encoded values for a 8x8 grid, want {need}",
                 need - 1
             )
+        );
+    }
+
+    /// A reader that encodes one grid refuses a tile group by name, and does not ask the tower.
+    /// 448×448 is one overview: 64 cells and the `</image>` row, one tile.
+    #[test]
+    fn a_tile_group_handed_to_a_grid_encode_is_refused_by_name() {
+        let group = preprocess_group(&vision::Rgb8::filled(448, 448, [1, 2, 3]), &minicpm_hp())
+            .expect("group");
+        let (tiles, span) = (group.tiles.len(), group.rows());
+        assert_eq!((tiles, span), (1, 65));
+        let input = EncoderInput::Tiles(group);
+        let mut encoded = false;
+        let err = span_rows_of(
+            [Image {
+                at: 4,
+                input: &input,
+                span_len: span,
+            }],
+            W,
+            |_: &Patches| {
+                encoded = true;
+                Ok::<Vec<u16>, String>(Vec::new())
+            },
+            merged_cells,
+        )
+        .expect_err("a tile group is not a grid")
+        .to_string();
+        assert!(
+            !encoded,
+            "a grid reader refuses a tile group before it encodes"
+        );
+        assert_eq!(
+            err,
+            "the image at 4: the image is a group of 1 tiles, not one patch grid; \
+             this encoder runs one grid per image"
+        );
+    }
+
+    /// A call is all grids or all tile groups. The count is how many groups it holds, and a mix
+    /// names both numbers.
+    #[test]
+    fn a_call_is_all_grids_or_all_tile_groups() {
+        let grid = grid_input(1, 1);
+        let group = preprocess_group(&vision::Rgb8::filled(448, 448, [4, 5, 6]), &minicpm_hp())
+            .expect("group");
+        let tiles = EncoderInput::Tiles(group);
+        assert_eq!(tile_group_count(&[]).expect("no image"), 0);
+        assert_eq!(tile_group_count(&[&grid, &grid]).expect("grids"), 0);
+        assert_eq!(tile_group_count(&[&tiles, &tiles]).expect("groups"), 2);
+        let err = tile_group_count(&[&grid, &tiles])
+            .expect_err("a grid beside a group")
+            .to_string();
+        assert_eq!(
+            err,
+            "1 tile groups among 2 images: a call's images are all grids or all canvas groups"
         );
     }
 
