@@ -72,6 +72,8 @@
 #             for ours and bin: arms; the label keeps it. The arm's prompt stays the arm's own — a prose
 #             arm still feeds the profile's corpus, whose ids must be the same tokenizer's as the named
 #             file's; the runner does not check that (the Q3_K_XL and Q4_K_XL Qwen3.8 files share one).
+#             The item prefill=<auto|pass|gemm> is no lever either: it is the arm's `--prefill` (Prefill
+#             path below), in its load key; the label keeps it.
 #             Refused by name before anything runs: a relative path, one holding `@`, `|` or white space,
 #             and model given twice (a `,` separates the list's items, so a path with one never arrives
 #             whole: the item after it is no NAME=VALUE and is refused there); model= on a reference or
@@ -465,6 +467,19 @@
 # mem= on a reference or server arm rides the '@' refusal those arms take; an empty value, one with no G, a
 # value that is not a whole number of GiB, mem given twice, a shard of the arm's split set that is not there
 # (before the lease) and a mem= arm under BLOOMERY_WARM_ROWS=1 (its eviction drops what the prime warmed)
+# are refused by name before anything runs.
+#
+# Prefill path. An ours arm's own list may name the path its prompt runs by, `prefill=<auto|pass|gemm>` among its
+# NAME=VALUE items (`512@prefill=pass`, `prose:512@prefill=gemm`, `512@prefill=pass,BLOOMERY_THREADS=8`): the
+# arm's process gets generate_qwen3moe's `--prefill <word>`, auto being the binary's own default (the unnamed
+# arms'), in a load of its own (the word is in the load key, since a different --prefill is a different
+# process); the label keeps it (`ours@prefill=pass`, `ours@prose@prefill=gemm`). The item is the runner's,
+# never a variable the binary sees. So `512 512@prefill=pass` is the same-binary A/B of one prompt through
+# its two paths, in one lease, as any lever arm is, and each row's `kind=` and `plan=` (Prefill above) name
+# the path it ran. Only this runner's binary takes the flag, and all three profiles (qwen3moe, qwen35moe,
+# qwen4exp) run generate_qwen3moe, so no profile refuses it here (the binary refuses a path its body does
+# not run by name, a FAIL row). A word outside auto, pass and gemm, an empty one, prefill given twice,
+# prefill= on a reference or server arm and prefill= on a bin: arm (an older build may know no --prefill)
 # are refused by name before anything runs.
 #
 # Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh has the mode) runs the arms on both cards,
@@ -955,6 +970,51 @@ q3_self_test() {
   out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen3moe BLOOMERY_DATA="$pt/data" "$BASH" "$me" "6@mem=61G,model=$pt/m-00001-of-00002.gguf" 2>&1)
   rc=$?
   want mem-shard-missing 2 "no shard $pt/m-00002-of-00002.gguf of its model file $pt/m-00001-of-00002.gguf"
+  # The prefill= item (the header's Prefill path): the arm's own --prefill and a part of its load key, never a
+  # variable of its process; the label keeps it. The same word shares a load, another word is a load of its own.
+  run_parse -- 512 512@prefill=pass
+  want prefill-pair 0 \
+    "[parse] 512: kind=ours depth=512 label=ours env=- load=$bin|ctx=768" \
+    "[parse] 512@prefill=pass: kind=ours depth=512 label=ours@prefill=pass env=- load=$bin|ctx=768|prefill=pass" \
+    "[parse] round 1 loads: [512] [512@prefill=pass]" \
+    "[parse] load: $bin --arm <lcg_prompt 512> -n 96 --ctx 768 --time --arm-sync" \
+    "[parse] load: $bin --arm <lcg_prompt 512> -n 96 --ctx 768 --prefill pass --time --arm-sync"
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:512@prefill=gemm
+  want prefill-prose 0 \
+    "[parse] prose:512@prefill=gemm: kind=ours depth=512 label=ours@prose@prefill=gemm env=- load=$bin|ctx=768|prefill=gemm corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
+    "[parse] load: $bin --arm <prose_prompt 512> -n 96 --ctx 768 --prefill gemm --time --arm-sync"
+  run_parse -- 6@prefill=pass 5@prefill=pass,BLOOMERY_THREADS=8 5@prefill=pass 6@prefill=gemm
+  want prefill-load 0 \
+    "[parse] 5@prefill=pass,BLOOMERY_THREADS=8: kind=ours depth=5 label=ours@prefill=pass,BLOOMERY_THREADS=8 env=BLOOMERY_THREADS=8 load=$bin|ctx=256|prefill=pass|BLOOMERY_THREADS=8" \
+    "[parse] round 1 loads: [6@prefill=pass 5@prefill=pass] [5@prefill=pass,BLOOMERY_THREADS=8] [6@prefill=gemm]" \
+    "[parse] load: $bin --arm <lcg_prompt 6> --arm <lcg_prompt 5> -n 96 --ctx 256 --prefill pass --time --arm-sync" \
+    "[parse] load: env BLOOMERY_THREADS=8 $bin --arm <lcg_prompt 5> -n 96 --ctx 256 --prefill pass --time --arm-sync" \
+    "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --prefill gemm --time --arm-sync"
+  run_parse -- 6@mem=61G,prefill=pass
+  want prefill-mem 0 \
+    "[parse] 6@mem=61G,prefill=pass: kind=ours depth=6 label=ours@mem=61G,prefill=pass env=- load=(a process of its own) mem=61G"
+  out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen35moe BLOOMERY_AB_ROUNDS=2 "$BASH" "$me" --parse-arms 512 512@prefill=pass 2>&1)
+  rc=$?
+  want prefill-qwen35moe 0 \
+    "[parse] 512@prefill=pass: kind=ours depth=512 label=ours@prefill=pass env=- load=$bin|ctx=768|prefill=pass" \
+    "[parse] load: $bin --arm <lcg_prompt 512> -n 96 --ctx 768 --prefill pass --time --arm-sync"
+  out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen4exp BLOOMERY_AB_ROUNDS=2 "$BASH" "$me" --parse-arms 6@place=gate,prefill=pass 2>&1)
+  rc=$?
+  want prefill-qwen4exp 0 \
+    "[parse] 6@place=gate,prefill=pass: kind=ours depth=6 label=ours@place=gate,prefill=pass env=- load=$bin|ctx=256|place=gate|prefill=pass" \
+    "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --place gate --prefill pass --time --arm-sync"
+  run_parse -- 6@prefill=step
+  want prefill-word 64 "depth-qwen3moe.sh: arm '6@prefill=step': prefill=step: the item is prefill=<auto|pass|gemm>"
+  run_parse -- 6@prefill=
+  want prefill-empty 64 "depth-qwen3moe.sh: arm '6@prefill=': prefill= names no prefill path"
+  run_parse -- 6@prefill=pass,prefill=gemm
+  want prefill-twice 64 "depth-qwen3moe.sh: arm '6@prefill=pass,prefill=gemm': prefill is given twice"
+  for ex in lcpp:6@prefill=pass lcppsrv:6@prefill=pass ik:6@prefill=pass; do
+    run_parse -- "$ex"
+    want "prefill-ref-${ex%%:*}" 64 "depth-qwen3moe.sh: arm '$ex': prefill= sets generate_qwen3moe's --prefill, and ${ex%%:*} is a reference engine's arm"
+  done
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@prefill=pass
+  want prefill-bin 64 "prefill= is an ours arm's item here: a bin: arm may be an older build that takes no --prefill"
   run_parse BLOOMERY_DATA="$pt/data" -- prose:4 bin:/root/r/t/target/release/generate_qwen3moe:prose:4
   want prose-bin 0 \
     "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:4: kind=bin depth=4 label=bin:t@prose env=- load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
@@ -1239,8 +1299,8 @@ ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 # Per arm, by its index in ARMS: the kind (ours, ref, srv or bin), the depth, the row label, the engine
 # (ours, bin, or the reference's), the binary (ours and bin) and a server arm's ids (lcg).
 A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_IDS=()
-# A lever arm's NAME=VALUE list as given less its place=, mem= and model= items (comma-separated; empty
-# for every other arm): the variables its process gets.
+# A lever arm's NAME=VALUE list as given less its place=, mem=, model= and prefill= items (comma-separated;
+# empty for every other arm): the variables its process gets.
 A_ENV=()
 # An ours or bin: arm's placement (its place= word, else BLOOMERY_GEN_PLACE; empty: no --place) and whether
 # place= set it (1, or empty); empty for a reference or server arm.
@@ -1251,6 +1311,9 @@ A_MEM=()
 # An ours or bin: arm's model= item (the header's model=): its file, the BLOOMERY_REF_MODEL the arm's
 # process runs under (empty for every other arm: the profile's file, inherited).
 A_MODEL=()
+# An ours arm's prefill= item (the header's Prefill): its word, the --prefill its process gets (empty for
+# every other arm and for an ours arm with none: the binary's own default).
+A_PREFILL=()
 # A prose arm's prompt, the corpus's first P ids comma-separated as --tokens takes them (empty for
 # every other arm); under --parse-arms the placeholder `<prose_prompt P>` its load lines print.
 A_TOK=()
@@ -1413,6 +1476,37 @@ arm_has_model() { [[ ,$1 == *,model=* ]]; }
 model_ref_refuse() {
   arm_refuse "$1" "model= sets the arm's BLOOMERY_REF_MODEL, and $2 is a reference engine's arm, which opens the profile's file"
 }
+# arm_prefill_split <arm> <NAME=VALUE list>: the list's prefill= item into ARM_PREFILL (empty without one) and
+# the rest, every other item as given and in order, into ARM_PREFILL_REST. The item is no lever: it is the arm's
+# --prefill (the header's Prefill), a part of its load key, never a variable the binary sees. An empty value, a
+# word outside auto, pass and gemm, and prefill given twice are refused by name.
+arm_prefill_split() {
+  local a=$1 s="$2," e rest='' seen=''
+  ARM_PREFILL=''
+  while [ -n "$s" ]; do
+    e=${s%%,*} s=${s#*,}
+    case $e in
+      prefill=*)
+        [ -z "$ARM_PREFILL" ] || arm_refuse "$a" "prefill is given twice"
+        ARM_PREFILL=${e#prefill=}
+        case $ARM_PREFILL in
+          '') arm_refuse "$a" "prefill= names no prefill path (the item is prefill=<auto|pass|gemm>, the arm's generate_qwen3moe --prefill)" ;;
+          auto | pass | gemm) ;;
+          *) arm_refuse "$a" "prefill=$ARM_PREFILL: the item is prefill=<auto|pass|gemm>, the arm's generate_qwen3moe --prefill" ;;
+        esac
+        ;;
+      *) rest+="${seen:+,}$e" seen=1 ;;
+    esac
+  done
+  # shellcheck disable=SC2034 # read by split_at
+  ARM_PREFILL_REST=$rest
+}
+# arm_has_prefill <NAME=VALUE list>: whether the list holds a prefill= item.
+arm_has_prefill() { [[ ,$1 == *,prefill=* ]]; }
+# prefill_ref_refuse <arm> <engine>: prefill= on a reference or server arm, refused by name.
+prefill_ref_refuse() {
+  arm_refuse "$1" "prefill= sets generate_qwen3moe's --prefill, and $2 is a reference engine's arm, which takes no prefill path of ours"
+}
 # model_shards <file>: every shard of <file>'s split set, one a line (`<stem>-0000k-of-0000n.gguf`, k = 1..n,
 # whichever shard <file> names), or <file> alone when its name is no shard's.
 model_shards() {
@@ -1483,15 +1577,17 @@ evict_arm() {
   return 1
 }
 # split_at <arm> <list>: an ours arm's @ list into AT (as given: its label's), ENVS (its lever list, checked
-# by lever-arms.sh), APLACE (its place= word, empty without one), AMEM (its mem= N, empty without one) and
-# AMODEL (its model= path, empty without one); place= only a qwen4exp file takes.
+# by lever-arms.sh), APLACE (its place= word, empty without one), AMEM (its mem= N, empty without one),
+# AMODEL (its model= path, empty without one) and APREFILL (its prefill= word, empty without one); place= only
+# a qwen4exp file takes.
 split_at() {
   AT=$2
   [ -n "$2" ] || arm_envs_ok "$1" "$2"
   arm_place_split "$1" "$2"
   arm_mem_split "$1" "$ARM_REST"
   arm_model_split "$1" "$ARM_MEM_REST"
-  ENVS=$ARM_MODEL_REST APLACE=$ARM_PLACE AMEM=$ARM_MEM AMODEL=$ARM_MODEL
+  arm_prefill_split "$1" "$ARM_MODEL_REST"
+  ENVS=$ARM_PREFILL_REST APLACE=$ARM_PLACE AMEM=$ARM_MEM AMODEL=$ARM_MODEL APREFILL=$ARM_PREFILL
   [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
   if [ -n "$APLACE" ] && [ "$MODEL_NAME" != qwen4exp ]; then
     place_refuse "$1" "place=$APLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)"
@@ -1510,10 +1606,10 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 # shellcheck source=tools/ref/lcpp-warm.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS='' AMEM='' AMODEL='' blist=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS='' AMEM='' AMODEL='' APREFILL='' blist=''
   # `@` is ours, a prose arm's or a bin: arm's list: split at it first, so a value with a `:` is not
-  # read as a reference's arm. place= and model= on a reference or server arm are refused by name (the
-  # header's Placement, model=).
+  # read as a reference's arm. place=, model= and prefill= on a reference or server arm are refused by name
+  # (the header's Placement, model=, Prefill).
   case ${a%%@*} in
     "$a") ;;
     prose:*) ;;
@@ -1521,6 +1617,7 @@ for a in "${ARMS[@]}"; do
     *:*)
       ! arm_has_place "${a#*@}" || place_ref_refuse "$a" "${eng%%+*}"
       ! arm_has_model "${a#*@}" || model_ref_refuse "$a" "${eng%%+*}"
+      ! arm_has_prefill "${a#*@}" || prefill_ref_refuse "$a" "${eng%%+*}"
       arm_refuse "$a" "'@' sets a lever of ours, and ${a%%:*}: is a reference engine's arm — a lever of ours is not a reference's"
       ;;
   esac
@@ -1539,7 +1636,7 @@ for a in "${ARMS[@]}"; do
     srv_check_arm "$a" || { echo "depth-qwen3moe.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     srv=1
     A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_IDS+=("$ids") A_ENV+=('') A_TOK+=("$tok") A_SLOTS+=('')
-    A_PLACE+=('') A_PLACE_SET+=('') A_MEM+=('') A_MODEL+=('')
+    A_PLACE+=('') A_PLACE_SET+=('') A_MEM+=('') A_MODEL+=('') A_PREFILL+=('')
     continue
   fi
   case $a in
@@ -1574,6 +1671,7 @@ for a in "${ARMS[@]}"; do
         arm_mem_split "$a" "$ARM_MODEL_REST"
         blist=$ARM_MEM_REST
         ! arm_has_place "$blist" || arm_refuse "$a" "place= is an ours arm's item here (this runner's --place over BLOOMERY_GEN_PLACE); a bin: arm's list holds the build's levers, model= and mem="
+        ! arm_has_prefill "$blist" || arm_refuse "$a" "prefill= is an ours arm's item here: a bin: arm may be an older build that takes no --prefill; its list holds the build's levers, model= and mem="
         [ -z "$blist" ] || arm_envs_ok "$a" "$blist"
         envs=$blist AMODEL=$ARM_MODEL AMEM=$ARM_MEM
       fi
@@ -1650,7 +1748,7 @@ for a in "${ARMS[@]}"; do
     echo "depth-qwen3moe.sh: our arm '$a' feeds $ASLOTS slots × $dep = $((dep * ASLOTS)) ids, past the 20000 one --tokens argument holds" >&2
     exit 64
   fi
-  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok") A_SLOTS+=("$ASLOTS") A_MEM+=("${AMEM:-}") A_MODEL+=("${AMODEL:-}")
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok") A_SLOTS+=("$ASLOTS") A_MEM+=("${AMEM:-}") A_MODEL+=("${AMODEL:-}") A_PREFILL+=("${APREFILL:-}")
   # An ours or bin: arm's placement: its place=, else BLOOMERY_GEN_PLACE (empty: no --place, the binary's a).
   if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
@@ -1683,14 +1781,15 @@ arm_env_list() {
   lg_strip_solo "${A_ENV[$1]}"
 }
 # A lever arm's variables are load-time, so they go into its key, sorted; a model= arm's file too (a
-# load reads one file); `|solo` on an arm whose list holds BLOOMERY_AB_LOAD=arm.
+# load reads one file) and a prefill= arm's word (a different --prefill is a different process); `|solo` on
+# an arm whose list holds BLOOMERY_AB_LOAD=arm.
 for i in "${!ARMS[@]}"; do
   LG_KEY[i]=
   [ "${A_KIND[$i]}" = ours ] || continue
   # A mem= arm's scope is its process's, so the arm never shares a load (the header's Mem): no key,
   # as a bin: arm.
   [ -z "${A_MEM[$i]}" ] || continue
-  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")${A_PLACE[$i]:+|place=${A_PLACE[$i]}}${A_MODEL[$i]:+|model=${A_MODEL[$i]}}"
+  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")${A_PLACE[$i]:+|place=${A_PLACE[$i]}}${A_MODEL[$i]:+|model=${A_MODEL[$i]}}${A_PREFILL[$i]:+|prefill=${A_PREFILL[$i]}}"
   [ -n "${A_ENV[$i]}" ] || continue
   env_key=$(lg_env_key "$(arm_env_list "$i")")
   [ -z "$env_key" ] || LG_KEY[i]+="|$env_key"
@@ -1715,7 +1814,7 @@ lg_cmd() {
   LG_CMD=("$BIN")
   for i in "$@"; do LG_CMD+=(--arm "$(arm_prompt "$i")"); done
   # shellcheck disable=SC2206 # an empty WARM adds nothing
-  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" ${A_PLACE[$1]:+--place "${A_PLACE[$1]}"} --time ${WARM:+--warm "$WARM"} --arm-sync)
+  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" ${A_PLACE[$1]:+--place "${A_PLACE[$1]}"} ${A_PREFILL[$1]:+--prefill "${A_PREFILL[$1]}"} --time ${WARM:+--warm "$WARM"} --arm-sync)
 }
 # srv_ctx_of <i> <n_predict>: a server arm's -c, ours' context at its D or P (lcpp-warm.sh's Context).
 srv_ctx_of() { echo "${GEN_CTX:-$(((A_DEP[$1] + N + 255) / 256 * 256))}"; }
@@ -2237,9 +2336,9 @@ ours_arm() {
       -p "MemoryMax=${A_MEM[$i]}G" -p MemorySwapMax=0 \
       env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} bash -c "$MEM_SCOPE_SCRIPT" -- \
       "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" \
-      ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
+      ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
   else
-    out=$(timeout --kill-after=10 "$BOUND" env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
+    out=$(timeout --kill-after=10 "$BOUND" env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
   fi
   rc=$?
   f1=$(majflt_now)
@@ -2626,13 +2725,13 @@ dry_cmd() {
   [ -z "${A_MEM[$i]}" ] || facts+=", the arm's process in systemd-run --scope -p MemoryMax=${A_MEM[$i]}G -p MemorySwapMax=0 (its peak in the arm's witness), after posix_fadvise(DONTNEED) and a mincore count over the $(model_shards "${A_MODEL[$i]:-$MODEL}" | grep -c .) shard(s) of ${A_MODEL[$i]:-$MODEL}"
   if lg_grouped "$i"; then
     arm_envs "$i"
-    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
+    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}}${A_PREFILL[$i]:+ --prefill ${A_PREFILL[$i]}} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
   else
     local mem='' envs=''
     [ -z "${A_MEM[$i]}" ] || mem="systemd-run --scope --quiet -p MemoryMax=${A_MEM[$i]}G -p MemorySwapMax=0 "
     arm_envs "$i"
     [ ${#ARM_ENVS[@]} -eq 0 ] || envs="env ${ARM_ENVS[*]} "
-    echo "timeout --kill-after=10 $BOUND ${mem}${envs}${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM}$note"
+    echo "timeout --kill-after=10 $BOUND ${mem}${envs}${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}}${A_PREFILL[$i]:+ --prefill ${A_PREFILL[$i]}} --time${WARM:+ --warm $WARM}$note"
   fi
 }
 

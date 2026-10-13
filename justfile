@@ -1987,6 +1987,8 @@ depth-gpu-qwen3moe *ARMS:
 # Qwen3.6-35B-A3B(qwen35moe) 같은 표: depth-gpu-qwen3moe의 러너·팔·표를 qwen35moe 프로필로 돈다. 우리 팔은 같은
 # generate_qwen3moe가 파일 헤더에서 아키텍처를 읽어 Body35로 연다.
 # Its prompt runs as its `--prefill` default (auto: ubatches for nine ids or more, `kind=` in the row names the path).
+# `<D>@prefill=<auto|pass|gemm>` (and `prose:<P>@prefill=…`) runs one arm's prompt at that `--prefill` in a load of its own:
+# `512 512@prefill=pass` is the same-binary A/B of the ubatch prompt against its eight-position passes (header: Prefill path).
 # `prose:<P>`는 depth-gpu-qwen3moe의 prose 팔과 같다. 이 프로필의
 # $BLOOMERY_DATA/qwen35moe/corpus-prose.ids 앞 P개 id를 --tokens로 넣고(행 라벨 ours@prose), prose 표에서만 비교한다.
 # 참조 트리와 플래그는 tools/ref/models/qwen35moe.sh. BLOOMERY_DRY=1이면 명령줄만, 빌드 없음.
