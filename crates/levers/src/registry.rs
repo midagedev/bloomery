@@ -2276,6 +2276,19 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          refuses.",
     ),
     runner(
+        "BLOOMERY_SELFTEST_LOAD",
+        Some("bloomery/selftest.py"),
+        "The self-test's synthetic 1-minute load. `tools/bloomery/selftest.py` reads it \
+         instead of the host load, and `tools/boxq.py`'s load-ready case sets it. The \
+         shell caller does not.",
+    ),
+    runner(
+        "BLOOMERY_SELFTEST_NCPU",
+        Some("bloomery/selftest.py"),
+        "The self-test's synthetic CPU count, read with the synthetic load. Unset, the \
+         host's CPU count.",
+    ),
+    runner(
         "BLOOMERY_SPLITK_BAND_DUMP",
         None,
         "The model attention gate's handshake with the child it runs of its own test \
