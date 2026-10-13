@@ -3055,6 +3055,8 @@ EOS
     && grep -Eq '^DONE total=1 red=1 tier=real skipped=0 wall=[0-9]+s' "$t/out-yield-card.log"; then
     pass 'yield: a plain card-lock rc 75 keeps today'"'"'s retry (try=11, red)'
   else fail 'yield: a plain card-lock rc 75 keeps today'"'"'s retry (try=11, red)' "rc=$(cat "$t/rc-yield-card") $(tail -1 "$t/out-yield-card.log")"; fi
+  # The final try is rc 75, so it ran nothing and must not feed the budget median. The seeded plain-any row is the plan's input.
+  want_no_row 'yield: a final card-lock rc 75 appends no times row' "$t/times-yield-card.tsv" '$1 ~ /^plain-any@FAKE_CARD75/'
   rc=$(GBFAST=1 LFLAG=--ledger steal_case yield-lead "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_HOLD75=leadbatch')
   printf '%s' "$rc" > "$t/rc-yield-lead"
   if [ "$(cat "$t/rc-yield-lead")" = 1 ] && grep -Eq '^plain-any rc=75 [0-9]+s try=11 lane=[AB] ' "$t/target/c-yield-lead/run.log"; then
