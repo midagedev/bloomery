@@ -21,7 +21,7 @@
 //! - `refuse`: by name, a room under the floor and an arena one slot set under the arena's floor (both at plan time),
 //!   and the family's own refusals.
 //! - `residency`: the unset residency rule on the paged plan resolves as the plan's own numbers say (the card
-//!   experts, the churn pool at the counts the rule probes, the host headroom and what `MemAvailable` leaves,
+//!   experts, the churn pool at the counts the rule probes, the host headroom and what the host's room leaves,
 //!   [`RoomFacts`]), never with why `paged`: the family states the pair it expects ([`Family::expected_residency`]).
 
 use std::sync::Arc;
@@ -84,7 +84,7 @@ pub struct RoomFacts {
     pub pool_last: u64,
     /// The plan's host headroom, in bytes.
     pub headroom: i128,
-    /// What `MemAvailable` leaves past the plan's host need, in bytes.
+    /// What the host's room leaves past the plan's host need, in bytes.
     pub mem_left: i128,
 }
 
@@ -126,7 +126,7 @@ impl std::fmt::Display for RoomFacts {
         write!(
             f,
             "fewest card experts a layer {:?}, churn pool {} B at P0 and {} B at the last count, host headroom {} B, \
-             MemAvailable leaves {} B",
+             the host's room leaves {} B",
             self.fewest, self.pool_first, self.pool_last, self.headroom, self.mem_left
         )
     }
@@ -152,7 +152,7 @@ impl Unset {
     /// - no layer holds a card expert (`:1287`): `off`, `no_card_experts`;
     /// - the fewest layer cannot hold P 0 and the spares (`:1294-1306`, `fewest < spares + 1`, and half of it is
     ///   under the minimum P): `off`, `no_room`;
-    /// - the pool at P 0 fits the headroom and what `MemAvailable` leaves: the word as it is;
+    /// - the pool at P 0 fits the headroom and what the host's room leaves: the word as it is;
     /// - else, on every body (an unset word never asks for its pool unhosted), the pool at the last count fits
     ///   (the pool only shrinks as the count grows): `pool_shrunk` to some `q` in `1..=fewest - spares - 1`;
     /// - else `off`, `pool_unhostable`.

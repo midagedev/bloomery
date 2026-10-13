@@ -228,8 +228,8 @@
 //! `bp` `mid-p0-s1`; `off` under `--place gate`, with stores too short for one
 //! window, beside `--prefill steps`, and when the plan holds no card expert,
 //! its fewest leave no room for the word, or the churn pool does not fit the
-//! plan's host headroom less the NextN layer's host experts or what
-//! `MemAvailable` leaves past the load's host need — never a refusal.
+//! plan's host headroom less the NextN layer's host experts or what the
+//! host's room leaves past the load's host need — never a refusal.
 //! `--plan` prints these records and the `plan` line and exits 0 before any
 //! card is opened. Running `mid-p<P>-s<S>` (plain or
 //! drafted), the load runs the common residency machine over the card's
@@ -719,12 +719,12 @@ fn residency_at(
             (r, word)
         }
         ResidencyLever::Unset(pick) => {
-            // The load refuses a host set past `MemAvailable` before any
-            // upload; the default leaves the pool out instead.
+            // The load refuses a host set past the host's available bytes
+            // before any upload; the default leaves the pool out instead.
             let room = PlanRoom::new(plan, GLM_CARD, beside);
-            let mem_left = match pick.word {
-                "off" => 0,
-                _ => room.mem_left()?,
+            let climb = match pick.word {
+                "off" => None,
+                _ => Some(room.climb_read()?),
             };
             let pick = glm_residency_at_plan(
                 <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
@@ -732,13 +732,10 @@ fn residency_at(
                 room.card_experts(),
                 |pinned| room.pool_bytes(pinned),
                 room.headroom(),
-                mem_left,
+                climb.as_ref().map_or(0, |c| c.mem_left),
             )
             .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?;
-            Record::new(&record::RESIDENCY_UNSET_GLM)
-                .w("residency", pick.word)
-                .w("why", pick.why)
-                .eprint();
+            record::residency_unset_glm(pick.word, pick.why, climb.as_ref()).eprint();
             (Residency::parse(pick.word)?, pick.word)
         }
     };

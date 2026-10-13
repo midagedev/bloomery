@@ -1855,7 +1855,7 @@ mod cli {
             return;
         }
         if let Some(pick) = residency38_unset(at) {
-            record::residency_unset(&pick).print();
+            record::residency_unset(&pick, None).print();
         }
     }
 

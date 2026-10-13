@@ -89,7 +89,7 @@ pub fn checkpoints_pinned(seqs: Seqs, slot_ctx: u64) -> Result<u64, GateError> {
 /// they take none. The one owner of a load's checkpoint bytes: the plan's
 /// host need (`HostNeed::bytes` counts every reserve) holds them, so the
 /// load's host check, the NVMe tier's floor and arena, the unset residency
-/// rule's room ([`mem_left_38`]) and the prompt cache's default budget
+/// rule's room ([`PlanRoom::mem_left`]) and the prompt cache's default budget
 /// (`CacheRam`) count them once, and a load that declares none counts none.
 /// Every machine builder prices its own context, so no probe of a context
 /// search reserves a figure priced at another. A machine reserves them once:
@@ -158,14 +158,6 @@ pub fn checkpoints_reserved(machine: &Machine) -> u64 {
         .sum()
 }
 
-/// What the host's available bytes leave the unset residency rule's room
-/// past the plan's host `need` (`HostNeed::bytes`), the load's
-/// checkpoints inside it ([`reserve_checkpoints`]).
-#[must_use]
-pub fn mem_left_38(available: u64, need: u64) -> i128 {
-    i128::from(available) - i128::from(need)
-}
-
 /// The plan's card a qwen4exp open loads: its one card.
 pub const CARD38: usize = 0;
 
@@ -211,7 +203,7 @@ pub enum Lever38<'a> {
 /// hosts its churn pool: a set word as given, hosted unless it asks for its
 /// pool unhosted ([`set_hosting`]); unset, the rule's before the plan or on
 /// plan (a) from it (`residency38_at_plan`: P 0, the first P whose pool fits
-/// the plan's host headroom and `MemAvailable` where P 0 does not, `off` with
+/// the plan's host headroom and the host's room where P 0 does not, `off` with
 /// why where the card slots leave no room), always hosted — its
 /// `residency unset` record handed to `emit`, the hosting the pick's
 /// ([`Residency38Pick::pool`]), which the load takes. `carry` is the loading
@@ -235,26 +227,28 @@ pub fn residency38(
     let (residency, word, hosting) = match lever {
         Lever38::Set(r, word) => (r, word.to_owned(), set_hosting(carry, plan, word)?),
         Lever38::Unset(pre) => {
-            let pick = match pre {
-                Some(off) => off,
+            let (pick, climb) = match pre {
+                Some(off) => (off, None),
                 None => {
                     // The load refuses a host set past the host's available
                     // bytes before any upload; the default leaves the pool
                     // out instead. The need holds the load's checkpoints
                     // ([`reserve_checkpoints`]), as `CacheRam`'s does.
                     let room = PlanRoom::new(plan, CARD38, 0);
-                    residency38_at_plan(
+                    let climb = room.climb_read()?;
+                    let pick = residency38_at_plan(
                         carry,
                         room.card_experts(),
                         plan.host.experts,
                         |pinned| room.pool_bytes(pinned),
                         room.headroom(),
-                        room.mem_left()?,
+                        climb.mem_left,
                     )
-                    .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
+                    .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?;
+                    (pick, Some(climb))
                 }
             };
-            emit(record::residency_unset(&pick));
+            emit(record::residency_unset(&pick, climb.as_ref()));
             let residency = match pick.pinned {
                 None => Residency::Off,
                 Some(pinned) => Residency::Mid {
