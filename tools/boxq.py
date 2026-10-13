@@ -983,6 +983,39 @@ def case_queued_age(fx):
     check(rc == 0 and m and 100 <= int(m.group(1)) <= 120, f"the queued seconds come from `submitted`: {rc} {se!r}")
 
 
+def case_load_ready(fx):
+    """Pids that appear after the idle 10 s, inside the load cap, still satisfy wait_pids.
+
+    Load 80 on 10 cpus makes the cap 80 s. The pids land at 15 s of a fake clock, so a constant
+    cap of 10 s fails this case and the scaled cap returns as soon as they appear."""
+    path = os.path.join(fx.tmp, "late.pids")
+    open(path, "w").close()
+    os.environ["BLOOMERY_SELFTEST_LOAD"] = "80"
+    os.environ["BLOOMERY_SELFTEST_NCPU"] = "10"
+    now = [0.0]
+    real_mono, real_sleep = time.monotonic, time.sleep
+
+    def mono():
+        return now[0]
+
+    def sleep(seconds):
+        now[0] += seconds
+        if now[0] >= 15 and os.path.getsize(path) == 0:
+            with open(path, "w") as f:
+                f.write("11 22\n")
+
+    time.monotonic, time.sleep = mono, sleep
+    try:
+        fx.wait_pids(path, 2, secs=10)
+    finally:
+        time.monotonic, time.sleep = real_mono, real_sleep
+        os.environ.pop("BLOOMERY_SELFTEST_LOAD", None)
+        os.environ.pop("BLOOMERY_SELFTEST_NCPU", None)
+    check(fx.pids(path) == [11, 22], f"the late pids were recorded: {fx.pids(path)}")
+    check(now[0] >= 15, f"the wait did not see the late pids: t={now[0]}")
+    check(now[0] < 20, f"the wait sat out the scaled cap: t={now[0]}")
+
+
 def case_cancelled_elsewhere(fx):
     for state, want in (({"status": "cancelled", "rc": 137}, 137), ({"status": "cancelled", "rc": None}, 81)):
         fx.serve([{"status": "running"}, {"status": "running"}, state])
@@ -1084,7 +1117,7 @@ def case_tails_stop(fx):
 
 CASES = [case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
-         case_tails_stop, case_flush_cap, case_queued_age, case_cancelled_elsewhere]
+         case_tails_stop, case_flush_cap, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
 def run_cases(label, cases, make_fix, names):

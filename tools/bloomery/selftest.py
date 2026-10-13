@@ -9,12 +9,20 @@ import sys
 
 
 def load_cap(idle_s):
-    try:
-        load_avg = os.getloadavg()[0]
-    except OSError:
-        return idle_s
+    # The regression sets these. The shell caller (`selftest.py 20`) does not.
+    forced = os.environ.get("BLOOMERY_SELFTEST_LOAD")
+    if forced is None:
+        try:
+            load_avg = os.getloadavg()[0]
+        except OSError:
+            return idle_s
+        cpus = os.cpu_count() or 1
+    else:
+        load_avg = float(forced)
+        ncpu = os.environ.get("BLOOMERY_SELFTEST_NCPU")
+        cpus = int(ncpu) if ncpu is not None else (os.cpu_count() or 1)
     # PIN(2026-10-13): scale self-test caps with load per CPU to accommodate CPU contention.
-    return idle_s * max(1.0, load_avg / (os.cpu_count() or 1))
+    return idle_s * max(1.0, load_avg / (cpus or 1))
 
 
 def _constant_factor(idle_s):
@@ -28,6 +36,14 @@ def _sees_ready(policy, idle_s, ready_at):
 
 
 def self_test():
+    # Load 80 on 10 cpus, idle 20. Printing the argument alone yields 20, not 160.
+    env = os.environ.copy()
+    env["BLOOMERY_SELFTEST_LOAD"] = "80"
+    env["BLOOMERY_SELFTEST_NCPU"] = "10"
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__), "20"],
+                          env=env, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "160", proc.stdout
     real_load, real_cpus = os.getloadavg, os.cpu_count
     try:
         os.cpu_count = lambda: 10
@@ -57,13 +73,6 @@ def self_test():
         assert load_cap(10) == 10
     finally:
         os.getloadavg, os.cpu_count = real_load, real_cpus
-    # The shell calls this file with the idle seconds. The child sees the real host load, so the
-    # printed integer is only checked to be at least that idle cap.
-    proc = subprocess.run([sys.executable, os.path.abspath(__file__), "20"], capture_output=True, text=True, check=False)
-    assert proc.returncode == 0, proc.stderr
-    line = proc.stdout.strip()
-    assert line.isdigit(), repr(proc.stdout)
-    assert int(line) >= 20, line
     print("selftest: self-test ok")
     return 0
 
