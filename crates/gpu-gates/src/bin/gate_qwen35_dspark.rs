@@ -9,8 +9,9 @@
 //!    so one append runs past the ring's end. The captured block pass replays to the eager bits.
 //!    The loader opens the whole draft (fc, head, Markov tables, id map, embedding table) and the
 //!    card bytes it reports are the header-only count. Staging: on fresh layers an eager block pass
-//!    and an eager append, run before their stage call, are refused by name; a capture before any
-//!    stage call records (the owner captures at load).
+//!    and an eager append, run before their stage call, are refused by name; a replay before any
+//!    stage call is refused by name, and a capture before any stage call records (the owner
+//!    captures at load). After one stage call the replay is allowed.
 //!
 //! The target-side clauses (the draft run's ids equal the plain run's, and the acceptance floor with
 //! its mutants) need the draft wired to the target and are not in this binary yet.
@@ -662,8 +663,9 @@ mod gate {
     }
 
     /// Staging, on layers that no stage call has run on (a reset): the eager block pass and the
-    /// eager append are refused, each naming the stage call it needs; the same passes captured, as
-    /// the owner captures them at load, record.
+    /// eager append are refused, each naming the stage call it needs; a replay is refused by name
+    /// the same way; the same passes captured, as the owner captures them at load, record. After
+    /// one `stage_kv` the replay is allowed. The layers are reset again before return.
     fn staging_clause(gpu: &Gpu, layers: &mut DenseLayers) -> Result<bool, GateError> {
         layers.reset(gpu)?;
         let rows = vec![0.0f32; BLOCK.max(APPEND) * layers.dims().hidden];
@@ -673,18 +675,28 @@ mod gate {
         };
         let block = names(layers.enqueue_block(gpu, &mut x, BLOCK), "stage_block");
         let append = names(layers.append_kv(gpu, &x, APPEND), "stage_kv");
+        let replay_text = layers.replayable().err().map(|e| e.to_string());
+        let replay = replay_text.as_deref().is_some_and(|s| {
+            s.contains("stage_kv") && s.contains("stage_block")
+        });
         let block_captured = gpu
             .capture(|_| layers.enqueue_block(gpu, &mut x, BLOCK))
             .is_ok();
         let append_captured = gpu.capture(|_| layers.append_kv(gpu, &x, APPEND)).is_ok();
+        layers.stage_kv(gpu, 0, APPEND)?;
+        let replay_after = layers.replayable().is_ok();
+        layers.reset(gpu)?;
         println!(
             "staging: the eager block pass before stage_block is refused by name {}; the eager \
-             append before stage_kv {}; the captures before any stage call record {}",
+             append before stage_kv {}; a replay before either stage call {}; a replay after \
+             stage_kv {}; the captures before any stage call record {}",
             verdict(block),
             verdict(append),
+            verdict(replay),
+            verdict(replay_after),
             verdict(block_captured && append_captured)
         );
-        Ok(block && append && block_captured && append_captured)
+        Ok(block && append && replay && replay_after && block_captured && append_captured)
     }
 
     pub fn run() -> Result<(), GateError> {

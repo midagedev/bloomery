@@ -598,6 +598,19 @@ impl DraftLayers for DenseLayers {
         self.dims.hidden
     }
 
+    fn replayable(&self) -> Result<(), GpuError> {
+        // The owner stages, then asks, then launches. Both images empty means
+        // this replay has no stage call behind it. An eager pass checks its
+        // own count in the enqueue, including a count that does not match.
+        if self.staged_rows.is_none() && self.staged_block.is_none() {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a replay before stage_kv and stage_block",
+            });
+        }
+        Ok(())
+    }
+
     fn stage_kv(&mut self, gpu: &Gpu, first: u32, n: usize) -> Result<(), GpuError> {
         if n == 0 || n > APPEND_MAX {
             return Err(shape_err(format!(
