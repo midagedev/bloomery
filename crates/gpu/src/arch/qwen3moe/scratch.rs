@@ -17,24 +17,26 @@
 use super::body::KvQ8;
 use super::image::MediaRows;
 use super::plan::Flash;
-use super::router::{MAX_TOKENS, RouterDims, RouterOut};
+use super::router::{RouterDims, RouterOut, MAX_TOKENS};
 use super::ubatch::UBATCH;
-use super::wide::{GEMV_COLS, Wide};
-use crate::GpuError;
+use super::wide::{Wide, GEMV_COLS};
 use crate::fault::FaultSink;
 use crate::flash_gqa::{
-    FlashGqaKernels, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable, partials_ms_len,
-    partials_v_len, partials_v_len_256,
+    partials_ms_len, partials_v_len, partials_v_len_256, FlashGqaKernels, GqaArgs, GqaQ8Args,
+    GqaRowsArgs, RowTable, HEAD, HEAD_256,
 };
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
+use crate::kquant::EntryPlanes;
 use crate::linear::{self, LinearShape};
+use crate::q4k_sel::{tile_cap, BUCKET_EXPERTS};
 use crate::rope_neox::{
-    NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
-    q8_plane_lens,
+    q8_plane_lens, NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args,
+    RopeNeoxKernels,
 };
-use crate::tensor::{Q8Act, window};
+use crate::tensor::{window, Q8Act};
 use crate::weights::q8_0_planes;
+use crate::GpuError;
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
 use gguf::quant::f32_to_f16_bits;
 use model::quant::quantize_q8_0;
@@ -1150,6 +1152,57 @@ impl ApartRows {
     }
 }
 
+/// The grouped tile entry's table and planes for a pass of more than one
+/// row ([`tile_bytes`]). `h` and `act_h` stay the arena's: the gate·up writes
+/// entry order into `h`, and the down scatters each entry back to its slot.
+/// Load-time only. One row and a dense chain hold none.
+pub(super) struct TileBuf {
+    pub(super) order: DeviceBuffer<u32>,
+    pub(super) start: DeviceBuffer<u32>,
+    pub(super) tiles: DeviceBuffer<u32>,
+    pub(super) planes: EntryPlanes,
+    /// Slots the table and the planes hold at most (`rows.min(GEMV_COLS) · slots`).
+    pub(super) slots: usize,
+}
+
+impl TileBuf {
+    /// The table and the planes for `slots` entries of `hidden` values.
+    fn new(stream: &CudaStream, slots: usize, hidden: usize) -> Result<TileBuf, GpuError> {
+        Ok(TileBuf {
+            order: DeviceBuffer::zeroed(stream, slots)?,
+            start: DeviceBuffer::zeroed(stream, BUCKET_EXPERTS + 1)?,
+            tiles: DeviceBuffer::zeroed(stream, tile_cap(slots, BUCKET_EXPERTS) + 1)?,
+            planes: EntryPlanes::new(stream, slots, hidden)?,
+            slots,
+        })
+    }
+
+    /// Device bytes of the table and the planes.
+    fn bytes(&self) -> usize {
+        self.order.num_bytes()
+            + self.start.num_bytes()
+            + self.tiles.num_bytes()
+            + self.planes.device_bytes()
+    }
+}
+
+/// Device bytes of [`TileBuf`] for `d` and up to `rows` tokens, or 0 when
+/// the arena holds none: one row, a dense chain, or a hidden size that is
+/// not a multiple of 256 (the planes' `k`). The pass and the ubatch arena
+/// both count it. `cols = rows.min(GEMV_COLS) · slots`; the planes are
+/// `4 · cols · (256 · ⌈n_sb / 4⌉ + 10 · n_sb)` and the table is `order`,
+/// `start` of [`BUCKET_EXPERTS`] + 1 and `tiles` of [`tile_cap`] + 1.
+pub(super) fn tile_bytes(d: &Dims, rows: usize) -> usize {
+    if d.router.is_none() || rows <= 1 || !d.hidden.is_multiple_of(256) {
+        return 0;
+    }
+    let cols = rows.min(GEMV_COLS) * d.slots();
+    let n_sb = d.hidden / 256;
+    let planes = 4 * cols * (256 * n_sb.div_ceil(4) + 10 * n_sb);
+    let table = (cols + (BUCKET_EXPERTS + 1) + tile_cap(cols, BUCKET_EXPERTS) + 1) * 4;
+    planes + table
+}
+
 /// The arena, in chain order: every intermediate of one layer for up to
 /// `rows` tokens, token-major, shared by all layers (they run in turn). The
 /// decode step's arena has one row, a pass's [`GEMV_COLS`], a prompt's up to
@@ -1226,6 +1279,9 @@ pub(super) struct Arena {
     /// The gemv arm's buffers of a layer that keeps its shared expert apart
     /// (`Forms::apart`); `None` on a chain whose every layer joins it.
     pub(super) apart: Option<ApartRows>,
+    /// The grouped tile table and its planes ([`tile_bytes`]); `None` on a
+    /// one-row arena and on a dense chain.
+    pub(super) tile: Option<TileBuf>,
     /// The media call's rows the unit about to walk takes over its
     /// embeddings ([`Arena::write_media`]); `Some` only on a prompt arena of
     /// a media load.
@@ -1912,6 +1968,9 @@ impl Arena {
                 .apart
                 .map(|_| ApartRows::new(stream, &d, narrow))
                 .transpose()?,
+            tile: (tile_bytes(&d, rows) > 0)
+                .then(|| TileBuf::new(stream, narrow * d.slots(), d.hidden))
+                .transpose()?,
             media: None,
             dims: d,
             rows,
@@ -1999,6 +2058,7 @@ impl Arena {
                 .map_or(0, |g| g.g.num_bytes() + g.u.num_bytes())
             + self.cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.apart.as_ref().map_or(0, ApartRows::bytes)
+            + self.tile.as_ref().map_or(0, TileBuf::bytes)
             + self.route.bytes()
             + acts.map(act_bytes).sum::<usize>()
     }

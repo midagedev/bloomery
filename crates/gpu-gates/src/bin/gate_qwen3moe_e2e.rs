@@ -311,22 +311,22 @@ mod gate {
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
+    use bloomery_gpu_gates::kld::{score_ppl, KldBase, PplModel};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::prompts::{
-        GreedyClass, GreedyRow, MARGIN_FLOOR, PromptRow, compare_greedy, read_greedy, read_prompts,
+        compare_greedy, read_greedy, read_prompts, GreedyClass, GreedyRow, PromptRow, MARGIN_FLOOR,
     };
     use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir,
-        ik_q8_2, open_split, q8_1_dequant, ref_ints, ref_model_path, ref_tensor_logical_in,
-        topk_ids_logical_within, verdict,
+        bits_equal, checks_failed, data_dir, ik_q8_2, open_split, q8_1_dequant, ref_ints,
+        ref_model_path, ref_tensor_logical_in, topk_ids_logical_within, verdict, Fnv1a64,
+        GateError, Layout, RefManifest, RowKind,
     };
     use bloomery_levers::HostCfg;
     use cuda_core::sys;
-    use model::arch::Arch;
     use model::arch::qwen3moe::hparams::Hparams;
+    use model::arch::Arch;
     use model::moe::UNION_MAX_COLS;
     use model::placement::PlanLevers;
     use std::path::{Path, PathBuf};
@@ -433,19 +433,29 @@ mod gate {
     /// with the two q8_1 launches of [`NODES_CHAIN`]'s note folded.
     const NODES_PASS_1: usize = 601;
 
-    /// PIN(2026-10-05): the captured prefill pass's node count at every `m`
-    /// from two to `MAX_TOKENS`, derived the same way: the embedding rows,
-    /// then per layer the attention half's 7 (norm+quant, q·k·v,
-    /// QK-norm+rope+append, flash segment pass, flash merge, the attention
-    /// rows' q8_1, attn_output with the residual) plus 2 on each of the 24
-    /// layers whose value projection is Q6_K (its gemv, the token-major
-    /// copy), and the FFN half's 5 (the FFN norm with the m-token router in
-    /// one launch, gate·up·SwiGLU, one q8_1 over every token's slots, one
-    /// down `_sel` over every token's slots, the combine): 1 + 24·12 +
-    /// 24·14. Every launch covers all of the pass's tokens, so the count
-    /// does not grow with m. The head after the last pass runs eager. Was
-    /// 673, the FFN norm its own launch (`norm_quant`) before the router.
-    const NODES_PASS_M: usize = 625;
+    /// Q4_K routed downs on the Q4_K_M file (header census, 2026-10-14).
+    /// Gate and up are Q4_K on every layer, so these take the tile entry.
+    /// The other 24 downs are Q6_K and stay on `_sel`. There is no shared
+    /// expert.
+    const Q4_DOWN: usize = 24;
+
+    /// PIN(2026-10-14): the captured prefill pass's node count at every `m`
+    /// from two to `MAX_TOKENS`. The 2026-10-05 count was 625: the embedding
+    /// rows, then per layer the attention half's 7 plus 2 on each of the 24
+    /// Q6_K value layers, and the FFN half's 5: 1 + 24·12 + 24·14. The
+    /// [`Q4_DOWN`] layers replace the gate·up, the slot quantizer and the
+    /// down `_sel` with the grouped tile entry's six launches, three more.
+    /// 625 + 3·24 = 697. The count does not grow with m. The head after the
+    /// last pass runs eager. One token stays [`NODES_PASS_1`]: the tile
+    /// entry is not launched. Was 673 before the FFN norm folded into the
+    /// router.
+    const NODES_PASS_M: usize = 697;
+
+    /// The m >= 2 step of the 2026-10-05 count: one token-major copy on each
+    /// of the 24 Q6_K value layers. Not the Q4_K down set.
+    const Q6_V_COPY: usize = 24;
+
+    const _: () = assert!(NODES_PASS_M == NODES_PASS_1 + Q6_V_COPY + 3 * Q4_DOWN);
 
     /// PIN(2026-09-24): the teacher-forced bound on each half's error ratio
     /// — its relative error over the relative distance between the two
@@ -1441,11 +1451,24 @@ mod gate {
     /// head, 1 + 48 · 15.
     const Y_NODES_PASS_1: usize = 721;
 
-    /// PIN(2026-10-10): the captured pass at every count from two: the pass
-    /// at one token plus a token-major copy after each row-major (Q6_K) site
-    /// launched alone, which are the 24 layers' `attn_v` (Q5_K sites are
-    /// token-major and need none): 721 + 24.
-    const Y_NODES_PASS_M: usize = 745;
+    /// Q5_K routed downs on [`Y_FILE`] (header census, 2026-10-14): the same
+    /// 24 layer ids as [`Q4_DOWN`]. Gate and up are Q5_K on every layer, so
+    /// these take the tile entry. The other 24 downs are Q6_K and stay on
+    /// `_sel`.
+    const Y_Q5_DOWN: usize = 24;
+
+    /// PIN(2026-10-14): the captured pass at every count from two. The
+    /// 2026-10-10 count was 745: the one-token pass plus a token-major copy
+    /// after each of the 24 Q6_K `attn_v` sites. The [`Y_Q5_DOWN`] layers
+    /// take the grouped tile entry, three more launches. 745 + 3·24 = 817.
+    /// One token stays [`Y_NODES_PASS_1`].
+    const Y_NODES_PASS_M: usize = 817;
+
+    /// The m >= 2 step of the 2026-10-10 count: one token-major copy on each
+    /// of the 24 Q6_K `attn_v` layers.
+    const Y_Q6_V_COPY: usize = 24;
+
+    const _: () = assert!(Y_NODES_PASS_M == Y_NODES_PASS_1 + Y_Q6_V_COPY + 3 * Y_Q5_DOWN);
 
     /// (y) (module doc), on its own loads, each dropped before the clause
     /// returns. The whole-card runs are kept for the placed clause's compare.
@@ -2317,7 +2340,11 @@ mod gate {
     /// is the difference (both zeros at 0).
     fn f16_ord(b: u16) -> i32 {
         let mag = i32::from(b & 0x7fff);
-        if b & 0x8000 != 0 { -mag } else { mag }
+        if b & 0x8000 != 0 {
+            -mag
+        } else {
+            mag
+        }
     }
 
     /// `‖a − b‖ / ‖b‖` over f16 bits.

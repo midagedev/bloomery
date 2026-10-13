@@ -16,29 +16,31 @@
 //! into the projection beside them, the work lands in every block of a grid
 //! that already streams its weights at the card's bandwidth.
 
-use super::body::{ATTN_SCALE, ATTN_SCALE_256, Body, Kernels};
+use super::body::{Body, Kernels, ATTN_SCALE, ATTN_SCALE_256};
 use super::delta;
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{
-    DownEntry, FfnPlan, FfnRoute, Form, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan,
-    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry,
+    down_entry, gate_up_entry, DownEntry, FfnPlan, FfnRoute, Form, GateUpEntry, GqaKind, GqaPlan,
+    LayerPlan, MixerPlan, SharedPlan, SharedSites, SiteTy,
 };
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
-use super::scratch::{Append128, Append256, Arena, FlashPass, Io, KvPlanes, StoreMut};
+use super::scratch::{Append128, Append256, Arena, FlashPass, Io, KvPlanes, StoreMut, TileBuf};
 use super::wide::{self, GEMV_COLS};
 use crate::elem::EmbedRowsArgs;
 use crate::gated_quant::GateLayout;
 use crate::head::Head;
-use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
+use crate::kquant::{
+    Act, GateUpAct, KquantKernels, SelDown, TileGather, TileTable, TiledDown, TiledGateUpAct,
+};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
-use crate::q4k_sel::QuantSel;
 use crate::q38::{EmbedQ8Args, OutGateArgs};
+use crate::q4k_sel::{QuantSel, BUCKET_EXPERTS};
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
-use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
+use crate::weights::{DevWeight, Weights, HEAD_TENSOR};
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
@@ -271,7 +273,11 @@ pub(super) fn enqueue_pass(
 ///   row.
 /// - FFN: the norm with the router (one launch), gate·up, one quantizer
 ///   over every token's slots, the down `_sel` over every token's slots,
-///   and the combine — 5.
+///   and the combine — 5. At more than one row a joined routed layer whose
+///   gate and up are the same Q4_K or Q5_K and whose down is Q4_K or Q5_K
+///   takes the grouped tile entry instead of those three ([`ffn_tiles`]):
+///   the bucket table, its tiles, the gather, the gate·up, the quantizer
+///   and the down — 6 — and the norm and the combine stay, 8 in all.
 ///
 /// - A dense FFN: `norm_quant` and the four launches after the router — 5;
 ///   an unfused gate·up is the gate, the up and the SwiGLU; a Q8_0 down is
@@ -284,9 +290,11 @@ pub(super) fn enqueue_pass(
 ///   shared down's quantizer, the shared down, and the combine — 11 of
 ///   Q8_0 or of K-quant shared sites at one row.
 ///
-/// So a qwen3moe layer is 12 or 13 launches at one row and 12 or 14 at
-/// every `m` from two to [`GEMV_COLS`]. Past it (the wide arm, `wide`) the
-/// embedding is followed by the unit's dense route table, and a layer is
+/// So a qwen3moe layer is 12 or 13 launches at one row. From two rows to
+/// [`GEMV_COLS`] it is 15 or 17 where the FFN takes the tile entry (8 in
+/// place of 5) and 12 or 14 where the down stays `_sel`. Past it (the wide
+/// arm, `wide`) the embedding is followed by the unit's dense route table,
+/// and a layer is
 /// its mixer — the gated attention's norm, quantizer, three GEMMs, rope,
 /// prefill flash, gated quantizer, output GEMM and residual add, 10; the
 /// delta rule's 12 ([`delta::launches`]) — and the FFN's norm, quantizer,
@@ -357,7 +365,13 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                     + 1
             }
             (FfnRoute::Router { .. }, true) => 10,
-            (FfnRoute::Router { .. }, false) => 5,
+            (FfnRoute::Router { .. }, false) => {
+                if m > 1 && ffn_tiles(f) {
+                    8
+                } else {
+                    5
+                }
+            }
             (FfnRoute::Dense, true) => 1 + wide_quants(&[f.gate_ty, f.up_ty]) + 5,
             (FfnRoute::Dense, false) => {
                 let gate_up = if f.gate_up_fused() {
@@ -955,10 +969,16 @@ fn gated_256(
 /// all at that index, so each slot's row is the row a one-token launch
 /// writes. Its input is one quantizer launch over every token's slots (each
 /// 128-value block is quantized on its own, so a column's bytes do not
-/// depend on the columns beside it). The norm runs inside the router's
-/// launch, `norm_quant`'s bytes: `enqueue_norm_fused` at one token,
-/// `enqueue_norm_fused_m` at more; a shared expert kept apart whose gate or
-/// up reads f32 rows takes `norm_quant` and the router on those rows.
+/// depend on the columns beside it). At more than one row a joined routed
+/// layer whose gate and up are the same Q4_K or Q5_K and whose down is
+/// Q4_K or Q5_K runs the grouped tile entry ([`slots_tiles`]) in place of
+/// the gate·up, the quantizer and the down: each slot's value is that
+/// `_sel` entry's, and the combine is the same launch. One row, a Q6_K
+/// down, a shared expert kept apart and a dense FFN stay on the launches
+/// above. The norm runs inside the router's launch, `norm_quant`'s bytes:
+/// `enqueue_norm_fused` at one token, `enqueue_norm_fused_m` at more; a
+/// shared expert kept apart whose gate or up reads f32 rows takes
+/// `norm_quant` and the router on those rows.
 pub(super) fn ffn(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -1060,9 +1080,209 @@ pub(super) fn ffn(
     }
 }
 
+/// Whether a joined routed FFN takes the grouped tile entry: gate and up the
+/// same Q4_K or Q5_K, down Q4_K or Q5_K. A Q6_K down has no tile kernel, a
+/// shared expert kept apart writes a different `h`, and a dense FFN stays on
+/// today's launches. The caller still requires `m > 1`; one row saves no
+/// repeated expert read and stays on `_sel`.
+fn ffn_tiles(n: &FfnPlan) -> bool {
+    matches!(
+        n.route,
+        FfnRoute::Router {
+            shared: None | Some(SharedPlan::Joined),
+            ..
+        }
+    ) && n.gate_ty == n.up_ty
+        && matches!(n.gate_ty, SiteTy::Q4K | SiteTy::Q5K)
+        && matches!(n.down_ty, SiteTy::Q4K | SiteTy::Q5K)
+}
+
+/// The file type of a tile stack, or a named refusal. [`ffn_tiles`] is the
+/// only caller, and it admits Q4_K and Q5_K only.
+fn tile_ty(ty: SiteTy) -> Result<GgmlType, GpuError> {
+    match ty {
+        SiteTy::Q4K => Ok(GgmlType::Q4_K),
+        SiteTy::Q5K => Ok(GgmlType::Q5_K),
+        other => Err(GpuError::shape(
+            "qwen3moe::ffn",
+            format!("a {other:?} stack on the grouped tile entry, which runs Q4_K and Q5_K"),
+        )),
+    }
+}
+
+/// The FFN half after its slots are picked, on the grouped tile entry
+/// ([`ffn_tiles`], `m > 1`): the slot table, its tiles, the entries' planes
+/// gathered from the token columns, the gate·up by tiles into `h` in entry
+/// order, the q8_1 of those columns, and the down by tiles, which scatters
+/// each entry back to its slot. Then the same combine as [`slots_down`].
+/// Each slot's value is its `_sel` entry's. Refused by name when the arena
+/// holds no tile table, or when the expert count is outside the bucket
+/// table.
+fn slots_tiles(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    s: &mut Arena,
+    m: usize,
+    out: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "qwen3moe::ffn";
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let stream = gpu.stream();
+    let d = s.dims;
+    let i = s.col(m)?;
+    let slots = d.slots();
+    let n_slots = m * slots;
+    let wg = kq_weight(w, &n.gate)?;
+    let wu = kq_weight(w, &n.up)?;
+    let wd = kq_weight(w, &n.down)?;
+    let ff = d.ff;
+    if ff == 0 || !wg.rows().is_multiple_of(ff) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "layer {}: the gate holds {} rows, not a whole number of experts of {ff}",
+                c.layer,
+                wg.rows()
+            ),
+        ));
+    }
+    let n_experts = wg.rows() / ff;
+    if n_experts == 0 || n_experts > BUCKET_EXPERTS {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "layer {}: {n_experts} experts; the grouped table takes 1..={BUCKET_EXPERTS}",
+                c.layer
+            ),
+        ));
+    }
+    let ty = tile_ty(n.gate_ty)?;
+    let Arena {
+        act_ffn,
+        route,
+        h,
+        act_h,
+        down,
+        ffn_inp,
+        x,
+        tile,
+        ..
+    } = s;
+    let tile = tile.as_mut().ok_or(GpuError::state(
+        WHAT,
+        "the grouped tile table (a routed Q4_K or Q5_K pass of more than one row)",
+    ))?;
+    if n_slots == 0 || n_slots > tile.slots {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "layer {}: {n_slots} slots; the tile table holds 1..={}",
+                c.layer, tile.slots
+            ),
+        ));
+    }
+    let TileBuf {
+        order,
+        start,
+        tiles,
+        planes,
+        ..
+    } = tile;
+    let q4 = gpu.q4k_sel();
+    q4.enqueue_buckets(
+        stream,
+        route.ids(),
+        n_slots,
+        n_experts,
+        c.sink,
+        order,
+        start,
+    )?;
+    q4.enqueue_grouped_tiles(stream, start, n_experts, n_slots, c.sink, tiles)?;
+    k.tiles.enqueue_card_gather(
+        stream,
+        &TileGather {
+            x: &act_ffn[i],
+            cols: m,
+            slots_per_col: slots,
+            table: TileTable {
+                order: &*order,
+                start: &*start,
+                tiles: &*tiles,
+                n_experts,
+                n_slots,
+            },
+        },
+        c.sink,
+        planes,
+    )?;
+    k.tiles.enqueue_gate_up_tiles(
+        stream,
+        ty,
+        &TiledGateUpAct {
+            wg,
+            wu,
+            act: &*planes,
+            table: TileTable {
+                order: &*order,
+                start: &*start,
+                tiles: &*tiles,
+                n_experts,
+                n_slots,
+            },
+            rows_per_expert: ff,
+            rule: Act::SiluMul,
+        },
+        c.sink,
+        h,
+    )?;
+    q4.enqueue_quantize_ord(stream, h, start, n_experts, n_slots, c.sink, &mut act_h[i])?;
+    let down_in = TiledDown {
+        w: wd,
+        act: &act_h[i],
+        table: TileTable {
+            order: &*order,
+            start: &*start,
+            tiles: &*tiles,
+            n_experts,
+            n_slots,
+        },
+        rows_per_expert: d.hidden,
+    };
+    match n.down_ty {
+        SiteTy::Q4K => q4.enqueue_gemv_q4k_tiles(stream, &down_in, c.sink, down)?,
+        SiteTy::Q5K => k
+            .tiles
+            .enqueue_gemv_q5k_tiles(stream, &down_in, c.sink, down)?,
+        other => {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a {other:?} down on the grouped tile entry, which runs Q4_K and Q5_K"),
+            ));
+        }
+    }
+    let y = match out {
+        Some(y) => y,
+        None => x,
+    };
+    k.experts.enqueue_combine_tokens(
+        stream,
+        CombineArgs {
+            down,
+            w: route.weights(),
+            resid: ffn_inp,
+            rows: d.hidden,
+            n_slots: slots,
+            m,
+            y,
+        },
+    )
+}
+
 /// The FFN half after its slots are picked: the gate·up·SwiGLU of every
 /// token's slots, one quantizer over them, the down `_sel` and the combine
-/// ([`ffn`]'s doc).
+/// ([`ffn`]'s doc). A joined Q4_K or Q5_K layer at more than one row goes
+/// to [`slots_tiles`] before any of these launches.
 fn slots_down(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -1086,6 +1306,9 @@ fn slots_down(
                 c.p.slots(used)
             ),
         ));
+    }
+    if m > 1 && ffn_tiles(n) {
+        return slots_tiles(c, n, s, m, out);
     }
     if n.gate_up_fused() {
         match gate_up_entry(n.gate_ty, n.up_ty, WHAT)? {
@@ -1451,26 +1674,30 @@ mod tests {
     }
 
     /// A layer's attention launches follow its sites' types: the fused Q4_K
-    /// groups are 7 (12 with the FFN's 5, the pin of the Q4_K_M file), a site
-    /// that leaves a group launches alone (+3 for four Q5_K sites at one row,
-    /// +2 for a Q5_K value beside Q4_K q and k, which keep their gemvs), and
-    /// a Q8_0 or F32 output projection at head 128 is its gemv and the add:
-    /// no quantizer, as many launches as the fused one.
+    /// groups are 7 (12 with the FFN's 5 at one row, the pin of the Q4_K_M
+    /// file; 15 at two rows, where that FFN's Q4_K stacks take the tile
+    /// entry's 8), a site that leaves a group launches alone (+3 for four
+    /// Q5_K sites at one row, +2 for a Q5_K value beside Q4_K q and k, which
+    /// keep their gemvs), and a Q8_0 or F32 output projection at head 128 is
+    /// its gemv and the add: no quantizer, as many launches as the fused one.
     #[test]
     fn an_attention_layer_launches_by_its_site_types() {
         use SiteTy::{F32, Q3K, Q4K, Q5K, Q6K, Q8_0};
         let h = GqaKind::Neox128;
         let ffn = 5;
+        // The fixture's FFN is joined Q4_K gate, up and down, so two rows
+        // count the tile entry (8) in place of the `_sel` five.
+        let tiled = 8;
         assert_eq!(one(h, [Q4K; 4], 1), 7 + ffn);
         assert_eq!(one(h, [Q4K, Q4K, Q6K, Q4K], 1), 8 + ffn);
-        assert_eq!(one(h, [Q4K, Q4K, Q6K, Q4K], 2), 9 + ffn);
+        assert_eq!(one(h, [Q4K, Q4K, Q6K, Q4K], 2), 9 + tiled);
         assert_eq!(one(h, [Q5K; 4], 1), 10 + ffn);
         assert_eq!(one(h, [Q4K, Q4K, Q5K, Q4K], 1), 9 + ffn);
         // Past one row a row-major site alone adds its token-major copy; a
         // token-major Q5_K site does not.
-        assert_eq!(one(h, [Q4K, Q4K, Q5K, Q4K], 2), 11 + ffn);
-        assert_eq!(one(h, [Q5K; 4], 2), 10 + ffn);
-        assert_eq!(one(h, [Q6K; 4], 2), 1 + 6 + 3 + (1 + 2 + 1) + ffn);
+        assert_eq!(one(h, [Q4K, Q4K, Q5K, Q4K], 2), 11 + tiled);
+        assert_eq!(one(h, [Q5K; 4], 2), 10 + tiled);
+        assert_eq!(one(h, [Q6K; 4], 2), 1 + 6 + 3 + (1 + 2 + 1) + tiled);
         assert_eq!(one(h, [Q3K, Q3K, Q3K, Q4K], 1), 1 + 3 + 3 + 2 + ffn);
         // Head 128 and a Q8_0 or F32 output projection: gemv and add, no
         // quantizer; the same count as the fused projection's two.

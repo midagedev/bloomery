@@ -1,0 +1,30 @@
+# PF-1 mechanism A/B. Qwen3.6-35B-A3B Q4_K_M, one pass of 5 ids, tile arm minus the
+# _sel arm. Absolute milliseconds. Not a percent of the 5.16 ms decode step, and not
+# the Spark floor.
+#
+# Census (header only): 20 layers have Q4_K gate, up and down (ids 5, 6, 8, 9, 11,
+# 12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30, 32, 33). The other 20 downs are
+# Q6_K and stay on _sel. One Q4_K expert is 3*512*2048*144/256 = 1,769,472 B.
+#
+# Uniform routed draw, N=256, k=8, m=5: unique experts 256*(1-(248/256)^5) = 37.577
+# against 40 row-reads, so 2.423 repeated routed reads. The shared expert is always
+# selected: 5 reads against 1, save 4. Saved reads a tiled layer ≈ 6.423.
+# Bytes a layer ≈ 6.423*1,769,472 = 11,365,474.5. Twenty layers: 227,309,490 B.
+# Byte time 0.401 ms at 567 GB/s and 0.324 ms at 701 GB/s (docs/HARDWARE.md, the
+# stated A6000 large-gemv band). Launch tax 20*3*0.852 µs = 0.051 ms (c_node stated,
+# rig-log plan.md). Net 0.350 ms at 567 GB/s and 0.273 ms at 701 GB/s.
+#
+# Certain term, shared expert only, no routed repeat: 4*1,769,472*20 = 141,557,760 B.
+# 0.250 ms at 567 GB/s and 0.202 ms at 701 GB/s, then the same 0.051 ms tax: 0.199 ms
+# and 0.151 ms. Uniform is the low-overlap extra on the routed term. Correlated
+# routing saves more and lands above this band. The Spark floor (1.29–1.52 ms) is a
+# different model and stays [derived]. It is not this prediction.
+kind: profile
+question: on a whole-card Qwen3.6 Q4_K_M, does one m=5 prefill on the tile arm finish faster than the _sel arm by the derived expert-read saving?
+term: median of (_sel time-prompt ms minus tile time-prompt ms) over four prefills of five ids, --prefill pass, no BLOOMERY_STEP_STATS
+unit: ms
+predict: 0.15..0.35
+condition: gate_qwen35moe_verify passed on the tile binary (argmaxes and last logits bit for bit against the plain _sel steps). The timed row is `time prompt` of --tokens 760,6511,314,9338,369 --prefill pass -n 0, kind=prefill, one pass. The _sel arm is a second release build of the same tree with the m>1 tile branch forced off in dispatch, so its graph keeps the _sel launches. Load and graph capture sit outside that row.
+decide-in: the median is inside 0.15..0.35 ms. Record it. The mechanism matches the certain-to-uniform band. No lever and no default change.
+decide-below: the median is under 0.15 ms, including a slower tile arm. The certain shared-expert term did not show. Report the four pairs and stop. Do not add a switch.
+decide-above: the median is over 0.35 ms. Routing overlapped more than the uniform draw. Record the ms. Do not widen the edit.

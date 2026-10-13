@@ -83,11 +83,11 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use app::{RowsLog, Session, SessionError};
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, PrefillPath, Qwen35moeModel};
-    use bloomery_gpu::model::{MAX_PASS_ROWS, StepMode};
+    use bloomery_gpu::model::{StepMode, MAX_PASS_ROWS};
     use bloomery_gpu::{Gpu, GpuError};
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
-    use gguf::Split;
+    use bloomery_gpu_gates::{checks_failed, data_dir, verdict, GateError, RefManifest};
     use gguf::quant::dequant_row;
+    use gguf::Split;
     use model::arch::qwen35moe::place::PlanInputs;
     use model::placement::KvBytes;
     use refset::arch::qwen35moe::{D1K, IK, MODEL};
@@ -148,10 +148,12 @@ mod gate {
     const LANE_EXTRA: usize = N_DELTA * (7 * V_HEADS * STATE * STATE * 4 + 8 * 4);
 
     /// The e2e gate's pins of the plain load's captured graphs (decode step
-    /// 520 nodes, a pass of `m` rows 537 + 4m), which the verifying load
+    /// 520 nodes, a pass of `m` rows 597 + 4m), which the verifying load
     /// holds too: `gdn_delta_lanes` is one launch where `gdn_delta` is.
+    /// PIN(2026-10-14): 597 is the e2e gate's recount, 537 plus three tile
+    /// launches on each of the 20 Q4_K downs. One row stays 520.
     const NODES_DECODE: usize = 520;
-    const NODES_PASS: usize = 537;
+    const NODES_PASS: usize = 597;
 
     const WHAT: &str = "gate_qwen35moe_verify";
 
@@ -1248,6 +1250,10 @@ mod gate {
         let r = taps_refusals(&mut s);
         ok &= clause("(ti)", &mut s, r);
         println!("{WHAT}: {}", verdict(ok));
-        if ok { Ok(()) } else { Err(checks_failed()) }
+        if ok {
+            Ok(())
+        } else {
+            Err(checks_failed())
+        }
     }
 }

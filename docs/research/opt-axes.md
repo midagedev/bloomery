@@ -308,7 +308,7 @@ at 235 GB/s: 1.29 ms     at 200 GB/s: 1.52 ms     [derived]
 
 Uniform routing is the low-overlap case, so 1.3–1.5 ms is a floor. Correlated routing overlaps more and saves more; that recall is not measured here. The 200–235 GB/s band is the harvest's pool assumption, not a new measurement. On a Spark window of a few tens of milliseconds this is past a 1 % ruler; the window time itself was not re-measured. The host-tier leg of an A6000 verify was not traced, so this floor is the whole-model Spark split only.
 
-The edit would point the existing m ≤ 8 routed arm at the tile entry. That entry's contract is bit-identical to `_sel` (`q4k_sel.rs`). `dispatch::ffn` is also the prompt path common is working in, so the edit waits on the lead. No box run until then.
+The m ≤ 8 joined routed arm on branch `perflab` points at that tile entry for more than one row, and only when gate and up are the same Q4_K or Q5_K and the down is Q4_K or Q5_K. One row stays on `_sel`. There is no new lever and no default change. The token bar is the verify gate against the plain steps. `dispatch::ffn` is also the short-prompt path, so overlap with `q35hybpp` and `ringr1` is reported before any PR.
 
 ### 2. Spark E: full MTP head vs the shipped 76k list
 
@@ -341,4 +341,4 @@ The largest unmerged placement saving in the inventory: up to 5.2–5.7 s of re-
 
 ## What this file does not do
 
-It does not change a default, a lever's unset value, a public API, or a gate. It does not queue S2, S3, S5, LES, IQ2_K, IQ3_K, IQ4_K, or `q35hybpp`. It does not treat a harvest figure whose source page was not opened as a measurement. Gap 1 is traced. The edit that would point the routed arm at the tile entry waits on the lead, because the call site is `dispatch::ffn`. The ranked work is `specs/perflab/queue.md`. No box run is queued.
+It does not change a default, a lever's unset value, a public API, or a gate's pass band. The Qwen node-count pins move with the launch recount (PIN 2026-10-14), derived from the header census, not relaxed. It does not queue S2, S3, S5, LES, IQ2_K, IQ3_K, IQ4_K, or `q35hybpp`. It does not treat a harvest figure whose source page was not opened as a measurement. Gap 1's edit is the `perflab` experiment above. The ranked work is `specs/perflab/queue.md`.
