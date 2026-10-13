@@ -568,5 +568,9 @@ name = "gate_glm5v_tower"
 required-features = ["vision"]
 
 [[bin]]
+name = "gate_minicpmv_tower"
+required-features = ["vision"]
+
+[[bin]]
 name = "gate_qwen35_media"
 required-features = ["vision"]
