@@ -1778,11 +1778,13 @@ pub static CLEF_ROWS: Kind = Kind {
 /// model file's mapping), the prompt union's claims: its calls by path,
 /// the ids its claims filled and found filled, and the ids it claimed as
 /// keep and as transient, the step port's claims: the ids they filled and
-/// found filled, and the wall of the fill reader's jobs by kind.
+/// found filled, the step layers whose claim had a miss and the wall those
+/// fills took, the host compute of the hit group under that read, and the
+/// wall of the fill reader's jobs by kind.
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled; and the wall the fill reader's jobs ran, the prompt batches' and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled, the step layers whose claim had a miss (one a layer, not a pick), the wall those fills took as the step call measured it, and the host compute of the hit group while that fill was still in flight; and the wall the fill reader's jobs ran, the prompt batches', the step's and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
     parts: &[
         key("budget", U64, "B"),
         key("arena_planned", U64, "B"),
@@ -1809,6 +1811,10 @@ pub static NVTIER: Kind = Kind {
         key("transient_claims", U64, ""),
         key("step_fills", U64, ""),
         key("step_hits", U64, ""),
+        key("step_miss_layers", U64, ""),
+        key("step_fill_wall_ns", U64, "ns"),
+        key("step_hits_under_read_ns", U64, "ns"),
+        key("step_run_ns", U64, "ns"),
         key("prompt_run_ns", U64, "ns"),
         key("victim_run_ns", U64, "ns"),
     ],
@@ -3922,6 +3928,10 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
             .u("transient_claims", s.transient_claims)
             .u("step_fills", s.step_fills)
             .u("step_hits", s.step_hits)
+            .u("step_miss_layers", s.step_miss_layers)
+            .u("step_fill_wall_ns", s.step_fill_wall_ns)
+            .u("step_hits_under_read_ns", s.step_hits_under_read_ns)
+            .u("step_run_ns", ran.step.run_ns)
             .u("prompt_run_ns", ran.prompt.run_ns)
             .u("victim_run_ns", ran.victim.run_ns),
     )
@@ -4613,7 +4623,7 @@ mod tests {
     }
 
     /// The `nvtier` record ends with the prompt union's six counters, the
-    /// step port's two and the reader's two walls, in the order the kind
+    /// step port's counters and the reader's walls, in the order the kind
     /// declares them: a record that names one out of order or leaves one out
     /// panics by name.
     #[test]
@@ -4644,20 +4654,25 @@ mod tests {
             .u("transient_claims", 21)
             .u("step_fills", 22)
             .u("step_hits", 23)
-            .u("prompt_run_ns", 24)
-            .u("victim_run_ns", 25)
+            .u("step_miss_layers", 24)
+            .u("step_fill_wall_ns", 25)
+            .u("step_hits_under_read_ns", 26)
+            .u("step_run_ns", 27)
+            .u("prompt_run_ns", 28)
+            .u("victim_run_ns", 29)
             .line();
         assert!(
             line.ends_with(
                 "drop_ns=13 slot_reads=14 mapping_reads=15 union_small=16 union_batched=17 \
                  union_fills=18 union_hits=19 keep_claims=20 transient_claims=21 step_fills=22 \
-                 step_hits=23 prompt_run_ns=24 victim_run_ns=25"
+                 step_hits=23 step_miss_layers=24 step_fill_wall_ns=25 \
+                 step_hits_under_read_ns=26 step_run_ns=27 prompt_run_ns=28 victim_run_ns=29"
             ),
             "{line}"
         );
         let names: Vec<&str> = NVTIER.parts.iter().filter_map(Part::value_name).collect();
         assert_eq!(
-            names[names.len() - 10..],
+            names[names.len() - 14..],
             [
                 "union_small",
                 "union_batched",
@@ -4667,6 +4682,10 @@ mod tests {
                 "transient_claims",
                 "step_fills",
                 "step_hits",
+                "step_miss_layers",
+                "step_fill_wall_ns",
+                "step_hits_under_read_ns",
+                "step_run_ns",
                 "prompt_run_ns",
                 "victim_run_ns"
             ]

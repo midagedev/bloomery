@@ -1211,6 +1211,15 @@ pub struct NvTierStats {
     /// ids they found filled: counted here, not in the union's.
     pub step_fills: u64,
     pub step_hits: u64,
+    /// Step layers whose claim had at least one miss: one a layer, not a
+    /// pick. A layer of hits, and a victim fill, are not this.
+    pub step_miss_layers: u64,
+    /// Wall of those step fills, as the step call measured it (ns): the
+    /// pool's and the reader's, beside [`NvTierStats::fill_ns`].
+    pub step_fill_wall_ns: u64,
+    /// Host compute of a step's hit group while its miss ticket was still
+    /// in flight (ns). A ready ticket and a fill wait are not this.
+    pub step_hits_under_read_ns: u64,
 }
 
 /// The atomically counted [`NvTierStats`]: a counter a field.
@@ -1237,6 +1246,9 @@ struct Stats {
     transient_claims: AtomicU64,
     step_fills: AtomicU64,
     step_hits: AtomicU64,
+    step_miss_layers: AtomicU64,
+    step_fill_wall_ns: AtomicU64,
+    step_hits_under_read_ns: AtomicU64,
     /// The last union call of each layer, kept when asked for
     /// ([`NvTier::record_unions`]); unset while off.
     unions: OnceLock<Mutex<Vec<Option<UnionBook>>>>,
@@ -1267,6 +1279,26 @@ impl Stats {
             &self.union_small
         };
         by_path.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One step layer whose claim had a miss. A keep or transient claim,
+    /// and a victim fill, are not this.
+    fn note_step_miss(&self, kind: Claim) {
+        if kind == Claim::Step {
+            self.step_miss_layers.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The wall a step fill already measured. Not folded into `fill_ns`.
+    fn note_step_wall(&self, kind: Claim, wall_ns: u64) {
+        if kind == Claim::Step {
+            self.step_fill_wall_ns.fetch_add(wall_ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Host compute of a step's hit group while its miss fill was in flight.
+    fn note_hits_under_read(&self, ns: u64) {
+        self.step_hits_under_read_ns.fetch_add(ns, Ordering::Relaxed);
     }
 }
 
@@ -1965,6 +1997,9 @@ impl NvTier {
             transient_claims: s.transient_claims.load(Ordering::Relaxed),
             step_fills: s.step_fills.load(Ordering::Relaxed),
             step_hits: s.step_hits.load(Ordering::Relaxed),
+            step_miss_layers: s.step_miss_layers.load(Ordering::Relaxed),
+            step_fill_wall_ns: s.step_fill_wall_ns.load(Ordering::Relaxed),
+            step_hits_under_read_ns: s.step_hits_under_read_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -2537,6 +2572,9 @@ impl NvTier {
         if picks.is_empty() {
             return Ok(held);
         }
+        // A step layer with a miss, pinned or not. The unpinned ensure's
+        // fill is counted with no claim, so the wall is noted beside it.
+        self.stats.note_step_miss(kind);
         let t0 = Instant::now();
         self.fill(arena, &picks)
             .inspect_err(|_| free_picks(arena, &picks))?;
@@ -2548,13 +2586,9 @@ impl NvTier {
                 publish(arena, &mut books, &picks, kind);
             }
         }
-        count_fill(
-            &self.stats,
-            arena,
-            &picks,
-            t0.elapsed().as_nanos() as u64,
-            pin.then_some(kind),
-        );
+        let wall = t0.elapsed().as_nanos() as u64;
+        count_fill(&self.stats, arena, &picks, wall, pin.then_some(kind));
+        self.stats.note_step_wall(kind, wall);
         Ok(held)
     }
 
@@ -2638,6 +2672,7 @@ impl NvTier {
             drop(picks);
             return Ok(Some(TierPin::new(arena, PinToken { layer, ids: pinned })));
         }
+        self.stats.note_step_miss(kind);
         {
             let mut reads = self
                 .step
@@ -2750,6 +2785,7 @@ impl NvTier {
         }
         if !picks.is_empty() {
             count_fill(&self.stats, arena, &picks, wall, Some(kind));
+            self.stats.note_step_wall(kind, wall);
         }
         picks.clear();
         Ok(TierPin::new(arena, batch.into_token()))
@@ -2772,6 +2808,7 @@ impl NvTier {
         if claim.picks.is_empty() {
             return Ok(Prefetch::Held(held));
         }
+        self.stats.note_step_miss(kind);
         let reads: Vec<PickRead> = claim.picks.iter().map(|p| read_of(arena, p)).collect();
         let mem = Arc::clone(&self.mem);
         Inflight::queue(
@@ -3053,6 +3090,7 @@ impl<'a> Inflight<'a> {
         }
         if !self.picks.is_empty() {
             count_fill(stats, arena, &self.picks, wall, Some(self.kind));
+            stats.note_step_wall(self.kind, wall);
         }
         Ok(held)
     }
@@ -3216,6 +3254,10 @@ impl TierSlots for NvTier {
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
         let (at, len) = self.by_layer.get(layer)?.as_ref()?.part_at(id, part)?;
         Some(self.mem.slice(at, len))
+    }
+
+    fn note_step_hits_under_read(&self, ns: u64) {
+        self.stats.note_hits_under_read(ns);
     }
 
     fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], batched: bool) {
@@ -3642,6 +3684,15 @@ mod tests {
             "the fill site counts the fills"
         );
         assert_eq!((load(&s.union_batched), load(&s.union_small)), (2, 1));
+        s.note_step_miss(Claim::Keep);
+        s.note_step_miss(Claim::Step);
+        s.note_step_miss(Claim::Step);
+        s.note_step_wall(Claim::Step, 9);
+        s.note_step_wall(Claim::Transient, 4);
+        s.note_hits_under_read(7);
+        assert_eq!(load(&s.step_miss_layers), 2, "a keep claim is not a step layer");
+        assert_eq!(load(&s.step_fill_wall_ns), 9, "a transient wall is not a step's");
+        assert_eq!(load(&s.step_hits_under_read_ns), 7);
     }
 
     /// A union book holds the arena's ids of the call with their columns,

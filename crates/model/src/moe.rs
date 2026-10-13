@@ -1930,7 +1930,14 @@ fn serve_step_split<'w>(
             x: g == 0,
             states: &mut claims[..],
         });
+        // The hit group runs while the miss ticket is still held. The late
+        // group waits that ticket first, and that wait is not this span.
+        let hit_t = (g == 0).then(Instant::now);
         call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], claim, passes)?;
+        if let Some(hit_t) = hit_t {
+            tier.slots
+                .note_step_hits_under_read(hit_t.elapsed().as_nanos() as u64);
+        }
         base += sub.cols.len();
     }
     drop(pin);
@@ -2397,6 +2404,10 @@ pub trait TierSlots: Send + Sync {
     /// told. It must not lock or allocate unless its tier was asked to keep
     /// the call; a tier that keeps no books takes the default.
     fn note_union(&self, _layer: usize, _ids: &[u32], _off: &[usize], _batched: bool) {}
+    /// Host compute of a step's hit group while its miss ticket was still
+    /// in flight, in ns. A tier that does not count it takes the default.
+    /// A ready ticket never reaches the hit group, so it adds nothing.
+    fn note_step_hits_under_read(&self, _ns: u64) {}
 }
 
 /// One layer's tier handle: the layer's own index (the arena's books are
