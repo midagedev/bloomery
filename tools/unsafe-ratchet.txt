@@ -237,7 +237,9 @@ gguf 9 2 0
 # prefill_512_p (one unsafe fn) has 23 blocks: query read/stage (2), key/value stage address/copy/zero/commit (4),
 # ldmatrix pointer formation and address conversion (6), cp.async waits (2), score loads and MMA calls (4),
 # exchange write/read (2), value load and MMA calls (3). Each block has its SAFETY line; shared macros count once.
-gpu 1814 198 10
+# PIN(2026-10-15): gpu 1814 -> 1816 blocks, new code, not old code relaxed: the tier link's RDMA end registers its
+# page with its NIC and posts its writes from it (host/link/rdma.rs), two blocks, each with its SAFETY line.
+gpu 1816 198 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -288,7 +290,9 @@ gpu-deepseek41 392 44 0
 # PIN(2026-10-15): gpu-gates 116 -> 121 blocks: the common prefill window check's six single-operation
 # window constructors replace two blocks in the existing gates (+4); the head-512 gate's append call vouches
 # for the distinct positions checked by the common rope runner (+1). Each block has its SAFETY line.
-gpu-gates 121 26 1
+# PIN(2026-10-14): gpu-gates 121 -> 75 blocks, 26 -> 5 fns, lowered to the tree's count: shared/verbs.rs moved to
+# its own crate (verbs) and link_probe posts through the engine's RDMA link ends, so its registration call goes.
+gpu-gates 75 5 1
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
@@ -378,4 +382,12 @@ sampler 4 4 1
 serve 6 0 0
 threads 9 0 1
 tokenizer 0 0 0
+# PIN(2026-10-14): verbs 0 -> 57 blocks, 22 fns, 2 impls, new crate, moved from gpu-gates/src/bin/shared/verbs.rs (45
+# blocks there) with the tier link's RDMA end as its second user: the calls into libibverbs loaded at run time
+# (dlopen, dlsym and one per resolved entry, the verbs and the context's post and poll entries, each entry read in
+# a block of its own), plus the RoCE v2 GID lookup (`_ibv_query_gid_ex`) and the completion status name
+# (`ibv_wc_status_str`), each with its SAFETY line. The fns are the `unsafe extern "C" fn` pointer types the loader
+# fills, the symbol lookup, the memory registration and the post of a chain of writes, whose ranges the NIC reads
+# after the call; the impls are Send and Sync for the raw handles the owned types hold.
+verbs 57 22 2
 vision 0 0 0

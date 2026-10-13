@@ -93,7 +93,7 @@ pub mod weights;
 pub use fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
 pub use graph::{
     Branch, FLAG_WAIT_OPS, Graph, HostFlags, KernelNode, MappedHost, NodeInfo, capture_template,
-    capturing, mem_batch, node_info, op_barrier_sys, op_wait_geq, op_write,
+    capturing, mem_batch, node_info, op_add, op_barrier_sys, op_wait_geq, op_write,
 };
 pub use model::{GpuModel, Slots};
 pub use watchdog::Busy as EngineBusy;

@@ -55,6 +55,8 @@ cuda-host = { workspace = true, optional = true }
 # `BLOOMERY_STEP_STATS`. Reached only through the `deepseek41` feature.
 bloomery-threads = { path = "../threads", optional = true }
 libc = { workspace = true, optional = true }
+# `link_probe`'s endpoint record: the RDMA end's queue pair, GID, address and key (`gpu` feature).
+bloomery-verbs = { path = "../verbs", optional = true }
 # Text in and out through the file's own vocabulary: `bloomery-chat` (the `deepseek41`
 # feature) and `generate_qwen3moe --prompt` (the `gpu` feature). Host only.
 bloomery-tokenizer = { path = "../tokenizer", optional = true }
@@ -84,6 +86,7 @@ bloomery-vision = { path = "../vision", optional = true }
 [features]
 gpu = [
     "dep:bloomery-gpu",
+    "dep:bloomery-verbs",
     "dep:bloomery-threads",
     "dep:libc",
     "dep:cuda-core",

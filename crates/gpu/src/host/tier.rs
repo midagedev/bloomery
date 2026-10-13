@@ -1505,11 +1505,21 @@ impl TierCard {
     /// Back to a fresh tier's words once the tier's stream has drained:
     /// counters and go counters at 0, the host's count at the tier's
     /// progress, the tier's fault word and its copy clean. The host tier's
-    /// reset calls it.
+    /// reset calls it. A link that stopped carrying for good fails it by
+    /// why.
     pub(super) fn reset(&mut self, page: &TierPage) -> Result<(), GpuError> {
         self.gpu.stream().synchronize()?;
         for off in page.counters(self.index) {
-            page.link.reset(off);
+            page.link.reset(off).map_err(|b| {
+                GpuError::protocol(
+                    "TierCard::reset",
+                    format!(
+                        "the tier link of the expert tier on {} stopped carrying ({b}): reload the \
+                         model",
+                        self.name
+                    ),
+                )
+            })?;
         }
         self.issued = self.progress(page);
         self.clear_fault(page)
@@ -1901,12 +1911,12 @@ mod tests {
     }
 
     /// A release over the loopback takes all of a tier's counters in one
-    /// hold of the pump's lock. The released tier card runs on: after each
-    /// release the tier's done steps by three on the tier cards' page and the
-    /// pump passes once. Released together, the done is stopped before that
-    /// pass and carries nothing; released one counter at a time, the pass
-    /// between the go and the done would see the done three ahead and stop
-    /// the pump by name.
+    /// call. The released tier card runs on: after each release the tier's
+    /// done steps by three on the tier cards' page and each end passes once.
+    /// Released together, the done is stopped on both ends before any
+    /// counter is raised and carries nothing; released one counter at a
+    /// time, the passes between the go and the done would see the done three
+    /// ahead and stop its end by name.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_release_takes_a_tiers_counters_in_one_hold_of_the_pump() {

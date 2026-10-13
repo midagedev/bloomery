@@ -10850,7 +10850,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     real = dict(pure_crates(tree, load_lock(tree.root)))
     pure_now = sorted(n for n, w in real.items() if not w)
     expect(
-        pure_now == ["bloomery-decision", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
@@ -10865,7 +10865,8 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
         == [
             "bloomery-app", "bloomery-decision", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf", "bloomery-jinja",
             "bloomery-levers", "bloomery-model", "bloomery-models", "bloomery-placement", "bloomery-qdot", "bloomery-refset", "bloomery-runtime",
-            "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-vision",
+            "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
+            "bloomery-vision",
         ],
         f"host nightly: the real tree's set is {host_now} — a new member of the set is proven by a nightly run before this list takes it",
     )

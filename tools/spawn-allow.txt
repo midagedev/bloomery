@@ -15,7 +15,7 @@ crates/gpu-gates/src/act_rule.rs 2 host references the gate binaries run; those 
 crates/gpu-gates/src/ik_q8_2.rs 1 a host reference the gate binaries run; those never pin
 crates/gpu-gates/src/lib.rs 1 par_map's workers, for the host references the gate binaries run; those never pin
 crates/gpu/src/graph.rs 2 the capture-race tests' second threads, from a libtest thread that is never pinned
-crates/gpu/src/host/link/pump.rs 2 the relay tests' pump thread and model tier card, from a libtest thread that is never pinned
+crates/gpu/src/host/link/pump.rs 1 the relay tests' model tier card, from a libtest thread that is never pinned
 crates/gpu/src/linear/delta.rs 1 a host reference, called from tests only
 crates/model/src/fixture/plan.rs 1 the gate fixture's builder, a gate-side tool
 crates/model/src/placement/host_lock.rs 1 PENDING (triage): the host set's walk at load, spawned by the step thread after pin_caller — every chunk on one cpu
@@ -24,7 +24,6 @@ crates/model/src/bin/bench_v41_host.rs 1 a bench binary
 crates/qdot/src/bin/qdot-rate-mt.rs 2 a rate probe binary
 crates/gpu-gates/src/bin/exact_ref.rs 1 a referee binary, never pinned
 crates/gpu-gates/src/bin/h2d_probe.rs 3 a probe binary, never pinned
-crates/gpu-gates/src/bin/link_probe.rs 1 a probe binary, never pinned: the card thread beside the pump
 crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs 3 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_chain_ffn.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_qwen4exp_mtp.rs 1 a gate binary, never pinned: the host simulations' scoped workers

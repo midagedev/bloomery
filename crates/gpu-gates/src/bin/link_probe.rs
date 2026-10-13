@@ -1,42 +1,38 @@
 //! The protocol probe of `docs/contrib/dgx-spark.md` section 9.6: the host
-//! tier's word protocol carried between nodes over RDMA, timed as one round
-//! trip a generation.
+//! tier's counters carried between nodes by the engine's RDMA link ends
+//! (`bloomery_gpu::host::RdmaEnd`), timed as one round trip a generation.
 //!
 //! N nodes, one process each: rank 0 is the stage, ranks 1.. are peers.
+//! Every node allocates the same page: the image, each peer's rows, a go and
+//! a done counter for each peer, then the link's tail. Rank 0 holds one end
+//! for each peer and a peer one end, each end with its own queue pair and
+//! pump thread. The counters cross as the tier protocol's do: a peer's go
+//! carries the image to it, its done carries its rows back.
+//!
 //! For generation g = 1, 2, … the stage's kernel writes the image, 256
-//! lines of 64 bytes with every word g; its stream raises the image's flag
-//! to g behind a system-scope barrier and waits until every peer's rows flag
-//! is at least g. The card cannot post to the NIC, so a pump thread on each
-//! node posts the writes: the stage's pump sends the image to every peer
-//! once its flag moves, and each peer's pump sends its rows back the same
-//! way. A peer's stream waits until its image flag is at least g, then runs
-//! one kernel that counts the image lines not reading g (stale lines: data
-//! its flag overtook) and writes 1024 lines of rows, every word g, and
-//! raises its rows flag. The stage's next kernel counts the stale rows
-//! lines.
-//!
-//! A node reuses its send buffer only after the NIC is done with it: the
-//! pump raises the node's sent word to g once every write of generation g
-//! completed, and the batch in which the stream raises its own flag to g
-//! ends with a wait until the sent word is at least g, so the next kernel
-//! writes the region only after that.
-//!
-//! Each node's page is `cuMemHostAlloc` memory registered with `ibv_reg_mr`
-//! without relaxed ordering: on GB10 the NIC cannot reach `cudaMalloc`
-//! memory. `--flag write` (the default) sends a region and its flag line as
-//! one RDMA write, flag last; `--flag imm` sends the region as a write with
-//! immediate, and the receiving pump raises the flag once the completion
-//! arrives. Every node runs the same `--flag`: setup refuses a mismatch.
+//! lines of 64 bytes with every word g; its stream adds one to every peer's
+//! go behind a system-scope barrier, then waits for at least one on every
+//! peer's done and takes it back. A peer's stream waits for at least one on
+//! its go and takes it back, runs one kernel that counts the image lines not
+//! reading g (stale lines: data its counter overtook) and writes 1024 lines
+//! of rows, every word g, and adds one to its done behind a system-scope
+//! barrier. The stage's next kernel counts the stale rows lines. A card
+//! rewrites its region only for its next generation, which waits for the
+//! other side to take this one, so the NIC has read the region by then.
 //!
 //! The round trip of generation g is read on the stage's card from
 //! `%globaltimer`: from the end of the kernel that wrote image g to the start
-//! of the kernel its wait released. Every wait is bounded: with no progress
-//! for `--deadline-ms` the probe prints each flag word and the sent word as
-//! the host reads them (a wait that never passes is told from a write that
-//! never landed). A failure of either side, the card thread's or the
-//! pump's, ends the run the same way: the pump stops, the stream's waits are
-//! released, and the stream drains within one more deadline; a stream not
-//! seen to drain ends the process without teardown.
+//! of the kernel its waits released. Every wait is bounded: with no progress
+//! for `--deadline-ms`, or with an end broken, the probe prints each counter
+//! as the host reads it and why the end broke, releases every counter its
+//! stream waits on, and waits one more deadline for the stream to drain; a
+//! stream not seen to drain ends the process without teardown.
+//!
+//! `--size BYTES` runs no kernel: a host thread on each node plays its card
+//! with the image and each peer's rows `BYTES` long, and only each region's
+//! last word carries the generation. The stage prints half the round trip,
+//! the one-way time `ib_write_lat` prints as `t_typical`, carried by the
+//! link's posts.
 //!
 //! Both ends run this binary on a host with rdma-core (`libibverbs.so.1`):
 //!
@@ -45,17 +41,14 @@
 //! link_probe --nodes 2 --rank 1 --dev <ibdev> --gid <index> --stage <ip:port>
 //! ```
 //!
-//! Optional: `--iters` (timed generations), `--warmup`, `--flag write|imm`,
-//! `--deadline-ms`. The stage prints one `link` line (the round trip's
-//! percentiles, the stale lines of both directions) and fails when a line
-//! was stale.
+//! Optional: `--iters` (timed generations), `--warmup`, `--size`,
+//! `--deadline-ms`. Every node runs the same `--size`: setup refuses a
+//! mismatch. The stage prints one `link` line (the round trip's percentiles
+//! and the stale lines of both directions, or under `--size` the one-way
+//! time) and fails when a line was stale.
 //!
 //! No lease runner runs this probe, so its numbers are contributor evidence
 //! (the list in CONTRIBUTING.md), never numbers for our tables.
-
-#[cfg(feature = "gpu")]
-#[path = "shared/verbs.rs"]
-mod verbs;
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -64,38 +57,32 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod probe {
-    use super::verbs::{
-        Endpoint, Gid, Nic, Qp, Region, Verbs, WC_RDMA_WRITE, WC_RECV_RDMA_WITH_IMM, Wc, WriteKind,
-    };
-    use bloomery_gpu::{Gpu, MappedHost, mem_batch, op_barrier_sys, op_wait_geq, op_write, window};
+    use bloomery_gpu::host::{Crossing, RdmaEnd, Reader, link_tail};
+    use bloomery_gpu::{Gpu, MappedHost, mem_batch, op_add, op_barrier_sys, op_wait_geq, window};
     use bloomery_gpu_gates::{GateError, verdict};
+    use bloomery_verbs::{Endpoint, Gid};
     use cuda_core::{CudaEvent, DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, debug, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::panic::AssertUnwindSafe;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    /// The most generations a run takes. The stream's wait is cyclic
-    /// (`(i32)(word - value) >= 0`), so a release, one past the last
-    /// generation, must stay under 2^31 above every waited value.
-    const MAX_GENERATIONS: usize = 0x7fff_fffe;
-
-    /// u32 words in a 64-byte line.
-    const WORDS: usize = 16;
     const LINE: usize = 64;
     /// The handoff image: 16 KB.
-    const IMAGE_LINES: usize = 256;
+    const IMAGE_BYTES: usize = 256 * LINE;
     /// One peer's rows: 64 KB.
-    const ROWS_LINES: usize = 1024;
+    const ROWS_BYTES: usize = 1024 * LINE;
     /// Threads of the one block of [`link_kernels::lines`].
     const THREADS: u32 = 256;
-    /// Receives each queue pair keeps posted under `--flag imm`.
-    const RECVS: usize = 16;
     /// Generations the stream runs ahead of the host's bounded wait.
     const AHEAD: usize = 32;
+    /// What a failed run raises a waited counter to: every wait for at least
+    /// one passes and no take back brings it near 0.
+    const RELEASE: u32 = 1 << 30;
 
     #[cuda_module]
     mod link_kernels {
@@ -103,9 +90,8 @@ mod probe {
 
         /// One block: thread 0 stamps `%globaltimer` into `stamps[2 slot]` at
         /// entry. Unless `want` is 0, every line `l < seen_lines` of `seen`
-        /// with `l % stride != stride - 1` (the last line of each stride is a
-        /// flag line) whose 16 words are not all `want` counts as stale into
-        /// the thread's `stale` slot; a thread reads whole lines. Every word of
+        /// whose 16 words are not all `want` counts as stale into the
+        /// thread's `stale` slot; a thread reads whole lines. Every word of
         /// the `put_lines` lines of `put` is set to `seq`, word by word across
         /// the block, so a warp's store covers two whole lines. Thread 0 stamps
         /// `stamps[2 slot + 1]` once the block has written.
@@ -120,7 +106,6 @@ mod probe {
             block = (256, 1, 1),
             requires = (
                 seen.len() >= 16 * seen_lines,
-                stride >= 1,
                 put.len() >= 16 * put_lines,
                 stale.len() >= 256,
                 stamps.len() >= 2 * slot + 2
@@ -129,7 +114,6 @@ mod probe {
         pub fn lines(
             seen: &[u32],
             seen_lines: u32,
-            stride: u32,
             want: u32,
             mut put: DisjointSlice<u32>,
             put_lines: u32,
@@ -148,17 +132,15 @@ mod probe {
             let mut bad = 0u64;
             let mut l = t;
             while want != 0 && l < seen_lines as usize {
-                if l % stride as usize != stride as usize - 1 {
-                    let mut off = 0;
-                    let mut w = 0;
-                    while w < 16 {
-                        // SAFETY: 16 l + w < 16 seen_lines <= seen.len() by the
-                        // launch contract.
-                        off |= unsafe { *seen.get_unchecked(16 * l + w) } ^ want;
-                        w += 1;
-                    }
-                    bad += u64::from(off != 0);
+                let mut off = 0;
+                let mut w = 0;
+                while w < 16 {
+                    // SAFETY: 16 l + w < 16 seen_lines <= seen.len() by the
+                    // launch contract.
+                    off |= unsafe { *seen.get_unchecked(16 * l + w) } ^ want;
+                    w += 1;
                 }
+                bad += u64::from(off != 0);
                 l += 256;
             }
             let mut i = t;
@@ -182,32 +164,6 @@ mod probe {
 
     // ------------------------------------------------------------ the run
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Flag {
-        /// The flag line rides last in the region's own write.
-        Write,
-        /// The region goes as a write with immediate; the receiver's pump
-        /// raises the flag after the completion.
-        Imm,
-    }
-
-    impl Flag {
-        fn name(self) -> &'static str {
-            match self {
-                Flag::Write => "write",
-                Flag::Imm => "imm",
-            }
-        }
-
-        /// The mode's word in the endpoint record; 0 names no mode.
-        fn word(self) -> u32 {
-            match self {
-                Flag::Write => 1,
-                Flag::Imm => 2,
-            }
-        }
-    }
-
     struct Opts {
         nodes: usize,
         rank: usize,
@@ -218,15 +174,17 @@ mod probe {
         control: String,
         iters: usize,
         warmup: usize,
-        /// `warmup + iters`, at most [`MAX_GENERATIONS`].
-        total: usize,
-        flag: Flag,
+        /// `warmup + iters`, a generation that fits a word.
+        total: u32,
+        /// `--size`: the host plays the card over regions this long; 0 runs
+        /// the card.
+        size: usize,
         deadline: Duration,
     }
 
     fn opts() -> Result<Opts, GateError> {
         const USAGE: &str = "link_probe --nodes N --rank R --dev IBDEV --gid INDEX \
-             (--listen IP:PORT | --stage IP:PORT) [--iters N] [--warmup N] [--flag write|imm] \
+             (--listen IP:PORT | --stage IP:PORT) [--iters N] [--warmup N] [--size BYTES] \
              [--deadline-ms MS]";
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut o = Opts {
@@ -238,7 +196,7 @@ mod probe {
             iters: 100_000,
             warmup: 1_000,
             total: 0,
-            flag: Flag::Write,
+            size: 0,
             deadline: Duration::from_secs(10),
         };
         let (mut listen, mut stage, mut gid) = (None, None, None);
@@ -257,14 +215,8 @@ mod probe {
                 "--stage" => stage = Some(v.clone()),
                 "--iters" => o.iters = v.parse().map_err(bad)?,
                 "--warmup" => o.warmup = v.parse().map_err(bad)?,
+                "--size" => o.size = v.parse().map_err(bad)?,
                 "--deadline-ms" => o.deadline = Duration::from_millis(v.parse().map_err(bad)?),
-                "--flag" => {
-                    o.flag = match v.as_str() {
-                        "write" => Flag::Write,
-                        "imm" => Flag::Imm,
-                        _ => return Err(format!("--flag {v}: want write or imm").into()),
-                    }
-                }
                 _ => return Err(format!("unknown argument {k}; usage: {USAGE}").into()),
             }
         }
@@ -273,6 +225,9 @@ mod probe {
                 "want --nodes >= 2, --rank below it, --dev and --iters >= 1; usage: {USAGE}"
             )
             .into());
+        }
+        if !o.size.is_multiple_of(LINE) {
+            return Err(format!("--size {}: want a multiple of {LINE} bytes", o.size).into());
         }
         o.gid = gid.ok_or_else(|| format!("--gid is required; usage: {USAGE}"))?;
         o.control = match (o.rank, listen, stage) {
@@ -283,179 +238,173 @@ mod probe {
         o.total = o
             .warmup
             .checked_add(o.iters)
-            .filter(|&t| t <= MAX_GENERATIONS)
-            .ok_or_else(|| {
-                format!(
-                    "--iters plus --warmup above {MAX_GENERATIONS}: the stream's wait compares \
-                     generations cyclically, so a release must stay under 2^31 above every wait"
-                )
-            })?;
+            .and_then(|t| u32::try_from(t).ok())
+            .filter(|&t| t < u32::MAX)
+            .ok_or("--iters plus --warmup must stay under 2^32 - 1: a generation is a word")?;
         Ok(o)
     }
 
-    /// The page every node allocates, in lines: region 0 is the image,
-    /// region j (1..nodes) peer j's rows. A region is its data lines and then
-    /// one flag line, whose first word is the region's flag. The last line is
-    /// the node's own, which no peer writes: its first word is the sent word.
+    /// The page every node allocates: the image, then each peer's rows, then
+    /// a go and a done counter for each peer, each on its own line, then the
+    /// link's tail, two lines of it for each peer.
     #[derive(Clone, Copy)]
     struct Layout {
         nodes: usize,
+        image: usize,
+        rows: usize,
     }
 
     impl Layout {
-        fn data_lines(self, r: usize) -> usize {
-            if r == 0 { IMAGE_LINES } else { ROWS_LINES }
+        /// The first byte of peer `j`'s rows.
+        fn rows_off(self, j: usize) -> usize {
+            self.image + (j - 1) * self.rows
         }
 
-        /// The first line of region `r`; `start(nodes)` is the page's end.
-        fn start(self, r: usize) -> usize {
-            if r == 0 {
-                0
-            } else {
-                IMAGE_LINES + 1 + (r - 1) * (ROWS_LINES + 1)
-            }
+        /// Peer `j`'s go counter.
+        fn go(self, j: usize) -> usize {
+            self.rows_off(self.nodes) + 2 * LINE * (j - 1)
         }
 
-        /// The byte offset of region `r`'s flag word.
-        fn flag(self, r: usize) -> usize {
-            (self.start(r) + self.data_lines(r)) * LINE
+        /// Peer `j`'s done counter.
+        fn done(self, j: usize) -> usize {
+            self.go(j) + LINE
         }
 
-        /// The byte offset of the sent word.
-        fn sent(self) -> usize {
-            self.start(self.nodes) * LINE
+        /// The bytes before the link's tail.
+        fn words(self) -> usize {
+            self.go(self.nodes)
+        }
+
+        /// The first byte of peer `j`'s tail lines: past those of every
+        /// peer before it.
+        fn tail(self, j: usize) -> usize {
+            link_tail(self.words(), 2 * (j - 1)).1
         }
 
         fn bytes(self) -> usize {
-            self.sent() + LINE
+            link_tail(self.words(), 2 * (self.nodes - 1)).1
+        }
+
+        /// What crosses between the stage and peer `j`: its go with the
+        /// image, its done with its rows.
+        fn crossings(self, j: usize) -> Vec<Crossing> {
+            let (image, rows) = (
+                0..self.image,
+                self.rows_off(j)..self.rows_off(j) + self.rows,
+            );
+            vec![
+                Crossing {
+                    counter: self.go(j),
+                    reader: Reader::Tier,
+                    spans: vec![image],
+                    prog: None,
+                },
+                Crossing {
+                    counter: self.done(j),
+                    reader: Reader::Stage,
+                    spans: vec![rows],
+                    prog: None,
+                },
+            ]
         }
     }
 
     pub fn run() -> Result<(), GateError> {
         let o = opts()?;
-        let layout = Layout { nodes: o.nodes };
-        let total = o.total;
+        let layout = if o.size == 0 {
+            Layout {
+                nodes: o.nodes,
+                image: IMAGE_BYTES,
+                rows: ROWS_BYTES,
+            }
+        } else {
+            Layout {
+                nodes: o.nodes,
+                image: o.size,
+                rows: o.size,
+            }
+        };
         let gpu = Gpu::new()?;
         let ctx = gpu.context();
-        // SAFETY: this package owns the embedded device bundle produced for
-        // the module above; the launcher checks its launch contract.
-        let kernels = unsafe { bloomery_gpu::shared_module!(link_kernels, ctx)? };
-        let page = MappedHost::new(ctx, layout.bytes(), "cuMemHostAlloc (the probe's page)")?;
-        let verbs = Verbs::load()?;
-        let nic = Nic::open(&verbs, &o.dev, o.gid)?;
-        // SAFETY: `page` is declared before `region`, so it drops after it:
-        // the range stays allocated for the region's whole life.
-        let region = unsafe { nic.register(page.host_at(0), layout.bytes())? };
-        let peers = if o.rank == 0 { o.nodes - 1 } else { 1 };
-        let qps = (0..peers)
-            .map(|_| nic.queue_pair())
+        let page = Arc::new(MappedHost::new(
+            ctx,
+            layout.bytes(),
+            "cuMemHostAlloc (the probe's page)",
+        )?);
+        let peers: Vec<usize> = if o.rank == 0 {
+            (1..o.nodes).collect()
+        } else {
+            vec![o.rank]
+        };
+        let side = if o.rank == 0 {
+            Reader::Stage
+        } else {
+            Reader::Tier
+        };
+        let mut ends = peers
+            .iter()
+            .map(|&j| {
+                RdmaEnd::new(
+                    Arc::clone(&page),
+                    layout.tail(j),
+                    layout.crossings(j),
+                    side,
+                    &o.dev,
+                    o.gid,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let mut control = Control::open(&o)?;
-        let local: Vec<Endpoint> = qps
+        let local: Vec<Endpoint> = ends
             .iter()
             .enumerate()
-            .map(|(i, qp)| Endpoint {
-                qpn: qp.qpn(),
-                psn: psn(o.rank, i),
-                gid: nic.gid(),
-                addr: page.host_at(0) as u64,
-                rkey: region.rkey(),
-            })
+            .map(|(i, e)| e.endpoint(psn(o.rank, i)))
             .collect();
-        let remote = control.exchange(&local, o.rank, o.flag)?;
-        for ((qp, l), r) in qps.iter().zip(&local).zip(&remote) {
-            qp.connect(l.psn, r)?;
-        }
-        if o.flag == Flag::Imm {
-            for qp in &qps {
-                (0..RECVS).try_for_each(|_| qp.post_recv())?;
-            }
+        let remote = control.exchange(&local, o.rank, o.size)?;
+        for ((e, l), r) in ends.iter_mut().zip(&local).zip(&remote) {
+            e.connect(l.psn, r)?;
         }
         println!(
-            "link setup rank={} nodes={} dev={} gid_index={} page_bytes={} access=local_write,remote_write \
-             flag={} iters={} warmup={}",
+            "link setup rank={} nodes={} dev={} gid_index={} page_bytes={} \
+             access=local_write,remote_write size={} iters={} warmup={}",
             o.rank,
             o.nodes,
             o.dev,
             o.gid,
             layout.bytes(),
-            o.flag.name(),
+            o.size,
             o.iters,
             o.warmup
         );
-        let mut stamps = DeviceBuffer::<u64>::zeroed(gpu.stream(), 2 * (total + 1))?;
-        let mut stale = DeviceBuffer::<u64>::zeroed(gpu.stream(), THREADS as usize)?;
-        let word = |off| {
-            page.atomic_u32(off)
-                .expect("every flag word and the sent word lie in the layout's page")
-        };
-        let flags: Vec<&AtomicU32> = (0..o.nodes).map(|r| word(layout.flag(r))).collect();
-        let sent = word(layout.sent());
         let card = Card {
-            gpu: &gpu,
-            kernels: &kernels,
             layout,
             rank: o.rank,
-            dev: page.dev_at(0),
-            total,
+            peers: &peers,
+            page: &page,
+            ends: &ends,
+            total: o.total,
             deadline: o.deadline,
-            flags: &flags,
-            sent,
         };
-        card.launch(&mut stale, &mut stamps, 0, 0, 0, 0)?;
+        if o.size != 0 {
+            return host_run(&o, &card, &mut control);
+        }
+        // SAFETY: this package owns the embedded device bundle produced for
+        // the module above; the launcher checks its launch contract.
+        let kernels = unsafe { bloomery_gpu::shared_module!(link_kernels, ctx)? };
+        let total = o.total as usize;
+        let mut stamps = DeviceBuffer::<u64>::zeroed(gpu.stream(), 2 * (total + 1))?;
+        let mut stale = DeviceBuffer::<u64>::zeroed(gpu.stream(), THREADS as usize)?;
+        let stream = Stream {
+            card: &card,
+            gpu: &gpu,
+            kernels: &kernels,
+            dev: page.dev_at(0),
+        };
+        stream.launch(&mut stale, &mut stamps, 0, 0, 0, 0)?;
         gpu.stream().synchronize()?;
         stale.copy_from_host(gpu.stream(), &[0; THREADS as usize])?;
         control.ready()?;
-
-        let own = if o.rank == 0 { 0 } else { o.rank };
-        let out = Out {
-            mode: o.flag,
-            flag: flags[own],
-            sent,
-            local: page.host_at(0) as u64 + (layout.start(own) * LINE) as u64,
-            bytes: u32::try_from(match o.flag {
-                Flag::Write => (layout.data_lines(own) + 1) * LINE,
-                Flag::Imm => layout.data_lines(own) * LINE,
-            })?,
-            targets: qps
-                .iter()
-                .zip(&remote)
-                .map(|(qp, r)| (qp, r.addr + (layout.start(own) * LINE) as u64, r.rkey))
-                .collect(),
-        };
-        let ins: Vec<(u32, &Qp<'_>, &AtomicU32)> = match o.flag {
-            Flag::Write => Vec::new(),
-            Flag::Imm if o.rank == 0 => (0..peers)
-                .map(|i| (qps[i].qpn(), &qps[i], flags[i + 1]))
-                .collect(),
-            Flag::Imm => vec![(qps[0].qpn(), &qps[0], flags[0])],
-        };
-        let stop = AtomicBool::new(false);
-        let (driven, pumped) = std::thread::scope(|s| {
-            let card = &card;
-            let (stale, stamps, stop) = (&mut stale, &mut stamps, &stop);
-            let driver = s.spawn(move || card.drive(stale, stamps, stop));
-            // Once the card raised `stop`, its release moves the words the
-            // pump reads: a pump failure after that is the card's to report.
-            let pumped = pump(&nic, &region, &out, &ins, total, o.deadline, stop).or_else(|e| {
-                if stop.load(Ordering::Acquire) {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            });
-            if pumped.is_err() {
-                stop.store(true, Ordering::Release);
-            }
-            let driven = driver.join().unwrap_or_else(|_| {
-                Err(Failed {
-                    why: "the card thread panicked in its release".into(),
-                    drained: Err("not released".into()),
-                })
-            });
-            (driven, pumped.map_err(|e| e.to_string()))
-        });
-        ended(driven, pumped)?;
+        stream.drive(&mut stale, &mut stamps)?;
         let stale_here: u64 = stale.to_host_vec(gpu.stream())?.iter().sum();
         let stamps = stamps.to_host_vec(gpu.stream())?;
         let kernel_ns: Vec<u64> = (1..=total)
@@ -463,54 +412,13 @@ mod probe {
             .collect();
         if o.rank != 0 {
             control.report(stale_here, pct(&mut kernel_ns[o.warmup..].to_vec(), 50.0))?;
+            control.ready()?;
             println!("link peer rank={} stale_image={stale_here}", o.rank);
             return Ok(());
         }
         let reports = control.collect()?;
+        control.ready()?;
         report(&o, &stamps, stale_here, &reports, &kernel_ns)
-    }
-
-    /// The card thread's failure: why, and whether its stream drained after
-    /// the release (the error says why that is not known).
-    struct Failed {
-        why: String,
-        drained: Result<(), String>,
-    }
-
-    /// The run's end from both sides: the pump's own failure first (the pump
-    /// returns `Ok` when the card stopped it), then the card's. A stream not
-    /// seen to drain may still hold work over the page and the device
-    /// buffers, and their drops would wait on it without bound, so the
-    /// process ends here and leaves them to the OS.
-    fn ended(driven: Result<(), Failed>, pumped: Result<(), String>) -> Result<(), GateError> {
-        if driven.is_ok() && pumped.is_ok() {
-            return Ok(());
-        }
-        let mut why = Vec::new();
-        if let Err(p) = &pumped {
-            why.push(format!("pump: {p}"));
-        }
-        if let Err(f) = &driven {
-            let drained = match &f.drained {
-                Ok(()) => "true".to_string(),
-                Err(e) => format!("false ({e})"),
-            };
-            why.push(format!(
-                "card: {}; stream drained after release: {drained}",
-                f.why
-            ));
-        }
-        let why = why.join("; ");
-        if driven.is_err_and(|f| f.drained.is_err()) {
-            // `eprintln!` panics when stderr fails, and the unwind would drop
-            // the buffers this exit leaves alone.
-            let _ = writeln!(
-                std::io::stderr(),
-                "link_probe: {why}; exiting without teardown"
-            );
-            std::process::exit(1);
-        }
-        Err(why.into())
     }
 
     /// The first packet sequence number of this rank's `i`th queue pair.
@@ -527,7 +435,7 @@ mod probe {
         reports: &[(u64, u64)],
         kernel_ns: &[u64],
     ) -> Result<(), GateError> {
-        let mut rtt: Vec<u64> = (o.warmup + 1..=o.total)
+        let mut rtt: Vec<u64> = (o.warmup + 1..=o.total as usize)
             .map(|g| stamps[2 * g] - stamps[2 * (g - 1) + 1])
             .collect();
         let tick = rtt.iter().chain(kernel_ns).fold(0, |a, &b| gcd(a, b));
@@ -539,11 +447,10 @@ mod probe {
         let peer_kernel = reports.iter().map(|r| r.1).max().unwrap_or(0);
         let stage_kernel = pct(&mut kernel_ns[o.warmup..].to_vec(), 50.0);
         println!(
-            "link nodes={} flag={} iters={} rtt_us_p50={:.2} rtt_us_p90={:.2} rtt_us_p99={:.2} \
+            "link nodes={} iters={} rtt_us_p50={:.2} rtt_us_p90={:.2} rtt_us_p99={:.2} \
              rtt_us_p999={:.2} rtt_us_min={:.2} rtt_us_max={:.2} rtt_us_mean={:.2} stale_image={stale_image} \
              stale_rows={stale_rows} stage_kernel_us_p50={:.2} peer_kernel_us_p50={:.2} timer_gcd_ns={tick}",
             o.nodes,
-            o.flag.name(),
             o.iters,
             p50,
             p90,
@@ -558,16 +465,19 @@ mod probe {
         for (i, r) in reports.iter().enumerate() {
             println!("link peer rank={} stale_image={}", i + 1, r.0);
         }
-        let pass = stale_image == 0 && stale_rows == 0;
+        stale_verdict(stale_image + stale_rows)
+    }
+
+    fn stale_verdict(stale: u64) -> Result<(), GateError> {
+        let pass = stale == 0;
         println!(
-            "{}: link_probe stale lines after the flag {}",
-            verdict(pass),
-            stale_image + stale_rows
+            "{}: link_probe stale lines after the counter {stale}",
+            verdict(pass)
         );
         if pass {
             Ok(())
         } else {
-            Err("stale lines after the flag".into())
+            Err("stale lines after the counter".into())
         }
     }
 
@@ -584,36 +494,177 @@ mod probe {
 
     // ------------------------------------------------------------ the card
 
-    /// One node's card side: the launches and stream memory operations of
-    /// every generation, enqueued at most [`AHEAD`] generations in front of
-    /// the host's bounded wait, and the words its stream waits on.
+    /// One node's side of the protocol, whoever plays it: the page, the
+    /// counters this rank adds to and waits on, and the ends that carry them.
     struct Card<'a> {
-        gpu: &'a Gpu,
-        kernels: &'a link_kernels::LoadedModule,
         layout: Layout,
         rank: usize,
-        dev: sys::CUdeviceptr,
-        total: usize,
+        /// The peers this rank's ends reach: every peer on the stage, itself
+        /// on a peer.
+        peers: &'a [usize],
+        page: &'a MappedHost,
+        ends: &'a [RdmaEnd],
+        total: u32,
         deadline: Duration,
-        /// Every region's flag word on this node's page, by region.
-        flags: &'a [&'a AtomicU32],
-        sent: &'a AtomicU32,
     }
 
     impl Card<'_> {
-        /// A `u32` window of `lines` lines from line `start` of the page.
-        fn span(&self, start: usize, lines: usize) -> std::mem::ManuallyDrop<DeviceBuffer<u32>> {
-            // SAFETY: the span lies inside the page (the layout's own lines),
-            // which is mapped into this context and outlives every launch:
-            // the run drains the stream before the page drops, or ends the
-            // process without dropping it.
-            unsafe {
-                window::<u32>(
-                    self.dev + (start * LINE) as u64,
-                    lines * WORDS,
-                    self.gpu.context(),
-                )
+        fn word(&self, off: usize) -> &AtomicU32 {
+            self.page
+                .atomic_u32(off)
+                .expect("every counter and region word lies in the layout's page")
+        }
+
+        /// The counters this rank waits on: every peer's done on the stage,
+        /// its go on a peer.
+        fn waits(&self) -> Vec<usize> {
+            let l = self.layout;
+            self.peers
+                .iter()
+                .map(|&j| if self.rank == 0 { l.done(j) } else { l.go(j) })
+                .collect()
+        }
+
+        /// The first end that broke, by why.
+        fn broken(&self) -> Option<String> {
+            self.ends.iter().find_map(RdmaEnd::broken)
+        }
+
+        /// The stall's report at generation `g`: every counter of this
+        /// rank's peers as the host reads it, and any end's failure.
+        fn stalled(&self, g: usize, why: &str) -> GateError {
+            let l = self.layout;
+            let words: Vec<String> = self
+                .peers
+                .iter()
+                .map(|&j| {
+                    format!(
+                        "go[{j}]={} done[{j}]={}",
+                        self.word(l.go(j)).load(Ordering::Acquire),
+                        self.word(l.done(j)).load(Ordering::Acquire)
+                    )
+                })
+                .collect();
+            format!(
+                "rank {}: {why} at generation {g}: {} (host reads); link: {}",
+                self.rank,
+                words.join(" "),
+                self.broken().unwrap_or_else(|| "carrying".into())
+            )
+            .into()
+        }
+
+        /// Release every counter this rank waits on: its end stops carrying
+        /// it and raises it to [`RELEASE`].
+        fn release(&self) {
+            for (e, off) in self.ends.iter().zip(self.waits()) {
+                e.release(off, RELEASE);
             }
+        }
+    }
+
+    /// The host as the card: `--size`'s run on this node.
+    fn host_run(o: &Opts, card: &Card<'_>, control: &mut Control) -> Result<(), GateError> {
+        control.ready()?;
+        let l = card.layout;
+        let mut one_way = Vec::with_capacity(o.total as usize);
+        let mut stale = 0u64;
+        let played = (1..=card.total).try_for_each(|g| {
+            let start = Instant::now();
+            if o.rank == 0 {
+                card.word(l.image - 4).store(g, Ordering::Relaxed);
+                for &j in card.peers {
+                    card.word(l.go(j)).fetch_add(1, Ordering::Release);
+                }
+                for &j in card.peers {
+                    host_wait(card, l.done(j), g)?;
+                    let last = l.rows_off(j) + l.rows - 4;
+                    stale += u64::from(card.word(last).load(Ordering::Relaxed) != g);
+                    card.word(l.done(j)).fetch_sub(1, Ordering::AcqRel);
+                }
+                one_way.push(start.elapsed().as_nanos() as u64 / 2);
+            } else {
+                host_wait(card, l.go(o.rank), g)?;
+                stale += u64::from(card.word(l.image - 4).load(Ordering::Relaxed) != g);
+                card.word(l.go(o.rank)).fetch_sub(1, Ordering::AcqRel);
+                let last = l.rows_off(o.rank) + l.rows - 4;
+                card.word(last).store(g, Ordering::Relaxed);
+                card.word(l.done(o.rank)).fetch_add(1, Ordering::Release);
+            }
+            Ok::<(), GateError>(())
+        });
+        if let Err(e) = played {
+            card.release();
+            return Err(e);
+        }
+        if let Some(b) = card.broken() {
+            return Err(format!("the link broke: {b}").into());
+        }
+        if o.rank != 0 {
+            control.report(stale, 0)?;
+            control.ready()?;
+            println!(
+                "link peer rank={} size={} stale_words={stale}",
+                o.rank, o.size
+            );
+            return Ok(());
+        }
+        let peer_stale: u64 = control.collect()?.iter().map(|r| r.0).sum();
+        control.ready()?;
+        let t = &mut one_way[o.warmup..];
+        let us = |ns: u64| ns as f64 / 1e3;
+        let mean = t.iter().sum::<u64>() as f64 / t.len() as f64 / 1e3;
+        let [p50, p90, p99] = [50.0, 90.0, 99.0].map(|p| us(pct(t, p)));
+        println!(
+            "link size nodes={} bytes={} iters={} one_way_us_p50={p50:.2} one_way_us_p90={p90:.2} \
+             one_way_us_p99={p99:.2} one_way_us_min={:.2} one_way_us_mean={mean:.2} \
+             stale_rows={stale} stale_image={peer_stale}",
+            o.nodes,
+            o.size,
+            o.iters,
+            us(t[0]),
+        );
+        stale_verdict(stale + peer_stale)
+    }
+
+    /// The host's wait for at least one on the counter at `off`, bounded by
+    /// the deadline and by the ends' failure.
+    fn host_wait(card: &Card<'_>, off: usize, g: u32) -> Result<(), GateError> {
+        let start = Instant::now();
+        let mut spins = 0u32;
+        while card.word(off).load(Ordering::Acquire) < 1 {
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(1024) {
+                if card.broken().is_some() {
+                    return Err(card.stalled(g as usize, "the link broke"));
+                }
+                if start.elapsed() > card.deadline {
+                    return Err(card.stalled(g as usize, "no progress"));
+                }
+            }
+            std::hint::spin_loop();
+        }
+        Ok(())
+    }
+
+    /// The card's stream: the launches and stream memory operations of every
+    /// generation, enqueued at most [`AHEAD`] generations in front of the
+    /// host's bounded wait.
+    struct Stream<'a> {
+        card: &'a Card<'a>,
+        gpu: &'a Gpu,
+        kernels: &'a link_kernels::LoadedModule,
+        dev: sys::CUdeviceptr,
+    }
+
+    impl Stream<'_> {
+        /// A `u32` window of `bytes` bytes from byte `off` of the page.
+        fn span(&self, off: usize, bytes: usize) -> std::mem::ManuallyDrop<DeviceBuffer<u32>> {
+            // SAFETY: the span lies inside the page (the layout's own
+            // regions), which is mapped into this context and outlives every
+            // launch: the run drains the stream before the page drops, or
+            // ends the process without dropping it.
+            unsafe { window::<u32>(self.dev + off as u64, bytes / 4, self.gpu.context()) }
         }
 
         /// One launch of [`link_kernels::lines`] for this rank: the stage
@@ -628,22 +679,20 @@ mod probe {
             put_lines: usize,
             slot: usize,
         ) -> Result<(), GateError> {
-            let l = self.layout;
-            let (seen_start, seen_lines, stride, put_start) = if self.rank == 0 {
+            let l = self.card.layout;
+            let (seen_off, seen_bytes, put_off, put_bytes) = if self.card.rank == 0 {
                 (
-                    l.start(1),
-                    (l.nodes - 1) * (ROWS_LINES + 1),
-                    ROWS_LINES + 1,
+                    l.rows_off(1),
+                    l.rows_off(l.nodes) - l.rows_off(1),
                     0,
+                    l.image,
                 )
             } else {
-                (0, IMAGE_LINES + 1, IMAGE_LINES + 1, l.start(self.rank))
+                let r = self.card.rank;
+                (0, l.image, l.rows_off(r), l.rows)
             };
-            let seen = self.span(seen_start, seen_lines);
-            let mut put = self.span(
-                put_start,
-                l.data_lines(if self.rank == 0 { 0 } else { self.rank }),
-            );
+            let seen = self.span(seen_off, seen_bytes);
+            let mut put = self.span(put_off, put_bytes);
             let prep = self
                 .kernels
                 .prepare_lines(LaunchConfig1D::new(1, THREADS, 0))?;
@@ -651,8 +700,7 @@ mod probe {
                 self.gpu.stream(),
                 &prep,
                 &seen,
-                u32::try_from(seen_lines)?,
-                u32::try_from(stride)?,
+                u32::try_from(seen_bytes / LINE)?,
                 want,
                 &mut put,
                 u32::try_from(put_lines)?,
@@ -664,318 +712,160 @@ mod probe {
             Ok(())
         }
 
-        /// The words this node's stream waits on: every rows flag on the
-        /// stage, the image flag on a peer, and the sent word.
-        fn waits(&self) -> Vec<&AtomicU32> {
-            let mut w = if self.rank == 0 {
-                self.flags[1..].to_vec()
-            } else {
-                vec![self.flags[0]]
-            };
-            w.push(self.sent);
-            w
-        }
-
-        /// Every generation, then a drained stream. Any failure on the way
-        /// (a stall, a driver error, `stop` raised by the pump, or a panic)
-        /// ends through [`Card::release`].
+        /// Every generation, then a drained stream. A failure on the way (a
+        /// stall, a broken end, a driver error or a panic) releases the
+        /// counters the stream waits on; a stream not seen to drain after
+        /// that ends the process here, leaving the page and the device
+        /// buffers it may still reach to the OS.
         fn drive(
             &self,
             stale: &mut DeviceBuffer<u64>,
             stamps: &mut DeviceBuffer<u64>,
-            stop: &AtomicBool,
-        ) -> Result<(), Failed> {
-            let mut last = 0;
-            let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                self.generations(stale, stamps, stop, &mut last)
-            }));
+        ) -> Result<(), GateError> {
+            let run =
+                std::panic::catch_unwind(AssertUnwindSafe(|| self.generations(stale, stamps)));
             let why = match run {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(e)) => e.to_string(),
                 Err(_) => "the card thread panicked".to_string(),
             };
-            Err(Failed {
-                why,
-                drained: self.release(last, stop),
-            })
+            match self.drain_released() {
+                Ok(()) => Err(format!("{why}; stream drained after release: true").into()),
+                Err(e) => {
+                    // `eprintln!` panics when stderr fails, and the unwind
+                    // would drop the buffers this exit leaves alone.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "link_probe: {why}; stream drained after release: false ({e}); exiting \
+                         without teardown"
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
 
         /// Enqueue generations 1..=total, at most [`AHEAD`] ahead of the
-        /// host, and wait for the stream to drain; `last` follows the last
-        /// generation whose waits were enqueued.
+        /// host, and wait for the stream to drain.
         fn generations(
             &self,
             stale: &mut DeviceBuffer<u64>,
             stamps: &mut DeviceBuffer<u64>,
-            stop: &AtomicBool,
-            last: &mut u32,
         ) -> Result<(), GateError> {
             let ctx = self.gpu.context();
             ctx.bind_to_thread()?;
             let stream = self.gpu.stream();
-            let l = self.layout;
-            let sent = self.dev + l.sent() as u64;
+            let (l, card) = (self.card.layout, self.card);
+            let at = |off: usize| self.dev + off as u64;
             let events = (0..AHEAD)
                 .map(|_| ctx.new_event(None))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut progress = Instant::now();
-            for g in 1..=self.total {
+            let total = card.total as usize;
+            for g in 1..=total {
                 if g > AHEAD {
-                    self.settle(&events[g % AHEAD], progress, g - AHEAD, stop)?;
+                    self.settle(&events[g % AHEAD], progress, g - AHEAD)?;
                     progress = Instant::now();
                 }
                 let seq = u32::try_from(g)?;
-                *last = seq;
-                if self.rank == 0 {
-                    self.launch(stale, stamps, seq - 1, seq, IMAGE_LINES, g - 1)?;
-                    let mut ops =
-                        vec![op_barrier_sys(), op_write(self.dev + l.flag(0) as u64, seq)];
-                    ops.extend((1..l.nodes).map(|r| op_wait_geq(self.dev + l.flag(r) as u64, seq)));
-                    ops.push(op_wait_geq(sent, seq));
-                    // SAFETY: every flag word and the sent word lie in the
-                    // page (the layout's own words), which outlives every
-                    // batch as in `span`.
+                if card.rank == 0 {
+                    self.launch(stale, stamps, seq - 1, seq, l.image / LINE, g - 1)?;
+                    let mut ops = vec![op_barrier_sys()];
+                    ops.extend(card.peers.iter().map(|&j| op_add(at(l.go(j)), 1)));
+                    for &j in card.peers {
+                        ops.push(op_wait_geq(at(l.done(j)), 1));
+                        ops.push(op_add(at(l.done(j)), u32::MAX));
+                    }
+                    // SAFETY: every counter lies in the page (the layout's
+                    // own words), which outlives every batch as in `span`.
+                    unsafe { mem_batch(stream, &mut ops, "link_probe: the gos and the dones")? };
+                } else {
+                    let r = card.rank;
+                    // SAFETY: the go counter lies in the page, which outlives
+                    // every batch as in `span`.
                     unsafe {
                         mem_batch(
                             stream,
-                            &mut ops,
-                            "link_probe: the image flag and the rows waits",
+                            &mut [op_wait_geq(at(l.go(r)), 1), op_add(at(l.go(r)), u32::MAX)],
+                            "link_probe: the go",
                         )?;
                     }
-                } else {
-                    // SAFETY: the stage's flag word lies in the page, which
+                    self.launch(stale, stamps, seq, seq, l.rows / LINE, g - 1)?;
+                    // SAFETY: the done counter lies in the page, which
                     // outlives every batch as in `span`.
                     unsafe {
                         mem_batch(
                             stream,
-                            &mut [op_wait_geq(self.dev + l.flag(0) as u64, seq)],
-                            "link_probe: the image wait",
-                        )?;
-                    }
-                    self.launch(stale, stamps, seq, seq, ROWS_LINES, g - 1)?;
-                    let flag = self.dev + l.flag(self.rank) as u64;
-                    // SAFETY: this rank's flag word and the sent word lie in
-                    // the page, which outlives every batch as in `span`.
-                    unsafe {
-                        mem_batch(
-                            stream,
-                            &mut [
-                                op_barrier_sys(),
-                                op_write(flag, seq),
-                                op_wait_geq(sent, seq),
-                            ],
-                            "link_probe: the rows flag and the sent wait",
+                            &mut [op_barrier_sys(), op_add(at(l.done(r)), 1)],
+                            "link_probe: the done",
                         )?;
                     }
                 }
                 events[g % AHEAD].record(stream)?;
             }
-            if self.rank == 0 {
-                let last = u32::try_from(self.total)?;
-                self.launch(stale, stamps, last, 0, 0, self.total)?;
+            if card.rank == 0 {
+                self.launch(stale, stamps, card.total, 0, 0, total)?;
             }
             let end = ctx.new_event(None)?;
             end.record(stream)?;
-            self.settle(&end, Instant::now(), self.total, stop)
+            self.settle(&end, Instant::now(), total)
         }
 
         /// Wait for `event`, generation `g`'s, until `since` is a deadline
-        /// old or the pump raised `stop`.
-        fn settle(
-            &self,
-            event: &CudaEvent,
-            since: Instant,
-            g: usize,
-            stop: &AtomicBool,
-        ) -> Result<(), GateError> {
+        /// old or an end broke.
+        fn settle(&self, event: &CudaEvent, since: Instant, g: usize) -> Result<(), GateError> {
+            let mut spins = 0u32;
             while !event.query()? {
-                if stop.load(Ordering::Acquire) {
-                    return Err(format!("rank {}: stopped at generation {g}", self.rank).into());
-                }
-                if since.elapsed() > self.deadline {
-                    return Err(self.stalled(g));
+                spins = spins.wrapping_add(1);
+                if spins.is_multiple_of(1024) {
+                    if self.card.broken().is_some() {
+                        return Err(self.card.stalled(g, "the link broke"));
+                    }
+                    if since.elapsed() > self.card.deadline {
+                        return Err(self.card.stalled(g, "no progress"));
+                    }
                 }
                 std::hint::spin_loop();
             }
             Ok(())
         }
 
-        /// The stall's report: every flag word and the sent word as the host
-        /// reads them, before anything is released.
-        fn stalled(&self, g: usize) -> GateError {
-            let words: Vec<String> = self
-                .flags
-                .iter()
-                .enumerate()
-                .map(|(r, f)| format!("flag[{r}]={}", f.load(Ordering::Acquire)))
-                .collect();
-            format!(
-                "rank {}: no progress for {:?} at generation {g}: {} sent={} (host reads; the stream waits on {} \
-                 and sent)",
-                self.rank,
-                self.deadline,
-                words.join(" "),
-                self.sent.load(Ordering::Acquire),
-                if self.rank == 0 { "every rows flag" } else { "flag[0]" },
-            )
-            .into()
-        }
-
-        /// The end of a failed run: `Ok` once the stream drained, else why
-        /// it is not known to have. `stop` goes up first, so the pump ends at
-        /// its next turn. Then every word the stream waits on is raised to
-        /// the generation past `last`, which every enqueued wait takes
-        /// (`u32::MAX` would hold them all: the wait is cyclic), again on
-        /// every poll, since a peer's write still in flight or the pump's
-        /// last turn can lower it, until the stream drains or the deadline
-        /// passes.
-        fn release(&self, last: u32, stop: &AtomicBool) -> Result<(), String> {
-            stop.store(true, Ordering::Release);
-            let past = last + 1;
-            let ctx = self.gpu.context();
-            let end = ctx
+        /// The end of a failed run: release every counter the stream waits
+        /// on, then `Ok` once the stream drained, else why it is not known
+        /// to have.
+        fn drain_released(&self) -> Result<(), String> {
+            self.card.release();
+            let end = self
+                .gpu
+                .context()
                 .new_event(None)
                 .map_err(|e| format!("no end event: {e}"))?;
             end.record(self.gpu.stream())
                 .map_err(|e| format!("end event not recorded: {e}"))?;
-            let waits = self.waits();
             let start = Instant::now();
             loop {
-                for w in &waits {
-                    w.fetch_max(past, Ordering::AcqRel);
-                }
                 match end.query() {
                     Ok(true) => return Ok(()),
-                    Ok(false) if start.elapsed() <= self.deadline => std::hint::spin_loop(),
-                    Ok(false) => return Err(format!("not drained within {:?}", self.deadline)),
+                    Ok(false) if start.elapsed() <= self.card.deadline => std::hint::spin_loop(),
+                    Ok(false) => {
+                        return Err(format!("not drained within {:?}", self.card.deadline));
+                    }
                     Err(e) => return Err(format!("end event query: {e}")),
                 }
             }
         }
     }
 
-    // ------------------------------------------------------------ the pump
-
-    /// What a node's pump sends: its own region, from `local` (`bytes`
-    /// long), to each target queue pair at its remote address and key, once
-    /// `flag` moves, as `mode` writes it; `sent` is raised once a
-    /// generation's writes completed.
-    struct Out<'a> {
-        mode: Flag,
-        flag: &'a AtomicU32,
-        sent: &'a AtomicU32,
-        local: u64,
-        bytes: u32,
-        targets: Vec<(&'a Qp<'a>, u64, u32)>,
-    }
-
-    /// Post a write per target for each new generation of `out.flag`, reap
-    /// the completions, raise `out.sent` to the generation once all its
-    /// writes completed and, under `--flag imm`, raise each incoming flag
-    /// (`ins`: queue pair number, queue pair, flag) from its completion and
-    /// repost the receive. Ends once all `total` generations went out and
-    /// came in, at once with `Ok` when the card raised `stop` (the card
-    /// reports why), or with the state named when nothing moved for
-    /// `deadline`.
-    fn pump(
-        nic: &Nic<'_>,
-        region: &Region<'_>,
-        out: &Out<'_>,
-        ins: &[(u32, &Qp<'_>, &AtomicU32)],
-        total: usize,
-        deadline: Duration,
-        stop: &AtomicBool,
-    ) -> Result<(), GateError> {
-        let total = u32::try_from(total)?;
-        let (mut posted, mut pending, mut received) = (0u32, 0usize, 0usize);
-        let want_in = ins.len() * total as usize;
-        let mut wc = [Wc::default(); 16];
-        let mut progress = Instant::now();
-        let mut spins = 0u32;
-        loop {
-            if stop.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            let g = out.flag.load(Ordering::Acquire);
-            if g > posted {
-                // The stream raised flag g after the sent word reached g - 1,
-                // so generation g - 1 is the last one posted, and complete.
-                if g != posted + 1 || g > total || pending != 0 {
-                    return Err(format!(
-                        "own flag {g} after generation {posted} posted, {pending} writes unacknowledged"
-                    )
-                    .into());
-                }
-                let kind = match out.mode {
-                    Flag::Write => WriteKind::Plain,
-                    Flag::Imm => WriteKind::Imm(g),
-                };
-                for &(qp, addr, rkey) in &out.targets {
-                    qp.post_write(region, out.local, out.bytes, (addr, rkey), kind)?;
-                    pending += 1;
-                }
-                posted = g;
-                progress = Instant::now();
-            }
-            let n = nic.poll(&mut wc)?;
-            for w in &wc[..n] {
-                if w.status != 0 {
-                    return Err(format!(
-                        "completion status {} (vendor {:#x}) opcode {} on qp {}",
-                        w.status, w.vendor_err, w.opcode, w.qp_num
-                    )
-                    .into());
-                }
-                match w.opcode {
-                    WC_RDMA_WRITE => {
-                        pending = pending
-                            .checked_sub(1)
-                            .ok_or("a write completion with no write outstanding")?;
-                        if pending == 0 {
-                            out.sent.fetch_max(posted, Ordering::AcqRel);
-                        }
-                    }
-                    WC_RECV_RDMA_WITH_IMM => {
-                        let &(_, qp, flag) = ins
-                            .iter()
-                            .find(|i| i.0 == w.qp_num)
-                            .ok_or_else(|| format!("a receive on unknown qp {}", w.qp_num))?;
-                        flag.fetch_max(u32::from_be(w.imm_data), Ordering::AcqRel);
-                        qp.post_recv()?;
-                        received += 1;
-                    }
-                    op => return Err(format!("unexpected completion opcode {op}").into()),
-                }
-            }
-            if n > 0 {
-                progress = Instant::now();
-            }
-            if posted == total && pending == 0 && received == want_in {
-                return Ok(());
-            }
-            spins = spins.wrapping_add(1);
-            if spins.is_multiple_of(1024) && progress.elapsed() > deadline {
-                return Err(format!(
-                    "no progress for {deadline:?}: posted {posted} of {total}, {pending} writes \
-                     unacknowledged, received {received} of {want_in}, own flag {g}"
-                )
-                .into());
-            }
-            std::hint::spin_loop();
-        }
-    }
-
     // ------------------------------------------------------ control channel
 
     /// The stage's TCP connections to its peers (one, to the stage, on a
-    /// peer): the endpoints and flag modes, the start, and the peers' counts
+    /// peer): the endpoints and `--size`, the start, and the peers' counts
     /// at the end.
     struct Control {
         socks: Vec<TcpStream>,
         deadline: Duration,
     }
 
-    const ENDPOINT_BYTES: usize = 40;
+    const ENDPOINT_BYTES: usize = 44;
 
     impl Control {
         fn open(o: &Opts) -> Result<Control, GateError> {
@@ -1035,14 +925,14 @@ mod probe {
             })
         }
 
-        /// Send each connection its local endpoint and this node's flag mode,
+        /// Send each connection its local endpoint and this node's `--size`,
         /// and read the remote ones. Both ends write before they read, so each
         /// end of a mismatch refuses it by name before any generation.
         fn exchange(
             &mut self,
             local: &[Endpoint],
             rank: usize,
-            flag: Flag,
+            size: usize,
         ) -> Result<Vec<Endpoint>, GateError> {
             let mut remote = Vec::with_capacity(local.len());
             for (s, l) in self.socks.iter_mut().zip(local) {
@@ -1052,7 +942,7 @@ mod probe {
                 b[8..24].copy_from_slice(&l.gid.raw);
                 b[24..32].copy_from_slice(&l.addr.to_le_bytes());
                 b[32..36].copy_from_slice(&l.rkey.to_le_bytes());
-                b[36..40].copy_from_slice(&flag.word().to_le_bytes());
+                b[36..44].copy_from_slice(&(size as u64).to_le_bytes());
                 s.write_all(&b)?;
             }
             for (i, s) in self.socks.iter_mut().enumerate() {
@@ -1062,23 +952,14 @@ mod probe {
                     .map_err(|e| format!("rank {other}'s endpoint: {e}"))?;
                 let word =
                     |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"));
-                let theirs = match word(36) {
-                    m if m == Flag::Write.word() => Flag::Write,
-                    m if m == Flag::Imm.word() => Flag::Imm,
-                    m => return Err(format!("rank {other} sent flag mode {m}").into()),
-                };
-                if theirs != flag {
+                let theirs = u64::from_le_bytes(b[36..44].try_into().expect("8 bytes"));
+                if theirs != size as u64 {
                     let (stage, peer, r) = if rank == 0 {
-                        (flag, theirs, other)
+                        (size as u64, theirs, other)
                     } else {
-                        (theirs, flag, rank)
+                        (theirs, size as u64, rank)
                     };
-                    return Err(format!(
-                        "flag mode differs: rank 0 {}, rank {r} {}",
-                        stage.name(),
-                        peer.name()
-                    )
-                    .into());
+                    return Err(format!("--size differs: rank 0 {stage}, rank {r} {peer}").into());
                 }
                 let mut gid = Gid::default();
                 gid.raw.copy_from_slice(&b[8..24]);
@@ -1093,8 +974,10 @@ mod probe {
             Ok(remote)
         }
 
-        /// Every node's queue pairs are ready before any node starts: a byte
-        /// each way.
+        /// A byte each way: before the first generation, every node's queue
+        /// pairs are ready; after the last, the stage has every peer's done,
+        /// so no peer drops its end (its pump and queue pair) with a done
+        /// still to post.
         fn ready(&mut self) -> Result<(), GateError> {
             for s in &mut self.socks {
                 s.write_all(b"R")?;
@@ -1106,7 +989,7 @@ mod probe {
             Ok(())
         }
 
-        /// A peer's stale image lines and its kernel's median time, to the stage.
+        /// A peer's stale lines and its kernel's median time, to the stage.
         fn report(&mut self, stale: u64, kernel_ns: u64) -> Result<(), GateError> {
             let mut b = [0u8; 16];
             b[0..8].copy_from_slice(&stale.to_le_bytes());

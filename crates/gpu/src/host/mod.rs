@@ -114,6 +114,7 @@ pub mod tier;
 pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
+pub use link::{Crossing, RdmaEnd, Reader, link_tail};
 
 use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};

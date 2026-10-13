@@ -345,16 +345,19 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: TIER_LINK,
         class: Class::M,
-        kind: Kind::Words(&["shared", "loopback"]),
+        kind: Kind::Words(&["shared", "loopback", "rdma"]),
         default: Unset::Is("shared"),
         doc: "How the expert tier cards' page crosses between the stage card and the tier \
               cards. `shared` is one host-mapped page every card reaches. `loopback` gives the \
               tier cards a page of their own and a host pump thread that carries each go and \
               done between the two pages as a generation, with the bytes it publishes; the \
               cards' operations, graphs and bits are the shared page's. It checks the relay on \
-              one machine (`weekly-gpu-ds41-lost` runs the V4.1 tier gate over it), and the pump \
-              spins on one core while the load lives. Read where the host tier takes its tier \
-              cards.",
+              one machine (`weekly-gpu-ds41-lost` runs the V4.1 tier gate over it). `rdma` is \
+              the loopback's two pages, each held by its own end with its own pump thread and \
+              queue pair, the posts sent as RDMA writes between two queue pairs on the \
+              machine's first RoCE v2 port; it needs `libibverbs.so.1` and an active RoCE port. \
+              Each pump spins on one core while the load lives. Read where the host tier takes \
+              its tier cards.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

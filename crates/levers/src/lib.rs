@@ -2529,6 +2529,9 @@ pub enum TierLink {
     Shared,
     /// Two pages and a host pump thread between them.
     Loopback,
+    /// Two pages, each with its own pump thread posting RDMA writes to the
+    /// other.
+    Rdma,
 }
 
 /// `BLOOMERY_TIER_LINK` from the process environment, parsed as [`at_main`]
@@ -2540,7 +2543,8 @@ pub fn tier_link() -> Result<TierLink, LeverError> {
     match &levers.entry(TIER_LINK).value {
         None | Some(Value::Word("shared")) => Ok(TierLink::Shared),
         Some(Value::Word("loopback")) => Ok(TierLink::Loopback),
-        v => panic!("{TIER_LINK} holds {v:?}, not shared or loopback"),
+        Some(Value::Word("rdma")) => Ok(TierLink::Rdma),
+        v => panic!("{TIER_LINK} holds {v:?}, not shared, loopback or rdma"),
     }
 }
 

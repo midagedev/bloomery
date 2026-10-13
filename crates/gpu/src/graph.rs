@@ -576,6 +576,11 @@ impl MappedHost {
         self.dev + off as u64
     }
 
+    /// The allocation's length in bytes.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// The host address of byte `off`. Computing it touches nothing; each
     /// access proves its own span.
     pub fn host_at(&self, off: usize) -> *mut u8 {
@@ -698,7 +703,7 @@ pub fn op_barrier_sys() -> sys::CUstreamBatchMemOpParams {
 }
 
 /// Atomic reduction `*addr += value` on a u32 (wrapping).
-pub(crate) fn op_add(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+pub fn op_add(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
     let mut p = op_zero();
     p.atomicReduction = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpAtomicReductionParams_st {
         operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_ATOMIC_REDUCTION,

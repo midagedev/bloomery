@@ -39,11 +39,12 @@ budget solver.
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
 | **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6) | nothing |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
-| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words | the placement half's engine side: a remote node's census, the card plans each node's budget comes from, and decode at n = N (contributor, answer 20; section 10); the protocol half, started by the contributor with the `Link` seam and the counter relay (section 9.5, item 2) on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828); the transport and the N = 2 run are left |
+| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words | the placement half's engine side: a remote node's census, the card plans each node's budget comes from, and decode at n = N (contributor, answer 20; section 10); the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in; node 1's tier server (items 5 and 6) and the N = 2 run are left |
 
 Files the open work touches: P1, the unpublished V4.1 DSpark draft fixture; P4, the card's gather kernels that read the arena in
 `crates/gpu/src/host/nvtier.rs` (the card leg); P5, `crates/placement` (`Machine`, `nodes_scale`),
-`crates/gpu/src/host/link.rs` and `link/pump.rs` (the `Link` seam and the counter relay) and the transport (9.5).
+`crates/gpu/src/host/link.rs`, `link/pump.rs` and `link/rdma.rs` (the `Link` seam, the counter relay and the RDMA end)
+and the tier server (9.5, items 5 and 6).
 
 ## 2. Build and first run on a Spark
 
@@ -358,7 +359,7 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 | Term | On the Spark |
 |---|---|
 | H2D promotion over PCIe (`cuMemcpyHtoDAsync`, `crates/gpu/src/host/xstream.rs:1223,1261` at `cce176c5`; the staging rings `:283,760,1614`) | vanishes as a PCIe cost; a copy from pageable memory into a `cudaMalloc` buffer is still a DRAM-to-DRAM copy at half the pool's rate (reads and writes both cross it: 21.2 GB in ~0.16 s `[derived]`), negligible beside the file read |
-| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/link.rs:143`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
+| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/link.rs:293`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
 | CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (section 4) |
 | The pool's bandwidth | stays, as the single term (section 5) |
 | Page cache of the model file plus the device copy | stays and doubles the footprint until dropped; `nvtier.rs:12-30` already drops pages after use (`MADV_DONTNEED`, the `release_union` path) for the NVMe tier |
@@ -641,49 +642,57 @@ decision.
 (`all_gather_perf` per NVIDIA's NCCL playbook), and the fallback only if the probe of 9.6 shows our pump path slower
 than NCCL's point to point. Without GPUDirect NCCL stages through host bounce buffers with its proxy thread `[derived
 from the cuda.html line; NCCL internals unverified]`, and a send or receive kernel per message would occupy SMs. The
-handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:143`), which is what 9.1's "what to
+handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:293`), which is what 9.1's "what to
 use instead" asks for, so the NIC reads the same LPDDR with no copy. The protocol stays `host/mod.rs`'s alone
-(`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam (`crates/gpu/src/host/link.rs`). It has two impls: the
-shared page (PCIe and one Spark, identity) and the loopback (two pages on one machine, a host pump thread between them,
-picked by `BLOOMERY_TIER_LINK=loopback`). Mirrored pages over RDMA are the transport's impl. The relay's step rule and
-its order (the bytes, then the progress, then the generation) carry to it; a pump a node, the inbox word between them
-and the release of a remote node's words are the transport's. ~~A raw-verbs build adds `libibverbs`, whose licence
-under `just deny` is `[unverified]`.~~ The probe loads `libibverbs` at run time with `dlopen`, so no build links it
-(9.6, item 5).
+(`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam (`crates/gpu/src/host/link.rs`). It has three impls: the
+shared page (PCIe and one Spark, identity), the loopback (two pages on one machine, a host pump thread between them,
+picked by `BLOOMERY_TIER_LINK=loopback`) and the RDMA link (`BLOOMERY_TIER_LINK=rdma`). The RDMA link is the
+loopback's two pages, each held by its own end with its own pump thread and queue pair, the two queue pairs connected
+on the machine's first RoCE v2 port (`crates/gpu/src/host/link/rdma.rs`). An end writes only its own page and reaches
+the other through RDMA writes, so a node holds one end of a link between two nodes. ~~A raw-verbs build adds
+`libibverbs`, whose licence under `just deny` is `[unverified]`.~~ The verbs crate (`crates/verbs`) loads `libibverbs`
+at run time with `dlopen`, so no build links it (9.6, item 5).
 
 What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
-1. **Two pages, one a node.** Every word keeps one writer node. The link mirrors a region one way, one RDMA write a
-   message.
+1. **Two pages, one a node.** Every word keeps one writer node. A message is one chain of RDMA writes on one queue
+   pair: the bytes the counter publishes, then for a done the tier's progress, then the generation into an inbox word
+   on the reader's page. The inbox and the staged values a post sends sit in a tail past the tier page's own bytes, so
+   the shared page keeps its layout.
 2. **The counters cross as generations; the cards keep their operations.** A row's go counter is added to by the stage
    and taken back by the tier, and its done counter the other way: two writers, at different times. A mirrored absolute
    write would erase the remote take back. A captured wait also keeps its value fixed on every replay
    (`crates/gpu/src/graph.rs`, `HostFlags`), so a wait for a target that rises each replay cannot be captured. So the
    counter is split across the two pages. On the writer's page only the writing card adds one to it, and that value is
-   a generation. For each new generation the pump copies the bytes it publishes to the reader's page, then adds one to
-   the counter on the reader's page, and the reading card waits for at least one and takes it back, as on the shared
-   page. A step of 0 carries nothing, a step of 1 carries one, and any other step publishes nothing and stops the pump
-   by name, since a row has at most one go or done in flight. The host's progress word on the stage's page counts the
-   dones the pump carried and is written after their bytes, so it never runs ahead of them. A release takes all of the
-   tier's counters in one hold of the pump's lock, so no pass falls between two of them while the released card runs on
-   and steps the counters it writes; each counter's reset takes its generations as carried and resumes it
+   a generation. The writer's end posts each new generation to the reader's inbox, after the bytes it publishes. The
+   reader's end adds one to the counter on the reader's page for each new generation in its inbox, and the reading
+   card waits for at least one and takes it back, as on the shared page. Both ends hold the step rule: a step of 0
+   carries nothing, a step of 1 carries one, and any other step publishes nothing and stops that end by name, since a
+   row has at most one go or done in flight. The host's progress word on the stage's page counts the dones the
+   writer's end posted and goes after their bytes, so it never runs ahead of them. A release stops all of the tier's
+   counters on both ends before it raises any reader's counter, since a released card runs on and steps the counters it
+   writes. Each counter's reset takes its generations as carried and resumes it alone, each end resetting only its own
+   side of it, and a link stopped by name fails the reset, so the host tier stays poisoned
    (`crates/gpu/src/host/link/pump.rs`). On the shared page nothing changes: the same words, values, card operations
-   and graphs. On two nodes the writer's pump posts each generation to an inbox word on the reader's node, after the
-   bytes, and the reader's pump holds it to the same step rule; that split is the transport's.
-3. **A pump thread a node.** The card cannot post to the NIC. The pump load-acquires the go generation (Arm needs an
-   explicit acquire: the memorder row) before posting. The card's system-scope barrier before go
-   (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
-4. **Data before flag across the NIC.** Register the pages without `IBV_ACCESS_RELAXED_ORDERING`, so write-after-write
-   order holds (the `ibv_reg_mr` row), with the flag last on the same QP. Or use write-with-immediate, where the remote
-   pump writes the flag after the completion: one more hop, ordered by the completion rule. NVIDIA's perftest ran with
-   relaxed ordering on, so its bandwidth is not protocol-mode bandwidth.
+   and graphs.
+3. **A pump thread a node.** The card cannot post to the NIC. Each end's pump load-acquires the generation (Arm needs
+   an explicit acquire: the memorder row) and checks its step before any byte of the message moves. The card's
+   system-scope barrier before go (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
+4. **Data before flag across the NIC.** The pages are registered without `IBV_ACCESS_RELAXED_ORDERING`, so
+   write-after-write order holds (the `ibv_reg_mr` row), with the generation last on the same QP. Only the last write of
+   a message is signaled; a completion with an error stops the end by its status name, which the lost tier's detail
+   carries. Write-with-immediate, where the remote pump writes the flag after the completion, was the other way: one
+   more hop, receives to keep posted, and a second ordering rule. NVIDIA's perftest ran with relaxed ordering on, so its
+   bandwidth is not protocol-mode bandwidth.
 5. **The remote is another process.** Node 1 runs a tier server: it loads its experts from its own copy of the file,
    captures its graphs from the go order it is sent at load, and launches a replay on a "replay r of chain c" message,
    which the first image can carry (today the stage process launches the tier's graph, `tier.rs:37-42`). Before the
    plan, the same channel carries node 1's census to node 0.
 6. **Loss.** The go deadline already names a lost tier (`tier.rs:49-54`, `CardLost`). A down link also means the stage
    cannot write `RELEASE` to node 1's words, so node 1 needs its own deadline that drains its streams.
-7. **Faults and sequence.** The tier's fault-word copy already rides before its signal (`tier.rs:42-44`). The handoff's
-   sequence word detects a stale or doubled image across the mirror.
+7. **Faults and sequence.** The tier's fault-word copy rides before its signal (`tier.rs:42-44`). A doubled image is
+   refused by the relay's step rule (item 2): a repeated generation delivers nothing, and a step above one stops the end
+   by name. A stale image, bytes their generation overtook, is what item 4's order prevents, and `link_probe` counts it
+   on the link's own ends: every 64-byte line carries its generation, and each card counts the lines that do not.
 
 ### 9.6 First step, and what it measured
 
@@ -699,9 +708,9 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    place of a same-lease A/B on the box (same comment). `weekly-gpu-ds41-lost` runs the owning gate's clauses over the
    loopback (`BLOOMERY_TIER_LINK=loopback`) on one card.
 4. A `Link` seam where the tier page is written and read: a move-class change, `ptx-scan` identical.
-5. ~~Decide the `libibverbs` dependency under `just deny`.~~ Decided in #44's review: `verbs.rs` loads the system's
-   `libibverbs.so.1` with `dlopen`, so no crate links it, and it stays in `gpu-gates` until a second user moves it to
-   its own crate ([#44](https://github.com/midagedev/bloomery/pull/44)).
+5. ~~Decide the `libibverbs` dependency under `just deny`.~~ Decided in #44's review: the verbs code loads the system's
+   `libibverbs.so.1` with `dlopen`, so no crate links it ([#44](https://github.com/midagedev/bloomery/pull/44)). The
+   tier link's RDMA end is its second user, so it is its own crate, `crates/verbs`.
 
 **The contributor's first step needs no engine code.** It is done: `link_probe`
 ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`) and the fabric runs, with the results in 9.1. On two Sparks, one cable, one rail, under a prediction card
@@ -731,7 +740,8 @@ start, so nothing in it assumes a pair.
      - **40–120 µs**: (a) only for the models that do not fit one Spark (GLM, V4.1). Qwen3.8 sits near its λ* of 122 µs,
        so it stays on one node.
      - **over 120 µs**: the pump or wake-up path is wrong; fix it before any engine work.
-     - **stale lines over 0**: switch to write-with-immediate and measure again.
+     - **stale lines over 0**: switch to write-with-immediate and measure again. The verbs crate no longer has the
+       write-with-immediate and receive paths (item 4), so this needs them written again.
 3. Then the single-node term section 5 names (sustained BW), which sets every band above. Measured: section 5.
 
 **What carries from N = 2 to N = 4 unchanged:** the pump threads, the strict-order registration, the relay's step rule
@@ -1117,19 +1127,6 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   split (9.2), and decode at n = N in the predictor (9.8).
 - GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
 - S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on.
-- Small-message (16 to 64 KB) bandwidth in protocol mode, strict ordering and one message in flight: the contributor,
-  with the protocol half (answer 20). The floor is one message's serialization on one rail plus the one-way trip without
-  it `[derived]`: floor = bytes × 8 / R + (t_typical − bytes × 8 / R₁₂₈). R is 9.1's 109.28 or 92.57 Gb/s, so the
-  serialization is 1.2 to 1.4 µs at 16 KB, 2.4 to 2.8 µs at 32 KB and 4.8 to 5.7 µs at 64 KB. t_typical is
-  `ib_write_lat`'s one-way time and R₁₂₈ the `-t 128` rate, each the mean of three runs in one session (9.1). R₁₂₈
-  (108.71 to 109.26 Gb/s) is close to 109.28, so the floor's low end lands within 0.01 µs of t_typical by construction,
-  and only the range of R sets the floor's width: 0.22, 0.43 and 0.87 µs at 16, 32 and 64 KB. With one write in flight
-  on perftest's host buffers ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)), the time
-  per write derived from throughput at 64 KB is 9.10 µs A to B and 9.27 µs B to A, 0.33 and 0.29 µs under the mean
-  t_typical of the same direction `[derived]`. A time per write from throughput and half a ping-pong round trip are
-  different quantities, and neither ran on the protocol's pinned pages, so this reading neither confirms nor refutes the
-  floor. The item closes with the same sizes measured on the protocol's pinned pages, with strict ordering and one
-  message written at a time.
 - The switch hop: no switched Spark was measured (9.6).
 - Whether to take tensor parallel first instead of (a) is the maintainers' decision (9.4).
 
@@ -1159,6 +1156,25 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   rows in one call (`adjacent_runs`, `crates/engram/src/lib.rs:567`; `SplitTable::evict_rows`,
   `crates/engram/src/rows.rs:196`), and the clause (`crates/engram/tests/engram.rs:706`) checks every page of the named
   experts after each eviction.
+- ~~Small-message (16 to 64 KB) bandwidth in protocol mode, strict ordering and one message in flight~~ (the
+  contributor, with the protocol half, answer 20). Across a direct cable between two Sparks, the link's one-way time
+  is 1.52 to 1.80 µs over `ib_write_lat`'s and 0.66 to 1.81 µs over the floor, with 0 stale lines (the table).
+  The floor is one message's serialization on one rail plus the one-way trip without it `[derived]`:
+  floor = bytes × 8 / R + (t_typical − bytes × 8 / R₁₂₈). R is 9.1's 109.28 or 92.57 Gb/s, t_typical is
+  `ib_write_lat`'s one-way time and R₁₂₈ the `ib_write_bw -t 128` rate, each the mean of three runs in the same
+  session as the link's reading. The reading: two GB10s, one RoCE v2 port each, the link's RDMA ends on its pinned
+  pages with strict ordering, and `link_probe --size` writing one message at a time (one-way time = half the round
+  trip, p50 of 100,000 messages, the mean of three rounds).
+
+  | Size | t_typical | `link_probe` one-way | Over t_typical | R₁₂₈ | Floor | Over the floor |
+  |---|---|---|---|---|---|---|
+  | 16 KB | 4.49 µs | 6.08 µs | 1.59 µs | 108.35 Gb/s | 4.48 to 4.70 µs | 1.38 to 1.60 µs |
+  | 32 KB | 5.97 µs | 7.77 µs | 1.80 µs | 108.96 Gb/s | 5.96 to 6.40 µs | 1.37 to 1.81 µs |
+  | 64 KB | 8.76 µs | 10.29 µs | 1.52 µs | 109.15 Gb/s | 8.76 to 9.62 µs | 0.66 to 1.53 µs |
+
+  On one Spark, with both RDMA ends on one RoCE port (the NIC's own loopback), the same probe read 1.50, 1.59 and
+  1.69 µs over that session's t_typical. At the three sizes checked, the cable's excess falls inside the band the
+  one-port reading predicted for it (1.2 to 2.0 µs).
 
 ## 11. Maintainers' decisions
 

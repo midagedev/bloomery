@@ -136,6 +136,7 @@ dependencies = [
  "bloomery-model",
  "bloomery-runtime",
  "bloomery-threads",
+ "bloomery-verbs",
  "bloomery-vision",
  "crc32fast",
  "cuda-core",
@@ -182,6 +183,7 @@ dependencies = [
  "bloomery-serve",
  "bloomery-threads",
  "bloomery-tokenizer",
+ "bloomery-verbs",
  "bloomery-vision",
  "cuda-core",
  "cuda-device",
@@ -352,6 +354,13 @@ dependencies = [
  "bloomery-refset",
  "memchr",
  "thiserror",
+]
+
+[[package]]
+name = "bloomery-verbs"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
