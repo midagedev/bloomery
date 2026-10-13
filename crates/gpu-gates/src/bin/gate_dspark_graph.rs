@@ -442,7 +442,7 @@ mod gate {
             m: usize,
         ) -> Result<(), GpuError> {
             self.pass
-                .enqueue_layers(gpu, body.layers().weights(), &self.rings, &mut self.x)?;
+                .enqueue_layers(gpu, body.layers().weights(), &self.rings, m, &mut self.x)?;
             body.head_mut().enqueue_logits(gpu, &self.x, m)
         }
 
@@ -1392,7 +1392,7 @@ mod gate {
                     rule: Rule::Reference,
                 },
             )?;
-            sa.pass.enqueue_layers(gpu, w, &sa.rings, &mut sa.x)?;
+            sa.pass.enqueue_layers(gpu, w, &sa.rings, 1, &mut sa.x)?;
             s.synchronize()?;
             let streams = sa.pass.streams0().to_host_vec(s)?;
             let fold = sa.pass.fold0().to_host_vec(s)?;
