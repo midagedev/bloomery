@@ -14,7 +14,10 @@
 //! 3. the conv and prep ([`crate::linear::conv`]) over the layer's conv ring
 //!    by the rows' positions;
 //! 4. the delta step ([`crate::linear::delta`]) over the state lane the
-//!    record's lane word names;
+//!    record's lane word names — on a load whose stores keep a lane per
+//!    verify row, `gdn_delta_lanes` over the committed lane the body's lane
+//!    word names ([`LaneRun`]), in place for a step and a prompt unit and in
+//!    row mode for a verify;
 //! 5. the gated norm ([`crate::linear::norm_gate`]) into the arena's
 //!    attention rows;
 //! 6. a Q4_K output projection: the rows' q8_1 quantizer and the
@@ -36,12 +39,12 @@
 use super::dispatch::{self, Ctx, site_launches};
 use super::plan::{DeltaPlan, SiteTy};
 use super::proj::{OResidArgs, QkvArgs};
-use super::scratch::{Arena, Io, RecStore};
+use super::scratch::{Arena, Io, LaneRun, RecStore};
 use super::wide::{self, GEMV_COLS};
 use crate::GpuError;
 use crate::linear;
 use crate::linear::conv::ConvArgs;
-use crate::linear::delta::DeltaArgs;
+use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
 use crate::model::lookup::{f32_gain, kq_weight};
 
@@ -93,10 +96,6 @@ pub(super) fn delta(
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let q35 = k.q35(WHAT)?;
     let stream = gpu.stream();
-    let lane = io.lane.ok_or(GpuError::state(
-        WHAT,
-        "the record's lane word (a chain with delta layers carries one)",
-    ))?;
     let g = s
         .gdn
         .as_ref()
@@ -140,22 +139,62 @@ pub(super) fn delta(
             ring: &mut r.ring,
         },
     )?;
-    lin.delta.enqueue_delta(
-        stream,
-        DeltaArgs {
-            qkv: &g.conv,
-            beta: &g.beta,
-            decay: &g.decay,
-            lane,
-            lane_at: 0,
-            lanes: r.lanes,
-            shape: d.shape,
-            m,
-            fault: c.sink,
-            o: &mut g.o,
-            state: &mut r.state,
-        },
-    )?;
+    match (g.lanes.as_ref(), r.stamp.as_mut()) {
+        (None, None) => {
+            let lane = io.lane.ok_or(GpuError::state(
+                WHAT,
+                "the record's lane word (a chain with delta layers carries one)",
+            ))?;
+            lin.delta.enqueue_delta(
+                stream,
+                DeltaArgs {
+                    qkv: &g.conv,
+                    beta: &g.beta,
+                    decay: &g.decay,
+                    lane,
+                    lane_at: 0,
+                    lanes: r.lanes,
+                    shape: d.shape,
+                    m,
+                    fault: c.sink,
+                    o: &mut g.o,
+                    state: &mut r.state,
+                },
+            )?;
+        }
+        (Some(LaneRun { word, each }), Some(stamp)) => lin.delta.enqueue_delta_lanes(
+            stream,
+            DeltaLanesArgs {
+                delta: DeltaArgs {
+                    qkv: &g.conv,
+                    beta: &g.beta,
+                    decay: &g.decay,
+                    lane: word,
+                    lane_at: 0,
+                    lanes: r.lanes,
+                    shape: d.shape,
+                    m,
+                    fault: c.sink,
+                    o: &mut g.o,
+                    state: &mut r.state,
+                },
+                each: *each,
+                pos,
+                stamp,
+            },
+        )?,
+        (run, stamp) => {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the arena's lane run and the layer's stamps both present or both absent \
+                     (the arena has {}, the store {})",
+                    if run.is_some() { "a run" } else { "none" },
+                    if stamp.is_some() { "stamps" } else { "none" },
+                ),
+            ));
+        }
+    }
     lin.norm_gate.enqueue_norm_gate(
         stream,
         NormGateArgs {

@@ -148,14 +148,17 @@ impl Prompt for Body35 {
 
 impl Keep for Body35 {
     /// [`Body35::kept`]'s position: every position, the empty model, or the
-    /// nearest checkpoint a marked prompt call took at or below `n`.
+    /// nearest checkpoint a marked prompt call took at or below `n` — and,
+    /// on a load that verifies drafted rows, any position past the first of
+    /// the verify waiting for its commit.
     fn keepable(m: &Qwen35moeModel, n: u32) -> u32 {
         <Body35 as Keep>::kept(m, n).at
     }
 
     /// [`Body35::kept`]: what a cut keeps and why — a checkpoint's
-    /// position, or nothing with the reason a delta layer holds no earlier
-    /// state but a copy.
+    /// position, a waiting verify's row (the commit moves the lane word and
+    /// copies nothing), or nothing with the reason a delta layer holds no
+    /// earlier state but a copy.
     fn kept(m: &Qwen35moeModel, n: u32) -> Kept {
         m.body(WHAT)
             .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
@@ -163,7 +166,8 @@ impl Keep for Body35 {
 
     /// Back to empty at 0 — a reset; else the model's rollback
     /// ([`Rollback`](bloomery_gpu::model::Rollback)): the checkpoint at
-    /// `n`, any other position refused by name.
+    /// `n`, a row of the verify waiting on a load of several lanes (its
+    /// commit), any other position refused by name.
     fn cut(m: &mut Qwen35moeModel, n: u32) -> Result<(), GpuError> {
         cut_positions(m, n)
     }

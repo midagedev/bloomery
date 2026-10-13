@@ -1334,6 +1334,20 @@ pub(super) struct GdnArena {
     pub(super) beta: DeviceBuffer<f32>,
     pub(super) decay: DeviceBuffer<f32>,
     pub(super) o: DeviceBuffer<f32>,
+    /// The lanes the walks over this arena run their delta launches by
+    /// ([`LaneRun`]); `None` on a load whose stores keep one lane in place.
+    pub(super) lanes: Option<LaneRun>,
+}
+
+/// How the delta launches of the walks over one arena use the stamped lanes
+/// of a load that verifies drafted rows: the body's lane word (a
+/// non-owning view of [`LaneWord`]'s device word, so a walk reads the
+/// committed lane whatever its input record holds) and whether the walk is
+/// a verify, whose row `j` writes lane `(c + j) mod lanes` (`each`), or one
+/// that writes the state after its last row back into lane `c`.
+pub(super) struct LaneRun {
+    pub(super) word: ManuallyDrop<DeviceBuffer<u32>>,
+    pub(super) each: bool,
 }
 
 impl GdnArena {
@@ -1373,6 +1387,7 @@ impl GdnArena {
             beta: f(rows * nv)?,
             decay: f(rows * nv)?,
             o: f(rows * zl)?,
+            lanes: None,
         })
     }
 
@@ -1394,15 +1409,21 @@ impl GdnArena {
 
 /// One delta layer's recurrent store: the state `[lanes][n_v][128][128]`
 /// (value-major, `linear`'s layout), read and written in place through the
-/// lane word, and the conv ring `[RING_ROWS][C]`, indexed by position.
+/// lane word, the conv ring `[RING_ROWS][C]`, indexed by position, and — on
+/// a store that keeps a lane per verify row — the lanes' stamps (`linear::delta`'s
+/// module doc): the position each lane's state stands at.
 pub(super) struct RecStore {
     pub(super) state: DeviceBuffer<f32>,
     pub(super) ring: DeviceBuffer<f32>,
     pub(super) lanes: usize,
+    /// `lanes` u32 stamps ([`fresh_stamps`]); `None` on a one-lane store,
+    /// whose launches are `gdn_delta`'s.
+    pub(super) stamp: Option<DeviceBuffer<u32>>,
 }
 
 impl RecStore {
-    /// A zeroed store of `lanes` lanes for `shape`. Load-time only.
+    /// A zeroed store of `lanes` lanes for `shape`, with no stamps. Load-time
+    /// only.
     pub(super) fn new(
         stream: &CudaStream,
         shape: LinearShape,
@@ -1413,7 +1434,52 @@ impl RecStore {
             state: DeviceBuffer::zeroed(stream, state)?,
             ring: DeviceBuffer::zeroed(stream, ring)?,
             lanes,
+            stamp: None,
         })
+    }
+
+    /// A zeroed store of `lanes` lanes for `shape` with its stamps fresh
+    /// ([`fresh_stamps`]): the store a load that verifies drafted rows keeps.
+    /// Load-time only.
+    pub(super) fn stamped(
+        stream: &CudaStream,
+        shape: LinearShape,
+        lanes: usize,
+    ) -> Result<RecStore, GpuError> {
+        let mut r = RecStore::new(stream, shape, lanes)?;
+        r.stamp = Some(DeviceBuffer::from_host(stream, &fresh_stamps(lanes))?);
+        Ok(r)
+    }
+
+    /// The stamps back to a fresh store's ([`fresh_stamps`]); a store with
+    /// none is refused by name. Never inside a capture.
+    pub(super) fn restamp(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        let fresh = fresh_stamps(self.lanes);
+        self.stamp_with(stream, &fresh)
+    }
+
+    /// The stamps with lane `lane` at position `at` and every other lane
+    /// never written ([`stamps_at`]): the store after a cut restored a
+    /// checkpoint into the committed lane. A store with no stamps is
+    /// refused by name. Never inside a capture.
+    pub(super) fn restamp_at(
+        &mut self,
+        stream: &CudaStream,
+        lane: u32,
+        at: u32,
+    ) -> Result<(), GpuError> {
+        let st = stamps_at(self.lanes, lane, at)?;
+        self.stamp_with(stream, &st)
+    }
+
+    fn stamp_with(&mut self, stream: &CudaStream, st: &[u32]) -> Result<(), GpuError> {
+        match self.stamp.as_mut() {
+            Some(stamp) => Ok(stamp.copy_from_host(stream, st)?),
+            None => Err(GpuError::state(
+                "qwen3moe::RecStore::restamp",
+                "a store of stamped lanes",
+            )),
+        }
     }
 
     /// The f32s of the state and of the ring of a store of `lanes` lanes for
@@ -1441,7 +1507,142 @@ impl RecStore {
     }
 
     pub(super) fn bytes(&self) -> usize {
-        self.state.num_bytes() + self.ring.num_bytes()
+        self.state.num_bytes()
+            + self.ring.num_bytes()
+            + self.stamp.as_ref().map_or(0, DeviceBuffer::num_bytes)
+    }
+}
+
+/// A fresh store's stamps over `lanes` lanes: lane 0 holds the zero state of
+/// position 0, every other lane was never written ([`linear::delta::NEVER`], a position no
+/// call starts at, so reading such a lane raises `FaultSite::DeltaStamp`).
+pub(super) fn fresh_stamps(lanes: usize) -> Vec<u32> {
+    let mut st = vec![linear::delta::NEVER; lanes];
+    if let Some(first) = st.first_mut() {
+        *first = 0;
+    }
+    st
+}
+
+/// The stamps of a store over `lanes` lanes whose committed lane `lane`
+/// stands at position `at` and whose every other lane was never written. A
+/// lane at or past `lanes` is refused by name.
+pub(super) fn stamps_at(lanes: usize, lane: u32, at: u32) -> Result<Vec<u32>, GpuError> {
+    let mut st = vec![linear::delta::NEVER; lanes];
+    *st.get_mut(lane as usize).ok_or_else(|| {
+        GpuError::shape(
+            "qwen3moe::stamps_at",
+            format!("lane {lane} of {lanes} lanes"),
+        )
+    })? = at;
+    Ok(st)
+}
+
+/// Non-owning views of a [`LaneWord`]'s device word ([`LaneWord::with_views`]).
+pub(super) type LaneViews = Vec<ManuallyDrop<DeviceBuffer<u32>>>;
+
+/// The lane word every delta launch of a verifying load's walks reads: the
+/// lane that holds the committed state, which only a verify's commit moves
+/// (`linear::delta::kept_lane`) and a reset sets back to 0. One device word
+/// written by an asynchronous copy ahead of the launches that read it, over
+/// `lanes` lanes.
+pub(super) struct LaneWord {
+    word: ManuallyDrop<DeviceBuffer<u32>>,
+    inbox: Inbox,
+    lane: u32,
+    lanes: usize,
+}
+
+impl LaneWord {
+    /// Lane 0 of `lanes` lanes. Load-time only.
+    pub(super) fn new(stream: &CudaStream, lanes: usize) -> Result<LaneWord, GpuError> {
+        Ok(LaneWord::with_views(stream, lanes, 0)?.0)
+    }
+
+    /// Lane 0 of `lanes` lanes, and `views` non-owning views of its device
+    /// word for the arenas whose walks read it ([`Arena::run_lanes`]). A view
+    /// must not outlive the word, nor be used after the struct is dropped:
+    /// the body that holds both keeps them together. Load-time only.
+    pub(super) fn with_views(
+        stream: &CudaStream,
+        lanes: usize,
+        views: usize,
+    ) -> Result<(LaneWord, LaneViews), GpuError> {
+        let inbox = Inbox::new(stream, 1)?;
+        // SAFETY: word 0 of the inbox's one device word for each window, and
+        // the inbox moves into the struct beside the first of them (a move of
+        // the handle, not of the allocation), where it outlives it; the views
+        // are the caller's to keep inside that lifetime (above).
+        let (word, views) = unsafe {
+            (
+                param_view::<u32>(inbox.dev(), 0, 1),
+                (0..views)
+                    .map(|_| param_view::<u32>(inbox.dev(), 0, 1))
+                    .collect(),
+            )
+        };
+        Ok((
+            LaneWord {
+                word,
+                inbox,
+                lane: 0,
+                lanes,
+            },
+            views,
+        ))
+    }
+
+    /// Set the word to `lane` (below the word's lanes, else refused by name)
+    /// and enqueue its copy. Never inside a capture.
+    pub(super) fn set(&mut self, stream: &CudaStream, lane: u32) -> Result<(), GpuError> {
+        if lane as usize >= self.lanes {
+            return Err(GpuError::shape(
+                "qwen3moe::LaneWord::set",
+                format!("lane {lane} of {} lanes", self.lanes),
+            ));
+        }
+        self.inbox.host_mut()?[0] = lane;
+        self.inbox.upload(stream, 1)?;
+        self.lane = lane;
+        Ok(())
+    }
+
+    /// The word after a verify from the committed lane keeps its first `k`
+    /// rows: the lane row `k − 1` wrote ([`linear::delta::kept_lane`]),
+    /// enqueued as [`LaneWord::set`] does. A `k` outside `1..=lanes` is
+    /// refused by name, the word where it was.
+    pub(super) fn keep(&mut self, stream: &CudaStream, k: usize) -> Result<(), GpuError> {
+        let lanes = u32::try_from(self.lanes).map_err(|_| {
+            GpuError::shape(
+                "qwen3moe::LaneWord::keep",
+                format!("{} lanes past u32", self.lanes),
+            )
+        })?;
+        let k = u32::try_from(k)
+            .ok()
+            .filter(|k| (1..=lanes).contains(k))
+            .ok_or_else(|| {
+                GpuError::shape(
+                    "qwen3moe::LaneWord::keep",
+                    format!("{k} kept rows of a verify over {lanes} lanes (1..={lanes})"),
+                )
+            })?;
+        self.set(stream, linear::delta::kept_lane(self.lane, k, lanes))
+    }
+
+    /// The lane the word holds.
+    pub(super) fn lane(&self) -> u32 {
+        self.lane
+    }
+
+    /// The device word.
+    pub(super) fn word(&self) -> &DeviceBuffer<u32> {
+        &self.word
+    }
+
+    /// Device bytes.
+    pub(super) fn bytes(&self) -> usize {
+        self.inbox.bytes()
     }
 }
 
@@ -1726,6 +1927,23 @@ impl Arena {
             Some(rows) => rows.write(stream, x),
             None => Ok(()),
         }
+    }
+
+    /// Run the delta launches of the walks over this arena by the stamped
+    /// lanes ([`LaneRun`]): `word` the body's lane word, `each` whether the
+    /// walk is a verify. Refused by name on an arena with no delta
+    /// intermediates. Load-time only.
+    pub(super) fn run_lanes(
+        &mut self,
+        word: ManuallyDrop<DeviceBuffer<u32>>,
+        each: bool,
+    ) -> Result<(), GpuError> {
+        let g = self.gdn.as_mut().ok_or(GpuError::state(
+            "qwen3moe::Arena::run_lanes",
+            "an arena with delta intermediates",
+        ))?;
+        g.lanes = Some(LaneRun { word, each });
+        Ok(())
     }
 
     /// `m − 1`, the index of the `m`-column activations a gemv arm of `m`

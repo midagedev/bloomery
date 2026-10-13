@@ -391,6 +391,23 @@ impl PlanInputs {
         })
     }
 
+    /// The inputs of a load whose GDN layers keep `lanes` stamped lanes of
+    /// state ([`KvLayout::of_lanes`]): a Qwen3.6 load that verifies drafted
+    /// rows asks for `MAX_PASS_ROWS` of them, and the plan, the whole-fit
+    /// verdict and the sequences' stores all price the one count. The layout's
+    /// q8_0 form ([`KvLayout::in_q8`]) is kept.
+    ///
+    /// # Panics
+    ///
+    /// On no lane, by name.
+    #[must_use]
+    pub fn with_lanes(mut self, lanes: usize) -> PlanInputs {
+        let q8 = self.kv.q8;
+        self.kv = KvLayout::of_lanes(&self.hp, lanes);
+        self.kv.q8 = q8;
+        self
+    }
+
     /// Every feature of the file the engine does not run, as
     /// [`coverage::check`] lists them. Empty for a file the program runs.
     pub fn unimplemented(&self) -> Vec<Unimplemented> {
@@ -1365,7 +1382,8 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 ///   channels, `2·k_heads·state + v_heads·state`, in f32), both fixed by the
 ///   file; on a qwen4exp file its state keeps
 ///   `runtime::stores::DELTA_LANES` lanes, each stamped
-///   (`runtime::stores::delta_lane_bytes`);
+///   (`runtime::stores::delta_lane_bytes`); a qwen35moe load that verifies
+///   drafted rows asks for its own count ([`KvLayout::of_lanes`]);
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
 /// - an attention layer: a position's K and V (`2 · kv_heads · head_dim`
@@ -1397,15 +1415,31 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    /// The layout `hp` describes.
+    /// The layout `hp` describes, its GDN layers keeping the lanes the file's
+    /// family verifies by: [`DELTA_LANES`] on a qwen4exp file (its drafted
+    /// rows always verify), one on a qwen35moe file (a load that verifies
+    /// drafted rows asks for more, [`KvLayout::of_lanes`]).
     #[must_use]
     pub fn of(hp: &Hparams) -> KvLayout {
+        let lanes = hp.exp.as_ref().map_or(1, |_| DELTA_LANES);
+        KvLayout::of_lanes(hp, lanes)
+    }
+
+    /// The layout `hp` describes with every GDN layer keeping `lanes` stamped
+    /// lanes of state (`runtime::stores::delta_lane_bytes`): one lane is the
+    /// state in place with no stamps, more are a verify's rows, one lane a
+    /// row. The lane count is an input of the layout, whichever model.
+    ///
+    /// # Panics
+    ///
+    /// On no lane, by name.
+    #[must_use]
+    pub fn of_lanes(hp: &Hparams, lanes: usize) -> KvLayout {
         let exp = hp.exp.as_ref();
-        let copy = recurrent_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv);
+        let (recurrent, copy) = gdn_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv, lanes);
         KvLayout {
             kinds: hp.kinds.clone(),
-            recurrent: copy
-                + exp.map_or(0, |_| delta_lane_bytes(hp.v_heads, hp.state, DELTA_LANES)),
+            recurrent,
             copy,
             ple: exp.and_then(|e| e.ple).map(|p| {
                 (
@@ -1427,6 +1461,31 @@ impl KvLayout {
         self.q8 = true;
         self
     }
+}
+
+/// A GDN layer's resident bytes and what one checkpoint of it copies, for
+/// `lanes` lanes of state: `(recurrent, copy)`. One lane is the state in
+/// place ([`recurrent_bytes`], no stamps); more add
+/// [`delta_lane_bytes`] — the other lanes and a stamp a lane.
+///
+/// # Panics
+///
+/// On no lane, by name.
+fn gdn_bytes(
+    v_heads: usize,
+    k_heads: usize,
+    state: usize,
+    conv: usize,
+    lanes: usize,
+) -> (u64, u64) {
+    assert!(lanes >= 1, "gdn_bytes: a state of at least one lane");
+    let copy = recurrent_bytes(v_heads, k_heads, state, conv);
+    let lane_bytes = if lanes > 1 {
+        delta_lane_bytes(v_heads, state, lanes)
+    } else {
+        0
+    };
+    (copy + lane_bytes, copy)
 }
 
 /// The hyper-connection streams of a qwen4exp file (1 without).
@@ -2026,7 +2085,8 @@ impl KvBytes for MtpKv {
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_LANES, Kind, KvBytes, KvLayout, delta_lane_bytes, ple_ring_bytes, recurrent_bytes,
+        DELTA_LANES, Kind, KvBytes, KvLayout, delta_lane_bytes, gdn_bytes, ple_ring_bytes,
+        recurrent_bytes,
     };
 
     /// Qwen3.8's layers by kind (the sizes themselves are
@@ -2091,6 +2151,51 @@ mod tests {
         assert_eq!(
             kv.state_bytes(4097),
             12 * (4097 * 2304 + 1025 * 256) + 2 * checkpoint
+        );
+    }
+
+    /// The lane term ([`gdn_bytes`], the layout's one rule): Qwen3.6's 30 GDN
+    /// layers (32 value heads of 128, 16 key heads, a 4-tap conv) at one
+    /// lane are the state in place with no stamp; at eight each holds seven
+    /// more lanes of 2,097,152 B and a stamp a lane, so 30 layers add 420 MiB
+    /// and 960 B [derived]. A checkpoint copies one lane whatever the count.
+    /// The layer's bytes follow the term, and Qwen3.8's count is the term at
+    /// `DELTA_LANES`.
+    #[test]
+    fn the_lane_count_is_the_layouts_input() {
+        let one = gdn_bytes(32, 16, 128, 4, 1);
+        let eight = gdn_bytes(32, 16, 128, 4, 8);
+        assert_eq!(
+            one,
+            (
+                recurrent_bytes(32, 16, 128, 4),
+                recurrent_bytes(32, 16, 128, 4)
+            )
+        );
+        assert_eq!(one.0, 2_097_152 + 360_448);
+        assert_eq!(eight.1, one.1, "a checkpoint copies one lane");
+        assert_eq!(eight.0 - one.0, 7 * 2_097_152 + 8 * 4);
+        assert_eq!(30 * (eight.0 - one.0), 420 * (1 << 20) + 960);
+        assert_eq!(
+            gdn_bytes(48, 16, 128, 4, DELTA_LANES).0,
+            recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES)
+        );
+        let kinds = vec![Kind::DeltaRule, Kind::Attention];
+        let layout = |lanes| KvLayout {
+            kinds: kinds.clone(),
+            recurrent: gdn_bytes(32, 16, 128, 4, lanes).0,
+            copy: gdn_bytes(32, 16, 128, 4, lanes).1,
+            ple: None,
+            kv_heads: 2,
+            head_dim: 256,
+            select: None,
+            q8: false,
+        };
+        assert_eq!(layout(1).layer_bytes(0, 4096), one.0);
+        assert_eq!(layout(8).layer_bytes(0, 4096), eight.0);
+        assert_eq!(
+            layout(8).layer_bytes(1, 4096),
+            layout(1).layer_bytes(1, 4096)
         );
     }
 
