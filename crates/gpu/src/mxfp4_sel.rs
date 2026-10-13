@@ -14,6 +14,21 @@
 //! equals the route kernel's value for that (slot, token) bit for bit; the
 //! scale byte follows ggml's half rule for every value.
 //!
+//! The slot tiles (`mxfp4_gate_up_tiles`, `mxfp4_gemv_tiles`), the pair's
+//! grouped form for a prompt batch's card slots: over a grouped slot table
+//! (`crate::q4k_sel`'s module doc: the slots by expert, cut into tiles of up to
+//! eight consecutive slots of one expert) a block takes a tile and eight
+//! weight rows, so each file block is read and decoded once for up to eight
+//! slots. Entry `c` of a tile reads the activation column of its own slot —
+//! the gate·up's token column `slot / slots_per_col` of the normed rows' q8_1,
+//! the down's column `slot` of the slots' — and writes row `r` of its own
+//! slot, so nothing is gathered and the rows are the pair's, bit for bit: the
+//! dot of a (row, column) is the pair's [`lane_partial_file`] rule whatever the
+//! tile holds, and the slot-order sum of the leg that reads the rows is
+//! untouched. A slot the table does not hold (a place that is [`HOST`]) is
+//! left as it was, as the pair leaves it. [`Mxfp4SelKernels::enqueue_gate_up_tiles`]
+//! and [`Mxfp4SelKernels::enqueue_down_tiles`] launch them.
+//!
 //! The route-plan kernels, in the order a layer runs them:
 //! - `dflash_quantize_q8_1`: the engine's q8_1 activation rule
 //!   ([`crate::q8_1_quant_block`]) over any number of columns — the down
@@ -50,9 +65,13 @@
 
 use crate::hybrid::HOST;
 use crate::kquant::act::{self, swiglu_clamp};
-use crate::kquant::{GateUpAct, SelDown};
-use crate::mxfp4::{self, Planes, lane_partial_file, lane_partials};
-use crate::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32, q8_1_quant_block};
+use crate::kquant::tiles::{TileTable, tile_grid};
+use crate::kquant::{Act, GateUpAct, SelDown};
+use crate::mxfp4::{self, Planes, lane_partial_file, lane_partials, lane_partials_file_cols};
+use crate::q4k_sel::{TileBlock, TileWork, tile_block};
+use crate::{
+    DeviceTensor, FaultSink, FaultSite, GpuError, Q8Act, col_sums, launch_u32, q8_1_quant_block,
+};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::{U32x4, as_vectors};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
@@ -452,6 +471,292 @@ mod mxfp4_sel_kernels {
     }
 }
 
+/// The q8_1 column each of a tile's `m` entries `j .. j + m` of `order` reads,
+/// `slot / per_col`: the tile's [`TileWork`] resolves its columns through the
+/// table, so the activation stays where its quantizer wrote it. A table entry
+/// past `n_slots` raises [`FaultSite::ExpertId`] on `fault` (lane 0) and the
+/// whole tile is skipped: the same entries, so the same answer, in every lane
+/// of the warp.
+///
+/// # Safety
+///
+/// `j + m <= order.len()`, `1 <= m <= 8`, `per_col >= 1`, and the 32 lanes of
+/// the warp call it with the same arguments.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device helper: the table, the tile, its bounds and the fault sink (rust-quality R8)"
+)]
+#[inline(always)]
+unsafe fn tile_cols(
+    order: &[u32],
+    j: usize,
+    m: usize,
+    n_slots: u32,
+    per_col: u32,
+    fault: FaultSink,
+    lane: usize,
+) -> Option<[u32; 8]> {
+    let mut col = [0u32; 8];
+    let mut bad = false;
+    macro_rules! entry {
+        ($c:literal) => {
+            if m > $c {
+                // SAFETY: j + $c < j + m <= order.len() by this fn's contract.
+                let s = unsafe { *order.get_unchecked(j + $c) };
+                bad |= s >= n_slots;
+                col[$c] = s / per_col;
+            }
+        };
+    }
+    entry!(0);
+    entry!(1);
+    entry!(2);
+    entry!(3);
+    entry!(4);
+    entry!(5);
+    entry!(6);
+    entry!(7);
+    if bad {
+        if lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        return None;
+    }
+    Some(col)
+}
+
+/// Lane 0's stores of a tile's columns: value `v[c]` into row `r` of the slot
+/// `order[j + c]`'s rows of `y`, for each `c < m` — the entries
+/// [`tile_cols`] checked, read again here so no slot stays live through the
+/// dot loops.
+///
+/// # Safety
+///
+/// `j + m <= order.len()`, `1 <= m <= 8`, every `order[j + c]` below `n_slots`
+/// for `c < m` ([`tile_cols`] returned `Some` for the tile), `r < rpe`,
+/// `y.len() >= n_slots · rpe`, and no other thread writes row `r` of those
+/// slots.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device helper: a kernel's output, table, tile and bounds (rust-quality R8)"
+)]
+#[inline(always)]
+unsafe fn store_slots(
+    y: &mut DisjointSlice<f32>,
+    order: &[u32],
+    j: usize,
+    m: usize,
+    rpe: usize,
+    r: usize,
+    v: [f32; 8],
+) {
+    macro_rules! store {
+        ($c:literal) => {
+            if m > $c {
+                // SAFETY: j + $c < j + m <= order.len(); the slot is below
+                // n_slots and r < rpe, so the index is below n_slots · rpe <=
+                // y.len(); this thread is its only writer.
+                unsafe {
+                    let slot = *order.get_unchecked(j + $c) as usize;
+                    *y.get_unchecked_mut(slot * rpe + r) = v[$c];
+                }
+            }
+        };
+    }
+    store!(0);
+    store!(1);
+    store!(2);
+    store!(3);
+    store!(4);
+    store!(5);
+    store!(6);
+    store!(7);
+}
+
+/// A grouped MXFP4 gate·up's work (module doc, [`tile_block`]): warp `w`'s
+/// weight row `r` of the tile's expert in both stacks, dotted with the tile's
+/// token columns ([`tile_cols`], `slot / slots_per_col`) through
+/// [`lane_partials_file_cols`] and reduced with the warp tree; lane 0 stores
+/// `h[slot · rows_per_expert + r] = act::apply(act, limit, g, u)` for each
+/// entry's slot. Its launch contract: both stacks hold `n_experts ·
+/// rows_per_expert` rows of `34 · n_sb` words, `q` and `d8` hold `m_cols`
+/// columns with `n_slots <= m_cols · slots_per_col`, `order.len() >= n_slots`,
+/// `h.len() >= n_slots · rows_per_expert`; `iters = ceil(n_sb / 4)`.
+struct MxGateUpTiles<'a> {
+    wg: &'a [u32],
+    wu: &'a [u32],
+    q: &'a [u32],
+    d8: &'a [f32],
+    order: &'a [u32],
+    rows_per_expert: u32,
+    n_slots: u32,
+    slots_per_col: u32,
+    n_sb: u32,
+    iters: u32,
+    act: u32,
+    limit: f32,
+    fault: FaultSink,
+    h: DisjointSlice<'a, f32>,
+}
+
+impl TileWork for MxGateUpTiles<'_> {
+    #[inline(always)]
+    unsafe fn run(&mut self, t: TileBlock) {
+        let TileBlock { e, j, m, r, lane } = t;
+        let rpe = self.rows_per_expert as usize;
+        // SAFETY: j + m <= n_slots <= order.len() and 1 <= m <= 8 (the tile
+        // is `tile_at`'s), slots_per_col >= 1 by the launch contract, the
+        // warp's lanes share the tile.
+        let tile = unsafe {
+            tile_cols(
+                self.order,
+                j,
+                m,
+                self.n_slots,
+                self.slots_per_col,
+                self.fault,
+                lane,
+            )
+        };
+        let Some(col) = tile else {
+            return;
+        };
+        let n_sb = self.n_sb as usize;
+        let (q_col, d_col) = (256 * self.iters, 2 * self.n_sb);
+        let row_abs = e * rpe + r;
+        // SAFETY: row_abs < n_experts · rpe rows of both stacks (e <
+        // n_experts, r < rpe); each column is slot / slots_per_col <
+        // m_cols (slot < n_slots <= m_cols · slots_per_col), and the host
+        // keeps m_cols · 256 · iters below 2^32; 1 <= m <= 8 block-uniform;
+        // iters = ceil(n_sb/4) so q and d8 hold each column's words; the
+        // warp's 32 lanes are here: this fn's contract and the work's. The
+        // gate's sums are reduced before the up's loop starts, so only its
+        // eight values stay live through it.
+        let g = col_sums(
+            unsafe {
+                lane_partials_file_cols(
+                    self.wg,
+                    row_abs,
+                    8 * n_sb,
+                    self.q,
+                    self.d8,
+                    col,
+                    q_col,
+                    d_col,
+                    m,
+                    lane,
+                )
+            },
+            m,
+        );
+        let u = col_sums(
+            unsafe {
+                lane_partials_file_cols(
+                    self.wu,
+                    row_abs,
+                    8 * n_sb,
+                    self.q,
+                    self.d8,
+                    col,
+                    q_col,
+                    d_col,
+                    m,
+                    lane,
+                )
+            },
+            m,
+        );
+        if lane == 0 {
+            let (rule, limit) = (self.act, self.limit);
+            let mut v = [0.0f32; 8];
+            macro_rules! apply {
+                ($c:literal) => {
+                    if m > $c {
+                        v[$c] = act::apply(rule, limit, g[$c], u[$c]);
+                    }
+                };
+            }
+            apply!(0);
+            apply!(1);
+            apply!(2);
+            apply!(3);
+            apply!(4);
+            apply!(5);
+            apply!(6);
+            apply!(7);
+            // SAFETY: the tile's entries are below n_slots ([`tile_cols`]
+            // returned Some), r < rpe, h.len() >= n_slots · rpe; a slot sits
+            // in one table entry, so lane 0 of this row's warp is the only
+            // writer of its row r.
+            unsafe { store_slots(&mut self.h, self.order, j, m, rpe, r, v) };
+        }
+    }
+}
+
+/// A grouped MXFP4 down's work (module doc, [`tile_block`]): warp `w`'s weight
+/// row `r` of the tile's expert, dotted with the tile's columns — column
+/// `slot` of the slots' q8_1 ([`tile_cols`]) — through
+/// [`lane_partials_file_cols`] and reduced with the warp tree; lane 0 stores
+/// `y[slot · rows_per_expert + r]` for each entry's slot. Its launch contract:
+/// `w` holds `n_experts · rows_per_expert` rows of `34 · n_sb` words, `q` and
+/// `d8` hold `n_slots` columns, `order.len() >= n_slots`, `y.len() >= n_slots
+/// · rows_per_expert`; `iters = ceil(n_sb / 4)`.
+struct MxGemvTiles<'a> {
+    w: &'a [u32],
+    q: &'a [u32],
+    d8: &'a [f32],
+    order: &'a [u32],
+    rows_per_expert: u32,
+    n_slots: u32,
+    n_sb: u32,
+    iters: u32,
+    fault: FaultSink,
+    y: DisjointSlice<'a, f32>,
+}
+
+impl TileWork for MxGemvTiles<'_> {
+    #[inline(always)]
+    unsafe fn run(&mut self, t: TileBlock) {
+        let TileBlock { e, j, m, r, lane } = t;
+        let rpe = self.rows_per_expert as usize;
+        // SAFETY: j + m <= n_slots <= order.len() and 1 <= m <= 8 (the tile
+        // is `tile_at`'s), the per-column divisor is 1, the warp's lanes share
+        // the tile.
+        let tile = unsafe { tile_cols(self.order, j, m, self.n_slots, 1, self.fault, lane) };
+        let Some(col) = tile else {
+            return;
+        };
+        let n_sb = self.n_sb as usize;
+        // SAFETY: row e·rpe + r < n_experts·rpe rows of `w` (e < n_experts,
+        // r < rpe); each column is its slot < n_slots of the planes, and the
+        // host keeps n_slots · 256 · iters below 2^32; 1 <= m <= 8
+        // block-uniform; iters = ceil(n_sb/4); the warp's 32 lanes are here:
+        // this fn's contract and the work's.
+        let f = unsafe {
+            lane_partials_file_cols(
+                self.w,
+                e * rpe + r,
+                8 * n_sb,
+                self.q,
+                self.d8,
+                col,
+                256 * self.iters,
+                2 * self.n_sb,
+                m,
+                lane,
+            )
+        };
+        let v = col_sums(f, m);
+        if lane == 0 {
+            // SAFETY: the tile's entries are below n_slots ([`tile_cols`]
+            // returned Some), r < rpe, y.len() >= n_slots · rpe; a slot sits
+            // in one table entry, so lane 0 of this row's warp is the only
+            // writer of its row r.
+            unsafe { store_slots(&mut self.y, self.order, j, m, rpe, r, v) };
+        }
+    }
+}
+
 #[cuda_module]
 mod mxfp4_pair_kernels {
     use super::*;
@@ -615,6 +920,158 @@ mod mxfp4_pair_kernels {
             // SAFETY: row < n_slots · rows_per_expert <= y.len() by the
             // launch contract; only lane 0 of the warp writes y[row].
             unsafe { *y.get_unchecked_mut(row) = s };
+        }
+    }
+
+    /// The MXFP4 gate·up of a grouped slot table's slots by tile items
+    /// ([`MxGateUpTiles`]): block `g + tile_cap · ρ` (of `tile_cap ·
+    /// row_tiles`, [`crate::q4k_sel::tile_cap`] of the table) is tile `g` of
+    /// the table `tiles` ([`crate::q4k_sel::grouped_tiles`], [`tile_block`]) on
+    /// the eight weight rows `8ρ ..` of both stacks, its entries' slots read
+    /// from `order`: entry `c` dots the rows with column `slot / slots_per_col`
+    /// of the q8_1 planes and writes `h[slot · rows_per_expert + r] =
+    /// act::apply(act, limit, g, u)`, [`mxfp4_gate_up_sel`]'s value for that
+    /// slot bit for bit; each file block is read once for up to eight slots. A
+    /// block past the table's count returns; a tile word [`crate::q4k_sel::
+    /// tile_at`] refuses and an entry that names no slot raise
+    /// [`FaultSite::ExpertId`] on `fault`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            wg.len() >= n_experts * rows_per_expert * 34 * n_sb,
+            wu.len() >= n_experts * rows_per_expert * 34 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * iters,
+            d8.len() >= m_cols * 2 * n_sb,
+            order.len() >= n_slots,
+            start.len() >= n_experts + 1,
+            tiles.len() >= tile_cap + 1,
+            tile_cap >= 1,
+            h.len() >= n_slots * rows_per_expert,
+            rows_per_expert >= 8 * row_tiles
+        )
+    )]
+    pub fn mxfp4_gate_up_tiles(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        order: &[u32],
+        start: &[u32],
+        tiles: &[u32],
+        tile_cap: u32,
+        row_tiles: u32,
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        h: DisjointSlice<f32>,
+    ) {
+        let _ = m_cols;
+        let mut work = MxGateUpTiles {
+            wg,
+            wu,
+            q,
+            d8,
+            order,
+            rows_per_expert,
+            n_slots,
+            slots_per_col,
+            n_sb,
+            iters,
+            act,
+            limit,
+            fault,
+            h,
+        };
+        // SAFETY: the launch contract is the work's (34 = SB_WORDS) and
+        // `tile_block`'s; the host passes iters = ceil(n_sb/4).
+        unsafe {
+            tile_block(
+                tiles, start, n_experts, n_slots, tile_cap, row_tiles, fault, &mut work,
+            );
+        }
+    }
+
+    /// The MXFP4 down of a grouped slot table's slots by tile items
+    /// ([`MxGemvTiles`]): block `g + tile_cap · ρ` is tile `g` of the table
+    /// `tiles` on the eight weight rows `8ρ ..`, entry `c` dotting them with
+    /// column `slot` of the q8_1 planes (the slots' own activation, as
+    /// [`mxfp4_gemv_sel`] reads it) and writing `y[slot · rows_per_expert +
+    /// r]`, [`mxfp4_gemv_sel`]'s value for that slot bit for bit; each file
+    /// block is read once for up to eight slots. A block past the table's
+    /// count returns; a tile word [`crate::q4k_sel::tile_at`] refuses and an
+    /// entry that names no slot raise [`FaultSite::ExpertId`] on `fault`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows_per_expert * 34 * n_sb,
+            q.len() >= n_slots * 256 * iters,
+            d8.len() >= n_slots * 2 * n_sb,
+            order.len() >= n_slots,
+            start.len() >= n_experts + 1,
+            tiles.len() >= tile_cap + 1,
+            tile_cap >= 1,
+            y.len() >= n_slots * rows_per_expert,
+            rows_per_expert >= 8 * row_tiles
+        )
+    )]
+    pub fn mxfp4_gemv_tiles(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        order: &[u32],
+        start: &[u32],
+        tiles: &[u32],
+        tile_cap: u32,
+        row_tiles: u32,
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        let mut work = MxGemvTiles {
+            w,
+            q,
+            d8,
+            order,
+            rows_per_expert,
+            n_slots,
+            n_sb,
+            iters,
+            fault,
+            y,
+        };
+        // SAFETY: the launch contract is the work's (34 = SB_WORDS) and
+        // `tile_block`'s; the host passes iters = ceil(n_sb/4).
+        unsafe {
+            tile_block(
+                tiles, start, n_experts, n_slots, tile_cap, row_tiles, fault, &mut work,
+            );
         }
     }
 }
@@ -955,6 +1412,34 @@ impl MxExpertKernels {
     }
 }
 
+/// What [`Mxfp4SelKernels::enqueue_gate_up_tiles`] reads: both stacks of the
+/// table's `n_experts` experts of `rows_per_expert` rows (the file's blocks, as
+/// [`Mxfp4SelKernels::enqueue_gate_up`] reads them), the block's q8_1
+/// activation by token (`slots_per_col` slots a token: slot `s` reads column
+/// `s / slots_per_col`) and the grouped slot table of the block's `n_slots`
+/// slots; `rule` the activation. A slot's row `h` is written where the
+/// per-slot gate·up writes it.
+pub struct SlotTilesGateUp<'a> {
+    pub wg: &'a DeviceTensor<u32>,
+    pub wu: &'a DeviceTensor<u32>,
+    pub act: &'a Q8Act,
+    pub table: TileTable<'a>,
+    pub rows_per_expert: usize,
+    pub slots_per_col: usize,
+    pub rule: Act,
+}
+
+/// What [`Mxfp4SelKernels::enqueue_down_tiles`] reads: the down stack of the
+/// table's `n_experts` experts of `rows_per_expert` rows, the slots' q8_1
+/// activation (column `s` the activation of slot `s`, as
+/// [`Mxfp4SelKernels::enqueue_down`] reads it) and the grouped slot table.
+pub struct SlotTilesDown<'a> {
+    pub w: &'a DeviceTensor<u32>,
+    pub act: &'a Q8Act,
+    pub table: TileTable<'a>,
+    pub rows_per_expert: usize,
+}
+
 /// The loaded MXFP4 per-slot pair and its launchers. Owns no stream: every
 /// enqueue takes the engine stream, so launches order with the step and are
 /// capturable.
@@ -1133,6 +1618,148 @@ impl Mxfp4SelKernels {
             launch_u32(what, "n_experts", n_experts)?,
             launch_u32(what, "rows_per_expert", rpe)?,
             launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "iters", n_sb.div_ceil(4))?,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`mxfp4_gate_up_tiles`]: the gate·up of the table's slots
+    /// (one run per expert of the stacks, `a.wg.rows() / rows_per_expert` of
+    /// them) by its tiles ([`crate::kquant::TileTables::enqueue`] of the same
+    /// table): slot `s` writes `h[s · rows_per_expert ..][..rows_per_expert]`
+    /// as `a.rule` over the rows of its expert dotted with column `s /
+    /// slots_per_col` of `a.act` — [`Mxfp4SelKernels::enqueue_gate_up`]'s value
+    /// for it. A slot the table does not hold keeps its rows. A tile word that
+    /// names no run and an entry that names no slot raise
+    /// [`FaultSite::ExpertId`] on `fault`. The tile count is the table's, a
+    /// device value: the grid is sized for [`crate::q4k_sel::tile_cap`] of them
+    /// and a block past the count returns. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_gate_up_tiles(
+        &self,
+        stream: &CudaStream,
+        a: &SlotTilesGateUp<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Mxfp4SelKernels::enqueue_gate_up_tiles";
+        let n_sb = a.act.n_sb();
+        if a.wu.rows() != a.wg.rows() || a.wu.cols() != a.wg.cols() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the up stack {} x {} must be the gate stack's {} x {}",
+                    a.wu.rows(),
+                    a.wu.cols(),
+                    a.wg.rows(),
+                    a.wg.cols()
+                ),
+            ));
+        }
+        let gr = tile_grid(what, SB_WORDS, a.wg, n_sb, a.rows_per_expert, &a.table)?;
+        let (n_slots, rpe, spc, m) = (
+            a.table.n_slots,
+            a.rows_per_expert,
+            a.slots_per_col,
+            a.act.m(),
+        );
+        if spc == 0 || n_slots > m * spc || h.len() < n_slots * rpe {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_slots} slots at {spc} a column (at least one) over {m} columns, h.len() \
+                     {} >= n_slots*rows_per_expert = {}",
+                    h.len(),
+                    n_slots * rpe
+                ),
+            ));
+        }
+        // The kernel's column offsets are 32-bit.
+        launch_u32(what, "activation words", m * 256 * n_sb.div_ceil(4))?;
+        let prep = self
+            .module
+            .prepare_mxfp4_gate_up_tiles(LaunchConfig1D::new(gr.blocks, BLOCK, 0))?;
+        let (act, limit) = a.rule.code();
+        self.module.mxfp4_gate_up_tiles(
+            stream,
+            &prep,
+            a.wg.buf(),
+            a.wu.buf(),
+            &a.act.q4,
+            &a.act.d8,
+            a.table.order,
+            a.table.start,
+            a.table.tiles,
+            gr.tile_cap,
+            gr.row_tiles,
+            gr.n_experts,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            gr.n_slots,
+            launch_u32(what, "m_cols", m)?,
+            launch_u32(what, "slots_per_col", spc)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "iters", n_sb.div_ceil(4))?,
+            act,
+            limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`mxfp4_gemv_tiles`]: the down of the table's slots by its tiles
+    /// ([`crate::kquant::TileTables::enqueue`] of the same table): slot `s`
+    /// writes `y[s · rows_per_expert ..][..rows_per_expert]` as the rows of its
+    /// expert dotted with column `s` of `a.act` —
+    /// [`Mxfp4SelKernels::enqueue_down`]'s value for it. A slot the table does
+    /// not hold keeps its rows. Refusals and the grid as
+    /// [`Mxfp4SelKernels::enqueue_gate_up_tiles`]. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_down_tiles(
+        &self,
+        stream: &CudaStream,
+        a: &SlotTilesDown<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Mxfp4SelKernels::enqueue_down_tiles";
+        let n_sb = a.act.n_sb();
+        let gr = tile_grid(what, SB_WORDS, a.w, n_sb, a.rows_per_expert, &a.table)?;
+        let (n_slots, rpe) = (a.table.n_slots, a.rows_per_expert);
+        if n_slots > a.act.m() || y.len() < n_slots * rpe {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_slots} slots over {} activation columns (a column a slot), y.len() {} >= \
+                     n_slots*rows_per_expert = {}",
+                    a.act.m(),
+                    y.len(),
+                    n_slots * rpe
+                ),
+            ));
+        }
+        // The kernel's column offsets are 32-bit.
+        launch_u32(what, "activation words", n_slots * 256 * n_sb.div_ceil(4))?;
+        let prep = self
+            .module
+            .prepare_mxfp4_gemv_tiles(LaunchConfig1D::new(gr.blocks, BLOCK, 0))?;
+        self.module.mxfp4_gemv_tiles(
+            stream,
+            &prep,
+            a.w.buf(),
+            &a.act.q4,
+            &a.act.d8,
+            a.table.order,
+            a.table.start,
+            a.table.tiles,
+            gr.tile_cap,
+            gr.row_tiles,
+            gr.n_experts,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            gr.n_slots,
             launch_u32(what, "n_sb", n_sb)?,
             launch_u32(what, "iters", n_sb.div_ceil(4))?,
             fault,

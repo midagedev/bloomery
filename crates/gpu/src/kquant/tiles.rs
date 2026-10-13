@@ -690,47 +690,43 @@ pub struct TiledDown<'a> {
     pub rows_per_expert: usize,
 }
 
-/// The tile path's scratch for blocks of up to `slots` slots through experts
-/// of `ff` rows, but the planes its format's gather writes: the grouped slot
-/// table — the slots by expert (`order`, runs `start` of up to
-/// [`BUCKET_EXPERTS`] experts) and its tiles — the gate·up rows by entry
-/// (`h`, `ff` an entry) and their q8_1 form (`act_h`), column `j` slot
-/// `order[j]`'s. Every model's tile path holds one beside the planes its
-/// gate·up reads; a block runs [`TileScratch::enqueue_table`], its format's
-/// gather and gate·up into [`TileScratch::table_and_h`],
-/// [`TileScratch::enqueue_quantize_h`] and its format's down over
-/// [`TileScratch::down`].
-pub struct TileScratch {
+/// The grouped slot table's buffers for blocks of up to `slots` slots: the
+/// slots by expert (`order`, runs `start` of up to [`BUCKET_EXPERTS`]
+/// experts) and their tiles. Every tile path holds one: [`TileScratch`]'s
+/// family paths beside the planes their gather writes, and the common card
+/// leg's slot tiles (`CardLeg::enqueue_tiled`) beside the leg's own buffers.
+/// A block runs [`TileTables::enqueue`], then reads [`TileTables::table`].
+pub struct TileTables {
     order: DeviceBuffer<u32>,
     start: DeviceBuffer<u32>,
     tiles: DeviceBuffer<u32>,
-    h: DeviceBuffer<f32>,
-    act_h: Q8Act,
     slots: usize,
 }
 
-impl TileScratch {
-    /// The scratch for blocks of up to `slots` slots through experts of `ff`
-    /// rows, on `stream`'s card. Load-time only.
-    pub fn new(stream: &CudaStream, slots: usize, ff: usize) -> Result<TileScratch, GpuError> {
-        Ok(TileScratch {
+/// Device bytes of a [`TileTables`] of `slots` slots, counted before it is
+/// made: a word a slot of `order`, `BUCKET_EXPERTS + 1` of `start`, and
+/// [`tile_cap`]`(slots, BUCKET_EXPERTS) + 1` of the tile table.
+#[must_use]
+pub const fn tile_tables_bytes(slots: usize) -> usize {
+    size_of::<u32>() * (slots + BUCKET_EXPERTS + 1 + tile_cap(slots, BUCKET_EXPERTS) + 1)
+}
+
+impl TileTables {
+    /// The tables for blocks of up to `slots` slots, on `stream`'s card.
+    /// Load-time only.
+    pub fn new(stream: &CudaStream, slots: usize) -> Result<TileTables, GpuError> {
+        Ok(TileTables {
             order: DeviceBuffer::zeroed(stream, slots)?,
             start: DeviceBuffer::zeroed(stream, BUCKET_EXPERTS + 1)?,
             tiles: DeviceBuffer::zeroed(stream, tile_cap(slots, BUCKET_EXPERTS) + 1)?,
-            h: DeviceBuffer::zeroed(stream, slots * ff)?,
-            act_h: Q8Act::with_slots(stream, slots, ff)?,
             slots,
         })
     }
 
-    /// Device bytes of the scratch.
+    /// Device bytes of the tables: [`tile_tables_bytes`] of their slots.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
-        self.order.num_bytes()
-            + self.start.num_bytes()
-            + self.tiles.num_bytes()
-            + self.h.num_bytes()
-            + self.act_h.device_bytes()
+        self.order.num_bytes() + self.start.num_bytes() + self.tiles.num_bytes()
     }
 
     /// Slots a block takes at most.
@@ -743,10 +739,10 @@ impl TileScratch {
     /// of the `n_experts` card experts, or [`crate::hybrid::HOST`]) grouped
     /// by expert ([`crate::q4k_sel::Q4kSelKernels::enqueue_buckets`]), then
     /// its tiles ([`crate::q4k_sel::Q4kSelKernels::enqueue_grouped_tiles`]).
-    /// A block of no slot or of more than the scratch takes is refused by
+    /// A block of no slot or of more than the tables take is refused by
     /// name, as the two launchers refuse what they do not take. Two launches.
     /// Asynchronous, allocation-free.
-    pub fn enqueue_table(
+    pub fn enqueue(
         &mut self,
         gpu: &Gpu,
         sel: &DeviceBuffer<u32>,
@@ -756,9 +752,9 @@ impl TileScratch {
     ) -> Result<(), GpuError> {
         if n_slots == 0 || n_slots > self.slots {
             return Err(GpuError::shape(
-                "TileScratch::enqueue_table",
+                "TileTables::enqueue",
                 format!(
-                    "a block of {n_slots} slots; the scratch takes 1..={}",
+                    "a block of {n_slots} slots; the tables take 1..={}",
                     self.slots
                 ),
             ));
@@ -784,7 +780,7 @@ impl TileScratch {
     }
 
     /// The table of `n_slots` slots over `n_experts` experts, as the last
-    /// [`TileScratch::enqueue_table`] of those counts wrote it.
+    /// [`TileTables::enqueue`] of those counts wrote it.
     #[must_use]
     pub fn table(&self, n_slots: usize, n_experts: usize) -> TileTable<'_> {
         TileTable {
@@ -795,6 +791,64 @@ impl TileScratch {
             n_slots,
         }
     }
+}
+
+/// The tile path's scratch for blocks of up to `slots` slots through experts
+/// of `ff` rows, but the planes its format's gather writes: the grouped slot
+/// table ([`TileTables`]), the gate·up rows by entry (`h`, `ff` an entry) and
+/// their q8_1 form (`act_h`), column `j` slot `order[j]`'s. Every model's
+/// tile path holds one beside the planes its gate·up reads; a block runs
+/// [`TileScratch::enqueue_table`], its format's gather and gate·up into
+/// [`TileScratch::table_and_h`], [`TileScratch::enqueue_quantize_h`] and its
+/// format's down over [`TileScratch::down`].
+pub struct TileScratch {
+    tables: TileTables,
+    h: DeviceBuffer<f32>,
+    act_h: Q8Act,
+}
+
+impl TileScratch {
+    /// The scratch for blocks of up to `slots` slots through experts of `ff`
+    /// rows, on `stream`'s card. Load-time only.
+    pub fn new(stream: &CudaStream, slots: usize, ff: usize) -> Result<TileScratch, GpuError> {
+        Ok(TileScratch {
+            tables: TileTables::new(stream, slots)?,
+            h: DeviceBuffer::zeroed(stream, slots * ff)?,
+            act_h: Q8Act::with_slots(stream, slots, ff)?,
+        })
+    }
+
+    /// Device bytes of the scratch.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.tables.device_bytes() + self.h.num_bytes() + self.act_h.device_bytes()
+    }
+
+    /// Slots a block takes at most.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.tables.slots()
+    }
+
+    /// Enqueue a block's table ([`TileTables::enqueue`]). Two launches.
+    /// Asynchronous, allocation-free.
+    pub fn enqueue_table(
+        &mut self,
+        gpu: &Gpu,
+        sel: &DeviceBuffer<u32>,
+        n_slots: usize,
+        n_experts: usize,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        self.tables.enqueue(gpu, sel, n_slots, n_experts, fault)
+    }
+
+    /// The table of `n_slots` slots over `n_experts` experts, as the last
+    /// [`TileScratch::enqueue_table`] of those counts wrote it.
+    #[must_use]
+    pub fn table(&self, n_slots: usize, n_experts: usize) -> TileTable<'_> {
+        self.tables.table(n_slots, n_experts)
+    }
 
     /// [`TileScratch::table`] and the gate·up rows by entry, for the
     /// format's gate·up to write.
@@ -803,14 +857,7 @@ impl TileScratch {
         n_slots: usize,
         n_experts: usize,
     ) -> (TileTable<'_>, &mut DeviceBuffer<f32>) {
-        let table = TileTable {
-            order: &self.order,
-            start: &self.start,
-            tiles: &self.tiles,
-            n_experts,
-            n_slots,
-        };
-        (table, &mut self.h)
+        (self.tables.table(n_slots, n_experts), &mut self.h)
     }
 
     /// Enqueue the q8_1 form of the gate·up rows of the table's entries
@@ -826,7 +873,7 @@ impl TileScratch {
         gpu.q4k_sel().enqueue_quantize_ord(
             gpu.stream(),
             &self.h,
-            &self.start,
+            &self.tables.start,
             n_experts,
             n_slots,
             fault,
@@ -878,7 +925,7 @@ pub(crate) struct TileGrid {
 /// `table` checked for a stack `w` of `words · n_sb`-word rows in experts of
 /// `rows_per_expert` rows (a multiple of eight), one expert a run of the
 /// table, or the shape error naming `what`.
-fn tile_grid(
+pub(crate) fn tile_grid(
     what: &'static str,
     words: usize,
     w: &DeviceTensor<u32>,

@@ -212,7 +212,9 @@ generate_ds41   mimo2_router_scores                      0           0
 generate_ds41   moe_combine                              0           0
 generate_ds41   mtp_input                                0           0
 generate_ds41   mxfp4_gate_up_sel                        0           0
+generate_ds41   mxfp4_gate_up_tiles                      0           0
 generate_ds41   mxfp4_gemv_sel                           0           0
+generate_ds41   mxfp4_gemv_tiles                         0           0
 generate_ds41   neox_append_k192                         0           0
 generate_ds41   norm_quant                               0           0
 generate_ds41   ple_conv                                 0           0
@@ -446,7 +448,9 @@ gate_e2e   latent_rms_append                        0           0
 gate_e2e   moe_combine                              0           0
 gate_e2e   mtp_input                                0           0
 gate_e2e   mxfp4_gate_up_sel                        0           0
+gate_e2e   mxfp4_gate_up_tiles                      0           0
 gate_e2e   mxfp4_gemv_sel                           0           0
+gate_e2e   mxfp4_gemv_tiles                         0           0
 gate_e2e   neox_append_k192                         0           0
 gate_e2e   norm_quant                               0           0
 gate_e2e   ple_conv                                 0           0

@@ -58,6 +58,9 @@
 //! - The grouped tile entries (`crates/gpu/src/kquant/tiles.rs`, and
 //!   `grouped_tiles` and `q4k_gemv_tiles` in `crates/gpu/src/q4k_sel.rs`) run
 //!   the Q4_K and Q5_K stacks the `_sel` rows already name and add no type.
+//! - The common leg's slot tiles ([`card_tiles`]: `mxfp4_gate_up_tiles` and
+//!   `mxfp4_gemv_tiles` in `crates/gpu/src/mxfp4_sel.rs`) run the MXFP4 stacks
+//!   the `_sel` rows already name, over a grouped slot table, and add no type.
 //!
 //! BF16 and a dense site. A BF16 file tensor loads on a card as f32 values
 //! decoded at load ([`crate::placement::CardFormat::Bf16AsF32`],
@@ -515,6 +518,32 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
     )
 }
 
+/// Whether the common card leg's slot tiles (`CardLeg::enqueue_tiled`) run the
+/// gate·up of a routed gate or up stack of type `ty`: the [`gate_up`] row
+/// whose slot-tile entry is `Mxfp4SelKernels::enqueue_gate_up_tiles`
+/// (`mxfp4_gate_up_tiles`) in `crates/gpu/src/mxfp4_sel.rs`.
+#[must_use]
+pub const fn card_gate_up_tiles(ty: GgmlType) -> bool {
+    matches!(gate_up(ty), Some(GateUpEntry::Mxfp4))
+}
+
+/// Whether the leg's slot tiles run the down of a routed down stack of type
+/// `ty`: the [`down`] row whose slot-tile entry is
+/// `Mxfp4SelKernels::enqueue_down_tiles` (`mxfp4_gemv_tiles`).
+#[must_use]
+pub const fn card_down_tiles(ty: GgmlType) -> bool {
+    matches!(down(ty), Some((DownEntry::Mxfp4, DownAct::Q8Act)))
+}
+
+/// Whether a layer of gate·up type `gate` and down type `down` runs a prompt
+/// batch on the leg's slot tiles: both roles have a tile entry
+/// ([`card_gate_up_tiles`], [`card_down_tiles`]). A layer of any other
+/// [`card_runs`] pair runs its batch on the per-slot entries.
+#[must_use]
+pub const fn card_tiles(gate: GgmlType, down: GgmlType) -> bool {
+    card_gate_up_tiles(gate) && card_down_tiles(down)
+}
+
 /// Whether the common card leg runs a routed stack of `ty` in any of the three
 /// roles: the gate·up and the down rows both have launches the leg runs
 /// ([`card_gate_up_runs`], [`card_down_runs`]). A plan reads a stack's type
@@ -840,6 +869,34 @@ mod tests {
         assert!(gate_up(GgmlType::Q8_0).is_some() && !card_gate_up_runs(GgmlType::Q8_0));
         for ty in [GgmlType::Q6_K, GgmlType::Q5_0] {
             assert!(down(ty).is_some() && !card_down_runs(ty), "{ty:?}");
+        }
+    }
+
+    /// The slot tiles run exactly the MXFP4 pair, and every type they run is a
+    /// type the leg runs in that role.
+    #[test]
+    fn the_slot_tiles_admit_exactly_the_mxfp4_pair() {
+        let gate_up: Vec<GgmlType> = ALL
+            .into_iter()
+            .filter(|&ty| card_gate_up_tiles(ty))
+            .collect();
+        let down: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_down_tiles(ty)).collect();
+        assert_eq!(gate_up, [GgmlType::MXFP4]);
+        assert_eq!(down, [GgmlType::MXFP4]);
+        for ty in gate_up {
+            assert!(card_gate_up_runs(ty), "{ty:?}");
+        }
+        for ty in down {
+            assert!(card_down_runs(ty), "{ty:?}");
+        }
+        for gate in ALL {
+            for dn in ALL {
+                assert_eq!(
+                    card_tiles(gate, dn),
+                    gate == GgmlType::MXFP4 && dn == GgmlType::MXFP4,
+                    "{gate:?} / {dn:?}"
+                );
+            }
         }
     }
 

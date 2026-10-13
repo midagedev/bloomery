@@ -202,7 +202,12 @@ gguf 9 2 0
 # over a value becomes a block for each load and each store (the first pass's residual load, y load and residual store,
 # the second pass's residual load, gamma load and output store), each with its SAFETY line, and the two entries' copies
 # of the body become one call each (#45, merged onto the tree's 1731).
-gpu 1733 193 10
+# PIN(2026-10-13): gpu 1733 -> 1745 blocks, 193 -> 198 fns, new kernel entries, not old code relaxed: the MXFP4 slot
+# tiles (mxfp4_gate_up_tiles, mxfp4_gemv_tiles) add five unsafe fns, each with its SAFETY contract: the m-column core
+# lane_partials_file_cols, the entry check tile_cols, the stores store_slots and the two TileWork::run bodies; and twelve
+# blocks, each with its SAFETY line: the core's loads (1), tile_cols' and store_slots' reads (2), the gate·up run's
+# call of each (tile_cols, two cores, store_slots: 4), the down run's (3), and each entry's tile_block call (2).
+gpu 1745 198 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

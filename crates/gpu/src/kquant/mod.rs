@@ -34,6 +34,7 @@ pub use q5k::Q5k;
 pub use q8_0::Q8_0;
 pub use sel::{GateUpAct, KquantKernels, SelDown, walk_a_planes};
 pub use tiles::{
-    EntryPlanes, KquantTileKernels, TileGather, TileScratch, TileTable, TiledDown, TiledGateUpAct,
+    EntryPlanes, KquantTileKernels, TileGather, TileScratch, TileTable, TileTables, TiledDown,
+    TiledGateUpAct, tile_tables_bytes,
 };
 pub use walk::{Q4k, SbDecode};

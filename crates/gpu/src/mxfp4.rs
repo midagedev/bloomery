@@ -332,6 +332,86 @@ pub unsafe fn lane_partials<const M: usize>(
     f
 }
 
+/// Lane `lane`'s partial sums of one file-layout row against `m` q8_1 columns
+/// of a stream of columns, the module doc's rule: each block is read through
+/// [`file_block`] and decoded once and dotted with columns `cols[0] .. cols[m]`,
+/// column `c` of the stream at `cols[c] · q_col` words of `q` and `cols[c] ·
+/// d_col` scales of `d8`. Column `c`'s value is [`lane_partial_file`]'s for that
+/// column bit for bit; columns `m..8` stay 0.0. `m` is warp-uniform. The column
+/// offsets are 32-bit, so each stays in a register across the block loop.
+///
+/// The caller keeps `1 <= m <= 8`, `n_blk` a multiple of 4 below 2^32, `w`
+/// holding the stream through the last block of row `row` ([`file_block`]'s
+/// boundary), and for every `c < m`: `cols[c] · q_col + 256 · ceil(n_blk / 32)
+/// <= q.len()` and `cols[c] · d_col + n_blk / 4 <= d8.len()`, both below 2^32
+/// (no offset wraps); `lane < 32` (rust-quality R28).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) unsafe fn lane_partials_file_cols(
+    w: &[u32],
+    row: usize,
+    n_blk: usize,
+    q: &[u32],
+    d8: &[f32],
+    cols: [u32; 8],
+    q_col: u32,
+    d_col: u32,
+    m: usize,
+    lane: usize,
+) -> [f32; 8] {
+    let mut f = [0.0f32; 8];
+    let g0 = row * n_blk;
+    let n = n_blk as u32;
+    let mut b = lane as u32;
+    while b < n {
+        // b < n_blk, so block g0 + b is inside the row, inside `w` by this
+        // fn's contract.
+        let (dw, qs) = file_block(w, g0 + b as usize);
+        let dec = decode_block(qs);
+        let slot = 256 * (b >> 5) + (b & 31);
+        macro_rules! col {
+            ($c:literal) => {
+                if m > $c {
+                    let qb = (cols[$c] * q_col + slot) as usize;
+                    // SAFETY: slot + 224 < 256·ceil(n_blk/32) for b < n_blk,
+                    // so the eight words qb + 32i are inside column cols[$c],
+                    // and scale cols[$c]·d_col + b/4 inside its scales, both
+                    // by this fn's contract.
+                    let (x, dx) = unsafe {
+                        (
+                            [
+                                *q.get_unchecked(qb),
+                                *q.get_unchecked(qb + 32),
+                                *q.get_unchecked(qb + 64),
+                                *q.get_unchecked(qb + 96),
+                                *q.get_unchecked(qb + 128),
+                                *q.get_unchecked(qb + 160),
+                                *q.get_unchecked(qb + 192),
+                                *q.get_unchecked(qb + 224),
+                            ],
+                            *d8.get_unchecked((cols[$c] * d_col + (b >> 2)) as usize),
+                        )
+                    };
+                    f[$c] = block_fma(&dec, &x, dw, dx, f[$c]);
+                }
+            };
+        }
+        col!(0);
+        col!(1);
+        col!(2);
+        col!(3);
+        col!(4);
+        col!(5);
+        col!(6);
+        col!(7);
+        b += 32;
+    }
+    f
+}
+
 // ------------------------------------------------------------------ host
 
 /// The rule's block sum on the host: the 32 codes of a file block

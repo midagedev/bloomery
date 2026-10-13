@@ -19,6 +19,17 @@
 //! (`CardSlotKernels::enqueue_places`). Each slot's rows are what the step's
 //! launches write for it, whatever `m`, so the two feeds leave the same bits.
 //!
+//! A prompt batch of a layer whose stacks have slot-tile entries
+//! ([`bloomery_gpu::card_leg::LegStacks::tiles_run`]: MXFP4) runs the leg's
+//! tile form instead (`CardLeg::enqueue_tiled`): the batch's slots grouped by
+//! expert on the card, the gate·up and the down over tiles of up to eight
+//! slots of one expert, seven launches with the sum and eight with the add
+//! where the per-slot form has six. The step and a pass of several rows keep
+//! the per-slot form, whose launch count the captured step pins: a step's
+//! slots sit mostly on distinct experts, so tiles would be of one column and
+//! pay the two table launches for nothing. Each slot's rows are the same bits
+//! either way.
+//!
 //! MiMo facts that fix this file: the routed block has no shared expert, so
 //! the shadow is the card slots alone and the layer's back adds the host's sum
 //! to `acc + x1`; the routed SwiGLU is the description's limit (0: plain);
@@ -27,7 +38,7 @@
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, leg_bytes};
 use bloomery_gpu::card_slots::{CardSlotKernels, Places};
 use bloomery_gpu::hybrid::SlotMap;
-use bloomery_gpu::kquant::Act;
+use bloomery_gpu::kquant::{Act, TileTables, tile_tables_bytes};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED};
@@ -96,6 +107,8 @@ impl CardBufs {
 pub(crate) struct CardBatch {
     bufs: CardBufs,
     sel: DeviceBuffer<u32>,
+    /// The slots grouped by expert, for a layer that runs the tile form.
+    tables: TileTables,
 }
 
 impl CardBatch {
@@ -106,6 +119,7 @@ impl CardBatch {
         Ok(CardBatch {
             bufs: CardBufs::new(stream, n, ff, cap)?,
             sel: DeviceBuffer::zeroed(stream, cap * N_USED)?,
+            tables: TileTables::new(stream, cap * N_USED)?,
         })
     }
 
@@ -113,7 +127,7 @@ impl CardBatch {
     /// tokens of `n` values through experts of `ff` rows, counted before it
     /// does ([`card_batch_bytes`]).
     pub(crate) fn bytes(&self) -> usize {
-        self.bufs.bytes() + self.sel.num_bytes()
+        self.bufs.bytes() + self.sel.num_bytes() + self.tables.device_bytes()
     }
 
     /// The sum plus the residual of the last run over the batch, `t` rows.
@@ -137,12 +151,16 @@ pub(crate) struct Io<'a> {
 struct CardLayer {
     n_card: usize,
     names: [String; 3],
+    /// A prompt batch of the layer runs the leg's tile form: its stacks have
+    /// slot-tile entries ([`LegStacks::tiles_run`]), a fact of their types.
+    tiles: bool,
 }
 
 impl CardLayer {
     fn of(l: usize, n_card: usize) -> CardLayer {
         CardLayer {
             n_card,
+            tiles: false,
             names: [
                 names::ffn_gate_exps(l),
                 names::ffn_up_exps(l),
@@ -171,10 +189,13 @@ fn layer_of(layers: &[Option<CardLayer>], l: usize) -> Result<&CardLayer, GpuErr
 /// Device bytes of the card buffers of a prompt batch of up to `cap` tokens of
 /// `n` values through experts of `ff` rows ([`CardBatch::bytes`]'s formula):
 /// the card leg's ([`leg_bytes`]), the card sum and the sum plus the
-/// residual, and the places.
+/// residual, the places and the slot tiles' tables ([`tile_tables_bytes`]).
 #[must_use]
 pub(crate) fn card_batch_bytes(n: usize, ff: usize, cap: usize) -> usize {
-    leg_bytes(shape(n, ff, cap)) + 2 * size_of::<f32>() * cap * n + size_of::<u32>() * cap * N_USED
+    leg_bytes(shape(n, ff, cap))
+        + 2 * size_of::<f32>() * cap * n
+        + size_of::<u32>() * cap * N_USED
+        + tile_tables_bytes(cap * N_USED)
 }
 
 /// The card's routed experts of the step: the kernels, each layer's count
@@ -230,7 +251,7 @@ impl CardExperts {
                     card
                 }
             };
-            let layer = CardLayer::of(l, n_card);
+            let mut layer = CardLayer::of(l, n_card);
             if n_card == 0 {
                 if let Some(name) = layer.names.iter().find(|name| w.get(name).is_some()) {
                     return Err(GpuError::Tensor {
@@ -243,7 +264,9 @@ impl CardExperts {
                 per.push(None);
                 continue;
             }
-            LegStacks::of(w, layer.names())?.check(n_card, shape(n, ff, 1))?;
+            let stacks = LegStacks::of(w, layer.names())?;
+            stacks.check(n_card, shape(n, ff, 1))?;
+            layer.tiles = stacks.tiles_run();
             per.push(Some(layer));
         }
         Ok(CardExperts {
@@ -315,8 +338,15 @@ impl CardExperts {
         sel: &DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
         let layer = layer_of(&self.layers, l)?;
-        self.k
-            .enqueue(gpu, w, &mut self.step, (l, layer, self.n), rule, io, sel)
+        self.k.enqueue(
+            gpu,
+            w,
+            &mut self.step,
+            (l, layer, self.n),
+            rule,
+            io,
+            (sel, None),
+        )
     }
 
     /// Layer `l`'s card slots of a pass of `io.m` rows (module doc), the
@@ -344,7 +374,7 @@ impl CardExperts {
             });
         }
         self.k
-            .enqueue(gpu, w, bufs, (l, layer, self.n), rule, io, sel)
+            .enqueue(gpu, w, bufs, (l, layer, self.n), rule, io, (sel, None))
     }
 
     /// Layer `l`'s card slots over a prompt batch of `io.m` tokens (module
@@ -385,14 +415,25 @@ impl CardExperts {
             gpu.layer_sink(l)?,
             &mut cb.sel,
         )?;
-        self.k
-            .enqueue(gpu, w, &mut cb.bufs, (l, layer, self.n), rule, io, &cb.sel)
+        let tables = layer.tiles.then_some(&mut cb.tables);
+        self.k.enqueue(
+            gpu,
+            w,
+            &mut cb.bufs,
+            (l, layer, self.n),
+            rule,
+            io,
+            (&cb.sel, tables),
+        )
     }
 }
 
 impl CardKernels {
     /// The six launches (module doc) of layer `l` over `io.m` tokens, `layer`
-    /// its card experts and `n` the model's width.
+    /// its card experts and `n` the model's width, over the slots' places
+    /// `sel`: the leg's tile form when `tables` is given (the caller's
+    /// decision: a prompt batch of a layer with slot-tile entries), the
+    /// per-slot form otherwise.
     #[allow(
         clippy::too_many_arguments,
         reason = "one run's inputs: the weights, the buffers, the layer's shape and rule, the \
@@ -406,7 +447,7 @@ impl CardKernels {
         (l, layer, n): (usize, &CardLayer, usize),
         rule: Act,
         io: &Io<'_>,
-        sel: &DeviceBuffer<u32>,
+        (sel, tables): (&DeviceBuffer<u32>, Option<&mut TileTables>),
     ) -> Result<(), GpuError> {
         let stacks = LegStacks::of(w, layer.names())?;
         let run = LegRun {
@@ -422,7 +463,12 @@ impl CardKernels {
             w: io.weights,
             acc: &mut bufs.acc,
         };
-        self.leg.enqueue(gpu, &mut bufs.leg, &run, Some(sum))?;
+        match tables {
+            Some(tables) => self
+                .leg
+                .enqueue_tiled(gpu, &mut bufs.leg, tables, &run, Some(sum))?,
+            None => self.leg.enqueue(gpu, &mut bufs.leg, &run, Some(sum))?,
+        }
         let stream = gpu.stream();
         gpu.elem()
             .enqueue_add(stream, &bufs.acc, io.x1, io.m * n, &mut bufs.pre)

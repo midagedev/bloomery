@@ -93,8 +93,9 @@ const _: () = assert!(BUCKET_EXPERTS <= TILE_MAX_EXPERTS);
 /// at most `min(n_slots, ⌊(n_slots + 7 · n_experts) / 8⌋)`. A tile table for
 /// them is one count word and a word a tile.
 #[must_use]
-pub fn tile_cap(n_slots: usize, n_experts: usize) -> usize {
-    n_slots.min((n_slots + (TILE_COLS - 1) * n_experts) / TILE_COLS)
+pub const fn tile_cap(n_slots: usize, n_experts: usize) -> usize {
+    let bound = (n_slots + (TILE_COLS - 1) * n_experts) / TILE_COLS;
+    if n_slots < bound { n_slots } else { bound }
 }
 
 /// Tile `g` of a tile table ([`grouped_tiles`]): its expert `e`, first table

@@ -29,6 +29,17 @@
 //! the routing weights. A caller whose down rows live in a buffer of its own
 //! (the expert tier's staged rows) runs [`CardLeg::enqueue_rows`].
 //!
+//! A prompt batch of a layer whose stacks have slot-tile entries
+//! ([`kernels::card_tiles`]: MXFP4) runs [`CardLeg::enqueue_tiled`] instead of
+//! the two `_sel` launches: the slots grouped by expert on the device
+//! ([`TileTables`], two launches), then the gate·up and the down over tiles of
+//! up to eight slots of one expert, each file block read once for the tile.
+//! The q8_1 quantizers, the buffers and the rows are the per-slot run's: a
+//! slot's rows are the same bits, so the sum and every reader of the rows are
+//! untouched. A caller picks the form by what it knows — the tile form for a
+//! batch of many slots, the per-slot form for a step — and a layer whose
+//! stacks have no tile entry is refused by name, never run per slot.
+//!
 //! The run launches the entries [`kernels::card_gate_up_runs`] and
 //! [`kernels::card_down_runs`] admit, each stack by its role: those whose
 //! launchers read an activation of more columns than a run uses (a
@@ -42,8 +53,8 @@
 
 use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
 use crate::iq_sel::{IqDown, IqGateUp, IqSelKernels};
-use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
-use crate::mxfp4_sel::Mxfp4SelKernels;
+use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown, TileTables};
+use crate::mxfp4_sel::{Mxfp4SelKernels, SlotTilesDown, SlotTilesGateUp};
 use crate::q4k_sel::QuantSel;
 use crate::q5::Q8Blocks32;
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
@@ -280,6 +291,13 @@ impl<'a> LegStacks<'a> {
         Ok(LegStacks { gate, up, down })
     }
 
+    /// The layer's stacks have slot-tile entries ([`kernels::card_tiles`] of
+    /// the gate·up and down types): [`CardLeg::enqueue_tiled`] runs them.
+    #[must_use]
+    pub fn tiles_run(&self) -> bool {
+        kernels::card_tiles(self.gate.ty, self.down.ty)
+    }
+
     /// The stacks hold `n_card` experts of `shape` each: the gate's and up's
     /// `ff` rows of `n` values, the down's `n` rows of `ff`.
     pub fn check(&self, n_card: usize, shape: LegShape) -> Result<(), GpuError> {
@@ -374,7 +392,59 @@ impl CardLeg {
             down,
         } = bufs;
         let shape = *shape;
-        if sum.is_some() && CardSlots::of(shape.slots_per_col).is_none() {
+        Self::check_sum(shape, sum.is_some())?;
+        let scratch = Scratch {
+            shape,
+            act_x,
+            h,
+            act_h,
+        };
+        self.launch(gpu, scratch, run, down)?;
+        self.enqueue_sum(gpu, shape, down, run, sum)
+    }
+
+    /// [`CardLeg::enqueue`] over the slot tiles (module doc): the same
+    /// quantizers, buffers and rows, the gate·up and the down launched as
+    /// tiles of the slots `tables` groups by expert — seven launches with the
+    /// sum where the per-slot run has five. `run.stacks` must have slot-tile
+    /// entries ([`LegStacks::tiles_run`]) and `bufs` the Q8Act form of the
+    /// down's activation; `run.m` outside `1..=bufs.shape().cap`, more slots
+    /// than `tables` takes, a stack pair the tiles do not run, any other
+    /// down activation form, or a sum over a slot count the sum has no entry
+    /// for is refused by name before the first launch. A tile past the table
+    /// and an entry that names no slot raise on the layer's fault sink.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_tiled(
+        &self,
+        gpu: &Gpu,
+        bufs: &mut LegBufs,
+        tables: &mut TileTables,
+        run: &LegRun<'_>,
+        sum: Option<LegSum<'_>>,
+    ) -> Result<(), GpuError> {
+        let LegBufs {
+            shape,
+            act_x,
+            h,
+            act_h,
+            down,
+        } = bufs;
+        let shape = *shape;
+        Self::check_sum(shape, sum.is_some())?;
+        let scratch = Scratch {
+            shape,
+            act_x,
+            h,
+            act_h,
+        };
+        self.launch_tiled(gpu, scratch, tables, run, down)?;
+        self.enqueue_sum(gpu, shape, down, run, sum)
+    }
+
+    /// A sum over `shape.slots_per_col` slots a token is refused by name
+    /// unless the sum has an entry for it.
+    fn check_sum(shape: LegShape, sum: bool) -> Result<(), GpuError> {
+        if sum && CardSlots::of(shape.slots_per_col).is_none() {
             return Err(GpuError::Shape {
                 what: WHAT,
                 detail: format!(
@@ -384,13 +454,18 @@ impl CardLeg {
                 ),
             });
         }
-        let scratch = Scratch {
-            shape,
-            act_x,
-            h,
-            act_h,
-        };
-        self.launch(gpu, scratch, run, down)?;
+        Ok(())
+    }
+
+    /// The card slots' weighted sum over `down`'s rows, when the run asks for it.
+    fn enqueue_sum(
+        &self,
+        gpu: &Gpu,
+        shape: LegShape,
+        down: &DeviceBuffer<f32>,
+        run: &LegRun<'_>,
+        sum: Option<LegSum<'_>>,
+    ) -> Result<(), GpuError> {
         let Some(LegSum { w, acc }) = sum else {
             return Ok(());
         };
@@ -606,6 +681,96 @@ impl CardLeg {
             _ => return Err(st.down.unrun()),
         }
         Ok(())
+    }
+
+    /// The slot-tile launches of `run` into `scratch` and `down`: the normed
+    /// rows' q8_1, the table, the gate·up tiles, the q8_1 of the card slots'
+    /// `h` columns and the down tiles. Seven launches with [`TileTables`]'s
+    /// two; the sum is [`CardLeg::enqueue_sum`]'s.
+    fn launch_tiled(
+        &self,
+        gpu: &Gpu,
+        scratch: Scratch<'_>,
+        tables: &mut TileTables,
+        run: &LegRun<'_>,
+        down: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let Scratch {
+            shape:
+                LegShape {
+                    cap,
+                    slots_per_col,
+                    n,
+                    ff,
+                },
+            act_x,
+            h,
+            act_h,
+        } = scratch;
+        if run.m == 0 || run.m > cap {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a run of {} tokens in buffers of {cap}", run.m),
+            });
+        }
+        let st = run.stacks;
+        if !st.tiles_run() {
+            return Err(GpuError::Tensor {
+                what: WHAT,
+                name: st.gate.name.to_owned(),
+                need: "a gate·up and a down stack of types the slot tiles run \
+                       (`kernels::card_tiles`)",
+            });
+        }
+        let ActH::Q8Act(act_h) = act_h else {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "the slot tiles' down reads Q8Act columns; the buffers hold {:?}",
+                    act_h.form()
+                ),
+            });
+        };
+        let slots = run.m * slots_per_col;
+        if slots > tables.slots() {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a run of {slots} slots in tile tables of {}",
+                    tables.slots()
+                ),
+            });
+        }
+        let stream = gpu.stream();
+        let fault = gpu.layer_sink(run.layer)?;
+        gpu.enqueue_quantize_q8_1_cols(run.normed, act_x, run.m, run.layer)?;
+        tables.enqueue(gpu, run.sel, slots, run.n_card, fault)?;
+        let gate_up = SlotTilesGateUp {
+            wg: st.gate.w,
+            wu: st.up.w,
+            act: act_x,
+            table: tables.table(slots, run.n_card),
+            rows_per_expert: ff,
+            slots_per_col,
+            rule: run.rule,
+        };
+        self.mxfp4
+            .enqueue_gate_up_tiles(stream, &gate_up, fault, h)?;
+        let q = QuantSel {
+            x: h,
+            cols: 0..slots,
+            sel: run.sel,
+            n_card: run.n_card,
+        };
+        gpu.q4k_sel()
+            .enqueue_quantize_sel(stream, &q, fault, act_h)?;
+        let d = SlotTilesDown {
+            w: st.down.w,
+            act: act_h,
+            table: tables.table(slots, run.n_card),
+            rows_per_expert: n,
+        };
+        self.mxfp4.enqueue_down_tiles(stream, &d, fault, down)
     }
 }
 
@@ -1208,6 +1373,23 @@ mod tests {
         assert_eq!(bufs.bytes(), leg_bytes(shape));
     }
 
+    /// The slot tiles' tables hold the bytes [`crate::kquant::tile_tables_bytes`]
+    /// counts for their slots, which a caller adds to its plan before it makes
+    /// them.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_tile_tables_hold_the_counted_bytes() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        for slots in [1, SPC, WIDE_CAP * SPC, 4096] {
+            let tables = TileTables::new(gpu.stream(), slots).expect("the tables");
+            assert_eq!(
+                tables.device_bytes(),
+                crate::kquant::tile_tables_bytes(slots),
+                "{slots} slots"
+            );
+        }
+    }
+
     /// A run whose down entry reads the other activation form than the
     /// buffers hold is refused by name before the first launch (the down's
     /// rows stay as they were), and [`CardLeg::enqueue_rows`] writes the rows
@@ -1286,6 +1468,370 @@ mod tests {
         assert!(
             own_rows.iter().all(|v| *v == SENT),
             "enqueue_rows wrote the buffers' own rows"
+        );
+    }
+
+    /// Tokens of the slot-tile tests' buffers and their runs: one token (every
+    /// tile a column or two), one past a group of eight columns, and the cap
+    /// (about seventy slots an expert: nine tiles, the last one partial).
+    const TILE_RUNS: [usize; 3] = WIDE_RUNS;
+
+    /// The routing weights of the slot-tile tests' sums: a function of the
+    /// slot, all distinct and positive.
+    fn tile_weights() -> Vec<f32> {
+        (0..WIDE_CAP * SPC)
+            .map(|i| ((i * 37) % 101 + 1) as f32 / 64.0)
+            .collect()
+    }
+
+    /// A run of `m` tokens of `normed` over `stacks` and the places `sel`.
+    fn tile_run<'a>(
+        stacks: &'a LegStacks<'a>,
+        normed: &'a DeviceBuffer<f32>,
+        sel: &'a DeviceBuffer<u32>,
+        m: usize,
+    ) -> LegRun<'a> {
+        LegRun {
+            layer: 0,
+            stacks,
+            normed,
+            m,
+            sel,
+            n_card: N_CARD,
+            rule: Act::SiluMul,
+        }
+    }
+
+    /// The `(gate, up, down)` stack names of the MXFP4 tile cases.
+    fn mxfp4_names() -> [String; 3] {
+        let ty = GgmlType::MXFP4;
+        [
+            stack_name("gate", ty),
+            stack_name("up", ty),
+            stack_name("down", ty),
+        ]
+    }
+
+    /// The tile form is the per-slot form's bits (module doc): over places
+    /// that mix duplicates, every card expert and host slots, at runs of one
+    /// token, past eight columns and the buffers' cap, the tiled leg's `h`
+    /// rows, down rows and card sums equal the per-slot leg's bit for bit, a
+    /// host slot keeps its sentinel in both, and neither writes past its run.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_tiled_leg_writes_the_per_slot_legs_bits() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let w = weights(&gpu, WIDE_SHAPE, &[GgmlType::MXFP4]);
+        let names = mxfp4_names();
+        let stacks = LegStacks::of(&w, [&names[0], &names[1], &names[2]]).expect("the stacks");
+        stacks.check(N_CARD, WIDE_SHAPE).expect("the stacks' shape");
+        assert!(stacks.tiles_run(), "MXFP4 stacks have slot-tile entries");
+        let sel_all: Vec<u32> = (0..WIDE_CAP).flat_map(wide_places).collect();
+        let host_normed: Vec<f32> = (0..WIDE_CAP).flat_map(wide_row).collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &sel_all).expect("the places");
+        let wts = DeviceBuffer::from_host(stream, &tile_weights()).expect("the weights");
+        let sentinel = vec![SENT; WIDE_CAP * SPC * WIDE_N];
+        for rule in [Act::SiluMul, Act::SwigluClamp { limit: 7.0 }] {
+            for m in TILE_RUNS {
+                let case = format!("{rule:?}, {m} tokens");
+                let run = LegRun {
+                    layer: 0,
+                    stacks: &stacks,
+                    normed: &normed,
+                    m,
+                    sel: &sel,
+                    n_card: N_CARD,
+                    rule,
+                };
+                let mut per_slot = LegBufs::new(stream, WIDE_SHAPE).expect("the buffers");
+                let mut tiled = LegBufs::new(stream, WIDE_SHAPE).expect("the buffers");
+                let mut tables = TileTables::new(stream, WIDE_CAP * SPC).expect("the tile tables");
+                let mut acc_a =
+                    DeviceBuffer::<f32>::zeroed(stream, WIDE_CAP * WIDE_N).expect("the sum");
+                let mut acc_b =
+                    DeviceBuffer::<f32>::zeroed(stream, WIDE_CAP * WIDE_N).expect("the sum");
+                for b in [&mut per_slot, &mut tiled] {
+                    b.down.copy_from_host(stream, &sentinel).expect("sentinel");
+                    b.h.copy_from_host(stream, &vec![SENT; WIDE_CAP * SPC * WIDE_FF])
+                        .expect("sentinel");
+                }
+                let sum_a = LegSum {
+                    w: &wts,
+                    acc: &mut acc_a,
+                };
+                leg.enqueue(&gpu, &mut per_slot, &run, Some(sum_a))
+                    .unwrap_or_else(|e| panic!("{case}: the per-slot leg: {e}"));
+                let sum_b = LegSum {
+                    w: &wts,
+                    acc: &mut acc_b,
+                };
+                leg.enqueue_tiled(&gpu, &mut tiled, &mut tables, &run, Some(sum_b))
+                    .unwrap_or_else(|e| panic!("{case}: the tiled leg: {e}"));
+                assert!(
+                    gpu.take_fault().expect("the fault word").is_none(),
+                    "{case}: a fault"
+                );
+                let rows = |b: &DeviceBuffer<f32>| b.to_host_vec(stream).expect("rows");
+                for (what, got, want) in [
+                    ("h", rows(&tiled.h), rows(&per_slot.h)),
+                    ("down", rows(&tiled.down), rows(&per_slot.down)),
+                    ("sum", rows(&acc_b), rows(&acc_a)),
+                ] {
+                    assert_eq!(got.len(), want.len(), "{case}: {what}");
+                    if let Some(i) = (0..got.len()).find(|&i| got[i].to_bits() != want[i].to_bits())
+                    {
+                        panic!(
+                            "{case}: {what}[{i}]: tiled {:#010x}, per-slot {:#010x}",
+                            got[i].to_bits(),
+                            want[i].to_bits()
+                        );
+                    }
+                }
+                let slots = m * SPC;
+                let down = rows(&tiled.down);
+                for (s, &place) in sel_all[..slots].iter().enumerate() {
+                    if let Err(why) = slot_state(&down[s * WIDE_N..(s + 1) * WIDE_N], place) {
+                        panic!("{case}: slot {s}: {why}");
+                    }
+                }
+                println!("leg_tiled[{case}] ok");
+            }
+        }
+    }
+
+    /// The node counts and entries of the two forms of a run with its sum: the
+    /// per-slot form is five launches (the normed rows' q8_1, the gate·up, the
+    /// q8_1 of the card slots' `h`, the down, the card sum), the tile form
+    /// seven — the table's two launches and the tiles' two entries in place of
+    /// the `_sel` pair. The ratchet of the leg's launch structure: a launch
+    /// added to or dropped from either form fails here.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_tiled_leg_launches_seven_and_the_per_slot_leg_five() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let w = weights(&gpu, WIDE_SHAPE, &[GgmlType::MXFP4]);
+        let names = mxfp4_names();
+        let stacks = LegStacks::of(&w, [&names[0], &names[1], &names[2]]).expect("the stacks");
+        let sel_all: Vec<u32> = (0..WIDE_CAP).flat_map(wide_places).collect();
+        let host_normed: Vec<f32> = (0..WIDE_CAP).flat_map(wide_row).collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &sel_all).expect("the places");
+        let wts = DeviceBuffer::from_host(stream, &tile_weights()).expect("the weights");
+        let run = LegRun {
+            layer: 0,
+            stacks: &stacks,
+            normed: &normed,
+            m: WIDE_CAP,
+            sel: &sel,
+            n_card: N_CARD,
+            rule: Act::SiluMul,
+        };
+        let mut bufs = LegBufs::new(stream, WIDE_SHAPE).expect("the buffers");
+        let mut tables = TileTables::new(stream, WIDE_CAP * SPC).expect("the tile tables");
+        let mut acc = DeviceBuffer::<f32>::zeroed(stream, WIDE_CAP * WIDE_N).expect("the sum");
+        let entries = |g: &crate::graph::Graph| -> Vec<String> {
+            g.nodes()
+                .expect("the nodes")
+                .into_iter()
+                .map(|n| n.kernel.expect("a kernel node").name)
+                .collect()
+        };
+        let per_slot = gpu
+            .capture(|_| {
+                let sum = LegSum {
+                    w: &wts,
+                    acc: &mut acc,
+                };
+                leg.enqueue(&gpu, &mut bufs, &run, Some(sum))
+            })
+            .expect("the captured per-slot run");
+        let tiled = gpu
+            .capture(|_| {
+                let sum = LegSum {
+                    w: &wts,
+                    acc: &mut acc,
+                };
+                leg.enqueue_tiled(&gpu, &mut bufs, &mut tables, &run, Some(sum))
+            })
+            .expect("the captured tiled run");
+        let (per_slot, tiled) = (entries(&per_slot), entries(&tiled));
+        let in_order = |names: &[String], want: &[&str]| {
+            let mut at = 0;
+            for w in want {
+                let Some(i) = names[at..].iter().position(|n| n.contains(w)) else {
+                    return false;
+                };
+                at += i + 1;
+            }
+            true
+        };
+        assert_eq!(
+            per_slot.len(),
+            5,
+            "the per-slot run's entries: {per_slot:?}"
+        );
+        assert!(
+            in_order(
+                &per_slot,
+                &["mxfp4_gate_up_sel", "q8_1_quantize_sel", "mxfp4_gemv_sel"]
+            ),
+            "the per-slot run's entries: {per_slot:?}"
+        );
+        assert_eq!(tiled.len(), 7, "the tiled run's entries: {tiled:?}");
+        assert!(
+            in_order(
+                &tiled,
+                &[
+                    "grouped_buckets",
+                    "grouped_tiles",
+                    "mxfp4_gate_up_tiles",
+                    "q8_1_quantize_sel",
+                    "mxfp4_gemv_tiles",
+                ]
+            ),
+            "the tiled run's entries: {tiled:?}"
+        );
+    }
+
+    /// The tile form refuses by name, before any launch: a stack pair with no
+    /// tile entry (Q4_K), more slots than its tables take, and the other
+    /// down activation form; the down rows stay as they were.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_tiled_leg_refuses_what_it_does_not_run_by_name() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let w = weights(&gpu, WIDE_SHAPE, &[GgmlType::MXFP4, GgmlType::Q4_K]);
+        let sel_all: Vec<u32> = (0..WIDE_CAP).flat_map(wide_places).collect();
+        let host_normed: Vec<f32> = (0..WIDE_CAP).flat_map(wide_row).collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &sel_all).expect("the places");
+        let sentinel = vec![SENT; WIDE_CAP * SPC * WIDE_N];
+        let q4k = [
+            stack_name("gate", GgmlType::Q4_K),
+            stack_name("up", GgmlType::Q4_K),
+            stack_name("down", GgmlType::Q4_K),
+        ];
+        let mx = mxfp4_names();
+        let q4k_stacks = LegStacks::of(&w, [&q4k[0], &q4k[1], &q4k[2]]).expect("the stacks");
+        let mx_stacks = LegStacks::of(&w, [&mx[0], &mx[1], &mx[2]]).expect("the stacks");
+        assert!(!q4k_stacks.tiles_run(), "Q4_K has no slot-tile entry");
+        let mut tables = TileTables::new(stream, WIDE_CAP * SPC).expect("the tile tables");
+        let mut small = TileTables::new(stream, SPC).expect("the small tile tables");
+        let run = |stacks, m| tile_run(stacks, &normed, &sel, m);
+        let mut bufs = LegBufs::new(stream, WIDE_SHAPE).expect("the buffers");
+        bufs.down
+            .copy_from_host(stream, &sentinel)
+            .expect("sentinel");
+        let refused = leg.enqueue_tiled(&gpu, &mut bufs, &mut tables, &run(&q4k_stacks, 2), None);
+        assert!(
+            matches!(&refused, Err(GpuError::Tensor { what: WHAT, .. })),
+            "Q4_K stacks on the slot tiles: {refused:?}"
+        );
+        let refused = leg.enqueue_tiled(&gpu, &mut bufs, &mut small, &run(&mx_stacks, 2), None);
+        assert!(
+            matches!(&refused, Err(GpuError::Shape { what: WHAT, .. })),
+            "two tokens' slots in tables of one token's: {refused:?}"
+        );
+        let mut blocks = LegBufs::for_down(stream, WIDE_SHAPE, DownAct::Q8Blocks32)
+            .expect("the 32-value buffers");
+        let refused = leg.enqueue_tiled(&gpu, &mut blocks, &mut tables, &run(&mx_stacks, 2), None);
+        assert!(
+            matches!(&refused, Err(GpuError::Shape { what: WHAT, .. })),
+            "MXFP4 tiles over 32-value activation buffers: {refused:?}"
+        );
+        let rows = bufs.down.to_host_vec(stream).expect("the rows");
+        assert!(rows.iter().all(|v| *v == SENT), "a refused run wrote rows");
+    }
+
+    /// A table entry that names no slot of the block raises
+    /// [`FaultSite::ExpertId`] in each tile entry and the tile writes nothing:
+    /// the table here lists slots 0 and 99 of a block of two.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_slot_tile_entry_past_the_block_raises_and_writes_nothing() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let k = Mxfp4SelKernels::load(gpu.context(), gpu.fault_word()).expect("the module");
+        let w = weights(&gpu, WIDE_SHAPE, &[GgmlType::MXFP4]);
+        let names = mxfp4_names();
+        let host_normed: Vec<f32> = wide_row(0);
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed row");
+        let mut act = Q8Act::with_tier_cols(stream, 1, WIDE_N).expect("the activation");
+        gpu.enqueue_quantize_q8_1_cols(&normed, &mut act, 1, 0)
+            .expect("q8_1");
+        let mut act_h = Q8Act::with_slots(stream, 2, WIDE_FF).expect("the slots' activation");
+        let hx = DeviceBuffer::from_host(stream, &vec![0.5f32; 2 * WIDE_FF]).expect("h");
+        gpu.q4k_sel()
+            .enqueue_quantize_sel(
+                stream,
+                &QuantSel {
+                    x: &hx,
+                    cols: 0..2,
+                    sel: &DeviceBuffer::from_host(stream, &[0u32, 0]).expect("places"),
+                    n_card: N_CARD,
+                },
+                gpu.layer_sink(0).expect("a sink"),
+                &mut act_h,
+            )
+            .expect("the slots' q8_1");
+        let order = DeviceBuffer::from_host(stream, &[0u32, 99]).expect("order");
+        let start = DeviceBuffer::from_host(stream, &[0u32, 2, 2, 2, 2]).expect("start");
+        let tiles = DeviceBuffer::from_host(stream, &[1u32, 0, 0]).expect("tiles");
+        let table = || crate::kquant::TileTable {
+            order: &order,
+            start: &start,
+            tiles: &tiles,
+            n_experts: N_CARD,
+            n_slots: 2,
+        };
+        let sink = gpu.layer_sink(0).expect("a sink");
+        let mut h = DeviceBuffer::from_host(stream, &vec![SENT; 2 * WIDE_FF]).expect("h");
+        let gate_up = SlotTilesGateUp {
+            wg: words(&w, &names[0]),
+            wu: words(&w, &names[1]),
+            act: &act,
+            table: table(),
+            rows_per_expert: WIDE_FF,
+            slots_per_col: SPC,
+            rule: Act::SiluMul,
+        };
+        k.enqueue_gate_up_tiles(stream, &gate_up, sink, &mut h)
+            .expect("the gate·up tiles");
+        let fault = gpu.take_fault().expect("the fault word");
+        assert_eq!(
+            fault.map(|f| f.code),
+            Some(crate::FaultSite::ExpertId as u32),
+            "the gate·up tile with an entry past the block"
+        );
+        assert!(
+            h.to_host_vec(stream).expect("h").iter().all(|v| *v == SENT),
+            "the gate·up tile wrote rows"
+        );
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; 2 * WIDE_N]).expect("y");
+        let down = SlotTilesDown {
+            w: words(&w, &names[2]),
+            act: &act_h,
+            table: table(),
+            rows_per_expert: WIDE_N,
+        };
+        k.enqueue_down_tiles(stream, &down, sink, &mut y)
+            .expect("the down tiles");
+        let fault = gpu.take_fault().expect("the fault word");
+        assert_eq!(
+            fault.map(|f| f.code),
+            Some(crate::FaultSite::ExpertId as u32),
+            "the down tile with an entry past the block"
+        );
+        assert!(
+            y.to_host_vec(stream).expect("y").iter().all(|v| *v == SENT),
+            "the down tile wrote rows"
         );
     }
 }

@@ -51,7 +51,11 @@
 //!   window layers' flash over a whole batch and the full layers' in chunks),
 //!   from a reset, then the step: the prefill's argmax, the step's logits and
 //!   the step's layer outputs equal those of the set fed by our steps bit for
-//!   bit — (t)'s run, or its own when (b) runs without (t). The 1,024-position
+//!   bit — (t)'s run, or its own when (b) runs without (t). A batch's card
+//!   experts run the leg's slot tiles (`CardLeg::enqueue_tiled`: the MXFP4
+//!   stacks grouped by expert, tiles of up to eight slots) and the steps' the
+//!   per-slot entries, so this clause holds the tile form to the per-slot bits
+//!   on the real routing. The 1,024-position
 //!   prefill is two batches and the 4,096-position one eight, so the cut at a
 //!   batch's end and a flash over a window of real keys are both on the path.
 //!
@@ -218,7 +222,9 @@ mod gate {
 
     /// PIN(2026-10-10): a routed layer with card experts adds its shadow's six
     /// launches (the norm's q8_1, the gate·up, the q8_1 of the card columns,
-    /// the down, the card sum, the add of `x1`) and no memory operation.
+    /// the down, the card sum, the add of `x1`) and no memory operation. The
+    /// captured step and a pass of rows run the per-slot entries; a prompt
+    /// batch's tile form is counted by the card leg's own launch pin.
     const CARD_LAUNCHES: usize = 6;
 
     /// PIN(2026-10-10): the captured decode step's node count at the gate

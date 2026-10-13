@@ -1,3 +1,13 @@
+# Scope (premise fix, 2026-10-13): this card prices the HOST qdot tile, one pinned core of AVX2, and its
+# c_tile <= ~23.5 us a slot is the host union's bound (R8c). It is not a GPU bound. The card experts' tile
+# (mxfp4_gate_up_tiles / mxfp4_gemv_tiles, crates/gpu/src/mxfp4_sel.rs) is bounded by its read: one 13.37 MB
+# expert (3 x 2048 rows x 2176 B) read once per tile of G <= 8 slots is 19.1 us / G at ~700 GB/s, 2.4 us a slot
+# at two full tiles per expert and 3.4 us at the partial-tile bound (q4k_sel.rs tile_cap) [derived]. Its compute
+# term is open: the SASS loop bodies are 107 + 26 G warp-instructions per (row, 32-block step), so a slot costs
+# ~1.45 M warp-instructions at G = 8 [derived from the built loops, epilogue estimated] against the 1.13 M
+# (2.4 us x 470 G/s) the read leaves room for: at G = 8 the tile is compute-bound, ~3.1 us a slot at full issue.
+# The card tile's A/B belongs to the seating round (the pair), not to this card.
+#
 # The MXFP4 C = 8 tile's one-core rate, never measured. Prediction [derived, the
 # R8 design's §5]: the tile shares the weight-side decode (lut4_codes, the E8M0
 # pair) across eight columns, leaving per column the activation loads, four
