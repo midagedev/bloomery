@@ -550,14 +550,16 @@ gate_e2e   tier_fault_copy                          0           0
 gate_e2e   touch                                    0           0
 gate_e2e   weighted_sum                             0           0
 
-# gate_qwen3vl_tower (--features vision), the `vis_` entries of bloomery-gpu-vision only: V4.1's six, the Qwen3-VL tower's five and the glm5v tower's three
+# gate_qwen3vl_tower (--features vision), the `vis_` entries of bloomery-gpu-vision only: V4.1's six, the Qwen3-VL tower's five, the glm5v tower's three, and MiniCPM's two
 gate_qwen3vl_tower   vis_attn                           0           0
+gate_qwen3vl_tower   vis_attn_group                     0           0
 gate_qwen3vl_tower   vis_attn_h72                       0           0
 gate_qwen3vl_tower   vis_gelu_erf                       0           0
 gate_qwen3vl_tower   vis_gelu_tanh                      0           0
 gate_qwen3vl_tower   vis_gemm_bf16                      0           0
 gate_qwen3vl_tower   vis_head_rms_norm                  0           0
 gate_qwen3vl_tower   vis_layer_norm                     0           0
+gate_qwen3vl_tower   vis_mean_groups                    0           0
 gate_qwen3vl_tower   vis_pos_bilinear                   0           0
 gate_qwen3vl_tower   vis_rms_norm                       0           0
 gate_qwen3vl_tower   vis_rope2d                         0           0
