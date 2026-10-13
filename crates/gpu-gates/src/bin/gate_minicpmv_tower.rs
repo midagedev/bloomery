@@ -20,6 +20,14 @@
 //!    merger teacher-forced on the card's `vit` tap — norm, GEMMs and the erf GELU op by op, the
 //!    whole against its twin; (d) three images (a 448×448 slice, a 1000×700 image that slices,
 //!    200×200): finite rows, the rows each grid gives, eager twice, reuse after the largest.
+//! 5. The tower against mainline's own nodes (real mmproj and the clefvis sets of
+//!    `refset::arch::minicpmv4_7::vis`): for each tile of the three set images, fed the pixels
+//!    mainline's preprocess produced (`inp_raw`), every tapped node (the patch embedding, blocks
+//!    0, 6, 7 and 26, the vit_merger's stream, mean and output, the post-LN, the final merger's
+//!    norm and rows) and the `embd` rows, which are the merger rows followed by the tile's
+//!    separator rows (`tile_embd`), within a band derived from the set's CPU twin, the bf16 floor
+//!    and the tower's sensitivity to a one-ulp nudge of its input; and that our plan and canvas
+//!    are the set's.
 
 #[cfg(not(feature = "vision"))]
 fn main() {
@@ -354,28 +362,31 @@ mod gate {
 
 #[cfg(feature = "vision")]
 mod tower {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::ops::AddAssign;
     use std::sync::Arc;
 
     use super::vision_rules::{exact_check, gemm_check, par_rows};
     use super::vision_taps::{
-        Collect, HostFile, dist_f32, eager_twice, floor, nudged, read_image, to_f32,
+        Collect, HostFile, band_check, dist, dist_f32, eager_twice, floor, nudge, nudged,
+        read_image, sens, to_f32,
     };
     use bloomery_gpu_gates::{GateError, verdict};
-    use bloomery_gpu_vision::bf16_f32;
     use bloomery_gpu_vision::gelu_tanh::{gelu_erf_ref, gelu_tanh_ref};
     use bloomery_gpu_vision::gemm_bf16::{Epilogue, GemmArgs, GemmKernels, gelu_erf, within_order};
     use bloomery_gpu_vision::layer_norm::layer_norm_ref;
     use bloomery_gpu_vision::mean_groups::mean_groups_ref;
     use bloomery_gpu_vision::minicpmv::{
         Encoder, GROUP, HostFinalMerger, HostLinear, HostNorm, HostVitMerger, final_merger_f32,
-        scratch_bytes_of, vit_merger_f32, weight_bytes_of,
+        merge_rows, scratch_bytes_of, tile_embd, vit_merger_f32, weight_bytes_of, window_rows,
     };
+    use bloomery_gpu_vision::{bf16_f32, f32_bf16};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
     use gguf::Gguf;
+    use refset::arch::minicpmv4_7::vis::{self, Kind, McvisSet};
+    use refset::family::Family;
     use vision::arch::minicpmv::{Hparams, names, preprocess};
-    use vision::{Patches, Rgb8};
+    use vision::{GridPlan, Patches, Rgb8};
 
     /// The checkpoint's mmproj.
     const MMPROJ: &str = "/models/MiniCPM-V-4.7-35B-A3B/mmproj-model-f16.gguf";
@@ -653,6 +664,375 @@ mod tower {
         rows.iter().all(|&v| v & 0x7f80 != 0x7f80)
     }
 
+    // ------------------------------------------------------------ mainline's nodes
+
+    /// A tap within one block of the input (the patch embedding, block 0) passes against mainline
+    /// when `rms(ours − ref) / rms(ref)` is at most `K_MARGIN · √N` times the larger of its controls
+    /// (the reference's own CPU-twin distance and the bf16 floor; see [`NODES`] for `N`, the count
+    /// of independent bf16 roundings that reach the tap). Independent roundings add in rms, so the
+    /// distance is about `√N` floors; the margin covers the amplification of a norm or a cancelling
+    /// sum.
+    /// PIN(2026-10-13): fixed before the first run of the tower against these sets; the margin
+    /// `K_TAP` leaves over its `√11` floors (6 over 3.3). The first measurement of this build, over
+    /// the seven tiles: ratios of 1.2 to 1.3 at the patch embedding and 2.3 to 2.5 at block 0.
+    const K_MARGIN: f64 = 1.8;
+
+    /// A tap from block 1 on passes when the distance is at most `K_SENS` times the larger of its
+    /// controls, the sensitivity to a nudge of the input among them. The nudge runs through the
+    /// same blocks the distance does, so it already carries their amplification: the `√N` of
+    /// [`K_MARGIN`] would count it twice.
+    /// PIN(2026-10-13): the first measurement of this build, over the seven tiles: ratios of 0.8 to
+    /// 1.3 from block 6 on, so 3 leaves a margin of 2.3; the merge-order mutant reads 15.4 at its
+    /// least (the vit_merger's attention), 5 times this band.
+    const K_SENS: f64 = 3.0;
+
+    /// Our name for the final merger's rows, which the encode returns and no tap carries.
+    const MERGER_OUT: &str = "merger_out";
+
+    /// The roundings that reach the final merger's rows and `embd`: the 62 of the post-LN, the
+    /// final norm, and the up projection, the GELU and the down projection.
+    const N_FINAL: usize = 66;
+
+    /// Where a tap's rows lie on mainline's side against ours.
+    #[derive(Clone, Copy)]
+    enum Rows {
+        /// One row a patch before the down-sample: mainline's in raster order, ours in merge order
+        /// (`merge_rows`).
+        Raster,
+        /// One row a 2×2 window after it: mainline's in the window raster order of its index
+        /// tensors, ours four consecutive merge-order rows a window (`window_rows`).
+        Window,
+        /// One row a group of the final merger, in the same order on both sides.
+        Group,
+    }
+
+    /// `(mainline's node, our tap, the order of its rows, N)` of every node the sets hold that the
+    /// tower can tap, in chain order. `N` counts the independent bf16 roundings that reach the tap
+    /// with a weight of about 1: the patch embedding's 4 (the pixels, the f16 weights, the position
+    /// rows, the output); 2 for each block (the attention's and the MLP's sum into the stream; the
+    /// roundings inside a branch ride on the margin); 1 each for the vit_merger's attention sum,
+    /// its mean and its output sum; then the post-LN's 1, the final norm's 1 and [`N_FINAL`].
+    const NODES: [(&str, &str, Rows, usize); 11] = [
+        ("pos_embed", "embed", Rows::Raster, 4),
+        ("layer_out-0", "blk0", Rows::Raster, 6),
+        ("layer_out-6", "blk6", Rows::Raster, 18),
+        (
+            "vit_merger_attn_residual",
+            "vit_merger.attn",
+            Rows::Raster,
+            19,
+        ),
+        (
+            "vit_merger_ds_mean_res",
+            "vit_merger.mean",
+            Rows::Window,
+            20,
+        ),
+        ("vit_merger_ds_out", "vit_merger", Rows::Window, 21),
+        ("layer_out-7", "blk7", Rows::Window, 23),
+        ("layer_out-26", "blk26", Rows::Window, 61),
+        ("post_ln", "vit", Rows::Window, 62),
+        ("merger_normed", "merger.norm", Rows::Group, 63),
+        ("merger_out", MERGER_OUT, Rows::Group, N_FINAL),
+    ];
+
+    /// The card's set, its CPU twin and the preprocess set.
+    struct Oracle {
+        card: McvisSet,
+        twin: McvisSet,
+        pre: McvisSet,
+    }
+
+    /// `rows` of `width` values in the order `order` names: row `r` of the result is row `order[r]`
+    /// of the input.
+    fn reorder(rows: &[f32], width: usize, order: &[usize]) -> Vec<f32> {
+        order
+            .iter()
+            .flat_map(|&i| rows[i * width..(i + 1) * width].iter().copied())
+            .collect()
+    }
+
+    /// A tile's patches from mainline's own pixels (`inp_raw`: planar `[W, H, 3]` f32): the patch
+    /// grid in raster order, each patch `3 × 14 × 14` values (channel, row, column), rounded to
+    /// bf16, which is what the tower takes.
+    fn mainline_patches(inp: &[f32], t: &vis::Tile) -> Result<Patches, GateError> {
+        let (w, h, p) = (t.w, t.h, vis::PATCH);
+        if inp.len() != 3 * w * h {
+            return Err(format!(
+                "tile {}: inp_raw holds {} values, the tile is {w}x{h}x3",
+                t.index,
+                inp.len()
+            )
+            .into());
+        }
+        let (n_vit_h, n_vit_w) = (h / p, w / p);
+        let mut bf16 = Vec::with_capacity(n_vit_h * n_vit_w * 3 * p * p);
+        for i in 0..n_vit_h {
+            for j in 0..n_vit_w {
+                for c in 0..3 {
+                    for py in 0..p {
+                        let at = (c * h + i * p + py) * w + j * p;
+                        bf16.extend(inp[at..at + p].iter().map(|&v| f32_bf16(v)));
+                    }
+                }
+            }
+        }
+        Ok(Patches {
+            plan: GridPlan {
+                n_llm_h: t.ny,
+                n_llm_w: t.nx,
+                best_h: h,
+                best_w: w,
+            },
+            n_vit_h,
+            n_vit_w,
+            patch_len: 3 * p * p,
+            bf16,
+        })
+    }
+
+    /// A tile's separator rows as the table's row numbers.
+    fn suffix_of(t: &vis::Tile) -> Result<Vec<u8>, GateError> {
+        Ok(t.suffix
+            .iter()
+            .map(|&s| u8::try_from(s))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("tile {}: a separator row: {e}", t.index))?)
+    }
+
+    /// Our plan and canvas for the image's PNG against the set's `# image` and `# tile` lines (the
+    /// tile sizes, the token grids, the separator rows, the rows of each tile and of the image),
+    /// and, printed without a verdict, how far our preprocess's bf16 patches lie from mainline's
+    /// own pixels rounded the same way.
+    fn preproc_clause(
+        hp: &Hparams,
+        name: &str,
+        img: &vis::Image,
+        mainline: &[Patches],
+    ) -> Result<bool, GateError> {
+        let g = preprocess(&read_image(name)?, hp)?;
+        let canvas = g.canvas();
+        let mut same = g.tiles.len() == img.tiles.len()
+            && canvas.tiles() == img.tiles.len()
+            && canvas.rows() == img.n_tokens
+            && img.n_tokens == img.tiles.iter().map(|t| t.rows).sum::<usize>();
+        for (k, (t, ours)) in img.tiles.iter().zip(&g.tiles).enumerate() {
+            let c = canvas.tile(k);
+            same &= (ours.plan.best_w, ours.plan.best_h) == (t.w, t.h)
+                && (c.nx, c.ny) == (t.nx, t.ny)
+                && c.seps == suffix_of(t)?.as_slice()
+                && t.merger_rows == t.nx * t.ny
+                && t.rows == t.merger_rows + t.suffix.len();
+        }
+        println!(
+            "preproc {name}: {} tiles, {} rows; our plan, canvas and separator rows equal the set's  {}",
+            img.tiles.len(),
+            img.n_tokens,
+            verdict(same)
+        );
+        for (t, (ours, theirs)) in img.tiles.iter().zip(g.tiles.iter().zip(mainline)) {
+            let differ = ours
+                .bf16
+                .iter()
+                .zip(&theirs.bf16)
+                .filter(|(a, b)| a != b)
+                .count();
+            println!(
+                "preproc {name}/t{}: our patches differ from mainline's pixels in {differ} of {} bf16 values, rms rel {:.2e} (printed, no verdict)",
+                t.index,
+                theirs.bf16.len(),
+                dist(&ours.bf16, &to_f32(&theirs.bf16)).rms_rel
+            );
+        }
+        Ok(same)
+    }
+
+    /// [`band_check`] for ours in f32: `embd` holds the table's separator rows, which are not bf16
+    /// values.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one tap's names, values and three controls, as the line prints them"
+    )]
+    fn band_f32(
+        k: f64,
+        stem: &str,
+        label: &str,
+        ours: &[f32],
+        refv: &[f32],
+        twin: f64,
+        floor: f64,
+        sens: f64,
+    ) -> bool {
+        if ours.len() != refv.len() {
+            println!(
+                "tap {stem:<14} {label:<20} FAIL: {} values, the set has {}",
+                ours.len(),
+                refv.len()
+            );
+            return false;
+        }
+        let d = dist_f32(ours, refv);
+        let ctl = twin.max(floor).max(sens);
+        let pass = d.rms_rel <= k * ctl;
+        println!(
+            "tap {stem:<14} {label:<20} max|rel| {:.3e}  rms rel {:.3e}  controls twin {twin:.2e} floor {floor:.2e} sens {sens:.2e}  ratio {:.2} (at most {k})  {}",
+            d.max_rel,
+            d.rms_rel,
+            d.rms_rel / ctl,
+            verdict(pass)
+        );
+        pass
+    }
+
+    /// One encode of `patches` with the taps `want` names, and the final rows as [`MERGER_OUT`].
+    fn tapped_encode(
+        enc: &mut Encoder,
+        stream: &CudaStream,
+        patches: &Patches,
+        want: &HashSet<String>,
+    ) -> Result<HashMap<String, Vec<u16>>, GateError> {
+        let mut sink = Collect::new(want.clone());
+        let out = {
+            let r = enc.encode_tapped(patches, &mut sink)?;
+            r.rows.buf().to_host_vec(stream)?
+        };
+        let mut got = sink.got;
+        got.insert(MERGER_OUT.to_string(), out);
+        Ok(got)
+    }
+
+    /// Every node of tile `t` of image `name` against the card's set, from mainline's own pixels,
+    /// then its `embd`: the merger rows with the tile's separator rows after them, in a band, and
+    /// the separator rows equal to mainline's bit for bit.
+    fn tile_clauses(
+        enc: &mut Encoder,
+        stream: &CudaStream,
+        hp: &Hparams,
+        oracle: &Oracle,
+        name: &str,
+        t: &vis::Tile,
+        patches: &Patches,
+    ) -> Result<bool, GateError> {
+        let want: HashSet<String> = NODES
+            .iter()
+            .filter(|n| n.1 != MERGER_OUT)
+            .map(|n| n.1.to_string())
+            .collect();
+        let ours = tapped_encode(enc, stream, patches, &want)?;
+        let mut noisy = patches.clone();
+        nudge(&mut noisy.bf16);
+        let nudged_run = tapped_encode(enc, stream, &noisy, &want)?;
+        let stem = format!("{name}/t{}", t.index);
+        let (n_h, n_w) = (patches.n_vit_h, patches.n_vit_w);
+        let (raster, window) = (merge_rows(n_h, n_w), window_rows(n_h, n_w));
+        let mut ok = true;
+        for (node, label, order, n) in NODES {
+            let x = ours
+                .get(label)
+                .ok_or_else(|| format!("tap {label} was not taken"))?;
+            let (_, refv) = oracle.card.tap(name, t.index, node)?;
+            let (_, twin_v) = oracle.twin.tap(name, t.index, node)?;
+            let rows = match order {
+                Rows::Raster => n_h * n_w,
+                Rows::Window => n_h * n_w / GROUP,
+                Rows::Group => t.merger_rows,
+            };
+            let want_v = match order {
+                Rows::Raster => reorder(&refv, refv.len() / rows, &raster),
+                Rows::Window => reorder(&refv, refv.len() / rows, &window),
+                Rows::Group => refv.clone(),
+            };
+            // Block 0 and the patch embedding are within one block of the input, where a nudge
+            // measures the input's rounding and no amplification.
+            let free = !matches!(label, "embed" | "blk0");
+            ok &= band_check(
+                if free {
+                    K_SENS
+                } else {
+                    K_MARGIN * (n as f64).sqrt()
+                },
+                &stem,
+                label,
+                x,
+                &want_v,
+                dist_f32(&twin_v, &refv).rms_rel,
+                floor(&want_v),
+                free.then(|| sens(&nudged_run[label], x)),
+            );
+        }
+        let (width, split) = (hp.out_dim, t.merger_rows * hp.out_dim);
+        let seps = suffix_of(t)?;
+        let table = enc.separators();
+        let embd = tile_embd(&to_f32(&ours[MERGER_OUT]), table, width, &seps)?;
+        let embd_nudged = tile_embd(&to_f32(&nudged_run[MERGER_OUT]), table, width, &seps)?;
+        let (_, ref_embd) = oracle.card.tap(name, t.index, vis::EMBD)?;
+        let (_, twin_embd) = oracle.twin.tap(name, t.index, vis::EMBD)?;
+        ok &= band_f32(
+            K_SENS,
+            &stem,
+            "embd",
+            &embd,
+            &ref_embd,
+            dist_f32(&twin_embd, &ref_embd).rms_rel,
+            floor(&ref_embd),
+            dist_f32(&embd_nudged, &embd).rms_rel,
+        );
+        let tail_equal = match (embd.get(split..), ref_embd.get(split..)) {
+            (Some(a), Some(b)) => {
+                embd.len() == t.rows * width
+                    && a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            _ => false,
+        };
+        println!(
+            "tap {stem:<14} {:<20} the {} separator rows {seps:?} equal mainline's, bit for bit  {}",
+            "embd.sep",
+            seps.len(),
+            verdict(tail_equal)
+        );
+        Ok(ok && tail_equal)
+    }
+
+    /// The tower against the sets of mainline's nodes, tile by tile of every image the sets hold.
+    fn mainline_clauses(
+        enc: &mut Encoder,
+        stream: &CudaStream,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
+        let open = |f: &Family, i: usize, kind| McvisSet::open(&f.path(f.sets[i]), kind);
+        let oracle = Oracle {
+            card: open(&vis::TAPS, 0, Kind::Taps)?,
+            twin: open(&vis::TAPS, 1, Kind::Taps)?,
+            pre: open(&vis::PREPROC, 0, Kind::Preproc)?,
+        };
+        let geometry = (hp.n_layer, hp.merger_after, hp.dim, hp.out_dim)
+            == (vis::BLOCKS, vis::INSERT_LAYER, vis::VIT_WIDTH, vis::N_EMBD)
+            && vis::TAP_BLOCKS == [0, hp.merger_after, hp.merger_after + 1, hp.n_layer - 1];
+        println!(
+            "mainline sets: {} images; the card's dumped on {}, its twin on {}; blocks, insert layer and widths equal the nodes' table: {}",
+            oracle.card.images.len(),
+            oracle.card.card,
+            oracle.twin.card,
+            verdict(geometry)
+        );
+        let mut ok = geometry;
+        for img in &oracle.card.images {
+            let mut mainline = Vec::new();
+            for t in &img.tiles {
+                mainline.push(mainline_patches(
+                    &oracle.pre.inp_raw(&img.name, t.index)?,
+                    t,
+                )?);
+            }
+            ok &= preproc_clause(hp, &img.name, img, &mainline)?;
+            for (t, patches) in img.tiles.iter().zip(&mainline) {
+                ok &= tile_clauses(enc, stream, hp, &oracle, &img.name, t, patches)?;
+            }
+        }
+        Ok(ok)
+    }
+
     // ------------------------------------------------------------ the clauses
 
     #[allow(clippy::too_many_lines, reason = "the tower's clauses in chain order")]
@@ -864,6 +1244,9 @@ mod tower {
             verdict(pass)
         );
         ok &= pass;
+
+        // (e) mainline's nodes
+        ok &= mainline_clauses(&mut enc, stream, &hp)?;
         Ok(ok)
     }
 }

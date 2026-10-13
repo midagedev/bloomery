@@ -1,5 +1,6 @@
 //! The row order of a tile and its position rows, as pure functions of the grid: the layout the
-//! tower's two mergers read as reshapes (see [`super`]) and the table row of every patch.
+//! tower's two mergers read as reshapes (see [`super`]) and the table row of every patch; and the
+//! rows that follow a tile's merger rows in the prompt.
 
 use super::{BLOCK_SIDE, GROUP, POS_SIDE};
 
@@ -50,6 +51,62 @@ pub fn position_index(n_h: usize, n_w: usize) -> Vec<usize> {
     (0..n_h)
         .flat_map(|i| (0..n_w).map(move |j| bucket(i, n_h) * POS_SIDE + bucket(j, n_w)))
         .collect()
+}
+
+/// For each window row of the tower (four consecutive merge-order rows, a 2×2 window of patches),
+/// the window's index in mainline's order, `wi·(n_w/2) + wj` (`clip.cpp:4890-4898`): the order of
+/// the rows the down-sample leaves, which blocks 7.. and the final merger read. The grid must pass
+/// [`check_grid`].
+#[must_use]
+pub fn window_rows(n_h: usize, n_w: usize) -> Vec<usize> {
+    let rows = merge_rows(n_h, n_w);
+    (0..n_h * n_w / GROUP)
+        .map(|w| {
+            let raster = rows[w * GROUP];
+            (raster / n_w / 2) * (n_w / 2) + raster % n_w / 2
+        })
+        .collect()
+}
+
+/// The rows of the projector's separator table (`v.tok_embd_sep`, the converter's order:
+/// `</image>`, `<slice>`, `</slice>`, `\n`).
+pub const SEPARATORS: usize = 4;
+
+/// A tile's embeddings as mainline's `embd` holds them: the tower's merger rows (`rows`, `width`
+/// values each) followed by the separator rows `suffix` names, each a row of `separators` (the
+/// table, [`SEPARATORS`] rows of `width`; `Encoder::separators`), in `clip_suffix_rows`' order
+/// (`clip-impl.h:681-697`). A row count that is not whole, a table that is not [`SEPARATORS`]
+/// rows and a suffix naming a row past the table are named errors.
+pub fn tile_embd(
+    rows: &[f32],
+    separators: &[f32],
+    width: usize,
+    suffix: &[u8],
+) -> Result<Vec<f32>, String> {
+    if width == 0 || !rows.len().is_multiple_of(width) {
+        return Err(format!(
+            "{} values are not whole rows of {width}",
+            rows.len()
+        ));
+    }
+    if separators.len() != SEPARATORS * width {
+        return Err(format!(
+            "the separator table holds {} values, not {SEPARATORS} rows of {width}",
+            separators.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(rows.len() + suffix.len() * width);
+    out.extend_from_slice(rows);
+    for &s in suffix {
+        let s = usize::from(s);
+        if s >= SEPARATORS {
+            return Err(format!(
+                "the suffix names separator row {s}; the table has {SEPARATORS}"
+            ));
+        }
+        out.extend_from_slice(&separators[s * width..(s + 1) * width]);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -170,5 +227,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The window rows against the final merger's index tensors: group `t` takes the windows
+    /// `d_q[t]` as its four members, which sit at rows `4t + q`.
+    #[test]
+    fn window_rows_are_mainlines_down_sample_order() {
+        for (n_h, n_w) in [(32usize, 32usize), (24, 40), (28, 40)] {
+            let (half_h, half_w) = (n_h / 2, n_w / 2);
+            let win = window_rows(n_h, n_w);
+            let ds: Vec<Vec<usize>> = [(0, 0), (0, 1), (1, 0), (1, 1)]
+                .iter()
+                .map(|&(r, c)| make_ds_idx(r, c, half_h / 2, half_w / 2, half_w))
+                .collect();
+            for t in 0..ds[0].len() {
+                for (q, d) in ds.iter().enumerate() {
+                    assert_eq!(win[4 * t + q], d[t], "{n_h}x{n_w} t {t} q {q}");
+                }
+            }
+            let mut seen = win.clone();
+            seen.sort_unstable();
+            assert!(seen.iter().enumerate().all(|(i, &v)| i == v));
+        }
+    }
+
+    /// The splice: the merger rows, then the named separator rows in order, and the three named
+    /// refusals.
+    #[test]
+    fn a_tile_is_its_rows_then_its_suffix() {
+        let table: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        let rows = [100.0, 101.0, 102.0, 110.0, 111.0, 112.0];
+        let got = tile_embd(&rows, &table, 3, &[2, 3, 1]).unwrap();
+        assert_eq!(
+            got,
+            [
+                100.0, 101.0, 102.0, 110.0, 111.0, 112.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 3.0, 4.0,
+                5.0
+            ]
+        );
+        assert_eq!(tile_embd(&rows, &table, 3, &[]).unwrap(), rows);
+        assert!(tile_embd(&rows[..5], &table, 3, &[0]).is_err());
+        assert!(tile_embd(&rows, &table[..9], 3, &[0]).is_err());
+        assert!(tile_embd(&rows, &table, 3, &[4]).is_err());
     }
 }
