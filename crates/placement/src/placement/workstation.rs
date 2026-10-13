@@ -258,8 +258,9 @@ pub fn plan_a(layers: usize) -> Machine {
 /// [`PlacementError::DraftOffPlan`], before any device alloc. `None` is
 /// [`plan_a`].
 pub fn plan_a_draft(layers: usize, draft_bytes: Option<u64>) -> Result<Machine, PlacementError> {
-    // Today's plan (a) drops the ask and still returns the unreserved machine.
-    let _ = draft_bytes;
+    if draft_bytes.is_some() {
+        return Err(PlacementError::DraftOffPlan { on: 0, tiers: 0 });
+    }
     Ok(plan_a(layers))
 }
 

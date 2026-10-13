@@ -216,7 +216,16 @@ mod gate {
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&split)?;
         let machine = match args.plan {
-            PlanId::A => workstation::plan_a(inputs.model.layers),
+            PlanId::A => {
+                // A draft file asked of the one-card plan is refused by name
+                // before any device alloc. The byte count is not read.
+                if args.draft.is_some() {
+                    workstation::plan_a_draft(inputs.model.layers, Some(0))
+                        .map_err(|e| format!("plan (a): {e}"))?
+                } else {
+                    workstation::plan_a(inputs.model.layers)
+                }
+            }
             PlanId::B => workstation::plan_b(inputs.model.layers),
             PlanId::Bp => workstation::plan_bp(
                 inputs.model.layers,
