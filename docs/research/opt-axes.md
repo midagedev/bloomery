@@ -331,11 +331,44 @@ The 200–235 GB/s band is the harvest's assumption for the GB10 pool (`dgx-spar
 
 ### 4. Decode A: GLM q8_0 m = 1 gemv
 
-Harvest P0.2 prices a +13 % decode move if the card-serial term is the Q8_0 m = 1 gemv `[stated, plan-triage.md:2055, page not read]`. The card-serial piece they add up is 11.6–13.4 ms inside a 41–43 ms wall `[stated, harvest §2]`. Before any nsys, the trace is: name the kernel in today's GLM decode graph and its bytes, and see whether a card already in `docs/cards` or a published nsys table has its achieved GB/s. A confirm is one nsys on ws only if that kernel is still on the wall and below the plain rate by more than the ruler. Quant owns quant formats; this is a bandwidth reading of a kernel that already exists.
+The decode kernel is `q8_0_gemv` (`crates/gpu/src/q8f32.rs`): one warp owns one output row, one column. The launcher `enqueue_q8_0_gemv` sends `m = 1` there and `m > 1` to `q8_0_gemv_mcol`. A GLM decode step is the point `(1, 1, Step)`. The m=1 sites are `body::gemv` (it refuses a weight that is not Q8_0), `Weights::q8_gemv` for a Q8_0 down, `select` on `indexer.attn_q_b` with the step's `m = 1`, and `Head::enqueue` when `output.weight` is Q8_0. File bytes and device bytes are the same: 32 values are 32 code bytes plus one f16 scale (`q8f32.rs` layout), 34/32 bytes a value.
+
+The trunk step (layers 0–44; layer 45 is the unused next-token layer) reads these weights. Widths are the pinned header census (hidden 4096, KDA k = v = 64, d = 128, latent q 1536, kv 512, heads 64, absorbed qk/v 256, indexer 32 × 128, dense ff 12288, shared ff 2048, vocab 154880) and `Hparams::kda_dims` in ggml order `[k, n_rows]`. The joined q·k·v and the joined latent stack are one launch each. The header census matches that typing: attn q8_0 405 = 34 × 9 KDA matrices + 11 × 9 latent matrices, and attn f32 315 = the remaining vectors.
+
+```text
+serial, on the wall (mixer front, dense down, head)
+  KDA ×34   qkv 24576×4096  106,954,752
+            f_a 128×4096        557,056
+            g_a 128×4096        557,056
+            beta 64×4096        278,528
+            f_b 8192×128      1,114,112
+            g_b 8192×128      1,114,112
+            out 4096×8192    35,651,584
+            one layer       146,227,200    ×34 = 4,971,724,800
+  latent ×11  stack 2304×4096   10,027,008
+              q_b 16384×1536    26,738,688
+              out 4096×16384    71,303,168
+              one layer        108,068,864    ×11 = 1,188,757,504
+  dense down ×3   4096×12288    53,477,376     ×3 =   160,432,128
+  head ×1         154880×4096                     674,037,760
+  serial sum                                          6,994,952,192 B
+```
+
+At the A6000 large-gemv plain read, 567–701 GB/s (`docs/HARDWARE.md`), that sum is 12.34 ms at 567 and 9.98 ms at 701 `[derived]`. Those are byte times, not a measured kernel rate. Launches at or above 26.7 MB are 6,761,545,728 B, 96.7 % of the sum (head, joined qkv, latent out, dense down, KDA out, latent q_b). The rest of the serial sum is the low-rank KDA projections and the 10.0 MB latent stack.
+
+Same kernel, off that sum: `indexer.attn_q_b` is 11 × 6,684,672 = 73,531,392 B on the branch stream beside `attn_q_b`. The shared-expert down is 42 × 8,912,896 = 374,341,632 B in the shadow, concurrent with the host leg (`program.rs`). Other kernels, named so they stay out of this count: `q8_0_gemv_heads` is `attn_k_b` and `attn_v_b` (8,912,896 B each a latent layer); `q8_0_gemv_mcol` is the prompt front; `hc_pre_q8_0` is the stream mix; `ds41_shexp_gate_up` is gate and up (each the same size as that block's down, which is why `glmgemm2-pp.card` calls a dense layer's three matrices 160.4 MB); card experts are K-quant `_sel`.
+
+`glmgemm2-pp.card`'s 26.7 MB and 71.3 MB are these q_b and out weights. `glmswap-pp.card`'s ~195 GB/s is `q8_0_gemv_mcol` at m = 8 on a prompt front, where each weight is reread per chunk. It is not this launch.
+
+The front gemvs, the three dense downs, and the head are on the wall: the mixer and the dense block run before the host go, and the head runs after the chain. The shared-expert down is the launch under the host bridge. The cards that price a whole step put the host leg ahead of the card front. `glmslots-ab.card` derives a card front of 12.8–15.6 ms beside a host leg of 29.6–31.4 ms. `glm-public.card` derives a host-experts-only step of 53.6–61.6 ms from a per-layer card front of 0.30–0.41 ms plus the host leg, and says nothing of GLM has been timed on the A6000 (the box reading it cites is a 3090 feed at 53.7 ms a step). Neither card is this kernel's GB/s.
+
+V4.1 B9 (`docs/v41-placement.md`) measured this kernel on another model: launches of tens of MB at 567–701 GB/s, with the miss in the small launches. That is the nearest achieved rate, and it puts the byte-dominant launches on the plain read. It is not a GLM m = 1 trace.
+
+Confirm: not started. The pass needs the kernel on the wall, the bytes above, and an existing achieved GB/s more than ~1 % under 567–701. The first two hold. No card or nsys table has the third for `q8_0_gemv` at one column on this model, so the ruler clause fails. No nsys. Harvest P0.2's +13 % and its 11.6–13.4 ms inside a 41–43 ms wall stay `[stated, plan-triage.md:2055 and harvest §2, pages not read]`. Quant still owns quant formats. No lever, no default change.
 
 ### 5. Spark G: router regrid
 
-`sparkrouter`, −0.07…−0.22 ms on an 11.50 ms step `[derived, sparkdec §4]`. The center (−1.3 %) can clear a six-round ruler (±0.8 %) and can miss a four-round one (±1.0 %). Spark only. Not ahead of item 1, and not a ws job.
+`sparkrouter`, −0.07…−0.22 ms on an 11.50 ms step `[derived, sparkdec §4]`. The center (−1.3 %) can clear a six-round ruler (±0.8 %) and can miss a four-round one (±1.0 %). Spark only. Gap 4's confirm did not start, and this is not a ws job.
 
 ### 6. Decode F: warmprof W2–W5
 
