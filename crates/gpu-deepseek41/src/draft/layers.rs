@@ -17,9 +17,6 @@
 //!   (the 4-stream broadcast), runs the layers and leaves the last layer's
 //!   fold in the owner's `x`: the last ffn's HC post writes it there, so no
 //!   copy follows ([`BlockPass::enqueue_layers`]).
-//!
-//! The block pass is [`BlockPass`] as it is: its head is built and never
-//! launched here, and goes with the owner's wiring.
 
 use std::mem::size_of;
 use std::sync::Arc;
@@ -32,7 +29,6 @@ use gguf::Split;
 use model::arch::dspark::DraftHparams;
 
 use super::block::{BlockInput, BlockPass, MAX_WIDTH, Rule, embedding_row};
-use super::head::DraftHead;
 use super::kv::{AppendCx, AppendDims, DraftRings, GROUP, GroupRows};
 use super::load::DraftWeights;
 use crate::rope::{Direction, RopeKernels, RopeSpec, RopeTable};
@@ -299,15 +295,6 @@ pub struct V41Layers {
 }
 
 impl V41Layers {
-    /// The widest block the layers hold scratch for. The trait's
-    /// `MAX_ROWS` takes this value; the integration moves it into the impl.
-    pub const MAX_ROWS: usize = MAX_WIDTH;
-
-    /// The most context rows one append graph takes. The trait's
-    /// `APPEND_GROUP` takes this value; the integration moves it into the
-    /// impl.
-    pub const APPEND_GROUP: usize = GROUP;
-
     /// Rings, the append's scratch and the block pass over `w`'s draft.
     /// Load-time only.
     pub fn new(gpu: &Gpu, w: DraftWeights, target: Arc<Split>) -> Result<V41Layers, GpuError> {
@@ -360,17 +347,9 @@ impl V41Layers {
     }
 
     /// Follow `rule` from the next staged block on. Only the pass of
-    /// [`Rule::Reference`] is a graph's: see [`V41Layers::replayable`].
+    /// [`Rule::Reference`] is a graph's: see [`DraftLayers::replayable`].
     pub fn set_rule(&mut self, rule: Rule) {
         self.rule = rule;
-    }
-
-    /// Whether a graph captured under [`Rule::Reference`] is the pass the
-    /// next staged block asks for: the rule's clamp limits are launch scalars
-    /// of the capture, so a block under [`Rule::Ik`] runs eager.
-    #[must_use]
-    pub fn replayable(&self) -> bool {
-        self.rule == Rule::Reference
     }
 
     /// Stage the next blocks at `oracle`'s positions instead of the ones the
@@ -390,7 +369,7 @@ impl V41Layers {
     /// the head chain the owner holds.
     #[must_use]
     pub fn launches(&self, m: usize) -> usize {
-        self.pass.launches(m) - DraftHead::LOGIT_LAUNCHES - DraftHead::markov_launches(m)
+        self.pass.launches(m)
     }
 
     /// Kernel launches one append of `n` rows makes: per group, per layer,
@@ -402,6 +381,9 @@ impl V41Layers {
 }
 
 impl DraftLayers for V41Layers {
+    const MAX_ROWS: usize = MAX_WIDTH;
+    const APPEND_GROUP: usize = GROUP;
+
     fn hidden(&self) -> usize {
         self.w.hp().n_embd
     }
@@ -429,7 +411,6 @@ impl DraftLayers for V41Layers {
         self.pass.stage(
             gpu.stream(),
             &BlockInput {
-                id_last: last,
                 row,
                 width: m,
                 first_pos,
@@ -461,13 +442,25 @@ impl DraftLayers for V41Layers {
                 detail: format!("{m} rows of {n_embd} in a buffer of {} values", x.len()),
             });
         }
-        self.pass.enqueue_layers(gpu, &self.w, &self.rings, Some(x))
+        self.pass.enqueue_layers(gpu, &self.w, &self.rings, x)
     }
 
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         self.rings.reset(gpu.stream())?;
         gpu.stream().synchronize()?;
         Ok(())
+    }
+
+    /// The captures are the pass of [`Rule::Reference`]: its clamp limits are
+    /// launch scalars, so a block staged under another rule runs eager.
+    fn replayable(&self) -> Result<(), GpuError> {
+        if self.rule == Rule::Reference {
+            return Ok(());
+        }
+        Err(GpuError::State {
+            what: WHAT,
+            missing: "the reference rule for a graph pass (ik's rule runs eager)",
+        })
     }
 
     /// The rings are the draft's window whatever `ctx` is, so the bytes do

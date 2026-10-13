@@ -202,7 +202,10 @@ gguf 9 2 0
 # over a value becomes a block for each load and each store (the first pass's residual load, y load and residual store,
 # the second pass's residual load, gamma load and output store), each with its SAFETY line, and the two entries' copies
 # of the body become one call each (#45, merged onto the tree's 1731).
-gpu 1733 193 10
+# PIN(2026-10-13): gpu 1733 -> 1743 blocks, 193 -> 194 fns, a moved body, not old code relaxed: the Markov kernel
+# (ds41_markov, dspark/head.rs) came from gpu-deepseek41's markov.rs with its blocks and its one unsafe fn, each with
+# its SAFETY line; gpu-deepseek41 counts the same amount less.
+gpu 1743 194 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -217,7 +220,9 @@ gpu 1733 193 10
 # went to the gpu crate's mxfp4_sel.rs; the draft's router stays.
 # PIN(2026-10-11): gpu-deepseek41 412 -> 402 blocks and 46 -> 45 fns, the move above: the card sum and places entries
 # went to the gpu crate's card_slots.rs; the tier sums stay.
-gpu-deepseek41 402 45 0
+# PIN(2026-10-13): gpu-deepseek41 402 -> 392 blocks and 45 -> 44 fns, the move above: the Markov kernel went to the gpu
+# crate's dspark/head.rs.
+gpu-deepseek41 392 44 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.

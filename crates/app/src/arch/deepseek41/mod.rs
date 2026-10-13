@@ -5,7 +5,7 @@
 
 mod draft;
 
-pub use draft::CardDraft;
+pub use draft::{Ds41Draft, open_draft};
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
@@ -16,7 +16,7 @@ use bloomery_gpu_deepseek41::body::{
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, Plan};
-use runtime::{Tapped, Target};
+use runtime::{Tapped, TappedPrompt, Target};
 
 use crate::{Keep, Open, Prompt, Session, SessionError};
 
@@ -155,14 +155,55 @@ impl Tapped for Session<Body> {
     }
 }
 
-impl Session<Body> {
+impl TappedPrompt for Session<Body> {
+    /// The tap is built at the draft's open ([`open_draft`]) for its layers;
+    /// a different set is refused by name.
+    fn set_taps(&mut self, layers: &[usize]) -> Result<(), SessionError> {
+        match self.model().body(WHAT)?.feature_layers() {
+            Some(held) if held == layers => Ok(()),
+            Some(held) => Err(SessionError::Refused(format!(
+                "{WHAT}: the feature tap reads the layers {held:?}, not {layers:?}"
+            ))),
+            None => Err(SessionError::Refused(format!(
+                "{WHAT}: no feature tap: open_draft attaches it before the target's first capture"
+            ))),
+        }
+    }
+
     /// [`Target::prompt`] with the feature tap's rows handed to `sink` (the
     /// first position they hold, then one row a position): under the batched
     /// schedule the rows of the call's last `window` positions, per batch
     /// ([`body::prefill_with`]); under steps every position's, after its
     /// step, the host tier's route trace told the call's positions first as
-    /// [`Prompt::prompt`] tells it. The argmax after the last id.
-    pub fn prompt_tapped(
+    /// [`Prompt::prompt`] tells it. The argmax after the last id. A sink's
+    /// error ends the call and comes back as it was.
+    fn prompt_tapped(
+        &mut self,
+        ids: &[u32],
+        window: usize,
+        sink: &mut dyn FnMut(u32, &[f32]) -> Result<(), SessionError>,
+    ) -> Result<u32, SessionError> {
+        let mut refused = None;
+        let called = self.feed_tapped(ids, window, &mut |first, rows| {
+            sink(first, rows).map_err(|e| {
+                refused = Some(e);
+                GpuError::State {
+                    what: WHAT,
+                    missing: "a feature sink that took the rows",
+                }
+            })
+        });
+        match refused {
+            Some(e) => Err(e),
+            None => called,
+        }
+    }
+}
+
+impl Session<Body> {
+    /// The prompt call of [`TappedPrompt::prompt_tapped`], its sink's errors
+    /// the body's.
+    fn feed_tapped(
         &mut self,
         ids: &[u32],
         window: usize,
