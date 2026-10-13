@@ -550,8 +550,16 @@ impl CardLeg {
                 self.kquant.enqueue_gemv_q5k_sel(stream, &d, fault, down)?;
             }
             (Some((DownEntry::Q6k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
-                self.q6k
-                    .enqueue_gemv_q6k_sel(stream, w, act, sel, slots, rows_per_expert, down)?;
+                self.q6k.enqueue_gemv_q6k_sel(
+                    stream,
+                    w,
+                    act,
+                    sel,
+                    slots,
+                    rows_per_expert,
+                    fault,
+                    down,
+                )?;
             }
             (Some((DownEntry::Mxfp4, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 let d = SelDown {
@@ -807,7 +815,8 @@ mod tests {
     /// The leg's K-quant arms against the launches the table names, run by
     /// hand on buffers of exactly the run's slots: for each type, a run of
     /// every token its buffers hold and of fewer, and a Q4_K gate·up beside a
-    /// Q6_K down. The down of a run of fewer reads an activation of more
+    /// Q6_K down. The hand match names Q4_K and Q5_K, and the down also names
+    /// Q6_K; another type refuses by name. The down of a run of fewer reads an activation of more
     /// columns than the run has slots. A slot the card serves must hold a
     /// finite value the run wrote, a slot it does not must still hold what it
     /// held, and the rows are the hand launches' bit for bit.
@@ -879,7 +888,8 @@ mod tests {
                 };
                 match ty {
                     GgmlType::Q4_K => kq.enqueue_gate_up_q4k(stream, &a, sink, &mut h),
-                    _ => kq.enqueue_gate_up_q5k(stream, &a, sink, &mut h),
+                    GgmlType::Q5_K => kq.enqueue_gate_up_q5k(stream, &a, sink, &mut h),
+                    other => panic!("{case}: the hand launch has no {other} gate·up"),
                 }
                 .unwrap_or_else(|e| panic!("{case}: the gate·up: {e}"));
                 let q = QuantSel {
@@ -902,7 +912,10 @@ mod tests {
                     GgmlType::Q4_K => gpu
                         .q4k_sel()
                         .enqueue_gemv_q4k_sel(stream, d.w, d.act, d.sel, slots, N, &mut want),
-                    _ => kq.enqueue_gemv_q5k_sel(stream, &d, sink, &mut want),
+                    GgmlType::Q5_K => kq.enqueue_gemv_q5k_sel(stream, &d, sink, &mut want),
+                    GgmlType::Q6_K => q6
+                        .enqueue_gemv_q6k_sel(stream, d.w, d.act, d.sel, slots, N, sink, &mut want),
+                    other => panic!("{case}: the hand launch has no {other} down"),
                 }
                 .unwrap_or_else(|e| panic!("{case}: the down: {e}"));
 
@@ -973,6 +986,7 @@ mod tests {
                     &sel,
                     slots,
                     N,
+                    sink,
                     &mut want,
                 )
                 .unwrap_or_else(|e| panic!("{case}: the down: {e}"));

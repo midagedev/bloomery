@@ -16,7 +16,7 @@
 //! bytes and every other row starts at 2 mod 4).
 
 use crate::cores::{funnel16, half_to_f32, l2_prefetch, q6k_chain, q6k_dequant, q6k_sub_scale};
-use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
+use crate::fault::{FaultSink, FaultSite};
 use crate::hybrid::HOST;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
@@ -380,8 +380,6 @@ mod q6k_sel_kernels {
 /// the engine stream.
 pub struct Q6kSelKernels {
     module: q6k_sel_kernels::LoadedModule,
-    /// The fault word of the `Gpu` that owns the context.
-    fault: Arc<DeviceBuffer<u32>>,
     /// [`crate::row_prefetch`] of the context's device.
     row_prefetch: bool,
 }
@@ -394,13 +392,14 @@ impl Q6kSelKernels {
         ctx: &Arc<CudaContext>,
         word: &Arc<DeviceBuffer<u32>>,
     ) -> Result<Q6kSelKernels, GpuError> {
-        let fault = crate::module_fault_word(ctx, word, "Q6kSelKernels::load")?;
+        // The word is checked against `ctx` and then dropped: each enqueue
+        // takes the caller's sink, which is a view of this word.
+        crate::module_fault_word(ctx, word, "Q6kSelKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(q6k_sel_kernels, ctx)? };
         Ok(Q6kSelKernels {
             module,
-            fault,
             row_prefetch: crate::row_prefetch(ctx)?,
         })
     }
@@ -414,12 +413,12 @@ impl Q6kSelKernels {
     /// is read for `s < n_slots`, so a cap-sized activation serves a smaller
     /// batch. An id
     /// `>= n_experts` leaves its slot of `y` untouched, and one that is not
-    /// [`HOST`] raises [`FaultSite::ExpertId`] on the owning `Gpu`'s fault
-    /// word as an unlabelled launch ([`LAYER_NONE`]: the launcher knows no
-    /// layer). Asynchronous, allocation-free, capturable.
+    /// [`HOST`] raises [`FaultSite::ExpertId`] on `fault`. A leg passes the
+    /// layer's sink; a direct gate launch passes the unlabelled sink
+    /// ([`Gpu::unlabelled_sink`]). Asynchronous, allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
-        reason = "host launcher, the shape of enqueue_gemv_q4k_sel"
+        reason = "host launcher: the stack, the slots and the caller's fault sink"
     )]
     pub fn enqueue_gemv_q6k_sel(
         &self,
@@ -429,6 +428,7 @@ impl Q6kSelKernels {
         sel: &DeviceBuffer<u32>,
         n_slots: usize,
         rows_per_expert: usize,
+        fault: FaultSink,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "enqueue_gemv_q6k_sel";
@@ -506,7 +506,7 @@ impl Q6kSelKernels {
                 n_slots,
                 n_sb,
                 n_sb.div_ceil(2),
-                crate::sink_over(&self.fault, LAYER_NONE),
+                fault,
                 y,
             )?;
         } else {
@@ -525,7 +525,7 @@ impl Q6kSelKernels {
                 n_slots,
                 n_sb,
                 n_sb.div_ceil(2),
-                crate::sink_over(&self.fault, LAYER_NONE),
+                fault,
                 y,
             )?;
         }

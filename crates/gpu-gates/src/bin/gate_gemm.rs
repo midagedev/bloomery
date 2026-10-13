@@ -835,7 +835,14 @@ mod gate {
                             )?;
                         } else {
                             self.q6s.enqueue_gemv_q6k_sel(
-                                stream, &res.w, act, &sel, m, st.rows, &mut ybuf,
+                                stream,
+                                &res.w,
+                                act,
+                                &sel,
+                                m,
+                                st.rows,
+                                self.gpu.unlabelled_sink(),
+                                &mut ybuf,
                             )?;
                         }
                         let got = ybuf.to_host_vec(stream)?;
@@ -874,9 +881,16 @@ mod gate {
                     .gpu
                     .q4k_sel()
                     .enqueue_gemv_q4k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
-                GemmWeight::Q6K => self
-                    .q6s
-                    .enqueue_gemv_q6k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
+                GemmWeight::Q6K => self.q6s.enqueue_gemv_q6k_sel(
+                    stream,
+                    &res.w,
+                    act,
+                    &sel,
+                    m,
+                    st.rows,
+                    self.gpu.unlabelled_sink(),
+                    &mut y,
+                )?,
                 GemmWeight::Q5K => return Err("Q5_K has no _sel gemv".into()),
                 GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
                     return Err("an i-quant stack has no _sel gemv".into());

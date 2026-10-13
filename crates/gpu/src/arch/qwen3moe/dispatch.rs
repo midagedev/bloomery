@@ -1174,6 +1174,7 @@ fn slots_down(
                 s.route.ids(),
                 m * slots,
                 d.hidden,
+                c.sink,
                 &mut s.down,
             )?,
             DownEntry::Q5k => k.q35(WHAT)?.ffn.kq.enqueue_gemv_q5k_sel(
@@ -1372,7 +1373,7 @@ fn apart_down(
             .enqueue_gemv_q4k_sel(stream, wd, act, &a.sel, n_slots, d.hidden, down)?,
         DownEntry::Q6k => {
             k.q6_sel
-                .enqueue_gemv_q6k_sel(stream, wd, act, &a.sel, n_slots, d.hidden, down)?;
+                .enqueue_gemv_q6k_sel(stream, wd, act, &a.sel, n_slots, d.hidden, c.sink, down)?;
         }
         DownEntry::Q5k => kk.kq.enqueue_gemv_q5k_sel(
             stream,

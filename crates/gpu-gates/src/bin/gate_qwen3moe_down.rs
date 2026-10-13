@@ -114,7 +114,16 @@ mod gate {
         let mut runs = Vec::new();
         for _ in 0..2 {
             let mut y = DeviceBuffer::from_host(stream, &vec![SENT; 4 * rpe])?;
-            q6.enqueue_gemv_q6k_sel(stream, &stack, &act, &sel, 4, rpe, &mut y)?;
+            q6.enqueue_gemv_q6k_sel(
+                stream,
+                &stack,
+                &act,
+                &sel,
+                4,
+                rpe,
+                gpu.unlabelled_sink(),
+                &mut y,
+            )?;
             stream.synchronize()?;
             runs.push(y.to_host_vec(stream)?);
         }
@@ -133,7 +142,16 @@ mod gate {
         }
         let sel_oor = DeviceBuffer::from_host(stream, &[1u32, 4, 0, u32::MAX])?;
         let mut y = DeviceBuffer::from_host(stream, &vec![SENT; 4 * rpe])?;
-        q6.enqueue_gemv_q6k_sel(stream, &stack, &act, &sel_oor, 4, rpe, &mut y)?;
+        q6.enqueue_gemv_q6k_sel(
+            stream,
+            &stack,
+            &act,
+            &sel_oor,
+            4,
+            rpe,
+            gpu.unlabelled_sink(),
+            &mut y,
+        )?;
         stream.synchronize()?;
         let yo = y.to_host_vec(stream)?;
         // Id 4 is past the stack and raises the named fault; u32::MAX is a
@@ -146,12 +164,30 @@ mod gate {
         x_wide.extend(activations(k_out, 4, 6329));
         let act_wide = quantize(&gpu, &x_wide, 8, k_out)?;
         let mut y_wide = DeviceBuffer::from_host(stream, &vec![SENT; 4 * rpe])?;
-        q6.enqueue_gemv_q6k_sel(stream, &stack, &act_wide, &sel, 4, rpe, &mut y_wide)?;
+        q6.enqueue_gemv_q6k_sel(
+            stream,
+            &stack,
+            &act_wide,
+            &sel,
+            4,
+            rpe,
+            gpu.unlabelled_sink(),
+            &mut y_wide,
+        )?;
         stream.synchronize()?;
         let wide_same = bits_equal(&y_wide.to_host_vec(stream)?, &runs[0]);
         let act_few = quantize(&gpu, &x[..2 * k_out], 2, k_out)?;
         let few_refused = matches!(
-            q6.enqueue_gemv_q6k_sel(stream, &stack, &act_few, &sel, 4, rpe, &mut y_wide),
+            q6.enqueue_gemv_q6k_sel(
+                stream,
+                &stack,
+                &act_few,
+                &sel,
+                4,
+                rpe,
+                gpu.unlabelled_sink(),
+                &mut y_wide
+            ),
             Err(bloomery_gpu::GpuError::Shape {
                 what: "enqueue_gemv_q6k_sel",
                 ..
@@ -182,8 +218,11 @@ mod gate {
 
         // ---- the graph: the eager launch above, captured.
         let mut yg = DeviceBuffer::from_host(stream, &vec![SENT; 4 * rpe])?;
+        // The sink is copied in. Taking it inside the closure would borrow `gpu`
+        // for the whole capture.
+        let sink = gpu.unlabelled_sink();
         let graph =
-            gpu.capture(|s| q6.enqueue_gemv_q6k_sel(s, &stack, &act, &sel, 4, rpe, &mut yg))?;
+            gpu.capture(|s| q6.enqueue_gemv_q6k_sel(s, &stack, &act, &sel, 4, rpe, sink, &mut yg))?;
         graph.launch(stream)?;
         stream.synchronize()?;
         let g_same = bits_equal(&yg.to_host_vec(stream)?, &runs[0]);
@@ -247,9 +286,16 @@ mod gate {
                     let act = quantize(&gpu, x, slots, k)?;
                     let mut y = DeviceBuffer::from_host(stream, &vec![SENT; slots * rpe])?;
                     match info.ty {
-                        GgmlType::Q6_K => {
-                            q6.enqueue_gemv_q6k_sel(stream, &stack, &act, &sel, slots, rpe, &mut y)?
-                        }
+                        GgmlType::Q6_K => q6.enqueue_gemv_q6k_sel(
+                            stream,
+                            &stack,
+                            &act,
+                            &sel,
+                            slots,
+                            rpe,
+                            gpu.unlabelled_sink(),
+                            &mut y,
+                        )?,
                         GgmlType::Q4_K => {
                             q4.enqueue_gemv_q4k_sel(stream, &stack, &act, &sel, slots, rpe, &mut y)?
                         }

@@ -1455,7 +1455,7 @@ fn down_sel(
         ),
         DownArm::Q6k => k
             .q6_sel
-            .enqueue_gemv_q6k_sel(stream, wd, act, sel, n_slots, hidden, y),
+            .enqueue_gemv_q6k_sel(stream, wd, act, sel, n_slots, hidden, sink, y),
     }
 }
 

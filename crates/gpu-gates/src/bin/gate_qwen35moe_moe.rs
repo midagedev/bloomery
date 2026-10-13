@@ -2001,9 +2001,16 @@ mod gate {
                 .gpu
                 .q4k_sel()
                 .enqueue_gemv_q4k_sel(stream, wd, &act, &seld, n, HIDDEN, &mut y)?,
-            GgmlType::Q6_K => {
-                c.q6.enqueue_gemv_q6k_sel(stream, wd, &act, &seld, n, HIDDEN, &mut y)?
-            }
+            GgmlType::Q6_K => c.q6.enqueue_gemv_q6k_sel(
+                stream,
+                wd,
+                &act,
+                &seld,
+                n,
+                HIDDEN,
+                c.gpu.unlabelled_sink(),
+                &mut y,
+            )?,
             ty => return Err(format!("layer {} down is {ty:?}", ly.l).into()),
         }
         stream.synchronize()?;
@@ -2085,9 +2092,16 @@ mod gate {
                 .gpu
                 .q4k_sel()
                 .enqueue_gemv_q4k_sel(s, w, act, sel, n_slots, HIDDEN, y),
-            _ => {
-                c.q6.enqueue_gemv_q6k_sel(s, w, act, sel, n_slots, HIDDEN, y)
-            }
+            _ => c.q6.enqueue_gemv_q6k_sel(
+                s,
+                w,
+                act,
+                sel,
+                n_slots,
+                HIDDEN,
+                c.gpu.unlabelled_sink(),
+                y,
+            ),
         }
     }
 
