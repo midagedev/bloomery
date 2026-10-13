@@ -39,15 +39,17 @@
 //! GEMM's residual operand; they are re-sent only when the grid changes (the slices of an image
 //! share one grid). The patch kernel is narrowed f32 → bf16 at load ([`Encoder::narrowed`]).
 //!
-//! The two ops that are not the other towers' (`vis_attn_group`, `vis_mean_groups`) come from the
-//! kernel round that adds them; until its files are in this crate, [`window_attention`] and
-//! [`group_mean`] return a named error and an encode ends there.
+//! The two ops that are not the other towers' are `vis_attn_group` (the vit_merger's attention
+//! inside windows of four rows) and `vis_mean_groups` (the down-sample's residual, the mean of each
+//! window in bf16 like the stream it joins).
 
 use crate::attn::{Attn72Kernels, AttnArgs, HEAD_DIM_72, QkvLayout};
+use crate::attn_group::{AttnGroupArgs, AttnGroupKernels};
 use crate::chain::{Encoded, NoTaps, TapSink, read_bf16, read_f32, tap, up_f32};
 use crate::gelu_tanh::GeluTanhKernels;
 use crate::gemm_bf16::{Epilogue, GemmArgs, GemmKernels};
 use crate::layer_norm::LayerNormKernels;
+use crate::mean_groups::MeanGroupsKernels;
 use bloomery_gpu::{DeviceTensor, GpuError, WindowMut};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Gguf;
@@ -76,48 +78,6 @@ pub const BLOCK_SIDE: usize = 4;
 pub const POS_SIDE: usize = 70;
 /// The tensors the load narrows (f32 on disk, bf16 on the card).
 const NARROWED: [&str; 1] = ["v.patch_embd.weight"];
-
-// ------------------------------------------------------------------ the two mcviskern ops
-
-/// The vit_merger's windowed attention: `vis_attn_group` over `n` rows of `qkv` in groups of
-/// `group` consecutive rows. The kernel is not in this crate yet, so this is a named error.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the argument list of the kernel entry this stands in for"
-)]
-fn window_attention(
-    _stream: &CudaStream,
-    _qkv: &DeviceBuffer<u16>,
-    _layout: QkvLayout,
-    _n: usize,
-    _group: usize,
-    _scale: f32,
-    _out_width: usize,
-    _out: &mut DeviceBuffer<u16>,
-) -> Result<(), GpuError> {
-    Err(GpuError::Shape {
-        what: "MiniCPM-V tower encode",
-        detail: "the vit_merger's windowed attention lands with mcviskern (vis_attn_group)".into(),
-    })
-}
-
-/// The down-sample's residual: the mean `((p0 + p1) + p2) + p3` × 0.25 of each group of `group`
-/// consecutive rows of the first `n` bf16 rows of `src` (`width` values each), rounded to bf16,
-/// into the first `n / group` rows of `out`. The kernel is not in this crate yet, so this is a
-/// named error.
-fn group_mean(
-    _stream: &CudaStream,
-    _src: &DeviceBuffer<u16>,
-    _n: usize,
-    _group: usize,
-    _width: usize,
-    _out: &mut DeviceBuffer<u16>,
-) -> Result<(), GpuError> {
-    Err(GpuError::Shape {
-        what: "MiniCPM-V tower encode",
-        detail: "the vit_merger's mean residual lands with mcviskern (vis_mean_groups)".into(),
-    })
-}
 
 // ------------------------------------------------------------------ bytes
 
@@ -291,6 +251,8 @@ struct Chain {
     norm: LayerNormKernels,
     gelu: GeluTanhKernels,
     attn: Attn72Kernels,
+    window: AttnGroupKernels,
+    mean: MeanGroupsKernels,
     w: Weights,
     pos_table: Vec<u16>,
 }
@@ -499,6 +461,8 @@ impl Encoder {
                 norm: LayerNormKernels::load(ctx)?,
                 gelu: GeluTanhKernels::load(ctx)?,
                 attn: Attn72Kernels::load(ctx)?,
+                window: AttnGroupKernels::load(ctx)?,
+                mean: MeanGroupsKernels::load(ctx)?,
                 hp,
                 w,
                 pos_table,
@@ -822,19 +786,22 @@ impl Chain {
         self.norm
             .enqueue(stream, &s.xa, (&m.ln1.0, &m.ln1.1), hp.eps, n, &mut s.h)?;
         self.project_qkv(stream, &m.attn, n, s)?;
-        window_attention(
+        self.window.enqueue(
             stream,
-            &s.qkv,
-            qkv_layout(hp),
-            n,
-            GROUP,
-            scale,
-            dim,
-            &mut s.att,
+            AttnGroupArgs {
+                qkv: &s.qkv,
+                layout: qkv_layout(hp),
+                n,
+                group: GROUP,
+                scale,
+                out_width: dim,
+                out: &mut s.att,
+            },
         )?;
         self.project_out(stream, &m.attn, n, s)?;
         tap(stream, taps, "vit_merger.attn", &s.xb, n, dim)?;
-        group_mean(stream, &s.xb, n, GROUP, dim, &mut s.mean)?;
+        self.mean
+            .enqueue(stream, n, GROUP, dim, &s.xb, &mut s.mean)?;
         tap(stream, taps, "vit_merger.mean", &s.mean, n / GROUP, dim)?;
         self.norm.enqueue(
             stream,
@@ -972,35 +939,42 @@ mod tests {
         }
     }
 
-    /// The card's bytes against the snapshot's figures (`vision::arch::minicpmv::card`): the
-    /// weights differ by the patch kernel's narrowing, the position table and the separator rows
-    /// staying on the host, and the MLP padding; the scratch by the position rows being bf16, the
-    /// vit_merger's hidden and merged rows reusing `up` and `h`, and the mean buffer.
+    /// The tower's bytes are the card figure a plan reserves for it (`vision::arch::minicpmv::
+    /// card`), whole: the weights of the file's hyperparameters and the activations of tiles of
+    /// 16, 1024 and 1120 patches (the 1000×700 image's slices), buffer lengths included.
     #[test]
-    fn card_bytes_against_the_snapshot() {
+    fn the_tower_holds_the_card_figure() {
         use vision::arch::minicpmv::card;
         let hp = hp();
-        let snapshot = card::of(&hp, 1024);
-        let pad_per_block = 2 * 2 * 48 * 1152 + 4 * 48;
-        let (table, seps) = (4 * 4900 * 1152, 4 * 4 * 2048);
-        let narrowing = 2 * 14 * 14 * 3 * 1152;
-        assert_eq!(
-            weight_bytes_of(&hp),
-            snapshot.weights + 27 * pad_per_block - narrowing - table - seps
-        );
+        for n in [16, 1024, 1120] {
+            let figure = card::of(&hp, n);
+            assert_eq!(weight_bytes_of(&hp), figure.weights);
+            assert_eq!(scratch_bytes_of(&hp, n), figure.scratch, "{n} patches");
+            let (lens, planned) = (Lens::of(&hp, n), card::ScratchLens::of(&hp, n));
+            assert_eq!(
+                [
+                    lens.patches,
+                    lens.pos,
+                    lens.stream,
+                    lens.qkv,
+                    lens.att,
+                    lens.up
+                ],
+                [
+                    planned.patches,
+                    planned.pos,
+                    planned.xa,
+                    planned.qkv,
+                    planned.attn,
+                    planned.up
+                ]
+            );
+            assert_eq!([lens.mean, lens.rows], [planned.mean, planned.out]);
+            assert_eq!(lens.stream, planned.xb);
+            assert_eq!(lens.stream, planned.h);
+        }
         let lens = Lens::of(&hp, 1024);
-        assert_eq!(lens.up, 1024 * 4352);
         assert!(256 * 4 * hp.ff <= lens.up && 64 * hp.merged_dim() <= lens.up);
-        let merged = 256 * 4608; // snapshot `merged`: our `h` is the same rows
-        let merged_mlp = 1024 * 4304; // snapshot `merged_mlp`: inside our `up`
-        let snap = card::ScratchLens::of(&hp, 1024);
-        assert_eq!((snap.merged, snap.merged_mlp), (merged, merged_mlp));
-        let ours = scratch_bytes_of(&hp, 1024);
-        let expect = snapshot.scratch
-            - 4 * snap.cs as u64 // f32 position rows
-            - 2 * (snap.merged + snap.merged_mlp + snap.final_in) as u64
-            + 2 * (lens.pos + lens.up - snap.mlp + lens.mean) as u64;
-        assert_eq!(ours, expect);
         assert_eq!(Encoder::launches(27), 230);
     }
 }
