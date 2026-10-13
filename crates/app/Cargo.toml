@@ -29,6 +29,7 @@ bloomery-levers = { path = "../levers", optional = true }
 cuda-core = { workspace = true, optional = true }
 
 [features]
-deepseek41 = ["dep:bloomery-gpu-deepseek41", "dep:cuda-core"]
+dspark = ["dep:cuda-core"]
+deepseek41 = ["dep:bloomery-gpu-deepseek41", "dspark"]
 glm5next = ["dep:bloomery-gpu-glm5next", "dep:bloomery-levers"]
 mimo2 = ["dep:bloomery-gpu-mimo2", "dep:bloomery-levers"]
