@@ -251,11 +251,7 @@ impl HostExperts for HostRun {
                 scratch,
                 union.as_mut().expect("the branch found the slabs"),
             )?;
-            reads.arena_or_file(
-                tier.as_deref(),
-                layer,
-                experts.iter().map(|&(id, _)| id),
-            );
+            reads.arena_or_file(tier.as_deref(), layer, experts.iter().map(|&(id, _)| id));
             return Ok(());
         }
         let view = &self.layers[index];

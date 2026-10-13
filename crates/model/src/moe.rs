@@ -2679,6 +2679,10 @@ impl HostLayer {
     /// not fit, waits and then runs today's [`serve`]; a pending ticket whose
     /// plan fits runs the one-list split. Without them the claim is
     /// [`TierSlots::ensure_pinned`] and the serve is today's, as before.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the leg's pieces, plus the load's slabs when the call is resident"
+    )]
     pub fn experts_into_on(
         &self,
         lanes: Lanes,
@@ -2752,6 +2756,10 @@ impl HostLayer {
     /// The one-column resident path. A ready ticket, a plan that does not fit
     /// the slabs, or a call with no arena id waits and runs [`serve_column`].
     /// A pending ticket whose plan fits computes hits while the misses fill.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the one-column leg's pieces plus the slabs the split reuses"
+    )]
     fn serve_column_resident(
         &self,
         lanes: Lanes,

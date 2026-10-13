@@ -515,6 +515,14 @@ fn claim_with(
 /// has capacity is the pin's id buffer; a fresh empty one takes a buffer from
 /// the arena's pool, as the allocating claim always did. On a refusal the
 /// picks are given back and cleared, and the pin drops.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the claim's pieces plus the three caller buffers the step slot reuses"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one claim: distinct ids, the slot take, the pin, and the refusal give-back"
+)]
 fn claim_fill(
     layer: usize,
     arena: &LayerArena,
@@ -2705,10 +2713,7 @@ impl NvTier {
                         });
                     }
                 }
-                return Err(fill_error(
-                    layer,
-                    FillFailed { id, error: f.error },
-                ));
+                return Err(fill_error(layer, FillFailed { id, error: f.error }));
             }
         };
         let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
@@ -2868,10 +2873,7 @@ fn step_read(buf: &StepBuf, unit: usize) -> Result<(), GpuError> {
         let Some(read) = reads.get(unit / PARTS) else {
             return Err(GpuError::protocol(
                 "NvTier::fill",
-                format!(
-                    "unit {unit} is past the step fill's {} picks",
-                    reads.len()
-                ),
+                format!("unit {unit} is past the step fill's {} picks", reads.len()),
             ));
         };
         (read.id, read.parts[unit % PARTS].clone())
