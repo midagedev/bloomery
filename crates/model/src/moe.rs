@@ -2764,6 +2764,35 @@ impl HostLayer {
         serve(weights, run, x, experts, out, scratch)
     }
 
+    /// A step call's distinct ids, the refusal of an id past the layer, and
+    /// the ids outside the host segment. The one-column path and the union
+    /// path share it.
+    fn prepare_step_ids(
+        &self,
+        tier: &LayerTier,
+        lists: &[&[(u32, f32)]],
+        s: &mut UnionScratch,
+    ) -> Result<(), ModelError> {
+        s.plan.build(lists, s.per_list)?;
+        if let Some(&e) = s.plan.ids.last()
+            && e as usize >= self.n_expert
+        {
+            return Err(ModelError::MissingTensor(format!(
+                "expert {e} of {}",
+                self.gate.source().info().name
+            )));
+        }
+        s.tier_ids.clear();
+        s.tier_ids.extend(
+            s.plan
+                .ids
+                .iter()
+                .copied()
+                .filter(|e| !tier.host.contains(e)),
+        );
+        Ok(())
+    }
+
     /// The one-column resident path. A ready ticket, a plan that does not fit
     /// the slabs, or a call with no arena id waits and runs [`serve_column`].
     /// A pending ticket whose plan fits computes hits while the misses fill.
@@ -2782,25 +2811,8 @@ impl HostLayer {
         union: &mut UnionScratch,
     ) -> Result<(), ModelError> {
         let lists: [&[(u32, f32)]; 1] = [experts];
-        union.plan.build(&lists, union.per_list)?;
-        if let Some(&e) = union.plan.ids.last()
-            && e as usize >= self.n_expert
-        {
-            return Err(ModelError::MissingTensor(format!(
-                "expert {e} of {}",
-                self.gate.source().info().name
-            )));
-        }
         let tier = self.tier.as_ref().expect("a resident column has a tier");
-        union.tier_ids.clear();
-        union.tier_ids.extend(
-            union
-                .plan
-                .ids
-                .iter()
-                .copied()
-                .filter(|e| !tier.host.contains(e)),
-        );
+        self.prepare_step_ids(tier, &lists, union)?;
         if union.tier_ids.is_empty() {
             return self.serve_column(lanes, split, x, experts, out, scratch);
         }
@@ -2933,24 +2945,7 @@ impl HostLayer {
         )?;
         // The plan's ids are the call's distinct ids, ascending; the union
         // builds the same plan again.
-        scratch.plan.build(lists, scratch.per_list)?;
-        if let Some(&e) = scratch.plan.ids.last()
-            && e as usize >= self.n_expert
-        {
-            return Err(ModelError::MissingTensor(format!(
-                "expert {e} of {}",
-                self.gate.source().info().name
-            )));
-        }
-        scratch.tier_ids.clear();
-        scratch.tier_ids.extend(
-            scratch
-                .plan
-                .ids
-                .iter()
-                .copied()
-                .filter(|e| !tier.host.contains(e)),
-        );
+        self.prepare_step_ids(tier, lists, scratch)?;
         let mut stacks = self.stacks_of(split)?;
         let run = LegRun {
             limit: Some(self.limit),

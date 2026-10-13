@@ -1271,6 +1271,30 @@ impl Stats {
         }
     }
 
+    /// A claim's misses, its pinned hits when the claim pinned, and the
+    /// resident bytes an eviction gives back. The sync claim and the reused
+    /// step job share it.
+    fn note_claim(
+        &self,
+        arena: &LayerArena,
+        kind: Claim,
+        hits: Option<u64>,
+        misses: u64,
+        evictions: u64,
+    ) {
+        self.misses.fetch_add(misses, Ordering::Relaxed);
+        if let Some(hits) = hits {
+            self.pinned_claim(kind, hits, misses);
+        }
+        if evictions > 0 {
+            self.evictions.fetch_add(evictions, Ordering::Relaxed);
+            self.resident_bytes.fetch_sub(
+                evictions * arena.slot_bytes as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     /// One union call on a layer with an arena, by the path it took.
     fn union_call(&self, batched: bool) {
         let by_path = if batched {
@@ -2537,17 +2561,13 @@ impl NvTier {
                 claim_slots(layer, arena, &mut books, ids, kind)?
             }
         };
-        self.stats.misses.fetch_add(claim.misses, Ordering::Relaxed);
-        if pin {
-            self.stats
-                .pinned_claim(kind, claim.pinned.len() as u64, claim.misses);
-        }
-        for _ in &claim.evicted {
-            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .resident_bytes
-                .fetch_sub(arena.slot_bytes as u64, Ordering::Relaxed);
-        }
+        self.stats.note_claim(
+            arena,
+            kind,
+            pin.then_some(claim.pinned.len() as u64),
+            claim.misses,
+            claim.evicted.len() as u64,
+        );
         Ok((arena, claim))
     }
 
@@ -2658,17 +2678,15 @@ impl NvTier {
                 return Err(seam_error(layer, ids, e));
             }
         };
-        self.stats.misses.fetch_add(misses, Ordering::Relaxed);
-        self.stats.pinned_claim(kind, pinned.len() as u64, misses);
-        let n_evict = evicted.len() as u64;
+        self.stats.note_claim(
+            arena,
+            kind,
+            Some(pinned.len() as u64),
+            misses,
+            evicted.len() as u64,
+        );
         evicted.clear();
         drop(evicted);
-        if n_evict > 0 {
-            self.stats.evictions.fetch_add(n_evict, Ordering::Relaxed);
-            self.stats
-                .resident_bytes
-                .fetch_sub(n_evict * arena.slot_bytes as u64, Ordering::Relaxed);
-        }
         if picks.is_empty() {
             drop(picks);
             return Ok(Some(TierPin::new(arena, PinToken { layer, ids: pinned })));
