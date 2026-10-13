@@ -1288,10 +1288,8 @@ impl Stats {
         }
         if evictions > 0 {
             self.evictions.fetch_add(evictions, Ordering::Relaxed);
-            self.resident_bytes.fetch_sub(
-                evictions * arena.slot_bytes as u64,
-                Ordering::Relaxed,
-            );
+            self.resident_bytes
+                .fetch_sub(evictions * arena.slot_bytes as u64, Ordering::Relaxed);
         }
     }
 
