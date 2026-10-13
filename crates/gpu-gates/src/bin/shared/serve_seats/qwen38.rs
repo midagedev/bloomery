@@ -1539,13 +1539,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                    mtp: bool,
                    draft_off: Option<Draft38Off>,
                    floor: bool| {
+        let asked_on = mtp || matches!(draft_off, Some(Draft38Off::Yield(_)));
         let (drafts, draft_off) =
             bloomery_levers::paged_draft(&paged_at(arena, slots, mtp), draft_off);
         eprintln!(
             "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
              slots={served} draft={} (the plan pages host experts through the NVMe tier's RAM \
              arena; {}{})",
-            if mtp { "on" } else { "off" },
+            if asked_on { "on" } else { "off" },
             if drafts { "on" } else { "off" },
             if served < slots {
                 "an unset count serves one slot: a second slot's KV takes card bytes that \
@@ -1845,9 +1846,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     // The one-column rule holds at the plan the load runs: the cache's
     // bound only lowers the context the rule read, which leaves the card
-    // more experts and the host fewer, so a paged load of several columns
-    // — slots stepped together, or a draft — is the seat's own breach.
-    if plan.host.nvme_arena_bytes > 0 && (pass.together(slots) || mtp) {
+    // more experts and the host fewer, so a paged load whose slots step
+    // together is the seat's own breach. A set draft on the one slot
+    // `paged_columns` already served is that plan, not a second column.
+    if plan.host.nvme_arena_bytes > 0 && pass.together(slots) {
         return Err(format!(
             "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
              {slots} slots, the draft {}: the one-column rule read another plan",
