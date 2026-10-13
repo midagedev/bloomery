@@ -33,8 +33,12 @@
 //!   residual add), every linear layer of both towers.
 //! * [`attn`] — non-causal multi-head attention over one image, online softmax: heads of 64
 //!   (`vis_attn`) and heads of 72 (`vis_attn_h72`).
+//! * [`attn_group`] — heads of 72 attending inside consecutive groups of rows only
+//!   (`vis_attn_group`), the vit_merger's windowed attention of MiniCPM-V's tower.
 //! * [`rope2d`] — the 2D rotary embedding of the query and key heads and its angle tables:
 //!   heads of 64 (`vis_rope2d`) and heads of 72 (`vis_rope2d_h72`).
+//! * [`mean_groups`] — the mean of consecutive groups of f32 rows (`vis_mean_groups`), the
+//!   down-sample's residual of MiniCPM-V's vit_merger.
 //! * [`norm`] — RMSNorm over bf16 rows with f32 gains, whole rows or the heads of a segment.
 //! * [`layer_norm`] — LayerNorm with gain and bias.
 //! * [`mlp`] — the SiLU gate between the ViT MLPs' linears, with an optional clamp.
@@ -48,12 +52,14 @@
 
 pub mod aligner;
 pub mod attn;
+pub mod attn_group;
 pub mod chain;
 pub mod encoder;
 pub mod gelu_tanh;
 pub mod gemm_bf16;
 pub mod glm5v;
 pub mod layer_norm;
+pub mod mean_groups;
 pub mod minicpmv;
 pub mod mlp;
 pub mod norm;
