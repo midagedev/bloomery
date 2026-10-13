@@ -64,7 +64,9 @@ pub use host::{
     HostFinalMerger, HostLinear, HostNorm, HostVitMerger, final_merger_f32, host_layer_norm,
     host_linear, vit_merger_f32,
 };
-pub use order::{bucket, check_grid, merge_row, merge_rows, position_index};
+pub use order::{
+    SEPARATORS, bucket, check_grid, merge_row, merge_rows, position_index, tile_embd, window_rows,
+};
 
 const WHAT: &str = "MiniCPM-V tower load";
 

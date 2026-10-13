@@ -2284,8 +2284,12 @@ gate-gpu-qwen3vl-tower:
 # the named refusal of a row count that is not a whole number of windows. Then the tower on the real mmproj: the card bytes (weights
 # 1,101,559,552 B, scratch per patch of a tile), 230 launches a tile, the narrowed tensor; the vit_merger and the final merger
 # teacher-forced against their f32 host twins on a real image's own taps (the erf GELU inside its libm bound); three images (448x448,
-# a sliced 1000x700, 200x200) with finite rows, the rows each grid gives and reuse after the largest bit for bit. The clauses against
-# mainline's reference sets are the media round's. Real file only; the gate lock.
+# a sliced 1000x700, 200x200) with finite rows, the rows each grid gives and reuse after the largest bit for bit. Then the tower against
+# mainline's own nodes (the card's set ref_minicpmv47_vis_taps with its CPU twin and ref_minicpmv47_vis_preproc, under $BLOOMERY_DATA; the
+# mmproj's sets, refused by name when dumped for another file): each tile of its three images fed mainline's own pixels, eleven taps from
+# the patch embedding to the final merger's rows and the embd rows (merger rows then the tile's separator rows, which equal mainline's
+# bit for bit) in a band of K_MARGIN x sqrt(N) times the larger of the twin's distance, the bf16 floor and the nudge sensitivity; our plan
+# and canvas equal the set's. Real file only; the gate lock.
 gate-gpu-minicpmv-tower:
     ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minicpmv-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_minicpmv_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minicpmv_tower'
 
