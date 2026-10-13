@@ -24,10 +24,11 @@ breakdown and no read sizes.
 
    The other parts of stage 1 predict about 0 here: repacking (C2 already gets its queue depth),
    fewer read calls, and GPU-visible writes (GB10 only, S7).
-2. Stage 2 (mixed precision) is not lossless against the shipped file: it is a different model file. Stage 3 (draft)
-   already exists for Qwen3.8 (MTP) and Qwen3.6 (DSpark), and its multi-column steps already take C1's path. Both are
-   maintainer questions (§5), not 0.3.3 work.
+2. Stage 2 (mixed precision) is not lossless against the shipped file: it is a different model file. It is in
+   0.3.3 as a separate file-choice row (§5). Stage 3 (draft) already exists for Qwen3.8 (MTP) and Qwen3.6 (DSpark);
+   MiniCPM draft serving is also in 0.3.3. Multi-column steps already take C1's path.
 3. C3 opens only on a measured miss recall. A free Mac replay and an oracle-prefetch ceiling run come first (§3).
+   Prefetch gets a lever; default ON if it measures a win. Defaults favor what measures best; release scope is aggressive.
 
 ## 1. Current state
 
@@ -111,13 +112,13 @@ independent expert products are computed. The final sum stays in list order, so 
 | Rank | Candidate (LES idea) | Shape A gain [derived] | Gate plan G gain [derived] | Cost | Break-even / open condition |
 |---|---|---|---|---|---|
 | 1 | **C2: part units**, a fill's 3 parts as 3 reader units, so one miss runs at QD 3 (LES "fewer read calls" / "weight layout"; tierengine S2's remaining half) | L × (t_QD1 − t_QD3) = 3.5 × (0.81–1.06 − 0.64–0.75) = 0.2–1.5 ms: **+1..+7 %**, central +4 % | 29.5 × (0.31–0.42) = 9–12 ms: **+11..+17 %** of ~75–85 ms [assumption: G's post-S1 token] | small: `read_pick` split into parts, `Job.units = 3 × picks`, publish at the last part | none: the bytes are the same. Gain > 0 while R(3) > R(1). Opened either way; T2's census reads t_QD1 for the Step kind first |
-| 2 | **C1: resident-first on the one-column step**: the `Chain::Step` miss path takes the existing `serve_step_split` (LES "compute resident experts first") | hits per miss layer ≈ 3 × 23.6 µs = 0.07 ms; × L 3.5 = 0.25 ms: **+1 %** (inside the ruler) | ≈ 9 hits × 23.6 µs = 0.21 ms × 29.5 = 6.2 ms: **+7..+9 %** | small: the code exists; the step needs union slabs (`HostRun::prepare_union`, `run.rs:132`) and an allocation-free miss issue (§5 Q6) | gain = L × min(t_hits, t_fill) > the handoff of a reader job (0.05–0.15 ms a job [assumption, `tierengine.md:494`]). At shape A it is near even, so it lands as structural, the prerequisite for C3 (the step must be able to wait on a fill in flight), and is A/B'd at G |
+| 2 | **C1: resident-first on the one-column step**: the `Chain::Step` miss path takes the existing `serve_step_split` (LES "compute resident experts first") | hits per miss layer ≈ 3 × 23.6 µs = 0.07 ms; × L 3.5 = 0.25 ms: **+1 %** (inside the ruler) | ≈ 9 hits × 23.6 µs = 0.21 ms × 29.5 = 6.2 ms: **+7..+9 %** | small: the code exists; the step needs union slabs (`HostRun::prepare_union`, `run.rs:132`) and a miss issue that may allocate on land (§5); allocation-free is a follow-up | gain = L × min(t_hits, t_fill) > the handoff of a reader job (0.05–0.15 ms a job [assumption, `tierengine.md:494`]). At shape A it is near even, so it lands as structural, the prerequisite for C3 (the step must be able to wait on a fill in flight), and is A/B'd at G |
 | 3 | **C3: cross-layer prefetch** (LES "cross-layer routing prediction"): at layer l's service, predict l+d's misses and queue them as `Kind::Prefetch` (rank 3, `Claim::Transient`); a step claim on an in-flight prefetch waits on it | r × L × h, h = min(window d × 0.49 ms, residual fill 0.57–0.68): d = 1 gives r × 3.5 × 0.49; **r 0.6 → +4.5 %, oracle r 1 → +7.8 %** | window ≥ 0.77 ms ≥ fill: r × 29.5 × 0.5 ≈ 15 r ms; **r 0.6 → +12 %** | medium: a fourth kind, joining a FILLING slot, cancellation, counters, a predictor | see the break-even below; open only if the replay gives r_miss ≥ 0.35 at d = 1 (shape A) and the oracle ceiling run clears the ruler |
 | 4 | C2b: sub-part tiles (part/3, 9 units a fill) | −0.16 ms a fill × 3.5 = 0.56 ms: +2 % | −7 ms (−8 %) (`tierengine.md:357`) | small after C2 | only if C2's measured QD-3 fill is ≥ 0.6 ms (S11's existing gate) |
 | — | Contiguous repack (one 3.1 MB pread an expert, LES "weight layout") | 2 syscalls × ~10 µs [assumption] × f 4 = 0.08 ms: **~0** once C2 lands. The block layer already gives QD ~3–4 from one thread (`qdsweep.card:17-20`) and C2 gives the same QD with no file rewrite | ~0 | large: a sidecar of the paged stacks (2× disk) or a rewritten file | do not open |
 | — | Direct writes to GPU-visible memory | 0 on discrete: the CPU computes the paged experts (`nvtier.rs:1-9`) | 0 | — | GB10 only: that is S7 + the card leg, the contributor's (`tierengine.md:499`; `docs/contrib/dgx-spark.md` §8). Not this plan |
-| — | Layer-wise mixed precision (LES stage 2) | n/a | n/a | a new quant file | not lossless against the shipped file; maintainer question §5 Q3 |
-| — | Speculative decode (LES stage 3) | exists: MTP (Qwen3.8), DSpark (Qwen3.6); its `Cols` steps already take C1's path | — | — | read beside as a row (§3), no work |
+| — | Layer-wise mixed precision (LES stage 2) | n/a | n/a | a new quant file | not lossless against the shipped file; in 0.3.3 as a separate file-choice row (§5) |
+| — | Speculative decode (LES stage 3) | exists: MTP (Qwen3.8), DSpark (Qwen3.6); MiniCPM draft serving in 0.3.3; its `Cols` steps already take C1's path | — | — | read beside as a row (§3); MiniCPM draft is in scope (§5) |
 
 **C3 break-even [derived].** Let r be the miss recall: the predicted ids that would have missed, over all step
 misses. Let q be the precision over predicted *non-resident* ids (only those issue reads; a predicted resident id is
@@ -159,7 +160,7 @@ the replay also scores d = 2.
 |---|---|---|---|
 | A | Qwen3.8 UD-Q4_K_XL, A6000 plan a, `HOST_ROOM=27G NVTIER_BYTES=20G`, residency off, `BLOOMERY_DRAFT=off`, prose 512, n 1024, ctx 3072 | refill-decode.card's shape: the one paged tier shape with an admissible number on main (42.21 tok/s) | `just depth-gpu-qwen4exp` (as in `refill-decode.card:61-64`) |
 | G | Qwen3.8, gate plan (`BLOOMERY_GEN_PLACE=gate`), draft off, n 1024 | f ≈ 46: the fill-bound regime; C1's only admissible shape | same, `BLOOMERY_GEN_PLACE=gate` |
-| M | MiniCPM-V 4.7 35B-A3B Q4_K_M text, A6000, `BLOOMERY_CARD_BUDGET` low enough that every routed expert is on the host, `HOST_ROOM` / `NVTIER_BYTES` so the arena holds about half the routed bytes ("LES-like": most experts behind the drive) | LES's own model; checks that the levers carry across families | `just depth-gpu-qwen35moe` with `BLOOMERY_REF_MODEL` → the MiniCPM file (§5 Q2 on its corpus ids) |
+| M | MiniCPM-V 4.7 35B-A3B Q4_K_M text, A6000, `BLOOMERY_CARD_BUDGET` low enough that every routed expert is on the host, `HOST_ROOM` / `NVTIER_BYTES` so the arena holds about half the routed bytes ("LES-like": most experts behind the drive) | LES's own model; checks that the levers carry across families | `just depth-gpu-qwen35moe` with `BLOOMERY_REF_MODEL` → the MiniCPM file (qwen35moe profile + path override; no new corpus ids, §5) |
 | A+d, M+d | A and M with the draft on (MTP / DSpark) | reads beside: a `Cols` chain already takes C1's path | same |
 
 MiniCPM's expert size: Qwen3.6-35B-A3B's shape is 40 layers, 256 experts, 8 used, hidden 2048, expert ff 512 [all
@@ -229,7 +230,7 @@ same arms with the draft on.
   - `gate-union` and `gate-ops` (column identity).
   - `gate-gpu-nvtier` (slot bit identity, the identities of §3.2).
   - `gate-gpu-e2e` and `gate-gpu-qwen35moe-e2e` (tokens).
-  - `gate-alloc` (no allocation added on a hit-only step; §5 Q6 for the miss path).
+  - `gate-alloc` (no allocation added on a hit-only step; miss-path allocation may land, removal is a follow-up, §5).
 
   FAIL-first per clause:
   - Sum the split path in landing order: `gate-union` goes red.
@@ -255,24 +256,15 @@ Order and owners: T0, T1 and T3's script run in parallel (Mac). T2 needs T1 and 
 `nvtier.rs`, so one owner per round, T5 rebased on T4. T6 needs both, and T7 needs T6 and the E0/E3b verdict. Every
 task is host-only. `just narrow` applies, and a kernel that moved is a stop.
 
-## 5. Questions for the maintainer (nothing here changes a release, a default or a public API)
+## 5. Decisions (2026-10-14)
 
-1. **Which shape is the 0.3.3 claim?** A (the public paged A6000 shape, draft off), G (the gate plan) or M (MiniCPM,
-   LES-like)? C1 is under the ruler at A and admissible only at G. The README's rows run the draft on, where `Cols`
-   already has C1.
-2. **MiniCPM in the timing runners.** There is no profile under `tools/ref/models/`. Is `qwen35moe.sh` with
-   `BLOOMERY_REF_MODEL` acceptable, or does MiniCPM get its own profile? Is its tokenizer equal to Qwen3.6's? If not,
-   its `corpus-prose.ids` must be made.
-3. **LES stage 2 (mixed precision)** produces a different file and is not bit-identical to the shipped Q4_K_M. Is it
-   out of scope, or a separate "file choice" row?
-4. **LES stage 3.** The MiniCPM DFlash draft config reads (`crates/hf/src/dspark.rs:9`, fixture
-   `crates/hf/tests/fixtures/dspark-minicpm-v-4.7-config.json`). Is it served on the `qwen3` seat in 0.3.3? This plan
-   only reads drafted rows beside.
-5. **A prefetch lever.** A same-binary arm needs a lever row in `crates/levers/src/registry.rs`, a new runtime lever
-   with a default. Without one, every C3 claim is tree-against-tree, which keeps claims under 1 % inadmissible. Should
-   T6 add it, and with which default?
-6. **Allocation on the miss path.** `4d6dbeb2` states that the `Cols` miss path allocates on issue and that `gate-alloc`
-   does not see it. T5 moves the one-column step onto that path. Does T5 make it allocation-free (as planned) before
-   landing, or may it land with the `Cols` path's current allocation and a dated note?
+Project rule for this plan: defaults favor what measures best; release scope is aggressive.
+
+1. **0.3.3 claim shape.** The claim rides on A6000 paged (shape A). Other shapes (G, M, drafted rows) record measurements only.
+2. **MiniCPM timing.** Use the `qwen35moe` profile with a model-path override (`BLOOMERY_REF_MODEL`). Do not add new corpus ids.
+3. **Mixed-precision stage (LES stage 2).** In 0.3.3, as a separate file-choice row (not bit-identical to the shipped Q4_K_M).
+4. **MiniCPM draft serving (LES stage 3).** In 0.3.3 on the `qwen3` seat. Drafted rows still read beside as in §3.
+5. **Prefetch lever.** T6 adds a lever row. Default is ON if it measures a win; otherwise OFF until it does.
+6. **Allocation on the miss path.** Plain-decode resident-first (T5) may land with the `Cols` path's current allocations if it wins. Making that path allocation-free is a follow-up.
 
 [les]: https://github.com/tc-mb/llama.cpp-omni/blob/master/docs/les/lookahead-expert-scheduling.md
