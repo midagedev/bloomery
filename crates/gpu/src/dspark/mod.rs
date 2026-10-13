@@ -275,7 +275,13 @@ impl<L: DraftLayers> DsparkBody<L> {
         // Markov step through its device map: the two must be one map.
         match (&shape.vocab, &head.to_target) {
             (DraftVocab::Full { .. }, None) => {}
-            (DraftVocab::Reduced { to_target, n_target }, Some(map)) => {
+            (
+                DraftVocab::Reduced {
+                    to_target,
+                    n_target,
+                },
+                Some(map),
+            ) => {
                 if head.markov_w1.rows() != *n_target {
                     return Err(refuse(format!(
                         "markov_w1 of {} rows for a reduced vocabulary over the target's {n_target} \
