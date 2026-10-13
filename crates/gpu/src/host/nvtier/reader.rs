@@ -1,9 +1,11 @@
 //! The NVMe tier's fill reader: threads the tier owns, started at its build,
-//! that run a fill's units (one pick's reads a unit) off the caller. Each
+//! that run a fill's units (one part's read a unit) off the caller. Each
 //! thread is blocked in one read at a time, so the threads are the queue
-//! depth the drive is read at. They never take the pool's dispatch lock, the
-//! books' lock or wait on the card: a job is its own data (the mapping, the
-//! files, the spans), and its completion is a latch the caller waits on.
+//! depth the drive is read at. A fill is three parts, so one miss is three
+//! units and those reads are in flight together. They never take the pool's
+//! dispatch lock, the books' lock or wait on the card: a job is its own data
+//! (the mapping, the files, the spans), and its completion is a latch the
+//! caller waits on.
 //!
 //! One queue, by rank: a job of a lower rank is taken before every job of a
 //! higher one, first come first served within a rank. A job's rank is its
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 use crate::GpuError;
 use model::moe::Claim;
 
-/// The work of one unit of a job: a pick's reads. Runs on a reader thread.
+/// The work of one unit of a job: one part of one pick. Runs on a reader thread.
 type Unit = Box<dyn Fn(usize) -> Result<(), GpuError> + Send + Sync>;
 
 /// Why a job's unit failed: the first failure of the job, by the unit's index.
@@ -153,8 +155,8 @@ impl Job {
 /// What the readers count of one kind of job.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KindStats {
-    /// Jobs submitted, and their units (picks) — the fills that ran off the
-    /// caller.
+    /// Jobs submitted, and their units (one part of a pick) — the fills that
+    /// ran off the caller. A fill is three units.
     pub jobs: u64,
     pub units: u64,
     /// Waits that found their job unfinished, and the wall they blocked

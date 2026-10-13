@@ -2120,7 +2120,7 @@ fn run() -> Result<(), GateError> {
             println!(
                 "refuse floor-serve: an arena of the floor's {} slots a paged layer (carved {}) \
                  served the {PROMPT}-position prompt, its argmax and logits row bit for bit the \
-                 all-RAM arm's ({bits}), the fill reader took {} picks of it: {}",
+                 all-RAM arm's ({bits}), the fill reader took {} parts of it: {}",
                 least.slots,
                 floor.slots,
                 floor.reader_units,
@@ -2489,7 +2489,7 @@ fn run() -> Result<(), GateError> {
         ran.victim.jobs > 0 && ran.prompt.jobs > 0 && paged.landed > 0 && slot_reads > 0;
     println!(
         "residency_prompt: over the prompt call and {STEPS} steps under the set mid-p0-s1 the fill \
-         reader ran {} victim jobs ({} picks, {} waits for {:.1} ms) and {} prompt jobs ({} picks, \
+         reader ran {} victim jobs ({} parts, {} waits for {:.1} ms) and {} prompt jobs ({} parts, \
          {} waits for {:.1} ms); {} flips landed; the lane's copies read {slot_reads} arena slots \
          and {mapping_reads} of the file mapping over the steps (the mapping reads are printed, \
          not judged) (want victim jobs, prompt jobs, flips and slot reads above 0): {}",
@@ -2777,11 +2777,14 @@ fn run() -> Result<(), GateError> {
         .as_ref()
         .ok_or("the paged arm read no prompt fills")?;
     let batches = fill.reader.prompt;
-    let on_reader = fill.fills > 0 && batches.units * 100 >= fill.fills * 99;
+    // A fill is three part-units. A reader that still issued one unit a fill
+    // falls short of 99 % of that.
+    let want_parts = fill.fills.saturating_mul(3);
+    let on_reader = fill.fills > 0 && batches.units * 100 >= want_parts * 99;
     println!(
         "pool: the prompt's {} fills ({:.2} GB, {:.1} ms summed over the batches' own walls, \
-         {:.2} GB/s) ran {} picks in {} batches on the fill reader (want at least 99 % of the \
-         fills): {}; the caller blocked in {} waits for {:.1} ms of the prompt's {:.1} ms",
+         {:.2} GB/s) ran {} parts in {} batches on the fill reader (want at least 99 % of \
+         3 parts a fill): {}; the caller blocked in {} waits for {:.1} ms of the prompt's {:.1} ms",
         fill.fills,
         fill.bytes as f64 / 1e9,
         fill.fill_ns as f64 / 1e6,
