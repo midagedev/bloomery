@@ -170,7 +170,7 @@
 //! under `--place gate`, beside `--logits` or `BLOOMERY_ROUTE_TRACE`, with no
 //! file there, and when an arm's last window would pass `--ctx` (depth + n +
 //! 2 positions), with a `load draft=off (<why>)` record after the `load`
-//! line — `no file at <path>` for the missing file — never a refusal.
+//! line — `no file at <path>[, <path>…]`, every place the pick looked — never a refusal.
 //! `BLOOMERY_DRAFT=off` is the plain path with the same record. A plan that
 //! pages host experts through the NVMe tier's RAM arena steps one column
 //! (`bloomery_levers::paged_columns`, asked of the plan the run loads): an
@@ -419,7 +419,7 @@ mod cli {
     use model::placement::workstation::HostRead;
     use model::placement::{Device, Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
-    use refset::arch::qwen4exp::mtp::draft_file;
+    use refset::arch::qwen4exp::mtp::{draft_file, draft_places};
     use runtime::width::{Choosing, Chosen as _, Mode as WidthMode, Stats};
     use runtime::{
         Advance, Committed, Exhausted, Forced, PassSink, Picked, Speculative, Stop, Target,
@@ -1820,7 +1820,9 @@ mod cli {
             )
             .into()),
             None => {
-                let (file, _) = draft_file(levers.mtp_draft(), &ref_model_path()?);
+                let target = ref_model_path()?;
+                let (file, _) = draft_file(levers.mtp_draft(), &target);
+                let looked = draft_places(&target);
                 // The generation loop runs a window of ROWS rows only while
                 // they fit (`runtime::Stop::check`): at `e` tokens emitted the
                 // target stands at depth + e − 1, and the last check before
@@ -1837,6 +1839,7 @@ mod cli {
                     route_trace: levers.route_trace().is_some(),
                     file: &file,
                     file_is_there: file.is_file(),
+                    looked: &looked,
                     need,
                     ctx,
                 };

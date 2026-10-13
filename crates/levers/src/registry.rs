@@ -374,7 +374,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `--place gate`, beside `--logits` or `BLOOMERY_ROUTE_TRACE`, with no file there, \
               and when an arm's last four-row window would pass `--ctx` (depth + n + 2 \
               positions) — each printed as a `load draft=off (<why>)` record after the `load` \
-              line (`no file at <path>` for the missing file), never a refusal; with the file \
+              line (`no file at <path>[, <path>…]`, every place the pick looked), never a refusal; with the file \
               there, a target whose `token_embd` or `output` is not Q8_0, the format the draft \
               reads them in, is refused by name before the load. \
               `bloomery-serve-qwen38` follows the same rule, its conditions the seat's: under \

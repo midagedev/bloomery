@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -1127,6 +1127,7 @@ fn draft38_unset_follows_the_place_and_the_file() {
         route_trace,
         file,
         file_is_there,
+        looked: &[],
         need,
         ctx: 4352,
     };
@@ -1142,7 +1143,7 @@ fn draft38_unset_follows_the_place_and_the_file() {
         ),
         (
             at(true, false, false, false, 4353),
-            Some(Draft38Off::NoFile(file.to_path_buf())),
+            Some(Draft38Off::NoFile(vec![file.to_path_buf()])),
         ),
         (
             at(true, false, true, false, 1),
@@ -1155,8 +1156,17 @@ fn draft38_unset_follows_the_place_and_the_file() {
         assert_eq!(draft38_unset(&at), want, "{at:?}");
     }
     assert_eq!(
-        Draft38Off::NoFile(file.to_path_buf()).to_string(),
+        Draft38Off::NoFile(vec![file.to_path_buf()]).to_string(),
         "no file at /models/q/mtp.gguf"
+    );
+    assert_eq!(
+        Draft38Off::NoFile(vec![
+            PathBuf::from("/links/mtp.gguf"),
+            PathBuf::from("/real/mtp.gguf"),
+            file.to_path_buf(),
+        ])
+        .to_string(),
+        "no file at /links/mtp.gguf, /real/mtp.gguf, /models/q/mtp.gguf"
     );
     assert_eq!(
         Draft38Off::Borrowed {
@@ -1325,7 +1335,7 @@ fn a_paged_plan_serves_its_asked_slots() {
         Draft38Off::Gate,
         Draft38Off::Logits,
         Draft38Off::RouteTrace,
-        Draft38Off::NoFile(file.to_path_buf()),
+        Draft38Off::NoFile(vec![file.to_path_buf()]),
         Draft38Off::Ctx { need: 5, ctx: 4 },
         Draft38Off::Borrowed {
             name: "output.weight".to_string(),

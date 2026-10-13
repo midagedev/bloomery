@@ -235,7 +235,7 @@
 //! plain path runs under `--place gate`, with no file there, and with stores
 //! too short for one window (a slot's share of `--ctx-size` under 5: the
 //! total under 5 a slot), each printed as a `load draft=off (<why>)` record
-//! after the `load` line (`no file at <path>` for the missing file), never a
+//! after the `load` line (`no file at <path>[, <path>…]`, every place the pick looked), never a
 //! refusal; `BLOOMERY_DRAFT=mtp` set with stores that short is refused by
 //! name before the plan. Unset with the ctx rule's own
 //! default, the draft then yields to the context
@@ -391,7 +391,7 @@ use model::placement::ctx::{
 use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN, host_available_read};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
-use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
+use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file, draft_places};
 use runtime::Target as _;
 use runtime::seqstate::pinned;
 use runtime::width::Mode as WidthMode;
@@ -787,6 +787,7 @@ fn draft38(
     place: Place38,
     (ctx, slots): (usize, usize),
     file: &Path,
+    looked: &[std::path::PathBuf],
     inputs: &PlanInputs,
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
     match levers.draft() {
@@ -804,6 +805,7 @@ fn draft38(
                 route_trace: levers.route_trace().is_some(),
                 file,
                 file_is_there: file.is_file(),
+                looked,
                 need: window_positions(slots),
                 ctx,
             };
@@ -1351,6 +1353,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let draft_at = a.flag.unwrap_or(Place38::A);
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
+    let draft_looked = draft_places(&path);
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     // The stage card's first open is made before the room is read
     // (`Gpu::hold_card`: its context and the bundle), so the plans' room has
@@ -1380,6 +1383,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_at,
         (a.ctx.unwrap_or(CTX.saturating_mul(slots)), slots),
         &draft_path,
+        &draft_looked,
         &inputs,
     )?;
     // A draft lever set on a server that drafts nothing is refused, with

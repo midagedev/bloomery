@@ -200,6 +200,35 @@ impl BesideDraft {
                 }),
         }
     }
+
+    /// Every path [`BesideDraft::pick`] checks when the lever is unset, in
+    /// that order, whether or not a file is there: the draft's name in the
+    /// target's directory, that name in the resolved directory when it is a
+    /// different one, then [`BesideDraft::path`] when it is not already one
+    /// of those. The `load draft=off` line names this list, so a missing
+    /// sidecar says where the run looked, once per path.
+    #[must_use]
+    pub fn places(&self, target: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let name = Path::new(self.path).file_name();
+        if let (Some(name), Some(dir)) = (name, target.parent()) {
+            out.push(dir.join(name));
+            if let Some(resolved) = target
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+            {
+                if resolved.as_path() != dir {
+                    out.push(resolved.join(name));
+                }
+            }
+        }
+        let family = PathBuf::from(self.path);
+        if !out.iter().any(|p| p == &family) {
+            out.push(family);
+        }
+        out
+    }
 }
 
 /// [`BesideDraft::pick`]'s rule over one path.
@@ -495,6 +524,34 @@ mod tests {
         assert_eq!(
             ROW.pick(None, &target),
             (PathBuf::from(ROW_PATH), DraftFrom::Family)
+        );
+        let beside = s.real_dir("only").join(ROW.name());
+        assert_eq!(ROW.places(&target), vec![beside, PathBuf::from(ROW.path)]);
+    }
+
+    /// The beside path is the family's path when the target already sits in
+    /// that directory, so the off line names it once.
+    #[test]
+    fn places_names_the_family_path_once_when_the_target_sits_there() {
+        let target = Path::new("/nowhere/shard.gguf");
+        assert_eq!(ROW.places(target), vec![PathBuf::from(ROW.path)]);
+    }
+
+    /// A symlink is looked at in the link's directory and then beside the
+    /// real shard, and the family's path is last. The off line names all three.
+    #[cfg(unix)]
+    #[test]
+    fn places_names_the_link_the_real_shard_and_the_family_path() {
+        let s = Scratch::new("places");
+        let shard = s.file("real", "shard-00001.gguf");
+        let target = s.link(&shard);
+        assert_eq!(
+            ROW.places(&target),
+            vec![
+                s.0.join("links").join(ROW.name()),
+                s.real_dir("real").join(ROW.name()),
+                PathBuf::from(ROW.path),
+            ]
         );
     }
 

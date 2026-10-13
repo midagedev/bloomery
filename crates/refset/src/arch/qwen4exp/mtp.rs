@@ -33,6 +33,13 @@ pub fn draft_file(set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
     BESIDE.pick(set, target)
 }
 
+/// Every path [`draft_file`] checks when the lever is unset
+/// ([`BesideDraft::places`]).
+#[must_use]
+pub fn draft_places(target: &Path) -> Vec<PathBuf> {
+    BESIDE.places(target)
+}
+
 /// The ik tree the MTP draft set is dumped from: ik's glm5next MTP graph
 /// merged onto the upstream commit whose qwen4exp graph builds the MTP
 /// layer and loads a shared draft beside the target, so one dumper serves

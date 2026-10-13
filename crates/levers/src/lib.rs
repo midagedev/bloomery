@@ -1854,6 +1854,9 @@ pub struct Draft38At<'a> {
     /// there.
     pub file: &'a Path,
     pub file_is_there: bool,
+    /// Every path the unset pick checked, in order. Empty means the caller
+    /// only has `file`, and the off line names that one path.
+    pub looked: &'a [PathBuf],
     /// The positions the drafted run's last window needs at most over the
     /// run's arms, and `--ctx`.
     pub need: usize,
@@ -1872,8 +1875,9 @@ pub enum Draft38Off {
     Logits,
     /// Unset beside the route trace.
     RouteTrace,
-    /// Unset, and no regular file where the draft would be opened.
-    NoFile(PathBuf),
+    /// Unset, and no regular file at any path the pick checked. The paths are
+    /// every place it looked, in order.
+    NoFile(Vec<PathBuf>),
     /// Unset, and the last window needs `need` positions of `ctx`.
     Ctx { need: usize, ctx: usize },
     /// Unset on the Qwen3.8 seat, and the target's `name`, a matrix the
@@ -1901,7 +1905,19 @@ impl fmt::Display for Draft38Off {
             Draft38Off::RouteTrace => {
                 f.write_str("unset: BLOOMERY_ROUTE_TRACE records one step a position")
             }
-            Draft38Off::NoFile(p) => write!(f, "no file at {}", p.display()),
+            Draft38Off::NoFile(paths) => {
+                let mut it = paths.iter();
+                match it.next() {
+                    None => f.write_str("no file"),
+                    Some(first) => {
+                        write!(f, "no file at {}", first.display())?;
+                        for p in it {
+                            write!(f, ", {}", p.display())?;
+                        }
+                        Ok(())
+                    }
+                }
+            }
             Draft38Off::Ctx { need, ctx } => write!(
                 f,
                 "unset: the last window needs {need} positions, past --ctx {ctx}"
@@ -1933,7 +1949,12 @@ pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
     } else if at.route_trace {
         Some(Draft38Off::RouteTrace)
     } else if !at.file_is_there {
-        Some(Draft38Off::NoFile(at.file.to_path_buf()))
+        let paths = if at.looked.is_empty() {
+            vec![at.file.to_path_buf()]
+        } else {
+            at.looked.to_vec()
+        };
+        Some(Draft38Off::NoFile(paths))
     } else if at.need > at.ctx {
         Some(Draft38Off::Ctx {
             need: at.need,
