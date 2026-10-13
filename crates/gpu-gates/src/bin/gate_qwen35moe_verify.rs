@@ -80,6 +80,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/greedy.rs"]
+mod greedy;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use app::{RowsLog, Session, SessionError};
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, PrefillPath, Qwen35moeModel};
@@ -95,6 +99,8 @@ mod gate {
     use runtime::{
         Advance, Lookup, RowLogits, Speculative, Tapped, TappedPrompt, Target, Verify, Want,
     };
+
+    use crate::greedy::greedy;
 
     type Seat = Session<Body35>;
 
@@ -212,34 +218,6 @@ mod gate {
                     from + n
                 ))
             })
-    }
-
-    /// `n` greedy ids from `prompt`, each with the logits that produced it
-    /// when `logits`: id `i + 1` is the argmax after feeding id `i`. Starts
-    /// from a reset.
-    fn greedy(
-        s: &mut Seat,
-        prompt: &[u32],
-        n: usize,
-        logits: bool,
-    ) -> Result<(Vec<u32>, Vec<Vec<f32>>), GateError> {
-        let want = if logits { Want::Logits } else { Want::Argmax };
-        s.reset()?;
-        let (mut ids, mut rows) = (Vec::with_capacity(n), Vec::new());
-        let push = |out: runtime::Out<'_>, ids: &mut Vec<u32>, rows: &mut Vec<Vec<f32>>| {
-            ids.push(out.argmax());
-            if let runtime::Out::Logits { row, .. } = out {
-                rows.push(row.to_vec());
-            }
-        };
-        let out = s.prompt(prompt, want)?;
-        push(out, &mut ids, &mut rows);
-        while ids.len() < n {
-            let last = ids[ids.len() - 1];
-            let out = s.step(last, want)?;
-            push(out, &mut ids, &mut rows);
-        }
-        Ok((ids, rows))
     }
 
     fn same_bits(a: &[f32], b: &[f32]) -> bool {

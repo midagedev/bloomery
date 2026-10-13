@@ -50,6 +50,10 @@ mod dspark_hf;
 mod quiet;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/greedy.rs"]
+mod greedy;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -71,9 +75,10 @@ mod gate {
     use model::quant::quantize_q8_0;
     use refset::arch::qwen35moe::MODEL;
     use runtime::dspark::DraftVocab;
-    use runtime::{Advance, Draft, Speculative, Target, Verify, Want};
+    use runtime::{Advance, Draft, Speculative, Target, Verify};
 
     use crate::dspark_hf::{self, HfFile, Parts};
+    use crate::greedy::greedy;
     use crate::quiet::Quiet;
 
     /// The context rows of the two cases: a ring that is nearly empty and one past the window.
@@ -868,22 +873,6 @@ mod gate {
         Ok(seat.with_draft::<Spark, VERIFY_ROWS>(card, &mut Quiet)?)
     }
 
-    /// `n` greedy ids from `prompt`. Id 0 is the prompt's argmax; each later id is the argmax
-    /// after feeding the one before it.
-    fn greedy(s: &mut Seat, prompt: &[u32], n: usize) -> Result<Vec<u32>, GateError> {
-        s.reset()?;
-        let mut ids = Vec::with_capacity(n);
-        ids.push(s.prompt(prompt, Want::Argmax)?.argmax());
-        while ids.len() < n {
-            let last = ids[ids.len() - 1];
-            ids.push(s.step(last, Want::Argmax)?.argmax());
-        }
-        if ids.len() < n {
-            return Err(format!("the plain run decoded {} ids, {n} asked for", ids.len()).into());
-        }
-        Ok(ids)
-    }
-
     /// Committed tokens of clause 2, and how often draft slot `k` (1-based) was kept.
     struct Accept {
         passes: usize,
@@ -994,7 +983,7 @@ mod gate {
         let fixed = prose_ids("qwen35moe", PROMPT_FIXED)?;
         let plain = if c1 {
             let mut seat = open_seat(false)?;
-            let ids = greedy(&mut seat, &fixed, DECODE_LOSSLESS)?;
+            let (ids, _) = greedy(&mut seat, &fixed, DECODE_LOSSLESS, false)?;
             drop(seat);
             Some(ids)
         } else {
