@@ -22,6 +22,7 @@ use super::q38place;
 use super::{Adapter, Arm, Outcome, census, outcome_of, probed, view_of};
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::checkpoint_price38;
+use bloomery_gpu::arch::qwen3moe::refuse_unimplemented;
 use bloomery_gpu::arch::qwen3moe::swap38;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu_gates::GateError;
@@ -174,9 +175,14 @@ fn choose(inputs: &PlanInputs, ctx: u64, seqs: Seqs) -> Result<Place, Outcome> {
 }
 
 /// The file described by the family's reader (`PlanInputs::describe`, the
-/// host's room its own reading).
+/// host's room its own reading), then refused as the placed open refuses it
+/// ([`refuse_unimplemented`], the one function `Body38`'s open calls): a
+/// routed stack no tier runs is a refusal here as it is at the open, before
+/// any upload, not a plan.
 fn describe(split: &Split) -> Result<PlanInputs, Outcome> {
-    PlanInputs::describe(split).map_err(|e| outcome_of(&e))
+    let inputs = PlanInputs::describe(split).map_err(|e| outcome_of(&e))?;
+    refuse_unimplemented(&inputs).map_err(|e| outcome_of(&e))?;
+    Ok(inputs)
 }
 
 /// The ubatch a load of `ctx` positions runs (`ubatch_for`: the default

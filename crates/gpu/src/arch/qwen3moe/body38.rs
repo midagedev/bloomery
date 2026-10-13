@@ -171,6 +171,37 @@ pub const ALLOWED: &[&str] = &[
     "a tool-call parser for this template",
 ];
 
+/// Refuse by name a file whose coverage check ([`PlanInputs::unimplemented`])
+/// lists an item the program does not run: every item [`ALLOWED`] does not
+/// name, a layer's with its layer. The one refusal every placed open makes
+/// before any upload ([`Body38::open_with`]), which a caller that plans a
+/// file reads through too.
+///
+/// [`PlanInputs::unimplemented`]: model::arch::qwen35moe::place::PlanInputs::unimplemented
+pub fn refuse_unimplemented(
+    inputs: &model::arch::qwen35moe::place::PlanInputs,
+) -> Result<(), GpuError> {
+    let refused: Vec<String> = inputs
+        .unimplemented()
+        .into_iter()
+        .map(|u| match u.layer {
+            Some(l) => format!("{} (layer {l})", u.feature),
+            None => u.feature,
+        })
+        .filter(|f| !ALLOWED.contains(&f.as_str()))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(GpuError::shape(
+        WHAT,
+        format!(
+            "the file needs what the program does not run: {}",
+            refused.join("; ")
+        ),
+    ))
+}
+
 /// The Qwen3.8 model: one card, the skeleton over this body.
 pub type Qwen38Model = GpuModel<Body38>;
 
@@ -1250,24 +1281,7 @@ impl Body38 {
             return Err(GpuError::shape(WHAT, "a load of 0 resident sequence slots"));
         }
         refuse_tier_count(WHAT, plan.machine.tiers.len())?;
-        let refused: Vec<String> = inputs
-            .unimplemented()
-            .into_iter()
-            .map(|u| match u.layer {
-                Some(l) => format!("{} (layer {l})", u.feature),
-                None => u.feature,
-            })
-            .filter(|f| !ALLOWED.contains(&f.as_str()))
-            .collect();
-        if !refused.is_empty() {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the file needs what the program does not run: {}",
-                    refused.join("; ")
-                ),
-            ));
-        }
+        refuse_unimplemented(inputs)?;
         let n = inputs.spec.layers.len();
         let spec = plan
             .machine

@@ -49,7 +49,7 @@ use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names::{self, token_embd};
 use model::placement::kernels::{self, SiteEntry};
-use model::placement::{Plan, WholeLoad};
+use model::placement::{Plan, WholeLoad, accepts};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
@@ -481,24 +481,56 @@ fn header_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<[SiteTy; 3], Gp
 /// [`stack_entries`] refuses). Such a layer holds no card expert a placed
 /// load can run — its load refuses card experts of it by name (`placed`'s
 /// `n_card > 0` arm) and its wide arm launches nothing for a layer with none —
-/// so the plan does not refuse it. A missing tensor, or a site type of
-/// another shape, is refused by name.
+/// so the plan hosts it, and a stack of a type that neither the card leg's
+/// arm for its part ([`accepts::leg_arms`]) nor the host tier's fused rows
+/// ([`model::ops::host_stack_runs`]) runs is refused by name, with the layer:
+/// no plan can place it. A missing tensor, or a site type of another shape,
+/// is refused by name.
 fn card_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<Option<[SiteTy; 3]>, GpuError> {
     const WHAT_H: &str = "qwen3moe::Body::load";
     let (h, ff, e) = (hp.n_embd, hp.experts.ff, hp.experts.n_expert);
-    let site = |name: String, shape| -> Result<Option<SiteTy>, GpuError> {
+    let arms = accepts::leg_arms(accepts::Program::Qwen3moeBody)
+        .ok_or_else(|| GpuError::shape(WHAT_H, "the qwen3moe body runs no card leg"))?;
+    let site = |name: String,
+                shape: (usize, usize),
+                (part, kind, arm): (&str, &str, fn(GgmlType) -> bool)|
+     -> Result<Option<SiteTy>, GpuError> {
         let (_, t) = file
             .find(&name)
             .ok_or_else(|| GpuError::tensor(WHAT_H, &name, "in the file"))?;
+        if !arm(t.ty) {
+            model::ops::host_stack_runs("the host tier", &name, t.ty, shape.1).map_err(|e| {
+                GpuError::shape(
+                    WHAT_H,
+                    format!(
+                        "layer {l}: the {part} stack is {}, which runs on no tier: the card \
+                         leg's {kind} launches read none; {e}",
+                        t.ty
+                    ),
+                )
+            })?;
+        }
         if SiteTy::of_ggml(t.ty).is_none() {
             return Ok(None);
         }
         site::file_site(file, WHAT_H, &name, shape, SiteTy::ALL).map(Some)
     };
     let (Some(gate), Some(up), Some(down)) = (
-        site(names::ffn_gate_exps(l), (e * ff, h))?,
-        site(names::ffn_up_exps(l), (e * ff, h))?,
-        site(names::ffn_down_exps(l), (e * h, ff))?,
+        site(
+            names::ffn_gate_exps(l),
+            (e * ff, h),
+            ("gate", "gate·up", arms.gate_up),
+        )?,
+        site(
+            names::ffn_up_exps(l),
+            (e * ff, h),
+            ("up", "gate·up", arms.gate_up),
+        )?,
+        site(
+            names::ffn_down_exps(l),
+            (e * h, ff),
+            ("down", "down", arms.down),
+        )?,
     ) else {
         return Ok(None);
     };

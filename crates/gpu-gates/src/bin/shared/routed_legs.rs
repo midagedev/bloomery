@@ -1,6 +1,6 @@
 //! The common owner of gate_routed_legs: the census reading and checking,
 //! the arch → family dispatch, the card-room derivation, the retype sweep
-//! and the checks L1–L6. A family is added by one adapter file
+//! and the checks L1–L7. A family is added by one adapter file
 //! (`routed_legs/<family>.rs`, holding only what the family forces — how its
 //! production `--place`-unset defaults plan one split, the loader's plan-time
 //! stack table where it has one, a leg-adjacent sweep triple where its leg is
@@ -232,6 +232,15 @@ struct Counts {
     /// Plans L6 asked the loader table about, and the ones it refused.
     loader_asked: u64,
     loader_refused: u64,
+    /// Layers L7 asked the host tier's owner about (a layer a plan gives no
+    /// card expert, with routed stacks), and the stacks it refused.
+    host_asked: u64,
+    host_refused: u64,
+    /// The no-tier retype's arms (one retyped header, each arm that opened
+    /// it): the ones that refused it before any plan, and the ones that
+    /// planned it.
+    notier_refused: u64,
+    notier_planned: u64,
     refusals: BTreeMap<&'static str, u64>,
 }
 
@@ -253,13 +262,25 @@ impl Counts {
         self.calls += other.calls;
         self.loader_asked += other.loader_asked;
         self.loader_refused += other.loader_refused;
+        self.host_asked += other.host_asked;
+        self.host_refused += other.host_refused;
+        self.notier_refused += other.notier_refused;
+        self.notier_planned += other.notier_planned;
         for (kind, n) in &other.refusals {
             *self.refusals.entry(kind).or_default() += n;
         }
     }
 
-    /// The family's counts line.
-    fn line(&self, family: &str, traps: usize, loader: Option<&str>) -> String {
+    /// The family's counts line: `traps` the sweep's trap triples (L5),
+    /// `notier` the type its no-tier retype wrote, `loader` the name of its
+    /// loader table where it has one.
+    fn line(
+        &self,
+        family: &str,
+        traps: usize,
+        notier: Option<GgmlType>,
+        loader: Option<&str>,
+    ) -> String {
         let refusals = self
             .refusals
             .iter()
@@ -276,16 +297,22 @@ impl Counts {
                 self.loader_asked, self.loader_refused
             )
         });
+        let notier = notier.map_or("-".to_string(), |ty| ty.to_string());
         format!(
             "legs: {family}: sets {} plans {} partial {} whole {} floors {} standing {} \
-             refusals {refusals} retyped {} traps {traps}{loader}",
+             refusals {refusals} retyped {} traps {traps} host asked {} refused {} \
+             notier {notier} refused {} planned {}{loader}",
             self.sets,
             self.plans,
             self.partial,
             self.whole,
             self.floors,
             self.standing,
-            self.retyped
+            self.retyped,
+            self.host_asked,
+            self.host_refused,
+            self.notier_refused,
+            self.notier_planned
         )
     }
 }
@@ -338,6 +365,8 @@ struct Family {
     seed: Option<Seed>,
     /// The sweep triples the retyping wrote (the trap count's domain).
     swept: Vec<[GgmlType; 3]>,
+    /// The type of the sweep's no-tier triple, where the owners name one.
+    notier: Option<GgmlType>,
     /// Seconds of worker time the sets and the sweep took, and the plan
     /// calls the sets made (the rest are the sweep's).
     sets_secs: f64,
@@ -634,9 +663,10 @@ fn per_call(secs: f64, calls: u64) -> String {
 /// The gate's run: read the census, plan every family's sets through its
 /// production defaults at derived rooms, sweep one set's retyped headers per
 /// family, and answer green only when every carded layer is one its file's
-/// architecture runs, every loader table takes the plans, and every family's
-/// sweep holds a trap. The sets and the swept headers are planned on
-/// [`WORKERS`] threads and printed in the manifest's order.
+/// architecture runs, every other routed layer is one the host tier runs,
+/// every loader table takes the plans, and every family's sweep holds a trap
+/// and a no-tier retype that no arm plans. The sets and the swept headers are
+/// planned on [`WORKERS`] threads and printed in the manifest's order.
 pub(super) fn run() -> Result<(), GateError> {
     bloomery_levers::at_main(&[])?;
     let (manifest, root) = args()?;
@@ -675,6 +705,7 @@ pub(super) fn run() -> Result<(), GateError> {
                 counts: Counts::default(),
                 seed: None,
                 swept: Vec::new(),
+                notier: None,
                 sets_secs: 0.0,
                 sweep_secs: 0.0,
                 sets_calls: 0,
@@ -704,12 +735,17 @@ pub(super) fn run() -> Result<(), GateError> {
         );
     }
     // The retype sweep: every family's seed written once per triple, planned
-    // through its arms; then L3, L5 and the loader table's vacuity per
-    // family.
+    // through its arms; then L3, L5, the no-tier retype and the loader
+    // table's vacuity per family.
     let mut sweeps = Vec::new();
     for (&name, family) in families.iter_mut() {
         if let Some(seed) = family.seed.take() {
-            sweeps.push(Sweep::prepare(name, family.who, seed, &root)?);
+            let sweep = Sweep::prepare(name, family.who, seed, &root)?;
+            for line in &sweep.notes {
+                println!("{line}");
+            }
+            family.notier = sweep.notier;
+            sweeps.push(sweep);
         }
     }
     let dir =
@@ -760,6 +796,31 @@ pub(super) fn run() -> Result<(), GateError> {
             println!("legs: {name}: vacuous: no partial plan {}", verdict(false));
             ok = false;
         }
+        match family.notier {
+            None => {
+                println!(
+                    "legs: {name}: the sweep has no no-tier retype: no type is refused by both \
+                     the card arms and the host tier's owner {}",
+                    verdict(false)
+                );
+                ok = false;
+            }
+            Some(ty) if !family.swept.contains(&[ty; 3]) => {
+                println!(
+                    "legs: {name}: the no-tier retype {ty} was not written {}",
+                    verdict(false)
+                );
+                ok = false;
+            }
+            Some(ty) if family.counts.notier_refused + family.counts.notier_planned == 0 => {
+                println!(
+                    "legs: {name}: vacuous: no arm answered the no-tier retype {ty} {}",
+                    verdict(false)
+                );
+                ok = false;
+            }
+            Some(_) => {}
+        }
         if let Some(table) = family.who.adapter.loader_table()
             && family.counts.loader_asked == 0
         {
@@ -782,6 +843,7 @@ pub(super) fn run() -> Result<(), GateError> {
             family.counts.line(
                 name,
                 trap_count(family.who.program, &family.swept),
+                family.notier,
                 family.who.adapter.loader_table()
             )
         );
@@ -834,10 +896,11 @@ fn args() -> Result<(PathBuf, PathBuf), GateError> {
     ))
 }
 
-/// One plan's line (L1 over it, L6 over the loader's answer, L3's partial
-/// count, the carded-layer pick): `legs: <family> <set> <arm> room <room>:
-/// <what> PASS|FAIL`, each FAIL line naming family, set, arm, room, layer and
-/// the three types. A failure marks the unit of work red.
+/// One plan's line (L1 over it, L6 over the loader's answer, L7 over its
+/// hosted layers, L3's partial count, the carded-layer pick): `legs: <family>
+/// <set> <arm> room <room>: <what> PASS|FAIL`, each FAIL line naming family,
+/// set, arm, room, layer and the types (L7's also the part). A failure marks
+/// the unit of work red.
 fn plan_line(
     out: &mut Out,
     who: Who,
@@ -885,6 +948,10 @@ fn plan_line(
                     ));
                 }
             }
+            let (asked, refused) = l7(at, view, stacks);
+            out.counts.host_asked += asked;
+            out.counts.host_refused += refused.len() as u64;
+            fails.extend(refused);
             let routed = (0..view.n_l.len())
                 .filter(|&l| stacks.types.get(l).is_some_and(Option::is_some))
                 .count();
@@ -942,6 +1009,50 @@ fn l1(at: &At<'_>, view: &PlanView, stacks: &Stacks, program: Program) -> Vec<St
         }
     }
     broken
+}
+
+/// The routed stacks' parts, in stack order: the words of the tensor names.
+const PARTS: [&str; 3] = ["gate", "up", "down"];
+
+/// The name of layer `l`'s routed stack `part` (one of [`PARTS`]).
+fn stack_name(l: usize, part: &str) -> String {
+    format!("blk.{l}.ffn_{part}_exps.weight")
+}
+
+/// L7, L1's mirror: every layer `view` gives no card expert and whose file
+/// holds routed stacks is a host layer, and the host tier runs it when each
+/// of its three stacks passes the owner of the host union's admission,
+/// [`model::ops::host_stack_runs`] — every family's `HostLayer::build` reaches
+/// it through `UnionStack::of_call` — asked at the stack's own type and row
+/// length from the header ([`Stacks::ks`]). Returns the layers asked and one
+/// line for each stack refused, naming family, set, arm, room, layer, part,
+/// type and the owner's text. A layer past the plan's own (a next-token
+/// layer) is never asked.
+fn l7(at: &At<'_>, view: &PlanView, stacks: &Stacks) -> (u64, Vec<String>) {
+    let mut asked = 0;
+    let mut broken = Vec::new();
+    for l in 0..view.n_l.len() {
+        if carded_layer(view, l) {
+            continue;
+        }
+        let (Some(tys), Some(ks)) = (stacks.types.get(l).copied().flatten(), stacks.ks.get(l))
+        else {
+            continue;
+        };
+        asked += 1;
+        for ((part, ty), &k) in PARTS.iter().zip(tys).zip(ks) {
+            if let Err(e) =
+                model::ops::host_stack_runs("the host tier", &stack_name(l, part), ty, k)
+            {
+                broken.push(format!(
+                    "{} {} {} room {}: layer {l} {part} stack of {ty:?}, which the host tier \
+                     does not run: {e}",
+                    at.family, at.set, at.arm, at.room
+                ));
+            }
+        }
+    }
+    (asked, broken)
 }
 
 /// Whether `view` gives layer `l` card experts: its stage card's count or
@@ -1070,6 +1181,10 @@ fn family_name(program: Program) -> &'static str {
 /// count, where no check reads it.
 struct Stacks {
     types: Vec<Option<[GgmlType; 3]>>,
+    /// Per layer: the three stacks' row length `k` — the first dim of the
+    /// tensor, the values a row contracts (the model width for a gate and
+    /// an up, the expert width for a down).
+    ks: Vec<[usize; 3]>,
     /// Per layer: the three stacks' file bytes.
     bytes: Vec<u64>,
 }
@@ -1083,10 +1198,11 @@ impl Stacks {
 }
 
 /// Read `split`'s routed stacks ([`Stacks`]); a layer word that is not a
-/// number is an error naming the tensor.
+/// number, or a stack with no row length, is an error naming the tensor.
 fn routed_stacks(split: &Split) -> Result<Stacks, GateError> {
     let mut stacks = Stacks {
         types: Vec::new(),
+        ks: Vec::new(),
         bytes: Vec::new(),
     };
     for (_, t) in split.iter_tensors() {
@@ -1105,19 +1221,38 @@ fn routed_stacks(split: &Split) -> Result<Stacks, GateError> {
         let l: usize = l
             .parse()
             .map_err(|_| format!("{}: a layer word that is not a number", t.name))?;
+        let k = t
+            .dims
+            .first()
+            .and_then(|&k| usize::try_from(k).ok())
+            .ok_or_else(|| format!("{}: no row length (a first dim that is a usize)", t.name))?;
         if stacks.types.len() <= l {
             stacks.types.resize(l + 1, None);
+            stacks.ks.resize(l + 1, [0; 3]);
             stacks.bytes.resize(l + 1, 0);
         }
         let cell = stacks.types[l].get_or_insert([GgmlType::F32; 3]);
         cell[part] = t.ty;
+        stacks.ks[l][part] = k;
         stacks.bytes[l] = stacks.bytes[l].saturating_add(t.nbytes);
     }
     Ok(stacks)
 }
 
+/// A refusal's text, said for the no-tier retype's plans, which
+/// [`plan_line`] counts by kind alone.
+fn say_refusal(out: &mut Out, at: &At<'_>, outcome: &Outcome) {
+    if let Outcome::Refused(r) = outcome {
+        out.say(format!(
+            "legs:   {} {} {} room {}: refused {}: {}",
+            at.family, at.set, at.arm, at.room, r.kind, r.text
+        ));
+    }
+}
+
 /// One family's retype sweep (L4), prepared: the seed's set opened once, its
-/// carded layer's types and the triples to write. The shards holding the
+/// carded layer's types and the triples to write — L4's, and the one no-tier
+/// triple every arm must refuse ([`no_tier_type`]). The shards holding the
 /// layer are rewritten per triple (their kvs and tensors verbatim but the
 /// three stacks' type and recomputed bytes, over a sparse file of the
 /// layout's length), every other shard a symlink to its stub, the file names
@@ -1131,6 +1266,12 @@ struct Sweep {
     split: Split,
     tys: [GgmlType; 3],
     triples: Vec<[GgmlType; 3]>,
+    /// The type of the no-tier triple among `triples` ([`no_tier_type`]),
+    /// where the owners name one.
+    notier: Option<GgmlType>,
+    /// The lines the preparation made: the no-tier type chosen, and the
+    /// candidates skipped by name.
+    notes: Vec<String>,
 }
 
 /// What one swept header produced.
@@ -1161,13 +1302,22 @@ impl Sweep {
             )
             .into());
         };
+        let mut triples = sweep_triples(who.adapter);
+        let mut notes = Vec::new();
+        let ks = stacks.ks[seed.layer];
+        let notier = no_tier_type(name, who.program, (seed.layer, ks), &mut notes);
+        if let Some(ty) = notier {
+            triples.push([ty; 3]);
+        }
         Ok(Sweep {
             name,
             who,
             set_name,
             split,
             tys,
-            triples: sweep_triples(who.adapter),
+            triples,
+            notier,
+            notes,
             seed,
         })
     }
@@ -1205,6 +1355,8 @@ impl Sweep {
         };
         let out = &mut done.out;
         let (name, set, tys) = (self.name, &self.set_name, self.tys);
+        // The no-tier triple: every arm must refuse it before any plan.
+        let notier = self.notier.filter(|&ty| triple == [ty; 3]);
         let here = dir.join(n.to_string());
         std::fs::create_dir_all(&here)?;
         let retyped = retype_split(
@@ -1231,6 +1383,9 @@ impl Sweep {
                 Ok(arm) => arm,
                 Err(Outcome::Refused(r)) => {
                     out.counts.refused(r.kind);
+                    if notier.is_some() {
+                        out.counts.notier_refused += 1;
+                    }
                     out.judged(
                         format!(
                             "legs: {name} {set} [{tys:?} → {triple:?}]: refused {}: {}",
@@ -1260,20 +1415,48 @@ impl Sweep {
                 arm: &word,
                 room: "-",
             };
+            let planned_before = out.counts.plans;
             if !arm.whole
                 && let Some(outcome) = &arm.unbudgeted
             {
                 plan_line(out, self.who, &at, outcome, &stacks, &mut pick);
+                if notier.is_some() {
+                    say_refusal(out, &at, outcome);
+                }
             }
-            let Some((_, rooms)) = self.seed.rooms.iter().find(|(word, _)| *word == arm.name)
-            else {
-                continue;
-            };
+            let rooms = self
+                .seed
+                .rooms
+                .iter()
+                .find(|(word, _)| *word == arm.name)
+                .map_or(&[][..], |(_, rooms)| rooms.as_slice());
             for &bytes in rooms {
                 let outcome = (arm.placed)(&budget(bytes));
                 let room = bytes.to_string();
                 let at = At { room: &room, ..at };
                 plan_line(out, self.who, &at, &outcome, &stacks, &mut pick);
+                if notier.is_some() {
+                    say_refusal(out, &at, &outcome);
+                }
+            }
+            if let Some(ty) = notier {
+                let planned = out.counts.plans - planned_before;
+                if planned == 0 {
+                    out.counts.notier_refused += 1;
+                } else {
+                    out.counts.notier_planned += 1;
+                }
+                out.judged(
+                    format!(
+                        "legs: {name} {set} {word}: the no-tier retype {ty}: {}",
+                        if planned == 0 {
+                            "no plan, every outcome a refusal".to_string()
+                        } else {
+                            format!("{planned} plan(s), where the planner must refuse")
+                        }
+                    ),
+                    planned == 0,
+                );
             }
         }
         drop(split);
@@ -1315,6 +1498,56 @@ fn sweep_triples(adapter: &dyn Adapter) -> Vec<[GgmlType; 3]> {
     triples
 }
 
+/// The family's no-tier type, the sweep's `[T, T, T]` triple: the first type,
+/// in the file format's id order (`Unknown` skipped), that neither of
+/// `program`'s card arms runs ([`leg_arms`]) and that the host tier's owner
+/// ([`model::ops::host_stack_runs`]) refuses at each of layer `layer`'s three
+/// row lengths `ks`, so no tier runs a stack of it in any part. A candidate
+/// whose block does not divide a row length cannot be written as a stack of
+/// that row: it is skipped by name in `notes`, where the chosen type is named
+/// too.
+fn no_tier_type(
+    name: &str,
+    program: Program,
+    (layer, ks): (usize, [usize; 3]),
+    notes: &mut Vec<String>,
+) -> Option<GgmlType> {
+    let arms = leg_arms(program);
+    let card_runs = |ty: GgmlType| arms.is_some_and(|a| (a.gate_up)(ty) || (a.down)(ty));
+    let host_refuses = |ty: GgmlType| {
+        PARTS.iter().zip(ks).all(|(part, k)| {
+            model::ops::host_stack_runs("the host tier", &stack_name(layer, part), ty, k).is_err()
+        })
+    };
+    let ty = (0..64)
+        .map(GgmlType::from_u32)
+        .filter(|ty| !matches!(ty, GgmlType::Unknown(_)))
+        .filter(|&ty| !card_runs(ty) && host_refuses(ty))
+        .find(|&ty| {
+            let Some((_, blck, _)) = gguf::ggml_type_info(ty.as_u32()) else {
+                notes.push(format!(
+                    "legs: {name}: no-tier candidate {ty} skipped: no block info"
+                ));
+                return false;
+            };
+            if let Some(k) = ks.iter().find(|&&k| !(k as u64).is_multiple_of(blck)) {
+                notes.push(format!(
+                    "legs: {name}: no-tier candidate {ty} skipped: a row of {k} values holds no \
+                     whole {ty} block"
+                ));
+                return false;
+            }
+            true
+        });
+    if let Some(ty) = ty {
+        notes.push(format!(
+            "legs: {name}: no-tier type {ty}: neither card arm runs it and the host tier \
+             refuses it at row lengths {ks:?}"
+        ));
+    }
+    ty
+}
+
 /// Write `set`'s shards into `dir` with layer `l`'s three routed stacks
 /// retyped to `triple`, and return the first shard's path there. A type
 /// whose block does not divide its stack's first dim skips the whole triple
@@ -1328,10 +1561,9 @@ fn retype_split(
     dir: &Path,
     lines: &mut Vec<String>,
 ) -> Result<Option<PathBuf>, GateError> {
-    let parts = ["gate", "up", "down"];
     let mut retype: Vec<(String, GgmlType)> = Vec::new();
-    for (part, &ty) in parts.iter().zip(&triple) {
-        let name = format!("blk.{l}.ffn_{part}_exps.weight");
+    for (part, &ty) in PARTS.iter().zip(&triple) {
+        let name = stack_name(l, part);
         let (_, t) = split.find(&name).ok_or_else(|| {
             format!("the sweep's stack {name}: not in the file the plan was read from")
         })?;

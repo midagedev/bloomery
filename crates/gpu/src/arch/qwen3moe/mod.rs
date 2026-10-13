@@ -56,7 +56,7 @@ pub use body35::{
 pub use body38::{
     ALLOWED, Body38, CHECKPOINT_EVERY, DecodeInput38, LayerKind38, Prompt38, Qwen38Model, RouteTap,
     Seq38, Store38Host, XSTREAM_COSTS, checkpoint_budget38, checkpoint_bytes, checkpoint_price38,
-    seq_positional_bytes, seq38_bytes,
+    refuse_unimplemented, seq_positional_bytes, seq38_bytes,
 };
 pub use mtp38::{
     BorrowedPlanes, DraftRows38, Held38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
