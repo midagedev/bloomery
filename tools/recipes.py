@@ -6527,7 +6527,8 @@ def own_variant_row(path: str, variant: str) -> bool:
 # tools/gate-batch.sh's fixture_table() and default_profile() read the same text with):
 #     case "$BLOOMERY_MODEL" in
 #       qwen4exp) __fixture_dir=qwen38 ;;
-#       deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;
+#       qwen35moe) __fixture_dir=qwen35moe ;;
+#       deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;
 #       *) __fixture_dir=none ;;
 #     esac
 REF_PATHS = "tools/ref/ref-paths.sh"
@@ -8917,13 +8918,13 @@ def key_self_test(expect, real: Side) -> None:
         # one owner), as a variant's below holds its tag's: a file in a directory no family of the item maps to moves nothing of it.
         rows, default = fixture_table(sa.tree.read(REF_PATHS))
         expect(default == DEFAULT_PROFILE, f"ref-paths.sh's default profile {default} is not DEFAULT_PROFILE {DEFAULT_PROFILE}")
-        expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "self", "self"]
+        expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "qwen35moe", "self"]
                and "mimo2" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
         fam = {
             "q4": "gate-gpu-qwen4exp-e2e",  # BLOOMERY_MODEL=qwen4exp: qwen38
             "glm": "gate-gpu-glm-sel",  # glm5next: glm5next
             "ds41": "gate-gpu-ds41-hc",  # deepseek41: v41, its draft/ below it
-            "q35": "gate-gpu-qwen35moe-moe",  # qwen35moe: `self`, no fixture directory
+            "q35": "gate-gpu-qwen35moe-moe",  # qwen35moe: its own directory
             "mimo": "gate-gpu-mimo2-flash",  # mimo2: no row, `none`
             "envm": "gate-gpu-glm-sel@BLOOMERY_MODEL=qwen4exp",  # a BLOOMERY_MODEL in the item's env: no telling
             "mac": "check-comments",  # a command run on the Mac: no telling
@@ -8953,7 +8954,7 @@ def key_self_test(expect, real: Side) -> None:
         bump = lambda d: fx_rows({**sizes, d: sizes[d] + 1})  # noqa: E731
         m = rewritten(bump("qwen35moe"))
         expect("q4" not in m, f"a file under {FIXTURE_ROOT}/qwen35moe moved the key of a qwen4exp item")  # (a)
-        expect(m == open_keys, f"a file in a directory no family maps to (qwen35moe is `self`) moved {sorted(m)}, not only the items whose family cannot be told {sorted(open_keys)}")  # (b)
+        expect(m == {"q35"} | open_keys, f"a file under qwen35moe moved {sorted(m)}, not its item and the unknown-family ones")  # (b)
         expect(rewritten(bump("qwen38")) == {"q4"} | open_keys, f"a file under qwen38 moved {sorted(rewritten(bump('qwen38')))}: the qwen4exp item and the unknown-family ones")  # (c)
         expect(rewritten(bump("glm5next")) == {"glm"} | open_keys, f"a file under glm5next moved {sorted(rewritten(bump('glm5next')))}")
         expect(rewritten(bump("v41")) == {"ds41"} | open_keys, f"a file under v41 moved {sorted(rewritten(bump('v41')))}")
@@ -8984,27 +8985,32 @@ def key_self_test(expect, real: Side) -> None:
         # the key part names what the fixture rows were taken from: the debuggability of "moved since"
         fparts = lambda it, env: [p for p in KeyContext(sa, mf, "", env, settings=settings).parts(it)[0] if p.startswith("fixture\t")]  # noqa: E731
         write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
-        expect([fparts(fam[k], fx_env) for k in ("q4", "ds41", "q35", "envm")] == [["fixture\tdirs\tqwen38"], ["fixture\tdirs\tv41"], ["fixture\tdirs\t-"], ["fixture\tdirs\t*"]]
+        expect([fparts(fam[k], fx_env) for k in ("q4", "ds41", "q35", "envm")] == [["fixture\tdirs\tqwen38"], ["fixture\tdirs\tv41"], ["fixture\tdirs\tqwen35moe"], ["fixture\tdirs\t*"]]
                and fparts(fam["q4"], {}) == [], "the fixture key part does not name the directories the key holds")
-        # (f) the table is ref-paths.sh's: moving qwen35moe's row to a directory of its own makes its item hold it, and the edit moves the
-        # keys of the box items (the file is a key part of every one of them: a row edit moves its family's keys, and others' with them)
+        # (f) the table is ref-paths.sh's. qwen35moe already names its own directory. Pointing that row back at
+        # `self` edits the file, so it moves the keys of the box items (the file is a key part of every one of
+        # them). Against that table a file under the qwen35moe directory is a directory no family maps to.
         rp = os.path.join(roots[0], REF_PATHS)
         with open(rp, encoding="utf-8") as fh:
             rp_old = fh.read()
-        two_rows = "deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;\n      qwen35moe) __fixture_dir=qwen35moe ;;"
+        own = "qwen35moe) __fixture_dir=qwen35moe ;;"
+        split_self = "deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;"
+        joined = "deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;"
         refused = [
             (rp_old.replace("*) __fixture_dir=none ;;", "*) __fixture_dir=self ;;"), "not none"),
             (rp_old.replace("qwen4exp) __fixture_dir=qwen38 ;;", "qwen4*) __fixture_dir=qwen38 ;;"), "neither a family name nor a lone `*`"),
             (rp_old.replace('case "$BLOOMERY_MODEL" in', 'case "$M" in'), "no fixture table"),
         ]
         try:
-            expect(two_rows.split("\n")[0] != "" and "deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;" in rp_old, "ref-paths.sh's `self` row is not the one this clause edits")
+            expect(own in rp_old and joined not in rp_old, "ref-paths.sh's qwen35moe row is not the one this clause edits")
+            edited = rp_old.replace("      " + own + "\n", "").replace(split_self, joined)
+            expect(edited != rp_old and joined in edited and own not in edited, "pointing qwen35moe back at self did not edit the table")
             with open(rp, "w", encoding="utf-8") as fh:
-                fh.write(rp_old.replace("deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;", two_rows))
+                fh.write(edited)
             kf_row = fam_keys(fx_rows(sizes))
             expect(kf_row["q4"] != kf["q4"] and kf_row["q35"] != kf["q35"] and kf_row["glm"] != kf["glm"], "an edit of ref-paths.sh's table moved no key of a box item")
             m = rewritten(bump("qwen35moe"), None, kf_row)
-            expect(m == {"q35"} | open_keys, f"qwen35moe given a fixture directory by the table: a file in it moved {sorted(m)}, not its item and the unknown-family ones")
+            expect(m == open_keys, f"qwen35moe pointed back at self: a file under its directory moved {sorted(m)}, not only the items whose family cannot be told {sorted(open_keys)}")
             for text, why in refused:
                 with open(rp, "w", encoding="utf-8") as fh:
                     fh.write(text)
