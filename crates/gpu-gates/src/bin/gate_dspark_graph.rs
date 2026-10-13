@@ -1,7 +1,9 @@
 //! GPU gate for the DSpark draft's block pass and head
-//! (`bloomery_gpu_deepseek41::draft::{block, head}` and `DraftBody`), on one
-//! card, against the dsref set `code64_n32_w3` (ik's draft, dumped at block
-//! width 3).
+//! (`bloomery_gpu_deepseek41::draft::block`, the owner's head chain
+//! `bloomery_gpu::dspark::head::Head`, and `DraftBody`: the owner
+//! `bloomery_gpu::dspark::DsparkBody` over V4.1's layers), on one card,
+//! against the dsref set `code64_n32_w3` (ik's draft, dumped at block width
+//! 3).
 //!
 //! Inputs. For each block the set's own: each layer's ring as ik's block
 //! graph read it (`dflash_k_ctx_cache_L`, the committed rows `0..n`, in
@@ -10,6 +12,15 @@
 //! decoded first and must name exactly the keys the arm below feeds — the
 //! `n` ring rows and, for block row `t`, ik's block rows `0..=t`.
 //!
+//! The gate's own pass runs the layers into rows of its own and the owner's
+//! head over them, so the head's taps are read between its logits and its
+//! Markov loop. Where a block runs through `DraftBody` (the graph clauses
+//! below), the set's rings are seated in the layers' rings and the block's
+//! rope positions and visible rows are the layers' oracle override
+//! (`set_oracle`), since ik turns its rows at positions the engine never
+//! feeds. The body refuses a block with no committed position, so one context
+//! row is appended first; the seat then rewrites every ring slot.
+//
 //! Two arms of the same pass, differing only in data (`Rule`): the block
 //! rows a row sees (the attention's `vis[2t + 1]`) and the SwiGLU limits.
 //!
@@ -76,16 +87,27 @@
 //! not pinned.
 //!
 //! Graphs. The launches a pass of each width `1..=5` makes, counted in the
-//! gate's own capture and in the graph `DraftBody` captured at load, equal
-//! `BlockPass::launches` and the pinned `73 + 8w`; each append graph
-//! (`1..=GROUP` rows) holds its eight launches; every node is a kernel. Then,
-//! on `DraftBody`'s own pass and rings under the reference rule: for blocks
-//! 0–2 and every width, the replay and then the eager twin leave every tap
-//! bit-identical (the replay first, so one that did not re-read its inputs
-//! would read the previous call's); blocks 0–2 in a row through the `w = 3`
-//! graph equal the judged eager passes of the gate's own pass above; and
-//! `DraftBody` over the whole set through its graphs gives the ids and the
-//! rings of its eager twin after every block.
+//! gate's own capture (the layers, then the owner head's norm, projection
+//! and Markov loop) and in the graph `DraftBody` captured at load, equal the
+//! layers' launches plus the owner head's and the pinned `73 + 8w`; each
+//! append graph (`1..=GROUP` rows) holds its eight launches, the layers' plus
+//! the owner's fc and norm; every node is a kernel. Then, on `DraftBody`'s
+//! own layers and rings under the reference rule: for blocks 0–2 and every
+//! width, the replay and then the eager twin leave every tap bit-identical
+//! (the replay first, so one that did not re-read its inputs would read the
+//! previous call's); blocks 0–2 in a row through the `w = 3` graph equal the
+//! judged eager passes of the gate's own pass above; and `DraftBody` over the
+//! whole set through its graphs gives the ids and the rings of its eager twin
+//! after every block. The last layer's fold is the rows the layers leave in
+//! the owner's `x`: the gate's own pass reads its own, the body's is read
+//! through `block_rows_to_host`.
+//!
+//! Replay refusal. The graphs are captured under the reference rule, whose
+//! clamp limits are launch scalars; ik's rule runs eager. Under `Rule::Ik` a
+//! block asked for through its graph and an append asked for through its
+//! graph are each refused by name (`GpuError::State`, "the reference rule"),
+//! nothing is replayed or appended, and the eager block of the same call
+//! runs.
 //!
 //! Embedding rows. Before the set is read: for the mask token, ids 0 and
 //! `n_vocab − 1` and two ids of the set's prompt, row 0 of layer 0's four
@@ -99,17 +121,20 @@
 //! target file stores.
 //!
 //! Fault readback. A row of all-`0xFF` bytes (a bf16 NaN; a Q3_K super-block
-//! whose f16 `d` is NaN) staged into `DraftBody`'s pass, eager and through its
-//! `w = 3` graph: the NaN reaches the routed experts' q8_1 quantizer, which
-//! raises the card's fault word, and the draft's own readback must be
-//! `GpuError::Fault` rather than ids. The word is cleared after each arm.
-//! Run last: the NaN stays in the body's buffers.
+//! whose f16 `d` is NaN) staged into `DraftBody`'s layers (`pass_mut`), run
+//! eager over the owner's head and through the body's `w = 3` graph: the NaN
+//! reaches the routed experts' q8_1 quantizer, which raises the card's fault
+//! word, and the head's own readback must be `GpuError::Fault` rather than
+//! ids. The word is cleared after each arm. Run last: the NaN stays in the
+//! body's buffers.
 //!
 //! FAIL-first: swapping the attention's two sources in `draft/block.rs` (the
 //! ring as the second source, the block rows as the first) turns this gate
 //! red from layer 0's attention on; a graph replay that does not restage its
-//! inputs (`draft/mod.rs`'s `run_block` staging for the eager arm only)
-//! turns the graph rows red.
+//! inputs (`DsparkBody::propose_as_with` staging for the eager arm only)
+//! turns the graph rows red; dropping the `replayable` check before a graph
+//! replay in `propose_as_with`, or in `append_as_with`, turns the refusal
+//! row red.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -129,16 +154,19 @@ mod gate {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use bloomery_gpu::dspark::{DraftLayers, Submit};
     use bloomery_gpu::elem::q3k_embed_value;
     use bloomery_gpu::{Gpu, GpuError, Graph};
     use bloomery_gpu_deepseek41::draft::block::{
         BlockInput, BlockPass, LayerBufs, MAX_WIDTH, Rule, embedding_row,
     };
     use bloomery_gpu_deepseek41::draft::kv::{DraftRings, GROUP};
+    use bloomery_gpu_deepseek41::draft::layers::OracleBlock;
     use bloomery_gpu_deepseek41::draft::load::DraftWeights;
-    use bloomery_gpu_deepseek41::draft::{DraftBody, Submit};
+    use bloomery_gpu_deepseek41::draft::{DraftBody, open as open_draft};
     use bloomery_gpu_deepseek41::hc::HC_STREAMS;
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
+    use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits};
     use model::arch::deepseek41::names as target_names;
@@ -382,36 +410,108 @@ mod gate {
             .collect()
     }
 
-    /// Stage, run the body, read every tap, run the Markov loop, read the rest.
+    /// The gate's own pass: a `BlockPass` and rings beside the body's, and the
+    /// rows the layers leave for the head. The head is the body's — its taps
+    /// are read between the logits and the Markov loop, which rewrites them.
+    struct Standalone {
+        pass: BlockPass,
+        rings: DraftRings,
+        /// The layers' output rows, [`MAX_WIDTH`] of them.
+        x: DeviceBuffer<f32>,
+        /// The id before the block: the Markov loop's first previous token.
+        first: DeviceBuffer<u32>,
+    }
+
+    impl Standalone {
+        fn new(gpu: &Gpu, body: &DraftBody, hp: &DraftHparams) -> Result<Standalone, GateError> {
+            let s = gpu.stream();
+            Ok(Standalone {
+                pass: BlockPass::new(gpu, body.layers().weights())?,
+                rings: DraftRings::new(s, hp)?,
+                x: DeviceBuffer::zeroed(s, MAX_WIDTH * hp.n_embd)?,
+                first: DeviceBuffer::from_host(s, &[0u32])?,
+            })
+        }
+
+        /// The staged pass's layers into `x`, then the head's norm,
+        /// quantizer and projection over them. Capturable.
+        fn enqueue_body(
+            &mut self,
+            gpu: &Gpu,
+            body: &mut DraftBody,
+            m: usize,
+        ) -> Result<(), GpuError> {
+            self.pass
+                .enqueue_layers(gpu, body.layers().weights(), &self.rings, &mut self.x)?;
+            body.head_mut().enqueue_logits(gpu, &self.x, m)
+        }
+
+        /// The head's Markov loop over the logits [`Standalone::enqueue_body`]
+        /// left, after `first`. Capturable.
+        fn enqueue_markov(
+            &self,
+            gpu: &Gpu,
+            body: &mut DraftBody,
+            m: usize,
+        ) -> Result<(), GpuError> {
+            body.head_mut().enqueue_markov(gpu, m, &self.first)
+        }
+
+        /// One captured pass of `input.width` rows under the reference rule:
+        /// the layers, the head's logits and the Markov loop, as the body's
+        /// own graphs hold them. Leaves the pass staged as `input` says.
+        fn capture(
+            &mut self,
+            gpu: &Gpu,
+            body: &mut DraftBody,
+            input: &BlockInput<'_>,
+        ) -> Result<Graph, GateError> {
+            let m = input.width;
+            self.pass.stage(gpu.stream(), input)?;
+            Ok(gpu.capture(|_| {
+                self.enqueue_body(gpu, body, m)?;
+                self.enqueue_markov(gpu, body, m)
+            })?)
+        }
+    }
+
+    /// Stage, run the layers and the logits, read every tap, run the Markov
+    /// loop, read the rest. `id_last` is the id the block runs after.
     fn run_pass(
         gpu: &Gpu,
-        w: &DraftWeights,
-        pass: &mut BlockPass,
-        rings: &DraftRings,
+        body: &mut DraftBody,
+        sa: &mut Standalone,
         input: &BlockInput<'_>,
+        id_last: u32,
     ) -> Result<Ours, GateError> {
         let s = gpu.stream();
         let m = input.width;
-        pass.stage(s, input)?;
-        pass.enqueue_body(gpu, w, rings)?;
+        sa.first.copy_from_host(s, &[id_last])?;
+        sa.pass.stage(s, input)?;
+        sa.enqueue_body(gpu, body, m)?;
         s.synchronize()?;
-        let layers = (0..w.hp().n_layer)
-            .map(|l| read_layer(gpu, pass.layer(l).ok_or("a layer")?))
-            .collect::<Result<_, _>>()?;
-        let n_vocab = pass.head().n_vocab();
-        let base = rows_of(&pass.head().logits_to_host(s, m)?, m, n_vocab);
-        let head_normed = pass.head().normed_to_host(s, m)?;
-        let streams0 = pass.streams0().to_host_vec(s)?;
-        pass.enqueue_markov(gpu, w)?;
+        let n_layer = body.layers().weights().hp().n_layer;
+        let mut layers = (0..n_layer)
+            .map(|l| read_layer(gpu, sa.pass.layer(l).ok_or("a layer")?))
+            .collect::<Result<Vec<_>, GateError>>()?;
+        // The last layer's fold is the rows the head reads, in `x`.
+        layers.last_mut().ok_or("a layer")?.fold_f = sa.x.to_host_vec(s)?;
+        let head = body.head();
+        let n_vocab = head.n_vocab();
+        let base = rows_of(&head.logits_to_host(s, m)?, m, n_vocab);
+        let head_normed = head.normed_to_host(s, m)?;
+        let streams0 = sa.pass.streams0().to_host_vec(s)?;
+        sa.enqueue_markov(gpu, body, m)?;
         s.synchronize()?;
-        let result = rows_of(&pass.head().logits_to_host(s, m)?, m, n_vocab);
+        let head = body.head();
+        let result = rows_of(&head.logits_to_host(s, m)?, m, n_vocab);
         Ok(Ours {
             streams0,
             layers,
             head_normed,
             base,
             result,
-            tokens: pass.tokens(s)?,
+            tokens: head.tokens(s, m)?,
         })
     }
 
@@ -1186,7 +1286,6 @@ mod gate {
 
     fn input<'a>(bs: &BlockSet, row: &'a [u8], width: usize, rule: Rule) -> BlockInput<'a> {
         BlockInput {
-            id_last: bs.id_last,
             row,
             width,
             first_pos: bs.pos[0] as u32,
@@ -1260,14 +1359,14 @@ mod gate {
     /// for each of [`embed_ids`], and the mask rows, against the host rules.
     fn check_embed_rows(
         gpu: &Gpu,
-        w: &DraftWeights,
-        pass: &mut BlockPass,
-        rings: &DraftRings,
+        body: &DraftBody,
+        sa: &mut Standalone,
         target: &Split,
         hp: &DraftHparams,
     ) -> Result<bool, GateError> {
         let s = gpu.stream();
         let n = hp.n_embd;
+        let w = body.layers().weights();
         let name = target_names::token_embd();
         let ty = target
             .find(&name)
@@ -1276,17 +1375,16 @@ mod gate {
             .ty;
         println!(
             "{NAME}: embed | target {name} is {ty}, the draft reads it as {:?}, the mask row as {:?}",
-            pass.embd_rows(),
+            sa.pass.embd_rows(),
             w.embd_rows()
         );
         let mut ok = true;
-        for id in embed_ids(hp, pass.head().n_vocab())? {
+        for id in embed_ids(hp, body.head().n_vocab())? {
             let row = embedding_row(target, n, id)?;
             let (deq, q3k) = host_row(ty, row, n)?;
-            pass.stage(
+            sa.pass.stage(
                 s,
                 &BlockInput {
-                    id_last: id,
                     row,
                     width: 1,
                     first_pos: 0,
@@ -1294,10 +1392,10 @@ mod gate {
                     rule: Rule::Reference,
                 },
             )?;
-            pass.enqueue_body(gpu, w, rings)?;
+            sa.pass.enqueue_layers(gpu, w, &sa.rings, &mut sa.x)?;
             s.synchronize()?;
-            let streams = pass.streams0().to_host_vec(s)?;
-            let fold = pass.fold0().to_host_vec(s)?;
+            let streams = sa.pass.streams0().to_host_vec(s)?;
+            let fold = sa.pass.fold0().to_host_vec(s)?;
             let row0: Vec<&[f32]> = (0..HC_STREAMS)
                 .map(|k| &streams[k * n..(k + 1) * n])
                 .chain([&fold[..n]])
@@ -1340,19 +1438,20 @@ mod gate {
         Ok(ok)
     }
 
-    /// The fault readback (module doc): a NaN row through `body`'s pass,
-    /// eager and through its graph, must read back as `GpuError::Fault`.
+    /// The fault readback (module doc): a NaN row through `body`'s layers,
+    /// eager over its head and through its graph, must read back as
+    /// `GpuError::Fault`.
     fn check_fault(
         gpu: &Gpu,
         body: &mut DraftBody,
         target: &Split,
         hp: &DraftHparams,
     ) -> Result<bool, GateError> {
+        let s = gpu.stream();
         let width = SET_WIDTH;
         let len = embedding_row(target, hp.n_embd, 0)?.len();
         let nan_row = vec![0xFFu8; len];
         let input = BlockInput {
-            id_last: 0,
             row: &nan_row,
             width,
             first_pos: 0,
@@ -1362,9 +1461,27 @@ mod gate {
         if let Some(f) = gpu.fault()? {
             return Err(format!("the fault word is raised before the fault case: {f}").into());
         }
+        let mut x = DeviceBuffer::<f32>::zeroed(s, MAX_WIDTH * hp.n_embd)?;
+        let first = DeviceBuffer::from_host(s, &[0u32])?;
         let mut ok = true;
         for submit in [Submit::Eager, Submit::Graph] {
-            let got = body.block(gpu, &input, submit);
+            // The row goes in through the layers' own pass: a proposal stages
+            // its first id's row from the target's file.
+            body.layers_mut().pass_mut().stage(s, &input)?;
+            let got = match submit {
+                Submit::Eager => {
+                    body.layers_mut().enqueue_block(gpu, &mut x, width)?;
+                    body.head_mut().enqueue_logits(gpu, &x, width)?;
+                    body.head_mut().enqueue_markov(gpu, width, &first)?;
+                    body.head().tokens(s, width)
+                }
+                Submit::Graph => {
+                    body.graph_block(width)
+                        .ok_or("a block graph per width")?
+                        .launch(s)?;
+                    body.head().tokens(s, width)
+                }
+            };
             let (case_ok, what) = match &got {
                 Err(GpuError::Fault { fault, .. }) => (true, format!("GpuError::Fault at {fault}")),
                 Err(e) => (false, format!("another error: {e}")),
@@ -1372,7 +1489,7 @@ mod gate {
             };
             println!(
                 "{NAME}: fault | {submit:?} pass over an all-0xFF row ({len} bytes, w={width}): the \
-                 draft's readback is {what} {}",
+                 head's readback is {what} {}",
                 verdict(case_ok)
             );
             ok &= case_ok;
@@ -1398,19 +1515,16 @@ mod gate {
             "{NAME}: draft {} layers, block_size {} in the file, width {SET_WIDTH} (the set's) and {WIDE} (synthetic) gated",
             hp.n_layer, hp.block_size
         );
-        let mut body = DraftBody::new(&gpu, weights, Arc::clone(&target))?;
+        let mut body = open_draft(&gpu, weights, Arc::clone(&target))?;
         let mut ok = true;
-        let s = gpu.stream();
 
-        let w = body.weights();
-        let mut pass = BlockPass::new(&gpu, w)?;
-        let mut rings = DraftRings::new(s, &hp)?;
-        ok &= check_embed_rows(&gpu, w, &mut pass, &rings, &target, &hp)?;
+        let mut sa = Standalone::new(&gpu, &body, &hp)?;
+        ok &= check_embed_rows(&gpu, &body, &mut sa, &target, &hp)?;
         let set = Dsref::open(&DSREF.path(DSREF_SET), &DSREF)?;
         let cx = Cx {
             set: &set,
             hp: &hp,
-            n_vocab: pass.head().n_vocab(),
+            n_vocab: body.head().n_vocab(),
             shexp: (0..hp.n_layer)
                 .map(|l| {
                     Ok((
@@ -1421,25 +1535,29 @@ mod gate {
                 .collect::<Result<_, GateError>>()?,
         };
 
-        // Launches: the gate's own capture of one pass per width, and the
-        // graphs DraftBody captured at load — every node a kernel.
+        // Launches: the gate's own capture of one pass per width (the layers
+        // and the owner head's), and the graphs DraftBody captured at load —
+        // every node a kernel.
         let b0 = block_set(&set, &hp, 0)?;
         let row0 = embedding_row(&target, hp.n_embd, b0.id_last)?;
-        seat(&gpu, &hp, &b0, &mut rings)?;
+        seat(&gpu, &hp, &b0, &mut sa.rings)?;
         for m in 1..=MAX_WIDTH {
-            let nodes = pass.capture(&gpu, w, &rings, m)?.node_count();
-            let g = body.pass_graph(m).ok_or("a pass graph per width")?;
+            let nodes = sa
+                .capture(&gpu, &mut body, &input(&b0, row0, m, Rule::Reference))?
+                .node_count();
+            let g = body.graph_block(m).ok_or("a block graph per width")?;
             let kernels = all_kernels(g)?;
+            let own = sa.pass.launches(m) + body.head_launches(m);
+            let owned = body.layers().launches(m) + body.head_launches(m);
             let pass_ok = nodes == PASS_NODES[m - 1]
-                && pass.launches(m) == PASS_NODES[m - 1]
+                && own == PASS_NODES[m - 1]
                 && g.node_count() == PASS_NODES[m - 1]
-                && body.pass_launches(m) == PASS_NODES[m - 1]
+                && owned == PASS_NODES[m - 1]
                 && kernels;
             println!(
                 "{NAME}: launches w={m}: gate capture {nodes} nodes, DraftBody graph {} nodes (all kernel nodes {kernels}), \
-                 BlockPass::launches {}, pinned {} {}",
+                 BlockPass::launches + head {own}, the body's layers + head {owned}, pinned {} {}",
                 g.node_count(),
-                pass.launches(m),
                 PASS_NODES[m - 1],
                 verdict(pass_ok)
             );
@@ -1447,17 +1565,15 @@ mod gate {
         }
         for n in 1..=GROUP {
             let g = body
-                .append_graph(n)
+                .graph_append(n)
                 .ok_or("an append graph per row count")?;
             let kernels = all_kernels(g)?;
-            let append_ok = g.node_count() == APPEND_NODES
-                && body.append_launches(n) == APPEND_NODES
-                && kernels;
+            let launches = body.layers().append_launches(n) + body.fc_launches(n);
+            let append_ok = g.node_count() == APPEND_NODES && launches == APPEND_NODES && kernels;
             println!(
                 "{NAME}: launches append n={n}: DraftBody graph {} nodes (all kernel nodes {kernels}), \
-                 KvAppend::launches {}, pinned {APPEND_NODES} {}",
+                 the layers' append + fc {launches}, pinned {APPEND_NODES} {}",
                 g.node_count(),
-                body.append_launches(n),
                 verdict(append_ok)
             );
             ok &= append_ok;
@@ -1469,16 +1585,16 @@ mod gate {
         for b in set.blocks() {
             let bs = block_set(&set, &hp, b)?;
             let row = embedding_row(&target, hp.n_embd, bs.id_last)?;
-            seat(&gpu, &hp, &bs, &mut rings)?;
+            seat(&gpu, &hp, &bs, &mut sa.rings)?;
             let v = set.verify_of(b)?;
             let mut line = (b, v.accepted, 0usize, 0usize);
             for arm in [Arm::IkMask, Arm::Reference] {
                 let o = run_pass(
                     &gpu,
-                    w,
-                    &mut pass,
-                    &rings,
+                    &mut body,
+                    &mut sa,
                     &input(&bs, row, bs.width, arm.rule()),
+                    bs.id_last,
                 )?;
                 let a = accepted(&o.tokens, v.targets());
                 if arm == Arm::IkMask {
@@ -1524,28 +1640,28 @@ mod gate {
         }
 
         // w = 5 over block 0's inputs.
-        seat(&gpu, &hp, &b0, &mut rings)?;
+        seat(&gpu, &hp, &b0, &mut sa.rings)?;
         for arm in [Arm::IkMask, Arm::Reference] {
             let narrow = run_pass(
                 &gpu,
-                w,
-                &mut pass,
-                &rings,
+                &mut body,
+                &mut sa,
                 &input(&b0, row0, SET_WIDTH, arm.rule()),
+                b0.id_last,
             )?;
             let wide = run_pass(
                 &gpu,
-                w,
-                &mut pass,
-                &rings,
+                &mut body,
+                &mut sa,
                 &input(&b0, row0, WIDE, arm.rule()),
+                b0.id_last,
             )?;
             let again = run_pass(
                 &gpu,
-                w,
-                &mut pass,
-                &rings,
+                &mut body,
+                &mut sa,
                 &input(&b0, row0, WIDE, arm.rule()),
+                b0.id_last,
             )?;
             let shape =
                 wide.tokens.len() == WIDE && wide.tokens.iter().all(|&t| (t as usize) < cx.n_vocab);
@@ -1573,23 +1689,20 @@ mod gate {
             ok &= pass_ok;
         }
 
-        drop(rings);
-        drop(pass);
+        drop(sa);
 
-        // Graph = eager on DraftBody's own pass and rings: blocks 0-2 of
+        // Graph = eager on DraftBody's own layers and rings: blocks 0-2 of
         // the set at every width, the replay first — a replay that did not
         // re-read its inputs would read the previous call's — then the
         // eager twin, every tap the whole pass leaves, bit for bit.
         for b in TAP_BLOCKS {
             let bs = block_set(&set, &hp, b)?;
-            let row = embedding_row(&target, hp.n_embd, bs.id_last)?;
-            seat(&gpu, &hp, &bs, body.rings_mut())?;
+            seat_body(&gpu, &mut body, &hp, &bs)?;
             for m in 1..=MAX_WIDTH {
-                let inp = input(&bs, row, m, Rule::Reference);
-                let ids = body.block(&gpu, &inp, Submit::Graph)?;
-                let replay = read_after(&gpu, body.pass(), hp.n_layer, m)?;
-                body.block(&gpu, &inp, Submit::Eager)?;
-                let eager = read_after(&gpu, body.pass(), hp.n_layer, m)?;
+                let ids = propose(&gpu, &mut body, bs.id_last, m, Submit::Graph)?;
+                let replay = read_after(&gpu, &body, m)?;
+                propose(&gpu, &mut body, bs.id_last, m, Submit::Eager)?;
+                let eager = read_after(&gpu, &body, m)?;
                 let off = first_difference(&replay, &eager);
                 println!(
                     "{NAME}: graph = eager b{b} w={m}: ids {ids:?} (eager {:?}); {} taps; {} {}",
@@ -1609,14 +1722,9 @@ mod gate {
         // eager passes above (the gate's own pass, the reference rule).
         for (b, eager) in &eager_ref {
             let bs = block_set(&set, &hp, *b)?;
-            let row = embedding_row(&target, hp.n_embd, bs.id_last)?;
-            seat(&gpu, &hp, &bs, body.rings_mut())?;
-            body.block(
-                &gpu,
-                &input(&bs, row, bs.width, Rule::Reference),
-                Submit::Graph,
-            )?;
-            let replay = read_after(&gpu, body.pass(), hp.n_layer, bs.width)?;
+            seat_body(&gpu, &mut body, &hp, &bs)?;
+            propose(&gpu, &mut body, bs.id_last, bs.width, Submit::Graph)?;
+            let replay = read_after(&gpu, &body, bs.width)?;
             let off = first_difference(&replay, eager);
             println!(
                 "{NAME}: graph b{b} w={} = the judged eager pass: ids {:?} (eager {:?}); {} taps; {} {}",
@@ -1633,25 +1741,34 @@ mod gate {
             ok &= off.is_none();
         }
 
+        // The graphs are the reference rule's: ik's rule is refused by name
+        // through a graph, and runs eager.
+        ok &= check_ik_refusal(&gpu, &mut body, &hp, &block_set(&set, &hp, 0)?)?;
+
         // DraftBody over the set: the set's features appended at the
         // reference positions, every block's proposal — eager, then through
         // the graphs, the ids and the rings after each block bit for bit.
+        // Its own positions and rows again, not the oracle's.
+        body.layers_mut().set_oracle(None);
         let mut eager_run = Vec::new();
         body.reset(&gpu)?;
         for b in set.blocks() {
             let bs = block_set(&set, &hp, b)?;
-            body.append_as(&gpu, &bs.feats, Submit::Eager)?;
-            let ids = body.propose_as(&gpu, bs.id_last, bs.width, Submit::Eager)?;
-            eager_run.push((ids, ring_bits(&gpu, body.rings(), hp.n_layer)?));
+            let first = body.committed();
+            body.append_as_with(&gpu, first, &bs.feats, Submit::Eager)?;
+            let ids = propose(&gpu, &mut body, bs.id_last, bs.width, Submit::Eager)?;
+            eager_run.push((ids, ring_bits(&gpu, body.layers().rings(), hp.n_layer)?));
         }
         let mut body_accept = Vec::new();
         body.reset(&gpu)?;
         for (b, (e_ids, e_rings)) in set.blocks().into_iter().zip(&eager_run) {
             let bs = block_set(&set, &hp, b)?;
-            let n = body.append(&gpu, &bs.feats)?;
+            let first = body.committed();
+            let n = body.append_as(&gpu, first, &bs.feats)?;
             let v = set.verify_of(b)?;
-            let ids = body.propose(&gpu, bs.id_last, bs.width)?;
-            let same = ids == *e_ids && ring_bits(&gpu, body.rings(), hp.n_layer)? == *e_rings;
+            let ids = propose(&gpu, &mut body, bs.id_last, bs.width, Submit::Graph)?;
+            let same =
+                ids == *e_ids && ring_bits(&gpu, body.layers().rings(), hp.n_layer)? == *e_rings;
             let a = accepted(&ids, v.targets());
             println!(
                 "{NAME}: DraftBody b{b} appended {n} ({}) committed {} ids {ids:?} target {:?}: accept {a} (ik {}); \
@@ -1696,7 +1813,7 @@ mod gate {
                 "PASSED: {NAME} — the block pass and head against the dsref set: every tap of blocks 0-2 within its band under ik's rule, \
                  the rows on ik's path under the reference rule, draft_argmax on every block, launches = the kernel list, w=5 bit-identical where it must be; \
                  the captured passes and appends = their pinned node counts, graph = eager per block and width, blocks 0-2 through the graph = the judged eager passes, \
-                 DraftBody through the graphs = its eager twin; the draft's embedding rows = the host rules bit for bit, a NaN row reads back as GpuError::Fault"
+                 DraftBody through the graphs = its eager twin, ik's rule through a graph refused by name; the draft's embedding rows = the host rules bit for bit, a NaN row reads back as GpuError::Fault"
             );
             Ok(())
         } else {
@@ -1810,26 +1927,117 @@ mod gate {
         )
     }
 
-    /// [`After`] of the pass `pass` last ran, `m` rows.
-    fn read_after(
-        gpu: &Gpu,
-        pass: &BlockPass,
-        n_layer: usize,
-        m: usize,
-    ) -> Result<After, GateError> {
+    /// [`After`] of the pass `body` last ran, `m` rows: its layers' taps and
+    /// head, and the last layer's fold from the owner's rows.
+    fn read_after(gpu: &Gpu, body: &DraftBody, m: usize) -> Result<After, GateError> {
         let s = gpu.stream();
-        let layers = (0..n_layer)
+        let pass = body.layers().pass();
+        let hp = body.layers().weights().hp();
+        let mut layers = (0..hp.n_layer)
             .map(|l| read_layer(gpu, pass.layer(l).ok_or("a layer")?))
-            .collect::<Result<Vec<_>, _>>()?;
-        let n_vocab = pass.head().n_vocab();
+            .collect::<Result<Vec<_>, GateError>>()?;
+        // The tap holds `MAX_WIDTH` rows, as the layer's own buffer does.
+        let mut fold = body.block_rows_to_host(s, m)?;
+        fold.resize(MAX_WIDTH * hp.n_embd, 0.0);
+        layers.last_mut().ok_or("a layer")?.fold_f = fold;
+        let head = body.head();
+        let n_vocab = head.n_vocab();
         Ok(after_parts(
             &pass.streams0().to_host_vec(s)?,
             &layers,
-            &pass.head().normed_to_host(s, m)?,
-            &rows_of(&pass.head().logits_to_host(s, m)?, m, n_vocab),
-            &pass.tokens(s)?,
+            &head.normed_to_host(s, m)?,
+            &rows_of(&head.logits_to_host(s, m)?, m, n_vocab),
+            &head.tokens(s, m)?,
             m,
         ))
+    }
+
+    /// A block of `width` ids after `id_last` through the body, at its
+    /// committed position.
+    fn propose(
+        gpu: &Gpu,
+        body: &mut DraftBody,
+        id_last: u32,
+        width: usize,
+        submit: Submit,
+    ) -> Result<Vec<u32>, GpuError> {
+        let mut ids = vec![0u32; width];
+        let pos = body.committed();
+        body.propose_as_with(gpu, pos, id_last, width, &mut ids, &mut [], submit)?;
+        Ok(ids)
+    }
+
+    /// The first feature row of the block's kv rows: `target_layers` rows of
+    /// `n_embd`.
+    fn first_feature_row<'a>(hp: &DraftHparams, bs: &'a BlockSet) -> Result<&'a [f32], GateError> {
+        Ok(bs
+            .feats
+            .get(..hp.target_layers.len() * hp.n_embd)
+            .ok_or("a feature row in the block's kv rows")?)
+    }
+
+    /// Put the body at the set's block `bs`: ik's committed rows in the
+    /// layers' rings, and the block's own rope positions and visible rows in
+    /// force. The body refuses a block with no committed position, so one
+    /// context row (the set's first) is appended first; the seat rewrites
+    /// every ring slot after it, so that row leaves nothing in the rings.
+    fn seat_body(
+        gpu: &Gpu,
+        body: &mut DraftBody,
+        hp: &DraftHparams,
+        bs: &BlockSet,
+    ) -> Result<(), GateError> {
+        body.reset(gpu)?;
+        body.append_as_with(gpu, 0, first_feature_row(hp, bs)?, Submit::Eager)?;
+        seat(gpu, hp, bs, body.layers_mut().rings_mut())?;
+        body.layers_mut().set_oracle(Some(OracleBlock {
+            first_pos: u32::try_from(bs.pos[0])?,
+            ring_rows: bs.ring_rows,
+        }));
+        Ok(())
+    }
+
+    /// The replay refusal (module doc): under ik's rule a block and an
+    /// append asked for through their graphs are each refused by name, the
+    /// refused append commits nothing, and the eager block runs.
+    fn check_ik_refusal(
+        gpu: &Gpu,
+        body: &mut DraftBody,
+        hp: &DraftHparams,
+        bs: &BlockSet,
+    ) -> Result<bool, GateError> {
+        seat_body(gpu, body, hp, bs)?;
+        body.layers_mut().set_rule(Rule::Ik);
+        let committed = body.committed();
+        let row = first_feature_row(hp, bs)?;
+        let block = propose(gpu, body, bs.id_last, bs.width, Submit::Graph);
+        let append = body.append_as_with(gpu, committed, row, Submit::Graph);
+        let eager = propose(gpu, body, bs.id_last, bs.width, Submit::Eager);
+        body.layers_mut().set_rule(Rule::Reference);
+        fn named<T>(r: &Result<T, GpuError>) -> bool {
+            matches!(r, Err(GpuError::State { missing, .. }) if missing.contains("the reference rule"))
+        }
+        fn show<T>(r: &Result<T, GpuError>) -> String {
+            match r {
+                Err(e) => format!("refused: {e}"),
+                Ok(_) => "replayed".to_string(),
+            }
+        }
+        let (block_ok, append_ok) = (named(&block), named(&append));
+        let kept = body.committed() == committed;
+        let eager_ok = eager.as_ref().is_ok_and(|ids| ids.len() == bs.width);
+        println!(
+            "{NAME}: ik-rule replay | block through the graph {} {}; append through the graph {} {}; \
+             committed kept at {committed}: {kept} {}; eager block {} {}",
+            show(&block),
+            verdict(block_ok),
+            show(&append),
+            verdict(append_ok),
+            verdict(kept),
+            if eager_ok { "ran" } else { "did not run" },
+            verdict(eager_ok)
+        );
+        Ok(block_ok && append_ok && kept && eager_ok)
     }
 
     /// The first tap (or the ids) where `a` and `b` differ; `None` when
