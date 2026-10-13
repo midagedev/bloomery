@@ -20,8 +20,9 @@
 //!   dense layer is layer 0 and the host run is layers `1..48`; the plan puts
 //!   at least one routed expert on the card, as many as the slot map holds
 //!   there and none on a tier (the plan's `n_l` and the slot map's both), on
-//!   every routed layer; the stores hold
-//!   [`KV_BYTES_PER_POSITION`] a position at [`CTX`] positions;
+//!   every routed layer; one sequence's stores at [`CTX`] hold
+//!   [`KV_BYTES_AT_CTX`] (full layers over the context, window layers over
+//!   768 rows);
 //!   each layer's arguments to its attention launches (kv heads, window,
 //!   sinks, the rope table's base, the value multiplier) are its
 //!   description's and the file's pins ([`FULL`], [`WINDOW`], [`THETA_FULL`],
@@ -239,8 +240,15 @@ mod gate {
 
     /// PIN(2026-10-08): the stores' bytes a position, derived from the
     /// header: the 39 window layers' 8 key/value heads and the 9 full layers'
-    /// 4, each head 192 + 128 f16 values: (39·8 + 9·4)·320·2.
+    /// 4, each head 192 + 128 f16 values: (39·8 + 9·4)·320·2. At a context
+    /// inside the ring's pad this is still what a sequence holds a position.
     const KV_BYTES_PER_POSITION: usize = 222_720;
+
+    /// PIN(2026-10-13): one sequence at [`CTX`] under the ring [derived]. A
+    /// full layer is 23,040 B a position (9 × 4 × 320 × 2) and a window layer
+    /// 199,680 B (39 × 8 × 320 × 2). The ring is 768 rows, so the sequence is
+    /// 4,160 × 23,040 + 768 × 199,680.
+    const KV_BYTES_AT_CTX: usize = 249_200_640;
 
     /// PIN(2026-10-08): the full layers (`attention.sliding_window_pattern`
     /// 0), by index; the other 39 are window layers.
@@ -312,7 +320,7 @@ mod gate {
         let dense: Vec<usize> = (0..kinds.len())
             .filter(|&l| kinds[l].ffn == FfnKind::Dense)
             .collect();
-        let (stores, want_stores) = (body.store_bytes(), KV_BYTES_PER_POSITION * CTX);
+        let (stores, want_stores) = (body.store_bytes(), KV_BYTES_AT_CTX);
         let ok = kinds.len() == N_LAYER
             && dense == [0]
             && body.host_run() == (1..N_LAYER)
@@ -827,9 +835,9 @@ mod gate {
             Ok(h.value())
         }
 
-        /// The stores alone: the sequence holds nothing else, so it is the
-        /// header's bytes a position ([`KV_BYTES_PER_POSITION`]) at
-        /// [`SLOT_CTX`] positions.
+        /// The stores alone: the sequence holds nothing else. [`SLOT_CTX`] is
+        /// inside the ring's pad, so a window layer still holds every
+        /// position and the bytes are [`KV_BYTES_PER_POSITION`] a position.
         fn seq_bytes_derived(&self, _m: &Mimo2Model) -> Result<Derived, GateError> {
             let bytes = KV_BYTES_PER_POSITION * SLOT_CTX;
             Ok(Derived {

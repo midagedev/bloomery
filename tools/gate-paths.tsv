@@ -188,6 +188,7 @@ crates/gpu-gates/src/bin/{gate_glm5next_e2e.rs,generate_glm5next.rs}	weekly-gpu-
 crates/gpu-mimo2/**	weekly-gpu-mimo2-e2e weekly-gpu-mimo2-serve	the MiMo engine, which the weekly's one gate runs end to end
 crates/app/src/arch/mimo2/**	weekly-gpu-mimo2-e2e weekly-gpu-mimo2-serve	the MiMo session pieces the gate opens it through
 crates/model/src/arch/mimo2/**	weekly-gpu-mimo2-e2e weekly-gpu-mimo2-serve	the MiMo file's reader and placement
+crates/runtime/src/state.rs	weekly-gpu-mimo2-e2e	a GQA window is a window store, which this round's MiMo ring keep and copy rules read
 crates/refset/src/arch/mimo2/**	weekly-gpu-mimo2-e2e	the MiMo oracle sets' family, which the gate reads every set through
 crates/gpu-gates/src/bin/gate_mimo2_e2e.rs	weekly-gpu-mimo2-e2e	the MiMo end-to-end gate's own bin
 crates/gpu-gates/src/bin/shared/mimo2_open.rs	weekly-gpu-mimo2-e2e weekly-gpu-mimo2-serve	the MiMo open both MiMo gates load the model through
