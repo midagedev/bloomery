@@ -3377,7 +3377,7 @@ pub fn plan_in_pool<'a>(
 ) -> Result<Plan<'a>, PlacementError> {
     let first = make(levers);
     let (Some(_), None, Some(card)) = (
-        machine.unified,
+        machine.unified(),
         levers.card_budget_bytes,
         machine.cards.first(),
     ) else {
@@ -3932,11 +3932,13 @@ mod tests {
             Machine {
                 cards: vec![c],
                 tiers: Vec::new(),
-                host: Host {
-                    usable_bytes: POOL,
-                    reserves: Vec::new(),
-                },
-                unified: unified.then_some(UnifiedPool { bytes: POOL }),
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: POOL,
+                        reserves: Vec::new(),
+                    },
+                    unified: unified.then_some(UnifiedPool { bytes: POOL }),
+                }],
             }
         };
         let floor = |short: u64| PlacementError::HostRoomFloor {
