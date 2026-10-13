@@ -289,6 +289,21 @@ pub fn ring_rows(window: u64, ctx_max: u64) -> u64 {
     ctx_max.min(span.div_ceil(256) * 256)
 }
 
+/// Whether a cut of `depth` positions (`pos - n`) still leaves the keys the
+/// pass at `n` reads. A plane (`rows == ctx`) does. A ring holds
+/// `[pos - rows, pos)` and that pass appends row `n` and reads
+/// `[n - window + 1, n]`, so the cut is free when
+/// `depth <= rows - window + 1`. The ring is at least the window plus one
+/// prompt batch minus one, which is why a cut inside that slack writes
+/// nothing.
+#[must_use]
+pub fn cut_depth_keeps(depth: u64, rows: u64, ctx: u64, window: u64) -> bool {
+    if rows == ctx {
+        return true;
+    }
+    depth <= rows.saturating_sub(window).saturating_add(1)
+}
+
 /// One file's per-layer KV bytes. A full layer holds a plane of every
 /// position. A window layer holds that plane under [`Rows::Plane`], and
 /// [`ring_rows`] rows under [`Rows::Ring`]. Each row is the layer's KV-head
@@ -412,6 +427,26 @@ mod tests {
         assert_eq!(plane.layer_bytes(1, past), past * 48);
         assert_eq!(ring.layer_bytes(0, past), past * 2 * 48);
         assert_eq!(plane.layer_bytes(0, past), past * 2 * 48);
+    }
+
+    /// A ring cut keeps `n` through `rows - window + 1` positions and refuses
+    /// the next one. A plane (`rows == ctx`) keeps a cut of any depth. At a
+    /// context the ring still fills, the two are the same term.
+    #[test]
+    fn a_ring_cut_past_the_slack_is_refused() {
+        let window = 128;
+        let ctx = 4_160;
+        let rows = super::ring_rows(window, ctx);
+        let span = window + crate::moe::UNION_MAX_COLS as u64 - 1;
+        assert_eq!(rows, span.div_ceil(256) * 256);
+        assert!(rows < ctx, "the ring is shorter than this context");
+        let slack = rows - window + 1;
+        assert!(super::cut_depth_keeps(slack, rows, ctx, window));
+        assert!(!super::cut_depth_keeps(slack + 1, rows, ctx, window));
+        assert!(super::cut_depth_keeps(slack + 1, ctx, ctx, window));
+        let filled = super::ring_rows(8, 9);
+        assert_eq!(filled, 9);
+        assert!(super::cut_depth_keeps(1_000, filled, 9, 8));
     }
 
     /// One sequence's terms are the layout's stores over the trunk with

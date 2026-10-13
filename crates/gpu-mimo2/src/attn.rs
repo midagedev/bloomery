@@ -1,10 +1,11 @@
 //! The attention sub-layer of one token: `x` (the layer's input) in, the
 //! residual after the attention `x1` out. Seven launches, the same on every
-//! layer, whatever its window:
-//! `attn_norm` RMS, the fused q·k·v projection, the rope-and-append
-//! (`neox_append_k192`: the key heads turned in place, the value rows times
-//! the layer's multiplier, both into the f16 planes), the K192 flash's
-//! segment pass and its merge, the output projection, and the add of `x`.
+//! layer. A store shorter than the context is the ring
+//! ([`enqueue_append`], [`enqueue_pass`]); a store that fills it is the plane
+//! entry. The launches are `attn_norm` RMS, the fused q·k·v projection, the
+//! rope-and-append (the key heads turned in place, the value rows times the
+//! layer's multiplier, both into the f16 planes), the K192 flash's segment
+//! pass and its merge, the output projection, and the add of `x`.
 //!
 //! MiMo facts that fix this file: the score head is 192 values and the value
 //! head 128 (the planes' rows differ in width, [`flash_gqa::HEAD_K192`] and
@@ -16,10 +17,11 @@
 //! layer's window, sinks, base and multiplier come from its description
 //! ([`facts::attn_args`]), never from a literal here.
 
-use bloomery_gpu::flash_gqa::{self, GqaK192Args};
-use bloomery_gpu::rope_neox::K192Args;
+use bloomery_gpu::flash_gqa::{self, FlashGqaKernels, GqaK192Args};
+use bloomery_gpu::rope_neox::{K192Args, RopeNeoxKernels};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
+use cuda_core::CudaStream;
 use model::arch::mimo2::names;
 use model::arch::mimo2::program::{self as facts, AttnArgs};
 
@@ -57,6 +59,38 @@ impl AttnNames {
     }
 }
 
+/// The rope-and-append into `rows` rows a key head. A cache shorter than
+/// `args.ctx` is the ring entry; a cache that fills the context is the plane
+/// entry (a full layer, a window layer whose ring is the whole plane, and
+/// the oracle's plane sequence).
+pub(crate) fn enqueue_append(
+    rope: &RopeNeoxKernels,
+    stream: &CudaStream,
+    args: K192Args<'_>,
+    rows: usize,
+) -> Result<(), GpuError> {
+    if rows < args.ctx {
+        rope.enqueue_neox_append_k192_ring(stream, args, rows)
+    } else {
+        rope.enqueue_neox_append_k192(stream, args)
+    }
+}
+
+/// The K192 flash over the same rows as [`enqueue_append`].
+pub(crate) fn enqueue_pass(
+    flash: &FlashGqaKernels,
+    stream: &CudaStream,
+    args: GqaK192Args<'_>,
+    n_head: usize,
+    rows: usize,
+) -> Result<(), GpuError> {
+    if rows < args.ctx {
+        flash.enqueue_pass_k192_ring(stream, args, n_head, rows)
+    } else {
+        flash.enqueue_pass_k192(stream, args, n_head)
+    }
+}
+
 /// Enqueue layer `l`'s attention (module doc): `x` in, `x1` out.
 pub(crate) fn attention(
     gpu: &Gpu,
@@ -71,6 +105,7 @@ pub(crate) fn attention(
     let fault = gpu.layer_sink(l)?;
     let s = &mut *p.s;
     let store = &mut p.stores[l];
+    let rows = store.rows;
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.x,
@@ -81,7 +116,8 @@ pub(crate) fn attention(
         &mut s.xn,
     )?;
     w.q8_gemv(gpu, WHAT, &n.qkv, &s.xn, &mut s.qkv)?;
-    p.k.rope.enqueue_neox_append_k192(
+    enqueue_append(
+        &p.k.rope,
         stream,
         K192Args {
             qkv: &mut s.qkv,
@@ -97,13 +133,15 @@ pub(crate) fn attention(
             cache_k: &mut store.k,
             cache_v: &mut store.v,
         },
+        rows,
     )?;
     let sinks = n
         .sinks
         .as_deref()
         .map(|name| w.f32_buf(WHAT, name))
         .transpose()?;
-    p.k.flash.enqueue_pass_k192(
+    enqueue_pass(
+        &p.k.flash,
         stream,
         GqaK192Args {
             q: &s.q,
@@ -122,6 +160,7 @@ pub(crate) fn attention(
             y: &mut s.y,
         },
         d.heads,
+        rows,
     )?;
     w.q8_gemv(gpu, WHAT, &n.o, &s.y, &mut s.out)?;
     gpu.elem()

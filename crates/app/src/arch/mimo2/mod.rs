@@ -5,11 +5,12 @@
 //! or not ([`Mimo2Cfg::residency`]).//!
 //! A prompt is fed as the configuration says ([`Mimo2Cfg::prefill`]): in
 //! batches ([`bloomery_gpu_mimo2::prefill`]) or one decode step an id
-//! ([`GpuModel::step`]), the two leaving the same bits. The caches are per
-//! position, and the body takes no checkpoint, so a cut keeps every held
-//! position (its rollback takes positions back without device work). The
-//! body parks resident slots ([`bloomery_gpu::model::Slots`]: a slot is its
-//! layers' stores), so [`crate::Session::add_slots`] and
+//! ([`GpuModel::step`]), the two leaving the same bits. A full layer's cache
+//! is per position. A window layer holds a ring, so a cut keeps its target
+//! when that ring still holds the keys the target reads, and otherwise keeps
+//! nothing until the marks land. The rollback writes nothing inside that
+//! slack. The body parks resident slots ([`bloomery_gpu::model::Slots`]: a
+//! slot is its layers' stores), so [`crate::Session::add_slots`] and
 //! [`crate::Session::select_slot`] serve it as they serve every body that
 //! does.
 
@@ -23,7 +24,7 @@ use gguf::Split;
 use model::arch::mimo2::place::PlanInputs;
 use model::placement::{Machine, Plan, PlanLevers};
 
-use crate::{Keep, Open, Prompt, cut_positions, keep_positions};
+use crate::{Keep, Open, Prompt, cut_positions};
 
 const WHAT: &str = "mimo2 session";
 
@@ -115,15 +116,27 @@ impl Prompt for Body {
 }
 
 impl Keep for Body {
-    /// Every held position: the caches are per-position and the body holds
-    /// no checkpoint.
+    /// `n` when every live layer still holds the keys the pass at `n` reads:
+    /// a full plane always, a ring when `pos - n` is within `rows - window + 1`.
+    /// Otherwise 0. `n` past the model's position is that position.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        keep_positions(m, n)
+        let pos = m.pos();
+        let Ok(body) = m.body("mimo2 keep") else {
+            return 0;
+        };
+        if n > pos {
+            return pos;
+        }
+        if body.cut_keeps(pos, n) { n } else { 0 }
     }
 
-    /// Back to empty at 0 — a reset; else the model's rollback, which the
-    /// caches take as given.
+    /// Back to empty at 0 — a reset; else the model's rollback. The depth is
+    /// the model's position, recorded before the rollback.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
+        let pos = m.pos();
+        if let Ok((_, _, body)) = m.body_parts("mimo2 cut") {
+            body.stand_for_cut(pos);
+        }
         cut_positions(m, n)
     }
 }

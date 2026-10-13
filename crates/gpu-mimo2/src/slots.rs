@@ -51,6 +51,7 @@ use super::prefill::FLASH_ROWS;
 use super::{
     Body, Dims, Kernels, LayerCfg, LayerNames, RopeBase, Scratch, Seq, Store, WHAT, shape,
 };
+use crate::attn::{enqueue_append, enqueue_pass};
 use crate::card::{CardExperts, Io};
 use crate::ffn::FfnNames;
 use crate::program::walk_step;
@@ -241,8 +242,13 @@ impl Body {
                  sequence's positions",
             ));
         }
+        self.pending = None;
         if total == 1 {
             let input = self.decode_input(ids[0], rows[0].pos0)?;
+            if rows[0].slot != 0 {
+                // Another slot's row. The live sequence does not stand past it.
+                self.pending = None;
+            }
             return self.refresh(stream, &input);
         }
         let Body {
@@ -315,73 +321,90 @@ impl Body {
         };
         if total == 1 {
             let slot = rows[0].slot;
-            let stores = match slot {
-                0 => None,
-                _ => Some(
-                    others
+            {
+                let stores = match slot {
+                    0 => None,
+                    _ => Some(
+                        others
+                            .next()
+                            .ok_or_else(|| no_home(slot))?
+                            .stores
+                            .as_mut_slice(),
+                    ),
+                };
+                let (parts, hybrid) = self.parts_on(stores);
+                walk_step(gpu, w, parts, hybrid, head)?;
+            }
+            if slot == 0 {
+                self.commit_pending();
+            }
+            return Ok(());
+        }
+        let live_end = rows.iter().find(|r| r.slot == 0).map(|r| {
+            r.pos0
+                .saturating_add(u32::try_from(r.rows.len()).unwrap_or(u32::MAX))
+        });
+        {
+            let Body {
+                hybrid,
+                cfg,
+                names,
+                dims,
+                k,
+                pass,
+                card,
+                stores,
+                ropes,
+                slots,
+                ctx,
+                ..
+            } = self;
+            let b = pass.as_mut().ok_or_else(|| {
+                shape_in(
+                    PASS,
+                    format!("a pass of {total} rows on a load planned for one sequence"),
+                )
+            })?;
+            let mut live = Some(stores.as_mut_slice());
+            let mut seqs = Vec::with_capacity(rows.len());
+            for r in rows {
+                let st = match r.slot {
+                    0 => live.take().ok_or_else(|| no_home(0))?,
+                    s => others
                         .next()
-                        .ok_or_else(|| no_home(slot))?
+                        .ok_or_else(|| no_home(s))?
                         .stores
                         .as_mut_slice(),
-                ),
+                };
+                seqs.push(SlotStores {
+                    rows: r.rows.clone(),
+                    stores: st,
+                });
+            }
+            let mut prog = PassProgram {
+                gpu,
+                w,
+                k,
+                d: dims,
+                cfg,
+                names,
+                b,
+                card,
+                ropes,
+                slots,
+                ctx: *ctx,
+                seqs,
+                head,
+                m: total,
             };
-            let (parts, hybrid) = self.parts_on(stores);
-            return walk_step(gpu, w, parts, hybrid, head);
+            let mut leg = StepLeg::new(gpu.stream(), hybrid);
+            prog.walk(&mut leg)?;
         }
-        let Body {
-            hybrid,
-            cfg,
-            names,
-            dims,
-            k,
-            pass,
-            card,
-            stores,
-            ropes,
-            slots,
-            ctx,
-            ..
-        } = self;
-        let b = pass.as_mut().ok_or_else(|| {
-            shape_in(
-                PASS,
-                format!("a pass of {total} rows on a load planned for one sequence"),
-            )
-        })?;
-        let mut live = Some(stores.as_mut_slice());
-        let mut seqs = Vec::with_capacity(rows.len());
-        for r in rows {
-            let st = match r.slot {
-                0 => live.take().ok_or_else(|| no_home(0))?,
-                s => others
-                    .next()
-                    .ok_or_else(|| no_home(s))?
-                    .stores
-                    .as_mut_slice(),
-            };
-            seqs.push(SlotStores {
-                rows: r.rows.clone(),
-                stores: st,
-            });
+        if let Some(end) = live_end {
+            self.at = end;
+            self.pending = None;
         }
-        let mut prog = PassProgram {
-            gpu,
-            w,
-            k,
-            d: dims,
-            cfg,
-            names,
-            b,
-            card,
-            ropes,
-            slots,
-            ctx: *ctx,
-            seqs,
-            head,
-            m: total,
-        };
-        let mut leg = StepLeg::new(gpu.stream(), hybrid);
-        prog.walk(&mut leg)
+        Ok(())
     }
 
     /// The launches of the captured pass of `key` (each `(slot, rows)`, in
@@ -495,11 +518,13 @@ impl<'s> PassProgram<'s> {
         for sq in &mut self.seqs {
             let (r0, mj) = (sq.rows.start, sq.rows.len());
             let store = &mut sq.stores[l];
+            let rows = store.rows;
             {
                 let mut qkv = span_mut(W, &mut s.qkv, r0 * width, mj * width)?;
                 let mut q = span_mut(W, &mut s.q, r0 * q_row, mj * q_row)?;
                 let pos = span(W, &s.pos, r0, mj)?;
-                self.k.rope.enqueue_neox_append_k192(
+                enqueue_append(
+                    &self.k.rope,
                     stream,
                     K192Args {
                         qkv: &mut qkv,
@@ -515,12 +540,14 @@ impl<'s> PassProgram<'s> {
                         cache_k: &mut store.k,
                         cache_v: &mut store.v,
                     },
+                    rows,
                 )?;
             }
             let q = span(W, &s.q, r0 * q_row, mj * q_row)?;
             let keys = span(W, &s.n_keys, r0, mj)?;
             let mut y = span_mut(W, &mut s.y, r0 * y_row, mj * y_row)?;
-            self.k.flash.enqueue_pass_k192(
+            enqueue_pass(
+                &self.k.flash,
                 stream,
                 GqaK192Args {
                     q: &q,
@@ -539,6 +566,7 @@ impl<'s> PassProgram<'s> {
                     y: &mut y,
                 },
                 d.heads,
+                rows,
             )?;
         }
         for (c0, cn) in chunks(m, COL_GROUP) {

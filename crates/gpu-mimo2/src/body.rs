@@ -4,8 +4,8 @@
 //! All 48 layers are one card's chain: the dense layer 0 and 47 routed layers
 //! whose experts run on the card where the plan puts them ([`crate::card`]: the
 //! common per-slot pair, in the host leg's shadow) and on the host tier
-//! otherwise. Each layer is a GQA attention over a full plane of the stores' positions —
-//! its window bounds what a query reads, not what the layer holds — and a
+//! otherwise. Each layer is a GQA attention over its store — a window layer a
+//! ring of the plan's rows, a full layer the plane of every position — and a
 //! block; the step is [`crate::program`]'s walk, one token at a time. A pass
 //! of several slots' rows, one row each, is `slots`'s walk over the same
 //! layers (there is no verify pass of several rows of one sequence and no
@@ -56,7 +56,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::names;
-use model::arch::mimo2::place::PlanInputs;
+use model::arch::mimo2::place::{self, PlanInputs, Rows};
 use model::arch::mimo2::program::{self as facts, AttnArgs, AttnBuilt, BlockArgs, RouterBuilt};
 use model::embed::EmbedTable;
 use model::placement::Plan;
@@ -139,25 +139,70 @@ pub(crate) struct LayerNames {
     pub ffn: FfnNames,
 }
 
-/// A layer's cache: its key plane of `kv_heads · ctx` rows of 192 f16 and its
-/// value plane of `kv_heads · ctx` rows of 128, as the f16 bits the append
-/// writes.
+/// A layer's cache: its key plane of `kv_heads · rows` rows of 192 f16 and its
+/// value plane of `kv_heads · rows` rows of 128, as the f16 bits the append
+/// writes. `rows` is the context on a full layer and on a window layer whose
+/// ring fills the context, and the ring's height otherwise.
 pub(crate) struct Store {
     pub k: DeviceBuffer<u16>,
     pub v: DeviceBuffer<u16>,
+    /// Rows one key head holds.
+    pub rows: usize,
 }
 
 impl Store {
-    fn new(stream: &CudaStream, kv_heads: usize, ctx: usize) -> Result<Store, GpuError> {
+    fn new(stream: &CudaStream, kv_heads: usize, rows: usize) -> Result<Store, GpuError> {
         Ok(Store {
-            k: DeviceBuffer::zeroed(stream, kv_heads * ctx * HEAD_K192)?,
-            v: DeviceBuffer::zeroed(stream, kv_heads * ctx * HEAD)?,
+            k: DeviceBuffer::zeroed(stream, kv_heads * rows * HEAD_K192)?,
+            v: DeviceBuffer::zeroed(stream, kv_heads * rows * HEAD)?,
+            rows,
         })
     }
 
     fn bytes(&self) -> usize {
         self.k.num_bytes() + self.v.num_bytes()
     }
+}
+
+/// Device bytes of a store of `kv_heads` key heads and `rows` rows: the key
+/// and value planes [`Store::new`] allocates.
+fn store_device_bytes(kv_heads: usize, rows: usize) -> usize {
+    kv_heads
+        .saturating_mul(rows)
+        .saturating_mul(HEAD_K192 + HEAD)
+        * size_of::<u16>()
+}
+
+/// Rows layer `layer` holds, from the plan's layout. Refused by name when
+/// that count is not in `1..=ctx`.
+fn plan_rows(
+    kv: &place::KvLayout,
+    layer: usize,
+    ctx_max: u64,
+    ctx: usize,
+) -> Result<usize, GpuError> {
+    let rows = kv.rows_at(layer, ctx_max);
+    usize::try_from(rows)
+        .ok()
+        .filter(|&r| (1..=ctx).contains(&r))
+        .ok_or_else(|| {
+            shape(format!(
+                "layer {layer}: the plan counts {rows} rows in stores of {ctx}"
+            ))
+        })
+}
+
+/// Rows one layer holds under `choice`: the context on a full layer
+/// (`window == 0`) and under [`Rows::Plane`], and [`place::ring_rows`] on a
+/// window layer under [`Rows::Ring`].
+fn rows_for(choice: Rows, window: usize, ctx: usize) -> usize {
+    if window == 0 || choice == Rows::Plane {
+        return ctx;
+    }
+    let rows = place::ring_rows(window as u64, ctx as u64);
+    usize::try_from(rows)
+        .map(|r| r.clamp(1, ctx))
+        .unwrap_or(ctx)
 }
 
 /// One rope base's table on the card: the K192 rows at base `theta`. The full
@@ -335,8 +380,22 @@ pub struct Body {
     embd: Embedding,
     /// Each layer's output after the last step, when a gate armed them.
     taps: Option<Vec<DeviceBuffer<f32>>>,
-    /// Positions every store holds.
+    /// The position bound: a step at or past it is refused. A ring layer's
+    /// store is shorter; this stays the bound of the rope table and of the
+    /// live key count.
     ctx: usize,
+    /// Rows each layer of a sequence the load planned holds, from the plan's
+    /// layout. The live stores can be a sequence made beside that plan
+    /// ([`Body::new_seq_rows`]).
+    seq_rows: Vec<usize>,
+    /// Where the next step of the live sequence runs. The step and the prompt
+    /// batch move it. [`Body::stand_for_cut`] sets it from the model before a
+    /// cut, and [`Rollback::rollback`] measures its depth from here.
+    at: u32,
+    /// The position [`ChainBody::decode_input`] accepted and the step has not
+    /// stood past yet. A capture enqueues the chain with this clear, so the
+    /// capture does not move [`Body::at`].
+    pending: Option<u32>,
     /// How a prompt is fed, and the batch feed's buffers.
     prompt: PromptState,
     /// The resident sequences the load's plan counts, the live one included
@@ -702,9 +761,14 @@ impl Body {
         let pass = (rows > 1)
             .then(|| slots::PassBufs::new(stream, &dims, (qkv, ff), blocks(), rows))
             .transpose()?;
-        let stores = cfg
+        let mut seq_rows = Vec::with_capacity(cfg.len());
+        for (l, _) in cfg.iter().enumerate() {
+            seq_rows.push(plan_rows(&inputs.kv, l, plan.ctx_max, ctx)?);
+        }
+        let stores = seq_rows
             .iter()
-            .map(|c| Store::new(stream, c.attn.kv_heads, ctx))
+            .zip(&cfg)
+            .map(|(&rows, c)| Store::new(stream, c.attn.kv_heads, rows))
             .collect::<Result<Vec<_>, _>>()?;
         let held: usize = stores.iter().map(Store::bytes).sum();
         let planned = inputs.kv.bytes(layers.clone(), plan.ctx_max);
@@ -785,6 +849,9 @@ impl Body {
             embd,
             taps: None,
             ctx,
+            seq_rows,
+            at: 0,
+            pending: None,
             prompt: PromptState::new(),
             slots_planned: seqs.get(),
             slots_made: 1,
@@ -864,6 +931,70 @@ impl Body {
     #[must_use]
     pub fn store_bytes(&self) -> usize {
         self.stores.iter().map(Store::bytes).sum()
+    }
+
+    /// Whether a cut from `pos` back to `n` leaves every live layer's keys.
+    /// A plane does. A ring does when `pos - n` is within
+    /// [`place::cut_depth_keeps`]. `n` past `pos` does not.
+    #[must_use]
+    pub fn cut_keeps(&self, pos: u32, n: u32) -> bool {
+        if n > pos || self.stores.len() != self.cfg.len() {
+            return false;
+        }
+        let depth = u64::from(pos - n);
+        let ctx = self.ctx as u64;
+        self.stores.iter().zip(&self.cfg).all(|(store, c)| {
+            place::cut_depth_keeps(depth, store.rows as u64, ctx, c.attn.window as u64)
+        })
+    }
+
+    /// The live sequence stands at `pos`, the model's position. The session's
+    /// cut and a prompt's take-back set this before they roll back, so the
+    /// depth is the model's even when the last advance was a pass this record
+    /// did not see.
+    pub fn stand_for_cut(&mut self, pos: u32) {
+        self.at = pos;
+        self.pending = None;
+    }
+
+    /// Stand past the position [`ChainBody::decode_input`] accepted.
+    fn commit_pending(&mut self) {
+        if let Some(pos) = self.pending.take() {
+            self.at = pos.saturating_add(1);
+        }
+    }
+
+    /// One sequence of `rows` beside the load's own, for a gate's oracle: a
+    /// [`Rows::Plane`] sequence holds the context on every layer, a
+    /// [`Rows::Ring`] sequence the plan's ring. It is not one of the
+    /// sequences the load's plan counts, so it does not move
+    /// [`Slots::new_seq`]'s count. Refused by name when the card has fewer
+    /// free bytes than the stores take.
+    pub fn new_seq_rows(&self, gpu: &Gpu, rows: Rows) -> Result<Seq, GpuError> {
+        let need: usize = self
+            .cfg
+            .iter()
+            .map(|c| store_device_bytes(c.attn.kv_heads, rows_for(rows, c.attn.window, self.ctx)))
+            .sum();
+        let free = gpu.alloc_room()?;
+        if need > free {
+            return Err(shape(format!(
+                "a sequence of {need} B of stores, and the card has {free} B free"
+            )));
+        }
+        let stream = gpu.stream();
+        let stores = self
+            .cfg
+            .iter()
+            .map(|c| {
+                Store::new(
+                    stream,
+                    c.attn.kv_heads,
+                    rows_for(rows, c.attn.window, self.ctx),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Seq { stores })
     }
 
     /// Device bytes of the load's scratch, what the plan's card term
@@ -1033,6 +1164,7 @@ impl ChainBody for Body {
             )));
         }
         self.embd.fill(token)?;
+        self.pending = Some(pos);
         Ok(StepInput { pos })
     }
 
@@ -1047,13 +1179,18 @@ impl ChainBody for Body {
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
         let (parts, hybrid) = self.parts();
-        program::walk_step(gpu, w, parts, hybrid, head)
+        program::walk_step(gpu, w, parts, hybrid, head)?;
+        // A capture enqueues this with `pending` clear, so it does not stand.
+        self.commit_pending();
+        Ok(())
     }
 
     /// The host tier settled. The stores keep their rows: a position is
     /// written before a later one reads it, so a fresh prompt reads only what
     /// it wrote.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.at = 0;
+        self.pending = None;
         self.hybrid.settle(gpu.stream())
     }
 
@@ -1102,7 +1239,11 @@ impl TierBody for Body {
     }
 
     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
-        self.hybrid.serve_captured_of(chain)
+        self.hybrid.serve_captured_of(chain)?;
+        if chain == Chain::Step {
+            self.commit_pending();
+        }
+        Ok(())
     }
 }
 
@@ -1117,13 +1258,24 @@ impl Drop for Body {
 }
 
 impl Rollback for Body {
-    /// Nothing to take back: every layer holds its full plane of rows (a
-    /// window layer's window bounds what a query reads, not what the layer
-    /// holds), the flash never loads a key row at or past the live count
-    /// (`n_keys = pos + 1`, [`ChainBody::refresh`]), and every row below it is
-    /// written by its own step first ([`ChainBody::reset`]'s rule), so the
-    /// rows past `pos` are dead the moment the model stands at `pos`.
-    fn rollback(&mut self, _pos: u32) -> Result<(), GpuError> {
+    /// A cut back to `pos` writes nothing when every ring layer still holds
+    /// the keys the pass at `pos` reads, and is refused by name past that.
+    /// The ring holds `[at - rows, at)`. The pass appends row `pos` and reads
+    /// `[pos - window + 1, pos]`. `rows` is at least the window plus one
+    /// prompt batch minus one, so a cut of at most `rows - window + 1`
+    /// positions leaves those keys and the rows past `pos` are simply unread.
+    /// A full plane (`rows == ctx`) never refuses. The depth is `at - pos`,
+    /// and `at` is where the next step runs ([`Body::stand_for_cut`] sets it
+    /// from the model).
+    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        if !self.cut_keeps(self.at, pos) {
+            return Err(shape(format!(
+                "back to position {pos} from {} drops keys a ring no longer holds",
+                self.at
+            )));
+        }
+        self.at = pos;
+        self.pending = None;
         Ok(())
     }
 }
@@ -1141,11 +1293,11 @@ impl Slots for Body {
     type Seq = Seq;
 
     /// A sequence of the load's shape in the state the load leaves
-    /// ([`ChainBody::reset`]'s contract): zeroed stores of the live ones'
-    /// positions and kv heads. Refused by name past the sequences the load's
-    /// plan counts ([`Body::open_placed_slots`]), and when the card has fewer
-    /// free bytes ([`Gpu::alloc_room`]) than the stores take (the prompt
-    /// batch's buffers are unreserved and come out of the same free bytes).
+    /// ([`ChainBody::reset`]'s contract): zeroed stores of the load's rows
+    /// and kv heads. Refused by name past the sequences the load's plan
+    /// counts ([`Body::open_placed_slots`]), and when the card has fewer free
+    /// bytes ([`Gpu::alloc_room`]) than the stores take (the prompt batch's
+    /// buffers are unreserved and come out of the same free bytes).
     /// Load-time allocation.
     fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
         if self.slots_made >= self.slots_planned {
@@ -1156,7 +1308,12 @@ impl Slots for Body {
                 self.slots_planned
             )));
         }
-        let need = self.seq_bytes();
+        let need: usize = self
+            .seq_rows
+            .iter()
+            .zip(&self.cfg)
+            .map(|(&rows, c)| store_device_bytes(c.attn.kv_heads, rows))
+            .sum();
         let free = gpu.alloc_room()?;
         if need > free {
             return Err(shape(format!(
@@ -1165,9 +1322,10 @@ impl Slots for Body {
         }
         let stream = gpu.stream();
         let stores = self
-            .cfg
+            .seq_rows
             .iter()
-            .map(|c| Store::new(stream, c.attn.kv_heads, self.ctx))
+            .zip(&self.cfg)
+            .map(|(&rows, c)| Store::new(stream, c.attn.kv_heads, rows))
             .collect::<Result<Vec<_>, _>>()?;
         // Last, so a sequence whose allocation failed is not counted.
         self.slots_made += 1;

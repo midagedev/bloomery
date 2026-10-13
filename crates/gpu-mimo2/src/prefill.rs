@@ -46,10 +46,10 @@
 //! positions). That holds only behind a dense prefix: a group of two or more
 //! is refused by name on a load with a dense layer past a routed one.
 //!
-//! A call that fails stands the model where it found it: its positions are
-//! taken back (the stores keep every row, and a row past the model's position
-//! is dead), unless a fault poisoned the model. The fault word is read at the
-//! end of every group.
+//! A call that fails takes its positions back when every ring still holds the
+//! keys the restored position reads, unless a fault poisoned the model. A
+//! deeper cut is refused by name. The fault word is read at the end of every
+//! group.
 
 use std::ops::Range;
 
@@ -76,6 +76,7 @@ use runtime::prompt::{
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 use super::{Body, Dims, Kernels, LayerCfg, LayerNames, Mimo2Model, RopeBase, Store, WHAT, shape};
+use crate::attn::{enqueue_append, enqueue_pass};
 use crate::card::{CardBatch, CardExperts, Io, card_batch_bytes};
 use crate::ffn::FfnNames;
 
@@ -502,6 +503,10 @@ fn take_back(m: &mut Mimo2Model, from: u32, e: GpuError) -> GpuError {
     if matches!(e, GpuError::Fault { .. }) || m.poisoned().is_some() {
         return e;
     }
+    let pos = m.pos();
+    if let Ok((_, _, body)) = m.body_parts(WHAT) {
+        body.stand_for_cut(pos);
+    }
     match m.rollback(from) {
         Ok(()) => e,
         Err(r) => shape(format!(
@@ -650,102 +655,110 @@ impl Body {
         runs: &[Range<u32>],
         last: bool,
     ) -> Result<bool, GpuError> {
-        let n = self.dims.embd;
-        let layers = self.cfg.len();
-        let Body {
-            hybrid,
-            cfg,
-            names,
-            dims,
-            k,
-            s,
-            card,
-            stores,
-            ropes,
-            slots,
-            embd,
-            prompt,
-            ctx,
-            ..
-        } = self;
-        let Batch {
-            bufs,
-            units,
-            hsum,
-            card: card_batch,
-        } = prompt.batch.as_deref_mut().ok_or(GpuError::State {
-            what: WHAT,
-            missing: "the batch's buffers (set_prefill)",
-        })?;
-        let g = runs.len();
-        let ts: Vec<usize> = runs.iter().map(|r| (r.end - r.start) as usize).collect();
-        if g == 0 || g > units.len() {
-            return Err(shape(format!(
-                "a group of {g} batches on buffers of {} units",
-                units.len()
-            )));
-        }
-        let cap = bufs.cap;
-        if ts.iter().any(|&t| t == 0 || t > cap)
-            || runs.first().map(|r| r.start) != Some(pos)
-            || runs.windows(2).any(|w| w[0].end != w[1].start)
-            || ts.iter().sum::<usize>() != ids.len()
-        {
-            return Err(shape(format!(
-                "a group of batches {runs:?} from {pos} over {} ids: 1 to {cap} positions a \
-                 batch, consecutive from the group's position",
-                ids.len()
-            )));
-        }
-        let stream = gpu.stream();
-        let mut at = 0;
-        for (ub, &t) in units.iter_mut().zip(&ts) {
-            let p0 = pos + at as u32;
-            for (&token, row) in ids[at..at + t]
-                .iter()
-                .zip(ub.rows[..t * n].chunks_exact_mut(n))
+        let stood = runs.last().map(|r| r.end).unwrap_or(pos);
+        let ran = {
+            let n = self.dims.embd;
+            let layers = self.cfg.len();
+            let Body {
+                hybrid,
+                cfg,
+                names,
+                dims,
+                k,
+                s,
+                card,
+                stores,
+                ropes,
+                slots,
+                embd,
+                prompt,
+                ctx,
+                ..
+            } = self;
+            let Batch {
+                bufs,
+                units,
+                hsum,
+                card: card_batch,
+            } = prompt.batch.as_deref_mut().ok_or(GpuError::State {
+                what: WHAT,
+                missing: "the batch's buffers (set_prefill)",
+            })?;
+            let g = runs.len();
+            let ts: Vec<usize> = runs.iter().map(|r| (r.end - r.start) as usize).collect();
+            if g == 0 || g > units.len() {
+                return Err(shape(format!(
+                    "a group of {g} batches on buffers of {} units",
+                    units.len()
+                )));
+            }
+            let cap = bufs.cap;
+            if ts.iter().any(|&t| t == 0 || t > cap)
+                || runs.first().map(|r| r.start) != Some(pos)
+                || runs.windows(2).any(|w| w[0].end != w[1].start)
+                || ts.iter().sum::<usize>() != ids.len()
             {
-                embd.fill_into(token, row)?;
+                return Err(shape(format!(
+                    "a group of batches {runs:?} from {pos} over {} ids: 1 to {cap} positions a \
+                 batch, consecutive from the group's position",
+                    ids.len()
+                )));
             }
-            for i in 0..t {
-                ub.pos_host[i] = p0 + i as u32;
-                ub.keys_host[i] = p0 + i as u32 + 1;
+            let stream = gpu.stream();
+            let mut at = 0;
+            for (ub, &t) in units.iter_mut().zip(&ts) {
+                let p0 = pos + at as u32;
+                for (&token, row) in ids[at..at + t]
+                    .iter()
+                    .zip(ub.rows[..t * n].chunks_exact_mut(n))
+                {
+                    embd.fill_into(token, row)?;
+                }
+                for i in 0..t {
+                    ub.pos_host[i] = p0 + i as u32;
+                    ub.keys_host[i] = p0 + i as u32 + 1;
+                }
+                span_mut(WHAT, &mut ub.x, 0, t * n)?.copy_from_host(stream, &ub.rows[..t * n])?;
+                span_mut(WHAT, &mut ub.pos, 0, t)?.copy_from_host(stream, &ub.pos_host[..t])?;
+                span_mut(WHAT, &mut ub.n_keys, 0, t)?.copy_from_host(stream, &ub.keys_host[..t])?;
+                at += t;
             }
-            span_mut(WHAT, &mut ub.x, 0, t * n)?.copy_from_host(stream, &ub.rows[..t * n])?;
-            span_mut(WHAT, &mut ub.pos, 0, t)?.copy_from_host(stream, &ub.pos_host[..t])?;
-            span_mut(WHAT, &mut ub.n_keys, 0, t)?.copy_from_host(stream, &ub.keys_host[..t])?;
-            at += t;
-        }
-        let mut prog = PromptProgram {
-            gpu,
-            w,
-            k,
-            d: dims,
-            cfg,
-            names,
-            stores,
-            ropes,
-            slots,
-            card,
-            card_batch: card_batch.as_mut(),
-            no_bias: &s.no_bias,
-            ctx: *ctx,
-            b: bufs,
-            u: &mut units[..g],
-            t: &ts,
+            let mut prog = PromptProgram {
+                gpu,
+                w,
+                k,
+                d: dims,
+                cfg,
+                names,
+                stores,
+                ropes,
+                slots,
+                card,
+                card_batch: card_batch.as_mut(),
+                no_bias: &s.no_bias,
+                ctx: *ctx,
+                b: bufs,
+                u: &mut units[..g],
+                t: &ts,
+            };
+            let o = Overlap {
+                units: g,
+                cols: ts.iter().copied().max().unwrap_or(1),
+                port: PortKind::Batch,
+            };
+            let mut leg = BatchLeg::new(stream, hybrid, hsum, cap);
+            leg.set_unit_cols(&ts);
+            sched::walk(o, layers, &mut leg, &mut prog)?;
+            if last {
+                prog.head(head)?;
+            }
+            read_fault(WHAT, gpu, hybrid, last)
         };
-        let o = Overlap {
-            units: g,
-            cols: ts.iter().copied().max().unwrap_or(1),
-            port: PortKind::Batch,
-        };
-        let mut leg = BatchLeg::new(stream, hybrid, hsum, cap);
-        leg.set_unit_cols(&ts);
-        sched::walk(o, layers, &mut leg, &mut prog)?;
-        if last {
-            prog.head(head)?;
+        if ran.is_ok() {
+            self.at = stood;
+            self.pending = None;
         }
-        read_fault(WHAT, gpu, hybrid, last)
+        ran
     }
 }
 
@@ -788,6 +801,7 @@ impl PromptProgram<'_> {
         let n = &self.names[l].attn;
         let fault = gpu.layer_sink(l)?;
         let (b, ub, store) = (&mut *self.b, &mut self.u[u], &mut self.stores[l]);
+        let rows = store.rows;
         let width = d.heads * HEAD_K192 + a.kv_heads * (HEAD_K192 + HEAD);
         gpu.elem().enqueue_rms_norm(
             stream,
@@ -803,7 +817,8 @@ impl PromptProgram<'_> {
             let mut ys = span_mut(W, &mut b.qkv, c0 * width, cn * width)?;
             w.q8_gemv_mcol(gpu, WHAT, &n.qkv, &xs, cn, &mut ys)?;
         }
-        self.k.rope.enqueue_neox_append_k192(
+        enqueue_append(
+            &self.k.rope,
             stream,
             K192Args {
                 qkv: &mut b.qkv,
@@ -819,6 +834,7 @@ impl PromptProgram<'_> {
                 cache_k: &mut store.k,
                 cache_v: &mut store.v,
             },
+            rows,
         )?;
         let sinks = n
             .sinks
@@ -830,7 +846,8 @@ impl PromptProgram<'_> {
             let q = span(W, &b.q, c0 * q_row, cn * q_row)?;
             let keys = span(W, &ub.n_keys, c0, cn)?;
             let mut y = span_mut(W, &mut b.y, c0 * y_row, cn * y_row)?;
-            self.k.flash.enqueue_pass_k192(
+            enqueue_pass(
+                &self.k.flash,
                 stream,
                 GqaK192Args {
                     q: &q,
@@ -849,6 +866,7 @@ impl PromptProgram<'_> {
                     y: &mut y,
                 },
                 d.heads,
+                rows,
             )?;
         }
         for (c0, cn) in chunks(t, COL_GROUP) {
