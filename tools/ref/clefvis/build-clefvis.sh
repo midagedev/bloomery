@@ -4,8 +4,8 @@
 # fork. Clef-Flash's seat (BLOOMERY_MODEL=qwen35) links the tree hidden_ref links (53ed051ce) into $BLOOMERY_DATA/bin/dump_mtmd;
 # the Qwen seats (qwen35moe, qwen4exp) one binary between them, from the tree beside it (36a73916e, tools/ref/qvis/build-lcpp-qvis.sh)
 # into dump_mtmd_qvis, with the chat mode (DUMP_MTMD_CHAT: it links libllama-common for the model's chat template and parser);
-# MiniCPM-V 4.7's seat (minicpmv47: the tower only, no chat mode) from mainline 358a420e (`just build-mc47-lcpp`, the tree with
-# `minicpmv4_7`) into dump_mtmd_mc47. The
+# MiniCPM-V 4.7's seat (minicpmv47: the tower, hidden and chat arms, the chat mode linked as the Qwen seats' is) from mainline
+# 358a420e (`just build-mc47-lcpp`, the tree with `minicpmv4_7`) into dump_mtmd_mc47. The
 # post-decode callback of the helper changed with that tree's header (mtmd_helper_embd_batch): the build defines
 # DUMP_MTMD_EMBD_BATCH when the header has it.
 #
@@ -31,7 +31,7 @@ fi
 COMMIT=$(git_lcpp rev-parse --short=9 HEAD)
 LIB=$LCPP/build/bin
 libs=(libmtmd.so libllama.so libggml.so libggml-base.so)
-[ "$FAMILY" != qvis ] || libs+=(libllama-common.so)
+case $FAMILY in qvis | mcvis) libs+=(libllama-common.so) ;; esac
 for l in "${libs[@]}"; do
   [ -e "$LIB/$l" ] || { echo "build-clefvis: no $LIB/$l (the mainline build is the depth runners'; it must carry mtmd)" >&2; exit 2; }
 done
@@ -45,7 +45,7 @@ defs=()
 grep -q 'struct mtmd_helper_embd_batch' "$LCPP/tools/mtmd/mtmd-helper.h" && defs+=(-DDUMP_MTMD_EMBD_BATCH)
 incs=(-I"$LCPP/include" -I"$LCPP/ggml/include" -I"$LCPP/tools/mtmd")
 links=(-lmtmd -lllama -lggml -lggml-base)
-if [ "$FAMILY" = qvis ]; then
+if [ "$FAMILY" = qvis ] || [ "$FAMILY" = mcvis ]; then
   defs+=(-DDUMP_MTMD_CHAT)
   incs+=(-I"$LCPP/common" -I"$LCPP/vendor")
   links+=(-lllama-common)

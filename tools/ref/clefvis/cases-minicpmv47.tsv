@@ -1,0 +1,5 @@
+# case	images (the order of the image runs in the case's prompt)	decode steps after the prompt (0: the canvas seat has no decode arm)
+# mc1..mc3 are the requests of requests-minicpmv47.jsonl of the same id: set C (canvas-hidden) is their hidden states, set E (canvas-chatids) their ids
+mc1	free-448x448	0
+mc2	pad-1000x700	0
+mc3	free-448x448,small-200x200	0

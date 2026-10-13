@@ -96,7 +96,7 @@ pub const EMBD: &str = "embd";
 pub const INP_RAW: &str = "inp_raw";
 
 /// The text model's rope section order the canvas positions are laid out for (the checkpoint's `rope.section_order`).
-const SECTION_ORDER: &str = "zyxt";
+pub(super) const SECTION_ORDER: &str = "zyxt";
 
 /// The tapped nodes of a tile, in the order the dump writes them (without [`EMBD`]).
 #[must_use]
@@ -251,7 +251,7 @@ pub struct McvisSet {
     pub tap_effect: Vec<TapEffect>,
 }
 
-struct At<'a>(&'a Path);
+pub(super) struct At<'a>(pub(super) &'a Path);
 
 impl fmt::Display for At<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -271,7 +271,7 @@ fn lines<'a>(man: &'a RefManifest, key: &str) -> Vec<Vec<&'a str>> {
 }
 
 /// The one line of the header that opens with `# <key>\t`.
-fn one<'a>(man: &'a RefManifest, key: &str) -> Result<Vec<&'a str>, RefError> {
+pub(super) fn one<'a>(man: &'a RefManifest, key: &str) -> Result<Vec<&'a str>, RefError> {
     let mut v = lines(man, key);
     match v.len() {
         0 => Err(RefError::missing(
@@ -288,7 +288,7 @@ fn one<'a>(man: &'a RefManifest, key: &str) -> Result<Vec<&'a str>, RefError> {
 
 /// Every `# <kind>` line of the set as a row by the names of its `# <kind> columns` line; a line before its column line
 /// or of another width is `Malformed`.
-fn rows_of<T>(
+pub(super) fn rows_of<T>(
     man: &RefManifest,
     kind: &str,
     parse: impl Fn(&crate::columns::Row<'_>) -> Result<T, RefError>,
@@ -326,7 +326,7 @@ fn rows_of<T>(
 /// mtmd's `add_canvas_chunk` and `clip_suffix_rows`, spelled out: the overview closes with `</image>` (row 0) and opens
 /// the slices with `<slice>` (row 1) when there are some; a slice closes with `</slice>` (2) and opens the next with
 /// `<slice>` (1), the last of a row adds `\n` (3) between, the very last closes with `</slice>` only.
-fn canvas_suffix(tile: usize, grid_x: usize, grid_y: usize) -> Vec<usize> {
+pub(super) fn canvas_suffix(tile: usize, grid_x: usize, grid_y: usize) -> Vec<usize> {
     if tile == 0 {
         return if grid_x > 0 { vec![0, 1] } else { vec![0] };
     }
@@ -386,6 +386,76 @@ fn want_shape(man: &RefManifest, name: &str, ne: [u64; 4], at: &At<'_>) -> Resul
     Ok(())
 }
 
+/// What a set states about the run that made it.
+pub(super) struct Seat {
+    /// `# device cpu`: the CPU twin.
+    pub cpu: bool,
+    /// The card the dump ran on (`# device … card <name>`), `cpu` for a twin.
+    pub card: String,
+}
+
+/// The identity every set of the seat carries, tower or prompt: against the family ([`RefManifest::open`]: the trailer, the
+/// model file, the architecture and the mainline build), then the lines this module owns: `# clefvis` is `kind`, the
+/// projector file and its digest, the `# projector` and `# positions` lines, and the device. A set of another kind, or of
+/// the Qwen or GLM seats, is [`RefError::Foreign`] on `clefvis`, `projector` or `positions`; one made with another mmproj
+/// [`RefError::Stale`].
+pub(super) fn open_seat(
+    dir: &Path,
+    family: &'static Family,
+    kind: &str,
+) -> Result<(RefManifest, Seat), RefError> {
+    let man = RefManifest::open(dir, family)?;
+    let at = At(dir);
+    let foreign = |field: &'static str, got: String, want: String| RefError::Foreign {
+        set: dir.display().to_string(),
+        family: family.name,
+        field,
+        got,
+        want,
+    };
+    let line = one(&man, "clefvis")?;
+    if line != [kind] {
+        return Err(foreign("clefvis", line.join(" "), kind.into()));
+    }
+    let mm = one(&man, "mmproj")?;
+    let [path, "sha256", digest] = mm[..] else {
+        return Err(RefError::malformed(
+            &at,
+            format!("{mm:?}: want <path>\tsha256\t<digest>"),
+        ));
+    };
+    if path != MMPROJ_F16 || digest != MMPROJ_F16_SHA256 {
+        return Err(RefError::Stale {
+            set: dir.display().to_string(),
+            dumped_from: format!("mmproj {path} sha256 {digest}"),
+            runs: format!("mmproj {MMPROJ_F16} sha256 {MMPROJ_F16_SHA256}"),
+        });
+    }
+    let want_projector = format!(
+        "{PROJECTOR}\tpatch_size {PATCH}\timage_size 448\tn_merge {N_MERGE}\tprojection_dim {N_EMBD}\tblocks {BLOCKS}\tinsert_layer_id {INSERT_LAYER}"
+    );
+    let projector = one(&man, "projector")?.join("\t");
+    if projector != want_projector {
+        return Err(foreign("projector", projector, want_projector));
+    }
+    let want_positions = format!("canvas\tqwen35moe.rope.section_order {SECTION_ORDER}");
+    let positions = one(&man, "positions")?.join("\t");
+    if positions != want_positions {
+        return Err(foreign("positions", positions, want_positions));
+    }
+    let dev = one(&man, "device")?;
+    let (cpu, card) = match dev[..] {
+        [d @ ("cuda" | "cpu"), "threads", _, "card", card, ..] => (d == "cpu", card.to_string()),
+        _ => {
+            return Err(RefError::malformed(
+                &at,
+                format!("{dev:?}: want cuda|cpu\tthreads\t<n>\tcard\t<name>…"),
+            ));
+        }
+    };
+    Ok((man, Seat { cpu, card }))
+}
+
 impl McvisSet {
     /// Read the set at `dir` as a set of `kind`'s family: against the family ([`RefManifest::open`]: the trailer, the
     /// projector file as the model, the architecture and the mainline build), then against this module's pins. A set of
@@ -393,58 +463,7 @@ impl McvisSet {
     /// another mmproj [`RefError::Stale`]; a line or row that is missing or of another shape [`RefError::Malformed`]
     /// naming it.
     pub fn open(dir: &Path, kind: Kind) -> Result<McvisSet, RefError> {
-        let family = kind.family();
-        let man = RefManifest::open(dir, family)?;
-        let at = At(dir);
-        let foreign = |field: &'static str, got: String, want: String| RefError::Foreign {
-            set: dir.display().to_string(),
-            family: family.name,
-            field,
-            got,
-            want,
-        };
-        let line = one(&man, "clefvis")?;
-        if line != [kind.as_str()] {
-            return Err(foreign("clefvis", line.join(" "), kind.as_str().into()));
-        }
-        let mm = one(&man, "mmproj")?;
-        let [path, "sha256", digest] = mm[..] else {
-            return Err(RefError::malformed(
-                &at,
-                format!("{mm:?}: want <path>\tsha256\t<digest>"),
-            ));
-        };
-        if path != MMPROJ_F16 || digest != MMPROJ_F16_SHA256 {
-            return Err(RefError::Stale {
-                set: dir.display().to_string(),
-                dumped_from: format!("mmproj {path} sha256 {digest}"),
-                runs: format!("mmproj {MMPROJ_F16} sha256 {MMPROJ_F16_SHA256}"),
-            });
-        }
-        let want_projector = format!(
-            "{PROJECTOR}\tpatch_size {PATCH}\timage_size 448\tn_merge {N_MERGE}\tprojection_dim {N_EMBD}\tblocks {BLOCKS}\tinsert_layer_id {INSERT_LAYER}"
-        );
-        let projector = one(&man, "projector")?.join("\t");
-        if projector != want_projector {
-            return Err(foreign("projector", projector, want_projector));
-        }
-        let want_positions = format!("canvas\tqwen35moe.rope.section_order {SECTION_ORDER}");
-        let positions = one(&man, "positions")?.join("\t");
-        if positions != want_positions {
-            return Err(foreign("positions", positions, want_positions));
-        }
-        let dev = one(&man, "device")?;
-        let (cpu, card) = match dev[..] {
-            [d @ ("cuda" | "cpu"), "threads", _, "card", card, ..] => {
-                (d == "cpu", card.to_string())
-            }
-            _ => {
-                return Err(RefError::malformed(
-                    &at,
-                    format!("{dev:?}: want cuda|cpu\tthreads\t<n>\tcard\t<name>…"),
-                ));
-            }
-        };
+        let (man, Seat { cpu, card }) = open_seat(dir, kind.family(), kind.as_str())?;
         let images = read_images(&man)?;
         let tap_effect = if kind == Kind::Taps {
             read_tap_effect(&man, &images)?

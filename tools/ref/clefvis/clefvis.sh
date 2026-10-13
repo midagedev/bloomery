@@ -40,9 +40,11 @@
 # under test: build-clefvis.sh writes there too), QVIS_REF moves the ids: a re-dump compared with an installed set touches none.
 # The GLM seat (BLOOMERY_MODEL=glm5next, BLOOMERY_TIER=fixture) dumps on the respelled copy of the fixture the profile names; its sets
 # carry the fixture's `# fixture` line (refset-check --fixture-line, built here) and the copy's `# respell` line.
-# MiniCPM-V 4.7 (`just dump-ref-mcvis`, BLOOMERY_MODEL=minicpmv47, FAMILY mcvis in profile.sh) is the canvas seat: sets A and B only,
-# one row a tile (`<image>/t<k>/<node>`, dump_mtmd.cpp's header), the images of its own list (IMAGES_LIST), no case, no prompt arm and
-# no ids (`--ids` is refused, exit 64); its refset family is crates/refset/src/arch/minicpmv4_7.
+# MiniCPM-V 4.7 (`just dump-ref-mcvis`, BLOOMERY_MODEL=minicpmv47, FAMILY mcvis in profile.sh) is the canvas seat: sets A and B with
+# one row a tile (`<image>/t<k>/<node>`, dump_mtmd.cpp's header) from the images of its own list (IMAGES_LIST), the chat ids of
+# its requests (--ids: ref_minicpmv47_vis_chatids_mc1..3, kind canvas-chatids, CPU only) and the hidden rows of its cases
+# (ref_minicpmv47_vis_hidden_mc1..3, kind canvas-hidden, with the CPU twins); no prose, bf16 or decode arm. Its refset family is
+# crates/refset/src/arch/minicpmv4_7.
 set -euo pipefail
 REAL=$(readlink -f "${BASH_SOURCE[0]}")
 HERE=$(cd "$(dirname "$REAL")/../../.." && pwd)
@@ -130,11 +132,10 @@ fail() { echo "clefvis.sh: $1 failed (rc $2); the old set, if any, stays" >&2; r
 # chatids set and the ids file of every request; the set is moved into place, the ids to $REF/<case>.ids.
 write_ids() {
   if [ "$FAMILY" = clef ]; then ref_d --encode-only "$@"; return $?; fi
-  [ "$FAMILY" != mcvis ] || { echo "clefvis.sh: the $SEAT seat dumps the tower only (sets A and B): it has no chat ids" >&2; exit 64; }
   check_inputs
   fixture_args
   export BLOOMERY_REF_BUILD=$BUILD_COMMIT
-  local stage=$OUT/qvis/$MODEL_NAME.ids.staging case_ set_ ok=1
+  local stage=$OUT/qvis/${STAGE_NAME:-$MODEL_NAME}.ids.staging case_ set_ ok=1
   rm -rf "$stage"
   mkdir -p "$OUT/qvis" "$REF"
   set_images "$(all_images)"
@@ -195,8 +196,7 @@ else
   where=(-ngl 99)
   run=(env)
   suffix=
-  [ "$FAMILY" != mcvis ] || where+=(-t "$THREADS")
-  if [ "$FAMILY" = qvis ]; then
+  if [ "$FAMILY" = qvis ] || [ "$FAMILY" = mcvis ]; then
     where+=(-t "$THREADS")
     ncmoe=$NCMOE_3090
     case $device in *A6000*) ncmoe=$NCMOE_A6000 ;; esac
