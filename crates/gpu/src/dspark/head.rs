@@ -59,10 +59,9 @@ use crate::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, Q8Act, lau
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
-use gguf::GgmlType;
 use std::sync::Arc;
 
-use super::HeadSource;
+use super::{HeadSource, Q8Rows, TargetHead};
 
 const WHAT: &str = "dspark::head";
 
@@ -408,22 +407,12 @@ impl Head {
                 "the draft's own projection: the head runs the target's matrix only".into(),
             ));
         };
-        match target.ty {
-            GgmlType::Q6_K => {}
-            GgmlType::Q8_0 => {
-                return Err(refuse(
-                    "a Q8_0 target matrix: its row kernel takes the quants and the scales as two \
-                     planes, and a TargetHead holds one word stream"
-                        .into(),
-                ));
-            }
-            ty => {
-                return Err(refuse(format!(
-                    "a {ty} target matrix: the head has a row kernel for Q6_K"
-                )));
-            }
-        }
-        let n_vocab = target.w.rows();
+        let TargetHead::Q6K(proj) = target else {
+            return Err(refuse(
+                "a Q8_0 target matrix: the head chain has a row kernel for Q6_K".into(),
+            ));
+        };
+        let n_vocab = proj.rows();
         if w.norm.buf().len() != hidden {
             return Err(refuse(format!(
                 "a norm gain of {} values for rows of {hidden}",
@@ -483,9 +472,10 @@ impl Head {
     #[must_use]
     pub fn card_bytes(&self) -> u64 {
         let tensor = |t: &DeviceTensor<u32>| t.buf().num_bytes();
+        let rows = |q: &Q8Rows| q.qs.buf().num_bytes() + q.d.buf().num_bytes();
         let source = match &self.w.source {
-            HeadSource::Target(t) => tensor(&t.w),
-            HeadSource::Own(q) => q.qs.buf().num_bytes() + q.d.buf().num_bytes(),
+            HeadSource::Target(TargetHead::Q6K(w)) => tensor(w),
+            HeadSource::Target(TargetHead::Q8_0(q)) | HeadSource::Own(q) => rows(q),
         };
         let conf = self.w.conf.as_ref().map_or(0, |(c, _)| c.buf().num_bytes());
         let to_target = self.w.to_target.as_ref().map_or(0, DeviceBuffer::num_bytes);
@@ -529,7 +519,7 @@ impl Head {
         m: usize,
     ) -> Result<(), GpuError> {
         self.check(m)?;
-        let HeadSource::Target(target) = &self.w.source else {
+        let HeadSource::Target(TargetHead::Q6K(proj)) = &self.w.source else {
             return Err(GpuError::State {
                 what: WHAT,
                 missing: "the target's projection",
@@ -547,7 +537,7 @@ impl Head {
         )?;
         let act = &mut self.acts[m - 1];
         gpu.enqueue_quantize_q8_1(&self.normed, act)?;
-        gpu.enqueue_gemv_q6k(&target.w, act, &mut self.logits)
+        gpu.enqueue_gemv_q6k(proj, act, &mut self.logits)
     }
 
     /// Enqueue the Markov loop over the `m` rows' logits, row 0's previous
@@ -602,6 +592,19 @@ impl Head {
                 done: &mut self.done,
             },
         )
+    }
+
+    /// The `m` rows' normed input, token-major. Blocking; gate use.
+    pub fn normed_to_host(&self, stream: &CudaStream, m: usize) -> Result<Vec<f32>, GpuError> {
+        self.check(m)?;
+        Ok(self.normed.to_host_vec(stream)?[..m * self.hidden].to_vec())
+    }
+
+    /// The `m` rows' logits in the gemv's layout (`v · m + c`). Blocking;
+    /// gate use.
+    pub fn logits_to_host(&self, stream: &CudaStream, m: usize) -> Result<Vec<f32>, GpuError> {
+        self.check(m)?;
+        Ok(self.logits.to_host_vec(stream)?[..m * self.n_vocab].to_vec())
     }
 
     /// The `m` rows' proposal. Blocking. A fault the last step copied is

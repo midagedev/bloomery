@@ -32,9 +32,10 @@
 
 use std::sync::Arc;
 
-use bloomery_gpu::dspark::{CudaContext, DraftLayers, DsparkBody};
+use bloomery_gpu::dspark::{DraftLayers, DsparkBody};
 use bloomery_gpu::model::ChainBody;
 use bloomery_gpu::{Gpu, GpuError};
+use cuda_core::CudaContext;
 use model::placement::workstation::DeviceId;
 use runtime::dspark::DsparkShape;
 use runtime::{Draft, TapNeed, Tapped, TappedPrompt, Target, Verify};

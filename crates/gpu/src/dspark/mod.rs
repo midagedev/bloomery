@@ -7,9 +7,7 @@
 //! dense Qwen3-shaped layer in [`dense`]. The draft's geometry is
 //! [`bloomery_runtime::dspark::DsparkShape`].
 
-pub use cuda_core::CudaContext;
-use cuda_core::DeviceBuffer;
-use gguf::GgmlType;
+use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::dspark::{DraftVocab, DsparkShape};
 
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
@@ -105,6 +103,14 @@ pub trait DraftLayers {
     /// Forget every context row: a new generation.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError>;
 
+    /// Whether the captured graphs replay what the layers would enqueue now.
+    /// The owner asks before every graph replay, block and append, and never
+    /// before an eager pass. Layers whose captures bake in a setting a caller
+    /// can change refuse by name; the default says the captures always hold.
+    fn replayable(&self) -> Result<(), GpuError> {
+        Ok(())
+    }
+
     /// Card bytes these layers hold at `ctx` positions.
     fn card_bytes(&self, ctx: usize) -> u64;
 }
@@ -133,13 +139,15 @@ pub struct HostEmbed {
 }
 
 /// The target's output matrix as the draft's head borrows it: a copy on the
-/// draft's card in the target file's type.
-pub struct TargetHead {
-    /// The matrix's words.
-    pub w: DeviceTensor<u32>,
-    /// Its type: the owner runs the types it has a row kernel for and refuses
-    /// any other by name.
-    pub ty: GgmlType,
+/// draft's card in the target file's type, each arm holding exactly its
+/// planes. The owner runs the types it has a row kernel for and refuses any
+/// other by name.
+pub enum TargetHead {
+    /// Q6_K superblocks: the matrix's words.
+    Q6K(DeviceTensor<u32>),
+    /// Q8_0 rows in the form the row kernel takes. Refused by name until a
+    /// family's borrowed head needs it.
+    Q8_0(Q8Rows),
 }
 
 /// Where the head's projection comes from.
@@ -154,9 +162,10 @@ pub enum HeadSource {
 /// How a [`DsparkBody`] call reaches the card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Submit {
-    /// A replay of the graph captured at load for the call's shape. An
-    /// append of more than [`DraftLayers::APPEND_GROUP`] rows has no graph
-    /// and runs eager either way.
+    /// A replay of the graph captured at load for the call's shape, after
+    /// [`DraftLayers::replayable`] says the captures hold. An append of more
+    /// than [`DraftLayers::APPEND_GROUP`] rows has no graph and runs eager
+    /// either way.
     Graph,
     /// Every launch enqueued one by one: the gates' twin of a replay.
     Eager,
@@ -483,13 +492,20 @@ impl<L: DraftLayers> DsparkBody<L> {
             ));
         }
         self.positions.check_append(first, n)?;
+        let graph = match submit {
+            Submit::Graph => self.graphs.append.get(n - 1),
+            Submit::Eager => None,
+        };
+        if graph.is_some() {
+            self.layers.replayable()?;
+        }
         let s = gpu.stream();
         put_f32(&mut self.feats.host_mut()?[..n * self.feat], taps);
         self.feats.upload(s, n * self.feat)?;
         self.layers.stage_kv(gpu, first, n)?;
-        match (submit, self.graphs.append.get(n - 1)) {
-            (Submit::Graph, Some(g)) => g.launch(s)?,
-            _ => self.enqueue_append(gpu, n)?,
+        match graph {
+            Some(g) => g.launch(s)?,
+            None => self.enqueue_append(gpu, n)?,
         }
         self.positions.append(first, n)?;
         Ok(n)
@@ -558,6 +574,13 @@ impl<L: DraftLayers> DsparkBody<L> {
                 "the token {last} before a block, past the target's {n_target} ids"
             )));
         }
+        let graph = match submit {
+            Submit::Graph => self.graphs.block.get(m - 1),
+            Submit::Eager => None,
+        };
+        if graph.is_some() {
+            self.layers.replayable()?;
+        }
         let s = gpu.stream();
         let host = self.block_in.host_mut()?;
         host[0] = last;
@@ -577,9 +600,9 @@ impl<L: DraftLayers> DsparkBody<L> {
             let mut x = WindowMut::of_mut(&mut self.x, 0, m * self.hidden)?;
             x.copy_from_device_async(&rows, s)?;
         }
-        match (submit, self.graphs.block.get(m - 1)) {
-            (Submit::Graph, Some(g)) => g.launch(s)?,
-            _ => self.enqueue_block(gpu, m)?,
+        match graph {
+            Some(g) => g.launch(s)?,
+            None => self.enqueue_block(gpu, m)?,
         }
         let asked = !p.is_empty();
         let (ids, probs) = if asked {
@@ -603,6 +626,26 @@ impl<L: DraftLayers> DsparkBody<L> {
             p[..width].copy_from_slice(&probs[skip..]);
         }
         Ok(width)
+    }
+
+    /// The gate's seat: commit `committed` positions as if that many rows
+    /// had been appended, with no launch, for a gate that seats the layers'
+    /// context from an oracle ([`DsparkBody::layers_mut`]) instead of
+    /// appending it. Refused by name unless nothing is committed, and for 0.
+    pub fn seat_positions(&mut self, committed: u32) -> Result<(), GpuError> {
+        let held = self.positions.committed();
+        if held != 0 || committed == 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a seat of {committed} positions after {held} committed; a seat takes a \
+                     reset draft and 1.. positions"
+                ),
+            ));
+        }
+        let n = usize::try_from(committed)
+            .map_err(|_| GpuError::shape(WHAT, format!("a seat of {committed} positions")))?;
+        self.positions.append(0, n)
     }
 
     /// Forget the sequence: no committed position, the layers' context
@@ -638,6 +681,30 @@ impl<L: DraftLayers> DsparkBody<L> {
     /// seated.
     pub fn layers_mut(&mut self) -> &mut L {
         &mut self.layers
+    }
+
+    /// The head, for the gates' readouts.
+    #[must_use]
+    pub fn head(&self) -> &Head {
+        &self.head
+    }
+
+    /// The head, writable: the gates' way to run its launches over rows of
+    /// their own.
+    pub fn head_mut(&mut self) -> &mut Head {
+        &mut self.head
+    }
+
+    /// The `m` rows the layers left in the owner's `x`, before the head's
+    /// norm, token-major. Blocking; gate use.
+    pub fn block_rows_to_host(&self, stream: &CudaStream, m: usize) -> Result<Vec<f32>, GpuError> {
+        if !(1..=L::MAX_ROWS).contains(&m) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a readout of {m} rows; the layers hold 1..={}", L::MAX_ROWS),
+            ));
+        }
+        Ok(self.x.to_host_vec(stream)?[..m * self.hidden].to_vec())
     }
 
     /// The captured block pass of `m` rows.
