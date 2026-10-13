@@ -1009,6 +1009,12 @@ q3_self_test() {
   want prefill-empty 64 "depth-qwen3moe.sh: arm '6@prefill=': prefill= names no prefill path"
   run_parse -- 6@prefill=pass,prefill=gemm
   want prefill-twice 64 "depth-qwen3moe.sh: arm '6@prefill=pass,prefill=gemm': prefill is given twice"
+  # A comma with nothing between is an empty item. The splitters drop it, so these two would
+  # otherwise leave ENVS empty and skip the lever check. The list as given is refused first.
+  run_parse -- 6@prefill=pass,
+  want prefill-trail-comma 64 "an empty item in 'prefill=pass,'"
+  run_parse -- 6@,prefill=pass
+  want prefill-lead-comma 64 "an empty item in ',prefill=pass'"
   for ex in lcpp:6@prefill=pass lcppsrv:6@prefill=pass ik:6@prefill=pass; do
     run_parse -- "$ex"
     want "prefill-ref-${ex%%:*}" 64 "depth-qwen3moe.sh: arm '$ex': prefill= sets generate_qwen3moe's --prefill, and ${ex%%:*} is a reference engine's arm"
@@ -1586,6 +1592,9 @@ split_at() {
   arm_place_split "$1" "$2"
   arm_mem_split "$1" "$ARM_REST"
   arm_model_split "$1" "$ARM_MEM_REST"
+  # Empty items are dropped by the splitters, so `prefill=pass,` and `,prefill=pass` would
+  # leave ENVS empty and skip arm_envs_ok. Refuse the list as given, before prefill= is taken out.
+  case ,$AT, in *,,*) arm_envs_ok "$1" "$AT" ;; esac
   arm_prefill_split "$1" "$ARM_MODEL_REST"
   ENVS=$ARM_PREFILL_REST APLACE=$ARM_PLACE AMEM=$ARM_MEM AMODEL=$ARM_MODEL APREFILL=$ARM_PREFILL
   [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
