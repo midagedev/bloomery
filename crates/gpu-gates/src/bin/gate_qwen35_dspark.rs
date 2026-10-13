@@ -720,9 +720,9 @@ mod gate {
         let block = names(layers.enqueue_block(gpu, &mut x, BLOCK), "stage_block");
         let append = names(layers.append_kv(gpu, &x, APPEND), "stage_kv");
         let replay_text = layers.replayable().err().map(|e| e.to_string());
-        let replay = replay_text.as_deref().is_some_and(|s| {
-            s.contains("stage_kv") && s.contains("stage_block")
-        });
+        let replay = replay_text
+            .as_deref()
+            .is_some_and(|s| s.contains("stage_kv") && s.contains("stage_block"));
         let block_captured = gpu
             .capture(|_| layers.enqueue_block(gpu, &mut x, BLOCK))
             .is_ok();
