@@ -270,7 +270,10 @@ gpu-mimo2 0 0 0
 # PIN(2026-10-11): gpu-vision 86 -> 91 blocks, new code, not old code relaxed: the glm5v tower's three new kernel entries read
 # and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_head_rms_norm 2,
 # vis_silu_mul_clamp 2, vis_gelu_erf 1.
-gpu-vision 91 0 0
+# PIN(2026-10-13): gpu-vision 91 -> 97 blocks, new code, not old code relaxed: the MiniCPM-V merger's two new kernel entries read
+# and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_attn_group 5 (its
+# loader, three word reads, one store), vis_mean_groups 1 (its loader).
+gpu-vision 97 0 0
 # PIN(2026-10-13): hf 0 -> 2 blocks, new code, not old code relaxed: the DSpark draft's 1.9 GB safetensors file is read
 # through a read-only mapping (Safetensors::open) instead of into memory, and a bf16 tensor's bytes are viewed as u16
 # (Safetensors::bf16, a misaligned file refused), each block with its SAFETY line.
