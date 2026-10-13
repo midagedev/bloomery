@@ -204,13 +204,24 @@ impl BesideDraft {
     /// Every path [`BesideDraft::pick`] checks when the lever is unset, in
     /// that order, whether or not a file is there: the draft's name in the
     /// target's directory, that name in the resolved directory when it is a
-    /// different one, then [`BesideDraft::path`] when it is not already one
-    /// of those. The `load draft=off` line names this list, so a missing
-    /// sidecar says where the run looked, once per path.
+    /// different one, then the [`DraftFile::Fixed`] path when it is not
+    /// already one of those. The `load draft=off` line names this list, so a
+    /// missing sidecar says where the run looked, once per path.
+    ///
+    /// # Panics
+    /// On a [`DraftFile::ByCheckpoint`] row, which has no one path: the
+    /// caller names the target's checkpoint ([`BesideDraft::pick_for`]).
     #[must_use]
     pub fn places(&self, target: &Path) -> Vec<PathBuf> {
+        let path = match self.file {
+            DraftFile::Fixed(path) => path,
+            DraftFile::ByCheckpoint(_) => panic!(
+                "the {} draft file follows the target's checkpoint: pick_for names it",
+                self.arch
+            ),
+        };
         let mut out = Vec::new();
-        let name = Path::new(self.path).file_name();
+        let name = Path::new(path).file_name();
         if let (Some(name), Some(dir)) = (name, target.parent()) {
             out.push(dir.join(name));
             if let Some(resolved) = target
@@ -223,7 +234,7 @@ impl BesideDraft {
                 }
             }
         }
-        let family = PathBuf::from(self.path);
+        let family = PathBuf::from(path);
         if !out.iter().any(|p| p == &family) {
             out.push(family);
         }
@@ -525,8 +536,8 @@ mod tests {
             ROW.pick(None, &target),
             (PathBuf::from(ROW_PATH), DraftFrom::Family)
         );
-        let beside = s.real_dir("only").join(ROW.name());
-        assert_eq!(ROW.places(&target), vec![beside, PathBuf::from(ROW.path)]);
+        let beside = s.real_dir("only").join(ROW_NAME);
+        assert_eq!(ROW.places(&target), vec![beside, PathBuf::from(ROW_PATH)]);
     }
 
     /// The beside path is the family's path when the target already sits in
@@ -534,7 +545,7 @@ mod tests {
     #[test]
     fn places_names_the_family_path_once_when_the_target_sits_there() {
         let target = Path::new("/nowhere/shard.gguf");
-        assert_eq!(ROW.places(target), vec![PathBuf::from(ROW.path)]);
+        assert_eq!(ROW.places(target), vec![PathBuf::from(ROW_PATH)]);
     }
 
     /// A symlink is looked at in the link's directory and then beside the
@@ -548,9 +559,9 @@ mod tests {
         assert_eq!(
             ROW.places(&target),
             vec![
-                s.0.join("links").join(ROW.name()),
-                s.real_dir("real").join(ROW.name()),
-                PathBuf::from(ROW.path),
+                s.0.join("links").join(ROW_NAME),
+                s.real_dir("real").join(ROW_NAME),
+                PathBuf::from(ROW_PATH),
             ]
         );
     }
