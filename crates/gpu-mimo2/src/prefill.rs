@@ -673,7 +673,7 @@ impl Body {
                 embd,
                 prompt,
                 ctx,
-                at: ref mut high,
+                at: high,
                 ..
             } = self;
             let Batch {

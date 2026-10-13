@@ -471,12 +471,7 @@ mod tests {
         let first = 960;
         let second = 950;
         assert!(super::cut_depth_keeps(written - first, rows, ctx, window));
-        assert!(!super::cut_depth_keeps(
-            written - second,
-            rows,
-            ctx,
-            window
-        ));
+        assert!(!super::cut_depth_keeps(written - second, rows, ctx, window));
         assert!(super::cut_depth_keeps(first - second, rows, ctx, window));
     }
 
