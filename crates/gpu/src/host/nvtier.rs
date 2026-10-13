@@ -99,9 +99,7 @@ use bloomery_levers::NvTierMem;
 use cuda_core::CudaContext;
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
-use model::moe::{
-    Claim, PinRelease, PinToken, Ticket, TicketWait, TierError, TierPin, TierSlots,
-};
+use model::moe::{Claim, PinRelease, PinToken, Ticket, TicketWait, TierError, TierPin, TierSlots};
 use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
 use model::placement::workstation::ArenaGrant;
@@ -501,7 +499,15 @@ fn claim_with(
     let mut evicted = Vec::new();
     let mut pinned = Vec::new();
     let misses = claim_fill(
-        layer, arena, books, ids, kind, pin, &mut picks, &mut evicted, &mut pinned,
+        layer,
+        arena,
+        books,
+        ids,
+        kind,
+        pin,
+        &mut picks,
+        &mut evicted,
+        &mut pinned,
     )?;
     Ok(Claimed {
         picks,
@@ -2618,8 +2624,7 @@ impl NvTier {
             }
         };
         self.stats.misses.fetch_add(misses, Ordering::Relaxed);
-        self.stats
-            .pinned_claim(kind, pinned.len() as u64, misses);
+        self.stats.pinned_claim(kind, pinned.len() as u64, misses);
         let n_evict = evicted.len() as u64;
         evicted.clear();
         drop(evicted);
