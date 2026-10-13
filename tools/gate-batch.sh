@@ -1501,7 +1501,9 @@ FP
   # (9b) a ledger skip of a lane item, not a member: a balanced item green on one key. Either lane may take it (take_next hands a
   # green skip out first), so a lane claims it before it records the skip: one `rc=skip` line, the other lane goes on, the batch
   # ends. Unclaimed, the same item came back to both lanes without end, so the case runs the batch under a bound: the lanes' skip
-  # line past one, or the batch still running after 20 s, stops it. lskip_case prints `<rc, 124 at the bound> <skip lines>`.
+  # line past one, or the batch still running after 60 s, stops it. 20 s was short of a loaded key recheck: the green case was
+  # still inside ledger_record (its `echo recorded` then died on a broken pipe) when the bound killed it. The mutant still stops
+  # on a second skip line. lskip_case prints `<rc, 124 at the bound> <skip lines>`.
   fi
   lskip_case() { # <tag> <script>
     local tag=$1 script=$2 sp k=0 rc=0 cnt=0 f
@@ -1510,7 +1512,7 @@ FP
     FAKE_GREEN_FILE=$t/green-lskip.tsv BLOOMERY_GATE_TIMES=$t/times-$tag.tsv BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
       bash "$script" --out "$t/target/c-$tag" --round-ledger steal-fix plain-any 'v41-any@FAKE_SLEEP=2' > "$t/out-$tag.log" 2>&1 &
     sp=$!
-    while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 20 ]; do
+    while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 60 ]; do
       cnt=$(grep -c '^plain-any rc=skip ' "$t/target/c-$tag/run.log" 2> /dev/null || true)
       [ "${cnt:-0}" -lt 2 ] || break
       sleep 1
