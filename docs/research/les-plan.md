@@ -100,9 +100,9 @@ shape are `BLOOMERY_CARD_BUDGET`, `BLOOMERY_HOST_ROOM` and `BLOOMERY_NVTIER_BYTE
 | host compute, one Qwen3.8 pick | 23.6 µs | [measured, `tierengine.md:464`] |
 | ruler | sd 2.6 %; ±2.44 % at 10 rounds | [measured, `refill-decode.card:74-77`, `:49-50`] |
 
-Derived from these: shape A's layer time is 23.7 / 48 = 0.49 ms. L = 48 (1 − e^(−f/48)) is 3.5 at f 4. The fill wall
-is L × t_fill = 3.5 × (0.81–1.06) = 2.8–3.7 ms, 12–16 % of the token [derived]. Removing every fill from the chain is
-therefore worth at most +13..+19 % tok/s at shape A [derived].
+Derived from these: shape A's layer time is 23.7 / 48 = 0.49 ms. L = 48 × (1 − exp(−f/48)) ≈ 3.84 at f = 4
+[derived]. The fill wall is L × t_fill = 3.84 × (0.81–1.06) = 3.1–4.1 ms, 13–17 % of the token [derived]. Removing
+every fill from the chain is therefore worth at most +15..+21 % tok/s at shape A [derived].
 
 ## 2. Candidates, ranked by expected decode gain over cost
 
@@ -111,10 +111,10 @@ independent expert products are computed. The final sum stays in list order, so 
 
 | Rank | Candidate (LES idea) | Shape A gain [derived] | Gate plan G gain [derived] | Cost | Break-even / open condition |
 |---|---|---|---|---|---|
-| 1 | **C2: part units**, a fill's 3 parts as 3 reader units, so one miss runs at QD 3 (LES "fewer read calls" / "weight layout"; tierengine S2's remaining half) | L × (t_QD1 − t_QD3) = 3.5 × (0.81–1.06 − 0.64–0.75) = 0.2–1.5 ms: **+1..+7 %**, central +4 % | 29.5 × (0.31–0.42) = 9–12 ms: **+11..+17 %** of ~75–85 ms [assumption: G's post-S1 token] | small: `read_pick` split into parts, `Job.units = 3 × picks`, publish at the last part | none: the bytes are the same. Gain > 0 while R(3) > R(1). Opened either way; T2's census reads t_QD1 for the Step kind first |
-| 2 | **C1: resident-first on the one-column step**: the `Chain::Step` miss path takes the existing `serve_step_split` (LES "compute resident experts first") | hits per miss layer ≈ 3 × 23.6 µs = 0.07 ms; × L 3.5 = 0.25 ms: **+1 %** (inside the ruler) | ≈ 9 hits × 23.6 µs = 0.21 ms × 29.5 = 6.2 ms: **+7..+9 %** | small: the code exists; the step needs union slabs (`HostRun::prepare_union`, `run.rs:132`) and a miss issue that may allocate on land (§5); allocation-free is a follow-up | gain = L × min(t_hits, t_fill) > the handoff of a reader job (0.05–0.15 ms a job [assumption, `tierengine.md:494`]). At shape A it is near even, so it lands as structural, the prerequisite for C3 (the step must be able to wait on a fill in flight), and is A/B'd at G |
-| 3 | **C3: cross-layer prefetch** (LES "cross-layer routing prediction"): at layer l's service, predict l+d's misses and queue them as `Kind::Prefetch` (rank 3, `Claim::Transient`); a step claim on an in-flight prefetch waits on it | r × L × h, h = min(window d × 0.49 ms, residual fill 0.57–0.68): d = 1 gives r × 3.5 × 0.49; **r 0.6 → +4.5 %, oracle r 1 → +7.8 %** | window ≥ 0.77 ms ≥ fill: r × 29.5 × 0.5 ≈ 15 r ms; **r 0.6 → +12 %** | medium: a fourth kind, joining a FILLING slot, cancellation, counters, a predictor | see the break-even below; open only if the replay gives r_miss ≥ 0.35 at d = 1 (shape A) and the oracle ceiling run clears the ruler |
-| 4 | C2b: sub-part tiles (part/3, 9 units a fill) | −0.16 ms a fill × 3.5 = 0.56 ms: +2 % | −7 ms (−8 %) (`tierengine.md:357`) | small after C2 | only if C2's measured QD-3 fill is ≥ 0.6 ms (S11's existing gate) |
+| 1 | **C2: part units**, a fill's 3 parts as 3 reader units, so one miss runs at QD 3 (LES "fewer read calls" / "weight layout"; tierengine S2's remaining half) | L × (t_QD1 − t_QD3) = 3.84 × (0.81–1.06 − 0.64–0.75) = 0.23–1.6 ms: **+1..+7 %**, central +4 % | 29.5 × (0.31–0.42) = 9–12 ms: **+11..+17 %** of ~75–85 ms [assumption: G's post-S1 token] | small: `read_pick` split into parts, `Job.units = 3 × picks`, publish at the last part | none: the bytes are the same. Gain > 0 while R(3) > R(1). Opened either way; T2's census reads t_QD1 for the Step kind first |
+| 2 | **C1: resident-first on the one-column step**: the `Chain::Step` miss path takes the existing `serve_step_split` (LES "compute resident experts first") | hits per miss layer ≈ 3 × 23.6 µs = 0.07 ms; gain = L × (min(t_hits, t_fill) − t_handoff) with t_handoff 0.05–0.15 ms a job [assumption, `tierengine.md:494`]: at most ~0.08 ms, often ≤ 0: **≤ +1 %** (inside the ruler; no claim) | ≈ 9 hits × 23.6 µs = 0.21 ms; × 29.5 × (0.21 − 0.05..0.15) = 1.8–4.7 ms: **+2..+6 %** of ~75–85 ms | small: the code exists; the step needs union slabs (`HostRun::prepare_union`, `run.rs:132`) and a miss issue that may allocate on land (§5); allocation-free is a follow-up | open when L × (min(t_hits, t_fill) − t_handoff) > 0. At shape A it is near even or negative, so it lands as structural, the prerequisite for C3 (the step must be able to wait on a fill in flight), and is A/B'd at G |
+| 3 | **C3: cross-layer prefetch** (LES "cross-layer routing prediction"): at layer l's service, predict l+d's misses and queue them as `Kind::Prefetch` (rank 3, `Claim::Transient`); a step claim on an in-flight prefetch waits on it | r × L × h, h = min(window d × 0.49 ms, residual fill 0.57–0.68): d = 1 gives r × 3.84 × 0.49; **r 0.6 → +4.8 %, oracle r 1 → +7.9 %** | window ≥ 0.77 ms ≥ fill: r × 29.5 × 0.5 ≈ 15 r ms; **r 0.6 → +12 %** | medium: a fourth kind, joining a FILLING slot, cancellation, counters, a predictor | see the break-even below; open only if the replay gives r_miss ≥ 0.31 at d = 1 (shape A) and the oracle ceiling run clears the ruler |
+| 4 | C2b: sub-part tiles (part/3, 9 units a fill) | −0.16 ms a fill × 3.84 = 0.61 ms: +3 % | −7 ms (−8 %) (`tierengine.md:357`) | small after C2 | only if C2's measured QD-3 fill is ≥ 0.6 ms (S11's existing gate) |
 | — | Contiguous repack (one 3.1 MB pread an expert, LES "weight layout") | 2 syscalls × ~10 µs [assumption] × f 4 = 0.08 ms: **~0** once C2 lands. The block layer already gives QD ~3–4 from one thread (`qdsweep.card:17-20`) and C2 gives the same QD with no file rewrite | ~0 | large: a sidecar of the paged stacks (2× disk) or a rewritten file | do not open |
 | — | Direct writes to GPU-visible memory | 0 on discrete: the CPU computes the paged experts (`nvtier.rs:1-9`) | 0 | — | GB10 only: that is S7 + the card leg, the contributor's (`tierengine.md:499`; `docs/contrib/dgx-spark.md` §8). Not this plan |
 | — | Layer-wise mixed precision (LES stage 2) | n/a | n/a | a new quant file | not lossless against the shipped file; in 0.3.3 as a separate file-choice row (§5) |
@@ -136,8 +136,8 @@ Open C3 when both conditions hold:
 
 At shape A (h 0.49, t 0.64, f 4, T 23.7) with μ ≤ 0.2 [assumption until the replay], the first condition is q > 0.21.
 The second is w ≤ 21 a token, so precision is not binding. To clear the ruler at 10 rounds (≥ 0.58 ms), the bar is
-r ≥ 0.58 / (3.5 × 0.49) = **0.34**. MiniCPM's layers are thinner (§3.1): there d = 1 hides only part of a fill, so
-the replay also scores d = 2.
+r ≥ 0.58 / (3.837868 × 0.49) ≈ 0.3084; round up to **0.31** [derived]. MiniCPM's layers are thinner (§3.1): there
+d = 1 hides only part of a fill, so the replay also scores d = 2.
 
 **Predictor choice, cheapest first** (`tierengine.md:130-176` names (1) and (3)):
 
@@ -202,11 +202,11 @@ and equal plan and nvtier budget fields.
 
 | Step | Kind | Shape | Predicted | Pass (decide-in) | Fail (finding) |
 |---|---|---|---|---|---|
-| E0 replay (Mac, no card) | functional | traces of A, G, M | r_miss, q, μ for P2 at d = 1, 2 | r ≥ 0.34 (A) → C3 opens with P2 | r < 0.34: P3 probe (E3b); both < 0.34: C3 closes, C1+C2 stand |
+| E0 replay (Mac, no card) | functional | traces of A, G, M | r_miss, q, μ for P2 at d = 1, 2 | r ≥ 0.31 (A) → C3 opens with P2 | r < 0.31: P3 probe (E3b); both < 0.31: C3 closes, C1+C2 stand |
 | E1 census (box, no lease) | functional | A, G, M, A+d | f, L, step t_fill, `step.wait_ns`, by chain | fixes M's budgets (f ≥ 5) and each card's band | f at A < 3: shape A cannot show C1/C3; G and M carry them |
 | E2 +C2 | ab | A, G | A +1..+7 %; G +11..+17 % | inside the band; the Step kind's run_ns per fill falls to 0.63–0.75 ms | t_QD3 ≥ t_QD1: the drive's QD-3 rate is the wrong term; recheck qdsweep's curve |
-| E3 +C1 | ab | G (A read beside) | G +7..+9 %; A +1 % (inside the ruler, no claim) | G in band; `step_hits_under_read_ns` ≈ L × 0.21 ms | a loss at A beyond −1 %: the handoff term (job alloc, wake) is larger than 0.15 ms |
-| E3b P3 probe | functional | M | r for router-on-x_l | r ≥ 0.34 → P3 replaces P2 | — |
+| E3 +C1 | ab | G (A read beside) | G +2..+6 %; A ≤ +1 % (inside the ruler, no claim) | G in band; `step_hits_under_read_ns` ≈ L × 0.21 ms | a loss at A beyond −1 %: the handoff term (job alloc, wake) is larger than 0.15 ms |
+| E3b P3 probe | functional | M | r for router-on-x_l | r ≥ 0.31 → P3 replaces P2 | — |
 | E4 +C3 oracle | ab | A, M | the ceiling: A +7.8 %, M from E1 | the ceiling clears the ruler → build the predictor | ceiling inside the ruler: C3 closes before the predictor |
 | E5 +C3 predictor | ab | A, M | r × ceiling (E0's r) | inside the band; `induced_misses` ≤ μ · w as the replay said | below: read r and q from the probe keys, then which term (r, h, μ) missed |
 
@@ -225,15 +225,16 @@ same arms with the draft on.
   `NvTier::audit_on` checks on functional runs (`nvtier.rs:2092-2166`).
 - **Sum order.** Every path sums in list order. The one-column path uses `serve`; the split path uses
   `sum_batched` (`moe.rs:1937`), whose contract is "column j = `experts_into` of column j bit for bit"
-  (`moe.rs:2696-2706`, held by `gate-union`). C1 routes the one-column miss case through that same contract.
+  (`moe.rs:2696-2706`, held by `gate-ops`'s split-path bit-identity test via `experts_step_union_into`). The ordinary
+  union contract stays with `gate-union`. C1 routes the one-column miss case through the split-path contract.
 - **Gates.**
-  - `gate-union` and `gate-ops` (column identity).
+  - `gate-union` (ordinary union) and `gate-ops` (split-path column identity).
   - `gate-gpu-nvtier` (slot bit identity, the identities of §3.2).
   - `gate-gpu-e2e` and `gate-gpu-qwen35moe-e2e` (tokens).
   - `gate-alloc` (no allocation added on a hit-only step; miss-path allocation may land, removal is a follow-up, §5).
 
   FAIL-first per clause:
-  - Sum the split path in landing order: `gate-union` goes red.
+  - Sum the split path in landing order: run `gate-ops`'s existing split-path bit-identity test and confirm it goes red.
   - A prefetch that pins a slot a step needs: the nvtier clause goes red.
   - A step that reads a FILLING slot without joining: refused by name (`TierError::Unfilled`).
 - **A/B runs.** `tokens-differ rounds: 0 of 10` is a condition of every card.
