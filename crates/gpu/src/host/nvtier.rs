@@ -2631,10 +2631,7 @@ impl NvTier {
         }
         if picks.is_empty() {
             drop(picks);
-            return Ok(Some(TierPin::new(
-                arena,
-                PinToken { layer, ids: pinned },
-            )));
+            return Ok(Some(TierPin::new(arena, PinToken { layer, ids: pinned })));
         }
         {
             let mut reads = self
@@ -2650,10 +2647,8 @@ impl NvTier {
         }
         let units = picks.len() * PARTS;
         drop(picks);
-        *self.step.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(HeldClaim {
-            layer,
-            ids: pinned,
-        });
+        *self.step.held.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(HeldClaim { layer, ids: pinned });
         *self.step.kind.lock().unwrap_or_else(|e| e.into_inner()) = kind;
         self.step.layer.store(layer, Ordering::Relaxed);
         let job = Arc::clone(&self.step.job.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2690,10 +2685,7 @@ impl NvTier {
             Ok(wall) => wall,
             Err(f) => {
                 let mut picks = self.step.picks.lock().unwrap_or_else(|e| e.into_inner());
-                let id = picks
-                    .get(f.unit / PARTS)
-                    .map(|p| p.id)
-                    .unwrap_or(u32::MAX);
+                let id = picks.get(f.unit / PARTS).map(|p| p.id).unwrap_or(u32::MAX);
                 if let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) {
                     free_picks(arena, &picks);
                 }
@@ -2704,14 +2696,13 @@ impl NvTier {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .take()
+                    && let Some(arena) = self.by_layer.get(held.layer).and_then(|l| l.as_ref())
                 {
-                    if let Some(arena) = self.by_layer.get(held.layer).and_then(|l| l.as_ref()) {
-                        drop(BatchPin {
-                            arena,
-                            layer: held.layer,
-                            ids: held.ids,
-                        });
-                    }
+                    drop(BatchPin {
+                        arena,
+                        layer: held.layer,
+                        ids: held.ids,
+                    });
                 }
                 return Err(fill_error(layer, FillFailed { id, error: f.error }));
             }
