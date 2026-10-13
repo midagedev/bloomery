@@ -1109,7 +1109,11 @@ PY
   TL="$t/d2" gate "$t/h5" 3090 "$t/lease" &
   p5=$!
   hold other 0 "$t/d3"
-  TL="$t/d3" gate "$t/h6" 3090 "$t/lease" &
+  # The test removes this hold. A loaded Mac spent the whole 4 s card bound inside one poll (sleep 1
+  # accounted as 6 s, "0 s so far" then "still up after 6 s"), so the run exited 75 before the next
+  # poll could see the release. The safety cap is the helper waiter's; the cases that judge the 4 s
+  # bound do not set it.
+  TL="$t/d3" gate "$t/h6" 3090 "$t/lease" GATE_TEST_CAP="$cap" &
   p6=$!
   # And a stale hold over a 3090 lock that stays taken: the run polls for the card for the whole bound and names the stale hold once.
   mkdir -p "$t/d4"
