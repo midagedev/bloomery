@@ -16,7 +16,7 @@ use crate::Error;
 use crate::encode::Encoded;
 use crate::json::{self, Json};
 use crate::ops::{self, Mha, dot, gelu, layer_norm, layer_normed, linear, normalized};
-use crate::safetensors::Safetensors;
+use hf::safetensors::Safetensors;
 
 pub use crate::ops::LAYER_NORM_EPS;
 
@@ -226,11 +226,12 @@ impl Weights for Safetensors {
     }
 
     fn tensor(&self, name: &str) -> Result<Vec<f32>, Error> {
-        Safetensors::tensor(self, name).map(|t| t.data)
+        Ok(Safetensors::tensor(self, name)?.data)
     }
 
     fn scales(&self) -> Result<Scales, Error> {
-        let raw = |name: &str| Safetensors::tensor(self, name).map(|t| t.data[0]);
+        let raw =
+            |name: &str| -> Result<f32, Error> { Ok(Safetensors::tensor(self, name)?.data[0]) };
         Ok(scales_of(
             raw(SCALARS[0])?,
             raw(SCALARS[1])?,
@@ -763,7 +764,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::encode::encode_with;
     use crate::request::Request;
-    use crate::safetensors::write;
+    use hf::safetensors::write;
 
     pub(crate) const CFG: HeadConfig = HeadConfig {
         hidden_size: 16,
