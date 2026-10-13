@@ -520,6 +520,25 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
         )
         .into())
     }
+
+    /// One prompt call of `ids` whose images are tile groups: each entry is the span's first
+    /// position, the group's rows (one bf16 row of the text width a position) and the canvas that
+    /// places them ([`vision_seat::Resident::group_rows`]). Refused by the default: only a
+    /// qwen35moe file's body takes a canvas group.
+    #[cfg(feature = "vision")]
+    fn prompt_groups(
+        s: &mut app::Session<Self>,
+        ids: &[u32],
+        groups: &[(usize, Vec<u16>, vision::mrope::Canvas)],
+    ) -> Result<u32, GateError> {
+        let _ = (s, ids);
+        Err(format!(
+            "a prompt with {} image groups: a {} file takes no image group",
+            groups.len(),
+            Self::ARCH
+        )
+        .into())
+    }
 }
 
 impl Body3 for Body {
@@ -712,6 +731,29 @@ impl Body3 for Body35 {
     ) -> Result<u32, GateError> {
         encoded.prompt(s, ids, |rows| rows.image_spans())
     }
+
+    /// The session's media call of canvas groups ([`Body3::prompt_groups`]): each span's rows
+    /// stand in for its positions, and the sequence's rotation table takes the canvas
+    /// ([`bloomery_gpu::media::ImageShape::Canvas`]).
+    #[cfg(feature = "vision")]
+    fn prompt_groups(
+        s: &mut app::Session<Body35>,
+        ids: &[u32],
+        groups: &[(usize, Vec<u16>, vision::mrope::Canvas)],
+    ) -> Result<u32, GateError> {
+        use bloomery_gpu::media::{ImageShape, ImageSpan, MediaSpan};
+        let spans: Vec<ImageSpan<'_>> = groups
+            .iter()
+            .map(|(at, rows, canvas)| ImageSpan {
+                span: MediaSpan {
+                    at: *at..*at + canvas.rows(),
+                    rows,
+                },
+                shape: ImageShape::Canvas(*canvas),
+            })
+            .collect();
+        Ok(s.prompt_media(ids, &spans, runtime::Want::Argmax)?.argmax())
+    }
 }
 
 /// The session on the engine thread, the positions its cache was sized
@@ -849,17 +891,53 @@ impl<B: Body3> Seat for Q3<B> {
         self.vision.as_ref().map(vision_seat::Resident::media)
     }
 
-    /// Each feed's image encoded on the resident encoder and read back as bf16, one row a cell of
-    /// its grid and nothing around them ([`vision_seat::merged_cells`]: the tokens carry the
-    /// delimiters; [`vision_seat::Resident::encode`]), then one prompt call with the images
-    /// spliced in ([`Body3::prompt_media`]); the encode binds the model's card back before the
-    /// prompt call.
+    /// Each feed's image encoded on the resident encoder and read back as bf16, then one prompt
+    /// call with the images spliced in. A patch grid is one row a cell and nothing around it
+    /// ([`vision_seat::merged_cells`]: the tokens carry the delimiters;
+    /// [`vision_seat::Resident::encode`], [`Body3::prompt_media`]). A tile group is each tile's
+    /// cells then its separator rows ([`vision_seat::Resident::group_rows`]), and the span's
+    /// shape is that group's canvas ([`Body3::prompt_groups`]). A call is one shape or the other.
+    /// The draft's media refusal comes before any encode. The encode binds the model's card back
+    /// before the prompt call.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
         self.draft.refuse_media()?;
+        let tiles = feeds
+            .iter()
+            .filter(|f| matches!(f.prepared.input, vision::media::EncoderInput::Tiles(_)))
+            .count();
+        if tiles != 0 && tiles != feeds.len() {
+            return Err(format!(
+                "{tiles} tile groups among {} images: a call's images are all grids or all \
+                 canvas groups",
+                feeds.len()
+            )
+            .into());
+        }
+        if tiles != 0 {
+            let ctx = Arc::clone(self.s.model().gpu().context());
+            let mut groups = Vec::with_capacity(feeds.len());
+            for f in feeds {
+                let vision::media::EncoderInput::Tiles(group) = &f.prepared.input else {
+                    return Err("a tile group call holds a patch grid".into());
+                };
+                let (rows, canvas) = v.group_rows(&ctx, group)?;
+                if canvas.rows() != f.prepared.span_len {
+                    return Err(format!(
+                        "image at {}: the canvas holds {} rows, the prompt's span is {}",
+                        f.at,
+                        canvas.rows(),
+                        f.prepared.span_len
+                    )
+                    .into());
+                }
+                groups.push((f.at, rows, canvas));
+            }
+            return B::prompt_groups(&mut self.s, ids, &groups);
+        }
         let encoded = v.encode(
             self.s.model().gpu().context(),
             feeds
