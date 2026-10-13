@@ -192,17 +192,12 @@ fn plan_rows(
         })
 }
 
-/// Rows one layer holds under `choice`: the context on a full layer
-/// (`window == 0`) and under [`Rows::Plane`], and [`place::ring_rows`] on a
-/// window layer under [`Rows::Ring`].
+/// Rows one layer holds under `choice`: [`Rows::count`], with no window on a
+/// full layer (`window == 0`).
 fn rows_for(choice: Rows, window: usize, ctx: usize) -> usize {
-    if window == 0 || choice == Rows::Plane {
-        return ctx;
-    }
-    let rows = place::ring_rows(window as u64, ctx as u64);
-    usize::try_from(rows)
-        .map(|r| r.clamp(1, ctx))
-        .unwrap_or(ctx)
+    let window = (window != 0).then_some(window as u64);
+    usize::try_from(choice.count(window, ctx as u64))
+        .expect("row count is bounded by ctx and therefore fits usize")
 }
 
 /// One rope base's table on the card: the K192 rows at base `theta`. The full
@@ -388,9 +383,10 @@ pub struct Body {
     /// layout. The live stores can be a sequence made beside that plan
     /// ([`Body::new_seq_rows`]).
     seq_rows: Vec<usize>,
-    /// Where the next step of the live sequence runs. The step and the prompt
-    /// batch move it. [`Body::stand_for_cut`] sets it from the model before a
-    /// cut, and [`Rollback::rollback`] measures its depth from here.
+    /// The greatest position the live sequence may have written. A cut
+    /// measures its depth from here, and nothing here moves it backward: a
+    /// rollback leaves the rows in place, so a later cut still has to see
+    /// the overwritten end. Reset clears it. A swap parks it on the sequence.
     at: u32,
     /// The position [`ChainBody::decode_input`] accepted and the step has not
     /// stood past yet. A capture enqueues the chain with this clear, so the
@@ -933,34 +929,36 @@ impl Body {
         self.stores.iter().map(Store::bytes).sum()
     }
 
-    /// Whether a cut from `pos` back to `n` leaves every live layer's keys.
-    /// A plane does. A ring does when `pos - n` is within
-    /// [`place::cut_depth_keeps`]. `n` past `pos` does not.
+    /// Whether a cut back to `n` leaves every live layer's keys. The depth is
+    /// the written end, or `pos` when that is further: a
+    /// rollback does not restore rows. A plane keeps any depth. A ring keeps
+    /// a depth within [`place::cut_depth_keeps`]. `n` past that end does not.
     #[must_use]
     pub fn cut_keeps(&self, pos: u32, n: u32) -> bool {
-        if n > pos || self.stores.len() != self.cfg.len() {
+        let end = self.at.max(pos);
+        if n > end || self.stores.len() != self.cfg.len() {
             return false;
         }
-        let depth = u64::from(pos - n);
+        let depth = u64::from(end - n);
         let ctx = self.ctx as u64;
         self.stores.iter().zip(&self.cfg).all(|(store, c)| {
             place::cut_depth_keeps(depth, store.rows as u64, ctx, c.attn.window as u64)
         })
     }
 
-    /// The live sequence stands at `pos`, the model's position. The session's
-    /// cut and a prompt's take-back set this before they roll back, so the
-    /// depth is the model's even when the last advance was a pass this record
-    /// did not see.
+    /// Raise the written end to `pos`. The session's cut and a prompt's
+    /// take-back call this before they roll back, so the depth sees a pass
+    /// this record did not, and a lower `pos` does not hide an earlier write.
     pub fn stand_for_cut(&mut self, pos: u32) {
-        self.at = pos;
+        self.at = self.at.max(pos);
         self.pending = None;
     }
 
-    /// Stand past the position [`ChainBody::decode_input`] accepted.
+    /// Stand past the position [`ChainBody::decode_input`] accepted. A lower
+    /// pending position does not hide an earlier write.
     fn commit_pending(&mut self) {
         if let Some(pos) = self.pending.take() {
-            self.at = pos.saturating_add(1);
+            self.at = self.at.max(pos.saturating_add(1));
         }
     }
 
@@ -994,7 +992,7 @@ impl Body {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Seq { stores })
+        Ok(Seq { stores, at: 0 })
     }
 
     /// Device bytes of the load's scratch, what the plan's card term
@@ -1165,6 +1163,10 @@ impl ChainBody for Body {
         }
         self.embd.fill(token)?;
         self.pending = Some(pos);
+        // Accepting the step may write through `pos`. A one-row pass of
+        // another slot calls this and then puts the end back (that write is
+        // not the live sequence's).
+        self.at = self.at.max(pos.saturating_add(1));
         Ok(StepInput { pos })
     }
 
@@ -1263,10 +1265,9 @@ impl Rollback for Body {
     /// The ring holds `[at - rows, at)`. The pass appends row `pos` and reads
     /// `[pos - window + 1, pos]`. `rows` is at least the window plus one
     /// prompt batch minus one, so a cut of at most `rows - window + 1`
-    /// positions leaves those keys and the rows past `pos` are simply unread.
-    /// A full plane (`rows == ctx`) never refuses. The depth is `at - pos`,
-    /// and `at` is where the next step runs ([`Body::stand_for_cut`] sets it
-    /// from the model).
+    /// positions leaves those keys. The rows past `pos` stay as they are:
+    /// `at` remains the written end, so a second cut is still measured from
+    /// that end. A full plane (`rows == ctx`) never refuses.
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
         if !self.cut_keeps(self.at, pos) {
             return Err(shape(format!(
@@ -1274,19 +1275,24 @@ impl Rollback for Body {
                 self.at
             )));
         }
-        self.at = pos;
+        self.at = self.at.max(pos);
         self.pending = None;
         Ok(())
     }
 }
 
 /// One resident sequence of the load ([`Slots`], what a select exchanges):
-/// its layers' stores. Every step and every prompt call writes the stores
-/// and a later call reads them; nothing else outlives a call. The buffer
-/// handles move on a select, and each slot's captured steps keep addressing
-/// the stores that were live when they were captured.
+/// its layers' stores and the written end those stores may hold. Every step
+/// and every prompt call writes the stores and a later call reads them;
+/// nothing else outlives a call. The buffer handles and the written end move
+/// on a select, and each slot's captured steps keep addressing the stores
+/// that were live when they were captured.
 pub struct Seq {
     stores: Vec<Store>,
+    /// The greatest position this sequence may have written. Parked with the
+    /// stores so a cut after a swap still measures from it. A new sequence
+    /// has written nothing.
+    at: u32,
 }
 
 impl Slots for Body {
@@ -1329,7 +1335,7 @@ impl Slots for Body {
             .collect::<Result<Vec<_>, _>>()?;
         // Last, so a sequence whose allocation failed is not counted.
         self.slots_made += 1;
-        Ok(Seq { stores })
+        Ok(Seq { stores, at: 0 })
     }
 
     /// Exchange the live sequence's stores with `seq`'s: pointer moves, no
@@ -1340,6 +1346,7 @@ impl Slots for Body {
     /// load's, counted by passes whichever slot runs them).
     fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
         std::mem::swap(&mut self.stores, &mut seq.stores);
+        std::mem::swap(&mut self.at, &mut seq.at);
         Ok(())
     }
 

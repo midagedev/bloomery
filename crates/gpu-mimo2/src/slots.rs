@@ -178,11 +178,30 @@ impl SlotRows for Body {
     fn plan_slots(
         &mut self,
         stream: &CudaStream,
-        _parked: &mut [&mut Seq],
+        parked: &mut [&mut Seq],
         rows: &[SlotRange],
         ids: &[u32],
     ) -> Result<(), GpuError> {
-        self.plan(stream, rows, ids)
+        self.plan(stream, rows, ids)?;
+        let mut others = parked.iter_mut();
+        for r in rows {
+            let count =
+                u32::try_from(r.rows.len()).map_err(|_| shape("a slot's row count past u32"))?;
+            let end = r
+                .pos0
+                .checked_add(count)
+                .ok_or_else(|| shape("a slot's end past u32"))?;
+            let high = if r.slot == 0 {
+                &mut self.at
+            } else {
+                &mut others
+                    .next()
+                    .ok_or_else(|| shape("a slot's sequence missing"))?
+                    .at
+            };
+            *high = (*high).max(end);
+        }
+        Ok(())
     }
 
     /// The pass into `heads[0]`, a head of its rows; any other heads are
@@ -244,9 +263,11 @@ impl Body {
         }
         self.pending = None;
         if total == 1 {
+            let written = self.at;
             let input = self.decode_input(ids[0], rows[0].pos0)?;
             if rows[0].slot != 0 {
                 // Another slot's row. The live sequence does not stand past it.
+                self.at = written;
                 self.pending = None;
             }
             return self.refresh(stream, &input);
@@ -401,7 +422,7 @@ impl Body {
             prog.walk(&mut leg)?;
         }
         if let Some(end) = live_end {
-            self.at = end;
+            self.at = self.at.max(end);
             self.pending = None;
         }
         Ok(())

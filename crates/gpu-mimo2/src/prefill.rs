@@ -673,6 +673,7 @@ impl Body {
                 embd,
                 prompt,
                 ctx,
+                at: ref mut high,
                 ..
             } = self;
             let Batch {
@@ -748,6 +749,7 @@ impl Body {
             };
             let mut leg = BatchLeg::new(stream, hybrid, hsum, cap);
             leg.set_unit_cols(&ts);
+            *high = (*high).max(stood);
             sched::walk(o, layers, &mut leg, &mut prog)?;
             if last {
                 prog.head(head)?;
@@ -755,7 +757,7 @@ impl Body {
             read_fault(WHAT, gpu, hybrid, last)
         };
         if ran.is_ok() {
-            self.at = stood;
+            self.at = self.at.max(stood);
             self.pending = None;
         }
         ran

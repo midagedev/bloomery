@@ -280,6 +280,17 @@ pub enum Rows {
     Plane,
 }
 
+impl Rows {
+    /// Rows held under this choice. No window means a full layer.
+    #[must_use]
+    pub fn count(self, window: Option<u64>, ctx_max: u64) -> u64 {
+        match (self, window) {
+            (Self::Ring, Some(w)) => ring_rows(w, ctx_max),
+            _ => ctx_max,
+        }
+    }
+}
+
 /// Rows a window of `window` positions holds at `ctx_max`: the window plus
 /// one prompt batch, padded up to a multiple of 256, and never past
 /// `ctx_max`. The batch is [`crate::moe::UNION_MAX_COLS`].
@@ -361,10 +372,8 @@ impl KvLayout {
         if self.kv_heads.get(layer).is_none() {
             return 0;
         }
-        match (self.rows, self.windows.get(layer).copied().flatten()) {
-            (Rows::Ring, Some(window)) => ring_rows(window, ctx_max),
-            _ => ctx_max,
-        }
+        self.rows
+            .count(self.windows.get(layer).copied().flatten(), ctx_max)
     }
 }
 
@@ -447,6 +456,28 @@ mod tests {
         let filled = super::ring_rows(8, 9);
         assert_eq!(filled, 9);
         assert!(super::cut_depth_keeps(1_000, filled, 9, 8));
+    }
+
+    /// A feed of 1,600 leaves the written end at 1,600. The cut to 960 is
+    /// depth 640, inside the slack. The end stays 1,600, so the cut to 950
+    /// is depth 650 and is refused. Depth 10, measured from 960, is the
+    /// overwritten-key reading.
+    #[test]
+    fn a_second_cut_is_measured_from_the_written_end() {
+        let window = 128;
+        let ctx = 4_160;
+        let rows = super::ring_rows(window, ctx);
+        let written = 1_600;
+        let first = 960;
+        let second = 950;
+        assert!(super::cut_depth_keeps(written - first, rows, ctx, window));
+        assert!(!super::cut_depth_keeps(
+            written - second,
+            rows,
+            ctx,
+            window
+        ));
+        assert!(super::cut_depth_keeps(first - second, rows, ctx, window));
     }
 
     /// The published MiMo trunk: nine full layers of 4 KV heads and thirty-nine

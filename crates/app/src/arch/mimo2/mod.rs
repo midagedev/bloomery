@@ -117,8 +117,9 @@ impl Prompt for Body {
 
 impl Keep for Body {
     /// `n` when every live layer still holds the keys the pass at `n` reads:
-    /// a full plane always, a ring when `pos - n` is within `rows - window + 1`.
-    /// Otherwise 0. `n` past the model's position is that position.
+    /// a full plane always, a ring when the written end minus `n` is within
+    /// `rows - window + 1`. Otherwise 0. `n` past the model's position is
+    /// that position.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
         let pos = m.pos();
         let Ok(body) = m.body("mimo2 keep") else {

@@ -38,6 +38,11 @@
 //!   4,096 ids in batches of [`T_MAX`], then 64 decode steps. The logits are
 //!   equal bit for bit at the prompt's last row (position 4,095) and at
 //!   every step (positions 4,096..4,159).
+//! - (o) also, on that load: a feed of 1,600 ids, a cut to 960, then a cut
+//!   to 950. The second cut is refused, and it is refused again after the
+//!   ring sequence is swapped out and back. The written end stays 1,600, so
+//!   the depth is 650, past the ring's slack. FAIL-first: a rollback that
+//!   lowers the written end accepts the second cut.
 //! - (c) free-running on the batch set: its five tokens as eager steps from a
 //!   reset, the last position's argmax equal to ik's `result_output` argmax,
 //!   or — named and counted, never silently — ours ik's runner-up with ik's
@@ -545,6 +550,63 @@ mod gate {
     /// The oracle's prompt, then its decode steps. 4,096 + 64 = [`CTX`].
     const ORACLE_PROMPT: usize = 4_096;
     const ORACLE_STEPS: usize = 64;
+
+    /// A feed of 1,600 writes through that position. The cut to 960 is depth
+    /// 640, inside the ring's slack. The written end stays 1,600, so the cut
+    /// to 950 is depth 650 and is refused. Swapping the ring sequence out
+    /// and back parks that end with the stores, and the cut to 950 is refused
+    /// again. The session's cut records the model's position first
+    /// ([`Body::stand_for_cut`]) and then rolls back.
+    ///
+    /// FAIL-first: a rollback that lowers the written end accepts the second
+    /// cut, and a swap that drops it accepts the cut after the swap.
+    fn second_cut_is_refused(m: &mut Mimo2Model) -> Result<bool, GateError> {
+        const FED: u32 = 1_600;
+        const FIRST: u32 = 960;
+        const SECOND: u32 = 950;
+        let feed_to = |m: &mut Mimo2Model| -> Result<(), GateError> {
+            m.reset()?;
+            set_taps(m, false)?;
+            m.set_mode(StepMode::Eager);
+            prefill(m, &seq_ids(FED as usize))?;
+            if m.pos() != FED {
+                return Err(format!("second cut: a prefill of {FED} stands at {}", m.pos()).into());
+            }
+            Ok(())
+        };
+        feed_to(m)?;
+        session_cut(m, FIRST)?;
+        let bare = session_cut(m, SECOND).is_err();
+        feed_to(m)?;
+        session_cut(m, FIRST)?;
+        let mut parked = {
+            let (gpu, _, body) = m.body_parts("second cut")?;
+            let mut seq = body.new_seq_rows(gpu, Rows::Ring)?;
+            body.swap_seq(gpu, &mut seq)?;
+            seq
+        };
+        {
+            let (gpu, _, body) = m.body_parts("second cut")?;
+            body.swap_seq(gpu, &mut parked)?;
+        }
+        let swapped = session_cut(m, SECOND).is_err();
+        let ok = bare && swapped;
+        println!(
+            "second cut: feed {FED}, cut {FIRST} kept, cut {SECOND} refused ({bare}); the same \
+             after a swap of the ring sequence ({swapped}) {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The session's cut: record the model's position, then roll back.
+    fn session_cut(m: &mut Mimo2Model, n: u32) -> Result<(), GpuError> {
+        let pos = m.pos();
+        if let Ok((_, _, body)) = m.body_parts("second cut") {
+            body.stand_for_cut(pos);
+        }
+        m.rollback(n)
+    }
 
     /// (o). One load. The live sequence is the ring. `new_seq_rows(Plane)`
     /// is the other sequence, outside the plan's held count (`new_seq`
@@ -1787,6 +1849,7 @@ mod gate {
         if matches!(only, Only::All | Only::O) {
             let t = Instant::now();
             ok &= oracle(m)?;
+            ok &= second_cut_is_refused(m)?;
             elapsed("(o)", &t);
         }
         if matches!(only, Only::All | Only::C) {
