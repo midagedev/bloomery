@@ -852,12 +852,16 @@ mod gate {
         let mask_id = shape.mask_id;
         let body = DsparkBody::new(&gpu, &shape, layers, fc, head, embed)?;
         let (free1, _) = gpu.mem_info()?;
-        let resident = free0.saturating_sub(free1);
-        println!(
-            "draft: taps {taps:?}, mask {mask_id}, proposal width {width}, resident {resident} B"
-        );
+        let taken = free0.saturating_sub(free1);
+        let own = body.own_held();
+        let held = body.layers().held(&own);
         let target = Arc::clone(seat.model().gpu().context());
-        let card = CardDspark::new::<Body35>(body, gpu, target, "gate", shape, resident)?;
+        let card = CardDspark::new::<Body35>(body, gpu, target, "gate", shape, held, taken)?;
+        println!(
+            "draft: taps {taps:?}, mask {mask_id}, proposal width {width}, resident {} B, taken \
+             {taken} B",
+            card.resident_bytes()
+        );
         // Capture reads the stream's current context and does not bind it. The draft's load left
         // its own context current.
         seat.model().gpu().context().bind_to_thread()?;

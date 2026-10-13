@@ -53,9 +53,10 @@ use std::sync::{Mutex, PoisonError};
 
 use cuda_core::DeviceBuffer;
 use gguf::quant::Q8Block;
+use model::arch::dspark::DraftHeld;
 use model::quant::quantize_q8_0;
 
-use super::{DraftLayers, Q8Rows};
+use super::{DraftLayers, OwnHeld, Q8Rows};
 use crate::flash_gqa::{
     FlashGqaKernels, GROUP, GqaArgs, HEAD_256, PACK_4, partials_ms_len, partials_v_len_256,
 };
@@ -588,6 +589,102 @@ impl DenseLayers {
     fn row(&self, h: usize, slot: usize) -> u32 {
         u32::try_from(GUARD + h * self.planes + slot).expect("a plane row fits u32")
     }
+
+    /// The buffers this load allocated, counted from the buffers themselves.
+    /// Weights are these layers', in the order [`DenseLayers::load`] allocated
+    /// them, then the owner's ([`OwnHeld::weights`]). One layer's weights are
+    /// its query, each key head beside that head's value, the output and the
+    /// three MLP matrices, then its four norm gains. The rings are each
+    /// layer's K plane and then its V plane. Working bytes are this pass's
+    /// scratch and images plus the owner's. Kernel modules and captured
+    /// graphs are not buffers. A zero-length buffer allocates nothing and is
+    /// not listed.
+    #[must_use]
+    pub fn held(&self, own: &OwnHeld) -> DraftHeld {
+        let mut weights = self.weight_buffers();
+        weights.extend(own.weights.iter().copied().filter(|&n| n > 0));
+        DraftHeld {
+            weights,
+            rings: self.ring_bytes(),
+            working: self.working_bytes() + own.working,
+        }
+    }
+
+    /// Weight buffers in [`DenseLayers::load`]'s order. See [`DenseLayers::held`].
+    fn weight_buffers(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for layer in &self.layers {
+            push_q8(&mut out, &layer.q);
+            for (k, v) in layer.k.iter().zip(&layer.v) {
+                push_q8(&mut out, k);
+                push_q8(&mut out, v);
+            }
+            push_q8(&mut out, &layer.o);
+            push_q8(&mut out, &layer.gate);
+            push_q8(&mut out, &layer.up);
+            push_q8(&mut out, &layer.down);
+            push_live(&mut out, buffer_bytes(&layer.ln_in));
+            push_live(&mut out, buffer_bytes(&layer.ln_post));
+            push_live(&mut out, buffer_bytes(&layer.q_norm));
+            push_live(&mut out, buffer_bytes(&layer.k_norm));
+        }
+        out
+    }
+
+    /// Each layer's K plane, then its V plane.
+    fn ring_bytes(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for layer in &self.layers {
+            push_live(&mut out, buffer_bytes(layer.kc.buf()));
+            push_live(&mut out, buffer_bytes(layer.vc.buf()));
+        }
+        out
+    }
+
+    /// The pass's scratch and the staged images, in all.
+    fn working_bytes(&self) -> u64 {
+        let s = &self.s;
+        let mut n = buffer_bytes(&s.xn)
+            + buffer_bytes(&s.q)
+            + buffer_bytes(&s.qn)
+            + buffer_bytes(&s.qr)
+            + buffer_bytes(&s.attn)
+            + buffer_bytes(&s.o)
+            + buffer_bytes(&s.x1)
+            + buffer_bytes(&s.xn2)
+            + buffer_bytes(&s.g)
+            + buffer_bytes(&s.u)
+            + buffer_bytes(&s.act)
+            + buffer_bytes(&s.dn)
+            + buffer_bytes(&s.part_v)
+            + buffer_bytes(&s.part_ms)
+            + buffer_bytes(&s.blk_words)
+            + buffer_bytes(&s.blk_cs)
+            + buffer_bytes(&s.ctx_words)
+            + buffer_bytes(&s.ctx_cs);
+        for b in s.kb.iter().chain(&s.kn).chain(&s.kr).chain(&s.vb) {
+            n += buffer_bytes(b);
+        }
+        n
+    }
+}
+
+/// Bytes of `buf`.
+fn buffer_bytes<T>(buf: &DeviceBuffer<T>) -> u64 {
+    buf.num_bytes() as u64
+}
+
+/// List `bytes` when the buffer allocated anything.
+fn push_live(out: &mut Vec<u64>, bytes: u64) {
+    if bytes > 0 {
+        out.push(bytes);
+    }
+}
+
+/// The two planes of a Q8_0 matrix, quants then scales.
+fn push_q8(out: &mut Vec<u64>, rows: &Q8Rows) {
+    push_live(out, buffer_bytes(rows.qs.buf()));
+    push_live(out, buffer_bytes(rows.d.buf()));
 }
 
 impl DraftLayers for DenseLayers {
