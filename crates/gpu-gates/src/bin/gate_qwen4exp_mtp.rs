@@ -5457,7 +5457,12 @@ mod gate {
         prompt: &[u32],
     ) -> Result<bool, GateError> {
         const N: usize = 32;
-        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine_for_experts(
+            card()?,
+            inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+            Experts::Card,
+        );
         let extra = mtp.card_bytes(CTX)?;
         // The room halves until the plan pages through an arena; a room the
         // tier's floor refuses ends the search, and the clause is red there.
