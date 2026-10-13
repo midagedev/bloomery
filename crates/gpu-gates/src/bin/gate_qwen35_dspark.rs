@@ -46,13 +46,17 @@ fn main() -> std::process::ExitCode {
 mod dspark_hf;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Instant;
 
     use app::dspark::CardDspark;
-    use app::{RowsLog, Session, SessionError};
+    use app::Session;
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel};
     use bloomery_gpu::dspark::dense::{DenseDims, DenseLayers};
     use bloomery_gpu::dspark::{DraftLayers, DsparkBody, HeadSource, Q8Rows};
@@ -70,6 +74,7 @@ mod gate {
     use runtime::{Advance, Draft, Speculative, Target, Verify, Want};
 
     use crate::dspark_hf::{self, HfFile, Parts};
+    use crate::quiet::Quiet;
 
     /// The context rows of the two cases: a ring that is nearly empty and one past the window.
     const CASES: [usize; 2] = [3, 2100];
@@ -793,16 +798,6 @@ mod gate {
             ok &= case;
         }
         Ok(ok)
-    }
-
-    /// `with_draft` tells this of each capture. The first prompt drops those graphs (`set_taps`),
-    /// and the next pass captures again, so a count printed here would not be the one that ran.
-    struct Quiet;
-
-    impl RowsLog for Quiet {
-        fn capture_rows(&mut self, _rows: usize, _nodes: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
     }
 
     /// A plain or verifying load of the Qwen3.6 file, whole card, context [`TARGET_CTX`].
