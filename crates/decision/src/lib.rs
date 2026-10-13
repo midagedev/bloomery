@@ -7,8 +7,8 @@
 //! template, the answer the language-model head's logits at label tokens.
 //!
 //! [`json`] reads a request as Python does, [`render`] writes JSON as Python does, [`request`]
-//! validates (under the model's [`request::Rules`]), [`encode`] builds Clef's ids, [`safetensors`] and
-//! [`head`] load and run Clef's head, [`gguf_head`] reads it from a model file that carries it
+//! validates (under the model's [`request::Rules`]), [`encode`] builds Clef's ids, [`head`] loads (through
+//! `hf::safetensors`) and runs Clef's head, [`gguf_head`] reads it from a model file that carries it
 //! (llama.cpp's Clef layout), [`rows`] gives either model its output embedding rows from a GGUF file,
 //! [`answer`] builds the shared parts of a body, [`label`] the label models'; [`release`] holds what a
 //! server needs to seat each model.
@@ -25,7 +25,6 @@ pub mod release;
 pub mod render;
 pub mod request;
 pub mod rows;
-pub mod safetensors;
 
 /// Why a request, a file or a forward pass was refused.
 #[derive(Debug, thiserror::Error)]
@@ -87,7 +86,7 @@ pub enum Error {
     Io(String, std::io::Error),
     #[error("safetensors: {0}")]
     Safetensors(String),
-    #[error("safetensors: {name} is {dtype}; this reader converts BF16, F16 and F32")]
+    #[error("safetensors: {name} is {dtype}, a type this reader does not hold")]
     Dtype { name: String, dtype: String },
     #[error("weight {0} is missing")]
     MissingWeight(String),
@@ -122,4 +121,19 @@ pub enum Error {
     NoOutputHead,
     #[error("{name}: {what}")]
     OutputHead { name: &'static str, what: String },
+}
+
+impl From<hf::safetensors::Error> for Error {
+    fn from(e: hf::safetensors::Error) -> Error {
+        use hf::safetensors::Error as E;
+        match e {
+            E::Io(path, e) => Error::Io(path, e),
+            E::Format(what) => Error::Safetensors(what),
+            E::Dtype { name, dtype } => Error::Dtype { name, dtype },
+            E::Kind { name, have, want } => {
+                Error::Safetensors(format!("{name} is {have}; this read wants {want}"))
+            }
+            E::Missing(name) => Error::MissingWeight(name),
+        }
+    }
 }

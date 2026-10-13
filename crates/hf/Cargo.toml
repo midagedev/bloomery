@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
-description = "A Hugging Face repo's GGUF set by quant tag, fetched into a local cache with curl and checked against the API's sizes and hashes"
+description = "A Hugging Face repo's GGUF set by quant tag, fetched into a local cache with curl and checked against the API's sizes and hashes; its safetensors files and a DSpark draft's config"
 
 [lib]
 name = "hf"
@@ -13,6 +13,12 @@ name = "hf"
 workspace = true
 
 [dependencies]
+bloomery-gguf = { path = "../gguf" }
+# `dspark` returns the draft's geometry as the runtime's `DsparkShape`; the runtime depends on the model
+# description only, so hf does not close a cycle.
+bloomery-runtime = { path = "../runtime" }
+# `safetensors` maps the file (a draft's is 1.9 GB) instead of reading it into memory.
+memmap2.workspace = true
 serde_json = "=1.0.151"
 sha1 = "0.10"
 sha2 = { workspace = true }

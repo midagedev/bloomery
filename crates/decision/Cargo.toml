@@ -22,6 +22,7 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
+bloomery-hf = { path = "../hf" }
 bloomery-jinja = { path = "../jinja" }
 bloomery-tokenizer = { path = "../tokenizer" }
 bloomery-vision = { path = "../vision" }

@@ -544,7 +544,7 @@ fn load_gguf_head(split: &gguf::Split) -> ClefHead {
 #[test]
 #[ignore = "needs the clef-layout GGUF and the release's head; just gate-decision-clef"]
 fn hw_clef_layout_tensors_are_the_releases_within_q8_0() {
-    let release = decision::safetensors::Safetensors::open(&PathBuf::from(CLEF_HEAD)).unwrap();
+    let release = hf::safetensors::Safetensors::open(&PathBuf::from(CLEF_HEAD)).unwrap();
     let split = gguf::Split::open(CLEF_LAYOUT_GGUF).unwrap_or_else(|e| panic!("{e}"));
     let src = GgufHead::open(&split).unwrap_or_else(|e| panic!("{e}"));
     let cfg = src.config();

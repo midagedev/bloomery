@@ -912,6 +912,12 @@ gate-gpu-qwen35moe-e2e:
 gate-gpu-qwen35moe-verify:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_verify'
 
+# Qwen3.6-35B-A3B's DSpark draft, RedHatAI's speculator (an HF directory on the box, `--draft DIR` names another): the dense layers on the card against a host f64 computation of the same layers from the file's bf16
+# weights (a block of 8 rows over 3 and over 2,100 context rows, the window 2,048), the captured pass replaying to the
+# eager bits, and the loader's card bytes. Real file only (the draft belongs to the Q4_K_M target); the gate lock.
+gate-gpu-qwen35-dspark:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35_dspark && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dspark'
+
 # The Clef backbone (Qwen3.5 dense, qwen35) gate: the tensor-core decode flash refused at group 6 before any upload,
 # then the prompt call's final-norm hidden states (Tail::Hidden) of the first 64, 600 and 4,096 prose ids, each from a
 # reset as one GEMM ubatch (the 64 also as eight passes: the gemv arm), against llama.cpp mainline's result_norm on the

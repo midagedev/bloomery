@@ -24,9 +24,14 @@
 //! ([`mtp_draft`]) beside the set's first shard, where the engine opens it
 //! from, when the caller's predicate says the set can run it
 //! ([`fetch::Draft`]); a repo holding no file of the name is fetched as it is.
+//!
+//! The other files of a repo are read by [`safetensors`] (a draft's weights, Clef's head) and
+//! [`dspark`] (a DSpark draft's `config.json` read into the runtime's shape).
 
 pub mod card;
+pub mod dspark;
 pub mod fetch;
+pub mod safetensors;
 pub mod source;
 
 use std::ffi::OsString;
