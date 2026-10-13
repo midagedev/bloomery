@@ -55,8 +55,8 @@ mod gate {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use app::dspark::CardDspark;
     use app::Session;
+    use app::dspark::CardDspark;
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel};
     use bloomery_gpu::dspark::dense::{DenseDims, DenseLayers};
     use bloomery_gpu::dspark::{DraftLayers, DsparkBody, HeadSource, Q8Rows};
