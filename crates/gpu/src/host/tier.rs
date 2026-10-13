@@ -52,6 +52,11 @@
 //! poisoned as [`super::PoisonKind::CardLost`], which a reset does not lift,
 //! and the release writes [`RELEASE`] to every tier's counters and go
 //! counters too, so every stream drains.
+//!
+//! A tier's work on its card ([`TierWork`]: its stacks, staging, windows and
+//! graphs) is apart from the stage side that drives it ([`TierCard`]: the
+//! replay or feed decision, the books, the settle, the release and the
+//! reset).
 
 use std::mem::ManuallyDrop;
 use std::ops::Range;
@@ -992,19 +997,17 @@ struct Stage {
 /// [`Chain::Cols`] width `2..=DEFER_MAX_COLS` ([`chain_slot`]).
 const TIER_CHAINS: usize = 2 + DEFER_MAX_COLS;
 
-/// An expert tier's card: its `Gpu` (its own stream and fault word), its
-/// resident stacks, its tier on the host tier's page, one captured graph per
-/// chain, and the architecture's computation. Owned by the host tier
-/// ([`super::HostTier::attach_tiers`]), which binds it to the page; every
-/// call that reads or writes the page takes it.
+/// An expert tier's work on its card: its `Gpu` (its own stream and fault
+/// word), its resident stacks, the architecture's computation, the staging
+/// a layer's kernels read, its windows over the page and one captured graph
+/// per chain. The tier card that drives it holds it ([`TierCard`]); each
+/// method is one step the stage side's protocol asks of the tier, and the
+/// stage side alone decides which.
 ///
 /// Field order is drop order: the graphs before the buffers they address,
 /// the windows and the weights before the card.
-pub struct TierCard {
+pub(crate) struct TierWork {
     graphs: [Option<Graph>; TIER_CHAINS],
-    /// Per chain, the (layer, row) services its graph was captured for, in
-    /// go order.
-    captured: [Vec<(usize, usize)>; TIER_CHAINS],
     experts: Box<dyn TierExperts>,
     module: tier_kernels::LoadedModule,
     /// The staged activation and places a layer's kernels read, copied in
@@ -1016,25 +1019,258 @@ pub struct TierCard {
     /// row's routed rows on the page after the launches.
     out: DeviceBuffer<f32>,
     /// Per row, the page's routed rows in this card's context: made when the
-    /// host tier binds the card to its page ([`TierCard::bind`]).
+    /// work is bound to the page ([`TierWork::bind`]).
     rows: Vec<TierRows>,
-    /// The card's end of the page's link, in this card's context: made when
-    /// the host tier binds the card to its page.
-    end: Option<LinkEnd>,
+    /// The card's end of the page's link, in this card's context, and the
+    /// page's layout: set when the work is bound to the page.
+    end: Option<(LinkEnd, TierLayout)>,
     /// The card's tier on the page: its index in the host tier's tiers.
     index: usize,
     shape: TierShape,
-    /// Columns a row's image carries ([`TierCard::open_cols`]).
+    /// Columns a row's image carries ([`TierWork::open`]).
     cols: usize,
-    set: TierSet,
     weights: Weights,
+    gpu: Gpu,
+}
+
+impl TierWork {
+    /// The work on `gpu` with `weights` its resident routed stacks,
+    /// `experts` the architecture's computation, cut for `shape`, rows of
+    /// `cols` columns (`1..=DEFER_MAX_COLS`, else refused by name): the
+    /// staging holds `cols` columns' activation and places, the page's rows
+    /// `cols` columns' ([`TierLayout::with_cols`]). Load-time only. Its
+    /// windows over the page are made when it is bound ([`TierWork::bind`]).
+    pub(super) fn open(
+        gpu: Gpu,
+        weights: Weights,
+        experts: Box<dyn TierExperts>,
+        shape: TierShape,
+        cols: usize,
+    ) -> Result<TierWork, GpuError> {
+        if !(1..=DEFER_MAX_COLS).contains(&cols) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a tier of {cols} columns a row: 1..={DEFER_MAX_COLS}"),
+            ));
+        }
+        let ctx = Arc::clone(gpu.context());
+        ctx.bind_to_thread()?;
+        let stream = gpu.stream();
+        let act = match shape.act {
+            TierAct::Q8 => Staged::Q8(Q8Act::with_k(stream, cols, shape.hidden)?),
+            TierAct::F32 => Staged::F32(DeviceBuffer::zeroed(stream, cols * shape.hidden)?),
+        };
+        // The shape is checked once here, as the page the work binds to
+        // will be laid out.
+        let (q3, d8) = act.planes();
+        TierLayout::with_cols(shape, cols, q3, d8, 1)?;
+        // SAFETY: this crate owns the embedded device bundle produced for the
+        // module above; its launcher checks the launch contract.
+        let module = unsafe { crate::shared_module!(tier_kernels, &ctx)? };
+        Ok(TierWork {
+            graphs: std::array::from_fn(|_| None),
+            experts,
+            module,
+            sel: DeviceBuffer::zeroed(stream, cols * shape.n_used)?,
+            out: DeviceBuffer::zeroed(stream, cols * shape.n_used * shape.hidden)?,
+            act,
+            rows: Vec::new(),
+            end: None,
+            index: 0,
+            shape,
+            cols,
+            weights,
+            gpu,
+        })
+    }
+
+    /// The tier's card.
+    pub(super) fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
+    /// The tier's resident stacks.
+    pub(super) fn weights(&self) -> &Weights {
+        &self.weights
+    }
+
+    /// The layout of a page of `tiers` tiers the work's staging reads.
+    pub(super) fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
+        let (q3, d8) = self.act.planes();
+        TierLayout::with_cols(self.shape, self.cols, q3, d8, tiers)
+    }
+
+    /// Device bytes the work holds besides its weights: the staging and the
+    /// routed rows.
+    pub(super) fn device_bytes(&self) -> usize {
+        self.act.device_bytes() + self.sel.num_bytes() + self.out.num_bytes()
+    }
+
+    /// Nodes of the graph held in slot `i`; `None` when none is held.
+    fn graph_nodes(&self, i: usize) -> Option<usize> {
+        self.graphs[i].as_ref().map(Graph::node_count)
+    }
+
+    /// Bind the work to a page laid out by `layout` as tier `index`, `end`
+    /// its end of the page's link in its card's context: its windows over
+    /// the page's routed rows, in that context.
+    pub(super) fn bind(&mut self, layout: TierLayout, index: usize, end: LinkEnd) {
+        let ctx = self.gpu.context();
+        let img = layout.image;
+        self.rows = (0..layout.rows)
+            .map(|r| {
+                // SAFETY: row r's routed rows (`n_used · cols · hidden` f32)
+                // lie inside the page, apart from every other row's (the
+                // layout's strides); the host tier frees the page only after
+                // its cards.
+                TierRows(unsafe {
+                    window::<f32>(
+                        end.dev(layout.rows_off(r)),
+                        img.n_used * img.cols * img.hidden,
+                        ctx,
+                    )
+                })
+            })
+            .collect();
+        self.end = Some((end, layout));
+        self.index = index;
+    }
+
+    /// Launch the graph held in `chain`'s slot on the tier's stream; a chain
+    /// with no graph held is refused by name.
+    pub(super) fn launch(&mut self, chain: Chain) -> Result<(), GpuError> {
+        let i = chain_slot(chain)?;
+        let graph = self.graphs[i].as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a tier graph of the chain (TierWork::capture)",
+        })?;
+        self.gpu.context().bind_to_thread()?;
+        graph.launch(self.gpu.stream())
+    }
+
+    /// Capture `chain`'s graph for the services `list` (in go order), over
+    /// the first `cols` columns of each row's image, replacing the one held:
+    /// its node count, 0 for an empty list, which holds none. Nothing is
+    /// launched.
+    pub(super) fn capture(
+        &mut self,
+        chain: Chain,
+        cols: usize,
+        list: &[(usize, usize)],
+    ) -> Result<usize, GpuError> {
+        let i = chain_slot(chain)?;
+        self.graphs[i] = None;
+        let Some(last) = list.len().checked_sub(1) else {
+            return Ok(0);
+        };
+        self.gpu.context().bind_to_thread()?;
+        let mut parts = self.parts()?;
+        let graph = Graph::capture(parts.gpu.stream(), |_| {
+            for (k, &(layer, row)) in list.iter().enumerate() {
+                parts.enqueue_layer(layer, row, cols, k == last)?;
+            }
+            Ok(())
+        })?;
+        let n = graph.node_count();
+        self.graphs[i] = Some(graph);
+        Ok(n)
+    }
+
+    /// Enqueue layer `layer` of row `row` on the tier's stream now, over the
+    /// image's first `cols` columns, its fault copy with it.
+    pub(super) fn enqueue(
+        &mut self,
+        layer: usize,
+        row: usize,
+        cols: usize,
+    ) -> Result<(), GpuError> {
+        self.gpu.context().bind_to_thread()?;
+        self.parts()?.enqueue_layer(layer, row, cols, true)
+    }
+
+    /// Enqueue layer `layer`'s tier experts over the block `io` of a prompt
+    /// batch on the tier's stream ([`TierExperts::enqueue_block`]), the
+    /// tier's context bound.
+    pub(super) fn enqueue_block(
+        &mut self,
+        layer: usize,
+        io: TierBlock<'_>,
+    ) -> Result<(), GpuError> {
+        self.gpu.context().bind_to_thread()?;
+        self.experts
+            .enqueue_block(&self.gpu, &self.weights, layer, io)
+    }
+
+    /// Wait until the tier's stream has drained.
+    pub(super) fn sync(&self) -> Result<(), GpuError> {
+        self.gpu.stream().synchronize()?;
+        Ok(())
+    }
+
+    /// The tier card's fault word back to clean, once its stream drained.
+    pub(super) fn clear_fault(&self) -> Result<(), GpuError> {
+        self.gpu.clear_fault()?;
+        self.gpu.stream().synchronize()?;
+        Ok(())
+    }
+
+    /// The parts one tier layer's enqueue reads and writes; refused by name
+    /// before the work is bound to a page.
+    fn parts(&mut self) -> Result<Parts<'_>, GpuError> {
+        let TierWork {
+            experts,
+            module,
+            act,
+            sel,
+            out,
+            rows,
+            end,
+            index,
+            weights,
+            gpu,
+            ..
+        } = self;
+        let (end, layout) = end.ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the tier page (TierWork::bind)",
+        })?;
+        Ok(Parts {
+            experts: &mut **experts,
+            module,
+            act,
+            sel,
+            out,
+            rows,
+            layout,
+            end,
+            index: *index,
+            weights,
+            gpu,
+        })
+    }
+}
+
+/// An expert tier card as the stage side drives it: its work on the card
+/// ([`TierWork`]), its tier on the host tier's page, the go order each held
+/// graph was captured for, which experts it holds, and what the host asked
+/// of it. Owned by the host tier ([`super::HostTier::attach_tiers`]), which
+/// binds it to the page; every call that reads or writes the page takes it.
+///
+/// Field order is drop order: the work before the stage card's stream.
+pub struct TierCard {
+    work: TierWork,
+    /// Per chain, the (layer, row) services its graph was captured for, in
+    /// go order.
+    captured: [Vec<(usize, usize)>; TIER_CHAINS],
+    /// The card's tier on the page: its index in the host tier's tiers.
+    index: usize,
+    set: TierSet,
     stage: Option<Stage>,
     stats: TierStats,
     /// Layers the host asked of the tier since load (wrapping): what the
     /// progress word reaches once the tier has served them.
     issued: u32,
     name: String,
-    gpu: Gpu,
 }
 
 impl TierCard {
@@ -1054,11 +1290,9 @@ impl TierCard {
         TierCard::open_cols(gpu, name, weights, set, experts, shape, 1)
     }
 
-    /// [`TierCard::open`] of rows of `cols` columns (`1..=DEFER_MAX_COLS`,
-    /// else refused by name): the staging holds `cols` columns' activation
-    /// and places, the page's rows `cols` columns' ([`TierLayout::with_cols`]),
-    /// and the card serves [`Chain::Cols`] up to `cols` wide beside the step
-    /// and the pair.
+    /// [`TierCard::open`] of rows of `cols` columns ([`TierWork::open`]):
+    /// the card serves [`Chain::Cols`] up to `cols` wide beside the step and
+    /// the pair.
     pub fn open_cols(
         gpu: Gpu,
         name: String,
@@ -1068,42 +1302,13 @@ impl TierCard {
         shape: TierShape,
         cols: usize,
     ) -> Result<TierCard, GpuError> {
-        if !(1..=DEFER_MAX_COLS).contains(&cols) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("a tier of {cols} columns a row: 1..={DEFER_MAX_COLS}"),
-            ));
-        }
-        let ctx = Arc::clone(gpu.context());
-        ctx.bind_to_thread()?;
-        let stream = gpu.stream();
-        let act = match shape.act {
-            TierAct::Q8 => Staged::Q8(Q8Act::with_k(stream, cols, shape.hidden)?),
-            TierAct::F32 => Staged::F32(DeviceBuffer::zeroed(stream, cols * shape.hidden)?),
-        };
-        // The shape is checked once here, as the page the card binds to
-        // will be laid out.
-        let (q3, d8) = act.planes();
-        TierLayout::with_cols(shape, cols, q3, d8, 1)?;
-        // SAFETY: this crate owns the embedded device bundle produced for the
-        // module above; its launcher checks the launch contract.
-        let module = unsafe { crate::shared_module!(tier_kernels, &ctx)? };
+        let work = TierWork::open(gpu, weights, experts, shape, cols)?;
         let layer_hits = vec![0; set.layers().len()];
         Ok(TierCard {
-            graphs: std::array::from_fn(|_| None),
+            work,
             captured: std::array::from_fn(|_| Vec::new()),
-            experts,
-            module,
-            sel: DeviceBuffer::zeroed(stream, cols * shape.n_used)?,
-            out: DeviceBuffer::zeroed(stream, cols * shape.n_used * shape.hidden)?,
-            act,
-            rows: Vec::new(),
-            end: None,
             index: 0,
-            shape,
-            cols,
             set,
-            weights,
             stage: None,
             stats: TierStats {
                 layer_hits,
@@ -1111,14 +1316,13 @@ impl TierCard {
             },
             issued: 0,
             name,
-            gpu,
         })
     }
 
     /// The tier's card.
     #[must_use]
     pub fn gpu(&self) -> &Gpu {
-        &self.gpu
+        self.work.gpu()
     }
 
     /// The card's name, as the plan gives it.
@@ -1131,14 +1335,14 @@ impl TierCard {
     /// tier card ([`TierExperts::block_bytes`]).
     #[must_use]
     pub fn block_bytes(&self) -> usize {
-        self.experts.block_bytes()
+        self.work.experts.block_bytes()
     }
 
     /// Where the architecture's block rows reach the set's rows
     /// ([`TierExperts::block_rows`]).
     #[must_use]
     pub fn block_rows(&self) -> BlockRows {
-        self.experts.block_rows()
+        self.work.experts.block_rows()
     }
 
     /// Which experts the tier holds.
@@ -1150,32 +1354,32 @@ impl TierCard {
     /// The tier's resident stacks.
     #[must_use]
     pub fn weights(&self) -> &Weights {
-        &self.weights
+        self.work.weights()
     }
 
     /// The layout of a page of `tiers` tiers this card's staging reads.
     pub(super) fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
-        let (q3, d8) = self.act.planes();
-        TierLayout::with_cols(self.shape, self.cols, q3, d8, tiers)
+        self.work.page_layout(tiers)
     }
 
     /// Columns a row's image carries.
     #[must_use]
     pub fn cols(&self) -> usize {
-        self.cols
+        self.work.cols
     }
 
     /// `chain`'s columns, refused by name past the tier's own.
     fn chain_cols(&self, chain: Chain) -> Result<usize, GpuError> {
         let m = chain.cols();
-        if m <= self.cols {
+        if m <= self.cols() {
             Ok(m)
         } else {
             Err(GpuError::shape(
                 WHAT,
                 format!(
                     "a {chain:?} go of {m} columns to the tier {}, opened for {}",
-                    self.name, self.cols
+                    self.name,
+                    self.cols()
                 ),
             ))
         }
@@ -1191,7 +1395,7 @@ impl TierCard {
     /// routed rows.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
-        self.act.device_bytes() + self.sel.num_bytes() + self.out.num_bytes()
+        self.work.device_bytes()
     }
 
     /// Nodes per tier layer of a captured tier graph whose image carries
@@ -1208,7 +1412,7 @@ impl TierCard {
     #[must_use]
     pub fn graph_nodes(&self, chain: Chain) -> Option<usize> {
         let i = chain_slot(chain).ok()?;
-        self.graphs[i].as_ref().map(Graph::node_count)
+        self.work.graph_nodes(i)
     }
 
     /// The tier's fault copy as `page` holds it: what the tier's last fault
@@ -1234,9 +1438,7 @@ impl TierCard {
                 format!("layer {layer}: a tier block of a layer the tier holds no expert of"),
             ));
         }
-        self.gpu.context().bind_to_thread()?;
-        self.experts
-            .enqueue_block(&self.gpu, &self.weights, layer, io)
+        self.work.enqueue_block(layer, io)
     }
 
     /// Bind the card to `page` as tier `index`: its end of the page's link
@@ -1263,25 +1465,10 @@ impl TierCard {
                 ),
             ));
         }
-        let ctx = self.gpu.context();
-        let end = page.link.tier_end(ctx, BIND, &self.name)?;
-        let img = layout.image;
-        self.rows = (0..layout.rows)
-            .map(|r| {
-                // SAFETY: row r's routed rows (`n_used · cols · hidden` f32)
-                // lie inside the page, apart from every other row's (the
-                // layout's strides); the host tier frees the page only after
-                // its cards.
-                TierRows(unsafe {
-                    window::<f32>(
-                        end.dev(layout.rows_off(r)),
-                        img.n_used * img.cols * img.hidden,
-                        ctx,
-                    )
-                })
-            })
-            .collect();
-        self.end = Some(end);
+        let end = page
+            .link
+            .tier_end(self.work.gpu().context(), BIND, &self.name)?;
+        self.work.bind(layout, index, end);
         self.index = index;
         self.stage = Some(Stage {
             stream: stage.stream_handle(),
@@ -1310,43 +1497,32 @@ impl TierCard {
         if list.is_empty() {
             return Ok(Pass::Graph);
         }
-        let Some(graph) = self.graphs[i].as_ref().filter(|_| self.captured[i] == list) else {
+        if self.work.graph_nodes(i).is_none() || self.captured[i] != list {
             self.stats.feeds += 1;
             return Ok(Pass::Feed);
-        };
-        self.gpu.context().bind_to_thread()?;
-        graph.launch(self.gpu.stream())?;
+        }
+        self.work.launch(chain)?;
         self.issue(list.len());
         self.stats.replays += 1;
         self.rebind_stage()?;
         Ok(Pass::Graph)
     }
 
-    /// Capture `chain`'s tier graph for `list` over `page`, replacing the
-    /// one held, after a fed pass has settled: the stage card's chain waits
-    /// on neither the host nor the tier any more. Nothing is launched.
+    /// Capture `chain`'s tier graph for `list`, replacing the one held,
+    /// after a fed pass has settled: the stage card's chain waits on neither
+    /// the host nor the tier any more. Nothing is launched.
     pub(super) fn capture(
         &mut self,
-        page: &TierPage,
         chain: Chain,
         list: &[(usize, usize)],
     ) -> Result<(), GpuError> {
         let i = chain_slot(chain)?;
         let cols = self.chain_cols(chain)?;
-        self.graphs[i] = None;
         self.captured[i].clear();
-        let Some(last) = list.len().checked_sub(1) else {
+        self.work.capture(chain, cols, list)?;
+        if list.is_empty() {
             return Ok(());
-        };
-        self.gpu.context().bind_to_thread()?;
-        let mut parts = self.parts(page);
-        let graph = Graph::capture(parts.gpu.stream(), |_| {
-            for (k, &(layer, row)) in list.iter().enumerate() {
-                parts.enqueue_layer(layer, row, cols, k == last)?;
-            }
-            Ok(())
-        })?;
-        self.graphs[i] = Some(graph);
+        }
         self.captured[i] = list.to_vec();
         self.stats.captures += 1;
         self.rebind_stage()
@@ -1358,46 +1534,14 @@ impl TierCard {
     /// layer more. A chain wider than the tier's columns is refused by name.
     pub(super) fn enqueue_eager(
         &mut self,
-        page: &TierPage,
         chain: Chain,
         layer: usize,
         row: usize,
     ) -> Result<(), GpuError> {
         let cols = self.chain_cols(chain)?;
-        self.gpu.context().bind_to_thread()?;
-        self.parts(page).enqueue_layer(layer, row, cols, true)?;
+        self.work.enqueue(layer, row, cols)?;
         self.issue(1);
         self.rebind_stage()
-    }
-
-    /// The parts one tier layer's enqueue reads and writes, over `page`.
-    fn parts<'a>(&'a mut self, page: &'a TierPage) -> Parts<'a> {
-        let TierCard {
-            experts,
-            module,
-            act,
-            sel,
-            out,
-            rows,
-            end,
-            index,
-            weights,
-            gpu,
-            ..
-        } = self;
-        Parts {
-            experts: &mut **experts,
-            module,
-            act,
-            sel,
-            out,
-            rows,
-            page,
-            end: *end,
-            index: *index,
-            weights,
-            gpu,
-        }
     }
 
     /// Make the stage card's context current again after tier work, so the
@@ -1507,7 +1651,7 @@ impl TierCard {
     /// progress, the tier's fault word and its copy clean. The host tier's
     /// reset calls it.
     pub(super) fn reset(&mut self, page: &TierPage) -> Result<(), GpuError> {
-        self.gpu.stream().synchronize()?;
+        self.work.sync()?;
         for off in page.counters(self.index) {
             page.link.reset(off);
         }
@@ -1517,8 +1661,7 @@ impl TierCard {
 
     /// The tier's fault word and its copy back to clean.
     pub(super) fn clear_fault(&mut self, page: &TierPage) -> Result<(), GpuError> {
-        self.gpu.clear_fault()?;
-        self.gpu.stream().synchronize()?;
+        self.work.clear_fault()?;
         let at = page.off(self.index, TWord::Fault);
         page.link.store(at, FAULT_NONE);
         page.link.store(at + 4, 0);
@@ -1628,7 +1771,7 @@ impl Staged {
     }
 }
 
-/// The card's parts one tier layer's enqueue reads and writes.
+/// The work's parts one tier layer's enqueue reads and writes.
 struct Parts<'a> {
     experts: &'a mut dyn TierExperts,
     module: &'a tier_kernels::LoadedModule,
@@ -1636,11 +1779,10 @@ struct Parts<'a> {
     sel: &'a mut DeviceBuffer<u32>,
     out: &'a mut DeviceBuffer<f32>,
     rows: &'a mut [TierRows],
-    page: &'a TierPage,
-    /// The card's end of the page's link: every device address the layer's
-    /// copies and stream memory operations take. Set with `rows`; a card
-    /// without it has no rows and refuses every row.
-    end: Option<LinkEnd>,
+    layout: TierLayout,
+    /// The work's end of the page's link: every device address the layer's
+    /// copies and stream memory operations take.
+    end: LinkEnd,
     index: usize,
     weights: &'a Weights,
     gpu: &'a Gpu,
@@ -1663,22 +1805,19 @@ impl Parts<'_> {
         copy_fault: bool,
     ) -> Result<(), GpuError> {
         let stream = self.gpu.stream();
-        let (page, t) = (self.page, self.index);
-        let img = page.layout.image(t)?;
-        let end = match self.end {
-            Some(end) if row < self.rows.len() && (1..=img.cols).contains(&cols) => end,
-            _ => {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "row {row} of {cols} columns on a tier page of {} rows of {} columns",
-                        self.rows.len(),
-                        img.cols
-                    ),
-                ));
-            }
-        };
-        let go = end.dev(page.layout.word_off(t, TWord::Go(row)));
+        let (layout, t, end) = (self.layout, self.index, self.end);
+        let img = layout.image(t)?;
+        if row >= self.rows.len() || !(1..=img.cols).contains(&cols) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "row {row} of {cols} columns on a tier page of {} rows of {} columns",
+                    self.rows.len(),
+                    img.cols
+                ),
+            ));
+        }
+        let go = end.dev(layout.word_off(t, TWord::Go(row)));
         // SAFETY: this tier's go word of row `row` lies in the page (row
         // checked above), which the host tier drops after its tier cards and
         // so after every graph that captured this batch.
@@ -1689,7 +1828,7 @@ impl Parts<'_> {
                 "cuStreamBatchMemOp_v2 (tier go)",
             )?;
         }
-        let at = page.layout.image_off(row);
+        let at = layout.image_off(row);
         let staged = match &*self.act {
             Staged::Q8(a) => a.q3.len() * 2 == img.q3_words && a.d8.len() == img.d8_len,
             Staged::F32(x) => x.len() == img.x_len && img.q3_words + img.d8_len == 0,
@@ -1759,7 +1898,7 @@ impl Parts<'_> {
             // lines; the window is used for this launch only and never
             // dropped as a buffer (its raw parts are, below).
             let mut out =
-                unsafe { window::<u32>(end.dev(page.layout.word_off(t, TWord::Fault)), 2, ctx) };
+                unsafe { window::<u32>(end.dev(layout.word_off(t, TWord::Fault)), 2, ctx) };
             let prep = self
                 .module
                 .prepare_tier_fault_copy(LaunchConfig1D::new(1, 32, 0))?;
@@ -1779,8 +1918,8 @@ impl Parts<'_> {
                 stream,
                 &mut [
                     op_barrier_sys(),
-                    op_add(end.dev(page.layout.word_off(t, TWord::Cnt(row))), 1),
-                    op_add(end.dev(page.layout.word_off(t, TWord::Prog)), 1),
+                    op_add(end.dev(layout.word_off(t, TWord::Cnt(row))), 1),
+                    op_add(end.dev(layout.word_off(t, TWord::Prog)), 1),
                 ],
                 "cuStreamBatchMemOp_v2 (tier signal)",
             )

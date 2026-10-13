@@ -2660,11 +2660,7 @@ impl<H: HostExperts> HostTier<H> {
         };
         self.settle_tiers(last, listed)?;
         for t in (0..k).filter(|t| fed >> t & 1 == 1) {
-            let page = self
-                .tier_page
-                .as_ref()
-                .expect("a host tier with tiers holds their page");
-            if let Err(e) = self.tiers[t].capture(page, chain, &self.tier_lists[t]) {
+            if let Err(e) = self.tiers[t].capture(chain, &self.tier_lists[t]) {
                 return Err(self.fail_released(SERVE, last, e));
             }
         }
@@ -2681,13 +2677,13 @@ impl<H: HostExperts> HostTier<H> {
         mask: u32,
         chain: Chain,
     ) -> Result<(), GpuError> {
-        let r = match self.tier_page.as_ref() {
-            Some(page) => self
+        let r = match self.tier_page {
+            Some(_) => self
                 .tiers
                 .iter_mut()
                 .enumerate()
                 .filter(|(t, _)| mask >> t & 1 == 1)
-                .try_for_each(|(_, t)| t.enqueue_eager(page, chain, layer, row)),
+                .try_for_each(|(_, t)| t.enqueue_eager(chain, layer, row)),
             None => Ok(()),
         };
         if let Err(e) = r {
