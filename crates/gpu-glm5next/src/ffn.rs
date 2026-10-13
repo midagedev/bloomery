@@ -46,22 +46,25 @@
 //! sigmoid scores sit below that: a named difference.
 
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
+use bloomery_gpu::gemm::GemmKernels;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::{
-    Act, EntryPlanes, KquantTileKernels, TileGather, TileScratch, TiledGateUpAct,
+    Act, EntryPlanes, GateUpAct, KquantKernels, KquantTileKernels, TileGather, TileScratch,
+    TiledGateUpAct,
 };
+use bloomery_gpu::site::{self, KGemvKernels, SiteTy};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, CardAccTier, FfnBatchKernels, Handoff, Places};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::GgmlType;
+use gguf::{GgmlType, Split};
 use model::arch::glm5next::place::{card_routed, card_tile_bytes};
 use model::arch::names::routed_stacks;
 use models::{Ffn, LayerSpec};
 
-use crate::body::{Parts, f32t, f32v, gemv, weight};
+use crate::body::{Kernels, Parts, f32t, f32v, gemv, weight};
 use crate::tensors::{FfnNames, LayerNames, other_kind};
 use crate::tier::{STAGE_TIER, TierSide};
 
@@ -76,6 +79,350 @@ pub(crate) const MOE_LAUNCHES: usize = 3 + 1 + 2 + 1 + 1;
 /// the gate·up, the q8_1 of its card columns, the down, the card sum and the
 /// add of the shared expert's output.
 pub(crate) const CARD_LAUNCHES: usize = 6;
+
+/// The types a dense block or a shared expert reads, one launch family each
+/// ([`site::file_site`]'s `allowed`).
+const BLOCK_TYPES: [SiteTy; 4] = [SiteTy::Q8_0, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K];
+
+/// A block's gate·up half, picked once at load from the file's types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateUp {
+    /// The q8_0 pair: `ds41_shexp_gate_up`, the clamp fused, f32 `h` out.
+    Ds41,
+    /// One K-quant type for both, Q4_K or Q5_K: the fused clamped `_sel` over
+    /// a stack of one expert, f32 `h` out.
+    Fused(SiteTy),
+    /// A gemv each, then the clamped SwiGLU into the down's q8_1 rows: no f32
+    /// `h`.
+    Split { gate: SiteTy, up: SiteTy },
+}
+
+/// The launches of one gate·up·SwiGLU·down block (a dense layer or a shared
+/// expert) by its file's types, read once at load ([`BlockPlan::of_file`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockPlan {
+    gate_up: GateUp,
+    down: SiteTy,
+}
+
+impl BlockPlan {
+    /// A block of q8_0 matrices: today's two launches.
+    pub const Q8: BlockPlan = BlockPlan {
+        gate_up: GateUp::Ds41,
+        down: SiteTy::Q8_0,
+    };
+
+    /// Whether the block is [`BlockPlan::Q8`].
+    #[must_use]
+    pub fn is_q8(self) -> bool {
+        self == BlockPlan::Q8
+    }
+
+    /// The plan of a block whose gate, up and down are `tys`: the q8_0 pair or
+    /// two K-quants for gate·up (the same Q4_K or Q5_K fused, else split),
+    /// any of the four for the down, which a split gate·up needs a K-quant
+    /// one of; another mix is refused by name.
+    pub(crate) fn of_types([gate, up, down]: [SiteTy; 3]) -> Result<BlockPlan, GpuError> {
+        let gate_up = match (gate, up) {
+            (SiteTy::Q8_0, SiteTy::Q8_0) => GateUp::Ds41,
+            (g, u) if g.kquant() && u.kquant() => match (g == u, g) {
+                (true, SiteTy::Q4K | SiteTy::Q5K) => GateUp::Fused(g),
+                _ => GateUp::Split { gate: g, up: u },
+            },
+            _ => {
+                return Err(refuse(format!(
+                    "gate is {gate} and up is {up}: a block takes two q8_0 or two K-quants"
+                )));
+            }
+        };
+        if matches!(gate_up, GateUp::Split { .. }) && !down.kquant() {
+            return Err(refuse(format!(
+                "gate {gate} and up {up} split, and the split writes q8_1 rows a {down} down cannot read"
+            )));
+        }
+        Ok(BlockPlan { gate_up, down })
+    }
+
+    /// The plan of the block `names` (gate, up, down) of `ff` rows over `n`
+    /// values in `file`, read from the header before any upload.
+    pub(crate) fn of_file(
+        file: &Split,
+        names: [&str; 3],
+        (ff, n): (usize, usize),
+    ) -> Result<BlockPlan, GpuError> {
+        let shapes = [(ff, n), (ff, n), (n, ff)];
+        let mut tys = [SiteTy::Q8_0; 3];
+        for ((ty, name), shape) in tys.iter_mut().zip(names).zip(shapes) {
+            *ty = site::file_site(file, BLOCK, name, shape, &BLOCK_TYPES)?;
+        }
+        BlockPlan::of_types(tys)
+    }
+
+    /// The launches [`enqueue_block`] enqueues beyond the q8_0 block's two
+    /// (the pair, the down): a fused gate·up quantizes the row and launches
+    /// the `_sel` (+1), a split one quantizes it, runs both gemvs and the
+    /// clamped SwiGLU's quantizer (+3), and a K-quant down over an f32 `h`
+    /// quantizes it first (+1; a split block's SwiGLU already wrote it).
+    #[must_use]
+    pub fn extra_launches(self) -> usize {
+        let down_quantize = usize::from(self.down.kquant());
+        match self.gate_up {
+            GateUp::Ds41 => down_quantize,
+            GateUp::Fused(_) => 1 + down_quantize,
+            GateUp::Split { .. } => 3,
+        }
+    }
+
+    /// The types of gate, up and down.
+    fn types(self) -> [SiteTy; 3] {
+        match self.gate_up {
+            GateUp::Ds41 => [SiteTy::Q8_0, SiteTy::Q8_0, self.down],
+            GateUp::Fused(t) => [t, t, self.down],
+            GateUp::Split { gate, up } => [gate, up, self.down],
+        }
+    }
+
+    /// Refused by name unless the resident weights `names` are the types the
+    /// plan was read as, at the block's shape.
+    pub(crate) fn check_resident(
+        self,
+        w: &Weights,
+        names: [&str; 3],
+        (ff, n): (usize, usize),
+    ) -> Result<(), GpuError> {
+        let shapes = [(ff, n), (ff, n), (n, ff)];
+        for ((ty, name), shape) in self.types().into_iter().zip(names).zip(shapes) {
+            site::site(w, BLOCK, name, shape, ty)?;
+        }
+        Ok(())
+    }
+}
+
+/// The gate, up and down names of a layer's dense block or shared expert.
+pub(crate) fn block_names(n: &LayerNames) -> [&str; 3] {
+    match &n.ffn {
+        FfnNames::Dense { gate, up, down, .. }
+        | FfnNames::Moe {
+            sh_gate: gate,
+            sh_up: up,
+            sh_down: down,
+            ..
+        } => [gate, up, down],
+    }
+}
+
+/// Names a refusal by the block that makes it.
+const BLOCK: &str = "glm5next block";
+
+/// A shape no block launch reads, by name.
+fn refuse(detail: String) -> GpuError {
+    GpuError::Shape {
+        what: BLOCK,
+        detail,
+    }
+}
+
+/// The kernels a K-quant block launches beyond the body's: the K-quant
+/// gemvs, the fused `_sel` gate·up and the clamped SwiGLU's quantizer. Made
+/// at load for a file with a K-quant block only.
+pub(crate) struct BlockKernels {
+    gemv: KGemvKernels,
+    sel: KquantKernels,
+    swiglu: GemmKernels,
+}
+
+impl BlockKernels {
+    /// Load the three into `gpu`'s context. Load-time only.
+    pub(crate) fn load(gpu: &Gpu) -> Result<BlockKernels, GpuError> {
+        Ok(BlockKernels {
+            gemv: KGemvKernels::load(gpu)?,
+            sel: KquantKernels::load(gpu.context(), gpu.fault_word())?,
+            swiglu: GemmKernels::load(gpu.context())?,
+        })
+    }
+}
+
+/// One row's buffers for its K-quant blocks: the normed row and each block
+/// width's `h` as q8_1, the split gate and up in f32, and the one expert's id
+/// the fused `_sel` reads. Made at load for the blocks the row runs.
+pub(crate) struct BlockScratch {
+    xa: Q8Act,
+    ha: Vec<(usize, Q8Act)>,
+    gu: Option<[DeviceBuffer<f32>; 2]>,
+    one: DeviceBuffer<u32>,
+}
+
+impl BlockScratch {
+    /// The scratch of a row that runs `blocks` (plan, width) over `n` values:
+    /// `None` when every block is q8_0.
+    pub(crate) fn new(
+        stream: &CudaStream,
+        n: usize,
+        blocks: impl IntoIterator<Item = (BlockPlan, usize)>,
+    ) -> Result<Option<BlockScratch>, GpuError> {
+        let mut ha: Vec<(usize, Q8Act)> = Vec::new();
+        let (mut any, mut split_ff) = (false, 0);
+        for (plan, ff) in blocks.into_iter().filter(|(p, _)| !p.is_q8()) {
+            any = true;
+            if plan.down.kquant() && !ha.iter().any(|(f, _)| *f == ff) {
+                ha.push((ff, Q8Act::with_k(stream, 1, ff)?));
+            }
+            if matches!(plan.gate_up, GateUp::Split { .. }) {
+                split_ff = split_ff.max(ff);
+            }
+        }
+        if !any {
+            return Ok(None);
+        }
+        let gu = if split_ff > 0 {
+            Some([
+                DeviceBuffer::zeroed(stream, split_ff)?,
+                DeviceBuffer::zeroed(stream, split_ff)?,
+            ])
+        } else {
+            None
+        };
+        Ok(Some(BlockScratch {
+            xa: Q8Act::with_k(stream, 1, n)?,
+            ha,
+            gu,
+            one: DeviceBuffer::zeroed(stream, 1)?,
+        }))
+    }
+
+    /// Device bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.xa.device_bytes()
+            + self.ha.iter().map(|(_, a)| a.device_bytes()).sum::<usize>()
+            + self
+                .gu
+                .as_ref()
+                .map_or(0, |g| g.iter().map(DeviceBuffer::num_bytes).sum())
+            + self.one.num_bytes()
+    }
+}
+
+/// One block's inputs: its plan, tensor names (gate, up, down), width, SwiGLU
+/// limit and layer.
+pub(crate) struct Block<'a> {
+    pub plan: BlockPlan,
+    pub names: [&'a str; 3],
+    pub ff: usize,
+    pub limit: f32,
+    pub layer: usize,
+}
+
+/// One block's row buffers: the normed row in, `h` between, the block's
+/// output.
+pub(crate) struct BlockIo<'a> {
+    pub x: &'a DeviceBuffer<f32>,
+    pub h: &'a mut DeviceBuffer<f32>,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The resident K-quant words of `name`.
+fn kq_words<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, GpuError> {
+    match weight(w, name)? {
+        DevWeight::KQuant { w, .. } => Ok(w),
+        _ => Err(GpuError::Tensor {
+            what: BLOCK,
+            name: name.to_string(),
+            need: "a K-quant weight",
+        }),
+    }
+}
+
+/// Enqueue one block over the one row `io.x`: a q8_0 block is `k.experts`'
+/// pair and the q8_0 gemv; any other is the plan's gate·up, then the down by
+/// its type ([`site::kgemv`] over the q8_1 rows, the q8_0 gemv over `h`).
+pub(crate) fn enqueue_block(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &Kernels,
+    s: &mut Option<BlockScratch>,
+    blk: &Block<'_>,
+    io: BlockIo<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let [gate, up, down] = blk.names;
+    let BlockIo { x, h, y } = io;
+    if blk.plan.gate_up == GateUp::Ds41 && !blk.plan.down.kquant() {
+        k.experts.enqueue_shexp_gate_up(
+            stream,
+            weight(w, gate)?,
+            weight(w, up)?,
+            x,
+            blk.limit,
+            h,
+        )?;
+        return gemv(gpu, w, down, h, y);
+    }
+    let (Some(kb), Some(BlockScratch { xa, ha, gu, one })) = (k.block.as_ref(), s.as_mut()) else {
+        return Err(GpuError::State {
+            what: BLOCK,
+            missing: "the K-quant block's kernels and scratch",
+        });
+    };
+    let fault = gpu.layer_sink(blk.layer)?;
+    let rule = Act::SwigluClamp { limit: blk.limit };
+    match blk.plan.gate_up {
+        GateUp::Ds41 => {
+            k.experts.enqueue_shexp_gate_up(
+                stream,
+                weight(w, gate)?,
+                weight(w, up)?,
+                x,
+                blk.limit,
+                h,
+            )?;
+        }
+        GateUp::Fused(ty) => {
+            gpu.enqueue_quantize_q8_1_layer(x, xa, blk.layer)?;
+            let a = GateUpAct {
+                wg: kq_words(w, gate)?,
+                wu: kq_words(w, up)?,
+                act: xa,
+                sel: one,
+                n_slots: 1,
+                rows_per_expert: blk.ff,
+                slots_per_col: 1,
+                rule,
+            };
+            match ty {
+                SiteTy::Q4K => kb.sel.enqueue_gate_up_q4k(stream, &a, fault, h)?,
+                _ => kb.sel.enqueue_gate_up_q5k(stream, &a, fault, h)?,
+            }
+        }
+        GateUp::Split { gate: gt, up: ut } => {
+            let act = ha.iter_mut().find(|(f, _)| *f == blk.ff).map(|(_, a)| a);
+            let (Some([g, u]), Some(act)) = (gu.as_mut(), act) else {
+                return Err(GpuError::State {
+                    what: BLOCK,
+                    missing: "the split block's f32 gate and up and its q8_1 rows",
+                });
+            };
+            gpu.enqueue_quantize_q8_1_layer(x, xa, blk.layer)?;
+            site::kgemv(gpu, &kb.gemv, (gt, w, gate), xa, fault, g)?;
+            site::kgemv(gpu, &kb.gemv, (ut, w, up), xa, fault, u)?;
+            kb.swiglu
+                .enqueue_swiglu_act_quant_q8(stream, g, u, rule, 1, act, fault)?;
+            return site::kgemv(gpu, &kb.gemv, (blk.plan.down, w, down), act, fault, y);
+        }
+    }
+    if !blk.plan.down.kquant() {
+        return gemv(gpu, w, down, h, y);
+    }
+    let act = ha
+        .iter_mut()
+        .find(|(f, _)| *f == blk.ff)
+        .map(|(_, a)| a)
+        .ok_or(GpuError::State {
+            what: BLOCK,
+            missing: "the down's q8_1 rows at the block's width",
+        })?;
+    gpu.enqueue_quantize_q8_1_layer(h, act, blk.layer)?;
+    site::kgemv(gpu, &kb.gemv, (blk.plan.down, w, down), act, fault, y)
+}
 
 /// A layer's card experts: how many its stacks hold, the routed SwiGLU limit
 /// (`swiglu_clamp_exp`) and the stacks' names (gate, up, down), made once at
@@ -397,15 +744,19 @@ pub(crate) fn dense(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Resu
         1,
         &mut s.xn,
     )?;
-    p.k.experts.enqueue_shexp_gate_up(
-        stream,
-        weight(w, gate)?,
-        weight(w, up)?,
-        &s.xn,
-        c.limit,
-        &mut s.h,
-    )?;
-    gemv(gpu, w, down, &s.h, &mut s.out)
+    let blk = Block {
+        plan: c.block,
+        names: [gate, up, down],
+        ff: c.ff,
+        limit: c.limit,
+        layer: l,
+    };
+    let io = BlockIo {
+        x: &s.xn,
+        h: &mut s.h,
+        y: &mut s.out,
+    };
+    enqueue_block(gpu, w, p.k, &mut s.block, &blk, io)
 }
 
 /// Enqueue layer `l`'s routed block up to its go (module doc).
@@ -480,15 +831,19 @@ pub(crate) fn shadow(
     }
     let sh = moe_names(p, l)?;
     let s = &mut *p.s;
-    p.k.experts.enqueue_shexp_gate_up(
-        gpu.stream(),
-        weight(w, sh.sh_gate)?,
-        weight(w, sh.sh_up)?,
-        boundary.normed(),
-        c.limit,
-        &mut s.h,
-    )?;
-    gemv(gpu, w, sh.sh_down, &s.h, &mut s.sh_y)?;
+    let blk = Block {
+        plan: c.block,
+        names: [sh.sh_gate, sh.sh_up, sh.sh_down],
+        ff: c.ff,
+        limit: c.limit,
+        layer: l,
+    };
+    let io = BlockIo {
+        x: boundary.normed(),
+        h: &mut s.h,
+        y: &mut s.sh_y,
+    };
+    enqueue_block(gpu, w, p.k, &mut s.block, &blk, io)?;
     if card && !tiered {
         let k = card_row_mut(&mut p.card.rows, p.row)?;
         gpu.elem()

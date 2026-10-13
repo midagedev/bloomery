@@ -858,12 +858,12 @@ pub fn prefill_mode(m: &Glm5nextModel) -> Result<PrefillMode, GpuError> {
 /// prompt allocates nothing. Returns whether it made any.
 pub fn set_prefill(m: &mut Glm5nextModel, mode: PrefillMode) -> Result<bool, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
-    body.prompt.mode = mode;
-    if mode == PrefillMode::Steps || body.prompt.batch.is_some() {
-        return Ok(false);
+    let made = mode == PrefillMode::Batch && body.prompt.batch.is_none();
+    if made {
+        body.make_batch(gpu)?;
     }
-    body.make_batch(gpu)?;
-    Ok(true)
+    body.prompt.mode = mode;
+    Ok(made)
 }
 
 /// The batches a prompt group of `m` runs layer by layer: `g` consecutive
@@ -1374,6 +1374,12 @@ impl Body {
             return Ok(());
         }
         refuse_late_dense(&self.cfg, self.prompt.group)?;
+        if let Some(l) = self.cfg.iter().position(|c| !c.block.is_q8()) {
+            return Err(shape(format!(
+                "layer {l}'s dense block or shared expert is a K-quant: the batch feed's GEMM \
+                 front and its shared expert read q8_0 planes; this file feeds by steps"
+            )));
+        }
         let ff = self.cfg.iter().map(|c| c.ff).max().unwrap_or(0);
         let dense_ff = self
             .cfg

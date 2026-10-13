@@ -565,6 +565,17 @@ struct TypePin {
     reads: &'static [GgmlType],
 }
 
+/// The types the glm5next body's dense block and shared expert read: the
+/// q8_0 pair, or K-quants (`gpu-glm5next/src/ffn.rs` `BlockPlan`, each a
+/// launch of `gpu/src/site.rs` or the fused K-quant gate·up).
+// PIN(2026-10-11): widened from `[Q8_0]` with the K-quant block dispatch.
+const GLM5NEXT_BLOCK: &[GgmlType] = &[
+    GgmlType::Q8_0,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+];
+
 /// The per-tensor type pins of the programs, as lists (the qwen3moe body's
 /// dense FFN; `Body35`'s
 /// site types, its `PROJ`, `EMBED` and `HEAD_TY` in
@@ -674,16 +685,16 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::DenseFfn,
         matrices: true,
         names: None,
-        what: "dense block (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "dense block (the body reads q8_0, q4_K, q5_K and q6_K)",
+        reads: GLM5NEXT_BLOCK,
     },
     TypePin {
         program: Program::Glm5nextBody,
         role: Role::SharedExpert,
         matrices: true,
         names: None,
-        what: "shared expert (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "shared expert (the body reads q8_0, q4_K, q5_K and q6_K)",
+        reads: GLM5NEXT_BLOCK,
     },
     TypePin {
         program: Program::Glm5nextBody,
@@ -1909,6 +1920,47 @@ mod tests {
                     .to_string()
             )]
         );
+    }
+
+    /// The glm5next dense block's and shared expert's pins read the q8_0
+    /// pair and the K-quants the block dispatch launches (`BlockPlan`); any
+    /// other type is an item naming the role and the type.
+    // PIN(2026-10-11): q4_K, q5_K and q6_K joined both roles' set (it was
+    // q8_0 alone) with the K-quant block dispatch (`gpu-glm5next` ffn.rs);
+    // derivation: each type is read by `site::kgemv` or the fused K-quant
+    // gate·up at the three decode sites.
+    #[test]
+    fn the_glm5next_block_pins_read_the_dispatched_types() {
+        for (role, text) in [
+            (
+                Role::DenseFfn,
+                "dense block (the body reads q8_0, q4_K, q5_K and q6_K)",
+            ),
+            (
+                Role::SharedExpert,
+                "shared expert (the body reads q8_0, q4_K, q5_K and q6_K)",
+            ),
+        ] {
+            let items =
+                |ty: GgmlType| glm5next_whole_items("blk.0.ffn_gate.weight", role, ty, text);
+            for ty in [
+                GgmlType::Q8_0,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+            ] {
+                assert_eq!(
+                    items(ty),
+                    Vec::<(Option<usize>, String)>::new(),
+                    "{role:?} {ty}"
+                );
+            }
+            assert_eq!(
+                items(GgmlType::Q3_K),
+                [(None, format!("q3_K {text}"))],
+                "{role:?}"
+            );
+        }
     }
 
     /// The glm5next and mimo2 embedding pins read the set the host row

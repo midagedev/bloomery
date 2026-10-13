@@ -57,8 +57,9 @@ pub use body::seq::{
 };
 pub use body::{
     Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, LOAD_ROWS, NEXTN_ON_TIER, Plant,
-    TIER_BEFORE_UPLOAD, prompt, set_taps,
+    TIER_BEFORE_UPLOAD, prompt, set_taps, trunk_blocks,
 };
+pub use ffn::BlockPlan;
 pub use model::arch::glm5next::place::KdaLanes;
 pub use program::{layer_launches, step_launches};
 pub use swap::{DEADLINE, LIVE_DELAY};

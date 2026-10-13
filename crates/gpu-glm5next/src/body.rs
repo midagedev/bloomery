@@ -112,7 +112,7 @@ use models::{Act, Ffn, LayerSpec, Mixer, Score};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{HOST_BUDGET, Kept, Take};
 
-use crate::ffn::CardExperts;
+use crate::ffn::{BlockKernels, BlockPlan, BlockScratch, CardExperts, block_names};
 use crate::host::routed_layers;
 use crate::program;
 use crate::swap;
@@ -164,6 +164,8 @@ pub(crate) struct Kernels {
     pub router: RouterKernels,
     pub experts: ExpertKernels,
     pub ffn: FfnKernels,
+    /// The K-quant blocks' kernels: `None` on a file whose blocks are all q8_0.
+    pub block: Option<BlockKernels>,
     /// The k-pool selector's score and top-k passes, and the stream its
     /// launches run on beside the latent mixer's query ([`crate::mla`]).
     pub kpool: KpoolKernels,
@@ -172,7 +174,7 @@ pub(crate) struct Kernels {
 }
 
 impl Kernels {
-    fn load(gpu: &Gpu) -> Result<Kernels, GpuError> {
+    fn load(gpu: &Gpu, k_blocks: bool) -> Result<Kernels, GpuError> {
         let ctx = gpu.context();
         Ok(Kernels {
             step: StepKernels::load(ctx)?,
@@ -183,6 +185,7 @@ impl Kernels {
             router: RouterKernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
             ffn: FfnKernels::load(ctx)?,
+            block: k_blocks.then(|| BlockKernels::load(gpu)).transpose()?,
             kpool: KpoolKernels::load(ctx)?,
             qsa: QsaKernels::load(ctx)?,
             branch: Branch::new(ctx)?,
@@ -234,6 +237,8 @@ pub(crate) struct LayerCfg {
     pub limit: f32,
     /// The dense block's or the shared expert's width.
     pub ff: usize,
+    /// The block's launches by its file's types ([`BlockPlan`]).
+    pub block: BlockPlan,
     /// The router's selection bias is in the file.
     pub bias: bool,
     /// The layer's row in the slot map's card copy, as a word offset
@@ -414,8 +419,13 @@ pub(crate) struct Scratch {
 impl Scratch {
     /// Each row's buffers ([`RowScratch::new`]) and the lane word at lane 0.
     /// Load-time only.
-    fn new(stream: &CudaStream, d: &Dims, ff: usize, ctx: usize) -> Result<Scratch, GpuError> {
-        let row = || RowScratch::new(stream, d, ff, ctx);
+    fn new(
+        stream: &CudaStream,
+        d: &Dims,
+        (ff, ctx): (usize, usize),
+        blocks: &[(BlockPlan, usize)],
+    ) -> Result<Scratch, GpuError> {
+        let row = || RowScratch::new(stream, d, (ff, ctx), blocks.iter().copied());
         Ok(Scratch {
             // One buffer set a row of the load's LOAD_ROWS; another count
             // fails to compile here.
@@ -513,6 +523,8 @@ pub(crate) struct RowScratch {
     // The feed-forward blocks'.
     pub h: DeviceBuffer<f32>,
     pub sh_y: DeviceBuffer<f32>,
+    /// The K-quant blocks' buffers, for the blocks this row runs.
+    pub block: Option<BlockScratch>,
     pub rout: RouterOut,
     pub sel: DeviceBuffer<u32>,
     /// A layer without a selection bias in the file selects with none.
@@ -526,7 +538,12 @@ pub(crate) struct RowScratch {
 impl RowScratch {
     /// One row's buffers; the low-rank halves are `kda.head_dim` wide, as
     /// the header reader holds every KDA tensor to ik's exact dims.
-    fn new(stream: &CudaStream, d: &Dims, ff: usize, ctx: usize) -> Result<RowScratch, GpuError> {
+    fn new(
+        stream: &CudaStream,
+        d: &Dims,
+        (ff, ctx): (usize, usize),
+        blocks: impl IntoIterator<Item = (BlockPlan, usize)>,
+    ) -> Result<RowScratch, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let (n, c, v) = (d.embd, d.kda.channels(), d.kda.n_v * HEAD);
         let rows = d.heads;
@@ -567,6 +584,7 @@ impl RowScratch {
             list: DeviceBuffer::zeroed(stream, list_width(d.kept))?,
             h: z(ff)?,
             sh_y: z(n)?,
+            block: BlockScratch::new(stream, n, blocks)?,
             rout: RouterOut::new(stream)?,
             sel: DeviceBuffer::zeroed(stream, N_USED)?,
             no_bias: z(N_EXPERT)?,
@@ -623,6 +641,7 @@ impl RowScratch {
             + self.vis.num_bytes()
             + self.cnt.num_bytes()
             + self.list.num_bytes()
+            + self.block.as_ref().map_or(0, BlockScratch::bytes)
     }
 }
 
@@ -1519,7 +1538,7 @@ impl Body {
         let dims = dims_of(inputs)?;
         let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
         let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), N_EXPERT)?;
-        let cfg = spec
+        let mut cfg = spec
             .layers
             .iter()
             .enumerate()
@@ -1530,10 +1549,21 @@ impl Body {
             .enumerate()
             .map(|(l, c)| LayerNames::of(l, c.kind))
             .collect::<Result<Vec<_>, _>>()?;
+        for (c, n) in cfg.iter_mut().zip(&names) {
+            c.block = BlockPlan::of_file(file, block_names(n), (c.ff, dims.embd))?;
+            c.block
+                .check_resident(w, block_names(n), (c.ff, dims.embd))?;
+        }
+        let nextn_block = nextn
+            .map(|(_, ni)| nextn::block_plan(file, inputs, ni, dims.embd))
+            .transpose()?;
+        let k_blocks =
+            cfg.iter().any(|c| !c.block.is_q8()) || nextn_block.is_some_and(|(p, _)| !p.is_q8());
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         let ff = cfg.iter().map(|c| c.ff).max().unwrap_or(0);
-        let s = Scratch::new(stream, &dims, ff, ctx)?;
+        let blocks: Vec<(BlockPlan, usize)> = cfg.iter().map(|c| (c.block, c.ff)).collect();
+        let s = Scratch::new(stream, &dims, (ff, ctx), &blocks)?;
         let stores = cfg
             .iter()
             .map(|c| store(stream, c.kind, &dims, ctx, lanes))
@@ -1647,7 +1677,7 @@ impl Body {
             cfg,
             names,
             dims,
-            k: Kernels::load(gpu)?,
+            k: Kernels::load(gpu, k_blocks)?,
             s,
             stores,
             slots,
@@ -1684,6 +1714,7 @@ impl Body {
                 &body.dims,
                 (ctx, seqs),
                 host.card_dontneed,
+                nextn_block.ok_or_else(|| shape("the NextN layer's block plan".to_string()))?,
             )?;
             body.nextn = Some(Box::new(layer));
             body.prepare_port(gpu)?;
@@ -1720,6 +1751,12 @@ impl Body {
     #[must_use]
     pub fn kinds(&self) -> Vec<Layer> {
         self.cfg.iter().map(|c| c.kind).collect()
+    }
+
+    /// Each layer's dense block or shared expert plan, in layer order.
+    #[must_use]
+    pub fn blocks(&self) -> Vec<BlockPlan> {
+        self.cfg.iter().map(|c| c.block).collect()
     }
 
     /// The layers the host tier serves.
@@ -1973,6 +2010,39 @@ pub fn prompt(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
     })
 }
 
+/// Each trunk layer's dense block or shared expert plan, read from `file`'s
+/// header before any upload: the plans [`Body::open_placed`] loads by.
+///
+/// # Errors
+/// A header the plan reader refuses, a routed layer without its shared
+/// expert, or a block the plan chooser refuses by name.
+pub fn trunk_blocks(file: &Split) -> Result<Vec<BlockPlan>, GpuError> {
+    let inputs = PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+    let embd = dims_of(&inputs)?.embd;
+    inputs
+        .spec
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(l, s)| {
+            let ff = match &s.ffn {
+                Ffn::Dense { ff, .. } => *ff,
+                Ffn::Moe(m) => {
+                    m.shared
+                        .ok_or_else(|| {
+                            shape(format!(
+                                "layer {l}: a routed block without its shared expert"
+                            ))
+                        })?
+                        .ff
+                }
+            };
+            let names = LayerNames::of(l, Layer::of(s))?;
+            BlockPlan::of_file(file, block_names(&names), (ff as usize, embd))
+        })
+        .collect()
+}
+
 /// The file's widths and constants, each checked against the kernel that
 /// fixes it.
 fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
@@ -2087,6 +2157,7 @@ fn layer_cfg(l: usize, s: &LayerSpec, map: &SlotMap) -> Result<LayerCfg, GpuErro
         kind,
         limit,
         ff,
+        block: BlockPlan::Q8,
         bias,
         row_off,
     })

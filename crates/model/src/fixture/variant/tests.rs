@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GENERAL_ARCHITECTURE, GgmlType, Split, Value};
 
-use super::{Row, check, custom_q, expand, override_kv, parse_table, row};
+use super::{Row, Scope, check, custom_q, expand, override_kv, parse_table, row};
 use crate::fixture::{FixtureError, KEY_VARIANT};
 
 const TABLE_ROW: &str = "v1\tfam\ttrunk\tffn_gate_exps=iq3_s ffn_up_exps=iq3_s ffn_down_exps=iq4_xs\tgate-a gate-b\ta reason";
@@ -206,13 +206,30 @@ fn the_table_parses_and_refuses_by_name() {
     bad("v1\tfam\ttrunk\tx=q4_K", &["4 columns"]);
     bad(&format!("{TABLE_ROW}\n{TABLE_ROW}"), &["v1", "twice"]);
     bad("V1\tfam\ttrunk\ta=q4_K\tg\tr", &["lower-case"]);
-    bad("v1\tfam\tall\ta=q4_K\tg\tr", &["scope"]);
+    bad(
+        "v1\tfam\tpool\ta=q4_K\tg\tr",
+        &["scope", "`trunk` or `all`"],
+    );
+    let all = parse_table("v1\tfam\tall\ta=q4_K\tg\tr").expect("an all-scope row");
+    assert_eq!(all[0].scope, Scope::All);
     bad("v1\tfam\ttrunk\ta=q9_9\tg\tr", &["q9_9"]);
     bad("v1\tfam\ttrunk\ta\tg\tr", &["not role=type"]);
     bad("v1\tfam\ttrunk\ta=q4_K a=q5_K\tg\tr", &["twice"]);
     bad("v1\tfam\ttrunk\t\tg\tr", &["not empty"]);
     bad("v1\tfam\ttrunk\ta=q4_K\t\tr", &["not empty"]);
     bad("v1\tfam\ttrunk\ta=q4_K\tg\t ", &["not empty"]);
+}
+
+/// The shipped table is the one `fixture variant-rules` reads: every row parses, with each map word a type ggml names.
+#[test]
+fn the_shipped_table_parses() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/fixture-variants.tsv"
+    ))
+    .expect("tools/fixture-variants.tsv");
+    let rows = parse_table(&text).expect("the shipped table parses");
+    assert!(!rows.is_empty(), "the shipped table has no row");
 }
 
 /// A map reaches the trunk layers' tensors of its roles in the source's order, and the NextN layer keeps its types.
@@ -238,6 +255,27 @@ fn a_map_expands_to_the_trunk_tensors() {
     );
     assert_eq!((got[0].from, got[0].to), (GgmlType::Q4_K, GgmlType::IQ3_S));
     assert_eq!((got[2].from, got[2].to), (GgmlType::Q5_K, GgmlType::IQ4_XS));
+}
+
+/// The `all` scope reaches the NextN layer's tensors of the map's roles too, in the source's order; `trunk` leaves them.
+#[test]
+fn the_all_scope_reaches_the_nextn_layer() {
+    let d = Dir::new();
+    let src = open(&write(&d.0, "s", &source_kvs(), &source_tensors(), 2));
+    let all = Row {
+        scope: Scope::All,
+        ..the_row()
+    };
+    let names: Vec<String> = expand(&all, &src)
+        .expect("an expansion")
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    let want: Vec<String> = [1, 2, 3]
+        .into_iter()
+        .flat_map(|l| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| tn(l, r)))
+        .collect();
+    assert_eq!(names, want);
 }
 
 /// A row that changes nothing, names nothing, names another family or cannot be held is refused by name.
