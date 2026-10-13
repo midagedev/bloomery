@@ -310,6 +310,8 @@ Uniform routing is the low-overlap case, so 1.3–1.5 ms is a floor. Correlated 
 
 The m ≤ 8 joined routed arm on branch `perflab` points at that tile entry for more than one row, and only when gate and up are the same Q4_K or Q5_K and the down is Q4_K or Q5_K. One row stays on `_sel`. There is no new lever and no default change. The token bar is the verify gate against the plain steps. `dispatch::ffn` is also the short-prompt path, so overlap with `q35hybpp` and `ringr1` is reported before any PR.
 
+The ws A/B (card `pf1-tile-m5`, A6000, Qwen3.6-35B-A3B Q4_K_M, m=5, `--prefill pass`) passed that token bar and missed the time bar. `gate_qwen35moe_verify` passed; the captured counts were decode 520, a 5-row pass 617, and an 8-row pass 629. The scored row is `time prompt` after load and after the prefill-graph capture. Median `_sel` minus tile was −0.079 ms (tile slower). The four pairs, `_sel` minus tile, were −0.109, −0.079, −0.077, and −0.080 ms. The band was 0.15..0.35 ms saved. No switch was added, and the edit is not proposed for a PR.
+
 ### 2. Spark E: full MTP head vs the shipped 76k list
 
 The unset lever is already the shipped list when the tokenizer matches (`crates/model/src/arch/qwen35moe/head_list.rs`, `SHIPPED` / cjk-76000). The saving against the full head, from the constants in `docs/research/headpick.md` appendix A (`VOCAB` 248320, `ROW` 2720 B, 3 walks, the same arithmetic that prints `T_C` 35.424 ms):
