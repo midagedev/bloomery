@@ -1,0 +1,2 @@
+# tools/gate-paths.tsv merges by row, gates as sets (tools/gate-paths-merge.py; `--install` registers the driver in a clone).
+tools/gate-paths.tsv merge=gate-paths
