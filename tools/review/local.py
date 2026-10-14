@@ -81,15 +81,28 @@ def gh_json(*args):
     """gh's JSON answer, or None when gh cannot answer (no gh, no login, no network)."""
     if not shutil.which("gh"):
         return None
-    pages = "--paginate" in args
     try:
-        p = subprocess.run(["gh", *args, *(["--slurp"] if pages else [])], capture_output=True, text=True, timeout=NET_S)
+        p = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=NET_S)
         if p.returncode:
             return None
-        data = json.loads(p.stdout)
-        return [item for page in data for item in page] if pages else data
+        return json_pages(p.stdout) if "--paginate" in args else json.loads(p.stdout)
     except (subprocess.TimeoutExpired, ValueError):
         return None
+
+
+def json_pages(text):
+    """`gh api --paginate` prints one JSON document per page (`--slurp` is newer than the gh some machines carry):
+    each is decoded in turn, and list pages are joined."""
+    dec, i, out = json.JSONDecoder(), 0, []
+    while True:
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i == len(text):
+            return out
+        page, i = dec.raw_decode(text, i)
+        if not isinstance(page, list):
+            raise ValueError("a paginated gh page is not a list")
+        out += page
 
 
 def files_txt(name_status, numstat):
@@ -483,10 +496,12 @@ def self_test():
     with tempfile.TemporaryDirectory() as t:
         fake = os.path.join(t, "gh")
         marker = "<!-- bloomery-review head_sha=" + "a" * 40 + " verdict=CLEAN"
-        pages = json.dumps([[{"user": {"login": "someone"}, "body": "x"}],
-                            [{"user": {"login": "github-actions[bot]"}, "body": marker}], [{"user": {"login": "z"}, "body": "y"}]])
+        # gh prints the pages back to back, one JSON document each, as 2.46 does (no --slurp)
+        pages = "".join(json.dumps(pg) for pg in ([{"user": {"login": "someone"}, "body": "x"}],
+                                                  [{"user": {"login": "github-actions[bot]"}, "body": marker}])) \
+            + "\n" + json.dumps([{"user": {"login": "z"}, "body": "y"}])
         open(fake, "w").write('#!/usr/bin/env bash\ncase "$*" in\n'
-                              f'  "auth token") sleep 5 ;;\n  *--slurp*) echo \'{pages}\' ;;\n  *) echo \'[{{"number":1}}]\' ;;\nesac\n')
+                              f'  "auth token") sleep 5 ;;\n  *--slurp*) echo "unknown flag: --slurp" >&2; exit 1 ;;\n  *--paginate*) printf %s \'{pages}\' ;;\n  *) echo \'[{{"number":1}}]\' ;;\nesac\n')
         os.chmod(fake, 0o755)
         saved_env = {k: os.environ.get(k) for k in ("PATH", "GH_TOKEN")}
         saved_net = globals()["NET_S"]
