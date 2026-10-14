@@ -1627,7 +1627,7 @@ mod gate {
     /// a flip is no near tie, when a site's ids are not the top set of its own
     /// logits, when the held rows fall below [`FREE_COVER_MIN`] of the
     /// rows ik kept, or when the probe does not replay the chain's layers
-    /// within `probe_rel` ([`FREE_PROBE_EXACT`], [`FREE_PROBE_HOST`]). The real
+    /// within `probe_rel` ([`FREE_PROBE_CARD`], [`FREE_PROBE_HOST`]). The real
     /// tier holds every row.
     fn free(
         m: &mut Qwen35moeModel,

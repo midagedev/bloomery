@@ -2886,9 +2886,8 @@ fn hw_fixture_q36_plan() {
 }
 
 /// Contract 25: the recorded card budget makes the written file's plan hold
-/// half of the experts on every layer, none of which is host-only. The first
-/// generate printed 3,684,696,064 B; the gate holds the round trip, not the
-/// figure.
+/// half of the experts on every layer, none of which is host-only. The gate
+/// holds the budget's round trip through the header.
 #[test]
 #[ignore = "needs the box and the Qwen3.6 file (just gate-fixture)"]
 fn hw_fixture_q36_budget() {
