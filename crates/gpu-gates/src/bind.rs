@@ -329,9 +329,6 @@ pub enum SlotsFrom {
     Ctx,
     /// Neither flag: the seat's own default count over its automatic context.
     Default,
-    /// The default count's plan pages host experts through the NVMe tier, so
-    /// fewer slots are served.
-    Paged,
     /// A route trace records one sequence's steps, so one slot is served.
     RouteTrace,
     /// The DSpark draft's window is one sequence's, so one slot is served.
@@ -346,7 +343,6 @@ impl SlotsFrom {
             SlotsFrom::Flag => "flag",
             SlotsFrom::Ctx => "ctx",
             SlotsFrom::Default => "default",
-            SlotsFrom::Paged => "paged",
             SlotsFrom::RouteTrace => "route-trace",
             SlotsFrom::Dspark => "dspark",
         }
@@ -3323,7 +3319,6 @@ mod tests {
             (SlotsFrom::Flag, "flag"),
             (SlotsFrom::Ctx, "ctx"),
             (SlotsFrom::Default, "default"),
-            (SlotsFrom::Paged, "paged"),
             (SlotsFrom::RouteTrace, "route-trace"),
             (SlotsFrom::Dspark, "dspark"),
         ] {
@@ -3395,7 +3390,6 @@ mod tests {
             (SlotsFrom::Flag, "flag"),
             (SlotsFrom::Ctx, "ctx"),
             (SlotsFrom::Default, "default"),
-            (SlotsFrom::Paged, "paged"),
             (SlotsFrom::RouteTrace, "route-trace"),
             (SlotsFrom::Dspark, "dspark"),
         ];

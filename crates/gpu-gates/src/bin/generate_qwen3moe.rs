@@ -172,10 +172,11 @@
 //! 2 positions), with a `load draft=off (<why>)` record after the `load`
 //! line — `no file at <path>[, <path>…]`, every place the pick looked — never a refusal.
 //! `BLOOMERY_DRAFT=off` is the plain path with the same record. A plan that
-//! pages host experts through the NVMe tier's RAM arena steps one column
-//! (`bloomery_levers::paged_columns`, asked of the plan the run loads): an
-//! unset draft goes off there (`unset: the plan pages …`), a set one runs,
-//! and `BLOOMERY_GEN_SLOTS` past one is refused by name.
+//! pages host experts through the NVMe tier's RAM arena keeps the slots it
+//! was asked (`bloomery_levers::paged_draft`, asked of the plan the run
+//! loads): an unset draft goes off there (`unset: the plan pages …`), a set
+//! one runs, and `BLOOMERY_GEN_SLOTS` past one is refused by the load's
+//! one-column check.
 //!
 //! Drafting (`BLOOMERY_DRAFT=mtp`, or unset as above; a qwen4exp file only,
 //! every other family and word refused by name — `dspark` on a qwen35moe file
@@ -1071,9 +1072,6 @@ mod cli {
         let at = PagedAt {
             arena,
             slots,
-            slots_set: slots > 1,
-            // `BLOOMERY_GEN_SLOTS` decodes its streams as one pass.
-            together: true,
             draft: true,
             draft_set: levers.draft().is_some(),
         };

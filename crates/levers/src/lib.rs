@@ -2039,14 +2039,9 @@ pub struct PagedAt {
     /// The plan's RAM arena (`HostTotals::nvme_arena_bytes`); 0 is a plan
     /// the tier does not page through an arena.
     pub arena: u64,
-    /// The resident slots the plan counts.
+    /// The resident slots the plan counts. The default is already one, so
+    /// the rule does not change the count.
     pub slots: usize,
-    /// Whether the user set the count (`--parallel`, [`GEN_SLOTS`]); unset
-    /// it is the binary's own default.
-    pub slots_set: bool,
-    /// Whether the slots step as one pass of their rows. Where each steps
-    /// alone (beside an expert tier card), the default count is kept.
-    pub together: bool,
     /// Whether the plan drafts, and whether [`DRAFT`] named the draft.
     pub draft: bool,
     pub draft_set: bool,
@@ -2065,35 +2060,24 @@ impl PagedAt {
 pub enum Paged {
     /// The plan as asked.
     AsAsked,
-    /// The plan with the rule applied: the draft off where unset
-    /// ([`paged_draft`] names why; a set [`DRAFT`] runs), and `slots` — one
-    /// for a default count whose slots step together, else every one asked.
+    /// The plan with the unset draft off ([`paged_draft`] names why; a set
+    /// [`DRAFT`] runs). `slots` is the count asked: the default is already
+    /// one, so the rule does not reduce it.
     Reduced { slots: usize },
 }
 
 /// A plan that pages host experts through the NVMe tier's RAM arena serves
-/// the slots it was asked for, a set count of them stepped as one pass over
-/// the arena (the placement's floor counts their columns, [`PagedAt::slots`]).
-/// A plan with no arena serves as asked. Else the draft goes off where unset
-/// and a default count of slots that step together falls to one: a second
-/// slot's KV takes card bytes that experts would hold, and a later budget
-/// rule prices that trade. A set draft runs — whether a drafted verify pays
-/// on a paged plan is the machine's drive, not the rule's, to answer
-/// ([`DRAFT`]'s doc names the trade; `pageddraft-decode.card` holds the
-/// measurement).
+/// the slots it was asked for ([`PagedAt::slots`]). A plan with no arena, a
+/// plan that does not draft, or a set draft, serves as asked. An unset draft
+/// on a paged plan goes off and the asked count stays. Whether a drafted
+/// verify pays on a paged plan is the machine's drive, not the rule's, to
+/// answer ([`DRAFT`]'s doc names the trade; `pageddraft-decode.card` holds
+/// the measurement).
 pub fn paged_columns(at: &PagedAt) -> Paged {
-    if at.arena == 0 {
-        return Paged::AsAsked;
-    }
-    let slots = if at.slots > 1 && at.together && !at.slots_set {
-        1
-    } else {
-        at.slots
-    };
-    if (at.draft && !at.draft_set) || slots != at.slots {
-        Paged::Reduced { slots }
-    } else {
+    if at.arena == 0 || !at.draft || at.draft_set {
         Paged::AsAsked
+    } else {
+        Paged::Reduced { slots: at.slots }
     }
 }
 

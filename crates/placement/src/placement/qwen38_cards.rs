@@ -1249,11 +1249,11 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
 
 /// The serving seats' paged rule reads the plan's RAM arena
 /// (`bloomery_levers::paged_columns`): the 3090 gate plan at a 27 GiB room
-/// pages its host experts through an arena at the seat's default two slots
-/// and at one, so the default falls to one slot and `--parallel 2` is served
-/// as asked; at 40 GiB (over half the host leg, under its need) the tier
-/// pages experts with no arena (the mapping path), and the plan serves as
-/// asked — the serve gate's two rooms.
+/// pages its host experts through an arena at two slots and at one, and an
+/// unset draft goes off with that count kept; at 40 GiB (over half the host
+/// leg, under its need) the tier pages experts with no arena (the mapping
+/// path), so the same unset draft is served as asked — the serve gate's two
+/// rooms. A count is never reduced: the default is already one slot.
 #[test]
 fn the_paged_rule_reads_the_arena() {
     use bloomery_levers::{Paged, PagedAt, paged_columns};
@@ -1262,12 +1262,10 @@ fn the_paged_rule_reads_the_arena() {
         let plan = plan_at(&q4, &gate, 4096, slots, room).expect("the plan");
         (plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes)
     };
-    let at = |arena, slots, slots_set: bool| PagedAt {
+    let at = |arena, slots, draft| PagedAt {
         arena,
         slots,
-        slots_set,
-        together: true,
-        draft: false,
+        draft,
         draft_set: false,
     };
     let (moved2, deep2) = arena(2, 27 << 30);
@@ -1275,11 +1273,14 @@ fn the_paged_rule_reads_the_arena() {
     println!("27 GiB: two slots arena {deep2} B, one slot arena {deep1} B");
     assert!(moved2 > 0 && deep2 > 0 && moved1 > 0 && deep1 > 0);
     assert_eq!(
-        paged_columns(&at(deep2, 2, false)),
+        paged_columns(&at(deep2, 2, true)),
+        Paged::Reduced { slots: 2 }
+    );
+    assert_eq!(
+        paged_columns(&at(deep1, 1, true)),
         Paged::Reduced { slots: 1 }
     );
-    assert_eq!(paged_columns(&at(deep1, 1, false)), Paged::AsAsked);
-    assert_eq!(paged_columns(&at(deep2, 2, true)), Paged::AsAsked);
+    assert_eq!(paged_columns(&at(deep2, 2, false)), Paged::AsAsked);
     let (moved, shallow) = arena(2, 40 << 30);
     println!("40 GiB: two slots NVMe experts {moved} B, arena {shallow} B");
     assert!(moved > 0, "the 40 GiB room pages experts");

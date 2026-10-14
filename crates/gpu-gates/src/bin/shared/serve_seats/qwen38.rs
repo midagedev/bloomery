@@ -117,7 +117,7 @@
 //! one-sequence server, its rounds one pass a slot. `--parallel` naming no
 //! count, the seat serves one slot beside a set `--ctx-size` (the flag is
 //! one request's context, `bind::slots_of`; one line on stderr says so),
-//! one under the route trace (below), and its default two over the automatic
+//! one under the route trace (below), and its default one over the automatic
 //! context. Under more slots than one
 //! the context is split
 //! as llama-server splits it with
@@ -132,8 +132,8 @@
 //! refused by name — resident slots hold their state on the card, in the
 //! plan. A `parallel` line on stderr names the rule (`slots`), the slots,
 //! the split they serve, what set the count (`from`: the `--parallel`
-//! flag, a set `--ctx-size`, the default, `route-trace`, or `paged`, the rule
-//! below) and the shape of a round of several slots (`pass=one`, or
+//! flag, a set `--ctx-size`, the default, or `route-trace`) and the shape of a
+//! round of several slots (`pass=one`, or
 //! `pass=turns` under `--place bp`, which runs the slots a slot at a time).
 //! `--queue-depth Q` bounds the requests that wait for a slot.
 //!
@@ -142,34 +142,25 @@
 //! `placement::nvme_arena_of`) serves its slots as one pass over the arena
 //! (`bloomery_levers::paged_columns`): the placement's floor counts a column
 //! a slot (`ArenaFloor::of`), so the paged experts of every slot's rows are
-//! read from the arena, not through the file mapping. A set `--parallel` is
-//! served as asked; an unset count falls to one slot (`from=paged`: a second
-//! slot's KV takes card bytes that experts would hold, and a later budget
-//! rule prices that trade) and an unset draft goes off (`load draft=off
+//! read from the arena, not through the file mapping. The count is served
+//! as asked — the default is already one slot, so the rule has no count to
+//! reduce — and an unset draft goes off (`load draft=off
 //! (unset: the plan pages …)` — also for a draft whose yield to the context,
-//! judged on the plan of several slots the load abandons, had turned it off;
+//! judged on the plan the load abandons, had turned it off;
 //! whether a drafted verify pays on a paged plan is the machine's drive, not
 //! the rule's, to answer, so a set `BLOOMERY_DRAFT=mtp` runs), one `paged`
 //! line on stderr naming the arena and what was asked (`asked_draft` the
-//! draft before that yield, `draft` what the plan serves); a set count the
-//! room's floor cannot hold is refused by name with the room and the floor.
-//! Under `--place bp` each slot steps alone (the
-//! rounds below), so slots add no column there: they are served as asked, and
-//! only an unset draft goes off. The rule reads the plan the flags name — a set
-//! context's plain plan before any search, else the plan the default's search
-//! and the draft's yield chose — and the load's own plan is held to it: the
-//! engine thread plans from the room the main thread read
-//! (`PlanInputs::room`, never a reading of its own), and its plan must have
-//! the terms the records and rules read (`PlanKey`: the card's and the tiers'
-//! experts, the host's experts, resident bytes and tables, the NVMe tier's
-//! bytes and arena) or the load is refused by name. The plan's host reserves
-//! every slot's checkpoints (the body's budget at the slot's context,
-//! [`reserve_checkpoints`]),
-//! so the host need, the split's floor and the arena count them, so a default
-//! count whose plan the room leaves under the floor is planned at one slot
-//! with no draft where that plan pages, under `--place bp` too: that one slot
-//! is the room's, not a column's (the same `paged` line, the floor named at
-//! its end); a set `--parallel` there is refused by the floor, by name. The
+//! draft before that yield, `draft` what the plan serves). The rule reads
+//! the plan the flags name — a set context's plain plan before any search,
+//! else the plan the default's search and the draft's yield chose — and the
+//! load's own plan is held to it: the engine thread plans from the room the
+//! main thread read (`PlanInputs::room`, never a reading of its own), and
+//! its plan must have the terms the records and rules read (`PlanKey`: the
+//! card's and the tiers' experts, the host's experts, resident bytes and
+//! tables, the NVMe tier's bytes and arena) or the load is refused by name.
+//! The plan's host reserves every slot's checkpoints (the body's budget at
+//! the slot's context, [`reserve_checkpoints`]), so the host need, the
+//! split's floor and the arena count them. The
 //! residency machine's victim fills read through the NVMe tier's reader
 //! while the step's ids stay pinned in the arena, so a `BLOOMERY_RESIDENCY`
 //! word set on such a plan is served as given (unset resolves `off`).
@@ -1250,16 +1241,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // doc), asked once of the plan the flags name: a set context's slot is
     // known before any search, so its plain plan's arena decides ahead of the
     // drafted plan; the default's is asked below, of the plan its search and
-    // the draft's yield chose. Under the rule the plan serves a set draft, an
-    // unset one off, a set `--parallel` as asked, and a default count of
-    // slots that step together at one slot (`from=paged`); beside an expert
-    // tier card each slot steps alone ([`Place38::tiered`], the rounds' own
-    // rule below), and the slots stay.
+    // the draft's yield chose. Under the rule the plan serves the asked
+    // count, a set draft, and an unset one off.
     let paged_at = |arena: u64, slots: usize, mtp: bool| bloomery_levers::PagedAt {
         arena,
         slots,
-        slots_set: from == SlotsFrom::Flag,
-        together: !a.place.tiered(),
         draft: mtp,
         draft_set: levers.draft().is_some(),
     };
@@ -1269,35 +1255,20 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The draft a reduced load runs ([`bloomery_levers::paged_draft`]): a set
     // one runs, and an unset one the plan would draft — or that only its
     // yield to the context turned off on the plan this load abandons — goes
-    // off naming the paged rule, at either point.
-    let reduced =
-        |arena: u64, (slots, served): (usize, usize), mtp: bool, draft_off: Option<Draft38Off>| {
-            let at = paged_at(arena, slots, mtp);
-            let asked_on = at.asked_draft(draft_off.as_ref());
-            let (drafts, draft_off) = bloomery_levers::paged_draft(&at, draft_off);
-            eprintln!(
-                "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
-             slots={served} draft={} (the plan pages host experts through the NVMe tier's RAM \
-             arena; {})",
-                if asked_on { "on" } else { "off" },
-                if drafts { "on" } else { "off" },
-                if served < slots {
-                    "an unset count serves one slot: a second slot's KV takes card bytes that \
-                 experts would hold, and a later budget rule prices that trade"
-                } else {
-                    "a set count is served as one pass over the arena"
-                }
-            );
-            (
-                if served < slots {
-                    SlotsFrom::Paged
-                } else {
-                    from
-                },
-                drafts,
-                draft_off,
-            )
-        };
+    // off naming the paged rule, at either point. The asked count stays.
+    let reduced = |arena: u64, slots: usize, mtp: bool, draft_off: Option<Draft38Off>| {
+        let at = paged_at(arena, slots, mtp);
+        let asked_on = at.asked_draft(draft_off.as_ref());
+        let (drafts, draft_off) = bloomery_levers::paged_draft(&at, draft_off);
+        eprintln!(
+            "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
+             slots={slots} draft={} (the plan pages host experts through the NVMe tier's RAM \
+             arena; the asked count is served, and an unset draft goes off)",
+            if asked_on { "on" } else { "off" },
+            if drafts { "on" } else { "off" },
+        );
+        (drafts, draft_off)
+    };
     let early = match a.ctx.map(|c| c / slots) {
         Some(ctx) if ctx > 0 && (slots > 1 || mtp) => {
             let plain = Plans {
@@ -1320,7 +1291,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (slots, from, mtp, head, draft_off) = match paged(early, slots, mtp) {
         Paged::AsAsked => (slots, from, mtp, head, draft_off),
         Paged::Reduced { slots: served } => {
-            let (from, drafts, draft_off) = reduced(early, (slots, served), mtp, draft_off);
+            let (drafts, draft_off) = reduced(early, served, mtp, draft_off);
             if !drafts {
                 mtp_inputs = None;
             }
@@ -1385,7 +1356,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             (slots, from, mtp, head, draft_off, host)
         }
         Paged::Reduced { slots: served } => {
-            let (from, drafts, draft_off) = reduced(host.2, (slots, served), mtp, draft_off);
+            let (drafts, draft_off) = reduced(host.2, served, mtp, draft_off);
             let one = Plans {
                 mtp: if drafts { plans.mtp } else { None },
                 slots: served,
@@ -1504,8 +1475,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The one-column rule holds at the plan the load runs: the cache's
     // bound only lowers the context the rule read, which leaves the card
     // more experts and the host fewer, so a paged load whose slots step
-    // together is the seat's own breach. A set draft on the one slot
-    // `paged_columns` already served is that plan, not a second column.
+    // together is the seat's own breach. The rule serves the asked count,
+    // so several slots that step together are that breach.
     if plan.host.nvme_arena_bytes > 0 && pass.together(slots) {
         return Err(format!(
             "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
