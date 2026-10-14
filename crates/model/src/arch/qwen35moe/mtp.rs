@@ -1710,7 +1710,14 @@ mod in_file_tests {
                 "one stream norms 64 values, not 256",
             ),
         ] {
-            let path = header_shaped(tag, "qwen35moe", &kv, &[], &tensors);
+            // spec reads the tokenizer before the tail. open() carries the same pre.
+            let path = header_shaped(
+                tag,
+                "qwen35moe",
+                &kv,
+                &[("tokenizer.ggml.pre", V::Str("qwen35"))],
+                &tensors,
+            );
             let split = gguf::Split::open(&path).expect("the synthetic header opens");
             let err = crate::arch::spec(&split)
                 .map_or_else(|e| e.to_string(), |_| "accepted".to_string());
