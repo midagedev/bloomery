@@ -182,7 +182,7 @@ use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
-    note_line, parallel_line, slots_given,
+    note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
@@ -1443,6 +1443,24 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         load.print_plan(&levers, vision.as_ref())?;
         std::process::exit(0);
     }
+    // `/props`' placement: a placed load's plan, the one its open makes from the same plan and
+    // levers; a whole-card load opens with no plan, so it reports none and says so.
+    let placement = match &load {
+        Q3Load::Placed { q, total, .. } => {
+            let plan = q.plan(*total, &plan_levers)?;
+            placement_of(NAME, plan.machine, &plan)
+        }
+        Q3Load::Whole(_) => {
+            eprintln!(
+                "{NAME}: /props leaves the placement out: a whole-card load opens with no plan"
+            );
+            None
+        }
+    };
+    let props = EngineProps {
+        placement,
+        ..EngineProps::default()
+    };
     drop(split);
     let open = path.clone();
     let device = match &load {
@@ -1456,7 +1474,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             slot_ctx,
             vocab,
             device,
-            EngineProps::default(),
+            props,
             0,
         )?,
         _ => SeatEngine::spawn(
@@ -1464,7 +1482,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             slot_ctx,
             vocab,
             device,
-            EngineProps::default(),
+            props,
             0,
         )?,
     };
