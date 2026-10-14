@@ -13,21 +13,22 @@ LOG is a tools/gate-batch.sh run.log (or the batch's own stdout, which carries t
                                             than total= minus unrun= (a killed batch, a cut-off tee), is a named error
   gate-batch: …, logs in DIR   red: …       the stdout's header and red-list lines
 Any other line is a named error. Each item prints as
-  - `just <recipe>` (lane <x>): ok|FAIL rc <n>|skip|deferred|yield|unclaimed, <wall> s
+  - `<recipe>` (lane <x>): ok|FAIL rc <n>|skip|deferred|yield|unclaimed, <wall> s
 and the first `gate-batch: … logs in DIR` line (the stdout's) or the DONE line is printed above them as the batch's identity.
 
 rc 84 is tools/boxq.py's: the Mac lost the daemon for three polls and the job is left running on the box, so the item's
 result is not known here. The job id is the one in boxq's `boxq: <name>: job <id> is left as it is: …` line (printed when
 the attach ends 84), taken from the item's own log (DIR/g-<stem>.log, next to LOG unless --logs names another directory)
 and only when that is the log's last `boxq: ` line: an id of an earlier call in the same log is another job's. With --attach the id is followed with `boxq.py attach <id>` (its
-output goes to stderr) and the line takes the job's rc from the box: `ok (rc 84 on the Mac, attached: box rc 0)` or
-`FAIL box rc <n>`. Without --attach, with no id in the log, or when the attach itself ends 84 again, the line says the job
-is not attached and the exit is 3; such an item is never printed as ok or as a plain FAIL.
+output goes to stderr). A box rc of 0 does not pass the recipe: the line says the attached job passed and that recipe
+completion is unverified, and the exit is 3. A box rc other than 0 and 84 is `FAIL box rc <n>`. Without --attach, with no id in the
+log, or when the attach itself ends 84 again, the line says the job is not attached and the exit is 3; such an item is
+never printed as ok or as a plain FAIL.
 PR_GATE_LINES_BOXQ names another boxq.py (the self-test's stub); it runs under python3.
 
 Exit: 0 every item ok (a ledger skip, a deferral and a yield are not failures, as in gate-batch's own exit); 1 some item
-FAIL; 3 an rc 84 not resolved (a FAIL elsewhere in the log takes the 1); 64 usage; 65 an unreadable log or a line this
-tool cannot parse.
+FAIL, or the DONE line names unrun items; 3 an rc 84 not resolved (a FAIL elsewhere in the log takes the 1); 64 usage;
+65 an unreadable log or a line this tool cannot parse.
 """
 
 import contextlib
@@ -39,7 +40,7 @@ import sys
 import tempfile
 
 OK, FAIL, UNRESOLVED, USAGE, BAD_LOG = 0, 1, 3, 64, 65
-DOWN = 84  # tools/boxq.py: the daemon is not reachable, the job is left as it is
+from boxq import DOWN
 
 ITEM_RE = re.compile(r"^(?P<stem>\S+) rc=(?P<rc>\S+)(?P<rest> .*)?$")
 WALL_RE = re.compile(r" (\d+)s(?: |$)")
@@ -58,14 +59,13 @@ class LogError(Exception):
 
 
 class Item:
-    def __init__(self, stem, rc, rest, lineno):
-        self.stem, self.rc, self.lineno = stem, rc, lineno
+    def __init__(self, stem, rc, rest):
+        self.stem, self.rc = stem, rc
         self.lane = (LANE_RE.search(rest) or [None, "?"])[1]
         wall = WALL_RE.search(rest)
         self.wall = wall.group(1) if wall else None
         field = ITEM_FIELD_RE.search(rest)
         self.recipe = field.group(1).strip() if field else stem
-        self.rest = rest
 
 
 def parse_log(path):
@@ -94,7 +94,7 @@ def parse_log(path):
             raise LogError(f"{path}:{n}: rc={rc} is neither a number nor one of {', '.join(SPECIAL_RC)}: {line!r}")
         if rc.isdigit() and not WALL_RE.search(rest):
             raise LogError(f"{path}:{n}: an item with rc={rc} carries no `<s>s` wall: {line!r}")
-        items.append(Item(m["stem"], rc, rest, n))
+        items.append(Item(m["stem"], rc, rest))
     if not items:
         raise LogError(f"{path}: no item line in the log")
     m = DONE_RE.match(done or "")
@@ -130,7 +130,7 @@ def attach(jid):
 
 def render(item, logs_dir, do_attach):
     """(markdown line, status) with status OK, FAIL or UNRESOLVED."""
-    head = f"- `just {item.recipe}` (lane {item.lane}): "
+    head = f"- `{item.recipe}` (lane {item.lane}): "
     wall = f", {item.wall} s" if item.wall is not None else ""
     if item.rc == "0":
         return head + "ok" + wall, OK
@@ -155,7 +155,7 @@ def render(item, logs_dir, do_attach):
     if rc == DOWN:
         return head + f"rc 84: daemon unreachable, job {jid} not attached (the attach ended 84 too)" + wall, UNRESOLVED
     if rc == 0:
-        return head + "ok (rc 84 on the Mac, attached: box rc 0)" + wall, OK
+        return head + "rc 84: attached job passed (box rc 0); recipe completion unverified — rerun the recipe" + wall, UNRESOLVED
     return head + f"FAIL box rc {rc} (rc 84 on the Mac, attached)" + wall, FAIL
 
 
@@ -173,7 +173,7 @@ def run(log, do_attach, logs_dir):
         line, status = render(item, logs_dir, do_attach)
         print(line, flush=True)
         statuses.append(status)
-    if FAIL in statuses:
+    if FAIL in statuses or ((unrun := UNRUN_RE.search(ident[-1])) and int(unrun[1]) > 0):
         return FAIL
     return UNRESOLVED if UNRESOLVED in statuses else OK
 
@@ -257,8 +257,8 @@ def self_test():
 
         rc, out, _ = call([write("green.log", GREEN)])
         check(rc == 0, f"all ok exits 0: {rc}")
-        check("- `just gate-fmt` (lane B): ok, 4 s" in out, f"an ok line: {out!r}")
-        check("- `just gate-qdot:--cases 4` (lane A): ok, 61 s" in out, "the item= field names the recipe with its ARGS")
+        check("- `gate-fmt` (lane B): ok, 4 s" in out, f"an ok line: {out!r}")
+        check("- `gate-qdot:--cases 4` (lane A): ok, 61 s" in out, "the item= field names the recipe with its ARGS")
         check("skip" in out and "deferred" in out and "FAIL" not in out, "a skip and a deferral are no failure")
         check("Gate batch: DONE total=4" in out, "the DONE line is the identity when the log has no header line")
 
@@ -269,7 +269,7 @@ def self_test():
 
         red = GREEN[:2] + ["gate-qdot rc=1 61s try=1 lane=A tier=real"] + GREEN[2:-1] + ["DONE total=5 red=1 tier=real"]
         rc, out, _ = call([write("red.log", red)])
-        check(rc == 1 and "- `just gate-qdot` (lane A): FAIL rc 1, 61 s" in out, f"one FAIL exits 1: {rc} {out!r}")
+        check(rc == 1 and "- `gate-qdot` (lane A): FAIL rc 1, 61 s" in out, f"one FAIL exits 1: {rc} {out!r}")
 
         down = ["gate-gpu-z rc=84 30s try=1 lane=A tier=real", "DONE total=1 red=1 tier=real"]
         item_log = ["=== try 1 2026-10-14 10:00:00 lane=A: just gate-gpu-z", "boxq: daemon-down: job j-ok is left as it is: poll 3/3 failed"]
@@ -280,8 +280,9 @@ def self_test():
 
         rc, out, _ = call([os.path.join(t, "down.log"), "--attach"], **env)
         got = open(calls, encoding="utf-8").read() if os.path.exists(calls) else "(the stub never ran)"
-        check(rc == 0 and "ok (rc 84 on the Mac, attached: box rc 0)" in out and got == "attach j-ok\n",
-              f"rc 84 with --attach takes the box's rc 0 from `attach j-ok`: {rc} {out!r} {got!r}")
+        check(rc == 3 and "rc 84: attached job passed (box rc 0); recipe completion unverified — rerun the recipe" in out
+              and got == "attach j-ok\n",
+              f"rc 84 with --attach and box rc 0 stays unresolved: {rc} {out!r} {got!r}")
 
         write("g-gate-gpu-z.log", item_log + ["boxq: daemon-down: job j-red is left as it is: poll 3/3 failed"])
         rc, out, _ = call([os.path.join(t, "down.log"), "--attach"], **env)
@@ -292,10 +293,10 @@ def self_test():
         rc, out, _ = call([os.path.join(t, "down.log"), "--attach"], **env)
         check(rc == 3 and "job j-down not attached" in out, f"an attach that ends 84 stays unresolved: {rc} {out!r}")
 
-        write("g-gate-gpu-z.log", ["boxq: gate-gpu-z is job j-old", "boxq: daemon-down: ssh: cannot reach the daemon"])
+        write("g-gate-gpu-z.log", ["boxq: daemon-down: job j-ok is left as it is: poll failed", "boxq: daemon-down: ssh: cannot reach the daemon"])
         rc, out, _ = call([os.path.join(t, "down.log"), "--attach"], **env)
         check(rc == 3 and "job unknown not attached" in out,
-              f"an older `is job` line then a submit failure gives job unknown: {rc} {out!r}")
+              f"a left-as-it-is line that is not the log's last boxq line gives job unknown: {rc} {out!r}")
 
         os.remove(os.path.join(t, "g-gate-gpu-z.log"))
         rc, out, _ = call([os.path.join(t, "down.log"), "--attach"], **env)
@@ -317,11 +318,11 @@ def self_test():
             check(rc == 65 and want in err, f"{name} log exits 65 and names the line: {rc} {err!r}")
         canary = GREEN[:3] + ["DONE total=4 red=1 tier=real canary=red gate-fmt unrun=2 wall=9s"]
         rc, _, _ = call([write("canary.log", canary)])
-        check(rc == 0, f"a canary stop's items equal total= minus unrun=: {rc}")
+        check(rc == 1, f"a canary stop with unrun items cannot report success: {rc}")
         rc, _, err = call([os.path.join(t, "absent.log")])
         check(rc == 65 and "cannot read the log" in err, f"a missing log exits 65: {rc} {err!r}")
 
-    for args in ([], ["--nope", "x"], ["a", "b"], ["--logs"]):
+    for args in ([], ["--nope"], ["a", "b"], ["--logs"]):
         rc, _, _ = call(args)
         check(rc == 64, f"usage {args} exits 64: {rc}")
 
