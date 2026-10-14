@@ -190,5 +190,12 @@ mod tests {
             !super::reserve_named(&full, 32_768, 32_768, bytes),
             "a reason with no drop"
         );
+        // The serve clause also requires the plan to exit 0. A `--plan` that
+        // exits 1 is red even when the line names the drop.
+        let clause = |success: bool, line: &str, with: u64, without: u64| {
+            success && super::reserve_named(line, with, without, bytes)
+        };
+        assert!(!clause(false, &full, 16_384, 32_768), "a plan that exits 1");
+        assert!(clause(true, &full, 16_384, 32_768), "{full}");
     }
 }

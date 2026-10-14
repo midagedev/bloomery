@@ -479,7 +479,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (a, placed) = parse_args(args)?;
     placed.record().eprint();
     // The lane's rate, taken before the plan reads the room (`lane_of`).
-    let lane = lane_at(placed.place)?;
+    // `--plan` returns before any card is opened, so it probes no lane.
+    let lane = if a.plan_only {
+        None
+    } else {
+        Some(lane_at(placed.place)?)
+    };
     let at = ResidencyAt {
         serving_place: a.place != Place::Gate,
         check_finite: false,
@@ -647,7 +652,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let open = SeatArgs {
         place: a.place,
-        lane,
+        lane: lane.expect("a serving run probed the lane before the plan"),
         ctx,
         slots,
         pass,

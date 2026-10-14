@@ -1943,7 +1943,8 @@ mod gate {
         check(
             &mut ok,
             "mmproj_a_dropped_rung_names_the_reserve",
-            ctx_ladder::reserve_named(&line, with.slot_ctx, without.slot_ctx, bytes),
+            status.success()
+                && ctx_ladder::reserve_named(&line, with.slot_ctx, without.slot_ctx, bytes),
         );
         Ok(ok)
     }
