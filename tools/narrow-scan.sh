@@ -237,7 +237,7 @@ except OSError:
 }
 
 lock_release() { # drops this process's flock. A directory at the path is an older copy's and is not removed.
-  exec 9>&- 2> /dev/null || true
+  exec 9>&-
   return 0
 }
 
@@ -403,7 +403,7 @@ self_test() {
   # fd 9 if this shell already held the flock, so the holder is its own bash.
   rm -rf "$t/lock.d" "$t/lock.d.flock"
   export -f lock_take
-  bash -c 'lock_take "$1" 0 "test run" 2>/dev/null || exit 1; sleep 30' _ "$t/lock.d" &
+  bash -c 'lock_take "$1" 0 "test run" 2>/dev/null || exit 1; exec sleep 30' _ "$t/lock.d" &
   hp=$!
   k=0
   while [ "$k" -lt 50 ]; do
@@ -451,9 +451,9 @@ self_test() {
     fi
     builtin kill "$@"
   }
-  ( lock_take "$t/lock.d" 0 "recover-a" >/dev/null 2>&1; echo $? > "$rec/a.rc"; [ "$(cat "$rec/a.rc")" = 0 ] && sleep 30 ) &
+  ( lock_take "$t/lock.d" 0 "recover-a" >/dev/null 2>&1; echo $? > "$rec/a.rc"; [ "$(cat "$rec/a.rc")" = 0 ] && exec sleep 30 ) &
   pa=$!
-  ( lock_take "$t/lock.d" 0 "recover-b" >/dev/null 2>&1; echo $? > "$rec/b.rc"; [ "$(cat "$rec/b.rc")" = 0 ] && sleep 30 ) &
+  ( lock_take "$t/lock.d" 0 "recover-b" >/dev/null 2>&1; echo $? > "$rec/b.rc"; [ "$(cat "$rec/b.rc")" = 0 ] && exec sleep 30 ) &
   pb=$!
   k=0
   while [ "$k" -lt 80 ]; do
@@ -785,7 +785,7 @@ LOCKD=$HOME/.cache/bloomery/narrow-scan-$(str_key "$BASE_DIR $HEAD_DIR").lock.d
 # keeps that lock, so a run of an older copy (a tree not yet rebased) still excludes this one from the dirs.
 [ "$BASE_DIR $HEAD_DIR" != '~/repo/bloomery-narrow-base ~/repo/bloomery-narrow-head' ] || LOCKD=$HOME/.cache/bloomery/narrow-scan.lock.d
 lock_take "$LOCKD" "${NARROW_WAIT:-1800}" "$(basename "$ROOT") ${BASE_SHA:0:8}..$HEAD_NAME since $(date +%H:%M:%S)" || exit $?
-trap 'lock_release "$LOCKD"' EXIT
+trap lock_release EXIT
 trap 'stop_run 130' INT
 trap 'stop_run 143' TERM
 
