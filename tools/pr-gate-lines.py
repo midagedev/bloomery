@@ -17,7 +17,8 @@ Any other line is a named error. Each item prints as
 and the first `gate-batch: … logs in DIR` line (the stdout's) or the DONE line is printed above them as the batch's identity.
 
 rc 84 is tools/boxq.py's: the Mac lost the daemon for three polls and the job is left running on the box, so the item's
-result is not known here. The job id is the one in boxq's `boxq: <name>: job <id> is left as it is: …` line (printed when
+result is not known here. The job id is the one in boxq's `boxq: <id> left as it is on the box; resume with: …` line (a
+lost daemon past BOXQ_RECONNECT_S) or its `boxq: <name>: job <id> is left as it is: …` line (printed when
 the attach ends 84), taken from the item's own log (DIR/g-<stem>.log, next to LOG unless --logs names another directory)
 and only when that is the log's last `boxq: ` line: an id of an earlier call in the same log is another job's. With --attach the id is followed with `boxq.py attach <id>` (its
 output goes to stderr). A box rc of 0 does not pass the recipe: the line says the attached job passed and that recipe
@@ -46,7 +47,7 @@ ITEM_RE = re.compile(r"^(?P<stem>\S+) rc=(?P<rc>\S+)(?P<rest> .*)?$")
 WALL_RE = re.compile(r" (\d+)s(?: |$)")
 LANE_RE = re.compile(r" lane=(\S+)")
 ITEM_FIELD_RE = re.compile(r" item=(.*)$")
-LEFT_RE = re.compile(r"^boxq: \S+: job ([A-Za-z0-9._-]+) is left as it is")
+LEFT_RE = re.compile(r"^boxq: (?:\S+: job )?([A-Za-z0-9._-]+) (?:is )?left as it is")
 DONE_RE = re.compile(r"^DONE total=(\d+)\b")
 UNRUN_RE = re.compile(r" unrun=(\d+)\b")
 LOGS_IN_RE = re.compile(r"^gate-batch: .*logs in \S+")
@@ -288,6 +289,14 @@ def self_test():
         rc, out, _ = call([os.path.join(t, "down.log"), "--attach"], **env)
         check(rc == 1 and "FAIL box rc 3" in out and "ok" not in out.split(":", 1)[1],
               f"the last job id of the log is attached, box rc 3 is a FAIL: {rc} {out!r}")
+
+        if os.path.exists(calls):
+            os.unlink(calls)
+        write("g-gate-gpu-z.log", ["boxq: j-ok left as it is on the box; resume with: tools/boxq.py attach j-ok"])
+        rc, out, _ = call([os.path.join(t, "down.log"), "--attach"], **env)
+        got = open(calls, encoding="utf-8").read() if os.path.exists(calls) else "(the stub never ran)"
+        check(rc == 3 and "attached job passed" in out and got == "attach j-ok\n",
+              f"the reconnect bound's resume line names the job too: {rc} {out!r} {got!r}")
 
         write("g-gate-gpu-z.log", ["boxq: daemon-down: job j-down is left as it is: poll 3/3 failed"])
         rc, out, _ = call([os.path.join(t, "down.log"), "--attach"], **env)
