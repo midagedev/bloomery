@@ -157,7 +157,7 @@ pub const SEAT_STEPS: placement::ctx_ask::Steps = placement::ctx_ask::Steps {
 /// The file's missing `context_length`, [`placement::ctx::PastLimit`], the
 /// choice's refusal ([`placement::ctx_ask::AskError`]) in its words, or the
 /// seat's own plan error.
-pub fn choose_ctx<P, E: Into<GateError>>(
+pub fn choose_ctx<P, E: Into<GateError> + std::fmt::Display>(
     file: &Split,
     (set, slots): (Option<usize>, usize),
     (kernel, verified): (Option<(u64, &'static str)>, Option<(u64, &'static str)>),
