@@ -75,6 +75,7 @@ SLOTS=2 # runs at once on the remote; a further run waits for a slot
 SLOT_SAY=300 # seconds between two prints of the slots' line while a run waits for a slot
 SLOT_POLL=3 # seconds between a waiting run's two looks at the queue and the slots
 TRACK_WAIT=1800 # seconds a run waits for its track's lock held by a live run
+PUSH_RETRY_S=${PUSH_RETRY_S:-5} # seconds before the one retry of a failed git push to the clone
 LOCK_DEAD=${LOCK_DEAD:-600} # a lock with no live remote run and a heartbeat older than this is dead and reclaimed
 
 say() { printf '%s\n' "$*" >&2; }
@@ -746,9 +747,7 @@ remote_main() {
   say "mac-remote: track $track on ${MAC_NAME:-the second Mac}, HEAD ${HEAD_SHA:0:12}, base ${BASE_ARG:-none (full run)}"
 
   # objects, checkout, content
-  git -C "$TREE" push -q --no-verify -f "$R:$RBASE/$track" "${pushes[@]}" > "$TMP/push.log" 2>&1 || {
-    say "mac-remote: git push to the remote clone failed:"; scrub "$RHOME" "$RUSER" "$RHOST" < "$TMP/push.log" | tail -5 >&2; return 75
-  }
+  push_clone "$track" || return $?
   printf '%s\n' "$CHECKOUT" > "$TMP/checkout.sh"
   ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$HEAD_SHA")" < "$TMP/checkout.sh" > "$TMP/checkout.log" 2>&1 || {
     say "mac-remote: git checkout --detach on the remote failed:"; scrub "$RHOME" "$RUSER" "$RHOST" < "$TMP/checkout.log" | tail -5 >&2; return 75
@@ -841,6 +840,24 @@ JUST
   chmod +x "$rh/opt/bloomery-bin/python3" "$rh/opt/bloomery-bin/just"
 }
 
+# push_clone TRACK: git push of HEAD and BASE (pushes) to TRACK's clone; a failed push is tried once more after
+# PUSH_RETRY_S, then ends 75 with git's last lines. The push is a fresh ssh session right after the preflight's own
+# succeeded, so a failure here is most often a dropped connection, not a missing clone (the preflight made it).
+push_clone() {
+  local n
+  for n in 1 2; do
+    git -C "$TREE" push -q --no-verify -f "$R:$RBASE/$1" "${pushes[@]}" > "$TMP/push.log" 2>&1 && return 0
+    [ "$n" = 2 ] && break
+    say "mac-remote: git push to the remote clone failed; trying once more in ${PUSH_RETRY_S} s"
+    sleep "$PUSH_RETRY_S" &
+    SLPID=$!
+    wait "$SLPID" || true
+    SLPID=
+  done
+  say "mac-remote: git push to the remote clone failed twice:"; scrub "$RHOME" "$RUSER" "$RHOST" < "$TMP/push.log" | tail -5 >&2
+  return 75
+}
+
 self_test() {
   local fails=0 d out rc t fake stub repo me k1 k2 rh rt pid
   fail() { say "mac-remote self-test FAIL: $*"; fails=$((fails + 1)); }
@@ -848,6 +865,17 @@ self_test() {
   fake=$d/home
   mkdir -p "$fake/.config/bloomery"
   me=$(hostname -s | tr -c 'A-Za-z0-9.\n-' _)
+
+  # the push: a dropped first push is tried once more; two failures end 75 with git's lines
+  mkdir -p "$d/gitbin"
+  printf '#!/bin/sh\nc=$(cat "%s/n" 2>/dev/null || echo 0); c=$((c + 1)); echo $c > "%s/n"\n[ "$c" -gt "${FAIL_N:-0}" ] && exit 0\necho "fatal: Could not read from remote repository."; exit 128\n' "$d/gitbin" "$d/gitbin" > "$d/gitbin/git"
+  chmod +x "$d/gitbin/git"
+  out=$( (TREE=$d R=st-user@st-host RHOME= RUSER=st-user RHOST=st-host TMP=$d pushes=(x) PUSH_RETRY_S=0 SLPID=; PATH=$d/gitbin:$PATH FAIL_N=1; export FAIL_N; push_clone t) 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 0 ] && [ "$(cat "$d/gitbin/n")" = 2 ] && grep -qF 'trying once more' <<< "$out" || fail "a push that failed once was not retried to success: rc $rc, calls $(cat "$d/gitbin/n"): $out"
+  rm -f "$d/gitbin/n"
+  out=$( (TREE=$d R=st-user@st-host RHOME= RUSER=st-user RHOST=st-host TMP=$d pushes=(x) PUSH_RETRY_S=0 SLPID=; PATH=$d/gitbin:$PATH FAIL_N=9; export FAIL_N; push_clone t) 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 75 ] && [ "$(cat "$d/gitbin/n")" = 2 ] && grep -qF 'Could not read from remote repository' <<< "$out" || fail "a push that failed twice did not end 75 with git's line after two tries: rc $rc, calls $(cat "$d/gitbin/n" 2>/dev/null): $out"
+  rm -f "$d/gitbin/n"
 
   # the pool: the choice, the lock notes, the reservations, the pin, an unreachable pool
   out=$(printf '%s\n' 'a 1 40 1 0 0 0 0' 'b 1 40 2 0 0 0 0' | POOL_MIN_GB=15 pool_choose)
