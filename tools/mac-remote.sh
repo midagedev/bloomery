@@ -75,7 +75,7 @@ SLOTS=2 # runs at once on the remote; a further run waits for a slot
 SLOT_SAY=300 # seconds between two prints of the slots' line while a run waits for a slot
 SLOT_POLL=3 # seconds between a waiting run's two looks at the queue and the slots
 TRACK_WAIT=1800 # seconds a run waits for its track's lock held by a live run
-PUSH_RETRY_S=${PUSH_RETRY_S:-5} # seconds before the one retry of a failed git push to the clone
+PUSH_RETRY_S=5 # seconds before the one retry of a failed git push to the clone
 LOCK_DEAD=${LOCK_DEAD:-600} # a lock with no live remote run and a heartbeat older than this is dead and reclaimed
 
 say() { printf '%s\n' "$*" >&2; }
@@ -868,14 +868,17 @@ self_test() {
 
   # the push: a dropped first push is tried once more; two failures end 75 with git's lines
   mkdir -p "$d/gitbin"
-  printf '#!/bin/sh\nc=$(cat "%s/n" 2>/dev/null || echo 0); c=$((c + 1)); echo $c > "%s/n"\n[ "$c" -gt "${FAIL_N:-0}" ] && exit 0\necho "fatal: Could not read from remote repository."; exit 128\n' "$d/gitbin" "$d/gitbin" > "$d/gitbin/git"
-  chmod +x "$d/gitbin/git"
-  out=$( (TREE=$d R=st-user@st-host RHOME= RUSER=st-user RHOST=st-host TMP=$d pushes=(x) PUSH_RETRY_S=0 SLPID=; PATH=$d/gitbin:$PATH FAIL_N=1; export FAIL_N; push_clone t) 2>&1) && rc=0 || rc=$?
-  [ "$rc" = 0 ] && [ "$(cat "$d/gitbin/n")" = 2 ] && grep -qF 'trying once more' <<< "$out" || fail "a push that failed once was not retried to success: rc $rc, calls $(cat "$d/gitbin/n"): $out"
-  rm -f "$d/gitbin/n"
-  out=$( (TREE=$d R=st-user@st-host RHOME= RUSER=st-user RHOST=st-host TMP=$d pushes=(x) PUSH_RETRY_S=0 SLPID=; PATH=$d/gitbin:$PATH FAIL_N=9; export FAIL_N; push_clone t) 2>&1) && rc=0 || rc=$?
-  [ "$rc" = 75 ] && [ "$(cat "$d/gitbin/n")" = 2 ] && grep -qF 'Could not read from remote repository' <<< "$out" || fail "a push that failed twice did not end 75 with git's line after two tries: rc $rc, calls $(cat "$d/gitbin/n" 2>/dev/null): $out"
-  rm -f "$d/gitbin/n"
+  printf '#!/bin/sh\nc=$(cat "%s/n" 2>/dev/null || echo 0); c=$((c + 1)); echo $c > "%s/n"; echo git >> "%s/calls"\n[ "$c" -gt "${FAIL_N:-0}" ] && exit 0\necho "fatal: Could not read from remote repository."; exit 128\n' "$d/gitbin" "$d/gitbin" "$d/gitbin" > "$d/gitbin/git"
+  printf '#!/bin/sh\necho "sleep $1" >> "%s/calls"\n' "$d/gitbin" > "$d/gitbin/sleep"
+  chmod +x "$d/gitbin/git" "$d/gitbin/sleep"
+  out=$( (TREE=$d R=st-user@st-host RHOME= RUSER=st-user RHOST=st-host TMP=$d pushes=(x) SLPID=; PATH=$d/gitbin:$PATH FAIL_N=1; export FAIL_N; push_clone t) 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 0 ] && [ "$(tr '\n' ' ' < "$d/gitbin/calls")" = "git sleep $PUSH_RETRY_S git " ] && grep -qF 'trying once more' <<< "$out" ||
+    fail "a push that failed once was not retried after the wait: rc $rc, calls $(tr '\n' ' ' < "$d/gitbin/calls"): $out"
+  rm -f "$d/gitbin/n" "$d/gitbin/calls"
+  out=$( (TREE=$d R=st-user@st-host RHOME= RUSER=st-user RHOST=st-host TMP=$d pushes=(x) SLPID=; PATH=$d/gitbin:$PATH FAIL_N=9; export FAIL_N; push_clone t) 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 75 ] && [ "$(tr '\n' ' ' < "$d/gitbin/calls")" = "git sleep $PUSH_RETRY_S git " ] && grep -qF 'Could not read from remote repository' <<< "$out" ||
+    fail "a push that failed twice did not end 75 with git's line after two tries and one wait: rc $rc, calls $(tr '\n' ' ' < "$d/gitbin/calls" 2>/dev/null): $out"
+  rm -f "$d/gitbin/n" "$d/gitbin/calls"
 
   # the pool: the choice, the lock notes, the reservations, the pin, an unreachable pool
   out=$(printf '%s\n' 'a 1 40 1 0 0 0 0' 'b 1 40 2 0 0 0 0' | POOL_MIN_GB=15 pool_choose)
