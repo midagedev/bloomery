@@ -216,8 +216,10 @@ def device_dirs(base_tree, out, base_sha=None):
     if cache and os.path.isfile(cache):
         shutil.copy(cache, out)
         return
+    # review.yml pins stable: cargo metadata must not install the nightly the base tree names.
+    env = dict(os.environ, RUSTUP_TOOLCHAIN="stable")
     p = subprocess.run([sys.executable, os.path.join(base_tree, "tools/review/post.py"), "device", "--root", base_tree,
-                        "--out", out], capture_output=True, text=True)
+                        "--out", out], capture_output=True, text=True, env=env)
     if p.returncode:
         raise Stop(70, f"pre-review: post.py device failed: {p.stderr.strip()[:200]}")
     if cache:
@@ -681,11 +683,13 @@ def self_test():
         home = os.environ.get("HOME")
         os.environ["HOME"] = t
         ran = []
+        envs = []
         real_run = subprocess.run
 
         def wrapped(argv, *a, **k):
             if len(argv) > 1 and str(argv[1]).endswith("post.py"):
                 ran.append(1)
+                envs.append((k.get("env") or {}).get("RUSTUP_TOOLCHAIN"))
                 open(argv[argv.index("--out") + 1], "w").write("crates/gpu/\n")
                 return subprocess.CompletedProcess(argv, 0, "", "")
             return real_run(argv, *a, **k)
@@ -706,6 +710,8 @@ def self_test():
             device_dirs(t, outs[2], "sha-b")
             expect(ran == [1, 1] and open(outs[1]).read() == "crates/gpu/\n" and published == ["crates/gpu/\n", "crates/gpu/\n"],
                    f"device dirs run once per base sha and replace the cache whole: ran {len(ran)}, published {published}")
+            expect(envs == ["stable", "stable"],
+                   f"post.py device runs under RUSTUP_TOOLCHAIN=stable: {envs}")
         finally:
             os.replace = real_replace
             subprocess.run = real_run
