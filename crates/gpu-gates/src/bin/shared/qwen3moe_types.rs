@@ -56,12 +56,13 @@ pub fn serve_default(split: &Split) -> Result<String, String> {
     let (chosen, _) = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
         .map_err(|e| format!("the --ctx choice refused: {e}"))?;
     let total = usize::try_from(chosen.total).map_err(|e| e.to_string())?;
+    let line = chosen.line();
     let u = match chosen.plan {
         q3place::ServeLoad::Whole(card) => q3place::Unplaced::Whole(card),
         q3place::ServeLoad::Placed { q, .. } => q3place::Unplaced::Placed(q),
     };
     let how = held(split, &u, total, whole_refuses)?;
-    Ok(format!("{}, {how}", chosen.line()))
+    Ok(format!("{line}, {how}"))
 }
 
 /// The answer `u` at `ctx` positions held to the rule: the whole load only

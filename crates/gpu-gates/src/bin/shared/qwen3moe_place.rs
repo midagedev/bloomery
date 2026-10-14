@@ -58,13 +58,6 @@ use model::placement::{
     WholeLoad, WholeNeed,
 };
 
-#[allow(
-    clippy::duplicate_mod,
-    reason = "the serving binary compiles both seats that plan a qwen35moe file, each including this one file"
-)]
-#[path = "plan_room.rs"]
-mod plan_room;
-
 /// The census readings this module took since the process began: a caller
 /// reads them around a choice of context ([`census_reads`]), so a choice
 /// that reads the census per probe shows in its counts.
@@ -125,19 +118,6 @@ pub fn choose(flag: Option<Place>, census: &[DeviceInfo]) -> Result<PlaceWhy, Ga
 enum Inputs {
     Qwen3(q3::PlanInputs),
     Qwen35(Box<q35::PlanInputs>),
-}
-
-impl Inputs {
-    /// These inputs with the host room unbounded ([`plan_room::unbounded`]),
-    /// for the file whose plan reads a room: the plan they make pages no
-    /// expert to the NVMe tier, so what it holds on the card is the card's
-    /// alone. `None` for a qwen3moe file, whose plan reads no room.
-    fn room_free(&self) -> Option<Inputs> {
-        match self {
-            Inputs::Qwen3(_) => None,
-            Inputs::Qwen35(i) => Some(Inputs::Qwen35(Box::new(plan_room::unbounded(i)))),
-        }
-    }
 }
 
 /// The plan of `inputs` over `machine` at `ctx` positions (a total) under
@@ -990,7 +970,7 @@ pub fn serve_choice(
         if let ServeLoad::Placed { q, total, .. } = &load
             && let Err(e) = q.plan(*total, o.levers)
         {
-            return short_or(e.into());
+            return short_or(e);
         }
         Ok(Probe::Holds(load))
     };
