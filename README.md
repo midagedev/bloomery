@@ -60,7 +60,7 @@ Greedy, thinking off, `--ctx-size 16384`, serving defaults, one load. The long p
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. Every number here comes from an 8-channel host; a 2-channel desktop host is not measured here and runs the CPU experts slower |
 | macOS, Apple silicon · AMD GPUs, Windows without WSL2 | Not supported yet · Not supported |
 | OpenAI and Anthropic APIs, streaming, tool calls | Every generative model |
-| Several requests at once (`--parallel`, default 1) | One pass on V4.1, GLM-5.3, Qwen3.8, MiMo-V2.6-Flash and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest. A `--parallel` you set is never lowered. `--ctx-size` alone is one request's context: the server then serves one request at that length, as llama-server does. Unset, that length is the ladder (PIN(2026-10-14)): the lesser of 262,144 and the file's limit, one slot, halved while the plan is short of the card, and of the host where the body keeps no tier past it. V4.1's limit is `workstation::CTX_MAX`, 32,768. A set value that does not fit is refused, never cut. The number rows on this page still sit at `--ctx-size 16384` |
+| Several requests at once (`--parallel`, default 1) | One pass on V4.1, GLM-5.3, Qwen3.8, MiMo-V2.6-Flash and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest. A `--parallel` you set is never lowered. `--ctx-size` alone is one request's context: the server then serves one request at that length, as llama-server does. Unset, that length is the ladder (PIN(2026-10-14)): the lesser of 262,144 and the file's limit, one slot, halved while the plan is short of the card, and of the host where the body keeps no tier past it. A set value that does not fit is refused, never cut. The number rows on this page still sit at `--ctx-size 16384` |
 | Prompt cache (Qwen3.8, GLM-5.3) | Saved states in host RAM (`--cache-ram`; by default the lesser of 8 GiB and half the RAM the plan leaves; on Qwen3.8, 0 on a plan that pages experts from NVMe). A shared prefix restores the last checkpoint inside it; a saved state keeps checkpoints at 512·2^i positions below its end. On Qwen3.8 the card's checkpoints are 4,096 positions apart, so a shared prefix shorter than that does not restore |
 | MTP draft (Qwen3.8, GLM-5.3) | On by default; its width follows measured cost |
 | Qwen3.8 prompts | Each layer seats the prompt's most-used CPU experts on the card (`--place a` and `bp`); the extra stream ring runs only under `--place a` |
@@ -76,7 +76,7 @@ Greedy, thinking off, `--ctx-size 16384`, serving defaults, one load. The long p
 - **`gate-gpu-qwen4exp-mtp` (pg) is a known gate-side red, and its fix does not ship in 0.3.2.** On an RTX A6000 the drafted plan's stage card holds 2,843,738,112 B less room than the plain plan at the same budget (15:52 KST, rc 1). This is the gate's clause, not a serving-default load refusal.
 - **Unset context is the seats' ladder (PIN(2026-10-14)).** With `--ctx-size` unset, one slot asks the lesser of
   262,144 and the file's limit and halves while the plan is short of the card, and of the host where the body keeps
-  no tier past it. V4.1's limit is `workstation::CTX_MAX`, 32,768. A set `--ctx-size` that does not fit is refused
+  no tier past it. A set `--ctx-size` that does not fit is refused
   and is never cut. `--ctx-size` sets the context by hand.
 - **Qwen3.8's MTP draft:** a request that keeps a cached prefix runs with the draft off. The prompt-state save after a
   request adds 100–160 ms to the next request's first token ([#46](https://github.com/midagedev/bloomery/issues/46)).

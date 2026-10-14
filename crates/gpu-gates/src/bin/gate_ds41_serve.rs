@@ -1278,7 +1278,7 @@ mod gate {
     /// The `ctx` clause (module header): a server with no `--ctx` (one slot,
     /// `--place gate`) prints its one `ctx` line and its `plan` record before
     /// its load, and is stopped there. The line holds its word under the
-    /// model's limit (the trained context within `workstation::CTX_MAX`;
+    /// model's limit (the trained context within the plan's i32 positions;
     /// `ctx_ladder::default_line_held`), and this gate's own one-slot plans
     /// at the server's free card bytes agree: the card holds the default, and
     /// not the rung above it when it halved. Mutants: a ladder that starts a
@@ -1315,9 +1315,7 @@ mod gate {
             trained: split
                 .arch_get_u64("context_length")
                 .ok_or("the file states no context_length")?,
-            // PIN(2026-10-14): the seat's limit, CTX_MAX until the KV pool
-            // lands; it was the trained context within i32 positions.
-            kernel: Some((workstation::CTX_MAX, "CTX_MAX")),
+            kernel: Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
             verified: None,
         }
         .limit();

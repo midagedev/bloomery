@@ -49,8 +49,7 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   do under `MTP/`, landing it beside the set, where the run picks it up), `--parallel/-np`, `--queue-depth`,
   `--cache-ram`, `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the lesser of
   262,144 and the file's limit, and halve that while the plan is short of the card — and of the host, where the body
-  keeps no tier past it — down to 4,096; one `ctx` line names the rule. V4.1's limit is `workstation::CTX_MAX`,
-  32,768. A set value is the total the slots split, and
+  keeps no tier past it — down to 4,096; one `ctx` line names the rule. A set value is the total the slots split, and
   one that does not fit is refused, never cut. PIN(2026-10-14): `generate::choose_ctx` over `ctx_ask::choose`),
   `--cache-type-k f16|q8_0` (the qwen3
   seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the

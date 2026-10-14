@@ -20,7 +20,7 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::{Chosen, PlanRefusal, Probe};
-use model::placement::workstation::{CTX_MAX, TierBatchBytes};
+use model::placement::workstation::TierBatchBytes;
 
 /// The expert tier cards the V4.1 body serves: the host tier's count
 /// (`Body::open_placed_tiered` refuses past it).
@@ -78,7 +78,7 @@ pub fn with_cards(
 
 /// A serving slot's context by the seats' common choice
 /// (`generate::choose_ctx`): the limit is the file's trained context within
-/// [`CTX_MAX`] (32,768), and a probe is the load's plan of every slot at
+/// the plan's i32 positions, and a probe is the load's plan of every slot at
 /// a slot context on `place`'s machine with `reserve` (the DSpark draft's),
 /// `tier_batch` and `vision` (the encoder's stage-card reserve), its refusal
 /// read for the memory it was short of. `set` is the total the slots split.
@@ -97,9 +97,10 @@ pub fn ctx_choice(
     choose_ctx(
         split,
         (set, slots.get()),
-        // PIN(2026-10-14): V4.1's limit is CTX_MAX until the KV pool lands (the
-        // user's decision); it was the trained context within i32 positions.
-        (Some((CTX_MAX, "CTX_MAX")), None),
+        (
+            Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
+            None,
+        ),
         |c| -> Result<Probe<()>, GateError> {
             let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
             vision_seat::reserve_on(&mut machine, vision);
