@@ -1424,6 +1424,8 @@ mod tests {
     }
 }
 
+// PIN(2026-10-14): duplicate mixer, no-HC and shaped-spec checks remain in d1; tail roles remain in hparams tests.
+// PIN(2026-10-14): card-byte tests removed with the unused sizing API.
 #[cfg(test)]
 mod in_file_tests {
     use models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, Residual};
@@ -1683,6 +1685,7 @@ mod in_file_tests {
         );
     }
 
+    // PIN(2026-10-14): require named refusal errors; the former empty-mtp contract concealed invalid tails.
     /// A shaped tail the draft refuses fails the description by name.
     /// Absent, stripped and stub tails stay a successful read with no draft.
     #[test]

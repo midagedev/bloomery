@@ -204,6 +204,7 @@ fn hw_qwen35moe_nextn_draft() {
     assert_eq!(draft.layer, read.spec.layers[39]);
     assert_eq!(mtp::EH_JOIN, ["e", "h"]);
     assert_eq!((draft.hidden, g.kv_heads, g.head_dim), (2048, 2, 256));
+    // PIN(2026-10-14): card-byte assertions removed with the unused in_file_card_bytes API.
     println!("A1 draft index {} mtp {}", draft.index, read.spec.mtp.len());
 
     let split = Split::open(A2_MINICPM).unwrap_or_else(|e| panic!("open A2: {e}"));

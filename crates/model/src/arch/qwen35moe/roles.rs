@@ -9,6 +9,8 @@
 //! layer stems or next-token stems is [`Role::Unused`], and a trunk layer
 //! carrying a next-token stem is unclassified.
 
+// PIN(2026-10-14): draft-role checks removed with nextn_role, which had no engine consumer.
+
 use gguf::Split;
 
 use super::hparams::{Hparams, Variant};
