@@ -1,6 +1,6 @@
-# PF-1 mechanism A/B. Qwen3.6-35B-A3B Q4_K_M, one pass of 5 ids, tile arm minus the
-# _sel arm. Absolute milliseconds. Not a percent of the 5.16 ms decode step, and not
-# the Spark floor.
+# PF-1 mechanism A/B. Qwen3.6-35B-A3B Q4_K_M, one pass of 5 ids, _sel arm minus the
+# tile arm. Absolute milliseconds. Not a percent of the 5.16 ms decode step, and not
+# the Spark estimate.
 #
 # Census (header only): 20 layers have Q4_K gate, up and down (ids 5, 6, 8, 9, 11,
 # 12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30, 32, 33). The other 20 downs are
@@ -17,7 +17,7 @@
 # Certain term, shared expert only, no routed repeat: 4*1,769,472*20 = 141,557,760 B.
 # 0.250 ms at 567 GB/s and 0.202 ms at 701 GB/s, then the same 0.051 ms tax: 0.199 ms
 # and 0.151 ms. Uniform is the low-overlap extra on the routed term. Correlated
-# routing saves more and lands above this band. The Spark floor (1.29–1.52 ms) is a
+# routing saves more and lands above this band. The Spark estimate (1.29–1.52 ms) is a
 # different model and stays [derived]. It is not this prediction.
 kind: profile
 question: on a whole-card Qwen3.6 Q4_K_M, does one m=5 prefill on the tile arm finish faster than the _sel arm by the derived expert-read saving?
