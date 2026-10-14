@@ -92,11 +92,9 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
+pub use model::mamba2::STATE;
 use model::mamba2::{Checked, Geom};
 use std::sync::Arc;
-
-/// The one state length the scan runs: lane `l` of a warp holds `n = l + 32j`.
-pub const STATE: usize = 128;
 
 /// Warps of a block.
 const WARPS: usize = 4;
@@ -112,7 +110,6 @@ const STAGED: usize = 2 * STATE + CH_PER_BLOCK;
 // The entries' launch attributes spell the block out as a literal, and the
 // scan and the conv are written for these widths.
 const _: () = assert!(BLOCK == 128 && STATE == 128 && CONV_TAPS == 4 && CH_PER_BLOCK == 16);
-const _: () = assert!(STATE == model::mamba2::STATE);
 
 #[cuda_module]
 mod mamba2_kernels {
@@ -423,11 +420,8 @@ mod mamba2_kernels {
             i += 1;
         }
         let mean = (total / width as f64) as f32;
-        let fin = mean.is_finite();
-        if !fin && tid == 0 {
-            fault.raise(FaultSite::Mamba2Scan);
-        }
-        let scale = if fin {
+        // A non-finite mean gives a NaN scale: each `o` below is NaN and raises.
+        let scale = if mean.is_finite() {
             1.0 / (mean + eps).sqrt()
         } else {
             f32::NAN
