@@ -102,6 +102,7 @@ generate_ds41   ds41_tap_means                           0           0
 generate_ds41   embed_rows                               0           0
 generate_ds41   embed_rows_q3k                           0           0
 generate_ds41   embed_rows_q4k                           0           0
+generate_ds41   embed_rows_q5_0                          0           0
 generate_ds41   embed_rows_q5k                           0           0
 generate_ds41   embed_rows_q6k                           0           0
 generate_ds41   embed_rows_q8_0                          0           0
@@ -147,6 +148,7 @@ generate_ds41   gqa_flash_seg                            0           0
 generate_ds41   gqa_flash_seg_256                        0           0
 generate_ds41   gqa_flash_seg_256_p2                     0           0
 generate_ds41   gqa_flash_seg_256_p4                     0           0
+generate_ds41   gqa_flash_seg_g5                         0           0
 generate_ds41   gqa_flash_seg_k192                       0           0
 generate_ds41   gqa_flash_seg_k192_ring                  0           0
 generate_ds41   gqa_flash_seg_mma                        0           0
@@ -307,6 +309,7 @@ generate_ds41   qwen3moe_router_norm_m_prefetch          0           0
 generate_ds41   qwen3moe_router_norm_prefetch            0           0
 generate_ds41   qwen3moe_router_route                    0           0
 generate_ds41   qwen3moe_token_major                     0           0
+generate_ds41   relu_sqr                                 0           0
 generate_ds41   rms_norm                                 0           0
 generate_ds41   rope                                     0           0
 generate_ds41   router_topk                              0           0
@@ -349,6 +352,7 @@ gate_e2e   ds41_markov                              0           0
 gate_e2e   embed_rows                               0           0
 gate_e2e   embed_rows_q3k                           0           0
 gate_e2e   embed_rows_q4k                           0           0
+gate_e2e   embed_rows_q5_0                          0           0
 gate_e2e   embed_rows_q5k                           0           0
 gate_e2e   embed_rows_q6k                           0           0
 gate_e2e   embed_rows_q8_0                          0           0
@@ -391,6 +395,7 @@ gate_e2e   gqa_flash_seg                            0           0
 gate_e2e   gqa_flash_seg_256                        0           0
 gate_e2e   gqa_flash_seg_256_p2                     0           0
 gate_e2e   gqa_flash_seg_256_p4                     0           0
+gate_e2e   gqa_flash_seg_g5                         0           0
 gate_e2e   gqa_flash_seg_k192                       0           0
 gate_e2e   gqa_flash_seg_k192_ring                  0           0
 gate_e2e   gqa_flash_seg_mma                        0           0
@@ -547,6 +552,7 @@ gate_e2e   qwen3moe_router_norm_m_prefetch          0           0
 gate_e2e   qwen3moe_router_norm_prefetch            0           0
 gate_e2e   qwen3moe_router_route                    0           0
 gate_e2e   qwen3moe_token_major                     0           0
+gate_e2e   relu_sqr                                 0           0
 gate_e2e   rms_norm                                 0           0
 gate_e2e   rope                                     0           0
 gate_e2e   router_topk                              0           0
