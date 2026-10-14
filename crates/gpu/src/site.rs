@@ -141,10 +141,10 @@ impl SiteTy {
         }
     }
 
-    /// The kernel table's launch family of this type (`SiteEntry`).
+    /// The activation form the site's launch reads (`SiteEntry::reads`).
     #[must_use]
-    pub const fn entry(self) -> SiteEntry {
-        match self {
+    pub const fn reads(self) -> Form {
+        (match self {
             SiteTy::Q3K => SiteEntry::Q3k,
             SiteTy::Q4K => SiteEntry::Q4k,
             SiteTy::Q5K => SiteEntry::Q5k,
@@ -152,13 +152,8 @@ impl SiteTy {
             SiteTy::Q5_0 => SiteEntry::Q5_0,
             SiteTy::Q8_0 => SiteEntry::Q8_0,
             SiteTy::F32 => SiteEntry::F32,
-        }
-    }
-
-    /// The activation form the site's launch reads (`SiteEntry::reads`).
-    #[must_use]
-    pub const fn reads(self) -> Form {
-        self.entry().reads()
+        })
+        .reads()
     }
 }
 
@@ -391,19 +386,6 @@ pub fn kgemv(
     }
 }
 
-/// The resident packed Q5_0 weight of `name`, or a named refusal: absent
-/// and any other variant are both "a packed Q5_0 weight".
-fn packed_q5_0<'w>(
-    w: &'w Weights,
-    what: &'static str,
-    name: &str,
-) -> Result<&'w DeviceTensor<u32>, GpuError> {
-    match w.get(name) {
-        Some(DevWeight::Q5_0 { w, .. }) => Ok(w),
-        _ => Err(GpuError::tensor(what, name, "a packed Q5_0 weight")),
-    }
-}
-
 /// `y = W · act` for Q5_0 site `name` over the `act.m()` columns of the
 /// `Q8Blocks32` rows `act`, row-major (`y[r · m + c]`). The weight is the
 /// packed plane [`Weights::load_where`] uploads (`pack_q5_0`, the one
@@ -423,7 +405,10 @@ pub fn blocks32_gemv(
             format!("{name} is {ty}: `site::blocks32_gemv` runs a Q5_0 site"),
         ));
     };
-    let wt = packed_q5_0(w, WHAT, name)?;
+    let wt = match w.get(name) {
+        Some(DevWeight::Q5_0 { w, .. }) => w,
+        _ => return Err(GpuError::tensor(WHAT, name, "a packed Q5_0 weight")),
+    };
     gpu.q5()
         .enqueue_gemv_q5_0(gpu.stream(), wt, act, 0, wt.rows(), 0, act.m(), y, 0)
 }

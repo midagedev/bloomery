@@ -226,8 +226,8 @@ fn run() -> Result<(), GateError> {
 /// synthetic GGUF loaded through `Weights::load_where`, so the bytes are
 /// packed by the `pack_q5_0` upload and by nothing else. The launch is
 /// `site::blocks32_gemv` (one expert, `row0 = 0`), and the reference dot
-/// runs on the 32-value quantization the kernel consumes (`q8_hat`, the
-/// same reconstruction `gate_p2` uses). A refused launch fails on its own
+/// runs on the 32-value quantization the kernel consumes (the shared host
+/// quantizer `gemm32::host_act`, reconstructed as `q·d`). A refused launch fails on its own
 /// line; a launch that writes the wrong rows fails `max_rel_err <= KERNEL_BAND`.
 #[cfg(feature = "gpu")]
 fn q5_0_dense_site(gpu: &bloomery_gpu::Gpu) -> Result<bool, GateError> {
@@ -286,7 +286,14 @@ fn q5_0_dense_site(gpu: &bloomery_gpu::Gpu) -> Result<bool, GateError> {
         stream.synchronize()?;
         let y2 = y_dev.to_host_vec(stream)?;
         let bit_same = bits_equal(&y1, &y2);
-        let y_ref = ref_gemv(GgmlType::Q5_0, &raw, K, ROWS, &q8_hat(&x, K), M)?;
+        let (reference_act, _) = bloomery_gpu_gates::gemm32::host_act(&x, K, M);
+        let xq: Vec<f32> = reference_act
+            .codes
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| f32::from(q) * reference_act.d[i / 32])
+            .collect();
+        let y_ref = ref_gemv(GgmlType::Q5_0, &raw, K, ROWS, &xq, M)?;
         let rel = max_rel_err(&y1, &y_ref)?;
         println!(
             "shape q5_0_dense_site T=Q5_0 K={K} rows={ROWS} m={M} max_rel_err={rel:.3e} \
@@ -303,8 +310,9 @@ fn q5_0_dense_site(gpu: &bloomery_gpu::Gpu) -> Result<bool, GateError> {
         }
         Ok(ok)
     })();
-    let _ = std::fs::remove_dir_all(&dir);
-    outcome
+    let cleanup =
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("q5_0_dense_site cleanup: {e}"));
+    outcome.and_then(|ok| cleanup.map(|()| ok).map_err(Into::into))
 }
 
 /// `rows` of Q5_0, `k` values each. Block scale is f16 of `row + 1` and the
@@ -322,26 +330,6 @@ fn q5_0_rows(rows: usize, k: usize) -> Vec<u8> {
         }
     }
     bytes
-}
-
-/// Host mirror of the 32-value quantizer `enqueue_quantize_q8` writes into
-/// `Q8Blocks32`: per block, `d = amax/127` (1.0 when the block is 0) and
-/// `round(x/d)` clamped to ±127, reconstructed as `q·d`. The same
-/// reconstruction `gate_p2`'s `q8_hat` uses, so the band measures the gemv.
-#[cfg(feature = "gpu")]
-fn q8_hat(x: &[f32], k: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; x.len()];
-    for col in 0..x.len() / k {
-        for b in 0..k / 32 {
-            let vals = &x[col * k + 32 * b..][..32];
-            let amax = vals.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-            for (o, &v) in out[col * k + 32 * b..][..32].iter_mut().zip(vals) {
-                *o = (v / d).round().clamp(-127.0, 127.0) * d;
-            }
-        }
-    }
-    out
 }
 
 /// The quantizers' fault contract on planted input. The pinned shapes above

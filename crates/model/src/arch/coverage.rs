@@ -1279,7 +1279,12 @@ mod tests {
                     &none,
                 );
             }
-            for ty in [GgmlType::BF16, GgmlType::F16, GgmlType::IQ4_XS] {
+            for ty in [
+                GgmlType::BF16,
+                GgmlType::F16,
+                GgmlType::IQ4_XS,
+                GgmlType::Q5_0,
+            ] {
                 let item = format!(
                     "{ty} attention matrices (the body's dense sites: the types qwen3moe_dense \
                      names)"

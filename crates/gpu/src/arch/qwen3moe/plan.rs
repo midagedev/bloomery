@@ -18,10 +18,10 @@
 //! cross-checked with its interval key by the reader — never from the
 //! layer's number.
 
+use super::body::ggml_ty as ggml_of;
 use super::router::RouterDims;
 use crate::GpuError;
 use crate::linear::{self, LinearShape};
-use gguf::quant::GgmlType;
 pub(super) use model::arch::coverage::{DownEntry, GateUpEntry};
 use model::arch::coverage::{SiteEntry, qwen35_down, qwen35_gate_up, qwen35_shared, turns_as_neox};
 use model::arch::models::shape::{AttnShape, GroupRule, MoeShape, select_gqa};
@@ -306,19 +306,6 @@ impl FfnPlan {
             } => Some(sh),
             FfnRoute::Router { .. } | FfnRoute::Dense => None,
         }
-    }
-}
-
-/// The file type a site of `ty` reads: the inverse of [`SiteTy::of_ggml`].
-const fn ggml_of(ty: SiteTy) -> GgmlType {
-    match ty {
-        SiteTy::Q3K => GgmlType::Q3_K,
-        SiteTy::Q4K => GgmlType::Q4_K,
-        SiteTy::Q5K => GgmlType::Q5_K,
-        SiteTy::Q6K => GgmlType::Q6_K,
-        SiteTy::Q5_0 => GgmlType::Q5_0,
-        SiteTy::Q8_0 => GgmlType::Q8_0,
-        SiteTy::F32 => GgmlType::F32,
     }
 }
 
