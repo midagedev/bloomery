@@ -20,15 +20,11 @@
 //! load asks for: its weights' granules, its cache planes' granules for
 //! every resident slot the load serves ([`kv_bytes`]), and the program's own
 //! arena and the reserve its load keeps free past it — and when it does
-//! not, the placed plan on the same card. The serve seat's unset
-//! `--ctx` default lives here too ([`default_ctx_qwen3`], [`default_ctx_qwen35`]:
-//! the common rule over the whole load or a placed one), and its resident slots open a
-//! placed plan through [`open_qwen3_slots`] and [`open_qwen35_slots`]. A
-//! seat's placed plan counts what its resident sequences hold past the plan's
-//! one-sequence terms ([`Seqs`]): on the card the stores no position moves,
-//! once a sequence past the live one; on the host the checkpoints a
-//! qwen35moe sequence's prompt calls pin. Every census reading the module
-//! takes and every probe its searches run is counted ([`reads`]).
+//! not, the placed plan on the same card. The serve seat chooses its
+//! context and load through [`serve_choice`]. Its resident slots open
+//! through [`open_qwen3_slots`] and [`open_qwen35_slots`]; [`Seqs`]
+//! counts their stores and checkpoints. [`census_reads`] counts census
+//! readings; [`serve_choice`] returns each choice's probe count.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -782,7 +778,7 @@ pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> 
 /// What a run with `--place` unset loads, as [`unplaced_qwen3_slots`]
 /// decides it, of a qwen35moe file under `o` at `o.ctx` positions — the
 /// total its `seqs` split: the whole-fit verdict of every slot's stores at
-/// its share ([`default_ctx_qwen35`]'s count) over the program's own arena and
+/// its share over the program's own arena and
 /// reserve as a slot's load gives them ([`qwen35_whole`] at [`share`]); the
 /// placed plan on `a`'s card, carrying the sequences' rows ([`laid`]), when
 /// it does not take it; the image `encoder`'s bytes are in the verdict and in

@@ -876,21 +876,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     chosen.record().eprint();
     // The lane's rate, taken before the plan reads the room (`lane_of`).
     let lane = lane_at(chosen.place)?;
-    // The unset draft's yield to the context (qwen38's module doc, the one
-    // rule through `bloomery_levers::DraftYield`): the chosen placement's
-    // search is the drafted load's own — its fit is the positions a slot
-    // gets with the draft — and under [`CTX`] the plain search, the
-    // draft-off load's own, decides: it holds more, and the NextN layer's
-    // card bytes leave a slot under the base the plain rule aims for, so
-    // the draft goes off, the plain placement replaces this one and one
-    // `draft yield` record names both; a serving cap that binds the two
-    // fits together keeps the draft. A set `--ctx` or `BLOOMERY_DRAFT`
-    // never asks, and the placement's own choice (`chosen`, planned with
-    // the NextN layer) stands: a card small enough to yield holds no tier
-    // either way. The default's second slot that the plan refuses falls to
-    // one slot (`from=fit`), the placement stays the one chosen at the asked
-    // count; a count the flags set is never lowered. An attempt prints
-    // nothing: the record is returned and printed once the count stands.
+    // An unset draft yields when the plain load serves more positions.
+    // A set context can yield if only its plain plan holds; a set draft never yields.
+    // The selected placement and slot count stay fixed.
     let drafted = plan_place(chosen.place, (a.ctx, slots));
     // The draft is unset, so it yields to the context, set or not: the
     // context comes first.

@@ -196,20 +196,6 @@ impl PlanInputs {
         })
     }
 
-    /// The same inputs at an unbounded host room (`HostRead::Given` of every
-    /// byte, no arena): the plan they make pages no expert to the NVMe tier,
-    /// so what it holds on the card is the card's alone. A machine whose
-    /// card shares the host's memory has no such plan: the pool is the
-    /// card's room.
-    #[must_use]
-    pub fn room_free(&self) -> PlanInputs {
-        PlanInputs {
-            room: (u64::MAX, HostRead::Given),
-            arena: None,
-            ..self.clone()
-        }
-    }
-
     /// Every feature of the file the engine does not run, as
     /// [`coverage::check`] lists them. Empty for a file the program runs.
     pub fn unimplemented(&self) -> Vec<Unimplemented> {
@@ -426,7 +412,7 @@ mod tests {
         SeqTerms, Stores, card_routed,
     };
     use crate::arch::synthetic::{V, header_shaped};
-    use crate::placement::workstation::{self, HostRead};
+    use crate::placement::workstation;
 
     /// A layer's rows: its own KV-head count's key and value rows in f16 a
     /// position. Layers 1 and 2 are a window of 8; 0 and 3 are full. At 9
@@ -677,37 +663,6 @@ mod tests {
              149000000000 B (plan room 149000000000 B), and the MiMo engine serves no NVMe \
              expert tier; free host memory (the room is the host's available bytes, or \
              BLOOMERY_HOST_ROOM where set)"
-        );
-    }
-
-    /// The card probe's inputs are the file's at an unbounded given room and
-    /// no arena, and nothing else changes.
-    #[test]
-    fn room_free_unbounds_the_room_alone() {
-        let path = header_shaped(
-            "mimo2-place-room-free",
-            "mimo2",
-            &keys(),
-            &[
-                ("tokenizer.ggml.pre", V::Str("qwen2")),
-                ("tokenizer.chat_template", V::Str("{{ messages }}")),
-            ],
-            &tensors(),
-        );
-        let split = Split::open(&path).expect("the synthetic header opens");
-        let mut inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
-        let _ = std::fs::remove_file(&path);
-        inputs.room = (7, HostRead::MemAvailable);
-        inputs.arena = Some(3);
-        let free = inputs.room_free();
-        assert_eq!(free.room, (u64::MAX, HostRead::Given));
-        assert_eq!(free.arena, None);
-        assert_eq!(free.hp, inputs.hp);
-        assert_eq!(free.model.layers, inputs.model.layers);
-        assert_eq!(
-            inputs.room,
-            (7, HostRead::MemAvailable),
-            "the original stays"
         );
     }
 

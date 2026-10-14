@@ -1036,12 +1036,12 @@ mod gate {
     /// (`generate::choose_ctx_of`): the file's trained context, verified up
     /// to `ORACLE_POSITIONS`, the lesser, with its name.
     fn glm_limit(inputs: &PlanInputs) -> Result<(u64, &'static str), GateError> {
-        let trained = u64::try_from(inputs.hp.n_ctx_train)?;
-        Ok(if ORACLE_POSITIONS < trained {
-            (ORACLE_POSITIONS, "ORACLE_POSITIONS")
-        } else {
-            (trained, "trained")
-        })
+        Ok(model::placement::ctx::CtxLimit {
+            trained: u64::try_from(inputs.hp.n_ctx_train)?,
+            kernel: None,
+            verified: Some((ORACLE_POSITIONS, "ORACLE_POSITIONS")),
+        }
+        .limit())
     }
 
     /// The plan's stage-card expert bytes, NVMe expert bytes and NVMe arena
