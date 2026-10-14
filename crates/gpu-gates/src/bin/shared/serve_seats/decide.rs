@@ -574,22 +574,28 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
         let card = Place::A.on(&census)?.card_specs()?[0];
         let reserve = image.as_ref().and_then(|o| o.seat.reserve);
         let media = image.is_some();
-        let chosen = choose_ctx(&file, (l.ctx, 1), (None, None), |c| -> Result<_, GateError> {
-            let ctx = usize::try_from(c).map_err(|e| format!("a context of {c} positions: {e}"))?;
-            let shape = crate::qwen35_open::open_shape(ctx, media);
-            let need = crate::qwen35_open::whole_verdict(&file, shape, card, &|machine| {
-                vision_seat::reserve_on(machine, reserve);
-            })?;
-            Ok(if need.fits() {
-                Probe::Holds(())
-            } else {
-                Probe::Short(Short {
-                    on: Side::Card,
-                    need: need.need,
-                    room: need.budget,
+        let chosen = choose_ctx(
+            &file,
+            (l.ctx, 1),
+            (None, None),
+            |c| -> Result<_, GateError> {
+                let ctx =
+                    usize::try_from(c).map_err(|e| format!("a context of {c} positions: {e}"))?;
+                let shape = crate::qwen35_open::open_shape(ctx, media);
+                let need = crate::qwen35_open::whole_verdict(&file, shape, card, &|machine| {
+                    vision_seat::reserve_on(machine, reserve);
+                })?;
+                Ok(if need.fits() {
+                    Probe::Holds(())
+                } else {
+                    Probe::Short(Short {
+                        on: Side::Card,
+                        need: need.need,
+                        room: need.budget,
+                    })
                 })
-            })
-        })?;
+            },
+        )?;
         eprintln!("{}", chosen.line());
         let ctx = usize::try_from(chosen.slot_ctx)?;
         drop(file);

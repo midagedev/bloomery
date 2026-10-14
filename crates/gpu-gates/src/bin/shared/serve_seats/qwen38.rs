@@ -353,8 +353,8 @@ use model::arch::qwen35moe::place::{
     Experts, MtpInputs, PlaceError, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx,
     tier_batch,
 };
-use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
 use model::placement::churn::ChurnPool;
+use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
 use model::placement::workstation::{CardSpec, HostNeed, HostRead, host_available_read};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
@@ -837,8 +837,13 @@ impl Plans<'_> {
         )?;
         match self.mtp {
             None => {
-                self.inputs
-                    .plan_with_slots(&machine, ctx, self.levers, self.experts, self.slots)?;
+                self.inputs.plan_with_slots(
+                    &machine,
+                    ctx,
+                    self.levers,
+                    self.experts,
+                    self.slots,
+                )?;
             }
             Some(mi) => {
                 self.inputs.plan_mtp_with_slots(
@@ -1265,36 +1270,34 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // one runs, and an unset one the plan would draft — or that only its
     // yield to the context turned off on the plan this load abandons — goes
     // off naming the paged rule, at either point.
-    let reduced = |arena: u64,
-                   (slots, served): (usize, usize),
-                   mtp: bool,
-                   draft_off: Option<Draft38Off>| {
-        let at = paged_at(arena, slots, mtp);
-        let asked_on = at.asked_draft(draft_off.as_ref());
-        let (drafts, draft_off) = bloomery_levers::paged_draft(&at, draft_off);
-        eprintln!(
-            "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
+    let reduced =
+        |arena: u64, (slots, served): (usize, usize), mtp: bool, draft_off: Option<Draft38Off>| {
+            let at = paged_at(arena, slots, mtp);
+            let asked_on = at.asked_draft(draft_off.as_ref());
+            let (drafts, draft_off) = bloomery_levers::paged_draft(&at, draft_off);
+            eprintln!(
+                "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
              slots={served} draft={} (the plan pages host experts through the NVMe tier's RAM \
              arena; {})",
-            if asked_on { "on" } else { "off" },
-            if drafts { "on" } else { "off" },
-            if served < slots {
-                "an unset count serves one slot: a second slot's KV takes card bytes that \
+                if asked_on { "on" } else { "off" },
+                if drafts { "on" } else { "off" },
+                if served < slots {
+                    "an unset count serves one slot: a second slot's KV takes card bytes that \
                  experts would hold, and a later budget rule prices that trade"
-            } else {
-                "a set count is served as one pass over the arena"
-            }
-        );
-        (
-            if served < slots {
-                SlotsFrom::Paged
-            } else {
-                from
-            },
-            drafts,
-            draft_off,
-        )
-    };
+                } else {
+                    "a set count is served as one pass over the arena"
+                }
+            );
+            (
+                if served < slots {
+                    SlotsFrom::Paged
+                } else {
+                    from
+                },
+                drafts,
+                draft_off,
+            )
+        };
     let early = match a.ctx.map(|c| c / slots) {
         Some(ctx) if ctx > 0 && (slots > 1 || mtp) => {
             let plain = Plans {

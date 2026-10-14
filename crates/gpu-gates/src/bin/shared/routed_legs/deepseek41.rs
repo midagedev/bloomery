@@ -41,7 +41,10 @@ impl Adapter for Row {
         match PlanInputs::read(split).map_err(|e| refused_of(&e)) {
             Ok(inputs) => {
                 let inputs = Arc::new(inputs);
-                vec![arm(&inputs, "cli", None), arm(&inputs, "serve", Some(split))]
+                vec![
+                    arm(&inputs, "cli", None),
+                    arm(&inputs, "serve", Some(split)),
+                ]
             }
             // The file is read once; a refusal of it is each arm's.
             Err(refusal) => vec![Err(refusal.clone()), Err(refusal)],

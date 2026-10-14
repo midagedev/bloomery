@@ -458,8 +458,7 @@ mod gate {
     use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, checkpoint_budget38,
-        seq38_bytes,
+        Body38, CHECKPOINT_EVERY, checkpoint_budget38, seq38_bytes,
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
@@ -3626,10 +3625,13 @@ mod gate {
         // (`placement::ctx::PastLimit`).
         let named = if card_bounds1 {
             let largest = fit1 as u64 / ctx_ladder::STEP * ctx_ladder::STEP;
-            let head =
-                format!("--ctx {over} over 1 slot(s) asks {over} positions a slot, and the card holds ");
+            let head = format!(
+                "--ctx {over} over 1 slot(s) asks {over} positions a slot, and the card holds "
+            );
             let tail = if largest >= ctx_ladder::FLOOR {
-                format!("a slot holds at most {largest} here; ask {largest} or less, or fewer slots")
+                format!(
+                    "a slot holds at most {largest} here; ask {largest} or less, or fewer slots"
+                )
             } else {
                 format!(
                     "not even {} positions a slot fit; ask fewer slots or a smaller model file",

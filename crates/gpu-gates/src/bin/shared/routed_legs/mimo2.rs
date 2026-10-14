@@ -21,9 +21,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use super::{
-    Adapter, Arm, Outcome, Refusal, floor_or, outcome_of, probed, refused_of, view_of,
-};
+use super::{Adapter, Arm, Outcome, Refusal, floor_or, outcome_of, probed, refused_of, view_of};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::choose_ctx;
 use bloomery_gpu_mimo2::swap;

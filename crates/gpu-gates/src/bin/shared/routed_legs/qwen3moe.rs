@@ -43,7 +43,8 @@ impl Adapter for Row {
             encoder: None,
         };
         let serve = floor_or(
-            q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts).map(|(chosen, _)| chosen.total),
+            q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
+                .map(|(chosen, _)| chosen.total),
         )
         .map_err(|e| outcome_of(e.as_ref()))
         .and_then(|total| {
