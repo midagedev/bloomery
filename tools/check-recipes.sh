@@ -236,8 +236,23 @@ blk_q38srv() { tool_selftest ref/q38-3090-server.sh; }
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
 blk_maccheck() { tool_selftest mac-check.sh; }
 # gate-batch.sh's placement rules (the v41-load lane, a batch or a solo recipe's arm as an item, a cold
-# build's times row) on a fixture justfile and fixture times rows, no box.
-blk_gatebatch() { tool_selftest gate-batch.sh; }
+# build's times row) on a fixture justfile and fixture times rows, no box. The block prints the three
+# slowest cases and then the count, which stays the block's last line.
+blk_gatebatch() {
+  local out slow
+  if ! out=$(bash "$(dirname "$0")/gate-batch.sh" --self-test 2>&1); then
+    printf '%s\n' "$out" >&2
+    echo "check-recipes: the gate-batch self-test failed" >&2
+    return 1
+  fi
+  slow=$(printf '%s\n' "$out" | grep '^gate-batch self-test: slowest cases: ' | tail -n 1)
+  if [ -z "$slow" ]; then
+    echo "check-recipes: the gate-batch self-test printed no slowest-cases line" >&2
+    return 1
+  fi
+  printf '%s\n' "$slow"
+  printf '%s\n' "${out##*$'\n'}"
+}
 # gpu-gate.sh's card choice, its lease refusals and the V4.1 load lock, against lock files of its own and
 # a stub nvidia-smi (flock and timeout stand-ins where the host has none, as on the Mac), no card.
 blk_gpugate() {

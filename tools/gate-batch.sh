@@ -1567,10 +1567,11 @@ FP
   fi
   if gb_part 7; then
   # (10) a lane killed while it holds the mutex: the batch ends by name inside a bound, never a
-  # wait without end. The deaf-watch mutant hangs instead and the case kills it.
+  # wait without end. The deaf-watch mutant hangs instead and the case kills it. steal-slow's one
+  # second lets the member's command reach seen.log; v41-a's hold is the mutex.
   fresh_state "$t/target/c-ch-kill"
   BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill.tsv \
-    "${gb[@]}" --out "$t/target/c-ch-kill" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-kill.log" 2>&1 &
+    "${gb[@]}" --out "$t/target/c-ch-kill" --round-ledger 'steal-slow@FAKE_SLEEP=1' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-kill.log" 2>&1 &
   sp=$!
   k=0
   while ! grep -q 'gen_y' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
@@ -1598,7 +1599,7 @@ FP
   mutant_of ch-deaf "s|^      \*) dead_now=\"\\\$dead_now \\\$lane\"; continue ;;\$|      *) continue ;; # MUTANT ch-deaf|" '# MUTANT ch-deaf$'
   fresh_state "$t/target/c-ch-killm"
   BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill.tsv \
-    bash "$t/tools/gate-batch-ch-deaf.sh" --out "$t/target/c-ch-killm" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-killm.log" 2>&1 &
+    bash "$t/tools/gate-batch-ch-deaf.sh" --out "$t/target/c-ch-killm" --round-ledger 'steal-slow@FAKE_SLEEP=1' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-killm.log" 2>&1 &
   sp=$!
   k=0
   while ! grep -q 'gen_y' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
@@ -1608,7 +1609,8 @@ FP
   kill -TERM "$(cat "$t/target/c-ch-killm/lane-A.pid")"
   k=0
   hung=0
-  while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 15 ]; do
+  # The watch declares a lane dead on two sweeps a second apart. Four seconds is those two, twice.
+  while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 4 ]; do
     sleep 1
     k=$((k + 1))
   done
@@ -1625,7 +1627,7 @@ FP
   # alternate and never twice in a row, and wait without end.
   fresh_state "$t/target/c-ch-kill2"
   BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill2.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill2.tsv \
-    "${gb[@]}" --out "$t/target/c-ch-kill2" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-kill2.log" 2>&1 &
+    "${gb[@]}" --out "$t/target/c-ch-kill2" --round-ledger 'steal-slow@FAKE_SLEEP=1' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-kill2.log" 2>&1 &
   sp=$!
   k=0
   while ! grep -q 'gen_y' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do

@@ -27,7 +27,8 @@
 # machine sets x86-64-v3 (tools/nightly/run.sh); the unit runner is the same code (tools/nightly/units.sh).
 #
 # Output: a header (commit, host, toolchain, RUSTFLAGS), one line per unit `<name> rc=<N> <secs>s` (a red unit then names its
-# failing tests and its first red lines), a `DONE tier=… total=… red=… wall=…s` line; each unit's full log is in
+# failing tests and its first red lines, then prints that unit's log whole — the CI step keeps this stdout, and the file
+# under target/ is not uploaded), a `DONE tier=… total=… red=… wall=…s` line; each unit's full log is also in
 # target/contrib-check/<time>/<name>.log. A host without GNU `timeout` (macOS) runs units unbounded, and the header says so;
 # the bound elsewhere is CONTRIB_UNIT_BOUND seconds a unit (default 1200), BLOOMERY_GATE_BOUND for tools/gate.sh.
 # CONTRIB_INJECT_FAIL=1 adds one deliberately failing unit, `inject-fail`: the red path end to end.
@@ -226,6 +227,8 @@ while IFS=$'\t' read -r name cmd; do
     REDNAMES="$REDNAMES $name"
     unit_failure "$name" "$UNIT_RC" "$log" "$BOUND" | sed 's/^/  /'
     echo "  log: $log"
+    # The whole log. CI keeps this step's stdout; target/contrib-check is not uploaded.
+    sed 's/^/  | /' "$log"
   fi
 done < "$PLAN"
 echo "DONE tier=$TIER total=$TOTAL red=$RED wall=$((SECONDS - START))s${REDNAMES:+ red:$REDNAMES}"
