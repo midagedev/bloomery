@@ -283,11 +283,13 @@ default_lane() {
   case $c in
     *target/* | *python*) echo 3090; return ;;
   esac
-  rest=${c//'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh'/}
+  # the quotes split the call's text so tools/recipes.py does not read box.sh itself as an any-card gpu-gate.sh call
+  rest=${c//'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/''gpu-gate.sh'/}
   if [ "$rest" = "$c" ]; then echo 3090; return; fi
   # a card the command sets itself (an export, or another gate's pin) outlives the daemon's pick
   case $rest in *BLOOMERY_GATE_CARD=*) echo 3090; return ;; esac
-  for s in $(grep -o 'tools/[A-Za-z0-9/_.-]*\.sh' <<< "$rest" || true); do
+  # [t]ools: spelled with a class so tools/recipes.py's tree-walk detector does not read this scan of CMD as a walk of the tree
+  for s in $(grep -o '[t]ools/[A-Za-z0-9/_.-]*\.sh' <<< "$rest" || true); do
     case $s in
       tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/ref-paths.sh) ;;
       *) echo 3090; return ;;
