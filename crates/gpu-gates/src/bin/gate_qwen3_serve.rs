@@ -441,7 +441,10 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
-    use bloomery_gpu_gates::generate::{CTX_GRAN, Place};
+    use bloomery_gpu_gates::ctx_ladder::{
+        ctx_line, default_line_held, rung_above, rungs, target_of,
+    };
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
         self, Answer, PrefixTurns, Served, agree, beside, chat_is_those_ids, check, curl,
@@ -694,80 +697,6 @@ mod gate {
             .collect()
     }
 
-    /// The `ctx` line of a server's stderr
-    /// (`ctx rule=… ctx=… slots=… total=… limit=… (…)[ from=… card-short
-    /// need=… room=…]`, `placement::ctx_ask::Chosen::line`): the one line,
-    /// `None` when there is none or more than one.
-    fn ctx_line(log: &str) -> Option<&str> {
-        let mut lines = log.lines().filter(|l| l.starts_with("ctx rule="));
-        let one = lines.next()?;
-        lines.next().is_none().then_some(one)
-    }
-
-    /// The context an unset `--ctx` asks a slot first: [`TARGET`] or the
-    /// file's `trained` context, the lesser, down to a [`CTX_GRAN`] step,
-    /// never under the base a slot ([`SEAT_FLOOR`]) a file trained past it
-    /// holds.
-    fn target_of(trained: u64) -> u64 {
-        let step = CTX_GRAN as u64;
-        let cap = TARGET.min(trained);
-        (cap / step * step).max(SEAT_FLOOR.min(cap))
-    }
-
-    /// The rungs an unset `--ctx` asks a slot, in order: the target
-    /// ([`target_of`]), then each rung's half down to a [`CTX_GRAN`] step,
-    /// [`SEAT_FLOOR`] where the half falls under it, which is the last.
-    fn rungs(trained: u64) -> Vec<u64> {
-        let step = CTX_GRAN as u64;
-        let target = target_of(trained);
-        let mut rungs = vec![target];
-        while let Some(&last) = rungs.last() {
-            let next = (last / 2 / step * step).max(SEAT_FLOOR.min(target));
-            if next == last {
-                break;
-            }
-            rungs.push(next);
-        }
-        rungs
-    }
-
-    /// The rung an unset `--ctx` asked a slot before `ctx`; `None` when
-    /// `ctx` is the target or no rung.
-    fn rung_above(trained: u64, ctx: u64) -> Option<u64> {
-        let rungs = rungs(trained);
-        let at = rungs.iter().position(|&r| r == ctx)?;
-        at.checked_sub(1).map(|i| rungs[i])
-    }
-
-    /// Whether the `ctx` line of an unset `--ctx` on `slots` slots of a file
-    /// trained at `trained` holds its word: `target` asks the target and
-    /// took it; `halved` asked it (`from`), found the card short of the
-    /// rung above its context (`need` past `room`) and took a rung below;
-    /// the slots are `slots`, the total their sum, the limit the trained
-    /// context. `None` when the line or one of its terms is missing.
-    fn default_line_held(line: &str, slots: u64, trained: u64) -> Option<bool> {
-        let rule = line
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix("rule="))?;
-        let num = |k: &str| field_u64(line, k);
-        let (ctx, n, total, limit) = (num("ctx")?, num("slots")?, num("total")?, num("limit")?);
-        let by_word = match rule {
-            "target" => ctx == target_of(trained) && !line.contains(" from="),
-            "halved" => {
-                let (from, need, room) = (num("from")?, num("need")?, num("room")?);
-                from == target_of(trained) && rung_above(trained, ctx).is_some() && need > room
-            }
-            _ => false,
-        };
-        Some(
-            by_word
-                && n == slots
-                && total == slots * ctx
-                && limit == trained
-                && line.contains(&format!("limit={limit} (trained)")),
-        )
-    }
-
     /// `default_ctx_line_names_its_rule` (module header), on a server of
     /// `slots` slots and an unset `--ctx` whose `/props` named `props_n` and
     /// whose file's trained context is `trained`; `plan_total` the `ctx_max`
@@ -786,7 +715,7 @@ mod gate {
             println!("default ctx line: {line}");
             let num = |k: &str| field_u64(line, k);
             Some(
-                default_line_held(line, slots, trained)?
+                default_line_held(line, slots, (trained, "trained"))?
                     && props_n == num("ctx")?
                     && plan_total.is_none_or(|t| Some(t) == num("total")),
             )
@@ -1008,7 +937,8 @@ mod gate {
             run.stopped_with_its_plan()
                 && ctx.is_some_and(|c| c >= LONG_PROMPT_SLOT_CTX)
                 && slots == Some(1)
-                && ctx_line(&run.said).and_then(|l| default_line_held(l, 1, trained)) == Some(true),
+                && ctx_line(&run.said).and_then(|l| default_line_held(l, 1, (trained, "trained")))
+                    == Some(true),
         );
         Ok(())
     }
@@ -1208,15 +1138,6 @@ mod gate {
         check(ok, "q8_load_names_its_cache", caches == ["q8_0"]);
         Ok(())
     }
-
-    /// The base a slot (`generate::SEAT_STEPS`' floor, every seat's): the
-    /// least rung an unset `--ctx` asks, held as the gate's own literal.
-    const SEAT_FLOOR: u64 = 4096;
-
-    /// The context an unset `--ctx` asks a slot first on a file trained past
-    /// it (`placement::ctx_ask::DEFAULT_TARGET`), held as the gate's own
-    /// literal: 256K positions.
-    const TARGET: u64 = 262_144;
 
     /// The terms of one whole-fit line (`whole fit at ctx …: the whole load
     /// on …`): its `need`, that need less its cache term (the terms no
@@ -1814,7 +1735,7 @@ mod gate {
         total: Total,
     }
 
-    /// The whole-card arm: no `--place`, a set `--ctx` of [`SEAT_FLOOR`] a
+    /// The whole-card arm: no `--place`, a set `--ctx` of `ctx_ladder::FLOOR` a
     /// slot, which the whole load holds on every card the gate runs on (an
     /// unset `--ctx` asks the target, which a card may hold only placed).
     const WHOLE_SLOTS: SlotsArm<'static> = SlotsArm {
