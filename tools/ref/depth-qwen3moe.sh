@@ -409,7 +409,7 @@
 # may run, default 900: a hung arm ends at rc 124/137 as a FAIL row instead of holding the lease; a
 # shared load's process has that bound per arm and one more for its load, and one that prints nothing
 # for that long is killed),
-# BLOOMERY_GEN_PLACE (Qwen3.8 only: a, gate or bp, passed as --place; unset passes none, the binary's a;
+# BLOOMERY_GEN_PLACE (a or gate on every file, bp on Qwen3.8 only, passed as --place; unset passes none, the binary's a;
 # Placement below),
 # BLOOMERY_AB_ORDER, BLOOMERY_AB_WARMUP and BLOOMERY_WARM_ROWS (above), BLOOMERY_DRY=1 (print each arm's command line,
 # the binaries' tree lines and the rotation, or the blocks and their discards, then exit 0 before the
@@ -434,11 +434,11 @@
 # `plan=` in its `time prompt` row), and `--seed-depth` is refused. Its reference is mainline llama.cpp at
 # its profile's hand-set -ncmoe placement and llama-bench's fit (models/qwen4exp.sh).
 #
-# Placement. A qwen4exp arm's own list may name its placement, `place=<a|gate|bp>` among its NAME=VALUE
+# Placement. An ours arm's own list may name its placement, `place=<a|gate|bp>` among its NAME=VALUE
 # items (`prose:512@place=bp`, `6@place=a,BLOOMERY_QWEN38_EXPERTS=host`): that arm runs at --place <word>
 # over BLOOMERY_GEN_PLACE, in a load of its own (the place is in the load key); the label keeps it
 # (`ours@prose@place=bp`), so `prose:512 prose:512@place=bp` is the same-binary placement A/B in the prose
-# table. place= on another profile, on a reference, server or bin: arm, a word outside a|gate|bp, an
+# table. place=bp on a file other than qwen4exp, place= on a reference, server or bin: arm, a word outside a|gate|bp, an
 # empty one and place given twice are refused by name before anything runs (tools/ref/arm-place.sh, shared with
 # depth-ds41.sh and depth-glm5next.sh, its refusals one text in all three). Under one card a placement whose
 # card is not the timing card is refused (64), bp too; every row of an arm with a --place names it (`place
@@ -865,19 +865,26 @@ q3_self_test() {
   want force-literal 0 "[parse] prose:4@BLOOMERY_FORCE_IDS=/x/ids:7: kind=ours depth=4 label=ours@prose@BLOOMERY_FORCE_IDS=/x/ids:7 env=BLOOMERY_FORCE_IDS=/x/ids:7 load=$bin|ctx=256|BLOOMERY_FORCE_IDS=/x/ids:7 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
   run_parse -- lcppsrv+x1:512
   want srv-flag-bad 64 "'+x1' in 'lcppsrv+x1' is none of +t<N> (-t), +nopo<0|1> (-nopo), +k<K> (--n-cpu-moe)"
-  # The placement (BLOOMERY_GEN_PLACE): a qwen4exp file's only, in the load key and the command line.
-  run_parse BLOOMERY_GEN_PLACE=gate -- 6
-  want place-other-file 64 "BLOOMERY_GEN_PLACE=gate: only a qwen4exp file takes --place"
+  # The placement (BLOOMERY_GEN_PLACE), in the load key and the command line: a or gate on every file, bp on a
+  # qwen4exp file's only (generate_qwen3moe's --place rule).
+  run_parse BLOOMERY_GEN_PLACE=bp -- 6
+  want place-other-file 64 "BLOOMERY_GEN_PLACE=bp: only a qwen4exp file takes --place bp"
+  run_parse BLOOMERY_GEN_PLACE=a -- 6
+  want place-other-file-a 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256|place=a" \
+    "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --place a --time --arm-sync"
   out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen4exp BLOOMERY_AB_ROUNDS=2 BLOOMERY_GEN_PLACE=gate "$BASH" "$me" --parse-arms 6 2>&1)
   rc=$?
   want place-gate 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256|place=gate" \
     "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --place gate --time --arm-sync"
   run_parse BLOOMERY_GEN_PLACE=b -- 6
   want place-bad 64 "BLOOMERY_GEN_PLACE is a (the A6000's plan), gate (the 3090's) or bp"
-  # An arm's place= (tools/ref/arm-place.sh): a qwen4exp file's only, the arm's own load key and --place,
-  # never a variable of its process; the lever list beside it still gated by the registry.
+  # An arm's place= (tools/ref/arm-place.sh): the arm's own load key and --place, never a variable of its
+  # process, bp a qwen4exp file's only; the lever list beside it still gated by the registry.
+  run_parse -- 6@place=bp
+  want place-arm-other-file 64 "depth-qwen3moe.sh: arm '6@place=bp': place=bp: only a qwen4exp file takes --place bp"
   run_parse -- 6@place=a
-  want place-arm-other-file 64 "depth-qwen3moe.sh: arm '6@place=a': place=a: only a qwen4exp file takes --place"
+  want place-arm-other-file-a 0 "[parse] 6@place=a: kind=ours depth=6 label=ours@place=a env=- load=$bin|ctx=256|place=a" \
+    "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --place a --time --arm-sync"
   out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen4exp BLOOMERY_AB_ROUNDS=2 "$BASH" "$me" --parse-arms 6 6@place=gate 6@place=gate,BLOOMERY_QWEN38_EXPERTS=host 2>&1)
   rc=$?
   want place-arm 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256" \
@@ -1267,8 +1274,9 @@ PLACE=${BLOOMERY_GEN_PLACE:-}
 DRY=${BLOOMERY_DRY:-}
 case $PLACE in
   '') ;;
-  a | gate | bp)
-    [ "$MODEL_NAME" = qwen4exp ] || { echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=$PLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)" >&2; exit 64; }
+  a | gate) ;;
+  bp)
+    [ "$MODEL_NAME" = qwen4exp ] || { echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=$PLACE: only a qwen4exp file takes --place bp (generate_qwen3moe hangs no expert tier on $MODEL_NAME's)" >&2; exit 64; }
     ;;
   *) echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE is a (the A6000's plan), gate (the 3090's) or bp (plan (b′), the two-card mode's), or unset (no --place: the binary's a), got '$PLACE'" >&2; exit 64 ;;
 esac
@@ -1585,7 +1593,7 @@ evict_arm() {
 # split_at <arm> <list>: an ours arm's @ list into AT (as given: its label's), ENVS (its lever list, checked
 # by lever-arms.sh), APLACE (its place= word, empty without one), AMEM (its mem= N, empty without one),
 # AMODEL (its model= path, empty without one) and APREFILL (its prefill= word, empty without one); place= only
-# a qwen4exp file takes.
+# bp only a qwen4exp file takes.
 split_at() {
   AT=$2
   [ -n "$2" ] || arm_envs_ok "$1" "$2"
@@ -1598,8 +1606,8 @@ split_at() {
   arm_prefill_split "$1" "$ARM_MODEL_REST"
   ENVS=$ARM_PREFILL_REST APLACE=$ARM_PLACE AMEM=$ARM_MEM AMODEL=$ARM_MODEL APREFILL=$ARM_PREFILL
   [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
-  if [ -n "$APLACE" ] && [ "$MODEL_NAME" != qwen4exp ]; then
-    place_refuse "$1" "place=$APLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)"
+  if [ "$APLACE" = bp ] && [ "$MODEL_NAME" != qwen4exp ]; then
+    place_refuse "$1" "place=$APLACE: only a qwen4exp file takes --place bp (generate_qwen3moe hangs no expert tier on $MODEL_NAME's)"
   fi
 }
 # arm_feed <i>: the ids arm <i> feeds: its depth, N·D for an aggregate arm.
@@ -2417,9 +2425,10 @@ ours_post() {
     passcol=" | ms/pass $passcol (mean_ms × steps $steps / passes $passes)"
   fi
   pp_col "${A_KIND[$i]}" "$out" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"; return 0; }
-  # The placement it was given: its own `load` line, or its load's (LG_HEADER).
+  # The placement it was given: its own `load` line, or its load's (LG_HEADER); a qwen3moe or qwen35moe
+  # load line names none, and its `plan` line does.
   if [ -n "${A_PLACE[$i]}" ]; then
-    ran=$(printf '%s\n%s\n' "$out" "${LG_HEADER:-}" | sed -n 's/^load .* place=\([a-z]*\).*/\1/p' | head -n 1)
+    ran=$(printf '%s\n%s\n' "$out" "${LG_HEADER:-}" | sed -n -e 's/^load .* place=\([a-z]*\).*/\1/p' -e 's/^plan place=\([a-z]*\).*/\1/p' | head -n 1)
     [ "$ran" = "${A_PLACE[$i]}" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its load line names place=${ran:-none}; the runner passed --place ${A_PLACE[$i]}" "$out"; return 0; }
   fi
   # Two cards: an Xid, a card lost or off its cap, or a load whose cards are not its placement's (bp both
