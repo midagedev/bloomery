@@ -85,7 +85,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::linear::RING_ROWS;
-    use bloomery_gpu::mamba2::{Mamba2Kernels, Mamba2Scratch, STATE, StepArgs};
+    use bloomery_gpu::mamba2::{Mamba2Kernels, Mamba2Scratch, STATE};
     use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError};
     use bloomery_gpu_gates::rounding::U;
     use bloomery_gpu_gates::{GateError, bits_equal, no_local_depot, verdict};
@@ -377,17 +377,19 @@ mod gate {
             Ok(())
         }
 
-        /// The launch, on `stream` (the engine's, or a capture's).
+        /// The launch, on `stream` (the engine's, or a capture's). `eps` is
+        /// the norm's epsilon.
         fn step(
             &mut self,
             cx: &Ctx,
             stream: &CudaStream,
             shape: Checked,
             norm: bool,
+            eps: f32,
         ) -> Result<(), GpuError> {
             cx.k.enqueue_step(
                 stream,
-                StepArgs {
+                bloomery_gpu::mamba2::StepArgs {
                     shape,
                     xbc: &self.xbc,
                     dt: &self.dt,
@@ -398,7 +400,7 @@ mod gate {
                     conv_w: &self.conv_w,
                     conv_b: &self.conv_b,
                     norm: norm.then_some(&self.norm),
-                    eps: EPS,
+                    eps,
                     pos: &self.pos,
                     pos_at: 0,
                     fault: cx.gpu.layer_sink(LAYER)?,
@@ -437,7 +439,7 @@ mod gate {
         let mut ys = Vec::new();
         for (t, tok) in toks.iter().enumerate() {
             dev.put(cx, tok, p0 + t as u32)?;
-            dev.step(cx, cx.gpu.stream(), shape, norm)?;
+            dev.step(cx, cx.gpu.stream(), shape, norm, EPS)?;
             ys.push(dev.read_y(cx)?);
         }
         Ok(DevRun {
@@ -794,7 +796,7 @@ mod gate {
         // launches nothing.
         let conv3 = match mamba2::check(Geom { d_conv: 3, ..GEOM }) {
             Ok(host) => {
-                let e = dev.step(cx, cx.gpu.stream(), host, true).err();
+                let e = dev.step(cx, cx.gpu.stream(), host, true, EPS).err();
                 let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
                 matches!(e, Some(GpuError::Shape { .. })) && text.contains("d_conv 3")
             }
@@ -806,61 +808,20 @@ mod gate {
         let short = {
             let mut half =
                 DeviceBuffer::from_host(cx.gpu.stream(), &vec![0.0f32; INNER * STATE / 2])?;
-            let e =
-                cx.k.enqueue_step(
-                    cx.gpu.stream(),
-                    StepArgs {
-                        shape: device_shape()?,
-                        xbc: &dev.xbc,
-                        dt: &dev.dt,
-                        dt_bias: &dev.dt_bias,
-                        z: &dev.z,
-                        a: &dev.a,
-                        d: &dev.d,
-                        conv_w: &dev.conv_w,
-                        conv_b: &dev.conv_b,
-                        norm: Some(&dev.norm),
-                        eps: EPS,
-                        pos: &dev.pos,
-                        pos_at: 0,
-                        fault: cx.gpu.layer_sink(LAYER)?,
-                        y: &mut dev.y,
-                        ring: &mut dev.ring,
-                        state: &mut half,
-                        scratch: &mut dev.scratch,
-                    },
-                )
+            // The short buffer is the state for this call only.
+            std::mem::swap(&mut dev.state, &mut half);
+            let e = dev
+                .step(cx, cx.gpu.stream(), device_shape()?, true, EPS)
                 .err();
+            std::mem::swap(&mut dev.state, &mut half);
             matches!(&e, Some(GpuError::Shape { detail, .. }) if detail.contains("state.len()"))
         };
         named.push(format!("short state={}", verdict(short)));
         ok &= short;
         // +∞ epsilon would make the norm scale 0. Refused before a launch.
         let eps_inf = {
-            let e =
-                cx.k.enqueue_step(
-                    cx.gpu.stream(),
-                    StepArgs {
-                        shape: device_shape()?,
-                        xbc: &dev.xbc,
-                        dt: &dev.dt,
-                        dt_bias: &dev.dt_bias,
-                        z: &dev.z,
-                        a: &dev.a,
-                        d: &dev.d,
-                        conv_w: &dev.conv_w,
-                        conv_b: &dev.conv_b,
-                        norm: Some(&dev.norm),
-                        eps: f32::INFINITY,
-                        pos: &dev.pos,
-                        pos_at: 0,
-                        fault: cx.gpu.layer_sink(LAYER)?,
-                        y: &mut dev.y,
-                        ring: &mut dev.ring,
-                        state: &mut dev.state,
-                        scratch: &mut dev.scratch,
-                    },
-                )
+            let e = dev
+                .step(cx, cx.gpu.stream(), device_shape()?, true, f32::INFINITY)
                 .err();
             let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
             matches!(e, Some(GpuError::Shape { .. })) && text.contains("norm eps must be finite")
@@ -965,7 +926,7 @@ mod gate {
         let shape = device_shape()?;
         let graph = {
             let dev = &mut dev;
-            cx.gpu.capture(|s| dev.step(cx, s, shape, true))?
+            cx.gpu.capture(|s| dev.step(cx, s, shape, true, EPS))?
         };
         let mut ys = Vec::new();
         for (t, tok) in toks.iter().enumerate() {
