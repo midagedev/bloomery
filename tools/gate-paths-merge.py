@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gate-paths-merge.py — git's merge driver for tools/gate-paths.tsv: rows merge by their glob, gates as sets.
+"""gate-paths-merge.py — git's merge driver for tools/gate-paths.tsv: one glob owns its rows.
 
     tools/gate-paths-merge.py BASE OURS THEIRS      the driver (`%O %A %B`): the merged file goes to OURS
     tools/gate-paths-merge.py --install             registers the driver in this clone's git config (worktrees share it)
@@ -7,18 +7,21 @@
 
 .gitattributes names it (`tools/gate-paths.tsv merge=gate-paths`); a clone with no `merge.gate-paths.driver` entry
 merges the file as text, as before. The driver runs `git merge-file --diff3` first, so every line both sides left
-alone, and every hunk only one side touched, merges as git would. Inside a conflicted hunk each row (a non-comment
-line with a tab) is keyed by its glob and merged three ways against the hunk's base: a gate either side added is in,
-a gate one side removed and the other kept is out, and the why and exceptions columns take the side that changed them.
-A hunk whose comment and blank lines the two sides changed differently, a row whose why or exceptions both sides
-changed to different texts, a row one side removed and the other changed, or a row whose order changed stays a
-conflict: its markers stay in OURS and the exit is 1, git's "not merged". The removed-and-changed check reads the
-whole tables, so a row deleted on one side and edited on the other still conflicts when git's text merge is clean,
-or when the edit moved across a comment and the hunk's own base never saw the row.
+alone, and every hunk only one side touched, merges as git would. The owner of a glob is the tuple of its rows in
+file order. A duplicate glob is ordinary table data: its rows stay, and the other globs still merge. A glob with at
+most one row on every side merges that row: a gate either side added is in, a gate one side removed and the other
+kept is out, and the why and exceptions columns take the side that changed them. A glob with two or more rows on any
+side is one value, picked as a whole: the side that changed the tuple, or a conflict when both sides changed it
+differently. Deleting the glob is the empty tuple, so a deletion against an edit conflicts the same way, including
+when git's text merge is clean. A comment, a why or an exception both sides changed differently, or a glob whose
+place among the others changed, stays a conflict: its markers stay in OURS and the exit is 1, git's "not merged".
+The message names the glob and its line numbers. The order check lists each glob once, at its first row, so a second
+row of the same glob is not a move.
 
 Exit: 0 merged; 1 a conflict left with its markers; 2 git merge-file failed; 64 usage.
 """
 
+import io
 import os
 import subprocess
 import sys
@@ -36,22 +39,40 @@ def is_row(line):
 
 
 def rows_of(lines):
-    """The rows of a hunk side by glob, in order, and the side's other lines."""
+    """Rows grouped by glob, in file order, the non-row lines, and each glob once at its first row."""
     rows, order, other = {}, [], []
     for line in lines:
         if is_row(line):
-            f = line.split("\t")
-            if f[0] in rows:
-                return None, None, None
-            rows[f[0]] = f
-            order.append(f[0])
+            fields = line.split("\t")
+            glob = fields[0]
+            if glob not in rows:
+                rows[glob] = []
+                order.append(glob)
+            rows[glob].append(fields)
         else:
             other.append(line)
     return rows, order, other
 
 
+def line_index(text):
+    """The same grouping as rows_of, plus each glob's 1-based line numbers."""
+    rows, at, order = {}, {}, []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not is_row(line):
+            continue
+        fields = tuple(line.split("\t"))
+        glob = fields[0]
+        if glob not in rows:
+            rows[glob] = []
+            at[glob] = []
+            order.append(glob)
+        rows[glob].append(fields)
+        at[glob].append(n)
+    return rows, at, order
+
+
 def pick(base, ours, theirs):
-    """Three-way pick of one field: the side that changed it; None when both changed it differently."""
+    """Three-way pick of one value: the side that changed it; None when both changed it differently."""
     if ours == theirs or theirs == base:
         return ours
     if ours == base:
@@ -86,32 +107,61 @@ def merge_row(b, o, t):
     return out
 
 
+def decide(b, o, t):
+    """One glob's rows, three ways. A tuple of field-tuples, () when the glob drops, None on conflict.
+
+    At most one row on every side merges field by field. Two or more rows on any side is one tuple: the side that
+    changed it, including a deletion (the empty tuple) against an unchanged side. Both sides changing it differently
+    conflicts, and so does a deletion against an edit.
+    """
+    b = tuple(tuple(r) for r in b)
+    o = tuple(tuple(r) for r in o)
+    t = tuple(tuple(r) for r in t)
+    if len(b) <= 1 and len(o) <= 1 and len(t) <= 1:
+        m = merge_row(list(b[0]) if b else None, list(o[0]) if o else None, list(t[0]) if t else None)
+        if m is None:
+            return None
+        if m == "drop":
+            return ()
+        return (tuple(m),)
+    return pick(b, o, t)
+
+
 def resolve(ours, base, theirs):
     """A conflicted hunk's lines, or None to leave it a conflict."""
     ro, oo, xo = rows_of(ours)
-    rb, _, _ = rows_of(base)
-    rt, ot, xt = rows_of(theirs)
-    if ro is None or rb is None or rt is None or xo != xt:
+    rb, bo, _xb = rows_of(base)
+    rt, to, xt = rows_of(theirs)
+    if xo != xt:
         return None
     merged = {}
-    for key in list(dict.fromkeys(oo + ot + list(rb))):
-        m = merge_row(rb.get(key), ro.get(key), rt.get(key))
+    for glob in list(dict.fromkeys(oo + to + bo)):
+        m = decide(rb.get(glob, ()), ro.get(glob, ()), rt.get(glob, ()))
         if m is None:
             return None
-        merged[key] = m
-    out, placed = [], set()
+        merged[glob] = m
+    cursors = {glob: 0 for glob in merged}
+    out = []
     for line in ours:
-        if is_row(line):
-            key = line.split("\t")[0]
-            placed.add(key)
-            if merged[key] != "drop":
-                out.append("\t".join(merged[key]))
-        else:
+        if not is_row(line):
             out.append(line)
+            continue
+        glob = line.split("\t", 1)[0]
+        rows = merged[glob]
+        i = cursors[glob]
+        if i < len(rows):
+            out.append("\t".join(rows[i]))
+            cursors[glob] = i + 1
+    extra = []
+    for glob in list(dict.fromkeys(to + oo)):
+        rows = merged[glob]
+        extra.extend("\t".join(row) for row in rows[cursors[glob]:])
+        cursors[glob] = len(rows)
+    if not extra:
+        return out
     # theirs' new rows go after the last row of the hunk, in their order
     last = max((i for i, line in enumerate(out) if is_row(line)), default=len(out) - 1)
-    new = ["\t".join(merged[k]) for k in ot if k not in placed and merged[k] != "drop"]
-    return out[: last + 1] + new + out[last + 1 :]
+    return out[: last + 1] + extra + out[last + 1 :]
 
 
 def merge_text(text):
@@ -141,41 +191,49 @@ def merge_text(text):
     return "\n".join(out), left
 
 
+def _fmt_lines(nums):
+    return "none" if not nums else " ".join(str(n) for n in nums)
+
+
 def driver(base, ours, theirs):
     p = subprocess.run(["git", "merge-file", "-p", "--diff3", "-L", "ours", "-L", "base", "-L", "theirs", ours, base, theirs],
                        capture_output=True, text=True)
     if p.returncode < 0 or p.returncode > 127:
         sys.stderr.write("gate-paths-merge: git merge-file failed (rc %d): %s" % (p.returncode, p.stderr))
         return 2
-    # Git's text merge is not the row merge. A row deleted on one side and edited on the other can move
-    # across a comment, so the hunk base never holds it, or the two edits can miss each other and git
-    # returns 0. Read the whole tables either way. An order change is only visible once git has a conflict.
+    # Git's text merge is not the row merge. Read every glob either way: a row deleted on one side and edited on
+    # the other can miss the edit and git returns 0, and a second row of a glob must not blank the whole file.
     reason = "a comment, a why or an exception both sides changed differently"
-    contents, tables = [], []
+    texts, indexed = [], []
     for path in (base, ours, theirs):
         with open(path) as f:
-            contents.append(f.read())
-        tables.append(rows_of(contents[-1].splitlines()))
-    (rb, bo, _), (ro, oo, _), (rt, tho, _) = tables
-    valid = all(order is not None for _, order, _ in tables)
-    deleted_changed = valid and any(
-        (key not in ro and key in rt and rt[key] != row)
-        or (key not in rt and key in ro and ro[key] != row)
-        for key, row in rb.items()
+            texts.append(f.read())
+        indexed.append(line_index(texts[-1]))
+    (rb, lb, bo), (ro, lo, oo), (rt, lt, tho) = indexed
+    order_changed = bool(p.returncode) and any(
+        [g for g in order if g in bo] != [g for g in bo if g in order]
+        for order in (oo, tho)
     )
-    blocked = deleted_changed or (p.returncode and (
-        not valid or any(
-            [k for k in order if k in bo] != [k for k in bo if k in order]
-            for order in (oo, tho)
-        )
-    ))
-    if blocked:
+    globs, bad = [], []
+    for glob in oo + bo + tho:
+        if glob not in globs:
+            globs.append(glob)
+    for glob in globs:
+        if decide(rb.get(glob, ()), ro.get(glob, ()), rt.get(glob, ())) is None:
+            bad.append(glob)
+    if bad or order_changed:
         text = p.stdout
         if not p.returncode:
-            b, o, t = (s if s.endswith("\n") else s + "\n" for s in contents)
-            text = f"<<<<<<< ours\n{o}||||||| base\n{b}=======\n{t}>>>>>>> theirs\n"
+            b, o, t = (s if s.endswith("\n") else s + "\n" for s in texts)
+            text = "<<<<<<< ours\n%s||||||| base\n%s=======\n%s>>>>>>> theirs\n" % (o, b, t)
+        if bad:
+            reason = "; ".join(
+                "glob %s (ours line %s, base line %s, theirs line %s)" % (
+                    glob, _fmt_lines(lo.get(glob, ())), _fmt_lines(lb.get(glob, ())), _fmt_lines(lt.get(glob, ())))
+                for glob in bad)
+        else:
+            reason = "a row moved"
         left = text.count(OURS_M) or 1
-        reason = "a row moved, or was deleted on one side and changed on the other"
     else:
         text, left = merge_text(p.stdout) if p.returncode else (p.stdout, 0)
     with open(ours, "w") as f:
@@ -250,23 +308,115 @@ def self_test():
          base.replace("a/*.rs\tgate-x gate-y\twhy a\n", ""),
          1, None),
     ]
-    fails = 0
+    # A glob that already has two rows. The rows sit outside the hunk that merges b, and a one-sided change of
+    # the pair is that side's tuple. Both sides changing the pair differently conflicts and names the lines.
+    dup = head + "a/*.rs\tgate-x\twhy1\na/*.rs\tgate-y\twhy2\nb/*.rs\tgate-z\twhy b\n"
+    ours_a = head + "a/*.rs\tgate-x gate-o\twhy1\na/*.rs\tgate-y\twhy2\nb/*.rs\tgate-z\twhy b\n"
+    theirs_a = head + "a/*.rs\tgate-x\twhy1\na/*.rs\tgate-y gate-t\twhy2\nb/*.rs\tgate-z\twhy b\n"
+    extra = [
+        ("a duplicate glob outside the hunk still merges",
+         dup,
+         head + "a/*.rs\tgate-x\twhy1\na/*.rs\tgate-y\twhy2\nb/*.rs\tgate-z gate-o\twhy b\n",
+         head + "a/*.rs\tgate-x\twhy1\na/*.rs\tgate-y\twhy2\nb/*.rs\tgate-z gate-t\twhy b\n",
+         0,
+         head + "a/*.rs\tgate-x\twhy1\na/*.rs\tgate-y\twhy2\nb/*.rs\tgate-z gate-o gate-t\twhy b\n",
+         None),
+        ("a duplicate glob one side changes",
+         dup, ours_a, dup, 0, ours_a, None),
+        ("a duplicate glob the other side changes",
+         dup, dup, ours_a, 0, ours_a, None),
+        ("a duplicate glob both sides change differently",
+         dup, ours_a, theirs_a, 1, None,
+         "glob a/*.rs (ours line 3 4, base line 3 4, theirs line 3 4)"),
+        ("a duplicate glob deleted on one side and kept on the other",
+         dup, head + "b/*.rs\tgate-z\twhy b\n", dup, 0, head + "b/*.rs\tgate-z\twhy b\n", None),
+        ("a duplicate glob deleted on one side and edited on the other",
+         dup, head + "b/*.rs\tgate-z\twhy b\n", theirs_a, 1, None,
+         "glob a/*.rs (ours line none, base line 3 4, theirs line 3 4)"),
+    ]
+    fails, n = 0, 0
+
+    def check_resolve(name, ours_lines, base_lines, theirs_lines, want):
+        nonlocal fails, n
+        n += 1
+        got = resolve(ours_lines, base_lines, theirs_lines)
+        if got != want:
+            fails += 1
+            print("FAIL %s: got %s" % (name, got))
+        else:
+            print("ok   %s" % name)
+
+    check_resolve(
+        "an unchanged two-row glob inside a hunk stays, and the other row merges",
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z gate-o\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z gate-t\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z gate-o gate-t\twhy b"])
+    check_resolve(
+        "one side's two-row glob inside a hunk replaces the tuple",
+        ["a/*.rs\tgate-x gate-o\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z gate-o\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z gate-t\twhy b"],
+        ["a/*.rs\tgate-x gate-o\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z gate-o gate-t\twhy b"])
+    check_resolve(
+        "the other side's two-row glob inside a hunk replaces the tuple",
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z gate-o\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y gate-t\twhy2", "b/*.rs\tgate-z gate-t\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y gate-t\twhy2", "b/*.rs\tgate-z gate-o gate-t\twhy b"])
+    check_resolve(
+        "a two-row glob both sides change inside a hunk stays a conflict",
+        ["a/*.rs\tgate-x gate-o\twhy1", "a/*.rs\tgate-y\twhy2"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y gate-t\twhy2"],
+        None)
+    check_resolve(
+        "a two-row glob deleted on one side and kept on the other drops",
+        ["b/*.rs\tgate-z\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z\twhy b"],
+        ["b/*.rs\tgate-z\twhy b"])
+    check_resolve(
+        "a two-row glob deleted on one side and edited on the other conflicts",
+        ["b/*.rs\tgate-z\twhy b"],
+        ["a/*.rs\tgate-x\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z\twhy b"],
+        ["a/*.rs\tgate-x gate-t\twhy1", "a/*.rs\tgate-y\twhy2", "b/*.rs\tgate-z\twhy b"],
+        None)
+
     with tempfile.TemporaryDirectory() as d:
-        for name, ours, theirs, want_rc, want in cases:
+        def run(name, base_text, ours, theirs, want_rc, want, err_has):
+            nonlocal fails, n
+            n += 1
             paths = {}
-            for k, v in (("base", base), ("ours", ours), ("theirs", theirs)):
+            for k, v in (("base", base_text), ("ours", ours), ("theirs", theirs)):
                 paths[k] = os.path.join(d, k)
                 with open(paths[k], "w") as f:
                     f.write(v)
-            rc = driver(paths["base"], paths["ours"], paths["theirs"])
+            buf = io.StringIO()
+            old_err = sys.stderr
+            sys.stderr = buf
+            try:
+                rc = driver(paths["base"], paths["ours"], paths["theirs"])
+            finally:
+                sys.stderr = old_err
+            err = buf.getvalue()
+            if err:
+                sys.stderr.write(err)
             got = open(paths["ours"]).read()
             ok = rc == want_rc and (want is None or got == want) and (rc == 0 or OURS_M in got)
+            if err_has is not None and err_has not in err:
+                ok = False
             if not ok:
                 fails += 1
-                print("FAIL %s: rc %d (want %d), got:\n%s" % (name, rc, want_rc, got))
+                print("FAIL %s: rc %d (want %d), stderr %r, got:\n%s" % (name, rc, want_rc, err, got))
             else:
                 print("ok   %s" % name)
-    print("gate-paths-merge: self-test %s (%d cases, %d failed)" % ("ok" if not fails else "FAIL", len(cases), fails))
+
+        for name, ours, theirs, want_rc, want in cases:
+            run(name, base, ours, theirs, want_rc, want, None)
+        for item in extra:
+            run(*item)
+    print("gate-paths-merge: self-test %s (%d cases, %d failed)" % ("ok" if not fails else "FAIL", n, fails))
     return 1 if fails else 0
 
 
