@@ -41,6 +41,7 @@ sys.path.insert(0, HERE)
 from post import VERDICT_RE  # noqa: E402
 
 REPO = "midagedev/bloomery"
+NET_S = 60  # each gh or git fetch call: past it the step reads as unanswered, never as a hang
 MARKER_RE = re.compile(r"<!-- bloomery-review head_sha=([0-9a-f]{40})")
 # The files the workflow's context step leaves in CTX (pr-full.json is removed there); prev-review.md only on a re-review.
 CTX_FILES = ("diff.patch", "files.txt", "pr.json", "open-issues.txt", "ledger.md", "device-dirs.txt", "diagnostics.md")
@@ -68,7 +69,10 @@ def gh_json(*args):
     """gh's JSON answer, or None when gh cannot answer (no gh, no login, no network)."""
     if not shutil.which("gh"):
         return None
-    p = subprocess.run(["gh", *args], capture_output=True, text=True)
+    try:
+        p = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=NET_S)
+    except subprocess.TimeoutExpired:
+        return None
     if p.returncode:
         return None
     try:
@@ -177,11 +181,14 @@ def read_ledger(base_tree, out):
     environment only."""
     env = dict(os.environ)
     if not env.get("GH_TOKEN") and shutil.which("gh"):
-        t = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+        t = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=NET_S)
         if t.returncode == 0 and t.stdout.strip():
             env["GH_TOKEN"] = t.stdout.strip()
-    p = subprocess.run([sys.executable, os.path.join(base_tree, "tools/review/ledger.py"), "accepted", "--repo", REPO,
-                        "--out", out], capture_output=True, text=True, env=env)
+    try:
+        p = subprocess.run([sys.executable, os.path.join(base_tree, "tools/review/ledger.py"), "accepted", "--repo", REPO,
+                            "--out", out], capture_output=True, text=True, env=env, timeout=NET_S)
+    except subprocess.TimeoutExpired:
+        return None
     return p.stdout.strip() if p.returncode == 0 else None
 
 
@@ -220,6 +227,10 @@ def run_role(role, d, minutes, runner=None):
         os.killpg(p.pid, signal.SIGKILL)
         p.wait()
         return 124
+    except BaseException:  # Ctrl-C or TERM here: the run stops with us
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+        raise
 
 
 def must_fix_titles(body):
@@ -240,8 +251,12 @@ def unpack(sha, dest):
 def review(args, runner=None, say=lambda m: print(m, file=sys.stderr)):
     if not runner and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
-    if subprocess.run(["git", "fetch", "-q", "origin"], capture_output=True).returncode:
-        say(f"pre-review: git fetch origin failed; {args.base} is as this clone last saw it")
+    try:
+        fetched = subprocess.run(["git", "fetch", "-q", "origin"], capture_output=True, timeout=NET_S).returncode == 0
+    except subprocess.TimeoutExpired:
+        fetched = False
+    if not fetched:
+        say(f"pre-review: git fetch origin failed or took over {NET_S} s; {args.base} is as this clone last saw it")
     head = git("rev-parse", "HEAD").strip()
     base_sha = git("rev-parse", args.base).strip()
     if git("status", "--porcelain", "--untracked-files=no").strip():
@@ -255,14 +270,21 @@ def review(args, runner=None, say=lambda m: print(m, file=sys.stderr)):
         unpack(head, os.path.join(d, "pr"))
         for x in ("ctx", "out", "trace"):
             os.makedirs(os.path.join(d, x))
-        meta = build_ctx(os.path.join(d, "ctx"), os.path.join(d, "base"), base_sha, head, args, say)
-        roles = ("reviewer", "validator") if args.full else ("reviewer",)
-        for role in roles:
-            rc = run_role(role, d, args.minutes, runner)
-            if rc == 124:
-                raise Stop(75, f"pre-review: the {role} ran past {args.minutes} min; no verdict (push is your call)")
-            if rc:
-                raise Stop(70, f"pre-review: the {role} ended rc {rc}; its transcript is in the kept trace")
+        try:
+            meta = build_ctx(os.path.join(d, "ctx"), os.path.join(d, "base"), base_sha, head, args, say)
+            t_ctx = time.time() - t0
+            roles = ("reviewer", "validator") if args.full else ("reviewer",)
+            for role in roles:
+                rc = run_role(role, d, args.minutes, runner)
+                if rc == 124:
+                    raise Stop(75, f"pre-review: the {role} ran past {args.minutes} min; no verdict (push is your call); see {keep}")
+                if rc:
+                    raise Stop(70, f"pre-review: the {role} ended rc {rc}; its transcript is in {keep}/trace")
+        finally:
+            # every path out keeps what ran, a failed or stopped role's transcript included
+            os.makedirs(os.path.dirname(keep), exist_ok=True)
+            for x in ("ctx", "out", "trace"):
+                shutil.copytree(os.path.join(d, x), os.path.join(keep, x), dirs_exist_ok=True)
         usages = [os.path.join(d, "trace", f"{r}.usage.json") for r in roles]
         p = subprocess.run([sys.executable, os.path.join(d, "base/tools/review/post.py"), "check", "--out", os.path.join(d, "out"),
                             "--diff", os.path.join(d, "ctx/diff.patch"), "--pr-json", os.path.join(d, "ctx/pr.json"),
@@ -270,9 +292,8 @@ def review(args, runner=None, say=lambda m: print(m, file=sys.stderr)):
                             "--base", os.path.join(d, "base"), "--secret-env", "ANTHROPIC_API_KEY",
                             *[a for u in usages if os.path.isfile(u) for a in ("--usage", u)]],
                            capture_output=True, text=True)
-        os.makedirs(os.path.dirname(keep), exist_ok=True)
         for x in ("ctx", "out", "trace"):
-            shutil.copytree(os.path.join(d, x), os.path.join(keep, x))
+            shutil.copytree(os.path.join(d, x), os.path.join(keep, x), dirs_exist_ok=True)
         if p.returncode:
             raise Stop(65, f"pre-review: post.py check refused the output (rc {p.returncode}): {p.stderr.strip()[:200]}; see {keep}")
         body = open(os.path.join(d, "out/review.md")).read()
@@ -287,7 +308,7 @@ def review(args, runner=None, say=lambda m: print(m, file=sys.stderr)):
             pass
     titles = must_fix_titles(body)
     print(f"pre-review: {m.group(1)} — {meta['mode']} review of {head[:8]} against {args.base} "
-          f"({'reviewer + validator' if args.full else 'reviewer'}, {time.time() - t0:.0f} s, ${cost:.2f})")
+          f"({'reviewer + validator' if args.full else 'reviewer'}, {time.time() - t0:.0f} s of which context {t_ctx:.0f} s, ${cost:.2f})")
     for t in titles[:12]:
         print(f"  must fix: {t}")
     print(f"  review: {keep}/out/review.md")
@@ -414,6 +435,8 @@ def self_test():
             time.sleep(0.2)
             child = int(open(pidf).read())
             alive = subprocess.run(["kill", "-0", str(child)], capture_output=True).returncode == 0
+            kept = os.path.isdir(os.path.join(t, "home/.cache/bloomery/pre-review/topic-" + git("rev-parse", "HEAD").strip()[:8], "trace"))
+            expect(kept, "a role stopped past --minutes still leaves its kept trace")
             expect(rc == 75 and "past" in msg and not alive,
                    f"a role past --minutes ends 75 named and its whole process group is gone: rc {rc}, child alive {alive}")
             rc, msgs = go("no verdict here")
