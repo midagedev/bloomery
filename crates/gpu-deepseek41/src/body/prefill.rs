@@ -154,6 +154,11 @@ const CHUNKS_MAX: usize = T_MAX / CHUNK + 1;
 /// prices the streamed pass, so the call does not stream.
 pub const STREAM_MIN_P: usize = 128;
 
+/// The longest text prompt the session feeds as pair replays rather than one
+/// batch ([`prefill`]): the last even length at which that walk is the faster
+/// feed. A longer call stays [`prefill`].
+pub const PAIR_BELOW: usize = 6;
+
 /// The least count an expert's first batch with a block routes to it for
 /// the pick to admit it, per batch the group holds (the batches the admitted
 /// expert then serves from the card): the flow model's best threshold at
@@ -788,7 +793,7 @@ fn stream_failed(m: &mut Deepseek41Model, e: GpuError) -> GpuError {
 /// state no longer holds `first`'s group, at the cut [`Body::keep_point`]
 /// grants below it, which the error then names. A fault poisons the model
 /// and is returned as it came: nothing runs on it until a reset.
-fn take_back(m: &mut Deepseek41Model, first: usize, e: GpuError) -> GpuError {
+pub fn take_back(m: &mut Deepseek41Model, first: usize, e: GpuError) -> GpuError {
     if matches!(e, GpuError::Fault { .. }) || m.poisoned().is_some() {
         return e;
     }
