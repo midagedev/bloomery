@@ -90,8 +90,8 @@
 #
 # The box queue. BLOOMERY_BOX_QUEUE=1 makes the command a job of the box's signalbox daemon (unset or 0:
 # the path above, byte for byte). The daemon waits on the timing lease and the holds, so the job carries
-# no guard; tools/boxq.py runs it (submit, follow its out and err apart, exit with its rc, cancel it on
-# INT or TERM). A read (BLOOMERY_BOX_READONLY=1) never goes through the queue.
+# no guard; tools/boxq.py runs it (submit, follow its out and err apart, exit with its rc; INT or TERM
+# cancels it while queued and leaves it running once started). A read (BLOOMERY_BOX_READONLY=1) never goes through the queue.
 #   Sync. The tree goes to the remote directory under that directory's lock, /root/bloomery-queue/dir-<key>.lock
 #   (<key> the remote directory's name): rsync runs behind `flock -n -x`, so a tree a job is running in is
 #   never replaced under it. A sync that fails on that lock ends 83 naming it (the lock is probed once

@@ -27,8 +27,13 @@ The box's rc is the authority: for done and failed the exit code is the job's rc
 else 81, with `boxq: <id> cancelled elsewhere` on stderr; 143 is only our own trapped TERM. A mirror that cannot be
 written is a stderr line; the exit code stays the job's.
 A job with no --expected-s is posted without one (the daemon reads it as an unknown wall) and its line says `predicted unknown`.
-INT or TERM during run or attach posts the cancel and keeps polling until the job is terminal (at most
-BOXQ_CANCEL_WAIT_S), then exits 130 or 143; a job not terminal by then, or a second signal, exits 81 naming the job.
+INT or TERM during run or attach cancels only a job that has not started: for a job last seen queued (or not seen yet) it
+posts the cancel and keeps polling until the job is terminal (at most BOXQ_CANCEL_WAIT_S), then exits 130 or 143; a job not
+terminal by then, or a second signal, exits 81 naming the job. A job last seen running is left running on the box: the
+client stops following it, names `boxq.py attach <id>` and `boxq.py cancel <id>`, mirrors nothing and exits 130 or 143,
+so an interrupted session does not throw away a job's card time. A job whose first answer after the signal is terminal
+is not cancelled either: the exit is 130 or 143 and nothing is mirrored. A job that starts between the last poll and the
+cancel is cancelled (the poll interval is the window).
 Three polls in a row that cannot reach the daemon exit 84 and leave the job as it is.
 
   BOXQ_HOST   ssh host (default $BLOOMERY_BOX, else ws)      BOXQ_URL            the daemon (http://127.0.0.1:8030)
@@ -366,6 +371,24 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                 if fails >= POLL_FAILS:
                     raise Down(e.name, f"job {jid} is left as it is: {e.msg}")
                 say(f"boxq: {jid}: poll {fails}/{POLL_FAILS} failed: {e.msg}")
+            # a pending signal is decided here, before this poll's answer is taken: another client's job (leave) and a job
+            # seen past the queue are not ours to cancel, and a terminal answer after the signal never stands in for the
+            # signal's exit or writes a mirror
+            if trap.sigs and cancel_at is None:
+                seen = [x["status"] for x in (last, job) if x is not None]
+                if leave:
+                    say(f"boxq: {jid}: signal, leaving the job as it is")
+                    return trap.rc()
+                if "running" in seen:
+                    say(f"boxq: {jid}: signal while running: the job is left running on the box; "
+                        f"follow it with `tools/boxq.py attach {jid}`, stop it with `tools/boxq.py cancel {jid}`")
+                    return trap.rc()
+                if seen and seen[-1] in TERMINAL:
+                    say(f"boxq: {jid}: signal; the job had already ended {seen[-1]} on the box (no rc mirrored)")
+                    return trap.rc()
+                say(f"boxq: {jid}: signal, cancelling")
+                q.cancel(jid)
+                cancel_at = time.monotonic()
             if job is not None:
                 last, now = job, time.monotonic()
                 if job["status"] == "queued":
@@ -384,13 +407,6 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                     queued_at = None
                 if job["status"] in TERMINAL:
                     break
-            if trap.sigs and leave:
-                say(f"boxq: {jid}: signal, leaving the job as it is")
-                return trap.rc()
-            if trap.sigs and cancel_at is None:
-                say(f"boxq: {jid}: signal, cancelling")
-                q.cancel(jid)
-                cancel_at = time.monotonic()
             if cancel_at is not None and (len(trap.sigs) > 1 or time.monotonic() - cancel_at >= q.cancel_wait_s):
                 st = last["status"] if last else "unknown"
                 raise Refusal(LOST, "cancel-pending", f"job {jid} is still {st} after the cancel; check it on the box")
@@ -957,20 +973,23 @@ def case_int_cancel(fx):
         fx.wait_pids(fx.tail_pids, 2)
         p.send_signal(sig)
         got, so, se = fx.finish(p)
+        check(got == want and fake.cancels() == [] and b"left running" in se and b"boxq.py attach j1" in se,
+              f"{sig.name} on a running job exits {want}, posts no cancel and names the attach: {got} {se!r} {fake.cancels()}")
+        check(fx.rc_file() is None, f"a job left running gets no rc mirror: {fx.rc_file()!r}")
+        fx.gone(fx.tail_pids, 2)
+    for sig, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+        fake = fx.serve([{"status": "queued", "wait_reason": "card-busy"}])
+        p = fx.start(*fx.run_args())
+        fx.wait_polls(fake, 2)
+        p.send_signal(sig)
+        got, so, se = fx.finish(p)
         cancels = fake.cancels()
-        check(got == want and b"elsewhere" not in se, f"{sig.name} exits {want}, the cancel is ours: {got} {se!r}")
+        check(got == want and b"elsewhere" not in se and fx.pids(fx.tail_pids) == [],
+              f"{sig.name} on a queued job exits {want}, the cancel is ours, no tail to stop: {got} {se!r}")
         check(len(cancels) == 1 and cancels[0][0] == "POST" and cancels[0][2] == b"{}",
               f"one POST cancel with {{}}: {cancels}")
         check(fx.rc_file() == f"{want}\n", f"the mirror holds {want}: {fx.rc_file()!r}")
-        fx.gone(fx.tail_pids, 2)
         fx.rm_rc()
-    fake = fx.serve([{"status": "queued", "wait_reason": "card-busy"}])
-    p = fx.start(*fx.run_args())
-    fx.wait_polls(fake, 2)
-    p.send_signal(signal.SIGTERM)
-    got, so, se = fx.finish(p)
-    check(got == 143 and fx.pids(fx.tail_pids) == [] and len(fake.cancels()) == 1,
-          f"a queued job is cancelled too, with no tail to stop: {got} {se!r} {fake.requests}")
     fake = fx.serve([{"status": "running"}], slow=1.0)
     p = fx.start(*fx.run_args())
     fx.wait_requests(fake, 1)
@@ -979,19 +998,18 @@ def case_int_cancel(fx):
     check(got == 130 and not [r for r in fake.requests if r[:2] == ("POST", "/jobs")] and b"interrupted" in se,
           f"a signal before the post posts nothing: {got} {se!r} {fake.requests}")
     fx.rm_rc()
-    fake = fx.serve([{"status": "running"}], cancel_to=None)
+    fake = fx.serve([{"status": "queued", "wait_reason": "card-busy"}], cancel_to=None)
     p = fx.start(*fx.run_args(), BOXQ_CANCEL_WAIT_S="1")
-    fx.wait_pids(fx.tail_pids, 2)
+    fx.wait_polls(fake, 2)
     t0 = time.monotonic()
     p.send_signal(signal.SIGINT)
     got, so, se = fx.finish(p)
     check(got == 81 and b"j1" in se and time.monotonic() - t0 >= 1.0,
-          f"a job still running after the wait: 81 naming it: {got} {se!r}")
+          f"a job still queued after the wait: 81 naming it: {got} {se!r}")
     check(fx.rc_file() is None, "a job that is not terminal gets no rc mirror")
-    fx.gone(fx.tail_pids, 2)
-    fake = fx.serve([{"status": "running"}], cancel_to=None)
+    fake = fx.serve([{"status": "queued", "wait_reason": "card-busy"}], cancel_to=None)
     p = fx.start(*fx.run_args(), BOXQ_CANCEL_WAIT_S="100")
-    fx.wait_pids(fx.tail_pids, 2)
+    fx.wait_polls(fake, 2)
     p.send_signal(signal.SIGINT)
     fx.wait_requests(fake, 1, fake.cancels)
     p.send_signal(signal.SIGINT)
@@ -1018,6 +1036,34 @@ def case_flush_cap(fx):
               f"the flush after a terminal status is min(poll, 2 s): poll {poll} s waited {trap.waits}")
         fx.gone(fx.tail_pids)  # the waits are instant, so a tail may be stopped before it recorded its pid
         fx.fake.polls = 0
+
+
+class SigTrap(RecTrap):
+    """A RecTrap that delivers one signal during its first wait, as a signal during the sleep between two polls."""
+
+    def __init__(self, sig):
+        super().__init__()
+        self.sig = sig
+
+    def wait(self, secs):
+        super().wait(secs)
+        if len(self.waits) == 1:
+            self.sigs.append(self.sig)
+
+    rc = Trap.rc
+
+
+def case_signal_then_done(fx):
+    for before in ({"status": "running"}, {"status": "queued", "wait_reason": "card-busy"}):
+        for sig, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+            fake = fx.serve([before, {"status": "done", "rc": 0}])
+            trap = SigTrap(sig)
+            rc = attach_job(Queue(fx.env()), "j1", fx.rc_dir, trap)
+            check(rc == want and fake.cancels() == [] and fx.rc_file() is None,
+                  f"{sig.name} after a {before['status']} poll wins over a done reply: {want}, no cancel, no mirror: "
+                  f"{rc} {fake.cancels()} {fx.rc_file()!r}")
+            fx.gone(fx.tail_pids)
+            fx.fake.polls = 0
 
 
 def case_queued_age(fx):
@@ -1240,7 +1286,7 @@ def case_attach_leave(fx):
 
 CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
-         case_tails_stop, case_flush_cap, case_queued_age, case_cancelled_elsewhere, case_load_ready]
+         case_tails_stop, case_flush_cap, case_signal_then_done, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
 def run_cases(label, cases, make_fix, names):
