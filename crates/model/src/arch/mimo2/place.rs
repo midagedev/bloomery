@@ -756,6 +756,10 @@ mod tests {
             .plan(&machine, 1024, &PlanLevers::default())
             .expect("the small header plans at 1,024");
         assert_eq!(plan.cards[0].stage_rows_bytes, 32 * 1024);
+        assert_eq!(
+            two.seq_terms().slots_of(3).stage_position_bytes(1024),
+            32 * 1024
+        );
     }
 
     /// [`PlanInputs::read`] of a synthetic header, or its error's text.

@@ -815,8 +815,7 @@ mod gate {
             }))
     }
 
-    /// `default_load_listens` (the module header).
-    fn default_load_listens(dir: &Path, file: &Path, ok: &mut bool) -> Result<(), GateError> {
+    fn default_load_listens(dir: &Path, file: &Path) -> Result<bool, GateError> {
         let pins = Pins {
             residency: None,
             ..OFF
@@ -827,8 +826,7 @@ mod gate {
         let text = std::fs::read_to_string(&err_log).unwrap_or_default();
         let Ok(addr) = listened else {
             println!("default: the server never listened; server stderr:\n{text}");
-            check(ok, "default_load_listens", false);
-            return Ok(());
+            return Ok(false);
         };
         let records = server_log(&err_log, record::BLOOMERY_SERVE_MIMO2)?;
         let load = records.one(&record::LOAD_MIMO2)?;
@@ -841,12 +839,7 @@ mod gate {
             listen.line(),
             s.stop()?
         );
-        check(
-            ok,
-            "default_load_listens",
-            named.is_some() && named == Some(load.u64("ctx")?) && named == Some(listen.u64("ctx")?),
-        );
-        Ok(())
+        Ok(named.is_some() && named == Some(load.u64("ctx")?) && named == Some(listen.u64("ctx")?))
     }
 
     /// The host bytes the seat's plan of `file` needs at `slot_ctx` positions
@@ -1697,7 +1690,11 @@ mod gate {
             residency_default_is_the_machine(&a.dir, &file, &mut ok)?;
             refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
             slots_total_is_planned(&a.dir, &file, &mut ok)?;
-            default_load_listens(&a.dir, &file, &mut ok)?;
+            check(
+                &mut ok,
+                "default_load_listens",
+                default_load_listens(&a.dir, &file)?,
+            );
             if cards >= 2 {
                 child_clauses(&a.dir, &mut ok)?;
             } else {
