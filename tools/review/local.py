@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -78,19 +79,25 @@ def gh_json(*args):
 
 def files_txt(name_status, numstat):
     """files.txt as the workflow writes it from the pull request's files: `<status>\t+<added>\t-<deleted>\t<path>`,
-    a rename under its new path, a binary file's counts 0."""
-    counts = {}
-    for line in numstat.splitlines():
-        a, d, path = line.split("\t", 2)
-        if "\t" in path:  # a rename under -z-less numstat: old<TAB>new
-            path = path.split("\t")[-1]
+    a rename under its new path with its own counts, a binary file's counts 0. The inputs are `git diff -z -M
+    --name-status` and `-z -M --numstat`: NUL-separated, a rename's two paths as two fields."""
+    counts, f, i = {}, numstat.split("\0"), 0
+    while i < len(f) - 1:
+        a, d, path = f[i].split("\t", 2)
+        if path == "":  # a rename or copy: the two paths follow
+            path, i = f[i + 2], i + 3
+        else:
+            i += 1
         counts[path] = (0 if a == "-" else int(a), 0 if d == "-" else int(d))
-    out = []
-    for line in name_status.splitlines():
-        f = line.split("\t")
-        path = f[-1]
+    out, f, i = [], name_status.split("\0"), 0
+    while i < len(f) - 1:
+        st = f[i]
+        if st[0] in "RC":
+            path, i = f[i + 2], i + 3
+        else:
+            path, i = f[i + 1], i + 2
         a, d = counts.get(path, (0, 0))
-        out.append(f"{STATUS.get(f[0][0], 'modified')}\t+{a}\t-{d}\t{path}")
+        out.append(f"{STATUS.get(st[0], 'modified')}\t+{a}\t-{d}\t{path}")
     return "\n".join(out) + ("\n" if out else "")
 
 
@@ -127,8 +134,8 @@ def build_ctx(ctx, base_tree, base_sha, head, args, say):
     with open(os.path.join(ctx, "diff.patch"), "w") as f:
         f.write(git("diff", diff_from, head) if mode == "incremental" else git("diff", f"{base_sha}...{head}"))
     with open(os.path.join(ctx, "files.txt"), "w") as f:
-        f.write(files_txt(git("diff", "--name-status", "-M", f"{base_sha}...{head}"),
-                          git("diff", "--numstat", "-M", f"{base_sha}...{head}")))
+        f.write(files_txt(git("diff", "-z", "-M", "--name-status", f"{base_sha}...{head}"),
+                          git("diff", "-z", "-M", "--numstat", f"{base_sha}...{head}")))
     issues = gh_json("api", "--paginate", f"repos/{REPO}/issues?labels=review-bot&state=open&per_page=100")
     with open(os.path.join(ctx, "open-issues.txt"), "w") as f:
         if isinstance(issues, list):
@@ -165,9 +172,16 @@ def device_dirs(base_tree, out):
 
 
 def read_ledger(base_tree, out):
-    """The ledger's version (ledger.py prints it), the lessons written to out; None when gh cannot read it."""
+    """The ledger's version (ledger.py prints it), the lessons written to out; None when gh cannot read it. ledger.py
+    reads GH_TOKEN, which a plain `gh auth login` does not set: it comes from `gh auth token` then, into the child's
+    environment only."""
+    env = dict(os.environ)
+    if not env.get("GH_TOKEN") and shutil.which("gh"):
+        t = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+        if t.returncode == 0 and t.stdout.strip():
+            env["GH_TOKEN"] = t.stdout.strip()
     p = subprocess.run([sys.executable, os.path.join(base_tree, "tools/review/ledger.py"), "accepted", "--repo", REPO,
-                        "--out", out], capture_output=True, text=True)
+                        "--out", out], capture_output=True, text=True, env=env)
     return p.stdout.strip() if p.returncode == 0 else None
 
 
@@ -197,10 +211,14 @@ def run_role(role, d, minutes, runner=None):
     """One role through the base tree's run-claude.sh; its rc, 124 past the bound."""
     script = runner or os.path.join(d, "base/tools/review/run-claude.sh")
     env = dict(os.environ, REVIEW_SETTING_SOURCES="project")
+    # its own process group: past the bound the whole run stops, claude included, not only the bash in front of it
+    p = subprocess.Popen(["bash", script, role, *(os.path.join(d, x) for x in ("base", "pr", "ctx", "out", "trace"))],
+                         env=env, stdin=subprocess.DEVNULL, start_new_session=True)
     try:
-        return subprocess.run(["bash", script, role, *(os.path.join(d, x) for x in ("base", "pr", "ctx", "out", "trace"))],
-                              env=env, timeout=minutes * 60, stdin=subprocess.DEVNULL).returncode
+        return p.wait(timeout=minutes * 60)
     except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
         return 124
 
 
@@ -222,7 +240,8 @@ def unpack(sha, dest):
 def review(args, runner=None, say=lambda m: print(m, file=sys.stderr)):
     if not runner and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
-    subprocess.run(["git", "fetch", "-q", "origin"], capture_output=True)
+    if subprocess.run(["git", "fetch", "-q", "origin"], capture_output=True).returncode:
+        say(f"pre-review: git fetch origin failed; {args.base} is as this clone last saw it")
     head = git("rev-parse", "HEAD").strip()
     base_sha = git("rev-parse", args.base).strip()
     if git("status", "--porcelain", "--untracked-files=no").strip():
@@ -295,10 +314,29 @@ def self_test():
                   r"\s*tree_sha: \$tree, mode: \$mode, ledger: \$ledger, run: \$run\}'", step)
     expect(m is not None, "pr.json's keys are the workflow's jq object (number … run)")
     # files.txt: GitHub's status words, a rename under its new path, binary counts 0
-    got = files_txt("A\tnew.rs\nM\tsrc/a.rs\nD\told.rs\nR100\tx/a.py\tx/b.py\nM\timg.png\n",
-                    "3\t0\tnew.rs\n2\t1\tsrc/a.rs\n0\t9\told.rs\n0\t0\tx/a.py\tx/b.py\n-\t-\timg.png\n")
-    expect(got == "added\t+3\t-0\tnew.rs\nmodified\t+2\t-1\tsrc/a.rs\nremoved\t+0\t-9\told.rs\nrenamed\t+0\t-0\tx/b.py\n"
-                  "modified\t+0\t-0\timg.png\n", f"files.txt rows: {got!r}")
+    with tempfile.TemporaryDirectory() as t:
+        sh = lambda *c: subprocess.run(c, cwd=t, check=True, capture_output=True, text=True).stdout
+        sh("git", "init", "-q")
+        sh("git", "config", "user.email", "t@t")
+        sh("git", "config", "user.name", "t")
+        os.makedirs(os.path.join(t, "x"))
+        open(os.path.join(t, "x/a.py"), "w").write("".join(f"line {i}\n" for i in range(20)))
+        open(os.path.join(t, "old.rs"), "w").write("o\n" * 9)
+        open(os.path.join(t, "img.png"), "wb").write(b"\0\1\2")
+        sh("git", "add", "-A")
+        sh("git", "commit", "-qm", "a")
+        os.rename(os.path.join(t, "x/a.py"), os.path.join(t, "x/b.py"))
+        open(os.path.join(t, "x/b.py"), "a").write("one more\n")
+        os.unlink(os.path.join(t, "old.rs"))
+        open(os.path.join(t, "new.rs"), "w").write("n\n" * 3)
+        open(os.path.join(t, "img.png"), "wb").write(b"\0\3")
+        sh("git", "add", "-A")
+        sh("git", "commit", "-qm", "b")
+        got = files_txt(sh("git", "diff", "-z", "-M", "--name-status", "HEAD~1", "HEAD"),
+                        sh("git", "diff", "-z", "-M", "--numstat", "HEAD~1", "HEAD"))
+    expect(sorted(got.splitlines()) == ["added\t+3\t-0\tnew.rs", "modified\t+0\t-0\timg.png", "removed\t+0\t-9\told.rs",
+                                        "renamed\t+1\t-0\tx/b.py"],
+           f"files.txt from git's own output: a rename under its new path with its counts, a binary 0: {got!r}")
     # must-fix titles from the body format reviewer.md asks for
     body = "**Verdict: MUST_FIX**: x\n\n### Must fix\n#### 1. One\ntext\n#### 2. Two\n\n### Checked\n#### not this\n"
     expect(must_fix_titles(body) == ["1. One", "2. Two"], f"must-fix titles: {must_fix_titles(body)}")
@@ -366,8 +404,18 @@ def self_test():
             expect(open(os.path.join(keep, "ctx/files.txt")).read() == "modified\t+1\t-0\ta.txt\n", "files.txt of the branch")
             rc, _ = go("**Verdict: MUST_FIX**: no\n\n### Must fix\n#### 1. Broken\n")
             expect(rc == 1, f"a MUST_FIX review ends 1 (got {rc})")
-            rc, msgs = go("**Verdict: CLEAN**: late", sleep=3, minutes=0.02)
-            expect(rc == 75 and any("past" in x for x in msgs), f"a role past --minutes ends 75 named: {rc} {msgs[-1:]}")
+            pidf = os.path.join(t, "child.pid")
+            open(stub, "w").write(f"#!/usr/bin/env bash\n( sleep 30 & echo $! > {pidf}; wait )\n")
+            a = argparse.Namespace(base="basebr", full=False, minutes=0.03, body=None)
+            try:
+                rc, msg = review(a, runner=stub, say=lambda m: None), ""
+            except Stop as e:
+                rc, msg = e.code, e.msg
+            time.sleep(0.2)
+            child = int(open(pidf).read())
+            alive = subprocess.run(["kill", "-0", str(child)], capture_output=True).returncode == 0
+            expect(rc == 75 and "past" in msg and not alive,
+                   f"a role past --minutes ends 75 named and its whole process group is gone: rc {rc}, child alive {alive}")
             rc, msgs = go("no verdict here")
             expect(rc in (65,) , f"a review with no verdict ends 65: {rc} {msgs[-1:]}")
         finally:
