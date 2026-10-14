@@ -16,9 +16,9 @@
 //!   load only where `Qwen3moeModel::whole_load` takes the file, and card
 //!   experts only in layers whose routed stacks the card kernel table runs
 //!   (the load refuses by name a layer holding card experts of any other).
-//! - (b) the serve seat's default (`q3types::serve_default`: the `--ctx`
-//!   search under `q3place::SERVE_RULE` for two slots, then the load it
-//!   decides at the total) answers and holds as (a).
+//! - (b) the serve seat's default (`q3types::serve_default`: the seat's own
+//!   choice of context and load, `q3place::serve_choice`, for its default
+//!   slots) answers and holds as (a).
 //! - (c) the whole load's refusal of a Q8_0 gate·up is the load's own text
 //!   ([`REFUSED_TEXT`]).
 //!

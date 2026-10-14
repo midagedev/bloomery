@@ -177,14 +177,14 @@ use q3place::{PlaceQ3, Seqs};
 
 use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
     note_line, parallel_line, slots_given,
 };
-use bloomery_gpu_gates::generate::{Place, choose_ctx};
+use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
@@ -192,10 +192,8 @@ use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::qwen35moe::hparams::Hparams;
-use model::placement::PlacementError;
 use model::placement::PlanLevers;
-use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, PlanRefusal, Probe};
-use model::placement::workstation::{CardSpec, DeviceInfo};
+use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS};
 use runtime::Target as _;
 #[cfg(feature = "vision")]
 use serve::media::{MediaFeed, SharedMediaModel};
@@ -213,26 +211,30 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
-/// What a qwen35moe file's load opens at with a `ctx`-row cache: the
-/// tensor-core decode flash, the levers' ubatch and the `kv` planes, as
-/// `generate_qwen3moe` opens it; `media` when `--mmproj` gave the load an
-/// image input: every sequence then holds the rotation table an image's
-/// positions rewrite.
-fn open35(ctx: usize, kv: KvQ8, media: bool) -> Result<Open35, GateError> {
-    Ok(Open35 {
-        ctx,
-        mma: true,
-        ubatch: ubatch_size()?,
-        kv,
-        media,
-    })
-}
-
 /// What the plans and the open take of `--mmproj` ([`vision_of`]): the load's `media` flag
 /// ([`open35`]) and the bytes the image encoder reserves on the stage card, when its tower sits
 /// there.
 fn images_of(vision: Option<&Opened>) -> (bool, Option<u64>) {
     (vision.is_some(), vision.and_then(|v| v.seat.reserve))
+}
+
+/// What shapes the load beside its context and slots ([`q3place::ServeOpts`]),
+/// `--mmproj`'s part read by [`images_of`].
+fn serve_opts<'a>(
+    arch: Arch,
+    (place, levers): (Option<Place>, &'a PlanLevers),
+    kv: KvQ8,
+    vision: Option<&Opened>,
+) -> q3place::ServeOpts<'a> {
+    let (media, encoder) = images_of(vision);
+    q3place::ServeOpts {
+        arch,
+        place,
+        levers,
+        kv,
+        media,
+        encoder,
+    }
 }
 
 /// What a plan's line says of the encoder's reserve: the reserve named, `""` when the tower sits
@@ -574,7 +576,7 @@ impl Body3 for Body35 {
         levers: &Levers,
         (kv, vision): (KvQ8, Option<&Opened>),
     ) -> Result<Qwen35moeModel, GateError> {
-        let o = open35(ctx, kv, vision.is_some())?;
+        let o = q3place::serve_open35(ctx, kv, vision.is_some())?;
         let mut m = match load {
             Q3Load::Whole(card) => {
                 print_seat(vision);
@@ -987,28 +989,8 @@ impl<B: Body3> Seat for Q3<B> {
     }
 }
 
-/// What the file loads as, decided once before the open at the total
-/// context — the context its whole-fit verdict and its plan count — and
-/// carried into it ([`Body3::open`]), so the open makes no fit call of its
-/// own ([`decide`]).
-enum Q3Load {
-    /// The whole model on this card, `a`'s: `--place` unset, and the
-    /// whole-fit verdict at the total on it takes the whole load.
-    Whole(CardSpec),
-    /// The placed plan made at `total` positions on `q`'s card: `--place`'s
-    /// (no `why`), or `a`'s card's when the whole load does not fit at the
-    /// total (`why` names that, `q3place::WHY_NOT_WHOLE`). Its open is the
-    /// placed body, its host set whatever the plan holds, none included;
-    /// under `--place` whose plan holds no host expert, `whole` is the card
-    /// the whole model opens on instead, when the whole-fit verdict takes it
-    /// (the plan record prints either way).
-    Placed {
-        q: Box<PlaceQ3>,
-        total: usize,
-        why: Option<&'static str>,
-        whole: Option<CardSpec>,
-    },
-}
+/// What the file loads as, decided before the open ([`q3place::serve_load`]).
+use q3place::ServeLoad as Q3Load;
 
 impl Q3Load {
     /// The `plan` record a placed load prints before its open
@@ -1056,123 +1038,27 @@ fn pass_of<B: Body3>(slots: usize, placed: bool) -> Pass {
 /// of the total. Under `--mmproj` (`vision`) the load is a media load and the
 /// encoder's reserve, when its tower sits on the stage card, is in the
 /// verdict and in the plan.
-/// The context `slots` slots serve and the load made at it, by the seats'
-/// common choice ([`choose_ctx`]): a set `--ctx` (`set`) is the total they
-/// split, planned once at its share; unset, a slot is planned at the target
-/// and halved only while the card is short. Each candidate is the load [`decide`] makes at its total, a
-/// placed one planned there too, so a short card shows here and not at the
-/// open. Every candidate reads one census: a line names the probes and the
-/// readings ([`searched_line`]).
-fn ctx_and_load(
-    split: &Split,
-    arch: Arch,
-    (set, slots): (Option<usize>, usize),
-    (place, levers): (Option<Place>, &PlanLevers),
-    (kv, vision): (KvQ8, Option<&Opened>),
-) -> Result<Chosen<Q3Load>, GateError> {
-    let word = if set.is_some() { "set" } else { "default" };
-    let before = q3place::reads();
-    let census = q3place::census()?;
-    let mut probes = 0;
-    let plan_at = |c: u64| -> Result<Probe<Q3Load>, GateError> {
-        probes += 1;
-        let total = usize::try_from(c)?.saturating_mul(slots);
-        let at = (split, census.as_slice());
-        let load = match decide(at, arch, total, (place, levers), slots, (kv, vision)) {
-            Ok(load) => load,
-            Err(e) => return short_or(e),
-        };
-        if let Q3Load::Placed { q, total, .. } = &load
-            && let Err(e) = q.plan(*total, levers)
-        {
-            return short_or(e);
-        }
-        Ok(Probe::Holds(load))
-    };
-    let chosen = choose_ctx(split, (set, slots), (None, None), plan_at);
-    searched_line(word, probes, before);
-    chosen
-}
-
 /// The line a `--ctx` choice (`word`, set or default) prints once it
-/// answers: the `probes` it ran and the census readings it took since
-/// `before` — one reading serves every probe, so a choice that read the
-/// census per probe shows here.
-fn searched_line(word: &str, probes: usize, before: q3place::Reads) {
-    let censuses = q3place::reads().since(before).censuses;
+/// answers: the probes it ran and the census readings it took
+/// ([`q3place::serve_choice`]) — one reading serves every probe, so a choice
+/// that read the census per probe shows here.
+fn searched_line(word: &str, r: q3place::Reads) {
     eprintln!(
-        "{NAME}: the {word} --ctx search ran {probes} probes on {censuses} census reading(s)"
+        "{NAME}: the {word} --ctx search ran {} probes on {} census reading(s)",
+        r.probes, r.censuses
     );
 }
 
-/// A plan's refusal as a short memory ([`Probe::Short`]), else the
-/// refusal as it stands.
-fn short_or(e: GateError) -> Result<Probe<Q3Load>, GateError> {
-    let short = e
-        .downcast_ref::<model::arch::qwen3moe::place::PlaceError>()
-        .and_then(PlanRefusal::short)
-        .or_else(|| {
-            e.downcast_ref::<model::arch::qwen35moe::place::PlaceError>()
-                .and_then(PlanRefusal::short)
-        })
-        .or_else(|| {
-            e.downcast_ref::<PlacementError>()
-                .and_then(PlacementError::card_short)
-        });
-    short.map(Probe::from).ok_or(e)
-}
-
-fn decide(
-    (split, census): (&Split, &[DeviceInfo]),
-    arch: Arch,
-    total: usize,
-    (place, levers): (Option<Place>, &PlanLevers),
-    parallel: usize,
-    (kv, vision): (KvQ8, Option<&Opened>),
-) -> Result<Q3Load, GateError> {
-    let (media, encoder) = images_of(vision);
-    let unplaced = match (arch, place) {
-        (Arch::Qwen35moe, Some(p)) => {
-            let o = q3place::share(&open35(total, kv, media)?, total, parallel);
-            let q = PlaceQ3::qwen35_on(split, p, census, o, seqs35(split, parallel)?, encoder)?;
-            let plan = q.plan(total, levers)?;
-            let whole = q.whole_card_qwen35(split, &plan, (total, parallel), o)?;
-            return Ok(Q3Load::Placed {
-                q: Box::new(q),
-                total,
-                why: None,
-                whole,
-            });
-        }
-        (Arch::Qwen35moe, None) => q3place::unplaced_qwen35_slots(
-            split,
-            census,
-            &open35(total, kv, media)?,
-            seqs35(split, parallel)?,
-            encoder,
-        )?,
-        (_, Some(p)) => {
-            let q = PlaceQ3::qwen3_on(split, p, census, total, kv)?;
-            let plan = q.plan(total, levers)?;
-            let whole = q.whole_card_qwen3(split, &plan, (total, parallel))?;
-            return Ok(Q3Load::Placed {
-                q: Box::new(q),
-                total,
-                why: None,
-                whole,
-            });
-        }
-        (_, None) => q3place::unplaced_qwen3_slots(split, census, total, parallel, kv)?,
-    };
-    Ok(match unplaced {
-        q3place::Unplaced::Whole(card) => Q3Load::Whole(card),
-        q3place::Unplaced::Placed(q) => Q3Load::Placed {
-            q,
-            total,
-            why: Some(q3place::WHY_NOT_WHOLE),
-            whole: None,
-        },
-    })
+/// The context `slots` slots serve and the load made at it
+/// ([`q3place::serve_choice`]), its search line printed.
+fn ctx_and_load(
+    split: &Split,
+    (set, slots): (Option<usize>, usize),
+    o: q3place::ServeOpts<'_>,
+) -> Result<Chosen<Q3Load>, GateError> {
+    let (chosen, reads) = q3place::serve_choice(split, (set, slots), o)?;
+    searched_line(if set.is_some() { "set" } else { "default" }, reads);
+    Ok(chosen)
 }
 
 /// The least context a resident slot loads at, one rule for both loads and
@@ -1493,10 +1379,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         let plan_levers = PlanLevers::from_levers(&levers)?;
         let asked = ctx_and_load(
             &split,
-            arch,
             (a.ctx, slots),
-            (a.place, &plan_levers),
-            (kv, v),
+            serve_opts(arch, (a.place, &plan_levers), kv, v),
         )?;
         let cost_ctx = asked.total;
         Ok(match asked.plan {
@@ -1520,10 +1404,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let asked = ctx_and_load(
         &split,
-        arch,
         (a.ctx, slots),
-        (a.place, &plan_levers),
-        (kv, vision.as_ref()),
+        serve_opts(arch, (a.place, &plan_levers), kv, vision.as_ref()),
     )?;
     let (_, encoder) = images_of(vision.as_ref());
     eprintln!("{}{}", asked.line(), encoder_words(encoder));

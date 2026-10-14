@@ -1,8 +1,7 @@
 //! A qwen3moe file's `--place`-unset decisions, read before any load and held
 //! to what the card runs: the CLI's (`q3place::unplaced_qwen3` at
-//! [`CLI_CTX`]) and the serve seat's (its `--ctx` search under
-//! `q3place::SERVE_RULE` for [`SERVE_PARALLEL`] slots, then the load it
-//! decides at the total). Both read the file's header and this card's census
+//! [`CLI_CTX`]) and the serve seat's (its own choice of context and load,
+//! `q3place::serve_choice`, for its default slots). Both read the file's header and this card's census
 //! only: no tensor byte, no upload. Where the whole load refuses the file
 //! (`Qwen3moeModel::whole_load`: the card kernel table names no entry for a
 //! layer's routed stacks) the answer must be the placed plan, and every layer
@@ -17,8 +16,10 @@
 use bloomery_gpu::Qwen3moeModel;
 use bloomery_gpu::arch::qwen3moe::KvQ8;
 use gguf::Split;
+use model::arch::Arch;
 use model::placement::PlanLevers;
 use model::placement::accepts::{self, Program};
+use model::placement::ctx_ask::DEFAULT_SLOTS;
 
 #[path = "qwen3moe_place.rs"]
 #[allow(
@@ -31,9 +32,6 @@ mod q3place;
 /// `--ctx` unset).
 pub const CLI_CTX: usize = 4096;
 
-/// The serve seat's resident sequences, `--parallel` unset.
-pub const SERVE_PARALLEL: usize = 2;
-
 /// The CLI's decision on `split`, as the words of one line, or why it is
 /// refused or breaks the rule above.
 pub fn cli_default(split: &Split) -> Result<String, String> {
@@ -42,28 +40,28 @@ pub fn cli_default(split: &Split) -> Result<String, String> {
     held(split, &u, CLI_CTX, whole_refuses)
 }
 
-/// The serve seat's decision on `split`: its `--ctx` search, then its load at
-/// the total, as for [`cli_default`].
+/// The serve seat's decision on `split`: its own choice of context and the
+/// load at it (`q3place::serve_choice`), as for [`cli_default`].
 pub fn serve_default(split: &Split) -> Result<String, String> {
     let whole_refuses = Qwen3moeModel::whole_load(split).is_err();
     let levers = PlanLevers::default();
-    let found = q3place::default_ctx_qwen3(
-        split,
-        None,
-        q3place::SERVE_RULE,
-        (SERVE_PARALLEL, &levers),
-        KvQ8::F16,
-    )
-    .map_err(|e| format!("the --ctx search refused: {e}"))?;
-    let total = found.slot.ctx * SERVE_PARALLEL;
-    let census = q3place::census().map_err(|e| format!("the census refused: {e}"))?;
-    let u = q3place::unplaced_qwen3_slots(split, &census, total, SERVE_PARALLEL, KvQ8::F16)
-        .map_err(|e| format!("the load at {total} positions refused: {e}"))?;
+    let opts = q3place::ServeOpts {
+        arch: Arch::Qwen3moe,
+        place: None,
+        levers: &levers,
+        kv: KvQ8::F16,
+        media: false,
+        encoder: None,
+    };
+    let (chosen, _) = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
+        .map_err(|e| format!("the --ctx choice refused: {e}"))?;
+    let total = usize::try_from(chosen.total).map_err(|e| e.to_string())?;
+    let u = match chosen.plan {
+        q3place::ServeLoad::Whole(card) => q3place::Unplaced::Whole(card),
+        q3place::ServeLoad::Placed { q, .. } => q3place::Unplaced::Placed(q),
+    };
     let how = held(split, &u, total, whole_refuses)?;
-    Ok(format!(
-        "ctx {} a slot ({}), {how}",
-        found.slot.ctx, found.basis
-    ))
+    Ok(format!("{}, {how}", chosen.line()))
 }
 
 /// The answer `u` at `ctx` positions held to the rule: the whole load only

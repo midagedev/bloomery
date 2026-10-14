@@ -40,19 +40,18 @@ use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::{CTX_GRAN, Place, PlaceWhy};
+use bloomery_gpu_gates::generate::{CTX_GRAN, Place, PlaceWhy, choose_ctx};
 use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
+use model::arch::Arch;
 use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
 use model::placement::accepts::{Program, routed_rule};
-use model::placement::ctx::{
-    ExpertBytes, SlotCtx, Veto, default_slot_ctx, default_slot_ctx_by_card,
-};
+use model::placement::ctx_ask::{Chosen, PlanRefusal, Probe};
 use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
     self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
@@ -66,50 +65,22 @@ use model::placement::{
 #[path = "plan_room.rs"]
 mod plan_room;
 
-/// The census readings this module took and the probes its context searches
-/// ran, since the process began: a caller reads them around a search
-/// ([`reads`], [`Reads::since`]), so a search that reads the census per
-/// probe shows in its counts.
+/// The census readings this module took since the process began: a caller
+/// reads them around a choice of context ([`census_reads`]), so a choice
+/// that reads the census per probe shows in its counts.
 static CENSUSES: AtomicUsize = AtomicUsize::new(0);
-static PROBES: AtomicUsize = AtomicUsize::new(0);
 
-/// The module's census readings and search probes at one moment ([`reads`]).
-#[allow(
-    dead_code,
-    reason = "the serve seat prints a search's counts; the CLI and the e2e gates include the planner without them"
-)]
+/// A choice of context's probes and the census readings it took
+/// ([`serve_choice`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reads {
     pub censuses: usize,
     pub probes: usize,
 }
 
-impl Reads {
-    /// The readings and probes taken since `before`.
-    #[allow(
-        dead_code,
-        reason = "the serve seat prints a search's counts; the CLI and the e2e gates include the planner without them"
-    )]
-    #[must_use]
-    pub fn since(self, before: Reads) -> Reads {
-        Reads {
-            censuses: self.censuses - before.censuses,
-            probes: self.probes - before.probes,
-        }
-    }
-}
-
-/// The census readings and search probes so far.
-#[allow(
-    dead_code,
-    reason = "the serve seat prints a search's counts; the CLI and the e2e gates include the planner without them"
-)]
-#[must_use]
-pub fn reads() -> Reads {
-    Reads {
-        censuses: CENSUSES.load(Ordering::Relaxed),
-        probes: PROBES.load(Ordering::Relaxed),
-    }
+/// The census readings so far.
+fn census_reads() -> usize {
+    CENSUSES.load(Ordering::Relaxed)
 }
 
 /// This process's census ([`bloomery_gpu_gates::gpu_census::census`]),
@@ -118,11 +89,6 @@ pub fn reads() -> Reads {
 pub fn census() -> Result<Vec<DeviceInfo>, GateError> {
     CENSUSES.fetch_add(1, Ordering::Relaxed);
     bloomery_gpu_gates::gpu_census::census()
-}
-
-/// One probe of a context search, counted.
-fn probed() {
-    PROBES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The levers a placed load acts on: the plan's card budget and the host
@@ -182,25 +148,6 @@ fn plan_inputs<'a>(
     Ok(match inputs {
         Inputs::Qwen3(i) => i.plan(machine, ctx, levers)?,
         Inputs::Qwen35(i) => i.plan_rule(machine, ctx, levers, routed_rule(Program::Qwen35Body))?,
-    })
-}
-
-/// [`plan_inputs`]'s routed-expert bytes on the card and on the NVMe tier.
-fn expert_bytes_of(
-    inputs: &Inputs,
-    machine: &Machine,
-    ctx: usize,
-    levers: &PlanLevers,
-) -> Result<ExpertBytes, GateError> {
-    let plan = plan_inputs(inputs, machine, ctx, levers)?;
-    Ok(ExpertBytes {
-        card: plan
-            .cards
-            .first()
-            .ok_or("a plan with no card")?
-            .expert_bytes,
-        nvme: plan.host.nvme_expert_bytes,
-        arena: plan.host.nvme_arena_bytes,
     })
 }
 
@@ -481,21 +428,6 @@ impl PlaceQ3 {
             slot_ctx,
             self.media,
         )
-    }
-
-    /// The routed-expert bytes the plan over `machine` at `ctx` (a total) holds
-    /// on the card and on the NVMe tier: one probe of a placed `--ctx` search.
-    /// The plan's own refusal is the refusal: a plan that keeps every routed
-    /// expert on the card opens placed ([`open_qwen3`]) like any other, its
-    /// arena the placed machine's, so the plan stands wherever it is made and
-    /// the search is monotone.
-    fn expert_bytes(
-        &self,
-        machine: &Machine,
-        ctx: usize,
-        levers: &PlanLevers,
-    ) -> Result<ExpertBytes, GateError> {
-        expert_bytes_of(&self.inputs, machine, ctx, levers)
     }
 
     /// The layers the model loads ([`layers_of`]).
@@ -882,235 +814,6 @@ pub fn unplaced_qwen3_slots(
 
 pub use bloomery_gpu_gates::generate::trained_ctx;
 
-/// The constants of the unset `--ctx` rule a seat supplies
-/// (`placement::ctx::default_slot_ctx_by_card`): the base context a slot
-/// takes, the step the answer moves in and the card expert bytes it may trade
-/// for positions.
-#[derive(Clone, Copy, Debug)]
-pub struct SlotRule {
-    pub base: usize,
-    pub step: usize,
-    pub margin: u64,
-}
-
-/// The qwen3 serve seat's rule: a slot's base `generate_qwen3moe`'s default
-/// context (4096), steps of [`CTX_GRAN`], a margin of
-/// [`workstation::MARGIN`] card expert bytes. The seat and
-/// `gate_qwen3moe_types` read this one.
-#[allow(
-    dead_code,
-    reason = "the serve seat and gate_qwen3moe_types read it; the CLI includes the planner without a seat"
-)]
-pub const SERVE_RULE: SlotRule = SlotRule {
-    base: 4096,
-    step: CTX_GRAN,
-    margin: workstation::MARGIN,
-};
-
-/// A default context and the load it was searched over.
-#[allow(
-    dead_code,
-    reason = "the serve seat reads the answer; the CLI and the e2e gates include the planner without it"
-)]
-#[derive(Clone, Copy, Debug)]
-pub struct Defaulted {
-    pub slot: SlotCtx,
-    /// `whole` or `placed`: the load the probes planned.
-    pub basis: &'static str,
-}
-
-/// The routed-expert bytes of every stack a whole load holds on the card: the
-/// file's own bytes of the layers the model loads.
-fn routed_bytes(model: &ModelTensors) -> u64 {
-    model
-        .tensors
-        .iter()
-        .filter(|t| t.role == Role::RoutedExperts && t.layer.is_none_or(|l| l < model.layers))
-        .map(|t| t.file_bytes)
-        .sum()
-}
-
-/// What a context search sizes the program by at a probe's total: the arena
-/// a placed machine carries past the m = 1 scratch, and what a whole load
-/// holds past its cache.
-struct Sizing<'a> {
-    arena: &'a dyn Fn(usize) -> Result<u64, GateError>,
-    load: &'a dyn Fn(usize) -> Result<WholeLoad, String>,
-}
-
-/// The slot context a run with `--ctx` unset takes
-/// (`placement::ctx::default_slot_ctx_by_card` under `rule`, the file's
-/// `cap`): the probes plan `slots` resident sequences of a slot's context
-/// each, the load counted at the total they hold, over one resolved `probe` —
-/// its place, inputs and sequences taken once, the machine relaid per probe,
-/// one census reading for the whole search. The load is the whole model on
-/// `a`'s card while `whole` — no `--place`, and the whole-fit verdict at the
-/// base takes it ([`PlaceQ3::unplaced_on`]) — its every routed expert on the
-/// card at every context (the verdict bounds the fit alone); else the placed
-/// plan on the probe's card, whose card and NVMe expert bytes the margin
-/// counts.
-///
-/// The card decides and the host room only vetoes, by the placement's fact on
-/// how far ([`Veto::of`] of the probe's machine): a qwen35moe file's placed
-/// plan reads a room, so it is probed a second time at an unbounded one
-/// ([`Inputs::room_free`]). The two other loads read none: a qwen3moe plan has
-/// no NVMe tier, and the whole load's verdict is a whole-load fit. Where each
-/// card has memory of its own they are one probe for both terms
-/// (`default_slot_ctx`, the same answer at half the probes). Where the card
-/// shares the host's memory (a unified pool) the pool is their room, the
-/// verdict and the plan are refused where it cannot hold them, and the ladder
-/// reads the one probe: every answer is a rung of the halving ladder from the
-/// cap.
-fn default_over(
-    probe: &PlaceQ3,
-    (cap, rule): (usize, SlotRule),
-    (slots, levers): (usize, &PlanLevers),
-    whole: bool,
-    sizing: &Sizing<'_>,
-) -> Result<Defaulted, GateError> {
-    let held = |ctx: usize| -> Result<ExpertBytes, GateError> {
-        probed();
-        let total = ctx.saturating_mul(slots);
-        if whole {
-            let verdict = probe.whole_at(u64::try_from(total)?, slots, (sizing.load)(total))?;
-            if !verdict.fits() {
-                return Err(verdict.line(total).into());
-            }
-            return Ok(ExpertBytes {
-                card: routed_bytes(inputs_model(&probe.inputs)),
-                nvme: 0,
-                arena: 0,
-            });
-        }
-        let machine = probe.machine_at((sizing.arena)(total)?, u64::try_from(ctx)?)?;
-        probe.expert_bytes(&machine, total, levers)
-    };
-    let free = if whole {
-        None
-    } else {
-        probe.inputs.room_free()
-    };
-    let veto = Veto::of(&probe.machine);
-    let slot = match (&free, veto) {
-        (Some(free), _) => {
-            let card = |ctx: usize| -> Result<ExpertBytes, GateError> {
-                probed();
-                let total = ctx.saturating_mul(slots);
-                let machine = probe.machine_at((sizing.arena)(total)?, u64::try_from(ctx)?)?;
-                expert_bytes_of(free, &machine, total, levers)
-            };
-            default_slot_ctx_by_card(cap, rule.base, rule.step, rule.margin, veto, &card, &held)?
-        }
-        // No room to read: the ladder asks no card, the other machine's rule
-        // is the one probe.
-        (None, Veto::Ladder) => {
-            default_slot_ctx_by_card(cap, rule.base, rule.step, rule.margin, veto, &held, &held)?
-        }
-        (None, Veto::Binary) => default_slot_ctx(cap, rule.base, rule.step, rule.margin, &held)?,
-    };
-    Ok(Defaulted {
-        slot,
-        basis: if whole { "whole" } else { "placed" },
-    })
-}
-
-/// Whether the whole load takes `rule`'s base at `slots` resident sequences:
-/// the verdict on `probe`'s card, one probe of the search it decides.
-fn whole_holds_base(
-    probe: &PlaceQ3,
-    rule: SlotRule,
-    slots: usize,
-    sizing: &Sizing<'_>,
-) -> Result<bool, GateError> {
-    probed();
-    let total = rule.base.saturating_mul(slots);
-    Ok(probe
-        .whole_at(u64::try_from(total)?, slots, (sizing.load)(total))?
-        .fits())
-}
-
-/// The slot context a run of a qwen3moe file with `--ctx` unset takes for
-/// `slots` resident sequences ([`default_over`]): on `a`'s card
-/// ([`PlaceQ3::unplaced_on`]) the whole load while its whole-fit verdict
-/// takes the base, else the placed plan on `place`'s card (`a`'s with no
-/// `--place`) under `levers`. The cap is the file's trained context, the
-/// rule's base when it states none.
-#[allow(
-    dead_code,
-    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
-)]
-pub fn default_ctx_qwen3(
-    file: &Split,
-    place: Option<Place>,
-    rule: SlotRule,
-    (slots, levers): (usize, &PlanLevers),
-    kv: KvQ8,
-) -> Result<Defaulted, GateError> {
-    record::require(
-        record::groups::qwen3moe_place::PLAN,
-        "qwen3moe_place::default_ctx_qwen3",
-    );
-    let census = census()?;
-    let at_base = rule.base.saturating_mul(slots);
-    let on = PlaceQ3::unplaced_on(&census)?;
-    let probe = PlaceQ3::qwen3_on(file, place.unwrap_or(on), &census, at_base, kv)?;
-    let sizing = Sizing {
-        arena: &|total| Ok(Qwen3moeModel::placed_arena_bytes(file, total)?),
-        load: &|_| qwen3_whole(file),
-    };
-    let whole = place.is_none() && whole_holds_base(&probe, rule, slots, &sizing)?;
-    let cap = trained_ctx(file).unwrap_or(rule.base);
-    default_over(&probe, (cap, rule), (slots, levers), whole, &sizing)
-}
-
-/// [`default_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context
-/// terms, for the load's `seqs`: every plan carries their rows ([`laid`]),
-/// its arena the load each slot's share opens at ([`share`]), and the whole
-/// verdict counts every slot's stores at its share of the total
-/// ([`kv_bytes`]: the attention planes at a slot's rows and the delta layers'
-/// fixed stores, once a slot, and on a media load a slot's rotation table);
-/// the image `encoder`'s bytes are a reserve of each plan.
-#[allow(
-    dead_code,
-    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
-)]
-pub fn default_ctx_qwen35(
-    file: &Split,
-    o: &Open35,
-    place: Option<Place>,
-    rule: SlotRule,
-    (seqs, levers, encoder): (Seqs, &PlanLevers, Option<u64>),
-) -> Result<Defaulted, GateError> {
-    record::require(
-        record::groups::qwen3moe_place::PLAN,
-        "qwen3moe_place::default_ctx_qwen35",
-    );
-    let census = census()?;
-    let slots = seqs.slots;
-    let at_base = rule.base.saturating_mul(slots);
-    let on = PlaceQ3::unplaced_on(&census)?;
-    let probe = PlaceQ3::qwen35_on(
-        file,
-        place.unwrap_or(on),
-        &census,
-        share(o, at_base, slots),
-        seqs,
-        encoder,
-    )?;
-    let sizing = Sizing {
-        arena: &|total| {
-            Ok(Qwen35moeModel::placed_arena_bytes(
-                file,
-                share(o, total, slots),
-            )?)
-        },
-        load: &|total| qwen35_whole(file, share(o, total, slots)),
-    };
-    let whole = place.is_none() && whole_holds_base(&probe, rule, slots, &sizing)?;
-    let cap = trained_ctx(file).unwrap_or(rule.base);
-    default_over(&probe, (cap, rule), (slots, levers), whole, &sizing)
-}
-
 /// What a run with `--place` unset loads, as [`unplaced_qwen3`] decides it,
 /// of a qwen35moe file under `o`: one sequence taking no checkpoints
 /// ([`unplaced_qwen35_slots`]), as the CLI's own runs do.
@@ -1144,6 +847,169 @@ pub fn unplaced_qwen35_slots(
     )?;
     let whole = probe.whole_at(u64::try_from(o.ctx)?, seqs.slots, qwen35_whole(file, at))?;
     probe.unplaced(o.ctx, &whole)
+}
+
+/// What shapes the qwen3 serve seat's load beside its context and slots: the
+/// file's family, `--place`, the plan's levers, the cache planes, and under
+/// `--mmproj` the media flag (every sequence holds the rotation table an
+/// image's positions rewrite) and the encoder's reserve on the stage card.
+#[derive(Clone, Copy)]
+pub struct ServeOpts<'a> {
+    pub arch: Arch,
+    pub place: Option<Place>,
+    pub levers: &'a PlanLevers,
+    pub kv: KvQ8,
+    pub media: bool,
+    pub encoder: Option<u64>,
+}
+
+/// What the serve seat's file loads as, decided once before the open at the
+/// total context — the context its whole-fit verdict and its plan count — so
+/// the open makes no fit call of its own ([`serve_load`]).
+#[allow(
+    dead_code,
+    reason = "the serve seat loads it; the routed legs and the types gate read its context"
+)]
+pub enum ServeLoad {
+    /// The whole model on this card, `a`'s: `--place` unset, and the
+    /// whole-fit verdict at the total on it takes the whole load.
+    Whole(CardSpec),
+    /// The placed plan made at `total` positions on `q`'s card: `--place`'s
+    /// (no `why`), or `a`'s card's when the whole load does not fit at the
+    /// total (`why` names that, [`WHY_NOT_WHOLE`]). Under `--place` whose
+    /// plan holds no host expert, `whole` is the card the whole model opens
+    /// on instead, when the whole-fit verdict takes it.
+    Placed {
+        q: Box<PlaceQ3>,
+        total: usize,
+        why: Option<&'static str>,
+        whole: Option<CardSpec>,
+    },
+}
+
+/// What a qwen35moe file's serve load opens at with a `ctx`-row cache: the
+/// tensor-core decode flash, the levers' ubatch and the `kv` planes, as
+/// `generate_qwen3moe` opens it, with `media`'s rotation tables.
+///
+/// # Errors
+/// The ubatch lever's refusal.
+pub fn serve_open35(ctx: usize, kv: KvQ8, media: bool) -> Result<Open35, GateError> {
+    Ok(Open35 {
+        ctx,
+        mma: true,
+        ubatch: bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size()?,
+        kv,
+        media,
+    })
+}
+
+/// The serve seat's load of `slots` resident sequences at `total` positions,
+/// decided on one census reading: under `--place`, the placed plan there;
+/// unset, the whole model while the whole-fit verdict takes it, else the
+/// placed plan ([`unplaced_qwen3_slots`], [`unplaced_qwen35_slots`]).
+///
+/// # Errors
+/// The plan's or the verdict's refusal.
+pub fn serve_load(
+    (split, census): (&Split, &[DeviceInfo]),
+    (total, slots): (usize, usize),
+    o: ServeOpts<'_>,
+) -> Result<ServeLoad, GateError> {
+    let unplaced = match (o.arch, o.place) {
+        (Arch::Qwen35moe, Some(p)) => {
+            let at = share(&serve_open35(total, o.kv, o.media)?, total, slots);
+            let seqs = seqs_qwen35(split, at.ubatch, slots)?;
+            let q = PlaceQ3::qwen35_on(split, p, census, at, seqs, o.encoder)?;
+            let plan = q.plan(total, o.levers)?;
+            let whole = q.whole_card_qwen35(split, &plan, (total, slots), at)?;
+            return Ok(ServeLoad::Placed {
+                q: Box::new(q),
+                total,
+                why: None,
+                whole,
+            });
+        }
+        (Arch::Qwen35moe, None) => {
+            let open = serve_open35(total, o.kv, o.media)?;
+            let seqs = seqs_qwen35(split, open.ubatch, slots)?;
+            unplaced_qwen35_slots(split, census, &open, seqs, o.encoder)?
+        }
+        (_, Some(p)) => {
+            let q = PlaceQ3::qwen3_on(split, p, census, total, o.kv)?;
+            let plan = q.plan(total, o.levers)?;
+            let whole = q.whole_card_qwen3(split, &plan, (total, slots))?;
+            return Ok(ServeLoad::Placed {
+                q: Box::new(q),
+                total,
+                why: None,
+                whole,
+            });
+        }
+        (_, None) => unplaced_qwen3_slots(split, census, total, slots, o.kv)?,
+    };
+    Ok(match unplaced {
+        Unplaced::Whole(card) => ServeLoad::Whole(card),
+        Unplaced::Placed(q) => ServeLoad::Placed {
+            q,
+            total,
+            why: Some(WHY_NOT_WHOLE),
+            whole: None,
+        },
+    })
+}
+
+/// The serve seat's context and the load at it, the seats' common choice
+/// ([`choose_ctx`]): a set `--ctx` (`set`) is the total the `slots` split,
+/// planned once at its share; unset, a slot asks the target and halves only
+/// while the plan is short. Each candidate is the load [`serve_load`] makes
+/// at its total, a placed one planned there too, so a short card shows here
+/// and not at the open, all on one census reading; the probes it ran and
+/// the readings it took come back beside the choice.
+///
+/// # Errors
+/// As [`choose_ctx`].
+pub fn serve_choice(
+    split: &Split,
+    (set, slots): (Option<usize>, usize),
+    o: ServeOpts<'_>,
+) -> Result<(Chosen<ServeLoad>, Reads), GateError> {
+    let before = census_reads();
+    let census = census()?;
+    let mut probes = 0;
+    let plan_at = |c: u64| -> Result<Probe<ServeLoad>, GateError> {
+        probes += 1;
+        let total = usize::try_from(c)?.saturating_mul(slots);
+        let load = match serve_load((split, &census), (total, slots), o) {
+            Ok(load) => load,
+            Err(e) => return short_or(e),
+        };
+        if let ServeLoad::Placed { q, total, .. } = &load
+            && let Err(e) = q.plan(*total, o.levers)
+        {
+            return short_or(e.into());
+        }
+        Ok(Probe::Holds(load))
+    };
+    let chosen = choose_ctx(split, (set, slots), (None, None), plan_at)?;
+    let censuses = census_reads() - before;
+    Ok((chosen, Reads { censuses, probes }))
+}
+
+/// A plan's refusal as a short memory ([`Probe::Short`]), else the refusal
+/// as it stands.
+fn short_or(e: GateError) -> Result<Probe<ServeLoad>, GateError> {
+    let short = e
+        .downcast_ref::<q3::PlaceError>()
+        .and_then(PlanRefusal::short)
+        .or_else(|| {
+            e.downcast_ref::<q35::PlaceError>()
+                .and_then(PlanRefusal::short)
+        })
+        .or_else(|| {
+            e.downcast_ref::<PlacementError>()
+                .and_then(PlacementError::card_short)
+        });
+    short.map(Probe::Short).ok_or(e)
 }
 
 /// The load a run with `--place` unset takes ([`unplaced_qwen3`]), on `a`'s

@@ -1,9 +1,9 @@
 //! qwen3moe (Qwen3-30B-A3B): the two `--place`-unset production defaults
 //! that plan a qwen3moe file, as `generate_qwen3moe` and the qwen3 serve
 //! seat call the planner. The CLI's is `q3place::unplaced_qwen3` at the
-//! CLI's 4096 for one sequence; the seat's is its `--ctx` search
-//! (`q3place::default_ctx_qwen3` under `q3place::SERVE_RULE` for two
-//! slots) and then its load at the total (`q3place::unplaced_qwen3_slots`).
+//! CLI's 4096 for one sequence; the seat's is its own choice of context and
+//! load (`q3place::serve_choice` for the default slots), then its load at the
+//! total (`q3place::unplaced_qwen3_slots`).
 //! The forced rooms go through the `PlaceQ3::plan` the defaults hand their
 //! answer to, at the arm's context and slots. The cache planes are the
 //! default f16 (`KvQ8::F16`).
@@ -13,14 +13,13 @@ use super::{Adapter, Arm, Outcome, outcome_of, view_of};
 use bloomery_gpu::arch::qwen3moe::KvQ8;
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
+use model::arch::Arch;
 use model::placement::PlanLevers;
+use model::placement::ctx_ask::DEFAULT_SLOTS;
 
 /// The CLI's default context (`generate_qwen3moe`'s `--ctx` unset), the
 /// precedent gate's own constant (`shared/qwen3moe_types.rs`'s `CLI_CTX`).
 const CLI_CTX: usize = 4096;
-
-/// The serve seat's resident sequences, `--parallel` unset.
-const SERVE_PARALLEL: usize = 2;
 
 /// The family's adapter, one row of the gate's dispatch.
 pub(super) struct Row;
@@ -32,21 +31,23 @@ impl Adapter for Row {
 
     fn arms(&self, split: &Split) -> Vec<Result<Arm, Outcome>> {
         let cli = arm(split, "cli", CLI_CTX, 1);
-        // The seat's `--ctx` search first (its rule for two slots), then its
-        // load at the total.
+        // The seat's own choice of context first, then its load at the
+        // total.
         let levers = PlanLevers::default();
-        let serve = q3place::default_ctx_qwen3(
-            split,
-            None,
-            q3place::SERVE_RULE,
-            (SERVE_PARALLEL, &levers),
-            KvQ8::F16,
-        )
-        .map_err(|e| outcome_of(e.as_ref()))
-        .and_then(|found| {
-            let total = found.slot.ctx.saturating_mul(SERVE_PARALLEL);
-            arm(split, "serve", total, SERVE_PARALLEL)
-        });
+        let opts = q3place::ServeOpts {
+            arch: Arch::Qwen3moe,
+            place: None,
+            levers: &levers,
+            kv: KvQ8::F16,
+            media: false,
+            encoder: None,
+        };
+        let serve = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
+            .map_err(|e| outcome_of(e.as_ref()))
+            .and_then(|(chosen, _)| {
+                let total = usize::try_from(chosen.total).map_err(|e| outcome_of(&e))?;
+                arm(split, "serve", total, DEFAULT_SLOTS)
+            });
         vec![cli, serve]
     }
 }

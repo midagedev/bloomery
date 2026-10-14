@@ -3,10 +3,10 @@
 //! it, as `generate_qwen3moe` and the qwen3 serve seat call the planner. The
 //! CLI's is `q3place::unplaced_qwen35` at the CLI's 4096 for one sequence
 //! (the default `Open35`: the tensor-core flash, the default ubatch, the f16
-//! cache, no media load); the seat's is its `--ctx` search
-//! (`q3place::default_ctx_qwen35` under `q3place::SERVE_RULE` for two slots
-//! that take checkpoints, `q3place::seqs_qwen35`) and then its load at the
-//! total (`q3place::unplaced_qwen35_slots`). The forced rooms go through
+//! cache, no media load); the seat's is its own choice of context and load
+//! (`q3place::serve_choice` for the default slots, which take checkpoints,
+//! `q3place::seqs_qwen35`), then its load at the total
+//! (`q3place::unplaced_qwen35_slots`). The forced rooms go through
 //! the `PlaceQ3::plan` the defaults hand their answer to, at the arm's
 //! context and slots.
 
@@ -16,14 +16,13 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35};
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
+use model::arch::Arch;
 use model::placement::PlanLevers;
+use model::placement::ctx_ask::DEFAULT_SLOTS;
 
 /// The CLI's default context (`generate_qwen3moe`'s `--ctx` unset), the
 /// precedent gate's own constant (`shared/qwen3moe_types.rs`'s `CLI_CTX`).
 const CLI_CTX: usize = 4096;
-
-/// The serve seat's resident sequences, `--parallel` unset.
-const SERVE_PARALLEL: usize = 2;
 
 /// The family's adapter, one row of the gate's dispatch.
 pub(super) struct Row;
@@ -41,37 +40,32 @@ impl Adapter for Row {
     }
 }
 
-/// The seat's arm: its `--ctx` search first — the rule for two checkpointing
-/// slots, probed at the base context the seat itself names — then its load
-/// at the total.
+/// The seat's arm: its own choice of context first, then its load at the
+/// total.
 fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
     let levers = PlanLevers::default();
-    let seqs = q3place::seqs_qwen35(split, ubatch_size().map_err(gpu_red)?, SERVE_PARALLEL)
+    let opts = q3place::ServeOpts {
+        arch: Arch::Qwen35moe,
+        place: None,
+        levers: &levers,
+        kv: KvQ8::F16,
+        media: false,
+        encoder: None,
+    };
+    let (chosen, _) = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
         .map_err(|e| outcome_of(e.as_ref()))?;
-    let found = q3place::default_ctx_qwen35(
-        split,
-        &open35(q3place::SERVE_RULE.base)?,
-        None,
-        q3place::SERVE_RULE,
-        (seqs, &levers, None),
-    )
-    .map_err(|e| outcome_of(e.as_ref()))?;
-    let total = found.slot.ctx.saturating_mul(SERVE_PARALLEL);
+    let total = usize::try_from(chosen.total).map_err(|e| outcome_of(&e))?;
+    let seqs = q3place::seqs_qwen35(split, ubatch_size().map_err(gpu_red)?, DEFAULT_SLOTS)
+        .map_err(|e| outcome_of(e.as_ref()))?;
     // The seat passes the total-context `Open35`; the default shares it
     // across the slots itself.
     arm(split, "serve", &open35(total)?, seqs)
 }
 
-/// The seat's `open35` at `ctx` (`serve_seats/qwen3.rs`): the tensor-core
+/// The seat's `Open35` at `ctx` (`q3place::serve_open35`): the tensor-core
 /// flash, the default ubatch, the f16 cache, no media load.
 fn open35(ctx: usize) -> Result<Open35, Outcome> {
-    Ok(Open35 {
-        ctx,
-        mma: true,
-        ubatch: ubatch_size().map_err(gpu_red)?,
-        kv: KvQ8::F16,
-        media: false,
-    })
+    q3place::serve_open35(ctx, KvQ8::F16, false).map_err(|e| outcome_of(e.as_ref()))
 }
 
 /// One arm's default at the context `o` names for its `seqs`: the

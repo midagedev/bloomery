@@ -4478,7 +4478,7 @@ mod tests {
                 ],
             ),
             (
-                "qwen3 seat: Flags::encoder, default_ctx_qwen3, bind::spawn",
+                "qwen3 seat: Flags::encoder, q3place::serve_choice, bind::spawn",
                 BLOOMERY_SERVE_QWEN3,
                 &[
                     model_file::FETCH,
