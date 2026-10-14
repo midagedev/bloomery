@@ -230,6 +230,7 @@ cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/dspark-path.sh" "$ROOT/tool
   "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" "$ROOT/tools/ref/drive-read.sh" \
   "$ROOT/tools/ref/bin-label.sh" \
   "$T/tools/ref/"
+cp "$ROOT/tools/gate-bound.sh" "$T/tools/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
 # records.py and the checked-in schemas: the runner reads the arm's residency, mtp and stat records by kind.
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"

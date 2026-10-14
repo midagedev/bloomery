@@ -34,7 +34,7 @@ T=$tmp/tree
 mkdir -p "$T/tools/ref" "$T/docs/cards" "$tmp/old/tools" "$tmp/nocard/tools/ref"
 cp "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease-hold.sh" "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" \
   "$ROOT/tools/ref/card-precheck.sh" "$T/tools/ref/"
-cp "$ROOT/tools/gpu-ab.py" "$T/tools/"
+cp "$ROOT/tools/gpu-ab.py" "$ROOT/tools/gate-bound.sh" "$T/tools/"
 cp "$ROOT"/docs/cards/*.card "$HERE/hcpre-ab.card" "$HERE/exclusive.card" "$T/docs/cards/"
 echo 'BLOOMERY_BOX_ENV' > "$T/tools/box.sh"
 cp "$T/tools/box.sh" "$tmp/old/tools/box.sh"
@@ -1137,7 +1137,8 @@ else
 fi
 
 # tools/gate.sh --oxide builds for the arch tools/arch.sh reads (BLOOMERY_ARCH, sm_86 unset) and refuses a value that is no arch by
-# name before cargo runs; a call without --oxide never reads it. The stub timeout drops its two words and the stub cargo prints its.
+# name before cargo runs; a call without --oxide never reads it. A call with a test filter passes cargo's output through and ends 78
+# when no test passed. The stub timeout drops its two words and the stub cargo prints its.
 GS=$tmp/gateshtree
 mkdir -p "$GS/tools" "$GS/stub"
 cp "$ROOT/tools/gate.sh" "$ROOT/tools/gate-bound.sh" "$ROOT/tools/arch.sh" "$GS/tools/"
@@ -1151,6 +1152,9 @@ run 'gate.sh: --oxide builds for BLOOMERY_ARCH' 0 '^cargo oxide test --arch sm_1
 run 'gate.sh: --oxide refuses a BLOOMERY_ARCH that is no arch, by name' 64 "gate.sh: BLOOMERY_ARCH is a CUDA arch.*got 'sm121'" gs BLOOMERY_ARCH=sm121
 GS_ARGS=(-p x --release --lib)
 run 'gate.sh: a plain cargo test never reads BLOOMERY_ARCH' 0 '^cargo test -p x --release --lib$' gs BLOOMERY_ARCH=sm121
+GS_ARGS=(-p x --release --lib -- f)
+run "gate.sh: a filter's call passes cargo's output through" 78 '^cargo test -p x --release --lib -- f$' gs
+has '  … and ends 78 when no test passed, by name' 'the filter f matched no test'
 
 # card-precheck.sh: lease_card before the build, with the recipe's own card or the environment's.
 pre() {

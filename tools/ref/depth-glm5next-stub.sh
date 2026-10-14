@@ -222,6 +222,7 @@ cp "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/dspark-path.sh" "$ROOT/tools/
   "$ROOT/tools/ref/gguf-ranges.py" "$ROOT/tools/ref/lever-arms.sh" "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" \
   "$T/tools/ref/"
 cp "$ROOT/tools/ref/models/glm5next.sh" "$T/tools/ref/models/"
+cp "$ROOT/tools/gate-bound.sh" "$T/tools/"
 cp "$ROOT/tools/bloomery/records.py" "$T/tools/bloomery/"
 # The lever registry, which a lever arm's NAME=VALUE list is checked against (before the stub binaries are
 # written, so they are newer than every crates/ source).

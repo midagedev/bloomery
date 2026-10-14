@@ -71,13 +71,19 @@ for a in "$@"; do
   esac
 done
 if [ "${#FILTERS[@]}" = 0 ] || [ "$LISTING" = 1 ]; then
-  timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@"
+  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@"
   rc=$?
 else
   LOG=$(mktemp)
-  trap 'rm -f "$LOG"' EXIT
-  timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@" | tee "$LOG"
-  rc=${PIPESTATUS[0]}
+  trap 'rm -f "$LOG" "$LOG.out"' EXIT
+  # cargo's output reaches tee through a FIFO, not a pipe: in a pipeline run_bounded would run in a subshell that a TERM to this
+  # runner does not reach.
+  mkfifo "$LOG.out"
+  tee "$LOG" < "$LOG.out" &
+  TEE_PID=$!
+  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@" > "$LOG.out"
+  rc=$?
+  wait "$TEE_PID"
   if [ "$rc" -eq 0 ]; then
     passed=$(awk '/^test result: / { for (i = 2; i <= NF; i++) if ($i == "passed;") n += $(i - 1) } END { print n + 0 }' "$LOG")
     if [ "$passed" -eq 0 ]; then

@@ -17,7 +17,8 @@ export BLOOMERY_DATA
 # depth/profile runners use; this runner used to pin the 3090 by hand and print no card name.
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
-# The lease and the witness fields.
+# The lease, the witness fields and run_bounded (tools/gate-bound.sh, through lease.sh): an ended
+# runner takes its binary, and the lease the binary holds, with it.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 NAME=${1:?usage: time-gate.sh <gate_bin_name> [extra args...]}
@@ -35,7 +36,7 @@ witness pre
 # spot, and the post witness and the rc line never print (measured 2026-09-21 — a FAIL-first
 # timing run lost its post witness). A failing timed run must still be a complete record.
 rc=0
-timeout --kill-after=10 600 "$BIN" "${ARGS[@]}" || rc=$?
+run_bounded timeout --kill-after=10 600 "$BIN" "${ARGS[@]}" || rc=$?
 witness post
 echo "$NAME ${ARGS[*]} rc=$rc"
 exit $rc

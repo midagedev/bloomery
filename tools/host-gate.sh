@@ -22,7 +22,7 @@ source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
 gate_bound host-gate.sh || exit $?
 EXE=./target/release/$NAME
 [ -x "$EXE" ] || { echo "host-gate.sh: no $EXE — the recipe builds it before calling this" >&2; exit 2; }
-timeout --kill-after=10 "$BOUND" "$EXE" "$@"
+run_bounded timeout --kill-after=10 "$BOUND" "$EXE" "$@"
 rc=$?
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
   echo "HOST GATE TIMED OUT: $NAME after the ${BOUND}s bound (exit $rc) — a gate that hangs is a red gate, not a silent one" >&2

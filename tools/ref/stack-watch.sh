@@ -14,8 +14,10 @@
 # 'thread apply all bt'` when gdb is on PATH, else every thread's /proc/<pid>/task/*/{comm,wchan,stack},
 # else a line saying neither is there. The dump goes to stderr, each line prefixed `stack-watch:`.
 # QUIET counts from the last byte the command wrote; the command's own output reaches stdout within a
-# second of being written (stdout and stderr merged). Exit: the command's code (143 or 137 when the watch
-# ended it), 64 on a bad command line.
+# second of being written (stdout and stderr merged). A TERM or HUP to the watch goes on to the command and
+# to a dump under way as a TERM; so does an INT when the watch runs in the foreground (bash starts a command
+# run with & with INT ignored, and tools/gpu-gate.sh, which starts the watch so, sends it a TERM for its own
+# INT). Exit: the command's code (143 or 137 when the watch ended it), 64 on a bad command line.
 set -uo pipefail
 
 usage() {
@@ -46,26 +48,35 @@ comm_of() {
   printf '%s\n' "${c:0:15}"
 }
 
+# dump_stacks <pid>: a gdb dump runs in the background as the watch's $dump and is waited for, so a TERM
+# to the watch is heard during it (the watch's trap reads $pid and $dump, so neither is a local here).
 dump_stacks() {
-  local pid=$1 t
+  local target=$1 t
   if command -v gdb > /dev/null; then
-    timeout 120 gdb -p "$pid" -batch -ex 'thread apply all bt' 2>&1 | sed 's/^/stack-watch: /' >&2
-  elif [ -d "/proc/$pid/task" ]; then
-    for t in /proc/"$pid"/task/*; do
+    timeout 120 gdb -p "$target" -batch -ex 'thread apply all bt' > >(sed 's/^/stack-watch: /' >&2) 2>&1 &
+    dump=$!
+    wait "$dump"
+    dump=''
+  elif [ -d "/proc/$target/task" ]; then
+    for t in /proc/"$target"/task/*; do
       echo "stack-watch: == ${t##*/} $(cat "$t/comm" 2> /dev/null) wchan=$(cat "$t/wchan" 2> /dev/null)" >&2
       sed 's/^/stack-watch:    /' "$t/stack" >&2 2> /dev/null
     done
   else
-    echo "stack-watch: no stack source here (no gdb on PATH, no /proc/$pid/task)" >&2
+    echo "stack-watch: no stack source here (no gdb on PATH, no /proc/$target/task)" >&2
   fi
 }
 
 watch() {
-  local quiet=$1 comm=$2 log pid sent=0 size last_change=$SECONDS target='' rc c p
+  local quiet=$1 comm=$2 log pid sent=0 size last_change=$SECONDS target='' rc c p dump=''
   shift 3
   log=$(mktemp "${TMPDIR:-/tmp}/stack-watch.XXXXXX") || return 70
   "$@" > "$log" 2>&1 &
   pid=$!
+  # A command under timeout runs in a process group of its own, which a signal to the watch's group never reaches: a TERM or HUP
+  # to the watch (an INT too, in the foreground) goes on to the command and to a dump under way, and the loop below waits for the
+  # command's end. The trap ignores further signals, so no later one cuts that wait short.
+  trap 'trap "" TERM INT HUP; kill -TERM "$pid" ${dump:+"$dump"} 2> /dev/null' TERM INT HUP
   # Pass new bytes of the log through; true when there were any.
   flush_log() {
     size=$(wc -c < "$log" | tr -d ' ')
@@ -103,10 +114,10 @@ watch() {
 }
 
 # The watch on stub commands: output passes through and the code is the command's; a quiet stub named
-# by its comm is dumped and ended; a quiet command with no such process is left to finish. One line a
-# case; exit 0 iff none failed.
+# by its comm is dumped and ended; a quiet command with no such process is left to finish; a TERM during
+# a dump ends the dump and the command. One line a case; exit 0 iff none failed.
 self_test() {
-  local self t bad=0 out rc
+  local self t bad=0 out rc w k s left
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   t=$(mktemp -d "${TMPDIR:-/tmp}/stack-watch-test.XXXXXX") || return 70
   # shellcheck disable=SC2064 # the path is fixed now
@@ -126,6 +137,26 @@ self_test() {
   case_ '  … and its later output kept' 0 '^late$' "$rc" "$t/c"
   rc=0; bash "$self" x sleep -- true > "$t/d" 2>&1 || rc=$?
   case_ 'QUIET not a whole number: 64' 64 'usage' "$rc" "$t/d"
+  # A TERM during a dump (a gdb that holds) ends the dump and the command at once, and a second TERM while the watch waits for the
+  # command does not cut that wait short: the code is the command's (7, two seconds after its TERM) and neither is left.
+  mkdir "$t/bin"
+  printf '%s\n' '#!/bin/sh' 'echo $$ > "$SW_GDB"' 'exec sleep 10' > "$t/bin/gdb"
+  printf '%s\n' 'echo $$ > "$SW_CMD"' "trap 'sleep 2; exit 7' TERM" 'sleep 30 &' 'wait' > "$t/cmd"
+  chmod +x "$t/bin/gdb"
+  command -v timeout > /dev/null || cp "${self%/*}/stub-timeout.py" "$t/bin/timeout"
+  SW_GDB=$t/gdb.pid SW_CMD=$t/cmd.pid PATH=$t/bin:$PATH bash "$self" 1 sleep -- sh "$t/cmd" > "$t/e" 2>&1 &
+  w=$! k=0
+  until [ -s "$t/gdb.pid" ] || [ "$k" = 50 ]; do sleep 0.2; k=$((k + 1)); done
+  s=$SECONDS
+  kill -TERM "$w"
+  sleep 1.5
+  kill -TERM "$w"
+  rc=0; wait "$w" || rc=$?
+  left=
+  kill -0 "$(cat "$t/gdb.pid" 2> /dev/null)" 2> /dev/null && left="$left gdb"
+  kill -0 "$(cat "$t/cmd.pid")" 2> /dev/null && left="$left command"
+  echo "dumping: $([ -s "$t/gdb.pid" ] && echo yes || echo no), ended in $((SECONDS - s)) s, left:${left:- none}" >> "$t/e"
+  case_ 'a TERM during the dump ends it and the command, their code kept' 7 'dumping: yes, ended in [0-7] s, left: none$' "$rc" "$t/e"
   [ "$bad" = 0 ] && echo "stack-watch self-test: ok" || echo "stack-watch self-test: $bad failed"
   [ "$bad" = 0 ]
 }

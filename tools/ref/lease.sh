@@ -66,6 +66,9 @@ LEASE_TREE=$(cd "$__lease_dir/../.." 2> /dev/null && pwd) || LEASE_TREE=
 # The lease's file, its probe, the holds, box.sh's guard, lease_holders and now: lease-probe.sh.
 # shellcheck source=tools/ref/lease-probe.sh
 source "$__lease_dir/lease-probe.sh"
+# run_bounded, which lease_bounded runs its command through: tools/gate-bound.sh.
+# shellcheck source=tools/gate-bound.sh
+source "$__lease_dir/../gate-bound.sh"
 unset __lease_dir
 
 # The lease is descriptor 9 on LEASE_LOCK, held until the runner exits or calls lease_release — and
@@ -442,7 +445,12 @@ lease_take() {
 # code returned. Every process a runner starts under the lease goes through it or its own `timeout`:
 # the lease stays held while any process that inherited descriptor 9 lives, so a hung child must end
 # at a bound instead of holding the machine. A command cut off there prints `[bound]` on stderr: a
-# child that hangs is a failed run, not a slow one. The command is an executable, not a shell
+# child that hangs is a failed run, not a slow one. The command runs through run_bounded
+# (tools/gate-bound.sh), so a TERM, INT or HUP to the runner ends the command first; the runner then
+# stops on that signal as it would have (by its own trap, if it set one), not at its next arm. Where
+# lease_bounded runs in a subshell (`out=$(lease_bounded …)`, a pipeline), a signal to the runner's
+# pid alone does not reach it: the runner ends and the command runs on to its bound. A signal to the
+# runner's group ends both. The command is an executable, not a shell
 # function or an assignment: `lease_bounded "$LEASE_ARM_BOUND" env K=V "$BIN" …`. LEASE_ARM_BOUND is
 # BLOOMERY_ARM_BOUND, default 900 s — the arm bound the depth, nsys and ncu runners read too; a
 # runner whose children run longer names its own. A bound that is not a positive integer is refused
@@ -458,11 +466,12 @@ lease_bounded() {
       ;;
   esac
   shift
-  timeout --kill-after=10 "$bound" "$@" || rc=$?
+  run_bounded timeout --kill-after=10 "$bound" "$@" || rc=$?
   case $rc in
     124) echo "[bound] $1 cut off at its ${bound} s bound (rc 124)" >&2 ;;
     137) echo "[bound] $1 killed (rc 137: the bound's KILL ${bound} s + 10 s in, or another SIGKILL)" >&2 ;;
   esac
+  [ -z "$BIN_SIGNAL" ] || kill -s "$BIN_SIGNAL" $$ 2> /dev/null
   return "$rc"
 }
 
@@ -874,7 +883,8 @@ decode_bin() { echo "$HOME/repo/$1/$DECODE_BIN"; }
 # first on PATH in a temp dir (the made-up UUIDs the stub tests use, never the box's), with no
 # card, no lock and no /proc — the holder lines name a pid that does not resolve. The waits scale
 # to seconds (LEASE_GPU_POLL/REPORT/WAIT of 1/1/2), and the four lease_gpu_idle cases sleep 4 s
-# between them; the trace cases (a temp lease and trace, no /root) follow. just check-recipes runs this
+# between them; the trace cases (a temp lease and trace, no /root) follow, then lease_bounded's under
+# a TERM (a temp lease; the stand-in timeout where there is no timeout). just check-recipes runs this
 # on the Mac.
 # Trace-write checks name the failed path and preserve continuation, not the OS's localized wording.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
@@ -1131,6 +1141,50 @@ EOF
     unset BLOOMERY_LEASE_TRACE BLOOMERY_LEASE_CARD
   fi
   # ---- end the trace ----
+  # ---- lease_bounded ----
+  # A runner that holds a lease (a temp file) runs a stub under lease_bounded and then its next arm; the
+  # stub writes its pid and its parent's (its timeout), ends 7 on a TERM and holds otherwise. A TERM to
+  # the runner's pid ends the stub, its timeout and then the runner, by the runner's own TERM trap when it
+  # set one, within seconds: the lease is free once the runner is gone and the next arm never starts. A
+  # stub still there once the checks are made is let go. Of the output only the runner's own two lines
+  # are read: the stub's /bin/sh may report its sleep ended by the group's TERM. The command reads the
+  # runner's stdin.
+  if command -v flock > /dev/null 2>&1; then
+    command -v timeout > /dev/null || cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout"
+    printf '%s\n' '#!/bin/sh' 'echo "$$ $PPID" > "$1"' 'trap "exit 7" TERM' 'while :; do sleep 1; done' > "$t/held"
+    chmod +x "$t/held"
+    n=0
+    for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
+      n=$((n + 1))
+      s0=$SECONDS
+      bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp lease_bounded 20 \"\$3\" \"\$4\"; echo next arm; }" \
+        _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" > "$t/bout$n" 2>&1 &
+      rp=$!
+      for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        [ -s "$t/held$n.pid" ] && break
+        sleep 0.5
+      done
+      kill -TERM "$rp" 2> /dev/null
+      RC=0
+      wait "$rp" || RC=$?
+      left='' sp=''
+      if [ -s "$t/held$n.pid" ]; then
+        read -r sp ip < "$t/held$n.pid"
+        if kill -0 "$sp" 2> /dev/null; then left="$left stub"; fi
+        if kill -0 "$ip" 2> /dev/null; then left="$left timeout"; fi
+      fi
+      lk=free
+      lease_free "$t/blease$n" 2> /dev/null || lk=held
+      [ -z "$left" ] || kill -TERM "$sp" 2> /dev/null
+      OUT="stub ran: $([ -n "$sp" ] && echo yes || echo no), left:${left:- none}, lease: $lk, ended in $((SECONDS - s0)) s, out: [$(grep -E '^(trap ran|next arm)$' "$t/bout$n" | tr '\n' ' ')]"
+      check "bounded-term${trp:+-trap}-rc" "$RC" 143
+      matches "bounded-term${trp:+-trap}" "^stub ran: yes, left: none, lease: free, ended in [0-9] s, out: \[${trp:+trap ran }\]\$" "$OUT"
+    done
+    check bounded-stdin "$(printf 'stdin reaches it\n' | lease_bounded 10 cat 2>&1)" 'stdin reaches it'
+  else
+    echo "skip lease_bounded: no flock(1) and no tools/ref/card-tests/bin/flock stand-in"
+  fi
+  # ---- end lease_bounded ----
   # ---- the witness fields' variables ----
   # witness refuses by name, before any line, a field whose variable the runner did not set.
   OUT=$(WITNESS=(head table); DIR=/d; DEV=sda; unset SRC; witness pre 2>&1); RC=$?

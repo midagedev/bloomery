@@ -30,6 +30,7 @@ trap cleanup EXIT
 mkdir -p "$tmp/tree/tools/ref" "$tmp/bin"
 cp "$LEASE" "$tmp/tree/tools/ref/lease.sh"
 cp "$ROOT/tools/ref/lease-probe.sh" "$tmp/tree/tools/ref/"
+cp "$ROOT/tools/gate-bound.sh" "$tmp/tree/tools/"
 L=$tmp/tree/tools/ref/lease.sh
 n=0 failed=0
 
