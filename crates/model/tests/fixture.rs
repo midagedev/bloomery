@@ -3327,10 +3327,7 @@ fn fixture_nemotron_round_trip() {
 /// pinned on both sides. A `[1, n]` F32 is a per-channel parameter: the family's constant when it
 /// names the leaf (`ssm_a`, `ssm_d`, stored `[1, heads]`), refused by name when it names none, as a
 /// 1-D tensor is. A `[n, 1]` tensor (a projection of n inputs to one output, the V4.1 draft's
-/// `conf_proj.weight`) and an F32 `[n, m]` are matrices, drawn at σ = 1/√n. Judged by the number of
-/// dims a `[1, 4]` went to the matrix rule and was filled at σ = 1 with the family's value never
-/// asked; judged by "every dim but one is 1" a `[4, 1]` became a vector and the V4.1 draft's plan
-/// died with `NoFillRule`.
+/// `conf_proj.weight`) and an F32 `[n, m]` are matrices, drawn at σ = 1/√n.
 #[test]
 fn fixture_a_vector_by_shape_is_not_a_matrix() {
     let guard = dir("nemo-vector");
@@ -3462,6 +3459,26 @@ fn fixture_nemotron_refuses_a_map_that_loses_a_kind_or_a_pair() {
         Ok(_) => bad.push("a cut of a keyless source: planned".into()),
     }
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// A source that carries `split.no` and neither `split.count` nor
+/// `split.tensors.count` is refused by name. Those two values are copied onto
+/// a later shard from the source, so a partial set is not a keyless file.
+#[test]
+fn fixture_nemotron_refuses_a_partial_split() {
+    let guard = dir("nemo-partial-split");
+    let src = nemo_source(
+        &guard.0.join("src.gguf"),
+        &[],
+        &[("split.no", Value::U16(0))],
+    );
+    let spec = nemo_spec();
+    match fixture::plan(&spec, &src, None, &spec.options()) {
+        Err(e) if e.to_string().contains("split.count") && e.to_string().contains("absent") => {
+            println!("nemotron partial split: {e}");
+        }
+        other => panic!("a source with split.no alone: {other:?}"),
+    }
 }
 
 /// Contract 22: the spec's window holds every quantized (type, K) of the real file's census (Q5_0

@@ -238,10 +238,8 @@ impl Family for Nemo {
 
 /// The engine reads `fixture`'s header as `spec`'s layers whose kinds, KV head
 /// counts and feed-forward lengths are the source layers', at the source's
-/// globals and Mamba-2 widths, under a map [`check_map`] accepts; and every
-/// tensor of the fixture is a tensor of the source (renamed through the map) at
-/// its dims and type. The planner makes the second true by construction; this
-/// reads it back from the file.
+/// globals and Mamba-2 widths, under a map [`check_map`] accepts. Tensor names,
+/// dims and types are the plan's, which `verify` holds the file to.
 pub fn check_kinds(
     spec: &FixtureSpec,
     fixture: &Split,
@@ -298,39 +296,5 @@ pub fn check_kinds(
             format!("{}, the source's {}", fx.rms_eps, src.rms_eps),
         ));
     }
-    check_tensors(spec, fixture, source)?;
     Ok(fx)
-}
-
-/// Each tensor of `fixture` is the source tensor of its name (a layer's through
-/// `spec.layers`) at the same dims and type.
-fn check_tensors(spec: &FixtureSpec, fixture: &Split, source: &Split) -> Result<(), FixtureError> {
-    for (_, t) in fixture.iter_tensors() {
-        let from = match split_layer(&t.name) {
-            Some((f, leaf)) => match spec.layers.get(f) {
-                Some(l) => format!("blk.{l}.{leaf}"),
-                None => {
-                    return Err(FixtureError::Mismatch {
-                        what: t.name.clone(),
-                        detail: format!("is a layer past the map's {}", spec.layers.len()),
-                    });
-                }
-            },
-            None => t.name.clone(),
-        };
-        let (_, s) = source.find(&from).ok_or_else(|| FixtureError::Mismatch {
-            what: t.name.clone(),
-            detail: format!("has no source tensor {from}"),
-        })?;
-        if s.ty != t.ty || s.dims != t.dims {
-            return Err(FixtureError::Mismatch {
-                what: t.name.clone(),
-                detail: format!(
-                    "{} {:?}, the source's {from} {} {:?}",
-                    t.ty, t.dims, s.ty, s.dims
-                ),
-            });
-        }
-    }
-    Ok(())
 }
