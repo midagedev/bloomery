@@ -283,7 +283,8 @@ def drain(kids):
                 os.close(t.src)
                 t.src = None
                 break
-            write_all(t.dst, chunk)
+            with contextlib.suppress(BrokenPipeError):  # a reader that closed early: its bytes are dropped, the job goes on
+                write_all(t.dst, chunk)
             t.n += len(chunk)
 
 
@@ -1388,6 +1389,25 @@ def case_signal_then_done(fx):
             fx.fake.polls = 0
 
 
+def case_drain_closed_reader(fx):
+    src_r, src_w = os.pipe()
+    dst_r, dst_w = os.pipe()
+    os.set_blocking(src_r, False)
+    os.close(dst_r)  # the reader of our stdout went away (`| head`, `| grep -q`)
+    os.write(src_w, b"abc")
+    os.close(src_w)
+    t = Tail(None, src_r, dst_w)
+    try:
+        drain([t])
+        ok, why = True, ""
+    except BrokenPipeError as e:
+        ok, why = False, repr(e)
+    finally:
+        os.close(dst_w)
+    check(ok and t.n == 3 and t.src is None,
+          f"a closed reader drops the tail's bytes, still counts them and raises nothing: {why} n={t.n}")
+
+
 def case_queued_age(fx):
     now, sec = datetime.datetime.now(), datetime.timedelta(seconds=1)
     kst = datetime.timezone(datetime.timedelta(hours=9))
@@ -1609,7 +1629,7 @@ def case_attach_leave(fx):
 CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_reconnect,
          case_rerun_id, case_rerun_none, case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
-         case_tails_stop, case_flush_cap, case_signal_then_done, case_queued_age, case_cancelled_elsewhere, case_load_ready]
+         case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
 def run_cases(label, cases, make_fix, names):
