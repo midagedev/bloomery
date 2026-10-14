@@ -268,18 +268,25 @@ PY
 # python forms above; the allowlist below is the scripts that run no device code, and a script not on it stays on 3090.
 # Plain cargo (`cargo test`, tools/gate.sh without --oxide) builds no device crate (AGENTS.md), so it holds no card.
 default_lane() {
-  local c=$1 rest s kv
+  local c=$1 rest s kv gate_card=
+  local device_run='cargo[[:space:]]+(oxide[[:space:]]+(run|test)|run)|gate[.]sh[[:space:]]+--oxide'
+  # the job exports BLOOMERY_BOX_ENV in order, so its last BLOOMERY_GATE_CARD entry is the card the gates see
   for kv in ${box_env[@]+"${box_env[@]}"}; do
-    case $kv in
-      BLOOMERY_GATE_CARD=3090 | BLOOMERY_GATE_CARD=a6000 | BLOOMERY_GATE_CARD=both) echo "${kv#*=}"; return ;;
-      BLOOMERY_GATE_CARD=*) echo 3090; return ;;
-    esac
+    [ "${kv%%=*}" != BLOOMERY_GATE_CARD ] || gate_card=$kv
   done
+  case $gate_card in
+    '') ;;
+    BLOOMERY_GATE_CARD=3090 | BLOOMERY_GATE_CARD=a6000 | BLOOMERY_GATE_CARD=both) echo "${gate_card#*=}"; return ;;
+    *) echo 3090; return ;;
+  esac
+  if [[ $c =~ $device_run ]]; then echo 3090; return; fi
   case $c in
-    *'cargo oxide run'* | *'cargo oxide test'* | *'cargo run'* | *'gate.sh --oxide'* | *target/* | *python*) echo 3090; return ;;
+    *target/* | *python*) echo 3090; return ;;
   esac
   rest=${c//'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh'/}
   if [ "$rest" = "$c" ]; then echo 3090; return; fi
+  # a card the command sets itself (an export, or another gate's pin) outlives the daemon's pick
+  case $rest in *BLOOMERY_GATE_CARD=*) echo 3090; return ;; esac
   for s in $(grep -o 'tools/[A-Za-z0-9/_.-]*\.sh' <<< "$rest" || true); do
     case $s in
       tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/ref-paths.sh) ;;
