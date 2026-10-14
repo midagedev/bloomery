@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--no-canary] [--wait-hold [SECONDS]]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #   tools/gate-batch.sh --self-test [--part K|all]   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it: every part at once, see self_test)
@@ -260,7 +260,17 @@
 # that quotes a line names its tier. A deferred item has
 # its own line (`<item> rc=deferred <real-only|no-fixture|real-file|variant|fixture-only> lane=- tier=<real|fixture> deferred=1`), counted in `total=` and in no other rc class; a
 # yielded item (`rc=yield`, above) is counted the same way, in `yielded=` when any did. Exit 0
-# iff every rc is 0 (or deferred, yielded, or a ledger skip). DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
+# iff every rc is 0 (or deferred, yielded, or a ledger skip).
+# --red-main-check is off unless named. An item whose final rc is a red gate — not 0, not a yield,
+# not rc 75 (contention, which retries above and is not a verdict) — is run once more from the local
+# origin/main: the same recipe, the same args and the same box env, so the same card, and no second
+# build is asked for. Its line gains `main=also-red` (that run's rc is neither 0 nor 75),
+# `main=batch-only` (that run ended 0) or `main=unrun` (no checkout, the tree stayed busy, or the
+# run ended 75), placed before `item=` when the item has one. The checkout is one detached worktree,
+# $HOME/.cache/bloomery/gate-batch-main, reused when it is already that commit. box.sh's remote is
+# that directory's basename: a tree it already holds is not synced, and rsync never sends target/,
+# so the binary already built there is the one the recheck runs. The batch's own rc does not change.
+# DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
 # basename of this worktree's root): outside every tree, so the logs survive a `rm -rf target/`
 # cleanup of the worktrees and neither mark a tree dirty nor reach box.sh's rsync. An explicit
 # --out is still taken: under the tree's target/ it is gitignored and accepted, a DIR inside the
@@ -436,7 +446,7 @@ CHAIN_SOLO_REAL='gate-gpu-ds41-residency-a gate-gpu-glm5next-e2e gate-gpu-glm5ne
 # BLOOMERY_PACK_BUDGET overrides it (bytes, a positive integer; the self-test's numbers).
 PACK_BUDGET=262185889800
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -1112,6 +1122,9 @@ echo "$s0 $(date +%s) $*" >> "$st/ran.log"
 echo "E $*" >> "$st/seq.log"
 # …and whether the hold is still up when it ends (a lane that finished first must not have taken it down).
 if [ -f "$st/batch.gpuhold" ]; then printf 'present\t%s\n' "$*" >> "$st/end.log"; else printf 'ABSENT\t%s\n' "$*" >> "$st/end.log"; fi
+# The origin/main recheck (GATE_BATCH_FROM, not a BLOOMERY_* name) exits with FAKE_MAIN_RC, so a case
+# can make main green while the batch item stays red.
+if [ "${GATE_BATCH_FROM:-}" = main ]; then exit "${FAKE_MAIN_RC:-0}"; fi
 exit "${FAKE_RC:-0}"
 FB
   chmod +x "$t/tools/box.sh"
@@ -3053,6 +3066,67 @@ EOS
   printf '%s' "$rc" > "$t/rc-tr-skip"
   rc_ok 'tier=: a batch whose item the ledger skips ends green' tr-skip 1
   want 'tier=: … the skip line says tier=real, behind lane=' "$t/target/c-tr-skip/run.log" '^plain-any rc=skip .* lane=[AB] tier=real( |$)'
+  # --red-main-check (the header): off unless named. A red gate is run once more from the main
+  # tree, on the same card; the line says whether that run was red too. The tree is
+  # GATE_BATCH_MAIN_TREE (not a BLOOMERY_* name). FAIL-first: without the call the line names no
+  # verdict and the main tree is not run.
+  mkdir -p "$t/mainwt/tools" "$t/nomain"
+  cp "$t/justfile" "$t/mainwt/justfile"
+  cp "$t/tools/box.sh" "$t/mainwt/tools/box.sh"
+  mutant_of red-nocheck 's/\[ "\$RED_MAIN" = 1 \]/[ "$RED_MAIN" = never ]/' 'RED_MAIN" = never'
+  export GATE_BATCH_MAIN_TREE=$t/mainwt FAKE_MAIN_RC=1
+  rc=$(MTAG=red-nocheck steal_case rm-mut "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-mut"
+  if [ "$(cat "$t/rc-rm-mut")" = 1 ]; then pass 'red-main mutant: the batch stays red'
+  else fail 'red-main mutant: the batch stays red' "rc=$(cat "$t/rc-rm-mut")"; fi
+  want 'red-main mutant: without the recheck the red line names no main verdict' "$t/target/c-rm-mut/run.log" \
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red item=steal-fix@FAKE_RC=1$'
+  if [ ! -e "$t/mainwt/fake-state/box.log" ]; then pass 'red-main mutant: the main tree was not run'
+  else fail 'red-main mutant: the main tree was not run' "$(cat "$t/mainwt/fake-state/box.log")"; fi
+  rm -rf "$t/mainwt/fake-state"
+  rc=$(steal_case rm-also "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-also"
+  if [ "$(cat "$t/rc-rm-also")" = 1 ]; then pass 'red-main: main red too, the batch stays red'
+  else fail 'red-main: main red too, the batch stays red' "rc=$(cat "$t/rc-rm-also")"; fi
+  want 'red-main: the line says main=also-red, before item=' "$t/target/c-rm-also/run.log" \
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=also-red item=steal-fix@FAKE_RC=1$'
+  want_row 'red-main: the batch run kept the 3090' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=3090/ && $2 ~ /gen_f$/'
+  want_row 'red-main: the main run used that same card and the same binary name' "$t/mainwt/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=3090/ && $2 ~ /gen_f$/'
+  bn=$(grep -c 'gen_f$' "$t/fake-state/box.log" || true)
+  mn=$(grep -c 'gen_f$' "$t/mainwt/fake-state/box.log" || true)
+  if [ "$bn" = 1 ] && [ "$mn" = 1 ]; then pass 'red-main: one batch run and one main run'
+  else fail 'red-main: one batch run and one main run' "batch $bn main $mn"; fi
+  rm -rf "$t/mainwt/fake-state"
+  export FAKE_MAIN_RC=0
+  rc=$(steal_case rm-only "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-only"
+  if [ "$(cat "$t/rc-rm-only")" = 1 ]; then pass 'red-main: main green, the batch stays red'
+  else fail 'red-main: main green, the batch stays red' "rc=$(cat "$t/rc-rm-only")"; fi
+  want 'red-main: the line says main=batch-only' "$t/target/c-rm-only/run.log" \
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=batch-only item=steal-fix@FAKE_RC=1$'
+  rm -rf "$t/mainwt/fake-state"
+  rc=$(steal_case rm-green "host	B	none	2	$d" -- --red-main-check host)
+  printf '%s' "$rc" > "$t/rc-rm-green"
+  rc_ok 'red-main: a green item is not rechecked' rm-green 1
+  want_not 'red-main: its line names no main verdict' "$t/target/c-rm-green/run.log" 'main='
+  if [ ! -e "$t/mainwt/fake-state/box.log" ]; then pass 'red-main: a green item does not run the main tree'
+  else fail 'red-main: a green item does not run the main tree' "$(cat "$t/mainwt/fake-state/box.log")"; fi
+  export GATE_BATCH_MAIN_TREE=$t/nomain
+  rc=$(steal_case rm-unrun "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-unrun"
+  want 'red-main: no checkout is main=unrun, and the batch stays red' "$t/target/c-rm-unrun/run.log" \
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=unrun item=steal-fix@FAKE_RC=1$'
+  unset GATE_BATCH_MAIN_TREE FAKE_MAIN_RC
+  rc=$(steal_case rm-off "steal-fix@FAKE_RC=1	A	3090	2	$d" -- 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-off"
+  want 'red-main: off, the red line is the one it always printed' "$t/target/c-rm-off/run.log" \
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red item=steal-fix@FAKE_RC=1$'
+  check 'red-main: the dry run names the recheck' 0 \
+    '^gate-batch: red-main-check: a red item is run once more from origin/main' \
+    "${gb[@]}" --dry-run --red-main-check host
+  out=$("${gb[@]}" --dry-run host 2>&1) || fail 'red-main: a dry run without the flag failed' "$out"
+  if grep -q 'red-main-check' <<< "$out"; then fail 'red-main: without the flag the dry run says nothing' "$out"
+  else pass 'red-main: without the flag the dry run says nothing'; fi
   fi
   if gb_part 14; then
   # --wait-hold (the header). The fake answers the poll (`lease_guard 0`, a READONLY call) busy for the first FAKE_BUSY_POLLS polls and
@@ -3181,7 +3255,7 @@ if [ "${1:-}" = --self-test ]; then
   esac
 fi
 OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
-CANARY=1
+CANARY=1 RED_MAIN=0
 ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -3201,6 +3275,7 @@ while [ $# -gt 0 ]; do
     --rerun) RERUN=1; shift ;;
     --over-budget-ok) BUDGET_OK=1; shift ;;
     --no-canary) CANARY=0; shift ;;
+    --red-main-check) RED_MAIN=1; shift ;;
     --wait-hold) WAIT_HOLD=3600
       # an optional bound: the next word when it is whole seconds (an item is a recipe name, never a number)
       if [ $# -ge 2 ]; then
@@ -5239,6 +5314,95 @@ stop() {
   exit 130
 }
 
+red_main_say() { # one line when --red-main-check is on; a dry run and a real run both say it
+  [ "$RED_MAIN" = 1 ] || return 0
+  echo "gate-batch: red-main-check: a red item is run once more from origin/main, on the card it just used; its line gains main=also-red or main=batch-only (main=unrun when that run could not say)"
+}
+
+# The origin/main recheck's tree. GATE_BATCH_MAIN_TREE (not a BLOOMERY_* name: every such name is a
+# lever-registry row) is that tree, for the self-test. Otherwise one detached worktree at the local
+# origin/main, reused when it is already that commit so the box keeps the binary it built there.
+main_root() {
+  local dest sha cur
+  if [ -n "${GATE_BATCH_MAIN_TREE:-}" ]; then
+    [ -f "${GATE_BATCH_MAIN_TREE}/justfile" ] || return 1
+    printf '%s' "$GATE_BATCH_MAIN_TREE"
+    return 0
+  fi
+  dest=$HOME/.cache/bloomery/gate-batch-main
+  sha=$(git -C "$ROOT" rev-parse --verify origin/main 2>/dev/null) || return 1
+  if [ -e "$dest/.git" ]; then
+    cur=$(git -C "$dest" rev-parse HEAD 2>/dev/null || true)
+    if [ "$cur" = "$sha" ]; then printf '%s' "$dest"; return 0; fi
+    git -C "$dest" checkout --detach --quiet "$sha" || return 1
+    printf '%s' "$dest"
+    return 0
+  fi
+  [ ! -e "$dest" ] || return 1
+  mkdir -p "$(dirname "$dest")"
+  git -C "$ROOT" worktree add --detach --quiet "$dest" "$sha" || return 1
+  printf '%s' "$dest"
+}
+
+# One holder of the main tree. $2 is this process's pid (a lane is its own process). A dead holder's
+# lock is removed; a live one is waited out for one gate bound, then the recheck says unrun.
+main_hold() {
+  local lk=$1 token=$2 p waits=0
+  mkdir -p "$(dirname "$lk")"
+  while :; do
+    if mkdir "$lk" 2>/dev/null; then
+      printf '%s\n' "$token" > "$lk/pid"
+      return 0
+    fi
+    p=$(cat "$lk/pid" 2>/dev/null || true)
+    if [ "$p" = "$token" ]; then return 0; fi
+    if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+      rm -rf "$lk"
+      continue
+    fi
+    [ "$waits" -lt 900 ] || return 1
+    sleep 1
+    waits=$((waits + 1))
+  done
+}
+main_drop() { # $1 = lock dir, $2 = this process's pid: only the holder removes it
+  [ "$(cat "$1/pid" 2>/dev/null || true)" = "$2" ] || return 0
+  rm -rf "$1"
+}
+
+# One run of the red item from origin/main. Prints also-red, batch-only or unrun. The box env is the
+# item's, card included, and nothing here cleans the remote target/.
+main_recheck() { # $1 = plan index, $2 = box env, $3 = the item log
+  local i=$1 benv=$2 log=$3 root rc=0 mpid lk argv=()
+  mpid=$(sh -c 'echo $PPID')
+  if [ -n "${GATE_BATCH_MAIN_TREE:-}" ]; then lk=${GATE_BATCH_MAIN_TREE}.lk
+  else lk=$HOME/.cache/bloomery/gate-batch-main.lk; fi
+  if ! main_hold "$lk" "$mpid"; then
+    echo "=== main recheck: the origin/main tree stayed busy" >> "$log"
+    printf unrun
+    return 0
+  fi
+  root=$(main_root 2>> "$log") || {
+    echo "=== main recheck: no origin/main checkout" >> "$log"
+    main_drop "$lk" "$mpid"
+    printf unrun
+    return 0
+  }
+  eval "argv=(${P_ARGS[$i]})"
+  echo "=== main recheck $(date '+%F %T') tree=$root" >> "$log"
+  rc=0
+  # GATE_BATCH_FROM marks the recheck for the self-test's fake box. The real box.sh does not read it.
+  GATE_BATCH_FROM=main BLOOMERY_BOX_PIDDIR="$OUT/lane-main-$i.box" BLOOMERY_BOX_ENV="$benv" \
+    just --justfile "$root/justfile" --working-directory "$root" \
+    "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null || rc=$?
+  main_drop "$lk" "$mpid"
+  case $rc in
+    0) printf batch-only ;;
+    75) printf unrun ;;
+    *) printf also-red ;;
+  esac
+}
+
 if [ "$DRY" = 1 ]; then
   echo "gate-batch: dry run — $N items$DEFER_NOTE, lanes $LANES, logs would go to $OUT"
   canary_say
@@ -5285,6 +5449,7 @@ if [ "$DRY" = 1 ]; then
   predicted
   hold_say
   [ -z "$WAIT_HOLD" ] || echo "gate-batch: --wait-hold: a real run waits up to ${WAIT_HOLD} s, polling every ${WAIT_POLL} s, for the timing lease and the holds to drop before its first box call; this dry run touches no box"
+  red_main_say
   exit 0
 fi
 
@@ -5333,6 +5498,7 @@ board_event start total="$NT" tier="$TIER" lanes="$LANES" mode="${LMODE:-none}" 
   tree="$(basename "$ROOT")" branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2> /dev/null || echo unknown)"
 echo "gate-batch: $N items$DEFER_NOTE, lanes $LANES, logs in $OUT"
 canary_say
+red_main_say
 MAIN_PID=$$ # canary_red signals this shell from a lane's subshell
 predicted
 for ((i = 0; i < ND; i++)); do # a deferred item is recorded at once: the batch never calls it (nothing to time, key or claim)
@@ -5435,6 +5601,10 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   if [ "$rc" != 75 ] && ! times_record "$i" "$lane" "$ran" "$cold"; then
     line="$line times=append-failed"
     echo "gate-batch: ${P_STEM[$i]}: its row did not reach $([ "$cold" = 0 ] && echo "$TIMES_FILE" || echo "$COLD_FILE") (above)" >&2
+  fi
+  # --red-main-check (the header): one more run of a red gate, from origin/main, before the line is printed.
+  if [ "$RED_MAIN" = 1 ] && [ -z "$yowner" ] && [ "$rc" != 0 ] && [ "$rc" != 75 ]; then
+    line="$line main=$(main_recheck "$i" "$benv" "$log")"
   fi
   [ -z "${P_ITEM[$i]}" ] || line="$line item=${P_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"
