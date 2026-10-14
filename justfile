@@ -817,6 +817,16 @@ dump-ref-mimo2 *VARIANT:
 dump-ref-mimo2-cuda:
     BLOOMERY_MODEL=mimo2 ./tools/box.sh 'BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
+# Nemotron 3 Nano 4B last-position logits, mainline on the CPU (ik has no nemotron_h). nemotron_ref
+# links the existing mainline build (tools/ref/build-nemotron-ref.sh; it does not rebuild it) and
+# writes $BLOOMERY_DATA/ref-nemotron-logits (refset family ref-nemotron-logits). CUDA stays hidden.
+# No card: the lane is none.
+build-ref-nemotron:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=90 BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'bash tools/ref/build-nemotron-ref.sh'
+
+dump-ref-nemotron:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=600 BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'bash tools/ref/dump-nemotron.sh'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:
