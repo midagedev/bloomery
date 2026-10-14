@@ -397,6 +397,15 @@
 # under it (bash dies and leaves its foreground child, on the Mac too), so the remote command is still `just box-gc`'s to clear.
 # A pid is never signalled for being in a file alone: a KILLed call leaves its file and pids are reused. Local and queue mode
 # (BLOOMERY_BOX_LOCAL, BLOOMERY_BOX_QUEUE) exec box.sh away and register nothing.
+# The box queue (BLOOMERY_BOX_QUEUE=1). Each item's call carries its times median as BLOOMERY_Q_PRED_S (none with no times row;
+# the caller's value wins; a recipe of several box.sh calls gives each the whole item's). An item whose closure is one box.sh
+# call and nothing else (PYPLAN's T record) is that call, so it also carries its mark, GATE_BATCH_ITEM=<its ledger key> (a
+# batch with no ledger has none; no BLOOMERY_ name: a binary refuses one its lever registry lacks). Before it queues, a
+# queued or running job with that mark and this tree's id (box.sh --tree-id, which the job's stale-tree test spells) is the
+# same item on its way from another batch (`tools/boxq.py list --match`): the item follows that job (`boxq.py attach
+# --leave`, every BOXQ_POLL_S) and takes its rc — run.log's twin=<id>, no times row, a green one recorded in the ledger
+# under the key it ran — and a stop leaves that job alone. A twin that ends with no verdict on these inputs (75, 80, 81, 84,
+# 85) and a job list that cannot be read are each a line in the item's log; the item then queues itself.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 JUST=(just --justfile "$ROOT/justfile" --working-directory "$ROOT")
@@ -659,6 +668,21 @@ plain-any:
 host:
     ./tools/box.sh 'bash tools/gate.sh -p x'
 
+twin-two:
+    ./tools/box.sh 'bash tools/gpu-gate.sh other'
+    ./tools/box.sh 'bash tools/gpu-gate.sh other'
+
+twin-loop:
+    for c in a b; do ./tools/box.sh "bash tools/gpu-gate.sh other-$c"; done
+
+twin-script:
+    bash tools/twin-pre.sh
+    ./tools/box.sh 'bash tools/gpu-gate.sh other'
+
+twin-local:
+    mkdir -p target/twin-local
+    ./tools/box.sh 'bash tools/gpu-gate.sh other'
+
 gate-x:
     ./tools/box.sh 'bash tools/gate.sh -p y'
 
@@ -915,7 +939,7 @@ DF
   fail() {
     n=$((n + 1)) bad=$((bad + 1))
     echo "FAIL $1: ${2:-}"
-    printf '%s\n' "$out" | sed 's/^/    | /'
+    printf '%s\n' "${out:-}" | sed 's/^/    | /' # a case that set no output prints an empty line, not an unbound-variable exit
   }
   # check <name> <want rc> <ERE the output must hold> <command…>
   check() {
@@ -1013,6 +1037,7 @@ here=$(dirname "$0")/..
 st=$here/fake-state
 mkdir -p "$st"
 case "$*" in
+  --tree-id) echo "${FAKE_TREE_ID:-0123456789abcdef}"; exit 0 ;; # a queued item's twin lookup
   '. tools/ref/lease-probe.sh && lease_free')
     echo probe >> "$st/probe.log"
     [ -e "$st/lease-up" ] || exit 0
@@ -1150,11 +1175,15 @@ green = set()
 if os.environ.get("FAKE_GREEN_FILE"):
     with open(os.environ["FAKE_GREEN_FILE"]) as fh:
         green = {ln.strip() for ln in fh if ln.strip()}
+# FAKE_KEY_SALT: another key for the same item (another model file, say); FAKE_KEY_ERROR=1: the item is unkeyed.
+salt = os.environ.get("FAKE_KEY_SALT", "")
 for k, it in enumerate(items):
-    if os.environ.get("FAKE_SKIP") == "1" or f"stub-{it}" in green:
+    if os.environ.get("FAKE_KEY_ERROR") == "1":
+        print(f"-\t{it}\terror\tstub key error")
+    elif os.environ.get("FAKE_SKIP") == "1" or f"stub-{it}" in green:
         print(f"stub-{it}\t{it}\tskip\tgreen-at=abc1234 2026-10-08T00:00:00+0900 tree=/x")
     else:
-        print(f"stub-{it}\t{it}\trun\tstub")
+        print(f"stub-{it}{salt}\t{it}\trun\tstub")
     if pd:
         import os
         os.makedirs(pd, exist_ok=True)
@@ -1234,7 +1263,8 @@ FP
     [ "${GBFAST:-}" != 1 ] || runner=(bash "$t/tools/gate-batch-fast.sh")
     [ -z "${MTAG:-}" ] || runner=(bash "$t/tools/gate-batch-$MTAG.sh")
     # AWAIT: the fake's FAKE_AWAIT_MAP, DELAY: its FAKE_START_DELAY (the header above the fake)
-    FAKE_AWAIT_MAP=${AWAIT:-} FAKE_START_DELAY=${DELAY:-} \
+    # The box queue's daemon is the twin cases' fake (fake-ssh, twinq/): no case reaches a real box.
+    FAKE_AWAIT_MAP=${AWAIT:-} FAKE_START_DELAY=${DELAY:-} BOXQ_SSH="$t/tools/fake-ssh" BOXQ_POLL_S=0.2 \
       BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
       "${runner[@]}" --out "$t/target/c-$tag" "${LFLAG:---round-ledger}" "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
     printf '%s' "$rc"
@@ -2604,6 +2634,162 @@ IG
   qpred_case queued 20 '' BLOOMERY_BOX_QUEUE=1
   qpred_case caller 99 99 BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_PRED_S=99
   qpred_case direct '' '' BLOOMERY_BOX_QUEUE=0
+  # The queued twin (the header's box-queue paragraph). fake-ssh logs each call and runs its command here, with a curl that
+  # answers as tools/boxq.py reads a reply (the body, a newline, the status) from twinq/<path>.json — a job's file in turns
+  # (<id>.1.json, <id>.2.json, the last repeating). A queued one-call item carries its ledger key as its mark; a running job
+  # with that mark on this tree id is waited on and boxq's outcome of it taken (lost: 81, an rc off the wire: 84), with no box
+  # call and no times row; a job of another tree id or another key is no twin; an unkeyed item, a recipe with any other line,
+  # and a batch outside queue mode carry no mark and read no job list; a list that cannot be read is named and the item queues.
+  mkdir -p "$t/tools/fakebin" "$t/twinq"
+  cp "$(dirname "$self")/boxq.py" "$t/tools/boxq.py" # the queue's client the twin lookup and wait import, on the fakes below
+  [ -d "$t/tools/bloomery" ] || cp -R "$(dirname "$self")/bloomery" "$t/tools/bloomery"
+  cat > "$t/tools/fake-ssh" << 'FS'
+#!/bin/sh
+h=$(dirname "$0")/..
+echo "$*" >> "$h/twin-ssh.log"
+for last; do :; done
+PATH="$h/tools/fakebin:$PATH" exec sh -c "$last"
+FS
+  cat > "$t/tools/fakebin/curl" << 'FC'
+#!/bin/sh
+q=$(dirname "$0")/../../twinq
+for a; do u=$a; done
+p=${u#http://*/}
+case $p in
+  jobs) cat "$q/jobs.json" ;;
+  jobs/*)
+    id=${p#jobs/} n=$(cat "$q/${p#jobs/}.n" 2> /dev/null || echo 0)
+    n=$((n + 1))
+    [ -e "$q/$id.$n.json" ] || n=$((n - 1))
+    echo "$n" > "$q/$id.n"
+    cat "$q/$id.$n.json" ;;
+  *) printf '{"error": "no such path"}\n404'; exit 0 ;;
+esac
+printf '\n200'
+FC
+  chmod +x "$t/tools/fake-ssh" "$t/tools/fakebin/curl"
+  echo '[]' > "$t/twinq/jobs.json"
+  printf '#!/bin/sh\nexit 0\n' > "$t/tools/twin-pre.sh"
+  rm -f "$t/twin-ssh.log"
+  rc=$(export BLOOMERY_BOX_QUEUE=1; steal_case twin-none "plain-any	B	a6000	10	$d" -- twin-two twin-loop twin-script twin-local)
+  if [ "$rc" = 0 ] && grep -q 'gpu-gate.sh other-b$' "$t/fake-state/box.log" && ! grep -q GATE_BATCH_ITEM "$t/fake-state/box.log" && [ ! -e "$t/twin-ssh.log" ]; then
+    pass 'twin: two calls, a loop, a script or a local command beside the call: no mark and no job list'
+  else fail 'twin: two calls, a loop, a script or a local command beside the call: no mark and no job list' "rc=$rc $(cut -f1 "$t/fake-state/box.log" | tr '\n' '|')"; fi
+  rc=$(export BLOOMERY_BOX_QUEUE=1 FAKE_KEY_ERROR=1; steal_case twin-unkeyed "plain-any	B	a6000	10	$d" -- plain-any)
+  if [ "$rc" = 0 ] && grep -q 'gpu-gate.sh other$' "$t/fake-state/box.log" && ! grep -q GATE_BATCH_ITEM "$t/fake-state/box.log" && [ ! -e "$t/twin-ssh.log" ]; then
+    pass '  … nor an unkeyed item'
+  else fail '  … nor an unkeyed item' "rc=$rc $(cut -f1 "$t/fake-state/box.log" | tr '\n' '|')"; fi
+  rc=$(export BLOOMERY_BOX_QUEUE=1; steal_case twin-mark "plain-any	B	a6000	10	$d" -- plain-any)
+  tmark=$(grep -o 'GATE_BATCH_ITEM=[^[:space:]]*' "$t/fake-state/box.log" 2> /dev/null | head -1) || true
+  tkey=$(cut -f1 "$t/rounds-twin-mark.tsv" 2> /dev/null | head -1) || true
+  if [ "$rc" = 0 ] && [ -n "$tkey" ] && [ "$tmark" = "GATE_BATCH_ITEM=$tkey" ] && grep -q '/jobs' "$t/twin-ssh.log" 2> /dev/null; then
+    pass 'twin: a queued one-call item carries its ledger key as its mark and reads the job list'
+  else fail 'twin: a queued one-call item carries its ledger key as its mark and reads the job list' "rc=$rc mark='$tmark' key='$tkey'"; fi
+  twin_jobs() { # <tree id> <status> <rc>: job j7 runs the marked item on that tree, then ends with that status and rc
+    python3 - "$t/twinq" "$1" "${TWIN_MARK:-$tmark}" "$2" "$3" << 'PY'
+import json, os, sys
+d, tid, mark, status, rc = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], json.loads(sys.argv[5])
+for f in os.listdir(d):
+    if f.startswith("j7."):
+        os.remove(os.path.join(d, f))
+json.dump([{"id": "j6", "status": "done"}, {"id": "j7", "status": "running"}], open(f"{d}/jobs.json", "w"))
+argv = f"bash -c '[ \"$(cat ~/repo/x/.sync-id)\" = {tid} ] || exit 1\nsource e && export {mark} && bash tools/gpu-gate.sh other'"
+json.dump({"id": "j7", "status": "running", "argv": argv}, open(f"{d}/j7.1.json", "w"))
+out = os.path.abspath(f"{d}/j7.out")
+with open(out, "w") as fh:
+    fh.write(os.environ.get("TWIN_OUT", "twin tail\n"))
+json.dump({"id": "j7", "status": status, "rc": rc, "out": out, "err": out + ".none"}, open(f"{d}/j7.2.json", "w"))
+PY
+  }
+  twin_case() { # <tag> <job status> <job rc> <want item rc>: a twin on this tree, its outcome the item's
+    local rc want=1
+    twin_jobs 0123456789abcdef "$2" "$3"
+    [ "$4" != 0 ] || want=0
+    rc=$(export BLOOMERY_BOX_QUEUE=1; steal_case "$1" "plain-any	B	a6000	10	$d" -- plain-any)
+    if [ "$rc" = "$want" ] && grep -Eq "^plain-any rc=$4 .* twin=j7( |\$)" "$t/target/c-$1/run.log" && ! grep -q 'gpu-gate.sh other$' "$t/fake-state/box.log" 2> /dev/null \
+      && [ "$(grep -c '^plain-any	' "$t/times-$1.tsv")" = 1 ]; then
+      pass "twin: a running twin that ends $2 rc $3: the item ends rc $4, no box call, no times row"
+    else fail "twin: a running twin that ends $2 rc $3: the item ends rc $4, no box call, no times row" "rc=$rc $(tail -1 "$t/target/c-$1/run.log" 2> /dev/null)"; fi
+  }
+  twin_case twin-red failed 3 3
+  if grep -q '^twin tail$' "$t/target/c-twin-red/g-plain-any.log"; then pass '  … and its out is in the item log'
+  else fail '  … and its out is in the item log' "$(tail -3 "$t/target/c-twin-red/g-plain-any.log" | tr '\n' '|')"; fi
+  twin_case twin-green done 0 0
+  if grep -q "^$(cut -f1 "$t/rounds-twin-mark.tsv" | head -1)	" "$t/rounds-twin-green.tsv" 2> /dev/null; then pass '  … a green twin is recorded in the ledger under the key it ran'
+  else fail '  … a green twin is recorded in the ledger under the key it ran' "$(tr '\n' '|' < "$t/rounds-twin-green.tsv" 2> /dev/null)"; fi
+  # A fixture item's green twin that printed two deferred(real) clauses: the item line and the DONE line count them.
+  rc=$(export BLOOMERY_BOX_QUEUE=1; steal_case twin-fxmark "plain-any	B	a6000	10	$d" -- --tier fixture plain-any)
+  fxmark=$(grep -o 'GATE_BATCH_ITEM=[^[:space:]]*' "$t/fake-state/box.log" 2> /dev/null | head -1) || true
+  TWIN_MARK=$fxmark TWIN_OUT=$'deferred(real) oracle: fake clause 0\ndeferred(real) oracle: fake clause 1\n' twin_jobs 0123456789abcdef done 0
+  rc=$(export BLOOMERY_BOX_QUEUE=1; steal_case twin-fx "plain-any	B	a6000	10	$d" -- --tier fixture plain-any)
+  if [ "$rc" = 0 ] && [ -n "$fxmark" ] && grep -Eq '^plain-any rc=0 [0-9]+s try=0 lane=[AB] tier=fixture twin=j7 deferred=2( |$)' "$t/target/c-twin-fx/run.log" \
+    && grep -Eq '^DONE total=1 red=0 tier=fixture .* deferred=2$' "$t/target/c-twin-fx/run.log"; then
+    pass 'twin: a fixture twin'"'"'s deferred clauses are counted on the item line and the DONE line'
+  else fail 'twin: a fixture twin'"'"'s deferred clauses are counted on the item line and the DONE line' "rc=$rc mark='$fxmark' $(grep -E '^(plain-any|DONE) ' "$t/target/c-twin-fx/run.log" 2> /dev/null | tr '\n' '|')"; fi
+  # A pack item (lane X) waiting on a twin: TERM to the batch ends its attach client too, and posts no cancel of the job.
+  rc=$(export BLOOMERY_BOX_QUEUE=1 BLOOMERY_PACK_BUDGET=10000; steal_case twin-pkmark "pk-a	A	3090	5	$d" -- pk-a)
+  pkmark=$(grep -o 'GATE_BATCH_ITEM=[^[:space:]]*' "$t/fake-state/box.log" 2> /dev/null | head -1) || true
+  TWIN_MARK=$pkmark twin_jobs 0123456789abcdef running null
+  fresh_state "$t/target/c-twin-pk"
+  rm -f "$t/twin-ssh.log"
+  printf '%s\n' "pk-a	A	3090	5	$d" > "$t/times-twin-pk.tsv"
+  BLOOMERY_BOX_QUEUE=1 BLOOMERY_PACK_BUDGET=10000 BOXQ_SSH="$t/tools/fake-ssh" BOXQ_POLL_S=0.2 BLOOMERY_GATE_TIMES=$t/times-twin-pk.tsv \
+    BLOOMERY_GATE_LEDGER=$t/lead-twin-pk.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-twin-pk.tsv \
+    bash "$t/tools/gate-batch.sh" --out "$t/target/c-twin-pk" --round-ledger pk-a > "$t/out-twin-pk.log" 2>&1 &
+  sp=$!
+  k=0 ap=''
+  while [ "$k" -lt 200 ] && [ -z "$ap" ]; do # the attach client has filed its pid
+    for f in "$t"/target/c-twin-pk/lane-X-*.attach.child; do [ ! -s "$f" ] || ap=$(cat "$f"); done
+    sleep 0.1
+    k=$((k + 1))
+  done
+  kill -TERM "$sp" 2> /dev/null || true
+  k=0
+  while [ -n "$ap" ] && kill -0 "$ap" 2> /dev/null && [ "$k" -lt 50 ]; do
+    sleep 0.1
+    k=$((k + 1))
+  done
+  wait "$sp" 2> /dev/null || true
+  if [ -n "$pkmark" ] && [ -n "$ap" ] && ! kill -0 "$ap" 2> /dev/null && ! grep -q cancel "$t/twin-ssh.log" 2> /dev/null; then
+    pass 'twin: TERM to a batch ends a pack item'"'"'s attach client, and the twin job is not cancelled'
+  else
+    fail 'twin: TERM to a batch ends a pack item'"'"'s attach client, and the twin job is not cancelled' "mark='$pkmark' client='$ap' $(grep -c cancel "$t/twin-ssh.log" 2> /dev/null) cancel call(s)"
+    [ -z "$ap" ] || kill -KILL "$ap" 2> /dev/null || true
+  fi
+  twin_none() { # <tag> <job status> <job rc> <the rc it gives>: a twin with no verdict on these inputs; the item queues itself
+    local rc
+    twin_jobs 0123456789abcdef "$2" "$3"
+    rc=$(export BLOOMERY_BOX_QUEUE=1; steal_case "$1" "plain-any	B	a6000	10	$d" -- plain-any)
+    if [ "$rc" = 0 ] && grep -q 'gpu-gate.sh other$' "$t/fake-state/box.log" && ! grep -q 'twin=' "$t/target/c-$1/run.log" \
+      && grep -q "^=== twin j7 ended rc $4 with no verdict on these inputs: queueing this item itself" "$t/target/c-$1/g-plain-any.log"; then
+      pass "twin: a twin that ends $2 rc $3 (rc $4) is no verdict: the item queues itself"
+    else fail "twin: a twin that ends $2 rc $3 (rc $4) is no verdict: the item queues itself" "rc=$rc $(tail -1 "$t/target/c-$1/run.log" 2> /dev/null)"; fi
+  }
+  twin_none twin-lost lost null 81
+  twin_none twin-cancelled cancelled null 81
+  twin_none twin-stopped cancelled 143 81
+  twin_none twin-stale failed 80 80
+  twin_none twin-badrc failed 256 84
+  twin_jobs fedcba9876543210 failed 3
+  rc=$(export BLOOMERY_BOX_QUEUE=1; steal_case twin-other "plain-any	B	a6000	10	$d" -- plain-any)
+  if [ "$rc" = 0 ] && grep -q 'gpu-gate.sh other$' "$t/fake-state/box.log" && ! grep -q 'twin=' "$t/target/c-twin-other/run.log"; then
+    pass '  … a job of another tree id is no twin: the item queues'
+  else fail '  … a job of another tree id is no twin: the item queues' "rc=$rc $(tail -1 "$t/target/c-twin-other/run.log" 2> /dev/null)"; fi
+  twin_jobs 0123456789abcdef failed 3
+  rc=$(export BLOOMERY_BOX_QUEUE=1 FAKE_KEY_SALT=-other-model; steal_case twin-key "plain-any	B	a6000	10	$d" -- plain-any)
+  if [ "$rc" = 0 ] && grep -q 'gpu-gate.sh other$' "$t/fake-state/box.log" && ! grep -q 'twin=' "$t/target/c-twin-key/run.log"; then
+    pass '  … nor a job of the item under another ledger key (another model file, say)'
+  else fail '  … nor a job of the item under another ledger key (another model file, say)' "rc=$rc $(tail -1 "$t/target/c-twin-key/run.log" 2> /dev/null)"; fi
+  echo 'not json' > "$t/twinq/jobs.json"
+  rc=$(export BLOOMERY_BOX_QUEUE=1; steal_case twin-down "plain-any	B	a6000	10	$d" -- plain-any)
+  if [ "$rc" = 0 ] && grep -q 'gpu-gate.sh other$' "$t/fake-state/box.log" && grep -q "^twin: the box queue's job list could not be read" "$t/target/c-twin-down/g-plain-any.log"; then
+    pass '  … a job list that cannot be read is named in the item log, and the item queues'
+  else fail '  … a job list that cannot be read is named in the item log, and the item queues' "rc=$rc $(grep -h 'twin' "$t/target/c-twin-down/g-plain-any.log" 2> /dev/null | tr '\n' '|')"; fi
+  twin_jobs 0123456789abcdef failed 3
+  rm -f "$t/twin-ssh.log"
+  rc=$(export BLOOMERY_BOX_QUEUE=0; steal_case twin-direct "plain-any	B	a6000	10	$d" -- plain-any)
+  if [ "$rc" = 0 ] && ! grep -q GATE_BATCH_ITEM "$t/fake-state/box.log" && [ ! -e "$t/twin-ssh.log" ]; then pass '  … outside queue mode: no mark, no job list'
+  else fail '  … outside queue mode: no mark, no job list' "rc=$rc $(cut -f1 "$t/fake-state/box.log" | tr '\n' '|')"; fi
   # A batch that is red takes the hold down too (the EXIT trap: every exit).
   rc=$(LFLAG=--ledger steal_case hold-red "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC=1')
   printf '%s' "$rc" > "$t/rc-hold-red"
@@ -3600,6 +3786,27 @@ def box_commands(text):
         yield text[m.end():j]
 
 
+# The queued twin (the header's box-queue paragraph): a recipe whose closure is one tools/box.sh call and nothing else — no
+# shebang body, no other line, not even a local mkdir or scp a twin would skip — is that one call: a twin job of it is the
+# whole item.
+ONE_BOX_LINE = re.compile(r"(?:[A-Z_][A-Z0-9_]*=\S*\s+)*(?:\./)?tools/box\.sh '[^']*'")
+
+
+def one_box_call(name):
+    calls = 0
+    for n in closure(name, set()):
+        if recipes[n].get("shebang"):
+            return False
+        for line in body(n).split("\n"):
+            s = line.strip().lstrip("@-").strip()
+            if not s or s.startswith("#"):
+                continue
+            if not ONE_BOX_LINE.fullmatch(s):
+                return False
+            calls += 1
+    return calls == 1
+
+
 # The budget refusal (a suite whose slowest single item is past 0.75 × the bound that kills it is a
 # named refusal, not an overflow): the plan reads each recipe's bounded calls — a command segment
 # of its closure's text, or of a tree script that text names, holding tools/gate.sh,
@@ -4269,6 +4476,7 @@ if src == "classes":
 prefetch_real_file([m.group(1) for m in map(ITEM.match, raw_items) if m and m.group(1) in recipes])
 counts, errors, out, fams = {}, [], [], []
 budget_over, budget_unchecked = [], []
+onebox = set()
 for item, at in zip(raw_items, where):
     m = ITEM.match(item)
     if not m:
@@ -4358,6 +4566,8 @@ for item, at in zip(raw_items, where):
     stem = name if counts[name] == 1 else f"{name}-{counts[name]}"
     shown = item if (env is not None or args is not None) else ""
     calls = bounded_calls(name)
+    if one_box_call(name):
+        onebox.add(name)
     if len(calls) == 1 and calls[0][1] > 0 and exp * 4 > calls[0][1] * 3:
         budget_over.append(f"{shown or name}={exp}s>past-0.75xBLOOMERY_GATE_BOUND={calls[0][1]}s")
     elif len(calls) != 1 or calls[0][1] < 0:
@@ -4404,6 +4614,8 @@ if cs:
     print("\x1f".join(["K", " ".join(str(final_of[k]) for k in cs), " ".join(fams[k] for k in cs)]))
 if budget_over or budget_unchecked:
     print("\x1f".join(["W", " ".join(budget_over), " ".join(budget_unchecked)]))  # W, not B: a class-B record starts with B
+if onebox:
+    print("\x1f".join(["T", " ".join(sorted(onebox))]))
 PY
 # The plan record's fields, in the order the writer above joins them (its `out.append`): the one list
 # the shell side reads a record by. A writer that gains or loses a field without this list is a named
@@ -4458,6 +4670,7 @@ DP_STEM=() DP_NAME=() DP_ENV=() DP_ARGS=() DP_ITEM=() DP_WHY=() DP_KIND=()
 CHAIN_ORDER=() CHAIN_FAMS=() CHAIN_ACTIVE=0 CHAIN_K=''
 [ "$TIER" = real ] && [ "$LANES" = 2 ] && CHAIN_ACTIVE=1
 BUDGET_OVER=() BUDGET_UNCHECKED=() # the plan's B record: items past 0.75x their bound, and unchecked ones
+TWIN_OK=' ' # the plan's T record: the recipes a queued twin can stand for, space-delimited
 while IFS= read -r rec; do
   case $rec in
     D$'\x1f'*)
@@ -4472,6 +4685,7 @@ while IFS= read -r rec; do
       IFS=$'\x1f' read -r _ bover bunc <<< "$rec"
       read -r -a BUDGET_OVER <<< "$bover"
       read -r -a BUDGET_UNCHECKED <<< "$bunc" ;;
+    T$'\x1f'*) TWIN_OK=" ${rec#T?} " ;;
     *) R_REC+=("$rec") ;;
   esac
 done <<< "$PLAN0"
@@ -4806,6 +5020,23 @@ box_env_of() { # the item's full BLOOMERY_BOX_ENV: the caller's, then the item's
 q_pred_of() { # $1 = plan index: a queued call's BLOOMERY_Q_PRED_S — the caller's when set, else the item's times median (empty: none)
   if [ -n "${BLOOMERY_Q_PRED_S:-}" ] || [ "${BLOOMERY_BOX_QUEUE:-0}" != 1 ]; then printf '%s' "${BLOOMERY_Q_PRED_S:-}"; return; fi
   printf '%s' "${P_QPRED[$1]:-}"
+}
+twin_mark() { # $1 = plan index: GATE_BATCH_ITEM=<the item's ledger key> in queue mode when its recipe can have a twin (else
+  # empty). The key is the ledger's certificate of the item's inputs (the files, the caller's box env, the model file), so a
+  # twin with the same key ran those inputs; an unkeyed item (no ledger, or a key that failed) has no twin.
+  [ "${BLOOMERY_BOX_QUEUE:-0}" = 1 ] || return 0
+  case $TWIN_OK in *" ${P_NAME[$1]} "*) ;; *) return 0 ;; esac
+  case ${P_LST[$1]} in - | never | error) return 0 ;; esac
+  printf 'GATE_BATCH_ITEM=%s' "${P_KEY[$1]}"
+}
+queued_twin() { # $1 = mark: the id of a queued or running job that exports it on this tree (none: empty); a failure goes to stderr
+  local tid ids
+  tid=$("$ROOT/tools/box.sh" --tree-id) || { echo "twin: the tree id could not be read: this item queues" >&2; return 0; }
+  if ! ids=$(python3 "$ROOT/tools/boxq.py" list --match "export $1 && " --match "= $tid ]"); then
+    echo "twin: the box queue's job list could not be read (above): this item queues" >&2
+    return 0
+  fi
+  printf '%s' "${ids%%$'\n'*}"
 }
 cmd_of() {
   local e; e=$(box_env_of "$1")
@@ -5333,7 +5564,7 @@ fi
 
 
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
-  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0 cold=0 deferred=0 yowner='' rcl
+  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran=0 s benv line waits=0 cold=0 deferred=0 yowner='' rcl mark twin='' attach_pid attach_file
   local pdir="$OUT/lane-$lane.box" # the box.sh calls this item's `just` starts file their pids here (reap_boxes; the pack's items each have their own)
   [ "$lane" != X ] || pdir="$OUT/lane-X-$i.box"
   local argv=()
@@ -5344,7 +5575,35 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   # The lead's landing batch is class 1 of the V4.1 load queue (tools/gpu-gate.sh's header): in the call's env, never the key's.
   [ "$LMODE" != lead ] || benv="${benv:+$benv }BLOOMERY_V41_CLASS=1"
   t0=$(date +%s)
-  while :; do
+  # A queued item's mark joins the call's env (never the key's); its twin, when one is queued or running, is waited on instead.
+  mark=$(twin_mark "$i")
+  if [ -n "$mark" ]; then
+    benv="$benv${benv:+ }$mark"
+    twin=$(queued_twin "$mark" 2>> "$log")
+  fi
+  if [ -n "$twin" ]; then
+    # A try section of its own (try 0): what the twin prints — its deferred(real) clauses above all — is read as this item's.
+    echo "=== try $try $(date '+%F %T') lane=$lane: twin job $twin already runs $(item_of "$i") on this tree — waiting for it, not queueing another" >> "$log"
+    rc=0
+    # --leave: the job is another batch's — a stop of this one leaves it running, and a cancelled or lost one is 81.
+    # The client's pid is filed where the stop trap's lane-*.child glob finds it: a pack item's run_item subshell is that
+    # item's .child, so the client gets a file of its own, and TERM ends it with the batch.
+    attach_file="$OUT/lane-$lane.child"
+    [ "$lane" != X ] || attach_file="$OUT/lane-X-$i.attach.child"
+    python3 "$ROOT/tools/boxq.py" attach "$twin" --leave >> "$log" 2>&1 < /dev/null &
+    attach_pid=$!
+    echo "$attach_pid" > "$attach_file"
+    wait "$attach_pid" || rc=$?
+    [ "$lane" != X ] || rm -f "$attach_file"
+    # A twin that ended with no verdict on these inputs (lock contention, a stale tree, lost or cancelled, a dir lock not
+    # taken, a daemon this client could not follow) is no run of them: the item queues itself, in the loop below.
+    case $rc in
+      75 | 80 | 81 | 84 | 85)
+        echo "=== twin $twin ended rc $rc with no verdict on these inputs: queueing this item itself" >> "$log"
+        twin='' ;;
+    esac
+  fi
+  while [ -z "$twin" ]; do
     try=$((try + 1))
     echo "=== try $try $(date '+%F %T') lane=$lane: $(cmd_of "$i")" >> "$log"
     rc=0
@@ -5384,6 +5643,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane tier=$TIER"
   fi
   [ "$waits" = 0 ] || line="$line waited=${waits}s"
+  [ -z "$twin" ] || line="$line twin=$twin"
   ran=$((ran > waits ? ran - waits : 0))
   cold=$(cold_of "$log" "$try")
   [ "$cold" = 0 ] || line="$line cold=1"
@@ -5397,7 +5657,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   fi
   # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing. A cold
   # build's row goes to COLD_FILE, which no plan reads.
-  if [ "$rc" != 75 ] && ! times_record "$i" "$lane" "$ran" "$cold"; then
+  if [ "$rc" != 75 ] && [ -z "$twin" ] && ! times_record "$i" "$lane" "$ran" "$cold"; then
     line="$line times=append-failed"
     echo "gate-batch: ${P_STEM[$i]}: its row did not reach $([ "$cold" = 0 ] && echo "$TIMES_FILE" || echo "$COLD_FILE") (above)" >&2
   fi

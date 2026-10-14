@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""boxq.py — the box queue's client: it posts a job to signalbox, follows it and cancels it.
+"""boxq.py — the box queue's client: it posts a job to signalbox, follows it, lists jobs and cancels them.
 
   boxq.py submit --card C --class K [--expected-s N] --name TAG [--owner O] [--env K=V …] -- CMD…
                                                    post a job to signalbox; its id on stdout
-  boxq.py attach ID [--rc-dir DIR]                 follow its out and err, mirror its rc, exit with it
+  boxq.py attach ID [--rc-dir DIR] [--leave]       follow its out and err, mirror its rc, exit with it; --leave: the
+                                                   job is another client's — a signal leaves it as it is, a cancelled
+                                                   or lost job ends 81 whatever rc it kept, and nothing is mirrored
+  boxq.py list [--match TEXT …]                    the queued and running jobs whose command holds every TEXT, one
+                                                   id a line (none: no output)
   boxq.py run …                                    submit, then attach (the id goes to stderr: stdout is the job's out)
   boxq.py cancel ID                                post the cancel, print the job's status
   boxq.py --self-test [CASE …]                     --list-cases names the cases
@@ -166,7 +170,7 @@ class Queue:
             st, obj = int(code), json.loads(raw)
         except ValueError:
             raise Down("bad-reply", f"{method} {path}: not JSON and a status: {out[:120]!r}")
-        if not isinstance(obj, dict):
+        if not isinstance(obj, dict) and not (method == "GET" and path == "/jobs" and isinstance(obj, list)):
             raise Down("bad-reply", f"{method} {path}: the reply is not a JSON object: {raw[:120]!r}")
         return st, obj
 
@@ -189,6 +193,13 @@ class Queue:
 
     def cancel(self, jid):
         return self.call("POST", f"/jobs/{jid}/cancel", "{}", ok=(200, 202))
+
+    def jobs(self):
+        """The daemon's job list: one summary (id, status, name, …) per job, without the command."""
+        st, obj = self.request("GET", "/jobs")
+        if st != 200 or not isinstance(obj, list):
+            raise Down("bad-reply", f"GET /jobs: status {st}, not a list: {json.dumps(obj)[:120]}")
+        return obj
 
 
 class Trap:
@@ -334,8 +345,10 @@ def mirror(rc_dir, jid, rc):
             os.unlink(tmp)
 
 
-def attach_job(q, jid, rc_dir, trap):
-    """Follow the job to a terminal status, mirror and return its exit code."""
+def attach_job(q, jid, rc_dir, trap, leave=False):
+    """Follow the job to a terminal status, mirror and return its exit code. With leave the job is another client's: a
+    signal posts no cancel and exits with the signal's code, a cancelled or lost job is no verdict of its command (81,
+    whatever rc the daemon kept: 143 after its owner's stop), and no rc is mirrored — the owner's client mirrors its own."""
     kids, fails, last = [], 0, None
     queued_at, next_note, reason, cancel_at = None, 0.0, None, None
     try:
@@ -344,7 +357,11 @@ def attach_job(q, jid, rc_dir, trap):
             try:
                 job = q.job(jid)
                 fails = 0
-            except Down as e:
+            except Refusal as e:
+                # Another client's job that the daemon no longer knows (a restart, a pruned history) is a miss like an
+                # unreachable daemon: after POLL_FAILS the job is no verdict (84), never a usage error of this call.
+                if not (leave or isinstance(e, Down)):
+                    raise
                 fails += 1
                 if fails >= POLL_FAILS:
                     raise Down(e.name, f"job {jid} is left as it is: {e.msg}")
@@ -367,6 +384,9 @@ def attach_job(q, jid, rc_dir, trap):
                     queued_at = None
                 if job["status"] in TERMINAL:
                     break
+            if trap.sigs and leave:
+                say(f"boxq: {jid}: signal, leaving the job as it is")
+                return trap.rc()
             if trap.sigs and cancel_at is None:
                 say(f"boxq: {jid}: signal, cancelling")
                 q.cancel(jid)
@@ -382,6 +402,8 @@ def attach_job(q, jid, rc_dir, trap):
             dump(q, last, trap)
         if cancel_at is None and last["status"] == "cancelled":
             say(f"boxq: {jid} cancelled elsewhere")
+        if leave:
+            return LOST if last["status"] in ("cancelled", "lost") else outcome(jid, last)
         rc = trap.rc() if cancel_at is not None else outcome(jid, last)
         mirror(rc_dir, jid, rc)
         return rc
@@ -447,7 +469,38 @@ def cmd_submit(a):
 def cmd_attach(a):
     q, jid = Queue(os.environ), job_id(a)
     with Trap() as trap:
-        return attach_job(q, jid, rc_dir_of(a), trap)
+        return attach_job(q, jid, rc_dir_of(a), trap, a.leave)
+
+
+def cmd_list(a):
+    """The ids of the queued and running jobs whose command holds every --match text (a job's command needs a request of
+    its own, so with no --match none is read). A row off the wire (no id, an id not a name, a status the daemon does not
+    have) is named on stderr and skipped. A job the daemon no longer knows by the time its command is read (404) is
+    skipped; any other refusal, and a live job whose command is not a string, end the list (84 or the refusal's code):
+    a reply the client cannot read is never an empty list."""
+    q = Queue(os.environ)
+    for summary in q.jobs():
+        jid = summary.get("id") if isinstance(summary, dict) else None
+        if not (isinstance(jid, str) and NAME_RE.fullmatch(jid)) or summary.get("status") not in STATUSES:
+            say(f"boxq: list: a row off the wire is skipped: {json.dumps(summary)[:120]}")
+            continue
+        if summary["status"] not in ("queued", "running"):
+            continue
+        if a.match:
+            try:
+                job = q.job(jid)
+            except Refusal as e:
+                if isinstance(e, Down) or e.name != "no-such-job":
+                    raise
+                continue
+            if job["status"] in TERMINAL:
+                continue
+            argv = job.get("argv")
+            if not isinstance(argv, str):
+                raise Down("bad-reply", f"job {jid}: argv is not a string: {argv!r}"[:200])
+            if not all(m in argv for m in a.match):
+                continue
+        print(jid, flush=True)
 
 
 def cmd_run(a):
@@ -478,11 +531,13 @@ def parser():
     s = sub.add_parser("attach")
     s.add_argument("id")
     s.add_argument("--rc-dir")
+    s.add_argument("--leave", action="store_true")
+    sub.add_parser("list").add_argument("--match", action="append", default=[])
     sub.add_parser("cancel").add_argument("id")
     return p
 
 
-HANDLERS = {"submit": cmd_submit, "attach": cmd_attach, "run": cmd_run, "cancel": cmd_cancel}
+HANDLERS = {"submit": cmd_submit, "attach": cmd_attach, "run": cmd_run, "cancel": cmd_cancel, "list": cmd_list}
 
 
 def main(argv):
@@ -519,10 +574,10 @@ class Fake:
     status."""
 
     def __init__(self, files, states, health=(200, {"ok": True}), post=None, cancel_to="cancelled", slow=0.0, gate=None,
-                 late=None):
+                 late=None, listing=None, job_reply=None):
         self.requests, self.polls, self.cancelled, self.slow = [], 0, False, slow
         self.files, self.states, self.health, self.post, self.cancel_to = files, states, health, post, cancel_to
-        self.gate, self.late = gate, late
+        self.gate, self.late, self.listing, self.job_reply = gate, late, listing, job_reply
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -581,8 +636,10 @@ class Fake:
             return self.health
         if (method, path) == ("POST", "/jobs"):
             return self.post or (201, self.job(**self.states[0]))
+        if (method, path) == ("GET", "/jobs"):  # `listing` (summaries) replaces the default, j1 as it stands
+            return 200, self.listing if self.listing is not None else [{"id": "j1", "status": self.peek()["status"]}]
         if path == "/jobs/j1" and method == "GET":
-            return 200, self.poll()
+            return self.job_reply or (200, self.poll())  # `job_reply` (status, object) replaces j1's reply
         if path == "/jobs/j1/cancel" and method == "POST":
             self.cancelled = True
             return 200, self.peek()
@@ -1115,7 +1172,73 @@ def case_tails_stop(fx):
     os.close(null)
 
 
-CASES = [case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_refusal,
+def case_list(fx):
+    argv = "flock q bash -c '[ x = 0123 ] || exit 1\nexport M=1 && bash tools/gpu-gate.sh g'"
+    fake = fx.serve([{"status": "running", "argv": argv}])
+    rc, out, err = fx.client("list", "--match", "export M=1 && ", "--match", "= 0123 ]")
+    check(rc == 0 and out == b"j1\n", f"a running job whose command holds every text is listed: {rc} {out!r} {err!r}")
+    rc, out, err = fx.client("list", "--match", "export M=2 && ", "--match", "= 0123 ]")
+    check(rc == 0 and out == b"", f"one text it does not hold: not listed: {rc} {out!r} {err!r}")
+    n = len(fake.requests)
+    rc, out, err = fx.client("list")
+    check(rc == 0 and out == b"j1\n" and [r[1] for r in fake.requests[n:]] == ["/jobs"],
+          f"with no --match every live job is listed and no command is read: {rc} {out!r} {fake.requests[n:]}")
+    fx.serve([{"status": "running", "argv": argv}], listing=[{"id": "j0", "status": "done"}, {"id": "j1", "status": "failed"},
+                                                          {"id": "../x", "status": "running"}])
+    rc, out, err = fx.client("list", "--match", "export M=1 && ")
+    check(rc == 0 and out == b"" and b"a row off the wire is skipped" in err and b"../x" in err,
+          f"finished jobs are not listed, and an id off the wire is named and skipped: {rc} {out!r} {err!r}")
+    fx.serve([{"status": "running", "argv": argv}], listing=[{"id": "j1\n", "status": "running"}, {"id": "j9", "status": "running"}])
+    rc, out, err = fx.client("list", "--match", "export M=1 && ")
+    check(rc == 0 and out == b"" and b"skipped" in err,
+          f"an id with a trailing newline is off the wire, and a job the daemon no longer knows is skipped: {rc} {out!r} {err!r}")
+    fx.serve([{"status": "done", "rc": 0, "argv": argv}], listing=[{"id": "j1", "status": "running"}])
+    rc, out, err = fx.client("list", "--match", "export M=1 && ")
+    check(rc == 0 and out == b"", f"a job that ended between the list and its read is not listed: {rc} {out!r}")
+    fx.serve([{"status": "running", "argv": argv}], listing=[{"id": "j1", "status": "parked"}])
+    rc, out, err = fx.client("list", "--match", "export M=1 && ")
+    check(rc == 0 and out == b"" and b"a row off the wire is skipped" in err and b"parked" in err,
+          f"a status the daemon does not have is named and skipped: {rc} {out!r} {err!r}")
+    fx.serve([{"status": "running", "argv": None}])
+    rc, out, err = fx.client("list", "--match", "export M=1 && ")
+    check(rc == 84 and out == b"" and b"argv is not a string" in err,
+          f"a live job whose command is not a string ends the list 84, never an empty list: {rc} {out!r} {err!r}")
+    fx.serve([{"status": "running", "argv": argv}], job_reply=(403, {"error": "not yours", "rc": 65}))
+    rc, out, err = fx.client("list", "--match", "export M=1 && ")
+    check(rc == 65 and out == b"" and b"not yours" in err,
+          f"a refusal other than 404 ends the list with its code, never an empty list: {rc} {out!r} {err!r}")
+    rc, out, err = fx.client("list", BOXQ_URL="http://127.0.0.1:9")
+    check(rc == 84 and b"GET /jobs" in err, f"a daemon that does not answer: 84 naming the list: {rc} {err!r}")
+
+
+def case_attach_leave(fx):
+    fx.files(b"o\n", b"e\n")
+    for sig, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+        fake = fx.serve([{"status": "running"}])
+        p = fx.start("attach", "j1", "--leave", "--rc-dir", fx.rc_dir)
+        fx.wait_pids(fx.tail_pids, 2)
+        p.send_signal(sig)
+        got, so, se = fx.finish(p)
+        check(got == want and fake.cancels() == [] and b"leaving the job as it is" in se,
+              f"{sig.name} with --leave exits {want} and posts no cancel: {got} {se!r} {fake.cancels()}")
+        check(fx.rc_file() is None, "a job left running gets no rc mirror")
+        fx.gone(fx.tail_pids, 2)
+    for end, want in (({"status": "failed", "rc": 3}, 3), ({"status": "done", "rc": 0}, 0),
+                      ({"status": "cancelled", "rc": 143}, 81), ({"status": "lost", "rc": None}, 81)):
+        fx.serve([{"status": "running"}, end])
+        got, so, se = fx.client("attach", "j1", "--leave", "--rc-dir", fx.rc_dir)
+        check(got == want and fx.rc_file() is None,
+              f"--leave on a job that ends {end}: {want}, no mirror: {got} {se!r} {fx.rc_file()!r}")
+        fx.gone(fx.tail_pids, 2)
+    fx.serve([{"status": "running"}])
+    got, so, se = fx.client("attach", "j9", "--leave", "--rc-dir", fx.rc_dir)
+    check(got == 84 and fx.rc_file("j9") is None and se.count(b"poll") >= 2,
+          f"--leave on a job the daemon no longer knows: three missed polls, 84, no mirror: {got} {se!r}")
+    got, so, se = fx.client("attach", "j9", "--rc-dir", fx.rc_dir)
+    check(got == 64, f"without --leave an unknown job stays a usage error: {got} {se!r}")
+
+
+CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
          case_tails_stop, case_flush_cap, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
