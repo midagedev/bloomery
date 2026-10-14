@@ -492,6 +492,48 @@ mod tests {
         assert!(err.contains("rope.dimension_count"), "{err}");
     }
 
+    fn set_key(kv: &mut [(&str, V)], key: &str, value: V) {
+        let row = kv.iter_mut().find(|(k, _)| *k == key).expect(key);
+        row.1 = value;
+    }
+
+    /// `n_head * key_length` overflows `usize` before any tensor is walked.
+    /// The tensors stay the small valid set, so the file's byte size is not
+    /// what refuses it.
+    #[test]
+    fn an_overflowing_key_projection_is_named() {
+        let g = geo();
+        let mut kv = keys(&g);
+        set_key(&mut kv, "attention.head_count", V::U64(1_u64 << 63));
+        set_key(&mut kv, "attention.key_length", V::U64(8));
+        set_key(&mut kv, "attention.value_length", V::U64(1));
+        let err = load("nemotron-h-keymul", "nemotron_h", kv, &tensors(&g, true))
+            .expect_err("key product");
+        assert!(
+            err.contains("attention.key_length") && err.contains("does not fit"),
+            "{err}"
+        );
+        assert!(!err.contains("attention.value_length"), "{err}");
+    }
+
+    /// The key product fits and the value product does not. Rope dims stay
+    /// within the key length, so that check is not the refusal.
+    #[test]
+    fn an_overflowing_value_projection_is_named() {
+        let g = geo();
+        let mut kv = keys(&g);
+        set_key(&mut kv, "attention.head_count", V::U64(1_u64 << 62));
+        set_key(&mut kv, "attention.key_length", V::U64(2));
+        set_key(&mut kv, "rope.dimension_count", V::U32(2));
+        set_key(&mut kv, "attention.value_length", V::U64(4));
+        let err = load("nemotron-h-valmul", "nemotron_h", kv, &tensors(&g, true))
+            .expect_err("value product");
+        assert!(
+            err.contains("attention.value_length") && err.contains("does not fit"),
+            "{err}"
+        );
+    }
+
     /// A per-layer array shorter than `block_count` is refused by name.
     #[test]
     fn a_short_per_layer_array_is_named() {

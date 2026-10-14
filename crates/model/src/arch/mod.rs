@@ -511,6 +511,10 @@ pub(crate) mod synthetic {
     /// A metadata value, as the GGUF type it is written as.
     pub(crate) enum V {
         U32(u32),
+        /// A scalar U64. A count above `u32::MAX` is how an overflowing
+        /// projection product is written without a tensor large enough to
+        /// fail the file's own byte-size check first.
+        U64(u64),
         F32(f32),
         Str(&'static str),
         Bool(bool),
@@ -623,6 +627,10 @@ pub(crate) mod synthetic {
             match v {
                 V::U32(x) => {
                     b.extend_from_slice(&4u32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                V::U64(x) => {
+                    b.extend_from_slice(&10u32.to_le_bytes());
                     b.extend_from_slice(&x.to_le_bytes());
                 }
                 V::F32(x) => {

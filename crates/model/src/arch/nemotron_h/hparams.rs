@@ -124,6 +124,10 @@ impl Hparams {
                     format!("is {heads} at layer {l} for {n_head} query heads"),
                 ));
             }
+            if kind == Kind::Attention {
+                mul(split, "attention.key_length", n_head, key_len)?;
+                mul(split, "attention.value_length", n_head, value_len)?;
+            }
         }
         let hp = Hparams {
             n_layer,

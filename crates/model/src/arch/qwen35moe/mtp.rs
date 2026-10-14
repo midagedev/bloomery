@@ -30,6 +30,7 @@ use super::hparams::{
 use super::place::{PlaceError, PlanInputs};
 use super::spec::{out_gate, routed_at};
 use crate::arch::draft::{EMBEDDING, HEAD, borrows, same, same_token_ids};
+use crate::arch::names::blk;
 use crate::arch::{
     architecture_is, meta_arr, meta_f32, meta_usize, metadata, n_vocab, qwen35moe_variant, spec_u32,
 };
@@ -835,10 +836,6 @@ fn layer_of(
         residual: Residual::Plain,
         extras: Vec::new(),
     })
-}
-
-fn blk(index: usize, stem: &str) -> String {
-    format!("blk.{index}.{stem}")
 }
 
 fn named<'a>(tensors: &'a ModelTensors, name: &str) -> Result<&'a ModelTensor, PlacementError> {
