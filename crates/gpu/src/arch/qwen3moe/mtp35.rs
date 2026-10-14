@@ -58,7 +58,7 @@ struct Names {
 
 impl Names {
     fn of(index: usize) -> Names {
-        let blk = |stem: &str| format!("blk.{index}.{stem}");
+        let blk = |stem: &str| super::body35::blk(index, stem);
         Names {
             eh: blk(model::arch::qwen35moe::mtp::EH_PROJ),
             enorm: blk(model::arch::qwen35moe::mtp::ENORM),
@@ -96,12 +96,12 @@ pub struct Mtp35 {
 }
 
 /// A weight's device addresses as a [`BorrowedPlanes`] holds them: a Q8_0
-/// weight's two planes, a K-quant weight's one plane and a zero.
+/// weight's two planes ([`super::mtp38::planes`]), a K-quant weight's one
+/// plane and a zero.
 pub fn addresses(dw: &DevWeight) -> Option<[u64; 2]> {
     match dw {
-        DevWeight::Q8_0 { qs, d, .. } => Some([qs.buf().cu_deviceptr(), d.buf().cu_deviceptr()]),
         DevWeight::KQuant { w, .. } => Some([w.buf().cu_deviceptr(), 0]),
-        _ => None,
+        _ => super::mtp38::planes(dw),
     }
 }
 
@@ -201,12 +201,6 @@ impl Mtp35 {
     #[must_use]
     pub fn index(&self) -> usize {
         self.index
-    }
-
-    /// The K/V rows the draft holds: the load's context.
-    #[must_use]
-    pub fn ctx(&self) -> usize {
-        self.ctx
     }
 
     /// The draft's own weights, by file name.

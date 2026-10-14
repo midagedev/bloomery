@@ -557,7 +557,7 @@ impl Mtp38 {
 }
 
 /// A Q8_0 weight's two planes' device addresses; `None` for another format.
-fn planes(dw: &DevWeight) -> Option<[u64; 2]> {
+pub(super) fn planes(dw: &DevWeight) -> Option<[u64; 2]> {
     match dw {
         DevWeight::Q8_0 { qs, d, .. } => Some([qs.buf().cu_deviceptr(), d.buf().cu_deviceptr()]),
         _ => None,

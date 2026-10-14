@@ -111,10 +111,10 @@ fn qwen4exp_role(stem: &str) -> Option<Role> {
 /// its two norms, and the head's norm (ik's tensor tables,
 /// `src/llama-model.cpp:667-670` for qwen35moe, :699-702 for qwen35).
 const NEXTN: &[&str] = &[
-    "nextn.eh_proj.weight",
-    "nextn.enorm.weight",
-    "nextn.hnorm.weight",
-    "nextn.shared_head_norm.weight",
+    super::mtp::EH_PROJ,
+    super::mtp::ENORM,
+    super::mtp::HNORM,
+    super::mtp::SHARED_HEAD_NORM,
 ];
 
 /// The gated-residual head a qwen4exp next-token layer carries beside

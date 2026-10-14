@@ -9,12 +9,11 @@
 //! - (q) refusals by name at open, before any upload: the plain Qwen3.6 file
 //!   (no `nextn` tensor, no next-token layer) fails with the in-file rule's
 //!   reason, not a missing-tensor error from the loader, and a media load.
-//! - (d) the draft's resident card bytes are the plan's figure
-//!   (`qwen35moe::mtp::in_file_card_bytes`: the layer's file bytes, one f32
-//!   stream and one K/V store at the open's context) plus the bytes a bf16
-//!   tensor of the layer takes widened to f32 on the card (the router and the
-//!   shared expert's gate), which the plan counts as the file stores them;
-//!   the head's output matrix and the embedding are the target's own device
+//! - (d) the draft's resident card bytes are the figure derived from the
+//!   file's tensor table: the layer's own tensors (a bf16 one, the router and
+//!   the shared expert's gate, widened to f32 on the card, every other type as
+//!   the file stores it), one f32 stream and one dense K/V store at the open's
+//!   context; the head's output matrix and the embedding are the target's own device
 //!   buffers at the addresses the draft recorded, and the draft's weights
 //!   hold neither.
 //! - (j) the input join (`mtp_input` at one stream) is the two RMS norms of
@@ -27,14 +26,15 @@
 //! - (r) refusals by name on the live draft: a position past its K/V rows, a
 //!   token past the vocabulary and a hidden row too short leave the load as
 //!   it was, and the step they interrupted repeats to the same token.
-//! - (s) smoke, printed and not pinned: a 64-id prompt through the target,
+//! - (s) the draft's acceptance against the target: a 64-id prompt through the target,
 //!   one step at a time for its own next tokens and in one pass for its
 //!   final-norm rows; the draft is then fed each position in order — the
 //!   prompt's next id, the position and the target's row of it — so its K/V
 //!   rows cover the prompt, and its token for each of the last 16 positions
 //!   is compared with the token the target itself takes after that next id.
 //!   Under 30 % is a wiring error (the join order, a wrong `h`, a wrong
-//!   gain), which this gate prints and the report names.
+//!   gain), and the clause is red. The draft's own K/V rows weigh little
+//!   at this prompt length: a draft attending to one row stays above it.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -51,9 +51,11 @@ mod gate {
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::GgmlType;
-    use model::arch::qwen35moe::mtp::{InFile, in_file, in_file_card_bytes};
+    use model::arch::models::Mixer;
+    use model::arch::qwen35moe::mtp::{EH_PROJ, ENORM, HNORM, InFile, SHARED_HEAD_NORM, in_file};
     use model::arch::qwen35moe::spec;
     use refset::arch::qwen35moe::{D1K, IK, MODEL};
+    use runtime::stores::dense_kv_bytes;
 
     const WHAT: &str = "gate_qwen35moe_mtp";
 
@@ -175,27 +177,38 @@ mod gate {
             return Err("the pinned file reads as no in-file draft".into());
         };
         let read = spec::read(file).map_err(|e| format!("spec::read: {e}"))?;
-        let want = in_file_card_bytes(&draft, &read.tensors, CTX)
-            .map_err(|e| format!("in_file_card_bytes: {e}"))?;
+        let Mixer::Gqa(g) = &draft.layer.mixer else {
+            return Err("the in-file draft's mixer is not full attention".into());
+        };
         // [derived] A bf16 tensor is decoded to f32 on the card
         // (`DevWeight::F32`): two bytes a value become four; every other
-        // type is resident as the file stores it.
-        let widened: u64 = read
+        // type is resident as the file stores it. The embedding and the head
+        // are the target's and carry no layer index.
+        let (mut own, mut widened) = (0u64, 0u64);
+        for t in read
             .tensors
             .tensors
             .iter()
-            .filter(|t| t.layer == Some(mtp.index()) && t.ty == GgmlType::BF16)
-            .map(|t| 4 * t.dims.iter().product::<u64>() - t.file_bytes)
-            .sum();
+            .filter(|t| t.layer == Some(mtp.index()))
+        {
+            if t.ty == GgmlType::BF16 {
+                let wide = 4 * t.dims.iter().product::<u64>();
+                widened += wide - t.file_bytes;
+                own += wide;
+            } else {
+                own += t.file_bytes;
+            }
+        }
+        let kv = dense_kv_bytes(g.kv_heads as usize, g.head_dim as usize, CTX);
+        let stream = (HIDDEN * 4) as u64;
+        let want = own + stream + kv;
         let got = mtp.resident_bytes() as u64;
-        let bytes_ok = got == want + widened;
+        let bytes_ok = got == want;
         println!(
-            "(d) draft resident {got} = plan's {want} + bf16 widened {widened} ({}): weights {} \
-             + K/V {} + stream {}; step scratch {} {}",
+            "(d) draft resident {got} = derived {want} ({}): layer {own} (bf16 widened \
+             {widened}) + stream {stream} + K/V {kv}; weights {}; step scratch {} {}",
             got as i64 - want as i64,
             mtp.weights().resident_bytes(),
-            got as usize - mtp.weights().resident_bytes() - HIDDEN * 4,
-            HIDDEN * 4,
             mtp.scratch_bytes(),
             verdict(bytes_ok)
         );
@@ -213,8 +226,8 @@ mod gate {
                 verdict(same && !held)
             );
         }
-        let stems = ["eh_proj", "enorm", "hnorm", "shared_head_norm"]
-            .map(|s| format!("blk.{}.nextn.{s}.weight", mtp.index()));
+        let stems =
+            [EH_PROJ, ENORM, HNORM, SHARED_HEAD_NORM].map(|s| format!("blk.{}.{s}", mtp.index()));
         let resident = stems.iter().all(|n| mtp.weights().get(n).is_some());
         ok &= resident;
         println!("(d) the four nextn stems resident {}", verdict(resident));
@@ -445,20 +458,21 @@ mod gate {
             .filter(|&i| run.drafted[i] == next[i + 1])
             .count();
         let rate = hits as f64 / LAST as f64;
+        let wired = rate >= FLOOR;
         println!(
             "(s) the draft's token is the target's own next token at {hits}/{LAST} of the last \
              positions = {:.1} % ({all}/{steps} over every position, {text}/{LAST} the \
-             prompt's next id; floor {:.0} %, not pinned): {}",
+             prompt's next id; floor {:.0} %) {}",
             100.0 * rate,
             100.0 * FLOOR,
-            if rate < FLOOR { "BELOW" } else { "above" }
+            verdict(wired)
         );
         println!(
             "(s) the last draft step's largest logit {:.6} at token {}",
             run.peak.0, run.peak.1
         );
         let r_ok = refusals(m, ids, &rows, run.drafted[steps - 1])?;
-        Ok(h_ok && r_ok)
+        Ok(h_ok && r_ok && wired)
     }
 
     /// (r): the refusals on the live draft, then the last step again.

@@ -537,7 +537,7 @@ pub(super) fn rope_table<'a>(
 }
 
 /// `name` of layer `l`.
-fn blk(l: usize, stem: &str) -> String {
+pub(super) fn blk(l: usize, stem: &str) -> String {
     format!("blk.{l}.{stem}")
 }
 
@@ -3188,6 +3188,10 @@ impl ChainBody for Body35 {
             + self.head_state.bytes()
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
             + self.draft.as_ref().map_or(0, DraftTaps::bytes)
+            + self
+                .mtp
+                .as_ref()
+                .map_or(0, |d| d.resident_bytes() + d.scratch_bytes())
             + self.placed.as_ref().map_or(0, Placed::device_bytes)
     }
 

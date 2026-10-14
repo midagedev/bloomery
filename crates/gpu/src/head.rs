@@ -39,16 +39,7 @@ use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
-
-/// The name of the final norm's gain tensor: the one a head reads unless its
-/// body names another ([`Head::with_gain`]).
-pub const OUTPUT_NORM: &str = "output_norm.weight";
-
-/// The final norm's gain `name`, resident F32 — the shared weights reader, so
-/// the head's residency error reads like every other stage's.
-fn head_gain<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceBuffer<f32>, GpuError> {
-    crate::model::f32_gain(w, name)
-}
+use model::arch::names::output_norm;
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
 /// Q6_K or Q4_K word plane over q8_1 rows, or Q8_0's two planes over the
@@ -163,7 +154,7 @@ fn norm_rows<'a>(
 ) -> Result<&'a DeviceBuffer<f32>, GpuError> {
     match fin {
         Final::Rms { normed } => {
-            let g = head_gain(gain.0, gain.1)?;
+            let g = crate::model::f32_gain(gain.0, gain.1)?;
             gpu.elem()
                 .enqueue_rms_norm(gpu.stream(), x, g, eps, hidden, m, normed)?;
             Ok(normed)
@@ -179,7 +170,7 @@ fn norm_rows<'a>(
 /// so a graph that captures it serves every input written into `x`.
 pub struct Head {
     fin: Final,
-    /// The gain tensor's name under [`HeadNorm::Rms`]: [`OUTPUT_NORM`], or
+    /// The gain tensor's name under [`HeadNorm::Rms`]: [`output_norm`], or
     /// the one the body's [`Head::with_gain`] named.
     gain: String,
     eps: f32,
@@ -229,7 +220,7 @@ impl Head {
         m: usize,
         norm: HeadNorm,
     ) -> Result<Head, GpuError> {
-        Head::with_gain(gpu, (w, OUTPUT_NORM), w, eps, m, norm)
+        Head::with_gain(gpu, (w, &output_norm()), w, eps, m, norm)
     }
 
     /// [`Head::with_norm`] over two weight sets: the norm's gain is the tensor
@@ -255,7 +246,7 @@ impl Head {
         let stream = gpu.stream();
         let (out_w, k) = head_out_w(out)?;
         let hidden = match norm {
-            HeadNorm::Rms => head_gain(gain.0, gain.1)?.len(),
+            HeadNorm::Rms => crate::model::f32_gain(gain.0, gain.1)?.len(),
             HeadNorm::Mixed => k,
         };
         if k != hidden {
@@ -297,7 +288,7 @@ impl Head {
         })
     }
 
-    /// The name of the gain tensor the final norm reads ([`OUTPUT_NORM`], or
+    /// The name of the gain tensor the final norm reads ([`output_norm`], or
     /// what [`Head::with_gain`] was given); a [`HeadNorm::Mixed`] head reads
     /// none.
     pub fn gain(&self) -> &str {
