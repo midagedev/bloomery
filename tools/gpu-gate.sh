@@ -426,7 +426,7 @@ PY
       -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S \
       -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID \
       PATH="$t/bin:$PATH" BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
-      bash "$self" --test-locks "${TL:-$t}" ok) > "$o" 2>&1
+      bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}") > "$o" 2>&1
   }
   # judge <name> <rc> <want rc> <ERE that must match> [ERE that must not]. The output is matched as a here-string, never piped into
   # grep -q: under pipefail a writer still writing when grep exits on its first match fails the pipeline (Broken pipe), which read a
@@ -546,6 +546,11 @@ PY
   case_ "a run closes with its own wall and exit" 0 '^gpu-gate\.sh: ok ran [0-9]+ s \(exit 0\)$' 3090 "$t/lease"
   case_ 'BLOOMERY_GATE_GDB other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_GDB is 1' 3090 "$t/lease" BLOOMERY_GATE_GDB=yes
   case_ 'BLOOMERY_GATE_GDB with BLOOMERY_GATE_STACKS: 64, named' 64 'set one' 3090 "$t/lease" BLOOMERY_GATE_GDB=1 BLOOMERY_GATE_STACKS=5
+  # A 3090-only gate (PIN_3090) asked of another card stops by name before any lock; on the 3090 it runs.
+  cp "$t/tree/target/release/ok" "$t/tree/target/release/gate_qwen38_serve"
+  GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate forced to the A6000: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' a6000 "$t/lease"
+  GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate under any: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' any "$t/lease"
+  GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate on the 3090 runs' 0 'ran on ' 3090 "$t/lease"
   # Events, not seconds. A run in the background is held by what it waits for and released by what the test saw it do, so no case reads
   # the clock: the stub binary says `up` on STUB_READY once its run holds its locks and then blocks on STUB_HOLD until the test writes a
   # line; a waiting run's own output (read through a FIFO by relay) says it waits. The FIFOs are held open read-write by this shell
@@ -1419,6 +1424,19 @@ esac
     } ;;
   *) echo "gpu-gate.sh: BLOOMERY_GATE_CARD is 3090, a6000, any or both, got '$CARD'" >&2; exit 64 ;;
 esac
+# Gates whose checks hold on the 3090 alone, a fact the gate placement's bytes (gate_card) do not carry: one row a gate,
+# `<binary>: <the fact>`. Asked of another card (a6000, any, both, or box.sh's A6000 view) one stops here by name, before
+# any lock, with 64.
+PIN_3090=(
+  "gate_qwen38_serve: its paged clause runs generate_qwen3moe at 27 GiB of host room on the card in view, and only the 3090's plan pages there (on the A6000 the experts fit and the draft stays on)"
+)
+for row in "${PIN_3090[@]}"; do
+  [ "${row%%:*}" = "$NAME" ] || continue
+  if [ "$BOXC" != local ] && [ "$CARD" != 3090 ]; then
+    echo "gpu-gate.sh: $NAME runs on the 3090 only — ${row#*: }; BLOOMERY_GATE_CARD=$CARD (box.sh's view $BOXC) names another card: leave both unset or name the 3090" >&2
+    exit 64
+  fi
+done
 uuid_of() { nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "$1" | cut -d, -f1 | head -1; }
 a6000_idle() {
   local u; u=$(uuid_of A6000); [ -n "$u" ] || return 1
