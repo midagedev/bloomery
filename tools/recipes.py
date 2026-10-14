@@ -3900,7 +3900,8 @@ def reach_chain(tree: Tree, graph: Graph, n: str, node: int) -> str:
     r = reach_of(tree)
     return r.chain(r.gate(graph, n), node)
 
-def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow] | None = None, stats: dict[str, int] | None = None) -> list[str]:
+def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow] | None = None, stats: dict[str, int] | None = None,
+                        adds: dict[int, list[str]] | None = None) -> list[str]:
     """The table against the tree: each row's recipes are gate recipes; its glob matches a file and a gate reads
     one of its files through a dependency edge (a row for files only own targets read maps nothing); each file it
     matches that a gate reads through a dependency edge is in the inputs of every recipe the row names
@@ -3909,7 +3910,8 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
     exception naming such a gate (a gate that reaches the file through another lib's code is never left out
     silently); and every gate whose own target names the module the glob stands for is in the row (a gate
     that calls into the module directly is never left out). `stats`, when given, gains the counts the
-    summary prints: rows held to the derivation, exceptions, the gates they name."""
+    summary prints: rows held to the derivation, exceptions, the gates they name. `adds`, when given, gains per row line
+    the gates a problem says to add to that row (`check --fill` writes them)."""
     try:
         rows = rows if rows is not None else load_gate_paths(tree.root)
     except RecipeError as err:
@@ -3971,6 +3973,8 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
         for n, (f, node) in missing.items():
             problems.append(f"{at}: {n} reaches {f} — add it to the row, or name it in the row's exceptions with the reason; "
                             f"the chain: {reach_chain(tree, graph, n, node)}")
+            if adds is not None:
+                adds.setdefault(r.line, []).append(n)
         for n in sorted(set(r.exceptions) - used):
             problems.append(f"{at}: the exception names {n}, which reaches no file the glob matches through a dependency — take it out")
         if stats is not None:
@@ -3995,6 +3999,8 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
                 hit = next((f for f in sorted(own) if any(names_module(named_paths(tree.read(f)), p, kids) for p, kids in paths)), None)
                 if hit:
                     problems.append(f"{at}: {n} runs {kind} {tname}, whose {hit} names {'::'.join(paths[0][0])} — add {n} to the row")
+                    if adds is not None:
+                        adds.setdefault(r.line, []).append(n)
                     break
     return problems
 
@@ -4603,9 +4609,34 @@ def static_problems(tree: Tree, recipes: dict[str, Recipe], names: tuple[str, ..
     return problems
 
 
+def fill_gate_paths(text: str, adds: dict[int, list[str]]) -> tuple[str, int]:
+    """The table's text with each row line of `adds` gaining those gates at the end of its recipes column, each once; and how
+    many gates went in. A line that is not a row of gates (a comment, `*`) is left as it is."""
+    lines, n = text.split("\n"), 0
+    for ln, names in adds.items():
+        f = lines[ln - 1].split("\t")
+        if len(f) < 3 or f[0].startswith("#") or f[1] == "*":
+            continue
+        have = f[1].split()
+        new = [g for g in dict.fromkeys(names) if g not in have]
+        f[1] = " ".join(have + new)
+        lines[ln - 1] = "\t".join(f)
+        n += len(new)
+    return "\n".join(lines), n
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
+    if args.fill:
+        adds: dict[int, list[str]] = {}
+        gate_paths_problems(tree, recipes, adds=adds)
+        path = os.path.join(ROOT, GATE_PATHS)
+        text, n = fill_gate_paths(open(path).read(), adds)
+        if n:
+            with open(path, "w") as fh:
+                fh.write(text)
+        print(f"check-recipes: --fill put {n} gates into {len(adds)} rows of {GATE_PATHS}; the check below reads the filled table")
     held: dict[str, int] = {}
     problems = (check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes, stats=held) + weekly_problems(recipes)
                 + host_problems(tree, recipes) + static_problems(tree, recipes) + nightly_problems(tree, load_lock(tree.root)))
@@ -9747,7 +9778,12 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
         for f in ("base/data/list.txt", "tools/table.tsv"):
             got = gate_paths_problems(st, rs, [row(f, ["gate-app", "gate-mid"])])
             expect(not got, f"gate-paths: a row naming the gates that reach {f} by a literal is refused: {got[:2]}")
-            got = gate_paths_problems(st, rs, [row(f, ["gate-mid"])])
+            adds: dict[int, list[str]] = {}
+            got = gate_paths_problems(st, rs, [row(f, ["gate-mid"])], adds=adds)
+            text, n = fill_gate_paths("# t\n" + f + "\tgate-mid\twhy\n", {ln: names for ln, names in ((2, v) for v in adds.values())})
+            expect(list(adds.values()) == [["gate-app"]] and n == 1 and text == "# t\n" + f + "\tgate-mid gate-app\twhy\n",
+                   f"gate-paths: --fill puts the gate a row lacks at the end of its recipes, once: adds {adds}, {n} in, {text!r}")
+            expect(fill_gate_paths("# t\n*\t*\tw\n", {2: ["gate-app"]}) == ("# t\n*\t*\tw\n", 0), "gate-paths: --fill writes into a `*` row")
             expect(any(p.endswith(f"gate-app reaches {f} — add it to the row, or name it in the row's exceptions with the reason; the chain: {reach_chain(st, sg, 'gate-app', dep_reach(st, sg, ['gate-app'], f)['gate-app'])}") for p in got),
                    f"gate-paths: a row leaving out the gate that reaches {f} by a literal is not refused with its chain: {got[:2]}")
         # one label for a target's own read whether it names a file or a directory (origin_label): a test's own
@@ -10105,7 +10141,8 @@ def narrow_table_self_test(expect, side: Side) -> None:
     expect(glob_regex("x/{a.rs,b/**}").match("x/b/c/d.rs") and not glob_regex("x/*.rs").match("x/b/c.rs"), "gate-paths: glob `**`, `*` and braces")
     stats: dict[str, int] = {}
     got = gate_paths_problems(tree, recipes, stats=stats)
-    expect(not got, f"gate-paths: the real table: {got[:3]}")
+    expect(not got, f"gate-paths: the real table, {len(got)} problems (`python3 tools/recipes.py check --fill` adds the missing gates):\n"
+           + "\n".join(got))
     reach_self_test(expect, side, row, stats)
     # the host group: the real host recipes pass; gate-gpu-lib, whose hw_ tests use the card, is refused by name
     expect(not host_problems(tree, recipes), f"host: the real justfile: {host_problems(tree, recipes)[:2]}")
@@ -10965,6 +11002,7 @@ def main(argv: list[str]) -> int:
     sub = ap.add_subparsers(dest="cmd")
     c = sub.add_parser("check")
     c.add_argument("--justfile")
+    c.add_argument("--fill", action="store_true", help=f"first add to each row of {GATE_PATHS} the gates the derivation says it lacks")
     t = sub.add_parser("targets")
     t.add_argument("recipes", nargs="*")
     a = sub.add_parser("affected")
