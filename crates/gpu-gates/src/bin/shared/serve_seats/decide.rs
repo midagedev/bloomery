@@ -69,7 +69,7 @@ use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
 use bloomery_gpu::media::{ImageSpan, MediaBody};
 use bloomery_gpu_gates::bind::arm_screen;
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{Place, check_set_slot};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
@@ -664,6 +664,12 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
     let width = split
         .arch_get_u64("embedding_length")
         .ok_or_else(|| format!("{}: no {arch}.embedding_length", model.display()))?;
+    // A set `--ctx` is the backbone's one context, held to the model's limit
+    // before the load.
+    if let Some(ctx) = a.ctx {
+        check_set_slot(&split, ctx, None, None)?;
+    }
+    let ctx = a.ctx.unwrap_or(row.ctx);
     drop(split);
     let model_name = base_name(&model);
     let head_name = head
@@ -671,7 +677,6 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         .map_or_else(|| model_name.clone(), |(h, _)| base_name(h));
     let name = hf.map_or_else(|| model_name.clone(), str::to_owned);
     let addr = format!("{}:{}", a.host, a.port);
-    let ctx = a.ctx.unwrap_or(row.ctx);
     let load = Load {
         model,
         name: name.clone(),

@@ -136,7 +136,7 @@ use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
     default_slots_fit, model_props, note_line, parallel_line, placement_of, slots_given,
 };
-use bloomery_gpu_gates::generate::{CTX_GRAN, Lane, Place, lane_at, trained_ctx};
+use bloomery_gpu_gates::generate::{CTX_GRAN, Lane, Place, check_set_slot, lane_at, trained_ctx};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, residency};
@@ -671,6 +671,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
             let rule = ctx_of(a.ctx, &split, &inputs, &machine, &plan_levers, n)?;
             let slot_ctx = slot_ctx_of(rule.ctx, slots)?;
+            // A set `--ctx` is the total the slots split: its share is held to
+            // the model's limit before the plan.
+            if a.ctx.is_some() {
+                check_set_slot(&split, slot_ctx, None, None)?;
+            }
             let plan = inputs
                 .plan_with_slots(&machine, u64::try_from(slot_ctx)?, &plan_levers, n)
                 .map_err(|e| format!("--place {}: {e}", place.name()))?;

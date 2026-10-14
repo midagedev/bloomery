@@ -188,7 +188,7 @@ use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
     default_slots_fit, note_line, parallel_line, slots_given,
 };
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{Place, check_set_slot};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
@@ -1291,6 +1291,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (slots, from) = slots_given(a.parallel, a.ctx, 2)?;
     // The DSpark draft's window is one sequence's: several slots are refused by name.
     let (slots, from) = served::draft_slots(a.parallel, draft, false)?.unwrap_or((slots, from));
+    // A set `--ctx` is the total the slots split: its share is held to the
+    // model's limit before any plan.
+    if let Some(total) = a.ctx {
+        check_set_slot(&split, slot_ctx(total, slots)?, None, None)?;
+    }
     // A projector the `--hf` repo picked stays only where the load gives the text model the same
     // experts and context with its reserve as without ([`vision_seat::kept`]).
     let vision = vision_seat::kept(vision, &a.vision, |v| {

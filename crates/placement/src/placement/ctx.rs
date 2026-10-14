@@ -16,6 +16,10 @@
 //! the plan's bytes, the base a slot, the step, the margin, the cap — enters
 //! as an argument.
 //!
+//! A context the flag names is checked per slot against the model's limit
+//! ([`CtxLimit`], [`check_slot_ctx`]) before any plan: past it the load
+//! stops by name ([`PastLimit`]), never on a context cut to fit.
+//!
 //! A context the flag did not name is decided by the card; the host room may
 //! veto it, never choose it. On a plan that pages nothing at the base, a
 //! deeper context's missed bytes are its whole host need past the room, so a
@@ -80,6 +84,69 @@ pub enum CtxError {
          two recurrent copies among its terms); --cache-ram 0 turns it off"
     )]
     NoCacheState { state: u64, ram: u64 },
+}
+
+/// The most positions one slot may be asked for: the least of the file's
+/// trained context and, where the engine has them, a kernel's position bound
+/// and the bound the gates have checked up to, each with the word its
+/// refusal names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CtxLimit {
+    /// The file's `context_length`.
+    pub trained: u64,
+    /// A position bound a kernel or the cache's index type imposes.
+    pub kernel: Option<(u64, &'static str)>,
+    /// The deepest context the gates have checked the model at.
+    pub verified: Option<(u64, &'static str)>,
+}
+
+impl CtxLimit {
+    /// The least bound and its word: `trained`, or the bound's own; of equal
+    /// bounds the earlier word (trained, kernel, verified).
+    pub fn limit(&self) -> (u64, &'static str) {
+        let mut least = (self.trained, "trained");
+        for bound in [self.kernel, self.verified].into_iter().flatten() {
+            if bound.0 < least.0 {
+                least = bound;
+            }
+        }
+        least
+    }
+}
+
+/// A context asked past the model's limit ([`check_slot_ctx`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "--ctx asks {ctx} positions a slot, past this model's limit of {limit} ({bound}; the file \
+     was trained at {trained}): the load stops; ask {limit} or fewer a slot"
+)]
+pub struct PastLimit {
+    /// The positions a slot was asked for.
+    pub ctx: u64,
+    /// [`CtxLimit::limit`]'s bound.
+    pub limit: u64,
+    /// The word that names the bound.
+    pub bound: &'static str,
+    /// The file's trained context.
+    pub trained: u64,
+}
+
+/// The limit when a slot's `ctx` is within it, else [`PastLimit`]: the one
+/// comparison every seat's set `--ctx` goes through, never a cut.
+///
+/// # Errors
+/// [`PastLimit`] when `ctx` is past [`CtxLimit::limit`].
+pub fn check_slot_ctx(ctx: u64, bounds: &CtxLimit) -> Result<u64, PastLimit> {
+    let (limit, bound) = bounds.limit();
+    if ctx > limit {
+        return Err(PastLimit {
+            ctx,
+            limit,
+            bound,
+            trained: bounds.trained,
+        });
+    }
+    Ok(limit)
 }
 
 /// The resident sequences a seat serves and what set the count, for its
@@ -2867,5 +2934,68 @@ mod tests {
         );
         let (host, probes) = run(MIMO_TRAINED, false);
         assert_eq!((host.ctx, host.rule, probes), (MIMO_FLOOR, RULE_HOST, 1));
+    }
+
+    /// The limit is the least bound with its word (of equal bounds the
+    /// earlier word); a slot at it gets it back, one past it is
+    /// [`PastLimit`] naming the bound, its word and the trained context.
+    #[test]
+    fn a_slot_past_the_least_bound_is_refused_by_its_name() {
+        type Row = (
+            u64,
+            Option<(u64, &'static str)>,
+            Option<(u64, &'static str)>,
+            (u64, &'static str),
+        );
+        let rows: [Row; 5] = [
+            (262_144, None, None, (262_144, "trained")),
+            (1 << 20, Some((1 << 31, "i32")), None, (1 << 20, "trained")),
+            (
+                1 << 20,
+                Some((1 << 31, "i32")),
+                Some((16_384, "ORACLE_POSITIONS")),
+                (16_384, "ORACLE_POSITIONS"),
+            ),
+            (
+                u64::MAX,
+                Some((u64::from(u32::MAX), "KERNEL_POSITIONS")),
+                None,
+                (u64::from(u32::MAX), "KERNEL_POSITIONS"),
+            ),
+            (
+                4096,
+                Some((4096, "i32")),
+                Some((4096, "ORACLE_POSITIONS")),
+                (4096, "trained"),
+            ),
+        ];
+        for (trained, kernel, verified, (limit, source)) in rows {
+            let bounds = CtxLimit {
+                trained,
+                kernel,
+                verified,
+            };
+            assert_eq!(bounds.limit(), (limit, source));
+            assert_eq!(check_slot_ctx(limit, &bounds), Ok(limit));
+            let past = check_slot_ctx(limit + 1, &bounds).expect_err("one past the limit");
+            assert_eq!(
+                past,
+                PastLimit {
+                    ctx: limit + 1,
+                    limit,
+                    bound: source,
+                    trained,
+                }
+            );
+            assert_eq!(
+                past.to_string(),
+                format!(
+                    "--ctx asks {} positions a slot, past this model's limit of {limit} ({source}; \
+                     the file was trained at {trained}): the load stops; ask {limit} or \
+                     fewer a slot",
+                    limit + 1
+                )
+            );
+        }
     }
 }

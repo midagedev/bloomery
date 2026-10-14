@@ -205,7 +205,7 @@ use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
     bind_server, model_props, parallel_line, placement_of,
 };
-use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
+use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, check_set_slot, lane_at, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
 use bloomery_gpu_gates::vision_seat;
@@ -513,6 +513,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::read(&split)?;
+    // A slot's context is held to the model's limit before the plan: the
+    // trained context, and the plan's positions are i32. The unset context
+    // is within both.
+    check_set_slot(
+        &split,
+        ctx,
+        Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
+        None,
+    )?;
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);
     drop(split);

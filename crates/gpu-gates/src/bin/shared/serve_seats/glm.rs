@@ -292,7 +292,9 @@ use model::arch::glm5next::place::{
     KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlaceError, PlanInputs, refusal_text,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::ctx::{ExpertBytes, SlotCtx, Veto, default_slot_ctx_by_card};
+use model::placement::ctx::{
+    CtxLimit, ExpertBytes, SlotCtx, Veto, check_slot_ctx, default_slot_ctx_by_card,
+};
 use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, HostRead, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
@@ -468,6 +470,16 @@ fn ctx_of(
     set: Option<usize>,
     slots: usize,
 ) -> Result<SlotCtx, GateError> {
+    // A set share is held to the model's limit before any probe or plan:
+    // the trained context, verified up to [`ORACLE_POSITIONS`].
+    if let Some(ctx) = set {
+        let bounds = CtxLimit {
+            trained: u64::try_from(inputs.hp.n_ctx_train)?,
+            kernel: None,
+            verified: Some((ORACLE_POSITIONS, "ORACLE_POSITIONS")),
+        };
+        check_slot_ctx(u64::try_from(ctx)?, &bounds)?;
+    }
     let bytes_over = |inputs: &PlanInputs, ctx: usize| -> Result<ExpertBytes, GateError> {
         let ctx = u64::try_from(ctx)?;
         let machine = machine_at(ctx)?;

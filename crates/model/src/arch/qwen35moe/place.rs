@@ -51,6 +51,7 @@ use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::fileio::hex;
 use crate::placement::accepts::{Program, qwen38_down, qwen38_gate_up, routed_rule};
+use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::workstation::{
     self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
     TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, host_of, tier_batch_host_bytes,
@@ -75,15 +76,19 @@ pub const KERNEL_POSITIONS: u64 = u32::MAX as u64;
 /// The most positions a load of the file `hp` describes serves: its
 /// `context_length`, the context it was trained at (the rope runs unscaled;
 /// YaRN scaling is not built), within [`KERNEL_POSITIONS`]. `ctx` past it is
-/// refused by name; else the cap. The one owner of the rule for
-/// `generate_qwen3moe` and the Qwen3.8 seat.
+/// refused by name ([`check_slot_ctx`]); else the cap. `generate_qwen3moe`
+/// and the Qwen3.8 seat take the rule here.
 pub fn serve_ctx(ctx: u64, hp: &Hparams) -> Result<u64, PlaceError> {
-    let trained = u64::try_from(hp.n_ctx_train).unwrap_or(u64::MAX);
-    let cap = trained.min(KERNEL_POSITIONS);
-    if ctx > cap {
-        return Err(PlaceError::PastTrained { ctx, trained, cap });
-    }
-    Ok(cap)
+    let bounds = CtxLimit {
+        trained: u64::try_from(hp.n_ctx_train).unwrap_or(u64::MAX),
+        kernel: Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")),
+        verified: None,
+    };
+    check_slot_ctx(ctx, &bounds).map_err(|p: PastLimit| PlaceError::PastTrained {
+        ctx: p.ctx,
+        trained: p.trained,
+        cap: p.limit,
+    })
 }
 
 /// Where a plan puts the file's routed experts.

@@ -134,6 +134,32 @@ pub fn trained_ctx(file: &Split) -> Option<usize> {
         .and_then(|v| usize::try_from(v).ok())
 }
 
+/// A set `--ctx`'s share of one slot, held to the model's limit before any
+/// plan ([`placement::ctx::check_slot_ctx`]): the file's trained context and
+/// the bounds the seat names (`kernel`, `verified`). Past it the load stops
+/// by name; a file that states no trained context is refused too, since a set
+/// context cannot be held to it.
+///
+/// # Errors
+/// [`placement::ctx::PastLimit`], or the file's missing `context_length`.
+pub fn check_set_slot(
+    file: &Split,
+    slot_ctx: usize,
+    kernel: Option<(u64, &'static str)>,
+    verified: Option<(u64, &'static str)>,
+) -> Result<(), GateError> {
+    let trained = file.arch_get_u64("context_length").ok_or(
+        "the file states no context_length, so a set --ctx cannot be held to the model's limit",
+    )?;
+    let bounds = placement::ctx::CtxLimit {
+        trained,
+        kernel,
+        verified,
+    };
+    placement::ctx::check_slot_ctx(u64::try_from(slot_ctx)?, &bounds)?;
+    Ok(())
+}
+
 /// A family's input to the common unset-`--place` rule ([`Place::choose`]):
 /// the expert tier cards its body serves, the tier count that pays once a
 /// sitting has shown the tier not slower (`None` until one has), and the card
