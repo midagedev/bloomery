@@ -1,13 +1,17 @@
 //! What a Qwen3.8 (qwen4exp) binary's placement decides beside its plan
 //! (`bloomery_gpu_gates::generate::Place`): the family's input to the common
 //! unset `--place` rule, and the experts a placement's tier card holds in its
-//! plan — the unset rule's question. `generate_qwen3moe` and the Qwen3.8
-//! serve seat read them here.
+//! plan — the unset rule's question — and a serving slot's context choice.
+//! `generate_qwen3moe`, the Qwen3.8 serve seat and the routed-leg gate read
+//! them here.
 
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule};
+use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule, choose_ctx_of, short_in};
 use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
-use model::arch::qwen35moe::place::{Experts, MtpInputs, PlanInputs, machine_bp_on, tier_batch};
+use model::arch::qwen35moe::place::{
+    Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_bp_on, tier_batch,
+};
+use model::placement::ctx_ask::{Chosen, Probe};
 use model::placement::PlanLevers;
 use model::placement::workstation::{CardSpec, DeviceInfo};
 
@@ -73,4 +77,29 @@ pub fn tier_experts(
         }
     };
     Ok(plan.tier_n_l.iter().flatten().sum())
+}
+
+/// A serving slot's context by the seats' common choice
+/// (`generate::choose_ctx_of`) under the file's limit: its trained context
+/// within `place::KERNEL_POSITIONS`. `asked` is the set total (or none) and
+/// the slots; `holds` plans every slot at a slot context, its refusal a
+/// [`PlaceError`] the choice reads for the memory it was short of.
+#[allow(
+    dead_code,
+    reason = "generate_qwen3moe includes this file and runs one sequence at its own --ctx"
+)]
+pub fn ctx_choice(
+    inputs: &PlanInputs,
+    asked: (Option<usize>, usize),
+    mut holds: impl FnMut(u64) -> Result<(), GateError>,
+) -> Result<Chosen<()>, GateError> {
+    choose_ctx_of(
+        u64::try_from(inputs.hp.n_ctx_train)?,
+        asked,
+        (Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")), None),
+        |c| match holds(c) {
+            Ok(()) => Ok(Probe::Holds(())),
+            Err(e) => short_in::<PlaceError>(&e).map(Probe::Short).ok_or(e),
+        },
+    )
 }

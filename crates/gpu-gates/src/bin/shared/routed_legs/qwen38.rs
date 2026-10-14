@@ -7,9 +7,9 @@
 //! [`Experts::Card`] (`BLOOMERY_QWEN38_EXPERTS` unset) on the machine the
 //! load lays out: the CLI's at the CLI's 4096 for one sequence with no
 //! checkpoints (`machine38`'s one-card arm), the seat's at the context its
-//! `--ctx` search answers (`default_slot_ctx` at the seat's own base and
-//! step over the plans' expert bytes) for two slots whose checkpoints are
-//! priced (`checkpoint_price38` of the file's delta layers) and reserved.
+//! unset `--ctx` takes (`q38place::ctx_choice`, the seats' ladder) for its
+//! default slots, whose checkpoints are priced (`checkpoint_price38` of the
+//! file's delta layers) and reserved.
 //! Drafts are off in both (the draft levers unset).
 //!
 //! The loader's plan-time stack table (`swap38::stacks`, L6) is asked of every
@@ -30,22 +30,17 @@ use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use gguf::Split;
 use model::arch::models::Mixer;
 use model::arch::qwen35moe::place::{
-    Experts, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
+    Experts, PlanInputs, machine_bp_on, machine_for_experts, tier_batch,
 };
-use model::placement::ctx::{ExpertBytes, default_slot_ctx};
-use model::placement::workstation::MARGIN;
+use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::{Machine, Plan, PlanLevers};
 
 /// The CLI's default context (`generate_qwen3moe`'s `--ctx` unset).
 const CLI_CTX: usize = 4096;
 
-/// The seat's context rule (`serve_seats/qwen38.rs`'s own constants): a
-/// slot's base context and the step the answer moves in.
+/// The context the seat asks its placement at (`serve_seats/qwen38.rs`'s
+/// `CTX`), before the context is chosen.
 const SEAT_CTX: usize = 4096;
-const SEAT_CTX_STEP: usize = 256;
-
-/// The serve seat's resident sequences, `--parallel` unset.
-const SERVE_PARALLEL: usize = 2;
 
 /// The family's adapter, one row of the gate's dispatch.
 pub(super) struct Row;
@@ -89,62 +84,43 @@ fn cli_arm(inputs: &Arc<PlanInputs>) -> Result<Arm, Outcome> {
 }
 
 /// The serve seat's default: the unset placement by the family's rule, its
-/// `--ctx` search over the plans' expert bytes for two checkpointing slots,
-/// then the load's plan at the context it answered.
+/// unset `--ctx`'s choice for the default checkpointing slots, then the
+/// load's plan at the context it took.
 fn serve_arm(inputs: &Arc<PlanInputs>) -> Result<Arm, Outcome> {
-    let seqs = seqs38(inputs, SERVE_PARALLEL);
+    let seqs = seqs38(inputs, DEFAULT_SLOTS);
     let ctx = u64::try_from(SEAT_CTX).expect("the seat's base context is a u64");
     let place = choose(inputs, ctx, seqs)?;
-    // The seat's search: `serve_ctx`'s cap, the seat's base and step, the
-    // margin over the plans' card expert bytes.
-    let cap = usize::try_from(serve_ctx(1, &inputs.hp).map_err(|e| outcome_of(&e))?)
-        .map_err(|e| Outcome::Red(format!("the file's serving cap: {e}")))?;
-    let found = default_slot_ctx(cap, SEAT_CTX, SEAT_CTX_STEP, MARGIN, &|c| {
+    let chosen = q38place::ctx_choice(inputs, (None, DEFAULT_SLOTS), |c| {
         probe(inputs, place, seqs, c)
     })
-    .map_err(|refused| outcome_of(refused.source.as_ref()))?;
-    let ctx =
-        u64::try_from(found.ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?;
-    let ub = ub_of(found.ctx)?;
+    .map_err(|e| outcome_of(e.as_ref()))?;
+    let ctx = chosen.slot_ctx;
+    let ub = ub_of(usize::try_from(ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?)?;
     let machine = machine(place, inputs, (ctx, ub), seqs)?;
-    let unbudgeted = planned(
-        inputs,
-        &machine,
-        ctx,
-        &PlanLevers::default(),
-        SERVE_PARALLEL,
-    );
+    let unbudgeted = planned(inputs, &machine, ctx, &PlanLevers::default(), DEFAULT_SLOTS);
     let inputs = Arc::clone(inputs);
     Ok(Arm {
         name: "serve",
         whole: false,
         unbudgeted: Some(unbudgeted),
-        placed: Box::new(move |levers| planned(&inputs, &machine, ctx, levers, SERVE_PARALLEL)),
+        placed: Box::new(move |levers| planned(&inputs, &machine, ctx, levers, DEFAULT_SLOTS)),
     })
 }
 
-/// One probe of the seat's `--ctx` search: the plan at a slot context `c`
-/// and its routed-expert bytes, the search's term.
-fn probe(
-    inputs: &PlanInputs,
-    place: Place,
-    seqs: Seqs,
-    c: usize,
-) -> Result<ExpertBytes, GateError> {
+/// One probe of the seat's context choice: whether the plan at a slot
+/// context `c` holds, or why not.
+fn probe(inputs: &PlanInputs, place: Place, seqs: Seqs, c: u64) -> Result<(), GateError> {
     probed();
-    let ctx = u64::try_from(c).expect("a context the search probed is a u64");
-    let ub = ub_of(c).map_err(text_of)?;
-    let machine = machine(place, inputs, (ctx, ub), seqs).map_err(text_of)?;
-    inputs
-        .plan_with_slots(
-            &machine,
-            ctx,
-            &PlanLevers::default(),
-            Experts::Card,
-            seqs.slots,
-        )
-        .map(expert_bytes_of)
-        .map_err(GateError::from)
+    let ub = ub_of(usize::try_from(c)?).map_err(text_of)?;
+    let machine = machine(place, inputs, (c, ub), seqs).map_err(text_of)?;
+    inputs.plan_with_slots(
+        &machine,
+        c,
+        &PlanLevers::default(),
+        Experts::Card,
+        seqs.slots,
+    )?;
+    Ok(())
 }
 
 /// The family's unset `--place` (`q38place::choose` by `Q38_RULE`): the
@@ -250,15 +226,6 @@ fn plan_of<'a>(
     inputs
         .plan_with_slots(machine, ctx, levers, Experts::Card, slots)
         .map_err(|e| outcome_of(&e))
-}
-
-/// A plan's routed-expert bytes, the `--ctx` search's probe term.
-fn expert_bytes_of(plan: Plan<'_>) -> ExpertBytes {
-    ExpertBytes {
-        card: plan.cards.first().map_or(0, |c| c.expert_bytes),
-        nvme: plan.host.nvme_expert_bytes,
-        arena: plan.host.nvme_arena_bytes,
-    }
 }
 
 /// An outcome's text, where a search probe or the placement rule reports it

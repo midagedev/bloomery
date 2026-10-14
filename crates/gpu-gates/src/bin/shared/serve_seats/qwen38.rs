@@ -38,54 +38,27 @@
 //! count one slot serves the whole of it, and under `--parallel N` it is
 //! the total the N slots split): `/props`' `n_ctx` is a
 //! slot's number, a prompt that long is a 400 before it reaches the engine,
-//! and generation stops there with `truncated`. Unset, the context is
-//! `placement::ctx::default_slot_ctx_by_card`'s answer over a slot's share
-//! (the one rule every serving seat takes, [`CTX`] a slot, steps of
-//! [`CTX_STEP`], a margin of `MARGIN` card expert bytes): the card decides it
-//! and the host room only vetoes it. The card's context is the largest
-//! multiple of [`CTX_STEP`] up to the fit (the largest a slot's N-slot plan
-//! holds on the card at an unbounded host room, at most the file's serving
-//! cap) whose plan holds at most the plan's own margin (`MARGIN`) fewer card
-//! expert bytes than the N-slot plan at [`CTX`] a slot, the fit when every
-//! context does — the largest the card holds when that is fewer than
-//! [`CTX`]. Where the plan at the room read pages no expert at [`CTX`], the
-//! card's context stands only if the plan at the room read pages none there
-//! either, else the answer is [`CTX`] (the `host` rule), so a reading of the
-//! room never picks a depth between the two; on a machine whose card
-//! allocates from the host's memory (`Machine.unified`) the pool is the
-//! card's room too, so the answer is instead the first rung of the halving
-//! ladder from the serving cap down to [`CTX`] whose plan at the room read
-//! stands and is within the margin and pages nothing past the base's (the
-//! `pool` rule below the cap's rung), and the reading moves it only where it
-//! crosses one rung's need (`placement::ctx::Veto`). Where that plan pages
-//! already, the answer is the largest such context whose plan misses the arena
-//! on at most a hundredth of the base's missed expert bytes more
-//! (`placement::ctx::NVME_SLACK_DIV`). The answer is also at most what lets
-//! one session's sequence state with its two recurrent copies fit the prompt
-//! cache's budget (one session's whole slot context can be saved): the first
-//! rung of the halving ladder from the answer down to [`CTX`] that holds it,
-//! and [`CTX`] when none does (the `cache` line then names that its budget
-//! holds no session there; the cache keeps the shorter ones). Set, a
-//! total a slot's share of which passes the file's
-//! `context_length` (`place::serve_ctx`: YaRN scaling past it is not built),
-//! then one whose N-slot plan the card cannot hold beside the plan's dense
-//! weights — the largest slot context any N-slot plan of the file and the
-//! placement takes up to that cap ([`fit38`]) — is refused by name before
-//! the load; a set context keeps the MTP draft, so that refusal names the
-//! draft's card bytes and the context a slot holds without it. The
+//! and generation stops there with `truncated`. The context is the seats'
+//! common choice ([`ctx38`], `generate::choose_ctx_of`): it comes first, the
+//! experts fill what is left. The limit is the file's `context_length`
+//! within `place::KERNEL_POSITIONS` (YaRN scaling past it is not built). Set,
+//! a total a slot's share of which passes the limit is refused by name, and
+//! one whose N-slot plan the machine cannot hold is refused with the largest
+//! share it holds, before the load. Unset, a slot asks the target (256K under
+//! the limit) and halves while the plan is short of the card, down to the
+//! floor. An unset MTP draft yields to the context: when the drafted plan
+//! halves the context or holds not even the floor and the plain plan holds
+//! more, the draft goes off and a `draft yield` record names both. The
+//! prompt cache's budget never lowers the context: the `cache` line names
+//! when it holds no session there. The
 //! `load` line prints the stores' `ctx` (a slot's rows) with the slot count
 //! and each slot's context, the cap as `ctx_max`, `ctx_train` and
 //! `verified`, the deepest context the reference sets hold our numbers to
 //! ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`, `/props`'
-//! `engine.ctx_verified`), which bounds nothing. A `ctx` line on stderr names
-//! the rule (`card`, `base`, `fit`, `margin`, `host` where the host room
-//! vetoed the card's context, `pool` where the unified pool's reading took a
-//! lower rung, or `cache` where the prompt cache's budget lowered it), the slot context, the slots and the total they serve, the
-//! cap, the largest context the card holds with its card expert bytes, and
-//! the largest whose plan holds at most the plan's own margin (`MARGIN`)
-//! fewer card expert bytes than the plan at [`CTX`] a slot (`margin_ctx`;
-//! under `host` the context the room vetoed): more positions on the card push
-//! card experts to the host.
+//! `engine.ctx_verified`), which bounds nothing. One `ctx` line on stderr
+//! names the rule (`set`, `target` or `halved`, with the rung it halved from
+//! and the memory it was short of), the slot context, the slots, their
+//! total and the limit with its source.
 //! `--plan` prints the records the decisions before the load make (the `ctx`
 //! line, the `plan` and `residency` records) and exits 0 before the route
 //! trace's directory is made or any model is loaded.
@@ -151,12 +124,10 @@
 //! `-np N` and no `-kvu`: the total (the `--ctx-size` the flags named, or
 //! the automatic choice when unset) is the slots' sum, each slot `total /
 //! N` positions rounded
-//! down, and the search for the default — the largest total whose N-slot
-//! plan fits the card within the margin rule `ctx38` applies, each slot a
-//! multiple of [`CTX_STEP`] — runs over a slot's context, the plan counting
-//! every sequence ([`PlanInputs::plan_with_slots`]). An explicit `--ctx` a
-//! slot of whose N-slot plan the card cannot hold is refused by name before
-//! the load, naming the split. Nothing parks: no slot ever waits for another
+//! down, and the default's ladder runs over a slot's context, the plan
+//! counting every sequence ([`PlanInputs::plan_with_slots`]). An explicit
+//! `--ctx` a slot of whose N-slot plan the machine cannot hold is refused by
+//! name before the load, naming the split. Nothing parks: no slot ever waits for another
 //! (a slot's round runs whether the others stream), so `--park-ram` is
 //! refused by name — resident slots hold their state on the card, in the
 //! plan. A `parallel` line on stderr names the rule (`slots`), the slots,
@@ -384,11 +355,9 @@ use model::arch::qwen35moe::place::{
     Experts, MtpInputs, PlaceError, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx,
     tier_batch,
 };
+use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
 use model::placement::churn::ChurnPool;
-use model::placement::ctx::{
-    ExpertBytes, Refused, SlotCtx, Veto, default_slot_ctx_by_card, fit_of, within_cache,
-};
-use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN, host_available_read};
+use model::placement::workstation::{CardSpec, HostNeed, HostRead, host_available_read};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file, draft_places};
@@ -402,12 +371,6 @@ use tokenizer::Tokenizer;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
 
-#[allow(
-    clippy::duplicate_mod,
-    reason = "the serving binary compiles both seats that plan a qwen35moe file, each including this one file"
-)]
-#[path = "../plan_room.rs"]
-mod plan_room;
 #[path = "../qwen38_place.rs"]
 mod q38place;
 #[path = "../qwen38_levers.rs"]
@@ -425,12 +388,10 @@ const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place
                      [--parallel N] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
                      [--plan] [--api-key KEY] [--api-key-file FNAME]";
 
-/// The context the default's expert cost is counted against: the plan
-/// every Qwen3.8 measurement ran at, and `generate_qwen3moe`'s default.
+/// The context a slot asks before the context is chosen (the placement's
+/// offer, the draft's window): the plan every Qwen3.8 measurement ran at, and
+/// `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
-
-/// The default context is a multiple of this many positions.
-const CTX_STEP: usize = 256;
 
 /// The token every message of the chat template opens with: a prompt call is
 /// cut at the first and the last inside it.
@@ -826,9 +787,9 @@ fn draft38(
 
 /// The default slot count's plan, refused because the host room is under the
 /// NVMe expert tier's floor, answered by the one-column rule's own plan: the
-/// first plan the context search asks, at one position (`fit38`), is the
-/// asked slots' — its refusal the floor's ([`floor_refused`]) — and the
-/// arena of the one-slot plan with no draft, which the rule loads
+/// asked slots' plan at one position — its refusal the floor's
+/// ([`floor_refused`]) — and the arena of the one-slot plan with no draft,
+/// which the rule loads
 /// (`one`), when that plan pages (an arena past 0: the rule's own condition;
 /// a plan with none serves as asked, so the refusal stands for [`ctx38`] to
 /// name). The floor counts every slot's checkpoints ([`reserve_checkpoints`]),
@@ -841,7 +802,7 @@ fn floor_fallback(
     asked: &Plans<'_>,
     set: Option<(Residency, &str)>,
 ) -> Result<Option<u64>, GateError> {
-    let Err(refused) = asked.expert_bytes(1) else {
+    let Err(refused) = asked.holds(1) else {
         return Ok(None);
     };
     if !floor_refused(&refused) {
@@ -853,11 +814,11 @@ fn floor_fallback(
         ..*asked
     };
     let rule = ctx38(&one, None)?;
-    let arena = one.host(rule.ctx(), set)?.2;
+    let arena = one.host(rule.ctx, set)?.2;
     Ok((arena > 0).then_some(arena))
 }
 
-/// Whether `refused`, the asked slots' refusal as [`Plans::expert_bytes`]
+/// Whether `refused`, the asked slots' refusal as [`Plans::holds`]
 /// hands it back, is the NVMe expert tier floor's, matched by type through
 /// its [`PlaceError`]: [`PlacementError::HostRoomFloor`], or on a unified
 /// pool [`PlacementError::PoolBudget`] (the card budget lowered toward the
@@ -911,25 +872,9 @@ struct Plans<'a> {
 }
 
 impl Plans<'_> {
-    /// How far a default the host room vetoed falls on this placement's
-    /// machine ([`Veto::of`]), read at the base: the machine's card either
-    /// has memory of its own or shares the host's, whatever the context.
-    fn veto(&self) -> Result<Veto, GateError> {
-        let ub = ubatch_for(CTX)?;
-        let machine = self.place.machine(
-            self.inputs,
-            (u64::try_from(CTX)?, u64::try_from(ub)?),
-            self.experts,
-            self.mtp,
-            self.slots,
-        )?;
-        Ok(Veto::of(&machine))
-    }
-
-    /// The plan's routed-expert bytes by tier at `ctx` positions a sequence
-    /// serves — the stage card's and the NVMe tier's, what the default rule
-    /// counts — or why no plan takes that context.
-    fn expert_bytes(&self, ctx: usize) -> Result<ExpertBytes, GateError> {
+    /// Whether a plan takes `ctx` positions a sequence serves, or why none
+    /// does.
+    fn holds(&self, ctx: usize) -> Result<(), GateError> {
         let ub = ubatch_for(ctx)?;
         let ctx = u64::try_from(ctx)?;
         let machine = self.place.machine(
@@ -939,26 +884,23 @@ impl Plans<'_> {
             self.mtp,
             self.slots,
         )?;
-        let plan = match self.mtp {
+        match self.mtp {
             None => {
                 self.inputs
-                    .plan_with_slots(&machine, ctx, self.levers, self.experts, self.slots)?
+                    .plan_with_slots(&machine, ctx, self.levers, self.experts, self.slots)?;
             }
             Some(mi) => {
-                self.inputs
-                    .plan_mtp_with_slots(&machine, ctx, self.levers, mi, self.experts, self.slots)?
-                    .plan
+                self.inputs.plan_mtp_with_slots(
+                    &machine,
+                    ctx,
+                    self.levers,
+                    mi,
+                    self.experts,
+                    self.slots,
+                )?;
             }
-        };
-        Ok(ExpertBytes {
-            card: plan
-                .cards
-                .first()
-                .ok_or("a plan with no card")?
-                .expert_bytes,
-            nvme: plan.host.nvme_expert_bytes,
-            arena: plan.host.nvme_arena_bytes,
-        })
+        }
+        Ok(())
     }
 
     /// The plan's host need (`HostNeed::bytes`, the NVMe expert tier's
@@ -1033,204 +975,31 @@ fn seq38_state(inputs: &PlanInputs, positions: usize, drafts: bool) -> u64 {
     seq38_bytes(gdn, inputs.spec.layers.len() - gdn, positions, drafts)
 }
 
-/// The context the seat loads ([`ctx38`]) and what decided it: every number
-/// a slot's own — the stores' rows one sequence serves — the total they hold
-/// `slots` times over.
-enum Ctx38 {
-    /// `--ctx-size`: a slot's share of the flag, the plan's card expert
-    /// bytes there. The default's search probes contexts the flag did not
-    /// name, so a set context runs none.
-    Set {
-        ctx: usize,
-        slots: usize,
-        card_bytes: u64,
-    },
-    /// The unset default: the common rule's answer ([`ctx38`]), which the
-    /// prompt cache's bound may lower ([`Ctx38::host_bound`]) — `rule` and
-    /// `chosen` then name the bound and the plan at the lowered context.
-    Rule { found: SlotCtx, slots: usize },
+/// The context the seat loads ([`ctx38`]): a slot's own, the stores' rows
+/// one sequence serves, and the choice's one `ctx` line.
+struct Ctx38 {
+    ctx: usize,
+    line: String,
+    /// Whether the default halved from its target: the plan was short there.
+    halved: bool,
 }
 
-/// The refusal of a probe the common rule's searches ran, as this seat
-/// names it: a tier card the plan leaves idle is refused as itself
-/// (`PlacementError::IdleTier`): no context gives it an expert.
-fn refusal38(refused: Refused<GateError>) -> GateError {
-    match refused.source.downcast_ref::<PlaceError>() {
-        Some(PlaceError::Placement(PlacementError::IdleTier { .. })) => refused.source,
-        _ => refused.into(),
-    }
-}
-
-/// The most a slot serves: the file's serving cap (`place::serve_ctx`: its
-/// `context_length`).
-fn cap38(plans: &Plans<'_>) -> Result<usize, GateError> {
-    Ok(usize::try_from(serve_ctx(1, &plans.inputs.hp)?)?)
-}
-
-/// The largest slot context any plan of the file and the placement takes —
-/// every plan counting the seat's slots — up to the file's serving cap: the
-/// most a `--ctx-size`'s split may give a slot.
-fn fit38(plans: &Plans<'_>) -> Result<usize, GateError> {
-    let (fit, _) = fit_of(cap38(plans)?, &|c| plans.expert_bytes(c)).map_err(refusal38)?;
-    Ok(fit)
-}
-
-/// The seat's context (the module doc), every number a slot's own: `set`
-/// when the file's serving cap takes a slot's share of the total
-/// (`place::serve_ctx`, refused by name past it) and it fits the card
-/// ([`fit38`]), else refused by name; unset, the common rule's answer
-/// (`placement::ctx::default_slot_ctx_by_card`: [`CTX`] a slot, [`CTX_STEP`],
-/// a margin of `MARGIN` card expert bytes) over two probes of the same plan,
-/// the card's at an unbounded host room ([`plan_room::unbounded`]) and the
-/// load's at the room read. The prompt cache's bound comes after ([`Ctx38::host_bound`]).
+/// The seat's context (the module doc) by the family's common choice
+/// (`q38place::ctx_choice`): a set `--ctx-size` (`set`, the total the slots
+/// split) whose share passes the limit stops by name, and one the machine
+/// cannot hold stops with the largest share it would hold; unset, a slot asks
+/// the target and halves while the plan of every slot is short
+/// ([`Plans::holds`]). A tier card the plan leaves idle is refused as itself:
+/// no context gives it an expert.
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
-    let n = plans.slots;
-    if let Some(c) = set {
-        let ctx = c / n;
-        if ctx == 0 {
-            return Err(
-                format!("--ctx-size {c}: --parallel {n} splits it to no position a slot").into(),
-            );
-        }
-        serve_ctx(u64::try_from(ctx)?, &plans.inputs.hp)?;
-        // A set context plans its own split alone: the default's search
-        // probes contexts the flag did not name, and a refusal at one of them
-        // is not this load's.
-        return match plans.expert_bytes(ctx) {
-            Ok(bytes) => Ok(Ctx38::Set {
-                ctx,
-                slots: n,
-                card_bytes: bytes.card,
-            }),
-            Err(refused) => {
-                let fit = fit38(plans)?;
-                if ctx <= fit {
-                    return Err(refused);
-                }
-                let head = format!(
-                    "--ctx-size {c}: with --parallel {n} each slot takes {ctx} positions and the \
-                     card holds at most {fit} a slot beside the plan's dense weights"
-                );
-                let place = plans.place.name();
-                // A set context keeps the MTP draft (the unset one yields to
-                // the context): the refusal names it, and what a slot holds
-                // without it.
-                let Some(m) = plans.mtp else {
-                    return Err(format!("{head} (`--place {place}`)").into());
-                };
-                let bytes = m.card_bytes_of(u64::try_from(ctx)?, n)?;
-                let without = fit38(&Plans {
-                    mtp: None,
-                    ..*plans
-                })?;
-                let tail = if ctx <= without {
-                    format!(
-                        "; without the draft a slot holds {without}: set BLOOMERY_DRAFT=off to serve \
-                         {ctx} a slot, or leave --ctx-size unset (the unset context turns the draft \
-                         off when it costs positions)"
-                    )
-                } else {
-                    format!(", and {without} without the draft")
-                };
-                Err(
-                    format!("{head} and the MTP draft's {bytes} B (`--place {place}`){tail}")
-                        .into(),
-                )
-            }
-        };
-    }
-    // The card decides, the host room only vetoes: the plan at an unbounded
-    // room is the card's probe, the plan at the room read the veto's. How far
-    // a veto falls is the placement's fact (`Veto::of`).
-    let free = plan_room::unbounded(plans.inputs);
-    let card = Plans {
-        inputs: &free,
-        ..*plans
-    };
-    let found = default_slot_ctx_by_card(
-        cap38(plans)?,
-        CTX,
-        CTX_STEP,
-        MARGIN,
-        plans.veto()?,
-        &|c| card.expert_bytes(c),
-        &|c| plans.expert_bytes(c),
-    )
-    .map_err(refusal38)?;
-    Ok(Ctx38::Rule { found, slots: n })
-}
-
-impl Ctx38 {
-    /// A slot's context.
-    fn ctx(&self) -> usize {
-        match self {
-            Ctx38::Set { ctx, .. } => *ctx,
-            Ctx38::Rule { found, .. } => found.ctx,
-        }
-    }
-
-    /// The largest slot context the card holds, which the default's search
-    /// found; `None` for a set context, which ran none.
-    fn fit(&self) -> Option<usize> {
-        match self {
-            Ctx38::Set { .. } => None,
-            Ctx38::Rule { found, .. } => Some(found.fit),
-        }
-    }
-
-    /// A default bounded by the prompt cache too: the first rung of the
-    /// halving ladder from the rule's context down to [`CTX`] whose one
-    /// session's state at its slot's context ([`seq38_state`]) fits the
-    /// budget `ram_at` gives there, when the cache is on
-    /// ([`model::placement::ctx::within_cache`]: a unified pool's need moves
-    /// with the context, so the budget is read at the context bounded, not at
-    /// the one the rule read), and the plan's bytes at the lowered context are
-    /// `plans`' ([`Plans::expert_bytes`]). A set context keeps its value, as
-    /// does a default whose budget is 0 at the rule's context (the cache is
-    /// off: `--cache-ram 0`, or the NVMe tier's split fills the room); a set
-    /// budget too small for one position's state is refused by name (a
-    /// default one is 0 already, [`CacheRam::holding`]). The second term is
-    /// whether the budget holds one session at the context returned: false
-    /// when not even [`CTX`]'s does, which the cache line says
-    /// ([`CacheRam::short_of`]) — the cache keeps the shorter sessions it
-    /// holds.
-    fn host_bound(
-        self,
-        plans: &Plans<'_>,
-        ram_at: &dyn Fn(usize) -> Result<u64, GateError>,
-        drafts: bool,
-    ) -> Result<(Ctx38, bool), GateError> {
-        let Ctx38::Rule { mut found, slots } = self else {
-            return Ok((self, true));
-        };
-        if ram_at(found.ctx)? == 0 {
-            return Ok((Ctx38::Rule { found, slots }, true));
-        }
-        let state = |n: usize| seq38_state(plans.inputs, n, drafts);
-        let bound = within_cache(found.ctx, CTX, CTX_STEP, &state, ram_at)?;
-        if bound.ctx != found.ctx {
-            found.ctx = bound.ctx;
-            found.rule = "cache";
-            found.chosen = plans.expert_bytes(bound.ctx)?;
-        }
-        Ok((Ctx38::Rule { found, slots }, bound.holds))
-    }
-
-    /// The `ctx` line on stderr: the common rule's ([`SlotCtx::line`]); a
-    /// set context's line carries no search terms (it ran none).
-    fn print(&self) {
-        match self {
-            Ctx38::Set {
-                ctx,
-                slots,
-                card_bytes,
-            } => eprintln!(
-                "ctx rule=set ctx={ctx} slots={slots} total={} card_expert_bytes={card_bytes}",
-                slots * ctx
-            ),
-            Ctx38::Rule { found, slots } => eprintln!("{}", found.line(*slots)),
-        }
-    }
+    let chosen = q38place::ctx_choice(plans.inputs, (set, plans.slots), |c| {
+        plans.holds(usize::try_from(c)?)
+    })?;
+    Ok(Ctx38 {
+        ctx: usize::try_from(chosen.slot_ctx)?,
+        line: chosen.line(),
+        halved: matches!(chosen.rule, Rule::Halved { .. }),
+    })
 }
 
 struct Args {
@@ -1381,7 +1150,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // `--parallel` is one request's context — one slot at the whole of it
     // (`bind::slots_of`).
     // The route trace records one sequence's steps, so its default is one.
-    let (slots, from) = match slots_of(a.parallel, a.ctx.is_some(), 2)? {
+    let (slots, from) = match slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)? {
         (_, SlotsFrom::Default) if feed.traced => (1, SlotsFrom::RouteTrace),
         given => given,
     };
@@ -1592,7 +1361,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 slots,
                 feed,
             };
-            if plain.expert_bytes(ctx).is_ok() {
+            if plain.holds(ctx).is_ok() {
                 plain.host(ctx, set)?.2
             } else {
                 0
@@ -1664,51 +1433,37 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         slots,
         feed,
     };
-    let mut rule = ctx38(&drafted, a.ctx)?;
-    // The unset draft's yield to the context (the module doc), judged on
-    // the drafted search the load just ran — its fit is the positions a
-    // slot gets with the draft, and a fit under [`CTX`] served the card
-    // rule's own fit exactly. One plain search, the draft-off load's own,
-    // decides the rest: it holds more, and the draft's bytes leave a slot
-    // under the base the plain rule aims for, so the draft goes off, the
-    // plain rule replaces this one and one `draft yield` record names both;
-    // a serving cap that binds the two fits together keeps the draft. A set
-    // `--ctx-size` or `BLOOMERY_DRAFT` never asks.
-    let (plans, mtp, head, draft_off) = if mtp
-        && draft_off.is_none()
-        && a.ctx.is_none()
-        && levers.draft().is_none()
-        && rule.fit().is_some_and(|fit| fit < CTX)
-    {
-        let plain_plans = Plans {
-            inputs: &inputs,
-            place: a.place,
-            experts,
-            levers: &plan_levers,
-            mtp: None,
-            slots,
-            feed,
-        };
-        let plain = ctx38(&plain_plans, a.ctx)?;
-        let without = plain.fit().expect("an unset rule searched");
-        let bytes = mtp_inputs
-            .as_ref()
-            .expect("a drafted search held the draft")
-            .card_bytes_of(u64::try_from(rule.ctx())?, slots)?;
-        match bloomery_levers::DraftYield::of(rule.ctx(), plain.ctx(), CTX.min(without), bytes) {
-            Some(y) => {
-                record::draft_yield(&y).eprint();
-                rule = plain;
-                mtp_inputs = None;
-                (plain_plans, false, None, Some(Draft38Off::Yield(y)))
+    // The unset draft's yield to the context (the module doc): the context
+    // comes first, so when the drafted load halved its context, or holds not
+    // even the floor, the plain load decides; it holds more, the draft goes
+    // off and one `draft yield` record names both. A set `--ctx-size` asks
+    // too; `BLOOMERY_DRAFT` never does.
+    let asks_yield = mtp && draft_off.is_none() && levers.draft().is_none();
+    let (plans, mut rule, mtp, head, draft_off) = match ctx38(&drafted, a.ctx) {
+        Ok(r) if !r.halved => (drafted, r, mtp, head, draft_off),
+        r if !asks_yield => (drafted, r?, mtp, head, draft_off),
+        drafted_rule => {
+            let plain_plans = Plans {
+                mtp: None,
+                ..drafted
+            };
+            let plain = ctx38(&plain_plans, a.ctx)?;
+            let with = drafted_rule.as_ref().map_or(0, |r| r.ctx);
+            let bytes = mtp_inputs
+                .as_ref()
+                .expect("a drafted choice held the draft")
+                .card_bytes_of(u64::try_from(plain.ctx)?, slots)?;
+            match bloomery_levers::DraftYield::of(with, plain.ctx, plain.ctx, bytes) {
+                Some(y) => {
+                    record::draft_yield(&y).eprint();
+                    (plain_plans, plain, false, None, Some(Draft38Off::Yield(y)))
+                }
+                None => (drafted, drafted_rule?, mtp, head, draft_off),
             }
-            None => (drafted, mtp, head, draft_off),
         }
-    } else {
-        (drafted, mtp, head, draft_off)
     };
-    let host = plans.host(rule.ctx(), set)?;
-    let (slots, from, mtp, head, draft_off, host, one) = match paged(host.2, slots, mtp) {
+    let host = plans.host(rule.ctx, set)?;
+    let (slots, from, mtp, head, draft_off, host) = match paged(host.2, slots, mtp) {
         Paged::AsAsked => {
             if host.2 > 0 && slots > 1 {
                 eprintln!(
@@ -1718,7 +1473,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                     host.2
                 );
             }
-            (slots, from, mtp, head, draft_off, host, None)
+            (slots, from, mtp, head, draft_off, host)
         }
         Paged::Reduced { slots: served } => {
             let (from, drafts, draft_off) = reduced(host.2, (slots, served), mtp, draft_off, false);
@@ -1728,7 +1483,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 ..plans
             };
             rule = ctx38(&one, a.ctx)?;
-            let host = one.host(rule.ctx(), set)?;
+            let host = one.host(rule.ctx, set)?;
             (
                 served,
                 from,
@@ -1736,19 +1491,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 if drafts { head } else { None },
                 draft_off,
                 host,
-                Some(one),
             )
         }
     };
     refuse_mtp_levers(&draft_off)?;
     let residency_word = set.filter(|&(r, _)| r != Residency::Off).map(|(_, w)| w);
     refuse_feed(feed, (slots, mtp), residency_word)?;
-    // The prompt cache's budget, read from the host need at the context the
-    // bound asks about, on one reading of the host's available bytes: the
-    // bound searches contexts, and a reading that moved between two of its
-    // probes would make its answer and its check disagree.
-    let paged_one = one.is_some();
-    let live = one.unwrap_or(plans);
+    // The prompt cache's budget, read from the host need at the chosen
+    // context on one reading of the host's available bytes.
     let reading = host_available_read()?;
     let entry = seq38_state(&inputs, 1, mtp);
     let cache_of = |(need, pool, arena, checkpoints, paged): (u64, u64, u64, u64, u64)| {
@@ -1763,31 +1513,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .map(|c| c.holding(entry))
     };
     let first = cache_of(host)?;
-    // A set `--cache-ram` is the same at every context.
-    let ram_at = |n: usize| -> Result<u64, GateError> {
-        match a.cache_ram {
-            Some(_) => Ok(first.ram),
-            None => Ok(cache_of(live.host(n, set)?)?.ram),
-        }
-    };
-    let before = rule.ctx();
-    let (rule, holds) = rule.host_bound(&live, &ram_at, mtp)?;
-    // The cache line names the need of the context the load serves at, and
-    // that its budget holds no session there when it does not.
-    let cache = if rule.ctx() == before {
+    // The context comes first: the cache holds the sessions its budget
+    // takes at it, and says so when that is not even one.
+    let state = seq38_state(&inputs, rule.ctx, mtp);
+    let cache = if first.ram == 0 || state <= first.ram {
         first
     } else {
-        cache_of(live.host(rule.ctx(), set)?)?
+        first.short_of(rule.ctx, state)
     };
-    let cache = if holds {
-        cache
-    } else {
-        cache.short_of(rule.ctx(), seq38_state(&inputs, rule.ctx(), mtp))
-    };
-    if paged_one && !mtp {
+    // A draft the yield or the paged rule turned off plans nothing more.
+    if !mtp {
         mtp_inputs = None;
     }
-    rule.print();
+    eprintln!("{}", rule.line);
     eprint_noted(&format!(
         "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
         cache.line()
@@ -1796,10 +1534,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // `SeatArgs`): one pass of the busy rows, a slot at a time beside an
     // expert tier card ([`Place38::tiered`]).
     let pass = Pass::of(slots, !a.place.tiered());
-    // The slots the seat serves ([`Session::add_slots`]): the flag's, one
-    // beside a set `--ctx-size`, or 2 — one drafted pass a slot a round,
-    // nothing parked.
-    parallel_line(slots, rule.ctx(), from, pass);
+    // The slots the seat serves ([`Session::add_slots`]): the flag's, or
+    // one — one drafted pass a slot a round, nothing parked.
+    parallel_line(slots, rule.ctx, from, pass);
     if mtp {
         let be = break_even_of(a.place);
         eprintln!(
@@ -1811,7 +1548,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             be.per_token
         );
     }
-    let ctx = rule.ctx();
+    let ctx = rule.ctx;
     // A drafted load's window checked at the context the rule chose — the
     // unset draft's own condition at the default's, the set draft's at any;
     // a draft the yield turned off needs no window (the plain rule's context
