@@ -266,6 +266,7 @@ PY
 # is the lane, and any other value of it (any, which the daemon's pick would contradict) keeps 3090, so the export after
 # the lane's own never names a card its lane did not get. The scan reads only `.sh` names and the cargo, target/ and
 # python forms above; the allowlist below is the scripts that run no device code, and a script not on it stays on 3090.
+# Plain cargo (`cargo test`, tools/gate.sh without --oxide) builds no device crate (AGENTS.md), so it holds no card.
 default_lane() {
   local c=$1 rest s kv
   for kv in ${box_env[@]+"${box_env[@]}"}; do
@@ -275,7 +276,7 @@ default_lane() {
     esac
   done
   case $c in
-    *'cargo oxide run'* | *'cargo oxide test'* | *'cargo run'* | *'cargo test'* | *'gate.sh --oxide'* | *target/* | *python*) echo 3090; return ;;
+    *'cargo oxide run'* | *'cargo oxide test'* | *'cargo run'* | *'gate.sh --oxide'* | *target/* | *python*) echo 3090; return ;;
   esac
   rest=${c//'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh'/}
   if [ "$rest" = "$c" ]; then echo 3090; return; fi

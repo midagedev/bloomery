@@ -866,7 +866,8 @@ cp "$tmp/boxq.job" "$Q/any.job"
 # job's gate card is the daemon's pick; anything else stays on the 3090 pin.
 ANYG='BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh'
 for c in "cargo oxide build -- --bin a && $ANYG a" "bash tools/ref/real-only.sh g && cargo oxide build -- --bin a && $ANYG a && bash tools/gate.sh -p m" \
-  "bash tools/host-gate.sh h && bash tools/ref/fixture-only.sh g && $ANYG a" "bash tools/scan-args.sh s && bash tools/ref/ref-paths.sh r && $ANYG a"; do
+  "bash tools/host-gate.sh h && bash tools/ref/fixture-only.sh g && $ANYG a" "bash tools/scan-args.sh s && bash tools/ref/ref-paths.sh r && $ANYG a" \
+  "cargo test -p x -- --ignored && bash tools/gate.sh -p y -- --ignored && $ANYG a"; do
   rc_is "box.sh: no lane named, any-form gates only: '${c:0:40}…'" 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" "$c"
   inlog "box.sh: … is lane any" "$tmp/boxq.args" '^any$'
   inlog "box.sh: … its gate card is the daemon's" "$tmp/boxq.job" 'export BLOOMERY_GATE_CARD="\$SIGNALBOX_CARD" && '
@@ -874,7 +875,7 @@ done
 for c in 'true' "cargo oxide build -- --bin g && bash tools/gpu-gate.sh g --place gate" "$ANYG a && bash tools/ref/dump.sh" \
   "$ANYG a && bash tools/gate.sh --oxide -p bloomery-gpu" "$ANYG a && ./target/release/gate_x" "$ANYG a && cargo oxide test -p x" \
   "$ANYG a && cargo oxide run -p x" "$ANYG a && cargo run --bin y" "$ANYG a && bash tools/gpu-gate.sh g --place gate" \
-  "$ANYG a && cargo test -p x" "$ANYG a && target/debug/x" "$ANYG a && python3 tools/x.py"; do
+  "$ANYG a && target/debug/x" "$ANYG a && python3 tools/x.py"; do
   rc_is "box.sh: no lane named, not only any-form gates: '${c:0:40}…'" 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" "$c"
   inlog "box.sh: … stays on lane 3090" "$tmp/boxq.args" '^3090$'
 done
