@@ -52,6 +52,7 @@ use crate::arch::coverage;
 use crate::fileio::hex;
 use crate::placement::accepts::{Program, qwen38_down, qwen38_gate_up, routed_rule};
 use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
+use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{
     self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
     TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, host_of, tier_batch_host_bytes,
@@ -293,6 +294,22 @@ pub enum PlaceError {
         ty.map_or("absent".to_string(), |t| t.to_string())
     )]
     DraftBorrow { name: String, ty: Option<GgmlType> },
+}
+
+impl PlanRefusal for PlaceError {
+    fn placement(&self) -> Option<&PlacementError> {
+        match self {
+            Self::Placement(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    fn violations(&self) -> Option<&[Violation]> {
+        match self {
+            Self::Broken(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// The planner's refusal of a tier card on the all-host plan

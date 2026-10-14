@@ -20,6 +20,7 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::placement::accepts::{Program, routed_rule};
+use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
@@ -384,6 +385,22 @@ pub enum PlaceError {
     /// A plan of no resident sequence: a load serves at least one.
     #[error("a plan of {slots} resident sequences: a load serves at least one")]
     Slots { slots: usize },
+}
+
+impl PlanRefusal for PlaceError {
+    fn placement(&self) -> Option<&PlacementError> {
+        match self {
+            Self::Placement(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    fn violations(&self) -> Option<&[Violation]> {
+        match self {
+            Self::Broken(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// The prompt batch's reserve `front` ([`prompt_reserve_bytes`]) beside

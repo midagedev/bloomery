@@ -22,6 +22,7 @@ use super::kv::KvLayout;
 use super::{roles, spec};
 use crate::arch::coverage;
 use crate::placement::accepts::{Program, routed_rule};
+use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{self, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
@@ -80,6 +81,22 @@ pub enum PlaceError {
     /// The plan was built and breaks these invariants, every one of them.
     #[error("the plan breaks its invariants: {}", joined(.0))]
     Broken(Vec<Violation>),
+}
+
+impl PlanRefusal for PlaceError {
+    fn placement(&self) -> Option<&PlacementError> {
+        match self {
+            Self::Placement(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    fn violations(&self) -> Option<&[Violation]> {
+        match self {
+            Self::Broken(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 impl PlanInputs {

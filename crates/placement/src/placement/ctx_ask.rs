@@ -131,6 +131,22 @@ impl PlacementError {
     }
 }
 
+/// A family's plan refusal, read as a short card ([`PlanRefusal::card_short`]):
+/// each family's error says which of its variants carry a placement error
+/// and a plan's violations, and the reading is this one.
+pub trait PlanRefusal {
+    /// The placement error this refusal carries, if any.
+    fn placement(&self) -> Option<&PlacementError>;
+    /// The plan's violations this refusal carries, if any.
+    fn violations(&self) -> Option<&[Violation]>;
+    /// This refusal as a short card, else `None`.
+    fn card_short(&self) -> Option<Short> {
+        self.placement()
+            .and_then(PlacementError::card_short)
+            .or_else(|| self.violations().and_then(short_of))
+    }
+}
+
 /// What set the context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {

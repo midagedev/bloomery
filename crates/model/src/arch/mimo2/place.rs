@@ -27,6 +27,7 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::placement::accepts::{Program, routed_rule};
+use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
     self, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
@@ -113,6 +114,22 @@ pub enum PlaceError {
         /// ([`placement::HostTotals::room_clause`]).
         room: String,
     },
+}
+
+impl PlanRefusal for PlaceError {
+    fn placement(&self) -> Option<&PlacementError> {
+        match self {
+            Self::Placement(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    fn violations(&self) -> Option<&[Violation]> {
+        match self {
+            Self::Broken(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 impl PlanInputs {

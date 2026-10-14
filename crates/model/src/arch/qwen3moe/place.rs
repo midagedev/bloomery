@@ -17,6 +17,7 @@ use gguf::Split;
 use super::hparams::Hparams;
 use super::roles;
 use crate::placement::accepts::{Program, routed_rule};
+use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{
     CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host_of, unified_of,
 };
@@ -140,6 +141,22 @@ pub enum PlaceError {
         "the machine has the expert tier card {tier}; the qwen3moe program hangs no expert tier"
     )]
     Tier { tier: String },
+}
+
+impl PlanRefusal for PlaceError {
+    fn placement(&self) -> Option<&PlacementError> {
+        match self {
+            Self::Placement(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    fn violations(&self) -> Option<&[Violation]> {
+        match self {
+            Self::Broken(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// What a plan of a qwen3moe file is made from, read from its headers.
