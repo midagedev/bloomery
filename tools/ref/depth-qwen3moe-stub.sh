@@ -228,6 +228,7 @@ cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/dspark-path.sh" "$ROOT/tool
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/load-groups.sh" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$ROOT/tools/ref/lever-arms.sh" \
   "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" "$ROOT/tools/ref/drive-read.sh" \
+  "$ROOT/tools/ref/bin-label.sh" \
   "$T/tools/ref/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
 # records.py and the checked-in schemas: the runner reads the arm's residency, mtp and stat records by kind.
