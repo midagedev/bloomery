@@ -406,7 +406,7 @@ mod gate {
     use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::nodes::count_kinds;
-    use bloomery_gpu_gates::q36_fixture::{Kind, Shape, Site};
+    use bloomery_gpu_gates::q36_fixture::{Shape, Site};
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
@@ -420,7 +420,7 @@ mod gate {
     use gguf::quant::half_to_f32;
     use model::arch::models::Mixer;
     use model::arch::models::shape::{AttnShape, MoeShape};
-    use model::arch::qwen35moe::hparams::{Hparams, Kind as HeaderKind};
+    use model::arch::qwen35moe::hparams::Hparams;
     use model::arch::qwen35moe::names;
     use model::placement::PlanLevers;
     use refset::arch::qwen35moe::fixture as fx;
@@ -754,14 +754,7 @@ mod gate {
     /// split's tensor table. Returns the file's hyperparameters with it.
     fn header_shape(split: &Split) -> Result<(Hparams, Shape), GateError> {
         let hp = Hparams::read(split)?;
-        let kinds: Vec<Kind> = hp
-            .kinds
-            .iter()
-            .map(|k| match k {
-                HeaderKind::DeltaRule => Kind::Delta,
-                HeaderKind::Attention => Kind::Attention,
-            })
-            .collect();
+        let kinds = hp.kinds.clone();
         let shape = Shape::from_header(&kinds, |l, site| {
             let name = match site {
                 Site::AttnQkv => names::attn_qkv(l),
@@ -1480,7 +1473,7 @@ mod gate {
     struct RouteSites {
         sites: usize,
         flips: Vec<RouteFlip>,
-        /// Sites whose ids are not the top set of the chain's own logits.
+        /// Sites whose ids are not [`flip::picks_its_top`] of the chain's own logits.
         inconsistent: Vec<(usize, usize)>,
     }
 
@@ -1517,29 +1510,14 @@ mod gate {
                 let theirs = &ids[k * n_used..(k + 1) * n_used];
                 let lg = &logits[k * n_expert..(k + 1) * n_expert];
                 out.sites += 1;
-                let low = ours
-                    .iter()
-                    .map(|&e| ours_lg.get(e as usize).copied().unwrap_or(f32::NAN))
-                    .fold(f32::INFINITY, f32::min);
-                let high = (0..n_expert)
-                    .filter(|&e| !ours.contains(&(e as u32)))
-                    .map(|e| ours_lg[e])
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let consistent = low >= high;
+                let consistent = flip::picks_its_top(ours, ours_lg, n_used);
                 if !consistent {
                     out.inconsistent.push((l, t));
                 }
                 if ours.iter().all(|&e| theirs.contains(&(e as i32))) {
                     continue;
                 }
-                let min_in = theirs
-                    .iter()
-                    .map(|&e| lg[e as usize])
-                    .fold(f32::INFINITY, f32::min);
-                let max_out = (0..n_expert)
-                    .filter(|&e| !theirs.contains(&(e as i32)))
-                    .map(|e| lg[e])
-                    .fold(f32::NEG_INFINITY, f32::max);
+                let margin = flip::margin(lg, theirs) as f32;
                 let err = ours_lg
                     .iter()
                     .zip(lg)
@@ -1550,9 +1528,9 @@ mod gate {
                     token: t,
                     ours: ours.to_vec(),
                     theirs: theirs.to_vec(),
-                    margin: min_in - max_out,
+                    margin,
                     err,
-                    tie: router_tie(min_in - max_out, err),
+                    tie: router_tie(margin, err),
                 });
             }
         }
@@ -2134,26 +2112,19 @@ mod gate {
             let theirs = &ids[t * n_used..(t + 1) * n_used];
             if !ours.iter().all(|&e| theirs.contains(&(e as i32))) {
                 let lg = &ik_logits[t * row..t * row + n_expert];
-                let min_in = theirs
-                    .iter()
-                    .map(|&e| lg[e as usize])
-                    .fold(f32::INFINITY, f32::min);
-                let max_out = (0..n_expert)
-                    .filter(|&e| !theirs.contains(&(e as i32)))
-                    .map(|e| lg[e])
-                    .fold(f32::NEG_INFINITY, f32::max);
+                let margin = flip::margin(lg, theirs) as f32;
                 let err = f.logits[t * row..t * row + n_expert]
                     .iter()
                     .zip(lg)
                     .map(|(&a, &b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
-                let tie = router_tie(min_in - max_out, err);
+                let tie = router_tie(margin, err);
                 ok &= tie;
                 flipped.push(t);
                 println!(
                     "forced layer={l} token={t}: ids ours {ours:?} ik {theirs:?}, ik margin {:.3e}, \
                      our logits' error {err:.3e}: {}",
-                    min_in - max_out,
+                    margin,
                     if tie { "a near tie (counted)" } else { "FAIL" }
                 );
                 continue;

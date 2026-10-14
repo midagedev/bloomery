@@ -68,7 +68,7 @@
 //! - (c) free-running on the batch set, each layer's picks read from the
 //!   eager run's route taps (our own chain's routing, which is what a
 //!   layer-by-layer run would read, so this gate has no layered clause),
-//!   each tap's ids the top ten of its own logits ([`picks_its_top`]): a
+//!   each tap's ids the top ten of its own logits ([`flip::picks_its_top`]): a
 //!   token whose chosen set differs from ik's `ffn_moe_topk-L` is a flip,
 //!   allowed only when every exchanged pair's gap in ik's logits
 //!   (`ffn_moe_logits`, whose softmax order is the pick's) lies within our
@@ -1104,30 +1104,6 @@ mod gate {
         Flip::between((l, t), (&ours.ids, &ours.logits), (ids, iv), ik.margin(t))
     }
 
-    /// Whether a route tap's ids are [`N_USED`] distinct experts under
-    /// [`N_EXPERT`] and the top of its own logits: none it left above the
-    /// lowest it kept (ties either way). A tap of another layer's logits
-    /// beside this layer's ids does not hold it.
-    fn picks_its_top(r: &RouteTap) -> bool {
-        let mut ids = r.ids.clone();
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.len() != N_USED
-            || r.logits.len() != N_EXPERT
-            || ids.iter().any(|&e| e as usize >= N_EXPERT)
-        {
-            return false;
-        }
-        let kept = |e: usize| ids.binary_search(&(e as u32)).is_ok();
-        let min_in = ids
-            .iter()
-            .map(|&e| r.logits[e as usize])
-            .fold(f32::INFINITY, f32::min);
-        (0..N_EXPERT)
-            .filter(|&e| !kept(e))
-            .all(|e| r.logits[e] <= min_in)
-    }
-
     /// The free clause's verdict, and by position the first layer a flip
     /// lies on the path of ([`n_layer`] where none does). Every route tap
     /// the top ten of its own logits is a self-consistency clause; the
@@ -1138,7 +1114,7 @@ mod gate {
         let mut inconsistent = Vec::new();
         for (t, routes) in eager.routes.iter().enumerate() {
             for (l, r) in routes.iter().enumerate() {
-                if !picks_its_top(r) {
+                if r.logits.len() != N_EXPERT || !flip::picks_its_top(&r.ids, &r.logits, N_USED) {
                     inconsistent.push((l, t));
                 }
             }
@@ -2780,7 +2756,10 @@ mod gate {
             .flat_map(|(t, ls)| {
                 ls.iter()
                     .enumerate()
-                    .filter(|(_, r)| !picks_its_top(r))
+                    .filter(|(_, r)| {
+                        r.logits.len() != N_EXPERT
+                            || !flip::picks_its_top(&r.ids, &r.logits, N_USED)
+                    })
                     .map(move |(l, _)| (l, t))
             })
             .collect();

@@ -57,14 +57,7 @@ pub const APART_FFN_LAUNCHES: usize = 11;
 pub const SLOT_DELTA_LAUNCHES: usize = 2;
 pub const SLOT_ATTN_LAUNCHES: usize = 3;
 
-/// What a layer mixes with, as the file's header says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// A gated delta-rule layer (`attn_qkv`).
-    Delta,
-    /// A gated GQA layer (`attn_q`).
-    Attention,
-}
+pub use model::arch::qwen35moe::hparams::Kind;
 
 /// A tensor of a layer whose type a launch rule reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,7 +117,7 @@ impl Layer {
     #[must_use]
     pub fn kind(&self) -> Kind {
         match self.mixer {
-            Mixer::Delta { .. } => Kind::Delta,
+            Mixer::Delta { .. } => Kind::DeltaRule,
             Mixer::Attention { .. } => Kind::Attention,
         }
     }
@@ -233,7 +226,7 @@ impl Shape {
         let mut layers = Vec::with_capacity(kinds.len());
         for (l, kind) in kinds.iter().enumerate() {
             let mixer = match kind {
-                Kind::Delta => Mixer::Delta {
+                Kind::DeltaRule => Mixer::Delta {
                     qkv: ty(l, Site::AttnQkv)?,
                     gate: ty(l, Site::AttnGate)?,
                     alpha: ty(l, Site::SsmAlpha)?,
@@ -285,7 +278,7 @@ impl Shape {
     /// Delta layers.
     #[must_use]
     pub fn n_delta(&self) -> usize {
-        self.count(Kind::Delta)
+        self.count(Kind::DeltaRule)
     }
 
     fn q6(&self, kind: Kind) -> usize {
@@ -300,7 +293,7 @@ impl Shape {
     /// Joined delta layers whose `attn_qkv` is Q6_K.
     #[must_use]
     pub fn q6_qkv(&self) -> usize {
-        self.q6(Kind::Delta)
+        self.q6(Kind::DeltaRule)
     }
 
     /// Joined attention layers whose `attn_v` is Q6_K.
@@ -326,7 +319,9 @@ impl Shape {
             .layers
             .iter()
             .map(|(layer, rule)| match (rule, layer.kind()) {
-                (Rule::Joined { .. }, Kind::Delta) => DELTA_MIXER_LAUNCHES + JOINED_FFN_LAUNCHES,
+                (Rule::Joined { .. }, Kind::DeltaRule) => {
+                    DELTA_MIXER_LAUNCHES + JOINED_FFN_LAUNCHES
+                }
                 (Rule::Joined { q6 }, Kind::Attention) => {
                     ATTN_MIXER_LAUNCHES
                         + JOINED_FFN_LAUNCHES
@@ -346,7 +341,7 @@ impl Shape {
             .layers
             .iter()
             .map(|(layer, rule)| match (rule, layer.kind()) {
-                (Rule::Joined { q6 }, Kind::Delta) => {
+                (Rule::Joined { q6 }, Kind::DeltaRule) => {
                     DELTA_MIXER_LAUNCHES
                         + JOINED_FFN_LAUNCHES
                         + if *q6 { PASS_QKV_COPY_LAUNCHES } else { 0 }
@@ -570,7 +565,12 @@ mod tests {
     /// ends the read with its own error. Mutant: an apart rule that reads only the gate and up.
     #[test]
     fn a_header_read_gives_the_layers_and_an_apart_rule_over_all_three_parts() {
-        let kinds = [Kind::Delta, Kind::Attention, Kind::Delta, Kind::Attention];
+        let kinds = [
+            Kind::DeltaRule,
+            Kind::Attention,
+            Kind::DeltaRule,
+            Kind::Attention,
+        ];
         let table = |l: usize, site: Site| {
             let (qkv, v) = (
                 if l == 2 { Q6_K } else { Q4_K },

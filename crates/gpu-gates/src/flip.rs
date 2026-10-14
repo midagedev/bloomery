@@ -123,6 +123,28 @@ pub fn margin(values: &[f32], ids: &[i32]) -> f64 {
     min_in - max_out
 }
 
+/// Whether ids are n_used distinct experts at the top of finite logits.
+#[must_use]
+pub fn picks_its_top(ids: &[u32], logits: &[f32], n_used: usize) -> bool {
+    if ids.len() != n_used
+        || logits.iter().any(|v| !v.is_finite())
+        || ids
+            .iter()
+            .enumerate()
+            .any(|(i, &e)| e as usize >= logits.len() || ids[..i].contains(&e))
+    {
+        return false;
+    }
+    let low = ids
+        .iter()
+        .map(|&e| logits[e as usize])
+        .fold(f32::INFINITY, f32::min);
+    logits
+        .iter()
+        .enumerate()
+        .all(|(e, &v)| ids.iter().any(|&id| id as usize == e) || v <= low)
+}
+
 /// A head's argmax that differs from ik's, excused as a tie: ours is ik's
 /// runner-up, ik's own margin between the two lies within twice our
 /// distance from ik's logits at those ids, and our whole logits row lies
