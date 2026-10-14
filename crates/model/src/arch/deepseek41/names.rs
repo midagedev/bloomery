@@ -5,20 +5,7 @@
 //! names. Anything that formats a `blk.` literal elsewhere in `crates/model/src`
 //! is a name this table does not yet own.
 
-/// `token_embd.weight` — the token embedding, one row per token.
-pub fn token_embd() -> String {
-    "token_embd.weight".to_string()
-}
-
-/// `output_norm.weight` — the RMS gain before the head.
-pub fn output_norm() -> String {
-    "output_norm.weight".to_string()
-}
-
-/// `output.weight` — the head, one row per vocabulary entry.
-pub fn output() -> String {
-    "output.weight".to_string()
-}
+pub use crate::arch::names::{output, output_norm, token_embd};
 
 /// `output_hc_fn.weight` — the hyper-connection head's mix of the streams
 /// into one before the output norm; a V4 file carries it, a V4.1 file

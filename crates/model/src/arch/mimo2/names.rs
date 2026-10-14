@@ -4,22 +4,9 @@
 //! [`LayerSpec`](models::LayerSpec), read by [`super::spec`]; the roles
 //! table ([`super::roles`]) holds the same stems for the classifier.
 
-/// `blk.{l}.{stem}`.
-fn blk(l: usize, stem: &str) -> String {
-    format!("blk.{l}.{stem}")
-}
+use crate::arch::names::blk;
 
-pub fn token_embd() -> String {
-    "token_embd.weight".to_string()
-}
-
-pub fn output_norm() -> String {
-    "output_norm.weight".to_string()
-}
-
-pub fn output() -> String {
-    "output.weight".to_string()
-}
+pub use crate::arch::names::{output, output_norm, token_embd};
 
 /// The mixer's RMS gain.
 pub fn attn_norm(l: usize) -> String {

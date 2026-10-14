@@ -52,7 +52,7 @@ impl AnyEngine {
             Ok(Arch::Deepseek2) => {
                 return Ok(AnyEngine::Deepseek2(Deepseek2Model::open(file, ctx)?));
             }
-            Ok(a @ (Arch::Deepseek41 | Arch::Glm5next | Arch::Mimo2)) => {
+            Ok(a @ (Arch::Deepseek41 | Arch::Glm5next | Arch::Mimo2 | Arch::NemotronH)) => {
                 return Err(GpuError::UnsupportedArch(a.name().to_string()));
             }
             Ok(Arch::Qwen3moe | Arch::Qwen35moe) | Err(_) => {}

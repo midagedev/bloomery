@@ -2351,6 +2351,13 @@ gate-glm5next-meta:
 gate-mimo2-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::mimo2 --nocapture && bash tools/gate.sh --release -p bloomery-model --test mimo2_meta -- --ignored --nocapture'
 
+# nemotron_h (Nemotron 3 Nano 4B) header gate: the reader's refusals on synthetic headers (a Mamba
+# layer read as attention, nemotron_h_moe, a missing ssm key, a rope need on an attention layer, a
+# state width other than 128), then the reader's description of the Q4_K_M file. Headers only,
+# seconds. The lib half is what runs the synthetic refusals; the test half is the file.
+gate-nemotron-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::nemotron_h --nocapture && bash tools/gate.sh --release -p bloomery-model --test nemotron_meta -- --ignored --nocapture'
+
 # mimo2 (MiMo-V2.6-Flash) end-to-end: the program loaded once by the gate placement, the 3090's bytes on either card
 # (every routed expert on the host tier, the host set derived at about 161.5 GB), against ik's sets (refset `ik-mimo2`,
 # dumped from the MOPD file): (s) the step's node count and its memory operations, the layer kinds, each layer's

@@ -139,6 +139,18 @@ impl LayerNames {
                     detail: format!("layer {l}: a GQA mixer, which glm5next has none of"),
                 });
             }
+            MixerKind::Mamba2 => {
+                return Err(GpuError::Shape {
+                    what: "glm5next LayerNames",
+                    detail: format!("layer {l}: a Mamba-2 mixer, which glm5next has none of"),
+                });
+            }
+            MixerKind::None => {
+                return Err(GpuError::Shape {
+                    what: "glm5next LayerNames",
+                    detail: format!("layer {l}: no token mixer, which glm5next has none of"),
+                });
+            }
         };
         let ffn = match kind.ffn {
             FfnKind::Dense => FfnNames::Dense {

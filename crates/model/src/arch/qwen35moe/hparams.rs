@@ -13,7 +13,8 @@
 use gguf::{Split, Value};
 
 use crate::arch::{
-    meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, nextn_layers, qwen35moe_variant,
+    meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, nextn_layers, optional_usize,
+    positive, qwen35moe_variant,
 };
 use crate::placement::PlacementError;
 
@@ -844,14 +845,6 @@ fn exp_tensors_agree(split: &Split, kinds: &[Kind], exp: &Exp) -> Result<(), Pla
     Ok(())
 }
 
-/// `<architecture>.<suffix>` as a count above 0.
-fn positive(split: &Split, suffix: &str) -> Result<usize, PlacementError> {
-    match meta_usize(split, suffix)? {
-        0 => Err(metadata(split, suffix, "is 0")),
-        v => Ok(v),
-    }
-}
-
 /// `rope.dimension_sections`, required (qwen35moe.cpp:8): four counts.
 pub(super) fn sections(split: &Split) -> Result<[u32; 4], PlacementError> {
     let key = "rope.dimension_sections";
@@ -999,14 +992,6 @@ fn layers_text(n_trunk: usize, n_layer: usize) -> String {
         format!("{n_trunk} layers")
     } else {
         format!("{n_trunk} trunk layers or the file's {n_layer}")
-    }
-}
-
-/// `<architecture>.<suffix>` as a count, `None` when absent.
-fn optional_usize(split: &Split, suffix: &str) -> Result<Option<usize>, PlacementError> {
-    match split.value(&split.arch_key(suffix)) {
-        None => Ok(None),
-        Some(_) => meta_usize(split, suffix).map(Some),
     }
 }
 

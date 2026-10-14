@@ -208,7 +208,15 @@ impl CardExperts {
                     detail: format!("layer {l}: card experts on a dense block"),
                 });
             };
-            let models::Act::SwiGlu { limit } = m.act;
+            let limit = match m.act {
+                models::Act::SwiGlu { limit } => limit,
+                models::Act::ReluSqr => {
+                    return Err(GpuError::Shape {
+                        what: CARD,
+                        detail: format!("layer {l}: squared ReLU has no SwiGLU clamp"),
+                    });
+                }
+            };
             // The card leg's arms ([`accepts::leg_arms`]); a prompt batch runs
             // a layer the tiles do not on the card leg.
             let st = CardStacks::of(w, l)?;

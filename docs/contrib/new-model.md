@@ -41,7 +41,7 @@ dumps, real-file gates, timed runs).
 
 | # | Step | Owning files (new family) | Alone? |
 |---|---|---|---|
-| 1 | GGUF arch reading | `crates/model/src/arch/<arch>/{hparams,names,roles,spec,place}.rs`; arms in `arch/mod.rs:32`, `crates/models/src/lib.rs:52` (`Arch`), `coverage.rs:52` (`program_of`) | L; header meta test needs the real file's headers |
+| 1 | GGUF arch reading | `crates/model/src/arch/<arch>/{hparams,names,roles,spec,place}.rs`; arms in `arch/mod.rs` (`spec`), `crates/models/src/lib.rs` (`Arch`), `crates/placement/src/accepts.rs` (`program_of`, re-exported from `coverage`) | L; header meta test needs the real file's headers |
 | 2 | Tokenizer, chat template | `crates/tokenizer/src/pretok.rs:324`, `ChatSpec` `crates/models/src/lib.rs:589`, `chat_of` `arch/mod.rs:256`, tool parsers `crates/serve/src/{glmxml,qwenxml,dsml,hermes}.rs` | A for the code; the id oracle is B |
 | 3 | Refset family and its dump | `crates/refset/src/arch/<arch>/mod.rs` and the table `arch/mod.rs:17-28`; `tools/ref/models/<arch>.sh`, `tools/ref/build-ik-<arch>.sh`, `justfile:667` (`dump-ref-mimo2`) | A for the row's tests; the dump is B |
 | 4 | Fixture row | `crates/model/src/arch/<arch>/fixture.rs`, `crates/model/src/bin/fixture.rs:44`, `crates/refset/src/fixture.rs:33`, `tools/ref/ref-paths.sh:73-79` | generate L; its `fx_` oracle sets B |
@@ -66,6 +66,16 @@ surface; `crates/models/src/lib.rs:1-12`) and a role for every tensor, and refus
 - Header test, needs the real file: `crates/model/tests/<arch>_meta.rs`, `hw_`-prefixed, `#[ignore]`, headers only,
   seconds. It pins the description line by line (`mimo2_meta.rs:31`). The MiMo test hard-codes the box path
   (`mimo2_meta.rs:20`); `crates/model/tests/common/model_path.rs:4` reads `$BLOOMERY_MODEL` instead.
+
+A next family calls the common readers instead of copying them. A count above zero is `positive` and an optional
+count is `optional_usize`, both beside `meta_usize` in `arch/mod.rs`. The block spelling is `names::blk`, and the
+three model-level tensors are `names::token_embd`, `names::output_norm` and `names::output`. Already common, and
+still the ones to call: `classify_with`, `Stem` with `req` and `opt`, the `meta_*` key readers, `chat_of`,
+`n_vocab`, `spec_u32` and `nextn_layers`. A per-layer array is not one of those: the families' arrays do not share
+a shape (a count above zero, a count that may be zero, a float with a scalar fallback), so each family keeps the
+read that matches its key. `program_of` is defined in `crates/placement/src/accepts.rs` and re-exported from
+`coverage`. An architecture with a reader and no program returns `None` from it; the coverage check then names
+`Need::Program`.
 
 ### 2. Tokenizer and template
 

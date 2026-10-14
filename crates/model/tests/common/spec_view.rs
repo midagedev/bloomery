@@ -30,6 +30,7 @@ fn rope(r: &Rope) -> String {
 fn act(a: &Act) -> String {
     match a {
         Act::SwiGlu { limit } => format!("swiglu {limit:?}"),
+        Act::ReluSqr => "relusqr".to_string(),
     }
 }
 
@@ -131,6 +132,14 @@ pub fn layer_line(layer: &LayerSpec) -> String {
                 r.kind, r.k_heads, r.v_heads, r.d, r.conv
             );
         }
+        Mixer::Mamba2(m) => {
+            let _ = write!(
+                o,
+                "mamba2 inner {} state {} heads {} dim {} groups {} conv {} proj {}",
+                m.d_inner, m.d_state, m.n_heads, m.head_dim, m.n_groups, m.d_conv, m.d_in_proj
+            );
+        }
+        Mixer::None => o.push_str("none"),
     }
     match &layer.ffn {
         Ffn::Moe(m) => {
@@ -159,7 +168,11 @@ pub fn layer_line(layer: &LayerSpec) -> String {
             }
         }
         Ffn::Dense { ff, act: a } => {
-            let _ = write!(o, " || dense {ff} {}", act(a));
+            if *ff == 0 && matches!(a, Act::ReluSqr) {
+                o.push_str(" || none");
+            } else {
+                let _ = write!(o, " || dense {ff} {}", act(a));
+            }
         }
     }
     let _ = write!(

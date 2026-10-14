@@ -110,7 +110,8 @@ fn main() {
                 | Arch::Qwen3moe
                 | Arch::Qwen35moe
                 | Arch::Glm5next
-                | Arch::Mimo2),
+                | Arch::Mimo2
+                | Arch::NemotronH),
             ) => {
                 eprintln!("bloomery-decode: unsupported architecture {:?}", a.name());
                 std::process::exit(1);

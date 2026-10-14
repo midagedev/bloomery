@@ -608,6 +608,8 @@ pub fn mixer_terms(
             at(names::attn_output(l), 1.0)?,
         ]),
         MixerKind::Gqa => Err(format!("layer {l}: a GQA mixer").into()),
+        MixerKind::Mamba2 => Err(format!("layer {l}: a Mamba-2 mixer").into()),
+        MixerKind::None => Err(format!("layer {l}: no token mixer").into()),
     }
 }
 

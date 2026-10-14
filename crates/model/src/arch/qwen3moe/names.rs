@@ -4,20 +4,7 @@
 //! a routed FFN. [`LAYER`] lists the per-layer stems, which the classifier
 //! (`roles`) and the metadata gate walk.
 
-/// `token_embd.weight` — the token embedding, one row per token.
-pub fn token_embd() -> String {
-    "token_embd.weight".to_string()
-}
-
-/// `output_norm.weight` — the RMS gain before the head.
-pub fn output_norm() -> String {
-    "output_norm.weight".to_string()
-}
-
-/// `output.weight` — the head, one row per vocabulary entry.
-pub fn output() -> String {
-    "output.weight".to_string()
-}
+pub use crate::arch::names::{output, output_norm, token_embd};
 
 /// `blk.{block}.attn_norm.weight` — the pre-attention RMS gain.
 pub fn attn_norm(block: usize) -> String {

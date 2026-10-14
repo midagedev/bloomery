@@ -99,6 +99,16 @@ pub enum Need {
     Shared { ff: u32, sigmoid_gate: bool },
     /// A dense feed-forward layer of `ff` values.
     DenseFfn { ff: u32 },
+    /// A dense squared-ReLU layer of `ff` values, with no gate.
+    ReluSqr { ff: u32 },
+    /// A Mamba-2 mixer. The fields are the widths a scan kernel is built for.
+    Mamba2 {
+        d_inner: u32,
+        d_state: u32,
+        n_heads: u32,
+        n_groups: u32,
+        d_conv: u32,
+    },
     /// Hyper-connections of `streams` streams.
     Hc { streams: u32 },
     /// Gated-residual hyper-connections of `streams` streams through a
@@ -262,6 +272,17 @@ impl fmt::Display for Need {
                 Ok(())
             }
             Need::DenseFfn { ff } => write!(f, "dense SwiGLU layer: ff {ff}"),
+            Need::ReluSqr { ff } => write!(f, "squared-ReLU dense layer: ff {ff}"),
+            Need::Mamba2 {
+                d_inner,
+                d_state,
+                n_heads,
+                n_groups,
+                d_conv,
+            } => write!(
+                f,
+                "Mamba-2 mixer: inner {d_inner}, state {d_state}, {n_heads} heads, {n_groups} groups, conv {d_conv}"
+            ),
             Need::Hc { streams } => write!(f, "hyper-connections of {streams} streams"),
             Need::HcGated { streams, rank } => write!(
                 f,
@@ -309,6 +330,7 @@ fn mode_name(mode: RopeMode) -> String {
         RopeMode::NormTail => "NORM tail".to_string(),
         RopeMode::Neox => "NeoX".to_string(),
         RopeMode::Imrope { sections } => format!("IMROPE {sections:?}"),
+        RopeMode::None => "no rope".to_string(),
     }
 }
 
@@ -330,12 +352,14 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                     sinks: g.sinks,
                     scaled: g.value_scale.is_some(),
                 });
-                at(Need::QkRope {
-                    qk_norm: g.qk_norm,
-                    head: g.head_dim,
-                    mode: g.rope.mode,
-                    dims: g.rope.dims,
-                });
+                if g.rope.mode != RopeMode::None {
+                    at(Need::QkRope {
+                        qk_norm: g.qk_norm,
+                        head: g.head_dim,
+                        mode: g.rope.mode,
+                        dims: g.rope.dims,
+                    });
+                }
                 if g.out_gate {
                     at(Need::OutGate);
                 }
@@ -374,6 +398,14 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 d: r.d,
                 conv: r.conv,
             }),
+            Mixer::Mamba2(m) => at(Need::Mamba2 {
+                d_inner: m.d_inner,
+                d_state: m.d_state,
+                n_heads: m.n_heads,
+                n_groups: m.n_groups,
+                d_conv: m.d_conv,
+            }),
+            Mixer::None => {}
         }
         match &layer.ffn {
             Ffn::Moe(m) => {
@@ -388,7 +420,13 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                     });
                 }
             }
-            Ffn::Dense { ff, .. } => at(Need::DenseFfn { ff: *ff }),
+            Ffn::Dense { ff, act } => match act {
+                crate::Act::SwiGlu { .. } => at(Need::DenseFfn { ff: *ff }),
+                // Width 0 is a layer with no feed-forward block. A squared
+                // ReLU of a positive width is the block.
+                crate::Act::ReluSqr if *ff > 0 => at(Need::ReluSqr { ff: *ff }),
+                crate::Act::ReluSqr => {}
+            },
         }
         if layer.residual == Residual::Hc
             && let Some(hc) = spec.hc

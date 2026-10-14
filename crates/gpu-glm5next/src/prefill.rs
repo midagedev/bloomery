@@ -3084,6 +3084,16 @@ impl<'a> LayerProgram for PromptProgram<'a> {
                         "layer {l}: a GQA mixer, which glm5next has none of"
                     )));
                 }
+                MixerKind::Mamba2 => {
+                    return Err(shape(format!(
+                        "layer {l}: a Mamba-2 mixer, which glm5next has none of"
+                    )));
+                }
+                MixerKind::None => {
+                    return Err(shape(format!(
+                        "layer {l}: no token mixer, which glm5next has none of"
+                    )));
+                }
             }
             self.hc_out(u)?;
             self.hc_in(l, u, Sub::Ffn)?;

@@ -9,6 +9,7 @@ use gguf::{Split, Value};
 use super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, required};
 use crate::arch::{
     meta_arr, meta_bool, meta_f32, meta_u64, meta_usize, metadata, n_vocab, nextn_layers,
+    optional_usize, positive,
 };
 use crate::placement::PlacementError;
 
@@ -673,22 +674,6 @@ fn per_layer_f32(split: &Split, suffix: &str, n_layer: usize) -> Result<Vec<f32>
             )),
         })
         .collect()
-}
-
-/// `<architecture>.<suffix>` as a count above 0.
-fn positive(split: &Split, suffix: &str) -> Result<usize, PlacementError> {
-    match meta_usize(split, suffix)? {
-        0 => Err(metadata(split, suffix, "is 0")),
-        v => Ok(v),
-    }
-}
-
-/// `<architecture>.<suffix>` as a count, `None` when absent.
-fn optional_usize(split: &Split, suffix: &str) -> Result<Option<usize>, PlacementError> {
-    match split.value(&split.arch_key(suffix)) {
-        None => Ok(None),
-        Some(_) => meta_usize(split, suffix).map(Some),
-    }
 }
 
 /// `<architecture>.<suffix>` as a float, `None` when absent.

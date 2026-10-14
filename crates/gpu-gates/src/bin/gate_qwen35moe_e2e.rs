@@ -837,6 +837,7 @@ mod gate {
                     (("delta", got), [c(N_V), c(HEAD_V), c(C), 0])
                 }
                 Mixer::Latent(_) => (("latent", [0; 4]), [u32::MAX; 4]),
+                Mixer::Mamba2(_) | Mixer::None => (("mamba2", [0; 4]), [u32::MAX; 4]),
             };
             let pass = got.1 == want;
             ok &= pass;

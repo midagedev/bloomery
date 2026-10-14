@@ -112,6 +112,16 @@ pub fn stores(layer: &LayerSpec) -> Vec<(Store, StoreRule)> {
                 Some(Selector::StreamTopK { .. }) | None => {}
             }
         }
+        Mixer::Mamba2(m) => {
+            v.push((
+                Store::Conv,
+                StoreRule::Window {
+                    slots: m.d_conv.saturating_sub(1),
+                },
+            ));
+            v.push((Store::State, StoreRule::Recurrent));
+        }
+        Mixer::None => {}
     }
     v
 }

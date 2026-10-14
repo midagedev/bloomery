@@ -13,7 +13,7 @@
 //! the routed block has no shared expert and no clamp, so a layer's card
 //! shadow is its card experts alone; layer 0's block is dense.
 
-use models::{Ffn, LayerSpec, Mixer, RopeMode, Score};
+use models::{Act, Ffn, LayerSpec, Mixer, RopeMode, Score};
 use runtime::layer::FfnKind;
 
 /// A layer the program has no launch for, named by its layer.
@@ -176,11 +176,17 @@ pub struct BlockArgs {
 /// and the card experts run the plain combine).
 pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockArgs, Refusal> {
     match &s.ffn {
-        Ffn::Dense { ff, act } => Ok(BlockArgs {
-            limit: act.swiglu_limit(),
-            ff: *ff as usize,
-            bias: false,
-        }),
+        Ffn::Dense { ff, act } => match act {
+            Act::SwiGlu { limit } => Ok(BlockArgs {
+                limit: limit.unwrap_or(0.0),
+                ff: *ff as usize,
+                bias: false,
+            }),
+            Act::ReluSqr => Err(refuse(
+                l,
+                "a squared ReLU; the dense block runs SwiGLU".to_string(),
+            )),
+        },
         Ffn::Moe(m) => {
             let r = &m.router;
             if r.score != Score::Sigmoid || !r.norm || r.hash {
@@ -212,7 +218,18 @@ pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockAr
                     "a shared expert; the routed block has none".to_string(),
                 ));
             }
-            if m.act.swiglu_limit() != 0.0 {
+            let limit = match m.act {
+                Act::SwiGlu { limit } => limit.unwrap_or(0.0),
+                Act::ReluSqr => {
+                    return Err(refuse(
+                        l,
+                        "a squared ReLU on the routed experts; the host tier and the card experts \
+                         run SwiGLU"
+                            .to_string(),
+                    ));
+                }
+            };
+            if limit != 0.0 {
                 return Err(refuse(
                     l,
                     "a clamp on the routed experts; the host tier and the card experts run the \

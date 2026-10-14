@@ -21,12 +21,17 @@ pub enum MixerKind {
     Gqa,
     Latent,
     DeltaRule,
+    /// A Mamba-2 mixer.
+    Mamba2,
+    /// This layer has no token mixer.
+    None,
 }
 
 /// A layer's feed-forward block, as the program that runs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfnKind {
-    /// One dense SwiGLU block: the card runs it whole.
+    /// One dense block: the card runs it whole. The activation is the spec's
+    /// ([`models::Act`]); the programs that match this arm run SwiGLU.
     Dense,
     /// Routed experts: the router hands the step's slots to the host tier,
     /// whose answer the back joins.
@@ -58,6 +63,8 @@ impl Layer {
                 Mixer::Gqa(_) => MixerKind::Gqa,
                 Mixer::Latent(_) => MixerKind::Latent,
                 Mixer::DeltaRule(_) => MixerKind::DeltaRule,
+                Mixer::Mamba2(_) => MixerKind::Mamba2,
+                Mixer::None => MixerKind::None,
             },
             ffn: match spec.ffn {
                 Ffn::Dense { .. } => FfnKind::Dense,

@@ -62,6 +62,7 @@ pub enum Arch {
     Qwen4Exp,
     Glm5Next,
     MiMo2,
+    NemotronH,
 }
 
 impl Arch {
@@ -79,6 +80,7 @@ impl Arch {
             Arch::Qwen4Exp => "qwen4exp",
             Arch::Glm5Next => "glm5next",
             Arch::MiMo2 => "mimo2",
+            Arch::NemotronH => "nemotron_h",
         }
     }
 }
@@ -153,6 +155,31 @@ pub enum Mixer {
     Gqa(Gqa),
     Latent(Latent),
     DeltaRule(DeltaRule),
+    /// A Mamba-2 mixer: a short conv, then a selective scan of [`Mamba2::n_heads`]
+    /// heads of [`Mamba2::head_dim`] values in [`Mamba2::n_groups`] groups.
+    Mamba2(Mamba2),
+    /// This layer has no token mixer. Its feed-forward block is the layer.
+    None,
+}
+
+/// A Mamba-2 mixer. The widths are the header's `ssm.*` keys, and the two
+/// products the input projection and the conv are built at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mamba2 {
+    /// `ssm.inner_size`.
+    pub d_inner: u32,
+    /// `ssm.state_size`.
+    pub d_state: u32,
+    /// `ssm.time_step_rank`: the scan's heads.
+    pub n_heads: u32,
+    /// `d_inner / n_heads`.
+    pub head_dim: u32,
+    /// `ssm.group_count`.
+    pub n_groups: u32,
+    /// `ssm.conv_kernel`.
+    pub d_conv: u32,
+    /// Input-projection columns: `2 * d_inner + 2 * n_groups * d_state + n_heads`.
+    pub d_in_proj: u32,
 }
 
 /// Grouped-query attention.
@@ -393,6 +420,8 @@ pub enum RopeMode {
     Neox,
     /// NeoX halves, pair `i`'s position taken from its section's axis.
     Imrope { sections: [u32; 4] },
+    /// No value is rotated.
+    None,
 }
 
 /// YaRN's parameters.
@@ -470,15 +499,20 @@ pub enum Act {
     /// `None`: `silu(g)·u`. `Some(L)`: `min(silu(g), L)·clamp(u, ±L)`; an `L`
     /// of at most 1e-6 clamps nothing.
     SwiGlu { limit: Option<f32> },
+    /// `relu(x)^2`, with no gate.
+    ReluSqr,
 }
 
 impl Act {
     /// The clamp the combine kernels take: 0, the plain combine, when the
-    /// activation has no limit, else the limit.
+    /// activation has no limit, else the limit. A squared ReLU has no clamp;
+    /// a caller matches on [`Act`] and refuses that arm by name.
     #[must_use]
     pub fn swiglu_limit(self) -> f32 {
-        let Act::SwiGlu { limit } = self;
-        limit.unwrap_or(0.0)
+        match self {
+            Act::SwiGlu { limit } => limit.unwrap_or(0.0),
+            Act::ReluSqr => panic!("squared ReLU has no SwiGLU clamp"),
+        }
     }
 }
 
@@ -862,5 +896,13 @@ mod tests {
     fn swiglu_limit_is_zero_without_a_limit_and_the_limit_with_one() {
         assert_eq!(Act::SwiGlu { limit: None }.swiglu_limit(), 0.0);
         assert_eq!(Act::SwiGlu { limit: Some(7.0) }.swiglu_limit(), 7.0);
+    }
+
+    /// A squared ReLU has no SwiGLU clamp. Calling the clamp on it is the
+    /// caller's miss: the message names the activation.
+    #[test]
+    #[should_panic(expected = "squared ReLU has no SwiGLU clamp")]
+    fn swiglu_limit_on_squared_relu_names_the_activation() {
+        Act::ReluSqr.swiglu_limit();
     }
 }

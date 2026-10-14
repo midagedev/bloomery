@@ -12,7 +12,7 @@
 use gguf::{Split, Value};
 
 use super::names;
-use crate::arch::{meta_f32, meta_str, meta_usize, metadata, n_vocab};
+use crate::arch::{meta_f32, meta_str, meta_usize, metadata, n_vocab, optional_usize};
 use crate::placement::PlacementError;
 
 /// ik's `LLM_EXPERT_GATING_FUNC_SOFTMAX` (llama-hparams.h:15).
@@ -247,15 +247,6 @@ impl Experts {
             score: Score::Softmax,
             weights_norm: true,
         })
-    }
-}
-
-/// `<architecture>.<suffix>` as a count, `None` when the file does not carry
-/// the key; a key of another type is an error naming it.
-fn optional_usize(split: &Split, suffix: &str) -> Result<Option<usize>, PlacementError> {
-    match split.value(&split.arch_key(suffix)) {
-        None => Ok(None),
-        Some(_) => meta_usize(split, suffix).map(Some),
     }
 }
 

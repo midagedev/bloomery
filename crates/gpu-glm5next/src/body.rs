@@ -1115,10 +1115,13 @@ fn shape(detail: String) -> GpuError {
     GpuError::Shape { what: WHAT, detail }
 }
 
-/// The layer's SwiGLU limit, 0 (the plain combine) when it has none.
-fn limit_of(act: Act) -> f32 {
-    let Act::SwiGlu { limit } = act;
-    limit.unwrap_or(0.0)
+/// The layer's SwiGLU limit, 0 (the plain combine) when it has none. A
+/// squared ReLU has no clamp and is refused by name.
+fn limit_of(act: Act) -> Result<f32, GpuError> {
+    match act {
+        Act::SwiGlu { limit } => Ok(limit.unwrap_or(0.0)),
+        Act::ReluSqr => Err(shape("squared ReLU has no SwiGLU clamp".into())),
+    }
 }
 
 /// Refused by name unless `plan`'s card `card` counts the KV term of
@@ -1526,6 +1529,16 @@ impl Body {
                 MixerKind::Gqa => {
                     return Err(shape(format!(
                         "layer {l}: a GQA mixer, which glm5next has none of"
+                    )));
+                }
+                MixerKind::Mamba2 => {
+                    return Err(shape(format!(
+                        "layer {l}: a Mamba-2 mixer, which glm5next has none of"
+                    )));
+                }
+                MixerKind::None => {
+                    return Err(shape(format!(
+                        "layer {l}: no token mixer, which glm5next has none of"
                     )));
                 }
             }
@@ -2220,13 +2233,26 @@ fn layer_cfg(
             "layer {l}: a plain residual; every trunk block is wrapped in the streams"
         )));
     }
-    if let Mixer::Gqa(_) = s.mixer {
-        return Err(shape(format!(
-            "layer {l}: a GQA mixer, which glm5next has none of"
-        )));
+    match &s.mixer {
+        Mixer::Gqa(_) => {
+            return Err(shape(format!(
+                "layer {l}: a GQA mixer, which glm5next has none of"
+            )));
+        }
+        Mixer::Mamba2(_) => {
+            return Err(shape(format!(
+                "layer {l}: a Mamba-2 mixer, which glm5next has none of"
+            )));
+        }
+        Mixer::None => {
+            return Err(shape(format!(
+                "layer {l}: no token mixer, which glm5next has none of"
+            )));
+        }
+        Mixer::Latent(_) | Mixer::DeltaRule(_) => {}
     }
     let (limit, ff, bias) = match &s.ffn {
-        Ffn::Dense { ff, act } => (limit_of(*act), *ff as usize, false),
+        Ffn::Dense { ff, act } => (limit_of(*act)?, *ff as usize, false),
         Ffn::Moe(m) => {
             let r = &m.router;
             if r.score != Score::Sigmoid || !r.norm || r.hash {
@@ -2241,7 +2267,7 @@ fn layer_cfg(
                     "layer {l}: a routed block without its shared expert"
                 ))
             })?;
-            (limit_of(sh.act), sh.ff as usize, m.router.bias)
+            (limit_of(sh.act)?, sh.ff as usize, m.router.bias)
         }
     };
     let row_off = match kind.ffn {
@@ -2282,6 +2308,14 @@ fn store(
             pooled: DeviceTensor::zeroed(stream, pools_for(ctx), INDEX_HEAD)?,
         },
         MixerKind::Gqa => return Err(shape("a GQA store, which glm5next has none of".into())),
+        MixerKind::Mamba2 => {
+            return Err(shape("a Mamba-2 store, which glm5next has none of".into()));
+        }
+        MixerKind::None => {
+            return Err(shape(
+                "a store for a layer with no token mixer, which glm5next has none of".into(),
+            ));
+        }
     })
 }
 

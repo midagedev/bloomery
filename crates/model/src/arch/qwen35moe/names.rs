@@ -5,18 +5,9 @@
 //! stems for the classifier, and the plan's gate holds every name to the file
 //! (`tests/qwen4exp_meta.rs`).
 
-/// `blk.{l}.{stem}`.
-fn blk(l: usize, stem: &str) -> String {
-    format!("blk.{l}.{stem}")
-}
+use crate::arch::names::blk;
 
-pub fn token_embd() -> String {
-    "token_embd.weight".to_string()
-}
-
-pub fn output() -> String {
-    "output.weight".to_string()
-}
+pub use crate::arch::names::{output, token_embd};
 
 /// The head's hyper-connection mix: the streams' grouped RMS gain, then the
 /// low-rank gate's down and up — the output norm of this architecture.

@@ -506,7 +506,7 @@ pub fn turns_as_neox(mode: RopeMode, dims: u32) -> bool {
         RopeMode::Imrope { sections } => {
             sections.iter().map(|&s| u64::from(s)).sum::<u64>() == u64::from(dims / 2)
         }
-        RopeMode::NormTail => false,
+        RopeMode::NormTail | RopeMode::None => false,
     }
 }
 

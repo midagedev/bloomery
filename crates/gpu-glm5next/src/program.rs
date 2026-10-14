@@ -77,7 +77,7 @@ pub fn layer_launches(mixer: MixerKind, ffn: FfnKind, card: bool, plan: BlockPla
     let mix = match mixer {
         MixerKind::DeltaRule => kda::LAUNCHES,
         MixerKind::Latent => mla::LAUNCHES,
-        MixerKind::Gqa => 0,
+        MixerKind::Gqa | MixerKind::Mamba2 | MixerKind::None => 0,
     };
     let block = match ffn {
         FfnKind::Dense => ffn::DENSE_LAUNCHES,
@@ -260,6 +260,18 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
                 return Err(GpuError::Shape {
                     what: WHAT,
                     detail: format!("layer {l}: a GQA mixer, which glm5next has none of"),
+                });
+            }
+            MixerKind::Mamba2 => {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("layer {l}: a Mamba-2 mixer, which glm5next has none of"),
+                });
+            }
+            MixerKind::None => {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("layer {l}: no token mixer, which glm5next has none of"),
                 });
             }
         }

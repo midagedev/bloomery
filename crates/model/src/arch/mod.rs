@@ -19,6 +19,7 @@ pub mod dspark;
 pub mod glm5next;
 pub mod mimo2;
 pub mod names;
+pub mod nemotron_h;
 pub mod qwen35moe;
 pub mod qwen3moe;
 mod stems;
@@ -39,6 +40,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
         Some(a) if is_qwen35_body(a) => qwen35moe::spec::read(split)?,
         Some("glm5next" | GLM5_NEXT_LLAMA_CPP) => glm5next::spec::read(split)?,
         Some("mimo2") => mimo2::spec::read(split)?,
+        Some("nemotron_h") => nemotron_h::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
                 other.unwrap_or("<missing>").to_string(),
@@ -133,7 +135,8 @@ fn architecture_is(is: &str) -> PlacementError {
     }
 }
 
-/// The architectures this engine can run.
+/// An architecture a file's `general.architecture` names, when this crate has
+/// a reader or a program for it. `nemotron_h` has a reader and no program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
     Deepseek2,
@@ -142,6 +145,7 @@ pub enum Arch {
     Qwen35moe,
     Glm5next,
     Mimo2,
+    NemotronH,
 }
 
 impl Arch {
@@ -167,6 +171,7 @@ impl Arch {
             "qwen35moe" => Ok(Arch::Qwen35moe),
             "glm5next" | GLM5_NEXT_LLAMA_CPP => Ok(Arch::Glm5next),
             "mimo2" => Ok(Arch::Mimo2),
+            "nemotron_h" => Ok(Arch::NemotronH),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -186,6 +191,7 @@ impl Arch {
             Arch::Qwen35moe => "qwen35moe",
             Arch::Glm5next => "glm5next",
             Arch::Mimo2 => "mimo2",
+            Arch::NemotronH => "nemotron_h",
         }
     }
 }
@@ -217,6 +223,23 @@ fn meta_u64(split: &Split, suffix: &str) -> Result<u64, PlacementError> {
 fn meta_usize(split: &Split, suffix: &str) -> Result<usize, PlacementError> {
     let v = meta_u64(split, suffix)?;
     usize::try_from(v).map_err(|_| metadata(split, suffix, format!("{v} does not fit usize")))
+}
+
+/// `<architecture>.<suffix>` as a count above 0.
+pub(crate) fn positive(split: &Split, suffix: &str) -> Result<usize, PlacementError> {
+    match meta_usize(split, suffix)? {
+        0 => Err(metadata(split, suffix, "is 0")),
+        v => Ok(v),
+    }
+}
+
+/// `<architecture>.<suffix>` as a count, `None` when the file does not carry
+/// the key; a key of another type is an error naming it.
+pub(crate) fn optional_usize(split: &Split, suffix: &str) -> Result<Option<usize>, PlacementError> {
+    match split.value(&split.arch_key(suffix)) {
+        None => Ok(None),
+        Some(_) => meta_usize(split, suffix).map(Some),
+    }
 }
 
 /// `<architecture>.<suffix>` as a float.
@@ -642,6 +665,7 @@ mod tests {
             Arch::Qwen35moe,
             Arch::Glm5next,
             Arch::Mimo2,
+            Arch::NemotronH,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

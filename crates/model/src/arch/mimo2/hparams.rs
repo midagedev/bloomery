@@ -13,7 +13,9 @@ use gguf::{Split, Value};
 use super::roles::{
     DENSE, MIXER, MOE, NEXTN, QKV_FUSED, QKV_SPLIT, SELECTION_BIAS, Stem, required,
 };
-use crate::arch::{meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab};
+use crate::arch::{
+    meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, optional_usize, positive,
+};
 use crate::placement::PlacementError;
 
 /// llama.cpp's `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`, which the mimo2
@@ -541,22 +543,6 @@ fn one_width(split: &Split, suffix: &str, why: &str) -> Result<usize, PlacementE
     match meta_usize(split, suffix)? {
         0 => Err(metadata(split, suffix, "is 0")),
         v => Ok(v),
-    }
-}
-
-/// `<architecture>.<suffix>` as a count above 0.
-fn positive(split: &Split, suffix: &str) -> Result<usize, PlacementError> {
-    match meta_usize(split, suffix)? {
-        0 => Err(metadata(split, suffix, "is 0")),
-        v => Ok(v),
-    }
-}
-
-/// `<architecture>.<suffix>` as a count, `None` when absent.
-fn optional_usize(split: &Split, suffix: &str) -> Result<Option<usize>, PlacementError> {
-    match split.value(&split.arch_key(suffix)) {
-        None => Ok(None),
-        Some(_) => meta_usize(split, suffix).map(Some),
     }
 }
 
