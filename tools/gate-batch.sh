@@ -267,9 +267,10 @@
 # build is asked for. Its line gains `main=also-red` (that run's rc is neither 0 nor 75),
 # `main=batch-only` (that run ended 0) or `main=unrun` (no checkout, the tree stayed busy,
 # origin/main has no such recipe, or the run ended 75), placed before `item=` when the item has one. The checkout is one detached worktree,
-# $HOME/.cache/bloomery/gate-batch-main, reused when it is already that commit. box.sh's remote is
-# that directory's basename: a tree it already holds is not synced, and rsync never sends target/,
-# so the binary already built there is the one the recheck runs. The batch's own rc does not change.
+# $HOME/.cache/bloomery/gate-batch-main, reused when it is already that commit. The recheck drops
+# the caller's BLOOMERY_REMOTE, so box.sh's remote is that directory's basename: a tree it already
+# holds is not synced, and rsync never sends target/, so the binary already built there is the one
+# the recheck runs. The batch's own rc does not change.
 # DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
 # basename of this worktree's root): outside every tree, so the logs survive a `rm -rf target/`
 # cleanup of the worktrees and neither mark a tree dirty nor reach box.sh's rsync. An explicit
@@ -1081,6 +1082,9 @@ for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
 word=${*##* }
 for d in ${FAKE_START_DELAY:-}; do [ "${d%%=*}" != "$word" ] || sleep "${d#*=}"; done
 printf '%s\t%s\n' "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/box.log"
+# BLOOMERY_REMOTE is the caller's box directory. The origin/main recheck drops it; a case reads this.
+if [ -n "${BLOOMERY_REMOTE+x}" ]; then printf 'set\t%s\n' "$BLOOMERY_REMOTE" >> "$st/remote.log"
+else printf 'unset\n' >> "$st/remote.log"; fi
 echo "S $*" >> "$st/seq.log"
 # What an item sees of the batch's hold when it starts: its owner from the env, and the hold file as it stands.
 printf '%s\t%s\t%s\n' "${BLOOMERY_BATCH_OWNER:-none}" "$(head -1 "$st/batch.gpuhold" 2> /dev/null || echo nohold)" "$*" >> "$st/seen.log"
@@ -3106,6 +3110,20 @@ EOS
   if [ "$bn" = 1 ] && [ "$mn" = 1 ]; then pass 'red-main: one batch run and one main run'
   else fail 'red-main: one batch run and one main run' "batch $bn main $mn"; fi
   rm -rf "$t/mainwt/fake-state"
+  # The recheck drops BLOOMERY_REMOTE. The batch's own calls keep it. FAIL-first: without the
+  # unset the main run records the caller's directory.
+  export BLOOMERY_REMOTE=$t/repo-trk
+  mutant_of red-noremote 's/^  env -u BLOOMERY_REMOTE GATE_BATCH_FROM=main/  GATE_BATCH_FROM=main/' '^  GATE_BATCH_FROM=main BLOOMERY_BOX_PIDDIR'
+  rc=$(MTAG=red-noremote steal_case rm-remote-m "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-remote-m"
+  want 'red-main mutant: without the unset the main run keeps BLOOMERY_REMOTE' "$t/mainwt/fake-state/remote.log" "$(printf '^set\t%s$' "$t/repo-trk")"
+  rm -rf "$t/mainwt/fake-state"
+  rc=$(steal_case rm-remote "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-remote"
+  want 'red-main: the batch run keeps BLOOMERY_REMOTE' "$t/fake-state/remote.log" "$(printf '^set\t%s$' "$t/repo-trk")"
+  want 'red-main: the main run drops BLOOMERY_REMOTE' "$t/mainwt/fake-state/remote.log" '^unset$'
+  unset BLOOMERY_REMOTE
+  rm -rf "$t/mainwt/fake-state"
   export FAKE_MAIN_RC=0
   rc=$(steal_case rm-only "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
   printf '%s' "$rc" > "$t/rc-rm-only"
@@ -3144,7 +3162,7 @@ EOS
   printf '%s' "$rc" > "$t/rc-rm-unrun"
   want 'red-main: no checkout is main=unrun, and the batch stays red' "$t/target/c-rm-unrun/run.log" \
     '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=unrun item=steal-fix@FAKE_RC=1$'
-  unset GATE_BATCH_MAIN_TREE FAKE_MAIN_RC
+  unset GATE_BATCH_MAIN_TREE FAKE_MAIN_RC BLOOMERY_REMOTE
   rc=$(steal_case rm-off "steal-fix@FAKE_RC=1	A	3090	2	$d" -- 'steal-fix@FAKE_RC=1')
   printf '%s' "$rc" > "$t/rc-rm-off"
   want 'red-main: off, the red line is the one it always printed' "$t/target/c-rm-off/run.log" \
@@ -5427,7 +5445,8 @@ main_recheck() { # $1 = plan index, $2 = box env, $3 = the item log
   echo "=== main recheck $(date '+%F %T') tree=$root" >> "$log"
   rc=0
   # GATE_BATCH_FROM marks the recheck for the self-test's fake box. The real box.sh does not read it.
-  GATE_BATCH_FROM=main BLOOMERY_BOX_PIDDIR="$OUT/lane-main-$i.box" BLOOMERY_BOX_ENV="$benv" \
+  # Drop BLOOMERY_REMOTE so the remote is this tree's basename, not the caller's box directory.
+  env -u BLOOMERY_REMOTE GATE_BATCH_FROM=main BLOOMERY_BOX_PIDDIR="$OUT/lane-main-$i.box" BLOOMERY_BOX_ENV="$benv" \
     just --justfile "$root/justfile" --working-directory "$root" \
     "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null || rc=$?
   main_drop "$lk" "$mpid"
