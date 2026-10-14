@@ -31,10 +31,13 @@ The failure it blocks: a pull request whose first Shingler review is a MUST_FIX,
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -44,6 +47,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from post import MARKER, VERDICT_RE  # noqa: E402
 from run import MINUTES, TIMEOUT, launch  # noqa: E402
+sys.path.insert(0, os.path.dirname(HERE))
+from recipes import RecipeError, archive  # noqa: E402
 
 REPO = "midagedev/bloomery"
 # (script, the path prefixes that run it): a text-only check of PR_TREE, run when the branch changes one of them
@@ -65,8 +70,8 @@ class Stop(Exception):
         self.code, self.msg = code, msg
 
 
-def git(*args, cwd=None):
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+def git(*args):
+    p = subprocess.run(["git", *args], capture_output=True, text=True)
     if p.returncode:
         raise Stop(70, f"pre-review: git {' '.join(args)} failed: {p.stderr.strip()[:200]}")
     return p.stdout
@@ -76,15 +81,14 @@ def gh_json(*args):
     """gh's JSON answer, or None when gh cannot answer (no gh, no login, no network)."""
     if not shutil.which("gh"):
         return None
+    pages = "--paginate" in args
     try:
-        p = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=NET_S)
-    except subprocess.TimeoutExpired:
-        return None
-    if p.returncode:
-        return None
-    try:
-        return json.loads(p.stdout)
-    except ValueError:
+        p = subprocess.run(["gh", *args, *(["--slurp"] if pages else [])], capture_output=True, text=True, timeout=NET_S)
+        if p.returncode:
+            return None
+        data = json.loads(p.stdout)
+        return [item for page in data for item in page] if pages else data
+    except (subprocess.TimeoutExpired, ValueError):
         return None
 
 
@@ -188,7 +192,10 @@ def read_ledger(base_tree, out):
     environment only."""
     env = dict(os.environ)
     if not env.get("GH_TOKEN") and shutil.which("gh"):
-        t = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=NET_S)
+        try:
+            t = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=NET_S)
+        except subprocess.TimeoutExpired:
+            return None
         if t.returncode == 0 and t.stdout.strip():
             env["GH_TOKEN"] = t.stdout.strip()
     try:
@@ -308,15 +315,6 @@ def must_fix_titles(body):
     return re.findall(r"^#### (.+)$", m.group(1), re.M) if m else []
 
 
-def unpack(sha, dest):
-    os.makedirs(dest)
-    a = subprocess.Popen(["git", "archive", sha], stdout=subprocess.PIPE)
-    t = subprocess.run(["tar", "-x", "-C", dest], stdin=a.stdout)
-    a.stdout.close()
-    if a.wait() or t.returncode:
-        raise Stop(70, f"pre-review: git archive {sha[:12]} could not be unpacked")
-
-
 def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     if not stubbed and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
@@ -335,8 +333,11 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     shutil.rmtree(keep, ignore_errors=True)
     t0 = time.time()
     with tempfile.TemporaryDirectory(prefix="pre-review.") as d:
-        unpack(base_sha, os.path.join(d, "base"))
-        unpack(head, os.path.join(d, "pr"))
+        try:
+            archive(base_sha, os.path.join(d, "base"), cwd=os.getcwd())
+            archive(head, os.path.join(d, "pr"), cwd=os.getcwd())
+        except RecipeError as e:
+            raise Stop(70, f"pre-review: {e}") from e
         pre_checks(os.path.join(d, "pr"), git("diff", "--name-only", "-z", f"{base_sha}...{head}").split("\0"), say)
         for x in ("ctx", "out", "trace"):
             os.makedirs(os.path.join(d, x))
@@ -370,15 +371,9 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     m = VERDICT_RE.search(body)
     if not m:
         raise Stop(65, f"pre-review: the review has no verdict line; see {keep}/out/review.md")
-    cost = 0.0
-    for r in roles:
-        try:
-            cost += json.load(open(os.path.join(keep, "trace", f"{r}.usage.json"))).get("cost_usd") or 0.0
-        except (OSError, ValueError):
-            pass
     titles = must_fix_titles(body)
     print(f"pre-review: {m.group(1)} — {meta['mode']} review of {head[:8]} against {args.base} "
-          f"({'reviewer + validator' if args.full else 'reviewer'}, {time.time() - t0:.0f} s of which context {t_ctx:.0f} s, ${cost:.2f})")
+          f"({'reviewer + validator' if args.full else 'reviewer'}, {time.time() - t0:.0f} s of which context {t_ctx:.0f} s)")
     for t in titles[:12]:
         print(f"  must fix: {t}")
     print(f"  review: {keep}/out/review.md")
@@ -483,6 +478,31 @@ def self_test():
         open(lev, "w").write("exit 0\n")
         pre_checks(t, ["crates/gpu/src/lib.rs"], said.append)
         expect(len(said) == 1 and said[0].startswith("pre-review: tools/check-levers.sh ok"), f"a green one is printed: {said}")
+    # gh's paginated answer is several JSON documents: every page is read; a credential lookup that times out is the
+    # named empty-ledger fallback, not a traceback
+    with tempfile.TemporaryDirectory() as t:
+        fake = os.path.join(t, "gh")
+        marker = "<!-- bloomery-review head_sha=" + "a" * 40 + " verdict=CLEAN"
+        pages = json.dumps([[{"user": {"login": "someone"}, "body": "x"}],
+                            [{"user": {"login": "github-actions[bot]"}, "body": marker}], [{"user": {"login": "z"}, "body": "y"}]])
+        open(fake, "w").write('#!/usr/bin/env bash\ncase "$*" in\n'
+                              f'  "auth token") sleep 5 ;;\n  *--slurp*) echo \'{pages}\' ;;\n  *) echo \'[{{"number":1}}]\' ;;\nesac\n')
+        os.chmod(fake, 0o755)
+        saved_env = {k: os.environ.get(k) for k in ("PATH", "GH_TOKEN")}
+        saved_net = globals()["NET_S"]
+        os.environ["PATH"] = t + os.pathsep + os.environ["PATH"]
+        os.environ.pop("GH_TOKEN", None)
+        try:
+            got = gh_json("api", "--paginate", "x")
+            expect(isinstance(got, list) and len(got) == 3, f"a paginated gh answer is read page by page: {got}")
+            expect(last_review(7) == ("a" * 40, marker), f"the last Shingler review is found across pages: {last_review(7)}")
+            expect(gh_json("pr", "view") == [{"number": 1}], "an unpaginated gh answer is parsed as before")
+            globals()["NET_S"] = 1
+            expect(read_ledger(t, os.path.join(t, "ledger.md")) is None, "a timed-out credential lookup is the empty-ledger fallback")
+        finally:
+            globals()["NET_S"] = saved_net
+            for k, v in saved_env.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
     # a scratch repo end to end with a stub runner: CLEAN 0, MUST_FIX 1, a slow runner 75, no verdict 65
     with tempfile.TemporaryDirectory() as t:
         repo = os.path.join(t, "r")
@@ -539,8 +559,11 @@ def self_test():
                 except Stop as e:
                     return e.code, msgs + [e.msg]
 
-            rc, _ = go("**Verdict: CLEAN**: fine\n\n### Checked\nall")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc, _ = go("**Verdict: CLEAN**: fine\n\n### Checked\nall")
             expect(rc == 0, f"a CLEAN review ends 0 (got {rc})")
+            expect("$" not in buf.getvalue(), f"accounting that is not available is not printed as a cost: {buf.getvalue()!r}")
             keep = os.path.join(t, "home/.cache/bloomery/pre-review/topic-" + git("rev-parse", "HEAD").strip()[:8])
             ctx_files = set(os.listdir(os.path.join(keep, "ctx")))
             expect(ctx_files == set(CTX_FILES), f"the kept ctx holds the workflow's files: {sorted(ctx_files)}")
@@ -565,6 +588,32 @@ def self_test():
                    f"a role past --minutes ends 75 named and its whole process group is gone: rc {rc}, child alive {alive}")
             rc, msgs = go("no verdict here")
             expect(rc in (65,) , f"a review with no verdict ends 65: {rc} {msgs[-1:]}")
+            # SIGTERM to local.py itself stops the role's process group (run.launch's cleanup runs on the exception)
+            open(stub, "w").write(f"#!/usr/bin/env bash\n( sleep 30 & echo $! > {pidf}; wait )\n")
+            os.unlink(pidf)
+            wrapper = (f"import shutil, sys\nsys.path.insert(0, {HERE!r})\nimport local as L\nreal = shutil.which\n"
+                       "shutil.which = lambda n, *a: '/x' if n == 'claude' else real(n, *a)\n"
+                       "L.gh_json = lambda *a: None\nL.device_dirs = lambda b, o: open(o, 'w').write('crates/gpu\\n')\n"
+                       "L.read_ledger = lambda b, o: (open(o, 'w').close(), 'v0')[1]\n"
+                       "sys.exit(L.main(['--base', 'basebr', '--minutes', '5']))\n")
+            proc = subprocess.Popen([sys.executable, "-c", wrapper], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for _ in range(200):
+                if os.path.exists(pidf) and open(pidf).read().strip():
+                    break
+                time.sleep(0.1)
+            child = int(open(pidf).read())
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.communicate(timeout=30)
+                ended = True
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                ended = False
+            time.sleep(0.2)
+            alive = subprocess.run(["kill", "-0", str(child)], capture_output=True).returncode == 0
+            expect(ended and not alive, f"SIGTERM to local.py ends it and the role's process group: ended {ended}, child alive {alive}")
+            if alive:
+                os.kill(child, signal.SIGKILL)
         finally:
             os.chdir(cwd)
             g.update(saved)
@@ -590,6 +639,7 @@ def main(argv):
     except SystemExit as e:
         return 64 if e.code else 0
     try:
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
         return review(args)
     except Stop as e:
         print(e.msg, file=sys.stderr)

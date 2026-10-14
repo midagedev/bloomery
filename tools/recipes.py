@@ -1862,9 +1862,9 @@ def git(*args: str, cwd: str = ROOT) -> str:
     return proc.stdout
 
 
-def archive(rev: str, into: str) -> str:
+def archive(rev: str, into: str, cwd: str = ROOT) -> str:
     os.makedirs(into, exist_ok=True)
-    arch = subprocess.Popen(["git", "archive", "--format=tar", rev], cwd=ROOT, stdout=subprocess.PIPE)
+    arch = subprocess.Popen(["git", "archive", "--format=tar", rev], cwd=cwd, stdout=subprocess.PIPE)
     tar = subprocess.run(["tar", "-x", "-C", into], stdin=arch.stdout, capture_output=True)
     arch.stdout.close()
     rc = arch.wait()
