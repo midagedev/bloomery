@@ -1779,7 +1779,7 @@ mod gate {
 
     /// The `parallel` line's rule against its own terms (the module header):
     /// under `slots` the line's slots are the flag's (`--parallel`'s value,
-    /// the caller naming it) or the default's (2), and the split the line
+    /// the caller naming it) or the default's (`ctx_ask::DEFAULT_SLOTS`), and the split the line
     /// names holds — `slot_ctx` the one context the whole round of clauses
     /// pins a slot at (the server's `--ctx-size` total over the slots) and
     /// `total` the slots' sum. `None` a line that is not the seat's;
@@ -1791,7 +1791,7 @@ mod gate {
         let slot_ctx: usize = field("slot_ctx")?.parse().ok()?;
         let total: usize = field("total")?.parse().ok()?;
         let want = match (rule, flag) {
-            ("slots", f) => f.unwrap_or(2),
+            ("slots", f) => f.unwrap_or(model::placement::ctx_ask::DEFAULT_SLOTS),
             _ => return None,
         };
         Some(slots == want && total == slots * slot_ctx && slot_ctx > 0)

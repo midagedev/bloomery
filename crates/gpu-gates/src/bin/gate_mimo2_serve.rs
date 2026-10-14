@@ -64,7 +64,7 @@
 //!   record of the churn pool after it; at the largest total two slots hold
 //!   (the KV planes take the card, the plan holds no expert to spare; read
 //!   off the seat's refusal of a total past it) the common rule prints `off`
-//!   with why `no_room` and no pool; under
+//!   with why `no_card_experts` and no pool; under
 //!   `BLOOMERY_RESIDENCY=off` it prints `off` with why `set` and no pool
 //!   record.
 //! - `plan_only_names_its_default`: `--plan` with no `--place`, `--ctx` or
@@ -924,7 +924,7 @@ mod gate {
     /// host` record of the churn pool after it; at the largest total two
     /// slots hold, whose KV planes leave the plan no card expert to spare —
     /// the `ask N or less` of the seat's refusal of the trained context a
-    /// slot — the common rule turns it `off` (why `no_room`) with no pool;
+    /// slot — the common rule turns it `off` (why `no_card_experts`) with no pool;
     /// and under
     /// `BLOOMERY_RESIDENCY=off` it prints `off` and why `set`, and no pool.
     fn residency_default_is_the_machine(
@@ -980,7 +980,7 @@ mod gate {
             Pins::default(),
         )?;
         let no_room = match wide.first(&record::RESIDENCY_LEVER)? {
-            Some(l) => l.word("residency")? == "off" && l.word("why")? == "no_room",
+            Some(l) => l.word("residency")? == "off" && l.word("why")? == "no_card_experts",
             None => false,
         } && wide.first(&record::RESIDENCY_HOST)?.is_none();
         let (_, off_log, _) = plan_pinned(dir, "plan-residency-off", file, &["--ctx", &ctx], OFF)?;
@@ -992,7 +992,8 @@ mod gate {
         println!(
             "residency default: exit 0 {exits}; at ctx {ctx} the lever record is mid-p0-s1 (place), \
              then the plan, then the pool {word} {in_order}; at --ctx {largest} over two slots \
-             it is off (no_room) with no pool {no_room}; set off prints off (set) and no pool {off}"
+             it is off (no_card_experts) with no pool {no_room}; set off prints off (set) and no pool \
+             {off}"
         );
         check(
             ok,
