@@ -474,9 +474,10 @@ self_test() {
   [ "$wins" = 1 ] && { [ "$ra" = 75 ] || [ "$rb" = 75 ]; }
   ok "lock: two recoverers of a dead holder, and only one takes it" $?
   rm -rf "$t/lock.d" "$t/lock.d.flock"
-  mkdir "$t/lock.d" && echo 1 > "$t/lock.d/pid"
+  mkdir "$t/lock.d" && echo $$ > "$t/lock.d/pid" && echo older > "$t/lock.d/who"
+  got=$(lock_take "$t/lock.d" 0 "second" 2>&1); rc=$?
   lock_release
-  [ -d "$t/lock.d" ]; ok "lock: release leaves another holder's lock" $?
+  [ "$rc" = 75 ] && [ -d "$t/lock.d" ] && grep -qF "held by pid $$ (older)" <<< "$got"; ok "lock: a live older copy's directory is refused, not deleted" $?
   # A child inherits fd 9, so it keeps the flock after the holder exits. The same child
   # started with the fd closed does not. Every launch below closes it; a line that loses
   # the close is red.
