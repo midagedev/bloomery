@@ -316,10 +316,11 @@ pub(super) fn read(spec: &ModelSpec) -> Result<Shape38, GpuError> {
                 }
                 Kind38::Qsa
             }
-            Mixer::Latent(_) => {
-                return Err(refuse(
-                    "a latent-attention mixer, which no kernel here runs".into(),
-                ));
+            other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::None) => {
+                return Err(refuse(format!(
+                    "{}, which no kernel here runs",
+                    other.what()
+                )));
             }
         });
         let Ffn::Moe(m) = &s.ffn else {

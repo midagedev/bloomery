@@ -113,10 +113,11 @@ FROM_NAME = {
     "Qwen35moe": ("qwen35moe",),
     "Glm5next": ("glm5next", "glm5-next"),
     "Mimo2": ("mimo2",),
+    "NemotronH": ("nemotron_h",),
 }
 # crates/model/src/arch/mod.rs:spec — the architectures the model reader takes (QWEN35_BODY is `qwen35` and `clef`).
 SPEC = ("deepseek41", "deepseek4", "qwen3moe", "qwen35moe", "qwen4exp", "qwen35", "clef", "glm5next", "glm5-next",
-        "mimo2")
+        "mimo2", "nemotron_h")
 # crates/gpu-gates/src/bin/shared/serve_seats/decide.rs:ROWS with the constants of
 # crates/decision/src/release/{clef,lev}.rs.
 DECIDE_ROWS = (

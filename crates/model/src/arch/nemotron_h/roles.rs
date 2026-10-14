@@ -92,14 +92,14 @@ mod tests {
     fn a_group_lists_each_stem_once() {
         for g in [MAMBA, ATTENTION, MLP] {
             for (i, s) in g.iter().enumerate() {
-                assert!(
-                    !g[..i].iter().any(|t| t.name == s.name),
-                    "{} twice",
-                    s.name
-                );
+                assert!(!g[..i].iter().any(|t| t.name == s.name), "{} twice", s.name);
             }
         }
-        let norm = |g: &[Stem]| g.iter().find(|s| s.name == super::ATTN_NORM).map(|s| s.role);
+        let norm = |g: &[Stem]| {
+            g.iter()
+                .find(|s| s.name == super::ATTN_NORM)
+                .map(|s| s.role)
+        };
         assert_eq!(norm(MAMBA), Some(crate::placement::Role::Attention));
         assert_eq!(norm(ATTENTION), Some(crate::placement::Role::Attention));
         assert_eq!(norm(MLP), Some(crate::placement::Role::FfnNorm));

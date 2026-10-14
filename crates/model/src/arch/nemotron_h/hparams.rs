@@ -12,9 +12,7 @@ use gguf::Split;
 use super::names::{self, ATTN_NORM};
 use super::roles;
 use crate::arch::stems::{Stem, required};
-use crate::arch::{
-    meta_arr, meta_f32, meta_usize, metadata, n_vocab, optional_usize, positive,
-};
+use crate::arch::{meta_arr, meta_f32, meta_usize, metadata, n_vocab, optional_usize, positive};
 use crate::placement::PlacementError;
 
 /// What a layer is, from the two per-layer arrays.

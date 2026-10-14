@@ -11,8 +11,7 @@ use std::fs;
 use models::{Act, Ffn, Mixer, Need, RopeMode};
 
 /// The file the gate reads.
-const FILE: &str =
-    "/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf";
+const FILE: &str = "/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf";
 
 /// Its length, so a different file at the same path fails before the pins.
 const BYTES: u64 = 2_837_072_864;
@@ -81,7 +80,10 @@ fn hw_nemotron_h_header() {
     if s.chat.tools != Some(models::ToolFormat::QwenXml)
         || s.chat.reasoning != Some(models::ReasoningFormat::ThinkSpan)
     {
-        bad.push(format!("chat tools {:?} reasoning {:?}", s.chat.tools, s.chat.reasoning));
+        bad.push(format!(
+            "chat tools {:?} reasoning {:?}",
+            s.chat.tools, s.chat.reasoning
+        ));
     }
     if s.layers.len() != 42 {
         bad.push(format!("layers {}", s.layers.len()));
@@ -124,7 +126,10 @@ fn hw_nemotron_h_header() {
             .map(|t| t.dims.clone())
     };
     if dims("blk.0.ssm_norm.weight") != Some(vec![960, 8]) {
-        bad.push(format!("blk.0.ssm_norm {:?}", dims("blk.0.ssm_norm.weight")));
+        bad.push(format!(
+            "blk.0.ssm_norm {:?}",
+            dims("blk.0.ssm_norm.weight")
+        ));
     }
     if dims("blk.0.ssm_in.weight") != Some(vec![3136, 17504]) {
         bad.push(format!("blk.0.ssm_in {:?}", dims("blk.0.ssm_in.weight")));
@@ -134,15 +139,27 @@ fn hw_nemotron_h_header() {
          rope=none mtp=0 pins_differ={}",
         bad.len()
     );
-    assert!(bad.is_empty(), "{} pin(s) differ:\n  {}", bad.len(), bad.join("\n  "));
+    assert!(
+        bad.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
 }
 
 fn pin_layer(bad: &mut Vec<String>, name: &str, l: usize, layer: &models::LayerSpec) {
     match name {
         "mamba" => match &layer.mixer {
             Mixer::Mamba2(m) => {
-                if (m.d_inner, m.d_state, m.n_heads, m.head_dim, m.n_groups, m.d_conv, m.d_in_proj)
-                    != (7680, 128, 96, 80, 8, 4, 17504)
+                if (
+                    m.d_inner,
+                    m.d_state,
+                    m.n_heads,
+                    m.head_dim,
+                    m.n_groups,
+                    m.d_conv,
+                    m.d_in_proj,
+                ) != (7680, 128, 96, 80, 8, 4, 17504)
                 {
                     bad.push(format!("layer {l} mamba {m:?}"));
                 }
@@ -178,6 +195,9 @@ fn pin_layer(bad: &mut Vec<String>, name: &str, l: usize, layer: &models::LayerS
             act: Act::ReluSqr
         } if ff == want_ff
     ) {
-        bad.push(format!("layer {l} ffn {:?}, want dense {want_ff} relusqr", layer.ffn));
+        bad.push(format!(
+            "layer {l} ffn {:?}, want dense {want_ff} relusqr",
+            layer.ffn
+        ));
     }
 }

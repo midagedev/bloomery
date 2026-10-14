@@ -162,6 +162,20 @@ pub enum Mixer {
     None,
 }
 
+impl Mixer {
+    /// The mixer's kind as a refusal names it.
+    #[must_use]
+    pub fn what(&self) -> &'static str {
+        match self {
+            Mixer::Gqa(_) => "a GQA mixer",
+            Mixer::Latent(_) => "a latent-attention mixer",
+            Mixer::DeltaRule(_) => "a delta-rule mixer",
+            Mixer::Mamba2(_) => "a Mamba-2 mixer",
+            Mixer::None => "no token mixer",
+        }
+    }
+}
+
 /// A Mamba-2 mixer. The widths are the header's `ssm.*` keys, and the two
 /// products the input projection and the conv are built at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -903,6 +917,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "squared ReLU has no SwiGLU clamp")]
     fn swiglu_limit_on_squared_relu_names_the_activation() {
-        Act::ReluSqr.swiglu_limit();
+        let _ = Act::ReluSqr.swiglu_limit();
     }
 }

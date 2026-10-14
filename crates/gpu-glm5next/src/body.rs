@@ -2233,23 +2233,11 @@ fn layer_cfg(
             "layer {l}: a plain residual; every trunk block is wrapped in the streams"
         )));
     }
-    match &s.mixer {
-        Mixer::Gqa(_) => {
-            return Err(shape(format!(
-                "layer {l}: a GQA mixer, which glm5next has none of"
-            )));
-        }
-        Mixer::Mamba2(_) => {
-            return Err(shape(format!(
-                "layer {l}: a Mamba-2 mixer, which glm5next has none of"
-            )));
-        }
-        Mixer::None => {
-            return Err(shape(format!(
-                "layer {l}: no token mixer, which glm5next has none of"
-            )));
-        }
-        Mixer::Latent(_) | Mixer::DeltaRule(_) => {}
+    if let other @ (Mixer::Gqa(_) | Mixer::Mamba2(_) | Mixer::None) = &s.mixer {
+        return Err(shape(format!(
+            "layer {l}: {}, which glm5next has none of",
+            other.what()
+        )));
     }
     let (limit, ff, bias) = match &s.ffn {
         Ffn::Dense { ff, act } => (limit_of(*act)?, *ff as usize, false),

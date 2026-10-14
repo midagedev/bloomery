@@ -158,10 +158,7 @@ mod tests {
             ("attention.value_length", V::U32(HEAD as u32)),
             ("attention.layer_norm_rms_epsilon", V::F32(1e-5)),
             ("rope.dimension_count", V::U32(4)),
-            (
-                "attention.head_count_kv",
-                V::I32s(vec![0, 0, KV, 0, 0, KV]),
-            ),
+            ("attention.head_count_kv", V::I32s(vec![0, 0, KV, 0, 0, KV])),
             ("feed_forward_length", V::I32s(vec![0, FF, 0, 0, FF, 0])),
             ("ssm.conv_kernel", V::U32(CONV as u32)),
             ("ssm.inner_size", V::U32(INNER as u32)),
@@ -186,22 +183,14 @@ mod tests {
                 let heads = MAMBA_HEADS;
                 one(format!("blk.{l}.{}", names::SSM_A), vec![1, heads], out);
                 one(format!("blk.{l}.{}", names::SSM_D), vec![1, heads], out);
-                one(
-                    format!("blk.{l}.{}", names::SSM_DT_BIAS),
-                    vec![heads],
-                    out,
-                );
+                one(format!("blk.{l}.{}", names::SSM_DT_BIAS), vec![heads], out);
                 one(
                     format!("blk.{l}.{}", names::SSM_CONV),
                     vec![CONV, conv],
                     out,
                 );
                 if bias {
-                    one(
-                        format!("blk.{l}.{}", names::SSM_CONV_BIAS),
-                        vec![conv],
-                        out,
-                    );
+                    one(format!("blk.{l}.{}", names::SSM_CONV_BIAS), vec![conv], out);
                 }
                 one(names::ssm_in(l), vec![e, proj], out);
                 one(
@@ -328,12 +317,13 @@ mod tests {
             "{stores:?}"
         );
         assert!(
-            stores
-                .iter()
-                .any(|(store, rule)| matches!(
-                    (store, rule),
-                    (runtime::state::Store::State, runtime::state::StoreRule::Recurrent)
-                )),
+            stores.iter().any(|(store, rule)| matches!(
+                (store, rule),
+                (
+                    runtime::state::Store::State,
+                    runtime::state::StoreRule::Recurrent
+                )
+            )),
             "{stores:?}"
         );
         assert!(runtime::state::stores(&s.layers[1]).is_empty());
@@ -395,7 +385,8 @@ mod tests {
         let norm = format!("blk.0.{}", names::SSM_NORM);
         let row = bad.iter_mut().find(|(n, _)| *n == norm).expect("the norm");
         row.1 = vec![INNER / MAMBA_HEADS, g.n_groups];
-        let err = load("nemotron-h-norm", "nemotron_h", keys(&g), &bad).expect_err("a head-dim norm");
+        let err =
+            load("nemotron-h-norm", "nemotron_h", keys(&g), &bad).expect_err("a head-dim norm");
         assert!(err.contains(&norm), "{err}");
     }
 
@@ -428,10 +419,7 @@ mod tests {
         ] {
             let kv: Vec<_> = keys(&g).into_iter().filter(|(k, _)| *k != key).collect();
             let err = load("nemotron-h-ssm", "nemotron_h", kv, &tensors).expect_err(key);
-            assert!(
-                err.contains(key) && err.contains("absent"),
-                "{key}: {err}"
-            );
+            assert!(err.contains(key) && err.contains("absent"), "{key}: {err}");
         }
     }
 
@@ -444,8 +432,13 @@ mod tests {
             d_state: 96,
             n_groups: 4,
         };
-        let err = load("nemotron-h-state", "nemotron_h", keys(&g), &tensors(&g, true))
-            .expect_err("state 96");
+        let err = load(
+            "nemotron-h-state",
+            "nemotron_h",
+            keys(&g),
+            &tensors(&g, true),
+        )
+        .expect_err("state 96");
         assert!(
             err.contains("ssm.state_size") && err.contains("is 96, not 128"),
             "{err}"
@@ -460,13 +453,8 @@ mod tests {
         let mut tensors = tensors(&g, true);
         tensors.retain(|(n, _)| !n.starts_with("blk.0."));
         layer(0, 'a', &g, true, &mut tensors);
-        let err = load(
-            "nemotron-h-kind",
-            "nemotron_h",
-            keys(&g),
-            &tensors,
-        )
-        .expect_err("layer 0 as attention");
+        let err = load("nemotron-h-kind", "nemotron_h", keys(&g), &tensors)
+            .expect_err("layer 0 as attention");
         assert!(
             err.contains("attention.head_count_kv")
                 && err.contains("layer 0")
@@ -513,10 +501,7 @@ mod tests {
             .iter_mut()
             .find(|(k, _)| *k == "attention.head_count_kv")
             .expect("the kv array");
-        *row = (
-            "attention.head_count_kv",
-            V::I32s(vec![0, 0, KV, 0, 0]),
-        );
+        *row = ("attention.head_count_kv", V::I32s(vec![0, 0, KV, 0, 0]));
         let err = load("nemotron-h-short", "nemotron_h", kv, &tensors(&g, true))
             .expect_err("short array");
         assert!(
@@ -542,7 +527,8 @@ mod tests {
         let g = geo();
         let mut kv = keys(&g);
         kv.push(("nextn_predict_layers", V::U32(1)));
-        let err = load("nemotron-h-nextn", "nemotron_h", kv, &tensors(&g, true)).expect_err("nextn");
+        let err =
+            load("nemotron-h-nextn", "nemotron_h", kv, &tensors(&g, true)).expect_err("nextn");
         assert!(
             err.contains("nextn_predict_layers") && err.contains("is 1"),
             "{err}"

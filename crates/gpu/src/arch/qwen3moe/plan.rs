@@ -399,10 +399,11 @@ pub(super) fn kind35(s: &LayerSpec, l: usize) -> Result<Kind35, GpuError> {
     let kind = match &s.mixer {
         Mixer::Gqa(g) => Kind35::Gqa(gqa_fits(g).map_err(refuse)?),
         Mixer::DeltaRule(d) => Kind35::Delta(delta_shape(d).map_err(refuse)?),
-        Mixer::Latent(_) => {
-            return Err(refuse(
-                "a latent-attention mixer, which no kernel here runs".into(),
-            ));
+        other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::None) => {
+            return Err(refuse(format!(
+                "{}, which no kernel here runs",
+                other.what()
+            )));
         }
     };
     match &s.ffn {
