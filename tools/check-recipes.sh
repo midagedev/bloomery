@@ -685,8 +685,9 @@ blk_fixturevariants() {
 }
 # A fixture-tier command exports an empty draft path when it reads DSPARK_MODEL out of ref-paths.sh
 # other than through dspark_model: zero drafts leave the variable empty and the export reaches a file
-# open. dspark_model refuses that with exit 66. A justfile line or a tools shell script that prints the
-# variable, or expands it after sourcing ref-paths.sh without calling dspark_model, fails here by file:line.
+# open. dspark_model refuses that with exit 66. A justfile expansion, a printf of the variable, or any
+# expansion in a shell script that sources ref-paths.sh fails here by file:line. A dspark_model call
+# does not exempt another expansion in the same file. A quoted source path still counts as sourcing.
 blk_dsparkread() {
   local out
   if ! out=$(python3 - "$JF" "$(dirname "$0")" << 'PY'
@@ -698,8 +699,7 @@ import sys
 # for it must stay empty, including on this checker).
 PRINTF = re.compile(re.escape("printf %s \"" + "$" + "DSPARK_MODEL\""))
 EXPAND = re.compile(r"(?<![A-Za-z0-9_])\$\{?DSPARK_MODEL\b")
-SOURCE = re.compile(r"(?:\.|source)\s+\S*ref-paths\.sh")
-CALL = re.compile(r"(?<![A-Za-z0-9_])dspark_model(?![A-Za-z0-9_])")
+SOURCE = re.compile(r"(?:\.|source)\s+[^\n]*ref-paths\.sh")
 
 
 def strip_comment(line):
@@ -743,29 +743,16 @@ def code_lines(text):
 
 
 def justfile_hits(text, path):
-    hits = []
-    for n, code in code_lines(text):
-        if PRINTF.search(code):
-            hits.append(f"{path}:{n}: reads the draft with printf instead of dspark_model")
-        elif EXPAND.search(code) and not CALL.search(code):
-            hits.append(f"{path}:{n}: reads the draft out of ref-paths.sh other than through dspark_model")
-    return hits
+    return [f"{path}:{n}: reads DSPARK_MODEL instead of dspark_model"
+            for n, code in code_lines(text) if EXPAND.search(code)]
 
 
 def script_hits(text, path):
     lines = list(code_lines(text))
     sources = any(SOURCE.search(code) for _, code in lines)
-    calls = any(CALL.search(code) for _, code in lines)
-    hits = []
-    for n, code in lines:
-        if PRINTF.search(code):
-            hits.append(f"{path}:{n}: reads the draft with printf instead of dspark_model")
-            continue
-        if not EXPAND.search(code):
-            continue
-        if (SOURCE.search(code) and not CALL.search(code)) or (sources and not calls):
-            hits.append(f"{path}:{n}: reads the draft out of ref-paths.sh other than through dspark_model")
-    return hits
+    return [f"{path}:{n}: reads DSPARK_MODEL instead of dspark_model"
+            for n, code in lines
+            if PRINTF.search(code) or (sources and EXPAND.search(code))]
 
 
 def expect(name, hits, want):
@@ -784,7 +771,17 @@ def fixtures():
         bad.append("check-recipes: draft-read fixture 'a justfile line that prints the variable': the hit has no file:line")
     bad += expect("a justfile line that calls dspark_model", justfile_hits("recipe:\n    __s=$(. tools/ref/ref-paths.sh && dspark_model)\n", "fixture-justfile"), 0)
     bad += expect("a script that sources ref-paths and expands the variable", script_hits("source tools/ref/ref-paths.sh\necho " + expand + "\n", "fixture.sh"), 1)
-    bad += expect("a script that goes through dspark_model", script_hits("source tools/ref/ref-paths.sh\nx=$(dspark_model) || exit $?\necho " + expand + "\n", "fixture-ok.sh"), 0)
+    bad += expect("a script that goes through dspark_model", script_hits("source tools/ref/ref-paths.sh\nx=$(dspark_model) || exit $?\necho " + '"$x"' + "\n", "fixture-ok.sh"), 0)
+    bad += expect("a getter call then an unchecked export", script_hits("source tools/ref/ref-paths.sh; x=$(dspark_model); export BLOOMERY_DSPARK_MODEL=" + expand + "\n", "fixture-getter-export.sh"), 1)
+    bad += expect(
+        "a quoted source path then an unchecked export",
+        script_hits(
+            "source \"$(dirname \"$0\")/ref-paths.sh\"\n"
+            "export BLOOMERY_DSPARK_MODEL=" + expand + "\n",
+            "fixture-quoted-source.sh",
+        ),
+        1,
+    )
     bad += expect("printf beside a dspark_model call", script_hits("x=$(dspark_model)\n" + bad_printf + "\n", "fixture-both.sh"), 1)
     bad += expect("the function's own file", script_hits("dspark_model() {\n  printf '%s' " + expand + "\n}\n", "ref-paths.sh"), 0)
     # timing-card.sh expands the variable and does not source ref-paths.sh; this rule does not own that file.

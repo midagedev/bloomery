@@ -27,7 +27,7 @@
 # ik's greedy sampler; --ignore-eos because generate_ds41 has no end-of-generation stop and
 # always emits N tokens. CTX is 512 + N + 64 rounded up to 256 — llama-cli's default context is
 # the model's own (over a million positions), not the prompt's. The dspark arm adds
-# `-md $DSPARK_MODEL --spec-type $STAGE`. ik builds the DSpark draft's parameters from the
+# `-md $DRAFT_PATH --spec-type $STAGE`. ik builds the DSpark draft's parameters from the
 # target's own (common/speculative.cpp: only an MTP stage clears them), so the draft inherits
 # -ngl and --n-cpu-moe, and with its three layers under the profile's --n-cpu-moe (IK_NCMOE)
 # every draft expert runs on the host; BLOOMERY_IK_DRAFT_PARAMS (passed as ik's --draft-params) changes that.
@@ -118,7 +118,7 @@ case $ARM in plain | dspark) ENGINE=ik ;; lcpp) ENGINE=lcpp ;; *) usage ;; esac
 # path); dspark_model names that and exits 66, so -md never receives an empty path. The plain and
 # lcpp arms open no draft.
 if [ "$ARM" = dspark ]; then
-  DSPARK_MODEL=$(dspark_model) || exit $?
+  DRAFT_PATH=$(dspark_model) || exit $?
 fi
 DRY=${BLOOMERY_DRY:-}
 STAGE=${BLOOMERY_IK_SPEC:-dspark}
@@ -183,7 +183,7 @@ args+=($FLAGS)
 args+=(-c "$CTX" -n "$N" -f "$WORK/prompt" --no-escape --temp 0 --ignore-eos --no-display-prompt --verbose-prompt)
 [ "$ENGINE" = ik ] || args+=(-no-cnv)
 if [ "$ARM" = dspark ]; then
-  args+=(-md "$DSPARK_MODEL" --spec-type "$STAGE")
+  args+=(-md "$DRAFT_PATH" --spec-type "$STAGE")
   [ -z "$DRAFT_PARAMS" ] || args+=(--draft-params "$DRAFT_PARAMS")
 fi
 if [ -n "$DRY" ]; then
@@ -199,8 +199,8 @@ for f in "$CLI" "$LTOK"; do
   exit 2
 done
 [ -f "$IDS" ] || { echo "ik-draft.sh: no corpus $IDS" >&2; exit 2; }
-if [ "$ARM" = dspark ] && [ ! -f "$DSPARK_MODEL" ]; then
-  echo "ik-draft.sh: no draft $DSPARK_MODEL" >&2
+if [ "$ARM" = dspark ] && [ ! -f "$DRAFT_PATH" ]; then
+  echo "ik-draft.sh: no draft $DRAFT_PATH" >&2
   exit 2
 fi
 # Our tokenizer decodes the prompt; the freshness check is the one the timing runners use.
@@ -239,7 +239,7 @@ CLI_SHA=$(sha256sum "$CLI" | cut -c1-12)
 TREE_HEAD=$(git -c safe.directory="$TREE" -C "$TREE" rev-parse --short=9 HEAD 2> /dev/null || echo '?')
 TREE_DIRTY=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$TREE" -C "$TREE" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
 DRAFT_SHA=-
-[ "$ARM" != dspark ] || DRAFT_SHA=$(sha256sum "$DSPARK_MODEL" | cut -c1-12)
+[ "$ARM" != dspark ] || DRAFT_SHA=$(sha256sum "$DRAFT_PATH" | cut -c1-12)
 WITNESS=(head-open indent card busiest model mem pgmajfault)
 ref_witness() { echo "    $ENGINE: $CLI sha256=$CLI_SHA head=$TREE_HEAD dirty_files=$TREE_DIRTY"; }
 
@@ -247,7 +247,7 @@ STAGE_SHOWN=none
 DRAFT_SHOWN=none
 if [ "$ARM" = dspark ]; then
   STAGE_SHOWN=$STAGE
-  DRAFT_SHOWN="$DSPARK_MODEL sha256=$DRAFT_SHA draft_params=${DRAFT_PARAMS:-<inherited from the target>}"
+  DRAFT_SHOWN="$DRAFT_PATH sha256=$DRAFT_SHA draft_params=${DRAFT_PARAMS:-<inherited from the target>}"
 fi
 
 if [ -n "$DRY" ]; then
