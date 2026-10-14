@@ -30,7 +30,7 @@
 //!   logits row every token: one seed twice gives the same ids, and `top_k` 1
 //!   gives the greedy ids;
 //! - the positions the server serves: `/props`' `n_ctx` is the server's
-//!   default context (`workstation::CTX_MAX`); a prompt of that many ids,
+//!   named context ([`GATE_CTX`], `workstation::CTX_MAX`); a prompt of that many ids,
 //!   which leaves no position for the token it asks for, is a 400
 //!   (`exceed_context_size_error`, naming it) refused before the engine, and
 //!   the server stays up;
@@ -89,13 +89,17 @@
 //!   `cache_prompt: false`.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
-//! waited for. A server asked for [`SLOTS_OVER`] slots of the default context
-//! (`<dir>/slots-over`), whose plan counts that many whole sequences, ends
-//! before it loads (s4): no `plan` record, and the plan's own refusal names
-//! the gate card and its KV term (the card's floor, or its usable bytes past
-//! the plan's total) — the same context as one slot is the server above.
-//! Then a second server of two resident sequences (`--parallel 2`, the
-//! default context each, the residency off as the gate placement runs it,
+//! waited for. A server with no `--ctx` (`<dir>/ctx-default`, one slot)
+//! prints its one `ctx` line before its load: the seats' ladder, its word
+//! held against this gate's own plans (`ctx_default_is_the_highest_rung_held`,
+//! [`ctx_default`]). A server asked for [`SLOTS_OVER`] slots of [`GATE_CTX`]
+//! each (`<dir>/slots-over`, `--ctx` their total), whose plan counts that many
+//! sequences, ends before it loads (s4): no `plan` record, and the seats'
+//! common refusal names the share a slot asks and what the card holds — the
+//! same context as one slot is the server above.
+//! Then a second server of two resident sequences (`--parallel 2`,
+//! [`GATE_CTX`] each — `--ctx` is that total, `from=flag` — the residency
+//! off as the gate placement runs it,
 //! the slot actions on, `BLOOMERY_STEP_STATS=1` set on the process — the
 //! lever moves no computation in the round path and, on V4.1, also turns on
 //! the engine's engram fill statistics (clock reads and page-classifying
@@ -103,10 +107,10 @@
 //! step, so a server run under it is never a timing reading) is started
 //! into `<dir>/slots`:
 //!
-//! - its `parallel` line names the rule, the two slots, the default context
-//!   a slot, their total and the shape of a round (`pass=one`: no draft);
+//! - its `parallel` line names the rule, the two slots, [`GATE_CTX`] a
+//!   slot, their total and the shape of a round (`pass=one`: no draft);
 //!   its `slots` line two sequences made of two
-//!   planned; `/props`' `n_ctx` the default context;
+//!   planned; `/props`' `n_ctx` is [`GATE_CTX`];
 //! - (s5) two greedy requests (`ignore_eos`, `cache_prompt: false`), each
 //!   alone, then both posted at once: each request's ids are its alone ids,
 //!   and the decode rounds over the pair carry at least [`SLOTS_BUSY`] busy
@@ -148,7 +152,7 @@
 //! the same arguments and directory (`<dir>/slots-files`) restores the (p3)
 //! file into the other slot, and the continuation keeps all but its last id
 //! with the first server's ids of `cache_prompt: false`: the round trip
-//! across two processes. A third, of half the default context
+//! across two processes. A third, of half of [`GATE_CTX`] a slot
 //! (`<dir>/slots-files-ctx`), refuses the file by name (p4): a 400
 //! (`invalid_request_error`) naming both contexts; it then answers `/health`
 //! and a request. Each starts after the one before it is gone: one load on
@@ -286,6 +290,7 @@ mod gate {
     use std::time::Duration;
 
     use bloomery_gpu_gates::bind::nvidia_smi_index;
+    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
@@ -296,6 +301,7 @@ mod gate {
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::{self, PlanInputs};
     use model::arch::deepseek41::plan::Planner;
+    use model::placement::ctx::CtxLimit;
     use model::placement::{Card, PlanLevers, workstation};
     use refset::arch::deepseek41::VERIFIED_POSITIONS;
     use refset::arch::deepseek41v::{VISION, VISION_SET};
@@ -318,9 +324,9 @@ mod gate {
     /// The server's arguments after its path; `/props` must echo them. The
     /// plain engine is pinned (`--parallel 1`): this gate's body holds the
     /// one-slot path's prompt-cache clauses, and the draft runs below would
-    /// refuse the default's two slots by name; the slots clause's server
+    /// refuse two slots by name; the slots clause's server
     /// runs two on its own.
-    const SERVER_ARGS: [&str; 8] = [
+    const SERVER_ARGS: [&str; 10] = [
         "--host",
         "127.0.0.1",
         "--port",
@@ -329,10 +335,17 @@ mod gate {
         "gate",
         "--parallel",
         "1",
+        "--ctx",
+        GATE_CTX,
     ];
+    /// The context a slot of every server here takes, named: the clauses
+    /// count on `workstation::CTX_MAX` positions, and an unset `--ctx` is the
+    /// seats' ladder ([`ctx_default`]).
+    const GATE_CTX: &str = "32768";
+    const _: () = assert!(workstation::CTX_MAX == 32_768);
     /// The server's arguments under `--place bp`, the plain engine pinned as
     /// [`SERVER_ARGS`]'s (the run drafts).
-    const BP_SERVER_ARGS: [&str; 8] = [
+    const BP_SERVER_ARGS: [&str; 10] = [
         "--host",
         "127.0.0.1",
         "--port",
@@ -341,13 +354,15 @@ mod gate {
         "bp",
         "--parallel",
         "1",
+        "--ctx",
+        GATE_CTX,
     ];
     // PIN(2026-10-05): the swap clause (two slots taking this seat in turns through
     // serve::SwapEngine) is replaced by the slots clause below; SwapEngine stays only as the
     // fallback for bodies without Slots, and crates/serve's mock suite owns its turns
     // (tests/slots: hw_live_requests_take_turns_…, hw_slots_that_take_turns_keep_the_draft).
-    /// The slots clause's server: two resident sequences of the default
-    /// context each (the slot actions' directory added at the spawn).
+    /// The slots clause's server: two resident sequences (the slot actions'
+    /// directory and [`SLOTS_CTX`] added at the spawn).
     const SLOTS_SERVER_ARGS: [&str; 8] = [
         "--host",
         "127.0.0.1",
@@ -358,13 +373,15 @@ mod gate {
         "--parallel",
         "2",
     ];
+    /// The slots server's `--ctx`: the total of two slots of [`GATE_CTX`]
+    /// each (`--ctx` is the total the slots split).
+    const SLOTS_CTX: [&str; 2] = ["--ctx", "65536"];
     /// The slots clause's pair: each request this long, so nearly every
     /// round after the second prompt call carries both slots.
     const SLOTS_PREDICT: usize = 48;
-    /// (s4) Slots of the default context past what the gate card holds: each
-    /// one's KV is the plan's card KV of one sequence, about 110 MB at the
-    /// default context, so this many need about 28 GB beside the dense trunk
-    /// on a card of 24 GB.
+    /// (s4) Slots of [`GATE_CTX`] past what the gate card holds: each one's
+    /// KV is the plan's card KV of one sequence, about 110 MB at [`GATE_CTX`],
+    /// so this many need about 28 GB beside the dense trunk on a card of 24 GB.
     const SLOTS_OVER: usize = 256;
     /// (s5) Busy slots a decode round carries over the pair posted at once:
     /// both prompt calls run before their first rounds, a round or two of
@@ -451,7 +468,7 @@ mod gate {
         })
     }
 
-    /// The positions the server serves at its default context: all of them.
+    /// The positions one slot of [`GATE_CTX`] serves: all of them.
     fn served_positions() -> Result<usize, GateError> {
         Ok(usize::try_from(workstation::CTX_MAX)?)
     }
@@ -1192,13 +1209,14 @@ mod gate {
         Ok((slot, ids, v["timings"]["cache_n"].clone()))
     }
 
-    /// (s4) [`SLOTS_OVER`] slots of the default context, which the gate
-    /// card cannot hold, refused before the load (module header), into
+    /// (s4) [`SLOTS_OVER`] slots of [`GATE_CTX`], which the gate card cannot
+    /// hold, refused before the load (module header), into
     /// `<dir>/slots-over`.
     fn over_refused(a: &Args) -> Result<bool, GateError> {
         let dir = a.dir.join("slots-over");
         std::fs::create_dir_all(&dir)?;
         let n = SLOTS_OVER.to_string();
+        let total = (SLOTS_OVER * served_positions()?).to_string();
         let args = [
             "--host",
             "127.0.0.1",
@@ -1208,6 +1226,8 @@ mod gate {
             "gate",
             "--parallel",
             &n,
+            "--ctx",
+            &total,
         ];
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&args, &dir)?;
@@ -1218,22 +1238,88 @@ mod gate {
         let planned = server_log(&err_log, record::BLOOMERY_SERVE_DS41)?
             .first(&record::PLAN)?
             .is_some();
-        // The card the server's `--place gate` resolves to, as it resolves it.
-        let card = Place::Gate
-            .on_host()?
-            .card_specs()?
-            .first()
-            .map(|c| c.name)
-            .ok_or("--place gate resolved to no card")?;
-        println!("slots over the card {card}: planned {planned}; {refused}");
+        // The seats' common words for a set context the card cannot hold
+        // (`ctx_ask::AskError::DoesNotFit`).
+        let named = format!(
+            "--ctx {total} over {SLOTS_OVER} slot(s) asks {} positions a slot, and the card \
+             holds ",
+            served_positions()?
+        );
+        println!("slots over the card: planned {planned}; {refused}");
         let mut ok = true;
+        // PIN(2026-10-14): `--ctx` is the total the slots split (ctx-first, D4), so the
+        // server asks the slots' total and is refused by the common words; was the plan's
+        // own refusal naming the card and its KV term.
         check(
             &mut ok,
             "slots_over_the_card_refused_before_the_load",
-            refused.contains("before listening")
-                && refused.contains(&format!("card {card}: "))
-                && refused.contains("KV")
-                && !planned,
+            refused.contains("before listening") && refused.contains(&named) && !planned,
+        );
+        Ok(ok)
+    }
+
+    /// The `ctx` clause (module header): a server with no `--ctx` (one slot,
+    /// `--place gate`) prints its one `ctx` line and its `plan` record before
+    /// its load, and is stopped there. The line holds its word under the
+    /// model's limit (the trained context within the plan's i32 positions;
+    /// `ctx_ladder::default_line_held`), and this gate's own one-slot plans
+    /// at the server's free card bytes agree: the card holds the default, and
+    /// not the rung above it when it halved. Mutants: a ladder that starts a
+    /// rung low (the rung above holds); a default of two slots (the line
+    /// names two).
+    fn ctx_default(a: &Args, levers: &PlanLevers) -> Result<bool, GateError> {
+        let dir = a.dir.join("ctx-default");
+        std::fs::create_dir_all(&dir)?;
+        let err_log = dir.join("server.err");
+        let mut served = Served::spawn(&SERVER_ARGS[..8], &dir)?;
+        let mut text = String::new();
+        for _ in 0..POLLS {
+            text = std::fs::read_to_string(&err_log).unwrap_or_default();
+            let planned = matches!(
+                server_log(&err_log, record::BLOOMERY_SERVE_DS41)?.first(&record::PLAN),
+                Ok(Some(_))
+            );
+            if (ctx_line(&text).is_some() && planned) || served.child.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        if served.child.try_wait()?.is_none() {
+            println!("ctx: the default server stopped: {}", served.stop()?);
+        }
+        let line = ctx_line(&text)
+            .ok_or("the default server printed no one `ctx` line")?
+            .to_owned();
+        println!("ctx: {line}");
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let limit = CtxLimit {
+            trained: split
+                .arch_get_u64("context_length")
+                .ok_or("the file states no context_length")?,
+            kernel: Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
+            verified: None,
+        }
+        .limit();
+        let free = server_card_free(&err_log)?;
+        let at = |c: u64| -> Result<bool, GateError> {
+            let mut machine = Place::Gate.machine(None, None)?(inputs.model.layers);
+            machine.cards[0].free_bytes = Some(free);
+            Ok(inputs.plan(&machine, c, levers).is_ok())
+        };
+        let ctx = ctx_ladder::field(&line, "ctx").ok_or("the `ctx` line names no ctx")?;
+        let above = rung_above(limit.0, ctx);
+        let (at_ctx, at_above) = (at(ctx)?, above.map(at).transpose()?);
+        println!(
+            "ctx: the gate's plans: at {ctx} {at_ctx}, at the rung above {above:?} {at_above:?}; \
+             the limit {limit:?}"
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "ctx_default_is_the_highest_rung_held",
+            default_line_held(&line, 1, limit) == Some(true) && at_ctx && at_above != Some(true),
         );
         Ok(ok)
     }
@@ -1255,6 +1341,7 @@ mod gate {
             .ok_or_else(|| format!("{}: not UTF-8", save.display()))?
             .to_owned();
         let mut args = SLOTS_SERVER_ARGS.to_vec();
+        args.extend(SLOTS_CTX);
         args.extend(["--slot-save-path", save.as_str()]);
         // The rounds clause counts the seat's rounds: the lever set on this
         // process alone, so the servers below run without it.
@@ -1409,6 +1496,7 @@ mod gate {
         let dir = a.dir.join("slots-files");
         std::fs::create_dir_all(&dir)?;
         let mut args = SLOTS_SERVER_ARGS.to_vec();
+        args.extend(SLOTS_CTX);
         args.extend(["--slot-save-path", save]);
         let mut served = Served::spawn(&args, &dir)?;
         println!("slot-file server pid {}", served.child.id());
@@ -1440,9 +1528,11 @@ mod gate {
         let dir = a.dir.join("slots-files-ctx");
         std::fs::create_dir_all(&dir)?;
         let whole = served_positions()?;
+        // Half the context a slot: the total the two slots split is `whole`.
         let ctx = (whole / 2).to_string();
+        let total = whole.to_string();
         let mut args = SLOTS_SERVER_ARGS.to_vec();
-        args.extend(["--ctx", ctx.as_str(), "--slot-save-path", save]);
+        args.extend(["--ctx", total.as_str(), "--slot-save-path", save]);
         let mut served = Served::spawn(&args, &dir)?;
         println!("other-context server pid {}", served.child.id());
         let addr = served.address(&dir.join("server.err"), POLLS, POLL)?;
@@ -1990,8 +2080,8 @@ mod gate {
     }
 
     /// The context the slots server names: its `parallel` line (the rule,
-    /// two slots, the default context a slot and their total), its `slots`
-    /// line (two sequences made of two planned) and `/props`' `n_ctx`.
+    /// two slots, [`GATE_CTX`] a slot and their total, `from=flag`), its
+    /// `slots` line (two sequences made of two planned) and `/props`' `n_ctx`.
     fn slots_ctx(url: &dyn Fn(&str) -> String, err_log: &Path) -> Result<bool, GateError> {
         let text = std::fs::read_to_string(err_log)?;
         let line = |head: &str| {
@@ -2086,7 +2176,7 @@ mod gate {
     /// them, sum to the tokens the two requests decoded beyond their
     /// prompts' first. The lever moves no computation in the round path —
     /// it only prints the record — so (s5)'s together-equals-alone bits
-    /// stand for the default server.
+    /// stand for the slots server.
     fn slots_rounds_run_one_pass(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,
@@ -3142,6 +3232,7 @@ mod gate {
         ok &= shared_system(&url)?;
 
         println!("server stopped: {}", served.stop()?);
+        ok &= ctx_default(&a, &place)?;
         ok &= slots(&a)?;
         ok &= slots_refuse_dspark(&a)?;
         if ok {

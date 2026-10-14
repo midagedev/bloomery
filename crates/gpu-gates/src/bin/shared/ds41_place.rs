@@ -2,15 +2,24 @@
 //! (`bloomery_gpu_gates::generate::Place`): the unset `--place` rule, the
 //! expert tier's prompt-batch bytes the plan reserves, the `load` record's
 //! cards (the shared rule, `generate::with_cards`), and the `--place` word a
-//! V4.1 body serves. `generate_ds41`, `bloomery-serve-ds41` and
-//! `bloomery-chat` read them here.
+//! V4.1 body serves, and a serving slot's context choice. `generate_ds41`,
+//! `bloomery-serve-ds41`, `bloomery-chat` and the routed-leg gate read them
+//! here.
+
+use std::num::NonZeroUsize;
 
 use bloomery_gpu_deepseek41::body::Deepseek41Model;
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule};
+use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule, choose_ctx};
 use bloomery_gpu_gates::gpu_census;
 use bloomery_gpu_gates::record::Record;
+use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
+use bloomery_gpu_gates::vision_seat;
+use gguf::Split;
 use model::arch::deepseek41::hparams::Hparams;
+use model::arch::deepseek41::place::PlanInputs;
+use model::placement::PlanLevers;
+use model::placement::ctx_ask::{Chosen, PlanRefusal, Probe};
 use model::placement::workstation::TierBatchBytes;
 
 /// The expert tier cards the V4.1 body serves: the host tier's count
@@ -65,4 +74,41 @@ pub fn with_cards(
 ) -> Result<Record, GateError> {
     let tiers = m.body(what)?.hybrid().tiers();
     bloomery_gpu_gates::generate::with_cards(r, place, m.gpu(), tiers)
+}
+
+/// A serving slot's context by the seats' common choice
+/// (`generate::choose_ctx`): the limit is the file's trained context within
+/// the plan's i32 positions, and a probe is the load's plan of every slot at
+/// a slot context on `place`'s machine with `reserve` (the DSpark draft's),
+/// `tier_batch` and `vision` (the encoder's stage-card reserve), its refusal
+/// read for the memory it was short of. `set` is the total the slots split.
+#[allow(
+    dead_code,
+    reason = "generate_ds41 and bloomery-chat include this module and never call it"
+)]
+pub fn ctx_choice(
+    split: &Split,
+    inputs: &PlanInputs,
+    place: Place,
+    (reserve, tier_batch, vision): (Option<u64>, Option<TierBatchBytes>, Option<u64>),
+    (set, slots): (Option<usize>, NonZeroUsize),
+    levers: &PlanLevers,
+) -> Result<Chosen<()>, GateError> {
+    choose_ctx(
+        split,
+        (set, slots.get()),
+        (Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")), None),
+        |c| -> Result<Probe<()>, GateError> {
+            let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
+            vision_seat::reserve_on(&mut machine, vision);
+            reserve_checkpoints(&mut machine, Seqs::none(slots.get()), c)?;
+            match inputs.plan_with_slots(&machine, c, levers, slots) {
+                Ok(_) => Ok(Probe::Holds(())),
+                Err(e) => match PlanRefusal::short(&e) {
+                    Some(short) => Ok(Probe::Short(short)),
+                    None => Err(e.into()),
+                },
+            }
+        },
+    )
 }

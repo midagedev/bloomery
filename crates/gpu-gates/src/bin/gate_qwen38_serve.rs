@@ -474,7 +474,6 @@ mod gate {
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
         Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_for_experts,
-        serve_ctx,
     };
     use model::placement::ctx::CtxLimit;
     use model::placement::workstation::{HostNeed, HostRead, RTX_3090};

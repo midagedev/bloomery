@@ -45,9 +45,17 @@
 //! batch, and a lost tier card is an engine error like any other: the
 //! request's 500 and `/health`'s 503 carry its message, which names the card.
 //!
-//! Each slot serves `--ctx` positions (below): that is `/props`' `n_ctx`, a
-//! prompt that long is a 400 before it reaches the engine, and generation
-//! stops there with `truncated`.
+//! Each slot serves its share of `--ctx` (below): that is `/props`' `n_ctx`,
+//! a prompt that long is a 400 before it reaches the engine, and generation
+//! stops there with `truncated`. The context is the seats' common choice
+//! (`place::ctx_choice`, `generate::choose_ctx`): it comes first, the experts fill
+//! what is left. The limit is the file's trained context within the plan's
+//! i32 positions. Set, `--ctx` is the total the slots split (llama-server's
+//! `-np` without `-kvu`); a share past the limit is refused by name, and one
+//! the machine cannot hold is refused with the largest share it holds,
+//! before the load. Unset, a slot asks the target (256K under the limit) and
+//! halves while the plan is short of the card, down to the floor; one `ctx`
+//! line on stderr names the rule.
 //! `/props`' `engine.ctx_verified` is the
 //! deepest context the reference sets hold our numbers to ik's at
 //! (`refset::arch::deepseek41::VERIFIED_POSITIONS`), which bounds nothing.
@@ -63,7 +71,7 @@
 //! whether the chat template writes it). Every cache event and every prefix
 //! the body keeps less of than a request shares is a record line.
 //!
-//! `--parallel N` (`-np N`, default [`SLOTS`]) serves N resident sequences
+//! `--parallel N` (`-np N`, default one) serves N resident sequences
 //! inside the one model (`Session::add_slots` over the body's `Slots`): the
 //! server steps the busy slots together, the sequences switched by pointer
 //! exchange; nothing parks and no slot waits for another. At a fixed
@@ -84,12 +92,12 @@
 //! reads, page-classifying syscalls) — a server run under it is never a
 //! timing reading.
 //! `--parallel 1` is exactly the one-sequence server, and `--parallel 0` is
-//! refused by name. Every slot holds a whole context: each serves the full
-//! `--ctx` positions, refused by name before the load below the pair pass's
-//! rows ([`slot_ctx`]). The plan counts every sequence — each one's caches on
-//! the card and ring shadows on the host (`PlanInputs::plan_with_slots`) — so
-//! slots the machine cannot hold are refused before the load by the plan's
-//! own refusal, as one sequence's are (the card's floor or its usable bytes
+//! refused by name. A slot's share under the pair pass's rows is refused by
+//! name before the load ([`slot_ctx`]). The plan counts every sequence —
+//! each one's caches on the card and ring shadows on the host
+//! (`PlanInputs::plan_with_slots`) — so slots the machine cannot hold are
+//! refused before the load by the plan's own refusal, as one sequence's are
+//! (the card's floor or its usable bytes
 //! past its dense trunk, KV, context, scratch, reserves and margin; the
 //! host's usable bytes past its tensors, ring shadows and reserves); and
 //! `--park-ram` is refused by name: resident slots hold their state in the
@@ -205,7 +213,7 @@ use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
     bind_server, model_props, parallel_line, placement_of,
 };
-use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, check_set_slot, lane_at, mode_name};
+use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
 use bloomery_gpu_gates::vision_seat;
@@ -214,7 +222,8 @@ use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::dspark::DraftHparams;
-use model::placement::workstation::{self, DeviceId, HostNeed, TierBatchBytes};
+use model::placement::ctx_ask::DEFAULT_SLOTS;
+use model::placement::workstation::{DeviceId, HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::width::{Choosing, Mode as WidthMode};
@@ -246,9 +255,6 @@ const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
-/// The resident sequences the seat serves when `--parallel` is not given.
-pub const SLOTS: usize = 2;
-
 /// The token V4.1's chat template opens every user and tool message with.
 pub const USER_START: &str = "<｜User｜>";
 
@@ -263,7 +269,9 @@ struct Args {
     /// The placement the seat runs by, resolved against this process's
     /// devices by the common unset rule ([`place::choose`]).
     place: Place,
-    ctx: usize,
+    /// `--ctx`: the total the slots split; `None` takes the seats' default
+    /// choice (`place::ctx_choice`).
+    ctx: Option<usize>,
     alias: Option<String>,
     /// `--cache-ram` in bytes; `None` takes the default.
     cache_ram: Option<u64>,
@@ -287,7 +295,7 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
         host: "127.0.0.1".to_owned(),
         port: 8080,
         place: Place::A,
-        ctx: usize::try_from(workstation::CTX_MAX)?,
+        ctx: None,
         alias: None,
         cache_ram: None,
         parallel: None,
@@ -313,7 +321,7 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = number(flag, v)?,
             "--place" => place_flag = Some(place::parse(v)?),
-            f if CTX.contains(&f) => a.ctx = number(flag, v)?,
+            f if CTX.contains(&f) => a.ctx = Some(number(flag, v)?),
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(mib_bytes(flag, v)?),
             "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
@@ -351,7 +359,7 @@ fn mib_bytes(flag: &str, v: &str) -> Result<u64, GateError> {
 }
 
 /// The resident sequences the seat serves and what set the count:
-/// `parallel` (`--parallel`) as given, else [`SLOTS`] — one under the DSpark
+/// `parallel` (`--parallel`) as given, else `ctx_ask::DEFAULT_SLOTS` — one under the DSpark
 /// draft, whose window is one sequence's on its own card
 /// ([`served::draft_slots`], which refuses several under it by name), and one
 /// under a route trace (`traced`), which records one sequence's steps; under a
@@ -366,28 +374,30 @@ fn slot_count(
         None => match parallel {
             Some(n) => (n, SlotsFrom::Flag),
             None if traced => (1, SlotsFrom::RouteTrace),
-            None => (SLOTS, SlotsFrom::Default),
+            None => (DEFAULT_SLOTS, SlotsFrom::Default),
         },
     };
     let n = NonZeroUsize::new(n).ok_or("--parallel 0: the server serves no slot")?;
     Ok((n, from))
 }
 
-/// The positions each of `slots` slots serves for `--ctx` `ctx`: the whole
-/// of it, every slot a full context, so the plan counts `slots` times one
-/// sequence's bytes. The one place the rule lives: a split (⌊ctx / slots⌋,
-/// llama-server's `-np` without `-kvu`) is this function's body. Refused by
-/// name below [`PAIR_ROWS`], the pair pass's rows: the most one call of a
-/// slot runs on a capture.
-fn slot_ctx(ctx: usize, slots: NonZeroUsize) -> Result<usize, GateError> {
-    if ctx < PAIR_ROWS {
+/// A set `--ctx` `total`'s share a slot of `slots` (llama-server's `-np`
+/// without `-kvu`, `slots::split_ctx`), refused by name below
+/// [`PAIR_ROWS`], the pair pass's rows: the most one call of a slot runs on a
+/// capture. Unset, nothing to check before the choice.
+fn slot_ctx(total: Option<usize>, slots: NonZeroUsize) -> Result<(), GateError> {
+    let Some(total) = total else {
+        return Ok(());
+    };
+    let share = total / slots;
+    if share < PAIR_ROWS {
         return Err(format!(
-            "--ctx {ctx}: each of the {slots} slots serves {ctx} positions, below the \
+            "--ctx {total}: each of the {slots} slots serves {share} positions, below the \
              {PAIR_ROWS} a slot serves at least (the pair pass's rows)"
         )
         .into());
     }
-    Ok(ctx)
+    Ok(())
 }
 
 /// What `--mmproj` opened for the plan ([`vision_seat::open_seat`]): the encoder file's card
@@ -484,12 +494,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     let (slots, from) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
     // Before anything is read or planned: a context no slot can serve.
-    let ctx = slot_ctx(a.ctx, slots)?;
+    slot_ctx(a.ctx, slots)?;
     // The rounds of several slots, decided once (the open takes it through
     // `SeatArgs`): one pass of the busy rows with no draft, else the fallback
     // loop ([`V41::one_pass`]).
     let pass = Pass::of(slots.get(), draft == Draft::Off);
-    parallel_line(slots.get(), ctx, from, pass);
     // The draft's file is read before the target's load, which takes a minute.
     let draft_file = match draft {
         Draft::Dspark => Some(dspark::draft_hparams()?),
@@ -513,20 +522,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::read(&split)?;
-    // A slot's context is held to the model's limit before the plan: the
-    // trained context, and the plan's positions are i32. The unset context
-    // is within both.
-    check_set_slot(
-        &split,
-        Some(ctx),
-        (
-            Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
-            None,
-        ),
-    )?;
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);
-    drop(split);
+    // The context the load takes with the encoder's reserve `vision`
+    // (`place::ctx_choice`): asked once for a projector's cost, once for the
+    // load.
+    let ctx_of = |vision: Option<u64>| {
+        place::ctx_choice(
+            &split,
+            &inputs,
+            a.place,
+            (reserve, tier_batch, vision),
+            (a.ctx, slots),
+            &cfg.place,
+        )
+    };
     // The encoder's file is read before the plan, which reserves its bytes, and held against the
     // text model's embedding width and vocabulary.
     let n_embd = inputs.hp.n_embd;
@@ -538,9 +548,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         vision_of(&a, cfg.body.prefill, n_embd, &token)?,
         &a.vision,
         |v| {
+            let vision = v.and_then(|v| v.seat.reserve);
+            let ctx = ctx_of(vision)?.slot_ctx;
             let mut machine = a.place.machine(reserve, tier_batch)?(inputs.model.layers);
-            vision_seat::reserve_on(&mut machine, v.and_then(|v| v.seat.reserve));
-            let ctx = u64::try_from(ctx)?;
+            vision_seat::reserve_on(&mut machine, vision);
             reserve_checkpoints(&mut machine, Seqs::none(slots.get()), ctx)?;
             let plan = inputs.plan_with_slots(&machine, ctx, &cfg.place, slots)?;
             Ok(vision_seat::Cost::of(&plan, ctx))
@@ -552,6 +563,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     vision_of(&a, cfg.body.prefill, n_embd, &token)?;
     #[cfg(not(feature = "vision"))]
     let seated: Option<&vision_seat::Opened> = None;
+    let chosen = ctx_of(seated.and_then(|v| v.seat.reserve))?;
+    drop(split);
+    let ctx = usize::try_from(chosen.slot_ctx)?;
+    eprintln!("{}", chosen.line());
+    parallel_line(slots.get(), ctx, from, pass);
     let trace = route_trace(
         &levers,
         &cfg,
