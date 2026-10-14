@@ -46,8 +46,9 @@ impl Wire for Rdma {
                 len: u32::try_from(m.len).map_err(|_| format!("a write of {} bytes", m.len))?,
             });
         }
-        // SAFETY: region and page outlive the queue pair (field order here and in `End`); a range
-        // may be rewritten on landing, before completion: `docs/contrib/dgx-spark.md` 9.5, item 2.
+        // SAFETY: region and page outlive the queue pair (field order here and in `End`), so each
+        // range stays registered and allocated while a write may read it; which ranges are
+        // rewritten meanwhile: `docs/contrib/dgx-spark.md` 9.5, item 2.
         let posted = unsafe { self.qp.post_writes(&self.region, &self.writes, rkey) };
         self.in_flight += match &posted {
             Ok(()) => self.writes.len(),

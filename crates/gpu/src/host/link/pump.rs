@@ -18,8 +18,11 @@
 //! page only through its [`Wire`], which carries a post's byte ranges in order:
 //! each span the counter publishes, then for a done the tier's progress, then
 //! the generation into the inbox. The progress the host reads is the writer's
-//! dones posted, so it does not run ahead of the bytes posted with them while
-//! each write lands once (`docs/contrib/dgx-spark.md` 9.5, item 2).
+//! dones posted, so it does not run ahead of the bytes posted with them. An
+//! end delivers only while none of its posts is in flight, so a card a
+//! delivery releases, and the line's next staged words, rewrite no range a
+//! post made before the delivery still reads (`docs/contrib/dgx-spark.md`
+//! 9.5, item 2).
 //!
 //! The inbox and two staging words per crossing (the generation and the
 //! progress a post sends) are the link's tail, past the tier page's own
@@ -258,25 +261,35 @@ impl Half {
         Ok(h)
     }
 
-    /// One pass: post each new generation this end writes, deliver what each
-    /// inbox it reads holds, then reap the wire. `true` when anything moved.
+    /// One pass: post each new generation this end writes, reap the wire,
+    /// and only when none of the end's posts is in flight deliver what each
+    /// inbox it reads holds: a card a delivery releases rewrites the ranges
+    /// its end's earlier posts read. `true` when anything moved.
     pub(super) fn pass(&mut self, page: &dyn Page, wire: &mut dyn Wire) -> bool {
         let mut moved = false;
         for i in 0..self.lines.len() {
             if self.broken.is_some() {
                 return false;
             }
-            if self.lines[i].stopped {
-                continue;
+            if self.lines[i].writes && !self.lines[i].stopped {
+                moved |= self.post(i, page, wire);
             }
-            moved |= if self.lines[i].writes {
-                self.post(i, page, wire)
-            } else {
-                self.deliver(i, page)
-            };
         }
-        if let Err(e) = wire.reap() {
-            self.break_with(e);
+        match wire.reap() {
+            Ok(true) => {}
+            Ok(false) => return moved,
+            Err(e) => {
+                self.break_with(e);
+                return false;
+            }
+        }
+        for i in 0..self.lines.len() {
+            if self.broken.is_some() {
+                return false;
+            }
+            if !self.lines[i].writes && !self.lines[i].stopped {
+                moved |= self.deliver(i, page);
+            }
         }
         moved
     }
@@ -986,6 +999,37 @@ mod tests {
             (Arc::strong_count(&stage), Arc::strong_count(&tier)),
             (1, 1)
         );
+    }
+
+    // A done found in the stage's inbox while the stage end's go is still in
+    // flight, an answer that came before the end reaped the go's completion,
+    // is delivered only once the go is over: the stage card it releases
+    // writes the next image and go, which the go's writes and a resend of
+    // them may still read.
+    #[test]
+    fn a_delivery_waits_for_the_ends_posts_in_flight() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let (go_wire, go_seen) = Late::new(&stage, &tier, CNT);
+        let m = link(&stage, &tier, go_wire, wire(&tier, &stage));
+        stage.word(IMAGE).store(1, Ordering::Relaxed);
+        stage.word(GO).store(1, Ordering::Release);
+        stage.word(TAIL + TAIL_LINE).store(1, Ordering::Release);
+        m.pass();
+        assert_eq!(
+            stage.word(CNT).load(Ordering::Acquire),
+            0,
+            "the done delivered while the go is in flight"
+        );
+        m.pass();
+        assert_eq!(m.broken(), None);
+        assert_eq!(
+            go_seen.load(Ordering::Acquire),
+            0,
+            "the stage's done at the go's landing"
+        );
+        assert_eq!(tier.word(IMAGE).load(Ordering::Acquire), 1);
+        assert_eq!(stage.word(CNT).load(Ordering::Acquire), 1);
     }
 
     // The tiers of a row post the same spans. A release stops every tier's

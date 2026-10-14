@@ -972,14 +972,18 @@ impl Qp {
     /// has its own completion, success or error. On `Err`, the count of the
     /// writes the queue pair took before the one it refused.
     ///
+    /// A source range rewritten before its write's completion is polled may
+    /// land as its old bytes, its new ones or a mix, and a resend of the
+    /// write may read it again: a buffer is reused only once its work
+    /// completion is retrieved (`ibv_post_send(3)`).
+    ///
     /// # Safety
     ///
     /// The NIC reads a write's source range after the call returns, until
-    /// that write's completion is polled or the queue pair is destroyed: a
-    /// buffer is reused only once its work completion is retrieved
-    /// (`ibv_post_send(3)`). Until then the caller keeps `region` registered
-    /// and its memory allocated, and does not rewrite the range. On `Err`
-    /// the writes taken are in flight under the same terms.
+    /// that write's completion is polled or the queue pair is destroyed.
+    /// Until then the caller keeps `region` registered and its memory
+    /// allocated. On `Err` the writes taken are in flight under the same
+    /// terms.
     pub unsafe fn post_writes(
         &self,
         region: &Region,

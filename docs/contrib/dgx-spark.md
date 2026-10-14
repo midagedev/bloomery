@@ -668,31 +668,37 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    card waits for at least one and takes it back, as on the shared page. Both ends hold the step rule: a step of 0
    carries nothing, a step of 1 carries one, and any other step publishes nothing and stops that end by name, since a
    row has at most one go or done in flight. The host's progress word on the stage's page counts the dones the
-   writer's end posted and goes after their bytes, so it does not run ahead of them while each write lands once (a
-   retransmission is the exception below). A release stops every counter of the page on both ends, every tier's in one
-   call, and an end raises its reader's counters only once its posts are over, since a released card runs on, steps the
-   counters it writes and rewrites the spans its end's posts still read. A post is over when each of its writes'
-   completions is polled (`ibv_post_send(3)`: a buffer is reused only after its work completion is retrieved), and each
-   write is signaled to have one. Writes that fail or do not complete within the bound (`DRAIN`) are flushed by taking
-   the queue pair to its error state, which completes every write still posted (the flush `rdma_disconnect(3)`
-   describes for that transition). An end whose writes still do not complete leaves its counters where they are and is
-   broken by name: its cards keep waiting, a synchronize of their streams does not return, the host's error and every
-   later refusal name the end, and the link's drop leaks both ends and their pages rather than free them under the
-   waits.
-   Outside a release the link does not wait for completions `[derived, not run]`. A card rewrites a span after the other
-   side's take, which follows the generation's landing, and the pump rewrites a line's staged generation and progress
-   words at its next post. If a request lands and its acknowledgement is lost, the requester sends again from the first
-   unacknowledged write and reads each source range again. Whether the responder writes a duplicate RDMA write again was
-   not checked against the specification. If it does, a span the card is rewriting can land torn; a later post of the
-   line, on the same queue pair, lands that span again before its own generation, so the reader does not read the torn
-   bytes through it. The staged words are read again too, though: when the card finishes its next span and the pump
-   stages the next generation between the retransmission's read of the span and its read of the generation, the reader
-   receives that generation, and the stage's progress counts it, before the span's bytes land. A lost request is not
-   this case: the reader has not taken that generation, so the line waits and no source range changes. How to close it
-   is open: the staged words sent inline (`ibv_post_send(3)`: an inline buffer can be reused once the call returns), a
-   completion gate before a delivery, or the `# Safety` wording of `post_writes`. Each
-   counter's reset takes its generations as carried and resumes it alone, each end resetting only its own
-   side of it, and a link stopped by name fails the reset, so the host tier stays poisoned
+   writer's end posted and goes after their bytes, so it does not run ahead of them. A release stops every counter of
+   the page on both ends, every tier's in one call, and an end raises its reader's counters only once its posts are
+   over, since a released card runs on, steps the counters it writes and rewrites the spans its end's posts still
+   read. A post is over when each of its writes' completions is polled (`ibv_post_send(3)`: a buffer is reused only
+   after its work completion is retrieved), and each write is signaled to have one. Writes that fail or do not complete
+   within the bound (`DRAIN`) are flushed by taking the queue pair to its error state, which completes every write
+   still posted (the flush `rdma_disconnect(3)` describes for that transition). An end whose writes still do not
+   complete leaves its counters where they are and is broken by name: its cards keep waiting, a synchronize of their
+   streams does not return, the host's error and every later refusal name the end, and the link's drop leaks both ends
+   and their pages rather than free them under the waits.
+   Outside a release an end delivers only while none of its posts is in flight: each pass of its pump posts, reaps
+   its completions, and delivers what its inboxes hold only when every write it posted has completed; a failed
+   completion stops the end by name. A card rewrites a span only after it takes a counter its end delivered (the stage
+   card a row's image after every tier's done of that row, a tier card the row's rows and its fault copy after its
+   next go), and the pump rewrites a line's staged generation and progress only at the line's next post, which follows
+   the reader's take of the last one. So neither rewrites a range that a write posted before the delivery may still
+   read, a resend included: if a request lands and its acknowledgement is lost, the requester sends again from the
+   first unacknowledged write and reads each source range again, and those ranges still hold the bytes of the first
+   send `[derived, not run]`. Whether the responder executes a duplicate RDMA write again was not checked against the
+   specification; if it does, the same bytes and generation land again, and a repeated generation delivers nothing.
+   One range is rewritten while a write may read it: a row's rows, which every tier of the page writes in its own
+   slots and each tier's done posts whole. A tier card writes its slots after its own go, while another tier's done of
+   the row may still be in flight. Those bytes reach the stage by the writing tier's own done, later on the same queue
+   pair, which a resend of the earlier done sends again after it, and the stage card reads the rows only after every
+   tier's done, so it reads each tier's slots as that tier wrote them `[derived, not run]`. When an end posted nothing
+   after the post an answer is to, that post's acknowledgements return before the answer, so the wait delays nothing.
+   In a pass of two rows a row's go can be posted while the other row's done is on its way
+   (`crates/gpu/src/host/mod.rs:40-43`), and that done then also waits for the later go's completion, about one
+   acknowledgement `[derived, not run]`. Neither is measured. Each counter's reset takes its generations as carried
+   and resumes it alone, each end resetting only its own side of it, and a link stopped by name fails the reset, so
+   the host tier stays poisoned
    (`crates/gpu/src/host/link/pump.rs`). On the shared page nothing changes: the same words, values, card operations
    and graphs.
 3. **A pump thread a node.** The card cannot post to the NIC. Each end's pump load-acquires the generation (Arm needs
