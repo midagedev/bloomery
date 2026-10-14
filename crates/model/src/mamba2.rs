@@ -32,6 +32,8 @@
 //! `silu(z) * y`, then a grouped RMSNorm of width `d_inner / n_group` when a
 //! gain is present. The out projection is not this module.
 
+use runtime::hc_gated::card::butterfly;
+
 use crate::ops::{self, Tensor2};
 
 /// The scan's `dt` map. `dt <= 20` takes `log1p(exp(dt))`; a greater value
@@ -159,19 +161,6 @@ fn len(what: &'static str, got: usize, need: usize) -> Result<(), Mamba2Error> {
     }
 }
 
-/// Lane 0 of a 32-wide xor reduction. Each step adds `lane ^ d` from the
-/// values at the start of that step. This order is the gate: the card's scan
-/// sums the same way.
-fn warp_sum(mut lane: [f32; 32]) -> f32 {
-    for d in [16usize, 8, 4, 2, 1] {
-        let prev = lane;
-        for l in 0..32 {
-            lane[l] = prev[l] + prev[l ^ d];
-        }
-    }
-    lane[0]
-}
-
 /// One scan token. `state` is `d_inner * 128` floats, `n` the fastest index
 /// inside `(head, channel)`. `x` and `y` are `d_inner` channels, channel
 /// `c + head * head_dim`. `dt` and `a` are one float per head (`dt` already
@@ -222,7 +211,8 @@ pub fn scan_token(
                 }
                 *slot = acc;
             }
-            y[h * head_dim + ch] = warp_sum(lane);
+            // The card's scan sums the lanes in this order: the gate.
+            y[h * head_dim + ch] = butterfly(&lane);
         }
     }
     Ok(())
@@ -334,13 +324,13 @@ pub fn conv_tokens(
     len("conv y", y.len(), n_tok * channels)?;
     for tok in 0..n_tok {
         for channel in 0..channels {
-            let mut sum = bias[channel];
+            let mut sum = 0.0f32;
             let base = channel * d_conv;
             for tap in 0..d_conv {
                 sum +=
                     conv_sample(state, x_new, channel, channels, ages, tok + tap) * w[base + tap];
             }
-            y[channel + tok * channels] = sum;
+            y[channel + tok * channels] = sum + bias[channel];
         }
     }
     if ages > 0 {
@@ -442,6 +432,141 @@ pub fn step_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conv_adds_bias_after_the_dot() {
+        let mut state = [16_777_216.0, -16_777_216.0, 0.0];
+        let mut y = [0.0];
+        conv_tokens(4, &mut state, &[0.0], &[1.0; 4], &[1.0], &mut y).unwrap();
+        assert_eq!(y, [1.0]);
+    }
+
+    fn one_channel() -> Checked {
+        check(Geom {
+            d_inner: 1,
+            n_heads: 1,
+            n_groups: 1,
+            d_state: STATE,
+            d_conv: 4,
+        })
+        .unwrap()
+    }
+
+    /// A negative `A` decays the held state by `exp(dt_sp * A)`; a decay of 1
+    /// leaves it, so the state words tell the two apart.
+    #[test]
+    fn a_negative_a_decays_the_state() {
+        let g = one_channel();
+        let mut state = vec![1.0; STATE];
+        let mut y = [0.0];
+        scan_token(
+            &g,
+            &mut state,
+            &[0.0],
+            &[21.0],
+            &[-1.0],
+            &[1.0; STATE],
+            &[1.0; STATE],
+            &mut y,
+        )
+        .unwrap();
+        let d_a = (-21.0f32).exp();
+        assert!(d_a < 1.0);
+        assert!(state.iter().all(|&v| v == d_a));
+    }
+
+    /// Lanes 0, 1, 2 hold 2^24, -2^24 and 1. The xor reduction adds lane 2
+    /// into lane 0 first, where 2^24 + 1 rounds to 2^24, so `y` is 0; a
+    /// sequential sum would give 1.
+    #[test]
+    fn y_sums_the_lanes_in_xor_order() {
+        let g = one_channel();
+        let mut state = vec![0.0; STATE];
+        state[0] = 16_777_216.0;
+        state[1] = -16_777_216.0;
+        state[2] = 1.0;
+        let mut y = [0.0];
+        scan_token(
+            &g,
+            &mut state,
+            &[0.0],
+            &[21.0],
+            &[0.0],
+            &[1.0; STATE],
+            &[1.0; STATE],
+            &mut y,
+        )
+        .unwrap();
+        assert_eq!(y[0], 0.0);
+    }
+
+    /// One composed token at two channels against an f64 reading of the same
+    /// stages: the conv (only the current tap), its bias, SiLU, the `dt` bias
+    /// and softplus, the scan from a zero state, `+ x*D`, `silu(z)*y`, and the
+    /// grouped RMSNorm with a gain.
+    #[test]
+    fn a_composed_token_wires_every_stage() {
+        // Two heads of one channel with their own `dt`, so a scan term that
+        // moved by one common factor would not cancel in the norm.
+        let g = check(Geom {
+            d_inner: 2,
+            n_heads: 2,
+            n_groups: 1,
+            d_state: STATE,
+            d_conv: 4,
+        })
+        .unwrap();
+        let conv_dim = g.conv_dim;
+        let mut xbc = vec![0.0f32; conv_dim];
+        xbc[0] = 0.5;
+        xbc[1] = -1.0;
+        for v in &mut xbc[2..2 + STATE] {
+            *v = 0.25;
+        }
+        for v in &mut xbc[2 + STATE..] {
+            *v = 0.5;
+        }
+        let mut conv_w = vec![0.0f32; 4 * conv_dim];
+        for ch in 0..conv_dim {
+            conv_w[ch * 4 + 3] = 1.0;
+        }
+        let conv_bias = vec![0.1f32; conv_dim];
+        let (z, norm) = ([0.8f32, -0.4], [1.0f32, 2.0]);
+        let tok = Token {
+            xbc: &xbc,
+            dt: &[0.3, 0.1],
+            dt_bias: &[0.2, 0.6],
+            z: &z,
+            a: &[-0.7, -0.7],
+            d: &[1.5, 1.5],
+            conv_w: &conv_w,
+            conv_bias: &conv_bias,
+            norm: Some(&norm),
+            eps: 1e-5,
+        };
+        let mut conv_state = vec![0.0; 3 * conv_dim];
+        let mut scan_state = vec![0.0; 2 * STATE];
+        let mut y = [0.0f32; 2];
+        step_token(&g, &mut conv_state, &mut scan_state, &tok, &mut y).unwrap();
+
+        let silu = |v: f64| v / (1.0 + (-v).exp());
+        let (bm, cm) = (silu(0.35), silu(0.6));
+        let mut want = [0.0f64; 2];
+        for (ch, w) in want.iter_mut().enumerate() {
+            let x = silu(f64::from(xbc[ch]) + 0.1);
+            let dt_sp = (1.0 + [0.5f64, 0.7][ch].exp()).ln();
+            let scan = STATE as f64 * bm * x * dt_sp * cm;
+            *w = (scan + x * 1.5) * silu(f64::from(z[ch]));
+        }
+        let rms = ((want[0] * want[0] + want[1] * want[1]) / 2.0 + 1e-5).sqrt();
+        for (ch, w) in want.iter_mut().enumerate() {
+            *w = *w / rms * f64::from(norm[ch]);
+        }
+        for ch in 0..2 {
+            let rel = (f64::from(y[ch]) - want[ch]).abs() / want[ch].abs();
+            assert!(rel < 1e-5, "channel {ch}: {} vs {}", y[ch], want[ch]);
+        }
+    }
 
     fn nano() -> Checked {
         check(Geom {
@@ -559,7 +684,7 @@ mod tests {
             }
             *slot = acc;
         }
-        assert_eq!(y[0], warp_sum(lane));
+        assert_eq!(y[0], butterfly(&lane));
         // f32 `log1p(exp(20))` is 20, so the channel sum is the identity's 2560.
         assert_eq!(y[0], 2560.0);
     }
