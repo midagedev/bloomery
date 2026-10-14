@@ -171,17 +171,19 @@ blk_cardtests() {
   fi
   echo "${cards##*$'\n'}"
 }
-# tool_selftest SCRIPT: bash tools/SCRIPT --self-test; its last line, or its full output and a named error.
-# A slowest-cases line, when the script printed one, comes out before that last line. A script that
-# printed none leaves this pipeline empty: grep's miss is not a failure.
+# tool_selftest SCRIPT [ERE]: bash tools/SCRIPT --self-test; its last line, or its full output and a
+# named error. ERE, when named, is printed before that last line: the last line of the output that
+# matches. A script that printed none leaves the pipeline empty: grep's miss is not a failure.
 tool_selftest() {
-  local script=$1 out
+  local script=$1 pat=${2:-} out
   if ! out=$(bash "$(dirname "$0")/$script" --self-test 2>&1); then
     printf '%s\n' "$out" >&2
     echo "check-recipes: the ${script%.sh} self-test failed" >&2
     return 1
   fi
-  printf '%s\n' "$out" | grep -E '^[a-z-]+ self-test: slowest cases: ' | tail -n 1 || true
+  if [ -n "$pat" ]; then
+    printf '%s\n' "$out" | grep -E -- "$pat" | tail -n 1 || true
+  fi
   printf '%s\n' "${out##*$'\n'}"
 }
 # lease.sh's own self-test: lease_gpu_idle (the take's timing-card check) and the witness tag, on a
@@ -239,9 +241,9 @@ blk_q38srv() { tool_selftest ref/q38-3090-server.sh; }
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
 blk_maccheck() { tool_selftest mac-check.sh; }
 # gate-batch.sh's placement rules (the v41-load lane, a batch or a solo recipe's arm as an item, a cold
-# build's times row) on a fixture justfile and fixture times rows, no box. tool_selftest prints the
-# three slowest cases and then the count, which stays the block's last line.
-blk_gatebatch() { tool_selftest gate-batch.sh; }
+# build's times row) on a fixture justfile and fixture times rows, no box. The pattern is the
+# slowest-cases line: tool_selftest prints its last match, then the count, which stays the block's last line.
+blk_gatebatch() { tool_selftest gate-batch.sh '^[a-z-]+ self-test: slowest cases: '; }
 # gpu-gate.sh's card choice, its lease refusals and the V4.1 load lock, against lock files of its own and
 # a stub nvidia-smi (flock and timeout stand-ins where the host has none, as on the Mac), no card.
 blk_gpugate() {

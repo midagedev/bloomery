@@ -1647,7 +1647,16 @@ FP
     sleep 1
     k=$((k + 1))
   done
-  kill -TERM "$(cat "$t/target/c-ch-kill2/lane-A.pid")" "$(cat "$t/target/c-ch-kill2/lane-B.pid")"
+  # Both lane pids answer at the kill. A lane that had already exited would let the named end
+  # below pass without this kill having ended it.
+  ap=$(cat "$t/target/c-ch-kill2/lane-A.pid" 2> /dev/null || true)
+  bp=$(cat "$t/target/c-ch-kill2/lane-B.pid" 2> /dev/null || true)
+  if [ -n "$ap" ] && [ -n "$bp" ] && kill -0 "$ap" 2> /dev/null && kill -0 "$bp" 2> /dev/null; then
+    pass 'chain: both lanes are alive at the kill'
+  else
+    fail 'chain: both lanes are alive at the kill' "lane A '${ap:-missing}' lane B '${bp:-missing}'"
+  fi
+  kill -TERM "$ap" "$bp"
   k=0
   while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 30 ]; do
     sleep 1
