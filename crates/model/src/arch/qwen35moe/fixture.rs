@@ -81,7 +81,7 @@ pub const D_MAX: f32 = 1.0 / 64.0;
 
 /// The PLE table's cut: the fixture's head vocab sizes are scaled to keep
 /// the table at about this many bytes (the source's table is 28.8 GB).
-pub const PLE_TABLE_BYTES: u64 = 112 << 20;
+const PLE_TABLE_BYTES: u64 = 112 << 20;
 
 /// The Qwen3.8 model width: the length of the shared expert's gate vector
 /// (`ffn_gate_inp_shexp`), which the family's gate value derives from
@@ -557,7 +557,7 @@ pub fn check_kinds(
 
 /// [`check_kinds`] for the architecture `variant` names: both headers must
 /// read as that variant.
-pub fn check_kinds_as(
+fn check_kinds_as(
     variant: Variant,
     spec: &FixtureSpec,
     fixture: &Split,
@@ -666,7 +666,7 @@ pub fn check_kinds_as(
 /// A variant spec of another map of the same length writes the draft's
 /// decorative per-layer entries by this map, not its own: `kvs` is not given
 /// the spec.
-pub struct QwenMtp;
+struct QwenMtp;
 
 impl QwenMtp {
     fn map(&self) -> &'static [usize] {

@@ -8,28 +8,28 @@
 use crate::GateError;
 
 /// Launches of the embedding row.
-pub const EMBED_LAUNCHES: usize = 1;
+const EMBED_LAUNCHES: usize = 1;
 /// Launches of a delta layer: its two mixes' 3 each, the mixer's 7 (q·k·v, z, β·α, the conv, the
 /// delta step, the gated norm, the output projection) and the block's 9 (the router, the handoff,
 /// the go, the shared expert's four, the wait, the gated sum).
-pub const GDN_LAYER_LAUNCHES: usize = 6 + 7 + 9;
+const GDN_LAYER_LAUNCHES: usize = 6 + 7 + 9;
 /// Launches of a selecting layer: the same 6 and 9 around the mixer's 14.
-pub const QSA_LAYER_LAUNCHES: usize = 6 + 14 + 9;
+const QSA_LAYER_LAUNCHES: usize = 6 + 14 + 9;
 /// Launches of the PLE site: the combine, key and value, the gate and the conv.
-pub const PLE_SITE_LAUNCHES: usize = 5;
+const PLE_SITE_LAUNCHES: usize = 5;
 /// Launches of the head: its mix's three, the q8_0 gemv and the argmax.
-pub const HEAD_LAUNCHES: usize = 5;
+const HEAD_LAUNCHES: usize = 5;
 /// Nodes a verify of more than one row adds on a delta layer (β and α out of the joined
 /// projection, two token-major copies) and on a selecting layer (the indexer queries, one).
-pub const VERIFY_GDN_EXTRA: usize = 2;
-pub const VERIFY_QSA_EXTRA: usize = 1;
+const VERIFY_GDN_EXTRA: usize = 2;
+const VERIFY_QSA_EXTRA: usize = 1;
 /// Launches bound to one sequence on a selecting layer, and on a delta layer (its conv and delta
 /// step); a captured pass of several slots' rows repeats them for each busy slot.
-pub const SLOT_QSA_LAUNCHES: usize = 8;
-pub const SLOT_GDN_LAUNCHES: usize = 2;
+const SLOT_QSA_LAUNCHES: usize = 8;
+const SLOT_GDN_LAUNCHES: usize = 2;
 /// Launches the card leg adds on a card layer: the normed rows' q8_1, the gate·up, the card
 /// slots' q8_1, the down and the card sum.
-pub const CARD_LEG_LAUNCHES: usize = 5;
+const CARD_LEG_LAUNCHES: usize = 5;
 
 /// The layer kinds a file's header names: what a gate's structure clause is written against, and
 /// the only source it reads them from (never the loaded body).
@@ -49,7 +49,7 @@ pub struct Shape {
 
 /// The selecting layers of `n_layer` layers at `interval`.
 #[must_use]
-pub fn qsa_layers(n_layer: usize, interval: usize) -> Vec<usize> {
+fn qsa_layers(n_layer: usize, interval: usize) -> Vec<usize> {
     (0..n_layer)
         .filter(|l| (l + 1).is_multiple_of(interval))
         .collect()

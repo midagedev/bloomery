@@ -20,44 +20,44 @@ use crate::GateError;
 use gguf::quant::GgmlType;
 
 /// Launches of the embedding row.
-pub const EMBED_LAUNCHES: usize = 1;
+const EMBED_LAUNCHES: usize = 1;
 /// Launches of the decode step's head.
-pub const HEAD_LAUNCHES: usize = 3;
+const HEAD_LAUNCHES: usize = 3;
 /// Launches of a joined delta layer's mixer: the norm with its quantizer, the q·k·v projection and
 /// the z·β·α projection (a Q6_K q·k·v in its own gemv), the conv, the delta step, the gated norm,
 /// the q8_1 and `ssm_out` with the residual.
-pub const DELTA_MIXER_LAUNCHES: usize = 8;
+const DELTA_MIXER_LAUNCHES: usize = 8;
 /// Launches of a joined attention layer's mixer: the norm with its quantizer, q·k·v, rope, the
 /// flash segment pass and merge, the gated q8_1 and the output projection with the residual.
-pub const ATTN_MIXER_LAUNCHES: usize = 7;
+const ATTN_MIXER_LAUNCHES: usize = 7;
 /// Launches of a joined layer's feed-forward block: the norm with the gated router, the gate·up
 /// over the joined stacks, the q8_1 of the nine slots, the down `_sel` and the combine.
-pub const JOINED_FFN_LAUNCHES: usize = 5;
+const JOINED_FFN_LAUNCHES: usize = 5;
 /// Launches a Q6_K `attn_v` adds to a joined attention layer's mixer at one row: its own gemv.
-pub const ATTN_V_GEMV_LAUNCHES: usize = 1;
+const ATTN_V_GEMV_LAUNCHES: usize = 1;
 /// Launches a Q6_K `attn_qkv` adds to a joined delta layer's mixer in a pass of two or more rows:
 /// the token-major copy of its output.
-pub const PASS_QKV_COPY_LAUNCHES: usize = 1;
+const PASS_QKV_COPY_LAUNCHES: usize = 1;
 /// Launches a Q6_K `attn_v` adds to a joined attention layer's mixer in a pass of two or more
 /// rows: its gemv and the token-major copy.
-pub const PASS_V_LAUNCHES: usize = 2;
+const PASS_V_LAUNCHES: usize = 2;
 /// Launches of an unjoined layer's mixer, either kind: the norm with its quantizer, each of the
 /// layer's projections in its own gemv, and for a delta layer the conv, the delta step, the gated
 /// norm and the output projection into `normed` with the residual add; no site is row-major past
 /// one row, so a pass holds the same launches as a row.
-pub const UNJOINED_MIXER_LAUNCHES: usize = 10;
+const UNJOINED_MIXER_LAUNCHES: usize = 10;
 /// Launches of an apart shared expert's feed-forward block: the norm and the router on the f32
 /// rows its gate and up read, the card list, the routed gate·up, the routed slots' quantizer, the
 /// routed down `_sel`, the shared gate and up, the SwiGLU, the shared down and the host-sum
 /// combine.
-pub const APART_FFN_LAUNCHES: usize = 11;
+const APART_FFN_LAUNCHES: usize = 11;
 /// Launches one busy slot adds to a captured pass of several slots on a delta layer (its conv and
 /// delta step) and on an attention layer (its rope with the cache append and the flash segment
 /// pass and merge).
-pub const SLOT_DELTA_LAUNCHES: usize = 2;
-pub const SLOT_ATTN_LAUNCHES: usize = 3;
+const SLOT_DELTA_LAUNCHES: usize = 2;
+const SLOT_ATTN_LAUNCHES: usize = 3;
 
-pub use model::arch::qwen35moe::hparams::Kind;
+use model::arch::qwen35moe::hparams::Kind;
 
 /// A tensor of a layer whose type a launch rule reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +81,7 @@ pub enum Site {
 
 /// The types of a layer's mixer sites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mixer {
+enum Mixer {
     Delta {
         qkv: GgmlType,
         gate: GgmlType,
@@ -100,22 +100,22 @@ pub enum Mixer {
 /// Whether a layer's shared expert has the types of its routed stacks (joined into them) or any
 /// part of another type (apart).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Shared {
+enum Shared {
     Joined,
     Apart,
 }
 
 /// One layer as its header describes it: what the launch rules read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Layer {
-    pub mixer: Mixer,
-    pub shared: Shared,
+struct Layer {
+    mixer: Mixer,
+    shared: Shared,
 }
 
 impl Layer {
     /// The layer's kind.
     #[must_use]
-    pub fn kind(&self) -> Kind {
+    fn kind(&self) -> Kind {
         match self.mixer {
             Mixer::Delta { .. } => Kind::DeltaRule,
             Mixer::Attention { .. } => Kind::Attention,
@@ -190,7 +190,7 @@ impl Shape {
     ///
     /// # Errors
     /// No layer, or a layer whose sites match no launch rule (the layer and its sites named).
-    pub fn from_layers(layers: Vec<Layer>) -> Result<Shape, GateError> {
+    fn from_layers(layers: Vec<Layer>) -> Result<Shape, GateError> {
         if layers.is_empty() {
             return Err("a file of no layer has no shape".into());
         }
