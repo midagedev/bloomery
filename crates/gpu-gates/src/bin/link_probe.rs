@@ -57,6 +57,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod probe {
+    use bloomery_gpu::host::step::RELEASE;
     use bloomery_gpu::host::{Crossing, RdmaEnd, Reader, link_tail};
     use bloomery_gpu::{Gpu, MappedHost, mem_batch, op_add, op_barrier_sys, op_wait_geq, window};
     use bloomery_gpu_gates::{GateError, verdict};
@@ -80,9 +81,6 @@ mod probe {
     const THREADS: u32 = 256;
     /// Generations the stream runs ahead of the host's bounded wait.
     const AHEAD: usize = 32;
-    /// What a failed run raises a waited counter to: every wait for at least
-    /// one passes and no take back brings it near 0.
-    const RELEASE: u32 = 1 << 30;
 
     #[cuda_module]
     mod link_kernels {

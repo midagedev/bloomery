@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use bloomery_verbs::{Endpoint, Nic, Qp, Region, WC_RDMA_WRITE, Wc, Write};
+use bloomery_verbs::{Endpoint, MAX_CHAIN, Nic, Qp, Region, WC_RDMA_WRITE, Wc, Write};
 
 use super::pump::{Crossing, Half, Move, Reader, Wire};
 use super::{End, Pump, Side};
@@ -27,6 +27,8 @@ struct Rdma {
     /// Posts not yet completed.
     in_flight: usize,
     wc: [Wc; 16],
+    /// One post's writes, with room for the longest chain.
+    writes: Vec<Write>,
 }
 
 impl Wire for Rdma {
@@ -34,23 +36,20 @@ impl Wire for Rdma {
         let (addr, rkey) = self
             .peer
             .ok_or("the link's RDMA end posted before it was connected")?;
-        let writes = moves
-            .iter()
-            .filter(|m| m.len > 0)
-            .map(|m| {
-                Ok(Write {
-                    from: m.from as u64,
-                    to: addr + m.to as u64,
-                    len: u32::try_from(m.len).map_err(|_| format!("a write of {} bytes", m.len))?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        self.writes.clear();
+        for m in moves.iter().filter(|m| m.len > 0) {
+            self.writes.push(Write {
+                from: m.from as u64,
+                to: addr + m.to as u64,
+                len: u32::try_from(m.len).map_err(|_| format!("a write of {} bytes", m.len))?,
+            });
+        }
         // SAFETY: the end holds the region and its page past the queue pair
         // (field order and `End`'s), so every range stays registered and
         // allocated until the queue pair is gone. A posted range is rewritten
         // only by the next generation of its counter, which the other side's
         // take of this one gates: a row has at most one go or done in flight.
-        unsafe { self.qp.post_writes(&self.region, &writes, rkey, 0) }
+        unsafe { self.qp.post_writes(&self.region, &self.writes, rkey, 0) }
             .map_err(|e| format!("the link's RDMA post: {e}"))?;
         self.in_flight += 1;
         Ok(())
@@ -133,6 +132,7 @@ impl RdmaEnd {
             peer: None,
             in_flight: 0,
             wc: [Wc::default(); 16],
+            writes: Vec::with_capacity(MAX_CHAIN),
         };
         Ok(RdmaEnd {
             pump: None,

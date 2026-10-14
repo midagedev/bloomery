@@ -503,8 +503,7 @@ fn roce_v2_gid(v: &Verbs, ctx: *mut Context) -> Option<u8> {
     if unsafe { (v.f.query_port)(ctx, PORT, &mut port) } != 0 || port.state != PORT_ACTIVE {
         return None;
     }
-    let len = u8::try_from(port.gid_tbl_len.clamp(0, 255)).unwrap_or(u8::MAX);
-    (0..len).find(|&i| {
+    gid_indices(port.gid_tbl_len).find(|&i| {
         let mut e = GidEntry {
             gid: Gid::default(),
             gid_index: 0,
@@ -526,6 +525,11 @@ fn roce_v2_gid(v: &Verbs, ctx: *mut Context) -> Option<u8> {
         let ipv4 = e.gid.raw[..10].iter().all(|&b| b == 0) && e.gid.raw[10..12] == [0xff, 0xff];
         rc == 0 && e.gid_type == GID_TYPE_ROCE_V2 && ipv4
     })
+}
+
+/// The indices of a GID table of `len` entries, each one a `u8`.
+fn gid_indices(len: c_int) -> impl Iterator<Item = u8> {
+    (0..=u8::MAX).take(usize::try_from(len).unwrap_or(0))
 }
 
 /// A zeroed `ibv_port_attr`.
@@ -1080,5 +1084,20 @@ fn qp_attr() -> QpAttr {
         alt_port_num: 0,
         alt_timeout: 0,
         rate_limit: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gid_indices;
+
+    #[test]
+    fn a_gid_table_is_searched_to_its_last_index() {
+        assert_eq!(gid_indices(256).last(), Some(255));
+        assert_eq!(gid_indices(256).count(), 256);
+        assert_eq!(gid_indices(300).count(), 256);
+        assert_eq!(gid_indices(1).collect::<Vec<_>>(), [0]);
+        assert_eq!(gid_indices(0).count(), 0);
+        assert_eq!(gid_indices(-1).count(), 0);
     }
 }

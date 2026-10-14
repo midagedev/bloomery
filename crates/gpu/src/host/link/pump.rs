@@ -158,6 +158,8 @@ struct Prog {
 pub(super) struct Half {
     lines: Vec<Line>,
     progs: Vec<Prog>,
+    /// One post's moves, with room at load for the longest post.
+    moves: Vec<Move>,
     /// The first failure by name: a step that was neither 0 nor 1, or a
     /// post the wire refused or lost. It stays, and the end carries nothing
     /// more.
@@ -192,6 +194,13 @@ impl Half {
             ));
         }
         let mut progs: Vec<Prog> = Vec::new();
+        let moves = Vec::with_capacity(
+            crossings
+                .iter()
+                .map(|c| c.spans.len() + 2)
+                .max()
+                .unwrap_or(0),
+        );
         let lines = crossings
             .into_iter()
             .enumerate()
@@ -221,6 +230,7 @@ impl Half {
         let mut h = Half {
             lines,
             progs,
+            moves,
             broken: None,
         };
         for i in 0..h.lines.len() {
@@ -284,16 +294,13 @@ impl Half {
                 return false;
             }
         }
-        let mut moves: Vec<Move> = line
-            .c
-            .spans
-            .iter()
-            .map(|s| Move {
-                from: s.start,
-                to: s.start,
-                len: s.len(),
-            })
-            .collect();
+        let moves = &mut self.moves;
+        moves.clear();
+        moves.extend(line.c.spans.iter().map(|s| Move {
+            from: s.start,
+            to: s.start,
+            len: s.len(),
+        }));
         page.word(line.gen_slot()).store(g, Ordering::Relaxed);
         if let Some(p) = line.prog {
             let p = &mut self.progs[p];
@@ -311,7 +318,7 @@ impl Half {
             to: line.inbox(),
             len: 4,
         });
-        if let Err(e) = wire.post(&moves) {
+        if let Err(e) = wire.post(moves) {
             self.break_with(e);
             return false;
         }
