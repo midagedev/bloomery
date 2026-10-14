@@ -1092,6 +1092,7 @@ while [ "$k" -lt "$cap" ]; do
   k=$((k + 1))
 done
 echo "$s0 $(date +%s) $*" >> "$st/ran.log"
+printf 'pred=%s %s\n' "${BLOOMERY_Q_PRED_S-unset}" "$*" >> "$st/pred.log" # the box queue's prediction this call carried
 [ -z "$peer" ] || [ -n "$met" ] || echo "C $*" >> "$st/seq.log"
 echo "E $*" >> "$st/seq.log"
 # …and whether the hold is still up when it ends (a lane that finished first must not have taken it down).
@@ -2589,6 +2590,20 @@ IG
   want_no_row '  … but every item call carries class 1, hold or none' "$t/fake-state/box.log" '$2 != "true" && $2 !~ /box-manifest/ && $1 !~ /BLOOMERY_V41_CLASS=1( |$)/'
   if [ ! -e "$t/fake-state/hold.log" ] && [ ! -e "$t/target/c-hold-off/gpuhold.pid" ]; then pass '  … no hold call, no heartbeat pid'
   else fail '  … no hold call, no heartbeat pid' "hold.log or gpuhold.pid exists"; fi
+  # A queued call carries the item's times median as BLOOMERY_Q_PRED_S (none: empty); the caller's own value wins;
+  # outside queue mode the batch passes the caller's (here none) through.
+  qpred_case() { # <tag> <want plain-any> <want host> [env…]
+    local tag=$1 wp=$2 wh=$3 rc got
+    shift 3
+    rm -f "$t/fake-state/pred.log"
+    rc=$(export "$@"; steal_case "$tag" "plain-any	B	a6000	10	$d" "plain-any	B	a6000	30	$d" -- plain-any host)
+    got="$(grep -c "^pred=$wp .*gpu-gate.sh other\$" "$t/fake-state/pred.log" 2> /dev/null)/$(grep -c "^pred=$wh .*gate.sh -p x\$" "$t/fake-state/pred.log" 2> /dev/null)"
+    if [ "$rc" = 0 ] && [ "$got" = 1/1 ]; then pass "q-pred: $tag (plain-any '$wp', host '$wh')"
+    else fail "q-pred: $tag (plain-any '$wp', host '$wh')" "rc=$rc got=$got: $(tr '\n' '|' < "$t/fake-state/pred.log" 2> /dev/null)"; fi
+  }
+  qpred_case queued 20 '' BLOOMERY_BOX_QUEUE=1
+  qpred_case caller 99 99 BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_PRED_S=99
+  qpred_case direct '' '' BLOOMERY_BOX_QUEUE=0
   # A batch that is red takes the hold down too (the EXIT trap: every exit).
   rc=$(LFLAG=--ledger steal_case hold-red "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC=1')
   printf '%s' "$rc" > "$t/rc-hold-red"
@@ -4695,7 +4710,10 @@ for i, f in enumerate(recs):
         if esrc == "default":
             defaults.append(stem)
     plan = f"{kind}, {told}"
-    print("\x1f".join([ln, stem, name, env, args, shown, why, plan, str(cost), tkey, label, str(c), tag, sim.get(i, "")]))
+    # The last field is the item's measured expectation for the box queue (BLOOMERY_Q_PRED_S, whole seconds >= 1):
+    # empty at the default.
+    qpred = "" if esrc == "default" else str(max(int(exp), 1))
+    print("\x1f".join([ln, stem, name, env, args, shown, why, plan, str(cost), tkey, label, str(c), tag, sim.get(i, ""), qpred]))
 # The wall. Without a chain it is today's: the longer lane, then the pack. With one, phase 1 is the
 # largest of the chain's own sum (one member at a time batch-wide), the whole work over two cards (a
 # member lands on either), each card's own-only sum, and the chain plus the tail of the pool and
@@ -4753,7 +4771,7 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
   done
   plan_out=$(printf '%s' "$feed" | python3 -c "$PYBAL" "$LANES" "$PACK_BUDGET") || RC=70 die "the lane balance failed (above)"
   i=0 SUM_W=''
-  while IFS=$'\x1f' read -r lane stem name env args item why plan _ tkey tcard cand tag sim; do
+  while IFS=$'\x1f' read -r lane stem name env args item why plan _ tkey tcard cand tag sim qpred; do
     if [ "$lane" = "=" ]; then
       SUM_A=$stem SUM_B=$name SUM_X=$env SUM_C=$args SUM_W=$item SUM_NDEF=$why SUM_DEF=$plan
       continue
@@ -4765,7 +4783,7 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
     P_LANE+=("$lane"); P_STEM+=("$stem"); P_NAME+=("$name"); P_ENV+=("$env"); P_ARGS+=("$args")
     P_ITEM+=("$item"); P_WHY+=("$why"); P_PLAN+=("$plan"); P_TKEY+=("$tkey"); P_TCARD+=("$tcard")
     j=$((${R_C0[$i]} + cand))
-    P_CI+=("$j"); P_KEY+=("${C_KEY[$j]}"); P_LST+=("${C_LST[$j]}"); P_LDET+=("${C_LDET[$j]}"); P_TAG+=("$tag"); P_SIM+=("$sim")
+    P_CI+=("$j"); P_KEY+=("${C_KEY[$j]}"); P_LST+=("${C_LST[$j]}"); P_LDET+=("${C_LDET[$j]}"); P_TAG+=("$tag"); P_SIM+=("$sim"); P_QPRED+=("$qpred")
     i=$((i + 1))
   done <<< "$plan_out"
   [ "$i" = "$N" ] && [ -n "$SUM_W" ] && [ "${#ORDER[@]}" = "$((N - ${#CHAIN_ORDER[@]}))" ] || RC=70 die "the lane balance returned $i of $N items and an order of ${#ORDER[@]}"
@@ -4773,6 +4791,7 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
 ORDER=() # the run order (PYBAL's `O` record): plan indices, each lane's items in the order they run
 P_LANE=() P_STEM=() P_NAME=() P_ENV=() P_ARGS=() P_ITEM=() P_WHY=() P_PLAN=() P_TKEY=() P_TCARD=()
 P_CI=() P_KEY=() P_LST=() P_LDET=() P_TAG=() P_SIM=() # the candidate taken, its key, status, detail, tags, simulated take
+P_QPRED=() # the item's expected seconds from its times rows, for a queued box call's BLOOMERY_Q_PRED_S (empty: no row)
 # P_FAM: a chain member's model family (aligned with CHAIN_ORDER), for the run-time order.
 P_FAM=()
 for ((i = 0; i < ${#CHAIN_ORDER[@]}; i++)); do P_FAM[${CHAIN_ORDER[$i]}]=${CHAIN_FAMS[$i]}; done
@@ -4783,6 +4802,10 @@ box_env_of() { # the item's full BLOOMERY_BOX_ENV: the caller's, then the item's
   local e="${BLOOMERY_BOX_ENV:-}"
   [ -z "${P_ENV[$1]}" ] || e="${e:+$e }${P_ENV[$1]}"
   printf '%s' "$e"
+}
+q_pred_of() { # $1 = plan index: a queued call's BLOOMERY_Q_PRED_S — the caller's when set, else the item's times median (empty: none)
+  if [ -n "${BLOOMERY_Q_PRED_S:-}" ] || [ "${BLOOMERY_BOX_QUEUE:-0}" != 1 ]; then printf '%s' "${BLOOMERY_Q_PRED_S:-}"; return; fi
+  printf '%s' "${P_QPRED[$1]:-}"
 }
 cmd_of() {
   local e; e=$(box_env_of "$1")
@@ -5327,7 +5350,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     rc=0
     t1=$(date +%s)
     rm -rf "$pdir" # the last try's calls ended (a KILLed one leaves its file, and its pid may be reused)
-    BLOOMERY_BOX_PIDDIR="$pdir" BLOOMERY_BOX_ENV="$benv" "${JUST[@]}" "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null &
+    BLOOMERY_Q_PRED_S=$(q_pred_of "$i") BLOOMERY_BOX_PIDDIR="$pdir" BLOOMERY_BOX_ENV="$benv" "${JUST[@]}" "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null &
     [ "$lane" = X ] || echo $! > "$OUT/lane-$lane.child" # the pack's driver owns its children's pids
     wait $! || rc=$?
     ran=$(($(date +%s) - t1))
