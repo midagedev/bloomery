@@ -239,10 +239,12 @@ impl Vocab {
             return Err(Error::UnsupportedModel(model.to_string()));
         }
         // The names `Pre` runs share the rest of the reference's per-name
-        // flags that reach `encode` and `piece`: byte-level encoding, merges
-        // always applied, no BOS unless the file asks for it. (`glm4` keeps
-        // the reference's `clean_spaces`, which only its `llama_detokenize`
-        // reads; `llama_token_to_piece`, what this crate mirrors, does not.)
+        // flags that reach `encode` and `piece`: byte-level encoding, and no
+        // BOS unless the file asks for it. A pre may take a word that is
+        // itself a token whole (`Pre::ignore_merges`); the others always
+        // merge. (`glm4` keeps the reference's `clean_spaces`, which only its
+        // `llama_detokenize` reads; `llama_token_to_piece`, what this crate
+        // mirrors, does not.)
         let pre = m.str("tokenizer.ggml.pre")?.unwrap_or("");
         let Some(pretok) = Pre::of(pre) else {
             return Err(Error::UnsupportedPre(pre.to_string()));

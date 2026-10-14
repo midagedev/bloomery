@@ -1,7 +1,7 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
-//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`), [`Pre::Glm4`] (`glm4`) and
-//! [`Pre::Qwen35`] (`qwen35`).
+//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`), [`Pre::Glm4`] (`glm4`),
+//! [`Pre::Qwen35`] (`qwen35`) and [`Pre::Pixtral`] (`pixtral`).
 //!
 //! ## deepseek-v3
 //!
@@ -72,6 +72,17 @@
 //! regex leaves as qwen2's — takes one as readily as a space or an apostrophe.
 //! [`match_qwen35`] is that regex under ECMAScript semantics, written out by
 //! hand, and [`split_qwen35`] its one pass over the fragment.
+//!
+//! ## pixtral
+//!
+//! The reference maps `pixtral` to its LLAMA3 type. That type's one regex is
+//! the one [`Pre::Glm4`] runs — qwen2's with `\p{N}{1,3}` in place of `\p{N}` —
+//! and it goes to the same hand-written splitter (`unicode_regex_split_custom_llama3`),
+//! so [`split`] uses [`split_custom`] with a run of three numbers, the `glm4`
+//! arm. The reference also sets `ignore_merges` for this name and not for
+//! `glm4`: a pre-tokenizer word whose byte-encoded text is itself a vocabulary
+//! token is that token, and merges do not run on it. [`Pre::ignore_merges`]
+//! carries the flag for any pre, so the two names do not share a variant.
 
 use crate::unicode::collapse;
 
@@ -317,17 +328,21 @@ pub(crate) enum Pre {
     /// `qwen35`: qwen2's regex with `\p{M}` joined to the letter classes,
     /// run as a regex, not a hand-written splitter.
     Qwen35,
+    /// `pixtral`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
+    /// itself a token is taken whole ([`Pre::ignore_merges`]).
+    Pixtral,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 6] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 7] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
         ("qwen2", Pre::Qwen2),
         ("glm4", Pre::Glm4),
         ("qwen35", Pre::Qwen35),
+        ("pixtral", Pre::Pixtral),
     ];
 
     /// The pre-tokenizer `name` stands for; `None` for one this crate does
@@ -340,6 +355,12 @@ impl Pre {
     pub(crate) fn names() -> String {
         let names: Vec<&str> = Pre::NAMES.iter().map(|&(n, _)| n).collect();
         names.join(", ")
+    }
+
+    /// Whether a word that is itself a vocabulary token is taken whole,
+    /// before merges. Any pre can carry it; `pixtral` does.
+    pub(crate) fn ignore_merges(self) -> bool {
+        matches!(self, Pre::Pixtral)
     }
 }
 
@@ -354,7 +375,7 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
             split_custom(cpts, &s.collapsed, 1, &mut s.b);
             &s.b
         }
-        Pre::Glm4 => {
+        Pre::Glm4 | Pre::Pixtral => {
             split_custom(cpts, &s.collapsed, 3, &mut s.b);
             &s.b
         }
@@ -578,6 +599,10 @@ mod tests {
         ];
         for &(text, want) in cases {
             assert_eq!(words(Pre::Glm4, text), want, "{text:?}");
+            // `pixtral` is the same regex and the same splitter. What the
+            // two names do not share is `ignore_merges`, which runs after
+            // this split.
+            assert_eq!(words(Pre::Pixtral, text), want, "pixtral {text:?}");
         }
     }
 

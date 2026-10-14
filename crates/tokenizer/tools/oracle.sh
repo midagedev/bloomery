@@ -35,6 +35,7 @@
 #   qwen3moe  the Qwen3-MoE file                  ik-tokref (the unicode_tolower fix)                  ref-tokenizer-qwen3moe
 #   glm5next  GLM-5.3-Flash's first shard         ik-tokref                                            ref-tokenizer-glm5next
 #   qwen38    Qwen3.8-Flash-Next's first shard    ik-tokref                                            ref-tokenizer-qwen38
+#   nemotron  Nemotron 3 Nano 4B                  llama.cpp-mainline (pixtral; --no-bos, below)        ref-tokenizer-nemotron
 #
 # The sets' directories are `ref-tokenizer-*`, not the `tokenizer*` of the format this script wrote
 # before it wrote a trailer: a checkout that still runs that format's gate rewrites those and cannot
@@ -43,7 +44,7 @@
 # Every vocabulary reads the same texts: the default profile's ik tree and this tree's docs/. `all`
 # takes one snapshot of docs/ per vocabulary, in turn.
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|all
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|all
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -51,16 +52,16 @@ ROOT=$(cd "$HERE/../../.." && pwd)
 CASES=$ROOT/crates/tokenizer/tests/cases.txt
 
 case ${1:-} in
-  v41 | qwen3moe | glm5next | qwen38) [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|all" >&2; exit 64; } ;;
+  v41 | qwen3moe | glm5next | qwen38 | nemotron) [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|all" >&2; exit 64; } ;;
   all)
-    [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|all" >&2; exit 64; }
-    for v in v41 qwen3moe glm5next qwen38; do
+    [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|all" >&2; exit 64; }
+    for v in v41 qwen3moe glm5next qwen38 nemotron; do
       echo "oracle: $v"
       bash "${BASH_SOURCE[0]}" "$v"
     done
     exit 0
     ;;
-  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|all" >&2; exit 64 ;;
+  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|all" >&2; exit 64 ;;
 esac
 VOCAB_NAME=$1
 
@@ -74,8 +75,12 @@ source "$ROOT/tools/ref/ref-paths.sh"
 }
 
 # profile <name>: TOKENIZE (the reference executable), SHARD (the vocabulary file) and SET (the
-# directory under $BLOOMERY_DATA) of one vocabulary.
+# directory under $BLOOMERY_DATA) of one vocabulary. REF_FLAGS holds the flags that make a reference
+# tree's llama-tokenize read the text as ik's does: `--no-bos` where the file would prepend a BOS
+# (the gate compares the text's own ids), `--no-escape` where it would turn a `\n` in the text into
+# a newline.
 profile() {
+  REF_FLAGS=()
   case $1 in
     v41)
       # The V4.1 file set is the deepseek41 profile's choice, exported by tools/box.sh.
@@ -100,13 +105,30 @@ profile() {
       SHARD=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
       SET=ref-tokenizer-qwen38
       ;;
+    nemotron)
+      # ik-tokref knows the pre name and refuses the file: its loader has no
+      # nemotron_h architecture. This tree's binary loads it. The pre is the
+      # same LLAMA3 regex with ignore_merges.
+      TOKENIZE=/home/user/llama.cpp-mainline/build/bin/llama-tokenize
+      SHARD=/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf
+      SET=ref-tokenizer-nemotron
+      # The file sets add_bos_token, so llama-tokenize prepends BOS. The gate's
+      # shared comparison encodes with add_special false (the text's own ids,
+      # which have to decode back to the text), and --no-bos is that call:
+      # tokenize.cpp passes it through as add_special. Mainline's
+      # llama-tokenize also processes escapes in a -f text by default
+      # (tokenize.cpp `params.escape`), so a `\n` in the code corpus would
+      # reach the tokenizer as a newline; --no-escape keeps the text's bytes.
+      REF_FLAGS=(--no-bos --no-escape)
+      ;;
   esac
 }
 profile "$VOCAB_NAME"
 
 [ -x "$TOKENIZE" ] || { echo "oracle: no llama-tokenize at $TOKENIZE" >&2; exit 66; }
 [ -f "$SHARD" ] || { echo "oracle: no vocabulary file at $SHARD" >&2; exit 66; }
-LIBLLAMA=$(ldd "$TOKENIZE" | awk '$1 == "libllama.so" { print $3 }')
+# ik's binaries export libllama.so; the mainline build nemotron uses exports libllama.so.0.
+LIBLLAMA=$(ldd "$TOKENIZE" | awk '$1 == "libllama.so" || $1 == "libllama.so.0" { print $3; exit }')
 [ -f "$LIBLLAMA" ] || { echo "oracle: $TOKENIZE loads no libllama.so (ldd names '$LIBLLAMA')" >&2; exit 66; }
 if [ "$VOCAB_NAME" = v41 ]; then
   # The reference's `~` is a symbol, so `~/` is one word and one id; a tree whose `~` is in neither
@@ -152,7 +174,8 @@ ids() {
 
 # one <text file> <out file> [flag] — llama-tokenize --ids, reshaped to one id per line.
 one() {
-  CUDA_VISIBLE_DEVICES= "$TOKENIZE" -m "$SHARD" -f "$1" --ids --log-disable "${@:3}" > "$2.raw"
+
+  CUDA_VISIBLE_DEVICES= "$TOKENIZE" -m "$SHARD" -f "$1" --ids --log-disable "${REF_FLAGS[@]}" "${@:3}" > "$2.raw"
   tr -d '[] ' < "$2.raw" | tr ',' '\n' | { grep -v '^$' || true; } > "$2"
   rm -f "$2.raw"
 }

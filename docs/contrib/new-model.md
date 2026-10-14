@@ -79,12 +79,16 @@ KV-head loop). A float array with a scalar fallback (GLM's clamps) stays the fam
 
 ### 2. Tokenizer and template
 
-`tokenizer.ggml.pre` must be one of the pre-tokenizers the tokenizer runs (`pretok.rs:324`: `deepseek-v3`, `qwen2`,
-`glm4`, `qwen35` and two aliases); `coverage` asks `runs_pre_tokenizer` (`crates/tokenizer/src/lib.rs:53`) at every plan,
-so an unknown one is a named refusal, not a wrong id. MiMo needed no new tokenizer code: its spec reads `qwen2`,
+`tokenizer.ggml.pre` must be one of the pre-tokenizers the tokenizer runs (`pretok.rs:338`: `deepseek-v3`, `qwen2`,
+`glm4`, `qwen35`, `pixtral` and two aliases); `coverage` asks `runs_pre_tokenizer` (`crates/tokenizer/src/lib.rs:54`) at
+every plan, so an unknown one is a named refusal, not a wrong id. `ignore_merges` is a property of the pre
+(`Pre::ignore_merges`, `pretok.rs:362`): `pixtral` takes a word whose byte-encoded text is itself a vocabulary token,
+and the others merge. MiMo needed no new tokenizer code: its spec reads `qwen2`,
 `ToolFormat::QwenXml` and the `<think>` span (`crates/model/src/arch/mimo2/spec.rs:25,31`). A new tool-call syntax is a
 new `ToolFormat` variant (`models/lib.rs:602`) with its parser in `crates/serve/src/`, tested with the mock engine.
-The oracle for ids is ik's `llama-tokenize` (`crates/tokenizer/tools/oracle.sh`, `tests/tokenizer.rs:243`): B.
+The oracle for ids is ik's `llama-tokenize` (`crates/tokenizer/tools/oracle.sh`, `tests/tokenizer.rs:243`): B. A
+vocabulary ik cannot load reads through mainline's `llama-tokenize`; its profile in `oracle.sh` sets `REF_FLAGS`
+(`--no-escape`: mainline turns a `\n` in a `-f` text into a newline by default; `--no-bos` when the file adds a BOS).
 
 ### 3. Refset family and its reference dump
 

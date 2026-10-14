@@ -9,8 +9,11 @@
 //! rewrites.
 //!
 //! V4.1's set is read by the tree patched so `~` is a symbol
-//! (`/home/user/ik-tilde`); the others by the tree with the tolower fix
-//! (`/home/user/ik-tokref`). A family pins the executable and the library it
+//! (`/home/user/ik-tilde`); Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 by the tree
+//! with the tolower fix (`/home/user/ik-tokref`). Nemotron's file is
+//! `nemotron_h`, which that tree refuses, so its set is read by
+//! `/home/user/llama.cpp-mainline`, whose `pixtral` pre is the LLAMA3 regex
+//! with `ignore_merges`. A family pins the executable and the library it
 //! loads by md5 ([`crate::tokenizer::build_id`]): the tokenizer is the
 //! library's code, the executable only calls it.
 
@@ -33,10 +36,19 @@ pub const TILDE_BUILD: &str = "llama-tokenize d03083b01a24f6a9e5c2190abf7d38c6 \
 
 /// The executable and library of `/home/user/ik-tokref`: the ik-idxkey commit
 /// plus the `unicode_tolower` fix the `(?i:'re)` contractions of the qwen2 and
-/// llama3 regexes need, whose `llama-tokenize` reads the other vocabularies.
+/// llama3 regexes need, whose `llama-tokenize` reads Qwen3-MoE, GLM-5.3-Flash
+/// and Qwen3.8.
 // PIN(2026-10-08): /home/user/ik-tokref's llama-tokenize and libllama.so.
 pub const TOKREF_BUILD: &str = "llama-tokenize 0128e83c5e71e5f2b72f3d5d2c2de6b2 \
                                 libllama.so 1674b0181160aba8599f5750cba1b30d";
+
+/// The executable and library of `/home/user/llama.cpp-mainline`, whose
+/// `llama-tokenize` loads the Nemotron file. ik-tokref does not: it has no
+/// `nemotron_h` architecture. The soname is `libllama.so.0`; the pin's word
+/// is the one [`crate::tokenizer::build_id`] spells.
+// PIN(2026-10-14): /home/user/llama.cpp-mainline's llama-tokenize and libllama.so.0.
+pub const NEMOTRON_BUILD: &str = "llama-tokenize 5df95d3a942effc971ff170432d840fd \
+                                  libllama.so 3575b1f39e7773379fec011d39f32a77";
 
 /// V4.1's set (`deepseek-v3` pre-tokenizer), from the file the tree runs.
 pub static V41: Family = Family {
@@ -94,6 +106,24 @@ pub static QWEN38: Family = Family {
     consumers: &["gate-tokenizer"],
 };
 
+/// The Nemotron 3 Nano 4B file the tokenizer gate loads (`pixtral`).
+pub const NEMOTRON_MODEL: &str =
+    "/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf";
+
+/// Nemotron 3 Nano 4B's set (`pixtral` pre-tokenizer).
+pub static NEMOTRON: Family = Family {
+    name: "tokenizer-nemotron",
+    sets: &["ref-tokenizer-nemotron"],
+    resolve: None,
+    recipe: "just dump-ref-tokenizer nemotron",
+    identity: Identity::Vocabulary,
+    arch: None,
+    build: Some(Build::Is(NEMOTRON_BUILD)),
+    runs: Some(nemotron_model),
+    draft_runs: None,
+    consumers: &["gate-tokenizer"],
+};
+
 /// The Qwen3-MoE vocabulary file: `$BLOOMERY_QWEN3MOE_VOCAB`, else
 /// [`QWEN3MOE_MODEL`]. An empty value counts as unset.
 fn qwen3moe_model() -> Result<String, RefError> {
@@ -111,12 +141,19 @@ fn qwen38_model() -> Result<String, RefError> {
     Ok(super::qwen4exp::MODEL.to_string())
 }
 
+fn nemotron_model() -> Result<String, RefError> {
+    Ok(NEMOTRON_MODEL.to_string())
+}
+
 /// The families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&V41, &QWEN3MOE, &GLM5NEXT, &QWEN38];
+pub static FAMILIES: &[&Family] = &[&V41, &QWEN3MOE, &GLM5NEXT, &QWEN38, &NEMOTRON];
 
 #[cfg(test)]
 mod tests {
-    use super::{ARCH, FAMILIES, GLM5NEXT, QWEN3MOE, QWEN38, TILDE_BUILD, TOKREF_BUILD, V41};
+    use super::{
+        ARCH, FAMILIES, GLM5NEXT, NEMOTRON, NEMOTRON_BUILD, QWEN3MOE, QWEN38, TILDE_BUILD,
+        TOKREF_BUILD, V41,
+    };
     use crate::RefError;
     use crate::family::Family;
     use crate::md5::check_hex;
@@ -153,12 +190,12 @@ mod tests {
         r
     }
 
-    /// The table holds the four vocabularies under one key, each its own row
-    /// with its own set directory and the recipe that writes it; a pin is two
-    /// md5s the reader's `build_id` spells.
+    /// The table holds the vocabularies under one key, each its own row with
+    /// its own set directory and the recipe that writes it; a pin is two md5s
+    /// the reader's `build_id` spells.
     #[test]
-    fn the_four_vocabularies_are_rows_of_the_table() {
-        assert_eq!(crate::arch::families(ARCH).len(), 4);
+    fn the_vocabularies_are_rows_of_the_table() {
+        assert_eq!(crate::arch::families(ARCH).len(), 5);
         for f in FAMILIES {
             assert!(std::ptr::eq(crate::arch::named(f.name).unwrap_or(&V41), *f));
             assert!(
@@ -182,6 +219,7 @@ mod tests {
             (&QWEN3MOE, TOKREF_BUILD),
             (&GLM5NEXT, TOKREF_BUILD),
             (&QWEN38, TOKREF_BUILD),
+            (&NEMOTRON, NEMOTRON_BUILD),
         ] {
             assert!(
                 matches!(f.build, Some(crate::family::Build::Is(p)) if p == pin),
@@ -196,7 +234,8 @@ mod tests {
                 "ref-tokenizer-v41",
                 "ref-tokenizer-qwen3moe",
                 "ref-tokenizer-glm5next",
-                "ref-tokenizer-qwen38"
+                "ref-tokenizer-qwen38",
+                "ref-tokenizer-nemotron",
             ]
         );
     }
@@ -227,7 +266,7 @@ mod tests {
     }
 
     /// A set of another vocabulary's file is stale under every family, though its
-    /// executable and library are the family's: the four files differ.
+    /// executable and library are the family's: the files differ.
     #[test]
     fn a_set_of_another_vocabulary_file_is_stale_under_each_family() -> Result<(), RefError> {
         let files: Vec<String> = FAMILIES

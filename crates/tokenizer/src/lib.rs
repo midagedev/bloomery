@@ -6,7 +6,8 @@
 //! is the reference's pipeline: special tokens are cut out of the text as
 //! whole pieces first (longest text first), each remaining fragment is split
 //! by the pre-tokenizer ([`pretok`]), and each word is merged by BPE rank
-//! ([`bpe`]). Decoding concatenates pieces as `llama_token_to_piece` renders
+//! ([`bpe`]), unless that pre-tokenizer takes a word that is itself a token
+//! whole. Decoding concatenates pieces as `llama_token_to_piece` renders
 //! them; this vocabulary family adds no space prefix, so decoding strips
 //! nothing.
 
@@ -76,7 +77,7 @@ impl Tokenizer {
     /// first shard (the one that carries `tokenizer.ggml.*`).
     pub fn from_gguf(path: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         let vocab = Vocab::load(path.as_ref())?;
-        let bpe = bpe::Bpe::new(&vocab.texts, &vocab.merges);
+        let bpe = bpe::Bpe::new(&vocab.texts, &vocab.merges, vocab.pretok.ignore_merges());
         let specials = vocab.special_order();
         let finders = specials
             .iter()

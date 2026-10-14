@@ -1,8 +1,8 @@
 //! Tokenizer gates: our ids equal the reference's `llama-tokenize` ids, id for
 //! id, and the reference's ids decode back to the source bytes — for each
 //! vocabulary the engine runs: V4.1's (`deepseek-v3` pre-tokenizer),
-//! Qwen3-MoE's (`qwen2`), GLM-5.3-Flash's (`glm4`) and Qwen3.8-Flash-Next's
-//! (`qwen35`).
+//! Qwen3-MoE's (`qwen2`), GLM-5.3-Flash's (`glm4`), Qwen3.8-Flash-Next's
+//! (`qwen35`) and Nemotron 3 Nano 4B's (`pixtral`).
 //!
 //! The reference's sets are written once by `just dump-ref-tokenizer`
 //! (`crates/tokenizer/tools/oracle.sh`) and opened here through their refset
@@ -11,17 +11,19 @@
 //! text that is not the one dumped, or that never finished; the set's cases
 //! must be the ones in `tests/cases.txt`.
 //! Every text is checked in both of the reference's parse modes: special
-//! tokens parsed (its default) and `--no-parse-special`. Neither adds a BOS
-//! for these vocabularies (`tokenizer.ggml.add_bos_token` is false), so there
-//! is nothing to strip before comparing; the round trip decodes with special
-//! tokens rendered, which returns their text, so it is exact for every input
-//! that is valid UTF-8. Invalid input is not: the reference decodes it to
-//! U+FFFD first.
+//! tokens parsed (its default) and `--no-parse-special`. The first four
+//! vocabularies do not add a BOS (`tokenizer.ggml.add_bos_token` is false).
+//! Nemotron's file does, so its set is dumped with `--no-bos`: that is
+//! `llama-tokenize`'s `add_special` false, the call `encode` makes here, and
+//! the ids are the text's own. The round trip decodes with
+//! special tokens rendered, which returns their text, so it is exact for
+//! every input that is valid UTF-8. Invalid input is not: the reference
+//! decodes it to U+FFFD first.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use refset::arch::tokenizer::{GLM5NEXT, QWEN3MOE, QWEN38, V41};
+use refset::arch::tokenizer::{GLM5NEXT, NEMOTRON, QWEN3MOE, QWEN38, V41};
 use refset::family::Family;
 use refset::tokenizer::{Text, TokenizerSet};
 use tokenizer::{Decoder, Tokenizer};
@@ -82,6 +84,17 @@ fn qwen38() -> Vocabulary {
         // `<|endoftext|>` (the bos and pad) are both on the reference's EOT list.
         ambiguous: &["eot"],
         eog: &["<|im_end|>", "<|endoftext|>"],
+    }
+}
+
+/// Nemotron 3 Nano 4B on the box (`pixtral`). No `eot_token_id` key, and
+/// `<|im_end|>` is the only reference EOT name in the vocabulary, so no role
+/// is ambiguous. Generation ends on `</s>` and `<|im_end|>` (the eos).
+fn nemotron() -> Vocabulary {
+    Vocabulary {
+        family: &NEMOTRON,
+        ambiguous: &[],
+        eog: &["</s>", "<|im_end|>"],
     }
 }
 
@@ -324,4 +337,16 @@ fn hw_qwen38_corpus_ids_equal_reference() {
 #[ignore = "needs the qwen38 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_qwen38_cases_equal_reference() {
     cases_equal_reference(&qwen38());
+}
+
+#[test]
+#[ignore = "needs the nemotron vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_nemotron_corpus_ids_equal_reference() {
+    corpus_ids_equal_reference(&nemotron());
+}
+
+#[test]
+#[ignore = "needs the nemotron vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_nemotron_cases_equal_reference() {
+    cases_equal_reference(&nemotron());
 }
