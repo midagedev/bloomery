@@ -266,8 +266,9 @@
 # origin/main: the same recipe, the same args and the same box env, so the same card, and no second
 # build is asked for. Its line gains `main=also-red` (that run's rc is neither 0 nor 75),
 # `main=batch-only` (that run ended 0) or `main=unrun` (no checkout, the tree stayed busy,
-# origin/main has no such recipe, or the run ended 75), placed before `item=` when the item has one. The checkout is one detached worktree,
-# $HOME/.cache/bloomery/gate-batch-main, reused when it is already that commit. The recheck drops
+# the lock file cannot be created, origin/main has no such recipe, or the run ended 75), placed before `item=` when the item has one. The checkout is one detached worktree,
+# $HOME/.cache/bloomery/gate-batch-main, reused when it is already that commit. One lane holds it:
+# an fcntl flock on the file beside that worktree, waited out for one gate bound. The recheck drops
 # the caller's BLOOMERY_REMOTE, so box.sh's remote is that directory's basename: a tree it already
 # holds is not synced, and rsync never sends target/, so the binary already built there is the one
 # the recheck runs. The batch's own rc does not change.
@@ -1018,6 +1019,12 @@ DF
   printf '%s\n' 'something else' 'affected: a..b — 1 changed file' '  gate-x  crates/x/src/lib.rs (+1)' > "$t/aff-other.txt"
   check 'list: any other line above the affected: header is a malformed item' 65 "aff-other.txt:1: malformed item 'something else'" \
     "${gb[@]}" --dry-run --list "$t/aff-other.txt"
+  # The slowest-cases line names three cases in descending duration. An ascending sort would name
+  # the fastest three; four distinct durations make that choice visible.
+  printf '%s\n' $'1\tfast' $'9\tthird' $'40\tfirst' $'12\tsecond' > "$t/slow.tsv"
+  got=$(case_slowest "$t/slow.tsv")
+  if [ "$got" = 'first 40 s, second 12 s, third 9 s' ]; then pass 'slowest: the three longest names, in descending order'
+  else fail 'slowest: the three longest names, in descending order' "got '$got'"; fi
   fi
   # Work stealing (the header's paragraph): real batch runs on the fixture, through a fake box.sh
   # that logs every call and never runs the command, and a key stub that keys an item by its own
@@ -3173,6 +3180,58 @@ EOS
   out=$("${gb[@]}" --dry-run host 2>&1) || fail 'red-main: a dry run without the flag failed' "$out"
   if grep -q 'red-main-check' <<< "$out"; then fail 'red-main: without the flag the dry run says nothing' "$out"
   else pass 'red-main: without the flag the dry run says nothing'; fi
+  # Two acquirers of one lock file. The second must not enter while the first is inside, and a lock
+  # file that cannot be created returns at once rather than waiting out the gate bound.
+  lk=$t/recheck.lk
+  span=$t/lock-span
+  : > "$span"
+  ( main_hold "$lk" || { echo hold-fail >> "$span"; exit 1; }
+    printf 'in\t%s\n' "$(date +%s)" >> "$span"
+    sleep 1
+    printf 'out\t%s\n' "$(date +%s)" >> "$span"
+    main_drop ) &
+  p1=$!
+  ( main_hold "$lk" || { echo hold-fail >> "$span"; exit 1; }
+    printf 'in\t%s\n' "$(date +%s)" >> "$span"
+    printf 'out\t%s\n' "$(date +%s)" >> "$span"
+    main_drop ) &
+  p2=$!
+  rc1=0
+  rc2=0
+  wait "$p1" || rc1=$?
+  wait "$p2" || rc2=$?
+  got=$(awk -F '\t' '{ printf "%s%s", (NR > 1 ? "," : ""), $1 }' "$span")
+  order=$(awk -F '\t' 'NR == 2 { o = $2 } NR == 3 { print ($1 == "in" && $2 >= o ? "ok" : "early") }' "$span")
+  if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] && [ "$got" = 'in,out,in,out' ] && [ "$order" = ok ]; then
+    pass 'lock: two holders are never inside together'
+  else fail 'lock: two holders are never inside together' "rc=$rc1/$rc2 lines=$got order=${order:-none}"; fi
+  echo x > "$t/notadir"
+  mkdir -p "$t/isdir"
+  lock_returns() { # $1 = path that cannot be a lock file. Prints ok:<seconds waited> or why, rc 0 only on a fast refusal.
+    local path=$1 hp k rc=0
+    ( main_hold "$path" ) > /dev/null 2>&1 &
+    hp=$!
+    k=0
+    while kill -0 "$hp" 2> /dev/null && [ "$k" -lt 3 ]; do
+      sleep 1
+      k=$((k + 1))
+    done
+    if kill -0 "$hp" 2> /dev/null; then
+      kill -TERM "$hp" 2> /dev/null || true
+      wait "$hp" 2> /dev/null || true
+      echo "hung:$path"
+      return 1
+    fi
+    wait "$hp" || rc=$?
+    if [ "$rc" = 0 ]; then echo "held:$path"; return 1; fi
+    echo "ok:$k"
+  }
+  a=$(lock_returns "$t/notadir/child.lk" || true)
+  b=$(lock_returns "$t/isdir" || true)
+  case $a/$b in
+    ok:*/ok:*) pass 'lock: a lock file that cannot be created returns at once' ;;
+    *) fail 'lock: a lock file that cannot be created returns at once' "parent=$a path=$b" ;;
+  esac
   fi
   if gb_part 14; then
   # --wait-hold (the header). The fake answers the poll (`lease_guard 0`, a READONLY call) busy for the first FAKE_BUSY_POLLS polls and
@@ -3245,6 +3304,34 @@ EOS
 case_slowest() {
   sort -t$'\t' -k1,1nr "$@" | awk -F '\t' 'NR <= 3 { printf "%s%s %s s", (NR > 1 ? ", " : ""), $2, $1 }'
 }
+
+# One holder of the main tree. The lock is an fcntl exclusive flock on fd 9 (python3's fcntl: the
+# Mac has no flock(1), the same call as tools/mutant-run.sh). It is the open file description's, so
+# it stays held after python3 exits and drops when this process closes the fd. A live holder is
+# waited out for one gate bound; a file that cannot be opened returns at once. Defined here because
+# the self-test calls it, and `--self-test` returns before the later helpers.
+main_hold() {
+  local lk=$1 rc waits=0
+  mkdir -p "$(dirname "$lk")" || return 1
+  exec 9>"$lk" || return 1
+  while :; do
+    rc=0
+    python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(75)' || rc=$?
+    case $rc in
+      0) return 0 ;;
+      75) ;;
+      *) exec 9>&-; return 1 ;;
+    esac
+    [ "$waits" -lt 900 ] || { exec 9>&-; return 1; }
+    sleep 1
+    waits=$((waits + 1))
+  done
+}
+main_drop() { exec 9>&-; }
 
 
 # --self-test: every part in a process of its own, their lines in part order, one summary of the counts. The guards in this
@@ -5390,54 +5477,28 @@ main_root() {
   printf '%s' "$dest"
 }
 
-# One holder of the main tree. $2 is this process's pid (a lane is its own process). A dead holder's
-# lock is removed; a live one is waited out for one gate bound, then the recheck says unrun.
-main_hold() {
-  local lk=$1 token=$2 p waits=0
-  mkdir -p "$(dirname "$lk")"
-  while :; do
-    if mkdir "$lk" 2>/dev/null; then
-      printf '%s\n' "$token" > "$lk/pid"
-      return 0
-    fi
-    p=$(cat "$lk/pid" 2>/dev/null || true)
-    if [ "$p" = "$token" ]; then return 0; fi
-    if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
-      rm -rf "$lk"
-      continue
-    fi
-    [ "$waits" -lt 900 ] || return 1
-    sleep 1
-    waits=$((waits + 1))
-  done
-}
-main_drop() { # $1 = lock dir, $2 = this process's pid: only the holder removes it
-  [ "$(cat "$1/pid" 2>/dev/null || true)" = "$2" ] || return 0
-  rm -rf "$1"
-}
-
 # One run of the red item from origin/main. Prints also-red, batch-only or unrun. The box env is the
-# item's, card included, and nothing here cleans the remote target/.
+# item's, card included, and nothing here cleans the remote target/. main_hold (above) is the one
+# holder of the lock file beside the tree; a hold it cannot take is unrun.
 main_recheck() { # $1 = plan index, $2 = box env, $3 = the item log
-  local i=$1 benv=$2 log=$3 root rc=0 mpid lk argv=()
-  mpid=$(sh -c 'echo $PPID')
+  local i=$1 benv=$2 log=$3 root rc=0 lk argv=()
   if [ -n "${GATE_BATCH_MAIN_TREE:-}" ]; then lk=${GATE_BATCH_MAIN_TREE}.lk
   else lk=$HOME/.cache/bloomery/gate-batch-main.lk; fi
-  if ! main_hold "$lk" "$mpid"; then
+  if ! main_hold "$lk"; then
     echo "=== main recheck: the origin/main tree stayed busy" >> "$log"
     printf unrun
     return 0
   fi
   root=$(main_root 2>> "$log") || {
     echo "=== main recheck: no origin/main checkout" >> "$log"
-    main_drop "$lk" "$mpid"
+    main_drop
     printf unrun
     return 0
   }
   # A recipe this tree does not have is not a red main: just exits 1, and that is not a verdict.
   if ! just --justfile "$root/justfile" --working-directory "$root" --show "${P_NAME[$i]}" > /dev/null 2>> "$log"; then
     echo "=== main recheck: origin/main has no recipe ${P_NAME[$i]}" >> "$log"
-    main_drop "$lk" "$mpid"
+    main_drop
     printf unrun
     return 0
   fi
@@ -5449,7 +5510,7 @@ main_recheck() { # $1 = plan index, $2 = box env, $3 = the item log
   env -u BLOOMERY_REMOTE GATE_BATCH_FROM=main BLOOMERY_BOX_PIDDIR="$OUT/lane-main-$i.box" BLOOMERY_BOX_ENV="$benv" \
     just --justfile "$root/justfile" --working-directory "$root" \
     "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null || rc=$?
-  main_drop "$lk" "$mpid"
+  main_drop
   case $rc in
     0) printf batch-only ;;
     75) printf unrun ;;
