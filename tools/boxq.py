@@ -39,15 +39,11 @@ After POLL_FAILS (3) polls in a row that cannot reach the daemon the client back
 BOXQ_RECONNECT_S seconds (300), resumes each tail at the next byte, and only past that bound exits 84 with
 `boxq: <id> left as it is on the box; resume with: tools/boxq.py attach <id>` and no rc file. A signal during a pause
 is decided as after any poll.
-A re-run of that 84 sets BOXQ_JOB. An id attaches to that job and posts nothing (the submit had landed; only the attach
-dropped). `none` posts one job (the submit never reached the daemon). Unset is an ordinary run, and box.sh does not
-choose between them.
 
   BOXQ_HOST   ssh host (default $BLOOMERY_BOX, else ws)      BOXQ_URL            the daemon (http://127.0.0.1:8030)
   BOXQ_SSH    the ssh command (default ssh)                  BOXQ_POLL_S         poll interval, seconds (5)
   BOXQ_NOTE_S seconds between queue-wait lines (60)          BOXQ_CANCEL_WAIT_S  wait after a cancel (150)
   BOXQ_RECONNECT_S seconds of backoff after those misses (300)
-  BOXQ_JOB    on a re-run of an 84: the id, or none
 
 Exit: the job's rc (run, attach); 0 ok; 64 usage or no such job; 81 lost, or still running after the cancel; 84 the daemon
 is not alive past the reconnect bound, or answers outside the wire; 130/143 a trapped INT/TERM; a daemon refusal exits with the rc it names. 80, 83
@@ -703,27 +699,10 @@ def cmd_list(a):
         print(jid, flush=True)
 
 
-def resumed_job():
-    """BOXQ_JOB on a re-run of an 84: (True, id) to attach, (True, None) for `none` (submit once), or
-    (False, None) when this run is not that re-run."""
-    if "BOXQ_JOB" not in os.environ:
-        return False, None
-    raw = os.environ["BOXQ_JOB"]
-    if raw == "none":
-        return True, None
-    if not NAME_RE.match(raw):
-        raise Refusal(USAGE, "usage", f"BOXQ_JOB is a job id or none, got {raw!r}")
-    return True, raw
-
-
 def cmd_run(a):
     body, q = job_body(a), Queue(os.environ)
     with Trap() as trap:
-        rerun, jid = resumed_job()
-        if not jid:
-            if rerun:
-                say("boxq: job=none: one submit")
-            jid = submit_job(q, body, trap)
+        jid = submit_job(q, body, trap)
         say(f"boxq: {body['name']} is job {jid}")
         return attach_job(q, jid, rc_dir_of(a), trap)
 
@@ -1209,34 +1188,6 @@ def case_reconnect(fx):
     fx.rm_rc()
 
 
-def posts_of(fake):
-    return [r for r in fake.requests if r[:2] == ("POST", "/jobs")]
-
-
-def case_rerun_id(fx):
-    """A re-run of an 84 whose submit landed attaches to that id and posts nothing."""
-    fx.files(b"kept\n", b"")
-    fake = fx.serve([{"status": "done", "rc": 3}])
-    rc, out, err = fx.client(*fx.run_args(), BOXQ_JOB="j1")
-    posts = posts_of(fake)
-    check(rc == 3 and out == b"kept\n" and posts == [] and b"is job j1" in err and fx.rc_file() == "3\n",
-          f"an id attaches to the one job: {rc} {out!r} {err!r} posts={len(posts)} rcfile={fx.rc_file()!r}")
-
-
-def case_rerun_none(fx):
-    """A re-run of an 84 whose submit never landed (job=none) posts exactly one job."""
-    fx.files(b"new\n", b"")
-    fake = fx.serve([{"status": "done", "rc": 0}])
-    rc, out, err = fx.client(*fx.run_args(), BOXQ_JOB="none")
-    posts = posts_of(fake)
-    check(rc == 0 and out == b"new\n" and len(posts) == 1 and b"job=none: one submit" in err
-          and fx.rc_file() == "0\n",
-          f"no id submits one job: {rc} {out!r} {err!r} posts={len(posts)} rcfile={fx.rc_file()!r}")
-    rc, out, err = fx.client(*fx.run_args(), BOXQ_JOB="not an id")
-    check(rc == 64 and b"BOXQ_JOB" in err and len(posts_of(fake)) == 1,
-          f"BOXQ_JOB other than an id or none is a usage error and posts nothing more: {rc} {err!r}")
-
-
 def case_refusal(fx):
     fake = fx.serve([], post=(409, {"error": "a sitting is draining the box", "rc": 75}))
     rc, out, err = fx.client("submit", *JOB_ARGS, "--", "true")
@@ -1627,7 +1578,7 @@ def case_attach_leave(fx):
 
 
 CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_reconnect,
-         case_rerun_id, case_rerun_none, case_refusal,
+         case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
          case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
