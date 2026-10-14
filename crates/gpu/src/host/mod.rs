@@ -642,7 +642,7 @@ impl PassKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Poison {
     /// Input the card should already have refused: the engine is sound, and
-    /// [`HostTier::reset`] lifts it.
+    /// [`HostTier::reset`] lifts it once no tier link end holds a card's waits.
     Refused(Refusal),
     /// The service failed with an error of its own — the protocol's words,
     /// the handoff's shape, the host experts' answer: a broken engine, which
@@ -809,6 +809,29 @@ pub(crate) struct Health {
 }
 
 impl Health {
+    /// A poison no reset lifts, as the error that says so; `None` for a
+    /// refusal whose release left no card waiting.
+    fn unlifted(&self, what: &'static str) -> Option<GpuError> {
+        if let Some(held) = &self.held {
+            return Some(GpuError::protocol(
+                what,
+                format!("{held}; reload the model"),
+            ));
+        }
+        let cause = match &self.poison {
+            Some(Poison::Refused(_)) => return None,
+            Some(p) => p.to_string(),
+            None => "a failure with no cause recorded".to_string(),
+        };
+        Some(GpuError::protocol(
+            what,
+            format!(
+                "the host tier is poisoned ({cause}); a reset lifts only refused input — \
+                 reload the model"
+            ),
+        ))
+    }
+
     /// Count `r` and keep it: a service that `fails` on it poisons the tier,
     /// so its refusal replaces any earlier one; one that returns keeps the
     /// first.
@@ -2263,6 +2286,9 @@ impl<H: HostExperts> HostTier<H> {
     /// attached route trace drops the position the refusal cut short
     /// (`RouteTrace::abandon_position`): its layers were never written.
     ///
+    /// A refusal whose release left a tier card waiting fails before any
+    /// synchronization and requires a reload.
+    ///
     /// A tier poisoned any other way — a failure of its own, a panic in the
     /// host experts — stays poisoned and the call fails by name: only a
     /// reload clears it. On a tier that is not poisoned the call changes
@@ -2281,7 +2307,7 @@ impl<H: HostExperts> HostTier<H> {
         if !self.health.poisoned {
             return self.settle_checks(stream, WHAT);
         }
-        if let Some(e) = self.unlifted(WHAT) {
+        if let Some(e) = self.health.unlifted(WHAT) {
             return Err(e);
         }
         self.lift_words(stream, WHAT)
@@ -2301,7 +2327,7 @@ impl<H: HostExperts> HostTier<H> {
         if !self.health.poisoned {
             return self.settle_checks(stream, WHAT);
         }
-        match self.unlifted(WHAT) {
+        match self.health.unlifted(WHAT) {
             Some(e) => Err(e),
             None => Ok(()),
         }
@@ -2318,7 +2344,7 @@ impl<H: HostExperts> HostTier<H> {
         if !self.health.poisoned {
             return Ok(());
         }
-        if let Some(e) = self.unlifted(WHAT) {
+        if let Some(e) = self.health.unlifted(WHAT) {
             return Err(e);
         }
         self.lift_words(stream, WHAT)
@@ -2365,23 +2391,6 @@ impl<H: HostExperts> HostTier<H> {
             ));
         }
         Ok(())
-    }
-
-    /// A poison no reset lifts, as the error that says so; `None` for a
-    /// refusal, the one a reset can lift.
-    fn unlifted(&self, what: &'static str) -> Option<GpuError> {
-        let cause = match &self.health.poison {
-            Some(Poison::Refused(_)) => return None,
-            Some(p) => p.to_string(),
-            None => "a failure with no cause recorded".to_string(),
-        };
-        Some(GpuError::protocol(
-            what,
-            format!(
-                "the host tier is poisoned ({cause}); a reset lifts only refused input — \
-                 reload the model"
-            ),
-        ))
     }
 
     /// The refusal lift itself ([`HostTier::reset`]'s protocol): the stream
@@ -3140,6 +3149,35 @@ mod tests {
     };
     use crate::GpuError;
     use std::time::Duration;
+
+    #[test]
+    fn a_refused_tier_with_held_waits_cannot_lift_without_a_machine() {
+        let mut health = super::Health {
+            poisoned: true,
+            poison: Some(super::Poison::Refused(super::Refusal {
+                what: "Hybrid::serve",
+                layer: 3,
+                detail: "planted refusal".into(),
+            })),
+            held: Some("the stage end left its done counter waiting".into()),
+            ..Default::default()
+        };
+        for what in ["Hybrid::reset", "Hybrid::settle", "Hybrid::lift_refusal"] {
+            let error = health.unlifted(what).expect("held waits need a reload");
+            assert!(matches!(
+                error,
+                GpuError::Protocol {
+                    what: entry,
+                    ref detail,
+                } if entry == what
+                        && detail == "the stage end left its done counter waiting; reload the model"
+            ));
+        }
+        assert!(health.poisoned);
+        assert!(matches!(health.poison, Some(super::Poison::Refused(_))));
+        health.held = None;
+        assert!(health.unlifted("Hybrid::reset").is_none());
+    }
 
     /// A drain's wait reads as drained, late past its deadline, the process's
     /// exit when the driver was deinitialized under it (a drop's no-leak
