@@ -907,29 +907,24 @@ mod gate {
         let mut t = tok.clone();
         t.dt[0] = f32::NEG_INFINITY;
         plants.push(("-inf dt", t, 0));
-        for (label, t, g) in plants {
-            let got = run(&mut dev, &t)?;
+        let check = |label: &str, y: &[f32], g: usize| -> Result<bool, GateError> {
             let f = cx.gpu.take_fault()?;
-            let all_bad = group(&got.y[0], g).iter().all(|v| !v.is_finite());
-            let mut others = true;
-            for o in (0..GROUPS).filter(|&o| o != g) {
-                others &= bits_equal(group(&got.y[0], o), group(&base.y[0], o));
-            }
+            let all_bad = group(y, g).iter().all(|v| !v.is_finite());
+            let others = (0..GROUPS)
+                .filter(|&o| o != g)
+                .all(|o| bits_equal(group(y, o), group(&base.y[0], o)));
             let pass = f == want && all_bad && others;
-            let shown = f.map_or("none".to_owned(), |f| {
-                format!(
-                    "layer {} {}",
-                    f.layer,
-                    f.site().map_or("?", FaultSite::name)
-                )
-            });
+            let shown = f.map_or("none".to_owned(), |f| f.to_string());
             println!(
-                "fault {label}: raised {shown} (want layer {LAYER} {}), group {g} non-finite \
-                 {all_bad}, other groups the clean bits {others} {}",
-                FaultSite::Mamba2Scan.name(),
+                "fault {label}: raised {shown}, group {g} non-finite {all_bad}, other groups \
+                 unchanged {others} {}",
                 verdict(pass)
             );
-            ok &= pass;
+            Ok(pass)
+        };
+        for (label, t, g) in plants {
+            let got = run(&mut dev, &t)?;
+            ok &= check(label, &got.y[0], g)?;
         }
         // −∞ A on head 0, the weight buffer. Restored after the plant.
         let mut a = w.a.clone();
@@ -937,27 +932,7 @@ mod gate {
         dev.a.copy_from_host(cx.gpu.stream(), &a)?;
         let got = run(&mut dev, &tok)?;
         dev.a.copy_from_host(cx.gpu.stream(), &w.a)?;
-        let f = cx.gpu.take_fault()?;
-        let all_bad = group(&got.y[0], 0).iter().all(|v| !v.is_finite());
-        let mut others = true;
-        for o in 1..GROUPS {
-            others &= bits_equal(group(&got.y[0], o), group(&base.y[0], o));
-        }
-        let pass = f == want && all_bad && others;
-        let shown = f.map_or("none".to_owned(), |f| {
-            format!(
-                "layer {} {}",
-                f.layer,
-                f.site().map_or("?", FaultSite::name)
-            )
-        });
-        println!(
-            "fault -inf A: raised {shown} (want layer {LAYER} {}), group 0 non-finite \
-             {all_bad}, other groups the clean bits {others} {}",
-            FaultSite::Mamba2Scan.name(),
-            verdict(pass)
-        );
-        ok &= pass;
+        ok &= check("-inf A", &got.y[0], 0)?;
         Ok(ok)
     }
 
