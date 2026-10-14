@@ -169,7 +169,7 @@ margin. With no measured gain past 2, the model gives it no workload term.
 1. **Where.** ~~A placed qwen35moe load runs every prompt as passes of at most 8 rows through the host tier's batch
    port, whatever its length.~~ A placed qwen35moe load now walks a prompt in units of `PLACED_ROWS` = 512 rows on
    the wide arm, each unit reading a host expert once (`crates/gpu/src/arch/qwen3moe/body35.rs` `placed_open`,
-   `placed.rs`). Eight-row passes remain only under `--prefill pass` and for a prompt of at most 8 ids. The
+   `placed.rs`). `--prefill pass` uses passes of at most 8 ids; `auto` also uses a pass for a prompt or final tail of at most 8 ids. The
    decomposition below prices the old 8-row walk; for units of 512 the host union's compute is the wall, and
    `docs/cards/q35pfa.card` derives 325–510 tok/s at the 3060 shape, unmeasured there.
 2. **Fact.** The prompt length P (request) and the lane's copy rate (the load's probe), priced by
