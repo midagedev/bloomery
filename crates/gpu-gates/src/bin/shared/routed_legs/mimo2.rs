@@ -1,46 +1,35 @@
-//! mimo2 (MiMo-V2.6-Flash): the `--place`-unset production defaults that plan
+//! mimo2 (MiMo-V2.6-Flash): the `--place`-unset production default that plans
 //! a mimo2 file. MiMo ships one binary, the serve seat of `bloomery-serve`
-//! (`serve_seats/mimo2.rs`): no `generate_*` binary opens it, so both arms
-//! are the seat's. The first is its default: two slots (`--parallel` unset),
-//! the second kept only while the plan takes it (`default_slots_fit`). The
-//! second is the one-sequence server (`--parallel 1`), which is also the
-//! slot count the first falls to. Each plans as the seat does: the context
-//! its search answers (`placement::ctx::searched` over the trained context
-//! at the seat's floor and grid, a slot holding ⌊total / slots⌋) and the plan
-//! at a slot's share (`PlanInputs::plan_with_slots`).
+//! (`serve_seats/mimo2.rs`): no `generate_*` binary opens it, so the one arm
+//! is the seat's. It plans as the seat does: one default slot
+//! (`ctx_ask::DEFAULT_SLOTS`) at the context `generate::choose_ctx` takes
+//! (the seats' ladder; a host short is `PlaceError::NoNvmeTier`) and the plan
+//! at that slot context (`PlanInputs::plan_with_slots`).
 //!
 //! The machine is the one card `a` names on a workstation whose largest card
 //! is the A6000 (`workstation::plan_on` over `A6000`, which is what the
 //! seat's `Place::A.machine` builds there; the body serves no tier card). The
 //! 3090's usable bytes would plan no MiMo expert on the card: the trunk's
-//! floor (25,338,839,040 B, the same at every set and arm) leaves 11 MiB of
-//! them, less than any layer's first expert, so every plan there places 0 of
-//! the routed layers and no check could read a carded layer. The forced rooms
-//! go through the same call at the arm's slot context and slots.
+//! floor (25,338,839,040 B) leaves 11 MiB of them, less than any layer's
+//! first expert, so every plan there places 0 of the routed layers and no
+//! check could read a carded layer. The forced rooms go through the same
+//! call at the arm's slot context and slots.
 //!
 //! The loader's plan-time stack table (`bloomery_gpu_mimo2::swap::stacks`,
 //! L6) is asked of every plan: it reads the header alone.
 
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use super::{Adapter, Arm, Outcome, Refusal, probed, refused_of, view_of};
-use bloomery_gpu_gates::bind::{SlotsFrom, default_slots_fit};
-use bloomery_gpu_gates::generate::{CTX_GRAN, trained_ctx};
+use super::{Adapter, Arm, Outcome, Refusal, outcome_of, probed, refused_of, view_of};
+use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::generate::choose_ctx;
 use bloomery_gpu_mimo2::swap;
 use gguf::Split;
 use model::arch::mimo2::place::{PlaceError, PlanInputs};
-use model::placement::slots::split_ctx;
+use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{A6000, plan_on};
 use model::placement::{Machine, Plan, PlanLevers};
-
-/// The floor of the seat's searched default context
-/// (`serve_seats/mimo2.rs`'s `CTX`).
-const CTX: usize = 4096;
-
-/// The slots a seat with no `--parallel` and no `--ctx` serves
-/// (`serve_seats/mimo2.rs`'s `SLOTS`).
-const SLOTS: usize = 2;
 
 /// The loader table L6 asks.
 const LOADER: &str = "mimo2::swap::stacks";
@@ -55,16 +44,8 @@ impl Adapter for Row {
 
     fn arms(&self, split: &Split) -> Vec<Result<Arm, Outcome>> {
         match PlanInputs::read(split).map_err(|e| refused_of(&e)) {
-            Ok(inputs) => {
-                let inputs = Arc::new(inputs);
-                let trained = trained_ctx(split);
-                vec![
-                    arm(&inputs, trained, ("serve", SLOTS), SlotsFrom::Default),
-                    arm(&inputs, trained, ("serve1", 1), SlotsFrom::Flag),
-                ]
-            }
-            // The file is read once; a refusal of it is each arm's.
-            Err(refusal) => vec![Err(refusal.clone()), Err(refusal)],
+            Ok(inputs) => vec![arm(&Arc::new(inputs), split)],
+            Err(refusal) => vec![Err(refusal)],
         }
     }
 
@@ -73,72 +54,36 @@ impl Adapter for Row {
     }
 }
 
-/// One arm of the seat: `slots` sequences asked for as `from` says (a
-/// default count falls to one when its plan is refused, a flag's never).
-fn arm(
-    inputs: &Arc<PlanInputs>,
-    trained: Option<usize>,
-    (name, slots): (&'static str, usize),
-    from: SlotsFrom,
-) -> Result<Arm, Outcome> {
+/// The seat's arm: the default slot at the context its unset `--ctx` takes.
+fn arm(inputs: &Arc<PlanInputs>, split: &Split) -> Result<Arm, Outcome> {
     let machine = plan_on(A6000, inputs.model.layers);
-    let (slot_ctx, slots, _) = default_slots_fit("gate_routed_legs", "a", slots, from, |slots| {
-        let n = NonZeroUsize::new(slots)
-            .ok_or_else(|| Outcome::Red("--parallel 0: the server serves no slot".to_owned()))?;
-        let total = total_ctx(trained, inputs, &machine, n)?;
-        let slot_ctx = slot_ctx_of(total, slots)?;
-        // The seat plans here and keeps the plan; a refusal falls to one
-        // slot or stands.
-        plan_of(inputs, &machine, slot_ctx, &PlanLevers::default(), n).map(|_| slot_ctx)
-    })?;
-    let n = NonZeroUsize::new(slots).expect("the slot fit kept a count of at least one");
-    let unbudgeted = planned(inputs, &machine, slot_ctx, &PlanLevers::default(), n);
+    let n = NonZeroUsize::new(DEFAULT_SLOTS).expect("the default serves a slot");
+    let chosen = choose_ctx(split, (None, DEFAULT_SLOTS), (None, None), |c| {
+        probed();
+        probe_of(inputs.plan_with_slots(&machine, c, &PlanLevers::default(), n))
+    })
+    .map_err(|e| place_gate(&e))?;
+    let ctx = chosen.slot_ctx;
+    let unbudgeted = planned(inputs, &machine, ctx, &PlanLevers::default(), n);
     let inputs = Arc::clone(inputs);
     Ok(Arm {
-        name,
+        name: "serve",
         whole: false,
         unbudgeted: Some(unbudgeted),
-        placed: Box::new(move |levers| planned(&inputs, &machine, slot_ctx, levers, n)),
+        placed: Box::new(move |levers| planned(&inputs, &machine, ctx, levers, n)),
     })
 }
 
-/// The seat's total context (`ctx_of` with `--ctx` unset): the file's
-/// trained context capped to the largest on the [`CTX_GRAN`] grid whose
-/// plan stands for every slot at its share, the floor [`CTX`] where the file
-/// states none or nothing fits.
-fn total_ctx(
-    trained: Option<usize>,
-    inputs: &PlanInputs,
-    machine: &Machine,
-    slots: NonZeroUsize,
-) -> Result<usize, Outcome> {
-    let fits = |c: usize| -> Result<bool, Outcome> {
-        probed();
-        let share = slot_ctx_of(c, slots.get()).ok();
-        Ok(share
-            .is_some_and(|s| plan_of(inputs, machine, s, &PlanLevers::default(), slots).is_ok()))
-    };
-    Ok(model::placement::ctx::searched(trained, CTX, CTX_GRAN, &fits)?.unwrap_or(CTX))
-}
-
-/// A slot's positions when `slots` slots split `total`: ⌊total / slots⌋
-/// (`placement::slots::split_ctx`, llama-server's `-np N` without `-kvu`).
-fn slot_ctx_of(total: usize, slots: usize) -> Result<usize, Outcome> {
-    let share = split_ctx(total as u64, slots as u64, NonZeroU64::MIN)
-        .map_err(|e| Outcome::Red(format!("--ctx {total} over {slots} slots: {e}")))?;
-    usize::try_from(share).map_err(|e| Outcome::Red(format!("a slot's {share} positions: {e}")))
-}
-
 /// The plan `levers` ask of `inputs` on `machine` for `slots` sequences of
-/// `slot_ctx` positions each, with the loader table's answer on its header.
+/// `ctx` positions, with the loader table's answer on its header.
 fn planned(
     inputs: &PlanInputs,
     machine: &Machine,
-    slot_ctx: usize,
+    ctx: u64,
     levers: &PlanLevers,
     slots: NonZeroUsize,
 ) -> Outcome {
-    match plan_of(inputs, machine, slot_ctx, levers, slots) {
+    match plan_of(inputs, machine, ctx, levers, slots) {
         Ok(plan) => Outcome::Plan(view_of(&plan).with_loader(swap::stacks(inputs).map(drop))),
         Err(outcome) => outcome,
     }
@@ -148,15 +93,26 @@ fn planned(
 fn plan_of<'a>(
     inputs: &'a PlanInputs,
     machine: &'a Machine,
-    slot_ctx: usize,
+    ctx: u64,
     levers: &PlanLevers,
     slots: NonZeroUsize,
 ) -> Result<Plan<'a>, Outcome> {
-    let ctx = u64::try_from(slot_ctx)
-        .map_err(|e| Outcome::Red(format!("a slot's context {slot_ctx}: {e}")))?;
     inputs
         .plan_with_slots(machine, ctx, levers, slots)
         .map_err(|e| place_of(&e))
+}
+
+/// A `choose_ctx` error as an outcome: the family's plan refusal keeps its
+/// name ([`place_of`]); anything else is the gate's common reading.
+fn place_gate(e: &GateError) -> Outcome {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
+    while let Some(c) = cur {
+        if let Some(p) = c.downcast_ref::<PlaceError>() {
+            return place_of(p);
+        }
+        cur = c.source();
+    }
+    outcome_of(e.as_ref())
 }
 
 /// A plan refusal as an outcome: the placement's own are named by

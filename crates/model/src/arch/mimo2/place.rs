@@ -198,10 +198,9 @@ impl PlanInputs {
 
     /// The same inputs at an unbounded host room (`HostRead::Given` of every
     /// byte, no arena): the plan they make pages no expert to the NVMe tier,
-    /// so what it holds on the card is the card's alone. The card probe of
-    /// the default context's search; a machine whose card shares the host's
-    /// memory has no such plan, and the ladder
-    /// ([`placement::ctx::Veto::Ladder`]) does not ask this one.
+    /// so what it holds on the card is the card's alone. A machine whose
+    /// card shares the host's memory has no such plan: the pool is the
+    /// card's room.
     #[must_use]
     pub fn room_free(&self) -> PlanInputs {
         PlanInputs {

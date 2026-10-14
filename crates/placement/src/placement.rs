@@ -4969,11 +4969,11 @@ mod tests {
         }
     }
 
-    /// The whole-fit search over contexts stops where the program's arena
-    /// does: the verdict's `fits` falls as the context grows, so the grid
-    /// search ([`ctx::searched`]) over it lands on the last context the
-    /// arena and its reserve leave room for. A card whose reading is under
-    /// the arena alone — `1_151_139_840` B free against the `1_642_419_556` B
+    /// The whole-fit verdict stops where the program's arena does: `fits`
+    /// falls as the context grows, so a grid from the floor up to the
+    /// trained context lands on the last context the arena and its reserve
+    /// leave room for. A card whose reading is under the arena alone —
+    /// `1_151_139_840` B free against the `1_642_419_556` B
     /// arena a Qwen3.6 whole load refused on a 3090 (the gate census's
     /// reading and the arena check's message) — holds no context: the
     /// search says so, and the caller takes the placed plan. The same
@@ -5005,8 +5005,30 @@ mod tests {
                 };
                 whole_need(&model, &card, kv, load).expect("every tensor has a format")
             };
-            let fits = |c: usize| Ok::<_, std::convert::Infallible>(at(c as u64 * KV_ROW).fits());
-            ctx::searched(Some(TRAINED), FLOOR, GRAN, &fits).expect("infallible")
+            let fits = |c: usize| at(c as u64 * KV_ROW).fits();
+            // The grid the seats used to search: nothing under the floor,
+            // else the largest `floor + k·gran` at or under the trained
+            // context that still fits.
+            if !fits(FLOOR) {
+                return None;
+            }
+            if fits(TRAINED) {
+                return Some(TRAINED);
+            }
+            let mut lo = FLOOR;
+            let mut hi = TRAINED;
+            while hi - lo > GRAN {
+                let mid = lo + (hi - lo) / 2 / GRAN * GRAN;
+                if mid == lo {
+                    break;
+                }
+                if fits(mid) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            Some(lo)
         };
         let weights = 9 * 4096;
         let rest = weights + workstation::CONTEXT + workstation::SCRATCH + RESERVE;

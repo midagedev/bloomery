@@ -7,19 +7,15 @@
 //! A6000 first, so a term restated wrong fails here before any large-card
 //! figure is read.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use bloomery_levers::{Residency38Pick, Residency38Why, UnhostedPool, residency38_at_plan};
 use gguf::GgmlType;
 
 use super::churn::ChurnPool;
-use super::ctx::{CtxError, NVME_SLACK_DIV, RULE_FIT, RULE_MARGIN, within_cache};
 use super::workstation::{
     A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
     HostRead, MARGIN, MIB, PLAN_ROOM, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
-    TIER_BATCH_RESERVE, census_usable, gb10, host, host_of, plan_room, resolve,
-    tier_batch_host_bytes, tier_batch_staging_bytes, unified_of,
+    TIER_BATCH_RESERVE, census_usable, host, host_of, plan_room, resolve,
+    tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use super::{
     ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, Device, KvBytes, Machine,
@@ -706,14 +702,14 @@ fn two_slots_at_4096_hold_every_routed_expert() {
     assert_eq!((bytes, n_l, host), (Q4_ROUTED, vec![EXPERTS; LAYERS], 0));
 }
 
-/// The seat's default context on one such card, two sequences and no
-/// draft: 252,416 positions a slot, the last step of 256 whose plan holds
-/// at most the plan's margin fewer card expert bytes than the plan at
-/// 4,096 ([`two_slots_at_4096_hold_every_routed_expert`]: every routed
-/// byte), the next step past it. There 504 or 505 experts a layer stay on
-/// the card and 337 go to the host.
+/// 252,416 positions a slot on one such card, two sequences and no draft,
+/// is the last step of 256 whose plan holds at most the plan's margin fewer
+/// card expert bytes than the plan at 4,096
+/// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
+/// next step passes it. There 504 or 505 experts a layer stay on the card
+/// and 337 go to the host. The seat no longer searches for this context.
 #[test]
-fn two_slots_default_context_is_252416() {
+fn two_slots_at_252416_stay_within_the_margin() {
     let (at, n_l, host) = two_slots(252_416);
     assert!(Q4_ROUTED - at <= MARGIN);
     let (next, _, _) = two_slots(252_416 + 256);
@@ -1090,9 +1086,9 @@ fn a_given_room_plans_as_given() {
     assert_eq!(format!("{at:?}"), format!("{direct:?}"));
 }
 
-/// An unpaged plan keeps the drift margin too. The default context grows
-/// while no expert goes to the NVMe tier ([`super::ctx::default_slot_ctx`]),
-/// so a plan made at the reading itself ends with its need at the reading,
+/// An unpaged plan keeps the drift margin too. A deeper context grows while
+/// no expert goes to the NVMe tier, so a plan made at the reading itself
+/// ends with its need at the reading,
 /// and a load whose reading fell by a little less than the margin is
 /// refused with no arena to shrink. A plan made at [`plan_room`] of the
 /// reading pages the context whose need passes the margin, which stops the
@@ -1743,333 +1739,5 @@ fn the_host_room_lever_reads_bytes_or_is_refused_by_name() {
             e.contains("BLOOMERY_HOST_ROOM") && e.contains("UTF-8"),
             "{e}"
         );
-    }
-}
-
-/// The slots the Qwen3.8 seat's default load serves.
-const SPARK_SLOTS: u64 = 2;
-
-/// The checkpoints a load pins on the host, one `HOST_BUDGET` of
-/// `runtime::seqstate` a slot (`residency38::reserve_checkpoints`).
-const SPARK_CHECKPOINTS: u64 = SPARK_SLOTS * (4 << 30);
-
-/// The prompt cache's cap (`bind::CACHE_RAM_CAP`, llama-server's
-/// `--cache-ram` default) and the seat's context step (`CTX_STEP`).
-const CACHE_CAP: u64 = 8192 << 20;
-const CTX_STEP: usize = 256;
-
-/// The default context before the cache's bound, the file's serving cap
-/// (`serve_ctx`): what the seat's margin rule gives on a pool that holds it.
-const SPARK_FROM: usize = 262_144;
-
-/// A DGX Spark's GB10 as the census reads it (an integrated device whose
-/// free bytes are the pool): one stage card beside the pool, the host with
-/// no OS reserve and the checkpoints the seat's load pins.
-fn spark(free: u64) -> Machine {
-    let spec = gb10(free);
-    let mut m = machine_a(spec);
-    *m.host_mut() = host_of(&spec);
-    *m.unified_mut() = unified_of(&spec);
-    m.host_mut()
-        .reserves
-        .push(("checkpoints".to_string(), SPARK_CHECKPOINTS));
-    m
-}
-
-/// The Qwen3.8 seat's drafted plan on `spark(..)` at `ctx` positions a slot
-/// for [`SPARK_SLOTS`] sequences, the card rule's, the draft's card bytes
-/// (`fixed` and its two slots' stores, 2,048 B a position each) reserved
-/// beside the sequences' own bytes as `plan_mtp_with_slots` does, then the
-/// PLE table's tier by `room` and the NVMe expert tier. `floor` the
-/// prompt cache's floor on the table's tier: off is the rule before the
-/// floor.
-fn spark_plan<'a>(
-    model: &'a ModelTensors,
-    machine: &'a Machine,
-    ctx: u64,
-    room: u64,
-    fixed: u64,
-    floor: bool,
-) -> Plan<'a> {
-    let terms = SeqTerms {
-        layers: Stores {
-            kv: &Kv38,
-            count: LAYERS,
-        },
-        draft: None,
-        beside: BESIDE,
-    };
-    let rows = terms.plan_beside(SPARK_SLOTS);
-    let kv = terms.slots_of(SPARK_SLOTS);
-    let draft = fixed + SPARK_SLOTS * 2048 * ctx;
-    let mut plan = plan_routed_reserving(
-        model,
-        machine,
-        ctx,
-        &kv,
-        &PlanLevers::default(),
-        routed_rule(Program::Qwen38Body),
-        rows + draft,
-    )
-    .expect("a Spark plan");
-    let floor = if floor { 2 * state38(ctx, true) } else { 0 };
-    super::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED).expect("the PLE table's tier");
-    super::expert_nvme_tier(&mut plan, room, None).expect("the NVMe expert tier");
-    plan.cards[0].grow_kv(rows);
-    let broken = plan.violations();
-    assert!(broken.is_empty(), "ctx {ctx}: {broken:?}");
-    plan
-}
-
-/// The seat's default context on a DGX Spark with no flag, both files, each
-/// at its own host reading (the census's free bytes, `MemAvailable`): the
-/// first rung of the halving ladder from the serving cap down to the base
-/// whose sequence state the prompt cache's default budget holds, the budget
-/// read from the host need at the rung bounded ([`within_cache`]) and the PLE
-/// table on the host only where it fits beside two saved states
-/// ([`super::row_table_tier`]).
-///
-/// A unified pool counts the positions' bytes in the need (60,928 B a
-/// position across two slots, the draft's included), so a need read once at
-/// the untrimmed 262,144 gives a budget the bounded context does not have:
-/// the same chain with the budget read once there is the order the seat had,
-/// which the test also runs (UD-Q3 16,384, UD-Q4 131,072: the smaller file
-/// the smaller context). Read at the rung bounded, UD-Q4 serves 131,072;
-/// UD-Q3 keeps its table on the NVMe tier, where the whole serving cap
-/// holds its state.
-///
-/// PIN(2026-10-12): the bound is the halving ladder, not the largest context
-/// that holds. UD-Q3's budget read once answered 18,176 and answers 16,384;
-/// UD-Q4's answered 134,400 and answers 131,072, and read at the context
-/// bounded 198,144 and now 131,072 (its need 112,495,484,208 B and budget
-/// 6,308,004,200 B there are now 108,408,921,392 B and 8,351,285,608 B).
-///
-/// The draft's fixed card bytes are the term that closes each file's need at
-/// 262,144 [derived: the need less every other term]; UD-Q3's is 68,736 B
-/// more, the draft borrowing the target's output matrix.
-#[test]
-fn a_spark_defaults_to_the_context_its_prompt_cache_holds() {
-    struct File {
-        q3: bool,
-        free: u64,
-        room: u64,
-        fixed: u64,
-        old: (usize, u64, u64),
-        new: (usize, u64, u64, Device),
-    }
-    let files = [
-        File {
-            q3: true,
-            free: 125_309_718_528,
-            room: 125_124_673_536,
-            fixed: 2_839_606_572,
-            old: (16_384, 123_483_268_528, 820_702_504),
-            new: (262_144, 95_220_001_200, CACHE_CAP, Device::Nvme),
-        },
-        File {
-            q3: false,
-            free: 125_394_333_696,
-            room: 125_111_492_608,
-            fixed: 2_839_537_836,
-            old: (131_072, 116_394_876_208, 4_358_308_200),
-            new: (131_072, 108_408_921_392, 8_351_285_608, Device::Nvme),
-        },
-    ];
-    for f in files {
-        let model = model(f.q3);
-        let m = spark(f.free);
-        // A plan is the test's cost: each context is planned once, its need
-        // and its table's tier kept.
-        let seen = RefCell::new(HashMap::new());
-        let plan = |ctx: usize, floor: bool| {
-            *seen.borrow_mut().entry((ctx, floor)).or_insert_with(|| {
-                let p = spark_plan(&model, &m, ctx as u64, f.room, f.fixed, floor);
-                (HostNeed::of(&p, 0).bytes(), p.row_tier().expect("one tier"))
-            })
-        };
-        let need = |ctx: usize, floor: bool| plan(ctx, floor).0;
-        let state = |n: usize| state38(n as u64, true);
-        let entry = state(1);
-        // `CacheRam::default_of` and `CacheRam::holding`, restated.
-        let ram_of = |need: u64| {
-            let left = i128::from(f.room) - i128::from(need);
-            let ram = if left / 2 <= 0 {
-                0
-            } else {
-                u64::try_from(left / 2).map_or(CACHE_CAP, |h| h.min(CACHE_CAP))
-            };
-            if ram != 0 && ram < entry { 0 } else { ram }
-        };
-
-        // Before: the need and the budget read once at the untrimmed context.
-        let (ctx, old_need, ram) = f.old;
-        let held = if f.q3 { Device::Host } else { Device::Nvme };
-        assert_eq!(
-            plan(SPARK_FROM, false),
-            (old_need, Some(held)),
-            "q3 {}",
-            f.q3
-        );
-        assert_eq!(ram_of(old_need), ram, "q3 {}", f.q3);
-        let once = |_: usize| Ok::<_, CtxError>(ram);
-        let got = within_cache(SPARK_FROM, SEAT_CTX, CTX_STEP, &state, &once)
-            .expect("a context")
-            .ctx;
-        assert_eq!(
-            got, ctx,
-            "q3 {}: the budget read once at {SPARK_FROM}",
-            f.q3
-        );
-
-        // After: both read at the context bounded, the table beside the floor.
-        let (ctx, new_need, ram, table) = f.new;
-        let at = |n: usize| Ok::<_, CtxError>(ram_of(need(n, true)));
-        let got = within_cache(SPARK_FROM, SEAT_CTX, CTX_STEP, &state, &at)
-            .expect("a context")
-            .ctx;
-        assert_eq!(got, ctx, "q3 {}", f.q3);
-        let (served, tier) = plan(ctx, true);
-        assert_eq!(
-            (served, ram_of(served), tier),
-            (new_need, ram, Some(table)),
-            "q3 {}",
-            f.q3
-        );
-        assert!(state(ctx) <= ram, "q3 {}: the state holds the budget", f.q3);
-    }
-}
-
-/// A 12 GB card: 12,288 MiB beside a driver reserve of 774 MiB [assumed: the
-/// reserve at which this file's plan reproduces a 3060 12 GB host's ctx line
-/// to the byte — the line's `fit` and its `base_nvme_expert_bytes`].
-const CARD_12: CardSpec = CardSpec {
-    name: "12 GB",
-    total_bytes: 12_288 * MIB,
-    driver_reserve_bytes: 774 * MIB,
-    device: None,
-    free_bytes: None,
-    held_by: None,
-    integrated: false,
-};
-
-/// The room of the 32 GB host that line was made at [assumed: the reading
-/// less the drift margin, the room the seat's plan is made at].
-const ROOM_32: u64 = 27_294_000_000;
-
-/// The seat's base context a slot (`serve_seats::qwen38::CTX`) and the file's
-/// serving cap (`place::serve_ctx`).
-const SEAT_CTX: usize = 4096;
-const SEAT_CAP: usize = 262_144;
-
-/// The plan the seat probes at `ctx` positions a slot on [`CARD_12`] beside
-/// [`ROOM_32`] with no draft, for `slots` resident sequences and the split's
-/// arena `given` (`BLOOMERY_NVTIER_BYTES`): its bytes by tier, the arena the
-/// host room leaves after the checkpoints every slot reserves at that
-/// context ([`points_38`]), a plan that breaks an invariant refused there.
-fn expert_bytes_on_12(
-    slots: u64,
-    given: Option<u64>,
-    ctx: usize,
-) -> Result<super::ctx::ExpertBytes, PlacementError> {
-    let q4 = model(false);
-    let mut card = machine_a(CARD_12);
-    let ctx = ctx as u64;
-    card.host_mut().reserves.push((
-        "checkpoints".to_string(),
-        slots * points_38(ctx) * CHECKPOINT_38,
-    ));
-    let plan = planned(&q4, &card, ctx, slots, ROOM_32, Some(given))?;
-    let broken = plan.violations();
-    if !broken.is_empty() {
-        return Err(PlacementError::Metadata {
-            key: "the plan".to_string(),
-            detail: format!("{broken:?}"),
-        });
-    }
-    Ok(super::ctx::ExpertBytes {
-        card: plan.cards[0].expert_bytes,
-        nvme: plan.host.nvme_expert_bytes,
-        arena: plan.host.nvme_arena_bytes,
-    })
-}
-
-/// The seat's default-context rule over [`expert_bytes_on_12`]'s plans.
-fn default_on_12(slots: u64, given: Option<u64>) -> super::ctx::SlotCtx {
-    super::ctx::default_slot_ctx(SEAT_CAP, SEAT_CTX, CTX_STEP, MARGIN, &|ctx| {
-        expert_bytes_on_12(slots, given, ctx)
-    })
-    .expect("the default context")
-}
-
-/// Flash-Next (this file's table) on a 12 GB card beside a 32 GB host pages
-/// most of its experts through the NVMe tier at the base context, and every
-/// deeper context both pushes a few more there and gives up arena to the
-/// checkpoints a slot reserves: the default grows while the missed bytes
-/// (the tier's less the arena) stay within a hundredth of the base's
-/// ([`NVME_SLACK_DIV`]), where the strict rule kept the base. The card clause
-/// cannot bind: at the base the card holds under 1 GiB of experts. The base's
-/// bytes and the fit are the reporter's, to the byte.
-#[test]
-fn flash_next_on_a_12_gb_card_one_slot_stops_where_the_miss_bound_binds() {
-    let one = default_on_12(1, None);
-    assert_eq!(
-        one.base.nvme, 74_413_158_400,
-        "the reported base's paged bytes"
-    );
-    assert_eq!(one.fit, 28_881, "the reported fit");
-    assert!(one.base.card < 1 << 30, "the card clause cannot bind");
-    assert_eq!(one.nvme_bound, one.base.miss() / NVME_SLACK_DIV);
-    assert!(
-        one.chosen.miss() - one.base.miss() <= one.nvme_bound,
-        "{} B missed past the base's {} B",
-        one.chosen.miss() - one.base.miss(),
-        one.base.miss()
-    );
-    // PIN(2026-10-12): the default stops at 12,288, not at the fit. Derived:
-    // the arena is the room less the base's host need, the checkpoints
-    // (⌈ctx/4096⌉ + 1 points a slot) and the run-ahead window; the bound is
-    // miss(base) / 100 = 540,026,010 B. 12,288 holds 4 points and misses
-    // 498,917,376 B more than the base (41,108,634 B inside the bound);
-    // 12,544 holds the 5th point and misses 635,224,064 B more (95,198,054 B
-    // out). The fit's 28,881 holds 9 points and misses a fiftieth more than
-    // the base, which the rule used to take for the NVMe bytes alone.
-    assert_eq!((one.rule, one.ctx), (RULE_MARGIN, 12_288));
-    assert_eq!(one.base.arena, 20_410_557_312);
-    assert_eq!(one.chosen.arena, 20_138_251_136);
-    assert_eq!(one.chosen.miss() - one.base.miss(), 498_917_376);
-    let next = expert_bytes_on_12(1, None, 12_544).expect("a plan");
-    assert_eq!(next.miss() - one.base.miss(), 635_224_064);
-    assert!(next.miss() - one.base.miss() > one.nvme_bound);
-    assert_eq!([4096, 12_288, 12_544, 28_881].map(points_38), [2, 4, 5, 9]);
-}
-
-/// The same host's other cells [derived: the plan's bytes at each context
-/// against the bound]: two slots stop at the card's fit, 6,165 positions a
-/// slot, with the bound far from binding; one slot with no arena
-/// (`BLOOMERY_NVTIER_BYTES=0`) misses every paged byte, the checkpoints'
-/// points reaching the NVMe bytes, so the bound binds at the last step
-/// within it.
-#[test]
-fn flash_next_on_a_12_gb_card_stops_at_the_fit_or_the_bound() {
-    for (slots, given, ctx, rule) in [
-        (2, None, 6165, RULE_FIT),
-        (2, Some(0), 6165, RULE_FIT),
-        // PIN(2026-10-12): 12,288, not 26,112. The probe reserves the
-        // checkpoints a slot holds at each context ([`points_38`]), which the
-        // fixture did not; with no arena they reach the NVMe bytes. Derived:
-        // the bound is 54,002,790,400 / 100 = 540,027,904 B; 12,288 holds 4
-        // points and pages 498,380,800 B more than the base (41,647,104 B
-        // inside), 12,544 holds the 5th and pages 633,446,400 B more (93,418,496
-        // B out). Re-pin by the fixture, not a relaxation: the rule is the
-        // shipped one on an arena of 0.
-        (1, Some(0), 12_288, RULE_MARGIN),
-    ] {
-        let got = default_on_12(slots, given);
-        assert_eq!(
-            (got.ctx, got.rule),
-            (ctx, rule),
-            "{slots} slots, arena {given:?}"
-        );
-        assert!(got.chosen.miss() - got.base.miss() <= got.nvme_bound);
     }
 }
