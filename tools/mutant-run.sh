@@ -364,7 +364,9 @@ EOF
   one y a.rs 'KILL();'
   rm -rf "$t/held"
   mkdir -p "$t/held"
-  flock -n "$t/held/.mutant-run.lock" -c 'sleep 30' &
+  python3 -c 'import fcntl, os, sys, time
+fcntl.flock(os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644), fcntl.LOCK_EX)
+time.sleep(30)' "$t/held/.mutant-run.lock" &
   hold=$!
   sleep 0.2
   run "$t/o" "$t/one" --copy "$t/held"
@@ -627,7 +629,10 @@ check_expects
 if [ -n "$COPY" ]; then
   mkdir -p "$COPY" || usage "cannot make --copy $COPY"
   exec 9>>"$COPY/.mutant-run.lock" || usage "cannot open the lock for --copy $COPY"
-  flock -n 9 || usage "--copy $COPY is in use by another mutant-run"
+  # flock(2) on fd 9 through python3's fcntl (the Mac has no flock(1)): the lock is the open file
+  # description's, so it stays held by this shell after python3 exits.
+  python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)' 2> /dev/null ||
+    usage "--copy $COPY is in use by another mutant-run"
   copy_tree "$ROOT" "$COPY"
   cd "$COPY" || usage "cannot enter --copy $COPY"
   ROOT=$COPY
