@@ -3,7 +3,7 @@
 //! `generate_glm5next` on the same card, as one process under the GPU gate
 //! lock.
 //!
-//!     gate_glm5next_serve --arm plain|drafted|slots|unset|prefix|second-slot --dir <out>
+//!     gate_glm5next_serve --arm plain|drafted|slots|unset|prefix --dir <out>
 //!     gate_glm5next_serve --arm media --dir <out> --mmproj <file>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
@@ -44,37 +44,15 @@
 //! count and its `basis` the rule's card file), the unset rule's
 //! `mtp` and `mid-p0-s1`, and a plan on the cards `--place bp` plans:
 //!
-//! - the seat's `--ctx` rule ([`ctx`], on the gate card, one slot): the
-//!   default's `ctx` line against this gate's own plans of the file — the
-//!   rule's context, its fit and its margin — the flag winning below the
-//!   floor, and a context past `place::ORACLE_POSITIONS` refused by name
-//!   before it listens; and, on the same plan, `--plan` under a
-//!   `BLOOMERY_HOST_ROOM` that makes the base plan page NVMe expert bytes
-//!   (`ctx_paged_default_grows_within_the_bound`): the line's `nvme_bound`
-//!   is above 0 and a hundredth of its base NVMe bytes, its rule word is not
-//!   `base`, and it pages more than the base and at most a hundredth more;
-//!
-//! - `default_second_slot_never_costs_a_load` ([`second_slot`], five `--plan`
-//!   runs under `--place gate`, no load): a card budget at which the default's
-//!   two slots are refused and one slot is not. A slot's card bytes in the
-//!   plan are its stores at the context (the KDA layers' recurrent state
-//!   whole, a position of the attention layers') and the bytes beside them
-//!   (`PlanInputs::kv_term`); the plan stands from the budget its other terms
-//!   take plus the slots' own, so the least budget of two slots is one slot's
-//!   bytes past the least of one [derived]. Under a budget below every floor
-//!   `--parallel 2` and `--parallel 1` are refused with the floor of their
-//!   count (`PlacementError::CardBudgetFloor`, read by
-//!   `bind::budget_floor`): the least budget of two slots, `F2`, and of one,
-//!   `F1`. At `F2 - 1`: the default prints `parallel … slots=1 … from=fit`
-//!   with the line that says the second slot did not fit and exits 0, and
-//!   `--parallel 2` is refused with the words that line carries and prints no
-//!   such line (a set count is never lowered); at `F2` the default serves two
-//!   slots (`from=default`) and prints no such line. FAIL-first: a seat that
-//!   plans the default at two slots with no fall refuses the first half (the
-//!   mutant: the call to `bind::default_slots_fit` replaced by the plan at
-//!   the asked count). `second_slot_window_is_the_slots_bytes` holds the
-//!   derivation, from the same two floors: `F2 - F1` is `kv_term`'s second
-//!   slot.
+//! - the seat's `--ctx` choice ([`ctx`], on the gate card, one slot): the
+//!   default's one `ctx` line holds its word (`ctx_ladder::default_line_held`:
+//!   a rung of the ladder from the trained context verified to
+//!   `place::ORACLE_POSITIONS`, `target` or `halved`) and this gate's own
+//!   plans agree: the card holds the default, and not the rung above it when
+//!   it halved (`ctx_default_is_the_highest_rung_held`); the flag winning
+//!   below the floor; and a context past `place::ORACLE_POSITIONS` refused by
+//!   name before it listens. FAIL-first: a default that starts a rung low
+//!   names a rung whose rung above the card holds;
 //!
 //! - the load prints `load draft=off (BLOOMERY_DRAFT=off)` and the word as a
 //!   `residency lever` record (`why=set`), no `residency host` and no verify
@@ -323,7 +301,7 @@ mod gate {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use bloomery_gpu_gates::bind::budget_floor;
+    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
@@ -359,25 +337,16 @@ mod gate {
         bloomery_levers::SCREEN,
     ];
 
-    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix|second-slot \
+    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix \
                          --dir <out> | --arm media --dir <out> --mmproj <file>";
 
     /// The stores both engines size, the seat's floor and the CLI's default.
     const CTX: usize = 2048;
-    /// The seat's default context's multiple (its `CTX_STEP`).
-    const CTX_STEP: usize = 256;
-    /// The flag arm's context, below the seat's floor: a flag seen to win,
-    /// not to coincide with a default the floor already takes.
+    /// The flag arm's context, below the ladder's floor: a flag seen to win,
+    /// not to coincide with a default rung.
     const FLAG_CTX: usize = 1536;
     /// A context past `ORACLE_POSITIONS`, the refusal the clause asks for.
     const OVER_CTX: usize = 99_999;
-    /// The paged arm's host room: under the gate plan's host need and over
-    /// half its host experts, so the base plan pages through the NVMe tier
-    /// with no RAM arena, and far enough under the need that the base's
-    /// hundredth clears several checkpoint points. Past the base every host
-    /// need byte is an NVMe byte, the card expert a context pushes off and
-    /// each checkpoint point a longer context pins.
-    const PAGED_HOST_ROOM: &str = "120G";
     /// The `ctx` clause's polls for the seat's pre-load lines, 1 s apart:
     /// the lines print at plan time, before the load's first-start JIT.
     const LINE_POLLS: usize = 90;
@@ -487,9 +456,7 @@ mod gate {
 
     /// The arms, one a process: `slots` is the drafted arm's (s5) alone,
     /// its server and clauses, which `drafted` runs too; `unset` is the plain
-    /// arm's last server alone ([`unset_load`]), which `plain` runs too;
-    /// `second-slot` is the plain arm's `--plan` clauses on the second slot
-    /// alone ([`second_slot`]), which `plain` runs too.
+    /// arm's last server alone ([`unset_load`]), which `plain` runs too.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Arm {
         Plain,
@@ -497,7 +464,6 @@ mod gate {
         Slots,
         Unset,
         Prefix,
-        SecondSlot,
         Media,
     }
 
@@ -509,10 +475,9 @@ mod gate {
                 "slots" => Ok(Arm::Slots),
                 "unset" => Ok(Arm::Unset),
                 "prefix" => Ok(Arm::Prefix),
-                "second-slot" => Ok(Arm::SecondSlot),
                 "media" => Ok(Arm::Media),
                 other => Err(format!(
-                    "--arm is plain, drafted, slots, unset, prefix, second-slot or media, not {other}"
+                    "--arm is plain, drafted, slots, unset, prefix or media, not {other}"
                 )
                 .into()),
             }
@@ -1003,18 +968,15 @@ mod gate {
         // that holds less plans fewer, `card`, as qwen38 does). FAIL-first:
         // a seat that keeps the floor silently, or prints no line, turns
         // this red.
-        let ctx_line = |lines: &[String]| -> Option<(String, usize)> {
-            let l = lines.iter().find(|l| l.starts_with("ctx rule="))?;
-            Some((field(l, "rule")?.to_owned(), field(l, "ctx")?.parse().ok()?))
+        let limit = {
+            let path = ref_model_path()?;
+            let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            glm_limit(&PlanInputs::read(&split)?)?
         };
         for (place, lines) in [("a", &a), ("bp", &bp), ("gate", &g)] {
-            let named = ctx_line(lines).is_some_and(|(rule, ctx)| {
-                matches!(
-                    rule.as_str(),
-                    "base" | "margin" | "fit" | "card" | "host" | "pool"
-                ) && ctx >= CTX
-            });
-            println!("--place {place}: a default ctx line, rule and context in {named}");
+            let named = ctx_line(&lines.join("\n"))
+                .is_some_and(|l| default_line_held(l, 1, limit) == Some(true));
+            println!("--place {place}: a default ctx line holding its word {named}");
             check(&mut ok, "unset_plans_take_the_ctx_default", named);
         }
         // The default word's churn pool inside the plan's host terms: the
@@ -1070,6 +1032,18 @@ mod gate {
         Ok(free)
     }
 
+    /// The model's limit the seat holds a context to
+    /// (`generate::choose_ctx_of`): the file's trained context, verified up
+    /// to `ORACLE_POSITIONS`, the lesser, with its name.
+    fn glm_limit(inputs: &PlanInputs) -> Result<(u64, &'static str), GateError> {
+        let trained = u64::try_from(inputs.hp.n_ctx_train)?;
+        Ok(if ORACLE_POSITIONS < trained {
+            (ORACLE_POSITIONS, "ORACLE_POSITIONS")
+        } else {
+            (trained, "trained")
+        })
+    }
+
     /// The plan's stage-card expert bytes, NVMe expert bytes and NVMe arena
     /// on the gate card at `ctx`, plain, as the server makes it; `None` when
     /// no plan takes the context.
@@ -1103,30 +1077,15 @@ mod gate {
 
     /// The `ctx` clause (the module header): a plain server with no `--ctx`
     /// prints its `ctx` and `plan` lines before any load and is stopped
-    /// there, against this gate's own plans of the file: its context is the
-    /// rule's — [`CTX`] under `base`, the largest within the plan's margin
-    /// under `margin`, the plan's largest under `fit`, the card's largest
-    /// under `card`; the line's `cap` is the file's trained context capped to
-    /// `ORACLE_POSITIONS`; its `fit` the largest context whose plan stands up
-    /// to that cap — this gate's own plan taken, the one past it refused when
-    /// the card bounds it, else the cap itself — with that plan's stage-card
-    /// expert bytes; its `margin_ctx` at most `workstation::MARGIN` fewer of
-    /// them than the plan at [`CTX`] and at most a hundredth of the base's NVMe
-    /// expert bytes more (`NVME_DIV` in `ctx`), and the
-    /// next multiple of [`CTX_STEP`] past it more of either (or it is the
-    /// fit). A
-    /// server asked for [`FLAG_CTX`] takes it (below the floor, a value no
-    /// default can coincide with); one asked past the oracle is refused by
-    /// name before it listens. Every unset rule word must hold the relation
-    /// it claims between the line's `ctx`, its `margin_ctx` and its `fit` —
-    /// a default that keeps the floor while its margin reaches further
-    /// names the wrong word. Mutants: the default taking the trained
-    /// context past the fit (the server's own plan refuses it by name
-    /// before any line); the search giving up (the line's `margin_ctx`
-    /// keeps the floor while a step past it stays within it). A `--plan`
-    /// run under [`PAGED_HOST_ROOM`] holds the NVMe terms of the rule on a
-    /// base that pages (the arm's own comment says which change of the rule
-    /// turns which term red).
+    /// there. Its one `ctx` line holds its word under the model's limit
+    /// ([`glm_limit`], `ctx_ladder::default_line_held`), and this gate's own
+    /// plans of the file at the card's free bytes agree: the default holds,
+    /// and the rung above it, when it halved, does not. A server asked for
+    /// [`FLAG_CTX`] takes it (below the floor, a value no default rung can
+    /// coincide with); one asked past the oracle is refused by name before it
+    /// listens. Mutants: a ladder that starts a rung low (the rung above
+    /// holds); a default that keeps the target whatever the card (the
+    /// server's own plan refuses it by name before any line).
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -1171,152 +1130,35 @@ mod gate {
         println!("ctx server pid {}", served.child.id());
         let lines = wait_for(&mut served, &err_log, &["ctx rule=", "plan "])?;
         println!("ctx: the default server stopped: {}", served.stop()?);
-        let line = lines
-            .iter()
-            .find(|l| l.starts_with("ctx rule="))
-            .map(String::as_str)
-            .ok_or("the default server printed no `ctx` line")?
+        let line = ctx_line(&lines.join("\n"))
+            .ok_or("the default server printed no one `ctx` line")?
             .to_owned();
         println!("ctx: {line}");
-        let num = |k: &str| field(&line, k).and_then(|v| v.parse::<usize>().ok());
-        let bytes = |k: &str| field(&line, k).and_then(|v| v.parse::<u64>().ok());
-        let (rule, ctx, line_cap, fit) = (
-            field(&line, "rule").map(str::to_owned),
-            num("ctx"),
-            num("cap"),
-            num("fit"),
-        );
-        let (fit_bytes, margin_ctx) = (bytes("fit_card_expert_bytes"), num("margin_ctx"));
-        let (Some(rule), Some(ctx), Some(line_cap), Some(fit), Some(fit_bytes), Some(margin_ctx)) =
-            (rule, ctx, line_cap, fit, fit_bytes, margin_ctx)
-        else {
-            return Err(format!(
-                "a `ctx` line without its rule, ctx, cap, fit, fit_card_expert_bytes and \
-                 margin_ctx: {line}"
-            )
-            .into());
-        };
-
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
+        let limit = glm_limit(&inputs)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
         let free = Some(server_card_free(&err_log)?);
-        let at = |c: usize| card_at(&inputs, &plan_levers, c, free);
-        let (base, base_nvme, base_arena) = at(CTX)?.ok_or("no plan at the base context")?;
-        let base_miss = base_nvme.saturating_sub(base_arena);
-        let margin = model::placement::workstation::MARGIN;
-        // Whether the plan at `c` is within the rule's margin of the base's:
-        // at most `margin` fewer card expert bytes and at most a hundredth of
-        // the base's missed expert bytes (the NVMe bytes less the arena) more,
-        // re-derived from the gate's own plans; `None` when no plan takes the
-        // context.
-        //
-        // PIN(2026-10-12): the default misses at most `base_miss / 100` bytes
-        // past the base's (the rule's `NVME_SLACK_DIV`), the arena a deeper
-        // context gives up counted beside the experts it moves to the tier,
-        // where it paged none past it: the gate holds the divisor as its own
-        // literal, never the line's `nvme_bound`. Tightens the NVMe-bytes
-        // clause it replaces: an arena that never grows with the context
-        // makes the NVMe bytes' growth no more than the misses'.
-        const NVME_DIV: u64 = 100;
-        let slack = base_miss / NVME_DIV;
-        let within = |c: usize| -> Result<Option<bool>, GateError> {
-            Ok(at(c)?.map(|(card, nvme, arena)| {
-                base.saturating_sub(card) <= margin
-                    && nvme.saturating_sub(arena) <= base_miss + slack
-            }))
-        };
-        let here = within(margin_ctx)?;
-        let past = within(margin_ctx + CTX_STEP)?;
-        let (at_fit, past_fit) = (at(fit)?, at(fit + 1)?);
-        // The plan's bytes at the line's own context, which the line's
-        // `card_expert_bytes` and `nvme_expert_bytes` name.
-        let at_ctx = at(ctx)?;
-        let cap = inputs
-            .hp
-            .n_ctx_train
-            .min(usize::try_from(ORACLE_POSITIONS)?);
-        let card_bounds = fit < cap;
+        let at = |c: u64| card_at(&inputs, &plan_levers, usize::try_from(c)?, free);
+        let ctx = ctx_ladder::field(&line, "ctx").ok_or("the `ctx` line names no ctx")?;
+        let above = rung_above(limit.0, ctx);
+        let (at_ctx, at_above) = (at(ctx)?, above.map(at).transpose()?);
         println!(
-            "ctx: the gate's plans: within the margin at {margin_ctx} {here:?}, at {} {past:?}, \
-             fit {fit} {at_fit:?}, past it {past_fit:?}; the cap {cap} ({})",
-            margin_ctx + CTX_STEP,
-            if card_bounds {
-                "the card bounds the fit"
-            } else {
-                "the cap bounds the fit"
-            }
+            "ctx: the gate's plans: at {ctx} {at_ctx:?}, at the rung above {above:?} {at_above:?}; \
+             the limit {limit:?}"
         );
         let mut ok = true;
+        // The line holds its word, and the gate's own plans agree: the card
+        // holds the default, and not the rung above it when it halved.
         check(
             &mut ok,
-            "ctx_default_is_the_rules",
-            match rule.as_str() {
-                "set" => false,
-                "base" => ctx == CTX && margin_ctx == CTX && CTX <= fit,
-                "card" => ctx == fit && margin_ctx == fit && fit < CTX,
-                "margin" => ctx == margin_ctx && CTX < margin_ctx && margin_ctx < fit,
-                "fit" => ctx == fit && margin_ctx == fit && fit > CTX,
-                // The host room vetoed the card's context `margin_ctx` past
-                // the base: the base stands.
-                "host" => ctx == CTX && CTX < margin_ctx && margin_ctx <= fit,
-                // A unified machine's pool took a lower rung of the halving
-                // ladder from the cap: `cap >> k` rounded down to the step,
-                // never under the base.
-                "pool" => {
-                    ctx == margin_ctx
-                        && ctx <= fit
-                        && (0..usize::BITS)
-                            .any(|k| ctx == ((cap >> k) / CTX_STEP * CTX_STEP).max(CTX))
-                }
-                _ => false,
-            },
-        );
-        check(
-            &mut ok,
-            "ctx_line_prints_the_fit_and_the_margin",
-            line_cap == cap
-                && fit <= cap
-                && at_fit.map(|e| e.0) == Some(fit_bytes)
-                && at_ctx.map(|e| e.0) == bytes("card_expert_bytes")
-                && at_ctx.map(|e| e.1) == bytes("nvme_expert_bytes")
-                && (if card_bounds {
-                    past_fit.is_none()
-                } else {
-                    fit == cap
-                })
-                // The context the host room vetoed (`host`) is the one whose
-                // plan at the room read is not within; a rung (`pool`) is
-                // not the last multiple of the step within.
-                && (here == Some(true)) != (rule == "host")
-                && margin_ctx <= fit
-                && (margin_ctx == fit
-                    || rule == "pool"
-                    || (margin_ctx.is_multiple_of(CTX_STEP) && past != Some(true))),
+            "ctx_default_is_the_highest_rung_held",
+            default_line_held(&line, 1, limit) == Some(true)
+                && at_ctx.is_some()
+                && at_above.is_none_or(|a| a.is_none()),
         );
 
-        check(
-            &mut ok,
-            "ctx_line_prints_the_nvme_bound",
-            // The arena is the host room's (read when the server starts), so
-            // the line's own terms carry it: the bound is a hundredth of the
-            // base's missed bytes as the line states them, and the chosen
-            // plan's missed bytes are inside it; the NVMe bytes are the plan's.
-            bytes("base_nvme_expert_bytes") == Some(base_nvme)
-                && bytes("nvme_bound")
-                    == bytes("base_arena").map(|a| base_nvme.saturating_sub(a) / NVME_DIV)
-                && bytes("nvme_expert_bytes")
-                    .zip(bytes("arena"))
-                    .zip(bytes("base_arena"))
-                    .is_some_and(|((nvme, arena), base_arena)| {
-                        nvme.saturating_sub(arena)
-                            <= base_nvme.saturating_sub(base_arena)
-                                + base_nvme.saturating_sub(base_arena) / NVME_DIV
-                    }),
-        );
-
-        // The flag arm: below the floor, the flag wins.
         let flag_ctx = FLAG_CTX.to_string();
         let mut flag = args.clone();
         flag.extend_from_slice(&["--ctx", flag_ctx.as_str()]);
@@ -1393,246 +1235,6 @@ mod gate {
         // at most a hundredth more (a wider slack reaches a longer context,
         // whose points page far more). A room that pages nothing leaves
         // `base_nvme_expert_bytes` at 0 and the clause red by name.
-        let paged_err = own.join("paged.err");
-        let status = Command::new(beside("bloomery-serve")?)
-            .args([
-                "--model",
-                "glm",
-                "--place",
-                "gate",
-                "--parallel",
-                "1",
-                "--plan",
-            ])
-            .env_remove(bloomery_levers::DRAFT)
-            .env_remove(bloomery_levers::RESIDENCY)
-            .env(bloomery_levers::HOST_ROOM, PAGED_HOST_ROOM)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(File::create(&paged_err)?)
-            .status()
-            .map_err(|e| format!("spawn bloomery-serve: {e}"))?;
-        let text = std::fs::read_to_string(&paged_err)?;
-        let ctx_lines: Vec<&str> = text
-            .lines()
-            .filter(|l| l.starts_with("ctx rule="))
-            .collect();
-        let held = (|| {
-            let [line] = ctx_lines.as_slice() else {
-                return None;
-            };
-            let b = |k: &str| field(line, k).and_then(|v| v.parse::<u64>().ok());
-            let rule = field(line, "rule")?;
-            let (base_nvme, now, bound) = (
-                b("base_nvme_expert_bytes")?,
-                b("nvme_expert_bytes")?,
-                b("nvme_bound")?,
-            );
-            println!(
-                "ctx paged arm (BLOOMERY_HOST_ROOM={PAGED_HOST_ROOM}): exit {status}, rule={rule} \
-                 base_nvme_expert_bytes={base_nvme} nvme_expert_bytes={now} nvme_bound={bound}"
-            );
-            Some(
-                status.success()
-                    && base_nvme > 0
-                    && bound > 0
-                    && bound == base_nvme / NVME_DIV
-                    && rule != "base"
-                    && now > base_nvme
-                    && now <= base_nvme + bound,
-            )
-        })();
-        if held.is_none() {
-            println!(
-                "ctx paged arm: {} ctx line(s), or one without its terms; {}",
-                ctx_lines.len(),
-                paged_err.display()
-            );
-        }
-        check(
-            &mut ok,
-            "ctx_paged_default_grows_within_the_bound",
-            held == Some(true),
-        );
-        Ok(ok)
-    }
-
-    /// One `--plan` run of the seat on the gate card under `BLOOMERY_CARD_BUDGET`
-    /// `budget` and both unset levers, `flags` beside `--place gate`: it is
-    /// planned (exit 0, its `parallel` line printed) or refused (a non-zero
-    /// exit, no `parallel` line); any other ending is a named error, never a
-    /// refusal. The run's stderr goes to `<dir>/<name>.err`.
-    fn plan_under(
-        dir: &Path,
-        name: &str,
-        budget: usize,
-        flags: &[&str],
-    ) -> Result<(bool, Vec<String>), GateError> {
-        let exe = beside("bloomery-serve")?;
-        let err = dir.join(format!("{name}.err"));
-        let status = Command::new(&exe)
-            .args(["--model", "glm", "--place", "gate"])
-            .args(flags)
-            .arg("--plan")
-            .env_remove(bloomery_levers::DRAFT)
-            .env_remove(bloomery_levers::RESIDENCY)
-            .env(bloomery_levers::CARD_BUDGET, budget.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(File::create(&err)?)
-            .status()
-            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-        let lines = lines_from(&err, 0)?;
-        let printed = lines.iter().any(|l| l.starts_with("parallel rule="));
-        if status.success() != printed {
-            return Err(format!(
-                "--plan under {budget} B ({}) ended {status} and {} a `parallel` line: neither \
-                 planned nor refused; {}:\n{}",
-                flags.join(" "),
-                if printed { "printed" } else { "printed no" },
-                err.display(),
-                lines.join("\n")
-            )
-            .into());
-        }
-        Ok((status.success(), lines))
-    }
-
-    /// The `default_second_slot_never_costs_a_load` clause (module header),
-    /// five `--plan` runs of the seat on the gate card's plan under a card
-    /// budget, none of them a load.
-    ///
-    /// Under a budget below every floor, each count's refusal names its own
-    /// (`PlacementError::CardBudgetFloor`, read by [`budget_floor`]):
-    /// `--parallel 2`'s is the least budget of two slots, `F2`, and
-    /// `--parallel 1`'s that of one, `F1`; the seat's rule plans one position
-    /// first, and its refusal is that plan's. The default's window is the
-    /// budgets from `F1` to `F2 - 1`, where the second slot is the plan's
-    /// refusal and one slot stands. The runs at `F2 - 1` (the default, then
-    /// `--parallel 2`) and at `F2` (the default) hold it; a floor that is not
-    /// the plan's boundary turns them red, their lines printed. The window is
-    /// one slot's card bytes ([`PlanInputs::kv_term`] of two slots less one, at
-    /// the one position), which the second clause holds with no run of its
-    /// own: `F2 - F1` is those bytes.
-    fn second_slot(dir: &Path) -> Result<bool, GateError> {
-        // Every plan of the file is over this: a card's margin alone is a GiB.
-        const BELOW_ANY_FLOOR: usize = 256 << 20;
-        let own = dir.join("second-slot");
-        std::fs::create_dir_all(&own)?;
-        let planned_at =
-            |name: &str, budget: usize, flags: &[&str]| plan_under(&own, name, budget, flags);
-        // The floor the refusal of `flags` names under the budget below every
-        // floor.
-        let floor_of = |name: &str, flags: &[&str]| -> Result<usize, GateError> {
-            let (planned, lines) = planned_at(name, BELOW_ANY_FLOOR, flags)?;
-            let flags = flags.join(" ");
-            if planned {
-                return Err(format!(
-                    "--plan ({flags}) plans under {BELOW_ANY_FLOOR} B: the clause's budget is \
-                     over the file's floor"
-                )
-                .into());
-            }
-            budget_floor(&lines.join("\n"), BELOW_ANY_FLOOR as u64)
-                .and_then(|floor| usize::try_from(floor).ok())
-                .ok_or_else(|| -> GateError {
-                    format!(
-                        "--plan ({flags}) under {BELOW_ANY_FLOOR} B names no `budget \
-                         {BELOW_ANY_FLOOR} B is below its floor N B`; {name}'s stderr:\n{}",
-                        lines.join("\n")
-                    )
-                    .into()
-                })
-        };
-        let floor2 = floor_of("floor-2", &["--parallel", "2"])?;
-        let floor1 = floor_of("floor-1", &["--parallel", "1"])?;
-        let below = floor2.checked_sub(1).ok_or("a floor of 0 B")?;
-        let least = floor2;
-        println!(
-            "second slot: --parallel 2 names the floor {floor2} B and --parallel 1 {floor1} B \
-             under {BELOW_ANY_FLOOR} B"
-        );
-
-        const FALL: &str = "the default's second slot does not fit on --place gate (";
-        const FALL_END: &str = "); serving one slot";
-        let (fell, fell_lines) = planned_at("default-below", below, &[])?;
-        let (held, held_lines) = planned_at("parallel-2-below", below, &["--parallel", "2"])?;
-        let (two, two_lines) = planned_at("default-least", least, &[])?;
-        let (fell_text, held_text, two_text) = (
-            fell_lines.join("\n"),
-            held_lines.join("\n"),
-            two_lines.join("\n"),
-        );
-        // The slots and the `from` word of the one `parallel` line.
-        let counted = |lines: &[String]| {
-            lines
-                .iter()
-                .find(|l| l.starts_with("parallel rule="))
-                .map(|l| {
-                    (
-                        field(l, "slots").map(str::to_owned),
-                        field(l, "from").map(str::to_owned),
-                    )
-                })
-        };
-        let words = |slots: &str, from: &str| Some((Some(slots.to_owned()), Some(from.to_owned())));
-        let line = |lines: &[String]| {
-            lines
-                .iter()
-                .find(|l| l.starts_with("parallel rule="))
-                .cloned()
-        };
-        // What the fall line quotes of the second slot's refusal, which a
-        // set count prints on its own.
-        let refusal = fell_text.find(FALL).and_then(|at| {
-            let from = at + FALL.len();
-            fell_text
-                .get(from..)
-                .and_then(|rest| rest.find(FALL_END).map(|to| &rest[..to]))
-        });
-        println!(
-            "second slot: default under {below} B: planned {fell}, {:?}, refusal {refusal:?}",
-            line(&fell_lines)
-        );
-        println!(
-            "second slot: --parallel 2 under {below} B: planned {held}, says the fall {}",
-            held_text.contains(FALL)
-        );
-        println!(
-            "second slot: default under {least} B: planned {two}, {:?}, says the fall {}",
-            line(&two_lines),
-            two_text.contains(FALL)
-        );
-        let mut ok = true;
-        check(
-            &mut ok,
-            "default_second_slot_never_costs_a_load",
-            fell && counted(&fell_lines) == words("1", "fit")
-                && refusal.is_some_and(|r| {
-                    !r.is_empty() && !held && held_text.contains(r) && !held_text.contains(FALL)
-                })
-                && two
-                && counted(&two_lines) == words("2", "default")
-                && !two_text.contains(FALL),
-        );
-
-        // The window's derivation: one slot's card bytes.
-        let path = ref_model_path()?;
-        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
-        let layers = 0..inputs.model.layers;
-        let kv = |slots: usize| inputs.kv_term(layers.clone(), 1, KdaLanes::One, None, slots);
-        let slot_bytes = usize::try_from(kv(2)? - kv(1)?)?;
-        println!(
-            "second slot [derived]: a slot is {slot_bytes} B of card at one position; the floors \
-             are {floor1} B and {floor2} B, {} B apart",
-            floor2.abs_diff(floor1)
-        );
-        check(
-            &mut ok,
-            "second_slot_window_is_the_slots_bytes",
-            floor1 < floor2 && floor2 - floor1 == slot_bytes,
-        );
         Ok(ok)
     }
 
@@ -2957,7 +2559,6 @@ mod gate {
     fn plain(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let mut ok = unset_rule(dir)?;
         ok &= ctx(dir, levers)?;
-        ok &= second_slot(dir)?;
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&SERVER_ARGS, dir, PLAIN)?;
         println!("plain server pid {}", served.child.id());
@@ -3459,7 +3060,6 @@ mod gate {
             Arm::Slots => slots_flow_together(&a.dir)?,
             Arm::Unset => unset_load(&a.dir)?,
             Arm::Prefix => prefix_alone(&a.dir)?,
-            Arm::SecondSlot => second_slot(&a.dir)?,
             Arm::Media => media(
                 &a.dir,
                 a.mmproj
