@@ -31,10 +31,12 @@
 # (no scan is cached; they run again), the HEAD side the crates the change touched. A pair belongs to this recipe alone,
 # and one run uses it at a time: a lock under ~/.cache/bloomery named by the pair, an fcntl flock on a file
 # held for the whole scan (python3's fcntl: the Mac has no flock(1)). Each launch closes that fd, so a child
-# does not keep the lock after this process exits. A second run waits up to NARROW_WAIT
+# does not keep the lock after this process exits. While the flock is held this run also creates that directory
+# and writes its pid, so an older copy's mkdir of the same path fails. A directory whose pid is live, or not
+# written yet, is refused and not deleted. A dead directory is removed only while this flock is already held,
+# and this run removes its own directory when it drops the flock. A second run waits up to NARROW_WAIT
 # seconds, default 1800, naming the holder. The main tree's pair keeps the lock name older copies of this
-# script took for every tree: a directory there with a live pid is that older copy's lock and is refused,
-# not deleted. A dead directory is removed only while this flock is already held. NARROW_BASE_REMOTE and
+# script took for every tree. NARROW_BASE_REMOTE and
 # NARROW_HEAD_REMOTE name other dirs. The names follow the
 # auxiliary-dir rule (bloomery-<track>-<suffix>): once the track's worktree is gone, `just box-tracks --remove
 # <track>-narrow-base <track>-narrow-head` clears them (the main tree's: `narrow-base narrow-head`).
@@ -173,9 +175,10 @@ split_logs() {
 # lock_take <lock path> <wait seconds> <who>: one run at a time uses a pair of persistent remote dirs.
 # The lock is an fcntl exclusive flock on fd 9 of <lock path>.flock (python3's fcntl: the Mac has no
 # flock(1)). It is the open file description's, so it stays held after python3 exits and drops when this
-# process closes the fd. A directory at <lock path> is an older copy's lock: a live pid there is refused
-# by name, and a dead one is removed only after this flock is held, so two recoverers cannot both delete
-# it. Prints what it waits for; rc 75 at the bound.
+# process closes the fd. While the flock is held this run creates <lock path> and writes its pid, so an
+# older copy's mkdir of that path fails. A directory already there with a live pid, or with no pid written
+# yet, is refused by name. A dead one is removed only after this flock is held, so two recoverers cannot
+# both delete it. Prints what it waits for; rc 75 at the bound.
 lock_take() {
   local lockd=$1 wait=$2 who=$3 waited=0 rc pid='' holder=''
   mkdir -p "$(dirname "$lockd")" || return 1
@@ -183,12 +186,12 @@ lock_take() {
     if [ -d "$lockd" ]; then
       pid=$(cat "$lockd/pid" 2> /dev/null || true)
       holder=$(cat "$lockd/who" 2> /dev/null || true)
-      if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then
+      if [ -z "$pid" ] || kill -0 "$pid" 2> /dev/null; then
         if [ "$waited" -ge "$wait" ]; then
-          echo "narrow-scan: $lockd is held by pid $pid (${holder}); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
+          echo "narrow-scan: $lockd is held by pid ${pid:-?} (${holder}); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
           return 75
         fi
-        echo "narrow-scan: waiting for pid $pid (${holder}): this pair of remote dirs takes one run at a time (${waited}s of ${wait}s)" >&2
+        echo "narrow-scan: waiting for pid ${pid:-?} (${holder}): this pair of remote dirs takes one run at a time (${waited}s of ${wait}s)" >&2
         sleep 30
         waited=$((waited + 30))
         continue
@@ -224,20 +227,26 @@ except OSError:
     if [ -d "$lockd" ]; then
       pid=$(cat "$lockd/pid" 2> /dev/null || true)
       holder=$(cat "$lockd/who" 2> /dev/null || true)
-      if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then
+      if [ -z "$pid" ] || kill -0 "$pid" 2> /dev/null; then
         exec 9>&-
-        echo "narrow-scan: $lockd is held by pid $pid (${holder}); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
+        echo "narrow-scan: $lockd is held by pid ${pid:-?} (${holder}); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
         return 75
       fi
       echo "narrow-scan: the lock's holder (pid ${pid:-?}, ${holder}) is gone: taking it over" >&2
       rm -rf "$lockd"
     fi
+    mkdir "$lockd" 2> /dev/null && printf '%s\n' "$$" > "$lockd/pid" && printf '%s\n' "$who" > "$lockd/who" || { exec 9>&-; return 1; }
     printf '%s\n%s\n' "$$" "$who" > "$lockd.flock" || { exec 9>&-; return 1; }
+    NARROW_LOCK=$lockd
     return 0
   done
 }
 
-lock_release() { # drops this process's flock. A directory at the path is an older copy's and is not removed.
+lock_release() { # drops this process's flock. The directory is removed only when its pid is this process.
+  if [ -n "${NARROW_LOCK:-}" ] && [ "$(cat "$NARROW_LOCK/pid" 2> /dev/null || true)" = "$$" ]; then
+    rm -rf "$NARROW_LOCK"
+  fi
+  NARROW_LOCK=
   exec 9>&-
   return 0
 }
@@ -415,12 +424,16 @@ self_test() {
     k=$((k + 1))
   done
   [ "$(head -n 1 "$t/lock.d.flock" 2> /dev/null || true)" = "$hp" ]; ok "lock: a free lock is taken" $?
+  [ -d "$t/lock.d" ] && [ "$(cat "$t/lock.d/pid" 2> /dev/null || true)" = "$hp" ] && ! mkdir "$t/lock.d" 2> /dev/null
+  ok "lock: the held directory is the holder's, so an older copy's mkdir fails" $?
   got=$( (lock_take "$t/lock.d" 0 "second" 2>&1); echo "rc=$?")
   grep -q "rc=75" <<< "$got" && grep -qF "held by pid $hp (test run)" <<< "$got"; ok "lock: a held lock is refused rc 75 naming its holder" $?
   kill -TERM "$hp" 2> /dev/null || true
   wait "$hp" 2> /dev/null || true
   lock_take "$t/lock.d" 0 "after the holder" 2> /dev/null; ok "lock: the hold ends when its process does, and a later take succeeds" $?
+  [ -d "$t/lock.d" ] && [ "$(cat "$t/lock.d/pid" 2> /dev/null || true)" = "$$" ]; ok "lock: a take creates the directory with this pid" $?
   lock_release
+  [ ! -d "$t/lock.d" ]; ok "lock: release removes the directory when the pid is this process" $?
   ( lock_take "$t/lock.d" 0 "after release" > /dev/null 2>&1 ); ok "lock: release drops this process's hold" $?
   lock_release
   rm -rf "$t/lock.d" "$t/lock.d.flock"
@@ -478,6 +491,13 @@ self_test() {
   got=$(lock_take "$t/lock.d" 0 "second" 2>&1); rc=$?
   lock_release
   [ "$rc" = 75 ] && [ -d "$t/lock.d" ] && grep -qF "held by pid $$ (older)" <<< "$got"; ok "lock: a live older copy's directory is refused, not deleted" $?
+  rm -rf "$t/lock.d" "$t/lock.d.flock"
+  mkdir "$t/lock.d"
+  : > "$t/lock.d/pid"
+  got=$(lock_take "$t/lock.d" 0 "second" 2>&1); rc=$?
+  lock_release
+  [ "$rc" = 75 ] && [ -d "$t/lock.d" ] && grep -qF "held by pid ?" <<< "$got"
+  ok "lock: a directory whose pid is not written yet is not taken" $?
   # A child inherits fd 9, so it keeps the flock after the holder exits. The same child
   # started with the fd closed does not. Every launch below closes it; a line that loses
   # the close is red.
@@ -700,7 +720,19 @@ NARROW_STUB_EOF
   [ "$rp" -gt 1 ] && ! kill -0 "$rp" 2> /dev/null; ok "stop: the recorded remote pid is gone" $?
   grep -qx "readonly ~/repo/bloomery-aa-narrow-base" "$t/stop-stub.log" && grep -qF "signalled the recorded remote pid $rp" "$t/stop.log"
   ok "stop: it signalled exactly that pid, through a read-only call on the side's dir" $?
-  [ -z "$(ls -d "$t/home/.cache/bloomery"/narrow-scan*.lock.d 2> /dev/null)" ]; ok "stop: the lock is released" $?
+  # A directory glob misses the flock file, so the check takes that file. The probe's directory
+  # carries this shell's pid (a subshell keeps $$); remove it after a take that succeeded.
+  free=1
+  for f in "$t/home/.cache/bloomery"/narrow-scan*.lock.d.flock; do
+    if [ -e "$f" ]; then
+      if ( lock_take "${f%.flock}" 0 probe > /dev/null 2>&1 ); then
+        rm -rf "${f%.flock}"
+      else
+        free=0
+      fi
+    fi
+  done
+  [ "$free" = 1 ]; ok "stop: the lock is released" $?
   # The main tree's pair keeps the lock older copies of the script took for every tree: a live holder of it holds that pair, and no other.
   mkdir -p "$t/home/.cache/bloomery/narrow-scan.lock.d"
   echo $$ > "$t/home/.cache/bloomery/narrow-scan.lock.d/pid"
@@ -851,8 +883,9 @@ if [ "$DRY" = 1 ]; then
 fi
 
 LOCKD=$HOME/.cache/bloomery/narrow-scan-$(str_key "$BASE_DIR $HEAD_DIR").lock.d
-# The main tree's pair is the one every copy of this script shared, under one lock of this name before the pairs were per track: it
-# keeps that lock, so a run of an older copy (a tree not yet rebased) still excludes this one from the dirs.
+# The main tree's pair is the one every copy of this script shared, under one lock of this name before the pairs were per track.
+# This run creates that directory while it holds the flock, so an older copy's mkdir fails, and a directory there whose pid is
+# live or not yet written is that older copy's lock and is refused, not deleted.
 [ "$BASE_DIR $HEAD_DIR" != '~/repo/bloomery-narrow-base ~/repo/bloomery-narrow-head' ] || LOCKD=$HOME/.cache/bloomery/narrow-scan.lock.d
 lock_take "$LOCKD" "${NARROW_WAIT:-1800}" "$(basename "$ROOT") ${BASE_SHA:0:8}..$HEAD_NAME since $(date +%H:%M:%S)" || exit $?
 trap lock_release EXIT
