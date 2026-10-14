@@ -11,8 +11,8 @@ file to either. CTX holds what .github/workflows/review.yml's "Build the review 
 instead of the pull request API: diff.patch (BASE...HEAD), files.txt (the PR's files, its format), pr.json (the same
 keys; number 0 and the head's subject when the branch has no open pull request), open-issues.txt and ledger.md (read
 with gh; an empty file and a named line when gh cannot), device-dirs.txt (post.py device), diagnostics.md (dryer and
-crapper when tools/review/diagnostics.py finds them where the workflow installs them, else one line saying they did not
-run). When the branch's pull request already has a Shingler review of an ancestor of HEAD, the run is incremental as the
+crapper at the commits review.yml pins, installed once where the workflow installs them; one line saying they did not
+run when they cannot be had). When the branch's pull request already has a Shingler review of an ancestor of HEAD, the run is incremental as the
 workflow's is: the diff since that head, and that review as prev-review.md.
 
 By default only the reviewer runs: the validator only removes findings, and here a false one costs a read, not a
@@ -199,14 +199,68 @@ def read_ledger(base_tree, out):
     return p.stdout.strip() if p.returncode == 0 else None
 
 
+UB = "~/.cache/bloomery-review/ub"  # where review.yml installs dryer and crapper; the same place here
+
+
+def ub_pins(base_tree):
+    """The dryer and crapper commits review.yml's install step pins (its DRYER_SHA and CRAPPER_SHA), or None."""
+    try:
+        text = open(os.path.join(base_tree, ".github/workflows/review.yml"), encoding="utf-8").read()
+    except OSError:
+        return None
+    pins = [re.search(rf"\b{k}_SHA: ([0-9a-f]{{40}})\b", text) for k in ("DRYER", "CRAPPER")]
+    return (pins[0][1], pins[1][1]) if all(pins) else None
+
+
+def install_ub(root, pins):
+    """review.yml's install step, here: each tool at its pinned commit, one venv, built aside and moved in place."""
+    tmp = root + ".new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    for name, sha in zip(("dryer", "crapper"), pins):
+        d = os.path.join(tmp, name)
+        for c in (["git", "init", "-q", d], ["git", "-C", d, "fetch", "-q", "--depth", "1", f"https://github.com/unclebob/{name}", sha],
+                  ["git", "-C", d, "checkout", "-q", "FETCH_HEAD"]):
+            subprocess.run(c, check=True, capture_output=True, timeout=NET_S)
+    subprocess.run([sys.executable, "-m", "venv", os.path.join(tmp, "venv")], check=True, capture_output=True, timeout=NET_S)
+    subprocess.run([os.path.join(tmp, "venv/bin/pip"), "install", "-q", os.path.join(tmp, "dryer"), os.path.join(tmp, "crapper")],
+                   check=True, capture_output=True, timeout=3 * NET_S)
+    with open(os.path.join(tmp, "pins"), "w") as f:
+        f.write(" ".join(pins) + "\n")
+    shutil.rmtree(root, ignore_errors=True)
+    os.rename(tmp, root)
+
+
+def ub_bins(base_tree, say, root=None, install=install_ub):
+    """dryer and crapper at review.yml's pins, installed once (about 20 s) when missing or at other pins; None when
+    they cannot be had (the reason is printed). The failure it blocks: a duplicate only Shingler's dryer reported."""
+    root = os.path.expanduser(root or UB)
+    pins = ub_pins(base_tree)
+    if pins is None:
+        say("pre-review: review.yml names no DRYER_SHA/CRAPPER_SHA; the diagnostics do not run")
+        return None
+    bins = tuple(os.path.join(root, "venv/bin", t) for t in ("dryer", "crapper"))
+    try:
+        have = open(os.path.join(root, "pins")).read().split()
+    except OSError:
+        have = []
+    if have != list(pins) or not all(os.access(b, os.X_OK) for b in bins):
+        say(f"pre-review: installing dryer {pins[0][:8]} and crapper {pins[1][:8]} under {root} (once)")
+        try:
+            install(root, pins)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+            say(f"pre-review: the dryer/crapper install failed ({e}); the diagnostics do not run")
+            return None
+    return bins
+
+
 def diag(ctx, base_tree, base_sha, head, say):
-    ub = os.path.expanduser("~/.cache/bloomery-review/ub/venv/bin")
-    dryer, crapper = os.path.join(ub, "dryer"), os.path.join(ub, "crapper")
     out = os.path.join(ctx, "diagnostics.md")
-    if not (os.access(dryer, os.X_OK) and os.access(crapper, os.X_OK)):
+    bins = ub_bins(base_tree, say)
+    if not bins:
         with open(out, "w") as f:
             f.write(NO_DIAG + "\n")
         return
+    dryer, crapper = bins
     changed = os.path.join(ctx, ".changed")
     with open(changed, "w") as f:
         f.write(git("diff", "--name-only", f"{base_sha}...{head}"))
@@ -380,6 +434,39 @@ def self_test():
     body = "**Verdict: MUST_FIX**: x\n\n### Must fix\n#### 1. One\ntext\n#### 2. Two\n\n### Checked\n#### not this\n"
     expect(must_fix_titles(body) == ["1. One", "2. Two"], f"must-fix titles: {must_fix_titles(body)}")
     expect(must_fix_titles("**Verdict: CLEAN**: ok\n\n### Checked\n") == [], "a clean review has no must-fix titles")
+    # dryer and crapper: review.yml's pins, installed only when missing or at other pins
+    with tempfile.TemporaryDirectory() as t:
+        expect(ub_pins(os.path.normpath(os.path.join(HERE, "../.."))) is not None, "review.yml's install step names both pins")
+        os.makedirs(os.path.join(t, "base/.github/workflows"))
+        open(os.path.join(t, "base/.github/workflows/review.yml"), "w").write("DRYER_SHA: " + "a" * 40 + "\nCRAPPER_SHA: " + "b" * 40 + "\n")
+        calls = []
+
+        def fake_install(root, pins):
+            calls.append(pins)
+            os.makedirs(os.path.join(root, "venv/bin"))
+            for b in ("dryer", "crapper"):
+                open(os.path.join(root, "venv/bin", b), "w").close()
+                os.chmod(os.path.join(root, "venv/bin", b), 0o755)
+            open(os.path.join(root, "pins"), "w").write(" ".join(pins) + "\n")
+
+        ub = os.path.join(t, "ub")
+        got = ub_bins(os.path.join(t, "base"), lambda m: None, ub, fake_install)
+        expect(got is not None and calls == [("a" * 40, "b" * 40)], f"missing tools are installed at the pins: {calls}")
+        ub_bins(os.path.join(t, "base"), lambda m: None, ub, fake_install)
+        expect(len(calls) == 1, f"tools at the pins are not installed again: {calls}")
+        open(os.path.join(t, "base/.github/workflows/review.yml"), "w").write("DRYER_SHA: " + "c" * 40 + "\nCRAPPER_SHA: " + "b" * 40 + "\n")
+        shutil.rmtree(ub)
+        os.makedirs(os.path.join(ub, "venv/bin"))
+        open(os.path.join(ub, "pins"), "w").write("a" * 40 + " " + "b" * 40 + "\n")
+        ub_bins(os.path.join(t, "base"), lambda m: None, ub, fake_install)
+        expect(len(calls) == 2 and calls[-1][0] == "c" * 40, f"a moved pin installs again: {calls}")
+
+        def broken(root, pins):
+            raise subprocess.CalledProcessError(128, "git")
+
+        said = []
+        expect(ub_bins(os.path.join(t, "base"), said.append, os.path.join(t, "ub2"), broken) is None and any("failed" in m for m in said),
+               f"a failed install is named and the diagnostics skip: {said}")
     # pre-checks: run only for a path under their prefixes; a red one stops the run 1 naming the script and its output
     with tempfile.TemporaryDirectory() as t:
         os.makedirs(os.path.join(t, "tools"))
