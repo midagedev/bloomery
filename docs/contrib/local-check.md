@@ -40,7 +40,9 @@ for your own hardware"). CI runs `just contrib-check --tier t0` on every pull re
 `just pre-review` (`tools/review/local.py`) runs only the reviewer by default, in at most 10 minutes; `--full` adds the
 validator as the pull request review runs it. Nothing is posted, and the pull request's own review stays the review of
 record. Its output stays in `~/.cache/bloomery/pre-review/<branch>-<sha8>/`. Do not push while that review is running:
-a push starts it again.
+a push starts it again. Before the reviewer, a branch that touches `tools/`, the justfile, `.cargo/` or `crates/` runs
+`tools/check-levers.sh` (text only, about 10 s; `PRE_CHECKS` in `local.py` lists such checks): red ends the run 1 with its
+output, before the reviewer's cost.
 
 ## 2. `just contrib-check` (T0 and T1)
 

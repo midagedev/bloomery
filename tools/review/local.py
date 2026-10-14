@@ -19,8 +19,13 @@ By default only the reviewer runs: the validator only removes findings, and here
 round trip. --full runs the validator after it, as the workflow does. Then `post.py check` reads the output as it
 does before posting. Nothing is posted and the workflow is not touched; review.yml stays the review of record.
 
+Before the reviewer, the text-only checks a push needs and nobody runs by hand run on PR_TREE when the branch touches
+their inputs (PRE_CHECKS: tools/check-levers.sh, about 10 s, for tools/, the justfile, .cargo/ or crates/); a red one
+ends the run 1 by name, before the reviewer's cost. The failure it blocks: a lever or marker name that only a
+hand-run check-levers caught.
+
 Prints the verdict, the must-fix titles and where the output is (~/.cache/bloomery/pre-review/<branch>-<sha8>/).
-Exit: 0 CLEAN; 1 MUST_FIX; 75 no claude CLI, or a role past --minutes (default 10); 64 usage; 65 output post.py refused
+Exit: 0 CLEAN; 1 MUST_FIX or a red pre-check; 75 no claude CLI, or a role past --minutes (default 10); 64 usage; 65 output post.py refused
 or a review with no verdict; 70 a context step that failed (named).
 The failure it blocks: a pull request whose first Shingler review is a MUST_FIX, each fold another 10-27 minute round.
 """
@@ -41,6 +46,8 @@ from post import VERDICT_RE  # noqa: E402
 from run import MINUTES, TIMEOUT, launch  # noqa: E402
 
 REPO = "midagedev/bloomery"
+# (script, the path prefixes that run it): a text-only check of PR_TREE, run when the branch changes one of them
+PRE_CHECKS = (("tools/check-levers.sh", ("tools/", "justfile", ".cargo/", "crates/")),)
 NET_S = 60  # each gh or git fetch call: past it the step reads as unanswered, never as a hang
 MARKER_RE = re.compile(r"<!-- bloomery-review head_sha=([0-9a-f]{40})")
 # The files the workflow's context step leaves in CTX (pr-full.json is removed there); prev-review.md only on a re-review.
@@ -229,6 +236,20 @@ def run_role(role, d, minutes, say):
     return rc
 
 
+def pre_checks(pr_tree, paths, say):
+    """PRE_CHECKS whose prefixes a changed path starts with, on PR_TREE; the first red one stops the run 1, named."""
+    for script, prefixes in PRE_CHECKS:
+        if not any(p.startswith(prefixes) for p in paths):
+            continue
+        t0 = time.time()
+        r = subprocess.run(["bash", os.path.join(pr_tree, script)], cwd=pr_tree, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+        if r.returncode:
+            tail = "\n".join((r.stdout + r.stderr).strip().splitlines()[-8:])
+            raise Stop(1, f"pre-review: {script} is red on this head (rc {r.returncode}); fix it before the push:\n{tail}")
+        say(f"pre-review: {script} ok ({time.time() - t0:.0f} s)")
+
+
 def must_fix_titles(body):
     """The must-fix items' titles (`#### <n>. <title>` under `### Must fix`)."""
     m = re.search(r"^### Must fix\s*$(.*?)(?=^### |\Z)", body, re.M | re.S)
@@ -264,6 +285,7 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     with tempfile.TemporaryDirectory(prefix="pre-review.") as d:
         unpack(base_sha, os.path.join(d, "base"))
         unpack(head, os.path.join(d, "pr"))
+        pre_checks(os.path.join(d, "pr"), git("diff", "--name-only", "-z", f"{base_sha}...{head}").split("\0"), say)
         for x in ("ctx", "out", "trace"):
             os.makedirs(os.path.join(d, x))
         try:
@@ -358,6 +380,24 @@ def self_test():
     body = "**Verdict: MUST_FIX**: x\n\n### Must fix\n#### 1. One\ntext\n#### 2. Two\n\n### Checked\n#### not this\n"
     expect(must_fix_titles(body) == ["1. One", "2. Two"], f"must-fix titles: {must_fix_titles(body)}")
     expect(must_fix_titles("**Verdict: CLEAN**: ok\n\n### Checked\n") == [], "a clean review has no must-fix titles")
+    # pre-checks: run only for a path under their prefixes; a red one stops the run 1 naming the script and its output
+    with tempfile.TemporaryDirectory() as t:
+        os.makedirs(os.path.join(t, "tools"))
+        lev = os.path.join(t, "tools/check-levers.sh")
+        open(lev, "w").write("echo 'check-levers: BLOOMERY_X is no row'; exit 3\n")
+        said = []
+        pre_checks(t, ["a.txt", "docs/x.md"], said.append)
+        expect(said == [], f"a branch outside the prefixes runs no pre-check: {said}")
+        try:
+            pre_checks(t, ["a.txt", "tools/box.sh"], said.append)
+            got = None
+        except Stop as e:
+            got = e
+        expect(got is not None and got.code == 1 and "tools/check-levers.sh is red" in got.msg and "BLOOMERY_X is no row" in got.msg,
+               f"a red check-levers stops the run 1 by name with its output: {got and (got.code, got.msg)}")
+        open(lev, "w").write("exit 0\n")
+        pre_checks(t, ["crates/gpu/src/lib.rs"], said.append)
+        expect(len(said) == 1 and said[0].startswith("pre-review: tools/check-levers.sh ok"), f"a green one is printed: {said}")
     # a scratch repo end to end with a stub runner: CLEAN 0, MUST_FIX 1, a slow runner 75, no verdict 65
     with tempfile.TemporaryDirectory() as t:
         repo = os.path.join(t, "r")
