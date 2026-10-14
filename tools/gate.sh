@@ -75,15 +75,24 @@ if [ "${#FILTERS[@]}" = 0 ] || [ "$LISTING" = 1 ]; then
   rc=$?
 else
   LOG=$(mktemp)
-  trap 'rm -f "$LOG" "$LOG.out"' EXIT
+  TEE_PID='' TEE_EXIT=''
+  trap '[ -z "$TEE_PID" ] || kill -TERM "$TEE_PID" 2> /dev/null || :; rm -f "$LOG" "$LOG.out"' EXIT
   # cargo's output reaches tee through a FIFO, not a pipe: in a pipeline run_bounded would run in a subshell that a TERM to this
-  # runner does not reach.
+  # runner does not reach. tee starts before run_bounded sets its trap, so until then a TERM, INT or HUP ends this runner and tee
+  # with it (one that comes before tee's pid is known, as soon as it is): a tee left waiting to open the FIFO would hold this
+  # runner's output open. run_bounded puts this trap back when it returns.
+  for s in TERM:143 INT:130 HUP:129; do
+    # shellcheck disable=SC2064 # the code now, TEE_PID when the trap runs
+    trap "TEE_EXIT=${s#*:}; [ -z \"\$TEE_PID\" ] || exit ${s#*:}" "${s%:*}"
+  done
   mkfifo "$LOG.out"
   tee "$LOG" < "$LOG.out" &
   TEE_PID=$!
+  [ -z "$TEE_EXIT" ] || exit "$TEE_EXIT"
   run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@" > "$LOG.out"
   rc=$?
   wait "$TEE_PID"
+  TEE_PID=''
   if [ "$rc" -eq 0 ]; then
     passed=$(awk '/^test result: / { for (i = 2; i <= NF; i++) if ($i == "passed;") n += $(i - 1) } END { print n + 0 }' "$LOG")
     if [ "$passed" -eq 0 ]; then
