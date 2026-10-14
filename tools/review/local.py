@@ -30,7 +30,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -39,6 +38,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from post import VERDICT_RE  # noqa: E402
+from run import MINUTES, TIMEOUT, launch  # noqa: E402
 
 REPO = "midagedev/bloomery"
 NET_S = 60  # each gh or git fetch call: past it the step reads as unanswered, never as a hang
@@ -214,23 +214,19 @@ def diag(ctx, base_tree, base_sha, head, say):
             f.write(NO_DIAG + "\n")
 
 
-def run_role(role, d, minutes, runner=None):
-    """One role through the base tree's run-claude.sh; its rc, 124 past the bound."""
-    script = runner or os.path.join(d, "base/tools/review/run-claude.sh")
-    env = dict(os.environ, REVIEW_SETTING_SOURCES="project")
-    # its own process group: past the bound the whole run stops, claude included, not only the bash in front of it
-    p = subprocess.Popen(["bash", script, role, *(os.path.join(d, x) for x in ("base", "pr", "ctx", "out", "trace"))],
-                         env=env, stdin=subprocess.DEVNULL, start_new_session=True)
-    try:
-        return p.wait(timeout=minutes * 60)
-    except subprocess.TimeoutExpired:
-        os.killpg(p.pid, signal.SIGKILL)
-        p.wait()
-        return 124
-    except BaseException:  # Ctrl-C or TERM here: the run stops with us
-        os.killpg(p.pid, signal.SIGKILL)
-        p.wait()
-        raise
+def run_role(role, d, minutes, say):
+    """One role through the base tree's run-claude.sh, by the workflow's own launcher (run.py): its own process group,
+    stopped past the bound or when we are; its output in trace/<role>.log, whose summary line is printed. Its rc, TIMEOUT
+    past the bound."""
+    MINUTES[role] = minutes
+    paths = [os.path.join(d, x) for x in ("base", "pr", "ctx", "out", "trace")]
+    rc = launch("claude", role, paths, dict(os.environ, REVIEW_SETTING_SOURCES="project"))
+    log = os.path.join(d, "trace", f"{role}.log")
+    if os.path.exists(log):
+        for line in open(log, encoding="utf-8", errors="replace"):
+            if line.startswith(f"{role}: "):
+                say(line.rstrip("\n"))
+    return rc
 
 
 def must_fix_titles(body):
@@ -248,8 +244,8 @@ def unpack(sha, dest):
         raise Stop(70, f"pre-review: git archive {sha[:12]} could not be unpacked")
 
 
-def review(args, runner=None, say=lambda m: print(m, file=sys.stderr)):
-    if not runner and not shutil.which("claude"):
+def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
+    if not stubbed and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
     try:
         fetched = subprocess.run(["git", "fetch", "-q", "origin"], capture_output=True, timeout=NET_S).returncode == 0
@@ -275,8 +271,8 @@ def review(args, runner=None, say=lambda m: print(m, file=sys.stderr)):
             t_ctx = time.time() - t0
             roles = ("reviewer", "validator") if args.full else ("reviewer",)
             for role in roles:
-                rc = run_role(role, d, args.minutes, runner)
-                if rc == 124:
+                rc = run_role(role, d, args.minutes, say)
+                if rc == TIMEOUT:
                     raise Stop(75, f"pre-review: the {role} ran past {args.minutes} min; no verdict (push is your call); see {keep}")
                 if rc:
                     raise Stop(70, f"pre-review: the {role} ended rc {rc}; its transcript is in {keep}/trace")
@@ -371,12 +367,15 @@ def self_test():
         sh("git", "config", "user.email", "t@t")
         sh("git", "config", "user.name", "t")
         here_root = os.path.normpath(os.path.join(HERE, "../.."))
-        for rel in ("tools/review/post.py", "tools/review/ledger.py", "tools/review/run-claude.sh", "tools/review/usage.py",
+        for rel in ("tools/review/post.py", "tools/review/ledger.py", "tools/review/usage.py",
                     "tools/recipes.py", "justfile", "Cargo.toml"):
             src = os.path.join(here_root, rel)
             if os.path.exists(src):
                 os.makedirs(os.path.dirname(os.path.join(repo, rel)), exist_ok=True)
                 shutil.copy(src, os.path.join(repo, rel))
+        # the base tree's run-claude.sh, which run.launch starts, hands the role to the case's stub
+        stub = os.path.join(t, "stub.sh")
+        open(os.path.join(repo, "tools/review/run-claude.sh"), "w").write('#!/usr/bin/env bash\nexec bash "$PRE_REVIEW_TEST_STUB" "$@"\n')
         open(os.path.join(repo, "a.txt"), "w").write("a\n")
         sh("git", "add", "-A")
         sh("git", "commit", "-qm", "base")
@@ -384,13 +383,11 @@ def self_test():
         sh("git", "checkout", "-qb", "topic")
         open(os.path.join(repo, "a.txt"), "w").write("a\nb\n")
         sh("git", "commit", "-qam", "topic: one line")
-        stub = os.path.join(t, "stub.sh")
 
         def runner(text, sleep=0):
             open(stub, "w").write("#!/usr/bin/env bash\nout=$5\n" + (f"sleep {sleep}\n" if sleep else "")
                                   + f"cat > \"$out/review.md\" <<'EOF'\n{text}\nEOF\n"
                                   + "case \"$(head -1 \"$out/review.md\")\" in *MUST_FIX*) echo MUST_FIX ;; *) echo CLEAN ;; esac > \"$out/decision.txt\"\n")
-            return stub
 
         cwd = os.getcwd()
         os.chdir(repo)
@@ -406,12 +403,14 @@ def self_test():
         g["read_ledger"] = fake_ledger
         home = os.environ.get("HOME")
         os.environ["HOME"] = os.path.join(t, "home")
+        os.environ["PRE_REVIEW_TEST_STUB"] = stub
         try:
             def go(text, sleep=0, minutes=10):
                 a = argparse.Namespace(base="basebr", full=False, minutes=minutes, body=None)
                 msgs = []
                 try:
-                    return review(a, runner=runner(text, sleep), say=msgs.append), msgs
+                    runner(text, sleep)
+                    return review(a, stubbed=True, say=msgs.append), msgs
                 except Stop as e:
                     return e.code, msgs + [e.msg]
 
@@ -429,7 +428,7 @@ def self_test():
             open(stub, "w").write(f"#!/usr/bin/env bash\n( sleep 30 & echo $! > {pidf}; wait )\n")
             a = argparse.Namespace(base="basebr", full=False, minutes=0.03, body=None)
             try:
-                rc, msg = review(a, runner=stub, say=lambda m: None), ""
+                rc, msg = review(a, stubbed=True, say=lambda m: None), ""
             except Stop as e:
                 rc, msg = e.code, e.msg
             time.sleep(0.2)
@@ -444,6 +443,7 @@ def self_test():
         finally:
             os.chdir(cwd)
             g.update(saved)
+            os.environ.pop("PRE_REVIEW_TEST_STUB", None)
             if home is None:
                 os.environ.pop("HOME", None)
             else:
