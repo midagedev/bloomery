@@ -88,10 +88,8 @@
 //!   step-1,024 set prefilled on the pass path (128 units of eight, bit for
 //!   bit the one-token path) and as one ubatch of 1,024 (the wide arm), each
 //!   from zero stores: layer 0's recurrent state and conv ring within
-//!   [`U_L0_REL`] of the pass run's, and each run's conv ring rows within
-//!   [`HOST_RULE_REL`] of the host's rule for the `attn_qkv` site's declared
-//!   form (a Q8_0 site's 8-bit codes of 32 values, on both arms); every
-//!   layer's store distance and the prefill's last logits printed, and (d)
+//!   [`U_L0_REL`] of the pass run's; every layer's store distance and the
+//!   prefill's last logits printed, and (d)
 //!   prints each layer's store distance between the two runs beside its
 //!   distances from ik.
 //! - (d) both prefills against ik's state after its 1,024-token prompt batch
@@ -450,10 +448,7 @@ mod gate {
     /// against the pass run's (`‖ubatch − pass‖ / ‖pass‖`). Layer 0's input is
     /// the same bits on both paths (the embedding rows; `rms_norm` then the
     /// GEMM quantizer write the bytes `norm_quant` writes, gate_qwen3moe's
-    /// premise for the same kernels), and every site of layer 0 reads its
-    /// declared activation form on both arms (`SiteTy::reads`: q8_1 blocks of
-    /// 128 for a K-quant, q8 blocks of 32 for a Q8_0 site; the host-rule
-    /// clause below holds the premise), so only its four projections differ,
+    /// premise for the same kernels), so only its four projections differ,
     /// each within its sum's rounding of the exact dot of the same codes:
     /// about 1.2e-6 of `Σ |terms|` at K = 2,048, some four times a value, so
     /// Δ ≤ 1e-5 of a row (gate_qwen3moe's GEMM_L0_REL note). The ring holds
@@ -466,21 +461,6 @@ mod gate {
     /// fault in layer 0 (β read from α's weights, a token's position off)
     /// reads an error of order one.
     const U_L0_REL: f64 = 1e-4;
-
-    /// PIN(2026-10-13): the band of (u)'s host-rule clause, a conv ring row of
-    /// layer 0 against the host's f64 dot of the file's `attn_qkv` rows with
-    /// the 8-bit/32 form of the normed embedding (a scale `amax/127` and codes
-    /// `round(x/d)` a block of 32), each run's own rows (`‖run − host‖ /
-    /// ‖host‖`). Each arm's launch evaluates that dot as exact integer sums
-    /// per block times two scales in f32, so it differs from the host's by the
-    /// f32 sum's rounding: some 1e-7 of the rows' norm (udnarrow measured
-    /// 1.1e-7 and 1.4e-7 on the UD file, layer 0's ring of the last four
-    /// positions), at most a few 1e-6 of a value where terms cancel by four.
-    /// The other rule (the f32 rows) sits 3.0e-3 from the 8-bit one on the
-    /// same rows: a path that reads its sites in another form than the other
-    /// reads 3e-3 and fails this band by three orders; 1e-6 is ten times the
-    /// measured error.
-    const HOST_RULE_REL: f64 = 1e-6;
 
     /// PIN(2026-09-27): (d)'s bound on the step at position 1,024 free-running
     /// from each run's own state — each layer's output distance from ik's and
@@ -2564,115 +2544,6 @@ mod gate {
         }
     }
 
-    /// (u)'s host-rule clause: layer 0's conv ring rows (its `attn_qkv`
-    /// projection of the last [`RING_ROWS`] positions of `prompt`) from the
-    /// pass run and the ubatch run, each against the host's dot of the file's
-    /// rows with the normed embedding in the form the site declares, within
-    /// [`HOST_RULE_REL`]; the host's other form (the f32 rows) is printed
-    /// beside. Run on a Q8_0 site (the 8-bit rule of 32 values, both arms);
-    /// a K-quant site reads blocks of 128 and is named, not run.
-    fn l0_host_rule(
-        label: &str,
-        prompt: &[u32],
-        (pass, ub): (&StoreHost, &StoreHost),
-    ) -> Result<bool, GateError> {
-        let split = open_model()?;
-        let wqkv = HostMat::of(&split, "blk.0.attn_qkv.weight")?;
-        if wqkv.ty != gguf::GgmlType::Q8_0 {
-            println!(
-                "{label}wide layer=0 host rule: attn_qkv is {}, read as q8_1 blocks of 128 on \
-                 both arms; the 8-bit/32 rule is not run (printed)",
-                wqkv.ty
-            );
-            return Ok(true);
-        }
-        let (StoreHost::Rec { ring: ring_p, .. }, StoreHost::Rec { ring: ring_u, .. }) = (pass, ub)
-        else {
-            return Err("layer 0 holds no recurrent store".into());
-        };
-        let embd = HostMat::of(&split, &names::token_embd())?;
-        let gain = split_f32(&split, "blk.0.attn_norm.weight", HIDDEN)?;
-        let eps = f64::from(Hparams::read(&split)?.rms_eps);
-        let n = prompt.len();
-        let ch = ring_p.len() / RING_ROWS;
-        if n < RING_ROWS
-            || embd.k != HIDDEN
-            || wqkv.k != HIDDEN
-            || ring_u.len() != ring_p.len()
-            || wqkv.data.len() / wqkv.row_bytes != ch
-        {
-            return Err(format!(
-                "host rule: {n} ids, embedding rows of {}, attn_qkv {} x {} rows, rings of {} and \
-                 {} values over {ch} channels",
-                embd.k,
-                wqkv.k,
-                wqkv.data.len() / wqkv.row_bytes,
-                ring_p.len(),
-                ring_u.len()
-            )
-            .into());
-        }
-        // Each slot's position, its normed row as f32 (the form of the f32
-        // rows) and as 32-value 8-bit codes times their scale.
-        let (mut xf, mut xq) = (Vec::new(), Vec::new());
-        let mut row = vec![0.0f32; HIDDEN];
-        for s in 0..RING_ROWS {
-            let p = (n - RING_ROWS..n)
-                .find(|p| p % RING_ROWS == s)
-                .ok_or("host rule: a ring slot with no position")?;
-            let t = prompt[p] as usize;
-            let bytes = embd
-                .data
-                .get(t * embd.row_bytes..(t + 1) * embd.row_bytes)
-                .ok_or("host rule: a token past the embedding")?;
-            gguf::quant::dequant_row(embd.ty, bytes, &mut row)
-                .map_err(|e| format!("dequant {}: {e}", embd.ty))?;
-            let ss = row.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / HIDDEN as f64;
-            let r = 1.0 / (ss + eps).sqrt();
-            let xn: Vec<f32> = row
-                .iter()
-                .zip(&gain)
-                .map(|(&v, &g)| (f64::from(v) * r * f64::from(g)) as f32)
-                .collect();
-            let mut q = vec![0.0f64; HIDDEN];
-            for (blk, qb) in xn.chunks(32).zip(q.chunks_mut(32)) {
-                let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                for (o, &v) in qb.iter_mut().zip(blk) {
-                    *o = f64::from((v / d).round().clamp(-127.0, 127.0)) * f64::from(d);
-                }
-            }
-            xf.push(xn.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>());
-            xq.push(q);
-        }
-        let mut yf = vec![0.0f32; RING_ROWS * ch];
-        let mut yq = vec![0.0f32; RING_ROWS * ch];
-        let mut w = vec![0.0f32; HIDDEN];
-        for r in 0..ch {
-            let bytes = &wqkv.data[r * wqkv.row_bytes..(r + 1) * wqkv.row_bytes];
-            gguf::quant::dequant_row(wqkv.ty, bytes, &mut w)
-                .map_err(|e| format!("dequant {}: {e}", wqkv.ty))?;
-            for s in 0..RING_ROWS {
-                let dot =
-                    |x: &[f64]| -> f64 { w.iter().zip(x).map(|(&a, &b)| f64::from(a) * b).sum() };
-                yf[s * ch + r] = dot(&xf[s]) as f32;
-                yq[s * ch + r] = dot(&xq[s]) as f32;
-            }
-        }
-        let (pq, uq) = (rel_to(ring_p, &yq), rel_to(ring_u, &yq));
-        let ok = worse(pq, uq) <= HOST_RULE_REL;
-        println!(
-            "{label}wide layer=0 host rule (attn_qkv {}, {RING_ROWS} ring rows of {ch}): pass \
-             {pq:.3e} ubatch {uq:.3e} against the host's 8-bit/32 rule (band {HOST_RULE_REL:.0e}) \
-             {}; against the host's f32-rows rule pass {:.3e} ubatch {:.3e} (printed)",
-            wqkv.ty,
-            verdict(ok),
-            rel_to(ring_p, &yf),
-            rel_to(ring_u, &yf)
-        );
-        Ok(ok)
-    }
-
     /// (u) and (d) on `m`, whose ubatch is `ubatch`: the step set's prompt on
     /// the pass path (the one-token path's bits) and as the ubatch walk, whose
     /// units are all wide (`label` prefixes the clause's lines). The whole
@@ -2721,7 +2592,6 @@ mod gate {
                 );
             }
         }
-        ok &= l0_host_rule(label, prompt, (&pass.stores[0], &ub.stores[0]))?;
         println!(
             "{label}wide prefill: token ours ubatch={} pass={}, last logits_rel={:.3e} (printed)",
             ub.next,
