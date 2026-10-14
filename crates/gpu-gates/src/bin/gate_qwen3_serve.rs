@@ -241,7 +241,7 @@
 //!   the pass capture under the launcher's own message; a seat that still
 //!   splits a set `--ctx` by its default two prints `slots=2 slot_ctx=7`
 //!   and dies in the load instead of the one-slot line.
-//! - `ctx_search_reads_the_census_once`, the main server and
+//! - `ctx_choice_reads_the_census_once`, the main server and
 //!   `ctx_default`'s placed arm, the servers whose `--ctx` is unset: each
 //!   `--ctx` choice the seat ran names its probes and its census readings on
 //!   one line, and every one read the census once for all its probes.
@@ -670,14 +670,14 @@ mod gate {
             .find_map(|w| w.strip_prefix(&format!("{name}=")))
     }
 
-    /// The `--ctx` searches a server's stderr names, one line a search
-    /// (`… --ctx search ran P probes on C census reading(s)`): each one's
+    /// The `--ctx` choices a server's stderr names, one line a choice
+    /// (`… --ctx choice ran P probes on C census reading(s)`): each one's
     /// probes and census readings.
-    fn searches(log: &str) -> Vec<(u64, u64)> {
+    fn choices(log: &str) -> Vec<(u64, u64)> {
         log.lines()
             .filter_map(|l| {
                 let (probes, rest) = l
-                    .split(" --ctx search ran ")
+                    .split(" --ctx choice ran ")
                     .nth(1)?
                     .split_once(" probes on ")?;
                 let censuses = rest.split(' ').next()?;
@@ -951,7 +951,7 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         // The trained context read from the file beside the server, not the
-        // server's own echo of it, by the owner the seat's search reads it
+        // server's own echo of it, by the owner the seat's choice reads it
         // through.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let trained = bloomery_gpu_gates::generate::trained_ctx(&split)
@@ -986,12 +986,12 @@ mod gate {
             .unwrap_or(u64::MAX);
         println!("ctx arm placed: props n_ctx {n} of trained {trained}");
         check(ok, "ctx_never_passes_the_trained_context", n <= trained);
-        // The placed default is searched over the plan's own
+        // The placed default is chosen over the plan's own
         // expert split under the common rule, and the relation is what
         // holds on every card — the fit rides the census reading: the one
         // `ctx` line's total is the total the one `plan` record was made
         // at, and `/props` serves a slot's share of it. FAIL-first: a
-        // search that ignores its bound plans past what the card holds
+        // choice that ignores its bound plans past what the card holds
         // and the server dies before listening — on the 3090, a
         // Qwen3.6 plan that keeps every expert at a context its
         // whole load (which that plan opens) does not fit.
@@ -1038,16 +1038,16 @@ mod gate {
         // qwen35moe arm: the seat's qwen35moe slots are resident
         // sequences (`Slot35`), so the turns it pinned are gone.
         check(ok, "placed_slots_are_resident", terms == [2, slot, 2, slot]);
-        // Every search the unset `--ctx` ran — the placed one a run under
+        // Every choice the unset `--ctx` ran — the placed one a run under
         // `--place` runs — read the census once for all its probes (the
-        // seat's line a search). FAIL-first: a search that resolves its
+        // seat's line a choice). FAIL-first: a choice that resolves its
         // placement per probe reads the census once a probe.
         let log = std::fs::read_to_string(&err_log)?;
-        let runs = searches(&log);
-        println!("ctx arm placed: searches (probes, census readings) {runs:?}");
+        let runs = choices(&log);
+        println!("ctx arm placed: choices (probes, census readings) {runs:?}");
         check(
             ok,
-            "ctx_search_reads_the_census_once",
+            "ctx_choice_reads_the_census_once",
             !runs.is_empty() && runs.iter().all(|&(p, c)| p >= 1 && c == 1),
         );
         println!("ctx arm placed: server stopped: {}", s.stop()?);
@@ -1069,9 +1069,9 @@ mod gate {
         // carry none, so the same product is only the upper
         // bound (their exact 17/32 term is the model crate's
         // own unit pin).
-        // The delta holds at one context: the auto search grows
-        // the q8_0 answer past the f16 one wherever the card has
-        // room, so the residents compare against a q8_0 server
+        // The delta holds at one context: the default ladder can take
+        // a higher rung under q8_0 than under f16 where the card is
+        // short at f16's, so the residents compare against a q8_0 server
         // held to the main server's context by `--ctx`, started
         // once the placed arm's server has stopped (two loads do
         // not fit one card).
@@ -1343,7 +1343,7 @@ mod gate {
         ];
         let mut s = Served::spawn_cmd(cmd, &args, &d)?;
         // The verdict's line prints before the open, so a listening server
-        // has printed it. The flag wins over the search: `/props` names the
+        // has printed it. The flag wins over the default: `/props` names the
         // context it named. FAIL-first: a seat that ignores the flag serves
         // its default.
         let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
@@ -2815,14 +2815,14 @@ mod gate {
         ctx_default_is_the_highest_rung_held(model, &split, &log, default_n, trained, ok)?;
         default_ctx_line_names_its_rule(&log, (1, default_n, trained), None, ok);
         default_load_counts_its_arena(&split, &log, default_n, &arch, ok)?;
-        // Every search the unset `--ctx` ran read the census once for all its
-        // probes (the seat's line a search). FAIL-first: a search that
+        // Every choice the unset `--ctx` ran read the census once for all its
+        // probes (the seat's line a choice). FAIL-first: a choice that
         // resolves its placement per probe reads the census once a probe.
-        let runs = searches(&log);
-        println!("ctx arm default: searches (probes, census readings) {runs:?}");
+        let runs = choices(&log);
+        println!("ctx arm default: choices (probes, census readings) {runs:?}");
         check(
             ok,
-            "ctx_search_reads_the_census_once",
+            "ctx_choice_reads_the_census_once",
             !runs.is_empty() && runs.iter().all(|&(p, c)| p >= 1 && c == 1),
         );
 

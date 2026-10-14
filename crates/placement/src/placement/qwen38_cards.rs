@@ -699,7 +699,7 @@ fn two_slots_at_4096_hold_every_routed_expert() {
 /// card expert bytes than the plan at 4,096
 /// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
 /// next step passes it. There 504 or 505 experts a layer stay on the card
-/// and 337 go to the host. The seat no longer searches for this context.
+/// and 337 go to the host.
 #[test]
 fn two_slots_at_252416_stay_within_the_margin() {
     let (at, n_l, host) = two_slots(252_416);
@@ -1083,10 +1083,10 @@ fn a_given_room_plans_as_given() {
 /// ends with its need at the reading,
 /// and a load whose reading fell by a little less than the margin is
 /// refused with no arena to shrink. A plan made at [`plan_room`] of the
-/// reading pages the context whose need passes the margin, which stops the
-/// search a margin under the reading.
+/// reading pages the context whose need passes the margin, so its need ends
+/// a margin under the reading.
 #[test]
-fn an_unpaged_plans_search_stops_a_margin_under_the_reading() {
+fn an_unpaged_plan_at_the_plan_room_ends_a_margin_under_the_reading() {
     // The reading the load took less than the plan's, as a second host
     // reported it.
     const SHORT: u64 = 162_668_544;
@@ -1112,8 +1112,8 @@ fn an_unpaged_plans_search_stops_a_margin_under_the_reading() {
     assert_eq!(filled.bytes(), need);
     assert!(filled.check(need - SHORT).is_err(), "no arena to shrink");
 
-    // The plan at the reading's plan room pages, so the search stops there,
-    // and its load passes the lowered reading.
+    // The plan at the reading's plan room pages, and its load passes the
+    // lowered reading.
     let room = plan_room(&(need, HostRead::MemAvailable));
     let kept =
         plan_given(&q4, &gate, 4096, 1, room, Some(None)).expect("the plan at the plan room");

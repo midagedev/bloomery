@@ -151,8 +151,8 @@
 //! the rule's, to answer, so a set `BLOOMERY_DRAFT=mtp` runs), one `paged`
 //! line on stderr naming the arena and what was asked (`asked_draft` the
 //! draft before that yield, `draft` what the plan serves). The rule reads
-//! the plan the flags name — a set context's plain plan before any search,
-//! else the plan the default's search and the draft's yield chose — and the
+//! the plan the flags name — a set context's plain plan before any choice,
+//! else the plan the default's choice and the draft's yield chose — and the
 //! load's own plan is held to it: the engine thread plans from the room the
 //! main thread read (`PlanInputs::room`, never a reading of its own), and
 //! its plan must have the terms the records and rules read (`PlanKey`: the
@@ -1092,7 +1092,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let lane = lane_of(stage)?;
     let mut inputs = PlanInputs::describe(&split)?;
     // The slot count first: it shapes the draft's window condition, the
-    // context search itself, and every plan the seat asks for, each counting
+    // context choice itself, and every plan the seat asks for, each counting
     // every sequence (`Plans::slots`). A set `--ctx-size` with no
     // `--parallel` is one request's context — one slot at the whole of it
     // (`bind::slots_of`).
@@ -1200,7 +1200,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The common rule's choice (the comment at the draft's rule above): the
     // plan of the offer at the seat's own terms — the draft the flag's stage
     // resolved, the slots, the asked-or-default context, which the context
-    // search below asks again at the chosen placement — names the tier count
+    // choice below asks again at the chosen placement — names the tier count
     // the rule holds against its break-even; a refused plan of the offer
     // runs `a`, the refusal named on stderr, and an unset flag never refuses
     // a load that `--place a` serves.
@@ -1239,8 +1239,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     // The paged tier's rule (`bloomery_levers::paged_columns`, the module
     // doc), asked once of the plan the flags name: a set context's slot is
-    // known before any search, so its plain plan's arena decides ahead of the
-    // drafted plan; the default's is asked below, of the plan its search and
+    // known before any choice, so its plain plan's arena decides ahead of the
+    // drafted plan; the default's is asked below, of the plan its choice and
     // the draft's yield chose. Under the rule the plan serves the asked
     // count, a set draft, and an unset one off.
     let paged_at = |arena: u64, mtp: bool| bloomery_levers::PagedAt {

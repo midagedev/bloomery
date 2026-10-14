@@ -154,7 +154,7 @@ enum Outcome {
 }
 
 impl std::fmt::Display for Outcome {
-    /// The text of a refusal or a red outcome, where a search probe or the
+    /// The text of a refusal or a red outcome, where a ladder probe or the
     /// seat's slot fit reads it as an error.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -227,7 +227,7 @@ struct Counts {
     standing: u64,
     retyped: u64,
     /// The planner calls the gate made: one a plan line, one a floor probe and
-    /// one a probe of an adapter's context search (a qwen3moe or qwen35moe
+    /// one a probe of an adapter's context choice (a qwen3moe or qwen35moe
     /// default's census reads are `q3place::census_reads`, not here).
     calls: u64,
     /// Plans L6 asked the loader table about, and the ones it refused.
@@ -363,13 +363,13 @@ struct Seed {
 const WORKERS: usize = 8;
 
 thread_local! {
-    /// The probes of context searches the adapters made on this thread
+    /// The probes of context choices the adapters made on this thread
     /// ([`probed`]); a unit of work runs on one thread, so its share is the
     /// difference across it.
     static PROBES: Cell<u64> = const { Cell::new(0) };
 }
 
-/// One plan an adapter's context search probed, counted for the unit of work
+/// One plan an adapter's context choice probed, counted for the unit of work
 /// running on this thread.
 fn probed() {
     PROBES.with(|p| p.set(p.get() + 1));

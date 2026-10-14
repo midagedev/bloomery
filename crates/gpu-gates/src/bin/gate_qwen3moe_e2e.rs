@@ -119,9 +119,8 @@
 //!   and logits bit for bit, and row 0's dequantized values within each
 //!   32-value block's own quantization step of the f16 model's row 0 (bounds
 //!   derived at runtime, no measured band); the later rows' compounding
-//!   distance prints as a diagnostic. The auto context search under the two
-//!   formats and the resident bytes' drop are `gate_qwen3_serve`'s
-//!   (`q8_ctx_never_below_the_f16_answer`, `q8_resident_drops_by_the_planes`).
+//!   distance prints as a diagnostic. The resident bytes' drop under the two
+//!   formats is `gate_qwen3_serve`'s (`q8_resident_drops_by_the_planes`).
 //! - (o) the placed load: the file planned on device 0 under a card budget
 //!   of [`PLACED_BUDGET`] (`shared/qwen3moe_place.rs`, the CLI's and the
 //!   seat's planner), which must leave routed experts both on the card and

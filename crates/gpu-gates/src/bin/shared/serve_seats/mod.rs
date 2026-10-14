@@ -15,10 +15,11 @@
 //! `drafted` is the
 //! seats' shared MTP draft driver and `served` the owner of the DSpark draft
 //! the V4.1 and qwen3 seats serve, each one file a seat's per-model binary
-//! includes beside the seat. The seats' shared `--ctx` rules (the search
-//! bisection, the default slot context — the fit and the expert margin — and
-//! the slot count a set `--ctx` buys: one slot at the whole context while
-//! `--parallel` names none) are `model::placement::ctx`.
+//! includes beside the seat. The seats' shared `--ctx` rules are one owner:
+//! the context an unset or set `--ctx` serves is `generate::choose_ctx` over
+//! `placement::ctx_ask::choose` (the ladder), and a set value's bound and the
+//! slot count it buys (one slot at the whole context while `--parallel` names
+//! none) are `placement::ctx`.
 
 #[cfg(feature = "deepseek41")]
 mod drafted;

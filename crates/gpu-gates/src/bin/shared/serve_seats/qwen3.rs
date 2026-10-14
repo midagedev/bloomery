@@ -58,12 +58,12 @@
 //! on `a`'s card, the largest visible card: the whole file while the
 //! whole-fit verdict there takes it (one stderr line with its terms), else
 //! the placed plan on that card, its `plan` record naming why
-//! (`whole_does_not_fit`). Each `--ctx` search prints one line more: its
+//! (`whole_does_not_fit`). Each `--ctx` choice prints one line more: its
 //! probes and the census readings it took. The seat takes the common rule
 //! every serving seat takes (`generate::Place::choose_untiered`: the body
 //! serves no tier card): a `place unset` record names the word `a`
 //! and why — `one card`, or on two `the body serves no tier card` — before
-//! the first search.
+//! the first choice.
 //!
 //! A request keeps the longest prefix it shares with what the slot holds:
 //! the session over the model answers the server's keep queries and cuts
@@ -1039,22 +1039,22 @@ fn pass_of<B: Body3>(slots: usize, placed: bool) -> Pass {
 /// answers: the probes it ran and the census readings it took
 /// ([`q3place::serve_choice`]) — one reading serves every probe, so a choice
 /// that read the census per probe shows here.
-fn searched_line(word: &str, r: q3place::Reads) {
+fn choice_line(word: &str, r: q3place::Reads) {
     eprintln!(
-        "{NAME}: the {word} --ctx search ran {} probes on {} census reading(s)",
+        "{NAME}: the {word} --ctx choice ran {} probes on {} census reading(s)",
         r.probes, r.censuses
     );
 }
 
 /// The context `slots` slots serve and the load made at it
-/// ([`q3place::serve_choice`]), its search line printed.
+/// ([`q3place::serve_choice`]), its choice line printed.
 fn ctx_and_load(
     split: &Split,
     (set, slots): (Option<usize>, usize),
     o: q3place::ServeOpts<'_>,
 ) -> Result<Chosen<Q3Load>, GateError> {
     let (chosen, reads) = q3place::serve_choice(split, (set, slots), o)?;
-    searched_line(if set.is_some() { "set" } else { "default" }, reads);
+    choice_line(if set.is_some() { "set" } else { "default" }, reads);
     Ok(chosen)
 }
 

@@ -92,7 +92,7 @@ pub fn checkpoints_pinned(seqs: Seqs, slot_ctx: u64) -> Result<u64, GateError> {
 /// rule's room ([`PlanRoom::mem_left`]) and the prompt cache's default budget
 /// (`CacheRam`) count them once, and a load that declares none counts none.
 /// Every machine builder prices its own context, so no probe of a context
-/// search reserves a figure priced at another. A machine reserves them once:
+/// choice reserves a figure priced at another. A machine reserves them once:
 /// a second declaration is a panic by name.
 pub fn reserve_checkpoints(
     machine: &mut Machine,

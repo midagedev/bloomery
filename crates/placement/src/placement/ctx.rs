@@ -1,10 +1,9 @@
-//! What a set `--ctx` is held to, and the bisection a search runs.
+//! What a set `--ctx` is held to, and the bisection the ladder's set ask runs.
 //!
 //! A context the flag names is checked per slot against the model's limit
 //! ([`CtxLimit`], [`check_slot_ctx`]) before any plan: past it the load
 //! stops by name ([`PastLimit`]), never on a context cut to fit. The
-//! context an unset flag serves is [`super::ctx_ask::choose`], not a search
-//! in this module.
+//! context an unset flag serves is [`super::ctx_ask::choose`].
 //!
 //! [`slots_of`] is the resident sequences a seat serves and the word for
 //! what set the count. [`largest`] is the bisection: the greatest `c` in a

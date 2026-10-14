@@ -143,7 +143,7 @@
 //! `BLOOMERY_STEP_STATS=1` each round of several slots prints a `slots
 //! round` record naming its command, rows, passes and the slots the seat
 //! serves. The plan counts every sequence in its KV term
-//! (`PlanInputs::plan_slots`, `plan_nextn_slots`), so the context search, the
+//! (`PlanInputs::plan_slots`, `plan_nextn_slots`), so the context choice, the
 //! load and `/props`' `vram_kv_bytes` see them all, and a card that cannot
 //! hold them is refused by name. Nothing parks — no slot waits for another —
 //! so `--park-ram` is refused by name. `--queue-depth Q` bounds the requests
@@ -497,7 +497,7 @@ impl Placed {
     ) -> Result<Placed, GateError> {
         let tier_batch = glm_place::tier_batch(place, &inputs.hp);
         // Every machine reserves its checkpoints at the slot context it is
-        // laid for: the search's probes each at their own, the load's at the
+        // laid for: the choice's probes each at their own, the load's at the
         // context it is granted; and the encoder's reserve, as the printed plan does.
         let price = checkpoint_price(inputs)?;
         // A projector the `--hf` repo picked stays only where the plan gives the text model the

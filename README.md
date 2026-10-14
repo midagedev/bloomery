@@ -76,11 +76,8 @@ Greedy, thinking off, `--ctx-size 16384`, serving defaults, one load. The long p
 - **`gate-gpu-qwen4exp-mtp` (pg) is a known gate-side red, and its fix does not ship in 0.3.2.** On an RTX A6000 the drafted plan's stage card holds 2,843,738,112 B less room than the plain plan at the same budget (15:52 KST, rc 1). This is the gate's clause, not a serving-default load refusal.
 - **Unset context is the seats' ladder (PIN(2026-10-14)).** With `--ctx-size` unset, one slot asks the lesser of
   262,144 and the file's limit and halves while the plan is short of the card, and of the host where the body keeps
-  no tier past it. V4.1's limit is `workstation::CTX_MAX`, 32,768. A set `--ctx-size` that does not fit is refused and is never cut. The earlier pin — one slot at
-  12,288 on a 12 GB card, while the experts moved to NVMe and the arena stayed within 1 % of the 4,096 plan, the
-  `ctx` line printing `arena=` and `base_arena=` — was that deleted search [derived on the Flash-Next fixture, before
-  2026-10-14]. It is not the current default. The ladder has not been remeasured on that card. `--ctx-size` sets the
-  context by hand.
+  no tier past it. V4.1's limit is `workstation::CTX_MAX`, 32,768. A set `--ctx-size` that does not fit is refused
+  and is never cut. `--ctx-size` sets the context by hand.
 - **Qwen3.8's MTP draft:** a request that keeps a cached prefix runs with the draft off. The prompt-state save after a
   request adds 100–160 ms to the next request's first token ([#46](https://github.com/midagedev/bloomery/issues/46)).
 - **Quant types not loaded yet:** Q2_0, IQ2_S, IQ2_XXS and IQ1_M routed experts

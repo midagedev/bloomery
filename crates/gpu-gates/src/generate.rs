@@ -123,8 +123,8 @@ const fn alias(i: usize) -> Place {
     }
 }
 
-/// The step a searched default context moves in: a round power of two a
-/// cache row count stays readable in.
+/// The step every rung of the context ladder rounds to: a round power of two
+/// a cache row count stays readable in.
 pub const CTX_GRAN: usize = 1024;
 
 /// The file's trained context (`<arch>.context_length`), `None` when the
@@ -142,7 +142,7 @@ pub type SeatBounds = (Option<(u64, &'static str)>, Option<(u64, &'static str)>)
 
 /// The steps every serving seat's context moves in
 /// ([`placement::ctx_ask::choose`]): the base a slot, the least rung an unset
-/// `--ctx` asks and the least share a set one searches, and [`CTX_GRAN`], the
+/// `--ctx` asks and the least share a set one is held to, and [`CTX_GRAN`], the
 /// rounding of every rung.
 pub const SEAT_STEPS: placement::ctx_ask::Steps = placement::ctx_ask::Steps {
     floor: 4096,
