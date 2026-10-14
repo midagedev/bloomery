@@ -77,6 +77,7 @@ md5_of() {
 self_test() {
   local t me fails=0 out rc pid
   me=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+  local boxq; boxq=$(dirname "$me")/boxq.py  # the owner of rc 84 (a lost daemon); the fake gate runs it
   t=$(mktemp -d)
   mkdir -p "$t/repo/src" "$t/muts" "$t/bad"
   local g="git -C $t/repo -c user.name=t -c user.email=t@t -c core.hooksPath=/dev/null"
@@ -111,7 +112,7 @@ case "$s" in
   *NOBUILD*) echo "error: could not compile \`fake\` (lib)"; exit 101 ;;
   *QUIET*) exit 1 ;;
   *NOTRUN*) exit 69 ;;
-  *LOST*) echo "boxq: fixture is job s184"; echo "boxq: daemon-down: job s184 is left as it is"; exit 84 ;;
+  *LOST*) BOXQ_SSH=false BOXQ_POLL_S=0.01 python3 "$T_BOXQ" attach s184; exit $? ;;
   *BREAKCOPY*) printf 'x\n' >> "$T_OUT/orig/src/a.rs"; exit 1 ;;
   *EDIT*) printf '// an edit made during the run\n' >> src/a.rs; exit 1 ;;
   *SIGNAL*) for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$T_PID" ] && break; sleep 0.1; done
@@ -130,7 +131,7 @@ EOF
     local o=$1 m=$2
     shift 2
     rm -rf "$o"
-    out=$(cd "$t/repo" && T_OUT=$o T_PID=$t/pid T_SRC=$t/repo T_CLEANRED=${CLEANRED:-} bash "$me" --out "$o" --crate fake "$@" "$m" -- "$t/gate.sh" 2>&1)
+    out=$(cd "$t/repo" && T_OUT=$o T_PID=$t/pid T_SRC=$t/repo T_BOXQ=$boxq T_CLEANRED=${CLEANRED:-} bash "$me" --out "$o" --crate fake "$@" "$m" -- "$t/gate.sh" 2>&1)
     rc=$?
   }
   expect() { # expect <case> <want rc> <want substring>
@@ -381,7 +382,7 @@ fi
 
 # A line this runner writes. With --copy it names DIR; without, it is echo.
 logline() { if [ -n "${COPY:-}" ]; then echo "$1 dir=$COPY"; else echo "$1"; fi; }
-logerr() { if [ -n "${COPY:-}" ]; then echo "$1 dir=$COPY" >&2; else echo "$1" >&2; fi; }
+logerr() { logline "$1" >&2; }
 
 # norm_abs PATH — PATH with . and .. collapsed. PATH may not exist. Relative to the cwd.
 norm_abs() {
@@ -441,7 +442,7 @@ copy_tree() {
   : > "$keep"
   while IFS= read -r -d '' f; do
     case "$f" in
-      '' | target | target/* | .git | .git/*) continue ;;
+      '' | target | target/* | .git | .git/* | .mutant-run.lock) continue ;;
       *$'\n'*) usage "--copy refuses a path that contains a newline" ;;
     esac
     [ -e "$src/$f" ] || [ -L "$src/$f" ] || continue
@@ -463,6 +464,7 @@ copy_tree() {
       .git | .git/* | target | target/* | .mutant-run.lock) continue ;;
     esac
     if [ -d "$f" ] && [ ! -L "$f" ]; then continue; fi
+    case "$rel" in *$'\n'*) usage "--copy refuses an existing path that contains a newline" ;; esac
     printf '%s\n' "$rel" >> "$OUT/copy.dest"
   done < <(find "$dst" -mindepth 1 \( -path "$dst/.git" -o -path "$dst/.git/*" -o -path "$dst/target" -o -path "$dst/target/*" \) -prune -o -print0)
   while IFS= read -r rel; do
@@ -586,6 +588,7 @@ if [ -n "$COPY" ]; then
   if [ -e "$COPY" ] && [ ! -d "$COPY" ]; then usage "--copy $COPY is not a directory"; fi
   COPY=$(phys_abs "$COPY")
   ROOT_P=$(cd "$ROOT" && pwd -P)
+  [ "$COPY" != / ] || usage "--copy / contains the tree $ROOT"
   if [ "$COPY" = "$ROOT" ] || [ "$COPY" = "$ROOT_P" ]; then usage "--copy $COPY is the tree $ROOT"; fi
   case "$COPY/" in
     "$ROOT"/* | "$ROOT_P"/*) usage "--copy $COPY is inside the tree $ROOT" ;;
@@ -684,11 +687,7 @@ run_gate() {
   local run=$1 try=1
   : > "$OUT/$run.log"
   while :; do
-    if [ -n "$COPY" ]; then
-      echo "== $run attempt $try $(date +%H:%M:%S) dir=$COPY" >> "$OUT/$run.log"
-    else
-      echo "== $run attempt $try $(date +%H:%M:%S)" >> "$OUT/$run.log"
-    fi
+    logline "== $run attempt $try $(date +%H:%M:%S)" >> "$OUT/$run.log"
     "${CMD[@]}" >> "$OUT/$run.log" 2>&1 < /dev/null
     GRC=$?
     [ "$GRC" = 75 ] && [ "$try" -lt "$RETRIES" ] || break
