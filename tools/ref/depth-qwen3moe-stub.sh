@@ -56,6 +56,11 @@
 #   place-gate   BLOOMERY_GEN_PLACE=gate with the 3090 as the timing card, 6: `--place gate` on the stub's
 #                command line, the row's `place gate`; the load line naming place=a (STUB_GEN_PLACE_RAN): a
 #                FAIL row naming both, rc 1; gate with the A6000 as the timing card: refused by name, rc 64.
+#   place-plan   STUB_GEN_PLAN=1, BLOOMERY_GEN_PLACE=a, bin:<base>:6 6 4: a qwen35moe-style arm prints a
+#                plan38 record (records.sample_line, place=a) and a load line that names no place=. The
+#                bin: arm carries that in its own output (it runs first, so LG_HEADER is empty); 6 and 4
+#                share a load, so the record is the load's header (LG_HEADER). Three ROW lines at `place a`,
+#                no FAIL. Red when the witness reads only the load line.
 #   mtp          STUB_GEN_MTP=1, 6: the row's `mtp E(4) 2.500 = positions 10 / passes 4, kept [1, 1, 1, 1]` and
 #                its pass time from the SMOKE line, `ms/pass 12.5000 (mean_ms × steps 10 / passes 4)`.
 #   mtp-pass-ratio  STUB_GEN_MTP=1, 6 6@STUB_GEN_PASSES=5, two rounds: one `mean pass` line a label (12.5 and
@@ -386,7 +391,9 @@ touch "$T/Cargo.toml"
 # a step. Every process appends its arm list to $TMPDIR/stub-gen-loads. An arm of depth
 # STUB_GEN_FAIL_DEPTH ends the process at rc 3 the first time (a marker file), after its prompt ids; the
 # first arm of depth STUB_GEN_XID adds an Xid line to $TMPDIR/stub-xid (the stub journalctl's) before that. Its
-# load line names --place's placement (a when none; STUB_GEN_PLACE_RAN in its stead), each arm ends with
+# load line names --place's placement (a when none; STUB_GEN_PLACE_RAN in its stead). Under STUB_GEN_PLAN=1
+# that placement is the plan38 record (records.sample_line, its place=w stand-in set to --place, a when
+# none) and the load line names no place=. Each arm ends with
 # its `tokens` line (token 0 STUB_GEN_TOKEN0, 1000 by default, then the step lines' ids), and under
 # STUB_GEN_MTP an `mtp summary` of 10 positions in 4 passes and the MTP form of the SMOKE line (steps= the
 # summary's positions, passes= its passes, no seeded=): STUB_GEN_PASSES=5 is 10 positions in 5 passes, 0 none
@@ -467,7 +474,15 @@ if [ -n "${STUB_GEN_CARDS_ON:-}" ]; then
     *) cards='[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' ;;
   esac
 fi
-echo "load arch=stub ctx=$ctx place=${STUB_GEN_PLACE_RAN:-${place:-a}}${cards:+ cards=$cards} (stub)"
+# STUB_GEN_PLAN=1: a qwen35moe-style placement. plan38 is records.sample_line (place=w is its word
+# stand-in); the load line names no place=. The runner's cwd is the stub tree, where tools/bloomery is.
+if [ -n "${STUB_GEN_PLAN:-}" ]; then
+  plan=$(python3 -c 'import sys; sys.path.insert(0, "tools/bloomery"); import records; print(records.sample_line(records.load("generate_qwen3moe").by_name["plan38"]))') || exit 8
+  echo "${plan/place=w/place=${place:-a}}"
+  echo "load arch=stub ctx=$ctx${cards:+ cards=$cards} (stub)"
+else
+  echo "load arch=stub ctx=$ctx place=${STUB_GEN_PLACE_RAN:-${place:-a}}${cards:+ cards=$cards} (stub)"
+fi
 echo "capture graph_nodes=10"
 # The tier's counters since the load, cumulative: the arm's depth is what each arm adds, printed at the end of the
 # arm as the binary does (a level, resident_bytes, stays).
@@ -1374,6 +1389,23 @@ if [ "$RC" != 1 ]; then
   fail place-ran "rc $RC, want 1" "$L"
 elif want place-ran "$L" 1 '^FAIL r1 ours d=6 rc=0 \| its load line names place=a; the runner passed --place gate'; then
   pass place-ran
+fi
+# qwen35moe-style: plan38.place names the placement and the load line names none. The bin: arm runs
+# first (its own output; LG_HEADER still empty), then 6 and 4 share a load (the record is LG_HEADER).
+L=$tmp/place-plan.log
+: > "$tmp/tmp/stub-gen-place"
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_GEN_PLACE=a STUB_GEN_PLAN=1 -- "bin:$BASEBIN:6" 6 4
+if [ "$RC" != 0 ]; then
+  fail place-plan "rc $RC, want 0" "$L"
+elif [ "$(paste -sd' ' - < "$tmp/tmp/stub-gen-place")" != "a a" ]; then
+  fail place-plan "the processes' --place: $(paste -sd' ' - < "$tmp/tmp/stub-gen-place"), want a a (the bin: arm, then the shared load)" "$L"
+elif want place-plan "$L" 1 '^\[load\] r1 2 arm\(s\): 6 4 ' &&
+  want place-plan "$L" 3 '^ROW r1 (bin:base|ours) d=[46] .* \| place a \| ' &&
+  want place-plan "$L" 0 '^FAIL ' &&
+  want place-plan "$L" 2 'plan place=a ' &&
+  want place-plan "$L" 2 '^ *load arch=stub ctx=256 ' &&
+  want place-plan "$L" 0 'load .*place='; then
+  pass place-plan
 fi
 L=$tmp/place-card.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PLACE=gate BLOOMERY_TIMING_GPU="$STUB_GPU_A6000" -- 6

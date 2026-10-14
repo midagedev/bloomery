@@ -2425,10 +2425,18 @@ ours_post() {
     passcol=" | ms/pass $passcol (mean_ms × steps $steps / passes $passes)"
   fi
   pp_col "${A_KIND[$i]}" "$out" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"; return 0; }
-  # The placement it was given: its own `load` line, or its load's (LG_HEADER); a qwen3moe or qwen35moe
-  # load line names none, and its `plan` line does.
+  # The placement it was given: its own `load` line's place=, or its load's (LG_HEADER). A qwen4exp
+  # load names one; a qwen3moe or qwen35moe load names none, and plan38.place does, through records.py.
+  # A reader that fails is a named FAIL row.
   if [ -n "${A_PLACE[$i]}" ]; then
-    ran=$(printf '%s\n%s\n' "$out" "${LG_HEADER:-}" | sed -n -e 's/^load .* place=\([a-z]*\).*/\1/p' -e 's/^plan place=\([a-z]*\).*/\1/p' | head -n 1)
+    ran=$(printf '%s\n%s\n' "$out" "${LG_HEADER:-}" | sed -n 's/^load .* place=\([a-z]*\).*/\1/p' | head -n 1)
+    if [ -z "$ran" ]; then
+      why=$(python3 "$RS_RECORDS" sh --bin generate_qwen3moe - 'ran=plan38.place' <<< "$(printf '%s\n%s\n' "$out" "${LG_HEADER:-}")" 2>&1) || {
+        arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "placement reader failed: $why" "$out"
+        return 0
+      }
+      eval "$why"
+    fi
     [ "$ran" = "${A_PLACE[$i]}" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its load line names place=${ran:-none}; the runner passed --place ${A_PLACE[$i]}" "$out"; return 0; }
   fi
   # Two cards: an Xid, a card lost or off its cap, or a load whose cards are not its placement's (bp both
