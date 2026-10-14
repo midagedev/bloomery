@@ -873,12 +873,15 @@ for c in "cargo oxide build -- --bin a && $ANYG a" "bash tools/ref/real-only.sh 
 done
 for c in 'true' "cargo oxide build -- --bin g && bash tools/gpu-gate.sh g --place gate" "$ANYG a && bash tools/ref/dump.sh" \
   "$ANYG a && bash tools/gate.sh --oxide -p bloomery-gpu" "$ANYG a && ./target/release/gate_x" "$ANYG a && cargo oxide test -p x" \
-  "$ANYG a && cargo oxide run -p x" "$ANYG a && cargo run --bin y"; do
+  "$ANYG a && cargo oxide run -p x" "$ANYG a && cargo run --bin y" "$ANYG a && bash tools/gpu-gate.sh g --place gate" \
+  "$ANYG a && cargo test -p x" "$ANYG a && target/debug/x" "$ANYG a && python3 tools/x.py"; do
   rc_is "box.sh: no lane named, not only any-form gates: '${c:0:40}…'" 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" "$c"
   inlog "box.sh: … stays on lane 3090" "$tmp/boxq.args" '^3090$'
 done
 rc_is 'box.sh: a BLOOMERY_GATE_CARD card in BLOOMERY_BOX_ENV is the lane of any-form gates' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_BOX_ENV=BLOOMERY_GATE_CARD=a6000 "$B/tools/box.sh" "$ANYG a"
 inlog 'box.sh: … lane a6000 from BLOOMERY_BOX_ENV' "$tmp/boxq.args" '^a6000$'
+rc_is 'box.sh: BLOOMERY_GATE_CARD=any in BLOOMERY_BOX_ENV keeps lane 3090' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_BOX_ENV=BLOOMERY_GATE_CARD=any "$B/tools/box.sh" "$ANYG a"
+inlog 'box.sh: … lane 3090 under an any entry' "$tmp/boxq.args" '^3090$'
 rc_is 'box.sh: BLOOMERY_CARD=a6000 is its lane whatever the command' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_CARD=a6000 "$B/tools/box.sh" "cargo oxide build -- --bin a && $ANYG a"
 inlog 'box.sh: … lane a6000' "$tmp/boxq.args" '^a6000$'
 rc_is 'box.sh: BLOOMERY_Q_CARD=none' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=none "$B/tools/box.sh" true

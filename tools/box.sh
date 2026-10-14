@@ -263,18 +263,22 @@ PY
 # runs none, so either card's lock is the run's own; else 3090, the box's pin. A command it cannot read for certain stays
 # on 3090: the failure it blocks is the other way round, a fixture batch of `any` gates queued one after another on the
 # 3090's lane while the A6000 sits idle. A card BLOOMERY_BOX_ENV names as BLOOMERY_GATE_CARD (tools/gate-batch.sh's lane A)
-# is the lane, so the export after the lane's own never sends the job to a card its lane did not get.
+# is the lane, and any other value of it (any, which the daemon's pick would contradict) keeps 3090, so the export after
+# the lane's own never names a card its lane did not get. The scan reads only `.sh` names and the cargo, target/ and
+# python forms above; the allowlist below is the scripts that run no device code, and a script not on it stays on 3090.
 default_lane() {
   local c=$1 rest s kv
   for kv in ${box_env[@]+"${box_env[@]}"}; do
-    case $kv in BLOOMERY_GATE_CARD=3090 | BLOOMERY_GATE_CARD=a6000 | BLOOMERY_GATE_CARD=both) echo "${kv#*=}"; return ;; esac
+    case $kv in
+      BLOOMERY_GATE_CARD=3090 | BLOOMERY_GATE_CARD=a6000 | BLOOMERY_GATE_CARD=both) echo "${kv#*=}"; return ;;
+      BLOOMERY_GATE_CARD=*) echo 3090; return ;;
+    esac
   done
   case $c in
-    *'cargo oxide run'* | *'cargo oxide test'* | *'cargo run'* | *'gate.sh --oxide'* | *target/release/* | *./target/*) echo 3090; return ;;
+    *'cargo oxide run'* | *'cargo oxide test'* | *'cargo run'* | *'cargo test'* | *'gate.sh --oxide'* | *target/* | *python*) echo 3090; return ;;
   esac
   rest=${c//'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh'/}
   if [ "$rest" = "$c" ]; then echo 3090; return; fi
-  case $rest in *gpu-gate.sh*) echo 3090; return ;; esac
   for s in $(grep -o 'tools/[A-Za-z0-9/_.-]*\.sh' <<< "$rest" || true); do
     case $s in
       tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/ref-paths.sh) ;;
