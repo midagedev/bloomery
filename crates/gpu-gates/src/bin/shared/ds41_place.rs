@@ -98,7 +98,7 @@ pub fn ctx_choice(
     choose_ctx(
         split,
         (set, slots.get()),
-        // PIN: V4.1's limit is the trained context within
+        // PIN(2026-10-15): V4.1's limit is the trained context within
         // KERNEL_POSITIONS again, by the user's decision; the 32,768 cap
         // assumed the seat could not serve past it, and an unset
         // context served 262,144 on two cards before it.
