@@ -6,7 +6,8 @@ use gguf::quant::{KVALUES_MXFP4, half_to_f32};
 use gguf::{Split, Value, dequant_row};
 
 use super::fill::{
-    Band, Q4K_MIN_PER_SCALE, Q5K_MIN_PER_SCALE, Rule, Window, q3k_scale, scale_min_k4, unit_bytes,
+    Band, Q4K_MIN_PER_SCALE, Q5_0_OFFSET, Q5K_MIN_PER_SCALE, Rule, Window, q3k_scale, scale_min_k4,
+    unit_bytes,
 };
 use super::plan::{FilePlan, PlannedTensor, header_sha256, items, plan, unsigned};
 use super::sidecar::{self, SidecarStat};
@@ -132,18 +133,25 @@ fn block_fault(rule: &Rule, blk: &[u8], y: &[f32], window: Window) -> Option<Str
                 None => Ok(()),
             }
         }),
-        Rule::Q5_1 { d, m } => scale_at(0, "d", *d).and_then(|d| {
-            let got = u16::from_le_bytes([blk[2], blk[3]]);
-            if got != *m {
-                return Err(format!(
-                    "m {} (bits {got:#06x}), the rule's {}",
-                    half_to_f32(got),
-                    half_to_f32(*m)
-                ));
-            }
-            let m = half_to_f32(got);
-            match y.iter().find(|&&v| !code_in((v - m) / d, 0..=31)) {
-                Some(v) => Err(format!("dequantizes {v}, not q·d + m with q in 0..=31")),
+        Rule::Q5Legacy { d, m } => scale_at(0, "d", *d).and_then(|d| {
+            let offset = match m {
+                Some(want) => {
+                    let got = u16::from_le_bytes([blk[2], blk[3]]);
+                    if got != *want {
+                        return Err(format!(
+                            "m {} (bits {got:#06x}), the rule's {}",
+                            half_to_f32(got),
+                            half_to_f32(*want)
+                        ));
+                    }
+                    half_to_f32(got)
+                }
+                None => -Q5_0_OFFSET * d,
+            };
+            match y.iter().find(|&&v| !code_in((v - offset) / d, 0..=31)) {
+                Some(v) => Err(format!(
+                    "dequantizes {v}, not q·d + offset with q in 0..=31"
+                )),
                 None => Ok(()),
             }
         }),

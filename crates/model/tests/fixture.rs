@@ -24,7 +24,7 @@
 //!    layer-id list — and its fixture is planned, written and verified; the
 //!    spec's ratios one short, a layer list the map does not hold, a draft for
 //!    a family with none and another architecture are refused by name;
-//! 7. the Q5_1 and IQ4_NL rules under the rule window, [2^-13, 2^-10]: a filled chunk
+//! 7. the Q5_0, Q5_1 and IQ4_NL rules under the rule window, [2^-13, 2^-10]: a filled chunk
 //!    dequantizes (`gguf::dequant_row`) to an RMS within ±10 % of 1/√K and
 //!    every block holds its rule; a K whose `d` no code choice puts in the
 //!    window is refused with `NoScale`;
@@ -76,6 +76,24 @@
 //!     source or in the written file, a fixture ff and dense count off the header's, an ff off the
 //!     block grid.
 //!
+//! The Nemotron 3 Nano 4B spec (`model::arch::nemotron_h::fixture`), the first dense family and the
+//! first whose source is one unsplit file. The synthetic clauses plan a small `nemotron_h` source
+//! of eight layers through the family's own rules; the real file's header on the box:
+//!
+//! 19. the written fixture of the synthetic source is one file with no `split.*` keys, `verify`
+//!     passes (Q5_0 blocks included), the engine's reader reads its kinds, and the family's
+//!     constants land where they are named: `ssm_a` and `ssm_d` (stored `[1, heads]`) and
+//!     `ssm_norm` (a `[n, groups]` gain) are constants, the conv's weight a matrix draw;
+//! 20. the cut between a vector and a matrix is `dims[0]` = 1: a `[1, n]` F32 takes the family's
+//!     constant, or is refused by name when none names it; a `[n, 1]` projection and an F32
+//!     matrix are still drawn at 1/√K;
+//! 21. a layer map that loses a kind or a (stem, type) pair of the source is refused by name, at
+//!     the plan; a keyless source whose fixture the cap cuts into shards is refused by name;
+//! 22. the window holds every quantized (type, K) of the real file's census, filled at σ;
+//! 23. the real header: the plan of the five layers `[0, 1, 12, 13, 24]` (kinds, every tensor at
+//!     its source's dims and type, every (stem, type) pair of the source, the constants), the
+//!     written file verified against the source, and the maps that lose a kind or a pair refused.
+//!
 //! Files go under this crate's `CARGO_TARGET_TMPDIR` and are removed.
 
 use std::collections::{BTreeMap, HashMap};
@@ -92,6 +110,8 @@ use model::arch::deepseek41::place::PlanInputs as V41Inputs;
 use model::arch::glm5next::fixture as glm;
 use model::arch::glm5next::hparams::Kind as GlmKind;
 use model::arch::glm5next::place::{NextnInputs, PlanInputs as GlmInputs};
+use model::arch::nemotron_h::fixture as nemo;
+use model::arch::nemotron_h::hparams::{Hparams as NemoHparams, Kind as NemoKind};
 use model::arch::qwen35moe::fixture as q38;
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, UBATCH_PLANNED, machine_for_experts};
@@ -2081,13 +2101,15 @@ fn rule_window() -> Window {
     Window::new(1.0 / 8192.0, 1.0 / 1024.0).unwrap()
 }
 
-/// Contract 7: the Q5_1 and IQ4_NL rules fill at σ under the rule window. Every
-/// case runs; the failures are listed together.
+/// Contract 7: the Q5_0, Q5_1 and IQ4_NL rules fill at σ under the rule window.
+/// Every case runs; the failures are listed together.
 #[test]
 fn fixture_new_rules_fill_at_sigma() {
     let window = rule_window();
     let mut bad = Vec::new();
     for (ty, k) in [
+        (GgmlType::Q5_0, 16384),
+        (GgmlType::Q5_0, 65536),
         (GgmlType::Q5_1, 16384),
         (GgmlType::Q5_1, 65536),
         (GgmlType::IQ4_NL, 160),
@@ -2119,6 +2141,8 @@ fn fixture_new_rules_refuse_out_of_window() {
     let window = rule_window();
     let mut bad = Vec::new();
     for (ty, k) in [
+        (GgmlType::Q5_0, 640),
+        (GgmlType::Q5_0, 1 << 21),
         (GgmlType::Q5_1, 640),
         (GgmlType::Q5_1, 1 << 21),
         (GgmlType::IQ4_NL, 32),
@@ -3064,6 +3088,663 @@ fn hw_fixture_glm_refusals() {
             fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}),
             want,
         );
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+// ------------------------------------------------------------------ Nemotron 3 Nano 4B
+
+/// A synthetic `nemotron_h` source of eight layers at small widths, one unsplit file (no
+/// `split.*` keys unless `extra_kvs` adds some): Mamba-2 at layers 0, 2 and 5; MLP at 1
+/// (`ffn_down` Q6_K), 3 and 7 (Q4_K); attention at 4 (`attn_v` Q5_0) and 6 (Q8_0). `extra` adds
+/// tensors to layer 0. The tensors are zeros: the generator reads the header alone.
+fn nemo_source(
+    path: &Path,
+    extra: &[(&str, Vec<u64>, GgmlType)],
+    extra_kvs: &[(&str, Value)],
+) -> Split {
+    use GgmlType::{F32, Q4_K, Q5_0, Q6_K, Q8_0};
+    let norm = |l: usize| (format!("blk.{l}.attn_norm.weight"), vec![256], F32);
+    let mamba = |l: usize| {
+        vec![
+            norm(l),
+            (format!("blk.{l}.ssm_a"), vec![1, 4], F32),
+            (format!("blk.{l}.ssm_d"), vec![1, 4], F32),
+            (format!("blk.{l}.ssm_dt.bias"), vec![4], F32),
+            (format!("blk.{l}.ssm_conv1d.weight"), vec![4, 1024], F32),
+            (format!("blk.{l}.ssm_conv1d.bias"), vec![1024], F32),
+            (format!("blk.{l}.ssm_in.weight"), vec![256, 1540], Q5_0),
+            (format!("blk.{l}.ssm_norm.weight"), vec![256, 2], F32),
+            (format!("blk.{l}.ssm_out.weight"), vec![512, 256], Q4_K),
+        ]
+    };
+    let mlp = |l: usize, down: GgmlType| {
+        vec![
+            norm(l),
+            (format!("blk.{l}.ffn_up.weight"), vec![256, 512], Q5_0),
+            (format!("blk.{l}.ffn_down.weight"), vec![512, 256], down),
+        ]
+    };
+    let attn = |l: usize, v: GgmlType| {
+        vec![
+            norm(l),
+            (format!("blk.{l}.attn_q.weight"), vec![256, 256], Q5_0),
+            (format!("blk.{l}.attn_k.weight"), vec![256, 128], Q5_0),
+            (format!("blk.{l}.attn_v.weight"), vec![256, 128], v),
+            (format!("blk.{l}.attn_output.weight"), vec![256, 256], Q4_K),
+        ]
+    };
+    let mut tensors: Vec<(String, Vec<u64>, GgmlType)> = vec![
+        ("token_embd.weight".into(), vec![256, 64], Q5_0),
+        ("output_norm.weight".into(), vec![256], F32),
+        ("output.weight".into(), vec![256, 64], Q8_0),
+    ];
+    for l in 0..8 {
+        tensors.extend(match l {
+            0 | 2 | 5 => mamba(l),
+            1 => mlp(l, Q6_K),
+            3 | 7 => mlp(l, Q4_K),
+            4 => attn(l, Q5_0),
+            _ => attn(l, Q8_0),
+        });
+        if l == 0 {
+            tensors.extend(
+                extra
+                    .iter()
+                    .map(|(n, d, t)| (format!("blk.0.{n}"), d.clone(), *t)),
+            );
+        }
+    }
+    let arr = |v: &[u32]| Value::Array(v.iter().map(|&x| Value::U32(x)).collect());
+    let mut kvs: Vec<(String, Value)> = vec![
+        (
+            gguf::GENERAL_ARCHITECTURE.to_string(),
+            Value::String("nemotron_h".into()),
+        ),
+        (
+            "general.name".to_string(),
+            Value::String("synthetic".into()),
+        ),
+        ("nemotron_h.block_count".to_string(), Value::U32(8)),
+        ("nemotron_h.context_length".to_string(), Value::U32(4096)),
+        ("nemotron_h.embedding_length".to_string(), Value::U32(256)),
+        (
+            "nemotron_h.feed_forward_length".to_string(),
+            arr(&[0, 512, 0, 512, 0, 0, 0, 512]),
+        ),
+        ("nemotron_h.attention.head_count".to_string(), Value::U32(4)),
+        (
+            "nemotron_h.attention.head_count_kv".to_string(),
+            arr(&[0, 0, 0, 0, 2, 0, 2, 0]),
+        ),
+        (
+            "nemotron_h.attention.layer_norm_rms_epsilon".to_string(),
+            Value::F32(1e-5),
+        ),
+        (
+            "nemotron_h.attention.layer_norm_epsilon".to_string(),
+            Value::F32(1e-5),
+        ),
+        ("nemotron_h.vocab_size".to_string(), Value::U32(64)),
+        (
+            "nemotron_h.rope.dimension_count".to_string(),
+            Value::U32(64),
+        ),
+        ("nemotron_h.ssm.conv_kernel".to_string(), Value::U32(4)),
+        ("nemotron_h.ssm.state_size".to_string(), Value::U32(128)),
+        ("nemotron_h.ssm.group_count".to_string(), Value::U32(2)),
+        ("nemotron_h.ssm.inner_size".to_string(), Value::U32(512)),
+        ("nemotron_h.ssm.time_step_rank".to_string(), Value::U32(4)),
+        (
+            "nemotron_h.rope.scaling.finetuned".to_string(),
+            Value::Bool(false),
+        ),
+        (
+            "nemotron_h.attention.key_length".to_string(),
+            Value::U32(64),
+        ),
+        (
+            "nemotron_h.attention.value_length".to_string(),
+            Value::U32(64),
+        ),
+    ];
+    kvs.extend(extra_kvs.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    let decls: Vec<TensorDecl> = tensors
+        .iter()
+        .map(|(name, dims, ty)| {
+            let (_, blck, tsz) = gguf::ggml_type_info(ty.as_u32()).unwrap();
+            TensorDecl {
+                name: name.clone(),
+                dims: dims.clone(),
+                type_id: ty.as_u32(),
+                nbytes: tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>(),
+            }
+        })
+        .collect();
+    let bytes: Vec<u64> = decls.iter().map(|t| t.nbytes).collect();
+    let layout = Layout::new(&kvs, decls).unwrap();
+    let mut w = Writer::new(File::create(path).unwrap(), layout).unwrap();
+    for ((name, _, _), n) in tensors.iter().zip(bytes) {
+        w.tensor(name, &vec![0u8; n as usize]).unwrap();
+    }
+    w.finish().unwrap();
+    Split::open(path).unwrap()
+}
+
+/// The production family on the synthetic source's layers: Mamba-2, MLP with `ffn_down` Q6_K,
+/// attention with `attn_v` Q5_0, MLP with Q4_K and attention with Q8_0 (source layers 0, 1, 4, 3
+/// and 6), as the real map holds one of each.
+fn nemo_spec() -> FixtureSpec {
+    FixtureSpec {
+        layers: vec![0, 1, 4, 3, 6],
+        ..nemo::spec()
+    }
+}
+
+/// The rule the plan gives the tensor of `leaf` in fixture layer 0.
+fn rule_of<'a>(p: &'a Plan, leaf: &str) -> &'a Rule {
+    let name = format!("blk.0.{leaf}");
+    &p.target
+        .tensors
+        .iter()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("no {name}"))
+        .rule
+}
+
+/// Contract 19: the synthetic source's fixture is one file with no `split.*` keys, verified
+/// against the source (Q5_0, Q4_K, Q6_K and Q8_0 blocks, the F32 constants), read by the engine's
+/// reader as [Mamba-2, MLP, attention, MLP, attention], and the family's constants land: `ssm_a`
+/// negative and `ssm_d` (stored `[1, heads]`), `ssm_norm` (a `[n, groups]` gain) constants, the
+/// conv's weight a matrix draw at `1/√4`.
+#[test]
+fn fixture_nemotron_round_trip() {
+    let guard = dir("nemo-round-trip");
+    let d = &guard.0;
+    let src = nemo_source(&d.join("src.gguf"), &[], &[]);
+    let spec = nemo_spec();
+    let plan = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    for (leaf, want) in [
+        ("ssm_a", -0.30),
+        ("ssm_d", 0.66),
+        ("ssm_dt.bias", -2.86),
+        ("ssm_conv1d.bias", 0.0),
+        ("ssm_norm.weight", 1.0),
+        ("attn_norm.weight", 1.0),
+    ] {
+        match rule_of(&plan, leaf) {
+            Rule::Const { value } if *value == want => {}
+            other => panic!("{leaf}: {}, want constant {want}", other.describe()),
+        }
+    }
+    match rule_of(&plan, "ssm_conv1d.weight") {
+        Rule::Uniform { half_width, .. } => {
+            let want = (3.0f64.sqrt() / 2.0) as f32;
+            assert!((half_width - want).abs() < 1e-6, "{half_width}");
+        }
+        other => panic!("ssm_conv1d.weight: {}", other.describe()),
+    }
+    let out = d.join("fx");
+    fixture::generate(&spec, &src, None, &out, &spec.options(), &mut |_| {}).unwrap();
+    let first = out.join("nemotron-nano-fixture-00001-of-00001.gguf");
+    let fx = Split::open(&first).unwrap();
+    assert_eq!(fx.shard_count(), 1);
+    let split_keys: Vec<&str> = fx
+        .iter_kv()
+        .map(|(k, _)| k)
+        .filter(|k| k.starts_with("split."))
+        .collect();
+    assert!(split_keys.is_empty(), "{split_keys:?}");
+    fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    let hp = NemoHparams::read(&fx).unwrap();
+    assert_eq!(
+        hp.kinds,
+        [
+            NemoKind::Mamba,
+            NemoKind::Mlp,
+            NemoKind::Attention,
+            NemoKind::Mlp,
+            NemoKind::Attention
+        ]
+    );
+    assert_eq!(
+        (hp.kv.as_slice(), hp.ff.as_slice()),
+        (&[0, 0, 2, 0, 2][..], &[0, 512, 0, 512, 0][..])
+    );
+    // The bytes of `ssm_a` are the constant, read back from the file.
+    let (s, info) = fx.find("blk.0.ssm_a").unwrap();
+    assert_eq!(info.dims, [1, 4]);
+    let at = fx.shard(s).unwrap().data_base() as usize + info.offset as usize;
+    let a = floats(&fx.shard(s).unwrap().mapping()[at..at + 16]);
+    assert_eq!(a, [-0.30; 4]);
+    assert!(
+        a.iter().all(|&v| v < 0.0),
+        "dA = exp(dt·A) stays below 1 only for a negative A"
+    );
+}
+
+/// Contract 20: the cut between a vector and a matrix is `dims[0]` = 1 (one input per output),
+/// pinned on both sides. A `[1, n]` F32 is a per-channel parameter: the family's constant when it
+/// names the leaf (`ssm_a`, `ssm_d`, stored `[1, heads]`), refused by name when it names none, as a
+/// 1-D tensor is. A `[n, 1]` tensor (a projection of n inputs to one output, the V4.1 draft's
+/// `conf_proj.weight`) and an F32 `[n, m]` are matrices, drawn at σ = 1/√n. Judged by the number of
+/// dims a `[1, 4]` went to the matrix rule and was filled at σ = 1 with the family's value never
+/// asked; judged by "every dim but one is 1" a `[4, 1]` became a vector and the V4.1 draft's plan
+/// died with `NoFillRule`.
+#[test]
+fn fixture_a_vector_by_shape_is_not_a_matrix() {
+    let guard = dir("nemo-vector");
+    let d = &guard.0;
+    let spec = nemo_spec();
+    let mut bad = Vec::new();
+    let src = nemo_source(&d.join("p.gguf"), &[], &[]);
+    let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    for (leaf, want) in [("ssm_a", -0.30), ("ssm_d", 0.66)] {
+        let dims = &p
+            .target
+            .tensors
+            .iter()
+            .find(|t| t.name == format!("blk.0.{leaf}"))
+            .unwrap()
+            .dims;
+        assert_eq!(dims, &[1, 4], "{leaf} is stored [1, heads]");
+        match rule_of(&p, leaf) {
+            Rule::Const { value } if *value == want => {}
+            other => bad.push(format!(
+                "[1, 4] {leaf}: {}, want constant {want}",
+                other.describe()
+            )),
+        }
+    }
+    for (what, dims) in [("[1, 4]", vec![1, 4]), ("[4]", vec![4])] {
+        let src = nemo_source(
+            &d.join("v.gguf"),
+            &[("ssm_stray", dims, GgmlType::F32)],
+            &[],
+        );
+        match fixture::plan(&spec, &src, None, &spec.options()) {
+            Err(FixtureError::NoFillRule { name, .. }) if name == "blk.0.ssm_stray" => {
+                println!("vector by shape: {what}: refused by name");
+            }
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(_) => bad.push(format!("{what}: planned")),
+        }
+        std::fs::remove_file(d.join("v.gguf")).unwrap();
+    }
+    for (what, dims) in [("[4, 8]", vec![4, 8]), ("[4, 1]", vec![4, 1])] {
+        let src = nemo_source(
+            &d.join("m.gguf"),
+            &[("ssm_stray", dims, GgmlType::F32)],
+            &[],
+        );
+        let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+        match rule_of(&p, "ssm_stray") {
+            Rule::Uniform { half_width, .. } => {
+                let want = (3.0f64.sqrt() / 2.0) as f32;
+                if (half_width - want).abs() > 1e-6 {
+                    bad.push(format!("{what}: half-width {half_width}, want √3/√4"));
+                }
+            }
+            other => bad.push(format!("{what}: {}, want a matrix draw", other.describe())),
+        }
+        std::fs::remove_file(d.join("m.gguf")).unwrap();
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 21: a layer map that loses a kind or a (stem, type) pair the source holds is refused
+/// by name at the plan, the pair as the source's layer that holds it; a keyless source whose
+/// fixture the cap cuts into shards is refused by name (a later shard's `split.*` values come from
+/// the source's keys).
+#[test]
+fn fixture_nemotron_refuses_a_map_that_loses_a_kind_or_a_pair() {
+    let guard = dir("nemo-map");
+    let d = &guard.0;
+    let src = nemo_source(&d.join("src.gguf"), &[], &[]);
+    let mut bad = Vec::new();
+    let control = FixtureSpec {
+        layers: vec![0, 1, 3, 4, 6],
+        ..nemo::spec()
+    };
+    if let Err(e) = fixture::plan(&control, &src, None, &control.options()) {
+        bad.push(format!("the control map: {e}"));
+    }
+    for (what, layers, want) in [
+        ("no Mamba-2 layer", vec![1, 3, 4, 6], vec!["Mamba"]),
+        ("no attention layer", vec![0, 1, 3], vec!["Attention"]),
+        ("no MLP layer", vec![0, 4, 6], vec!["Mlp"]),
+        (
+            "attn_v Q5_0 dropped (layer 4)",
+            vec![0, 1, 3, 6],
+            vec!["attn_v.weight", "q5_0", "source layer 4"],
+        ),
+        (
+            "attn_v Q8_0 dropped (layer 6)",
+            vec![0, 1, 3, 4],
+            vec!["attn_v.weight", "q8_0", "source layer 6"],
+        ),
+        (
+            "ffn_down Q4_K dropped (layers 3 and 7)",
+            vec![0, 1, 4, 6],
+            vec!["ffn_down.weight", "q4_K", "source layer 3"],
+        ),
+        (
+            "ffn_down Q6_K dropped (layer 1)",
+            vec![0, 3, 4, 6],
+            vec!["ffn_down.weight", "q6_K", "source layer 1"],
+        ),
+    ] {
+        let s = FixtureSpec {
+            layers,
+            ..nemo::spec()
+        };
+        match fixture::plan(&s, &src, None, &s.options()) {
+            Err(e) if want.iter().all(|w| e.to_string().contains(w)) => {
+                println!("nemotron map: {what}: {e}");
+            }
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(_) => bad.push(format!("{what}: planned")),
+        }
+    }
+    let cut = Options {
+        shard_bytes: 256 << 10,
+        ..nemo_spec().options()
+    };
+    match fixture::plan(&nemo_spec(), &src, None, &cut) {
+        Err(e)
+            if ["split.no", "unsplit", "--shard-bytes"]
+                .iter()
+                .all(|w| e.to_string().contains(w)) =>
+        {
+            println!("nemotron map: a cut of a keyless source: {e}");
+        }
+        Err(e) => bad.push(format!("a cut of a keyless source: refused as {e}")),
+        Ok(_) => bad.push("a cut of a keyless source: planned".into()),
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 22: the spec's window holds every quantized (type, K) of the real file's census (Q5_0
+/// and Q8_0 at K = 3,136, Q4_K at 5,120, 7,680 and 12,544, Q6_K at 12,544), and a filled chunk of
+/// each dequantizes to an RMS within ±10 % of 1/√K.
+#[test]
+fn fixture_nemotron_window_holds_the_real_files_types() {
+    let window = nemo::spec().window;
+    let mut bad = Vec::new();
+    for (ty, k) in [
+        (GgmlType::Q5_0, 3136),
+        (GgmlType::Q8_0, 3136),
+        (GgmlType::Q4_K, 5120),
+        (GgmlType::Q4_K, 7680),
+        (GgmlType::Q4_K, 12544),
+        (GgmlType::Q6_K, 12544),
+    ] {
+        let t = match rule_for("t", ty, k, window) {
+            Ok(rule) => one_chunk(ty, k, rule),
+            Err(e) => {
+                bad.push(format!("{ty} K = {k}: {e}"));
+                continue;
+            }
+        };
+        match filled_ratio(&t, window) {
+            Ok(r) if (0.9..=1.1).contains(&r) => {
+                println!(
+                    "nemotron window: {ty} K = {k}: {}; RMS / (1/sqrt K) = {r:.4}",
+                    t.rule.describe()
+                );
+            }
+            Ok(r) => bad.push(format!("{ty} K = {k}: RMS / (1/sqrt K) = {r:.4}")),
+            Err(e) => bad.push(format!("{ty} K = {k}: {e}")),
+        }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+fn nemo_real() -> Split {
+    Split::open(nemo::DEFAULT_MODEL)
+        .unwrap_or_else(|e| panic!("open the Nemotron file {}: {e}", nemo::DEFAULT_MODEL))
+}
+
+/// Contract 23: the plan of the real header: five layers from source layers 0, 1, 12, 13 and 24
+/// read back by the engine's reader as [Mamba-2, MLP, attention, MLP, attention], one shard with no
+/// `split.*` keys, 28 tensors at 929,573,760 bytes [derived from the header dump's per-tensor
+/// bytes], every tensor its source's at its dims and type, every (stem, type) pair of the source's
+/// layers held (the two `attn_v` types and the two `ffn_down` types included), the scan's
+/// constants where they are named (`ssm_a` negative), and the file's other keys covered.
+#[test]
+#[ignore = "needs the box and the Nemotron 3 Nano 4B file (just gate-fixture)"]
+fn hw_fixture_nemotron_plan() {
+    let src = nemo_real();
+    let spec = nemo::spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).expect("the plan of the real file");
+    let t = &p.target;
+    assert_eq!(
+        unsigned_items(
+            &t.kvs
+                .iter()
+                .find(|(k, _)| k == KEY_SOURCE_LAYERS)
+                .unwrap()
+                .1
+        ),
+        [0, 1, 12, 13, 24]
+    );
+    assert_eq!(t.shards.len(), 1, "one shard");
+    assert!(
+        t.kvs.iter().all(|(k, _)| !k.starts_with("split.")),
+        "no split keys"
+    );
+    assert_eq!(t.tensors.len(), 28);
+    let payload: u64 = t.tensors.iter().map(|pt| pt.nbytes).sum();
+    assert_eq!(payload, 929_573_760, "tensor payload");
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for pt in &t.tensors {
+        let info = src
+            .find(&pt.source)
+            .unwrap_or_else(|| panic!("no source tensor {}", pt.source))
+            .1;
+        assert_eq!((pt.ty, &pt.dims), (info.ty, &info.dims), "{}", pt.name);
+        if let Some(f) = pt.layer {
+            let l = nemo::LAYER_MAP[f];
+            assert_eq!(
+                pt.name,
+                format!("blk.{f}.{}", leaf_of(&pt.source)),
+                "{}",
+                pt.name
+            );
+            assert!(pt.source.starts_with(&format!("blk.{l}.")), "{}", pt.source);
+            pairs.push((leaf_of(&pt.name).to_string(), pt.ty.to_string()));
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    let held: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let mut want: Vec<(&str, &str)> = vec![
+        ("attn_k.weight", "q5_0"),
+        ("attn_norm.weight", "f32"),
+        ("attn_output.weight", "q4_K"),
+        ("attn_q.weight", "q5_0"),
+        ("attn_v.weight", "q5_0"),
+        ("attn_v.weight", "q8_0"),
+        ("ffn_down.weight", "q4_K"),
+        ("ffn_down.weight", "q6_K"),
+        ("ffn_up.weight", "q5_0"),
+        ("ssm_a", "f32"),
+        ("ssm_conv1d.bias", "f32"),
+        ("ssm_conv1d.weight", "f32"),
+        ("ssm_d", "f32"),
+        ("ssm_dt.bias", "f32"),
+        ("ssm_in.weight", "q5_0"),
+        ("ssm_norm.weight", "f32"),
+        ("ssm_out.weight", "q4_K"),
+    ];
+    want.sort();
+    assert_eq!(
+        held, want,
+        "every (stem, type) pair of the real file's layers"
+    );
+    for (leaf, v) in [
+        ("ssm_a", -0.30),
+        ("ssm_d", 0.66),
+        ("ssm_dt.bias", -2.86),
+        ("ssm_norm.weight", 1.0),
+    ] {
+        match rule_of(&p, leaf) {
+            Rule::Const { value } if *value == v => {}
+            other => panic!("{leaf}: {}, want constant {v}", other.describe()),
+        }
+    }
+    let guard = dir("nemo-plan");
+    let fx = Split::open(header_only(t, &guard.0)).unwrap();
+    let hp = nemo::check_kinds(&spec, &fx, &src).unwrap();
+    assert_eq!(
+        hp.kinds,
+        [
+            NemoKind::Mamba,
+            NemoKind::Mlp,
+            NemoKind::Attention,
+            NemoKind::Mlp,
+            NemoKind::Attention
+        ]
+    );
+    assert_eq!(
+        (hp.n_layer, hp.n_embd, hp.ssm.n_heads, hp.ssm.n_groups),
+        (5, 3136, 96, 8)
+    );
+    let total: u64 = t.layouts().unwrap().iter().map(|(_, l)| l.file_len()).sum();
+    println!(
+        "nemotron plan: {} layers kinds {:?}; {} tensors, payload {payload} B, file {total} B ({:.3} GB), card budget {}",
+        hp.n_layer,
+        hp.kinds,
+        t.tensors.len(),
+        total as f64 / 1e9,
+        p.card_budget
+    );
+}
+
+/// Contract 23: the fixture written from the real header is verified against it, and a flipped
+/// byte of a Q5_0 tensor is refused by name.
+#[test]
+#[ignore = "needs the box and the Nemotron 3 Nano 4B file (just gate-fixture)"]
+fn hw_fixture_nemotron_end_to_end() {
+    let src = nemo_real();
+    let spec = nemo::spec();
+    let guard = dir("nemo-e2e");
+    let out = guard.0.join("fx");
+    let t0 = Instant::now();
+    let stats = fixture::generate(&spec, &src, None, &out, &spec.options(), &mut |_| {}).unwrap();
+    println!(
+        "nemotron e2e: generate {stats:?} in {:.1} s",
+        t0.elapsed().as_secs_f64()
+    );
+    let first = out.join("nemotron-nano-fixture-00001-of-00001.gguf");
+    let fx = Split::open(&first).unwrap();
+    let (v, _) = fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    println!("nemotron e2e: verify {v:?}");
+    assert_eq!(v.tensors, 28);
+    let len = std::fs::metadata(&first).unwrap().len();
+    println!("nemotron e2e: file {len} B");
+    let name = "blk.0.ssm_in.weight";
+    let (s, info) = fx.find(name).unwrap();
+    let at = fx.shard(s).unwrap().data_base() + info.offset;
+    drop(fx);
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&first)
+            .unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact_at(&mut b, at).unwrap();
+        f.write_all_at(&[b[0] ^ 0x01], at).unwrap();
+    }
+    let fx = Split::open(&first).unwrap();
+    match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
+        Err(e) if e.to_string().contains(name) => println!("nemotron e2e: a flipped byte: {e}"),
+        other => panic!("a flipped byte of {name}: {other:?}"),
+    }
+}
+
+/// Contract 23: on the real header, a map that loses a kind or a pair is refused by name, the
+/// source's layers that hold the pair named: `attn_v` Q5_0 on layers 12 and 17 only, Q8_0 on 24 and
+/// 32 only; `ffn_down` Q6_K on nine layers (1 the first), Q4_K on eight (13 the first); the Mamba-2
+/// layers have `ssm_in`; layer 32 stands for 24.
+#[test]
+#[ignore = "needs the box and the Nemotron 3 Nano 4B file (just gate-fixture)"]
+fn hw_fixture_nemotron_refusals() {
+    let src = nemo_real();
+    let mut bad = Vec::new();
+    for (what, layers, want) in [
+        ("layer 32 for 24", Some(vec![0, 1, 12, 13, 32]), None),
+        (
+            "no Mamba-2 layer",
+            None,
+            Some((vec![1, 12, 13, 24], vec!["Mamba"])),
+        ),
+        (
+            "no attention layer",
+            None,
+            Some((vec![0, 1, 13], vec!["Attention"])),
+        ),
+        ("no MLP layer", None, Some((vec![0, 12, 24], vec!["Mlp"]))),
+        (
+            "layer 12 dropped",
+            None,
+            Some((
+                vec![0, 1, 13, 24],
+                vec!["attn_v.weight", "q5_0", "source layer 12"],
+            )),
+        ),
+        (
+            "layer 24 dropped",
+            None,
+            Some((
+                vec![0, 1, 12, 13],
+                vec!["attn_v.weight", "q8_0", "source layer 24"],
+            )),
+        ),
+        (
+            "layer 13 dropped",
+            None,
+            Some((
+                vec![0, 1, 12, 24],
+                vec!["ffn_down.weight", "q4_K", "source layer 13"],
+            )),
+        ),
+        (
+            "layer 1 dropped",
+            None,
+            Some((
+                vec![0, 12, 13, 24],
+                vec!["ffn_down.weight", "q6_K", "source layer 1"],
+            )),
+        ),
+    ] {
+        let layers_ok = layers.is_some();
+        let s = FixtureSpec {
+            layers: layers
+                .or_else(|| want.as_ref().map(|(l, _)| l.clone()))
+                .unwrap(),
+            ..nemo::spec()
+        };
+        let got = fixture::plan(&s, &src, None, &s.options());
+        match (layers_ok, got, want) {
+            (true, Ok(p), _) if p.target.tensors.len() == 28 => {
+                println!("nemotron refusals: {what}: planned")
+            }
+            (true, other, _) => bad.push(format!(
+                "{what}: {:?}",
+                other.map(|p| p.target.tensors.len())
+            )),
+            (false, Err(e), Some((_, w))) if w.iter().all(|x| e.to_string().contains(x)) => {
+                println!("nemotron refusals: {what}: {e}");
+            }
+            (false, Err(e), _) => bad.push(format!("{what}: refused as {e}")),
+            (false, Ok(_), _) => bad.push(format!("{what}: planned")),
+        }
     }
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }

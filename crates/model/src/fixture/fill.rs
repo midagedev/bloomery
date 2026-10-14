@@ -121,8 +121,10 @@ pub enum Rule {
     Q6K { d: u16, band: Band },
     /// `d·q`: `q` (i8) from `band`.
     Q8_0 { d: u16, band: Band },
-    /// `q·d + m`: `q` uniform in 0..=31, `m = −15.5·d` — zero mean.
-    Q5_1 { d: u16, m: u16 },
+    /// The legacy 32-value 5-bit blocks, `q` uniform in 0..=31: with `m`
+    /// (Q5_1) `q·d + m`, `m = −15.5·d` — zero mean; without (Q5_0) `d·(q − 16)`
+    /// — mean `−d/2`, no offset to zero it.
+    Q5Legacy { d: u16, m: Option<u16> },
     /// `d·k`: `k` from `band`, a band of `kvalues_iq4nl`, stored as its index.
     Iq4Nl { d: u16, band: Band },
     /// `2^(E−128)·kvalues[c]`: `E` is `e_lo` with probability `p_lo / 2^32`,
@@ -189,11 +191,14 @@ impl Rule {
                 format!("d {:.4e}, {}, q in 0..=63", half_to_f32(*d), band(b))
             }
             Rule::Q8_0 { d, band: b } => format!("d {:.4e}, codes {}", half_to_f32(*d), band(b)),
-            Rule::Q5_1 { d, m } => format!(
+            Rule::Q5Legacy { d, m: Some(m) } => format!(
                 "d {:.4e} m {:.4e}, q in 0..=31",
                 half_to_f32(*d),
                 half_to_f32(*m)
             ),
+            Rule::Q5Legacy { d, m: None } => {
+                format!("d {:.4e}, value d·(q − 16), q in 0..=31", half_to_f32(*d))
+            }
             Rule::Iq4Nl { d, band: b } => format!(
                 "d {:.4e}, kvalues |k| in [{}, {}] ({} codes, E[k^2] {:.2})",
                 half_to_f32(*d),
@@ -227,16 +232,26 @@ const Q5K_CODE_VAR: f64 = 85.25;
 pub(super) const Q5K_MIN_PER_SCALE: i32 = 2;
 const Q5K_DMIN_PER_D: f32 = 7.75;
 const Q6K_CODE_SQ: f64 = 341.5;
-/// Q5_1 (`block_q5_1`: f16 `d`, f16 `m`, 32 five-bit codes, value `q·d + m`):
-/// `q` uniform in 0..=31 has mean 15.5 and variance (32² − 1)/12 = 85.25, and
-/// `m = −15.5·d` zeroes the mean, so `E[w²] = 85.25·d²`. `m` is an offset, not
-/// a scale: `|m| / d = 15.5`, so a window narrower than that factor could
-/// never hold both; only `d` is held to the window, and `m` to a normal f16.
-/// No band is open (the block has no sub-block scales), so `d = σ/√85.25`: a
-/// [2^-13, 2^-10] window takes K in about [12,300, 787,000], and K = 640
-/// needs `d = 2^-7.87`.
-const Q5_1_CODE_VAR: f64 = 85.25;
-const Q5_1_MID: f32 = 15.5;
+/// The legacy 5-bit blocks, Q5_0 (`block_q5_0`: f16 `d`, 32 five-bit codes,
+/// value `d·(q − 16)`) and Q5_1 (`block_q5_1`: f16 `d`, f16 `m`, the same
+/// codes, value `q·d + m`), differ in the offset alone, so one rule makes both
+/// and `m` is its data: `q` uniform in 0..=31 has mean 15.5 and variance
+/// 85.25. Q5_1's `m = −15.5·d` zeroes the mean, so `E[w²] = 85.25·d²`; Q5_0 has
+/// no `m`, its values have mean `−d/2` (0.054 of the RMS) and
+/// `E[w²] = (85.25 + 0.25)·d² = 85.5·d²`. `m` is an offset, not a scale:
+/// `|m| / d = 15.5`, so a window narrower than that factor could never hold
+/// both; only `d` is held to the window, and `m` to a normal f16. No band is
+/// open (the block has no sub-block scales), so `d = σ/√E[w²/d²]`: a
+/// [2^-13, 2^-10] window takes Q5_1 at K in about [12,300, 787,000], and
+/// K = 640 needs `d = 2^-7.87`; a [2^-14, 2^-6] window takes Q5_0 at K in
+/// about [48, 3.1 million].
+const Q5_CODE_VAR: f64 = 85.25;
+const Q5_MID: f32 = 15.5;
+/// Q5_0's mean, `15.5 − 16`, squared: what its `E[w²]` holds beyond the
+/// variance.
+const Q5_0_MEAN_SQ: f64 = 0.25;
+/// Q5_0's offset in codes: its value is `d·(q − 16)`.
+pub(super) const Q5_0_OFFSET: f32 = 16.0;
 /// IQ4_NL (`block_iq4_nl`: f16 `d`, 32 four-bit codes, value
 /// `d·kvalues_iq4nl[c]`): the codes are table values, so a band of them is the
 /// code distribution and its own `E[k²]` the code variance, as Q8_0's codes
@@ -331,11 +346,13 @@ pub fn rule_for(name: &str, ty: GgmlType, k: u64, window: Window) -> Result<Rule
         GgmlType::Q8_0 => widest_band(&field(-127, 127), 1.0, sigma, in_window)
             .map(|(band, d)| Rule::Q8_0 { d, band })
             .ok_or_else(|| no_scale("band of i8 codes")),
-        GgmlType::Q5_1 => {
-            let d = f16(sigma / Q5_1_CODE_VAR.sqrt());
-            let m = f32_to_f16_bits(-Q5_1_MID * half_to_f32(d));
-            if window.holds(d) && normal_f16(m) {
-                Ok(Rule::Q5_1 { d, m })
+        GgmlType::Q5_0 | GgmlType::Q5_1 => {
+            let has_min = ty == GgmlType::Q5_1;
+            let code_sq = Q5_CODE_VAR + if has_min { 0.0 } else { Q5_0_MEAN_SQ };
+            let d = f16(sigma / code_sq.sqrt());
+            let m = has_min.then(|| f32_to_f16_bits(-Q5_MID * half_to_f32(d)));
+            if window.holds(d) && m.is_none_or(normal_f16) {
+                Ok(Rule::Q5Legacy { d, m })
             } else {
                 Err(no_scale("d of uniform 5-bit codes"))
             }
@@ -563,11 +580,20 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
                 }
             }
         }
-        Rule::Q5_1 { d, m } => {
-            for blk in units::<24>(out) {
+        Rule::Q5Legacy { d, m } => {
+            let head = 2 + 2 * usize::from(m.is_some());
+            let unit = head + 20;
+            assert!(
+                out.len().is_multiple_of(unit),
+                "{} bytes are not whole {unit}-byte units: a chunk is whole units of its tensor's type",
+                out.len()
+            );
+            for blk in out.chunks_exact_mut(unit) {
                 blk[0..2].copy_from_slice(&d.to_le_bytes());
-                blk[2..4].copy_from_slice(&m.to_le_bytes());
-                rng.fill(&mut blk[4..24]);
+                if let Some(m) = m {
+                    blk[2..4].copy_from_slice(&m.to_le_bytes());
+                }
+                rng.fill(&mut blk[head..]);
             }
         }
         Rule::Iq4Nl { d, band } => {

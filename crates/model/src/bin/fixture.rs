@@ -27,7 +27,7 @@
 //! listed size with its header (fetched through the hf crate's client) at the front, in a
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
-//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `glm5next`)
+//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `glm5next`, `nemotron`)
 //! reads its row of [`SOURCES`]: repo, quant and revision; a `<repo>:<quant>` takes `main`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
@@ -54,6 +54,7 @@ use hf::fetch::Client;
 use hf::{Entry, RepoRef};
 use model::arch::deepseek41::fixture as v41;
 use model::arch::glm5next::fixture as glm5;
+use model::arch::nemotron_h::fixture as nemo;
 use model::arch::qwen35moe::fixture as qwen38;
 use model::fixture::{
     self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, HeaderStat, Options, PlannedTensor,
@@ -71,7 +72,7 @@ flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a
 flags of fetch: the same but --draft, and --rev R";
 
 /// Every family's spec, found by the architecture it declares.
-const SPECS: [fn() -> FixtureSpec; 3] = [v41::spec, qwen38::spec, glm5::spec];
+const SPECS: [fn() -> FixtureSpec; 4] = [v41::spec, qwen38::spec, glm5::spec, nemo::spec];
 
 /// Where a family's draft fixture comes from on the hub.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +99,7 @@ struct Source {
 }
 
 /// One row per entry of [`SPECS`].
-const SOURCES: [Source; 3] = [
+const SOURCES: [Source; 4] = [
     Source {
         spec: v41::spec,
         family: "v41",
@@ -125,6 +126,15 @@ const SOURCES: [Source; 3] = [
         // unsloth's later rewrite of shard 1 renamed `glm5next` to `glm5-next`; this is the
         // commit before, whose header the fixture was made from.
         rev: Some("621d456e93"),
+        draft: DraftSource::None,
+    },
+    Source {
+        spec: nemo::spec,
+        family: "nemotron",
+        repo: "nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF",
+        quant: "Q4_K_M",
+        // The commit the 2,837,072,864-byte file's header was read at.
+        rev: Some("ba223d14e45525f7fae81db77ea8cabeb2fc6c25"),
         draft: DraftSource::None,
     },
 ];

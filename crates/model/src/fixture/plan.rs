@@ -213,7 +213,7 @@ pub fn unsigned(key: &str, v: &Value) -> Result<u64, FixtureError> {
 }
 
 /// `blk.<n>.<rest>` → `(n, rest)`.
-fn split_layer(name: &str) -> Option<(usize, &str)> {
+pub(crate) fn split_layer(name: &str) -> Option<(usize, &str)> {
     let rest = name.strip_prefix(BLK)?;
     let (n, rest) = rest.split_once('.')?;
     Some((n.parse().ok()?, rest))
@@ -279,16 +279,27 @@ fn apply_subset(
 }
 
 /// Rules are a function of (type, K) under the spec's window; planned once
-/// per pair. A 1-D tensor takes the family's constant.
+/// per pair. A vector, and an F32 tensor the family names, takes the family's
+/// constant or spread.
 struct Rules<'a> {
     family: &'a dyn Family,
     window: Window,
     cache: HashMap<(u32, u64), Rule>,
 }
 
+/// Whether `dims` is a vector by shape: one input per output (`dims[0]` is 1),
+/// or no second dim. A tensor stored `[1, n]` is a vector the converter gave a
+/// second dim, not a matrix: its n elements are a per-channel parameter, not the
+/// weights of K inputs, so it takes the family's constant or spread. A tensor
+/// stored `[n, 1]` is the other way round, a projection of n inputs to one
+/// output, and stays a matrix at σ = 1/√n.
+fn is_vector(dims: &[u64]) -> bool {
+    dims.len() < 2 || dims[0] == 1
+}
+
 impl Rules<'_> {
     fn get(&mut self, name: &str, ty: GgmlType, dims: &[u64]) -> Result<Rule, FixtureError> {
-        if dims.len() < 2 {
+        if is_vector(dims) || self.named(name, ty) {
             return self.constant(name, ty);
         }
         let key = (ty.as_u32(), dims[0]);
@@ -300,8 +311,19 @@ impl Rules<'_> {
         Ok(r)
     }
 
-    /// The rule of the 1-D tensor `name` of type `ty`: the family's constant
-    /// or spread for its name past `blk.N.`, as F32.
+    /// Whether the family names a constant or a spread for F32 tensor `name`,
+    /// whatever its shape. A norm gain stored as a matrix of groups (`[n, groups]`)
+    /// is still a gain: as a matrix it would be a zero-mean random-sign draw of
+    /// `1/√n`, which shrinks the block's output by that factor and flips half its
+    /// signs, and no family would choose that for a norm.
+    fn named(&self, name: &str, ty: GgmlType) -> bool {
+        let leaf = split_layer(name).map_or(name, |(_, rest)| rest);
+        ty == GgmlType::F32
+            && (self.family.const_value(leaf).is_some() || self.family.spread_value(leaf).is_some())
+    }
+
+    /// The rule of the vector or named tensor `name` of type `ty`: the family's
+    /// constant or spread for its name past `blk.N.`, as F32.
     fn constant(&self, name: &str, ty: GgmlType) -> Result<Rule, FixtureError> {
         let leaf = split_layer(name).map_or(name, |(_, rest)| rest);
         let bad = |detail: String| FixtureError::Tensor {
@@ -680,6 +702,14 @@ fn target_tensors(
 
 /// Cut `tensors` into shards of at most `cap` data bytes each (a larger
 /// tensor alone), named after `stem`, and set the split keys.
+///
+/// A source that is one unsplit file carries none of the split keys, so its
+/// fixture of one shard carries none either: the reader treats a file with no
+/// `split.*` keys as a whole model, and writing them would make a fixture whose
+/// header differs from its real file's in keys the family never chose. The keys'
+/// values for a later shard come from the source's own, so a keyless source
+/// whose fixture the cap cuts into more shards, and a source with some of the
+/// three keys only, are refused by name.
 fn shard(
     stem: &str,
     mut kvs: Vec<(String, Value)>,
@@ -703,9 +733,22 @@ fn shard(
     }
     shards.push(start..tensors.len());
     let n = shards.len();
-    for key in [SPLIT_NO, SPLIT_COUNT, SPLIT_TENSORS] {
-        if !split_keys.iter().any(|(k, _)| k == key) {
-            return Err(meta(key, "is absent from the source's first shard"));
+    let keyless = !split_keys
+        .iter()
+        .any(|(k, _)| [SPLIT_NO, SPLIT_COUNT, SPLIT_TENSORS].contains(&k.as_str()));
+    if !(keyless && n == 1) {
+        for key in [SPLIT_NO, SPLIT_COUNT, SPLIT_TENSORS] {
+            if !split_keys.iter().any(|(k, _)| k == key) {
+                let why = if keyless {
+                    format!(
+                        "is absent from the source's first shard, an unsplit file, and the cap \
+                         cuts the fixture into {n} shards: give a larger --shard-bytes"
+                    )
+                } else {
+                    "is absent from the source's first shard".to_string()
+                };
+                return Err(meta(key, why));
+            }
         }
     }
     for (k, v) in &mut kvs {

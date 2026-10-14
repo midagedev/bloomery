@@ -166,11 +166,13 @@ pub trait Family: Sync {
     /// fixture does not cover, which plans refuse by name.
     fn key_rule(&self, suffix: &str) -> Option<KeyRule>;
 
-    /// The value of every element of a 1-D F32 tensor, by its name past
-    /// `blk.N.`; `None` is a 1-D tensor with no fill rule.
+    /// The value of every element of an F32 tensor, by its name past
+    /// `blk.N.`: a tensor of any shape the family names (a norm gain stored
+    /// `[n, groups]`), and every vector (all dims but one are 1); `None` is a
+    /// vector with no fill rule.
     fn const_value(&self, leaf: &str) -> Option<f32>;
 
-    /// The half-width of a 1-D F32 tensor whose elements are drawn
+    /// The half-width of an F32 tensor whose elements are drawn
     /// independently and uniformly in `±half_width`, by its name past
     /// `blk.N.`: a tensor whose elements must differ from one another (a
     /// router's selection bias, whose picks a constant never moves) and from
@@ -198,7 +200,9 @@ pub trait Family: Sync {
     }
 
     /// The family's tables for a fixture of `spec` cut from `source`: the
-    /// keys and tensor dims that depend on the map beyond renaming.
+    /// keys and tensor dims that depend on the map beyond renaming. A map the
+    /// family cannot keep its facts under is refused here, by name, before any
+    /// byte is planned.
     fn tables(&self, source: &Split, spec: &FixtureSpec) -> Result<Box<dyn Tables>, FixtureError> {
         let _ = (source, spec);
         Ok(Box::new(NoTables))
@@ -236,8 +240,10 @@ pub trait Tables {
     fn lines(&self) -> Vec<String>;
 }
 
-/// The tables of a family that has none.
-struct NoTables;
+/// The tables of a family that has none; a family whose map needs a check
+/// only (no key or dim moves with it) returns this from its [`Family::tables`]
+/// after the check.
+pub(crate) struct NoTables;
 
 impl Tables for NoTables {
     fn key(&self, key: &str, _suffix: &str, _v: &Value) -> Result<Value, FixtureError> {

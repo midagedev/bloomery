@@ -23,8 +23,8 @@
 //! projection of a unit-RMS input has unit RMS. [`rule_for`] derives each
 //! type's scale from its block layout (the dequant ports in `gguf::quant`)
 //! and picks the widest band of scale codes whose `d` (and `dmin`) is a
-//! normal f16 in the spec's [`Window`]. A 1-D F32 tensor holds the constant
-//! the family names for it.
+//! normal f16 in the spec's [`Window`]. A vector (every dim but one is 1) and an
+//! F32 tensor the family names hold the constant the family gives them.
 //!
 //! The bytes are a function of the seed and the source header alone: each
 //! tensor's stream is cut into chunks of about [`CHUNK_TARGET`] bytes, and a
@@ -45,10 +45,10 @@
 //! `fixture-variants/<tag>/` beside the fixture root (the box manifest keys every file under the root into
 //! every fixture-tier item) and its reference sets are named apart from the base's.
 //!
-//! A 1-D F32 tensor holds the family's constant, or, for a tensor whose
-//! elements must differ (a router's selection bias), a uniform spread
-//! ([`Family::spread_value`]); each tensor's stream is keyed by its name, so
-//! two spread tensors of one shape differ.
+//! A vector or an F32 tensor the family names holds the family's constant, or,
+//! for a tensor whose elements must differ (a router's selection bias), a
+//! uniform spread ([`Family::spread_value`]); each tensor's stream is keyed by
+//! its name, so two spread tensors of one shape differ.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -73,12 +73,13 @@ mod write;
 pub use budget::check as check_budget;
 pub use fill::{Band, CHUNK_TARGET, FloatTy, Rule, Window, rule_for};
 pub use plan::{FilePlan, Kvs, Plan, PlannedTensor, header_sha256, plan};
-pub(crate) use plan::{int_like, items, unsigned};
+pub(crate) use plan::{int_like, items, split_layer, unsigned};
 pub use remote::{
     FIRST_RANGE, HeaderStat, MAX_HEADER, ReadRange, RemoteError, remove_fixture, sparse_set,
     sparse_shard,
 };
 pub use sidecar::{SidecarStat, path_of as sidecar_path};
+pub(crate) use spec::NoTables;
 pub use spec::{
     Budget, CardBudget, CardExperts, DraftRules, DraftSpec, Family, FixtureSpec, KeyRule, Options,
     SidecarSpec, Tables,
