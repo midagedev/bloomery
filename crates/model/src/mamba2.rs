@@ -154,13 +154,16 @@ pub fn check(g: Geom) -> Result<Checked, Mamba2Error> {
     if g.d_conv == 0 {
         return Err(Mamba2Error::Conv0);
     }
-    if g.n_heads == 0 || g.n_groups == 0 || g.n_heads % g.n_groups != 0 {
+    if g.n_heads == 0 || g.n_groups == 0 || !g.n_heads.is_multiple_of(g.n_groups) {
         return Err(Mamba2Error::Groups {
             n_heads: g.n_heads,
             n_groups: g.n_groups,
         });
     }
-    if g.d_inner == 0 || g.d_inner % g.n_heads != 0 || g.d_inner % g.n_groups != 0 {
+    if g.d_inner == 0
+        || !g.d_inner.is_multiple_of(g.n_heads)
+        || !g.d_inner.is_multiple_of(g.n_groups)
+    {
         return Err(Mamba2Error::Inner {
             d_inner: g.d_inner,
             n_heads: g.n_heads,
@@ -199,6 +202,7 @@ fn warp_sum(mut lane: [f32; 32]) -> f32 {
 /// `c + head * head_dim`. `dt` and `a` are one float per head (`dt` already
 /// includes its bias). `b` and `c` are `n_group * 128`, `n` fastest inside
 /// the group. Writes `y` and the updated state.
+#[allow(clippy::too_many_arguments)] // one scan step: geometry, state, x, dt, A, B, C, y
 pub fn scan_token(
     g: &Checked,
     state: &mut [f32],
@@ -230,7 +234,7 @@ pub fn scan_token(
             let x_dt = x[h * head_dim + ch] * dt_sp;
             let s_base = (h * head_dim + ch) * 128;
             let mut lane = [0.0f32; 32];
-            for l in 0..32 {
+            for (l, slot) in lane.iter_mut().enumerate() {
                 let mut acc = 0.0f32;
                 for j in 0..4 {
                     let n = l + 32 * j;
@@ -238,7 +242,7 @@ pub fn scan_token(
                     state[s_base + n] = updated;
                     acc += updated * c[b_base + n];
                 }
-                lane[l] = acc;
+                *slot = acc;
             }
             y[h * head_dim + ch] = warp_sum(lane);
         }
@@ -249,7 +253,7 @@ pub fn scan_token(
 /// `y[c] += x[c] * D[head]`, `D` one float per head.
 pub fn skip_d(y: &mut [f32], x: &[f32], d: &[f32], head_dim: usize) -> Result<(), Mamba2Error> {
     len("x", x.len(), y.len())?;
-    if head_dim == 0 || y.len() % head_dim != 0 {
+    if head_dim == 0 || !y.len().is_multiple_of(head_dim) {
         return Err(Mamba2Error::Len {
             what: "D",
             got: d.len(),
@@ -258,8 +262,7 @@ pub fn skip_d(y: &mut [f32], x: &[f32], d: &[f32], head_dim: usize) -> Result<()
     }
     let heads = y.len() / head_dim;
     len("D", d.len(), heads)?;
-    for h in 0..heads {
-        let gain = d[h];
+    for (h, &gain) in d.iter().enumerate() {
         for ch in 0..head_dim {
             let i = h * head_dim + ch;
             y[i] += x[i] * gain;
@@ -287,7 +290,7 @@ pub fn grouped_rms(
     eps: f32,
 ) -> Result<(), Mamba2Error> {
     len("norm", gain.len(), y.len())?;
-    if n_groups == 0 || y.len() % n_groups != 0 {
+    if n_groups == 0 || !y.len().is_multiple_of(n_groups) {
         return Err(Mamba2Error::Groups {
             n_heads: y.len(),
             n_groups,
@@ -339,7 +342,7 @@ pub fn conv_tokens(
         return Err(Mamba2Error::Conv0);
     }
     let channels = bias.len();
-    if channels == 0 || x_new.len() % channels != 0 {
+    if channels == 0 || !x_new.len().is_multiple_of(channels) {
         return Err(Mamba2Error::Len {
             what: "conv x",
             got: x_new.len(),
@@ -571,12 +574,12 @@ mod tests {
         let sp = scan_dt(20.0);
         assert!(state.iter().all(|&v| v == sp));
         let mut lane = [0.0f32; 32];
-        for l in 0..32 {
+        for slot in &mut lane {
             let mut acc = 0.0f32;
             for _j in 0..4 {
                 acc += sp;
             }
-            lane[l] = acc;
+            *slot = acc;
         }
         assert_eq!(y[0], warp_sum(lane));
         // f32 `log1p(exp(20))` is 20, so the channel sum is the identity's 2560.

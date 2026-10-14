@@ -296,7 +296,10 @@ levers 0 0 0
 # compute call (ops.rs dispatch_ccd, over each run of a block) and the warm walk's prefetch (ops.rs warm_touch), each
 # with its SAFETY line, and the cut test's RowSet double (ccd_tests::Pairs, whose `unsafe fn compute` the trait
 # makes unsafe).
-model 119 31 13
+# PIN(2026-10-14): model 119 -> 122 blocks, new code, not old code relaxed: the shared host Mamba-2 scan
+# (mamba2.rs) calls libm expf and log1pf. Two call blocks and one `unsafe extern "C"` block, each call with its
+# SAFETY line. The fn and impl counts stay.
+model 122 31 13
 models 0 0 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
