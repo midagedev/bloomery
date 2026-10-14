@@ -626,9 +626,9 @@ box_run() {
     STUB_BOXQ_ARGS="$tmp/boxq.args" STUB_BOXQ_JOB="$tmp/boxq.job" \
     HOME="$tmp/home" PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
 }
-# box [ARGS]: box_run with stdin as it is, or from BOX_STDIN when that is set.
+# box [ARGS]: box_run with stdin from BOX_STDIN, or empty, so no case depends on the stdin the suite was started with.
 box() {
-  if [ -n "${BOX_STDIN:-}" ]; then box_run "$@" < "$BOX_STDIN"; else box_run "$@"; fi
+  box_run "$@" < "${BOX_STDIN:-/dev/null}"
 }
 sshlog() {
   if grep -Eq -- "$2" "$tmp/ssh.log"; then pass "$1"; else fail "$1" "no ssh line matches /$2/" "$tmp/ssh.log"; fi
@@ -867,6 +867,8 @@ piped_box() { printf 'echo x\n' | BOX_STDIN=/dev/stdin box env BLOOMERY_BOX_QUEU
 run 'box.sh: a queued call with a pipe of input on stdin is refused' 64 'a queued job has no stdin' piped_box
 BOX_STDIN=$tmp/stdin.sh rc_is 'box.sh: a direct call still takes a file on stdin' 0 box "$B/tools/box.sh" 'bash -s'
 rc_is 'box.sh: a queued call with an empty stdin runs' 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" true
+open_pipe_box() { (sleep 3) | BOX_STDIN=/dev/stdin box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" true; }
+rc_is 'box.sh: a queued call on an open, empty pipe runs (no hang)' 0 open_pipe_box
 run 'box.sh: BLOOMERY_Q_CARD is a lane' 64 'BLOOMERY_Q_CARD must be 3090, a6000, both, any or none, got .moon.' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=moon "$B/tools/box.sh" true
 # `any`: the card is the daemon's choice, read when the job starts; `none`: no card pin beyond the default.
 rc_is 'box.sh: BLOOMERY_Q_CARD=any' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=any "$B/tools/box.sh" true
@@ -1042,8 +1044,8 @@ else
     BLOOMERY_Q_PRED_S=90 BLOOMERY_CARD_BUDGET=12345 BLOOMERY_FIXTURE_MODEL=/m/x.gguf BLOOMERY_BOX=elsewhere BLOOMERY_REMOTE='~/x' \
     BLOOMERY_BOX_WAIT=7 BLOOMERY_HOLD_OWNER=zz BLOOMERY_BOX_ENV=BLOOMERY_PREHEAT=0 BLOOMERY_BOX_READONLY=0 \
     BLOOMERY_REF_MODEL_PROFILE=qwen4exp BLOOMERY_LEASE_LOCK="$tmp/other.lock" BLOOMERY_LEASE_HOLDS="$tmp/other-*-hold" "$B/tools/box.sh" "$sel"
-  run "box.sh: just box-gc's script refuses local mode by name" 64 "box-gc: BLOOMERY_BOX_CARD=local is tools/box\\.sh's local mode" \
-    boxl BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'bash -s -- --kill' < "$ROOT/tools/box-gc.sh"
+  BOX_STDIN=$ROOT/tools/box-gc.sh run "box.sh: just box-gc's script refuses local mode by name" 64 "box-gc: BLOOMERY_BOX_CARD=local is tools/box\\.sh's local mode" \
+    boxl BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'bash -s -- --kill'
 fi
 run 'box.sh: local mode refuses the box queue' 64 "BLOOMERY_BOX_QUEUE=1 makes the command a job of the box's queue, and BLOOMERY_BOX_LOCAL=1 runs it here" \
   boxl BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" "$SHOW"
