@@ -113,6 +113,13 @@ ARM=${3:-dspark}
 case $CORPUS in *[!A-Za-z0-9_-]*) usage ;; esac
 case $N in '' | *[!0-9]* | 0) usage ;; esac
 case $ARM in plain | dspark) ENGINE=ik ;; lcpp) ENGINE=lcpp ;; *) usage ;; esac
+# The dspark arm is the draft reader. On the fixture tier ref-paths.sh leaves DSPARK_MODEL empty
+# when the fixture has no single draft (it does not exit, and it does not keep the profile's real
+# path); dspark_model names that and exits 66, so -md never receives an empty path. The plain and
+# lcpp arms open no draft.
+if [ "$ARM" = dspark ]; then
+  DSPARK_MODEL=$(dspark_model) || exit $?
+fi
 DRY=${BLOOMERY_DRY:-}
 STAGE=${BLOOMERY_IK_SPEC:-dspark}
 case $STAGE in dspark | dspark:*) ;; *) echo "ik-draft.sh: BLOOMERY_IK_SPEC must be dspark[:k=v,...], got '$STAGE'" >&2; exit 64 ;; esac

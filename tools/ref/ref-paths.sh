@@ -137,16 +137,21 @@ case "${BLOOMERY_TIER:-real}" in
           fi
           FIXTURE_FILE=${__fixture_files[0]}
           [ -n "${BLOOMERY_REF_MODEL:-}" ] || MODEL=$FIXTURE_FILE
-          # A family whose fixture has a DSpark draft keeps it in a directory of its own beside the target's shards (the glob above sees
-          # the target's first shard only): the fixture tier's draft is that file, never the real draft the profile names. A caller's own
-          # BLOOMERY_DSPARK_MODEL wins, as it does in the profile (the Rust side refuses a draft that is not a whole fixture).
-          if [ "$BLOOMERY_MODEL" = deepseek41 ] && [ -z "${BLOOMERY_DSPARK_MODEL:-}" ]; then
-            __fixture_drafts=("$__fixture_root/$__fixture_dir"/draft/*.gguf)
-            if [ ! -e "${__fixture_drafts[0]}" ] || [ "${#__fixture_drafts[@]}" != 1 ]; then
-              echo "ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir/draft holds ${#__fixture_drafts[@]} files (${__fixture_drafts[*]}), want the one DSpark fixture draft (\`fixture generate\` writes it); not running a draft on the real file (exit 66)" >&2
-              exit 66
-            fi
+        fi
+        # A family whose fixture has a DSpark draft keeps it in a directory of its own beside the target's shards (the glob above sees
+        # the target's first shard only): the fixture tier's draft is that file, never the real draft the profile names. A caller's own
+        # BLOOMERY_DSPARK_MODEL wins, as it does in the profile (the Rust side refuses a draft that is not a whole fixture). Zero files
+        # or several do not exit here — MODEL, FIXTURE_FILE and FIXTURE_DIR stay as resolved above, DSPARK_MODEL is empty (the profile's
+        # real path is not left in it), and the reason is kept for dspark_model, which is what refuses. Exactly one file: DSPARK_MODEL is
+        # it. FIXTURE_NEW=1 skips the target-file lookup above and still comes through here, so a writer does not keep the real draft path.
+        if [ "$BLOOMERY_MODEL" = deepseek41 ] && [ -z "${BLOOMERY_DSPARK_MODEL:-}" ]; then
+          DSPARK_MODEL=
+          DSPARK_MODEL_WHY=
+          __fixture_drafts=("$__fixture_root/$__fixture_dir"/draft/*.gguf)
+          if [ -e "${__fixture_drafts[0]}" ] && [ "${#__fixture_drafts[@]}" = 1 ]; then
             DSPARK_MODEL=${__fixture_drafts[0]}
+          else
+            DSPARK_MODEL_WHY="ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir/draft holds ${#__fixture_drafts[@]} files (${__fixture_drafts[*]}), want the one DSpark fixture draft (\`fixture generate\` writes it); not running a draft on the real file (exit 66)"
           fi
         fi
         ;;
@@ -158,6 +163,25 @@ case "${BLOOMERY_TIER:-real}" in
     exit 64
     ;;
 esac
+
+# dspark_model: the draft a command may export, on stdout, no trailing newline (the bytes the old
+# `printf %s` of DSPARK_MODEL produced). Non-empty — the real tier's profile path, a caller's
+# BLOOMERY_DSPARK_MODEL, or the one fixture draft — prints it and returns 0. Empty: print the reason
+# kept above (or a named line when this profile has none) to stderr, ending with "(exit 66)", and
+# exit 66. `$(. tools/ref/ref-paths.sh && dspark_model)` then ends the command's `&&` chain at 66,
+# which tools/gate-batch.sh counts as deferred. It never prints an empty path.
+dspark_model() {
+  if [ -n "${DSPARK_MODEL:-}" ]; then
+    printf '%s' "$DSPARK_MODEL"
+    return 0
+  fi
+  if [ -n "${DSPARK_MODEL_WHY:-}" ]; then
+    echo "$DSPARK_MODEL_WHY" >&2
+  else
+    echo "ref-paths.sh: DSPARK_MODEL is empty (exit 66)" >&2
+  fi
+  exit 66
+}
 
 # fixture_budget: what a command under the fixture tier needs of the fixture's header, once per command (tools/box.sh calls it):
 # the card budget the generator recorded (bloomery.fixture.card_budget, bytes) on stdout, nothing for a family whose real file

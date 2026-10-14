@@ -56,13 +56,26 @@ export CUDA_VISIBLE_DEVICES=$TIMING_GPU
 # is the profile's DSPARK_MODEL unless the caller names one. dspark_env prints the same two
 # assignments for a runner that sets the lever per arm (depth-ds41.sh); in the two-card mode the cards
 # are the mode's two (the draft sits on the 3090 beside the expert tier).
+# An empty draft path is refused by name (exit 66), never exported: on the fixture tier a fixture with
+# no single draft leaves DSPARK_MODEL empty and its reason in DSPARK_MODEL_WHY (ref-paths.sh).
+dspark_file() {
+  local d=${BLOOMERY_DSPARK_MODEL:-${DSPARK_MODEL:-}}
+  if [ -z "$d" ]; then
+    echo "timing-card.sh: no DSpark draft to run: ${DSPARK_MODEL_WHY:-DSPARK_MODEL is empty (exit 66)}" >&2
+    exit 66
+  fi
+  printf '%s' "$d"
+}
 dspark_env() {
+  local d
+  d=$(dspark_file) || exit $?
   echo "CUDA_VISIBLE_DEVICES=$TIMING_GPU${OTHER_GPU:+,$OTHER_GPU}${TIMING_GPU2:+,$TIMING_GPU2}"
-  echo "BLOOMERY_DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-${DSPARK_MODEL:-}}"
+  echo "BLOOMERY_DSPARK_MODEL=$d"
 }
 if [ "${BLOOMERY_DRAFT:-}" = dspark ]; then
   export CUDA_VISIBLE_DEVICES=$TIMING_GPU,$OTHER_GPU
-  export BLOOMERY_DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-${DSPARK_MODEL:-}}
+  BLOOMERY_DSPARK_MODEL=$(dspark_file) || exit $?
+  export BLOOMERY_DSPARK_MODEL
 fi
 
 # The two-card mode's state, set in both modes so a runner under `set -u` can read every name:

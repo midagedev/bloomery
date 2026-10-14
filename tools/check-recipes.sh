@@ -622,7 +622,210 @@ blk_fixturevariants() {
     out=$(env -i PATH="$PATH" HOME="$HOME" "${vars[@]}" BLOOMERY_BOX_READONLY=1 bash "$(dirname "$0")/box.sh" true 2>&1 || true)
     case $out in *"${c#*|}"*) ;; *) echo "check-recipes: box.sh with '${c%%|*}': wanted '${c#*|}' in: $out" >&2; return 1 ;; esac
   done
+  # deepseek41, fixture tier, on this same temporary root. Sourcing resolves the fixture and does not exit when
+  # v41/draft holds zero files or several: MODEL stays the fixture file, DSPARK_MODEL is empty (never the profile's
+  # real draft), and the reason is kept. dspark_model is what refuses, exit 66, naming the draft directory.
+  mkdir -p "$d/fixtures/v41"
+  local shard=$d/fixtures/v41/t-00001-of-00001.gguf ds_rc ds_out err
+  touch "$shard"
+  ds() { # ds SCRIPT NAME=value... : `. ref-paths.sh && SCRIPT` for this fixture; ds_out, ds_rc, $d/ds.err
+    local script=$1
+    shift
+    ds_rc=0
+    ds_out=$(env -i PATH="$PATH" BLOOMERY_FIXTURE_ROOT="$d/fixtures" BLOOMERY_MODEL=deepseek41 BLOOMERY_TIER=fixture \
+      name=DSPARK_MODEL "$@" bash -c "$script" _ "$rp" 2>"$d/ds.err") || ds_rc=$?
+  }
+  ds '. "$1" && printf "model=%s\nds=[%s]\n" "$MODEL" "${!name}"'
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 0 ] || { echo "check-recipes: ref-paths.sh, no draft: source exited $ds_rc, want 0: $err" >&2; return 1; }
+  [ "$ds_out" = "model=$shard"$'\n'"ds=[]" ] || { echo "check-recipes: ref-paths.sh, no draft: wanted model=$shard and an empty draft, got: $ds_out" >&2; return 1; }
+  case $err in *"(exit 66)"*) echo "check-recipes: ref-paths.sh, no draft: source printed a refusal: $err" >&2; return 1 ;; esac
+  ds '. "$1" && dspark_model'
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] || { echo "check-recipes: dspark_model, no draft: exited $ds_rc, want 66: $err" >&2; return 1; }
+  [ -z "$ds_out" ] || { echo "check-recipes: dspark_model, no draft: printed '$ds_out', want nothing" >&2; return 1; }
+  case $err in *"$d/fixtures/v41/draft"*) ;; *) echo "check-recipes: dspark_model, no draft: wanted the draft directory in: $err" >&2; return 1 ;; esac
+  case $err in *"fixture generate"*) ;; *) echo "check-recipes: dspark_model, no draft: wanted 'fixture generate' in: $err" >&2; return 1 ;; esac
+  case $err in *"(exit 66)"*) ;; *) echo "check-recipes: dspark_model, no draft: wanted '(exit 66)' in: $err" >&2; return 1 ;; esac
+  mv "$shard" "$shard.bak"
+  ds '. "$1" && printf x' FIXTURE_NEW=1
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 0 ] || { echo "check-recipes: ref-paths.sh, FIXTURE_NEW with no shard: source exited $ds_rc, want 0: $err" >&2; return 1; }
+  ds '. "$1" && printf "dir=%s\nds=[%s]" "$FIXTURE_DIR" "${!name}"' FIXTURE_NEW=1
+  [ "$ds_out" = "dir=$d/fixtures/v41"$'\n'"ds=[]" ] || { echo "check-recipes: ref-paths.sh, FIXTURE_NEW: wanted an empty draft under $d/fixtures/v41, got: $ds_out" >&2; return 1; }
+  ds '. "$1" && printf x'
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] || { echo "check-recipes: ref-paths.sh, no shard: source exited $ds_rc, want 66: $err" >&2; return 1; }
+  case $err in *"no fixture file"*) ;; *) echo "check-recipes: ref-paths.sh, no shard: wanted 'no fixture file' in: $err" >&2; return 1 ;; esac
+  mv "$shard.bak" "$shard"
+  local one=$d/fixtures/v41/draft/one.gguf two=$d/fixtures/v41/draft/two.gguf
+  mkdir -p "$d/fixtures/v41/draft"
+  touch "$one"
+  ds '. "$1" && dspark_model'
+  [ "$ds_rc" = 0 ] && [ "$ds_out" = "$one" ] || { echo "check-recipes: dspark_model, one draft: rc=$ds_rc out='$ds_out', want $one" >&2; return 1; }
+  touch "$two"
+  ds '. "$1" && dspark_model'
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] || { echo "check-recipes: dspark_model, two drafts: exited $ds_rc, want 66: $err" >&2; return 1; }
+  [ -z "$ds_out" ] || { echo "check-recipes: dspark_model, two drafts: printed '$ds_out', want nothing" >&2; return 1; }
+  case $err in *"$one"*) ;; *) echo "check-recipes: dspark_model, two drafts: wanted $one in: $err" >&2; return 1 ;; esac
+  case $err in *"$two"*) ;; *) echo "check-recipes: dspark_model, two drafts: wanted $two in: $err" >&2; return 1 ;; esac
+  ds '. "$1" && dspark_model' BLOOMERY_DSPARK_MODEL=/x.gguf
+  [ "$ds_rc" = 0 ] && [ "$ds_out" = /x.gguf ] || { echo "check-recipes: dspark_model, caller draft: rc=$ds_rc out='$ds_out', want /x.gguf" >&2; return 1; }
+  local prof line real f_rc f_out
+  prof=$(dirname "$0")/ref/models/deepseek41.sh
+  line=$(sed -n '215p' "$prof")
+  real=$(printf '%s\n' "$line" | sed -n 's/^DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-\(.*\)}$/\1/p')
+  [ -n "$real" ] || { echo "check-recipes: $prof:215 is not the DSPARK_MODEL default: $line" >&2; return 1; }
+  f_rc=0
+  f_out=$(env -i PATH="$PATH" BLOOMERY_MODEL=deepseek41 bash -c '. "$1" && dspark_model' _ "$rp" 2>"$d/f.err") || f_rc=$?
+  [ "$f_rc" = 0 ] && [ "$f_out" = "$real" ] || { echo "check-recipes: dspark_model, real tier: rc=$f_rc out='$f_out', want '$real' ($(cat "$d/f.err"))" >&2; return 1; }
+  echo "check-recipes: deepseek41 fixture draft: source stays up, dspark_model refuses"
   echo "check-recipes: fixture variants ok ($n row(s): $tags )"
+}
+# A fixture-tier command exports an empty draft path when it reads DSPARK_MODEL out of ref-paths.sh
+# other than through dspark_model: zero drafts leave the variable empty and the export reaches a file
+# open. dspark_model refuses that with exit 66. A justfile line or a tools shell script that prints the
+# variable, or expands it after sourcing ref-paths.sh without calling dspark_model, fails here by file:line.
+blk_dsparkread() {
+  local out
+  if ! out=$(python3 - "$JF" "$(dirname "$0")" << 'PY'
+import os
+import re
+import sys
+
+# The bad printf is built from parts so this file does not contain that byte string (the tree grep
+# for it must stay empty, including on this checker).
+PRINTF = re.compile(re.escape("printf %s \"" + "$" + "DSPARK_MODEL\""))
+EXPAND = re.compile(r"(?<![A-Za-z0-9_])\$\{?DSPARK_MODEL\b")
+SOURCE = re.compile(r"(?:\.|source)\s+\S*ref-paths\.sh")
+CALL = re.compile(r"(?<![A-Za-z0-9_])dspark_model(?![A-Za-z0-9_])")
+
+
+def strip_comment(line):
+    out, q, i = [], None, 0
+    while i < len(line):
+        c = line[i]
+        if q == "'":
+            out.append(c)
+            if c == "'":
+                q = None
+            i += 1
+            continue
+        if q == '"':
+            out.append(c)
+            if c == "\\" and i + 1 < len(line):
+                out.append(line[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                q = None
+            i += 1
+            continue
+        if c in "'\"":
+            q = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "#":
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def code_lines(text):
+    for n, raw in enumerate(text.splitlines(), 1):
+        code = strip_comment(raw)
+        if code.strip() == "":
+            continue
+        yield n, code
+
+
+def justfile_hits(text, path):
+    hits = []
+    for n, code in code_lines(text):
+        if PRINTF.search(code):
+            hits.append(f"{path}:{n}: reads the draft with printf instead of dspark_model")
+        elif EXPAND.search(code) and not CALL.search(code):
+            hits.append(f"{path}:{n}: reads the draft out of ref-paths.sh other than through dspark_model")
+    return hits
+
+
+def script_hits(text, path):
+    lines = list(code_lines(text))
+    sources = any(SOURCE.search(code) for _, code in lines)
+    calls = any(CALL.search(code) for _, code in lines)
+    hits = []
+    for n, code in lines:
+        if PRINTF.search(code):
+            hits.append(f"{path}:{n}: reads the draft with printf instead of dspark_model")
+            continue
+        if not EXPAND.search(code):
+            continue
+        if (SOURCE.search(code) and not CALL.search(code)) or (sources and not calls):
+            hits.append(f"{path}:{n}: reads the draft out of ref-paths.sh other than through dspark_model")
+    return hits
+
+
+def expect(name, hits, want):
+    if len(hits) != want:
+        return [f"check-recipes: draft-read fixture '{name}': {len(hits)} hits, want {want}: {hits}"]
+    return []
+
+
+def fixtures():
+    bad_printf = "printf %s \"" + "$" + "DSPARK_MODEL\""
+    expand = "\"$" + "DSPARK_MODEL\""
+    brace = "\"${" + "DSPARK_MODEL:-}\""
+    bad = []
+    bad += expect("a justfile line that prints the variable", justfile_hits("recipe:\n    " + bad_printf + "\n", "fixture-justfile"), 1)
+    if not bad and ":2:" not in justfile_hits("recipe:\n    " + bad_printf + "\n", "fixture-justfile")[0]:
+        bad.append("check-recipes: draft-read fixture 'a justfile line that prints the variable': the hit has no file:line")
+    bad += expect("a justfile line that calls dspark_model", justfile_hits("recipe:\n    __s=$(. tools/ref/ref-paths.sh && dspark_model)\n", "fixture-justfile"), 0)
+    bad += expect("a script that sources ref-paths and expands the variable", script_hits("source tools/ref/ref-paths.sh\necho " + expand + "\n", "fixture.sh"), 1)
+    bad += expect("a script that goes through dspark_model", script_hits("source tools/ref/ref-paths.sh\nx=$(dspark_model) || exit $?\necho " + expand + "\n", "fixture-ok.sh"), 0)
+    bad += expect("printf beside a dspark_model call", script_hits("x=$(dspark_model)\n" + bad_printf + "\n", "fixture-both.sh"), 1)
+    bad += expect("the function's own file", script_hits("dspark_model() {\n  printf '%s' " + expand + "\n}\n", "ref-paths.sh"), 0)
+    # timing-card.sh expands the variable and does not source ref-paths.sh; this rule does not own that file.
+    bad += expect("a script that does not source ref-paths", script_hits("echo " + brace + "\n", "timing-card.sh"), 0)
+    return bad
+
+
+def scan(justfile, tools):
+    hits = []
+    with open(justfile, encoding="utf-8") as fh:
+        hits += justfile_hits(fh.read(), justfile)
+    nsh = 0
+    for root, dirs, files in os.walk(tools):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in files:
+            if not name.endswith(".sh"):
+                continue
+            nsh += 1
+            path = os.path.join(root, name)
+            with open(path, encoding="utf-8") as fh:
+                hits += script_hits(fh.read(), path)
+    return hits, nsh
+
+
+errs = fixtures()
+if errs:
+    print("\n".join(errs))
+    sys.exit(1)
+hits, nsh = scan(sys.argv[1], sys.argv[2])
+if hits:
+    print("check-recipes: a fixture-tier command exports an empty draft path:")
+    print("\n".join(hits))
+    sys.exit(1)
+print(f"check-recipes: draft reads go through dspark_model ({nsh} shell files, the printf fixture is red)")
+PY
+  ); then
+    printf '%s\n' "$out" >&2
+    echo "check-recipes: a fixture-tier command exports an empty draft path" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
 }
 # refset-publish.sh's assignment of the fx_ sets to a family (never by name), its named error on a set it cannot place, its
 # left-out block (variant, DSpark) and its --upload refusal, on a fake tree, no box.
@@ -774,7 +977,7 @@ proc_leg
 unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc

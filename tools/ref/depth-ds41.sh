@@ -1156,7 +1156,9 @@ arm_envs() {
   [ -z "$envs" ] || IFS=, read -r -a ARM_ENVS <<< "$envs"
   if [[ ",${A_ENV[$1]}," == *",BLOOMERY_DRAFT=dspark,"* ]]; then
     local -a extra=()
-    mapfile -t extra < <(dspark_env)
+    local lines
+    lines=$(dspark_env) || exit $?
+    mapfile -t extra <<< "$lines"
     ARM_ENVS=("${extra[@]}" "${ARM_ENVS[@]}")
   fi
 }
