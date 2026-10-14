@@ -27,7 +27,7 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::placement::accepts::{Program, routed_rule};
-use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
     self, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
@@ -128,6 +128,21 @@ impl PlanRefusal for PlaceError {
         match self {
             Self::Broken(v) => Some(v),
             _ => None,
+        }
+    }
+
+    /// The card's reading, and the host's: a longer context leaves more
+    /// routed experts to the host, and the body serves no NVMe tier past it
+    /// ([`PlaceError::NoNvmeTier`]), so a smaller context is what that
+    /// refusal asks for. The host held its need less the bytes it paged.
+    fn short(&self) -> Option<Short> {
+        match self {
+            Self::NoNvmeTier { paged, need, .. } => Some(Short {
+                on: Side::Host,
+                need: *need,
+                room: need.saturating_sub(*paged),
+            }),
+            _ => self.card_short(),
         }
     }
 }

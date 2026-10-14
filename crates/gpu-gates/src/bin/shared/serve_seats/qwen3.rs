@@ -13,7 +13,7 @@
 //! The server takes `-m`/`--hf` out before this seat parses (its module
 //! doc); `--ctx-size` and `-c` are `--ctx` under llama-server's spellings.
 //! The context is the user's ask and the plan fills the card around it
-//! (`placement::ctx_ask::choose`): a set `--ctx` is the total the slots
+//! (`generate::choose_ctx`, every seat's): a set `--ctx` is the total the slots
 //! split, planned once at its share, and a share the card cannot hold stops
 //! the load by name with the largest it would hold. Unset, a slot is planned
 //! at 262,144 positions or the file's trained context where that is less,
@@ -184,7 +184,7 @@ use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
     note_line, parallel_line, slots_given,
 };
-use bloomery_gpu_gates::generate::{CTX_GRAN, Place, check_set_slot, trained_ctx};
+use bloomery_gpu_gates::generate::{Place, choose_ctx};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
@@ -194,9 +194,7 @@ use model::arch::Arch;
 use model::arch::qwen35moe::hparams::Hparams;
 use model::placement::PlacementError;
 use model::placement::PlanLevers;
-use model::placement::ctx_ask::{
-    Ask, AskError, Chosen, DEFAULT_SLOTS, Limit, PlanRefusal, Probe, Steps, choose,
-};
+use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, PlanRefusal, Probe};
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use runtime::Target as _;
 #[cfg(feature = "vision")]
@@ -214,9 +212,6 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
                      [--parallel N] [--queue-depth Q] [--plan] [--mmproj FILE | --no-mmproj] \
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
-
-/// The least context a slot's default steps down to ([`Steps::floor`]).
-const BASE_SLOT_CTX: usize = q3place::SERVE_RULE.base;
 
 /// What a qwen35moe file's load opens at with a `ctx`-row cache: the
 /// tensor-core decode flash, the levers' ubatch and the `kv` planes, as
@@ -1061,33 +1056,21 @@ fn pass_of<B: Body3>(slots: usize, placed: bool) -> Pass {
 /// of the total. Under `--mmproj` (`vision`) the load is a media load and the
 /// encoder's reserve, when its tower sits on the stage card, is in the
 /// verdict and in the plan.
-/// The context `slots` slots serve and the load made at it
-/// ([`choose`]): a set `--ctx` is the total they split, planned once at its
-/// share; unset, a slot is planned at the target and halved only while the
-/// card is short. Each candidate is the load [`decide`] makes at its total, a
+/// The context `slots` slots serve and the load made at it, by the seats'
+/// common choice ([`choose_ctx`]): a set `--ctx` (`set`) is the total they
+/// split, planned once at its share; unset, a slot is planned at the target
+/// and halved only while the card is short. Each candidate is the load [`decide`] makes at its total, a
 /// placed one planned there too, so a short card shows here and not at the
 /// open. Every candidate reads one census: a line names the probes and the
 /// readings ([`searched_line`]).
 fn ctx_and_load(
     split: &Split,
     arch: Arch,
-    (ask, slots): (Ask, usize),
+    (set, slots): (Option<usize>, usize),
     (place, levers): (Option<Place>, &PlanLevers),
     (kv, vision): (KvQ8, Option<&Opened>),
 ) -> Result<Chosen<Q3Load>, GateError> {
-    let trained = trained_ctx(split).ok_or("the file states no context_length")?;
-    let limit = Limit {
-        positions: u64::try_from(trained)?,
-        source: "trained",
-    };
-    let steps = Steps {
-        floor: u64::try_from(BASE_SLOT_CTX)?,
-        step: u64::try_from(CTX_GRAN)?,
-    };
-    let word = match ask {
-        Ask::Set { .. } => "set",
-        Ask::Default => "default",
-    };
+    let word = if set.is_some() { "set" } else { "default" };
     let before = q3place::reads();
     let census = q3place::census()?;
     let mut probes = 0;
@@ -1106,12 +1089,9 @@ fn ctx_and_load(
         }
         Ok(Probe::Holds(load))
     };
-    let chosen = choose(ask, slots, limit, steps, plan_at);
+    let chosen = choose_ctx(split, (set, slots), (None, None), plan_at);
     searched_line(word, probes, before);
-    chosen.map_err(|e| match e {
-        AskError::Plan(e) => e,
-        other => other.to_string().into(),
-    })
+    chosen
 }
 
 /// The line a `--ctx` choice (`word`, set or default) prints once it
@@ -1125,15 +1105,15 @@ fn searched_line(word: &str, probes: usize, before: q3place::Reads) {
     );
 }
 
-/// A plan's refusal as a short card ([`Probe::CardShort`]), else the
+/// A plan's refusal as a short memory ([`Probe::Short`]), else the
 /// refusal as it stands.
 fn short_or(e: GateError) -> Result<Probe<Q3Load>, GateError> {
     let short = e
         .downcast_ref::<model::arch::qwen3moe::place::PlaceError>()
-        .and_then(PlanRefusal::card_short)
+        .and_then(PlanRefusal::short)
         .or_else(|| {
             e.downcast_ref::<model::arch::qwen35moe::place::PlaceError>()
-                .and_then(PlanRefusal::card_short)
+                .and_then(PlanRefusal::short)
         })
         .or_else(|| {
             e.downcast_ref::<PlacementError>()
@@ -1502,22 +1482,22 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (slots, from) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
     // The DSpark draft's window is one sequence's: several slots are refused by name.
     let (slots, from) = served::draft_slots(a.parallel, draft, false)?.unwrap_or((slots, from));
-    // A set `--ctx` is the total the slots split: its share is held to the
-    // model's limit before any plan.
+    // A set `--ctx` is the total the slots split: a share under the rows a
+    // slot loads at is refused before any plan.
     if let Some(total) = a.ctx {
-        check_set_slot(&split, slot_ctx(total, slots)?, None, None)?;
+        slot_ctx(total, slots)?;
     }
     // A projector the `--hf` repo picked stays only where the load gives the text model the same
     // experts and context with its reserve as without ([`vision_seat::kept`]).
-    let ask = match a.ctx {
-        Some(total) => Ask::Set {
-            total: u64::try_from(total)?,
-        },
-        None => Ask::Default,
-    };
     let vision = vision_seat::kept(vision, &a.vision, |v| {
         let plan_levers = PlanLevers::from_levers(&levers)?;
-        let asked = ctx_and_load(&split, arch, (ask, slots), (a.place, &plan_levers), (kv, v))?;
+        let asked = ctx_and_load(
+            &split,
+            arch,
+            (a.ctx, slots),
+            (a.place, &plan_levers),
+            (kv, v),
+        )?;
         let cost_ctx = asked.total;
         Ok(match asked.plan {
             Q3Load::Whole(_) | Q3Load::Placed { whole: Some(_), .. } => {
@@ -1541,7 +1521,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let asked = ctx_and_load(
         &split,
         arch,
-        (ask, slots),
+        (a.ctx, slots),
         (a.place, &plan_levers),
         (kv, vision.as_ref()),
     )?;

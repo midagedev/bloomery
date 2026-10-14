@@ -9,8 +9,9 @@
 //! With no `--ctx`, a slot is planned at [`DEFAULT_TARGET`], or the model's
 //! limit where that is less. Only this default steps down, by halves, and
 //! only on a plan whose card cannot hold the load's resident bytes plus that
-//! context's sequence state ([`Probe::CardShort`]); any other refusal is the
-//! seat's error as it stands. Callers validate a set context against the
+//! context's sequence state, or whose host cannot hold what the card then
+//! leaves it where the body has no tier past the host ([`Probe::Short`]); any
+//! other refusal is the seat's error as it stands. Callers validate a set context against the
 //! model's limit; here it only caps the default target.
 
 use std::collections::BTreeSet;
@@ -60,33 +61,46 @@ pub struct Steps {
 pub enum Probe<P> {
     /// The plan holds.
     Holds(P),
-    /// The card cannot hold the load's resident bytes plus this context's
-    /// sequence state: `need` bytes against `room`. Only this outcome lets
-    /// the default step down.
-    CardShort {
-        /// The bytes the card would hold.
-        need: u64,
-        /// The bytes the card has for them.
-        room: u64,
-    },
+    /// A smaller context is what the plan asks for ([`Short`]). Only this
+    /// outcome lets the default step down.
+    Short(Short),
 }
 
-/// A card that cannot hold the load's resident bytes plus a context's
-/// sequence state: the bytes it would hold and the bytes it has for them.
+/// Which memory a context leaves short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// The card: the load's resident bytes plus the context's sequence
+    /// state pass its bytes.
+    Card,
+    /// The host: the experts the card leaves it pass its room, on a body
+    /// that serves no tier past the host.
+    Host,
+}
+
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Card => "card",
+            Self::Host => "host",
+        })
+    }
+}
+
+/// A plan short of one memory at a context: the bytes it would hold there
+/// and the bytes it has for them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Short {
-    /// The bytes the card would hold.
+    /// The memory.
+    pub on: Side,
+    /// The bytes it would hold.
     pub need: u64,
-    /// The card's bytes for them.
+    /// Its bytes for them.
     pub room: u64,
 }
 
 impl<P> From<Short> for Probe<P> {
     fn from(s: Short) -> Self {
-        Probe::CardShort {
-            need: s.need,
-            room: s.room,
-        }
+        Probe::Short(s)
     }
 }
 
@@ -100,6 +114,7 @@ pub fn short_of(violations: &[Violation]) -> Option<Short> {
             return None;
         };
         let s = Short {
+            on: Side::Card,
             need: *total,
             room: *limit,
         };
@@ -119,10 +134,12 @@ impl PlacementError {
     pub fn card_short(&self) -> Option<Short> {
         match self {
             Self::CardBudgetFloor { budget, floor, .. } => Some(Short {
+                on: Side::Card,
                 need: *floor,
                 room: *budget,
             }),
             Self::CardFreeFloor(f) => Some(Short {
+                on: Side::Card,
                 need: f.floor,
                 room: f.free,
             }),
@@ -131,9 +148,10 @@ impl PlacementError {
     }
 }
 
-/// A family's plan refusal, read as a short card ([`PlanRefusal::card_short`]):
+/// A family's plan refusal, read as a short memory ([`PlanRefusal::short`]):
 /// each family's error says which of its variants carry a placement error
-/// and a plan's violations, and the reading is this one.
+/// and a plan's violations, and the card's reading is this one; a family
+/// whose body serves no tier past the host adds its host refusal.
 pub trait PlanRefusal {
     /// The placement error this refusal carries, if any.
     fn placement(&self) -> Option<&PlacementError>;
@@ -145,6 +163,24 @@ pub trait PlanRefusal {
             .and_then(PlacementError::card_short)
             .or_else(|| self.violations().and_then(short_of))
     }
+    /// This refusal as a short memory, else `None`: the card's reading
+    /// unless the family's body adds the host's.
+    fn short(&self) -> Option<Short> {
+        self.card_short()
+    }
+}
+
+/// A seat's plan outcome as a probe: a refusal that reads as a short memory
+/// ([`PlanRefusal::short`]) steps the default down; any other stays the
+/// seat's error.
+///
+/// # Errors
+/// The plan's refusal when it is not short.
+pub fn probe_of<P, E: PlanRefusal>(planned: Result<P, E>) -> Result<Probe<P>, E> {
+    match planned {
+        Ok(plan) => Ok(Probe::Holds(plan)),
+        Err(e) => e.short().map(Probe::Short).ok_or(e),
+    }
 }
 
 /// What set the context.
@@ -154,15 +190,13 @@ pub enum Rule {
     Set,
     /// The default target.
     Target,
-    /// The default stepped down from `from`: the card was short of `need`
-    /// bytes against `room` at the rung above the one that held.
+    /// The default stepped down from `from`: the rung above the one that
+    /// held was `short`.
     Halved {
         /// The target the default began at.
         from: u64,
-        /// The bytes the last short plan needed.
-        need: u64,
-        /// The card's bytes for them.
-        room: u64,
+        /// The last short plan.
+        short: Short,
     },
 }
 
@@ -195,9 +229,10 @@ impl<P> Chosen<P> {
             self.slot_ctx, self.slots, self.total, self.limit.positions, self.limit.source
         );
         match self.rule {
-            Rule::Halved { from, need, room } => {
-                format!("{line} from={from} card-short need={need} room={room}")
-            }
+            Rule::Halved {
+                from,
+                short: Short { on, need, room },
+            } => format!("{line} from={from} {on}-short need={need} room={room}"),
             Rule::Set | Rule::Target => line,
         }
     }
@@ -215,7 +250,7 @@ pub enum AskError<E> {
         /// The slots.
         slots: usize,
     },
-    /// A set context the card cannot hold.
+    /// A set context the machine cannot hold.
     DoesNotFit {
         /// The asked total.
         total: u64,
@@ -223,28 +258,25 @@ pub enum AskError<E> {
         slot_ctx: u64,
         /// The slots.
         slots: usize,
-        /// The bytes the card would hold at `slot_ctx`.
-        need: u64,
-        /// The card's bytes for them.
-        room: u64,
+        /// The plan at `slot_ctx`.
+        short: Short,
         /// The largest share a slot holds, `None` when not even `floor`.
         largest: Option<u64>,
         /// The least share searched.
         floor: u64,
     },
-    /// The default stepped down to its floor and the card still cannot hold it.
+    /// The default stepped down to its floor and the machine still cannot
+    /// hold it.
     FloorShort {
         /// The least rung.
         floor: u64,
         /// The slots.
         slots: usize,
-        /// The bytes the card would hold at `floor`.
-        need: u64,
-        /// The card's bytes for them.
-        room: u64,
+        /// The plan at `floor`.
+        short: Short,
     },
-    /// The seat's plan refused for a reason other than a short card; never
-    /// retried.
+    /// The seat's plan refused for a reason other than a short memory;
+    /// never retried.
     Plan(E),
 }
 
@@ -260,15 +292,14 @@ impl<E: fmt::Display> fmt::Display for AskError<E> {
                 total,
                 slot_ctx,
                 slots,
-                need,
-                room,
+                short: Short { on, need, room },
                 largest,
                 floor,
             } => {
                 write!(
                     f,
                     "--ctx {total} over {slots} slot(s) asks {slot_ctx} positions a slot, and \
-                     the card holds {room} of the {need} bytes that takes: "
+                     the {on} holds {room} of the {need} bytes that takes: "
                 )?;
                 match largest {
                     Some(n) => write!(
@@ -286,12 +317,11 @@ impl<E: fmt::Display> fmt::Display for AskError<E> {
             Self::FloorShort {
                 floor,
                 slots,
-                need,
-                room,
+                short: Short { on, need, room },
             } => write!(
                 f,
                 "with --ctx unset, {slots} slot(s) at {floor} positions, the least the default \
-                 tries, take {need} bytes on a card that holds {room}: ask fewer slots or a \
+                 tries, take {need} bytes on a {on} that holds {room}: ask fewer slots or a \
                  smaller model file"
             ),
             Self::Plan(e) => write!(f, "{e}"),
@@ -340,17 +370,16 @@ pub fn choose<P, E>(
         Ask::Set { total } => {
             let slot_ctx = crate::slots::split_ctx(total, n, NonZeroU64::MIN)
                 .map_err(|_| AskError::NoPosition { total, slots })?;
-            let (need, room) = match probe(slot_ctx)? {
+            let short = match probe(slot_ctx)? {
                 Probe::Holds(plan) => return Ok(chosen(slot_ctx, Rule::Set, plan)),
-                Probe::CardShort { need, room } => (need, room),
+                Probe::Short(s) => s,
             };
             let largest = largest_held(steps, slot_ctx, &mut probe)?;
             Err(AskError::DoesNotFit {
                 total,
                 slot_ctx,
                 slots,
-                need,
-                room,
+                short,
                 largest,
                 floor: steps.floor,
             })
@@ -365,16 +394,15 @@ pub fn choose<P, E>(
                     Probe::Holds(plan) => {
                         let rule = match short {
                             None => Rule::Target,
-                            Some((need, room)) => Rule::Halved {
+                            Some(short) => Rule::Halved {
                                 from: target,
-                                need,
-                                room,
+                                short,
                             },
                         };
                         return Ok(chosen(rung, rule, plan));
                     }
-                    Probe::CardShort { need, room } => {
-                        short = Some((need, room));
+                    Probe::Short(s) => {
+                        short = Some(s);
                         // The floor is a rung of its own: a target that is
                         // no power of two halves past it otherwise.
                         let next = round_down(rung / 2, steps.step).max(steps.floor.min(target));
@@ -382,8 +410,7 @@ pub fn choose<P, E>(
                             return Err(AskError::FloorShort {
                                 floor: rung,
                                 slots,
-                                need,
-                                room,
+                                short: s,
                             });
                         }
                         rung = next;
@@ -464,10 +491,11 @@ mod tests {
             Ok(if need <= self.room {
                 Probe::Holds(c)
             } else {
-                Probe::CardShort {
+                Probe::Short(Short {
+                    on: Side::Card,
                     need,
                     room: self.room,
-                }
+                })
             })
         }
 
@@ -523,8 +551,11 @@ mod tests {
             got.rule,
             Rule::Halved {
                 from: 262_144,
-                need: 1000 + 131_072 * 10,
-                room: card.room,
+                short: Short {
+                    on: Side::Card,
+                    need: 1000 + 131_072 * 10,
+                    room: card.room,
+                },
             }
         );
     }
@@ -542,8 +573,11 @@ mod tests {
             AskError::FloorShort {
                 floor: 4096,
                 slots: 2,
-                need: 1000 + 4096 * 10,
-                room: card.room,
+                short: Short {
+                    on: Side::Card,
+                    need: 1000 + 4096 * 10,
+                    room: card.room,
+                },
             }
         );
         // A target that is no power of two steps onto the floor before it
@@ -664,12 +698,28 @@ mod tests {
         assert_eq!(
             chosen(Rule::Halved {
                 from: 262_144,
-                need: 9,
-                room: 8
+                short: Short {
+                    on: Side::Card,
+                    need: 9,
+                    room: 8,
+                },
             })
             .line(),
             "ctx rule=halved ctx=65536 slots=1 total=65536 limit=262144 (trained) from=262144 \
              card-short need=9 room=8"
+        );
+        assert_eq!(
+            chosen(Rule::Halved {
+                from: 262_144,
+                short: Short {
+                    on: Side::Host,
+                    need: 9,
+                    room: 8,
+                },
+            })
+            .line(),
+            "ctx rule=halved ctx=65536 slots=1 total=65536 limit=262144 (trained) from=262144 \
+             host-short need=9 room=8"
         );
     }
 
@@ -686,6 +736,7 @@ mod tests {
         assert_eq!(
             short_of(&[over(110, 100), over(150, 120)]),
             Some(Short {
+                on: Side::Card,
                 need: 150,
                 room: 120
             })
@@ -711,6 +762,7 @@ mod tests {
         assert_eq!(
             floor.card_short(),
             Some(Short {
+                on: Side::Card,
                 need: 120,
                 room: 90
             })

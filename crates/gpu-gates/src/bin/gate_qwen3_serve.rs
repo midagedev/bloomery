@@ -1209,8 +1209,8 @@ mod gate {
         Ok(())
     }
 
-    /// The base a slot (`generate_qwen3moe`'s default, the seat's
-    /// `BASE_SLOT_CTX`): the least rung an unset `--ctx` asks.
+    /// The base a slot (`generate::SEAT_STEPS`' floor, every seat's): the
+    /// least rung an unset `--ctx` asks, held as the gate's own literal.
     const SEAT_FLOOR: u64 = 4096;
 
     /// The context an unset `--ctx` asks a slot first on a file trained past
