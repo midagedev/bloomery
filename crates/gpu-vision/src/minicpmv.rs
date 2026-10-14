@@ -55,6 +55,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Gguf;
 use std::sync::Arc;
 use vision::Patches;
+use vision::arch::minicpmv::card::{self, ScratchLens as Lens, padded_ff as ff_padded};
 use vision::arch::minicpmv::{Hparams, names, tensors};
 
 mod host;
@@ -67,6 +68,7 @@ pub use host::{
 pub use order::{
     SEPARATORS, bucket, check_grid, merge_row, merge_rows, position_index, tile_embd, window_rows,
 };
+pub use vision::arch::minicpmv::card::weights as weight_bytes_of;
 
 const WHAT: &str = "MiniCPM-V tower load";
 
@@ -83,79 +85,10 @@ const NARROWED: [&str; 1] = ["v.patch_embd.weight"];
 
 // ------------------------------------------------------------------ bytes
 
-/// The columns `ffn_up` has after its zero padding: a multiple of the GEMM's column tile.
-fn ff_padded(hp: &Hparams) -> usize {
-    hp.ff.next_multiple_of(crate::gemm_bf16::TILE_N)
-}
-
-/// Bytes of weights the card holds for a file with these hyperparameters: bf16 matrices (the
-/// MLP of each block padded to [`ff_padded`]) and the patch kernel narrowed to bf16, every vector
-/// f32. The position table and the separator rows stay on the host.
-#[must_use]
-pub fn weight_bytes_of(hp: &Hparams) -> u64 {
-    let d = |n: usize| n as u64;
-    let (dim, ff, out) = (d(hp.dim), d(ff_padded(hp)), d(hp.out_dim));
-    let merged = d(hp.merged_dim());
-    let ds_ff = d(4 * hp.ff);
-    let k_patch = d(3 * hp.patch * hp.patch);
-    let attn_mats = 4 * dim * dim;
-    let block_mats = attn_mats + 2 * ff * dim;
-    let attn_vecs = 3 * dim + dim;
-    let block_vecs = attn_vecs + 4 * dim + ff + dim;
-    let merger_mats = attn_mats + (merged + dim) * ds_ff;
-    let merger_vecs = attn_vecs + 2 * dim + 2 * merged + ds_ff + dim;
-    2 * (d(hp.n_layer) * block_mats + merger_mats + dim * k_patch + merged * merged + merged * out)
-        + 4 * (d(hp.n_layer) * block_vecs + merger_vecs + dim + 2 * dim + 2 * merged + merged + out)
-}
-
-/// The activation buffers' lengths for a tile of at most `max_patches` patches, in bf16 values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Lens {
-    patches: usize,
-    pos: usize,
-    stream: usize,
-    qkv: usize,
-    att: usize,
-    up: usize,
-    mean: usize,
-    rows: usize,
-}
-
-impl Lens {
-    fn of(hp: &Hparams, max_patches: usize) -> Lens {
-        let n = max_patches;
-        Lens {
-            patches: n * 3 * hp.patch * hp.patch,
-            pos: n * hp.dim,
-            stream: n * hp.dim,
-            qkv: n * 3 * hp.dim,
-            att: n * hp.dim,
-            // Also the vit_merger's hidden rows (n/4 of 4·ff, which is n·ff) and the final
-            // merger's up rows (n/16 of 4608).
-            up: n * ff_padded(hp),
-            mean: n / GROUP * hp.dim,
-            rows: n / (GROUP * GROUP) * hp.out_dim,
-        }
-    }
-
-    /// Bytes of every buffer: all bf16, the three streams (`xa`, `xb`, `h`) counted.
-    fn bytes(&self) -> u64 {
-        let bf16 = self.patches
-            + self.pos
-            + 3 * self.stream
-            + self.qkv
-            + self.att
-            + self.up
-            + self.mean
-            + self.rows;
-        2 * bf16 as u64
-    }
-}
-
 /// Bytes of activations the card holds for a tile of at most `max_patches` patches.
 #[must_use]
 pub fn scratch_bytes_of(hp: &Hparams, max_patches: usize) -> u64 {
-    Lens::of(hp, max_patches).bytes()
+    card::ScratchLens::of(hp, max_patches).bytes()
 }
 
 // ------------------------------------------------------------------ weights
@@ -627,14 +560,14 @@ impl Scratch {
             lens,
             patches: bf16(lens.patches)?,
             pos: bf16(lens.pos)?,
-            xa: bf16(lens.stream)?,
-            xb: bf16(lens.stream)?,
-            h: bf16(lens.stream)?,
+            xa: bf16(lens.xa)?,
+            xb: bf16(lens.xb)?,
+            h: bf16(lens.h)?,
             qkv: bf16(lens.qkv)?,
-            att: bf16(lens.att)?,
+            att: bf16(lens.attn)?,
             up: bf16(lens.up)?,
             mean: bf16(lens.mean)?,
-            rows: bf16(lens.rows)?,
+            rows: bf16(lens.out)?,
         })
     }
 
@@ -646,13 +579,13 @@ impl Scratch {
         what: &'static str,
     ) -> Result<(), GpuError> {
         check_grid(n_h, n_w).map_err(|detail| GpuError::Shape { what, detail })?;
-        if n_h * n_w * hp.dim > self.lens.stream {
+        if n_h * n_w * hp.dim > self.lens.xa {
             return Err(GpuError::Shape {
                 what,
                 detail: format!(
                     "a {n_h}x{n_w} grid ({} patches) does not fit the tower's buffers, sized for {} patches",
                     n_h * n_w,
-                    self.lens.stream / hp.dim
+                    self.lens.xa / hp.dim
                 ),
             });
         }
@@ -960,9 +893,9 @@ mod tests {
                 [
                     lens.patches,
                     lens.pos,
-                    lens.stream,
+                    lens.xa,
                     lens.qkv,
-                    lens.att,
+                    lens.attn,
                     lens.up
                 ],
                 [
@@ -974,9 +907,9 @@ mod tests {
                     planned.up
                 ]
             );
-            assert_eq!([lens.mean, lens.rows], [planned.mean, planned.out]);
-            assert_eq!(lens.stream, planned.xb);
-            assert_eq!(lens.stream, planned.h);
+            assert_eq!([lens.mean, lens.out], [planned.mean, planned.out]);
+            assert_eq!(lens.xa, planned.xb);
+            assert_eq!(lens.xa, planned.h);
         }
         let lens = Lens::of(&hp, 1024);
         assert!(256 * 4 * hp.ff <= lens.up && 64 * hp.merged_dim() <= lens.up);

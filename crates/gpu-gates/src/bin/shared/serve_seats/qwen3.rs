@@ -1298,7 +1298,6 @@ fn open_minicpm(
     token: &dyn Fn(u32) -> Option<String>,
     one: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<Opened, GateError> {
-    use vision::MediaModel;
     use vision::arch::minicpmv::{self, Hparams, Marks, Media};
     use vision::arch::qwen3vl::TokenLimits;
 
@@ -1338,57 +1337,24 @@ fn open_minicpm(
             "the pad {PAD_TEXT:?} does not tokenize to exactly one token"
         ))
     })?;
-    let media = Media::new(hp, marks, PAD_TEXT, pad);
-    for &(id, want) in rule.ids {
-        match token(id) {
-            Some(got) if got == want => {}
-            got => {
-                return Err(at(&format!(
-                    "the {} projector's image id {id} is {want:?}, and the model's \
-                     vocabulary holds {}",
-                    rule.projector,
-                    got.map_or("no such token".to_owned(), |g| format!("{g:?}"))
-                )));
-            }
-        }
-    }
-    if let Some(want) = rule.text_rope
-        && text.imrope != Some(want)
-    {
-        return Err(at(&format!(
-            "the {} projector places image rows by IMROPE sections {want:?}, and the text \
-             model's rope is {}",
-            rule.projector,
-            text.imrope.map_or("not IMROPE".to_owned(), |s| format!(
-                "IMROPE sections {s:?}"
-            ))
-        )));
-    }
-    let image = media.image_token();
-    match text.ple {
-        PleImage::Absent => {}
-        PleImage::NoKey => {
-            return Err(at(
-                "the text model carries per-layer embeddings and no ple.image_token_id, \
-                 which must be the projector's image token",
-            ));
-        }
-        PleImage::Id(id) if id != image => {
-            return Err(at(&format!(
-                "the text model's ple.image_token_id is {id}, the projector's image token \
-                 is {image}"
-            )));
-        }
-        PleImage::Id(_) => {}
-    }
-    let seat = vision_seat::encoder_seat(place, card.total())?;
-    Ok(vision_seat::Opened {
+    let projector = vision_seat::Projector {
         path: path.to_owned(),
-        seat,
-        media: Arc::new(media),
-        cap: limits.max(),
+        rule,
         card,
+        out_dim: hp.out_dim,
+        media: Arc::new(Media::new(hp, marks, PAD_TEXT, pad)),
+        cap: limits.max(),
         limits,
+    };
+    projector.check_text(text, token)?;
+    let seat = vision_seat::encoder_seat(place, projector.card.total())?;
+    Ok(vision_seat::Opened {
+        path: projector.path,
+        seat,
+        media: projector.media,
+        cap: projector.cap,
+        card: projector.card,
+        limits: projector.limits,
     })
 }
 
