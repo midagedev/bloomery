@@ -862,6 +862,9 @@ BOX_STDIN=$tmp/stdin.sh run 'box.sh: a queued call with a file on stdin is refus
 if [ ! -s "$tmp/rsync.log" ] && [ ! -e "$tmp/boxq.args" ]; then pass 'box.sh: … before any sync or submit'; else fail 'box.sh: … before any sync or submit' 'rsync or boxq ran' "$tmp/rsync.log"; fi
 piped_box() { printf 'echo x\n' | BOX_STDIN=/dev/stdin box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" 'bash -s'; }
 run 'box.sh: a queued call with a pipe of input on stdin is refused' 64 'a queued job has no stdin' piped_box
+# A lone NUL is input. bash's default read skips one, so this row is red unless the pipe check's delimiter is NUL.
+nul_pipe_box() { printf '\0' | BOX_STDIN=/dev/stdin box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" 'bash -s'; }
+run 'box.sh: a queued call with a NUL on stdin is refused' 64 'a queued job has no stdin' nul_pipe_box
 BOX_STDIN=$tmp/stdin.sh rc_is 'box.sh: a direct call still takes a file on stdin' 0 box "$B/tools/box.sh" 'bash -s'
 rc_is 'box.sh: a queued call with an empty stdin runs' 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" true
 # A fifo this shell holds open on both ends is a pipe with a live writer and no bytes: the read's bound must end the wait.

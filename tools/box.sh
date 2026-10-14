@@ -584,9 +584,10 @@ QLOCK_DIR=/root/bloomery-queue
 QKEY= QLOCK= QCLASS= QLANE= QPRED= SYNC_ID=
 if [ "$QUEUE" = 1 ]; then
   # A queued job has no stdin (the header): a script piped or redirected in would never reach it, and the job would run an empty
-  # one and end 0. Input on stdin (a non-empty file, or a pipe that yields a byte within 1 s: a one-byte read, since bash 3.2's
-  # `read -t 0` is no poll) is refused before anything is synced; an open, empty pipe costs that second and passes.
-  if { [ -f /dev/stdin ] && [ -s /dev/stdin ]; } || { [ -p /dev/stdin ] && IFS= read -r -t 1 -n 1 _ 2> /dev/null; }; then
+  # one and end 0. Input on stdin (a non-empty file, or a pipe that yields a byte within 1 s) is refused before anything is
+  # synced; an open, empty pipe costs that second and passes. The read's delimiter is NUL (`-d ''`), so a NUL counts: bash's
+  # default read skips one. `read -t 0` is no poll on bash 3.2, and LC_ALL=C makes `-n 1` one byte.
+  if { [ -f /dev/stdin ] && [ -s /dev/stdin ]; } || { [ -p /dev/stdin ] && LC_ALL=C IFS= read -r -d '' -t 1 -n 1 _ 2> /dev/null; }; then
     echo "box.sh: BLOOMERY_BOX_QUEUE=1 and input on stdin: a queued job has no stdin, so it would run without it; put the script in the tree or the command, or run with < /dev/null" >&2
     exit 64
   fi
