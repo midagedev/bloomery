@@ -1,4 +1,4 @@
-//! The CPU engine: the shared modules (`ops`, `ffn`, `moe`, `head`, `kv`, `profile`) and,
+//! The CPU engine: the shared modules (`ops`, `ffn`, `moe`, `head`, `kv`, `mamba2`, `profile`) and,
 //! under `arch/`, one module per model architecture — `arch::deepseek2` holds
 //! DeepSeek-V2-Lite's `attn`, `derived` and `forward`.
 //!
@@ -27,6 +27,7 @@ pub mod fileio;
 pub mod fixture;
 pub mod head;
 pub mod kv;
+pub mod mamba2;
 pub mod moe;
 pub mod ops;
 pub mod placement;
