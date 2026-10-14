@@ -139,7 +139,8 @@ pub struct Row<O> {
     pub name: &'static str,
     /// The routes its requests are posted to.
     pub routes: &'static [&'static str],
-    /// The context unless `--ctx` says.
+    /// The release's designed prompt length. The seat sizes the cache by
+    /// `generate::choose_ctx`, not by this.
     pub ctx: usize,
     /// The file architectures whose hidden states the head reads.
     pub backbones: &'static [&'static str],

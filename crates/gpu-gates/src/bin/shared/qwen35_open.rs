@@ -13,7 +13,7 @@ use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::place as q35;
 use model::arch::{QWEN35_BODY, is_qwen35_body};
 use model::placement::workstation::CardSpec;
-use model::placement::{KvBytes, Machine, whole_need};
+use model::placement::{KvBytes, Machine, WholeNeed, whole_need};
 use std::path::Path;
 
 /// The first `n` ids of `path`, one decimal id a line; a line that is not an
@@ -110,34 +110,64 @@ pub fn open_seated(
     Ok((model, split))
 }
 
-/// Refuse the whole load of `split` under `o` unless the whole-fit verdict
-/// (`placement::whole_need`, its one owner) takes it on `card`, the card it
-/// opens on, as the census read it: every tensor's granules, the cache of
-/// `o.ctx` rows, the card the program's plan lays out (`q3::machine`:
-/// context and step arenas' scratch), and the ubatch arena with the reserve
-/// the load's own fit check keeps free past it (`GpuModel::whole_load`), and what `seat` puts on the
-/// machine. The verdict's line goes to stderr; a refusal names its terms, the card and its holders.
-fn refuse_unless_whole_fits(
+/// The open the dense seat and its context probe share: scalar flash, f16
+/// KV, prompt ubatches clipped to `ctx` at the family's ubatch cap, and media
+/// tables when an encoder seat exists.
+#[allow(
+    dead_code,
+    reason = "the hidden and media gates include this file and open at a context the caller names"
+)]
+pub fn open_shape(ctx: usize, media: bool) -> Open35 {
+    Open35 {
+        ctx,
+        mma: false,
+        ubatch: bloomery_gpu::arch::qwen3moe::ubatch::UBATCH.min(ctx),
+        kv: KvQ8::F16,
+        media,
+    }
+}
+
+/// The whole-fit verdict of `o` on `card` (`placement::whole_need`): every
+/// tensor's granules, the cache of `o.ctx` rows, the card the program's plan
+/// lays out (`q3::machine`), the ubatch arena with the reserve the load's own
+/// fit check keeps free past it (`GpuModel::whole_load`), and what `seat`
+/// puts on the machine. The caller prints it.
+pub fn whole_verdict(
     split: &Split,
     o: Open35,
     card: CardSpec,
     seat: &dyn Fn(&mut Machine),
-) -> Result<(), GateError> {
+) -> Result<WholeNeed, GateError> {
     let inputs = q35::PlanInputs::describe(split)?;
     let layers = inputs.hp.n_trunk;
     let ctx = u64::try_from(o.ctx)?;
     let kv = (0..layers).map(|l| inputs.kv.layer_bytes(l, ctx)).sum();
     let mut machine = q3::machine(card, layers, 0);
     seat(&mut machine);
-    let card = machine
+    let name = card.name;
+    let view = machine
         .whole_card()
-        .ok_or_else(|| format!("the whole load on {}: a machine with no card", card.name))?;
-    let need = whole_need(
+        .ok_or_else(|| format!("the whole load on {name}: a machine with no card"))?;
+    whole_need(
         &inputs.model,
-        &card,
+        &view,
         kv,
         Qwen35moeModel::whole_load(split, o)?,
-    )?;
+    )
+    .map_err(Into::into)
+}
+
+/// Refuse the whole load of `split` under `o` unless [`whole_verdict`] takes
+/// it on `card`, the card it opens on, as the census read it. The verdict's
+/// line goes to stderr; a refusal names its terms, the card and its holders.
+/// A dense backbone has no routed experts to move to the host tier.
+fn refuse_unless_whole_fits(
+    split: &Split,
+    o: Open35,
+    card: CardSpec,
+    seat: &dyn Fn(&mut Machine),
+) -> Result<(), GateError> {
+    let need = whole_verdict(split, o, card, seat)?;
     let held = image_plan::note(&need.card);
     eprintln!("whole fit at ctx {}: {need}{held}", o.ctx);
     if need.fits() {

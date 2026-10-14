@@ -21,9 +21,13 @@
 //! head flag beside it is refused). A decision type no row serves (`kev`) is
 //! refused by name. The head's config (`--head-config`, else the row's config
 //! file beside the weights) picks the row of [`ROWS`]; a config no row knows
-//! is refused by name, listing the rows. The server takes `-m`/`--hf` out before this seat parses (its
-//! module doc); `--ctx-size` and `-c` are `--ctx` under llama-server's
-//! spellings, and C defaults to the row's context.
+//! is refused by name, listing the rows. The server takes `-m`/`--hf` out
+//! before this seat parses (its module doc); `--ctx-size` and `-c` are
+//! `--ctx` under llama-server's spellings. Unset, `--ctx` is the seats'
+//! ladder (`generate::choose_ctx`, one slot): the target under the file's
+//! trained context, halved while the whole load is short of the card, one
+//! `ctx` line naming the rule. A set value is that one context; a share past
+//! the limit is refused by name before the load.
 //!
 //! Before any load the seat refuses by name a file whose architecture is
 //! not one of the row's backbones; then, on a worker thread that owns the
@@ -65,11 +69,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 use bloomery_gpu::GpuError;
-use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
 use bloomery_gpu::media::{ImageSpan, MediaBody};
 use bloomery_gpu_gates::bind::arm_screen;
-use bloomery_gpu_gates::generate::{Place, check_set_slot};
+use bloomery_gpu_gates::generate::{Place, choose_ctx};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
@@ -78,6 +81,7 @@ use decision::release::{clef, lev};
 use gguf::Split;
 use model::arch::is_qwen35_body;
 use model::arch::qwen35moe::hparams::Hparams;
+use model::placement::ctx_ask::{Probe, Short, Side};
 use serde_json::{Value, json};
 use serve::ServeError;
 use serve::decide::{
@@ -202,16 +206,16 @@ type Opens = fn(&str) -> bool;
 const BODIES: &[(Opens, OpenBody)] = &[(is_qwen35_body, open_qwen35)];
 
 /// A Qwen3.5 dense file (`qwen35`, or `clef` with its head beside the trunk)
-/// whole on one card, prompt ubatches of [`UBATCH`] ids clipped to the
-/// context.
+/// whole on one card, the open [`crate::qwen35_open::open_shape`] names.
 fn open_qwen35(
     path: &Path,
     ctx: usize,
     image: Option<&EncoderSeat>,
 ) -> Result<(Box<dyn Hidden>, Split), GateError> {
     let reserve = image.and_then(|s| s.reserve);
+    let o = crate::qwen35_open::open_shape(ctx, image.is_some());
     let (model, split) =
-        crate::qwen35_open::open_seated(path, ctx, UBATCH.min(ctx), image.is_some(), &|machine| {
+        crate::qwen35_open::open_seated(path, o.ctx, o.ubatch, o.media, &|machine| {
             vision_seat::reserve_on(machine, reserve)
         })?;
     Ok((Box::new(model), split))
@@ -448,7 +452,8 @@ struct Load {
     width: u64,
     head: Option<(PathBuf, PathBuf)>,
     open: Open,
-    ctx: usize,
+    /// Set `--ctx`, the one context. `None` walks the seats' ladder.
+    ctx: Option<usize>,
     /// The row's name, which a refusal names.
     row: &'static str,
     vision: vision_seat::Flags,
@@ -543,11 +548,12 @@ fn open_encoder(model: &CudaContext, at: &vision_seat::Opened) -> Result<image::
     Ok(tower)
 }
 
-/// Opens the head, checks its width, opens the tokenizer and the backbone on
-/// this thread, reports the open (the quant word, or why not) on `ready`,
-/// then answers `jobs` until the server drops its sender.
-fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) {
-    let opened = (|| -> Result<(Box<dyn Decision>, Backbone, String), GateError> {
+/// Opens the head, checks its width, chooses the context (the seats' ladder,
+/// the encoder's reserve in the probe), opens the tokenizer and the backbone
+/// on this thread, and reports the open (the quant word and that context, or
+/// why not) on `ready`, then answers `jobs` until the server drops its sender.
+fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiver<Job>) {
+    let opened = (|| -> Result<(Box<dyn Decision>, Backbone, String, usize), GateError> {
         let head = (l.open)(l.head_source())?;
         if u64::try_from(head.hidden_size())? != l.width {
             return Err(format!(
@@ -564,11 +570,36 @@ fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) 
         if let Some(at) = &image {
             vision_seat::seat_record(at).eprint();
         }
+        // The ladder sees the encoder's reserve, which the later open counts too.
+        let file = Split::open(&l.model).map_err(|e| format!("open {}: {e}", l.model.display()))?;
+        let census = bloomery_gpu_gates::gpu_census::census()?;
+        let card = Place::A.on(&census)?.card_specs()?[0];
+        let reserve = image.as_ref().and_then(|o| o.seat.reserve);
+        let media = image.is_some();
+        let chosen = choose_ctx(&file, (l.ctx, 1), (None, None), |c| -> Result<_, GateError> {
+            let ctx = usize::try_from(c).map_err(|e| format!("a context of {c} positions: {e}"))?;
+            let shape = crate::qwen35_open::open_shape(ctx, media);
+            let need = crate::qwen35_open::whole_verdict(&file, shape, card, &|machine| {
+                vision_seat::reserve_on(machine, reserve);
+            })?;
+            Ok(if need.fits() {
+                Probe::Holds(())
+            } else {
+                Probe::Short(Short {
+                    on: Side::Card,
+                    need: need.need,
+                    room: need.budget,
+                })
+            })
+        })?;
+        eprintln!("{}", chosen.line());
+        let ctx = usize::try_from(chosen.slot_ctx)?;
+        drop(file);
         let (_, open_body) = BODIES
             .iter()
             .find(|(opens, _)| opens(&l.arch))
             .ok_or_else(|| format!("no backbone body opens a {} file", l.arch))?;
-        let (body, file) = open_body(&l.model, l.ctx, image.as_ref().map(|o| &o.seat))?;
+        let (body, file) = open_body(&l.model, ctx, image.as_ref().map(|o| &o.seat))?;
         let vision = image
             .as_ref()
             .map(|at| open_encoder(body.context(), at))
@@ -578,15 +609,15 @@ fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) 
             body,
             file,
             tokenizer,
-            ctx: l.ctx,
+            ctx,
             name: l.name.clone(),
             vision,
         };
-        Ok((head, on, q))
+        Ok((head, on, q, ctx))
     })();
     let (mut head, mut on) = match opened {
-        Ok((head, on, q)) => {
-            let _ = ready.send(Ok(q));
+        Ok((head, on, q, ctx)) => {
+            let _ = ready.send(Ok((q, ctx)));
             (head, on)
         }
         Err(e) => {
@@ -664,12 +695,6 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
     let width = split
         .arch_get_u64("embedding_length")
         .ok_or_else(|| format!("{}: no {arch}.embedding_length", model.display()))?;
-    // A set `--ctx` is the backbone's one context, held to the model's limit
-    // before the load.
-    if let Some(ctx) = a.ctx {
-        check_set_slot(&split, Some(ctx), (None, None))?;
-    }
-    let ctx = a.ctx.unwrap_or(row.ctx);
     drop(split);
     let model_name = base_name(&model);
     let head_name = head
@@ -684,7 +709,7 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         width,
         head,
         open: row.open,
-        ctx,
+        ctx: a.ctx,
         row: row.name,
         vision: a.vision,
     };
@@ -693,8 +718,8 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
     let worker = std::thread::Builder::new()
         .name("decide-backbone".to_owned())
         .spawn(move || work(&load, &ready_tx, &jobs_rx))?;
-    let quant = match ready_rx.recv() {
-        Ok(Ok(q)) => q,
+    let (quant, ctx) = match ready_rx.recv() {
+        Ok(Ok(opened)) => opened,
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => {
             return Err(match worker.join() {

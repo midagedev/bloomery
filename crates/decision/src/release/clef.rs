@@ -12,7 +12,8 @@ pub const NAME: &str = "clef";
 /// The routes a SystemOne request is posted to: the release's.
 pub const ROUTES: &[&str] = &["/v1/systemone"];
 
-/// The context unless the server is told otherwise: the release's `max_length`.
+/// The release's `max_length`, the prompt the encoder fills. The seat sizes
+/// the cache by the common context choice, not by this.
 pub const CTX: usize = MAX_LENGTH;
 
 /// The file architectures the head reads the hidden states of: Qwen3.5 dense, Clef's backbone,
