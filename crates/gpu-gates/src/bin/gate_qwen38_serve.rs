@@ -4437,7 +4437,7 @@ mod gate {
         check(
             &mut ok,
             "paged_small_card_yields_on_one_card",
-            one_card && yielded.is_some_and(|y| y.with as u64 == rung),
+            one_card && yielded.is_some_and(|y| y.with == rung),
         );
         let line = parallel_line(&err_log)?;
         let one = line.as_deref().is_some_and(|l| {
