@@ -34,33 +34,14 @@
 
 use crate::ops::{self, Tensor2};
 
-/// libm `expf`. The scan's `dA` and its `dt <= 20` arm call this, not a
-/// polynomial exp.
-fn libm_expf(x: f32) -> f32 {
-    // SAFETY: libm `expf` is defined for every f32 and retains nothing.
-    unsafe { expf(x) }
-}
-
-/// libm `log1pf`, the scan's softplus arm (`log1pf(expf(dt))`).
-fn libm_log1pf(x: f32) -> f32 {
-    // SAFETY: libm `log1pf` is defined for every f32 and retains nothing.
-    unsafe { log1pf(x) }
-}
-
-unsafe extern "C" {
-    fn expf(x: f32) -> f32;
-    fn log1pf(x: f32) -> f32;
-}
-
 /// The scan's `dt` map. `dt <= 20` takes `log1p(exp(dt))`; a greater value
 /// is itself.
 fn scan_dt(dt: f32) -> f32 {
-    if dt <= 20.0 {
-        libm_log1pf(libm_expf(dt))
-    } else {
-        dt
-    }
+    if dt <= 20.0 { dt.exp().ln_1p() } else { dt }
 }
+
+/// The one state length the scan runs.
+pub const STATE: usize = 128;
 
 /// A Mamba-2 layer's widths. `d_state` is 128 on a layer this module runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,13 +69,8 @@ pub struct Checked {
 /// A width or a buffer this step will not run.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Mamba2Error {
-    /// Puzzle's state length. The scan does not launch it.
-    #[error("mamba2: state 96 is refused; the scan runs state 128 and writes nothing")]
-    State96,
-    /// Falcon-H1's state length. The scan does not launch it.
-    #[error("mamba2: state 256 is refused; the scan runs state 128 and writes nothing")]
-    State256,
-    /// Any other length that is not 128.
+    /// A state length other than [`STATE`] (Puzzle's 96, Falcon-H1's 256,
+    /// any other). The scan does not launch it.
     #[error("mamba2: state {0} is refused; the scan runs state 128 and writes nothing")]
     State(usize),
     /// `n_head` does not divide into `n_group`, so the group index is not a
@@ -146,9 +122,7 @@ impl Checked {
 /// [`Checked`].
 pub fn check(g: Geom) -> Result<Checked, Mamba2Error> {
     match g.d_state {
-        128 => {}
-        96 => return Err(Mamba2Error::State96),
-        256 => return Err(Mamba2Error::State256),
+        STATE => {}
         other => return Err(Mamba2Error::State(other)),
     }
     if g.d_conv == 0 {
@@ -186,7 +160,8 @@ fn len(what: &'static str, got: usize, need: usize) -> Result<(), Mamba2Error> {
 }
 
 /// Lane 0 of a 32-wide xor reduction. Each step adds `lane ^ d` from the
-/// values at the start of that step.
+/// values at the start of that step. This order is the gate: the card's scan
+/// sums the same way.
 fn warp_sum(mut lane: [f32; 32]) -> f32 {
     for d in [16usize, 8, 4, 2, 1] {
         let prev = lane;
@@ -202,7 +177,10 @@ fn warp_sum(mut lane: [f32; 32]) -> f32 {
 /// `c + head * head_dim`. `dt` and `a` are one float per head (`dt` already
 /// includes its bias). `b` and `c` are `n_group * 128`, `n` fastest inside
 /// the group. Writes `y` and the updated state.
-#[allow(clippy::too_many_arguments)] // one scan step: geometry, state, x, dt, A, B, C, y
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one scan step: geometry, state, x, dt, A, B, C, y"
+)]
 pub fn scan_token(
     g: &Checked,
     state: &mut [f32],
@@ -215,8 +193,8 @@ pub fn scan_token(
 ) -> Result<(), Mamba2Error> {
     let (inner, heads, groups, head_dim) =
         (g.geom.d_inner, g.geom.n_heads, g.geom.n_groups, g.head_dim);
-    let state_n = inner * 128;
-    let bc_n = groups * 128;
+    let state_n = inner * STATE;
+    let bc_n = groups * STATE;
     len("state", state.len(), state_n)?;
     len("x", x.len(), inner)?;
     len("y", y.len(), inner)?;
@@ -227,12 +205,12 @@ pub fn scan_token(
     let per = heads / groups;
     for h in 0..heads {
         let dt_sp = scan_dt(dt[h]);
-        let d_a = libm_expf(dt_sp * a[h]);
+        let d_a = (dt_sp * a[h]).exp();
         let group = h / per;
-        let b_base = group * 128;
+        let b_base = group * STATE;
         for ch in 0..head_dim {
             let x_dt = x[h * head_dim + ch] * dt_sp;
-            let s_base = (h * head_dim + ch) * 128;
+            let s_base = (h * head_dim + ch) * STATE;
             let mut lane = [0.0f32; 32];
             for (l, slot) in lane.iter_mut().enumerate() {
                 let mut acc = 0.0f32;
@@ -428,7 +406,7 @@ pub fn step_token(
     if let Some(norm) = tok.norm {
         len("norm", norm.len(), inner)?;
     }
-    len("scan state", scan_state.len(), inner * 128)?;
+    len("scan state", scan_state.len(), inner * STATE)?;
     len(
         "conv state",
         conv_state.len(),
@@ -449,8 +427,8 @@ pub fn step_token(
     qdot::swiglu(&conv_y, &ones, &mut mixed);
 
     let x = &mixed[..inner];
-    let b = &mixed[inner..inner + g.geom.n_groups * 128];
-    let c = &mixed[inner + g.geom.n_groups * 128..];
+    let b = &mixed[inner..inner + g.geom.n_groups * STATE];
+    let c = &mixed[inner + g.geom.n_groups * STATE..];
     let dt: Vec<f32> = tok.dt.iter().zip(tok.dt_bias).map(|(d, b)| d + b).collect();
     scan_token(g, scan_state, x, &dt, tok.a, b, c, y)?;
     skip_d(y, x, tok.d, g.head_dim)?;
@@ -470,7 +448,7 @@ mod tests {
             d_inner: 7680,
             n_heads: 96,
             n_groups: 8,
-            d_state: 128,
+            d_state: STATE,
             d_conv: 4,
         })
         .unwrap()
@@ -506,7 +484,7 @@ mod tests {
             d_inner: 6,
             n_heads: 3,
             n_groups: 2,
-            d_state: 128,
+            d_state: STATE,
             d_conv: 4,
         })
         .unwrap_err();
@@ -518,10 +496,10 @@ mod tests {
     #[test]
     fn dt_21_is_identity_and_dt_20_is_log1p_exp() {
         assert_eq!(scan_dt(21.0), 21.0);
-        assert_eq!(scan_dt(20.0), libm_log1pf(libm_expf(20.0)));
+        assert_eq!(scan_dt(20.0), 20.0f32.exp().ln_1p());
         assert_eq!(scan_dt(20.0), 20.0);
         assert_ne!(scan_dt(1.0), 1.0);
-        assert_eq!(scan_dt(1.0), libm_log1pf(libm_expf(1.0)));
+        assert_eq!(scan_dt(1.0), 1.0f32.exp().ln_1p());
     }
 
     /// `A = 0`, `dt = 21`, `x = B = C = 1`, state 0. After `t` tokens every
@@ -532,12 +510,12 @@ mod tests {
     fn uniform_row_at_the_4b_widths() {
         let g = nano();
         let inner = 7680;
-        let mut state = vec![0.0; inner * 128];
+        let mut state = vec![0.0; inner * STATE];
         let x = vec![1.0; inner];
         let dt = vec![21.0; 96];
         let a = vec![0.0; 96];
-        let b = vec![1.0; 8 * 128];
-        let c = vec![1.0; 8 * 128];
+        let b = vec![1.0; 8 * STATE];
+        let c = vec![1.0; 8 * STATE];
         let mut y = vec![0.0; inner];
         scan_token(&g, &mut state, &x, &dt, &a, &b, &c, &mut y).unwrap();
         assert_eq!(y.len(), 7680);
@@ -554,11 +532,11 @@ mod tests {
             d_inner: 1,
             n_heads: 1,
             n_groups: 1,
-            d_state: 128,
+            d_state: STATE,
             d_conv: 4,
         })
         .unwrap();
-        let mut state = vec![0.0; 128];
+        let mut state = vec![0.0; STATE];
         let mut y = [0.0];
         scan_token(
             &g,
@@ -566,8 +544,8 @@ mod tests {
             &[1.0],
             &[20.0],
             &[0.0],
-            &[1.0; 128],
-            &[1.0; 128],
+            &[1.0; STATE],
+            &[1.0; STATE],
             &mut y,
         )
         .unwrap();
@@ -594,7 +572,7 @@ mod tests {
             d_inner: 8,
             n_heads: 8,
             n_groups: 2,
-            d_state: 128,
+            d_state: STATE,
             d_conv: 4,
         })
         .unwrap();
@@ -602,7 +580,7 @@ mod tests {
         b[0] = 1.0;
         let mut c = vec![0.0; 256];
         c[0] = 1.0;
-        let mut state = vec![0.0; 8 * 128];
+        let mut state = vec![0.0; 8 * STATE];
         let mut y = vec![0.0; 8];
         scan_token(
             &g, &mut state, &[1.0; 8], &[21.0; 8], &[0.0; 8], &b, &c, &mut y,
