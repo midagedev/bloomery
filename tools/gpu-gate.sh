@@ -548,8 +548,10 @@ PY
   case_ 'BLOOMERY_GATE_GDB with BLOOMERY_GATE_STACKS: 64, named' 64 'set one' 3090 "$t/lease" BLOOMERY_GATE_GDB=1 BLOOMERY_GATE_STACKS=5
   # A 3090-only gate (PIN_3090) asked of another card stops by name before any lock; on the 3090 it runs.
   cp "$t/tree/target/release/ok" "$t/tree/target/release/gate_qwen38_serve"
-  GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate forced to the A6000: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' a6000 "$t/lease"
-  GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate under any: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' any "$t/lease"
+  # TL names a lock directory whose gate.lock cannot open: a refusal moved below the lock opening ends 69, not 64.
+  mkdir -p "$t/pin-refusal/gate.lock"
+  TL="$t/pin-refusal" GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate forced to the A6000: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' a6000 "$t/lease"
+  TL="$t/pin-refusal" GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate under any: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' any "$t/lease"
   GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate on the 3090 runs' 0 'ran on ' 3090 "$t/lease"
   # Events, not seconds. A run in the background is held by what it waits for and released by what the test saw it do, so no case reads
   # the clock: the stub binary says `up` on STUB_READY once its run holds its locks and then blocks on STUB_HOLD until the test writes a
@@ -1229,6 +1231,10 @@ PY
   gate "$t/out" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller || rc=$?
   judge_all 'local: any takes the local lock and leaves CUDA_VISIBLE_DEVICES as it was' "$rc" 0 "$ON_LOCAL \\(asked any\\)$" '^ran on GPU-caller$'
   case_ '  … a6000 takes it too' 0 "$ON_LOCAL \\(asked a6000\\)$" a6000 "$t/lease" "${LOC[@]}"
+  # A 3090-only gate (PIN_3090) in local mode runs only when the run sees one RTX 3090 by its UUID.
+  cp "$t/tree/target/release/ok" "$t/tree/target/release/gate_qwen38_serve"
+  GATE_BIN=gate_qwen38_serve case_ '  … a 3090-only gate on another local card: 64, named' 64 'local mode requires one RTX 3090' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller
+  GATE_BIN=gate_qwen38_serve case_ '  … a 3090-only gate on the local 3090 by its UUID runs' 0 "gate_qwen38_serve on this machine's card\\(s\\), the local gate lock \\(asked any\\)$" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES="$GPU_3090"
   case_ '  … a V4.1 load takes the V4.1 load lock with it' 0 "$ON_LOCAL \\(asked any\\), V4\\.1 load lock$" any "$t/lease" "${LOC[@]}" BLOOMERY_GATE_V41_LOAD=1
   exec 5> "$t/gate.lock" 6> "$t/gate-a6000.lock"
   { flock -x 5 && flock -x 6; } || { echo "FAIL: the test cannot hold the two card locks"; return 1; }
@@ -1430,9 +1436,27 @@ esac
 PIN_3090=(
   "gate_qwen38_serve: its paged clause runs generate_qwen3moe at 27 GiB of host room on the card in view, and only the 3090's plan pages there (on the A6000 the experts fit and the draft stays on)"
 )
+# In box.sh's local mode the run must see one RTX 3090 alone: CUDA_VISIBLE_DEVICES set to its full UUID, or, unset, a
+# machine whose one card is it (tools/ref/cards.sh, the card-name owner).
 for row in "${PIN_3090[@]}"; do
   [ "${row%%:*}" = "$NAME" ] || continue
-  if [ "$BOXC" != local ] && [ "$CARD" != 3090 ]; then
+  if [ "$BOXC" = local ]; then
+    # shellcheck source=tools/ref/cards.sh
+    source "${BASH_SOURCE[0]%/*}/ref/cards.sh"
+    visible=${CUDA_VISIBLE_DEVICES-}
+    if [ "${CUDA_VISIBLE_DEVICES+x}" != x ]; then
+      visible=$(nvidia-smi --query-gpu=uuid --format=csv,noheader) || {
+        echo "gpu-gate.sh: $NAME cannot read local cards" >&2
+        exit 64
+      }
+    fi
+    if [ -n "$GPU_3090" ] && [ "$visible" = "$GPU_3090" ]; then
+      continue
+    fi
+    echo "gpu-gate.sh: $NAME runs on the 3090 only — ${row#*: }; local mode requires one RTX 3090 selected by its full GPU UUID in CUDA_VISIBLE_DEVICES" >&2
+    exit 64
+  fi
+  if [ "$CARD" != 3090 ]; then
     echo "gpu-gate.sh: $NAME runs on the 3090 only — ${row#*: }; BLOOMERY_GATE_CARD=$CARD (box.sh's view $BOXC) names another card: leave both unset or name the 3090" >&2
     exit 64
   fi
