@@ -1602,6 +1602,33 @@ impl Tables for ToyTable {
 static TOY: Toy = Toy { both: false };
 static TOY_BOTH: Toy = Toy { both: true };
 
+fn zero_source<N: AsRef<str>>(
+    path: &Path,
+    kvs: &[(String, Value)],
+    tensors: &[(N, Vec<u64>, GgmlType)],
+) -> Split {
+    let decls: Vec<TensorDecl> = tensors
+        .iter()
+        .map(|(name, dims, ty)| {
+            let (_, blck, tsz) = gguf::ggml_type_info(ty.as_u32()).unwrap();
+            TensorDecl {
+                name: name.as_ref().to_string(),
+                dims: dims.clone(),
+                type_id: ty.as_u32(),
+                nbytes: gguf::tensor_bytes(blck, tsz, dims).unwrap(),
+            }
+        })
+        .collect();
+    let bytes: Vec<u64> = decls.iter().map(|t| t.nbytes).collect();
+    let layout = Layout::new(kvs, decls).unwrap();
+    let mut w = Writer::new(File::create(path).unwrap(), layout).unwrap();
+    for ((name, _, _), n) in tensors.iter().zip(bytes) {
+        w.tensor(name.as_ref(), &vec![0u8; n as usize]).unwrap();
+    }
+    w.finish().unwrap();
+    Split::open(path).unwrap()
+}
+
 /// A four-layer source of the second family: one file, its tensors zero.
 fn toy_source(path: &Path) -> Split {
     let arr = |v: &[u32]| Value::Array(v.iter().map(|&x| Value::U32(x)).collect());
@@ -1646,26 +1673,7 @@ fn toy_source(path: &Path) -> Split {
         ),
         ("toy.table_rows".to_string(), Value::U32(1000)),
     ];
-    let decls: Vec<TensorDecl> = tensors
-        .iter()
-        .map(|(name, dims, ty)| {
-            let (_, blck, tsz) = gguf::ggml_type_info(ty.as_u32()).unwrap();
-            TensorDecl {
-                name: name.to_string(),
-                dims: dims.clone(),
-                type_id: ty.as_u32(),
-                nbytes: tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>(),
-            }
-        })
-        .collect();
-    let bytes: Vec<u64> = decls.iter().map(|t| t.nbytes).collect();
-    let layout = Layout::new(&kvs, decls).unwrap();
-    let mut w = Writer::new(File::create(path).unwrap(), layout).unwrap();
-    for ((name, _, _), n) in tensors.iter().zip(bytes) {
-        w.tensor(name, &vec![0u8; n as usize]).unwrap();
-    }
-    w.finish().unwrap();
-    Split::open(path).unwrap()
+    zero_source(path, &kvs, &tensors)
 }
 
 fn toy_spec() -> FixtureSpec {
@@ -3209,26 +3217,7 @@ fn nemo_source(
         ),
     ];
     kvs.extend(extra_kvs.iter().map(|(k, v)| (k.to_string(), v.clone())));
-    let decls: Vec<TensorDecl> = tensors
-        .iter()
-        .map(|(name, dims, ty)| {
-            let (_, blck, tsz) = gguf::ggml_type_info(ty.as_u32()).unwrap();
-            TensorDecl {
-                name: name.clone(),
-                dims: dims.clone(),
-                type_id: ty.as_u32(),
-                nbytes: tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>(),
-            }
-        })
-        .collect();
-    let bytes: Vec<u64> = decls.iter().map(|t| t.nbytes).collect();
-    let layout = Layout::new(&kvs, decls).unwrap();
-    let mut w = Writer::new(File::create(path).unwrap(), layout).unwrap();
-    for ((name, _, _), n) in tensors.iter().zip(bytes) {
-        w.tensor(name, &vec![0u8; n as usize]).unwrap();
-    }
-    w.finish().unwrap();
-    Split::open(path).unwrap()
+    zero_source(path, &kvs, &tensors)
 }
 
 /// The production family on the synthetic source's layers: Mamba-2, MLP with `ffn_down` Q6_K,
@@ -3667,17 +3656,7 @@ fn hw_fixture_nemotron_end_to_end() {
     let (s, info) = fx.find(name).unwrap();
     let at = fx.shard(s).unwrap().data_base() + info.offset;
     drop(fx);
-    {
-        use std::os::unix::fs::FileExt;
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&first)
-            .unwrap();
-        let mut b = [0u8; 1];
-        f.read_exact_at(&mut b, at).unwrap();
-        f.write_all_at(&[b[0] ^ 0x01], at).unwrap();
-    }
+    flip(&first, at);
     let fx = Split::open(&first).unwrap();
     match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
         Err(e) if e.to_string().contains(name) => println!("nemotron e2e: a flipped byte: {e}"),
