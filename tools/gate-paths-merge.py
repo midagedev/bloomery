@@ -11,10 +11,8 @@ alone, and every hunk only one side touched, merges as git would. Inside a confl
 line with a tab) is keyed by its glob and merged three ways against the hunk's base: a gate either side added is in,
 a gate one side removed and the other kept is out, and the why and exceptions columns take the side that changed them.
 A hunk whose comment and blank lines the two sides changed differently, a row whose why or exceptions both sides
-changed to different texts, or a row one side removed and the other changed stays a conflict: its markers stay in
-OURS and the exit is 1, git's "not merged". The failure it blocks: two branches that each add a gate to a row, or a
-row beside another branch's row, stop a rebase on a file whose right merge is mechanical (three times on one PR in a
-day).
+changed to different texts, a row one side removed and the other changed, or a row whose order changed stays a
+conflict: its markers stay in OURS and the exit is 1, git's "not merged".
 
 Exit: 0 merged; 1 a conflict left with its markers; 2 git merge-file failed; 64 usage.
 """
@@ -147,12 +145,34 @@ def driver(base, ours, theirs):
     if p.returncode < 0 or p.returncode > 127:
         sys.stderr.write("gate-paths-merge: git merge-file failed (rc %d): %s" % (p.returncode, p.stderr))
         return 2
-    text, left = merge_text(p.stdout) if p.returncode else (p.stdout, 0)
+    # A hunk's base is only the lines inside that conflict. A row one side deleted and the other moved into a
+    # different hunk is absent from the first hunk's base, so the hunk-local merge treats the moved row as new and
+    # puts it back. When an existing row's order changed, leave git's markers instead of that merge.
+    reason = "a comment, a why or an exception both sides changed differently"
+    if p.returncode:
+        orders = []
+        for path in (base, ours, theirs):
+            with open(path) as f:
+                orders.append(rows_of(f.read().splitlines())[1])
+        bo, oo, tho = orders
+        moved = any(order is None for order in orders)
+        if not moved:
+            moved = any(
+                [k for k in order if k in bo] != [k for k in bo if k in order]
+                for order in (oo, tho)
+            )
+        if moved:
+            text, left = p.stdout, p.stdout.count(OURS_M) or 1
+            reason = "a row that exists in the base changed its order"
+        else:
+            text, left = merge_text(p.stdout)
+    else:
+        text, left = p.stdout, 0
     with open(ours, "w") as f:
         f.write(text)
     if left:
-        sys.stderr.write("gate-paths-merge: %d hunk(s) of %s left as conflicts (a comment, a why or an exception both sides "
-                         "changed differently)\n" % (left, os.environ.get("GIT_MERGE_PATH", "tools/gate-paths.tsv")))
+        sys.stderr.write("gate-paths-merge: %d hunk(s) of %s left as conflicts (%s)\n" % (
+            left, os.environ.get("GIT_MERGE_PATH", "tools/gate-paths.tsv"), reason))
         return 1
     return 0
 
@@ -189,6 +209,20 @@ def self_test():
         ("an exception column one side adds", base.replace("why c\n", "why c\texcept gate-z: r\n"),
          base.replace("gate-z\twhy c", "gate-z gate-t\twhy c"), 0,
          base.replace("gate-z\twhy c\n", "gate-z gate-t\twhy c\texcept gate-z: r\n")),
+        # The other direction of the two cases above. `gates = list(og)` and `pick` returning ours pass the
+        # earlier ten and drop a gate theirs removed, or a why theirs changed.
+        ("theirs removes a gate while ours adds one", base.replace("gate-x gate-y\twhy a", "gate-x gate-y gate-o\twhy a"),
+         base.replace("gate-x gate-y\twhy a", "gate-y\twhy a"), 0,
+         base.replace("gate-x gate-y\twhy a", "gate-y gate-o\twhy a")),
+        ("theirs changes why while ours adds a gate", base.replace("gate-x gate-y\twhy a", "gate-x gate-y gate-o\twhy a"),
+         base.replace("why a", "why a2"), 0,
+         base.replace("gate-x gate-y\twhy a", "gate-x gate-y gate-o\twhy a2")),
+        # Ours deletes a row and edits another; theirs moves the deleted row and edits it. The hunk that holds the
+        # edit does not hold the moved row in its base, so a hunk-local merge puts the row back.
+        ("deleted row moved and edited on the other side",
+         base.replace("a/*.rs\tgate-x gate-y\twhy a\n", "").replace("gate-z\twhy c", "gate-z gate-o\twhy c"),
+         base.replace("a/*.rs\tgate-x gate-y\twhy a\n", "").replace("c/*.rs", "a/*.rs\tgate-x gate-y gate-t\twhy a\nc/*.rs"),
+         1, None),
     ]
     fails = 0
     with tempfile.TemporaryDirectory() as d:
