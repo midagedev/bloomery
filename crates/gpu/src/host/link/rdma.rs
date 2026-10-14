@@ -49,7 +49,7 @@ impl Wire for Rdma {
         // allocated until the queue pair is gone. A posted range is rewritten
         // only by the next generation of its counter, which the other side's
         // take of this one gates: a row has at most one go or done in flight.
-        unsafe { self.qp.post_writes(&self.region, &self.writes, rkey, 0) }
+        unsafe { self.qp.post_writes(&self.region, &self.writes, rkey) }
             .map_err(|e| format!("the link's RDMA post: {e}"))?;
         self.in_flight += 1;
         Ok(())

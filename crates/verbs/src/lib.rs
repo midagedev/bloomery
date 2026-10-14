@@ -949,8 +949,7 @@ impl Qp {
     }
 
     /// Post `writes` (at most [`MAX_CHAIN`]) from `region` to the peer's
-    /// region keyed `rkey` as one chain, in order; only the last is signaled,
-    /// with `wr_id`.
+    /// region keyed `rkey` as one chain, in order; only the last is signaled.
     ///
     /// # Safety
     ///
@@ -965,7 +964,6 @@ impl Qp {
         region: &Region,
         writes: &[Write],
         rkey: u32,
-        wr_id: u64,
     ) -> Result<(), VerbsError> {
         let n = writes.len();
         if n == 0 || n > MAX_CHAIN {
@@ -998,7 +996,6 @@ impl Qp {
             };
             wr[i].remote_addr = w.to;
         }
-        wr[n - 1].wr_id = wr_id;
         wr[n - 1].send_flags = SEND_SIGNALED;
         // From here on the chain is reached through these two pointers alone,
         // which the post reads.
