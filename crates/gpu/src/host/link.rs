@@ -299,8 +299,10 @@ impl Link {
         }
     }
 
-    /// The stage card's end.
-    pub(super) fn stage_end(&self) -> LinkEnd {
+    /// The end of the context that made or opened the page, on the
+    /// loopback the stage card's page: the device address of its first byte
+    /// there.
+    pub(super) fn own_end(&self) -> LinkEnd {
         LinkEnd {
             dev: self.page.dev_at(0),
         }
