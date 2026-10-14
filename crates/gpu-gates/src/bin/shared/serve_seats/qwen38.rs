@@ -972,8 +972,8 @@ struct Args {
     /// `None` refuses every one, as llama-server does.
     slot_save_path: Option<PathBuf>,
     /// `--parallel`: the resident sequences the seat serves; `None` takes
-    /// one slot beside a set `--ctx-size`, else the default 2
-    /// (`bind::slots_of`).
+    /// one slot beside a set `--ctx-size`, else `ctx_ask::DEFAULT_SLOTS`
+    /// (one).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// `--park-ram` in bytes; set is refused by name (resident slots park

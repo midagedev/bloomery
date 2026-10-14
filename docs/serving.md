@@ -47,10 +47,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
   twice; it also fetches the model's MTP draft when the repo publishes it, as unsloth's Qwen3.8-Flash-Next GGUFs
   do under `MTP/`, landing it beside the set, where the run picks it up), `--parallel/-np`, `--queue-depth`,
-  `--cache-ram`, `--ctx/--ctx-size` (unset, a slot's context comes from one rule on the qwen3, qwen38, glm and mimo2
-  seats: the trained context capped to what the plan holds, pulled back so the card keeps its experts — within a
-  margin of the card expert bytes the base context's plan keeps, and no more experts on the NVMe tier; the base is
-  4,096 positions on the qwen3, qwen38 and mimo2 seats and 2,048 on glm. The V4.1 seat defaults to 32,768),
+  `--cache-ram`, `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the lesser of
+  262,144 and the file's limit, and halve that while the plan is short of the card — and of the host, where the body
+  keeps no tier past it — down to 4,096; one `ctx` line names the rule. A set value is the total the slots split, and
+  one that does not fit is refused, never cut. PIN(2026-10-14): `generate::choose_ctx` over `ctx_ask::choose`),
   `--cache-type-k f16|q8_0` (the qwen3
   seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the
   auto context nearly doubles on the same card; `--cache-type-v` does not exist, both planes quantize together),
@@ -95,9 +95,9 @@ bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` needs no head flag. The earlier `qw
 file: `--head joint_head.safetensors`, its `joint_head_config.json` beside it. A `--head` beside a `clef` file names the
 head instead of the file's own.
 
-**Concurrent requests.** Every generative seat takes `--parallel N` (unset, 2 over the automatic context; a set
+**Concurrent requests.** Every generative seat takes `--parallel N` (unset, one slot; a set
 `--ctx-size` with no `--parallel` serves one slot at the whole of it — the flag is one request's context, as
-llama-server reads it, and the startup line says so). The N slots are resident sequences
+llama-server reads it, and the startup line says so). A count you set is never lowered. The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
@@ -106,9 +106,9 @@ placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5
 lookup draft step their slots in turn (Qwen3.8 under `--place bp` runs one pass since 0.3.1), a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
-llama-server splits it with `-np N` and no `-kvu`: the total (a set `--ctx-size`, or the automatic choice when no
-context is named) is split and each slot holds `total / N` rows, except on V4.1, where every slot holds the whole
-context; `--parallel 1` keeps one sequence with the whole context.
+llama-server splits it with `-np N` and no `-kvu`: a set `--ctx-size` is the total and each slot holds `total / N`
+rows, on V4.1 the same way; with no context named, each slot holds the ladder's choice and the total is that times N.
+`--parallel 1` keeps one sequence with the whole context.
 The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
 name. A new request's prompt runs in one call between rounds, and the other streams wait for it.
 
@@ -126,9 +126,9 @@ and the cgroup's own memory limit (`docker run --memory`, a systemd scope's `Mem
 host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file. The
 tokens equal the all-RAM load's. The load prints an `nvtier` record (the arena's budget, the paged bytes and its
 counters; a load that attached no tier prints none). Limits of a paged load, as the code has them:
-- Qwen3.8 steps one column on a paged plan. With no `--parallel` it serves one slot and no MTP draft; `--parallel 2`
-  (slots that step together, not under `--place bp`) or `BLOOMERY_DRAFT=mtp` is refused by name, and a
-  `--parallel` default that the host room cannot hold at two slots falls to one slot.
+- Qwen3.8 steps one column on a paged plan. With no `--parallel` it serves one slot and the MTP draft stays off; a set
+  `--parallel` is served as asked, and one the room's floor cannot hold is refused by name. A set `BLOOMERY_DRAFT=mtp`
+  runs. Under `--place bp` each slot steps alone, so a set count stays and only an unset draft goes off.
 - Qwen3.8's prompt cache default is 0 on a plan the tier splits, and its `cache ram=…` line names the arena beside
   the load's own host need, so the two anonymous heaps cannot outrun `MemAvailable` into the OOM killer. GLM-5.3's
   default counts the arena inside the host need. `--cache-ram` sets the budget past both.
@@ -196,9 +196,9 @@ binary's `--help`.
   at the first start. The release binaries are x86-64 only (x86-64-v3). A DGX Spark (GB10, aarch64) builds from source
   with `BLOOMERY_ARCH` setting the CUDA arch ([`contrib/dgx-spark.md`](contrib/dgx-spark.md)); the AVX2 kernels stay
   x86-64 only, and a quant type without an aarch64 kernel runs through a scalar mirror there.
-- GLM-5.3 holds at most 16,384 positions a slot, whatever `--ctx-size` asks; a longer prompt is refused with
-  `exceed_context_size_error`. A 12–16 GB card's split Qwen3 load picks a small context (2,048 positions a slot at
-  `--parallel 2`); agent clients with long system prompts want the context to one request there (`--parallel 1`, or
+- GLM-5.3 holds at most 16,384 positions a slot (`ORACLE_POSITIONS`), whatever `--ctx-size` asks; a longer prompt is refused with
+  `exceed_context_size_error`. A 12–16 GB card's split Qwen3 load takes the ladder: unset halves until the plan fits. The sitting measured under the old rule was 2,048 positions a slot at
+  `--parallel 2`, and that card has not been remeasured. Agent clients with long system prompts want the context to one request there (`--parallel 1`, or
   a set `--ctx-size` with no `--parallel`).
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed

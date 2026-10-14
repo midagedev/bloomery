@@ -657,8 +657,7 @@ struct Args {
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
     /// `--parallel`: the resident sequences the seat serves; `None` takes
-    /// one slot beside a set `--ctx`, else the default 2
-    /// (`bind::slots_of`).
+    /// one slot beside a set `--ctx`, else `ctx_ask::DEFAULT_SLOTS` (one).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// The image-input flags: `--mmproj` is GLM's own encoder file, whose

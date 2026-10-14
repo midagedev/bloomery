@@ -278,7 +278,7 @@ struct Args {
     cache_type_k: Option<String>,
     /// `--parallel`: the slots the server serves, resident sequences on
     /// either file's load; `None` takes one slot beside a set `--ctx`, else
-    /// the default 2 (`bind::slots_of`).
+    /// `ctx_ask::DEFAULT_SLOTS` (one).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// The image-input flags: `--mmproj` is the encoder file whose images a
@@ -311,13 +311,10 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: None,
         place: None,
         cache_type_k: None,
-        // `None` resolves through `bind::slots_of`: one slot beside a set
-        // `--ctx` (the flag is one request's context), else the fixed
-        // default 2, not an elastic one — the second slot is a resident
-        // sequence the context split bounds (no byte budget to size it
-        // from). A lone request pays nothing for it beyond its share of the
-        // context: the other slot sits parked empty; `--parallel 1` keeps
-        // the one sequence.
+        // `None` resolves through `slots_given`: one slot beside a set
+        // `--ctx` (the flag is one request's context), else
+        // `ctx_ask::DEFAULT_SLOTS` (one). A count the flags set is never
+        // lowered.
         parallel: None,
         queue_depth: None,
         vision: vision_seat::Flags::default(),
