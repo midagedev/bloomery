@@ -271,6 +271,33 @@ fn meta_arr<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], Placement
         .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
 }
 
+/// `<architecture>.<suffix>` as a per-layer array of `n_layer` counts. Zero
+/// is a count; a family that refuses it checks that itself. A scalar is
+/// refused by name: the file's own form is the array.
+pub(crate) fn per_layer_count(
+    split: &Split,
+    suffix: &str,
+    n_layer: usize,
+) -> Result<Vec<usize>, PlacementError> {
+    let items = meta_arr(split, suffix)?;
+    if items.len() != n_layer {
+        return Err(metadata(
+            split,
+            suffix,
+            format!("has {} values for {n_layer} layers", items.len()),
+        ));
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(l, v)| {
+            v.as_unsigned()
+                .and_then(|x| usize::try_from(x).ok())
+                .ok_or_else(|| metadata(split, suffix, format!("has no count at layer {l}")))
+        })
+        .collect()
+}
+
 /// What `nextn_predict_layers` settles about the blocks past the trunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NextnLayers {

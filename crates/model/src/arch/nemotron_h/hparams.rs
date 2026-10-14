@@ -12,7 +12,9 @@ use gguf::Split;
 use super::names::{self, ATTN_NORM};
 use super::roles;
 use crate::arch::stems::{Stem, required};
-use crate::arch::{meta_arr, meta_f32, meta_usize, metadata, n_vocab, optional_usize, positive};
+use crate::arch::{
+    meta_f32, meta_usize, metadata, n_vocab, optional_usize, per_layer_count, positive,
+};
 use crate::placement::PlacementError;
 
 /// What a layer is, from the two per-layer arrays.
@@ -68,9 +70,6 @@ pub struct Hparams {
     pub key_len: usize,
     /// `attention.value_length`.
     pub value_len: usize,
-    /// `rope.dimension_count`, read and not applied: an attention layer
-    /// rotates nothing.
-    pub rope_dims: usize,
     /// The Mamba-2 widths. One set for every Mamba-2 layer.
     pub ssm: Ssm,
     /// `attention.head_count_kv`, per layer. 0 on a Mamba-2 layer.
@@ -79,8 +78,6 @@ pub struct Hparams {
     pub ff: Vec<usize>,
     /// Every layer's kind, in order.
     pub kinds: Vec<Kind>,
-    /// The keys this read took a default for. This reader takes none.
-    pub defaults: Vec<String>,
 }
 
 impl Hparams {
@@ -137,12 +134,10 @@ impl Hparams {
             n_head,
             key_len,
             value_len,
-            rope_dims,
             ssm,
             kv,
             ff,
             kinds,
-            defaults: Vec::new(),
         };
         hp.tensors_agree(split)?;
         hp.dims_agree(split)?;
@@ -361,33 +356,6 @@ fn no_nextn(split: &Split) -> Result<(), PlacementError> {
         ));
     }
     Ok(())
-}
-
-/// `<architecture>.<suffix>` as a per-layer array of counts. Zero is a
-/// count: it is how a layer says it has no KV heads, or no feed-forward
-/// block. A scalar is refused by name.
-fn per_layer_count(
-    split: &Split,
-    suffix: &str,
-    n_layer: usize,
-) -> Result<Vec<usize>, PlacementError> {
-    let items = meta_arr(split, suffix)?;
-    if items.len() != n_layer {
-        return Err(metadata(
-            split,
-            suffix,
-            format!("has {} values for {n_layer} layers", items.len()),
-        ));
-    }
-    items
-        .iter()
-        .enumerate()
-        .map(|(l, v)| {
-            v.as_unsigned()
-                .and_then(|x| usize::try_from(x).ok())
-                .ok_or_else(|| metadata(split, suffix, format!("has no count at layer {l}")))
-        })
-        .collect()
 }
 
 /// Both arrays 0 is Mamba-2; else a zero feed-forward length is attention;

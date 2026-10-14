@@ -69,11 +69,12 @@ pub fn stores(layer: &LayerSpec) -> Vec<(Store, StoreRule)> {
             g.window
                 .map_or(StoreRule::Positional, |slots| StoreRule::Window { slots }),
         )),
-        Mixer::DeltaRule(d) => {
+        Mixer::DeltaRule(models::DeltaRule { conv, .. })
+        | Mixer::Mamba2(models::Mamba2 { d_conv: conv, .. }) => {
             v.push((
                 Store::Conv,
                 StoreRule::Window {
-                    slots: d.conv.saturating_sub(1),
+                    slots: conv.saturating_sub(1),
                 },
             ));
             v.push((Store::State, StoreRule::Recurrent));
@@ -111,15 +112,6 @@ pub fn stores(layer: &LayerSpec) -> Vec<(Store, StoreRule)> {
                 }
                 Some(Selector::StreamTopK { .. }) | None => {}
             }
-        }
-        Mixer::Mamba2(m) => {
-            v.push((
-                Store::Conv,
-                StoreRule::Window {
-                    slots: m.d_conv.saturating_sub(1),
-                },
-            ));
-            v.push((Store::State, StoreRule::Recurrent));
         }
         Mixer::None => {}
     }

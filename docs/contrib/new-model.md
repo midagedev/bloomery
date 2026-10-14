@@ -71,9 +71,9 @@ A next family calls the common readers instead of copying them. A count above ze
 count is `optional_usize`, both beside `meta_usize` in `arch/mod.rs`. The block spelling is `names::blk`, and the
 three model-level tensors are `names::token_embd`, `names::output_norm` and `names::output`. Already common, and
 still the ones to call: `classify_with`, `Stem` with `req` and `opt`, the `meta_*` key readers, `chat_of`,
-`n_vocab`, `spec_u32` and `nextn_layers`. A per-layer array is not one of those: the families' arrays do not share
-a shape (a count above zero, a count that may be zero, a float with a scalar fallback), so each family keeps the
-read that matches its key. `program_of` is defined in `crates/placement/src/accepts.rs` and re-exported from
+`n_vocab`, `spec_u32` and `nextn_layers`. A per-layer array of counts is `per_layer_count` (`arch/mod.rs`): the
+array, its length and each value as a count, zero included; a family that refuses zero checks it after the read (MiMo's
+KV-head loop). A float array with a scalar fallback (GLM's clamps) stays the family's own read. `program_of` is defined in `crates/placement/src/accepts.rs` and re-exported from
 `coverage`. An architecture with a reader and no program returns `None` from it; the coverage check then names
 `Need::Program`.
 
@@ -151,7 +151,9 @@ place. `cargo test -p bloomery-levers` is pure.
 Per family: a `gate-<fam>-meta` recipe, an e2e (or a weekly while there is no fixture), a `dump-ref-<fam>` recipe.
 Bookkeeping that turns a check red when missed (`just check-recipes`, A):
 
-- `tools/gate-paths.tsv` rows (e.g. `:85`, `:156-160`); `tools/gate-batch-resources.tsv:36` for a solo recipe;
+- `tools/gate-paths.tsv` rows (e.g. `:85`, `:156-160`), and one glob row for the new reader,
+  `crates/model/src/arch/<arch>/**` with `gate-ops` and `gate-<arch>-meta` (then the gates `just check-recipes` names),
+  so `just narrow` bounds the next change to it instead of falling back to the full list; `tools/gate-batch-resources.tsv:36` for a solo recipe;
 - `tools/ref/ptx-shapes.tsv:200-202` for each PTX entry (the cc 12.1 tables in `tools/ref/ptx-shapes/` take the entry's row
   from a scan on a cc 12.1 card); `tools/unsafe-ratchet.txt:174` for a new crate;
 - the hard-coded device-crate list in `tools/recipes.py:8499`; `[[bin]] required-features` in

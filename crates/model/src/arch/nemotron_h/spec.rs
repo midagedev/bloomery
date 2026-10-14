@@ -29,7 +29,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
     Ok(Read {
         spec,
         tensors,
-        defaults: hp.defaults,
+        defaults: Vec::new(),
     })
 }
 

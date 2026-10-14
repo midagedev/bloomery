@@ -14,7 +14,8 @@ use super::roles::{
     DENSE, MIXER, MOE, NEXTN, QKV_FUSED, QKV_SPLIT, SELECTION_BIAS, Stem, required,
 };
 use crate::arch::{
-    meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, optional_usize, positive,
+    meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, optional_usize, per_layer_count,
+    positive,
 };
 use crate::placement::PlacementError;
 
@@ -149,7 +150,7 @@ impl Hparams {
         // 151-157), so a scalar broadcast is not this file's fact.
         let kv_heads = per_layer_count(split, "attention.head_count_kv", n_layer)?;
         for (l, &kv) in kv_heads.iter().enumerate() {
-            if !n_head.is_multiple_of(kv) {
+            if kv == 0 || !n_head.is_multiple_of(kv) {
                 return Err(metadata(
                     split,
                     "attention.head_count_kv",
@@ -469,34 +470,6 @@ fn nextn(
         return Ok(0);
     }
     Ok(n)
-}
-
-/// `<architecture>.<suffix>` as a per-layer array of counts, every one
-/// above 0: a scalar broadcast is refused by name, the file's own form
-/// being the array (conversion/mimo.py:157).
-fn per_layer_count(
-    split: &Split,
-    suffix: &str,
-    n_layer: usize,
-) -> Result<Vec<usize>, PlacementError> {
-    let items = meta_arr(split, suffix)?;
-    if items.len() != n_layer {
-        return Err(metadata(
-            split,
-            suffix,
-            format!("has {} values for {n_layer} layers", items.len()),
-        ));
-    }
-    items
-        .iter()
-        .enumerate()
-        .map(|(l, v)| {
-            v.as_unsigned()
-                .and_then(|x| usize::try_from(x).ok())
-                .filter(|&x| x > 0)
-                .ok_or_else(|| metadata(split, suffix, format!("has no count at layer {l}")))
-        })
-        .collect()
 }
 
 /// `attention.sliding_window_pattern`, a per-layer 0/1 array: 0 a full
