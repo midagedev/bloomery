@@ -112,12 +112,6 @@ impl Checked {
     pub fn conv_dim(self) -> usize {
         self.conv_dim
     }
-
-    /// The geometry this check accepted.
-    #[must_use]
-    pub fn geom(self) -> Geom {
-        self.geom
-    }
 }
 
 /// Accept a geometry or refuse it by name. State 96 and 256 never become a
@@ -568,6 +562,28 @@ mod tests {
         }
     }
 
+    /// The update is a product then an add, never one fused multiply-add:
+    /// `B * (x * dt)` rounds to 21 and cancels the state exactly, while a fused
+    /// `mul_add(B, x * dt, state)` keeps the product's low bits.
+    #[test]
+    fn the_recurrence_rounds_its_product_before_the_add() {
+        let g = one_channel();
+        let mut state = vec![-21.0; STATE];
+        let mut y = [0.0];
+        scan_token(
+            &g,
+            &mut state,
+            &[1.0 - f32::EPSILON],
+            &[21.0],
+            &[0.0],
+            &[1.0 + f32::EPSILON; STATE],
+            &[1.0; STATE],
+            &mut y,
+        )
+        .unwrap();
+        assert!(state.iter().all(|&v| v == 0.0), "{:?}", &state[..4]);
+    }
+
     fn nano() -> Checked {
         check(Geom {
             d_inner: 7680,
@@ -618,6 +634,8 @@ mod tests {
 
     /// `dt > 20` stays itself. `dt <= 20` is `log1p(exp(dt))`. In f32 that
     /// value at 20 is 20, so the arms meet there; at 1 they do not.
+    // PIN(2026-10-15): dt_20_uses_the_log1p_arm removed: at dt = 20 both softplus arms give the same f32 bits;
+    // this test owns the boundary and uniform_row_at_the_4b_widths the uniform recurrence.
     #[test]
     fn dt_21_is_identity_and_dt_20_is_log1p_exp() {
         assert_eq!(scan_dt(21.0), 21.0);
@@ -649,44 +667,6 @@ mod tests {
         scan_token(&g, &mut state, &x, &dt, &a, &b, &c, &mut y).unwrap();
         assert!(y.iter().all(|&v| v == 5376.0));
         assert!(state.iter().all(|&v| v == 42.0));
-    }
-
-    #[test]
-    fn dt_20_uses_the_log1p_arm() {
-        let g = check(Geom {
-            d_inner: 1,
-            n_heads: 1,
-            n_groups: 1,
-            d_state: STATE,
-            d_conv: 4,
-        })
-        .unwrap();
-        let mut state = vec![0.0; STATE];
-        let mut y = [0.0];
-        scan_token(
-            &g,
-            &mut state,
-            &[1.0],
-            &[20.0],
-            &[0.0],
-            &[1.0; STATE],
-            &[1.0; STATE],
-            &mut y,
-        )
-        .unwrap();
-        let sp = scan_dt(20.0);
-        assert!(state.iter().all(|&v| v == sp));
-        let mut lane = [0.0f32; 32];
-        for slot in &mut lane {
-            let mut acc = 0.0f32;
-            for _j in 0..4 {
-                acc += sp;
-            }
-            *slot = acc;
-        }
-        assert_eq!(y[0], butterfly(&lane));
-        // f32 `log1p(exp(20))` is 20, so the channel sum is the identity's 2560.
-        assert_eq!(y[0], 2560.0);
     }
 
     /// Heads 0..3 share group 0 when eight heads form two groups. Head 2
