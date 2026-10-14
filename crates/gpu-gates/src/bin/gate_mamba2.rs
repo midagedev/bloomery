@@ -23,10 +23,12 @@
 //!    Guide, standard functions), glibc's within about 1 and 2 — so no
 //!    equality holds, and `y` and the final state are held to the band below.
 //!    The ring stays exact.
-//! 3. refuse: state 96 and 256, a conv of 3 taps, a group count that does not
-//!    divide the heads, a short buffer and a non-finite norm epsilon are
-//!    refused by name at enqueue, nothing launched (the output keeps its
-//!    poison, the fault word stays clean).
+//! 3. refuse: state 96 and 256 and a group count that does not divide the
+//!    heads are refused by name by `mamba2::check` (the host's text; enqueue
+//!    calls it before a launch). A conv of 3 taps is a shape the host
+//!    accepts and enqueue still refuses. A short buffer and a non-finite
+//!    norm epsilon are refused by name at enqueue. Nothing launched (the
+//!    output keeps its poison, the fault word stays clean).
 //! 4. fault: a NaN in `x`, in `B`, an infinity in `z`, a non-finite `dt` and
 //!    a non-finite `A` each raise `Mamba2Scan` at the launch's layer and
 //!    leave the norm group they sit in entirely non-finite, never a
@@ -83,7 +85,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::linear::RING_ROWS;
-    use bloomery_gpu::mamba2::{Mamba2Kernels, Mamba2Scratch, Mamba2Shape, STATE, StepArgs};
+    use bloomery_gpu::mamba2::{Mamba2Kernels, Mamba2Scratch, STATE, StepArgs};
     use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError};
     use bloomery_gpu_gates::rounding::U;
     use bloomery_gpu_gates::{GateError, bits_equal, no_local_depot, verdict};
@@ -97,10 +99,10 @@ mod gate {
     const PER: usize = HEADS / GROUPS;
     const WIDTH: usize = INNER / GROUPS;
     const CONV_DIM: usize = INNER + 2 * GROUPS * STATE;
-    const SHAPE: Mamba2Shape = Mamba2Shape {
+    const GEOM: Geom = Geom {
         d_inner: INNER,
-        n_head: HEADS,
-        n_group: GROUPS,
+        n_heads: HEADS,
+        n_groups: GROUPS,
         d_state: STATE,
         d_conv: 4,
     };
@@ -249,14 +251,13 @@ mod gate {
         ring
     }
 
+    /// The card's checked widths. The host twin uses the same geometry.
+    fn device_shape() -> Result<Checked, GateError> {
+        Ok(bloomery_gpu::mamba2::check("gate_mamba2", GEOM)?)
+    }
+
     fn geom() -> Result<Checked, GateError> {
-        Ok(mamba2::check(Geom {
-            d_inner: INNER,
-            n_heads: HEADS,
-            n_groups: GROUPS,
-            d_state: STATE,
-            d_conv: 4,
-        })?)
+        Ok(mamba2::check(GEOM)?)
     }
 
     /// The host twin's run of `toks` from `init`: each token's `y`, the
@@ -352,7 +353,7 @@ mod gate {
                 y: DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); INNER])?,
                 ring: DeviceBuffer::from_host(st, &vec![0.0; RING_ROWS * CONV_DIM])?,
                 state: DeviceBuffer::from_host(st, &vec![0.0; INNER * STATE])?,
-                scratch: Mamba2Scratch::new(st, &SHAPE)?,
+                scratch: Mamba2Scratch::new(st, device_shape()?)?,
             })
         }
 
@@ -381,7 +382,7 @@ mod gate {
             &mut self,
             cx: &Ctx,
             stream: &CudaStream,
-            shape: Mamba2Shape,
+            shape: Checked,
             norm: bool,
         ) -> Result<(), GpuError> {
             cx.k.enqueue_step(
@@ -432,10 +433,11 @@ mod gate {
         norm: bool,
     ) -> Result<DevRun, GateError> {
         dev.load(cx, ring, &init.scan)?;
+        let shape = device_shape()?;
         let mut ys = Vec::new();
         for (t, tok) in toks.iter().enumerate() {
             dev.put(cx, tok, p0 + t as u32)?;
-            dev.step(cx, cx.gpu.stream(), SHAPE, norm)?;
+            dev.step(cx, cx.gpu.stream(), shape, norm)?;
             ys.push(dev.read_y(cx)?);
         }
         Ok(DevRun {
@@ -757,38 +759,49 @@ mod gate {
         let cases = [
             (
                 "state 96",
-                Mamba2Shape {
+                Geom {
                     d_state: 96,
-                    ..SHAPE
+                    ..GEOM
                 },
-                "d_state 96",
+                "state 96",
             ),
             (
                 "state 256",
-                Mamba2Shape {
+                Geom {
                     d_state: 256,
-                    ..SHAPE
+                    ..GEOM
                 },
-                "d_state 256",
+                "state 256",
             ),
-            ("conv 3", Mamba2Shape { d_conv: 3, ..SHAPE }, "d_conv 3"),
             (
                 "groups 7",
-                Mamba2Shape {
-                    n_group: 7,
-                    ..SHAPE
+                Geom {
+                    n_groups: 7,
+                    ..GEOM
                 },
-                "n_group",
+                "n_group 7",
             ),
         ];
         let mut named = Vec::new();
-        for (label, shape, want) in cases {
-            let e = dev.step(cx, cx.gpu.stream(), shape, true).err();
+        for (label, g, want) in cases {
+            let e = bloomery_gpu::mamba2::check("mamba2::enqueue_step", g).err();
             let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
             let pass = matches!(e, Some(GpuError::Shape { .. })) && text.contains(want);
             named.push(format!("{label}={}", verdict(pass)));
             ok &= pass;
         }
+        // The host accepts three taps. Enqueue still refuses them, and
+        // launches nothing.
+        let conv3 = match mamba2::check(Geom { d_conv: 3, ..GEOM }) {
+            Ok(host) => {
+                let e = dev.step(cx, cx.gpu.stream(), host, true).err();
+                let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
+                matches!(e, Some(GpuError::Shape { .. })) && text.contains("d_conv 3")
+            }
+            Err(_) => false,
+        };
+        named.push(format!("conv 3={}", verdict(conv3)));
+        ok &= conv3;
         // A buffer shorter than the shape's: the state of half the channels.
         let short = {
             let mut half =
@@ -797,7 +810,7 @@ mod gate {
                 cx.k.enqueue_step(
                     cx.gpu.stream(),
                     StepArgs {
-                        shape: SHAPE,
+                        shape: device_shape()?,
                         xbc: &dev.xbc,
                         dt: &dev.dt,
                         dt_bias: &dev.dt_bias,
@@ -828,7 +841,7 @@ mod gate {
                 cx.k.enqueue_step(
                     cx.gpu.stream(),
                     StepArgs {
-                        shape: SHAPE,
+                        shape: device_shape()?,
                         xbc: &dev.xbc,
                         dt: &dev.dt,
                         dt_bias: &dev.dt_bias,
@@ -949,9 +962,10 @@ mod gate {
         let eager = dev_run(cx, &mut dev, &ring0, &st, &toks, P0, true)?;
 
         dev.load(cx, &ring0, &st.scan)?;
+        let shape = device_shape()?;
         let graph = {
             let dev = &mut dev;
-            cx.gpu.capture(|s| dev.step(cx, s, SHAPE, true))?
+            cx.gpu.capture(|s| dev.step(cx, s, shape, true))?
         };
         let mut ys = Vec::new();
         for (t, tok) in toks.iter().enumerate() {

@@ -92,6 +92,7 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
+use model::mamba2::{Checked, Geom};
 use std::sync::Arc;
 
 /// The one state length the scan runs: lane `l` of a warp holds `n = l + 32j`.
@@ -111,6 +112,7 @@ const STAGED: usize = 2 * STATE + CH_PER_BLOCK;
 // The entries' launch attributes spell the block out as a literal, and the
 // scan and the conv are written for these widths.
 const _: () = assert!(BLOCK == 128 && STATE == 128 && CONV_TAPS == 4 && CH_PER_BLOCK == 16);
+const _: () = assert!(STATE == model::mamba2::STATE);
 
 #[cuda_module]
 mod mamba2_kernels {
@@ -451,90 +453,20 @@ mod mamba2_kernels {
     }
 }
 
-/// A Mamba-2 layer's widths: the host twin's `Geom` (`model::mamba2`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Mamba2Shape {
-    /// Channels, `n_head · head_dim`.
-    pub d_inner: usize,
-    /// Heads.
-    pub n_head: usize,
-    /// Groups that share one `B` and one `C`; a divisor of `n_head`.
-    pub n_group: usize,
-    /// Recurrent state length: the kernel runs 128 only.
-    pub d_state: usize,
-    /// Causal conv taps: the kernel runs 4 only.
-    pub d_conv: usize,
-}
-
-impl Mamba2Shape {
-    /// Channels of one head.
-    #[must_use]
-    pub fn head_dim(&self) -> usize {
-        self.d_inner / self.n_head
+/// Refuse a conv other than [`CONV_TAPS`] taps, then the host twin's
+/// [`model::mamba2::check`]. The host accepts any positive `d_conv`; this
+/// kernel runs four.
+pub fn check(what: &'static str, g: Geom) -> Result<Checked, GpuError> {
+    if g.d_conv != CONV_TAPS {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "d_conv {} is refused: the conv runs {CONV_TAPS} taps",
+                g.d_conv
+            ),
+        ));
     }
-
-    /// Conv channels: `d_inner + 2 · n_group · 128`.
-    #[must_use]
-    pub fn conv_dim(&self) -> usize {
-        self.d_inner + 2 * self.n_group * STATE
-    }
-
-    /// f32s of the scan state: `d_inner · 128`.
-    #[must_use]
-    pub fn state_len(&self) -> usize {
-        self.d_inner * STATE
-    }
-
-    /// f32s of the conv ring: `RING_ROWS · conv_dim`.
-    #[must_use]
-    pub fn ring_len(&self) -> usize {
-        RING_ROWS * self.conv_dim()
-    }
-
-    /// Blocks of a launch: `n_head · ⌈head_dim / 16⌉`.
-    #[must_use]
-    pub fn blocks(&self) -> usize {
-        self.n_head * self.head_dim().div_ceil(CH_PER_BLOCK)
-    }
-
-    /// Refuse by name a state, conv or division the kernel has no geometry
-    /// for.
-    fn check(&self, what: &'static str) -> Result<(), GpuError> {
-        if self.d_state != STATE {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "d_state {} is refused: the scan runs d_state {STATE} and launches nothing",
-                    self.d_state
-                ),
-            ));
-        }
-        if self.d_conv != CONV_TAPS {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "d_conv {} is refused: the conv runs {CONV_TAPS} taps",
-                    self.d_conv
-                ),
-            ));
-        }
-        if self.n_head == 0
-            || self.n_group == 0
-            || !self.n_head.is_multiple_of(self.n_group)
-            || self.d_inner == 0
-            || !self.d_inner.is_multiple_of(self.n_head)
-        {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "need n_group to divide n_head and n_head to divide d_inner, all at least 1, \
-                     got d_inner={} n_head={} n_group={}",
-                    self.d_inner, self.n_head, self.n_group
-                ),
-            ));
-        }
-        Ok(())
-    }
+    model::mamba2::check(g).map_err(|e| GpuError::shape(what, e.to_string()))
 }
 
 /// What the grouped norm's cross-block sum needs between launches: the
@@ -547,12 +479,18 @@ pub struct Mamba2Scratch {
 }
 
 impl Mamba2Scratch {
-    /// A zeroed scratch for `shape`. Load-time only.
-    pub fn new(stream: &CudaStream, shape: &Mamba2Shape) -> Result<Mamba2Scratch, GpuError> {
-        shape.check("mamba2::Mamba2Scratch::new")?;
+    /// A zeroed scratch for `shape`. Load-time only. `shape` is checked again
+    /// here, so a conv the host accepted and this kernel refuses never
+    /// allocates.
+    pub fn new(stream: &CudaStream, shape: Checked) -> Result<Mamba2Scratch, GpuError> {
+        let shape = check("mamba2::Mamba2Scratch::new", shape.geom())?;
+        let g = shape.geom();
         Ok(Mamba2Scratch {
-            part: DeviceBuffer::zeroed(stream, shape.blocks())?,
-            done: DeviceBuffer::zeroed(stream, shape.n_group)?,
+            part: DeviceBuffer::zeroed(
+                stream,
+                g.n_heads * shape.head_dim().div_ceil(CH_PER_BLOCK),
+            )?,
+            done: DeviceBuffer::zeroed(stream, g.n_groups)?,
         })
     }
 }
@@ -564,7 +502,7 @@ impl Mamba2Scratch {
 /// the sink a non-finite `y` raises on, and the outputs `y`, the conv ring
 /// and the scan state (the last two read and written in place).
 pub struct StepArgs<'a> {
-    pub shape: Mamba2Shape,
+    pub shape: Checked,
     pub xbc: &'a DeviceBuffer<f32>,
     pub dt: &'a DeviceBuffer<f32>,
     pub dt_bias: &'a DeviceBuffer<f32>,
@@ -627,13 +565,18 @@ impl Mamba2Kernels {
             state,
             scratch,
         } = args;
-        shape.check(what)?;
+        let shape = check(what, shape.geom())?;
         // +∞ epsilon makes the norm's scale 0, a finite y and no fault.
         if norm.is_some() && !eps.is_finite() {
             return Err(GpuError::shape(what, "norm eps must be finite"));
         }
-        let (inner, heads, groups) = (shape.d_inner, shape.n_head, shape.n_group);
+        let g = shape.geom();
+        let (inner, heads, groups) = (g.d_inner, g.n_heads, g.n_groups);
         let conv_dim = shape.conv_dim();
+        let head_dim = shape.head_dim();
+        let state_len = inner * STATE;
+        let ring_len = RING_ROWS * conv_dim;
+        let blocks = heads * head_dim.div_ceil(CH_PER_BLOCK);
         let lens = [
             ("xbc", xbc.len(), conv_dim),
             ("dt", dt.len(), heads),
@@ -646,9 +589,9 @@ impl Mamba2Kernels {
             ("norm", norm.map_or(inner, |n| n.len()), inner),
             ("pos", pos.len(), pos_at + 1),
             ("y", y.len(), inner),
-            ("ring", ring.len(), shape.ring_len()),
-            ("state", state.len(), shape.state_len()),
-            ("scratch.part", scratch.part.len(), shape.blocks()),
+            ("ring", ring.len(), ring_len),
+            ("state", state.len(), state_len),
+            ("scratch.part", scratch.part.len(), blocks),
             ("scratch.done", scratch.done.len(), groups),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -657,9 +600,9 @@ impl Mamba2Kernels {
                 format!("{name}.len() {got} < {need}"),
             ));
         }
-        let chunks = shape.head_dim().div_ceil(CH_PER_BLOCK);
+        let chunks = head_dim.div_ceil(CH_PER_BLOCK);
         let prep = self.module.prepare_mamba2_step(LaunchConfig1D::new(
-            launch_u32(what, "blocks", shape.blocks())?,
+            launch_u32(what, "blocks", blocks)?,
             BLOCK as u32,
             0,
         ))?;
@@ -682,7 +625,7 @@ impl Mamba2Kernels {
             launch_u32(what, "n_head", heads)?,
             launch_u32(what, "per", heads / groups)?,
             launch_u32(what, "n_group", groups)?,
-            launch_u32(what, "head_dim", shape.head_dim())?,
+            launch_u32(what, "head_dim", head_dim)?,
             launch_u32(what, "chunks", chunks)?,
             u32::from(norm.is_some()),
             fault,

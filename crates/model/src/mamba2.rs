@@ -115,6 +115,12 @@ impl Checked {
     pub fn conv_dim(self) -> usize {
         self.conv_dim
     }
+
+    /// The widths this check accepted.
+    #[must_use]
+    pub fn geom(self) -> Geom {
+        self.geom
+    }
 }
 
 /// Accept a geometry or refuse it by name. State 96 and 256 never become a
