@@ -384,7 +384,7 @@ def self_test():
     with tempfile.TemporaryDirectory() as t:
         os.makedirs(os.path.join(t, "tools"))
         lev = os.path.join(t, "tools/check-levers.sh")
-        open(lev, "w").write("echo 'check-levers: BLOOMERY_X is no row'; exit 3\n")
+        open(lev, "w").write("echo 'check-levers: SOME_NAME is no row'; exit 3\n")
         said = []
         pre_checks(t, ["a.txt", "docs/x.md"], said.append)
         expect(said == [], f"a branch outside the prefixes runs no pre-check: {said}")
@@ -393,7 +393,7 @@ def self_test():
             got = None
         except Stop as e:
             got = e
-        expect(got is not None and got.code == 1 and "tools/check-levers.sh is red" in got.msg and "BLOOMERY_X is no row" in got.msg,
+        expect(got is not None and got.code == 1 and "tools/check-levers.sh is red" in got.msg and "SOME_NAME is no row" in got.msg,
                f"a red check-levers stops the run 1 by name with its output: {got and (got.code, got.msg)}")
         open(lev, "w").write("exit 0\n")
         pre_checks(t, ["crates/gpu/src/lib.rs"], said.append)
