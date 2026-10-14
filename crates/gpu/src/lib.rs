@@ -75,6 +75,7 @@ pub mod q6k_sel;
 pub mod q8_0_sel32;
 pub mod q8f32;
 pub mod qsa;
+pub(crate) mod recur;
 pub mod rope_neox;
 pub mod rope_table;
 pub mod route_body;

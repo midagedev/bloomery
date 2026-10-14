@@ -535,6 +535,16 @@ pub const GQA: &[GqaInst] = &[
         at: "gpu/src/flash_gqa.rs HEAD, GROUP",
     },
     GqaInst {
+        head: 128,
+        value: 128,
+        pack: 5,
+        group: GroupRule::One,
+        window: false,
+        sinks: false,
+        value_scale: false,
+        at: "gpu/src/flash_gqa.rs GROUP_5 (gqa_flash_seg_g5, scalar)",
+    },
+    GqaInst {
         head: 256,
         value: 256,
         pack: 8,
@@ -913,7 +923,7 @@ mod tests {
             e.why,
             Refusal::GqaGroup {
                 group: 12,
-                served: vec!["exactly 8".to_string()]
+                served: vec!["exactly 8".to_string(), "exactly 5".to_string()]
             }
         );
         let e = select_gqa(attn(16, 2, 160)).expect_err("head 160");
@@ -928,6 +938,18 @@ mod tests {
         }
         let e = select_gqa(attn(24, 8, 256)).expect_err("group 3");
         assert!(e.to_string().contains("group 3"), "{e}");
+    }
+
+    /// Head 128 at five query heads a key head (10/2) selects the scalar
+    /// group-5 row: one block a group, no window, sinks or value scale.
+    #[test]
+    fn a_head_128_group_of_5_selects_the_scalar_row() {
+        let s = attn(10, 2, 128);
+        let row = select_gqa(s).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(row.pack, 5);
+        assert_eq!(row.group, GroupRule::One);
+        assert!(!row.window && !row.sinks && !row.value_scale);
+        assert_eq!(row.packs(5), 1);
     }
 
     fn mimo(n_head: u32, n_kv: u32, window: Option<u32>, sinks: bool) -> AttnShape {

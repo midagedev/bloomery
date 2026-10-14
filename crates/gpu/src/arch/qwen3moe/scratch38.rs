@@ -80,7 +80,7 @@ impl Store38 {
     /// 0 and every other never written.
     pub(super) fn rec(stream: &CudaStream) -> Result<Store38, GpuError> {
         Ok(Store38::Rec {
-            rec: RecStore::new(stream, GDN, LANES)?,
+            rec: RecStore::new(stream, GDN.lens(LANES), LANES)?,
             stamp: DeviceBuffer::from_host(stream, &fresh_stamps(LANES))?,
         })
     }

@@ -53,6 +53,10 @@
 //!
 //! And each kernel as a captured graph: one node, the replay equal to the
 //! eager launch.
+//!
+//! Q5_0 embedding rows (`embed_rows_q5_0`) are bit-identical to `dequant_row`
+//! on the same bytes. `relu_sqr` is bit-identical to `max(x, 0)^2`, and a
+//! non-finite input is copied through.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -72,7 +76,7 @@ mod gate {
         topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
-    use gguf::quant::{GgmlType, dequant_row};
+    use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits};
     use model::arch::qwen3moe::names;
 
     /// f32 roundings each side's dot is allowed per output, on `Σ|w·x̂|`
@@ -136,6 +140,8 @@ mod gate {
         let mut ok = true;
         ok &= embed(&gpu, &gguf, &sets)?;
         ok &= embed_kquant(&gpu)?;
+        ok &= embed_q5_0(&gpu)?;
+        ok &= relu_sqr(&gpu)?;
         ok &= gate_up_body(&gpu, &gguf, &ex)?;
         ok &= gate_up_tap(&gpu, &gguf, &ex, &sets)?;
         ok &= combine(&gpu, &ex, &sets, stream)?;
@@ -144,6 +150,157 @@ mod gate {
             return Err(checks_failed());
         }
         Ok(())
+    }
+
+    /// `rows` of Q5_0 (`k` values, two blocks) whose low and high nibbles
+    /// differ, so a read of the low half's word in place of the high half's
+    /// disagrees with `dequant_row`.
+    fn q5_0_bytes(rows: usize, k: usize) -> Vec<u8> {
+        let blocks = k / 32;
+        let mut bytes = vec![0u8; rows * blocks * 22];
+        for r in 0..rows {
+            for b in 0..blocks {
+                let blk = &mut bytes[(r * blocks + b) * 22..][..22];
+                let d = 0.5f32 + 0.25 * (b + r) as f32;
+                blk[..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                let qh: u32 = 0xA5A5_5A5A ^ (r as u32).wrapping_mul(0x0101_0101);
+                blk[2..6].copy_from_slice(&qh.to_le_bytes());
+                for j in 0..16 {
+                    blk[6 + j] = j as u8 | ((15 - j) as u8) << 4;
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Q5_0 rows through `embed_rows_q5_0` against `dequant_row` on the same
+    /// bytes, bit for bit, positions included, one captured node, and an id
+    /// past the table (NaN row, `FaultSite::TokenId`, the other rows intact).
+    fn embed_q5_0(gpu: &Gpu) -> Result<bool, GateError> {
+        const ROWS: usize = 4;
+        const K: usize = 64;
+        let bytes = q5_0_bytes(ROWS, K);
+        let packed = bloomery_gpu::q5::pack_q5_0(&bytes, K, ROWS)?;
+        let cols = packed.len() / ROWS;
+        let table = DeviceTensor::upload(gpu.stream(), &packed, ROWS, cols)?;
+        let ids = [0u32, (ROWS - 1) as u32, 1];
+        let launch = |ids: &[u32], graph: bool| -> Result<(Embedded, usize), GateError> {
+            let stream = gpu.stream();
+            let idb = DeviceBuffer::from_host(stream, ids)?;
+            let p0 = DeviceBuffer::from_host(stream, &[POS0])?;
+            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; ids.len() * K])?;
+            let mut pos = DeviceBuffer::from_host(stream, &vec![SENT_POS; ids.len()])?;
+            let mut n_keys = DeviceBuffer::from_host(stream, &vec![SENT_POS; ids.len()])?;
+            let mut enqueue = |s: &CudaStream| {
+                gpu.elem().enqueue_embed_rows_q5_0(
+                    s,
+                    EmbedRowsArgs {
+                        w: &table,
+                        ids: &idb,
+                        pos0: &p0,
+                        first: FIRST,
+                        y: &mut y,
+                        pos: &mut pos,
+                        n_keys: &mut n_keys,
+                    },
+                    K,
+                )
+            };
+            let nodes = if graph {
+                let g = gpu.capture(&mut enqueue)?;
+                g.launch(stream)?;
+                g.node_count()
+            } else {
+                enqueue(stream)?;
+                0
+            };
+            stream.synchronize()?;
+            Ok((
+                Embedded {
+                    y: y.to_host_vec(stream)?,
+                    pos: pos.to_host_vec(stream)?,
+                    n_keys: n_keys.to_host_vec(stream)?,
+                },
+                nodes,
+            ))
+        };
+        let (got, _) = launch(&ids, false)?;
+        let mut want = vec![0.0f32; ids.len() * K];
+        let rb = (K / 32) * 22;
+        for (t, &id) in ids.iter().enumerate() {
+            let row = &bytes[id as usize * rb..(id as usize + 1) * rb];
+            dequant_row(GgmlType::Q5_0, row, &mut want[t * K..(t + 1) * K])?;
+        }
+        let host_ok = bits_equal(&got.y, &want);
+        let pos_ok = positions_ok(&got, ids.len(), POS0, FIRST);
+        let (replayed, nodes) = launch(&ids, true)?;
+        let graph_ok = bits_equal(&replayed.y, &got.y)
+            && replayed.pos == got.pos
+            && replayed.n_keys == got.n_keys
+            && nodes == 1;
+        let clean = gpu.take_fault()?;
+        let bad = [ids[0], ROWS as u32, ids[2]];
+        let (ybad, _) = launch(&bad, false)?;
+        let fault = gpu.take_fault()?;
+        let want_fault = Fault::at(LAYER_NONE, FaultSite::TokenId);
+        let others =
+            bits_equal(&ybad.y[..K], &got.y[..K]) && bits_equal(&ybad.y[2 * K..], &got.y[2 * K..]);
+        let nan = ybad.y[K..2 * K].iter().filter(|v| v.is_nan()).count();
+        let bad_pos = positions_ok(&ybad, bad.len(), POS0, FIRST);
+        let oor_ok = clean.is_none() && fault == Some(want_fault) && others && nan == K && bad_pos;
+        println!(
+            "embed Q5_0 K={K} rows={ROWS}: vs dequant_row bit_identical={host_ok} positions={pos_ok} \
+             graph_nodes={nodes} graph_same={graph_ok} oor_nan={nan}/{K} {}",
+            verdict(host_ok && pos_ok && graph_ok && oor_ok)
+        );
+        Ok(host_ok && pos_ok && graph_ok && oor_ok)
+    }
+
+    /// Host transcription of `relu_sqr`: a non-finite input stays that value,
+    /// and a finite one is `max(x, 0)^2`.
+    fn host_relu_sqr(v: f32) -> f32 {
+        if !v.is_finite() {
+            v
+        } else {
+            let r = if v > 0.0 { v } else { 0.0 };
+            r * r
+        }
+    }
+
+    /// `relu_sqr` against [`host_relu_sqr`], bit for bit, including a
+    /// non-finite input, and one captured node.
+    fn relu_sqr(gpu: &Gpu) -> Result<bool, GateError> {
+        let x = [
+            0.0f32,
+            1.5,
+            -2.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            3.0,
+        ];
+        let want: Vec<f32> = x.iter().copied().map(host_relu_sqr).collect();
+        let stream = gpu.stream();
+        let xb = DeviceBuffer::from_host(stream, &x)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, x.len())?;
+        gpu.elem().enqueue_relu_sqr(stream, &xb, x.len(), &mut y)?;
+        stream.synchronize()?;
+        let got = y.to_host_vec(stream)?;
+        let host_ok = bits_equal(&got, &want);
+        // The eager read ends before this closure borrows `y` again.
+        let mut enqueue = |s: &CudaStream| gpu.elem().enqueue_relu_sqr(s, &xb, x.len(), &mut y);
+        let g = gpu.capture(&mut enqueue)?;
+        g.launch(stream)?;
+        stream.synchronize()?;
+        let replay = y.to_host_vec(stream)?;
+        let nodes = g.node_count();
+        let graph_ok = bits_equal(&replay, &want) && nodes == 1;
+        println!(
+            "relu_sqr n={}: vs host bit_identical={host_ok} graph_nodes={nodes} graph_same={graph_ok} {}",
+            x.len(),
+            verdict(host_ok && graph_ok)
+        );
+        Ok(host_ok && graph_ok)
     }
 
     // ------------------------------------------------------------ 1. embed

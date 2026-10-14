@@ -191,7 +191,7 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Qwen35Body],
-        at: "gpu/src/arch/qwen3moe/scratch.rs RecStore (Body35's delta stores)",
+        at: "gpu/src/recur.rs RecStore (Body35's delta stores)",
         runs: |n| matches!(n, Need::RecurrentState),
     },
     Available {

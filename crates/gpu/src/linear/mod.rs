@@ -180,6 +180,14 @@ impl LinearShape {
         RING_ROWS * self.channels()
     }
 
+    /// f32s of the state of `lanes` lanes and of the conv ring: the pair
+    /// [`crate::recur::RecStore::new`] allocates. The ring is not multiplied
+    /// by `lanes`.
+    #[must_use]
+    pub fn lens(&self, lanes: usize) -> [usize; 2] {
+        [lanes * self.state_len(), self.ring_len()]
+    }
+
     /// Refuse by name a shape the kernels have no geometry for.
     pub(crate) fn check(&self, what: &'static str) -> Result<(), GpuError> {
         if self.n_k == 0 || self.n_v == 0 || !self.n_v.is_multiple_of(self.n_k) {

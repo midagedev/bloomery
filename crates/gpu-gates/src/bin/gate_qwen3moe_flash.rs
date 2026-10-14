@@ -145,7 +145,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, HEAD, KEY_TILE, SEG_KEYS, SEGMENTS,
+        FlashGqaKernels, GROUP, GROUP_5, GqaArgs, GqaQ8Args, HEAD, KEY_TILE, SEG_KEYS, SEGMENTS,
         partials_ms_len, partials_v_len, seg_span,
     };
     use bloomery_gpu::flash_gqa_prefill::{
@@ -1901,6 +1901,79 @@ mod gate {
         plain: f64,
     }
 
+    /// Head 128, [`GROUP_5`] query heads a key head, the scalar pass,
+    /// against [`exact`]'s head-128 band. Two key heads: a KV index of
+    /// `h / 8` still reads the first plane for the second group.
+    fn group5(k: &FlashGqaKernels, gpu: &Gpu, scale: f32) -> Result<bool, GateError> {
+        const N_KV: usize = 2;
+        const KEYS: usize = 96;
+        const CTX: usize = 128;
+        let n_head = N_KV * GROUP_5;
+        let stream = gpu.stream();
+        let q: Vec<f32> = activations(HEAD, n_head, 5);
+        let kb: Vec<u16> = activations(HEAD, N_KV * CTX, 6)
+            .into_iter()
+            .map(f32_to_f16_bits)
+            .collect();
+        let vb: Vec<u16> = activations(HEAD, N_KV * CTX, 7)
+            .into_iter()
+            .map(f32_to_f16_bits)
+            .collect();
+        let kf: Vec<f32> = kb.iter().copied().map(half_to_f32).collect();
+        let vf: Vec<f32> = vb.iter().copied().map(half_to_f32).collect();
+        let q_d = DeviceBuffer::from_host(stream, &q)?;
+        let kc = DeviceBuffer::from_host(stream, &kb)?;
+        let vc = DeviceBuffer::from_host(stream, &vb)?;
+        let n_keys = DeviceBuffer::from_host(stream, &[KEYS as u32])?;
+        let mut part_v = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?;
+        let mut part_ms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
+        k.enqueue_pass_g5(
+            stream,
+            GqaArgs {
+                q: &q_d,
+                kc: &kc,
+                vc: &vc,
+                n_keys: &n_keys,
+                scale,
+                n_kv: N_KV,
+                ctx: CTX,
+                m: 1,
+                part_v: &mut part_v,
+                part_ms: &mut part_ms,
+                fault: gpu.unlabelled_sink(),
+                y: &mut y,
+            },
+        )?;
+        stream.synchronize()?;
+        let got = y.to_host_vec(stream)?;
+        let mut worst = 0.0f64;
+        let mut ok = true;
+        for h in 0..n_head {
+            let plane = (h / GROUP_5) * CTX * HEAD;
+            let ex = exact(
+                &q[h * HEAD..(h + 1) * HEAD],
+                &kf[plane..plane + KEYS * HEAD],
+                &vf[plane..plane + KEYS * HEAD],
+                KEYS,
+                scale,
+            );
+            for d in 0..HEAD {
+                let err = (f64::from(got[h * HEAD + d]) - ex.o[d]).abs();
+                let bound = ex.bound_ours[d];
+                if bound > 0.0 {
+                    worst = worst.max(err / bound);
+                }
+                ok &= err <= bound;
+            }
+        }
+        println!(
+            "flash group5 head={HEAD} group={GROUP_5} kv={N_KV} keys={KEYS}: measured/bound {worst:.3e} {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
@@ -2142,6 +2215,7 @@ mod gate {
         );
         ok &= seeded_ok;
         ok &= q8_window_refusal(&kp, &gpu, scale)?;
+        ok &= group5(&k, &gpu, scale)?;
         println!("gate_qwen3moe_flash: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

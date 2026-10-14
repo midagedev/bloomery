@@ -12,7 +12,8 @@
 //! v`, the layout of the reference dump's `q_rope`/`k_rope` views);
 //! `weighted_sum` on `[rows, n_exp, m]` down-projections with `[n_exp, m]`
 //! weights; the embedding table is Q3_K rows of 2048 values (880 bytes = 220
-//! u32 words each) or Q3_K, Q4_K, Q5_K or Q6_K rows of whole super-blocks.
+//! u32 words each), Q3_K, Q4_K, Q5_K or Q6_K rows of whole super-blocks, or
+//! Q5_0 rows in the `pack_q5_0` layout.
 //! Extents are launch arguments, never buffer lengths: scratch buffers may
 //! be larger than the shape in flight.
 
@@ -696,6 +697,100 @@ mod elem_kernels {
         }
     }
 
+    /// Dequantize `ids.len()` rows of a Q5_0 table in the `pack_q5_0` layout
+    /// (`q_stride + k/32` u32 words a row; byte `j % 4` of word
+    /// `256·(b>>5) + (b&31) + 32·(j/4)` of block `b = v/32` is the low half's
+    /// code when `v%32 < 16`, and the high half lives `4` word-groups later)
+    /// into `y`, with each row's position and live key count as
+    /// `embed_rows_q4k`. The code byte is the 5-bit code minus 16, and the
+    /// block's scale is the f32 bits after the code plane, so a value is that
+    /// byte as `i8` times the scale. Q5_0's rows are 32-value blocks split
+    /// into a code plane and a scale plane, not 256-value super-blocks, so
+    /// this does not share [`embed_rows_sb`]. An id past `n_rows` raises
+    /// [`FaultSite::TokenId`] and writes a NaN row, as `embed_rows` does.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= (q_stride + k_blocks) * n_rows,
+            y.len() >= k * ids.len(),
+            pos0.len() >= 1,
+            pos.len() >= ids.len(),
+            n_keys.len() >= ids.len()
+        )
+    )]
+    pub fn embed_rows_q5_0(
+        w: &[u32],
+        ids: &[u32],
+        pos0: &[u32],
+        first: u32,
+        n_rows: u32,
+        k: u32,
+        q_stride: u32,
+        k_blocks: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut pos: DisjointSlice<u32>,
+        mut n_keys: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i < ids.len() {
+            // SAFETY: pos0 holds a word by the launch contract.
+            let p = unsafe { *pos0.get_unchecked(0) } as usize + first as usize + i;
+            // SAFETY: i < ids.len() <= pos.len(), n_keys.len() by the launch
+            // contract; thread i owns entry i of both.
+            unsafe {
+                *pos.get_unchecked_mut(i) = position_word(p);
+                *n_keys.get_unchecked_mut(i) = position_word(p + 1);
+            }
+        }
+        let width = k as usize;
+        if i >= ids.len() * width {
+            return;
+        }
+        let t = i / width;
+        let v = i % width;
+        // SAFETY: t < ids.len() by the guard.
+        let id = unsafe { *ids.get_unchecked(t) };
+        let out = if id < n_rows {
+            let b = v / 32;
+            let within = v % 32;
+            let j = within % 16;
+            // The high half of the block (values 16..32) is the second group
+            // of four words; the low half is the first.
+            let word_i = j / 4 + 4 * usize::from(within >= 16);
+            let byte = j % 4;
+            let row_words = q_stride as usize + k_blocks as usize;
+            let row = id as usize * row_words;
+            let wbase = 256 * (b >> 5) + (b & 31);
+            // SAFETY: id < n_rows, b < k/32 = k_blocks (v < k and the launcher
+            // passes k = 32·k_blocks), and word_i < 8, so
+            // wbase + 32·word_i < q_stride (a window is 256 words and the
+            // addressed word sits in the last 256 of that window). The scale
+            // word is the next k_blocks words. The row ends at
+            // (id+1)·(q_stride+k_blocks) <= w.len() by the launch contract.
+            let word = unsafe { *w.get_unchecked(row + wbase + 32 * word_i) };
+            let code = ((word >> (8 * byte)) & 0xff) as u8 as i8;
+            let scale = f32::from_bits(unsafe { *w.get_unchecked(row + q_stride as usize + b) });
+            (code as f32) * scale
+        } else {
+            if v == 0 {
+                fault.raise(FaultSite::TokenId);
+            }
+            f32::NAN
+        };
+        // SAFETY: i < ids.len() * k <= y.len() by the launch contract.
+        unsafe {
+            *y.get_unchecked_mut(i) = out;
+        }
+    }
+
     /// Dequantize `ids.len()` rows of the Q5_K embedding table `w` (`44 ·
     /// n_sb` u32 words per row) into `y` with their positions and live key
     /// counts ([`embed_rows_sb`] over [`Q5kRows`]), as `embed_rows_q4k`.
@@ -1001,6 +1096,36 @@ mod elem_kernels {
         // block.
         let e = unsafe { Elem2::new(gate, up, &mut y, i) };
         e.map(silu_mul);
+    }
+
+    /// `y[i] = max(x[i], 0)^2` over `n` values. A non-finite input is copied
+    /// as it is: `max` of a non-finite is not this rule, and the square of
+    /// `−inf` is not 0.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= n, y.len() >= n)
+    )]
+    pub fn relu_sqr(x: &[f32], n: u32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= x.len() and y.len() by the launch contract; thread
+        // i owns entry i.
+        let v = unsafe { *x.get_unchecked(i) };
+        let out = if !v.is_finite() {
+            v
+        } else {
+            let r = if v > 0.0 { v } else { 0.0 };
+            let yv = r * r;
+            yv
+        };
+        unsafe {
+            *y.get_unchecked_mut(i) = out;
+        }
     }
 
     /// `y[i] = a[i] + b[i]`, elementwise over `n` values — exact; the body
@@ -1641,6 +1766,99 @@ impl ElemKernels {
         Ok(())
     }
 
+    /// Enqueue the Q5_0 embedding lookup of one unit of rows: `args.ids` each
+    /// select one row of `args.w` in the `pack_q5_0` layout (`k` values, `k`
+    /// a positive multiple of 32, `q_stride + k/32` words a row with
+    /// `q_stride = 256·ceil((k/32)/32)`), dequantized into `args.y`
+    /// token-major, bit-identical to `gguf::quant::dequant_row` on the same
+    /// row bytes, with each row's position and live key count as
+    /// [`Self::enqueue_embed_rows_q4k`]. An id past the table raises
+    /// [`FaultSite::TokenId`]. A table whose word count is not that layout's
+    /// is refused by name. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_embed_rows_q5_0(
+        &self,
+        stream: &CudaStream,
+        args: EmbedRowsArgs<'_>,
+        k: usize,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_embed_rows_q5_0";
+        let EmbedRowsArgs {
+            w,
+            ids,
+            pos0,
+            first,
+            y,
+            pos,
+            n_keys,
+        } = args;
+        if k == 0 || !k.is_multiple_of(32) {
+            return Err(GpuError::shape(
+                what,
+                format!("k must be a positive multiple of 32, got {k}"),
+            ));
+        }
+        let k_blocks = k / 32;
+        let q_stride = 256 * k_blocks.div_ceil(32);
+        if w.rows() == 0 || w.cols() != q_stride + k_blocks {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a Q5_0 table is {q_stride} + {k_blocks} words a row, got {}x{}",
+                    w.rows(),
+                    w.cols()
+                ),
+            ));
+        }
+        if ids.is_empty() {
+            return Err(GpuError::shape(what, "empty ids"));
+        }
+        if y.len() < k * ids.len() {
+            return Err(GpuError::shape(
+                what,
+                format!("y.len() {} < {k}*{}", y.len(), ids.len()),
+            ));
+        }
+        if pos0.is_empty() || pos.len() < ids.len() || n_keys.len() < ids.len() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "pos0 holds {} words (want 1), pos {} and n_keys {} (want {} each)",
+                    pos0.len(),
+                    pos.len(),
+                    n_keys.len(),
+                    ids.len()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", (ids.len() * k).div_ceil(256))?;
+        let first = launch_u32(what, "first", first)?;
+        let n_rows = launch_u32(what, "w.rows()", w.rows())?;
+        let k = launch_u32(what, "k", k)?;
+        let q_stride = launch_u32(what, "q_stride", q_stride)?;
+        let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
+        let prep = self
+            .module
+            .prepare_embed_rows_q5_0(LaunchConfig1D::new(grid, 256, 0))?;
+        let fault = crate::sink_over(&self.fault, LAYER_NONE);
+        self.module.embed_rows_q5_0(
+            stream,
+            &prep,
+            w.buf(),
+            ids,
+            pos0,
+            first,
+            n_rows,
+            k,
+            q_stride,
+            k_blocks,
+            fault,
+            y,
+            pos,
+            n_keys,
+        )?;
+        Ok(())
+    }
+
     /// Enqueue the embedding lookup of one unit of rows from a K-quant table
     /// of type `ty`, as [`Self::enqueue_embed_rows_q4k`] does for Q4_K: the
     /// rows dequantized token-major into `args.y`, bit-identical to
@@ -1952,6 +2170,29 @@ impl ElemKernels {
             .module
             .prepare_swiglu(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.swiglu(stream, &prep, gate, up, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue `y = max(x, 0)^2` over `n` values (flat). A non-finite input
+    /// stays that value. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_relu_sqr(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if n == 0 || x.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                "enqueue_relu_sqr",
+                format!("n={n}, x.len() {}, y.len() {}", x.len(), y.len()),
+            ));
+        }
+        let n = launch_u32("enqueue_relu_sqr", "n", n)?;
+        let prep = self
+            .module
+            .prepare_relu_sqr(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.relu_sqr(stream, &prep, x, n, y)?;
         Ok(())
     }
 

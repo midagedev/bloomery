@@ -472,8 +472,8 @@ pub(super) fn mixer(
 /// A unit's front, one launch: the embedding rows of `io`'s ids into `s.x`
 /// and each row's position and live key count into `s.pos` and `s.n_keys` —
 /// the rows every later launch of the unit reads. The table's resident type
-/// picks the lookup: Q3_K, Q4_K, Q5_K or Q6_K rows, or Q8_0 planes (the load
-/// admits only these).
+/// picks the lookup: Q3_K, Q4_K, Q5_K or Q6_K rows, Q5_0 packed rows, or
+/// Q8_0 planes (the load admits only these).
 pub(super) fn embed_rows(
     gpu: &Gpu,
     w: &Weights,
@@ -486,7 +486,8 @@ pub(super) fn embed_rows(
 
 /// [`embed_rows`] into `(y, pos, n_keys)`, a unit's embedding rows and
 /// their positions and live key counts: the arena's own, or a window of
-/// them where a pass of several slots embeds each slot's rows apart.
+/// them where a pass of several slots embeds each slot's rows apart. Q5_0
+/// packed rows take [`crate::elem::ElemKernels::enqueue_embed_rows_q5_0`].
 pub(super) fn embed_into(
     gpu: &Gpu,
     w: &Weights,
@@ -516,9 +517,30 @@ pub(super) fn embed_into(
             },
         );
     }
+    if let Some(DevWeight::Q5_0 { w, k }) = w.get(&name) {
+        return gpu.elem().enqueue_embed_rows_q5_0(
+            gpu.stream(),
+            EmbedRowsArgs {
+                w,
+                ids: io.ids,
+                pos0: io.pos0,
+                first: io.first,
+                y,
+                pos,
+                n_keys,
+            },
+            *k,
+        );
+    }
     let ty = match w.get(&name) {
         Some(DevWeight::KQuant { ty, .. }) => *ty,
-        _ => return Err(GpuError::tensor(WHAT, &name, "K-quant rows or Q8_0 planes")),
+        _ => {
+            return Err(GpuError::tensor(
+                WHAT,
+                &name,
+                "K-quant rows, Q5_0 packed rows or Q8_0 planes",
+            ));
+        }
     };
     gpu.elem().enqueue_embed_rows_kquant(
         gpu.stream(),

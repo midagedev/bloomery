@@ -229,7 +229,7 @@ fn checkpoint_lens(kinds: &[Kind35]) -> Vec<usize> {
     kinds
         .iter()
         .filter_map(|k| match k {
-            Kind35::Delta(shape) => Some(RecStore::lens(*shape, PLAIN_LANES)),
+            Kind35::Delta(shape) => Some(shape.lens(PLAIN_LANES)),
             Kind35::Gqa(_) => None,
         })
         .flatten()
@@ -1618,9 +1618,12 @@ impl Body35 {
             stores.push(match *kind {
                 Kind35::Gqa(_) => LayerStore::Kv(KvPlanes::new(stream, &d, o.kv)?),
                 Kind35::Delta(shape) if lanes > PLAIN_LANES => {
-                    LayerStore::Rec(RecStore::stamped(stream, shape, lanes)?)
+                    LayerStore::Rec(RecStore::stamped(stream, shape.lens(lanes), lanes)?)
                 }
-                Kind35::Delta(shape) => LayerStore::Rec(RecStore::new(stream, shape, lanes)?),
+                Kind35::Delta(shape) => {
+                    let [state_f32, ring_f32] = shape.lens(lanes);
+                    LayerStore::Rec(RecStore::new(stream, [state_f32, ring_f32], lanes)?)
+                }
             });
         }
         let forms = Forms::of(&plans, &d);
@@ -3153,7 +3156,7 @@ impl Slots for Body35 {
                         Ok(LayerStore::Kv(KvPlanes::new(stream, &d, kv)?))
                     }
                     (MixerPlan::Delta(dp), LayerStore::Rec(_)) => Ok(LayerStore::Rec(
-                        RecStore::new(stream, dp.shape, PLAIN_LANES)?,
+                        RecStore::new(stream, dp.shape.lens(PLAIN_LANES), PLAIN_LANES)?,
                     )),
                     _ => Err(GpuError::state(
                         WHAT_N,
@@ -3335,7 +3338,7 @@ mod tests {
     /// layer's state (2,097,152 B) and conv ring (360,448 B): 73,728,000 B,
     /// spaced at the 4,096-token default ubatch, so a slot of 2,048 positions
     /// pins one point and one of 10,240 three. The lengths are the stores'
-    /// own ([`RecStore::lens`]), in [`Copied35`]'s order.
+    /// own ([`LinearShape::lens`]), in [`Copied35`]'s order.
     #[test]
     fn a_checkpoint_copies_each_delta_layers_state_and_ring() {
         let delta = Kind35::Delta(LinearShape {

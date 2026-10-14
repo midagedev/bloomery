@@ -227,6 +227,14 @@ const THREADS_P12_U32: u32 = THREADS_P12 as u32;
 const _: () = assert!(PACK_12 == 12 && THREADS_P12_U32 == 384);
 const _: () = assert!(PACK_12 + PAD_12 == MMA_ROWS && PAD_12 <= PACK_12 && PACK_12 > MMA_ROWS / 2);
 
+/// Query heads one block of [`FlashGqaKernels::enqueue_pass_g5`] takes.
+/// The tensor-core tile is [`MMA_ROWS`] rows and pads a pack only when the
+/// pad is at most the pack and the pack is past half the tile, which five
+/// is not, and the packed scalar wants a pack that divides the key tile's
+/// staged words, which five does not. The pass is scalar.
+pub const GROUP_5: usize = 5;
+const _: () = assert!(GROUP_5 == 5);
+
 /// Segments every decode launch cuts a row's keys into, whatever the cache
 /// height: per (row, key head) unit about one block for each SM of either
 /// workstation card (82 and 84 SMs), and whole merge batches. The grid is
@@ -2925,6 +2933,206 @@ mod flash_gqa_kernels {
         }
     }
 
+    /// [`gqa_flash_seg`] for [`GROUP_5`] query heads a key head. The block
+    /// stays 256 threads so the key and value tile stage as that kernel's;
+    /// warps `0..5` own the query heads and the pad warps only help stage.
+    /// Five does not pad onto the tensor-core tile (see [`GROUP_5`]), so
+    /// this entry is scalar. The partial index is `(t·n_head + h)·segs + seg`
+    /// with `h = kh·GROUP_5 + w`, and [`gqa_flash_merge`] folds it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            q.len() >= m * n_kv * 5 * 128,
+            kc.len() >= n_kv * ctx * 128,
+            vc.len() >= n_kv * ctx * 128,
+            part_v.len() >= m * n_kv * 5 * segs * 128,
+            part_ms.len() >= m * n_kv * 5 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_g5(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { GROUP_5 * HEAD }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { GROUP_5 * KEY_TILE }> = SharedArray::UNINIT;
+
+        let b = thread::blockIdx_x() as usize;
+        let nkv = n_kv as usize;
+        let n_seg = segs as usize;
+        let rows = m as usize;
+        if b >= rows * nkv * n_seg {
+            return; // block-uniform
+        }
+        let t = b % rows;
+        let sk = b / rows;
+        let seg = sk / nkv;
+        let kh = sk - seg * nkv;
+        let tid = thread::threadIdx_x() as usize;
+        let w = tid / 32;
+        let lane = warp::lane_id() as usize;
+        let n_head = nkv * GROUP_5;
+        let h0 = kh * GROUP_5;
+        // The key head this block reads. For a live warp it is the query
+        // head's group; the pad warps share it so the staged tile is one.
+        let src = h0 / GROUP_5;
+        let h = h0 + w;
+        let idx = (t * n_head + h) * n_seg + seg;
+        let ctx = ctx as usize;
+        // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
+        let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
+        let span = seg_span(limit, n_seg, seg_keys as usize);
+        let lo = seg * span;
+        if lo >= limit {
+            if w < GROUP_5 && lane == 0 {
+                // SAFETY: w < GROUP_5 gives h < (kh+1)·GROUP_5 <= n_head, so
+                // idx < m·n_head·segs and both slots are inside part_ms.
+                unsafe {
+                    *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
+                    *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
+                }
+            }
+            return; // block-uniform: lo and limit are the block's
+        }
+        let hi = (lo + span).min(limit);
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation; the raw form reaches it without a reference. Every
+        // index below is inside its array, and every write is ordered before
+        // its reads by a block barrier (or, for WS, written and read by one
+        // warp between two barriers).
+        let (qs, ks, vs, ws) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+
+        // The group's 5·128 query values, four per thread. Threads past the
+        // group's 160 stage nothing; the pad warps have no query row.
+        let qb = (t * n_head + h0) * HEAD;
+        if tid < GROUP_5 * HEAD / 4 {
+            let mut i = 0usize;
+            while i < 4 {
+                // SAFETY: tid < 160, so 4·tid + i < GROUP_5·HEAD, and
+                // qb + that < (t·n_head + (kh+1)·GROUP_5)·HEAD <=
+                // m·n_kv·5·128 <= q.len().
+                unsafe { *qs.add(4 * tid + i) = *q.get_unchecked(qb + 4 * tid + i) };
+                i += 1;
+            }
+        }
+
+        let plane = src * ctx * HEAD;
+        let k64 = kc.as_ptr() as *const u64;
+        let v64 = vc.as_ptr() as *const u64;
+        let mut mx = f32::NEG_INFINITY;
+        let mut s_sum = 0.0f32;
+        let mut acc = [0.0f32; 4];
+        let mut t0 = lo;
+        while t0 < hi {
+            thread::sync_threads();
+            // Stage the tile with every thread, as `gqa_flash_seg` does: 32
+            // keys × 32 u64 of K and of V. A key at or past `hi` stages zeros.
+            let mut i = 0usize;
+            while i < 4 {
+                let e = tid + THREADS * i;
+                let key = e / ROW_QWORDS;
+                let word = e - key * ROW_QWORDS;
+                let (kw, vw) = if t0 + key < hi {
+                    // SAFETY: t0 + key < hi <= ctx, so the row is inside key
+                    // head `src`'s plane; a row is 128 u16 = 32 u64 and the
+                    // planes start 8-byte aligned (a device allocation).
+                    unsafe {
+                        let r = (plane + (t0 + key) * HEAD) / 4 + word;
+                        (*k64.add(r), *v64.add(r))
+                    }
+                } else {
+                    (0u64, 0u64)
+                };
+                // SAFETY: key < 32 and word < 32: 2·word + 1 < K_STRIDE and
+                // key·32 + word < KEY_TILE·ROW_QWORDS.
+                unsafe {
+                    *ks.add(key * K_STRIDE + 2 * word) = kw as u32;
+                    *ks.add(key * K_STRIDE + 2 * word + 1) = (kw >> 32) as u32;
+                    *vs.add(key * ROW_QWORDS + word) = vw;
+                }
+                i += 1;
+            }
+            thread::sync_threads();
+
+            if w < GROUP_5 {
+                // The score of key t0 + lane for head h.
+                let live = t0 + lane < hi;
+                let mut a = [0.0f32; ILP];
+                let mut wd = 0usize;
+                while wd < ROW_WORDS {
+                    let mut p = 0usize;
+                    while p < ILP {
+                        // SAFETY: lane < 32, wd + p < ROW_WORDS: inside KS;
+                        // w < GROUP_5, so the query index is inside QS.
+                        let (kw, q0, q1) = unsafe {
+                            (
+                                *ks.add(lane * K_STRIDE + wd + p),
+                                *qs.add(w * HEAD + 2 * (wd + p)),
+                                *qs.add(w * HEAD + 2 * (wd + p) + 1),
+                            )
+                        };
+                        let k0 = half_bits_to_f32(kw as u16);
+                        let k1 = half_bits_to_f32((kw >> 16) as u16);
+                        a[p] = f32::mul_add(q0, k0, a[p]);
+                        a[p] = f32::mul_add(q1, k1, a[p]);
+                        p += 1;
+                    }
+                    wd += ILP;
+                }
+                let dot = (a[0] + a[1]) + (a[2] + a[3]);
+                let sc = if live { dot * scale } else { f32::NEG_INFINITY };
+                // SAFETY: WS is GROUP_5·KEY_TILE and w < GROUP_5; VS was
+                // staged before the barrier above. The warp calls it together.
+                unsafe { fold_tile(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane) };
+            }
+            t0 += KEY_TILE;
+        }
+
+        if w < GROUP_5 {
+            // SAFETY: idx is inside the partials, as on the neutral path;
+            // lane `lane` owns dims 4·lane .. +3, and lane 0 writes (m, s).
+            unsafe {
+                let o = idx * HEAD + 4 * lane;
+                *part_v.get_unchecked_mut(o) = acc[0];
+                *part_v.get_unchecked_mut(o + 1) = acc[1];
+                *part_v.get_unchecked_mut(o + 2) = acc[2];
+                *part_v.get_unchecked_mut(o + 3) = acc[3];
+                if lane == 0 {
+                    *part_ms.get_unchecked_mut(2 * idx) = mx;
+                    *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
+                }
+            }
+        }
+    }
+
     /// The segment pass with `S = Q·Kᵀ` on the tensor cores: the grid,
     /// the partials and every step after the scores are [`gqa_flash_seg`]'s
     /// (`fold_tile`), so [`gqa_flash_merge`] serves both. The group's eight
@@ -4405,6 +4613,73 @@ impl FlashGqaKernels {
                 part_ms,
             )?;
         }
+        let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
+            merge_grid,
+            MERGE_THREADS,
+            0,
+        ))?;
+        self.module.gqa_flash_merge(
+            stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, fault, y,
+        )?;
+        Ok(())
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass`] at [`GROUP_5`] query heads a key
+    /// head: `gqa_flash_seg_g5` (`m · n_kv · [`SEGMENTS`]` blocks of 256) and
+    /// [`gqa_flash_merge`] over `n_kv · GROUP_5` heads. Scalar only. Two
+    /// launches. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pass_g5(&self, stream: &CudaStream, args: GqaArgs<'_>) -> Result<(), GpuError> {
+        let what = "flash_gqa::enqueue_g5";
+        let GqaArgs {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = args;
+        if n_kv == 0 || ctx == 0 || m == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
+            ));
+        }
+        let n_head = n_kv * GROUP_5;
+        let segs = SEGMENTS;
+        let lens = [
+            ("q", q.len(), m * n_head * HEAD),
+            ("kc", kc.len(), n_kv * ctx * HEAD),
+            ("vc", vc.len(), n_kv * ctx * HEAD),
+            ("n_keys", n_keys.len(), m),
+            ("part_v", part_v.len(), partials_v_len(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
+            ("y", y.len(), m * n_head * HEAD),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * n_kv * segs)?;
+        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
+        let heads = launch_u32(what, "n_head", n_head)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m = launch_u32(what, "m", m)?;
+        let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
+        let prep = self.module.prepare_gqa_flash_seg_g5(cfg)?;
+        self.module.gqa_flash_seg_g5(
+            stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v, part_ms,
+        )?;
         let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
             merge_grid,
             MERGE_THREADS,
