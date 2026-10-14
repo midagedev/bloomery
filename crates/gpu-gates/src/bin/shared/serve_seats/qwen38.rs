@@ -327,6 +327,7 @@ use bloomery_gpu_gates::bind::{
 };
 use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::nodes::count_kinds;
+use bloomery_gpu_gates::plan_lane::probed_unless_plan;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
     CARD38, Lever38, Seqs, check_reserve, checkpoints_reserved, reserve_checkpoints, residency38,
@@ -1089,7 +1090,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let stage = draft_at.cards.on(&census)?.card_specs()?[0];
     Gpu::hold_card(stage.name, stage.device)?;
     // The lane's rate, taken before the plan reads the room (`lane_of`).
-    let lane = lane_of(stage)?;
+    // `--plan` probes no lane. The hold above stays first, for a load and
+    // for `--plan`.
+    let lane = probed_unless_plan(a.plan_only, || lane_of(stage))?;
     let mut inputs = PlanInputs::describe(&split)?;
     // The slot count first: it shapes the draft's window condition, the
     // context choice itself, and every plan the seat asks for, each counting
@@ -1527,7 +1530,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
     let open = SeatArgs {
         place: a.place,
-        lane,
+        lane: lane.expect("a serving run probed the lane before the plan"),
         ctx,
         slots,
         pass,
