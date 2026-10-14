@@ -80,6 +80,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   A_LABEL=(bin:b1ab bin:b1ab@prose)
   out=$(bin_labels_ok 2>&1) && r=0 || r=$?
   check suffix "$r|$out" '0|'
+  # depth-ds41's witness prefix and block key call this stem. A second `bin:${…##*/}` is another owner.
+  ds41=${BASH_SOURCE[0]%/*}/depth-ds41.sh
+  check ds41-stem-calls "$(grep -c 'bin_label_stem' "$ds41")" 3
+  check ds41-one-format "$(grep -c 'bin:${' "$ds41" || true)" 0
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
   exit

@@ -1413,7 +1413,7 @@ for i in "${!ARMS[@]}"; do
   case $bin_seen in *" $gb "*) continue ;; esac
   bin_seen+="$gb "
   t=$(bin_tree "$gb")
-  BIN_LINES+=("bin:${t##*/}: $(tree_line "$gb" "$t")")
+  BIN_LINES+=("$(bin_label_stem "$gb"): $(tree_line "$gb" "$t")")
 done
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
@@ -1544,11 +1544,7 @@ arm_block() {
     srv) case ${A_ENG[$1]} in *fit*) echo lcppsrvfit ;; *) echo lcppsrv ;; esac ;;
     ours) echo ours ;;
     corpus) echo "${A_ENG[$1]}" ;;
-    *)
-      local t
-      t=$(bin_tree "${A_BIN[$1]}")
-      echo "bin:${t##*/}${A_IDS[$1]:+@${A_IDS[$1]}}"
-      ;;
+    *) echo "$(bin_label_stem "${A_BIN[$1]}")${A_IDS[$1]:+@${A_IDS[$1]}}" ;;
   esac
 }
 # arm_draws <i>: how many token ids arm <i>'s process takes — a reference arm's std::rand() draws, an
