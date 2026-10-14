@@ -139,9 +139,6 @@ pub struct Row<O> {
     pub name: &'static str,
     /// The routes its requests are posted to.
     pub routes: &'static [&'static str],
-    /// The release's designed prompt length. The seat sizes the cache by
-    /// `generate::choose_ctx`, not by this.
-    pub ctx: usize,
     /// The file architectures whose hidden states the head reads.
     pub backbones: &'static [&'static str],
     /// How a file that carries the head itself names the row: a file that matches seats it with no
@@ -1109,7 +1106,6 @@ mod tests {
         Row {
             name: "rowa",
             routes: &["/v1/a"],
-            ctx: 16,
             backbones: &["qwen35", "qwen35c"],
             in_file: &[InFile::Arch("qwen35c")],
             head: Some(HeadRepo {
@@ -1125,7 +1121,6 @@ mod tests {
         Row {
             name: "rowb",
             routes: &["/v1/b"],
-            ctx: 16,
             backbones: &["qwen35"],
             in_file: &[InFile::Decision("lbl")],
             head: None,

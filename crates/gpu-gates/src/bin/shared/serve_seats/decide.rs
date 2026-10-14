@@ -112,7 +112,6 @@ pub const ROWS: &[Row<Open>] = &[
     Row {
         name: clef::NAME,
         routes: clef::ROUTES,
-        ctx: clef::CTX,
         backbones: clef::BACKBONES,
         in_file: &[InFile::Arch(clef::LAYOUT_ARCH)],
         head: Some(HeadRepo {
@@ -128,7 +127,6 @@ pub const ROWS: &[Row<Open>] = &[
     Row {
         name: lev::NAME,
         routes: lev::ROUTES,
-        ctx: lev::CTX,
         backbones: lev::BACKBONES,
         in_file: &[InFile::Decision(lev::DECISION_TYPE)],
         head: None,

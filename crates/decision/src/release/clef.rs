@@ -3,7 +3,6 @@
 //! head inside the file, the repo and file names of its head, and how a head config is known to be
 //! Clef's. The server's own table holds one row of these.
 
-use crate::encode::MAX_LENGTH;
 use crate::head::{CONFIG_FILE, HeadConfig};
 
 /// The row's name, as a server's refusals and `/props` give it.
@@ -11,10 +10,6 @@ pub const NAME: &str = "clef";
 
 /// The routes a SystemOne request is posted to: the release's.
 pub const ROUTES: &[&str] = &["/v1/systemone"];
-
-/// The release's `max_length`, the prompt the encoder fills. The seat sizes
-/// the cache by the common context choice, not by this.
-pub const CTX: usize = MAX_LENGTH;
 
 /// The file architectures the head reads the hidden states of: Qwen3.5 dense, Clef's backbone,
 /// in the two layouts a GGUF of it comes in ([`IN_FILE`] is the one that holds its head).

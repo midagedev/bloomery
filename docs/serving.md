@@ -196,10 +196,11 @@ binary's `--help`.
   at the first start. The release binaries are x86-64 only (x86-64-v3). A DGX Spark (GB10, aarch64) builds from source
   with `BLOOMERY_ARCH` setting the CUDA arch ([`contrib/dgx-spark.md`](contrib/dgx-spark.md)); the AVX2 kernels stay
   x86-64 only, and a quant type without an aarch64 kernel runs through a scalar mirror there.
-- GLM-5.3 holds at most 16,384 positions a slot (`ORACLE_POSITIONS`), whatever `--ctx-size` asks; a longer prompt is refused with
-  `exceed_context_size_error`. A 12–16 GB card's split Qwen3 load takes the ladder: unset halves until the plan fits. The sitting measured under the old rule was 2,048 positions a slot at
-  `--parallel 2`, and that card has not been remeasured. Agent clients with long system prompts want the context to one request there (`--parallel 1`, or
-  a set `--ctx-size` with no `--parallel`).
+- GLM-5.3 holds at most 16,384 positions a slot (`ORACLE_POSITIONS`): a `--ctx-size` whose share a slot passes it
+  is refused at start, and a longer prompt with `exceed_context_size_error`. On a 12–16 GB card the split Qwen3 load's
+  unset context halves until the plan fits; the old rule's sitting there measured 2,048 positions a slot at
+  `--parallel 2`, and that card has not been remeasured. Agent clients with long system prompts want the context to
+  one request there (`--parallel 1`, or a set `--ctx-size` with no `--parallel`).
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other

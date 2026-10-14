@@ -13,13 +13,6 @@ pub const NAME: &str = "lev";
 /// The routes a SystemOne request is posted to: llama.cpp's.
 pub const ROUTES: &[&str] = &["/v1/systemone"];
 
-/// The release's designed prompt length. [derived] The Clef row's value: a prompt is a
-/// question's variant (the state and the options), and the gate suite's longest, a log state, is 6430
-/// ids, 2.5 times under it. The file keeps K and V on one layer in four
-/// (`block_count` 32, `full_attention_interval` 4, `head_count_kv` 4, `key_length` 256): 8 layers × 2
-/// × 4 KV heads × 256 × 2 B = 32 KB a token, so the whole context costs 512 MB.
-pub const CTX: usize = 16384;
-
 /// The file architectures the label head reads: Qwen3.5 dense, lev's backbone.
 pub const BACKBONES: &[&str] = &["qwen35"];
 

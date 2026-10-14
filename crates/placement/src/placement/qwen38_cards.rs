@@ -14,7 +14,7 @@ use super::churn::ChurnPool;
 use super::workstation::{
     A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
     HostRead, MARGIN, MIB, PLAN_ROOM, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
-    TIER_BATCH_RESERVE, census_usable, host, host_of, plan_room, resolve,
+    TIER_BATCH_RESERVE, census_usable, host, plan_room, resolve,
     tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use super::{
@@ -233,14 +233,6 @@ fn state38(ctx: u64, drafts: bool) -> u64 {
 /// One checkpoint's host bytes: the 36 delta layers' committed state lane
 /// and conv ring, and the PLE ring ([`state38`]'s term).
 const CHECKPOINT_38: u64 = 36 * 3_596_288 + 17 * 4 * 2560 * 4;
-
-/// The checkpoints a slot reserves on the host in a load of `ctx` positions
-/// a slot (`runtime::seqstate::Price::budget`, whose crate this one does not
-/// see): the points one prompt call over the whole context takes, one at
-/// each ubatch of 4,096 positions and one at its end, and one more.
-fn points_38(ctx: u64) -> u64 {
-    ctx.div_ceil(4096) + 1
-}
 
 /// The stage card of `qwen35moe::place::machine_for_experts(spec, 48, 4096,
 /// Experts::Card)`: every layer, the head and the token embedding, its

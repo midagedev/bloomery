@@ -329,8 +329,6 @@ pub enum SlotsFrom {
     Ctx,
     /// Neither flag: the seat's own default count over its automatic context.
     Default,
-    /// The default's second slot did not fit the plan, so one slot is served.
-    Fit,
     /// The default count's plan pages host experts through the NVMe tier, so
     /// fewer slots are served.
     Paged,
@@ -348,7 +346,6 @@ impl SlotsFrom {
             SlotsFrom::Flag => "flag",
             SlotsFrom::Ctx => "ctx",
             SlotsFrom::Default => "default",
-            SlotsFrom::Fit => "fit",
             SlotsFrom::Paged => "paged",
             SlotsFrom::RouteTrace => "route-trace",
             SlotsFrom::Dspark => "dspark",
@@ -418,51 +415,6 @@ pub fn slots_given(
         );
     }
     Ok((slots, from))
-}
-
-/// The plan of a load at the slot count `slots` names (`from`, as
-/// [`slots_given`] returns it), never costing a working load for a default's
-/// second slot: `plan(slots)` is tried first, and when it is refused while the
-/// count is the seat's default ([`SlotsFrom::Default`], more than one slot) the
-/// load is planned again at one slot, on one stderr line naming `name`, the
-/// `place` and the refusal. Returns what `plan` built, the slots it was built
-/// for and `from` ([`SlotsFrom::Fit`] after the fall to one slot). A set count
-/// ([`SlotsFrom::Flag`]) or a count a `--ctx` made ([`SlotsFrom::Ctx`]) is
-/// never lowered: its refusal stands, and so does the one-slot plan's when that
-/// too is refused.
-///
-/// # Errors
-/// The refusal of the plan that was last tried.
-pub fn default_slots_fit<T, E: std::fmt::Display>(
-    name: &str,
-    place: &str,
-    slots: usize,
-    from: SlotsFrom,
-    mut plan: impl FnMut(usize) -> Result<T, E>,
-) -> Result<(T, usize, SlotsFrom), E> {
-    match plan(slots) {
-        Ok(p) => Ok((p, slots, from)),
-        Err(e) if from == SlotsFrom::Default && slots > 1 => {
-            eprintln!(
-                "{name}: the default's second slot does not fit on --place {place} ({e}); serving \
-                 one slot (--parallel {slots} requires it)"
-            );
-            plan(1).map(|p| (p, 1, SlotsFrom::Fit))
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// The floor in bytes that the refusal of a plan under the card budget
-/// `budget` names: `PlacementError::CardBudgetFloor`'s words `budget {budget}
-/// B is below its floor {N} B`, found anywhere in `text` (a seat's error, or
-/// the line that quotes it). `None` when `text` holds no such refusal at that
-/// budget.
-#[must_use]
-pub fn budget_floor(text: &str, budget: u64) -> Option<u64> {
-    let head = format!("budget {budget} B is below its floor ");
-    let rest = &text[text.find(&head)? + head.len()..];
-    rest.split_once(" B")?.0.parse().ok()
 }
 
 /// The shape a seat's round of several slots runs in, decided once at the
@@ -3371,7 +3323,6 @@ mod tests {
             (SlotsFrom::Flag, "flag"),
             (SlotsFrom::Ctx, "ctx"),
             (SlotsFrom::Default, "default"),
-            (SlotsFrom::Fit, "fit"),
             (SlotsFrom::Paged, "paged"),
             (SlotsFrom::RouteTrace, "route-trace"),
             (SlotsFrom::Dspark, "dspark"),
@@ -3444,7 +3395,6 @@ mod tests {
             (SlotsFrom::Flag, "flag"),
             (SlotsFrom::Ctx, "ctx"),
             (SlotsFrom::Default, "default"),
-            (SlotsFrom::Fit, "fit"),
             (SlotsFrom::Paged, "paged"),
             (SlotsFrom::RouteTrace, "route-trace"),
             (SlotsFrom::Dspark, "dspark"),
@@ -3458,94 +3408,6 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
-    }
-
-    /// A default's second slot falls to one slot when its plan is refused and
-    /// the one-slot plan stands (`fit`); a set count is never lowered, and a
-    /// one-slot refusal ends the load with its own refusal. Only the default
-    /// falls: every other word, the ones a seat gives a count it chose itself
-    /// included, keeps its refusal.
-    #[test]
-    fn a_defaults_second_slot_never_costs_a_working_load() {
-        use super::{SlotsFrom, default_slots_fit};
-        let fits_one = |s: usize| {
-            if s == 1 {
-                Ok(s * 10)
-            } else {
-                Err(format!("{s} slots"))
-            }
-        };
-        let fits_all = |s: usize| Ok::<_, String>(s);
-        let fits_none = |s: usize| Err::<usize, _>(format!("{s} slots"));
-        let fit = |from, plan: &dyn Fn(usize) -> Result<usize, String>| {
-            default_slots_fit("t", "a", 2, from, plan)
-        };
-        assert_eq!(
-            fit(SlotsFrom::Default, &fits_one),
-            Ok((10, 1, SlotsFrom::Fit))
-        );
-        for held in [
-            SlotsFrom::Flag,
-            SlotsFrom::Ctx,
-            SlotsFrom::Fit,
-            SlotsFrom::Paged,
-            SlotsFrom::RouteTrace,
-            SlotsFrom::Dspark,
-        ] {
-            assert_eq!(fit(held, &fits_one), Err("2 slots".to_owned()), "{held}");
-        }
-        assert_eq!(
-            fit(SlotsFrom::Default, &fits_all),
-            Ok((2, 2, SlotsFrom::Default))
-        );
-        assert_eq!(
-            fit(SlotsFrom::Default, &fits_none),
-            Err("1 slots".to_owned())
-        );
-        assert_eq!(
-            default_slots_fit("t", "a", 1, SlotsFrom::Default, fits_one),
-            Ok((10, 1, SlotsFrom::Default))
-        );
-    }
-
-    /// The floor a card-budget refusal names is read from the placement's own
-    /// error text, alone or quoted in the default's fall line, and only for
-    /// the budget asked: another budget's refusal, an error of another kind
-    /// and a floor that is not a number name none.
-    #[test]
-    fn the_budget_floor_is_read_from_the_refusal_text() {
-        use super::budget_floor;
-        use model::placement::PlacementError;
-        let refusal = |budget, floor| {
-            PlacementError::CardBudgetFloor {
-                card: "gate".to_owned(),
-                budget,
-                floor,
-                dense: 5,
-                kv: 7,
-                context: 11,
-                scratch: 13,
-                reserves: 17,
-                margin: 19,
-                beside: 23,
-            }
-            .to_string()
-        };
-        let text = refusal(268_435_456, 3_000_000_001);
-        assert_eq!(budget_floor(&text, 268_435_456), Some(3_000_000_001));
-        assert_eq!(budget_floor(&text, 268_435_457), None);
-        assert_eq!(
-            budget_floor(&refusal(1, u64::MAX), 1),
-            Some(u64::MAX),
-            "an overflowed floor is printed as u64::MAX"
-        );
-        let quoted = format!(
-            "t: the default's second slot does not fit on --place gate ({text}); serving one \
-             slot (--parallel 2 requires it)"
-        );
-        assert_eq!(budget_floor(&quoted, 268_435_456), Some(3_000_000_001));
-        assert_eq!(budget_floor("budget 5 B is below its floor x B", 5), None);
-        assert_eq!(budget_floor("no space for 5 B", 5), None);
     }
 
     /// The checkpoints a load's sequences pin grow one budget a sequence

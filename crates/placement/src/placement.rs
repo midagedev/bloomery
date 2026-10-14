@@ -4970,9 +4970,9 @@ mod tests {
     }
 
     /// The whole-fit verdict stops where the program's arena does: `fits`
-    /// falls as the context grows, so a grid from the floor up to the
-    /// trained context lands on the last context the arena and its reserve
-    /// leave room for. A card whose reading is under the arena alone —
+    /// falls as the context grows, so the bisection over a grid from the
+    /// floor up to the trained context ([`ctx::largest`]) lands on the last
+    /// context the arena and its reserve leave room for. A card whose reading is under the arena alone —
     /// `1_151_139_840` B free against the `1_642_419_556` B
     /// arena a Qwen3.6 whole load refused on a 3090 (the gate census's
     /// reading and the arena check's message) — holds no context: the
@@ -5006,29 +5006,17 @@ mod tests {
                 whole_need(&model, &card, kv, load).expect("every tensor has a format")
             };
             let fits = |c: usize| at(c as u64 * KV_ROW).fits();
-            // The grid the seats used to search: nothing under the floor,
-            // else the largest `floor + k·gran` at or under the trained
-            // context that still fits.
+            // Nothing under the floor, else the largest `floor + k·gran` at
+            // or under the trained context that still fits.
             if !fits(FLOOR) {
                 return None;
             }
-            if fits(TRAINED) {
-                return Some(TRAINED);
-            }
-            let mut lo = FLOOR;
-            let mut hi = TRAINED;
-            while hi - lo > GRAN {
-                let mid = lo + (hi - lo) / 2 / GRAN * GRAN;
-                if mid == lo {
-                    break;
-                }
-                if fits(mid) {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            Some(lo)
+            let top = (TRAINED - FLOOR) / GRAN;
+            let k = ctx::largest(0, top, |k| {
+                Ok::<_, std::convert::Infallible>(fits(FLOOR + k * GRAN))
+            })
+            .expect("infallible");
+            Some(FLOOR + k * GRAN)
         };
         let weights = 9 * 4096;
         let rest = weights + workstation::CONTEXT + workstation::SCRATCH + RESERVE;
