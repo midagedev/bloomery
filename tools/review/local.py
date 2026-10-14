@@ -213,21 +213,19 @@ def ub_pins(base_tree):
 
 
 def install_ub(root, pins):
-    """review.yml's install step, here: each tool at its pinned commit, one venv, built aside and moved in place."""
-    tmp = root + ".new"
-    shutil.rmtree(tmp, ignore_errors=True)
+    """review.yml's install step, here: each tool at its pinned commit, one venv, built in place (a venv's scripts name
+    its absolute path, so it cannot be moved); the pins file is written last and marks it complete."""
+    shutil.rmtree(root, ignore_errors=True)
     for name, sha in zip(("dryer", "crapper"), pins):
-        d = os.path.join(tmp, name)
+        d = os.path.join(root, name)
         for c in (["git", "init", "-q", d], ["git", "-C", d, "fetch", "-q", "--depth", "1", f"https://github.com/unclebob/{name}", sha],
                   ["git", "-C", d, "checkout", "-q", "FETCH_HEAD"]):
             subprocess.run(c, check=True, capture_output=True, timeout=NET_S)
-    subprocess.run([sys.executable, "-m", "venv", os.path.join(tmp, "venv")], check=True, capture_output=True, timeout=NET_S)
-    subprocess.run([os.path.join(tmp, "venv/bin/pip"), "install", "-q", os.path.join(tmp, "dryer"), os.path.join(tmp, "crapper")],
+    subprocess.run([sys.executable, "-m", "venv", os.path.join(root, "venv")], check=True, capture_output=True, timeout=NET_S)
+    subprocess.run([os.path.join(root, "venv/bin/pip"), "install", "-q", os.path.join(root, "dryer"), os.path.join(root, "crapper")],
                    check=True, capture_output=True, timeout=3 * NET_S)
-    with open(os.path.join(tmp, "pins"), "w") as f:
+    with open(os.path.join(root, "pins"), "w") as f:
         f.write(" ".join(pins) + "\n")
-    shutil.rmtree(root, ignore_errors=True)
-    os.rename(tmp, root)
 
 
 def ub_bins(base_tree, say, root=None, install=install_ub):
