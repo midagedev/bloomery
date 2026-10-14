@@ -248,19 +248,6 @@ impl SiteEntry {
     }
 }
 
-impl SiteAct {
-    /// This form's name: the `Form` token in `crates/gpu/src/site.rs`.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            SiteAct::Q8x128 => "Q8x128",
-            SiteAct::Q8x32 => "Q8x32",
-            SiteAct::F32 => "F32",
-            SiteAct::Q8Blocks32 => "Q8Blocks32",
-        }
-    }
-}
-
 /// The lm_head launch family (`OutW` in `crates/gpu/src/head.rs`,
 /// `Head::enqueue`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

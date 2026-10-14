@@ -369,17 +369,15 @@ pub(super) fn dense_site(
     Ok(family)
 }
 
-/// [`qwen3moe_dense`] as a site family, or a named refusal. A table row whose
-/// activation the arena does not carry names that form (`SiteAct::name`, the
-/// `Form` token). A type with no row keeps the `kernels::dense` refusal.
+/// The body's dense family, or a named refusal identifying the missing arena form.
 fn admit_dense(what: &'static str, name: &str, ty: GgmlType) -> Result<SiteTy, GpuError> {
     if let Some(entry) = qwen3moe_dense(ty) {
         return Ok(site_ty(entry));
     }
     let msg = match kernels::dense(ty) {
         Some(entry) => format!(
-            "{name} is {ty}; its dense site reads {}, which this body's arena does not carry",
-            entry.reads().name()
+            "{name} is {ty}; its dense site reads {:?}, which this body's arena does not carry",
+            entry.reads()
         ),
         None => format!("{name} is {ty}; no dense site launches it (kernels::dense)"),
     };

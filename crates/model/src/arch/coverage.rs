@@ -16,9 +16,8 @@
 //! against the whole tree: a need any program's row covers, and a tensor type
 //! any program's pin reads, is not an item; the program itself is one.
 
-pub use bloomery_placement::accepts::{
-    Program, program_of, qwen3moe_dense, qwen35_down, qwen35_gate_up,
-};
+use bloomery_placement::accepts::qwen3moe_dense;
+pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 use bloomery_placement::kernels;
 pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
