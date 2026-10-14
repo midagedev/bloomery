@@ -928,7 +928,7 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let trained = q3place::trained_ctx(&split)
+        let trained = bloomery_gpu_gates::generate::trained_ctx(&split)
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;
         let past = (trained + 1).to_string();
         let over = plan_run(
@@ -983,7 +983,7 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let trained = q3place::trained_ctx(&split)
+        let trained = bloomery_gpu_gates::generate::trained_ctx(&split)
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;
         let trained = u64::try_from(trained)?;
         let run = plan_run(
@@ -1035,7 +1035,7 @@ mod gate {
         // server's own echo of it, by the owner the seat's search reads it
         // through.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let trained = q3place::trained_ctx(&split)
+        let trained = bloomery_gpu_gates::generate::trained_ctx(&split)
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;
         let trained = u64::try_from(trained)?;
         // Two slots on the placed load, resident on either file (the module
@@ -2862,7 +2862,7 @@ mod gate {
         // makes the load a plan the card cannot hold (the spawn never
         // listens), and one that starts a rung low is red there.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let trained = q3place::trained_ctx(&split)
+        let trained = bloomery_gpu_gates::generate::trained_ctx(&split)
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;
         let trained = u64::try_from(trained)?;
         let (st, body) = curl(&url("/props"), None, false)?;

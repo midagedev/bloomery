@@ -40,7 +40,7 @@ use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::{CTX_GRAN, Place, PlaceWhy, choose_ctx};
+use bloomery_gpu_gates::generate::{Place, PlaceWhy, choose_ctx};
 use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
@@ -65,6 +65,10 @@ static CENSUSES: AtomicUsize = AtomicUsize::new(0);
 
 /// A choice of context's probes and the census readings it took
 /// ([`serve_choice`]).
+#[allow(
+    dead_code,
+    reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reads {
     pub censuses: usize,
@@ -211,7 +215,7 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
 /// slot's share and the fixed stores once — none where they are 0; on the
 /// host, every sequence's checkpoints when they take them, through the lib's
 /// one owner ([`reserve_checkpoints`]). The one owner of a placed
-/// load's machine, so a relaid machine ([`PlaceQ3::machine_at`]) keeps the
+/// load's machine, so a relaid machine keeps the
 /// rows. The checkpoints are priced at `slot_ctx` positions a slot, the
 /// context the machine is laid for; on a media load each slot's rotation
 /// table holds as many positions.
@@ -383,35 +387,7 @@ impl PlaceQ3 {
     /// The plan at `ctx` positions under `levers` (the card budget), every
     /// refusal by name with its terms.
     pub fn plan(&self, ctx: usize, levers: &PlanLevers) -> Result<Plan<'_>, GateError> {
-        self.plan_over(&self.machine, ctx, levers)
-    }
-
-    /// [`Self::plan`] over a machine [`Self::machine_at`] relayed at another
-    /// context.
-    fn plan_over<'a>(
-        &'a self,
-        machine: &'a Machine,
-        ctx: usize,
-        levers: &PlanLevers,
-    ) -> Result<Plan<'a>, GateError> {
-        plan_inputs(&self.inputs, machine, ctx, levers)
-    }
-
-    /// The same placed load's machine at a probe's context: the place, the
-    /// inputs and the sequences this one resolved and read stay — the census
-    /// and the file's headers a context search's every probe retook before —
-    /// and the machine is relaid over the arena the context sets, the
-    /// checkpoints a slot of `slot_ctx` positions pins and, on a media load,
-    /// a slot's rotation table, its ctx-dependent terms.
-    fn machine_at(&self, arena: u64, slot_ctx: u64) -> Result<Machine, GateError> {
-        laid(
-            self.place.card_specs()?[0],
-            &self.inputs,
-            arena,
-            self.seqs,
-            slot_ctx,
-            self.media,
-        )
+        plan_inputs(&self.inputs, &self.machine, ctx, levers)
     }
 
     /// The layers the model loads ([`layers_of`]).
@@ -796,8 +772,6 @@ pub fn unplaced_qwen3_slots(
     probe.unplaced(ctx, &whole)
 }
 
-pub use bloomery_gpu_gates::generate::trained_ctx;
-
 /// What a run with `--place` unset loads, as [`unplaced_qwen3`] decides it,
 /// of a qwen35moe file under `o`: one sequence taking no checkpoints
 /// ([`unplaced_qwen35_slots`]), as the CLI's own runs do.
@@ -837,6 +811,10 @@ pub fn unplaced_qwen35_slots(
 /// file's family, `--place`, the plan's levers, the cache planes, and under
 /// `--mmproj` the media flag (every sequence holds the rotation table an
 /// image's positions rewrite) and the encoder's reserve on the stage card.
+#[allow(
+    dead_code,
+    reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
+)]
 #[derive(Clone, Copy)]
 pub struct ServeOpts<'a> {
     pub arch: Arch,
@@ -877,6 +855,10 @@ pub enum ServeLoad {
 ///
 /// # Errors
 /// The ubatch lever's refusal.
+#[allow(
+    dead_code,
+    reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
+)]
 pub fn serve_open35(ctx: usize, kv: KvQ8, media: bool) -> Result<Open35, GateError> {
     Ok(Open35 {
         ctx,
@@ -894,6 +876,10 @@ pub fn serve_open35(ctx: usize, kv: KvQ8, media: bool) -> Result<Open35, GateErr
 ///
 /// # Errors
 /// The plan's or the verdict's refusal.
+#[allow(
+    dead_code,
+    reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
+)]
 pub fn serve_load(
     (split, census): (&Split, &[DeviceInfo]),
     (total, slots): (usize, usize),
@@ -952,6 +938,10 @@ pub fn serve_load(
 ///
 /// # Errors
 /// As [`choose_ctx`].
+#[allow(
+    dead_code,
+    reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
+)]
 pub fn serve_choice(
     split: &Split,
     (set, slots): (Option<usize>, usize),
@@ -981,6 +971,10 @@ pub fn serve_choice(
 
 /// A plan's refusal as a short memory ([`Probe::Short`]), else the refusal
 /// as it stands.
+#[allow(
+    dead_code,
+    reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
+)]
 fn short_or(e: GateError) -> Result<Probe<ServeLoad>, GateError> {
     let short = e
         .downcast_ref::<q3::PlaceError>()

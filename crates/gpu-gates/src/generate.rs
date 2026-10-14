@@ -134,6 +134,12 @@ pub fn trained_ctx(file: &Split) -> Option<usize> {
         .and_then(|v| usize::try_from(v).ok())
 }
 
+/// The bounds a seat names beside the file's trained context
+/// ([`placement::ctx::CtxLimit`]): what its kernels index (`kernel`) and what
+/// its references were checked to (`verified`), each a position count and
+/// its name; `None` where the seat names none.
+pub type SeatBounds = (Option<(u64, &'static str)>, Option<(u64, &'static str)>);
+
 /// The steps every serving seat's context moves in
 /// ([`placement::ctx_ask::choose`]): the base a slot, the least rung an unset
 /// `--ctx` asks and the least share a set one searches, and [`CTX_GRAN`], the
@@ -160,7 +166,7 @@ pub const SEAT_STEPS: placement::ctx_ask::Steps = placement::ctx_ask::Steps {
 pub fn choose_ctx<P, E: Into<GateError> + std::fmt::Display>(
     file: &Split,
     (set, slots): (Option<usize>, usize),
-    (kernel, verified): (Option<(u64, &'static str)>, Option<(u64, &'static str)>),
+    (kernel, verified): SeatBounds,
     plan_at: impl FnMut(u64) -> Result<placement::ctx_ask::Probe<P>, E>,
 ) -> Result<placement::ctx_ask::Chosen<P>, GateError> {
     use placement::ctx_ask::{Ask, AskError, Limit, choose};
@@ -190,7 +196,7 @@ pub fn choose_ctx<P, E: Into<GateError> + std::fmt::Display>(
 pub fn check_set_slot(
     file: &Split,
     share: Option<usize>,
-    (kernel, verified): (Option<(u64, &'static str)>, Option<(u64, &'static str)>),
+    (kernel, verified): SeatBounds,
 ) -> Result<placement::ctx::CtxLimit, GateError> {
     let trained = file.arch_get_u64("context_length").ok_or(
         "the file states no context_length, so the context cannot be held to the model's limit",

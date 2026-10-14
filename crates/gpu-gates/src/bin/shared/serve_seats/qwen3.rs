@@ -173,7 +173,7 @@ use std::time::Instant;
 #[path = "../qwen3moe_place.rs"]
 mod q3place;
 use app::arch::qwen3moe::GEMM_FROM;
-use q3place::{PlaceQ3, Seqs};
+use q3place::Seqs;
 
 use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
