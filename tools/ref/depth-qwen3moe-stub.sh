@@ -60,7 +60,8 @@
 #                plan38 record (records.sample_line, place=a) and a load line that names no place=. The
 #                bin: arm carries that in its own output (it runs first, so LG_HEADER is empty); 6 and 4
 #                share a load, so the record is the load's header (LG_HEADER). Three ROW lines at `place a`,
-#                no FAIL. Red when the witness reads only the load line.
+#                no FAIL. The runner does not print those plan and load lines. Red when the witness reads
+#                only the load line.
 #   mtp          STUB_GEN_MTP=1, 6: the row's `mtp E(4) 2.500 = positions 10 / passes 4, kept [1, 1, 1, 1]` and
 #                its pass time from the SMOKE line, `ms/pass 12.5000 (mean_ms × steps 10 / passes 4)`.
 #   mtp-pass-ratio  STUB_GEN_MTP=1, 6 6@STUB_GEN_PASSES=5, two rounds: one `mean pass` line a label (12.5 and
@@ -1392,6 +1393,8 @@ elif want place-ran "$L" 1 '^FAIL r1 ours d=6 rc=0 \| its load line names place=
 fi
 # qwen35moe-style: plan38.place names the placement and the load line names none. The bin: arm runs
 # first (its own output; LG_HEADER still empty), then 6 and 4 share a load (the record is LG_HEADER).
+# The runner prints ROW and FAIL, not the process's plan and load lines; a load-line-only witness
+# FAILs these rows (place=none) instead of printing them.
 L=$tmp/place-plan.log
 : > "$tmp/tmp/stub-gen-place"
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_GEN_PLACE=a STUB_GEN_PLAN=1 -- "bin:$BASEBIN:6" 6 4
@@ -1401,10 +1404,7 @@ elif [ "$(paste -sd' ' - < "$tmp/tmp/stub-gen-place")" != "a a" ]; then
   fail place-plan "the processes' --place: $(paste -sd' ' - < "$tmp/tmp/stub-gen-place"), want a a (the bin: arm, then the shared load)" "$L"
 elif want place-plan "$L" 1 '^\[load\] r1 2 arm\(s\): 6 4 ' &&
   want place-plan "$L" 3 '^ROW r1 (bin:base|ours) d=[46] .* \| place a \| ' &&
-  want place-plan "$L" 0 '^FAIL ' &&
-  want place-plan "$L" 2 'plan place=a ' &&
-  want place-plan "$L" 2 '^ *load arch=stub ctx=256 ' &&
-  want place-plan "$L" 0 'load .*place='; then
+  want place-plan "$L" 0 '^FAIL '; then
   pass place-plan
 fi
 L=$tmp/place-card.log
