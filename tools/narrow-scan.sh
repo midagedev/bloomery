@@ -30,7 +30,8 @@
 # two tracks never wait on each other's dirs. A second run builds incrementally: the BASE side costs a sync and the scans
 # (no scan is cached; they run again), the HEAD side the crates the change touched. A pair belongs to this recipe alone,
 # and one run uses it at a time: a lock under ~/.cache/bloomery named by the pair, an fcntl flock on a file
-# held for the whole scan (python3's fcntl: the Mac has no flock(1)). A second run waits up to NARROW_WAIT
+# held for the whole scan (python3's fcntl: the Mac has no flock(1)). Each launch closes that fd, so a child
+# does not keep the lock after this process exits. A second run waits up to NARROW_WAIT
 # seconds, default 1800, naming the holder. The main tree's pair keeps the lock name older copies of this
 # script took for every tree: a directory there with a live pid is that older copy's lock and is refused,
 # not deleted. A dead directory is removed only while this flock is already held. NARROW_BASE_REMOTE and
@@ -260,10 +261,10 @@ stop_command() {
 remote_stop() {
   local bp k=0
   env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER BLOOMERY_REMOTE="$1" BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 \
-    "$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 &
+    "$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 9>&- &
   bp=$!
   while kill -0 "$bp" 2> /dev/null && [ "$k" -lt 150 ]; do
-    sleep 0.2
+    sleep 0.2 9>&-
     k=$((k + 1))
   done
   if kill -0 "$bp" 2> /dev/null; then
@@ -299,9 +300,9 @@ run_side() {
     src=$ROOT
   else
     src=$out/src-$name
-    rm -rf "$src"
-    mkdir -p "$src"
-    git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"
+    rm -rf "$src" 9>&-
+    mkdir -p "$src" 9>&-
+    { git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"; } 9>&-
     rc=("${PIPESTATUS[@]}")
     [ "${rc[0]}" = 0 ] && [ "${rc[1]}" = 0 ] || die 1 "git archive $rev failed (git ${rc[0]}, tar ${rc[1]})"
   fi
@@ -310,9 +311,10 @@ run_side() {
   echo "narrow-scan: $name: $rev -> $dir (bound ${bound}s)" >&2
   t0=$SECONDS
   fifo=$out/$name.build.fifo
-  rm -f "$fifo"
-  mkfifo "$fifo" || die 70 "cannot make $fifo"
-  tee "$out/$name.build.log" < "$fifo" >&2 &
+  rm -f "$fifo" 9>&-
+  mkfifo "$fifo" 9>&- || die 70 "cannot make $fifo"
+  # fd 9 is the flock. A child that inherits it holds the lock after this process exits.
+  tee "$out/$name.build.log" < "$fifo" >&2 9>&- &
   tp=$!
   # git must not find this tree's repository above the archive (box.sh stamps its HEAD into the build as the commit). Job control
   # makes the subshell the leader of a process group of its own, so a stop reaches box.sh's ssh and rsync with the one pid.
@@ -320,7 +322,7 @@ run_side() {
   (
     cd "$src" && exec env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER \
       -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S GIT_CEILING_DIRECTORIES="$out" BLOOMERY_REMOTE="$dir" \
-      ./tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out"
+      ./tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out" 9>&-
   ) > "$fifo" &
   bp=$!
   set +m
@@ -331,9 +333,9 @@ run_side() {
   rc=$?
   ACTIVE_NAME=''
   wait "$tp" 2> /dev/null
-  rm -f "$fifo" "$ACTIVE_PIDF"
+  rm -f "$fifo" "$ACTIVE_PIDF" 9>&-
   SIDE_WALL=$((SECONDS - t0))
-  [ "$rev" = worktree ] || rm -rf "$src"
+  [ "$rev" = worktree ] || rm -rf "$src" 9>&-
   case $rc in
     0) ;;
     75) echo "narrow-scan: $name: rc 75: the box is held by a sitting or a lease (contention, not failure; nothing was built): run again, BLOOMERY_BOX_WAIT=3600 waits longer" >&2 ;;
@@ -475,6 +477,73 @@ self_test() {
   mkdir "$t/lock.d" && echo 1 > "$t/lock.d/pid"
   lock_release
   [ -d "$t/lock.d" ]; ok "lock: release leaves another holder's lock" $?
+  # A child inherits fd 9, so it keeps the flock after the holder exits. The same child
+  # started with the fd closed does not. Every launch below closes it; a line that loses
+  # the close is red.
+  lock_release
+  rm -rf "$t/lock.d" "$t/lock.d.flock" "$t/sleep.pid"
+  export -f lock_take
+  bash -c 'lock_take "$1" 0 "inherit" >/dev/null 2>&1 || exit 1; sleep 30 & echo $! > "$2"; wait' _ "$t/lock.d" "$t/sleep.pid" &
+  hp=$!
+  k=0
+  while [ "$k" -lt 50 ]; do
+    [ -s "$t/sleep.pid" ] && [ "$(head -n 1 "$t/lock.d.flock" 2> /dev/null || true)" = "$hp" ] && break
+    kill -0 "$hp" 2> /dev/null || break
+    sleep 0.05
+    k=$((k + 1))
+  done
+  sp=$(cat "$t/sleep.pid" 2> /dev/null || true)
+  kill -TERM "$hp" 2> /dev/null || true
+  wait "$hp" 2> /dev/null || true
+  got=$( (lock_take "$t/lock.d" 0 "after the parent" 2>&1); echo "rc=$?")
+  grep -q "rc=75" <<< "$got" && [ -n "$sp" ] && kill -0 "$sp" 2> /dev/null
+  ok "lock: a child that inherited the fd keeps it after the holder exits" $?
+  kill -TERM "$sp" 2> /dev/null || true
+  wait "$sp" 2> /dev/null || true
+  rm -rf "$t/lock.d" "$t/lock.d.flock" "$t/sleep.pid"
+  bash -c 'lock_take "$1" 0 "closed" >/dev/null 2>&1 || exit 1; sleep 30 9>&- & echo $! > "$2"; wait' _ "$t/lock.d" "$t/sleep.pid" &
+  hp=$!
+  k=0
+  while [ "$k" -lt 50 ]; do
+    [ -s "$t/sleep.pid" ] && [ "$(head -n 1 "$t/lock.d.flock" 2> /dev/null || true)" = "$hp" ] && break
+    kill -0 "$hp" 2> /dev/null || break
+    sleep 0.05
+    k=$((k + 1))
+  done
+  sp=$(cat "$t/sleep.pid" 2> /dev/null || true)
+  kill -TERM "$hp" 2> /dev/null || true
+  wait "$hp" 2> /dev/null || true
+  lock_take "$t/lock.d" 0 "after the closed child" > /dev/null 2>&1
+  ok "lock: a child started with the fd closed does not keep it" $?
+  lock_release
+  kill -TERM "$sp" 2> /dev/null || true
+  wait "$sp" 2> /dev/null || true
+  # The strings sit in this function, so the check reads the script with this function removed.
+  body=$(awk '/^self_test\(\)/{skip=1} skip && /^}$/{skip=0; next} !skip' "$0")
+  miss=0
+  for site in \
+    'tee "$out/$name.build.log" < "$fifo" >&2 9>&- &' \
+    './tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out" 9>&-' \
+    '"$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 9>&- &' \
+    '{ git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"; } 9>&-' \
+    'split_logs "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&-' \
+    'WT_KEY1=$(worktree_key "$BASE_SHA" 9>&-)' \
+    '"$ROOT/tools/affected-gates.sh" "$AFFECTED_RANGE" --narrow "${ARGS[@]}" 9>&-' \
+    'sleep 0.2 9>&-' \
+    'rm -rf "$src" 9>&-' \
+    'mkdir -p "$src" 9>&-' \
+    'rm -f "$fifo" 9>&-' \
+    'mkfifo "$fifo" 9>&-' \
+    'rm -f "$fifo" "$ACTIVE_PIDF" 9>&-' \
+    'cat "$OUT/$side.split.err" >&2 9>&-' \
+    "'; } 9>&-)| \$({" \
+    'cat "$OUT/narrowed.txt" 9>&-' \
+    'cat "$OUT/narrowed.err" >&2 9>&-' \
+    'ptx_scan_md5=$(md5_of "$ROOT/tools/ptx-scan.sh" 9>&-)'
+  do
+    grep -qF "$site" <<< "$body" || miss=1
+  done
+  [ "$miss" = 0 ]; ok "lock: a launch while the lock is held closes fd 9" $?
   # the runner's build lines are the ptx-scan recipe's: a recipe edit that this script does not follow is red
   recipe=$(awk '/^ptx-scan /{f=1; next} f && /^[^ ]/{exit} f' "$ROOT/justfile")
   grep -qF "cargo oxide build --arch {{arch}} -- -p $PKG --features {{FEATURES}} --release --bin {{BIN}}" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds with this runner's cargo oxide line" $?
@@ -797,26 +866,26 @@ for side in base head; do
   [ "$left" -ge 60 ] || die 124 "the bound of ${BOUND}s is spent before the $side side (the base side took ${WALL_BASE}s): run again, the dirs keep their compiled crates"
   run_side "$side" "$rev" "$dir" "$OUT/runner.sh" "$OUT" "$left" "${BINS[@]}" || exit $?
   if [ "$side" = base ]; then WALL_BASE=$SIDE_WALL; else WALL_HEAD=$SIDE_WALL; fi
-  split_logs "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" > "$OUT/$side.split.err" 2>&1 || {
-    cat "$OUT/$side.split.err" >&2
+  split_logs "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&- > "$OUT/$side.split.err" 2>&1 || {
+    cat "$OUT/$side.split.err" >&2 9>&-
     die 1 "$side: the box output does not hold every scan ($OUT/$side.scan.out)"
   }
 done
 
 echo "narrow-scan: bundles each scan carried (base | head):"
 for b in "${BINS[@]}"; do
-  echo "  $b: $(sed -n 's/^ptx-scan: mod[0-9]* bundle=\([^ ]*\) .*/\1/p' "$OUT/base/$b.log" | tr '\n' ' ')| $(sed -n 's/^ptx-scan: mod[0-9]* bundle=\([^ ]*\) .*/\1/p' "$OUT/head/$b.log" | tr '\n' ' ')"
+  echo "  $b: $({ sed -n 's/^ptx-scan: mod[0-9]* bundle=\([^ ]*\) .*/\1/p' "$OUT/base/$b.log" | tr '\n' ' '; } 9>&-)| $({ sed -n 's/^ptx-scan: mod[0-9]* bundle=\([^ ]*\) .*/\1/p' "$OUT/head/$b.log" | tr '\n' ' '; } 9>&-)"
 done
 ARGS=()
 for b in "${BINS[@]}"; do ARGS[${#ARGS[@]}]=--scan; ARGS[${#ARGS[@]}]=$OUT/base/$b.log; ARGS[${#ARGS[@]}]=$OUT/head/$b.log; done
 if [ "$WORKTREE" = 1 ]; then
-  WT_KEY1=$(worktree_key "$BASE_SHA")
+  WT_KEY1=$(worktree_key "$BASE_SHA" 9>&-)
   [ "$WT_KEY1" = "$WT_KEY0" ] || die 1 "the working tree changed during the run (key $WT_KEY0 -> $WT_KEY1): the head scans and the affected list would read different content; run again with the tree still"
 fi
-"$ROOT/tools/affected-gates.sh" "$AFFECTED_RANGE" --narrow "${ARGS[@]}" > "$OUT/narrowed.txt" 2> "$OUT/narrowed.err"
+"$ROOT/tools/affected-gates.sh" "$AFFECTED_RANGE" --narrow "${ARGS[@]}" 9>&- > "$OUT/narrowed.txt" 2> "$OUT/narrowed.err"
 arc=$?
-cat "$OUT/narrowed.txt"
-cat "$OUT/narrowed.err" >&2
+cat "$OUT/narrowed.txt" 9>&-
+cat "$OUT/narrowed.err" >&2 9>&-
 {
   echo "base=$BASE_SHA"
   if [ "$WORKTREE" = 1 ]; then
@@ -829,7 +898,7 @@ cat "$OUT/narrowed.err" >&2
   echo "head_dir=$HEAD_DIR"
   echo "wall_base_s=$WALL_BASE"
   echo "wall_head_s=$WALL_HEAD"
-  echo "ptx_scan_md5=$(md5_of "$ROOT/tools/ptx-scan.sh")"
+  echo "ptx_scan_md5=$(md5_of "$ROOT/tools/ptx-scan.sh" 9>&-)"
   echo "affected_rc=$arc"
 } > "$OUT/MANIFEST"
 echo "narrow-scan: done: base side ${WALL_BASE}s, head side ${WALL_HEAD}s, affected rc $arc; scan logs and the list are under $OUT"
