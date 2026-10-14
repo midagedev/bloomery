@@ -1156,8 +1156,13 @@ arm_envs() {
   [ -z "$envs" ] || IFS=, read -r -a ARM_ENVS <<< "$envs"
   if [[ ",${A_ENV[$1]}," == *",BLOOMERY_DRAFT=dspark,"* ]]; then
     local -a extra=()
-    local lines
-    lines=$(dspark_env) || exit $?
+    # The arm's own BLOOMERY_DSPARK_MODEL, exported in the subshell only, is the path dspark_env checks
+    # ahead of the parent's draft.
+    local lines kv over=
+    for kv in "${ARM_ENVS[@]}"; do
+      case $kv in BLOOMERY_DSPARK_MODEL=*) over=$kv ;; esac
+    done
+    lines=$([ -z "$over" ] || export "$over"; dspark_env) || exit $?
     mapfile -t extra <<< "$lines"
     ARM_ENVS=("${extra[@]}" "${ARM_ENVS[@]}")
   fi
