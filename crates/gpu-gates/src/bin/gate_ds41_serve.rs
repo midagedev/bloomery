@@ -1315,7 +1315,7 @@ mod gate {
             trained: split
                 .arch_get_u64("context_length")
                 .ok_or("the file states no context_length")?,
-            // PIN(2026-10-15): the seat's limit, the trained context within
+            // PIN: the seat's limit, the trained context within
             // KERNEL_POSITIONS again (the user's decision); was CTX_MAX.
             kernel: Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")),
             verified: None,
