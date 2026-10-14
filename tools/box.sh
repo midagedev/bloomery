@@ -262,9 +262,13 @@ PY
 # calls in the `any` form (BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}), and every other script it names is one that
 # runs none, so either card's lock is the run's own; else 3090, the box's pin. A command it cannot read for certain stays
 # on 3090: the failure it blocks is the other way round, a fixture batch of `any` gates queued one after another on the
-# 3090's lane while the A6000 sits idle.
+# 3090's lane while the A6000 sits idle. A card BLOOMERY_BOX_ENV names as BLOOMERY_GATE_CARD (tools/gate-batch.sh's lane A)
+# is the lane, so the export after the lane's own never sends the job to a card its lane did not get.
 default_lane() {
-  local c=$1 rest s
+  local c=$1 rest s kv
+  for kv in ${box_env[@]+"${box_env[@]}"}; do
+    case $kv in BLOOMERY_GATE_CARD=3090 | BLOOMERY_GATE_CARD=a6000 | BLOOMERY_GATE_CARD=both) echo "${kv#*=}"; return ;; esac
+  done
   case $c in
     *'cargo oxide run'* | *'cargo oxide test'* | *'cargo run'* | *'gate.sh --oxide'* | *target/release/* | *./target/*) echo 3090; return ;;
   esac

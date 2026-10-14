@@ -2241,7 +2241,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("box.sh"),
         "Mac side, with `BLOOMERY_BOX_QUEUE=1`: the queue lane of the job, `3090`, `a6000`, `both`, \
          `any` (the daemon picks a card; the job reads it from `$SIGNALBOX_CARD`) or `none`. Unset: \
-         `BLOOMERY_CARD`, else `3090`; both set to different values is refused.",
+         `BLOOMERY_CARD`, else the card a `BLOOMERY_GATE_CARD` entry of `BLOOMERY_BOX_ENV` names, else `any` for a \
+         command whose every device run is an `any`-form `tools/gpu-gate.sh` call, else `3090`; both set to \
+         different values is refused.",
     ),
     runner(
         "BLOOMERY_Q_CLASS",
