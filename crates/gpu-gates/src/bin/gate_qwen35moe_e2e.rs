@@ -828,8 +828,8 @@ mod gate {
     /// was dumped from it, so the gate runs [`text_run`] and holds no move
     /// proof against the oracle file's literals.
     fn text_file() -> Result<bool, GateError> {
-        Ok(tier::Tier::from_env()? == tier::Tier::Real
-            && cfg().path != std::path::Path::new(MODEL))
+        let real = tier::Tier::from_env()? == tier::Tier::Real;
+        Ok(real && cfg().path != std::path::Path::new(MODEL))
     }
 
     /// The move proof: each value the header gives, beside the literal the
