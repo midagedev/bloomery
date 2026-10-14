@@ -217,6 +217,9 @@ dispatch=(
   # Hparams::read refuses a non-deepseek41v file by name, and the delimiter names and the card
   # figure it reads are the tower's own.
   'crates/gpu-gates/src/ds41_media.rs use'
+  # The Qwen3.6 fixture's shape (q36_fixture, the e2e gate's census) names its layers by the header's own kind
+  # (qwen35moe::hparams::Kind), the one owner of that fact, not a copy.
+  'crates/gpu-gates/src/q36_fixture.rs use'
   # The vision seat's one table that maps a projector type (`clip.projector_type`) to its host crate's module: the ids
   # its span carries, the text rope it needs, the row width and the image-token cap are that module's own facts.
   'crates/gpu-gates/src/vision_seat.rs use'
