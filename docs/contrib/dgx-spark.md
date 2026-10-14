@@ -35,13 +35,13 @@ budget solver.
 | Phase | Done when | State (2026-10-13) | Left, and who |
 |---|---|---|---|
 | **P0** compiles on aarch64 | `cargo check` of the host chain passes on aarch64 Linux, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | done: [#14](https://github.com/midagedev/bloomery/pull/14), `d95c7ec9` (design R: `qdot` refuses its host-tier types off x86, answer 1) | nothing (the site map is Appendix A) |
-| **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`86022f32`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the unpublished fixture-tier inputs (maintainers, answer 18); a gate for the first cc 12.1 bit pass (section 10) |
+| **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`86022f32`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the V4.1 DSpark draft fixture, still unpublished (only a draft reader refuses, [#159](https://github.com/midagedev/bloomery/pull/159)). `glm5next/corpus-prose.ids`, `engram/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` are on the refset dataset since 2026-10-14 ([#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6168041480)). The first cc 12.1 pass is section 6 |
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
 | **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6) | nothing |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
 | **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words | the placement half's engine side: a remote node's census, the card plans each node's budget comes from, and decode at n = N (contributor, answer 20; section 10); the protocol half, started by the contributor with the `Link` seam and the counter relay (section 9.5, item 2) on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828); the transport and the N = 2 run are left |
 
-Files the open work touches: P1, the fixture-tier inputs; P4, the card's gather kernels that read the arena in
+Files the open work touches: P1, the unpublished V4.1 DSpark draft fixture; P4, the card's gather kernels that read the arena in
 `crates/gpu/src/host/nvtier.rs` (the card leg); P5, `crates/placement` (`Machine`, `nodes_scale`),
 `crates/gpu/src/host/link.rs` and `link/pump.rs` (the `Link` seam and the counter relay) and the transport (9.5).
 
@@ -305,11 +305,21 @@ The card runs the tree's `sm_86` PTX through the driver's JIT. `sm_121` PTX was 
   driver's `cuOccupancyMaxActiveBlocksPerMultiprocessor` for all 551 entries of the three binaries at `sm_121`.
 - **Bit gates.** The memo concludes the bit gates have no generation dependence by structure (they compare against oracle
   files) and names two residual risks: `ptxas` contracting `.rn`-less mul-then-add differently, and the `ex2.approx`-class
-  approximate instructions in about 30 places (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L198, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md#L10-L16). The proof is
-  one bit-gate pass on the Spark (`gate-gpu-e2e`'s count pin and the card family gates). ~~The repo has only ever run
-  cc 8.6~~ The box has only ever run cc 8.6 (`tools/recipes.py:1960`: "both cards here are sm_86"). On GB10 the
-  contributor list defers `gate-gpu-e2e` as real-file, so the first bit-gate pass on cc 12.1 is still open
-  ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
+  approximate instructions in about 30 places (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L198, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md#L10-L16). ~~The proof is
+  one bit-gate pass on the Spark (`gate-gpu-e2e`'s count pin and the card family gates).~~ `gate-gpu-e2e` needs V2-Lite's
+  ik greedy and argmax sets, which are not public, so the contributor list still defers it as real-file. The first pass
+  on cc 12.1 is the fixture-tier family e2e gates ([#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6158672937),
+  answer 2): `gate-gpu-glm5next-e2e` now that `glm5next/corpus-prose.ids` is published, `gate-gpu-qwen4exp-e2e` after
+  Julian's tier-check fix ([#148](https://github.com/midagedev/bloomery/pull/148)), and `gate-gpu-ds41-step` after the
+  `ref-paths.sh` change ([#159](https://github.com/midagedev/bloomery/pull/159)). Against the `fx_` sets they hold bands,
+  an argmax inside a tie band, and exact routing ids. `gate-gpu-ds41-step` checks engram row ids, and routed expert ids
+  except near ties. `gate-gpu-qwen4exp-e2e` checks the ik-routed walk's expert ids, and zero refused flips. Their
+  bit-for-bit clauses compare our own runs (eager against replay, a rerun, and layer by layer). They do not show that
+  cc 12.1 gives the same bits as cc 8.6. ~~The repo has only ever run cc 8.6~~ The box has only ever run cc 8.6
+  (`tools/recipes.py:2498` at `3d750af3`: "both cards here are sm_86"). A green fixture pass shows no gross error.
+  The logits-row diff
+  in [#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6159465373) against a 3090 run of the same commit
+  and fixture closes that bits question. `gate-gpu-e2e` on cc 12.1 can come later.
 - **Device pick.** The real-tier gate plan opens the card by the names in `CARDS` and refuses any other card by name
   (`crates/gpu-gates/src/bin/shared/gate_card.rs:8-9, 38-47`: "none of this workstation's cards"). The fixture tier plans on
   `--place a`, "the largest visible card as the device reports itself" (`gate_card.rs:4-6`) and is not affected. The real
@@ -1072,9 +1082,8 @@ Where the gate holds a clause differently from its words below, the clause says 
 Each open item; the owner is named where one is agreed. An item that a measurement closed is in the list after it.
 
 **P1 and the card.**
-- The unpublished fixture-tier inputs, which hold most of the contributor list's reds: the
-  maintainers (answer 18, section 1).
-- Which gate carries the first bit-gate pass on cc 12.1 (asked of the maintainers, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
+- The V4.1 DSpark draft fixture stays unpublished: no public file has its header. Only a gate that runs the draft
+  refuses, after [#159](https://github.com/midagedev/bloomery/pull/159), so `gate-gpu-ds41-step` opens without it.
 - Which `llc` a build names ([#54](https://github.com/midagedev/bloomery/issues/54), section 6).
 
 **P4.**
@@ -1126,6 +1135,12 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 - Whether to take tensor parallel first instead of (a) is the maintainers' decision (9.4).
 
 **Closed.**
+- ~~`glm5next/corpus-prose.ids`, `engram/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` unpublished~~ on the refset
+  dataset since 2026-10-14 ([#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6168041480), section 1).
+- ~~Which gate carries the first bit-gate pass on cc 12.1~~ (asked in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
+  The fixture-tier gates in section 6 carry it. They prove bands, a tie-band argmax and exact routing ids, not bits
+  against cc 8.6. The logits-row diff in [#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6159465373)
+  against a 3090 run closes the bits question.
 - ~~LLVM 21 and `sm_121` PTX~~ ([#42](https://github.com/midagedev/bloomery/issues/42), section 6).
 - ~~Per-arch `ptx-shapes.tsv` rows, so `gate-ptx-spill` can read `sm_121` PTX~~: the cc 12.1 tables (section 6).
 - ~~the host-tier protocol's correctness on Arm~~ (its spin sites, Appendix A; [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)).
