@@ -224,6 +224,9 @@ blk_leverarms() { tool_selftest ref/lever-arms.sh; }
 # slots-arm.sh is the depth runners' aggregate arm (<arm>@BLOOMERY_GEN_SLOTS=N): its N, its plain twin, the
 # environment's refusal, its time pass and residency clauses and the plain tables' labels, no box.
 blk_slotsarm() { tool_selftest ref/slots-arm.sh; }
+# bin-label.sh is the depth runners' bin: row label (the tree's basename) and the refusal of two
+# binaries that would share it: the stem and the refusal on fixed paths, no box.
+blk_binlabel() { tool_selftest ref/bin-label.sh; }
 # lcpp-warm.sh is the depth runners' llama-server arms: its flag translation (against V4.1's LCPP_CLI_FLAGS),
 # its refusals, the context, the --help probe and a stub server's start, requests, checks and stop (python3
 # and curl, 127.0.0.1) are tested here, no box.
@@ -856,7 +859,7 @@ proc_leg_gpu() {
 proc_leg
 unset CPU_GUARD_PROC_LEG
 
-BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
+BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do

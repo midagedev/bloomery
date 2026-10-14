@@ -114,7 +114,8 @@
 #            references.
 #   bin:<path>:<D>[@NAME=VALUE[,NAME=VALUE...]]  a second generate_ds41 (an absolute path on the box, a
 #            base tree's build) at depth D with those variables set, row label `bin:<basename of its
-#            tree>` (the tree is the path above `target/`), plus `@NAME=VALUE[,...]` when given. It is a
+#            tree>` (the tree is the path above `target/`, or the binary's directory when the path has
+#            none), plus `@NAME=VALUE[,...]` when given. It is a
 #            base by construction, so its freshness is not asked; its tree line (sha256, HEAD, dirty
 #            files) is printed with the references'. Its arms share loads as ours do (Loads below).
 #   bin:<path>:prose:<P>[@…], bin:<path>:code:<P>[@…]  the second binary fed the corpus's first P ids, as a
@@ -149,8 +150,11 @@
 #            needing the residency on (`rc=residency`).
 # Every label is its own engine in the per-arm means and in the ratio table (ours / each other label,
 # the corpus labels excepted; <corpus> / each <corpus>@ label, and each label on that corpus, in that
-# corpus's tables). A bin: arm with variables is also paired with this binary's arm on the same prompt with
-# the same variables (their order aside) — `prose@X=1` / `bin:<tree>@prose@X=1`, `ours@X=1` /
+# corpus's tables). A label two arms share while their binaries differ is refused by name before anything
+# runs: the label stays `bin:<basename of its tree>` and the per-arm means key on it, so the rows would be
+# one engine. The same binary at two depths keeps the label; the depth is the mean's other key.
+# A bin: arm with variables is also paired with this binary's arm on the same prompt with the same
+# variables (their order aside) — `prose@X=1` / `bin:<tree>@prose@X=1`, `ours@X=1` /
 # `bin:<tree>@X=1` — in the across-binaries tables (`ratio xbin <corpus or ours> d=`, `ratio pp xbin …
 # p=`), each round's pair as in the others; a bin: arm with variables and no such arm says so there. A
 # dry run prints the pairs.
@@ -871,6 +875,15 @@ ds41_self_test() {
   want parse-twin 0 \
     "[parse] prose:4@place=gate,BLOOMERY_GEN_SLOTS=2: kind=corpus depth=4 label=prose@place=gate,BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=$bin|place=gate|BLOOMERY_GEN_SLOTS=2 slots=2 feed=8 twin=prose@place=gate ids=100..107" \
     "[parse] bin:/root/r/t/target/release/generate_ds41:prose:4@BLOOMERY_GEN_SLOTS=2: kind=bin depth=4 label=bin:t@prose@BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=/root/r/t/target/release/generate_ds41|place=a|BLOOMERY_GEN_SLOTS=2 slots=2 feed=8 twin=bin:t@prose ids=100..107"
+  # Two bin: arms in one directory (no `target/` segment) would both take that directory's basename.
+  # The label stays the basename, and a label is one engine, so the share is refused before a run.
+  # The same binary at two depths keeps the label.
+  run_parse -- bin:/root/r/b1ab/b1:6 bin:/root/r/b1ab/base:6
+  want parse-bin-label 64 "shares the label 'bin:b1ab' with arm 'bin:/root/r/b1ab/b1:6'"
+  run_parse -- bin:/root/r/t/target/release/generate_ds41:6 bin:/root/r/t/target/release/generate_ds41:512
+  want parse-bin-depths 0 \
+    "[parse] bin:/root/r/t/target/release/generate_ds41:6: kind=bin depth=6 label=bin:t env=- load=/root/r/t/target/release/generate_ds41|place=a|" \
+    "[parse] bin:/root/r/t/target/release/generate_ds41:512: kind=bin depth=512 label=bin:t env=- load=/root/r/t/target/release/generate_ds41|place=a|"
   run_parse -- 6@BLOOMERY_GEN_SLOTS=x
   want parse-count 64 "BLOOMERY_GEN_SLOTS=x is no slot count"
   run_parse -- prose:500@BLOOMERY_GEN_SLOTS=2
@@ -1000,6 +1013,10 @@ arm_refuse() {
 PLACE_RUNNER=depth-ds41.sh PLACE_BIN=generate_ds41 PLACE_WORDS='a gate bp'
 # shellcheck source=tools/ref/arm-place.sh
 source "${BASH_SOURCE[0]%/*}/arm-place.sh" || exit 2
+# A bin: arm's label (`bin:<basename of its tree>`) and the refusal of two binaries that would share
+# it: tools/ref/bin-label.sh, shared with depth-qwen3moe.sh.
+# shellcheck source=tools/ref/bin-label.sh
+source "${BASH_SOURCE[0]%/*}/bin-label.sh" || exit 2
 # arm_envs_ok <arm> <NAME=VALUE list>: the list is one or more NAME=VALUE, no spaces or commas in a value.
 arm_envs_ok() {
   local -a kv
@@ -1083,9 +1100,7 @@ for a in "${ARMS[@]}"; do
       case " $CORPORA " in *" ${bin##*:} "*) ids=${bin##*:} bin=${bin%:*} ;; esac
       case $bin in /*) ;; *) arm_usage "$a" ;; esac
       case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
-      tree=${bin%/target/*}
-      [ "$tree" != "$bin" ] || tree=${bin%/*}
-      label=bin:${tree##*/}${ids:+@$ids}${AT:+@$AT}
+      label=$(bin_label_stem "$bin")${ids:+@$ids}${AT:+@$AT}
       arm_slots "$a" "$envs"
       if [ -n "$ids" ]; then
         corpus_check "$a" "$ids" "$((dep * ${ASLOTS:-1}))" "${ASLOTS:+$ASLOTS slots × $dep}"
@@ -1138,6 +1153,9 @@ for a in "${ARMS[@]}"; do
   A_AT+=("$AT")
   if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
+# A label two arms share while their binaries differ is one engine in the per-arm means (the header's
+# bin:). Refused by name before a run.
+bin_labels_ok
 # The load keys (the header's Loads): an ours, corpus or bin: arm's binary, placement and variables, the
 # solo marker left out; `|solo` on an arm that runs alone. A reference or server arm has none, and neither
 # has a bin: arm that runs alone: it runs the one-arm command line (ours_arm).
@@ -1394,8 +1412,7 @@ for i in "${!ARMS[@]}"; do
   [ -x "$gb" ] || { echo "depth-ds41.sh: arm '${ARMS[$i]}': no binary at $gb" >&2; exit 2; }
   case $bin_seen in *" $gb "*) continue ;; esac
   bin_seen+="$gb "
-  t=${gb%/target/*}
-  [ "$t" != "$gb" ] || t=${gb%/*}
+  t=$(bin_tree "$gb")
   BIN_LINES+=("bin:${t##*/}: $(tree_line "$gb" "$t")")
 done
 ref_witness() {
@@ -1528,8 +1545,8 @@ arm_block() {
     ours) echo ours ;;
     corpus) echo "${A_ENG[$1]}" ;;
     *)
-      local t=${A_BIN[$1]%/target/*}
-      [ "$t" != "${A_BIN[$1]}" ] || t=${A_BIN[$1]%/*}
+      local t
+      t=$(bin_tree "${A_BIN[$1]}")
       echo "bin:${t##*/}${A_IDS[$1]:+@${A_IDS[$1]}}"
       ;;
   esac

@@ -143,7 +143,8 @@
 #            corpus with fewer than P + N + 3 ids (the binary's draft window).
 #   bin:<path>:<D>  a second generate_qwen3moe (an absolute path on the box, a base tree's build) at
 #             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
-#             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
+#             tree is the path above `target/`, or the binary's directory when the path has none).
+#             Beside a plain `<D>` arm it is the same-lease A/B of
 #             two builds. bin:<path>:prose:<P> feeds it the prose arms' prompt, row label
 #             `bin:<tree>@prose`, in the prose table beside `prose:<P>`. bin:<path>:<D or prose:<P>>
 #             @NAME=VALUE[,NAME=VALUE...] sets those variables for that build's process: the same
@@ -156,7 +157,10 @@
 #             (<D>@BLOOMERY_GEN_SLOTS=N above). It is a base by construction, so its freshness is not
 #             asked; its tree line (sha256, HEAD, dirty files) is printed with the references'. Every
 #             label is its own engine in the per-arm means and in the ratio table (ours / each other
-#             label; an aggregate label in the slots tables instead).
+#             label; an aggregate label in the slots tables instead). Two arms that would share one
+#             label and run different binaries are refused by name before anything runs: the label
+#             stays the tree's basename, which those means key on, so the rows would be one engine.
+#             The same binary at two depths keeps the label; the depth is the mean's other key.
 #   ik:<D>    ik: llama-bench -p 0 -n 0 -gp D,N -r 1 $IK_GPU_FLAGS (D = 0: plain tg N). The D-token
 #             prefill runs first and untimed: ik restarts its clock after it.
 #   ikdef:<D> the same at $IK_GPU_DEFAULT_FLAGS: llama-bench's own defaults with every layer on the
@@ -1040,6 +1044,15 @@ q3_self_test() {
   run_parse BLOOMERY_DATA="$pt/data" -- prose:4 bin:/root/r/t/target/release/generate_qwen3moe:prose:4
   want prose-bin 0 \
     "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:4: kind=bin depth=4 label=bin:t@prose env=- load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
+  # Two bin: arms in one directory (no `target/` segment) would both take that directory's basename.
+  # The label stays the basename, and a label is one engine, so the share is refused before a run.
+  # The same binary at two depths keeps the label.
+  run_parse -- bin:/root/r/b1ab/b1:6 bin:/root/r/b1ab/base:6
+  want bin-label-shared 64 "shares the label 'bin:b1ab' with arm 'bin:/root/r/b1ab/b1:6'"
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6 bin:/root/r/t/target/release/generate_qwen3moe:512
+  want bin-label-depths 0 \
+    "[parse] bin:/root/r/t/target/release/generate_qwen3moe:6: kind=bin depth=6 label=bin:t env=- load=(a process of its own)" \
+    "[parse] bin:/root/r/t/target/release/generate_qwen3moe:512: kind=bin depth=512 label=bin:t env=- load=(a process of its own)"
   run_parse BLOOMERY_DATA="$pt/data" -- bin:/root/r/t/release/generate_qwen3moe:prose
   want prose-bin-nop 64 "bin:<path>:prose:<P> takes a prompt length P after prose:"
   run_parse BLOOMERY_DATA="$pt/data" -- bin:/root/r/t/release/generate_qwen3moe:prose:900
@@ -1298,6 +1311,10 @@ esac
 SLOTS_RUNNER=depth-qwen3moe.sh
 # shellcheck source=tools/ref/slots-arm.sh
 source "${BASH_SOURCE[0]%/*}/slots-arm.sh" || exit 2
+# A bin: arm's label (`bin:<basename of its tree>`) and the refusal of two binaries that would share
+# it: tools/ref/bin-label.sh, shared with depth-ds41.sh.
+# shellcheck source=tools/ref/bin-label.sh
+source "${BASH_SOURCE[0]%/*}/bin-label.sh" || exit 2
 # The aggregate arm's lever is an arm's own: set here it would reach every ours arm, whose plain rows would
 # read a per stream rate under the label `ours`.
 slots_env_check
@@ -1678,9 +1695,7 @@ for a in "${ARMS[@]}"; do
         arm_refuse "$a" "bin:<path>:prose:<P> takes a prompt length P after prose:"
       fi
       case $bin in /*) ;; *) arm_usage "$a" ;; esac
-      tree=${bin%/target/*}
-      [ "$tree" != "$bin" ] || tree=${bin%/*}
-      label=bin:${tree##*/}
+      label=$(bin_label_stem "$bin")
       if [ -n "$corpus" ]; then
         case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
         label+=@prose
@@ -1772,6 +1787,9 @@ for a in "${ARMS[@]}"; do
   # An ours or bin: arm's placement: its place=, else BLOOMERY_GEN_PLACE (empty: no --place, the binary's a).
   if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
+# A label two arms share while their binaries differ is one engine in the per-arm means (the header's
+# bin:). Refused by name before a run.
+bin_labels_ok
 # A capped arm's process evicts its file's pages first (the header's Mem), so the warm rows' prime would warm
 # nothing and every capped row would end FAIL rc=cold: the two are refused together, by name.
 if [ "$WARM_ROWS" = 1 ]; then
@@ -2036,8 +2054,7 @@ for i in "${!ARMS[@]}"; do
   [ "${A_KIND[$i]}" = bin ] || continue
   b=${A_BIN[$i]}
   [ -x "$b" ] || { echo "depth-qwen3moe.sh: arm '${ARMS[$i]}': no binary at $b" >&2; exit 2; }
-  t=${b%/target/*}
-  [ "$t" != "$b" ] || t=${b%/*}
+  t=$(bin_tree "$b")
   BIN_LINES+=("${A_LABEL[$i]}: $(tree_line "$b" "$t")")
 done
 # A lever arm's variables are the binary's to take (at_main refuses a lever it does not act on, a value its kind
