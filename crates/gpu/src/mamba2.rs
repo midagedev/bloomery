@@ -74,11 +74,13 @@
 //!   `fl(fl(scale·gain)·y)`.
 //!
 //! No silent failure: state other than 128, a conv of other than 4 taps, a
-//! geometry that does not divide and a buffer too short are refused by name
-//! at enqueue, before any launch. A `y` that is not finite — a non-finite
-//! input, a state that stopped being finite, a norm whose mean square is not
-//! finite — raises [`FaultSite::Mamba2Scan`], and a norm group holding one
-//! normalizes to NaN, never a plausible value.
+//! geometry that does not divide, a buffer too short and a non-finite norm
+//! epsilon are refused by name at enqueue, before any launch. A non-finite
+//! `dt`, bias, `A` or `D` makes `σ` non-finite, so the scan raises
+//! [`FaultSite::Mamba2Scan`] instead of writing a finite `y`. A `y` that is
+//! not finite — a non-finite input, a state that stopped being finite, a
+//! norm whose mean square is not finite — raises the same site, and a norm
+//! group holding one normalizes to NaN, never a plausible value.
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::linear::{CONV_TAPS, RING_ROWS, ring_input, silu};
@@ -274,7 +276,16 @@ mod mamba2_kernels {
             )
         };
         let dtv = dt_h + bias_h;
-        let sigma = if dtv <= 20.0 { dtv.exp().ln_1p() } else { dtv };
+        // A non-finite parameter becomes a non-finite sigma, so the scan
+        // faults instead of writing a finite y (σ of −∞ would be 0).
+        let fin = crate::fault::quad_finite([dt_h, bias_h, a_h, d_h]) & dtv.is_finite();
+        let sigma = if !fin {
+            f32::NAN
+        } else if dtv <= 20.0 {
+            dtv.exp().ln_1p()
+        } else {
+            dtv
+        };
         let decay = mul_rn_f32(sigma, a_h).exp();
 
         // SAFETY: lane + 96 + 128 < STAGED; written before the barrier above.
@@ -590,8 +601,9 @@ impl Mamba2Kernels {
     /// Enqueue one decode token of one layer ([`StepArgs`], module doc):
     /// `n_head · ⌈head_dim / 16⌉` blocks of 128 threads, the ring and the
     /// state read and written in place. Refuses a state other than 128, a
-    /// conv other than 4 taps, widths that do not divide and a buffer too
-    /// short by name, launching nothing. One launch. Asynchronous,
+    /// conv other than 4 taps, widths that do not divide, a buffer too
+    /// short and a non-finite norm epsilon by name, launching nothing. One
+    /// launch. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_step(&self, stream: &CudaStream, args: StepArgs<'_>) -> Result<(), GpuError> {
         let what = "mamba2::enqueue_step";
@@ -616,6 +628,10 @@ impl Mamba2Kernels {
             scratch,
         } = args;
         shape.check(what)?;
+        // +∞ epsilon makes the norm's scale 0, a finite y and no fault.
+        if norm.is_some() && !eps.is_finite() {
+            return Err(GpuError::shape(what, "norm eps must be finite"));
+        }
         let (inner, heads, groups) = (shape.d_inner, shape.n_head, shape.n_group);
         let conv_dim = shape.conv_dim();
         let lens = [

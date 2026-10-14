@@ -24,16 +24,17 @@
 //!    equality holds, and `y` and the final state are held to the band below.
 //!    The ring stays exact.
 //! 3. refuse: state 96 and 256, a conv of 3 taps, a group count that does not
-//!    divide the heads and a short buffer are refused by name at enqueue,
-//!    nothing launched (the output keeps its poison, the fault word stays
-//!    clean).
-//! 4. fault: a NaN in `x`, in `B` and an infinity in `z` each raise
-//!    `Mamba2Scan` at the launch's layer and leave the norm group they sit in
-//!    entirely non-finite, never a plausible `y`; every other group is the
-//!    clean launch's bits. Clean launches raise nothing.
-//! 5. replay: one captured graph, replayed over three tokens whose inputs and
-//!    position word are rewritten between replays, equals the eager run bit
-//!    for bit (`y` of every token, the ring, the state).
+//!    divide the heads, a short buffer and a non-finite norm epsilon are
+//!    refused by name at enqueue, nothing launched (the output keeps its
+//!    poison, the fault word stays clean).
+//! 4. fault: a NaN in `x`, in `B`, an infinity in `z`, a non-finite `dt` and
+//!    a non-finite `A` each raise `Mamba2Scan` at the launch's layer and
+//!    leave the norm group they sit in entirely non-finite, never a
+//!    plausible `y`; every other group is the clean launch's bits. Clean
+//!    launches raise nothing.
+//! 5. replay: the capture is one node. Replayed over three tokens whose
+//!    inputs and position word are rewritten between replays, it equals the
+//!    eager run bit for bit (`y` of every token, the ring, the state).
 //! 6. shape: the entry compiles with no local depot.
 //!
 //! The band of clause 2. Write `u = 2^-24` and `ε = 2u = 2^-23`, one ulp at
@@ -821,6 +822,38 @@ mod gate {
         };
         named.push(format!("short state={}", verdict(short)));
         ok &= short;
+        // +∞ epsilon would make the norm scale 0. Refused before a launch.
+        let eps_inf = {
+            let e =
+                cx.k.enqueue_step(
+                    cx.gpu.stream(),
+                    StepArgs {
+                        shape: SHAPE,
+                        xbc: &dev.xbc,
+                        dt: &dev.dt,
+                        dt_bias: &dev.dt_bias,
+                        z: &dev.z,
+                        a: &dev.a,
+                        d: &dev.d,
+                        conv_w: &dev.conv_w,
+                        conv_b: &dev.conv_b,
+                        norm: Some(&dev.norm),
+                        eps: f32::INFINITY,
+                        pos: &dev.pos,
+                        pos_at: 0,
+                        fault: cx.gpu.layer_sink(LAYER)?,
+                        y: &mut dev.y,
+                        ring: &mut dev.ring,
+                        state: &mut dev.state,
+                        scratch: &mut dev.scratch,
+                    },
+                )
+                .err();
+            let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
+            matches!(e, Some(GpuError::Shape { .. })) && text.contains("norm eps must be finite")
+        };
+        named.push(format!("eps inf={}", verdict(eps_inf)));
+        ok &= eps_inf;
         let y = dev.read_y(cx)?;
         let untouched = y.iter().all(|v| v.to_bits() == POISON);
         ok &= untouched && clean(cx, "refuse")?;
@@ -870,6 +903,10 @@ mod gate {
         let mut t = tok.clone();
         t.z[5 * WIDTH + 1] = f32::INFINITY;
         plants.push(("inf in z", t, 5));
+        // −∞ dt: softplus would be 0 and the scan would stay finite.
+        let mut t = tok.clone();
+        t.dt[0] = f32::NEG_INFINITY;
+        plants.push(("-inf dt", t, 0));
         for (label, t, g) in plants {
             let got = run(&mut dev, &t)?;
             let f = cx.gpu.take_fault()?;
@@ -894,6 +931,33 @@ mod gate {
             );
             ok &= pass;
         }
+        // −∞ A on head 0, the weight buffer. Restored after the plant.
+        let mut a = w.a.clone();
+        a[0] = f32::NEG_INFINITY;
+        dev.a.copy_from_host(cx.gpu.stream(), &a)?;
+        let got = run(&mut dev, &tok)?;
+        dev.a.copy_from_host(cx.gpu.stream(), &w.a)?;
+        let f = cx.gpu.take_fault()?;
+        let all_bad = group(&got.y[0], 0).iter().all(|v| !v.is_finite());
+        let mut others = true;
+        for o in 1..GROUPS {
+            others &= bits_equal(group(&got.y[0], o), group(&base.y[0], o));
+        }
+        let pass = f == want && all_bad && others;
+        let shown = f.map_or("none".to_owned(), |f| {
+            format!(
+                "layer {} {}",
+                f.layer,
+                f.site().map_or("?", FaultSite::name)
+            )
+        });
+        println!(
+            "fault -inf A: raised {shown} (want layer {LAYER} {}), group 0 non-finite \
+             {all_bad}, other groups the clean bits {others} {}",
+            FaultSite::Mamba2Scan.name(),
+            verdict(pass)
+        );
+        ok &= pass;
         Ok(ok)
     }
 
@@ -929,7 +993,11 @@ mod gate {
             .count();
         let same_ring = bits_equal(&ring, &eager.ring);
         let same_state = bits_equal(&scan, &eager.scan);
-        let pass = same_y == toks.len() && same_ring && same_state && clean(cx, "replay")?;
+        let pass = graph.node_count() == 1
+            && same_y == toks.len()
+            && same_ring
+            && same_state
+            && clean(cx, "replay")?;
         println!(
             "replay: nodes={} y bit-identical to eager {same_y}/{} ring {same_ring} state \
              {same_state} {}",
@@ -962,9 +1030,10 @@ mod gate {
              where the device library is not asked for a value libm gives differently (four \
              tokens, with and without the gain, and from the sequence start; the ring exact) and \
              within the derived band where it is; state 96 and 256, a conv of 3 taps, a group \
-             count that does not divide and a short buffer refused by name; a NaN in x or B and an \
-             infinity in z raise mamba2_scan and leave their norm group non-finite and the other \
-             groups the clean bits; a captured graph replays three tokens bit for bit as eager; \
+             count that does not divide, a short buffer and a non-finite norm eps refused by name; \
+             a NaN in x or B, an infinity in z, a non-finite dt and a non-finite A raise \
+             mamba2_scan and leave their norm group non-finite and the other groups the clean \
+             bits; a captured graph is one node and replays three tokens bit for bit as eager; \
              no local depot"
         );
         Ok(())
