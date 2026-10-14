@@ -128,7 +128,8 @@ impl Tokenizer {
                             unicode::encode_cpt(cpt, &mut word);
                         }
                         at += n;
-                        self.bpe.word(&word, &mut bpe, &mut out);
+                        self.bpe
+                            .word(&word, &mut bpe, &mut out, &self.vocab.token_to_id);
                     }
                 }
             }

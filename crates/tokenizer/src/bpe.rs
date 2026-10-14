@@ -37,9 +37,6 @@ pub(crate) struct Bpe {
     merges: HashMap<(u32, u32), (u32, u32)>,
     /// Merges whose sides or result are not tokens (reported, not needed).
     pub(crate) merges_off_vocab: usize,
-    /// Token text (the GPT-2 byte encoding) to its id, built only when the
-    /// pre-tokenizer takes a word that is a token whole; empty otherwise.
-    token_of: HashMap<Vec<u8>, u32>,
     ignore_merges: bool,
 }
 
@@ -60,8 +57,7 @@ impl Interner {
 
 impl Bpe {
     /// `ignore_merges`: a word whose byte-encoded text is a token is that
-    /// token ([`Bpe::word`]). Without it the token map stays empty, so the
-    /// load does not copy every token text.
+    /// token ([`Bpe::word`]), found in the vocabulary's own lookup.
     pub(crate) fn new(texts: &[String], merges: &[String], ignore_merges: bool) -> Bpe {
         let n_tokens = u32::try_from(texts.len()).expect("the vocabulary loader bounds the count");
         let mut interner = Interner {
@@ -106,14 +102,6 @@ impl Bpe {
             let id = interner.ids.get(&[b as u8][..]).copied().unwrap_or(NONE);
             if id < n_tokens { id } else { NONE }
         });
-        let mut token_of = HashMap::new();
-        if ignore_merges {
-            token_of.reserve(texts.len());
-            for (i, t) in texts.iter().enumerate() {
-                let id = u32::try_from(i).expect("the vocabulary loader bounds the count");
-                token_of.insert(t.as_bytes().to_vec(), id);
-            }
-        }
         Bpe {
             n_tokens,
             byte_iid,
@@ -121,27 +109,39 @@ impl Bpe {
             one_byte_token,
             merges: table,
             merges_off_vocab: off_vocab,
-            token_of,
             ignore_merges,
         }
     }
 
     /// The token whose text is the GPT-2 byte encoding of `word`, if the
     /// vocabulary has that text.
-    fn whole_token(&self, word: &[u8], s: &mut Scratch) -> Option<u32> {
+    fn whole_token(
+        &self,
+        word: &[u8],
+        s: &mut Scratch,
+        tokens: &HashMap<String, u32>,
+    ) -> Option<u32> {
         s.encoded.clear();
         for &b in word {
             s.encoded.extend_from_slice(&self.byte_text[b as usize]);
         }
-        self.token_of.get(&s.encoded).copied()
+        tokens
+            .get(std::str::from_utf8(&s.encoded).expect("the GPT-2 byte alphabet is valid UTF-8"))
+            .copied()
     }
 
     /// Append the tokens of one word (raw bytes, before the GPT-2 byte
     /// encoding) to `out`. Under `ignore_merges` a word whose byte-encoded
     /// text is a token is that token.
-    pub(crate) fn word(&self, word: &[u8], s: &mut Scratch, out: &mut Vec<u32>) {
+    pub(crate) fn word(
+        &self,
+        word: &[u8],
+        s: &mut Scratch,
+        out: &mut Vec<u32>,
+        tokens: &HashMap<String, u32>,
+    ) {
         if self.ignore_merges
-            && let Some(id) = self.whole_token(word, s)
+            && let Some(id) = self.whole_token(word, s, tokens)
         {
             out.push(id);
             return;
@@ -244,11 +244,12 @@ mod tests {
     /// `ignore_merges` it is that token, otherwise its bytes' tokens.
     #[test]
     fn ignore_merges_takes_a_whole_token_no_merge_reaches() {
-        let texts = ["a", "b", "ab"].map(String::from);
+        let texts = ["Ġ", "a", "Ġa"].map(String::from);
+        let tokens = texts.iter().cloned().zip(0u32..).collect();
         let ids = |ignore_merges: bool| {
             let bpe = Bpe::new(&texts, &[], ignore_merges);
             let (mut s, mut out) = (Scratch::default(), Vec::new());
-            bpe.word(b"ab", &mut s, &mut out);
+            bpe.word(b" a", &mut s, &mut out, &tokens);
             out
         };
         assert_eq!(ids(true), [2]);
