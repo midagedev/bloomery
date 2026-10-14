@@ -1019,7 +1019,7 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
     let on_tier = places.iter().filter(|&&p| p != HOST).count();
     tier.hit(layer, on_tier as u64);
     {
-        let g = tier.gpu();
+        let g = tier.gpu()?;
         g.context().bind_to_thread()?;
         // SAFETY: the set's activations and places are not written again
         // before its upload, which waits for this service's event, recorded
@@ -1030,7 +1030,7 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
         }
         g.enqueue_quantize_q8_1_cols(stage_x, act, cols, layer)?;
     }
-    let copied = match tier.block_rows() {
+    let copied = match tier.block_rows()? {
         BlockRows::Staged => cols * s,
         BlockRows::Packed => on_tier,
     };
@@ -1044,7 +1044,7 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
             down: &mut *y,
         },
     )?;
-    let stream = tier.gpu().stream();
+    let stream = tier.gpu()?.stream();
     if copied > 0 {
         // SAFETY: `rows_len` is the rows' allocation's length (their window
         // spans all of it); the stage card reads them only after the host
@@ -1059,20 +1059,24 @@ impl<H: HostExperts> HostTier<H> {
     /// The batch port's tier legs, once the host tier holds both the port
     /// ([`HostTier::prepare_batch`]) and its expert tiers: per tier and set
     /// the places, the rows and the tier's event, and the tier card's staging
-    /// ([`BatchPort::attach_tier`]). Nothing without a tier; made once.
-    /// Load-time or first-prompt only; what it holds is checked against the
-    /// plan by [`HostTier::check_tier_reserves`].
+    /// ([`BatchPort::attach_tier`]). Nothing without a tier, and nothing
+    /// with a tier on a node, whose prompt batch [`HostTier::begin_group`]
+    /// refuses; made once. Load-time or first-prompt only; what it holds is
+    /// checked against the plan by [`HostTier::check_tier_reserves`].
     pub fn prepare_tier_batch(&mut self) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::prepare_tier_batch";
         let stage = Arc::clone(self.step.boundary.region.context());
         let Some(port) = self.port.as_mut() else {
             return Ok(());
         };
-        if self.tiers.is_empty() || !port.tiers.is_empty() {
+        if self.tiers.is_empty()
+            || !port.tiers.is_empty()
+            || self.tiers.iter().any(|t| t.node().is_some())
+        {
             return Ok(());
         }
         for tier in &self.tiers {
-            let r = port.attach_tier(&stage, tier.gpu());
+            let r = port.attach_tier(&stage, tier.gpu()?);
             let back = stage.bind_to_thread();
             r?;
             back.map_err(|e| GpuError::shape(WHAT, format!("rebinding the stage context: {e}")))?;
@@ -1088,9 +1092,13 @@ impl<H: HostExperts> HostTier<H> {
     /// places against the host's [`TIER_BATCH_HOST_RESERVE`] row. A card list
     /// that is not one card a tier, a missing row, a row named twice, or a
     /// difference is refused by name, naming the reserve. Load-time only, once
-    /// [`HostTier::prepare_batch`] has made the legs.
+    /// [`HostTier::prepare_batch`] has made the legs. With a tier on a node no
+    /// leg is made ([`HostTier::prepare_tier_batch`]) and none is checked.
     pub fn check_tier_reserves(&self, machine: &Machine, cards: &[usize]) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::check_tier_reserves";
+        if self.tiers.iter().any(|t| t.node().is_some()) {
+            return Ok(());
+        }
         if self.tiers.is_empty() || cards.len() != self.tiers.len() {
             return Err(GpuError::shape(
                 WHAT,
@@ -1120,7 +1128,7 @@ impl<H: HostExperts> HostTier<H> {
                 card.name.as_str(),
                 &card.reserves,
                 TIER_BATCH_RESERVE,
-                port.tier_device_bytes(i) + t.block_bytes(),
+                port.tier_device_bytes(i) + t.block_bytes()?,
             ));
         }
         rows.push((
@@ -1365,8 +1373,8 @@ impl<H: HostExperts> HostTier<H> {
         }
         let stage = Arc::clone(self.step.boundary.region.context());
         let mut words = [None; MAX_TIERS];
-        for (w, t) in words.iter_mut().zip(&self.tiers) {
-            let r = t.gpu().fault();
+        for (w, t) in words.iter_mut().zip(&mut self.tiers) {
+            let r = t.card_fault();
             let back = stage.bind_to_thread();
             *w = r?;
             back?;

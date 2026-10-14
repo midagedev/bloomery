@@ -351,7 +351,7 @@ pub fn open_slots(
         hp: inputs.hp.clone(),
         levers: cfg.body,
     };
-    let tiers = TierOpen::of_machine(plan.machine);
+    let tiers = TierOpen::of_machine(plan.machine)?;
     Body::open_placed_slots(file, &plan, 0, tiers, &meta, slots)
 }
 
@@ -2626,7 +2626,7 @@ fn open_tier(
     map: &SlotMap,
     card_dontneed: bool,
 ) -> Result<TierCard, GpuError> {
-    let gpu = Gpu::open_card(&t.name, t.device)?;
+    let gpu = t.open_here("deepseek41 open_tier")?;
     let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
     let set = TierSet::of_map(map, tier)?;
     let experts = Ds41Tier::new(&gpu, hp, &set, &w)?;

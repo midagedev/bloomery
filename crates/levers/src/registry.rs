@@ -45,6 +45,7 @@ pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
 pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
 pub const NVTIER_MEM: &str = "BLOOMERY_NVTIER_MEM";
 pub const TIER_LINK: &str = "BLOOMERY_TIER_LINK";
+pub const TIER_NODES: &str = "BLOOMERY_TIER_NODES";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
@@ -355,6 +356,24 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               one machine (`weekly-gpu-ds41-lost` runs the V4.1 tier gate over it), and the pump \
               spins on one core while the load lives. Read where the host tier takes its tier \
               cards.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: TIER_NODES,
+        class: Class::C,
+        kind: Kind::Addrs,
+        default: Unset::Means("every expert tier card is a card of the loading process"),
+        doc: "Where a placed load's expert tiers run: the address of each tier's node, in the \
+              plan's tier order, one a tier, where a `tier_server` process serves that tier's \
+              card over its control channel. The tier page is then a file under `/dev/shm`, \
+              which both processes map, so the node must share this host's memory (two \
+              processes on one machine): an address off this host is refused, and the channel \
+              has no authentication. The plan takes each tier card from its node's census. \
+              Qwen3.8's load opens a tier on a node; the other families refuse one by name. \
+              Read where a load takes its tier cards.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

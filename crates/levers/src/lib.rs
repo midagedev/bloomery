@@ -26,6 +26,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 mod registry;
@@ -36,7 +37,7 @@ pub use registry::{
     LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
     NVTIER_BYTES, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
     PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN,
-    STEP_STATS, THREADS, TIER_LINK,
+    STEP_STATS, THREADS, TIER_LINK, TIER_NODES,
 };
 pub use registry::{SPLIT_WALK, XSTREAM};
 
@@ -110,6 +111,10 @@ pub(crate) enum Kind {
     /// `off`, or the adaptive residency rule's `mid-p<P>-s<S>`
     /// ([`residency_word`]).
     Residency,
+    /// Loopback socket addresses (`IP:port`), comma-separated, at least
+    /// one, none twice: the tier page a node reaches is this host's memory,
+    /// and the channel has no authentication.
+    Addrs,
 }
 
 /// Why [`whole`] refused a number.
@@ -201,6 +206,22 @@ impl Kind {
                 }
                 None => Err(refused(None)),
             },
+            Kind::Addrs => {
+                let mut addrs: Vec<SocketAddr> = Vec::new();
+                for a in v.split(',') {
+                    let a: SocketAddr = a.parse().map_err(|_| refused(None))?;
+                    if !a.ip().is_loopback() {
+                        return Err(refused(Some(
+                            "an address off this host: a tier node shares this host's memory",
+                        )));
+                    }
+                    if addrs.contains(&a) {
+                        return Err(refused(Some("an address is given twice")));
+                    }
+                    addrs.push(a);
+                }
+                Ok(Value::Addrs(addrs))
+            }
             Kind::Path | Kind::File | Kind::Text => Err(refused(None)),
         }
     }
@@ -236,6 +257,10 @@ impl Kind {
                  whole number ({DIGITS})"
             ),
             Kind::Text => "what its owner takes".to_string(),
+            Kind::Addrs => {
+                "loopback IP:port socket addresses, comma-separated, at least one, none twice"
+                    .to_string()
+            }
             Kind::Residency => {
                 format!(
                     "off, or mid-p<P>-s<S>, optionally ending in -unhosted, with P and S whole \
@@ -314,6 +339,8 @@ pub(crate) enum Value {
     Path(PathBuf),
     /// A [`Kind::FileAt`] path and offset.
     PathAt(PathBuf, u64),
+    /// A [`Kind::Addrs`] list, in the order given.
+    Addrs(Vec<SocketAddr>),
 }
 
 /// What an unset name means.
@@ -628,6 +655,9 @@ pub(crate) enum Scope<'a> {
     /// How the tier page crosses ([`tier_link`]), read where the host tier
     /// takes its tier cards, below every binary's `main`.
     TierLink,
+    /// The expert tiers' nodes ([`tier_nodes`]), read where a load takes its
+    /// tier cards, below every binary's `main`.
+    TierNodes,
 }
 
 /// The levers of `scope` over `env`, every name once — the last of a name
@@ -649,6 +679,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
         name == HOST_ROOM || name == NVTIER_BYTES || name == NVTIER_READ || name == NVTIER_MEM
     };
     let link = |name: &str| name == TIER_LINK;
+    let nodes = |name: &str| name == TIER_NODES;
     let mut entries = Vec::new();
     let mut refused = Vec::new();
     for row in REGISTRY {
@@ -659,6 +690,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
                         pool(row.name)
                             || nvtier(row.name)
                             || link(row.name)
+                            || nodes(row.name)
                             || acts_on.contains(&row.name)
                     }
                     Scope::Every => true,
@@ -668,6 +700,8 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
                     Scope::NvTier => continue,
                     Scope::TierLink if link(row.name) => true,
                     Scope::TierLink => continue,
+                    Scope::TierNodes if nodes(row.name) => true,
+                    Scope::TierNodes => continue,
                 };
                 match (get(row.name), scope) {
                     (Some(v), Scope::Main { bin, .. }) if !acts => refused.push(Refusal {
@@ -2541,6 +2575,20 @@ pub fn tier_link() -> Result<TierLink, LeverError> {
         None | Some(Value::Word("shared")) => Ok(TierLink::Shared),
         Some(Value::Word("loopback")) => Ok(TierLink::Loopback),
         v => panic!("{TIER_LINK} holds {v:?}, not shared or loopback"),
+    }
+}
+
+/// `BLOOMERY_TIER_NODES` from the process environment ([`TIER_NODES`]),
+/// parsed as [`at_main`] parses it, and refused when it is set to a value its
+/// kind does not take and when a retired name is set: the address of each
+/// expert tier's node, in tier order; empty when unset. Nothing else.
+pub fn tier_nodes() -> Result<Vec<SocketAddr>, LeverError> {
+    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let levers = read(&env, Scope::TierNodes)?;
+    match &levers.entry(TIER_NODES).value {
+        None => Ok(Vec::new()),
+        Some(Value::Addrs(a)) => Ok(a.clone()),
+        v => panic!("{TIER_NODES} holds {v:?}, not socket addresses"),
     }
 }
 

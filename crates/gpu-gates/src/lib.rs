@@ -144,6 +144,11 @@ pub fn ref_model_path() -> Result<PathBuf, GateError> {
 
 pub use refset::data_dir;
 
+/// The binary `name` beside the running one.
+pub fn beside(name: &str) -> Result<PathBuf, GateError> {
+    Ok(std::env::current_exe()?.with_file_name(name))
+}
+
 /// The first `n` ids of `$BLOOMERY_DATA/<dir>/corpus-prose.ids`: text ids of the real tokenizer,
 /// which a fixture's embedding table holds the rows of.
 ///

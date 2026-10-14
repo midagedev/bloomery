@@ -209,6 +209,11 @@ pub enum GpuError {
         bound: std::time::Duration,
         note: String,
     },
+    /// The link to an expert tier on another node failed
+    /// ([`host::node`]): its control channel closed, timed out or carried
+    /// what the protocol does not, or the file its page is shared through
+    /// could not be made or opened. A tier lost this way is a lost card.
+    Link { what: &'static str, detail: String },
 }
 
 impl GpuError {
@@ -248,6 +253,14 @@ impl GpuError {
     /// `detail`.
     pub(crate) fn protocol(what: &'static str, detail: impl Into<String>) -> GpuError {
         GpuError::Protocol {
+            what,
+            detail: detail.into(),
+        }
+    }
+
+    /// The link to a tier node `what` uses failed, as `detail` says.
+    pub(crate) fn link(what: &'static str, detail: impl Into<String>) -> GpuError {
+        GpuError::Link {
             what,
             detail: detail.into(),
         }
@@ -504,6 +517,7 @@ impl std::fmt::Display for GpuError {
                 f,
                 "{what}: an earlier hybrid service failed and released the stream: {poison}"
             ),
+            GpuError::Link { what, detail } => write!(f, "{what}: {detail}"),
             GpuError::Stalled {
                 what,
                 waited,

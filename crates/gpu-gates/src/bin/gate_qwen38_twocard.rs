@@ -118,6 +118,10 @@ fn main() -> std::process::ExitCode {
 mod q38_arch;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/q38_history.rs"]
+mod q38_history;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::Path;
     use std::time::Instant;
@@ -126,7 +130,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, SplitWalk, Store38Host};
     use bloomery_gpu::host::swap::{PassReport, Residency};
-    use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet};
+    use bloomery_gpu::host::tier::TierSet;
     use bloomery_gpu::host::xstream::XMode;
     use bloomery_gpu::host::{PassKind, PoisonKind};
     use bloomery_gpu::hybrid::Chain;
@@ -150,15 +154,15 @@ mod gate {
     };
     use refset::arch::qwen4exp::MODEL;
     use runtime::swaprule::KeptRows;
-    use runtime::{Out, Target, Verify, Want};
+    use runtime::{Out, Target, Want};
+
+    use crate::q38_history::{
+        self, PROMPT, Run, TIER_LAYER_NODES, same, step, tier_graphs_and_chains, tier_layers,
+    };
 
     const NAME: &str = "gate_qwen38_twocard";
     /// The stores' positions, `gate_qwen38_residency`'s.
     const CTX: usize = 3072;
-    /// Prompt positions, fed one decode step each.
-    const PROMPT: usize = 32;
-    /// Greedy steps before the verifies and after them.
-    const STEPS: usize = 24;
     /// The prompt call's ids under `--union` and `--residency`: one ubatch
     /// at [`CTX`].
     const PROMPT_U: usize = 600;
@@ -177,12 +181,6 @@ mod gate {
     const REAL_BUDGET_GIB: u64 = 26;
     /// The go deadline and the grace a lost card is named within, plus room.
     const LOST_BOUND_S: f64 = 25.0;
-    /// Nodes of a tier graph a tier layer, nine: the go wait, the
-    /// activation's and the places' copies in, the card leg's four launches
-    /// into the tier card's rows, the rows' copy out to the page, the signal.
-    const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(TierAct::F32, 4);
-    // PIN(2026-10-06): 8 -> 9, the rows' copy out; launches storing into the page held 385 against 433.
-    const _: () = assert!(TIER_LAYER_NODES == 9);
     /// Nodes of a stage graph a layer with a host leg, two: the go and the
     /// wait, stream memory-operation batches ([`Shape::memops`]). A load with
     /// no residency machine and no route trace runs a layer with every routed
@@ -370,8 +368,8 @@ mod gate {
             Some(t) => format!(
                 ", tier {} experts on {} ({} B)",
                 t.set().experts(),
-                t.gpu().device_name()?,
-                t.weights().resident_bytes()
+                t.gpu()?.device_name()?,
+                t.resident_bytes()
             ),
             None => ", no tier".to_string(),
         };
@@ -388,82 +386,10 @@ mod gate {
         Ok(s)
     }
 
-    /// Every token and logits row a history read, in order, its stage graph
-    /// nodes (the step's, then each verify width's), and the flips that
-    /// landed over it.
-    #[derive(Default)]
-    struct Run {
-        tokens: Vec<u32>,
-        logits: Vec<Vec<f32>>,
-        stage_nodes: Vec<usize>,
-        landed: usize,
-    }
-
-    /// The verify windows: their rows and the rows each keeps.
-    const WINDOWS: [(usize, usize); 6] = [(4, 2), (3, 3), (2, 1), (4, 4), (2, 2), (3, 1)];
-
-    /// One greedy step of `next`, its token and row into `run`.
-    fn step(s: &mut Session<Body38>, run: &mut Run, next: u32) -> Result<u32, GateError> {
-        let out = s.step(next, Want::Logits)?;
-        let Out::Logits { argmax, row } = out else {
-            return Err("a step asked for its logits gave the argmax alone".into());
-        };
-        run.tokens.push(argmax);
-        run.logits.push(row.to_vec());
-        Ok(argmax)
-    }
-
-    /// A verify of `M` rows — `next`, then `fill`'s ids — committed at
-    /// `keep`: every row's token and logits into `run`; the next token, the
-    /// last kept row's argmax.
-    fn window<const M: usize>(
-        s: &mut Session<Body38>,
-        run: &mut Run,
-        next: u32,
-        fill: &[u32],
-        keep: usize,
-    ) -> Result<u32, GateError> {
-        let mut rows = [next; M];
-        rows[1..].copy_from_slice(&fill[..M - 1]);
-        let out = s.verify::<M>(rows)?;
-        run.tokens.extend_from_slice(&out);
-        run.logits.extend(s.model().rows_logits::<M>()?);
-        s.commit(keep)?;
-        Ok(out[keep - 1])
-    }
-
-    /// The history (module doc) from a clear.
+    /// The history (`q38_history`) from a clear, with the flips that landed
+    /// over it.
     fn history(s: &mut Session<Body38>, ids: &[u32]) -> Result<Run, GateError> {
-        s.clear()?;
-        take_passes(s)?;
-        let mut run = Run::default();
-        let mut next = 0;
-        for &id in &ids[..PROMPT] {
-            next = step(s, &mut run, id)?;
-        }
-        for _ in 0..STEPS {
-            next = step(s, &mut run, next)?;
-        }
-        let mut at = PROMPT;
-        for (m, keep) in WINDOWS {
-            let fill = &ids[at..];
-            next = match m {
-                2 => window::<2>(s, &mut run, next, fill, keep)?,
-                3 => window::<3>(s, &mut run, next, fill, keep)?,
-                _ => window::<4>(s, &mut run, next, fill, keep)?,
-            };
-            at += m;
-        }
-        for _ in 0..STEPS {
-            next = step(s, &mut run, next)?;
-        }
-        let m = s.model();
-        run.stage_nodes = vec![
-            m.step_graph_nodes()?.len(),
-            m.rows_graph_nodes::<2>()?.len(),
-            m.rows_graph_nodes::<3>()?.len(),
-            m.rows_graph_nodes::<4>()?.len(),
-        ];
+        let mut run = q38_history::history(s, ids, |s| take_passes(s).map(drop))?;
         run.landed = take_passes(s)?.iter().map(|(_, r)| r.landed).sum();
         Ok(run)
     }
@@ -472,41 +398,6 @@ mod gate {
     fn take_passes(s: &mut Session<Body38>) -> Result<Vec<(PassKind, PassReport)>, GateError> {
         let (_, _, b) = s.model_mut().body_parts(NAME)?;
         Ok(b.take_residency_passes())
-    }
-
-    /// Whether `got` is `want` bit for bit; prints the first difference.
-    fn same(what: &str, want: &Run, got: &Run) -> bool {
-        if want.tokens != got.tokens {
-            let at = want
-                .tokens
-                .iter()
-                .zip(&got.tokens)
-                .position(|(a, b)| a != b);
-            println!(
-                "FAIL {what}: tokens apart at {at:?} ({} and {} tokens)",
-                got.tokens.len(),
-                want.tokens.len()
-            );
-            return false;
-        }
-        for (i, (w, g)) in want.logits.iter().zip(&got.logits).enumerate() {
-            let first = w
-                .iter()
-                .zip(g)
-                .position(|(a, b)| a.to_bits() != b.to_bits());
-            if w.len() != g.len() || first.is_some() {
-                println!("FAIL {what}: logits row {i}: first logit apart {first:?}");
-                return false;
-            }
-        }
-        let ok = want.logits.len() == got.logits.len();
-        println!(
-            "{} {what}: {} tokens, {} logits rows bit for bit the reference's",
-            if ok { "ok" } else { "FAIL" },
-            got.tokens.len(),
-            got.logits.len()
-        );
-        ok
     }
 
     /// The top-1 margin of `row`: its largest value less its second.
@@ -521,14 +412,6 @@ mod gate {
             }
         }
         a - b
-    }
-
-    /// The tier layers: the plan's layers with a tier expert.
-    fn tier_layers(plan: &Plan<'_>) -> Vec<usize> {
-        plan.tier_n_l
-            .first()
-            .map(|t| (0..t.len()).filter(|&l| t[l] > 0).collect())
-            .unwrap_or_default()
     }
 
     /// `--union`'s structure and precondition lines over the tier load `s`
@@ -570,40 +453,8 @@ mod gate {
             .tiers()
             .first()
             .ok_or("the load holds no tier")?;
-        let want_tier = Some(TIER_LAYER_NODES * t + 1);
-        let graphs: Vec<Option<usize>> =
-            [Chain::Step, Chain::Cols(2), Chain::Cols(3), Chain::Cols(4)]
-                .iter()
-                .map(|&c| tier.graph_nodes(c))
-                .collect();
-        let graphs_ok = graphs.iter().all(|&g| g == want_tier);
-        println!(
-            "structure: the tier's graphs of the step and the 2, 3, 4-column verifies hold {graphs:?} \
-             nodes, {TIER_LAYER_NODES} a tier layer and the fault copy ({want_tier:?}): {}",
-            verdict(graphs_ok)
-        );
-        ok &= graphs_ok;
+        ok &= tier_graphs_and_chains(tier, t);
         let st = tier.stats();
-        // The history's passes: the steps, then one verify a window; its
-        // chains: the step's and one a distinct window width. Each chain's
-        // first pass is fed and its graph captured after it.
-        let mut widths: Vec<usize> = WINDOWS.iter().map(|w| w.0).collect();
-        widths.sort_unstable();
-        widths.dedup();
-        let chains = 1 + widths.len() as u64;
-        let passes = (PROMPT + 2 * STEPS + WINDOWS.len()) as u64;
-        let replay_ok = (st.feeds, st.captures, st.replays) == (chains, chains, passes - chains);
-        println!(
-            "structure: the tier's chains fed {} and captured {} times, replayed {} times; each of \
-             the history's {chains} chains fed and captured once, its {passes} passes' others \
-             replayed ({chains}, {chains}, {}): {}",
-            st.feeds,
-            st.captures,
-            st.replays,
-            passes - chains,
-            verdict(replay_ok)
-        );
-        ok &= replay_ok;
         let first = tier.set().layers().start;
         let hits = |l: usize| st.layer_hits.get(l - first).copied().unwrap_or(0);
         let missing: Vec<usize> = layers.iter().copied().filter(|&l| hits(l) == 0).collect();
@@ -766,8 +617,8 @@ mod gate {
         let flags = {
             let body = m.body(NAME)?;
             let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
-            let flags = HostFlags::new(tier.gpu().context(), 1)?;
-            flags.enqueue_wait(tier.gpu().stream(), 0)?;
+            let flags = HostFlags::new(tier.gpu()?.context(), 1)?;
+            flags.enqueue_wait(tier.gpu()?.stream(), 0)?;
             flags
         };
         let t0 = Instant::now();
@@ -816,7 +667,7 @@ mod gate {
             .tiers()
             .first()
             .ok_or("no tier card")?
-            .gpu()
+            .gpu()?
             .stream()
             .synchronize()?;
         m.gpu().stream().synchronize()?;
@@ -1347,7 +1198,7 @@ mod gate {
                  columns a row",
                 t0.elapsed().as_secs_f64(),
                 tier.set().experts(),
-                tier.gpu().device_name()?,
+                tier.gpu()?.device_name()?,
                 tier.cols()
             );
             Ok(m)

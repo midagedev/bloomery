@@ -287,7 +287,7 @@ mod gate {
             .tiers()
             .first()
             .ok_or("the (b′) load holds no tier card")?;
-        let tier_device = tier.gpu().device_name()?;
+        let tier_device = tier.gpu()?.device_name()?;
         if !tier_device.contains(tier_card) {
             return Err(format!("the tier opened on {tier_device}, not the {tier_card}").into());
         }
@@ -297,7 +297,7 @@ mod gate {
             m.gpu().device_name()?,
             m.resident_bytes(),
             tier.set().experts(),
-            tier.weights().resident_bytes(),
+            tier.resident_bytes(),
             workstation::RTX_3090.name,
         );
         Ok(o)
@@ -773,8 +773,8 @@ mod gate {
         let flags = {
             let body = m.body(NAME)?;
             let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
-            let flags = HostFlags::new(tier.gpu().context(), 1)?;
-            flags.enqueue_wait(tier.gpu().stream(), 0)?;
+            let flags = HostFlags::new(tier.gpu()?.context(), 1)?;
+            flags.enqueue_wait(tier.gpu()?.stream(), 0)?;
             flags
         };
         let t0 = Instant::now();
@@ -825,7 +825,7 @@ mod gate {
             .tiers()
             .first()
             .ok_or("no tier card")?
-            .gpu()
+            .gpu()?
             .stream()
             .synchronize()?;
         m.gpu().stream().synchronize()?;

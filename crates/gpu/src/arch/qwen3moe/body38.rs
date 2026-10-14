@@ -1481,7 +1481,7 @@ impl Body38 {
         let wide_hsum = DeviceBuffer::zeroed(stream, ub * geo::HIDDEN)?;
         let host_cols = ub.max(PASS_ROWS);
         let run = 0..n;
-        let tiers = TierOpen::of_machine(plan.machine);
+        let tiers = TierOpen::of_machine(plan.machine)?;
         let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
         let map = SlotMap::of_plan_tiers(plan, 0, &tier_cards, run.clone(), geo::EXPERTS)?;
         let card_leg = MapCheck::of(&map, !tiers.is_empty())?;

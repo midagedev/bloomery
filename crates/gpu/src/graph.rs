@@ -14,6 +14,7 @@
 use crate::GpuError;
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DriverError, sys};
 use std::ffi::c_void;
+use std::os::unix::fs::OpenOptionsExt;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -480,7 +481,9 @@ fn in_place_flags(integrated: bool) -> u32 {
 /// [`MappedHost::read_in_place`] on an integrated device): the host reaches
 /// it at `host`, kernels, copies and stream memory operations at `dev`, from
 /// every context of the process. Zeroed by [`MappedHost::new`], freed on
-/// drop. The one owner of mapped host memory: the host flags
+/// drop. Or a shared file's mapping registered the same way
+/// ([`MappedHost::shared_file`]), which another process that maps the file
+/// reaches too. The one owner of mapped host memory: the host flags
 /// ([`HostFlags`]) and the host tier's page are views over it. Its owner
 /// keeps every stream and graph that addresses it from running past the
 /// drop: it drains the stream, drops the graph first, or ends the process
@@ -492,11 +495,15 @@ pub struct MappedHost {
     /// The context that allocated the page: held so it outlives the
     /// allocation, and bound when the page is freed, as cuda-core's owners do.
     ctx: Arc<CudaContext>,
+    /// The shared file's mapping, unmapped after the drop unregisters it;
+    /// `None` for the driver's own allocation.
+    file: Option<memmap2::MmapMut>,
 }
 
-// SAFETY: the allocation is owned by this value alone and freed once, in its
-// drop; the host pointer is plain process memory any thread may reach, and
-// every access to it goes through the methods below.
+// SAFETY: this value alone frees or unregisters the allocation, once, in its
+// drop (a shared file's other process holds its own mapping and
+// registration); the host pointer is plain process memory any thread may
+// reach, and every access to it goes through the methods below.
 unsafe impl Send for MappedHost {}
 // SAFETY: a host access through `&self` is an atomic word
 // ([`MappedHost::atomic_u32`]) or a plain read of bytes the protocol that
@@ -567,7 +574,110 @@ impl MappedHost {
             dev,
             bytes,
             ctx: Arc::clone(ctx),
+            file: None,
         })
+    }
+
+    /// The `bytes` of the file at `path` (under `/dev/shm`, so host memory)
+    /// mapped shared and registered as `ctx`'s mapped host memory
+    /// (`cuMemHostRegister` with `PORTABLE | DEVICEMAP`): this process
+    /// reaches them as it reaches [`MappedHost::new`]'s, and every other
+    /// process that maps the file reaches the same bytes. With `create` the
+    /// file is made `bytes` long and zeroed, and a file already at `path` is
+    /// refused; without, the file must be `bytes` long. `bytes` is a whole
+    /// number of host pages, as registration takes. `what` names the page in
+    /// an error. A file made here is readable and writable by its user alone,
+    /// and is removed again when the call fails. Load-time only.
+    pub(crate) fn shared_file(
+        ctx: &Arc<CudaContext>,
+        path: &std::path::Path,
+        bytes: usize,
+        create: bool,
+        what: &'static str,
+    ) -> Result<MappedHost, GpuError> {
+        if bytes == 0 || !bytes.is_multiple_of(SHARED_PAGE) {
+            return Err(GpuError::shape(
+                what,
+                format!("a shared page of {bytes} bytes: a whole number of {SHARED_PAGE}"),
+            ));
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(create)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| GpuError::link(what, format!("{}: {e}", path.display())))?;
+        let r = MappedHost::map_file(ctx, &file, path, bytes, create, what);
+        if r.is_err() && create {
+            drop(std::fs::remove_file(path));
+        }
+        r
+    }
+
+    /// [`MappedHost::shared_file`] once `file`, at `path`, is open.
+    fn map_file(
+        ctx: &Arc<CudaContext>,
+        file: &std::fs::File,
+        path: &std::path::Path,
+        bytes: usize,
+        create: bool,
+        what: &'static str,
+    ) -> Result<MappedHost, GpuError> {
+        let io = |e: std::io::Error| GpuError::link(what, format!("{}: {e}", path.display()));
+        if create {
+            file.set_len(bytes as u64).map_err(io)?;
+        }
+        let len = file.metadata().map_err(io)?.len();
+        if len != bytes as u64 {
+            return Err(GpuError::link(
+                what,
+                format!("{} holds {len} bytes, the page {bytes}", path.display()),
+            ));
+        }
+        // SAFETY: the process that made the file and the one that opened it
+        // reach its bytes only through their registered mappings, by the
+        // page's protocol (atomic words, and spans one side writes before the
+        // word that hands them over). The file is made by its user alone
+        // (mode 0600) under a name a tier server opens alone; that no other
+        // process of that user maps it is assumed, not enforced.
+        let mut map = unsafe { memmap2::MmapMut::map_mut(file) }.map_err(io)?;
+        let host = map.as_mut_ptr();
+        ctx.bind_to_thread()?;
+        // SAFETY: the context is current on this thread (bound above);
+        // `host` is the start of a live, page-aligned mapping of `bytes`
+        // bytes, which outlives the registration (the drop unregisters it
+        // before the map goes).
+        let rc = unsafe {
+            sys::cuMemHostRegister_v2(
+                host.cast(),
+                bytes,
+                sys::CU_MEMHOSTREGISTER_PORTABLE | sys::CU_MEMHOSTREGISTER_DEVICEMAP,
+            )
+        };
+        cu(rc, what)?;
+        let mut dev: sys::CUdeviceptr = 0;
+        // SAFETY: `host` is the registered mapping just made; the flags must
+        // be 0.
+        let rc = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, host.cast(), 0) };
+        if let Err(e) = cu(rc, "cuMemHostGetDevicePointer_v2") {
+            // SAFETY: `host` was registered above and is unregistered once,
+            // here.
+            unsafe { sys::cuMemHostUnregister(host.cast()) };
+            return Err(e);
+        }
+        Ok(MappedHost {
+            host,
+            dev,
+            bytes,
+            ctx: Arc::clone(ctx),
+            file: Some(map),
+        })
+    }
+
+    /// Bytes of the allocation.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// The device address of byte `off`, which the caller's layout keeps
@@ -635,14 +745,25 @@ impl Drop for MappedHost {
         // Freed under the context that allocated it, not whichever context
         // the thread last bound; an error is kept on that context.
         self.ctx.record_err(self.ctx.bind_to_thread());
-        // SAFETY: `host` came from cuMemHostAlloc and is freed once, here,
-        // after every stream operation and graph that names it (the owner's
-        // contract on the type); the engine declares its graphs before the
-        // bodies that own the views over it.
-        let rc = unsafe { sys::cuMemFreeHost(self.host.cast()) };
+        let rc = match self.file {
+            // SAFETY: `host` is the mapping `shared_file` registered, whose
+            // map is dropped after this body; it is unregistered once, here,
+            // after every stream operation and graph that names it (the
+            // owner's contract on the type).
+            Some(_) => unsafe { sys::cuMemHostUnregister(self.host.cast()) },
+            // SAFETY: `host` came from cuMemHostAlloc and is freed once, here,
+            // after every stream operation and graph that names it (the
+            // owner's contract on the type); the engine declares its graphs
+            // before the bodies that own the views over it.
+            None => unsafe { sys::cuMemFreeHost(self.host.cast()) },
+        };
         self.ctx.record_err(driver(rc));
     }
 }
+
+/// The unit a shared page's bytes come in ([`MappedHost::shared_file`]): a
+/// whole number of host pages on every host the engine runs on.
+pub(crate) const SHARED_PAGE: usize = 1 << 16;
 
 // ------------------------------------------------------ stream memory ops
 

@@ -553,6 +553,14 @@ name = "gate_qwen38_twocard"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen38_nodes"
+required-features = ["gpu"]
+
+[[bin]]
+name = "tier_server"
+required-features = ["gpu"]
+
+[[bin]]
 name = "generate"
 required-features = ["gpu"]
 

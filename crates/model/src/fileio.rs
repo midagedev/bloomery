@@ -56,5 +56,14 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// Lowercase hex sha256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+    sha256_hex_of([bytes])
+}
+
+/// Lowercase hex sha256 of `parts`, one after another.
+pub fn sha256_hex_of<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut sha = Sha256::new();
+    for p in parts {
+        sha.update(p);
+    }
+    hex(&sha.finalize())
 }

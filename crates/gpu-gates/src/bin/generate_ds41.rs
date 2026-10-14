@@ -1210,7 +1210,7 @@ mod drive {
             hp: inputs.hp.clone(),
             levers: args.cfg.open.body,
         };
-        let tiers = TierOpen::of_machine(plan.machine);
+        let tiers = TierOpen::of_machine(plan.machine)?;
         let mut m = Body::open_placed_slots(file, &plan, 0, tiers, &meta, slots)?;
         m.set_mode(args.mode);
         log.load(&m)?;

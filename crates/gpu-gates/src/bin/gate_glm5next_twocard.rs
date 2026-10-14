@@ -330,7 +330,7 @@ mod gate {
             .tiers()
             .first()
             .ok_or("the (b′) load holds no tier card")?;
-        let tier_device = tier.gpu().device_name()?;
+        let tier_device = tier.gpu()?.device_name()?;
         if !tier_device.contains(workstation::RTX_3090.name) {
             return Err(format!(
                 "the tier opened on {tier_device}, not the {}",
@@ -344,7 +344,7 @@ mod gate {
             m.gpu().device_name()?,
             m.resident_bytes(),
             tier.set().experts(),
-            tier.weights().resident_bytes(),
+            tier.resident_bytes(),
         );
         Ok(())
     }
