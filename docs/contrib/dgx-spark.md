@@ -317,8 +317,7 @@ The card runs the tree's `sm_86` PTX through the driver's JIT. `sm_121` PTX was 
   bit-for-bit clauses compare our own runs (eager against replay, a rerun, and layer by layer). They do not show that
   cc 12.1 gives the same bits as cc 8.6. ~~The repo has only ever run cc 8.6~~ The box has only ever run cc 8.6
   (`tools/recipes.py:2498` at `3d750af3`: "both cards here are sm_86"). A green fixture pass shows no gross error.
-  The logits-row diff
-  in [#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6159465373) against a 3090 run of the same commit
+  The logits-row diff in [#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6159465373) against a 3090 run of the same commit
   and fixture closes that bits question. `gate-gpu-e2e` on cc 12.1 can come later.
 - **Device pick.** The real-tier gate plan opens the card by the names in `CARDS` and refuses any other card by name
   (`crates/gpu-gates/src/bin/shared/gate_card.rs:8-9, 38-47`: "none of this workstation's cards"). The fixture tier plans on
