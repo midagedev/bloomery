@@ -5248,6 +5248,14 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        // A saved `--model-file` names a file `init` never opens: the real tier
+        // reads `BLOOMERY_REF_MODEL`, so the flag would otherwise be ignored.
+        if std::env::args().skip(1).any(|a| a == "--model-file") {
+            return Err(
+                "--model-file is no longer supported; select the model through BLOOMERY_REF_MODEL"
+                    .into(),
+            );
+        }
         // The levers and the file's header are read, and each value the header
         // gives printed beside the literal it replaced, before anything loads.
         let proof = init()?;

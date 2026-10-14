@@ -215,11 +215,6 @@ mod gate {
     /// not a layer of any file.
     const LABEL_LAYER: usize = 5;
 
-    /// ik's sets by position: the batch, step-4 and 1,024-position sets of the real family and of the
-    /// fixture's.
-    const REAL_SETS: [&str; 3] = [oracle::BATCH, oracle::STEP4, oracle::D1K];
-    const FIXTURE_SETS: [&str; 3] = [fx::BATCH, fx::STEP4, fx::D1K];
-
     /// Where a case that reads ik's sets runs its clause.
     #[derive(Clone, Copy)]
     enum At {
@@ -326,8 +321,8 @@ mod gate {
         layers: [usize; 2],
         /// The file's delta layers in order: the layers that carry `ssm_output`.
         delta: Vec<usize>,
-        /// ik's sets of this tier by position ([`REAL_SETS`], [`FIXTURE_SETS`]); empty when no
-        /// selected case reads them.
+        /// ik's sets of this tier by position ([`refset::arch::qwen35moe::IK`],
+        /// [`refset::arch::qwen35moe::fixture::IK`]); empty when no selected case reads them.
         sets: Vec<(&'static str, RefManifest)>,
         filter: Option<String>,
     }
@@ -441,22 +436,20 @@ mod gate {
     /// fixture tier the fixture family's, each opened through `tier::fixture_set`, which ends the gate by
     /// name for a set that is missing, stale, foreign or unfinished.
     fn open_sets(what: &str) -> Result<Vec<(&'static str, RefManifest)>, GateError> {
-        let mut sets = Vec::new();
-        match Tier::from_env()? {
-            Tier::Real => {
-                for name in REAL_SETS {
-                    let man = RefManifest::open(&data_dir().join(name), &oracle::IK)?;
-                    sets.push((name, man));
-                }
-            }
-            Tier::Fixture => {
-                for name in FIXTURE_SETS {
-                    let path = tier::fixture_set(what, &fx::IK, name)?;
-                    sets.push((name, RefManifest::open(&path, &fx::IK)?));
-                }
-            }
-        }
-        Ok(sets)
+        let fixture = Tier::from_env()? == Tier::Fixture;
+        let family = if fixture { &fx::IK } else { &oracle::IK };
+        family
+            .sets
+            .iter()
+            .map(|&name| {
+                let path = if fixture {
+                    tier::fixture_set(what, family, name)?
+                } else {
+                    data_dir().join(name)
+                };
+                Ok((name, RefManifest::open(&path, family)?))
+            })
+            .collect()
     }
 
     /// The clause `what`, which reads the first `sets` of ik's sets: `Tag::Oracle` on the real sets in the
@@ -468,7 +461,7 @@ mod gate {
         tier::run_clause(&format!("{what} on ik's real sets"), Tag::Oracle)?;
         let fixture = format!("{what} on ik's fixture sets");
         if tier::run_clause(&fixture, Tag::FixtureOracle)? {
-            for name in FIXTURE_SETS.iter().take(sets) {
+            for name in fx::IK.sets.iter().take(sets) {
                 tier::fixture_set(&fixture, &fx::IK, name)?;
             }
         }
@@ -3005,7 +2998,10 @@ mod gate {
             ])?;
         }
         if c.want("routing") {
-            ik_clause("routing: the routing alone on ik's logits", REAL_SETS.len())?;
+            ik_clause(
+                "routing: the routing alone on ik's logits",
+                oracle::IK.sets.len(),
+            )?;
             ok &= routing_case(&c, n_layer)?;
             tier::sc("routing ties: the routing alone on constructed ties")?;
             ok &= routing_ties_case(&c)?;
@@ -3021,7 +3017,7 @@ mod gate {
         if c.want("ik") {
             ik_clause(
                 "ik: the fused router on ik's ffn_inp_normed, against ik",
-                REAL_SETS.len(),
+                oracle::IK.sets.len(),
             )?;
             ok &= ik_case(&c, n_layer)?;
         }
