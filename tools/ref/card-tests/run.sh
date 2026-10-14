@@ -912,7 +912,7 @@ inlog 'box.sh job: the quoted command ends the output the same way' "$tmp/out" '
 # gets the files the command reads (the guard's lease-probe.sh, the profiles), the environment file is a stub that says it ran,
 # the locks live in a directory of the test's own, and a stub uname says Linux (STUB_UNAME names another system).
 mkdir -p "$B/tools/ref/models" "$tmp/home" "$tmp/uname"
-cp "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/ref-paths.sh" "$B/tools/ref/"
+cp "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/dspark-path.sh" "$B/tools/ref/"
 cp "$ROOT"/tools/ref/models/*.sh "$B/tools/ref/models/"
 printf 'echo "[env] sourced"\n' > "$tmp/local-env.sh"
 printf '#!/bin/sh\necho "${STUB_UNAME:-Linux}"\n' > "$tmp/uname/uname"

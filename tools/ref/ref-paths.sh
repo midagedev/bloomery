@@ -170,17 +170,10 @@ esac
 # kept above (or a named line when this profile has none) to stderr, ending with "(exit 66)", and
 # exit 66. `$(. tools/ref/ref-paths.sh && dspark_model)` then ends the command's `&&` chain at 66,
 # which tools/gate-batch.sh counts as deferred. It never prints an empty path.
+# shellcheck source=tools/ref/dspark-path.sh
+source "${BASH_SOURCE[0]%/*}/dspark-path.sh"
 dspark_model() {
-  if [ -n "${DSPARK_MODEL:-}" ]; then
-    printf '%s' "$DSPARK_MODEL"
-    return 0
-  fi
-  if [ -n "${DSPARK_MODEL_WHY:-}" ]; then
-    echo "$DSPARK_MODEL_WHY" >&2
-  else
-    echo "ref-paths.sh: DSPARK_MODEL is empty (exit 66)" >&2
-  fi
-  exit 66
+  dspark_path "${DSPARK_MODEL:-}" "${DSPARK_MODEL_WHY:-}"
 }
 
 # fixture_budget: what a command under the fixture tier needs of the fixture's header, once per command (tools/box.sh calls it):

@@ -58,13 +58,11 @@ export CUDA_VISIBLE_DEVICES=$TIMING_GPU
 # are the mode's two (the draft sits on the 3090 beside the expert tier).
 # An empty draft path is refused by name (exit 66), never exported: on the fixture tier a fixture with
 # no single draft leaves DSPARK_MODEL empty and its reason in DSPARK_MODEL_WHY (ref-paths.sh).
+# shellcheck source=tools/ref/dspark-path.sh
+source "${BASH_SOURCE[0]%/*}/dspark-path.sh"
 dspark_file() {
-  local d=${BLOOMERY_DSPARK_MODEL:-${DSPARK_MODEL:-}}
-  if [ -z "$d" ]; then
-    echo "timing-card.sh: no DSpark draft to run: ${DSPARK_MODEL_WHY:-DSPARK_MODEL is empty (exit 66)}" >&2
-    exit 66
-  fi
-  printf '%s' "$d"
+  dspark_path "${BLOOMERY_DSPARK_MODEL:-${DSPARK_MODEL:-}}" \
+    "timing-card.sh: no DSpark draft to run: ${DSPARK_MODEL_WHY:-DSPARK_MODEL is empty (exit 66)}"
 }
 dspark_env() {
   local d

@@ -9476,7 +9476,7 @@ def ref_paths_self_test(expect) -> None:
     spec.loader.exec_module(gr)
     with tempfile.TemporaryDirectory(prefix="recipes-refpaths-") as tmp:
         os.makedirs(os.path.join(tmp, "tools/ref/models"))
-        for f in ("ref-paths.sh", "gguf-ranges.py"):
+        for f in ("ref-paths.sh", "dspark-path.sh", "gguf-ranges.py"):
             shutil.copyfile(os.path.join(src, f), os.path.join(tmp, "tools/ref", f))
         for fam in ("qwen4exp", "deepseek2", "glm5next", "mimo2", "newfam"):
             with open(os.path.join(tmp, f"tools/ref/models/{fam}.sh"), "w", encoding="utf-8") as fh:
