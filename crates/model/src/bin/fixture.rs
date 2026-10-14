@@ -73,7 +73,13 @@ flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a
 flags of fetch: the same but --draft, and --rev R";
 
 /// Every family's spec, found by the architecture it declares.
-const SPECS: [fn() -> FixtureSpec; 5] = [v41::spec, qwen38::spec, qwen36::spec, glm5::spec, nemo::spec];
+const SPECS: [fn() -> FixtureSpec; 5] = [
+    v41::spec,
+    qwen38::spec,
+    qwen36::spec,
+    glm5::spec,
+    nemo::spec,
+];
 
 /// Where a family's draft fixture comes from on the hub.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
