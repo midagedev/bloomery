@@ -1403,9 +1403,9 @@ FP
       END { print (ae == "" || bs == "" ? "absent" : ae <= bs ? "yes" : "no") }' "$1" || echo absent
   }
   if gb_part 1; then
-  # A recipe fixed to one card is named and stopped when BLOOMERY_CARD names the other card
-  # or both, before a lane would start. The card it is fixed to, a balanced recipe, and a recipe
-  # whose own text picks both cards still plan.
+  # A recipe whose only card candidate is one card is named and stopped when BLOOMERY_CARD
+  # names the other card, or both, before a lane would start. The card it is fixed to, a balanced
+  # recipe, and a recipe whose own text picks both cards still plan.
   check 'card: both refuses a recipe fixed to the 3090, by name' 65 \
     '^gate-batch: steal-fix is fixed to the 3090; BLOOMERY_CARD=both holds both cards' \
     env BLOOMERY_CARD=both "${gb[@]}" --dry-run steal-fix
@@ -1415,6 +1415,12 @@ FP
   check 'card: both refuses a fixture recipe fixed to the A6000, by name' 65 \
     '^gate-batch: sr-a6000 is fixed to the a6000; BLOOMERY_CARD=both holds both cards' \
     env BLOOMERY_CARD=both "${gb[@]}" --tier fixture --dry-run sr-a6000
+  check 'card: both refuses a single-card chain recipe' 65 \
+    '^gate-batch: v41-d41-a is fixed to the 3090;' \
+    env BLOOMERY_CARD=both "${gb[@]}" --dry-run v41-d41-a
+  check 'card: both refuses a single-card solo recipe' 65 \
+    '^gate-batch: x-none is fixed to the 3090;' \
+    env BLOOMERY_CARD=both "${gb[@]}" --dry-run x-none
   check 'card: the A6000 refuses a recipe fixed to the 3090, by name' 65 \
     '^gate-batch: steal-fix is fixed to the 3090; BLOOMERY_CARD=a6000 is another card' \
     env BLOOMERY_CARD=a6000 "${gb[@]}" --dry-run steal-fix
@@ -5018,9 +5024,11 @@ for ((i = 0; i < ND; i++)); do
     *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file, variant and fixture-only" ;;
   esac
 done
-# A recipe fixed to the 3090 or the A6000 is named and stopped when BLOOMERY_CARD names the other
-# card, or both, before a lane starts, the dry run included. The card it is fixed to still plans.
-# A balanced recipe is not that case, nor is one whose own text picks the card.
+# A recipe whose only card candidate is the 3090 or the A6000 is named and stopped when
+# BLOOMERY_CARD names the other card, or both, before a lane starts, the dry run included.
+# That is a fixed item, and a chain or solo item with that one candidate. The card it is
+# fixed to still plans. A balanced recipe is not that case, nor is one whose own text picks
+# the card.
 both_card_refuse() {
   local i nbad=0 name kind cards labels card asked="${BLOOMERY_CARD:-}"
   case "$asked" in
@@ -5029,7 +5037,7 @@ both_card_refuse() {
   esac
   for ((i = 0; i < N; i++)); do
     rec_get "$i" name kind cards labels
-    [ "$kind" = fixed ] || continue
+    [ "$kind" = fixed ] || [ "$cards" = 3090 ] || [ "$cards" = a6000 ] || continue
     card=
     case "$cards" in
       3090|a6000) card=$cards ;;
