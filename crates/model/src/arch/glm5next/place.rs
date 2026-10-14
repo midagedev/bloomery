@@ -1257,11 +1257,10 @@ fn beside_bytes(streams: usize, n_embd: usize, lanes: KdaLanes, nextn: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseForms, FRONT_STEP, FrontWidths, KdaLanes, Kind, KvBytes, KvLayout, NEXTN_ARENA_BYTES,
-        NextnKv, PROMPT_GROUP, PlaceError, card_tile_bytes, front_bytes, group_sets,
-        recurrent_bytes, row_bytes, seq_terms, stage_term, unit_bytes,
+        DenseForms, FRONT_STEP, FrontWidths, KdaLanes, Kind, KvBytes, KvLayout, NextnKv,
+        PROMPT_GROUP, card_tile_bytes, front_bytes, group_sets, recurrent_bytes, row_bytes,
+        seq_terms, stage_term, unit_bytes,
     };
-    use crate::placement::Violation;
 
     /// A prompt group unit at GLM-5.3-Flash's sizes (4,096 values, four
     /// streams, eight routed experts a token, 512 columns) is the bytes the
