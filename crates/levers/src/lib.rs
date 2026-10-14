@@ -1906,8 +1906,8 @@ pub enum Draft38Off {
     /// draft borrows, is `ty` (or `absent`), not the Q8_0 the draft reads.
     Borrowed { name: String, ty: String },
     /// Unset, and the draft yielded to the context
-    /// ([`DraftYield::of`]'s answer, the seats' plan-side rule).
-    Yield(DraftYield),
+    /// ([`RungCost::of`]'s answer, the seats' plan-side rule).
+    Yield(RungCost),
     /// Unset on the Qwen3.8 seat, and the plan pages host experts through
     /// the NVMe tier's RAM arena of `arena` bytes ([`paged_columns`]): the
     /// draft is off by default there (whether it pays depends on the
@@ -1987,33 +1987,44 @@ pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
     }
 }
 
-/// An unset draft's yield to the context, the numbers its record prints:
-/// the card bytes the draft reserves at the context it denied, and the
-/// positions a slot gets with the draft and without it. One owner of the
-/// comparison for Qwen3.8 and GLM-5.3's seats; its `Display` is the `load
-/// draft=off` record's why for the yield.
+/// A reserve on the card that can cost the ladder a rung.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DraftYield {
-    /// The positions a slot gets with the draft: the drafted choice's
-    /// context, 0 when it holds not even the ladder's floor.
-    pub with: usize,
-    /// The positions a slot gets without it: the plain choice's context.
-    pub without: usize,
-    /// The draft's card bytes at `with` — the plan's reserve, the number
-    /// the drafted plan counted (Qwen3.8's `MtpInputs::card_bytes_of`;
-    /// GLM-5.3's NextN card bytes with its arena).
+pub enum Reserve {
+    /// An unset draft (Qwen3.8, GLM-5.3): it goes off when it costs a rung,
+    /// and the `load draft=off` record's why is the cost.
+    Draft,
+    /// The image encoder (V4.1): it stays on, and the `ctx` line carries the
+    /// cost.
+    ImageEncoder,
+}
+
+/// What a reserve on the card cost the context: the positions a slot gets
+/// with the reserve and without it, and the reserve's card bytes at `with`.
+/// One owner of the comparison for every seat that weighs a reserve against
+/// the ladder; [`Reserve`] says what the seat does with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RungCost {
+    pub reserve: Reserve,
+    /// The positions a slot gets with the reserve, 0 when that plan holds
+    /// not even the ladder's floor.
+    pub with: u64,
+    /// The positions a slot gets without it.
+    pub without: u64,
+    /// The reserve's card bytes at `with`: the number the plan with it
+    /// counted (Qwen3.8's `MtpInputs::card_bytes_of`, GLM-5.3's NextN card
+    /// bytes with its arena, V4.1's encoder reserve).
     pub card_bytes: u64,
 }
 
-impl DraftYield {
-    /// The unset draft yields to the context when the plan with it leaves a
-    /// slot fewer positions than the plan without it: `with` under
-    /// `without` — a draft that denies no position stays on. `None` keeps
-    /// the draft. A set `BLOOMERY_DRAFT=mtp` never asks: the seat runs it as
-    /// given.
+impl RungCost {
+    /// `Some` when the plan with the reserve leaves a slot fewer positions
+    /// than the plan without it: `with` under `without`. The same rung or a
+    /// higher one costs nothing. A set `BLOOMERY_DRAFT=mtp` never asks: the
+    /// seat runs it as given.
     #[must_use]
-    pub fn of(with: usize, without: usize, card_bytes: u64) -> Option<DraftYield> {
-        (with < without).then_some(DraftYield {
+    pub fn of(reserve: Reserve, with: u64, without: u64, card_bytes: u64) -> Option<RungCost> {
+        (with < without).then_some(RungCost {
+            reserve,
             with,
             without,
             card_bytes,
@@ -2021,12 +2032,15 @@ impl DraftYield {
     }
 }
 
-impl fmt::Display for DraftYield {
+impl fmt::Display for RungCost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (head, tail) = match self.reserve {
+            Reserve::Draft => ("unset: the draft", "the draft"),
+            Reserve::ImageEncoder => ("the image encoder", "the encoder"),
+        };
         write!(
             f,
-            "unset: the draft's {} B on the card leave a slot {} positions; without the draft a \
-             slot takes {}",
+            "{head}'s {} B on the card leave a slot {} positions; without {tail} a slot takes {}",
             self.card_bytes, self.with, self.without
         )
     }

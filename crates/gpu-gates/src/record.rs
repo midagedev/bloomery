@@ -2907,7 +2907,7 @@ pub static DRAFT_UNSET_GLM: Kind = Kind {
 };
 
 /// An unset MTP draft yielding to the context
-/// ([`bloomery_levers::DraftYield`]): the card bytes it reserves at the
+/// ([`bloomery_levers::RungCost`]): the card bytes it reserves at the
 /// context it denied, and the positions a slot gets with it and without
 /// it. The seats print it where the
 /// decision closed, before the `ctx` line it produced; only a load that
@@ -3999,13 +3999,18 @@ pub fn residency_lever(pick: bloomery_levers::ResidencyPick) -> Record {
         .w("why", pick.why.name())
 }
 
-/// The `draft yield` record of `y` ([`bloomery_levers::DraftYield`]'s own
+/// The `draft yield` record of `y` ([`bloomery_levers::RungCost`]'s own
 /// numbers, one owner with the rule that decided them).
-pub fn draft_yield(y: &bloomery_levers::DraftYield) -> Record {
+pub fn draft_yield(y: &bloomery_levers::RungCost) -> Record {
+    assert_eq!(
+        y.reserve,
+        bloomery_levers::Reserve::Draft,
+        "a draft yield record of another reserve"
+    );
     Record::new(&DRAFT_YIELD)
         .u("card_bytes", y.card_bytes)
-        .u("with", y.with as u64)
-        .u("without", y.without as u64)
+        .u("with", y.with)
+        .u("without", y.without)
 }
 
 /// A round of several slots' record ([`SLOTS_ROUND`]): `cmd` the command the

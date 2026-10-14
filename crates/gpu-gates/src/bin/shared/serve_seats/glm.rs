@@ -194,7 +194,7 @@
 //! before the plan: `mtp` under `--place a` and `bp` on a file of one
 //! next-token layer; the plain path under `--place gate`, on a file of other than one,
 //! and with stores too short for one window, never a refusal. Unset, the
-//! draft then yields to the context, set or not (`bloomery_levers::DraftYield::of`,
+//! draft then yields to the context, set or not (`bloomery_levers::RungCost::of`,
 //! the one rule): when the drafted load halved its context, or holds not even
 //! the floor, and the plain load holds more, the draft goes off, one `draft
 //! yield` record naming its card bytes and the positions a slot gets either
@@ -903,7 +903,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 .as_ref()
                 .expect("a drafted load read the NextN layer")
                 .card_bytes(u64::try_from(plain.ctx)?, slots)?;
-            match bloomery_levers::DraftYield::of(with, plain.ctx, bytes) {
+            match bloomery_levers::RungCost::of(
+                bloomery_levers::Reserve::Draft,
+                u64::try_from(with)?,
+                u64::try_from(plain.ctx)?,
+                bytes,
+            ) {
                 Some(y) => {
                     let said = record::draft_yield(&y);
                     (plain, Some(y.to_string()), Some(said))

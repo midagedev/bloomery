@@ -1858,7 +1858,8 @@ gate-gpu-ds41-chat:
 # checks /props (the A6000, the tier card with the plan's tier bytes and the draft's class, the host) and the draft counts
 # in timings. Both cards in view (BLOOMERY_CARD=both: gpu-gate.sh takes both cards' gate locks, and the batch runs it
 # alone). Eight loads; logs and the raw stream in target/serve-gate/, the draft run's in target/serve-gate/draft/, the
-# image runs' in target/serve-gate/{mmproj,mmproj-bp,no-mmproj}/, the two-card run's in target/serve-gate/bp/. Weekly:
+# image runs' in target/serve-gate/{mmproj,mmproj-bp,no-mmproj}/ plus the unset-ctx bp --plan run
+# (target/serve-gate/mmproj-ctx, before the load), the two-card run's in target/serve-gate/bp/. Weekly:
 # `just weekly` runs it, and `just affected` names it when a file its
 # triggers in tools/gate-paths.tsv match changes.
 [group('solo')]

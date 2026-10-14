@@ -4410,9 +4410,10 @@ mod gate {
         let yielded = log
             .first(&record::DRAFT_YIELD)?
             .map(|y| -> Result<_, ReadError> {
-                Ok(bloomery_levers::DraftYield {
-                    with: usize::try_from(y.u64("with")?).unwrap_or(usize::MAX),
-                    without: usize::try_from(y.u64("without")?).unwrap_or(usize::MAX),
+                Ok(bloomery_levers::RungCost {
+                    reserve: bloomery_levers::Reserve::Draft,
+                    with: y.u64("with")?,
+                    without: y.u64("without")?,
                     card_bytes: y.u64("card_bytes")?,
                 })
             })

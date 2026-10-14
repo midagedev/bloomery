@@ -8,7 +8,11 @@
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
 //!                         [--parallel N] [--queue-depth Q] [--slot-save-path DIR]
 //!                         [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
-//!                         [--image-max-tokens N]
+//!                         [--image-max-tokens N] [--plan]
+//!
+//! `--plan` prints the lines the decisions before the load make (the `ctx`
+//! line, the `parallel` line) and exits 0 before the model is opened on a
+//! card.
 //!
 //! `--ctx` is also spelled `--ctx-size` and `-c`, as llama-server spells it
 //! (`serve::flag::CTX`); a number flag's value that is not a number is
@@ -49,13 +53,15 @@
 //! a prompt that long is a 400 before it reaches the engine, and generation
 //! stops there with `truncated`. The context is the seats' common choice
 //! (`place::ctx_choice`, `generate::choose_ctx`): it comes first, the experts fill
-//! what is left. The limit is the file's trained context within the plan's
-//! i32 positions. Set, `--ctx` is the total the slots split (llama-server's
-//! `-np` without `-kvu`); a share past the limit is refused by name, and one
-//! the machine cannot hold is refused with the largest share it holds,
-//! before the load. Unset, a slot asks the target (256K under the limit) and
-//! halves while the plan is short of the card, down to the floor; one `ctx`
-//! line on stderr names the rule.
+//! what is left. The limit is the file's trained context within
+//! `workstation::CTX_MAX` (32,768). Set, `--ctx` is the total the slots split
+//! (llama-server's `-np` without `-kvu`); a share past the limit is refused
+//! by name, and one the machine cannot hold is refused with the largest share
+//! it holds, before the load. Unset, a slot asks the target under that limit
+//! and halves while the plan is short of the card, down to the floor; one
+//! `ctx` line on stderr names the rule. The image encoder stays on, and when
+//! its reserve lowers that rung the same line names the positions a slot gets
+//! with the reserve and without it.
 //! `/props`' `engine.ctx_verified` is the
 //! deepest context the reference sets hold our numbers to ik's at
 //! (`refset::arch::deepseek41::VERIFIED_POSITIONS`), which bounds nothing.
@@ -250,7 +256,7 @@ use crate::{dspark, place};
 
 const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
-                     [--cache-ram MIB] [--parallel N] [--queue-depth Q] \
+                     [--cache-ram MIB] [--parallel N] [--queue-depth Q] [--plan] \
                      [--slot-save-path DIR] [--mmproj FILE | --no-mmproj] \
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
@@ -288,6 +294,9 @@ struct Args {
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     api_keys: serve::flag::ApiKeys,
+    /// `--plan`: the lines before the load (`ctx`, `parallel`), then exit;
+    /// nothing is opened on a card.
+    plan_only: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
@@ -303,6 +312,7 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
         slot_save_path: None,
         vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
+        plan_only: false,
     };
     let mut park_ram = false;
     let mut place_flag = None;
@@ -310,6 +320,10 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
             return Err(USAGE.into());
+        }
+        if flag == "--plan" {
+            a.plan_only = true;
+            continue;
         }
         if a.vision.take(flag, &mut it)? {
             continue;
@@ -541,20 +555,29 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // text model's embedding width and vocabulary.
     let n_embd = inputs.hp.n_embd;
     let token = |id| vocab.tokenizer().text(id).map(str::to_owned);
-    // A projector the `--hf` repo picked stays only where the plan gives the text model the same
-    // experts and context with its reserve as without ([`vision_seat::kept`]).
+    // A projector the `--hf` repo picked stays where the plan gives the text model the same
+    // experts with its reserve as without ([`vision_seat::kept`]). Both costs are read at the
+    // plain rung, so a reserve that only lowers the ladder does not drop the encoder: the `ctx`
+    // line names that rung. A reserve the ladder places at no rung, or not at a set `--ctx`, is
+    // a refused cost, and the projector goes as before.
     #[cfg(feature = "vision")]
     let vision = vision_seat::kept(
         vision_of(&a, cfg.body.prefill, n_embd, &token)?,
         &a.vision,
         |v| {
             let vision = v.and_then(|v| v.seat.reserve);
-            let ctx = ctx_of(vision)?.slot_ctx;
-            let mut machine = a.place.machine(reserve, tier_batch)?(inputs.model.layers);
-            vision_seat::reserve_on(&mut machine, vision);
-            reserve_checkpoints(&mut machine, Seqs::none(slots.get()), ctx)?;
-            let plan = inputs.plan_with_slots(&machine, ctx, &cfg.place, slots)?;
-            Ok(vision_seat::Cost::of(&plan, ctx))
+            let ctx = ctx_of(None)?.slot_ctx;
+            let cost_with = |vision: Option<u64>| -> Result<_, GateError> {
+                let mut machine = a.place.machine(reserve, tier_batch)?(inputs.model.layers);
+                vision_seat::reserve_on(&mut machine, vision);
+                reserve_checkpoints(&mut machine, Seqs::none(slots.get()), ctx)?;
+                let plan = inputs.plan_with_slots(&machine, ctx, &cfg.place, slots)?;
+                Ok(vision_seat::Cost::of(&plan, ctx))
+            };
+            match cost_with(vision) {
+                Err(_) if vision.is_some() && ctx_of(vision).is_ok() => cost_with(None),
+                r => r,
+            }
         },
     )?;
     #[cfg(feature = "vision")]
@@ -563,11 +586,29 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     vision_of(&a, cfg.body.prefill, n_embd, &token)?;
     #[cfg(not(feature = "vision"))]
     let seated: Option<&vision_seat::Opened> = None;
-    let chosen = ctx_of(seated.and_then(|v| v.seat.reserve))?;
-    drop(split);
+    let vision_reserve = seated.and_then(|v| v.seat.reserve);
+    let chosen = ctx_of(vision_reserve)?;
     let ctx = usize::try_from(chosen.slot_ctx)?;
-    eprintln!("{}", chosen.line());
+    // The encoder stays on. When its reserve lowers the rung, the `ctx` line
+    // names both rungs ([`bloomery_levers::RungCost`]). The same rung adds
+    // nothing.
+    let mut ctx_line = chosen.line();
+    if let Some(bytes) = vision_reserve {
+        let plain = ctx_of(None)?;
+        let image = bloomery_levers::Reserve::ImageEncoder;
+        if let Some(note) =
+            bloomery_levers::RungCost::of(image, chosen.slot_ctx, plain.slot_ctx, bytes)
+        {
+            ctx_line = format!("{ctx_line} ({note})");
+        }
+    }
+    drop(split);
+    eprintln!("{ctx_line}");
     parallel_line(slots.get(), ctx, from, pass);
+    if a.plan_only {
+        // The lines before the load are out; nothing was opened on a card.
+        std::process::exit(0);
+    }
     let trace = route_trace(
         &levers,
         &cfg,

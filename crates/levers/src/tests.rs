@@ -1212,7 +1212,7 @@ fn draft38_unset_follows_the_place_and_the_file() {
     );
 }
 
-/// The unset draft's yield to the context ([`DraftYield::of`]): it fires
+/// The unset draft's yield to the context ([`RungCost::of`]): it fires
 /// when the drafted choice leaves a slot fewer positions than the plain one,
 /// and only then — a draft that denies no position stays on.
 ///
@@ -1222,10 +1222,11 @@ fn draft38_unset_follows_the_place_and_the_file() {
 #[test]
 fn draft_yields_to_the_context_only_when_it_costs_positions() {
     let r = 2_842_413_228_u64;
-    let y = DraftYield::of(702, 6165, r).expect("the draft yields");
+    let y = RungCost::of(Reserve::Draft, 702, 6165, r).expect("the draft yields");
     assert_eq!(
         y,
-        DraftYield {
+        RungCost {
+            reserve: Reserve::Draft,
             with: 702,
             without: 6165,
             card_bytes: r,
@@ -1238,9 +1239,48 @@ fn draft_yields_to_the_context_only_when_it_costs_positions() {
     );
     assert_eq!(Draft38Off::Yield(y).to_string(), y.to_string());
     // A draft that denies no position (both choices at one rung) stays on.
-    assert!(DraftYield::of(131_072, 131_072, r).is_none(), "same rung");
+    assert!(
+        RungCost::of(Reserve::Draft, 131_072, 131_072, r).is_none(),
+        "same rung"
+    );
     // A drafted choice that holds not even the floor yields to any plain one.
-    assert!(DraftYield::of(0, 4096, r).is_some(), "under the floor");
+    assert!(
+        RungCost::of(Reserve::Draft, 0, 4096, r).is_some(),
+        "under the floor"
+    );
+}
+
+/// The image encoder's reserve names itself on the `ctx` line only when it
+/// lowers the rung ([`RungCost::of`], the draft's comparison): a reserve
+/// that denies no position says nothing, and
+/// the encoder stays on either way.
+#[test]
+fn a_vision_reserve_names_itself_only_when_it_lowers_the_rung() {
+    let bytes = 1_234_567_890_u64;
+    let y = RungCost::of(Reserve::ImageEncoder, 32_768, 65_536, bytes)
+        .expect("the reserve lowers the rung");
+    assert_eq!(
+        y,
+        RungCost {
+            reserve: Reserve::ImageEncoder,
+            with: 32_768,
+            without: 65_536,
+            card_bytes: bytes,
+        }
+    );
+    assert_eq!(
+        y.to_string(),
+        "the image encoder's 1234567890 B on the card leave a slot 32768 positions; without the \
+         encoder a slot takes 65536"
+    );
+    assert!(
+        RungCost::of(Reserve::ImageEncoder, 32_768, 32_768, bytes).is_none(),
+        "same rung"
+    );
+    assert!(
+        RungCost::of(Reserve::ImageEncoder, 65_536, 32_768, bytes).is_none(),
+        "a higher rung"
+    );
 }
 
 /// The paged rule ([`paged_columns`]): with no arena, or a draft that is off
@@ -1276,7 +1316,7 @@ fn a_paged_plan_turns_only_an_unset_draft_off() {
     // by the paged rule; every other reason holds whatever the plan, and
     // stays. A plan with no arena keeps its draft and its reason as asked.
     let paged = Some(Draft38Off::Paged { arena });
-    let y = DraftYield::of(702, 6165, 2_842_413_228).expect("the 3060's yield");
+    let y = RungCost::of(Reserve::Draft, 702, 6165, 2_842_413_228).expect("the 3060's yield");
     assert_eq!(
         paged_draft(&at(0, true, false), None),
         (true, None),

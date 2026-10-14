@@ -176,9 +176,17 @@
 //! With `--mmproj` (no draft; refused beside `--plain`, `--place bp`,
 //! `--slots` and `--need-path`), the gate runs the image clauses alone — a
 //! build of the server with the `vision` feature, which the weekly recipe
-//! builds — and nothing above, over three servers, each started after the
+//! builds — and nothing above, over four servers, each started after the
 //! one before it is gone (one load on the cards at a time):
 //!
+//! - a `--plan` run of [`BP_SERVER_ARGS`] without `--ctx`, with `--mmproj
+//!   <the vision set's encoder file>` and `BLOOMERY_RESIDENCY=off`: it prints
+//!   its `ctx` line and exits before the load. The line names the
+//!   encoder's reserve when that reserve lowers the rung
+//!   (`mmproj_a_dropped_rung_names_the_reserve`,
+//!   [`ctx_ladder::reserve_named`] against this gate's own `ctx_choice` with
+//!   the reserve and without it). The same rung adds nothing. Mutant: the
+//!   seat's `ctx` line omits the reserve sentence (this check);
 //! - the server of [`SERVER_ARGS`] with `--mmproj <the vision set's encoder
 //!   file>` (the one `gate-gpu-vision` and `gate-gpu-ds41-media` load): (a)
 //!   `/props`' `modalities.vision` is true, and its `vision` record names the
@@ -282,7 +290,16 @@ mod serve_levers;
 mod dspark;
 
 #[cfg(feature = "deepseek41")]
+#[allow(
+    dead_code,
+    reason = "shared with generate_ds41; this gate calls ctx_choice and tier_batch"
+)]
+#[path = "shared/ds41_place.rs"]
+mod ds41_place;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::mpsc::{self, Receiver};
@@ -294,7 +311,7 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        self, Served, curl, ids_of, json_of, metric, parse_ids, server_log,
+        self, Served, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::{Gguf, Split};
@@ -1261,7 +1278,7 @@ mod gate {
     /// The `ctx` clause (module header): a server with no `--ctx` (one slot,
     /// `--place gate`) prints its one `ctx` line and its `plan` record before
     /// its load, and is stopped there. The line holds its word under the
-    /// model's limit (the trained context within the plan's i32 positions;
+    /// model's limit (the trained context within `workstation::CTX_MAX`;
     /// `ctx_ladder::default_line_held`), and this gate's own one-slot plans
     /// at the server's free card bytes agree: the card holds the default, and
     /// not the rung above it when it halved. Mutants: a ladder that starts a
@@ -1298,7 +1315,9 @@ mod gate {
             trained: split
                 .arch_get_u64("context_length")
                 .ok_or("the file states no context_length")?,
-            kernel: Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
+            // PIN(2026-10-14): the seat's limit, CTX_MAX until the KV pool
+            // lands; it was the trained context within i32 positions.
+            kernel: Some((workstation::CTX_MAX, "CTX_MAX")),
             verified: None,
         }
         .limit();
@@ -1874,7 +1893,62 @@ mod gate {
         )
     }
 
-    /// The image clauses (module header): three servers, each started after
+    /// An unset `--ctx` under `--place bp` with the encoder (module header):
+    /// a `--plan` run ([`plan_run`]), which prints the `ctx` line and exits
+    /// before the load. The line names the reserve when this gate's own
+    /// `ctx_choice` (the seat's) gives a lower rung with the reserve than
+    /// without it, and only then.
+    /// Mutant: the seat's `ctx` line omits the reserve sentence (this check).
+    fn ctx_reserve_names_the_drop(
+        a: &Args,
+        bytes: u64,
+        mmproj: &str,
+        levers: &PlanLevers,
+    ) -> Result<bool, GateError> {
+        let dir = a.dir.join("mmproj-ctx");
+        std::fs::create_dir_all(&dir)?;
+        let mut cmd = Command::new(Served::exe()?);
+        cmd.env("BLOOMERY_RESIDENCY", "off");
+        let mut args: Vec<&str> = BP_SERVER_ARGS[..8].to_vec();
+        args.extend(["--mmproj", mmproj]);
+        let (status, lines) = plan_run(cmd, &args, &dir.join("plan.err"))?;
+        println!("ctx reserve --plan: {status}");
+        let text = lines.join("\n");
+        let line = ctx_line(&text)
+            .ok_or("the unset-ctx bp --plan run printed no one `ctx` line")?
+            .to_owned();
+        // The run opened no card, so the re-plan reads the same room.
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let tier = crate::ds41_place::tier_batch(Place::Bp, &inputs.hp);
+        let slots = NonZeroUsize::MIN;
+        let ask = |vision: Option<u64>| {
+            crate::ds41_place::ctx_choice(
+                &split,
+                &inputs,
+                Place::Bp,
+                (None, tier, vision),
+                (None, slots),
+                levers,
+            )
+        };
+        let with = ask(Some(bytes))?;
+        let without = ask(None)?;
+        println!(
+            "ctx reserve: {line}; with {} without {} bytes {bytes}",
+            with.slot_ctx, without.slot_ctx
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "mmproj_a_dropped_rung_names_the_reserve",
+            ctx_ladder::reserve_named(&line, with.slot_ctx, without.slot_ctx, bytes),
+        );
+        Ok(ok)
+    }
+
+    /// The image clauses (module header): four servers, each started after
     /// the one before it is gone.
     fn images(a: &Args, levers: &PlanLevers) -> Result<bool, GateError> {
         let s = scene()?;
@@ -1891,6 +1965,7 @@ mod gate {
             s.token
         );
         let mut ok = true;
+        ok &= ctx_reserve_names_the_drop(a, s.bytes.total(), &mmproj, levers)?;
 
         // The gate server with the encoder: (a) vision on, the encoder's seat
         // and bytes; (b) the chart read; (c) the span kept.

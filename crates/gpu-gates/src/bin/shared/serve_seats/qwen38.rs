@@ -200,7 +200,7 @@
 //! after the `load` line (`no file at <path>[, <path>…]`, every place the pick looked), never a
 //! refusal; `BLOOMERY_DRAFT=mtp` set with stores that short is refused by
 //! name before the plan. Unset, the draft then yields to the context
-//! (`bloomery_levers::DraftYield::of`, at [`ctx38`]'s caller): it goes off
+//! (`bloomery_levers::RungCost::of`, at [`ctx38`]'s caller): it goes off
 //! when the plan with it leaves a slot fewer positions than the plan
 //! without it, a set `--ctx-size` included, one `draft yield` record naming
 //! its card bytes and the positions a slot gets either way, and the plain
@@ -722,7 +722,7 @@ pub(crate) fn refuse_feed(
 /// the draft borrows are not its format (`PlanInputs::mtp_borrows`, which
 /// refuses a set `mtp` at `MtpInputs::read`); and, drafting nothing, why (the
 /// `load draft=off` record's). This is the rule before the plan: the unset
-/// draft's yield to the context (`bloomery_levers::DraftYield::of`, the
+/// draft's yield to the context (`bloomery_levers::RungCost::of`, the
 /// module doc) is decided after the context choice, at the caller. The V4.1
 /// words and any other are refused by name.
 ///
@@ -1324,7 +1324,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 .as_ref()
                 .expect("a drafted choice held the draft")
                 .card_bytes_of(u64::try_from(plain.ctx)?, slots)?;
-            match bloomery_levers::DraftYield::of(with, plain.ctx, bytes) {
+            match bloomery_levers::RungCost::of(
+                bloomery_levers::Reserve::Draft,
+                u64::try_from(with)?,
+                u64::try_from(plain.ctx)?,
+                bytes,
+            ) {
                 Some(y) => {
                     record::draft_yield(&y).eprint();
                     (plain_plans, plain, false, None, Some(Draft38Off::Yield(y)))

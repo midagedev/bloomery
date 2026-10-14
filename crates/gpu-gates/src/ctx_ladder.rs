@@ -109,6 +109,22 @@ pub fn default_line_held(line: &str, slots: u64, (limit, source): (u64, &str)) -
     )
 }
 
+/// Whether `line` is the seat's `ctx` line once an image-encoder reserve of
+/// `bytes` is weighed ([`bloomery_levers::RungCost`]): a reserve that lowers
+/// the rung (`with` under `without`) holds only when the line is the bare
+/// choice plus that cost in parentheses; the same rung holds only when the line names no
+/// reserve.
+#[must_use]
+pub fn reserve_named(line: &str, with: u64, without: u64, bytes: u64) -> bool {
+    const MARK: &str = " (the image encoder's";
+    let bare = line.split_once(MARK).map(|(head, _)| head).unwrap_or(line);
+    let image = bloomery_levers::Reserve::ImageEncoder;
+    match bloomery_levers::RungCost::of(image, with, without, bytes) {
+        Some(note) => line == format!("{bare} ({note})"),
+        None => !line.contains(MARK),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{default_line_held, rung_above, rungs, target_of};
@@ -145,5 +161,34 @@ mod tests {
                    from=262144 card-short need=9 room=8";
         assert_eq!(default_line_held(off, 1, limit), Some(false));
         assert_eq!(default_line_held("ctx rule=target", 1, limit), None);
+    }
+
+    /// The serve clause's predicate ([`super::reserve_named`]): a rung the
+    /// reserve lowers holds only with the cost named, a bare line does not;
+    /// the same rung holds only bare.
+    #[test]
+    fn a_dropped_rung_names_the_reserve() {
+        let bytes = 111;
+        let bare = "ctx rule=halved ctx=16384 slots=1 total=16384 limit=32768 (CTX_MAX) \
+                    from=32768 card-short need=9 room=8";
+        let image = bloomery_levers::Reserve::ImageEncoder;
+        let note = bloomery_levers::RungCost::of(image, 16_384, 32_768, bytes)
+            .expect("the reserve lowers the rung");
+        let full = format!("{bare} ({note})");
+        assert!(super::reserve_named(&full, 16_384, 32_768, bytes));
+        // The clause leaves the line's fields readable.
+        assert_eq!(super::field(&full, "room"), Some(8), "{full}");
+        assert!(
+            !super::reserve_named(bare, 16_384, 32_768, bytes),
+            "a dropped reason"
+        );
+        assert!(
+            super::reserve_named(bare, 32_768, 32_768, bytes),
+            "the same rung, bare"
+        );
+        assert!(
+            !super::reserve_named(&full, 32_768, 32_768, bytes),
+            "a reason with no drop"
+        );
     }
 }
