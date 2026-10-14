@@ -26,6 +26,8 @@
 //! - [`tokenizer`]: `llama-tokenize`'s ids per vocabulary
 //!   (`crates/tokenizer/tools/oracle.sh`).
 //! - [`dequant`]: ggml's dequantized rows (`tools/ref/dump-dequant.sh`).
+//! - [`nemotron`]: mainline's last-position logits of Nemotron 3 Nano
+//!   (`tools/ref/nemotron_ref.cpp`).
 //! - [`census`]: the census stubs — header-only copies of many users' model
 //!   files, pinned by `tools/census/stubs.tsv` (the writer
 //!   `tools/type-census.py --stubs`) and checked against it.
@@ -48,6 +50,7 @@ pub mod ik;
 pub mod kld;
 mod md5;
 pub mod mtpref;
+pub mod nemotron;
 pub mod tokenizer;
 pub mod vision;
 pub mod visref;

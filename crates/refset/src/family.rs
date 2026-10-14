@@ -63,6 +63,10 @@ pub enum Identity {
     /// naming the harness and ggml's library by md5: the family's `build`
     /// pins both ([`crate::dequant::build_id`]).
     DequantManifest,
+    /// `# model`, `# build` and `# arch` in a last-position logits set's
+    /// `MANIFEST.tsv` (`tools/ref/nemotron_ref.cpp`). A prompt row is read by
+    /// the `# prompt columns` line; `logits` is that prompt's last position.
+    NemotronLogits,
 }
 
 /// The ik build a family's sets must name.
@@ -388,6 +392,14 @@ impl Family {
                     dumped_from: stated(set.model.as_deref()),
                     draft: None,
                     build: set.build(),
+                })
+            }
+            Identity::NemotronLogits => {
+                let set = crate::nemotron::LogitsSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.model.as_deref()),
+                    draft: None,
+                    build: set.build,
                 })
             }
         }

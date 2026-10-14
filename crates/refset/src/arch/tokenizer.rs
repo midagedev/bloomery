@@ -47,7 +47,7 @@ pub const TOKREF_BUILD: &str = "llama-tokenize 0128e83c5e71e5f2b72f3d5d2c2de6b2 
 /// `nemotron_h` architecture. The soname is `libllama.so.0`; the pin's word
 /// is the one [`crate::tokenizer::build_id`] spells.
 // PIN(2026-10-14): /home/user/llama.cpp-mainline's llama-tokenize and libllama.so.0.
-const NEMOTRON_BUILD: &str = "llama-tokenize 5df95d3a942effc971ff170432d840fd \
+pub(crate) const NEMOTRON_BUILD: &str = "llama-tokenize 5df95d3a942effc971ff170432d840fd \
                                   libllama.so 3575b1f39e7773379fec011d39f32a77";
 
 /// V4.1's set (`deepseek-v3` pre-tokenizer), from the file the tree runs.
@@ -107,7 +107,7 @@ pub static QWEN38: Family = Family {
 };
 
 /// The Nemotron 3 Nano 4B file the tokenizer gate loads (`pixtral`).
-const NEMOTRON_MODEL: &str =
+pub(crate) const NEMOTRON_MODEL: &str =
     "/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf";
 
 /// Nemotron 3 Nano 4B's set (`pixtral` pre-tokenizer).
