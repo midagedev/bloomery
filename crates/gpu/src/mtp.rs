@@ -6,14 +6,16 @@
 //!
 //! - [`mtp_kernels::mtp_input`] — one block a row: the two RMS norms of
 //!   ik's MTP graph (`build_qwen4exp.cpp`, `is_mtp`), the embedding row `e`
-//!   (`hidden` values) over itself and the target's hidden row `h` (the
-//!   four streams, `4 · hidden` values) over all of it at once, each value
+//!   (`hidden` values) over itself and the target's hidden row `h` (`streams`
+//!   streams, `streams · hidden` values: four for Qwen3.8's hyper-connected
+//!   residual, one for a plain stream) over all of it at once, each value
 //!   `(x · r) · γ` with `r = 1/√(Σx²/n + eps)` as `ggml_rms_norm` then
 //!   `ggml_mul`, packed stream by stream as `[e_n | h_n,s]` — row `t`, stream
-//!   `s` at `(t·4 + s) · 2·hidden`, the `eh_proj` gemv's `4·m` columns. A
-//!   thread takes values `t, t + 256, …` of a row by fused multiply-adds,
-//!   each warp's by the xor butterfly, the eight warps' in order from warp
-//!   0 — the hyper-connection norm's order (`crate::hc_gated`).
+//!   `s` at `(t·streams + s) · 2·hidden`, the `eh_proj` gemv's `streams·m`
+//!   columns. A thread takes values `t, t + 256, …` of a row by fused
+//!   multiply-adds, each warp's by the xor butterfly, the eight warps' in
+//!   order from warp 0 — the hyper-connection norm's order
+//!   (`crate::hc_gated`).
 //! - [`mtp_kernels::argmax_p_rows_fault`] — one block a row of the head's
 //!   logits in the gemvs' layout (`x[i·m + c]`, `n` rows of the head): the
 //!   argmax walk of `crate::elem`'s argmax kernels (ties to the lower row,
@@ -43,7 +45,8 @@ use cuda_device::{
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
-/// Streams of the target's hidden row.
+/// Streams of the target's hidden row on a hyper-connected target: the most
+/// the input pack takes.
 pub const STREAMS: usize = 4;
 /// Threads of an input block, and its warps.
 const INPUT_THREADS: usize = 256;
@@ -92,10 +95,10 @@ mod mtp_kernels {
         block = (256, 1, 1),
         requires = (
             e.len() >= m * hidden,
-            h.len() >= m * 4 * hidden,
+            h.len() >= m * streams * hidden,
             enorm.len() >= hidden,
-            hnorm.len() >= 4 * hidden,
-            out.len() >= m * 8 * hidden
+            hnorm.len() >= streams * hidden,
+            out.len() >= m * 2 * streams * hidden
         )
     )]
     #[allow(
@@ -110,6 +113,7 @@ mod mtp_kernels {
         hidden: u32,
         eps: f32,
         m: u32,
+        streams: u32,
         fault: FaultSink,
         mut out: DisjointSlice<f32>,
     ) {
@@ -120,7 +124,8 @@ mod mtp_kernels {
         }
         let tid = thread::threadIdx_x() as usize;
         let hid = hidden as usize;
-        let wide = STREAMS * hid;
+        let n_streams = streams as usize;
+        let wide = n_streams * hid;
         // SAFETY: this block's own shared allocation, reached without a
         // reference; `input_sum` is its only user.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
@@ -137,7 +142,7 @@ mod mtp_kernels {
         let mut acc = 0.0f32;
         let mut j = tid;
         while j < wide {
-            // SAFETY: t·4·hidden + j < m·4·hidden <= h.len().
+            // SAFETY: t·streams·hidden + j < m·streams·hidden <= h.len().
             let x = unsafe { *h.get_unchecked(t * wide + j) };
             acc = f32::mul_add(x, x, acc);
             j += INPUT_THREADS;
@@ -153,27 +158,30 @@ mod mtp_kernels {
         let mut i = tid;
         while i < hid {
             // SAFETY: t·hidden + i < e.len() and i < hidden <= enorm.len(); the
-            // four slots (t·4 + s)·2·hidden + i, s < 4, lie below m·8·hidden
-            // <= out.len(), and value i of row t is this thread's alone.
+            // slots (t·streams + s)·2·hidden + i, s < streams, lie below
+            // m·streams·2·hidden <= out.len(), and value i of row t is this
+            // thread's alone.
             unsafe {
                 let v = (*e.get_unchecked(t * hid + i) * re) * *enorm.get_unchecked(i);
-                let base = t * STREAMS * pitch + i;
-                *out.get_unchecked_mut(base) = v;
-                *out.get_unchecked_mut(base + pitch) = v;
-                *out.get_unchecked_mut(base + 2 * pitch) = v;
-                *out.get_unchecked_mut(base + 3 * pitch) = v;
+                let base = t * n_streams * pitch + i;
+                let mut s = 0;
+                while s < n_streams {
+                    *out.get_unchecked_mut(base + s * pitch) = v;
+                    s += 1;
+                }
             }
             i += INPUT_THREADS;
         }
         let mut j = tid;
         while j < wide {
             let (s, i) = (j / hid, j % hid);
-            // SAFETY: t·4·hidden + j < h.len() and j < 4·hidden <=
-            // hnorm.len(); (t·4 + s)·2·hidden + hidden + i < m·8·hidden <=
-            // out.len(), and value j of row t is this thread's alone.
+            // SAFETY: t·streams·hidden + j < h.len() and j < streams·hidden <=
+            // hnorm.len(); (t·streams + s)·2·hidden + hidden + i <
+            // m·streams·2·hidden <= out.len(), and value j of row t is this
+            // thread's alone.
             unsafe {
                 let v = (*h.get_unchecked(t * wide + j) * rh) * *hnorm.get_unchecked(j);
-                *out.get_unchecked_mut((t * STREAMS + s) * pitch + hid + i) = v;
+                *out.get_unchecked_mut((t * n_streams + s) * pitch + hid + i) = v;
             }
             j += INPUT_THREADS;
         }
@@ -361,9 +369,10 @@ mod mtp_kernels {
 }
 
 /// [`MtpKernels::enqueue_mtp_input`]'s arguments: `m` embedding rows of
-/// `hidden` values and `m` hidden rows of four streams, the two gains, the
-/// norms' epsilon, the sink a non-finite row raises on, and the pack, `m ·
-/// 4 · 2·hidden` values.
+/// `hidden` values and `m` hidden rows of `streams` streams (1 or
+/// [`STREAMS`]), the embedding's gain, the hidden row's gain (`streams ·
+/// hidden` values), the norms' epsilon, the sink a non-finite row raises on,
+/// and the pack, `m · streams · 2·hidden` values.
 pub struct MtpInputArgs<'a> {
     pub e: &'a DeviceBuffer<f32>,
     pub h: &'a DeviceBuffer<f32>,
@@ -372,6 +381,7 @@ pub struct MtpInputArgs<'a> {
     pub hidden: usize,
     pub eps: f32,
     pub m: usize,
+    pub streams: usize,
     pub fault: FaultSink,
     pub out: &'a mut DeviceBuffer<f32>,
 }
@@ -408,20 +418,27 @@ impl MtpKernels {
     }
 
     /// Enqueue the draft's input pack over `m` rows ([`MtpInputArgs`],
-    /// module doc). One launch. Asynchronous, allocation-free, capturable.
+    /// module doc); a stream count other than 1 or [`STREAMS`] is refused by
+    /// name. One launch. Asynchronous, allocation-free, capturable.
     pub fn enqueue_mtp_input(
         &self,
         stream: &CudaStream,
         a: MtpInputArgs<'_>,
     ) -> Result<(), GpuError> {
         let what = "mtp::enqueue_mtp_input";
-        let (hid, m) = (a.hidden, a.m);
+        let (hid, m, streams) = (a.hidden, a.m, a.streams);
+        if streams != 1 && streams != STREAMS {
+            return Err(GpuError::shape(
+                what,
+                format!("{streams} streams: the pack takes 1 or {STREAMS}"),
+            ));
+        }
         let lens = [
             ("e", a.e.len(), m * hid),
-            ("h", a.h.len(), m * STREAMS * hid),
+            ("h", a.h.len(), m * streams * hid),
             ("enorm", a.enorm.len(), hid),
-            ("hnorm", a.hnorm.len(), STREAMS * hid),
-            ("out", a.out.len(), m * 2 * STREAMS * hid),
+            ("hnorm", a.hnorm.len(), streams * hid),
+            ("out", a.out.len(), m * 2 * streams * hid),
         ];
         if m == 0 || hid == 0 {
             return Err(GpuError::shape(
@@ -450,6 +467,7 @@ impl MtpKernels {
             launch_u32(what, "hidden", hid)?,
             a.eps,
             launch_u32(what, "m", m)?,
+            launch_u32(what, "streams", streams)?,
             a.fault,
             a.out,
         )?;

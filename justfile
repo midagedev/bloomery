@@ -972,6 +972,16 @@ gate-gpu-qwen35moe-e2e:
 gate-gpu-qwen35moe-verify:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_verify'
 
+# Qwen3.6's own next-token layer (the unsloth UD-Q4_K_M file that carries `blk.40`, pinned by its general.name and size) as a
+# draft through Body35's layer path: the refusals by name at open (the plain file with no next-token layer; a media load),
+# the draft's resident bytes against the plan's figure with the bf16 widening named, the target's token_embd and output
+# read in place at their addresses and copied nowhere, the input join at one stream against the host's rounding band and
+# its refused stream counts, the draft's token equal to the host argmax of its logits, the refusals on the live draft, and
+# a printed smoke of how often the draft's token is the target's own next token over a 64-id prompt. The real file only.
+[group('pool')]
+gate-gpu-qwen35moe-mtp:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-mtp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_mtp'
+
 # Qwen3.6-35B-A3B's DSpark draft, RedHatAI's speculator (an HF directory on the box, `--draft DIR` names another): the dense layers on the card against a host f64 computation of the same layers from the file's bf16
 # weights (a block of 8 rows over 3 and over 2,100 context rows, the window 2,048), the captured pass replaying to the
 # eager bits, and the loader's card bytes. Real file only (the draft belongs to the Q4_K_M target); the gate lock.

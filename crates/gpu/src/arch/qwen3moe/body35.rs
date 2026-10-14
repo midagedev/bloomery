@@ -79,13 +79,14 @@ use super::dispatch::{self, PassCtx};
 use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
 use super::image::{ImageWrite, MediaRows, PromptImage};
+use super::mtp35::Mtp35;
 use super::placed::{
     BatchWalk, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans, counted_arena,
     placed_bytes, placed_scratch, prompt_rows, tally_shape,
 };
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
-    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, kinds35, moe_fits, q35,
+    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, kind35, kinds35, moe_fits, q35,
     shared_entry,
 };
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
@@ -125,7 +126,7 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
-use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, RopeMode};
+use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, RopeMode};
 use model::placement::{Plan, WholeLoad, accepts};
 use runtime::seqstate::{Kept, Price, Why};
 use std::mem::ManuallyDrop;
@@ -466,6 +467,9 @@ pub struct Body35 {
     /// A placed load's placed side ([`Placed`]): the host tier and what the
     /// walks over its legs read; `None` on a whole-card load.
     pub(super) placed: Option<Placed>,
+    /// The file's own next-token layer ([`GpuModel::open_mtp`]); `None` on a
+    /// load that did not ask for it.
+    pub(super) mtp: Option<Mtp35>,
     /// Lanes of every delta store: 1 on a plain load, [`Body35::VERIFY_LANES`]
     /// on a load that verifies drafted rows ([`GpuModel::open_verifying`]).
     lanes: usize,
@@ -1346,6 +1350,58 @@ fn trunk_count(file: &Split, what: &'static str) -> Result<usize, GpuError> {
     Ok(hp.n_trunk)
 }
 
+/// The next-token layer `file` carries, or why it has none: the family's
+/// rule ([`model::arch::draft::draft_usable`]) states every refusal, before
+/// anything is read from the card.
+fn draft_of(file: &Split, o: Open35) -> Result<Box<MtpDraft>, GpuError> {
+    const WHAT_D: &str = "qwen35moe GpuModel::open_mtp";
+    if o.media {
+        return Err(GpuError::shape(
+            WHAT_D,
+            "a media load: its sequences' rotation tables are their own, and the draft reads the \
+             plain table",
+        ));
+    }
+    model::arch::draft::draft_usable(file, None).map_err(|e| GpuError::plan(WHAT_D, e))?;
+    match model::arch::qwen35moe::mtp::in_file(file).map_err(|e| GpuError::plan(WHAT_D, e))? {
+        model::arch::qwen35moe::mtp::InFile::Draft(d) => Ok(d),
+        other => Err(GpuError::shape(
+            WHAT_D,
+            format!("the file's next-token layer reads as {other:?} after the rule admitted it"),
+        )),
+    }
+}
+
+/// The tail block of `file` as the layer `draft` describes it: its plan over
+/// the dims `d` — the trunk's attention, so the one the trunk's layers take —
+/// and its tensors (`blk.{index}.*`, the layer's and the join's and head's
+/// own stems) on the card, the router joined with the shared expert's gate
+/// and the stacks with the shared expert where the plan folds it in, every
+/// site held to the plan ([`check_resident`]).
+fn draft_layer(
+    gpu: &Gpu,
+    file: &Split,
+    d: &Dims,
+    draft: &MtpDraft,
+) -> Result<(Weights, LayerPlan), GpuError> {
+    let l = draft.index as usize;
+    let Kind35::Gqa(flash) = kind35(&draft.layer, l)? else {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}: the next-token layer is full attention, not a delta rule"),
+        ));
+    };
+    let plan = LayerPlan {
+        mixer: MixerPlan::Gqa(plan_gqa(file, d, l, flash)?),
+        ffn: plan_ffn(file, d, &draft.layer, l, Read35::Whole)?,
+    };
+    let prefix = blk(l, "");
+    let mut w = Weights::load_where(gpu.stream(), file, |name| name.starts_with(&prefix))?;
+    join_ffn(gpu.stream(), &mut w, &plan.ffn, l)?;
+    check_resident(&w, d, &plan, true)?;
+    Ok((w, plan))
+}
+
 impl GpuModel<Body35> {
     /// The whole Qwen3.6 model of `file` resident on `gpu`, plus the output
     /// head, with caches of `o.ctx` rows, the decode flash `o.mma` (the
@@ -1354,7 +1410,18 @@ impl GpuModel<Body35> {
     /// type no launch reads refused by name before any upload. The model
     /// takes the file.
     pub fn open(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file, o, PLAIN_LANES)
+        GpuModel::open_lanes(gpu, file, o, PLAIN_LANES, false)
+    }
+
+    /// [`GpuModel::open`] with the file's own next-token layer resident
+    /// beside the trunk ([`Mtp35`]): the tail block's tensors on the card with
+    /// their own K/V planes and arena, the target's `token_embd` and `output`
+    /// read in place ([`GpuModel::mtp_draft`]). The file is asked first
+    /// whether it carries a draft — the reason a file with none is refused is
+    /// `model::arch::draft::draft_usable`'s, before any upload — and a media
+    /// load, whose rotation tables are per sequence, is refused by name.
+    pub fn open_mtp(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
+        GpuModel::open_lanes(gpu, file, o, PLAIN_LANES, true)
     }
 
     /// [`GpuModel::open`] for a load that will verify drafted rows
@@ -1369,17 +1436,20 @@ impl GpuModel<Body35> {
     /// [`GpuModel::open`]'s refusals: resident slots beyond the live
     /// sequence ([`Slots::new_seq`]) and a pass of several slots.
     pub fn open_verifying(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file, o, Body35::VERIFY_LANES)
+        GpuModel::open_lanes(gpu, file, o, Body35::VERIFY_LANES, false)
     }
 
-    /// The whole-card load with `lanes` lanes a delta store.
+    /// The whole-card load with `lanes` lanes a delta store, and the file's
+    /// next-token layer when `mtp`.
     fn open_lanes(
         gpu: Gpu,
         file: Split,
         o: Open35,
         lanes: usize,
+        mtp: bool,
     ) -> Result<GpuModel<Body35>, GpuError> {
         let n_layers = trunk_count(&file, "qwen35moe GpuModel::open")?;
+        let draft = mtp.then(|| draft_of(&file, o)).transpose()?;
         let pre = Pre35::read(&file, o, Read35::Whole)?;
         if pre.layers.len() != n_layers {
             return Err(GpuError::shape(
@@ -1391,7 +1461,18 @@ impl GpuModel<Body35> {
             ));
         }
         GpuModel::load_blocks(gpu, &file, o.ctx, 0..n_layers, true, |gpu, w| {
-            Body35::load(gpu, w, pre, o, lanes)
+            // Before the body, so its ubatch arena is sized from what the
+            // draft leaves free.
+            let d = pre.d;
+            let mtp = draft
+                .map(|draft| {
+                    let layer = draft_layer(gpu, &file, &d, &draft)?;
+                    Mtp35::open(gpu, w, &draft, layer, (d, o.kv))
+                })
+                .transpose()?;
+            let mut body = Body35::load(gpu, w, pre, o, lanes)?;
+            body.mtp = mtp;
+            Ok(body)
         })
     }
 
@@ -1712,6 +1793,7 @@ impl Body35 {
             taps: None,
             draft: None,
             placed,
+            mtp: None,
             lanes,
             lane,
             pending: None,
@@ -3200,6 +3282,60 @@ impl Slots for Body35 {
     /// [`checkpoint_budget35`] a sequence and none at [`Slots::new_seq`].
     fn seq_bytes(&self) -> usize {
         self.store_bytes() + self.rope_bytes()
+    }
+}
+
+impl Body35 {
+    /// The file's next-token layer, resident when the load was opened with
+    /// [`GpuModel::open_mtp`]; `None` on any other load.
+    #[must_use]
+    pub fn mtp(&self) -> Option<&Mtp35> {
+        self.mtp.as_ref()
+    }
+}
+
+/// The next-token layer's call; refused by name on a load without it.
+impl GpuModel<Body35> {
+    /// One step of the file's next-token layer ([`Mtp35`]): token `t` at
+    /// position `pos` over `h`, the target's post-`output_norm` row of the
+    /// position before it (`hidden` f32 on the card), through the layer's own
+    /// K/V rows `0..=pos`; the draft's argmax token, first index on a tie. The
+    /// draft's K/V row `pos` is written, so rows `0..pos` hold the earlier
+    /// steps' of the caller's choosing. A poisoned model is refused; a fault
+    /// the step raises is its error and poisons the model as the target's
+    /// would.
+    pub fn mtp_draft(
+        &mut self,
+        t: u32,
+        pos: usize,
+        h: &DeviceBuffer<f32>,
+    ) -> Result<u32, GpuError> {
+        const WHAT_D: &str = "qwen35moe mtp_draft";
+        self.refuse_if_poisoned(WHAT_D)?;
+        let (gpu, w, body) = self.body_parts(WHAT_D)?;
+        let r = body.mtp_run(gpu, w, (t, pos), h);
+        self.note_fault(WHAT_D, r)
+    }
+}
+
+impl Body35 {
+    /// [`GpuModel::mtp_draft`]'s step over the body's kernels and rope table.
+    fn mtp_run(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        feed: (u32, usize),
+        h: &DeviceBuffer<f32>,
+    ) -> Result<u32, GpuError> {
+        let Body35 {
+            mtp, k, rope, mma, ..
+        } = self;
+        let mtp = mtp.as_mut().ok_or(GpuError::state(
+            "qwen35moe mtp_draft",
+            "the load carries no next-token layer (open it with GpuModel::open_mtp)",
+        ))?;
+        mtp.enqueue(gpu, w, (&*k, &rope.table, *mma), feed, h)?;
+        mtp.token(gpu)
     }
 }
 

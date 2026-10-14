@@ -35,6 +35,7 @@ use crate::arch::{
     architecture_is, meta_arr, meta_f32, meta_usize, metadata, n_vocab, qwen35moe_variant, spec_u32,
 };
 use crate::placement::{ModelTensor, ModelTensors, PlacementError};
+use runtime::stores::{self, dense_kv_bytes};
 
 /// The layer's own stems: the input's norms and projection and the
 /// gated-residual head.
@@ -492,6 +493,16 @@ pub fn output_form(ty: GgmlType) -> Option<BorrowedHead> {
 /// field for it.
 pub const EH_JOIN: [&str; 2] = ["e", "h"];
 
+/// The input join's projection, after `blk.{index}.`: `[e | h]` to one stream.
+pub const EH_PROJ: &str = "nextn.eh_proj.weight";
+/// The gain norming the embedding half of the join.
+pub const ENORM: &str = "nextn.enorm.weight";
+/// The gain norming the head-row half of the join.
+pub const HNORM: &str = "nextn.hnorm.weight";
+/// The gain norming the layer's output before the borrowed head, and the row
+/// the next step reads as its `h`.
+pub const SHARED_HEAD_NORM: &str = "nextn.shared_head_norm.weight";
+
 /// The stems a shaped qwen35moe next-token layer carries. No hyper-connection
 /// head: the layer is one plain stream. The header fixture's tail uses this
 /// list, so the two cannot drift.
@@ -512,10 +523,10 @@ pub(super) const DRAFT_STEMS: &[&str] = &[
     "ffn_gate_shexp.weight",
     "ffn_up_shexp.weight",
     "ffn_down_shexp.weight",
-    "nextn.eh_proj.weight",
-    "nextn.enorm.weight",
-    "nextn.hnorm.weight",
-    "nextn.shared_head_norm.weight",
+    EH_PROJ,
+    ENORM,
+    HNORM,
+    SHARED_HEAD_NORM,
 ];
 
 /// Matrices the layer borrows from the target. A file that carries its own
@@ -607,6 +618,44 @@ pub(crate) fn describe(
         return Ok(None);
     }
     Ok(Some(shaped(hp, tensors, index)?))
+}
+
+/// Card bytes of this in-file draft at `ctx` positions: the next-token
+/// layer's own tensors in `tensors`, one f32 residual stream of
+/// `draft.hidden` and one dense attention KV ([`dense_kv_bytes`]) of the
+/// layer's GQA. The `token_embd` and `output` it borrows are the target's
+/// bytes, counted with the target.
+#[must_use = "the count is this draft's card bytes"]
+pub fn in_file_card_bytes(
+    draft: &MtpDraft,
+    tensors: &ModelTensors,
+    ctx: usize,
+) -> Result<u64, PlacementError> {
+    let Mixer::Gqa(g) = &draft.layer.mixer else {
+        return Err(PlacementError::Metadata {
+            key: format!("{}.nextn", Arch::Qwen35Moe.name()),
+            detail: "the in-file draft's mixer is not full attention".to_string(),
+        });
+    };
+    if draft.hc.is_some() || draft.layer.residual != Residual::Plain {
+        return Err(PlacementError::Metadata {
+            key: format!("{}.nextn", Arch::Qwen35Moe.name()),
+            detail: "the in-file draft is one plain stream".to_string(),
+        });
+    }
+    let own = tensors
+        .tensors
+        .iter()
+        .filter(|t| t.layer == Some(draft.index as usize))
+        .try_fold(0u64, |n, t| n.checked_add(t.file_bytes));
+    let stream = u64::from(draft.hidden) * stores::F32_BYTES;
+    let kv = dense_kv_bytes(g.kv_heads as usize, g.head_dim as usize, ctx);
+    own.and_then(|n| n.checked_add(stream))
+        .and_then(|n| n.checked_add(kv))
+        .ok_or_else(|| PlacementError::Metadata {
+            key: format!("{}.nextn", Arch::Qwen35Moe.name()),
+            detail: "the draft's card bytes overflow u64".to_string(),
+        })
 }
 
 /// `split` carries a matrix the next-token layer borrows from the target.
@@ -714,7 +763,7 @@ fn require_widths(
 ) -> Result<(), PlacementError> {
     let n = hp.n_embd as u64;
     let join = [2 * n, n];
-    let eh = named(tensors, &blk(index, "nextn.eh_proj.weight"))?;
+    let eh = named(tensors, &blk(index, EH_PROJ))?;
     if eh.dims.as_slice() != join {
         return Err(PlacementError::Tensor {
             name: eh.name.clone(),
@@ -729,9 +778,9 @@ fn require_widths(
         });
     }
     for stem in [
-        "nextn.hnorm.weight",
-        "nextn.enorm.weight",
-        "nextn.shared_head_norm.weight",
+        HNORM,
+        ENORM,
+        SHARED_HEAD_NORM,
         "attn_norm.weight",
         "post_attention_norm.weight",
     ] {
@@ -1427,7 +1476,7 @@ mod tests {
 mod in_file_tests {
     use models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, Residual};
 
-    use super::{EH_JOIN, InFile, in_file};
+    use super::{EH_JOIN, InFile, in_file, in_file_card_bytes};
     use crate::arch::Read;
     use crate::arch::draft::draft_usable;
     use crate::arch::synthetic::{V, header_shaped};
@@ -1772,5 +1821,41 @@ mod in_file_tests {
         drop(split);
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("stripped next-token layer"), "{err}");
+    }
+
+    #[test]
+    fn d5_card_bytes_are_the_layer_one_stream_and_one_kv() {
+        let (read, draft) = open("q35m-d5", &keys(5, Some(1)), &shaped());
+        let InFile::Draft(d) = draft.expect("draft") else {
+            panic!("not a draft");
+        };
+        let got = in_file_card_bytes(&d, &read.tensors, 1).expect("the draft sizes");
+        let Mixer::Gqa(g) = &d.layer.mixer else {
+            panic!("not full attention");
+        };
+        let stream = u64::from(d.hidden) * runtime::stores::F32_BYTES;
+        let kv = runtime::stores::dense_kv_bytes(g.kv_heads as usize, g.head_dim as usize, 1);
+        let own: u64 = read
+            .tensors
+            .tensors
+            .iter()
+            .filter(|t| t.layer == Some(d.index as usize))
+            .map(|t| t.file_bytes)
+            .sum();
+        let head = read
+            .tensors
+            .tensors
+            .iter()
+            .find(|t| t.name == "output.weight")
+            .expect("the borrowed head")
+            .file_bytes;
+        assert!(own > 0, "the layer's own tensors");
+        assert_eq!(got, own + stream + kv);
+        assert_ne!(
+            got,
+            own + stream + kv + head,
+            "the borrowed head is the target's"
+        );
+        assert_ne!(got, own + 4 * stream + kv, "a four-stream reserve");
     }
 }

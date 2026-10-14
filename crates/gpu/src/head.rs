@@ -40,11 +40,14 @@ use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
 
-/// The final norm's gain (`output_norm.weight`), resident F32 — the shared
-/// weights reader, so the head's residency error reads like every other
-/// stage's.
-fn head_gain(w: &Weights) -> Result<&DeviceBuffer<f32>, GpuError> {
-    crate::model::f32_gain(w, "output_norm.weight")
+/// The name of the final norm's gain tensor: the one a head reads unless its
+/// body names another ([`Head::with_gain`]).
+pub const OUTPUT_NORM: &str = "output_norm.weight";
+
+/// The final norm's gain `name`, resident F32 — the shared weights reader, so
+/// the head's residency error reads like every other stage's.
+fn head_gain<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceBuffer<f32>, GpuError> {
+    crate::model::f32_gain(w, name)
 }
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
@@ -148,19 +151,21 @@ fn refuse_readback_fault(word: u32, sites: u32) -> Result<(), GpuError> {
     Ok(())
 }
 
-/// Enqueue the final norm `fin` names over `m` rows of `hidden` in `x`
-/// and return the rows the projection reads: its normed rows, or `x` itself.
+/// Enqueue the final norm `fin` names over `m` rows of `hidden` in `x`, its
+/// gain the tensor `gain.1` of the weights `gain.0`, and return the rows the
+/// projection reads: its normed rows, or `x` itself.
 fn norm_rows<'a>(
     gpu: &Gpu,
-    w: &Weights,
+    gain: (&Weights, &str),
     fin: &'a mut Final,
     (eps, hidden, m): (f32, usize, usize),
     x: &'a DeviceBuffer<f32>,
 ) -> Result<&'a DeviceBuffer<f32>, GpuError> {
     match fin {
         Final::Rms { normed } => {
+            let g = head_gain(gain.0, gain.1)?;
             gpu.elem()
-                .enqueue_rms_norm(gpu.stream(), x, head_gain(w)?, eps, hidden, m, normed)?;
+                .enqueue_rms_norm(gpu.stream(), x, g, eps, hidden, m, normed)?;
             Ok(normed)
         }
         Final::Mixed => Ok(x),
@@ -174,6 +179,9 @@ fn norm_rows<'a>(
 /// so a graph that captures it serves every input written into `x`.
 pub struct Head {
     fin: Final,
+    /// The gain tensor's name under [`HeadNorm::Rms`]: [`OUTPUT_NORM`], or
+    /// the one the body's [`Head::with_gain`] named.
+    gain: String,
     eps: f32,
     hidden: usize,
     n_vocab: usize,
@@ -221,7 +229,23 @@ impl Head {
         m: usize,
         norm: HeadNorm,
     ) -> Result<Head, GpuError> {
-        const WHAT: &str = "Head::with_norm";
+        Head::with_gain(gpu, (w, OUTPUT_NORM), w, eps, m, norm)
+    }
+
+    /// [`Head::with_norm`] over two weight sets: the norm's gain is the tensor
+    /// `gain.1` of `gain.0`, the projection `output.weight` of `out` — a draft
+    /// layer's own norm in front of the target's matrix, which it reads where
+    /// it sits ([`Head::enqueue_over`] takes the same two sets). Load-time
+    /// only.
+    pub fn with_gain(
+        gpu: &Gpu,
+        gain: (&Weights, &str),
+        out: &Weights,
+        eps: f32,
+        m: usize,
+        norm: HeadNorm,
+    ) -> Result<Head, GpuError> {
+        const WHAT: &str = "Head::with_gain";
         if !(1..=8).contains(&m) {
             return Err(GpuError::shape(
                 WHAT,
@@ -229,9 +253,9 @@ impl Head {
             ));
         }
         let stream = gpu.stream();
-        let (out_w, k) = head_out_w(w)?;
+        let (out_w, k) = head_out_w(out)?;
         let hidden = match norm {
-            HeadNorm::Rms => head_gain(w)?.len(),
+            HeadNorm::Rms => head_gain(gain.0, gain.1)?.len(),
             HeadNorm::Mixed => k,
         };
         if k != hidden {
@@ -260,6 +284,7 @@ impl Head {
         };
         Ok(Head {
             fin,
+            gain: gain.1.to_string(),
             eps,
             hidden,
             n_vocab,
@@ -270,6 +295,13 @@ impl Head {
             token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
             rows_done,
         })
+    }
+
+    /// The name of the gain tensor the final norm reads ([`OUTPUT_NORM`], or
+    /// what [`Head::with_gain`] was given); a [`HeadNorm::Mixed`] head reads
+    /// none.
+    pub fn gain(&self) -> &str {
+        &self.gain
     }
 
     /// The hidden width the head's norm and projection take.
@@ -314,11 +346,28 @@ impl Head {
     /// word after the tokens. Pure enqueues — no allocation, no
     /// synchronization — so the same body is what a capture records.
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
+        self.enqueue_over(gpu, w, w)
+    }
+
+    /// [`Head::enqueue`] with the norm's gain read from `gain` and the
+    /// projection from `out`: the two sets [`Head::with_gain`] was made over.
+    pub fn enqueue_over(
+        &mut self,
+        gpu: &Gpu,
+        gain: &Weights,
+        out: &Weights,
+    ) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let shape = (self.eps, self.hidden, self.m);
-        let rows = norm_rows(gpu, w, &mut self.fin, shape, &self.x)?;
+        let rows = norm_rows(
+            gpu,
+            (gain, self.gain.as_str()),
+            &mut self.fin,
+            shape,
+            &self.x,
+        )?;
         let fault = gpu.fault_sink(LAYER_HEAD);
-        match head_out_w(w)?.0 {
+        match head_out_w(out)?.0 {
             OutW::Q6K(out_w) => {
                 gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
                 gpu.enqueue_gemv_q6k(out_w, &self.act, &mut self.logits)?;
@@ -396,7 +445,7 @@ impl Head {
         ) -> Result<(), GpuError>,
     {
         let shape = (self.eps, self.hidden, self.m);
-        let rows = norm_rows(gpu, w, &mut self.fin, shape, &self.x)?;
+        let rows = norm_rows(gpu, (w, self.gain.as_str()), &mut self.fin, shape, &self.x)?;
         gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
         tail(
             &self.act,

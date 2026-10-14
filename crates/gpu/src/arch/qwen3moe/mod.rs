@@ -3,7 +3,8 @@
 //! QK-normed grouped-query attention over the layer's own K/V planes, then
 //! eight routed experts; no shared expert, no dense layer), and [`Body35`],
 //! Qwen3.6-35B-A3B (gated-delta-rule layers between gated GQA layers at head
-//! 256, each layer's experts carrying a sigmoid-gated shared expert) — each
+//! 256, each layer's experts carrying a sigmoid-gated shared expert; its
+//! file's own next-token layer runs through that layer body, [`Mtp35`]) — each
 //! layer's kind a load-time plan (`plan`); [`Body38`], Qwen3.8-Flash-Next,
 //! over its own plan and program (`plan38`, [`program38`]: the layers in
 //! gated-residual streams, a selecting attention, every routed expert on the
@@ -28,6 +29,7 @@ pub mod experts;
 pub mod head_argmax;
 mod hostleg;
 mod image;
+mod mtp35;
 mod mtp38;
 mod placed;
 mod plan;
@@ -60,6 +62,7 @@ pub use body38::{
     point_row_budget38, seq_positional_bytes, seq38_bytes,
 };
 pub use draft_taps::TapRowsSink;
+pub use mtp35::{Mtp35, addresses};
 pub use mtp38::{
     BorrowedPlanes, DraftRows38, Held38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
     MtpFeed, MtpHead, MtpHidden, MtpMode, MtpNode, MtpTaps, TargetRows, walk_launches,
