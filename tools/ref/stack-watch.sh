@@ -155,7 +155,8 @@ watch() {
 # The watch on stub commands: output passes through and the code is the command's; a quiet stub named
 # by its comm is dumped and ended; a quiet command with no such process is left to finish; a TERM during
 # a dump or during the last wait ends the dump and the command, and the watch returns after both, with the
-# command's code; after a TERM before the quiet time no dump starts; a TERM as the command starts ends it.
+# command's code; after a TERM before the quiet time no dump starts; a TERM right after the command has
+# started ends it.
 # One line a case, a failed one with the last line of what it read; exit 0 iff none failed.
 self_test() {
   local self t bad=0 out rc w k s left
@@ -182,8 +183,8 @@ self_test() {
   # TERM while the watch waits does not cut that wait short: the watch returns after both, with the command's code (7, two
   # seconds after its TERM).
   mkdir "$t/bin"
-  printf '%s\n' '#!/bin/sh' 'echo $$ > "$SW_GDB"' '[ -n "${SW_HOLD:-}" ] || exit 0' "trap 'sleep 6; exit 0' TERM" \
-    'while :; do sleep 1; done' > "$t/bin/gdb"
+  printf '%s\n' '#!/bin/sh' "[ -z \"\${SW_HOLD:-}\" ] || trap 'sleep 6; exit 0' TERM" 'echo $$ > "$SW_GDB"' \
+    '[ -n "${SW_HOLD:-}" ] || exit 0' 'while :; do sleep 1; done' > "$t/bin/gdb"
   printf '%s\n' 'echo $$ > "$SW_CMD"' "trap 'sleep 2; exit 7' TERM" 'sleep 30 &' 'wait' > "$t/cmd"
   chmod +x "$t/bin/gdb"
   command -v timeout > /dev/null || cp "${self%/*}/stub-timeout.py" "$t/bin/timeout"
@@ -200,7 +201,7 @@ self_test() {
   kill -0 "$(cat "$t/cmd.pid")" 2> /dev/null && left="$left command"
   echo "dumping: $([ -s "$t/gdb.pid" ] && echo yes || echo no), ended in $((SECONDS - s)) s, left:${left:- none}" >> "$t/e"
   # PIN(2026-10-15): was [0-7] s: the stub gdb ends six seconds after its TERM, so the watch returns about 6 s after the TERM;
-  # a gdb the TERM does not reach holds until the dump's 120 s bound, far past 19 s.
+  # a gdb the TERM does not reach holds until the dump's bound (a TERM at 120 s), far past 19 s.
   case_ 'a TERM during the dump ends it and the command, their code kept' 7 'dumping: yes, ended in 1?[0-9] s, left: none$' "$rc" "$t/e"
   # A TERM while the watch waits for the command, after it has ended the command's quiet process (the command goes on after
   # it), ends the command, and the watch returns after it, with its code.
@@ -216,13 +217,14 @@ self_test() {
   kill -0 "$(cat "$t/cmd2.pid")" 2> /dev/null && left=' command'
   echo "quiet process ended: $([ -e "$t/after" ] && echo yes || echo no), left:${left:- none}" >> "$t/f"
   case_ 'a TERM during the last wait ends the command, its code kept' 7 'quiet process ended: yes, left: none$' "$rc" "$t/f"
-  # A TERM before the quiet time, to a command that takes five seconds to end after its TERM (longer than the quiet time):
-  # the watch starts no dump after the TERM, and returns when the command ends, with its code.
-  printf '%s\n' 'echo $$ > "$SW_CMD"' "trap 'sleep 5; exit 7' TERM" 'echo start' 'sleep 30 &' 'wait' > "$t/cmd3"
+  # A TERM before the quiet time, to a command that prints every 0.2 s until its TERM and then takes five seconds to end (longer
+  # than the quiet time): the watch starts no dump after the TERM, and returns when the command ends, with its code. The printing,
+  # not the TERM's timing, keeps the quiet time from running out before the TERM.
+  printf '%s\n' "trap 'sleep 5; exit 7' TERM" 'echo $$ > "$SW_CMD"' 'while :; do echo tick; sleep 0.2; done' > "$t/cmd3"
   SW_GDB=$t/gdb3.pid SW_CMD=$t/cmd3.pid PATH=$t/bin:$PATH bash "$self" 2 sleep -- sh "$t/cmd3" > "$t/g" 2>&1 &
   w=$! k=0
   until [ -s "$t/cmd3.pid" ] || [ "$k" = 50 ]; do sleep 0.2; k=$((k + 1)); done
-  sleep 0.5
+  sleep 1
   s=$SECONDS
   kill -TERM "$w"
   rc=0; wait "$w" || rc=$?
@@ -231,8 +233,9 @@ self_test() {
   echo "dumped: $([ -e "$t/gdb3.pid" ] && echo yes || echo no), ended in $((SECONDS - s)) s, left:${left:- none}" >> "$t/g"
   case_ 'a TERM before the quiet time: no dump after it, the command awaited, its code kept' 7 \
     'dumped: no, ended in [4-7] s, left: none$' "$rc" "$t/g"
-  # A TERM as soon as the command runs (it sets its trap, then writes its pid): the command gets it, and the watch returns after
-  # the command, with its code. A command still there once the checks are made is let go.
+  # A TERM right after the command has started (it sets its trap, then writes its pid; the watch has read the pid by then): the
+  # command gets it, and the watch returns after the command, with its code. A command still there once the checks are made is
+  # let go.
   printf '%s\n' "trap 'exit 7' TERM" 'echo $$ > "$SW_CMD"' 'while :; do sleep 1; done' > "$t/cmd4"
   SW_CMD=$t/cmd4.pid bash "$self" 30 sleep -- sh "$t/cmd4" > "$t/h" 2>&1 &
   w=$! k=0
@@ -243,7 +246,7 @@ self_test() {
   kill -0 "$(cat "$t/cmd4.pid" 2> /dev/null)" 2> /dev/null && left=' command'
   echo "command ran: $([ -s "$t/cmd4.pid" ] && echo yes || echo no), left:${left:- none}" >> "$t/h"
   [ -z "$left" ] || kill -TERM "$(cat "$t/cmd4.pid")" 2> /dev/null
-  case_ 'a TERM as the command starts: the command ended, its code kept' 7 'command ran: yes, left: none$' "$rc" "$t/h"
+  case_ 'a TERM right after the command has started: the command ended, its code kept' 7 'command ran: yes, left: none$' "$rc" "$t/h"
   [ "$bad" = 0 ] && echo "stack-watch self-test: ok" || echo "stack-watch self-test: $bad failed"
   [ "$bad" = 0 ]
 }
