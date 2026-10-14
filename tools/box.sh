@@ -111,7 +111,7 @@
 #   '…'`: the lock is held shared for the job's life, children included, and not taking it ends 85. Inside,
 #   a .sync-id that is not this call's id (another sync replaced the tree after the submit) ends 80 before
 #   anything runs. box.sh produces 80, 83 and 85 only, and tools/boxq.py passes them through; boxq.py's own
-#   are 81, 84 and 130/143 (see its header). A queued job has no stdin, and BLOOMERY_BOX_WAIT and
+#   are 81, 84 and 130/143 (see its header). A queued job has no stdin (input waiting on it is refused, 64), and BLOOMERY_BOX_WAIT and
 #   BLOOMERY_HOLD_OWNER do not reach the daemon.
 #   BLOOMERY_Q_CLASS=lead|round|sitting|fill   the job's class, which sets its priority (default round)
 #   BLOOMERY_Q_CARD=3090|a6000|both|any|none   the lane (default BLOOMERY_CARD, else 3090; both set to
@@ -583,6 +583,12 @@ esac
 QLOCK_DIR=/root/bloomery-queue
 QKEY= QLOCK= QCLASS= QLANE= QPRED= SYNC_ID=
 if [ "$QUEUE" = 1 ]; then
+  # A queued job has no stdin (the header): a script piped or redirected in would never reach it, and the job would run an empty
+  # one and end 0. Input waiting on stdin (a non-empty file, or a pipe with bytes ready) is refused before anything is synced.
+  if { [ -f /dev/stdin ] && [ -s /dev/stdin ]; } || { [ -p /dev/stdin ] && read -r -t 0 2> /dev/null; }; then
+    echo "box.sh: BLOOMERY_BOX_QUEUE=1 and input on stdin: a queued job has no stdin, so it would run without it; put the script in the tree or the command, or run with < /dev/null" >&2
+    exit 64
+  fi
   QKEY=$(basename "$REMOTE")
   case $QKEY in
     '' | *[!A-Za-z0-9._-]*) echo "box.sh: the remote directory's name is the dir lock's key, [A-Za-z0-9._-]+, got '$QKEY' (BLOOMERY_REMOTE=$REMOTE)" >&2; exit 64 ;;

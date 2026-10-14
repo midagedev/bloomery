@@ -616,7 +616,7 @@ chmod +x "$tmp/stub/ssh" "$tmp/stub/rsync"
 # The caller's own box.sh variables are dropped (a batch run with BLOOMERY_HOLD_OWNER set runs these
 # tests too), and HOME is a fresh one, so a Mac-side hold under ~/.cache/bloomery/box-hold does not refuse
 # them; a test that wants one sets it after `box`.
-box() {
+box_run() {
   : > "$tmp/ssh.log"
   rm -f "$tmp/rsync.log" "$tmp/rsync.sync-id" "$tmp/rsync.sync-path" "$tmp/boxq.args" "$tmp/boxq.job"
   env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_READONLY -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD \
@@ -625,6 +625,10 @@ box() {
     -u BLOOMERY_BOX_LOCAL -u BLOOMERY_ENV_FILE -u BLOOMERY_LOCK_DIR \
     STUB_BOXQ_ARGS="$tmp/boxq.args" STUB_BOXQ_JOB="$tmp/boxq.job" \
     HOME="$tmp/home" PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
+}
+# box [ARGS]: box_run with stdin as it is, or from BOX_STDIN when that is set.
+box() {
+  if [ -n "${BOX_STDIN:-}" ]; then box_run "$@" < "$BOX_STDIN"; else box_run "$@"; fi
 }
 sshlog() {
   if grep -Eq -- "$2" "$tmp/ssh.log"; then pass "$1"; else fail "$1" "no ssh line matches /$2/" "$tmp/ssh.log"; fi
@@ -854,6 +858,15 @@ run 'box.sh: BLOOMERY_CARD and BLOOMERY_Q_CARD that differ are refused' 64 "BLOO
   box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_CARD=a6000 BLOOMERY_Q_CARD=both "$B/tools/box.sh" true
 nofile 'box.sh: the differing lanes synced nothing' "$tmp/rsync.log"
 run 'box.sh: BLOOMERY_CARD=any is not a lane (only BLOOMERY_Q_CARD takes it)' 64 'BLOOMERY_CARD must be 3090, a6000 or both' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_CARD=any "$B/tools/box.sh" true
+# A queued job has no stdin: a script redirected or piped in is refused by name before any sync, not run as an empty one.
+printf 'echo from-stdin\n' > "$tmp/stdin.sh"
+BOX_STDIN=$tmp/stdin.sh run 'box.sh: a queued call with a file on stdin is refused' 64 'a queued job has no stdin' \
+  box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" 'bash -s'
+if [ ! -s "$tmp/rsync.log" ] && [ ! -e "$tmp/boxq.args" ]; then pass 'box.sh: … before any sync or submit'; else fail 'box.sh: … before any sync or submit' 'rsync or boxq ran' "$tmp/rsync.log"; fi
+piped_box() { printf 'echo x\n' | BOX_STDIN=/dev/stdin box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" 'bash -s'; }
+run 'box.sh: a queued call with a pipe of input on stdin is refused' 64 'a queued job has no stdin' piped_box
+BOX_STDIN=$tmp/stdin.sh rc_is 'box.sh: a direct call still takes a file on stdin' 0 box "$B/tools/box.sh" 'bash -s'
+rc_is 'box.sh: a queued call with an empty stdin runs' 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" true
 run 'box.sh: BLOOMERY_Q_CARD is a lane' 64 'BLOOMERY_Q_CARD must be 3090, a6000, both, any or none, got .moon.' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=moon "$B/tools/box.sh" true
 # `any`: the card is the daemon's choice, read when the job starts; `none`: no card pin beyond the default.
 rc_is 'box.sh: BLOOMERY_Q_CARD=any' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=any "$B/tools/box.sh" true

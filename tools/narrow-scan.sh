@@ -45,7 +45,9 @@
 # It runs no gate and takes no timing lease, no hold, no card and no gate lock: `--no-jit` loads nothing on a card, and
 # the box commands are builds and ptxas. box.sh's own guard still waits while a sitting's lease or hold is up (rc 75 is
 # contention: run again, BLOOMERY_BOX_WAIT=3600 waits longer). BLOOMERY_CARD, BLOOMERY_BOX_ENV and BLOOMERY_TIER are
-# unset for the box calls, so nothing card-related reaches the box. The scans are sm_86's: a BLOOMERY_ARCH naming another
+# unset for the box calls, so nothing card-related reaches the box, and so are BLOOMERY_BOX_QUEUE and the queue's
+# settings: the runner goes over stdin and the stop signals pids the direct path records, and a queued job has neither.
+# A runner that arrives empty ends the side 65 by name, never an empty scan read as rc 0. The scans are sm_86's: a BLOOMERY_ARCH naming another
 # arch is refused (64) before anything runs.
 #
 # DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>, <base8>-worktree under `--worktree`) keeps: scan-set.tsv, runner.sh (the script each side
@@ -199,7 +201,7 @@ lock_release() { # lock_release <lock dir>: only the holder's own
 # came before it (the guard's 75, the backend's 70). The leading `:` names `cargo oxide`, which makes box.sh check the pinned backend
 # before the command, as it does for a recipe.
 side_command() {
-  printf '%s' ': cargo oxide && T=$(mktemp) && cat > "$T" && { timeout --kill-after=10 '"$1"' bash "$T" </dev/null & echo $! > '"$2"'; wait $!; }; rc=$?; rm -f "$T" '"$2"'; exit $rc'
+  printf '%s' ': cargo oxide && T=$(mktemp) && cat > "$T" && { [ -s "$T" ] || { echo "narrow-scan: the runner arrived empty on stdin" >&2; rm -f "$T"; exit 65; }; } && { timeout --kill-after=10 '"$1"' bash "$T" </dev/null & echo $! > '"$2"'; wait $!; }; rc=$?; rm -f "$T" '"$2"'; exit $rc'
 }
 
 # stop_command <pid file>: the READONLY box command of a stop: signals the pid the side command recorded, if the file is there.
@@ -270,7 +272,8 @@ run_side() {
   # makes the subshell the leader of a process group of its own, so a stop reaches box.sh's ssh and rsync with the one pid.
   set -m
   (
-    cd "$src" && exec env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER GIT_CEILING_DIRECTORIES="$out" BLOOMERY_REMOTE="$dir" \
+    cd "$src" && exec env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER \
+      -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S GIT_CEILING_DIRECTORIES="$out" BLOOMERY_REMOTE="$dir" \
       ./tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out"
   ) > "$fifo" &
   bp=$!
@@ -289,6 +292,7 @@ run_side() {
     0) ;;
     75) echo "narrow-scan: $name: rc 75: the box is held by a sitting or a lease (contention, not failure; nothing was built): run again, BLOOMERY_BOX_WAIT=3600 waits longer" >&2 ;;
     124 | 137) echo "narrow-scan: $name: the bound of ${bound}s ended the box command (rc $rc); the dir keeps its compiled crates: run again to continue" >&2 ;;
+    65) echo "narrow-scan: $name: rc 65: the runner reached the box empty (nothing was scanned)" >&2 ;;
     70) echo "narrow-scan: $name: rc 70: the box's cuda-oxide backend is missing for this commit's pin (tools/box.sh header)" >&2 ;;
     *) echo "narrow-scan: $name: the box command ended rc $rc (the commit's build or a scan: $out/$name.build.log)" >&2 ;;
   esac
@@ -318,6 +322,9 @@ self_test() {
   sed -n "/^cat > \"\$P\" <<'NARROW_PTX_SCAN_EOF'$/,/^NARROW_PTX_SCAN_EOF$/p" "$t/runner.sh" | sed '1d;$d' | cmp -s - "$t/ptx-scan.sh"; ok "runner: ptx-scan.sh embedded verbatim" $?
   [ "$(grep -c '^echo "narrow-scan: wall: ' "$t/runner.sh")" = 6 ]; ok "runner: a wall line per build group, the extractor and each scan" $?
   case $(side_command 900 .p-1) in *"cargo oxide"*) ;; *) false ;; esac; ok "side command: names cargo oxide, so box.sh checks the backend" $?
+  rc=0; got=$(cd "$t" && bash -c "$(side_command 900 .p-empty)" < /dev/null 2>&1) || rc=$?
+  [ "$rc" = 65 ] && grep -qF "the runner arrived empty on stdin" <<< "$got" && [ ! -e "$t/.p-empty" ]; ok "side command: an empty runner ends 65 by name, never an empty scan's 0" $?
+  grep -qE -- '^ +-u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S GIT_CEILING' "$0"; ok "side call: the queue's settings are unset, so the runner's stdin reaches the box" $?
   case $(side_command 900 .p-1) in *"timeout --kill-after=10 900 bash"*) ;; *) false ;; esac; ok "side command: the runner runs under the bound" $?
   case $(side_command 900 .p-1) in *'echo $! > .p-1'*) ;; *) false ;; esac; ok "side command: the runner's pid is recorded in the named file" $?
   case $(side_command 900 .p-1) in *'rm -f "$T" .p-1'*) ;; *) false ;; esac; ok "side command: the pid file goes when the runner ends" $?
