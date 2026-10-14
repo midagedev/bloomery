@@ -1879,7 +1879,7 @@ pub static NVREAD: Kind = Kind {
 pub static TIME_PROMPT: Kind = Kind {
     name: "time_prompt",
     head: "time prompt",
-    doc: "The feed's wall, before the first fed step to after the readback of generated token 0, and the passes it took.",
+    doc: "The feed's wall, before the first fed step to after the readback of generated token 0, and the passes it took. kind is the feed's word (batch, steps, pairs, and the binary's own); passes counts that feed's passes, and under pairs it is the replay count.",
     parts: &[
         key("n", U64, "positions"),
         key("ms", F64(4), "ms"),

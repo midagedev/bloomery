@@ -22,9 +22,10 @@
 //!
 //! Greedy only, one token per generated step. The fed ids go in batches of
 //! up to `body::T_MAX` positions (`body::prefill`, bit for bit the steps'
-//! state); `BLOOMERY_PREFILL=steps` feeds them one real step per id instead,
-//! the same binary's timing arm, and the `load` line prints which one ran
-//! (`prefill=`, the mode the engine holds). The levers it acts on (`ACTS_ON`)
+//! state), except a batch-mode call of at most `body::PAIR_BELOW` ids, which
+//! is pair replays (`time prompt` `kind=pairs`); `BLOOMERY_PREFILL=steps`
+//! feeds them one real step per id instead, the same binary's timing arm, and
+//! the `load` line prints which one ran (`prefill=`, the mode the engine holds). The levers it acts on (`ACTS_ON`)
 //! are parsed once, at `main` (`bloomery_levers::at_main`), which refuses by
 //! name a lever set outside them and a `BLOOMERY_*` name no registry row
 //! names; `--levers` prints them with this process's values and exits.
@@ -92,12 +93,14 @@
 //! before the first fed step to after the readback of generated token 0.
 //! `passes` is the passes the feed took: the batches under `kind=batch`
 //! (with the DSpark draft, each batch's feature rows are read and appended
-//! to the draft inside the wall), one step per id under `kind=steps` — the
-//! step rate by construction, at or above it, since that feed runs one body
-//! per id and reads back once at the end — or `dspark` (the step feed with
-//! the draft: one readback per id, its feature reads and draft appends) or
-//! `checked` (the finite probe's eager steps run inside the wall; the probe
-//! always feeds step by step). The row prints on every run,
+//! to the draft inside the wall), the replays under `kind=pairs` (a
+//! batch-mode call of at most `body::PAIR_BELOW` ids: `called.div_ceil(2)`,
+//! plus the last id's step under `--serve-feed`), one step per id under
+//! `kind=steps` — the step rate by construction, at or above it, since that
+//! feed runs one body per id and reads back once at the end — or `dspark`
+//! (the step feed with the draft: one readback per id, its feature reads and
+//! draft appends) or `checked` (the finite probe's eager steps run inside the
+//! wall; the probe always feeds step by step). The row prints on every run,
 //! after the loop, as a runtime value like the `load` line; it is a
 //! measurement only under the lease, as `time step` is. Nothing is printed
 //! between two timed steps. `--warm W` drops the first W generated steps from the
@@ -148,7 +151,9 @@
 //! its card's experts (`call layer`), the needs (`call need`) and every
 //! layer-batch's starts and sub-blocks (`call lb`) — and exits before the
 //! load; it is refused with `--time`, beside `BLOOMERY_DRAFT=dspark` (its
-//! feed widens the tapped layers' blocks) and beside a feed of steps.
+//! feed widens the tapped layers' blocks), beside a feed of steps, and beside
+//! a batch-mode prompt of at most `body::PAIR_BELOW` ids (that call walks
+//! pair replays and runs no batch).
 //!
 //! The binary owns its main thread, so it pins it to the dispatcher's cpu
 //! slot (`threads::pool().pin_caller()`), as `bloomery-decode` and
@@ -174,7 +179,8 @@
 //! and `code:P` the first P ids of `$BLOOMERY_DATA/engram/corpus-<name>.ids`
 //! as `--tokens` does, each optionally followed by `/N`, its own `-n`. Each
 //! arm opens with an `arm` record (its index, the list's length, the feed and
-//! its counts), then its call's plan under a batched feed, then every line a
+//! its counts), then its call's plan under a batched feed of more than
+//! `body::PAIR_BELOW` ids, then every line a
 //! one-arm run prints after its capture; each arm after the first starts
 //! from the session's clear, so it prints the tokens, logits and counters it
 //! prints in a fresh process. Before each arm after the first, the state-back
@@ -821,6 +827,17 @@ mod drive {
             .ok_or("generate_ds41: no arm to run")?;
         let (depth, fed_n) = (widest.ids.len() / slots, widest.a.n_gen);
         let fed = depth + fed_n - 1;
+        if a.plan && batched && draft != Draft::Dspark {
+            let called = depth.saturating_sub(usize::from(a.diag.serve_feed));
+            if called <= body::PAIR_BELOW {
+                return Err(format!(
+                    "--plan is refused with a prompt of at most {} ids \
+                     (BLOOMERY_PREFILL=batch): it walks pair replays and runs no batch",
+                    body::PAIR_BELOW
+                )
+                .into());
+            }
+        }
         let draft_file = match draft {
             Draft::Dspark => Some(dspark::draft_hparams()?),
             _ => None,
@@ -1421,9 +1438,10 @@ mod drive {
                     .into());
                 }
             }
-            let view = self
-                .call
-                .then(|| CallView::of(self.cfg, self.hp, self.ctx_max, r.ids.len() / self.slots));
+            let n = r.ids.len() / self.slots;
+            let called = n.saturating_sub(usize::from(self.slots == 1 && r.a.diag.serve_feed));
+            let view = (self.call && called > body::PAIR_BELOW)
+                .then(|| CallView::of(self.cfg, self.hp, self.ctx_max, n));
             if let Some(c) = &view {
                 c.print(false, self.hp, &[]);
             }
@@ -1886,7 +1904,8 @@ mod drive {
             // call before it runs.
             // Under `--serve-feed` the call runs every id but the last.
             let called = depth - usize::from(a.diag.serve_feed);
-            let call = (self.batched && self.draft != Draft::Dspark && a.arms.is_empty())
+            let pairs = self.batched && self.draft != Draft::Dspark && called <= body::PAIR_BELOW;
+            let call = (self.batched && self.draft != Draft::Dspark && a.arms.is_empty() && !pairs)
                 .then(|| CallView::of(self.cfg, &inputs.hp, ctx_max, called));
             if let Some(c) = &call {
                 c.print(a.plan, &inputs.hp, &plan.n_l);
@@ -2091,7 +2110,7 @@ mod drive {
         /// Before the first fed step to after the readback of generated
         /// token 0.
         wall: Duration,
-        /// `steps`, `dspark`, or `checked` under the finite probe.
+        /// `batch`, `pairs`, `steps`, `dspark`, or `checked`.
         kind: &'static str,
     }
 
@@ -2151,8 +2170,8 @@ mod drive {
     /// (in batches under `f.mode` `Batch`, else one real step per id), the
     /// draft's tapped call, or the finite probe's steps — print the `fed` and
     /// `step 0` lines, and return the first generated token and the feed's
-    /// wall. `steps` is the `time prompt` row's kind when the feed is not a
-    /// batch.
+    /// wall. `steps` is the `time prompt` row's kind when the feed is neither
+    /// a batch nor the short pair walk.
     fn feed<A: Advance<Session<Body>>>(
         s: &mut Session<Body>,
         adv: &mut A,
@@ -2167,20 +2186,33 @@ mod drive {
         let next = adv.prompt(s, ids)?;
         let wall = t.elapsed();
         print_step0(s.pos() - 1, next, depth, wall);
-        if batch {
+        let called = if f.serve { depth - 1 } else { depth };
+        // A short batch is the session's pair walk: it ran no batch, so the
+        // printed plan's needs are not checked and the union line is not
+        // printed. `passes` is the replay count, plus the last id's step
+        // under `--serve-feed`.
+        let pairs = batch && called <= body::PAIR_BELOW;
+        if batch && !pairs {
             check_plan(s.model(), f.need)?;
             print_union(s.model_mut(), &f.base)?;
         }
-        let called = if f.serve { depth - 1 } else { depth };
         let time = FeedTime {
             n: depth,
-            passes: if batch {
+            passes: if pairs {
+                called.div_ceil(2) + usize::from(f.serve)
+            } else if batch {
                 body::batch_count(called) + usize::from(f.serve)
             } else {
                 depth
             },
             wall,
-            kind: if batch { "batch" } else { steps },
+            kind: if pairs {
+                "pairs"
+            } else if batch {
+                "batch"
+            } else {
+                steps
+            },
         };
         Ok((next, time))
     }

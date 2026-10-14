@@ -18,6 +18,16 @@
 //! `Body::keep_point` grants restores a row outside those — what the batch
 //! leaves unwritten is never claimed.
 //!
+//! A text `Batch` prompt of at most [`body::PAIR_BELOW`] ids is the session's
+//! pair walk, not [`body::prefill`] (the cases below keep pinning the batch).
+//! Four clauses, before the long oracle: the call runs no batch and no union
+//! columns; its rings, compressor state, compressed rows, index keys, logits,
+//! shadow rows and kept features equal the same ids as graph steps (the
+//! batch's shadow exception does not apply — the walk writes every row the
+//! steps write); with a residency machine every folded pass is `prompt`
+//! keeping 0 rows, and `P` of 1 and 3 are in that clause; `keep_point` equals
+//! the step walk.
+//!
 //! - **Clear.** First, right after the load and the step's capture, before
 //!   any other call touches the model: three arms through the session
 //!   (`app::Session::arms`), each after the first from `Session::clear` —
@@ -235,6 +245,7 @@ mod gate {
     use std::time::Instant;
 
     use app::Session;
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::hybrid::{HOST, HandoffLayout, HandoffTarget, PageLayout};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::q4k_sel::tile_cap;
@@ -275,7 +286,7 @@ mod gate {
     use model::arch::deepseek41::names;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::workstation;
-    use runtime::{Target, Want};
+    use runtime::{TappedPrompt, Target, Want};
 
     use crate::{dspark, finite, split};
     use bloomery_gpu_gates::tier;
@@ -523,6 +534,19 @@ mod gate {
         }
         let clear_t = Instant::now();
         let mut s = Session::from_model(m, u32::try_from(workstation::CTX_MAX)?);
+        let pair_ids = corpus("prose", body::PAIR_BELOW)?;
+        crate::ds41_tier::sc(
+            "pair dispatch: a prompt of PAIR_BELOW ids runs no batch and no union columns",
+        )?;
+        pass &= pair_dispatch(&mut s, &pair_ids)?;
+        crate::ds41_tier::sc("pair bits: the short prompt equals the same ids as graph steps")?;
+        pass &= pair_bits(&mut s, &pair_ids, &hp, dhp.window)?;
+        crate::ds41_tier::sc(
+            "pair residency: the walk's passes are prompt keeps of 0 rows, P = 1 and 3 included",
+        )?;
+        pass &= pair_residency(&mut s, &pair_ids)?;
+        crate::ds41_tier::sc("pair keep: keep_point equals the step walk")?;
+        pass &= pair_keep(&mut s, &pair_ids)?;
         crate::ds41_tier::sc(
             "clear: A after B and a clear is A right after the load, every field",
         )?;
@@ -764,6 +788,258 @@ mod gate {
             .filter_map(|(name, same)| (!same).then_some(name))
             .collect()
         }
+    }
+
+    /// The session prompt of [`body::PAIR_BELOW`] ids runs no batch: prefill
+    /// batches stay 0 and the host tier's batch columns do not move. Red when
+    /// the short prompt is routed back through [`body::prefill`].
+    fn pair_dispatch(s: &mut Session<Body>, ids: &[u32]) -> Result<bool, GateError> {
+        const P: usize = 6;
+        if body::PAIR_BELOW != P || ids.len() < P {
+            return Err(format!(
+                "{NAME}: pair dispatch pins P = {P}, PAIR_BELOW is {}, ids {}",
+                body::PAIR_BELOW,
+                ids.len()
+            )
+            .into());
+        }
+        let m = s.model_mut();
+        m.reset()?;
+        m.body_parts(NAME)?.2.take_prefill_stats();
+        let base = m.body(NAME)?.hybrid().stats();
+        s.prompt(&ids[..P], Want::Argmax)?;
+        let st = s.model_mut().body_parts(NAME)?.2.take_prefill_stats();
+        let now = s.model().body(NAME)?.hybrid().stats();
+        let cols = now.batch_cols - base.batch_cols;
+        let served = now.batch_served - base.batch_served;
+        let ok = st.batches == 0 && cols == 0 && served == 0;
+        println!(
+            "{NAME}: pair dispatch P={P}: batches={} union_cols={cols} union_layers={served}: {}",
+            st.batches,
+            verdict(ok)
+        );
+        s.model_mut().reset()?;
+        Ok(ok)
+    }
+
+    /// The session's tapped prompt against `P` graph steps, for an even `P`
+    /// and an odd one: ring, compressor state, compressed rows, index keys,
+    /// logits, every shadow row of `0..P`, and the kept feature rows. The
+    /// batch's shadow-hole exception does not apply. Red when a pair head (or
+    /// the one-row replay's head) moves by one ulp.
+    fn pair_bits(
+        s: &mut Session<Body>,
+        ids: &[u32],
+        hp: &Hparams,
+        window: usize,
+    ) -> Result<bool, GateError> {
+        let width = s.model().body(NAME)?.feature_width();
+        if width == 0 {
+            return Err(format!("{NAME}: pair bits: the feature tap has no width").into());
+        }
+        let mut ok = true;
+        for p in [3usize, 6] {
+            if ids.len() < p {
+                return Err(format!("{NAME}: pair bits: {p} ids, have {}", ids.len()).into());
+            }
+            let m = s.model_mut();
+            m.reset()?;
+            let mut want_feats = Vec::with_capacity(p);
+            let mut want_token = 0;
+            for (i, &id) in ids.iter().enumerate().take(p) {
+                want_token = m.step(&[id])?;
+                let (gpu, _, b) = m.body_parts(NAME)?;
+                let f = b.read_features(gpu, 1)?;
+                if f.pos as usize != i {
+                    return Err(format!(
+                        "{NAME}: pair bits: features after step {i} name {}",
+                        f.pos
+                    )
+                    .into());
+                }
+                want_feats.push(md5(&bytes_of(f.values)));
+            }
+            let (want_snap, want_shadow) = pair_shot(m, hp, p)?;
+            m.reset()?;
+            let from = p.saturating_sub(window.min(p));
+            let mut got_feats: Option<(u32, Vec<Digest>)> = None;
+            let mut sink_note = String::new();
+            let got_token = s.prompt_tapped(&ids[..p], window, &mut |first, rows| {
+                if got_feats.is_some() {
+                    sink_note = "more than one feature call".to_string();
+                    return Ok(());
+                }
+                if !rows.len().is_multiple_of(width) {
+                    sink_note = format!("feature bytes {} not a multiple of {width}", rows.len());
+                    return Ok(());
+                }
+                let ds = rows
+                    .chunks_exact(width)
+                    .map(|r| md5(&bytes_of(r)))
+                    .collect();
+                got_feats = Some((first, ds));
+                Ok(())
+            })?;
+            let (got_snap, got_shadow) = pair_shot(s.model_mut(), hp, p)?;
+            let feats_ok = match &got_feats {
+                Some((first, ds)) => {
+                    *first as usize == from
+                        && ds.len() == p - from
+                        && ds.iter().zip(&want_feats[from..]).all(|(a, b)| a == b)
+                        && sink_note.is_empty()
+                }
+                None => from == p && sink_note.is_empty(),
+            };
+            let token_ok = got_token == want_token;
+            let ring_ok = got_snap.ring == want_snap.ring;
+            let state_ok = got_snap.state == want_snap.state;
+            let rows_ok = got_snap.rows == want_snap.rows;
+            let keys_ok = got_snap.keys == want_snap.keys;
+            let logits_ok = got_snap.logits == want_snap.logits;
+            let shadow_ok = got_shadow == want_shadow;
+            let same = token_ok
+                && ring_ok
+                && state_ok
+                && rows_ok
+                && keys_ok
+                && logits_ok
+                && shadow_ok
+                && feats_ok;
+            ok &= same;
+            println!(
+                "{NAME}: pair bits P={p}: token {} ring {} state {} rows {} keys {} logits {} \
+                 shadow {} features {}{}: {}",
+                verdict(token_ok),
+                verdict(ring_ok),
+                verdict(state_ok),
+                verdict(rows_ok),
+                verdict(keys_ok),
+                verdict(logits_ok),
+                verdict(shadow_ok),
+                verdict(feats_ok),
+                if sink_note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({sink_note})")
+                },
+                verdict(same)
+            );
+            s.model_mut().reset()?;
+        }
+        Ok(ok)
+    }
+
+    /// Ring, state, the rows below `p`, the logits, and every shadow row of
+    /// `0..p`, as the model stands.
+    fn pair_shot(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+        p: usize,
+    ) -> Result<(Snap, Vec<Vec<Digest>>), GateError> {
+        let mut snap = live(m)?;
+        snap.logits = bits(&m.logits()?);
+        written_rows(m, hp, p, &mut snap)?;
+        let shadow = shadow_rows(m, hp, p)?;
+        Ok((snap, shadow))
+    }
+
+    /// `P` of 1, 3 and 6: the session prompt succeeds, and when a residency
+    /// machine is logging, the folded passes are exactly `ceil(P/2)` prompt
+    /// keeps of 0 rows (the leading `none` is the pass the first boundary
+    /// ended). This gate's load has no machine, so the log stays empty and a
+    /// `keep_rows(prefix(1), Step)` edit is not visible here; routing the odd
+    /// id through `GpuModel::step` is, because the keep after an ahead
+    /// boundary is refused.
+    fn pair_residency(s: &mut Session<Body>, ids: &[u32]) -> Result<bool, GateError> {
+        let mut ok = true;
+        for p in [1usize, 3, 6] {
+            if ids.len() < p {
+                return Err(format!("{NAME}: pair residency: {p} ids, have {}", ids.len()).into());
+            }
+            let replays = p.div_ceil(2);
+            let m = s.model_mut();
+            m.reset()?;
+            // A machine keeps the previous walk's last keep until a boundary
+            // folds it. The reset drops that pass so this walk's first
+            // boundary ends none.
+            m.residency_reset()?;
+            {
+                let b = m.body_parts(NAME)?.2;
+                let _ = b.take_residency_passes();
+                b.log_residency(replays + 2);
+            }
+            let prompted = s.prompt(&ids[..p], Want::Argmax);
+            let prompted_ok = prompted.is_ok();
+            let bound_ok = s.model_mut().pass_boundary().is_ok();
+            let passes = s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+            let machine = s.model().body(NAME)?.hybrid().swap().is_some();
+            let prompts: Vec<_> = passes
+                .iter()
+                .filter(|(k, _)| *k == PassKind::Prompt)
+                .collect();
+            let logged = if machine {
+                prompted_ok
+                    && bound_ok
+                    && prompts.len() == replays
+                    && prompts.iter().all(|(_, r)| r.kept == 0)
+                    && passes
+                        .iter()
+                        .all(|(k, _)| matches!(k, PassKind::None | PassKind::Prompt))
+            } else {
+                prompted_ok && bound_ok && passes.is_empty()
+            };
+            ok &= logged;
+            println!(
+                "{NAME}: pair residency P={p}: prompt {} boundary {} machine {} \
+                 passes={} prompt_keeps={} replays={replays}: {}",
+                verdict(prompted_ok),
+                verdict(bound_ok),
+                if machine { "on" } else { "off" },
+                passes.len(),
+                prompts.len(),
+                verdict(logged)
+            );
+            s.model_mut().reset()?;
+        }
+        Ok(ok)
+    }
+
+    /// `keep_point(k)` for `k` in `0..=P` after the session prompt equals the
+    /// same ids run as graph steps. Red when the walk still leaves a CED hole
+    /// the steps do not (a route back through [`body::prefill`]).
+    fn pair_keep(s: &mut Session<Body>, ids: &[u32]) -> Result<bool, GateError> {
+        let mut ok = true;
+        for p in [3usize, 6] {
+            if ids.len() < p {
+                return Err(format!("{NAME}: pair keep: {p} ids, have {}", ids.len()).into());
+            }
+            let m = s.model_mut();
+            m.reset()?;
+            for &id in ids.iter().take(p) {
+                m.step(&[id])?;
+            }
+            let want: Vec<usize> = {
+                let b = m.body(NAME)?;
+                (0..=p).map(|k| b.keep_point(k)).collect()
+            };
+            m.reset()?;
+            s.prompt(&ids[..p], Want::Argmax)?;
+            let got: Vec<usize> = {
+                let b = s.model().body(NAME)?;
+                (0..=p).map(|k| b.keep_point(k)).collect()
+            };
+            let same = got == want;
+            ok &= same;
+            println!(
+                "{NAME}: pair keep P={p}: keep_point {} (step {:?}, prompt {:?}): {}",
+                if same { "equal" } else { "differs" },
+                want,
+                got,
+                verdict(same)
+            );
+            s.model_mut().reset()?;
+        }
+        Ok(ok)
     }
 
     /// The clear clause (module doc): A's premises against the file, then A,
