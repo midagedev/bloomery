@@ -12,7 +12,9 @@ line with a tab) is keyed by its glob and merged three ways against the hunk's b
 a gate one side removed and the other kept is out, and the why and exceptions columns take the side that changed them.
 A hunk whose comment and blank lines the two sides changed differently, a row whose why or exceptions both sides
 changed to different texts, a row one side removed and the other changed, or a row whose order changed stays a
-conflict: its markers stay in OURS and the exit is 1, git's "not merged".
+conflict: its markers stay in OURS and the exit is 1, git's "not merged". The removed-and-changed check reads the
+whole tables, so a row deleted on one side and edited on the other still conflicts when the edit moved across a
+comment and the hunk's own base never saw the row.
 
 Exit: 0 merged; 1 a conflict left with its markers; 2 git merge-file failed; 64 usage.
 """
@@ -145,25 +147,30 @@ def driver(base, ours, theirs):
     if p.returncode < 0 or p.returncode > 127:
         sys.stderr.write("gate-paths-merge: git merge-file failed (rc %d): %s" % (p.returncode, p.stderr))
         return 2
-    # A hunk's base is only the lines inside that conflict. A row one side deleted and the other moved into a
-    # different hunk is absent from the first hunk's base, so the hunk-local merge treats the moved row as new and
-    # puts it back. When an existing row's order changed, leave git's markers instead of that merge.
+    # A hunk's base is only the lines inside that conflict. A row one side deleted and the other moved across a
+    # comment is absent from that hunk's base, and the row-key order is unchanged, so the hunk-local merge treats
+    # the moved row as new and puts it back. Leave git's markers when an existing row's order changed, or when a
+    # base row is gone on one side and different on the other.
     reason = "a comment, a why or an exception both sides changed differently"
     if p.returncode:
-        orders = []
+        tables = []
         for path in (base, ours, theirs):
             with open(path) as f:
-                orders.append(rows_of(f.read().splitlines())[1])
-        bo, oo, tho = orders
-        moved = any(order is None for order in orders)
-        if not moved:
-            moved = any(
+                tables.append(rows_of(f.read().splitlines()))
+        (rb, bo, _), (ro, oo, _), (rt, tho, _) = tables
+        blocked = any(order is None for _, order, _ in tables)
+        if not blocked:
+            blocked = any(
                 [k for k in order if k in bo] != [k for k in bo if k in order]
                 for order in (oo, tho)
+            ) or any(
+                (key not in ro and key in rt and rt[key] != row)
+                or (key not in rt and key in ro and ro[key] != row)
+                for key, row in rb.items()
             )
-        if moved:
+        if blocked:
             text, left = p.stdout, p.stdout.count(OURS_M) or 1
-            reason = "a row that exists in the base changed its order"
+            reason = "a row moved, or was deleted on one side and changed on the other"
         else:
             text, left = merge_text(p.stdout)
     else:
@@ -222,6 +229,11 @@ def self_test():
         ("deleted row moved and edited on the other side",
          base.replace("a/*.rs\tgate-x gate-y\twhy a\n", "").replace("gate-z\twhy c", "gate-z gate-o\twhy c"),
          base.replace("a/*.rs\tgate-x gate-y\twhy a\n", "").replace("c/*.rs", "a/*.rs\tgate-x gate-y gate-t\twhy a\nc/*.rs"),
+         1, None),
+        # The same hole across a comment: row-key order is unchanged, and the conflict hunk's base is empty.
+        ("deleted row moved across header and edited",
+         "o/*.rs\tgate-o\twhy o\n" + base.replace("a/*.rs\tgate-x gate-y\twhy a\n", ""),
+         "a/*.rs\tgate-x gate-y gate-t\twhy a\n" + base.replace("a/*.rs\tgate-x gate-y\twhy a\n", ""),
          1, None),
     ]
     fails = 0
