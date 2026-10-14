@@ -182,11 +182,11 @@ pub fn spec_of(
         ctx_train: spec_u32("context_length", hp.n_ctx_train)?,
         rms_eps: hp.rms_eps,
         layers,
-        // A tail the draft refuses stays out of `mtp`, and the plain load reads
-        // as it did; the refusal is `mtp::in_file`'s, for a requested draft.
-        mtp: match super::mtp::describe(hp, tensors) {
-            Ok(Some(draft)) => vec![draft.layer],
-            Ok(None) | Err(_) => Vec::new(),
+        // Absent, stripped and one-element tails are no draft. A shaped tail
+        // the draft refuses is this description's error, by the key or tensor.
+        mtp: match super::mtp::describe(hp, tensors)? {
+            Some(draft) => vec![draft.layer],
+            None => Vec::new(),
         },
         hc,
         engram,

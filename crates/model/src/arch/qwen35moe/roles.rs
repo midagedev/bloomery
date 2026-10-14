@@ -7,8 +7,7 @@
 //! such name listed. A layer at or past the trunk (`nextn_predict_layers`
 //! next-token layers close the file) is never loaded: any of its variant's
 //! layer stems or next-token stems is [`Role::Unused`], and a trunk layer
-//! carrying a next-token stem is unclassified. [`nextn_role`] is the draft
-//! plan's reading of a qwen35moe next-token stem; [`classify`] does not call it.
+//! carrying a next-token stem is unclassified.
 
 use gguf::Split;
 
@@ -124,29 +123,6 @@ const NEXTN_HC: &[&str] = &[
     "nextn.hc_head_up.weight",
 ];
 
-/// The role a qwen35moe next-token stem takes in the draft's plan.
-/// The file's plan keeps that layer [`Role::Unused`] ([`role`]). `None` for
-/// a gated-delta stem, a hyper-connection, or a matrix the layer borrows
-/// from the target (`nextn.embed_tokens`, `nextn.shared_head_head`).
-#[must_use]
-pub fn nextn_role(stem: &str) -> Option<Role> {
-    match stem {
-        "nextn.shared_head_norm.weight" => Some(Role::Head),
-        "nextn.eh_proj.weight" | "nextn.enorm.weight" | "nextn.hnorm.weight" => {
-            Some(Role::Attention)
-        }
-        "nextn.embed_tokens.weight" | "nextn.shared_head_head.weight" => None,
-        "attn_qkv.weight" | "attn_gate.weight" => None,
-        _ if stem.starts_with("ssm_")
-            || stem.starts_with("hc_")
-            || stem.starts_with("nextn.hc_") =>
-        {
-            None
-        }
-        _ => qwen35moe_role(stem),
-    }
-}
-
 /// Whether `stem` is one of a next-token layer's own in `variant`'s file.
 fn nextn_stem(stem: &str, variant: Variant) -> bool {
     NEXTN.contains(&stem) || (variant == Variant::Qwen4Exp && NEXTN_HC.contains(&stem))
@@ -226,38 +202,4 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
         }
     }
     Ok(model)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::nextn_role;
-    use crate::placement::Role;
-
-    /// The draft's reading of the tail: full attention, the head norm, the
-    /// routed block. A gated-delta stem and a borrowed matrix are not roles.
-    #[test]
-    fn d2_nextn_role_classifies_the_draft_stems() {
-        assert_eq!(nextn_role("attn_q.weight"), Some(Role::Attention));
-        assert_eq!(nextn_role("nextn.eh_proj.weight"), Some(Role::Attention));
-        assert_eq!(nextn_role("nextn.hnorm.weight"), Some(Role::Attention));
-        assert_eq!(
-            nextn_role("nextn.shared_head_norm.weight"),
-            Some(Role::Head)
-        );
-        assert_eq!(
-            nextn_role("post_attention_norm.weight"),
-            Some(Role::FfnNorm)
-        );
-        assert_eq!(nextn_role("ffn_gate_inp.weight"), Some(Role::Router));
-        assert_eq!(
-            nextn_role("ffn_gate_inp_shexp.weight"),
-            Some(Role::SharedExpert)
-        );
-        assert_eq!(nextn_role("ffn_up_exps.weight"), Some(Role::RoutedExperts));
-        assert_eq!(nextn_role("ssm_a"), None);
-        assert_eq!(nextn_role("attn_qkv.weight"), None);
-        assert_eq!(nextn_role("nextn.hc_head_norm.weight"), None);
-        assert_eq!(nextn_role("nextn.embed_tokens.weight"), None);
-        assert_eq!(nextn_role("nextn.shared_head_head.weight"), None);
-    }
 }

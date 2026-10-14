@@ -1594,29 +1594,7 @@ pub(super) mod tests {
     /// bartowski's Qwen3.6 files carry on their last block — an attention
     /// layer whatever the interval says, with the layer's own four stems.
     fn qwen35moe_next_token_layer(l: usize) -> Vec<(String, Vec<u64>)> {
-        const STEMS: [&str; 20] = [
-            "attn_norm.weight",
-            "attn_q.weight",
-            "attn_k.weight",
-            "attn_v.weight",
-            "attn_output.weight",
-            "attn_q_norm.weight",
-            "attn_k_norm.weight",
-            "post_attention_norm.weight",
-            "ffn_gate_inp.weight",
-            "ffn_gate_exps.weight",
-            "ffn_up_exps.weight",
-            "ffn_down_exps.weight",
-            "ffn_gate_inp_shexp.weight",
-            "ffn_gate_shexp.weight",
-            "ffn_up_shexp.weight",
-            "ffn_down_shexp.weight",
-            "nextn.eh_proj.weight",
-            "nextn.enorm.weight",
-            "nextn.hnorm.weight",
-            "nextn.shared_head_norm.weight",
-        ];
-        STEMS
+        super::super::mtp::DRAFT_STEMS
             .iter()
             .map(|s| (format!("blk.{l}.{s}"), vec![1]))
             .collect()

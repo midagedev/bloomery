@@ -203,24 +203,8 @@ fn hw_qwen35moe_nextn_draft() {
     assert!(moe.shared.is_some_and(|s| s.sigmoid_gate));
     assert_eq!(draft.layer, read.spec.layers[39]);
     assert_eq!(mtp::EH_JOIN, ["e", "h"]);
-    let bytes = mtp::in_file_card_bytes(&draft, &read.tensors, 1)
-        .unwrap_or_else(|e| panic!("card bytes: {e}"));
-    let own: u64 = read
-        .tensors
-        .tensors
-        .iter()
-        .filter(|t| t.layer == Some(draft.index as usize))
-        .map(|t| t.file_bytes)
-        .sum();
-    let stream = u64::from(draft.hidden) * 4;
-    let kv = runtime::stores::dense_kv_bytes(g.kv_heads as usize, g.head_dim as usize, 1);
-    assert_eq!(bytes, own + stream + kv);
     assert_eq!((draft.hidden, g.kv_heads, g.head_dim), (2048, 2, 256));
-    println!(
-        "A1 draft index {} mtp {} card_bytes {bytes}",
-        draft.index,
-        read.spec.mtp.len()
-    );
+    println!("A1 draft index {} mtp {}", draft.index, read.spec.mtp.len());
 
     let split = Split::open(A2_MINICPM).unwrap_or_else(|e| panic!("open A2: {e}"));
     let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec A2: {e}"));
