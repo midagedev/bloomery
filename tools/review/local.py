@@ -35,6 +35,7 @@ import fcntl
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -48,7 +49,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from post import MARKER, VERDICT_RE  # noqa: E402
-from run import MINUTES, TIMEOUT, launch  # noqa: E402
+from run import MINUTES, TIMEOUT, launch, produced  # noqa: E402
 sys.path.insert(0, os.path.dirname(HERE))
 from recipes import RecipeError, archive  # noqa: E402
 
@@ -304,10 +305,18 @@ def diag(ctx, base_tree, base_sha, head, say):
 def run_role(role, d, minutes, say):
     """One role through the base tree's run-claude.sh, by the workflow's own launcher (run.py): its own process group,
     stopped past the bound or when we are; its output in trace/<role>.log, whose summary line is printed. Its rc, TIMEOUT
-    past the bound."""
+    past the bound. A role that ends 0 without its output (run.py's produced: the validator's line in review.md, the
+    reviewer's verdict and decision.txt) ends the run 65 by name."""
     MINUTES[role] = minutes
     paths = [os.path.join(d, x) for x in ("base", "pr", "ctx", "out", "trace")]
-    rc = launch("claude", role, paths, dict(os.environ, REVIEW_SETTING_SOURCES="project"))
+    with tempfile.TemporaryDirectory() as snap:
+        before = os.path.join(snap, "out")
+        shutil.copytree(paths[3], before)
+        rc = launch("claude", role, paths, dict(os.environ, REVIEW_SETTING_SOURCES="project"))
+        if rc == 0:
+            reason = produced(role, paths[3], before)
+            if reason:
+                raise Stop(65, f"pre-review: the {role} ended 0 without its output: {reason}")
     log = os.path.join(d, "trace", f"{role}.log")
     if os.path.exists(log):
         for line in open(log, encoding="utf-8", errors="replace"):
@@ -627,6 +636,16 @@ def self_test():
             expect(kept, "a role stopped past --minutes still leaves its kept trace")
             expect(rc == 75 and "past" in msg and not alive,
                    f"a role past --minutes ends 75 named and its whole process group is gone: rc {rc}, child alive {alive}")
+            # --full: a validator that ends 0 and leaves the review as the reviewer wrote it is no validation
+            runner("**Verdict: CLEAN**: fine\n\n### Checked\nall")
+            a = argparse.Namespace(base="basebr", full=True, minutes=10, body=None)
+            try:
+                rc, msg = review(a, stubbed=True, say=lambda m: None), ""
+            except Stop as e:
+                rc, msg = e.code, e.msg
+            expect(rc == 65 and "validator ended 0 without its output" in msg, f"--full with a validator that wrote nothing ends 65: {rc} {msg}")
+            for bad in ("nan", "inf", "0", "-1"):
+                expect(main(["--minutes", bad]) == 64, f"--minutes {bad} is refused 64 before any role")
             rc, msgs = go("no verdict here")
             expect(rc in (65,) , f"a review with no verdict ends 65: {rc} {msgs[-1:]}")
             # SIGTERM to local.py itself stops the role's process group (run.launch's cleanup runs on the exception)
@@ -679,6 +698,9 @@ def main(argv):
         args = ap.parse_args(argv)
     except SystemExit as e:
         return 64 if e.code else 0
+    if not math.isfinite(args.minutes) or args.minutes <= 0:
+        print("pre-review: --minutes must be finite and positive", file=sys.stderr)
+        return 64
     try:
         signal.signal(signal.SIGTERM, signal.default_int_handler)
         return review(args)
