@@ -408,10 +408,10 @@ impl Mtp38 {
         &self,
         target: &'w Weights,
     ) -> Result<(&'w DevWeight, HeadOut<'w>), GpuError> {
-        let embd = at_open(target, &self.embd)?;
+        let embd = at_open(target, &self.embd, WHAT)?;
         let head = match &self.head_w {
             BorrowedHead::Q8_0(b) => {
-                let DevWeight::Q8_0 { qs, d, .. } = at_open(target, b)? else {
+                let DevWeight::Q8_0 { qs, d, .. } = at_open(target, b, WHAT)? else {
                     return Err(GpuError::tensor(WHAT, b.name.clone(), "Q8_0 planes"));
                 };
                 HeadOut::Q8_0 { qs, d }
@@ -564,16 +564,20 @@ pub(super) fn planes(dw: &DevWeight) -> Option<[u64; 2]> {
     }
 }
 
-/// `name` of the target's weights, the Q8_0 matrix at the addresses `b`
-/// records; the refusal names what moved.
-fn at_open<'w>(target: &'w Weights, b: &BorrowedPlanes) -> Result<&'w DevWeight, GpuError> {
+/// `name` of the target's weights, at the addresses [`super::mtp35::addresses`]
+/// records in `b`. `what` names the caller in the refusal.
+pub(super) fn at_open<'w>(
+    target: &'w Weights,
+    b: &BorrowedPlanes,
+    what: &str,
+) -> Result<&'w DevWeight, GpuError> {
     let dw = target
         .get(&b.name)
-        .ok_or_else(|| GpuError::tensor(WHAT, b.name.clone(), "resident"))?;
-    match planes(dw) {
+        .ok_or_else(|| GpuError::tensor(what, b.name.clone(), "resident"))?;
+    match super::mtp35::addresses(dw) {
         Some(p) if p == b.planes => Ok(dw),
         p => Err(GpuError::shape(
-            WHAT,
+            what,
             format!(
                 "{} sits at {p:?}, the draft was opened beside {:?}",
                 b.name, b.planes

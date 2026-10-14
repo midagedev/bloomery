@@ -250,23 +250,6 @@ impl Mtp35 {
         self.head.logits_to_host(gpu)
     }
 
-    /// Refuse by name a target matrix that is not where it was at open.
-    fn check_borrowed(&self, target: &Weights) -> Result<(), GpuError> {
-        for b in &self.borrowed {
-            let now = target.get(&b.name).and_then(addresses);
-            if now != Some(b.planes) {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "{} sits at {now:x?}, the draft was opened beside {:x?}",
-                        b.name, b.planes
-                    ),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// Enqueue one step of the draft for token `t` at position `pos` over
     /// the target's hidden row `h` (`hidden` f32 on the card, the row of the
     /// position before `t`): the join, `eh_proj`, the layer at `pos` over the
@@ -298,7 +281,9 @@ impl Mtp35 {
                 ),
             ));
         }
-        self.check_borrowed(target)?;
+        for b in &self.borrowed {
+            super::mtp38::at_open(target, b, WHAT)?;
+        }
         let stream = gpu.stream();
         self.sp.write(stream, t, launch_u32(WHAT, "pos", pos)?)?;
         embed_into(
