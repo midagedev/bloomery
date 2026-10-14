@@ -1,0 +1,10 @@
+kind: ab
+question: Does the pair walk cut the P=6 prose prompt wall on A6000 plan (a)?
+term: time prompt ms @ prose P=6, A6000, plan a, residency default, graph, no draft
+unit: %
+predict: -16..-4
+rounds: 4
+condition: interleaved prose:6, base binary is the batch, changed binary is the pair walk; changed time prompt kind=pairs passes=3; base kind=batch; residency host shows the machine
+decide-in: keep PAIR_BELOW = 6
+decide-below: keep 6; a P=8 card comes before any raise
+decide-above: set PAIR_BELOW = 4 and run this recipe at prose:4
