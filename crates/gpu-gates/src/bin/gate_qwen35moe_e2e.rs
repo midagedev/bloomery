@@ -21,8 +21,10 @@
 //!   (`refset::arch::qwen35moe::fixture`, each opened by `tier::fixture_set`, resolved to the variant's own sets under
 //!   `BLOOMERY_FIXTURE_VARIANT`); the real tier prints a `fixture-only(oracle)` line for each, and the gate's end holds
 //!   the count it decided to [`FX_ORACLE`] (`tier::expect_fixture_oracle`). The bands are the real tier's: they are
-//!   per value, from ik's inputs and our rules. One form differs by tier: the free-running argmax of (c), (o2), (o7)
-//!   and (t1) is equality with ik's in the real tier and [`flip::head_tie`] in the fixture tier ([`head_argmax`]).
+//!   per value, from ik's inputs and our rules. Two forms differ by tier, both read from `cfg().tier`: the
+//!   free-running argmax of (c), (o2), (o7) and (t1) is equality with ik's in the real tier and [`flip::head_tie`]
+//!   in the fixture tier ([`head_argmax`]), and (t1)'s new-state term is `state_rel / gap` in the real tier and the
+//!   larger of that gap and the layer input's own distance in the fixture tier ([`state_ratio`]).
 //! - `no-layout-layer` (`tier::layout_clause`): (n) reads joined layers (the node count of a slot,
 //!   [`Shape::nodes_slot`]), (j) and (o8) apart ones. (j) and (o8) open [`UNJOINED`] in the real tier and the tier's file
 //!   in the fixture tier, so they run on a variant and are left on the base fixture; (n) the other way round.
@@ -75,8 +77,9 @@
 //!   the set's position, then (t1) the step free-running: every layer
 //!   output within [`FREE_BAND`], the argmax as (c) takes it (equal in the
 //!   real tier, a tie in the fixture tier), every delta layer's new state
-//!   within [`RATIO_BAND`] of the larger of the input gap and the layer
-//!   input's own distance from ik's ([`state_ratio`]); and (t2) each
+//!   within [`RATIO_BAND`] of the input gap in the real tier and of the
+//!   larger of that gap and the layer input's own distance from ik's in
+//!   the fixture tier ([`state_ratio`]); and (t2) each
 //!   layer teacher-forced at one row on its reloaded store, its taps as (f).
 //! - (p′) the ubatch arena's gemv arm: the batch set's five tokens through
 //!   the prompt call (`prefill_with`) from zero stores — on the pass path
@@ -1350,28 +1353,34 @@ mod gate {
         }
     }
 
-    /// A delta layer's free-running new-state term: the state's relative
-    /// distance from ik's, `state_rel`, over the larger of `gap` (the two
-    /// sides' 8-bit activations of ik's normed input) and `in_rel` (our layer
-    /// input's own relative distance from ik's: 0 at layer 0, whose input is
-    /// the exact embedding). A gap or an input distance that is not finite makes
-    /// the ratio infinite.
+    /// A delta layer's free-running new-state term. The real tier is
+    /// `state_rel / gap` (the two sides' 8-bit activations of ik's normed
+    /// input). The fixture tier is `state_rel` over the larger of `gap` and
+    /// `in_rel` (our layer input's own relative distance from ik's: 0 at
+    /// layer 0, whose input is the exact embedding). The tier is `cfg().tier`,
+    /// the same owner [`head_argmax`] reads. In the fixture tier a gap or an
+    /// input distance that is not finite makes the ratio infinite.
     ///
-    /// PIN(2026-10-13): the free state term charges a layer for the stack's
-    /// upstream error as well as its own. Derivation: to first order the
-    /// state carries its input's relative error through a linear update, so
-    /// `state_rel` ≈ g · `in_rel` with a gain g of 0.73: the fixture's layer 0,
-    /// whose input is exact and so carries the 8-bit gap alone, reads
-    /// 3.94e-3 / 5.40e-3 = 0.73, and its layer 2, whose input is 1.48e-1 off,
-    /// reads 1.08e-1 / 1.48e-1 = 0.73, where the ratio over the gap alone
-    /// read 14.26. A layer whose input is off by more than the gap is held to
-    /// that gain, not to the gap; (t2) is the wiring catcher on ik's own input
-    /// and is unchanged.
+    /// PIN(2026-10-13): the fixture tier's form. The fixture's layer 2 input
+    /// is 1.48e-1 off, and the ratio over the gap alone read 14.26.
+    /// Derivation: to first order the state carries its input's relative
+    /// error through a linear update, so `state_rel` ≈ g · `in_rel` with a
+    /// gain g of 0.73: the fixture's layer 0, whose input is exact and so
+    /// carries the 8-bit gap alone, reads 3.94e-3 / 5.40e-3 = 0.73, and its
+    /// layer 2 reads 1.08e-1 / 1.48e-1 = 0.73. A fixture layer whose input is
+    /// off by more than the gap is held to that gain, not to the gap. The
+    /// real tier keeps `state_rel / gap`. (t2) is the wiring catcher on ik's
+    /// own input and is unchanged.
     fn state_ratio(state_rel: f64, gap: f64, in_rel: f64) -> f64 {
-        if !gap.is_finite() || !in_rel.is_finite() {
-            return f64::INFINITY;
+        match cfg().tier {
+            Tier::Real => state_rel / gap.max(f64::MIN_POSITIVE),
+            Tier::Fixture => {
+                if !gap.is_finite() || !in_rel.is_finite() {
+                    return f64::INFINITY;
+                }
+                state_rel / gap.max(in_rel).max(f64::MIN_POSITIVE)
+            }
         }
-        state_rel / gap.max(in_rel).max(f64::MIN_POSITIVE)
     }
 
     /// The router test the forced arm and the free clause read: a token whose
