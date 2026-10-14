@@ -164,6 +164,34 @@ pub fn choose_ctx<P, E: Into<GateError>>(
     plan_at: impl FnMut(u64) -> Result<placement::ctx_ask::Probe<P>, E>,
 ) -> Result<placement::ctx_ask::Chosen<P>, GateError> {
     use placement::ctx_ask::{Ask, AskError, Limit, choose};
+    let share = set.and_then(|total| total.checked_div(slots));
+    let bounds = check_set_slot(file, share, (kernel, verified))?;
+    let ask = match set {
+        Some(total) => Ask::Set {
+            total: u64::try_from(total)?,
+        },
+        None => Ask::Default,
+    };
+    let (positions, source) = bounds.limit();
+    choose(ask, slots, Limit { positions, source }, SEAT_STEPS, plan_at).map_err(|e| match e {
+        AskError::Plan(e) => e.into(),
+        other => other.to_string().into(),
+    })
+}
+
+/// The model's limit for a seat ([`placement::ctx::CtxLimit`]): the file's
+/// trained context and the bounds the seat names (`kernel`, `verified`); a set
+/// `--ctx`'s share of one slot (`share`) past it stops the load by name before
+/// any plan ([`placement::ctx::check_slot_ctx`]). A file that states no
+/// trained context is refused, since no context can be held to it.
+///
+/// # Errors
+/// [`placement::ctx::PastLimit`], or the file's missing `context_length`.
+pub fn check_set_slot(
+    file: &Split,
+    share: Option<usize>,
+    (kernel, verified): (Option<(u64, &'static str)>, Option<(u64, &'static str)>),
+) -> Result<placement::ctx::CtxLimit, GateError> {
     let trained = file.arch_get_u64("context_length").ok_or(
         "the file states no context_length, so the context cannot be held to the model's limit",
     )?;
@@ -172,21 +200,10 @@ pub fn choose_ctx<P, E: Into<GateError>>(
         kernel,
         verified,
     };
-    let ask = match set {
-        Some(total) => {
-            let total = u64::try_from(total)?;
-            if let Some(share) = total.checked_div(u64::try_from(slots)?) {
-                placement::ctx::check_slot_ctx(share, &bounds)?;
-            }
-            Ask::Set { total }
-        }
-        None => Ask::Default,
-    };
-    let (positions, source) = bounds.limit();
-    choose(ask, slots, Limit { positions, source }, SEAT_STEPS, plan_at).map_err(|e| match e {
-        AskError::Plan(e) => e.into(),
-        other => other.to_string().into(),
-    })
+    if let Some(share) = share {
+        placement::ctx::check_slot_ctx(u64::try_from(share)?, &bounds)?;
+    }
+    Ok(bounds)
 }
 
 /// A family's input to the common unset-`--place` rule ([`Place::choose`]):

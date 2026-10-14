@@ -518,9 +518,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // is within both.
     check_set_slot(
         &split,
-        ctx,
-        Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
-        None,
+        Some(ctx),
+        (
+            Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
+            None,
+        ),
     )?;
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);

@@ -32,14 +32,9 @@
 //! `--parallel N` serves N resident sequences (`app::Session::add_slots`):
 //! the model loads one slot's stores and parks the other N − 1 after its step
 //! capture, each slot capturing its own step on first use. `--parallel`
-//! unset takes two slots (a set `--ctx` with no `--parallel` is one request's
-//! context: one slot), and when the plan refuses the default's second slot
-//! the seat plans one and says so (`bind::default_slots_fit`: one stderr line
-//! and `from=fit` on the `parallel` line); a count the flags set is never
-//! lowered. The slot count is read before the context, which the slots
-//! split: each slot holds ⌊`--ctx` / N⌋ positions
-//! (`placement::slots::split_ctx`, the split the qwen3 and GLM seats take) and
-//! a split that leaves a slot no position is refused by name. The plan counts
+//! unset takes one slot; a count is never lowered. The slot count is read
+//! before the context, which the slots split: each slot holds ⌊`--ctx` / N⌋
+//! positions, and a split that leaves a slot no position is refused by name. The plan counts
 //! every slot's stores (`PlanInputs::plan_with_slots`: N times a slot's), so
 //! a total the card cannot hold is refused by the plan before any load, and
 //! the load serves no more sequences than the plan counted.
@@ -63,27 +58,21 @@
 //! reserve is zero bytes.
 //!
 //! `--ctx` is the total the slots split (`--ctx 0` is refused); with one slot
-//! it is one request's context. Unset, the card decides it and the host room
-//! only vetoes it (`placement::ctx::searched_by_card`): the file's trained
-//! context (`<arch>.context_length`) capped to the largest total whose plan
-//! stands on the card, searched on a grid of `generate::CTX_GRAN` positions
-//! from the floor [`CTX`] over the plan at an unbounded host room; then the
-//! plan at the room read must stand at that total too (the routed experts a
-//! longer context moves to the host must fit the room), else the answer is
-//! the floor. A file that states no trained context takes the floor, and one
-//! stderr line names a cap that binds. The routed experts the plan puts on
-//! the card take the room the stores leave, so a longer context leaves fewer
-//! of them there; the default caps at the plan's own fit and applies no
-//! expert margin. On a machine whose card shares the host's memory the room
-//! is the card's, no plan is independent of it, and the answer is the first
-//! rung of a halving ladder from the trained context whose plan the room read
-//! holds. The plan reads the host room (`BLOOMERY_HOST_ROOM` replaces the
-//! reading) and refuses by name a room that cannot hold the host experts: the
-//! body serves no NVMe expert tier (`PlaceError::NoNvmeTier`).
+//! it is one request's context. The context comes first and the plan fills
+//! the machine around it (`generate::choose_ctx`, every seat's): a set share
+//! past the file's trained context stops by name, and a share the machine
+//! cannot hold stops with the largest it would hold. Unset, a slot asks
+//! 262,144 positions or the trained context where that is less, halved while
+//! the card cannot hold the stores and resident bytes, or while the host
+//! cannot hold the routed experts the card then leaves it: the plan reads the
+//! host room (`BLOOMERY_HOST_ROOM` replaces the reading) and the body serves
+//! no NVMe expert tier (`PlaceError::NoNvmeTier`), so a shorter context, which
+//! keeps more experts on the card, is what that refusal asks for.
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
-//! line (the rule — `set`, `trained`, `card`, `host`, `pool` or `floor` —, a
-//! slot's context, the slots, the total and the trained context), the `plan`
+//! line (`placement::ctx_ask::Chosen::line`: the rule — `set`, `target` or
+//! `halved`, with the memory a halving was short of —, a slot's context, the
+//! slots, the total and the model's limit), the `plan`
 //! record (its `ctx_max` a slot's), the `parallel` line (`rule=slots
 //! slots=N slot_ctx=C total=N·C from=<word> pass=one`); then the `load`
 //! record (architecture, resident bytes of every slot, a slot's context,
@@ -123,7 +112,7 @@
 //! binds through (`bind`, the `serve` and `sampler` crates) is scoped to
 //! `deepseek41`; it runs no V4.1 code.
 
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -134,9 +123,9 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
-    default_slots_fit, model_props, note_line, parallel_line, placement_of, slots_given,
+    model_props, note_line, parallel_line, placement_of, slots_given,
 };
-use bloomery_gpu_gates::generate::{CTX_GRAN, Lane, Place, check_set_slot, lane_at, trained_ctx};
+use bloomery_gpu_gates::generate::{Lane, Place, choose_ctx, lane_at};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, residency};
@@ -145,8 +134,7 @@ use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt, ResidencyWhy};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
-use model::placement::ctx::{RULE_CARD, RULE_HOST, RULE_POOL, Veto, searched_by_card};
-use model::placement::slots::{SplitError, split_ctx};
+use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target as _;
@@ -180,12 +168,6 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::HOST_LANES,
     bloomery_levers::SCREEN,
 ];
-
-/// The floor of the searched default context.
-const CTX: usize = 4096;
-
-/// The slots a seat with no `--parallel` and no `--ctx` serves.
-const SLOTS: usize = 2;
 
 /// Whether a round of several slots runs as one pass of the busy rows
 /// (`GpuModel::step_slots`, the body's `SlotRows`): the `parallel` line's
@@ -275,88 +257,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         return Err("--parallel 0: the server serves no slot".into());
     }
     Ok(a)
-}
-
-/// A slot's positions when `slots` slots split `total`: ⌊total / slots⌋
-/// (`placement::slots::split_ctx`, llama-server's `-np N` without `-kvu`), so
-/// the slots together never hold more than the total the plan counted. A
-/// split that leaves a slot no position is refused by name in the flags'
-/// words.
-fn slot_ctx_of(total: usize, slots: usize) -> Result<usize, GateError> {
-    let share = split_ctx(total as u64, slots as u64, NonZeroU64::MIN).map_err(|e| match e {
-        SplitError::NoSlots { .. } => {
-            format!("--ctx {total}: --parallel 0 splits it among no slot")
-        }
-        SplitError::BelowFloor { split, floor, .. } => format!(
-            "--ctx {total}: --parallel {slots} splits it to {split} positions a slot, under the \
-             {floor} a slot needs (a slot holds at least one position)"
-        ),
-    })?;
-    Ok(usize::try_from(share).map_err(|_| format!("a slot's {share} positions"))?)
-}
-
-/// What decided the seat's context, for its `ctx` line.
-struct CtxRule {
-    ctx: usize,
-    /// `set` (`--ctx`), `trained` (the file's own context stands), `card`
-    /// (the card's plan stands to a context under it), `host` (the host room
-    /// vetoed the card's context, so the floor stands), `pool` (a machine
-    /// whose card shares the host's memory: a rung of the halving ladder
-    /// under the trained context) or `floor` ([`CTX`]: a file that states no
-    /// trained context, or a plan that stands nowhere at the floor, which the
-    /// load's own plan call then refuses by name).
-    rule: &'static str,
-    trained: Option<usize>,
-}
-
-/// The seat's total context, the positions its slots split: `set` as given,
-/// else the file's trained context capped to the largest on the [`CTX_GRAN`]
-/// grid whose plan stands on the card, the host room only vetoing it
-/// (`placement::ctx::searched_by_card`). The plan counts every slot's stores
-/// at a slot's share of the total ([`PlanInputs::plan_with_slots`]) and reads
-/// the host room, so a probe plans a total twice: `card`, at an unbounded
-/// room ([`PlanInputs::room_free`]), and `read`, at the room read. The search
-/// runs over `card`; `read` is asked once, at its answer, and a refusal
-/// there is the floor, so a reading's noise moves the answer only near the
-/// one room that holds the answer's host bytes past the floor's. Where the
-/// card shares the host's memory ([`Veto::of`]) the room is the card's and
-/// the answer is a rung of a halving ladder `read` takes.
-fn ctx_of(
-    set: Option<usize>,
-    split: &Split,
-    inputs: &PlanInputs,
-    machine: &Machine,
-    levers: &PlanLevers,
-    slots: NonZeroUsize,
-) -> Result<CtxRule, GateError> {
-    let trained = trained_ctx(split);
-    if let Some(ctx) = set {
-        return Ok(CtxRule {
-            ctx,
-            rule: "set",
-            trained,
-        });
-    }
-    let fits = |inputs: &PlanInputs, c: usize| -> Result<bool, GateError> {
-        let share = slot_ctx_of(c, slots.get())
-            .ok()
-            .and_then(|s| u64::try_from(s).ok());
-        Ok(share.is_some_and(|s| inputs.plan_with_slots(machine, s, levers, slots).is_ok()))
-    };
-    let free = inputs.room_free();
-    let found = searched_by_card(
-        trained,
-        CTX,
-        CTX_GRAN,
-        Veto::of(machine),
-        &|c| fits(&free, c),
-        &|c| fits(inputs, c),
-    )?;
-    Ok(CtxRule {
-        ctx: found.ctx,
-        rule: found.rule,
-        trained,
-    })
 }
 
 /// The MiMo session on the engine thread and the positions each slot's
@@ -630,7 +530,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The slot count before the context it splits: a set `--ctx` with no
     // `--parallel` is one request's context, one slot at the whole of it
     // (`bind::slots_of`).
-    let (slots, from) = slots_given(a.parallel, a.ctx, SLOTS)?;
+    let (slots, from) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
     // The common unset rule, once, on one census reading.
     let census = gpu_census::census()?;
     let chosen = Place::choose_untiered(a.place, &census, "mimo2")?;
@@ -661,48 +561,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     let tier = (!place.tier_cards().is_empty()).then_some(NO_BATCH);
     let machine = place.machine(None, tier)?(inputs.model.layers);
-    // The context and the plan of every slot: each layer's stores `slots`
-    // times at a slot's positions. A tier card, a total the card cannot hold
-    // and a budget that binds are refused here by name, before any load; the
-    // load plans the same. The default's second slot that does not fit falls
-    // to one slot (`from=fit`); a count the flags set is never lowered.
-    let ((rule, slot_ctx, plan), slots, from) =
-        default_slots_fit(NAME, place.name(), slots, from, |slots| {
-            let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
-            let rule = ctx_of(a.ctx, &split, &inputs, &machine, &plan_levers, n)?;
-            let slot_ctx = slot_ctx_of(rule.ctx, slots)?;
-            // A set `--ctx` is the total the slots split: its share is held to
-            // the model's limit before the plan.
-            if a.ctx.is_some() {
-                check_set_slot(&split, slot_ctx, None, None)?;
-            }
-            let plan = inputs
-                .plan_with_slots(&machine, u64::try_from(slot_ctx)?, &plan_levers, n)
-                .map_err(|e| format!("--place {}: {e}", place.name()))?;
-            Ok::<_, GateError>((rule, slot_ctx, plan))
-        })?;
+    // The context, then the plan of every slot around it, each layer's
+    // stores `slots` times at a slot's positions (`choose_ctx`, every seat's).
+    // A tier card, a total the machine cannot hold and a budget that binds
+    // are refused here by name, before any load; the load plans the same. A
+    // count is never lowered: the default is one slot.
     let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
-    let ctx = rule.ctx;
-    if let Some(trained) = rule.trained {
-        let bound = match rule.rule {
-            RULE_CARD => Some("the plan stands to there"),
-            RULE_HOST | RULE_POOL => Some("the host room holds the plan to there"),
-            _ => None,
-        };
-        if let Some(bound) = bound {
-            eprintln!(
-                "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions \
-                 ({bound}; pass --ctx to choose)"
-            );
-        }
-    }
-    eprintln!(
-        "ctx rule={} ctx={slot_ctx} slots={slots} total={} trained={}",
-        rule.rule,
-        slots * slot_ctx,
-        rule.trained
-            .map_or_else(|| "none".to_owned(), |t| t.to_string())
-    );
+    let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
+        probe_of(inputs.plan_with_slots(&machine, c, &plan_levers, n))
+            .map_err(|e| format!("--place {}: {e}", place.name()))
+    })?;
+    eprintln!("{}", asked.line());
+    let slot_ctx = usize::try_from(asked.slot_ctx)?;
+    let plan = asked.plan;
     let pick = residency::at_plan(
         <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
         &plan,

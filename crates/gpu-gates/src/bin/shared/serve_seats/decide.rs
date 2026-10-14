@@ -667,7 +667,7 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
     // A set `--ctx` is the backbone's one context, held to the model's limit
     // before the load.
     if let Some(ctx) = a.ctx {
-        check_set_slot(&split, ctx, None, None)?;
+        check_set_slot(&split, Some(ctx), (None, None))?;
     }
     let ctx = a.ctx.unwrap_or(row.ctx);
     drop(split);
