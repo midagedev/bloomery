@@ -265,8 +265,8 @@
 # not rc 75 (contention, which retries above and is not a verdict) — is run once more from the local
 # origin/main: the same recipe, the same args and the same box env, so the same card, and no second
 # build is asked for. Its line gains `main=also-red` (that run's rc is neither 0 nor 75),
-# `main=batch-only` (that run ended 0) or `main=unrun` (no checkout, the tree stayed busy, or the
-# run ended 75), placed before `item=` when the item has one. The checkout is one detached worktree,
+# `main=batch-only` (that run ended 0) or `main=unrun` (no checkout, the tree stayed busy,
+# origin/main has no such recipe, or the run ended 75), placed before `item=` when the item has one. The checkout is one detached worktree,
 # $HOME/.cache/bloomery/gate-batch-main, reused when it is already that commit. box.sh's remote is
 # that directory's basename: a tree it already holds is not synced, and rsync never sends target/,
 # so the binary already built there is the one the recheck runs. The batch's own rc does not change.
@@ -3114,6 +3114,25 @@ EOS
   want 'red-main: the line says main=batch-only' "$t/target/c-rm-only/run.log" \
     '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=batch-only item=steal-fix@FAKE_RC=1$'
   rm -rf "$t/mainwt/fake-state"
+  # A recipe the batch has and origin/main does not is not a red main: just exits 1, which is not a
+  # verdict. FAIL-first: without the --show check the line says also-red.
+  sed '/^steal-fix:$/,/^[^[:space:]]/ { /^steal-fix:$/d; /^[[:space:]]/d; }' "$t/mainwt/justfile" > "$t/mainwt/justfile.norec"
+  mv "$t/mainwt/justfile.norec" "$t/mainwt/justfile"
+  if grep -q '^steal-fix:$' "$t/mainwt/justfile"; then fail 'red-main: the main justfile dropped steal-fix' 'the recipe is still there'
+  else pass 'red-main: the main justfile dropped steal-fix'; fi
+  mutant_of red-norecipe 's/^  if ! just --justfile .*$/  if false; then # MUTANT red-norecipe/' '# MUTANT red-norecipe$'
+  rc=$(MTAG=red-norecipe steal_case rm-norec-m "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-norec-m"
+  want 'red-main mutant: without the recipe check a missing recipe is main=also-red' "$t/target/c-rm-norec-m/run.log" \
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=also-red item=steal-fix@FAKE_RC=1$'
+  rc=$(steal_case rm-norec "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-rm-norec"
+  if [ "$(cat "$t/rc-rm-norec")" = 1 ]; then pass 'red-main: a recipe main lacks keeps the batch red'
+  else fail 'red-main: a recipe main lacks keeps the batch red' "rc=$(cat "$t/rc-rm-norec")"; fi
+  want 'red-main: a recipe origin/main lacks is main=unrun' "$t/target/c-rm-norec/run.log" \
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=unrun item=steal-fix@FAKE_RC=1$'
+  want 'red-main: the log names the missing recipe' "$t/target/c-rm-norec/g-steal-fix.log" \
+    '=== main recheck: origin/main has no recipe steal-fix'
   rc=$(steal_case rm-green "host	B	none	2	$d" -- --red-main-check host)
   printf '%s' "$rc" > "$t/rc-rm-green"
   rc_ok 'red-main: a green item is not rechecked' rm-green 1
@@ -5397,6 +5416,13 @@ main_recheck() { # $1 = plan index, $2 = box env, $3 = the item log
     printf unrun
     return 0
   }
+  # A recipe this tree does not have is not a red main: just exits 1, and that is not a verdict.
+  if ! just --justfile "$root/justfile" --working-directory "$root" --show "${P_NAME[$i]}" > /dev/null 2>> "$log"; then
+    echo "=== main recheck: origin/main has no recipe ${P_NAME[$i]}" >> "$log"
+    main_drop "$lk" "$mpid"
+    printf unrun
+    return 0
+  fi
   eval "argv=(${P_ARGS[$i]})"
   echo "=== main recheck $(date '+%F %T') tree=$root" >> "$log"
   rc=0
