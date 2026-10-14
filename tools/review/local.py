@@ -2,7 +2,7 @@
 """Shingler's reviewer on this machine, before a push: the PR review's own instructions, catalog and ledger, run through
 the base tree's tools/review/run-claude.sh under the caller's own Claude login (`just pre-review`).
 
-    tools/review/local.py [--base REF] [--full] [--minutes N] [--body FILE]
+    tools/review/local.py [--base REF] [--full] [--minutes N] [--body FILE] [--no-pre-checks]
     tools/review/local.py --self-test
 
 What it reviews is the committed HEAD, what a push sends; a dirty tree is named and left out. The trees come from
@@ -21,14 +21,16 @@ does before posting. Nothing is posted and the workflow is not touched; review.y
 
 Before the reviewer, the text-only checks a push needs and nobody runs by hand run on PR_TREE when the branch touches
 their inputs (PRE_CHECKS: tools/check-levers.sh, about 10 s, for tools/, the justfile, .cargo/ or crates/); a red one
-ends the run 1 by name, before the reviewer's cost. The failure it blocks: a lever or marker name that only a
-hand-run check-levers caught.
+ends the run 1 by name, before the reviewer's cost. --no-pre-checks skips them. The failure it blocks: a lever or
+marker name that only a hand-run check-levers caught.
+
+`claude --version` runs first on a real review. A binary that is on PATH and does not answer is a broken install.
 
 Prints the verdict, the must-fix titles and where the output is (~/.cache/bloomery/pre-review/<branch>-<sha8>/).
 A CLEAN review also prints one line for the pull request body, with the full HEAD sha.
 A base that lacks commits origin/main has is behind it and is refused by name before the reviewer runs.
 A missing origin/main is not that case. A failed ancestry walk stops 70.
-Exit: 0 CLEAN; 1 MUST_FIX or a red pre-check; 75 no claude CLI, or a role past --minutes (default 10); 64 usage,
+Exit: 0 CLEAN; 1 MUST_FIX or a red pre-check; 75 no claude CLI, a broken install, or a role past --minutes (default 10); 64 usage,
 or a base behind origin/main; 65 output post.py refused
 or a review with no verdict; 70 a context step or a git command that failed (named).
 The failure it blocks: a pull request whose first Shingler review is a MUST_FIX, each fold another 10-27 minute round.
@@ -335,6 +337,17 @@ def run_role(role, d, minutes, say):
     return rc
 
 
+def claude_ok():
+    """`claude --version` must answer. On PATH and silent or red is a broken install, not a missing binary."""
+    try:
+        p = subprocess.run(["claude", "--version"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Stop(75, f"pre-review: claude --version failed ({type(e).__name__}): 설치 깨짐; nothing was reviewed") from e
+    if p.returncode != 0:
+        raise Stop(75, f"pre-review: claude --version failed (rc {p.returncode}): 설치 깨짐; nothing was reviewed")
+
+
 def pre_checks(pr_tree, paths, say):
     """PRE_CHECKS whose prefixes a changed path starts with, on PR_TREE; the first red one stops the run 1, named."""
     for script, prefixes in PRE_CHECKS:
@@ -358,6 +371,8 @@ def must_fix_titles(body):
 def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     if not stubbed and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
+    if not stubbed:
+        claude_ok()
     try:
         fetched = subprocess.run(["git", "fetch", "-q", "origin"], capture_output=True, timeout=NET_S).returncode == 0
     except subprocess.TimeoutExpired:
@@ -385,7 +400,10 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
             archive(head, os.path.join(d, "pr"), cwd=os.getcwd())
         except RecipeError as e:
             raise Stop(70, f"pre-review: {e}") from e
-        pre_checks(os.path.join(d, "pr"), git("diff", "--name-only", "-z", f"{base_sha}...{head}").split("\0"), say)
+        if getattr(args, "no_pre_checks", False):
+            say("pre-review: pre-checks skipped (--no-pre-checks)")
+        else:
+            pre_checks(os.path.join(d, "pr"), git("diff", "--name-only", "-z", f"{base_sha}...{head}").split("\0"), say)
         for x in ("ctx", "out", "trace"):
             os.makedirs(os.path.join(d, x))
         try:
@@ -545,6 +563,34 @@ def self_test():
         open(lev, "w").write("exit 0\n")
         pre_checks(t, ["crates/gpu/src/lib.rs"], said.append)
         expect(len(said) == 1 and said[0].startswith("pre-review: tools/check-levers.sh ok"), f"a green one is printed: {said}")
+    # claude --version: a binary that exits red is a broken install (75), and the message names it
+    with tempfile.TemporaryDirectory() as t:
+        fake = os.path.join(t, "claude")
+        open(fake, "w").write("#!/bin/sh\necho broken >&2\nexit 1\n")
+        os.chmod(fake, 0o755)
+        saved_path = os.environ.get("PATH")
+        os.environ["PATH"] = t + os.pathsep + (saved_path or "")
+        try:
+            try:
+                claude_ok()
+                got = None
+            except Stop as e:
+                got = e
+            expect(got is not None and got.code == 75 and "설치 깨짐" in got.msg,
+                   f"a claude that fails --version ends 75 naming a broken install: {got and (got.code, got.msg)}")
+            open(fake, "w").write("#!/bin/sh\necho 2.0.0\nexit 0\n")
+            os.chmod(fake, 0o755)
+            try:
+                claude_ok()
+                ok_ver = True
+            except Stop as e:
+                ok_ver = False
+            expect(ok_ver, "a claude that answers --version is a healthy install")
+        finally:
+            if saved_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = saved_path
     # gh's paginated answer is several JSON documents: every page is read; a credential lookup that times out is the
     # named empty-ledger fallback, not a traceback
     with tempfile.TemporaryDirectory() as t:
@@ -703,6 +749,7 @@ def self_test():
             os.unlink(pidf)
             wrapper = (f"import shutil, sys\nsys.path.insert(0, {HERE!r})\nimport local as L\nreal = shutil.which\n"
                        "shutil.which = lambda n, *a: '/x' if n == 'claude' else real(n, *a)\n"
+                       "L.claude_ok = lambda: None\n"
                        "L.gh_json = lambda *a: None\nL.device_dirs = lambda b, o: open(o, 'w').write('crates/gpu\\n')\n"
                        "L.read_ledger = lambda b, o: (open(o, 'w').close(), 'v0')[1]\n"
                        "sys.exit(L.main(['--base', 'basebr', '--minutes', '5']))\n")
@@ -724,6 +771,26 @@ def self_test():
             expect(ended and not alive, f"SIGTERM to local.py ends it and the role's process group: ended {ended}, child alive {alive}")
             if alive:
                 os.kill(child, signal.SIGKILL)
+            # --no-pre-checks: a red text check on this head does not run, and the review still ends
+            open(os.path.join(repo, "tools/check-levers.sh"), "w").write("echo 'check-levers: SOME_NAME is no row'; exit 3\n")
+            sh("git", "add", "-A")
+            sh("git", "commit", "-qm", "topic: a red levers check")
+            a = argparse.Namespace(base="basebr", full=False, minutes=10, body=None, no_pre_checks=False)
+            try:
+                rc, msg = review(a, stubbed=True, say=lambda m: None), ""
+            except Stop as e:
+                rc, msg = e.code, e.msg
+            expect(rc == 1 and "tools/check-levers.sh is red" in msg,
+                   f"a red pre-check still stops the run when the flag is off: {rc} {msg}")
+            runner("**Verdict: CLEAN**: fine\n\n### Checked\nall")
+            a.no_pre_checks = True
+            skipped = []
+            try:
+                rc = review(a, stubbed=True, say=skipped.append)
+            except Stop as e:
+                rc = e.code
+            expect(rc == 0 and any("pre-checks skipped" in m for m in skipped),
+                   f"--no-pre-checks skips a red pre-check and the review ends 0: {rc} {skipped}")
         finally:
             os.chdir(cwd)
             g.update(saved)
@@ -744,6 +811,7 @@ def main(argv):
     ap.add_argument("--full", action="store_true", help="the validator too, as the workflow runs it")
     ap.add_argument("--minutes", type=float, default=10, help="the bound per role (default 10)")
     ap.add_argument("--body", help="a file with the pull request body the reviewer reads (default: the open PR's, else none)")
+    ap.add_argument("--no-pre-checks", action="store_true", help="skip the text-only checks before the reviewer")
     try:
         args = ap.parse_args(argv)
     except SystemExit as e:
