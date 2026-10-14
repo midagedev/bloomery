@@ -29,29 +29,32 @@ gate_bound() {
 # runner goes on only after the child has ended: an ended run leaves no binary holding its locks and
 # its output. The child keeps the runner's stdin, which a command run with & would not. The trap is
 # set before the child starts, so no signal falls between the two: one that comes before the child's
-# pid is known is held in BIN_SIGNAL and passed on as soon as the pid is. Once it has passed a signal
-# on, the trap ignores further ones (GNU timeout sends its TERM to the runner and again to the
-# runner's group), so the second wait is not cut short and reads the child's status; it ignores none
-# before the child starts, which would start the child with them ignored. The caller's own traps on
-# the three signals are back when it returns, and BIN_SIGNAL names the signal that was passed on
-# (empty: none), for a caller that stops on it.
+# pid is known is held in BIN_SIGNAL and passed on as soon as the pid is, once (BIN_SENT says the trap
+# has passed it on already). Once it has passed a signal on, the trap ignores further ones (GNU
+# timeout sends its TERM to the runner and again to the runner's group), so the second wait is not
+# cut short and reads the child's status; it ignores none before the child starts, which would start
+# the child with them ignored. A TERM to a child that has already ended is no error, under set -e
+# too, and the pid is cleared once the child is reaped, so a late signal reaches no other process.
+# The caller's own traps on the three signals are back when it returns, and BIN_SIGNAL names the
+# signal that was passed on (empty: none), for a caller that stops on it.
 run_bounded() {
-  local traps s rc=0 BIN_PID=''
+  local traps s rc=0 BIN_PID='' BIN_SENT=''
   traps=$(trap -p TERM INT HUP)
   # shellcheck disable=SC2034 # the caller reads it
   BIN_SIGNAL=
   for s in TERM INT HUP; do
     # shellcheck disable=SC2064 # the signal's name now, the pid when the trap runs
-    trap "BIN_SIGNAL=$s; [ -z \"\$BIN_PID\" ] || { trap '' TERM INT HUP; kill -TERM \"\$BIN_PID\" 2> /dev/null; }" "$s"
+    trap "BIN_SIGNAL=$s; [ -z \"\$BIN_PID\" ] || { trap '' TERM INT HUP; BIN_SENT=1; kill -TERM \"\$BIN_PID\" 2> /dev/null || :; }" "$s"
   done
   "$@" <&0 &
   BIN_PID=$!
   if [ -n "$BIN_SIGNAL" ]; then
     trap '' TERM INT HUP
-    kill -TERM "$BIN_PID" 2> /dev/null
+    [ -n "$BIN_SENT" ] || kill -TERM "$BIN_PID" 2> /dev/null || :
   fi
   wait "$BIN_PID" || true
   wait "$BIN_PID" || rc=$?
+  BIN_PID=''
   trap - TERM INT HUP
   eval "$traps"
   return "$rc"

@@ -59,16 +59,25 @@ comm_of() {
 
 # dump_stacks <pid>: a gdb dump runs in the background as the watch's $dump and is waited for, so a TERM
 # to the watch is heard during it and the dump ends before the watch goes on; a dump started as the TERM
-# came gets a TERM too (the watch's trap sets $stop and reads $pid and $dump, so none is a local here).
+# came gets a TERM too, unless the trap sent it one already (the watch's trap sets $stop and $told and
+# reads $pid, $dump and $spawning, so none is a local here). The dump is bounded at 120 s by a TERM and
+# 10 s later by a KILL. Its output goes to a file beside the watch's log and then to stderr, so no
+# child of the dump outlives it.
 dump_stacks() {
   local target=$1 t
   if command -v gdb > /dev/null; then
-    timeout 120 gdb -p "$target" -batch -ex 'thread apply all bt' > >(sed 's/^/stack-watch: /' >&2) 2>&1 &
+    timeout --kill-after=10 120 gdb -p "$target" -batch -ex 'thread apply all bt' > "$log.gdb" 2>&1 &
     dump=$!
-    [ "$stop" = 0 ] || kill -TERM "$dump" 2> /dev/null
+    spawning=0
+    if [ "$stop" = 1 ]; then
+      trap '' TERM INT HUP
+      [ "$told" = "$pid $dump" ] || kill -TERM "$dump" 2> /dev/null || :
+    fi
     wait "$dump" || true
     wait "$dump" || true
     dump=''
+    sed 's/^/stack-watch: /' "$log.gdb" >&2
+    rm -f "$log.gdb"
   elif [ -d "/proc/$target/task" ]; then
     for t in /proc/"$target"/task/*; do
       echo "stack-watch: == ${t##*/} $(cat "$t/comm" 2> /dev/null) wchan=$(cat "$t/wchan" 2> /dev/null)" >&2
@@ -80,22 +89,24 @@ dump_stacks() {
 }
 
 watch() {
-  local quiet=$1 comm=$2 log pid='' sent=0 size last_change=$SECONDS target='' rc c p dump='' stop=0
+  local quiet=$1 comm=$2 log pid='' sent=0 size last_change=$SECONDS target='' rc c p dump='' stop=0 spawning=0 told=''
   shift 3
   log=$(mktemp "${TMPDIR:-/tmp}/stack-watch.XXXXXX") || return 70
   # A command under timeout runs in a process group of its own, which a signal to the watch's group never reaches: a TERM or HUP
   # to the watch (an INT too, in the foreground) goes on to the command and to a dump under way, and the watch goes on only after
   # each has ended; after it the watch starts no dump and waits for the command. The trap is set before the command starts, so no
   # signal falls between the two: one that comes before the command's pid is known sets $stop, and the command gets its TERM as
-  # soon as the pid is. The signal cuts short the wait it arrives in; once it has a pid to pass it to, the trap ignores further
-  # signals (none before the command starts, which would start it with them ignored), so each wait is made twice and the second
-  # reads the child's status.
-  trap 'stop=1; [ -z "$pid" ] || { trap "" TERM INT HUP; kill -TERM "$pid" ${dump:+"$dump"} 2> /dev/null; }' TERM INT HUP
+  # soon as the pid is, unless the trap sent it one already ($told names the pids it sent to). The signal cuts short the wait it
+  # arrives in; once it has a pid to pass it to, the trap ignores further signals, so each wait is made twice and the second reads
+  # the child's status. It ignores none while a child may still start ($spawning: before the command's pid is known, and from the
+  # check before a dump until the dump's pid is), which would start that child with them ignored. A TERM to a child that has
+  # already ended is no error, under set -e too.
+  trap 'stop=1; [ -z "$pid" ] || { [ "$spawning" = 1 ] || trap "" TERM INT HUP; told="$pid $dump"; kill -TERM "$pid" ${dump:+"$dump"} 2> /dev/null || :; }' TERM INT HUP
   "$@" > "$log" 2>&1 &
   pid=$!
   if [ "$stop" = 1 ]; then
     trap '' TERM INT HUP
-    kill -TERM "$pid" 2> /dev/null
+    [ -n "$told" ] || kill -TERM "$pid" 2> /dev/null || :
   fi
   # Pass new bytes of the log through; true when there were any.
   flush_log() {
@@ -118,18 +129,24 @@ watch() {
         last_change=$SECONDS
         continue
       fi
-      [ "$stop" = 0 ] || break
+      spawning=1
+      if [ "$stop" = 1 ]; then
+        spawning=0
+        break
+      fi
       echo "stack-watch: no output for ${quiet} s: the stacks of $target ($comm), then TERM" >&2
       dump_stacks "$target"
-      kill -TERM "$target" 2> /dev/null
+      spawning=0
+      kill -TERM "$target" 2> /dev/null || :
       for _ in 1 2 3 4 5 6 7 8 9 10; do alive "$target" || break; sleep 1; done
-      alive "$target" && kill -KILL "$target" 2> /dev/null
+      if alive "$target"; then kill -KILL "$target" 2> /dev/null || :; fi
       break
     fi
   done
   rc=0
   wait "$pid" || true
   wait "$pid" || rc=$?
+  pid=''
   flush_log || true
   rm -f "$log"
   return "$rc"
