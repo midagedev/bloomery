@@ -19,6 +19,13 @@
 //! the word read back and cleared per case; the pinned shapes leave it clean.
 //! The two q8_1 quantizers store a refused block with a NaN scale, so the
 //! q3_K gemv over the planted column is NaN in every row.
+//!
+//! And one Q5_0 dense site (`site::blocks32_gemv`): a small Q5_0 matrix
+//! packed at load by `Weights::load_where` (the `pack_q5_0` upload), the
+//! activations quantized by `enqueue_quantize_q8` into `Q8Blocks32`, the
+//! site launched as one expert (`row0 = 0`). The band is `KERNEL_BAND`
+//! against `ref_gemv` on those same 32-value activations. A refused launch
+//! and a band miss are separate failures.
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::GateError;
@@ -199,6 +206,7 @@ fn run() -> Result<(), GateError> {
         }
     }
 
+    all_ok &= q5_0_dense_site(&gpu)?;
     all_ok &= quant_faults(&gpu, &gguf)?;
 
     if !all_ok {
@@ -207,9 +215,133 @@ fn run() -> Result<(), GateError> {
     println!(
         "PASSED: gate_p1 K-quant gemvs within {KERNEL_BAND} of the q8_1 reference, \
          reruns bit-identical, pins matched, every planted non-finite lane raised its \
-         quantizer's fault and the gemv over a refused q8_1 column is NaN"
+         quantizer's fault and the gemv over a refused q8_1 column is NaN, \
+         and the Q5_0 dense site (`site::blocks32_gemv`, row0 = 0) is within \
+         {KERNEL_BAND} of the Q8Blocks32 reference"
     );
     Ok(())
+}
+
+/// One Q5_0 dense site against the host dequant reference. The weight is a
+/// synthetic GGUF loaded through `Weights::load_where`, so the bytes are
+/// packed by the `pack_q5_0` upload and by nothing else. The launch is
+/// `site::blocks32_gemv` (one expert, `row0 = 0`), and the reference dot
+/// runs on the 32-value quantization the kernel consumes (`q8_hat`, the
+/// same reconstruction `gate_p2` uses). A refused launch fails on its own
+/// line; a launch that writes the wrong rows fails `max_rel_err <= KERNEL_BAND`.
+#[cfg(feature = "gpu")]
+fn q5_0_dense_site(gpu: &bloomery_gpu::Gpu) -> Result<bool, GateError> {
+    use bloomery_gpu::q5::Q8Blocks32;
+    use bloomery_gpu::site::{self, SiteTy};
+    use bloomery_gpu::weights::Weights;
+    use bloomery_gpu_gates::{KERNEL_BAND, activations, bits_equal, max_rel_err, ref_gemv};
+    use cuda_core::DeviceBuffer;
+    use gguf::Split;
+    use gguf::quant::GgmlType;
+    use gguf::write::{Layout, TensorDecl, Writer};
+
+    const K: usize = 64;
+    const ROWS: usize = 4;
+    const M: usize = 2;
+    const NAME: &str = "w";
+
+    let raw = q5_0_rows(ROWS, K);
+    let dir = std::env::temp_dir().join(format!("bloomery-q5-site-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("q5_0.gguf");
+    let outcome = (|| -> Result<bool, GateError> {
+        let decls = vec![TensorDecl {
+            name: NAME.to_string(),
+            dims: vec![K as u64, ROWS as u64],
+            type_id: GgmlType::Q5_0.as_u32(),
+            nbytes: raw.len() as u64,
+        }];
+        let layout = Layout::new(&[], decls).map_err(|e| format!("q5_0 gguf: {e}"))?;
+        {
+            let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            let mut writer = Writer::new(file, layout).map_err(|e| format!("q5_0 gguf: {e}"))?;
+            writer
+                .tensor(NAME, &raw)
+                .map_err(|e| format!("q5_0 gguf: {e}"))?;
+            writer.finish().map_err(|e| format!("q5_0 gguf: {e}"))?;
+        }
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let stream = gpu.stream();
+        let weights = Weights::load_where(stream, &split, |n| n == NAME)?;
+        site::site(&weights, "gate_p1", NAME, (ROWS, K), SiteTy::Q5_0)?;
+
+        let x = activations(K, M, 4100);
+        let x_dev = DeviceBuffer::from_host(stream, &x)?;
+        let mut act = Q8Blocks32::new(stream, K, M)?;
+        gpu.q5()
+            .enqueue_quantize_q8(stream, &x_dev, &mut act, gpu.unlabelled_sink())?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * M)?;
+        if let Err(e) = site::blocks32_gemv(gpu, (SiteTy::Q5_0, &weights, NAME), &act, &mut y_dev) {
+            eprintln!("FAIL: q5_0_dense_site launch refused: {e}");
+            return Ok(false);
+        }
+        stream.synchronize()?;
+        let y1 = y_dev.to_host_vec(stream)?;
+        site::blocks32_gemv(gpu, (SiteTy::Q5_0, &weights, NAME), &act, &mut y_dev)?;
+        stream.synchronize()?;
+        let y2 = y_dev.to_host_vec(stream)?;
+        let bit_same = bits_equal(&y1, &y2);
+        let y_ref = ref_gemv(GgmlType::Q5_0, &raw, K, ROWS, &q8_hat(&x, K), M)?;
+        let rel = max_rel_err(&y1, &y_ref)?;
+        println!(
+            "shape q5_0_dense_site T=Q5_0 K={K} rows={ROWS} m={M} max_rel_err={rel:.3e} \
+             bit_identical_rerun={bit_same}"
+        );
+        let mut ok = true;
+        if rel > KERNEL_BAND {
+            eprintln!("FAIL: q5_0_dense_site rel err {rel:.3e} exceeds {KERNEL_BAND}");
+            ok = false;
+        }
+        if !bit_same {
+            eprintln!("FAIL: q5_0_dense_site rerun is not bit-identical");
+            ok = false;
+        }
+        Ok(ok)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome
+}
+
+/// `rows` of Q5_0, `k` values each. Block scale is f16 of `row + 1` and the
+/// codes are 0, so row `r` dequants to `-16 * (r + 1)` and a launch that
+/// starts at `row0 = 1` cannot match `ref_gemv` of row 0.
+#[cfg(feature = "gpu")]
+fn q5_0_rows(rows: usize, k: usize) -> Vec<u8> {
+    use gguf::quant::f32_to_f16_bits;
+    let blocks = k / 32;
+    let mut bytes = vec![0u8; rows * blocks * 22];
+    for r in 0..rows {
+        let d = f32_to_f16_bits((r + 1) as f32);
+        for b in 0..blocks {
+            bytes[(r * blocks + b) * 22..][..2].copy_from_slice(&d.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// Host mirror of the 32-value quantizer `enqueue_quantize_q8` writes into
+/// `Q8Blocks32`: per block, `d = amax/127` (1.0 when the block is 0) and
+/// `round(x/d)` clamped to ±127, reconstructed as `q·d`. The same
+/// reconstruction `gate_p2`'s `q8_hat` uses, so the band measures the gemv.
+#[cfg(feature = "gpu")]
+fn q8_hat(x: &[f32], k: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; x.len()];
+    for col in 0..x.len() / k {
+        for b in 0..k / 32 {
+            let vals = &x[col * k + 32 * b..][..32];
+            let amax = vals.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            for (o, &v) in out[col * k + 32 * b..][..32].iter_mut().zip(vals) {
+                *o = (v / d).round().clamp(-127.0, 127.0) * d;
+            }
+        }
+    }
+    out
 }
 
 /// The quantizers' fault contract on planted input. The pinned shapes above

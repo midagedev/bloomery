@@ -7,7 +7,7 @@
 use gguf::GgmlType;
 use models::Arch;
 
-use crate::kernels::{self, DownAct, DownEntry, GateUpEntry};
+use crate::kernels::{self, DownAct, DownEntry, GateUpEntry, SiteAct, SiteEntry};
 use crate::placement::{CardFormat, RoutedRule};
 
 /// A layer program: the chain that runs a family's layers.
@@ -95,6 +95,24 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
         | DownEntry::Iq4nl
         | DownEntry::Iq4xs
         | DownEntry::Mxfp4 => None,
+    }
+}
+
+/// The dense site the qwen3moe body runs a projection of `ty` with: the
+/// table's row ([`kernels::dense`]) when that site reads an activation the
+/// body's arena carries ([`SiteAct::Q8x128`], [`SiteAct::Q8x32`],
+/// [`SiteAct::F32`] — `Form::Q8x128`, `Form::Q8x32`, `Form::F32`). A Q5_0
+/// site reads [`SiteAct::Q8Blocks32`], which the arena does not carry, and
+/// is `None`. The body's load and the coverage census both read this, so a
+/// site the arena cannot feed is refused at load and listed together.
+#[must_use]
+pub const fn qwen3moe_dense(ty: GgmlType) -> Option<SiteEntry> {
+    let Some(entry) = kernels::dense(ty) else {
+        return None;
+    };
+    match entry.reads() {
+        SiteAct::Q8x128 | SiteAct::Q8x32 | SiteAct::F32 => Some(entry),
+        SiteAct::Q8Blocks32 => None,
     }
 }
 
@@ -314,5 +332,20 @@ mod tests {
                 "{ty} down"
             );
         }
+    }
+
+    /// The qwen3moe body's dense owner is the table row kept to the forms
+    /// its arena carries: `None` for Q5_0 (it reads `Q8Blocks32`), `Some`
+    /// for Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32.
+    #[test]
+    fn the_qwen3moe_body_dense_owner_refuses_q5_0() {
+        use crate::kernels::SiteEntry;
+        assert_eq!(qwen3moe_dense(GgmlType::Q5_0), None);
+        assert_eq!(qwen3moe_dense(GgmlType::Q3_K), Some(SiteEntry::Q3k));
+        assert_eq!(qwen3moe_dense(GgmlType::Q4_K), Some(SiteEntry::Q4k));
+        assert_eq!(qwen3moe_dense(GgmlType::Q5_K), Some(SiteEntry::Q5k));
+        assert_eq!(qwen3moe_dense(GgmlType::Q6_K), Some(SiteEntry::Q6k));
+        assert_eq!(qwen3moe_dense(GgmlType::Q8_0), Some(SiteEntry::Q8_0));
+        assert_eq!(qwen3moe_dense(GgmlType::F32), Some(SiteEntry::F32));
     }
 }

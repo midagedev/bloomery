@@ -14,7 +14,7 @@
 //! - [`gemm`]: the prompt path's GEMM over a route table (`GemmWeight`,
 //!   `Gemm32Weight`);
 //! - [`dense`]: `crates/gpu/src/site.rs`'s dense gemv sites, named by the file
-//!   tensor's own type;
+//!   tensor's own type; the activation each reads is [`SiteEntry::reads`];
 //! - [`head`]: `crates/gpu/src/head.rs`'s lm_head;
 //! - [`embed`]: the card's embedding row lookups.
 //!
@@ -26,7 +26,8 @@
 //!
 //! Weights. The routed `_sel`, gate·up and file-layout gemm entries read a
 //! stack as the file's blocks in the [`crate::placement::CardFormat::KQuant`]
-//! word stream; `q5_0_gemv_sel` reads the packed
+//! word stream; `q5_0_gemv_sel` and the Q5_0 dense site
+//! ([`SiteEntry::Q5_0`]) read the packed
 //! [`crate::placement::CardFormat::Q5_0`] layout, and the Q8_0 dense, head
 //! and embedding entries read [`crate::placement::CardFormat::Q8_0Planes`].
 //! Every type a row names has a card layout:
@@ -190,8 +191,9 @@ pub enum GemmEntry {
 }
 
 /// A dense gemv site's launch family (`SiteTy` in `crates/gpu/src/site.rs`):
-/// `site::gemv` over the f32 rows, `site::kgemv` over the q8_1 rows, and
-/// `site::gemm` for a wide unit.
+/// `site::gemv` over the f32 rows, `site::kgemv` over the q8_1 rows,
+/// `site::blocks32_gemv` over the `Q8Blocks32` rows, and `site::gemm` for a
+/// wide unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiteEntry {
     /// `Gpu::enqueue_gemv_q3k`; wide, the grouped GEMM.
@@ -203,11 +205,60 @@ pub enum SiteEntry {
     Q5k,
     /// `Gpu::enqueue_gemv_q6k`; wide, the grouped GEMM.
     Q6k,
+    /// `Q5Kernels::enqueue_gemv_q5_0` (`crates/gpu/src/q5.rs`) over the packed
+    /// Q5_0 layout, the site as one expert (`row0 = 0`), through
+    /// `site::blocks32_gemv` on the `Q8Blocks32` rows. No wide GEMM.
+    Q5_0,
     /// `Q8F32Kernels::enqueue_q8_0_gemv` (`enqueue_q8_0_gemv_mcol` past one
     /// column) over the q8f32 planes and f32 rows; wide, `Gemm32Weight::Q8_0Plane`.
     Q8_0,
     /// `Gemm32Kernels::enqueue_f32_tile` over the f32 rows, narrow and wide.
     F32,
+}
+
+/// The activation a dense site's launch reads; `crates/gpu/src/site.rs`
+/// names it `Form` and a body quantizes a unit's rows into exactly the forms
+/// its sites read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteAct {
+    /// q8_1 blocks of 128 values (the K-quant gemv's `Q8Act`, the grouped
+    /// GEMM's `GemmAct`).
+    Q8x128,
+    /// The f32 rows on the gemv arm; q8 blocks of 32 values (`GemmAct32`) on
+    /// the wide arm.
+    Q8x32,
+    /// The f32 rows on both arms.
+    F32,
+    /// q8 blocks of 32 values in the q5 gemv's `Q8Blocks32`: per column
+    /// `q_stride` code words, `k/32` block sums and `k/32` scales, written
+    /// by `Q5Kernels::enqueue_quantize_q8`; `site::blocks32_gemv` reads them.
+    Q8Blocks32,
+}
+
+impl SiteEntry {
+    /// The activation this site's launch reads.
+    #[must_use]
+    pub const fn reads(self) -> SiteAct {
+        match self {
+            SiteEntry::Q3k | SiteEntry::Q4k | SiteEntry::Q5k | SiteEntry::Q6k => SiteAct::Q8x128,
+            SiteEntry::Q8_0 => SiteAct::Q8x32,
+            SiteEntry::F32 => SiteAct::F32,
+            SiteEntry::Q5_0 => SiteAct::Q8Blocks32,
+        }
+    }
+}
+
+impl SiteAct {
+    /// This form's name: the `Form` token in `crates/gpu/src/site.rs`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            SiteAct::Q8x128 => "Q8x128",
+            SiteAct::Q8x32 => "Q8x32",
+            SiteAct::F32 => "F32",
+            SiteAct::Q8Blocks32 => "Q8Blocks32",
+        }
+    }
 }
 
 /// The lm_head launch family (`OutW` in `crates/gpu/src/head.rs`,
@@ -365,9 +416,9 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         GgmlType::Q5_K => Some(SiteEntry::Q5k),
         GgmlType::Q6_K => Some(SiteEntry::Q6k),
         GgmlType::Q8_0 => Some(SiteEntry::Q8_0),
+        GgmlType::Q5_0 => Some(SiteEntry::Q5_0),
         GgmlType::F32 => Some(SiteEntry::F32),
         GgmlType::F16
-        | GgmlType::Q5_0
         | GgmlType::Q5_1
         | GgmlType::Q2_K
         | GgmlType::BF16
@@ -727,6 +778,7 @@ mod tests {
             rows(dense),
             [
                 (GgmlType::F32, SiteEntry::F32),
+                (GgmlType::Q5_0, SiteEntry::Q5_0),
                 (GgmlType::Q8_0, SiteEntry::Q8_0),
                 (GgmlType::Q3_K, SiteEntry::Q3k),
                 (GgmlType::Q4_K, SiteEntry::Q4k),

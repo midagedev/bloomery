@@ -16,7 +16,9 @@
 //! against the whole tree: a need any program's row covers, and a tensor type
 //! any program's pin reads, is not an item; the program itself is one.
 
-pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
+pub use bloomery_placement::accepts::{
+    Program, program_of, qwen3moe_dense, qwen35_down, qwen35_gate_up,
+};
 use bloomery_placement::kernels;
 pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
@@ -762,11 +764,12 @@ struct RowPin {
 }
 
 /// The per-tensor pins whose types are the card kernel table's: the qwen3moe
-/// body's attention sites ([`kernels::dense`]: `site.rs`'s launches, the fused
-/// Q4_K ones among them), head ([`kernels::head`]: `head.rs`) and token
-/// embedding ([`kernels::embed`]: `elem.rs`) and routed stacks
-/// ([`qwen35_gate_up`], [`qwen35_down`]: the FFN dispatch both bodies share),
-/// and `Body35`'s FFN ([`qwen35_gate_up`], [`qwen35_down`], [`qwen35_shared`]),
+/// body's attention sites ([`qwen3moe_dense`]: the table's dense row kept to
+/// the forms that body's arena carries, the fused Q4_K ones among them), head
+/// ([`kernels::head`]: `head.rs`) and token embedding ([`kernels::embed`]:
+/// `elem.rs`) and routed stacks ([`qwen35_gate_up`], [`qwen35_down`]: the FFN
+/// dispatch both bodies share), and `Body35`'s FFN ([`qwen35_gate_up`],
+/// [`qwen35_down`], [`qwen35_shared`]),
 /// and the glm5next and mimo2 bodies' token embedding (the host's rows,
 /// `GgmlType::has_dequant`), each `what` naming the types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
@@ -775,8 +778,8 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::Attention,
         matrices: true,
         names: None,
-        what: "attention matrices (the body's dense sites: the types kernels::dense names)",
-        row: |ty| kernels::dense(ty).is_some(),
+        what: "attention matrices (the body's dense sites: the types qwen3moe_dense names)",
+        row: |ty| qwen3moe_dense(ty).is_some(),
     },
     RowPin {
         program: Program::Qwen3moeBody,
@@ -864,12 +867,12 @@ const Q35_PROJ: &[GgmlType] = &[
 
 /// The dense site `Body35` runs a part of a shared expert of `ty` with when
 /// the layer keeps it apart from its routed stacks (a part whose type is not
-/// its stack's): the table's dense gemv site of the part's own type
-/// ([`kernels::dense`]). A shared expert of its stacks' types is joined into
-/// them and runs at their entries.
+/// its stack's): the qwen3moe body's dense owner ([`qwen3moe_dense`]), the
+/// table's dense row kept to the forms that body's arena carries. A shared
+/// expert of its stacks' types is joined into them and runs at their entries.
 #[must_use]
 pub const fn qwen35_shared(ty: GgmlType) -> Option<SiteEntry> {
-    kernels::dense(ty)
+    qwen3moe_dense(ty)
 }
 
 /// A routed expert stack's gate or up rows (`ffn_gate_exps`/`ffn_up_exps`):
@@ -1241,8 +1244,10 @@ mod tests {
     // embedding and head are no items. Derivation: each type admitted below
     // has a launch the qwen3moe body runs on both paths (`gpu/src/site.rs`
     // `kgemv`/`gemv` and `gemm`; `Head::enqueue`; `enqueue_embed_rows_kquant`
-    // and `embed_rows_q8_0`), and `kernels`' own tests pin each row's set.
-    // The routed stacks' pins are the FFN dispatch's rows, below.
+    // and `embed_rows_q8_0`). Attention follows [`qwen3moe_dense`], the dense
+    // row kept to the forms the body's arena carries, and `kernels`' own
+    // tests pin each row's set. The routed stacks' pins are the FFN
+    // dispatch's rows, below.
     #[test]
     fn the_qwen3moe_body_reads_the_kernel_tables_rows() {
         // Every mismatch is collected, so a base run lists each type it
@@ -1276,7 +1281,7 @@ mod tests {
             }
             for ty in [GgmlType::BF16, GgmlType::F16, GgmlType::IQ4_XS] {
                 let item = format!(
-                    "{ty} attention matrices (the body's dense sites: the types kernels::dense \
+                    "{ty} attention matrices (the body's dense sites: the types qwen3moe_dense \
                      names)"
                 );
                 check(

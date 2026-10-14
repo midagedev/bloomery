@@ -316,6 +316,7 @@ const fn ggml_of(ty: SiteTy) -> GgmlType {
         SiteTy::Q4K => GgmlType::Q4_K,
         SiteTy::Q5K => GgmlType::Q5_K,
         SiteTy::Q6K => GgmlType::Q6_K,
+        SiteTy::Q5_0 => GgmlType::Q5_0,
         SiteTy::Q8_0 => GgmlType::Q8_0,
         SiteTy::F32 => GgmlType::F32,
     }

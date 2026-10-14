@@ -14,12 +14,17 @@
 //!   past it, the two bit for bit equal on a column), F32 `f32_gemv` at one
 //!   column and the F32 tile past it (`f32_tile_gemm`, token-major, bit for
 //!   bit `f32_gemv` on every row and column). A K-quant site's gemv is
-//!   [`kgemv`].
+//!   [`kgemv`]. A Q5_0 site's is [`blocks32_gemv`].
 //! - [`kgemv`], a K-quant site at most eight columns over the q8_1 rows:
 //!   Q3_K, Q4_K and Q6_K their gemvs, row-major (`m` outputs a row); Q5_K
 //!   the K-quant down `_sel` over a stack of one expert, token-major (a slot
-//!   a column). Where a body copies a row-major output token-major, and its
-//!   fused groups of Q4_K launches, stay the body's.
+//!   a column). [`SiteTy::kgemv_order`] is this family's layout and is
+//!   `None` for Q5_0. Where a body copies a row-major output token-major,
+//!   and its fused groups of Q4_K launches, stay the body's.
+//! - [`blocks32_gemv`], a Q5_0 site at most eight columns over the
+//!   `Q8Blocks32` rows: `enqueue_gemv_q5_0` over the packed weight, the site
+//!   as one expert (`row0 = 0`), row-major (`y[r · m + c]`). That row-major
+//!   layout is this function's, not [`SiteTy::kgemv_order`]'s.
 //! - [`gemm`], a wide unit through a route table: a K-quant the grouped
 //!   int8 GEMM over the q8_1 blocks of 128 values ([`GemmAct`]), Q8_0 the
 //!   32-value GEMM over the q8 blocks of 32 values ([`GemmAct32`]) on the
@@ -40,6 +45,7 @@ use crate::gemm::{
     GemmRoute, GemmWeight,
 };
 use crate::kquant::{Act, KquantKernels, SelDown};
+use crate::q5::Q8Blocks32;
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
@@ -47,6 +53,7 @@ use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::Split;
 use gguf::quant::GgmlType;
+use model::placement::kernels::SiteEntry;
 use std::fmt;
 
 /// The launch family a site's file type selects.
@@ -56,22 +63,14 @@ pub enum SiteTy {
     Q4K,
     Q5K,
     Q6K,
+    /// Packed Q5_0 (`pack_q5_0`), launched by [`blocks32_gemv`].
+    Q5_0,
     Q8_0,
     F32,
 }
 
-/// The activation form a site's launch reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Form {
-    /// q8_1 blocks of 128 values (the K-quant gemv's `Q8Act`, the grouped
-    /// GEMM's `GemmAct`).
-    Q8x128,
-    /// The f32 rows on the gemv arm; q8 blocks of 32 values (`GemmAct32`) on
-    /// the wide arm.
-    Q8x32,
-    /// The f32 rows on both arms.
-    F32,
-}
+/// The activation form a site's launch reads: the kernel table's fact.
+pub use model::placement::kernels::SiteAct as Form;
 
 /// Where a gemv writes output `r` of column `c` of a site of `rows` rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +88,7 @@ impl SiteTy {
         SiteTy::Q4K,
         SiteTy::Q5K,
         SiteTy::Q6K,
+        SiteTy::Q5_0,
         SiteTy::Q8_0,
         SiteTy::F32,
     ];
@@ -102,6 +102,7 @@ impl SiteTy {
             GgmlType::Q4_K => Some(SiteTy::Q4K),
             GgmlType::Q5_K => Some(SiteTy::Q5K),
             GgmlType::Q6_K => Some(SiteTy::Q6K),
+            GgmlType::Q5_0 => Some(SiteTy::Q5_0),
             GgmlType::Q8_0 => Some(SiteTy::Q8_0),
             GgmlType::F32 => Some(SiteTy::F32),
             _ => None,
@@ -114,7 +115,8 @@ impl SiteTy {
         self.gemm_weight().is_some()
     }
 
-    /// The grouped GEMM's type of a K-quant; `None` for Q8_0 and F32.
+    /// The grouped GEMM's type of a K-quant; `None` for Q5_0, Q8_0 and F32.
+    /// Q5_0 has no wide GEMM.
     #[must_use]
     pub fn gemm_weight(self) -> Option<GemmWeight> {
         match self {
@@ -122,30 +124,41 @@ impl SiteTy {
             SiteTy::Q4K => Some(GemmWeight::Q4K),
             SiteTy::Q5K => Some(GemmWeight::Q5K),
             SiteTy::Q6K => Some(GemmWeight::Q6K),
-            SiteTy::Q8_0 | SiteTy::F32 => None,
+            SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 => None,
         }
     }
 
-    /// How a K-quant site's [`kgemv`] lays out its columns: Q3_K, Q4_K and
-    /// Q6_K row-major, Q5_K token-major; `None` for a type whose gemv is
-    /// [`gemv`].
+    /// How [`kgemv`] lays a K-quant site's columns out: Q3_K, Q4_K and Q6_K
+    /// row-major, Q5_K token-major. `None` for a type [`kgemv`] does not run:
+    /// Q8_0 and F32 ([`gemv`]), and Q5_0 ([`blocks32_gemv`], whose row-major
+    /// layout `y[r · m + c]` is that function's own).
     #[must_use]
     pub fn kgemv_order(self) -> Option<Order> {
         match self {
             SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q6K => Some(Order::RowMajor),
             SiteTy::Q5K => Some(Order::TokenMajor),
-            SiteTy::Q8_0 | SiteTy::F32 => None,
+            SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 => None,
         }
     }
 
-    /// The activation form the site's launch reads.
+    /// The kernel table's launch family of this type (`SiteEntry`).
     #[must_use]
-    pub fn reads(self) -> Form {
+    pub const fn entry(self) -> SiteEntry {
         match self {
-            SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => Form::Q8x128,
-            SiteTy::Q8_0 => Form::Q8x32,
-            SiteTy::F32 => Form::F32,
+            SiteTy::Q3K => SiteEntry::Q3k,
+            SiteTy::Q4K => SiteEntry::Q4k,
+            SiteTy::Q5K => SiteEntry::Q5k,
+            SiteTy::Q6K => SiteEntry::Q6k,
+            SiteTy::Q5_0 => SiteEntry::Q5_0,
+            SiteTy::Q8_0 => SiteEntry::Q8_0,
+            SiteTy::F32 => SiteEntry::F32,
         }
+    }
+
+    /// The activation form the site's launch reads (`SiteEntry::reads`).
+    #[must_use]
+    pub const fn reads(self) -> Form {
+        self.entry().reads()
     }
 }
 
@@ -156,6 +169,7 @@ impl fmt::Display for SiteTy {
             SiteTy::Q4K => "Q4_K",
             SiteTy::Q5K => "Q5_K",
             SiteTy::Q6K => "Q6_K",
+            SiteTy::Q5_0 => "Q5_0",
             SiteTy::Q8_0 => "Q8_0",
             SiteTy::F32 => "F32",
         })
@@ -216,6 +230,7 @@ pub fn site(
             .filter(|s| s.kquant())
             .map(|s| (s, p.rows(), *wk)),
         Some(DevWeight::Q8_0 { d, k: wk, .. }) => Some((SiteTy::Q8_0, d.rows(), *wk)),
+        Some(DevWeight::Q5_0 { w: p, k: wk }) => Some((SiteTy::Q5_0, p.rows(), *wk)),
         Some(DevWeight::F32 { w: p, k: wk }) => Some((SiteTy::F32, p.rows(), *wk)),
         Some(_) => None,
     };
@@ -258,7 +273,8 @@ fn kq<'w>(
 
 /// `y = W · x` for site `name` of type `ty` over the first `m` (1..=8)
 /// columns of the f32 rows `x`, token-major (module doc). A K-quant site is
-/// the body's launch and is refused here by name.
+/// [`kgemv`] and a Q5_0 site is [`blocks32_gemv`]; each is refused here by
+/// name.
 pub fn gemv(
     gpu: &Gpu,
     g32: &Gemm32Kernels,
@@ -300,6 +316,10 @@ pub fn gemv(
             WHAT,
             format!("{name} is {ty}: a K-quant site's gemv is `site::kgemv`, on the q8_1 rows"),
         )),
+        SiteTy::Q5_0 => Err(GpuError::shape(
+            WHAT,
+            format!("{name} is {ty}: its gemv is `site::blocks32_gemv`, on the Q8Blocks32 rows"),
+        )),
     }
 }
 
@@ -330,7 +350,8 @@ impl KGemvKernels {
 /// columns of the q8_1 rows `act`, laid out as [`SiteTy::kgemv_order`]
 /// says: Q4_K, Q6_K and Q3_K their gemvs, row-major; Q5_K the down `_sel`
 /// over the site as one expert, token-major, an id past it raising on
-/// `fault`. Any other type's gemv is [`gemv`], refused here by name.
+/// `fault`. Q8_0 and F32 are [`gemv`]; Q5_0 is [`blocks32_gemv`]. Each is
+/// refused here by name.
 pub fn kgemv(
     gpu: &Gpu,
     kk: &KGemvKernels,
@@ -363,7 +384,48 @@ pub fn kgemv(
             WHAT,
             format!("{name} is {ty}: its gemv is `site::gemv`, on the f32 rows"),
         )),
+        SiteTy::Q5_0 => Err(GpuError::shape(
+            WHAT,
+            format!("{name} is {ty}: its gemv is `site::blocks32_gemv`, on the Q8Blocks32 rows"),
+        )),
     }
+}
+
+/// The resident packed Q5_0 weight of `name`, or a named refusal: absent
+/// and any other variant are both "a packed Q5_0 weight".
+fn packed_q5_0<'w>(
+    w: &'w Weights,
+    what: &'static str,
+    name: &str,
+) -> Result<&'w DeviceTensor<u32>, GpuError> {
+    match w.get(name) {
+        Some(DevWeight::Q5_0 { w, .. }) => Ok(w),
+        _ => Err(GpuError::tensor(what, name, "a packed Q5_0 weight")),
+    }
+}
+
+/// `y = W · act` for Q5_0 site `name` over the `act.m()` columns of the
+/// `Q8Blocks32` rows `act`, row-major (`y[r · m + c]`). The weight is the
+/// packed plane [`Weights::load_where`] uploads (`pack_q5_0`, the one
+/// owner). The site is one expert: `row0 = 0`, `n_rows` the plane's rows,
+/// `col0 = 0`, `y0 = 0`. A missing packed weight, another type, or a plane
+/// the quantizer's columns do not match is a named error.
+pub fn blocks32_gemv(
+    gpu: &Gpu,
+    (ty, w, name): (SiteTy, &Weights, &str),
+    act: &Q8Blocks32,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "site::blocks32_gemv";
+    let SiteTy::Q5_0 = ty else {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("{name} is {ty}: `site::blocks32_gemv` runs a Q5_0 site"),
+        ));
+    };
+    let wt = packed_q5_0(w, WHAT, name)?;
+    gpu.q5()
+        .enqueue_gemv_q5_0(gpu.stream(), wt, act, 0, wt.rows(), 0, act.m(), y, 0)
 }
 
 /// Where a wide site reads its weight: the resident tensor of a name
@@ -532,6 +594,10 @@ pub fn gemm(
                 y,
             )
         }
+        SiteTy::Q5_0 => Err(GpuError::shape(
+            WHAT,
+            format!("{name} is {ty}: a Q5_0 site has no wide GEMM"),
+        )),
     }
 }
 
@@ -670,6 +736,12 @@ fn swiglu_launch((ty, name): (SiteTy, &str), rule: Act) -> Result<SwigluLaunch, 
                  not the clamp at {limit}"
             ),
         )),
+        (Form::Q8Blocks32, _) => Err(GpuError::shape(
+            "site::swiglu",
+            format!(
+                "{name} is {ty}: its SwiGLU rows are Q8Blocks32, which the wide GEMM writes none of"
+            ),
+        )),
     }
 }
 
@@ -735,17 +807,18 @@ fn swiglu(
 
 #[cfg(test)]
 mod tests {
-    use super::{SiteTy, SwigluLaunch, file_site, swiglu_launch};
+    use super::{Form, SiteTy, SwigluLaunch, file_site, swiglu_launch};
     use crate::kquant::Act;
     use gguf::Split;
+    use gguf::quant::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
     use std::fs::File;
     use std::io::BufWriter;
 
     /// A site's type is read from the file's header alone: a Q8_0 matrix of
     /// two rows of 64 is read as Q8_0 where Q8_0 is launched, and refused by
-    /// name where only K-quants are; a Q3_K and a Q5_K one are read as
-    /// theirs; an IQ4_XS one (a type no site launch reads) and a matrix of
+    /// name where only K-quants are; a Q3_K, a Q5_K and a Q5_0 one are read
+    /// as theirs; an IQ4_XS one (a type no site launch reads) and a matrix of
     /// another shape are refused by name.
     #[test]
     fn a_site_type_comes_from_the_header_and_a_type_with_no_launch_is_refused() {
@@ -757,6 +830,7 @@ mod tests {
             ("iq", vec![256, 1], 23, 136),
             ("q3", vec![256, 2], 11, 2 * 110),
             ("q5", vec![256, 2], 13, 2 * 176),
+            ("q50", vec![64, 2], 6, 2 * 2 * 22),
         ];
         let tensors = decls
             .iter()
@@ -781,6 +855,7 @@ mod tests {
             SiteTy::Q4K,
             SiteTy::Q5K,
             SiteTy::Q6K,
+            SiteTy::Q5_0,
             SiteTy::Q8_0,
             SiteTy::F32,
         ];
@@ -788,6 +863,7 @@ mod tests {
             ("q8", 64, SiteTy::Q8_0),
             ("q3", 256, SiteTy::Q3K),
             ("q5", 256, SiteTy::Q5K),
+            ("q50", 64, SiteTy::Q5_0),
         ] {
             let got = file_site(&split, "test", name, (2, k), &all);
             assert_eq!(got.ok(), Some(want), "{name}");
@@ -846,5 +922,31 @@ mod tests {
             }
             Ok(l) => panic!("an F32 down under the clamp launched {l:?}"),
         }
+        for rule in [Act::SiluMul, clamp] {
+            match launch(SiteTy::Q5_0, rule) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("down is Q5_0") && msg.contains("Q8Blocks32"),
+                        "{msg}"
+                    );
+                }
+                Ok(l) => panic!("a Q5_0 down launched {l:?}"),
+            }
+        }
+    }
+
+    /// Q5_0 is the blocks32 gemv: the `Q8Blocks32` form, no K-quant GEMM
+    /// type, and `kgemv_order` is `None` (that is kgemv's layout; the
+    /// row-major layout stays on `blocks32_gemv`). The file type maps back.
+    #[test]
+    fn a_q5_0_site_reads_q8blocks32_and_is_not_a_kgemv() {
+        assert_eq!(SiteTy::of_ggml(GgmlType::Q5_0), Some(SiteTy::Q5_0));
+        assert!(SiteTy::ALL.contains(&SiteTy::Q5_0));
+        assert_eq!(SiteTy::Q5_0.reads(), Form::Q8Blocks32);
+        assert_eq!(SiteTy::Q5_0.kgemv_order(), None);
+        assert!(!SiteTy::Q5_0.kquant());
+        assert_eq!(SiteTy::Q5_0.gemm_weight(), None);
+        assert_eq!(SiteTy::Q5_0.to_string(), "Q5_0");
     }
 }

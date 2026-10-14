@@ -222,7 +222,8 @@ impl SiteRel {
 ///   the weight's own dot on that form.
 /// - Ours: the form each launch reads. A dense site is `crates/gpu/src/site.rs`'s
 ///   `SiteTy::reads`: a K-quant reads q8_1 blocks of [`Q8_1_BLOCK`] values on both arms, Q8_0 the
-///   f32 rows on the gemv and q8 blocks of [`Q8_32_BLOCK`] on the GEMM, F32 f32. An expert reads
+///   f32 rows on the gemv and q8 blocks of [`Q8_32_BLOCK`] on the GEMM, Q5_0 q8 blocks of
+///   [`Q8_32_BLOCK`] on the gemv (`Q8Blocks32`; no GEMM arm), F32 f32. An expert reads
 ///   q8_1 blocks of [`Q8_1_BLOCK`] under a K-quant, IQ3_XXS or IQ4_XS (the gate·up's `Q8Act` and
 ///   the grouped GEMM's `GemmAct`) and q8 blocks of [`Q8_32_BLOCK`] under Q8_0, Q5_1 or IQ4_NL
 ///   (`Q8Blocks32` and `GemmAct32`). An IQ2_XS, IQ3_S or Q2_K expert stack is read by the host tier
@@ -234,7 +235,8 @@ pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
         (GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K, _)
         | (GgmlType::IQ3_XXS | GgmlType::IQ4_XS, Arm::Expert) => Some(Q8_1_BLOCK),
         (GgmlType::Q8_0, Arm::Gemm | Arm::Expert)
-        | (GgmlType::Q5_1 | GgmlType::IQ4_NL, Arm::Expert) => Some(Q8_32_BLOCK),
+        | (GgmlType::Q5_1 | GgmlType::IQ4_NL, Arm::Expert)
+        | (GgmlType::Q5_0, Arm::Gemv) => Some(Q8_32_BLOCK),
         // No card launch of these bodies reads IQ2_XS, IQ3_S or Q2_K experts; the host tier reads
         // their q8_K blocks as ik does (the same dot).
         (GgmlType::IQ2_XS | GgmlType::IQ3_S | GgmlType::Q2_K, Arm::Expert) => Some(QK_K),
@@ -975,6 +977,9 @@ mod site_tests {
             assert_eq!(site_rel(ty, Arm::Expert), q(q256, q256), "{ty}");
         }
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Gemv), q(q32, None));
+        assert_eq!(site_rel(GgmlType::Q5_0, Arm::Gemv), q(q32, q32));
+        assert_eq!(site_rel(GgmlType::Q5_0, Arm::Gemm), None);
+        assert_eq!(site_rel(GgmlType::Q5_0, Arm::Expert), None);
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Gemm), q(q32, q32));
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Expert), q(q32, q32));
         for ty in [GgmlType::Q5_1, GgmlType::IQ4_NL] {
@@ -1013,9 +1018,10 @@ mod site_tests {
         }
     }
 
-    /// Ours is the form the launches read, as their sources say it: the text of `site.rs`'s
-    /// `SiteTy::reads` and of the 32-value GEMM family's module doc, so a launch that moves to
-    /// another form is red here until the table follows it.
+    /// Ours is the form the launches read, as their sources say it: the text of the kernel
+    /// table's `SiteEntry::reads` (which `site.rs`'s `SiteTy::reads` returns) and of the 32-value
+    /// GEMM family's module doc, so a launch that moves to another form is red here until the
+    /// table follows it.
     #[test]
     fn site_rel_reads_the_forms_the_launches_name() {
         let gpu = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpu/src");
@@ -1024,17 +1030,18 @@ mod site_tests {
                 .unwrap_or_else(|e| panic!("crates/gpu/src/{file}: {e}"))
         };
         let (site, gemm, grouped) = (
-            read("site.rs"),
+            read("../../placement/src/kernels.rs"),
             read("gemm/mod.rs"),
             read("gemm/grouped.rs"),
         );
         for line in [
-            "SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => Form::Q8x128",
-            "SiteTy::Q8_0 => Form::Q8x32",
-            "SiteTy::F32 => Form::F32",
+            "SiteEntry::Q3k | SiteEntry::Q4k | SiteEntry::Q5k | SiteEntry::Q6k => SiteAct::Q8x128",
+            "SiteEntry::Q8_0 => SiteAct::Q8x32",
+            "SiteEntry::F32 => SiteAct::F32",
+            "SiteEntry::Q5_0 => SiteAct::Q8Blocks32",
             "q8_1 blocks of 128 values",
         ] {
-            assert!(site.contains(line), "site.rs no longer says {line:?}");
+            assert!(site.contains(line), "kernels.rs no longer says {line:?}");
         }
         assert!(
             gemm.contains("(Q8_0, IQ4_NL, Q5_1), over [`GemmAct32`]"),

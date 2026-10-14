@@ -48,6 +48,7 @@ use model::arch::Arch;
 use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names::{self, token_embd};
+use model::placement::accepts::qwen3moe_dense;
 use model::placement::kernels::{self, SiteEntry};
 use model::placement::{Plan, WholeLoad};
 use std::mem::ManuallyDrop;
@@ -315,6 +316,7 @@ pub(super) const fn site_ty(entry: SiteEntry) -> SiteTy {
         SiteEntry::Q4k => SiteTy::Q4K,
         SiteEntry::Q5k => SiteTy::Q5K,
         SiteEntry::Q6k => SiteTy::Q6K,
+        SiteEntry::Q5_0 => SiteTy::Q5_0,
         SiteEntry::Q8_0 => SiteTy::Q8_0,
         SiteEntry::F32 => SiteTy::F32,
     }
@@ -329,15 +331,18 @@ pub(super) const fn ggml_ty(site: SiteTy) -> GgmlType {
         SiteTy::Q4K => GgmlType::Q4_K,
         SiteTy::Q5K => GgmlType::Q5_K,
         SiteTy::Q6K => GgmlType::Q6_K,
+        SiteTy::Q5_0 => GgmlType::Q5_0,
         SiteTy::Q8_0 => GgmlType::Q8_0,
         SiteTy::F32 => GgmlType::F32,
     }
 }
 
 /// Weight `name` as a dense site of `rows` rows of `k` values and the launch
-/// family the table's `dense` row picks for the type it is resident as (a
-/// K-quant word plane, Q8_0 planes or an F32 plane); a type with no row, or
-/// a weight of another shape or form, is refused by name.
+/// family the qwen3moe body's dense owner ([`qwen3moe_dense`]) picks for the
+/// type it is resident as (a K-quant word plane, Q8_0 planes or an F32
+/// plane). A type the table names no dense site for, a site whose activation
+/// the arena does not carry, or a weight of another shape or form, is refused
+/// by name.
 pub(super) fn dense_site(
     w: &Weights,
     name: &str,
@@ -347,6 +352,7 @@ pub(super) fn dense_site(
     let what = "qwen3moe::Body::load";
     let ty = match w.get(name) {
         Some(DevWeight::KQuant { ty, .. }) => *ty,
+        Some(DevWeight::Q5_0 { .. }) => GgmlType::Q5_0,
         Some(DevWeight::Q8_0 { .. }) => GgmlType::Q8_0,
         Some(DevWeight::F32 { .. }) => GgmlType::F32,
         Some(_) => {
@@ -358,15 +364,26 @@ pub(super) fn dense_site(
         }
         None => return Err(GpuError::tensor(what, name, "resident")),
     };
-    let Some(entry) = kernels::dense(ty) else {
-        return Err(GpuError::shape(
-            what,
-            format!("{name} is {ty}; no dense site launches it (kernels::dense)"),
-        ));
-    };
-    let family = site_ty(entry);
+    let family = admit_dense(what, name, ty)?;
     site::site(w, what, name, (rows, k), family)?;
     Ok(family)
+}
+
+/// [`qwen3moe_dense`] as a site family, or a named refusal. A table row whose
+/// activation the arena does not carry names that form (`SiteAct::name`, the
+/// `Form` token). A type with no row keeps the `kernels::dense` refusal.
+fn admit_dense(what: &'static str, name: &str, ty: GgmlType) -> Result<SiteTy, GpuError> {
+    if let Some(entry) = qwen3moe_dense(ty) {
+        return Ok(site_ty(entry));
+    }
+    let msg = match kernels::dense(ty) {
+        Some(entry) => format!(
+            "{name} is {ty}; its dense site reads {}, which this body's arena does not carry",
+            entry.reads().name()
+        ),
+        None => format!("{name} is {ty}; no dense site launches it (kernels::dense)"),
+    };
+    Err(GpuError::shape(what, msg))
 }
 
 /// Weight `name` as a resident F32 plane of `rows` rows of `k`.
@@ -510,9 +527,11 @@ fn card_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<Option<[SiteTy; 3
 /// sites' types and the three routed stacks' as the card part runs them
 /// ([`card_stacks`]), which are the types [`resolve`] finds resident; a layer
 /// whose stacks the card runs none of keeps [`parts_of`]'s, which no launch
-/// reads. A placed load plans its card bytes from it before any weight is
-/// uploaded ([`GpuModel::placed_arena_bytes`]) and its wide arm reads the
-/// stacks' types from it, the resident stacks being the card's part of them.
+/// reads. An attention site [`qwen3moe_dense`] does not run is refused by
+/// name, the missing activation form named. A placed load plans its card
+/// bytes from it before any weight is uploaded
+/// ([`GpuModel::placed_arena_bytes`]) and its wide arm reads the stacks'
+/// types from it, the resident stacks being the card's part of them.
 fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
     const WHAT_H: &str = "qwen3moe::Body::load";
     let (h, q, kv) = (
@@ -520,7 +539,10 @@ fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuErr
         hp.n_head * hp.head_dim,
         hp.n_head_kv * hp.head_dim,
     );
-    let site = |name: &str, shape| site::file_site(file, WHAT_H, name, shape, SiteTy::ALL);
+    let site = |name: &str, shape| -> Result<SiteTy, GpuError> {
+        let got = site::file_site(file, WHAT_H, name, shape, SiteTy::ALL)?;
+        admit_dense(WHAT_H, name, ggml_ty(got))
+    };
     let (mut g, mut f) = parts_of(l);
     g.q_ty = site(&g.attn_q, (q, h))?;
     g.k_ty = site(&g.attn_k, (kv, h))?;
@@ -1275,11 +1297,14 @@ mod tests {
     use super::{ggml_ty, site_ty};
     use crate::site::SiteTy;
     use gguf::quant::GgmlType;
+    use model::placement::accepts::qwen3moe_dense;
     use model::placement::kernels;
 
-    /// A dense entry of the table is the launch family of its own file type:
-    /// `site_ty` maps the entry to the family `site.rs` names for the type,
-    /// and `ggml_ty` maps it back, for every type the `dense` row names.
+    /// A dense entry the qwen3moe body runs is the launch family of its file
+    /// type: [`qwen3moe_dense`] maps the type to the entry, `site_ty` to the
+    /// family `site.rs` names, and `ggml_ty` back. A type the owner does not
+    /// return has no site launch, unless the table row reads an activation
+    /// the arena does not carry (Q5_0).
     #[test]
     fn a_dense_entry_is_the_launch_family_of_its_file_type() {
         let mut named = 0;
@@ -1299,21 +1324,20 @@ mod tests {
             GgmlType::IQ4_NL,
             GgmlType::IQ4_XS,
         ] {
-            let Some(entry) = kernels::dense(ty) else {
-                assert_eq!(
-                    SiteTy::of_ggml(ty),
-                    None,
-                    "{ty}: a launch with no table row"
-                );
+            let Some(entry) = qwen3moe_dense(ty) else {
+                if kernels::dense(ty).is_none() {
+                    assert_eq!(
+                        SiteTy::of_ggml(ty),
+                        None,
+                        "{ty}: a launch with no table row"
+                    );
+                }
                 continue;
             };
             named += 1;
             assert_eq!(ggml_ty(site_ty(entry)), ty, "{ty}");
             assert_eq!(SiteTy::of_ggml(ty), Some(site_ty(entry)), "{ty}");
         }
-        assert!(
-            named >= 6,
-            "the dense row names {named} of the listed types"
-        );
+        assert!(named >= 6, "the body runs {named} of the listed types");
     }
 }
