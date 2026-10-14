@@ -3437,20 +3437,13 @@ mod gate {
 
     /// (j)'s FFN clause (module doc): each FFN type combination's first
     /// layer run alone on each arm against the host's f64 FFN under the
-    /// card's routing. `apart`: the header gives the file a layer whose
-    /// shared expert is apart (`tier::layout_clause`).
+    /// card's routing.
     fn unjoined_ffn(
         m: &mut Qwen35moeModel,
         toks: &[u32],
         n_layer: usize,
-        apart: bool,
     ) -> Result<bool, GateError> {
-        if !tier::layout_clause(
-            "(j) unjoined ffn: the shared expert's FFN half against the host's",
-            apart,
-        )? {
-            return Ok(true);
-        }
+        tier::sc("(j) unjoined ffn: the shared expert's FFN half against the host's")?;
         let path = unjoined_path();
         let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let parts = |l: usize| {
@@ -3620,7 +3613,7 @@ mod gate {
         let (p_ok, decode) = paths(&mut m, toks)?;
         ok &= p_ok;
         ok &= gemv_arm(&mut m, toks, &decode)?;
-        ok &= unjoined_ffn(&mut m, toks, want_layers, want.contains(&true))?;
+        ok &= unjoined_ffn(&mut m, toks, want_layers)?;
         let man = ik_set("(j) the step-1,024 set's prompt ids", Set::D1k)?;
         let (_, _, prompt) = man.step()?;
         let mut run = |cut: Option<usize>| -> Result<(u32, Vec<f32>, Vec<StoreHost>), GateError> {
