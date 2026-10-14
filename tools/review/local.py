@@ -280,29 +280,25 @@ def diag(ctx, base_tree, base_sha, head, say):
     os.makedirs(os.path.dirname(root), exist_ok=True)
     with open(root + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        diag_locked(ctx, base_tree, base_sha, head, say, root)
-
-
-def diag_locked(ctx, base_tree, base_sha, head, say, root):
-    out = os.path.join(ctx, "diagnostics.md")
-    bins = ub_bins(base_tree, say, root=root)
-    if not bins:
-        with open(out, "w") as f:
-            f.write(NO_DIAG + "\n")
-        return
-    dryer, crapper = bins
-    changed = os.path.join(ctx, ".changed")
-    with open(changed, "w") as f:
-        f.write(git("diff", "--name-only", f"{base_sha}...{head}"))
-    p = subprocess.run([sys.executable, os.path.join(base_tree, "tools/review/diagnostics.py"), "--base", base_tree,
-                        "--pr", os.path.join(os.path.dirname(ctx), "pr"), "--changed", changed,
-                        "--diff", os.path.join(ctx, "diff.patch"), "--out", out, "--dryer", dryer, "--crapper", crapper],
-                       capture_output=True, text=True)
-    os.unlink(changed)
-    if p.returncode or not os.path.isfile(out):
-        say("pre-review: diagnostics.py failed; diagnostics.md says so")
-        with open(out, "w") as f:
-            f.write(NO_DIAG + "\n")
+        out = os.path.join(ctx, "diagnostics.md")
+        bins = ub_bins(base_tree, say, root=root)
+        if not bins:
+            with open(out, "w") as f:
+                f.write(NO_DIAG + "\n")
+            return
+        dryer, crapper = bins
+        changed = os.path.join(ctx, ".changed")
+        with open(changed, "w") as f:
+            f.write(git("diff", "--name-only", f"{base_sha}...{head}"))
+        p = subprocess.run([sys.executable, os.path.join(base_tree, "tools/review/diagnostics.py"), "--base", base_tree,
+                            "--pr", os.path.join(os.path.dirname(ctx), "pr"), "--changed", changed,
+                            "--diff", os.path.join(ctx, "diff.patch"), "--out", out, "--dryer", dryer, "--crapper", crapper],
+                           capture_output=True, text=True)
+        os.unlink(changed)
+        if p.returncode or not os.path.isfile(out):
+            say("pre-review: diagnostics.py failed; diagnostics.md says so")
+            with open(out, "w") as f:
+                f.write(NO_DIAG + "\n")
 
 
 def run_role(role, d, minutes, say):
