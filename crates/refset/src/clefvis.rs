@@ -1192,7 +1192,7 @@ fn want_shape(man: &RefManifest, name: &str, ne: [u64; 4], at: &At<'_>) -> Resul
 }
 
 /// Undo the dump's line escaping: `\\`, `\n`, `\t` and `\r`; another escape, or one cut short, is an error.
-fn unescape(raw: &str) -> Result<String, String> {
+pub(crate) fn unescape(raw: &str) -> Result<String, String> {
     let mut out = String::with_capacity(raw.len());
     let mut it = raw.chars();
     while let Some(c) = it.next() {
@@ -1499,8 +1499,13 @@ fn read_tap_effect(man: &RefManifest) -> Result<Vec<TapEffect>, RefError> {
 /// `# chat\ttemplate_sha256 <hex>\tuse_jinja 1\tenable_thinking 0|1\treasoning_format deepseek\t
 /// add_generation_prompt 0|1\tcontinue_final_message none|auto`.
 fn read_chat(man: &RefManifest) -> Result<ChatLine, RefError> {
-    let f = one(man, "chat")?;
-    let bad = |what: &str| RefError::malformed(At(&man.dir), format!("# chat {f:?}: {what}"));
+    parse_chat(&one(man, "chat")?, &At(&man.dir))
+}
+
+/// The fields of a `# chat` line (`read_chat`'s format), refused with `at` naming the set: the one
+/// parser of every family whose oracle writes llama-server's chat settings.
+pub(crate) fn parse_chat(f: &[&str], at: &dyn fmt::Display) -> Result<ChatLine, RefError> {
+    let bad = |what: &str| RefError::malformed(at, format!("# chat {f:?}: {what}"));
     let value = |i: usize, key: &str| -> Result<&str, RefError> {
         f.get(i)
             .and_then(|s| s.strip_prefix(key))

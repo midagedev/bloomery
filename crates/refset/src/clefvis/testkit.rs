@@ -289,3 +289,11 @@ pub(crate) fn decode(
     ));
     finish(dir, head, &extra, &rows);
 }
+
+/// The text of a refusal. A set the reader took is a failed test.
+pub(crate) fn refusal<T>(r: Result<T, crate::RefError>) -> String {
+    match r {
+        Ok(_) => panic!("the set was taken"),
+        Err(e) => e.to_string(),
+    }
+}

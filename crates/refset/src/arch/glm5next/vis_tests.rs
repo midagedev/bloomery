@@ -8,7 +8,7 @@ use super::vis::{
 };
 use crate::RefError;
 use crate::clefvis::testkit::{
-    CHAT, Head, IMAGE_COLUMNS, finish, put, put_ints, put_ints_shaped, scratch, write,
+    CHAT, Head, IMAGE_COLUMNS, finish, put, put_ints, put_ints_shaped, refusal, scratch, write,
 };
 use crate::clefvis::{
     AFTER_FC_PROJ, AFTER_FFN_PROJ, CLEF, ClefvisSet, EMBD, Kind, POST_LN, PositionKind, Profile,
@@ -274,13 +274,6 @@ fn drop_lines(dir: &Path, prefix: &str) {
             .map(|l| format!("{l}\n"))
             .collect()
     });
-}
-
-fn refusal(r: Result<ClefvisSet, RefError>) -> String {
-    match r {
-        Ok(_) => panic!("the set was taken"),
-        Err(e) => e.to_string(),
-    }
 }
 
 fn ok(r: Result<ClefvisSet, RefError>) -> ClefvisSet {

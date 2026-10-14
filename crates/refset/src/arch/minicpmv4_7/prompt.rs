@@ -22,7 +22,7 @@
 
 use super::vis::{At, MC47_LCPP_BUILD, N_EMBD, canvas_suffix, one, open_seat, rows_of};
 use crate::RefError;
-use crate::clefvis::ChatLine;
+use crate::clefvis::{ChatLine, parse_chat, unescape};
 use crate::family::{Build, Family, Identity};
 use crate::ik::{self, FileElem, Layout, RefManifest, RowKind};
 use std::path::Path;
@@ -660,59 +660,7 @@ fn read_spans(man: &RefManifest) -> Result<Vec<PromptSpan>, RefError> {
 }
 
 /// `# chat\ttemplate_sha256 <hex>\tuse_jinja 1\tenable_thinking 0|1\treasoning_format deepseek\t
-/// add_generation_prompt 0|1\tcontinue_final_message none|auto`.
+/// add_generation_prompt 0|1\tcontinue_final_message none|auto`, parsed by [`parse_chat`].
 fn read_chat(man: &RefManifest) -> Result<ChatLine, RefError> {
-    let f = one(man, "chat")?;
-    let bad = |what: &str| RefError::malformed(At(&man.dir), format!("# chat {f:?}: {what}"));
-    let value = |i: usize, key: &str| -> Result<&str, RefError> {
-        f.get(i)
-            .and_then(|s| s.strip_prefix(key))
-            .and_then(|s| s.strip_prefix(' '))
-            .ok_or_else(|| bad(&format!("field {i} is not `{key} <value>`")))
-    };
-    let flag = |i: usize, key: &str| -> Result<bool, RefError> {
-        match value(i, key)? {
-            "1" => Ok(true),
-            "0" => Ok(false),
-            v => Err(bad(&format!("{key} {v:?}, want 0 or 1"))),
-        }
-    };
-    if value(1, "use_jinja")? != "1" {
-        return Err(bad("the oracle renders with the jinja template"));
-    }
-    Ok(ChatLine {
-        template_sha256: value(0, "template_sha256")?.to_string(),
-        enable_thinking: flag(2, "enable_thinking")?,
-        add_generation_prompt: flag(4, "add_generation_prompt")?,
-        continue_final_message: match value(5, "continue_final_message")? {
-            "none" => false,
-            "auto" => true,
-            v => {
-                return Err(bad(&format!(
-                    "continue_final_message {v:?}, want none or auto"
-                )));
-            }
-        },
-    })
-}
-
-/// Undo the dump's line escaping: `\\`, `\n`, `\t` and `\r`; another escape, or one cut short, is an error.
-fn unescape(raw: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(raw.len());
-    let mut it = raw.chars();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        out.push(match it.next() {
-            Some('\\') => '\\',
-            Some('n') => '\n',
-            Some('t') => '\t',
-            Some('r') => '\r',
-            Some(o) => return Err(format!("the escape \\{o} is none of \\\\ \\n \\t \\r")),
-            None => return Err("a backslash ends the line".to_string()),
-        });
-    }
-    Ok(out)
+    parse_chat(&one(man, "chat")?, &At(&man.dir))
 }

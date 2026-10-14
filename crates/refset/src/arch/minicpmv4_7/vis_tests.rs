@@ -7,7 +7,7 @@ use super::vis::{
     McvisSet, N_EMBD, PREPROC, TAP_BLOCKS, TAPS, Tile, row_name, tap_names, tap_shape,
 };
 use crate::RefError;
-use crate::clefvis::testkit::{Head, finish, put, scratch};
+use crate::clefvis::testkit::{Head, finish, put, refusal, scratch};
 use crate::clefvis::{ClefvisSet, Profile, QVIS_LCPP_BUILD};
 use crate::family::{Family, Identity};
 use std::path::Path;
@@ -135,13 +135,6 @@ fn qwen36() -> (&'static Family, &'static Profile) {
         panic!("{} is not a clefvis family", family.name);
     };
     (family, profile)
-}
-
-fn refusal(r: Result<McvisSet, RefError>) -> String {
-    match r {
-        Ok(_) => panic!("the set was taken"),
-        Err(e) => e.to_string(),
-    }
 }
 
 fn replace(extra: &mut [String], from: &str, to: &str) {

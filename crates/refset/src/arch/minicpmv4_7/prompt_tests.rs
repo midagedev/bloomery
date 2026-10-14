@@ -6,9 +6,8 @@ use super::prompt::{
     CHATIDS, HIDDEN, IMAGE_PAD_ID, LANES, PromptKind, PromptSet, TEXT_ARCH, TEXT_MODEL,
 };
 use super::vis::{MC47_LCPP_BUILD, MMPROJ_F16, MMPROJ_F16_SHA256, N_EMBD};
-use crate::RefError;
 use crate::clefvis::QVIS_LCPP_BUILD;
-use crate::clefvis::testkit::{Head, finish, put, put_ints, put_ints_shaped, scratch};
+use crate::clefvis::testkit::{Head, finish, put, put_ints, put_ints_shaped, refusal, scratch};
 use std::path::PathBuf;
 
 const PROJECTOR: &str = "# projector\tminicpmv4_7\tpatch_size 14\timage_size 448\tn_merge 4\tprojection_dim 2048\tblocks 27\tinsert_layer_id 6";
@@ -149,13 +148,6 @@ fn hidden(tag: &str) -> PathBuf {
         |_| {},
         |_| {},
     )
-}
-
-fn refusal(r: Result<PromptSet, RefError>) -> String {
-    match r {
-        Ok(_) => panic!("the set was taken"),
-        Err(e) => e.to_string(),
-    }
 }
 
 fn replace(extra: &mut [String], from: &str, to: &str) {
