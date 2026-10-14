@@ -212,6 +212,15 @@ MiMo's first card-expert design skipped two rows, with these results:
 
 If a row needs a copy of another model's code, stop and say so in the issue: that copy is a lift to do first.
 
+## A new host module
+
+A host module is the CPU step under `crates/model/src/` that a family runs before a card body exists. It refuses by name, the way `embed` and `ops` already do. These four tests land with the module.
+
+- **Size products use `checked_mul`.** A wrapping `usize` product turns a huge extent into a short buffer, and the next index walks off it. `checked_mul`, and `checked_add` when a sum is a length, returns `None` into a named error. The embedding table does this for its row bytes (`crates/model/src/embed.rs:66-69`). The test builds two extents whose product does not fit in `usize` and expects that error.
+- **A zero extent the step cannot run is a named error.** Zero rows, zero channels or zero taps are an impossible geometry, so the step returns its error instead of an empty success. The embedding table refuses a file that holds no rows (`embed.rs:63-65`). A count the format allows to be zero, such as a per-layer array in step 1, is a different contract and stays allowed.
+- **A NaN is not a defined output.** A non-finite lane is a named error (`AGENTS.md`, No silent failure). Compare and sort floats with `total_cmp` (`docs/rust-quality.md`, R23). Plant one NaN and assert the refusal. A column-wise op reports the column through `first_non_finite_col` (`crates/model/src/ops.rs:853`); the test is `first_non_finite_col_finds_every_position_in_a_chunk`.
+- **Pin the FMA order.** Where the host expression is the contract a later kernel matches, write `mul_add` for a fused product and a separate multiply and add where the roundings stay apart (`docs/rust-quality.md`, R29). `v_expf` states that contract: every `mul_add` is the reference's fused op (`crates/model/src/arch/deepseek2/attn.rs:713`). The test uses values where `a.mul_add(b, c)` and `a * b + c` differ in bits and asserts the fused bits. Zeros and exact products leave the two forms equal, so they do not pin the order.
+
 ## Where you stop today
 
 Steps 1, 2 (code), 8, 9 and the bookkeeping of 10 you can do and verify on an x86_64 Linux machine. Steps 3 and 4
