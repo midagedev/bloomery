@@ -809,6 +809,18 @@ pub(crate) struct Health {
 }
 
 impl Health {
+    /// The service's error, with its kind kept under an unsettled release.
+    fn released(&self, what: &'static str, error: GpuError) -> GpuError {
+        match &self.held {
+            None => error,
+            Some(held) => GpuError::Unsettled {
+                what,
+                source: Box::new(error),
+                detail: held.clone(),
+            },
+        }
+    }
+
     /// A poison no reset lifts, as the error that says so; `None` for a
     /// refusal whose release left no card waiting.
     fn unlifted(&self, what: &'static str) -> Option<GpuError> {
@@ -2748,17 +2760,11 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// Release every card's waits ([`HostTier::release_all`]) and return
-    /// `e`, or, when the release left a card's waits standing, a protocol
-    /// error of `what` that names `e` and why.
+    /// `e`, or, when the release left a card's waits standing, an unsettled
+    /// error of `what` that keeps `e` as its source and names why.
     fn released(&mut self, what: &'static str, e: GpuError) -> GpuError {
         self.release_all();
-        match (self.health.held.clone(), e) {
-            (None, e) => e,
-            (Some(held), GpuError::Protocol { what, detail }) => {
-                GpuError::protocol(what, format!("{detail}; {held}"))
-            }
-            (Some(held), e) => GpuError::protocol(what, format!("{e}; {held}")),
-        }
+        self.health.released(what, e)
     }
 
     /// Wait under one go deadline for each tier whose bit `mask` sets to
@@ -3149,6 +3155,89 @@ mod tests {
     };
     use crate::GpuError;
     use std::time::Duration;
+
+    #[test]
+    fn an_unsettled_release_keeps_the_service_error_kind_and_source() {
+        use cuda_core::{DriverError, sys};
+        use std::error::Error;
+
+        let mut health = super::Health::default();
+        let driver = || GpuError::Driver {
+            op: Some("cuLaunchKernel"),
+            source: DriverError(sys::cudaError_enum_CUDA_ERROR_LAUNCH_FAILED),
+        };
+        let settled = health.released("Hybrid::serve", driver());
+        assert!(matches!(
+            settled,
+            GpuError::Driver {
+                op: Some("cuLaunchKernel"),
+                source,
+            } if source.0 == sys::cudaError_enum_CUDA_ERROR_LAUNCH_FAILED
+        ));
+
+        health.held = Some("the stage end left its done counter waiting".into());
+        let errors = [
+            driver(),
+            GpuError::protocol("Hybrid::serve", "the generation ran ahead"),
+            GpuError::HostPoisoned {
+                what: "Hybrid::serve",
+                poison: Box::new(super::Poison::Refused(super::Refusal {
+                    what: "Hybrid::serve",
+                    layer: 3,
+                    detail: "planted refusal".into(),
+                })),
+            },
+        ];
+        for original in errors {
+            let text = original.to_string();
+            let error = health.released("Hybrid::serve", original);
+            assert!(matches!(
+                &error,
+                GpuError::Unsettled {
+                    what: "Hybrid::serve",
+                    detail,
+                    ..
+                } if detail == "the stage end left its done counter waiting"
+            ));
+            let source = error
+                .source()
+                .and_then(|source| source.downcast_ref::<GpuError>())
+                .expect("the service's typed error is the release's source");
+            match source {
+                GpuError::Driver { op, source } => {
+                    assert_eq!(*op, Some("cuLaunchKernel"));
+                    assert_eq!(source.0, sys::cudaError_enum_CUDA_ERROR_LAUNCH_FAILED);
+                    let driver = error
+                        .source()
+                        .and_then(|source| source.source())
+                        .and_then(|source| source.downcast_ref::<DriverError>())
+                        .expect("the driver code stays in the error chain");
+                    assert_eq!(driver.0, sys::cudaError_enum_CUDA_ERROR_LAUNCH_FAILED);
+                }
+                GpuError::Protocol { what, detail } => {
+                    assert_eq!(*what, "Hybrid::serve");
+                    assert_eq!(detail, "the generation ran ahead");
+                }
+                GpuError::HostPoisoned { what, poison } => {
+                    assert_eq!(*what, "Hybrid::serve");
+                    assert!(matches!(
+                        &**poison,
+                        super::Poison::Refused(super::Refusal {
+                            what: "Hybrid::serve",
+                            layer: 3,
+                            detail,
+                        }) if detail == "planted refusal"
+                    ));
+                }
+                other => panic!("the service's error kind changed: {other}"),
+            }
+            assert_eq!(source.to_string(), text);
+            assert_eq!(
+                error.to_string(),
+                format!("{text}; Hybrid::serve release: the stage end left its done counter waiting")
+            );
+        }
+    }
 
     #[test]
     fn a_refused_tier_with_held_waits_cannot_lift_without_a_machine() {

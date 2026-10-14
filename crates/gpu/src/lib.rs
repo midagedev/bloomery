@@ -167,6 +167,14 @@ pub enum GpuError {
     /// refuses to serve again, so the model is unusable, not the call's
     /// arguments wrong.
     Protocol { what: &'static str, detail: String },
+    /// A failed service whose release left a tier link end's card waits
+    /// standing. `source` keeps the service's error kind and driver code;
+    /// `detail` names the end that could not settle its posts.
+    Unsettled {
+        what: &'static str,
+        source: Box<GpuError>,
+        detail: String,
+    },
     /// The residency machine refused a flip whose expert the host would
     /// serve from the file, not from resident pages, once its pages were
     /// read in again: `refused` names the expert and where it was sent. The
@@ -488,6 +496,11 @@ impl std::fmt::Display for GpuError {
             GpuError::Plan { what, source } => write!(f, "{what}: {source}"),
             GpuError::UnsupportedArch(name) => write!(f, "unsupported architecture {name:?}"),
             GpuError::Protocol { what, detail } => write!(f, "{what}: {detail}"),
+            GpuError::Unsettled {
+                what,
+                source,
+                detail,
+            } => write!(f, "{source}; {what} release: {detail}"),
             GpuError::Unresident { what, refused } => write!(f, "{what}: {refused}"),
             GpuError::Fault {
                 what,
@@ -538,6 +551,7 @@ impl std::error::Error for GpuError {
             GpuError::Load(e) => Some(&**e),
             GpuError::Model(e) => Some(&**e),
             GpuError::Plan { source, .. } => Some(&**source),
+            GpuError::Unsettled { source, .. } => Some(&**source),
             GpuError::Fault {
                 behind: Some(e), ..
             } => Some(&**e),
