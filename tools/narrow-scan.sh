@@ -29,9 +29,12 @@
 # this tree's directory name without "bloomery-" (the main tree's pair: ~/repo/bloomery-narrow-base and -narrow-head), so
 # two tracks never wait on each other's dirs. A second run builds incrementally: the BASE side costs a sync and the scans
 # (no scan is cached; they run again), the HEAD side the crates the change touched. A pair belongs to this recipe alone,
-# and one run uses it at a time: a lock under ~/.cache/bloomery named by the pair (a second run on it waits up to
-# NARROW_WAIT seconds, default 1800, naming the holder; the main tree's pair keeps the lock name older copies of this
-# script took for every tree). NARROW_BASE_REMOTE and NARROW_HEAD_REMOTE name other dirs. The names follow the
+# and one run uses it at a time: a lock under ~/.cache/bloomery named by the pair, an fcntl flock on a file
+# held for the whole scan (python3's fcntl: the Mac has no flock(1)). A second run waits up to NARROW_WAIT
+# seconds, default 1800, naming the holder. The main tree's pair keeps the lock name older copies of this
+# script took for every tree: a directory there with a live pid is that older copy's lock and is refused,
+# not deleted. A dead directory is removed only while this flock is already held. NARROW_BASE_REMOTE and
+# NARROW_HEAD_REMOTE name other dirs. The names follow the
 # auxiliary-dir rule (bloomery-<track>-<suffix>): once the track's worktree is gone, `just box-tracks --remove
 # <track>-narrow-base <track>-narrow-head` clears them (the main tree's: `narrow-base narrow-head`).
 #
@@ -166,32 +169,75 @@ split_logs() {
     }' "$file"
 }
 
-# lock_take <lock dir> <wait seconds> <who>: one run at a time uses a pair of persistent remote dirs. A holder whose pid
-# is gone is taken over. Prints what it waits for; rc 75 at the bound.
+# lock_take <lock path> <wait seconds> <who>: one run at a time uses a pair of persistent remote dirs.
+# The lock is an fcntl exclusive flock on fd 9 of <lock path>.flock (python3's fcntl: the Mac has no
+# flock(1)). It is the open file description's, so it stays held after python3 exits and drops when this
+# process closes the fd. A directory at <lock path> is an older copy's lock: a live pid there is refused
+# by name, and a dead one is removed only after this flock is held, so two recoverers cannot both delete
+# it. Prints what it waits for; rc 75 at the bound.
 lock_take() {
-  local lockd=$1 wait=$2 who=$3 waited=0 pid
-  mkdir -p "$(dirname "$lockd")"
-  while ! mkdir "$lockd" 2> /dev/null; do
-    pid=$(cat "$lockd/pid" 2> /dev/null || true)
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null; then
-      echo "narrow-scan: the lock's holder (pid $pid, $(cat "$lockd/who" 2> /dev/null)) is gone: taking it over" >&2
+  local lockd=$1 wait=$2 who=$3 waited=0 rc pid='' holder=''
+  mkdir -p "$(dirname "$lockd")" || return 1
+  while :; do
+    if [ -d "$lockd" ]; then
+      pid=$(cat "$lockd/pid" 2> /dev/null || true)
+      holder=$(cat "$lockd/who" 2> /dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then
+        if [ "$waited" -ge "$wait" ]; then
+          echo "narrow-scan: $lockd is held by pid $pid (${holder}); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
+          return 75
+        fi
+        echo "narrow-scan: waiting for pid $pid (${holder}): this pair of remote dirs takes one run at a time (${waited}s of ${wait}s)" >&2
+        sleep 30
+        waited=$((waited + 30))
+        continue
+      fi
+    fi
+    exec 9>>"$lockd.flock" || return 1
+    rc=0
+    python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(75)
+except OSError:
+    sys.exit(1)' || rc=$?
+    case $rc in
+      0) ;;
+      75)
+        pid=''
+        holder=''
+        { IFS= read -r pid; IFS= read -r holder; } < "$lockd.flock" || true
+        exec 9>&-
+        if [ "$waited" -ge "$wait" ]; then
+          echo "narrow-scan: $lockd is held by pid ${pid:-?} (${holder}); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
+          return 75
+        fi
+        echo "narrow-scan: waiting for pid ${pid:-?} (${holder}): this pair of remote dirs takes one run at a time (${waited}s of ${wait}s)" >&2
+        sleep 30
+        waited=$((waited + 30))
+        continue
+        ;;
+      *) exec 9>&-; return 1 ;;
+    esac
+    if [ -d "$lockd" ]; then
+      pid=$(cat "$lockd/pid" 2> /dev/null || true)
+      holder=$(cat "$lockd/who" 2> /dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then
+        exec 9>&-
+        echo "narrow-scan: $lockd is held by pid $pid (${holder}); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
+        return 75
+      fi
+      echo "narrow-scan: the lock's holder (pid ${pid:-?}, ${holder}) is gone: taking it over" >&2
       rm -rf "$lockd"
-      continue
     fi
-    if [ "$waited" -ge "$wait" ]; then
-      echo "narrow-scan: $lockd is held by pid ${pid:-?} ($(cat "$lockd/who" 2> /dev/null)); this pair of remote dirs takes one run at a time (contention, not failure: run again)" >&2
-      return 75
-    fi
-    echo "narrow-scan: waiting for pid ${pid:-?} ($(cat "$lockd/who" 2> /dev/null)): this pair of remote dirs takes one run at a time (${waited}s of ${wait}s)" >&2
-    sleep 30
-    waited=$((waited + 30))
+    printf '%s\n%s\n' "$$" "$who" > "$lockd.flock" || { exec 9>&-; return 1; }
+    return 0
   done
-  echo "$$" > "$lockd/pid"
-  echo "$who" > "$lockd/who"
 }
 
-lock_release() { # lock_release <lock dir>: only the holder's own
-  [ "$(cat "$1/pid" 2> /dev/null)" = "$$" ] && rm -rf "$1"
+lock_release() { # drops this process's flock. A directory at the path is an older copy's and is not removed.
+  exec 9>&- 2> /dev/null || true
   return 0
 }
 
@@ -352,18 +398,82 @@ self_test() {
   { echo '=== narrow-scan begin a'; echo '=== narrow-scan begin b'; echo '=== narrow-scan end b rc=0'; } > "$t/nest.out"
   got=$(split_logs "$t/nest.out" "$t/nest" a b 2>&1); rc=$?
   [ "$rc" != 0 ] && grep -qF "block a has no end marker" <<< "$got"; ok "split: a begin inside a block is refused by name" $?
-  # the lock: a free lock is taken, a held one is refused at its bound naming the holder, a dead holder is taken over
-  lock_take "$t/lock.d" 0 "test run" 2> /dev/null; ok "lock: a free lock is taken" $?
+  # the lock: a free lock is taken, a held one is refused at its bound naming the holder, a dead holder is taken over.
+  # The holder is another process. A subshell of this one keeps $$ as this shell, and would inherit
+  # fd 9 if this shell already held the flock, so the holder is its own bash.
+  rm -rf "$t/lock.d" "$t/lock.d.flock"
+  export -f lock_take
+  bash -c 'lock_take "$1" 0 "test run" 2>/dev/null || exit 1; sleep 30' _ "$t/lock.d" &
+  hp=$!
+  k=0
+  while [ "$k" -lt 50 ]; do
+    [ -f "$t/lock.d.flock" ] && [ "$(head -n 1 "$t/lock.d.flock" 2> /dev/null || true)" = "$hp" ] && break
+    kill -0 "$hp" 2> /dev/null || break
+    sleep 0.05
+    k=$((k + 1))
+  done
+  [ "$(head -n 1 "$t/lock.d.flock" 2> /dev/null || true)" = "$hp" ]; ok "lock: a free lock is taken" $?
   got=$( (lock_take "$t/lock.d" 0 "second" 2>&1); echo "rc=$?")
-  grep -q "rc=75" <<< "$got" && grep -qF "held by pid $$ (test run)" <<< "$got"; ok "lock: a held lock is refused rc 75 naming its holder" $?
-  lock_release "$t/lock.d"
-  [ ! -d "$t/lock.d" ]; ok "lock: release removes the holder's own" $?
+  grep -q "rc=75" <<< "$got" && grep -qF "held by pid $hp (test run)" <<< "$got"; ok "lock: a held lock is refused rc 75 naming its holder" $?
+  kill -TERM "$hp" 2> /dev/null || true
+  wait "$hp" 2> /dev/null || true
+  lock_take "$t/lock.d" 0 "after the holder" 2> /dev/null; ok "lock: the hold ends when its process does, and a later take succeeds" $?
+  lock_release
+  ( lock_take "$t/lock.d" 0 "after release" > /dev/null 2>&1 ); ok "lock: release drops this process's hold" $?
+  lock_release
+  rm -rf "$t/lock.d" "$t/lock.d.flock"
   mkdir "$t/lock.d" && echo 99999999 > "$t/lock.d/pid" && echo gone > "$t/lock.d/who"
   got=$(lock_take "$t/lock.d" 0 "after the dead one" 2>&1); rc=$?
   [ "$rc" = 0 ] && grep -qF "is gone: taking it over" <<< "$got"; ok "lock: a dead holder is taken over" $?
-  rm -rf "$t/lock.d"
+  lock_release
+  rm -rf "$t/lock.d" "$t/lock.d.flock"
+  # Two recoverers both see the dead pid before either removes the directory. Exactly one may
+  # come back holding the lock; the other is contention (75). The one that took it keeps the fd
+  # until the other's rc is recorded, so a fast exit is not a second success.
+  mkdir "$t/lock.d"
+  echo 99999999 > "$t/lock.d/pid"
+  echo gone > "$t/lock.d/who"
+  rec=$t/recover-sync
+  rm -rf "$rec"
+  mkdir "$rec"
+  kill() {
+    if [ "$1" = "-0" ]; then
+      echo $$ >> "$rec/pids"
+      local k=0 n=0
+      while [ "$k" -lt 40 ]; do
+        n=$(wc -l < "$rec/pids" 2>/dev/null || echo 0)
+        n=${n//[[:space:]]/}
+        [ "${n:-0}" -ge 2 ] && break
+        sleep 0.05
+        k=$((k + 1))
+      done
+      return 1
+    fi
+    builtin kill "$@"
+  }
+  ( lock_take "$t/lock.d" 0 "recover-a" >/dev/null 2>&1; echo $? > "$rec/a.rc"; [ "$(cat "$rec/a.rc")" = 0 ] && sleep 30 ) &
+  pa=$!
+  ( lock_take "$t/lock.d" 0 "recover-b" >/dev/null 2>&1; echo $? > "$rec/b.rc"; [ "$(cat "$rec/b.rc")" = 0 ] && sleep 30 ) &
+  pb=$!
+  k=0
+  while [ "$k" -lt 80 ]; do
+    [ -f "$rec/a.rc" ] && [ -f "$rec/b.rc" ] && break
+    sleep 0.05
+    k=$((k + 1))
+  done
+  unset -f kill
+  kill -TERM "$pa" "$pb" 2> /dev/null || true
+  wait "$pa" "$pb" 2> /dev/null || true
+  ra=$(cat "$rec/a.rc" 2> /dev/null || true)
+  rb=$(cat "$rec/b.rc" 2> /dev/null || true)
+  wins=0
+  [ "$ra" = 0 ] && wins=$((wins + 1))
+  [ "$rb" = 0 ] && wins=$((wins + 1))
+  [ "$wins" = 1 ] && { [ "$ra" = 75 ] || [ "$rb" = 75 ]; }
+  ok "lock: two recoverers of a dead holder, and only one takes it" $?
+  rm -rf "$t/lock.d" "$t/lock.d.flock"
   mkdir "$t/lock.d" && echo 1 > "$t/lock.d/pid"
-  lock_release "$t/lock.d"
+  lock_release
   [ -d "$t/lock.d" ]; ok "lock: release leaves another holder's lock" $?
   # the runner's build lines are the ptx-scan recipe's: a recipe edit that this script does not follow is red
   recipe=$(awk '/^ptx-scan /{f=1; next} f && /^[^ ]/{exit} f' "$ROOT/justfile")
