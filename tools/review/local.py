@@ -222,22 +222,24 @@ def device_dirs(base_tree, out, base_sha=None):
         raise Stop(70, f"pre-review: post.py device failed: {p.stderr.strip()[:200]}")
     if cache:
         os.makedirs(os.path.dirname(cache), exist_ok=True)
-        shutil.copy(out, cache)
+        tmp = f"{cache}.{os.getpid()}"
+        shutil.copy(out, tmp)
+        os.replace(tmp, cache)
 
 
 def review_slot():
-    """One of two flock slots. A third pre-review blocks on the first until a holder finishes."""
+    """One of two flock slots. A third pre-review polls both and takes the first that frees."""
     d = os.path.expanduser("~/.cache/bloomery-review")
     os.makedirs(d, exist_ok=True)
     fds = [open(os.path.join(d, f"slot{i}"), "a") for i in (0, 1)]
-    for f in fds:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return f
-        except BlockingIOError:
-            continue
-    fcntl.flock(fds[0], fcntl.LOCK_EX)
-    return fds[0]
+    while True:
+        for f in fds:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return f
+            except BlockingIOError:
+                continue
+        time.sleep(0.05)
 
 
 def read_ledger(base_tree, out):
@@ -663,10 +665,10 @@ def self_test():
             th.start()
             time.sleep(0.4)
             waited = seen == []
-            held.pop(0).close()
+            held.pop().close()  # slot 1 frees; slot 0 stays held
             th.join(5)
             expect(waited and seen == [1] and not th.is_alive(),
-                   f"a third pre-review waits for a slot: waited {waited}, ran {seen}, alive {th.is_alive()}")
+                   f"a third pre-review takes the free slot, not only slot 0: waited {waited}, ran {seen}, alive {th.is_alive()}")
         finally:
             for f in held:
                 f.close()
@@ -689,14 +691,23 @@ def self_test():
             return real_run(argv, *a, **k)
 
         subprocess.run = wrapped
+        real_replace = os.replace
         try:
             outs = [os.path.join(t, n) for n in ("a", "b", "c")]
+            published = []
+
+            def wrap_replace(src, dst):
+                published.append(open(src).read())
+                return real_replace(src, dst)
+
+            os.replace = wrap_replace
             device_dirs(t, outs[0], "sha-a")
             device_dirs(t, outs[1], "sha-a")
             device_dirs(t, outs[2], "sha-b")
-            expect(ran == [1, 1] and open(outs[1]).read() == "crates/gpu/\n",
-                   f"device dirs run once per base sha: ran {len(ran)}, second {open(outs[1]).read()!r}")
+            expect(ran == [1, 1] and open(outs[1]).read() == "crates/gpu/\n" and published == ["crates/gpu/\n", "crates/gpu/\n"],
+                   f"device dirs run once per base sha and replace the cache whole: ran {len(ran)}, published {published}")
         finally:
+            os.replace = real_replace
             subprocess.run = real_run
             if home is None:
                 os.environ.pop("HOME", None)
