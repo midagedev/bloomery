@@ -54,12 +54,27 @@ If `AGENTS.md` and this file disagree, `AGENTS.md` wins: it is the project's con
 Read the contracts narrowly: Grep for the heading or the rule you need and read that section, not the whole file.
 Every turn re-sends what you have read, so a whole 40 KB file read early costs on every later turn.
 
-## Principles (Kent Beck's simple design, in order)
+## Principles (Kent Beck's simple design, this project's order)
 
-1. It works: the change does what it says, on every input it can get.
-2. It reveals its intent.
-3. No duplication: one fact has one owner.
-4. Fewest elements: no layer, flag, wrapper or trait method the change does not need now.
+1. It works: the change does what it says, on every input it can get, and its tests pass.
+2. No duplication: one fact has one owner.
+2. Fewest elements: no layer, flag, parameter, wrapper, trait method, file or dead code the change does not need now.
+3. It reveals its intent.
+
+Rules 2 weigh the same, and both rank above intent. Raise must-fix items in this order (kind A behavior first, then
+duplication and elements, then intent), and number them that way in `review.md`. An unneeded element (dead code, an
+abstraction with one user and no second coming in this diff, an extra flag, parameter or file) is a kind B must-fix,
+not a ⚠.
+
+A deduplication fix must leave fewer elements than it removes. Do not ask for a new helper, trait, module or
+abstraction when two short copies cost less than the owner that would replace them; ask only when the fix reuses an
+existing owner, or when the new owner removes more lines and names than it adds. Otherwise it is not a finding.
+A deduplication fix never adds net elements.
+
+**Revert and mirror pull requests.** A revert (the title starts with `Revert` or says it reverts, or the diff only
+restores earlier code) and a mirror that will not be merged (the title or body says "do not merge" or "mirror")
+get a correctness review only: kind A findings. No duplication, element, pin or comment findings; restoring earlier
+code is not a new duplicate.
 
 ## What to look for
 
@@ -165,9 +180,12 @@ decide:
 Classify each finding first:
 - **Must fix, kind A (behavior):** a failure path you constructed and could not refute.
 - **Must fix, kind B (proven quality defect):** no failure path needed, but proven with file:line and the fix is
-  mechanical: a proven duplicate of an existing owner, a silent-failure default on a value that reaches a consumer, a
+  mechanical: a proven duplicate of an existing owner, an unneeded element (see "Principles"), a silent-failure default on a value that reaches a consumer, a
   gate relaxed without a dated PIN and reason, a comment that misleads (names an API or path that no longer exists).
 - **Non-blocking (⚠):** questions, suggestions, a refactor that is its own piece of work.
+
+All duplication, unneeded-element and missing-PIN findings belong in the first (full) review, in one batch: Grep every new item then,
+not across rounds.
 
 The decision follows from the classification: `MUST_FIX` if any kind A or B finding survives, otherwise `CLEAN`.
 Never write the conclusion first and fit the findings to it.
@@ -268,5 +286,6 @@ If you have none, do not create the file.
 
 `prev-review.md` is your last review and `diff.patch` holds only the commits since. Start the body with "Since the
 last review": for each earlier must-fix and ⚠ item, one line saying fixed, still open (file:line), or answered by the
-author. Then review the new commits. Do not raise a new non-blocking item on code the earlier review already saw;
-a new must-fix is always allowed.
+author. Then review only the new commits. Code the earlier review already saw and the new commits do not change
+gets no new finding of any kind, except a kind A behavior bug. Duplication, element and missing-PIN findings on a re-review
+apply only to lines the new commits add.
