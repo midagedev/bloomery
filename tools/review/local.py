@@ -42,14 +42,14 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from post import VERDICT_RE  # noqa: E402
+from post import MARKER, VERDICT_RE  # noqa: E402
 from run import MINUTES, TIMEOUT, launch  # noqa: E402
 
 REPO = "midagedev/bloomery"
 # (script, the path prefixes that run it): a text-only check of PR_TREE, run when the branch changes one of them
 PRE_CHECKS = (("tools/check-levers.sh", ("tools/", "justfile", ".cargo/", "crates/")),)
 NET_S = 60  # each gh or git fetch call: past it the step reads as unanswered, never as a hang
-MARKER_RE = re.compile(r"<!-- bloomery-review head_sha=([0-9a-f]{40})")
+MARKER_RE = re.compile(rf"<!-- {re.escape(MARKER)} head_sha=([0-9a-f]{{40}})")
 # The files the workflow's context step leaves in CTX (pr-full.json is removed there); prev-review.md only on a re-review.
 CTX_FILES = ("diff.patch", "files.txt", "pr.json", "open-issues.txt", "ledger.md", "device-dirs.txt", "diagnostics.md")
 CTX_RE_REVIEW = ("prev-review.md",)
