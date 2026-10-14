@@ -78,14 +78,18 @@ fn open35(ctx: usize) -> Result<Open35, Outcome> {
 /// unbudgeted answer of `q3place::unplaced_qwen35_slots` (the CLI's own
 /// `unplaced_qwen35` at one sequence), and the placed planner it hands its
 /// answer to. Where the default answers the whole load, the placed planner
-/// is the probe the default itself built on `a`'s card
-/// (`q3place::PlaceQ3::qwen35_seqs` rebuilds it).
+/// is the probe the default itself built on `a`'s card, on the same census
+/// reading (`q3place::PlaceQ3::qwen35_on` rebuilds it).
 fn arm(split: &Split, name: &'static str, o: &Open35, seqs: q3place::Seqs) -> Result<Arm, Outcome> {
-    match q3place::unplaced_qwen35_slots(split, o, seqs, None).map_err(|e| outcome_of(e.as_ref())) {
+    let census = q3place::census().map_err(|e| outcome_of(e.as_ref()))?;
+    match q3place::unplaced_qwen35_slots(split, &census, o, seqs, None)
+        .map_err(|e| outcome_of(e.as_ref()))
+    {
         Ok(q3place::Unplaced::Whole(_)) => {
-            let placed = q3place::PlaceQ3::qwen35_seqs(
+            let placed = q3place::PlaceQ3::qwen35_on(
                 split,
                 Place::A,
+                &census,
                 q3place::share(o, o.ctx, seqs.slots),
                 seqs,
                 None,

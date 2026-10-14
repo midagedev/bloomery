@@ -182,7 +182,7 @@ use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
-    default_slots_fit, note_line, parallel_line, slots_given,
+    note_line, parallel_line, slots_given,
 };
 use bloomery_gpu_gates::generate::{CTX_GRAN, Place, check_set_slot, trained_ctx};
 use bloomery_gpu_gates::record::{self, Record};
@@ -197,7 +197,7 @@ use model::placement::PlanLevers;
 use model::placement::ctx_ask::{
     Ask, AskError, Chosen, DEFAULT_SLOTS, Limit, PlanRefusal, Probe, Steps, choose,
 };
-use model::placement::workstation::CardSpec;
+use model::placement::workstation::{CardSpec, DeviceInfo};
 use runtime::Target as _;
 #[cfg(feature = "vision")]
 use serve::media::{MediaFeed, SharedMediaModel};
@@ -1066,7 +1066,8 @@ fn pass_of<B: Body3>(slots: usize, placed: bool) -> Pass {
 /// share; unset, a slot is planned at the target and halved only while the
 /// card is short. Each candidate is the load [`decide`] makes at its total, a
 /// placed one planned there too, so a short card shows here and not at the
-/// open.
+/// open. Every candidate reads one census: a line names the probes and the
+/// readings ([`searched_line`]).
 fn ctx_and_load(
     split: &Split,
     arch: Arch,
@@ -1083,9 +1084,18 @@ fn ctx_and_load(
         floor: u64::try_from(BASE_SLOT_CTX)?,
         step: u64::try_from(CTX_GRAN)?,
     };
+    let word = match ask {
+        Ask::Set { .. } => "set",
+        Ask::Default => "default",
+    };
+    let before = q3place::reads();
+    let census = q3place::census()?;
+    let mut probes = 0;
     let plan_at = |c: u64| -> Result<Probe<Q3Load>, GateError> {
+        probes += 1;
         let total = usize::try_from(c)?.saturating_mul(slots);
-        let load = match decide(split, arch, total, (place, levers), slots, (kv, vision)) {
+        let at = (split, census.as_slice());
+        let load = match decide(at, arch, total, (place, levers), slots, (kv, vision)) {
             Ok(load) => load,
             Err(e) => return short_or(e),
         };
@@ -1096,10 +1106,23 @@ fn ctx_and_load(
         }
         Ok(Probe::Holds(load))
     };
-    choose(ask, slots, limit, steps, plan_at).map_err(|e| match e {
+    let chosen = choose(ask, slots, limit, steps, plan_at);
+    searched_line(word, probes, before);
+    chosen.map_err(|e| match e {
         AskError::Plan(e) => e,
         other => other.to_string().into(),
     })
+}
+
+/// The line a `--ctx` choice (`word`, set or default) prints once it
+/// answers: the `probes` it ran and the census readings it took since
+/// `before` — one reading serves every probe, so a choice that read the
+/// census per probe shows here.
+fn searched_line(word: &str, probes: usize, before: q3place::Reads) {
+    let censuses = q3place::reads().since(before).censuses;
+    eprintln!(
+        "{NAME}: the {word} --ctx search ran {probes} probes on {censuses} census reading(s)"
+    );
 }
 
 /// A plan's refusal as a short card ([`Probe::CardShort`]), else the
@@ -1120,7 +1143,7 @@ fn short_or(e: GateError) -> Result<Probe<Q3Load>, GateError> {
 }
 
 fn decide(
-    split: &Split,
+    (split, census): (&Split, &[DeviceInfo]),
     arch: Arch,
     total: usize,
     (place, levers): (Option<Place>, &PlanLevers),
@@ -1131,7 +1154,7 @@ fn decide(
     let unplaced = match (arch, place) {
         (Arch::Qwen35moe, Some(p)) => {
             let o = q3place::share(&open35(total, kv, media)?, total, parallel);
-            let q = PlaceQ3::qwen35_seqs(split, p, o, seqs35(split, parallel)?, encoder)?;
+            let q = PlaceQ3::qwen35_on(split, p, census, o, seqs35(split, parallel)?, encoder)?;
             let plan = q.plan(total, levers)?;
             let whole = q.whole_card_qwen35(split, &plan, (total, parallel), o)?;
             return Ok(Q3Load::Placed {
@@ -1143,12 +1166,13 @@ fn decide(
         }
         (Arch::Qwen35moe, None) => q3place::unplaced_qwen35_slots(
             split,
+            census,
             &open35(total, kv, media)?,
             seqs35(split, parallel)?,
             encoder,
         )?,
         (_, Some(p)) => {
-            let q = PlaceQ3::qwen3(split, p, total, kv)?;
+            let q = PlaceQ3::qwen3_on(split, p, census, total, kv)?;
             let plan = q.plan(total, levers)?;
             let whole = q.whole_card_qwen3(split, &plan, (total, parallel))?;
             return Ok(Q3Load::Placed {
@@ -1158,7 +1182,7 @@ fn decide(
                 whole,
             });
         }
-        (_, None) => q3place::unplaced_qwen3_slots(split, total, parallel, kv)?,
+        (_, None) => q3place::unplaced_qwen3_slots(split, census, total, parallel, kv)?,
     };
     Ok(match unplaced {
         q3place::Unplaced::Whole(card) => Q3Load::Whole(card),
@@ -1510,30 +1534,24 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let census = gpu_census::census()?;
     let chosen = q3place::choose(a.place, &census)?;
     chosen.record().eprint();
-    // The context and the load of `slots` slots, the plans a second slot can
-    // refuse: the default's second slot that the load refuses falls to one
-    // slot (`from=fit`); a count the flags set is never lowered.
-    let ((slot_ctx, load), slots, from) =
-        default_slots_fit(NAME, chosen.place.name(), slots, from, |slots| {
-            // The context and the load are one choice: the ask first, the
-            // plan around it ([`ctx_and_load`]).
-            let plan_levers = PlanLevers::from_levers(&levers)?;
-            let asked = ctx_and_load(
-                &split,
-                arch,
-                (ask, slots),
-                (a.place, &plan_levers),
-                (kv, vision.as_ref()),
-            )?;
-            let (_, encoder) = images_of(vision.as_ref());
-            eprintln!("{}{}", asked.line(), encoder_words(encoder));
-            let slot_ctx = slot_ctx(usize::try_from(asked.total)?, slots)?;
-            let load = asked.plan;
-            if matches!(arch, Arch::Qwen35moe) {
-                q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
-            }
-            Ok::<_, GateError>((slot_ctx, load))
-        })?;
+    // The context and the load of the slots the flags or the default name,
+    // one choice: the ask first, the plan around it ([`ctx_and_load`]). A
+    // count is never lowered: the default is one slot.
+    let plan_levers = PlanLevers::from_levers(&levers)?;
+    let asked = ctx_and_load(
+        &split,
+        arch,
+        (ask, slots),
+        (a.place, &plan_levers),
+        (kv, vision.as_ref()),
+    )?;
+    let (_, encoder) = images_of(vision.as_ref());
+    eprintln!("{}{}", asked.line(), encoder_words(encoder));
+    let slot_ctx = slot_ctx(usize::try_from(asked.total)?, slots)?;
+    let load = asked.plan;
+    if matches!(arch, Arch::Qwen35moe) {
+        q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
+    }
     // The shape of a round of several slots, from the load's body
     // ([`Q3Load::placed_body`]); the open holds the opened body to it.
     let placed = load.placed_body();

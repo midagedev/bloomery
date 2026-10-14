@@ -25,9 +25,11 @@
 //!   other clauses skipped. FAIL-first: a whole fit that leaves the arena out
 //!   of its need picks, on the 3090, a Qwen3.6 context whose load the arena
 //!   check refuses;
-//! - `default_load_is_its_whole_fit`: the seat prints one whole-fit verdict
-//!   line at the loaded context, its terms named, and it says `fits`
-//!   exactly when the load is the whole-card one (no `plan` record);
+//! - `default_load_is_its_whole_fit`: the seat prints a whole-fit verdict
+//!   line at each rung its default asked, the last at the loaded context,
+//!   its terms named; that one says `fits` exactly when the load is the
+//!   whole-card one (no `plan` record), and every rung before it did not
+//!   fit;
 //! - `default_load_counts_its_arena`: that line's arena and the reserve
 //!   past it are the pair the load's own `whole_load` hands the verdict for
 //!   the file (a qwen3moe file's line names the margin in their place). The
@@ -101,11 +103,10 @@
 //!   rounds 1 — at 96 tokens each the ratio is (2·94 + 2 + ~2)/(94 + 2 +
 //!   ~2) ≈ 1.9 — while a turn-taking server books exactly 1 busy a call
 //!   (every round is one slot's), 1.0 past the two prompts;
-//!   (v3) the load record names `slots=2` and `slot_ctx` = the auto total
-//!   over two (a cache row the granularity, the floor exact) — the total the
-//!   server's own whole-fit line names, which the search for two slots, each
-//!   slot's planes rounded to the granule, may leave under the one-slot
-//!   arm's default (both print) — and `/props`' `n_ctx` is that slot ctx.
+//!   (v3) the load record names `slots=2` and `slot_ctx` = the arm's set
+//!   `--ctx` of 8192 over two (a cache row the granularity, the floor
+//!   exact), which the whole load holds on either card, and `/props`'
+//!   `n_ctx` is that slot ctx.
 //!   The same clause runs a second time on a placed load, its checks named
 //!   `placed_…`: `--place a` under `BLOOMERY_CARD_BUDGET=12G` (a 12 GiB
 //!   card's budget, which keeps routed experts on the host tier on either
@@ -150,21 +151,16 @@
 //!   red and its round clause's `placed_slots_rounds_hold_a_round_of_both`
 //!   red, no `placed slots` line, and `ctx_default`'s placed arm's
 //!   `placed_slots_are_resident` and `placed_ctx_is_the_plans_ctx_max` red.
-//! - `slots_default_is_the_whole_search`, the whole slots arm: the total its
-//!   server's one whole-fit line names is two slots of the two-slot whole
-//!   search's own answer, not merely a total the server split. The line's need less its
-//!   cache term is the rest no context moves, and the two-slot need at a
-//!   total `t` is that rest plus the allocator's bytes of the two slots'
-//!   planes — each slot one slot's list at ⌊t/2⌋ rows, the per-slot list the
-//!   seat's own verdict counts (`q3place::kv_bytes`: N copies of one slot's
-//!   planes) — so the relation holds (a) the line says the load fits and
-//!   that need at the total is inside what the card had, (b) a slot's
-//!   context never passes the one-slot default arm's answer, and (c) the
-//!   slot context is the largest the load fits: one position past it the
-//!   trained context stands or the need passes the card. A whole-fit line
-//!   that says the load does not fit is a named error: the arm is not a
-//!   whole arm. FAIL-first: a fit search that stops a position early splits
-//!   a slot context whose next position still fits, red on (c).
+//! - `slots_set_total_is_its_whole_fit`, the whole slots arm: its one
+//!   whole-fit line is at the arm's set total `t` and says the load fits. The
+//!   line's need less its cache term is the rest no context moves, and the
+//!   two-slot need at `t` is that rest plus the allocator's bytes of the two
+//!   slots' planes — each slot one slot's list at ⌊t/2⌋ rows, the per-slot
+//!   list the seat's own verdict counts (`q3place::kv_bytes`: N copies of one
+//!   slot's planes) — inside what the card had. A whole-fit line that says
+//!   the load does not fit is a named error: the arm is not a whole arm.
+//!   FAIL-first: a seat that decides a set total's load at a slot's share
+//!   puts its line at half the total.
 //! - `slots_rounds_run_one_pass`, on both arms (both bodies run one pass of
 //!   their slots, `SlotRows`: a qwen3moe file's `Body`, a qwen35moe file's
 //!   `Body35`), and the seat's `parallel` line names the shape the open
@@ -246,11 +242,11 @@
 //!   splits a set `--ctx` by its default two prints `slots=2 slot_ctx=7`
 //!   and dies in the load instead of the one-slot line.
 //! - `ctx_search_reads_the_census_once`, the main server and
-//!   `ctx_default`'s placed arm, the servers whose `--ctx` is searched:
-//!   each `--ctx` search the seat ran names its probes and its census
-//!   readings on one line, and every one read the census once for all its
-//!   probes. FAIL-first: a placed search that resolves its placement per
-//!   probe reads it once a probe.
+//!   `ctx_default`'s placed arm, the servers whose `--ctx` is unset: each
+//!   `--ctx` choice the seat ran names its probes and its census readings on
+//!   one line, and every one read the census once for all its probes.
+//!   FAIL-first: a choice that resolves its placement per rung reads it once
+//!   a rung where the card is short of the target.
 //! - `ctx_flag_wins`, the whole-fit clause's server: `/props`' `n_ctx` is
 //!   the flagged context, not the seat's default.
 //! - `whole_fit_counts_the_planes_granules`: a server at a flagged `--ctx`
@@ -269,34 +265,29 @@
 //!   `n_ctx` is at most the file's trained context, the load record names
 //!   the f16 planes, and the common rule's `place unset` record names `a`,
 //!   its why one card (or two the body serves no tier card of), and no
-//!   break-even, basis or tier count; and `ctx_default_is_the_trained_context`,
-//!   the same server, on either card: a card that holds the whole load at the file's trained
-//!   context (read by the seat's own `trained_ctx`) defaults to it; one that
-//!   does not defaults under it to a context the whole load fits at, one
-//!   position past which it does not; one whose whole load does not fit at
-//!   the base a slot (4096) had nothing there either (the placed arm's
-//!   relations hold that default). The fits are the seat's own whole-fit
-//!   line at the default — the census reading, its verdict, what the card
-//!   had, the need term by term — with its cache term moved to each
-//!   context's planes. FAIL-first: a search that never probes the trained
-//!   context stops under it on an idle A6000, where both
-//!   contexts' planes take the same granules, and the clause is red on both
-//!   files.
+//!   break-even, basis or tier count; and `ctx_default_is_the_highest_rung_held`,
+//!   the same server, on either card: the default is a rung of the halving
+//!   ladder an unset `--ctx` asks — 262,144 or the file's trained context
+//!   (read by the seat's own `trained_ctx`), the lesser, then each half down
+//!   to a `CTX_GRAN` step while not under the base a slot (4096) — and either
+//!   the first rung or one under a rung whose whole load does not fit (the
+//!   placed plan there was short too, which the `ctx` line's `halved` word
+//!   holds). The fit is the seat's own whole-fit line at the default — the
+//!   census reading, its verdict, what the card had, the need term by term —
+//!   with its cache term moved to the rung above. FAIL-first: a ladder that
+//!   starts a rung under the target defaults to half the target where the
+//!   whole load fits the target.
 //! - `default_ctx_line_names_its_rule`, on the main server's default arm
 //!   (`--parallel 1`) and `ctx_default`'s placed arm (`--parallel 2`): the
-//!   one `ctx` line of an unset `--ctx` (`placement::ctx::SlotCtx::line`)
-//!   names a rule word and holds the relations the word claims between its
-//!   `ctx`, `fit` and the base a slot (4096): `card` is the fit under the
-//!   base, `base` the base, `margin` a multiple of `CTX_GRAN` past
-//!   the base and under the fit, `fit` the fit past the base; its slots are
-//!   the arm's, its `total` the slots' sum, its `cap` the file's trained
-//!   context, its `margin_ctx` the context (this seat bounds it no further),
-//!   and the plan's card bytes lost against the base's are at most its
-//!   margin where the fit is not the card's. The answer is also what the
-//!   server serves (`/props`' `n_ctx` the slot context, the plan's `ctx_max`
-//!   the total on the placed arm). FAIL-first: a seat that prints no `ctx`
-//!   line, two, or a context a slot's share of which the load does not hold
-//!   turns this red.
+//!   one `ctx` line of an unset `--ctx` (`placement::ctx_ask::Chosen::line`)
+//!   names a rule word and holds the relations the word claims: `target`
+//!   the first rung, `halved` a rung under it, its `from` the first rung and
+//!   its `need` past its `room` (the rung above was short); its slots are
+//!   the arm's, its `total` the slots' sum, its `limit` the file's trained
+//!   context. The answer is also what the server serves (`/props`' `n_ctx`
+//!   the slot context, the plan's `ctx_max` the total on the placed arm).
+//!   FAIL-first: a seat that prints no `ctx` line, two, or a context off the
+//!   ladder turns this red.
 //! - `ctx_past_the_trained_is_refused_by_name`: two `--plan` runs of a set
 //!   `--ctx` on `--place a`. One position past the file's trained context
 //!   on one slot exits non-zero with the shared limit's words
@@ -309,55 +300,20 @@
 //!   record, whose `ctx_max` is the line's `total`, and the process exits 0
 //!   with no `load` or `listening` record. FAIL-first: a seat that ignores
 //!   the flag loads and listens, the clause red.
-//! - `default_second_slot_never_costs_a_load`, on both arms: five `--plan` runs of
-//!   the placed load on `a` (`--place a`: the census and the whole-fit verdict
-//!   read the card, not the budget) under a card budget at which the default's
-//!   two slots are refused and one slot is not. The default's first try is
-//!   `--parallel 2`'s: the context search, the floor of [`MAX_TOKENS`] rows a
-//!   slot loads at, the plan at the total of both slots and, on a qwen35moe
-//!   file, the checkpoints of both sequences. Two slots plan at least twice the
-//!   floor's rows, one slot at least the floor's, so the least budget of two
-//!   slots is the least of one plus those rows' cache bytes, and on a qwen35moe
-//!   file the second slot's fixed stores [derived]. Under a budget below every
-//!   floor, `--parallel 2` and `--parallel 1` with the floor's rows a slot as
-//!   their `--ctx` are refused with the floor of their plan
-//!   (`PlacementError::CardBudgetFloor`, read by `bind::budget_floor`): the
-//!   least budget of two slots, `F2`, and of one, `F1` (the default's own
-//!   refusal there is the plan at one position a slot, under the floor's
-//!   rows, so it names neither). At `F2 - 1`: the default prints
-//!   `parallel … slots=1 … from=fit` with the line that says the second slot
-//!   did not fit and exits 0, and `--parallel 2` is refused with the words
-//!   that line carries and prints no such line (a set count is never lowered);
-//!   at `F2` the default serves two slots (`from=default`) and prints no such
-//!   line; `F1` is under `F2` (`second_slot_window_is_open`). FAIL-first: a
-//!   seat that plans the default at two slots with no fall refuses the first
-//!   half (the mutant: the call to `bind::default_slots_fit` replaced by the
-//!   plan at the asked count).
 //! - `defaults_take_a_long_prompt_on_a_12gb_card`, on a qwen35moe file
 //!   alone: `--plan` with the seat's defaults — no `--ctx`, no `--parallel` —
 //!   under [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`], a 12 GB card in a
-//!   27.5 GiB host, prints a `ctx` line of at least two slots (the default
-//!   count) each of at least [`LONG_PROMPT_SLOT_CTX`] positions, and stops as
-//!   the clause above holds (the line's `total` the `plan` record's
-//!   `ctx_max`, exit 0, no `load` or `listening` record). The plan is asked
-//!   for by name, `--place a`: on a 12 GB card the unset `--place` falls to
-//!   the placed plan on `a`'s card because the whole file does not fit, but
-//!   the whole-fit verdict reads the card's census, not the budget, so a card
-//!   that holds the file whole would print no plan; the placed probes and the
-//!   `ctx` line are the same either way. FAIL-first: a seat whose unset
-//!   default is the base context as the total its slots split, taken whenever
-//!   the plan keeps fewer card experts than the base's, names a slot of half
-//!   the base and the clause is red.
-//! - `paged_default_grows_past_the_base`, on the same arm's `ctx` line when
-//!   its base pages NVMe expert bytes (`base_nvme_expert_bytes` above 0): the
-//!   rule word is not `base` and the line pages more bytes than the base
-//!   (`nvme_expert_bytes` above it), so a rule that lets the default page
-//!   nothing past the base is red. With no NVMe bytes at the base the line
-//!   `skip paged_default_grows_past_the_base: no NVMe bytes at base: the
-//!   growth clause did not run` is printed in place of a verdict, and a `ctx`
-//!   line without its terms is a failed clause. FAIL-first: a rule whose NVMe
-//!   slack is zero pages nothing past the base and turns the second term red;
-//!   the printed line names the rule and the base and chosen NVMe bytes.
+//!   27.5 GiB host, prints a `ctx` line of one slot (the default count) of at
+//!   least [`LONG_PROMPT_SLOT_CTX`] positions that holds its word (the clause
+//!   above), and stops as the `--plan` clause holds (the line's `total` the
+//!   `plan` record's `ctx_max`, exit 0, no `load` or `listening` record). The
+//!   plan is asked for by name, `--place a`: on a 12 GB card the unset
+//!   `--place` falls to the placed plan on `a`'s card because the whole file
+//!   does not fit, but the whole-fit verdict reads the card's census, not the
+//!   budget, so a card that holds the file whole would print no plan; the
+//!   placed probes and the `ctx` line are the same either way. FAIL-first: a
+//!   default that keeps the card's experts before the context halves to the
+//!   floor and the clause is red.
 //! - `placed_slots_are_resident`, `ctx_default`'s placed arm (`--place a
 //!   --parallel 2`, no budget), on both arms: the placed load holds its two
 //!   slots resident — its plan made at the total, which counts every slot's
@@ -373,9 +329,6 @@
 //!   with tokens — a placed load's prompt call runs the wide units from [`GEMM_FROM`] ids and passes below.
 //!   FAIL-first: a prompt call that asks a placed load for the GEMM walk is
 //!   refused by `prefill_plan` and the request answers no tokens.
-//!
-//! With `--only-second-slot`, `default_second_slot_never_costs_a_load` alone, on each file: its
-//! `--plan` runs open no card.
 //!
 //! With `--images` (the file's own clauses first) or `--only-images`, the image clauses on the
 //! Qwen3.6 file (`images`), against the oracle sets of `refset::arch::qwen35moe::vis` — llama.cpp
@@ -452,12 +405,11 @@
 //! flagged `--ctx` [`SET_F_CTX`] (the other image clauses' servers take the seat's own default
 //! `--ctx`).
 //!
-//! Held by another test, and not run here: the search rules of the unset
-//! `--ctx` — the fit, the base and the step, the trained cap, the margin of
-//! card and NVMe expert bytes, the rule's words and the slot count a flag
-//! buys — by `bloomery_placement::placement::ctx`'s tests; the whole-fit search
-//! stopping where the arena does, by `bloomery_placement`'s
-//! `the_whole_search_stops_where_the_arena_does`.
+//! Held by another test, and not run here: the choice of `--ctx` — the
+//! target, the halving, the floor, a set total's share and the largest a
+//! short card would hold, the line's words — by
+//! `bloomery_placement::placement::ctx_ask`'s tests; a set share past the
+//! file's limit, by `bloomery_placement::placement::ctx`'s.
 //!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
@@ -489,7 +441,6 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
-    use bloomery_gpu_gates::bind::budget_floor;
     use bloomery_gpu_gates::generate::{CTX_GRAN, Place};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
@@ -513,7 +464,7 @@ mod gate {
     use crate::q3place;
 
     const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> \
-                         [--images | --only-images | --only-second-slot]";
+                         [--images | --only-images]";
 
     /// The tokens each request makes.
     const N: usize = 64;
@@ -591,20 +542,15 @@ mod gate {
         images: bool,
         /// `--only-images`: the image clauses alone.
         only_images: bool,
-        /// `--only-second-slot`: `default_second_slot_never_costs_a_load`
-        /// alone, on each file.
-        only_second_slot: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut models, mut dir, mut images, mut only_images) = (Vec::new(), None, false, false);
-        let mut only_second_slot = false;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             match flag.as_str() {
                 "--images" => images = true,
                 "--only-images" => only_images = true,
-                "--only-second-slot" => only_second_slot = true,
                 "--model" | "--dir" => {
                     let v = it
                         .next()
@@ -624,7 +570,6 @@ mod gate {
                 dir,
                 images: images || only_images,
                 only_images,
-                only_second_slot,
             }),
             _ => Err(USAGE.into()),
         }
@@ -749,80 +694,86 @@ mod gate {
             .collect()
     }
 
-    /// The default `ctx` line of a server's stderr
-    /// (`ctx rule=… ctx=… slots=… total=… cap=… fit=…`,
-    /// `placement::ctx::SlotCtx::line`): the one line, `None` when there is
-    /// none or more than one.
+    /// The `ctx` line of a server's stderr
+    /// (`ctx rule=… ctx=… slots=… total=… limit=… (…)[ from=… card-short
+    /// need=… room=…]`, `placement::ctx_ask::Chosen::line`): the one line,
+    /// `None` when there is none or more than one.
     fn ctx_line(log: &str) -> Option<&str> {
         let mut lines = log.lines().filter(|l| l.starts_with("ctx rule="));
         let one = lines.next()?;
         lines.next().is_none().then_some(one)
     }
 
-    /// Whether a default `ctx` line's NVMe terms hold the rule's contract,
-    /// recomputed here from the line's `base_nvme_expert_bytes` and
-    /// `base_arena` (never trusting its `nvme_bound`): the chosen plan misses
-    /// the arena on at most a hundredth of the base's missed bytes (the NVMe
-    /// bytes less the arena) more, and the line names that hundredth. `None`
-    /// when a term is missing.
-    fn nvme_held(line: &str) -> Option<bool> {
-        let num = |k: &str| field_u64(line, k);
-        let (base, now, bound) = (
-            num("base_nvme_expert_bytes")?.saturating_sub(num("base_arena")?),
-            num("nvme_expert_bytes")?.saturating_sub(num("arena")?),
-            num("nvme_bound")?,
-        );
-        Some(bound == base / NVME_DIV && now <= base + base / NVME_DIV)
+    /// The context an unset `--ctx` asks a slot first: [`TARGET`] or the
+    /// file's `trained` context, the lesser, down to a [`CTX_GRAN`] step,
+    /// never under the base a slot ([`SEAT_FLOOR`]) a file trained past it
+    /// holds.
+    fn target_of(trained: u64) -> u64 {
+        let step = CTX_GRAN as u64;
+        let cap = TARGET.min(trained);
+        (cap / step * step).max(SEAT_FLOOR.min(cap))
     }
 
-    /// `paged_default_grows_past_the_base` (module header) on a default
-    /// `ctx` line: with NVMe expert bytes at the base, the rule word is not
-    /// `base` and the line pages more than the base does. A line with no
-    /// NVMe bytes at the base prints the skip in place of a verdict, and a
-    /// line without the terms is a failed clause. The terms are recomputed
-    /// from the line, never from its `nvme_bound`.
-    fn paged_default_grows_past_the_base(line: Option<&str>, ok: &mut bool) {
-        const NAME: &str = "paged_default_grows_past_the_base";
-        let terms = line.and_then(|l| {
-            let rule = l.split_whitespace().find_map(|w| w.strip_prefix("rule="))?;
-            let num = |k: &str| field_u64(l, k);
-            Some((
-                rule,
-                num("base_nvme_expert_bytes")?,
-                num("nvme_expert_bytes")?,
-            ))
-        });
-        match terms {
-            None => {
-                println!("{NAME}: the ctx line is missing or has no rule or NVMe terms: {line:?}");
-                check(ok, NAME, false);
+    /// The rungs an unset `--ctx` asks a slot, in order: the target
+    /// ([`target_of`]), then each rung's half down to a [`CTX_GRAN`] step
+    /// while it is not under [`SEAT_FLOOR`].
+    fn rungs(trained: u64) -> Vec<u64> {
+        let step = CTX_GRAN as u64;
+        let mut rungs = vec![target_of(trained)];
+        while let Some(&last) = rungs.last() {
+            let next = last / 2 / step * step;
+            if next < SEAT_FLOOR {
+                break;
             }
-            Some((_, 0, _)) => {
-                println!("skip {NAME}: no NVMe bytes at base: the growth clause did not run");
-            }
-            Some((rule, base_nvme, now)) => {
-                println!(
-                    "{NAME}: rule={rule} base_nvme_expert_bytes={base_nvme} nvme_expert_bytes={now}"
-                );
-                check(ok, NAME, rule != "base" && now > base_nvme);
-            }
+            rungs.push(next);
         }
+        rungs
+    }
+
+    /// The rung an unset `--ctx` asked a slot before `ctx`; `None` when
+    /// `ctx` is the target or no rung.
+    fn rung_above(trained: u64, ctx: u64) -> Option<u64> {
+        let rungs = rungs(trained);
+        let at = rungs.iter().position(|&r| r == ctx)?;
+        at.checked_sub(1).map(|i| rungs[i])
+    }
+
+    /// Whether the `ctx` line of an unset `--ctx` on `slots` slots of a file
+    /// trained at `trained` holds its word: `target` asks the target and
+    /// took it; `halved` asked it (`from`), found the card short of the
+    /// rung above its context (`need` past `room`) and took a rung below;
+    /// the slots are `slots`, the total their sum, the limit the trained
+    /// context. `None` when the line or one of its terms is missing.
+    fn default_line_held(line: &str, slots: u64, trained: u64) -> Option<bool> {
+        let rule = line
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("rule="))?;
+        let num = |k: &str| field_u64(line, k);
+        let (ctx, n, total, limit) = (num("ctx")?, num("slots")?, num("total")?, num("limit")?);
+        let by_word = match rule {
+            "target" => ctx == target_of(trained) && !line.contains(" from="),
+            "halved" => {
+                let (from, need, room) = (num("from")?, num("need")?, num("room")?);
+                from == target_of(trained) && rung_above(trained, ctx).is_some() && need > room
+            }
+            _ => false,
+        };
+        Some(
+            by_word
+                && n == slots
+                && total == slots * ctx
+                && limit == trained
+                && line.contains(&format!("limit={limit} (trained)")),
+        )
     }
 
     /// `default_ctx_line_names_its_rule` (module header), on a server of
-    /// `slots` slots whose `/props` named `props_n` and whose file's trained
-    /// context is `trained`; `plan_total` the `ctx_max` of its `plan` record
-    /// when it made one. The words and the relations each claims, over the
-    /// seat's base a slot ([`SEAT_FLOOR`]) and step ([`CTX_GRAN`]):
-    /// `card` the fit under the base, `base` the base itself with the fit at
-    /// least it, `margin` a multiple of the step past the base and under the
-    /// fit, `fit` the fit past the base, `host` the base with the card's
-    /// context past it that the host room vetoed (`margin_ctx`), `pool` a
-    /// rung of the halving ladder from the cap on a unified machine; and on
-    /// every word the paged bytes
-    /// at most a hundredth of the base's past them, the line's `nvme_bound`
-    /// that hundredth. A named error when the line is missing or one of its
-    /// terms is.
+    /// `slots` slots and an unset `--ctx` whose `/props` named `props_n` and
+    /// whose file's trained context is `trained`; `plan_total` the `ctx_max`
+    /// of its `plan` record when it made one: the one `ctx` line holds its
+    /// word ([`default_line_held`]), and it is what the server serves
+    /// (`/props`' `n_ctx` the slot context, the plan's `ctx_max` the total).
+    /// A missing line or term is a failed clause.
     fn default_ctx_line_names_its_rule(
         log: &str,
         (slots, props_n, trained): (u64, u64, u64),
@@ -831,52 +782,12 @@ mod gate {
     ) {
         let held = (|| {
             let line = ctx_line(log)?;
-            let rule = line
-                .split_whitespace()
-                .find_map(|w| w.strip_prefix("rule="))?;
-            let num = |k: &str| field_u64(line, k);
-            let (ctx, n, total, cap) = (num("ctx")?, num("slots")?, num("total")?, num("cap")?);
-            let (fit, margin_ctx, base) = (num("fit")?, num("margin_ctx")?, num("base")?);
-            let (base_card, card) = (num("base_card_expert_bytes")?, num("card_expert_bytes")?);
-            let (lost, margin) = (num("lost_bytes")?, num("margin_bytes")?);
-            let step = CTX_GRAN as u64;
             println!("default ctx line: {line}");
-            let by_word = match rule {
-                "card" => ctx == fit && fit < SEAT_FLOOR && base == fit,
-                "base" => ctx == SEAT_FLOOR && base == SEAT_FLOOR && fit >= SEAT_FLOOR,
-                "margin" => ctx % step == 0 && SEAT_FLOOR < ctx && ctx < fit,
-                "fit" => ctx == fit && fit > SEAT_FLOOR,
-                // The host room vetoed the card's context `margin_ctx` past
-                // the base: the base stands.
-                "host" => {
-                    ctx == SEAT_FLOOR
-                        && base == SEAT_FLOOR
-                        && SEAT_FLOOR < margin_ctx
-                        && margin_ctx <= fit
-                }
-                // A unified machine's pool took a lower rung of the halving
-                // ladder from the cap: `cap >> k` rounded down to the step,
-                // never under the base.
-                "pool" => {
-                    ctx <= fit
-                        && (0..u64::BITS).any(|k| ctx == ((cap >> k) / step * step).max(SEAT_FLOOR))
-                }
-                _ => false,
-            };
+            let num = |k: &str| field_u64(line, k);
             Some(
-                by_word
-                    && n == slots
-                    && total == slots * ctx
-                    && cap == trained
-                    && ctx <= fit
-                    && fit <= cap
-                    && (margin_ctx == ctx || rule == "host")
-                    && margin == model::placement::workstation::MARGIN
-                    && base_card.saturating_sub(card) == lost
-                    && (rule == "card" || lost <= margin)
-                    && nvme_held(line)?
-                    && props_n == ctx
-                    && plan_total.is_none_or(|t| t == total),
+                default_line_held(line, slots, trained)?
+                    && props_n == num("ctx")?
+                    && plan_total.is_none_or(|t| Some(t) == num("total")),
             )
         })();
         check(ok, "default_ctx_line_names_its_rule", held == Some(true));
@@ -1058,20 +969,22 @@ mod gate {
 
     /// `defaults_take_a_long_prompt_on_a_12gb_card` (module header): the
     /// seat's defaults — no `--ctx`, no `--parallel` — planned under
-    /// [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`] print a `ctx` line of at
-    /// least two slots, each of at least [`LONG_PROMPT_SLOT_CTX`] positions,
-    /// and stop as `--plan` says ([`PlanRun::stopped_with_its_plan`]), the
-    /// line's NVMe terms within the rule's bound ([`nvme_held`]), and a base
-    /// that pages NVMe expert bytes grown past
-    /// ([`paged_default_grows_past_the_base`]). The
-    /// plan is asked for by name (`--place a`): the census and the whole-fit
-    /// verdict read the card, not the budget, so a card that holds the file
-    /// whole would not plan at all.
+    /// [`SMALL_CARD_BUDGET`] and [`SMALL_HOST_ROOM`] print a `ctx` line of
+    /// one slot (the default count) of at least [`LONG_PROMPT_SLOT_CTX`]
+    /// positions that holds its word ([`default_line_held`]), and stop as
+    /// `--plan` says ([`PlanRun::stopped_with_its_plan`]). The plan is asked
+    /// for by name (`--place a`): the census and the whole-fit verdict read
+    /// the card, not the budget, so a card that holds the file whole would
+    /// not plan at all.
     fn defaults_take_a_long_prompt_on_a_12gb_card(
         model: &Path,
         dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let trained = q3place::trained_ctx(&split)
+            .ok_or_else(|| format!("{}: no context_length", model.display()))?;
+        let trained = u64::try_from(trained)?;
         let run = plan_run(
             "plan-defaults",
             (model, dir),
@@ -1093,158 +1006,24 @@ mod gate {
             "defaults_take_a_long_prompt_on_a_12gb_card",
             run.stopped_with_its_plan()
                 && ctx.is_some_and(|c| c >= LONG_PROMPT_SLOT_CTX)
-                && slots.is_some_and(|n| n >= 2)
-                && ctx_line(&run.said).and_then(nvme_held) == Some(true),
-        );
-        paged_default_grows_past_the_base(ctx_line(&run.said), ok);
-        Ok(())
-    }
-
-    /// `default_second_slot_never_costs_a_load` (module header): five `--plan`
-    /// runs on `--place a`, none of them a load. Under a card budget below
-    /// every floor, a count's refusal names the floor of its plan
-    /// (`PlacementError::CardBudgetFloor`, read by [`budget_floor`]). The
-    /// default's own refusal there is the plan at one position a slot, which
-    /// is not the boundary: the seat refuses a slot under [`MAX_TOKENS`] rows
-    /// (`slot_ctx`), so the runs that name it are `--parallel 2` and
-    /// `--parallel 1` with the `--ctx` of those rows a slot, `F2` and `F1`,
-    /// the least budgets of two slots and of one. The default's window is the
-    /// budgets from `F1` to `F2 - 1`. The default and `--parallel 2` run at
-    /// `F2 - 1`, the default again at `F2`; a floor that is not the plan's
-    /// boundary turns the check red, the lines printed. A run ends planned
-    /// (exit 0, its `parallel` line printed) or refused (a non-zero exit, no
-    /// `parallel` line); any other ending is a named error, never a refusal.
-    fn default_second_slot_never_costs_a_load(
-        model: &Path,
-        dir: &Path,
-        ok: &mut bool,
-    ) -> Result<(), GateError> {
-        // Every plan of either file is over this: a card's margin alone is a GiB.
-        const BELOW_ANY_FLOOR: usize = 256 << 20;
-        const FALL: &str = "the default's second slot does not fit on --place a (";
-        const FALL_END: &str = "); serving one slot";
-        let own = dir.join("second-slot");
-        std::fs::create_dir_all(&own)?;
-        let planned_at =
-            |name: &str, budget: usize, flags: &[&str]| -> Result<(bool, String), GateError> {
-                let budget = budget.to_string();
-                let mut args = vec!["--place", "a"];
-                args.extend_from_slice(flags);
-                let run = plan_run(
-                    name,
-                    (model, &own),
-                    &[(bloomery_levers::CARD_BUDGET, budget.as_str())],
-                    &args,
-                )?;
-                let printed = run.said.lines().any(|l| l.starts_with("parallel rule="));
-                match run.exited {
-                    Some(planned) if planned == printed => Ok((planned, run.said)),
-                    other => Err(format!(
-                        "--plan under {budget} B ({}) ended {other:?} and {} a `parallel` line: \
-                         neither planned nor refused; {name}'s stderr:\n{}",
-                        flags.join(" "),
-                        if printed { "printed" } else { "printed no" },
-                        run.said
-                    )
-                    .into()),
-                }
-            };
-        let floor_of = |name: &str, flags: &[&str]| -> Result<usize, GateError> {
-            let (planned, said) = planned_at(name, BELOW_ANY_FLOOR, flags)?;
-            let flags = flags.join(" ");
-            if planned {
-                return Err(format!(
-                    "--plan ({flags}) plans under {BELOW_ANY_FLOOR} B: the clause's budget is \
-                     over the file's floor"
-                )
-                .into());
-            }
-            budget_floor(&said, BELOW_ANY_FLOOR as u64)
-                .and_then(|floor| usize::try_from(floor).ok())
-                .ok_or_else(|| -> GateError {
-                    format!(
-                        "--plan ({flags}) under {BELOW_ANY_FLOOR} B names no `budget \
-                         {BELOW_ANY_FLOOR} B is below its floor N B`; {name}'s stderr:\n{said}"
-                    )
-                    .into()
-                })
-        };
-        let rows = MAX_TOKENS;
-        let (ctx2, ctx1) = ((2 * rows).to_string(), rows.to_string());
-        let floor2 = floor_of("floor-2", &["--parallel", "2", "--ctx", ctx2.as_str()])?;
-        let floor1 = floor_of("floor-1", &["--parallel", "1", "--ctx", ctx1.as_str()])?;
-        let below = floor2.checked_sub(1).ok_or("a floor of 0 B")?;
-        let least = floor2;
-        println!(
-            "second slot: --parallel 2 --ctx {ctx2} names the floor {floor2} B and --parallel 1 \
-             --ctx {ctx1} {floor1} B under {BELOW_ANY_FLOOR} B"
-        );
-        let (fell, fell_said) = planned_at("default-below", below, &[])?;
-        let (held, held_said) = planned_at("parallel-2-below", below, &["--parallel", "2"])?;
-        let (two, two_said) = planned_at("default-least", least, &[])?;
-        // The slots and the `from` word of the one `parallel` line.
-        fn counted(said: &str) -> Option<(Option<&str>, Option<&str>)> {
-            said.lines()
-                .find(|l| l.starts_with("parallel rule="))
-                .map(|l| (parallel_word(l, "slots"), parallel_word(l, "from")))
-        }
-        let line = |said: &str| {
-            said.lines()
-                .find(|l| l.starts_with("parallel rule="))
-                .map(str::to_owned)
-        };
-        // What the fall line quotes of the second slot's refusal, which a set
-        // count prints on its own.
-        let refusal = fell_said.find(FALL).and_then(|at| {
-            let rest = fell_said.get(at + FALL.len()..)?;
-            rest.find(FALL_END).map(|to| &rest[..to])
-        });
-        println!(
-            "second slot: default under {below} B: planned {fell}, {:?}, refusal {refusal:?}",
-            line(&fell_said)
-        );
-        println!(
-            "second slot: --parallel 2 under {below} B: planned {held}, says the fall {}",
-            held_said.contains(FALL)
-        );
-        println!(
-            "second slot: default under {least} B: planned {two}, {:?}, says the fall {}",
-            line(&two_said),
-            two_said.contains(FALL)
-        );
-        println!(
-            "second slot: the window is {} B wide (the floors {floor1} B and {floor2} B)",
-            floor2.abs_diff(floor1)
-        );
-        check(ok, "second_slot_window_is_open", floor1 < floor2);
-        check(
-            ok,
-            "default_second_slot_never_costs_a_load",
-            fell && counted(&fell_said) == Some((Some("1"), Some("fit")))
-                && refusal.is_some_and(|r| {
-                    !r.is_empty() && !held && held_said.contains(r) && !held_said.contains(FALL)
-                })
-                && two
-                && counted(&two_said) == Some((Some("2"), Some("default")))
-                && !two_said.contains(FALL),
+                && slots == Some(1)
+                && ctx_line(&run.said).and_then(|l| default_line_held(l, 1, trained)) == Some(true),
         );
         Ok(())
     }
 
     /// The seat's `--ctx` against the file and this gate's card, beyond the
-    /// main server's own default arm ([`served`]: unset, the whole-card load
-    /// takes the file's trained context capped to what the card had free,
-    /// `ctx_default_is_the_trained_context`): a load under `--place` takes
-    /// the placed search's answer over the plan's expert split, its two
-    /// slots resident on either file (`placed_slots_are_resident`), and the
-    /// q8_0 cache's load holds the planes' derived delta against the main
-    /// server's at the same context. The search rules themselves — the fit,
-    /// the base and the step, the trained cap and the margin of card and
-    /// NVMe expert bytes — are held by `bloomery_placement::placement::ctx`'s
-    /// tests.
-    /// FAIL-first: a search that hands back the trained context uncapped
-    /// makes the placed arm's load a plan the card cannot hold (the spawn
-    /// never listens).
+    /// main server's own default arm ([`served`]: unset, the first rung of
+    /// the halving ladder the load holds,
+    /// `ctx_default_is_the_highest_rung_held`): a load under `--place` takes
+    /// the rung its plan holds, its two slots resident on either file
+    /// (`placed_slots_are_resident`), and the q8_0 cache's load holds the
+    /// planes' derived delta against the main server's at the same context.
+    /// The choice itself — the target, the halving, the floor and the set
+    /// share — is held by `bloomery_placement::placement::ctx_ask`'s tests.
+    /// FAIL-first: a choice that keeps the target whatever the card makes
+    /// the placed arm's load a plan the card cannot hold (the spawn never
+    /// listens).
     fn ctx_default(
         model: &Path,
         dir: &Path,
@@ -1430,19 +1209,13 @@ mod gate {
     }
 
     /// The base a slot (`generate_qwen3moe`'s default, the seat's
-    /// `BASE_SLOT_CTX`): the context the margin counts against, the whole-fit
-    /// verdict that picks the load, and the least default the card holds.
+    /// `BASE_SLOT_CTX`): the least rung an unset `--ctx` asks.
     const SEAT_FLOOR: u64 = 4096;
 
-    // PIN(2026-10-12): the default misses at most `(base_nvme_expert_bytes -
-    // base_arena) / 100` bytes past the base's (the rule's `NVME_SLACK_DIV`),
-    // the arena a deeper context gives up counted beside the experts it moves
-    // to the tier, where it paged none past it: the gate holds the divisor as
-    // its own literal and recomputes the bound from the line's base, never
-    // trusting its `nvme_bound`. Tightens the NVMe-bytes clause it replaces:
-    // an arena that never grows with the context makes the NVMe bytes' growth
-    // no more than the misses'.
-    const NVME_DIV: u64 = 100;
+    /// The context an unset `--ctx` asks a slot first on a file trained past
+    /// it (`placement::ctx_ask::DEFAULT_TARGET`), held as the gate's own
+    /// literal: 256K positions.
+    const TARGET: u64 = 262_144;
 
     /// The terms of one whole-fit line (`whole fit at ctx …: the whole load
     /// on …`): its `need`, that need less its cache term (the terms no
@@ -1487,27 +1260,23 @@ mod gate {
         })
     }
 
-    /// `ctx_default_is_the_trained_context`, on the default arm's server
+    /// `ctx_default_is_the_highest_rung_held`, on the default arm's server
     /// (no `--ctx`, `--parallel 1`, its stderr `log`, its default `n`): the
-    /// default is the whole search's answer on every card. A card that holds
-    /// the whole load at the file's `trained` context defaults to it; one
-    /// that does not defaults under it to a context the load fits at, one
-    /// position past which it does not (or past which is the trained
-    /// context); one whose whole load does not fit at the default
-    /// had nothing at [`SEAT_FLOOR`] either — the default is then the placed
-    /// plan's, which the placed arm's relations hold. The verdicts are the
-    /// seat's own: its one whole-fit line at `n` — the census reading the
-    /// load was decided on, its `fits`, what the card had and the need term
-    /// by term — with the cache term moved from `n` rows to each context
-    /// asked: the need is a sum (`Card::floor_bytes`) whose other terms read
-    /// no context at or past the floor, and the cache at a context is the
-    /// allocator's bytes of [`cache_planes`] there, the list
+    /// default is the first rung of the halving ladder from the target
+    /// ([`rungs`]) the load holds. `n` is a rung; the seat's one whole-fit
+    /// line at `n` — the census reading the load was decided on, its `fits`,
+    /// what the card had and the need term by term — with the cache term
+    /// moved from `n` rows to the rung above `n` says the whole load did not
+    /// fit there, so the seat did not halve past a rung the card held whole
+    /// (the placed plan there was short too, which the `ctx` line's
+    /// `halved` word holds). The need is a sum (`Card::floor_bytes`) whose
+    /// other terms read no context at or past the floor, and the cache at a
+    /// context is the allocator's bytes of [`cache_planes`] there, the list
     /// [`whole_fit_counts_the_planes_granules`] holds equal to the verdict's
     /// own. A line missing or without its terms is a named error.
-    /// FAIL-first: a search that never probes the trained context stops one
-    /// granule under it on an idle A6000, where the cache at both contexts
-    /// takes the same granules.
-    fn ctx_default_is_the_trained_context(
+    /// FAIL-first: a ladder that starts a rung under the target defaults to
+    /// half the target where the whole load fits the target, red here.
+    fn ctx_default_is_the_highest_rung_held(
         model: &Path,
         split: &Split,
         log: &str,
@@ -1533,31 +1302,16 @@ mod gate {
             rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
                 .ok_or_else(|| format!("the whole load's need at {ctx} passes u64 bytes").into())
         };
-        // PIN(2026-10-11): one position past the default, where it was one
-        // `CTX_GRAN` step: the seat's default is the largest context the
-        // whole load fits (`placement::ctx::fit_of`, the one fit search every
-        // seat takes), not a point on a 1024 grid off the floor, so the next
-        // context is the next position. Re-pin by specification, not a
-        // relaxation: the old step is past that position, and the new bound
-        // is the stricter of the two.
-        let next = n + 1;
-        let (at_trained, at_next, at_floor) =
-            (need_at(trained)?, need_at(next)?, need_at(SEAT_FLOOR)?);
+        let rungs = rungs(trained);
+        let above = rung_above(trained, n);
+        let at_above = above.map(need_at).transpose()?;
         println!(
-            "default arm: the default {n} of the file's trained {trained}, the whole load {} \
-             there; it needs {need} B at {n}, {at_trained} B at {trained}, {at_next} B at \
-             {next}, {at_floor} B at the floor {SEAT_FLOOR}, of {budget} B the card had \
-             ({census})",
+            "default arm: the default {n} of the rungs {rungs:?} (the file's trained {trained}),              the whole load {} there; it needs {need} B at {n}, {at_above:?} B at the rung above              {above:?}, of {budget} B the card had ({census})",
             if whole { "fits" } else { "does not fit" },
         );
-        let held = if !whole {
-            at_floor > budget
-        } else if at_trained <= budget {
-            n == trained
-        } else {
-            n < trained && (next >= trained || at_next > budget)
-        };
-        check(ok, "ctx_default_is_the_trained_context", held);
+        let held =
+            rungs.contains(&n) && (n == target_of(trained) || at_above.is_some_and(|b| b > budget));
+        check(ok, "ctx_default_is_the_highest_rung_held", held);
         Ok(())
     }
 
@@ -2038,15 +1792,13 @@ mod gate {
         Ok((h, rx))
     }
 
-    /// Where a slots arm's total context comes from: the server's own one
-    /// whole-fit line (`whole fit at ctx T`: the whole search's answer for
-    /// its slots, each slot's planes rounded to the granule, so it may sit
-    /// under the one-slot default arm's answer, carried here to print
-    /// beside it), or its own `plan` record (`ctx_max`: the placed search's
-    /// answer, the total the plan was made at).
+    /// Where a slots arm's total context comes from: the arm's own `--ctx`
+    /// (a set total, which its one whole-fit line is at), or its own `plan`
+    /// record (`ctx_max`: the placed default's answer, the total the plan
+    /// was made at).
     #[derive(Clone, Copy, Debug)]
     enum Total {
-        Verdict { one_slot: Option<u64> },
+        Set,
         Plan,
     }
 
@@ -2061,18 +1813,16 @@ mod gate {
         total: Total,
     }
 
-    /// The whole-card arm: no `--place`, no `--ctx`, the total its own
-    /// whole-fit line names split; `one_slot` the one-slot default arm's
-    /// answer, printed beside it.
-    fn whole_slots(one_slot: Option<u64>) -> SlotsArm<'static> {
-        SlotsArm {
-            dir: "slots",
-            prefix: "",
-            flags: &[],
-            env: &[],
-            total: Total::Verdict { one_slot },
-        }
-    }
+    /// The whole-card arm: no `--place`, a set `--ctx` of [`SEAT_FLOOR`] a
+    /// slot, which the whole load holds on every card the gate runs on (an
+    /// unset `--ctx` asks the target, which a card may hold only placed).
+    const WHOLE_SLOTS: SlotsArm<'static> = SlotsArm {
+        dir: "slots",
+        prefix: "",
+        flags: &["--ctx", "8192"],
+        env: &[],
+        total: Total::Set,
+    };
 
     /// The slots clause's placed arm (its checks `placed_…`): `--place a`
     /// under a card budget of [`PLACED_BUDGET`], no `--ctx` — the placed
@@ -2164,7 +1914,7 @@ mod gate {
         // split's check red).
         let plan = or_named(match arm.total {
             Total::Plan => records.one(&record::PLAN38).map(Some),
-            Total::Verdict { .. } => records.first(&record::PLAN38),
+            Total::Set => records.first(&record::PLAN38),
         });
         let plan_line = plan.as_ref().and_then(Option::as_ref).map(Fields::line);
         // The load's decision, printed: the whole-fit verdicts the seat ran
@@ -2179,23 +1929,12 @@ mod gate {
             verdicts.len()
         );
         let total = match arm.total {
-            Total::Verdict { one_slot } => {
-                // One verdict, at the total the seat decided its slots at;
-                // none or more names no total, and the split's checks are red.
-                let said = match verdicts[..] {
-                    [line] => line
-                        .strip_prefix("whole fit at ctx ")
-                        .and_then(|t| t.split(':').next())
-                        .and_then(|t| t.parse::<u64>().ok()),
-                    _ => None,
-                };
-                println!(
-                    "{}: the total {said:?} its whole-fit line names, the one-slot default \
-                     {one_slot:?}",
-                    arm.dir
-                );
-                said
-            }
+            Total::Set => arm
+                .flags
+                .iter()
+                .position(|&f| f == "--ctx")
+                .and_then(|i| arm.flags.get(i + 1))
+                .and_then(|t| t.parse::<u64>().ok()),
             Total::Plan => u64_of(plan.as_ref().and_then(Option::as_ref), "ctx_max"),
         };
         let (st, body) = curl(&url("/props"), None, false)?;
@@ -2222,10 +1961,10 @@ mod gate {
             &named("props_names_the_slot_ctx"),
             total.is_some_and(|t| n_ctx == t / 2),
         );
-        // The whole arm's total is its own two-slot whole search's answer,
-        // held by relation; the placed arm's is the plan's.
-        if let Total::Verdict { one_slot } = arm.total {
-            slots_default_is_the_whole_search(model, &verdicts, one_slot, ok)?;
+        // The whole arm's set total is its whole-fit verdict's, held by the
+        // two slots' planes; the placed arm's is the plan's.
+        if let (Total::Set, Some(t)) = (arm.total, total) {
+            slots_set_total_is_its_whole_fit(model, &verdicts, t, ok)?;
         }
         // Two distinct prompts, each first run alone, then both together.
         let a_ids = rendered(&url, messages())?;
@@ -2288,50 +2027,35 @@ mod gate {
         Ok(())
     }
 
-    /// `slots_default_is_the_whole_search` (the module header), on the whole
-    /// slots arm's server: its one whole-fit line (`verdicts`) names the
-    /// total `t` the server split — two slots of a context `t / 2` — and the
-    /// clause holds that slot context to be the two-slot whole search's own
-    /// answer. The line's terms — its need, its
-    /// cache, what the card had, its `fits` ([`whole_terms`]) — leave a rest
-    /// no context moves, and the two-slot need at a total `x` is that rest
-    /// plus the allocator's bytes of the two slots' planes: each slot the
-    /// one-slot list [`cache_planes`] gives at ⌊x/2⌋ rows, once per slot
+    /// `slots_set_total_is_its_whole_fit` (the module header), on the whole
+    /// slots arm's server of a set total `t`: its one whole-fit line
+    /// (`verdicts`) is at `t` and says the load fits, and the line's terms —
+    /// its need, its cache, what the card had ([`whole_terms`]) — leave a
+    /// rest no context moves, so the two-slot need at `t` is that rest plus
+    /// the allocator's bytes of the two slots' planes: each slot the
+    /// one-slot list [`cache_planes`] gives at ⌊t/2⌋ rows, once per slot
     /// concatenated — the per-slot list the seat's own verdict counts
     /// (`q3place::kv_bytes` over `PlaceQ3::whole_at`: N copies of one slot's
-    /// planes, each slot `ctx / N` rows, through the card's granule). The
-    /// relation, every branch printed: (a) the line says the load fits and
-    /// the two-slot need at `t` is inside what the card had; (b) a slot's
-    /// context `t / 2` never passes the one-slot default arm's answer
-    /// `one_slot`; (c) `t / 2` is the largest slot context the card holds,
-    /// the file's trained context at most: one position past it the trained
-    /// context stands or the two-slot need passes the card. A line that says
-    /// the load does not fit is a named error: the arm is not a whole arm,
-    /// its total no whole search's answer. FAIL-first: a fit search that
-    /// stops a position early splits a slot context whose next position still
-    /// fits, red on (c) with the need at `t + 2` inside the card.
-    // PIN(2026-10-11): (b) and (c) are over a slot's context now. (b) was
-    // `t <= one_slot` and (c) the next point of a 1024 grid on the total
-    // (`t + CTX_GRAN`, the trained context a cap on the total): the seat's
-    // default is a slot's context, the fit search is exact
-    // (`placement::ctx::fit_of`) and the trained context caps a slot, so a
-    // two-slot total may pass the one-slot answer on a card that holds both
-    // at the trained context. Derivation: two slots at `s` rows each need at
-    // least what one slot at `s` needs (their planes and fixed stores twice,
-    // their checkpoint reserve twice), so the two-slot fit `s` is never past
-    // the one-slot fit, and one more row a slot is a total `t + 2`. Re-pin
-    // by specification (the common rule's slot-context default), not a
-    // relaxation: the relations bound the same answer at the finer point.
-    fn slots_default_is_the_whole_search(
+    /// planes, each slot `ctx / N` rows, through the card's granule) — and
+    /// it is inside what the card had. A line that says the load does not
+    /// fit is a named error: the arm is not a whole arm. FAIL-first: a seat
+    /// that decides a set total's load at a slot's share puts its line at
+    /// half the total, red on every card.
+    // PIN(2026-10-14): the clause was `slots_default_is_the_whole_search`,
+    // the whole arm an unset `--ctx` whose two-slot fit search it held: (b)
+    // a slot never past the one-slot default, (c) the largest slot context
+    // the card holds. An unset `--ctx` now asks the target and halves only
+    // on a short card (`placement::ctx_ask`), which a card may hold only
+    // placed, so the whole arm sets its total and (b) and (c) left with the
+    // search; the halving's relations are `ctx_default_is_the_highest_rung_held`'s
+    // and `default_ctx_line_names_its_rule`'s.
+    fn slots_set_total_is_its_whole_fit(
         model: &Path,
         verdicts: &[&str],
-        one_slot: Option<u64>,
+        t: u64,
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let trained = q3place::trained_ctx(&split)
-            .ok_or_else(|| format!("{}: no context_length", model.display()))?;
-        let trained = u64::try_from(trained)?;
         let line = match verdicts {
             [line] => *line,
             _ => {
@@ -2343,7 +2067,7 @@ mod gate {
                 .into());
             }
         };
-        let t = line
+        let at = line
             .strip_prefix("whole fit at ctx ")
             .and_then(|x| x.split(':').next())
             .and_then(|x| x.parse::<u64>().ok())
@@ -2370,17 +2094,16 @@ mod gate {
                     format!("the two-slot whole load's need at {x} passes u64 bytes").into()
                 })
         };
-        let (slot, next) = (t / 2, t + 2);
-        let (at_t, at_next) = (need2(t)?, need2(next)?);
+        let at_t = need2(t)?;
         println!(
-            "slots arm: the total {t} of the one-slot default {one_slot:?} and the file's \
-             trained {trained}; the two-slot load needs {at_t} B at {t}, {at_next} B at {next}, \
-             of {budget} B the card had",
+            "slots arm: the set total {t}, its whole-fit line at {at}; the two-slot load needs \
+             {at_t} B at {t}, of {budget} B the card had",
         );
-        let held = at_t <= budget
-            && one_slot.is_none_or(|o| slot <= o)
-            && (slot >= trained || at_next > budget);
-        check(ok, "slots_default_is_the_whole_search", held);
+        check(
+            ok,
+            "slots_set_total_is_its_whole_fit",
+            at == t && at_t <= budget,
+        );
         Ok(())
     }
 
@@ -3105,10 +2828,12 @@ mod gate {
             "unplaced_default_names_itself",
             load.is_some() && default_ok,
         );
-        // The whole-fit verdict that chose the load, one line at the loaded
-        // context: `fits` exactly when the load is the whole-card one (no
-        // `plan` record). FAIL-first: a seat that loads whole on a verdict
-        // that does not fit, or prints none, turns this red.
+        // The whole-fit verdicts of the rungs the default asked, the last at
+        // the loaded context: `fits` exactly when the load is the whole-card
+        // one (no `plan` record), and every rung before it did not fit (a
+        // rung whose whole load fits is taken). FAIL-first: a seat that
+        // loads whole on a verdict that does not fit, or prints none, turns
+        // this red.
         let verdicts: Vec<&str> = log
             .lines()
             .filter(|l| l.starts_with("whole fit at ctx "))
@@ -3121,21 +2846,20 @@ mod gate {
         check(
             ok,
             "default_load_is_its_whole_fit",
-            verdicts.len() == 1
-                && verdicts[0].contains(": fits: ") == plans.is_empty()
-                && loaded_ctx
-                    .is_some_and(|c| verdicts[0].starts_with(&format!("whole fit at ctx {c}: "))),
+            verdicts.split_last().is_some_and(|(last, before)| {
+                last.contains(": fits: ") == plans.is_empty()
+                    && loaded_ctx
+                        .is_some_and(|c| last.starts_with(&format!("whole fit at ctx {c}: ")))
+                    && before.iter().all(|v| !v.contains(": fits: "))
+            }),
         );
 
         // The seat's default `--ctx` on this server (no `--ctx`, `--parallel
-        // 1`): unset, the whole-card load takes the file's trained context
-        // capped to what the card had free, and the default is the whole
-        // search's answer on either card — the trained context where the
-        // whole load fits it, else the largest the load fits
-        // ([`ctx_default_is_the_trained_context`]). FAIL-first: a search
-        // that hands back the trained context uncapped makes the load a plan
-        // the card cannot hold (the spawn never listens), and one that hands
-        // back nothing leaves the default at the floor.
+        // 1`): the first rung of the halving ladder from the target the load
+        // holds, on either card ([`ctx_default_is_the_highest_rung_held`]).
+        // FAIL-first: a choice that keeps the target whatever the card
+        // makes the load a plan the card cannot hold (the spawn never
+        // listens), and one that starts a rung low is red there.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let trained = q3place::trained_ctx(&split)
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;
@@ -3177,7 +2901,7 @@ mod gate {
                 && even.is_none()
                 && basis.is_none(),
         );
-        ctx_default_is_the_trained_context(model, &split, &log, default_n, trained, ok)?;
+        ctx_default_is_the_highest_rung_held(model, &split, &log, default_n, trained, ok)?;
         default_ctx_line_names_its_rule(&log, (1, default_n, trained), None, ok);
         default_load_counts_its_arena(&split, &log, default_n, &arch, ok)?;
         // Every search the unset `--ctx` ran read the census once for all its
@@ -4181,10 +3905,7 @@ mod gate {
             &env,
             "plan ",
         )?;
-        let line = err
-            .lines()
-            .find(|l| l.contains("--ctx defaults to "))
-            .ok_or("the placed image server printed no --ctx default line")?;
+        let line = ctx_line(&err).ok_or("the placed image server printed no one ctx line")?;
         println!("{line}");
         let counted = format!(
             ", the {} reserve of {} B counted",
@@ -4315,10 +4036,6 @@ mod gate {
                 images(model, &dir, &mut ok)?;
                 continue;
             }
-            if a.only_second_slot {
-                default_second_slot_never_costs_a_load(model, &dir, &mut ok)?;
-                continue;
-            }
             let Some((answers, arch, default_n)) = served(model, &dir, &mut ok)? else {
                 continue;
             };
@@ -4333,7 +4050,6 @@ mod gate {
             ctx_default(model, &dir, default_n, &mut ok)?;
             plan_flag_stops_before_the_load(model, &dir, &mut ok)?;
             ctx_past_the_trained_is_refused_by_name(model, &dir, &mut ok)?;
-            default_second_slot_never_costs_a_load(model, &dir, &mut ok)?;
             if arch == "qwen35moe" {
                 // The Qwen3.6 file alone: the defaults on the 12 GB card it
                 // is served from.
@@ -4349,7 +4065,7 @@ mod gate {
             // the seat's last swap engine: both bodies hold resident slots, so
             // the qwen35moe arm runs these slot clauses instead; `Park::Ids`
             // keeps its pure tests in `crates/serve/tests/slots`.
-            slots_flow_together(model, &dir, &whole_slots(Some(default_n)), &mut ok)?;
+            slots_flow_together(model, &dir, &WHOLE_SLOTS, &mut ok)?;
             slots_flow_together(model, &dir, &PLACED_SLOTS, &mut ok)?;
             placed_slots_hold_the_plan(model, &dir, &mut ok)?;
             slots_count_their_checkpoints(model, &dir, &mut ok)?;

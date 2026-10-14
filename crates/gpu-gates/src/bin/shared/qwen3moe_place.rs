@@ -113,8 +113,9 @@ pub fn reads() -> Reads {
 }
 
 /// This process's census ([`bloomery_gpu_gates::gpu_census::census`]),
-/// counted.
-fn census() -> Result<Vec<DeviceInfo>, GateError> {
+/// counted: a choice that probes several contexts reads it once and hands
+/// the reading to each probe.
+pub fn census() -> Result<Vec<DeviceInfo>, GateError> {
     CENSUSES.fetch_add(1, Ordering::Relaxed);
     bloomery_gpu_gates::gpu_census::census()
 }
@@ -355,7 +356,7 @@ impl PlaceQ3 {
     }
 
     /// [`PlaceQ3::qwen3`] resolved against `census`.
-    fn qwen3_on(
+    pub fn qwen3_on(
         file: &Split,
         place: Place,
         census: &[DeviceInfo],
@@ -394,7 +395,7 @@ impl PlaceQ3 {
     /// this process's devices: one sequence taking no checkpoints, the CLI's.
     #[allow(
         dead_code,
-        reason = "the CLI's and the e2e gates' load; the serve seat's holds its slots (qwen35_seqs)"
+        reason = "the CLI's and the e2e gates' load; the serve seat's holds its slots (qwen35_on)"
     )]
     pub fn qwen35(file: &Split, place: Place, o: Open35) -> Result<PlaceQ3, GateError> {
         PlaceQ3::qwen35_on(file, place, &census()?, o, Seqs::ONE, None)
@@ -404,23 +405,9 @@ impl PlaceQ3 {
     /// opened under `o` (a slot's share of the total, [`share`]), its machine
     /// carrying their rows ([`laid`]) and, on a media load (`o.media`), the
     /// tables of its sequences and the image encoder's `encoder` bytes when
-    /// the tower sits on this card: the serve seat's.
-    #[allow(
-        dead_code,
-        reason = "the serve seat's resident slots; the CLI and the e2e gates load one sequence"
-    )]
-    pub fn qwen35_seqs(
-        file: &Split,
-        place: Place,
-        o: Open35,
-        seqs: Seqs,
-        encoder: Option<u64>,
-    ) -> Result<PlaceQ3, GateError> {
-        PlaceQ3::qwen35_on(file, place, &census()?, o, seqs, encoder)
-    }
-
-    /// [`PlaceQ3::qwen35_seqs`] resolved against `census`.
-    fn qwen35_on(
+    /// the tower sits on this card, resolved against `census`: the serve
+    /// seat's, and one sequence's under [`PlaceQ3::qwen35`].
+    pub fn qwen35_on(
         file: &Split,
         place: Place,
         census: &[DeviceInfo],
@@ -862,11 +849,11 @@ impl PlaceQ3 {
 /// What a run with `--place` unset loads for one sequence
 /// ([`unplaced_qwen3_slots`]), as the CLI's own runs do.
 pub fn unplaced_qwen3(file: &Split, ctx: usize, kv: KvQ8) -> Result<Unplaced, GateError> {
-    unplaced_qwen3_slots(file, ctx, 1, kv)
+    unplaced_qwen3_slots(file, &census()?, ctx, 1, kv)
 }
 
 /// What a run with `--place` unset loads, decided before any load on one
-/// census reading, on `a`'s card ([`PlaceQ3::unplaced_on`]): the whole
+/// census reading (`census`), on `a`'s card ([`PlaceQ3::unplaced_on`]): the whole
 /// model there (`Whole` — no plan, no record) while the whole-fit verdict at
 /// `ctx` for `slots` resident sequences takes it ([`whole_on`]: the qwen3moe
 /// body's whole load ([`qwen3_whole`]), the cache [`kv_bytes`] counts at the
@@ -879,12 +866,12 @@ pub fn unplaced_qwen3(file: &Split, ctx: usize, kv: KvQ8) -> Result<Unplaced, Ga
 )]
 pub fn unplaced_qwen3_slots(
     file: &Split,
+    census: &[DeviceInfo],
     ctx: usize,
     slots: usize,
     kv: KvQ8,
 ) -> Result<Unplaced, GateError> {
-    let census = census()?;
-    let probe = PlaceQ3::qwen3_on(file, PlaceQ3::unplaced_on(&census)?, &census, ctx, kv)?;
+    let probe = PlaceQ3::qwen3_on(file, PlaceQ3::unplaced_on(census)?, census, ctx, kv)?;
     let whole = probe.whole_at(u64::try_from(ctx)?, slots, qwen3_whole(file))?;
     probe.unplaced(ctx, &whole)
 }
@@ -1124,7 +1111,7 @@ pub fn default_ctx_qwen35(
 /// of a qwen35moe file under `o`: one sequence taking no checkpoints
 /// ([`unplaced_qwen35_slots`]), as the CLI's own runs do.
 pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> {
-    unplaced_qwen35_slots(file, o, Seqs::ONE, None)
+    unplaced_qwen35_slots(file, &census()?, o, Seqs::ONE, None)
 }
 
 /// What a run with `--place` unset loads, as [`unplaced_qwen3_slots`]
@@ -1137,16 +1124,16 @@ pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> 
 /// the plan.
 pub fn unplaced_qwen35_slots(
     file: &Split,
+    census: &[DeviceInfo],
     o: &Open35,
     seqs: Seqs,
     encoder: Option<u64>,
 ) -> Result<Unplaced, GateError> {
-    let census = census()?;
     let at = share(o, o.ctx, seqs.slots);
     let probe = PlaceQ3::qwen35_on(
         file,
-        PlaceQ3::unplaced_on(&census)?,
-        &census,
+        PlaceQ3::unplaced_on(census)?,
+        census,
         at,
         seqs,
         encoder,
@@ -1261,7 +1248,7 @@ pub fn open_qwen3_slots(
 
 /// The Qwen3.6 model of `file` by `plan` ([`open_qwen35`]) for `slots`
 /// resident sequences of `o.ctx` rows each ([`open_slots`]), `plan` carrying
-/// their rows ([`PlaceQ3::qwen35_seqs`]). One slot is [`open_qwen35`]
+/// their rows ([`PlaceQ3::qwen35_on`]). One slot is [`open_qwen35`]
 /// itself.
 #[allow(
     dead_code,
