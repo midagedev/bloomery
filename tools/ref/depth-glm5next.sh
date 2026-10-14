@@ -985,14 +985,20 @@ run_arm() {
     ours | oursmtp)
       # Through majflt_mark: the fault count at the `fed` line, where the feed's timer starts.
       markf=$(mktemp "${TMPDIR:-/tmp}/depth-glm5next-fed.XXXXXX") || exit 2
-      out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1 | majflt_mark "$markf" '^fed '; exit "${PIPESTATUS[0]}")
-      rc=$?
+      lease_out_init || exit 70
+      majflt_mark "$markf" '^fed ' < "$LEASE_OUT_FIFO" > "$LEASE_OUT_FILE" &
+      mark_pid=$!
+      rc=0
+      LEASE_BOUNDED_OUT=$LEASE_OUT_FIFO lease_bounded "$BOUND" "${CMD[@]}" || rc=$?
+      wait "$mark_pid"
+      out=$(< "$LEASE_OUT_FILE")
       mark=$(cat "$markf")
       rm -f "$markf"
       ;;
     *)
-      out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1)
-      rc=$?
+      rc=0
+      lease_capture "$BOUND" "${CMD[@]}" || rc=$?
+      out=$LEASE_OUT
       ;;
   esac
   t1=$(date +%s) m1=$(majflt_now)

@@ -155,12 +155,13 @@ stamp() {
 
 # bench <log>: one bench run, its lines stamped; its rc.
 bench() {
-  local r
-  set +e
-  BLOOMERY_THREADS=$THREADS BLOOMERY_HOST_LEASE=1 lease_bounded "$BOUND" "$BENCH" --time --rounds 1 \
-    --seconds "$SECS" --warmup "$WARMUP" --arms "$ARMS" 2>&1 | stamp > "$1"
-  r=${PIPESTATUS[0]}
-  set -e
+  local r=0 sp
+  lease_out_init || return 70
+  stamp < "$LEASE_OUT_FIFO" > "$1" &
+  sp=$!
+  BLOOMERY_THREADS=$THREADS BLOOMERY_HOST_LEASE=1 LEASE_BOUNDED_OUT=$LEASE_OUT_FIFO lease_bounded "$BOUND" "$BENCH" --time --rounds 1 \
+    --seconds "$SECS" --warmup "$WARMUP" --arms "$ARMS" || r=$?
+  wait "$sp" || true
   return "$r"
 }
 

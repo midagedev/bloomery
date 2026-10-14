@@ -29,23 +29,31 @@ for n in $IK_RATES; do
   [ -x "$BLOOMERY_DATA/bin/$n" ] || { echo "no $BLOOMERY_DATA/bin/$n — run: just build-ref" >&2; exit 2; }
 done
 WITNESS=(head loadavg pressure-cpu pressure-io gpus lock-holder core core-mhz)
-ik_arm() { for n in $IK_RATES; do lease_bounded "$LEASE_ARM_BOUND" taskset -c "$CORE" "$BLOOMERY_DATA/bin/$n"; done; }
+ik_arm() { for n in $IK_RATES; do lease_bounded "$LEASE_ARM_BOUND" taskset -c "$CORE" "$BLOOMERY_DATA/bin/$n" || return $?; done; }
 rust_arm() { lease_bounded "$LEASE_ARM_BOUND" taskset -c "$CORE" "$RUST"; }
 SITTING=$(mktemp)
 trap 'rm -f "$SITTING"' EXIT
 lease_take
 witness pre
 echo "rust-bin: $RUST md5 $(md5sum < "$RUST" | cut -d' ' -f1)"
-for r in $(seq 1 "$ROUNDS"); do
-  if [ $((r % 2)) = 1 ]; then
-    echo "--- round $r: ik then rust"
-    ik_arm
-    rust_arm
-  else
-    echo "--- round $r: rust then ik"
-    rust_arm
-    ik_arm
-  fi
-done | tee "$SITTING"
+# The rounds run in this shell, not in a pipeline, so a signal to the runner reaches lease_bounded's trap.
+rounds() {
+  local r
+  for r in $(seq 1 "$ROUNDS"); do
+    if [ $((r % 2)) = 1 ]; then
+      echo "--- round $r: ik then rust"
+      ik_arm || return $?
+      rust_arm || return $?
+    else
+      echo "--- round $r: rust then ik"
+      rust_arm || return $?
+      ik_arm || return $?
+    fi
+  done
+}
+rounds_rc=0
+rounds > "$SITTING" || rounds_rc=$?
+cat "$SITTING"
+[ "$rounds_rc" -eq 0 ] || exit "$rounds_rc"
 witness post
 python3 "$FLOORS" check "$SITTING"

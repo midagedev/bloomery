@@ -59,7 +59,8 @@ echo "[perf] window ${SECS}s after the prefill; decode still running when the wi
 # a `-p` record dropped every qdot kernel from the main thread and showed it as 73 % barrier spin, while
 # its own samples, listed one by one, were 68 % dot kernels.
 ms_step=$(grep -E 'decode steps in' "$OUT/decode.log" | sed 's/.*mean \([0-9.]*\) ms.*/\1/')
-lease_bounded "$LEASE_ARM_BOUND" perf script -i "$OUT/perf.data" -F tid,sym 2> /dev/null | awk -v main="$pid" '{print ($1 == main ? "main" : "workers"), $2}' \
+LEASE_BOUNDED_OUT=$OUT/script.txt LEASE_BOUNDED_ERR=/dev/null lease_bounded "$LEASE_ARM_BOUND" perf script -i "$OUT/perf.data" -F tid,sym
+awk -v main="$pid" '{print ($1 == main ? "main" : "workers"), $2}' "$OUT/script.txt" \
   | sed 's/\.llvm\.[0-9]*$//' > "$OUT/samples.txt"
 for who in main workers; do
   echo
@@ -78,14 +79,14 @@ done
 for sym in ${PERF_ANNOTATE:-}; do
   echo
   echo "=== hottest instructions of $sym ==="
-  lease_bounded "$LEASE_ARM_BOUND" perf annotate -i "$OUT/perf.data" --stdio -s "$sym" 2> /dev/null \
-    | grep -E '^ +[0-9]+\.[0-9]+ +:' | sort -rn | head -n 12 || true
+  LEASE_BOUNDED_OUT=$OUT/annotate.txt LEASE_BOUNDED_ERR=/dev/null lease_bounded "$LEASE_ARM_BOUND" perf annotate -i "$OUT/perf.data" --stdio -s "$sym" || true
+  grep -E '^ +[0-9]+\.[0-9]+ +:' "$OUT/annotate.txt" | sort -rn | head -n 12 || true
 done
 for sym in ${PERF_CALLERS:-}; do
   echo
   echo "=== main thread, callers of $sym ==="
-  lease_bounded "$LEASE_ARM_BOUND" perf report -i "$OUT/perf.data" --stdio --no-children --percentage relative -S "$sym" -G 2> /dev/null \
-    | grep -vE '^#|^$' | head -n 60 || true
+  LEASE_BOUNDED_OUT=$OUT/report.txt LEASE_BOUNDED_ERR=/dev/null lease_bounded "$LEASE_ARM_BOUND" perf report -i "$OUT/perf.data" --stdio --no-children --percentage relative -S "$sym" -G || true
+  grep -vE '^#|^$' "$OUT/report.txt" | head -n 60 || true
 done
 # PERF_KEEP=1 leaves the record for reading afterwards (reading is not measuring; recording is).
 if [ "${PERF_KEEP:-0}" = 1 ]; then echo "[perf] kept $OUT (main tid $pid)"; else rm -rf "$OUT"; fi

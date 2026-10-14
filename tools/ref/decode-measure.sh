@@ -58,8 +58,10 @@ if [ -n "${SWEEP:-}" ]; then
   for th in $SWEEP; do
     export BLOOMERY_THREADS=$th
     witness "pre-threads$th"
-    lease_bounded "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
-      | grep -E "^derived|decode steps in|per step"
+    rc=0
+    lease_capture "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" || rc=$?
+    grep -E "^derived|decode steps in|per step" "$LEASE_OUT_FILE" || rc=$?
+    [ "$rc" -eq 0 ] || exit "$rc"
     witness "post-threads$th"
     unset BLOOMERY_THREADS
   done
@@ -75,8 +77,10 @@ if [ -n "${SPINS:-}" ]; then
   for sp in $SPINS; do
     export BLOOMERY_SPIN=$sp
     witness "pre-spin$sp"
-    lease_bounded "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
-      | grep -E "^derived|decode steps in|per step"
+    rc=0
+    lease_capture "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" || rc=$?
+    grep -E "^derived|decode steps in|per step" "$LEASE_OUT_FILE" || rc=$?
+    [ "$rc" -eq 0 ] || exit "$rc"
     witness "post-spin$sp"
     unset BLOOMERY_SPIN
   done

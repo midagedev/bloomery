@@ -441,7 +441,9 @@ lease_take() {
   lease_netdata
 }
 
-# lease_bounded <seconds> <command…>: the command under `timeout --kill-after=10 <seconds>`, its exit
+# lease_bounded <seconds> <command…>: (with LEASE_BOUNDED_OUT=<file> set for the call, the command's stdout
+# and stderr go to that file, stderr to LEASE_BOUNDED_ERR when that is set too, and the runner's own
+# trap output stays on the runner's stdout) the command under `timeout --kill-after=10 <seconds>`, its exit
 # code returned. Every process a runner starts under the lease goes through it or its own `timeout`:
 # the lease stays held while any process that inherited descriptor 9 lives, so a hung child must end
 # at a bound instead of holding the machine. A command cut off there prints `[bound]` on stderr: a
@@ -449,8 +451,10 @@ lease_take() {
 # (tools/gate-bound.sh), so a TERM, INT or HUP to the runner ends the command first; the runner then
 # stops on that signal as it would have (by its own trap, if it set one), not at its next arm. Where
 # lease_bounded runs in a subshell (`out=$(lease_bounded …)`, a pipeline), a signal to the runner's
-# pid alone does not reach it: the runner ends and the command runs on to its bound. A signal to the
-# runner's group ends both. The command is an executable, not a shell
+# pid alone does not reach it: the runner ends and the command runs on to its bound, holding the
+# lease. So a runner calls it in its own shell and takes the output from a file: lease_capture, or a
+# LEASE_BOUNDED_OUT=$LEASE_OUT_FILE after lease_out_init, or $LEASE_OUT_FIFO for a filter that must see each
+# line as it is printed. The command is an executable, not a shell
 # function or an assignment: `lease_bounded "$LEASE_ARM_BOUND" env K=V "$BIN" …`. LEASE_ARM_BOUND is
 # BLOOMERY_ARM_BOUND, default 900 s — the arm bound the depth, nsys and ncu runners read too; a
 # runner whose children run longer names its own. A bound that is not a positive integer is refused
@@ -466,12 +470,56 @@ lease_bounded() {
       ;;
   esac
   shift
-  run_bounded timeout --kill-after=10 "$bound" "$@" || rc=$?
+  if [ -n "${LEASE_BOUNDED_OUT:-}" ] && [ -n "${LEASE_BOUNDED_ERR:-}" ]; then
+    run_bounded timeout --kill-after=10 "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2> "$LEASE_BOUNDED_ERR" || rc=$?
+  elif [ -n "${LEASE_BOUNDED_OUT:-}" ]; then
+    run_bounded timeout --kill-after=10 "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2>&1 || rc=$?
+  else
+    run_bounded timeout --kill-after=10 "$bound" "$@" || rc=$?
+  fi
   case $rc in
     124) echo "[bound] $1 cut off at its ${bound} s bound (rc 124)" >&2 ;;
     137) echo "[bound] $1 killed (rc 137: the bound's KILL ${bound} s + 10 s in, or another SIGKILL)" >&2 ;;
   esac
   [ -z "$BIN_SIGNAL" ] || kill -s "$BIN_SIGNAL" $$ 2> /dev/null
+  return "$rc"
+}
+
+# lease_out_init: a temp dir for the runner's own shell to capture a lease_bounded command's output in
+# (LEASE_OUT_FILE, and LEASE_OUT_FIFO for a live filter; pass either as LEASE_BOUNDED_OUT), removed by lease_out_clean, which it adds to
+# the runner's EXIT trap without replacing it (call it again after a later `trap … EXIT`).
+LEASE_OUT_DIR='' LEASE_OUT_FILE='' LEASE_OUT_FIFO=''
+lease_out_clean() {
+  [ -z "$LEASE_OUT_DIR" ] || { rm -f "$LEASE_OUT_FILE" "$LEASE_OUT_FIFO"; rmdir "$LEASE_OUT_DIR" 2> /dev/null; }
+  return 0
+}
+lease_out_init() {
+  local cur
+  if [ -z "$LEASE_OUT_DIR" ]; then
+    LEASE_OUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lease-out.XXXXXX") || return 70
+    LEASE_OUT_FILE=$LEASE_OUT_DIR/out LEASE_OUT_FIFO=$LEASE_OUT_DIR/fifo
+    mkfifo "$LEASE_OUT_FIFO" || return 70
+  fi
+  trap -p EXIT > "$LEASE_OUT_FILE"
+  cur=$(< "$LEASE_OUT_FILE")
+  case $cur in
+    *lease_out_clean*) ;;
+    *)
+      eval "set -- ${cur#trap -- }"
+      # shellcheck disable=SC2064 # the runner's trap text now, to run again at exit
+      trap "${1:+$1; }lease_out_clean" EXIT
+      ;;
+  esac
+}
+
+# lease_capture <seconds> <command…>: lease_bounded with stdout and stderr in LEASE_OUT (as `$(…) 2>&1`
+# gives them, the last newlines cut), its rc returned. Call it in the runner's shell, never in a
+# substitution or a pipeline.
+lease_capture() {
+  local rc=0
+  lease_out_init || return 70
+  LEASE_BOUNDED_OUT=$LEASE_OUT_FILE lease_bounded "$@" || rc=$?
+  LEASE_OUT=$(< "$LEASE_OUT_FILE")
   return "$rc"
 }
 
@@ -1153,34 +1201,52 @@ EOF
     command -v timeout > /dev/null || cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout"
     printf '%s\n' '#!/bin/sh' 'trap "exit 7" TERM' 'echo "$$ $PPID" > "$1"' 'while :; do sleep 1; done' > "$t/held"
     chmod +x "$t/held"
-    n=0
-    for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
-      n=$((n + 1))
-      s0=$SECONDS
-      bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp lease_bounded 20 \"\$3\" \"\$4\"; echo next arm; }" \
-        _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" > "$t/bout$n" 2>&1 &
-      rp=$!
-      i=0
-      until [ -s "$t/held$n.pid" ] || [ "$i" = 100 ]; do
-        sleep 0.1
-        i=$((i + 1))
+    n=0 BOUND=20
+    # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
+    # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
+    # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
+    for form in direct capture; do
+      for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
+        n=$((n + 1))
+        case $form in
+          direct) call='lease_bounded "$BOUND" "$3" "$4"' ;;
+          capture) call='lease_out_init; echo "capture dir $LEASE_OUT_DIR"; lease_capture "$BOUND" "$3" "$4"' ;;
+        esac
+        BOUND=$BOUND bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp $call; echo next arm; }" \
+          _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" > "$t/bout$n" 2>&1 &
+        rp=$!
+        i=0
+        until [ -s "$t/held$n.pid" ] || [ "$i" = 100 ]; do
+          sleep 0.1
+          i=$((i + 1))
+        done
+        s0=$SECONDS
+        kill -TERM "$rp" 2> /dev/null
+        RC=0
+        wait "$rp" || RC=$?
+        ended=before
+        [ "$((SECONDS - s0))" -lt "$BOUND" ] || ended='at or after'
+        left='' sp=''
+        if [ -s "$t/held$n.pid" ]; then
+          read -r sp ip < "$t/held$n.pid"
+          if kill -0 "$sp" 2> /dev/null; then left="$left stub"; fi
+          if kill -0 "$ip" 2> /dev/null; then left="$left timeout"; fi
+        fi
+        lk=free
+        lease_free "$t/blease$n" 2> /dev/null || lk=held
+        [ -z "$left" ] || kill -TERM "$sp" 2> /dev/null
+        cdir=$(sed -n 's/^capture dir //p' "$t/bout$n")
+        OUT="stub ran: $([ -n "$sp" ] && echo yes || echo no), left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound, out: [$(grep -E '^(trap ran|next arm)$' "$t/bout$n" | tr '\n' ' ')]"
+        cfix=''
+        [ "$form" != capture ] || { cfix=', capture dir: removed'; [ -n "$cdir" ] && [ ! -e "$cdir" ] && OUT="$OUT, capture dir: removed" || OUT="$OUT, capture dir: left"; }
+        check "bounded-$form-term${trp:+-trap}-rc" "$RC" 143
+        matches "bounded-$form-term${trp:+-trap}" "^stub ran: yes, left: none, lease: free, ended before the $BOUND s bound, out: \[${trp:+trap ran }\]${cfix}\$" "$OUT"
       done
-      kill -TERM "$rp" 2> /dev/null
-      RC=0
-      wait "$rp" || RC=$?
-      left='' sp=''
-      if [ -s "$t/held$n.pid" ]; then
-        read -r sp ip < "$t/held$n.pid"
-        if kill -0 "$sp" 2> /dev/null; then left="$left stub"; fi
-        if kill -0 "$ip" 2> /dev/null; then left="$left timeout"; fi
-      fi
-      lk=free
-      lease_free "$t/blease$n" 2> /dev/null || lk=held
-      [ -z "$left" ] || kill -TERM "$sp" 2> /dev/null
-      OUT="stub ran: $([ -n "$sp" ] && echo yes || echo no), left:${left:- none}, lease: $lk, ended in $((SECONDS - s0)) s, out: [$(grep -E '^(trap ran|next arm)$' "$t/bout$n" | tr '\n' ' ')]"
-      check "bounded-term${trp:+-trap}-rc" "$RC" 143
-      matches "bounded-term${trp:+-trap}" "^stub ran: yes, left: none, lease: free, ended in [0-9] s, out: \[${trp:+trap ran }\]\$" "$OUT"
     done
+    RC=0
+    lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    check bounded-capture-rc "$RC" 3
+    check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
     check bounded-stdin "$(printf 'stdin reaches it\n' | lease_bounded 10 cat 2>&1)" 'stdin reaches it'
   else
     echo "skip lease_bounded: no flock(1) and no tools/ref/card-tests/bin/flock stand-in"
