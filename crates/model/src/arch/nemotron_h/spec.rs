@@ -340,22 +340,15 @@ mod tests {
             "{needs:?}"
         );
         let items = coverage::check(&read.spec, &read.tensors);
+        // The program runs the Mamba-2 and squared-ReLU layers; this
+        // header's attention (head 8, group 2) has no flash row.
         assert!(
             items
                 .iter()
-                .any(|u| u.feature == "a layer program for nemotron_h"),
+                .all(|u| u.feature.starts_with("GQA flash, head 8, group 2")),
             "{items:?}"
         );
-        assert!(
-            items.iter().any(|u| u.feature.starts_with("Mamba-2 mixer")),
-            "{items:?}"
-        );
-        assert!(
-            items
-                .iter()
-                .any(|u| u.feature.starts_with("squared-ReLU dense layer")),
-            "{items:?}"
-        );
+        assert!(!items.is_empty(), "{items:?}");
         assert!(
             items.iter().all(|u| !u.feature.contains("rope")),
             "{items:?}"

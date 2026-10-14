@@ -96,7 +96,28 @@ pub const AVAILABLE: &[Available] = &[
         runs: |n| matches!(n, Need::Engram { row: 5120 }),
     },
     Available {
-        programs: &[Program::Qwen3moeBody, Program::Qwen35Body],
+        programs: &[Program::NemotronHBody],
+        at: "gpu/src/mamba2.rs Mamba2Kernels::enqueue_step (STATE 128, CONV_TAPS 4)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Mamba2 {
+                    d_state: 128,
+                    d_conv: 4,
+                    n_heads,
+                    n_groups,
+                    ..
+                } if *n_groups > 0 && n_heads % n_groups == 0
+            )
+        },
+    },
+    Available {
+        programs: &[Program::NemotronHBody],
+        at: "gpu/src/elem.rs enqueue_relu_sqr",
+        runs: |n| matches!(n, Need::ReluSqr { .. }),
+    },
+    Available {
+        programs: &[Program::Qwen3moeBody, Program::Qwen35Body, Program::NemotronHBody],
         at: "models/src/shape.rs GQA",
         runs: |n| {
             matches!(
@@ -1051,6 +1072,8 @@ pub fn check_with(
                 // by name and part (the default expert rule's card formats
                 // would pass q3_K and q6_K gate·up to the load's refusal).
                 Some(Program::Qwen3moeBody | Program::Qwen35Body) => {}
+                // The nemotron_h body is dense: a routed stack is an item.
+                Some(Program::NemotronHBody) => at(t.layer, Need::RoutedFormat(t.ty)),
             }
         }
         for need in weight_formats(program, t) {

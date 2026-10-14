@@ -32,6 +32,10 @@ pub enum Program {
     /// on a card (MXFP4 stacks, the common pair) and the rest on the host
     /// tier.
     Mimo2Body,
+    /// The nemotron_h body (`crates/gpu/src/arch/nemotron_h`): whole-card,
+    /// dense, its Mamba-2, NoPE GQA and squared-ReLU layers over the common
+    /// kernels; no routed experts.
+    NemotronHBody,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -44,7 +48,8 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Glm5Next => Some(Program::Glm5nextBody),
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
         Arch::MiMo2 => Some(Program::Mimo2Body),
-        Arch::NemotronH | Arch::GemmaEmbedding2 => None,
+        Arch::NemotronH => Some(Program::NemotronHBody),
+        Arch::GemmaEmbedding2 => None,
     }
 }
 
@@ -180,6 +185,7 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: |ty| ty == DS41_LEG[0],
             down: |ty| ty == DS41_LEG[2],
         }),
+        Program::NemotronHBody => None,
     }
 }
 
@@ -217,6 +223,8 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             gate_up: |ty| (ty == DS41_LEG[0]).then_some(CardFormat::KQuant),
             down: |ty| (ty == DS41_LEG[2]).then_some(CardFormat::KQuant),
         },
+        // No routed stack: every one is refused by name.
+        Program::NemotronHBody => RoutedRule::PerType(|_| None),
     }
 }
 
@@ -230,13 +238,14 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 6] = [
+    const PROGRAMS: [Program; 7] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
         Program::Glm5nextBody,
         Program::Qwen38Body,
         Program::Mimo2Body,
+        Program::NemotronHBody,
     ];
 
     /// Every type the file format names.
@@ -289,18 +298,19 @@ mod tests {
     /// read per type over the union of its parts (a Q6_K, a Q8_0 gate), the
     /// common leg's per type (a gate and an up of two types), V4.1's read per
     /// type in its own format (a Q6_K down) — each names its program and
-    /// triples.
+    /// triples. A program with no card leg (the dense nemotron_h body) cards
+    /// none.
     #[test]
     fn a_layer_the_plan_cards_is_one_its_load_runs() {
         let (model, layers) = triples(&types());
         let mut broken = Vec::new();
         for p in PROGRAMS {
-            assert!(leg_arms(p).is_some(), "{p:?} has a card leg");
             let rule = routed_rule(p);
             for (l, &tys) in layers.iter().enumerate() {
                 let stacks = [3 * l, 3 * l + 1, 3 * l + 2];
                 let cards = rule.layer_runs(&stacks, &model).expect("named stacks");
-                if cards && leg_runs(p, tys) == Some(false) {
+                // A program with no card leg cards no layer.
+                if cards && leg_runs(p, tys) != Some(true) {
                     broken.push(format!("{p:?} {tys:?}"));
                 }
             }
