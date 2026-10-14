@@ -71,16 +71,23 @@ dump_stacks() {
 }
 
 watch() {
-  local quiet=$1 comm=$2 log pid sent=0 size last_change=$SECONDS target='' rc c p dump='' stop=0
+  local quiet=$1 comm=$2 log pid='' sent=0 size last_change=$SECONDS target='' rc c p dump='' stop=0
   shift 3
   log=$(mktemp "${TMPDIR:-/tmp}/stack-watch.XXXXXX") || return 70
-  "$@" > "$log" 2>&1 &
-  pid=$!
   # A command under timeout runs in a process group of its own, which a signal to the watch's group never reaches: a TERM or HUP
   # to the watch (an INT too, in the foreground) goes on to the command and to a dump under way, and the watch goes on only after
-  # each has ended; after it the watch starts no dump and waits for the command. The signal cuts short the wait it arrives in;
-  # the trap ignores further signals, so each wait is made twice and the second reads the child's status.
-  trap 'trap "" TERM INT HUP; stop=1; kill -TERM "$pid" ${dump:+"$dump"} 2> /dev/null' TERM INT HUP
+  # each has ended; after it the watch starts no dump and waits for the command. The trap is set before the command starts, so no
+  # signal falls between the two: one that comes before the command's pid is known sets $stop, and the command gets its TERM as
+  # soon as the pid is. The signal cuts short the wait it arrives in; once it has a pid to pass it to, the trap ignores further
+  # signals (none before the command starts, which would start it with them ignored), so each wait is made twice and the second
+  # reads the child's status.
+  trap 'stop=1; [ -z "$pid" ] || { trap "" TERM INT HUP; kill -TERM "$pid" ${dump:+"$dump"} 2> /dev/null; }' TERM INT HUP
+  "$@" > "$log" 2>&1 &
+  pid=$!
+  if [ "$stop" = 1 ]; then
+    trap '' TERM INT HUP
+    kill -TERM "$pid" 2> /dev/null
+  fi
   # Pass new bytes of the log through; true when there were any.
   flush_log() {
     size=$(wc -c < "$log" | tr -d ' ')
@@ -122,7 +129,8 @@ watch() {
 # The watch on stub commands: output passes through and the code is the command's; a quiet stub named
 # by its comm is dumped and ended; a quiet command with no such process is left to finish; a TERM during
 # a dump or during the last wait ends the dump and the command, and the watch returns after both, with the
-# command's code; after a TERM before the quiet time no dump starts. One line a case; exit 0 iff none failed.
+# command's code; after a TERM before the quiet time no dump starts; a TERM as the command starts ends it.
+# One line a case; exit 0 iff none failed.
 self_test() {
   local self t bad=0 out rc w k s left
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -197,6 +205,19 @@ self_test() {
   echo "dumped: $([ -e "$t/gdb3.pid" ] && echo yes || echo no), ended in $((SECONDS - s)) s, left:${left:- none}" >> "$t/g"
   case_ 'a TERM before the quiet time: no dump after it, the command awaited, its code kept' 7 \
     'dumped: no, ended in [4-7] s, left: none$' "$rc" "$t/g"
+  # A TERM as soon as the command runs (it sets its trap, then writes its pid): the command gets it, and the watch returns after
+  # the command, with its code. A command still there once the checks are made is let go.
+  printf '%s\n' "trap 'exit 7' TERM" 'echo $$ > "$SW_CMD"' 'while :; do sleep 1; done' > "$t/cmd4"
+  SW_CMD=$t/cmd4.pid bash "$self" 30 sleep -- sh "$t/cmd4" > "$t/h" 2>&1 &
+  w=$! k=0
+  until [ -s "$t/cmd4.pid" ] || [ "$k" = 100 ]; do sleep 0.1; k=$((k + 1)); done
+  kill -TERM "$w"
+  rc=0; wait "$w" || rc=$?
+  left=
+  kill -0 "$(cat "$t/cmd4.pid" 2> /dev/null)" 2> /dev/null && left=' command'
+  echo "command ran: $([ -s "$t/cmd4.pid" ] && echo yes || echo no), left:${left:- none}" >> "$t/h"
+  [ -z "$left" ] || kill -TERM "$(cat "$t/cmd4.pid")" 2> /dev/null
+  case_ 'a TERM as the command starts: the command ended, its code kept' 7 'command ran: yes, left: none$' "$rc" "$t/h"
   [ "$bad" = 0 ] && echo "stack-watch self-test: ok" || echo "stack-watch self-test: $bad failed"
   [ "$bad" = 0 ]
 }

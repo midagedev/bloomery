@@ -1143,15 +1143,15 @@ EOF
   # ---- end the trace ----
   # ---- lease_bounded ----
   # A runner that holds a lease (a temp file) runs a stub under lease_bounded and then its next arm; the
-  # stub writes its pid and its parent's (its timeout), ends 7 on a TERM and holds otherwise. A TERM to
-  # the runner's pid ends the stub, its timeout and then the runner, by the runner's own TERM trap when it
-  # set one, within seconds: the lease is free once the runner is gone and the next arm never starts. A
-  # stub still there once the checks are made is let go. Of the output only the runner's own two lines
-  # are read: the stub's /bin/sh may report its sleep ended by the group's TERM. The command reads the
-  # runner's stdin.
+  # stub sets a trap that ends it 7 on a TERM, writes its pid and its parent's (its timeout) and holds.
+  # A TERM to the runner's pid, sent as soon as the stub's pid is there, ends the stub, its timeout and
+  # then the runner, by the runner's own TERM trap when it set one, within seconds: the lease is free once
+  # the runner is gone and the next arm never starts. A stub still there once the checks are made is let
+  # go. Of the output only the runner's own two lines are read: the stub's /bin/sh may report its sleep
+  # ended by the group's TERM. The command reads the runner's stdin.
   if command -v flock > /dev/null 2>&1; then
     command -v timeout > /dev/null || cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout"
-    printf '%s\n' '#!/bin/sh' 'echo "$$ $PPID" > "$1"' 'trap "exit 7" TERM' 'while :; do sleep 1; done' > "$t/held"
+    printf '%s\n' '#!/bin/sh' 'trap "exit 7" TERM' 'echo "$$ $PPID" > "$1"' 'while :; do sleep 1; done' > "$t/held"
     chmod +x "$t/held"
     n=0
     for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
@@ -1160,9 +1160,10 @@ EOF
       bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp lease_bounded 20 \"\$3\" \"\$4\"; echo next arm; }" \
         _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" > "$t/bout$n" 2>&1 &
       rp=$!
-      for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-        [ -s "$t/held$n.pid" ] && break
-        sleep 0.5
+      i=0
+      until [ -s "$t/held$n.pid" ] || [ "$i" = 100 ]; do
+        sleep 0.1
+        i=$((i + 1))
       done
       kill -TERM "$rp" 2> /dev/null
       RC=0

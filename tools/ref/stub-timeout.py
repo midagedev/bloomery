@@ -17,10 +17,11 @@ for a in sys.argv[1:]:
         kill_after = float(a.split('=', 1)[1])
     else:
         args.append(a)
-proc = subprocess.Popen(args[1:])
 deadline = time.monotonic() + float(args[0])
 term_signal = signal.SIGTERM
 timed_out = False
+proc = None
+pending = False
 
 
 def cleanup(sig):
@@ -30,7 +31,19 @@ def cleanup(sig):
     proc.send_signal(sig)
 
 
-signal.signal(signal.SIGTERM, lambda *_: cleanup(signal.SIGTERM))
+def on_term(*_):
+    global pending
+    if proc is None:
+        pending = True
+    else:
+        cleanup(signal.SIGTERM)
+
+
+# Set before COMMAND starts, so a TERM that comes as it starts reaches it.
+signal.signal(signal.SIGTERM, on_term)
+proc = subprocess.Popen(args[1:])
+if pending:
+    cleanup(signal.SIGTERM)
 # Short waits, so a deadline a TERM moves takes effect.
 while True:
     try:
