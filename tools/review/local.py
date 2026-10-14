@@ -24,6 +24,9 @@ their inputs (PRE_CHECKS: tools/check-levers.sh, about 10 s, for tools/, the jus
 ends the run 1 by name, before the reviewer's cost. --no-pre-checks skips them. The failure it blocks: a lever or
 marker name that only a hand-run check-levers caught.
 
+Two pre-reviews run at once; a third waits on a flock slot. device-dirs.txt is cached by the base sha, and the
+summary's context time starts after the pre-checks.
+
 `claude --version` runs first on a real review. A binary that is on PATH and does not answer is a broken install.
 
 Prints the verdict, the must-fix titles and where the output is (~/.cache/bloomery/pre-review/<branch>-<sha8>/).
@@ -185,7 +188,7 @@ def build_ctx(ctx, base_tree, base_sha, head, args, say):
             f.write("".join(f"#{i['number']} {i['title']}\n" for i in issues))
         else:
             say("pre-review: gh could not list the bot's open issues; open-issues.txt is empty")
-    device_dirs(base_tree, os.path.join(ctx, "device-dirs.txt"))
+    device_dirs(base_tree, os.path.join(ctx, "device-dirs.txt"), base_sha)
     ledger = read_ledger(base_tree, os.path.join(ctx, "ledger.md"))
     if ledger is None:
         say("pre-review: the slag ledger could not be read (gh); ledger.md is empty")
@@ -207,11 +210,34 @@ def build_ctx(ctx, base_tree, base_sha, head, args, say):
     return meta
 
 
-def device_dirs(base_tree, out):
+def device_dirs(base_tree, out, base_sha=None):
+    """post.py device, copied from the cache for this base sha when that file is already there."""
+    cache = base_sha and os.path.expanduser(f"~/.cache/bloomery-review/device-{base_sha}")
+    if cache and os.path.isfile(cache):
+        shutil.copy(cache, out)
+        return
     p = subprocess.run([sys.executable, os.path.join(base_tree, "tools/review/post.py"), "device", "--root", base_tree,
                         "--out", out], capture_output=True, text=True)
     if p.returncode:
         raise Stop(70, f"pre-review: post.py device failed: {p.stderr.strip()[:200]}")
+    if cache:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        shutil.copy(out, cache)
+
+
+def review_slot():
+    """One of two flock slots. A third pre-review blocks on the first until a holder finishes."""
+    d = os.path.expanduser("~/.cache/bloomery-review")
+    os.makedirs(d, exist_ok=True)
+    fds = [open(os.path.join(d, f"slot{i}"), "a") for i in (0, 1)]
+    for f in fds:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except BlockingIOError:
+            continue
+    fcntl.flock(fds[0], fcntl.LOCK_EX)
+    return fds[0]
 
 
 def read_ledger(base_tree, out):
@@ -369,6 +395,7 @@ def must_fix_titles(body):
 
 
 def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
+    slot = review_slot()  # held until this review returns
     if not stubbed and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
     if not stubbed:
@@ -404,11 +431,12 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
             say("pre-review: pre-checks skipped (--no-pre-checks)")
         else:
             pre_checks(os.path.join(d, "pr"), git("diff", "--name-only", "-z", f"{base_sha}...{head}").split("\0"), say)
+        t_pre = time.time()
         for x in ("ctx", "out", "trace"):
             os.makedirs(os.path.join(d, x))
         try:
             meta = build_ctx(os.path.join(d, "ctx"), os.path.join(d, "base"), base_sha, head, args, say)
-            t_ctx = time.time() - t0
+            t_ctx = time.time() - t_pre
             roles = ("reviewer", "validator") if args.full else ("reviewer",)
             for role in roles:
                 rc = run_role(role, d, args.minutes, say)
@@ -618,6 +646,62 @@ def self_test():
             globals()["NET_S"] = saved_net
             for k, v in saved_env.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    # two pre-reviews at once: a third waits until one slot frees
+    with tempfile.TemporaryDirectory() as t:
+        home = os.environ.get("HOME")
+        os.environ["HOME"] = t
+        held = []
+        try:
+            held = [review_slot(), review_slot()]
+            seen = []
+
+            def third():
+                review_slot()
+                seen.append(1)
+
+            th = threading.Thread(target=third)
+            th.start()
+            time.sleep(0.4)
+            waited = seen == []
+            held.pop(0).close()
+            th.join(5)
+            expect(waited and seen == [1] and not th.is_alive(),
+                   f"a third pre-review waits for a slot: waited {waited}, ran {seen}, alive {th.is_alive()}")
+        finally:
+            for f in held:
+                f.close()
+            if home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home
+    # device dirs are cached by the base sha: the second call at one sha does not run post.py again
+    with tempfile.TemporaryDirectory() as t:
+        home = os.environ.get("HOME")
+        os.environ["HOME"] = t
+        ran = []
+        real_run = subprocess.run
+
+        def wrapped(argv, *a, **k):
+            if len(argv) > 1 and str(argv[1]).endswith("post.py"):
+                ran.append(1)
+                open(argv[argv.index("--out") + 1], "w").write("crates/gpu/\n")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, *a, **k)
+
+        subprocess.run = wrapped
+        try:
+            outs = [os.path.join(t, n) for n in ("a", "b", "c")]
+            device_dirs(t, outs[0], "sha-a")
+            device_dirs(t, outs[1], "sha-a")
+            device_dirs(t, outs[2], "sha-b")
+            expect(ran == [1, 1] and open(outs[1]).read() == "crates/gpu/\n",
+                   f"device dirs run once per base sha: ran {len(ran)}, second {open(outs[1]).read()!r}")
+        finally:
+            subprocess.run = real_run
+            if home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home
     # a scratch repo end to end with a stub runner: CLEAN 0, MUST_FIX 1, a slow runner 75, no verdict 65
     with tempfile.TemporaryDirectory() as t:
         repo = os.path.join(t, "r")
@@ -655,7 +739,7 @@ def self_test():
         saved = {k: g[k] for k in ("gh_json", "device_dirs", "read_ledger")}
         # no network and no cargo here: gh answers nothing, the device list and the ledger are fixed
         g["gh_json"] = lambda *a: None
-        g["device_dirs"] = lambda base_tree, out: open(out, "w").write("crates/gpu\n")
+        g["device_dirs"] = lambda base_tree, out, base_sha=None: open(out, "w").write("crates/gpu\n")
         def fake_ledger(base_tree, out):
             open(out, "w").close()
             return "v0"
@@ -750,7 +834,7 @@ def self_test():
             wrapper = (f"import shutil, sys\nsys.path.insert(0, {HERE!r})\nimport local as L\nreal = shutil.which\n"
                        "shutil.which = lambda n, *a: '/x' if n == 'claude' else real(n, *a)\n"
                        "L.claude_ok = lambda: None\n"
-                       "L.gh_json = lambda *a: None\nL.device_dirs = lambda b, o: open(o, 'w').write('crates/gpu\\n')\n"
+                       "L.gh_json = lambda *a: None\nL.device_dirs = lambda b, o, s=None: open(o, 'w').write('crates/gpu\\n')\n"
                        "L.read_ledger = lambda b, o: (open(o, 'w').close(), 'v0')[1]\n"
                        "sys.exit(L.main(['--base', 'basebr', '--minutes', '5']))\n")
             proc = subprocess.Popen([sys.executable, "-c", wrapper], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -791,6 +875,18 @@ def self_test():
                 rc = e.code
             expect(rc == 0 and any("pre-checks skipped" in m for m in skipped),
                    f"--no-pre-checks skips a red pre-check and the review ends 0: {rc} {skipped}")
+            # context seconds start after the pre-checks: a slow check is not part of them
+            open(os.path.join(repo, "tools/check-levers.sh"), "w").write("sleep 1.2\nexit 0\n")
+            sh("git", "add", "-A")
+            sh("git", "commit", "-qm", "topic: a slow pre-check")
+            runner("**Verdict: CLEAN**: fine\n\n### Checked\nall")
+            buf = io.StringIO()
+            a = argparse.Namespace(base="basebr", full=False, minutes=10, body=None, no_pre_checks=False)
+            with contextlib.redirect_stdout(buf):
+                rc = review(a, stubbed=True, say=lambda m: None)
+            ctx_s = re.search(r"context (\d+) s", buf.getvalue())
+            expect(rc == 0 and ctx_s is not None and int(ctx_s.group(1)) == 0,
+                   f"context time starts after pre-checks: {buf.getvalue()!r}")
         finally:
             os.chdir(cwd)
             g.update(saved)
