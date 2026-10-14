@@ -862,6 +862,21 @@ inlog 'box.sh: any picks the card from $SIGNALBOX_CARD when the job starts' "$tm
 inlog 'box.sh: any exports the daemon'"'"'s card as BLOOMERY_BOX_CARD' "$tmp/boxq.job" 'BLOOMERY_BOX_CARD="\$SIGNALBOX_CARD" && '
 notinlog 'box.sh: any fixes no card on the Mac' "$tmp/boxq.job" 'BLOOMERY_BOX_CARD=(3090|a6000|any) '
 cp "$tmp/boxq.job" "$Q/any.job"
+# No lane named (default_lane): a command whose every device run is an `any`-form gpu-gate.sh call goes to lane any, and its
+# job's gate card is the daemon's pick; anything else stays on the 3090 pin.
+ANYG='BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh'
+for c in "cargo oxide build -- --bin a && $ANYG a" "bash tools/ref/real-only.sh g && cargo oxide build -- --bin a && $ANYG a && bash tools/gate.sh -p m"; do
+  rc_is "box.sh: no lane named, any-form gates only: '${c:0:40}…'" 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" "$c"
+  inlog "box.sh: … is lane any" "$tmp/boxq.args" '^any$'
+  inlog "box.sh: … its gate card is the daemon's" "$tmp/boxq.job" 'export BLOOMERY_GATE_CARD="\$SIGNALBOX_CARD" && '
+done
+for c in 'true' "cargo oxide build -- --bin g && bash tools/gpu-gate.sh g --place gate" "$ANYG a && bash tools/ref/dump.sh" \
+  "$ANYG a && bash tools/gate.sh --oxide -p bloomery-gpu" "$ANYG a && ./target/release/gate_x" "$ANYG a && cargo oxide test -p x"; do
+  rc_is "box.sh: no lane named, not only any-form gates: '${c:0:40}…'" 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" "$c"
+  inlog "box.sh: … stays on lane 3090" "$tmp/boxq.args" '^3090$'
+done
+rc_is 'box.sh: BLOOMERY_CARD=a6000 is its lane whatever the command' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_CARD=a6000 "$B/tools/box.sh" "cargo oxide build -- --bin a && $ANYG a"
+inlog 'box.sh: … lane a6000' "$tmp/boxq.args" '^a6000$'
 rc_is 'box.sh: BLOOMERY_Q_CARD=none' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=none "$B/tools/box.sh" true
 inlog 'box.sh: --card none' "$tmp/boxq.args" '^none$'
 inlog 'box.sh: none keeps the default card pin and BLOOMERY_BOX_CARD=3090' "$tmp/boxq.job" 'BLOOMERY_BOX_CARD=3090 && '

@@ -114,7 +114,8 @@
 #   are 81, 84 and 130/143 (see its header). A queued job has no stdin, and BLOOMERY_BOX_WAIT and
 #   BLOOMERY_HOLD_OWNER do not reach the daemon.
 #   BLOOMERY_Q_CLASS=lead|round|sitting|fill   the job's class, which sets its priority (default round)
-#   BLOOMERY_Q_CARD=3090|a6000|both|any|none   the lane (default BLOOMERY_CARD, else 3090; both set to
+#   BLOOMERY_Q_CARD=3090|a6000|both|any|none   the lane (default BLOOMERY_CARD, else default_lane below: any for a
+#                             command whose every device run is a gpu-gate.sh call in the `any` form, else 3090; both set to
 #                             different values: 64). `any` is the daemon's choice of a card: the card pick and
 #                             BLOOMERY_BOX_CARD then read $SIGNALBOX_CARD, which the daemon sets in the job's
 #                             environment. `none` holds no card and pins none beyond the default
@@ -255,6 +256,28 @@ def walk(rel):
 walk("")
 print(h.hexdigest()[:16])
 PY
+}
+
+# default_lane CMD: the queue lane of a call that names none. `any` when CMD runs device code only through gpu-gate.sh
+# calls in the `any` form (BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}), and every other script it names is one that
+# runs none, so either card's lock is the run's own; else 3090, the box's pin. A command it cannot read for certain stays
+# on 3090: the failure it blocks is the other way round, a fixture batch of `any` gates queued one after another on the
+# 3090's lane while the A6000 sits idle.
+default_lane() {
+  local c=$1 rest s
+  case $c in
+    *'cargo oxide run'* | *'cargo oxide test'* | *'cargo run'* | *'gate.sh --oxide'* | *target/release/* | *./target/*) echo 3090; return ;;
+  esac
+  rest=${c//'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh'/}
+  if [ "$rest" = "$c" ]; then echo 3090; return; fi
+  case $rest in *gpu-gate.sh*) echo 3090; return ;; esac
+  for s in $(grep -o 'tools/[A-Za-z0-9/_.-]*\.sh' <<< "$rest" || true); do
+    case $s in
+      tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/ref-paths.sh) ;;
+      *) echo 3090; return ;;
+    esac
+  done
+  echo any
 }
 
 # self_test [SCRIPT]: the hold's rules (the header) on a copy of SCRIPT (default: this file) in a scratch tree, under a fake HOME,
@@ -602,7 +625,11 @@ if [ "$QUEUE" = 1 ]; then
     3090 | a6000 | both) ;;
     *) echo "box.sh: BLOOMERY_CARD must be 3090, a6000 or both (BLOOMERY_Q_CARD also takes any and none)" >&2; exit 64 ;;
   esac
-  QLANE=${BLOOMERY_CARD:-3090}
+  if [ -n "${BLOOMERY_CARD:-}" ]; then
+    QLANE=$BLOOMERY_CARD
+  else
+    QLANE=$(default_lane "$*")
+  fi
   if [ -n "${BLOOMERY_Q_CARD:-}" ]; then
     case $BLOOMERY_Q_CARD in
       3090 | a6000 | both | any | none) ;;
