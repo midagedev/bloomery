@@ -3474,7 +3474,7 @@ mod gate {
     // context comes first, the experts fill what is left; the user approved D1/D2), so
     // the clause holds the line's word and the rung above, not the old margin rule's
     // terms; the refusal names the seats' common words. Was the two-slot margin rule
-    // (PIN 2026-10-05) and the one-slot refusal (PIN 2026-10-07).
+    // and the one-slot refusal of the two pins above it.
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;

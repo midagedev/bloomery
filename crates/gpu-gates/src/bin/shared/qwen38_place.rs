@@ -11,8 +11,8 @@ use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use model::arch::qwen35moe::place::{
     Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_bp_on, tier_batch,
 };
-use model::placement::ctx_ask::{Chosen, Probe};
 use model::placement::PlanLevers;
+use model::placement::ctx_ask::{Chosen, Probe};
 use model::placement::workstation::{CardSpec, DeviceInfo};
 
 /// The Qwen3.8 family's input to the common unset rule (`Place::choose`):

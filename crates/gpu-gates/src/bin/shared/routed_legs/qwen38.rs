@@ -95,7 +95,8 @@ fn serve_arm(inputs: &Arc<PlanInputs>) -> Result<Arm, Outcome> {
     })
     .map_err(|e| outcome_of(e.as_ref()))?;
     let ctx = chosen.slot_ctx;
-    let ub = ub_of(usize::try_from(ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?)?;
+    let ub =
+        ub_of(usize::try_from(ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?)?;
     let machine = machine(place, inputs, (ctx, ub), seqs)?;
     let unbudgeted = planned(inputs, &machine, ctx, &PlanLevers::default(), DEFAULT_SLOTS);
     let inputs = Arc::clone(inputs);

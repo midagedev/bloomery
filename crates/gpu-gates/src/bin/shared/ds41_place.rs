@@ -97,7 +97,10 @@ pub fn ctx_choice(
     choose_ctx(
         split,
         (set, slots.get()),
-        (Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")), None),
+        (
+            Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
+            None,
+        ),
         |c| -> Result<Probe<()>, GateError> {
             let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
             vision_seat::reserve_on(&mut machine, vision);

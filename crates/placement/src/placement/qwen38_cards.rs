@@ -14,8 +14,8 @@ use super::churn::ChurnPool;
 use super::workstation::{
     A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
     HostRead, MARGIN, MIB, PLAN_ROOM, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
-    TIER_BATCH_RESERVE, census_usable, host, plan_room, resolve,
-    tier_batch_host_bytes, tier_batch_staging_bytes,
+    TIER_BATCH_RESERVE, census_usable, host, plan_room, resolve, tier_batch_host_bytes,
+    tier_batch_staging_bytes,
 };
 use super::{
     ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, Device, KvBytes, Machine,
