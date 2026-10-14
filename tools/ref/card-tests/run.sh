@@ -776,8 +776,8 @@ inlog 'box.sh: the job is the command as it runs directly' "$tmp/boxq.job" "^\} 
 notinlog 'box.sh: the job has no guard' "$tmp/boxq.job" 'lease_guard|lease-probe'
 notinlog 'box.sh: the ssh of a queued call has no guard and no command' "$tmp/ssh.log" 'lease_guard|source ~/bloomery-env'
 inlog 'box.sh: the remote directory is made, and its id read, before the sync' "$tmp/ssh.log" '^-n stub mkdir -p ~/repo/x && \{ cat ~/repo/x/\.sync-id 2>/dev/null \|\| true; \}$'
-# The tree's id: the paths rsync sends, with mode, size, mtime and link target. One the remote directory already holds is not synced, so
-# jobs queued one after another from one tree all run; another id, or none, syncs as above.
+# The tree's id: the paths rsync sends, with mode, size, mtime, a regular file's bytes and a link's target. One the remote
+# directory already holds is not synced, so jobs queued one after another from one tree all run; another id, or none, syncs as above.
 TT=$tmp/idtree
 mkdir -p "$TT/src"
 printf 'a\n' > "$TT/src/a.rs"
@@ -796,6 +796,15 @@ idcase "a file's new mtime moves it" !=
 tid=$(bash "$B/tools/box.sh" --tree-id "$TT")
 chmod +x "$TT/src/a.rs"
 idcase "a file's new mode moves it" !=
+# Same length, the previous mtime put back: the bytes are in the id, so it still moves.
+tid=$(bash "$B/tools/box.sh" --tree-id "$TT")
+ns=$(python3 -c 'import os,sys; print(os.lstat(sys.argv[1]).st_mtime_ns)' "$TT/src/a.rs")
+printf 'b\n' > "$TT/src/a.rs"
+python3 -c 'import os,sys; ns=int(sys.argv[1]); os.utime(sys.argv[2], ns=(ns, ns))' "$ns" "$TT/src/a.rs"
+idcase "same-length bytes with the mtime put back move it" !=
+printf 'a\n' > "$TT/src/a.rs"
+python3 -c 'import os,sys; ns=int(sys.argv[1]); os.utime(sys.argv[2], ns=(ns, ns))' "$ns" "$TT/src/a.rs"
+idcase "the bytes restored, the mtime kept, is the same id" =
 id=$(bash "$B/tools/box.sh" --tree-id)
 run 'box.sh: a queued call on a tree the box holds is not synced, named' 0 "box.sh: ~/repo/x already holds this tree \\(sync-id $id\\): not synced" \
   box env BLOOMERY_BOX_QUEUE=1 STUB_SYNC_ID="$id" "$B/tools/box.sh" 'echo hi'

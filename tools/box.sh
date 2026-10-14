@@ -96,8 +96,9 @@
 #   (<key> the remote directory's name): rsync runs behind `flock -n -x`, so a tree a job is running in is
 #   never replaced under it. A sync that fails on that lock ends 83 naming it (the lock is probed once
 #   after a failed rsync: rsync's own code is 12 for a lock and a network fault alike). The tree's id
-#   (tree_id: a hash of every path rsync sends, with its type, mode, size, mtime and link target) goes along
-#   as the remote tree's .sync-id, from a temp dir (a file in the Mac tree would make every later command
+#   (tree_id: a hash of every path rsync sends, with its type, mode, size, mtime, link target and, for a
+#   regular file, its bytes) goes along as the remote tree's .sync-id, from a temp dir (a file in the Mac tree
+#   would make every later command
 #   `-dirty` and move the ledger keys that walk the tree): under the lock the old id is removed, rsync runs,
 #   and only a sync that ended 0 puts the new id in place. A remote directory whose .sync-id is already this
 #   tree's id is not synced at all, so jobs queued one after another from an unchanged tree all run (each
@@ -213,9 +214,10 @@ hold_cmd() {
 }
 
 # tree_id DIR: the id of the tree rsync sends from DIR (the queue's .sync-id), 16 hex digits: a sha256 over every path it
-# sends, sorted, with its type and mode, a file's size and mtime and a link's target, under rsync's excludes (a directory
-# named target or .git anywhere, and at the top /*.ptx, /*.ll and /.oxide-artifacts/). Equal ids mean equal trees; an
-# edit, a restore with another mtime, a new or removed file each give another id.
+# sends, sorted, with its type and mode, a file's size, mtime and bytes and a link's target, under rsync's excludes (a
+# directory named target or .git anywhere, and at the top /*.ptx, /*.ll and /.oxide-artifacts/). Equal ids mean equal
+# trees; an edit of the bytes or of the mtime, a new or removed file each give another id. A same-length edit whose
+# mtime is put back still moves the id, because the bytes are in it.
 tree_id() {
   python3 - "$1" << 'PY'
 import hashlib
@@ -230,15 +232,22 @@ h = hashlib.sha256()
 def walk(rel):
     for name in sorted(os.listdir(os.path.join(root, rel))):
         p = os.path.join(rel, name) if rel else name
-        st = os.lstat(os.path.join(root, p))
+        full = os.path.join(root, p)
+        st = os.lstat(full)
         isdir = stat.S_ISDIR(st.st_mode)
         if isdir and name in ("target", ".git"):
             continue
         if not rel and (name == ".oxide-artifacts" if isdir else name.endswith((".ptx", ".ll"))):
             continue
-        link = os.readlink(os.path.join(root, p)) if stat.S_ISLNK(st.st_mode) else ""
+        link = os.readlink(full) if stat.S_ISLNK(st.st_mode) else ""
         size, mtime = (0, 0) if isdir else (st.st_size, st.st_mtime_ns)
         h.update(("%s\0%o\0%d\0%d\0%s\n" % (p, st.st_mode, size, mtime, link)).encode("utf-8", "surrogateescape"))
+        # A regular file's bytes. Metadata alone collides: a same-length edit with the old mtime restored keeps the
+        # id, the sync is skipped, and a queued gate runs the source that was never sent.
+        if stat.S_ISREG(st.st_mode):
+            with open(full, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
         if isdir:
             walk(p)
 
