@@ -494,7 +494,7 @@ lease_out_clean() {
   return 0
 }
 lease_out_init() {
-  local cur
+  local cur exit_trap
   if [ -z "$LEASE_OUT_DIR" ]; then
     LEASE_OUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lease-out.XXXXXX") || return 70
     LEASE_OUT_FILE=$LEASE_OUT_DIR/out LEASE_OUT_FIFO=$LEASE_OUT_DIR/fifo
@@ -505,9 +505,9 @@ lease_out_init() {
   case $cur in
     *lease_out_clean*) ;;
     *)
-      eval "set -- ${cur#trap -- }"
+      eval "exit_trap=(${cur#trap -- })"
       # shellcheck disable=SC2064 # the runner's trap text now, to run again at exit
-      trap "${1:+$1; }lease_out_clean" EXIT
+      trap "${exit_trap[0]:+${exit_trap[0]}; }lease_out_clean" EXIT
       ;;
   esac
 }
