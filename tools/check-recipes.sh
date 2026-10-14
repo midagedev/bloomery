@@ -263,7 +263,9 @@ blk_gpugate() {
   echo "${ggt##*$'\n'}"
 }
 # stack-watch.sh (gpu-gate.sh's BLOOMERY_GATE_STACKS): output passed through, a quiet stub dumped and ended by
-# its comm among the spawned command's descendants only, a quiet command with no such process left alone.
+# its comm among the spawned command's descendants only, a quiet command with no such process left alone, a
+# TERM during a dump or the last wait ending the dump and the command before the watch returns, no dump after a
+# TERM.
 blk_stackwatch() { tool_selftest ref/stack-watch.sh; }
 # ptx-scan.sh's global load widths, legacy columns, entry boundaries and scan readers on synthetic PTX, no box.
 blk_ptxscan() { tool_selftest ptx-scan.sh; }
