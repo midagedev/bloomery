@@ -40,6 +40,15 @@ descendants() {
     }' <<< "$table"
 }
 
+# True while pid $1 runs: one that has ended and is not yet reaped (a zombie, state Z) has ended, and
+# its parent may never reap it.
+alive() {
+  local s
+  s=$(ps -o stat= -p "$1" 2> /dev/null) || return 1
+  s=${s#"${s%%[! ]*}"}
+  [ -n "$s" ] && [ "${s:0:1}" != Z ]
+}
+
 # The comm of pid $1 (the last path part: ps prints a path on some systems).
 comm_of() {
   local c
@@ -113,8 +122,8 @@ watch() {
       echo "stack-watch: no output for ${quiet} s: the stacks of $target ($comm), then TERM" >&2
       dump_stacks "$target"
       kill -TERM "$target" 2> /dev/null
-      for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$target" 2> /dev/null || break; sleep 1; done
-      kill -0 "$target" 2> /dev/null && kill -KILL "$target" 2> /dev/null
+      for _ in 1 2 3 4 5 6 7 8 9 10; do alive "$target" || break; sleep 1; done
+      alive "$target" && kill -KILL "$target" 2> /dev/null
       break
     fi
   done
@@ -130,7 +139,7 @@ watch() {
 # by its comm is dumped and ended; a quiet command with no such process is left to finish; a TERM during
 # a dump or during the last wait ends the dump and the command, and the watch returns after both, with the
 # command's code; after a TERM before the quiet time no dump starts; a TERM as the command starts ends it.
-# One line a case; exit 0 iff none failed.
+# One line a case, a failed one with the last line of what it read; exit 0 iff none failed.
 self_test() {
   local self t bad=0 out rc w k s left
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -139,7 +148,7 @@ self_test() {
   trap "rm -rf '$t'" EXIT
   case_() { # name, want rc, want pattern, rc, file
     if [ "$4" = "$2" ] && grep -Eq -- "$3" "$5"; then echo "ok     $1"; else
-      echo "FAIL   $1 (rc $4, want $2; output:)"; sed 's/^/         /' "$5"; bad=$((bad + 1))
+      echo "FAIL   $1 (rc $4, want $2; last line: $(tail -n 1 "$5"); output:)"; sed 's/^/         /' "$5"; bad=$((bad + 1))
     fi
   }
   rc=0; bash "$self" 3 sleep -- sh -c 'echo one; echo two >&2; exit 3' > "$t/a" 2>&1 || rc=$?
