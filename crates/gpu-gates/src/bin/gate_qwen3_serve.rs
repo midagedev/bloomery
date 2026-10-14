@@ -269,7 +269,7 @@
 //!   the same server, on either card: the default is a rung of the halving
 //!   ladder an unset `--ctx` asks — 262,144 or the file's trained context
 //!   (read by the seat's own `trained_ctx`), the lesser, then each half down
-//!   to a `CTX_GRAN` step while not under the base a slot (4096) — and either
+//!   to a `CTX_GRAN` step, the base a slot (4096) the last — and either
 //!   the first rung or one under a rung whose whole load does not fit (the
 //!   placed plan there was short too, which the `ctx` line's `halved` word
 //!   holds). The fit is the seat's own whole-fit line at the default — the
@@ -715,14 +715,15 @@ mod gate {
     }
 
     /// The rungs an unset `--ctx` asks a slot, in order: the target
-    /// ([`target_of`]), then each rung's half down to a [`CTX_GRAN`] step
-    /// while it is not under [`SEAT_FLOOR`].
+    /// ([`target_of`]), then each rung's half down to a [`CTX_GRAN`] step,
+    /// [`SEAT_FLOOR`] where the half falls under it, which is the last.
     fn rungs(trained: u64) -> Vec<u64> {
         let step = CTX_GRAN as u64;
-        let mut rungs = vec![target_of(trained)];
+        let target = target_of(trained);
+        let mut rungs = vec![target];
         while let Some(&last) = rungs.last() {
-            let next = last / 2 / step * step;
-            if next < SEAT_FLOOR {
+            let next = (last / 2 / step * step).max(SEAT_FLOOR.min(target));
+            if next == last {
                 break;
             }
             rungs.push(next);
