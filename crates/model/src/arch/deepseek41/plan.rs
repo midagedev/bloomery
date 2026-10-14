@@ -81,6 +81,10 @@ pub struct Planner {
     ctx_max: u32,
 }
 
+/// The most positions the port's i32 position type holds: a [`Planner`]'s cache past it is
+/// refused, and the seat's context limit is the trained context within it.
+pub const KERNEL_POSITIONS: u64 = i32::MAX as u64;
+
 impl Planner {
     /// The planner of the model `split` holds, for caches of `ctx_max` positions: the window,
     /// every layer's ratio and the engram n-gram length from `hp`, the file's [`Hparams`]; a
@@ -102,7 +106,7 @@ impl Planner {
 
     /// The planner of explicit values: a window of `window` positions, `layer_ratios[l]` the
     /// ratio of layer `l` (0: window only), `ngram` tokens per engram n-gram, and caches of
-    /// `ctx_max` positions — at least one, and few enough for the port's i32 positions.
+    /// `ctx_max` positions — at least one, and at most [`KERNEL_POSITIONS`].
     pub fn new(
         window: u32,
         layer_ratios: &[u32],
@@ -121,7 +125,7 @@ impl Planner {
         }
         let ctx_max = u32::try_from(ctx_max)
             .ok()
-            .filter(|&c| c > 0 && i32::try_from(c).is_ok())
+            .filter(|&c| c > 0 && u64::from(c) <= KERNEL_POSITIONS)
             .ok_or_else(|| {
                 PlanError::Layout(format!(
                     "a context of {ctx_max} positions: it holds at least one, and a position is an i32"

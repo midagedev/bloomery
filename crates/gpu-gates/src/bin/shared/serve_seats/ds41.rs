@@ -53,11 +53,11 @@
 //! a prompt that long is a 400 before it reaches the engine, and generation
 //! stops there with `truncated`. The context is the seats' common choice
 //! (`place::ctx_choice`, `generate::choose_ctx`): it comes first, the experts fill
-//! what is left. The limit is the file's trained context within the plan's
-//! i32 positions. Set, `--ctx` is the total the slots split (llama-server's
+//! what is left. The limit is the file's trained context within
+//! `plan::KERNEL_POSITIONS`. Set, `--ctx` is the total the slots split (llama-server's
 //! `-np` without `-kvu`); a share past the limit is refused by name, and one
 //! the machine cannot hold is refused with the largest share it holds,
-//! before the load. Unset, a slot asks the target (256K under the limit) and
+//! before the load. Unset, a slot asks the ladder's target under the limit and
 //! halves while the plan is short of the card, down to the floor; one `ctx`
 //! line on stderr names the rule. The image encoder stays on, and when
 //! its reserve lowers that rung the same line names the positions a slot gets

@@ -18,6 +18,7 @@ use bloomery_gpu_gates::vision_seat;
 use gguf::Split;
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::place::PlanInputs;
+use model::arch::deepseek41::plan::KERNEL_POSITIONS;
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::{Chosen, PlanRefusal, Probe};
 use model::placement::workstation::TierBatchBytes;
@@ -78,7 +79,7 @@ pub fn with_cards(
 
 /// A serving slot's context by the seats' common choice
 /// (`generate::choose_ctx`): the limit is the file's trained context within
-/// the plan's i32 positions, and a probe is the load's plan of every slot at
+/// [`KERNEL_POSITIONS`], and a probe is the load's plan of every slot at
 /// a slot context on `place`'s machine with `reserve` (the DSpark draft's),
 /// `tier_batch` and `vision` (the encoder's stage-card reserve), its refusal
 /// read for the memory it was short of. `set` is the total the slots split.
@@ -97,10 +98,11 @@ pub fn ctx_choice(
     choose_ctx(
         split,
         (set, slots.get()),
-        (
-            Some((u64::from(i32::MAX.unsigned_abs()), "i32 positions")),
-            None,
-        ),
+        // PIN(2026-10-15): V4.1's limit is the trained context within
+        // KERNEL_POSITIONS again, by the user's decision; the 32,768 cap of
+        // 2026-10-14 assumed the seat could not serve past it, and an unset
+        // context served 262,144 on two cards before it.
+        (Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")), None),
         |c| -> Result<Probe<()>, GateError> {
             let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
             vision_seat::reserve_on(&mut machine, vision);
