@@ -877,7 +877,8 @@ for c in 'true' "cargo oxide build -- --bin g && bash tools/gpu-gate.sh g --plac
   "$ANYG a && bash tools/gate.sh --oxide -p bloomery-gpu" "$ANYG a && ./target/release/gate_x" "$ANYG a && cargo oxide test -p x" \
   "$ANYG a && cargo oxide run -p x" "$ANYG a && cargo run --bin y" "$ANYG a && bash tools/gpu-gate.sh g --place gate" \
   "$ANYG a && target/debug/x" "export BLOOMERY_GATE_CARD=3090 && $ANYG a" "$ANYG a && cargo oxide${TAB}run -p x" \
-  "$ANYG a && cargo  run --bin y" "$ANYG a && bash tools/gate.sh  --oxide -p z" "$ANYG a && python3 tools/x.py"; do
+  "$ANYG a && cargo  run --bin y" "$ANYG a && bash tools/gate.sh  --oxide -p z" "$ANYG a && python3 tools/x.py" \
+  "$ANYG a && cargo +nightly-2026-08-28 oxide test --arch sm_86 -- -p bloomery-gpu --release --lib -- --include-ignored"; do
   rc_is "box.sh: no lane named, not only any-form gates: '${c:0:40}…'" 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" "$c"
   inlog "box.sh: … stays on lane 3090" "$tmp/boxq.args" '^3090$'
 done

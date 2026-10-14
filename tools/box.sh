@@ -269,7 +269,7 @@ PY
 # Plain cargo (`cargo test`, tools/gate.sh without --oxide) builds no device crate (AGENTS.md), so it holds no card.
 default_lane() {
   local c=$1 rest s kv gate_card=
-  local device_run='cargo[[:space:]]+(oxide[[:space:]]+(run|test)|run)|gate[.]sh[[:space:]]+--oxide'
+  local device_run='cargo[[:space:]]+([+-]|oxide[[:space:]]+(run|test)|run)|gate[.]sh[[:space:]]+--oxide'
   # the job exports BLOOMERY_BOX_ENV in order, so its last BLOOMERY_GATE_CARD entry is the card the gates see
   for kv in ${box_env[@]+"${box_env[@]}"}; do
     [ "${kv%%=*}" != BLOOMERY_GATE_CARD ] || gate_card=$kv
