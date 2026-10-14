@@ -103,7 +103,7 @@ const BLOCK: usize = WARPS * 32;
 /// Channels one warp walks.
 const CH_PER_WARP: usize = 4;
 /// Channels of one head a block takes.
-pub const CH_PER_BLOCK: usize = WARPS * CH_PER_WARP;
+const CH_PER_BLOCK: usize = WARPS * CH_PER_WARP;
 /// Shared f32s a block stages: its group's `B` and `C`, then its `x`.
 const STAGED: usize = 2 * STATE + CH_PER_BLOCK;
 

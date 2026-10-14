@@ -485,6 +485,34 @@ pub fn verdict(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
 }
 
+/// A seeded xorshift64 stream for a gate's synthetic inputs: the same seed
+/// draws the same values on every run.
+pub struct GateRng(pub u64);
+
+impl GateRng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// A draw in `[0, 1)`: the high 24 bits over `2^24`.
+    pub fn unit(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// A draw below `n` (`n > 0`).
+    pub fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    /// A draw in `[lo, hi)`.
+    pub fn uni(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * self.unit()
+    }
+}
+
 /// The values of `v` with a comma between each two — how a gate's line
 /// prints a list of positions, rows or slots.
 pub fn comma_list(v: &[impl ToString]) -> String {

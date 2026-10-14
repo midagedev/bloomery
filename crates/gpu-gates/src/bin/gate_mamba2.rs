@@ -130,21 +130,7 @@ mod gate {
     /// The dropped second-order terms (module doc).
     const SECOND_ORDER: f64 = 1.0 + 1e-4;
 
-    /// A fixed xorshift64 stream.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        /// Uniform in `[lo, hi)`.
-        fn uni(&mut self, lo: f32, hi: f32) -> f32 {
-            let u = (self.next() >> 40) as f32 / (1u64 << 24) as f32;
-            lo + (hi - lo) * u
-        }
-    }
+    use bloomery_gpu_gates::GateRng as Rng;
 
     /// Which inputs the weights and tokens come from (module doc, clauses 1
     /// and 2).
@@ -554,12 +540,7 @@ mod gate {
 
     /// The host token stage by stage, the composition `step_token` is, with
     /// the intermediates kept. Its `y` must be `step_token`'s.
-    fn trace_run(
-        w: &Weights,
-        init: &Init,
-        toks: &[TokenIn],
-        norm: bool,
-    ) -> Result<Vec<Trace>, GateError> {
+    fn trace_run(w: &Weights, init: &Init, toks: &[TokenIn]) -> Result<Vec<Trace>, GateError> {
         let g = geom()?;
         let (mut conv, mut scan) = (init.conv.clone(), init.scan.clone());
         let mut out = Vec::new();
@@ -595,9 +576,7 @@ mod gate {
             let y2 = y.clone();
             let mut sz = vec![0.0; INNER];
             qdot::swiglu(&t.z, &vec![1.0; INNER], &mut sz);
-            if norm {
-                mamba2::grouped_rms(&mut y, &w.norm, GROUPS, EPS)?;
-            }
+            mamba2::grouped_rms(&mut y, &w.norm, GROUPS, EPS)?;
             out.push(Trace {
                 s_before,
                 s_after: scan.clone(),
@@ -617,7 +596,7 @@ mod gate {
 
     /// The bands (module doc): per token the bound on each output value, and
     /// the bound on each final state element.
-    fn bands(w: &Weights, trace: &[Trace], norm: bool) -> (Vec<Vec<f64>>, Vec<f64>) {
+    fn bands(w: &Weights, trace: &[Trace]) -> (Vec<Vec<f64>>, Vec<f64>) {
         let mut e = vec![0.0f64; INNER * STATE];
         let mut per_token = Vec::new();
         for tr in trace {
@@ -657,31 +636,26 @@ mod gate {
                 let d1 = dy[i] + EPS_F * f64::from(tr.y1[i]).abs();
                 d2[i] = f64::from(tr.sz[i]).abs() * d1 + EPS_F * f64::from(tr.y2[i]).abs();
             }
-            if norm {
-                for g in 0..GROUPS {
-                    let r = g * WIDTH..(g + 1) * WIDTH;
-                    let m = r
-                        .clone()
-                        .map(|i| f64::from(tr.y2[i] * tr.y2[i]))
-                        .sum::<f64>()
-                        / WIDTH as f64;
-                    let cross = r
-                        .clone()
-                        .map(|i| f64::from(tr.y2[i]).abs() * d2[i])
-                        .sum::<f64>()
-                        / WIDTH as f64;
-                    let sq = r.clone().map(|i| d2[i] * d2[i]).sum::<f64>() / WIDTH as f64;
-                    let dm = 2.0 * cross + sq + 2.0 * EPS_F * m;
-                    let scale = 1.0 / (m + f64::from(EPS)).sqrt();
-                    let ds = dm / (2.0 * (m + f64::from(EPS))) + 3.0 * EPS_F;
-                    for i in r {
-                        let o = f64::from(tr.out[i]).abs();
-                        band[i] =
-                            o * (ds + 2.0 * EPS_F) + scale * f64::from(w.norm[i]).abs() * d2[i];
-                    }
+            for g in 0..GROUPS {
+                let r = g * WIDTH..(g + 1) * WIDTH;
+                let m = r
+                    .clone()
+                    .map(|i| f64::from(tr.y2[i] * tr.y2[i]))
+                    .sum::<f64>()
+                    / WIDTH as f64;
+                let cross = r
+                    .clone()
+                    .map(|i| f64::from(tr.y2[i]).abs() * d2[i])
+                    .sum::<f64>()
+                    / WIDTH as f64;
+                let sq = r.clone().map(|i| d2[i] * d2[i]).sum::<f64>() / WIDTH as f64;
+                let dm = 2.0 * cross + sq + 2.0 * EPS_F * m;
+                let scale = 1.0 / (m + f64::from(EPS)).sqrt();
+                let ds = dm / (2.0 * (m + f64::from(EPS))) + 3.0 * EPS_F;
+                for i in r {
+                    let o = f64::from(tr.out[i]).abs();
+                    band[i] = o * (ds + 2.0 * EPS_F) + scale * f64::from(w.norm[i]).abs() * d2[i];
                 }
-            } else {
-                band.copy_from_slice(&d2);
             }
             for b in &mut band {
                 *b *= SECOND_ORDER;
@@ -719,14 +693,14 @@ mod gate {
         let toks: Vec<TokenIn> = (0..TOKENS).map(|_| token(Regime::Band, &mut r)).collect();
         let ring0 = ring_of(&st, P0, false);
         let want = host_run(&w, &st, &toks, true)?;
-        let trace = trace_run(&w, &st, &toks, true)?;
+        let trace = trace_run(&w, &st, &toks)?;
         // The referee's composition is step_token.
         let mut referee = true;
         for (tr, y) in trace.iter().zip(&want.y) {
             referee &= bits_equal(&tr.out, y);
         }
         referee &= bits_equal(&trace[TOKENS - 1].s_after, &want.scan);
-        let (y_bands, s_band) = bands(&w, &trace, true);
+        let (y_bands, s_band) = bands(&w, &trace);
         let mut dev = Dev::new(cx, &w)?;
         let got = dev_run(cx, &mut dev, &ring0, &st, &toks, P0, true)?;
         let mut ok = referee;

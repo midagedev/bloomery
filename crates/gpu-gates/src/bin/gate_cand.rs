@@ -86,23 +86,7 @@ mod gate {
         f32::from_bits(POISON)
     }
 
-    /// A fixed xorshift64 stream.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-        /// A value in `[0, 1)`.
-        fn unit(&mut self) -> f32 {
-            (self.next() >> 40) as f32 / (1u64 << 24) as f32
-        }
-    }
+    use bloomery_gpu_gates::GateRng as Rng;
 
     // ------------------------------------------------------------ the rules
     //
