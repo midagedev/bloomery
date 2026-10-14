@@ -55,20 +55,21 @@ def rows_of(lines):
 
 
 def line_index(text):
-    """The same grouping as rows_of, plus each glob's 1-based line numbers."""
-    rows, at, order = {}, {}, []
-    for n, line in enumerate(text.splitlines(), 1):
-        if not is_row(line):
-            continue
-        fields = tuple(line.split("\t"))
-        glob = fields[0]
-        if glob not in rows:
-            rows[glob] = []
-            at[glob] = []
-            order.append(glob)
-        rows[glob].append(fields)
-        at[glob].append(n)
+    """The rows_of grouping, plus each glob's 1-based line numbers."""
+    lines = text.splitlines()
+    rows, order, _ = rows_of(lines)
+    at = {glob: [] for glob in order}
+    for n, line in enumerate(lines, 1):
+        if is_row(line):
+            at[line.split("\t", 1)[0]].append(n)
     return rows, at, order
+
+
+def same_rows(got, want):
+    """One glob's emitted rows against its decision: the rows in order, each row's gates as a set (a side's own gate
+    order is not a change), the other fields as they are."""
+    norm = lambda rows: [(r[0], frozenset(r[1].split()) if len(r) > 1 else frozenset(), tuple(r[2:])) for r in rows]
+    return norm(got) == norm(want)
 
 
 def pick(base, ours, theirs):
@@ -236,6 +237,16 @@ def driver(base, ours, theirs):
         left = text.count(OURS_M) or 1
     else:
         text, left = merge_text(p.stdout) if p.returncode else (p.stdout, 0)
+    if not left:
+        # The one invariant, whichever path made the text: every glob's rows are what decide() chose for it. A text merge
+        # that kept a row a side deleted, or moved a duplicate's member past the hunk that holds the other, fails it.
+        got, _, _ = line_index(text)
+        mismatched = [g for g in globs if not same_rows(got.get(g, ()), decide(rb.get(g, ()), ro.get(g, ()), rt.get(g, ())))]
+        if mismatched:
+            b, o, t = (s if s.endswith("\n") else s + "\n" for s in texts)
+            text = "<<<<<<< ours\n%s||||||| base\n%s=======\n%s>>>>>>> theirs\n" % (o, b, t)
+            left = 1
+            reason = "the merged rows of %s differ from the three-way decision" % ", ".join(mismatched)
     with open(ours, "w") as f:
         f.write(text)
     if left:
@@ -333,6 +344,18 @@ def self_test():
         ("a duplicate glob deleted on one side and edited on the other",
          dup, head + "b/*.rs\tgate-z\twhy b\n", theirs_a, 1, None,
          "glob a/*.rs (ours line none, base line 3 4, theirs line 3 4)"),
+        # A duplicate's member that ours moves and theirs deletes: git and the hunks merge it clean with both rows back,
+        # and only the final check against the decision (theirs' one row) leaves it a conflict.
+        ("a moved duplicate member versus deletion",
+         head + "a/*.rs\tgate-x\twhy1\nb/*.rs\tgate-z\twhy b\na/*.rs\tgate-y\twhy2\n",
+         head + "b/*.rs\tgate-z\twhy b\na/*.rs\tgate-x\twhy1\na/*.rs\tgate-y\twhy2\n",
+         head + "b/*.rs\tgate-z\twhy b\na/*.rs\tgate-y\twhy2\n",
+         1, None, None),
+        # A side's own gate order is not a change: theirs alone reorders a row's gates and adds one; the clean text merge
+        # (theirs' line) passes the final check that compares gates as sets.
+        ("one side reorders a row's gates and adds one",
+         base, base, base.replace("gate-x gate-y\twhy a", "gate-t gate-y gate-x\twhy a"), 0,
+         base.replace("gate-x gate-y\twhy a", "gate-t gate-y gate-x\twhy a"), None),
     ]
     fails, n = 0, 0
 
