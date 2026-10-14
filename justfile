@@ -114,6 +114,12 @@ mac-locks *ARGS:
 contrib-check *ARGS:
     ./tools/contrib-check.sh {{ARGS}}
 
+# Before a push: Shingler's reviewer on this machine, on the committed HEAD against origin/main, under your own Claude
+# login (`--full` adds the validator, `--minutes N` bounds a role, default 10). Exit 0 CLEAN, 1 MUST_FIX, 75 no verdict.
+# Nothing is posted; the pull request's own review stays the review of record. The owner is tools/review/local.py.
+pre-review *ARGS:
+    python3 tools/review/local.py {{ARGS}}
+
 # 레시피 자체의 점검(맥, grep뿐). 게이트 줄의 `||`는 종료 코드를 삼킨다 — tools/check-recipes.sh 머리말.
 check-recipes:
     ./tools/check-recipes.sh
