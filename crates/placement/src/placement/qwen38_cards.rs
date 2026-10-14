@@ -1733,3 +1733,104 @@ fn the_host_room_lever_reads_bytes_or_is_refused_by_name() {
         );
     }
 }
+
+/// The Qwen3.8 seat's drafted plan (`fixed` the draft's card bytes, its
+/// store 2,048 B a position) or its plain one (`fixed` none) on a DGX Spark
+/// (`free` the census's pool, `room` `MemAvailable`) at `ctx` positions for
+/// the default slot, the card rule's, then the PLE table's tier (kept on the
+/// host only beside two saved states) and the NVMe expert tier: whether it
+/// holds, or the memory it is short of.
+fn spark_holds(
+    model: &ModelTensors,
+    (free, room): (u64, u64),
+    ctx: u64,
+    fixed: Option<u64>,
+) -> Result<super::ctx_ask::Probe<()>, PlacementError> {
+    let spec = super::workstation::gb10(free);
+    let mut machine = machine_a(spec);
+    *machine.host_mut() = super::workstation::host_of(&spec);
+    *machine.unified_mut() = super::workstation::unified_of(&spec);
+    machine
+        .host_mut()
+        .reserves
+        .push(("checkpoints".to_string(), 4 << 30));
+    let terms = SeqTerms {
+        layers: Stores {
+            kv: &Kv38,
+            count: LAYERS,
+        },
+        draft: None,
+        beside: BESIDE,
+    };
+    let rows = terms.plan_beside(1);
+    let kv = terms.slots_of(1);
+    let draft = fixed.map_or(0, |f| f + 2048 * ctx);
+    let planned = plan_routed_reserving(
+        model,
+        &machine,
+        ctx,
+        &kv,
+        &PlanLevers::default(),
+        routed_rule(Program::Qwen38Body),
+        rows + draft,
+    )
+    .and_then(|mut plan| {
+        let floor = 2 * state38(ctx, fixed.is_some());
+        super::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
+        super::expert_nvme_tier(&mut plan, room, None)?;
+        plan.cards[0].grow_kv(rows);
+        Ok(plan)
+    });
+    match planned {
+        Ok(plan) if plan.violations().is_empty() => Ok(super::ctx_ask::Probe::Holds(())),
+        Ok(plan) => panic!("ctx {ctx}: {:?}", plan.violations()),
+        Err(e) => e.card_short().map(super::ctx_ask::Probe::Short).ok_or(e),
+    }
+}
+
+/// The Qwen3.8 seat's default on a DGX Spark with no flag, both files at
+/// their own readings (the census's free pool, `MemAvailable`): the ladder's
+/// target, 262,144 positions for the one default slot, with the draft on —
+/// the drafted plan holds the target, so the draft costs no position and does
+/// not yield. The prompt cache's budget does not lower it: the cache keeps
+/// what its budget holds at that context.
+///
+/// PIN(2026-10-14): the default is the seats' ladder (ctx-first, the user approved
+/// D1, D5 and D6). UD-Q4 was 131,072, the first rung whose saved state the
+/// cache's default budget held; UD-Q3 stays 262,144.
+#[test]
+fn a_spark_defaults_to_the_ladders_target() {
+    use super::ctx_ask::{Ask, DEFAULT_SLOTS, Limit, Rule, Steps, choose};
+    // The draft's fixed card bytes close each file's need at 262,144
+    // [derived: the need less every other term]; UD-Q3's is 68,736 B more, the
+    // draft borrowing the target's output matrix.
+    for (q3, free, room, fixed) in [
+        (true, 125_309_718_528, 125_124_673_536, 2_839_606_572_u64),
+        (false, 125_394_333_696, 125_111_492_608, 2_839_537_836),
+    ] {
+        let model = model(q3);
+        let limit = Limit {
+            positions: 262_144,
+            source: "trained",
+        };
+        let steps = Steps {
+            floor: 4096,
+            step: 1024,
+        };
+        let pick = |fixed: Option<u64>| {
+            choose(Ask::Default, DEFAULT_SLOTS, limit, steps, |c| {
+                spark_holds(&model, (free, room), c, fixed)
+            })
+            .expect("a Spark default")
+        };
+        for fixed in [Some(fixed), None] {
+            let chosen = pick(fixed);
+            assert_eq!(
+                (chosen.slot_ctx, chosen.rule),
+                (262_144, Rule::Target),
+                "q3 {q3}, drafted {}",
+                fixed.is_some()
+            );
+        }
+    }
+}
