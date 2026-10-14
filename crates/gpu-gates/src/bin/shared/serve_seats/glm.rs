@@ -914,7 +914,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 .as_ref()
                 .expect("a drafted load read the NextN layer")
                 .card_bytes(u64::try_from(plain.ctx)?, slots)?;
-            match bloomery_levers::DraftYield::of(with, plain.ctx, plain.ctx, bytes) {
+            match bloomery_levers::DraftYield::of(with, plain.ctx, bytes) {
                 Some(y) => {
                     let said = record::draft_yield(&y);
                     (plain, Some(y.to_string()), Some(said))

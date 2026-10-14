@@ -208,14 +208,12 @@
 //! total under 5 a slot), each printed as a `load draft=off (<why>)` record
 //! after the `load` line (`no file at <path>[, <path>…]`, every place the pick looked), never a
 //! refusal; `BLOOMERY_DRAFT=mtp` set with stores that short is refused by
-//! name before the plan. Unset with the ctx rule's own
-//! default, the draft then yields to the context
-//! (`bloomery_levers::DraftYield::of`, below at the search): it goes off
-//! when the plan with it leaves a slot under the base the plain rule aims
-//! for, one `draft yield` record naming its card bytes, the positions a
-//! slot gets either way and the base, and the plain rule's `ctx` line
-//! following; `BLOOMERY_DRAFT=mtp` set never yields, and a set
-//! `--ctx-size` keeps today's answer. `BLOOMERY_DRAFT=off` is the plain
+//! name before the plan. Unset, the draft then yields to the context
+//! (`bloomery_levers::DraftYield::of`, at [`ctx38`]'s caller): it goes off
+//! when the plan with it leaves a slot fewer positions than the plan
+//! without it, a set `--ctx-size` included, one `draft yield` record naming
+//! its card bytes and the positions a slot gets either way, and the plain
+//! plan's `ctx` line following; `BLOOMERY_DRAFT=mtp` set never yields. `BLOOMERY_DRAFT=off` is the plain
 //! path with the same record; `mtp` drafts wherever the draft loads. The
 //! CLI's `--logits` condition has no seat equivalent: a request that reads
 //! the logits row steps plainly. The route trace's condition is the seat's
@@ -358,7 +356,7 @@ use model::arch::qwen35moe::place::{
 use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{CardSpec, HostNeed, HostRead, host_available_read};
-use model::placement::{Machine, PlacementError, Plan, PlanLevers};
+use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file, draft_places};
 use runtime::Target as _;
@@ -734,7 +732,7 @@ pub(crate) fn refuse_feed(
 /// refuses a set `mtp` at `MtpInputs::read`); and, drafting nothing, why (the
 /// `load draft=off` record's). This is the rule before the plan: the unset
 /// draft's yield to the context (`bloomery_levers::DraftYield::of`, the
-/// module doc) is decided after the context search, at the caller. The V4.1
+/// module doc) is decided after the context choice, at the caller. The V4.1
 /// words and any other are refused by name.
 ///
 /// The rule's run conditions as the seat meets them: no `--logits` (a
@@ -783,53 +781,6 @@ fn draft38(
             })
         }
     }
-}
-
-/// The default slot count's plan, refused because the host room is under the
-/// NVMe expert tier's floor, answered by the one-column rule's own plan: the
-/// asked slots' plan at one position — its refusal the floor's
-/// ([`floor_refused`]) — and the arena of the one-slot plan with no draft,
-/// which the rule loads
-/// (`one`), when that plan pages (an arena past 0: the rule's own condition;
-/// a plan with none serves as asked, so the refusal stands for [`ctx38`] to
-/// name). The floor counts every slot's checkpoints ([`reserve_checkpoints`]),
-/// so a room between the one-slot floor and the asked slots' is one only the
-/// one-slot plan clears. That one slot is the room's, so it holds under
-/// `--place bp` too, where the one-column rule alone keeps every slot. Any
-/// other refusal of the asked plan is `ctx38`'s, and a one-slot plan that is
-/// refused too is named by the context search of `one`.
-fn floor_fallback(
-    asked: &Plans<'_>,
-    set: Option<(Residency, &str)>,
-) -> Result<Option<u64>, GateError> {
-    let Err(refused) = asked.holds(1) else {
-        return Ok(None);
-    };
-    if !floor_refused(&refused) {
-        return Ok(None);
-    }
-    let one = Plans {
-        mtp: None,
-        slots: 1,
-        ..*asked
-    };
-    let rule = ctx38(&one, None)?;
-    let arena = one.host(rule.ctx, set)?.2;
-    Ok((arena > 0).then_some(arena))
-}
-
-/// Whether `refused`, the asked slots' refusal as [`Plans::holds`]
-/// hands it back, is the NVMe expert tier floor's, matched by type through
-/// its [`PlaceError`]: [`PlacementError::HostRoomFloor`], or on a unified
-/// pool [`PlacementError::PoolBudget`] (the card budget lowered toward the
-/// floor and still refused).
-pub(crate) fn floor_refused(refused: &GateError) -> bool {
-    matches!(
-        refused.downcast_ref::<PlaceError>(),
-        Some(PlaceError::Placement(
-            PlacementError::HostRoomFloor { .. } | PlacementError::PoolBudget { .. },
-        ))
-    )
 }
 
 /// The residency the load of `plan` at `place` runs: `set` (the word and
@@ -1317,15 +1268,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let reduced = |arena: u64,
                    (slots, served): (usize, usize),
                    mtp: bool,
-                   draft_off: Option<Draft38Off>,
-                   floor: bool| {
+                   draft_off: Option<Draft38Off>| {
         let at = paged_at(arena, slots, mtp);
         let asked_on = at.asked_draft(draft_off.as_ref());
         let (drafts, draft_off) = bloomery_levers::paged_draft(&at, draft_off);
         eprintln!(
             "paged rule=reduced arena={arena} asked_slots={slots} asked_draft={} \
              slots={served} draft={} (the plan pages host experts through the NVMe tier's RAM \
-             arena; {}{})",
+             arena; {})",
             if asked_on { "on" } else { "off" },
             if drafts { "on" } else { "off" },
             if served < slots {
@@ -1333,11 +1283,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                  experts would hold, and a later budget rule prices that trade"
             } else {
                 "a set count is served as one pass over the arena"
-            },
-            if floor {
-                "; the asked slots' plan leaves the room under the tier's floor"
-            } else {
-                ""
             }
         );
         (
@@ -1372,7 +1317,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (slots, from, mtp, head, draft_off) = match paged(early, slots, mtp) {
         Paged::AsAsked => (slots, from, mtp, head, draft_off),
         Paged::Reduced { slots: served } => {
-            let (from, drafts, draft_off) = reduced(early, (slots, served), mtp, draft_off, false);
+            let (from, drafts, draft_off) = reduced(early, (slots, served), mtp, draft_off);
             if !drafts {
                 mtp_inputs = None;
             }
@@ -1384,45 +1329,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 draft_off,
             )
         }
-    };
-    // A default count whose plan the room leaves under the tier's floor
-    // ([`floor_fallback`]) falls to one slot, and no draft where unset, on
-    // the plan that pages. The one slot is the room's, not a column's, so it
-    // holds beside a tier card too, where each slot steps alone and the
-    // column rule keeps them (`bloomery_levers::paged_floor`).
-    let floor = if from == SlotsFrom::Default && slots > 1 {
-        let asked = Plans {
-            inputs: &inputs,
-            place: a.place,
-            experts,
-            levers: &plan_levers,
-            mtp: mtp_inputs.as_ref(),
-            slots,
-            feed,
-        };
-        floor_fallback(&asked, set)?
-    } else {
-        None
-    };
-    let (slots, from, mtp, head, draft_off) = match floor {
-        Some(arena) => match bloomery_levers::paged_floor(&paged_at(arena, slots, mtp)) {
-            Paged::AsAsked => (slots, from, mtp, head, draft_off),
-            Paged::Reduced { slots: served } => {
-                let (from, drafts, draft_off) =
-                    reduced(arena, (slots, served), mtp, draft_off, true);
-                if !drafts {
-                    mtp_inputs = None;
-                }
-                (
-                    served,
-                    from,
-                    drafts,
-                    if drafts { head } else { None },
-                    draft_off,
-                )
-            }
-        },
-        None => (slots, from, mtp, head, draft_off),
     };
     let drafted = Plans {
         inputs: &inputs,
@@ -1453,7 +1359,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 .as_ref()
                 .expect("a drafted choice held the draft")
                 .card_bytes_of(u64::try_from(plain.ctx)?, slots)?;
-            match bloomery_levers::DraftYield::of(with, plain.ctx, plain.ctx, bytes) {
+            match bloomery_levers::DraftYield::of(with, plain.ctx, bytes) {
                 Some(y) => {
                     record::draft_yield(&y).eprint();
                     (plain_plans, plain, false, None, Some(Draft38Off::Yield(y)))
@@ -1476,7 +1382,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             (slots, from, mtp, head, draft_off, host)
         }
         Paged::Reduced { slots: served } => {
-            let (from, drafts, draft_off) = reduced(host.2, (slots, served), mtp, draft_off, false);
+            let (from, drafts, draft_off) = reduced(host.2, (slots, served), mtp, draft_off);
             let one = Plans {
                 mtp: if drafts { plans.mtp } else { None },
                 slots: served,

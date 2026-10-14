@@ -1,7 +1,7 @@
 residency lever residency=mid-p3-s1 why=set
 place unset place=a why=one card
 plan place=a card=3090 experts=card ctx_max=8192 host_experts=5427 card_experts=4813 n_l=120-121 card_free=25052381184 devices=[stage:3090:cuda0:25350373376] cuda_order=unset(FASTEST_FIRST)
-ctx rule=set ctx=8192 slots=1 total=8192 card_expert_bytes=20132659200
+ctx rule=set ctx=8192 slots=1 total=8192 limit=262144 (trained)
 parallel rule=slots slots=1 slot_ctx=8192 total=8192 from=ctx pass=one
 cache ram=4294967296 rule=default available=68719476736 read=meminfo need=12884901888 pool=0 tier=0 paged=107374182400 checkpoints=0 message_start=<|im_start|> in_vocab=true in_template=true
 lane card=3090 bytes=268435456 gbs_median=24.61 gbs_min=24.02 pinned=true

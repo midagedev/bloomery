@@ -2908,8 +2908,8 @@ pub static DRAFT_UNSET_GLM: Kind = Kind {
 
 /// An unset MTP draft yielding to the context
 /// ([`bloomery_levers::DraftYield`]): the card bytes it reserves at the
-/// context it denied, the positions a slot gets with it and without it,
-/// and the base the ctx rule aims for. The seats print it where the
+/// context it denied, and the positions a slot gets with it and without
+/// it. The seats print it where the
 /// decision closed, before the `ctx` line it produced; only a load that
 /// yields prints one.
 pub static DRAFT_YIELD: Kind = Kind {
@@ -2917,12 +2917,11 @@ pub static DRAFT_YIELD: Kind = Kind {
     head: "draft yield",
     doc: "An unset MTP draft yielding to the context, before the ctx line of the plain rule it \
           fell to: the draft's card bytes at the context it denied, the positions a slot gets \
-          with the draft and without it, and the base the ctx rule aims for.",
+          with the draft and without it.",
     parts: &[
         key("card_bytes", U64, "B"),
         key("with", U64, "positions"),
         key("without", U64, "positions"),
-        key("base", U64, "positions"),
     ],
 };
 
@@ -4007,7 +4006,6 @@ pub fn draft_yield(y: &bloomery_levers::DraftYield) -> Record {
         .u("card_bytes", y.card_bytes)
         .u("with", y.with as u64)
         .u("without", y.without as u64)
-        .u("base", y.base as u64)
 }
 
 /// A round of several slots' record ([`SLOTS_ROUND`]): `cmd` the command the

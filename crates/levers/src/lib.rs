@@ -1988,21 +1988,17 @@ pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
 }
 
 /// An unset draft's yield to the context, the numbers its record prints:
-/// the card bytes the draft reserves at the context it denied, the
-/// positions a slot gets with the draft and without it, and the base the
-/// ctx rule aims for — the rule's own constant, or the plan's fit when the
-/// file's serving cap holds under it (the `ctx` line's `base_at`). One
-/// owner of the comparison for Qwen3.8 and GLM-5.3's seats; its `Display`
-/// is the `load draft=off` record's why for the yield.
+/// the card bytes the draft reserves at the context it denied, and the
+/// positions a slot gets with the draft and without it. One owner of the
+/// comparison for Qwen3.8 and GLM-5.3's seats; its `Display` is the `load
+/// draft=off` record's why for the yield.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DraftYield {
-    /// The positions a slot gets with the draft: the drafted rule's own
-    /// context, its search's fit when that sits under the base.
+    /// The positions a slot gets with the draft: the drafted choice's
+    /// context, 0 when it holds not even the ladder's floor.
     pub with: usize,
-    /// The positions a slot gets without it: the plain rule's own context.
+    /// The positions a slot gets without it: the plain choice's context.
     pub without: usize,
-    /// The base the ctx rule aims for.
-    pub base: usize,
     /// The draft's card bytes at `with` — the plan's reserve, the number
     /// the drafted plan counted (Qwen3.8's `MtpInputs::card_bytes_of`;
     /// GLM-5.3's NextN card bytes with its arena).
@@ -2011,17 +2007,15 @@ pub struct DraftYield {
 
 impl DraftYield {
     /// The unset draft yields to the context when the plan with it leaves a
-    /// slot under the base the ctx rule without it aims for: `with` under
-    /// `base`, and under `without` — a draft that denies no position (a
-    /// file whose serving cap binds both rules to the same context) stays
-    /// on. `None` keeps the draft. A set `BLOOMERY_DRAFT=mtp` never asks:
-    /// the seat runs it as given.
+    /// slot fewer positions than the plan without it: `with` under
+    /// `without` — a draft that denies no position stays on. `None` keeps
+    /// the draft. A set `BLOOMERY_DRAFT=mtp` never asks: the seat runs it as
+    /// given.
     #[must_use]
-    pub fn of(with: usize, without: usize, base: usize, card_bytes: u64) -> Option<DraftYield> {
-        (with < without.min(base)).then_some(DraftYield {
+    pub fn of(with: usize, without: usize, card_bytes: u64) -> Option<DraftYield> {
+        (with < without).then_some(DraftYield {
             with,
             without,
-            base,
             card_bytes,
         })
     }
@@ -2031,9 +2025,9 @@ impl fmt::Display for DraftYield {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unset: the draft's {} B on the card leave a slot {} positions, under the rule's \
-             base of {}; without the draft a slot takes {}",
-            self.card_bytes, self.with, self.base, self.without
+            "unset: the draft's {} B on the card leave a slot {} positions; without the draft a \
+             slot takes {}",
+            self.card_bytes, self.with, self.without
         )
     }
 }
@@ -2100,20 +2094,6 @@ pub fn paged_columns(at: &PagedAt) -> Paged {
         Paged::Reduced { slots }
     } else {
         Paged::AsAsked
-    }
-}
-
-/// The rule asked of a default slot count whose plan the host room leaves
-/// under the NVMe tier's floor, where the one-slot plan pages: that plan
-/// serves one slot, and its draft is [`paged_draft`]'s on it. The one slot
-/// is the room's, not a column's, so it holds where the slots step alone too
-/// ([`PagedAt::together`] is not read). With no arena the asked plan stands,
-/// for the floor's own refusal to name.
-pub fn paged_floor(at: &PagedAt) -> Paged {
-    if at.arena == 0 {
-        Paged::AsAsked
-    } else {
-        Paged::Reduced { slots: 1 }
     }
 }
 

@@ -36,17 +36,14 @@ mod drafted;
 pub mod rounds;
 
 // The seat's refusal and cut rules, pure functions of its feed (the seat's module
-// doc holds the contract), and the refusals its floor fallback answers. They are
+// doc holds the contract). They are
 // tested here, in the per-model binary's root: a test inside the seat would also
 // build in `bloomery-serve`, which includes it.
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use bloomery_gpu::arch::qwen3moe::Prompt38;
-    use bloomery_gpu_gates::GateError;
-    use model::arch::qwen35moe::place::PlaceError;
-    use model::placement::PlacementError;
 
-    use super::qwen38::{ACTS_ON, Feed38, floor_refused, prompt_cuts, refuse_feed};
+    use super::qwen38::{ACTS_ON, Feed38, prompt_cuts, refuse_feed};
 
     const STEPS: Feed38 = Feed38 {
         prompt: Prompt38::Step,
@@ -135,38 +132,6 @@ mod tests {
     fn the_batch_feed_without_a_trace_refuses_nothing() {
         refuse_feed(BATCH, (2, true), Some("mid-p40-s1"))
             .expect("the seat's own feed beside every other lever");
-    }
-
-    #[test]
-    fn the_floor_fallback_takes_the_floors_refusal_and_the_pools_only() {
-        let of = |e: PlacementError| -> GateError { PlaceError::Placement(e).into() };
-        let floor = || PlacementError::HostRoomFloor {
-            room: 68_719_476_736,
-            floor: 72_652_636_208,
-            base: 0,
-            layer: 0,
-            need: 72_652_636_208,
-            arena: None,
-        };
-        assert!(floor_refused(&of(floor())), "HostRoomFloor");
-        let pool = PlacementError::PoolBudget {
-            rounds: 3,
-            budget: 60_000_000_000,
-            last: Box::new(floor()),
-        };
-        assert!(floor_refused(&of(pool)), "PoolBudget");
-        let arena = PlacementError::NvTierArena {
-            arena: 25_769_803_776,
-            room: 68_719_476_736,
-            floor: 68_719_476_000,
-        };
-        assert!(!floor_refused(&of(arena)), "NvTierArena");
-        let positions: GateError = PlaceError::Positions { ctx_max: 0 }.into();
-        assert!(!floor_refused(&positions), "Positions");
-        assert!(
-            !floor_refused(&"no plan".into()),
-            "a refusal of no PlaceError"
-        );
     }
 
     /// Every accessor the seat calls on `Levers`, with the levers it reads.

@@ -259,28 +259,25 @@
 //! `generate_qwen3moe` run (whole, two tokens), then the slots clause's two
 //! and the sampled rounds' one (above).
 //!
-//! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default
-//!   (the margin rule's answer — or the largest the card holds when that is
-//!   fewer, or the prompt cache's clamp of it), the largest context the card
-//!   holds with its card expert bytes and the largest within the plan's
-//!   margin, before its load, each the rule's against this gate's own plans
-//!   (stopped there), the fit at most the file's serving cap
-//!   (`place::serve_ctx`); one with `--ctx-size` set and no `--parallel`
-//!   takes one slot at the whole flag (`from=ctx` on its `parallel` line,
-//!   and the one-request note on stderr), and one asked for a position past
-//!   the one-slot fit is
-//!   refused by name before it listens (the card's rule, or the cap's when
-//!   the card holds more). The rules' own terms — the slot count a flag
-//!   buys, the bisection, the margin guard — are held by
-//!   `bloomery_placement::placement::ctx`'s tests; these servers hold the
-//!   seat's composition and its lines;
+//! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default's
+//!   one `ctx` line before its load (stopped there): the seats' ladder at
+//!   one slot, its word held against this gate's own plans (the default
+//!   held, the rung above not when it halved); one with `--ctx-size` set and
+//!   no `--parallel` takes one slot at the whole flag (`from=ctx` on its
+//!   `parallel` line, and the one-request note on stderr), and one asked a
+//!   position past the one-slot fit is refused by name before it listens
+//!   (with the share the card holds, or by the limit when the card holds
+//!   more). The ladder's own terms are held by
+//!   `bloomery_placement::placement::ctx_ask`'s tests; these servers hold
+//!   the seat's composition and its lines;
 //! - `paged` ([`paged`], deferred by name in the fixture tier: its rooms
 //!   are the real file's shapes): the NVMe tier's paged rule at two
 //!   rooms (`BLOOMERY_HOST_ROOM`): at 27 GiB, where the gate plan pages its
 //!   host experts through the tier's RAM arena, the server with no
-//!   `--ctx-size` serves one slot (`from=paged`, its `paged` line naming the
-//!   arena, the two slots asked and the draft the placement left off;
-//!   `paged_default_serves_one_column`), `--parallel 2` is accepted by the
+//!   `--ctx-size` serves its default one slot with no `paged` line (the
+//!   rule has no count to reduce, and the placement left the draft off) on a
+//!   plan that pages (`paged_default_serves_one_column`, the `cache` line's
+//!   arena), `--parallel 2` is accepted by the
 //!   plan and its server's end is printed, not judged (PIN(2026-10-12):
 //!   the clause `paged_parallel_serves_one_pass` returns when the server's
 //!   named error after the plan is fixed), and
@@ -289,12 +286,12 @@
 //!   at 40 GiB, where the tier pages experts with no arena, `--parallel 2`
 //!   serves its two slots (`unpaged_parallel_serves_as_asked`). The small
 //!   card's case last: a server with no `--place` (the box pin's one card,
-//!   `a`) under the budget whose drafted two-slot plan holds half of `CTX`
-//!   a slot, at 27 GiB — the unset draft yields to the context on that plan
-//!   (`paged_small_card_yields_on_one_card`, the premise), the plan pages,
-//!   and the one-slot load's `load draft=off` record names the paged rule,
-//!   never the yield judged on the plan it abandoned
-//!   (`paged_small_card_load_names_the_rule`). Beside them, at 27 GiB: the
+//!   `a`) under the budget whose drafted one-slot plan halves to a rung the
+//!   plain plan holds more than, at 27 GiB — the unset draft yields to the
+//!   context on that plan (`paged_small_card_yields_on_one_card`, the
+//!   premise), and the load runs the plain plan the yield was judged on, its
+//!   `load draft=off` record naming the yield
+//!   (`paged_small_card_load_names_the_yield`). Beside them, at 27 GiB: the
 //!   checkpoints every resident sequence may pin sit outside the room the
 //!   split fills — the server's arena is the gate's own plan's (no host
 //!   reserve for them) less `pinned_checkpoints(slots)`, and its host need that
@@ -309,26 +306,22 @@
 //!   reads of the arena's ids go through its slots and none through the
 //!   model file's mapping, read off the run's last `nvtier` record). The
 //!   floor counts every slot's checkpoints, so between the one-slot plan's
-//!   floor and the asked two slots' lies a band of rooms only the one-slot
-//!   plan clears: the gate reads both floors off its own plans
+//!   floor and two slots' lies a band of rooms a set `--parallel 2` cannot
+//!   clear: the gate reads both floors off its own plans
 //!   (`paged_floor_band_is_between_the_slot_floors`), and at the band's
-//!   middle the flagless server serves one slot, `from=paged`, its `paged`
-//!   line naming the floor (`paged_floor_fallback_serves_one_column`), while
-//!   `--parallel 2` there is refused by the floor, by name
+//!   middle `--parallel 2` is refused by the floor, by name
 //!   (`paged_floor_set_parallel_is_refused_by_the_floor`).
 //!   Then `generate_qwen3moe` with no `--place` at 27 GiB: its unset
 //!   draft at `a` falls to the same rule, and the run's `load draft=off`
 //!   record names it (`paged_cli_drafts_nothing_by_the_rule`). FAIL-first:
-//!   the seat with no
-//!   rule serves two slots at 27 GiB and refuses neither; a rule on the
-//!   paged experts' bytes refuses the 40 GiB server; a one-column load that
-//!   keeps the yield's reason names it on the small card; a CLI with no rule
-//!   drafts on the paged plan; a machine with no
-//!   checkpoint reserve gives the arena of the gate's own plan; a seat that
-//!   takes the set word on a paged plan prints its `plan` record and loads;
-//!   one that refuses `off` too never reaches the 27 GiB `plan` record; a
-//!   seat that plans the asked two slots with no fallback refuses the
-//!   flagless band server by the floor, red on the fallback clause;
+//!   a default of two slots prints a `paged` line at 27 GiB; a rule on the
+//!   paged experts' bytes refuses the 40 GiB server; a seat whose yield
+//!   leaves the draft on, or whose paged rule overrides the yield's reason,
+//!   is red on the small card; a CLI with no rule drafts on the paged plan;
+//!   a machine with no checkpoint reserve gives the arena of the gate's own
+//!   plan; a seat that takes the set word on a paged plan prints its `plan`
+//!   record and loads; one that refuses `off` too never reaches the 27 GiB
+//!   `plan` record;
 //! - `draft_slot_share` ([`draft_slot_share`]): the unset draft judged on a
 //!   slot's share of `--ctx-size`: at `--ctx-size 8 --parallel 2` (four
 //!   positions a slot, a window needs five) an unset draft turns off, its
@@ -465,10 +458,11 @@ mod gate {
     use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, checkpoint_budget38, checkpoint_bytes, seq_positional_bytes,
+        Body38, CHECKPOINT_EVERY, checkpoint_budget38,
         seq38_bytes,
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
+    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore, server_log,
@@ -479,8 +473,10 @@ mod gate {
     use model::arch::models::Mixer;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx,
+        Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_for_experts,
+        serve_ctx,
     };
+    use model::placement::ctx::CtxLimit;
     use model::placement::workstation::{HostNeed, HostRead, RTX_3090};
     use model::placement::{PlacementError, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
@@ -538,11 +534,8 @@ mod gate {
             && PREFIX_SHARED < 2 * CHECKPOINT_EVERY as usize
             && PREFIX_SHARED < PREFIX_A
     );
-    /// The context the servers are started at (`SERVER_ARGS`), and the one
-    /// the default's expert cost is counted against.
+    /// The context the servers are started at (`SERVER_ARGS`).
     const CTX: usize = 4096;
-    /// The default context's multiple.
-    const CTX_STEP: usize = 256;
     /// Session A's first turn, session B's, a later turn A resends after its
     /// reply (`cache` clause (a)), and the text A resends instead of its
     /// reply (clause (b)): the last's first id is not the reply's.
@@ -3465,47 +3458,24 @@ mod gate {
         ))
     }
 
-    /// The `ctx` clause: a plain server with no `--ctx-size` (and no
-    /// `--parallel`, so the seat's default two resident slots) prints its
-    /// `ctx` line before its load (it is stopped there), against this gate's
-    /// own plans of the file — every plan counting the two slots, as the
-    /// seat's does: its context is a slot's, the common rule's answer
-    /// (`base` when no step past [`CTX`] is within the margin, `fit` when the
-    /// fit is, else `margin`: the line's own `margin_ctx`, which the clause
-    /// below holds to the gate's plans), or the largest the card holds when
-    /// that is fewer than [`CTX`] (`card`), or the prompt cache's clamp of
-    /// the rule's answer (`cache`, composed the seat's way from the cache
-    /// line's own ram — the clamp rides MemAvailable as the fit rides the
-    /// census); the line's `fit` is the largest slot context the card holds
-    /// up to the file's serving cap (`place::serve_ctx`, its
-    /// `context_length`) — its plan taken, and the one past it refused when
-    /// the card bounds it, else the cap itself — with that plan's card
-    /// expert bytes; its `margin_ctx` holds at most the plan's margin fewer
-    /// card expert bytes than the two-slot plan at [`CTX`] and no more NVMe
-    /// expert bytes, and the next multiple of [`CTX_STEP`] past it more of
-    /// either (or it is the fit). A server
-    /// with `--ctx-size` set and no `--parallel` takes one slot at the whole
-    /// flag (the `from=ctx` rule; the clause's last server holds the line
-    /// and the one-request note beside it), and one asked for a context one
-    /// past the one-slot fit is refused by name
-    /// before it listens: by the card's rule when the card bounds that fit,
-    /// by the cap's (the trained context, YaRN not built) when the cap
-    /// does. Mutants: the default ignoring the fit (staying at the base);
-    /// the default passing the fit through without the margin rule; the
-    /// refusal of a context past the card taken out (the load's own plan
-    /// refuses it, not by the rule's name); the cap's refusal taken out
-    /// (the card's rule names the clamped fit instead); a set `--ctx-size`
-    /// still split by the default two (the one-slot line names two slots,
-    /// and the one-request note prints nowhere).
-    // PIN(2026-10-05): re-derived for the seat's default two resident slots — every
-    // `at` below is `plan_with_slots(2)` at a slot's context, and the default
-    // `--parallel` names two (the `parallel` line's check). Was the
-    // one-sequence search (round q38rules). The refusal arm's own count moved
-    // to one slot by the PIN(2026-10-07) below.
-    // PIN(2026-10-07): the refusal arm and the one-slot arm take one slot — a set
-    // `--ctx-size` with no `--parallel` is one request's context now (`bind::slots_of`),
-    // so the arm's `at1` below is `plan_with_slots(1)` and its ask is one past the
-    // one-slot fit.
+    /// The `ctx` clause: a plain server with no `--ctx-size` and no
+    /// `--parallel` (the seat's default one slot) prints its `ctx` and
+    /// `parallel` lines before its load (it is stopped there). Its one `ctx`
+    /// line holds its word under the model's limit (the trained context
+    /// within `place::KERNEL_POSITIONS`; `ctx_ladder::default_line_held`),
+    /// and this gate's own one-slot plans at the card's free bytes agree: the
+    /// card holds the default, and not the rung above it when it halved. A
+    /// server asked one past the one-slot fit is refused by name before it
+    /// listens: with the largest share the card holds when the card bounds
+    /// the fit, by the limit when the limit does. Mutants: a ladder that
+    /// starts a rung low (the rung above holds); a default of two slots (the
+    /// `parallel` line names two); the refusal of a context past the card
+    /// taken out (the load's own plan refuses it, not by the common words).
+    // PIN(2026-10-14): the default is the seats' ladder at one slot (ctx-first: the
+    // context comes first, the experts fill what is left; the user approved D1/D2), so
+    // the clause holds the line's word and the rung above, not the old margin rule's
+    // terms; the refusal names the seats' common words. Was the two-slot margin rule
+    // (PIN 2026-10-05) and the one-slot refusal (PIN 2026-10-07).
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -3545,88 +3515,40 @@ mod gate {
         if served.child.try_wait()?.is_none() {
             println!("ctx: the default server stopped: {}", served.stop()?);
         }
-        let line = line.ok_or("the default server printed no `ctx` line")?;
+        line.ok_or("the default server printed no `ctx` line")?;
+        let line = ctx_line(&std::fs::read_to_string(&err_log)?)
+            .ok_or("the default server printed no one `ctx` line")?
+            .to_owned();
         println!("ctx: {line}");
         // The resident-slot default's own line (the module header): this
-        // flagless server is the one that takes it, [`SERVER_ARGS`] naming
-        // the one slot its clauses count on. The slots its rule names are
-        // what the line's own terms hold — the default's 2 and the split it
-        // names the `ctx` line's own context. FAIL-first: a default that
+        // flagless server is the one that takes it. The slots its rule names
+        // are what the line's own terms hold — the default's one slot at the
+        // `ctx` line's own context. FAIL-first: a default that
         // serves another count (or a split off the `ctx` line) turns this
         // red.
         let parallel =
             parallel_line(&err_log)?.ok_or("the default server printed no `parallel` line")?;
         println!("ctx: {parallel}");
-        let field = |k: &str| -> Option<String> {
-            line.split_whitespace()
-                .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
-                .map(str::to_owned)
-        };
-        let num = |k: &str| field(k).and_then(|v| v.parse::<usize>().ok());
-        let (rule, ctx, fit) = (field("rule"), num("ctx"), num("fit"));
-        let fit_bytes = field("fit_card_expert_bytes").and_then(|v| v.parse::<u64>().ok());
-        let margin_ctx = num("margin_ctx");
-        let (Some(rule), Some(ctx), Some(fit), Some(fit_bytes), Some(margin_ctx)) =
-            (rule, ctx, fit, fit_bytes, margin_ctx)
-        else {
-            return Err(format!(
-                "a `ctx` line without its rule, ctx, fit, fit_card_expert_bytes and margin_ctx: \
-                 {line}"
-            )
-            .into());
-        };
-        // The rule's own terms: the default's 2 slots at the `ctx` line's own
-        // context (the line's `total` twice it, held by `parallel_agrees`).
-        let pfield = |k: &str| {
-            parallel
-                .split_whitespace()
-                .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
-                .and_then(|v| v.parse::<usize>().ok())
-        };
-        let parallel_ok = parallel_agrees(&parallel, None).unwrap_or(false)
-            && pfield("slots") == Some(2)
-            && pfield("slot_ctx") == Some(ctx);
+        let pfield = |k: &str| ctx_ladder::field(&parallel, k);
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
         let experts = experts38(levers)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
         let free = Some(server_card_free(&err_log)?);
-        // The default the seat's rules compose to also answers the prompt
-        // cache's bound, whose ram rides MemAvailable as the fit rides the
-        // census: the gate takes the server's own `cache` line's ram, not a
-        // fresh reading.
-        let ram = record_line(&err_log, "cache")?
-            .ok_or("the default server printed no `cache` line")?
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix("ram="))
-            .and_then(|v| v.parse::<u64>().ok())
-            .ok_or("a `cache` line without its ram")?;
-        let at = |c: usize| card_at(&inputs, &plan_levers, experts, c, free, 2);
-        let (base, base_nvme) = at(CTX)?.ok_or("no plan at the base context")?;
-        let margin = model::placement::workstation::MARGIN;
-        // Whether the plan at `c` is within the rule's margin of the base's:
-        // at most `margin` fewer card expert bytes and no more NVMe expert
-        // bytes, re-derived from the gate's own plans; `None` when no plan
-        // takes the context.
-        let within = |c: usize| -> Result<Option<bool>, GateError> {
-            Ok(at(c)?.map(|(card, nvme)| base.saturating_sub(card) <= margin && nvme <= base_nvme))
-        };
-        let here = within(margin_ctx)?;
-        let past = within(margin_ctx + CTX_STEP)?;
-        let (at_fit, past_fit) = (at(fit)?, at(fit + 1)?);
-        // The plan's bytes at the line's own context, which the line's
-        // `card_expert_bytes` and `nvme_expert_bytes` name: a context the
-        // cache's bound lowered carries its own plan's bytes, not the rule's.
-        let at_ctx = at(ctx)?;
-        let line_bytes = |k: &str| field(k).and_then(|v| v.parse::<u64>().ok());
-        let cap = usize::try_from(serve_ctx(1, &inputs.hp)?)?;
-        // PIN(2026-10-02): the fit is the card's largest context up to the file's serving cap
-        // (round q38rules: `serve_ctx`, 262,144 for Qwen3.8); where the card holds more, the fit
-        // is the cap and a plan past it is still a plan; was the card's largest, `past_fit` none.
-        let card_bounds = fit < cap;
-        // One session's whole-context state (`Seq38`), the bound the seat's
-        // `cache` rule clamps the default with (`Ctx38::host_bound`).
+        let limit = limit38(&inputs)?;
+        let at = |c: u64| card_at(&inputs, &plan_levers, experts, usize::try_from(c)?, free, 1);
+        let ctx = ctx_ladder::field(&line, "ctx").ok_or("the `ctx` line names no ctx")?;
+        let above = rung_above(limit.0, ctx);
+        let (at_ctx, at_above) = (at(ctx)?, above.map(at).transpose()?);
+        let parallel_ok = parallel_agrees(&parallel, None).unwrap_or(false)
+            && pfield("slots") == Some(1)
+            && pfield("slot_ctx") == Some(ctx);
+        // The plan's floor for the PLE table's tier counts the state the cache
+        // saves ([`PlanInputs::seq_state_bytes`]): the engine's `seq38_bytes`,
+        // plain and with the draft the seat's unset default carries. FAIL-first:
+        // a term of the plan's state off by a byte (the checkpoint's second
+        // copy, the draft's rows) turns this red.
         let gdn = inputs
             .spec
             .layers
@@ -3634,22 +3556,6 @@ mod gate {
             .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
             .count();
         let qsa = inputs.spec.layers.len() - gdn;
-        let state = |n: usize| seq_positional_bytes(qsa, n) + 2 * checkpoint_bytes(gdn);
-        // The prompt cache's halving ladder, derived here apart from the
-        // seat's: `from`, then `from >> k` rounded down to the step and raised
-        // to the base, the first rung whose state the budget holds; the base
-        // when none does.
-        let cache_ctx = |from: usize| {
-            std::iter::once(from)
-                .chain((1..usize::BITS).map(|k| ((from >> k) / CTX_STEP * CTX_STEP).max(CTX)))
-                .find(|&n| n <= CTX || state(n) <= ram)
-                .unwrap_or(CTX)
-        };
-        // The plan's floor for the PLE table's tier counts the state the cache
-        // saves ([`PlanInputs::seq_state_bytes`]): the engine's `seq38_bytes`,
-        // plain and with the draft the seat's unset default carries. FAIL-first:
-        // a term of the plan's state off by a byte (the checkpoint's second
-        // copy, the draft's rows) turns this red.
         let (draft_path, _) = draft_file(None, &path);
         let draft = Split::open(&draft_path)
             .map_err(|e| format!("open the MTP draft {}: {e}", draft_path.display()))?;
@@ -3660,54 +3566,19 @@ mod gate {
             inputs.seq_state_bytes(p, None) == seq38_bytes(gdn, qsa, n, false)
                 && inputs.seq_state_bytes(p, Some(&mtp)) == seq38_bytes(gdn, qsa, n, true)
         });
-        // The rule's word by the common precedence, then the cache's bound
-        // where one session's state does not fit its budget.
-        // The cache rule's ram is the line's, read at the served context; the
-        // derivation holds it at every context, exact where the cap binds as at
-        // this server's plan.
-        // The host room's veto (`host`): the base stands where the card's
-        // context `margin_ctx` past it does not plan within the margin at the
-        // room read (the clause below holds the card's context to the card's
-        // plans); a unified pool's rung (`pool`): a rung of the halving
-        // ladder from the cap, `cap >> k` rounded down to the step, never
-        // under the base.
-        let (want_rule, want_ctx) =
-            if rule.as_str() == "host" && margin_ctx > CTX && here != Some(true) {
-                ("host", CTX)
-            } else if rule.as_str() == "pool"
-                && (0..usize::BITS).any(|k| ctx == ((cap >> k) / CTX_STEP * CTX_STEP).max(CTX))
-            {
-                ("pool", ctx)
-            } else if fit < CTX {
-                ("card", fit)
-            } else {
-                let word = match margin_ctx {
-                    c if c == CTX => "base",
-                    c if c == fit => "fit",
-                    _ => "margin",
-                };
-                if ram == 0 || state(margin_ctx) <= ram {
-                    (word, margin_ctx)
-                } else {
-                    ("cache", cache_ctx(margin_ctx))
-                }
-            };
         println!(
-            "ctx: the gate's plans: within the margin at {margin_ctx} {here:?}, at {} {past:?}, fit \
-             {fit} {at_fit:?}, past it {past_fit:?}; the serving cap {cap} ({}); the default the \
-             rules compose to: rule {want_rule} ctx {want_ctx} (the cache line's ram {ram})",
-            margin_ctx + CTX_STEP,
-            if card_bounds {
-                "the card bounds the fit"
-            } else {
-                "the cap bounds the fit"
-            }
+            "ctx: the gate's plans: at {ctx} {at_ctx:?}, at the rung above {above:?} {at_above:?}; \
+             the limit {limit:?}"
         );
         let mut ok = true;
+        // The line holds its word, and the gate's own plans agree: the card
+        // holds the default, and not the rung above it when it halved.
         check(
             &mut ok,
-            "ctx_default_is_the_rules",
-            rule.as_str() == want_rule && ctx == want_ctx,
+            "ctx_default_is_the_highest_rung_held",
+            default_line_held(&line, 1, limit) == Some(true)
+                && at_ctx.is_some()
+                && at_above.is_none_or(|a| a.is_none()),
         );
         check(
             &mut ok,
@@ -3719,37 +3590,10 @@ mod gate {
             "parallel_default_holds_what_its_rule_names",
             parallel_ok,
         );
-        check(
-            &mut ok,
-            "ctx_line_prints_the_fit_and_the_margin",
-            at_fit.map(|e| e.0) == Some(fit_bytes)
-                && at_ctx.map(|e| e.0) == line_bytes("card_expert_bytes")
-                && at_ctx.map(|e| e.1) == line_bytes("nvme_expert_bytes")
-                && fit <= cap
-                && (if card_bounds {
-                    past_fit.is_none()
-                } else {
-                    fit == cap
-                })
-                // The context the host room vetoed (`host`) is the one whose
-                // plan at the room read is not within; a rung (`pool`) is not
-                // the last multiple of the step within.
-                && (here == Some(true)) != (rule.as_str() == "host")
-                && margin_ctx <= fit
-                && (margin_ctx == fit
-                    || rule.as_str() == "pool"
-                    || (margin_ctx.is_multiple_of(CTX_STEP) && past != Some(true))),
-        );
-        // PIN(2026-10-07): the refusal arm's server takes one slot — a set
-        // `--ctx-size` with no `--parallel` is one request's context now, the
-        // one-slot `from=ctx` rule the arm below holds — so the arm asks for
-        // one past the one-slot fit (every `at1` a `plan_with_slots(1)` at a
-        // slot's context), not the total whose two-slot share was one past
-        // the two-slot fit. Re-pin by specification (the seat's
-        // `--ctx-size` rule), not a relaxation: the refusal is still asked
-        // one past the boundary the card holds, at the slot count the flag
-        // set now serves, and still by name.
+        // The one-slot fit at the default server's free reading: the largest
+        // share whose plan the card holds, up to the limit.
         let at1 = |c: usize| card_at(&inputs, &plan_levers, experts, c, free, 1);
+        let cap = usize::try_from(limit.0)?;
         let (mut lo, mut hi) = (1, cap);
         while lo < hi {
             let mid = lo + (hi - lo).div_ceil(2);
@@ -3777,32 +3621,43 @@ mod gate {
             std::thread::sleep(Duration::from_secs(1));
         }
         let text = std::fs::read_to_string(&err_log).unwrap_or_default();
+        // The seats' common words: past the card, the share the card holds
+        // (`ctx_ask::AskError::DoesNotFit`, its largest a step multiple at or
+        // over the floor); past the limit, the limit
+        // (`placement::ctx::PastLimit`).
         let named = if card_bounds1 {
-            format!(
-                "--ctx-size {over}: with --parallel 1 each slot takes {over} positions and the \
-                 card holds at most {fit1} a slot beside the plan's dense weights (`--place gate`)"
-            )
+            let largest = fit1 as u64 / ctx_ladder::STEP * ctx_ladder::STEP;
+            let head =
+                format!("--ctx {over} over 1 slot(s) asks {over} positions a slot, and the card holds ");
+            let tail = if largest >= ctx_ladder::FLOOR {
+                format!("a slot holds at most {largest} here; ask {largest} or less, or fewer slots")
+            } else {
+                format!(
+                    "not even {} positions a slot fit; ask fewer slots or a smaller model file",
+                    ctx_ladder::FLOOR
+                )
+            };
+            text.contains(&head) && text.contains(&tail)
         } else {
-            format!(
-                "a context of {over} positions: the file was trained at {cap} (context_length), \
-                 and a load serves at most {cap}; YaRN scaling past the trained context is not \
-                 implemented"
-            )
+            let (limit, source) = limit;
+            text.contains(&format!(
+                "--ctx asks {over} positions a slot, past this model's limit of {limit} \
+                 ({source}; the file was trained at {}): the load stops; ask {limit} or fewer a \
+                 slot",
+                inputs.hp.n_ctx_train
+            ))
         };
         let listened = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
             .first(&record::LISTENING38)?
             .is_some();
-        println!(
-            "ctx: --ctx-size {over}: exit {status:?}; named {}; listened {listened}",
-            text.contains(&named)
-        );
+        println!("ctx: --ctx-size {over}: exit {status:?}; named {named}; listened {listened}");
         if status.is_none() {
             println!("ctx: the refused server stopped: {}", refused.stop()?);
         }
         check(
             &mut ok,
             "ctx_past_the_fit_is_refused_by_name",
-            status.is_some_and(|s| !s.success()) && text.contains(&named) && !listened,
+            status.is_some_and(|s| !s.success()) && named && !listened,
         );
 
         // The one-slot rule itself, the flag set the refusal arm now shares:
@@ -4070,8 +3925,8 @@ mod gate {
     /// prints one. At 27 GiB the plan pages its host experts through the
     /// tier's RAM arena (`bloomery_placement`'s
     /// `the_paged_rule_reads_the_arena` derives both rooms on the Mac):
-    /// the flagless server serves one slot (`from=paged`), its `paged` line
-    /// naming the arena and the two slots asked; `--parallel 2` serves two
+    /// the flagless server serves its default one slot with no `paged` line,
+    /// the `cache` line naming the arena; `--parallel 2` serves two
     /// slots as one pass over the arena, and `BLOOMERY_DRAFT=mtp` serves
     /// one slot with the draft on (PIN(2026-10-12): the rule refused it by
     /// name; a paged step reads its columns' ids from the arena in one union
@@ -4092,29 +3947,23 @@ mod gate {
     /// the NVMe tier's reader, so the lane's arena reads count as slot reads
     /// and none as mapping reads, `slot_reads` and `mapping_reads` of the
     /// run's last `nvtier` record). The floor counts the checkpoints too: at the
-    /// middle of the band of rooms between the one-slot plan's floor and the
-    /// asked two slots' (the gate's own plans' floors, read off
-    /// `HostRoomFloor`, plus `pinned_checkpoints(slots)`) the flagless server
-    /// serves one slot, `from=paged`, its `paged` line naming the floor, with
-    /// the arena the gate's own plan has less `pinned_checkpoints(1)`
-    /// (`paged_floor_fallback_serves_one_column`), and `--parallel 2` is
-    /// refused by the floor, by name
+    /// middle of the band of rooms between the one-slot plan's floor and two
+    /// slots' (the gate's own plans' floors, read off `HostRoomFloor`, plus
+    /// `pinned_checkpoints(slots)`) `--parallel 2` is refused by the floor, by
+    /// name
     /// (`paged_floor_set_parallel_is_refused_by_the_floor`). Last, the small
     /// card's case (below, at its server). The fixture tier defers the clause by name: its rooms and
     /// budget are the real file's shapes.
-    /// FAIL-first: the seat before the rule serves the default's two slots
-    /// at 27 GiB and refuses neither; a rule that reads the paged experts'
-    /// bytes rather than the arena refuses the 40 GiB `--parallel 2`; a
-    /// one-column load that keeps the yield's reason names it on the small
-    /// card; a machine with no checkpoint reserve gives the arena the gate's
+    /// FAIL-first: a default of two slots prints a `paged` line at 27 GiB; a
+    /// rule that reads the paged experts' bytes rather than the arena refuses
+    /// the 40 GiB `--parallel 2`; a yield the paged rule overrides is red on
+    /// the small card; a machine with no checkpoint reserve gives the arena the gate's
     /// own plan has, red on the checkpoint clause; a seat that refuses a set
     /// word on the paged plan by name never listens, red on the residency
     /// clause, and so is one that hands the machine's lane no tier (no slot
     /// read) or lets it read the mapping (a mapping read); one that refuses
     /// `off` as well never reaches the `plan` record, red on the acceptance
-    /// clause; a seat that plans the asked two slots with
-    /// no floor fallback refuses the flagless band server by the floor, red
-    /// on the fallback clause; one that turns a set draft off on a paged plan
+    /// clause; one that turns a set draft off on a paged plan
     /// serves it plain, red on the drafted clause's `draft=on`.
     fn paged(
         dir: &Path,
@@ -4192,33 +4041,25 @@ mod gate {
         let (line, _, text) = run(&[(bloomery_levers::HOST_ROOM, "27G")], &[])?;
         let paged = paged_line(&text);
         println!("paged: {}", paged.as_deref().unwrap_or("no paged line"));
-        let arena = paged
-            .as_deref()
-            .and_then(|l| field(l, "arena"))
+        let arena = text
+            .lines()
+            .find(|l| l.starts_with("cache "))
+            .and_then(|l| field(l, "tier"))
             .and_then(|v| v.parse::<u64>().ok());
         let one = line.as_deref().is_some_and(|l| {
             let n = |k: &str| field(l, k).and_then(|v| v.parse::<usize>().ok());
             n("slots") == Some(1)
-                && field(l, "from").as_deref() == Some("paged")
+                && field(l, "from").as_deref() == Some("default")
                 && n("slot_ctx").is_some_and(|c| c > 0 && n("total") == Some(c))
         });
-        // At `--place gate` the unset draft is off by the placement, a reason
-        // that holds whatever the plan: it was not asked, and stays.
-        let named = paged.as_deref().is_some_and(|l| {
-            field(l, "rule").as_deref() == Some("reduced")
-                && field(l, "asked_slots").as_deref() == Some("2")
-                && field(l, "asked_draft").as_deref() == Some("off")
-                && field(l, "slots").as_deref() == Some("1")
-                && field(l, "draft").as_deref() == Some("off")
-        });
-        // PIN(2026-10-12): the default stays at one slot, for a new reason:
-        // the file mapping is gone from a paged step, and a second slot's KV
-        // takes card bytes that experts would hold, a trade a later budget
-        // rule prices.
+        // PIN(2026-10-14): the default is one slot by itself (ctx-first, D2), so the
+        // paged rule has no count to reduce and, with the draft off by `--place
+        // gate`'s placement, nothing to turn off: it prints no `paged` line. Was two
+        // slots asked, one served (`from=paged`).
         check(
             &mut ok,
             "paged_default_serves_one_column",
-            one && named && arena.is_some_and(|a| a > 0),
+            one && paged.is_none() && arena.is_some_and(|a| a > 0),
         );
         // `off`, set on every server of this clause, reaches the `plan`
         // record: its `residency lever` record names `off` with why `set`
@@ -4367,6 +4208,9 @@ mod gate {
         // `BLOOMERY_DRAFT=mtp` runs, and a user the refusal stopped now
         // runs, possibly slower on a drive flat in queue depth. Stopped at
         // the `parallel` line, before its load.
+        // PIN(2026-10-14): the default is one slot (ctx-first, D2), so a set draft
+        // on it is served as asked: no `paged` line, the drafted load's `draft keep`
+        // line. Was two slots asked, one served (`from=paged`, `draft=on`).
         let (line, failed, text) = run(
             &[
                 (bloomery_levers::HOST_ROOM, "27G"),
@@ -4382,15 +4226,10 @@ mod gate {
             !failed
                 && line.as_deref().is_some_and(|l| {
                     field(l, "slots").as_deref() == Some("1")
-                        && field(l, "from").as_deref() == Some("paged")
+                        && field(l, "from").as_deref() == Some("default")
                 })
-                && drafted.as_deref().is_some_and(|l| {
-                    field(l, "rule").as_deref() == Some("reduced")
-                        && field(l, "asked_slots").as_deref() == Some("2")
-                        && field(l, "asked_draft").as_deref() == Some("on")
-                        && field(l, "slots").as_deref() == Some("1")
-                        && field(l, "draft").as_deref() == Some("on")
-                }),
+                && drafted.is_none()
+                && text.lines().any(|l| l.starts_with("draft keep ")),
         );
 
         // A residency word set on a plan that pages through the arena is
@@ -4483,19 +4322,16 @@ mod gate {
             asked && paged_line(&text).is_none(),
         );
 
-        // The default count's floor fallback. The floor counts every slot's
-        // checkpoints: the gate's own floors (the planner's, read off
-        // `HostRoomFloor` at a room of one byte, with no checkpoint reserve)
-        // plus `pinned_checkpoints(slots)` are the server's, so the one-slot
-        // plan's floor sits `pinned_checkpoints(1)` above the two-slot plan's
-        // less its own extra checkpoints — a band of rooms the one-slot plan
-        // clears and the two the flagless server asks first does not. The
-        // server's first plan, at one position (the context search's first),
-        // is the asked slots', so the band is [one slot's floor, two slots'
-        // floor at one position); its middle is the room. A flagless server
-        // there serves one slot (`from=paged`, its `paged` line naming the
-        // floor), and `--parallel 2` is refused by the floor, by name (the
-        // context search's first plan fails before the `paged` rule).
+        // The floor counts every slot's checkpoints: the gate's own floors
+        // (the planner's, read off `HostRoomFloor` at a room of one byte, with
+        // no checkpoint reserve) plus `pinned_checkpoints(slots)` are the
+        // server's, so the two-slot plan's floor at one position sits over the
+        // one-slot plan's at [`CTX`] — a band of rooms a set `--parallel 2`
+        // cannot clear. At its middle that server is refused by the floor, by
+        // name (its context choice's first plan fails before the `paged` rule).
+        // PIN(2026-10-14): `paged_floor_fallback_serves_one_column` is gone with the
+        // seat's floor fallback: it served a default of two slots as one, and the
+        // default is one slot now (ctx-first, D2).
         let one_floor = host_floor(levers, (CTX, 1), free)? + pinned_checkpoints((CTX, 1))?;
         let two_floor = host_floor(levers, (1, 2), free)? + pinned_checkpoints((1, 2))?;
         let band = one_floor < two_floor;
@@ -4506,51 +4342,6 @@ mod gate {
         );
         check(&mut ok, "paged_floor_band_is_between_the_slot_floors", band);
         let room_arg = room.to_string();
-        let (line, failed, text) = run(&[(bloomery_levers::HOST_ROOM, &room_arg)], &[])?;
-        let paged = paged_line(&text);
-        println!("paged: {}", paged.as_deref().unwrap_or("no paged line"));
-        if paged.is_none() {
-            println!("paged: the flagless server's last lines:");
-            for l in text.lines().rev().take(12).collect::<Vec<_>>().iter().rev() {
-                println!("  {l}");
-            }
-        }
-        let cache = text
-            .lines()
-            .find(|l| l.starts_with("cache "))
-            .map(str::to_owned);
-        let shape = term(line.as_deref(), "slots")
-            .zip(term(line.as_deref(), "slot_ctx"))
-            .map(|(slots, ctx)| {
-                Ok::<_, GateError>((usize::try_from(ctx)?, usize::try_from(slots)?))
-            })
-            .transpose()?;
-        let arena = term(cache.as_deref(), "tier");
-        let held = shape.map(pinned_checkpoints).transpose()?.unwrap_or(0);
-        let bare = shape
-            .map(|shape| host_split_at(levers, shape, free, room))
-            .transpose()?;
-        let one = line.as_deref().is_some_and(|l| {
-            field(l, "slots").as_deref() == Some("1")
-                && field(l, "from").as_deref() == Some("paged")
-        });
-        let named = paged.as_deref().is_some_and(|l| {
-            field(l, "rule").as_deref() == Some("reduced")
-                && field(l, "asked_slots").as_deref() == Some("2")
-                && field(l, "slots").as_deref() == Some("1")
-                && l.ends_with("; the asked slots' plan leaves the room under the tier's floor)")
-        });
-        println!("paged: the seat's arena {arena:?}, the gate's plan with no reserve {bare:?}");
-        check(
-            &mut ok,
-            "paged_floor_fallback_serves_one_column",
-            !failed
-                && one
-                && named
-                && arena.zip(bare).is_some_and(|(arena, (bare_arena, _))| {
-                    arena > 0 && arena + held == bare_arena
-                }),
-        );
         let (line, failed, text) = run(
             &[(bloomery_levers::HOST_ROOM, &room_arg)],
             &["--parallel", "2"],
@@ -4569,15 +4360,17 @@ mod gate {
         // The small card's case: a flagless server — no `--place`, so the
         // box pin's one-card view runs `a` on the 3090, as
         // `slots_default_residency`'s does — under the budget whose drafted
-        // two-slot plan holds half of [`CTX`] a slot ([`small_card_budget`]),
-        // at 27 GiB. The unset draft yields to the context on that plan, the
-        // plan pages, and the load runs one slot with no draft: its `load
-        // draft=off` record names the paged rule at the `paged` line's own
-        // arena, never the yield judged on the plan it abandoned, and the
-        // `paged` line names the draft as asked before that yield. The
-        // residency is pinned off: the clause holds the draft, and a paged
-        // plan's residency is its own rule's. Stopped at that record.
-        let budget = small_card_budget(levers, free)?;
+        // one-slot plan halves to a rung the plain plan holds more than
+        // ([`small_card_budget`]), at 27 GiB. The unset draft yields to the
+        // context on that plan, and the load runs the plain plan the yield
+        // was judged on: its `load draft=off` record names the yield, the
+        // positions the `draft yield` record holds. The residency is pinned
+        // off: the clause holds the draft. Stopped at that record.
+        // PIN(2026-10-14): was the two-slot default, whose yield the paged rule
+        // overrode on the one-slot plan it fell to (`paged_small_card_load_names_the_rule`);
+        // with one default slot (ctx-first, D2) the yield's plan is the load's, so its
+        // record names the yield (`paged_small_card_load_names_the_yield`).
+        let (budget, rung) = small_card_budget(levers, free)?;
         let budget_bytes = budget.to_string();
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::HOST_ROOM, "27G")
@@ -4613,11 +4406,16 @@ mod gate {
             Some(p) => p.word("place")? == "a" && p.text("why")? == "one card",
             None => false,
         };
-        let with = log
+        let yielded = log
             .first(&record::DRAFT_YIELD)?
-            .map(|y| y.u64("with"))
+            .map(|y| -> Result<_, ReadError> {
+                Ok(bloomery_levers::DraftYield {
+                    with: usize::try_from(y.u64("with")?).unwrap_or(usize::MAX),
+                    without: usize::try_from(y.u64("without")?).unwrap_or(usize::MAX),
+                    card_bytes: y.u64("card_bytes")?,
+                })
+            })
             .transpose()?;
-        let yielded = with.is_some();
         if off.is_none() {
             let tail: Vec<&str> = text.lines().rev().take(20).collect();
             println!(
@@ -4627,40 +4425,28 @@ mod gate {
                 println!("  {l}");
             }
         }
-        let paged = paged_line(&text);
-        let arena = paged
-            .as_deref()
-            .and_then(|l| field(l, "arena"))
-            .and_then(|v| v.parse::<u64>().ok());
         println!(
-            "paged: small card, budget {budget} B: one card {one_card}, draft yield with={with:?} \
-             (the gate's plan: the drafted fit reaches {} a slot), {}; load draft=off ({})",
-            CTX / 2,
-            paged.as_deref().unwrap_or("no paged line"),
+            "paged: small card, budget {budget} B: one card {one_card}, draft yield \
+             {yielded:?} (the gate's plan: the drafted choice takes {rung}); load draft=off ({})",
             off.as_deref().unwrap_or("none")
         );
-        // The premise: the box's one-card view, and the yield judged on the
-        // two-slot drafted plan.
+        // The premise: the box's one-card view, and the yield at the rung the
+        // gate's plans put it.
         check(
             &mut ok,
             "paged_small_card_yields_on_one_card",
-            one_card && yielded,
+            one_card && yielded.is_some_and(|y| y.with as u64 == rung),
         );
         let line = parallel_line(&err_log)?;
         let one = line.as_deref().is_some_and(|l| {
             field(l, "slots").as_deref() == Some("1")
-                && field(l, "from").as_deref() == Some("paged")
+                && field(l, "from").as_deref() == Some("default")
         });
-        let asked = paged.as_deref().is_some_and(|l| {
-            field(l, "asked_slots").as_deref() == Some("2")
-                && field(l, "asked_draft").as_deref() == Some("on")
-                && field(l, "draft").as_deref() == Some("off")
-        });
-        let why = arena.map(|arena| bloomery_levers::Draft38Off::Paged { arena }.to_string());
+        let why = yielded.map(|y| bloomery_levers::Draft38Off::Yield(y).to_string());
         check(
             &mut ok,
-            "paged_small_card_load_names_the_rule",
-            one && asked && arena.is_some_and(|a| a > 0) && why.is_some() && off == why,
+            "paged_small_card_load_names_the_yield",
+            one && paged_line(&text).is_none() && why.is_some() && off == why,
         );
 
         // `generate_qwen3moe` under the same rule: with no `--place` (the
@@ -4731,18 +4517,22 @@ mod gate {
         Ok(ok)
     }
 
-    /// The card budget under which the file's drafted two-slot plan on the
-    /// 3090 (its free bytes `free`, the seat's census reading) holds half of
-    /// [`CTX`] a slot, to a MiB: the least under which the plan at `CTX / 2`
-    /// a slot holds, so the drafted fit reaches it. The seat's unset draft
-    /// yields to the context there — the drafted fit under [`CTX`], the plain
-    /// one past it — as on a 12 GB card. The plan is the small-card server's:
-    /// the unset head and the draft file beside the target (that server sets
-    /// neither lever), the census's 3090 as `a` resolves it
-    /// (`devices::spec_of_device`: the known spec with the census's free
-    /// bytes) and no draft reserve in the machine, which a one-card plan
-    /// counts in `plan_mtp_with_slots`.
-    fn small_card_budget(levers: &bloomery_levers::Levers, free: u64) -> Result<u64, GateError> {
+    /// The card budget under which the unset draft yields to the context on
+    /// the 3090 (its free bytes `free`, the seat's census reading), to a
+    /// MiB, and the rung the drafted choice takes there: for each rung below
+    /// the target in turn ([`ctx_ladder::rungs`] under [`limit38`]), the
+    /// least budget under which the file's drafted one-slot plan holds the
+    /// rung, kept when the plain plan holds the rung above it there — the
+    /// drafted choice halves to the rung and the plain one holds more, as on
+    /// a 12 GB card. The plan is the small-card server's: the unset head and
+    /// the draft file beside the target (that server sets neither lever),
+    /// the census's 3090 as `a` resolves it (`devices::spec_of_device`: the
+    /// known spec with the census's free bytes) and no draft reserve in the
+    /// machine, which a one-card plan counts in `plan_mtp_with_slots`.
+    fn small_card_budget(
+        levers: &bloomery_levers::Levers,
+        free: u64,
+    ) -> Result<(u64, u64), GateError> {
         const MIB: u64 = 1 << 20;
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -4758,43 +4548,67 @@ mod gate {
         })?;
         let rows = head_rows_of(None, &split, inputs.spec.vocab)?.rows;
         let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
-        let holds = |budget: u64, c: usize| -> Result<bool, GateError> {
+        let holds = |budget: u64, c: u64, drafted: bool| -> Result<bool, GateError> {
             let mut machine = machine_for_experts(
                 RTX_3090,
                 inputs.spec.layers.len(),
-                u64::try_from(ubatch_for(c)?)?,
+                u64::try_from(ubatch_for(usize::try_from(c)?)?)?,
                 experts,
             );
             machine.cards[0].free_bytes = Some(free);
             let plan_levers = PlanLevers {
                 card_budget_bytes: Some(budget),
             };
-            Ok(inputs
-                .plan_mtp_with_slots(&machine, u64::try_from(c)?, &plan_levers, &mtp, experts, 2)
-                .is_ok())
-        };
-        let want = CTX / 2;
-        let (mut lo, mut hi) = (1, free / MIB);
-        if !holds(hi * MIB, want)? {
-            return Err(format!(
-                "the 3090's {free} free bytes hold no drafted two-slot plan at {want} positions a \
-                 slot: no budget makes the small card's case"
-            )
-            .into());
-        }
-        while lo + 1 < hi {
-            let mid = lo + (hi - lo) / 2;
-            if holds(mid * MIB, want)? {
-                hi = mid;
+            Ok(if drafted {
+                inputs
+                    .plan_mtp_with_slots(&machine, c, &plan_levers, &mtp, experts, 1)
+                    .is_ok()
             } else {
-                lo = mid;
+                inputs
+                    .plan_with_slots(&machine, c, &plan_levers, experts, 1)
+                    .is_ok()
+            })
+        };
+        let rungs = ctx_ladder::rungs(limit38(&inputs)?.0);
+        for pair in rungs.windows(2) {
+            let (above, rung) = (pair[0], pair[1]);
+            let (mut lo, mut hi) = (1, free / MIB);
+            if !holds(hi * MIB, rung, true)? {
+                continue;
+            }
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                if holds(mid * MIB, rung, true)? {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let budget = hi * MIB;
+            if holds(budget, above, false)? && !holds(budget, above, true)? {
+                println!(
+                    "paged: the small card's budget {budget} B (the drafted plan holds {rung}, \
+                     the plain plan {above})"
+                );
+                return Ok((budget, rung));
             }
         }
-        let budget = hi * MIB;
-        let cap = usize::try_from(serve_ctx(1, &inputs.hp)?)?;
-        let fit = model::placement::ctx::largest(want, cap, |c| holds(budget, c))?;
-        println!("paged: the small card's budget {budget} B (drafted two-slot fit {fit} a slot)");
-        Ok(budget)
+        Err(format!(
+            "the 3090's {free} free bytes give no budget under which the drafted one-slot plan \
+             halves a rung the plain plan holds ({rungs:?}): no budget makes the small card's case"
+        )
+        .into())
+    }
+
+    /// The model's limit as the seat names it: the file's trained context
+    /// within `place::KERNEL_POSITIONS`.
+    fn limit38(inputs: &PlanInputs) -> Result<(u64, &'static str), GateError> {
+        Ok(CtxLimit {
+            trained: u64::try_from(inputs.hp.n_ctx_train)?,
+            kernel: Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")),
+            verified: None,
+        }
+        .limit())
     }
 
     /// The plain arm (the module header): the main server with the draft
