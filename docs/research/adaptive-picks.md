@@ -51,7 +51,7 @@ shipped head list was chosen on (§3.11).
 | 3.1 | `width.rs:448-500`: one chooser state per slot (`drafted.rs:100-107`) or per process (`ds41.rs:1120`) across requests; `drafted.rs:351-358` restarts the draft, not the chooser | request: head class | windows priced on the old class's profile and costs | 0..+2.5 % after a switch `[derived]` | open (head round) |
 | 3.2 | `registry.rs:334` `DRAFT` unset on V4.1 = plain | run-time: the chooser | positions per pass | threads/code ≤ +10 %, prose ~0 `[derived]` | open `v41lookup` |
 | 3.3 | `registry.rs:769` `QWEN3_KV` unset = f16 | config/run-time: depth | KV bytes a step | +4..+28 % by depth `[derived]` | open `q3kvdepth` |
-| 3.4 | `body35.rs:1906-1921`: a placed load runs every prompt as 8-row passes | request: P; probe: lane rate | host-union ms → PCIe + card | 12 GB: TTFT ÷ 5–15 `[derived]` | open `q35hybpp` (triage item) |
+| 3.4 | `body35.rs` `placed_open`: a placed load runs a prompt as units of 512 rows; the 8-row reading below is the walk before that | request: P; probe: lane rate | host-union ms → PCIe + card | 12 GB: TTFT ÷ 5–15 `[derived]` | open `q35hybpp` (triage item) |
 | 3.5 | `width.rs:622` `round_ran`: a multi-slot round verifies every slot's whole width | run-time: live slots, each slot's profile | rows a round | 0 on matched slots; mixed pairs unknown | ledger |
 | 3.6 | Qwen3.8/GLM: MTP is the only proposer | run-time: n-gram hit beside MTP | positions per window | ≤ +11.4 % ceiling (Qwen3.8) `[derived]` | ledger |
 | 3.7 | every process starts residency from the id-prefix seed | the user's own routing, persisted | card hit rate in the transient | one-shot runs only; cross-topic carry unknown | ledger (Mac replay) |
@@ -166,8 +166,12 @@ margin. With no measured gain past 2, the model gives it no workload term.
 
 ### 3.4 Hybrid prompt path by prompt length (qwen35moe placed loads)
 
-1. **Where.** A placed qwen35moe load runs every prompt as passes of at most 8 rows through the host tier's batch
-   port, whatever its length (`crates/gpu/src/arch/qwen3moe/body35.rs:1906-1921`, `:155-162`).
+1. **Where.** ~~A placed qwen35moe load runs every prompt as passes of at most 8 rows through the host tier's batch
+   port, whatever its length.~~ A placed qwen35moe load now walks a prompt in units of `PLACED_ROWS` = 512 rows on
+   the wide arm, each unit reading a host expert once (`crates/gpu/src/arch/qwen3moe/body35.rs` `placed_open`,
+   `placed.rs`). Eight-row passes remain only under `--prefill pass` and for a prompt of at most 8 ids. The
+   decomposition below prices the old 8-row walk; for units of 512 the host union's compute is the wall, and
+   `docs/cards/q35pfa.card` derives 325–510 tok/s at the 3060 shape, unmeasured there.
 2. **Fact.** The prompt length P (request) and the lane's copy rate (the load's probe), priced by
    `runtime::xsplit`. No model or card name enters that rule (`crates/runtime/src/xsplit.rs:1-5`).
 3. **Decomposition.** Measured on the 3060 test PC (RTX 3060 12 GB, WSL2): a 1,464-token prompt took 10.1 s TTFT, 145
