@@ -1339,7 +1339,7 @@ impl Body {
         lanes: KdaLanes,
         slots: usize,
     ) -> Result<Glm5nextModel, GpuError> {
-        let tiers = TierOpen::of_machine(plan.machine);
+        let tiers = TierOpen::of_machine(plan.machine)?;
         refuse_tiers_before_upload(plan, inputs, card, &tiers, None)?;
         refuse_other_lanes(plan, inputs, card, (lanes, slots), None)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
@@ -1452,7 +1452,7 @@ impl Body {
         slots: usize,
     ) -> Result<Glm5nextModel, GpuError> {
         let target = &plan.plan;
-        let tiers = TierOpen::of_machine(target.machine);
+        let tiers = TierOpen::of_machine(target.machine)?;
         refuse_tiers_before_upload(target, inputs, card, &tiers, Some(nextn.index))?;
         refuse_other_lanes(target, inputs, card, (KdaLanes::Two, slots), Some(nextn))?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();

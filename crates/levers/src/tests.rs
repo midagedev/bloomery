@@ -41,8 +41,9 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 
 /// Whether the pool reads it: it is on every binary's list.
 /// The rows read below every binary's `main` (the pool's two, the host's
-/// room and the NVMe tier's three, [`nvtier_levers`], and the tier link,
-/// [`tier_link`]), which no `at_main` list refuses.
+/// room, the NVMe tier's three, [`nvtier_levers`], the tier link,
+/// [`tier_link`], and the tiers' nodes, [`tier_nodes`]), which no `at_main`
+/// list refuses.
 fn pool(r: &LeverSpec) -> bool {
     r.name == THREADS
         || r.name == SPIN
@@ -51,6 +52,7 @@ fn pool(r: &LeverSpec) -> bool {
         || r.name == NVTIER_READ
         || r.name == NVTIER_MEM
         || r.name == TIER_LINK
+        || r.name == TIER_NODES
 }
 
 /// Every file that reads a lever in place, with its round.
@@ -77,6 +79,7 @@ fn sample(kind: Kind) -> String {
         Kind::FileAt => format!("{A_FILE}:0"),
         Kind::Text => "text".into(),
         Kind::Residency => "mid-p33-s1".into(),
+        Kind::Addrs => "127.0.0.1:7340".into(),
     }
 }
 
@@ -146,6 +149,18 @@ fn garbage(kind: Kind) -> Vec<String> {
             ":0".to_string(),
         ]),
         Kind::Path | Kind::PathOr(_) | Kind::Text => {}
+        Kind::Addrs => g.extend(
+            [
+                "127.0.0.1",
+                "localhost:7340",
+                " 127.0.0.1:7340",
+                "127.0.0.1:7340,",
+                "127.0.0.1:7340,127.0.0.1:7340",
+                "127.0.0.1:65536",
+                "10.0.0.2:7340",
+            ]
+            .map(String::from),
+        ),
         Kind::Residency => g.extend(
             [
                 "OFF",
@@ -499,6 +514,7 @@ fn accessors_read_their_rows() {
             NVTIER_READ,
             NVTIER_MEM,
             TIER_LINK,
+            TIER_NODES,
             PIN_MAIN,
             DRAFT,
             MTP_HEAD_ROWS,

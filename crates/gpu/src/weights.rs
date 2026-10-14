@@ -16,7 +16,7 @@ use crate::upload::{Stage, UploadRing, bytes_of};
 use crate::{Gpu, GpuError};
 use ::model::placement::host_lock::PageDrop;
 use ::model::placement::{
-    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment,
+    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment, Span,
 };
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use gguf::quant::{GgmlType, dequant_row};
@@ -828,13 +828,83 @@ fn load_segments(
     })
 }
 
+/// Where placement segment `seg` of tensor `t`, a stack of `experts` when it
+/// is one, lies in a split ([`SegmentFile::of`]): the tensor's shard and
+/// header, that shard's reader, the segment's spans, and their file bytes as
+/// one borrowed slice a span. The upload ([`upload_segment`]) and a tier
+/// node's digest of the rows it holds (`host::node`) read these bytes.
+pub(crate) struct SegmentFile<'f> {
+    pub shard: usize,
+    pub info: &'f TensorInfo,
+    pub gguf: &'f Gguf,
+    pub spans: Vec<Span>,
+    pub bytes: Vec<&'f [u8]>,
+}
+
+impl<'f> SegmentFile<'f> {
+    /// Find `t` in `split`, confirm it is the tensor the placement was made
+    /// from, and borrow the file bytes of `seg`'s spans; a tensor the split
+    /// lacks or holds otherwise, and spans past its bytes, are refused by
+    /// name.
+    pub(crate) fn of(
+        split: &'f Split,
+        experts: u64,
+        t: &ModelTensor,
+        seg: &Segment,
+    ) -> Result<SegmentFile<'f>, GpuError> {
+        let spans = seg
+            .spans(t, experts)
+            .map_err(|e| GpuError::plan(PLACED, e))?;
+        let (shard, info) = split
+            .find(&t.name)
+            .ok_or_else(|| placed_refusal(t, "is not in the split".to_string()))?;
+        if shard != t.shard || info.ty != t.ty || info.dims != t.dims || info.nbytes != t.file_bytes
+        {
+            let detail = format!(
+                "the split's shard {shard} {} {:?} ({} bytes) is not the plan's shard {} {} {:?} \
+                 ({} bytes)",
+                info.ty, info.dims, info.nbytes, t.shard, t.ty, t.dims, t.file_bytes
+            );
+            return Err(placed_refusal(t, detail));
+        }
+        let gguf = split
+            .shard(shard)
+            .ok_or_else(|| placed_refusal(t, format!("shard {shard} is not in the split")))?;
+        let data = gguf.data(info)?;
+        let mut bytes = Vec::with_capacity(spans.len());
+        for span in &spans {
+            let range = (|| {
+                Some(
+                    usize::try_from(span.bytes.start).ok()?
+                        ..usize::try_from(span.bytes.end).ok()?,
+                )
+            })()
+            .and_then(|r| data.get(r));
+            let slice = range.ok_or_else(|| {
+                placed_refusal(
+                    t,
+                    format!("spans {spans:?} run past its {} file bytes", info.nbytes),
+                )
+            })?;
+            bytes.push(slice);
+        }
+        Ok(SegmentFile {
+            shard,
+            info,
+            gguf,
+            spans,
+            bytes,
+        })
+    }
+}
+
 /// Upload placement segment `seg` of tensor `t`, a stack of `experts` when
-/// it is one: find the tensor in `split`, confirm it is the tensor the
-/// placement was made from, upload the rows the segment holds (their file
-/// bytes as one borrowed slice per span, so a whole-tensor segment uploads
-/// from the mapping itself and an expert stack streams its spans without a
-/// gathered copy), and hand back the file bytes the caller may release now
-/// that they are staged — empty for a tensor a step reads from the file.
+/// it is one: find its bytes in `split` ([`SegmentFile::of`]), upload the
+/// rows the segment holds (their file bytes as one borrowed slice per span,
+/// so a whole-tensor segment uploads from the mapping itself and an expert
+/// stack streams its spans without a gathered copy), and hand back the file
+/// bytes the caller may release now that they are staged — empty for a
+/// tensor a step reads from the file.
 fn upload_segment(
     ring: &mut UploadRing,
     stream: &CudaStream,
@@ -846,40 +916,16 @@ fn upload_segment(
     let Format::Card(format) = seg.format else {
         return Err(placed_refusal(t, format!("is on a card as {}", seg.format)));
     };
-    let spans = seg
-        .spans(t, experts)
-        .map_err(|e| GpuError::plan(PLACED, e))?;
-    let (s, info) = split
-        .find(&t.name)
-        .ok_or_else(|| placed_refusal(t, "is not in the split".to_string()))?;
-    if s != t.shard || info.ty != t.ty || info.dims != t.dims || info.nbytes != t.file_bytes {
-        let detail = format!(
-            "the split's shard {s} {} {:?} ({} bytes) is not the plan's shard {} {} {:?} ({} bytes)",
-            info.ty, info.dims, info.nbytes, t.shard, t.ty, t.dims, t.file_bytes
-        );
-        return Err(placed_refusal(t, detail));
-    }
-    let g = split
-        .shard(s)
-        .ok_or_else(|| placed_refusal(t, format!("shard {s} is not in the split")))?;
+    let SegmentFile {
+        shard: s,
+        info,
+        gguf: g,
+        spans,
+        bytes: src,
+    } = SegmentFile::of(split, experts, t, seg)?;
     let held: u64 = spans.iter().map(|s| s.rows.end - s.rows.start).sum();
     let rows =
         usize::try_from(held).map_err(|_| placed_refusal(t, format!("{held} rows pass usize")))?;
-    let data = g.data(info)?;
-    let mut src = Vec::with_capacity(spans.len());
-    for span in &spans {
-        let range = (|| {
-            Some(usize::try_from(span.bytes.start).ok()?..usize::try_from(span.bytes.end).ok()?)
-        })()
-        .and_then(|r| data.get(r));
-        let slice = range.ok_or_else(|| {
-            placed_refusal(
-                t,
-                format!("spans {spans:?} run past its {} file bytes", info.nbytes),
-            )
-        })?;
-        src.push(slice);
-    }
     let dw = upload_rows(stream, ring, PLACED, format, info, rows, &src)?;
     if u64::try_from(dw.resident_bytes()).ok() != Some(seg.resident_bytes) {
         // The upload's copies may still be running into the buffers this

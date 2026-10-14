@@ -56,9 +56,11 @@
 //! A tier's work on its card ([`TierWork`]: its stacks, staging, windows and
 //! graphs) is apart from the stage side that drives it ([`TierCard`]: the
 //! replay or feed decision, the books, the settle, the release and the
-//! reset).
+//! reset). The work runs in this process, or in a tier node's
+//! ([`super::node`]), which runs the same steps when the stage side asks.
 
 use std::mem::ManuallyDrop;
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,8 +69,10 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, sys};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use model::placement::Machine;
+use model::placement::devices::DeviceInfo;
 
 use super::link::{Crossing, Link, LinkEnd, Reader};
+use super::node::TierNode;
 use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
@@ -216,22 +220,38 @@ impl TierSet {
 
 /// A tier card a placed load hangs under the host tier: the plan's device
 /// index its routed segments sit on (`Device::Card(card)`), the card's name,
-/// and the device the plan resolved it to, by which it opens
-/// ([`Gpu::open_card`]).
+/// the device the plan resolved it to, by which it opens
+/// ([`Gpu::open_card`]), and the node that serves it, when it runs on one
+/// ([`super::node`]).
 #[derive(Clone, Debug)]
 pub struct TierOpen {
     pub card: usize,
     pub name: String,
     pub device: Option<model::placement::workstation::DeviceId>,
+    pub node: Option<SocketAddr>,
 }
 
 impl TierOpen {
     /// The expert tier cards `machine` names, in tier order: each card's
-    /// index in [`Machine::all_cards`] (after the stage cards), its name and
-    /// its device. Empty without a tier.
-    #[must_use]
-    pub fn of_machine(machine: &Machine) -> Vec<TierOpen> {
-        machine
+    /// index in [`Machine::all_cards`] (after the stage cards), its name, its
+    /// device, and the node `BLOOMERY_TIER_NODES` names for it, the lever's
+    /// `t`-th address for tier `t`. Empty without a tier. A lever that names
+    /// another count of nodes than the machine's tiers is refused by name.
+    pub fn of_machine(machine: &Machine) -> Result<Vec<TierOpen>, GpuError> {
+        const WHAT: &str = "TierOpen::of_machine";
+        let nodes = bloomery_levers::tier_nodes().map_err(|e| GpuError::plan(WHAT, e))?;
+        if !nodes.is_empty() && nodes.len() != machine.tiers.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} names {} tier nodes for a plan of {} expert tiers: one a tier",
+                    bloomery_levers::TIER_NODES,
+                    nodes.len(),
+                    machine.tiers.len()
+                ),
+            ));
+        }
+        Ok(machine
             .tiers
             .iter()
             .enumerate()
@@ -239,8 +259,27 @@ impl TierOpen {
                 card: machine.cards.len() + i,
                 name: t.name.clone(),
                 device: t.device,
+                node: nodes.get(i).copied(),
             })
-            .collect()
+            .collect())
+    }
+
+    /// The tier's card, opened in this process ([`Gpu::open_card`]), for a
+    /// family whose tier opens only on a card of the loading process: a tier
+    /// that runs on a node is refused by name, as `what`, before any card
+    /// opens.
+    pub fn open_here(&self, what: &'static str) -> Result<Gpu, GpuError> {
+        if let Some(addr) = self.node {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the expert tier {} on the node at {addr}: this family's tier opens on a \
+                     card of the loading process only",
+                    self.name
+                ),
+            ));
+        }
+        Gpu::open_card(&self.name, self.device)
     }
 }
 
@@ -598,11 +637,40 @@ impl TierPage {
         kind: TierLink,
     ) -> Result<TierPage, GpuError> {
         const NEW: &str = "TierPage::new";
-        let ctx = stage.context();
-        let bytes = layout
+        let bytes = Self::bytes_of(layout, NEW)?;
+        let link = Link::new(
+            kind,
+            stage.context(),
+            tier.context(),
+            bytes,
+            layout.crossings(),
+            NEW,
+        )?;
+        Self::over(stage, layout, link)
+    }
+
+    /// The page laid out by `layout` for a load with a tier on a node: a
+    /// shared page in a file the node's process opens ([`Link::across`]),
+    /// every tier's fault copy clean, with the stage card's windows.
+    /// Load-time only; `stage`'s context is current on return.
+    pub(super) fn across(stage: &Gpu, layout: TierLayout) -> Result<TierPage, GpuError> {
+        let bytes = Self::bytes_of(layout, "TierPage::across")?;
+        let link = Link::across(stage.context(), bytes)?;
+        Self::over(stage, layout, link)
+    }
+
+    /// The bytes a page laid out by `layout` holds; past `usize` refused by
+    /// name as `what`.
+    fn bytes_of(layout: TierLayout, what: &'static str) -> Result<usize, GpuError> {
+        layout
             .bytes()
-            .ok_or_else(|| GpuError::shape(NEW, "the page's size passes usize"))?;
-        let link = Link::new(kind, ctx, tier.context(), bytes, layout.crossings(), NEW)?;
+            .ok_or_else(|| GpuError::shape(what, "the page's size passes usize"))
+    }
+
+    /// The page over `link`, laid out by `layout`, every tier's fault copy
+    /// clean, with the stage card's windows in `stage`'s context.
+    fn over(stage: &Gpu, layout: TierLayout, link: Link) -> Result<TierPage, GpuError> {
+        let ctx = stage.context();
         for t in 0..layout.tiers {
             link.store(layout.word_off(t, TWord::Fault), FAULT_NONE);
         }
@@ -639,6 +707,13 @@ impl TierPage {
     #[must_use]
     pub fn layout(&self) -> TierLayout {
         self.layout
+    }
+
+    /// Remove the name of the file the page is shared through, once every
+    /// tier node has opened it ([`Link::unlink`]); nothing for a page of this
+    /// process alone.
+    pub(super) fn unlink(&mut self) -> Result<(), GpuError> {
+        self.link.unlink()
     }
 
     /// Row `row`'s image as tier `tier` reads it and the routed rows, for
@@ -995,17 +1070,18 @@ struct Stage {
 
 /// The tier graphs' slots: the step, the pair, the quad, and one per
 /// [`Chain::Cols`] width `2..=DEFER_MAX_COLS` ([`chain_slot`]).
-const TIER_CHAINS: usize = 2 + DEFER_MAX_COLS;
+pub(super) const TIER_CHAINS: usize = 2 + DEFER_MAX_COLS;
 
 /// An expert tier's work on its card: its `Gpu` (its own stream and fault
 /// word), its resident stacks, the architecture's computation, the staging
 /// a layer's kernels read, its windows over the page and one captured graph
-/// per chain. The tier card that drives it holds it ([`TierCard`]); each
-/// method is one step the stage side's protocol asks of the tier, and the
-/// stage side alone decides which.
+/// per chain. A tier card in the stage card's process holds it
+/// ([`TierCard`]); a tier node's server holds it in another
+/// ([`super::node`]). Each method is one step the stage side's protocol asks
+/// of the tier, and the stage side alone decides which.
 ///
 /// Field order is drop order: the graphs before the buffers they address,
-/// the windows and the weights before the card.
+/// the windows before the link, the weights and the link before the card.
 pub(crate) struct TierWork {
     graphs: [Option<Graph>; TIER_CHAINS],
     experts: Box<dyn TierExperts>,
@@ -1030,6 +1106,9 @@ pub(crate) struct TierWork {
     /// Columns a row's image carries ([`TierWork::open`]).
     cols: usize,
     weights: Weights,
+    /// The page as a tier node opened it ([`TierWork::bind_opened`]); `None`
+    /// beside the stage card, whose host tier owns the page.
+    link: Option<Link>,
     gpu: Gpu,
 }
 
@@ -1080,6 +1159,7 @@ impl TierWork {
             shape,
             cols,
             weights,
+            link: None,
             gpu,
         })
     }
@@ -1092,6 +1172,11 @@ impl TierWork {
     /// The tier's resident stacks.
     pub(super) fn weights(&self) -> &Weights {
         &self.weights
+    }
+
+    /// The staging's q8_1 codes and scales ([`Staged::planes`]).
+    pub(super) fn planes(&self) -> (usize, usize) {
+        self.act.planes()
     }
 
     /// The layout of a page of `tiers` tiers the work's staging reads.
@@ -1122,7 +1207,8 @@ impl TierWork {
                 // SAFETY: row r's routed rows (`n_used · cols · hidden` f32)
                 // lie inside the page, apart from every other row's (the
                 // layout's strides); the host tier frees the page only after
-                // its cards.
+                // its cards, and a node's link is a field dropped after the
+                // windows, bound once ([`TierWork::bind_opened`]).
                 TierRows(unsafe {
                     window::<f32>(
                         end.dev(layout.rows_off(r)),
@@ -1134,6 +1220,52 @@ impl TierWork {
             .collect();
         self.end = Some((end, layout));
         self.index = index;
+    }
+
+    /// [`TierWork::bind`] on a tier node, to the page the stage card's
+    /// process made, the file at `path`, `bytes` long, laid out for `tiers`
+    /// tiers: opened in the work's context ([`Link::open_across`]), its end
+    /// that context's address of the page, the link kept while the work
+    /// lives. A second bind, a tier the page does not carry and a page
+    /// smaller than the layout are refused by name before the page is
+    /// opened: the graphs captured hold the first page's addresses.
+    pub(super) fn bind_opened(
+        &mut self,
+        path: &std::path::Path,
+        bytes: usize,
+        tiers: usize,
+        index: usize,
+    ) -> Result<(), GpuError> {
+        const BIND: &str = "TierWork::bind_opened";
+        if self.link.is_some() {
+            return Err(GpuError::shape(
+                BIND,
+                "a second bind: the tier is bound to a page already, and its graphs hold that \
+                 page's addresses",
+            ));
+        }
+        let layout = self.page_layout(tiers)?;
+        let need = layout
+            .bytes()
+            .ok_or_else(|| GpuError::shape(BIND, "the page's size passes usize"))?;
+        if bytes < need || index >= tiers {
+            return Err(GpuError::shape(
+                BIND,
+                format!(
+                    "tier {index} of a page of {bytes} bytes laid out for {tiers} tiers of \
+                     {need}: the stage card's process laid out another page"
+                ),
+            ));
+        }
+        let link = Link::open_across(self.gpu.context(), path, bytes)?;
+        self.bind(layout, index, link.stage_end());
+        self.link = Some(link);
+        Ok(())
+    }
+
+    /// Rows of the page the work is bound to; `None` before it is bound.
+    pub(super) fn page_rows(&self) -> Option<usize> {
+        self.end.map(|(_, l)| l.rows)
     }
 
     /// Launch the graph held in `chain`'s slot on the tier's stream; a chain
@@ -1214,6 +1346,59 @@ impl TierWork {
         Ok(())
     }
 
+    /// [`TierWork::clear_fault`] with every wait for the stream polled, at
+    /// most `deadline` each; past it the call fails by name as `what`. A
+    /// tier node's server clears this way, so a stream that never drains
+    /// leaves it free to see its stage side lost.
+    pub(super) fn clear_fault_within(
+        &self,
+        deadline: Duration,
+        what: &'static str,
+    ) -> Result<(), GpuError> {
+        self.drain(deadline, what)?;
+        self.gpu.clear_fault()?;
+        self.drain(deadline, what)
+    }
+
+    /// Wait, polling, until the tier's stream has drained, at most
+    /// `deadline`; past it the wait fails by name as `what`.
+    pub(super) fn drain(&self, deadline: Duration, what: &'static str) -> Result<(), GpuError> {
+        super::drain_within(self.gpu.stream(), deadline, what)
+    }
+
+    /// The tier card's fault word, once its stream drained ([`Gpu::fault`]).
+    pub(super) fn fault(&self) -> Result<Option<Fault>, GpuError> {
+        self.gpu.fault()
+    }
+
+    /// On a tier node, the layers the tier has served since load, as its
+    /// progress word on the page says; `None` before it is bound to a page
+    /// it opened.
+    pub(super) fn opened_progress(&self) -> Option<u32> {
+        let (link, (_, layout)) = (self.link.as_ref()?, self.end?);
+        Some(link.load(layout.word_off(self.index, TWord::Prog)))
+    }
+
+    /// On a tier node whose stage card's process is lost, release the
+    /// tier's words for good, as [`TierCard::release`] does in one process:
+    /// every row's counter, then its go counter, far past anything a layer
+    /// takes back. Every go wait the tier's stream holds passes and the
+    /// stream drains; a stage side that runs again finds the counters
+    /// released and refuses the step by name ([`TierCard::released`]) rather
+    /// than read rows the tier served from images it never wrote. Nothing
+    /// before it is bound to a page it opened.
+    pub(super) fn release_opened(&self) {
+        let (Some(link), Some((_, layout))) = (self.link.as_ref(), self.end) else {
+            return;
+        };
+        let offs: Vec<usize> = (0..layout.rows)
+            .map(TWord::Cnt)
+            .chain((0..layout.rows).map(TWord::Go))
+            .map(|w| layout.word_off(self.index, w))
+            .collect();
+        link.release(&offs, RELEASE);
+    }
+
     /// The parts one tier layer's enqueue reads and writes; refused by name
     /// before the work is bound to a page.
     fn parts(&mut self) -> Result<Parts<'_>, GpuError> {
@@ -1250,15 +1435,32 @@ impl TierWork {
     }
 }
 
-/// An expert tier card as the stage side drives it: its work on the card
-/// ([`TierWork`]), its tier on the host tier's page, the go order each held
+/// Where a tier card's work runs: on a card of this process, or on a tier
+/// node's card ([`TierNode`]), which runs the same [`TierWork`] steps as
+/// requests over its channel.
+enum TierSide {
+    Here(Box<TierWork>),
+    Node(Box<TierNode>),
+}
+
+/// The error of a call that needs the tier's card in this process, on the
+/// tier `name` that runs on the node at `addr`.
+fn not_here(name: &str, addr: SocketAddr) -> GpuError {
+    GpuError::shape(
+        WHAT,
+        format!("the tier {name} runs on the node at {addr}: its card is not in this process"),
+    )
+}
+
+/// An expert tier card as the stage side drives it: where its work runs
+/// ([`TierSide`]), its tier on the host tier's page, the go order each held
 /// graph was captured for, which experts it holds, and what the host asked
 /// of it. Owned by the host tier ([`super::HostTier::attach_tiers`]), which
 /// binds it to the page; every call that reads or writes the page takes it.
 ///
 /// Field order is drop order: the work before the stage card's stream.
 pub struct TierCard {
-    work: TierWork,
+    side: TierSide,
     /// Per chain, the (layer, row) services its graph was captured for, in
     /// go order.
     captured: [Vec<(usize, usize)>; TIER_CHAINS],
@@ -1303,9 +1505,19 @@ impl TierCard {
         cols: usize,
     ) -> Result<TierCard, GpuError> {
         let work = TierWork::open(gpu, weights, experts, shape, cols)?;
+        Ok(TierCard::of(TierSide::Here(Box::new(work)), name, set))
+    }
+
+    /// The tier the node `node` serves (the card named `name`, holding
+    /// `set`), as its server opened it ([`TierNode::open`]).
+    pub(crate) fn on_node(node: TierNode, name: String, set: TierSet) -> TierCard {
+        TierCard::of(TierSide::Node(Box::new(node)), name, set)
+    }
+
+    fn of(side: TierSide, name: String, set: TierSet) -> TierCard {
         let layer_hits = vec![0; set.layers().len()];
-        Ok(TierCard {
-            work,
+        TierCard {
+            side,
             captured: std::array::from_fn(|_| Vec::new()),
             index: 0,
             set,
@@ -1316,13 +1528,66 @@ impl TierCard {
             },
             issued: 0,
             name,
-        })
+        }
     }
 
-    /// The tier's card.
+    fn work(&self) -> Result<&TierWork, GpuError> {
+        match &self.side {
+            TierSide::Here(w) => Ok(w),
+            TierSide::Node(n) => Err(not_here(&self.name, n.addr())),
+        }
+    }
+
+    fn work_mut(&mut self) -> Result<&mut TierWork, GpuError> {
+        match &mut self.side {
+            TierSide::Here(w) => Ok(w),
+            TierSide::Node(n) => Err(not_here(&self.name, n.addr())),
+        }
+    }
+
+    /// The tier's card, when it is in this process; a tier on a node is
+    /// refused by name.
+    pub fn gpu(&self) -> Result<&Gpu, GpuError> {
+        self.work().map(TierWork::gpu)
+    }
+
+    /// Resident bytes of the tier's stacks, wherever its card is.
     #[must_use]
-    pub fn gpu(&self) -> &Gpu {
-        self.work.gpu()
+    pub fn resident_bytes(&self) -> usize {
+        match &self.side {
+            TierSide::Here(w) => w.weights().resident_bytes(),
+            TierSide::Node(n) => n.resident_bytes(),
+        }
+    }
+
+    /// The address of the node the tier runs on; `None` for a card of this
+    /// process.
+    #[must_use]
+    pub fn node(&self) -> Option<SocketAddr> {
+        match &self.side {
+            TierSide::Here(_) => None,
+            TierSide::Node(n) => Some(n.addr()),
+        }
+    }
+
+    /// The device of its node's census the tier opened on; `None` for a
+    /// card of this process.
+    #[must_use]
+    pub fn node_device(&self) -> Option<&DeviceInfo> {
+        match &self.side {
+            TierSide::Here(_) => None,
+            TierSide::Node(n) => Some(n.device()),
+        }
+    }
+
+    /// Why the tier's node is lost, once its channel failed; `None` for a
+    /// card of this process and a node still reached.
+    #[must_use]
+    pub fn node_lost(&self) -> Option<&str> {
+        match &self.side {
+            TierSide::Here(_) => None,
+            TierSide::Node(n) => n.lost(),
+        }
     }
 
     /// The card's name, as the plan gives it.
@@ -1332,17 +1597,15 @@ impl TierCard {
     }
 
     /// Device bytes of the architecture's prompt-batch block scratch on the
-    /// tier card ([`TierExperts::block_bytes`]).
-    #[must_use]
-    pub fn block_bytes(&self) -> usize {
-        self.work.experts.block_bytes()
+    /// tier card ([`TierExperts::block_bytes`]), when it is in this process.
+    pub fn block_bytes(&self) -> Result<usize, GpuError> {
+        Ok(self.work()?.experts.block_bytes())
     }
 
     /// Where the architecture's block rows reach the set's rows
-    /// ([`TierExperts::block_rows`]).
-    #[must_use]
-    pub fn block_rows(&self) -> BlockRows {
-        self.work.experts.block_rows()
+    /// ([`TierExperts::block_rows`]), when the card is in this process.
+    pub fn block_rows(&self) -> Result<BlockRows, GpuError> {
+        Ok(self.work()?.experts.block_rows())
     }
 
     /// Which experts the tier holds.
@@ -1351,21 +1614,21 @@ impl TierCard {
         &self.set
     }
 
-    /// The tier's resident stacks.
-    #[must_use]
-    pub fn weights(&self) -> &Weights {
-        self.work.weights()
-    }
-
     /// The layout of a page of `tiers` tiers this card's staging reads.
     pub(super) fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
-        self.work.page_layout(tiers)
+        match &self.side {
+            TierSide::Here(w) => w.page_layout(tiers),
+            TierSide::Node(n) => n.page_layout(tiers),
+        }
     }
 
     /// Columns a row's image carries.
     #[must_use]
     pub fn cols(&self) -> usize {
-        self.work.cols
+        match &self.side {
+            TierSide::Here(w) => w.cols,
+            TierSide::Node(n) => n.cols(),
+        }
     }
 
     /// `chain`'s columns, refused by name past the tier's own.
@@ -1395,7 +1658,10 @@ impl TierCard {
     /// routed rows.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
-        self.work.device_bytes()
+        match &self.side {
+            TierSide::Here(w) => w.device_bytes(),
+            TierSide::Node(n) => n.device_bytes(),
+        }
     }
 
     /// Nodes per tier layer of a captured tier graph whose image carries
@@ -1411,8 +1677,15 @@ impl TierCard {
     /// replay captured it, or for a chain the tier does not serve.
     #[must_use]
     pub fn graph_nodes(&self, chain: Chain) -> Option<usize> {
-        let i = chain_slot(chain).ok()?;
-        self.work.graph_nodes(i)
+        self.graph_nodes_at(chain_slot(chain).ok()?)
+    }
+
+    /// Nodes of the graph held in slot `i`; `None` when none is held.
+    fn graph_nodes_at(&self, i: usize) -> Option<usize> {
+        match &self.side {
+            TierSide::Here(w) => w.graph_nodes(i),
+            TierSide::Node(n) => n.graph_nodes(i),
+        }
     }
 
     /// The tier's fault copy as `page` holds it: what the tier's last fault
@@ -1425,8 +1698,9 @@ impl TierCard {
 
     /// Enqueue layer `layer`'s tier experts over the block `io` of a prompt
     /// batch on the tier's stream ([`TierExperts::enqueue_block`]), the
-    /// tier's context bound; a layer the set holds no expert of is refused
-    /// by name. The caller binds its own context again afterwards.
+    /// tier's context bound; a layer the set holds no expert of, and a tier
+    /// on a node, are refused by name. The caller binds its own context
+    /// again afterwards.
     pub(super) fn enqueue_block(
         &mut self,
         layer: usize,
@@ -1438,16 +1712,18 @@ impl TierCard {
                 format!("layer {layer}: a tier block of a layer the tier holds no expert of"),
             ));
         }
-        self.work.enqueue_block(layer, io)
+        self.work_mut()?.enqueue_block(layer, io)
     }
 
     /// Bind the card to `page` as tier `index`: its end of the page's link
-    /// and its windows over the page's routed rows, in its own context, and
+    /// and its windows over the page's routed rows, in its own context, or
+    /// on a node, the page's file opened there ([`TierNode::bind`]); and
     /// `stage`'s stream and fault word kept. The card's staging copies and
     /// its waits take their addresses from that end; an end the link refuses
-    /// ([`Link::tier_end`]) refuses the call by name, and so does a page laid
-    /// out for another shape. The host tier's load-time call; `stage`'s
-    /// context is current on return.
+    /// ([`Link::tier_end`]) refuses the call by name, and so do a page laid
+    /// out for another shape and, for a tier on a node, a page no other
+    /// process can open. The host tier's load-time call; `stage`'s context
+    /// is current on return.
     pub(super) fn bind(
         &mut self,
         page: &TierPage,
@@ -1465,10 +1741,26 @@ impl TierCard {
                 ),
             ));
         }
-        let end = page
-            .link
-            .tier_end(self.work.gpu().context(), BIND, &self.name)?;
-        self.work.bind(layout, index, end);
+        match &mut self.side {
+            TierSide::Here(w) => {
+                let end = page.link.tier_end(w.gpu().context(), BIND, &self.name)?;
+                w.bind(layout, index, end);
+            }
+            TierSide::Node(n) => {
+                let Some(path) = page.link.path() else {
+                    return Err(GpuError::shape(
+                        BIND,
+                        format!(
+                            "the tier {} on the node at {}: the page is not shared through a \
+                             file (TierPage::new)",
+                            self.name,
+                            n.addr()
+                        ),
+                    ));
+                };
+                n.bind(path, page.link.bytes(), layout.tiers, index)?;
+            }
+        }
         self.index = index;
         self.stage = Some(Stage {
             stream: stage.stream_handle(),
@@ -1497,11 +1789,14 @@ impl TierCard {
         if list.is_empty() {
             return Ok(Pass::Graph);
         }
-        if self.work.graph_nodes(i).is_none() || self.captured[i] != list {
+        if self.graph_nodes_at(i).is_none() || self.captured[i] != list {
             self.stats.feeds += 1;
             return Ok(Pass::Feed);
         }
-        self.work.launch(chain)?;
+        match &mut self.side {
+            TierSide::Here(w) => w.launch(chain)?,
+            TierSide::Node(n) => n.launch(chain)?,
+        }
         self.issue(list.len());
         self.stats.replays += 1;
         self.rebind_stage()?;
@@ -1519,7 +1814,10 @@ impl TierCard {
         let i = chain_slot(chain)?;
         let cols = self.chain_cols(chain)?;
         self.captured[i].clear();
-        self.work.capture(chain, cols, list)?;
+        match &mut self.side {
+            TierSide::Here(w) => w.capture(chain, cols, list)?,
+            TierSide::Node(n) => n.capture(chain, cols, list)?,
+        };
         if list.is_empty() {
             return Ok(());
         }
@@ -1539,9 +1837,32 @@ impl TierCard {
         row: usize,
     ) -> Result<(), GpuError> {
         let cols = self.chain_cols(chain)?;
-        self.work.enqueue(layer, row, cols)?;
+        match &mut self.side {
+            TierSide::Here(w) => w.enqueue(layer, row, cols)?,
+            TierSide::Node(n) => n.enqueue(layer, row, cols)?,
+        }
         self.issue(1);
         self.rebind_stage()
+    }
+
+    /// Wait, polling, until the tier's stream has drained, at most
+    /// `deadline`; past it the wait fails by name as `what`. The stage
+    /// card's context is current on return.
+    pub(super) fn drain(&mut self, deadline: Duration, what: &'static str) -> Result<(), GpuError> {
+        match &mut self.side {
+            TierSide::Here(w) => w.drain(deadline, what)?,
+            TierSide::Node(n) => n.drain(deadline)?,
+        }
+        self.rebind_stage()
+    }
+
+    /// The tier card's fault word, once its stream drained
+    /// ([`Gpu::fault`]); the caller binds its own context again afterwards.
+    pub(super) fn card_fault(&mut self) -> Result<Option<Fault>, GpuError> {
+        match &mut self.side {
+            TierSide::Here(w) => w.fault(),
+            TierSide::Node(n) => n.fault(),
+        }
     }
 
     /// Make the stage card's context current again after tier work, so the
@@ -1640,6 +1961,15 @@ impl TierCard {
         page.release(self.index);
     }
 
+    /// Whether a row's counter of the tier holds a release
+    /// ([`TierCard::release`]): a tier node that lost this process
+    /// releases its own words ([`TierWork::release_opened`]), and every row
+    /// the tier served after that is stale.
+    pub(super) fn released(&self, page: &TierPage) -> bool {
+        (0..page.layout.rows)
+            .any(|r| page.link.load(page.off(self.index, TWord::Cnt(r))) >= RELEASE >> 1)
+    }
+
     /// Whether the tier's words hold what a drained step leaves: no go and
     /// no signal pending, every layer asked of it served.
     pub(super) fn at_rest(&self, page: &TierPage) -> bool {
@@ -1651,7 +1981,10 @@ impl TierCard {
     /// progress, the tier's fault word and its copy clean. The host tier's
     /// reset calls it.
     pub(super) fn reset(&mut self, page: &TierPage) -> Result<(), GpuError> {
-        self.work.sync()?;
+        match &mut self.side {
+            TierSide::Here(w) => w.sync()?,
+            TierSide::Node(n) => n.sync()?,
+        }
         for off in page.counters(self.index) {
             page.link.reset(off);
         }
@@ -1661,7 +1994,10 @@ impl TierCard {
 
     /// The tier's fault word and its copy back to clean.
     pub(super) fn clear_fault(&mut self, page: &TierPage) -> Result<(), GpuError> {
-        self.work.clear_fault()?;
+        match &mut self.side {
+            TierSide::Here(w) => w.clear_fault()?,
+            TierSide::Node(n) => n.clear_fault()?,
+        }
         let at = page.off(self.index, TWord::Fault);
         page.link.store(at, FAULT_NONE);
         page.link.store(at + 4, 0);
@@ -1724,7 +2060,7 @@ pub(super) enum Pass {
 /// The tier graph's slot of `chain`: the step 0, the pair 1, the quad the
 /// last slot, a [`Chain::Cols`] of `m` columns `m` for `2..=DEFER_MAX_COLS`;
 /// any other width is refused by name.
-fn chain_slot(chain: Chain) -> Result<usize, GpuError> {
+pub(super) fn chain_slot(chain: Chain) -> Result<usize, GpuError> {
     match chain {
         Chain::Step => Ok(0),
         Chain::Pair => Ok(1),
@@ -1946,14 +2282,38 @@ fn copy_page(
 #[cfg(test)]
 mod tests {
     use super::{
-        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierPage, TierSet, TierShape,
-        chain_slot,
+        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierOpen, TierPage, TierSet,
+        TierShape, chain_slot,
     };
     use crate::Gpu;
     use crate::host::slots::{HOST, Slot, SlotMap, TIER};
     use crate::host::step::{Chain, RELEASE};
     use bloomery_levers::TierLink;
     use model::ops::DEFER_MAX_COLS;
+
+    /// A family whose tier opens only in the loading process refuses a
+    /// tier on a node by name, in one sentence, before it opens a card.
+    #[test]
+    fn a_tier_on_a_node_is_refused_by_name() {
+        let t = TierOpen {
+            card: 1,
+            name: "GB10".into(),
+            device: None,
+            node: Some("127.0.0.1:7340".parse().expect("an address")),
+        };
+        let e = t
+            .open_here("deepseek41 open_tier")
+            .err()
+            .expect("a refusal")
+            .to_string();
+        assert!(
+            e.contains(
+                "the expert tier GB10 on the node at 127.0.0.1:7340: this family's tier opens on \
+                 a card of the loading process only"
+            ),
+            "{e}"
+        );
+    }
 
     /// A set's rows are ascending ids below the stack, each once; a map's
     /// set of a tier is that tier's entries in its slot order, and a layer

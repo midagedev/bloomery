@@ -51,7 +51,7 @@ impl StateBack {
         let mut cards = Vec::with_capacity(1 + body.hybrid().tiers().len());
         cards.push(card("stage", m.gpu())?);
         for (t, tier) in body.hybrid().tiers().iter().enumerate() {
-            cards.push(card(&format!("tier {t}"), tier.gpu())?);
+            cards.push(card(&format!("tier {t}"), tier.gpu()?)?);
         }
         // A tier's read bound its own context; the stage card's is current
         // again.

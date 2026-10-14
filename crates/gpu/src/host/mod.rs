@@ -91,7 +91,8 @@
 //! service and, once it has served the replay's last layer, waits for each
 //! card's progress under the go deadline and reads its fault copy (the module
 //! comment of [`tier`]). A card that stops signalling poisons the tier as a
-//! lost card, which no reset lifts.
+//! lost card, which no reset lifts. A tier card may run in another process,
+//! a tier node ([`node`]), whose channel lost is a lost card too.
 
 pub mod batch;
 pub mod census;
@@ -99,6 +100,7 @@ pub mod handoff;
 pub mod lane;
 pub mod leg;
 mod link;
+pub mod node;
 pub mod nvtier;
 pub mod page;
 pub mod prompt_stream;
@@ -1745,15 +1747,25 @@ impl<H: HostExperts> HostTier<H> {
             }
         }
         let kind = bloomery_levers::tier_link().map_err(|e| GpuError::plan(WHAT, e))?;
-        let page = TierPage::new(
-            stage,
-            tiers[0].gpu(),
-            tiers[0].page_layout(tiers.len())?,
-            kind,
-        )?;
+        let layout = tiers[0].page_layout(tiers.len())?;
+        let mut page = match (tiers.iter().find_map(TierCard::node), kind) {
+            (None, _) => TierPage::new(stage, tiers[0].gpu()?, layout, kind)?,
+            (Some(_), bloomery_levers::TierLink::Shared) => TierPage::across(stage, layout)?,
+            (Some(addr), bloomery_levers::TierLink::Loopback) => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "{} is loopback with an expert tier on the node at {addr}: the loopback's \
+                         tier side is a page of this process, and a node maps the shared page",
+                        bloomery_levers::TIER_LINK
+                    ),
+                ));
+            }
+        };
         for (t, tier) in tiers.iter_mut().enumerate() {
             tier.bind(&page, t, stage)?;
         }
+        page.unlink()?;
         self.tier_goes = tiers.iter().map(|t| t.progress(&page)).collect();
         self.tier_lists = tiers.iter().map(|_| Vec::new()).collect();
         self.tiers = tiers;
@@ -2045,9 +2057,21 @@ impl<H: HostExperts> HostTier<H> {
 
     /// Both batch sets free, at a group's start ([`BatchPort::begin`]); a
     /// poisoned tier is refused first, as [`BEGIN_GROUP`], so a call after a
-    /// failed service — a lost tier card among them — enqueues nothing.
+    /// failed service — a lost tier card among them — enqueues nothing. A
+    /// load with a tier on a node is refused by name: the port makes no tier
+    /// leg for it ([`HostTier::prepare_tier_batch`]).
     pub fn begin_group(&mut self) -> Result<(), GpuError> {
         self.health.refuse_if_poisoned(BEGIN_GROUP)?;
+        if let Some(t) = self.tiers.iter().find(|t| t.node().is_some()) {
+            return Err(GpuError::shape(
+                BEGIN_GROUP,
+                format!(
+                    "a prompt batch with the expert tier {} on a node: the batch port's tier \
+                     legs run on a card of this process; feed the prompt as steps",
+                    t.name()
+                ),
+            ));
+        }
         self.port_mut(BEGIN_GROUP)?.begin();
         Ok(())
     }
@@ -2315,11 +2339,7 @@ impl<H: HostExperts> HostTier<H> {
         let w = self.words();
         if let Some(page) = self.tier_page.as_ref() {
             for t in &mut self.tiers {
-                drain_within(
-                    t.gpu().stream(),
-                    DRAIN_DEADLINE,
-                    "Hybrid::reset: the expert tier's stream",
-                )?;
+                t.drain(DRAIN_DEADLINE, "Hybrid::reset: the expert tier's stream")?;
                 if !t.at_rest(page) {
                     return Err(GpuError::protocol(
                         what,
@@ -2636,7 +2656,7 @@ impl<H: HostExperts> HostTier<H> {
                     Ok(p) => pass[t] = p,
                     Err(e) => {
                         let at = self.tier_lists[t].first().map_or(0, |p| p.0);
-                        return Err(self.fail_released(SERVE, at, e));
+                        return Err(self.fail_tier(SERVE, at, t, e));
                     }
                 }
             }
@@ -2661,7 +2681,7 @@ impl<H: HostExperts> HostTier<H> {
         self.settle_tiers(last, listed)?;
         for t in (0..k).filter(|t| fed >> t & 1 == 1) {
             if let Err(e) = self.tiers[t].capture(chain, &self.tier_lists[t]) {
-                return Err(self.fail_released(SERVE, last, e));
+                return Err(self.fail_tier(SERVE, last, t, e));
             }
         }
         Ok(())
@@ -2677,17 +2697,13 @@ impl<H: HostExperts> HostTier<H> {
         mask: u32,
         chain: Chain,
     ) -> Result<(), GpuError> {
-        let r = match self.tier_page {
-            Some(_) => self
-                .tiers
-                .iter_mut()
-                .enumerate()
-                .filter(|(t, _)| mask >> t & 1 == 1)
-                .try_for_each(|(_, t)| t.enqueue_eager(chain, layer, row)),
-            None => Ok(()),
-        };
-        if let Err(e) = r {
-            return Err(self.fail_released(SERVE, layer, e));
+        if self.tier_page.is_none() {
+            return Ok(());
+        }
+        for t in (0..self.tiers.len()).filter(|t| mask >> t & 1 == 1) {
+            if let Err(e) = self.tiers[t].enqueue_eager(chain, layer, row) {
+                return Err(self.fail_tier(SERVE, layer, t, e));
+            }
         }
         Ok(())
     }
@@ -2707,6 +2723,25 @@ impl<H: HostExperts> HostTier<H> {
         }
     }
 
+    /// A request of service `what` at layer `layer` to tier `t` failed with
+    /// `e`: a tier whose node is lost ([`TierCard::node_lost`]: its channel
+    /// closed or timed out) is a lost card, named by its node
+    /// ([`HostTier::lose_tiers_as`]); any other failure is
+    /// [`HostTier::fail_released`]'s.
+    fn fail_tier(&mut self, what: &'static str, layer: usize, t: usize, e: GpuError) -> GpuError {
+        if !self.tiers.get(t).is_some_and(|c| c.node_lost().is_some()) {
+            return self.fail_released(what, layer, e);
+        }
+        self.lose_tiers_as(what, layer, 1 << t, |c, _| {
+            format!(
+                "the expert tier on {} at the node {}: {}: the card is lost",
+                c.name(),
+                c.node().map_or_else(String::new, |a| a.to_string()),
+                c.node_lost().unwrap_or_default()
+            )
+        })
+    }
+
     /// A service `what` of layer `layer` failed with `e` after either card
     /// may have been given work: poison the tier, release every card's
     /// waits, and return `e`.
@@ -2722,7 +2757,9 @@ impl<H: HostExperts> HostTier<H> {
     /// merged with the stage card's word once that card's stream has drained
     /// (the first layer wins). A tier that does not catch up in time is a
     /// lost card: the tier is poisoned, every card's waits released, and the
-    /// error names each tier still behind.
+    /// error names each tier still behind. So is a tier on a node whose
+    /// counters the node released ([`TierCard::released`]): it stopped
+    /// waiting for this process, and the rows it served since are stale.
     fn settle_tiers(&mut self, layer: usize, mask: u32) -> Result<(), GpuError> {
         let Some(page) = self.tier_page.as_ref() else {
             return Ok(());
@@ -2733,6 +2770,23 @@ impl<H: HostExperts> HostTier<H> {
                 let behind = self.behind_mask(mask) | 1 << t;
                 return Err(self.lose_tiers(SERVE, layer, behind, t0.elapsed()));
             }
+        }
+        let released = self
+            .tiers
+            .iter()
+            .enumerate()
+            .filter(|(t, c)| mask >> t & 1 == 1 && c.node().is_some() && c.released(page))
+            .fold(0, |m, (t, _)| m | 1 << t);
+        if released != 0 {
+            return Err(self.lose_tiers_as(SERVE, layer, released, |c, _| {
+                format!(
+                    "the expert tier on {} at the node {}: the node released the tier's words, \
+                     having seen no go from this process past its deadline, so the rows it \
+                     served since are stale: the card is lost",
+                    c.name(),
+                    c.node().map_or_else(String::new, |a| a.to_string())
+                )
+            }));
         }
         match tier::merged_fault(page, &self.tiers, mask)? {
             Some(f) => Err(GpuError::fault(SERVE, f)),

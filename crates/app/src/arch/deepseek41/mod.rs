@@ -86,7 +86,7 @@ impl Open for Body {
             hp: inputs.hp.clone(),
             levers: cfg.open.body,
         };
-        Body::open_placed_tiered(file, plan, 0, TierOpen::of_machine(plan.machine), &meta)
+        Body::open_placed_tiered(file, plan, 0, TierOpen::of_machine(plan.machine)?, &meta)
     }
 
     /// The batch's buffers under the batched schedule (with the card-timing

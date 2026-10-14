@@ -626,6 +626,55 @@ pub enum Format {
     Unused,
 }
 
+impl Format {
+    /// Every format, at its rank ([`Format::rank`]).
+    const ALL: [Format; 10] = [
+        Format::Card(CardFormat::KQuant),
+        Format::Card(CardFormat::Q5_0),
+        Format::Card(CardFormat::Q5_1),
+        Format::Card(CardFormat::Q8_0Planes),
+        Format::Card(CardFormat::F32),
+        Format::Card(CardFormat::Bf16AsF32),
+        Format::Card(CardFormat::Bf16Raw),
+        Format::HostFile,
+        Format::NvmeFile,
+        Format::Unused,
+    ];
+
+    /// The format's place in [`Format::ALL`]: an exhaustive match, so a new
+    /// format does not compile until it is given one, and the assertion
+    /// below holds the list in that order.
+    const fn rank(self) -> usize {
+        match self {
+            Format::Card(CardFormat::KQuant) => 0,
+            Format::Card(CardFormat::Q5_0) => 1,
+            Format::Card(CardFormat::Q5_1) => 2,
+            Format::Card(CardFormat::Q8_0Planes) => 3,
+            Format::Card(CardFormat::F32) => 4,
+            Format::Card(CardFormat::Bf16AsF32) => 5,
+            Format::Card(CardFormat::Bf16Raw) => 6,
+            Format::HostFile => 7,
+            Format::NvmeFile => 8,
+            Format::Unused => 9,
+        }
+    }
+
+    /// The format `word` names (its `Display`); `None` for a word no format
+    /// has.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Format> {
+        Format::ALL.into_iter().find(|f| f.to_string() == word)
+    }
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < Format::ALL.len() {
+        assert!(Format::ALL[i].rank() == i);
+        i += 1;
+    }
+};
+
 impl fmt::Display for Format {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -3913,6 +3962,17 @@ fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each format's word names it back, every word apart; another word
+    /// names none.
+    #[test]
+    fn a_formats_word_names_it() {
+        for f in Format::ALL {
+            assert_eq!(Format::of_word(&f.to_string()), Some(f), "{f}");
+        }
+        assert_eq!(Format::of_word("q4_k"), None);
+        assert_eq!(Format::of_word(""), None);
+    }
 
     /// The floor is the larger of a call's `k × columns + lane_slots` and the
     /// batched union's two batches and the lane's slots, and the union's term

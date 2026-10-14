@@ -62,3 +62,13 @@ pub fn stacks(model: &ModelTensors, plan: &Plan<'_>) -> Result<Qwen38Stacks, Gpu
         }
     })
 }
+
+/// The stacks of `model`'s layers, the layers `set` gives tier experts
+/// checked against [`Leg38`] ([`swap::stacks`]): a tier node's, which holds
+/// one tier's set and no plan. Load-time only.
+pub fn stacks_of_set(
+    model: &ModelTensors,
+    set: &crate::host::tier::TierSet,
+) -> Result<Qwen38Stacks, GpuError> {
+    swap::stacks::<Leg38>(model, |l| Ok(set.ids(l).is_some_and(|ids| !ids.is_empty())))
+}

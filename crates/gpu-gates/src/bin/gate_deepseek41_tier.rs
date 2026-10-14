@@ -724,6 +724,7 @@ mod gate {
             card: TIER_DEVICE,
             name: card.clone(),
             device,
+            node: None,
         };
         let tmachine = tier_machine(&machine, &inputs.hp)?;
         let draft = dspark::draft_hparams()?;
@@ -1123,7 +1124,7 @@ mod gate {
     fn raise_tier_fault(m: &mut Deepseek41Model, layer: usize) -> Result<Fault, GateError> {
         let body = m.body(NAME)?;
         let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
-        let g = tier.gpu();
+        let g = tier.gpu()?;
         let s = g.stream();
         let x = DeviceBuffer::from_host(s, &[f32::NAN; 256])?;
         let sel = DeviceBuffer::from_host(s, &[0u32])?;
@@ -1189,8 +1190,8 @@ mod gate {
         let flags = {
             let body = m.body(NAME)?;
             let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
-            let flags = HostFlags::new(tier.gpu().context(), 1)?;
-            flags.enqueue_wait(tier.gpu().stream(), 0)?;
+            let flags = HostFlags::new(tier.gpu()?.context(), 1)?;
+            flags.enqueue_wait(tier.gpu()?.stream(), 0)?;
             flags
         };
         m.gpu().context().bind_to_thread()?;
@@ -1249,7 +1250,7 @@ mod gate {
             .tiers()
             .first()
             .ok_or("no tier card")?
-            .gpu()
+            .gpu()?
             .stream()
             .synchronize()?;
         m.gpu().stream().synchronize()?;
@@ -1265,8 +1266,8 @@ mod gate {
         let flags = {
             let body = m.body(NAME)?;
             let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
-            let flags = HostFlags::new(tier.gpu().context(), 1)?;
-            flags.enqueue_wait(tier.gpu().stream(), 0)?;
+            let flags = HostFlags::new(tier.gpu()?.context(), 1)?;
+            flags.enqueue_wait(tier.gpu()?.stream(), 0)?;
             flags
         };
         let t0 = Instant::now();
@@ -1315,7 +1316,7 @@ mod gate {
             .tiers()
             .first()
             .ok_or("no tier card")?
-            .gpu()
+            .gpu()?
             .stream()
             .synchronize()?;
         m.gpu().stream().synchronize()?;

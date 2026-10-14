@@ -24,9 +24,11 @@
 //! names: the card's copy of the map, its host tier, its plan.
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use bloomery_gpu::host::node::node_cards;
 use bloomery_gpu::host::slots::{HOST, MAX_TIERS, SlotMap};
 use bloomery_gpu::host::swap::{CardTable, SwapMachine, TableCheck};
 use bloomery_gpu::host::tier::TierCard;
@@ -430,8 +432,14 @@ impl Place {
     /// device its pick finds ([`workstation::resolve`]), refused by name with
     /// every visible device when a pick finds none, several, or a device an
     /// earlier card is. A list of names spelled as an alias that lands on
-    /// other devices than the alias does here prints as its names.
+    /// other devices than the alias does here prints as its names. With
+    /// `BLOOMERY_TIER_NODES` set, the tier cards are its nodes'
+    /// ([`Place::on_nodes`]).
     pub fn on(self, census: &[DeviceInfo]) -> Result<Place, GateError> {
+        let nodes = bloomery_levers::tier_nodes()?;
+        if !nodes.is_empty() {
+            return self.on_nodes(census, &nodes);
+        }
         let resolved = workstation::resolve(self.picks(), census)
             .map_err(|e| format!("--place {}: {e}", self.spelled()))?;
         let mut specs = [None; 1 + MAX_TIERS];
@@ -454,6 +462,36 @@ impl Place {
         }
         Ok(Place {
             word,
+            specs,
+            resolved: true,
+            ..self
+        })
+    }
+
+    /// [`Place::on`] with the tiers on the nodes at `nodes`, one a tier
+    /// card in tier order: the stage card resolved against this process's
+    /// `census`, each tier card the one device its node's census lists
+    /// ([`node_cards`]). Another count of nodes than the placement's tier
+    /// cards is refused by name.
+    fn on_nodes(self, census: &[DeviceInfo], nodes: &[SocketAddr]) -> Result<Place, GateError> {
+        let tiers = usize::from(self.n) - 1;
+        if nodes.len() != tiers {
+            return Err(format!(
+                "--place {}: {} names {} tier nodes for its {tiers} expert tier cards",
+                self.spelled(),
+                bloomery_levers::TIER_NODES,
+                nodes.len()
+            )
+            .into());
+        }
+        let stage = workstation::resolve(&self.picks()[..1], census)
+            .map_err(|e| format!("--place {}: {e}", self.spelled()))?;
+        let mut specs = [None; 1 + MAX_TIERS];
+        specs[0] = stage.first().copied();
+        for (s, (_, spec)) in specs[1..].iter_mut().zip(node_cards(nodes)?) {
+            *s = Some(spec);
+        }
+        Ok(Place {
             specs,
             resolved: true,
             ..self
@@ -738,7 +776,8 @@ fn ordinal_word(o: u32) -> &'static str {
 }
 
 /// The devices a model runs on, the stage card `stage` then the expert tier
-/// cards `tiers`, as a `load` line's `cards` field names them: by the names
+/// cards `tiers` (a tier on a node, the device of its node's census it opened
+/// on), as a `load` line's `cards` field names them: by the names
 /// their drivers report, each space written `_`, since the field is one
 /// word. `planned` is the placement `--place <word>`'s cards by the names
 /// the plan gives them, and `specs` the devices it resolved to on this
@@ -754,13 +793,20 @@ pub fn card_words(
     stage: &Gpu,
     tiers: &[TierCard],
 ) -> Result<Vec<String>, GateError> {
-    let mut gpus = vec![stage];
-    gpus.extend(tiers.iter().map(TierCard::gpu));
-    let mut devices = Vec::with_capacity(gpus.len());
-    let mut ids = Vec::with_capacity(gpus.len());
-    for g in &gpus {
-        devices.push(g.device_name()?);
-        ids.push(g.device_id()?);
+    let mut devices = vec![stage.device_name()?];
+    let mut ids = vec![stage.device_id()?];
+    for t in tiers {
+        match t.node_device() {
+            Some(d) => {
+                devices.push(d.name.clone());
+                ids.push(d.device());
+            }
+            None => {
+                let g = t.gpu()?;
+                devices.push(g.device_name()?);
+                ids.push(g.device_id()?);
+            }
+        }
     }
     let named = devices.len() == planned.len()
         && match specs {
@@ -810,7 +856,7 @@ pub fn with_cards(
         ([], []) => Ok(r),
         ([t], [name]) if t.name() == *name => Ok(r
             .u("tier_experts", t.set().experts())
-            .u("tier_bytes", t.weights().resident_bytes())),
+            .u("tier_bytes", t.resident_bytes())),
         ([_, _, ..], _) if got == want => Err(format!(
             "--place {}: the load record holds one expert tier's fields, and the model loaded \
              {} tiers",

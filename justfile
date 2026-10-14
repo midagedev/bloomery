@@ -1915,6 +1915,21 @@ gate-gpu-qwen38-residency:
 gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard --bin generate_qwen3moe && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
 
+# Qwen3.8's plan (b′) with its expert tier on a tier node (docs/contrib/dgx-spark.md 9.5 items 5 and 6): node 0, a child
+# of the gate with BLOOMERY_TIER_NODES set, and node 1, tier_server, over loopback on this machine's card, the tier's page
+# one /dev/shm file both map. Node 1's census read over the channel (node_cards, the load's own reader) is the plan's tier
+# card; an open with one segment's experts swapped is refused naming the tier's set; the history (32 prose ids step by
+# step, greedy steps, six verifies, greedy steps) bit for bit the same plan in one process, the stage graphs its nodes,
+# the tier's graphs nine a tier layer and the fault copy, captured on node 1; node 1 killed: node 0's next step names the
+# lost node, CardLost, the next step and a reset refused; node 0 killed and node 0 stopped with node 1 mid-step: node 1
+# releases its go words, drains and exits naming the loss, and the stopped node 0, continued, fails its held step naming
+# the release and the lost card. Each budget at most 16 GiB, sized for both processes on one card: on the box the A6000
+# by box.sh's pick (`BLOOMERY_CARD=a6000`), as two 16 GiB budgets pass the 3090's 24 GB. Seven loads, one after the
+# other.
+[group('v41-load')]
+gate-gpu-qwen38-nodes:
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_nodes --bin tier_server && bash tools/gpu-gate.sh gate_qwen38_nodes'
+
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's
 # vocabulary, never our own tokenizer (the derivation command is the profile comment's) — and five is at most the

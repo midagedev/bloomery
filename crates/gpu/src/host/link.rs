@@ -18,6 +18,15 @@
 //!   writer's page to the reader's. Only the writing card adds to a counter
 //!   on the writer's page; the cards' operations are the shared page's.
 //!
+//! A tier served by another process on the same machine (a tier node,
+//! [`super::node`]) reaches a shared page through a file under `/dev/shm`
+//! that the stage card's process makes ([`Link::across`]) and the node's
+//! process opens and registers in its own tier card's context
+//! ([`Link::open_across`]): one physical page, at its own address on each
+//! side, so each word is still one location and each side's host reaches it
+//! as the shared page's. The loopback's tier side is a page of the stage
+//! card's process, so a tier on a node takes no loopback.
+//!
 //! The host touches the page's flag words through the link alone: it reads a
 //! word ([`Link::load`]), stores one ([`Link::store`]),
 //! checks at rest and resets a counter ([`Link::at_rest`], [`Link::reset`]),
@@ -29,6 +38,7 @@
 
 mod pump;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -38,8 +48,13 @@ use cuda_core::{CudaContext, sys};
 use threads::helper::{Placement, spawn_helper};
 
 use crate::GpuError;
-use crate::graph::{MappedHost, cu};
+use crate::graph::{MappedHost, SHARED_PAGE, cu};
 pub(super) use pump::{Crossing, Reader};
+
+/// Where a page shared with a tier node's process lives, and how its file's
+/// name starts ([`Link::across`]); [`Link::open_across`] opens no other.
+const ACROSS_DIR: &str = "/dev/shm";
+const ACROSS_NAME: &str = "bloomery-tier-";
 
 /// The tier page's bytes as every side reaches them: the stage card's page,
 /// which every tier card reaches too on the shared page, and on the loopback
@@ -49,6 +64,10 @@ pub(super) use pump::{Crossing, Reader};
 pub(super) struct Link {
     mirror: Option<Mirror>,
     page: Arc<MappedHost>,
+    /// The file the page is shared through, while its name stands for a tier
+    /// node's process to open ([`Link::unlink`]); `None` for a page of this
+    /// process alone and on the side that opened it.
+    path: Option<PathBuf>,
 }
 
 /// The loopback's tier side: the tier cards' page and the pump thread that
@@ -141,7 +160,74 @@ impl Link {
         Ok(Link {
             mirror: None,
             page: Arc::new(MappedHost::new(ctx, bytes, "cuMemHostAlloc (tier page)")?),
+            path: None,
         })
+    }
+
+    /// At least `bytes` zeroed bytes of page in a new file under `/dev/shm`,
+    /// registered in the stage card's context `ctx`, for a tier node's
+    /// process to open by its path ([`Link::path`], [`Link::open_across`]),
+    /// readable and writable by its user alone. The name goes at
+    /// [`Link::unlink`], or with the link. Load-time only.
+    pub(super) fn across(ctx: &Arc<CudaContext>, bytes: usize) -> Result<Link, GpuError> {
+        // An atomic count, so two loads of one process never name one file.
+        static MADE: AtomicU32 = AtomicU32::new(0);
+        let n = MADE.fetch_add(1, Ordering::Relaxed);
+        let path = Path::new(ACROSS_DIR).join(format!("{ACROSS_NAME}{}-{n}", std::process::id()));
+        let bytes = bytes.next_multiple_of(SHARED_PAGE);
+        let page = MappedHost::shared_file(ctx, &path, bytes, true, "the tier page's file")?;
+        Ok(Link {
+            mirror: None,
+            page: Arc::new(page),
+            path: Some(path),
+        })
+    }
+
+    /// The page another process made ([`Link::across`]): the file at `path`,
+    /// `bytes` long, registered in this process's tier card's context `ctx`.
+    /// A path that is not a file [`Link::across`] names (in `/dev/shm`, its
+    /// name starting `bloomery-tier-`) is refused by name: the path comes
+    /// over a channel with no authentication. Load-time only.
+    pub(super) fn open_across(
+        ctx: &Arc<CudaContext>,
+        path: &Path,
+        bytes: usize,
+    ) -> Result<Link, GpuError> {
+        if !across_named(path) {
+            return Err(GpuError::shape(
+                "Link::open_across",
+                format!(
+                    "a page at {}: a tier page is a file {ACROSS_DIR}/{ACROSS_NAME}*",
+                    path.display()
+                ),
+            ));
+        }
+        let page = MappedHost::shared_file(ctx, path, bytes, false, "the tier page's file")?;
+        Ok(Link {
+            mirror: None,
+            page: Arc::new(page),
+            path: None,
+        })
+    }
+
+    /// The file the page is shared through, while its name stands.
+    pub(super) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// The page's bytes: what a process that opens it maps.
+    pub(super) fn bytes(&self) -> usize {
+        self.page.bytes()
+    }
+
+    /// Remove the file's name once every tier node has opened it: the
+    /// processes that mapped the page keep it, and no other can open it.
+    pub(super) fn unlink(&mut self) -> Result<(), GpuError> {
+        match self.path.take() {
+            Some(p) => std::fs::remove_file(&p)
+                .map_err(|e| GpuError::link("Link::unlink", format!("{}: {e}", p.display()))),
+            None => Ok(()),
+        }
     }
 
     /// The loopback: `bytes` zeroed bytes of page for the stage card,
@@ -200,6 +286,7 @@ impl Link {
                 run_on: None,
             }),
             page,
+            path: None,
         })
     }
 
@@ -349,6 +436,45 @@ impl Mirror {
         if let Some((off, by)) = self.run_on {
             pump::Page::word(&*self.pump.tier, off).fetch_add(by, Ordering::Release);
             self.pump.lock().pass(&*self.pump.stage, &*self.pump.tier);
+        }
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            drop(std::fs::remove_file(p));
+        }
+    }
+}
+
+/// Whether `path` is a name [`Link::across`] gives.
+fn across_named(path: &Path) -> bool {
+    path.parent() == Some(Path::new(ACROSS_DIR))
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(ACROSS_NAME) && n != ACROSS_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::across_named;
+    use std::path::Path;
+
+    /// A tier node opens only a file the stage side's process names.
+    #[test]
+    fn a_tier_node_opens_only_a_tier_pages_name() {
+        assert!(across_named(Path::new("/dev/shm/bloomery-tier-41-0")));
+        for p in [
+            "/dev/shm/bloomery-tier-",
+            "/dev/shm/other",
+            "/var/tmp/bloomery-tier-1",
+            "/dev/shm/x/bloomery-tier-1",
+            "/dev/shm/..",
+            "bloomery-tier-1",
+        ] {
+            assert!(!across_named(Path::new(p)), "{p}");
         }
     }
 }

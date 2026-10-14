@@ -296,10 +296,7 @@ pub fn check(ok: &mut bool, name: &str, pass: bool) {
     *ok &= pass;
 }
 
-/// The binary `name` beside the running one.
-pub fn beside(name: &str) -> Result<PathBuf, GateError> {
-    Ok(std::env::current_exe()?.with_file_name(name))
-}
+pub use crate::beside;
 
 /// One `--plan` run of a seat: `cmd` (its binary and environment) with
 /// `args`, then `--plan`; stdin and stdout closed, stderr to `err`. Under
