@@ -568,6 +568,14 @@ impl<B: ChainBody> Drop for GpuModel<B> {
     }
 }
 
+/// What a one-row chain does with the pass it just ran.
+enum RowKeep {
+    /// Keep the one row and open the next boundary ahead of its readback.
+    Step,
+    /// Leave the pass unkept. The caller keeps it.
+    Prompt,
+}
+
 impl<B: ChainBody> GpuModel<B> {
     /// The model over `r`, standing at position 0 in graph mode with nothing
     /// captured, and its engine watchdog started ([`crate::watchdog`]).
@@ -1092,26 +1100,34 @@ impl<B: ChainBody> GpuModel<B> {
         if self.mode == StepMode::Graph && self.graphs.get(1).is_none() {
             self.capture_step()?;
         }
-        let token = self.run_tokens(tokens);
+        let token = self.run_tokens(tokens, RowKeep::Step, "GpuModel::step");
         self.note_fault("GpuModel::step", token)
     }
 
-    /// [`GpuModel::step`]'s tokens once its checks have passed: each
-    /// position's refresh and chain, its kept row and then the next pass's
-    /// residency boundary made ahead ([`HostServed::at_boundary`] at
-    /// [`BoundaryAt::Ahead`]: its host time runs under the rest of the
-    /// step, the head's read included), then the head's readback. This and
-    /// a pass of several slots ([`GpuModel::step_slots`]) are where a
-    /// boundary runs ahead of its pass. An error here can
-    /// follow launches, so the caller passes it through
-    /// [`GpuModel::note_fault`]; a boundary that fails leaves the model at
-    /// the step's position, as a refused kept row does.
-    fn run_tokens(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
+    /// [`GpuModel::step`]'s tokens, or one [`GpuModel::replay_row`], once the
+    /// caller's checks have passed. Each position is refreshed and run.
+    /// [`RowKeep::Step`] then keeps that row and makes the next pass's
+    /// residency boundary ahead ([`HostServed::at_boundary`] at
+    /// [`BoundaryAt::Ahead`]: its host time runs under the rest of the step,
+    /// the head's read included). [`RowKeep::Prompt`] keeps nothing and opens
+    /// no boundary. After the positions stand one on, the readback count
+    /// moves and the head's token comes back. The step arm, and a pass of
+    /// several slots ([`GpuModel::step_slots`]), are where a boundary runs
+    /// ahead of its pass. `what` names a refusal. An error here can follow
+    /// launches, so the caller passes it through [`GpuModel::note_fault`]; a
+    /// boundary that fails leaves the model at the step's position, as a
+    /// refused kept row does.
+    fn run_tokens(
+        &mut self,
+        tokens: &[u32],
+        keep: RowKeep,
+        what: &'static str,
+    ) -> Result<u32, GpuError> {
         self.one_pass = None;
         self.slot_rows = None;
         for &token in tokens {
             let pos = self.pos;
-            self.check_pos(pos, "GpuModel::step")?;
+            self.check_pos(pos, what)?;
             self.refresh_params(token, pos)?;
             let r = match self.mode {
                 StepMode::Eager => self
@@ -1120,18 +1136,41 @@ impl<B: ChainBody> GpuModel<B> {
                 StepMode::Graph => self.replay(1, Chain::Step),
             };
             self.name_host_refusal(r)?;
-            self.keep_rows(
-                runtime::swaprule::KeptRows::prefix(1),
-                crate::host::PassKind::Step,
-            )?;
-            self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
+            match keep {
+                RowKeep::Step => {
+                    self.keep_rows(
+                        runtime::swaprule::KeptRows::prefix(1),
+                        crate::host::PassKind::Step,
+                    )?;
+                    self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
+                }
+                // The caller keeps the pass and opens the next boundary.
+                RowKeep::Prompt => {}
+            }
             self.stand_at(pos + 1);
         }
         self.reads += 1;
-        self.heads
-            .first()
-            .ok_or(no_head("GpuModel::step"))?
-            .token(&self.gpu)
+        self.heads.first().ok_or(no_head(what))?.token(&self.gpu)
+    }
+
+    /// One step of `token` at the position the model stands: the captured
+    /// step when the mode is the graph, else the eager chain. The model
+    /// stands one position on and the head's token comes back. The pass is
+    /// not kept, and the next boundary is not opened ahead of it; the caller
+    /// keeps the pass ([`GpuModel::keep_rows`]) before the next boundary.
+    pub fn replay_row(&mut self, token: u32) -> Result<u32, GpuError> {
+        const WHAT: &str = "GpuModel::replay_row";
+        let _busy = watchdog::busy(&self.watch, watchdog::STEP, self.reads);
+        self.refuse_if_poisoned(WHAT)?;
+        self.refuse_if_slots_wait(WHAT)?;
+        if self.heads.is_empty() {
+            return Err(no_head(WHAT));
+        }
+        if self.mode == StepMode::Graph && self.graphs.get(1).is_none() {
+            self.capture_step()?;
+        }
+        let token = self.run_tokens(&[token], RowKeep::Prompt, WHAT);
+        self.note_fault(WHAT, token)
     }
 
     /// Launch the captured chain of `rows` rows and serve the host's share
@@ -1580,7 +1619,8 @@ impl<B: ChainBody> GpuModel<B> {
     /// The head's logits of the last `step` (`n_vocab` f32). Blocking read;
     /// gate/debug use. After [`GpuModel::step_rows`] these are row 0's: the
     /// pass writes row 0 through this same head and row `r` through head `r`
-    /// ([`GpuModel::rows_logits`]).
+    /// ([`GpuModel::rows_logits`]), unless a caller settled another row
+    /// ([`GpuModel::settle_row`]).
     pub fn logits(&self) -> Result<Vec<f32>, GpuError> {
         self.refuse_one_pass("GpuModel::logits")?;
         self.heads
@@ -1610,6 +1650,8 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// The head's normed rows of the last `step` or prompt call (`result_norm`, `hidden`
     /// f32 a row): the call's last position's row. Blocking read; gate/debug use.
+    /// After [`GpuModel::step_rows`] this is still row 0, unless a caller settled
+    /// another row ([`GpuModel::settle_row`]).
     pub fn head_normed(&self) -> Result<Vec<f32>, GpuError> {
         self.refuse_one_pass("GpuModel::head_normed")?;
         self.heads
@@ -1975,6 +2017,38 @@ fn placed_done<B: ChainBody>(
 // -------------------------------------------------------- the capabilities
 
 impl<B: Rows> GpuModel<B> {
+    /// Copy row `r` of the last per-row pass onto head 0, on the model
+    /// stream, so a later read of head 0 is that position, as a one-row
+    /// step leaves it. The bytes copied are the row's logits (one vocabulary
+    /// of f32), the row [`GpuModel::head_normed`] reads (one hidden row of
+    /// f32: the normed rows, or the input when the head has no final norm),
+    /// and the argmax readback (each row's token and the fault pair).
+    /// `r == 0` copies nothing. Refused by name on a [`RowHeads::One`] body
+    /// and when head `r` was never made.
+    pub fn settle_row(&mut self, r: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "GpuModel::settle_row";
+        if r == 0 {
+            return Ok(());
+        }
+        if B::HEADS != RowHeads::PerRow {
+            return Err(GpuError::shape(
+                WHAT,
+                "settle_row names a row of a per-row pass",
+            ));
+        }
+        if self.heads.get(r).is_none() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("row {r} of {} heads", self.heads.len()),
+            ));
+        }
+        let GpuModel { heads, gpu, .. } = self;
+        let (dst, src) = heads.split_at_mut(r);
+        let dst = dst.first_mut().ok_or(no_head(WHAT))?;
+        let src = src.first().ok_or(no_head(WHAT))?;
+        dst.copy_row_from(src, gpu)
+    }
+
     /// Run `tokens[r]` at position `pos + r`, for the model's position `pos`,
     /// as one pass of `M` rows ([`Rows::enqueue_rows`]) and return each row's
     /// greedy next token. Bit for bit `M` calls of `step(&[tokens[r]])`; the

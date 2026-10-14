@@ -432,6 +432,69 @@ impl Head {
         &mut self.x
     }
 
+    /// Copy onto this head the buffers a single-position read of `src`
+    /// returns, on `gpu`'s stream: the logits, the argmax readback, and the
+    /// row [`Head::normed_to_host`] reads. A length that differs, or two
+    /// heads whose final norms differ, is refused by name.
+    pub(crate) fn copy_row_from(&mut self, src: &Head, gpu: &Gpu) -> Result<(), GpuError> {
+        const WHAT: &str = "Head::copy_row_from";
+        let stream = gpu.stream();
+        if self.logits.len() != src.logits.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} logits into a head of {}",
+                    src.logits.len(),
+                    self.logits.len()
+                ),
+            ));
+        }
+        self.logits.copy_from_device_async(&src.logits, stream)?;
+        if self.token_out.len() != src.token_out.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} readback words into a head of {}",
+                    src.token_out.len(),
+                    self.token_out.len()
+                ),
+            ));
+        }
+        self.token_out
+            .copy_from_device_async(&src.token_out, stream)?;
+        match (&mut self.fin, &src.fin) {
+            (Final::Rms { normed: dst }, Final::Rms { normed: from }) => {
+                if dst.len() != from.len() {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!("{} normed values into a head of {}", from.len(), dst.len()),
+                    ));
+                }
+                dst.copy_from_device_async(from, stream)?;
+            }
+            (Final::Mixed, Final::Mixed) => {
+                if self.x.len() != src.x.len() {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{} input values into a head of {}",
+                            src.x.len(),
+                            self.x.len()
+                        ),
+                    ));
+                }
+                self.x.copy_from_device_async(&src.x, stream)?;
+            }
+            _ => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    "the two heads disagree on the final norm",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The normed rows of the last run (the dump's `result_norm` tap; under
     /// [`HeadNorm::Mixed`] the input, `result_embd`). Blocking read;
     /// gate/debug use.
