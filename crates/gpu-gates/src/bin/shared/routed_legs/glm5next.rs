@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use super::glmplace;
-use super::{Adapter, Arm, Outcome, Refusal, census, outcome_of, probed, refused_of, view_of};
+use super::{
+    Adapter, Arm, Outcome, Refusal, census, floor_or, outcome_of, probed, refused_of, view_of,
+};
 use app::mtp::MtpBody;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
@@ -177,15 +179,17 @@ fn fit(
         probed();
         machine_of(place, inputs, ctx, slots)
     };
-    let (ctx, _) = glmplace::serve_ctx(
-        inputs,
-        &machine_at,
-        &PlanLevers::default(),
-        nextn,
-        (None, slots),
+    let ctx = floor_or(
+        glmplace::serve_ctx(
+            inputs,
+            &machine_at,
+            &PlanLevers::default(),
+            nextn,
+            (None, slots),
+        )
+        .and_then(|(ctx, _)| Ok(u64::try_from(ctx)?)),
     )
     .map_err(|e| outcome_of(e.as_ref()))?;
-    let ctx = u64::try_from(ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?;
     Ok((machine(place, inputs, ctx, slots)?, ctx))
 }
 

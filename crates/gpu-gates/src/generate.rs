@@ -195,9 +195,31 @@ pub fn choose_ctx_of<P, E: Into<GateError> + std::fmt::Display>(
     let (positions, source) = bounds.limit();
     choose(ask, slots, Limit { positions, source }, SEAT_STEPS, plan_at).map_err(|e| match e {
         AskError::Plan(e) => e.into(),
+        AskError::FloorShort { floor, .. } => Box::new(FloorShort {
+            floor,
+            text: e.to_string(),
+        }),
         other => other.to_string().into(),
     })
 }
+
+/// A default context whose floor the machine cannot hold
+/// ([`placement::ctx_ask::AskError::FloorShort`]'s words), kept as its own
+/// type so a caller can read the floor and plan there for the refusal itself.
+#[derive(Debug)]
+pub struct FloorShort {
+    /// The least rung the default asked.
+    pub floor: u64,
+    text: String,
+}
+
+impl std::fmt::Display for FloorShort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for FloorShort {}
 
 /// A seat's boxed plan refusal read as a short memory
 /// ([`placement::ctx_ask::PlanRefusal::short`]): the family's error `E` when

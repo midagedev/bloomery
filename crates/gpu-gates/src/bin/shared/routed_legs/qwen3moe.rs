@@ -9,7 +9,7 @@
 //! default f16 (`KvQ8::F16`).
 
 use super::q3place;
-use super::{Adapter, Arm, Outcome, outcome_of, view_of};
+use super::{Adapter, Arm, Outcome, floor_or, outcome_of, view_of};
 use bloomery_gpu::arch::qwen3moe::KvQ8;
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
@@ -42,12 +42,14 @@ impl Adapter for Row {
             media: false,
             encoder: None,
         };
-        let serve = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
-            .map_err(|e| outcome_of(e.as_ref()))
-            .and_then(|(chosen, _)| {
-                let total = usize::try_from(chosen.total).map_err(|e| outcome_of(&e))?;
-                arm(split, "serve", total, DEFAULT_SLOTS)
-            });
+        let serve = floor_or(
+            q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts).map(|(chosen, _)| chosen.total),
+        )
+        .map_err(|e| outcome_of(e.as_ref()))
+        .and_then(|total| {
+            let total = usize::try_from(total).map_err(|e| outcome_of(&e))?;
+            arm(split, "serve", total, DEFAULT_SLOTS)
+        });
         vec![cli, serve]
     }
 }

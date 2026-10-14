@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use super::q38place;
-use super::{Adapter, Arm, Outcome, census, outcome_of, probed, view_of};
+use super::{Adapter, Arm, Outcome, census, floor_or, outcome_of, probed, view_of};
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::checkpoint_price38;
 use bloomery_gpu::arch::qwen3moe::swap38;
@@ -90,11 +90,13 @@ fn serve_arm(inputs: &Arc<PlanInputs>) -> Result<Arm, Outcome> {
     let seqs = seqs38(inputs, DEFAULT_SLOTS);
     let ctx = u64::try_from(SEAT_CTX).expect("the seat's base context is a u64");
     let place = choose(inputs, ctx, seqs)?;
-    let chosen = q38place::ctx_choice(inputs, (None, DEFAULT_SLOTS), |c| {
-        probe(inputs, place, seqs, c)
-    })
+    let ctx = floor_or(
+        q38place::ctx_choice(inputs, (None, DEFAULT_SLOTS), |c| {
+            probe(inputs, place, seqs, c)
+        })
+        .map(|chosen| chosen.slot_ctx),
+    )
     .map_err(|e| outcome_of(e.as_ref()))?;
-    let ctx = chosen.slot_ctx;
     let ub =
         ub_of(usize::try_from(ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?)?;
     let machine = machine(place, inputs, (ctx, ub), seqs)?;

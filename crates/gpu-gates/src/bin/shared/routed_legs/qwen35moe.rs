@@ -11,7 +11,7 @@
 //! context and slots.
 
 use super::q3place;
-use super::{Adapter, Arm, Outcome, outcome_of, view_of};
+use super::{Adapter, Arm, Outcome, floor_or, outcome_of, view_of};
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35};
 use bloomery_gpu_gates::generate::Place;
@@ -52,9 +52,11 @@ fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
         media: false,
         encoder: None,
     };
-    let (chosen, _) = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
-        .map_err(|e| outcome_of(e.as_ref()))?;
-    let total = usize::try_from(chosen.total).map_err(|e| outcome_of(&e))?;
+    let total = floor_or(
+        q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts).map(|(chosen, _)| chosen.total),
+    )
+    .map_err(|e| outcome_of(e.as_ref()))?;
+    let total = usize::try_from(total).map_err(|e| outcome_of(&e))?;
     let seqs = q3place::seqs_qwen35(split, ubatch_size().map_err(gpu_red)?, DEFAULT_SLOTS)
         .map_err(|e| outcome_of(e.as_ref()))?;
     // The seat passes the total-context `Open35`; the default shares it

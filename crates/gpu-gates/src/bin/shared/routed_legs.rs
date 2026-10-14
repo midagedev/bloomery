@@ -1417,6 +1417,17 @@ fn view_of(plan: &Plan) -> PlanView {
     }
 }
 
+/// A seat default's slot context for an arm: the choice's, or the ladder's
+/// floor where the machine holds not even that
+/// (`generate::FloorShort`), so the arm's plan there names the refusal
+/// itself; any other error stands.
+fn floor_or(chosen: Result<u64, GateError>) -> Result<u64, GateError> {
+    chosen.or_else(|e| match e.downcast_ref::<bloomery_gpu_gates::generate::FloorShort>() {
+        Some(short) => Ok(short.floor),
+        None => Err(e),
+    })
+}
+
 /// The outcome of a planner error: a named refusal L2 counts — a
 /// [`PlacementError`] the planner stated by name (the read and budget
 /// refusals), or a context refusal of the qwen plan wrappers — else red

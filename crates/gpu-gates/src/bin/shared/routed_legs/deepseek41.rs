@@ -20,7 +20,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::ds41place;
-use super::{Adapter, Arm, Outcome, census, outcome_of, refused_of, view_of};
+use super::{Adapter, Arm, Outcome, census, floor_or, outcome_of, refused_of, view_of};
 use bloomery_gpu_gates::generate::Place;
 use gguf::{GgmlType, Split};
 use model::arch::deepseek41::place::{PlaceError, PlanInputs};
@@ -76,16 +76,19 @@ fn arm(inputs: &Arc<PlanInputs>, name: &'static str, seat: Option<&Split>) -> Re
         None => (NonZeroUsize::MIN, CTX_MAX),
         Some(split) => {
             let n = NonZeroUsize::new(DEFAULT_SLOTS).expect("the default serves a slot");
-            let chosen = ds41place::ctx_choice(
-                split,
-                inputs,
-                place,
-                (None, tier_batch, None),
-                (None, n),
-                &PlanLevers::default(),
+            let ctx = floor_or(
+                ds41place::ctx_choice(
+                    split,
+                    inputs,
+                    place,
+                    (None, tier_batch, None),
+                    (None, n),
+                    &PlanLevers::default(),
+                )
+                .map(|chosen| chosen.slot_ctx),
             )
             .map_err(|e| outcome_of(e.as_ref()))?;
-            (n, chosen.slot_ctx)
+            (n, ctx)
         }
     };
     let unbudgeted = planned(inputs, &machine, &PlanLevers::default(), (n, ctx));

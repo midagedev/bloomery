@@ -21,7 +21,9 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use super::{Adapter, Arm, Outcome, Refusal, outcome_of, probed, refused_of, view_of};
+use super::{
+    Adapter, Arm, Outcome, Refusal, floor_or, outcome_of, probed, refused_of, view_of,
+};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::choose_ctx;
 use bloomery_gpu_mimo2::swap;
@@ -58,12 +60,14 @@ impl Adapter for Row {
 fn arm(inputs: &Arc<PlanInputs>, split: &Split) -> Result<Arm, Outcome> {
     let machine = plan_on(A6000, inputs.model.layers);
     let n = NonZeroUsize::new(DEFAULT_SLOTS).expect("the default serves a slot");
-    let chosen = choose_ctx(split, (None, DEFAULT_SLOTS), (None, None), |c| {
-        probed();
-        probe_of(inputs.plan_with_slots(&machine, c, &PlanLevers::default(), n))
-    })
+    let ctx = floor_or(
+        choose_ctx(split, (None, DEFAULT_SLOTS), (None, None), |c| {
+            probed();
+            probe_of(inputs.plan_with_slots(&machine, c, &PlanLevers::default(), n))
+        })
+        .map(|chosen| chosen.slot_ctx),
+    )
     .map_err(|e| place_gate(&e))?;
-    let ctx = chosen.slot_ctx;
     let unbudgeted = planned(inputs, &machine, ctx, &PlanLevers::default(), n);
     let inputs = Arc::clone(inputs);
     Ok(Arm {
