@@ -23,7 +23,7 @@
 //! projection of a unit-RMS input has unit RMS. [`rule_for`] derives each
 //! type's scale from its block layout (the dequant ports in `gguf::quant`)
 //! and picks the widest band of scale codes whose `d` (and `dmin`) is a
-//! normal f16 in the spec's [`Window`]. A vector (every dim but one is 1) and an
+//! normal f16 in the spec's [`Window`]. A vector (no second dim or `dims[0] == 1`) and an
 //! F32 tensor the family names hold the constant the family gives them.
 //!
 //! The bytes are a function of the seed and the source header alone: each

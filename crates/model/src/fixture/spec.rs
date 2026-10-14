@@ -168,7 +168,7 @@ pub trait Family: Sync {
 
     /// The value of every element of an F32 tensor, by its name past
     /// `blk.N.`: a tensor of any shape the family names (a norm gain stored
-    /// `[n, groups]`), and every vector (all dims but one are 1); `None` is a
+    /// `[n, groups]`), and every vector (no second dim or `dims[0] == 1`); `None` is a
     /// vector with no fill rule.
     fn const_value(&self, leaf: &str) -> Option<f32>;
 
