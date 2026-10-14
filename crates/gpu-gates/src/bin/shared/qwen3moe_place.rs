@@ -79,7 +79,11 @@ pub struct Reads {
 }
 
 /// The census readings so far.
-fn census_reads() -> usize {
+#[allow(
+    dead_code,
+    reason = "the serve choice and the routed legs read it; the CLI and the e2e gates include the planner without it"
+)]
+pub fn census_reads() -> usize {
     CENSUSES.load(Ordering::Relaxed)
 }
 

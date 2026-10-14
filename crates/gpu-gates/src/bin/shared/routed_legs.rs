@@ -227,7 +227,7 @@ struct Counts {
     retyped: u64,
     /// The planner calls the gate made: one a plan line, one a floor probe and
     /// one a probe of an adapter's context search (a qwen3moe or qwen35moe
-    /// default's own probes are in `q3place::reads`, not here).
+    /// default's census reads are `q3place::census_reads`, not here).
     calls: u64,
     /// Plans L6 asked the loader table about, and the ones it refused.
     loader_asked: u64,
@@ -787,14 +787,12 @@ pub(super) fn run() -> Result<(), GateError> {
         );
     }
     let work: f64 = families.values().map(|f| f.sets_secs + f.sweep_secs).sum();
-    let reads = q3place::reads();
     println!(
         "legs: wall {:.1} s, {:.1} s of work on up to {WORKERS} workers; the qwen3moe and \
-         qwen35moe defaults made {} census reads and {} probes of their own",
+         qwen35moe defaults made {} census reads of their own",
         started.elapsed().as_secs_f64(),
         work,
-        reads.censuses,
-        reads.probes
+        q3place::census_reads(),
     );
     println!("gate_routed_legs: {}", verdict(ok));
     if !ok {
