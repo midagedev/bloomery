@@ -10,11 +10,12 @@
 //! limit where that is less. Only this default steps down, by halves, and
 //! only on a plan whose card cannot hold the load's resident bytes plus that
 //! context's sequence state ([`Probe::CardShort`]); any other refusal is the
-//! seat's error as it stands. The model's limit is held by
-//! `ctx::check_slot_ctx` before this runs: here it only caps the target.
+//! seat's error as it stands. Callers validate a set context against the
+//! model's limit; here it only caps the default target.
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU64;
 
 use super::{PlacementError, Violation};
 
@@ -41,7 +42,7 @@ pub enum Ask {
 pub struct Limit {
     /// The positions.
     pub positions: u64,
-    /// `trained`, or the bound's own word (`ctx::CtxLimit::limit`).
+    /// The name of the model bound, such as `trained`.
     pub source: &'static str,
 }
 
@@ -321,10 +322,8 @@ pub fn choose<P, E>(
     };
     match ask {
         Ask::Set { total } => {
-            let slot_ctx = total / n;
-            if slot_ctx == 0 {
-                return Err(AskError::NoPosition { total, slots });
-            }
+            let slot_ctx = crate::slots::split_ctx(total, n, NonZeroU64::MIN)
+                .map_err(|_| AskError::NoPosition { total, slots })?;
             let (need, room) = match probe(slot_ctx)? {
                 Probe::Holds(plan) => return Ok(chosen(slot_ctx, Rule::Set, plan)),
                 Probe::CardShort { need, room } => (need, room),
@@ -360,8 +359,10 @@ pub fn choose<P, E>(
                     }
                     Probe::CardShort { need, room } => {
                         short = Some((need, room));
-                        let next = round_down(rung / 2, steps.step);
-                        if next < steps.floor {
+                        // The floor is a rung of its own: a target that is
+                        // no power of two halves past it otherwise.
+                        let next = round_down(rung / 2, steps.step).max(steps.floor.min(target));
+                        if next == rung {
                             return Err(AskError::FloorShort {
                                 floor: rung,
                                 slots,
@@ -400,17 +401,10 @@ fn largest_held<P, E>(
     if lo_k > hi_k || !holds(lo_k * steps.step)? {
         return Ok(None);
     }
-    // Invariant: `lo` holds; every k above `hi` is short.
-    let (mut lo, mut hi) = (lo_k, hi_k);
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if holds(mid * steps.step)? {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    Ok(Some(lo * steps.step))
+    let lo = usize::try_from(lo_k).expect("supported hosts have 64-bit usize");
+    let hi = usize::try_from(hi_k).expect("supported hosts have 64-bit usize");
+    let k = super::ctx::largest(lo, hi, |k| holds(k as u64 * steps.step))?;
+    Ok(Some(k as u64 * steps.step))
 }
 
 #[cfg(test)]
@@ -536,6 +530,22 @@ mod tests {
                 room: card.room,
             }
         );
+        // A target that is no power of two steps onto the floor before it
+        // refuses: 24,576 halves to 12,288 and 6,144, whose half is under it.
+        let limit = Limit {
+            positions: 24_576,
+            source: "trained",
+        };
+        let card = Card::holding(4096);
+        let got = run(&card, Ask::Default, 1, limit).expect("holds at the floor");
+        assert_eq!(card.calls(), [24_576, 12_288, 6_144, 4096]);
+        assert_eq!(got.slot_ctx, 4096);
+        let card = Card::holding(4095);
+        let err = run(&card, Ask::Default, 1, limit)
+            .map(|c| c.slot_ctx)
+            .expect_err("short at the floor");
+        assert_eq!(card.calls(), [24_576, 12_288, 6_144, 4096]);
+        assert!(matches!(err, AskError::FloorShort { floor: 4096, .. }));
     }
 
     /// A seat's own refusal ends the default at once.

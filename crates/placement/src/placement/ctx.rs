@@ -115,7 +115,7 @@ pub fn slots_of(
 pub fn largest<E>(
     mut lo: usize,
     mut hi: usize,
-    ok: impl Fn(usize) -> Result<bool, E>,
+    mut ok: impl FnMut(usize) -> Result<bool, E>,
 ) -> Result<usize, E> {
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
