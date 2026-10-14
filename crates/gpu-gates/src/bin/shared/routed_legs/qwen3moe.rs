@@ -55,17 +55,20 @@ impl Adapter for Row {
 /// unbudgeted answer of `q3place::unplaced_qwen3_slots` (the CLI's own
 /// `unplaced_qwen3` at one slot), and the placed planner it hands its
 /// answer to. Where the default answers the whole load, the placed planner
-/// is the probe the default itself built on `a`'s card
-/// (`q3place::PlaceQ3::qwen3` rebuilds it).
+/// is the probe the default itself built on `a`'s card, on the same census
+/// reading (`q3place::PlaceQ3::qwen3_on` rebuilds it).
 fn arm(split: &Split, name: &'static str, ctx: usize, slots: usize) -> Result<Arm, Outcome> {
     let kv = KvQ8::F16;
-    match q3place::unplaced_qwen3_slots(split, ctx, slots, kv).map_err(|e| outcome_of(e.as_ref())) {
+    let census = q3place::census().map_err(|e| outcome_of(e.as_ref()))?;
+    match q3place::unplaced_qwen3_slots(split, &census, ctx, slots, kv)
+        .map_err(|e| outcome_of(e.as_ref()))
+    {
         Ok(q3place::Unplaced::Whole(_)) => {
             // The placed path at the same context: the probe the default
-            // built on `a`'s card (`PlaceQ3::qwen3` censuses and lays out
-            // the same one; `Place::A` is the unresolved alias it resolves
-            // there).
-            let placed = q3place::PlaceQ3::qwen3(split, Place::A, ctx, kv)
+            // built on `a`'s card (`PlaceQ3::qwen3_on` lays out the same one
+            // on the same reading; `Place::A` is the unresolved alias it
+            // resolves there).
+            let placed = q3place::PlaceQ3::qwen3_on(split, Place::A, &census, ctx, kv)
                 .map_err(|e| outcome_of(e.as_ref()))?;
             Ok(Arm {
                 name,

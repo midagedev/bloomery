@@ -351,6 +351,10 @@ impl PlaceQ3 {
     /// A qwen3moe file's placed load at `ctx` positions on `place`'s card,
     /// its cache planes in the `kv` format ([`KvQ8`]), resolved against one
     /// census of this process's devices.
+    #[allow(
+        dead_code,
+        reason = "the e2e gates' load; the serve seat and the routed legs plan on one census (qwen3_on)"
+    )]
     pub fn qwen3(file: &Split, place: Place, ctx: usize, kv: KvQ8) -> Result<PlaceQ3, GateError> {
         PlaceQ3::qwen3_on(file, place, &census()?, ctx, kv)
     }

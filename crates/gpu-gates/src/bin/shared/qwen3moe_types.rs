@@ -56,7 +56,8 @@ pub fn serve_default(split: &Split) -> Result<String, String> {
     )
     .map_err(|e| format!("the --ctx search refused: {e}"))?;
     let total = found.slot.ctx * SERVE_PARALLEL;
-    let u = q3place::unplaced_qwen3_slots(split, total, SERVE_PARALLEL, KvQ8::F16)
+    let census = q3place::census().map_err(|e| format!("the census refused: {e}"))?;
+    let u = q3place::unplaced_qwen3_slots(split, &census, total, SERVE_PARALLEL, KvQ8::F16)
         .map_err(|e| format!("the load at {total} positions refused: {e}"))?;
     let how = held(split, &u, total, whole_refuses)?;
     Ok(format!(
