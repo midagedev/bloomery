@@ -61,9 +61,10 @@
 //! - `residency_default_is_the_machine`: `--plan` at [`CTX`] with no
 //!   `BLOOMERY_RESIDENCY` prints the `residency lever` record at `mid-p0-s1`
 //!   with why `place` ahead of the plan record, and the `residency host`
-//!   record of the churn pool after it; at the seat's default context (the
-//!   KV planes take the card, the plan holds no expert to spare) the common
-//!   rule prints `off` with why `no_room` and no pool; under
+//!   record of the churn pool after it; at the largest total two slots hold
+//!   (the KV planes take the card, the plan holds no expert to spare; read
+//!   off the seat's refusal of a total past it) the common rule prints `off`
+//!   with why `no_room` and no pool; under
 //!   `BLOOMERY_RESIDENCY=off` it prints `off` with why `set` and no pool
 //!   record.
 //! - `plan_only_names_its_default`: `--plan` with no `--place`, `--ctx` or
@@ -308,11 +309,14 @@ mod gate {
     /// A `--plan` reads the file's header and exits; it opens no card.
     const PLAN_WITHIN: Duration = Duration::from_secs(120);
 
-    /// The words the slot split's refusal names (`--ctx 1 --parallel 2`): the
-    /// flags, and the positions a slot is left with.
+    /// The words the slot split's refusal names (`--ctx 1 --parallel 2`,
+    /// `ctx_ask::AskError::NoPosition`): the total, the slots, and the least
+    /// total that gives each a position.
+    // PIN(2026-10-14): the seats' common words (ctx-first); were the seat's own
+    // "--parallel 2 splits it to 0 positions a slot".
     const SPLIT_REFUSAL: [&str; 2] = [
-        "--parallel 2 splits it to 0 positions a slot",
-        "a slot holds at least one position",
+        "--ctx 1 over 2 slots gives a slot no position",
+        "ask at least 2",
     ];
 
     /// The words the refusal of a set total the card cannot hold names
@@ -917,9 +921,11 @@ mod gate {
     /// `residency_default_is_the_machine` (the module header): `--plan` at
     /// [`CTX`] with no residency word prints the `residency lever` record at
     /// the serving word and why `place`, ahead of the plan, and the `residency
-    /// host` record of the churn pool after it; at the seat's default context,
-    /// whose KV planes leave the plan no card expert to spare, the common
-    /// rule turns it `off` (why `no_room`) with no pool; and under
+    /// host` record of the churn pool after it; at the largest total two
+    /// slots hold, whose KV planes leave the plan no card expert to spare —
+    /// the `ask N or less` of the seat's refusal of the trained context a
+    /// slot — the common rule turns it `off` (why `no_room`) with no pool;
+    /// and under
     /// `BLOOMERY_RESIDENCY=off` it prints `off` and why `set`, and no pool.
     fn residency_default_is_the_machine(
         dir: &Path,
@@ -947,11 +953,30 @@ mod gate {
             (&lever, &plan, &host),
             (Some(l), Some(p), Some(h)) if l.at() < p.at() && p.at() < h.at()
         );
+        // PIN(2026-10-14): was the seat's default context, whose KV left no expert
+        // to spare at the old two default slots; the default is one slot on the
+        // ladder now (ctx-first), which holds experts on the card.
+        let trained = trained_ctx(file)?.ok_or("the file states no context_length")?;
+        let past = (2 * trained).to_string();
+        let (_, _, said) = plan_pinned(
+            dir,
+            "plan-residency-past",
+            file,
+            &["--parallel", "2", "--ctx", &past],
+            Pins::default(),
+        )?;
+        let largest = said
+            .split("; ask ")
+            .nth(1)
+            .and_then(|r| r.split(" or less").next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| format!("no `ask N or less` in the refusal of --ctx {past}: {said}"))?
+            .to_string();
         let (_, wide, _) = plan_pinned(
             dir,
-            "plan-residency-default-ctx",
+            "plan-residency-largest",
             file,
-            &[],
+            &["--parallel", "2", "--ctx", &largest],
             Pins::default(),
         )?;
         let no_room = match wide.first(&record::RESIDENCY_LEVER)? {
@@ -966,8 +991,8 @@ mod gate {
         let exits = status.is_some_and(|s| s.success());
         println!(
             "residency default: exit 0 {exits}; at ctx {ctx} the lever record is mid-p0-s1 (place), \
-             then the plan, then the pool {word} {in_order}; at the default context it is off \
-             (no_room) with no pool {no_room}; set off prints off (set) and no pool {off}"
+             then the plan, then the pool {word} {in_order}; at --ctx {largest} over two slots \
+             it is off (no_room) with no pool {no_room}; set off prints off (set) and no pool {off}"
         );
         check(
             ok,
