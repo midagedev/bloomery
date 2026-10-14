@@ -2,10 +2,9 @@
 //! scratch directory and read, and each refusal by name.
 
 use super::{PREPROC, TAPS, TOWER_ARCH};
-use crate::RefError;
 use crate::arch::qwen35::{ARCH, HIDDEN_FLASH_Q8, LCPP_BUILD, MODEL_FLASH_Q8};
 use crate::clefvis::testkit::{
-    Head, IMAGE, IMAGE_COLUMNS, finish, prompt, put, scratch, taps, write,
+    Head, IMAGE, IMAGE_COLUMNS, finish, prompt, put, refusal, scratch, taps, write,
 };
 use crate::clefvis::{
     CLEF, ClefvisSet, EMBD, IMAGE_PAD_ID, INP_RAW, Kind, MMPROJ_BF16, MMPROJ_BF16_SHA256, N_EMBD,
@@ -49,13 +48,6 @@ fn prompt_head(kind: &str) -> Head<'_> {
 /// A preproc set of one image (128x96, 4x3 tokens).
 fn preproc(dir: &std::path::Path, head: &Head, image: &str) {
     crate::clefvis::testkit::preproc(dir, head, image);
-}
-
-fn refusal(r: Result<ClefvisSet, RefError>) -> String {
-    match r {
-        Ok(_) => panic!("the set was taken"),
-        Err(e) => e.to_string(),
-    }
 }
 
 /// A set of each kind is taken through its kind's family and read by name.

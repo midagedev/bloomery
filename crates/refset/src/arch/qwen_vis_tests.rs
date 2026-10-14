@@ -2,9 +2,8 @@
 //! steps, a final-tapped tower), the profile each family checks a set against, and each refusal by name.
 
 use super::{qwen4exp, qwen35, qwen35moe};
-use crate::RefError;
 use crate::clefvis::testkit::{
-    CHAT, DECODE_START, Head, chat_ids, chat_ids_of, decode, prompt, scratch, taps, write,
+    CHAT, DECODE_START, Head, chat_ids, chat_ids_of, decode, prompt, refusal, scratch, taps, write,
 };
 use crate::clefvis::{
     CLEF, ClefvisSet, EMBD, Kind, MMPROJ_BF16, POST_LN, Profile, QVIS_LCPP_BUILD, TOWER_ARCH,
@@ -71,13 +70,6 @@ impl Seat {
 
     fn pad(&self) -> u32 {
         self.profile.image_pad_id
-    }
-}
-
-fn refusal(r: Result<ClefvisSet, RefError>) -> String {
-    match r {
-        Ok(_) => panic!("the set was taken"),
-        Err(e) => e.to_string(),
     }
 }
 
