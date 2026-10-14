@@ -73,6 +73,26 @@ pub const PASS_ROWS: usize = 8;
 /// the call's writes also never land on the slots of `p − 3 .. p − 1`.
 pub const RING_ROWS: usize = CONV_ROWS + PASS_ROWS;
 
+/// The conv input `d` positions before `p` (`1 <= d <= CONV_ROWS`) of channel
+/// `c` of a ring of `ch` channels, when it lies before the call: zero while
+/// `p < d` (the sequence start, whatever the ring holds), else the row of
+/// slot `(p − d) mod RING_ROWS`. The one indexing of the ring; the delta
+/// layers' conv and the Mamba-2 step read through it.
+///
+/// # Safety
+///
+/// `ring` addresses `RING_ROWS · ch` readable f32s and `c < ch`.
+#[inline(always)]
+pub(crate) unsafe fn ring_input(ring: *const f32, p: usize, d: usize, ch: usize, c: usize) -> f32 {
+    if p < d {
+        0.0
+    } else {
+        // SAFETY: the slot (p − d) mod RING_ROWS is a row of the ring and
+        // c < ch, by the contract.
+        unsafe { *ring.add((p + RING_ROWS - d) % RING_ROWS * ch + c) }
+    }
+}
+
 /// `1 / √HEAD` rounded to f32: the query scale the conv applies after the
 /// L2 norm.
 pub const Q_SCALE: f32 = f32::from_bits(0x3db5_04f3);

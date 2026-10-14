@@ -219,7 +219,11 @@ gguf 9 2 0
 # capture dependencies (one cuStreamGetCaptureInfo_v3 block) and sets the branch's to them (one
 # cuStreamUpdateCaptureDependencies_v2 block), and its hw test reads the captured graph's edges (one cuGraphGetEdges_v2
 # block); each with its SAFETY line.
-gpu 1749 194 10
+# PIN(2026-10-15): gpu 1749 -> 1769 blocks, 194 -> 195 fns, new code, not old code relaxed: mamba2_step (the Mamba-2
+# decode kernel, mamba2.rs) reads and writes its shared stage, the conv ring, the scan state, the output and the norm
+# ticket's partials through raw pointers (19 blocks), and linear::ring_input, the conv ring's one indexing that the delta
+# layers' conv and the Mamba-2 step now share (one unsafe fn, its one block); each block with its SAFETY line.
+gpu 1769 195 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

@@ -55,7 +55,7 @@
 //! finite. `max(NaN, eps)` would otherwise turn an overflowed norm into a
 //! zero head.
 
-use super::{BLOCK, CONV_ROWS, CONV_TAPS, HEAD, LinearShape, Q_SCALE, RING_ROWS};
+use super::{BLOCK, CONV_ROWS, CONV_TAPS, HEAD, LinearShape, Q_SCALE, RING_ROWS, ring_input};
 use super::{expf_ik, sigmoid, silu, softplus};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -147,10 +147,8 @@ unsafe fn conv_token(
             xs[j] = unsafe {
                 if d <= t {
                     *inp.x.get_unchecked((t - d) * ch + c)
-                } else if p < d {
-                    0.0
                 } else {
-                    *ring.add((p + RING_ROWS - d) % RING_ROWS * ch + c)
+                    ring_input(ring, p, d, ch, c)
                 }
             };
         }
@@ -285,10 +283,8 @@ unsafe fn conv_head(
             xs[j] = unsafe {
                 if d <= t {
                     *x.get_unchecked((t - d) * ch + c)
-                } else if p < d {
-                    0.0
                 } else {
-                    *ring.add((p + RING_ROWS - d) % RING_ROWS * ch + c)
+                    ring_input(ring, p, d, ch, c)
                 }
             };
         }

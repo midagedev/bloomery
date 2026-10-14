@@ -223,6 +223,12 @@ gate-gpu-cand:
 gate-gpu-hc-gated:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_hc_gated && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_hc_gated'
 
+# The Mamba-2 decode step (bloomery_gpu::mamba2: conv ring, bias, SiLU, scan at state 128, D, z gate, grouped norm — one fused launch) against the
+# host twin model::mamba2::step_token, with no model file, at the 4B widths: bit for bit where the device library is not asked for a value libm
+# gives differently, within the derived band where it is; state 96/256 refused by name, the non-finite-y fault, eager = captured replay.
+gate-gpu-mamba2:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_mamba2 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mamba2'
+
 # GLM-5.3-Flash 라우터(288개 중 8개, sigmoid, ×2.5 — `router::glm5next`)를 모델 없이 합성 입력으로 호스트 규칙과 맞춘다.
 # 규칙마다 절이 하나다: logits·ids·weights·batch는 비트, scores는 sigmoid 밴드, ties·guard·fault·graph는 명시한 값.
 gate-gpu-glm-router:

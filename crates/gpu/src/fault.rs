@@ -142,6 +142,10 @@ pub enum FaultSite {
     /// non-finite key or value: the block is stored with a NaN scale, so
     /// every value it dequantizes to is NaN.
     KvQuant = 27,
+    /// A Mamba-2 decode step (`mamba2`) produced a `y` that is not finite: a
+    /// non-finite input, a state that stopped being finite, or a grouped
+    /// norm whose mean square is not finite.
+    Mamba2Scan = 28,
 }
 
 // A site is one bit of a u32 mask.
@@ -151,6 +155,7 @@ const _: () = assert!((FaultSite::Logit as u32) < 32);
 const _: () = assert!((FaultSite::DeltaStamp as u32) < 32);
 const _: () = assert!((FaultSite::CandMask as u32) < 32);
 const _: () = assert!((FaultSite::KvQuant as u32) < 32);
+const _: () = assert!((FaultSite::Mamba2Scan as u32) < 32);
 // No site's code is 0, so a raise never stores word 0 with an empty mask:
 // that pair is a head readback's unwritten seed, which `Head::tokens` names
 // as a state error instead of decoding as a fault.
@@ -189,6 +194,7 @@ impl FaultSite {
         FaultSite::DeltaStamp,
         FaultSite::CandMask,
         FaultSite::KvQuant,
+        FaultSite::Mamba2Scan,
     ];
 
     /// The site's name as an error prints it.
@@ -219,6 +225,7 @@ impl FaultSite {
             FaultSite::DeltaStamp => "delta_stamp",
             FaultSite::CandMask => "cand_mask",
             FaultSite::KvQuant => "kv_quant",
+            FaultSite::Mamba2Scan => "mamba2_scan",
         }
     }
 
@@ -279,6 +286,10 @@ impl FaultSite {
                  candidate rows"
             }
             FaultSite::KvQuant => "a q8_0 cache row value not finite",
+            FaultSite::Mamba2Scan => {
+                "a Mamba-2 step output not finite: a non-finite input, a scan state no longer \
+                 finite, or a grouped norm whose mean square is not finite"
+            }
         }
     }
 }
@@ -296,7 +307,7 @@ pub mod step_order {
     use super::FaultSite::{
         AttnCount, AttnSel, CachePos, CacheValue, CandMask, DeltaLane, DeltaStamp, ExpertId,
         F32Product, HcMix, HcQuant, KeyCount, KvQuant, LinearConv, LinearDelta, LinearGate, Logit,
-        NormQuant, Ple, PoolSelect, Q5Quant, QuantColumn, Router, TokenId,
+        Mamba2Scan, NormQuant, Ple, PoolSelect, Q5Quant, QuantColumn, Router, TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -329,6 +340,7 @@ pub mod step_order {
         DeltaStamp,
         Logit,
         CandMask,
+        Mamba2Scan,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -359,6 +371,7 @@ pub mod step_order {
         F32Product,
         DeltaStamp,
         Logit,
+        Mamba2Scan,
     ];
     /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
     /// layer's entry, the cache append's position, the flash's key count,
@@ -390,6 +403,7 @@ pub mod step_order {
         DeltaStamp,
         Logit,
         CandMask,
+        Mamba2Scan,
     ];
 
     /// Qwen3.6-35B-A3B and Qwen3.8-Flash-Next (`arch::qwen3moe`'s `Body35`
@@ -434,6 +448,7 @@ pub mod step_order {
         PoolSelect,
         CacheValue,
         CandMask,
+        Mamba2Scan,
     ];
 
     /// GLM-5.3-Flash (`gpu-glm5next`): a KDA layer's conv, delta step (its
@@ -468,6 +483,7 @@ pub mod step_order {
         F32Product,
         DeltaStamp,
         CandMask,
+        Mamba2Scan,
     ];
 
     /// No program runs `nemotron_h`. The order is [`MIMO2`]'s so a fault word
@@ -504,6 +520,7 @@ pub mod step_order {
         DeltaStamp,
         CandMask,
         KvQuant,
+        Mamba2Scan,
     ];
 
     /// The order of `arch`'s step.
