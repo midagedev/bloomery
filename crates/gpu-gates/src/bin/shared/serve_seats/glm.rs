@@ -252,9 +252,7 @@ use bloomery_gpu_gates::bind::{
     SlotStep, Vocab, arm_screen, begin, bind_server, eprint_noted, model_props, note_line,
     parallel_line, placement_of, put_back, slots_given,
 };
-use bloomery_gpu_gates::generate::{
-    Lane, Place, choose_ctx_of, lane_at, mode_name, short_in, with_cards,
-};
+use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::residency38::{
@@ -272,11 +270,9 @@ use bloomery_levers::{
     ChurnHosting, GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
 };
 use gguf::Split;
-use model::arch::glm5next::place::{
-    KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlaceError, PlanInputs,
-};
+use model::arch::glm5next::place::{KdaLanes, NextnInputs, PROMPT_GROUP, PlanInputs};
 use model::placement::churn::ChurnPool;
-use model::placement::ctx_ask::{DEFAULT_SLOTS, Probe};
+use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
@@ -306,9 +302,8 @@ const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] \
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
-/// The positions the stores are sized for when `--ctx` names none:
-/// `generate_glm5next`'s default, and the floor [`ctx_of`]'s rule never
-/// goes under while the card holds it.
+/// `generate_glm5next`'s default context: the unset draft rule reads a
+/// slot's window bound at it before the context is chosen.
 const CTX: usize = 2048;
 
 /// The levers this seat acts on: those `generate_glm5next` reads for its load
@@ -425,45 +420,8 @@ fn draft_of(
     }
 }
 
-/// The seat's context (the module doc), every number a slot's own and every
-/// plan counting `slots` sequences ([`plan_of`]), by the seats' common choice
-/// (`generate::choose_ctx_of`): the limit is the trained context, verified up
-/// to [`ORACLE_POSITIONS`]; a set share past it stops by name, and one the
-/// machine cannot hold stops with the largest it would hold; unset, a slot
-/// asks the target and halves while the plan is short. Each probe plans the
-/// machine laid at its context (`machine_at`). The context a slot gets and the
-/// choice's `ctx` line.
-fn ctx_of(
-    inputs: &PlanInputs,
-    machine_at: &dyn Fn(u64) -> Result<Machine, GateError>,
-    levers: &PlanLevers,
-    nextn: Option<&NextnInputs>,
-    asked: (Option<usize>, usize),
-) -> Result<(usize, String), GateError> {
-    let slots = asked.1;
-    let plan_at = |c: u64| -> Result<Probe<()>, GateError> {
-        let machine = machine_at(c)?;
-        match plan_of(inputs, &machine, c, levers, nextn, slots) {
-            Ok(_) => Ok(Probe::Holds(())),
-            Err(e) => short_in::<PlaceError>(&e).map(Probe::Short).ok_or(e),
-        }
-    };
-    let chosen = choose_ctx_of(
-        u64::try_from(inputs.hp.n_ctx_train)?,
-        asked,
-        (None, Some((ORACLE_POSITIONS, "ORACLE_POSITIONS"))),
-        plan_at,
-    )?;
-    Ok((usize::try_from(chosen.slot_ctx)?, chosen.line()))
-}
-
-/// The target's plan of `slots` resident sequences at `ctx` positions a slot
-/// on the load `nextn` names: with the next-token layer
-/// (`PlanInputs::plan_nextn_slots`, two KDA lanes) or without it
-/// (`PlanInputs::plan_slots` at one lane) — the plans the load runs
-/// ([`open_nextn_slots`], [`open_resident_slots`]). A refusal on a machine
-/// that carries the image encoder's reserve names it
-/// ([`vision_seat::refusal`]).
+/// The target's plan as the load runs it ([`glm_place::plan_of`]), its
+/// refusal named for the seat ([`glm_place::named`]).
 fn plan_of<'a>(
     inputs: &'a PlanInputs,
     machine: &'a Machine,
@@ -472,16 +430,8 @@ fn plan_of<'a>(
     nextn: Option<&'a NextnInputs>,
     slots: usize,
 ) -> Result<Plan<'a>, GateError> {
-    let planned = match nextn {
-        None => inputs.plan_slots(machine, ctx, levers, KdaLanes::One, slots),
-        Some(n) => inputs
-            .plan_nextn_slots(machine, ctx, levers, n, slots)
-            .map(|with| with.plan),
-    };
-    planned.map_err(|e| match vision_seat::reserve_in(machine) {
-        Some(bytes) => GateError::from(vision_seat::refusal(Some(bytes), e)),
-        None => GateError::from(e),
-    })
+    glm_place::plan_of(inputs, machine, ctx, levers, nextn, slots)
+        .map_err(|e| glm_place::named(machine, e))
 }
 
 /// What `--mmproj` asks of a placement: the flags, the encoder file they
@@ -526,7 +476,7 @@ struct Placed {
     place: Place,
     tier_batch: Option<TierBatchBytes>,
     machine: Machine,
-    /// The context a slot gets and the choice's `ctx` line ([`ctx_of`]).
+    /// The context a slot gets and the choice's `ctx` line ([`glm_place::serve_ctx`]).
     ctx: usize,
     line: String,
     tier_experts: u64,
@@ -535,7 +485,7 @@ struct Placed {
 
 impl Placed {
     /// `place` planned for `slots` sequences on the load `nextn` names, its
-    /// context `set` or the rule's ([`ctx_of`]), the encoder `images` seat
+    /// context `set` or the rule's ([`glm_place::serve_ctx`]), the encoder `images` seat
     /// counted; every refusal of the plan's by name.
     fn of(
         place: Place,
@@ -560,7 +510,9 @@ impl Placed {
                     reserve,
                 )(inputs.model.layers))
             };
-            let ctx = u64::try_from(ctx_of(inputs, &machine_at, levers, nextn, (set, slots))?.0)?;
+            let ctx = u64::try_from(
+                glm_place::serve_ctx(inputs, &machine_at, levers, nextn, (set, slots))?.0,
+            )?;
             let machine = machine_at(ctx)?;
             let plan = plan_of(inputs, &machine, ctx, levers, nextn, slots)?;
             Ok(vision_seat::Cost::of(&plan, ctx))
@@ -573,7 +525,8 @@ impl Placed {
                 reserve,
             )(inputs.model.layers))
         };
-        let (slot_ctx, line) = ctx_of(inputs, &machine_at, levers, nextn, (set, slots))?;
+        let (slot_ctx, line) =
+            glm_place::serve_ctx(inputs, &machine_at, levers, nextn, (set, slots))?;
         let ctx = u64::try_from(slot_ctx)?;
         let machine = machine_at(ctx)?;
         // `glm_place::tier_experts` plans on a machine of its own, which carries no reserve: a

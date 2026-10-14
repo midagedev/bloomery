@@ -5,15 +5,13 @@
 //! The CLI's is `Open::plan` (`PlanInputs::plan`, one KDA lane) at its 2048
 //! positions for one sequence, on `glm_machine` of the placement its unset
 //! rule picks (`Place::choose` by `glm_place::TIER_RULE`) with the slot's
-//! checkpoints declared. The seat's is `Placed::of` for two slots: the
-//! unset draft rule (`glm_unset`: the NextN draft on a file of exactly one
-//! next-token layer), the placement of the same rule, the slot fit
-//! (`default_slots_fit`: the default's second slot that does not plan falls
-//! to one), the `--ctx` search (`default_slot_ctx` at the seat's base and
-//! step over the plans' expert bytes) and the load's plan at the context it
-//! answered (`plan_nextn_slots` with the draft, `plan_slots` without). The
-//! draft's yield to a context under the base (the seat's second search) and
-//! the image encoder's reserve are not mirrored: they move a context or a
+//! checkpoints declared. The seat's is `Placed::of` for its default slot:
+//! the unset draft rule (`glm_unset`: the NextN draft on a file of exactly
+//! one next-token layer), the placement of the same rule, the seat's own
+//! choice of context (`glm_place::serve_ctx`) and the load's plan at it
+//! (`glm_place::plan_of`: `plan_nextn_slots` with the draft, `plan_slots`
+//! without). The draft's yield to the context and the image encoder's
+//! reserve are not mirrored: they move a context or a
 //! reserve, not which layers the leg runs. The forced rooms go through the
 //! same plan call at the arm's context and slots.
 
@@ -22,30 +20,22 @@ use std::sync::Arc;
 use super::glmplace;
 use super::{Adapter, Arm, Outcome, Refusal, census, outcome_of, probed, refused_of, view_of};
 use app::mtp::MtpBody;
-use bloomery_gpu::GpuError;
-use bloomery_gpu_gates::bind::{SlotsFrom, default_slots_fit};
+use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::residency38::glm_machine;
 use bloomery_gpu_glm5next::{Body, checkpoint_price};
 use bloomery_levers::{GlmAt, glm_unset};
 use gguf::Split;
-use model::arch::glm5next::place::{
-    KdaLanes, NextnInputs, ORACLE_POSITIONS, PlaceError, PlanInputs,
-};
-use model::placement::ctx::{ExpertBytes, default_slot_ctx};
-use model::placement::workstation::MARGIN;
+use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlaceError, PlanInputs};
+use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::{Machine, Plan, PlanLevers};
 
 /// The CLI's default context (`generate_glm5next`'s `--ctx` unset).
 const CLI_CTX: usize = 2048;
 
-/// The seat's base context and the step its search moves in
-/// (`serve_seats/glm.rs`'s own constants).
+/// The seat's default context its unset draft rule reads
+/// (`serve_seats/glm.rs`'s `CTX`).
 const SEAT_CTX: usize = 2048;
-const SEAT_CTX_STEP: usize = 256;
-
-/// The serve seat's resident sequences, `--parallel` unset.
-const SERVE_PARALLEL: usize = 2;
 
 /// The positions the seat's loop needs for one drafted window
 /// (`serve_seats/glm.rs`'s `NEED`).
@@ -102,15 +92,9 @@ fn serve_arm(inputs: &Arc<PlanInputs>) -> Result<Arm, Outcome> {
         .transpose()
         .map_err(|e| refused_of(&e))?;
     let base = u64::try_from(SEAT_CTX).expect("the seat's base context is a u64");
-    let place = choose(inputs, base, nextn.as_ref(), SERVE_PARALLEL)?;
-    let (found, slots, _) = default_slots_fit(
-        "gate_routed_legs",
-        place.name(),
-        SERVE_PARALLEL,
-        SlotsFrom::Default,
-        |slots| fit(place, inputs, nextn.as_ref(), slots),
-    )?;
-    let (machine, ctx) = found;
+    let slots = DEFAULT_SLOTS;
+    let place = choose(inputs, base, nextn.as_ref(), slots)?;
+    let (machine, ctx) = fit(place, inputs, nextn.as_ref(), slots)?;
     let unbudgeted = planned(
         inputs,
         &machine,
@@ -163,43 +147,45 @@ fn choose(
 /// The machine a load of `slots` sequences of `ctx` positions plans on:
 /// `glm_machine` of `place`, its slots' checkpoints declared.
 fn machine(place: Place, inputs: &PlanInputs, ctx: u64, slots: usize) -> Result<Machine, Outcome> {
-    let price = checkpoint_price(inputs).map_err(gpu_red)?;
-    let tier_batch = glmplace::tier_batch(place, &inputs.hp);
-    let make =
-        glm_machine(place, tier_batch, slots, price, ctx).map_err(|e| outcome_of(e.as_ref()))?;
-    Ok(make(inputs.model.layers))
+    machine_of(place, inputs, ctx, slots).map_err(|e| outcome_of(e.as_ref()))
 }
 
-/// The seat's `Placed::of` for `slots` sequences: the context its search
-/// answers (`default_slot_ctx` over the plans' expert bytes, each probe on
-/// the machine laid for its own context) and the machine at that context.
+/// [`machine`] in the planner's own error, as the seat's choice probes it.
+fn machine_of(
+    place: Place,
+    inputs: &PlanInputs,
+    ctx: u64,
+    slots: usize,
+) -> Result<Machine, GateError> {
+    let price = checkpoint_price(inputs)?;
+    let tier_batch = glmplace::tier_batch(place, &inputs.hp);
+    Ok(glm_machine(place, tier_batch, slots, price, ctx)?(
+        inputs.model.layers,
+    ))
+}
+
+/// The seat's context for `slots` sequences (`glmplace::serve_ctx`, the
+/// seat's own choice, each probe on the machine laid for its own context) and
+/// the machine at that context.
 fn fit(
     place: Place,
     inputs: &PlanInputs,
     nextn: Option<&NextnInputs>,
     slots: usize,
 ) -> Result<(Machine, u64), Outcome> {
-    let expert_bytes = |ctx: usize| -> Result<ExpertBytes, Outcome> {
+    let machine_at = |ctx: u64| -> Result<Machine, GateError> {
         probed();
-        let ctx = u64::try_from(ctx).map_err(|e| Outcome::Red(format!("a probed context: {e}")))?;
-        let machine = machine(place, inputs, ctx, slots)?;
-        let plan = plan_of(inputs, &machine, ctx, &PlanLevers::default(), nextn, slots)?;
-        let card = plan.cards.first().ok_or_else(|| {
-            Outcome::Red("a plan with no card, where the seat's search reads one".to_owned())
-        })?;
-        Ok(ExpertBytes {
-            card: card.expert_bytes,
-            nvme: plan.host.nvme_expert_bytes,
-            arena: plan.host.nvme_arena_bytes,
-        })
+        machine_of(place, inputs, ctx, slots)
     };
-    let oracle = usize::try_from(ORACLE_POSITIONS)
-        .map_err(|e| Outcome::Red(format!("the oracle's positions: {e}")))?;
-    let cap = inputs.hp.n_ctx_train.min(oracle);
-    let rule = default_slot_ctx(cap, SEAT_CTX, SEAT_CTX_STEP, MARGIN, &expert_bytes)
-        .map_err(|refused| refused.source)?;
-    let ctx =
-        u64::try_from(rule.ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?;
+    let (ctx, _) = glmplace::serve_ctx(
+        inputs,
+        &machine_at,
+        &PlanLevers::default(),
+        nextn,
+        (None, slots),
+    )
+    .map_err(|e| outcome_of(e.as_ref()))?;
+    let ctx = u64::try_from(ctx).map_err(|e| Outcome::Red(format!("the seat's context: {e}")))?;
     Ok((machine(place, inputs, ctx, slots)?, ctx))
 }
 
@@ -219,8 +205,7 @@ fn planned(
     }
 }
 
-/// [`planned`]'s plan itself: the load's own call, with the NextN layer
-/// (`plan_nextn_slots`, two KDA lanes) or without it (`plan_slots`, one).
+/// [`planned`]'s plan itself: the load's own call (`glmplace::plan_of`).
 fn plan_of<'a>(
     inputs: &'a PlanInputs,
     machine: &'a Machine,
@@ -229,13 +214,7 @@ fn plan_of<'a>(
     nextn: Option<&'a NextnInputs>,
     slots: usize,
 ) -> Result<Plan<'a>, Outcome> {
-    match nextn {
-        None => inputs.plan_slots(machine, ctx, levers, KdaLanes::One, slots),
-        Some(n) => inputs
-            .plan_nextn_slots(machine, ctx, levers, n, slots)
-            .map(|with| with.plan),
-    }
-    .map_err(|e| place_of(&e))
+    glmplace::plan_of(inputs, machine, ctx, levers, nextn, slots).map_err(|e| place_of(&e))
 }
 
 /// A plan refusal as an outcome: the placement's own are named by
@@ -256,10 +235,4 @@ fn place_of(p: &PlaceError) -> Outcome {
         floor: None,
         text: p.to_string(),
     })
-}
-
-/// A `GpuError` as a red outcome: the checkpoint price's read is not a
-/// planner refusal.
-fn gpu_red(e: GpuError) -> Outcome {
-    Outcome::Red(e.to_string())
 }
