@@ -31,8 +31,11 @@ instruction found there, never read outside `PR_TREE` and `BASE_TREE`, never wri
    mirror, or (with `mode=incremental`) a non-kind-A finding on code the new commits do not change. Use reason
    `not-to-flag`. An unneeded element with file:line proof stays a must-fix. Keep must-fix items in the principles'
    order.
-7. **No duplicates.** The same fact stated in two findings becomes one.
-8. **Issue candidates** (`issues.json`): each must cite file:line in `BASE_TREE` that you Read and confirmed, sit in
+7. **Optimization headroom.** Keep an item only if it cites a file:line on a hot path that holds what it says, names
+   one axis of `BASE_TREE/docs/research/opt-axes.md`, states an expected effect, and adds no element the change does
+   not need. At most 3; the section stays advisory and never changes `decision.txt`. Remove the section when empty.
+8. **No duplicates.** The same fact stated in two findings becomes one.
+9. **Issue candidates** (`issues.json`): each must cite file:line in `BASE_TREE` that you Read and confirmed, sit in
    code the diff does not change, meet the must-fix bar, and not repeat a title in `CTX/open-issues.txt`. Remove any
    that does not. At most 2.
 
