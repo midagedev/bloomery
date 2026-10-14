@@ -699,6 +699,18 @@ impl Poison {
         };
         PoisonMark { kind, what, layer }
     }
+
+    /// `note` added to what the poison saw.
+    fn note(&mut self, note: &str) {
+        let saw = match self {
+            Poison::Refused(r) => &mut r.detail,
+            Poison::Failed { error, .. } => error,
+            Poison::Panicked { message, .. } => message,
+            Poison::CardLost { detail, .. } => detail,
+        };
+        saw.push_str("; ");
+        saw.push_str(note);
+    }
 }
 
 impl std::fmt::Display for Poison {
@@ -790,6 +802,9 @@ pub(crate) struct Health {
     failing: Option<Refusal>,
     /// The refusal that failed a service, else the first one recorded.
     refusal: Option<Refusal>,
+    /// Why the last release left a card's waits standing
+    /// ([`HostTier::release_all`]): every refusal names it after the poison.
+    held: Option<String>,
     stats: TierStats,
 }
 
@@ -856,10 +871,13 @@ impl Health {
         if !self.poisoned {
             return Ok(());
         }
-        let poison = self
+        let mut poison = self
             .poison
             .clone()
             .expect("a poisoned tier holds its poison: set_poison and set_lost set both");
+        if let Some(held) = &self.held {
+            poison.note(held);
+        }
         Err(GpuError::HostPoisoned {
             what,
             poison: Box::new(poison),
@@ -2714,11 +2732,24 @@ impl<H: HostExperts> HostTier<H> {
 
     /// A service `what` of layer `layer` failed with `e` after either card
     /// may have been given work: poison the tier, release every card's
-    /// waits, and return `e`.
+    /// waits, and return `e` ([`HostTier::released`]).
     fn fail_released(&mut self, what: &'static str, layer: usize, e: GpuError) -> GpuError {
         self.health.set_poison(what, layer, Some(&e), None);
+        self.released(what, e)
+    }
+
+    /// Release every card's waits ([`HostTier::release_all`]) and return
+    /// `e`, or, when the release left a card's waits standing, a protocol
+    /// error of `what` that names `e` and why.
+    fn released(&mut self, what: &'static str, e: GpuError) -> GpuError {
         self.release_all();
-        e
+        match (self.health.held.clone(), e) {
+            (None, e) => e,
+            (Some(held), GpuError::Protocol { what, detail }) => {
+                GpuError::protocol(what, format!("{detail}; {held}"))
+            }
+            (Some(held), e) => GpuError::protocol(what, format!("{e}; {held}")),
+        }
     }
 
     /// Wait under one go deadline for each tier whose bit `mask` sets to
@@ -2798,17 +2829,21 @@ impl<H: HostExperts> HostTier<H> {
         }
         let (name, detail) = (self.tier_names(behind), details.join("; "));
         self.health.set_lost(what, &name, layer, &detail);
-        self.release_all();
-        GpuError::protocol(what, format!("layer {layer}: {detail}"))
+        self.released(
+            what,
+            GpuError::protocol(what, format!("layer {layer}: {detail}")),
+        )
     }
 
-    /// Release every wait still pending on every card.
-    fn release_all(&self) {
+    /// Release every wait still pending on every card. A tier link end
+    /// whose posts cannot be shown over leaves its cards' waits standing
+    /// ([`TierPage::release`]): its cards keep waiting and a synchronize of
+    /// their streams does not return, so the tier keeps why until a release
+    /// that does release them, and every refusal names it.
+    fn release_all(&mut self) {
         self.step.boundary.release();
         if let Some(page) = self.tier_page.as_ref() {
-            for t in &self.tiers {
-                t.release(page);
-            }
+            self.health.held = page.release().err();
         }
     }
 
@@ -2816,13 +2851,14 @@ impl<H: HostExperts> HostTier<H> {
     /// card's waits released first: a step service is asked after its
     /// chain's launch, so the card already waits on the host for it, and a
     /// refusal that left those waits standing would hang the next read of
-    /// the stream instead of naming the poison.
-    fn refuse_released(&self, what: &'static str) -> Result<(), GpuError> {
-        let r = self.health.refuse_if_poisoned(what);
-        if r.is_err() {
+    /// the stream instead of naming the poison. A release that leaves a
+    /// card's waits standing is named in the refusal
+    /// ([`HostTier::release_all`]).
+    fn refuse_released(&mut self, what: &'static str) -> Result<(), GpuError> {
+        if self.health.poisoned {
             self.release_all();
         }
-        r
+        self.health.refuse_if_poisoned(what)
     }
 
     /// Serve layer `layer` for an eager batch of `x.ne1()` tokens in one
@@ -2877,7 +2913,9 @@ impl<H: HostExperts> HostTier<H> {
     /// Serve layer `layer` of row `row` in `chain`. Any failure — an error
     /// or a panic inside the host experts, or a poisoned tier's refusal —
     /// releases every pending wait first, so the stream drains instead of
-    /// hanging a later synchronize. A planted refusal
+    /// hanging a later synchronize, unless the tier link leaves a card's
+    /// waits standing, which the error names ([`HostTier::release_all`]).
+    /// A planted refusal
     /// ([`HostTier::plant_refusal`]) is returned here, as the service's own
     /// refusal of this layer's input.
     fn serve(
@@ -2946,8 +2984,8 @@ impl<H: HostExperts> HostTier<H> {
     /// the refusal recorded for the caller's naming
     /// ([`HostTier::take_step_refusal`], [`HostTier::refusal`]), the tier
     /// poisoned as [`Poison::Refused`] with the refusal its cause, every
-    /// wait released so the stream drains ([`HostTier::serve`]'s failure
-    /// arm) — and the error a refusing service returns.
+    /// wait released ([`HostTier::serve`]'s failure arm) — and the error a
+    /// refusing service returns.
     fn refuse_planted(&mut self, layer: usize, detail: String) -> GpuError {
         let r = Refusal {
             what: SERVE,
@@ -2965,8 +3003,7 @@ impl<H: HostExperts> HostTier<H> {
         self.step.step_refusal = Some(r.clone());
         self.health.record_refusal(r, true);
         self.health.set_poison(SERVE, layer, None, None);
-        self.release_all();
-        e
+        self.released(SERVE, e)
     }
 
     /// A planted refusal of layer `layer`, a batch service's

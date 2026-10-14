@@ -1274,13 +1274,14 @@ impl<H: HostExperts> HostTier<H> {
                 batch.serve_guarded(t, layer, x, ids, w, exclude, out)
             },
         );
-        if let Err(e) = &r
-            && tier_failed
-        {
-            self.health
-                .set_poison(SERVE_BATCH, key.layer, Some(e), None);
-            self.release_all();
-        }
+        let r = match r {
+            Err(e) if tier_failed => {
+                self.health
+                    .set_poison(SERVE_BATCH, key.layer, Some(&e), None);
+                Err(self.released(SERVE_BATCH, e))
+            }
+            r => r,
+        };
         r.map_err(|e| self.noted(e))
     }
 

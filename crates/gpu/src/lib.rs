@@ -163,8 +163,9 @@ pub enum GpuError {
     /// The card and the hybrid host tier lost step with each other: a go that
     /// did not land in time, a card that ran ahead of the host, a handoff of
     /// another sequence number or layer. The tier has released every pending
-    /// wait and refuses to serve again, so the model is unusable, not the
-    /// call's arguments wrong.
+    /// wait, or `detail` names the tier link end that left one standing, and
+    /// refuses to serve again, so the model is unusable, not the call's
+    /// arguments wrong.
     Protocol { what: &'static str, detail: String },
     /// The residency machine refused a flip whose expert the host would
     /// serve from the file, not from resident pages, once its pages were

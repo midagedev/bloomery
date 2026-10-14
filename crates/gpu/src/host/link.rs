@@ -26,15 +26,16 @@
 //! The host touches the page's flag words through the link alone: it reads a
 //! word ([`Link::load`]), stores one ([`Link::store`]),
 //! checks at rest and resets a counter ([`Link::at_rest`], [`Link::reset`]),
-//! and releases a tier's counters, all of them in one call
-//! ([`Link::release`]). On the shared page each word access is one load or
-//! store, and a release one store a counter; on mirrored pages each end
-//! acts on its own page, and a release stops all of its counters on both
-//! ends before it raises any.
+//! and releases every counter of the page in one call ([`Link::release`]).
+//! On the shared page each word access is one load or store, and a release
+//! one store a counter; on mirrored pages each end acts on its own page, and
+//! a release stops every counter on both ends and settles both ends before
+//! it raises any.
 
 mod pump;
 mod rdma;
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -50,8 +51,9 @@ pub use pump::{Crossing, Reader};
 use pump::{Half, Move, Page, TAIL_LINE, Wire};
 pub use rdma::RdmaEnd;
 
-/// How long a reset waits for an end's posts in flight to finish.
-const RESET_DRAIN: Duration = Duration::from_secs(1);
+/// How long a reset or a release waits for an end's posts in flight to
+/// finish, and a release then for the posts it aborted.
+const DRAIN: Duration = Duration::from_secs(1);
 
 /// The tier page's bytes as every side reaches them: the stage card's page,
 /// which every tier card reaches too on the shared page, and on mirrored
@@ -61,11 +63,15 @@ const RESET_DRAIN: Duration = Duration::from_secs(1);
 pub(super) struct Link {
     mirror: Option<Mirror>,
     page: Arc<MappedHost>,
+    /// On the shared page every crossing's counter, what a release raises;
+    /// mirrored ends hold their own ([`Side::counters`]).
+    counters: Vec<usize>,
 }
 
 /// The two ends of mirrored pages and the pump threads that drive them.
 ///
-/// Field order is drop order: the pumps stop before the ends go.
+/// Field order is drop order: the pumps stop before the ends go. An end a
+/// release left unsettled is never freed ([`Mirror`]'s `Drop`).
 struct Mirror<P = MappedHost> {
     pumps: Vec<Pump>,
     stage: Arc<dyn Side<P>>,
@@ -108,6 +114,15 @@ trait Side<P = MappedHost>: Send + Sync {
     fn release(&self, off: usize, v: u32);
     /// Stop carrying the counter at byte `off`.
     fn stop(&self, off: usize);
+    /// Bring the end to where nothing it posted can still be read
+    /// ([`Half::settle`], within twice [`DRAIN`]): `false`, with the end
+    /// broken, when a post is not known to be over.
+    fn settle(&self) -> bool;
+    /// The counter of every crossing the end carries.
+    fn counters(&self) -> Vec<usize>;
+    /// Why the end is broken, if the last release left its counters where
+    /// they were ([`Half::settle`]).
+    fn unsettled(&self) -> Option<String>;
     /// Whether this end's side of the counter at byte `off` is at rest.
     fn at_rest(&self, off: usize) -> bool;
     /// The writer's reset of the counter at byte `off`, if this end writes it.
@@ -147,13 +162,29 @@ impl<W: Wire, P: Page> Side<P> for End<W, P> {
         self.lock().0.stop(off);
     }
 
+    fn settle(&self) -> bool {
+        let (half, wire) = &mut *self.lock();
+        half.settle(wire, DRAIN)
+    }
+
+    fn counters(&self) -> Vec<usize> {
+        self.lock().0.counters()
+    }
+
+    fn unsettled(&self) -> Option<String> {
+        let half = &self.lock().0;
+        half.broken()
+            .filter(|_| half.unsettled())
+            .map(str::to_string)
+    }
+
     fn at_rest(&self, off: usize) -> bool {
         let (half, wire) = &mut *self.lock();
         half.at_rest(off, &*self.page, wire)
     }
 
     fn reset_writer(&self, off: usize) {
-        let until = Instant::now() + RESET_DRAIN;
+        let until = Instant::now() + DRAIN;
         let (half, wire) = &mut *self.lock();
         half.reset_writer(off, &*self.page, wire, &|| Instant::now() < until);
     }
@@ -249,6 +280,40 @@ impl<P: Page> Wire for Memory<P> {
     fn reap(&mut self) -> Result<bool, String> {
         Ok(true)
     }
+
+    fn abort(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Release every counter each end of `ends` carries: every counter stops on
+/// its end, then every end settles ([`Side::settle`]), and only then does any
+/// counter move, since a released card runs on, steps the counters it writes
+/// and rewrites the spans its end's posts read. An end that does not settle
+/// keeps its counters where they are, so its cards keep waiting rather than
+/// rewrite a span a write may still read: `Err` names each such end.
+fn release_settled<P>(ends: &[&dyn Side<P>], v: u32) -> Result<(), String> {
+    let offs: Vec<Vec<usize>> = ends.iter().map(|end| end.counters()).collect();
+    for (end, offs) in ends.iter().zip(&offs) {
+        offs.iter().for_each(|&off| end.stop(off));
+    }
+    let settled: Vec<bool> = ends.iter().map(|end| end.settle()).collect();
+    let mut held = Vec::new();
+    for ((end, offs), settled) in ends.iter().zip(&offs).zip(settled) {
+        if settled {
+            offs.iter().for_each(|&off| end.release(off, v));
+        } else {
+            held.extend(end.unsettled());
+        }
+    }
+    if held.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the tier link left the waits on its counters standing, so the cards that read them keep \
+         waiting and a synchronize of their streams does not return: {}",
+        held.join("; ")
+    ))
 }
 
 /// One side's view of the page: the device address of each byte as that
@@ -279,18 +344,25 @@ impl Link {
         what: &'static str,
     ) -> Result<Link, GpuError> {
         match kind {
-            TierLink::Shared => Link::shared(stage, bytes),
+            TierLink::Shared => {
+                Link::shared(stage, bytes, crossings.iter().map(|c| c.counter).collect())
+            }
             TierLink::Loopback => Link::loopback(stage, tier, bytes, crossings, what),
             TierLink::Rdma => Link::rdma(stage, tier, bytes, crossings, what),
         }
     }
 
     /// `bytes` zeroed bytes of shared page, allocated in the stage card's
-    /// context `ctx`. Load-time only.
-    fn shared(ctx: &Arc<CudaContext>, bytes: usize) -> Result<Link, GpuError> {
+    /// context `ctx`, whose counters are at bytes `counters`. Load-time only.
+    fn shared(
+        ctx: &Arc<CudaContext>,
+        bytes: usize,
+        counters: Vec<usize>,
+    ) -> Result<Link, GpuError> {
         Ok(Link {
             mirror: None,
             page: Arc::new(MappedHost::new(ctx, bytes, "cuMemHostAlloc (tier page)")?),
+            counters,
         })
     }
 
@@ -346,6 +418,7 @@ impl Link {
                 run_on: None,
             }),
             page,
+            counters: Vec::new(),
         })
     }
 
@@ -383,6 +456,7 @@ impl Link {
                 run_on: None,
             }),
             page,
+            counters: Vec::new(),
         })
     }
 
@@ -459,16 +533,20 @@ impl Link {
         self.word(off).store(v, Ordering::Release);
     }
 
-    /// Release every wait on the counters at bytes `offs`, a tier's every
-    /// counter, until their resets: the counter each reader waits on goes to
-    /// `v`, far past anything a step subtracts. A tier's counters go in one
-    /// call: mirrored pages stop carrying all of them on both ends before any
-    /// reader's counter moves, since a released card runs on and writes the
-    /// counters that would still carry.
-    pub(super) fn release(&self, offs: &[usize], v: u32) {
+    /// Release every wait on every counter of the page, every tier's, until
+    /// their resets: the counter each reader waits on goes to `v`, far past
+    /// anything a step subtracts. Mirrored pages stop carrying every counter
+    /// on both ends and settle both ends before any reader's counter moves
+    /// ([`release_settled`]). An end whose posts cannot be shown over leaves
+    /// its own counters as they are, so its cards keep waiting: `Err` names
+    /// it, and the link's drop never frees its pages.
+    pub(super) fn release(&self, v: u32) -> Result<(), String> {
         match &self.mirror {
-            None => offs.iter().for_each(|&off| self.store(off, v)),
-            Some(m) => m.release(offs, v),
+            None => {
+                self.counters.iter().for_each(|&off| self.store(off, v));
+                Ok(())
+            }
+            Some(m) => m.release(v),
         }
     }
 
@@ -508,19 +586,12 @@ impl Link {
 }
 
 impl<P: Page> Mirror<P> {
-    /// [`Link::release`] on both ends: every counter of `offs` stopped on
-    /// both before any reader's counter goes to `v`.
-    fn release(&self, offs: &[usize], v: u32) {
-        for &off in offs {
-            self.stage.stop(off);
-            self.tier.stop(off);
-        }
-        for &off in offs {
-            self.stage.release(off, v);
-            self.tier.release(off, v);
-        }
+    /// [`Link::release`] on both ends.
+    fn release(&self, v: u32) -> Result<(), String> {
+        let released = release_settled(&[&*self.stage, &*self.tier], v);
         #[cfg(test)]
         self.after_release();
+        released
     }
 
     /// [`Link::at_rest`] on both ends.
@@ -546,6 +617,29 @@ impl<P: Page> Mirror<P> {
             .broken()
             .or_else(|| self.tier.broken())
             .or_else(|| self.pumps.iter().find_map(Pump::ended))
+    }
+}
+
+impl<P> Drop for Mirror<P> {
+    /// An end a release left unsettled still has cards waiting on its page's
+    /// counters and posts that may still land on the other page: both ends,
+    /// their wires and pages are leaked, never freed under them, and named.
+    fn drop(&mut self) {
+        let held: Vec<String> = [&self.stage, &self.tier]
+            .iter()
+            .filter_map(|end| end.unsettled())
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        std::mem::forget(Arc::clone(&self.stage));
+        std::mem::forget(Arc::clone(&self.tier));
+        // `eprintln!` panics when stderr fails, and a panic in a drop aborts.
+        let _ = writeln!(
+            std::io::stderr(),
+            "tier link drop: leaked both ends, their queue pairs and pages: {}",
+            held.join("; ")
+        );
     }
 }
 

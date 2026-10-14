@@ -52,6 +52,7 @@ const QPT_RC: u32 = 2;
 const QPS_INIT: u32 = 1;
 const QPS_RTR: u32 = 2;
 const QPS_RTS: u32 = 3;
+const QPS_ERR: u32 = 6;
 const PORT_ACTIVE: u32 = 4;
 const QP_STATE: c_int = 1;
 const QP_ACCESS_FLAGS: c_int = 8;
@@ -76,7 +77,8 @@ pub const WC_RDMA_WRITE: u32 = 1;
 const GID_TYPE_ROCE_V2: u32 = 2;
 /// The one port of a RoCE device.
 const PORT: u8 = 1;
-/// Completions the device's one queue holds.
+/// Completions the device's one queue holds, and so the writes a queue pair
+/// on it may hold in flight: each write is signaled.
 const CQ_DEPTH: c_int = 1024;
 /// Writes one post chains at most.
 pub const MAX_CHAIN: usize = 8;
@@ -673,6 +675,13 @@ impl Nic {
     /// A reliable-connected queue pair on this device, in its reset state,
     /// that holds `depth` writes in flight.
     pub fn queue_pair(self: &Arc<Self>, depth: u32) -> Result<Qp, VerbsError> {
+        if i64::from(depth) > i64::from(CQ_DEPTH) {
+            return Err(format!(
+                "a queue pair of {depth} writes on a completion queue of {CQ_DEPTH}: each write \
+                 completes on its own"
+            )
+            .into());
+        }
         let mut init = QpInitAttr {
             qp_context: ptr::null_mut(),
             send_cq: self.cq.0,
@@ -948,26 +957,38 @@ impl Qp {
         )
     }
 
+    /// Take the queue pair to its error state, from any state: every write
+    /// posted on it that has not completed is flushed to the completion queue
+    /// with its own completion, the flush `rdma_disconnect(3)` describes for
+    /// the same transition, which it makes through the connection manager.
+    pub fn to_error(&self) -> Result<(), VerbsError> {
+        let mut a = qp_attr();
+        a.qp_state = QPS_ERR;
+        self.modify(&mut a, QP_STATE, "ERR")
+    }
+
     /// Post `writes` (at most [`MAX_CHAIN`]) from `region` to the peer's
-    /// region keyed `rkey` as one chain, in order; only the last is signaled.
+    /// region keyed `rkey` as one chain, in order, each signaled: each write
+    /// has its own completion, success or error. On `Err`, the count of the
+    /// writes the queue pair took before the one it refused.
     ///
     /// # Safety
     ///
-    /// The NIC reads each source range after the call returns, until the
-    /// chain's completion is polled or the queue pair is destroyed. Until
-    /// then the caller keeps `region` registered and its memory allocated,
-    /// and does not rewrite a posted range. On `Err` the writes before the
-    /// one the post refused may have been taken and are still in flight
-    /// under the same terms.
+    /// The NIC reads a write's source range after the call returns, until
+    /// that write's completion is polled or the queue pair is destroyed: a
+    /// buffer is reused only once its work completion is retrieved
+    /// (`ibv_post_send(3)`). Until then the caller keeps `region` registered
+    /// and its memory allocated, and does not rewrite the range. On `Err`
+    /// the writes taken are in flight under the same terms.
     pub unsafe fn post_writes(
         &self,
         region: &Region,
         writes: &[Write],
         rkey: u32,
-    ) -> Result<(), VerbsError> {
+    ) -> Result<(), (usize, VerbsError)> {
         let n = writes.len();
         if n == 0 || n > MAX_CHAIN {
-            return Err(format!("a chain of {n} writes: 1 to {MAX_CHAIN}").into());
+            return Err((0, format!("a chain of {n} writes: 1 to {MAX_CHAIN}").into()));
         }
         let mut sge: [Sge; MAX_CHAIN] = std::array::from_fn(|_| Sge {
             addr: 0,
@@ -980,7 +1001,7 @@ impl Qp {
             sg_list: ptr::null_mut(),
             num_sge: 1,
             opcode: WR_RDMA_WRITE,
-            send_flags: 0,
+            send_flags: SEND_SIGNALED,
             imm_data: 0,
             remote_addr: 0,
             rkey,
@@ -996,7 +1017,6 @@ impl Qp {
             };
             wr[i].remote_addr = w.to;
         }
-        wr[n - 1].send_flags = SEND_SIGNALED;
         // From here on the chain is reached through these two pointers alone,
         // which the post reads.
         let sges = sge.as_mut_ptr();
@@ -1017,7 +1037,13 @@ impl Qp {
         // which copies them into the send queue.
         let rc = unsafe { (self.nic.post_send)(self.qp.0, base, &mut bad) };
         if rc != 0 {
-            return Err(format!("ibv_post_send of {n} writes failed: rc {rc}").into());
+            // `bad` is the first write refused; one it does not name counts
+            // every write as taken.
+            let taken = (bad.addr().wrapping_sub(base.addr()) / size_of::<SendWr>()).min(n);
+            return Err((
+                taken,
+                format!("ibv_post_send of {n} writes failed at write {taken}: rc {rc}").into(),
+            ));
         }
         Ok(())
     }

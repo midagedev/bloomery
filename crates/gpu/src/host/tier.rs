@@ -51,7 +51,10 @@
 //! the settle's, names each tier whose progress is behind, the host tier is
 //! poisoned as [`super::PoisonKind::CardLost`], which a reset does not lift,
 //! and the release writes [`RELEASE`] to every tier's counters and go
-//! counters too, so every stream drains.
+//! counters too, so every stream drains, unless an end of mirrored pages
+//! cannot show its posts over ([`Link::release`]): its cards keep waiting,
+//! the host's error names that end, and a synchronize of their streams does
+//! not return.
 
 use std::mem::ManuallyDrop;
 use std::ops::Range;
@@ -792,13 +795,12 @@ impl TierPage {
             .map(move |w| self.off(tier, w))
     }
 
-    /// Release every wait of both cards on tier `tier`'s words that is still
-    /// pending, for good: the tier's counters and go counters go far past
-    /// anything a step subtracts, every row's go and done in one link call
-    /// ([`Link::release`]).
-    pub(super) fn release(&self, tier: usize) {
-        let offs: Vec<usize> = self.counters(tier).collect();
-        self.link.release(&offs, RELEASE);
+    /// Release every wait of both cards on the page's words that is still
+    /// pending, for good: every tier's counters and go counters go far past
+    /// anything a step subtracts, in one link call ([`Link::release`]), which
+    /// names an end that leaves its cards' waits standing.
+    pub(super) fn release(&self) -> Result<(), String> {
+        self.link.release(RELEASE)
     }
 
     /// Why the link stopped carrying for good ([`Link::broken`]), as the
@@ -1490,12 +1492,6 @@ impl TierCard {
         )
     }
 
-    /// Release every wait of both cards on this tier's words that is still
-    /// pending, for good ([`TierPage::release`]).
-    pub(super) fn release(&self, page: &TierPage) {
-        page.release(self.index);
-    }
-
     /// Whether the tier's words hold what a drained step leaves: no go and
     /// no signal pending, every layer asked of it served.
     pub(super) fn at_rest(&self, page: &TierPage) -> bool {
@@ -1910,7 +1906,7 @@ mod tests {
         assert!(TierLayout::new(V41, 512, 32, 9).is_err());
     }
 
-    /// A release over the loopback takes all of a tier's counters in one
+    /// A release over the loopback takes every counter of the page in one
     /// call. The released tier card runs on: after each release the tier's
     /// done steps by three on the tier cards' page and each end passes once.
     /// Released together, the done is stopped on both ends before any
@@ -1927,7 +1923,7 @@ mod tests {
             TierPage::new(&stage, &tier, layout, TierLink::Loopback).expect("a loopback page");
         let done = layout.word_off(0, TWord::Cnt(0));
         page.link.run_on(done, 3);
-        page.release(0);
+        assert_eq!(page.release(), Ok(()));
         assert_eq!(page.link.broken(), None);
         assert_eq!(page.link.load(done), RELEASE);
     }

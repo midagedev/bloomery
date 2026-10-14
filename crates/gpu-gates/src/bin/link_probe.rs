@@ -18,7 +18,8 @@
 //! of rows, every word g, and adds one to its done behind a system-scope
 //! barrier. The stage's next kernel counts the stale rows lines. A card
 //! rewrites its region only for its next generation, which waits for the
-//! other side to take this one, so the NIC has read the region by then.
+//! other side to take this one: that take follows the landing, not the
+//! completion (`docs/contrib/dgx-spark.md` 9.5, item 2).
 //!
 //! The round trip of generation g is read on the stage's card from
 //! `%globaltimer`: from the end of the kernel that wrote image g to the start
@@ -513,16 +514,6 @@ mod probe {
                 .expect("every counter and region word lies in the layout's page")
         }
 
-        /// The counters this rank waits on: every peer's done on the stage,
-        /// its go on a peer.
-        fn waits(&self) -> Vec<usize> {
-            let l = self.layout;
-            self.peers
-                .iter()
-                .map(|&j| if self.rank == 0 { l.done(j) } else { l.go(j) })
-                .collect()
-        }
-
         /// The first end that broke, by why.
         fn broken(&self) -> Option<String> {
             self.ends.iter().find_map(RdmaEnd::broken)
@@ -552,12 +543,12 @@ mod probe {
             .into()
         }
 
-        /// Release every counter this rank waits on: its end stops carrying
-        /// it and raises it to [`RELEASE`].
-        fn release(&self) {
-            for (e, off) in self.ends.iter().zip(self.waits()) {
-                e.release(off, RELEASE);
-            }
+        /// Release every counter this rank waits on: its ends stop carrying
+        /// every counter, and once their posts are over raise the ones this
+        /// rank reads to [`RELEASE`]; `Err` names an end whose posts are not
+        /// known to be over, whose counters stay ([`RdmaEnd::release`]).
+        fn release(&self) -> Result<(), String> {
+            RdmaEnd::release(self.ends, RELEASE)
         }
     }
 
@@ -592,8 +583,10 @@ mod probe {
             Ok::<(), GateError>(())
         });
         if let Err(e) = played {
-            card.release();
-            return Err(e);
+            return Err(match card.release() {
+                Ok(()) => e,
+                Err(held) => format!("{e}; {held}").into(),
+            });
         }
         if let Some(b) = card.broken() {
             return Err(format!("the link broke: {b}").into());
@@ -727,6 +720,9 @@ mod probe {
                 Ok(Err(e)) => e.to_string(),
                 Err(_) => "the card thread panicked".to_string(),
             };
+            // The release and the drain each wait on the link; why the run
+            // failed is out first. `eprintln!` panics when stderr fails.
+            let _ = writeln!(std::io::stderr(), "link_probe: {why}; releasing the link");
             match self.drain_released() {
                 Ok(()) => Err(format!("{why}; stream drained after release: true").into()),
                 Err(e) => {
@@ -734,8 +730,8 @@ mod probe {
                     // would drop the buffers this exit leaves alone.
                     let _ = writeln!(
                         std::io::stderr(),
-                        "link_probe: {why}; stream drained after release: false ({e}); exiting \
-                         without teardown"
+                        "link_probe: stream drained after release: false ({e}); exiting without \
+                         teardown"
                     );
                     std::process::exit(1);
                 }
@@ -831,7 +827,7 @@ mod probe {
         /// on, then `Ok` once the stream drained, else why it is not known
         /// to have.
         fn drain_released(&self) -> Result<(), String> {
-            self.card.release();
+            self.card.release()?;
             let end = self
                 .gpu
                 .context()

@@ -668,9 +668,30 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    card waits for at least one and takes it back, as on the shared page. Both ends hold the step rule: a step of 0
    carries nothing, a step of 1 carries one, and any other step publishes nothing and stops that end by name, since a
    row has at most one go or done in flight. The host's progress word on the stage's page counts the dones the
-   writer's end posted and goes after their bytes, so it never runs ahead of them. A release stops all of the tier's
-   counters on both ends before it raises any reader's counter, since a released card runs on and steps the counters it
-   writes. Each counter's reset takes its generations as carried and resumes it alone, each end resetting only its own
+   writer's end posted and goes after their bytes, so it does not run ahead of them while each write lands once (a
+   retransmission is the exception below). A release stops every counter of the page on both ends, every tier's in one
+   call, and an end raises its reader's counters only once its posts are over, since a released card runs on, steps the
+   counters it writes and rewrites the spans its end's posts still read. A post is over when each of its writes'
+   completions is polled (`ibv_post_send(3)`: a buffer is reused only after its work completion is retrieved), and each
+   write is signaled to have one. Writes that fail or do not complete within the bound (`DRAIN`) are flushed by taking
+   the queue pair to its error state, which completes every write still posted (the flush `rdma_disconnect(3)`
+   describes for that transition). An end whose writes still do not complete leaves its counters where they are and is
+   broken by name: its cards keep waiting, a synchronize of their streams does not return, the host's error and every
+   later refusal name the end, and the link's drop leaks both ends and their pages rather than free them under the
+   waits.
+   Outside a release the link does not wait for completions `[derived, not run]`. A card rewrites a span after the other
+   side's take, which follows the generation's landing, and the pump rewrites a line's staged generation and progress
+   words at its next post. If a request lands and its acknowledgement is lost, the requester sends again from the first
+   unacknowledged write and reads each source range again. Whether the responder writes a duplicate RDMA write again was
+   not checked against the specification. If it does, a span the card is rewriting can land torn; a later post of the
+   line, on the same queue pair, lands that span again before its own generation, so the reader does not read the torn
+   bytes through it. The staged words are read again too, though: when the card finishes its next span and the pump
+   stages the next generation between the retransmission's read of the span and its read of the generation, the reader
+   receives that generation, and the stage's progress counts it, before the span's bytes land. A lost request is not
+   this case: the reader has not taken that generation, so the line waits and no source range changes. How to close it
+   is open: the staged words sent inline (`ibv_post_send(3)`: an inline buffer can be reused once the call returns), a
+   completion gate before a delivery, or the `# Safety` wording of `post_writes`. Each
+   counter's reset takes its generations as carried and resumes it alone, each end resetting only its own
    side of it, and a link stopped by name fails the reset, so the host tier stays poisoned
    (`crates/gpu/src/host/link/pump.rs`). On the shared page nothing changes: the same words, values, card operations
    and graphs.
@@ -678,11 +699,11 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    an explicit acquire: the memorder row) and checks its step before any byte of the message moves. The card's
    system-scope barrier before go (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
 4. **Data before flag across the NIC.** The pages are registered without `IBV_ACCESS_RELAXED_ORDERING`, so
-   write-after-write order holds (the `ibv_reg_mr` row), with the generation last on the same QP. Only the last write of
-   a message is signaled; a completion with an error stops the end by its status name, which the lost tier's detail
-   carries. Write-with-immediate, where the remote pump writes the flag after the completion, was the other way: one
-   more hop, receives to keep posted, and a second ordering rule. NVIDIA's perftest ran with relaxed ordering on, so its
-   bandwidth is not protocol-mode bandwidth.
+   write-after-write order holds (the `ibv_reg_mr` row), with the generation last on the same QP. Every write of a
+   message is signaled, so each has its own completion; a completion with an error stops the end by its status name,
+   which the lost tier's detail carries. Write-with-immediate, where the remote pump writes the flag after the
+   completion, was the other way: one more hop, receives to keep posted, and a second ordering rule. NVIDIA's perftest
+   ran with relaxed ordering on, so its bandwidth is not protocol-mode bandwidth.
 5. **The remote is another process.** Node 1 runs a tier server: it loads its experts from its own copy of the file,
    captures its graphs from the go order it is sent at load, and launches a replay on a "replay r of chain c" message,
    which the first image can carry (today the stage process launches the tier's graph, `tier.rs:37-42`). Before the

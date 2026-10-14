@@ -1,11 +1,13 @@
 //! The RDMA end of mirrored pages: one page registered with its NIC, one
 //! queue pair to the other end, and the pump thread that drives it. Each
 //! post is one chain of RDMA writes on that queue pair, in the post's order,
-//! only the last signaled; the page is registered without relaxed ordering,
+//! each signaled; the page is registered without relaxed ordering,
 //! so on the NIC this link runs on (mlx5, whose writes on one queue pair
 //! land in their order) the generation lands last (`docs/contrib/dgx-spark.md`
 //! 9.5, item 4). A write that completes with an error breaks the end by its
-//! status name.
+//! status name. A release takes the queue pair of an end whose writes do not
+//! finish to its error state, which flushes each of them to a completion
+//! ([`Wire::abort`]).
 
 use std::sync::Arc;
 
@@ -24,7 +26,7 @@ struct Rdma {
     qp: Qp,
     region: Region,
     peer: Option<(u64, u32)>,
-    /// Posts not yet completed.
+    /// Writes posted whose completion was not yet polled.
     in_flight: usize,
     wc: [Wc; 16],
     /// One post's writes, with room for the longest chain.
@@ -44,15 +46,14 @@ impl Wire for Rdma {
                 len: u32::try_from(m.len).map_err(|_| format!("a write of {} bytes", m.len))?,
             });
         }
-        // SAFETY: the end holds the region and its page past the queue pair
-        // (field order and `End`'s), so every range stays registered and
-        // allocated until the queue pair is gone. A posted range is rewritten
-        // only by the next generation of its counter, which the other side's
-        // take of this one gates: a row has at most one go or done in flight.
-        unsafe { self.qp.post_writes(&self.region, &self.writes, rkey) }
-            .map_err(|e| format!("the link's RDMA post: {e}"))?;
-        self.in_flight += 1;
-        Ok(())
+        // SAFETY: region and page outlive the queue pair (field order here and in `End`); a range
+        // may be rewritten on landing, before completion: `docs/contrib/dgx-spark.md` 9.5, item 2.
+        let posted = unsafe { self.qp.post_writes(&self.region, &self.writes, rkey) };
+        self.in_flight += match &posted {
+            Ok(()) => self.writes.len(),
+            Err((taken, _)) => *taken,
+        };
+        posted.map_err(|(_, e)| format!("the link's RDMA post: {e}"))
     }
 
     fn reap(&mut self) -> Result<bool, String> {
@@ -63,27 +64,34 @@ impl Wire for Rdma {
         let n = nic
             .poll(&mut self.wc)
             .map_err(|e| format!("the link's completion queue: {e}"))?;
+        let mut failed = None;
         for w in &self.wc[..n] {
-            if w.status != 0 {
-                return Err(format!(
-                    "the link's RDMA write failed: {} (status {}, vendor error {:#x})",
-                    nic.verbs().status_name(w.status),
-                    w.status,
-                    w.vendor_err
-                ));
-            }
-            if w.opcode != WC_RDMA_WRITE {
-                return Err(format!(
-                    "the link's completion queue returned opcode {}",
-                    w.opcode
-                ));
-            }
             self.in_flight = self
                 .in_flight
                 .checked_sub(1)
                 .ok_or("the link's completion queue returned a write never posted")?;
+            // A failed completion's opcode is undefined (`ibv_poll_cq(3)`).
+            let why = if w.status != 0 {
+                format!(
+                    "the link's RDMA write failed: {} (status {}, vendor error {:#x})",
+                    nic.verbs().status_name(w.status),
+                    w.status,
+                    w.vendor_err
+                )
+            } else if w.opcode != WC_RDMA_WRITE {
+                format!("the link's completion queue returned opcode {}", w.opcode)
+            } else {
+                continue;
+            };
+            failed.get_or_insert(why);
         }
-        Ok(self.in_flight == 0)
+        failed.map_or(Ok(self.in_flight == 0), Err)
+    }
+
+    fn abort(&mut self) -> Result<(), String> {
+        self.qp
+            .to_error()
+            .map_err(|e| format!("the link's queue pair: {e}"))
     }
 }
 
@@ -169,10 +177,16 @@ impl RdmaEnd {
         Ok(())
     }
 
-    /// Stop carrying the counter at byte `off` until the end drops; if this
-    /// end reads it, set it to `v`.
-    pub fn release(&self, off: usize, v: u32) {
-        self.end.release(off, v);
+    /// Release every counter `ends` carry until the ends drop: each end stops
+    /// carrying all of them, every end settles (its posts over, or its queue
+    /// pair taken to its error state and its writes flushed), and only then
+    /// does each end that settled set the counters it reads to `v`. Ends over
+    /// one page go in one call: a released card rewrites spans that any of
+    /// their posts may read. An end that does not settle leaves its counters
+    /// as they are, so a card waiting on them keeps waiting: `Err` names it.
+    pub fn release(ends: &[RdmaEnd], v: u32) -> Result<(), String> {
+        let sides: Vec<&dyn Side> = ends.iter().map(|e| &*e.end as &dyn Side).collect();
+        super::release_settled(&sides, v)
     }
 
     /// Why the end stopped carrying for good: a step that was neither 0 nor

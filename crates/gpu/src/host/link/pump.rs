@@ -18,7 +18,8 @@
 //! page only through its [`Wire`], which carries a post's byte ranges in order:
 //! each span the counter publishes, then for a done the tier's progress, then
 //! the generation into the inbox. The progress the host reads is the writer's
-//! dones posted, so it never runs ahead of the bytes posted with them.
+//! dones posted, so it does not run ahead of the bytes posted with them while
+//! each write lands once (`docs/contrib/dgx-spark.md` 9.5, item 2).
 //!
 //! The inbox and two staging words per crossing (the generation and the
 //! progress a post sends) are the link's tail, past the tier page's own
@@ -26,6 +27,7 @@
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 /// A page of 4-byte words an end reads and writes by byte offset.
 pub(super) trait Page: Send + Sync {
@@ -51,6 +53,10 @@ pub(super) trait Wire: Send {
     /// Take what the wire finished: `Ok(true)` when no post is in flight, or
     /// a failed post by name.
     fn reap(&mut self) -> Result<bool, String>;
+
+    /// Stop the wire for good: every post still in flight finishes, failed,
+    /// at a later reap.
+    fn abort(&mut self) -> Result<(), String>;
 }
 
 /// Bytes of the link's tail per crossing: the inbox word, then the staged
@@ -164,6 +170,10 @@ pub(super) struct Half {
     /// post the wire refused or lost. It stays, and the end carries nothing
     /// more.
     broken: Option<String>,
+    /// The last settle found posts it could not show over, so the release
+    /// that asked for it left this end's counters where they were: a later
+    /// settle does not wait for them again ([`Half::settle`]).
+    unsettled: bool,
 }
 
 impl Half {
@@ -232,6 +242,7 @@ impl Half {
             progs,
             moves,
             broken: None,
+            unsettled: false,
         };
         for i in 0..h.lines.len() {
             let l = &mut h.lines[i];
@@ -470,7 +481,7 @@ impl Half {
                 Ok(true) => return true,
                 Ok(false) if spin_until() => std::hint::spin_loop(),
                 Ok(false) => {
-                    self.break_with("the link's posts did not finish before a reset".into());
+                    self.break_with("the link's posts in flight did not finish in time".into());
                     return false;
                 }
                 Err(e) => {
@@ -479,6 +490,52 @@ impl Half {
                 }
             }
         }
+    }
+
+    /// Bring the end to where nothing it posted can still be read: reap until
+    /// nothing is in flight, at most `bound`. Past it, or on a failed post,
+    /// the end breaks, aborts its wire ([`Wire::abort`]) and reaps the
+    /// aborted posts, at most `bound` again. `false`, with the end broken,
+    /// when a post is still not known to be over; such an end later reaps
+    /// once, without waiting.
+    pub(super) fn settle(&mut self, wire: &mut dyn Wire, bound: Duration) -> bool {
+        if self.unsettled {
+            self.unsettled = !matches!(wire.reap(), Ok(true));
+            return !self.unsettled;
+        }
+        let until = Instant::now() + bound;
+        if self.drain(wire, &|| Instant::now() < until) {
+            return true;
+        }
+        if let Err(e) = wire.abort() {
+            self.break_with(e);
+        }
+        let until = Instant::now() + bound;
+        while Instant::now() < until {
+            if matches!(wire.reap(), Ok(true)) {
+                return true;
+            }
+            std::hint::spin_loop();
+        }
+        self.unsettled = true;
+        let held = "a release found the link's posts in flight not over after an abort and left \
+                    this end's counters where they were";
+        match &mut self.broken {
+            Some(why) => *why = format!("{why}; {held}"),
+            None => self.broken = Some(held.into()),
+        }
+        false
+    }
+
+    /// Whether the last release left this end's counters where they were
+    /// ([`Half::settle`]).
+    pub(super) fn unsettled(&self) -> bool {
+        self.unsettled
+    }
+
+    /// The counter of every crossing this end carries.
+    pub(super) fn counters(&self) -> Vec<usize> {
+        self.lines.iter().map(|l| l.c.counter).collect()
     }
 
     /// The broken end's description, if it broke.
@@ -490,11 +547,11 @@ impl Half {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use super::super::{End, Memory, Mirror, Pump};
+    use super::super::{DRAIN, End, Memory, Mirror, Pump};
     use super::{Crossing, Half, Move, Page, Reader, Relay, TAIL_LINE, Wire};
     use crate::host::step::RELEASE;
 
@@ -517,6 +574,109 @@ mod tests {
         fn reap(&mut self) -> Result<bool, String> {
             Ok(true)
         }
+
+        fn abort(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A wire whose posts land at their second reap, as a NIC reads a posted
+    /// range any time before the completion. As each post lands it records
+    /// the word at byte `watch` of its own page.
+    struct Late {
+        wire: Memory<Mem>,
+        held: Vec<Move>,
+        reaps: u32,
+        watch: usize,
+        seen: Arc<AtomicU32>,
+    }
+
+    impl Late {
+        fn new(from: &Arc<Mem>, to: &Arc<Mem>, watch: usize) -> (Late, Arc<AtomicU32>) {
+            let seen = Arc::new(AtomicU32::new(u32::MAX));
+            let late = Late {
+                wire: wire(from, to),
+                held: Vec::new(),
+                reaps: 0,
+                watch,
+                seen: Arc::clone(&seen),
+            };
+            (late, seen)
+        }
+    }
+
+    impl Wire for Late {
+        fn post(&mut self, moves: &[Move]) -> Result<(), String> {
+            self.held.extend_from_slice(moves);
+            Ok(())
+        }
+
+        fn reap(&mut self) -> Result<bool, String> {
+            if self.held.is_empty() {
+                return Ok(true);
+            }
+            self.reaps += 1;
+            if self.reaps < 2 {
+                return Ok(false);
+            }
+            self.reaps = 0;
+            let now = self.wire.from.word(self.watch).load(Ordering::Acquire);
+            self.seen.store(now, Ordering::Release);
+            self.wire.post(&std::mem::take(&mut self.held))?;
+            Ok(true)
+        }
+
+        fn abort(&mut self) -> Result<(), String> {
+            self.held.clear();
+            Ok(())
+        }
+    }
+
+    /// A wire whose writes fail and whose posts are never over, not even once
+    /// aborted.
+    struct Stuck(Arc<AtomicBool>);
+
+    impl Wire for Stuck {
+        fn post(&mut self, _: &[Move]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reap(&mut self) -> Result<bool, String> {
+            Err("the test wire's write failed".into())
+        }
+
+        fn abort(&mut self) -> Result<(), String> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    /// A wire that takes part of a post and refuses the rest, and whose taken
+    /// part is over only once aborted; it records the word at byte `watch`
+    /// of its own page at the abort.
+    struct Partial {
+        from: Arc<Mem>,
+        held: usize,
+        watch: usize,
+        seen: Arc<AtomicU32>,
+    }
+
+    impl Wire for Partial {
+        fn post(&mut self, moves: &[Move]) -> Result<(), String> {
+            self.held += moves.len() - 1;
+            Err("the test wire refused a post's last write".into())
+        }
+
+        fn reap(&mut self) -> Result<bool, String> {
+            Ok(self.held == 0)
+        }
+
+        fn abort(&mut self) -> Result<(), String> {
+            let now = self.from.word(self.watch).load(Ordering::Acquire);
+            self.seen.store(now, Ordering::Release);
+            self.held = 0;
+            Ok(())
+        }
     }
 
     #[test]
@@ -531,14 +691,18 @@ mod tests {
         assert_eq!(r.take(u32::MAX), Err(u32::MAX));
     }
 
-    // Byte offsets of the model page: one row of one tier, two crossings.
+    // Byte offsets of the model page: one row of one tier, two crossings,
+    // and a second tier's flags for the pages of two tiers.
     const GO: usize = 0;
     const CNT: usize = 64;
     const PROG: usize = 128;
     const IMAGE: usize = 192;
     const ROWS: usize = 256;
     const TAIL: usize = 320;
-    const WORDS: usize = (TAIL + 2 * TAIL_LINE) / 4;
+    const GO_1: usize = 8;
+    const CNT_1: usize = 72;
+    const PROG_1: usize = 136;
+    const WORDS: usize = (TAIL + 4 * TAIL_LINE) / 4;
 
     fn page(seed: &[(usize, u32)]) -> Arc<Mem> {
         let m = Mem((0..WORDS).map(|_| AtomicU32::new(0)).collect());
@@ -568,6 +732,18 @@ mod tests {
         ]
     }
 
+    // The row's crossings for two tiers, which post the same image and rows
+    // spans, each tier with its own counters and progress word.
+    fn two_tiers() -> Vec<Crossing> {
+        let mut c = row();
+        let mut t1 = row();
+        t1[0].counter = GO_1;
+        t1[1].counter = CNT_1;
+        t1[1].prog = Some(PROG_1);
+        c.extend(t1);
+        c
+    }
+
     /// The loopback's wire from `from` into `to`.
     fn wire(from: &Arc<Mem>, to: &Arc<Mem>) -> Memory<Mem> {
         Memory {
@@ -576,12 +752,30 @@ mod tests {
         }
     }
 
-    /// Mirrored pages as the link holds them, with no pump thread: the stage
-    /// card's end over `stage`, posting through `stage_wire`, and the tier
-    /// cards' end over `tier`, posting into `stage` on the loopback's wire.
-    fn link(stage: &Arc<Mem>, tier: &Arc<Mem>, stage_wire: impl Wire + 'static) -> Mirror<Mem> {
+    /// Mirrored pages as the link holds them over the model row, with no
+    /// pump thread ([`link_over`]).
+    fn link(
+        stage: &Arc<Mem>,
+        tier: &Arc<Mem>,
+        stage_wire: impl Wire + 'static,
+        tier_wire: impl Wire + 'static,
+    ) -> Mirror<Mem> {
+        link_over(row, stage, tier, stage_wire, tier_wire)
+    }
+
+    /// Mirrored pages as the link holds them over `crossings`, with no pump
+    /// thread: the stage card's end over `stage`, posting through
+    /// `stage_wire`, and the tier cards' end over `tier`, posting through
+    /// `tier_wire`.
+    fn link_over(
+        crossings: fn() -> Vec<Crossing>,
+        stage: &Arc<Mem>,
+        tier: &Arc<Mem>,
+        stage_wire: impl Wire + 'static,
+        tier_wire: impl Wire + 'static,
+    ) -> Mirror<Mem> {
         let half = |side, page: &Arc<Mem>| {
-            Half::new(row(), side, TAIL, &**page).expect("the model row fits before the tail")
+            Half::new(crossings(), side, TAIL, &**page).expect("the model row fits before the tail")
         };
         Mirror {
             pumps: Vec::new(),
@@ -592,7 +786,7 @@ mod tests {
             )),
             tier: Arc::new(End::new(
                 half(Reader::Tier, tier),
-                wire(tier, stage),
+                tier_wire,
                 Arc::clone(tier),
             )),
             run_on: None,
@@ -674,7 +868,7 @@ mod tests {
         let seed = u32::MAX - 700;
         let stage = page(&[(GO, seed), (PROG, seed), (TAIL + TAIL_LINE, seed)]);
         let tier = page(&[(CNT, seed), (PROG, seed), (TAIL, seed)]);
-        let mut m = link(&stage, &tier, wire(&stage, &tier));
+        let mut m = link(&stage, &tier, wire(&stage, &tier), wire(&tier, &stage));
         m.pumps = [&m.stage, &m.tier]
             .map(|e| Pump::start(vec![Arc::clone(e)]).expect("a pump thread"))
             .into();
@@ -682,7 +876,7 @@ mod tests {
         let run = || -> Result<(), String> {
             let card = tier_card(tier.clone(), 1..=N + K, N, until);
             stage_card(&stage, 1..=N, N, until)?;
-            m.release(&[GO, CNT], RELEASE);
+            m.release(RELEASE)?;
             stage_card(&stage, N + 1..=N + K, N, until)?;
             card.join().unwrap()?;
             m.reset(GO)?;
@@ -717,8 +911,8 @@ mod tests {
     fn a_reset_reopens_its_own_counter_alone() {
         let stage = page(&[]);
         let tier = page(&[]);
-        let m = link(&stage, &tier, wire(&stage, &tier));
-        m.release(&[GO, CNT], RELEASE);
+        let m = link(&stage, &tier, wire(&stage, &tier), wire(&tier, &stage));
+        assert_eq!(m.release(RELEASE), Ok(()));
         assert_eq!(stage.word(CNT).load(Ordering::Acquire), RELEASE);
         tier.word(CNT).store(2, Ordering::Release);
         tier.word(PROG).store(2, Ordering::Release);
@@ -749,6 +943,147 @@ mod tests {
         assert_eq!(stage.word(CNT).load(Ordering::Acquire), 1);
     }
 
+    // A go and a done still in flight at a release land with the bytes they
+    // published, not the ones the released cards write next: each end
+    // raises the counter its card waits on only once its own posts are over.
+    // Both ends settled, so the link's drop frees both pages.
+    #[test]
+    fn a_release_lands_the_posts_in_flight_first() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let (go_wire, go_seen) = Late::new(&stage, &tier, CNT);
+        let (done_wire, done_seen) = Late::new(&tier, &stage, GO);
+        let m = link(&stage, &tier, go_wire, done_wire);
+        stage.word(IMAGE).store(1, Ordering::Relaxed);
+        stage.word(GO).store(1, Ordering::Release);
+        tier.word(ROWS).store(7, Ordering::Relaxed);
+        tier.word(CNT).store(1, Ordering::Release);
+        tier.word(PROG).store(1, Ordering::Release);
+        m.pass();
+        assert_eq!(tier.word(TAIL).load(Ordering::Acquire), 0);
+        assert_eq!(stage.word(TAIL + TAIL_LINE).load(Ordering::Acquire), 0);
+        assert_eq!(m.release(RELEASE), Ok(()));
+        stage.word(IMAGE).store(2, Ordering::Relaxed);
+        tier.word(ROWS).store(8, Ordering::Relaxed);
+        m.pass();
+        assert_eq!(m.broken(), None);
+        assert_eq!(
+            go_seen.load(Ordering::Acquire),
+            0,
+            "the stage's done at the go's landing"
+        );
+        assert_eq!(
+            done_seen.load(Ordering::Acquire),
+            0,
+            "the tier's go at the done's landing"
+        );
+        assert_eq!(tier.word(IMAGE).load(Ordering::Acquire), 1);
+        assert_eq!(stage.word(ROWS).load(Ordering::Acquire), 7);
+        assert_eq!(tier.word(GO).load(Ordering::Acquire), RELEASE);
+        assert_eq!(stage.word(CNT).load(Ordering::Acquire), RELEASE);
+        drop(m);
+        assert_eq!(
+            (Arc::strong_count(&stage), Arc::strong_count(&tier)),
+            (1, 1)
+        );
+    }
+
+    // The tiers of a row post the same spans. A release stops every tier's
+    // counters on both ends before any counter moves, so a released tier
+    // card that runs on (its done stepped after the release, over the rows
+    // the tier cards' page holds) carries nothing to the stage's page.
+    #[test]
+    fn a_release_stops_every_tiers_counters_before_any_moves() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let mut m = link_over(
+            two_tiers,
+            &stage,
+            &tier,
+            wire(&stage, &tier),
+            wire(&tier, &stage),
+        );
+        m.run_on = Some((CNT_1, 1));
+        tier.word(ROWS).store(7, Ordering::Relaxed);
+        assert_eq!(m.release(RELEASE), Ok(()));
+        assert_eq!(m.broken(), None);
+        assert_eq!(stage.word(ROWS).load(Ordering::Acquire), 0, "rows carried");
+        assert_eq!(
+            stage.word(PROG_1).load(Ordering::Acquire),
+            0,
+            "a done counted"
+        );
+        for off in [CNT, CNT_1] {
+            assert_eq!(stage.word(off).load(Ordering::Acquire), RELEASE);
+        }
+        for off in [GO, GO_1] {
+            assert_eq!(tier.word(off).load(Ordering::Acquire), RELEASE);
+        }
+    }
+
+    // An end whose posts are not known to be over, even after it aborts its
+    // wire, leaves the counter its card waits on where it is: the card keeps
+    // waiting rather than rewrite a span a write may still read, and the
+    // release names the end. The other end settles and releases its own, a
+    // later release does not wait for the stuck end again, and the link's
+    // drop leaks both ends and their pages.
+    #[test]
+    fn a_release_leaves_the_counters_of_an_end_it_cannot_settle() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let aborted = Arc::new(AtomicBool::new(false));
+        let m = link(
+            &stage,
+            &tier,
+            Stuck(Arc::clone(&aborted)),
+            wire(&tier, &stage),
+        );
+        stage.word(GO).store(1, Ordering::Release);
+        m.pass();
+        let held = m.release(RELEASE).expect_err("an end that did not settle");
+        assert!(held.contains("the test wire's write failed"), "{held}");
+        assert!(aborted.load(Ordering::Acquire));
+        assert_eq!(stage.word(CNT).load(Ordering::Acquire), 0);
+        assert_eq!(tier.word(GO).load(Ordering::Acquire), RELEASE);
+        assert!(
+            m.broken()
+                .is_some_and(|b| b.contains("left this end's counters"))
+        );
+        let again = Instant::now();
+        assert!(m.release(RELEASE).is_err());
+        assert!(again.elapsed() < DRAIN);
+        assert_eq!(stage.word(CNT).load(Ordering::Acquire), 0);
+        drop(m);
+        assert!(Arc::strong_count(&stage) > 1 && Arc::strong_count(&tier) > 1);
+    }
+
+    // A post the wire took in part breaks its end, and a release raises the
+    // end's counters only once the wire is aborted and the part is over.
+    #[test]
+    fn a_release_after_a_partial_post_waits_for_the_abort() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let seen = Arc::new(AtomicU32::new(u32::MAX));
+        let partial = Partial {
+            from: Arc::clone(&stage),
+            held: 0,
+            watch: CNT,
+            seen: Arc::clone(&seen),
+        };
+        let m = link(&stage, &tier, partial, wire(&tier, &stage));
+        stage.word(GO).store(1, Ordering::Release);
+        m.pass();
+        assert!(m.broken().is_some_and(|b| b.contains("refused")));
+        assert_eq!(m.release(RELEASE), Ok(()));
+        assert_eq!(
+            seen.load(Ordering::Acquire),
+            0,
+            "the stage's done at the abort"
+        );
+        assert_eq!(stage.word(CNT).load(Ordering::Acquire), RELEASE);
+        assert_eq!(tier.word(GO).load(Ordering::Acquire), RELEASE);
+    }
+
     // A done whose generation steps by two publishes nothing, not the rows it
     // carries (a raised fault copy among them), the progress, the generation
     // or the counter: the host sees the tier behind, not a done the stage
@@ -758,7 +1093,7 @@ mod tests {
     fn a_doubled_done_publishes_nothing() {
         let stage = page(&[]);
         let tier = page(&[]);
-        let m = link(&stage, &tier, Refuse);
+        let m = link(&stage, &tier, Refuse, wire(&tier, &stage));
         tier.word(ROWS).store(7, Ordering::Relaxed);
         tier.word(CNT).store(2, Ordering::Release);
         tier.word(PROG).store(2, Ordering::Release);
