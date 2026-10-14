@@ -1,6 +1,7 @@
-//! A qwen4exp MTP draft file read against its target: the one next-token
-//! layer it carries, as a [`DraftSpec::Mtp`], or a refusal naming the key or
-//! the tensor that stops it.
+//! A qwen4exp MTP draft file read against its target (`mtp_of`), and a
+//! qwen35moe file's own next-token layer (`in_file`). The two readers do not
+//! share a branch: qwen4exp's layer is hyper-connected streams in its own
+//! file, and qwen35moe's is one plain full-attention layer in the target.
 //!
 //! The file is its own GGUF (unsloth's `mtp-…-Q8_0.gguf`): `block_count` is
 //! the target's layers plus one, `nextn_predict_layers` is 1, and its only
@@ -23,16 +24,17 @@ use models::{
 };
 
 use super::hparams::{
-    ATTN_STEMS, EXP_LAYER_STEMS, GDN_STEMS, NORM_STEMS, PLE_STEMS, Variant, expert_ff,
+    ATTN_STEMS, EXP_LAYER_STEMS, GDN_STEMS, Hparams, NORM_STEMS, PLE_STEMS, Variant, expert_ff,
     refuse_unless, sections,
 };
 use super::place::{PlaceError, PlanInputs};
-use super::spec::out_gate;
+use super::spec::{out_gate, routed_at};
 use crate::arch::draft::{EMBEDDING, HEAD, borrows, same, same_token_ids};
 use crate::arch::{
     architecture_is, meta_arr, meta_f32, meta_usize, metadata, n_vocab, qwen35moe_variant, spec_u32,
 };
-use crate::placement::PlacementError;
+use crate::placement::{ModelTensor, ModelTensors, PlacementError};
+use runtime::stores::{self, dense_kv_bytes};
 
 /// The layer's own stems: the input's norms and projection and the
 /// gated-residual head.
@@ -483,6 +485,409 @@ pub fn output_form(ty: GgmlType) -> Option<BorrowedHead> {
         GgmlType::Q6_K => Some(BorrowedHead::Q6K),
         _ => None,
     }
+}
+
+/// The join `nextn.eh_proj` reads: the embedding's half, then the head's row
+/// (`2 × hidden` values). [`MtpInput::HeadRow`] states that order and has no
+/// field for it.
+pub const EH_JOIN: [&str; 2] = ["e", "h"];
+
+/// The stems a shaped qwen35moe next-token layer carries. No hyper-connection
+/// head: the layer is one plain stream.
+const DRAFT_STEMS: &[&str] = &[
+    "attn_norm.weight",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_output.weight",
+    "attn_q_norm.weight",
+    "attn_k_norm.weight",
+    "post_attention_norm.weight",
+    "ffn_gate_inp.weight",
+    "ffn_gate_exps.weight",
+    "ffn_up_exps.weight",
+    "ffn_down_exps.weight",
+    "ffn_gate_inp_shexp.weight",
+    "ffn_gate_shexp.weight",
+    "ffn_up_shexp.weight",
+    "ffn_down_shexp.weight",
+    "nextn.eh_proj.weight",
+    "nextn.enorm.weight",
+    "nextn.hnorm.weight",
+    "nextn.shared_head_norm.weight",
+];
+
+/// Matrices the layer borrows from the target. A file that carries its own
+/// is refused; the role table does not name them either.
+const OWN_MATRICES: &[&str] = &["nextn.embed_tokens.weight", "nextn.shared_head_head.weight"];
+
+/// What a qwen35moe file's own next-token layer is ([`in_file`]).
+#[derive(Debug)]
+pub enum InFile {
+    /// One shaped draft at `n_trunk`. Boxed: the layer description is many
+    /// times the other variants.
+    Draft(Box<MtpDraft>),
+    /// The key is absent, or the blocks past the trunk are trunk layers.
+    Absent,
+    /// The key is set and the tail block holds no tensor. `reason` is the
+    /// line [`crate::arch::nextn_layers`] records.
+    Stripped {
+        /// The defaults line, naming the block.
+        reason: String,
+    },
+    /// The key is 1 and every tail tensor is a one-element vector: the
+    /// role table's stub, not a draft's shapes.
+    Unshaped,
+}
+
+/// The qwen35moe file's own next-token layer, or why it is not a draft.
+/// A file that carries `nextn.embed_tokens` or `nextn.shared_head_head` is
+/// refused here, by those names.
+pub fn in_file(split: &Split) -> Result<InFile, PlacementError> {
+    refuse_own(split)?;
+    let hp = Hparams::read(split)?;
+    if hp.variant != Variant::Qwen35Moe {
+        return Err(architecture_is(&format!(
+            "{:?}; an in-file next-token draft of this family is qwen35moe",
+            hp.variant
+        )));
+    }
+    let tensors = super::roles::classify(split, &hp)?;
+    Ok(match describe(&hp, &tensors)? {
+        Some(draft) => InFile::Draft(Box::new(draft)),
+        None => no_draft(&hp, &tensors)?,
+    })
+}
+
+/// The draft `hp` and `tensors` describe, when they are a shaped qwen35moe
+/// next-token layer. `None` when the file has no such layer: another
+/// variant, no key, a stripped tail, or a one-element stub. A shaped tail
+/// that is not this layer is an error naming the key or the tensor.
+pub(crate) fn describe(
+    hp: &Hparams,
+    tensors: &ModelTensors,
+) -> Result<Option<MtpDraft>, PlacementError> {
+    if hp.variant != Variant::Qwen35Moe {
+        return Ok(None);
+    }
+    let past = hp
+        .n_layer
+        .checked_sub(hp.n_trunk)
+        .ok_or_else(|| PlacementError::Metadata {
+            key: "block_count".to_string(),
+            detail: format!("is {}, under the trunk {}", hp.n_layer, hp.n_trunk),
+        })?;
+    if past == 0 {
+        return Ok(None);
+    }
+    if past != 1 {
+        return Err(PlacementError::Metadata {
+            key: format!("{}.nextn_predict_layers", Arch::Qwen35Moe.name()),
+            detail: format!("is {past}; one next-token layer is built"),
+        });
+    }
+    let index = hp.n_trunk;
+    let tail: Vec<&ModelTensor> = tensors
+        .tensors
+        .iter()
+        .filter(|t| t.layer == Some(index))
+        .collect();
+    if let Some(name) = tail.iter().map(|t| t.name.as_str()).find(|n| gdn_name(n)) {
+        return Err(PlacementError::Tensor {
+            name: name.to_string(),
+            detail: "is a gated-delta stem on the next-token layer, which is full attention"
+                .to_string(),
+        });
+    }
+    if let Some(name) = tail.iter().map(|t| t.name.as_str()).find(|n| own_name(n)) {
+        return Err(own_error(name, &[name]));
+    }
+    if tail.is_empty() || tail.iter().all(|t| t.dims == [1]) {
+        return Ok(None);
+    }
+    Ok(Some(shaped(hp, tensors, index)?))
+}
+
+/// Card bytes of this in-file draft at `ctx` positions: the next-token
+/// layer's own tensors in `tensors`, one f32 residual stream of
+/// `draft.hidden` and one dense attention KV ([`dense_kv_bytes`]) of the
+/// layer's GQA. The `token_embd` and `output` it borrows are the target's
+/// bytes, counted with the target.
+#[must_use = "the count is this draft's card bytes"]
+pub fn in_file_card_bytes(
+    draft: &MtpDraft,
+    tensors: &ModelTensors,
+    ctx: usize,
+) -> Result<u64, PlacementError> {
+    let Mixer::Gqa(g) = &draft.layer.mixer else {
+        return Err(PlacementError::Metadata {
+            key: format!("{}.nextn", Arch::Qwen35Moe.name()),
+            detail: "the in-file draft's mixer is not full attention".to_string(),
+        });
+    };
+    if draft.hc.is_some() || draft.layer.residual != Residual::Plain {
+        return Err(PlacementError::Metadata {
+            key: format!("{}.nextn", Arch::Qwen35Moe.name()),
+            detail: "the in-file draft is one plain stream".to_string(),
+        });
+    }
+    let own = tensors
+        .tensors
+        .iter()
+        .filter(|t| t.layer == Some(draft.index as usize))
+        .try_fold(0u64, |n, t| n.checked_add(t.file_bytes));
+    let stream = u64::from(draft.hidden) * stores::F32_BYTES;
+    let kv = dense_kv_bytes(g.kv_heads as usize, g.head_dim as usize, ctx);
+    own.and_then(|n| n.checked_add(stream))
+        .and_then(|n| n.checked_add(kv))
+        .ok_or_else(|| PlacementError::Metadata {
+            key: format!("{}.nextn", Arch::Qwen35Moe.name()),
+            detail: "the draft's card bytes overflow u64".to_string(),
+        })
+}
+
+/// `split` carries a matrix the next-token layer borrows from the target.
+fn refuse_own(split: &Split) -> Result<(), PlacementError> {
+    let found: Vec<&str> = split
+        .iter_tensors()
+        .map(|(_, t)| t.name.as_str())
+        .filter(|n| own_name(n))
+        .collect();
+    match found.first() {
+        Some(name) => Err(own_error(name, &found)),
+        None => Ok(()),
+    }
+}
+
+fn own_name(name: &str) -> bool {
+    OWN_MATRICES.iter().any(|s| name.ends_with(s))
+}
+
+fn own_error(name: &str, found: &[&str]) -> PlacementError {
+    PlacementError::Tensor {
+        name: name.to_string(),
+        detail: format!(
+            "is in the file; the next-token layer borrows token_embd.weight and output.weight \
+             ({}: {})",
+            found.len(),
+            found.join(", ")
+        ),
+    }
+}
+
+fn gdn_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("blk.")
+        .and_then(|r| r.split_once('.'))
+        .map(|(_, s)| s)
+    else {
+        return false;
+    };
+    stem.starts_with("ssm_") || GDN_STEMS.contains(&stem)
+}
+
+fn no_draft(hp: &Hparams, tensors: &ModelTensors) -> Result<InFile, PlacementError> {
+    if hp.n_layer == hp.n_trunk {
+        return Ok(InFile::Absent);
+    }
+    let index = hp.n_trunk;
+    let any = tensors.tensors.iter().any(|t| t.layer == Some(index));
+    if !any {
+        let reason = hp
+            .defaults
+            .iter()
+            .find(|d| d.contains("stripped next-token layer"))
+            .cloned()
+            .ok_or_else(|| PlacementError::Metadata {
+                key: format!("{}.nextn_predict_layers", Arch::Qwen35Moe.name()),
+                detail: format!(
+                    "is set and blk.{index} carries no tensor, and the read recorded no \
+                     stripped-layer line"
+                ),
+            })?;
+        return Ok(InFile::Stripped { reason });
+    }
+    Ok(InFile::Unshaped)
+}
+
+fn shaped(hp: &Hparams, tensors: &ModelTensors, index: usize) -> Result<MtpDraft, PlacementError> {
+    let missing: Vec<String> = DRAFT_STEMS
+        .iter()
+        .map(|s| blk(index, s))
+        .filter(|n| named(tensors, n).is_err())
+        .collect();
+    if let Some(name) = missing.first() {
+        return Err(PlacementError::Tensor {
+            name: name.clone(),
+            detail: format!(
+                "is not in the file ({} tensor(s) the next-token layer needs are missing: {})",
+                missing.len(),
+                missing.join(", ")
+            ),
+        });
+    }
+    require_widths(hp, tensors, index)?;
+    let layer = layer_of(hp, tensors, index)?;
+    Ok(MtpDraft {
+        source: MtpSource::InFile {
+            layer: spec_u32("block_count", index)?,
+        },
+        layer,
+        index: spec_u32("block_count", index)?,
+        hidden: spec_u32("embedding_length", hp.n_embd)?,
+        vocab: spec_u32("vocab", hp.n_vocab)?,
+        rms_eps: hp.rms_eps,
+        hc: None,
+        input: MtpInput::HeadRow,
+        head_norm: MtpHeadNorm::Rms,
+        head_rows: HeadSet::Full,
+    })
+}
+
+fn require_widths(
+    hp: &Hparams,
+    tensors: &ModelTensors,
+    index: usize,
+) -> Result<(), PlacementError> {
+    let n = hp.n_embd as u64;
+    let join = [2 * n, n];
+    let eh = named(tensors, &blk(index, "nextn.eh_proj.weight"))?;
+    if eh.dims.as_slice() != join {
+        return Err(PlacementError::Tensor {
+            name: eh.name.clone(),
+            detail: format!(
+                "is {:?}; the join is {} then {} ({} values to {})",
+                eh.dims,
+                EH_JOIN[0],
+                EH_JOIN[1],
+                2 * hp.n_embd,
+                hp.n_embd
+            ),
+        });
+    }
+    for stem in [
+        "nextn.hnorm.weight",
+        "nextn.enorm.weight",
+        "nextn.shared_head_norm.weight",
+        "attn_norm.weight",
+        "post_attention_norm.weight",
+    ] {
+        let t = named(tensors, &blk(index, stem))?;
+        if t.dims.as_slice() != [n] {
+            return Err(PlacementError::Tensor {
+                name: t.name.clone(),
+                detail: format!(
+                    "is {:?}; one stream norms {} values, not {}",
+                    t.dims,
+                    hp.n_embd,
+                    4 * hp.n_embd
+                ),
+            });
+        }
+    }
+    let head = hp.head_dim as u64;
+    for stem in ["attn_q_norm.weight", "attn_k_norm.weight"] {
+        let t = named(tensors, &blk(index, stem))?;
+        if t.dims.as_slice() != [head] {
+            return Err(PlacementError::Tensor {
+                name: t.name.clone(),
+                detail: format!("is {:?}; q and k are normed over the head ({head})", t.dims),
+            });
+        }
+    }
+    let borrowed = [n, hp.n_vocab as u64];
+    for name in [EMBEDDING, HEAD] {
+        let t = named(tensors, name)?;
+        if t.dims.as_slice() != borrowed {
+            return Err(PlacementError::Tensor {
+                name: name.to_string(),
+                detail: format!(
+                    "is {:?}; the next-token layer borrows a [{}, {}] matrix",
+                    t.dims, hp.n_embd, hp.n_vocab
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn layer_of(
+    hp: &Hparams,
+    tensors: &ModelTensors,
+    index: usize,
+) -> Result<LayerSpec, PlacementError> {
+    let heads = spec_u32("attention.head_count", hp.n_head)?;
+    let head_dim = spec_u32("attention.key_length", hp.head_dim)?;
+    let kv_heads = spec_u32("attention.head_count_kv", hp.n_head_kv)?;
+    let q = blk(index, "attn_q.weight");
+    let rows = named(tensors, &q)?.dims.get(1).copied();
+    let gate = out_gate(q.clone(), rows, heads, head_dim)?;
+    if !gate {
+        return Err(PlacementError::Tensor {
+            name: q,
+            detail: "writes the query without the per-head gate".to_string(),
+        });
+    }
+    let has = |name: String| tensors.tensors.iter().any(|t| t.name == name);
+    let ffn = routed_at(hp, Arch::Qwen35Moe, index, true, &has)?;
+    {
+        let Ffn::Moe(moe) = &ffn else {
+            return Err(PlacementError::Metadata {
+                key: format!("{}.expert_count", Arch::Qwen35Moe.name()),
+                detail: format!("layer {index} is not routed"),
+            });
+        };
+        let shared = moe.shared.as_ref().ok_or_else(|| PlacementError::Tensor {
+            name: blk(index, "ffn_up_shexp.weight"),
+            detail: "is not in the file; the next-token layer runs a shared expert".to_string(),
+        })?;
+        if !shared.sigmoid_gate {
+            return Err(PlacementError::Tensor {
+                name: blk(index, "ffn_gate_inp_shexp.weight"),
+                detail: "is not in the file; the shared expert's gate is a sigmoid".to_string(),
+            });
+        }
+    }
+    Ok(LayerSpec {
+        mixer: Mixer::Gqa(Gqa {
+            heads,
+            kv_heads,
+            head_dim,
+            value_dim: head_dim,
+            rope: Rope {
+                mode: RopeMode::Imrope {
+                    sections: hp.rope_sections,
+                },
+                dims: spec_u32("rope.dimension_count", hp.rope_dims)?,
+                base: hp.rope_base,
+                yarn: None,
+            },
+            qk_norm: true,
+            out_gate: true,
+            select: None,
+            window: None,
+            sinks: false,
+            value_scale: None,
+        }),
+        ffn,
+        residual: Residual::Plain,
+        extras: Vec::new(),
+    })
+}
+
+fn blk(index: usize, stem: &str) -> String {
+    format!("blk.{index}.{stem}")
+}
+
+fn named<'a>(tensors: &'a ModelTensors, name: &str) -> Result<&'a ModelTensor, PlacementError> {
+    tensors
+        .tensors
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| PlacementError::Tensor {
+            name: name.to_string(),
+            detail: "is not in the file".to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -1054,5 +1459,413 @@ mod tests {
             }
         }
         c.refused("mtp-hnorm", "tensor blk.4.nextn.hnorm.weight: is [64]");
+    }
+}
+
+#[cfg(test)]
+mod in_file_tests {
+    use models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, Residual};
+
+    use super::{EH_JOIN, InFile, in_file, in_file_card_bytes};
+    use crate::arch::draft::draft_usable;
+    use crate::arch::synthetic::{V, header_shaped};
+    use crate::arch::{Read, qwen35moe};
+    use crate::placement::Role;
+
+    fn keys(blocks: u32, nextn: Option<u32>) -> Vec<(&'static str, V)> {
+        let mut kv = vec![
+            ("block_count", V::U32(blocks)),
+            ("embedding_length", V::U32(64)),
+            ("context_length", V::U32(128)),
+            ("attention.head_count", V::U32(4)),
+            ("attention.head_count_kv", V::U32(2)),
+            ("attention.key_length", V::U32(16)),
+            ("attention.value_length", V::U32(16)),
+            ("attention.layer_norm_rms_epsilon", V::F32(1e-6)),
+            ("rope.dimension_count", V::U32(8)),
+            ("rope.dimension_sections", V::I32s(vec![2, 2, 0, 0])),
+            ("rope.freq_base", V::F32(1e7)),
+            ("expert_count", V::U32(8)),
+            ("expert_used_count", V::U32(2)),
+            ("expert_feed_forward_length", V::U32(16)),
+            ("expert_shared_feed_forward_length", V::U32(16)),
+            ("ssm.conv_kernel", V::U32(4)),
+            ("ssm.state_size", V::U32(8)),
+            ("ssm.group_count", V::U32(2)),
+            ("ssm.time_step_rank", V::U32(4)),
+            ("ssm.inner_size", V::U32(32)),
+            ("full_attention_interval", V::U32(4)),
+        ];
+        if let Some(n) = nextn {
+            kv.push(("nextn_predict_layers", V::U32(n)));
+        }
+        kv
+    }
+
+    /// The trunk: three delta layers, then attention. `embed` is the borrowed
+    /// matrices' shape.
+    fn trunk(embed: Vec<u64>) -> Vec<(String, Vec<u64>)> {
+        let mut t = vec![
+            ("token_embd.weight".to_string(), embed.clone()),
+            ("output_norm.weight".to_string(), vec![64]),
+            ("output.weight".to_string(), embed),
+        ];
+        for l in 0..4 {
+            if l == 3 {
+                t.push((format!("blk.{l}.attn_q.weight"), vec![64, 128]));
+            } else {
+                t.push((format!("blk.{l}.attn_qkv.weight"), vec![1]));
+            }
+            t.push((format!("blk.{l}.ffn_gate_inp.weight"), vec![1]));
+        }
+        t
+    }
+
+    /// Layer `l` as a shaped next-token layer. `hnorm`, `eh` and `q` are the
+    /// widths the contract distinguishes.
+    fn tail(l: usize, hnorm: Vec<u64>, eh: Vec<u64>, q: Vec<u64>) -> Vec<(String, Vec<u64>)> {
+        vec![
+            (format!("blk.{l}.attn_norm.weight"), vec![64]),
+            (format!("blk.{l}.attn_q.weight"), q),
+            (format!("blk.{l}.attn_k.weight"), vec![64, 32]),
+            (format!("blk.{l}.attn_v.weight"), vec![64, 32]),
+            (format!("blk.{l}.attn_output.weight"), vec![64, 64]),
+            (format!("blk.{l}.attn_q_norm.weight"), vec![16]),
+            (format!("blk.{l}.attn_k_norm.weight"), vec![16]),
+            (format!("blk.{l}.post_attention_norm.weight"), vec![64]),
+            (format!("blk.{l}.ffn_gate_inp.weight"), vec![64, 8]),
+            (format!("blk.{l}.ffn_gate_exps.weight"), vec![1]),
+            (format!("blk.{l}.ffn_up_exps.weight"), vec![1]),
+            (format!("blk.{l}.ffn_down_exps.weight"), vec![1]),
+            (format!("blk.{l}.ffn_gate_inp_shexp.weight"), vec![64]),
+            (format!("blk.{l}.ffn_gate_shexp.weight"), vec![1]),
+            (format!("blk.{l}.ffn_up_shexp.weight"), vec![1]),
+            (format!("blk.{l}.ffn_down_shexp.weight"), vec![1]),
+            (format!("blk.{l}.nextn.eh_proj.weight"), eh),
+            (format!("blk.{l}.nextn.enorm.weight"), vec![64]),
+            (format!("blk.{l}.nextn.hnorm.weight"), hnorm),
+            (format!("blk.{l}.nextn.shared_head_norm.weight"), vec![64]),
+        ]
+    }
+
+    fn shaped() -> Vec<(String, Vec<u64>)> {
+        let mut t = trunk(vec![64, 2]);
+        t.extend(tail(4, vec![64], vec![128, 64], vec![64, 128]));
+        t
+    }
+
+    /// Every tail tensor a one-element vector, the role table's stub.
+    /// `tail` writes the shaped widths; this file is the names alone.
+    fn stub() -> Vec<(String, Vec<u64>)> {
+        let mut t = trunk(vec![1]);
+        t.extend(
+            tail(4, vec![1], vec![1], vec![1])
+                .into_iter()
+                .map(|(n, _)| (n, vec![1])),
+        );
+        t
+    }
+
+    fn open(
+        tag: &str,
+        kv: &[(&str, V)],
+        tensors: &[(String, Vec<u64>)],
+    ) -> (Read, Result<InFile, String>) {
+        let path = header_shaped(
+            tag,
+            "qwen35moe",
+            kv,
+            &[("tokenizer.ggml.pre", V::Str("qwen35"))],
+            tensors,
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let read = crate::arch::spec(&split);
+        let draft = in_file(&split).map_err(|e| e.to_string());
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+        (read.expect("the description reads"), draft)
+    }
+
+    fn refused(tag: &str, kv: &[(&str, V)], tensors: &[(String, Vec<u64>)]) -> String {
+        let path = header_shaped(tag, "qwen35moe", kv, &[], tensors);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = in_file(&split).map_or_else(|e| e.to_string(), |_| "accepted".to_string());
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+        err
+    }
+
+    #[test]
+    fn d1_a_shaped_file_is_an_in_file_head_row_draft() {
+        let (read, draft) = open("q35m-d1", &keys(5, Some(1)), &shaped());
+        let InFile::Draft(d) = draft.expect("the layer is a draft") else {
+            panic!("not a draft");
+        };
+        assert!(matches!(d.source, MtpSource::InFile { layer: 4 }));
+        assert_eq!(d.index, 4);
+        assert_eq!(d.input, MtpInput::HeadRow);
+        assert_eq!(d.head_norm, MtpHeadNorm::Rms);
+        assert!(d.hc.is_none());
+        assert_eq!(d.layer.residual, Residual::Plain);
+        assert_eq!(d.hidden, 64);
+        assert_eq!(d.vocab, 2);
+        let Mixer::Gqa(g) = &d.layer.mixer else {
+            panic!("the mixer is not full attention: {:?}", d.layer.mixer);
+        };
+        assert!(g.out_gate && g.qk_norm && g.select.is_none());
+        let Ffn::Moe(moe) = &d.layer.ffn else {
+            panic!("the feed-forward block is not routed");
+        };
+        assert!(moe.shared.is_some_and(|s| s.sigmoid_gate));
+        assert_eq!(read.spec.mtp.as_slice(), std::slice::from_ref(&d.layer));
+        assert_eq!(read.spec.layers.len(), 4);
+    }
+
+    #[test]
+    fn m_a_the_join_is_embedding_then_hidden() {
+        assert_eq!(EH_JOIN, ["e", "h"]);
+        let mut t = shaped();
+        for row in &mut t {
+            if row.0 == "blk.4.nextn.eh_proj.weight" {
+                row.1 = vec![64, 64];
+            }
+        }
+        let err = refused("q35m-ma", &keys(5, Some(1)), &t);
+        assert!(
+            err.contains("e then h") && err.contains("blk.4.nextn.eh_proj.weight"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn m_b_the_tail_is_full_attention_where_the_interval_says_recurrent() {
+        let (_read, draft) = open("q35m-mb", &keys(5, Some(1)), &shaped());
+        let InFile::Draft(d) = draft.expect("the layer is a draft") else {
+            panic!("not a draft");
+        };
+        // Index 4 with interval 4: (4 + 1) % 4 != 0, so the trunk's interval
+        // rule would call this layer recurrent. The draft is full attention.
+        assert_ne!((d.index as usize + 1) % 4, 0);
+        assert!(
+            matches!(d.layer.mixer, Mixer::Gqa(_)),
+            "classified {:?}, a gated-delta layer",
+            d.layer.mixer
+        );
+    }
+
+    #[test]
+    fn m_c_a_shaped_draft_does_not_require_a_hyper_connection_head() {
+        let (_read, draft) = open("q35m-mc", &keys(5, Some(1)), &shaped());
+        let InFile::Draft(_) = draft.expect("no hc_head tensor is required") else {
+            panic!("not a draft");
+        };
+    }
+
+    #[test]
+    fn m_d_a_key_with_no_tensors_is_not_a_draft() {
+        let (read, draft) = open("q35m-md", &keys(5, Some(1)), &trunk(vec![1]));
+        assert!(
+            read.spec.mtp.is_empty(),
+            "a stripped layer is a draft layer"
+        );
+        let InFile::Stripped { reason } = draft.expect("the file still reads") else {
+            panic!("a stripped layer was accepted as a draft");
+        };
+        assert!(reason.contains("stripped next-token layer"), "{reason}");
+        assert!(
+            read.defaults.iter().any(|d| d == &reason),
+            "{:?}",
+            read.defaults
+        );
+    }
+
+    #[test]
+    fn m_e_hnorm_is_one_stream_of_n_embd() {
+        let (_read, draft) = open("q35m-me", &keys(5, Some(1)), &shaped());
+        assert!(
+            matches!(draft, Ok(InFile::Draft(_))),
+            "hnorm of n_embd was refused: {draft:?}"
+        );
+        let mut wide = shaped();
+        for row in &mut wide {
+            if row.0 == "blk.4.nextn.hnorm.weight" {
+                row.1 = vec![256];
+            }
+        }
+        let err = refused("q35m-me-wide", &keys(5, Some(1)), &wide);
+        assert!(err.contains("one stream norms 64 values, not 256"), "{err}");
+    }
+
+    #[test]
+    fn m_f_the_trunk_keeps_the_tail_unused() {
+        let path = header_shaped("q35m-mf", "qwen35moe", &keys(5, Some(1)), &[], &stub());
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let hp = qwen35moe::hparams::Hparams::read(&split).expect("the header reads");
+        let model = qwen35moe::roles::classify(&split, &hp).expect("every tensor has a role");
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+        let tail: Vec<_> = model
+            .tensors
+            .iter()
+            .filter(|t| t.layer == Some(4))
+            .collect();
+        assert_eq!(tail.len(), 20);
+        assert!(
+            tail.iter().all(|t| t.role == Role::Unused),
+            "blk.4 ran in the trunk: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn d3_spec_mtp_is_one_layer_only_for_a_shaped_tail() {
+        let (shaped_read, shaped_draft) = open("q35m-d3", &keys(5, Some(1)), &shaped());
+        assert_eq!(shaped_read.spec.mtp.len(), 1);
+        let InFile::Draft(d) = shaped_draft.expect("draft") else {
+            panic!("not a draft");
+        };
+        assert_eq!(shaped_read.spec.mtp[0], d.layer);
+
+        let (absent, absent_draft) = open("q35m-d3-abs", &keys(4, None), &trunk(vec![1]));
+        assert!(absent.spec.mtp.is_empty());
+        assert!(matches!(absent_draft, Ok(InFile::Absent)));
+
+        let (plain, _) = open("q35m-d3-base", &keys(4, None), &trunk(vec![1]));
+        let (with_stub, stub_draft) = open("q35m-d3-stub", &keys(5, Some(1)), &stub());
+        assert!(matches!(stub_draft, Ok(InFile::Unshaped)));
+        assert_eq!(with_stub.spec, plain.spec, "a stub is no layer of the spec");
+        assert_eq!(with_stub.defaults, plain.defaults[1..]);
+    }
+
+    #[test]
+    fn d3_a_count_other_than_one_is_refused_by_name() {
+        let err = refused("q35m-n2", &keys(6, Some(2)), &trunk(vec![1]));
+        assert!(
+            err.contains("qwen35moe.nextn_predict_layers: is 2; one next-token layer is built"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn d3_a_gated_delta_stem_on_the_tail_is_refused_by_name() {
+        let mut t = stub();
+        t.push(("blk.4.ssm_a".to_string(), vec![1]));
+        let err = refused("q35m-gdn", &keys(5, Some(1)), &t);
+        assert!(
+            err.contains("blk.4.ssm_a") && err.contains("full attention"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn d1_a_file_that_carries_its_own_embedding_or_head_is_refused_by_name() {
+        let mut t = shaped();
+        t.push(("blk.4.nextn.embed_tokens.weight".to_string(), vec![64, 2]));
+        t.push((
+            "blk.4.nextn.shared_head_head.weight".to_string(),
+            vec![64, 2],
+        ));
+        let err = refused("q35m-own", &keys(5, Some(1)), &t);
+        assert!(
+            err.contains("borrows token_embd.weight")
+                && err.contains("nextn.embed_tokens.weight")
+                && err.contains("nextn.shared_head_head.weight"),
+            "{err}"
+        );
+    }
+
+    /// A tail the draft refuses leaves the plain read as it was: no draft
+    /// layer, and the same layers and defaults as the file without the key.
+    #[test]
+    fn d6_a_refused_tail_leaves_the_plain_read_alone() {
+        let mut gdn = stub();
+        gdn.push(("blk.4.ssm_a".to_string(), vec![1]));
+        for (tag, kv, tensors) in [
+            ("q35m-d6-n2", keys(6, Some(2)), trunk(vec![1])),
+            ("q35m-d6-gdn", keys(5, Some(1)), gdn),
+        ] {
+            let (read, draft) = open(tag, &kv, &tensors);
+            assert!(read.spec.mtp.is_empty(), "{tag}: {:?}", read.spec.mtp);
+            assert!(draft.is_err(), "{tag}: the draft is refused by name");
+        }
+    }
+
+    #[test]
+    fn d4_qwen35moe_has_an_in_file_rule() {
+        let path = header_shaped("q35m-d4", "qwen35moe", &keys(5, Some(1)), &[], &shaped());
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        draft_usable(&split, None).expect("a shaped in-file draft can run");
+        let named = draft_usable(&split, Some("other-checkpoint")).expect_err("not a sidecar");
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+        assert!(named.to_string().contains("other-checkpoint"), "{named}");
+
+        let path = header_shaped(
+            "q35m-d4-abs",
+            "qwen35moe",
+            &keys(4, None),
+            &[],
+            &trunk(vec![1]),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = draft_usable(&split, None)
+            .expect_err("no layer")
+            .to_string();
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("nextn_predict_layers") && !err.contains("no rule"),
+            "{err}"
+        );
+
+        let path = header_shaped(
+            "q35m-d4-strip",
+            "qwen35moe",
+            &keys(5, Some(1)),
+            &[],
+            &trunk(vec![1]),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = draft_usable(&split, None)
+            .expect_err("stripped")
+            .to_string();
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("stripped next-token layer"), "{err}");
+    }
+
+    #[test]
+    fn d5_card_bytes_are_the_layer_one_stream_and_one_kv() {
+        let (read, draft) = open("q35m-d5", &keys(5, Some(1)), &shaped());
+        let InFile::Draft(d) = draft.expect("draft") else {
+            panic!("not a draft");
+        };
+        let got = in_file_card_bytes(&d, &read.tensors, 1).expect("the draft sizes");
+        let Mixer::Gqa(g) = &d.layer.mixer else {
+            panic!("not full attention");
+        };
+        let stream = u64::from(d.hidden) * runtime::stores::F32_BYTES;
+        let kv = runtime::stores::dense_kv_bytes(g.kv_heads as usize, g.head_dim as usize, 1);
+        let own: u64 = read
+            .tensors
+            .tensors
+            .iter()
+            .filter(|t| t.layer == Some(d.index as usize))
+            .map(|t| t.file_bytes)
+            .sum();
+        let head = read
+            .tensors
+            .tensors
+            .iter()
+            .find(|t| t.name == "output.weight")
+            .expect("the borrowed head")
+            .file_bytes;
+        assert!(own > 0, "the layer's own tensors");
+        assert_eq!(got, own + stream + kv);
+        assert_ne!(
+            got,
+            own + stream + kv + head,
+            "the borrowed head is the target's"
+        );
+        assert_ne!(got, own + 4 * stream + kv, "a four-stream reserve");
     }
 }

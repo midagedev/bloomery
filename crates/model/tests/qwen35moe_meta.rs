@@ -164,3 +164,88 @@ fn hw_qwen35moe_spec() {
         b.join("\n  ")
     );
 }
+
+/// The in-file next-token layer on the three headers this round describes.
+/// A1 carries one shaped draft, A2 declares the layer and stores no tensor,
+/// A4 has no key. Headers only.
+const A1_UNSLOTH_MTP: &str = "/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+const A2_MINICPM: &str = "/models/MiniCPM-V-4.7-35B-A3B/MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf";
+const A4_Q4KM: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
+
+#[test]
+#[ignore = "needs the Qwen3.6 and MiniCPM headers on the box (just gate-qwen35moe-meta)"]
+fn hw_qwen35moe_nextn_draft() {
+    use model::arch::models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, Residual};
+    use model::arch::qwen35moe::mtp::{self, InFile};
+
+    let split = Split::open(A1_UNSLOTH_MTP).unwrap_or_else(|e| panic!("open A1: {e}"));
+    let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec A1: {e}"));
+    let InFile::Draft(draft) = mtp::in_file(&split).unwrap_or_else(|e| panic!("draft A1: {e}"))
+    else {
+        panic!("A1 is not a draft");
+    };
+    assert_eq!(read.spec.layers.len(), 40, "the trunk gained a layer");
+    assert_eq!(read.spec.mtp.len(), 1);
+    assert_eq!(read.spec.mtp[0], draft.layer);
+    assert!(matches!(draft.source, MtpSource::InFile { layer: 40 }));
+    assert_eq!(draft.index, 40);
+    assert_eq!(draft.input, MtpInput::HeadRow);
+    assert_eq!(draft.head_norm, MtpHeadNorm::Rms);
+    assert!(draft.hc.is_none());
+    assert_eq!(draft.layer.residual, Residual::Plain);
+    let Mixer::Gqa(g) = &draft.layer.mixer else {
+        panic!("A1 mixer {:?}", draft.layer.mixer);
+    };
+    assert!(g.out_gate && g.qk_norm && g.select.is_none());
+    let Ffn::Moe(moe) = &draft.layer.ffn else {
+        panic!("A1 feed-forward {:?}", draft.layer.ffn);
+    };
+    assert!(moe.shared.is_some_and(|s| s.sigmoid_gate));
+    assert_eq!(draft.layer, read.spec.layers[39]);
+    assert_eq!(mtp::EH_JOIN, ["e", "h"]);
+    let bytes = mtp::in_file_card_bytes(&draft, &read.tensors, 1)
+        .unwrap_or_else(|e| panic!("card bytes: {e}"));
+    let own: u64 = read
+        .tensors
+        .tensors
+        .iter()
+        .filter(|t| t.layer == Some(draft.index as usize))
+        .map(|t| t.file_bytes)
+        .sum();
+    let stream = u64::from(draft.hidden) * 4;
+    let kv = runtime::stores::dense_kv_bytes(g.kv_heads as usize, g.head_dim as usize, 1);
+    assert_eq!(bytes, own + stream + kv);
+    assert_eq!((draft.hidden, g.kv_heads, g.head_dim), (2048, 2, 256));
+    println!(
+        "A1 draft index {} mtp {} card_bytes {bytes}",
+        draft.index,
+        read.spec.mtp.len()
+    );
+
+    let split = Split::open(A2_MINICPM).unwrap_or_else(|e| panic!("open A2: {e}"));
+    let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec A2: {e}"));
+    assert!(read.spec.mtp.is_empty(), "A2 drafted");
+    assert_eq!(read.spec.layers.len(), 40);
+    match mtp::in_file(&split).unwrap_or_else(|e| panic!("A2: {e}")) {
+        InFile::Stripped { reason } => {
+            assert!(reason.contains("stripped next-token layer"), "{reason}");
+            assert!(
+                read.defaults.iter().any(|d| d == &reason),
+                "{:?}",
+                read.defaults
+            );
+            println!("A2 {reason}");
+        }
+        other => panic!("A2 {other:?}"),
+    }
+
+    let split = Split::open(A4_Q4KM).unwrap_or_else(|e| panic!("open A4: {e}"));
+    let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec A4: {e}"));
+    assert!(read.spec.mtp.is_empty(), "A4 drafted");
+    assert_eq!(read.spec.layers.len(), 40);
+    assert!(matches!(
+        mtp::in_file(&split).unwrap_or_else(|e| panic!("A4: {e}")),
+        InFile::Absent
+    ));
+    println!("A4 mtp {}", read.spec.mtp.len());
+}

@@ -1,9 +1,10 @@
-//! What every beside-file MTP draft shares: how its file borrows the
-//! target's `token_embd` and `output` ([`borrows`]), the keys it must hold
-//! equal to the target's ([`same`], [`same_token_ids`]), and the table of
-//! each architecture's rule for whether a set can run the draft
-//! ([`draft_usable`]). The readers of the draft files themselves stay with
-//! their families (`qwen35moe::mtp`, `mimo2::mtp`).
+//! What every MTP draft's host rule shares, and the table of each
+//! architecture's rule for whether a set can run its draft
+//! ([`draft_usable`]). A beside-file draft borrows the target's
+//! `token_embd` and `output` ([`borrows`]) and holds its keys equal
+//! ([`same`], [`same_token_ids`]). A qwen35moe draft is the target's own
+//! next-token layer, not a sidecar. The readers of the draft files
+//! themselves stay with their families (`qwen35moe::mtp`, `mimo2::mtp`).
 
 use gguf::Split;
 use models::Borrows;
@@ -137,13 +138,50 @@ pub enum DraftUsableError {
 /// checkpoint).
 type Rule = fn(&Split, Option<&str>) -> Result<(), DraftUsableError>;
 
-/// Each architecture with a draft file of its own and its rule, keyed by the
-/// `general.architecture` its target declares. An architecture with no row
-/// has no rule.
-const RULES: &[(&str, Rule)] = &[("qwen4exp", qwen4exp_usable), ("mimo2", mimo2_usable)];
+/// Each architecture that has a draft and its rule, keyed by the
+/// `general.architecture` its target declares. qwen35moe's draft is the
+/// target file's own next-token layer. An architecture with no row has no
+/// rule.
+const RULES: &[(&str, Rule)] = &[
+    ("qwen4exp", qwen4exp_usable),
+    ("mimo2", mimo2_usable),
+    ("qwen35moe", qwen35moe_usable),
+];
 
 fn qwen4exp_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), DraftUsableError> {
     qwen35moe::mtp::target_usable(target, checkpoint).map_err(DraftUsableError::from)
+}
+
+fn qwen35moe_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), DraftUsableError> {
+    if let Some(name) = checkpoint {
+        return Err(PlacementError::Metadata {
+            key: "general.name".to_string(),
+            detail: format!(
+                "is named {name:?} for a qwen35moe draft, which is the target file's own \
+                 next-token layer"
+            ),
+        }
+        .into());
+    }
+    match qwen35moe::mtp::in_file(target)? {
+        qwen35moe::mtp::InFile::Draft(_) => Ok(()),
+        qwen35moe::mtp::InFile::Absent => Err(PlacementError::Metadata {
+            key: "qwen35moe.nextn_predict_layers".to_string(),
+            detail: "is absent or names no next-token layer; the file has no in-file draft"
+                .to_string(),
+        }
+        .into()),
+        qwen35moe::mtp::InFile::Stripped { reason } => Err(PlacementError::Metadata {
+            key: "qwen35moe.nextn_predict_layers".to_string(),
+            detail: reason,
+        }
+        .into()),
+        qwen35moe::mtp::InFile::Unshaped => Err(PlacementError::Metadata {
+            key: "qwen35moe.nextn_predict_layers".to_string(),
+            detail: "is 1 and the next-token tensors are not a draft's shapes".to_string(),
+        }
+        .into()),
+    }
 }
 
 fn mimo2_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), DraftUsableError> {
@@ -285,13 +323,13 @@ mod tests {
     /// set that can run its draft.
     #[test]
     fn an_architecture_without_a_rule_is_refused_by_name() {
-        let path = header_typed("draft-norule", "qwen35moe", &[], &[], &[layer()]);
+        let path = header_typed("draft-norule", "qwen35", &[], &[], &[layer()]);
         let target = gguf::Split::open(&path).expect("the synthetic target opens");
-        let err = draft_usable(&target, None).expect_err("no rule for qwen35moe");
+        let err = draft_usable(&target, None).expect_err("no rule for qwen35");
         let _ = std::fs::remove_file(&path);
         assert!(
             err.to_string()
-                .contains("no rule says whether a qwen35moe set can run its draft"),
+                .contains("no rule says whether a qwen35 set can run its draft"),
             "{err}"
         );
     }

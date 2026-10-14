@@ -6,9 +6,14 @@
 //! query's width. The file folds the norms' `+1` offset into their gains, so
 //! every norm is a plain RMS norm. A layer's feed-forward block is the routed
 //! experts or, on a qwen35 file, one SwiGLU block of `feed_forward_length`
-//! (qwen35.cpp:470-480), as its tensors say. The layers are the trunk's: a
-//! file's next-token layers are no layer of the description (`hparams`, their
-//! tensors `Role::Unused`). No chat parser is bound for this family.
+//! (qwen35.cpp:470-480), as its tensors say. The layers are the trunk's. A
+//! qwen35moe file with one shaped next-token layer carries that layer in
+//! `mtp`; its tensors stay [`Role::Unused`], so the trunk does not run it.
+//! A file whose key is absent, or whose key names a layer the file stripped,
+//! carries no draft layer, and neither does an unshaped role-table stub or a
+//! tail the draft refuses (`mtp::in_file` names that refusal).
+//! qwen35 and qwen4exp keep `mtp` empty. No chat parser is bound for this
+//! family.
 //!
 //! What qwen4exp changes, by its architecture and not by a key (llama.cpp
 //! `src/models/qwen4exp.cpp`): the GDN output gate is a sigmoid (:476-486);
@@ -177,7 +182,12 @@ pub fn spec_of(
         ctx_train: spec_u32("context_length", hp.n_ctx_train)?,
         rms_eps: hp.rms_eps,
         layers,
-        mtp: Vec::new(),
+        // A tail the draft refuses stays out of `mtp`, and the plain load reads
+        // as it did; the refusal is `mtp::in_file`'s, for a requested draft.
+        mtp: match super::mtp::describe(hp, tensors) {
+            Ok(Some(draft)) => vec![draft.layer],
+            Ok(None) | Err(_) => Vec::new(),
+        },
         hc,
         engram,
         chat,
@@ -193,10 +203,23 @@ fn routed(
     l: usize,
     has: &dyn Fn(String) -> bool,
 ) -> Result<Ffn, PlacementError> {
+    // The trunk's shared expert is the role. A next-token layer's tensors are
+    // `Unused` on this plan, so the draft passes the name instead.
     let shexp = tensors
         .tensors
         .iter()
         .any(|t| t.layer == Some(l) && t.role == Role::SharedExpert);
+    routed_at(hp, arch, l, shexp, has)
+}
+
+/// [`routed`] once the caller knows whether layer `l` carries a shared expert.
+pub(super) fn routed_at(
+    hp: &Hparams,
+    arch: Arch,
+    l: usize,
+    shexp: bool,
+    has: &dyn Fn(String) -> bool,
+) -> Result<Ffn, PlacementError> {
     let shared = match (shexp, hp.shared_ff) {
         (false, _) => None,
         (true, Some(ff)) => Some(Shared {
