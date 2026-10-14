@@ -238,24 +238,10 @@ where
     }
 }
 
-/// The model's limit for a seat ([`placement::ctx::CtxLimit`]): the file's
-/// trained context and the bounds the seat names (`kernel`, `verified`); a set
-/// `--ctx`'s share of one slot (`share`) past it stops the load by name before
-/// any plan ([`placement::ctx::check_slot_ctx`]). A file that states no
-/// trained context is refused, since no context can be held to it.
-///
-/// # Errors
-/// [`placement::ctx::PastLimit`], or the file's missing `context_length`.
-pub fn check_set_slot(
-    file: &Split,
-    share: Option<usize>,
-    bounds: SeatBounds,
-) -> Result<placement::ctx::CtxLimit, GateError> {
-    check_share(context_length(file)?, share, bounds)
-}
-
-/// [`check_set_slot`] for a seat that holds the file's trained context
-/// already (`trained`).
+/// The trained context and optional slot share checked against the seat's
+/// bounds: the model's limit ([`placement::ctx::CtxLimit`]), and a set
+/// `--ctx`'s share of one slot past it stopped by name before any plan
+/// ([`placement::ctx::check_slot_ctx`]).
 ///
 /// # Errors
 /// [`placement::ctx::PastLimit`].

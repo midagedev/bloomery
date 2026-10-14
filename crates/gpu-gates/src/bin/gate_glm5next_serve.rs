@@ -1225,16 +1225,8 @@ mod gate {
             !status.success() && text.contains(&refused),
         );
 
-        // The paged arm: `--plan` alone, so no load, under a host room that
-        // pages the base plan. The terms are the rule's contract read off
-        // the line, each red on a different change of the rule: the bound
-        // is the base's hundredth (another divisor); the rule word is not
-        // `base` and the chosen plan pages more than the base (a rule with
-        // no slack pages nothing past it: the first step past a checkpoint
-        // mark adds a point to the host need, which is NVMe bytes here); and
-        // at most a hundredth more (a wider slack reaches a longer context,
-        // whose points page far more). A room that pages nothing leaves
-        // `base_nvme_expert_bytes` at 0 and the clause red by name.
+        // PIN(2026-10-14): the one-slot context ladder replaces the paged-growth
+        // and default-second-slot-fallback clauses; those searches no longer run.
         Ok(ok)
     }
 

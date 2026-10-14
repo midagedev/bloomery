@@ -105,18 +105,27 @@ impl<P> From<Short> for Probe<P> {
 }
 
 /// A plan's violations read as a short card: some, and every one a card
-/// over its usable bytes ([`Violation::CardOver`]); the card past by most.
-/// Any other violation is a plan that is wrong, not short.
+/// over its usable bytes ([`Violation::CardOver`]) or the shared pool a
+/// unified card allocates from ([`Violation::PoolOver`], the cards, the host
+/// and what sits beside them against the pool); the one past by most. Any
+/// other violation is a plan that is wrong, not short.
 pub fn short_of(violations: &[Violation]) -> Option<Short> {
     let mut worst: Option<Short> = None;
     for v in violations {
-        let Violation::CardOver { total, limit, .. } = v else {
-            return None;
+        let (need, room) = match v {
+            Violation::CardOver { total, limit, .. } => (*total, *limit),
+            Violation::PoolOver {
+                cards,
+                host,
+                beside,
+                pool,
+            } => (cards + host + beside, *pool),
+            _ => return None,
         };
         let s = Short {
             on: Side::Card,
-            need: *total,
-            room: *limit,
+            need,
+            room,
         };
         if worst.is_none_or(|w| s.need.saturating_sub(s.room) > w.need.saturating_sub(w.room)) {
             worst = Some(s);
@@ -723,9 +732,9 @@ mod tests {
         );
     }
 
-    /// Violations read as a short card only when every one is a card over
-    /// its bytes, the card past by most; a placement error only when it is a
-    /// card's floor.
+    /// Violations read as a short card only when every one is a card or its
+    /// shared pool over its bytes, the one past by most; a placement error
+    /// only when it is a card's floor.
     #[test]
     fn only_a_card_over_its_bytes_reads_as_short() {
         let over = |total, limit| Violation::CardOver {
@@ -746,6 +755,22 @@ mod tests {
             card: "c".to_string(),
         };
         assert_eq!(short_of(&[over(110, 100), other]), None);
+        // A unified pool's shortage alone halves too: the cards, the host and
+        // what sits beside them against the pool.
+        let pool = Violation::PoolOver {
+            cards: 70,
+            host: 50,
+            beside: 10,
+            pool: 100,
+        };
+        assert_eq!(
+            short_of(&[over(110, 100), pool]),
+            Some(Short {
+                on: Side::Card,
+                need: 130,
+                room: 100
+            })
+        );
         assert_eq!(short_of(&[]), None);
         let floor = PlacementError::CardBudgetFloor {
             card: "c".to_string(),

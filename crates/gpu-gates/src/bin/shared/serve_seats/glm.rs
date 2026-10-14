@@ -897,6 +897,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let asks_yield = draft_off.is_none() && levers.draft().is_none();
     let (placed, draft_off, yield_record) = match drafted {
         Ok(d) if !asks_yield || !d.line.starts_with("ctx rule=halved ") => (d, draft_off, None),
+        // A draft the levers set keeps its own refusal: it never yields.
+        drafted if !asks_yield => (drafted?, draft_off, None),
         drafted => {
             // The draft costs context, or the drafted load holds not even
             // the floor: the plain load's context decides.

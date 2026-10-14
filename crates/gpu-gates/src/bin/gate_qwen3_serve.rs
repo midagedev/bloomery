@@ -442,7 +442,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::ctx_ladder::{
-        ctx_line, default_line_held, rung_above, rungs, target_of,
+        ctx_line, default_line_held, field as field_u64, rung_above, rungs, target_of,
     };
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields};
@@ -661,17 +661,6 @@ mod gate {
     /// that was not read.
     fn u64_of(rec: Option<&Fields>, name: &str) -> Option<u64> {
         rec.and_then(|r| or_named(r.u64(name)))
-    }
-
-    /// The whole-number field ` name=…` of a `ctx` line, which no record kind
-    /// owns; `None` when the line carries none.
-    fn field_u64(line: &str, name: &str) -> Option<u64> {
-        line.split(&format!(" {name}="))
-            .nth(1)?
-            .split(' ')
-            .next()?
-            .parse()
-            .ok()
     }
 
     /// The word ` name=…` of a `parallel` line; `None` when the line
