@@ -31,6 +31,7 @@ The failure it blocks: a pull request whose first Shingler review is a MUST_FIX,
 """
 
 import argparse
+import fcntl
 import contextlib
 import io
 import json
@@ -41,6 +42,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -272,8 +274,18 @@ def ub_bins(base_tree, say, root=None, install=install_ub):
 
 
 def diag(ctx, base_tree, base_sha, head, say):
+    """diagnostics.md from dryer and crapper; the shared cache is held under one lock (a sibling file, which the
+    install's rmtree leaves) from the pin check through the tools' use, so two runs at other pins never mix it."""
+    root = os.path.expanduser(UB)
+    os.makedirs(os.path.dirname(root), exist_ok=True)
+    with open(root + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        diag_locked(ctx, base_tree, base_sha, head, say, root)
+
+
+def diag_locked(ctx, base_tree, base_sha, head, say, root):
     out = os.path.join(ctx, "diagnostics.md")
-    bins = ub_bins(base_tree, say)
+    bins = ub_bins(base_tree, say, root=root)
     if not bins:
         with open(out, "w") as f:
             f.write(NO_DIAG + "\n")
@@ -449,7 +461,7 @@ def self_test():
 
         def fake_install(root, pins):
             calls.append(pins)
-            os.makedirs(os.path.join(root, "venv/bin"))
+            os.makedirs(os.path.join(root, "venv/bin"), exist_ok=True)
             for b in ("dryer", "crapper"):
                 open(os.path.join(root, "venv/bin", b), "w").close()
                 os.chmod(os.path.join(root, "venv/bin", b), 0o755)
@@ -461,11 +473,29 @@ def self_test():
         ub_bins(os.path.join(t, "base"), lambda m: None, ub, fake_install)
         expect(len(calls) == 1, f"tools at the pins are not installed again: {calls}")
         open(os.path.join(t, "base/.github/workflows/review.yml"), "w").write("DRYER_SHA: " + "c" * 40 + "\nCRAPPER_SHA: " + "b" * 40 + "\n")
-        shutil.rmtree(ub)
-        os.makedirs(os.path.join(ub, "venv/bin"))
-        open(os.path.join(ub, "pins"), "w").write("a" * 40 + " " + "b" * 40 + "\n")
-        ub_bins(os.path.join(t, "base"), lambda m: None, ub, fake_install)
-        expect(len(calls) == 2 and calls[-1][0] == "c" * 40, f"a moved pin installs again: {calls}")
+        # the tools stay in place: only the pin comparison can call for the install
+        got = ub_bins(os.path.join(t, "base"), lambda m: None, ub, fake_install)
+        expect(got is not None and len(calls) == 2 and calls[-1][0] == "c" * 40, f"a moved pin installs again: {calls}")
+
+        # the cache's lock: a run that finds it held waits for it before it looks at the pins
+        lock_root = os.path.join(t, "ublock")
+        seen = []
+        g = globals()
+        saved_ub, saved_bins = g["UB"], g["ub_bins"]
+        g["UB"] = lock_root
+        g["ub_bins"] = lambda base_tree, say, root=None: seen.append(time.time()) or None
+        try:
+            os.makedirs(os.path.join(t, "ctx"), exist_ok=True)
+            with open(lock_root + ".lock", "a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                th = threading.Thread(target=diag, args=(os.path.join(t, "ctx"), os.path.join(t, "base"), "a", "b", lambda m: None))
+                th.start()
+                time.sleep(0.5)
+                waited = seen == []
+            th.join(10)
+            expect(waited and len(seen) == 1, f"diag waits for the cache's lock, then runs: waited {waited}, ran {len(seen)}")
+        finally:
+            g["UB"], g["ub_bins"] = saved_ub, saved_bins
 
         def broken(root, pins):
             raise subprocess.CalledProcessError(128, "git")
