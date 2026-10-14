@@ -307,6 +307,11 @@
 # names both the refused and the unchecked — no single bounded call, or a bound the text does not
 # spell: several calls, an arithmetic, no runner at all).
 #
+# A recipe the plan fixes to the 3090 or the A6000 — its one card candidate, or no candidate and
+# that label — is named and stopped (65) when BLOOMERY_CARD names the other card, or both, before
+# anything runs, the dry run included. The card it is fixed to still plans. A balanced recipe, and
+# a recipe whose own text picks the card, are not that case.
+#
 # Disk floor. Before anything starts — after argument parsing, before the log directory and the first
 # lane — the free space of the volume that holds the tree's target/ and of the volume that holds OUT
 # must each be at least MIN_FREE_GIB (giB). Below the floor: exit 69 and one `gate-batch: disk:` line
@@ -1397,6 +1402,42 @@ FP
       $0 ~ (" " b "[ ]*$") { bs = $1 }
       END { print (ae == "" || bs == "" ? "absent" : ae <= bs ? "yes" : "no") }' "$1" || echo absent
   }
+  if gb_part 1; then
+  # A recipe fixed to one card is named and stopped when BLOOMERY_CARD names the other card
+  # or both, before a lane would start. The card it is fixed to, a balanced recipe, and a recipe
+  # whose own text picks both cards still plan.
+  check 'card: both refuses a recipe fixed to the 3090, by name' 65 \
+    '^gate-batch: steal-fix is fixed to the 3090; BLOOMERY_CARD=both holds both cards' \
+    env BLOOMERY_CARD=both "${gb[@]}" --dry-run steal-fix
+  check 'card: both refuses a fixed recipe with no gate lock, labelled 3090' 65 \
+    '^gate-batch: steal-lib is fixed to the 3090; BLOOMERY_CARD=both holds both cards' \
+    env BLOOMERY_CARD=both "${gb[@]}" --dry-run steal-lib
+  check 'card: both refuses a fixture recipe fixed to the A6000, by name' 65 \
+    '^gate-batch: sr-a6000 is fixed to the a6000; BLOOMERY_CARD=both holds both cards' \
+    env BLOOMERY_CARD=both "${gb[@]}" --tier fixture --dry-run sr-a6000
+  check 'card: the A6000 refuses a recipe fixed to the 3090, by name' 65 \
+    '^gate-batch: steal-fix is fixed to the 3090; BLOOMERY_CARD=a6000 is another card' \
+    env BLOOMERY_CARD=a6000 "${gb[@]}" --dry-run steal-fix
+  check 'card: the 3090 refuses a recipe fixed to the A6000, by name' 65 \
+    '^gate-batch: sr-a6000 is fixed to the a6000; BLOOMERY_CARD=3090 is another card' \
+    env BLOOMERY_CARD=3090 "${gb[@]}" --tier fixture --dry-run sr-a6000
+  check 'card: both still plans a balanced recipe' 0 '^lane [AB]  plain-any ' \
+    env BLOOMERY_CARD=both "${gb[@]}" --dry-run plain-any
+  check 'card: both still plans a recipe whose own text picks both cards' 0 '^lane X  pk-both ' \
+    env BLOOMERY_CARD=both "${gb[@]}" --dry-run pk-both
+  check 'card: a 3090 batch still plans the fixed recipe' 0 '^lane A  steal-fix ' \
+    env BLOOMERY_CARD=3090 "${gb[@]}" --dry-run steal-fix
+  check 'card: the A6000 still plans a recipe fixed to it' 0 '^lane B  sr-a6000 ' \
+    env BLOOMERY_CARD=a6000 "${gb[@]}" --tier fixture --dry-run sr-a6000
+  mutant_of card-noboth \
+    's%^    3090|a6000|both) ;;$%    never) ;; # MUTANT card-noboth%' \
+    '# MUTANT card-noboth$'
+  rc=0
+  out=$(env BLOOMERY_CARD=both bash "$t/tools/gate-batch-card-noboth.sh" --dry-run steal-fix 2>&1) || rc=$?
+  if [ "$rc" = 0 ] && grep -q '^lane A  steal-fix' <<< "$out"; then
+    pass 'card mutant: without the both check the fixed recipe is planned'
+  else fail 'card mutant: without the both check the fixed recipe is planned' "rc=$rc $(grep -E '^lane |^gate-batch:' <<< "$out" | tr '\n' ' ')"; fi
+  fi
   if gb_part 1; then
   # (1) chain exclusion: two any-form members and both lanes free — the mutex keeps them one at a
   # time, whichever lane takes each.
@@ -4977,6 +5018,38 @@ for ((i = 0; i < ND; i++)); do
     *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file, variant and fixture-only" ;;
   esac
 done
+# A recipe fixed to the 3090 or the A6000 is named and stopped when BLOOMERY_CARD names the other
+# card, or both, before a lane starts, the dry run included. The card it is fixed to still plans.
+# A balanced recipe is not that case, nor is one whose own text picks the card.
+both_card_refuse() {
+  local i nbad=0 name kind cards labels card asked="${BLOOMERY_CARD:-}"
+  case "$asked" in
+    3090|a6000|both) ;;
+    *) return 0 ;;
+  esac
+  for ((i = 0; i < N; i++)); do
+    rec_get "$i" name kind cards labels
+    [ "$kind" = fixed ] || continue
+    card=
+    case "$cards" in
+      3090|a6000) card=$cards ;;
+      -)
+        case "$labels" in
+          3090|a6000) card=$labels ;;
+        esac ;;
+    esac
+    [ -n "$card" ] || continue
+    [ "$asked" = "$card" ] && continue
+    if [ "$asked" = both ]; then
+      echo "gate-batch: $name is fixed to the $card; BLOOMERY_CARD=both holds both cards — run it on the card it is fixed to" >&2
+    else
+      echo "gate-batch: $name is fixed to the $card; BLOOMERY_CARD=$asked is another card — run it on the card it is fixed to" >&2
+    fi
+    nbad=$((nbad + 1))
+  done
+  [ "$nbad" = 0 ] || RC=65 die "$nbad fixed recipe(s) cannot run under BLOOMERY_CARD=$asked"
+}
+both_card_refuse
 DEFER_NOTE=''
 if [ "$ND" != 0 ] && [ "$ND_VR" = "$ND" ]; then
   DEFER_NOTE=" (and $ND_VR deferred to a fixture-tier batch: a variant is a fixture)"
