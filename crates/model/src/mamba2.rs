@@ -75,6 +75,9 @@ pub enum Mamba2Error {
     /// any other). The scan does not launch it.
     #[error("mamba2: state {0} is refused; the scan runs state 128 and writes nothing")]
     State(usize),
+    /// A buffer size that cannot be represented.
+    #[error("mamba2: {0} size overflows usize")]
+    Size(&'static str),
     /// `n_head` does not divide into `n_group`, so the group index is not a
     /// function of the head.
     #[error("mamba2: n_head {n_heads} is not a multiple of n_group {n_groups}")]
@@ -140,10 +143,24 @@ pub fn check(g: Geom) -> Result<Checked, Mamba2Error> {
             n_groups: g.n_groups,
         });
     }
+    let bc_n = g
+        .n_groups
+        .checked_mul(STATE)
+        .ok_or(Mamba2Error::Size("B/C"))?;
+    let conv_dim = bc_n
+        .checked_mul(2)
+        .and_then(|n| g.d_inner.checked_add(n))
+        .ok_or(Mamba2Error::Size("conv channels"))?;
+    g.d_inner
+        .checked_mul(STATE)
+        .ok_or(Mamba2Error::Size("scan state"))?;
+    g.d_conv
+        .checked_mul(conv_dim)
+        .ok_or(Mamba2Error::Size("conv weight"))?;
     Ok(Checked {
         geom: g,
         head_dim: g.d_inner / g.n_heads,
-        conv_dim: g.d_inner + 2 * g.n_groups * g.d_state,
+        conv_dim,
     })
 }
 
@@ -313,8 +330,14 @@ pub fn conv_tokens(
     }
     let n_tok = x_new.len() / channels;
     let ages = d_conv - 1;
-    len("conv state", state.len(), ages * channels)?;
-    len("conv weight", w.len(), d_conv * channels)?;
+    let state_n = ages
+        .checked_mul(channels)
+        .ok_or(Mamba2Error::Size("conv state"))?;
+    let weight_n = d_conv
+        .checked_mul(channels)
+        .ok_or(Mamba2Error::Size("conv weight"))?;
+    len("conv state", state.len(), state_n)?;
+    len("conv weight", w.len(), weight_n)?;
     len("conv y", y.len(), n_tok * channels)?;
     for tok in 0..n_tok {
         for channel in 0..channels {
@@ -562,26 +585,58 @@ mod tests {
         }
     }
 
-    /// The update is a product then an add, never one fused multiply-add:
-    /// `B * (x * dt)` rounds to 21 and cancels the state exactly, while a fused
-    /// `mul_add(B, x * dt, state)` keeps the product's low bits.
+    /// The update is two rounded products then an add, never a fused
+    /// multiply-add on either side.
     #[test]
     fn the_recurrence_rounds_its_product_before_the_add() {
+        // Each case cancels the state to 0 only when its product is rounded
+        // before the add: the first fuses `B * (x * dt)`, the second the
+        // decay `state * dA`.
         let g = one_channel();
-        let mut state = vec![-21.0; STATE];
-        let mut y = [0.0];
-        scan_token(
-            &g,
-            &mut state,
-            &[1.0 - f32::EPSILON],
-            &[21.0],
-            &[0.0],
-            &[1.0 + f32::EPSILON; STATE],
-            &[1.0; STATE],
-            &mut y,
-        )
-        .unwrap();
-        assert!(state.iter().all(|&v| v == 0.0), "{:?}", &state[..4]);
+        for (initial, a, b) in [
+            (-21.0, 0.0, 1.0 + f32::EPSILON),
+            (21.0, -f32::EPSILON / 21.0, -1.0),
+        ] {
+            let mut state = vec![initial; STATE];
+            let mut y = [0.0];
+            scan_token(
+                &g,
+                &mut state,
+                &[1.0 - f32::EPSILON],
+                &[21.0],
+                &[a],
+                &[b; STATE],
+                &[1.0; STATE],
+                &mut y,
+            )
+            .unwrap();
+            assert!(state.iter().all(|&v| v == 0.0), "a {a}: {:?}", &state[..4]);
+        }
+    }
+
+    #[test]
+    fn overflowing_sizes_are_refused() {
+        assert_eq!(
+            conv_tokens(
+                usize::MAX / 2 + 2,
+                &mut [],
+                &[1.0; 2],
+                &[1.0; 2],
+                &[0.0; 2],
+                &mut [0.0; 2]
+            ),
+            Err(Mamba2Error::Size("conv state"))
+        );
+        assert_eq!(
+            check(Geom {
+                d_inner: usize::MAX - 255,
+                n_heads: 1,
+                n_groups: 1,
+                d_state: STATE,
+                d_conv: 4,
+            }),
+            Err(Mamba2Error::Size("conv channels"))
+        );
     }
 
     fn nano() -> Checked {
