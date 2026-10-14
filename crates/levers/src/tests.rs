@@ -1243,40 +1243,30 @@ fn draft_yields_to_the_context_only_when_it_costs_positions() {
     assert!(DraftYield::of(0, 4096, r).is_some(), "under the floor");
 }
 
-/// A paged plan serves the slots it was asked for ([`paged_columns`]): with
-/// no arena, or a draft that is off or set, the plan serves as asked; an
-/// unset draft goes off and the asked count stays, including a count past
-/// one. The default is already one slot, so the rule has no count to reduce.
+/// The paged rule ([`paged_columns`]): with no arena, or a draft that is off
+/// or set, the plan serves as asked; on a paged plan an unset draft goes off.
 ///
 /// The arena is the 3090 gate plan's at a 27 GiB room [derived on the Mac:
 /// `crates/placement` `a_27_gib_room_puts_the_overflow_on_the_nvme_tier`].
 #[test]
-fn a_paged_plan_serves_its_asked_slots() {
+fn a_paged_plan_turns_only_an_unset_draft_off() {
     let arena = 23_434_203_136_u64;
-    let at = |arena, slots, draft, draft_set| PagedAt {
+    let at = |arena, draft, draft_set| PagedAt {
         arena,
-        slots,
         draft,
         draft_set,
     };
     for (at, want) in [
-        // No arena: every count as asked, draft or not.
-        (at(0, 2, true, false), Paged::AsAsked),
-        (at(0, 4, true, true), Paged::AsAsked),
-        // No draft: the asked count, one or several.
-        (at(arena, 1, false, false), Paged::AsAsked),
-        (at(arena, 1, false, true), Paged::AsAsked),
-        (at(arena, 2, false, false), Paged::AsAsked),
-        (at(arena, 4, false, false), Paged::AsAsked),
-        (at(arena, 8, false, false), Paged::AsAsked),
-        // The unset draft goes off; the asked count stays.
-        (at(arena, 1, true, false), Paged::Reduced { slots: 1 }),
-        (at(arena, 2, true, false), Paged::Reduced { slots: 2 }),
-        (at(arena, 3, true, false), Paged::Reduced { slots: 3 }),
+        // No arena: as asked, draft or not.
+        (at(0, true, false), Paged::AsAsked),
+        (at(0, true, true), Paged::AsAsked),
+        // No draft: as asked.
+        (at(arena, false, false), Paged::AsAsked),
+        (at(arena, false, true), Paged::AsAsked),
+        // The unset draft goes off.
+        (at(arena, true, false), Paged::Reduced),
         // A set draft runs as asked.
-        (at(arena, 1, true, true), Paged::AsAsked),
-        (at(arena, 2, true, true), Paged::AsAsked),
-        (at(arena, 3, true, true), Paged::AsAsked),
+        (at(arena, true, true), Paged::AsAsked),
     ] {
         assert_eq!(paged_columns(&at), want, "{at:?}");
     }
@@ -1288,26 +1278,26 @@ fn a_paged_plan_serves_its_asked_slots() {
     let paged = Some(Draft38Off::Paged { arena });
     let y = DraftYield::of(702, 6165, 2_842_413_228).expect("the 3060's yield");
     assert_eq!(
-        paged_draft(&at(0, 1, true, false), None),
+        paged_draft(&at(0, true, false), None),
         (true, None),
         "an unset draft runs on a plan with no arena"
     );
     assert_eq!(
-        paged_draft(&at(0, 2, false, false), Some(Draft38Off::Yield(y))),
+        paged_draft(&at(0, false, false), Some(Draft38Off::Yield(y))),
         (false, Some(Draft38Off::Yield(y))),
         "a yield on a plan with no arena stays"
     );
     assert_eq!(
-        paged_draft(&at(arena, 2, true, true), None),
+        paged_draft(&at(arena, true, true), None),
         (true, None),
         "a set draft runs on a paged plan"
     );
     assert_eq!(
-        paged_draft(&at(arena, 2, true, false), None),
+        paged_draft(&at(arena, true, false), None),
         (false, paged.clone())
     );
     assert_eq!(
-        paged_draft(&at(arena, 2, false, false), Some(Draft38Off::Yield(y))),
+        paged_draft(&at(arena, false, false), Some(Draft38Off::Yield(y))),
         (false, paged.clone()),
         "a yield judged on the abandoned plan"
     );
@@ -1325,7 +1315,7 @@ fn a_paged_plan_serves_its_asked_slots() {
         },
     ] {
         assert_eq!(
-            paged_draft(&at(arena, 2, false, false), Some(stays.clone())),
+            paged_draft(&at(arena, false, false), Some(stays.clone())),
             (false, Some(stays.clone())),
             "{stays:?}"
         );

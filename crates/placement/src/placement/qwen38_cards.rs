@@ -1253,7 +1253,7 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
 /// unset draft goes off with that count kept; at 40 GiB (over half the host
 /// leg, under its need) the tier pages experts with no arena (the mapping
 /// path), so the same unset draft is served as asked — the serve gate's two
-/// rooms. A count is never reduced: the default is already one slot.
+/// rooms.
 #[test]
 fn the_paged_rule_reads_the_arena() {
     use bloomery_levers::{Paged, PagedAt, paged_columns};
@@ -1262,9 +1262,8 @@ fn the_paged_rule_reads_the_arena() {
         let plan = plan_at(&q4, &gate, 4096, slots, room).expect("the plan");
         (plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes)
     };
-    let at = |arena, slots, draft| PagedAt {
+    let at = |arena, draft| PagedAt {
         arena,
-        slots,
         draft,
         draft_set: false,
     };
@@ -1272,20 +1271,14 @@ fn the_paged_rule_reads_the_arena() {
     let (moved1, deep1) = arena(1, 27 << 30);
     println!("27 GiB: two slots arena {deep2} B, one slot arena {deep1} B");
     assert!(moved2 > 0 && deep2 > 0 && moved1 > 0 && deep1 > 0);
-    assert_eq!(
-        paged_columns(&at(deep2, 2, true)),
-        Paged::Reduced { slots: 2 }
-    );
-    assert_eq!(
-        paged_columns(&at(deep1, 1, true)),
-        Paged::Reduced { slots: 1 }
-    );
-    assert_eq!(paged_columns(&at(deep2, 2, false)), Paged::AsAsked);
+    assert_eq!(paged_columns(&at(deep2, true)), Paged::Reduced);
+    assert_eq!(paged_columns(&at(deep1, true)), Paged::Reduced);
+    assert_eq!(paged_columns(&at(deep2, false)), Paged::AsAsked);
     let (moved, shallow) = arena(2, 40 << 30);
     println!("40 GiB: two slots NVMe experts {moved} B, arena {shallow} B");
     assert!(moved > 0, "the 40 GiB room pages experts");
     assert_eq!(shallow, 0, "through the mapping, no arena");
-    assert_eq!(paged_columns(&at(shallow, 2, true)), Paged::AsAsked);
+    assert_eq!(paged_columns(&at(shallow, true)), Paged::AsAsked);
 }
 
 /// The arena's floor counts a column a slot, to the step port's width: the

@@ -2032,16 +2032,13 @@ impl fmt::Display for DraftYield {
     }
 }
 
-/// What decides the columns a binary steps on a plan whose host experts
-/// page through the NVMe tier's RAM arena ([`paged_columns`]).
+/// What the paged rule reads of a plan whose host experts page through the
+/// NVMe tier's RAM arena ([`paged_columns`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagedAt {
     /// The plan's RAM arena (`HostTotals::nvme_arena_bytes`); 0 is a plan
     /// the tier does not page through an arena.
     pub arena: u64,
-    /// The resident slots the plan counts. The default is already one, so
-    /// the rule does not change the count.
-    pub slots: usize,
     /// Whether the plan drafts, and whether [`DRAFT`] named the draft.
     pub draft: bool,
     pub draft_set: bool,
@@ -2055,21 +2052,20 @@ impl PagedAt {
     }
 }
 
-/// What a seat serves on the plan [`paged_columns`] read.
+/// Whether the paged rule turns the plan's draft off ([`paged_columns`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Paged {
     /// The plan as asked.
     AsAsked,
     /// The plan with the unset draft off ([`paged_draft`] names why; a set
-    /// [`DRAFT`] runs). `slots` is the count asked: the default is already
-    /// one, so the rule does not reduce it.
-    Reduced { slots: usize },
+    /// [`DRAFT`] runs).
+    Reduced,
 }
 
-/// A plan that pages host experts through the NVMe tier's RAM arena serves
-/// the slots it was asked for ([`PagedAt::slots`]). A plan with no arena, a
-/// plan that does not draft, or a set draft, serves as asked. An unset draft
-/// on a paged plan goes off and the asked count stays. Whether a drafted
+/// Whether paging turns an unset draft off. A plan with no arena, a plan
+/// that does not draft, or a set draft, serves as asked; an unset draft on a
+/// paged plan goes off. The slot count is not the rule's: a plan serves the
+/// count it was asked. Whether a drafted
 /// verify pays on a paged plan is the machine's drive, not the rule's, to
 /// answer ([`DRAFT`]'s doc names the trade; `pageddraft-decode.card` holds
 /// the measurement).
@@ -2077,7 +2073,7 @@ pub fn paged_columns(at: &PagedAt) -> Paged {
     if at.arena == 0 || !at.draft || at.draft_set {
         Paged::AsAsked
     } else {
-        Paged::Reduced { slots: at.slots }
+        Paged::Reduced
     }
 }
 

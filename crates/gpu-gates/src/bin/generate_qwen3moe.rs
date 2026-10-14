@@ -1071,7 +1071,6 @@ mod cli {
         let arena = arena38(file, levers, (place, experts, room), (ctx, slots), true)?;
         let at = PagedAt {
             arena,
-            slots,
             draft: true,
             draft_set: levers.draft().is_some(),
         };

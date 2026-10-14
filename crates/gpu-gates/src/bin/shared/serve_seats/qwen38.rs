@@ -1243,21 +1243,18 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // drafted plan; the default's is asked below, of the plan its search and
     // the draft's yield chose. Under the rule the plan serves the asked
     // count, a set draft, and an unset one off.
-    let paged_at = |arena: u64, slots: usize, mtp: bool| bloomery_levers::PagedAt {
+    let paged_at = |arena: u64, mtp: bool| bloomery_levers::PagedAt {
         arena,
-        slots,
         draft: mtp,
         draft_set: levers.draft().is_some(),
     };
-    let paged = |arena: u64, slots: usize, mtp: bool| {
-        bloomery_levers::paged_columns(&paged_at(arena, slots, mtp))
-    };
+    let paged = |arena: u64, mtp: bool| bloomery_levers::paged_columns(&paged_at(arena, mtp));
     // The draft a reduced load runs ([`bloomery_levers::paged_draft`]): a set
     // one runs, and an unset one the plan would draft — or that only its
     // yield to the context turned off on the plan this load abandons — goes
     // off naming the paged rule, at either point. The asked count stays.
     let reduced = |arena: u64, slots: usize, mtp: bool, draft_off: Option<Draft38Off>| {
-        let at = paged_at(arena, slots, mtp);
+        let at = paged_at(arena, mtp);
         let asked_on = at.asked_draft(draft_off.as_ref());
         let (drafts, draft_off) = bloomery_levers::paged_draft(&at, draft_off);
         eprintln!(
@@ -1288,20 +1285,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
         _ => 0,
     };
-    let (slots, from, mtp, head, draft_off) = match paged(early, slots, mtp) {
-        Paged::AsAsked => (slots, from, mtp, head, draft_off),
-        Paged::Reduced { slots: served } => {
-            let (drafts, draft_off) = reduced(early, served, mtp, draft_off);
+    let (mtp, head, draft_off) = match paged(early, mtp) {
+        Paged::AsAsked => (mtp, head, draft_off),
+        Paged::Reduced => {
+            let (drafts, draft_off) = reduced(early, slots, mtp, draft_off);
             if !drafts {
                 mtp_inputs = None;
             }
-            (
-                served,
-                from,
-                drafts,
-                if drafts { head } else { None },
-                draft_off,
-            )
+            (drafts, if drafts { head } else { None }, draft_off)
         }
     };
     let drafted = Plans {
@@ -1343,7 +1334,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     let host = plans.host(rule.ctx, set)?;
-    let (slots, from, mtp, head, draft_off, host) = match paged(host.2, slots, mtp) {
+    let (mtp, head, draft_off, host) = match paged(host.2, mtp) {
         Paged::AsAsked => {
             if host.2 > 0 && slots > 1 {
                 eprintln!(
@@ -1353,25 +1344,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                     host.2
                 );
             }
-            (slots, from, mtp, head, draft_off, host)
+            (mtp, head, draft_off, host)
         }
-        Paged::Reduced { slots: served } => {
-            let (drafts, draft_off) = reduced(host.2, served, mtp, draft_off);
+        Paged::Reduced => {
+            let (drafts, draft_off) = reduced(host.2, slots, mtp, draft_off);
             let one = Plans {
                 mtp: if drafts { plans.mtp } else { None },
-                slots: served,
                 ..plans
             };
             rule = ctx38(&one, a.ctx)?;
             let host = one.host(rule.ctx, set)?;
-            (
-                served,
-                from,
-                drafts,
-                if drafts { head } else { None },
-                draft_off,
-                host,
-            )
+            (drafts, if drafts { head } else { None }, draft_off, host)
         }
     };
     refuse_mtp_levers(&draft_off)?;
