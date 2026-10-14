@@ -57,7 +57,7 @@
 # runner refused or could not start (NOT-RUN: 64 a runner usage error, 69 a lock file it cannot open —
 # tools/gpu-gate.sh's codes — 126 or 127 no command), and a client that lost the daemon (LOST-DAEMON:
 # rc 84, its own count, not RED). That line also prints `python3 tools/boxq.py attach sNNN` when the
-# log names `job sNNN`.
+# log names `job sNNN`, or `resume with: tools/boxq.py attach sNNN`.
 # The runner never calls git checkout, restore or stash. On every exit — the end, an error, a signal — a
 # trap restores a mutated file from its copy, and the md5 check against the record runs; a file that
 # changed while the gate ran (another editor) has that content saved under <out>/changed/ before the
@@ -112,7 +112,7 @@ case "$s" in
   *NOBUILD*) echo "error: could not compile \`fake\` (lib)"; exit 101 ;;
   *QUIET*) exit 1 ;;
   *NOTRUN*) exit 69 ;;
-  *LOST*) BOXQ_SSH=false BOXQ_POLL_S=0.01 python3 "$T_BOXQ" attach s184; exit $? ;;
+  *LOST*) BOXQ_SSH=false BOXQ_POLL_S=0.01 BOXQ_RECONNECT_S=0 python3 "$T_BOXQ" attach s184; exit $? ;;
   *BREAKCOPY*) printf 'x\n' >> "$T_OUT/orig/src/a.rs"; exit 1 ;;
   *EDIT*) printf '// an edit made during the run\n' >> src/a.rs; exit 1 ;;
   *SIGNAL*) for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$T_PID" ] && break; sleep 0.1; done
@@ -700,10 +700,15 @@ run_gate() {
     try=$((try + 1))
   done
 }
-# lost_verdict <run> — LOST-DAEMON plus the attach command. The id is the log's `job sNNN`.
+# lost_verdict <run> — LOST-DAEMON plus the attach command. The id is the log's `job sNNN`, or,
+# once the poller has given up, the id on `resume with: tools/boxq.py attach sNNN`.
 lost_verdict() {
   local id
   id=$(grep -oE 'job s[0-9]+' "$OUT/$1.log" | head -1 | cut -d' ' -f2)
+  if [ -z "$id" ]; then
+    id=$(grep -oE 'resume with: tools/boxq\.py attach s[0-9]+' "$OUT/$1.log" \
+      | head -1 | awk '{print $NF}')
+  fi
   if [ -n "$id" ]; then
     printf 'LOST-DAEMON python3 tools/boxq.py attach %s' "$id"
   else
