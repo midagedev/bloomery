@@ -165,13 +165,27 @@ pub const SEAT_STEPS: placement::ctx_ask::Steps = placement::ctx_ask::Steps {
 /// seat's own plan error.
 pub fn choose_ctx<P, E: Into<GateError> + std::fmt::Display>(
     file: &Split,
+    asked: (Option<usize>, usize),
+    bounds: SeatBounds,
+    plan_at: impl FnMut(u64) -> Result<placement::ctx_ask::Probe<P>, E>,
+) -> Result<placement::ctx_ask::Chosen<P>, GateError> {
+    choose_ctx_of(context_length(file)?, asked, bounds, plan_at)
+}
+
+/// [`choose_ctx`] for a seat that holds the file's trained context
+/// already (`trained`, its `context_length`).
+///
+/// # Errors
+/// As [`choose_ctx`].
+pub fn choose_ctx_of<P, E: Into<GateError> + std::fmt::Display>(
+    trained: u64,
     (set, slots): (Option<usize>, usize),
-    (kernel, verified): SeatBounds,
+    bounds: SeatBounds,
     plan_at: impl FnMut(u64) -> Result<placement::ctx_ask::Probe<P>, E>,
 ) -> Result<placement::ctx_ask::Chosen<P>, GateError> {
     use placement::ctx_ask::{Ask, AskError, Limit, choose};
     let share = set.and_then(|total| total.checked_div(slots));
-    let bounds = check_set_slot(file, share, (kernel, verified))?;
+    let bounds = check_share(trained, share, bounds)?;
     let ask = match set {
         Some(total) => Ask::Set {
             total: u64::try_from(total)?,
@@ -185,6 +199,23 @@ pub fn choose_ctx<P, E: Into<GateError> + std::fmt::Display>(
     })
 }
 
+/// A seat's boxed plan refusal read as a short memory
+/// ([`placement::ctx_ask::PlanRefusal::short`]): the family's error `E` when
+/// the box holds one, else a bare placement error's card reading; `None` when
+/// it is neither, or not short.
+#[must_use]
+pub fn short_in<E>(e: &GateError) -> Option<placement::ctx_ask::Short>
+where
+    E: placement::ctx_ask::PlanRefusal + std::error::Error + 'static,
+{
+    match e.downcast_ref::<E>() {
+        Some(family) => placement::ctx_ask::PlanRefusal::short(family),
+        None => e
+            .downcast_ref::<placement::PlacementError>()
+            .and_then(placement::PlacementError::card_short),
+    }
+}
+
 /// The model's limit for a seat ([`placement::ctx::CtxLimit`]): the file's
 /// trained context and the bounds the seat names (`kernel`, `verified`); a set
 /// `--ctx`'s share of one slot (`share`) past it stops the load by name before
@@ -196,11 +227,21 @@ pub fn choose_ctx<P, E: Into<GateError> + std::fmt::Display>(
 pub fn check_set_slot(
     file: &Split,
     share: Option<usize>,
+    bounds: SeatBounds,
+) -> Result<placement::ctx::CtxLimit, GateError> {
+    check_share(context_length(file)?, share, bounds)
+}
+
+/// [`check_set_slot`] for a seat that holds the file's trained context
+/// already (`trained`).
+///
+/// # Errors
+/// [`placement::ctx::PastLimit`].
+pub fn check_share(
+    trained: u64,
+    share: Option<usize>,
     (kernel, verified): SeatBounds,
 ) -> Result<placement::ctx::CtxLimit, GateError> {
-    let trained = file.arch_get_u64("context_length").ok_or(
-        "the file states no context_length, so the context cannot be held to the model's limit",
-    )?;
     let bounds = placement::ctx::CtxLimit {
         trained,
         kernel,
@@ -210,6 +251,14 @@ pub fn check_set_slot(
         placement::ctx::check_slot_ctx(u64::try_from(share)?, &bounds)?;
     }
     Ok(bounds)
+}
+
+/// The file's trained context (`<arch>.context_length`), refused by name when
+/// the file states none: no context can be held to it.
+fn context_length(file: &Split) -> Result<u64, GateError> {
+    Ok(file.arch_get_u64("context_length").ok_or(
+        "the file states no context_length, so the context cannot be held to the model's limit",
+    )?)
 }
 
 /// A family's input to the common unset-`--place` rule ([`Place::choose`]):

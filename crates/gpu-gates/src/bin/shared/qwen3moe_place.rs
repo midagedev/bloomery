@@ -40,7 +40,7 @@ use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::{Place, PlaceWhy, choose_ctx};
+use bloomery_gpu_gates::generate::{Place, PlaceWhy, choose_ctx, short_in};
 use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
@@ -51,7 +51,7 @@ use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
 use model::placement::accepts::{Program, routed_rule};
-use model::placement::ctx_ask::{Chosen, PlanRefusal, Probe};
+use model::placement::ctx_ask::{Chosen, Probe};
 use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
     self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
@@ -976,17 +976,7 @@ pub fn serve_choice(
     reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
 )]
 fn short_or(e: GateError) -> Result<Probe<ServeLoad>, GateError> {
-    let short = e
-        .downcast_ref::<q3::PlaceError>()
-        .and_then(PlanRefusal::short)
-        .or_else(|| {
-            e.downcast_ref::<q35::PlaceError>()
-                .and_then(PlanRefusal::short)
-        })
-        .or_else(|| {
-            e.downcast_ref::<PlacementError>()
-                .and_then(PlacementError::card_short)
-        });
+    let short = short_in::<q3::PlaceError>(&e).or_else(|| short_in::<q35::PlaceError>(&e));
     short.map(Probe::Short).ok_or(e)
 }
 
