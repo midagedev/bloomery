@@ -12,6 +12,7 @@
 # BLOOMERY_BOX_ENV for that item (values without spaces, commas or colons); `:ARGS` passed to the
 # recipe, word-split (shell quoting allowed). Env comes before ARGS, e.g.
 #   gate-gpu-ds41-prefill@BLOOMERY_PREFILL_GROUP=1:--cases 512 --no-split --no-extra
+# A BLOOMERY_* environment name needs a row of the lever registry (crates/levers/src/registry.rs).
 # --list FILE: one item per line (blank lines and `#` lines skipped), or the raw output of `just
 # affected …` (first line `affected:`, or just's echoed `./tools/affected-gates.sh …` line and then it): then
 # only lines starting with two spaces and `gate-` or `weekly-` (a weekly recipe a trigger named) count, the
@@ -624,11 +625,17 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # part is the cases between its `if gb_part K; then … fi` guards (contiguous in the file, a case group with the state it
 # builds on never split across parts), and runs the fixture, the helpers and the locals above and between them itself.
 # `--self-test` starts every part and sums their counts; `--self-test --part K` runs one (K, or `all`: the parts one
-# after another in this process, the serial form).
+# after another in this process, the serial form). The summary names the three slowest cases.
 SELFTEST_PARTS=17
 self_test() {
-  local self t h n=0 bad=0 out rc part=${1:-all}
-  gb_part() { [ "$part" = all ] || [ "$part" = "$1" ]; }
+  local self t h n=0 bad=0 out rc part=${1:-all} case_t0=$SECONDS
+  gb_part() {
+    if [ "$part" = all ] || [ "$part" = "$1" ]; then
+      case_t0=$SECONDS # the block's first case starts here, not at the previous part's shared setup
+      return 0
+    fi
+    return 1
+  }
   unset BLOOMERY_TIER # the tier of a case is the case's own
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   t=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-test.XXXXXX") || { echo "gate-batch: self-test: no temporary directory" >&2; return 70; }
@@ -639,6 +646,9 @@ self_test() {
   trap "rm -rf '$t' '$h'" EXIT
   mkdir -p "$t/tools"
   cp "$self" "$t/tools/gate-batch.sh"
+  # One justfile for every part. A recipe named by one part's cases can be appended inside that part
+  # alone: the other recipes keep their class, kind and cards, and the pack and marker checks still pass.
+  # It stays here — the cases are sleep-bound, and reading this file is not that wall.
   cat > "$t/justfile" << 'JF'
 [group('v41-load')]
 v41-any:
@@ -911,9 +921,15 @@ printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 100
 DF
   chmod +x "$t/fakebin/df"
   export PATH="$t/fakebin:$PATH"
-  pass() { n=$((n + 1)); echo "ok $1"; }
+  # Whole seconds since the previous case, or since this part's block opened. The name is the case's.
+  note_case() {
+    printf '%s\t%s\n' "$((SECONDS - case_t0))" "$1" >> "$t/case-times.tsv"
+    case_t0=$SECONDS
+  }
+  pass() { n=$((n + 1)); note_case "$1"; echo "ok $1"; }
   fail() {
     n=$((n + 1)) bad=$((bad + 1))
+    note_case "$1"
     echo "FAIL $1: ${2:-}"
     printf '%s\n' "$out" | sed 's/^/    | /'
   }
@@ -1161,22 +1177,22 @@ for k, it in enumerate(items):
             fh.write("stub\n")
 FP
   want() { # <name> <file> <ERE>: the file holds a matching line
-    n=$((n + 1))
+    n=$((n + 1)); note_case "$1"
     if [ -f "$2" ] && grep -Eq -- "$3" "$2"; then echo "ok $1"
     else bad=$((bad + 1)); echo "FAIL $1: no line matches /$3/ in $2"; fi
   }
   want_not() { # <name> <file> <ERE>: the file holds no matching line
-    n=$((n + 1))
+    n=$((n + 1)); note_case "$1"
     if [ -f "$2" ] && grep -Eq -- "$3" "$2"; then bad=$((bad + 1)); echo "FAIL $1: a line matches /$3/ in $2"
     else echo "ok $1"; fi
   }
   want_row() { # <name> <file> <awk program over $1 (env) and $2 (command)>: a row answers it
-    n=$((n + 1))
+    n=$((n + 1)); note_case "$1"
     if [ -f "$2" ] && [ -n "$(awk -F'\t' "$3" "$2")" ]; then echo "ok $1"
     else bad=$((bad + 1)); echo "FAIL $1: no row of $2 answers {$3}"; fi
   }
   want_no_row() { # <name> <file> <awk program>: no row answers it
-    n=$((n + 1))
+    n=$((n + 1)); note_case "$1"
     if [ -f "$2" ] && [ -n "$(awk -F'\t' "$3" "$2")" ]; then bad=$((bad + 1)); echo "FAIL $1: a row of $2 answers {$3}"
     else echo "ok $1"; fi
   }
@@ -1301,6 +1317,7 @@ FP
     sed "$expr" "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-$tag.sh"
     if grep -Eq -- "$proof" "$t/tools/gate-batch-$tag.sh"; then echo "mutant $tag: $expr"
     else bad=$((bad + 1)); echo "FAIL mutant $tag: the sed did not apply: $expr"; fi
+    note_case "mutant $tag"
   }
   # no_overlap <seq.log> <cmd-a> <cmd-b>: the two items' runs do not overlap — one's end line came before the other's start line
   # (the order the fake wrote them in, no clock); a batch's chain members run one at a time, so they never cross. A command with
@@ -1314,7 +1331,7 @@ FP
       $1 == "E" && $0 ~ (" " b "[ ]*$") { be = NR }
       $1 == "C" && ($0 ~ (" " a "[ ]*$") || $0 ~ (" " b "[ ]*$")) { print "  (a call was held to its AWAIT cap: its peer never started: " $0 ")" }
       END { if (as == "" || bs == "") exit 2; exit !((ae != "" && ae < bs) || (be != "" && be < as)) }' "$1" || arc=$?
-    [ "$arc" != 2 ] || { n=$((n + 1)) bad=$((bad + 1)); echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
+    [ "$arc" != 2 ] || { n=$((n + 1)); bad=$((bad + 1)); note_case "no_overlap: $2 $3"; echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
     return "$arc"
   }
   # ran_before <ran.log> <cmd-a> <cmd-b>: prints yes (a ended before b started), no, or absent (either never
@@ -1377,6 +1394,7 @@ FP
   else
     bad=$((bad + 1)); echo "FAIL chain mutant: members pinned to lane A never reach lane B (the batch waits without end): $(grep '^v41-any ' "$t/target/c-ch-lanebm/run.log" 2>&1 | tr '\n' ' ')"
   fi
+  note_case 'chain mutant: members pinned to lane A never reach lane B (the batch waits without end)'
   fi
   if gb_part 3; then
   # (3) the card rule: the pick member goes to lane B, the 3090-only one waits for lane A; no card
@@ -1671,7 +1689,7 @@ FP
   fi
   want_count() { # <name> <file> <ERE> <count>: exactly that many lines match
     local c=0
-    n=$((n + 1))
+    n=$((n + 1)); note_case "$1"
     if [ -f "$2" ]; then c=$(grep -Ec -- "$3" "$2" || true); fi
     if [ "$c" = "$4" ]; then echo "ok $1"
     else
@@ -1681,7 +1699,7 @@ FP
     fi
   }
   want_absent() { # <name> <path>: nothing is there
-    n=$((n + 1))
+    n=$((n + 1)); note_case "$1"
     if [ -e "$2" ]; then bad=$((bad + 1)); echo "FAIL $1: $2 exists"; else echo "ok $1"; fi
   }
   # The status board's events (tools/board/README.md). The ch-skip batch above is the fixture: its lanes ran two items and the ledger
@@ -1791,7 +1809,7 @@ FP
       $1 == "E" && $0 ~ (" " b "[ ]*$") { be = NR }
       $1 == "C" && ($0 ~ (" " a "[ ]*$") || $0 ~ (" " b "[ ]*$")) { print "  (a call was held to its AWAIT cap: its peer never started: " $0 ")" }
       END { if (as == "" || bs == "") exit 2; exit !((ae == "" || bs < ae) && (be == "" || as < be)) }' "$1" || arc=$?
-    [ "$arc" != 2 ] || { n=$((n + 1)) bad=$((bad + 1)); echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
+    [ "$arc" != 2 ] || { n=$((n + 1)); bad=$((bad + 1)); note_case "overlap: $2 $3"; echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
     return "$arc"
   }
   ivals() { # <seq.log> <cmd-a> <cmd-b>: the two items' seq.log lines (S start, E end, command), a red's detail
@@ -2059,6 +2077,7 @@ FP
   n=$((n + 1))
   if [ "$(grep -c . "$t/fake-state/keycalls.log")" -ge 2 ] && ! grep -qv 'BLOOMERY_TIER=fixture' "$t/fake-state/keycalls.log"; then echo 'ok tier run: the plan'"'"'s key call and the recheck both carry the tier'
   else bad=$((bad + 1)); echo "FAIL tier run: a key call lacks the tier: $(cat "$t/fake-state/keycalls.log" 2>&1)"; fi
+  note_case 'tier run: the plan'"'"'s key call and the recheck both carry the tier'
   # A fixture batch whose gates left nothing to the real tier (none is converted yet) still ends green, its total 0.
   rc=$(steal_case tier-f0 "steal-bal	B	a6000	10	$d" -- --tier fixture steal-bal)
   printf '%s' "$rc" > "$t/rc-tier-f0"
@@ -2144,6 +2163,7 @@ FP
   if [ "$(grep -v '^#' "$t/target/c-fo-re/deferred.list" | paste -sd, -)" = 'fo-any,fo-solo' ] && grep -q '^# fixture-only: ' "$t/target/c-fo-re/deferred.list" \
     && grep -q '^# gate-batch: the 2 item(s) it deferred to a fixture-tier batch' "$t/target/c-fo-re/deferred.list"; then echo 'ok fixture-only run: DIR/deferred.list holds the two items, with the comment of the kind'
   else bad=$((bad + 1)); echo "FAIL fixture-only run: DIR/deferred.list: $(cat "$t/target/c-fo-re/deferred.list" 2>&1)"; fi
+  note_case 'fixture-only run: DIR/deferred.list holds the two items, with the comment of the kind'
   check 'fixture-only run: a fixture batch takes exactly that list (both items placed)' 0 '^lane [AB]  fo-any ' "${gb[@]}" --tier fixture --dry-run --list "$t/target/c-fo-re/deferred.list"
   check '  … the solo one alone in lane X' 0 '^lane X  fo-solo ' "${gb[@]}" --tier fixture --dry-run --list "$t/target/c-fo-re/deferred.list"
   rc=$(steal_case fo-all "steal-bal	B	a6000	10	$d" -- fo-any fo-solo)
@@ -2190,6 +2210,7 @@ FP
   if [ "$(grep -v '^#' "$t/target/c-nf-fx/deferred.list" | paste -sd, -)" = 'ro-any,x-glm' ] && grep -q '^# real-only: ' "$t/target/c-nf-fx/deferred.list" \
     && grep -q '^# no-fixture: ' "$t/target/c-nf-fx/deferred.list"; then echo 'ok no-fixture run: DIR/deferred.list holds the two items, real-only first, with a comment for each kind'
   else bad=$((bad + 1)); echo "FAIL no-fixture run: DIR/deferred.list: $(cat "$t/target/c-nf-fx/deferred.list" 2>&1)"; fi
+  note_case 'no-fixture run: DIR/deferred.list holds the two items, real-only first, with a comment for each kind'
   check 'no-fixture run: a real-tier batch takes exactly that list (both items placed as usual)' 0 '^lane X  x-glm ' "${gb[@]}" --dry-run --list "$t/target/c-nf-fx/deferred.list"
   out=$("${gb[@]}" --dry-run --list "$t/target/c-nf-fx/deferred.list" 2>&1) || fail 'no-fixture run: the real dry run of the list failed' "$out"
   if grep -q '^lane [AB]  ro-any ' <<< "$out" && grep -q 'dry run — 2 items,' <<< "$out"; then pass 'no-fixture run: … two items, none deferred'
@@ -2342,12 +2363,14 @@ FP
   n=$((n + 1))
   if [ "$(cat "$t/fake-state/opens.log" 2> /dev/null)" = 'rf-def rf-none rf-q3 steal-bal' ]; then echo 'ok real-file: one opens call for the batch, over the self-family recipes the earlier kinds leave'
   else bad=$((bad + 1)); echo "FAIL real-file: opens calls: $(cat "$t/fake-state/opens.log" 2>&1)"; fi
+  note_case 'real-file: one opens call for the batch, over the self-family recipes the earlier kinds leave'
   rm -f "$t/fake-state/opens.log"
   out=$("${gb[@]}" --dry-run rf-q3 rf-def steal-bal 2>&1) || fail 'real-file: the real dry run failed' "$out"
   "${gb[@]}" --classes > /dev/null 2>&1 || fail 'real-file: the real --classes failed' ''
   n=$((n + 1))
   if [ ! -e "$t/fake-state/opens.log" ]; then echo 'ok real-file: in the real tier opens is never called'
   else bad=$((bad + 1)); echo "FAIL real-file: the real tier called opens: $(cat "$t/fake-state/opens.log")"; fi
+  note_case 'real-file: in the real tier opens is never called'
   check 'real-file: an opens call that fails is a named error in the fixture tier, 65' 65 'tools/recipes\.py opens failed \(exit 1\) for [0-9]+ recipe\(s\); nothing ran: fake opens: refused' \
     env FAKE_OPENS_RC=1 "${gb[@]}" --tier fixture --classes
   check '  … a dry run too' 65 'tools/recipes\.py opens failed \(exit 1\)' env FAKE_OPENS_RC=1 "${gb[@]}" --tier fixture --dry-run rf-def steal-bal
@@ -2363,6 +2386,7 @@ FP
   if [ "$rc" = 65 ] && grep -q 'tools/recipes.py opens failed' "$t/out-rf-bad.log" && [ ! -s "$t/fake-state/box.log" ] && [ ! -e "$t/target/c-rf-bad/run.log" ]; then
     echo 'ok real-file run: a failed opens ends the batch with 65 before anything ran (no box call, no run.log)'
   else bad=$((bad + 1)); echo "FAIL real-file run: a failed opens: rc=$rc $(tail -2 "$t/out-rf-bad.log" 2>&1)"; fi
+  note_case 'real-file run: a failed opens ends the batch with 65 before anything ran (no box call, no run.log)'
   rc=$(steal_case rf-fx "steal-bal	B	a6000	10	$d" -- --tier fixture ro-any x-glm rf-def steal-bal)
   printf '%s' "$rc" > "$t/rc-rf-fx"
   rc_ok 'real-file run: a fixture batch with a real-file item beside the other kinds ends green' rf-fx 4
@@ -2379,6 +2403,7 @@ FP
     && [ "$(grep -n '^# real-file: ' "$t/target/c-rf-fx/deferred.list" | cut -d: -f1)" -gt "$(grep -n '^x-glm$' "$t/target/c-rf-fx/deferred.list" | cut -d: -f1)" ]; then
     echo 'ok real-file run: DIR/deferred.list holds the three items, real-file in a third section after no-fixture, with its own comment'
   else bad=$((bad + 1)); echo "FAIL real-file run: DIR/deferred.list: $(cat "$t/target/c-rf-fx/deferred.list" 2>&1)"; fi
+  note_case 'real-file run: DIR/deferred.list holds the three items, real-file in a third section after no-fixture, with its own comment'
   rm -f "$t/fake-state/opens.log"
   out=$("${gb[@]}" --dry-run --list "$t/target/c-rf-fx/deferred.list" 2>&1) || fail 'real-file run: the real dry run of the list failed' "$out"
   if grep -q '^lane [AB]  rf-def ' <<< "$out" && grep -q '^lane X  x-glm ' <<< "$out" && grep -q 'dry run — 3 items,' <<< "$out" && [ ! -e "$t/fake-state/opens.log" ]; then
@@ -2476,6 +2501,7 @@ IG
   if [ "$rc" = 65 ] && grep -q 'recipe ig-guard: a box.sh command holds an inline tier guard' "$t/out-ig-run.log" && [ ! -s "$t/fake-state/box.log" ] && [ ! -e "$t/target/c-ig-run/run.log" ]; then
     echo 'ok inline guard: a batch run ends with 65 before anything ran (no box call, no run.log)'
   else bad=$((bad + 1)); echo "FAIL inline guard: a batch run: rc=$rc $(tail -2 "$t/out-ig-run.log" 2>&1)"; fi
+  note_case 'inline guard: a batch run ends with 65 before anything ran (no box call, no run.log)'
   cp "$t/justfile.good" "$t/justfile"
   cat >> "$t/justfile" << 'IG'
 
@@ -3048,6 +3074,7 @@ EOS
   if awk '/^P$/ { lastp = NR } /^S python3 tools\/recipes\.py box-manifest/ && !first { first = NR } END { exit !(lastp && first && lastp < first) }' "$t/fake-state/seq.log"; then
     echo 'ok wait-hold: … every poll came before the first box call of the batch (the ledger'"'"'s manifest read)'
   else bad=$((bad + 1)); echo "FAIL wait-hold: a poll came after the manifest read: $(tr '\n' ' ' < "$t/fake-state/seq.log")"; fi
+  note_case 'wait-hold: … every poll came before the first box call of the batch (the ledger'"'"'s manifest read)'
   rc=$(GBFAST=1 steal_case wh-now "plain-any	B	a6000	10	$d" -- --wait-hold 30 plain-any)
   printf '%s' "$rc" > "$t/rc-wh-now"
   rc_ok 'wait-hold: an idle box ends green' wh-now 1
@@ -3071,8 +3098,30 @@ EOS
   if [ "$rc" = 70 ]; then pass 'wait-hold: a lease that cannot be tested: rc 70'; else fail 'wait-hold: a lease that cannot be tested: rc 70' "rc=$rc"; fi
   want 'wait-hold: … named' "$t/out-wh-70.log" '^gate-batch: the wait probe through box.sh failed \(rc 70; '
   fi
+  # One row per case (seconds, then the name). A miss is a case the summary cannot name.
+  [ -f "$t/case-times.tsv" ] || : > "$t/case-times.tsv"
+  local times
+  times=$(wc -l < "$t/case-times.tsv")
+  times=${times//[[:space:]]/}
+  if [ "$times" != "$n" ]; then
+    echo "gate-batch: self-test: $times case times for $n cases" >&2
+    return 70
+  fi
+  # The parent collects the rows: this part's tree is removed on exit. A direct --part prints them here.
+  # The channel is not a BLOOMERY_* name; every such name is a row of the lever registry.
+  if [ -n "${GATE_BATCH_CASE_DIR:-}" ]; then
+    cp "$t/case-times.tsv" "$GATE_BATCH_CASE_DIR/$part.cases" \
+      || { echo "gate-batch: self-test: cannot record case times" >&2; return 70; }
+  else
+    echo "gate-batch self-test: slowest cases: $(case_slowest "$t/case-times.tsv")"
+  fi
   echo "gate-batch self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
+}
+
+# The three slowest rows (seconds<TAB>name) as "name N s, …".
+case_slowest() {
+  sort -t$'\t' -k1,1nr "$@" | awk -F '\t' 'NR <= 3 { printf "%s%s %s s", (NR > 1 ? ", " : ""), $2, $1 }'
 }
 
 
@@ -3091,8 +3140,10 @@ self_test_parts() {
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-parts.XXXXXX") || { echo "gate-batch: self-test: no temporary directory" >&2; return 70; }
   # shellcheck disable=SC2064 # the path is fixed now
   trap "rm -rf '$tmp'" EXIT
+  # Each part copies its case rows out before its tree goes. Not a BLOOMERY_* name: every such name
+  # is a row of the lever registry.
   for ((k = 1; k <= SELFTEST_PARTS; k++)); do
-    ( set +e; s0=$SECONDS; bash "$self" --self-test --part "$k" > "$tmp/$k.out" 2>&1; echo $? > "$tmp/$k.rc"; echo $((SECONDS - s0)) > "$tmp/$k.s" ) &
+    ( set +e; GATE_BATCH_CASE_DIR=$tmp bash "$self" --self-test --part "$k" > "$tmp/$k.out" 2>&1; echo $? > "$tmp/$k.rc" ) &
   done
   wait
   for ((k = 1; k <= SELFTEST_PARTS; k++)); do
@@ -3108,8 +3159,13 @@ self_test_parts() {
     fi
     [ "$(cat "$tmp/$k.rc" 2> /dev/null)" = 0 ] || { red=1; echo "gate-batch self-test: part $k ended rc $(cat "$tmp/$k.rc" 2> /dev/null || echo none)"; }
   done
-  slowest=$(for ((k = 1; k <= SELFTEST_PARTS; k++)); do echo "$(cat "$tmp/$k.s" 2> /dev/null || echo 0) part $k"; done | sort -rn | awk 'NR <= 3 {printf "%s%s %s %s s", (NR > 1 ? ", " : ""), $2, $3, $1}')
-  echo "gate-batch self-test: slowest parts: $slowest"
+  slowest=$(
+    shopt -s nullglob
+    files=("$tmp"/*.cases)
+    [ ${#files[@]} -gt 0 ] || exit 0
+    case_slowest "${files[@]}"
+  )
+  echo "gate-batch self-test: slowest cases: $slowest"
   echo "gate-batch self-test: $ok of $total ok"
   [ "$red" = 0 ]
 }
