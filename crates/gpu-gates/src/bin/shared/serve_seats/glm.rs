@@ -253,7 +253,6 @@ use bloomery_gpu_gates::bind::{
     parallel_line, placement_of, put_back, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
-use bloomery_gpu_gates::plan_lane::probed_unless_plan;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::residency38::{
@@ -877,7 +876,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     chosen.record().eprint();
     // The lane's rate, taken before the plan reads the room (`lane_of`).
     // `--plan` returns before any card is opened, so it probes no lane.
-    let lane = probed_unless_plan(a.plan_only, || lane_at(chosen.place))?;
+    let lane = if a.plan_only {
+        None
+    } else {
+        Some(lane_at(chosen.place)?)
+    };
     // An unset draft yields when the plain load serves more positions.
     // A set context can yield if only its plain plan holds; a set draft never yields.
     // The selected placement and slot count stay fixed.

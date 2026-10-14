@@ -37,7 +37,6 @@ pub mod model_file;
 #[cfg(feature = "gpu")]
 pub mod nodes;
 pub mod oracle;
-pub mod plan_lane;
 pub mod prompts;
 pub mod ptx;
 pub mod q36_fixture;
