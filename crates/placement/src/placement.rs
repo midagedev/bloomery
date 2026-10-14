@@ -344,9 +344,19 @@ impl Machine {
     }
 }
 
-/// An architecture's KV cache size: the bytes `layer` holds at `ctx_max` tokens.
+/// An architecture's context-sized bytes: the cache `layer` holds at
+/// `ctx_max` tokens, and what a stage keeps beside it.
 pub trait KvBytes {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64;
+    /// Bytes the stage that runs layer 0 holds at `ctx_max` positions beside
+    /// its cache, one copy for every resident sequence: the rope rows its
+    /// body copies to the card, one row a position (`gpu::rope_table::RopeRows`).
+    /// The plan counts them on that card ([`CardTotals::stage_rows_bytes`]).
+    /// The default is none.
+    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        let _ = ctx_max;
+        0
+    }
     /// Bytes beside the cache that `layer` keeps so the cache can be cut back:
     /// a copy of a ring that overwrites its rows, in page-locked host memory
     /// the card writes. The plan counts them on the host
@@ -869,13 +879,16 @@ pub struct CardTotals {
     pub experts: u64,
     /// The cache ([`KvBytes::layer_bytes`]).
     pub kv_bytes: u64,
+    /// The rows the stage keeps a position beside its cache, on the card that
+    /// runs layer 0 ([`KvBytes::stage_position_bytes`]); 0 on every other.
+    pub stage_rows_bytes: u64,
     pub scratch_bytes: u64,
     pub context_bytes: u64,
     /// The card's reserves ([`Card::reserves`]).
     pub reserve_bytes: u64,
-    /// usable − dense − experts − rounding − KV − scratch − context −
-    /// reserves, usable capped by the plan's card budget; the margin is
-    /// inside it.
+    /// usable − dense − experts − rounding − KV − stage rows − scratch −
+    /// context − reserves, usable capped by the plan's card budget; the
+    /// margin is inside it.
     pub headroom_bytes: i128,
 }
 
@@ -2222,7 +2235,7 @@ fn plan_rule<'a>(
     let none_held = vec![0u64; model.layers];
     let mut kv_bytes = Vec::with_capacity(machine.cards.len() + machine.tiers.len());
     for (c, card) in machine.cards.iter().enumerate() {
-        let (kv_card, shadow) = card_kv(card, kv, ctx_max);
+        let (kv_card, shadow, stage_rows) = card_kv(card, kv, ctx_max);
         let eligible = match routed {
             Some(r) => eligible(card.layers.clone(), &stacks, model, r)?,
             None => Vec::new(),
@@ -2235,15 +2248,15 @@ fn plan_rule<'a>(
             eligible: &eligible,
             routed,
             card_budget,
-            kv: kv_card,
+            kv: kv_card + stage_rows,
             reserve,
         };
         fill.run(&mut n_l, &none_held)?;
-        kv_bytes.push((kv_card, shadow));
+        kv_bytes.push((kv_card, shadow, stage_rows));
     }
     let mut tier_n_l: Vec<Vec<u64>> = Vec::with_capacity(machine.tiers.len());
     for (t, tier) in machine.tiers.iter().enumerate() {
-        let (kv_tier, shadow) = card_kv(tier, kv, ctx_max);
+        let (kv_tier, shadow, _) = card_kv(tier, kv, ctx_max);
         let mut held = n_l.clone();
         for prev in &tier_n_l {
             for (h, p) in held.iter_mut().zip(prev) {
@@ -2279,7 +2292,7 @@ fn plan_rule<'a>(
             });
         }
         tier_n_l.push(own);
-        kv_bytes.push((kv_tier, shadow));
+        kv_bytes.push((kv_tier, shadow, 0));
     }
     for (l, layer_stacks) in stacks.iter().enumerate() {
         if layer_stacks.is_empty() {
@@ -2326,9 +2339,10 @@ fn plan_rule<'a>(
     Ok(plan)
 }
 
-/// A card's KV cache and its ring shadows over the layers its stage runs;
+/// A card's KV cache and its ring shadows over the layers its stage runs,
+/// and the stage's rows beside the cache on the card that runs layer 0;
 /// none on a tier.
-fn card_kv(card: &Card, kv: &dyn KvBytes, ctx_max: u64) -> (u64, u64) {
+fn card_kv(card: &Card, kv: &dyn KvBytes, ctx_max: u64) -> (u64, u64, u64) {
     let kv_card = card
         .layers
         .clone()
@@ -2339,7 +2353,12 @@ fn card_kv(card: &Card, kv: &dyn KvBytes, ctx_max: u64) -> (u64, u64) {
         .clone()
         .map(|l| kv.shadow_bytes(l, ctx_max))
         .sum();
-    (kv_card, shadow)
+    let rows = if card.layers.contains(&0) {
+        kv.stage_position_bytes(ctx_max)
+    } else {
+        0
+    };
+    (kv_card, shadow, rows)
 }
 
 /// Refuse a tier card that says it runs a stage.
@@ -3465,14 +3484,15 @@ pub fn plan_in_pool<'a>(
 }
 
 /// The per-device sums of a finished set of rows; `kv_bytes` is, per card of
-/// [`Machine::all_cards`], its layers' cache and their ring shadows, which
-/// the host holds; `counts` the stage cards' `n_l` and the tiers'.
+/// [`Machine::all_cards`], its layers' cache, their ring shadows, which the
+/// host holds, and the stage's rows beside the cache; `counts` the stage
+/// cards' `n_l` and the tiers'.
 fn totals<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
     ctx_max: u64,
     rows: Vec<Row>,
-    kv_bytes: &[(u64, u64)],
+    kv_bytes: &[(u64, u64, u64)],
     counts: (Vec<u64>, Vec<Vec<u64>>),
     card_budget: Option<u64>,
 ) -> Plan<'a> {
@@ -3526,8 +3546,8 @@ fn totals<'a>(
         .enumerate()
         .map(|(c, (card, heap))| {
             let rounding = heap.taken - (card_dense[c] + card_experts[c]);
-            let (kv, _) = kv_bytes[c];
-            let used = heap.taken + kv + card.set_aside_bytes();
+            let (kv, _, stage_rows) = kv_bytes[c];
+            let used = heap.taken + kv + stage_rows + card.set_aside_bytes();
             pool_cards += used + card.margin_bytes - card.context_in_free();
             CardTotals {
                 dense_bytes: card_dense[c],
@@ -3535,6 +3555,7 @@ fn totals<'a>(
                 rounding_bytes: rounding,
                 experts: held(c, card),
                 kv_bytes: kv,
+                stage_rows_bytes: stage_rows,
                 scratch_bytes: card.scratch_bytes,
                 context_bytes: card.context_bytes,
                 reserve_bytes: card.reserve_bytes(),
@@ -3545,7 +3566,7 @@ fn totals<'a>(
     let row_reserve = row_cache_reserve(model, &rows);
     let reserve_bytes: u64 =
         machine.host().reserves.iter().map(|(_, b)| b).sum::<u64>() + row_reserve;
-    let shadow_bytes: u64 = kv_bytes.iter().map(|&(_, shadow)| shadow).sum();
+    let shadow_bytes: u64 = kv_bytes.iter().map(|&(_, shadow, _)| shadow).sum();
     let mut host = HostTotals {
         expert_bytes: host_experts,
         experts: (0..model.layers)
@@ -3600,10 +3621,10 @@ pub struct PoolNeed {
     pub pool: u64,
 }
 
-/// `card`'s total against usable − margin: its uploads' granules, its KV
-/// and its set-aside.
+/// `card`'s total against usable − margin: its uploads' granules, its KV,
+/// its stage rows and its set-aside.
 fn card_total(card: &Card, totals: &CardTotals, heap: &Heap) -> u64 {
-    heap.taken + totals.kv_bytes + card.set_aside_bytes()
+    heap.taken + totals.kv_bytes + totals.stage_rows_bytes + card.set_aside_bytes()
 }
 
 impl Plan<'_> {

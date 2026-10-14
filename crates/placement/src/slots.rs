@@ -139,6 +139,11 @@ impl KvBytes for SlotsOf<'_> {
             .shadow_bytes(layer, ctx_max)
             .saturating_mul(self.slots)
     }
+
+    /// One copy for every slot: the slots read one stage's rows.
+    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        self.kv.stage_position_bytes(ctx_max)
+    }
 }
 
 /// Why `total` positions do not split across `slots` slots ([`split_ctx`]),

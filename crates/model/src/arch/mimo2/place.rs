@@ -35,6 +35,8 @@ use crate::placement::{
 };
 
 const F16_BYTES: u64 = 2;
+/// Bytes of an f32: a rope row's value.
+const F32_BYTES: u64 = 4;
 
 /// The routed stacks the card experts read, each as the file stores it
 /// ([`CardFormat::KQuant`]): the types the common card leg runs
@@ -348,6 +350,12 @@ pub struct KvLayout {
     row: u64,
     /// Which row count a window layer uses.
     rows: Rows,
+    /// The rope rows the body copies to its card, in bytes a position: one
+    /// table of `rope.dimension_count` f32 values a position for each
+    /// distinct rope base the trunk's layers turn by (the full layers' and,
+    /// when it differs, the window layers'), as `gpu-mimo2`'s body builds
+    /// them (`RopeBase`, deduplicated by base).
+    rope_row: u64,
 }
 
 impl KvLayout {
@@ -372,6 +380,7 @@ impl KvLayout {
                 .collect(),
             row: (hp.head_k + hp.head_v) as u64 * F16_BYTES,
             rows,
+            rope_row: rope_bases(hp) * hp.rope_dims as u64 * F32_BYTES,
         }
     }
 
@@ -394,11 +403,32 @@ impl KvLayout {
     }
 }
 
+/// The distinct rope bases the trunk's layers turn by: the full layers'
+/// base when a full layer is in the trunk, the window layers' when a window
+/// layer is and it differs.
+fn rope_bases(hp: &Hparams) -> u64 {
+    let mut bases: Vec<u32> = Vec::new();
+    for k in &hp.kinds[..hp.n_trunk] {
+        let base = match k {
+            Kind::Full => hp.rope_base,
+            Kind::Swa => hp.rope_base_swa,
+        };
+        if !bases.contains(&base.to_bits()) {
+            bases.push(base.to_bits());
+        }
+    }
+    bases.len() as u64
+}
+
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         self.kv_heads
             .get(layer)
             .map_or(0, |&kv| self.rows_at(layer, ctx_max) * kv as u64 * self.row)
+    }
+
+    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        self.rope_row * ctx_max
     }
 }
 
@@ -428,6 +458,7 @@ mod tests {
             windows: vec![None, Some(8), Some(8), None],
             row: (16 + 8) as u64 * F16_BYTES,
             rows,
+            rope_row: 2 * 64 * 4,
         }
     }
 
@@ -512,6 +543,7 @@ mod tests {
             windows: windows.clone(),
             row,
             rows,
+            rope_row: 0,
         };
         let plane = layout(Rows::Plane);
         let ring = layout(Rows::Ring);
@@ -682,6 +714,48 @@ mod tests {
                 _ => (k, v),
             })
             .collect()
+    }
+
+    /// The stage's rope rows: one table a distinct rope base the trunk turns
+    /// by, `rope.dimension_count` f32 values a position, as the body copies
+    /// them to its card. The small header's full and window bases differ (two
+    /// tables of 4 values: 32 B a position); one base for both is one table.
+    /// The plan counts them on the card that runs layer 0, at the plan's
+    /// positions. FAIL-first: a layout that counts no row leaves the card's
+    /// `stage_rows_bytes` at 0 and the load's scratch check refuses a context
+    /// whose rope tables pass the fixed scratch term.
+    #[test]
+    fn the_stage_rope_rows_are_a_table_a_base() {
+        let describe = |tag: &str, kv: &[(&'static str, V)]| {
+            let global = [
+                ("tokenizer.ggml.pre", V::Str("qwen2")),
+                ("tokenizer.chat_template", V::Str("{{ messages }}")),
+            ];
+            let path = header_shaped(tag, "mimo2", kv, &global, &tensors());
+            let split = Split::open(&path).expect("the synthetic header opens");
+            let inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
+            let _ = std::fs::remove_file(&path);
+            inputs
+        };
+        let two = describe("mimo2-rope-two", &keys());
+        assert_eq!(
+            KvLayout::of(&two.hp).stage_position_bytes(10),
+            2 * 4 * 4 * 10
+        );
+        let one_base: Vec<_> = keys()
+            .into_iter()
+            .map(|(k, v)| match k {
+                "rope.freq_base_swa" => (k, V::F32(1e7)),
+                _ => (k, v),
+            })
+            .collect();
+        let one = describe("mimo2-rope-one", &one_base);
+        assert_eq!(KvLayout::of(&one.hp).stage_position_bytes(10), 4 * 4 * 10);
+        let machine = workstation::plan_gate(two.hp.n_trunk);
+        let plan = two
+            .plan(&machine, 1024, &PlanLevers::default())
+            .expect("the small header plans at 1,024");
+        assert_eq!(plan.cards[0].stage_rows_bytes, 32 * 1024);
     }
 
     /// [`PlanInputs::read`] of a synthetic header, or its error's text.

@@ -91,7 +91,7 @@ use bloomery_gpu::kpool::{self, KpoolKernels};
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, LatentKernels, POOL, pools_for};
 use bloomery_gpu::linear::{self, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
 use bloomery_gpu::model::{
-    ChainBody, HostServed, Rollback, SlotRange, Slots, StepKernels, StepMode,
+    ChainBody, HostServed, Rollback, SlotRange, Slots, StepKernels, StepMode, refuse_scratch_past,
 };
 use bloomery_gpu::qsa::{QsaKernels, list_width};
 use bloomery_gpu::weights::{DevWeight, Weights};
@@ -1158,27 +1158,6 @@ fn refuse_other_lanes(
     Ok(())
 }
 
-/// Refused by name when the load's scratch, `made` device bytes
-/// ([`Body::scratch_bytes`]), passes what card `card` of `plan` sets aside
-/// for it (the card's `scratch_bytes` term): the plan counts those bytes by
-/// that term alone, no formula of the body's, so the load holds them to it.
-fn refuse_scratch_past(plan: &Plan<'_>, card: usize, made: usize) -> Result<(), GpuError> {
-    let term = plan
-        .machine
-        .cards
-        .get(card)
-        .map(|c| c.scratch_bytes)
-        .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
-    if made as u64 > term {
-        return Err(shape(format!(
-            "the load's scratch holds {made} device bytes (the rows in flight, the card \
-             experts' rows, the host boundary, the slot map's copy); card {card}'s plan sets \
-             aside {term} for it"
-        )));
-    }
-    Ok(())
-}
-
 /// Refused by name, before anything uploads, unless the expert tier cards
 /// `tiers` of `plan` are ones this load hangs: at most the cards the host
 /// tier serves ([`refuse_tier_count`]), and a slot map over the host run
@@ -1792,7 +1771,13 @@ impl Body {
         };
         body.s.lane.copy_from_host(stream, &lane)?;
         stream.synchronize()?;
-        refuse_scratch_past(plan, card, body.scratch_bytes())?;
+        refuse_scratch_past(
+            WHAT,
+            plan,
+            card,
+            body.scratch_bytes(),
+            "the rows in flight, the card experts' rows, the host boundary, the slot map's copy",
+        )?;
         if let Some((np, ni, block)) = nextn {
             let layer = nextn::Nextn::open(
                 gpu,

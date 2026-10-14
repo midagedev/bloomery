@@ -1910,10 +1910,12 @@ fn placed_pre(
 }
 
 /// Refused by name, as `what`'s, when the load's scratch, `made` device
-/// bytes, passes what card `card` of `plan` sets aside for it (the card's
-/// `scratch_bytes` term): the plan counts those bytes by that term alone, no
-/// formula of the body's, so the load holds them to it. `parts` names what
-/// the body's scratch holds, for the message.
+/// bytes, passes what card `card` of `plan` sets aside for it: the card's
+/// `scratch_bytes` term and the stage's position rows the plan counts on that
+/// card (`CardTotals::stage_rows_bytes`, the rope tables at the context). The
+/// plan counts those bytes by those terms alone, no formula of the body's, so
+/// the load holds them to it. `parts` names what the body's scratch holds, for
+/// the message.
 pub fn refuse_scratch_past(
     what: &'static str,
     plan: &Plan<'_>,
@@ -1927,12 +1929,18 @@ pub fn refuse_scratch_past(
         .get(card)
         .map(|c| c.scratch_bytes)
         .ok_or_else(|| GpuError::shape(what, format!("the plan has no card {card}")))?;
+    let rows = plan
+        .cards
+        .get(card)
+        .map(|c| c.stage_rows_bytes)
+        .ok_or_else(|| GpuError::shape(what, format!("the plan totals no card {card}")))?;
+    let term = term + rows;
     if made as u64 > term {
         return Err(GpuError::shape(
             what,
             format!(
                 "the load's scratch holds {made} device bytes ({parts}); card {card}'s plan \
-                 sets aside {term} for it"
+                 sets aside {term} for it ({rows} of them the stage's position rows)"
             ),
         ));
     }

@@ -101,6 +101,16 @@
 //!   (`plan_with_slots` at one, over a slot's share) loads and is still
 //!   running at the bound; the refusal half is red.
 //!
+//! One server as a user starts it, before the child:
+//!
+//! - `default_load_listens`: `--port 0` and no other flag, no lever pinned,
+//!   on the census the recipe gives. It loads and listens, and its `load` and
+//!   `listening` records name the `ctx` its one `ctx` line names: the default
+//!   the plan chose is the context the load made. FAIL-first: a load scratch
+//!   check that does not count the stage's position rows the plan counts (the
+//!   rope tables at the default context) refuses the load, and the clause is
+//!   red.
+//!
 //! One server, `--ctx` [`CTX`], `--parallel 1`, `--port 0`, its answers the one
 //! slot's. It plans at the gate card's bytes: `BLOOMERY_CARD_BUDGET` is
 //! [`gate_budget`] (`RTX_3090`'s usable bytes), so on the A6000 it holds the
@@ -803,6 +813,40 @@ mod gate {
                 ctx_line: line.to_owned(),
                 ctx_max,
             }))
+    }
+
+    /// `default_load_listens` (the module header).
+    fn default_load_listens(dir: &Path, file: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let pins = Pins {
+            residency: None,
+            ..OFF
+        };
+        let (mut s, d) = spawn_levered(dir, "default", file, &["--port", "0"], pins)?;
+        let err_log = d.join("server.err");
+        let listened = s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1));
+        let text = std::fs::read_to_string(&err_log).unwrap_or_default();
+        let Ok(addr) = listened else {
+            println!("default: the server never listened; server stderr:\n{text}");
+            check(ok, "default_load_listens", false);
+            return Ok(());
+        };
+        let records = server_log(&err_log, record::BLOOMERY_SERVE_MIMO2)?;
+        let load = records.one(&record::LOAD_MIMO2)?;
+        let listen = records.one(&record::LISTENING_MIMO2)?;
+        let named = ctx_line(&text).and_then(|l| field(l, "ctx"));
+        println!(
+            "default at {addr}: ctx line {:?}; load record {:?}; listening record {:?}; {}",
+            ctx_line(&text),
+            load.line(),
+            listen.line(),
+            s.stop()?
+        );
+        check(
+            ok,
+            "default_load_listens",
+            named.is_some() && named == Some(load.u64("ctx")?) && named == Some(listen.u64("ctx")?),
+        );
+        Ok(())
     }
 
     /// The host bytes the seat's plan of `file` needs at `slot_ctx` positions
@@ -1644,7 +1688,7 @@ mod gate {
             println!(
                 "plan_only_names_its_default, host_room_halves_the_default, \
                  residency_default_is_the_machine, refusals_before_any_load, \
-                 slots_total_is_planned: run by the parent of this child"
+                 slots_total_is_planned, default_load_listens: run by the parent of this child"
             );
             after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
         } else {
@@ -1653,6 +1697,7 @@ mod gate {
             residency_default_is_the_machine(&a.dir, &file, &mut ok)?;
             refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
             slots_total_is_planned(&a.dir, &file, &mut ok)?;
+            default_load_listens(&a.dir, &file, &mut ok)?;
             if cards >= 2 {
                 child_clauses(&a.dir, &mut ok)?;
             } else {
