@@ -301,6 +301,32 @@ pub fn beside(name: &str) -> Result<PathBuf, GateError> {
     Ok(std::env::current_exe()?.with_file_name(name))
 }
 
+/// One `--plan` run of a seat: `cmd` (its binary and environment) with
+/// `args`, then `--plan`; stdin and stdout closed, stderr to `err`. Under
+/// `--plan` a seat prints the lines its decisions before the load make and
+/// exits before it opens a card, so the run needs no stop. Its exit status
+/// and its stderr's lines.
+pub fn plan_run(
+    mut cmd: Command,
+    args: &[&str],
+    err: &Path,
+) -> Result<(std::process::ExitStatus, Vec<String>), GateError> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let status = cmd
+        .args(args)
+        .arg("--plan")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(File::create(err)?)
+        .status()
+        .map_err(|e| format!("spawn {program}: {e}"))?;
+    let lines = std::fs::read_to_string(err)?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    Ok((status, lines))
+}
+
 /// `bloomery-serve` beside the running binary, `BLOOMERY_REF_MODEL` removed
 /// from its environment: the file is named once, by `-m`.
 pub fn serve_cmd() -> Result<Command, GateError> {

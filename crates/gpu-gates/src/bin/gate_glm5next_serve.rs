@@ -306,7 +306,7 @@ mod gate {
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
         self, PrefixRestore, agree, base64, beside, check, completion, curl, ids_of, json_of,
-        metric, parse_ids, prefix_restore, rendered, server_log, sha256, tokenized,
+        metric, parse_ids, plan_run, prefix_restore, rendered, server_log, sha256, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -819,25 +819,17 @@ mod gate {
     /// with no `--place`, the cards' rule): its exit status and stderr. It
     /// plans and exits before the load, so it opens no card.
     fn plan_only(dir: &Path, place: Option<&str>) -> Result<(bool, Vec<String>), GateError> {
-        let exe = beside("bloomery-serve")?;
         let name = place.unwrap_or("unset");
         let err = dir.join(format!("plan-{name}.err"));
-        let mut cmd = Command::new(&exe);
-        cmd.args(["--model", "glm"]);
-        if let Some(p) = place {
-            cmd.args(["--place", p]);
-        }
-        let status = cmd
-            .arg("--plan")
-            .env_remove(bloomery_levers::DRAFT)
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove(bloomery_levers::DRAFT)
             .env_remove(bloomery_levers::RESIDENCY)
-            .envs(UNSET.iter().copied())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(File::create(&err)?)
-            .status()
-            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-        let lines = lines_from(&err, 0)?;
+            .envs(UNSET.iter().copied());
+        let mut args = vec!["--model", "glm"];
+        if let Some(p) = place {
+            args.extend(["--place", p]);
+        }
+        let (status, lines) = plan_run(cmd, &args, &err)?;
         println!("--place {name} --plan with the levers unset: {status}");
         for l in &lines {
             println!("  {l}");
@@ -1186,7 +1178,9 @@ mod gate {
         let over_ctx = OVER_CTX.to_string();
         let err = own.join("oracle.err");
         let mut cmd = Command::new(beside("bloomery-serve")?);
-        cmd.args([
+        cmd.env_remove(bloomery_levers::DRAFT)
+            .env_remove(bloomery_levers::RESIDENCY);
+        let args = [
             "--model",
             "glm",
             "--place",
@@ -1195,17 +1189,9 @@ mod gate {
             over_ctx.as_str(),
             "--parallel",
             "1",
-            "--plan",
-        ])
-        .env_remove(bloomery_levers::DRAFT)
-        .env_remove(bloomery_levers::RESIDENCY)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(File::create(&err)?);
-        let status = cmd
-            .status()
-            .map_err(|e| format!("spawn bloomery-serve: {e}"))?;
-        let text = std::fs::read_to_string(&err)?;
+        ];
+        let (status, lines) = plan_run(cmd, &args, &err)?;
+        let text = lines.join("\n");
         // PIN(2026-10-14): the shared check refuses before planning; the
         // clause pins its named slot limit instead of the planner's
         // `ctx_max` wording.
@@ -1741,19 +1727,15 @@ mod gate {
             ),
         ] {
             let err = dir.join(format!("{name}.err"));
-            let status = Command::new(&exe)
-                .args(["--model", "glm", "--place", "gate"])
-                .args(flags)
-                .arg("--plan")
-                .env_remove(bloomery_levers::DRAFT)
+            let mut cmd = Command::new(&exe);
+            cmd.env_remove(bloomery_levers::DRAFT)
                 .env_remove(bloomery_levers::RESIDENCY)
-                .envs(DRAFT_ONLY.iter().copied())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(File::create(&err)?)
-                .status()
-                .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-            let lines = lines_from(&err, 0)?;
+                .envs(DRAFT_ONLY.iter().copied());
+            let args: Vec<&str> = ["--model", "glm", "--place", "gate"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect();
+            let (status, lines) = plan_run(cmd, &args, &err)?;
             let named = lines.iter().any(|l| l.contains(want));
             // The `ctx` line no record kind reads; the plan through its own.
             let planned = lines.iter().any(|l| l.starts_with("ctx rule="))
