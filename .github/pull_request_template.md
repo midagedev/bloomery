@@ -2,6 +2,8 @@
 
 <!-- What changes, in 2–3 sentences, and the issue it closes (`Closes #N`). -->
 
+Release notes: Added | Changed | Fixed | Under the hood | internal — <the line a user would read; for internal, why>
+
 ## Code shape
 
 The review reads these first. A box left unticked needs one line of why.
