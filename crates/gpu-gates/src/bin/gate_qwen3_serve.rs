@@ -297,6 +297,13 @@
 //!   the total on the placed arm). FAIL-first: a seat that prints no `ctx`
 //!   line, two, or a context a slot's share of which the load does not hold
 //!   turns this red.
+//! - `ctx_past_the_trained_is_refused_by_name`: two `--plan` runs of a set
+//!   `--ctx` on `--place a`. One position past the file's trained context
+//!   on one slot exits non-zero with the shared limit's words
+//!   (`placement::ctx::PastLimit`); twice the trained context on two slots,
+//!   a share of exactly it each, is not refused by the limit. FAIL-first: a
+//!   seat that skips the check plans the first; one that holds the total to
+//!   the limit refuses the second.
 //! - `plan_flag_stops_before_the_load`: `--plan` (a placed load under a
 //!   12 GiB card budget, two slots) prints the `ctx` line and the `plan`
 //!   record, whose `ctx_max` is the line's `total`, and the process exits 0
@@ -992,6 +999,59 @@ mod gate {
             ok,
             "plan_flag_stops_before_the_load",
             run.stopped_with_its_plan(),
+        );
+        Ok(())
+    }
+
+    /// `ctx_past_the_trained_is_refused_by_name` (module header): two
+    /// `--plan` runs of a set `--ctx` on `--place a`. One slot asked one
+    /// position past the file's `trained` context exits non-zero with the
+    /// shared limit's words (`placement::ctx::PastLimit`); two slots asked
+    /// twice the trained context, a share of exactly it each, are not refused
+    /// by the limit (the plan may still find the card short). The words are
+    /// printed with each run's exit.
+    fn ctx_past_the_trained_is_refused_by_name(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let trained = q3place::trained_ctx(&split)
+            .ok_or_else(|| format!("{}: no context_length", model.display()))?;
+        let past = (trained + 1).to_string();
+        let over = plan_run(
+            "ctx-past",
+            (model, dir),
+            &[],
+            &["--place", "a", "--ctx", &past],
+        )?;
+        let refused = format!(
+            "--ctx asks {past} positions a slot, past this model's limit of {trained} (trained; \
+             the file was trained at {trained}): the load stops; ask {trained} or fewer a slot"
+        );
+        let twice = (2 * trained).to_string();
+        let shared = plan_run(
+            "ctx-share",
+            (model, dir),
+            &[],
+            &["--place", "a", "--ctx", &twice, "--parallel", "2"],
+        )?;
+        let limit_words = "past this model's limit";
+        println!(
+            "ctx past the trained {trained}: --ctx {past} exit ok {:?}, named {}; --ctx {twice} \
+             --parallel 2 exit ok {:?}, refused by the limit {}",
+            over.exited,
+            over.said.contains(&refused),
+            shared.exited,
+            shared.said.contains(limit_words),
+        );
+        check(
+            ok,
+            "ctx_past_the_trained_is_refused_by_name",
+            over.exited == Some(false)
+                && over.said.contains(&refused)
+                && shared.exited.is_some()
+                && !shared.said.contains(limit_words),
         );
         Ok(())
     }
@@ -4272,6 +4332,7 @@ mod gate {
             check(&mut ok, "completion_ids_are_the_cli_ids", agree_all);
             ctx_default(model, &dir, default_n, &mut ok)?;
             plan_flag_stops_before_the_load(model, &dir, &mut ok)?;
+            ctx_past_the_trained_is_refused_by_name(model, &dir, &mut ok)?;
             default_second_slot_never_costs_a_load(model, &dir, &mut ok)?;
             if arch == "qwen35moe" {
                 // The Qwen3.6 file alone: the defaults on the 12 GB card it

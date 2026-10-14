@@ -1359,18 +1359,23 @@ mod gate {
             .status()
             .map_err(|e| format!("spawn bloomery-serve: {e}"))?;
         let text = std::fs::read_to_string(&err)?;
-        let refused = text
-            .lines()
-            .find(|l| l.contains(&format!("ctx_max {OVER_CTX}")))
-            .unwrap_or("")
-            .to_owned();
-        println!("ctx: --ctx {OVER_CTX} --plan: {status}; refused: {refused:?}");
+        // PIN(2026-10-14): the shared check refuses before planning; the
+        // clause pins its named slot limit instead of the planner's
+        // `ctx_max` wording.
+        let refused = format!(
+            "--ctx asks {OVER_CTX} positions a slot, past this model's limit of {ORACLE_POSITIONS} \
+             (ORACLE_POSITIONS; the file was trained at {}): the load stops; ask \
+             {ORACLE_POSITIONS} or fewer a slot",
+            inputs.hp.n_ctx_train
+        );
+        println!(
+            "ctx: --ctx {OVER_CTX} --plan: {status}; named {}",
+            text.contains(&refused)
+        );
         check(
             &mut ok,
             "ctx_past_the_oracle_is_refused_by_name",
-            !status.success()
-                && text.contains(&format!("ctx_max {OVER_CTX}"))
-                && text.contains(&ORACLE_POSITIONS.to_string()),
+            !status.success() && text.contains(&refused),
         );
 
         // The paged arm: `--plan` alone, so no load, under a host room that
