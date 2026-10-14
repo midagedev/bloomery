@@ -6,6 +6,7 @@
 #   tools/box.sh cargo oxide doctor
 #   tools/box.sh cargo oxide run q3k_gemv --arch sm_86
 #   tools/box.sh --hold up <owner> [reason…] | down <owner>   the hold on this side (below); `just box-hold`
+#   tools/box.sh --tree-id [DIR]                             the id a queued call gives DIR's tree (default: this tree)
 #   tools/box.sh --self-test [SCRIPT]                        the hold's rules against a stub ssh and rsync, no box;
 #                                                            SCRIPT (default: this one) is the box.sh under test
 #
@@ -94,9 +95,17 @@
 #   Sync. The tree goes to the remote directory under that directory's lock, /root/bloomery-queue/dir-<key>.lock
 #   (<key> the remote directory's name): rsync runs behind `flock -n -x`, so a tree a job is running in is
 #   never replaced under it. A sync that fails on that lock ends 83 naming it (the lock is probed once
-#   after a failed rsync: rsync's own code is 12 for a lock and a network fault alike). A fresh id goes
-#   along as the remote tree's .sync-id, from a temp dir (a file in the Mac tree would make every later
-#   command `-dirty` and move the ledger keys that walk the tree).
+#   after a failed rsync: rsync's own code is 12 for a lock and a network fault alike). The tree's id
+#   (tree_id: a hash of every path rsync sends, with its type, mode, size, mtime and link target) goes along
+#   as the remote tree's .sync-id, from a temp dir (a file in the Mac tree would make every later command
+#   `-dirty` and move the ledger keys that walk the tree): under the lock the old id is removed, rsync runs,
+#   and only a sync that ended 0 puts the new id in place. A remote directory whose .sync-id is already this
+#   tree's id is not synced at all, so jobs queued one after another from an unchanged tree all run (each
+#   resync would end the earlier, unstarted ones 80) and a call while a job of that tree runs is not 83.
+#   A job's own edits to its tree (a box `touch`, `just check`'s Cargo.lock) stay for the next job of the
+#   same id. Every queued job names the remote card lane it holds to tools/gpu-gate.sh: a lane of 3090,
+#   a6000, both or any exports BLOOMERY_GATE_CARD as that card (any: the daemon's pick) before
+#   BLOOMERY_BOX_ENV, so a recipe's `${BLOOMERY_GATE_CARD:-any}` takes the lane's lock, never another (64).
 #   Job. The assembled remote command, without the guard, runs as `flock -s -n -E 85 <the dir lock> bash -c
 #   '…'`: the lock is held shared for the job's life, children included, and not taking it ends 85. Inside,
 #   a .sync-id that is not this call's id (another sync replaced the tree after the submit) ends 80 before
@@ -201,6 +210,42 @@ hold_cmd() {
     echo "box-hold: $f cannot be made" >&2
     return 73
   fi
+}
+
+# tree_id DIR: the id of the tree rsync sends from DIR (the queue's .sync-id), 16 hex digits: a sha256 over every path it
+# sends, sorted, with its type and mode, a file's size and mtime and a link's target, under rsync's excludes (a directory
+# named target or .git anywhere, and at the top /*.ptx, /*.ll and /.oxide-artifacts/). Equal ids mean equal trees; an
+# edit, a restore with another mtime, a new or removed file each give another id.
+tree_id() {
+  python3 - "$1" << 'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+h = hashlib.sha256()
+
+
+def walk(rel):
+    for name in sorted(os.listdir(os.path.join(root, rel))):
+        p = os.path.join(rel, name) if rel else name
+        st = os.lstat(os.path.join(root, p))
+        isdir = stat.S_ISDIR(st.st_mode)
+        if isdir and name in ("target", ".git"):
+            continue
+        if not rel and (name == ".oxide-artifacts" if isdir else name.endswith((".ptx", ".ll"))):
+            continue
+        link = os.readlink(os.path.join(root, p)) if stat.S_ISLNK(st.st_mode) else ""
+        size, mtime = (0, 0) if isdir else (st.st_size, st.st_mtime_ns)
+        h.update(("%s\0%o\0%d\0%d\0%s\n" % (p, st.st_mode, size, mtime, link)).encode("utf-8", "surrogateescape"))
+        if isdir:
+            walk(p)
+
+
+walk("")
+print(h.hexdigest()[:16])
+PY
 }
 
 # self_test [SCRIPT]: the hold's rules (the header) on a copy of SCRIPT (default: this file) in a scratch tree, under a fake HOME,
@@ -376,6 +421,7 @@ self_test() {
 case ${1:-} in
   --hold) shift; rc=0; hold_cmd "$@" || rc=$?; exit "$rc" ;;
   --self-test) shift; rc=0; self_test "$@" || rc=$?; exit "$rc" ;;
+  --tree-id) shift; tree_id "${1:-$(cd "$(dirname "$0")/.." && pwd)}"; exit ;;
 esac
 # The registration tools/gate-batch.sh reaps by (its stop and dead-lane paths): BLOOMERY_BOX_PIDDIR names a directory, and a call that finds
 # it set files its own pid there while it runs, an empty file named <pid>, removed on exit, TERM included (a KILLed call leaves its file, so the
@@ -526,7 +572,7 @@ esac
 # A read never goes through the queue. The queue's settings (the header) are named before anything is synced: a refusal touches nothing.
 [ "$READONLY" = 0 ] || QUEUE=0
 QLOCK_DIR=/root/bloomery-queue
-QKEY= QLOCK= QCLASS= QLANE= QPRED=
+QKEY= QLOCK= QCLASS= QLANE= QPRED= SYNC_ID=
 if [ "$QUEUE" = 1 ]; then
   QKEY=$(basename "$REMOTE")
   case $QKEY in
@@ -578,7 +624,14 @@ elif [ "$READONLY" = 1 ]; then
     *) echo "box.sh: ssh $HOST failed looking for $REMOTE (rc $rc)" >&2; exit "$rc" ;;
   esac
 else
-  ssh -n "$HOST" "mkdir -p $REMOTE"
+  # A queued call reads the remote tree's id in the same ssh: this tree's id there means nothing to send (the header).
+  HAVE_ID=
+  if [ "$QUEUE" = 1 ]; then
+    SYNC_ID=$(tree_id "$HERE") || { echo "box.sh: the tree's id (tree_id $HERE) could not be read" >&2; exit 70; }
+    HAVE_ID=$(ssh -n "$HOST" "mkdir -p $REMOTE && { cat $REMOTE/.sync-id 2>/dev/null || true; }")
+  else
+    ssh -n "$HOST" "mkdir -p $REMOTE"
+  fi
   # 시각은 싣지 않는다(-t 없음) — 바뀐 파일은 내용 체크섬(-c)으로 고르고, 박스에 닿은 파일의 mtime은 박스 시계의 "지금"이 된다.
   # 맥의 mtime을 그대로 실으면 cargo가 낡은 바이너리를 내준다: 박스 시계가 맥보다 앞서 있어(실측 4.1초) 복원 직후의 touch조차
   # 직전 빌드 산출물보다 과거로 찍힌다(변이 바이너리가 두 번 그대로 돌았다).
@@ -586,17 +639,20 @@ else
   # 원격 디렉터리에서 빌드가 도는 사이 다른 box.sh 호출의 --delete가 그것을 지우면 빌드가 rc 101로 죽는다(dspark-q3k와
   # ds41splitk 라운드에서 한 번씩). `.oxide-artifacts/`(`embed.o` 등)도 같은 부류다(q3fix 라운드에서 한 번). 맥 트리에는 없으니
   # 삭제 대상에서 뺀다.
-  # A queued call syncs behind the remote directory's lock and ships a fresh id with the tree (the header); the direct call adds neither.
-  SYNC_ID= SYNC_TMP= SYNC_PATH=() SYNC_ID_SRC=()
-  if [ "$QUEUE" = 1 ]; then
-    SYNC_ID=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+  # A queued call syncs behind the remote directory's lock and ships the tree's id with it, put in place only after rsync ends 0
+  # (the header); the direct call adds neither.
+  SYNC_TMP= SYNC_PATH=() SYNC_ID_SRC=() SYNCED=1
+  if [ "$QUEUE" = 1 ] && [ "$HAVE_ID" = "$SYNC_ID" ]; then
+    SYNCED=0
+    echo "box.sh: $REMOTE already holds this tree (sync-id $SYNC_ID): not synced" >&2
+  elif [ "$QUEUE" = 1 ]; then
     SYNC_TMP=$(mktemp -d "${TMPDIR:-/tmp}/box-sync.XXXXXX")
-    printf '%s\n' "$SYNC_ID" > "$SYNC_TMP/.sync-id"
-    SYNC_PATH=(--rsync-path="mkdir -p $QLOCK_DIR && flock -n -x $QLOCK rsync")
-    SYNC_ID_SRC=("$SYNC_TMP/.sync-id")
+    printf '%s\n' "$SYNC_ID" > "$SYNC_TMP/.sync-id.new"
+    SYNC_PATH=(--rsync-path="mkdir -p $QLOCK_DIR && flock -n -x $QLOCK sh -c 'rm -f $REMOTE/.sync-id && rsync \"\$@\" && mv -f $REMOTE/.sync-id.new $REMOTE/.sync-id' rsync")
+    SYNC_ID_SRC=("$SYNC_TMP/.sync-id.new")
   fi
   rc=0
-  rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
+  [ "$SYNCED" = 0 ] || rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
   [ -z "$SYNC_TMP" ] || rm -rf "$SYNC_TMP"
   if [ "$rc" != 0 ] && [ "$QUEUE" = 1 ]; then
     # rsync's rc is 12 for a held lock and for a dead ssh alike: the lock decides (flock: 1 held, 0 free).
@@ -772,9 +828,14 @@ esac
 # serve의 build.rs가 `/props`의 version에 새기는 커밋. 박스 사본에는 .git이 없어서(rsync가 뺀다) 여기서 넘긴다.
 # 이 트리에 커밋에 없는 변경이 있으면 `-dirty`를 붙인다 — 그 바이너리는 그 커밋의 것이 아니다.
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+# A queued job's card lane is its gate lock (the header): BLOOMERY_BOX_ENV, after it, may still name another.
+GATEX=
+case "$QLANE" in
+  3090 | a6000 | both | any) GATEX="export BLOOMERY_GATE_CARD=$BOXCARD && " ;;
+esac
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
 REMOTE_CMD="source $ENVF && { $PICK
-} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $OXIDE$ARCHX$ENVS$OXCHECK$LOCALX$*"
+} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $GATEX$OXIDE$ARCHX$ENVS$OXCHECK$LOCALX$*"
 if [ "$LOCAL" = 1 ]; then
   # ssh carries no environment to the box: the command runs without what this side read, BLOOMERY_MODEL above all (the model
   # crate's tests read that name as a model path), without box.sh's own outputs, which only the profile sets, and without
@@ -800,10 +861,12 @@ JOB="flock -s -n -E 85 $QLOCK bash -c '$QUOTED'"
 # <remote directory>-<the command's first word, as a name>-<the id's first 6>
 first=${*%%[[:space:]]*}
 first=$(printf %s "${first##*/}" | tr -c 'A-Za-z0-9._-' '_')
-QNAME="$QKEY-${first:0:24}-${SYNC_ID:0:6}"
-[ -n "$first" ] || QNAME="$QKEY-cmd-${SYNC_ID:0:6}"
+# A tree's id repeats across its jobs: the name's suffix is this call's own.
+TAG=$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')
+QNAME="$QKEY-${first:0:24}-$TAG"
+[ -n "$first" ] || QNAME="$QKEY-cmd-$TAG"
 qargs=(run --card "$QLANE" --class "$QCLASS" --name "$QNAME")
 [ -z "$QPRED" ] || qargs+=(--expected-s "$QPRED")
 PRED_TEXT=${QPRED:+$QPRED s}
-echo "box.sh: queue $QCLASS card=$QLANE predicted ${PRED_TEXT:-unknown} remote=$REMOTE" >&2
+echo "box.sh: queue $QCLASS card=$QLANE predicted ${PRED_TEXT:-unknown} remote=$REMOTE tree=$SYNC_ID" >&2
 exec python3 "$HERE/tools/boxq.py" ${qargs[@]+"${qargs[@]}"} -- "$JOB"
