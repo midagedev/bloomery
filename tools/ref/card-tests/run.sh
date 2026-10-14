@@ -616,7 +616,8 @@ chmod +x "$tmp/stub/ssh" "$tmp/stub/rsync"
 # The caller's own box.sh variables are dropped (a batch run with BLOOMERY_HOLD_OWNER set runs these
 # tests too), and HOME is a fresh one, so a Mac-side hold under ~/.cache/bloomery/box-hold does not refuse
 # them; a test that wants one sets it after `box`.
-box_run() {
+# box [ARGS]: box.sh against the stubs, stdin from BOX_STDIN or empty, so no case depends on the stdin the suite was started with.
+box() {
   : > "$tmp/ssh.log"
   rm -f "$tmp/rsync.log" "$tmp/rsync.sync-id" "$tmp/rsync.sync-path" "$tmp/boxq.args" "$tmp/boxq.job"
   env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_READONLY -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD \
@@ -624,11 +625,7 @@ box_run() {
     -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S -u STUB_RSYNC_RC -u STUB_PROBE_RC -u STUB_BOXQ_RC -u STUB_SYNC_ID \
     -u BLOOMERY_BOX_LOCAL -u BLOOMERY_ENV_FILE -u BLOOMERY_LOCK_DIR \
     STUB_BOXQ_ARGS="$tmp/boxq.args" STUB_BOXQ_JOB="$tmp/boxq.job" \
-    HOME="$tmp/home" PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
-}
-# box [ARGS]: box_run with stdin from BOX_STDIN, or empty, so no case depends on the stdin the suite was started with.
-box() {
-  box_run "$@" < "${BOX_STDIN:-/dev/null}"
+    HOME="$tmp/home" PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@" < "${BOX_STDIN:-/dev/null}"
 }
 sshlog() {
   if grep -Eq -- "$2" "$tmp/ssh.log"; then pass "$1"; else fail "$1" "no ssh line matches /$2/" "$tmp/ssh.log"; fi
@@ -867,8 +864,19 @@ piped_box() { printf 'echo x\n' | BOX_STDIN=/dev/stdin box env BLOOMERY_BOX_QUEU
 run 'box.sh: a queued call with a pipe of input on stdin is refused' 64 'a queued job has no stdin' piped_box
 BOX_STDIN=$tmp/stdin.sh rc_is 'box.sh: a direct call still takes a file on stdin' 0 box "$B/tools/box.sh" 'bash -s'
 rc_is 'box.sh: a queued call with an empty stdin runs' 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" true
-open_pipe_box() { (sleep 3) | BOX_STDIN=/dev/stdin box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" true; }
-rc_is 'box.sh: a queued call on an open, empty pipe runs (no hang)' 0 open_pipe_box
+# A fifo this shell holds open on both ends is a pipe with a live writer and no bytes: the read's bound must end the wait.
+open_pipe_box() {
+  local f=$tmp/open.fifo p i
+  rm -f "$f" && mkfifo "$f" && exec 9<> "$f"
+  BOX_STDIN=$f box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" true 9>&- &
+  p=$!
+  for i in $(seq 100); do kill -0 "$p" 2> /dev/null || break; sleep 0.1; done
+  # past the bound: closing our end is the writer's EOF, which ends the read and the call
+  if kill -0 "$p" 2> /dev/null; then exec 9>&-; wait "$p"; echo 'box.sh still waited on the open pipe after 10 s'; return 99; fi
+  exec 9>&-
+  wait "$p"
+}
+rc_is 'box.sh: a queued call on an open, empty pipe runs within its 1 s bound (no hang)' 0 open_pipe_box
 run 'box.sh: BLOOMERY_Q_CARD is a lane' 64 'BLOOMERY_Q_CARD must be 3090, a6000, both, any or none, got .moon.' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=moon "$B/tools/box.sh" true
 # `any`: the card is the daemon's choice, read when the job starts; `none`: no card pin beyond the default.
 rc_is 'box.sh: BLOOMERY_Q_CARD=any' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=any "$B/tools/box.sh" true
