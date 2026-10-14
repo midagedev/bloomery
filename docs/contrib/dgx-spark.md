@@ -359,7 +359,7 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 | Term | On the Spark |
 |---|---|
 | H2D promotion over PCIe (`cuMemcpyHtoDAsync`, `crates/gpu/src/host/xstream.rs:1223,1261` at `cce176c5`; the staging rings `:283,760,1614`) | vanishes as a PCIe cost; a copy from pageable memory into a `cudaMalloc` buffer is still a DRAM-to-DRAM copy at half the pool's rate (reads and writes both cross it: 21.2 GB in ~0.16 s `[derived]`), negligible beside the file read |
-| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/link.rs:293`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
+| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/link.rs:364`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
 | CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (section 4) |
 | The pool's bandwidth | stays, as the single term (section 5) |
 | Page cache of the model file plus the device copy | stays and doubles the footprint until dropped; `nvtier.rs:12-30` already drops pages after use (`MADV_DONTNEED`, the `release_union` path) for the NVMe tier |
@@ -642,7 +642,7 @@ decision.
 (`all_gather_perf` per NVIDIA's NCCL playbook), and the fallback only if the probe of 9.6 shows our pump path slower
 than NCCL's point to point. Without GPUDirect NCCL stages through host bounce buffers with its proxy thread `[derived
 from the cuda.html line; NCCL internals unverified]`, and a send or receive kernel per message would occupy SMs. The
-handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:293`), which is what 9.1's "what to
+handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:364`), which is what 9.1's "what to
 use instead" asks for, so the NIC reads the same LPDDR with no copy. The protocol stays `host/mod.rs`'s alone
 (`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam (`crates/gpu/src/host/link.rs`). It has three impls: the
 shared page (PCIe and one Spark, identity), the loopback (two pages on one machine, a host pump thread between them,
@@ -677,26 +677,36 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    still posted (the flush `rdma_disconnect(3)` describes for that transition). An end whose writes still do not
    complete leaves its counters where they are and is broken by name: its cards keep waiting, a synchronize of their
    streams does not return, the host's error and every later refusal name the end, and the link's drop leaks both ends
-   and their pages rather than free them under the waits.
+   and their pages rather than free them under the waits. Any other end drops in the order queue pair, region, page,
+   with or without a release; that the NIC reads no source range once its queue pair is destroyed is `[unverified]`
+   (no verbs document says so), and an end dropped while its last writes have not completed relies on it.
    Outside a release an end delivers only while none of its posts is in flight: each pass of its pump posts, reaps
    its completions, and delivers what its inboxes hold only when every write it posted has completed; a failed
    completion stops the end by name. A card rewrites a span only after it takes a counter its end delivered (the stage
-   card a row's image after every tier's done of that row, a tier card the row's rows and its fault copy after its
-   next go), and the pump rewrites a line's staged generation and progress only at the line's next post, which follows
-   the reader's take of the last one. So neither rewrites a range that a write posted before the delivery may still
-   read, a resend included: if a request lands and its acknowledgement is lost, the requester sends again from the
-   first unacknowledged write and reads each source range again, and those ranges still hold the bytes of the first
-   send `[derived, not run]`. Whether the responder executes a duplicate RDMA write again was not checked against the
+   card a row's image after every tier's done of that row, a tier card the row's rows after its next go), and the pump
+   rewrites a line's staged generation and progress only at the line's next post, which follows the reader's take of
+   the last one. So neither rewrites a range that a write posted before the delivery may still read, a resend
+   included: if a request lands and its acknowledgement is lost, the requester sends again from the first
+   unacknowledged write and reads each source range again, and those ranges still hold the bytes of the first send
+   `[derived, not run]`. Whether the responder executes a duplicate RDMA write again was not checked against the
    specification; if it does, the same bytes and generation land again, and a repeated generation delivers nothing.
-   One range is rewritten while a write may read it: a row's rows, which every tier of the page writes in its own
-   slots and each tier's done posts whole. A tier card writes its slots after its own go, while another tier's done of
-   the row may still be in flight. Those bytes reach the stage by the writing tier's own done, later on the same queue
-   pair, which a resend of the earlier done sends again after it, and the stage card reads the rows only after every
-   tier's done, so it reads each tier's slots as that tier wrote them `[derived, not run]`. When an end posted nothing
-   after the post an answer is to, that post's acknowledgements return before the answer, so the wait delays nothing.
-   In a pass of two rows a row's go can be posted while the other row's done is on its way
-   (`crates/gpu/src/host/mod.rs:40-43`), and that done then also waits for the later go's completion, about one
-   acknowledgement `[derived, not run]`. Neither is measured. Each counter's reset takes its generations as carried
+   One range is rewritten while a write may read it: the tier's fault copy, which every done of the tier posts
+   (`crates/gpu/src/host/tier.rs:528`). In a pass of two rows (`crates/gpu/src/host/mod.rs:40-43`) the tier's end can
+   deliver both rows' gos in one pass. The tier card then signals one row's done and, on the other row's go it already
+   holds, runs a layer whose fault copy rewrites the word (`tier.rs:1762-1779`) while that done may still be in
+   flight. The later done posts the word again, later on the same queue pair, which a resend of the earlier done sends
+   again after it, and the host reads the copy only once the stage card's stream drained (`merged_fault`), after every
+   done, so it reads the last value `[derived, not run]`. Both arguments hold while every tier of a page posts through
+   one end, so one queue pair; ends on two nodes (item 5) need them made again.
+   The host tier serves one tier card today (`refuse_tier_count`, `crates/gpu/src/host/mod.rs:150`). With two, each
+   tier's copy-out copies the tier's whole buffer, the other tiers' slots included, to the row's rows
+   (`crates/gpu/src/host/tier.rs:1756-1761`), so a later tier's copy overwrites the slots an earlier tier wrote, on
+   any link, the shared page included. No link argument for rows that two tiers write is made here.
+   When no acknowledgement is lost or resent, and an end polls the completion of the post an answer is to before the
+   answer arrives, the wait delays nothing `[derived, not run]`. A lost acknowledgement whose answer arrives first
+   delays that answer until the resend completes. In a pass of two rows a row's go can be posted while the other
+   row's done is on its way, and that done then also waits for the later go's completion, about one acknowledgement
+   `[derived, not run]`. Neither is measured. Each counter's reset takes its generations as carried
    and resumes it alone, each end resetting only its own side of it, and a link stopped by name fails the reset, so
    the host tier stays poisoned
    (`crates/gpu/src/host/link/pump.rs`). On the shared page nothing changes: the same words, values, card operations

@@ -18,8 +18,9 @@
 //! of rows, every word g, and adds one to its done behind a system-scope
 //! barrier. The stage's next kernel counts the stale rows lines. A card
 //! rewrites its region only for its next generation, which waits for the
-//! other side to take this one: that take follows the landing, not the
-//! completion (`docs/contrib/dgx-spark.md` 9.5, item 2).
+//! other side to take this one: that take follows a delivery, which waits
+//! for the completion of every write its end posted
+//! (`docs/contrib/dgx-spark.md` 9.5, item 2).
 //!
 //! The round trip of generation g is read on the stage's card from
 //! `%globaltimer`: from the end of the kernel that wrote image g to the start
@@ -33,7 +34,8 @@
 //! with the image and each peer's rows `BYTES` long, and only each region's
 //! last word carries the generation. The stage prints half the round trip,
 //! the one-way time `ib_write_lat` prints as `t_typical`, carried by the
-//! link's posts.
+//! link's posts. A failed run prints why and releases every counter; a
+//! release that leaves an end standing ends the process without teardown.
 //!
 //! Both ends run this binary on a host with rdma-core (`libibverbs.so.1`):
 //!
@@ -548,7 +550,7 @@ mod probe {
         /// rank reads to [`RELEASE`]; `Err` names an end whose posts are not
         /// known to be over, whose counters stay ([`RdmaEnd::release`]).
         fn release(&self) -> Result<(), String> {
-            RdmaEnd::release(self.ends, RELEASE)
+            RdmaEnd::release(self.ends, RELEASE).map_err(|e| e.to_string())
         }
     }
 
@@ -582,14 +584,24 @@ mod probe {
             }
             Ok::<(), GateError>(())
         });
+        let played = played.and_then(|()| match card.broken() {
+            Some(b) => Err(format!("the link broke: {b}").into()),
+            None => Ok(()),
+        });
         if let Err(e) = played {
-            return Err(match card.release() {
-                Ok(()) => e,
-                Err(held) => format!("{e}; {held}").into(),
-            });
-        }
-        if let Some(b) = card.broken() {
-            return Err(format!("the link broke: {b}").into());
+            // The release waits on the link; why the run failed is out first.
+            // `eprintln!` panics when stderr fails.
+            let _ = writeln!(std::io::stderr(), "link_probe: {e}; releasing the link");
+            if let Err(held) = card.release() {
+                // The NIC may still read the page: exit before the ends and
+                // the page drop.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "link_probe: {held}; exiting without teardown"
+                );
+                std::process::exit(1);
+            }
+            return Err(e);
         }
         if o.rank != 0 {
             control.report(stale, 0)?;

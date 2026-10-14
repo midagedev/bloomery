@@ -21,8 +21,8 @@
 //! dones posted, so it does not run ahead of the bytes posted with them. An
 //! end delivers only while none of its posts is in flight, so a card a
 //! delivery releases, and the line's next staged words, rewrite no range a
-//! post made before the delivery still reads (`docs/contrib/dgx-spark.md`
-//! 9.5, item 2).
+//! post made before the delivery still reads, but for the tier's fault copy
+//! in a pass of two rows (`docs/contrib/dgx-spark.md` 9.5, item 2).
 //!
 //! The inbox and two staging words per crossing (the generation and the
 //! progress a post sends) are the link's tail, past the tier page's own

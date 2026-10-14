@@ -46,9 +46,8 @@ impl Wire for Rdma {
                 len: u32::try_from(m.len).map_err(|_| format!("a write of {} bytes", m.len))?,
             });
         }
-        // SAFETY: region and page outlive the queue pair (field order here and in `End`), so each
-        // range stays registered and allocated while a write may read it; which ranges are
-        // rewritten meanwhile: `docs/contrib/dgx-spark.md` 9.5, item 2.
+        // SAFETY: region and page outlive the queue pair (field order here and in `End`), so
+        // a range stays registered and allocated while a write reads it (dgx-spark.md 9.5, item 2).
         let posted = unsafe { self.qp.post_writes(&self.region, &self.writes, rkey) };
         self.in_flight += match &posted {
             Ok(()) => self.writes.len(),
@@ -125,9 +124,8 @@ impl RdmaEnd {
         let half =
             Half::new(crossings, side, tail, &*page).map_err(|e| GpuError::shape(what, e))?;
         let nic = Nic::open(dev, gid).map_err(|e| GpuError::shape(what, e.to_string()))?;
-        // SAFETY: the end holds `page` after its wire, so the page drops
-        // after the region: the range stays allocated while it is
-        // registered.
+        // SAFETY: the end holds `page` after its wire, so the page drops after
+        // the region: the range stays allocated while it is registered.
         let region = unsafe { nic.register(page.host_at(0), page.bytes()) }
             .map_err(|e| GpuError::shape(what, e.to_string()))?;
         let qp = nic
@@ -184,10 +182,11 @@ impl RdmaEnd {
     /// does each end that settled set the counters it reads to `v`. Ends over
     /// one page go in one call: a released card rewrites spans that any of
     /// their posts may read. An end that does not settle leaves its counters
-    /// as they are, so a card waiting on them keeps waiting: `Err` names it.
-    pub fn release(ends: &[RdmaEnd], v: u32) -> Result<(), String> {
+    /// as they are, so a card waiting on them keeps waiting: the
+    /// [`GpuError::Protocol`] names it.
+    pub fn release(ends: &[RdmaEnd], v: u32) -> Result<(), GpuError> {
         let sides: Vec<&dyn Side> = ends.iter().map(|e| &*e.end as &dyn Side).collect();
-        super::release_settled(&sides, v)
+        super::release_settled(&sides, v).map_err(|e| GpuError::protocol("the link's RDMA end", e))
     }
 
     /// Why the end stopped carrying for good: a step that was neither 0 nor
