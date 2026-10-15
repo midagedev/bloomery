@@ -200,24 +200,6 @@ static void gather(const ggml_tensor * t, const uint8_t * src, bool logical,
     }
 }
 
-static bool write_raw(const std::string & path, const void * data, size_t size, size_t count) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        fprintf(stderr, "dump_ref: cannot write %s\n", path.c_str());
-        return false;
-    }
-    if (fwrite(data, size, count, f) != count) {
-        fprintf(stderr, "dump_ref: short write on %s\n", path.c_str());
-        fclose(f);
-        return false;
-    }
-    if (fclose(f) != 0) {
-        fprintf(stderr, "dump_ref: cannot flush %s\n", path.c_str());
-        return false;
-    }
-    return true;
-}
-
 // An integer tensor's lossless twin for one layout, and its `int` row. i64 stays 64-bit;
 // every narrower integer widens to i32, which is exact.
 static bool write_twin(dump_ctx * d, const ggml_tensor * t, const char * name, int occurrence, bool input,
@@ -528,9 +510,15 @@ int main(int argc, char ** argv) {
     passthrough.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
-            char * list = argv[++i];
-            for (char * p = strtok(list, ","); p; p = strtok(nullptr, ",")) {
-                tokens.push_back((llama_token) atoi(p));
+            const std::string list(argv[++i]);
+            for (size_t at = 0;;) {
+                const size_t end = list.find(',', at);
+                const std::string field = list.substr(at, end == std::string::npos ? end : end - at);
+                int id = 0;
+                if (!parse_i32("dump_ref", "--tokens", field.c_str(), 0, id)) return 2;
+                tokens.push_back((llama_token) id);
+                if (end == std::string::npos) break;
+                at = end + 1;
             }
         } else if (strcmp(argv[i], "--tokens-file") == 0 && i + 1 < argc) {
             tokens_file = argv[++i];

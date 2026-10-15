@@ -172,24 +172,6 @@ static void gather(const ggml_tensor * t, const uint8_t * src, bool logical,
     }
 }
 
-static bool write_raw(const std::string & path, const void * data, size_t size, size_t count) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        fprintf(stderr, "dump_draft: cannot write %s\n", path.c_str());
-        return false;
-    }
-    if (fwrite(data, size, count, f) != count) {
-        fprintf(stderr, "dump_draft: short write on %s\n", path.c_str());
-        fclose(f);
-        return false;
-    }
-    if (fclose(f) != 0) {
-        fprintf(stderr, "dump_draft: cannot flush %s\n", path.c_str());
-        return false;
-    }
-    return true;
-}
-
 static bool write_twin(dump_ctx * d, const ggml_tensor * t, const char * name, int occurrence, bool input,
                        const std::string & stem, bool logical, const std::vector<int64_t> & ints) {
     const bool   wide = t->type == GGML_TYPE_I64;

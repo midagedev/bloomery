@@ -404,27 +404,7 @@ impl TapSet {
             ));
         }
         for t in &self.taps {
-            let path = self.dir.join(&t.file);
-            let bytes = std::fs::metadata(&path)
-                .map_err(|e| {
-                    RefError::missing(
-                        &path,
-                        format!("mtptaps: cannot read {}: {e}", path.display()),
-                    )
-                })?
-                .len();
-            if bytes != u64::from(t.n) * 4 {
-                return Err(RefError::malformed(
-                    path.display(),
-                    format!(
-                        "{} is {bytes} bytes, tap {} of {} values wants {}",
-                        t.file,
-                        t.name,
-                        t.n,
-                        u64::from(t.n) * 4
-                    ),
-                ));
-            }
+            read_bytes(&self.dir.join(&t.file), u64::from(t.n), &t.file)?;
         }
         Ok(())
     }

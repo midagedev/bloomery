@@ -56,19 +56,19 @@ static int fail(const std::string & what, const std::string & detail = "") {
     return 1;
 }
 
+// Comma-separated rows, each one whole integer in [0, 1000000] (parse_i64's rule); an empty piece is refused.
 static bool parse_rows(const char * spec, std::vector<int> & rows) {
-    const char * p = spec;
-    while (*p) {
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(p, &end, 10);
-        if (end == p || errno != 0 || v < 0 || v > 1000000) return false;
+    const std::string s(spec);
+    size_t at = 0;
+    while (true) {
+        const size_t comma = s.find(',', at);
+        const std::string piece = s.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        long long v = 0;
+        if (!parse_i64("q35mtp_ref", "--rows", piece.c_str(), 0, 1000000, v)) return false;
         rows.push_back((int) v);
-        if (*end == ',') ++end;
-        else if (*end != '\0') return false;
-        p = end;
+        if (comma == std::string::npos) return true;
+        at = comma + 1;
     }
-    return !rows.empty();
 }
 
 // The first index of the largest value: the argmax a tie gives to the lower id. A non-finite logit ends the run

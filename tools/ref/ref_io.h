@@ -99,6 +99,11 @@ inline bool write_bytes(const std::string & path, const void * data, size_t byte
     return true;
 }
 
+// `count` elements of `size` bytes each, the ik dumpers' typed rows.
+inline bool write_raw(const std::string & path, const void * data, size_t size, size_t count) {
+    return write_bytes(path, data, size * count);
+}
+
 inline bool write_raw(const std::string & path, const float * data, size_t count) {
     return write_bytes(path, data, count * sizeof(float));
 }

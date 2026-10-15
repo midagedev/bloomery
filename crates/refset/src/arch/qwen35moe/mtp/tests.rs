@@ -135,8 +135,8 @@ fn a_finished_set_reads_a_tap_by_name_and_row() {
         set.trunk_rows().unwrap_or_else(|e| panic!("{e}"))[6..],
         [6.0, 7.0]
     );
-    let s = set.step(2).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!((s.token, s.pos, s.mtp_argmax, s.target_next), (13, 2, 8, 8));
+    let s = set.step(1).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((s.token, s.pos, s.mtp_argmax, s.target_next), (12, 1, 6, 7));
     for (name, row) in [("mtp_nothing", 0), ("mtp_eh_proj", 1)] {
         let e = set.tap(name, row).err().map(|e| e.to_string());
         let e = e.unwrap_or_else(|| panic!("{name} at {row} was found"));
