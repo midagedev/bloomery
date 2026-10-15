@@ -54,8 +54,9 @@ bool read_token_file(const std::string & path, long long count, std::vector<Toke
         char * end = nullptr;
         errno = 0;
         const long id = strtol(line.c_str(), &end, 10);
-        if (line.empty() || line[0] < '0' || line[0] > '9' || *end != '\0' || errno != 0 || id < 0 ||
-            id > INT32_MAX) {
+        // The whole record is the number: a NUL inside the line ends the C string but not the record.
+        if (line.empty() || line[0] < '0' || line[0] > '9' || end != line.c_str() + line.size() ||
+            errno != 0 || id < 0 || id > INT32_MAX) {
             fprintf(stderr, "%s:%lld: invalid token id '%s'\n", path.c_str(), lines, line.c_str());
             return false;
         }

@@ -165,6 +165,21 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
     }
 
+    /// An empty line among the ids is malformed, as the C++ reader that writes the set refuses it.
+    #[test]
+    fn an_empty_token_line_is_malformed() {
+        let d = dir("empty-id");
+        write(&d, &runs(), pin(), true);
+        std::fs::write(d.join("p.ids"), "0\n\n1\n2\n3\n0\n").unwrap_or_else(|e| panic!("{e}"));
+        match LogitsSet::open(&d, &LOGITS) {
+            Err(RefError::Malformed { what, .. }) => {
+                assert!(what.contains("empty token id"), "{what}")
+            }
+            other => panic!("an empty token line: {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+    }
+
     /// An id at or past `n_vocab` is malformed, naming the id and the vocabulary.
     #[test]
     fn a_token_id_outside_the_vocabulary_is_malformed() {

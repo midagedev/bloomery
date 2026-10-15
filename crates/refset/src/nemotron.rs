@@ -235,7 +235,7 @@ impl LogitsSet {
         let mut n = 0usize;
         for (i, line) in text.lines().enumerate() {
             if line.is_empty() {
-                continue;
+                return Err(RefError::malformed(At(&ids, i + 1), "empty token id"));
             }
             n += 1;
             let id: u32 = crate::columns::parse_field(line, "token id", &At(&ids, i + 1))?;

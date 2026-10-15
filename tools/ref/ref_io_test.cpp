@@ -60,6 +60,12 @@ int main() {
     expect(!read_token_file(ids, 2, got), "garbage token id");
     got.clear();
     {
+        std::ofstream o(ids, std::ios::binary);
+        o.write("0\n1\0garbage\n", 12);
+    }
+    expect(!read_token_file(ids, 2, got), "a NUL inside a token record");
+    got.clear();
+    {
         std::ofstream o(ids);
         o << "1\n";
     }
