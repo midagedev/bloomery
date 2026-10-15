@@ -255,8 +255,9 @@ gate-gpu-mamba2:
 # nemotron_h (Nemotron 3 Nano 4B Q4_K_M) end-to-end gate, one card: the captured step's entries against the layer kinds the header derives
 # (the scans, the squared ReLUs, the group-5 flash passes, the appends, the Q5_0 embedding row; no group-8 flash entry, no host node), eager =
 # captured replay bit for bit over 16 tokens, reset rewinds the ids and the logits bits, the scan state carries (layer 0 nonzero, the last
-# token's logits differ from the token alone), the fault word clean. A step that raises the fault word fails the clause naming it. The
-# clauses against mainline's logits (top1, band) join the list with the reference set.
+# token's logits differ from the token alone), the fault word clean. A step that raises the fault word fails the clause naming it. Against
+# mainline's last-position logits (ref-nemotron-logits, `just dump-ref-nemotron`): the body's argmax is the set's on every prompt, and
+# each prompt's cosine keeps the floor with the same top-5 ids; the max |delta| and cosine print per prompt. A set the box lacks fails by name.
 gate-gpu-nemotron-e2e:
     BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_e2e'
 

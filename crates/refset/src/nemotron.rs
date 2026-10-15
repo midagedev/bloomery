@@ -222,40 +222,53 @@ impl LogitsSet {
         Ok(out)
     }
 
-    fn check_prompt(&self, p: &Prompt) -> Result<(), RefError> {
-        let ids = self.dir.join(&p.ids_file);
-        let text = std::fs::read_to_string(&ids).map_err(|e| {
+    /// The prompt's token ids, in order: `ids_file`, one id a line, as many as `n_ids` names, each
+    /// inside the vocabulary.
+    pub fn ids(&self, p: &Prompt) -> Result<Vec<u32>, RefError> {
+        let path = self.dir.join(&p.ids_file);
+        let text = std::fs::read_to_string(&path).map_err(|e| {
             RefError::missing(
-                &ids,
-                format!("nemotron: cannot read {}: {e}", ids.display()),
+                &path,
+                format!("nemotron: cannot read {}: {e}", path.display()),
             )
         })?;
         if p.n_ids == 0 || p.n_vocab == 0 {
             return Err(RefError::malformed(
-                ids.display(),
+                path.display(),
                 "empty prompt or vocabulary",
             ));
         }
-        let mut n = 0usize;
+        let mut ids = Vec::with_capacity(p.n_ids as usize);
         for (i, line) in text.lines().enumerate() {
             if line.is_empty() {
-                return Err(RefError::malformed(At(&ids, i + 1), "empty token id"));
+                return Err(RefError::malformed(At(&path, i + 1), "empty token id"));
             }
-            n += 1;
-            let id: u32 = crate::columns::parse_field(line, "token id", &At(&ids, i + 1))?;
+            let id: u32 = crate::columns::parse_field(line, "token id", &At(&path, i + 1))?;
             if id >= p.n_vocab {
                 return Err(RefError::malformed(
-                    At(&ids, i + 1),
+                    At(&path, i + 1),
                     format!("token id {id} outside vocabulary {}", p.n_vocab),
                 ));
             }
+            ids.push(id);
         }
-        if n != p.n_ids as usize {
+        if ids.len() != p.n_ids as usize {
             return Err(RefError::malformed(
-                ids.display(),
-                format!("{} holds {n} ids, {} wants {}", p.ids_file, p.name, p.n_ids),
+                path.display(),
+                format!(
+                    "{} holds {} ids, {} wants {}",
+                    p.ids_file,
+                    ids.len(),
+                    p.name,
+                    p.n_ids
+                ),
             ));
         }
+        Ok(ids)
+    }
+
+    fn check_prompt(&self, p: &Prompt) -> Result<(), RefError> {
+        self.ids(p)?;
         self.logits(p)?;
         Ok(())
     }

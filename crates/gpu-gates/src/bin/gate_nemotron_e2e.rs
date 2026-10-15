@@ -22,9 +22,20 @@
 //!   give equal ones).
 //! - `fault_word_clean`: the fault word is clean after every run.
 //!
-//! The prompt is a fixed walk of token ids: with no reference set the clauses
-//! are the body's own contracts. The mainline comparison (`top1_is_mainlines`,
-//! `logits_near_mainlines`) joins the list when the reference set lands.
+//! - `top1_is_mainlines`: for each prompt of the `ref-nemotron-logits` set,
+//!   the body's argmax at the last position is the set's.
+//! - `logits_near_mainlines`: per prompt the max |Δ| and the cosine of the
+//!   last-position logits against the set's are printed. The floor is cosine
+//!   at least [`COSINE_FLOOR`] and the same set of top-5 ids; a prompt below
+//!   it is a FAIL, never a pin. The order inside the top-5 is printed with
+//!   both sides' logits and not gated: two logits closer than the quantised
+//!   file's own noise swap places, and the order of rank 1 is the other
+//!   clause.
+//!
+//! The own-contract clauses run over a fixed walk of token ids; the mainline
+//! clauses run over the set's prompts, read through `crates/refset`. A set
+//! absent from the box, dumped from another file or build, or unfinished ends
+//! the gate by name before the card loads.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -40,12 +51,21 @@ mod gate {
     use cuda_core::sys;
     use model::arch::Arch;
     use model::arch::nemotron_h::hparams::{Hparams, Kind};
+    use refset::arch::nemotron_h::LOGITS;
+    use refset::nemotron::LogitsSet;
     use std::collections::BTreeMap;
 
     type Model = NemotronHModel;
 
-    /// Rows of the K/V planes a key head holds.
-    const CTX: usize = 256;
+    /// Rows of the K/V planes a key head holds: the longest prompt of the
+    /// reference set with room for the clauses' extra steps.
+    const CTX: usize = 640;
+
+    /// The cosine the last-position logits keep against mainline's.
+    const COSINE_FLOOR: f64 = 0.999;
+
+    /// How many of the highest logits must be the same ids.
+    const TOP_K: usize = 5;
 
     /// Tokens of the prompt every clause runs.
     const PROMPT_LEN: usize = 16;
@@ -55,6 +75,7 @@ mod gate {
     struct Case {
         hp: Hparams,
         prompts: Vec<Prompt>,
+        set: LogitsSet,
     }
 
     struct Prompt {
@@ -71,6 +92,8 @@ mod gate {
         ("eager_equals_replay", eager_equals_replay),
         ("reset_rewinds", reset_rewinds),
         ("state_carries", state_carries),
+        ("top1_is_mainlines", top1_is_mainlines),
+        ("logits_near_mainlines", logits_near_mainlines),
         ("fault_word_clean", fault_word_clean),
     ];
 
@@ -309,6 +332,129 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------- the mainline set
+
+    /// The first index of the largest value, as the reference's argmax takes it.
+    fn argmax(v: &[f32]) -> usize {
+        let mut best = 0;
+        for (i, &x) in v.iter().enumerate() {
+            if x > v[best] {
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// The ids of the `k` largest values, largest first, lower id first on a tie.
+    fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
+        let mut ids: Vec<usize> = (0..v.len()).collect();
+        ids.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
+        ids.truncate(k);
+        ids
+    }
+
+    /// The body's argmax and last-position logits after the set's prompt `p`,
+    /// from a reset, or `None` after a line naming the fault.
+    fn body_on(
+        clause: &str,
+        m: &mut Model,
+        set: &LogitsSet,
+        p: &refset::nemotron::Prompt,
+    ) -> Result<Option<(u32, Vec<f32>)>, GateError> {
+        let ids = set.ids(p)?;
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let mut last = 0;
+        for &t in &ids {
+            match m.step(&[t]) {
+                Ok(id) => last = id,
+                Err(GpuError::Fault { fault, .. }) => {
+                    println!("{clause}: {} raised the fault word: {fault} FAIL", p.name);
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Some((last, m.logits()?)))
+    }
+
+    fn top1_is_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "top1_is_mainlines";
+        let mut ok = true;
+        for p in &case.set.prompts {
+            let want = argmax(&case.set.logits(p)?);
+            let Some((got, logits)) = body_on(CLAUSE, m, &case.set, p)? else {
+                ok = false;
+                continue;
+            };
+            let pass = usize::try_from(got) == Ok(want) && argmax(&logits) == want;
+            println!(
+                "{CLAUSE}: {} {} tokens, body argmax {got} (logits' {}), mainline {want} {}",
+                p.name,
+                p.n_ids,
+                argmax(&logits),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
+    fn logits_near_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "logits_near_mainlines";
+        let mut ok = true;
+        for p in &case.set.prompts {
+            let want = case.set.logits(p)?;
+            let Some((_, got)) = body_on(CLAUSE, m, &case.set, p)? else {
+                ok = false;
+                continue;
+            };
+            if got.len() != want.len() || !got.iter().all(|v| v.is_finite()) {
+                println!(
+                    "{CLAUSE}: {} {} logits for the set's {}, finite {} FAIL",
+                    p.name,
+                    got.len(),
+                    want.len(),
+                    got.iter().all(|v| v.is_finite())
+                );
+                ok = false;
+                continue;
+            }
+            let max_delta = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
+                .fold(0.0, f64::max);
+            let dot: f64 = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+            let cosine = dot / (norm(&got) * norm(&want));
+            let (top_got, top_want) = (top_ids(&got, TOP_K), top_ids(&want, TOP_K));
+            let (mut set_got, mut set_want) = (top_got.clone(), top_want.clone());
+            set_got.sort_unstable();
+            set_want.sort_unstable();
+            let pass = cosine >= COSINE_FLOOR && set_got == set_want;
+            let values = |ids: &[usize], v: &[f32]| -> Vec<String> {
+                ids.iter().map(|&i| format!("{i}:{:.3}", v[i])).collect()
+            };
+            println!(
+                "{CLAUSE}: {} {} tokens, max |delta| {max_delta:.4}, cosine {cosine:.6} \
+                 (floor {COSINE_FLOOR}), top-{TOP_K} same ids {} (body {:?}, mainline {:?}) {}",
+                p.name,
+                p.n_ids,
+                set_got == set_want,
+                values(&top_got, &got),
+                values(&top_want, &want),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
     // --------------------------------------------------- fault_word_clean
 
     fn fault_word_clean(m: &mut Model, _case: &Case) -> Result<bool, GateError> {
@@ -335,7 +481,16 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let file = open_split(Arch::NemotronH, "gate-gpu-nemotron-e2e")?;
         let hp = Hparams::read(&file).map_err(|e| format!("nemotron_h header: {e}"))?;
+        let set = LogitsSet::open(&LOGITS.path(refset::arch::nemotron_h::LOGITS_SET), &LOGITS)?;
+        let longest = set.prompts.iter().map(|p| p.n_ids as usize).max();
+        if longest.is_none_or(|n| n + 1 > CTX) {
+            return Err(format!(
+                "the set's longest prompt is {longest:?} tokens, the gate's context holds {CTX}"
+            )
+            .into());
+        }
         let case = Case {
+            set,
             prompts: vec![Prompt {
                 name: "walk16",
                 ids: walk(PROMPT_LEN, hp.n_vocab),
@@ -364,8 +519,9 @@ mod gate {
         println!(
             "PASSED: gate_nemotron_e2e the captured step holds the entries its layer kinds derive \
              and no group-8 flash entry; eager and replay give bit-identical logits; a reset \
-             rewinds the ids and the logits bits; the scan state carries; the fault word stays \
-             clean"
+             rewinds the ids and the logits bits; the scan state carries; the body's argmax is \
+             mainline's and its logits keep the cosine floor and the top-{TOP_K} ids on every \
+             prompt of the set; the fault word stays clean"
         );
         Ok(())
     }

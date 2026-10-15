@@ -22,7 +22,7 @@ pub static LOGITS: Family = Family {
     build: Some(Build::Is(super::tokenizer::NEMOTRON_BUILD)),
     runs: Some(super::tokenizer::nemotron_model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-nemotron-e2e"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
@@ -101,6 +101,10 @@ mod tests {
             .logits(&set.prompts[0])
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(row[1], 1.5);
+        assert_eq!(
+            set.ids(&set.prompts[0]).unwrap_or_else(|e| panic!("{e}")),
+            [0, 1, 2, 3, 0]
+        );
         std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
     }
 
