@@ -175,6 +175,7 @@ mod gate {
     use bloomery_gpu::host::slots::Slot;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency, SlotState};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
+    use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{
         Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, prose_ids, verdict,
@@ -481,7 +482,7 @@ mod gate {
             return Err("the prompt call returned no logits row".into());
         };
         let logits = row.to_vec();
-        let mut margins = vec![margin(&logits)?];
+        let mut margins = vec![flip::head_margin(&logits)?];
         let prompt_slots = stats(s)?.batch_host_slots - before;
         let excluded = stats(s)?.batch_excluded_slots - excluded_before;
         let (_, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
@@ -500,7 +501,7 @@ mod gate {
             let out = s.step(next, Want::Logits)?;
             next = out.argmax();
             if let Out::Logits { row, .. } = out {
-                margins.push(margin(row)?);
+                margins.push(flip::head_margin(row)?);
             }
             if i == 0 {
                 first_slots = stats(s)?.host_slots - before;
@@ -652,24 +653,6 @@ mod gate {
             verdict(ok)
         );
         Ok(ok)
-    }
-
-    /// The top-1 margin of a logits row; a value that is not finite is
-    /// refused by name.
-    fn margin(row: &[f32]) -> Result<f32, GateError> {
-        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for (i, &v) in row.iter().enumerate() {
-            if !v.is_finite() {
-                return Err(format!("logit {i} is {v}").into());
-            }
-            if v > a {
-                b = a;
-                a = v;
-            } else if v > b {
-                b = v;
-            }
-        }
-        Ok(a - b)
     }
 
     /// `stream`: the prompt call streaming against not, from a clear each.
@@ -1126,7 +1109,7 @@ mod gate {
             let out = s.step(next, Want::Logits)?;
             next = out.argmax();
             if let Out::Logits { row, .. } = out {
-                run.margins.push(margin(row)?);
+                run.margins.push(flip::head_margin(row)?);
             }
             run.tokens.push(next);
         }
@@ -1148,7 +1131,7 @@ mod gate {
             return Err("the prompt call returned no logits row".into());
         };
         let logits = row.to_vec();
-        let margins = vec![margin(&logits)?];
+        let margins = vec![flip::head_margin(&logits)?];
         let (gpu, _, b) = s.model_mut().body_parts(NAME)?;
         let units = b.ubatch_units();
         let widths = if units == 2 {

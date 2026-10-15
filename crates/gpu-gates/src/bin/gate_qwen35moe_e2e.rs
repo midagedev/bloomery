@@ -4522,24 +4522,6 @@ mod gate {
             })
     }
 
-    /// The top-1 margin of a logits row; a value that is not finite is
-    /// refused by name.
-    fn e_margin(row: &[f32]) -> Result<f32, GateError> {
-        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for (i, &v) in row.iter().enumerate() {
-            if !v.is_finite() {
-                return Err(format!("logit {i} is {v}").into());
-            }
-            if v > a {
-                b = a;
-                a = v;
-            } else if v > b {
-                b = v;
-            }
-        }
-        Ok(a - b)
-    }
-
     /// How far a logits row `a` stands from `b`: ‖a − b‖ / ‖b‖ (f64 sums) and
     /// the largest single |a − b|.
     fn e_distance(a: &[f32], b: &[f32]) -> (f64, f32) {
@@ -4722,7 +4704,7 @@ mod gate {
         let parted = run.tokens.iter().zip(&off.tokens).position(|(a, b)| a != b);
         let near = match parted {
             None => true,
-            Some(i) => e_margin(&run.rows[i])? < GREEDY_MARGIN,
+            Some(i) => flip::head_margin(&run.rows[i])? < GREEDY_MARGIN,
         };
         Ok(Band {
             worst,

@@ -11,6 +11,8 @@
 //! rounding — so a flip is allowed only while each pair's error also sits
 //! under a cap the gate pins from what a correct chain reaches.
 
+use crate::GateError;
+
 /// A token whose chosen set differs from ik's, with every exchanged pair.
 #[derive(Clone, Debug)]
 pub struct Flip {
@@ -192,6 +194,28 @@ pub fn flip_cap(band: f64, row: &[f32]) -> f64 {
 #[must_use]
 pub fn margin_cap(band: f64, row: &[f32]) -> f64 {
     6.0 * band * spread(row)
+}
+
+/// A head row's own margin: its top logit less its runner-up, the quantity a greedy step's near
+/// tie is read at. A value that is not finite and a row shorter than two are refused by name —
+/// over either the margin is not a number, and a tie reads 0.
+pub fn head_margin(row: &[f32]) -> Result<f32, GateError> {
+    if row.len() < 2 {
+        return Err(format!("{} logits, a top-1 margin needs two", row.len()).into());
+    }
+    let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (i, &v) in row.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(format!("logit {i} is {v}").into());
+        }
+        if v > a {
+            b = a;
+            a = v;
+        } else if v > b {
+            b = v;
+        }
+    }
+    Ok(a - b)
 }
 
 /// How far below ik's top logit ik's own row puts our argmax `ours`: `max(ik_row) − ik_row[ours]`,
@@ -383,6 +407,26 @@ mod tests {
         6.0 * band * copy_rms(v)
     }
 
+    // The margin copies the gates carried, as they read when they were lifted:
+    // `gate_ds41_callstream`'s, `gate_qwen38_residency`'s and `gate_qwen35moe_e2e`'s, one body
+    // word for word.
+
+    fn copy_margin(row: &[f32]) -> Result<f32, GateError> {
+        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for (i, &v) in row.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(format!("logit {i} is {v}").into());
+            }
+            if v > a {
+                b = a;
+                a = v;
+            } else if v > b {
+                b = v;
+            }
+        }
+        Ok(a - b)
+    }
+
     /// The lifted `flip_cap` and `margin_cap` are the copies they were lifted from, bit for bit
     /// (the expected functions above are the copies' bodies), on a hand row, a row far from zero
     /// (where the spread and the RMS differ), 4,096 normal values and an empty row. Mutant: the
@@ -418,6 +462,54 @@ mod tests {
             flip_cap(1.0, &rows[1]).to_bits(),
             margin_cap(1.0, &rows[1]).to_bits(),
             "the two caps read the RMS and the spread: a row of one offset tells them apart"
+        );
+    }
+
+    /// The lifted `head_margin` is the copies, bit for bit, on a hand row, a row holding a ±0
+    /// pair and a tie, and 4,096 normals. What the copies left undefined the owner names: a row
+    /// with a value that is not finite and a row shorter than two are errors by name, never a
+    /// silent NaN, infinity or 0. Mutant: the subtraction swapped (the runner-up less the top),
+    /// or a refusal dropped.
+    #[test]
+    fn the_lifted_head_margin_is_the_copies_and_names_what_they_left_undefined() {
+        let rows = [
+            vec![0.5f32, 2.0, -1.0, 1.25],
+            vec![-0.0f32, 0.0, 3.0, 3.0],
+            row(4096, 0.7, 0.3),
+        ];
+        for v in &rows {
+            assert_eq!(
+                head_margin(v).unwrap().to_bits(),
+                copy_margin(v).unwrap().to_bits(),
+                "the lifted margin is the copies"
+            );
+        }
+        assert_eq!(head_margin(&rows[0]).unwrap(), 0.75, "2.0 less 1.25");
+        assert_eq!(
+            head_margin(&rows[1]).unwrap(),
+            0.0,
+            "a tie reads 0 (and a ±0 pair is no overflow)"
+        );
+        let nan = [1.0f32, f32::NAN, 2.0];
+        assert_eq!(
+            head_margin(&nan).unwrap_err().to_string(),
+            copy_margin(&nan).unwrap_err().to_string(),
+            "the refusal is the copies'"
+        );
+        assert_eq!(head_margin(&nan).unwrap_err().to_string(), "logit 1 is NaN");
+        assert_eq!(
+            head_margin(&[0.0, f32::INFINITY]).unwrap_err().to_string(),
+            "logit 1 is inf"
+        );
+        assert_eq!(
+            head_margin(&[]).unwrap_err().to_string(),
+            "0 logits, a top-1 margin needs two",
+            "an empty row is refused, not a silent NaN"
+        );
+        assert_eq!(
+            head_margin(&[1.0]).unwrap_err().to_string(),
+            "1 logits, a top-1 margin needs two",
+            "a one-value row is refused, not a silent infinity"
         );
     }
 }

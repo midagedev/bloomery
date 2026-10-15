@@ -128,6 +128,7 @@ mod gate {
     use bloomery_gpu::host::slots::Slot;
     use bloomery_gpu::host::swap::{CallReport, Residency};
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
+    use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::tier::{self, Tag};
@@ -253,25 +254,8 @@ mod gate {
         Ok(ids)
     }
 
-    /// The row's top-1 logit less its top-2; a non-finite logit is refused
-    /// by name.
-    fn margin(row: &[f32]) -> Result<f32, GateError> {
-        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for (i, &v) in row.iter().enumerate() {
-            if !v.is_finite() {
-                return Err(format!("logit {i} is {v}").into());
-            }
-            if v > a {
-                b = a;
-                a = v;
-            } else if v > b {
-                b = v;
-            }
-        }
-        Ok(a - b)
-    }
-
-    /// One position's output: its argmax, its logits' FNV and top-1 margin.
+    /// One position's output: its argmax, its logits' FNV and top-1 margin
+    /// ([`flip::head_margin`], which refuses a non-finite logit by name).
     #[derive(Clone, Copy, Debug, PartialEq)]
     struct Pos {
         argmax: u32,
@@ -284,7 +268,7 @@ mod gate {
             Out::Logits { argmax, row } => Ok(Pos {
                 argmax,
                 fnv: Fnv1a64::default().f32s(row).value(),
-                margin: margin(row)?,
+                margin: flip::head_margin(row)?,
             }),
             Out::Argmax(_) => Err("a call asked for its logits returned the argmax alone".into()),
         }
