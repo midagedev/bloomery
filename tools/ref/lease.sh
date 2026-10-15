@@ -1259,10 +1259,12 @@ EOF
         print "  while [ ! -e \"$START_RELEASE\" ]; do sleep 0.01 9>&-; done"
       }
     ' "$LEASE_TREE/tools/gate-bound.sh" > "$t/startup-gate-bound.sh"
-    for model in ds41 qwen3moe; do
-      sed -n '/^ref_arm() {/,/^}/p; /^ours_arm() {/,/^}/p' \
+    for model in ds41 qwen3moe glm5next; do
+      sed -n '/^ref_arm() {/,/^}/p; /^ours_arm() {/,/^}/p; /^preheat_arm() {/,/^}/p' \
         "$LEASE_TREE/tools/ref/depth-$model.sh" > "$t/$model-arm-functions"
     done
+    cstate='cstate-ab'
+    sed -n '/^for ((r = 1;/,$p' "$LEASE_TREE/tools/ref/$cstate.sh" > "$t/cstate-arms"
     cat > "$t/depth-arm-harness" << 'EOF'
 TEST_BIN=$3 TEST_PID=$4
 N=1 WARM='' PH_DIR=''
@@ -1272,6 +1274,8 @@ arm_envs() { ARM_ENVS=(); }
 arm_feed() { ARM_FEED=("$TEST_PID"); }
 arm_prompt() { echo 0; }
 arm_ctx() { echo 64; }
+ph_k() { PHK=1; }
+set_disable() { :; }
 evict_arm() { :; }
 majflt_now() { echo 0; }
 majflt_mark() { cat; }
@@ -1280,6 +1284,19 @@ ref_witness() { :; }
 ours_pre() { :; }
 ref_cmd() { REF_BIN=$TEST_BIN; REF_ARGS=("$TEST_PID"); REF_ENV=(); REF_MARK=''; }
 pp_eng() { [ "$1" = pp ]; }
+EOF
+    cat > "$t/held-preheat.py" << 'EOF'
+import os
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(7))
+assert sys.argv[1:] == ['preheat', os.environ['HELD_PID'] + '.ranges/k1.tsv']
+with open(os.environ['HELD_PID'], 'w') as f:
+    f.write(f'{os.getpid()} {os.getppid()}\n')
+while True:
+    time.sleep(1)
 EOF
     cat > "$t/tbin/systemd-run" << 'EOF'
 #!/bin/sh
@@ -1293,7 +1310,7 @@ EOF
     # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
     # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
     # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
-    for form in direct capture startup ds41-ours ds41-ref ds41-pp qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
+    for form in direct capture startup ds41-ours ds41-ref ds41-pp ds41-preheat glm5next-preheat cstate qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
       for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
         n=$((n + 1))
         funcs=''
@@ -1304,13 +1321,16 @@ EOF
           ds41-ours | qwen3moe-ours) call='source "$5"; source "$6"; ours_arm 0 1' ;;
           ds41-ref | qwen3moe-ref) call='source "$5"; source "$6"; ref_arm stub 6 1' ;;
           ds41-pp) call='source "$5"; source "$6"; ref_arm pp 6 1' ;;
+          ds41-preheat) call='source "$5"; source "$6"; PH_DIR=$TEST_PID.ranges GGUF_RANGES=$8; ref_arm stub 6 1' ;;
+          glm5next-preheat) call='source "$5"; source "$6"; PH_DIR=$TEST_PID.ranges GGUF_RANGES=$8; A_PHK=(1); A_LABEL=(stub); preheat_arm 0' ;;
+          cstate) call='source "$6"; ROUNDS=1 STATE=stub KEEP="."; source "$5" "$TEST_BIN" "$TEST_PID"' ;;
           qwen3moe-mem) call='source "$5"; source "$6"; A_MEM=(1); ours_arm 0 1' ;;
         esac
-        case $form in ds41-*) funcs=$t/ds41-arm-functions ;; qwen3moe-*) funcs=$t/qwen3moe-arm-functions ;; esac
+        case $form in ds41-*) funcs=$t/ds41-arm-functions ;; qwen3moe-*) funcs=$t/qwen3moe-arm-functions ;; glm5next-*) funcs=$t/glm5next-arm-functions ;; cstate) funcs=$t/cstate-arms ;; esac
         BOUND=$BOUND HELD_PID="$t/held$n.pid" START_READY="$t/gap$n" START_RELEASE="$t/go$n" PATH="$t/tbin:$PATH" \
           bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp $call; echo next arm; }" \
           _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" \
-          "$funcs" "$t/depth-arm-harness" "$t/startup-gate-bound.sh" > "$t/bout$n" 2>&1 &
+          "$funcs" "$t/depth-arm-harness" "$t/startup-gate-bound.sh" "$t/held-preheat.py" > "$t/bout$n" 2>&1 &
         rp=$!
         i=0
         until { [ -s "$t/held$n.pid" ] && { [ "$form" != startup ] || [ -s "$t/gap$n" ]; }; } || [ "$i" = 100 ]; do

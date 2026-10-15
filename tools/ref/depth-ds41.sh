@@ -1585,7 +1585,8 @@ ARM_FAIL_STEM=depth-ds41
 # arm bound) and its `preheat` line; non-zero with FAIL_WHY on a failure.
 preheat_arm() {
   local out rc=0
-  out=$(timeout --kill-after=10 "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$PHK.tsv" 2>&1) || rc=$?
+  lease_capture "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$PHK.tsv" || rc=$?
+  out=$LEASE_OUT
   if [ "$rc" -ne 0 ]; then
     FAIL_WHY="its preheat failed (rc $rc): ${out##*$'\n'}"
     return "$rc"

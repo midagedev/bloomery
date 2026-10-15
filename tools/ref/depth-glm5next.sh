@@ -817,7 +817,8 @@ ph_bytes() {
 preheat_arm() {
   local k=${A_PHK[$1]:-} out rc=0
   [ -n "$PH_DIR" ] && [ -n "$k" ] || return 0
-  out=$(timeout --kill-after=10 "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$k.tsv" 2>&1) || rc=$?
+  lease_capture "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$k.tsv" || rc=$?
+  out=$LEASE_OUT
   if [ "$rc" -ne 0 ]; then
     FAIL_WHY="its preheat failed (rc $rc): ${out##*$'\n'}"
     return "$rc"

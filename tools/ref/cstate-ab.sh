@@ -62,7 +62,8 @@ for ((r = 1; r <= ROUNDS; r++)); do
   for arm in "${order[@]}"; do
     if [ "$arm" = off ]; then set_disable 1; else set_disable 0; fi
     rc=0
-    out=$(timeout --kill-after=10 600 "$@" 2>&1) || rc=$?
+    lease_capture 600 "$@" || rc=$?
+    out=$LEASE_OUT
     grep -E "$KEEP" <<< "$out" | sed "s/^/$STATE=$arm round=$r | /" || true
     if [ "$rc" != 0 ]; then
       echo "$STATE=$arm round=$r rc=$rc; last lines:"
