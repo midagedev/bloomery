@@ -29,7 +29,18 @@ witness pre
 # Bounded like every child under the lease (lease_bounded's bound); perf attaches to the decode binary
 # itself, the bound's child, whose pid is the main thread's tid in the tables below.
 bound_pid='' decode_exit=''
-trap 'trap "" TERM INT HUP; [ -z "$bound_pid" ] || { kill -TERM "$bound_pid" 2>/dev/null || :; wait "$bound_pid" 2>/dev/null || :; }' EXIT
+trap 'trap "" TERM INT HUP; [ -z "$bound_pid" ] || lease_stop "$bound_pid" || :' EXIT
+decode_failed() {
+  local rc=$1 why=${2:-failed}
+  case $rc in
+    124) why="cut off at its $LEASE_ARM_BOUND s bound" ;;
+    137) why="killed by SIGKILL (the bound's KILL or another SIGKILL)" ;;
+    *) [ "$rc" -le 128 ] || why="ended by signal $((rc - 128))" ;;
+  esac
+  echo "decode exited $rc: $why" >&2
+  tail -n 20 "$OUT/decode.log" >&2
+  exit "$rc"
+}
 for s in TERM:143 INT:130 HUP:129; do
   # shellcheck disable=SC2064 # the signal's status now, the decoder PID when the trap runs
   trap "decode_exit=${s#*:}; [ -z \"\$bound_pid\" ] || exit ${s#*:}" "${s%:*}"
@@ -39,13 +50,23 @@ bound_pid=$!
 [ -z "$decode_exit" ] || exit "$decode_exit"
 pid=
 while [ -z "$pid" ]; do
-  kill -0 "$bound_pid" 2> /dev/null || { echo "decode exited before perf could attach" >&2; cat "$OUT/decode.log" >&2; exit 1; }
+  if ! kill -0 "$bound_pid" 2> /dev/null; then
+    decode_rc=0
+    wait "$bound_pid" || decode_rc=$?
+    [ "$decode_rc" != 0 ] || decode_rc=1
+    decode_failed "$decode_rc" 'ended before perf could attach'
+  fi
   pid=$(awk '{ print $1 }' "/proc/$bound_pid/task/$bound_pid/children" 2> /dev/null || true)
   [ -n "$pid" ] || sleep 0.01
 done
 # The step table's header is printed after the prefill returns; stdout is line-buffered.
 until grep -q '^step ' "$OUT/decode.log" 2> /dev/null; do
-  kill -0 "$pid" 2> /dev/null || { echo "decode exited before its step table" >&2; cat "$OUT/decode.log" >&2; exit 1; }
+  if ! kill -0 "$pid" 2> /dev/null; then
+    decode_rc=0
+    wait "$bound_pid" || decode_rc=$?
+    [ "$decode_rc" != 0 ] || decode_rc=1
+    decode_failed "$decode_rc" 'ended before its step table'
+  fi
   sleep 0.01
 done
 # PERF_CALLERS="<symbol>...": record the main thread alone with DWARF call chains instead, and print
@@ -63,7 +84,7 @@ bound_pid=''
 # Later profiling commands keep their normal signal handling once the decoder has been reaped.
 trap - TERM INT HUP
 [ -z "$decode_exit" ] || exit "$decode_exit"
-[ "$decode_rc" -eq 0 ] || exit "$decode_rc"
+[ "$decode_rc" -eq 0 ] || decode_failed "$decode_rc"
 witness post
 steps_done=$(grep -cE '^ +[0-9]+ +[0-9]+ +[0-9.]+ ' "$OUT/decode.log")
 grep -E 'decode steps in|per step' "$OUT/decode.log"

@@ -448,8 +448,9 @@ lease_take() {
 # the lease stays held while any process that inherited descriptor 9 lives, so a hung child must end
 # at a bound instead of holding the machine. A command cut off there prints `[bound]` on stderr: a
 # child that hangs is a failed run, not a slow one. The command runs through run_bounded
-# (tools/gate-bound.sh), so a TERM, INT or HUP to the runner ends the command first; the runner then
-# stops on that signal as it would have (by its own trap, if it set one), not at its next arm. Where
+# (tools/gate-bound.sh): a TERM, INT or HUP to the runner stops timeout and its process group through
+# lease_stop, then the runner stops on that signal as it would have (by its own trap, if it set one),
+# not at its next arm. Where
 # lease_bounded runs in a subshell (`out=$(lease_bounded …)`, a pipeline), a signal to the runner's
 # pid alone does not reach it: the runner ends and the command runs on to its bound, holding the
 # lease. So a runner calls it in its own shell and takes the output from a file: lease_capture, or a
@@ -469,6 +470,47 @@ lease_bound() {
       return 64
       ;;
   esac
+}
+# lease_stop <timeout pid>: TERM the monitor and its group, wait up to 10 s before KILL, then reap
+# the monitor. Allow another 10 s for KILL to finish, reporting a group still alive then. A monitor
+# that exited without forwarding TERM can leave a live group behind. Zombies hold no descriptors;
+# only live processes keep cleanup waiting. The caller ignores further signals.
+lease_stop() {
+  local pid=$1 sig target err table p pg state live failed=0 deadline
+  for sig in TERM KILL; do
+    for target in "$pid" "-$pid"; do
+      if err=$(LC_ALL=C kill -s "$sig" -- "$target" 2>&1); then :; else
+        case $err in
+          *'No such process'*) ;;
+          *) printf '[bound] cannot send %s to %s: %s\n' "$sig" "$target" "$err" >&2; failed=70 ;;
+        esac
+      fi
+    done
+    deadline=$((SECONDS + 10))
+    while :; do
+      if ! table=$(ps -eo pid=,pgid=,stat=); then
+        echo "[bound] cannot read processes while stopping $pid" >&2
+        failed=70
+        break
+      fi
+      live=''
+      while read -r p pg state; do
+        if { [ "$p" = "$pid" ] || [ "$pg" = "$pid" ]; } && [[ $state != Z* ]]; then live=1; break; fi
+      done <<< "$table"
+      [ -n "$live" ] || break 2
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        if [ "$sig" = KILL ]; then
+          echo "[bound] $pid or its process group still alive 10 s after KILL" >&2
+          return 70
+        fi
+        break
+      fi
+      sleep 0.1 9>&-
+    done
+  done
+  [ "$failed" = 0 ] || return "$failed"
+  wait "$pid" 2> /dev/null || :
+  return "$failed"
 }
 lease_bounded() {
   local bound=${1:-} rc=0
@@ -1242,15 +1284,15 @@ EOF
   # ---- end the trace ----
   # ---- lease_bounded ----
   # A runner that holds a lease (a temp file) runs a stub under lease_bounded and then its next arm; the
-  # stub sets a trap that ends it 7 on a TERM, writes its pid and its parent's (its timeout) and holds.
-  # A TERM to the runner's pid, sent once the stub and its waiting timeout are ready, ends the stub, its timeout and
+  # stub sets a trap that ends it 7 one second after TERM, writes its pid and its parent's (its timeout) and holds.
+  # A TERM to the runner's pid, sent after that PID file exists and its timeout sleeps, ends the stub, its timeout and
   # then the runner, by the runner's own TERM trap when it set one, within seconds: the lease is free once
   # the runner is gone and the next arm never starts. A stub still there once the checks are made is let
   # go. Of the output only the runner's own two lines are read: the stub's /bin/sh may report its sleep
   # ended by the group's TERM. The command reads the runner's stdin.
   if command -v flock > /dev/null 2>&1; then
     command -v timeout > /dev/null || cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout"
-    printf '%s\n' '#!/bin/sh' 'trap "exit 7" TERM' 'echo "$$ $PPID" > "${HELD_PID:-$1}"' 'while :; do sleep 1; done' > "$t/held"
+    printf '%s\n' '#!/bin/sh' 'trap '\''trap "" TERM INT HUP; sleep 1; exit 7'\'' TERM' 'echo "$$ $PPID" > "${HELD_PID:-$1}"' 'while :; do sleep 1; done' > "$t/held"
     chmod +x "$t/held"
     awk '
       { print }
@@ -1263,13 +1305,13 @@ EOF
       sed -n '/^ref_arm() {/,/^}/p; /^ours_arm() {/,/^}/p; /^preheat_arm() {/,/^}/p' \
         "$LEASE_TREE/tools/ref/depth-$model.sh" > "$t/$model-arm-functions"
     done
+    sed -n "/^MEM_SCOPE_SCRIPT='/,/^'$/p" "$LEASE_TREE/tools/ref/depth-qwen3moe.sh" >> "$t/qwen3moe-arm-functions"
     cstate='cstate-ab'
     sed -n '/^for ((r = 1;/,$p' "$LEASE_TREE/tools/ref/$cstate.sh" > "$t/cstate-arms"
     cat > "$t/depth-arm-harness" << 'EOF'
 TEST_BIN=$3 TEST_PID=$4
 N=1 WARM='' PH_DIR=''
 A_DEP=(6) A_BIN=("$TEST_BIN") A_PLACE=(a) A_MEM=('') A_PREFILL=('')
-MEM_SCOPE_SCRIPT='exec "$@"'
 arm_envs() { ARM_ENVS=(); }
 arm_feed() { ARM_FEED=("$TEST_PID"); }
 arm_prompt() { echo 0; }
@@ -1306,6 +1348,29 @@ done
 exec "$@"
 EOF
     chmod +x "$t/tbin/systemd-run"
+    # A timeout that has made its group and child but exits on TERM without forwarding it, as GNU
+    # timeout can before fork returns. The held command keeps descriptor 9 in that orphaned group.
+    mkdir "$t/fork-bin"
+    cat > "$t/fork-bin/timeout" << 'EOF'
+#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+
+os.setpgid(0, 0)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+args = [a for a in sys.argv[1:] if not a.startswith('--kill-after=')]
+child = subprocess.Popen(args[1:], close_fds=False)
+try:
+    rc = child.wait(timeout=float(args[0]))
+except subprocess.TimeoutExpired:
+    child.kill()
+    child.wait()
+    rc = 124
+sys.exit(128 - rc if rc < 0 else rc)
+EOF
+    chmod +x "$t/fork-bin/timeout"
     n=0 BOUND=20
     bounded_ready() {
       local sp ip state
@@ -1319,14 +1384,22 @@ EOF
     # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
     # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
     # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
-    for form in direct capture startup ds41-ours ds41-ref ds41-pp ds41-preheat glm5next-preheat cstate qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
+    for form in direct capture startup fork ds41-load ds41-load-fork ds41-ours ds41-ref ds41-pp ds41-preheat glm5next-preheat cstate qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
+      case $form in ds41-load*)
+        if ! bash -c '[ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 1 ]; }'; then
+          echo "skip bounded-$form: the runner's bash has no exec {fd}<>"
+          continue
+        fi
+        ;;
+      esac
       for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
         n=$((n + 1))
         funcs=''
         case $form in
-          direct) call='lease_bounded "$BOUND" "$3" "$4"' ;;
+          direct | fork) call='lease_bounded "$BOUND" "$3" "$4"' ;;
           capture) call='lease_out_init; echo "capture dir $LEASE_OUT_DIR"; lease_capture "$BOUND" "$3" "$4"' ;;
           startup) call='source "$7"; lease_bounded "$BOUND" "$3" "$4"' ;;
+          ds41-load*) call='source "$6"; source "$LEASE_TREE/tools/ref/load-groups.sh"; lg_cmd() { LG_CMD=("$TEST_BIN" "$TEST_PID"); LG_ENV=(); }; ARMS=(stub); lg_process 1 0' ;;
           ds41-ours | qwen3moe-ours) call='source "$5"; source "$6"; ours_arm 0 1' ;;
           ds41-ref | qwen3moe-ref) call='source "$5"; source "$6"; ref_arm stub 6 1' ;;
           ds41-pp) call='source "$5"; source "$6"; ref_arm pp 6 1' ;;
@@ -1336,7 +1409,9 @@ EOF
           qwen3moe-mem) call='source "$5"; source "$6"; A_MEM=(1); ours_arm 0 1' ;;
         esac
         case $form in ds41-*) funcs=$t/ds41-arm-functions ;; qwen3moe-*) funcs=$t/qwen3moe-arm-functions ;; glm5next-*) funcs=$t/glm5next-arm-functions ;; cstate) funcs=$t/cstate-arms ;; esac
-        BOUND=$BOUND HELD_PID="$t/held$n.pid" START_READY="$t/gap$n" START_RELEASE="$t/go$n" PATH="$t/tbin:$PATH" \
+        bpath=$t/tbin:$PATH
+        case $form in *fork) bpath=$t/fork-bin:$bpath ;; esac
+        BOUND=$BOUND HELD_PID="$t/held$n.pid" START_READY="$t/gap$n" START_RELEASE="$t/go$n" PATH="$bpath" \
           bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp $call; echo next arm; }" \
           _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" \
           "$funcs" "$t/depth-arm-harness" "$t/startup-gate-bound.sh" "$t/held-preheat.py" > "$t/bout$n" 2>&1 &
@@ -1357,22 +1432,49 @@ EOF
         left='' sp=''
         if [ -s "$t/held$n.pid" ]; then
           read -r sp ip < "$t/held$n.pid"
-          if kill -0 "$sp" 2> /dev/null; then left="$left stub"; fi
+          if kill -0 "$sp" 2> /dev/null; then
+            case $form in
+              *fork)
+                state=$(ps -o stat= -p "$sp" 2> /dev/null) || state=''
+                case $state in '' | *Z*) ;; *) left="$left stub" ;; esac
+                ;;
+              *) left="$left stub" ;;
+            esac
+          fi
           if kill -0 "$ip" 2> /dev/null; then left="$left timeout"; fi
         fi
         lk=free
         lease_free "$t/blease$n" 2> /dev/null || lk=held
-        [ -z "$left" ] || kill -TERM "$sp" 2> /dev/null
         cdir=$(sed -n 's/^capture dir //p' "$t/bout$n")
         OUT="stub ran: $([ -n "$sp" ] && echo yes || echo no), left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound, out: [$(grep -E '^(trap ran|next arm)$' "$t/bout$n" | tr '\n' ' ')]"
         cfix=''
         [ "$form" != capture ] || { cfix=', capture dir: removed'; [ -n "$cdir" ] && [ ! -e "$cdir" ] && OUT="$OUT, capture dir: removed" || OUT="$OUT, capture dir: left"; }
         check "bounded-$form-term${trp:+-trap}-rc" "$RC" 143
         matches "bounded-$form-term${trp:+-trap}" "^stub ran: yes, left: none, lease: free, ended before the $BOUND s bound, out: \[${trp:+trap ran }\]${cfix}\$" "$OUT"
+        if [ -n "$left" ]; then
+          if kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
+          if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
+        fi
       done
     done
-    # The profiling runner owns a decoder beside its bounded perf command. Cancel it only once
-    # both timeout monitors are waiting, with perf record active and the decoder holding the lease.
+    # The real memory scope must wait through a second TERM and return its late child's code.
+    source "$t/qwen3moe-arm-functions"
+    HELD_PID="$t/scope.pid" bash -c "$MEM_SCOPE_SCRIPT" -- "$t/held" > "$t/scope.log" 2>&1 &
+    rp=$!
+    i=0
+    until bounded_ready "$t/scope.pid" || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+    check bounded-mem-scope-ready "$(bounded_ready "$t/scope.pid" && echo yes || echo no)" yes
+    kill -TERM "$rp"
+    sleep 0.1
+    kill -TERM "$rp" 2> /dev/null || :
+    RC=0
+    wait "$rp" || RC=$?
+    check bounded-mem-scope-rc "$RC" 7
+    read -r sp ip < "$t/scope.pid"
+    check bounded-mem-scope-child-gone "$(kill -0 "$sp" 2> /dev/null && echo no || echo yes)" yes
+    if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
+    # Cancel profiling during record, before the decoder PID is assigned and during annotate/callers;
+    # failed decoders report their code and the last 20 log lines.
     perf='perf-decode'
     mkdir -p "$t/perf-tree/tools/ref" "$t/perf-bin"
     cp "$LEASE_TREE/tools/ref/$perf.sh" "$t/perf-tree/tools/ref/"
@@ -1385,14 +1487,36 @@ EOF
     cat > "$t/perf-bin/decoder" << 'EOF'
 #!/bin/sh
 echo 'step '
-exec "$STUB_PERF_HELD" "$STUB_PERF_PID"
+case $STUB_PERF_PHASE in
+  record | fork | startup) exec "$STUB_PERF_HELD" "$STUB_PERF_PID" ;;
+esac
+echo "$$ $PPID" > "$STUB_PERF_PID"
+while [ ! -e "$STUB_PERF_GO" ]; do sleep 0.01; done
+if [ "${STUB_DECODE_RC:-0}" != 0 ]; then
+  i=1
+  while [ "$i" -le 24 ]; do echo "decode line $i"; i=$((i + 1)); done
+fi
+echo ' 0 0 1.0 '
+echo 'decode steps in 1 s, per step mean 1.0 ms'
+exit "${STUB_DECODE_RC:-0}"
 EOF
     cat > "$t/perf-bin/perf" << 'EOF'
 #!/bin/sh
-[ "$1" = record ] || exit 64
-exec "$STUB_PERF_HELD" "$STUB_PERF_RECORD"
+echo "$1" >> "$STUB_PERF_CALLS"
+case $1 in
+  record)
+    case $STUB_PERF_PHASE in record | fork | startup) exec "$STUB_PERF_HELD" "$STUB_PERF_RECORD" ;; esac
+    touch "$STUB_PERF_GO"
+    ;;
+  script) echo '0 stub' ;;
+  annotate | report)
+    case $* in *next*) exit 0 ;; esac
+    exec "$STUB_PERF_HELD" "$STUB_PERF_RECORD"
+    ;;
+  *) exit 64 ;;
+esac
 EOF
-    # /proc is Linux-only; the stub's PID file provides the same timeout-child lookup on the Mac.
+    # The PID file supplies the timeout-child lookup on every host, so the test needs no /proc.
     cat > "$t/perf-bin/awk" << 'EOF'
 #!/bin/sh
 case ${2:-} in
@@ -1412,44 +1536,84 @@ fi
 exec /usr/bin/mktemp "$@"
 EOF
     chmod +x "$t/perf-bin/"*
-    STUB_PERF_LEASE="$LEASE_TREE/tools/ref/lease.sh" STUB_PERF_LOCK="$t/perf.lock" \
-      STUB_PERF_HELD="$t/held" STUB_PERF_PID="$t/perf-decoder.pid" STUB_PERF_RECORD="$t/perf-record.pid" \
-      BLOOMERY_DECODE_BIN="$t/perf-bin/decoder" STUB_PERF_DIR="$t" BLOOMERY_ARM_BOUND=$BOUND \
-      PATH="$t/perf-bin:$PATH" bash "$t/perf-tree/tools/ref/$perf.sh" > "$t/perf-log" 2>&1 &
-    rp=$!
-    i=0
-    until { bounded_ready "$t/perf-decoder.pid" && bounded_ready "$t/perf-record.pid"; } || [ "$i" = 100 ]; do
-      sleep 0.1
-      i=$((i + 1))
-    done
-    check bounded-perf-record-ready "$(bounded_ready "$t/perf-decoder.pid" && bounded_ready "$t/perf-record.pid" && echo yes || echo no)" yes
-    lk=free
-    lease_free "$t/perf.lock" 2> /dev/null || lk=held
-    check bounded-perf-record-lease-held "$lk" held
-    s0=$SECONDS
-    kill -TERM "$rp" 2> /dev/null
-    RC=0
-    wait "$rp" || RC=$?
-    check bounded-perf-record-term-rc "$RC" 143
-    ended=before
-    [ "$((SECONDS - s0))" -lt "$BOUND" ] || ended='at or after'
-    left=''
-    for child in decoder record; do
-      if [ -s "$t/perf-$child.pid" ]; then
-        read -r sp ip < "$t/perf-$child.pid"
-        if kill -0 "$sp" 2> /dev/null; then left="$left $child"; fi
-        if kill -0 "$ip" 2> /dev/null; then left="$left $child-timeout"; fi
+    for phase in record fork startup annotate callers fail bound; do
+      pdir=$t/perf-$phase
+      mkdir "$pdir"
+      bpath=$t/perf-bin:$PATH
+      [ "$phase" != fork ] || bpath=$t/fork-bin:$bpath
+      annotate='' callers='' decode_rc=0
+      case $phase in
+        annotate) annotate='stub next' ;;
+        callers) callers='stub next' ;;
+        fail) decode_rc=23 ;;
+        bound) decode_rc=124 ;;
+      esac
+      # Deliver TERM with the trap set but before the decoder PID is assigned.
+      awk -v phase="$phase" '
+        phase == "startup" && /^timeout --kill-after=10 / { print "kill -TERM $$" }
+        { print }
+      ' "$LEASE_TREE/tools/ref/$perf.sh" > "$t/perf-tree/tools/ref/$perf.sh"
+      STUB_PERF_LEASE="$LEASE_TREE/tools/ref/lease.sh" STUB_PERF_LOCK="$pdir/lease" \
+        STUB_PERF_HELD="$t/held" STUB_PERF_PID="$pdir/decoder.pid" STUB_PERF_RECORD="$pdir/record.pid" \
+        STUB_PERF_PHASE=$phase STUB_PERF_CALLS="$pdir/calls" STUB_DECODE_RC=$decode_rc \
+        STUB_PERF_GO="$pdir/go" \
+        BLOOMERY_DECODE_BIN="$t/perf-bin/decoder" STUB_PERF_DIR="$pdir" BLOOMERY_ARM_BOUND=$BOUND \
+        PERF_ANNOTATE=$annotate PERF_CALLERS=$callers PERF_KEEP=1 \
+        PATH="$bpath" bash "$t/perf-tree/tools/ref/$perf.sh" > "$pdir/log" 2> "$pdir/err" &
+      rp=$!
+      if [ "$phase" != startup ] && [ "$decode_rc" = 0 ]; then
+        i=0
+        until bounded_ready "$pdir/record.pid" || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+        check "bounded-perf-$phase-ready" "$(bounded_ready "$pdir/record.pid" && echo yes || echo no)" yes
+        case $phase in record | fork)
+          check "bounded-perf-$phase-decoder-ready" "$(bounded_ready "$pdir/decoder.pid" && echo yes || echo no)" yes
+          ;;
+        esac
+        lk=free
+        lease_free "$pdir/lease" 2> /dev/null || lk=held
+        check "bounded-perf-$phase-lease-held" "$lk" held
+        kill -TERM "$rp" 2> /dev/null
       fi
-    done
-    lk=free
-    lease_free "$t/perf.lock" 2> /dev/null || lk=held
-    check bounded-perf-record-term "left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound" \
-      "left: none, lease: free, ended before the $BOUND s bound"
-    # Let a surviving timeout reap its stub after the assertions, including on the unfixed runner.
-    for child in decoder record; do
-      if [ -s "$t/perf-$child.pid" ]; then
-        read -r sp ip < "$t/perf-$child.pid"
-        kill -TERM "$ip" 2> /dev/null || :
+      s0=$SECONDS
+      RC=0
+      wait "$rp" || RC=$?
+      if [ "$decode_rc" != 0 ]; then
+        check "bounded-perf-$phase-rc" "$RC" "$decode_rc"
+        matches "bounded-perf-$phase-reason" "^decode exited $decode_rc: " "$(cat "$pdir/err")"
+        matches "bounded-perf-$phase-tail" '^decode steps in 1 s, per step mean 1.0 ms$' "$(cat "$pdir/err")"
+        matches "bounded-perf-$phase-tail-first" '^decode line 7$' "$(cat "$pdir/err")"
+        check "bounded-perf-$phase-tail-lines" "$(grep -cE '^decode line |^ 0 |^decode steps in ' "$pdir/err")" 20
+        continue
+      fi
+      check "bounded-perf-$phase-term-rc" "$RC" 143
+      ended=before
+      [ "$((SECONDS - s0))" -lt "$BOUND" ] || ended='at or after'
+      left=''
+      for child in decoder record; do
+        if [ -s "$pdir/$child.pid" ]; then
+          read -r sp ip < "$pdir/$child.pid"
+          if kill -0 "$sp" 2> /dev/null; then
+            state=$(ps -o stat= -p "$sp" 2> /dev/null) || state=''
+            if [ "$phase" != fork ] || [[ $state != *Z* && -n $state ]]; then left="$left $child"; fi
+          fi
+          if kill -0 "$ip" 2> /dev/null; then left="$left $child-timeout"; fi
+        fi
+      done
+      lk=free
+      lease_free "$pdir/lease" 2> /dev/null || lk=held
+      check "bounded-perf-$phase-term" "left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound" \
+        "left: none, lease: free, ended before the $BOUND s bound"
+      check "bounded-perf-$phase-stopped" "$(grep -c '^\[perf\] kept ' "$pdir/log")" 0
+      [ "$phase" != startup ] || check bounded-perf-startup-no-perf "$([ -s "$pdir/calls" ] && echo called || echo none)" none
+      # Signal only a survivor, after the assertions, including on an unfixed runner.
+      if [ -n "$left" ]; then
+        for child in decoder record; do
+          if [ -s "$pdir/$child.pid" ]; then
+            read -r sp ip < "$pdir/$child.pid"
+            if kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
+            if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
+          fi
+        done
       fi
     done
     RC=0

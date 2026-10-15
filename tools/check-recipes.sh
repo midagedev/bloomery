@@ -186,8 +186,8 @@ tool_selftest() {
   fi
   printf '%s\n' "${out##*$'\n'}"
 }
-# lease.sh's own self-test: lease_gpu_idle (the take's timing-card check) and the witness tag, on a
-# stub nvidia-smi in a temp dir, no card, no lock, no /proc.
+# lease.sh's own self-test: the timing-card check and witness on a stub nvidia-smi, and the trace,
+# bounded arms and perf cancellation on temp leases and held stubs; no card or machine lease.
 blk_lease() { tool_selftest ref/lease.sh; }
 # box-tracks.sh deletes remote track directories: its selection (only the names given, never a new stale
 # the reader did not see, a bare --remove refused) is tested on fixed input, no ssh.

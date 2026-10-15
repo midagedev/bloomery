@@ -26,9 +26,10 @@ gate_bound() {
 # its return the child's code. timeout runs the binary in a process group of its own, which a signal
 # to the runner's group never reaches. So a TERM or HUP to the runner (an INT too, unless the runner
 # was started with & by a shell, which leaves INT ignored) goes on to the child as a TERM, and the
-# runner goes on only after the child has ended: an ended run leaves no binary holding its locks and
-# its output. The child keeps the runner's stdin, which a command run with & would not. The trap is
-# set before the child starts, so no signal falls between the two: one that comes before the child's
+# runner waits for the child and its process group before going on. The TERM reaches the group too,
+# including a command GNU timeout started before returning from fork. lease_stop (tools/ref/lease.sh)
+# bounds that cleanup at 10 s before KILL. The child keeps the runner's stdin, which a command run
+# with & would not. The trap is set before the child starts: one that comes before the child's
 # pid is known is held in BIN_SIGNAL and passed on as soon as the pid is, once (BIN_SENT says the trap
 # has passed it on already). Once it has passed a signal on, the trap ignores further ones (GNU
 # timeout sends its TERM to the runner and again to the runner's group), so the second wait is not
@@ -39,18 +40,23 @@ gate_bound() {
 # signal that was passed on (empty: none), for a caller that stops on it.
 run_bounded() {
   local traps s rc=0 BIN_PID='' BIN_SENT=''
+  # The lease and gate runners share the same process-group cleanup.
+  if ! declare -F lease_stop > /dev/null; then
+    # shellcheck source=tools/ref/lease.sh
+    source "${BASH_SOURCE[0]%/*}/ref/lease.sh" || return $?
+  fi
   traps=$(trap -p TERM INT HUP)
   # shellcheck disable=SC2034 # the caller reads it
   BIN_SIGNAL=
   for s in TERM INT HUP; do
     # shellcheck disable=SC2064 # the signal's name now, the pid when the trap runs
-    trap "BIN_SIGNAL=$s; [ -z \"\$BIN_PID\" ] || { trap '' TERM INT HUP; BIN_SENT=1; kill -TERM \"\$BIN_PID\" 2> /dev/null || :; }" "$s"
+    trap "BIN_SIGNAL=$s; [ -z \"\$BIN_PID\" ] || { trap '' TERM INT HUP; BIN_SENT=1; lease_stop \"\$BIN_PID\" || :; }" "$s"
   done
   "$@" <&0 &
   BIN_PID=$!
   if [ -n "$BIN_SIGNAL" ]; then
     trap '' TERM INT HUP
-    [ -n "$BIN_SENT" ] || kill -TERM "$BIN_PID" 2> /dev/null || :
+    [ -n "$BIN_SENT" ] || lease_stop "$BIN_PID" || :
   fi
   wait "$BIN_PID" || true
   wait "$BIN_PID" || rc=$?

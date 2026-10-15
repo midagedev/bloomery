@@ -142,6 +142,7 @@ lg_process() {
   shift
   local -a arms=("$@")
   local n=${#arms[@]} k=-1 line rc=0 st out='' prev_out='' header='' shown t0=0 f0=0 fed='' bound pid dir rfd wfd i
+  local lg_traps lg_sig='' s
   LG_LEFT=()
   lg_cmd "${arms[@]}"
   bound=$((BOUND * (n + 1)))
@@ -149,8 +150,23 @@ lg_process() {
   dir=$(mktemp -d "${TMPDIR:-/tmp}/load-groups.XXXXXX") || exit 2
   mkfifo "$dir/go" "$dir/out" || exit 2
   echo "[load] r$r ${n} arm(s): $(for i in "${arms[@]}"; do printf '%s ' "${ARMS[$i]}"; done)- one process, one load"
+  pid=''
+  lg_traps=$(trap -p TERM INT HUP)
+  # Stop and reap the load before restoring the caller's traps and raising its signal again.
+  lg_stop() {
+    trap '' TERM INT HUP
+    lease_stop "$pid" || :
+    trap - TERM INT HUP
+    eval "$lg_traps"
+    kill -s "$lg_sig" $$
+  }
+  for s in TERM INT HUP; do
+    # shellcheck disable=SC2064 # the signal now, the pid when the trap runs
+    trap "lg_sig=$s; [ -z \"\$pid\" ] || lg_stop" "$s"
+  done
   env "${LG_ENV[@]}" timeout --kill-after=10 "$bound" "${LG_CMD[@]}" < "$dir/go" > "$dir/out" 2>&1 &
   pid=$!
+  [ -z "$lg_sig" ] || lg_stop
   # Read-write, so this open does not wait for the process's; the process's stdin sees EOF only when
   # this end closes.
   exec {wfd}<> "$dir/go"
@@ -172,7 +188,7 @@ lg_process() {
     if [ "$st" != 0 ]; then
       if [ "$st" -gt 128 ]; then
         echo "[load] r$r: no line for ${BOUND} s; killing the process (pid $pid)" >&2
-        kill "$pid" 2> /dev/null
+        lease_stop "$pid" || :
       fi
       break
     fi
@@ -192,7 +208,7 @@ lg_process() {
       k=$((k + 1))
       if [ "$k" -ge "$n" ]; then
         out="the process printed arm line $k of a list of $n: $line"$'\n'
-        kill "$pid" 2> /dev/null
+        lease_stop "$pid" || :
         break
       fi
       lg_pre "${arms[$k]}" "$r"
@@ -211,6 +227,9 @@ lg_process() {
   done
   wait "$pid"
   rc=$?
+  pid=''
+  trap - TERM INT HUP
+  eval "$lg_traps"
   exec {wfd}>&- {rfd}<&-
   rm -rf "$dir"
   if [ "$k" -lt 0 ]; then
@@ -268,6 +287,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   # A host with no timeout takes tools/ref/stub-timeout.py, which ends the same two ways.
   stall_case() {
     local sd
+    # shellcheck source=tools/ref/lease.sh
+    source "${BASH_SOURCE[0]%/*}/lease.sh"
     sd=$(mktemp -d "${TMPDIR:-/tmp}/load-groups-selftest.XXXXXX")
     command -v timeout > /dev/null || cp "${BASH_SOURCE[0]%/*}/stub-timeout.py" "$sd/timeout"
     lg_majflt() { echo 0; }

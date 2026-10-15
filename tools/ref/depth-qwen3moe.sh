@@ -2346,10 +2346,11 @@ pp_col() {
 MEM_SCOPE_SCRIPT='
 "$@" &
 child=$!
-trap "kill -TERM $child 2> /dev/null" TERM INT
+trap "trap \"\" TERM INT HUP; kill -TERM $child 2> /dev/null" TERM INT HUP
+wait "$child"
 wait "$child"
 rc=$?
-trap - TERM INT
+trap - TERM INT HUP
 cg=$(awk -F: "/^0::/{print \$3}" /proc/self/cgroup) || cg=
 peak=$(cat "/sys/fs/cgroup$cg/memory.peak" 2> /dev/null) || peak=?
 echo "scope mem=peak:$peak cgroup:$cg"
