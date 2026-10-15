@@ -402,6 +402,12 @@ def parse_scan(path):
             if not nojit:
                 raise Refused(f"{path}: {e}'s {header[i + 1]} reads {SKIPPED} but the banner names "
                               "the JIT (jit-card, jit-cc, jit-cuda)")
+    # Every entry has a row and a digest, or no compare of this scan is a proof: an entry the md5 block
+    # lacks would be read as unmoved.
+    if set(rows) != set(md5):
+        odd = sorted(set(rows) ^ set(md5))
+        raise Refused(f"{path}: {len(odd)} entries in only one of the table and the md5 block "
+                      f"({' '.join(odd[:4])}) — a cut or mixed log")
     return method, header, rows, md5, nojit
 
 
@@ -576,6 +582,11 @@ def self_test():
         for x in (old, other):
             msg = refused(lambda: compare_scans(a, x))
             expect(msg is not None and "do not compare" in msg, f"two methods refused: {msg}")
+        # A table and an md5 block that name different entries: a cut or mixed log, refused before any compare.
+        cut = put("cut", scan("ptx-scan-md5: method=decl1", {"alpha": h1, "beta": h2}).replace(f"beta {h2} 9\n", ""))
+        msg = refused(lambda: compare_scans(a, cut))
+        expect(msg is not None and "1 entries in only one of the table and the md5 block (beta)" in msg,
+               f"a scan whose md5 block lacks a table entry is refused: {msg}")
         failed = put("failed", "ptx-scan bin=target/release/x missing scan=failed\n")
         msg = refused(lambda: compare_scans(a, failed))
         expect(msg is not None and "failed scan" in msg, f"a failed scan refused: {msg}")

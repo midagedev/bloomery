@@ -328,12 +328,19 @@ self_test() {
   [ "$rc" = 2 ] && grep -qF "scan-set.tsv" <<< "$got"; ok "a DIR with no scan-set.tsv: rc 2 by name" $?
   judge "$t/no-such-dir"
   [ "$rc" = 2 ] && grep -qF "no-such-dir" <<< "$got"; ok "--from a missing directory: rc 2 by name" $?
-  # md5 blocks that name other entries than the rows: ptx-canon exits 1 and names nothing this script can sort: refused, not passed
+  # an md5 block that names other entries than the rows (a cut or mixed log): ptx-canon refuses the scan, so no verdict; alone,
+  # and beside a moved entry whose body is identical (which would otherwise count and pass with beta unexamined)
   fx "$d" "alpha=1 beta=2" "alpha=1 beta=2"
   sed -i.bak '/^beta 0000/d' "$d/head/gx.log"
   rm -f "$d/head/gx.log.bak"
   judge "$d"
-  [ "$rc" = 2 ] && grep -qF "cannot classify" <<< "$got"; ok "ptx-canon exits 1 with nothing it names: rc 2 by name, not a pass" $?
+  [ "$rc" = 2 ] && grep -qF "entries in only one of the table and the md5 block (beta)" <<< "$got"; ok "an md5 block missing a table entry: rc 2, the coverage refusal named" $?
+  fx "$d" "alpha=1 beta=2" "alpha=3 beta=2" 5 6 ab 7 6
+  sed -i.bak '/^beta 0000/d' "$d/head/gx.log"
+  rm -f "$d/head/gx.log.bak"
+  judge "$d"
+  [ "$rc" = 2 ] && grep -qF "entries in only one of the table and the md5 block (beta)" <<< "$got" && ! grep -q '^canon-check: 1 bins' <<< "$got"
+  ok "a moved identical alpha beside beta's missing digest: rc 2, the coverage refusal, no summary" $?
   # two bins: counted, and one bin's moved entry judged in its own modules
   fx "$d" "alpha=1 beta=2" "alpha=3 beta=2" 5 6 ab 7 6
   mkdir -p "$d/base/gy.ptx" "$d/head/gy.ptx"

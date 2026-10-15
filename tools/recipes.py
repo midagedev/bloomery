@@ -2558,9 +2558,6 @@ def read_scan(path: str) -> ScanLog:
     bundles = [m.group(1) for m in map(_SCAN_BUNDLE.match, lines) if m]
     if not bundles:
         raise RecipeError(f"scan log {path}: no `ptx-scan: modN bundle=` line — which crates' kernels the scan read is unknown")
-    if set(rows) != set(md5):
-        odd = sorted(set(rows) ^ set(md5))
-        raise RecipeError(f"scan log {path}: {len(odd)} entries in only one of the table and the md5 block ({' '.join(odd[:4])}) — a cut or mixed log")
     fields["method"] = method
     return ScanLog(path, os.path.basename(fields["bin"]), fields, bundles, header, rows, md5, nojit)
 
