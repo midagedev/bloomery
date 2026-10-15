@@ -849,8 +849,18 @@ fn hw_qwen_malformed_call_is_an_api_error() {
 #[ignore = "gate: just gate-serve"]
 fn hw_content_after_the_span_is_mainlines() {
     let call = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
-    // (template, thinking, tools, output, content, reasoning, calls)
-    let cases: Vec<(&str, &str, bool, bool, String, &str, Option<&str>, usize)> = vec![
+    // (name, template, thinking, with_tools, out, content, reasoning, calls)
+    type Case = (
+        &'static str,
+        &'static str,
+        bool,
+        bool,
+        String,
+        &'static str,
+        Option<&'static str>,
+        usize,
+    );
+    let cases: Vec<Case> = vec![
         (
             "qwen38",
             TEMPLATE,
