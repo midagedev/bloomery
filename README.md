@@ -38,7 +38,7 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 
 ## Status (0.3.3)
 
-0.3.3 adds MiniCPM-V 4.7 35B-A3B image input ([#147](https://github.com/midagedev/bloomery/pull/147)), with `--mmproj` on the `qwen3` seat; a tile is capped at 70 tokens. The Qwen3.8 limits 0.3.2 listed are fixed: the paged log names the asked draft before the yield ([#121](https://github.com/midagedev/bloomery/pull/121)), and `gate-gpu-qwen4exp-mtp` (pg) plans its card experts with their route scratch ([#255](https://github.com/midagedev/bloomery/pull/255)). The release pass for this tarball is in the [0.3.3 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.3).
+0.3.3 adds Nemotron 3 Nano 4B on its own seat (`--model nemotron`, [#259](https://github.com/midagedev/bloomery/pull/259)) and MiniCPM-V 4.7 35B-A3B image input ([#147](https://github.com/midagedev/bloomery/pull/147)), with `--mmproj` on the `qwen3` seat; a tile is capped at 70 tokens. The Qwen3.8 limits 0.3.2 listed are fixed: the paged log names the asked draft before the yield ([#121](https://github.com/midagedev/bloomery/pull/121)), and `gate-gpu-qwen4exp-mtp` (pg) plans its card experts with their route scratch ([#255](https://github.com/midagedev/bloomery/pull/255)). The release pass for this tarball is in the [0.3.3 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.3).
 
 | Area | State |
 |---|---|
@@ -65,6 +65,7 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 - **On Qwen3.8 loads that page experts through the NVMe tier, `gate-gpu-qwen38-serve`'s real tier was 70/72 on 0.3.2's
   baseline (`f382b474`), with two preexisting paged failures.** It was not re-run for this note; the 0.3.3 release pass
   re-checks it. A default load keeps the draft off.
+- **Nemotron 3 Nano 4B reads a prompt at its decode rate:** the body has no prompt batch, so a prompt runs one decode step per token. It serves one slot on one card; `--parallel` above 1, a placement of more than one card or with a tier card, and a draft lever are each refused by name. A request keeps what the slot holds only when its prompt extends the whole held sequence (the Mamba-2 state cannot step back); the seat runs no prompt cache.
 - **Unset context is the seats' ladder (PIN(2026-10-14)).** With `--ctx-size` unset, one slot asks the lesser of
   262,144 and the file's limit and halves while the plan is short of the card, and of the host where the body keeps
   no tier past it. A set `--ctx-size` that does not fit is refused
@@ -104,7 +105,7 @@ The tarballs are on the [releases page](https://github.com/midagedev/bloomery/re
 
 ## Use
 
-One binary, six seats; the file's architecture picks the seat, and `--place` can stay unset on every model.
+One binary, seven seats; the file's architecture picks the seat, and `--place` can stay unset on every model.
 
 | Seat | Serves | One command |
 |---|---|---|
@@ -114,6 +115,10 @@ One binary, six seats; the file's architecture picks the seat, and `--place` can
 | `qwen3` | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (images with `--mmproj`), [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf) (images with `--mmproj` since 0.3.3) | `bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` |
 | `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
+
+The seventh seat, `nemotron`, serves Nemotron 3 Nano 4B (new in 0.3.3) from a file on disk, tested as
+`NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf`: `bloomery-serve --model nemotron -m PATH/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf`.
+The table above lists the seats with a checked `--hf` row.
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions \
