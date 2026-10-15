@@ -1,5 +1,6 @@
-use super::{MAINLINE, MAINLINE_BUILD, MODEL};
+use super::{MAINLINE, MODEL};
 use crate::RefError;
+use crate::clefvis::QVIS_LCPP_BUILD;
 use crate::clefvis::testkit::scratch as dir;
 use crate::mtptaps::{Elem, IDS_FILE, TapSet};
 use std::path::Path;
@@ -20,7 +21,7 @@ impl Default for Header<'_> {
     fn default() -> Self {
         Header {
             model: MODEL,
-            build: MAINLINE_BUILD,
+            build: QVIS_LCPP_BUILD,
             arch: "qwen35moe",
             mtp: Some("1\t3"),
             complete: true,
@@ -30,6 +31,14 @@ impl Default for Header<'_> {
 
 fn put(dir: &Path, name: &str, bytes: &[u8]) {
     std::fs::write(dir.join(name), bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+}
+
+/// The manifest at `dir` with its one line `from` replaced by `to`.
+fn swap(dir: &Path, from: &str, to: &str) {
+    let m = std::fs::read_to_string(dir.join("MANIFEST.tsv")).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(m.lines().filter(|l| *l == from).count(), 1, "{from}");
+    let out: Vec<&str> = m.lines().map(|l| if l == from { to } else { l }).collect();
+    put(dir, "MANIFEST.tsv", (out.join("\n") + "\n").as_bytes());
 }
 
 fn f32s(v: &[f32]) -> Vec<u8> {
@@ -104,7 +113,7 @@ fn a_finished_set_reads_a_tap_by_name_and_row() {
     write_set(&d, &Header::default(), &[]);
     let p = MAINLINE.check_set(&d).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(p.dumped_from, MODEL);
-    assert_eq!(p.build.as_deref(), Some(MAINLINE_BUILD));
+    assert_eq!(p.build.as_deref(), Some(QVIS_LCPP_BUILD));
     let set = open(&d).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(set.ids().unwrap_or_else(|e| panic!("{e}")), IDS);
     assert_eq!(
@@ -211,7 +220,10 @@ fn the_family_refuses_a_set_of_another_file_build_or_arch_or_without_the_mtp_con
                     ..
                 },
             ) => {
-                assert_eq!((got.as_str(), want.as_str()), (other_build, MAINLINE_BUILD));
+                assert_eq!(
+                    (got.as_str(), want.as_str()),
+                    (other_build, QVIS_LCPP_BUILD)
+                );
             }
             (
                 "arch",
@@ -294,6 +306,42 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         &["tap\tmtp_hnorm\t0\tf32\t2\tmtp_eh_proj.r0.f32"],
         &|_| {},
         "no tap mtp_hnorm at row 2",
+    );
+    at(
+        "an MTP context that ran fewer steps",
+        &[],
+        &|d| swap(d, "# mtp\t1\t3", "# mtp\t1\t2"),
+        "# mtp 1 2",
+    );
+    at(
+        "a step count at the integer's end",
+        &[],
+        &|d| swap(d, "# mtp\t1\t3", "# mtp\t1\t4294967295"),
+        "# mtp 1 4294967295",
+    );
+    at(
+        "a trunk of another length",
+        &[],
+        &|d| {
+            swap(
+                d,
+                "trunk\th_nextn\tf32\t4\t2\ttrunk_h.f32",
+                "trunk\th_nextn\tf32\t3\t2\ttrunk_h.f32",
+            )
+        },
+        "the trunk holds 3 rows",
+    );
+    at(
+        "a tapped row that is no step",
+        &[],
+        &|d| swap(d, "# rows\t0\t2", "# rows\t0\t2\t5"),
+        "# rows names 5, which is no step",
+    );
+    at(
+        "a tap at a row # rows does not name",
+        &["tap\tmtp_eh_proj\t1\tf32\t2\tmtp_eh_proj.r0.f32"],
+        &|_| {},
+        "a tap at a row # rows does not name",
     );
     std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
 }

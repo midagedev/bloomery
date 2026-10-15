@@ -298,7 +298,7 @@ impl TapSet {
         let n = self
             .tokens_count
             .ok_or_else(|| RefError::malformed(at.display(), "no # tokens_count line"))?;
-        if mtp.layers == 0 || mtp.steps + 1 != n {
+        if mtp.layers == 0 || u64::from(mtp.steps) + 1 != u64::from(n) {
             return Err(RefError::malformed(
                 at.display(),
                 format!(
