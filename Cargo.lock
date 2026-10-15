@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "bloomery-gpu-gates"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bloomery-app",
  "bloomery-decision",
@@ -325,7 +325,7 @@ version = "0.1.0"
 
 [[package]]
 name = "bloomery-serve"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bloomery-gguf",
  "bloomery-jinja",
