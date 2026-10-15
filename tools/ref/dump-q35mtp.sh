@@ -66,11 +66,7 @@ exec {set_lock}> "$SET.lock"
 flock -n "$set_lock" || { echo "dump-q35mtp: $SET already has a writer" >&2; exit 75; }
 STAGE=$SET.staging
 rm -rf "$STAGE"
-drop_incomplete_stage() {
-  [ -d "$STAGE" ] || return 0
-  rm -rf "$STAGE"
-  echo "[staging] removed the incomplete $STAGE" >&2
-}
+# ref-paths.sh's drop_incomplete_stage; a finished stage the checks below refuse is removed by the next run.
 trap drop_incomplete_stage EXIT
 where=(-ngl 999) run=(env)
 if [ "$cpu" = 1 ]; then where=(-ngl 0 -t 16) run=(env CUDA_VISIBLE_DEVICES=); fi
