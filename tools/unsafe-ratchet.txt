@@ -237,7 +237,9 @@ gguf 9 2 0
 # prefill_512_p (one unsafe fn) has 23 blocks: query read/stage (2), key/value stage address/copy/zero/commit (4),
 # ldmatrix pointer formation and address conversion (6), cp.async waits (2), score loads and MMA calls (4),
 # exchange write/read (2), value load and MMA calls (3). Each block has its SAFETY line; shared macros count once.
-gpu 1814 198 10
+# PIN(2026-10-15): gpu 1814 -> 1816 blocks, new code, not old code relaxed: relu_sqr returns with the nemotron_h
+# body that calls it (its input and output through raw pointers), each block with its SAFETY line.
+gpu 1816 198 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

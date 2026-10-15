@@ -313,6 +313,7 @@ generate_ds41   qwen3moe_router_norm_m_prefetch          0           0
 generate_ds41   qwen3moe_router_norm_prefetch            0           0
 generate_ds41   qwen3moe_router_route                    0           0
 generate_ds41   qwen3moe_token_major                     0           0
+generate_ds41   relu_sqr                                 0           0
 generate_ds41   rms_norm                                 0           0
 generate_ds41   rope                                     0           0
 generate_ds41   router_topk                              0           0
@@ -559,6 +560,7 @@ gate_e2e   qwen3moe_router_norm_m_prefetch          0           0
 gate_e2e   qwen3moe_router_norm_prefetch            0           0
 gate_e2e   qwen3moe_router_route                    0           0
 gate_e2e   qwen3moe_token_major                     0           0
+gate_e2e   relu_sqr                                 0           0
 gate_e2e   rms_norm                                 0           0
 gate_e2e   rope                                     0           0
 gate_e2e   router_topk                              0           0
