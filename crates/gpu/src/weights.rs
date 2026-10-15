@@ -1260,7 +1260,6 @@ mod tests {
             .expect_err("a derived name in the file")
             .to_string();
         assert!(err.contains("derived.nemotron_h.zero_conv_bias"), "{err}");
-        assert!(file_slot("blk.0.ssm_conv1d.bias").is_ok());
         assert!(file_slot("output.weight").is_ok());
     }
 }

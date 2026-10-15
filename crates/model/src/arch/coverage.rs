@@ -839,6 +839,43 @@ const TYPE_PINS: &[TypePin] = &[
         what: "dense FFN (the body reads q5_0, q8_0, q4_K and q6_K)",
         reads: NEMOTRON_SITES,
     },
+    TypePin {
+        program: Program::NemotronHBody,
+        role: Role::Attention,
+        matrices: false,
+        names: Some(|n| {
+            use super::nemotron_h::names as nm;
+            [
+                nm::ATTN_NORM,
+                nm::SSM_A,
+                nm::SSM_D,
+                nm::SSM_DT_BIAS,
+                nm::SSM_CONV,
+                nm::SSM_CONV_BIAS,
+                nm::SSM_NORM,
+            ]
+            .into_iter()
+            .any(|stem| n.ends_with(stem))
+        }),
+        what: "Mamba-2 parameters and normalization gains (the body reads f32 and bf16)",
+        reads: &[GgmlType::F32, GgmlType::BF16],
+    },
+    TypePin {
+        program: Program::NemotronHBody,
+        role: Role::FfnNorm,
+        matrices: false,
+        names: None,
+        what: "normalization gains (the body reads f32 and bf16)",
+        reads: &[GgmlType::F32, GgmlType::BF16],
+    },
+    TypePin {
+        program: Program::NemotronHBody,
+        role: Role::Head,
+        matrices: false,
+        names: Some(|n| n == "output_norm.weight"),
+        what: "output normalization gain (the head reads f32 and bf16)",
+        reads: &[GgmlType::F32, GgmlType::BF16],
+    },
 ];
 
 /// A tensor family whose type a program pins by the card kernel table's
@@ -2056,15 +2093,24 @@ mod tests {
             proj("blk.2.ffn_up.weight", Role::DenseFfn),
             ["f32 dense FFN (the body reads q5_0, q8_0, q4_K and q6_K)".to_string()]
         );
-        assert_eq!(
-            whole(
-                "blk.0.ssm_a",
-                Role::Attention,
-                GgmlType::F32,
-                "(the body reads"
-            ),
-            Vec::<String>::new()
-        );
+        let vector =
+            |name: &str, role: Role, ty: GgmlType| whole(name, role, ty, "reads f32 and bf16");
+        for (name, role) in [
+            ("blk.0.attn_norm.weight", Role::Attention),
+            ("blk.0.ssm_a", Role::Attention),
+            ("blk.0.ssm_d", Role::Attention),
+            ("blk.0.ssm_dt.bias", Role::Attention),
+            ("blk.0.ssm_conv1d.weight", Role::Attention),
+            ("blk.0.ssm_conv1d.bias", Role::Attention),
+            ("blk.0.ssm_norm.weight", Role::Attention),
+            ("blk.2.attn_norm.weight", Role::FfnNorm),
+            ("output_norm.weight", Role::Head),
+        ] {
+            for ty in [GgmlType::F32, GgmlType::BF16] {
+                assert_eq!(vector(name, role, ty), Vec::<String>::new(), "{name} {ty}");
+            }
+            assert_eq!(vector(name, role, GgmlType::Q8_0).len(), 1, "{name} q8_0");
+        }
     }
 
     /// The dense block's pin (mimo2, glm5next) and glm5next's shared-expert pin

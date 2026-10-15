@@ -357,21 +357,24 @@ mod gate {
         // an empty cache.
         let (prose_answer, _) = greedy(&url, prose.clone(), N, &d, "prose", false)?;
         let (turn_answer, turn_body) = greedy(&url, turn.clone(), N, &d, "turn", false)?;
-        clause(
-            ok,
-            "chat_is_200",
-            chat_is_those_ids(&url, &d, messages, N, (&turn_answer, &turn_body)),
-        );
-        clause(
-            ok,
-            "edit_resend_is_a_fresh_run",
-            edit_resend(&url, &d, &prose),
-        );
-        clause(
-            ok,
-            "extension_keeps_the_held_sequence",
-            extension(&url, &d, &prose, &prose_answer),
-        );
+        // A clause whose requests fail is that clause's FAIL, printed; the gate goes on.
+        for (name, run) in [
+            (
+                "chat_is_200",
+                chat_is_those_ids(&url, &d, messages, N, (&turn_answer, &turn_body)),
+            ),
+            ("edit_resend_is_a_fresh_run", edit_resend(&url, &d, &prose)),
+            (
+                "extension_keeps_the_held_sequence",
+                extension(&url, &d, &prose, &prose_answer),
+            ),
+        ] {
+            let pass = run.unwrap_or_else(|e| {
+                println!("{name}: {e}");
+                false
+            });
+            check(ok, name, pass);
+        }
         println!("server stopped: {}", s.stop()?);
         Ok(Some(Answers {
             prose,
@@ -379,16 +382,6 @@ mod gate {
             prose_answer,
             turn_answer,
         }))
-    }
-
-    /// A clause whose requests may fail: the error is the clause's FAIL, printed, and the gate goes
-    /// on to the clauses after it.
-    fn clause(ok: &mut bool, name: &str, run: Result<bool, GateError>) {
-        let pass = run.unwrap_or_else(|e| {
-            println!("{name}: {e}");
-            false
-        });
-        check(ok, name, pass);
     }
 
     /// `edit_resend_is_a_fresh_run` (the module header): the slot holds the prose prompt and its
