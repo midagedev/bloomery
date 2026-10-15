@@ -47,6 +47,8 @@ reference; what follows is the contract.
     just gate / smoke         # static checks, lint, fast library gates / the round loop's subset
     just gate-<name>          # one subsystem's tests, bounded, real exit code
     just gate-ptx-spill       # every PTX entry's spill/jit_local bytes against tools/ref/ptx-shapes.tsv
+    just canon-check BASE     # the move proof in one command: both sides' --no-jit scans of the scan set, then ptx-canon on every
+                              # entry whose md5 moved; rc 0 = every entry the same program (--worktree: an uncommitted tree)
     just mac-check / mac-lint / mac-fmt-check / mac-static / mac-test   # the Mac's static tier (above)
     just records-refresh      # tools/bloomery/schema/ and tools/flow/plans/ after a record kind or prompt-call plan
                               # change, each plan at the plan room (tools/ref/plan-room.sh)
@@ -85,8 +87,8 @@ wrong is the finding.
 
 | Change class | Proof | Runtime gate | Timed A/B |
 |---|---|---|---|
-| move, split, rename | `just ptx-scan` identical (`--no-jit` suffices: no card, no gate lock); host dispatch code also keeps its structural lines (graph node count, eager = replay, e2e set identical) | none beyond those lines | none |
-| delete | ptx-scan of `generate_ds41` and `gate_e2e` = base minus exactly the deleted entries; `gate-ptx-spill` red on exactly those rows before `ptx-shapes.tsv` loses them; per entry, the grep that shows no caller. A remaining entry whose md5 moves needs `tools/ref/ptx-canon.py` = `reordered-only` and equal resource columns | the owning gates of what it touched (bit-identical for a moved md5); a removed gate, case or arm is a coverage change with a dated reason | none |
+| move, split, rename | `just ptx-scan` identical (`--no-jit` suffices: no card, no gate lock; `just canon-check BASE` proves it for the whole scan set in one command); host dispatch code also keeps its structural lines (graph node count, eager = replay, e2e set identical) | none beyond those lines | none |
+| delete | ptx-scan of `generate_ds41` and `gate_e2e` = base minus exactly the deleted entries; `gate-ptx-spill` red on exactly those rows before `ptx-shapes.tsv` loses them; per entry, the grep that shows no caller. A remaining entry whose md5 moves needs `tools/ref/ptx-canon.py` = `reordered-only` and equal resource columns (`just canon-check BASE` runs it) | the owning gates of what it touched (bit-identical for a moved md5); a removed gate, case or arm is a coverage change with a dated reason | none |
 | add (no engine caller yet) | ptx-scan = base plus exactly the new entries; `gate-ptx-spill` red on exactly them before pinning; the family gate green with FAIL-first per clause | the new family gate, and the owning gates of entries engine bins gained | none |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
 | launch count only | Δt = ΔN × c_node | the owning gate | once, only if occupancy moves too |

@@ -146,6 +146,21 @@ affected BASE='main' *ARGS:
 narrow BASE HEAD='HEAD' OUT='' DRY='' TREE='':
     ./tools/narrow-scan.sh {{BASE}} {{ if HEAD != 'HEAD' { HEAD } else { '' } }} {{TREE}} {{DRY}} {{ if OUT != '' { '--out "' + OUT + '"' } else { '' } }}
 
+# The proof that a kernel move is bit-identical, in one command (AGENTS.md's change-class table): `just narrow`'s two --no-jit scans
+# BASE..HEAD (`--worktree` for this tree's current content; same dirs, lock and base-side cache), with each bin's PTX modules
+# brought back, then `ptx-canon.py --scans` per bin and `ptx-canon.py BASE.ptx HEAD.ptx ENTRY` for every entry whose md5
+# moved. Prints one line per moved entry and a summary (`canon-check: N bins, M entries: i identical, r reordered-only, d differs,
+# o only-on-one-side; rows equal|moved: …`); exit 0 only when no entry differs, none is on one side only, every swapped pair is
+# independent and every compared row column is equal, 1 otherwise, 2 on a refusal named (a missing module, a failed scan, a
+# usage error), 75 on contention. Runs no gate and takes no lease, no hold, no card and no gate lock. `--out DIR` keeps the scan
+# logs, the modules and DIR/canon/ (the diffs; default ~/.cache/bloomery/canon/<tree>/<base8>-<head8>, <base8>-worktree);
+# `--dry-run` prints the scan set and touches no box. The owner is tools/canon-check.sh (`--from DIR` re-judges a kept dir).
+[arg("OUT", long="out")]
+[arg("DRY", long="dry-run", value="--dry-run")]
+[arg("TREE", long="worktree", value="--worktree")]
+canon-check BASE HEAD='HEAD' OUT='' DRY='' TREE='':
+    ./tools/canon-check.sh {{BASE}} {{ if HEAD != 'HEAD' { HEAD } else { '' } }} {{TREE}} {{DRY}} {{ if OUT != '' { '--out "' + OUT + '"' } else { '' } }}
+
 # 호스트 rustflags의 두 소유자(.cargo/config.toml, .cargo/cuda-oxide.toml)가 같은지 — 맥에서, 빌드 없음.
 check-rustflags:
     ./tools/check-rustflags.sh

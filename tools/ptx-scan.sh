@@ -56,6 +56,11 @@
 #   (tools/ptx-spill-check.sh) read the JIT columns and need the full scan. Every reader of a scan
 #   (tools/ref/ptx-canon.py, tools/recipes.py `affected --narrow`, tools/ptx-spill-check.sh) reads the
 #   banner's `jit=` and the cell, and never takes the marker for a value.
+#   PTX_SCAN_KEEP=<dir> keeps the extractor's modules: every mod<N>.ptx it wrote (the raw module text, which is what
+#   tools/ref/ptx-canon.py reads, not the extractor's --norm bodies) is copied into <dir>, made if missing, after the older
+#   mod<N>.ptx files there are removed (other files stay). Nothing else changes: the same stdout and stderr, the same
+#   exit status; a <dir> that cannot take the copy is a failed scan (`keep=failed`). Unset or empty writes nothing.
+#   `tools/narrow-scan.sh --keep-ptx` sets it on the box and `tools/canon-check.sh` reads what it brought back.
 #   tools/ptx-scan.sh --self-test exercises synthetic PTX with stub tools, no CUDA toolkit or card.
 # Output puts entries that have a depot first, then by name ascending — a depot is the defect and
 # the rest is context.
@@ -100,6 +105,7 @@
 #   rows=0               no entry, or none the entry substring matches
 #   digest-unread=NAME   the extractor wrote no normalized body for these entries (`method`: it named
 #                        no digest method)
+#   keep=failed          PTX_SCAN_KEEP names a directory the modules could not be copied into
 # 2: a usage error (no binary, more than one entry substring, a flag other than --no-jit).
 # 64: an arch the blk/SM column holds no limits for (BLOOMERY_ARCH or PTX_SCAN_ARCH; see the column below).
 #
@@ -314,6 +320,30 @@ printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t
     rejected = scan(["--no-jit", "gate_x"], {"PTX_FIX_FAIL": "1"})
     check("assembler failure prints no rows", rejected.returncode == 1
           and "ptxas-failed=mod1,mod2 scan=failed" in rejected.stdout and "entry " not in rejected.stdout)
+    # PTX_SCAN_KEEP=<dir> keeps the extractor's modules (what tools/ref/ptx-canon.py reads) and changes nothing else; unset or
+    # empty writes nothing anywhere.
+    keep = root / "keep"
+    kept = scan(["--no-jit", "gate_x"], {"PTX_SCAN_KEEP": str(keep)})
+    check("PTX_SCAN_KEEP: the scan's stdout and stderr are the unset scan's, byte for byte",
+          kept.returncode == 0 and kept.stdout == result.stdout and kept.stderr == result.stderr)
+    check("PTX_SCAN_KEEP: <dir> holds exactly the extractor's modules, byte for byte",
+          keep.is_dir() and sorted(p.name for p in keep.iterdir()) == ["mod1.ptx", "mod2.ptx"]
+          and all((keep / m).read_bytes() == (fixture / m).read_bytes() for m in ("mod1.ptx", "mod2.ptx")))
+    keep.mkdir(exist_ok=True)
+    (keep / "mod9.ptx").write_text("stale\n", encoding="utf-8")
+    (keep / "notes.txt").write_text("mine\n", encoding="utf-8")
+    scan(["--no-jit", "gate_x"], {"PTX_SCAN_KEEP": str(keep)})
+    check("PTX_SCAN_KEEP: a stale module of an older scan goes, a file that is no module stays",
+          sorted(p.name for p in keep.iterdir()) == ["mod1.ptx", "mod2.ptx", "notes.txt"])
+    empty = scan(["--no-jit", "gate_x"], {"PTX_SCAN_KEEP": ""})
+    check("PTX_SCAN_KEEP empty is unset: the same output, no directory made",
+          empty.returncode == 0 and empty.stdout == result.stdout and empty.stderr == result.stderr
+          and not any(p.name.startswith("mod") for p in tree.iterdir()))
+    (root / "keep-file").write_text("a file, not a directory\n", encoding="utf-8")
+    refused = scan(["--no-jit", "gate_x"], {"PTX_SCAN_KEEP": str(root / "keep-file")})
+    check("PTX_SCAN_KEEP: a <dir> that cannot take the modules fails the scan by name, no rows",
+          refused.returncode == 1 and "keep=failed scan=failed" in refused.stdout and "entry " not in refused.stdout
+          and "PTX_SCAN_KEEP=" in refused.stderr)
     before, after = root / "before.scan", root / "after.scan"
     before.write_text(result.stdout, encoding="utf-8")
     after.write_text(result.stdout, encoding="utf-8")
@@ -422,6 +452,13 @@ fi
 if [ ! -x "$PTXAS" ]; then
   echo "ptx-scan: no $PTXAS — regs/smem/spill/blk cannot be read" >&2
   fail "$SEC $TOOLS modules=$NMOD"
+fi
+# PTX_SCAN_KEEP=<dir> (header): the extractor's modules go to <dir> before the trap removes them. Unset or empty: nothing.
+if [ -n "${PTX_SCAN_KEEP:-}" ]; then
+  if ! { mkdir -p "$PTX_SCAN_KEEP" && rm -f "$PTX_SCAN_KEEP"/mod[0-9]*.ptx && cp "$MODS"/mod[0-9]*.ptx "$PTX_SCAN_KEEP/"; }; then
+    echo "ptx-scan: PTX_SCAN_KEEP=$PTX_SCAN_KEEP: the modules cannot be kept there" >&2
+    fail "$SEC $TOOLS modules=$NMOD keep=failed"
+  fi
 fi
 MODFILES=()
 for ((i = 1; i <= NMOD; i++)); do MODFILES+=("$MODS/mod$i.ptx"); done

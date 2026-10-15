@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # `just narrow BASE [HEAD]`: the scans `just affected --narrow` needs, taken for you.
-#   tools/narrow-scan.sh BASE [HEAD] [--out DIR] [--dry-run]
-#   tools/narrow-scan.sh BASE --worktree [--out DIR] [--dry-run]
+#   tools/narrow-scan.sh BASE [HEAD] [--out DIR] [--dry-run] [--keep-ptx] [--scan-only]
+#   tools/narrow-scan.sh BASE --worktree [--out DIR] [--dry-run] [--keep-ptx] [--scan-only]
 #   tools/narrow-scan.sh --self-test
 #
 # What it does, in order:
@@ -25,6 +25,28 @@
 #      `--worktree`) with every pair, printing its output: the narrowed list with its why-lines, and the `recipes:`
 #      line to paste. DIR/narrowed.txt keeps it.
 #
+#   `--keep-ptx` (unset: everything above, byte for byte) has each side's runner keep every bin's PTX modules
+#   (`PTX_SCAN_KEEP`, tools/ptx-scan.sh) and send them after the bin's scan block, as `=== narrow-scan ptx begin <bin>`,
+#   a base64 of a gzipped tar of its mod<N>.ptx files (the raw module text tools/ref/ptx-canon.py reads), and
+#   `=== narrow-scan ptx end <bin> rc=<n>`; they arrive locally under DIR/<side>/<bin>.ptx/. The block sits outside
+#   the scan's own, so DIR/<side>/<bin>.log is the unset run's. A side that sends no block, a cut or failed one, or a
+#   member that is not a flat mod<N>.ptx ends the run (rc 1) by name; the MANIFEST then carries `keep_ptx=1`.
+#   `--scan-only` skips step 4's affected run (it prints no narrowed list, writes no narrowed.txt, and the MANIFEST
+#   says `affected_rc=skipped`): the caller reads the scans itself (tools/canon-check.sh).
+#
+# The base side's cache. BASE is a commit, so its side (the scan logs and, with --keep-ptx, the PTX modules) is the same
+# whenever its inputs are: the BASE sha, the md5 of this tree's tools/ptx-scan.sh (the scanner both sides run), the scan set
+# (scan-set.tsv's md5), the runner's md5 (the build lines), the arch and whether --keep-ptx is set. A run whose key has an
+# entry under ~/.cache/bloomery/narrow-base/<base8>-<key16>/ prints `narrow-scan: base <sha> from cache <dir>`, copies
+# <dir>/base/ into DIR/base/ as a fresh run lays it out and makes no box call for the base side (the head side runs as
+# always). Any key part different is a miss. An entry is written whole (a temp dir and a rename) only after the side
+# finished with every bin's scan rc 0 and, under --keep-ptx, every bin's modules; a failed or partial side is never kept.
+# An entry whose MANIFEST is missing or lacks a key part, or that lacks a bin's log (or modules under --keep-ptx), is named
+# in a line (`cache entry <dir> is corrupt (<why>)`), removed and rebuilt: a part of an entry is never used. NARROW_NO_CACHE=1
+# forces a miss (the cache is not read); the run's result then replaces that key's entry. The head side is never cached, and
+# the toolkit on the box is not in the key: a ptxas move shows as moved table rows against the cached base, so after one
+# remove ~/.cache/bloomery/narrow-base or run once with NARROW_NO_CACHE=1. The MANIFEST names it: `base_cache=hit|miss`.
+#
 # The remote dirs are per track and persist across runs: ~/repo/bloomery-<track>-narrow-base and -narrow-head, <track>
 # this tree's directory name without "bloomery-" (the main tree's pair: ~/repo/bloomery-narrow-base and -narrow-head), so
 # two tracks never wait on each other's dirs. A second run builds incrementally: the BASE side costs a sync and the scans
@@ -41,6 +63,10 @@
 # NARROW_HEAD_REMOTE name other dirs. The names follow the
 # auxiliary-dir rule (bloomery-<track>-<suffix>): once the track's worktree is gone, `just box-tracks --remove
 # <track>-narrow-base <track>-narrow-head` clears them (the main tree's: `narrow-base narrow-head`).
+#
+# A side whose box command ends rc 255 (ssh lost the box) runs once more: its recorded remote runner is ended first (the
+# stop's READONLY call below), then the side runs again in the same remote dir. One line says so, the MANIFEST carries
+# `retried=<sides>` and the done line `(retried: <sides>)`; a second 255 ends the run rc 255. No other code is retried.
 #
 # Stopping (INT/TERM): the side in flight ends from both ends, by pids it recorded and never by a name match. Its box
 # command writes the pid of the `timeout` it started to .narrow-scan-<side>-<pid>.pid in the remote dir (removed when the
@@ -59,7 +85,8 @@
 #
 # DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>, <base8>-worktree under `--worktree`) keeps: scan-set.tsv, runner.sh (the script each side
 # runs), <side>.build.log (the box's stderr: the builds), <side>.scan.out, <side>/<bin>.log (the scan logs a landing
-# cites), narrowed.txt and MANIFEST; <side>.box.pid while the side runs.
+# cites), narrowed.txt and MANIFEST; <side>.box.pid while the side runs. Under --keep-ptx also <side>/<bin>.ptx/mod<N>.ptx; a
+# cached base side has no base.build.log and no base.scan.out; base-cache.key holds the cache key's parts.
 #
 # NARROW_BOUND (default 7200 s, a hang guard: no box-job length needs approval) bounds the whole run: each side's box command runs under `timeout` with what
 # is left. A cut build keeps its compiled crates, so running again continues it. Exit codes: 0 done; 64 usage; 75
@@ -69,7 +96,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds; tools/recipes.py SCAN_PACKAGE
 ARCH=sm_86 # the arch of the scans, the recipes' default (BLOOMERY_ARCH, tools/arch.sh); the pairs are built at no other
-USAGE="usage: narrow-scan.sh BASE [HEAD | --worktree] [--out DIR] [--dry-run] | --self-test"
+USAGE="usage: narrow-scan.sh BASE [HEAD | --worktree] [--out DIR] [--dry-run] [--keep-ptx] [--scan-only] | --self-test"
 
 die() { # die <rc> <message>
   echo "narrow-scan: $2" >&2
@@ -97,11 +124,13 @@ worktree_key() {
   } | if command -v md5sum > /dev/null; then md5sum | cut -d' ' -f1; else md5 -q; fi
 }
 
-# make_runner <scan-set.tsv> <ptx-scan.sh> <runner out>: the script a side runs on the box. It writes ptx-scan.sh to a
+# make_runner <scan-set.tsv> <ptx-scan.sh> <runner out> [keep]: the script a side runs on the box. It writes ptx-scan.sh to a
 # temp file, builds each feature group (the builds' output goes to stderr: stdout carries the scan blocks only), builds
-# the extractor, and prints each bin's scan between `=== narrow-scan begin <bin>` and `end <bin> rc=<n>` markers.
+# the extractor, and prints each bin's scan between `=== narrow-scan begin <bin>` and `end <bin> rc=<n>` markers. With
+# keep = 1 each scan also keeps its modules (PTX_SCAN_KEEP) and the bin's modules follow the scan's end marker as a
+# base64 gzipped tar between `=== narrow-scan ptx begin <bin>` and `ptx end <bin> rc=<n>`; keep 0 or unset adds nothing.
 make_runner() {
-  local tsv=$1 scanner=$2 out=$3 bin feats covers f b groups='' line
+  local tsv=$1 scanner=$2 out=$3 keep=${4:-0} bin feats covers f b groups='' line
   local bins=() featl=()
   while IFS=$'\t' read -r bin feats covers; do
     [ -n "$bin" ] || continue
@@ -122,6 +151,7 @@ make_runner() {
     cat "$scanner"
     [ "$(tail -c 1 "$scanner" | wc -l)" -eq 1 ] || printf '\n'
     echo 'NARROW_PTX_SCAN_EOF'
+    [ "$keep" != 1 ] || echo 'K=$(mktemp -d) || exit 70'
     # one `cargo oxide build` per distinct feature list, its bins in the set's order
     for f in "${featl[@]}"; do
       case " $groups " in *" $f "*) continue ;; esac
@@ -139,10 +169,18 @@ make_runner() {
     echo "echo \"narrow-scan: wall: build, extractor: \$((SECONDS - t)) s\" >&2"
     for b in "${bins[@]}"; do
       echo 't=$SECONDS'
-      echo "echo '=== narrow-scan begin $b'; bash \"\$P\" --no-jit $b 2>&1; echo \"=== narrow-scan end $b rc=\$?\""
+      if [ "$keep" = 1 ]; then
+        echo "echo '=== narrow-scan begin $b'; PTX_SCAN_KEEP=\"\$K/$b\" bash \"\$P\" --no-jit $b 2>&1; echo \"=== narrow-scan end $b rc=\$?\""
+        echo "echo '=== narrow-scan ptx begin $b'"
+        echo "tar -czf - -C \"\$K/$b\" . | base64"
+        echo "echo \"=== narrow-scan ptx end $b rc=\$?\""
+      else
+        echo "echo '=== narrow-scan begin $b'; bash \"\$P\" --no-jit $b 2>&1; echo \"=== narrow-scan end $b rc=\$?\""
+      fi
       echo "echo \"narrow-scan: wall: scan $b: \$((SECONDS - t)) s\" >&2"
     done
     echo 'rm -f "$P"'
+    [ "$keep" != 1 ] || echo 'rm -rf "$K"'
   } > "$out"
 }
 
@@ -171,6 +209,117 @@ split_logs() {
       }
       exit bad
     }' "$file"
+}
+
+# The decoder split_ptx runs, kept in a function so that no here-document sits inside a command substitution (the Mac's bash 3.2).
+# argv: the base64 file, the out dir, the bin name. A tar's members must be flat mod<N>.ptx regular files; anything else is
+# refused before a byte is written.
+ptx_decode_py() {
+  cat << 'NARROW_PTX_DECODE_EOF'
+import base64, binascii, io, os, re, sys, tarfile
+src, out, name = sys.argv[1:4]
+try:
+    raw = base64.b64decode(open(src, "rb").read(), validate=False)
+    tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+    members = tf.getmembers()
+except (binascii.Error, tarfile.TarError, OSError, EOFError, ValueError) as e:
+    sys.exit(f"{name}: the ptx block does not decode ({e})")
+files = []
+for m in members:
+    base = m.name[2:] if m.name.startswith("./") else m.name
+    if m.isdir() and base in ("", "."):
+        continue
+    if not (m.isreg() and re.fullmatch(r"mod[0-9]+\.ptx", base)):
+        sys.exit(f"{name}: the ptx block holds a member that is not mod<N>.ptx: {m.name!r}")
+    files.append((base, m))
+if not files:
+    sys.exit(f"{name}: the ptx block holds no module")
+os.makedirs(out)
+for base, m in files:
+    with open(os.path.join(out, base), "wb") as f:
+        f.write(tf.extractfile(m).read())
+NARROW_PTX_DECODE_EOF
+}
+
+# split_ptx <scan.out> <dir> <bin>...: the keep runner's ptx blocks of the box's stdout, each cut into <dir>/<bin>.ptx/ as the
+# mod<N>.ptx files its tar holds. Non-zero when a block is missing, unterminated, ended non-zero, does not decode, holds no
+# module, or holds a member that is not a flat mod<N>.ptx (nothing is written for such a tar); the reasons are printed.
+split_ptx() {
+  local file=$1 dir=$2 b bad=0 msg
+  shift 2
+  mkdir -p "$dir"
+  for b in "$@"; do rm -rf "$dir/$b.ptx" "$dir/$b.ptx.b64"; done
+  awk -v dir="$dir" -v want="$*" '
+    BEGIN { n = split(want, W, " "); for (i = 1; i <= n; i++) need[W[i]] = 1 }
+    /^=== narrow-scan ptx begin / {
+      if (cur != "") { print "ptx block " cur " has no end marker"; bad = 1; close(file) }
+      cur = $5; file = dir "/" cur ".ptx.b64"; printf "" > file; seen[cur] = "open"; next
+    }
+    /^=== narrow-scan ptx end / {
+      if ($5 != cur) { print "ptx end marker for " $5 " outside its block (inside " (cur == "" ? "none" : cur) ")"; bad = 1; next }
+      rc = $6; sub(/^rc=/, "", rc); seen[cur] = (rc == "0" ? "ok" : "rc=" rc); close(file); cur = ""; next
+    }
+    cur != "" { print >> file }
+    END {
+      if (cur != "") { print "ptx block " cur " has no end marker: the box output was cut"; bad = 1 }
+      for (b in need) {
+        if (!(b in seen)) { print "no ptx block for " b; bad = 1 }
+        else if (seen[b] != "ok") { print "the ptx block of " b " ended " seen[b]; bad = 1 }
+      }
+      exit bad
+    }' "$file" || bad=1
+  [ "$bad" = 0 ] || return 1
+  for b in "$@"; do
+    msg=$(python3 -I -c "$(ptx_decode_py)" "$dir/$b.ptx.b64" "$dir/$b.ptx" "$b" 9>&- 2>&1) || { echo "$msg"; bad=1; continue; }
+    rm -f "$dir/$b.ptx.b64"
+  done
+  return "$bad"
+}
+
+# The base side's cache (header): the logs and modules of a finished base side, kept by what they were made from. cache_parts
+# prints the key's parts, one per line; the entry's dir is <root>/<base8>-<first 16 hex of the parts' md5>, and its MANIFEST
+# carries the parts again (compared line by line on a hit), the bins and the date.
+cache_parts() { # cache_parts <scanner> <scan-set.tsv> <runner.sh>
+  echo "base=$BASE_SHA"
+  echo "ptx_scan_md5=$(md5_of "$1" 9>&-)"
+  echo "scan_set_md5=$(md5_of "$2" 9>&-)"
+  echo "runner_md5=$(md5_of "$3" 9>&-)"
+  echo "arch=$ARCH"
+  echo "keep_ptx=$KEEP"
+}
+
+# cache_check <entry dir> <parts file> <bin>...: 0 when the entry is complete for this key; else 1 and the reason on stdout.
+cache_check() {
+  local dir=$1 parts=$2 line b
+  shift 2
+  [ -s "$dir/MANIFEST" ] || { echo "its MANIFEST is missing"; return 1; }
+  while IFS= read -r line; do
+    grep -qxF "$line" "$dir/MANIFEST" || { echo "its MANIFEST does not carry '$line'"; return 1; }
+  done < "$parts"
+  grep -qxF "bins=$*" "$dir/MANIFEST" || { echo "its MANIFEST does not carry 'bins=$*'"; return 1; }
+  for b in "$@"; do
+    [ -s "$dir/base/$b.log" ] || { echo "$dir/base/$b.log is missing or empty"; return 1; }
+    if [ "$KEEP" = 1 ] && ! ls "$dir/base/$b.ptx"/mod[0-9]*.ptx > /dev/null 2>&1; then
+      echo "$dir/base/$b.ptx holds no module"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# cache_store <entry dir> <parts file> <bin>...: the finished base side in DIR/base/ becomes the entry: written whole in a
+# temporary directory of the root (a dot name no lookup reads) and renamed into place, so a reader never sees part of one. A
+# failure to store is a named note, not a failed run: the cache is a saving, the scans are in DIR.
+cache_store() {
+  local dir=$1 parts=$2 root tmp
+  shift 2
+  root=$(dirname "$dir")
+  tmp=$root/.tmp-$$-$(basename "$dir")
+  { mkdir -p "$root" && rm -rf "$tmp" && mkdir "$tmp" && cp -R "$OUT/base" "$tmp/base" \
+    && { cat "$parts"; echo "bins=$*"; echo "created=$(date +%Y-%m-%dT%H:%M:%S)"; } > "$tmp/MANIFEST"; } 9>&- \
+    && { rm -rf "$dir" && python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$tmp" "$dir"; } 9>&- \
+    || { echo "narrow-scan: the base side's cache entry $dir could not be written; the scans are in $OUT" >&2; rm -rf "$tmp" 9>&-; return 0; }
+  echo "narrow-scan: base side cached: $dir"
 }
 
 # lock_take <lock path> <wait seconds> <who>: one run at a time uses a pair of persistent remote dirs.
@@ -362,6 +511,9 @@ run_side() {
 self_test() {
   local t n=0 bad=0 want rc got
   unset BLOOMERY_ARCH
+  # The base side's cache is off for every run below but its own cases (they set NARROW_NO_CACHE=0): a hit would skip the side the
+  # older cases assert on.
+  export NARROW_NO_CACHE=1
   t=$(mktemp -d "${TMPDIR:-/tmp}/narrow-scan-test.XXXXXX") || die 70 "self-test: no temporary directory"
   # ok <name> <condition rc>
   ok() {
@@ -394,6 +546,15 @@ self_test() {
   got=$(cd "$t" && bash -c "$(stop_command .no-such.pid 2> /dev/null)" 2>&1)
   grep -qF "no remote pid recorded in .no-such.pid" <<< "$got"; ok "stop command: with no pid file it says so and signals nothing" $?
   grep -q "the build with features gpu failed" "$t/runner.sh" && grep -q "the extractor build failed" "$t/runner.sh"; ok "runner: a failed build ends it by name" $?
+  # --keep-ptx: the runner keeps each bin's modules and sends them after the scan's block; unset it is the plain runner
+  make_runner "$t/set.tsv" "$t/ptx-scan.sh" "$t/runner-0.sh" 0 && cmp -s "$t/runner.sh" "$t/runner-0.sh"; ok "keep off: an explicit 0 writes the runner the default writes" $?
+  ! grep -qE 'PTX_SCAN_KEEP|ptx begin|ptx end|^K=|^tar ' "$t/runner.sh"; ok "keep off: the runner names no keep dir, no ptx block, no tar" $?
+  make_runner "$t/set.tsv" "$t/ptx-scan.sh" "$t/runner-keep.sh" 1; ok "keep on: runner written" $?
+  bash -n "$t/runner-keep.sh"; ok "keep on: runner parses" $?
+  [ "$(grep -c 'PTX_SCAN_KEEP="$K/' "$t/runner-keep.sh")" = 3 ] && [ "$(grep -c -- '--no-jit' "$t/runner-keep.sh")" = 3 ]; ok "keep on: each bin's --no-jit scan keeps its modules under its own dir" $?
+  [ "$(grep -c '^echo .=== narrow-scan ptx begin ' "$t/runner-keep.sh")" = 3 ] && [ "$(grep -c '^echo "=== narrow-scan ptx end ' "$t/runner-keep.sh")" = 3 ] && [ "$(grep -c '^tar -czf - -C "$K/' "$t/runner-keep.sh")" = 3 ]; ok "keep on: a tar block per bin, after the scan's own end marker" $?
+  awk '/narrow-scan end /{e=1; next} /narrow-scan ptx begin/{if (!e) bad=1; e=0} END{exit bad}' "$t/runner-keep.sh"; ok "keep on: the ptx block is outside the scan's block" $?
+  sed -e '/^K=/d' -e '/narrow-scan ptx begin/d' -e '/^tar -czf/d' -e '/narrow-scan ptx end/d' -e '/^rm -rf "$K"$/d' -e 's/PTX_SCAN_KEEP="$K\/[^"]*" //' "$t/runner-keep.sh" | cmp -s - "$t/runner.sh"; ok "keep on: the keep runner less its keep lines is the plain runner, byte for byte" $?
   # split_logs
   {
     echo 'noise before'; echo '=== narrow-scan begin a'; echo 'row 1'; echo 'row 2'; echo '=== narrow-scan end a rc=0'
@@ -412,6 +573,38 @@ self_test() {
   { echo '=== narrow-scan begin a'; echo '=== narrow-scan begin b'; echo '=== narrow-scan end b rc=0'; } > "$t/nest.out"
   got=$(split_logs "$t/nest.out" "$t/nest" a b 2>&1); rc=$?
   [ "$rc" != 0 ] && grep -qF "block a has no end marker" <<< "$got"; ok "split: a begin inside a block is refused by name" $?
+  # split_ptx <scan.out> <dir> <bin>...: the modules the keep runner sent come back as <dir>/<bin>.ptx/mod<N>.ptx
+  mkdir -p "$t/mods"
+  printf 'module one\n' > "$t/mods/mod1.ptx"
+  printf 'module two\n' > "$t/mods/mod2.ptx"
+  pb=$(tar -czf - -C "$t/mods" . | base64)
+  { echo '=== narrow-scan begin a'; echo 'row'; echo '=== narrow-scan end a rc=0'
+    echo '=== narrow-scan ptx begin a'; echo "$pb"; echo '=== narrow-scan ptx end a rc=0'; } > "$t/ptx-good.out"
+  got=$(split_ptx "$t/ptx-good.out" "$t/ptx-good" a 2>&1); rc=$?
+  [ "$rc" = 0 ] && [ "$(cat "$t/ptx-good/a.ptx/mod1.ptx")" = "module one" ] && [ "$(cat "$t/ptx-good/a.ptx/mod2.ptx")" = "module two" ] \
+    && [ "$(ls "$t/ptx-good/a.ptx" | wc -l | tr -d ' ')" = 2 ] && [ ! -e "$t/ptx-good/a.ptx.b64" ]; ok "split_ptx: two modules come back under <bin>.ptx/, no leftover" $?
+  split_logs "$t/ptx-good.out" "$t/ptx-good-logs" a > /dev/null 2>&1 && [ "$(cat "$t/ptx-good-logs/a.log")" = row ]; ok "split_ptx: the scan log's split ignores the ptx block (the log holds the scan's rows only)" $?
+  { echo '=== narrow-scan begin a'; echo 'row'; echo '=== narrow-scan end a rc=0'; } > "$t/ptx-none.out"
+  got=$(split_ptx "$t/ptx-none.out" "$t/ptx-none" a 2>&1); rc=$?
+  [ "$rc" != 0 ] && grep -qF "no ptx block for a" <<< "$got"; ok "split_ptx: a bin with no ptx block is refused by name" $?
+  { echo '=== narrow-scan ptx begin a'; echo "$pb"; } > "$t/ptx-cut.out"
+  got=$(split_ptx "$t/ptx-cut.out" "$t/ptx-cut" a 2>&1); rc=$?
+  [ "$rc" != 0 ] && grep -qF "ptx block a has no end marker: the box output was cut" <<< "$got"; ok "split_ptx: a cut ptx block is refused by name" $?
+  { echo '=== narrow-scan ptx begin a'; echo '=== narrow-scan ptx end a rc=2'; } > "$t/ptx-rc.out"
+  got=$(split_ptx "$t/ptx-rc.out" "$t/ptx-rc" a 2>&1); rc=$?
+  [ "$rc" != 0 ] && grep -qF "the ptx block of a ended rc=2" <<< "$got"; ok "split_ptx: a tar that ended rc=2 is refused by name" $?
+  { echo '=== narrow-scan ptx begin a'; echo 'not base64 !!'; echo '=== narrow-scan ptx end a rc=0'; } > "$t/ptx-b64.out"
+  got=$(split_ptx "$t/ptx-b64.out" "$t/ptx-b64" a 2>&1); rc=$?
+  [ "$rc" != 0 ] && grep -qF "a: the ptx block does not decode" <<< "$got"; ok "split_ptx: a block that is not a gzipped tar is refused by name" $?
+  mkdir -p "$t/mods-empty"
+  { echo '=== narrow-scan ptx begin a'; tar -czf - -C "$t/mods-empty" . | base64; echo '=== narrow-scan ptx end a rc=0'; } > "$t/ptx-empty.out"
+  got=$(split_ptx "$t/ptx-empty.out" "$t/ptx-empty" a 2>&1); rc=$?
+  [ "$rc" != 0 ] && grep -qF "a: the ptx block holds no module" <<< "$got"; ok "split_ptx: a block with no module is refused by name" $?
+  mkdir -p "$t/mods-bad/sub"
+  printf 'x\n' > "$t/mods-bad/sub/mod1.ptx"
+  { echo '=== narrow-scan ptx begin a'; tar -czf - -C "$t/mods-bad" . | base64; echo '=== narrow-scan ptx end a rc=0'; } > "$t/ptx-sub.out"
+  got=$(split_ptx "$t/ptx-sub.out" "$t/ptx-sub" a 2>&1); rc=$?
+  [ "$rc" != 0 ] && grep -qF "a: the ptx block holds a member that is not mod<N>.ptx" <<< "$got" && [ ! -e "$t/ptx-sub/a.ptx/sub" ]; ok "split_ptx: a member that is not a flat mod<N>.ptx is refused by name, nothing written for it" $?
   # the lock: a free lock is taken, a held one is refused at its bound naming the holder, a dead holder is taken over.
   # The holder is another process. A subshell of this one keeps $$ as this shell, and would inherit
   # fd 9 if this shell already held the flock, so the holder is its own bash.
@@ -595,6 +788,7 @@ self_test() {
     '"$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 9>&- &' \
     '{ git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"; } 9>&-' \
     'split_logs "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&-' \
+    'split_ptx "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&-' \
     'WT_KEY1=$(worktree_key "$BASE_SHA" 9>&-)' \
     '"$ROOT/tools/affected-gates.sh" "$AFFECTED_RANGE" --narrow "${ARGS[@]}" 9>&-' \
     'sleep 0.2 9>&-' \
@@ -607,7 +801,10 @@ self_test() {
     "'; } 9>&-)| \$({" \
     'cat "$OUT/narrowed.txt" 9>&-' \
     'cat "$OUT/narrowed.err" >&2 9>&-' \
-    'ptx_scan_md5=$(md5_of "$ROOT/tools/ptx-scan.sh" 9>&-)'
+    'ptx_scan_md5=$(md5_of "$ROOT/tools/ptx-scan.sh" 9>&-)' \
+    'cp -R "$CACHE_ENTRY/base/." "$OUT/base/" 9>&-' \
+    'rm -rf "$CACHE_ENTRY" 9>&-' \
+    'cache_check "$CACHE_ENTRY" "$OUT/base-cache.key" "${BINS[@]}" 9>&-'
   do
     grep -qF "$site" <<< "$body" || miss=1
   done
@@ -640,6 +837,14 @@ if [ "${BLOOMERY_BOX_READONLY:-0}" = 1 ]; then
 fi
 side=head
 case $BLOOMERY_REMOTE in rb | *narrow-base) side=base ;; esac
+# STUB_FAIL_SIDE=<side> STUB_FAIL_RC=<rc>: that side's first box call ends <rc> (255: ssh lost the box) before it runs
+# anything; STUB_FAIL_ALWAYS=1: every call of that side does.
+if [ "${STUB_FAIL_SIDE:-}" = "$side" ] && { [ -n "${STUB_FAIL_ALWAYS:-}" ] || [ ! -e "$STUB_LOG.failed-$side" ]; }; then
+  : > "$STUB_LOG.failed-$side"
+  echo "$side $BLOOMERY_REMOTE failed rc=$STUB_FAIL_RC" >> "$STUB_LOG"
+  cat > /dev/null
+  exit "$STUB_FAIL_RC"
+fi
 # STUB_HANG: the box.sh itself is held before it starts anything on the box (the sync, the guard's wait).
 if [ -n "${STUB_HANG:-}" ]; then
   mkdir -p "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")"
@@ -656,14 +861,25 @@ if [ -n "${STUB_BLOCK:-}" ]; then
   printf 'exec sleep 60\n' | PATH="$STUB_BIN:$PATH" bash -c "$*"
   exit $?
 fi
-cat > /dev/null
+rf=$(mktemp)
+cat > "$rf"
 new=no
 [ -e "$here/new.txt" ] && new=yes
 echo "$side $BLOOMERY_REMOTE marker=$(cat "$here/marker.txt") new=$new" >> "$STUB_LOG"
 [ "$side" = head ] && [ -n "${STUB_EDIT:-}" ] && echo more >> "$here/marker.txt"
 echo '=== narrow-scan begin gate_x'
 echo 'ptx-scan: mod0 bundle=b bytes=1'
-echo '=== narrow-scan end gate_x rc=0'
+echo "=== narrow-scan end gate_x rc=${STUB_SCANRC:-0}"
+# a keep runner (it names PTX_SCAN_KEEP) is answered with the ptx block it would print; STUB_NOPTX leaves it out
+if grep -q 'PTX_SCAN_KEEP' "$rf" && [ -z "${STUB_NOPTX:-}" ]; then
+  pd=$(mktemp -d)
+  echo "$side module" > "$pd/mod1.ptx"
+  echo '=== narrow-scan ptx begin gate_x'
+  tar -czf - -C "$pd" . | base64
+  echo '=== narrow-scan ptx end gate_x rc=0'
+  rm -rf "$pd"
+fi
+rm -f "$rf"
 NARROW_STUB_EOF
   chmod +x "$w/tools/"*.sh
   git -C "$w" init -q && git -C "$w" config user.email test@test && git -C "$w" config user.name test && git -C "$w" config commit.gpgsign false
@@ -694,6 +910,81 @@ NARROW_STUB_EOF
   [ "$rc" = 1 ] && grep -qF "the working tree changed during the run" <<< "$got"; ok "worktree: a tree edited during the run is refused by name" $?
   wt_run "$t/arg.log" "$wb" "$wb" --worktree --out "$t/arg-out"
   [ "$rc" = 64 ] && grep -qF -- "--worktree takes no HEAD" <<< "$got"; ok "worktree: a HEAD beside --worktree is refused rc 64 by name" $?
+  # --keep-ptx and --scan-only. Unset, the run is the one above: no ptx dir, the affected run, the MANIFEST as before.
+  [ ! -e "$t/wt-out/base/gate_x.ptx" ] && [ ! -e "$t/wt-out/head/gate_x.ptx" ] && ! grep -q 'keep_ptx' "$t/wt-out/MANIFEST" && grep -qx 'affected_rc=0' "$t/wt-out/MANIFEST" \
+    && ! grep -q 'PTX_SCAN_KEEP' "$t/wt-out/runner.sh"; ok "keep off: no ptx dir, no runner keep line, the MANIFEST as before" $?
+  # ssh rc 255 on a side: the side runs once more (its recorded remote runner is ended first, by the READONLY stop call); a second
+  # 255 or any other code is not retried.
+  mkdir -p "$t/remote/rh"
+  STUB_REMOTE=$t/remote STUB_FAIL_SIDE=head STUB_FAIL_RC=255 wt_run "$t/r255.log" "$wb" --worktree --out "$t/r255-out"
+  [ "$rc" = 0 ] && [ "$(grep -c '^head rh ' "$t/r255.log")" = 2 ] && grep -qx 'readonly rh' "$t/r255.log" \
+    && grep -qF "narrow-scan: head: ssh lost the box (rc 255); ending its recorded remote runner and running the side once more" <<< "$got" \
+    && grep -qx 'retried=head' "$t/r255-out/MANIFEST" && grep -q '^narrow-scan: done: .*(retried: head)' <<< "$got"
+  ok "retry: a side whose ssh ends rc 255 runs once more, names the retry and the run ends rc 0" $?
+  rm -f "$t/r255.log.failed-head"
+  STUB_REMOTE=$t/remote STUB_FAIL_SIDE=head STUB_FAIL_RC=255 STUB_FAIL_ALWAYS=1 wt_run "$t/r255b.log" "$wb" --worktree --out "$t/r255b-out"
+  [ "$rc" = 255 ] && [ "$(grep -c '^head rh ' "$t/r255b.log")" = 2 ] && grep -qF "narrow-scan: head: ssh lost the box again (rc 255): retried once, not again" <<< "$got"
+  ok "retry: a second rc 255 ends the run rc 255 after exactly two tries" $?
+  STUB_REMOTE=$t/remote STUB_FAIL_SIDE=head STUB_FAIL_RC=1 wt_run "$t/r1.log" "$wb" --worktree --out "$t/r1-out"
+  [ "$rc" = 1 ] && [ "$(grep -c '^head rh ' "$t/r1.log")" = 1 ] && ! grep -q 'once more' <<< "$got"
+  ok "retry: a box command that ends rc 1 (a build or a scan) is not retried" $?
+  wt_run "$t/keep.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/keep-out"
+  [ "$rc" = 0 ] && [ "$(cat "$t/keep-out/base/gate_x.ptx/mod1.ptx" 2> /dev/null)" = "base module" ] && [ "$(cat "$t/keep-out/head/gate_x.ptx/mod1.ptx" 2> /dev/null)" = "head module" ]; ok "keep: each side's modules arrive under DIR/<side>/<bin>.ptx/" $?
+  grep -q 'PTX_SCAN_KEEP' "$t/keep-out/runner.sh"; ok "keep: the runner each side runs keeps the modules" $?
+  ! grep -q '^affected ' "$t/keep.log" && [ ! -e "$t/keep-out/narrowed.txt" ] && grep -qx 'affected_rc=skipped' "$t/keep-out/MANIFEST" && grep -qx 'keep_ptx=1' "$t/keep-out/MANIFEST"; ok "scan-only: the affected run is skipped and the MANIFEST says so" $?
+  [ "$(cat "$t/keep-out/head/gate_x.log")" = "$(cat "$t/wt-out/head/gate_x.log")" ]; ok "keep: the scan log is the unset run's, byte for byte (the ptx block stays out of it)" $?
+  STUB_NOPTX=1 wt_run "$t/noptx.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/noptx-out"
+  [ "$rc" = 1 ] && grep -qF "no ptx block for gate_x" <<< "$got"; ok "keep: a side that sent no ptx block ends rc 1 by name" $?
+  wt_run "$t/so.log" "$wb" --worktree --scan-only --out "$t/so-out"
+  [ "$rc" = 0 ] && [ ! -e "$t/so-out/base/gate_x.ptx" ] && grep -qx 'affected_rc=skipped' "$t/so-out/MANIFEST" && ! grep -q 'keep_ptx' "$t/so-out/MANIFEST"; ok "scan-only alone: no ptx dir, no keep line" $?
+  wt_run "$t/kd.log" "$wb" --worktree --keep-ptx --dry-run --out "$t/kd-out"
+  [ "$rc" = 0 ] && grep -q 'PTX_SCAN_KEEP' "$t/kd-out/runner.sh" && ! grep -qE '^(base|head) ' "$t/kd.log"; ok "keep: --dry-run writes the keep runner and touches no box" $?
+  # The base side's cache, ~/.cache/bloomery/narrow-base/<key>/ under each case's own HOME: a run with the same BASE, scanner,
+  # scan set, arch and keep flag takes the base side's logs and modules from it and calls no box for that side.
+  ch=$t/chome
+  cr=$ch/.cache/bloomery/narrow-base
+  # cache_run <home> <log> <narrow-scan args...>: a run with the cache on (CACHE_FORCE=1: NARROW_NO_CACHE=1); output in $got, code in $rc
+  cache_run() {
+    local home=$1 log=$2
+    shift 2
+    : > "$log"
+    got=$(HOME="$home" STUB_LOG="$log" NARROW_NO_CACHE="${CACHE_FORCE:-0}" NARROW_BASE_REMOTE=rb NARROW_HEAD_REMOTE=rh bash "$w/tools/narrow-scan.sh" "$@" 2>&1)
+    rc=$?
+  }
+  # nent <dir>: the entries of the cache root, a temporary directory included
+  nent() { ls -A "$1" 2> /dev/null | wc -l | tr -d ' '; }
+  cache_run "$ch" "$t/c1.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c1-out"
+  ent=$cr/$(ls -A "$cr" 2> /dev/null | head -n 1)
+  [ "$rc" = 0 ] && grep -q '^base rb ' "$t/c1.log" && [ "$(nent "$cr")" = 1 ] && [ -s "$ent/base/gate_x.log" ] && [ "$(cat "$ent/base/gate_x.ptx/mod1.ptx" 2> /dev/null)" = "base module" ] \
+    && grep -qx "base=$wb" "$ent/MANIFEST" && grep -qx 'keep_ptx=1' "$ent/MANIFEST" && grep -qx "arch=$ARCH" "$ent/MANIFEST" && grep -qx 'bins=gate_x' "$ent/MANIFEST" \
+    && grep -qx "ptx_scan_md5=$(md5_of "$w/tools/ptx-scan.sh")" "$ent/MANIFEST" && grep -qx "scan_set_md5=$(md5_of "$t/c1-out/scan-set.tsv")" "$ent/MANIFEST"; ok "cache: a miss runs the base side and keeps its logs, modules and key under <key>/, nothing else in the root" $?
+  grep -qx 'base_cache=miss' "$t/c1-out/MANIFEST"; ok "cache: the MANIFEST says miss" $?
+  cache_run "$ch" "$t/c2.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c2-out"
+  [ "$rc" = 0 ] && ! grep -q '^base rb ' "$t/c2.log" && grep -q '^head rh ' "$t/c2.log" && grep -qxF "narrow-scan: base $wb from cache $ent" <<< "$got"; ok "cache: the same key hits: one line names the cache dir, no box call for the base side, the head side still runs" $?
+  grep -q '^narrow-scan: done: base side from cache, head side [0-9]*s' <<< "$got"; ok "cache: the done line says the base side came from the cache, not a wall" $?
+  cmp -s "$t/c1-out/base/gate_x.log" "$t/c2-out/base/gate_x.log" && cmp -s "$t/c1-out/base/gate_x.ptx/mod1.ptx" "$t/c2-out/base/gate_x.ptx/mod1.ptx" && grep -qx 'base_cache=hit' "$t/c2-out/MANIFEST"; ok "cache: a hit lays DIR/base/ out as the fresh run did, and the MANIFEST says hit" $?
+  cp "$w/tools/ptx-scan.sh" "$t/ptx-scan.orig"
+  echo '# the scanner changed' >> "$w/tools/ptx-scan.sh"
+  cache_run "$ch" "$t/c3.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c3-out"
+  [ "$rc" = 0 ] && grep -q '^base rb ' "$t/c3.log" && [ "$(nent "$cr")" = 2 ]; ok "cache: a changed scanner (its md5) misses, and its entry sits beside the old one" $?
+  cp "$t/ptx-scan.orig" "$w/tools/ptx-scan.sh"
+  cache_run "$ch" "$t/c4.log" "$wb" --worktree --scan-only --out "$t/c4-out"
+  [ "$rc" = 0 ] && grep -q '^base rb ' "$t/c4.log" && [ "$(nent "$cr")" = 3 ] && [ ! -e "$t/c4-out/base/gate_x.ptx" ]; ok "cache: --keep-ptx is part of the key: a run without it misses, and keeps no modules" $?
+  CACHE_FORCE=1 cache_run "$ch" "$t/c5.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c5-out"
+  [ "$rc" = 0 ] && grep -q '^base rb ' "$t/c5.log" && ! grep -q 'from cache' <<< "$got" && [ "$(nent "$cr")" = 3 ] && [ -s "$ent/base/gate_x.log" ]; ok "cache: NARROW_NO_CACHE=1 forces a miss, and the run's result replaces that key's entry (no leftover temp dir)" $?
+  rm -f "$ent/base/gate_x.log"
+  cache_run "$ch" "$t/c6.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c6-out"
+  [ "$rc" = 0 ] && grep -qF "cache entry $ent is corrupt" <<< "$got" && grep -qF "gate_x.log" <<< "$got" && grep -q '^base rb ' "$t/c6.log" && [ -s "$ent/base/gate_x.log" ] && [ "$(nent "$cr")" = 3 ]; ok "cache: an entry missing a bin's log is named, removed and rebuilt, never reused in part" $?
+  rm -f "$ent/MANIFEST"
+  cache_run "$ch" "$t/c7.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c7-out"
+  [ "$rc" = 0 ] && grep -qF "cache entry $ent is corrupt" <<< "$got" && grep -qF "MANIFEST" <<< "$got" && grep -q '^base rb ' "$t/c7.log" && [ -s "$ent/MANIFEST" ]; ok "cache: an entry with no MANIFEST is named, removed and rebuilt" $?
+  rm -rf "$ent/base/gate_x.ptx"
+  cache_run "$ch" "$t/c8.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c8-out"
+  [ "$rc" = 0 ] && grep -qF "cache entry $ent is corrupt" <<< "$got" && grep -qF "gate_x.ptx" <<< "$got" && grep -q '^base rb ' "$t/c8.log" && [ -s "$ent/base/gate_x.ptx/mod1.ptx" ]; ok "cache: a keep entry with no modules for a bin is named, removed and rebuilt" $?
+  STUB_NOPTX=1 cache_run "$t/chome2" "$t/c9.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c9-out"
+  [ "$rc" = 1 ] && [ "$(nent "$t/chome2/.cache/bloomery/narrow-base")" = 0 ]; ok "cache: a base side with no ptx block fails and is not cached" $?
+  STUB_SCANRC=1 cache_run "$t/chome2" "$t/c10.log" "$wb" --worktree --scan-only --out "$t/c10-out"
+  [ "$rc" = 1 ] && [ "$(nent "$t/chome2/.cache/bloomery/narrow-base")" = 0 ]; ok "cache: a base side whose scan ended rc 1 fails and is not cached" $?
   orphan=$(git -C "$w" commit-tree "$(git -C "$w" rev-parse 'HEAD^{tree}')" -m orphan)
   wt_run "$t/anc.log" "$orphan" --worktree --out "$t/anc-out"
   [ "$rc" = 64 ] && grep -qF "is not an ancestor of this tree's HEAD" <<< "$got" && [ ! -s "$t/anc.log" ]; ok "worktree: a BASE that is not an ancestor is refused rc 64 by name, nothing synced" $?
@@ -847,7 +1138,7 @@ fi
 # scans of the wrong code.
 [ "${BLOOMERY_ARCH-$ARCH}" = "$ARCH" ] || die 64 "BLOOMERY_ARCH is '$BLOOMERY_ARCH': the scan pairs are $ARCH's (this script builds both sides at $ARCH only)"
 
-BASE='' HEAD_REV='' OUT='' DRY=0 WORKTREE=0
+BASE='' HEAD_REV='' OUT='' DRY=0 WORKTREE=0 KEEP=0 SCAN_ONLY=0
 while [ $# -gt 0 ]; do
   case $1 in
     --out)
@@ -857,6 +1148,8 @@ while [ $# -gt 0 ]; do
       ;;
     --dry-run) DRY=1; shift ;;
     --worktree) WORKTREE=1; shift ;;
+    --keep-ptx) KEEP=1; shift ;;
+    --scan-only) SCAN_ONLY=1; shift ;;
     -*) die 64 "'$1' is not a flag of this tool; $USAGE" ;;
     *)
       if [ -z "$BASE" ]; then BASE=$1
@@ -921,7 +1214,7 @@ python3 "$ROOT/tools/recipes.py" scan-set ${SCAN_SET_REV[@]+"${SCAN_SET_REV[@]}"
 cat "$OUT/scan-set.err" >&2
 BINS=()
 while IFS=$'\t' read -r b _; do [ -z "$b" ] || BINS[${#BINS[@]}]=$b; done < "$OUT/scan-set.tsv"
-make_runner "$OUT/scan-set.tsv" "$ROOT/tools/ptx-scan.sh" "$OUT/runner.sh" || die 2 "the runner could not be written"
+make_runner "$OUT/scan-set.tsv" "$ROOT/tools/ptx-scan.sh" "$OUT/runner.sh" "$KEEP" || die 2 "the runner could not be written"
 echo "narrow-scan: scan set (bin, features, carriers it covers):"
 sed 's/^/  /' "$OUT/scan-set.tsv"
 if [ "$DRY" = 1 ]; then
@@ -939,18 +1232,61 @@ trap lock_release EXIT
 trap 'stop_run 130' INT
 trap 'stop_run 143' TERM
 
+# The base side's cache: BASE is always a commit, so its side is reusable; the head side never is. The key's parts are in
+# $OUT/base-cache.key, the entry's dir is named by their md5.
+CACHE_ROOT=$HOME/.cache/bloomery/narrow-base
+cache_parts "$ROOT/tools/ptx-scan.sh" "$OUT/scan-set.tsv" "$OUT/runner.sh" > "$OUT/base-cache.key"
+CACHE_ENTRY=$CACHE_ROOT/${BASE_SHA:0:8}-$(md5_of "$OUT/base-cache.key" 9>&- | cut -c1-16)
+BASE_CACHE=miss RETRIED=''
+if [ "${NARROW_NO_CACHE:-0}" != 1 ] && [ -d "$CACHE_ENTRY" ]; then
+  if why=$(cache_check "$CACHE_ENTRY" "$OUT/base-cache.key" "${BINS[@]}" 9>&-); then
+    BASE_CACHE=hit
+  else
+    echo "narrow-scan: cache entry $CACHE_ENTRY is corrupt ($why); removed, the base side runs" >&2
+    rm -rf "$CACHE_ENTRY" 9>&-
+  fi
+fi
+
 T0=$SECONDS
 WALL_BASE=- WALL_HEAD=-
 for side in base head; do
+  if [ "$side" = base ] && [ "$BASE_CACHE" = hit ]; then
+    echo "narrow-scan: base $BASE_SHA from cache $CACHE_ENTRY"
+    rm -rf "$OUT/base" 9>&-
+    mkdir -p "$OUT/base" 9>&-
+    cp -R "$CACHE_ENTRY/base/." "$OUT/base/" 9>&- || die 1 "base: the cache entry $CACHE_ENTRY could not be copied into $OUT/base"
+    WALL_BASE=cache
+    continue
+  fi
   if [ "$side" = base ]; then rev=$BASE_SHA dir=$BASE_DIR; else rev=$HEAD_SRC dir=$HEAD_DIR; fi
   left=$((BOUND - (SECONDS - T0)))
   [ "$left" -ge 60 ] || die 124 "the bound of ${BOUND}s is spent before the $side side (the base side took ${WALL_BASE}s): run again, the dirs keep their compiled crates"
-  run_side "$side" "$rev" "$dir" "$OUT/runner.sh" "$OUT" "$left" "${BINS[@]}" || exit $?
+  run_side "$side" "$rev" "$dir" "$OUT/runner.sh" "$OUT" "$left" "${BINS[@]}"
+  rc=$?
+  if [ "$rc" = 255 ]; then
+    # ssh lost the box: the remote runner it started may still run, so it is ended by its recorded pid first; then the side runs
+    # once more, in the same remote dir (its compiled crates kept). Once only: a second 255 ends the run.
+    echo "narrow-scan: $side: ssh lost the box (rc 255); ending its recorded remote runner and running the side once more" >&2
+    remote_stop "$dir" ".narrow-scan-$side-$$.pid"
+    RETRIED=${RETRIED:+$RETRIED,}$side
+    left=$((BOUND - (SECONDS - T0)))
+    [ "$left" -ge 60 ] || die 124 "the bound of ${BOUND}s is spent before the $side side's retry: run again, the dirs keep their compiled crates"
+    run_side "$side" "$rev" "$dir" "$OUT/runner.sh" "$OUT" "$left" "${BINS[@]}"
+    rc=$?
+    [ "$rc" != 255 ] || echo "narrow-scan: $side: ssh lost the box again (rc 255): retried once, not again" >&2
+  fi
+  [ "$rc" = 0 ] || exit "$rc"
   if [ "$side" = base ]; then WALL_BASE=$SIDE_WALL; else WALL_HEAD=$SIDE_WALL; fi
   split_logs "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&- > "$OUT/$side.split.err" 2>&1 || {
     cat "$OUT/$side.split.err" >&2 9>&-
     die 1 "$side: the box output does not hold every scan ($OUT/$side.scan.out)"
   }
+  [ "$KEEP" = 0 ] || split_ptx "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&- > "$OUT/$side.split-ptx.err" 2>&1 || {
+    cat "$OUT/$side.split-ptx.err" >&2 9>&-
+    die 1 "$side: the box output does not hold every bin's ptx modules ($OUT/$side.scan.out)"
+  }
+  # the side finished with every bin's scan rc 0 (and its modules, under --keep-ptx): only now is it kept
+  [ "$side" != base ] || cache_store "$CACHE_ENTRY" "$OUT/base-cache.key" "${BINS[@]}"
 done
 
 echo "narrow-scan: bundles each scan carried (base | head):"
@@ -963,10 +1299,14 @@ if [ "$WORKTREE" = 1 ]; then
   WT_KEY1=$(worktree_key "$BASE_SHA" 9>&-)
   [ "$WT_KEY1" = "$WT_KEY0" ] || die 1 "the working tree changed during the run (key $WT_KEY0 -> $WT_KEY1): the head scans and the affected list would read different content; run again with the tree still"
 fi
-"$ROOT/tools/affected-gates.sh" "$AFFECTED_RANGE" --narrow "${ARGS[@]}" 9>&- > "$OUT/narrowed.txt" 2> "$OUT/narrowed.err"
-arc=$?
-cat "$OUT/narrowed.txt" 9>&-
-cat "$OUT/narrowed.err" >&2 9>&-
+if [ "$SCAN_ONLY" = 1 ]; then
+  arc=skipped
+else
+  "$ROOT/tools/affected-gates.sh" "$AFFECTED_RANGE" --narrow "${ARGS[@]}" 9>&- > "$OUT/narrowed.txt" 2> "$OUT/narrowed.err"
+  arc=$?
+  cat "$OUT/narrowed.txt" 9>&-
+  cat "$OUT/narrowed.err" >&2 9>&-
+fi
 {
   echo "base=$BASE_SHA"
   if [ "$WORKTREE" = 1 ]; then
@@ -981,6 +1321,17 @@ cat "$OUT/narrowed.err" >&2 9>&-
   echo "wall_head_s=$WALL_HEAD"
   echo "ptx_scan_md5=$(md5_of "$ROOT/tools/ptx-scan.sh" 9>&-)"
   echo "affected_rc=$arc"
+  echo "base_cache=$BASE_CACHE"
+  [ -z "$RETRIED" ] || echo "retried=$RETRIED"
+  [ "$KEEP" = 0 ] || echo "keep_ptx=1"
 } > "$OUT/MANIFEST"
-echo "narrow-scan: done: base side ${WALL_BASE}s, head side ${WALL_HEAD}s, affected rc $arc; scan logs and the list are under $OUT"
+BASE_WALL_TXT=${WALL_BASE}s
+[ "$BASE_CACHE" != hit ] || BASE_WALL_TXT="from cache"
+RETRY_TXT=''
+[ -z "$RETRIED" ] || RETRY_TXT=" (retried: $RETRIED)"
+if [ "$SCAN_ONLY" = 1 ]; then
+  echo "narrow-scan: done: base side $BASE_WALL_TXT, head side ${WALL_HEAD}s$RETRY_TXT, affected run skipped (--scan-only); scan logs are under $OUT"
+  exit 0
+fi
+echo "narrow-scan: done: base side $BASE_WALL_TXT, head side ${WALL_HEAD}s$RETRY_TXT, affected rc $arc; scan logs and the list are under $OUT"
 exit "$arc"
