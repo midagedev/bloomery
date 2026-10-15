@@ -2786,6 +2786,9 @@ unsafe fn seg_scalar_g<const G: usize>(
     let seg = sk / nkv;
     let kh = sk - seg * nkv;
     let tid = thread::threadIdx_x() as usize;
+    // The launch is 256 threads. The inlined body does not see the entry's
+    // launch bound, so the address math is told the same limit here.
+    unsafe { core::hint::assert_unchecked(tid < THREADS) };
     let w = tid / 32;
     let lane = warp::lane_id() as usize;
     let n_head = nkv * G;
@@ -2898,17 +2901,21 @@ unsafe fn seg_scalar_g<const G: usize>(
 
     if full || w < G {
         // SAFETY: idx is inside the partials, as on the neutral path; lane
-        // `lane` owns dims 4·lane .. +3, and lane 0 writes (m, s).
+        // `lane` owns dims 4·lane .. +3.
         unsafe {
             let o = idx * HEAD + 4 * lane;
             *part_v.get_unchecked_mut(o) = acc[0];
             *part_v.get_unchecked_mut(o + 1) = acc[1];
             *part_v.get_unchecked_mut(o + 2) = acc[2];
             *part_v.get_unchecked_mut(o + 3) = acc[3];
-            if lane == 0 {
-                *part_ms.get_unchecked_mut(2 * idx) = mx;
-                *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
-            }
+        }
+    }
+    // Lane 0 writes (m, s). A full group keeps this the kernel's own test.
+    if lane == 0 && (full || w < G) {
+        // SAFETY: idx is inside part_ms, as on the neutral path.
+        unsafe {
+            *part_ms.get_unchecked_mut(2 * idx) = mx;
+            *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
         }
     }
 }
