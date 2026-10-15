@@ -109,6 +109,8 @@ fn hw_nemotron_h_header() {
         bad.push("an attention layer emits a rope need".to_string());
     }
     let items = model::arch::coverage::check(s, &read.tensors);
+    // PIN(2026-10-15): the nemotron_h body now runs the program, the Mamba-2 and the squared-ReLU
+    // layers, so the clause that listed them as missing is gone; the real header is fully covered.
     if !items.is_empty() {
         bad.push(format!("coverage has uncovered items: {items:?}"));
     }
