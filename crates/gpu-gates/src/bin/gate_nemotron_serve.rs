@@ -34,8 +34,9 @@
 //! - `completion_ids`: `/completion` at temperature 0, [`N`] tokens, of [`PROSE`] (`/tokenize`)
 //!   and of the chat turn the server's own template renders (`/apply-template`, `/tokenize`),
 //!   each from an empty cache (`cache_prompt: false`), answers the ids `NemotronHModel` gives
-//!   stepped directly on the same ids (the `gate_nemotron_e2e` way: the prompt one step an id,
-//!   then each answer fed back), or a prefix of them ending at an end-of-generation id. FAIL-first:
+//!   directly on the same ids as the seat runs them (a prompt of several ids through `prefill`,
+//!   one id a step, then each answer fed back), or a prefix of them ending at an end-of-generation
+//!   id. FAIL-first:
 //!   a prefill that skips the first id moves the ids and the clause is red.
 //! - `chat_is_200`: `/v1/chat/completions` of the same turn at temperature 0 and `max_tokens`
 //!   [`N`] is a 200 whose `usage` counts the prompt's ids and the completion's tokens, and whose
@@ -45,9 +46,13 @@
 //!   false` and keeps nothing (`cache_n` 0): the shared prefix is shorter than the held sequence
 //!   and the state cannot step back, so the slot is reset. FAIL-first: a `keep` that grants the
 //!   shared prefix reaches the refused rollback, the request fails and the clause is red.
-//! - `extension_keeps_the_held_sequence`: the prose prompt resent with its answer appended answers
-//!   the ids of the same request at `cache_prompt: false` and keeps the held positions (`cache_n`
-//!   above 0): the shared prefix is the whole held sequence.
+//! - `extension_keeps_the_held_sequence`: the prose prompt resent with its answer appended keeps
+//!   the held positions (`cache_n` above 0): the shared prefix is the whole held sequence.
+//! - `extension_is_the_held_run`: that resent answer is `NemotronHModel`'s run of the same split,
+//!   the server stopped: the prose prompt and its answer held, then the answer's last id and [`N`]
+//!   more. A fresh run of the longer prompt is one pass over all of it, which the held split's
+//!   steps differ from by the q8 rounding of the activations at the Q8_0 sites, so the split is
+//!   the reference.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -262,22 +267,47 @@ mod gate {
         Ok(ok)
     }
 
-    /// The ids `NemotronHModel` gives stepped directly: for each prompt, from an empty cache, the
-    /// prompt one step an id and then each answer fed back, [`N`] tokens.
-    fn session_ids(file: &Path, prompts: &[&[u32]]) -> Result<Vec<Vec<u32>>, GateError> {
+    /// `n` greedy ids from where `m` stands after `first`, each answer fed back.
+    fn continue_from(m: &mut NemotronHModel, first: u32, n: usize) -> Result<Vec<u32>, GateError> {
+        let mut answer = vec![first];
+        while answer.len() < n {
+            let last = *answer.last().ok_or("an empty answer")?;
+            answer.push(m.step(&[last])?);
+        }
+        Ok(answer)
+    }
+
+    /// The prompt `ids` as the seat runs it (`prefill` for several ids, one step for one), from
+    /// where `m` stands, then [`N`] greedy ids.
+    fn seat_answer(m: &mut NemotronHModel, ids: &[u32]) -> Result<Vec<u32>, GateError> {
+        let first = if ids.len() > 1 {
+            m.prefill(ids)?
+        } else {
+            m.step(ids)?
+        };
+        continue_from(m, first, N)
+    }
+
+    /// What `NemotronHModel` gives directly, the server stopped: for each prompt from an empty
+    /// cache, its [`N`] answer ids; and the extension's run, the prose prompt and its answer held
+    /// then that answer's last id fed and [`N`] more ids, the split the server's kept slot runs.
+    fn session_ids(
+        file: &Path,
+        prompts: &[&[u32]],
+        prose: &[u32],
+    ) -> Result<(Vec<Vec<u32>>, Vec<u32>), GateError> {
         let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
         let mut m = NemotronHModel::open(Gpu::new()?, split, SESSION_CTX)?;
         let mut out = Vec::new();
         for ids in prompts {
             m.reset()?;
-            let mut answer = vec![m.step(ids)?];
-            while answer.len() < N {
-                let last = *answer.last().ok_or("an empty answer")?;
-                answer.push(m.step(&[last])?);
-            }
-            out.push(answer);
+            out.push(seat_answer(&mut m, ids)?);
         }
-        Ok(out)
+        m.reset()?;
+        let held = seat_answer(&mut m, prose)?;
+        let last = *held.last().ok_or("an empty held answer")?;
+        let first = m.step(&[last])?;
+        Ok((out, continue_from(&mut m, first, N)?))
     }
 
     /// What the server answered, held until it is stopped and the session has the card.
@@ -286,6 +316,8 @@ mod gate {
         turn: Vec<u32>,
         prose_answer: Answer,
         turn_answer: Answer,
+        /// The extension's resent answer, held to the session's run of the same split.
+        resent: Option<Answer>,
     }
 
     /// The prose prompt with its second half replaced by ids the file's vocabulary holds.
@@ -361,10 +393,6 @@ mod gate {
                 chat_is_those_ids(&url, &d, messages, N, (&turn_answer, &turn_body)),
             ),
             ("edit_resend_is_a_fresh_run", edit_resend(&url, &d, &prose)),
-            (
-                "extension_keeps_the_held_sequence",
-                extension(&url, &d, &prose, &prose_answer),
-            ),
         ] {
             let pass = run.unwrap_or_else(|e| {
                 println!("{name}: {e}");
@@ -372,6 +400,18 @@ mod gate {
             });
             check(&mut ok, name, pass);
         }
+        let resent = match extension(&url, &d, &prose, &prose_answer) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                println!("extension_keeps_the_held_sequence: {e}");
+                None
+            }
+        };
+        check(
+            &mut ok,
+            "extension_keeps_the_held_sequence",
+            resent.as_ref().is_some_and(|r| r.cache_n > 0),
+        );
         println!("server stopped: {}", s.stop()?);
         Ok((
             Some(Answers {
@@ -379,6 +419,7 @@ mod gate {
                 turn,
                 prose_answer,
                 turn_answer,
+                resent,
             }),
             ok,
         ))
@@ -406,31 +447,26 @@ mod gate {
 
     /// `extension_keeps_the_held_sequence` (the module header): the slot holds the prose prompt
     /// and its answer (`held`'s tokens, from an empty cache), and the prompt with that answer
-    /// appended is sent.
+    /// appended is sent. Its answer, kept for `extension_is_the_held_run`.
     fn extension(
         url: &dyn Fn(&str) -> String,
         dir: &Path,
         prose: &[u32],
         held: &Answer,
-    ) -> Result<bool, GateError> {
+    ) -> Result<Answer, GateError> {
         let (_, _) = greedy(url, prose.to_vec(), N, dir, "extension-held", true)?;
         let mut longer = prose.to_vec();
         longer.extend(&held.tokens);
-        let (fresh, _) = greedy(url, longer.clone(), N, dir, "extension-fresh", false)?;
-        let (_, _) = greedy(url, prose.to_vec(), N, dir, "extension-held-again", true)?;
         let (resent, _) = greedy(url, longer, N, dir, "extension-resent", true)?;
-        println!(
-            "extension: ids equal the fresh run's {}; cache_n {} is above 0",
-            resent.tokens == fresh.tokens,
-            resent.cache_n
-        );
-        Ok(resent.tokens == fresh.tokens && resent.cache_n > 0)
+        println!("extension: cache_n {} is above 0", resent.cache_n);
+        Ok(resent)
     }
 
     /// `completion_ids` (the module header), the server stopped and the session on the card.
     fn completion_ids(file: &Path, a: &Answers) -> Result<bool, GateError> {
         let mut ok = true;
-        let ids = session_ids(file, &[a.prose.as_slice(), a.turn.as_slice()])?;
+        let (ids, extended) =
+            session_ids(file, &[a.prose.as_slice(), a.turn.as_slice()], &a.prose)?;
         let prose = agree(&a.prose_answer.tokens, &a.prose_answer.stop, &ids[0]);
         let turn = agree(&a.turn_answer.tokens, &a.turn_answer.stop, &ids[1]);
         println!(
@@ -440,6 +476,15 @@ mod gate {
             a.turn_answer.tokens.len()
         );
         check(&mut ok, "completion_ids", prose && turn);
+        let held = a
+            .resent
+            .as_ref()
+            .is_some_and(|r| agree(&r.tokens, &r.stop, &extended));
+        println!(
+            "extension: the resent answer is the session's run of the held split (the prose \
+             prompt and its answer, the answer's last id, {N} more) {held}"
+        );
+        check(&mut ok, "extension_is_the_held_run", held);
         Ok(ok)
     }
 
