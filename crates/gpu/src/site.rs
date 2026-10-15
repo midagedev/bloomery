@@ -517,6 +517,138 @@ impl WideKernels<'_> {
     }
 }
 
+/// One wide input's quantized forms, each held when a site of the unit reads
+/// it: q8_1 blocks of 128 for a K-quant site, q8 blocks of 32 for a Q8_0 or
+/// Q5_0 site.
+pub struct WideActs {
+    pub q128: Option<GemmAct>,
+    pub q32: Option<GemmAct32>,
+}
+
+impl WideActs {
+    /// `cols` columns of `k` values in the forms `(q128, q32)` asks for.
+    /// Load-time only.
+    pub fn new(
+        stream: &cuda_core::CudaStream,
+        (q128, q32): (bool, bool),
+        cols: usize,
+        k: usize,
+    ) -> Result<WideActs, GpuError> {
+        Ok(WideActs {
+            q128: q128.then(|| GemmAct::new(stream, cols, k)).transpose()?,
+            q32: q32.then(|| GemmAct32::new(stream, cols, k)).transpose()?,
+        })
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.q128.as_ref().map_or(0, GemmAct::bytes) + self.q32.as_ref().map_or(0, GemmAct32::bytes)
+    }
+
+    /// The forms `x`'s first `m` columns are quantized into for sites of
+    /// types `tys` ([`WideActsMut::quantize`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, the kernels, the sink, the rows, their count and the site types (rust-quality R8)"
+    )]
+    pub fn quantize(
+        &mut self,
+        gpu: &Gpu,
+        k: &WideKernels<'_>,
+        sink: FaultSink,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        tys: &[SiteTy],
+    ) -> Result<(), GpuError> {
+        self.views_mut().quantize(gpu, k, sink, x, m, tys)
+    }
+
+    /// The forms as views.
+    pub fn views_mut(&mut self) -> WideActsMut<'_> {
+        WideActsMut {
+            q128: self.q128.as_mut(),
+            q32: self.q32.as_mut(),
+        }
+    }
+
+    /// The forms beside the f32 rows `f32` a site picks from.
+    pub fn input<'a>(&'a self, f32: &'a DeviceBuffer<f32>) -> WideIn<'a> {
+        WideIn {
+            q128: self.q128.as_ref(),
+            q32: self.q32.as_ref(),
+            f32: Some(f32),
+        }
+    }
+
+    /// The forms a gated block's SwiGLU writes beside the f32 rows `f32`, if
+    /// its down reads them.
+    pub fn swiglu_rows<'a>(&'a mut self, f32: Option<&'a mut DeviceBuffer<f32>>) -> SwigluRows<'a> {
+        SwigluRows {
+            q128: self.q128.as_mut(),
+            q32: self.q32.as_mut(),
+            f32,
+        }
+    }
+}
+
+/// One wide input's quantized forms as views: those of a [`WideActs`], or of
+/// an arena that holds them as plain buffers, so one launch sequence runs over
+/// either.
+pub struct WideActsMut<'a> {
+    pub q128: Option<&'a mut GemmAct>,
+    pub q32: Option<&'a mut GemmAct32>,
+}
+
+impl WideActsMut<'_> {
+    /// The forms `x`'s first `m` columns are quantized into for sites of
+    /// types `tys`: each form one of them reads, and nothing else. A form a
+    /// site reads that the unit does not hold, or q8 blocks of 32 on a load
+    /// with no 32-value kernels, is refused by name.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, the kernels, the sink, the rows, their count and the site types (rust-quality R8)"
+    )]
+    pub fn quantize(
+        &mut self,
+        gpu: &Gpu,
+        k: &WideKernels<'_>,
+        sink: FaultSink,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        tys: &[SiteTy],
+    ) -> Result<(), GpuError> {
+        const WHAT_Q: &str = "site::WideActsMut::quantize";
+        let reads = |f: Form| tys.iter().any(|t| t.reads() == f);
+        if reads(Form::Q8x128) {
+            let a = self.q128.as_deref_mut().ok_or(GpuError::state(
+                WHAT_Q,
+                "the unit's q8_1 blocks of 128 (a K-quant site reads them)",
+            ))?;
+            gpu.enqueue_quantize_gemm(x, m, a, sink)?;
+        }
+        if reads(Form::Q8x32) {
+            let a = self.q32.as_deref_mut().ok_or(GpuError::state(
+                WHAT_Q,
+                "the unit's q8 blocks of 32 (a Q8_0 or Q5_0 site reads them)",
+            ))?;
+            k.g32(
+                WHAT_Q,
+                "the 32-value kernels q8 blocks of 32 are quantized by",
+            )?
+            .enqueue_quantize_gemm32(gpu.stream(), x, m, a, sink)?;
+        }
+        Ok(())
+    }
+
+    /// The forms beside the f32 rows `f32` a site picks from.
+    pub fn input<'a>(&'a self, f32: &'a DeviceBuffer<f32>) -> WideIn<'a> {
+        WideIn {
+            q128: self.q128.as_deref(),
+            q32: self.q32.as_deref(),
+            f32: Some(f32),
+        }
+    }
+}
+
 /// `y = W · x` for site `src` of type `ty`, `rows` rows an expert, over the
 /// slots `route` holds, `input` picking each slot's column (module doc). A
 /// 32-value GEMM over the unit's one-expert table must find it filled for

@@ -59,12 +59,13 @@ use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
 use super::plan::{Form, MixerPlan};
 use super::router::RouterOut;
 use super::scratch::{Arena, Dims, KvPlanes, f32_view};
-use super::wide::{self, ActsMut, Neox128Rows};
+use super::wide::{self, Neox128Rows};
 use crate::flash_gqa::HEAD;
 use crate::gemm::GemmAct32;
 use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
+use crate::site::WideActsMut;
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -582,11 +583,11 @@ fn attention(
             attn,
             attn_o,
             ffn_inp,
-            hid: ActsMut {
+            hid: WideActsMut {
                 q128: Some(act_hid),
                 q32: act_hid32.as_mut(),
             },
-            out: ActsMut {
+            out: WideActsMut {
                 q128: Some(act_attn),
                 q32: act_attn32.as_mut(),
             },
