@@ -500,10 +500,11 @@ ORDER = ('question', 'term', 'unit', 'predict', 'rounds', 'sd', 'margin', 'condi
 
 def wrapped(first, text, indent):
     """`text` after `first`, broken at spaces into lines of at most WRAP columns, each line after the
-    first opened by `indent`; a word longer than a line stays whole."""
+    first opened by `indent`; a word longer than a line stays whole, and no line breaks before a word
+    that starts with `#`, which `parse` would read as a comment line."""
     lines, line = [], first
     for word in text.split():
-        if line not in (first, indent) and len(line) + 1 + len(word) > WRAP:
+        if line not in (first, indent) and not word.startswith('#') and len(line) + 1 + len(word) > WRAP:
             lines.append(line)
             line = indent
         line = f'{line}{word}' if line in (first, indent) else f'{line} {word}'

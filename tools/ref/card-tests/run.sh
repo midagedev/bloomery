@@ -272,6 +272,19 @@ if awk 'length > 110 { bad = 1 } END { exit bad }' "$tmp/new-wrap.card" && grep 
 else
   fail "new wrap-110" "a line past 110 columns, or no continuation line" "$tmp/new-wrap.card"
 fi
+# A word that starts with `#` never opens a continuation line (parse would read the line as a comment): with `#ticket-123`
+# at each break point in turn, the condition read back from the card holds every word given.
+hashok=1
+for k in $(seq 14 30); do
+  words=$(for i in $(seq 1 40); do if [ "$i" = "$k" ]; then printf '#ticket-123 '; else printf 'word%s ' "$i"; fi; done)
+  rm -f "$tmp/new-hash.card"
+  python3 "$ROOT/tools/ref/card.py" new profile "$tmp/new-hash.card" --question q --term t --unit ms --predict 1..2 \
+    --condition "$words" --decide-in a --decide-below b --decide-above c > "$tmp/out" 2>&1 || { hashok=0; break; }
+  back=$(python3 -c 'import importlib.util as u, sys; s = u.spec_from_file_location("card", sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m); print(m.parse(open(sys.argv[2]).read())["condition"][1])' \
+    "$ROOT/tools/ref/card.py" "$tmp/new-hash.card")
+  [ "$back" = "${words% }" ] || { hashok=0; cp "$tmp/new-hash.card" "$tmp/out"; break; }
+done
+if [ "$hashok" = 1 ]; then pass "new hash-word"; else fail "new hash-word" "#ticket-123 at word $k: the value read back differs" "$tmp/out"; fi
 card straddle.card 68 'contains 0, so its nearest edge is 0: no round count resolves it'
 card sd-override.card 0 'h = 1\.020 % at 3 rounds .*sd 0\.45 % — a paired ratio SD'
 card sd-no-source.card 65 'names no source'
