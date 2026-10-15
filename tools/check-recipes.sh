@@ -280,6 +280,10 @@ blk_narrowscan() { tool_selftest narrow-scan.sh; }
 # canon-check.sh is `just canon-check`'s proof that a kernel move is bit-identical: its per-entry verdicts, counts, exit codes and
 # refusals over fixture scan logs and PTX modules through the real ptx-canon.py, and its call of narrow-scan.sh, on a stub, no box.
 blk_canoncheck() { tool_selftest canon-check.sh; }
+# ptx-compare.sh is `just ptx-compare`'s add and move proof: its two box calls (the base from a git archive in a remote dir of its own, the
+# head from this tree), the base side's cache, the table's exit codes (0, 3 changed, 4 removed, 5 both, 2 refused) through the real
+# recipes.py reader, its usage refusals and the build lines' drift against the ptx-scan recipe, on a stub box.sh in a temp git repo, no box.
+blk_ptxcompare() { tool_selftest ptx-compare.sh; }
 # lds-scan.sh's rows (its PTX and SASS counts over a fixture binary, stub extractor, ptxas and cuobjdump),
 # its filter, its failed-scan banner and its usage refusal, no box.
 blk_ldsscan() { tool_selftest lds-scan.sh; }
@@ -871,7 +875,7 @@ proc_leg
 unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc

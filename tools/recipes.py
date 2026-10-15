@@ -11,6 +11,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
     python3 tools/recipes.py ship-scan [--rev REV] BASE_LOG HEAD_LOG...  # the shipped bins' ptx-scan pairs: a verdict line each; exit 0 only when every shipped bin has a pair and all are identical
+    python3 tools/recipes.py ptx-compare BASE_LOG HEAD_LOG [--base-label L] [--head-label L]  # two full ptx-scan logs of one bin as one table: entries, added, removed, changed (tools/ptx-compare.sh); rc 0 nothing existing moved, 3 changed, 4 removed, 5 both
     python3 tools/recipes.py ship-bins [--rev REV]  # the shipped bins and the release features read from tools/release/build.sh: bin<TAB>features
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
     python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain
@@ -2633,6 +2634,58 @@ def scan_verdict(base: ScanLog, new: ScanLog) -> ScanVerdict:
                           "rescan without --no-jit: the add and occupancy classes need the JIT columns")
     v.detail = f"JIT skipped: --no-jit {which}"
     return v
+
+
+# `ptx-compare BASE_LOG HEAD_LOG`: the add and move classes' proof (AGENTS.md's change-class table) as one table of two full
+# ptx-scan logs of one binary. Exit codes: 0 nothing existing moved (the head holds the base's entries, each row and digest
+# equal, and maybe more); 3 an existing entry's row or digest moved, or the bundle set did; 4 an entry was removed; 5 both;
+# 2 a pair or log refused by name (RecipeError, `main`).
+PTX_COMPARE_RC = {(False, False): 0, (True, False): 3, (False, True): 4, (True, True): 5}
+
+
+def ptx_compare(base: ScanLog, head: ScanLog, base_label: str = "base", head_label: str = "head") -> tuple[int, list[str]]:
+    """The table of two scans: entries on each side, those added, those removed and those whose any column or digest moved
+    (each with its moved columns). The pair is read through scan_verdict (one binary, one method, one toolchain and card
+    capability), and a `--no-jit` scan is refused: the add class reads the JIT columns."""
+    if base.nojit or head.nojit:
+        which = "both" if base.nojit and head.nojit else "base" if base.nojit else "head"
+        raise RecipeError(f"scan pair {base.path} {head.path}: a --no-jit scan ({which}) holds no JIT columns, which the add class reads: "
+                          "rescan without --no-jit (a move alone is `just canon-check`'s proof, from --no-jit scans)")
+    scan_verdict(base, head)
+    cols = head.header[1:]
+    added = sorted(set(head.rows) - set(base.rows))
+    removed = sorted(set(base.rows) - set(head.rows))
+    changed: list[tuple[str, str]] = []
+    for e in sorted(set(base.rows) & set(head.rows)):
+        moved = [f"{c}:{a}->{b}" for c, a, b in zip(cols, base.rows[e], head.rows[e]) if a != b]
+        if base.md5[e] != head.md5[e]:
+            moved.append(f"ptx-scan-md5:{base.md5[e][0][:8]}->{head.md5[e][0][:8]}")
+        if moved:
+            changed.append((e, " ".join(moved)))
+    bundles = sorted(base.bundles) != sorted(head.bundles)
+
+    def names(xs: list[str]) -> str:
+        return f"{len(xs)}: {' '.join(xs)}" if xs else "none"
+
+    out = [f"ptx-compare: bin={head.bin} base={base_label} head={head_label} method={head.fields['method']} arch={head.fields.get('arch', '?')} "
+           f"jit-cc={head.fields.get('jit-cc', head.fields.get('jit-card', '?'))}",
+           f"  base entries  {len(base.rows)}",
+           f"  head entries  {len(head.rows)}",
+           f"  added         {names(added)}",
+           f"  removed       {names(removed)}",
+           f"  changed       {len(changed)}: {' | '.join(f'{e} ({m})' for e, m in changed)}" if changed else "  changed       none"]
+    if bundles:
+        out.append(f"  bundles       moved: {' '.join(base.bundles)} -> {' '.join(head.bundles)}")
+    rc = PTX_COMPARE_RC[(bool(changed) or bundles, bool(removed))]
+    word = {0: "identical" if not added else "added-only", 3: "changed", 4: "removed", 5: "changed and removed"}[rc]
+    out.append(f"ptx-compare: {word} (rc {rc})")
+    return rc, out
+
+
+def cmd_ptx_compare(args: argparse.Namespace) -> int:
+    rc, lines = ptx_compare(read_scan(args.base_log), read_scan(args.head_log), args.base_label, args.head_label)
+    print("\n".join(lines))
+    return rc
 
 
 @dataclass
@@ -9965,6 +10018,44 @@ def narrow_self_test(expect, side: Side) -> None:
         ):
             v = tried(lambda: read_scan(scan(tmp, "bad.log", {"alpha": h1}, **kw)))
             expect(isinstance(v, str) and why in v, f"narrow: {what} not refused by name: {v if isinstance(v, str) else 'read'}")
+        # ptx-compare: the table of two full scans and its exit code, by what moved (the commands above the function)
+        def compared(other: dict[str, str], **kw) -> tuple[int, str]:
+            got = tried(lambda: ptx_compare(base, read_scan(scan(tmp, "pc.log", other, **kw)), "B", "H"))
+            return (got[0], "\n".join(got[1])) if isinstance(got, tuple) else (-1, got)
+
+        rc_pc, txt = compared({"alpha": h1, "beta": h2})
+        expect(rc_pc == 0 and "  added         none" in txt and "  removed       none" in txt and "  changed       none" in txt
+               and txt.endswith("ptx-compare: identical (rc 0)") and "  base entries  2" in txt and "  head entries  2" in txt, f"ptx-compare: identical pair: {rc_pc} {txt}")
+        rc_pc, txt = compared({"alpha": h1, "beta": h2, "gamma": h3})
+        expect(rc_pc == 0 and "  added         1: gamma" in txt and "  head entries  3" in txt and txt.endswith("ptx-compare: added-only (rc 0)"),
+               f"ptx-compare: an added entry is rc 0: {rc_pc} {txt}")
+        rc_pc, txt = compared({"alpha": h1, "beta": h3})
+        expect(rc_pc == 3 and "  changed       1: beta (ptx-scan-md5:" in txt and txt.endswith("ptx-compare: changed (rc 3)"), f"ptx-compare: a moved digest is rc 3: {rc_pc} {txt}")
+        rc_pc, txt = compared({"alpha": h1, "beta": h2}, regs="13")
+        expect(rc_pc == 3 and "alpha (regs:12->13)" in txt and "beta (regs:12->13)" in txt and "ptx-scan-md5" not in txt, f"ptx-compare: a moved column is rc 3: {rc_pc} {txt}")
+        rc_pc, txt = compared({"alpha": h1})
+        expect(rc_pc == 4 and "  removed       1: beta" in txt and txt.endswith("ptx-compare: removed (rc 4)"), f"ptx-compare: a removed entry is rc 4: {rc_pc} {txt}")
+        rc_pc, txt = compared({"alpha": h3, "gamma": h1})
+        expect(rc_pc == 5 and "  added         1: gamma" in txt and "  removed       1: beta" in txt and "alpha (ptx-scan-md5:" in txt and txt.endswith("ptx-compare: changed and removed (rc 5)"),
+               f"ptx-compare: a changed and a removed entry are rc 5: {rc_pc} {txt}")
+        rc_pc, txt = compared({"alpha": h1, "beta": h2}, bundles=("bloomery-gpu", "bloomery-x"))
+        expect(rc_pc == 3 and "  bundles       moved: bloomery-gpu -> bloomery-gpu bloomery-x" in txt, f"ptx-compare: a moved bundle set is rc 3: {rc_pc} {txt}")
+        rc_pc, txt = compared({"alpha": h1, "beta": h2}, nojit=True)
+        expect(rc_pc == -1 and "holds no JIT columns" in txt and "--no-jit scan (head)" in txt, f"ptx-compare: a no-jit head is refused by name: {rc_pc} {txt}")
+        v = tried(lambda: ptx_compare(nj, base))
+        expect(isinstance(v, str) and "--no-jit scan (base)" in v, f"ptx-compare: a no-jit base is refused by name: {v}")
+        expect(refused(lambda: ptx_compare(base, read_scan(scan(tmp, "pcb.log", {"alpha": h1, "beta": h2}, bin="gy"))), "a pair is two scans of one binary"),
+               "ptx-compare: a pair of two binaries not refused")
+        other = read_scan(scan(tmp, "pcc.log", {"alpha": h1, "beta": h2}))
+        other.fields["jit-cc"] = "9.0"
+        expect(refused(lambda: ptx_compare(base, other), "jit-cc="), "ptx-compare: a pair of two capabilities not refused")
+        import contextlib
+        import io
+
+        cli = io.StringIO()
+        with contextlib.redirect_stdout(cli):
+            got = main(["ptx-compare", base.path, scan(tmp, "pcd.log", {"alpha": h1, "beta": h2, "gamma": h3}), "--base-label", "83212936", "--head-label", "HEAD"])
+        expect(got == 0 and "base=83212936 head=HEAD" in cli.getvalue(), f"ptx-compare: the command line: {got} {cli.getvalue()}")
         # narrow() on the real tree. A cargo global reaches every gate through a dependency edge and sits in no
         # kernel carrier's closure, so its row's recipes are its whole selection.
         rows = [row("rust-toolchain.toml", ["gate-sampler"]), row("crates/vision/src/**", ["gate-vision"], 2)]
@@ -11048,6 +11139,11 @@ def main(argv: list[str]) -> int:
     sc = sub.add_parser("ship-scan", help="the ptx-scan pairs of the shipped bins: one verdict line each; exit 0 only when every shipped bin has a pair and every pair is identical (tools/release/late-commit.sh)")
     sc.add_argument("logs", nargs="+", metavar="LOG", help="BASE_LOG HEAD_LOG, once per shipped bin")
     sc.add_argument("--rev", help="read the shipped bins at this commit; default the working tree")
+    pcm = sub.add_parser("ptx-compare", help="two full ptx-scan logs of one bin as one table (entries, added, removed, changed); exit 0 nothing existing moved, 3 an entry changed, 4 removed, 5 both (tools/ptx-compare.sh)")
+    pcm.add_argument("base_log", metavar="BASE_LOG")
+    pcm.add_argument("head_log", metavar="HEAD_LOG")
+    pcm.add_argument("--base-label", default="base")
+    pcm.add_argument("--head-label", default="head")
     sb = sub.add_parser("ship-bins", help="the shipped bins and the release features: bin<TAB>features (tools/release/build.sh)")
     sb.add_argument("--rev", help="read build.sh at this commit; default the working tree")
     w = sub.add_parser("why")
@@ -11108,6 +11204,8 @@ def main(argv: list[str]) -> int:
             return cmd_ship_scan(args)
         if args.cmd == "ship-bins":
             return cmd_ship_bins(args)
+        if args.cmd == "ptx-compare":
+            return cmd_ptx_compare(args)
         if args.cmd == "why":
             return cmd_why(args)
         if args.cmd == "reach":

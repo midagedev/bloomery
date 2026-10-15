@@ -251,6 +251,13 @@
 # hold's owner): the item ends `rc=yield held by <owner>: not retried (a round batch yields to the
 # lead's hold)`, counts in the DONE line's `yielded=` and in no rc class, and writes no times row and no
 # ledger record. A plain card-lock rc 75 and the lead's --ledger batch keep today's retry.
+# rc 83 (queue mode; tools/box.sh: a job of the item's remote directory runs in another tree than this call's, so the tree cannot be
+# replaced under it) is retried once, by name: the try's log gets `=== rc 83 (box.sh: a job of this remote directory holds <lock>; the
+# box holds tree <id>, this tree is <id>): waiting for the holder to end, then one retry`, the item polls that lock through a READONLY
+# box.sh call every RETRY_WAIT seconds up to DIRLOCK_WAIT (1800), and runs again once it is free (or cannot be probed, or the
+# bound has passed: no, then the 83 stands, named). A second 83 is final. The item line gains `dirlock=<s>s`, the seconds waited. A tree
+# that changed on this side while the batch runs is the usual cause of an 83 in a batch (its first items synced the tree they saw, and a
+# later item sees another id): the retry then runs the item on the tree as it is now, and the two ids in the log line say so.
 # DIR/run.log opens with `plan laneA=<s>s laneB=<s>s laneX=<s>s wall=<s>s
 # defaults=<n> …` (the predicted sums, derived from the times file), then gets `<recipe>[-<n>] rc=<n>
 # <s>s try=<t> lane=<A|B|X> tier=<real|fixture>` per item (plus `cold=1` for a cold build, `times=append-failed` when its
@@ -436,6 +443,7 @@ SMOKE=(
 )
 TRIES_MAX=11
 RETRY_WAIT=30
+DIRLOCK_WAIT=1800 # an item that ended 83: how long it waits for the holder of the remote directory's lock to end (box.sh's own guard bound), then one retry
 # --wait-hold's period between polls
 WAIT_POLL=30
 REAP_TICKS=50 # reap_boxes: 0.1 s ticks a box.sh gets after TERM before KILL (the header's «Stopping a batch»)
@@ -988,9 +996,10 @@ DF
   # The rc 75 and --wait-hold cases below run a copy of the fixture script whose retry wait and poll period are 1 s, not 30, and whose reap
   # bound (the deaf-call case) is 5 ticks, not 50 — a sed of the constants, the way gpu-gate.sh's --test-locks shrinks its bounds. No BLOOMERY_* name exists
   # for it: every such name is a row of the lever registry (tools/check-levers.sh holds tools/ to it).
-  sed -e 's/^RETRY_WAIT=30$/RETRY_WAIT=1/' -e 's/^WAIT_POLL=30$/WAIT_POLL=1/' -e 's/^REAP_TICKS=50 /REAP_TICKS=5 /' "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-fast.sh"
+  sed -e 's/^RETRY_WAIT=30$/RETRY_WAIT=1/' -e 's/^WAIT_POLL=30$/WAIT_POLL=1/' -e 's/^REAP_TICKS=50 /REAP_TICKS=5 /' -e 's/^DIRLOCK_WAIT=1800 /DIRLOCK_WAIT=3 /' "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-fast.sh"
   grep -q '^RETRY_WAIT=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-retry copy did not patch (RETRY_WAIT's line moved?)" >&2; return 70; }
   grep -q '^WAIT_POLL=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-poll copy did not patch (WAIT_POLL's line moved?)" >&2; return 70; }
+  grep -q '^DIRLOCK_WAIT=3 ' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast dir-lock copy did not patch (DIRLOCK_WAIT's line moved?)" >&2; return 70; }
   grep -q '^REAP_TICKS=5 ' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-reap copy did not patch (REAP_TICKS's line moved?)" >&2; return 70; }
   export BLOOMERY_GATE_TIMES=$t/times.tsv
   if gb_part 1; then
@@ -1098,6 +1107,12 @@ case "$*" in
       exit 75
     fi
     exit 0 ;;
+  'flock -n -x '*)
+    # The dir-lock probe of an item that ended 83: held (1) for the first FAKE_DIRLOCK_HELD probes, then free; FAKE_DIRLOCK_RC: it fails.
+    echo "$*" >> "$st/dirlock.log"
+    [ -z "${FAKE_DIRLOCK_RC:-}" ] || { echo 'box.sh: the fake probe cannot reach the box' >&2; exit "$FAKE_DIRLOCK_RC"; }
+    [ "$(grep -c . "$st/dirlock.log")" -gt "${FAKE_DIRLOCK_HELD:-0}" ] || exit 1
+    exit 0 ;;
   'bash tools/gpu-gate.sh --gpuhold '*)
     # The hold's writer: logged with the box.sh flags the batch passed, then the real script on the fixture, its hold file under
     # fake-state (--test-locks).
@@ -1119,6 +1134,14 @@ for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
 word=${*##* }
 for d in ${FAKE_START_DELAY:-}; do [ "${d%%=*}" != "$word" ] || sleep "${d#*=}"; done
 printf '%s\t%s\n' "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/box.log"
+# FAKE_RC83=<n> (the item's env): the first n calls end 83 as tools/box.sh does when a job of another tree holds the dir lock.
+if [ -n "${FAKE_RC83:-}" ] && [ "$(cat "$st/rc83.n" 2> /dev/null || echo 0)" -lt "$FAKE_RC83" ]; then
+  echo $(($(cat "$st/rc83.n" 2> /dev/null || echo 0) + 1)) > "$st/rc83.n"
+  echo "box.sh: ~/repo/fake holds tree aaaa1111aaaa1111 and this tree is bbbb2222bbbb2222" >&2
+  echo "box.sh: a job of this remote directory is running (/root/bloomery-queue/dir-fake.lock is held on ws); its tree cannot be replaced under it: wait for it, or use another BLOOMERY_REMOTE" >&2
+  held_rc=83 # the code the real box.sh ends with here; a variable, so no tool but box.sh and boxq.py spells one (tools/boxq-check.py)
+  exit "$held_rc"
+fi
 # BLOOMERY_REMOTE is the caller's box directory. The origin/main recheck drops it; a case reads this.
 if [ -n "${BLOOMERY_REMOTE+x}" ]; then printf 'set\t%s\n' "$BLOOMERY_REMOTE" >> "$st/remote.log"
 else printf 'unset\n' >> "$st/remote.log"; fi
@@ -3171,6 +3194,38 @@ EOS
     pass "yield: the lead's --ledger batch keeps waiting (try=11, red)"
   else fail "yield: the lead's --ledger batch keeps waiting (try=11, red)" "rc=$(cat "$t/rc-yield-lead") $(tail -1 "$t/out-yield-lead.log")"; fi
   want_not "yield: and its DONE line counts no yielded=" "$t/target/c-yield-lead/run.log" 'yielded='
+  # rc 83 (the header): box.sh refused to replace a tree a job of the remote directory runs in. The item waits for the holder (the fake's
+  # FAKE_DIRLOCK_HELD probes read held, then free) and runs once more; the fake box ends the item's first FAKE_RC83 calls 83.
+  rc=$(FAKE_DIRLOCK_HELD=2 GBFAST=1 steal_case dl-free "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC83=1')
+  printf '%s' "$rc" > "$t/rc-dl-free"
+  rc_ok 'rc 83: an item refused once by a holder is retried when the holder ends, and ends green' dl-free 1
+  want 'rc 83: its line is the second try and names the wait' "$t/target/c-dl-free/run.log" '^plain-any rc=0 [0-9]+s try=2 lane=[AB] tier=real dirlock=[0-9]+s( |$)'
+  want 'rc 83: the log names the lock, both tree ids and the wait' "$t/target/c-dl-free/g-plain-any.log" \
+    '^=== rc 83 \(box.sh: a job of this remote directory holds /root/bloomery-queue/dir-fake.lock; the box holds tree aaaa1111aaaa1111, this tree is bbbb2222bbbb2222\): waiting for the holder to end, then one retry$'
+  want 'rc 83: … and the lock being free' "$t/target/c-dl-free/g-plain-any.log" '^=== the dir lock /root/bloomery-queue/dir-fake.lock is free after [0-9]+ s: the one retry$'
+  want_row 'rc 83: the lock was probed until it read free (3 probes), the item ran twice' "$t/fake-state/dirlock.log" 'END { if (NR == 3) print NR }'
+  want_row 'rc 83: … through a READONLY call of the lock named on the 83 line' "$t/fake-state/dirlock.log" '$1 == "flock -n -x /root/bloomery-queue/dir-fake.lock true" { print }'
+  want_row 'rc 83: … and the item itself ran twice' "$t/fake-state/box.log" '$2 ~ /plain-any|gpu-gate/ { c++ } END { if (c == 2) print c }'
+  rc=$(FAKE_DIRLOCK_HELD=0 GBFAST=1 steal_case dl-twice "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC83=2')
+  printf '%s' "$rc" > "$t/rc-dl-twice"
+  if [ "$(cat "$t/rc-dl-twice")" = 1 ] && grep -Eq '^plain-any rc=83 [0-9]+s try=2 lane=[AB] tier=real dirlock=[0-9]+s( |$)' "$t/target/c-dl-twice/run.log"; then
+    pass 'rc 83: a second 83 is final (try=2, red)'
+  else fail 'rc 83: a second 83 is final (try=2, red)' "rc=$(cat "$t/rc-dl-twice") $(tail -2 "$t/target/c-dl-twice/run.log" 2>/dev/null)"; fi
+  rc=$(FAKE_DIRLOCK_HELD=999 GBFAST=1 steal_case dl-held "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC83=1')
+  printf '%s' "$rc" > "$t/rc-dl-held"
+  if [ "$(cat "$t/rc-dl-held")" = 1 ] && grep -Eq '^plain-any rc=83 [0-9]+s try=1 lane=[AB] tier=real dirlock=[0-9]+s( |$)' "$t/target/c-dl-held/run.log"; then
+    pass 'rc 83: a holder still there at the bound ends it red, not retried (try=1)'
+  else fail 'rc 83: a holder still there at the bound ends it red, not retried (try=1)' "rc=$(cat "$t/rc-dl-held") $(tail -2 "$t/target/c-dl-held/run.log" 2>/dev/null)"; fi
+  want 'rc 83: … and the log names the bound' "$t/target/c-dl-held/g-plain-any.log" '^=== the dir lock /root/bloomery-queue/dir-fake.lock is still held after 3 s: not retried, rc 83 stands$'
+  rc=$(FAKE_DIRLOCK_RC=255 GBFAST=1 steal_case dl-probe "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC83=1')
+  printf '%s' "$rc" > "$t/rc-dl-probe"
+  rc_ok 'rc 83: a lock probe that fails retries the item at once, and it ends green' dl-probe 1
+  want 'rc 83: … the log names the failed probe' "$t/target/c-dl-probe/g-plain-any.log" '^=== the dir lock /root/bloomery-queue/dir-fake.lock could not be probed \(rc 255: '
+  rc=$(GBFAST=1 steal_case dl-red "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-dl-red"
+  if [ "$(cat "$t/rc-dl-red")" = 1 ] && grep -Eq '^plain-any rc=1 [0-9]+s try=1 lane=[AB] tier=real( |$)' "$t/target/c-dl-red/run.log" && [ ! -e "$t/fake-state/dirlock.log" ]; then
+    pass 'rc 83: any other red rc is not retried and probes no lock'
+  else fail 'rc 83: any other red rc is not retried and probes no lock' "rc=$(cat "$t/rc-dl-red") $(tail -2 "$t/target/c-dl-red/run.log" 2>/dev/null)"; fi
   # Every item skips: nothing runs on the box, so no hold goes up.
   rc=$(FAKE_SKIP=1 LFLAG=--ledger steal_case hold-skip "plain-any	B	a6000	10	$d" -- plain-any)
   printf '%s' "$rc" > "$t/rc-hold-skip"
@@ -5985,8 +6040,46 @@ if [ "$ND" != 0 ]; then
 fi
 
 
+# wait_dirlock <log> <try>: an item's try ended 83 (tools/box.sh: a job of the remote directory runs in a tree this call would
+# replace, its dir lock held). Waits for that holder to end: a READONLY box.sh probe of the lock named on the try's 83 line, every
+# RETRY_WAIT seconds, up to DIRLOCK_WAIT. 0 when the lock is free or cannot be probed (the item's one retry then runs at once and
+# its own box.sh decides), 1 when it was still held at the bound. Every step is a `=== ` line of the item's log.
+wait_dirlock() {
+  local log=$1 try=$2 lock ids t0 rc out
+  lock=$(awk -v t="=== try $try " 'index($0, t) == 1 { on = 1; next } /^=== try / { on = 0 } on' "$log" |
+    sed -n 's/.*(\(\/[^ ]*\.lock\) is held on .*/\1/p' | tail -1)
+  ids=$(awk -v t="=== try $try " 'index($0, t) == 1 { on = 1; next } /^=== try / { on = 0 } on' "$log" |
+    sed -n 's/^box\.sh: .* holds tree \([0-9a-f]*\) and this tree is \([0-9a-f]*\)$/the box holds tree \1, this tree is \2/p' | tail -1)
+  if [ -z "$lock" ]; then
+    echo "=== rc 83 with no dir lock named on its line: retrying once at once" >> "$log"
+    return 0
+  fi
+  echo "=== rc 83 (box.sh: a job of this remote directory holds $lock${ids:+; $ids}): waiting for the holder to end, then one retry" >> "$log"
+  t0=$(date +%s)
+  while :; do
+    rc=0
+    out=$(BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" "flock -n -x $lock true" 2>&1 < /dev/null) || rc=$?
+    case $rc in
+      0)
+        echo "=== the dir lock $lock is free after $(($(date +%s) - t0)) s: the one retry" >> "$log"
+        return 0
+        ;;
+      1) ;;
+      *)
+        echo "=== the dir lock $lock could not be probed (rc $rc: ${out//$'\n'/ }): the one retry at once" >> "$log"
+        return 0
+        ;;
+    esac
+    if [ $(($(date +%s) - t0)) -ge "$DIRLOCK_WAIT" ]; then
+      echo "=== the dir lock $lock is still held after $DIRLOCK_WAIT s: not retried, rc 83 stands" >> "$log"
+      return 1
+    fi
+    sleep "$RETRY_WAIT"
+  done
+}
+
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
-  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran=0 s benv line waits=0 cold=0 deferred=0 yowner='' rcl mark twin='' attach_pid attach_file
+  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran=0 s benv line waits=0 cold=0 deferred=0 yowner='' rcl mark twin='' attach_pid attach_file held83=0 dl0=0 dlwait=0
   local pdir="$OUT/lane-$lane.box" # the box.sh calls this item's `just` starts file their pids here (reap_boxes; the pack's items each have their own)
   [ "$lane" != X ] || pdir="$OUT/lane-X-$i.box"
   local argv=()
@@ -6036,6 +6129,17 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     wait $! || rc=$?
     ran=$(($(date +%s) - t1))
     waits=$(try_waits "$log" "$try")
+    # rc 83 is box.sh's refusal to replace a tree a job of the same remote directory runs in. The item waits for that holder to end and
+    # runs once more; a second 83, or a holder still there at DIRLOCK_WAIT, is final.
+    if [ "$rc" -eq 83 ] && [ "$held83" = 0 ]; then
+      held83=1
+      dl0=$(date +%s)
+      if wait_dirlock "$log" "$try"; then
+        dlwait=$(($(date +%s) - dl0))
+        continue
+      fi
+      dlwait=$(($(date +%s) - dl0))
+    fi
     if [ "$rc" -eq 75 ]; then
       # A round's batch yields to a GPU hold another batch put up (the header's GPU-hold paragraph): a
       # lane that retried would park on the lead's hold for TRIES_MAX bounds and then start in the first
@@ -6065,6 +6169,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane tier=$TIER"
   fi
   [ "$waits" = 0 ] || line="$line waited=${waits}s"
+  [ "$held83" = 0 ] || line="$line dirlock=${dlwait}s"
   [ -z "$twin" ] || line="$line twin=$twin"
   ran=$((ran > waits ? ran - waits : 0))
   cold=$(cold_of "$log" "$try")

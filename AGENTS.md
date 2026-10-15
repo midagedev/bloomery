@@ -49,6 +49,8 @@ reference; what follows is the contract.
     just gate-ptx-spill       # every PTX entry's spill/jit_local bytes against tools/ref/ptx-shapes.tsv
     just canon-check BASE     # the move proof in one command: both sides' --no-jit scans of the scan set, then ptx-canon on every
                               # entry whose md5 moved; rc 0 = every entry the same program (--worktree: an uncommitted tree)
+    just ptx-compare BASE BIN [--features F]   # the add class's proof in one command: BIN's JIT scan at BASE and here as
+                              # one table (added, removed, changed); rc 0 = nothing existing moved, 3 changed, 4 removed, 5 both
     just mac-check / mac-lint / mac-fmt-check / mac-static / mac-test   # the Mac's static tier (above)
     just records-refresh      # tools/bloomery/schema/ and tools/flow/plans/ after a record kind or prompt-call plan
                               # change, each plan at the plan room (tools/ref/plan-room.sh)
@@ -89,7 +91,7 @@ wrong is the finding.
 |---|---|---|---|
 | move, split, rename | `just ptx-scan` identical (`--no-jit` suffices: no card, no gate lock; `just canon-check BASE` proves it for the whole scan set in one command); host dispatch code also keeps its structural lines (graph node count, eager = replay, e2e set identical) | none beyond those lines | none |
 | delete | ptx-scan of `generate_ds41` and `gate_e2e` = base minus exactly the deleted entries; `gate-ptx-spill` red on exactly those rows before `ptx-shapes.tsv` loses them; per entry, the grep that shows no caller. A remaining entry whose md5 moves needs `tools/ref/ptx-canon.py` = `reordered-only` and equal resource columns (`just canon-check BASE` runs it) | the owning gates of what it touched (bit-identical for a moved md5); a removed gate, case or arm is a coverage change with a dated reason | none |
-| add (no engine caller yet) | ptx-scan = base plus exactly the new entries; `gate-ptx-spill` red on exactly them before pinning; the family gate green with FAIL-first per clause | the new family gate, and the owning gates of entries engine bins gained | none |
+| add (no engine caller yet) | ptx-scan = base plus exactly the new entries (`just ptx-compare BASE BIN` prints it); `gate-ptx-spill` red on exactly them before pinning; the family gate green with FAIL-first per clause | the new family gate, and the owning gates of entries engine bins gained | none |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
 | launch count only | Δt = ΔN × c_node | the owning gate | once, only if occupancy moves too |
 | fold a launch into a neighbour | Δt = −ΔN × c_node − the removed kernel's time + the work every host-grid block now repeats or waits on × its blocks (paid in full on a grid near ~700 GB/s) | the owning gate | once |

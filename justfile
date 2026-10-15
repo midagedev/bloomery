@@ -161,6 +161,21 @@ narrow BASE HEAD='HEAD' OUT='' DRY='' TREE='':
 canon-check BASE HEAD='HEAD' OUT='' DRY='' TREE='':
     ./tools/canon-check.sh {{BASE}} {{ if HEAD != 'HEAD' { HEAD } else { '' } }} {{TREE}} {{DRY}} {{ if OUT != '' { '--out "' + OUT + '"' } else { '' } }}
 
+# The add and move classes' ptx-scan proof (AGENTS.md's change-class table) in one command: BIN scanned with the driver JIT at BASE (a
+# commit, read through `git archive` into a box dir of its own, ~/repo/bloomery-<track>-ptxcmp-base) and at this tree (as `just ptx-scan`
+# syncs it), and one table: entries on each side, added, removed, and the existing entries whose any column or md5 moved. Exit 0 when
+# nothing existing moved (the head holds every base entry, equal, and maybe more: `added` says which), 3 an entry changed, 4 removed,
+# 5 both, 2 a log or pair refused by name, 1 a side failed, 75 the box is held. The base side is cached under target/ptx-compare/ by
+# BASE, BIN, the features and the scanner: `--base-only` runs it at a round's open, the run without it at the end; `--no-cache` scans
+# the base again. A gate-batch item: `'ptx-compare:BASE generate_ds41 --features gpu,deepseek41'`.
+# The add and move proof of two JIT scans as one table (owner: tools/ptx-compare.sh).
+[arg("FEATURES", long="features")]
+[arg("BASEONLY", long="base-only", value="--base-only")]
+[arg("NOCACHE", long="no-cache", value="--no-cache")]
+ptx-compare BASE BIN FEATURES='gpu' BASEONLY='' NOCACHE='':
+    @bash tools/scan-args.sh ptx {{BIN}}
+    ./tools/ptx-compare.sh {{BASE}} {{BIN}} --features {{FEATURES}} {{BASEONLY}} {{NOCACHE}}
+
 # 호스트 rustflags의 두 소유자(.cargo/config.toml, .cargo/cuda-oxide.toml)가 같은지 — 맥에서, 빌드 없음.
 check-rustflags:
     ./tools/check-rustflags.sh

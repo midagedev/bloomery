@@ -94,8 +94,14 @@
 # cancels it while queued and leaves it running once started). A read (BLOOMERY_BOX_READONLY=1) never goes through the queue.
 #   Sync. The tree goes to the remote directory under that directory's lock, /root/bloomery-queue/dir-<key>.lock
 #   (<key> the remote directory's name): rsync runs behind `flock -n -x`, so a tree a job is running in is
-#   never replaced under it. A sync that fails on that lock ends 83 naming it (the lock is probed once
-#   after a failed rsync: rsync's own code is 12 for a lock and a network fault alike). The tree's id
+#   never replaced under it. A sync that fails is read by the lock and the remote tree's id in one ssh (rsync's
+#   own code is 12 for a held lock and a network fault alike): the directory now holds this tree's id, put there
+#   by another call of the same tree (two lanes of one batch open on a new tree in the same second), so there is
+#   nothing to send and the call goes on, whether a job of that tree holds the lock or not; the lock is held with
+#   another tree's id there, a job runs in the tree this call would replace: 83, naming both ids and the lock; the lock
+#   is held with no id, another call's sync is under way (it removes the id first and puts it back last): waited for
+#   up to SYNC_WAIT (120 s), then this call goes on if the tree is there, syncs itself if the lock was freed, or ends
+#   83 at the bound; the lock is free and the id is not this tree's: a drop (below). The tree's id
 #   (tree_id: a hash of every path rsync sends, with its type, mode, size, mtime, link target and, for a
 #   regular file, its bytes) goes along as the remote tree's .sync-id, from a temp dir (a file in the Mac tree
 #   would make every later command
@@ -107,6 +113,11 @@
 #   same id. Every queued job names the remote card lane it holds to tools/gpu-gate.sh: a lane of 3090,
 #   a6000, both or any exports BLOOMERY_GATE_CARD as that card (any: the daemon's pick) before
 #   BLOOMERY_BOX_ENV, so a recipe's `${BLOOMERY_GATE_CARD:-any}` takes the lane's lock, never another (64).
+#   A drop before the submit. An rsync that ends 12 or 255 with the dir lock free (a held lock is read above), or an
+#   ssh of this phase that ends 255 (the read of the remote id, the lock probe, the mkdir of a direct call, a
+#   read's test -d), is retried once after DROP_WAIT (5 s), printing `box.sh: rsync/ssh dropped (rc N) before submit;
+#   retrying once`; a second drop ends the call with its own rc. A direct call's rsync is retried the same way. After
+#   the submit nothing is retried here: the job may be running, and `boxq.py attach` is the path (tools/boxq.py).
 #   Job. The assembled remote command, without the guard, runs as `flock -s -n -E 85 <the dir lock> bash -c
 #   '…'`: the lock is held shared for the job's life, children included, and not taking it ends 85. Inside,
 #   a .sync-id that is not this call's id (another sync replaced the tree after the submit) ends 80 before
@@ -125,6 +136,11 @@
 set -euo pipefail
 # The hold on this side (the header): one file a holder.
 BOX_HOLD_DIR=$HOME/.cache/bloomery/box-hold
+# The transient-drop retry and the sync wait (the header's «A drop before the submit» and «Sync»), in seconds. The self-test runs a copy
+# with them shrunk by a sed of these lines (no BLOOMERY_* name: every such name is a row of the lever registry).
+DROP_WAIT=5  # between a dropped rsync or ssh and its one retry
+SYNC_WAIT=120 # how long a queued call waits on another call's sync of this remote directory (its lock held, its tree id not there)
+SYNC_POLL=2  # between two looks at that sync
 
 # hold_stamp <epoch>: the UTC stamp of an epoch second (BSD date -r on the Mac, GNU date -d elsewhere).
 hold_stamp() {
@@ -258,6 +274,77 @@ print(h.hexdigest()[:16])
 PY
 }
 
+# drop_note RC: the one line a dropped rsync or ssh gets before its one retry, and the wait.
+drop_note() {
+  echo "box.sh: rsync/ssh dropped (rc $1) before submit; retrying once" >&2
+  sleep "$DROP_WAIT"
+}
+
+# pre_ssh CMD: `ssh -n HOST CMD` before anything is submitted, its stdout in PRE_OUT and its rc the result. A 255 (the ssh itself
+# dropped: a tailnet restart, a closed connection) is retried once after drop_note; after the submit nothing is retried here.
+pre_ssh() {
+  local r=0
+  PRE_OUT=$(ssh -n "$HOST" "$1") || r=$?
+  if [ "$r" = 255 ]; then
+    drop_note "$r"
+    r=0
+    PRE_OUT=$(ssh -n "$HOST" "$1") || r=$?
+  fi
+  return "$r"
+}
+
+# sync_bail RC: the call ends RC here, with the temp dir of the tree's id gone.
+sync_bail() {
+  [ -z "${SYNC_TMP:-}" ] || rm -rf "$SYNC_TMP"
+  exit "$1"
+}
+
+# sync_refused RC: a queued rsync ended RC (not 0). The remote directory's lock and its .sync-id, read in one ssh, say why. Sets SYNC_NEXT:
+#   done   the directory holds this tree's id: another call of this tree synced it between the read before the rsync and the lock, so
+#          there is nothing to send (two lanes of one batch open on a new tree at the same second: the loser needs no sync, and a
+#          job of this tree running there is no reason to refuse)
+#   again  the lock is free and the id is not this tree's: the rsync was cut off (the caller's one drop retry decides)
+#   retry  the lock was held by a sync under way, which ended without this tree's id: the caller syncs again (not a drop)
+# and ends the call 83 when the lock is held with another tree's id there (a job runs in a tree this one would replace), or when it is held
+# with no id at all for SYNC_WAIT seconds: a sync removes the id first and puts it back last, so an empty id under the lock is a sync under
+# way, waited for. A lock that cannot be probed ends the call with RC.
+sync_refused() {
+  local rc=$1 t0=$SECONDS lockrc have said=0
+  SYNC_NEXT=again
+  while :; do
+    pre_ssh "mkdir -p $QLOCK_DIR && { flock -n -x $QLOCK true; echo lock=\$?; cat $REMOTE/.sync-id 2>/dev/null || true; }" || sync_bail "$rc"
+    lockrc=${PRE_OUT%%$'\n'*}
+    case $PRE_OUT in
+      *$'\n'*) have=${PRE_OUT#*$'\n'} ;;
+      *) have= ;;
+    esac
+    if [ "$have" = "$SYNC_ID" ]; then
+      echo "box.sh: $REMOTE holds this tree (sync-id $SYNC_ID), put there by another call: not synced" >&2
+      SYNC_NEXT=done
+      return 0
+    fi
+    case $lockrc in
+      lock=0) [ "$said" = 0 ] || SYNC_NEXT=retry; return 0 ;;
+      lock=1) ;;
+      *) echo "box.sh: the dir lock $QLOCK on $HOST could not be tested (rc $rc; probe said '$lockrc')" >&2; sync_bail "$rc" ;;
+    esac
+    if [ -n "$have" ]; then
+      echo "box.sh: $REMOTE holds tree $have and this tree is $SYNC_ID" >&2
+      echo "box.sh: a job of this remote directory is running ($QLOCK is held on $HOST); its tree cannot be replaced under it: wait for it, or use another BLOOMERY_REMOTE" >&2
+      sync_bail 83
+    fi
+    if [ $((SECONDS - t0)) -ge "$SYNC_WAIT" ]; then
+      echo "box.sh: a job of this remote directory is running ($QLOCK is held on $HOST, and $REMOTE has had no tree id for $SYNC_WAIT s); its tree cannot be replaced under it: wait for it, or use another BLOOMERY_REMOTE" >&2
+      sync_bail 83
+    fi
+    if [ "$said" = 0 ]; then
+      said=1
+      echo "box.sh: $QLOCK is held and $REMOTE has no tree id: another call is syncing it; waiting up to $SYNC_WAIT s" >&2
+    fi
+    sleep "$SYNC_POLL"
+  done
+}
+
 # default_lane CMD: the queue lane of a call that names none. `any` when CMD runs device code only through gpu-gate.sh
 # calls in the `any` form (BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}), and every other script it names is one that
 # runs none, so either card's lock is the run's own; else 3090, the box's pin. A command it cannot read for certain stays
@@ -306,8 +393,13 @@ self_test() {
   d=$(mktemp -d "${TMPDIR:-/tmp}/box-selftest.XXXXXX")
   box=$d/tree/tools/box.sh hd=$d/home/.cache/bloomery/box-hold
   mkdir -p "$d/tree/tools" "$d/stub" "$d/home"
-  cp "$script" "$box"
+  # The script under test, with the drop wait and the sync wait shrunk (the constants' lines at the top; the wait case below reads 2 s).
+  sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=2 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$box"
   printf '%s\n' 'cuda-device = { git = "x", rev = "0123456789ab" }' > "$d/tree/Cargo.toml"
+  # The queue client a queued call execs at its end: it logs its arguments and ends with boxq.rc (default 0).
+  printf '%s\n' '#!/usr/bin/env python3' 'import os, sys' "D = '$d'" \
+    "open(D + '/boxq.log', 'a').write(' '.join(sys.argv[1:2]) + chr(10))" \
+    "sys.exit(int(open(D + '/boxq.rc').read()) if os.path.exists(D + '/boxq.rc') else 0)" > "$d/tree/tools/boxq.py"
   for t in ssh rsync; do
     printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/%s.log"\n' "$d" "$t" > "$d/stub/$t"
     chmod +x "$d/stub/$t"
@@ -316,6 +408,35 @@ self_test() {
   # STUB_SLEEP=<s> holds it there, its own pid in ssh.pid, for the TERM case.
   printf '[ -z "${BLOOMERY_BOX_PIDDIR:-}" ] || echo "$PPID $(ls "$BLOOMERY_BOX_PIDDIR" 2> /dev/null | tr "\\n" " ")" >> "%s/pid.log"\n' "$d" >> "$d/stub/ssh"
   printf '[ -z "${STUB_SLEEP:-}" ] || { echo $$ > "%s/ssh.pid"; sleep "$STUB_SLEEP"; }\n' "$d" >> "$d/stub/ssh"
+  # Scripted answers (sc below): an rsync call takes its rc from rsync.script; an ssh call is a probe of the dir lock (answers
+  # `rc lock [id]`, from probe.script: lock=<lock's rc> and the remote .sync-id), a read of the remote .sync-id (`rc [id]`, read.script) or any other
+  # (an rc, ssh.script). The first line of a script is taken by a call unless it is the last, which repeats; no script: rc 0, no output.
+  for t in ssh rsync; do
+    printf 'D=%s\n' "$d" >> "$d/stub/$t"
+    cat >> "$d/stub/$t" << 'STUB'
+pop() {
+  [ -s "$1" ] || { echo "$2"; return; }
+  head -n 1 "$1"
+  if [ "$(grep -c '' "$1")" -gt 1 ]; then sed '1d' "$1" > "$1.n" && mv "$1.n" "$1"; fi
+}
+STUB
+  done
+  cat >> "$d/stub/rsync" << 'STUB'
+exit "$(pop "$D/rsync.script" 0)"
+STUB
+  cat >> "$d/stub/ssh" << 'STUB'
+case "$*" in
+  *flock*)
+    set -- $(pop "$D/probe.script" '0 0')
+    [ "$1" != 0 ] || { echo "lock=$2"; [ -z "${3:-}" ] || echo "$3"; }
+    exit "$1" ;;
+  *.sync-id*)
+    set -- $(pop "$D/read.script" 0)
+    [ "$1" != 0 ] || [ -z "${2:-}" ] || echo "$2"
+    exit "$1" ;;
+  *) exit "$(pop "$D/ssh.script" 0)" ;;
+esac
+STUB
   if [ "$(PATH="$d/stub:/usr/bin:/bin"; command -v ssh)" != "$d/stub/ssh" ]; then
     echo "box.sh: --self-test: the ssh stub is not first on PATH: nothing was run" >&2
     rm -rf "$d"
@@ -329,9 +450,15 @@ self_test() {
     shift
     : > "$d/ssh.log"
     : > "$d/rsync.log"
+    : > "$d/boxq.log"
     rc=0
     out=$(env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' ${envs[@]+"${envs[@]}"} bash "$box" "$@" 2>&1 < /dev/null) || rc=$?
+    rm -f "$d"/*.script "$d"/*.script.n "$d/boxq.rc"
   }
+  # sc KIND LINE…: the stubs' script of KIND (rsync, probe, read, ssh) for the next call, one answer line per call of that kind.
+  sc() { local f=$1; shift; printf '%s\n' "$@" > "$d/$f.script"; }
+  # count FILE PATTERN: the lines of FILE with PATTERN in them.
+  count() { grep -c -- "$2" "$1" || true; }
   want() { [ "$rc" = "$1" ] || fail "$2: rc $rc, want $1: $out"; }
   has() { case $out in *"$1"*) ;; *) fail "$2: no '$1' in: $out" ;; esac; }
   hasnt() { case $out in *"$1"*) fail "$2: '$1' in: $out" ;; esac; }
@@ -432,6 +559,97 @@ self_test() {
   [ "$lrc" = 75 ] || fail "a looping caller ended $lrc after $n runs, not 75 at its next call"
   [ "$n" = "$(grep -c 'echo hi' "$d/ssh.log")" ] || fail "a looping caller ran $n times and ssh got the command $(grep -c 'echo hi' "$d/ssh.log") times"
   rm -f "$hd/aa"
+  # A drop before the submit (the header): an rsync or ssh that ends 12 or 255 before the job is sent is retried once, by name; a
+  # second drop ends the call with its rc, and a job's own ssh is never retried.
+  local sid drops='box.sh: rsync/ssh dropped (rc '
+  sid=$(env -i PATH=/usr/bin:/bin HOME="$d/home" bash "$box" --tree-id "$d/tree") || sid=
+  [ -n "$sid" ] || fail "the scratch tree's id could not be read"
+  sc rsync 12 0
+  call -- 'echo hi'
+  want 0 'direct: one rsync drop'; has "${drops}12) before submit; retrying once" 'direct: one rsync drop'; reached 'direct: one rsync drop'
+  sc rsync 12 12
+  call -- 'echo hi'
+  want 12 'direct: two rsync drops'; has "${drops}12) before submit; retrying once" 'direct: two rsync drops'
+  grep -q 'echo hi' "$d/ssh.log" && fail 'direct: two rsync drops: the command reached ssh'
+  [ "$(printf '%s\n' "$out" | grep -c 'retrying once')" = 1 ] || fail "direct: two rsync drops: the line is not printed once: $out"
+  sc rsync 23
+  call -- 'echo hi'
+  want 23 'direct: an rsync that ended 23 is not a drop'; hasnt 'retrying once' 'direct: an rsync that ended 23 is not a drop'
+  sc ssh 255 0
+  call -- 'echo hi'
+  want 0 'direct: the ssh before the sync dropped'; has "${drops}255) before submit; retrying once" 'direct: the ssh before the sync dropped'
+  sc ssh 0 255
+  call -- 'echo hi'
+  want 255 'direct: the job'"'"'s own ssh ends 255'; hasnt 'retrying once' 'direct: the job'"'"'s own ssh ends 255'
+  [ "$(count "$d/ssh.log" 'echo hi')" = 1 ] || fail "direct: the job's own ssh ran $(count "$d/ssh.log" 'echo hi') times, not once"
+  sc ssh 255 0
+  call BLOOMERY_BOX_READONLY=1 -- 'echo hi'
+  want 0 'a read: the ssh that looks for the directory dropped'; has "${drops}255) before submit; retrying once" 'a read: the ssh that looks for the directory dropped'
+  # The queued sync. The stubs answer the read of the remote .sync-id (read.script: `rc [id]`), the rsync (rsync.script: rc) and the lock probe
+  # after a failed rsync (probe.script: `rc lock [id]`, lock the flock's rc).
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: a tree the box lacks is synced and queued'
+  [ -s "$d/rsync.log" ] || fail 'queue: a tree the box lacks: rsync was never called'
+  sc read "0 $sid"
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: the box holds this tree'; has 'already holds this tree' 'queue: the box holds this tree'
+  [ ! -s "$d/rsync.log" ] || fail 'queue: the box holds this tree: rsync ran'
+  sc rsync 255 0
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: an rsync drop with the lock free'; has "${drops}255) before submit; retrying once" 'queue: an rsync drop with the lock free'
+  [ "$(grep -c '' "$d/rsync.log")" = 2 ] || fail "queue: an rsync drop with the lock free: rsync ran $(grep -c '' "$d/rsync.log") times, not twice"
+  sc rsync 12 0
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: an rsync 12 with the lock free is a drop'; has "${drops}12) before submit; retrying once" 'queue: an rsync 12 with the lock free is a drop'
+  sc rsync 12 12
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 12 'queue: two rsync drops'; hasnt 'a job of this remote directory is running' 'queue: two rsync drops'
+  sc read 255 0
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: the read of the remote id dropped'; has "${drops}255) before submit; retrying once" 'queue: the read of the remote id dropped'
+  sc read 255 255
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 255 'queue: the read dropped twice'; [ ! -s "$d/rsync.log" ] || fail 'queue: the read dropped twice: rsync ran'
+  # rc 83 with an equal tree: two lanes of one tree open on a box that lacks it; the loser's rsync cannot take the lock, and by its probe the
+  # box holds this tree already (the lock still held by the winner's job, or free): it needs no sync and is not refused.
+  sc rsync 12
+  sc probe "0 1 $sid"
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: a sibling synced this tree, a job of it holds the lock'; [ -s "$d/boxq.log" ] || fail 'queue: a sibling synced this tree: no job was queued'; has 'put there by another call: not synced' 'queue: a sibling synced this tree, a job of it holds the lock'
+  hasnt 'is running' 'queue: a sibling synced this tree, a job of it holds the lock'; hasnt 'retrying once' 'queue: a sibling synced this tree, a job of it holds the lock'
+  [ "$(grep -c '' "$d/rsync.log")" = 1 ] || fail 'queue: a sibling synced this tree: rsync ran again'
+  sc rsync 12
+  sc probe "0 0 $sid"
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: a sibling synced this tree, the lock is free'; has 'put there by another call: not synced' 'queue: a sibling synced this tree, the lock is free'
+  # a real race stays refused: a job runs in another tree
+  sc read '0 ff'
+  sc rsync 12
+  sc probe '0 1 0123456789abcdef'
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 83 'queue: a job of another tree holds the lock'; has 'is held on stub); its tree cannot be replaced under it' 'queue: a job of another tree holds the lock'
+  has "holds tree 0123456789abcdef and this tree is $sid" 'queue: a job of another tree holds the lock'; hasnt 'retrying once' 'queue: a job of another tree holds the lock'
+  [ ! -s "$d/boxq.log" ] || fail 'queue: a job of another tree holds the lock: a job was queued'
+  # a sync under way (lock held, no id): waited for, then this tree is there, or the lock is free and the call syncs itself, or the bound ends it 83
+  sc rsync 12
+  sc probe '0 1' '0 1' "0 1 $sid"
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: another call'"'"'s sync of this tree ends'; has 'another call is syncing it; waiting' 'queue: another call'"'"'s sync of this tree ends'
+  has 'put there by another call' 'queue: another call'"'"'s sync of this tree ends'
+  sc rsync 12 0
+  sc probe '0 1' '0 0'
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: another call'"'"'s sync ended with another tree'; hasnt 'retrying once' 'queue: another call'"'"'s sync ended with another tree'
+  [ "$(grep -c '' "$d/rsync.log")" = 2 ] || fail 'queue: another call'"'"'s sync ended with another tree: this call did not sync'
+  sc rsync 12
+  sc probe '0 1'
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 83 'queue: a lock held with no tree id for good'; has 'has had no tree id for 2 s' 'queue: a lock held with no tree id for good'
+  # after the submit nothing is retried here: the queue client's own rc passes
+  printf '%s\n' 255 > "$d/boxq.rc"
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 255 'queue: the queue client ends 255'; hasnt 'retrying once' 'queue: the queue client ends 255'
+  [ "$(grep -c '' "$d/boxq.log")" = 1 ] || fail "queue: the queue client ran $(grep -c '' "$d/boxq.log") times, not once"
   # BLOOMERY_BOX_PIDDIR (tools/gate-batch.sh's reap): a call files its own pid there while it runs and removes it on exit, TERM included;
   # queue mode files nothing (it execs this shell away), and unset, nothing is filed anywhere.
   local pd=$d/pids line bpid spid
@@ -679,7 +897,7 @@ if [ "$LOCAL" = 1 ]; then
 elif [ "$READONLY" = 1 ]; then
   # A read runs in the remote directory as it is. -n: this lookup leaves stdin to the command's ssh.
   rc=0
-  ssh -n "$HOST" "test -d $REMOTE" || rc=$?
+  pre_ssh "test -d $REMOTE" || rc=$?
   case $rc in
     0) ;;
     1) echo "box.sh: BLOOMERY_BOX_READONLY=1 runs the command in $REMOTE as it is and syncs nothing, and $HOST has no $REMOTE: nothing was synced there yet" >&2; exit 66 ;;
@@ -687,13 +905,6 @@ elif [ "$READONLY" = 1 ]; then
   esac
 else
   # A queued call reads the remote tree's id in the same ssh: this tree's id there means nothing to send (the header).
-  HAVE_ID=
-  if [ "$QUEUE" = 1 ]; then
-    SYNC_ID=$(tree_id "$HERE") || { echo "box.sh: the tree's id (tree_id $HERE) could not be read" >&2; exit 70; }
-    HAVE_ID=$(ssh -n "$HOST" "mkdir -p $REMOTE && { cat $REMOTE/.sync-id 2>/dev/null || true; }")
-  else
-    ssh -n "$HOST" "mkdir -p $REMOTE"
-  fi
   # 시각은 싣지 않는다(-t 없음) — 바뀐 파일은 내용 체크섬(-c)으로 고르고, 박스에 닿은 파일의 mtime은 박스 시계의 "지금"이 된다.
   # 맥의 mtime을 그대로 실으면 cargo가 낡은 바이너리를 내준다: 박스 시계가 맥보다 앞서 있어(실측 4.1초) 복원 직후의 touch조차
   # 직전 빌드 산출물보다 과거로 찍힌다(변이 바이너리가 두 번 그대로 돌았다).
@@ -703,29 +914,51 @@ else
   # 삭제 대상에서 뺀다.
   # A queued call syncs behind the remote directory's lock and ships the tree's id with it, put in place only after rsync ends 0
   # (the header); the direct call adds neither.
-  SYNC_TMP= SYNC_PATH=() SYNC_ID_SRC=() SYNCED=1
-  if [ "$QUEUE" = 1 ] && [ "$HAVE_ID" = "$SYNC_ID" ]; then
-    SYNCED=0
-    echo "box.sh: $REMOTE already holds this tree (sync-id $SYNC_ID): not synced" >&2
-  elif [ "$QUEUE" = 1 ]; then
-    SYNC_TMP=$(mktemp -d "${TMPDIR:-/tmp}/box-sync.XXXXXX")
-    printf '%s\n' "$SYNC_ID" > "$SYNC_TMP/.sync-id.new"
-    SYNC_PATH=(--rsync-path="mkdir -p $QLOCK_DIR && flock -n -x $QLOCK sh -c 'rm -f $REMOTE/.sync-id && rsync \"\$@\" && mv -f $REMOTE/.sync-id.new $REMOTE/.sync-id' rsync")
-    SYNC_ID_SRC=("$SYNC_TMP/.sync-id.new")
-  fi
-  rc=0
-  [ "$SYNCED" = 0 ] || rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
-  [ -z "$SYNC_TMP" ] || rm -rf "$SYNC_TMP"
-  if [ "$rc" != 0 ] && [ "$QUEUE" = 1 ]; then
-    # rsync's rc is 12 for a held lock and for a dead ssh alike: the lock decides (flock: 1 held, 0 free).
-    prc=0
-    ssh -n "$HOST" "mkdir -p $QLOCK_DIR && flock -n -x $QLOCK true" || prc=$?
-    if [ "$prc" = 1 ]; then
-      echo "box.sh: a job of this remote directory is running ($QLOCK is held on $HOST); its tree cannot be replaced under it: wait for it, or use another BLOOMERY_REMOTE" >&2
-      exit 83
+  [ "$QUEUE" = 0 ] || SYNC_ID=$(tree_id "$HERE") || { echo "box.sh: the tree's id (tree_id $HERE) could not be read" >&2; exit 70; }
+  SYNC_TMP= SYNC_PATH=() SYNC_ID_SRC=() DROPS=0 SYNC_TRIES=0 PRE_OUT=
+  while :; do
+    HAVE_ID=
+    if [ "$QUEUE" = 1 ]; then
+      pre_ssh "mkdir -p $REMOTE && { cat $REMOTE/.sync-id 2>/dev/null || true; }" || sync_bail $?
+      HAVE_ID=$PRE_OUT
+    else
+      pre_ssh "mkdir -p $REMOTE" || sync_bail $?
     fi
-  fi
-  [ "$rc" = 0 ] || exit "$rc"
+    if [ "$QUEUE" = 1 ] && [ "$HAVE_ID" = "$SYNC_ID" ]; then
+      echo "box.sh: $REMOTE already holds this tree (sync-id $SYNC_ID): not synced" >&2
+      break
+    fi
+    if [ "$QUEUE" = 1 ]; then
+      if [ -z "$SYNC_TMP" ]; then
+        SYNC_TMP=$(mktemp -d "${TMPDIR:-/tmp}/box-sync.XXXXXX")
+        printf '%s\n' "$SYNC_ID" > "$SYNC_TMP/.sync-id.new"
+      fi
+      SYNC_PATH=(--rsync-path="mkdir -p $QLOCK_DIR && flock -n -x $QLOCK sh -c 'rm -f $REMOTE/.sync-id && rsync \"\$@\" && mv -f $REMOTE/.sync-id.new $REMOTE/.sync-id' rsync")
+      SYNC_ID_SRC=("$SYNC_TMP/.sync-id.new")
+    fi
+    rc=0
+    rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
+    [ "$rc" != 0 ] || break
+    # rsync's rc is 12 for a held lock and for a dead ssh alike: the lock and the remote tree's id decide (sync_refused).
+    SYNC_NEXT=again
+    [ "$QUEUE" = 0 ] || sync_refused "$rc"
+    [ "$SYNC_NEXT" != done ] || break
+    if [ "$SYNC_NEXT" = retry ] && [ "$SYNC_TRIES" -lt 5 ]; then
+      SYNC_TRIES=$((SYNC_TRIES + 1))
+      continue
+    fi
+    case $rc in
+      12 | 255)
+        if [ "$DROPS" = 0 ]; then
+          DROPS=1
+          drop_note "$rc"
+          continue
+        fi
+        ;;
+    esac
+    sync_bail "$rc"
+  done
+  [ -z "$SYNC_TMP" ] || rm -rf "$SYNC_TMP"
 fi
 # 카드 선택. 기본은 env 파일의 3090 핀 그대로. BLOOMERY_CARD=a6000|both는 박스에서 이름으로 UUID를 찾아
 # CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). 두 카드 다 우리 것이다(야간 학습은

@@ -639,12 +639,16 @@ run 'BLOOMERY_LOCK_DIR moves the lease and the holds' 0 "^$tmp/ld/bloomery-cpu\\
 # the last.
 B=$tmp/boxtree
 mkdir -p "$B/tools" "$tmp/stub"
-cp "$ROOT/tools/box.sh" "$B/tools/"
+# The copy under test has its drop wait and its sync wait shrunk (box.sh's constants' lines): a retried drop would wait 5 s a time.
+sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=1 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$ROOT/tools/box.sh" > "$B/tools/box.sh"
+chmod +x "$B/tools/box.sh"
+grep -q '^DROP_WAIT=0 ' "$B/tools/box.sh" && grep -q '^SYNC_WAIT=1 ' "$B/tools/box.sh" || { echo "card-tests: the box.sh copy's waits did not shrink (the constants' lines moved?)" >&2; exit 70; }
 cp "$ROOT/Cargo.toml" "$B/"
-# The ssh stub answers the queue's one probe (flock -n -x on the dir lock) with $STUB_PROBE_RC, 0 where unset, and a queued call's
-# look at the remote tree's id with $STUB_SYNC_ID (nothing where unset); the rsync stub records its arguments and the .sync-id.new it
-# was handed, and ends with $STUB_RSYNC_RC, 0 where unset.
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\ncase "$*" in *"flock -n -x"*) exit ${STUB_PROBE_RC:-0} ;; *"/.sync-id 2>"*) [ -z "${STUB_SYNC_ID:-}" ] || echo "$STUB_SYNC_ID" ;; esac\n' "$tmp/ssh.log" > "$tmp/stub/ssh"
+# The ssh stub answers the queue's one probe after a failed rsync (flock -n -x on the dir lock, then the remote tree's id) with
+# `lock=$STUB_PROBE_RC` (0 where unset) and $STUB_SYNC_ID on the next line, or with an ssh that ends 255 when STUB_PROBE_RC is 255;
+# a queued call's look at the remote tree's id answers $STUB_SYNC_ID (nothing where unset); the rsync stub records its arguments and
+# the .sync-id.new it was handed, and ends with $STUB_RSYNC_RC, 0 where unset.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\ncase "$*" in *"flock -n -x"*) [ "${STUB_PROBE_RC:-0}" != 255 ] || exit 255; echo "lock=${STUB_PROBE_RC:-0}"; [ -z "${STUB_SYNC_ID:-}" ] || echo "$STUB_SYNC_ID" ;; *"/.sync-id 2>"*) [ -z "${STUB_SYNC_ID:-}" ] || echo "$STUB_SYNC_ID" ;; esac\n' "$tmp/ssh.log" > "$tmp/stub/ssh"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nfor a; do case $a in */.sync-id.new) cp "$a" "%s"; echo "$a" > "%s" ;; esac; done\nexit ${STUB_RSYNC_RC:-0}\n' \
   "$tmp/rsync.log" "$tmp/rsync.sync-id" "$tmp/rsync.sync-path" > "$tmp/stub/rsync"
 # The queue client stub: the words before the job's text, one a line, and the text itself (the last word) byte for byte.
@@ -877,11 +881,12 @@ rc_is 'box.sh: a command whose first word is a path' 0 box env BLOOMERY_BOX_QUEU
 inlog 'box.sh: the name takes the last part of the first word' "$tmp/boxq.args" '^x-gate_x-[0-9a-f]{6}$'
 rc_is 'box.sh: a command whose first word is an assignment' 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" 'FOO=1 true'
 inlog 'box.sh: the name holds only [A-Za-z0-9._-]' "$tmp/boxq.args" '^x-FOO_1-[0-9a-f]{6}$'
-# A held dir lock: rsync fails (12), and the lock decides 83; a failure with the lock free or untestable is rsync's own.
-run 'box.sh: a failed sync with the dir lock held ends 83, named' 83 'a job of this remote directory is running .*bloomery-queue/dir-x\.lock is held on stub.; its tree cannot be replaced under it' \
-  box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=1 "$B/tools/box.sh" true
+# A held dir lock: rsync fails (12), and the lock and the remote tree's id decide: held with another tree's id there is 83; a failure with
+# the lock free or untestable is rsync's own (retried once first: the drop wait is shrunk above).
+run 'box.sh: a failed sync with the dir lock held by another tree ends 83, named' 83 'a job of this remote directory is running .*bloomery-queue/dir-x\.lock is held on stub.; its tree cannot be replaced under it' \
+  box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=1 STUB_SYNC_ID=0123456789abcdef "$B/tools/box.sh" true
 nofile 'box.sh: the 83 submitted no job' "$tmp/boxq.args"
-inlog 'box.sh: the 83 probed the dir lock once' "$tmp/ssh.log" '^-n stub mkdir -p /root/bloomery-queue && flock -n -x /root/bloomery-queue/dir-x\.lock true$'
+inlog 'box.sh: the 83 probed the dir lock and the remote id in one call' "$tmp/ssh.log" '^-n stub mkdir -p /root/bloomery-queue && \{ flock -n -x /root/bloomery-queue/dir-x\.lock true; echo lock=\$\?; cat ~/repo/x/\.sync-id 2>/dev/null \|\| true; \}$'
 if [ -e "$(cat "$tmp/rsync.sync-path" 2> /dev/null || echo "$tmp/none")" ]; then fail 'box.sh: the 83 left the id'"'"'s temp dir' 'it is still there'; else pass 'box.sh: the 83 left no temp dir'; fi
 rc_is 'box.sh: a failed sync with the dir lock free is rsync'"'"'s own code' 12 box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=0 "$B/tools/box.sh" true
 rc_is 'box.sh: a failed sync whose probe cannot reach the box is rsync'"'"'s own code' 12 box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=255 "$B/tools/box.sh" true
