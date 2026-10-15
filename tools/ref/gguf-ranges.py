@@ -36,8 +36,8 @@ A short read (the file is shorter than its header says) is an error, not a small
 -00001-of-00002.gguf): the depth runner's stub test preheats it.
 
 Every tensor's size comes from its type's block size and bytes per block (gguf-py `constants.py`,
-GGML_QUANT_SIZES: the ids mainline and ik share, and mainline's TQ1_0/TQ2_0 and Q2_0, ids ik
-leaves unassigned); a type not in the table is refused by name. Each shard's tensors are then
+GGML_QUANT_SIZES: the ids mainline and ik share, and mainline's TQ1_0/TQ2_0, Q2_0 and NVFP4, ids
+ik leaves unassigned); a type not in the table is refused by name. Each shard's tensors are then
 checked against their offsets: sorted by offset, every tensor ends at or before the next one
 starts and the gap is less than the alignment, and the last ends within an alignment of the
 file's end. A header whose sizes do not tile its data is refused (65), never read as a smaller set.
@@ -54,8 +54,8 @@ import threading
 import time
 
 # (block size in elements, bytes per block): gguf-py constants.py GGML_QUANT_SIZES, the type ids
-# mainline and ik share; TQ1_0/TQ2_0 (34/35) and Q2_0 (42) are mainline's, ids ik leaves unassigned
-# (crates/gguf/src/quant.rs:54-57).
+# mainline and ik share; TQ1_0/TQ2_0 (34/35), Q2_0 (42) and NVFP4 (40) are mainline's, ids ik
+# leaves unassigned (crates/gguf/src/quant.rs:62-66).
 QUANT = {
     0: (1, 4),       # F32
     1: (1, 2),       # F16
@@ -89,6 +89,7 @@ QUANT = {
     34: (256, 54),   # TQ1_0
     35: (256, 66),   # TQ2_0
     39: (32, 17),    # MXFP4
+    40: (64, 36),    # NVFP4
     42: (64, 18),    # Q2_0
 }
 # Metadata value types (GGUF v2/v3): scalar struct formats; 8 is a string, 9 an array.

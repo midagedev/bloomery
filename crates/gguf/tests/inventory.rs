@@ -182,16 +182,18 @@ fn inventory_reports_none_for_types_outside_the_table() {
     assert_eq!(inv.tensors[0].nbytes, None);
 }
 
-/// Both paths share one parser, so a type both accept (Q5_0, and Q2_0, mainline
-/// ggml's id 42) yields the same name, dims, type, offset and byte count from
-/// either entry point.
+/// Both paths share one parser, so a type both accept (Q5_0, and Q2_0 and
+/// NVFP4, mainline ggml's ids 42 and 40) yields the same name, dims, type,
+/// offset and byte count from either entry point.
 #[test]
 fn inventory_agrees_with_the_strict_reader_on_supported_types() {
     // dims 64x3: two 22-byte Q5_0 blocks per row, three rows = 132; dims
-    // 128x3: two 18-byte Q2_0 blocks per row, three rows = 108.
+    // 128x3: two 18-byte Q2_0 blocks per row, three rows = 108; dims 128x3:
+    // two 36-byte NVFP4 blocks per row, three rows = 216.
     for (file, dims, ty, bytes) in [
         ("q5_0.gguf", [64, 3], 6, 132),
         ("q2_0.gguf", [128, 3], 42, 108),
+        ("nvfp4.gguf", [128, 3], 40, 216),
     ] {
         let p = tmp(file);
         write_gguf(&p, &[("blk.0.ffn_down.weight", &dims, ty)], bytes);

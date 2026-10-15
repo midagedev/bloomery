@@ -27,6 +27,13 @@
 //! Q2_0 is mainline ggml's alone (ik has no Q2_0): its decode ports
 //! llama.cpp's `dequantize_row_q2_0`, whose one product is exact.
 //!
+//! NVFP4 is mainline ggml's too: its decode ports llama.cpp's
+//! `dequantize_row_nvfp4`, whose one product — a UE4M3 sub-block scale times
+//! the doubled E2M1 code table `kvalues_mxfp4` — is exact, subnormal scales
+//! included. A scale byte 0x7F or ≥ 0x80, which mainline's encoder never
+//! writes and its decoder folds to 0 or drops bit 7 of, is refused by name
+//! instead of decoded.
+//!
 //! Q2_K, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS are ports of the same-named
 //! functions in that file, whose bodies are identical in mainline ggml. None has a product
 //! that rounds, so the order of their multiplies does not decide the bits:
@@ -1579,6 +1586,12 @@ mod tests {
         assert_eq!(
             activation_format(GgmlType::BF16),
             Err(QuantError::NoActivationFormat(GgmlType::BF16))
+        );
+        // No CPU matmul takes NVFP4: dequant_row reads it, activation_format
+        // refuses it by name, as it refuses BF16.
+        assert_eq!(
+            activation_format(GgmlType::NVFP4),
+            Err(QuantError::NoActivationFormat(GgmlType::NVFP4))
         );
     }
 
