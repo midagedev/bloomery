@@ -260,9 +260,7 @@ mod gate {
     /// `[-1, 1)` times `scale`.
     fn values(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         let mut rng = bloomery_gpu_gates::GateRng(seed);
-        (0..n)
-            .map(|_| (2.0 * rng.unit() - 1.0) * scale)
-            .collect()
+        (0..n).map(|_| (2.0 * rng.unit() - 1.0) * scale).collect()
     }
 
     /// `(x · r) · γ` with `r = 1/√(Σx²/n + eps)` over `x`, in f64.
