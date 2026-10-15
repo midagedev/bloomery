@@ -198,23 +198,18 @@ pub fn margin_cap(band: f64, row: &[f32]) -> f64 {
 
 /// A head row's own margin: its top logit less its runner-up, the quantity a greedy step's near
 /// tie is read at. A value that is not finite and a row shorter than two are refused by name —
-/// over either the margin is not a number, and a tie reads 0.
+/// over either the margin is not a number. The top two are [`crate::kld::top2`]'s, whose ties
+/// order by id; the margin reads only the values, and a tie reads 0.
 pub fn head_margin(row: &[f32]) -> Result<f32, GateError> {
     if row.len() < 2 {
         return Err(format!("{} logits, a top-1 margin needs two", row.len()).into());
     }
-    let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for (i, &v) in row.iter().enumerate() {
         if !v.is_finite() {
             return Err(format!("logit {i} is {v}").into());
         }
-        if v > a {
-            b = a;
-            a = v;
-        } else if v > b {
-            b = v;
-        }
     }
+    let (_, a, _, b) = crate::kld::top2(row);
     Ok(a - b)
 }
 
