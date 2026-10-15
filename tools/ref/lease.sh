@@ -461,14 +461,18 @@ lease_take() {
 # (rc 64) before anything runs.
 # shellcheck disable=SC2034 # read by the runners that source this file
 LEASE_ARM_BOUND=${BLOOMERY_ARM_BOUND:-900}
-lease_bounded() {
-  local bound=${1:-} rc=0
+lease_bound() {
+  local bound=${1:-}
   case $bound in
     '' | *[!0-9]* | 0*)
       echo "[bound] lease_bounded: the bound is a positive number of seconds, got '$bound' (BLOOMERY_ARM_BOUND?)" >&2
       return 64
       ;;
   esac
+}
+lease_bounded() {
+  local bound=${1:-} rc=0
+  lease_bound "$bound" || return $?
   shift
   if [ -n "${LEASE_BOUNDED_OUT:-}" ] && [ -n "${LEASE_BOUNDED_ERR:-}" ]; then
     run_bounded timeout --kill-after=10 "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2> "$LEASE_BOUNDED_ERR" || rc=$?
@@ -520,6 +524,30 @@ lease_capture() {
   lease_out_init || return 70
   LEASE_BOUNDED_OUT=$LEASE_OUT_FILE lease_bounded "$@" || rc=$?
   LEASE_OUT=$(< "$LEASE_OUT_FILE")
+  return "$rc"
+}
+
+# lease_filter <seconds> <stdout|stderr> <file> <filter command...> -- <command...>:
+# a live filter in the output file, with the bounded command owned by the runner's shell.
+# stdout filters the combined output; stderr leaves stdout in LEASE_OUT_FILE.
+lease_filter() {
+  local bound=$1 stream=$2 output=$3 rc=0 reader filter_rc=0
+  local -a filter=()
+  shift 3
+  lease_bound "$bound" || return $?
+  case $stream in stdout | stderr) ;; *) echo "lease_filter: stream is stdout or stderr, got '$stream'" >&2; return 64 ;; esac
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do filter+=("$1"); shift; done
+  [ "$#" -gt 1 ] && [ "${#filter[@]}" -gt 0 ] || { echo 'lease_filter: a filter and -- command are required' >&2; return 64; }
+  shift
+  lease_out_init || return 70
+  "${filter[@]}" < "$LEASE_OUT_FIFO" > "$output" &
+  reader=$!
+  case $stream in
+    stdout) LEASE_BOUNDED_OUT=$LEASE_OUT_FIFO LEASE_BOUNDED_ERR= lease_bounded "$bound" "$@" || rc=$? ;;
+    stderr) LEASE_BOUNDED_OUT=$LEASE_OUT_FILE LEASE_BOUNDED_ERR=$LEASE_OUT_FIFO lease_bounded "$bound" "$@" || rc=$? ;;
+  esac
+  wait "$reader" || filter_rc=$?
+  [ "$rc" -ne 0 ] || rc=$filter_rc
   return "$rc"
 }
 
@@ -1247,6 +1275,15 @@ EOF
     lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-capture-rc "$RC" 3
     check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
+    RC=0
+    lease_bounded 5 bash -c 'source "$1"; lease_filter 0600 stdout "$2" cat -- true' \
+      _ "$LEASE_TREE/tools/ref/lease.sh" "$t/refused-filter" > "$t/refused-filter-log" 2>&1 || RC=$?
+    check bounded-filter-refused-rc "$RC" 64
+    check bounded-filter-refused-no-reader "$([ -e "$t/refused-filter" ] && echo created || echo absent)" absent
+    RC=0
+    env BLOOMERY_HOST_BOUND=0600 bash "$LEASE_TREE/tools/ref/dma-dram-share.sh" --parse-only \
+      > "$t/refused-dma-log" 2>&1 || RC=$?
+    check dma-leading-zero-bound-rc "$RC" 64
     mkdir -p "$t/expert-tree/tools/ref"
     cp "$LEASE_TREE/tools/ref/expert-union-dump.sh" "$t/expert-tree/tools/ref/"
     printf '%s\n' 'MODEL=unused' 'REF_PROMPTS=$STUB_EXPERT_PROMPTS' > "$t/expert-tree/tools/ref/ref-paths.sh"

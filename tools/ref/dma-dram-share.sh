@@ -71,7 +71,7 @@ while [ $# -gt 0 ]; do
 done
 BOUND=${BLOOMERY_HOST_BOUND:-600}
 for v in "$ROUNDS" "$SECS" "$WARMUP" "$CHUNK" "$RING" "$FILL" "$ALONE_S" "$BOUND" ${THREADS:+"$THREADS"}; do
-  case $v in '' | *[!0-9]* | 0) echo "dma-dram-share.sh: counts, seconds and bytes are positive integers, got '$v'" >&2; exit 64 ;; esac
+  case $v in '' | *[!0-9]* | 0*) echo "dma-dram-share.sh: counts, seconds and bytes are positive integers, got '$v'" >&2; exit 64 ;; esac
 done
 case $COPY_CPUS in '' | [0-9]*) ;; *) echo "dma-dram-share.sh: --copy-cpus is a cpu list like 7,15,23,31" >&2; exit 64 ;; esac
 
