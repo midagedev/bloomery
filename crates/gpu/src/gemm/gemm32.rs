@@ -1,7 +1,7 @@
-//! The 32-value-block GEMM: Q8_0, IQ4_NL and Q5_1 weights times
+//! The 32-value-block GEMM: Q8_0, IQ4_NL, Q5_1 and Q5_0 weights times
 //! [`GemmAct32`] activations over a route table — one block per (tile,
 //! [`GEMM_BM`]-row slab), as the K-quant family runs, for the weights whose
-//! scales come per 32 values. Four entries, declared in `kernels32.rs`,
+//! scales come per 32 values. Five entries, declared in `kernels32.rs`,
 //! differ only in how the weight bytes reach shared memory:
 //! - `gemm_q8_0p`: Q8_0 in the q8f32 planes (`qs` u32 words, eight per
 //!   block, and `d` the blocks' f16 bits, `q8f32.rs`'s layout) — the dense
@@ -13,16 +13,20 @@
 //!   to the table's int8 values and its `d` staged as f32 — the same staged
 //!   row `gemm_q8_0f` fills;
 //! - `gemm_q5_1`: the file's 24-byte `block_q5_1` stream (f16 `d` and `m`,
-//!   the high bits `qh`, the nibbles `qs[16]`) as u32 words.
+//!   the high bits `qh`, the nibbles `qs[16]`) as u32 words;
+//! - `gemm_q5_0p`: the resident packed Q5_0 the gemv reads (`q5.rs`,
+//!   `pack_q5_0`): per row the int8 codes `q − 16` in the gemv's transposed
+//!   word order, then the blocks' f32 `d` — no repack and no second copy.
 //!
 //! Numeric contract, every entry. Per 32-value block `b` of an output
 //! `(slot, row)`: `isum` the exact i32 dot of the weight codes (Q8_0 int8;
 //! IQ4_NL the signed `kvalues_iq4nl` entry of each nibble, |kv| ≤ 127; Q5_1
-//! the unsigned 5-bit code, 0..31) with the column's int8 codes, one
-//! `mma.m16n8k32` (mainline MMQ's Q8_0 way); `d_w` (and `m_w`) the block's
-//! f16 values, exact in f32; `d_a`, `s_a` the column's block scale and code
-//! sum. The block enters the f32 accumulator as
-//! `acc = fma(d_a, d_w·f32(isum), acc)` for Q8_0 and
+//! the unsigned 5-bit code, 0..31; Q5_0 the signed `q − 16`, −16..15) with
+//! the column's int8 codes, one `mma.m16n8k32` (mainline MMQ's Q8_0 way);
+//! `d_w` (and `m_w`) the block's f16 values, exact in f32 (packed Q5_0
+//! holds them widened); `d_a`, `s_a` the column's block scale and code sum.
+//! The block enters the f32 accumulator as
+//! `acc = fma(d_a, d_w·f32(isum), acc)` for Q8_0, IQ4_NL and Q5_0 and
 //! `acc = fma(d_a, fma(m_w, f32(s_a), d_w·f32(isum)), acc)` for Q5_1 —
 //! the value `d_w·d_a·isum + m_w·d_a·s_a` — from `acc = 0`, blocks in
 //! increasing k. That order is a function of K alone: never of the grid,
@@ -35,7 +39,7 @@
 //! a step, the last step holding one block when K/32 is odd. Each step's
 //! weights, activation codes and activation scales sit in one of two shared
 //! stages: the activations and the plane's codes arrive by `cp.async`; the
-//! plane's scales and every file layout's bytes are read into registers one
+//! plane's scales and every other layout's bytes are read into registers one
 //! step ahead and written into the stage after the step's compute, decoded
 //! to the staged form — per row sixteen code words then the two blocks' `d`
 //! (and Q5_1's `m`) as f32 ([`W32_ROW`] words). One barrier a step: it
@@ -99,6 +103,18 @@ const _: () = assert!(
 const _: () =
     assert!(4 * (2 * (W32_STAGE_W + B32_STAGE_W + D32_STAGE_W) + 2 * GEMM_BN) <= 48 * 1024);
 
+/// A packed Q5_0 row's 32-block windows at `kb` blocks: its code section
+/// is `256` words a window (`q5.rs`, `pack_q5_0`).
+fn q5_0_packed_windows(kb: usize) -> usize {
+    kb.div_ceil(32)
+}
+
+/// u32 words of one packed Q5_0 row at `kb` blocks: the code section, then
+/// one f32 scale a block.
+fn q5_0_packed_row_words(kb: usize) -> usize {
+    256 * q5_0_packed_windows(kb) + kb
+}
+
 /// A Q8_0 file block's `d` bits and its eight code words from the nine
 /// words `w` that cover it, the block starting at byte `x` of the stream
 /// (`w[0]` the word holding byte `x`; `x` is even, a block being 34 bytes).
@@ -142,10 +158,12 @@ pub(super) fn iq4_nl_file_block(w: [u32; 5], x: usize) -> (u16, [u32; 8]) {
 /// How the weight bytes of one (slab row, block) pair reach a stage, per
 /// entry: `@copy` the `cp.async` part (the plane's codes), `@load` the
 /// register part one step ahead, `@store` it decoded into the stage after
-/// the step's compute. `$live` is whether the pair exists (its row inside
-/// the slab's live rows, its block below K/32); `$n` is its block's index
-/// in the stack's block stream (`row · K/32 + block`), `$dst` its staged
-/// row's first word.
+/// the step's compute; `@prep` binds `$pv`, once per thread, to what a
+/// layout that addresses a row rather than the block stream needs of the
+/// pair's row (packed Q5_0 only; nothing for the others). `$live` is whether
+/// the pair exists (its row inside the slab's live rows, its block below
+/// K/32); `$n` is its block's index in the stack's block stream (`row · K/32
+/// + block`), `$dst` its staged row's first word.
 macro_rules! w32 {
     (@copy plane($qs:ident, $wd:ident), $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
         if $live {
@@ -161,10 +179,20 @@ macro_rules! w32 {
             }
         }
     }};
-    (@copy $kind:ident($w:ident), $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
+    (@copy $kind:ident($($w:ident),+), $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
         let _ = ($live, $n, $dst, $pj);
     }};
-    (@load plane($qs:ident, $wd:ident), $live:expr, $n:expr) => {{
+    (@prep q50p($w:ident, $win:ident), $pv:ident, $row:expr, $first:expr, $kb:expr) => {
+        // The pair's row as the packed layout addresses it: its first word,
+        // its first block's index in the stack's block stream, and its code
+        // words (`256 · windows`) before the scales.
+        let $pv = {
+            let qst = 256 * $win as usize;
+            ($row * (qst + $kb), $first, qst)
+        };
+    };
+    (@prep $kind:ident($($w:ident),+), $pv:ident, $row:expr, $first:expr, $kb:expr) => {};
+    (@load plane($qs:ident, $wd:ident), $live:expr, $n:expr, $pv:ident) => {{
         if $live {
             // SAFETY: block `n` is inside the stack, whose scale plane holds
             // `n_experts · rows · K/32` entries (launch contract).
@@ -173,7 +201,7 @@ macro_rules! w32 {
             0u16
         }
     }};
-    (@load q8f($w:ident), $live:expr, $n:expr) => {{
+    (@load q8f($w:ident), $live:expr, $n:expr, $pv:ident) => {{
         if $live {
             let a = Q8_0_BLOCK_BYTES * $n / 4;
             // SAFETY: the block's 34 bytes end at byte `34n + 33`, inside the
@@ -196,7 +224,7 @@ macro_rules! w32 {
             [0u32; 9]
         }
     }};
-    (@load q51($w:ident), $live:expr, $n:expr) => {{
+    (@load q51($w:ident), $live:expr, $n:expr, $pv:ident) => {{
         if $live {
             let a = Q5_1_BLOCK_WORDS * $n;
             // SAFETY: the block's six words are inside the stack (launch
@@ -215,7 +243,7 @@ macro_rules! w32 {
             [0u32; 6]
         }
     }};
-    (@load iq4nl($w:ident), $live:expr, $n:expr) => {{
+    (@load iq4nl($w:ident), $live:expr, $n:expr, $pv:ident) => {{
         if $live {
             let a = IQ4_NL_BLOCK_BYTES * $n / 4;
             // SAFETY: the block's 18 bytes end at byte `18n + 17`, inside the
@@ -234,14 +262,40 @@ macro_rules! w32 {
             [0u32; 5]
         }
     }};
-    (@store plane($qs:ident, $wd:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
+    (@load q50p($w:ident, $win:ident), $live:expr, $n:expr, $pv:ident) => {{
+        if $live {
+            let (wrow, first, qst) = $pv;
+            let b = $n - first;
+            let c = wrow + 256 * (b >> 5) + (b & 31);
+            // SAFETY: the pair's row is inside the stack and `b < K/32 <= 32
+            // · windows`, so `256 · (b >> 5) + 224 + (b & 31) < qst` and `qst
+            // + b` lies before the row's end `qst + K/32`; the stack holds
+            // `n_experts · rows` such rows (launch contract).
+            unsafe {
+                [
+                    *$w.get_unchecked(c),
+                    *$w.get_unchecked(c + 32),
+                    *$w.get_unchecked(c + 64),
+                    *$w.get_unchecked(c + 96),
+                    *$w.get_unchecked(c + 128),
+                    *$w.get_unchecked(c + 160),
+                    *$w.get_unchecked(c + 192),
+                    *$w.get_unchecked(c + 224),
+                    *$w.get_unchecked(wrow + qst + b),
+                ]
+            }
+        } else {
+            [0u32; 9]
+        }
+    }};
+    (@store plane($qs:ident, $wd:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
         if $live {
             // SAFETY: word 16 + pj of the pair's staged row, which no warp
             // reads before the next barrier.
             unsafe { *$dst.add(16 + $pj) = half_bits_to_f32($raw).to_bits() };
         }
     }};
-    (@store q8f($w:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
+    (@store q8f($w:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
         if $live {
             let (d, c) = q8_0_file_block($raw, Q8_0_BLOCK_BYTES * $n);
             // SAFETY: the pair's eight code words and its `d` word of its
@@ -260,7 +314,7 @@ macro_rules! w32 {
             }
         }
     }};
-    (@store q51($w:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
+    (@store q51($w:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
         if $live {
             let c = q5_1_codes($raw[1], [$raw[2], $raw[3], $raw[4], $raw[5]]);
             // SAFETY: the pair's eight code words and its `d` and `m` words
@@ -280,7 +334,7 @@ macro_rules! w32 {
             }
         }
     }};
-    (@store iq4nl($w:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
+    (@store iq4nl($w:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
         if $live {
             let (d, c) = iq4_nl_file_block($raw, IQ4_NL_BLOCK_BYTES * $n);
             // SAFETY: the pair's eight code words and its `d` word of its
@@ -296,6 +350,28 @@ macro_rules! w32 {
                 *p.add(6) = c[6];
                 *p.add(7) = c[7];
                 *$dst.add(16 + $pj) = half_bits_to_f32(d).to_bits();
+            }
+        }
+    }};
+    (
+        @store q50p($w:ident, $win:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr,
+        $pv:ident
+    ) => {{
+        if $live {
+            // SAFETY: the pair's eight code words and its `d` word (already
+            // f32 bits) of its staged row, which no warp reads before the
+            // next barrier.
+            unsafe {
+                let p = $dst.add(8 * $pj);
+                *p = $raw[0];
+                *p.add(1) = $raw[1];
+                *p.add(2) = $raw[2];
+                *p.add(3) = $raw[3];
+                *p.add(4) = $raw[4];
+                *p.add(5) = $raw[5];
+                *p.add(6) = $raw[6];
+                *p.add(7) = $raw[7];
+                *$dst.add(16 + $pj) = $raw[8];
             }
         }
     }};
@@ -362,8 +438,8 @@ macro_rules! epi32 {
 
 /// The 32-value GEMM block: one tile's columns against one 128-row slab of
 /// that tile's expert (module doc). A macro, not a function, for the
-/// K-quant block's reason (`grouped.rs`, `gemm_block`): the three entries
-/// share the walk and differ only in the weight relay `w32` names, and a
+/// K-quant block's reason (`grouped.rs`, `gemm_block`): the entries share
+/// the walk and differ only in the weight relay `w32` names, and a
 /// function boundary would move the accumulators out of registers.
 ///
 /// `wt` names the relay and the entry's weight parameters, `mins` (a
@@ -490,6 +566,7 @@ macro_rules! gemm32_block {
         let (pr, pj) = (tid / 2, tid % 2);
         let prow_live = pr < live_rows;
         let pn0 = (e * rows_n + slab0 + pr) * kb + pj;
+        w32!(@prep $kind($($w),+), prow, e * rows_n + slab0 + pr, pn0 - pj, kb);
         // Each lane's `ldmatrix` rows: A row `lane % 16` of the warp's slab
         // rows at 16-byte half `lane / 16`; B column `lane % 8` of an n-tile
         // at 16-byte chunk `lane / 8` (blocks 0 and 1, low and high half).
@@ -504,8 +581,8 @@ macro_rules! gemm32_block {
             // SAFETY: the pair's staged row of stage 0, inside WT.
             let dst = unsafe { wt.add(pr * W32_ROW) };
             w32!(@copy $kind($($w),+), live, pn0, dst, pj);
-            let raw = w32!(@load $kind($($w),+), live, pn0);
-            w32!(@store $kind($($w),+), raw, live, pn0, dst, pj);
+            let raw = w32!(@load $kind($($w),+), live, pn0, prow);
+            w32!(@store $kind($($w),+), raw, live, pn0, dst, pj, prow);
         }
         // SAFETY: commits this thread's copies above as one group.
         unsafe { cp_async_commit_group() };
@@ -518,7 +595,7 @@ macro_rules! gemm32_block {
             // Step h + 1's pair, loaded now, stored after this step's compute.
             let nlive = nx && prow_live && 2 * (h + 1) + pj < kb;
             let nn = pn0 + 2 * (h + 1);
-            let raw = w32!(@load $kind($($w),+), nlive, nn);
+            let raw = w32!(@load $kind($($w),+), nlive, nn, prow);
             // SAFETY: one group per step (possibly empty) and none newer, so
             // waiting for all leaves step h's copies complete; the barrier
             // then publishes them and every relay store of step h, and tells
@@ -611,7 +688,7 @@ macro_rules! gemm32_block {
             }
 
             if nx {
-                w32!(@store $kind($($w),+), raw, nlive, nn, ndst, pj);
+                w32!(@store $kind($($w),+), raw, nlive, nn, ndst, pj, prow);
             }
             h += 1;
         }
@@ -642,7 +719,7 @@ macro_rules! gemm32_block {
 }
 
 /// The weights of a 32-value GEMM: a stack of `n_experts · rows_per_expert`
-/// rows of K = `act.k()` values in one of the four layouts (module doc).
+/// rows of K = `act.k()` values in one of the five layouts (module doc).
 #[derive(Clone, Copy)]
 pub enum Gemm32Weight<'a> {
     /// Q8_0 in the q8f32 planes: `qs` rows × K/4 words, `d` rows × K/32
@@ -663,6 +740,10 @@ pub enum Gemm32Weight<'a> {
     /// zero-padded at its end to a whole number of words per row, as the
     /// K-quant stacks are.
     Iq4NlFile(&'a DeviceTensor<u32>),
+    /// The resident packed Q5_0 (`q5.rs`, `pack_q5_0`, the tensor
+    /// `enqueue_gemv_q5_0` reads): per row `256 · ceil(K/1024)` code words,
+    /// then `K/32` f32 scales.
+    Q5_0Packed(&'a DeviceTensor<u32>),
 }
 
 /// [`Gemm32Kernels::enqueue_gemm32`]'s arguments: `w` the stack, `route`
@@ -724,7 +805,8 @@ impl Gemm32Launch {
             Gemm32Weight::Q8_0Plane { qs, .. }
             | Gemm32Weight::Q8_0File(qs)
             | Gemm32Weight::Q5_1File(qs)
-            | Gemm32Weight::Iq4NlFile(qs) => qs.rows(),
+            | Gemm32Weight::Iq4NlFile(qs)
+            | Gemm32Weight::Q5_0Packed(qs) => qs.rows(),
         };
         if stack_rows != n_rows {
             return Err(GpuError::shape(
@@ -797,6 +879,20 @@ impl Gemm32Launch {
                              bytes",
                             w.cols(),
                             4 * w.buf().len()
+                        ),
+                    ));
+                }
+            }
+            Gemm32Weight::Q5_0Packed(w) => {
+                let words = q5_0_packed_row_words(kb);
+                if w.cols() != words || w.buf().len() < n_rows * words {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "packed Q5_0 rows at K = {k} are {words} words, got {} words over {} \
+                             words",
+                            w.cols(),
+                            w.buf().len()
                         ),
                     ));
                 }
@@ -907,6 +1003,14 @@ impl Gemm32Kernels {
             Gemm32Weight::Q8_0File(w) => launch!(prepare_gemm_q8_0f, gemm_q8_0f, w.buf()),
             Gemm32Weight::Q5_1File(w) => launch!(prepare_gemm_q5_1, gemm_q5_1, w.buf()),
             Gemm32Weight::Iq4NlFile(w) => launch!(prepare_gemm_iq4nl, gemm_iq4nl, w.buf()),
+            Gemm32Weight::Q5_0Packed(w) => {
+                let windows = launch_u32(
+                    "Gemm32Kernels::enqueue_gemm32",
+                    "windows",
+                    q5_0_packed_windows(g.kb as usize),
+                )?;
+                launch!(prepare_gemm_q5_0p, gemm_q5_0p, w.buf(), windows);
+            }
         }
         Ok(())
     }

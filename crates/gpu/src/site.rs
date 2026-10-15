@@ -30,10 +30,11 @@
 //! - [`gemm`], a wide unit through a route table: a K-quant the grouped
 //!   int8 GEMM over the q8_1 blocks of 128 values ([`GemmAct`]), Q8_0 the
 //!   32-value GEMM over the q8 blocks of 32 values ([`GemmAct32`]) on the
-//!   q8f32 planes, F32 the F32 tile over the f32 rows (one column a slot, on
-//!   the unit's one-expert table only). A site's weight is the resident
-//!   tensor of its name, or — a K-quant's — the words a caller holds
-//!   ([`SiteWeight`]).
+//!   q8f32 planes, Q5_0 the same GEMM on the packed weight the gemv reads
+//!   (`gemm_q5_0p`, on the unit's one-expert table only), F32 the F32 tile
+//!   over the f32 rows (one column a slot, on the unit's one-expert table
+//!   only). A site's weight is the resident tensor of its name, or — a
+//!   K-quant's — the words a caller holds ([`SiteWeight`]).
 //! - [`gated`], a wide gate·up·down block over one table: the gate and up
 //!   [`gemm`]s, the gate·up rule's SwiGLU written into the form the down's
 //!   type reads (the down's activation), and the down [`gemm`] over those
@@ -66,7 +67,8 @@ pub enum SiteTy {
     Q4K,
     Q5K,
     Q6K,
-    /// Packed Q5_0 (`pack_q5_0`), launched by [`blocks32_gemv`].
+    /// Packed Q5_0 (`pack_q5_0`), launched by [`blocks32_gemv`] and, wide,
+    /// by [`gemm`].
     Q5_0,
     Q8_0,
     F32,
@@ -118,8 +120,8 @@ impl SiteTy {
         self.gemm_weight().is_some()
     }
 
-    /// The grouped GEMM's type of a K-quant; `None` for Q5_0, Q8_0 and F32.
-    /// Q5_0 has no wide GEMM.
+    /// The grouped GEMM's type of a K-quant; `None` for Q5_0, Q8_0 and F32,
+    /// whose wide GEMM is the 32-value family's ([`gemm`]).
     #[must_use]
     pub fn gemm_weight(self) -> Option<GemmWeight> {
         match self {
@@ -604,10 +606,28 @@ pub fn gemm(
                 y,
             )
         }
-        SiteTy::Q5_0 => Err(GpuError::shape(
-            WHAT,
-            format!("{name} is {ty}: a Q5_0 site has no wide GEMM"),
-        )),
+        SiteTy::Q5_0 => {
+            dense()?;
+            let site = src.resident(WHAT, ty)?;
+            let Some(DevWeight::Q5_0 { w: packed, .. }) = w.get(site) else {
+                return Err(GpuError::tensor(WHAT, site, "a packed Q5_0 weight"));
+            };
+            k.g32(
+                WHAT,
+                "the 32-value kernels a Q5_0 site runs on (this load holds none)",
+            )?
+            .enqueue_gemm32(
+                stream,
+                Gemm32Args {
+                    w: Gemm32Weight::Q5_0Packed(packed),
+                    rows_per_expert: rows,
+                    act: x.q32.ok_or_else(|| missing("q8 blocks of 32"))?,
+                    route,
+                    input,
+                    y,
+                },
+            )
+        }
     }
 }
 

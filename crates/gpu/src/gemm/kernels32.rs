@@ -1,11 +1,11 @@
-//! The one device module of the 32-value-block family: the Q8_0, IQ4_NL and
-//! Q5_1 GEMMs, their activations' quantizers, the remapped route and the wide
-//! F32 product — every `#[kernel]` entry of the family, so one bundle load
-//! serves them all. It is a module of its own, beside `kernels.rs`, so no
-//! entry of the K-quant family's module changes with it. Each GEMM entry is
-//! one expansion of `gemm32.rs`'s block; the quantizer, route and F32 bodies
-//! live with their owners (`act32.rs`, `remap.rs`, `f32tile.rs`) or are
-//! written out here.
+//! The one device module of the 32-value-block family: the Q8_0, IQ4_NL,
+//! Q5_1 and packed Q5_0 GEMMs, their activations' quantizers, the remapped
+//! route and the wide F32 product — every `#[kernel]` entry of the family,
+//! so one bundle load serves them all. It is a module of its own, beside
+//! `kernels.rs`, so no entry of the K-quant family's module changes with it.
+//! Each GEMM entry is one expansion of `gemm32.rs`'s block; the quantizer,
+//! route and F32 bodies live with their owners (`act32.rs`, `remap.rs`,
+//! `f32tile.rs`) or are written out here.
 
 use super::act32::quant32_group;
 use super::f32tile::{STAGE_FLOATS, STAGES, f32_tile_body};
@@ -445,6 +445,61 @@ mod gemm32_kernels {
         gemm32_block!(
             wt: q51(w),
             mins: true,
+            params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
+                n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_q8_0p`] for the resident packed Q5_0 (`q5.rs`, `pack_q5_0`):
+    /// `w` is `n_experts · rows` rows of `256 · windows + blocks` words —
+    /// the int8 codes `q − 16` in the gemv's transposed word order (block
+    /// `b`'s word `i` at `256·(b >> 5) + 32·i + (b & 31)`), then the
+    /// blocks' f32 scales; `windows` is the row's 32-block windows. The
+    /// codes are signed already, so there is no min term (`s` is not read).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            32 * windows >= blocks,
+            w.len() >= n_experts * rows * (256 * windows + blocks),
+            2 * steps >= blocks,
+            q.len() >= act_cols * 16 * steps,
+            d.len() >= act_cols * 2 * steps,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_q5_0p(
+        w: &[u32],
+        windows: u32,
+        q: &[u32],
+        d: &[f32],
+        s: &[i32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        blocks: u32,
+        steps: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        gemm32_block!(
+            wt: q50p(w, windows),
+            mins: false,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),
         );

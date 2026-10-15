@@ -1,8 +1,9 @@
 //! The host transcription of the 32-value GEMM family (`bloomery_gpu::gemm`'s
 //! `Gemm32Kernels`): its quantizer and the per-output numeric contract that
 //! `gemm32.rs`'s module doc states. One owner, so every gate that holds a
-//! `gemm_q8_0p`, `gemm_q8_0f` or `gemm_q5_1` output bit for bit holds it to
-//! the same transcription (`gate_gemm`'s `g32_*` cases, `gate_glm5next_gemm`).
+//! `gemm_q8_0p`, `gemm_q8_0f`, `gemm_q5_1` or `gemm_q5_0p` output bit for bit
+//! holds it to the same transcription (`gate_gemm`'s `g32_*` cases,
+//! `gate_glm5next_gemm`).
 
 /// A `GemmAct32`'s three planes on the host, in the device layout: codes,
 /// scales, sums.
@@ -116,4 +117,30 @@ pub fn dot32(
         mag += dd.abs() + mm.abs();
     }
     (acc, y, mag)
+}
+
+/// The f32 roundings that separate a `gemm_q5_0p` output from the Q5_0
+/// gemv's (`q5.rs`, `q5_0_gemv`) for the same weight row and the same
+/// activation codes, at `kb` blocks: the band of the gate's
+/// `q5_0p_is_the_gemv` is `γ(this) · Σ_b |d_a·d_w·isum_b|`.
+///
+/// Both kernels form each block's exact i32 `isum_b` (the same int8 codes:
+/// `q − 16` and the column's q8, the quantizers' bits equal) and the same
+/// `t_b = d_w·f32(isum_b)` (`|isum_b| <= 32·16·127 < 2^24`, so the
+/// conversion is exact; one product, the same rounding on both sides). They
+/// differ in how the terms `d_a·t_b` reach the sum:
+/// - the GEMM: `acc = fma(d_a, t_b, acc)` from 0, blocks in increasing k —
+///   each term through at most `kb` roundings;
+/// - the gemv: lane `b % 32` adds `(t_b·d_a)` (one rounding, or none if the
+///   backend fuses it into the add) to its partial, then a five-level xor
+///   butterfly — each term through at most `1 + (ceil(kb/32) − 1) + 5`.
+///
+/// So both lie within `γ(kb)` and `γ(ceil(kb/32) + 5)` of `Σ_b d_a·t_b`,
+/// whose magnitude is at most `(1 + u)` times the exact `Σ_b |d_a d_w
+/// isum_b|`; `γ(a) + γ(b) <= γ(a + b)` and `(1 + u)·γ(n) <= γ(n + 1)` give
+/// `|y_gemm − y_gemv| <= γ(kb + ceil(kb/32) + 6) · Σ_b |d_a d_w isum_b|`.
+/// Not bit-equal: the two sum orders differ for every `kb > 1`.
+#[must_use]
+pub fn q5_0p_gemv_roundings(kb: usize) -> usize {
+    kb + kb.div_ceil(32) + 6
 }

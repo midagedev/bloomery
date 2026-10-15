@@ -140,6 +140,17 @@
 //!   column; a Q8_0 plane stack of 8 experts at K 2560 whose two slots a
 //!   token share its column; a Q5_1 stack of 8 × 2560 rows at K 640 (the
 //!   routed down's shape) up to 4096 slots.
+//! - `q5_0p_is_the_gemv`: the resident packed Q5_0 (`pack_q5_0`, the tensor
+//!   the gemv reads) in `gemm_q5_0p` over the dense table, at Nemotron's
+//!   `ssm_in` (17504 × 3136) and `ffn_up` (12544 × 3136) and at 272 rows of
+//!   K 1056 (33 blocks), for U ∈ {1, 8, 9, 64, 512} columns, against
+//!   `enqueue_gemv_q5_0` run eight columns at a time on the same input: both
+//!   quantizers' planes the host's, the decode ggml's, every output of both
+//!   written and finite, every checked output bit for bit the contract's
+//!   transcription and within the gemv band — not bit-equal, the gemv sums
+//!   a row's blocks in 32 lane partials and a butterfly, so
+//!   `|y − y_gemv| <= γ(K/32 + ceil(K/1024) + 6) · Σ_b |d_a·d_w·isum_b|`
+//!   (`gemm32::q5_0p_gemv_roundings` derives it).
 //! - `g38_iq4nl`: the IQ4_NL down of the Qwen3.8 card route (`gemm_iq4nl`)
 //!   — a synthetic 64 × 2560-row stack at K 640 (random nibble codes, finite
 //!   f16 `d`), each slot its own column, under the four routings of the
@@ -163,7 +174,8 @@
 //!   message (another check refusing first does not pass): the scratch's
 //!   K and columns, the quantizer's input and columns, an unfilled table,
 //!   rows not a multiple of 16, a layout or planes of another shape, an
-//!   activation of fewer columns than the slots or quantized for fewer, a
+//!   activation of fewer columns than the slots or quantized for fewer, packed
+//!   Q5_0 rows of another K, a
 //!   short `y`, a clamp limit that is not finite and a short input for the
 //!   rule-taking SwiGLU, an empty map and slots past the table for the remap, and the
 //!   F32 tile's K, short `x` and an `x` off a 16-byte boundary.
@@ -2207,8 +2219,9 @@ mod gate {
              the contract's transcription, every slot written, rerun and graph replay bit-identical, \
              faults named; the route table the host's stable grouping bit for bit up to 32,768 slots; \
              the SwiGLU quantizer bit for bit its composition; the 32-value family (Q8_0 planes and \
-             file, Q5_1) bit for bit its contract, its quantizers the host's, the remapped route's \
-             host slots untouched, the wide F32 product f32_gemv's bits"
+             file, Q5_1, packed Q5_0) bit for bit its contract, packed Q5_0 inside the gemv's \
+             band, its quantizers the host's, the remapped route's host slots untouched, the wide \
+             F32 product f32_gemv's bits"
         );
         Ok(())
     }
@@ -2792,6 +2805,7 @@ mod gate {
         };
         use bloomery_gpu::hybrid::HOST;
         use bloomery_gpu::kquant::{Act, act::silu_ik};
+        use bloomery_gpu::q5::{Q8Blocks32, pack_q5_0};
         use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
         use bloomery_gpu_gates::gemm32::{HostAct, Planes32, dot32, host_act};
         use bloomery_gpu_gates::rounding::gamma;
@@ -2802,6 +2816,36 @@ mod gate {
         use gguf::iq_tables::KVALUES_IQ4NL;
         use gguf::quant::{GgmlType, dequant_row, half_to_f32};
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// `each` over the slots `0..slots`, spread over the machine's threads
+        /// (at most 32), each thread folding into its own `init()`: one result
+        /// a thread, `Err` for a thread that panicked.
+        fn par_slots<T: Send>(
+            slots: usize,
+            init: impl Fn() -> T + Sync,
+            each: impl Fn(usize, &mut T) + Sync,
+        ) -> Vec<std::thread::Result<T>> {
+            let next = AtomicUsize::new(0);
+            let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
+            std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|_| {
+                        sc.spawn(|| {
+                            let mut t = init();
+                            loop {
+                                let s = next.fetch_add(1, Ordering::Relaxed);
+                                if s >= slots {
+                                    break;
+                                }
+                                each(s, &mut t);
+                            }
+                            t
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join()).collect()
+            })
+        }
 
         /// K per dense case: 96 and 352 end in a one-block step (K/32 odd),
         /// 320 and 640 are Qwen3.8's HC up and shared down, not multiples of
@@ -3020,57 +3064,50 @@ mod gate {
             y: &[f32],
             slots: usize,
         ) -> Checked {
-            let next = AtomicUsize::new(0);
-            let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
             let kb = w.k / 32;
-            let parts: Vec<_> = std::thread::scope(|sc| {
-                let hs: Vec<_> = (0..threads)
-                    .map(|_| {
-                        sc.spawn(|| {
-                            let (mut checked, mut band_off, mut bits_off, mut host_bad) = (0, 0, 0, 0);
-                            let mut worst = 0.0f64;
-                            let mut first: Option<String> = None;
-                            loop {
-                                let s = next.fetch_add(1, Ordering::Relaxed);
-                                if s >= slots {
-                                    break;
-                                }
-                                let out = &y[s * rows..(s + 1) * rows];
-                                let Some(e) = expert(s) else {
-                                    if out.iter().any(|v| v.to_bits() != SENT.to_bits()) {
-                                        host_bad += 1;
-                                        first.get_or_insert_with(|| format!("host slot {s} written"));
-                                    }
-                                    continue;
-                                };
-                                for r in (0..rows).filter(|&r| row_checked(slots, s, r)) {
-                                    let (want, y64, mag) = row_dot(w, e * rows + r, a, col(s), mins);
-                                    let got = out[r];
-                                    let band = gamma(kb + 3) * mag;
-                                    let err = (f64::from(got) - y64).abs();
-                                    checked += 1;
-                                    worst = worst.max(if band > 0.0 { err / band } else { err });
-                                    let within = err <= band;
-                                    if !within {
-                                        band_off += 1;
-                                        first.get_or_insert_with(|| {
-                                            format!("slot {s} row {r}: got {got:e} f64 {y64:e} band {band:.3e}")
-                                        });
-                                    }
-                                    if got.to_bits() != want.to_bits() {
-                                        bits_off += 1;
-                                        first.get_or_insert_with(|| {
-                                            format!("slot {s} row {r}: got {got:e} contract {want:e}")
-                                        });
-                                    }
-                                }
-                            }
-                            Checked { checked, band_off, bits_off, host_bad, worst, first }
-                        })
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join()).collect()
-            });
+            let parts = par_slots(
+                slots,
+                || Checked {
+                    checked: 0,
+                    band_off: 0,
+                    bits_off: 0,
+                    host_bad: 0,
+                    worst: 0.0,
+                    first: None,
+                },
+                |s, c: &mut Checked| {
+                    let out = &y[s * rows..(s + 1) * rows];
+                    let Some(e) = expert(s) else {
+                        if out.iter().any(|v| v.to_bits() != SENT.to_bits()) {
+                            c.host_bad += 1;
+                            c.first
+                                .get_or_insert_with(|| format!("host slot {s} written"));
+                        }
+                        return;
+                    };
+                    for r in (0..rows).filter(|&r| row_checked(slots, s, r)) {
+                        let (want, y64, mag) = row_dot(w, e * rows + r, a, col(s), mins);
+                        let got = out[r];
+                        let band = gamma(kb + 3) * mag;
+                        let err = (f64::from(got) - y64).abs();
+                        c.checked += 1;
+                        c.worst = c.worst.max(if band > 0.0 { err / band } else { err });
+                        let within = err <= band;
+                        if !within {
+                            c.band_off += 1;
+                            c.first.get_or_insert_with(|| {
+                                format!("slot {s} row {r}: got {got:e} f64 {y64:e} band {band:.3e}")
+                            });
+                        }
+                        if got.to_bits() != want.to_bits() {
+                            c.bits_off += 1;
+                            c.first.get_or_insert_with(|| {
+                                format!("slot {s} row {r}: got {got:e} contract {want:e}")
+                            });
+                        }
+                    }
+                },
+            );
             let mut all = Checked {
                 checked: 0,
                 band_off: 0,
@@ -3923,6 +3960,294 @@ mod gate {
             Ok(ok)
         }
 
+        /// Nemotron's Q5_0 sites in the GEMM: `ssm_in` (17504 × 3136) and
+        /// `ffn_up` (12544 × 3136), and 272 rows (two full slabs and one of
+        /// 16) at K 1056 (33 blocks: an odd count, a second 32-block window
+        /// holding one).
+        const Q50_SHAPES: [(usize, usize); 3] = [(17504, 3136), (12544, 3136), (ROWS, 1056)];
+        /// Columns per `q5_0p_is_the_gemv` run: the prompt's U = 512 and the
+        /// edges of a 64-column tile and of the gemv's 8-column chunk.
+        const Q50_US: [usize; 5] = [1, 8, 9, 64, 512];
+        /// The share of the derived band (`gemm32::q5_0p_gemv_roundings`) a
+        /// GEMM output may sit from the gemv's: tighter than the bound, which
+        /// counts every rounding at its worst.
+        // PIN(2026-10-16): worst 0.116 of the band (272 × K 1056, U 512), the Nemotron shapes ≤ 0.066.
+        const Q50_PIN: f64 = 0.25;
+
+        /// `n_rows` rows of Q5_0 blocks from `seed` (finite f16 `d`, random
+        /// `qh` and nibbles), decoded to the signed codes `q − 16` and `d`;
+        /// the decode is checked against ggml's `dequant_row` bit for bit
+        /// (`d·(q − 16)` is one f32 product on both sides).
+        fn weights_q50(n_rows: usize, k: usize, seed: u64) -> Result<(Wts, bool), GateError> {
+            let mut g = Lcg(seed);
+            let kb = k / 32;
+            let mut bytes = vec![0u8; n_rows * kb * 22];
+            let (mut d, mut q) = (
+                Vec::with_capacity(n_rows * kb),
+                Vec::with_capacity(n_rows * k),
+            );
+            for blk in bytes.as_chunks_mut::<22>().0 {
+                for b in blk.iter_mut() {
+                    *b = g.next() as u8;
+                }
+                let neg = g.next() & 1 == 1;
+                let db = f16_bits(&mut g, neg);
+                blk[0..2].copy_from_slice(&db.to_le_bytes());
+                d.push(half_to_f32(db));
+                let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+                let mut v = [0i8; 32];
+                for (j, &b) in blk[6..22].iter().enumerate() {
+                    v[j] = ((b & 0x0f) | ((((qh >> j) & 1) as u8) << 4)) as i8 - 16;
+                    v[16 + j] = ((b >> 4) | ((((qh >> (16 + j)) & 1) as u8) << 4)) as i8 - 16;
+                }
+                q.extend_from_slice(&v);
+            }
+            let mut want = vec![0.0f32; k];
+            let mut decode_ok = true;
+            for r in 0..n_rows {
+                dequant_row(
+                    GgmlType::Q5_0,
+                    &bytes[r * kb * 22..(r + 1) * kb * 22],
+                    &mut want,
+                )?;
+                for (v, &w) in want.iter().enumerate() {
+                    let mine = d[r * kb + v / 32] * f32::from(q[r * k + v]);
+                    decode_ok &= mine.to_bits() == w.to_bits();
+                }
+            }
+            Ok((
+                Wts {
+                    k,
+                    bytes,
+                    d,
+                    m: vec![0.0; n_rows * kb],
+                    q,
+                },
+                decode_ok,
+            ))
+        }
+
+        /// One `q5_0p_is_the_gemv` run's comparison: outputs checked, off
+        /// the contract's bits, outside the gemv band; values that are not
+        /// finite on either side; the worst distance over the band, the
+        /// outputs bit-equal to the gemv's, and the first failure.
+        struct GemvCmp {
+            checked: usize,
+            bits_off: usize,
+            band_off: usize,
+            nonfinite: usize,
+            worst: f64,
+            same_bits: usize,
+            first: Option<String>,
+        }
+
+        /// The GEMM's `y` (token-major, `y[s · rows + r]`) against the
+        /// gemv's (`yv`, the same layout) over `u` columns, each checked
+        /// output against [`dot32`]'s contract bits and the gemv band.
+        fn gemv_cmp(w: &Wts, rows: usize, a: &HostAct, y: &[f32], yv: &[f32], u: usize) -> GemvCmp {
+            let kb = w.k / 32;
+            let rel = Q50_PIN * gamma(bloomery_gpu_gates::gemm32::q5_0p_gemv_roundings(kb));
+            let parts = par_slots(
+                u,
+                || GemvCmp {
+                    checked: 0,
+                    bits_off: 0,
+                    band_off: 0,
+                    nonfinite: 0,
+                    worst: 0.0,
+                    same_bits: 0,
+                    first: None,
+                },
+                |s, c: &mut GemvCmp| {
+                    for r in 0..rows {
+                        let (got, gv) = (y[s * rows + r], yv[s * rows + r]);
+                        if !got.is_finite() || !gv.is_finite() {
+                            c.nonfinite += 1;
+                            c.first.get_or_insert_with(|| {
+                                format!("slot {s} row {r}: gemm {got:e} gemv {gv:e}")
+                            });
+                            continue;
+                        }
+                        if !row_checked(u, s, r) {
+                            continue;
+                        }
+                        let (want, _, mag) = row_dot(w, r, a, s, false);
+                        let band = rel * mag;
+                        let err = (f64::from(got) - f64::from(gv)).abs();
+                        c.checked += 1;
+                        c.same_bits += usize::from(got.to_bits() == gv.to_bits());
+                        c.worst = c.worst.max(if band > 0.0 { err / band } else { err });
+                        if err > band {
+                            c.band_off += 1;
+                            c.first.get_or_insert_with(|| {
+                                format!(
+                                    "slot {s} row {r}: gemm {got:e} gemv {gv:e} band {band:.3e}"
+                                )
+                            });
+                        }
+                        if got.to_bits() != want.to_bits() {
+                            c.bits_off += 1;
+                            c.first.get_or_insert_with(|| {
+                                format!("slot {s} row {r}: gemm {got:e} contract {want:e}")
+                            });
+                        }
+                    }
+                },
+            );
+            let mut all = GemvCmp {
+                checked: 0,
+                bits_off: 0,
+                band_off: 0,
+                nonfinite: 0,
+                worst: 0.0,
+                same_bits: 0,
+                first: None,
+            };
+            for p in parts {
+                let p = p.unwrap_or(GemvCmp {
+                    checked: 0,
+                    bits_off: 0,
+                    band_off: 1,
+                    nonfinite: 0,
+                    worst: 0.0,
+                    same_bits: 0,
+                    first: Some("reference thread panicked".into()),
+                });
+                all.checked += p.checked;
+                all.bits_off += p.bits_off;
+                all.band_off += p.band_off;
+                all.nonfinite += p.nonfinite;
+                all.worst = all.worst.max(p.worst);
+                all.same_bits += p.same_bits;
+                all.first = all.first.or(p.first);
+            }
+            all
+        }
+
+        /// `q5_0p_is_the_gemv`: the resident packed Q5_0 (`pack_q5_0`, the
+        /// tensor `enqueue_gemv_q5_0` reads) in `gemm_q5_0p` over the dense
+        /// table, at each of [`Q50_SHAPES`] and [`Q50_US`] columns, against
+        /// the Q5_0 gemv run eight columns at a time on the same input: both
+        /// quantizers' codes, scales and sums the host's; every output of
+        /// both written and finite; every checked output bit for bit the
+        /// contract's transcription and within the gemv band
+        /// (`gemm32::q5_0p_gemv_roundings`, scaled by [`Q50_PIN`]). Its
+        /// refusal at another K is `g32_refuse`'s.
+        fn q5_0p_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("q5_0p_is_the_gemv") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let max = Q50_US[Q50_US.len() - 1];
+            let mut route = GemmRoute::new(stream, max, 1)?;
+            let mut ok = true;
+            for (si, (rows, k)) in Q50_SHAPES.into_iter().enumerate() {
+                let kb = k / 32;
+                let (w, dec) = weights_q50(rows, k, 0x3500 + si as u64)?;
+                let packed = pack_q5_0(&w.bytes, k, rows)?;
+                let words = packed.len() / rows;
+                let wt = DeviceTensor::upload(stream, &packed, rows, words)?;
+                let mut act = GemmAct32::new(stream, max, k)?;
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, max * rows)?;
+                let mut yg = DeviceBuffer::<f32>::zeroed(stream, 8 * rows)?;
+                for u in Q50_US {
+                    let x = activations(k, u, 9800 + (k * 3 + u + si) as u32);
+                    let xd = DeviceBuffer::from_host(stream, &x)?;
+                    dev.g32
+                        .enqueue_quantize_gemm32(stream, &xd, u, &mut act, sink)?;
+                    dev.gk.enqueue_route_dense(stream, u, &mut route, sink)?;
+                    // The gemv's scratch quantizes all its columns: one of `u`.
+                    let mut act8u = Q8Blocks32::with_slots(stream, k, u)?;
+                    gpu.q5()
+                        .enqueue_quantize_q8(stream, &xd, &mut act8u, sink)?;
+                    y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                    dev.g32.enqueue_gemm32(
+                        stream,
+                        Gemm32Args {
+                            w: Gemm32Weight::Q5_0Packed(&wt),
+                            rows_per_expert: rows,
+                            act: &act,
+                            route: &route,
+                            input: GemmInput::PerSlot,
+                            y: &mut y,
+                        },
+                    )?;
+                    stream.synchronize()?;
+                    let mut got = y.to_host_vec(stream)?;
+                    got.truncate(u * rows);
+                    // The gemv, eight columns a launch, laid token-major.
+                    let mut yv = vec![SENT; u * rows];
+                    for c0 in (0..u).step_by(8) {
+                        let m = (u - c0).min(8);
+                        yg.copy_from_host(stream, &vec![SENT; yg.len()])?;
+                        gpu.q5()
+                            .enqueue_gemv_q5_0(stream, &wt, &act8u, 0, rows, c0, m, &mut yg, 0)?;
+                        let g = yg.to_host_vec(stream)?;
+                        for c in 0..m {
+                            for r in 0..rows {
+                                yv[(c0 + c) * rows + r] = g[r * m + c];
+                            }
+                        }
+                    }
+                    let (ha, want) = host_act(&x, k, u);
+                    let act_ok = planes_equal(&act, u, &want, stream)?;
+                    let h8 = act8u.readback(stream)?;
+                    let qst = 256 * kb.div_ceil(32);
+                    let act8_ok = (0..u).all(|c| {
+                        (0..kb).all(|b| {
+                            (0..8).all(|i| {
+                                h8.q[c * qst + 256 * (b >> 5) + 32 * i + (b & 31)]
+                                    == want.0[c * 16 * act.steps() + 8 * b + i]
+                            }) && h8.d8[c * kb + b].to_bits() == ha.d[c * kb + b].to_bits()
+                                && h8.s8[c * kb + b] == ha.s[c * kb + b]
+                        })
+                    });
+                    let unwritten = got
+                        .iter()
+                        .chain(&yv)
+                        .filter(|v| v.to_bits() == SENT.to_bits())
+                        .count();
+                    let GemvCmp {
+                        checked,
+                        bits_off,
+                        band_off,
+                        nonfinite,
+                        worst,
+                        same_bits,
+                        first,
+                    } = gemv_cmp(&w, rows, &ha, &got, &yv, u);
+                    let fault = gpu.take_fault()?;
+                    let pass = dec
+                        && act_ok
+                        && act8_ok
+                        && unwritten == 0
+                        && nonfinite == 0
+                        && checked > 0
+                        && bits_off == 0
+                        && band_off == 0
+                        && fault.is_none();
+                    println!(
+                        "gemm32 case=q5_0p_is_the_gemv rows={rows} K={k} U={u} decode_vs_ggml={dec} \
+                         act_eq_host={act_ok} q8blocks32_eq_host={act8_ok} unwritten={unwritten} \
+                         nonfinite={nonfinite} checked={checked} contract_bits_differ={bits_off} \
+                         gemv_band_off={band_off} worst_over_gemv_band={worst:.4} \
+                         gemv_bits_equal={same_bits} y_fnv={:016x} {}",
+                        Fnv1a64::default().f32s(&got).value(),
+                        verdict(pass)
+                    );
+                    if let Some(f) = first {
+                        println!(
+                            "gemm32 case=q5_0p_is_the_gemv rows={rows} K={k} U={u} first_failure: {f}"
+                        );
+                    }
+                    ok &= pass;
+                }
+            }
+            Ok(ok)
+        }
+
         /// The IQ4_NL down of the Qwen3.8 card route (`gemm_iq4nl`): a
         /// synthetic stack of 64 experts × 2560 rows at K 640 (random nibble
         /// codes, finite f16 `d`), each slot its own column, the four routings
@@ -4487,6 +4812,10 @@ mod gate {
             let ids = DeviceBuffer::<u32>::zeroed(stream, 9)?;
             let plane = r8.weight(Lay::Q8Plane)?;
             let (qs, _) = r8.plane.as_ref().ok_or("a Q8_0 stack with no planes")?;
+            // Packed Q5_0 rows at K 96: 259 words a row where K 320 needs 266.
+            let (w50, _) = weights_q50(rows, 96, 0x35f0)?;
+            let p50 = pack_q5_0(&w50.bytes, 96, rows)?;
+            let q50_96 = DeviceTensor::upload(stream, &p50, rows, p50.len() / rows)?;
             // The scales of a stack one block wider than the codes.
             let d_wide =
                 DeviceTensor::upload(stream, &vec![0u16; rows * (k / 32 + 1)], rows, k / 32 + 1)?;
@@ -4567,6 +4896,17 @@ mod gate {
                     "unfilled_route",
                     gemm(plane, rows, &act, &unfilled, &mut y),
                     "a filled route table",
+                ),
+                (
+                    "q5_0p_other_k",
+                    gemm(
+                        Gemm32Weight::Q5_0Packed(&q50_96),
+                        rows,
+                        &act,
+                        &route,
+                        &mut y,
+                    ),
+                    "packed Q5_0 rows at K = 320 are 266 words",
                 ),
                 (
                     "rows_not_16",
@@ -4674,6 +5014,7 @@ mod gate {
             ok &= swiglu_act_case(&dev)?;
             ok &= dense_case(&dev)?;
             ok &= routed_case(&dev)?;
+            ok &= q5_0p_case(&dev)?;
             ok &= iq4nl_case(&dev)?;
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
