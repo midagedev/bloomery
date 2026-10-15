@@ -5,6 +5,12 @@
 //! a plan over a card and the host tier (`--place`), greedy, one token per
 //! step, and the timing runner's ruler.
 //!
+//! A nemotron_h (Nemotron 3 Nano 4B) file runs here too, whole on one card,
+//! one sequence: its prompt runs as steps through the captured step chain
+//! (`--prefill step`, the default), as the seat's does. `--place`,
+//! `--seed-depth`, more than one slot, a draft and the qwen family's
+//! expert, K/V and residency levers are refused by name before the load.
+//!
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
 //!                       [-n N] [--ctx C] [--mode eager|graph]
 //!                       [--prefill auto|pass|gemm|step] [--place a|gate|bp|<cards>]
@@ -392,7 +398,8 @@ mod cli {
     use bloomery_gpu::host::xstream::{XLayer, XReport};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
-    use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
+    use bloomery_gpu::arch::nemotron_h::Body as BodyNh;
+    use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, Qwen3moeModel};
 
     use bloomery_gpu_gates::generate::{Place, card_words, lane_at};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
@@ -477,11 +484,26 @@ mod cli {
         /// `qwen4exp`, which the qwen35moe reader reads and `Arch` does not
         /// name.
         Qwen38,
+        /// `nemotron_h`, the whole model on one card, one sequence, its
+        /// prompt run as steps.
+        NemotronH,
+    }
+
+    impl Family {
+        /// The file architecture's name.
+        fn name(self) -> &'static str {
+            match self {
+                Family::Qwen3 => "qwen3moe",
+                Family::Qwen35 => "qwen35moe",
+                Family::Qwen38 => "qwen4exp",
+                Family::NemotronH => "nemotron_h",
+            }
+        }
     }
 
     /// The model file ([`ref_model_path`]) and its engine, read from its
     /// first shard's header: `qwen4exp` by its name, else `Arch::detect`'s
-    /// qwen3moe or qwen35moe; any other file is refused by name.
+    /// qwen3moe, qwen35moe or nemotron_h; any other file is refused by name.
     fn open_file() -> Result<(Split, Family), GateError> {
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -494,8 +516,10 @@ mod cli {
         match Arch::detect(first)? {
             Arch::Qwen3moe => Ok((file, Family::Qwen3)),
             Arch::Qwen35moe => Ok((file, Family::Qwen35)),
+            Arch::NemotronH => Ok((file, Family::NemotronH)),
             other => Err(format!(
-                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe and qwen4exp files",
+                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen4exp and \
+                 nemotron_h files",
                 path.display(),
                 file.architecture().unwrap_or(other.name())
             )
@@ -669,6 +693,90 @@ mod cli {
         fn capture_slot_prompt(m: &mut Qwen3moeModel) -> Result<(), GateError> {
             m.capture_prefill()?;
             Ok(())
+        }
+    }
+
+    /// The nemotron_h body's one prompt path: its ids run as steps through the
+    /// captured step chain (`GpuModel::step`), the seat's prompt.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PromptNh {
+        Step,
+    }
+
+    impl Prompted for BodyNh {
+        type Path = PromptNh;
+
+        /// `step`, or no `--prefill`: the body has no batched prompt path.
+        fn path(arg: Option<&str>) -> Result<PromptNh, GateError> {
+            match arg {
+                None | Some("step") => Ok(PromptNh::Step),
+                Some(o) => Err(format!(
+                    "--prefill {o}: a nemotron_h prompt runs as steps (--prefill step); the body \
+                     has no batched prompt path"
+                )
+                .into()),
+            }
+        }
+
+        fn plan(_: &NemotronHModel, n: usize, _: PromptNh) -> Result<Units, GateError> {
+            Ok(Units {
+                text: format!("step x{n}"),
+                count: n,
+                kind: "step",
+                ubatch_tokens: 0,
+            })
+        }
+
+        fn prefill(m: &mut NemotronHModel, ids: &[u32], _: PromptNh) -> Result<u32, GateError> {
+            Ok(m.step(ids)?)
+        }
+
+        fn image(_: &NemotronHModel, _: &Units) -> Result<Option<ImageWrite>, GateError> {
+            Ok(None)
+        }
+
+        fn seed(_: &mut NemotronHModel, rows: usize) -> Result<(), GateError> {
+            Err(no_seed_nh(rows))
+        }
+    }
+
+    /// `--seed-depth` on a nemotron_h file, refused by name: a seeded cache
+    /// row carries no scan state, so the Mamba-2 layers would decode from an
+    /// empty state at a deep position.
+    fn no_seed_nh(rows: usize) -> GateError {
+        format!(
+            "--seed-depth {rows}: a nemotron_h depth holds each Mamba-2 layer's scan state, which \
+             no seeded cache row carries; feed the ids (--tokens)"
+        )
+        .into()
+    }
+
+    /// The levers and flags a nemotron_h run does not take, refused by name
+    /// before the load: the body runs whole on one card, one sequence, with
+    /// f16 K/V and no expert tier.
+    fn nemotron_refused(
+        levers: &Levers,
+        (kv, card_set, residency): (KvQ8, bool, Residency),
+        (place, slots): (bool, usize),
+    ) -> Result<(), GateError> {
+        let set = [
+            ("--place", place),
+            ("BLOOMERY_GEN_SLOTS above 1", slots > 1),
+            ("BLOOMERY_QWEN3_KV=q8_0", kv == KvQ8::Q8),
+            ("BLOOMERY_QWEN38_EXPERTS=card", card_set),
+            ("BLOOMERY_RESIDENCY", residency != Residency::Off),
+            ("BLOOMERY_ROUTE_TRACE", levers.route_trace().is_some()),
+            ("BLOOMERY_HOSTSTREAM", levers.hoststream().is_some()),
+            ("BLOOMERY_XSTREAM", levers.xstream().is_some()),
+            ("BLOOMERY_SPLIT_WALK", levers.split_walk().is_some()),
+        ];
+        match set.iter().find(|(_, on)| *on) {
+            Some((name, _)) => Err(format!(
+                "{name} on a nemotron_h file: its body runs whole on one card, one sequence, \
+                 with f16 K/V and no expert tier"
+            )
+            .into()),
+            None => Ok(()),
         }
     }
 
@@ -1444,6 +1552,14 @@ mod cli {
                 let (place, lane) = place_q3(place.as_deref(), prefill)?;
                 (Chosen::Qwen35(Body35::path(prefill)?, place), None, lane)
             }
+            Family::NemotronH => {
+                draft_refused_on_other(&levers, family)?;
+                nemotron_refused(&levers, (kv, card_set, residency), (place.is_some(), slots))?;
+                if let Some(d) = seed_depth {
+                    return Err(no_seed_nh(d));
+                }
+                (Chosen::NemotronH(BodyNh::path(prefill)?), None, None)
+            }
             Family::Qwen38 => {
                 if let Some(d) = seed_depth {
                     return Err(no_seed38(d));
@@ -1481,7 +1597,7 @@ mod cli {
         };
         let draft = match chosen {
             Chosen::Qwen38(_, _, d, _) => d,
-            Chosen::Qwen3(..) | Chosen::Qwen35(..) => Draft38::Off,
+            Chosen::Qwen3(..) | Chosen::Qwen35(..) | Chosen::NemotronH(_) => Draft38::Off,
         };
         if last_step && (family == Family::Qwen38 || timed || seed_depth.is_some()) {
             return Err(
@@ -1581,7 +1697,7 @@ mod cli {
         }
         let (place_a, prefill_step) = match chosen {
             Chosen::Qwen38(path, place, ..) => (stage_a(place), path == Prompt38::Step),
-            Chosen::Qwen3(..) | Chosen::Qwen35(..) => (false, false),
+            Chosen::Qwen3(..) | Chosen::Qwen35(..) | Chosen::NemotronH(_) => (false, false),
         };
         let at = Residency38At {
             qwen38_file: family == Family::Qwen38,
@@ -1590,7 +1706,7 @@ mod cli {
             route_trace: levers.route_trace().is_some(),
             prefill_step,
         };
-        if family != Family::Qwen38 {
+        if matches!(family, Family::Qwen3 | Family::Qwen35) {
             residency_unset_early(&levers, at);
         }
         let lever38 = match levers.residency() {
@@ -1665,6 +1781,10 @@ mod cli {
                 } else {
                     drive(m, &run, path, &arms, listed, sync)
                 }
+            }
+            Chosen::NemotronH(path) => {
+                let m = open_nemotron(file, (ctx, mode), t)?;
+                drive(m, &run, path, &arms, listed, sync)
             }
             Chosen::Qwen38(path, place, draft, room) => match draft {
                 Draft38::Off => {
@@ -1868,19 +1988,16 @@ mod cli {
             .into()),
             // The load is decided at the open (`open_qwen35`), which refuses a placed one.
             Some("dspark") if family == Family::Qwen35 => Ok(()),
-            Some("dspark") => Err(
+            Some("dspark") => Err(format!(
                 "BLOOMERY_DRAFT=dspark: the DSpark draft serves a qwen35moe file \
-                 (Qwen3.6-35B-A3B); this is a qwen3moe file"
-                    .into(),
-            ),
+                 (Qwen3.6-35B-A3B); this is a {} file",
+                family.name()
+            )
+            .into()),
             Some(word) => Err(format!(
                 "BLOOMERY_DRAFT={word}: only a qwen4exp file runs a draft (mtp); this is a {} \
                  file",
-                match family {
-                    Family::Qwen3 => "qwen3moe",
-                    Family::Qwen35 => "qwen35moe",
-                    Family::Qwen38 => "qwen4exp",
-                }
+                family.name()
             )
             .into()),
         }
@@ -2015,6 +2132,7 @@ mod cli {
         /// The host's room as the run read it once: the one-column rule
         /// ([`paged38`]) and the load plan by the same reading.
         Qwen38(Prompt38, Place, Draft38, (u64, HostRead)),
+        NemotronH(PromptNh),
     }
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
@@ -2137,6 +2255,30 @@ mod cli {
     /// that card with its why — its `load` line, and in graph
     /// mode the step captured and, unplaced, the passes of 2 to
     /// [`MAX_PASS_ROWS`] rows, with their `capture` lines.
+    /// The nemotron_h engine on the card the run holds, its step captured in
+    /// graph mode, with the `load` and `capture` lines.
+    fn open_nemotron(
+        file: Split,
+        (ctx, mode): (usize, StepMode),
+        t: Instant,
+    ) -> Result<NemotronHModel, GateError> {
+        let mut m = NemotronHModel::open(Gpu::new()?, file, ctx)?;
+        m.set_mode(mode);
+        println!(
+            "load arch=nemotron_h resident_bytes={} ctx={ctx} cache=f16 layers={} mode={} \
+             prompt=step in {:.1} s (runtime value)",
+            m.resident_bytes(),
+            m.layers().len(),
+            mode_name(mode),
+            t.elapsed().as_secs_f64()
+        );
+        if mode == StepMode::Graph {
+            let step = m.capture_step()?;
+            println!("capture graph_nodes={step}");
+        }
+        Ok(m)
+    }
+
     fn open_qwen35(
         file: Split,
         (ctx, mode): (usize, StepMode),
@@ -3248,6 +3390,12 @@ mod cli {
             Family::Qwen38 => {
                 beside.extend([stats, trace]);
                 gen_slots::refused::<Body38>(slots, "qwen4exp", &beside)?;
+            }
+            Family::NemotronH => {
+                return Err(format!(
+                    "BLOOMERY_GEN_SLOTS={slots} on a nemotron_h file: its body holds one sequence"
+                )
+                .into());
             }
         }
         for (i, arm) in arms.iter().enumerate() {
