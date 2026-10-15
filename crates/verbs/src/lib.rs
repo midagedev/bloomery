@@ -968,9 +968,7 @@ impl Qp {
     /// # Safety
     ///
     /// The NIC reads a write's source range after the call returns, until
-    /// that write's completion is polled or the queue pair is destroyed
-    /// (the destroy clause is unverified: no verbs document says the NIC
-    /// reads nothing after `ibv_destroy_qp`). Until then the caller keeps
+    /// that write's completion is polled. Until then the caller keeps
     /// `region` registered and its memory allocated. On `Err` the writes
     /// taken are in flight under the same terms.
     pub unsafe fn post_writes(

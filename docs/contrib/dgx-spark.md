@@ -677,9 +677,10 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    still posted (the flush `rdma_disconnect(3)` describes for that transition). An end whose writes still do not
    complete leaves its counters where they are and is broken by name: its cards keep waiting, a synchronize of their
    streams does not return, the host's error and every later refusal name the end, and the link's drop leaks both ends
-   and their pages rather than free them under the waits. Any other end drops in the order queue pair, region, page,
-   with or without a release; that the NIC reads no source range once its queue pair is destroyed is `[unverified]`
-   (no verbs document says so), and an end dropped while its last writes have not completed relies on it.
+   and their pages rather than free them under the waits. A drop stops the pumps and settles every end through the
+   same bounded drain and abort before dropping its queue pair, region and page, with or without a release. If any
+   end's writes cannot be shown over, or a release left its cards waiting, every end and its page stay alive and the
+   drop names why.
    Outside a release an end delivers only while none of its posts is in flight: each pass of its pump posts, reaps
    its completions, and delivers what its inboxes hold only when every write it posted has completed; a failed
    completion stops the end by name. A card rewrites a span only after it takes a counter its end delivered (the stage
@@ -1165,6 +1166,11 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 - GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
 - S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on.
 - The switch hop: no switched Spark was measured (9.6).
+- Small-message (16 to 64 KB) bandwidth at the submitted head is `[unverified]`. The earlier cable reading in the
+  closed list below is from `e8982d6a`, before every write was signaled and counted. Repeat `link_probe --size`,
+  `ib_write_lat` and `ib_write_bw -t 128` across the cable in the same session, with strict ordering and one message
+  in flight in the probe. Save the contributor evidence list from CONTRIBUTING: the `nvidia-smi` card and driver
+  lines, both commit hashes, no model file (this probe uses synthetic messages), and the commands with their output.
 - Whether to take tensor parallel first instead of (a) is the maintainers' decision (9.4).
 
 **Closed.**
@@ -1194,8 +1200,10 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   `crates/engram/src/rows.rs:196`), and the clause (`crates/engram/tests/engram.rs:706`) checks every page of the named
   experts after each eviction.
 - ~~Small-message (16 to 64 KB) bandwidth in protocol mode, strict ordering and one message in flight~~ (the
-  contributor, with the protocol half, answer 20). Across a direct cable between two Sparks, the link's one-way time
-  is 1.52 to 1.80 µs over `ib_write_lat`'s and 0.66 to 1.81 µs over the floor, with 0 stale lines (the table).
+  contributor, with the protocol half, answer 20), at `e8982d6a` only, before every write was signaled and counted.
+  The submitted head needs the cable reading repeated (the open P5 item above). Across a direct cable between two
+  Sparks at that earlier commit, the link's one-way time is 1.52 to 1.80 µs over `ib_write_lat`'s and 0.66 to 1.81 µs
+  over the floor, with 0 stale lines (the table).
   The floor is one message's serialization on one rail plus the one-way trip without it `[derived]`:
   floor = bytes × 8 / R + (t_typical − bytes × 8 / R₁₂₈). R is 9.1's 109.28 or 92.57 Gb/s, t_typical is
   `ib_write_lat`'s one-way time and R₁₂₈ the `ib_write_bw -t 128` rate, each the mean of three runs in the same
@@ -1203,14 +1211,14 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   pages with strict ordering, and `link_probe --size` writing one message at a time (one-way time = half the round
   trip, p50 of 100,000 messages, the mean of three rounds).
 
-  | Size | t_typical | `link_probe` one-way | Over t_typical | R₁₂₈ | Floor | Over the floor |
+  | Size | t_typical | `link_probe` one-way at `e8982d6a` | Over t_typical | R₁₂₈ | Floor | Over the floor |
   |---|---|---|---|---|---|---|
   | 16 KB | 4.49 µs | 6.08 µs | 1.59 µs | 108.35 Gb/s | 4.48 to 4.70 µs | 1.38 to 1.60 µs |
   | 32 KB | 5.97 µs | 7.77 µs | 1.80 µs | 108.96 Gb/s | 5.96 to 6.40 µs | 1.37 to 1.81 µs |
   | 64 KB | 8.76 µs | 10.29 µs | 1.52 µs | 109.15 Gb/s | 8.76 to 9.62 µs | 0.66 to 1.53 µs |
 
-  On one Spark, with both RDMA ends on one RoCE port (the NIC's own loopback), the same probe read 1.50, 1.59 and
-  1.69 µs over that session's t_typical. At the three sizes checked, the cable's excess falls inside the band the
+  On one Spark at `9cfe31d7`, with both RDMA ends on one RoCE port (the NIC's own loopback), the probe read 1.50, 1.59
+  and 1.69 µs over that session's t_typical. At the three sizes checked, the cable's excess falls inside the band the
   one-port reading predicted for it (1.2 to 2.0 µs).
 
 ## 11. Maintainers' decisions

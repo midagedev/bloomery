@@ -5,8 +5,8 @@
 //! so on the NIC this link runs on (mlx5, whose writes on one queue pair
 //! land in their order) the generation lands last (`docs/contrib/dgx-spark.md`
 //! 9.5, item 4). A write that completes with an error breaks the end by its
-//! status name. A release takes the queue pair of an end whose writes do not
-//! finish to its error state, which flushes each of them to a completion
+//! status name. A release or drop takes the queue pair of an end whose
+//! writes do not finish to its error state, which flushes each to a completion
 //! ([`Wire::abort`]).
 
 use std::sync::Arc;
@@ -46,8 +46,8 @@ impl Wire for Rdma {
                 len: u32::try_from(m.len).map_err(|_| format!("a write of {} bytes", m.len))?,
             });
         }
-        // SAFETY: region and page outlive the queue pair (field order here and in `End`), so
-        // a range stays registered and allocated while a write reads it (dgx-spark.md 9.5, item 2).
+        // SAFETY: the end settles its writes before its region and page drop, or keeps both alive
+        // if they cannot be shown over (dgx-spark.md 9.5, item 2).
         let posted = unsafe { self.qp.post_writes(&self.region, &self.writes, rkey) };
         self.in_flight += match &posted {
             Ok(()) => self.writes.len(),
@@ -99,10 +99,11 @@ impl Wire for Rdma {
 /// crossings whose tail lines start at byte `tail` of both pages, its queue
 /// pair and, once started, its pump thread.
 ///
-/// Field order is drop order: the pump stops before the end goes.
+/// The pump stops before the end settles and drops its queue pair, region
+/// and page. An end whose posts cannot be shown over stays alive.
 pub struct RdmaEnd {
     pump: Option<Pump>,
-    end: Arc<End<Rdma>>,
+    end: Option<Arc<End<Rdma>>>,
 }
 
 impl RdmaEnd {
@@ -143,14 +144,14 @@ impl RdmaEnd {
         };
         Ok(RdmaEnd {
             pump: None,
-            end: Arc::new(End::new(half, wire, page)),
+            end: Some(Arc::new(End::new(half, wire, page))),
         })
     }
 
     /// What the other end needs to connect to this one, starting this end's
     /// sends at `psn`.
     pub fn endpoint(&self, psn: u32) -> Endpoint {
-        let wire = &self.end.lock().1;
+        let wire = &self.end().lock().1;
         Endpoint {
             qpn: wire.qp.qpn(),
             psn,
@@ -165,13 +166,13 @@ impl RdmaEnd {
     pub fn connect(&mut self, psn: u32, remote: &Endpoint) -> Result<(), GpuError> {
         let what = "the link's RDMA end";
         {
-            let wire = &mut self.end.lock().1;
+            let wire = &mut self.end().lock().1;
             wire.qp
                 .connect(psn, remote)
                 .map_err(|e| GpuError::shape(what, e.to_string()))?;
             wire.peer = Some((remote.addr, remote.rkey));
         }
-        let side: Arc<dyn Side> = self.end.clone();
+        let side: Arc<dyn Side> = self.end().clone();
         self.pump = Some(Pump::start(vec![side]).map_err(|e| GpuError::plan(what, e))?);
         Ok(())
     }
@@ -185,20 +186,39 @@ impl RdmaEnd {
     /// as they are, so a card waiting on them keeps waiting: the
     /// [`GpuError::Protocol`] names it.
     pub fn release(ends: &[RdmaEnd], v: u32) -> Result<(), GpuError> {
-        let sides: Vec<&dyn Side> = ends.iter().map(|e| &*e.end as &dyn Side).collect();
+        let sides: Vec<&dyn Side> = ends.iter().map(|e| &**e.end() as &dyn Side).collect();
         super::release_settled(&sides, v).map_err(|e| GpuError::protocol("the link's RDMA end", e))
     }
 
     /// Why the end stopped carrying for good: a step that was neither 0 nor
     /// 1, a failed write, or a pump thread that ended.
     pub fn broken(&self) -> Option<String> {
-        self.end
+        self.end()
             .broken()
             .or_else(|| self.pump.as_ref().and_then(Pump::ended))
     }
 
     /// The end's pump and the end itself, for a [`super::Link`] to hold.
-    pub(super) fn into_parts(self) -> (Option<Pump>, Arc<dyn Side>) {
-        (self.pump, self.end)
+    pub(super) fn into_parts(mut self) -> (Option<Pump>, Arc<dyn Side>) {
+        let end = self
+            .end
+            .take()
+            .expect("an RDMA end holds its page until it is taken into a link");
+        (self.pump.take(), end)
+    }
+
+    fn end(&self) -> &Arc<End<Rdma>> {
+        self.end
+            .as_ref()
+            .expect("an RDMA end holds its page until it is taken into a link")
+    }
+}
+
+impl Drop for RdmaEnd {
+    fn drop(&mut self) {
+        drop(self.pump.take());
+        if let Some(end) = self.end.take() {
+            super::drop_settled(&[end]);
+        }
     }
 }

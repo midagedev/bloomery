@@ -51,8 +51,8 @@ pub use pump::{Crossing, Reader};
 use pump::{Half, Move, Page, TAIL_LINE, Wire};
 pub use rdma::RdmaEnd;
 
-/// How long a reset or a release waits for an end's posts in flight to
-/// finish, and a release then for the posts it aborted.
+/// How long a reset, release or drop waits for an end's posts in flight to
+/// finish, and a release or drop then for the posts it aborted.
 const DRAIN: Duration = Duration::from_secs(1);
 
 /// The tier page's bytes as every side reaches them: the stage card's page,
@@ -70,8 +70,8 @@ pub(super) struct Link {
 
 /// The two ends of mirrored pages and the pump threads that drive them.
 ///
-/// Field order is drop order: the pumps stop before the ends go. An end a
-/// release left unsettled is never freed ([`Mirror`]'s `Drop`).
+/// The pumps stop before the ends settle and drop. An end whose posts
+/// cannot be shown over keeps both ends alive ([`Mirror`]'s `Drop`).
 struct Mirror<P = MappedHost> {
     pumps: Vec<Pump>,
     stage: Arc<dyn Side<P>>,
@@ -314,6 +314,33 @@ fn release_settled<P>(ends: &[&dyn Side<P>], v: u32) -> Result<(), String> {
          waiting and a synchronize of their streams does not return: {}",
         held.join("; ")
     ))
+}
+
+/// After their pumps stop, settle the ends before their wires and pages
+/// drop. An end a release left unsettled still has cards waiting on its
+/// page, so it keeps every end alive even if its posts have since finished.
+fn drop_settled<P>(ends: &[Arc<dyn Side<P>>]) {
+    let held: Vec<String> = ends
+        .iter()
+        .filter_map(|end| {
+            end.unsettled().or_else(|| {
+                end.settle();
+                end.unsettled()
+            })
+        })
+        .collect();
+    if held.is_empty() {
+        return;
+    }
+    for end in ends {
+        std::mem::forget(Arc::clone(end));
+    }
+    // `eprintln!` panics when stderr fails, and a panic in a drop aborts.
+    let _ = writeln!(
+        std::io::stderr(),
+        "tier link drop: leaked its ends, their queue pairs and pages: {}",
+        held.join("; ")
+    );
 }
 
 /// One side's view of the page: the device address of each byte as that
@@ -621,25 +648,9 @@ impl<P: Page> Mirror<P> {
 }
 
 impl<P> Drop for Mirror<P> {
-    /// An end a release left unsettled still has cards waiting on its page's
-    /// counters and posts that may still land on the other page: both ends,
-    /// their wires and pages are leaked, never freed under them, and named.
     fn drop(&mut self) {
-        let held: Vec<String> = [&self.stage, &self.tier]
-            .iter()
-            .filter_map(|end| end.unsettled())
-            .collect();
-        if held.is_empty() {
-            return;
-        }
-        std::mem::forget(Arc::clone(&self.stage));
-        std::mem::forget(Arc::clone(&self.tier));
-        // `eprintln!` panics when stderr fails, and a panic in a drop aborts.
-        let _ = writeln!(
-            std::io::stderr(),
-            "tier link drop: leaked both ends, their queue pairs and pages: {}",
-            held.join("; ")
-        );
+        self.pumps.clear();
+        drop_settled(&[Arc::clone(&self.stage), Arc::clone(&self.tier)]);
     }
 }
 

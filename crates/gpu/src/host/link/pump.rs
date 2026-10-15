@@ -532,7 +532,7 @@ impl Half {
             std::hint::spin_loop();
         }
         self.unsettled = true;
-        let held = "a release found the link's posts in flight not over after an abort and left \
+        let held = "a settle found the link's posts in flight not over after an abort and left \
                     this end's counters where they were";
         match &mut self.broken {
             Some(why) => *why = format!("{why}; {held}"),
@@ -541,7 +541,7 @@ impl Half {
         false
     }
 
-    /// Whether the last release left this end's counters where they were
+    /// Whether the last settle left this end's counters where they were
     /// ([`Half::settle`]).
     pub(super) fn unsettled(&self) -> bool {
         self.unsettled
@@ -1013,6 +1013,61 @@ mod tests {
             (Arc::strong_count(&stage), Arc::strong_count(&tier)),
             (1, 1)
         );
+    }
+
+    // A drop with no release lands both ends' posts before freeing their
+    // pages, without raising the counters their cards wait on.
+    #[test]
+    fn a_drop_lands_the_posts_in_flight_before_freeing_the_pages() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let (go_wire, go_seen) = Late::new(&stage, &tier, CNT);
+        let (done_wire, done_seen) = Late::new(&tier, &stage, GO);
+        let m = link(&stage, &tier, go_wire, done_wire);
+        stage.word(IMAGE).store(1, Ordering::Relaxed);
+        stage.word(GO).store(1, Ordering::Release);
+        tier.word(ROWS).store(7, Ordering::Relaxed);
+        tier.word(CNT).store(1, Ordering::Release);
+        tier.word(PROG).store(1, Ordering::Release);
+        m.pass();
+        assert_eq!(tier.word(TAIL).load(Ordering::Acquire), 0);
+        assert_eq!(stage.word(TAIL + TAIL_LINE).load(Ordering::Acquire), 0);
+        drop(m);
+        assert_eq!(go_seen.load(Ordering::Acquire), 0);
+        assert_eq!(done_seen.load(Ordering::Acquire), 0);
+        assert_eq!(tier.word(IMAGE).load(Ordering::Acquire), 1);
+        assert_eq!(stage.word(ROWS).load(Ordering::Acquire), 7);
+        assert_eq!(tier.word(TAIL).load(Ordering::Acquire), 1);
+        assert_eq!(stage.word(TAIL + TAIL_LINE).load(Ordering::Acquire), 1);
+        assert_eq!(stage.word(CNT).load(Ordering::Acquire), 0);
+        assert_eq!(tier.word(GO).load(Ordering::Acquire), 0);
+        assert_eq!(
+            (Arc::strong_count(&stage), Arc::strong_count(&tier)),
+            (1, 1)
+        );
+    }
+
+    // A drop whose outstanding writes remain after the abort keeps both
+    // ends and their pages alive, without a release beforehand.
+    #[test]
+    fn a_drop_keeps_the_pages_of_posts_it_cannot_settle() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let aborted = Arc::new(AtomicBool::new(false));
+        let m = link(
+            &stage,
+            &tier,
+            Stuck(Arc::clone(&aborted)),
+            wire(&tier, &stage),
+        );
+        stage.word(GO).store(1, Ordering::Release);
+        m.pass();
+        assert!(!aborted.load(Ordering::Acquire));
+        drop(m);
+        assert!(aborted.load(Ordering::Acquire));
+        assert_eq!(stage.word(CNT).load(Ordering::Acquire), 0);
+        assert_eq!(tier.word(GO).load(Ordering::Acquire), 0);
+        assert!(Arc::strong_count(&stage) > 1 && Arc::strong_count(&tier) > 1);
     }
 
     // A done found in the stage's inbox while the stage end's go is still in
