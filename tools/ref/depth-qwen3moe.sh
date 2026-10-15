@@ -754,7 +754,11 @@ q3_self_test() {
   want nemotron-ik 64 "arm 'ik:6': the nemotron_h profile runs ours, bin: and mainline llama.cpp arms"
   run_parse BLOOMERY_MODEL=nemotron_h -- mrspp:512
   want nemotron-mrs 64 "arm 'mrspp:512': the nemotron_h profile runs ours, bin: and mainline llama.cpp arms"
-  # The Bolt profile (nemotron_h_moe) refuses the same arms, by its own name.
+  # The Bolt profile (nemotron_h_moe): its default is mainline alone (no ours arm loads Bolt yet).
+  run_parse BLOOMERY_MODEL=nemotron_h_moe --
+  want nemotron-moe-default 0 "[parse] lcpp:6: kind=ref depth=6 label=lcpp env=- load=(a process of its own)" \
+    "[parse] round 1 order: lcpp:6"
+  # The Bolt profile refuses the same arms, by its own name.
   run_parse BLOOMERY_MODEL=nemotron_h_moe -- ik:6
   want nemotron-moe-ik 64 "arm 'ik:6': the nemotron_h_moe profile runs ours, bin: and mainline llama.cpp arms"
   # The refusals, each by name before anything runs.
@@ -1349,9 +1353,10 @@ case $AB_WARMUP in
 esac
 ARMS=("$@")
 if [ ${#ARMS[@]} -eq 0 ]; then
-  # nemotron_h has no ik arm (the refusal below), so its default is ours and mainline.
+  # The nemotron profiles have no ik arm (the refusal below): nemotron_h's default is ours and mainline;
+  # nemotron_h_moe's is mainline alone, since generate_qwen3moe has no Bolt arm yet.
   ARMS=(6 lcpp:6)
-  case $MODEL_NAME in nemotron_h | nemotron_h_moe) ;; *) ARMS=(6 ik:6 lcpp:6) ;; esac
+  case $MODEL_NAME in nemotron_h) ;; nemotron_h_moe) ARMS=(lcpp:6) ;; *) ARMS=(6 ik:6 lcpp:6) ;; esac
 fi
 ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 # Per arm, by its index in ARMS: the kind (ours, ref, srv or bin), the depth, the row label, the engine
