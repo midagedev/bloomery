@@ -3,12 +3,13 @@
 //! and the scan stores allocated once, and the per-step record refreshed
 //! before every enqueue or replay.
 
+use super::prefill::{PASS_ROWS, Prompt, PromptShape};
 use super::step::{
     Acts, AttnLayer, Kernels, Layer, MambaLayer, MlpLayer, ROW_WORDS, SITE_TYPES, Scratch, Shape,
     Site, WORD_POS, WORD_TOKEN,
 };
 use crate::flash_gqa::{FlashGqaKernels, GROUP_5, HEAD};
-use crate::gemm::Gemm32Kernels;
+use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
 use crate::linear::CONV_TAPS;
 use crate::mamba2::{self, Mamba2Kernels};
@@ -51,6 +52,8 @@ pub struct Body {
     pub(super) s: Scratch,
     /// The residual stream's second buffer ([`Body::enqueue`]).
     pub(super) r: DeviceBuffer<f32>,
+    /// A prompt pass's buffers ([`super::prefill`]).
+    pub(super) prompt: Prompt,
     /// Host zeros as long as the longest recurrent buffer, what a reset
     /// copies over every store.
     zeros: Vec<f32>,
@@ -117,7 +120,21 @@ impl Body {
                 flash: FlashGqaKernels::load(ctx_)?,
                 g32: Gemm32Kernels::load(ctx_)?,
                 kgemv: KGemvKernels::load(gpu)?,
+                gemm: GemmKernels::load(ctx_)?,
             },
+            prompt: Prompt::new(
+                stream,
+                PASS_ROWS.min(ctx),
+                &PromptShape {
+                    hidden,
+                    ld: 2 * ssm.d_inner + 2 * ssm.n_groups * ssm.d_state + ssm.n_heads,
+                    inner: ssm.d_inner,
+                    n_head: hp.n_head,
+                    n_kv,
+                    ff,
+                },
+                &layers,
+            )?,
             acts: Acts::new(stream, layers.iter().flat_map(Layer::sites))?,
             s: Scratch::new(stream, &sh, hp.n_head, ff)?,
             r: DeviceBuffer::zeroed(stream, hidden)?,
@@ -361,6 +378,7 @@ impl ChainBody for Body {
             + self.acts.bytes()
             + self.r.num_bytes()
             + self.k.kgemv.device_bytes()
+            + self.prompt.bytes()
     }
 
     fn layers(&self) -> Range<usize> {

@@ -7,7 +7,7 @@ use super::body::Body;
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{FlashGqaKernels, GROUP_5, GqaArgs, HEAD, partials_ms_len, partials_v_len};
-use crate::gemm::Gemm32Kernels;
+use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
 use crate::mamba2::{Mamba2Kernels, Mamba2Scratch, StepArgs};
 use crate::q5::Q8Blocks32;
@@ -102,6 +102,8 @@ pub(super) struct Kernels {
     pub(super) flash: FlashGqaKernels,
     pub(super) g32: Gemm32Kernels,
     pub(super) kgemv: KGemvKernels,
+    /// The grouped GEMM a prompt pass's K-quant sites run on.
+    pub(super) gemm: GemmKernels,
 }
 
 /// The quantized activation forms the sites read: one of each form a site's

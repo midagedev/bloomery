@@ -23,9 +23,13 @@
 //! Every per-step value (the token, the position, the key heads' row words)
 //! lives in device words refreshed before the enqueue or replay, so one
 //! captured graph serves every position. The body holds one sequence in one
-//! slot; a prompt is one step per token.
+//! slot. A prompt of several ids runs in passes of many rows
+//! ([`prefill`]): one GEMM a projection and one Mamba-2 pass a layer over the
+//! pass's rows.
 
 mod body;
+mod prefill;
 mod step;
 
 pub use body::{Body, DecodeInput};
+pub use prefill::PASS_ROWS;
