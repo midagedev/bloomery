@@ -309,7 +309,9 @@ mod tests {
             for (l, &tys) in layers.iter().enumerate() {
                 let stacks = [3 * l, 3 * l + 1, 3 * l + 2];
                 let cards = rule.layer_runs(&stacks, &model).expect("named stacks");
-                // A program with no card leg cards no layer.
+                // PIN(2026-10-15): the dense nemotron_h body has no card leg, so
+                // the assert that every program has one is gone; a program with
+                // no card leg cards no layer.
                 if cards && leg_runs(p, tys) != Some(true) {
                     broken.push(format!("{p:?} {tys:?}"));
                 }

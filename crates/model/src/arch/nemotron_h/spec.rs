@@ -340,8 +340,10 @@ pub(super) mod tests {
             "{needs:?}"
         );
         let items = coverage::check(&read.spec, &read.tensors);
-        // The program runs the Mamba-2 and squared-ReLU layers; this
-        // header's attention (head 8, group 2) has no flash row.
+        // PIN(2026-10-15): the nemotron_h body now runs the program, the
+        // Mamba-2 and the squared-ReLU layers, so the clauses that listed them
+        // as missing are gone; this header's attention (head 8, group 2) has
+        // no flash row.
         assert!(
             items
                 .iter()
