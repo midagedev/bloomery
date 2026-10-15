@@ -3193,6 +3193,7 @@ impl ChainBody for Body35 {
                 .as_ref()
                 .map_or(0, |d| d.resident_bytes() + d.scratch_bytes())
             + self.placed.as_ref().map_or(0, Placed::device_bytes)
+            + self.k.q35.as_ref().map_or(0, |k| k.kgemv.device_bytes())
     }
 
     fn layers(&self) -> Range<usize> {
