@@ -499,33 +499,6 @@ static void report_unhandled(const dump_ctx & d) {
     fprintf(stderr, "dump_mtp: %d tensors skipped as unhandled: %s\n", total, types.empty() ? "none" : types.c_str());
 }
 
-static bool read_token_file(const std::string & path, long long count, std::vector<llama_token> & ids) {
-    std::ifstream in(path);
-    if (!in) {
-        fprintf(stderr, "dump_mtp: cannot read %s\n", path.c_str());
-        return false;
-    }
-    std::string line;
-    long long   lines = 0;
-    while ((long long) ids.size() < count && std::getline(in, line)) {
-        ++lines;
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
-            fprintf(stderr, "dump_mtp: %s:%lld is not a token id: '%s'\n", path.c_str(), lines, line.c_str());
-            return false;
-        }
-        ids.push_back((llama_token) v);
-    }
-    if ((long long) ids.size() < count) {
-        fprintf(stderr, "dump_mtp: %s holds %zu token ids and --tokens-count asks for %lld\n", path.c_str(),
-                ids.size(), count);
-        return false;
-    }
-    return true;
-}
-
 static std::string file_arch(const std::string & path) {
     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);

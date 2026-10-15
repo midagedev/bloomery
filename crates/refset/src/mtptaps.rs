@@ -209,22 +209,7 @@ impl TapSet {
                 "# step columns" => step_cols = Some(Columns::new("step", f[1..].iter().copied())),
                 "# tap columns" => tap_cols = Some(Columns::new("tap", f[1..].iter().copied())),
                 "# complete" => {
-                    // `# complete <tap rows> 0`, the manifest's last line: a set whose trailer
-                    // counts other tap rows than it holds lost rows after the writer counted them.
-                    if f.len() != 3
-                        || f[2] != "0"
-                        || number(f[1], &at)? as usize != set.taps.len()
-                        || text.lines().skip(i + 1).any(|l| !l.is_empty())
-                    {
-                        return Err(RefError::malformed(
-                            &at,
-                            format!(
-                                "the trailer `{}` is not `# complete\t{}\t0` on the last line",
-                                f.join("\t"),
-                                set.taps.len()
-                            ),
-                        ));
-                    }
+                    check_trailer(&f, set.taps.len(), text.lines().skip(i + 1), &at)?;
                     set.complete = true;
                 }
                 h if h.starts_with('#') => {}
@@ -579,6 +564,30 @@ fn read_f32(path: &Path, want: u64, file: &str) -> Result<Vec<f32>, RefError> {
         .iter()
         .map(|c| f32::from_le_bytes(*c))
         .collect())
+}
+
+/// `# complete <tap rows> 0`, the manifest's last line: a set whose trailer counts other tap rows
+/// than it holds lost rows after the writer counted them. `after` is the lines after the trailer.
+fn check_trailer<'a>(
+    f: &[&str],
+    taps: usize,
+    mut after: impl Iterator<Item = &'a str>,
+    at: &dyn fmt::Display,
+) -> Result<(), RefError> {
+    if f.len() != 3
+        || f[2] != "0"
+        || number(f[1], at)? as usize != taps
+        || after.any(|l| !l.is_empty())
+    {
+        return Err(RefError::malformed(
+            at,
+            format!(
+                "the trailer `{}` is not `# complete\t{taps}\t0` on the last line",
+                f.join("\t")
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn number(v: &str, at: &dyn fmt::Display) -> Result<u32, RefError> {

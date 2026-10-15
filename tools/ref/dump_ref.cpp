@@ -448,36 +448,6 @@ static void report_unhandled(const dump_ctx & d) {
     fprintf(stderr, "dump_ref: %d tensors skipped as unhandled: %s\n", total, types.empty() ? "none" : types.c_str());
 }
 
-// One decimal token id per line, the format engram-corpus.sh writes and router_trace reads: the
-// first `count` ids, or every line for a negative count. A shorter file is an error, not a shorter
-// set — a decode step at another position is another set.
-static bool read_token_file(const std::string & path, long long count, std::vector<llama_token> & ids) {
-    std::ifstream in(path);
-    if (!in) {
-        fprintf(stderr, "dump_ref: cannot read %s\n", path.c_str());
-        return false;
-    }
-    std::string line;
-    long long   lines = 0;
-    while ((count < 0 || (long long) ids.size() < count) && std::getline(in, line)) {
-        ++lines;
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
-            fprintf(stderr, "dump_ref: %s:%lld is not a token id: '%s'\n", path.c_str(), lines, line.c_str());
-            return false;
-        }
-        ids.push_back((llama_token) v);
-    }
-    if (count >= 0 && (long long) ids.size() < count) {
-        fprintf(stderr, "dump_ref: %s holds %zu token ids and --tokens-count asks for %lld\n", path.c_str(),
-                ids.size(), count);
-        return false;
-    }
-    return true;
-}
-
 static double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
