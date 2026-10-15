@@ -26,6 +26,9 @@ static bool accepted(const char * flag, const char * value, long long lo, long l
 }
 
 int main() {
+    int n32 = 123;
+    expect(!parse_i32("ref", "-c", "garbage", 0, n32) && n32 == 123, "i32 rejects garbage");
+    expect(parse_i32("ref", "-c", "16", 0, n32) && n32 == 16, "i32 reads 16");
     expect(rejected("-c", "garbage", 0, INT_MAX), "nonnumeric -c");
     expect(rejected("-c", "12x", 0, INT_MAX), "trailing junk -c");
     expect(rejected("-c", "12 ", 0, INT_MAX), "trailing space -c");

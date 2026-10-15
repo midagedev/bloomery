@@ -75,12 +75,6 @@ SET=$BLOOMERY_DATA/ref-nemotron-logits
 STAGE=$BLOOMERY_DATA/ref-nemotron-logits.staging
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-drop_incomplete_stage() {
-  [ -d "$STAGE" ] || return 0
-  grep -qs '^# complete' "$STAGE/MANIFEST.tsv" && return 0
-  rm -rf "$STAGE"
-  echo "[staging] removed the incomplete $STAGE" >&2
-}
 trap 'drop_incomplete_stage; rm -rf "$WORK"' EXIT
 "$BIN" -m "$MODEL" --out "$STAGE" -c 512 -ub 512 -t 8 \
   --prompt "code5:5:$WORK/code5.ids" \

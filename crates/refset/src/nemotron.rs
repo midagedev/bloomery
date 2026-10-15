@@ -215,6 +215,12 @@ impl LogitsSet {
                 chunk.try_into().expect("chunks_exact(4)"),
             ));
         }
+        if let Some(i) = out.iter().position(|v| !v.is_finite()) {
+            return Err(RefError::malformed(
+                path.display(),
+                format!("non-finite logit at index {i}"),
+            ));
+        }
         Ok(out)
     }
 

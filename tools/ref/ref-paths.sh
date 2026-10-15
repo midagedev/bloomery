@@ -262,3 +262,12 @@ fixture_line() {
   esac
   printf '%s\n' "$line"
 }
+
+# A dump runner's EXIT trap: the set staged at $STAGE is removed unless its manifest carries the
+# `# complete` trailer, so a run that dies leaves no half-written staging set.
+drop_incomplete_stage() {
+  [ -d "$STAGE" ] || return 0
+  grep -qs '^# complete' "$STAGE/MANIFEST.tsv" && return 0
+  rm -rf "$STAGE"
+  echo "[staging] removed the incomplete $STAGE" >&2
+}

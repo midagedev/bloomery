@@ -58,8 +58,8 @@ mod tests {
         std::fs::write(dir.join("p.logits.f32"), logits).unwrap_or_else(|e| panic!("{e}"));
         let mut text = format!(
             "# model\t{model}\n# build\t{build}\n# arch\tnemotron_h\n\
-             # prompt columns\tname\tn_ids\tn_vocab\tids\tlogits\n\
-             prompt\tp\t5\t4\tp.ids\tp.logits.f32\n"
+             # prompt columns\tname\tn_vocab\tn_ids\tlogits\tids\n\
+             prompt\tp\t4\t5\tp.logits.f32\tp.ids\n"
         );
         if complete {
             text.push_str("# complete\t1\t0\n");
@@ -161,6 +161,25 @@ mod tests {
                 );
             }
             other => panic!("a token line that is not an id: {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// A NaN or infinite logit is malformed, naming its index.
+    #[test]
+    fn a_non_finite_logit_is_malformed() {
+        let d = dir("nan-logit");
+        write(&d, &runs(), pin(), true);
+        let logits: Vec<u8> = [0.0f32, f32::NAN, -0.5, 0.25]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        std::fs::write(d.join("p.logits.f32"), logits).unwrap_or_else(|e| panic!("{e}"));
+        match LogitsSet::open(&d, &LOGITS) {
+            Err(RefError::Malformed { what, .. }) => {
+                assert!(what.contains("non-finite logit at index 1"), "{what}");
+            }
+            other => panic!("a non-finite logit: {other:?}"),
         }
         std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
     }

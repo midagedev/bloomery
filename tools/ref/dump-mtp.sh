@@ -178,12 +178,6 @@ mkdir -p "$ROOT"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 # A staged set without its trailer is removed on every exit, with a line naming it (dump.sh's rule).
-drop_incomplete_stage() {
-  [ -d "$STAGE" ] || return 0
-  grep -qs '^# complete' "$STAGE/MANIFEST.tsv" && return 0
-  rm -rf "$STAGE"
-  echo "[staging] removed the incomplete $STAGE" >&2
-}
 trap drop_incomplete_stage EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM

@@ -41,10 +41,9 @@ static bool parse_prompt(const char * spec, Prompt & p) {
     for (char ch : p.name) {
         if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) return false;
     }
-    char * end = nullptr;
-    errno = 0;
-    const long n = strtol(c1 + 1, &end, 10);
-    if (end != c2 || errno != 0 || n <= 0 || n > 1000000) return false;
+    const std::string count(c1 + 1, c2);
+    long long n = 0;
+    if (!parse_i64("nemotron_ref", "--prompt count", count.c_str(), 1, 1000000, n)) return false;
     p.n = (int) n;
     p.path = c2 + 1;
     return true;
