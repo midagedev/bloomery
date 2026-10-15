@@ -298,6 +298,7 @@ impl Weights {
         let budget = kept.iter().map(|&(_, t)| upload_budget(t)).sum();
         let mut ring = UploadRing::new(stream, budget)?;
         for (shard, t) in kept {
+            file_slot(&t.name)?;
             let gguf = split.shard(shard).ok_or_else(|| {
                 GpuError::shape(
                     "Weights::load_where",
@@ -720,6 +721,19 @@ fn derived_slot_free<V>(by_name: &BTreeMap<String, V>, name: &str) -> Result<(),
     Ok(())
 }
 
+/// A file tensor's name, refused in the [`DERIVED_PREFIX`] namespace: a file
+/// tensor never stands where a derived weight is filed, so a lookup of a
+/// derived name finds only what `insert_derived` filed.
+fn file_slot(name: &str) -> Result<(), GpuError> {
+    if name.starts_with(DERIVED_PREFIX) {
+        return Err(GpuError::shape(
+            "Weights::load",
+            format!("file tensor {name:?} has a {DERIVED_PREFIX:?} name, which the engine derives"),
+        ));
+    }
+    Ok(())
+}
+
 /// `Some(L)` for a `blk.L.*` tensor name, `None` for a non-block name; a
 /// `blk.` name whose layer does not parse is an error naming the tensor.
 fn block_index(name: &str) -> Result<Option<usize>, GpuError> {
@@ -795,6 +809,7 @@ fn load_segments(
         let t = model.tensors.get(row.tensor).ok_or_else(|| {
             GpuError::shape(PLACED, format!("placement row names tensor {}", row.tensor))
         })?;
+        file_slot(&t.name)?;
         for seg in row
             .segments
             .iter()
@@ -1175,7 +1190,7 @@ pub fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEAD_TENSOR, derived_slot_free, head_tensor};
+    use super::{HEAD_TENSOR, derived_slot_free, file_slot, head_tensor};
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
     use std::collections::BTreeMap;
@@ -1234,5 +1249,18 @@ mod tests {
         assert!(derived_slot_free(&by_name, "derived.b").is_ok());
         assert!(derived_slot_free(&by_name, "output_norm.weight").is_err());
         assert!(derived_slot_free(&by_name, "derived.a").is_err());
+    }
+
+    /// A file tensor in the derived namespace is refused by name, so it never
+    /// stands in for a weight the engine derives (a nemotron_h zero conv
+    /// bias); every other file name is taken.
+    #[test]
+    fn a_file_tensor_never_takes_a_derived_name() {
+        let err = file_slot("derived.nemotron_h.zero_conv_bias")
+            .expect_err("a derived name in the file")
+            .to_string();
+        assert!(err.contains("derived.nemotron_h.zero_conv_bias"), "{err}");
+        assert!(file_slot("blk.0.ssm_conv1d.bias").is_ok());
+        assert!(file_slot("output.weight").is_ok());
     }
 }
