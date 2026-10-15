@@ -696,20 +696,16 @@ mod cli {
         }
     }
 
-    /// The nemotron_h body's one prompt path: its ids run as steps through the
-    /// captured step chain (`GpuModel::step`), the seat's prompt.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum PromptNh {
-        Step,
-    }
-
+    /// The nemotron_h body's one prompt path (`Path` is `()`): its ids run as
+    /// steps through the captured step chain (`GpuModel::step`), the seat's
+    /// prompt.
     impl Prompted for BodyNh {
-        type Path = PromptNh;
+        type Path = ();
 
         /// `step`, or no `--prefill`: the body has no batched prompt path.
-        fn path(arg: Option<&str>) -> Result<PromptNh, GateError> {
+        fn path(arg: Option<&str>) -> Result<(), GateError> {
             match arg {
-                None | Some("step") => Ok(PromptNh::Step),
+                None | Some("step") => Ok(()),
                 Some(o) => Err(format!(
                     "--prefill {o}: a nemotron_h prompt runs as steps (--prefill step); the body \
                      has no batched prompt path"
@@ -718,7 +714,7 @@ mod cli {
             }
         }
 
-        fn plan(_: &NemotronHModel, n: usize, _: PromptNh) -> Result<Units, GateError> {
+        fn plan(_: &NemotronHModel, n: usize, _: ()) -> Result<Units, GateError> {
             Ok(Units {
                 text: format!("step x{n}"),
                 count: n,
@@ -727,7 +723,7 @@ mod cli {
             })
         }
 
-        fn prefill(m: &mut NemotronHModel, ids: &[u32], _: PromptNh) -> Result<u32, GateError> {
+        fn prefill(m: &mut NemotronHModel, ids: &[u32], _: ()) -> Result<u32, GateError> {
             Ok(m.step(ids)?)
         }
 
@@ -751,25 +747,11 @@ mod cli {
         .into()
     }
 
-    /// The levers and flags a nemotron_h run does not take, refused by name
-    /// before the load: the body runs whole on one card, one sequence, with
-    /// f16 K/V and no expert tier.
-    fn nemotron_refused(
-        levers: &Levers,
-        (kv, card_set, residency): (KvQ8, bool, Residency),
-        (place, slots): (bool, usize),
-    ) -> Result<(), GateError> {
-        let set = [
-            ("--place", place),
-            ("BLOOMERY_GEN_SLOTS above 1", slots > 1),
-            ("BLOOMERY_QWEN3_KV=q8_0", kv == KvQ8::Q8),
-            ("BLOOMERY_QWEN38_EXPERTS=card", card_set),
-            ("BLOOMERY_RESIDENCY", residency != Residency::Off),
-            ("BLOOMERY_ROUTE_TRACE", levers.route_trace().is_some()),
-            ("BLOOMERY_HOSTSTREAM", levers.hoststream().is_some()),
-            ("BLOOMERY_XSTREAM", levers.xstream().is_some()),
-            ("BLOOMERY_SPLIT_WALK", levers.split_walk().is_some()),
-        ];
+    /// The flags a nemotron_h run does not take that no family guard of
+    /// [`cli::run`] already refuses, by name before the load: the body runs
+    /// whole on one card with f16 K/V.
+    fn nemotron_refused(kv: KvQ8, place: bool) -> Result<(), GateError> {
+        let set = [("--place", place), ("BLOOMERY_QWEN3_KV=q8_0", kv == KvQ8::Q8)];
         match set.iter().find(|(_, on)| *on) {
             Some((name, _)) => Err(format!(
                 "{name} on a nemotron_h file: its body runs whole on one card, one sequence, \
@@ -1554,7 +1536,7 @@ mod cli {
             }
             Family::NemotronH => {
                 draft_refused_on_other(&levers, family)?;
-                nemotron_refused(&levers, (kv, card_set, residency), (place.is_some(), slots))?;
+                nemotron_refused(kv, place.is_some())?;
                 if let Some(d) = seed_depth {
                     return Err(no_seed_nh(d));
                 }
@@ -1608,11 +1590,12 @@ mod cli {
             );
         }
         if family != Family::Qwen38 && card_set {
-            return Err(
-                "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a \
-                 qwen3moe or qwen35moe file has no host tier"
-                    .into(),
-            );
+            return Err(format!(
+                "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a {} file \
+                 has no host tier",
+                family.name()
+            )
+            .into());
         }
         if family == Family::Qwen38 && kv == KvQ8::Q8 {
             return Err(
@@ -1622,37 +1605,42 @@ mod cli {
             );
         }
         if family != Family::Qwen38 && levers.route_trace().is_some() {
-            return Err(
-                "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's routing; a qwen3moe or \
-                 qwen35moe plan holds every one on the card"
-                    .into(),
-            );
+            return Err(format!(
+                "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's routing; a {} plan holds \
+                 every one on the card",
+                family.name()
+            )
+            .into());
         }
         if family != Family::Qwen38 && levers.hoststream().is_some() {
-            return Err(
+            return Err(format!(
                 "BLOOMERY_HOSTSTREAM streams a V4.1 prompt's host experts into its residency \
-                 pool; a qwen3moe or qwen35moe plan holds every one on the card"
-                    .into(),
-            );
+                 pool; a {} plan holds every one on the card",
+                family.name()
+            )
+            .into());
         }
         if family != Family::Qwen38 && levers.xstream().is_some() {
-            return Err(
-                "BLOOMERY_XSTREAM moves a qwen4exp prompt's host experts to the card; a qwen3moe \
-                 or qwen35moe plan holds every one on the card"
-                    .into(),
-            );
+            return Err(format!(
+                "BLOOMERY_XSTREAM moves a qwen4exp prompt's host experts to the card; a {} plan \
+                 holds every one on the card",
+                family.name()
+            )
+            .into());
         }
         if family != Family::Qwen38 && levers.split_walk().is_some() {
-            return Err(
-                "BLOOMERY_SPLIT_WALK cuts a qwen4exp ubatch walk into two units; a qwen3moe or \
-                 qwen35moe prompt walks no units"
-                    .into(),
-            );
+            return Err(format!(
+                "BLOOMERY_SPLIT_WALK cuts a qwen4exp ubatch walk into two units; a {} prompt \
+                 walks no units",
+                family.name()
+            )
+            .into());
         }
         if family != Family::Qwen38 && residency != Residency::Off {
             return Err(format!(
-                "BLOOMERY_RESIDENCY={word_set} moves a qwen4exp plan's card experts; a qwen3moe \
-                 or qwen35moe plan holds every one on the card"
+                "BLOOMERY_RESIDENCY={word_set} moves a qwen4exp plan's card experts; a {} plan \
+                 holds every one on the card",
+                family.name()
             )
             .into());
         }
@@ -2132,7 +2120,7 @@ mod cli {
         /// The host's room as the run read it once: the one-column rule
         /// ([`paged38`]) and the load plan by the same reading.
         Qwen38(Prompt38, Place, Draft38, (u64, HostRead)),
-        NemotronH(PromptNh),
+        NemotronH(()),
     }
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
@@ -2247,14 +2235,6 @@ mod cli {
         ])
     }
 
-    /// The Qwen3.6-35B-A3B model of `file` with the tensor-core decode
-    /// flash (the engine's) — under `place` by its plan (`q3place`), the
-    /// `plan` line first, and with `place` unset the default
-    /// ([`q3place::open_unplaced_qwen35`]): the whole-card load on `a`'s
-    /// card while that fits the card's free bytes, else the placed plan on
-    /// that card with its why — its `load` line, and in graph
-    /// mode the step captured and, unplaced, the passes of 2 to
-    /// [`MAX_PASS_ROWS`] rows, with their `capture` lines.
     /// The nemotron_h engine on the card the run holds, its step captured in
     /// graph mode, with the `load` and `capture` lines.
     fn open_nemotron(
@@ -2279,6 +2259,14 @@ mod cli {
         Ok(m)
     }
 
+    /// The Qwen3.6-35B-A3B model of `file` with the tensor-core decode
+    /// flash (the engine's) — under `place` by its plan (`q3place`), the
+    /// `plan` line first, and with `place` unset the default
+    /// ([`q3place::open_unplaced_qwen35`]): the whole-card load on `a`'s
+    /// card while that fits the card's free bytes, else the placed plan on
+    /// that card with its why — its `load` line, and in graph
+    /// mode the step captured and, unplaced, the passes of 2 to
+    /// [`MAX_PASS_ROWS`] rows, with their `capture` lines.
     fn open_qwen35(
         file: Split,
         (ctx, mode): (usize, StepMode),
@@ -3367,7 +3355,8 @@ mod cli {
     /// each flag of `given` that is set, and of the three after it the
     /// qwen3moe and qwen35moe files' `--place` — a placed load's host tier
     /// serves one sequence — or the qwen4exp file's step stats and route
-    /// trace, which record one sequence's steps), and an arm whose ids
+    /// trace, which record one sequence's steps), any count above one on a
+    /// nemotron_h file (its body holds one sequence), and an arm whose ids
     /// `slots` does not cut into windows of one length
     /// ([`gen_slots::windows`]).
     fn slots_refused(
