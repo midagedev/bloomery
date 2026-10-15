@@ -8,8 +8,8 @@
 # the metadata keys and the logits set (crates/refset/src/arch/nemotron_h_moe).
 #
 #   MODEL           the single-file 24 GB GGUF. BLOOMERY_REF_MODEL moves it; a caller's own MODEL= is ignored.
-#   LCPP            mainline llama.cpp at cd0a5b6a1 (ggml-org/llama.cpp #30520), the first to load this file: the
-#                   layers hold 240 to 496 routed experts and the older tree the nemotron_h profile names sizes
+#   LCPP            mainline llama.cpp at cd0a5b6a1; its loader accepts per-layer expert counts. The file's
+#                   layers hold 240 to 496 routed experts, and the older tree the nemotron_h profile names sizes
 #                   every layer at expert_count. A tree of its own, so the tokenizer pins (crates/refset/src/arch/tokenizer.rs)
 #                   stay the Nano's. ik has no nemotron_h_moe.
 #   IK              no ik oracle. The default is only so IKBIN can be formed; nothing here runs it.
