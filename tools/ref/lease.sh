@@ -1252,6 +1252,13 @@ EOF
     command -v timeout > /dev/null || cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout"
     printf '%s\n' '#!/bin/sh' 'trap "exit 7" TERM' 'echo "$$ $PPID" > "${HELD_PID:-$1}"' 'while :; do sleep 1; done' > "$t/held"
     chmod +x "$t/held"
+    awk '
+      { print }
+      $0 == "  \"$@\" <&0 &" {
+        print "  echo gap > \"$START_READY\""
+        print "  while [ ! -e \"$START_RELEASE\" ]; do sleep 0.01 9>&-; done"
+      }
+    ' "$LEASE_TREE/tools/gate-bound.sh" > "$t/startup-gate-bound.sh"
     for model in ds41 qwen3moe; do
       sed -n '/^ref_arm() {/,/^}/p; /^ours_arm() {/,/^}/p' \
         "$LEASE_TREE/tools/ref/depth-$model.sh" > "$t/$model-arm-functions"
@@ -1286,31 +1293,33 @@ EOF
     # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
     # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
     # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
-    for form in direct capture ds41-ours ds41-ref ds41-pp qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
+    for form in direct capture startup ds41-ours ds41-ref ds41-pp qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
       for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
         n=$((n + 1))
         funcs=''
         case $form in
           direct) call='lease_bounded "$BOUND" "$3" "$4"' ;;
           capture) call='lease_out_init; echo "capture dir $LEASE_OUT_DIR"; lease_capture "$BOUND" "$3" "$4"' ;;
+          startup) call='source "$7"; lease_bounded "$BOUND" "$3" "$4"' ;;
           ds41-ours | qwen3moe-ours) call='source "$5"; source "$6"; ours_arm 0 1' ;;
           ds41-ref | qwen3moe-ref) call='source "$5"; source "$6"; ref_arm stub 6 1' ;;
           ds41-pp) call='source "$5"; source "$6"; ref_arm pp 6 1' ;;
           qwen3moe-mem) call='source "$5"; source "$6"; A_MEM=(1); ours_arm 0 1' ;;
         esac
         case $form in ds41-*) funcs=$t/ds41-arm-functions ;; qwen3moe-*) funcs=$t/qwen3moe-arm-functions ;; esac
-        BOUND=$BOUND HELD_PID="$t/held$n.pid" PATH="$t/tbin:$PATH" \
+        BOUND=$BOUND HELD_PID="$t/held$n.pid" START_READY="$t/gap$n" START_RELEASE="$t/go$n" PATH="$t/tbin:$PATH" \
           bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp $call; echo next arm; }" \
           _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" \
-          "$funcs" "$t/depth-arm-harness" > "$t/bout$n" 2>&1 &
+          "$funcs" "$t/depth-arm-harness" "$t/startup-gate-bound.sh" > "$t/bout$n" 2>&1 &
         rp=$!
         i=0
-        until [ -s "$t/held$n.pid" ] || [ "$i" = 100 ]; do
+        until { [ -s "$t/held$n.pid" ] && { [ "$form" != startup ] || [ -s "$t/gap$n" ]; }; } || [ "$i" = 100 ]; do
           sleep 0.1
           i=$((i + 1))
         done
         s0=$SECONDS
         kill -TERM "$rp" 2> /dev/null
+        [ "$form" != startup ] || { check "bounded-startup-gap${trp:+-trap}" "$(cat "$t/gap$n")" gap; touch "$t/go$n"; }
         RC=0
         wait "$rp" || RC=$?
         ended=before
