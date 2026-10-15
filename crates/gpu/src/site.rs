@@ -338,7 +338,7 @@ pub struct KGemvKernels {
 impl KGemvKernels {
     /// The device bytes the kernels hold beside their modules: the one
     /// expert's ids.
-    pub(crate) fn device_bytes(&self) -> usize {
+    pub fn device_bytes(&self) -> usize {
         self.one.num_bytes()
     }
 

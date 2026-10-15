@@ -2376,6 +2376,7 @@ impl ChainBody for Body {
                 .nextn
                 .as_deref()
                 .map_or(0, |n| n.resident_bytes() + n.arena_bytes())
+            + self.k.block.as_ref().map_or(0, KBlockKernels::device_bytes)
     }
 
     fn layers(&self) -> Range<usize> {

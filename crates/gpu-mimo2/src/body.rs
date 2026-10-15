@@ -1215,6 +1215,7 @@ impl ChainBody for Body {
                 .taps
                 .as_ref()
                 .map_or(0, |t| t.iter().map(DeviceBuffer::num_bytes).sum())
+            + self.k.block.as_ref().map_or(0, KBlockKernels::device_bytes)
     }
 
     fn layers(&self) -> Range<usize> {

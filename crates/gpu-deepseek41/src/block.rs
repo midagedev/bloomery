@@ -227,6 +227,12 @@ pub struct KBlockKernels {
 }
 
 impl KBlockKernels {
+    /// The device bytes the kernels hold beside their modules: the K-gemv's
+    /// expert ids.
+    pub fn device_bytes(&self) -> usize {
+        self.gemv.device_bytes()
+    }
+
     /// Load the three into `gpu`'s context. Load-time only.
     ///
     /// # Errors
