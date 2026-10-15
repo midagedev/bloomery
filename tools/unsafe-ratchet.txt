@@ -248,7 +248,10 @@ gguf 9 2 0
 # PIN(2026-10-16): gpu 199 -> 200 fns, new code, not old code relaxed: the compact resident Q5_0's block reader
 # (q5.rs q5_0_block, an unsafe fn with its `# Safety`), which the gemv core and the packed GEMM call; blocks stay
 # 1843 (the reader's one block replaces the embedding's second read of the old layout).
-gpu 1843 200 10
+# PIN(2026-10-16): gpu 1843 -> 1844 blocks (on 200 fns), new code, not old code relaxed: tensor.rs's dtod_2d, the
+# device-to-device 2-D copy the nemotron prompt path regroups token-major K/V rows with, one block over
+# cuMemcpy2DAsync with both spans checked before it (as dtoh_2d / htod_2d), with its SAFETY line.
+gpu 1844 200 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

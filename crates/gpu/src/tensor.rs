@@ -338,6 +338,74 @@ pub unsafe fn htod_2d<D>(
     cu(rc, "cuMemcpy2DAsync_v2 (host to device)")
 }
 
+/// The check of a device-to-device 2-D copy ([`dtod_2d`]): `shape` read with
+/// `dev_pitch` as the source's pitch and `host_pitch` as the destination's,
+/// the source span from byte `src_off` of `src_len` bytes and the destination
+/// span from byte `dst_off` of `dst_len`. Refused by name as [`Pitched`]'s own
+/// check refuses, and when `dst_off` is past the destination's end.
+fn dtod_check(
+    shape: &Pitched,
+    (src_off, src_len): (usize, usize),
+    (dst_off, dst_len): (usize, usize),
+) -> Result<(), GpuError> {
+    const WHAT: &str = "dtod_2d";
+    let dst_room = dst_len
+        .checked_sub(dst_off)
+        .ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "a destination offset of byte {dst_off} past its {dst_len}-byte buffer (pitch {})",
+                shape.host_pitch
+            ),
+        })?;
+    shape.check(WHAT, src_off, src_len, dst_room)
+}
+
+/// Enqueue the 2-D copy `shape` from device buffer `src` (from byte
+/// `src_off`) to device buffer `dst` (from byte `dst_off`): `shape.rows` runs
+/// of `shape.width` bytes, `shape.dev_pitch` bytes apart in the source and
+/// `shape.host_pitch` bytes apart in the destination. One call regroups a
+/// strided layout (token-major rows into head-major runs). Refused by name,
+/// nothing enqueued, when either span leaves its buffer ([`dtod_check`]).
+/// Asynchronous on `stream` and capturable; the two buffers are distinct
+/// borrows, so the spans never overlap.
+pub fn dtod_2d<D>(
+    stream: &CudaStream,
+    (src, src_off): (&DeviceBuffer<D>, usize),
+    (dst, dst_off): (&mut DeviceBuffer<D>, usize),
+    shape: Pitched,
+) -> Result<(), GpuError> {
+    dtod_check(
+        &shape,
+        (src_off, src.num_bytes()),
+        (dst_off, dst.num_bytes()),
+    )?;
+    let device = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
+    let copy = sys::CUDA_MEMCPY2D {
+        srcXInBytes: 0,
+        srcY: 0,
+        srcMemoryType: device,
+        srcHost: std::ptr::null(),
+        srcDevice: src.cu_deviceptr() + src_off as u64,
+        srcArray: std::ptr::null_mut(),
+        srcPitch: shape.dev_pitch,
+        dstXInBytes: 0,
+        dstY: 0,
+        dstMemoryType: device,
+        dstHost: std::ptr::null_mut(),
+        dstDevice: dst.cu_deviceptr() + dst_off as u64,
+        dstArray: std::ptr::null_mut(),
+        dstPitch: shape.host_pitch,
+        WidthInBytes: shape.width,
+        Height: shape.rows,
+    };
+    // SAFETY: both spans lie inside their buffers (checked above), the
+    // buffers are distinct borrows that outlive the enqueue on `stream`'s
+    // order, and the descriptor is read at the call.
+    let rc = unsafe { sys::cuMemcpy2DAsync_v2(&raw const copy, stream.cu_stream()) };
+    cu(rc, "cuMemcpy2DAsync_v2 (device to device)")
+}
+
 /// One device allocation cut into `N` consecutive parts, each of which the
 /// launches read and write as a buffer of its own, while a launch handed the
 /// whole writes every part at once — a gemv over row-concatenated weights
@@ -893,5 +961,32 @@ mod tests {
             one.check("t", 0, 40, 40).is_ok(),
             "a single row has no pitch to overlap"
         );
+    }
+
+    /// A device-to-device copy checks both spans: four rows of 40 bytes read
+    /// 128 bytes apart (424 source bytes) and written 40 apart (160 bytes from
+    /// the destination's offset); a span a byte short or an offset past the
+    /// destination's end is refused by name.
+    #[test]
+    fn a_device_to_device_2d_copy_refuses_by_name_what_leaves_its_buffers() {
+        let shape = Pitched {
+            width: 40,
+            rows: 4,
+            dev_pitch: 128,
+            host_pitch: 40,
+        };
+        assert!(dtod_check(&shape, (0, 424), (8, 168)).is_ok());
+        for (src, dst, why) in [
+            ((0, 423), (0, 160), "a source span one byte short"),
+            ((1, 424), (0, 160), "a source offset past the span's room"),
+            ((0, 424), (1, 160), "a destination span one byte short"),
+            ((0, 424), (161, 160), "a destination offset past its end"),
+        ] {
+            let err = dtod_check(&shape, src, dst).expect_err(why);
+            assert!(
+                err.to_string().starts_with("dtod_2d: ") && err.to_string().contains("pitch"),
+                "{why}: {err}"
+            );
+        }
     }
 }
