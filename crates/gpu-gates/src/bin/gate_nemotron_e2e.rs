@@ -43,6 +43,14 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
+    reason = "the shared runner serves several gates; each takes the helpers it reads"
+)]
+#[path = "shared/e2e.rs"]
+mod e2e;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, GpuError, NemotronHModel, NodeInfo};
@@ -334,16 +342,6 @@ mod gate {
 
     // ------------------------------------------------- the mainline set
 
-    /// The first index of the largest value, as the reference's argmax takes it.
-    fn argmax(v: &[f32]) -> usize {
-        let mut best = 0;
-        for (i, &x) in v.iter().enumerate() {
-            if x > v[best] {
-                best = i;
-            }
-        }
-        best
-    }
 
     /// The ids of the `k` largest values, largest first, lower id first on a tie.
     fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
@@ -382,17 +380,17 @@ mod gate {
         const CLAUSE: &str = "top1_is_mainlines";
         let mut ok = true;
         for p in &case.set.prompts {
-            let want = argmax(&case.set.logits(p)?);
+            let want = crate::e2e::argmax(&case.set.logits(p)?);
             let Some((got, logits)) = body_on(CLAUSE, m, &case.set, p)? else {
                 ok = false;
                 continue;
             };
-            let pass = usize::try_from(got) == Ok(want) && argmax(&logits) == want;
+            let pass = got == want && crate::e2e::argmax(&logits) == want;
             println!(
                 "{CLAUSE}: {} {} tokens, body argmax {got} (logits' {}), mainline {want} {}",
                 p.name,
                 p.n_ids,
-                argmax(&logits),
+                crate::e2e::argmax(&logits),
                 verdict(pass)
             );
             ok &= pass;
