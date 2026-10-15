@@ -74,9 +74,6 @@ impl GpuModel<Body> {
 impl Body {
     fn load(gpu: &Gpu, file: &Split, w: &mut Weights, ctx: usize) -> Result<Body, GpuError> {
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
-        if ctx == 0 {
-            return Err(GpuError::shape(WHAT, "a cache of 0 rows"));
-        }
         let ssm = hp.ssm;
         let mamba = mamba2::check(
             WHAT,
@@ -359,7 +356,11 @@ impl ChainBody for Body {
                 Layer::Mlp(_) => 0,
             })
             .sum();
-        layers + self.s.bytes() + self.acts.bytes() + self.r.num_bytes()
+        layers
+            + self.s.bytes()
+            + self.acts.bytes()
+            + self.r.num_bytes()
+            + self.k.kgemv.device_bytes()
     }
 
     fn layers(&self) -> Range<usize> {

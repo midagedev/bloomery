@@ -473,6 +473,11 @@ pub struct Mamba2Scratch {
 }
 
 impl Mamba2Scratch {
+    /// The device bytes the scratch holds.
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.part.num_bytes() + self.done.num_bytes()
+    }
+
     /// A zeroed scratch for `shape`. Load-time only. `shape` is checked again
     /// here, so a conv the host accepted and this kernel refuses never
     /// allocates.

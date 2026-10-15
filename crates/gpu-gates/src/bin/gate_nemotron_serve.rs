@@ -163,8 +163,8 @@ mod gate {
     fn plan_only_names_its_default(
         dir: &Path,
         file: &Path,
-        ok: &mut bool,
-    ) -> Result<Option<u64>, GateError> {
+    ) -> Result<(Option<u64>, bool), GateError> {
+        let mut ok = true;
         let limit = trained_ctx(file)?;
         let (status, log, text) = plan(dir, "plan", file, &[])?;
         let place = log.first(&record::PLACE_UNSET)?;
@@ -233,19 +233,16 @@ mod gate {
             default_ok = line_ok && held && stands && above_short;
         }
         check(
-            ok,
+            &mut ok,
             "plan_only_names_its_default",
             exits && in_order && word_a && no_load && default_ok,
         );
-        Ok(ctx_line(&text).and_then(|l| field(l, "ctx")))
+        Ok((ctx_line(&text).and_then(|l| field(l, "ctx")), ok))
     }
 
     /// `parallel_above_one_is_refused` (the module header).
-    fn parallel_above_one_is_refused(
-        dir: &Path,
-        file: &Path,
-        ok: &mut bool,
-    ) -> Result<(), GateError> {
+    fn parallel_above_one_is_refused(dir: &Path, file: &Path) -> Result<bool, GateError> {
+        let mut ok = true;
         let (status, log, text) = plan(dir, "refuse-parallel", file, &["--parallel", "2"])?;
         let named = text.contains(ONE_SEQUENCE);
         let no_plan = log.first(&record::PLAN)?.is_none();
@@ -258,11 +255,11 @@ mod gate {
             println!("refuse-parallel stderr:\n{text}");
         }
         check(
-            ok,
+            &mut ok,
             "parallel_above_one_is_refused",
             !status.success() && named && no_plan,
         );
-        Ok(())
+        Ok(ok)
     }
 
     /// The ids `NemotronHModel` gives stepped directly: for each prompt, from an empty cache, the
@@ -306,8 +303,8 @@ mod gate {
         file: &Path,
         default_ctx: Option<u64>,
         layers: u64,
-        ok: &mut bool,
-    ) -> Result<Option<Answers>, GateError> {
+    ) -> Result<(Option<Answers>, bool), GateError> {
+        let mut ok = true;
         let d = dir.join("serve");
         std::fs::create_dir_all(&d)?;
         let (cmd, mut all) = command(file)?;
@@ -319,8 +316,8 @@ mod gate {
             Ok(addr) => addr,
             Err(e) => {
                 println!("the server never listened: {e}");
-                check(ok, "load_and_listen", false);
-                return Ok(None);
+                check(&mut ok, "load_and_listen", false);
+                return Ok((None, ok));
             }
         };
         let text = std::fs::read_to_string(&err_log).unwrap_or_default();
@@ -345,7 +342,7 @@ mod gate {
             listen.line()
         );
         check(
-            ok,
+            &mut ok,
             "load_and_listen",
             same_ctx && loaded && ctx_is_plans && in_order,
         );
@@ -373,15 +370,18 @@ mod gate {
                 println!("{name}: {e}");
                 false
             });
-            check(ok, name, pass);
+            check(&mut ok, name, pass);
         }
         println!("server stopped: {}", s.stop()?);
-        Ok(Some(Answers {
-            prose,
-            turn,
-            prose_answer,
-            turn_answer,
-        }))
+        Ok((
+            Some(Answers {
+                prose,
+                turn,
+                prose_answer,
+                turn_answer,
+            }),
+            ok,
+        ))
     }
 
     /// `edit_resend_is_a_fresh_run` (the module header): the slot holds the prose prompt and its
@@ -428,7 +428,8 @@ mod gate {
     }
 
     /// `completion_ids` (the module header), the server stopped and the session on the card.
-    fn completion_ids(file: &Path, a: &Answers, ok: &mut bool) -> Result<(), GateError> {
+    fn completion_ids(file: &Path, a: &Answers) -> Result<bool, GateError> {
+        let mut ok = true;
         let ids = session_ids(file, &[a.prose.as_slice(), a.turn.as_slice()])?;
         let prose = agree(&a.prose_answer.tokens, &a.prose_answer.stop, &ids[0]);
         let turn = agree(&a.turn_answer.tokens, &a.turn_answer.stop, &ids[1]);
@@ -438,8 +439,8 @@ mod gate {
             a.prose_answer.tokens.len(),
             a.turn_answer.tokens.len()
         );
-        check(ok, "completion_ids", prose && turn);
-        Ok(())
+        check(&mut ok, "completion_ids", prose && turn);
+        Ok(ok)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -454,11 +455,13 @@ mod gate {
         )?;
         drop(split);
         let mut ok = true;
-        let default_ctx = plan_only_names_its_default(&dir, &file, &mut ok)?;
-        parallel_above_one_is_refused(&dir, &file, &mut ok)?;
-        let answers = served(&dir, &file, default_ctx, layers, &mut ok)?;
+        let (default_ctx, pass) = plan_only_names_its_default(&dir, &file)?;
+        ok &= pass;
+        ok &= parallel_above_one_is_refused(&dir, &file)?;
+        let (answers, pass) = served(&dir, &file, default_ctx, layers)?;
+        ok &= pass;
         if let Some(a) = answers {
-            completion_ids(&file, &a, &mut ok)?;
+            ok &= completion_ids(&file, &a)?;
         }
         if !ok {
             return Err(checks_failed());

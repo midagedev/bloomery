@@ -336,6 +336,12 @@ pub struct KGemvKernels {
 }
 
 impl KGemvKernels {
+    /// The device bytes the kernels hold beside their modules: the one
+    /// expert's ids.
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.one.num_bytes()
+    }
+
     /// Load the `_sel` family into `gpu`'s context, raising into its fault
     /// word, and zero the ids. Load-time only.
     pub fn load(gpu: &Gpu) -> Result<KGemvKernels, GpuError> {

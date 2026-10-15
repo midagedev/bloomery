@@ -191,6 +191,7 @@ impl Scratch {
             + self.words.num_bytes()
             + self.pos.num_bytes()
             + self.n_keys.num_bytes()
+            + self.mamba.device_bytes()
     }
 
     /// The scratch for `sh`, the widest `ff` an MLP layer has and the
