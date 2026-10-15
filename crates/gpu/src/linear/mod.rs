@@ -184,7 +184,7 @@ impl LinearShape {
     /// [`crate::recur::RecStore::new`] allocates. The ring is not multiplied
     /// by `lanes`.
     #[must_use]
-    pub fn lens(&self, lanes: usize) -> [usize; 2] {
+    pub(crate) fn lens(&self, lanes: usize) -> [usize; 2] {
         [lanes * self.state_len(), self.ring_len()]
     }
 

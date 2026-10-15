@@ -227,7 +227,7 @@ const THREADS_P12_U32: u32 = THREADS_P12 as u32;
 const _: () = assert!(PACK_12 == 12 && THREADS_P12_U32 == 384);
 const _: () = assert!(PACK_12 + PAD_12 == MMA_ROWS && PAD_12 <= PACK_12 && PACK_12 > MMA_ROWS / 2);
 
-/// Query heads one block of [`FlashGqaKernels::enqueue_pass_g5`] takes.
+/// Query heads one block of [`FlashGqaKernels::enqueue_pass`] takes.
 /// The tensor-core tile is [`MMA_ROWS`] rows and pads a pack only when the
 /// pad is at most the pack and the pack is past half the tile, which five
 /// is not, and the packed scalar wants a pack that divides the key tile's
@@ -4539,51 +4539,33 @@ impl FlashGqaKernels {
         Ok(FlashGqaKernels { module })
     }
 
-    /// Enqueue `m` rows' attention: the segment pass (`m · n_kv ·
-    /// [`SEGMENTS`]` blocks; the tensor-core one when `mma`) and the
-    /// merge (`m · n_kv · GROUP` blocks). Each block cuts its row's range
-    /// from the row's own count, so every count the kernels accept is
-    /// walked in full; a count
-    /// of zero or past `ctx` raises [`FaultSite::KeyCount`] on `args.fault`
-    /// and its row is NaN. Two launches. Asynchronous, allocation-free,
-    /// capturable.
-    pub fn enqueue_pass(
+    /// Enqueue head-128 attention; refused counts fault and yield NaNs.
+    pub fn enqueue_pass<const PACK: usize>(
         &self,
         stream: &CudaStream,
-        args: GqaArgs<'_>,
+        a: GqaArgs<'_>,
         mma: bool,
     ) -> Result<(), GpuError> {
+        const { assert!(PACK == GROUP || PACK == GROUP_5) };
         let what = "flash_gqa::enqueue";
-        let GqaArgs {
-            q,
-            kc,
-            vc,
-            n_keys,
-            scale,
-            n_kv,
-            ctx,
-            m,
-            part_v,
-            part_ms,
-            fault,
-            y,
-        } = args;
-        if n_kv == 0 || ctx == 0 || m == 0 {
+        if PACK == GROUP_5 && mma {
+            return Err(GpuError::shape(what, "group 5 requires the scalar pass"));
+        }
+        if a.n_kv == 0 || a.ctx == 0 || a.m == 0 {
             return Err(GpuError::shape(
                 what,
-                format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
+                format!("n_kv={}, ctx={}, m={} must be positive", a.n_kv, a.ctx, a.m,),
             ));
         }
-        let n_head = n_kv * GROUP;
-        let segs = SEGMENTS;
+        let n_head = a.n_kv * PACK;
         let lens = [
-            ("q", q.len(), m * n_head * HEAD),
-            ("kc", kc.len(), n_kv * ctx * HEAD),
-            ("vc", vc.len(), n_kv * ctx * HEAD),
-            ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len(m, n_head)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
-            ("y", y.len(), m * n_head * HEAD),
+            ("q", a.q.len(), a.m * n_head * HEAD),
+            ("kc", a.kc.len(), a.n_kv * a.ctx * HEAD),
+            ("vc", a.vc.len(), a.n_kv * a.ctx * HEAD),
+            ("n_keys", a.n_keys.len(), a.m),
+            ("part_v", a.part_v.len(), partials_v_len(a.m, n_head)),
+            ("part_ms", a.part_ms.len(), partials_ms_len(a.m, n_head)),
+            ("y", a.y.len(), a.m * n_head * HEAD),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
             return Err(GpuError::shape(
@@ -4591,26 +4573,32 @@ impl FlashGqaKernels {
                 format!("{name}.len() {got} < {need}"),
             ));
         }
-        let grid = launch_u32(what, "grid", m * n_kv * segs)?;
-        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
+        let grid = launch_u32(what, "grid", a.m * a.n_kv * SEGMENTS)?;
+        let merge_grid = launch_u32(what, "merge grid", a.m * n_head)?;
         let heads = launch_u32(what, "n_head", n_head)?;
-        let n_kv = launch_u32(what, "n_kv", n_kv)?;
-        let ctx = launch_u32(what, "ctx", ctx)?;
-        let segs = launch_u32(what, "segs", segs)?;
+        let n_kv = launch_u32(what, "n_kv", a.n_kv)?;
+        let ctx = launch_u32(what, "ctx", a.ctx)?;
+        let segs = launch_u32(what, "segs", SEGMENTS)?;
         let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
-        let m = launch_u32(what, "m", m)?;
+        let m = launch_u32(what, "m", a.m)?;
         let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
-        if mma {
+        if PACK == GROUP_5 {
+            let prep = self.module.prepare_gqa_flash_seg_g5(cfg)?;
+            self.module.gqa_flash_seg_g5(
+                stream, &prep, a.q, a.kc, a.vc, a.n_keys, a.scale, n_kv, ctx, segs, seg_keys, m,
+                a.part_v, a.part_ms,
+            )?;
+        } else if mma {
             let prep = self.module.prepare_gqa_flash_seg_mma(cfg)?;
             self.module.gqa_flash_seg_mma(
-                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
-                part_ms,
+                stream, &prep, a.q, a.kc, a.vc, a.n_keys, a.scale, n_kv, ctx, segs, seg_keys, m,
+                a.part_v, a.part_ms,
             )?;
         } else {
             let prep = self.module.prepare_gqa_flash_seg(cfg)?;
             self.module.gqa_flash_seg(
-                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
-                part_ms,
+                stream, &prep, a.q, a.kc, a.vc, a.n_keys, a.scale, n_kv, ctx, segs, seg_keys, m,
+                a.part_v, a.part_ms,
             )?;
         }
         let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
@@ -4619,74 +4607,8 @@ impl FlashGqaKernels {
             0,
         ))?;
         self.module.gqa_flash_merge(
-            stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, fault, y,
-        )?;
-        Ok(())
-    }
-
-    /// [`FlashGqaKernels::enqueue_pass`] at [`GROUP_5`] query heads a key
-    /// head: `gqa_flash_seg_g5` (`m · n_kv · [`SEGMENTS`]` blocks of 256) and
-    /// [`gqa_flash_merge`] over `n_kv · GROUP_5` heads. Scalar only. Two
-    /// launches. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_pass_g5(&self, stream: &CudaStream, args: GqaArgs<'_>) -> Result<(), GpuError> {
-        let what = "flash_gqa::enqueue_g5";
-        let GqaArgs {
-            q,
-            kc,
-            vc,
-            n_keys,
-            scale,
-            n_kv,
-            ctx,
-            m,
-            part_v,
-            part_ms,
-            fault,
-            y,
-        } = args;
-        if n_kv == 0 || ctx == 0 || m == 0 {
-            return Err(GpuError::shape(
-                what,
-                format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
-            ));
-        }
-        let n_head = n_kv * GROUP_5;
-        let segs = SEGMENTS;
-        let lens = [
-            ("q", q.len(), m * n_head * HEAD),
-            ("kc", kc.len(), n_kv * ctx * HEAD),
-            ("vc", vc.len(), n_kv * ctx * HEAD),
-            ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len(m, n_head)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
-            ("y", y.len(), m * n_head * HEAD),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
-        let grid = launch_u32(what, "grid", m * n_kv * segs)?;
-        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
-        let heads = launch_u32(what, "n_head", n_head)?;
-        let n_kv = launch_u32(what, "n_kv", n_kv)?;
-        let ctx = launch_u32(what, "ctx", ctx)?;
-        let segs = launch_u32(what, "segs", segs)?;
-        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
-        let m = launch_u32(what, "m", m)?;
-        let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
-        let prep = self.module.prepare_gqa_flash_seg_g5(cfg)?;
-        self.module.gqa_flash_seg_g5(
-            stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v, part_ms,
-        )?;
-        let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
-            merge_grid,
-            MERGE_THREADS,
-            0,
-        ))?;
-        self.module.gqa_flash_merge(
-            stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, fault, y,
+            stream, &prep, a.part_v, a.part_ms, a.n_keys, heads, ctx, segs, seg_keys, m, a.fault,
+            a.y,
         )?;
         Ok(())
     }

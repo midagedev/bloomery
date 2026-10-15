@@ -76,7 +76,7 @@ mod gate {
         topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
-    use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits};
+    use gguf::quant::{GgmlType, dequant_row};
     use model::arch::qwen3moe::names;
 
     /// f32 roundings each side's dot is allowed per output, on `Σ|w·x̂|`
@@ -152,33 +152,6 @@ mod gate {
         Ok(())
     }
 
-    /// `rows` of Q5_0 (`k` values, `k / 32` blocks) whose low and high
-    /// nibbles differ and whose codes differ from block to block, so a read
-    /// of the low half's word in place of the high half's, or of another
-    /// block's (another 32-block window's) words, disagrees with
-    /// `dequant_row`.
-    fn q5_0_bytes(rows: usize, k: usize) -> Vec<u8> {
-        let blocks = k / 32;
-        let mut bytes = vec![0u8; rows * blocks * 22];
-        for r in 0..rows {
-            for b in 0..blocks {
-                let blk = &mut bytes[(r * blocks + b) * 22..][..22];
-                let d = 0.5f32 + 0.25 * (b + r) as f32;
-                blk[..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-                let qh: u32 = 0xA5A5_5A5A
-                    ^ (r as u32).wrapping_mul(0x0101_0101)
-                    ^ (b as u32).wrapping_mul(0x9E37_79B9);
-                blk[2..6].copy_from_slice(&qh.to_le_bytes());
-                for j in 0..16 {
-                    let lo = (j + b) % 16;
-                    let hi = (15 - j + 3 * b) % 16;
-                    blk[6 + j] = lo as u8 | (hi as u8) << 4;
-                }
-            }
-        }
-        bytes
-    }
-
     /// Q5_0 rows through `embed_rows_q5_0` against `dequant_row` on the same
     /// bytes, bit for bit, positions included, one captured node, and an id
     /// past the table (NaN row, `FaultSite::TokenId`, the other rows intact).
@@ -186,7 +159,9 @@ mod gate {
         const ROWS: usize = 4;
         // 34 blocks: past the first 32-block window of the packed code plane.
         const K: usize = 1088;
-        let bytes = q5_0_bytes(ROWS, K);
+        // Reuse synthetic_rows with the Q5_0 scale at byte 0; host emulation
+        // confirms this seed rejects both addressing mutants.
+        let bytes = synthetic_rows((GgmlType::Q5_0, &[0]), (ROWS, K / 32), 0x2545_f491)?;
         let packed = bloomery_gpu::q5::pack_q5_0(&bytes, K, ROWS)?;
         let cols = packed.len() / ROWS;
         let table = DeviceTensor::upload(gpu.stream(), &packed, ROWS, cols)?;

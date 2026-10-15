@@ -23,8 +23,8 @@ use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
 use crate::fault::FaultSink;
 use crate::flash_gqa::{
-    FlashGqaKernels, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable, partials_ms_len,
-    partials_v_len, partials_v_len_256,
+    FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable,
+    partials_ms_len, partials_v_len, partials_v_len_256,
 };
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
@@ -605,7 +605,7 @@ impl KvPlanes {
             y,
         } = s;
         match self {
-            KvPlanes::F16 { k: kc, v: vc } => flash.enqueue_pass(
+            KvPlanes::F16 { k: kc, v: vc } => flash.enqueue_pass::<GROUP>(
                 stream,
                 GqaArgs {
                     q,

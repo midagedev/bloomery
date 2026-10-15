@@ -241,7 +241,7 @@ mod gate {
         let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(m, n_head))?;
         let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * n_head * HEAD)?;
-        k.enqueue_pass(
+        k.enqueue_pass::<GROUP>(
             stream,
             GqaArgs {
                 q,
@@ -500,7 +500,7 @@ mod gate {
                             },
                         )
                     } else {
-                        k.enqueue_pass(
+                        k.enqueue_pass::<GROUP>(
                             s,
                             GqaArgs {
                                 q: &inp.q,
@@ -620,7 +620,7 @@ mod gate {
             let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?;
             let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
-            k.enqueue_pass(
+            k.enqueue_pass::<GROUP>(
                 stream,
                 GqaArgs {
                     q: &qd,
@@ -772,7 +772,7 @@ mod gate {
             let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(ROWS, n_head))?;
             let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, n_head))?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, ROWS * n_head * HEAD)?;
-            k.enqueue_pass(
+            k.enqueue_pass::<GROUP>(
                 stream,
                 GqaArgs {
                     q: &rows_q,
@@ -1928,7 +1928,7 @@ mod gate {
         let mut part_v = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?;
         let mut part_ms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
-        k.enqueue_pass_g5(
+        k.enqueue_pass::<GROUP_5>(
             stream,
             GqaArgs {
                 q: &q_d,
@@ -1944,6 +1944,7 @@ mod gate {
                 fault: gpu.unlabelled_sink(),
                 y: &mut y,
             },
+            false,
         )?;
         stream.synchronize()?;
         let got = y.to_host_vec(stream)?;
