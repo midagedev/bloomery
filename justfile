@@ -2184,9 +2184,10 @@ depth-gpu-qwen4exp *ARMS:
 # profile (tools/ref/models/nemotron_h.sh). Our arm is the same generate_qwen3moe, which reads the architecture from
 # the file's header and runs the whole model on one card, its prompt as steps (`kind=step`); `--seed-depth` is refused,
 # so a depth D arm feeds D ids. The references are mainline llama.cpp's arms (lcpp:, lcpppp:); ik and mistral.rs arms
-# are refused by name. BLOOMERY_DRY=1 prints the command lines and builds nothing.
+# are refused by name. BLOOMERY_DRY=1 prints the command lines and builds nothing. A BLOOMERY_MODEL other than nemotron_h
+# is refused by name (exit 64), not overridden: the Bolt profile runs through depth-gpu-qwen3moe.
 depth-gpu-nemotron *ARMS:
-    BLOOMERY_MODEL=nemotron_h just depth-gpu-qwen3moe {{ARMS}}
+    case "${BLOOMERY_MODEL:-nemotron_h}" in nemotron_h) ;; *) echo "depth-gpu-nemotron: BLOOMERY_MODEL=$BLOOMERY_MODEL: this recipe times the nemotron_h profile; another profile runs through depth-gpu-qwen3moe (BLOOMERY_MODEL=$BLOOMERY_MODEL just depth-gpu-qwen3moe ...)" >&2; exit 64 ;; esac && BLOOMERY_MODEL=nemotron_h just depth-gpu-qwen3moe {{ARMS}}
 
 # GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용):
 # ours `<D>` (the first D prose ids, run as the binary's `--prefill` default, batches; `kind=` in the row names the feed),
