@@ -431,7 +431,7 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
             archive(head, os.path.join(d, "pr"), cwd=os.getcwd())
         except RecipeError as e:
             raise Stop(70, f"pre-review: {e}") from e
-        if getattr(args, "no_pre_checks", False):
+        if args.no_pre_checks:
             say("pre-review: pre-checks skipped (--no-pre-checks)")
         else:
             pre_checks(os.path.join(d, "pr"), git("diff", "--name-only", "-z", f"{base_sha}...{head}").split("\0"), say)
@@ -769,7 +769,7 @@ def self_test():
         sh("git", "update-ref", "refs/remotes/origin/main", "basebr")
         try:
             def go(text, sleep=0, minutes=10):
-                a = argparse.Namespace(base="basebr", full=False, minutes=minutes, body=None)
+                a = argparse.Namespace(base="basebr", full=False, minutes=minutes, body=None, no_pre_checks=False)
                 msgs = []
                 try:
                     runner(text, sleep)
@@ -821,7 +821,7 @@ def self_test():
                    f"a MUST_FIX review ends 1 and prints no PR-body line (got {rc}): {buf.getvalue()!r}")
             pidf = os.path.join(t, "child.pid")
             open(stub, "w").write(f"#!/usr/bin/env bash\n( sleep 30 & echo $! > {pidf}; wait )\n")
-            a = argparse.Namespace(base="basebr", full=False, minutes=0.03, body=None)
+            a = argparse.Namespace(base="basebr", full=False, minutes=0.03, body=None, no_pre_checks=False)
             try:
                 rc, msg = review(a, stubbed=True, say=lambda m: None), ""
             except Stop as e:
@@ -835,7 +835,7 @@ def self_test():
                    f"a role past --minutes ends 75 named and its whole process group is gone: rc {rc}, child alive {alive}")
             # --full: a validator that ends 0 and leaves the review as the reviewer wrote it is no validation
             runner("**Verdict: CLEAN**: fine\n\n### Checked\nall")
-            a = argparse.Namespace(base="basebr", full=True, minutes=10, body=None)
+            a = argparse.Namespace(base="basebr", full=True, minutes=10, body=None, no_pre_checks=False)
             try:
                 rc, msg = review(a, stubbed=True, say=lambda m: None), ""
             except Stop as e:
