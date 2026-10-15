@@ -81,6 +81,7 @@ LOST, DOWN = 81, 84
 INT_RC, TERM_RC = 130, 143
 POLL_FAILS = 3  # polls in a row that cannot reach the daemon before the attach starts backing off
 RECONNECT_S = 300.0  # BOXQ_RECONNECT_S default: the backoff budget, then 84
+RESUME_LINE = "boxq: {jid} left as it is on the box; resume with: tools/boxq.py attach {jid}"
 LINK_DOWN = ("daemon-down", "no-ssh")  # the Down names a blip can clear; any other answer is not waited out
 FLUSH_MAX_S = 2.0  # the longest the tails get, after a terminal status, to read what the job wrote last
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -159,7 +160,7 @@ class Queue:
         except OSError as e:
             raise Down("no-ssh", f"{self.ssh[0]}: {e}")
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, timeout=30.0):
         """(status, JSON object) of one request."""
         words = ["curl", "-sS", "--max-time", "20", "-X", method]
         if body is not None:  # only a POST has a body, on stdin
@@ -169,11 +170,11 @@ class Queue:
             p = self.spawn(remote, stdin=subprocess.DEVNULL if body is None else subprocess.PIPE,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
-                out, err = p.communicate(None if body is None else body.encode(), timeout=30)
+                out, err = p.communicate(None if body is None else body.encode(), timeout=timeout)
             except subprocess.TimeoutExpired:
                 p.kill()
                 p.communicate()
-                raise Down("daemon-down", f"{method} {path}: no reply in 30 s")
+                raise Down("daemon-down", f"{method} {path}: no reply in {timeout:g} s")
         except OSError as e:
             raise Down("daemon-down", f"{method} {path}: {e}")
         if p.returncode != 0:
@@ -188,8 +189,8 @@ class Queue:
             raise Down("bad-reply", f"{method} {path}: the reply is not a JSON object: {raw[:120]!r}")
         return st, obj
 
-    def call(self, method, path, body=None, ok=(200,)):
-        st, obj = self.request(method, path, body)
+    def call(self, method, path, body=None, ok=(200,), timeout=30.0):
+        st, obj = self.request(method, path, body, timeout=timeout)
         if st not in ok:
             raise refusal(st, obj, path)
         return obj
@@ -199,8 +200,8 @@ class Queue:
         if st != 200 or obj.get("ok") is not True:
             raise Down("daemon-down", f"GET /health: status {st}, {json.dumps(obj)[:120]}")
 
-    def job(self, jid):
-        job = self.call("GET", f"/jobs/{jid}")
+    def job(self, jid, timeout=30.0):
+        job = self.call("GET", f"/jobs/{jid}", timeout=timeout)
         if job.get("status") not in STATUSES:
             raise Down("bad-reply", f"job {jid}: status {job.get('status')!r} is not one of {', '.join(STATUSES)}")
         return job
@@ -256,41 +257,54 @@ class Tail:
 
     def __init__(self, proc, src, dst):
         self.proc, self.src, self.dst, self.n = proc, src, dst, 0
-
-
-def write_all(fd, chunk):
-    view = memoryview(chunk)
-    while view:
-        n = os.write(fd, view)
-        view = view[n:]
+        self.pending = b""  # read from src, not yet taken by dst; not in `n`
 
 
 def drain(kids):
-    """Bytes waiting on the tails' pipes, written on and counted. A closed pipe ends that tail's count."""
+    """Bytes waiting on the tails' pipes, written on and counted once written. A write never blocks: what the reader has
+    not taken stays in the tail's `pending` until its fd is writable. A closed reader's bytes are dropped and counted,
+    the job goes on."""
     for t in kids:
-        if not isinstance(t, Tail) or t.src is None:
+        if not isinstance(t, Tail) or t.src is None and not t.pending:
             continue
-        while True:
-            try:
-                chunk = os.read(t.src, 1 << 16)
-            except BlockingIOError:
-                break
+        for _ in range(16):
+            chunk = t.pending
             if not chunk:
-                os.close(t.src)
-                t.src = None
+                if t.src is None:
+                    break
+                try:
+                    chunk = os.read(t.src, 1 << 16)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    os.close(t.src)
+                    t.src = None
+                    break
+            blocking = os.get_blocking(t.dst)
+            try:
+                os.set_blocking(t.dst, False)
+                try:
+                    n = os.write(t.dst, chunk)
+                except BlockingIOError:
+                    n = 0
+                except BrokenPipeError:
+                    n = len(chunk)
+            finally:
+                os.set_blocking(t.dst, blocking)
+            t.n += n
+            t.pending = chunk[n:]
+            if t.pending:
                 break
-            with contextlib.suppress(BrokenPipeError):  # a reader that closed early: its bytes are dropped, the job goes on
-                write_all(t.dst, chunk)
-            t.n += len(chunk)
 
 
 def pause(trap, kids, secs):
-    """The wait between polls, draining the tails. A trap with no pipe (the flush test) just records the wait."""
+    """The wait between polls, draining the tails. A trap with no pipe (the flush test) just records the wait. The wait
+    also ends for a signal while a reader is slow: a tail with unwritten bytes is waited on at its dst, not its src."""
     if secs < 0:
         secs = 0.0
     r = getattr(trap, "r", None)
-    srcs = [t.src for t in kids if isinstance(t, Tail) and t.src is not None]
-    if r is None or not srcs:
+    tails = [t for t in kids if isinstance(t, Tail)]
+    if r is None or not any(t.src is not None or t.pending for t in tails):
         trap.wait(secs)
         drain(kids)
         return
@@ -300,15 +314,16 @@ def pause(trap, kids, secs):
         if left <= 0:
             drain(kids)
             return
-        ready, _, _ = select.select([r, *srcs], [], [], left)
+        ready, _, _ = select.select(
+            [r, *(t.src for t in tails if t.src is not None and not t.pending)],
+            [t.dst for t in tails if t.pending], [], left)
         if r in ready:
             with contextlib.suppress(OSError):
                 os.read(r, 64)
             drain(kids)
             return
         drain(kids)
-        srcs = [t.src for t in kids if isinstance(t, Tail) and t.src is not None]
-        if not srcs:
+        if not any(t.src is not None or t.pending for t in tails):
             trap.wait(max(0.0, end - time.monotonic()))
             return
 
@@ -442,14 +457,6 @@ def fold_offsets(offsets, kids):
     return [a + b for a, b in zip(offsets, extra)]
 
 
-def tails_dead(kids):
-    return any(_proc(k).poll() is not None for k in kids)
-
-
-def resumed_line(jid):
-    return f"boxq: {jid} left as it is on the box; resume with: tools/boxq.py attach {jid}"
-
-
 def eta_text(eta):
     if isinstance(eta, (int, float)) and not isinstance(eta, bool) and eta >= 0:
         return f"eta {round(eta)} s"
@@ -507,7 +514,8 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
         while True:
             job, wait, gone = None, q.poll_s, None
             try:
-                job = q.job(jid)
+                timeout = 30.0 if reconnect is None else min(30.0, max(0.001, reconnect["until"] - time.monotonic()))
+                job = q.job(jid, timeout=timeout)
                 fails, reconnect = 0, None
             except Refusal as e:
                 # Another client's job that the daemon no longer knows (a restart, a pruned history) is a miss like an
@@ -524,15 +532,14 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                     say(f"boxq: {jid}: poll {fails}/{POLL_FAILS} failed: {e.msg}")
                 else:
                     if reconnect is None:
-                        offsets = fold_offsets(offsets, kids)  # the tails are stopped; each resumes at its next byte
-                        reconnect = {"used": 0.0, "shift": 0}
-                    remain = q.reconnect_s - reconnect["used"]
+                        reconnect = {"until": time.monotonic() + q.reconnect_s, "shift": 0}
+                        offsets = fold_offsets(offsets, kids)
+                    remain = reconnect["until"] - time.monotonic()
                     if remain <= 0:
-                        gone = Down("daemon-down", e.msg, resumed_line(jid))
+                        gone = Down("daemon-down", e.msg, RESUME_LINE.format(jid=jid))
                     else:
                         wait = min(q.poll_s * 2 ** min(reconnect["shift"], 20), remain)
                         reconnect["shift"] += 1
-                        reconnect["used"] += wait
                         say(f"boxq: {jid}: reconnecting, next poll in {wait:g} s")
             # a pending signal is decided here, before this poll's answer is taken: another client's job (leave) and a job
             # seen past the queue are not ours to cancel, and a terminal answer after the signal never stands in for the
@@ -563,12 +570,12 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                                       f"job {jid} is still {st} after the cancel; check it on the box")
                     pause(trap, kids, q.poll_s)
                     continue
-                cancel_at = time.monotonic()
+                cancel_at = cancel_from
                 reconnect, fails, gone = None, 0, None
             if gone:
                 raise gone
             if job is not None:
-                if tails_dead(kids):
+                if any(_proc(k).poll() is not None for k in kids):
                     offsets = fold_offsets(offsets, kids)
                 last, now = job, time.monotonic()
                 if job["status"] == "queued":
@@ -1359,6 +1366,157 @@ def case_drain_closed_reader(fx):
           f"a closed reader drops the tail's bytes, still counts them and raises nothing: {why} n={t.n}")
 
 
+class Clock:
+    """A fake monotonic clock: only a stub's request or a trap's wait moves it."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class ClockTrap:
+    sigs = ()
+
+    def __init__(self, clock, sigs=()):
+        self.clock, self.sigs = clock, list(sigs)
+
+    def wait(self, secs):
+        self.clock.t += secs
+
+    rc = Trap.rc
+
+
+class StubQueue:
+    """The attach's Queue with no wire: `poll_s`, the budgets, and a job() and cancel() the case scripts."""
+
+    def __init__(self, clock, poll_s, reconnect_s=0.0, cancel_wait_s=0.0):
+        self.clock, self.poll_s, self.reconnect_s, self.cancel_wait_s = clock, poll_s, reconnect_s, cancel_wait_s
+        self.note_s = 60.0
+
+
+def with_clock(clock, fn):
+    real = time.monotonic
+    time.monotonic = clock
+    try:
+        return fn()
+    finally:
+        time.monotonic = real
+
+
+def case_reconnect_wall(fx):
+    """The reconnect budget is wall time: a poll that hangs its whole timeout counts, not only the sleeps between."""
+    clock = Clock()
+    q = StubQueue(clock, 5.0, reconnect_s=30.0)
+    asked = []
+
+    def job(jid, timeout=30.0):
+        asked.append(timeout)
+        clock.t += timeout  # the daemon never answers
+        raise Down("daemon-down", "GET /jobs/j1: no reply")
+
+    q.job = job
+    real_say = globals()["say"]
+    globals()["say"] = lambda msg: None
+    try:
+        try:
+            with_clock(clock, lambda: attach_job(q, "j1", fx.rc_dir, ClockTrap(clock)))
+            raised = None
+        except Down as e:
+            raised = e
+    finally:
+        globals()["say"] = real_say
+    check(raised is not None and raised.name == "daemon-down" and raised.line == RESUME_LINE.format(jid="j1"),
+          f"a budget past ends in 84 with the resume line: {raised!r}")
+    # two misses and their sleeps, the third miss at 100 s, then the budget of 30 s: 130 s, not 150 or more
+    check(clock.t <= 131.0, f"the budget counts the requests' time: the attach ended at {clock.t:g} s, 131 s at most")
+    check(min(asked) < 30.0, f"a poll inside the budget is asked for no longer than what is left: {asked}")
+
+
+def case_cancel_deadline(fx):
+    """The cancel wait counts from the first signal, whatever the failed posts and the accepted one before it."""
+    clock = Clock()
+    q = StubQueue(clock, 1.0, cancel_wait_s=4.0)
+    posts = []
+
+    def cancel(jid):
+        posts.append(clock.t)
+        if len(posts) <= 3:
+            raise Down("daemon-down", "POST cancel: no reply")
+        return {}
+
+    q.job = lambda jid, timeout=30.0: {"id": jid, "status": "queued", "wait_reason": None}
+    q.cancel = cancel
+    real_say = globals()["say"]
+    globals()["say"] = lambda msg: None
+    try:
+        try:
+            with_clock(clock, lambda: attach_job(q, "j1", fx.rc_dir, ClockTrap(clock, [signal.SIGINT])))
+            raised = None
+        except Refusal as e:
+            raised = e
+    finally:
+        globals()["say"] = real_say
+    check(raised is not None and raised.name == "cancel-pending" and len(posts) == 4,
+          f"three failed posts and an accepted one, the job still queued: cancel-pending: {raised!r} {posts}")
+    check(clock.t <= 4.5, f"the wait of 4 s runs from the first signal: the attach ended at {clock.t:g} s")
+
+
+def case_drain_full_pipe(fx):
+    """A reader that never reads cannot hold the client: the write does not block, the unwritten bytes are not counted,
+    and a SIGTERM during the stall exits 143."""
+    src_r, src_w = os.pipe()
+    dst_r, dst_w = os.pipe()
+    os.set_blocking(src_r, False)
+    t = Tail(None, src_r, dst_w)
+
+    def fill():
+        for _ in range(4):
+            os.write(src_w, b"x" * 60000)
+            drain([t])
+            if t.pending:
+                return
+
+    th = threading.Thread(target=fill, daemon=True)
+    th.start()
+    th.join(3)
+    stalled = th.is_alive()
+    if stalled:
+        os.close(dst_r)  # frees the blocked write; the case is red below
+    else:
+        n_before, held = t.n, len(t.pending)
+        os.set_blocking(dst_r, False)
+        got = 0
+        while True:
+            try:
+                chunk = os.read(dst_r, 1 << 16)
+            except BlockingIOError:
+                break
+            got += len(chunk)
+        drain([t])
+        for fd in (dst_r, dst_w):
+            os.close(fd)
+    os.close(src_w)
+    check(not stalled, "a drain into a full pipe blocked for 3 s")
+    check(held > 0 and n_before == got,
+          f"a full pipe leaves the bytes pending, counted only once written: held={held} n={n_before} read={got}")
+    fx.files(b"o" * 3000000, b"e\n")
+    fake = fx.serve([{"status": "running"}])
+    p = fx.start(*fx.run_args())  # its stdout pipe is never read
+    fx.wait_pids(fx.tail_pids, 2)
+    time.sleep(1.0)
+    p.send_signal(signal.SIGTERM)
+    try:
+        rc = p.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        raise AssertionError("a SIGTERM did not end a client whose stdout pipe is full within 10 s")
+    check(rc == 143 and fake.cancels() == [], f"SIGTERM with a full stdout pipe exits 143, no cancel: {rc}")
+    fx.gone(fx.tail_pids, 2)
+
+
 def case_queued_age(fx):
     now, sec = datetime.datetime.now(), datetime.timedelta(seconds=1)
     kst = datetime.timezone(datetime.timedelta(hours=9))
@@ -1580,7 +1738,8 @@ def case_attach_leave(fx):
 CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_reconnect,
          case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
-         case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_queued_age, case_cancelled_elsewhere, case_load_ready]
+         case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_drain_full_pipe, case_reconnect_wall,
+         case_cancel_deadline, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
 def run_cases(label, cases, make_fix, names):
