@@ -409,6 +409,10 @@ name = "gate_nemotron_e2e"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_nemotron_serve"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "gate_load_v41"
 required-features = ["gpu"]
 

@@ -2771,6 +2771,38 @@ pub static LISTENING_MIMO2: Kind = Kind {
     ],
 };
 
+/// The nemotron_h seat's load.
+pub static LOAD_NEMOTRON: Kind = Kind {
+    name: "load_nemotron",
+    head: "load",
+    doc: "The nemotron_h seat's model on its card: its architecture, resident bytes (the weights, the K/V planes of `ctx` rows, the scan stores and the step's scratch), the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: one, the body has no more), layers, the step graph's nodes, and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("graph_nodes", U64, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The nemotron_h seat's address.
+pub static LISTENING_NEMOTRON: Kind = Kind {
+    name: "listening_nemotron",
+    head: "bloomery-serve-nemotron:",
+    doc: "The nemotron_h seat's placement, the context its one slot serves, the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The GGUF set a `--hf` quant picked.
 pub static HF_SET: Kind = Kind {
     name: "hf_set",
@@ -3518,6 +3550,19 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
     groups::model_file::FETCH,
     groups::model_file::SET,
     &[&LANE, &LOAD_MIMO2, &LOAD_PHASES, &LISTENING_MIMO2],
+    groups::bind::CACHE,
+];
+
+/// What the nemotron_h seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
+/// the server before the seat registers), the plan, the load and its phases,
+/// the address and each request's note of the prefix it kept less of than it
+/// shared (the Mamba-2 state keeps a prefix only at the position it stands).
+pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
+    &[&PLACE_UNSET, &PLAN],
+    groups::model_file::FETCH,
+    groups::model_file::SET,
+    &[&LOAD_NEMOTRON, &LOAD_PHASES, &LISTENING_NEMOTRON],
     groups::bind::CACHE,
 ];
 
@@ -4452,7 +4497,7 @@ mod tests {
             residency38, vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 11] = [
+        let table: [(&str, Group, &[Group]); 12] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
@@ -4501,6 +4546,11 @@ mod tests {
                     residency38::HOST,
                     bind::CACHE,
                 ],
+            ),
+            (
+                "nemotron seat: bind::spawn",
+                BLOOMERY_SERVE_NEMOTRON,
+                &[model_file::FETCH, model_file::SET, bind::CACHE],
             ),
             (
                 "glm seat: Flags::encoder, residency_set, SlotDrafts::open, bind::spawn",
@@ -4561,6 +4611,11 @@ mod tests {
                 );
             }
         }
+        // The nemotron_h seat counts no round (`Seat::step_stats` is its default) and has one slot.
+        assert_eq!(
+            missing(BLOOMERY_SERVE_NEMOTRON, bind::SLOTS),
+            ["slots round", "slot call"]
+        );
         // The MiMo seat counts no round (`Seat::step_stats` is its default): no slot record in its list.
         assert_eq!(
             missing(BLOOMERY_SERVE_MIMO2, bind::SLOTS),

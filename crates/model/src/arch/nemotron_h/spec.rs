@@ -105,7 +105,7 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use models::{Act, Ffn, Mixer, Need, RopeMode};
 
     use super::super::names;
@@ -114,24 +114,24 @@ mod tests {
     use crate::arch::{Arch, spec};
 
     /// Six layers: Mamba, MLP, attention, and the same again.
-    const N: usize = 6;
-    const EMBD: u64 = 32;
+    pub(in crate::arch::nemotron_h) const N: usize = 6;
+    pub(in crate::arch::nemotron_h) const EMBD: u64 = 32;
     const HEADS: u64 = 4;
-    const KV: i32 = 2;
-    const HEAD: u64 = 8;
+    pub(in crate::arch::nemotron_h) const KV: i32 = 2;
+    pub(in crate::arch::nemotron_h) const HEAD: u64 = 8;
     const FF: i32 = 64;
-    const INNER: u64 = 32;
-    const MAMBA_HEADS: u64 = 4;
-    const CONV: u64 = 4;
+    pub(in crate::arch::nemotron_h) const INNER: u64 = 32;
+    pub(in crate::arch::nemotron_h) const MAMBA_HEADS: u64 = 4;
+    pub(in crate::arch::nemotron_h) const CONV: u64 = 4;
 
     /// `d_state` and `n_groups` are the two widths a test varies. The rest
     /// of the geometry is the constants above.
-    struct Geo {
-        d_state: u64,
-        n_groups: u64,
+    pub(in crate::arch::nemotron_h) struct Geo {
+        pub(in crate::arch::nemotron_h) d_state: u64,
+        pub(in crate::arch::nemotron_h) n_groups: u64,
     }
 
-    fn geo() -> Geo {
+    pub(in crate::arch::nemotron_h) fn geo() -> Geo {
         Geo {
             d_state: 128,
             n_groups: 4,
@@ -148,7 +148,7 @@ mod tests {
         )
     }
 
-    fn keys(g: &Geo) -> Vec<(&'static str, V)> {
+    pub(in crate::arch::nemotron_h) fn keys(g: &Geo) -> Vec<(&'static str, V)> {
         vec![
             ("block_count", V::U32(N as u32)),
             ("embedding_length", V::U32(EMBD as u32)),
@@ -221,7 +221,7 @@ mod tests {
         }
     }
 
-    fn tensors(g: &Geo, bias: bool) -> Vec<(String, Vec<u64>)> {
+    pub(in crate::arch::nemotron_h) fn tensors(g: &Geo, bias: bool) -> Vec<(String, Vec<u64>)> {
         let mut out = Vec::new();
         one(names::token_embd(), vec![EMBD, EMBD], &mut out);
         one(names::output(), vec![EMBD, EMBD], &mut out);

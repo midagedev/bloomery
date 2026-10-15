@@ -234,7 +234,8 @@ mod gate {
     /// header line above them.
     ///
     /// PIN(2026-10-10): a seventh row, the mimo2 seat's, joins the table.
-    const MODELS_LINES: [&str; 7] = [
+    /// PIN(2026-10-15): an eighth row, the nemotron seat's, joins the table.
+    const MODELS_LINES: [&str; 8] = [
         "models (the --model word is optional with a model file: the file's architecture picks \
          the seat)",
         "ds41    DeepSeek-V4.1-Flash          --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M",
@@ -242,6 +243,7 @@ mod gate {
         "glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL",
         "qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M",
         "mimo2   MiMo-V2.6-Flash              --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4",
+        "nemotron Nemotron 3 Nano             --hf nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M",
         "decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M",
     ];
 

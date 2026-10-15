@@ -10,6 +10,7 @@ use super::step::{
 use crate::flash_gqa::{FlashGqaKernels, GROUP_5, HEAD};
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
+use crate::linear::CONV_TAPS;
 use crate::mamba2::{self, Mamba2Kernels};
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
 use crate::recur::RecStore;
@@ -22,9 +23,14 @@ use model::arch::Arch;
 use model::arch::nemotron_h::hparams::{Hparams, Kind};
 use model::arch::nemotron_h::names;
 use model::mamba2::Geom;
+use runtime::stores;
 use std::ops::Range;
 
 const WHAT: &str = "nemotron_h::Body::load";
+
+// The scan's ring is indexed by the linear module's rows; the plan counts the ring by
+// `stores::conv_ring_rows`.
+const _: () = assert!(crate::linear::RING_ROWS == stores::conv_ring_rows(CONV_TAPS));
 
 /// The input of one decode step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,7 +232,7 @@ impl Names<'_> {
         Ok(match hp.kinds[l] {
             Kind::Mamba => {
                 let s = hp.ssm;
-                let lens = [s.d_inner * s.d_state, crate::linear::RING_ROWS * s.conv_dim];
+                let lens = stores::mamba2_lens(s.d_inner, s.d_state, CONV_TAPS, s.conv_dim);
                 Layer::Mamba(MambaLayer {
                     ssm_in: self.proj(l, names::SSM_IN, (s.d_in_proj, hidden))?,
                     ssm_out: self.proj(l, names::SSM_OUT, (hidden, s.d_inner))?,

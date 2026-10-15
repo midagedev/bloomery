@@ -625,6 +625,18 @@ impl Place {
         .into())
     }
 
+    /// [`Place::machine`] for a body that serves no tier card, with no draft:
+    /// a placement that names a tier card is planned with no batch bytes, so
+    /// the plan's own refusal of the tier reaches the seat.
+    pub fn machine_untiered(self) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
+        let none = TierBatchBytes {
+            staging: 0,
+            scratch: 0,
+            host: 0,
+        };
+        self.machine(None, (!self.tier_cards().is_empty()).then_some(none))
+    }
+
     /// The machine the placement plans over, by layer count. `draft_bytes`
     /// is the DSpark draft's resident bytes when the draft is served on the
     /// placement's first tier card ([`Place::draft_card`]); `batch` is the

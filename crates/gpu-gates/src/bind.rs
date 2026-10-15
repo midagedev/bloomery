@@ -413,6 +413,123 @@ pub fn slots_given(
     Ok((slots, from))
 }
 
+/// The flags every serving seat takes beside its own: the listener (`--host`,
+/// `--port`, `--queue-depth`), the keys (`--api-key`, `--api-key-file`), the
+/// context (`--ctx`, under every spelling `serve::flag::CTX` lists), the
+/// placement word (`--place`), the alias, the chat template file, `--parallel`
+/// (and `-np`) and `--plan`.
+pub struct SeatFlags {
+    pub host: String,
+    pub port: u16,
+    pub ctx: Option<usize>,
+    pub place: Option<crate::generate::Place>,
+    pub alias: Option<String>,
+    /// `--chat-template-file`, replacing the file's own template.
+    pub template_file: Option<PathBuf>,
+    /// `--plan`: the records before the load, then exit.
+    pub plan_only: bool,
+    pub parallel: Option<usize>,
+    pub queue_depth: Option<usize>,
+    /// `--api-key`/`--api-key-file`: the keys every request is checked
+    /// against ([`serve::flag::ApiKeys`]).
+    pub api_keys: serve::flag::ApiKeys,
+}
+
+impl SeatFlags {
+    /// The flags of `args`. A flag that is not one of the common set goes to
+    /// `own` with its value: `Ok(true)` took it, `Ok(false)` is an unknown
+    /// argument, refused by name with `usage`. `--help` returns `usage` as
+    /// the error; `--ctx 0` and `--parallel 0` are refused by name.
+    pub fn parse(
+        args: &[String],
+        usage: &str,
+        mut own: impl FnMut(&str, &str) -> Result<bool, GateError>,
+    ) -> Result<SeatFlags, GateError> {
+        let mut a = SeatFlags {
+            host: "127.0.0.1".to_owned(),
+            port: 8080,
+            ctx: None,
+            place: None,
+            alias: None,
+            template_file: None,
+            plan_only: false,
+            parallel: None,
+            queue_depth: None,
+            api_keys: serve::flag::ApiKeys::default(),
+        };
+        let mut it = args.iter().map(String::as_str);
+        while let Some(flag) = it.next() {
+            if flag == "--help" || flag == "-h" {
+                return Err(usage.into());
+            }
+            if flag == "--plan" {
+                a.plan_only = true;
+                continue;
+            }
+            let v = it
+                .next()
+                .ok_or_else(|| format!("{flag} needs a value, or is unknown: {usage}"))?;
+            match flag {
+                "--host" => a.host = v.to_owned(),
+                "--port" => a.port = serve::flag::number(flag, v)?,
+                f if serve::flag::CTX.contains(&f) => a.ctx = Some(serve::flag::number(flag, v)?),
+                "--place" => a.place = Some(crate::generate::Place::parse(v)?),
+                "--alias" => a.alias = Some(v.to_owned()),
+                "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
+                "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
+                "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
+                f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
+                other => {
+                    if !own(other, v)? {
+                        return Err(format!("unknown argument {other:?}: {usage}").into());
+                    }
+                }
+            }
+        }
+        if a.ctx == Some(0) {
+            return Err("--ctx 0: the stores hold no position".into());
+        }
+        if a.parallel == Some(0) {
+            return Err("--parallel 0: the server serves no slot".into());
+        }
+        Ok(a)
+    }
+
+    /// [`bind_server`] over `engine` with these flags: the alias the flag
+    /// gave or `chat`'s, `chat`'s template, no slot file path, `slots`
+    /// slots the seat made at its open.
+    pub fn bind(
+        self,
+        engine: SeatEngine,
+        chat: ChatSurface,
+        path: &Path,
+        slots: usize,
+    ) -> Result<Server, ServeError> {
+        let SeatFlags {
+            host,
+            port,
+            alias,
+            api_keys,
+            queue_depth,
+            ..
+        } = self;
+        bind_server(
+            engine,
+            Listen {
+                host: &host,
+                port,
+                alias: alias.unwrap_or(chat.name),
+                path,
+                template: chat.template,
+                slot_save_path: None,
+                api_keys,
+                parallel: slots,
+                queue_depth,
+            },
+        )
+    }
+}
+
 /// The shape a seat's round of several slots runs in, decided once at the
 /// open: the busy slots' rows as one pass of the body, or a select and a
 /// step (a pass, drafted) a slot in turn ([`step_rows_in_turn`],
@@ -501,6 +618,18 @@ pub fn placement_of(name: &str, machine: &Machine, plan: &Plan<'_>) -> Option<Pl
         eprintln!("{name}: /props leaves the placement out: {e}");
     }
     placement.ok()
+}
+
+/// [`Seat::keep`] of a body whose state cannot step back (a recurrent state
+/// no rollback restores): `n` when it is the whole held sequence (`pos`, the
+/// position the model stands at), else nothing with `why` as the rule that
+/// kept less. The caller resets the slot and feeds the prompt again.
+pub fn keep_where_standing(n: usize, pos: usize, why: &str) -> (usize, Option<String>) {
+    if n == pos {
+        (n, None)
+    } else {
+        (0, Some(why.to_owned()))
+    }
 }
 
 /// A seat's [`Seat::note`]: a prefix kept less of than shared is a `cache
@@ -2972,10 +3101,26 @@ impl Drop for SeatEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, Link, Reply};
+    use super::{Cmd, Link, Reply, keep_where_standing};
     use std::sync::mpsc;
 
     const N_VOCAB: usize = 8;
+
+    /// A body whose state cannot step back keeps the whole held sequence and
+    /// nothing shorter, and says why for the shorter.
+    #[test]
+    fn a_state_that_cannot_step_back_keeps_only_where_it_stands() {
+        assert_eq!(keep_where_standing(7, 7, "why"), (7, None));
+        assert_eq!(keep_where_standing(0, 0, "why"), (0, None));
+        assert_eq!(
+            keep_where_standing(6, 7, "why"),
+            (0, Some("why".to_owned()))
+        );
+        assert_eq!(
+            keep_where_standing(0, 7, "why"),
+            (0, Some("why".to_owned()))
+        );
+    }
 
     /// The factory's sampler is the sampler crate's chain over the request's
     /// parameters, and a parameter the chain refuses (a non-finite

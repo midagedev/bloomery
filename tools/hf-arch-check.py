@@ -100,10 +100,10 @@ SERVES = {
     "qwen3": ("qwen3moe", "qwen35moe"),
     "mimo2": ("mimo2",),
 }
-SERVES_VIA_FROM_NAME = {"glm": "Glm5next"}
+SERVES_VIA_FROM_NAME = {"glm": "Glm5next", "nemotron": "NemotronH"}
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::ALL and Model::word — the generative seats in the order
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
-SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2")
+SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "nemotron")
 DECIDE_WORD = "decide"
 # crates/model/src/arch/mod.rs:Arch::from_name — variant -> the strings that name it.
 FROM_NAME = {
@@ -1796,7 +1796,7 @@ def self_test():
         line, green, _ = row_line("glm", "glm5nextx", small)
         check("a glm5nextx file is refused by name",
               not green and "arch=glm5nextx route=REFUSED: a glm5nextx file, which no seat serves; the seats are "
-              "--model ds41, qwen38, glm, qwen3, mimo2, decide" in line, line)
+              "--model ds41, qwen38, glm, qwen3, mimo2, nemotron, decide" in line, line)
         line, green, _ = row_line("glm", "deepseek41", small)
         check("a file the router seats elsewhere is refused for the row's seat",
               not green and "in the ds41 seat, and the README row says glm" in line, line)

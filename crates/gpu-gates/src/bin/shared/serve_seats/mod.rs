@@ -3,7 +3,7 @@
 //! behind [`bloomery_gpu_gates::bind::Seat`], with a `run(&args)` a binary
 //! calls once. The per-model binaries (`bloomery-serve-ds41`,
 //! `bloomery-serve-qwen38`) include their one seat directly; the one-binary
-//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2`) includes this
+//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2|nemotron`) includes this
 //! registry and is one call into the seat the model names.
 //!
 //! A seat's module is its contract's owner: read it for the flags, the
@@ -11,7 +11,9 @@
 //! seat, opened as `generate_glm5next` opens the model; [`qwen3`] the
 //! single-card Qwen seat (qwen3moe, qwen35moe), opened as
 //! `generate_qwen3moe` opens them; [`mimo2`] the MiMo-V2.6-Flash seat, whose
-//! every routed expert sits on the host, opened as `gate_mimo2_e2e` opens it.
+//! every routed expert sits on the host, opened as `gate_mimo2_e2e` opens it;
+//! [`nemotron`] the Nemotron 3 Nano seat, one sequence on one card, opened as
+//! `gate_nemotron_e2e` opens it.
 //! `drafted` is the
 //! seats' shared MTP draft driver and `served` the owner of the DSpark draft
 //! the V4.1 and qwen3 seats serve, each one file a seat's per-model binary
@@ -43,6 +45,11 @@ pub mod qwen3;
 // through is scoped to it, and it runs no V4.1 code.
 #[cfg(all(feature = "deepseek41", feature = "mimo2"))]
 pub mod mimo2;
+// The nemotron seat sits behind `deepseek41` for the same reason: the server
+// surface it binds through is scoped to it, and it runs no V4.1 code. The
+// body it serves is in the gpu crate, so it needs no feature of its own.
+#[cfg(feature = "deepseek41")]
+pub mod nemotron;
 // The seats' one owner of a round run as passes (`step_rows_one_pass`).
 #[cfg(feature = "deepseek41")]
 pub mod rounds;

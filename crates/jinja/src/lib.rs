@@ -256,7 +256,12 @@ fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
+/// The byte at which the tag whose body starts at `from` closes. A comment ends at the first `#}`; the
+/// closer of an expression or a statement is the first outside a string.
 fn find_close(src: &str, from: usize, close: &str) -> Option<usize> {
+    if close == "#}" {
+        return src[from..].find(close).map(|at| from + at);
+    }
     let b = src.as_bytes();
     let mut i = from;
     let mut quote: Option<u8> = None;
@@ -2720,8 +2725,24 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_ends_at_its_first_closer_whatever_it_quotes() {
+        // The Nemotron 3 Nano template's comment, `{# Assistant message doesn't have tool calls. #}`,
+        // holds one apostrophe.
+        assert_eq!(render("a{# doesn't #}b", json!({})), "ab");
+        assert_eq!(render("a{# 'x #}b", json!({})), "ab");
+        assert_eq!(render("a{# \"#}b", json!({})), "ab");
+        let source = "한🙂 '#}' x";
+        assert_eq!(find_close(source, 0, "#}"), source.find("#}"));
+        // Quotes still guard the closer of an expression.
+        assert_eq!(render("{{ '}}' }}", json!({})), "}}");
+    }
+
+    // PIN(2026-10-15): the `#}` round leaves this loop. A comment's text holds no expression, so a
+    // quote in it opens no string (Jinja2's lexer reads it as `(.*?)` up to the first closer);
+    // `a_comment_ends_at_its_first_closer_whatever_it_quotes` holds that closer.
+    #[test]
     fn tag_closers_scan_unicode_without_slicing_inside_a_character() {
-        for close in ["}}", "%}", "#}"] {
+        for close in ["}}", "%}"] {
             let source = format!("한🙂 '{close}' \"{close}\" \\\u{00e9}{close}");
             assert_eq!(find_close(&source, 0, close), Some(source.len() - 2));
         }

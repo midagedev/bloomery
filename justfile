@@ -260,6 +260,15 @@ gate-gpu-mamba2:
 gate-gpu-nemotron-e2e:
     BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_e2e'
 
+# The nemotron seat of bloomery-serve on Nemotron 3 Nano 4B Q4_K_M (gate_nemotron_serve's doc): `--plan` with no flag names its
+# default context (the ladder's rung, held by the ctx line and the rung above refused) and exits before any load, `--parallel 2` is
+# refused by name (the body holds one sequence); one server with no flag listens at the context its ctx line named, answers
+# /completion at temperature 0 with the ids NemotronHModel gives stepped directly on the same ids (prose, and the chat turn the
+# server's template renders), serves that turn on /v1/chat/completions (usage counts its ids), resends an edited prompt as a
+# fresh run that keeps nothing and an extended one that keeps the held positions. One card.
+gate-gpu-nemotron-serve:
+    BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
+
 # GLM-5.3-Flash 라우터(288개 중 8개, sigmoid, ×2.5 — `router::glm5next`)를 모델 없이 합성 입력으로 호스트 규칙과 맞춘다.
 # 규칙마다 절이 하나다: logits·ids·weights·batch는 비트, scores는 sigmoid 밴드, ties·guard·fault·graph는 명시한 값.
 gate-gpu-glm-router:

@@ -122,8 +122,8 @@ use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
-    model_props, note_line, parallel_line, placement_of, slots_given,
+    ChatSurface, Pass, Seat, SeatEngine, SeatFlags, SlotStep, Vocab, arm_screen, model_props,
+    note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, choose_ctx, lane_at};
 use bloomery_gpu_gates::record::{self, Record};
@@ -135,10 +135,8 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
-use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target as _;
-use serve::flag::number;
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
@@ -177,86 +175,24 @@ const ONE_PASS: bool = true;
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the mimo2 seat runs no prompt cache";
 
-/// MiMo fact: the load refuses any expert tier card (`Body::load`,
-/// `PlanInputs::plan_with_slots`), so a tier card serves no prompt batch here.
-/// Planning a placement that names one with zero batch bytes reaches the
-/// plan's own refusal.
-const NO_BATCH: TierBatchBytes = TierBatchBytes {
-    staging: 0,
-    scratch: 0,
-    host: 0,
-};
-
+/// The flags this seat takes beside the common ones ([`SeatFlags`]).
 struct Args {
-    host: String,
-    port: u16,
-    ctx: Option<usize>,
-    place: Option<Place>,
-    alias: Option<String>,
-    /// `--chat-template-file`, replacing the file's own template.
-    template_file: Option<PathBuf>,
-    /// `--plan`: the records before the load, then exit.
-    plan_only: bool,
+    common: SeatFlags,
     /// `--prefill`: how a prompt call is fed.
     prefill: PrefillMode,
-    /// `--parallel`: the resident slots.
-    parallel: Option<usize>,
-    queue_depth: Option<usize>,
-    /// `--api-key`/`--api-key-file`: the keys every request is checked
-    /// against ([`serve::flag::ApiKeys`]).
-    api_keys: serve::flag::ApiKeys,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
-    let mut a = Args {
-        host: "127.0.0.1".to_owned(),
-        port: 8080,
-        ctx: None,
-        place: None,
-        alias: None,
-        template_file: None,
-        plan_only: false,
-        prefill: PrefillMode::Batch,
-        parallel: None,
-        queue_depth: None,
-        api_keys: serve::flag::ApiKeys::default(),
-    };
-    let mut it = args.iter().map(String::as_str);
-    while let Some(flag) = it.next() {
-        if flag == "--help" || flag == "-h" {
-            return Err(USAGE.into());
+    let mut prefill = PrefillMode::Batch;
+    let common = SeatFlags::parse(args, USAGE, |flag, v| match flag {
+        "--prefill" => {
+            prefill = PrefillMode::from_name(v)
+                .ok_or_else(|| format!("--prefill is batch or steps, not {v}"))?;
+            Ok(true)
         }
-        if flag == "--plan" {
-            a.plan_only = true;
-            continue;
-        }
-        let v = it
-            .next()
-            .ok_or_else(|| format!("{flag} needs a value, or is unknown: {USAGE}"))?;
-        match flag {
-            "--host" => a.host = v.to_owned(),
-            "--port" => a.port = number(flag, v)?,
-            f if serve::flag::CTX.contains(&f) => a.ctx = Some(number(flag, v)?),
-            "--place" => a.place = Some(Place::parse(v)?),
-            "--alias" => a.alias = Some(v.to_owned()),
-            "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
-            "--prefill" => {
-                a.prefill = PrefillMode::from_name(v)
-                    .ok_or_else(|| format!("--prefill is batch or steps, not {v}"))?;
-            }
-            "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
-            "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
-            f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
-            other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
-        }
-    }
-    if a.ctx == Some(0) {
-        return Err("--ctx 0: the stores hold no position".into());
-    }
-    if a.parallel == Some(0) {
-        return Err("--parallel 0: the server serves no slot".into());
-    }
-    Ok(a)
+        _ => Ok(false),
+    })?;
+    Ok(Args { common, prefill })
 }
 
 /// The MiMo session on the engine thread and the positions each slot's
@@ -373,7 +309,6 @@ impl Mimo {
     fn open(a: OpenSeat) -> Result<Mimo, GateError> {
         let pinned = a.pin_main && threads::pool().pin_caller();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
-        let tier = (!a.place.tier_cards().is_empty()).then_some(NO_BATCH);
         let mut log = Log {
             t: Instant::now(),
             opened: Duration::ZERO,
@@ -388,7 +323,7 @@ impl Mimo {
         };
         let args = OpenArgs {
             place: a.place.name(),
-            machine: a.place.machine(None, tier)?,
+            machine: a.place.machine_untiered()?,
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: Mimo2Cfg {
@@ -503,7 +438,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main(NAME, record::BLOOMERY_SERVE_MIMO2);
     arm_screen(levers.screen());
-    let a = parse_args(args)?;
+    let Args { common: a, prefill } = parse_args(args)?;
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let first = split
@@ -518,7 +453,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         )
         .into());
     }
-    let ChatSurface { template, name } = ChatSurface::read(
+    let chat = ChatSurface::read(
         &path,
         split.value("tokenizer.chat_template"),
         split.value("general.name"),
@@ -549,9 +484,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         serving_place: place != Place::Gate,
         check_finite: false,
         route_trace: false,
-        prefill_steps: a.prefill == PrefillMode::Steps,
+        prefill_steps: prefill == PrefillMode::Steps,
     });
-    if pick.why == ResidencyWhy::Set && pick.word != "off" && a.prefill == PrefillMode::Steps {
+    if pick.why == ResidencyWhy::Set && pick.word != "off" && prefill == PrefillMode::Steps {
         return Err(format!(
             "BLOOMERY_RESIDENCY={} is refused beside --prefill steps (each prompt id would end \
              a pass the rule counts)",
@@ -559,8 +494,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         )
         .into());
     }
-    let tier = (!place.tier_cards().is_empty()).then_some(NO_BATCH);
-    let machine = place.machine(None, tier)?(inputs.model.layers);
+    let machine = place.machine_untiered()?(inputs.model.layers);
     // The context, then the plan of every slot around it, each layer's
     // stores `slots` times at a slot's positions (`choose_ctx`, every seat's).
     // A tier card, a total the machine cannot hold and a budget that binds
@@ -621,25 +555,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         plan: plan_levers,
         host: levers.host(),
         pin_main: levers.pin_main(),
-        prefill: a.prefill,
+        prefill,
         residency,
         group: levers.prefill_group(),
     };
     let engine = SeatEngine::spawn(move || Mimo::open(open), slot_ctx, vocab, card, props, 0)?;
-    let server = bind_server(
-        engine,
-        Listen {
-            host: &a.host,
-            port: a.port,
-            alias: a.alias.unwrap_or(name),
-            path: &path,
-            template,
-            slot_save_path: None,
-            api_keys: a.api_keys,
-            parallel: slots,
-            queue_depth: a.queue_depth,
-        },
-    )?;
+    let server = a.bind(engine, chat, &path, slots)?;
     Record::new(&record::LISTENING_MIMO2)
         .w("place", place.name())
         .u("ctx", slot_ctx)

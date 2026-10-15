@@ -60,6 +60,29 @@ pub const fn recurrent_bytes(v_heads: usize, k_heads: usize, state: usize, conv:
     v * d * d * F32_BYTES + conv_ring_rows(conv) as u64 * channels * F32_BYTES
 }
 
+/// A Mamba-2 layer's stores in f32 values, `[state, ring]`: `d_inner` channels
+/// of `d_state` scan state, and the conv ring's rows
+/// ([`conv_ring_rows`] of the `conv`-tap conv) of `conv_dim` channels. The
+/// plan counts a layer's store by these lengths and the card body allocates
+/// it by them.
+#[must_use]
+pub const fn mamba2_lens(
+    d_inner: usize,
+    d_state: usize,
+    conv: usize,
+    conv_dim: usize,
+) -> [usize; 2] {
+    [d_inner * d_state, conv_ring_rows(conv) * conv_dim]
+}
+
+/// A Mamba-2 layer's stores in bytes ([`mamba2_lens`], f32): what it holds
+/// whatever the context, one sequence's.
+#[must_use]
+pub const fn mamba2_bytes(d_inner: usize, d_state: usize, conv: usize, conv_dim: usize) -> u64 {
+    let [state, ring] = mamba2_lens(d_inner, d_state, conv, conv_dim);
+    (state + ring) as u64 * F32_BYTES
+}
+
 /// Lanes of a gated-delta-rule layer's state on a model that verifies
 /// drafted rows (Qwen3.8's `Body38`): a verify of up to this many rows keeps
 /// the state after each of its rows in a lane of its own, and a commit moves
@@ -131,9 +154,17 @@ pub const fn selecting_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_LANES, conv_ring_rows, delta_lane_bytes, dense_kv_bytes, kv_row_bytes,
-        ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes, selecting_bytes,
+        DELTA_LANES, conv_ring_rows, delta_lane_bytes, dense_kv_bytes, kv_row_bytes, mamba2_bytes,
+        mamba2_lens, ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes, selecting_bytes,
     };
+
+    /// A Mamba-2 layer of 32 channels at state 128 with a 4-tap conv over
+    /// 1,056 conv channels: 4,096 f32 of scan state and eleven conv rows.
+    #[test]
+    fn mamba2_sizes() {
+        assert_eq!(mamba2_lens(32, 128, 4, 1056), [4096, 11 * 1056]);
+        assert_eq!(mamba2_bytes(32, 128, 4, 1056), (4096 + 11 * 1056) * 4);
+    }
 
     /// Qwen3.8's sizes: a GDN layer holds 48 heads of 128 × 128 f32 and
     /// eleven conv rows of 10,240 f32 channels; the PLE ring 17 rows of four

@@ -1,12 +1,12 @@
 //! `bloomery-serve` — one server binary, one seat a model: `--model
-//! ds41|qwen38|glm|qwen3|mimo2|decide` picks the seat (`serve_seats`, the shared
+//! ds41|qwen38|glm|qwen3|mimo2|nemotron|decide` picks the seat (`serve_seats`, the shared
 //! seat modules), every other flag the seat's own, parsed by the seat's own
 //! parser, so each seat's flag set is exactly its per-model binary's. The
 //! word is optional with a model file: with none, the file's architecture
 //! picks the seat, and a bare start or `--help` prints [`drive::MODELS`],
 //! one line a seat with a working `--hf` example.
 //!
-//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|decide]
+//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|nemotron|decide]
 //!                    [-m PATH | --model-file PATH | --hf <repo>[:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
 //!                    <the seat's own flags>
@@ -37,7 +37,7 @@
 //! Otherwise, with no `--model`, the architecture of the file's first shard
 //! picks the seat: deepseek41 and deepseek4 the ds41 seat, glm5next and
 //! glm5-next the glm seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe
-//! the qwen3 seat, mimo2 the mimo2 seat;
+//! the qwen3 seat, mimo2 the mimo2 seat, nemotron_h the nemotron seat;
 //! a file of a decision row's backbone (qwen35) with no head is refused by
 //! name, saying what would seat it (`--head`, a row's `--hf` repo, or a file
 //! that carries its head); a
@@ -122,15 +122,15 @@ mod drive {
     use serve::decide::Ask;
     use serve::preflight::Driver;
 
-    use crate::serve_seats::{decide, ds41, glm, mimo2, qwen3, qwen38};
+    use crate::serve_seats::{decide, ds41, glm, mimo2, nemotron, qwen3, qwen38};
 
     const NAME: &str = "bloomery-serve";
 
-    const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|decide] [-m PATH | \
-                         --model-file PATH | --hf <repo>[:<quant>]] [--head <weights> \
+    const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|nemotron|decide] \
+                         [-m PATH | --model-file PATH | --hf <repo>[:<quant>]] [--head <weights> \
                          [--head-config <file>]] <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
-                         mimo2 or the decide seat takes them> | --version";
+                         mimo2, the nemotron or the decide seat takes them> | --version";
 
     /// One line a seat, printed beside [`USAGE`] on `--help` and a bare
     /// start: the seat word, what it serves, and a working `--hf` example of
@@ -142,6 +142,7 @@ models (the --model word is optional with a model file: the file's architecture 
   glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL
   qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
   mimo2   MiMo-V2.6-Flash              --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4
+  nemotron Nemotron 3 Nano             --hf nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M
   decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M
   decide  a decision model in its file --hf ggml-org/lev-GGUF:Q4_K_M";
 
@@ -162,6 +163,7 @@ models (the --model word is optional with a model file: the file's architecture 
         Glm,
         Qwen3,
         Mimo2,
+        Nemotron,
     }
 
     /// A `--model` word: a generative seat's, or the decide seat's.
@@ -179,9 +181,10 @@ models (the --model word is optional with a model file: the file's architecture 
                 "glm" => Ok(Word::Seat(Model::Glm)),
                 "qwen3" => Ok(Word::Seat(Model::Qwen3)),
                 "mimo2" => Ok(Word::Seat(Model::Mimo2)),
+                "nemotron" => Ok(Word::Seat(Model::Nemotron)),
                 serve::decide::WORD => Ok(Word::Decide),
                 other => Err(format!(
-                    "--model is ds41, qwen38, glm, qwen3, mimo2 or {}, not {other}",
+                    "--model is ds41, qwen38, glm, qwen3, mimo2, nemotron or {}, not {other}",
                     serve::decide::WORD
                 )
                 .into()),
@@ -198,12 +201,13 @@ models (the --model word is optional with a model file: the file's architecture 
 
     impl Model {
         /// Every generative seat.
-        const ALL: [Model; 5] = [
+        const ALL: [Model; 6] = [
             Model::Ds41,
             Model::Qwen38,
             Model::Glm,
             Model::Qwen3,
             Model::Mimo2,
+            Model::Nemotron,
         ];
 
         /// The seat's word, as errors and the usage name it.
@@ -214,6 +218,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Glm => "glm",
                 Model::Qwen3 => "qwen3",
                 Model::Mimo2 => "mimo2",
+                Model::Nemotron => "nemotron",
             }
         }
 
@@ -228,6 +233,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Glm => matches!(Arch::from_name(arch), Ok(Arch::Glm5next)),
                 Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe"),
                 Model::Mimo2 => arch == "mimo2",
+                Model::Nemotron => matches!(Arch::from_name(arch), Ok(Arch::NemotronH)),
             }
         }
     }
@@ -245,7 +251,7 @@ models (the --model word is optional with a model file: the file's architecture 
             }
             let v = it.next().ok_or_else(|| {
                 format!(
-                    "--model needs a value (ds41, qwen38, glm, qwen3, mimo2 or {}): {USAGE}",
+                    "--model needs a value (ds41, qwen38, glm, qwen3, mimo2, nemotron or {}): {USAGE}",
                     serve::decide::WORD
                 )
             })?;
@@ -436,6 +442,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Glm => glm::run(&rest),
             Model::Qwen3 => qwen3::run(&rest),
             Model::Mimo2 => mimo2::run(&rest),
+            Model::Nemotron => nemotron::run(&rest),
         };
         ended(r)
     }
