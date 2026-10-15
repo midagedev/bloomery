@@ -932,8 +932,11 @@ class Fix:
         bindir, q = os.path.join(self.tmp, "bin"), shlex.quote
         os.makedirs(bindir)
         self.script(os.path.join(bindir, "tail"),
+                    # A follow (not dump's read) records itself in follow_pids before tail_pids, so a wait on
+                    # tail_pids never returns while a counted follow is still unrecorded.
+                    f'case " $* " in *" -F "*) echo $$ >> {q(self.follow_pids)} ;; esac\n'
                     f'echo $$ >> {q(self.tail_pids)}\n'
-                    f'case " $* " in *" -F "*) echo $$ >> {q(self.follow_pids)}\n'  # a follow, not dump's read
+                    f'case " $* " in *" -F "*)\n'
                     f'  if [ -f {q(self.tail_stall)} ]; then for f; do :; done; head -c 5 "$f"; exec sleep 600; fi ;;\n'
                     f'esac\n'
                     f'exec {q(shutil.which("tail"))} "$@"\n')
