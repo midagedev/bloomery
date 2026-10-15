@@ -42,8 +42,8 @@
 #      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000}, a gate whose default working set needs more
 #      than the 3090. Cards a6000, not stealable, so an unpinned batch does not place it on the 3090.
 #      A 3090 call, a box.sh card pick or solo keeps the lane that already won; a real-tier v41-load
-#      member without the `any` form stays on the chain's 3090 candidate. --lanes 1 forces
-#      BLOOMERY_GATE_CARD=a6000. Any other spelling of BLOOMERY_GATE_CARD on a gpu-gate.sh call is
+#      member without the `any` form stays on the chain's 3090 candidate. --lanes 1 preserves defaults
+#      and caller/item card overrides. Any other spelling of BLOOMERY_GATE_CARD on a gpu-gate.sh call is
 #      still refused. A fixture-tier solo-real recipe that picks the A6000 through box.sh is the same class.
 #   X  alone, after both lanes end: a recipe (or a dependency) that carries the just attribute
 #      `[group('solo')]`, whose gate pins a host-memory count (page faults, page-cache residency) that
