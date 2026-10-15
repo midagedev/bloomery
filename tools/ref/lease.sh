@@ -1524,6 +1524,7 @@ EOF
         i=0
         until bounded_ready "$pdir/record.pid" || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
         check "bounded-perf-$phase-ready" "$(bounded_ready "$pdir/record.pid" && echo yes || echo no)" yes
+        bounded_ready "$pdir/record.pid" || sed 's/^/  err: /' "$pdir/err" >&2
         case $phase in record | fork)
           check "bounded-perf-$phase-decoder-ready" "$(bounded_ready "$pdir/decoder.pid" && echo yes || echo no)" yes
           ;;

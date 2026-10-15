@@ -19,6 +19,8 @@
 # run with & with INT ignored, and tools/gpu-gate.sh, which starts the watch so, sends it a TERM for its own
 # INT). Exit: the command's code (143 or 137 when the watch ended it), 64 on a bad command line.
 set -uo pipefail
+# shellcheck source=tools/gate-bound.sh
+source "${BASH_SOURCE[0]%/*}/../gate-bound.sh"
 
 usage() {
   echo "usage: stack-watch.sh QUIET COMM -- CMD [ARGS...]  (QUIET whole seconds from 1)" >&2
@@ -66,7 +68,7 @@ comm_of() {
 dump_stacks() {
   local target=$1 t
   if command -v gdb > /dev/null; then
-    timeout --kill-after=10 120 gdb -p "$target" -batch -ex 'thread apply all bt' > "$log.gdb" 2>&1 &
+    run_bounded timeout --kill-after=10 120 gdb -p "$target" -batch -ex 'thread apply all bt' > "$log.gdb" 2>&1 &
     dump=$!
     spawning=0
     if [ "$stop" = 1 ]; then
@@ -102,7 +104,7 @@ watch() {
   # check before a dump until the dump's pid is), which would start that child with them ignored. A TERM to a child that has
   # already ended is no error, under set -e too.
   trap 'stop=1; [ -z "$pid" ] || { [ "$spawning" = 1 ] || trap "" TERM INT HUP; told="$pid $dump"; kill -TERM "$pid" ${dump:+"$dump"} 2> /dev/null || :; }' TERM INT HUP
-  "$@" > "$log" 2>&1 &
+  run_bounded "$@" > "$log" 2>&1 &
   pid=$!
   if [ "$stop" = 1 ]; then
     trap '' TERM INT HUP
@@ -159,7 +161,7 @@ watch() {
 # started ends it.
 # One line a case, a failed one with the last line of what it read; exit 0 iff none failed.
 self_test() {
-  local self t bad=0 out rc w k s left
+  local self t bad=0 out rc w k s left phase quiet ready before lk f sp ip
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   t=$(mktemp -d "${TMPDIR:-/tmp}/stack-watch-test.XXXXXX") || return 70
   # shellcheck disable=SC2064 # the path is fixed now
@@ -247,6 +249,77 @@ self_test() {
   echo "command ran: $([ -s "$t/cmd4.pid" ] && echo yes || echo no), left:${left:- none}" >> "$t/h"
   [ -z "$left" ] || kill -TERM "$(cat "$t/cmd4.pid")" 2> /dev/null
   case_ 'a TERM right after the command has started: the command ended, its code kept' 7 'command ran: yes, left: none$' "$rc" "$t/h"
+  # A timeout that exits on TERM without forwarding it leaves its child holding descriptor 9 in
+  # its own group. Cancelling the watch waits for that group, for both the command and a gdb dump.
+  command -v flock > /dev/null || PATH=${self%/*}/card-tests/bin:$PATH
+  mkdir "$t/fork-bin"
+  cat > "$t/fork-bin/timeout" << 'EOF'
+#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+
+os.setpgid(0, 0)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+args = [a for a in sys.argv[1:] if not a.startswith('--kill-after=')]
+child = subprocess.Popen(args[1:], close_fds=False)
+try:
+    rc = child.wait(timeout=float(args[0]))
+except subprocess.TimeoutExpired:
+    child.kill()
+    child.wait()
+    rc = 124
+sys.exit(128 - rc if rc < 0 else rc)
+EOF
+  printf '%s\n' '#!/bin/sh' 'trap '\''trap "" TERM INT HUP; sleep 1; exit 7'\'' TERM' \
+    'echo "$$ $PPID" > "$1"' 'while :; do sleep 1; done' > "$t/fork-held"
+  printf '%s\n' '#!/bin/sh' 'exec "$SW_HELD" "$SW_DUMP"' > "$t/fork-bin/gdb"
+  chmod +x "$t/fork-bin/timeout" "$t/fork-bin/gdb" "$t/fork-held"
+  fork_ready() {
+    local sp ip state
+    [ -s "$1" ] && read -r sp ip < "$1" || return 1
+    state=$(ps -o stat= -p "$ip" 2> /dev/null) || return 1
+    case $state in *S*) return 0 ;; esac
+    return 1
+  }
+  for phase in command dump; do
+    quiet=30
+    [ "$phase" != dump ] || quiet=1
+    SW_HELD=$t/fork-held SW_DUMP=$t/fork-$phase.gdb PATH=$t/fork-bin:$PATH \
+      bash -c 'exec 9> "$1" && flock -n 9 && exec bash "$2" "$3" sleep -- timeout --kill-after=10 30 "$4" "$5"' \
+      _ "$t/fork-$phase.lock" "$self" "$quiet" "$t/fork-held" "$t/fork-$phase.cmd" > "$t/fork-$phase.log" 2>&1 &
+    w=$! k=0 ready=no
+    until [ "$k" = 100 ]; do
+      if fork_ready "$t/fork-$phase.cmd" && { [ "$phase" != dump ] || fork_ready "$t/fork-$phase.gdb"; }; then
+        ready=yes
+        break
+      fi
+      sleep 0.1
+      k=$((k + 1))
+    done
+    before=free
+    flock -n "$t/fork-$phase.lock" true 2> /dev/null || before=held
+    kill -TERM "$w" 2> /dev/null || :
+    rc=0; wait "$w" || rc=$?
+    left=''
+    for f in "$t/fork-$phase.cmd" "$t/fork-$phase.gdb"; do
+      [ -s "$f" ] && read -r sp ip < "$f" || continue
+      alive "$sp" && left="$left child"
+      kill -0 "$ip" 2> /dev/null && left="$left timeout"
+    done
+    lk=free
+    flock -n "$t/fork-$phase.lock" true 2> /dev/null || lk=held
+    echo "ready: $ready, lock before: $before" >> "$t/fork-$phase.log"
+    echo "left:${left:- none}, lock after: $lk" >> "$t/fork-$phase.log"
+    case_ "a TERM with a fork-exit timeout ($phase): child ended, inherited lock free" 143 \
+      '^left: none, lock after: free$' "$rc" "$t/fork-$phase.log"
+    case_ "  $phase and its timeout ready with the lock held" 143 '^ready: yes, lock before: held$' "$rc" "$t/fork-$phase.log"
+    for f in "$t/fork-$phase.cmd" "$t/fork-$phase.gdb"; do
+      [ -s "$f" ] && read -r sp ip < "$f" || continue
+      if alive "$sp" || kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
+    done
+  done
   [ "$bad" = 0 ] && echo "stack-watch self-test: ok" || echo "stack-watch self-test: $bad failed"
   [ "$bad" = 0 ]
 }

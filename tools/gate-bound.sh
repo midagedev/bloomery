@@ -3,8 +3,9 @@
 # The bound of the gate runners (tools/gate.sh, tools/gpu-gate.sh, tools/host-gate.sh): the seconds
 # a gate's binary may run before `timeout` ends it, BLOOMERY_GATE_BOUND, 900 when unset, and
 # run_bounded, which runs the bounded command so that an ended runner takes it with it (also
-# tools/ref/lease.sh's lease_bounded, under a bound of its own). Sourced, never executed; one parser,
-# so the three runners take and refuse the same values.
+# tools/ref/lease.sh's lease_bounded, under a bound of its own), and lease_stop, the process-group
+# stop shared by run_bounded and the lease runners. Sourced, never executed; one parser, so the
+# three runners take and refuse the same values.
 #
 # The value is a base-10 whole number from 1 up, with no sign and no leading zero; anything else is
 # refused by name, set-and-empty included. GNU timeout reads 0 (00 as well) as no bound at all, so a
@@ -26,6 +27,8 @@ gate_bound() {
 # the monitor. Allow another 10 s for KILL to finish, reporting a group still alive then. A monitor
 # that exited without forwarding TERM can leave a live group behind. Zombies hold no descriptors;
 # only live processes keep cleanup waiting. The caller ignores further signals.
+# A failed process read skips its wait (KILL follows TERM without the grace) and returns 70 without
+# reaping the monitor.
 lease_stop() {
   local pid=$1 sig target err table p pg state live failed=0 deadline
   for sig in TERM KILL; do
@@ -69,11 +72,11 @@ lease_stop() {
 # to the runner's group never reaches. So a TERM or HUP to the runner (an INT too, unless the runner
 # was started with & by a shell, which leaves INT ignored) goes on to the child as a TERM, and the
 # runner waits for the child and its process group before going on. The TERM reaches the group too,
-# including a command GNU timeout started before returning from fork. lease_stop
-# bounds that cleanup at 10 s before KILL. The child keeps the runner's stdin, which a command run
-# with & would not. The trap is set before the child starts: one that comes before the child's
-# pid is known is held in BIN_SIGNAL and passed on as soon as the pid is, once (BIN_SENT says the trap
-# has passed it on already). Once it has passed a signal on, the trap ignores further ones (GNU
+# including a command GNU timeout started before returning from fork. lease_stop bounds that cleanup
+# at 10 s before KILL. The child keeps the runner's stdin, which a command run with & would not.
+# The trap is set before the child starts: one that comes before the child's pid is known is held in
+# BIN_SIGNAL and passed on as soon as the pid is, once (BIN_SENT says the trap has passed it on
+# already). Once it has passed a signal on, the trap ignores further ones (GNU
 # timeout sends its TERM to the runner and again to the runner's group), so the second wait is not
 # cut short and reads the child's status; it ignores none before the child starts, which would start
 # the child with them ignored. A TERM to a child that has already ended is no error, under set -e

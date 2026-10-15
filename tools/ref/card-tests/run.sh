@@ -1166,6 +1166,44 @@ run "gate.sh: a FIFO it cannot make ends 70" 70 'mkfifo.*File exists' gs PATH="$
 if [ "$(cat "$GS/target")" = keep ] && ! grep -q '^cargo ' "$tmp/out"; then pass '  … before cargo runs, and the linked file stays as it was'
 else fail '  … before cargo runs, and the linked file stays as it was' "cargo ran or the target changed" "$tmp/out"; fi
 
+# A signal just after tee starts, on either side of publishing its pid, ends the runner before
+# cargo starts and leaves no tee waiting to open the FIFO.
+for gs_window in before-pid after-pid; do
+  for gs_signal in TERM:143 HUP:129; do
+    awk -v window="$gs_window" '
+      function stop() { print "  echo startup-signal-$GS_START_SIGNAL"; print "  kill -s \"$GS_START_SIGNAL\" \"$$\"" }
+      $0 == "  tee \"$LOG\" < \"$LOG.out\" &" {
+        print
+        print "  echo \"$!\" > \"$GS_TEE_PID\""
+        if (window == "before-pid") stop()
+        next
+      }
+      $0 == "  TEE_PID=$!" && window == "after-pid" { print; stop(); next }
+      { print }
+    ' "$ROOT/tools/gate.sh" > "$GS/tools/gate.sh"
+    gs_pidfile=$GS/tee-$gs_window-${gs_signal%:*}.pid
+    run "gate.sh: ${gs_signal%:*} just after tee starts ($gs_window)" "${gs_signal#*:}" "^startup-signal-${gs_signal%:*}$" \
+      gs GS_START_SIGNAL="${gs_signal%:*}" GS_TEE_PID="$gs_pidfile"
+    if grep -q '^cargo ' "$tmp/out"; then fail '  cargo never starts after the signal' 'cargo ran' "$tmp/out"
+    else pass '  cargo never starts after the signal'; fi
+    gs_gone=no gs_tee=''
+    if [ -s "$gs_pidfile" ]; then
+      read -r gs_tee < "$gs_pidfile"
+      for ((gs_wait = 0; gs_wait < 50; gs_wait++)); do
+        gs_state=$(ps -o stat= -p "$gs_tee" 2> /dev/null) || gs_state=''
+        case $gs_state in '' | *Z*) gs_gone=yes; break ;; esac
+        sleep 0.1
+      done
+    fi
+    if [ "$gs_gone" = yes ]; then pass '  tee ended without a FIFO writer'
+    else
+      fail '  tee ended without a FIFO writer' 'tee pid missing or still alive' "$tmp/out"
+      [ -z "$gs_tee" ] || kill -TERM "$gs_tee" 2> /dev/null || :
+    fi
+  done
+done
+cp "$ROOT/tools/gate.sh" "$GS/tools/gate.sh"
+
 # card-precheck.sh: lease_card before the build, with the recipe's own card or the environment's.
 pre() {
   local name=$1 want=$2 pat=$3
