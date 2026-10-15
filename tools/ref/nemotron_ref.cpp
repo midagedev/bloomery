@@ -11,6 +11,7 @@
 // first <n> are the prompt. n_gpu_layers is 0. The caller also empties CUDA_VISIBLE_DEVICES.
 
 #include "llama.h"
+#include "ref_io.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -20,7 +21,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -31,33 +31,6 @@ struct Prompt {
     std::string path;
     std::vector<llama_token> ids;
 };
-
-static bool read_ids(Prompt & p) {
-    std::ifstream in(p.path);
-    if (!in) {
-        fprintf(stderr, "nemotron_ref: cannot read %s\n", p.path.c_str());
-        return false;
-    }
-    std::string line;
-    long long lines = 0;
-    while ((int) p.ids.size() < p.n && std::getline(in, line)) {
-        ++lines;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
-            fprintf(stderr, "nemotron_ref: %s:%lld is not a token id: '%s'\n", p.path.c_str(), lines, line.c_str());
-            return false;
-        }
-        p.ids.push_back((llama_token) v);
-    }
-    if ((int) p.ids.size() < p.n) {
-        fprintf(stderr, "nemotron_ref: %s holds %zu ids and the prompt asks for %d\n", p.path.c_str(), p.ids.size(), p.n);
-        return false;
-    }
-    return true;
-}
 
 static bool parse_prompt(const char * spec, Prompt & p) {
     const char * c1 = strchr(spec, ':');
@@ -74,20 +47,6 @@ static bool parse_prompt(const char * spec, Prompt & p) {
     if (end != c2 || errno != 0 || n <= 0 || n > 1000000) return false;
     p.n = (int) n;
     p.path = c2 + 1;
-    return true;
-}
-
-static bool write_raw(const std::string & path, const float * data, size_t count) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        fprintf(stderr, "nemotron_ref: cannot write %s\n", path.c_str());
-        return false;
-    }
-    const bool ok = fwrite(data, sizeof(float), count, f) == count;
-    if (fclose(f) != 0 || !ok) {
-        fprintf(stderr, "nemotron_ref: short write on %s\n", path.c_str());
-        return false;
-    }
     return true;
 }
 
@@ -144,11 +103,11 @@ int main(int argc, char ** argv) {
             }
             prompts.push_back(std::move(p));
         } else if (strcmp(argv[i], "-c") == 0 && more) {
-            n_ctx = atoi(argv[++i]);
+            if (!parse_i32("nemotron_ref", "-c", argv[++i], 0, n_ctx)) return 2;
         } else if (strcmp(argv[i], "-ub") == 0 && more) {
-            n_ubatch = atoi(argv[++i]);
+            if (!parse_i32("nemotron_ref", "-ub", argv[++i], 1, n_ubatch)) return 2;
         } else if (strcmp(argv[i], "-t") == 0 && more) {
-            threads = atoi(argv[++i]);
+            if (!parse_i32("nemotron_ref", "-t", argv[++i], 0, threads)) return 2;
         } else {
             fprintf(stderr, "nemotron_ref: unknown or incomplete argument '%s'\n", argv[i]);
             return 2;
@@ -163,7 +122,7 @@ int main(int argc, char ** argv) {
     }
     int max_n = 0;
     for (Prompt & p : prompts) {
-        if (!read_ids(p)) return 2;
+        if (!read_token_file(p.path, p.n, p.ids)) return 2;
         max_n = std::max(max_n, p.n);
     }
     if (n_ctx == 0) n_ctx = max_n;

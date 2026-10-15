@@ -67,7 +67,8 @@ impl LogitsSet {
     /// Parse `dir/MANIFEST.tsv`. A set without one is `Missing`, naming the
     /// recipe that writes it. A set without its trailer comes back unread,
     /// `complete` false. A row before its column line, of another width, with
-    /// a count that does not parse, or naming a prompt twice, is `Malformed`.
+    /// a count that does not parse, a `# complete` count other than the prompt
+    /// rows, or naming a prompt twice, is `Malformed`.
     pub fn read(dir: &Path, family: &Family) -> Result<LogitsSet, RefError> {
         let path = dir.join("MANIFEST.tsv");
         let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -94,6 +95,7 @@ impl LogitsSet {
         }
         let mut cols: Option<Columns> = None;
         let mut seen = HashSet::new();
+        let mut complete_rows = None;
         for (i, line) in text.lines().enumerate() {
             if line.is_empty() {
                 continue;
@@ -107,7 +109,13 @@ impl LogitsSet {
                 "# prompt columns" => {
                     cols = Some(Columns::new("prompt", f[1..].iter().copied()));
                 }
-                "# complete" => set.complete = true,
+                "# complete" => {
+                    if f.len() != 3 || f[2] != "0" {
+                        return Err(RefError::malformed(&at, "want # complete\t<count>\t0"));
+                    }
+                    complete_rows = Some(crate::columns::parse_field(f[1], "complete count", &at)?);
+                    set.complete = true;
+                }
                 h if h.starts_with('#') => {}
                 "prompt" => {
                     let c = cols.as_ref().ok_or_else(|| {
@@ -129,6 +137,12 @@ impl LogitsSet {
                     ));
                 }
             }
+        }
+        if complete_rows != Some(set.prompts.len()) {
+            return Err(RefError::malformed(
+                path.display(),
+                "completion count differs from prompt rows",
+            ));
         }
         Ok(set)
     }
@@ -212,7 +226,26 @@ impl LogitsSet {
                 format!("nemotron: cannot read {}: {e}", ids.display()),
             )
         })?;
-        let n = text.lines().filter(|l| !l.is_empty()).count();
+        if p.n_ids == 0 || p.n_vocab == 0 {
+            return Err(RefError::malformed(
+                ids.display(),
+                "empty prompt or vocabulary",
+            ));
+        }
+        let mut n = 0usize;
+        for (i, line) in text.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            n += 1;
+            let id: u32 = crate::columns::parse_field(line, "token id", &At(&ids, i + 1))?;
+            if id >= p.n_vocab {
+                return Err(RefError::malformed(
+                    At(&ids, i + 1),
+                    format!("token id {id} outside vocabulary {}", p.n_vocab),
+                ));
+            }
+        }
         if n != p.n_ids as usize {
             return Err(RefError::malformed(
                 ids.display(),

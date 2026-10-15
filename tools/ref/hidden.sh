@@ -4,7 +4,7 @@
 # <file> (the profile's MODEL when absent), by hidden_ref (tools/ref/hidden_ref.cpp), into $BLOOMERY_DATA/<set>/ — the
 # sets the refset families hidden-qwen35 and hidden-qwen35-flash-q8 check and gate-gpu-clef-hidden reads.
 #
-# The binary must be the one built from this tree's hidden_ref.cpp (its .build record's source sha256) against the
+# The binary must be the one built from this tree's hidden_ref.cpp then ref_io.h (its .build record's source sha256) against the
 # profile's LCPP at its current commit, and the ids file must have the profile's sha256: either refused names what
 # differs. Every layer on the card box.sh puts in view (-ngl 99), the context the longest set's P, ubatches of 512
 # (llama.cpp's default). Each set is written to <set>.staging and moved over the old set only when hidden_ref
@@ -26,7 +26,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 twin=0
 if [ "${1:-}" = --cpu-twin ]; then twin=1; shift; fi
 BIN=$BLOOMERY_DATA/bin/hidden_ref
-want_src=$(sha256sum "$HERE/tools/ref/hidden_ref.cpp" | cut -d' ' -f1)
+# cpp then the shared header, the same order build-hidden.sh records.
+want_src=$(cat "$HERE/tools/ref/hidden_ref.cpp" "$HERE/tools/ref/ref_io.h" | sha256sum | cut -d' ' -f1)
 want_commit=$(git -c safe.directory="$LCPP" -C "$LCPP" rev-parse --short=9 HEAD)
 if ! grep -qx "source_sha256 $want_src" "$BIN.build" 2>/dev/null ||
    ! grep -qx "lcpp_commit $want_commit" "$BIN.build" 2>/dev/null; then

@@ -14,13 +14,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
 }
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SRC=$HERE/tools/ref/nemotron_ref.cpp
+IO=$HERE/tools/ref/ref_io.h
 BIN=${NEMOTRON_BIN:-$BLOOMERY_DATA/bin/nemotron_ref}
 REC=$BIN.build
 [ -x "$BIN" ] || { echo "dump-nemotron: no $BIN — run just build-ref-nemotron" >&2; exit 2; }
-want=$(sha256sum "$SRC" | cut -d' ' -f1)
+# cpp then the shared header, the same order build-nemotron-ref.sh records. A header-only edit is a mismatch.
+want=$(cat "$SRC" "$IO" | sha256sum | cut -d' ' -f1)
 got=$(awk '$1 == "source_sha256" { print $2; exit }' "$REC")
 [ "$want" = "$got" ] || {
-  echo "dump-nemotron: $BIN was linked from another nemotron_ref.cpp — run just build-ref-nemotron" >&2
+  echo "dump-nemotron: $BIN was linked from another nemotron_ref.cpp or ref_io.h — run just build-ref-nemotron" >&2
   exit 2
 }
 TOKENIZE=$LCPP/build/bin/llama-tokenize

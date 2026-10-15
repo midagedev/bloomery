@@ -6,8 +6,8 @@
 # The tree is checked, not trusted: no tracked change (a hand edit there would reach the oracle under the
 # commit's name). Its build is the one the depth runners time; this links against it and builds nothing in it.
 # Output: $BLOOMERY_DATA/bin/hidden_ref (HIDDEN_OUT moves it) and hidden_ref.build beside it, naming the sha256 of
-# the hidden_ref.cpp it was built from and the mainline commit; hidden.sh refuses a binary whose record does not
-# match its own tree. The compile writes a temporary name and only a finished link replaces the installed binary.
+# hidden_ref.cpp then ref_io.h and the mainline commit; hidden.sh refuses a binary whose record does not match
+# its own tree. The compile writes a temporary name and only a finished link replaces the installed binary.
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
@@ -16,6 +16,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 OUT=${HIDDEN_OUT:-$BLOOMERY_DATA/bin}
 SRC=$HERE/tools/ref/hidden_ref.cpp
+IO=$HERE/tools/ref/ref_io.h
 git_lcpp() { git -c safe.directory="$LCPP" -C "$LCPP" "$@"; }
 if [ -n "$(git_lcpp status --porcelain --untracked-files=no)" ]; then
   echo "build-hidden: $LCPP has tracked changes; the oracle is the commit's build, not an edited tree" >&2
@@ -26,10 +27,11 @@ LIB=$LCPP/build/bin
 mkdir -p "$OUT"
 TMP=$OUT/hidden_ref.tmp.$$
 trap 'rm -f "$TMP" "$TMP.build"' EXIT
-SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+# cpp then the shared header, the same order hidden.sh hashes.
+SRC_SHA=$(cat "$SRC" "$IO" | sha256sum | cut -d' ' -f1)
 g++ -std=c++17 -O2 -o "$TMP" "$SRC" -I"$LCPP/include" -I"$LCPP/ggml/include" \
   -L"$LIB" -lllama -lggml -lggml-base -Wl,-rpath,"$LIB"
 printf 'source_sha256 %s\nlcpp %s\nlcpp_commit %s\n' "$SRC_SHA" "$(readlink -f "$LCPP")" "$COMMIT" > "$TMP.build"
 mv -f "$TMP" "$OUT/hidden_ref"
 mv -f "$TMP.build" "$OUT/hidden_ref.build"
-echo "built $OUT/hidden_ref from hidden_ref.cpp sha256 ${SRC_SHA:0:12} against $LCPP at $COMMIT"
+echo "built $OUT/hidden_ref from hidden_ref.cpp and ref_io.h sha256 ${SRC_SHA:0:12} against $LCPP at $COMMIT"

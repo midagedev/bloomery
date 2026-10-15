@@ -817,6 +817,10 @@ dump-ref-mimo2 *VARIANT:
 dump-ref-mimo2-cuda:
     BLOOMERY_MODEL=mimo2 ./tools/box.sh 'BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
+# ref_io.h's option parser, token reader and raw writer (tools/ref/ref_io_test.cpp). No card, no llama.cpp.
+test-ref-io:
+    g++ -std=c++17 -Wall -o "${TMPDIR:-/tmp}/ref_io_test" tools/ref/ref_io_test.cpp && "${TMPDIR:-/tmp}/ref_io_test"
+
 # Nemotron 3 Nano 4B last-position logits, mainline on the CPU (ik has no nemotron_h). nemotron_ref
 # links the existing mainline build (tools/ref/build-nemotron-ref.sh; it does not rebuild it) and
 # writes $BLOOMERY_DATA/ref-nemotron-logits (refset family ref-nemotron-logits). CUDA stays hidden.

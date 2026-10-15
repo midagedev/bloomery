@@ -50,7 +50,7 @@ mod tests {
     /// Write one prompt's ids and logits and the manifest. `complete` adds the trailer.
     fn write(dir: &Path, model: &str, build: &str, complete: bool) {
         std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{e}"));
-        std::fs::write(dir.join("p.ids"), "1\n2\n3\n4\n5\n").unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(dir.join("p.ids"), "0\n1\n2\n3\n0\n").unwrap_or_else(|e| panic!("{e}"));
         let logits: Vec<u8> = [0.0f32, 1.5, -0.5, 0.25]
             .into_iter()
             .flat_map(f32::to_le_bytes)
@@ -143,6 +143,84 @@ mod tests {
         match LogitsSet::open(&d, &LOGITS) {
             Err(RefError::Foreign { field, .. }) => assert_eq!(field, "build"),
             other => panic!("another build: {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// A line that is not a token id is malformed, naming the field and the text.
+    #[test]
+    fn a_token_line_that_is_not_an_id_is_malformed() {
+        let d = dir("bad-id");
+        write(&d, &runs(), pin(), true);
+        std::fs::write(d.join("p.ids"), "0\n1\n2\ngarbage\n0\n").unwrap_or_else(|e| panic!("{e}"));
+        match LogitsSet::open(&d, &LOGITS) {
+            Err(RefError::Malformed { what, .. }) => {
+                assert!(
+                    what.contains("token id") && what.contains("garbage"),
+                    "{what}"
+                );
+            }
+            other => panic!("a token line that is not an id: {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// An id at or past `n_vocab` is malformed, naming the id and the vocabulary.
+    #[test]
+    fn a_token_id_outside_the_vocabulary_is_malformed() {
+        let d = dir("oob-id");
+        write(&d, &runs(), pin(), true);
+        std::fs::write(d.join("p.ids"), "0\n1\n2\n3\n4\n").unwrap_or_else(|e| panic!("{e}"));
+        match LogitsSet::open(&d, &LOGITS) {
+            Err(RefError::Malformed { what, .. }) => {
+                assert!(what.contains("outside vocabulary"), "{what}");
+            }
+            other => panic!("a token id outside the vocabulary: {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// The trailer's count is the prompt rows. One row and `# complete 2` is malformed.
+    #[test]
+    fn a_completion_count_that_is_not_the_prompt_rows_is_malformed() {
+        let d = dir("complete-n");
+        write(&d, &runs(), pin(), true);
+        let text =
+            std::fs::read_to_string(d.join("MANIFEST.tsv")).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(
+            d.join("MANIFEST.tsv"),
+            text.replace("# complete\t1\t0\n", "# complete\t2\t0\n"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        match LogitsSet::open(&d, &LOGITS) {
+            Err(RefError::Malformed { what, .. }) => {
+                assert!(what.contains("completion count"), "{what}");
+            }
+            other => panic!("a completion count that is not the prompt rows: {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// A completion count that does not parse is malformed, naming the field.
+    #[test]
+    fn a_completion_count_that_does_not_parse_is_malformed() {
+        let d = dir("complete-bad");
+        write(&d, &runs(), pin(), true);
+        let text =
+            std::fs::read_to_string(d.join("MANIFEST.tsv")).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(
+            d.join("MANIFEST.tsv"),
+            text.replace("# complete\t1\t0\n", "# complete\tgarbage\t0\n"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        match LogitsSet::open(&d, &LOGITS) {
+            Err(RefError::Malformed { what, .. }) => {
+                assert!(
+                    what.contains("complete count") && what.contains("garbage"),
+                    "{what}"
+                );
+            }
+            other => panic!("a completion count that does not parse: {other:?}"),
         }
         std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
     }
