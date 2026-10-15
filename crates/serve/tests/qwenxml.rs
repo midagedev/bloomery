@@ -35,6 +35,7 @@ const TEMPLATE: &str = include_str!("fixtures/qwen38-chat-template.jinja");
 const QWEN36: &str = include_str!("fixtures/qwen36-chat-template.jinja");
 const GLM5: &str = include_str!("fixtures/glm5-chat-template.jinja");
 const QWEN3: &str = include_str!("fixtures/qwen3-chat-template.jinja");
+const NEMOTRON: &str = include_str!("fixtures/nemotron-chat-template.jinja");
 
 /// The template's generation prompt after one user turn, thinking on: the
 /// span is open, the script's first text already reasoning.
@@ -551,12 +552,17 @@ fn hw_qwen_parse_does_not_depend_on_chunking() {
 /// server reads from it ([`ToolFormat::of_chat_template`]). A new seat's
 /// template must join this table: a seat whose markup has no parser refuses
 /// every chat request that carries tools.
-const SEATS: [(&str, &str, ToolFormat); 5] = [
+const SEATS: [(&str, &str, ToolFormat); 6] = [
     ("v41-chat-template.jinja", V41_TEMPLATE, ToolFormat::Dsml),
     ("glm5-chat-template.jinja", GLM5, ToolFormat::GlmXml),
     ("qwen3-chat-template.jinja", QWEN3, ToolFormat::Hermes),
     ("qwen36-chat-template.jinja", QWEN36, ToolFormat::QwenXml),
     ("qwen38-chat-template.jinja", TEMPLATE, ToolFormat::QwenXml),
+    (
+        "nemotron-chat-template.jinja",
+        NEMOTRON,
+        ToolFormat::QwenXml,
+    ),
 ];
 
 /// Each seat's template types to its parser, none to

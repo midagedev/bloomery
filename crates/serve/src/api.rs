@@ -4883,7 +4883,7 @@ mod tests {
 
     /// Which of the fixture chat templates need a tool call's `arguments` as
     /// an object ([`needs_object_arguments`]): the ones that walk it
-    /// (Qwen3.6's and Qwen3.8's `|items`, GLM's `.items()`) do, and the ones
+    /// (Qwen3.6's, Qwen3.8's and Nemotron's `|items`, GLM's `.items()`) do, and the ones
     /// that take a string (Qwen3's `is string` branch, V4.1's `from_json`) do
     /// not, nor does a template that prints no arguments.
     #[test]
@@ -4915,6 +4915,11 @@ mod tests {
                 include_str!("../tests/fixtures/v41-chat-template.jinja"),
                 false,
             ),
+            (
+                "nemotron",
+                include_str!("../tests/fixtures/nemotron-chat-template.jinja"),
+                true,
+            ),
             ("mock", super::testserve::TEMPLATE, false),
         ];
         for (name, source, want) in cases {
@@ -4924,7 +4929,7 @@ mod tests {
 
     /// How each fixture chat template answers `reasoning_effort: "none"`
     /// ([`probe_thinking_off`]), read from its renders: Qwen3's, Qwen3.6's,
-    /// Qwen3.8's and V4.1's generation prompts change with `enable_thinking`
+    /// Qwen3.8's, V4.1's and Nemotron's generation prompts change with `enable_thinking`
     /// ([`ThinkingOff::Switch`]); GLM's always opens `<think>` and changes
     /// only its effort header ([`ThinkingOff::LowEffort`]); the mock's reads
     /// neither ([`ThinkingOff::Neither`]). Only the second prints a line at
@@ -4956,6 +4961,11 @@ mod tests {
             (
                 "v41",
                 include_str!("../tests/fixtures/v41-chat-template.jinja"),
+                ThinkingOff::Switch,
+            ),
+            (
+                "nemotron",
+                include_str!("../tests/fixtures/nemotron-chat-template.jinja"),
                 ThinkingOff::Switch,
             ),
             ("mock", super::testserve::TEMPLATE, ThinkingOff::Neither),
@@ -6909,6 +6919,10 @@ mod tests {
             (
                 "qwen36",
                 include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
+            ),
+            (
+                "nemotron",
+                include_str!("../tests/fixtures/nemotron-chat-template.jinja"),
             ),
         ];
         for (name, template) in fixtures {

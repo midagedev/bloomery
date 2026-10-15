@@ -1,0 +1,9 @@
+Source of nemotron-chat-template.jinja (kept byte-exact; this file records it):
+
+The `tokenizer.chat_template` value of NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf in
+https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF (the file sha256
+be5d9a656a51922f24f1f09a759cebb694e1f5d9728bf0ef9f8c972c5a0b5ef2, the one the nemotron gates load).
+sha256 ab7813c3abdd9cb655905a410728b26c7884eca45ddfab8d9f931553485a7862  nemotron-chat-template.jinja
+
+Its tool-call branch teaches the Qwen3-Coder XML markup (`<tool_call>` around `<function=`
+and `<parameter=`), and an assistant turn with calls opens with an empty `<think></think>`.
