@@ -1704,10 +1704,12 @@ mod gate {
 
     /// Head 128, [`GROUP_5`] query heads a key head, the scalar pass,
     /// against [`exact`]'s head-128 band. Two key heads: a KV index of
-    /// `h / 8` still reads the first plane for the second group.
+    /// `h / 8` still reads the first plane for the second group. 100 keys
+    /// leaves four live keys in the second segment's last tile, so the
+    /// live-key mask is read.
     fn group5(k: &FlashGqaKernels, gpu: &Gpu, scale: f32) -> Result<bool, GateError> {
         const N_KV: usize = 2;
-        const KEYS: usize = 96;
+        const KEYS: usize = 100;
         const CTX: usize = 128;
         let n_head = N_KV * GROUP_5;
         let stream = gpu.stream();
