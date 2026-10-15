@@ -2736,10 +2736,10 @@ unsafe fn merge_sink_body(
     unsafe { *y.get_unchecked_mut(b * HEAD + d) = out };
 }
 
-/// The head-128 scalar segment pass of [`flash_gqa_kernels::gqa_flash_seg`]
-/// and [`flash_gqa_kernels::gqa_flash_seg_g5`]. `G` is the query heads of one
-/// key head. The block stays 256 threads: a group of eight uses every warp,
-/// and a group of five leaves warps `5..8` to stage the key and value tile.
+/// The head-128 scalar segment pass of [`flash_gqa_kernels::gqa_flash_seg_g5`].
+/// `G` is the query heads of one key head. The block stays 256 threads: a
+/// group of five leaves warps `5..8` to stage the key and value tile. The
+/// group-of-eight entry keeps its own body, so this core is the short group.
 ///
 /// SAFETY: the entry's launch contract at `G` query heads per key head, a
 /// block of 256 threads, and the four tiles this block's shared memory as the
@@ -2786,9 +2786,6 @@ unsafe fn seg_scalar_g<const G: usize>(
     let seg = sk / nkv;
     let kh = sk - seg * nkv;
     let tid = thread::threadIdx_x() as usize;
-    // The launch is 256 threads. The inlined body does not see the entry's
-    // launch bound, so the address math is told the same limit here.
-    unsafe { core::hint::assert_unchecked(tid < THREADS) };
     let w = tid / 32;
     let lane = warp::lane_id() as usize;
     let n_head = nkv * G;
@@ -2932,8 +2929,9 @@ mod flash_gqa_kernels {
     /// kh·GROUP + w`, whose partials land at index `(t·n_head + h)·segs +
     /// seg`. `n_keys` is [`live_keys`] of `n_keys_buf[t]`: a refused row's
     /// segments are all neutral. The rows of one segment are neighbouring
-    /// blocks, so they read its key rows while they are in L2. The body is
-    /// `seg_scalar_g` at [`GROUP`].
+    /// blocks, so they read its key rows while they are in L2. The body stays
+    /// in this entry: a group of eight fills the block, and the launch bound
+    /// applies to the thread index here.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -2964,37 +2962,158 @@ mod flash_gqa_kernels {
         segs: u32,
         seg_keys: u32,
         m: u32,
-        part_v: DisjointSlice<f32>,
-        part_ms: DisjointSlice<f32>,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
     ) {
         static mut QS: SharedArray<f32, { GROUP * HEAD }> = SharedArray::UNINIT;
         static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
         static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
         static mut WS: SharedArray<f32, { GROUP * KEY_TILE }> = SharedArray::UNINIT;
 
+        let b = thread::blockIdx_x() as usize;
+        let nkv = n_kv as usize;
+        let n_seg = segs as usize;
+        let rows = m as usize;
+        if b >= rows * nkv * n_seg {
+            return; // block-uniform
+        }
+        let t = b % rows;
+        let sk = b / rows;
+        let seg = sk / nkv;
+        let kh = sk - seg * nkv;
+        let tid = thread::threadIdx_x() as usize;
+        let w = tid / 32;
+        let lane = warp::lane_id() as usize;
+        let n_head = nkv * GROUP;
+        let h = kh * GROUP + w;
+        let idx = (t * n_head + h) * n_seg + seg;
+        let ctx = ctx as usize;
+        // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
+        let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
+        let span = seg_span(limit, n_seg, seg_keys as usize);
+        let lo = seg * span;
+        if lo >= limit {
+            if lane == 0 {
+                // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
+                unsafe {
+                    *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
+                    *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
+                }
+            }
+            return; // block-uniform: lo and limit are the block's
+        }
+        let hi = (lo + span).min(limit);
+
         // SAFETY: each `static mut` above is this block's own shared
-        // allocation, sized for GROUP query heads; the raw form reaches it
-        // without a reference. The body is `seg_scalar_g` at that group.
-        unsafe {
-            seg_scalar_g::<GROUP>(
-                q,
-                kc,
-                vc,
-                n_keys_buf,
-                scale,
-                n_kv,
-                ctx,
-                segs,
-                seg_keys,
-                m,
-                part_v,
-                part_ms,
+        // allocation; the raw form reaches it without a reference. Every
+        // index below is inside its array, and every write is ordered before
+        // its reads by a block barrier (or, for WS, written and read by one
+        // warp between two barriers).
+        let (qs, ks, vs, ws) = unsafe {
+            (
                 SharedArray::as_raw_mut_ptr(&raw mut QS),
                 SharedArray::as_raw_mut_ptr(&raw mut KS),
                 SharedArray::as_raw_mut_ptr(&raw mut VS),
                 SharedArray::as_raw_mut_ptr(&raw mut WS),
             )
         };
+
+        // Row t's group query rows: thread `tid` stages values 4·tid .. +3 of
+        // the group's 1024.
+        let qb = (t * n_head + kh * GROUP) * HEAD;
+        let mut i = 0usize;
+        while i < 4 {
+            // SAFETY: qb + 4·tid + i < (t·n_head + (kh + 1)·GROUP)·HEAD <=
+            // m·n_kv·1024 <= q.len(); the shared index 4·tid + i < GROUP·HEAD.
+            unsafe { *qs.add(4 * tid + i) = *q.get_unchecked(qb + 4 * tid + i) };
+            i += 1;
+        }
+
+        let plane = kh * ctx * HEAD;
+        let k64 = kc.as_ptr() as *const u64;
+        let v64 = vc.as_ptr() as *const u64;
+        let mut mx = f32::NEG_INFINITY;
+        let mut s_sum = 0.0f32;
+        let mut acc = [0.0f32; 4];
+        let mut t0 = lo;
+        while t0 < hi {
+            thread::sync_threads();
+            // Stage the tile: 32 keys × 32 u64 of K and of V, four of each
+            // per thread; a key at or past `hi` stages zeros.
+            let mut i = 0usize;
+            while i < 4 {
+                let e = tid + THREADS * i;
+                let key = e / ROW_QWORDS;
+                let word = e - key * ROW_QWORDS;
+                let (kw, vw) = if t0 + key < hi {
+                    // SAFETY: t0 + key < hi <= ctx, so the row is inside key
+                    // head kh's plane; a row is 128 u16 = 32 u64 and the
+                    // planes start 8-byte aligned (a device allocation), so
+                    // the u64 read is aligned and inside both planes.
+                    unsafe {
+                        let r = (plane + (t0 + key) * HEAD) / 4 + word;
+                        (*k64.add(r), *v64.add(r))
+                    }
+                } else {
+                    (0u64, 0u64)
+                };
+                // SAFETY: key < 32 and word < 32: 2·word + 1 < K_STRIDE and
+                // key·32 + word < KEY_TILE·ROW_QWORDS.
+                unsafe {
+                    *ks.add(key * K_STRIDE + 2 * word) = kw as u32;
+                    *ks.add(key * K_STRIDE + 2 * word + 1) = (kw >> 32) as u32;
+                    *vs.add(key * ROW_QWORDS + word) = vw;
+                }
+                i += 1;
+            }
+            thread::sync_threads();
+
+            // The score of key t0 + lane for head h.
+            let live = t0 + lane < hi;
+            let mut a = [0.0f32; ILP];
+            let mut wd = 0usize;
+            while wd < ROW_WORDS {
+                let mut p = 0usize;
+                while p < ILP {
+                    // SAFETY: lane < 32, wd + p < ROW_WORDS: inside KS; the
+                    // query index w·HEAD + 2(wd + p) + 1 < GROUP·HEAD.
+                    let (kw, q0, q1) = unsafe {
+                        (
+                            *ks.add(lane * K_STRIDE + wd + p),
+                            *qs.add(w * HEAD + 2 * (wd + p)),
+                            *qs.add(w * HEAD + 2 * (wd + p) + 1),
+                        )
+                    };
+                    let k0 = half_bits_to_f32(kw as u16);
+                    let k1 = half_bits_to_f32((kw >> 16) as u16);
+                    a[p] = f32::mul_add(q0, k0, a[p]);
+                    a[p] = f32::mul_add(q1, k1, a[p]);
+                    p += 1;
+                }
+                wd += ILP;
+            }
+            let dot = (a[0] + a[1]) + (a[2] + a[3]);
+            let sc = if live { dot * scale } else { f32::NEG_INFINITY };
+
+            // SAFETY: WS and VS are this block's tiles, VS staged before the
+            // barrier above; w < GROUP and lane < 32.
+            unsafe { fold_tile(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane) };
+            t0 += KEY_TILE;
+        }
+
+        // SAFETY: idx < m·n_kv·GROUP·segs; the four dims 4·lane .. +3 of the
+        // partial row are this lane's alone, and lane 0 writes (m, s).
+        unsafe {
+            let o = idx * HEAD + 4 * lane;
+            *part_v.get_unchecked_mut(o) = acc[0];
+            *part_v.get_unchecked_mut(o + 1) = acc[1];
+            *part_v.get_unchecked_mut(o + 2) = acc[2];
+            *part_v.get_unchecked_mut(o + 3) = acc[3];
+            if lane == 0 {
+                *part_ms.get_unchecked_mut(2 * idx) = mx;
+                *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
+            }
+        }
     }
 
     /// `seg_scalar_g` at [`GROUP_5`]: the same 256-thread segment block as
