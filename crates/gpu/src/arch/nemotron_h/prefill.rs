@@ -487,9 +487,11 @@ impl Body {
 }
 
 impl GpuModel<Body> {
-    /// [`GpuModel::prefill_with`] in passes of [`PASS_ROWS`] ids.
+    /// [`GpuModel::prefill_with`] in passes of the most ids the prompt
+    /// buffers hold: [`PASS_ROWS`], or the context where that is less.
     pub fn prefill(&mut self, ids: &[u32]) -> Result<u32, GpuError> {
-        self.prefill_with(ids, PASS_ROWS)
+        let rows = self.body(WHAT)?.prompt.rows;
+        self.prefill_with(ids, rows)
     }
 
     /// Feed `ids` through the chain in passes of up to `rows` ids (module

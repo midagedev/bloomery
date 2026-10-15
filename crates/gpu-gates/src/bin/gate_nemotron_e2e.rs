@@ -58,6 +58,9 @@
 //!   whole passes): each within `B` of the step path, `B` the step path's own
 //!   max |Δ| against mainline's logits for that prompt, the same argmax past a
 //!   near tie (a step-path margin at most `2B`).
+//! - `prefill_at_a_small_context`: a model loaded at [`SMALL_CTX`] rows, under
+//!   [`PASS_ROWS`], takes `prefill` of [`SMALL_IDS`] ids in passes its prompt
+//!   buffers hold, and its logits are the gate's model's bits on the same ids.
 //!
 //! The own-contract clauses run over a fixed walk of token ids; the mainline
 //! clauses run over the set's prompts, read through `crates/refset`. A set
@@ -105,6 +108,11 @@ mod gate {
     /// The rows of `prefill_edges`' passes: the set's prose255, prose256 and
     /// prose257 fall short of, on and past one pass's end.
     const EDGE_ROWS: usize = 256;
+
+    /// `prefill_at_a_small_context`'s context, under [`PASS_ROWS`], and the
+    /// prompt it reads: the first [`SMALL_IDS`] ids of prose255.
+    const SMALL_CTX: usize = 256;
+    const SMALL_IDS: usize = 200;
 
     /// The cosine the last-position logits keep against mainline's.
     const COSINE_FLOOR: f64 = 0.999;
@@ -169,6 +177,7 @@ mod gate {
             prefill_then_step_is_mainlines,
         ),
         ("prefill_edges", prefill_edges),
+        ("prefill_at_a_small_context", prefill_at_a_small_context),
         ("fault_word_clean", fault_word_clean),
     ];
 
@@ -725,6 +734,48 @@ mod gate {
         Ok(ok)
     }
 
+    /// A model loaded at [`SMALL_CTX`] (prompt buffers of that many rows)
+    /// takes `prefill` of [`SMALL_IDS`] ids in one pass, and its logits are the
+    /// gate's model's bits on the same ids: the same pass, cut by the context.
+    fn prefill_at_a_small_context(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "prefill_at_a_small_context";
+        let Some(p) = case.set.prompts.iter().find(|p| p.name == "prose255") else {
+            println!("{CLAUSE}: the set holds no prompt prose255 FAIL");
+            return Ok(false);
+        };
+        let ids = case.set.ids(p)?;
+        let ids = &ids[..SMALL_IDS.min(ids.len())];
+        let Some((want_id, want)) = prefill_on(CLAUSE, m, "the gate's model", (ids, PASS_ROWS))?
+        else {
+            return Ok(false);
+        };
+        let file = open_split(Arch::NemotronH, "gate-gpu-nemotron-e2e")?;
+        let mut small = Model::open(Gpu::new()?, file, SMALL_CTX)?;
+        let got = match small.prefill(ids) {
+            Ok(id) => Some((id, small.logits()?)),
+            Err(GpuError::Fault { fault, .. }) => {
+                println!("{CLAUSE}: the small model raised the fault word: {fault} FAIL");
+                None
+            }
+            Err(e) => {
+                println!("{CLAUSE}: the small model's prefill: {e} FAIL");
+                None
+            }
+        };
+        let Some((got_id, got)) = got else {
+            return Ok(false);
+        };
+        let pass = got_id == want_id && bits_equal(&got, &want);
+        println!(
+            "{CLAUSE}: prose255's first {} ids at ctx {SMALL_CTX}: argmax {got_id} (the gate's \
+             model's {want_id}), logits bit-identical {} {}",
+            ids.len(),
+            bits_equal(&got, &want),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     // --------------------------------------------------- fault_word_clean
 
     fn fault_word_clean(m: &mut Model, _case: &Case) -> Result<bool, GateError> {
@@ -794,7 +845,7 @@ mod gate {
              mainline's and its logits keep the cosine floor and the top-{TOP_K} ids on every \
              prompt of the set; the prompt path keeps mainline's argmax and cosine floor, also on \
              the step after a pass, and stays within the step path's own band across pass edges \
-             of {EDGE_ROWS} rows; the fault word stays clean"
+             of {EDGE_ROWS} rows and at a context under one pass; the fault word stays clean"
         );
         Ok(())
     }
