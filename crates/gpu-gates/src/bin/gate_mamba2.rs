@@ -27,8 +27,10 @@
 //!    heads are refused by name by `mamba2::check` (the host's text; enqueue
 //!    calls it before a launch). A conv of 3 taps is a shape the host
 //!    accepts and enqueue still refuses. A short buffer and a non-finite
-//!    norm epsilon are refused by name at enqueue. Nothing launched (the
-//!    output keeps its poison, the fault word stays clean).
+//!    norm epsilon are refused by name at enqueue, and so are a pass of 0
+//!    tokens, its `xbc` window past the row stride, rows shorter than `U`
+//!    strides and a `y` shorter than `U` rows. Nothing launched (the
+//!    outputs keep their poison, the fault word stays clean).
 //! 4. fault: a NaN in `x`, in `B`, an infinity in `z`, a non-finite `dt` and
 //!    a non-finite `A` each raise `Mamba2Scan` at the launch's layer and
 //!    leave the norm group they sit in entirely non-finite, never a
@@ -37,7 +39,19 @@
 //! 5. replay: the capture is one node. Replayed over three tokens whose
 //!    inputs and position word are rewritten between replays, it equals the
 //!    eager run bit for bit (`y` of every token, the ring, the state).
-//! 6. shape: the entry compiles with no local depot.
+//! 6. steps_are_steps: the prompt pass (`enqueue_steps`, three entries) over
+//!    `U` rows of an in-projection output (the `z`, `xbc`, `dt` columns at
+//!    the Nemotron offsets) against `U` `enqueue_step` launches from the
+//!    same ring, state and position: every `y` row, the final state and the
+//!    whole ring bit for bit. `U` in {1, 2, 3, 4, 5, 37, 256} from a ring
+//!    and state that steps warmed, with the gain and without; `U` = 5 from
+//!    the sequence start; a norm tie: inputs built so a group's mean square
+//!    is an f32 rounding tie that only the step's chunk order resolves the
+//!    step's way (the f64 sums absorb every other order difference, so a
+//!    random input cannot tell the order); and a captured pass (three
+//!    nodes) replayed against the eager pass. The pass's refusals (`u` 0, a
+//!    column window past `ld`, short rows, a short `y`) are clause 3's.
+//! 7. shape: the entries compile with no local depot.
 //!
 //! The band of clause 2. Write `u = 2^-24` and `ε = 2u = 2^-23`, one ulp at
 //! most. Both sides are the same f32 program on inputs that differ only in
@@ -85,7 +99,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::linear::RING_ROWS;
-    use bloomery_gpu::mamba2::{Mamba2Kernels, Mamba2Scratch, STATE};
+    use bloomery_gpu::mamba2::{Mamba2Kernels, Mamba2Scratch, STATE, StepsArgs};
     use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError};
     use bloomery_gpu_gates::rounding::U;
     use bloomery_gpu_gates::{GateError, bits_equal, no_local_depot, verdict};
@@ -119,6 +133,15 @@ mod gate {
     const GARBAGE: f32 = 7.0;
     /// What the output holds before a launch.
     const POISON: u32 = 0x7fa5_a5a5;
+    /// A pass's row: the Nemotron in-projection's `z`, `xbc` and `dt`
+    /// columns, in that order, and its stride.
+    const Z0: usize = 0;
+    const X0: usize = INNER;
+    const DT0: usize = INNER + CONV_DIM;
+    const LD: usize = DT0 + HEADS;
+    /// The pass lengths of clause 6, and the steps that warm its start.
+    const STEPS_US: [usize; 7] = [1, 2, 3, 4, 5, 37, 256];
+    const WARM: usize = 5;
 
     /// One ulp at most, relative: 2^-23 (module doc).
     const EPS_F: f64 = 2.0 * U;
@@ -398,13 +421,60 @@ mod gate {
             )
         }
 
+        /// The pass of `pass.u` rows on `stream`, from the position word,
+        /// into `y`.
+        fn steps(
+            &mut self,
+            cx: &Ctx,
+            stream: &CudaStream,
+            pass: Pass<'_>,
+            y: &mut DeviceBuffer<f32>,
+            norm: bool,
+        ) -> Result<(), GpuError> {
+            cx.k.enqueue_steps(
+                stream,
+                StepsArgs {
+                    shape: pass.shape,
+                    u: pass.u,
+                    rows: pass.rows,
+                    ld: pass.ld,
+                    z0: Z0,
+                    x0: pass.x0,
+                    dt0: DT0,
+                    dt_bias: &self.dt_bias,
+                    a: &self.a,
+                    d: &self.d,
+                    conv_w: &self.conv_w,
+                    conv_b: &self.conv_b,
+                    norm: norm.then_some(&self.norm),
+                    eps: EPS,
+                    pos: &self.pos,
+                    pos_at: 0,
+                    fault: cx.gpu.layer_sink(LAYER)?,
+                    y,
+                    ring: &mut self.ring,
+                    state: &mut self.state,
+                },
+            )
+        }
+
         fn read_y(&self, cx: &Ctx) -> Result<Vec<f32>, GateError> {
             Ok(self.y.to_host_vec(cx.gpu.stream())?)
         }
     }
 
-    /// The card's run of `toks` from `init` at positions `P0 ..`: each
-    /// token's `y`, the final ring and scan state.
+    /// A pass's input rows and their layout.
+    #[derive(Clone, Copy)]
+    struct Pass<'b> {
+        shape: Checked,
+        u: usize,
+        ld: usize,
+        x0: usize,
+        rows: &'b DeviceBuffer<f32>,
+    }
+
+    /// The card's run of `toks` step by step from `ring` and `scan` at
+    /// positions `p0 ..`: each token's `y`, the final ring and scan state.
     struct DevRun {
         y: Vec<Vec<f32>>,
         ring: Vec<f32>,
@@ -415,12 +485,12 @@ mod gate {
         cx: &Ctx,
         dev: &mut Dev,
         ring: &[f32],
-        init: &Init,
+        scan: &[f32],
         toks: &[TokenIn],
         p0: u32,
         norm: bool,
     ) -> Result<DevRun, GateError> {
-        dev.load(cx, ring, &init.scan)?;
+        dev.load(cx, ring, scan)?;
         let shape = device_shape()?;
         let mut ys = Vec::new();
         for (t, tok) in toks.iter().enumerate() {
@@ -475,7 +545,7 @@ mod gate {
         let ring0 = ring_of(&st, p0, start);
         let want = host_run(&w, &st, &toks, norm)?;
         let mut dev = Dev::new(cx, &w)?;
-        let got = dev_run(cx, &mut dev, &ring0, &st, &toks, p0, norm)?;
+        let got = dev_run(cx, &mut dev, &ring0, &st.scan, &toks, p0, norm)?;
         let mut ok = true;
         let mut ys = Vec::new();
         for (t, (a, b)) in got.y.iter().zip(&want.y).enumerate() {
@@ -702,7 +772,7 @@ mod gate {
         referee &= bits_equal(&trace[TOKENS - 1].s_after, &want.scan);
         let (y_bands, s_band) = bands(&w, &trace);
         let mut dev = Dev::new(cx, &w)?;
-        let got = dev_run(cx, &mut dev, &ring0, &st, &toks, P0, true)?;
+        let got = dev_run(cx, &mut dev, &ring0, &st.scan, &toks, P0, true)?;
         let mut ok = referee;
         let mut y_bad = 0;
         let mut y_worst = 0.0f64;
@@ -802,11 +872,42 @@ mod gate {
         };
         named.push(format!("eps inf={}", verdict(eps_inf)));
         ok &= eps_inf;
+        // The pass's own refusals: (label, u, x0, y rows, the text).
+        let st = cx.gpu.stream();
+        let rows = DeviceBuffer::from_host(st, &vec![0.0f32; 2 * LD])?;
+        let mut ys = [
+            DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); INNER])?,
+            DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); 3 * INNER])?,
+        ];
+        let pass_cases = [
+            ("pass u 0", 0, X0, 1, "u 0 is refused"),
+            ("pass xbc window", 2, LD - CONV_DIM + 1, 1, "the xbc window"),
+            ("pass rows short", 3, X0, 1, "rows.len()"),
+            ("pass y short", 2, X0, 0, "y.len()"),
+        ];
+        for (label, u, x0, yi, want) in pass_cases {
+            let pass = Pass {
+                shape: device_shape()?,
+                u,
+                ld: LD,
+                x0,
+                rows: &rows,
+            };
+            let e = dev.steps(cx, st, pass, &mut ys[yi], true).err();
+            let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
+            let pass = matches!(e, Some(GpuError::Shape { .. })) && text.contains(want);
+            named.push(format!("{label}={}", verdict(pass)));
+            ok &= pass;
+        }
+        let mut untouched = true;
+        for y in &ys {
+            untouched &= y.to_host_vec(st)?.iter().all(|v| v.to_bits() == POISON);
+        }
         let y = dev.read_y(cx)?;
-        let untouched = y.iter().all(|v| v.to_bits() == POISON);
+        untouched &= y.iter().all(|v| v.to_bits() == POISON);
         ok &= untouched && clean(cx, "refuse")?;
         println!(
-            "refuse: {}; nothing launched (output keeps its poison) {untouched} {}",
+            "refuse: {}; nothing launched (the outputs keep their poison) {untouched} {}",
             named.join(" "),
             verdict(ok)
         );
@@ -829,7 +930,7 @@ mod gate {
         let ring0 = ring_of(&st, P0, false);
         let mut dev = Dev::new(cx, &w)?;
         let run = |dev: &mut Dev, t: &TokenIn| {
-            dev_run(cx, dev, &ring0, &st, std::slice::from_ref(t), P0, true)
+            dev_run(cx, dev, &ring0, &st.scan, std::slice::from_ref(t), P0, true)
         };
         let base = run(&mut dev, &tok)?;
         let mut ok = clean(cx, "fault base")?;
@@ -894,7 +995,7 @@ mod gate {
         let toks: Vec<TokenIn> = (0..3).map(|_| token(Regime::Band, &mut r)).collect();
         let ring0 = ring_of(&st, P0, false);
         let mut dev = Dev::new(cx, &w)?;
-        let eager = dev_run(cx, &mut dev, &ring0, &st, &toks, P0, true)?;
+        let eager = dev_run(cx, &mut dev, &ring0, &st.scan, &toks, P0, true)?;
 
         dev.load(cx, &ring0, &st.scan)?;
         let shape = device_shape()?;
@@ -932,6 +1033,347 @@ mod gate {
         Ok(pass)
     }
 
+    // ---------------------------------------------------------------- clause 6
+
+    /// The pass's input rows of `toks`: each token's `z`, `xbc` and `dt` at
+    /// their columns of a row of `LD`.
+    fn rows_of(toks: &[TokenIn]) -> Vec<f32> {
+        let mut rows = vec![0.0; toks.len() * LD];
+        for (row, tok) in rows.chunks_mut(LD).zip(toks) {
+            row[Z0..Z0 + INNER].copy_from_slice(&tok.z);
+            row[X0..X0 + CONV_DIM].copy_from_slice(&tok.xbc);
+            row[DT0..DT0 + HEADS].copy_from_slice(&tok.dt);
+        }
+        rows
+    }
+
+    /// The card's pass of `toks` from `ring` and `scan` at position `p`,
+    /// eager or captured and replayed once: each token's `y` row, the final
+    /// ring and state, and the captured graph's node count.
+    fn pass_run(
+        cx: &Ctx,
+        dev: &mut Dev,
+        start: (&[f32], &[f32], u32),
+        toks: &[TokenIn],
+        norm: bool,
+        capture: bool,
+    ) -> Result<(DevRun, Option<usize>), GateError> {
+        let (ring, scan, p) = start;
+        let st = cx.gpu.stream();
+        dev.load(cx, ring, scan)?;
+        dev.pos.copy_from_host(st, &[p])?;
+        let rows = DeviceBuffer::from_host(st, &rows_of(toks))?;
+        let mut y = DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); toks.len() * INNER])?;
+        let pass = Pass {
+            shape: device_shape()?,
+            u: toks.len(),
+            ld: LD,
+            x0: X0,
+            rows: &rows,
+        };
+        // The graph lives until the reads below are done.
+        let graph = if capture {
+            let (dev, y) = (&mut *dev, &mut y);
+            let g = cx.gpu.capture(|s| dev.steps(cx, s, pass, y, norm))?;
+            g.launch(st)?;
+            Some(g)
+        } else {
+            dev.steps(cx, st, pass, &mut y, norm)?;
+            None
+        };
+        let run = DevRun {
+            y: y.to_host_vec(st)?
+                .chunks(INNER)
+                .map(<[f32]>::to_vec)
+                .collect(),
+            ring: dev.ring.to_host_vec(st)?,
+            scan: dev.state.to_host_vec(st)?,
+        };
+        Ok((run, graph.map(|g| g.node_count())))
+    }
+
+    /// `got` against `want` bit for bit: the rows that differ (and the
+    /// first value), the state and ring values that differ.
+    fn same_run(label: &str, got: &DevRun, want: &DevRun) -> bool {
+        let mut rows_same = 0;
+        let mut shown = false;
+        for (t, (a, b)) in got.y.iter().zip(&want.y).enumerate() {
+            let (n, first) = diff(a, b);
+            if n == 0 {
+                rows_same += 1;
+            } else if !shown {
+                shown = true;
+                println!("steps {label}: row {t} first difference {first:?} ({n} values)");
+            }
+        }
+        let (ns, s_first) = diff(&got.scan, &want.scan);
+        let (nr, r_first) = diff(&got.ring, &want.ring);
+        if ns != 0 {
+            println!("steps {label}: state first difference {s_first:?}");
+        }
+        if nr != 0 {
+            println!("steps {label}: ring first difference {r_first:?}");
+        }
+        let ok = rows_same == want.y.len() && got.y.len() == want.y.len() && ns == 0 && nr == 0;
+        println!(
+            "steps {label}: y rows bit-identical {rows_same}/{}, state differing {ns}, ring \
+             differing {nr}",
+            want.y.len()
+        );
+        ok
+    }
+
+    /// The pass against as many steps from the same start (module doc,
+    /// clause 6).
+    fn steps_case(
+        cx: &Ctx,
+        label: &str,
+        dev: &mut Dev,
+        start: (&[f32], &[f32], u32),
+        toks: &[TokenIn],
+        norm: bool,
+    ) -> Result<bool, GateError> {
+        let (ring, scan, p) = start;
+        let want = dev_run(cx, dev, ring, scan, toks, p, norm)?;
+        let (got, _) = pass_run(cx, dev, start, toks, norm, false)?;
+        let ok = same_run(label, &got, &want) & clean(cx, label)?;
+        println!("steps {label}: {}", verdict(ok));
+        Ok(ok)
+    }
+
+    /// `u` tokens from a ring and state that `WARM` steps left at `P0 +
+    /// WARM`.
+    fn steps_warm(cx: &Ctx, u: usize, norm: bool, seed: u64) -> Result<bool, GateError> {
+        let w = weights(Regime::Band, seed);
+        let mut r = Rng(seed ^ 0x9e37_79b9);
+        let st = init(&mut r, false);
+        let warm: Vec<TokenIn> = (0..WARM).map(|_| token(Regime::Band, &mut r)).collect();
+        let toks: Vec<TokenIn> = (0..u).map(|_| token(Regime::Band, &mut r)).collect();
+        let mut dev = Dev::new(cx, &w)?;
+        let warmed = dev_run(
+            cx,
+            &mut dev,
+            &ring_of(&st, P0, false),
+            &st.scan,
+            &warm,
+            P0,
+            norm,
+        )?;
+        let p = P0 + WARM as u32;
+        let label = format!("u={u} norm={norm} p={p}");
+        steps_case(
+            cx,
+            &label,
+            &mut dev,
+            (&warmed.ring, &warmed.scan, p),
+            &toks,
+            norm,
+        )
+    }
+
+    /// Five tokens from position 0 over a ring of garbage.
+    fn steps_start(cx: &Ctx) -> Result<bool, GateError> {
+        let seed = 0x05e9_5701;
+        let w = weights(Regime::Band, seed);
+        let mut r = Rng(seed ^ 0x9e37_79b9);
+        let st = init(&mut r, true);
+        let toks: Vec<TokenIn> = (0..5).map(|_| token(Regime::Band, &mut r)).collect();
+        let mut dev = Dev::new(cx, &w)?;
+        let ring0 = ring_of(&st, 0, true);
+        steps_case(
+            cx,
+            "sequence start u=5 p=0",
+            &mut dev,
+            (&ring0, &st.scan, 0),
+            &toks,
+            true,
+        )
+    }
+
+    /// The role of head `h` in the norm tie: its head within its group.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        /// `y` = 2^12·z: the four squares of 15·2^36.
+        Big,
+        /// `y` = z: the squares of 15·(2j + 1)·2^12, the tie's offset.
+        Offset,
+        /// `y` = 31·2^-14 on every channel: chunk sums under half an f64
+        /// ulp of the group's total, which the step's order absorbs one by
+        /// one and the reverse order adds up first.
+        Small,
+    }
+
+    fn role(h: usize) -> Role {
+        match h % PER {
+            0 => Role::Big,
+            1 => Role::Offset,
+            _ => Role::Small,
+        }
+    }
+
+    /// The step's norm of one group of host values `y`: the chunk sums in
+    /// the step's order or reversed, the mean and the scale.
+    fn norm_scale(y: &[f32], reverse: bool) -> (f32, f32) {
+        let chunks: Vec<f64> = y
+            .chunks(16)
+            .map(|c| c.iter().fold(0.0f64, |a, &v| a + f64::from(v * v)))
+            .collect();
+        let mut total = 0.0f64;
+        if reverse {
+            chunks.iter().rev().for_each(|c| total += c);
+        } else {
+            chunks.iter().for_each(|c| total += c);
+        }
+        let mean = (total / y.len() as f64) as f32;
+        (mean, 1.0 / (mean + EPS).sqrt())
+    }
+
+    /// The host's silu, bit for bit the card's (clause 1 holds it).
+    fn silu(v: f32) -> f32 {
+        let mut out = [0.0f32];
+        qdot::swiglu(&[v], &[1.0], &mut out);
+        out[0]
+    }
+
+    /// The norm tie (module doc, clause 6). The conv passes `x` through
+    /// (taps 0, 0, 0, 1, no bias; `x` = 32 so SiLU is the identity) and
+    /// makes `B` and `C` zero, so `y = silu(z)·fl(32·D)` whatever the scan
+    /// holds. Per group, the mean square is `L + h` with `L = 2^30 + 128j`
+    /// (even `j`, the first whose scale differs from `L + 128`'s) and `h`
+    /// half its f32 ulp: the step's chunk order sums to exactly `960·(L +
+    /// h)` (the Small chunks absorbed), which narrows to `L`; any order that
+    /// adds the Small chunks first lands above the tie, at `L + 128`.
+    fn steps_tie(cx: &Ctx) -> Result<bool, GateError> {
+        let seed = 0x05e9_7e01;
+        let scale_of = |m: f32| 1.0 / (m + EPS).sqrt();
+        let j = (0u32..1 << 16)
+            .step_by(2)
+            .find(|&j| {
+                let l = (1u32 << 30) as f32 + 128.0 * j as f32;
+                scale_of(l).to_bits() != scale_of(l + 128.0).to_bits()
+            })
+            .ok_or_else(|| "norm tie: no even j whose two scales differ".to_owned())?;
+        // 15·(2j + 1) as a sum of squares, greedily.
+        let mut offset = Vec::new();
+        let mut rest = 15 * (2 * u64::from(j) + 1);
+        while rest > 0 {
+            let k = rest.isqrt();
+            offset.push(k);
+            rest -= k * k;
+        }
+        let z_head = |role: Role| -> Vec<f32> {
+            let mut z = vec![0.0f32; HEAD_DIM];
+            match role {
+                Role::Big => z[..4].copy_from_slice(&[192.0, 128.0, 64.0, 64.0]),
+                Role::Offset => {
+                    for (zi, &k) in z.iter_mut().zip(&offset) {
+                        *zi = 64.0 * k as f32;
+                    }
+                }
+                Role::Small => z.iter_mut().for_each(|v| *v = 31.0),
+            }
+            // A channel left at z = 0 carries y = 0.
+            z
+        };
+        let z: Vec<f32> = (0..HEADS).flat_map(|h| z_head(role(h))).collect();
+        let d: Vec<f32> = (0..HEADS)
+            .map(|h| match role(h) {
+                Role::Big => 128.0,
+                Role::Offset => 1.0 / 32.0,
+                Role::Small => 1.0 / 524_288.0,
+            })
+            .collect();
+        let mut conv_w = vec![0.0f32; 4 * CONV_DIM];
+        for c in 0..INNER {
+            conv_w[4 * c + 3] = 1.0;
+        }
+        let mut r = Rng(seed ^ 0x9e37_79b9);
+        let w = Weights {
+            dt_bias: (0..HEADS).map(|_| r.uni(22.0, 26.0)).collect(),
+            a: (0..HEADS)
+                .map(|h| if h % 2 == 0 { 0.0 } else { -8.0 })
+                .collect(),
+            d,
+            conv_w,
+            conv_b: vec![0.0; CONV_DIM],
+            norm: (0..INNER).map(|_| r.uni(0.5, 1.5)).collect(),
+        };
+        let toks: Vec<TokenIn> = (0..5)
+            .map(|_| {
+                let mut xbc: Vec<f32> = (0..CONV_DIM).map(|_| r.uni(-2.0, 2.0)).collect();
+                xbc[..INNER].iter_mut().for_each(|v| *v = 32.0);
+                TokenIn {
+                    xbc,
+                    dt: (0..HEADS).map(|_| r.uni(-1.0, 1.0)).collect(),
+                    z: z.clone(),
+                }
+            })
+            .collect();
+        // The design on the host: y of group 0, its two orders' means.
+        let x = silu(32.0);
+        let y0: Vec<f32> = (0..WIDTH)
+            .map(|i| silu(z[i]) * (x * w.d[i / HEAD_DIM]))
+            .collect();
+        let (m_step, s_step) = norm_scale(&y0, false);
+        let (m_rev, s_rev) = norm_scale(&y0, true);
+        let design = s_step.to_bits() != s_rev.to_bits();
+        println!(
+            "steps norm tie: j={j}, offset squares {offset:?}; the step's order mean {m_step} \
+             scale {s_step:e}, the reverse mean {m_rev} scale {s_rev:e}; the orders' scales \
+             differ {design}"
+        );
+        let st = init(&mut r, false);
+        let mut dev = Dev::new(cx, &w)?;
+        let ring0 = ring_of(&st, P0, false);
+        let ok = steps_case(
+            cx,
+            "norm tie u=5",
+            &mut dev,
+            (&ring0, &st.scan, P0),
+            &toks,
+            true,
+        )?;
+        Ok(ok && design)
+    }
+
+    /// The pass captured (three nodes with the gain) and replayed once
+    /// equals the eager pass bit for bit.
+    fn steps_capture(cx: &Ctx) -> Result<bool, GateError> {
+        let seed = 0x05e9_ca01;
+        let w = weights(Regime::Band, seed);
+        let mut r = Rng(seed ^ 0x9e37_79b9);
+        let st = init(&mut r, false);
+        let toks: Vec<TokenIn> = (0..37).map(|_| token(Regime::Band, &mut r)).collect();
+        let mut dev = Dev::new(cx, &w)?;
+        let ring0 = ring_of(&st, P0, false);
+        let start = (&ring0[..], &st.scan[..], P0);
+        let (eager, _) = pass_run(cx, &mut dev, start, &toks, true, false)?;
+        let (replay, nodes) = pass_run(cx, &mut dev, start, &toks, true, true)?;
+        let same = same_run("captured u=37", &replay, &eager);
+        let ok = nodes == Some(3) && same && clean(cx, "steps captured")?;
+        println!(
+            "steps captured u=37: nodes={} replay bit-identical to eager {same} {}",
+            nodes.unwrap_or(0),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    fn check_steps(cx: &Ctx) -> Result<bool, GateError> {
+        let mut ok = true;
+        for norm in [true, false] {
+            for (i, &u) in STEPS_US.iter().enumerate() {
+                let seed = 0x05e9_0001 + i as u64 + if norm { 0x100 } else { 0 };
+                ok &= steps_warm(cx, u, norm, seed)?;
+            }
+        }
+        ok &= steps_start(cx)?;
+        ok &= steps_tie(cx)?;
+        ok &= steps_capture(cx)?;
+        println!("steps_are_steps: {}", verdict(ok));
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         let k = Mamba2Kernels::load(gpu.context())?;
@@ -945,7 +1387,13 @@ mod gate {
         ok &= check_refuse(&cx)?;
         ok &= check_fault(&cx)?;
         ok &= check_replay(&cx)?;
-        ok &= no_local_depot(&["mamba2_step"])?;
+        ok &= check_steps(&cx)?;
+        ok &= no_local_depot(&[
+            "mamba2_step",
+            "mamba2_steps",
+            "mamba2_ring_tail",
+            "mamba2_norm_rows",
+        ])?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -958,7 +1406,9 @@ mod gate {
              a NaN in x or B, an infinity in z, a non-finite dt and a non-finite A raise \
              mamba2_scan and leave their norm group non-finite and the other groups the clean \
              bits; a captured graph is one node and replays three tokens bit for bit as eager; \
-             no local depot"
+             the prompt pass over 1 to 256 rows equals as many steps bit for bit (every y row, \
+             the state, the ring; with and without the gain, from the sequence start, on a norm \
+             tie, captured); no local depot"
         );
         Ok(())
     }
