@@ -42,8 +42,8 @@ fn kq_row_bytes(ty: GgmlType, k: usize) -> Option<usize> {
 /// `qh`, the f16 scale), plus two bytes per odd-block row because the scale
 /// reader loads whole words; a Q5_1 row is eight code words plus the block's scale
 /// and min per 32 values — the `q_stride` window padding past the last block
-/// is allocated but never addressed. The q8_0 planes are addressed whole, so
-/// theirs are the card format's own bytes.
+/// is allocated but never addressed. The q8_0 and nvfp4 planes are addressed
+/// whole, so theirs are the card format's own bytes.
 #[must_use]
 pub fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
     let k = w.k();
@@ -55,6 +55,7 @@ pub fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
             resident_size(GgmlType::Q8_0, k, rows)?
         }
         DevWeight::F32 { .. } => rows * k * 4,
+        DevWeight::Nvfp4 { .. } => resident_size(GgmlType::NVFP4, k, rows)?,
     })
 }
 
@@ -81,21 +82,21 @@ pub(crate) fn act_write_bytes(a: &Q8Act, cols: usize) -> usize {
 
 /// Bytes `cols` activation columns cost the gemv of `w`: Q3_K loads the u64
 /// code plane and the block scales, Q4_K the 32-bit codes, the group sums
-/// and the scales, Q6_K its own code plane and the scales. `None` for a
-/// weight that is not a K-quant.
+/// and the scales, Q6_K its own code plane and the scales, NVFP4 the 32-bit
+/// codes and the scales. `None` for any other weight.
 pub(crate) fn gemv_act_bytes(w: &DevWeight, a: &Q8Act, cols: usize) -> Option<usize> {
     let (q3, q4, q6, s8, d8) = act_planes(a.k());
-    let DevWeight::KQuant { ty, .. } = w else {
-        return None;
-    };
-    Some(
-        cols * match ty {
+    let per_col = match w {
+        DevWeight::KQuant { ty, .. } => match ty {
             GgmlType::Q3_K => q3 + d8,
             GgmlType::Q4_K => q4 + s8 + d8,
             GgmlType::Q6_K => q6 + d8,
             _ => return None,
         },
-    )
+        DevWeight::Nvfp4 { .. } => q4 + d8,
+        _ => return None,
+    };
+    Some(cols * per_col)
 }
 
 /// Bytes of `cols` columns of the 32-value q8 blocks the q5 gemvs read and

@@ -259,18 +259,6 @@ fn stack_buffers(s: &MxStack) -> Vec<u64> {
     s.buffer_bytes().into_iter().map(|b| b as u64).collect()
 }
 
-fn format_label(f: CardFormat) -> &'static str {
-    match f {
-        CardFormat::KQuant => "kquant",
-        CardFormat::Q5_0 => "q5_0",
-        CardFormat::Q5_1 => "q5_1",
-        CardFormat::Q8_0Planes => "q8_0_planes",
-        CardFormat::F32 => "f32",
-        CardFormat::Bf16AsF32 => "bf16_as_f32",
-        CardFormat::Bf16Raw => "bf16_raw",
-    }
-}
-
 /// A tensor the load expected and does not hold.
 fn missing(name: String, need: &'static str) -> GpuError {
     GpuError::Tensor {
@@ -357,7 +345,7 @@ impl Uploads {
                     .get(&t.name)
                     .ok_or_else(|| missing(t.name.clone(), "resident"))?;
                 let b = dw.buffer_bytes().into_iter().map(|b| b as u64).collect();
-                (format_label(f), b)
+                (f.label(), b)
             }
             None if t.ty == GgmlType::MXFP4 => {
                 let l = t.block.ok_or_else(|| missing(t.name.clone(), "a block"))?;
@@ -397,7 +385,7 @@ impl Uploads {
                     .get(&b.name)
                     .ok_or_else(|| missing(b.name.clone(), "resident"))?;
                 let v = dw.buffer_bytes().into_iter().map(|b| b as u64).collect();
-                (format_label(f), v)
+                (f.label(), v)
             }
             (Borrow::RowSource, Some(f)) => {
                 let n_embd = usize::try_from(b.dims[0]).map_err(|_| GpuError::Shape {

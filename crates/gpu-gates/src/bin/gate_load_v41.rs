@@ -633,7 +633,7 @@ mod gate {
                     .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
                     .collect(),
             ),
-            CardFormat::Q5_0 | CardFormat::Q5_1 | CardFormat::Bf16Raw => {
+            CardFormat::Q5_0 | CardFormat::Q5_1 | CardFormat::Bf16Raw | CardFormat::Nvfp4Planes => {
                 return Err(format!("no host packing of {format:?} here: V4.1 has none").into());
             }
         })
@@ -651,6 +651,9 @@ mod gate {
             DevWeight::F32 { w, .. } => Planes::F32(w.buf().to_host_vec(stream)?),
             DevWeight::Q8_0Derived { .. } => {
                 return Err("a derived weight under a file tensor's name".into());
+            }
+            DevWeight::Nvfp4 { .. } => {
+                return Err("an nvfp4 weight: V4.1 has none".into());
             }
         })
     }

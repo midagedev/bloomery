@@ -15,12 +15,12 @@
 //!   column and the F32 tile past it (`f32_tile_gemm`, token-major, bit for
 //!   bit `f32_gemv` on every row and column). A K-quant site's gemv is
 //!   [`kgemv`]. A Q5_0 site's is [`blocks32_gemv`].
-//! - [`kgemv`], a K-quant site at most eight columns over the q8_1 rows:
-//!   Q3_K, Q4_K and Q6_K their gemvs, row-major (`m` outputs a row; a Q6_K
-//!   row of an odd super-block count the down `_sel` over one expert, one
-//!   column); Q5_K
+//! - [`kgemv`], a site at most eight columns over the q8_1 rows: Q3_K, Q4_K
+//!   and Q6_K their gemvs, row-major (`m` outputs a row; a Q6_K row of an odd
+//!   super-block count the down `_sel` over one expert, one column); Q5_K
 //!   the K-quant down `_sel` over a stack of one expert, token-major (a slot
-//!   a column). [`SiteTy::kgemv_order`] is this family's layout and is
+//!   a column); NVFP4 `nvfp4_gemv` over its planes times the tensor's scale,
+//!   token-major. [`SiteTy::kgemv_order`] is this family's layout and is
 //!   `None` for Q5_0. Where a body copies a row-major output token-major,
 //!   and its fused groups of Q4_K launches, stay the body's.
 //! - [`blocks32_gemv`], a Q5_0 site at most eight columns over the
@@ -34,7 +34,8 @@
 //!   (`gemm_q5_0p`, on the unit's one-expert table only), F32 the F32 tile
 //!   over the f32 rows (one column a slot, on the unit's one-expert table
 //!   only). A site's weight is the resident tensor of its name, or — a
-//!   K-quant's — the words a caller holds ([`SiteWeight`]).
+//!   K-quant's — the words a caller holds ([`SiteWeight`]). NVFP4 has no
+//!   wide GEMM and is refused here by name.
 //! - [`gated`], a wide gate·up·down block over one table: the gate and up
 //!   [`gemm`]s, the gate·up rule's SwiGLU written into the form the down's
 //!   type reads (the down's activation), and the down [`gemm`] over those
@@ -48,6 +49,7 @@ use crate::gemm::{
     GemmRoute, GemmWeight,
 };
 use crate::kquant::{Act, KquantKernels, SelDown};
+use crate::mxfp4::Nvfp4Kernels;
 use crate::q5::Q8Blocks32;
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
@@ -72,6 +74,9 @@ pub enum SiteTy {
     Q5_0,
     Q8_0,
     F32,
+    /// NVFP4 in its two planes and the tensor's scale (`DevWeight::Nvfp4`),
+    /// launched by [`kgemv`]; no wide GEMM.
+    Nvfp4,
 }
 
 /// The activation form a site's launch reads: the kernel table's fact.
@@ -96,6 +101,7 @@ impl SiteTy {
         SiteTy::Q5_0,
         SiteTy::Q8_0,
         SiteTy::F32,
+        SiteTy::Nvfp4,
     ];
 
     /// The family of a file tensor of type `ty`; `None` for a type no launch
@@ -110,6 +116,7 @@ impl SiteTy {
             GgmlType::Q5_0 => Some(SiteTy::Q5_0),
             GgmlType::Q8_0 => Some(SiteTy::Q8_0),
             GgmlType::F32 => Some(SiteTy::F32),
+            GgmlType::NVFP4 => Some(SiteTy::Nvfp4),
             _ => None,
         }
     }
@@ -121,7 +128,8 @@ impl SiteTy {
     }
 
     /// The grouped GEMM's type of a K-quant; `None` for Q5_0, Q8_0 and F32,
-    /// whose wide GEMM is the 32-value family's ([`gemm`]).
+    /// whose wide GEMM is the 32-value family's ([`gemm`]), and NVFP4, which
+    /// has none.
     #[must_use]
     pub fn gemm_weight(self) -> Option<GemmWeight> {
         match self {
@@ -129,19 +137,19 @@ impl SiteTy {
             SiteTy::Q4K => Some(GemmWeight::Q4K),
             SiteTy::Q5K => Some(GemmWeight::Q5K),
             SiteTy::Q6K => Some(GemmWeight::Q6K),
-            SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 => None,
+            SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Nvfp4 => None,
         }
     }
 
-    /// How [`kgemv`] lays a K-quant site's columns out: Q3_K, Q4_K and Q6_K
-    /// row-major, Q5_K token-major. `None` for a type [`kgemv`] does not run:
+    /// How [`kgemv`] lays a site's columns out: Q3_K, Q4_K and Q6_K
+    /// row-major, Q5_K and NVFP4 token-major. `None` for a type [`kgemv`] does not run:
     /// Q8_0 and F32 ([`gemv`]), and Q5_0 ([`blocks32_gemv`], whose row-major
     /// layout `y[r · m + c]` is that function's own).
     #[must_use]
     pub fn kgemv_order(self) -> Option<Order> {
         match self {
             SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q6K => Some(Order::RowMajor),
-            SiteTy::Q5K => Some(Order::TokenMajor),
+            SiteTy::Q5K | SiteTy::Nvfp4 => Some(Order::TokenMajor),
             SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 => None,
         }
     }
@@ -157,6 +165,7 @@ impl SiteTy {
             SiteTy::Q5_0 => SiteEntry::Q5_0,
             SiteTy::Q8_0 => SiteEntry::Q8_0,
             SiteTy::F32 => SiteEntry::F32,
+            SiteTy::Nvfp4 => SiteEntry::Nvfp4,
         })
         .reads()
     }
@@ -172,6 +181,7 @@ impl fmt::Display for SiteTy {
             SiteTy::Q5_0 => "Q5_0",
             SiteTy::Q8_0 => "Q8_0",
             SiteTy::F32 => "F32",
+            SiteTy::Nvfp4 => "NVFP4",
         })
     }
 }
@@ -232,6 +242,7 @@ pub fn site(
         Some(DevWeight::Q8_0 { d, k: wk, .. }) => Some((SiteTy::Q8_0, d.rows(), *wk)),
         Some(DevWeight::Q5_0 { w: p, k: wk }) => Some((SiteTy::Q5_0, p.rows(), *wk)),
         Some(DevWeight::F32 { w: p, k: wk }) => Some((SiteTy::F32, p.rows(), *wk)),
+        Some(DevWeight::Nvfp4 { qs, k: wk, .. }) => Some((SiteTy::Nvfp4, qs.rows(), *wk)),
         Some(_) => None,
     };
     match got {
@@ -312,10 +323,12 @@ pub fn gemv(
                 .enqueue_f32_gemv(stream, w.f32_tensor(WHAT, name)?, x, 1, y)
         }
         SiteTy::F32 => g32.enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, x, m, y),
-        SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => Err(GpuError::shape(
-            WHAT,
-            format!("{name} is {ty}: a K-quant site's gemv is `site::kgemv`, on the q8_1 rows"),
-        )),
+        SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Nvfp4 => {
+            Err(GpuError::shape(
+                WHAT,
+                format!("{name} is {ty}: its gemv is `site::kgemv`, on the q8_1 rows"),
+            ))
+        }
         SiteTy::Q5_0 => Err(GpuError::shape(
             WHAT,
             format!("{name} is {ty}: its gemv is `site::blocks32_gemv`, on the Q8Blocks32 rows"),
@@ -326,14 +339,15 @@ pub fn gemv(
 /// The most columns a [`Q8Act`] holds, so the most a [`kgemv`] runs.
 const KGEMV_COLS: usize = 8;
 
-/// The kernels a K-quant site's [`kgemv`] launches beyond the `Gpu`'s own:
-/// the K-quant `_sel` family, whose Q5_K down entry over a stack of one
-/// expert is the Q5_K gemv, the Q6_K `_sel` entry, which a Q6_K row of an odd
-/// super-block count runs the same way, and that one expert's id for each of
-/// [`KGEMV_COLS`] slots.
+/// The kernels a site's [`kgemv`] launches beyond the `Gpu`'s own: the
+/// K-quant `_sel` family, whose Q5_K down entry over a stack of one expert is
+/// the Q5_K gemv, the Q6_K `_sel` entry, which a Q6_K row of an odd
+/// super-block count runs the same way, NVFP4's gemv, and that one expert's
+/// id for each of [`KGEMV_COLS`] slots.
 pub struct KGemvKernels {
     kq: KquantKernels,
     q6: Q6kSelKernels,
+    nv: Nvfp4Kernels,
     one: DeviceBuffer<u32>,
 }
 
@@ -350,17 +364,18 @@ impl KGemvKernels {
         Ok(KGemvKernels {
             kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
             q6: Q6kSelKernels::load(gpu.context(), gpu.fault_word())?,
+            nv: Nvfp4Kernels::load(gpu.context())?,
             one: DeviceBuffer::zeroed(gpu.stream(), KGEMV_COLS)?,
         })
     }
 }
 
-/// `y = W · act` for K-quant site `name` of type `ty` over the `act.m()`
-/// columns of the q8_1 rows `act`, laid out as [`SiteTy::kgemv_order`]
-/// says: Q4_K, Q6_K and Q3_K their gemvs, row-major; Q5_K the down `_sel`
-/// over the site as one expert, token-major, an id past it raising on
-/// `fault`. Q8_0 and F32 are [`gemv`]; Q5_0 is [`blocks32_gemv`]. Each is
-/// refused here by name.
+/// `y = W · act` for site `name` of type `ty` over the `act.m()` columns of
+/// the q8_1 rows `act`, laid out as [`SiteTy::kgemv_order`] says: Q4_K, Q6_K
+/// and Q3_K their gemvs, row-major; Q5_K the down `_sel` over the site as
+/// one expert, token-major, an id past it raising on `fault`; NVFP4 its gemv
+/// times the tensor's scale, token-major. Q8_0 and F32 are [`gemv`]; Q5_0 is
+/// [`blocks32_gemv`]. Each is refused here by name.
 pub fn kgemv(
     gpu: &Gpu,
     kk: &KGemvKernels,
@@ -408,6 +423,9 @@ pub fn kgemv(
                 y,
             )
         }
+        SiteTy::Nvfp4 => kk
+            .nv
+            .enqueue_gemv(gpu.stream(), w.nvfp4(WHAT, name)?, act, y),
         SiteTy::Q8_0 | SiteTy::F32 => Err(GpuError::shape(
             WHAT,
             format!("{name} is {ty}: its gemv is `site::gemv`, on the f32 rows"),
@@ -714,6 +732,7 @@ pub fn gemm(
         }
     };
     match ty {
+        SiteTy::Nvfp4 => Err(no_wide_gemm(WHAT, name, ty)),
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => k.gemm.enqueue_gemm(
             stream,
             GemmArgs {
@@ -790,6 +809,15 @@ pub fn gemm(
     }
 }
 
+/// A site of type `ty` on the wide arm, which has no GEMM for it, refused by
+/// name as `what`'s.
+fn no_wide_gemm(what: &'static str, name: &str, ty: SiteTy) -> GpuError {
+    GpuError::shape(
+        what,
+        format!("{name} is {ty}: it has a gemv (`site::kgemv`) and no wide GEMM"),
+    )
+}
+
 /// One gated block over a table: the three sites, their shapes, the gate·up
 /// rule between them. The gate and up read the input rows through `input`;
 /// the down reads the SwiGLU rows, slot `s` its own column `s`
@@ -822,6 +850,9 @@ impl<'a> Gated<'a> {
     fn check(&self) -> Result<(), GpuError> {
         for (ty, src) in [self.gate, self.up, self.down] {
             src.check("site::gated", ty)?;
+            if ty == SiteTy::Nvfp4 {
+                return Err(no_wide_gemm("site::gated", src.name(), ty));
+            }
         }
         swiglu_launch((self.down.0, self.down.1.name()), self.rule).map(|_| ())
     }
@@ -1047,6 +1078,7 @@ mod tests {
             SiteTy::Q5_0,
             SiteTy::Q8_0,
             SiteTy::F32,
+            SiteTy::Nvfp4,
         ];
         for (name, k, want) in [
             ("q8", 64, SiteTy::Q8_0),
@@ -1137,5 +1169,17 @@ mod tests {
         assert!(!SiteTy::Q5_0.kquant());
         assert_eq!(SiteTy::Q5_0.gemm_weight(), None);
         assert_eq!(SiteTy::Q5_0.to_string(), "Q5_0");
+    }
+
+    /// NVFP4 is a `kgemv` site: the q8_1 rows of 128 values, token-major, no
+    /// K-quant GEMM type; the file type maps to it and back to its table row.
+    #[test]
+    fn an_nvfp4_site_reads_q8_1_and_is_a_token_major_kgemv() {
+        assert_eq!(SiteTy::of_ggml(GgmlType::NVFP4), Some(SiteTy::Nvfp4));
+        assert!(SiteTy::ALL.contains(&SiteTy::Nvfp4));
+        assert_eq!(SiteTy::Nvfp4.reads(), Form::Q8x128);
+        assert_eq!(SiteTy::Nvfp4.kgemv_order(), Some(super::Order::TokenMajor));
+        assert!(!SiteTy::Nvfp4.kquant());
+        assert_eq!(SiteTy::Nvfp4.to_string(), "NVFP4");
     }
 }

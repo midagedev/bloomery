@@ -937,6 +937,19 @@ fn dequant_bf16(src: &[u8], dst: &mut [f32]) {
 /// codes 0-7 are 0, 0.5, 1, 1.5, 2, 3, 4, 6 times two, 8-15 the same negated.
 pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
+/// The two doubled E2M1 values of one FP4 code byte: the low nibble's
+/// [`KVALUES_MXFP4`] entry, then the high nibble's. The one host decode of a
+/// code byte, which MXFP4 and NVFP4 share (they differ only in their scales
+/// and in which values a byte's two nibbles are).
+#[inline]
+#[must_use]
+pub fn fp4_pair(byte: u8) -> [i8; 2] {
+    [
+        KVALUES_MXFP4[usize::from(byte & 0x0f)],
+        KVALUES_MXFP4[usize::from(byte >> 4)],
+    ]
+}
+
 /// The block scale of an MXFP4 block, `ggml_e8m0_to_fp32_half` (ggml-impl.h:40-45):
 /// `x >= 2 ? (x - 1) << 23 : {0x00200000, 0x00400000}[x]` as f32 bits, which is
 /// 2^(E-128) for every E — the E8M0 scale 2^(E-127) halved, the half that the
@@ -969,8 +982,9 @@ fn dequant_mxfp4(src: &[u8], dst: &mut [f32]) {
         let d = e8m0_to_f32_half(blk[0]);
         let (lo, hi) = out.split_at_mut(16);
         for (j, &q) in blk[1..].iter().enumerate() {
-            lo[j] = d * f32::from(KVALUES_MXFP4[usize::from(q & 0x0f)]);
-            hi[j] = d * f32::from(KVALUES_MXFP4[usize::from(q >> 4)]);
+            let [l, h] = fp4_pair(q);
+            lo[j] = d * f32::from(l);
+            hi[j] = d * f32::from(h);
         }
     }
 }
@@ -1045,8 +1059,9 @@ fn dequant_nvfp4(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
             })?;
             let (lo, hi) = out.split_at_mut(8);
             for (j, &q) in qs.iter().enumerate() {
-                lo[j] = d * f32::from(KVALUES_MXFP4[usize::from(q & 0x0f)]);
-                hi[j] = d * f32::from(KVALUES_MXFP4[usize::from(q >> 4)]);
+                let [l, h] = fp4_pair(q);
+                lo[j] = d * f32::from(l);
+                hi[j] = d * f32::from(h);
             }
         }
     }

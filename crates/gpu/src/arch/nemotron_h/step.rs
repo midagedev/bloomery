@@ -128,7 +128,7 @@ impl Acts {
                 SiteTy::Q5_0 if !acts.blocks32.iter().any(|a| a.k() == s.k) => {
                     acts.blocks32.push(Q8Blocks32::new(stream, s.k, 1)?);
                 }
-                SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K
+                SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Nvfp4
                     if !acts.q8_1.iter().any(|a| a.k() == s.k) =>
                 {
                     acts.q8_1.push(Q8Act::with_k(stream, 1, s.k)?);
@@ -298,7 +298,7 @@ impl Site {
                     .enqueue_quantize_q8(gpu.stream(), x, act, gpu.layer_sink(layer)?)?;
                 site::blocks32_gemv(gpu, key, act, y)
             }
-            SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => {
+            SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Nvfp4 => {
                 let act = acts
                     .q8_1
                     .iter_mut()

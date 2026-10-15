@@ -320,6 +320,7 @@ pub(super) const fn site_ty(entry: SiteEntry) -> SiteTy {
         SiteEntry::Q5_0 => SiteTy::Q5_0,
         SiteEntry::Q8_0 => SiteTy::Q8_0,
         SiteEntry::F32 => SiteTy::F32,
+        SiteEntry::Nvfp4 => SiteTy::Nvfp4,
     }
 }
 
@@ -335,6 +336,7 @@ pub(super) const fn ggml_ty(site: SiteTy) -> GgmlType {
         SiteTy::Q5_0 => GgmlType::Q5_0,
         SiteTy::Q8_0 => GgmlType::Q8_0,
         SiteTy::F32 => GgmlType::F32,
+        SiteTy::Nvfp4 => GgmlType::NVFP4,
     }
 }
 

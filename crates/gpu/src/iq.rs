@@ -92,12 +92,10 @@
 //! the integer sum with a truncating `/ 2`; this rule keeps `2s + 1` whole and
 //! moves the division into the exact f32 scale, so no term is dropped.
 
-use crate::GpuError;
 use crate::flash::half_bits_to_f32;
-use crate::launch_u32;
+use crate::{GpuError, cores, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::dotprod::dp4a_s32;
-use cuda_device::prmt::prmt;
 use cuda_device::vector::{U32x2, U32x4, as_vectors};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
@@ -123,19 +121,9 @@ pub(crate) const GRID3: &[u32; 256] = &IQ3XXS_GRID;
 /// The IQ3_S grid, likewise: 512 entries, a 9-bit index.
 pub(crate) const GRID3S: &[u32; 512] = &IQ3S_GRID;
 
-/// `KVALUES_IQ4NL` bytes `4i .. 4i + 4` as a little-endian word: the four
-/// `prmt` table words.
-const fn kv_word(i: usize) -> u32 {
-    let k = KVALUES_IQ4NL;
-    (k[4 * i] as u8 as u32)
-        | ((k[4 * i + 1] as u8 as u32) << 8)
-        | ((k[4 * i + 2] as u8 as u32) << 16)
-        | ((k[4 * i + 3] as u8 as u32) << 24)
-}
-const KV0: u32 = kv_word(0);
-const KV1: u32 = kv_word(1);
-const KV2: u32 = kv_word(2);
-const KV3: u32 = kv_word(3);
+/// `KVALUES_IQ4NL` as the shared nibble decode's table words
+/// ([`cores::table16`]).
+const IQ4NL: [u32; 4] = cores::table16(&KVALUES_IQ4NL);
 
 /// The six formats this module takes. [`IqFormat::Iq3S`] has the host rule
 /// only ([`IqFormat::plane_words`]).
@@ -406,18 +394,11 @@ pub(crate) fn iq3s_group(c: u32, qh: u32, m: u32, sb: u32) -> (u32, u32) {
 
 /// The eight IQ4_XS codes of one word decoded to int8 values: the low
 /// nibbles of its four bytes and the high nibbles, each as four bytes in byte
-/// order — `mxfp4`'s register table read by `prmt`, over `kvalues_iq4nl`.
+/// order — the shared nibble decode ([`cores::table16_word`]) over
+/// `kvalues_iq4nl`.
 #[inline(always)]
 pub(crate) fn iq4_word(qs: u32) -> (u32, u32) {
-    let sel = qs & 0x7777_7777;
-    let pick = 0x3210_3210 | ((qs & 0x8888_8888) >> 1);
-    let a = prmt(prmt(KV0, KV1, sel), prmt(KV2, KV3, sel), pick);
-    let b = prmt(
-        prmt(KV0, KV1, sel >> 16),
-        prmt(KV2, KV3, sel >> 16),
-        pick >> 16,
-    );
-    (prmt(a, b, 0x6420), prmt(a, b, 0x7531))
+    cores::table16_word(qs, IQ4NL)
 }
 
 /// `Σ dp4a(w[i], x[i])` over words `0 .. 4` and `4 .. 8`, each from 0. The

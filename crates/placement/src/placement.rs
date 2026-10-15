@@ -411,6 +411,11 @@ pub enum CardFormat {
     /// q8_0 in two planes: per 32-value block 8 code words and the block's
     /// f16 scale bits as the file stores them.
     Q8_0Planes,
+    /// nvfp4 in two planes (`crates/gpu/src/mxfp4.rs`, `repack`): a row's
+    /// code bytes as `k / 8` words, then its UE4M3 scale bytes four to a
+    /// word, `k / 64` words — the file's 36 bytes a 64-value block, moved.
+    /// The tensor's f32 `.scale` is its own F32 row.
+    Nvfp4Planes,
     /// f32: the file's values.
     F32,
     /// Decoded to f32 at load (`dequant_row`): bf16 by its type, and a
@@ -440,11 +445,11 @@ impl CardFormat {
             GgmlType::Q5_0 => Some(CardFormat::Q5_0),
             GgmlType::Q5_1 => Some(CardFormat::Q5_1),
             GgmlType::Q8_0 => Some(CardFormat::Q8_0Planes),
+            GgmlType::NVFP4 => Some(CardFormat::Nvfp4Planes),
             GgmlType::F32 => Some(CardFormat::F32),
             GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
             GgmlType::F16
             | GgmlType::MXFP4
-            | GgmlType::NVFP4
             | GgmlType::Q2_K
             | GgmlType::IQ2_XXS
             | GgmlType::IQ2_XS
@@ -506,6 +511,12 @@ impl CardFormat {
                     rows.checked_mul(blocks.checked_mul(2)?)?,
                 ]
             }
+            CardFormat::Nvfp4Planes => {
+                vec![
+                    rows.checked_mul(blocks.checked_mul(32)?)?,
+                    rows.checked_mul(blocks.checked_mul(4)?)?,
+                ]
+            }
             CardFormat::F32 | CardFormat::Bf16AsF32 => vec![rows.checked_mul(k.checked_mul(4)?)?],
             CardFormat::Bf16Raw => {
                 // Whole words per row: a row never shares a word with the next.
@@ -530,13 +541,14 @@ impl CardFormat {
 
     /// The format an expert stack of type `ty` loads in on a card under the
     /// default expert rule ([`plan_with`]): [`CardFormat::of`] less q5_K,
-    /// which this rule does not admit. A card expert kernel does read q5_K
+    /// which this rule does not admit, and less nvfp4, which no card expert
+    /// kernel reads (its planes are a dense site's). A card expert kernel does read q5_K
     /// (`kq_gate_up_act_q5k`, `q5k_gemv_sel`), and the program that runs
     /// them names q5_K in its own [`RoutedFormat`] (glm5next's
     /// `card_routed`). A stack of a type with none stays on the host.
     #[must_use]
     pub fn of_routed(ty: GgmlType) -> Option<CardFormat> {
-        CardFormat::of(ty).filter(|_| ty != GgmlType::Q5_K)
+        CardFormat::of(ty).filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::NVFP4))
     }
 
     /// A file tensor of type `ty` can be laid out in this format: the
@@ -563,6 +575,21 @@ impl CardFormat {
                         | GgmlType::IQ4_NL
                         | GgmlType::MXFP4
                 ))
+    }
+
+    /// The format's name in a plan's rows and a loader's table.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            CardFormat::KQuant => "kquant",
+            CardFormat::Q5_0 => "q5_0",
+            CardFormat::Q5_1 => "q5_1",
+            CardFormat::Q8_0Planes => "q8_0_planes",
+            CardFormat::Nvfp4Planes => "nvfp4_planes",
+            CardFormat::F32 => "f32",
+            CardFormat::Bf16AsF32 => "bf16_as_f32",
+            CardFormat::Bf16Raw => "bf16_raw",
+        }
     }
 
     /// Device bytes of `rows` rows of `k` values of file type `ty` in this
@@ -694,13 +721,7 @@ const _: () = {
 impl fmt::Display for Format {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Format::Card(CardFormat::KQuant) => "kquant",
-            Format::Card(CardFormat::Q5_0) => "q5_0",
-            Format::Card(CardFormat::Q5_1) => "q5_1",
-            Format::Card(CardFormat::Q8_0Planes) => "q8_0_planes",
-            Format::Card(CardFormat::F32) => "f32",
-            Format::Card(CardFormat::Bf16AsF32) => "bf16_as_f32",
-            Format::Card(CardFormat::Bf16Raw) => "bf16_raw",
+            Format::Card(c) => c.label(),
             Format::HostFile => "host_file",
             Format::NvmeFile => "nvme_file",
             Format::Unused => "unused",

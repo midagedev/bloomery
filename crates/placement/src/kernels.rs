@@ -215,6 +215,10 @@ pub enum SiteEntry {
     Q8_0,
     /// `Gemm32Kernels::enqueue_f32_tile` over the f32 rows, narrow and wide.
     F32,
+    /// `Nvfp4Kernels::enqueue_gemv` (`nvfp4_gemv`, `crates/gpu/src/mxfp4.rs`)
+    /// over the NVFP4 planes and the q8_1 rows, times the tensor's scale,
+    /// through `site::kgemv`. No wide GEMM.
+    Nvfp4,
 }
 
 /// The activation a dense site's launch reads; `crates/gpu/src/site.rs`
@@ -245,6 +249,7 @@ impl SiteEntry {
             SiteEntry::Q8_0 => SiteAct::Q8x32,
             SiteEntry::F32 => SiteAct::F32,
             SiteEntry::Q5_0 => SiteAct::Q8Blocks32,
+            SiteEntry::Nvfp4 => SiteAct::Q8x128,
         }
     }
 }
@@ -409,6 +414,7 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         GgmlType::Q8_0 => Some(SiteEntry::Q8_0),
         GgmlType::Q5_0 => Some(SiteEntry::Q5_0),
         GgmlType::F32 => Some(SiteEntry::F32),
+        GgmlType::NVFP4 => Some(SiteEntry::Nvfp4),
         GgmlType::F16
         | GgmlType::Q5_1
         | GgmlType::Q2_K
@@ -431,7 +437,6 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
-        | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -768,6 +773,8 @@ mod tests {
         );
     }
 
+    // PIN(2026-10-16): the dense pairs gain NVFP4 (`nvfp4_gemv` through
+    // `site::kgemv`); every other pair is unchanged.
     #[test]
     fn dense_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -780,6 +787,7 @@ mod tests {
                 (GgmlType::Q4_K, SiteEntry::Q4k),
                 (GgmlType::Q5_K, SiteEntry::Q5k),
                 (GgmlType::Q6_K, SiteEntry::Q6k),
+                (GgmlType::NVFP4, SiteEntry::Nvfp4),
             ]
         );
     }

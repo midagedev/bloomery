@@ -9,6 +9,7 @@
 //! `model::placement::CardFormat`'s. The gates (`gate_p10`, `gate_load_v41`)
 //! pin the uploads against independent host packings bit for bit.
 
+use crate::mxfp4::{Nvfp4, Nvfp4Weight, Planes, repack};
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::tensor::{DeviceTensor, window};
@@ -102,6 +103,17 @@ pub enum DevWeight {
     /// row-major with `k = dims[0]` (the contiguous axis the gemv kernels dot
     /// along). 1-D norm vectors are rows = 1.
     F32 { w: DeviceTensor<f32>, k: usize },
+    /// NVFP4 file tensor in the two planes of `mxfp4::repack::<Nvfp4>`
+    /// (`CardFormat::Nvfp4Planes`): `qs` rows × k/8 code words, `e` rows ×
+    /// k/64 scale words (a block's four UE4M3 bytes), and the tensor's scale,
+    /// the f32 of its `<stem>.scale` tensor, read from the file at load. `k`
+    /// is a multiple of 64.
+    Nvfp4 {
+        qs: DeviceTensor<u32>,
+        e: DeviceTensor<u32>,
+        k: usize,
+        scale: f32,
+    },
 }
 
 impl DevWeight {
@@ -114,6 +126,7 @@ impl DevWeight {
             }
             DevWeight::Q8_0 { d, .. } | DevWeight::Q8_0Derived { d, .. } => d.rows(),
             DevWeight::F32 { w, .. } => w.rows(),
+            DevWeight::Nvfp4 { qs, .. } => qs.rows(),
         }
     }
 
@@ -126,7 +139,8 @@ impl DevWeight {
             | DevWeight::Q5_1 { k, .. }
             | DevWeight::Q8_0 { k, .. }
             | DevWeight::Q8_0Derived { k, .. }
-            | DevWeight::F32 { k, .. } => *k,
+            | DevWeight::F32 { k, .. }
+            | DevWeight::Nvfp4 { k, .. } => *k,
         }
     }
 
@@ -145,6 +159,7 @@ impl DevWeight {
                 vec![held(qs), held(d)]
             }
             DevWeight::F32 { w, .. } => vec![held(w)],
+            DevWeight::Nvfp4 { qs, e, .. } => vec![held(qs), held(e)],
         }
     }
 
@@ -626,6 +641,19 @@ impl Weights {
         }
     }
 
+    /// The planes and the scale of the resident NVFP4 weight `name`; any
+    /// other variant is refused by name as `what`'s.
+    pub fn nvfp4(&self, what: &'static str, name: &str) -> Result<Nvfp4Weight<'_>, GpuError> {
+        match self.resident(what, name)? {
+            DevWeight::Nvfp4 { qs, e, scale, .. } => Ok(Nvfp4Weight {
+                qs,
+                e,
+                scale: *scale,
+            }),
+            _ => Err(GpuError::tensor(what, name, "an nvfp4 weight")),
+        }
+    }
+
     /// The resident F32 tensor `name` (an f32 file tensor, or a bf16 one
     /// decoded at load); any other variant is refused by name as `what`'s.
     pub fn f32_tensor(
@@ -942,7 +970,11 @@ fn upload_segment(
     let held: u64 = spans.iter().map(|s| s.rows.end - s.rows.start).sum();
     let rows =
         usize::try_from(held).map_err(|_| placed_refusal(t, format!("{held} rows pass usize")))?;
-    let dw = upload_rows(stream, ring, PLACED, format, info, rows, &src)?;
+    let scale = tensor_scale(PLACED, info, |n| {
+        let (s, t) = split.find(n)?;
+        Some((split.shard(s)?, t))
+    })?;
+    let dw = upload_rows(stream, ring, PLACED, format, info, rows, &src, scale)?;
     if u64::try_from(dw.resident_bytes()).ok() != Some(seg.resident_bytes) {
         // The upload's copies may still be running into the buffers this
         // error is about to drop; drain before they do.
@@ -994,6 +1026,7 @@ fn upload_file_tensor_with(
             format!("tensor {} has type {} with no device format", t.name, t.ty),
         ));
     };
+    let scale = tensor_scale("Weights::load", t, |n| Some((gguf, gguf.find(n)?)))?;
     upload_rows(
         stream,
         ring,
@@ -1002,7 +1035,48 @@ fn upload_file_tensor_with(
         t,
         tensor_rows(t),
         &[gguf.data(t)?],
+        scale,
     )
+}
+
+/// The per-tensor scale an NVFP4 tensor's products are multiplied by: the
+/// one f32 of `<stem>.scale` beside `<stem>.weight`, found through `find`
+/// (the file's tensors by name: its shard and entry). `None` for any other
+/// type. A name without the `.weight` suffix, a missing scale, one of another
+/// type or more than one value (a per-expert scale has no layout here), and
+/// a value that is not finite are refused by name as `what`'s.
+fn tensor_scale<'g>(
+    what: &'static str,
+    t: &TensorInfo,
+    find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
+) -> Result<Option<f32>, GpuError> {
+    if t.ty != GgmlType::NVFP4 {
+        return Ok(None);
+    }
+    let refuse = |detail: String| GpuError::shape(what, format!("tensor {}: {detail}", t.name));
+    let stem = t.name.strip_suffix(".weight").ok_or_else(|| {
+        refuse("an nvfp4 tensor's name ends in .weight, its scale's in .scale".into())
+    })?;
+    let name = format!("{stem}.scale");
+    let (g, s) =
+        find(&name).ok_or_else(|| refuse(format!("its scale {name} is not in the file")))?;
+    if s.ty != GgmlType::F32 || s.dims.iter().product::<u64>() != 1 {
+        return Err(refuse(format!(
+            "its scale {name} is {} {:?}; one f32 value is the tensor's scale",
+            s.ty, s.dims
+        )));
+    }
+    let bytes: [u8; 4] = g
+        .data(s)?
+        .try_into()
+        .map_err(|_| refuse(format!("its scale {name} is not 4 bytes")))?;
+    let scale = f32::from_le_bytes(bytes);
+    if !scale.is_finite() {
+        return Err(refuse(format!(
+            "its scale {name} is {scale}, not a finite value"
+        )));
+    }
+    Ok(Some(scale))
 }
 
 /// The bytes `t`'s upload moves, for sizing a load's staging ring: its
@@ -1027,7 +1101,12 @@ fn upload_budget(t: &TensorInfo) -> usize {
 /// its run on the host and stages the packed words. Refuses exactly where
 /// [`CardFormat::resident_bytes`] has no size for the rows, and checks the
 /// upload's device bytes against that size; `what` names the caller in both
-/// errors.
+/// errors. `scale` is an NVFP4 tensor's ([`tensor_scale`]), which its planes
+/// carry.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one upload's stream, ring, caller, format, tensor, rows, bytes and scale (rust-quality R8)"
+)]
 fn upload_rows(
     stream: &CudaStream,
     ring: &mut UploadRing,
@@ -1036,6 +1115,7 @@ fn upload_rows(
     t: &TensorInfo,
     rows: usize,
     src: &[&[u8]],
+    scale: Option<f32>,
 ) -> Result<DevWeight, GpuError> {
     let name = t.name.as_str();
     let all_rows: u64 = t.dims[1..].iter().product();
@@ -1129,6 +1209,21 @@ fn upload_rows(
                 qs: upload_packed(stream, ring, what, name, &qs, rows, k / 4)?,
                 d: upload_packed(stream, ring, what, name, &d, rows, k / 32)?,
                 k,
+            }
+        }
+        CardFormat::Nvfp4Planes => {
+            let scale = scale.ok_or_else(|| {
+                GpuError::shape(
+                    what,
+                    format!("tensor {name}: an nvfp4 upload without its scale"),
+                )
+            })?;
+            let Planes { qs, e } = repack::<Nvfp4>(&flat_of(src, take)?, rows, k)?;
+            DevWeight::Nvfp4 {
+                qs: upload_packed(stream, ring, what, name, &qs, rows, k / 8)?,
+                e: upload_packed(stream, ring, what, name, &e, rows, k / 64)?,
+                k,
+                scale,
             }
         }
         CardFormat::Bf16Raw => {

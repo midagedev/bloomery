@@ -51,7 +51,7 @@
 use crate::hybrid::HOST;
 use crate::kquant::act::{self, swiglu_clamp};
 use crate::kquant::{GateUpAct, SelDown};
-use crate::mxfp4::{self, Planes, lane_partial_file, lane_partials};
+use crate::mxfp4::{self, Mxfp4, Planes, lane_partial_file, lane_partials};
 use crate::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32, q8_1_quant_block};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::{U32x4, as_vectors};
@@ -280,13 +280,13 @@ mod mxfp4_sel_kernels {
         // and n_blk/4 scales at c·d_col (the q, d8 and n_grp bounds); the
         // host passes n_blk a multiple of 4 and scales repacked in range.
         let fg = unsafe {
-            lane_partials::<8>(
+            lane_partials::<8, Mxfp4>(
                 gv, ge, row_abs, n_blk, q, d8, 0, q_col, 0, d_col, mask, lane,
             )
         };
         // SAFETY: the same bounds for the up stack.
         let fu = unsafe {
-            lane_partials::<8>(
+            lane_partials::<8, Mxfp4>(
                 uv, ue, row_abs, n_blk, q, d8, 0, q_col, 0, d_col, mask, lane,
             )
         };
@@ -392,7 +392,7 @@ mod mxfp4_sel_kernels {
                 // q, d8 and n_grp bounds); n_blk a multiple of 4 and scales
                 // in range by the host.
                 let f = unsafe {
-                    lane_partials::<8>(
+                    lane_partials::<8, Mxfp4>(
                         wv,
                         we,
                         id * rpe + d,
@@ -650,7 +650,7 @@ impl MxStack {
             });
         }
         let rows = n_experts * rows_per_expert;
-        let Planes { qs, e } = mxfp4::repack(bytes, rows, k)?;
+        let Planes { qs, e } = mxfp4::repack::<Mxfp4>(bytes, rows, k)?;
         let n_blk = k / mxfp4::BLOCK_VALUES;
         Ok(MxStack {
             qs: DeviceTensor::upload(stream, &qs, rows, mxfp4::QS_WORDS * n_blk)?,

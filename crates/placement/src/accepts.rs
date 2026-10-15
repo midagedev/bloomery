@@ -108,13 +108,18 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
 /// body's arena carries ([`SiteAct::Q8x128`], [`SiteAct::Q8x32`],
 /// [`SiteAct::F32`] — `Form::Q8x128`, `Form::Q8x32`, `Form::F32`). A Q5_0
 /// site reads [`SiteAct::Q8Blocks32`], which the arena does not carry, and
-/// is `None`. The body's load and the coverage census both read this, so a
-/// site the arena cannot feed is refused at load and listed together.
+/// is `None`. An NVFP4 site has a gemv and no wide GEMM, which the body's
+/// prompt units run every dense site through, and is `None`. The body's load
+/// and the coverage census both read this, so a site the arena cannot feed is
+/// refused at load and listed together.
 #[must_use]
 pub const fn qwen3moe_dense(ty: GgmlType) -> Option<SiteEntry> {
     let Some(entry) = kernels::dense(ty) else {
         return None;
     };
+    if let SiteEntry::Nvfp4 = entry {
+        return None;
+    }
     match entry.reads() {
         SiteAct::Q8x128 | SiteAct::Q8x32 | SiteAct::F32 => Some(entry),
         SiteAct::Q8Blocks32 => None,
@@ -347,12 +352,14 @@ mod tests {
     }
 
     /// The qwen3moe body's dense owner is the table row kept to the forms
-    /// its arena carries: `None` for Q5_0 (it reads `Q8Blocks32`), `Some`
-    /// for Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32.
+    /// its arena carries and to a wide GEMM: `None` for Q5_0 (it reads
+    /// `Q8Blocks32`) and NVFP4 (no wide GEMM), `Some` for Q3_K, Q4_K, Q5_K,
+    /// Q6_K, Q8_0 and F32.
     #[test]
     fn the_qwen3moe_body_dense_owner_refuses_q5_0() {
         use crate::kernels::SiteEntry;
         assert_eq!(qwen3moe_dense(GgmlType::Q5_0), None);
+        assert_eq!(qwen3moe_dense(GgmlType::NVFP4), None);
         assert_eq!(qwen3moe_dense(GgmlType::Q3_K), Some(SiteEntry::Q3k));
         assert_eq!(qwen3moe_dense(GgmlType::Q4_K), Some(SiteEntry::Q4k));
         assert_eq!(qwen3moe_dense(GgmlType::Q5_K), Some(SiteEntry::Q5k));

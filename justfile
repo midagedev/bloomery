@@ -267,6 +267,12 @@ gate-gpu-hc-gated:
 gate-gpu-mamba2:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_mamba2 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mamba2'
 
+# NVFP4 dense gemv (bloomery_gpu::mxfp4, Nvfp4Kernels) at Bolt's ssm_in / ssm_out shapes, synthetic tensors loaded through
+# Weights::load_where and run through site::kgemv: every output written, within the derived band of the host dequant
+# times the tensor's scale, bit for bit the host rule; the load's refusals by name. `gate_nvfp4 --bench-kernels` prices it.
+gate-gpu-nvfp4:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvfp4'
+
 # nemotron_h (Nemotron 3 Nano 4B Q4_K_M) end-to-end gate, one card: the captured step's entries against the layer kinds the header derives
 # (the scans, the squared ReLUs, the group-5 flash passes, the appends, the Q5_0 embedding row; no group-8 flash entry, no host node), eager =
 # captured replay bit for bit over 16 tokens, reset rewinds the ids and the logits bits, the scan state carries (layer 0 nonzero, the last

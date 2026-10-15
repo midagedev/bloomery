@@ -72,7 +72,7 @@ mod gate {
     use bloomery_gpu::fault::{Fault, FaultSite, LAYER_NONE};
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::kquant::{Act, GateUpAct, SelDown};
-    use bloomery_gpu::mxfp4::{BLOCK_BYTES, BLOCK_VALUES, lane_partial_host};
+    use bloomery_gpu::mxfp4::{BLOCK_BYTES, BLOCK_VALUES, Mxfp4, lane_partial_host};
     use bloomery_gpu::mxfp4_sel::{
         DownArgs, GateUpArgs, MxAct, MxExpertKernels, MxStack, Mxfp4SelKernels, concat_route,
     };
@@ -259,7 +259,7 @@ mod gate {
     /// butterfly.
     fn dot_host(row: &[u8], q: &(Vec<i8>, Vec<f32>)) -> f32 {
         butterfly(std::array::from_fn(|lane| {
-            lane_partial_host(row, &q.0, &q.1, lane)
+            lane_partial_host::<Mxfp4>(row, &q.0, &q.1, lane)
         }))
     }
 

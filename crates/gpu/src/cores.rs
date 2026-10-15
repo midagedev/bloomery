@@ -13,6 +13,7 @@
 use cuda_device::convert::cvt_f32_f16x2_lo;
 use cuda_device::dotprod::dp4a_s32;
 use cuda_device::float::{add_rn_f32, fma_rn_f32, mul_rn_f32};
+use cuda_device::prmt::prmt;
 use cuda_device::ptx_asm;
 
 // ---- shared ----
@@ -58,6 +59,43 @@ pub(crate) fn half_to_f32(bits: u16) -> f32 {
         ((exp + 112) << 23) | (mant << 13)
     };
     f32::from_bits(sign | mag)
+}
+
+/// A 16-entry int8 code table as the four little-endian words
+/// [`table16_word`] permutes: entries `4i .. 4i + 4` in word `i`.
+pub(crate) const fn table16(k: &[i8; 16]) -> [u32; 4] {
+    const fn word(k: &[i8; 16], i: usize) -> u32 {
+        (k[4 * i] as u8 as u32)
+            | ((k[4 * i + 1] as u8 as u32) << 8)
+            | ((k[4 * i + 2] as u8 as u32) << 16)
+            | ((k[4 * i + 3] as u8 as u32) << 24)
+    }
+    [word(k, 0), word(k, 1), word(k, 2), word(k, 3)]
+}
+
+/// The eight 4-bit codes of one word decoded through a 16-entry table `t`
+/// ([`table16`]) to int8 values: the low nibbles of its four bytes, then the
+/// high nibbles, each as four bytes in byte order. The one decode of a
+/// nibble code word: FP4's E2M1 table (`mxfp4`, MXFP4 and NVFP4) and IQ4's
+/// `kvalues_iq4nl` (`iq`) call it.
+///
+/// A register table read by byte permute: `prmt` in its generic mode indexes
+/// eight bytes of two words with the low three bits of each selector nibble
+/// (bit 3 would ask for sign replication, so it is masked off), once into
+/// the codes `0..8` and once into `8..16`; a third permute picks between the
+/// two by each code's bit 3, and two more gather the low and the high
+/// nibbles. No memory is touched: a shared table would cost a load per code.
+#[inline(always)]
+pub(crate) fn table16_word(qs: u32, t: [u32; 4]) -> (u32, u32) {
+    let sel = qs & 0x7777_7777;
+    let pick = 0x3210_3210 | ((qs & 0x8888_8888) >> 1);
+    let a = prmt(prmt(t[0], t[1], sel), prmt(t[2], t[3], sel), pick);
+    let b = prmt(
+        prmt(t[0], t[1], sel >> 16),
+        prmt(t[2], t[3], sel >> 16),
+        pick >> 16,
+    );
+    (prmt(a, b, 0x6420), prmt(a, b, 0x7531))
 }
 
 /// The u32 at a byte window sitting 2 mod 4, assembled from the two aligned
