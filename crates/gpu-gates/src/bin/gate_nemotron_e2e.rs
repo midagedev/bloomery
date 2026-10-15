@@ -342,7 +342,6 @@ mod gate {
 
     // ------------------------------------------------- the mainline set
 
-
     /// The ids of the `k` largest values, largest first, lower id first on a tie.
     fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
         let mut ids: Vec<usize> = (0..v.len()).collect();

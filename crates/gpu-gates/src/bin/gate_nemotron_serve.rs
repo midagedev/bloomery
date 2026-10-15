@@ -66,7 +66,7 @@ mod gate {
         Answer, Served, agree, chat_is_those_ids, check, greedy, plan_run, rendered, serve_cmd,
         server_log, tokenized,
     };
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
+    use bloomery_gpu_gates::{GateError, checks_failed, generate, ref_model_path};
     use gguf::Split;
     use model::arch::nemotron_h::hparams::Hparams;
     use serde_json::json;
@@ -154,9 +154,9 @@ mod gate {
     /// The file's trained context.
     fn trained_ctx(file: &Path) -> Result<u64, GateError> {
         let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
-        split
-            .arch_get_u64("context_length")
-            .ok_or_else(|| format!("{}: no context_length", file.display()).into())
+        let n = generate::trained_ctx(&split)
+            .ok_or_else(|| format!("{}: no context_length", file.display()))?;
+        Ok(u64::try_from(n)?)
     }
 
     /// `plan_only_names_its_default` (the module header); the context the default named.
