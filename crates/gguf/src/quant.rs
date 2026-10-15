@@ -34,7 +34,7 @@
 //! writes and its decoder folds to 0 or drops bit 7 of, is refused by name
 //! instead of decoded.
 //!
-//! Q2_K, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS are ports of the same-named
+//! Q2_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS are ports of the same-named
 //! functions in that file, whose bodies are identical in mainline ggml. None has a product
 //! that rounds, so the order of their multiplies does not decide the bits:
 //! the scale factors (`d · (0.5 + s) · 0.25`, `d · (0.5 + s) · 0.5`,
@@ -50,7 +50,7 @@
 use std::fmt;
 
 use crate::iq_tables::{
-    IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+    IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 
 /// GGUF v3 / ggml tensor type tags, values from `enum ggml_type`
@@ -352,14 +352,14 @@ impl GgmlType {
             | GgmlType::BF16
             | GgmlType::MXFP4
             | GgmlType::NVFP4
+            | GgmlType::IQ2_XXS
             | GgmlType::IQ2_XS
             | GgmlType::IQ3_XXS
             | GgmlType::IQ3_S
             | GgmlType::IQ4_NL
             | GgmlType::IQ4_XS
             | GgmlType::Q2_0 => true,
-            GgmlType::IQ2_XXS
-            | GgmlType::IQ1_S
+            GgmlType::IQ1_S
             | GgmlType::IQ2_S
             | GgmlType::I8
             | GgmlType::I16
@@ -473,14 +473,14 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::BF16 => dequant_bf16(&src[..need], dst),
         GgmlType::MXFP4 => dequant_mxfp4(&src[..need], dst),
         GgmlType::NVFP4 => dequant_nvfp4(&src[..need], dst)?,
+        GgmlType::IQ2_XXS => dequant_iq2_xxs(&src[..need], dst),
         GgmlType::IQ2_XS => dequant_iq2_xs(&src[..need], dst),
         GgmlType::IQ3_XXS => dequant_iq3_xxs(&src[..need], dst),
         GgmlType::IQ3_S => dequant_iq3_s(&src[..need], dst),
         GgmlType::IQ4_NL => dequant_iq4_nl(&src[..need], dst),
         GgmlType::IQ4_XS => dequant_iq4_xs(&src[..need], dst),
         GgmlType::Q2_0 => dequant_q2_0(&src[..need], dst),
-        GgmlType::IQ2_XXS
-        | GgmlType::IQ1_S
+        GgmlType::IQ1_S
         | GgmlType::IQ2_S
         | GgmlType::I8
         | GgmlType::I16
@@ -1056,6 +1056,39 @@ fn iq_sign(signs: u8, j: usize) -> f32 {
     }
 }
 
+/// Port of `dequantize_row_iq2_xxs` (ggml-quants.c:3692). Block geometry
+/// (block_iq2_xxs, ggml-common.h:439-442, 66 bytes / 256 values): d f16 @0,
+/// qs u16[32] @2, read as two u32 words a 32-value sub-block.
+///
+/// Sub-block ib32's words are `idx` (bytes `2 + 8·ib32 ..`) and `aux` (the
+/// next four): byte l of `idx` indexes [`IQ2XXS_GRID`] (eight magnitudes, one
+/// per byte) for group l's eight values, bits `7l .. 7l + 7` of `aux` index
+/// [`KSIGNS_IQ2XS`] for its signs, and bits 28..32 are the scale `s`; each
+/// value is `db·grid[j]·(±1)` with `db = d·(0.5 + s)·0.25`, left to right as
+/// the C.
+fn dequant_iq2_xxs(src: &[u8], dst: &mut [f32]) {
+    for (blk, out) in src
+        .as_chunks::<66>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<256>().0)
+    {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let words = blk[2..66].as_chunks::<8>().0;
+        for (w, o32) in words.iter().zip(out.as_chunks_mut::<32>().0) {
+            let aux = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
+            let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+            for (l, o8) in o32.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                let grid = IQ2XXS_GRID[usize::from(w[l])].to_le_bytes();
+                let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                for (j, o) in o8.iter_mut().enumerate() {
+                    *o = db * f32::from(grid[j]) * iq_sign(signs, j);
+                }
+            }
+        }
+    }
+}
+
 /// Port of `dequantize_row_iq2_xs` (ggml-quants.c:3720). Block geometry
 /// (block_iq2_xs, ggml-common.h:453-458, 74 bytes / 256 values): d f16 @0,
 /// qs u16[32] @2, scales u8[8] @66.
@@ -1601,8 +1634,13 @@ mod tests {
     /// code value the format can hold: the f32 product equals the f64 one.
     #[test]
     fn iq_products_are_exact() {
-        use crate::iq_tables::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL};
-        let mut g2: Vec<u8> = IQ2XS_GRID.iter().flat_map(|w| w.to_le_bytes()).collect();
+        use crate::iq_tables::{IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL};
+        // IQ2_XXS's grid bytes and factor are IQ2_XS's: both go through `g2` and `db2`.
+        let mut g2: Vec<u8> = IQ2XS_GRID
+            .iter()
+            .chain(&IQ2XXS_GRID)
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         let mut g3: Vec<u8> = IQ3XXS_GRID.iter().flat_map(|w| w.to_le_bytes()).collect();
         let mut g3s: Vec<u8> = IQ3S_GRID.iter().flat_map(|w| w.to_le_bytes()).collect();
         g2.sort_unstable();
@@ -1625,7 +1663,7 @@ mod tests {
                 assert!(exact(d, 0.5 + s), "d·(0.5+s) at {bits:#06x}");
                 assert!(
                     g2.iter().all(|&g| exact(db2, f32::from(g))),
-                    "iq2_xs {bits:#06x}"
+                    "iq2_xs and iq2_xxs {bits:#06x}"
                 );
                 assert!(
                     g3.iter().all(|&g| exact(db3, f32::from(g))),
@@ -1658,14 +1696,16 @@ mod tests {
         }
     }
 
-    /// The codebooks' structure, as ggml builds them: every IQ2_XS grid byte
-    /// is one of 8, 25, 43; every IQ3_XXS grid byte is 4 + 8k or 62; every
+    /// The codebooks' structure, as ggml builds them: every IQ2_XS and
+    /// IQ2_XXS grid byte is one of 8, 25, 43; every IQ3_XXS grid byte is 4 + 8k or 62; every
     /// IQ3_S grid byte is odd and at most 15; a `ksigns_iq2xs` entry is its index with bit 7 set to the parity of the
     /// seven, so the eight signs of a group always flip an even number.
     #[test]
     fn iq_tables_have_ggml_structure() {
-        use crate::iq_tables::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
-        for w in IQ2XS_GRID {
+        use crate::iq_tables::{
+            IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS,
+        };
+        for &w in IQ2XS_GRID.iter().chain(&IQ2XXS_GRID) {
             assert!(
                 w.to_le_bytes().iter().all(|b| [8, 25, 43].contains(b)),
                 "{w:#x}"
@@ -1977,5 +2017,123 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// IQ2_XXS against a block ggml made: `quantize_iq2_xxs` over 256
+    /// seeded values with a seeded importance matrix, and `to_float`
+    /// (`dequantize_row_iq2_xxs`) of it, from llama.cpp a0e6dc7's
+    /// ggml-quants.c (its IQ2_XXS quantizer, dequant and tables are ik's,
+    /// `gen-iq-tables.py` holding the grid equal in both trees). Its eight
+    /// sub-blocks carry scales 9, 2, 1, 2, 15, 2, 3, 2, so a scale read from
+    /// a neighbour moves values. Every value equals ggml's bit for bit.
+    #[test]
+    fn iq2_xxs_matches_a_ggml_made_block() {
+        #[rustfmt::skip]
+        const BLOCK: [u8; 66] = [
+            203, 24, 0, 0, 3, 0, 243, 183, 141, 153, 95, 14, 177, 155, 146, 93,
+            82, 41, 247, 202, 70, 114, 250, 40, 11, 19, 172, 184, 225, 192, 191, 250,
+            194, 34, 0, 0, 3, 0, 53, 106, 19, 246, 139, 12, 0, 192, 134, 152,
+            90, 40, 39, 23, 3, 0, 190, 72, 157, 56, 151, 78, 4, 186, 222, 246,
+            131, 42,
+        ];
+        #[rustfmt::skip]
+        const WANT: [u32; 256] = [
+            0xbd36_2200, 0xbd36_2200, 0x3d36_2200, 0x3d36_2200, 0xbd36_2200, 0xbd36_2200,
+            0xbd36_2200, 0xbd36_2200, 0xbd36_2200, 0xbd36_2200, 0xbd36_2200, 0xbd36_2200,
+            0x3d36_2200, 0xbd36_2200, 0xbd36_2200, 0x3d36_2200, 0x3d36_2200, 0xbe74_bdb0,
+            0xbd36_2200, 0x3d36_2200, 0xbd36_2200, 0xbd36_2200, 0x3d36_2200, 0x3d36_2200,
+            0x3d36_2200, 0x3d36_2200, 0xbd36_2200, 0xbd36_2200, 0x3d36_2200, 0x3d36_2200,
+            0xbd36_2200, 0xbd36_2200, 0x3c3f_b800, 0xbd80_cfa0, 0x3d15_c7c0, 0x3c3f_b800,
+            0xbd15_c7c0, 0x3d15_c7c0, 0x3d15_c7c0, 0x3c3f_b800, 0xbc3f_b800, 0xbd80_cfa0,
+            0x3d15_c7c0, 0xbd15_c7c0, 0xbc3f_b800, 0xbc3f_b800, 0x3c3f_b800, 0xbc3f_b800,
+            0xbd15_c7c0, 0x3d80_cfa0, 0x3d15_c7c0, 0xbc3f_b800, 0x3c3f_b800, 0x3c3f_b800,
+            0xbd15_c7c0, 0xbd15_c7c0, 0x3c3f_b800, 0xbc3f_b800, 0x3c3f_b800, 0xbc3f_b800,
+            0x3c3f_b800, 0x3d15_c7c0, 0xbc3f_b800, 0xbd15_c7c0, 0x3be6_1000, 0xbbe6_1000,
+            0x3d1a_92c0, 0xbbe6_1000, 0xbcb3_bc80, 0xbd1a_92c0, 0xbcb3_bc80, 0xbd1a_92c0,
+            0xbbe6_1000, 0x3d1a_92c0, 0x3cb3_bc80, 0x3be6_1000, 0xbd1a_92c0, 0x3be6_1000,
+            0xbd1a_92c0, 0xbcb3_bc80, 0x3d1a_92c0, 0x3be6_1000, 0xbbe6_1000, 0xbbe6_1000,
+            0x3d1a_92c0, 0xbd1a_92c0, 0x3be6_1000, 0xbbe6_1000, 0x3d1a_92c0, 0x3be6_1000,
+            0x3be6_1000, 0xbd1a_92c0, 0xbbe6_1000, 0x3be6_1000, 0x3d1a_92c0, 0x3be6_1000,
+            0xbd15_c7c0, 0xbd15_c7c0, 0xbc3f_b800, 0xbd15_c7c0, 0xbd80_cfa0, 0xbd80_cfa0,
+            0x3c3f_b800, 0x3d15_c7c0, 0xbd15_c7c0, 0x3c3f_b800, 0xbd15_c7c0, 0x3d80_cfa0,
+            0xbd80_cfa0, 0xbc3f_b800, 0xbd15_c7c0, 0xbd15_c7c0, 0xbc3f_b800, 0xbc3f_b800,
+            0x3c3f_b800, 0xbc3f_b800, 0x3d15_c7c0, 0x3d15_c7c0, 0x3c3f_b800, 0xbd80_cfa0,
+            0x3d15_c7c0, 0xbd80_cfa0, 0xbd15_c7c0, 0x3c3f_b800, 0xbc3f_b800, 0x3d80_cfa0,
+            0x3d15_c7c0, 0xbd15_c7c0, 0xbd94_9500, 0x3d94_9500, 0xbd94_9500, 0x3d94_9500,
+            0xbd94_9500, 0xbd94_9500, 0x3d94_9500, 0x3d94_9500, 0x3d94_9500, 0x3d94_9500,
+            0xbd94_9500, 0x3d94_9500, 0xbd94_9500, 0x3d94_9500, 0xbd94_9500, 0xbd94_9500,
+            0xbd94_9500, 0x3ec7_a838, 0xbd94_9500, 0xbd94_9500, 0x3d94_9500, 0x3d94_9500,
+            0xbd94_9500, 0x3d94_9500, 0x3d94_9500, 0x3d94_9500, 0x3d94_9500, 0x3d94_9500,
+            0xbd94_9500, 0xbd94_9500, 0x3d94_9500, 0x3d94_9500, 0x3c3f_b800, 0xbd80_cfa0,
+            0xbc3f_b800, 0x3d15_c7c0, 0x3c3f_b800, 0x3c3f_b800, 0x3c3f_b800, 0x3d15_c7c0,
+            0xbc3f_b800, 0x3d15_c7c0, 0x3c3f_b800, 0x3d15_c7c0, 0xbc3f_b800, 0xbc3f_b800,
+            0x3c3f_b800, 0xbc3f_b800, 0x3c3f_b800, 0xbc3f_b800, 0x3c3f_b800, 0xbc3f_b800,
+            0x3c3f_b800, 0xbc3f_b800, 0xbc3f_b800, 0x3c3f_b800, 0x3d15_c7c0, 0xbd80_cfa0,
+            0x3d15_c7c0, 0x3c3f_b800, 0x3c3f_b800, 0x3d80_cfa0, 0xbd15_c7c0, 0x3d15_c7c0,
+            0x3c86_3400, 0xbdb4_55e0, 0xbc86_3400, 0xbd51_b140, 0xbc86_3400, 0xbd51_b140,
+            0x3c86_3400, 0xbc86_3400, 0xbc86_3400, 0x3c86_3400, 0x3d51_b140, 0x3c86_3400,
+            0xbd51_b140, 0x3c86_3400, 0x3c86_3400, 0x3c86_3400, 0xbc86_3400, 0x3db4_55e0,
+            0xbc86_3400, 0x3c86_3400, 0xbc86_3400, 0xbc86_3400, 0xbc86_3400, 0xbc86_3400,
+            0x3c86_3400, 0x3c86_3400, 0xbc86_3400, 0x3c86_3400, 0x3c86_3400, 0x3c86_3400,
+            0xbc86_3400, 0x3c86_3400, 0x3c3f_b800, 0xbc3f_b800, 0xbd15_c7c0, 0xbc3f_b800,
+            0xbd80_cfa0, 0x3c3f_b800, 0xbc3f_b800, 0xbd15_c7c0, 0xbc3f_b800, 0x3d15_c7c0,
+            0xbc3f_b800, 0xbd80_cfa0, 0x3c3f_b800, 0xbc3f_b800, 0xbd15_c7c0, 0xbc3f_b800,
+            0xbd80_cfa0, 0xbd80_cfa0, 0xbc3f_b800, 0xbc3f_b800, 0x3c3f_b800, 0x3c3f_b800,
+            0x3c3f_b800, 0x3c3f_b800, 0x3d80_cfa0, 0x3c3f_b800, 0xbd15_c7c0, 0x3d80_cfa0,
+            0xbc3f_b800, 0x3d15_c7c0, 0xbd15_c7c0, 0xbd15_c7c0,
+        ];
+        let mut dst = [0.0f32; 256];
+        dequant_row(GgmlType::IQ2_XXS, &BLOCK, &mut dst).expect("one whole block");
+        for (i, (&got, &want)) in dst.iter().zip(&WANT).enumerate() {
+            assert_eq!(got.to_bits(), want, "value {i}: {got:e}");
+        }
+    }
+
+    /// IQ2_XXS over its block layout: eight blocks whose 64 sub-blocks take
+    /// every grid index once (group l of sub-block `q` indexes `4q + l`), the
+    /// sign index `(37·(4q + l) + 5) mod 128` and the scale `q mod 16`, under
+    /// a normal and a negative `d`; every value is `d·(0.5 + s)·0.25·grid[j]`
+    /// negated where bit j of `ksigns_iq2xs[sign index]` is set, computed in
+    /// f64 (exact, [`iq_products_are_exact`]). One byte short of a block is
+    /// refused by name.
+    #[test]
+    fn iq2_xxs_decodes_every_index_sign_and_scale() {
+        use crate::iq_tables::{IQ2XXS_GRID, KSIGNS_IQ2XS};
+        let ds: [u16; 8] = [
+            0x3c00, 0x2e66, 0xb555, 0x1001, 0x3c00, 0xc400, 0x0401, 0x7bff,
+        ];
+        let mut src = Vec::new();
+        for (b, &d) in ds.iter().enumerate() {
+            src.extend(d.to_le_bytes());
+            for ib in 0..8 {
+                let q = 8 * b + ib;
+                let mut aux = (q as u32 % 16) << 28;
+                for l in 0..4 {
+                    src.push((4 * q + l) as u8);
+                    aux |= ((37 * (4 * q + l) as u32 + 5) % 128) << (7 * l);
+                }
+                src.extend(aux.to_le_bytes());
+            }
+        }
+        let mut dst = vec![0.0f32; 256 * ds.len()];
+        dequant_row(GgmlType::IQ2_XXS, &src, &mut dst).expect("eight whole blocks");
+        for (v, &got) in dst.iter().enumerate() {
+            let (q, l, j) = (v / 32, (v / 8) % 4, v % 8);
+            let d = f64::from(super::half_to_f32(ds[q / 8]));
+            let g = IQ2XXS_GRID[4 * q + l].to_le_bytes()[j];
+            let signs = KSIGNS_IQ2XS[(37 * (4 * q + l) + 5) % 128];
+            let neg = if signs >> j & 1 != 0 { -1.0 } else { 1.0 };
+            let want = d * (0.5 + (q % 16) as f64) * 0.25 * f64::from(g) * neg;
+            assert_eq!(f64::from(got), want, "value {v}");
+        }
+        assert_eq!(
+            dequant_row(GgmlType::IQ2_XXS, &src[..65], &mut [0.0f32; 256]),
+            Err(QuantError::ShortSrc {
+                ty: GgmlType::IQ2_XXS,
+                src: 65,
+                need: 66,
+                n: 256
+            })
+        );
     }
 }

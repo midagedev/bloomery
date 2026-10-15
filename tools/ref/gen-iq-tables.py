@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate crates/gguf/src/iq_tables.rs from ggml's sources, or check it.
 
-The i-quant codebooks (iq2xs_grid, iq3xxs_grid, iq3s_grid, ksigns_iq2xs, kmask_iq2xs,
+The i-quant codebooks (iq2xxs_grid, iq2xs_grid, iq3xxs_grid, iq3s_grid, ksigns_iq2xs, kmask_iq2xs,
 kvalues_iq4nl) are data, not code: this script is their one transcription.
 It reads them from the ggml tree the reference harnesses link ($IK), writes
 them as Rust `const` arrays, and prints each table's md5 over its
@@ -34,6 +34,7 @@ import sys
 TABLES = [
     ("kmask_iq2xs", "KMASK_IQ2XS", "uint8_t", 8),
     ("ksigns_iq2xs", "KSIGNS_IQ2XS", "uint8_t", 128),
+    ("iq2xxs_grid", "IQ2XXS_GRID", "uint64_t", 256),
     ("iq2xs_grid", "IQ2XS_GRID", "uint64_t", 512),
     ("iq3xxs_grid", "IQ3XXS_GRID", "uint32_t", 256),
     ("iq3s_grid", "IQ3S_GRID", "uint32_t", 512),
