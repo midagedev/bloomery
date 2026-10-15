@@ -1411,33 +1411,100 @@ EOF
     check dma-leading-zero-bound-rc "$RC" 64
     cat > "$t/filter-open-runner" << 'EOF'
 source "$1"
+eval "$(sed -n '/^lease_filter() {/,/^}/p' "$1" | awk '
+  { print }
+  $0 == "  \"${filter[@]}\" 9>&- < \"$LEASE_OUT_FIFO\" > \"$output\" &" {
+    print "  echo \"$! $LEASE_OUT_FIFO\" > \"$TEST_READY\""
+    print "  while [ ! -e \"$TEST_RELEASE\" ]; do sleep 0.01 9>&-; done"
+  }
+')"
 exec 9> "$2"
 flock -n 9 || exit 75
-lease_bounded() {
-  echo "$!" > "$TEST_READER"
-  echo ready > "$TEST_READY"
-  read -r line < "$TEST_HOLD"
-}
-lease_filter 10 stdout "$3" cat -- true
+case $TEST_TRAP in
+  exit) trap 'echo trap ran; exit 143' TERM ;;
+  return) trap 'echo trap ran' TERM ;;
+esac
+saved=$(trap -p TERM)
+rc=0
+lease_filter 10 stdout "$3" cat -- true || rc=$?
+echo "filter=$rc"
+[ "$(trap -p TERM)" != "$saved" ] || echo restored
 EOF
-    mkfifo "$t/filter-hold"
-    RC=0
-    lease_capture 5 bash -c '
-      source "$1"
-      TEST_READER="$2/reader.pid" TEST_READY="$2/reader.ready" TEST_HOLD="$2/filter-hold" \
-        bash "$2/filter-open-runner" "$1" "$2/filter-lock" "$2/filter-output" &
-      runner=$!
-      for ((i=0; i<100; i++)); do [ ! -s "$2/reader.ready" ] || break; sleep 0.01; done
-      kill -TERM "$runner" 2>/dev/null
-      wait "$runner" 2>/dev/null || :
+    for trp in none exit return; do
+      RC=0
+      OUT=$(python3 - "$LEASE_TREE/tools/ref/lease.sh" "$t" "$trp" << 'PY'
+import errno
+import os
+from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
+import time
+
+source, root, mode = sys.argv[1:]
+prefix = Path(root) / ("filter-" + mode)
+ready, release = Path(str(prefix) + ".ready"), Path(str(prefix) + ".release")
+fifo_link = str(prefix) + ".fifo"
+env = dict(os.environ, TEST_READY=str(ready), TEST_RELEASE=str(release), TEST_TRAP=mode)
+with open(str(prefix) + ".out", "w") as output:
+    runner = subprocess.Popen(["bash", str(Path(root) / "filter-open-runner"), source,
+                               str(prefix) + ".lock", str(prefix) + ".filtered"],
+                              stdout=output, stderr=subprocess.PIPE, env=env)
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() or not ready.read_text().strip():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("filter reader did not reach its startup gap")
+            time.sleep(0.01)
+        reader, fifo = ready.read_text().split()
+        # Keep a FIFO name for cleanup after the assertions: opening its writer lets an orphan
+        # finish normally, without the test sending the reader a signal.
+        os.link(fifo, fifo_link)
+        runner.send_signal(signal.SIGTERM)
+        time.sleep(0.1)
+        release.touch()
+        rc = runner.wait(timeout=5)
+        rc = 128 - rc if rc < 0 else rc
+        try:
+            os.kill(int(reader), 0)
+            state = "alive"
+        except ProcessLookupError:
+            state = "gone"
+        eof = False
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if select.select([runner.stderr], [], [], max(0, deadline - time.monotonic()))[0]:
+                if not os.read(runner.stderr.fileno(), 4096):
+                    eof = True
+                    break
+        text = Path(str(prefix) + ".out").read_text()
+        expected = {"none": "", "exit": "trap ran\n",
+                    "return": "trap ran\nfilter=143\nrestored\n"}[mode]
+        print(f"runner={rc} reader={state} stderr={'eof' if eof else 'open'} "
+              f"caller={'kept' if text == expected else repr(text)}")
+        sys.exit(0 if rc == (0 if mode == "return" else 143) and state == "gone"
+                 and eof and text == expected else 1)
+    finally:
+        release.touch()
+        if runner.poll() is None:
+            runner.terminate()
+            runner.wait(timeout=5)
+        try:
+            os.close(os.open(fifo_link, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError as error:
+            if error.errno not in (errno.ENXIO, errno.ENOENT):
+                raise
+        runner.stderr.close()
+PY
+      ) || RC=$?
+      check "bounded-filter-open-term-$trp-rc" "$RC" 0
+      check "bounded-filter-open-term-$trp-reader" "$OUT" \
+        "runner=$([ "$trp" = return ] && echo 0 || echo 143) reader=gone stderr=eof caller=kept"
       state=free
-      lease_free "$2/filter-lock" 2>/dev/null || state=held
-      reader=$(cat "$2/reader.pid")
-      kill -TERM "$reader" 2>/dev/null || :
-      echo "$state"
-    ' _ "$LEASE_TREE/tools/ref/lease.sh" "$t" || RC=$?
-    check bounded-filter-open-term-rc "$RC" 0
-    check bounded-filter-open-term-lease "$LEASE_OUT" free
+      lease_free "$t/filter-$trp.lock" 2> /dev/null || state=held
+      check "bounded-filter-open-term-$trp-lease" "$state" free
+    done
     mkdir -p "$t/expert-tree/tools/ref"
     expert='expert-union-dump'
     cp "$LEASE_TREE/tools/ref/$expert.sh" "$t/expert-tree/tools/ref/"
