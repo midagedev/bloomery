@@ -210,10 +210,8 @@ impl LogitsSet {
             ));
         }
         let mut out = Vec::with_capacity(p.n_vocab as usize);
-        for chunk in bytes.chunks_exact(4) {
-            out.push(f32::from_le_bytes(
-                chunk.try_into().expect("chunks_exact(4)"),
-            ));
+        for chunk in bytes.as_chunks::<4>().0 {
+            out.push(f32::from_le_bytes(*chunk));
         }
         if let Some(i) = out.iter().position(|v| !v.is_finite()) {
             return Err(RefError::malformed(
