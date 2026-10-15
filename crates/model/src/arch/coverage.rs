@@ -108,7 +108,9 @@ pub const AVAILABLE: &[Available] = &[
                     window: None,
                     sinks: false,
                     scaled: false,
-                } if value == head && gqa_row(*head, *group).is_some()
+                // The pack-5 row (head 128, group 5) is launched by no Qwen
+                // body; the program that launches it names its own entry.
+                } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack != 5)
             )
         },
     },
@@ -1136,6 +1138,17 @@ mod tests {
             unreachable!()
         };
         for (what, need) in [
+            (
+                "group 5, a row no Qwen body launches",
+                Need::Gqa {
+                    head,
+                    value: head,
+                    group: 5,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                },
+            ),
             (
                 "a narrower value head",
                 Need::Gqa {

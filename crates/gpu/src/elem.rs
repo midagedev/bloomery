@@ -777,6 +777,9 @@ mod elem_kernels {
             // (id+1)·(q_stride+k_blocks) <= w.len() by the launch contract.
             let word = unsafe { *w.get_unchecked(row + wbase + 32 * word_i) };
             let code = ((word >> (8 * byte)) & 0xff) as u8 as i8;
+            // SAFETY: b < k_blocks, so the scale word row + q_stride + b sits
+            // inside the row, which ends at (id+1)·(q_stride+k_blocks) <=
+            // w.len() by the launch contract.
             let scale = f32::from_bits(unsafe { *w.get_unchecked(row + q_stride as usize + b) });
             (code as f32) * scale
         } else {
@@ -1120,9 +1123,10 @@ mod elem_kernels {
             v
         } else {
             let r = if v > 0.0 { v } else { 0.0 };
-            let yv = r * r;
-            yv
+            r * r
         };
+        // SAFETY: i < n <= y.len() by the launch contract; thread i owns
+        // entry i.
         unsafe {
             *y.get_unchecked_mut(i) = out;
         }

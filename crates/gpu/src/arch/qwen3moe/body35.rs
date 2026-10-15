@@ -1621,8 +1621,7 @@ impl Body35 {
                     LayerStore::Rec(RecStore::stamped(stream, shape.lens(lanes), lanes)?)
                 }
                 Kind35::Delta(shape) => {
-                    let [state_f32, ring_f32] = shape.lens(lanes);
-                    LayerStore::Rec(RecStore::new(stream, [state_f32, ring_f32], lanes)?)
+                    LayerStore::Rec(RecStore::new(stream, shape.lens(lanes), lanes)?)
                 }
             });
         }
