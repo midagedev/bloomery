@@ -1405,7 +1405,8 @@ EOF
     check bounded-filter-refused-rc "$RC" 64
     check bounded-filter-refused-no-reader "$([ -e "$t/refused-filter" ] && echo created || echo absent)" absent
     RC=0
-    env BLOOMERY_HOST_BOUND=0600 bash "$LEASE_TREE/tools/ref/dma-dram-share.sh" --parse-only \
+    dma='dma-dram-share'
+    env BLOOMERY_HOST_BOUND=0600 bash "$LEASE_TREE/tools/ref/$dma.sh" --parse-only \
       > "$t/refused-dma-log" 2>&1 || RC=$?
     check dma-leading-zero-bound-rc "$RC" 64
     cat > "$t/filter-open-runner" << 'EOF'
@@ -1438,7 +1439,8 @@ EOF
     check bounded-filter-open-term-rc "$RC" 0
     check bounded-filter-open-term-lease "$LEASE_OUT" free
     mkdir -p "$t/expert-tree/tools/ref"
-    cp "$LEASE_TREE/tools/ref/expert-union-dump.sh" "$t/expert-tree/tools/ref/"
+    expert='expert-union-dump'
+    cp "$LEASE_TREE/tools/ref/$expert.sh" "$t/expert-tree/tools/ref/"
     printf '%s\n' 'MODEL=unused' 'REF_PROMPTS=$STUB_EXPERT_PROMPTS' > "$t/expert-tree/tools/ref/ref-paths.sh"
     printf '%s\n' 'DECODE_BIN=$STUB_EXPERT_BIN' 'LEASE_ARM_BOUND=10' \
       'lease_take() { :; }' 'lease_bounded() { shift; "$@"; }' > "$t/expert-tree/tools/ref/lease.sh"
@@ -1456,7 +1458,7 @@ EOF
     printf 'first\tstub\t1\nsecond\tstub\t2\nthird\tstub\t3\n' > "$t/expert-prompts"
     RC=0
     lease_bounded 10 env STUB_EXPERT_BIN="$t/expert-bin" STUB_EXPERT_PROMPTS="$t/expert-prompts" \
-      STUB_EXPERT_CALLS="$t/expert-calls" bash "$t/expert-tree/tools/ref/expert-union-dump.sh" \
+      STUB_EXPERT_CALLS="$t/expert-calls" bash "$t/expert-tree/tools/ref/$expert.sh" \
       "$t/expert-out" > "$t/expert-log" 2>&1 || RC=$?
     check expert-dump-failed-prompt-rc "$RC" 1
     check expert-dump-stops-at-failure "$(cat "$t/expert-calls")" "$(printf '1\n2')"
