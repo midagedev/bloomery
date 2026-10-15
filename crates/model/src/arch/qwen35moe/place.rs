@@ -2683,6 +2683,7 @@ mod tests {
                         experts: 512,
                         top_k: 10,
                         expert_ff: 640,
+                        latent: None,
                         act: Act::SwiGlu { limit: None },
                         router: Router {
                             score: Score::Softmax,

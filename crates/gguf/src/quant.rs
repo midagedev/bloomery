@@ -51,6 +51,9 @@ use crate::iq_tables::{
 /// at ggml.h:408-415, I8=24 … F64=28 at ggml.h:416-420, IQ1_M=29 at
 /// ggml.h:421, BF16=30 at ggml.h:422, MXFP4=39 at ggml.h:427).
 ///
+/// NVFP4=40 is mainline ggml's (llama.cpp-mainline ggml.h:430); ik has no
+/// NVFP4.
+///
 /// TQ1_0=34 and TQ2_0=35 are mainline ggml's (llama.cpp `930e2fa59`,
 /// ggml.h:424-425); the ik tree leaves 34 and 35 unassigned, so no id means
 /// two things. Q2_0=42 is mainline's too (llama.cpp `f2cc7282c`, ggml.h:432);
@@ -80,6 +83,7 @@ pub enum GgmlType {
     Q6_K,
     BF16,
     MXFP4,
+    NVFP4,
     IQ2_XXS,
     IQ2_XS,
     IQ3_XXS,
@@ -132,6 +136,7 @@ impl GgmlType {
             34 => GgmlType::TQ1_0,
             35 => GgmlType::TQ2_0,
             39 => GgmlType::MXFP4,
+            40 => GgmlType::NVFP4,
             42 => GgmlType::Q2_0,
             other => GgmlType::Unknown(other),
         }
@@ -167,6 +172,7 @@ impl GgmlType {
             GgmlType::TQ1_0 => 34,
             GgmlType::TQ2_0 => 35,
             GgmlType::MXFP4 => 39,
+            GgmlType::NVFP4 => 40,
             GgmlType::Q2_0 => 42,
             GgmlType::Unknown(v) => v,
         }
@@ -175,8 +181,9 @@ impl GgmlType {
     /// `ggml_type_name` string (type_traits table, ggml.c:620 — entries at
     /// ggml.c:657/667/756/777/819/912/938/998/1485, mxfp4 at ggml.c:1307;
     /// i8…f64 at ggml.c:621-649, the i-quants at ggml.c:1055-1293; tq1_0 and
-    /// tq2_0 from mainline's table, llama.cpp ggml.c:912/920, and q2_0 from
-    /// `f2cc7282c`'s, ggml.c:685).
+    /// tq2_0 from mainline's table, llama.cpp ggml.c:912/920, q2_0 from
+    /// `f2cc7282c`'s, ggml.c:685, and nvfp4 from llama.cpp-mainline's,
+    /// ggml.c:760-761).
     /// Used to name the oracle
     /// dumps `$BLOOMERY_DATA/ref/<name>.raw`.
     pub fn name(self) -> Option<&'static str> {
@@ -193,6 +200,7 @@ impl GgmlType {
             GgmlType::Q6_K => Some("q6_K"),
             GgmlType::BF16 => Some("bf16"),
             GgmlType::MXFP4 => Some("mxfp4"),
+            GgmlType::NVFP4 => Some("nvfp4"),
             GgmlType::IQ2_XXS => Some("iq2_xxs"),
             GgmlType::IQ2_XS => Some("iq2_xs"),
             GgmlType::IQ3_XXS => Some("iq3_xxs"),
@@ -222,7 +230,8 @@ impl GgmlType {
     /// types and F64 = 1 (ggml.c:621-649), IQ4_NL = QK4_NL = 32 (ggml.c:1276),
     /// the other i-quants and TQ1_0/TQ2_0 = QK_K = 256 (ggml.c:1055-1293,
     /// mainline ggml.c:912/920), Q2_0 = QK2_0 = 64 (mainline `f2cc7282c`
-    /// ggml.c:687, ggml-common.h:187).
+    /// ggml.c:687, ggml-common.h:187), NVFP4 = QK_NVFP4 = 64
+    /// (llama.cpp-mainline ggml.c:762, ggml-common.h:221).
     ///
     /// This match is the single owner of those numbers for the Rust side.
     pub fn blck_size(self) -> Option<u64> {
@@ -255,7 +264,7 @@ impl GgmlType {
             | GgmlType::IQ1_M
             | GgmlType::TQ1_0
             | GgmlType::TQ2_0 => Some(256),
-            GgmlType::Q2_0 => Some(64),
+            GgmlType::Q2_0 | GgmlType::NVFP4 => Some(64),
             GgmlType::Unknown(_) => None,
         }
     }
@@ -277,7 +286,9 @@ impl GgmlType {
     /// `block_iq1_m` = 56 (:540), `block_iq4_nl` = 18 (:590), `block_iq4_xs` =
     /// 136 (:608), and mainline's `block_tq1_0` = 54 (:281), `block_tq2_0` =
     /// 66 (:288), `block_q2_0` = 18 (`f2cc7282c` ggml-common.h:188-192: one
-    /// f16 `d`, then 16 bytes of 2-bit codes); I8/I16/I32/I64/F64 are their C
+    /// f16 `d`, then 16 bytes of 2-bit codes), `block_nvfp4` = 36
+    /// (llama.cpp-mainline ggml-common.h:223-227: four UE4M3 sub-block
+    /// scales, then 32 bytes of 4-bit codes); I8/I16/I32/I64/F64 are their C
     /// scalars, 1/2/4/8/8.
     pub fn type_size(self) -> Option<u64> {
         match self {
@@ -293,6 +304,7 @@ impl GgmlType {
             GgmlType::Q5_K => Some(176),
             GgmlType::Q6_K => Some(210),
             GgmlType::MXFP4 => Some(17),
+            GgmlType::NVFP4 => Some(36),
             GgmlType::IQ2_XXS => Some(66),
             GgmlType::IQ2_XS => Some(74),
             GgmlType::IQ3_XXS => Some(98),
@@ -332,6 +344,7 @@ impl GgmlType {
             | GgmlType::Q6_K
             | GgmlType::BF16
             | GgmlType::MXFP4
+            | GgmlType::NVFP4
             | GgmlType::IQ2_XS
             | GgmlType::IQ3_XXS
             | GgmlType::IQ3_S
@@ -390,6 +403,16 @@ pub enum QuantError {
         need: usize,
         n: usize,
     },
+    /// A block scale byte the format leaves undefined: no value is written
+    /// for it.
+    #[error("dequant {ty}: block {block} sub-block {sub} holds scale byte {byte:#04x}, {why}")]
+    UndefinedScale {
+        ty: GgmlType,
+        block: usize,
+        sub: usize,
+        byte: u8,
+        why: &'static str,
+    },
 }
 
 /// Dequantize `n = dst.len()` values of one contiguous span of type `ty`.
@@ -442,6 +465,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::Q8_0 => dequant_q8_0(&src[..need], dst),
         GgmlType::BF16 => dequant_bf16(&src[..need], dst),
         GgmlType::MXFP4 => dequant_mxfp4(&src[..need], dst),
+        GgmlType::NVFP4 => dequant_nvfp4(&src[..need], dst)?,
         GgmlType::IQ2_XS => dequant_iq2_xs(&src[..need], dst),
         GgmlType::IQ3_XXS => dequant_iq3_xxs(&src[..need], dst),
         GgmlType::IQ3_S => dequant_iq3_s(&src[..need], dst),
@@ -941,6 +965,78 @@ fn dequant_mxfp4(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+// ------------------------------------------------------------------- NVFP4
+
+/// An NVFP4 sub-block scale, `ggml_ue4m3_to_fp32` (llama.cpp-mainline
+/// ggml-impl.h:512-527): unsigned E4M3, bias 7, a subnormal `m · 2^-9` at
+/// exponent 0, times 0.5 — the half the doubled code table
+/// ([`KVALUES_MXFP4`], mainline's `kvalues_fp4`, ggml-common.h:1126-1129)
+/// puts back. The byte has no sign bit: a byte with bit 7 set, and 0x7F
+/// (E4M3's NaN), are not scales. Mainline decodes 0x7F to 0 and drops bit 7;
+/// its encoder (`ggml_fp32_to_ue4m3`, ggml-impl.h:529-565) writes neither,
+/// so each is refused here by name instead.
+///
+/// # Errors
+///
+/// Why the byte is no scale.
+pub fn ue4m3_to_f32_half(byte: u8) -> Result<f32, &'static str> {
+    if byte & 0x80 != 0 {
+        return Err("bit 7 set: UE4M3 has no sign bit");
+    }
+    if byte == 0x7F {
+        return Err("E4M3's NaN");
+    }
+    let (exp, man) = (i32::from(byte >> 3), f32::from(byte & 7));
+    let raw = if exp == 0 {
+        man * 2f32.powi(-9)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    };
+    Ok(raw * 0.5)
+}
+
+/// Port of `dequantize_row_nvfp4` (llama.cpp-mainline ggml-quants.c:589-612).
+/// Block geometry (block_nvfp4, ggml-common.h:221-227, 36 bytes / 64
+/// values): four UE4M3 scales `d[4]` @0, `qs[32]` @4; sub-block `s` holds
+/// values `16s..16s+16`, its value `j` (j < 8) the low nibble of
+/// `qs[8s + j]` and value `j + 8` the high nibble, each
+/// `d * kvalues_fp4[code]` with `d` = [`ue4m3_to_f32_half`]`(d[s])`. The
+/// tensor's per-tensor scale (`<name>.scale`, an f32 the graph multiplies
+/// the product by) is not part of the block. A 4-bit significand times a
+/// code of at most 4 bits, so every product is exact.
+fn dequant_nvfp4(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
+    for (block, (blk, out)) in src
+        .as_chunks::<36>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<64>().0)
+        .enumerate()
+    {
+        for (sub, (out, qs)) in out
+            .as_chunks_mut::<16>()
+            .0
+            .iter_mut()
+            .zip(blk[4..].as_chunks::<8>().0)
+            .enumerate()
+        {
+            let byte = blk[sub];
+            let d = ue4m3_to_f32_half(byte).map_err(|why| QuantError::UndefinedScale {
+                ty: GgmlType::NVFP4,
+                block,
+                sub,
+                byte,
+                why,
+            })?;
+            let (lo, hi) = out.split_at_mut(8);
+            for (j, &q) in qs.iter().enumerate() {
+                lo[j] = d * f32::from(KVALUES_MXFP4[usize::from(q & 0x0f)]);
+                hi[j] = d * f32::from(KVALUES_MXFP4[usize::from(q >> 4)]);
+            }
+        }
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------- i-quants
 
 /// `±1.0` for bit `j` of a sign byte, ggml's `signs & kmask_iq2xs[j] ? -1.f : 1.f`.
@@ -1252,7 +1348,7 @@ pub fn quantize_row_q8_0_roundtrip(x: &[f32], out: &mut [f32]) {
 /// IQ2_XS take Q8_K in ggml (ggml.c:895, :1105 on the IQK build; `iqk_set_kernels_kquants` and
 /// `iqk_set_kernels_iquants` accept Q8_K only for them); the other i-quants take Q8_K too and have no
 /// CPU matmul here. Q2_0, mainline's alone, takes Q8_0 (`f2cc7282c` ggml-cpu.c:237), the column
-/// qdot's Q2_0 kernel reads.
+/// qdot's Q2_0 kernel reads. NVFP4 has a reference decode and no CPU matmul here.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
         GgmlType::Q2_K
@@ -1272,6 +1368,7 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
         GgmlType::Q2_0 => Ok(Some(ActivationFormat::Q8_0)),
         GgmlType::F32 | GgmlType::F16 => Ok(None),
         GgmlType::BF16
+        | GgmlType::NVFP4
         | GgmlType::IQ2_XXS
         | GgmlType::IQ1_S
         | GgmlType::IQ2_S
@@ -1346,7 +1443,9 @@ mod tests {
     /// `c10fbbcc` (`build/ggml/src/libggml.so`) and, for tq1_0/tq2_0, which
     /// the ik table does not have, mainline llama.cpp `930e2fa59`
     /// (`build/bin/libggml-base.so`), and for q2_0 mainline `f2cc7282c`. ik's
-    /// and mainline's libraries agree on every other row here.
+    /// and mainline's libraries agree on every other row here. nvfp4's row
+    /// is read from llama.cpp-mainline's source (ggml.c:760-764,
+    /// ggml-common.h:221-227), not a compiled library.
     const GGML_TABLE: &[(u32, &str, u64, u64)] = &[
         (0, "f32", 1, 4),
         (1, "f16", 1, 2),
@@ -1376,17 +1475,19 @@ mod tests {
         (34, "tq1_0", 256, 54),
         (35, "tq2_0", 256, 66),
         (39, "mxfp4", 32, 17),
+        (40, "nvfp4", 64, 36),
         (42, "q2_0", 64, 18),
     ];
 
     /// Ids the enum leaves `Unknown`: types it does not name yet (q4_0, q4_1,
-    /// q8_1, q8_K; mainline's nvfp4 and q1_0 at 40 and 41, ik's q1_0_g128 at
-    /// 41 and q8_2_x4 at 99), slots ggml removed (4, 5, 31-33, 36-38; ik
-    /// reuses 31-33 and 36 for repacked and BitNet types mainline does not
-    /// have), and 43, the first id past mainline's table.
+    /// q8_1, q8_K; mainline's q1_0 at 41, ik's q1_0_g128 at 41 and q8_2_x4
+    /// at 99), slots ggml removed (4, 5, 31-33, 36-38; ik reuses 31-33 and
+    /// 36 for repacked and BitNet types mainline does not have), and 43, the
+    /// first id past mainline's table.
     // PIN(2026-09-24): 10 (q2_K) left this list when the enum named it for the GLM-5.3 MTP layer.
     // PIN(2026-10-12): 42 (q2_0) left this list when the enum named it.
-    const UNKNOWN_IDS: &[u32] = &[2, 3, 4, 5, 9, 15, 31, 32, 33, 36, 37, 38, 40, 41, 43, 99];
+    // PIN(2026-10-16): 40 (nvfp4) left this list when the enum named it for Nemotron 3.5 Bolt.
+    const UNKNOWN_IDS: &[u32] = &[2, 3, 4, 5, 9, 15, 31, 32, 33, 36, 37, 38, 41, 43, 99];
 
     /// Every named id round-trips through the enum and carries ggml's name,
     /// block size and block bytes; every other id stays `Unknown` with no
@@ -1759,6 +1860,107 @@ mod tests {
                     "E {e} value {i} (code {code}): got {got:e}, want {want:e}"
                 );
             }
+        }
+    }
+
+    /// An unsigned E4M3 scale byte's value from the format's definition, not
+    /// from ggml's decode: `m · 2^-9` at exponent 0, `(1 + m/8) · 2^(e-7)`
+    /// above.
+    fn ue4m3(byte: u8) -> f64 {
+        let (e, m) = (i32::from(byte >> 3), f64::from(byte & 7));
+        if e == 0 {
+            m * 2f64.powi(-9)
+        } else {
+            (1.0 + m / 8.0) * 2f64.powi(e - 7)
+        }
+    }
+
+    /// One NVFP4 block built by hand: scales 1, 2, 2^-9 and 448 (bytes 0x38,
+    /// 0x40, 0x01, 0x7E), every code byte 0x71 (low nibble code 1 = 0.5, high
+    /// nibble code 7 = 6). Each sub-block is eight 0.5s then eight 6s at its
+    /// scale. A swapped nibble order, a sub-block read at another stride or a
+    /// scale not halved against the doubled code table fails it.
+    #[test]
+    fn nvfp4_decodes_a_hand_built_block() {
+        let mut src = vec![0x38, 0x40, 0x01, 0x7E];
+        src.extend([0x71u8; 32]);
+        let mut dst = [0.0f32; 64];
+        dequant_row(GgmlType::NVFP4, &src, &mut dst).unwrap();
+        let tiny = 2f32.powi(-9);
+        for (s, scale) in [1.0, 2.0, tiny, 448.0].into_iter().enumerate() {
+            let sub = &dst[16 * s..16 * s + 16];
+            assert!(sub[..8].iter().all(|&v| v == 0.5 * scale), "{s}: {sub:?}");
+            assert!(sub[8..].iter().all(|&v| v == 6.0 * scale), "{s}: {sub:?}");
+        }
+        assert_eq!((dst[0], dst[15], dst[63]), (0.5, 6.0, 2688.0));
+    }
+
+    /// NVFP4 over its defined domain: 32 blocks whose 128 sub-block scales
+    /// run through every defined byte 0x00..=0x7E, each sub-block holding
+    /// every code once (low nibble j, high nibble 15 − j), decode to
+    /// `e2m1(code) · ue4m3(scale)` computed in f64 from the formats'
+    /// definitions. Every such product is an f32, so the comparison is on
+    /// bits.
+    #[test]
+    fn nvfp4_decodes_every_defined_scale_and_code() {
+        let scales: Vec<u8> = (0..128u8).map(|i| i % 127).collect();
+        let mut src = Vec::with_capacity(32 * 36);
+        for d in scales.chunks(4) {
+            src.extend_from_slice(d);
+            for _ in 0..4 {
+                src.extend((0..8u8).map(|j| j | ((15 - j) << 4)));
+            }
+        }
+        let mut dst = vec![0.0f32; 32 * 64];
+        dequant_row(GgmlType::NVFP4, &src, &mut dst).unwrap();
+        for (s, out) in dst.as_chunks::<16>().0.iter().enumerate() {
+            let scale = ue4m3(scales[s]);
+            for (i, &got) in out.iter().enumerate() {
+                let code = if i < 8 { i } else { 15 - (i - 8) } as u8;
+                let want = (e2m1(code) * scale) as f32;
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "scale {:#04x} value {i} (code {code}): got {got:e}, want {want:e}",
+                    scales[s]
+                );
+            }
+        }
+    }
+
+    /// A scale byte UE4M3 does not define — 0x7F, E4M3's NaN, or any byte
+    /// with bit 7 set — is refused naming the block, the sub-block and the
+    /// byte. Decoding it as mainline does (0x7F to 0, bit 7 dropped) passes
+    /// this test's decode, and fails it.
+    #[test]
+    fn nvfp4_refuses_an_undefined_scale_by_name() {
+        for (byte, why) in [
+            (0x7Fu8, "NaN"),
+            (0x80, "no sign bit"),
+            (0xB8, "no sign bit"),
+            (0xFF, "no sign bit"),
+        ] {
+            let mut src = vec![0x38u8; 72];
+            src[36 + 2] = byte;
+            let mut dst = [0.0f32; 128];
+            let e = dequant_row(GgmlType::NVFP4, &src, &mut dst).expect_err("undefined");
+            assert_eq!(
+                e,
+                QuantError::UndefinedScale {
+                    ty: GgmlType::NVFP4,
+                    block: 1,
+                    sub: 2,
+                    byte,
+                    why: super::ue4m3_to_f32_half(byte).unwrap_err(),
+                }
+            );
+            let text = e.to_string();
+            assert!(
+                text.contains("nvfp4")
+                    && text.contains("block 1 sub-block 2")
+                    && text.contains(why),
+                "{text}"
+            );
         }
     }
 }

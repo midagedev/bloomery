@@ -68,6 +68,9 @@ pub enum Arch {
     Glm5Next,
     MiMo2,
     NemotronH,
+    /// Nemotron-H with latent mixture-of-experts layers in place of the
+    /// dense MLP ones.
+    NemotronHMoe,
     GemmaEmbedding2,
 }
 
@@ -87,6 +90,7 @@ impl Arch {
             Arch::Glm5Next => "glm5next",
             Arch::MiMo2 => "mimo2",
             Arch::NemotronH => "nemotron_h",
+            Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
         }
     }
@@ -476,6 +480,11 @@ pub struct Moe {
     pub top_k: u32,
     /// `expert_feed_forward_length`: one expert's values.
     pub expert_ff: u32,
+    /// `moe_latent_size`: the routed experts read and write this many values,
+    /// the layer's input projected down to it before them (`ffn_latent_down`)
+    /// and their weighted sum projected back up after (`ffn_latent_up`);
+    /// `None`: they read and write the hidden row.
+    pub latent: Option<u32>,
     /// The routed experts' activation.
     pub act: Act,
     pub router: Router,

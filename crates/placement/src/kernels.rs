@@ -315,6 +315,7 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -353,6 +354,7 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -390,6 +392,7 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -427,6 +430,7 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -464,6 +468,7 @@ pub const fn head(ty: GgmlType) -> Option<HeadEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -501,6 +506,7 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -571,7 +577,7 @@ mod tests {
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.
-    const ALL: [GgmlType; 30] = [
+    const ALL: [GgmlType; 31] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q5_0,
@@ -584,6 +590,7 @@ mod tests {
         GgmlType::Q6_K,
         GgmlType::BF16,
         GgmlType::MXFP4,
+        GgmlType::NVFP4,
         GgmlType::IQ2_XXS,
         GgmlType::IQ2_XS,
         GgmlType::IQ3_XXS,
@@ -620,24 +627,25 @@ mod tests {
             GgmlType::Q6_K => 9,
             GgmlType::BF16 => 10,
             GgmlType::MXFP4 => 11,
-            GgmlType::IQ2_XXS => 12,
-            GgmlType::IQ2_XS => 13,
-            GgmlType::IQ3_XXS => 14,
-            GgmlType::IQ1_S => 15,
-            GgmlType::IQ4_NL => 16,
-            GgmlType::IQ3_S => 17,
-            GgmlType::IQ2_S => 18,
-            GgmlType::IQ4_XS => 19,
-            GgmlType::I8 => 20,
-            GgmlType::I16 => 21,
-            GgmlType::I32 => 22,
-            GgmlType::I64 => 23,
-            GgmlType::F64 => 24,
-            GgmlType::IQ1_M => 25,
-            GgmlType::TQ1_0 => 26,
-            GgmlType::TQ2_0 => 27,
-            GgmlType::Q2_0 => 28,
-            GgmlType::Unknown(_) => 29,
+            GgmlType::NVFP4 => 12,
+            GgmlType::IQ2_XXS => 13,
+            GgmlType::IQ2_XS => 14,
+            GgmlType::IQ3_XXS => 15,
+            GgmlType::IQ1_S => 16,
+            GgmlType::IQ4_NL => 17,
+            GgmlType::IQ3_S => 18,
+            GgmlType::IQ2_S => 19,
+            GgmlType::IQ4_XS => 20,
+            GgmlType::I8 => 21,
+            GgmlType::I16 => 22,
+            GgmlType::I32 => 23,
+            GgmlType::I64 => 24,
+            GgmlType::F64 => 25,
+            GgmlType::IQ1_M => 26,
+            GgmlType::TQ1_0 => 27,
+            GgmlType::TQ2_0 => 28,
+            GgmlType::Q2_0 => 29,
+            GgmlType::Unknown(_) => 30,
         }
     }
 

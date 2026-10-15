@@ -2485,6 +2485,15 @@ gate-mimo2-meta:
 gate-nemotron-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::nemotron_h --nocapture && bash tools/gate.sh --release -p bloomery-model --test nemotron_meta -- --ignored --nocapture'
 
+# nemotron_h_moe (Nemotron 3.5 Bolt 74B-A9B) header gate: the reader's refusals on synthetic headers (a missing
+# moe_latent_size, a per-layer array of the wrong length, a routed stack or bias whose expert dim is not its layer's
+# router's, routed arrays off their layer's kind, expert_count not the largest router's, a MoE key missing or of a
+# value the description cannot hold, a projection scale that is not one f32) and the coverage items of a latent MoE
+# layer, then the reader's description of the 24GB GGUF at the box's path
+# (BLOOMERY_BOX_ENV='BLOOMERY_MODEL=<path>' names another). Headers only, seconds.
+gate-nemotron-h-moe-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::nemotron_h_moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test nemotron_h_moe_meta -- --ignored --nocapture'
+
 # gemma-embedding2 (EmbeddingGemma 2) header gate: the reader's refusals on synthetic headers (a full
 # layer at the sliding head, a missing tensor, another pooling, causal attention, a key head count
 # that does not divide the heads, an odd rope, another tokenizer, a missing key) and the coverage

@@ -444,6 +444,7 @@ impl CardFormat {
             GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
             GgmlType::F16
             | GgmlType::MXFP4
+            | GgmlType::NVFP4
             | GgmlType::Q2_K
             | GgmlType::IQ2_XXS
             | GgmlType::IQ2_XS

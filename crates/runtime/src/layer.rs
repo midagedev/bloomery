@@ -179,6 +179,7 @@ mod tests {
                         experts: 288,
                         top_k: 8,
                         expert_ff: 2048,
+                        latent: None,
                         act,
                         router: Router {
                             score: Score::Sigmoid,

@@ -215,6 +215,7 @@ fn layer_of(
         experts: spec_u32("expert_count", e.n_expert)?,
         top_k: spec_u32("expert_used_count", e.n_used)?,
         expert_ff,
+        latent: None,
         act: Act::SwiGlu {
             limit: Some(kind.swiglu_limit),
         },
@@ -324,6 +325,7 @@ pub fn draft_of(hp: &DraftHparams) -> Result<DraftSpec, PlacementError> {
                     experts: spec_u32("expert_count", e.n_expert)?,
                     top_k: spec_u32("expert_used_count", e.n_used)?,
                     expert_ff,
+                    latent: None,
                     act: Act::SwiGlu {
                         limit: Some(hp.swiglu_limit[l]),
                     },

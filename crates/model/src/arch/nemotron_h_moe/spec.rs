@@ -1,0 +1,565 @@
+//! The `nemotron_h_moe` reader's [`ModelSpec`]. A Mamba-2 layer and an
+//! attention layer are the hybrid trunk's: a [`Mixer::Mamba2`], and grouped query
+//! attention with no rope, each with no feed-forward block. A MoE layer has
+//! no token mixer and a routed mixture of its own expert count and width:
+//! sigmoid scores with a selection bias, the kept weights renormalized
+//! (`expert_weights_norm`) and scaled (`expert_weights_scale`), squared-ReLU
+//! experts with no gate inside the `moe_latent_size` latent, and one
+//! squared-ReLU shared expert with no gate on the hidden row
+//! (nemotron-h.cpp:282-334). No next-token layer is read. The tool calls are
+//! the `<tool_call>` parser and the `<think>` span is read.
+
+use gguf::Split;
+use models::{
+    Act, Arch, Ffn, LayerSpec, Mixer, ModelSpec, Moe, ReasoningFormat, Residual, Router, Score,
+    Shared,
+};
+
+use super::hparams::{Hparams, Kind};
+use super::roles;
+use crate::arch::hybrid::{NO_BLOCK, TOOLS, mamba2, nope_gqa};
+use crate::arch::{Read, chat_of, spec_u32};
+use crate::placement::PlacementError;
+
+/// `split`'s description and roles, with the key defaults the reader took.
+pub fn read(split: &Split) -> Result<Read, PlacementError> {
+    let hp = Hparams::read(split)?;
+    let tensors = roles::classify(split, &hp)?;
+    let chat = chat_of(split, TOOLS, Some(ReasoningFormat::ThinkSpan))?;
+    let spec = spec_of(&hp, chat)?;
+    Ok(Read {
+        spec,
+        tensors,
+        defaults: hp.defaults,
+    })
+}
+
+/// The description of the file `hp` was read from.
+pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, PlacementError> {
+    let mamba = mamba2(&hp.ssm)?;
+    let attn = hp.attn();
+    let router = Router {
+        score: Score::Sigmoid,
+        bias: true,
+        norm: hp.weights_norm,
+        scale: hp.weights_scale,
+        hash: false,
+    };
+    let shared = Shared {
+        ff: spec_u32("expert_shared_feed_forward_length", hp.shared_ff)?,
+        act: Act::ReluSqr,
+        sigmoid_gate: false,
+    };
+    let latent = spec_u32("moe_latent_size", hp.latent)?;
+    let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
+        let (mixer, ffn) = match hp.kinds[l] {
+            Kind::Mamba => (Mixer::Mamba2(mamba), NO_BLOCK),
+            Kind::Attention => (Mixer::Gqa(nope_gqa(&attn, hp.kv[l])?), NO_BLOCK),
+            Kind::Moe => {
+                let x = hp.experts[l].expect("a MoE layer's experts are read");
+                (
+                    Mixer::None,
+                    Ffn::Moe(Moe {
+                        experts: spec_u32("the layer's router rows", x.n_expert)?,
+                        top_k: spec_u32("expert_used_count", x.top_k)?,
+                        expert_ff: spec_u32("expert_feed_forward_length", x.ff)?,
+                        latent: Some(latent),
+                        act: Act::ReluSqr,
+                        router,
+                        shared: Some(shared),
+                    }),
+                )
+            }
+        };
+        Ok(LayerSpec {
+            mixer,
+            ffn,
+            residual: Residual::Plain,
+            extras: Vec::new(),
+        })
+    };
+    Ok(ModelSpec {
+        arch: Arch::NemotronHMoe,
+        hidden: spec_u32("embedding_length", hp.n_embd)?,
+        vocab: spec_u32("vocab", hp.n_vocab)?,
+        ctx_train: spec_u32("context_length", hp.n_ctx)?,
+        rms_eps: hp.rms_eps,
+        layers: (0..hp.n_layer).map(layer).collect::<Result<Vec<_>, _>>()?,
+        mtp: Vec::new(),
+        hc: None,
+        engram: None,
+        encoder: None,
+        chat,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use models::{Act, Ffn, Mixer, RopeMode, Score};
+
+    use super::super::names;
+    use crate::arch::coverage;
+    use crate::arch::synthetic::{Ty, V, header_typed};
+    use crate::placement::Role;
+
+    /// Six layers: Mamba-2, MoE, attention, Mamba-2, MoE, MoE.
+    const KINDS: [char; 6] = ['m', 'e', 'a', 'm', 'e', 'e'];
+    const EMBD: u64 = 32;
+    const HEADS: u64 = 4;
+    const KV: i32 = 2;
+    const HEAD: u64 = 8;
+    const INNER: u64 = 32;
+    const MAMBA_HEADS: u64 = 4;
+    const GROUPS: u64 = 4;
+    const STATE: u64 = 128;
+    const CONV: u64 = 4;
+    const LATENT: u64 = 16;
+    const SHARED: u64 = 24;
+    /// Each MoE layer's (experts, width): two shapes share a count, two a
+    /// width. The largest count is `expert_count`.
+    const SHAPES: [(u64, u64); 3] = [(4, 16), (6, 32), (6, 16)];
+    const TOP_K: i32 = 2;
+
+    /// Each layer's (experts, width), `None` off the MoE layers.
+    fn shapes() -> Vec<Option<(u64, u64)>> {
+        let mut moe = SHAPES.iter();
+        KINDS
+            .iter()
+            .map(|&k| (k == 'e').then(|| *moe.next().expect("a shape a MoE layer")))
+            .collect()
+    }
+
+    fn per_layer(f: impl Fn(char, Option<(u64, u64)>) -> i32) -> V {
+        V::I32s(KINDS.iter().zip(shapes()).map(|(&k, s)| f(k, s)).collect())
+    }
+
+    fn keys() -> Vec<(&'static str, V)> {
+        let width = |_, s: Option<(u64, u64)>| s.map_or(0, |(_, w)| w as i32);
+        vec![
+            ("block_count", V::U32(KINDS.len() as u32)),
+            ("context_length", V::U32(128)),
+            ("embedding_length", V::U32(EMBD as u32)),
+            ("feed_forward_length", per_layer(width)),
+            ("attention.head_count", V::U32(HEADS as u32)),
+            (
+                "attention.head_count_kv",
+                per_layer(|k, _| if k == 'a' { KV } else { 0 }),
+            ),
+            ("attention.layer_norm_rms_epsilon", V::F32(1e-5)),
+            ("attention.layer_norm_epsilon", V::F32(1e-5)),
+            ("expert_count", V::U32(6)),
+            ("expert_group_count", V::U32(1)),
+            ("expert_group_used_count", V::U32(1)),
+            ("expert_gating_func", V::U32(2)),
+            ("vocab_size", V::U32(EMBD as u32)),
+            ("rope.dimension_count", V::U32(HEAD as u32)),
+            ("ssm.conv_kernel", V::U32(CONV as u32)),
+            ("ssm.state_size", V::U32(STATE as u32)),
+            ("ssm.group_count", V::U32(GROUPS as u32)),
+            ("ssm.inner_size", V::U32(INNER as u32)),
+            ("ssm.time_step_rank", V::U32(MAMBA_HEADS as u32)),
+            ("attention.key_length", V::U32(HEAD as u32)),
+            ("attention.value_length", V::U32(HEAD as u32)),
+            ("expert_feed_forward_length", per_layer(width)),
+            (
+                "expert_used_count",
+                per_layer(|k, _| if k == 'e' { TOP_K } else { 0 }),
+            ),
+            ("expert_shared_feed_forward_length", V::U32(SHARED as u32)),
+            ("expert_shared_count", V::U32(1)),
+            ("expert_weights_norm", V::Bool(true)),
+            ("expert_weights_scale", V::F32(5.0)),
+            ("moe_latent_size", V::U32(LATENT as u32)),
+        ]
+    }
+
+    type Tensors = Vec<(String, Vec<u64>, Ty)>;
+
+    fn one(l: usize, stem: &str, dims: Vec<u64>, out: &mut Tensors) {
+        out.push((format!("blk.{l}.{stem}"), dims, Ty::F32));
+    }
+
+    /// Layer `l`'s tensors for `kind`, at `shape` on a MoE layer.
+    fn layer(l: usize, kind: char, shape: Option<(u64, u64)>, out: &mut Tensors) {
+        let e = EMBD;
+        one(l, names::ATTN_NORM, vec![e], out);
+        match kind {
+            'm' => {
+                let gs = 2 * GROUPS * STATE;
+                let (proj, conv) = (2 * INNER + gs + MAMBA_HEADS, INNER + gs);
+                one(l, names::SSM_A, vec![1, MAMBA_HEADS], out);
+                one(l, names::SSM_D, vec![1, MAMBA_HEADS], out);
+                one(l, names::SSM_DT_BIAS, vec![MAMBA_HEADS], out);
+                one(l, names::SSM_CONV, vec![CONV, conv], out);
+                one(l, names::SSM_CONV_BIAS, vec![conv], out);
+                one(l, names::SSM_IN, vec![e, proj], out);
+                one(l, names::SSM_IN_SCALE, vec![1], out);
+                one(l, names::SSM_NORM, vec![INNER / GROUPS, GROUPS], out);
+                one(l, names::SSM_OUT, vec![INNER, e], out);
+                one(l, names::SSM_OUT_SCALE, vec![1], out);
+            }
+            'a' => {
+                let (h, kv) = (HEADS * HEAD, KV as u64 * HEAD);
+                one(l, names::ATTN_Q, vec![e, h], out);
+                one(l, names::ATTN_K, vec![e, kv], out);
+                one(l, names::ATTN_V, vec![e, kv], out);
+                one(l, names::ATTN_OUTPUT, vec![h, e], out);
+            }
+            'e' => {
+                let (n, w) = shape.expect("a MoE layer's shape");
+                one(l, names::FFN_GATE_INP, vec![e, n], out);
+                one(l, names::EXP_PROBS_B, vec![n], out);
+                one(l, names::FFN_LATENT_DOWN, vec![e, LATENT], out);
+                one(l, names::FFN_LATENT_UP, vec![LATENT, e], out);
+                one(l, names::FFN_UP_EXPS, vec![LATENT, w, n], out);
+                one(l, names::FFN_DOWN_EXPS, vec![w, LATENT, n], out);
+                one(l, names::FFN_UP_SHEXP, vec![e, SHARED], out);
+                one(l, names::FFN_DOWN_SHEXP, vec![SHARED, e], out);
+            }
+            _ => panic!("kind {kind}"),
+        }
+    }
+
+    fn tensors() -> Tensors {
+        let mut out = vec![
+            (names::token_embd(), vec![EMBD, EMBD], Ty::F32),
+            (names::output(), vec![EMBD, EMBD], Ty::F32),
+            (names::output_norm(), vec![EMBD], Ty::F32),
+        ];
+        for (l, (&kind, shape)) in KINDS.iter().zip(shapes()).enumerate() {
+            layer(l, kind, shape, &mut out);
+        }
+        out
+    }
+
+    fn load(tag: &str, kv: Vec<(&str, V)>, tensors: &Tensors) -> Result<crate::arch::Read, String> {
+        let global = [("tokenizer.ggml.pre", V::Str("pixtral"))];
+        let path = header_typed(tag, "nemotron_h_moe", &kv, &global, tensors);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let read = crate::arch::spec(&split).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&path);
+        read
+    }
+
+    /// `keys()` with `key` set to `value`, or dropped when `None`.
+    fn with(key: &str, value: Option<V>) -> Vec<(&'static str, V)> {
+        let mut kv = keys();
+        let i = kv.iter().position(|(k, _)| *k == key).expect(key);
+        match value {
+            Some(v) => kv[i].1 = v,
+            None => {
+                kv.remove(i);
+            }
+        }
+        kv
+    }
+
+    fn refused(tag: &str, kv: Vec<(&str, V)>, tensors: &Tensors, want: &[&str]) {
+        let err = load(tag, kv, tensors).expect_err(tag);
+        for w in want {
+            assert!(err.contains(w), "{tag}: want {w:?} in: {err}");
+        }
+    }
+
+    /// A MoE layer is a latent mixture of its own expert count and width,
+    /// no token mixer, squared-ReLU experts and shared expert with no gate,
+    /// a sigmoid router with the selection bias, renormalized and scaled;
+    /// the Mamba-2 and attention layers are `nemotron_h`'s. The latent pair
+    /// is a router-role matrix and `attn_norm` the pre-FFN norm on a MoE
+    /// layer. A MoE layer read at `expert_count`'s width fails this.
+    #[test]
+    fn a_moe_layer_is_a_latent_mixture_of_its_own_shape() {
+        let read = load("nhm-ok", keys(), &tensors()).expect("the header reads");
+        let s = &read.spec;
+        assert_eq!(s.arch, models::Arch::NemotronHMoe);
+        assert!(read.defaults.is_empty(), "{:?}", read.defaults);
+        let mut moe = SHAPES.iter();
+        for (l, &kind) in KINDS.iter().enumerate() {
+            match (kind, &s.layers[l].mixer, &s.layers[l].ffn) {
+                ('m', Mixer::Mamba2(m), Ffn::Dense { ff: 0, .. }) => {
+                    assert_eq!((m.n_heads, m.n_groups, m.d_state), (4, 4, 128));
+                }
+                ('a', Mixer::Gqa(q), Ffn::Dense { ff: 0, .. }) => {
+                    assert_eq!((q.heads, q.kv_heads, q.head_dim), (4, 2, 8));
+                    assert_eq!(q.rope.mode, RopeMode::None);
+                }
+                ('e', Mixer::None, Ffn::Moe(m)) => {
+                    let &(n, w) = moe.next().unwrap();
+                    assert_eq!((m.experts, m.expert_ff), (n as u32, w as u32), "layer {l}");
+                    assert_eq!((m.top_k, m.latent), (2, Some(LATENT as u32)));
+                    assert_eq!(m.act, Act::ReluSqr);
+                    assert_eq!(m.router.score, Score::Sigmoid);
+                    assert!(m.router.bias && m.router.norm && !m.router.hash);
+                    assert_eq!(m.router.scale, 5.0);
+                    let sh = m.shared.expect("a shared expert");
+                    assert_eq!((sh.ff, sh.act, sh.sigmoid_gate), (24, Act::ReluSqr, false));
+                }
+                other => panic!("layer {l} ({kind}): {other:?}"),
+            }
+        }
+        let t = &read.tensors;
+        assert_eq!((t.layers, t.experts, t.experts_used), (6, 6, 2));
+        let role = |name: String| {
+            t.tensors
+                .iter()
+                .find(|x| x.name == name)
+                .map(|x| x.role)
+                .expect("a classified tensor")
+        };
+        assert_eq!(
+            role(format!("blk.1.{}", names::FFN_LATENT_DOWN)),
+            Role::Router
+        );
+        assert_eq!(
+            role(format!("blk.1.{}", names::FFN_LATENT_UP)),
+            Role::Router
+        );
+        assert_eq!(
+            role(format!("blk.1.{}", names::FFN_UP_EXPS)),
+            Role::RoutedExperts
+        );
+        assert_eq!(
+            role(format!("blk.1.{}", names::FFN_UP_SHEXP)),
+            Role::SharedExpert
+        );
+        assert_eq!(role(format!("blk.1.{}", names::ATTN_NORM)), Role::FfnNorm);
+        assert_eq!(role(format!("blk.0.{}", names::ATTN_NORM)), Role::Attention);
+        assert_eq!(
+            role(format!("blk.0.{}", names::SSM_IN_SCALE)),
+            Role::Attention
+        );
+    }
+
+    /// The coverage check names what no program runs of a MoE layer — the
+    /// latent, the squared-ReLU experts and shared expert with no gate, the
+    /// per-layer expert shapes, the routers at their widths — and the
+    /// program, at the layers that carry each. Emitting a MoE layer's needs
+    /// as a dense layer's, or dropping one of them, fails this.
+    #[test]
+    fn coverage_names_the_latent_moe_parts() {
+        let read = load("nhm-cover", keys(), &tensors()).expect("the header reads");
+        let items = coverage::check(&read.spec, &read.tensors);
+        let at = |feature: &str| -> Vec<Option<usize>> {
+            items
+                .iter()
+                .filter(|u| u.feature == feature)
+                .map(|u| u.layer)
+                .collect()
+        };
+        let moe = vec![Some(1), Some(4), Some(5)];
+        assert_eq!(
+            at(
+                "routed experts in a 16-value latent (ffn_latent_down before them, \
+                ffn_latent_up after their sum)"
+            ),
+            moe
+        );
+        assert_eq!(at("routed experts of squared ReLU, no gate"), moe);
+        assert_eq!(at("shared expert of squared ReLU, no gate"), moe);
+        assert_eq!(
+            at("routed stacks whose expert count and width differ by layer (3 shapes)"),
+            vec![None]
+        );
+        assert_eq!(at("a layer program for nemotron_h_moe"), vec![None]);
+        for (l, n) in [(1, 4), (4, 6), (5, 6)] {
+            let want = format!("router: sigmoid, {n} experts, top 2, with a selection bias");
+            assert!(at(&want).contains(&Some(l)), "{want} at {l}: {items:?}");
+        }
+        assert!(
+            items
+                .iter()
+                .all(|u| !u.feature.starts_with("dense")
+                    && !u.feature.starts_with("squared-ReLU dense")),
+            "{items:?}"
+        );
+    }
+
+    /// FAIL-first: a header without `moe_latent_size` is refused by the key's
+    /// name. Reading the experts at the hidden width instead lets it read.
+    #[test]
+    fn a_missing_moe_latent_size_is_named() {
+        refused(
+            "nhm-nolatent",
+            with("moe_latent_size", None),
+            &tensors(),
+            &["nemotron_h_moe.moe_latent_size", "absent"],
+        );
+    }
+
+    /// FAIL-first: each per-layer array one value short of `block_count` is
+    /// refused by its name. An array read without its length check lets the
+    /// header read (the missing last layer reads as 0, a Mamba-2 layer's).
+    #[test]
+    fn a_per_layer_array_of_the_wrong_length_is_named() {
+        for key in [
+            "feed_forward_length",
+            "attention.head_count_kv",
+            "expert_feed_forward_length",
+            "expert_used_count",
+        ] {
+            let mut kv = keys();
+            let row = kv.iter_mut().find(|(k, _)| *k == key).expect(key);
+            let V::I32s(xs) = &mut row.1 else {
+                panic!("{key} is an array")
+            };
+            xs.pop();
+            refused(
+                "nhm-short",
+                kv,
+                &tensors(),
+                &[
+                    &format!("nemotron_h_moe.{key}"),
+                    "has 5 values for 6 layers",
+                ],
+            );
+        }
+    }
+
+    /// FAIL-first: a routed stack whose last dim is not its layer's expert
+    /// count (the router's rows) is refused naming the stack, both dims
+    /// listed. A stack sized by `expert_count` (6 at layer 1, of 4 experts)
+    /// is refused the same way.
+    #[test]
+    fn a_stack_whose_expert_dim_disagrees_is_named() {
+        for (stem, dims) in [
+            (names::FFN_UP_EXPS, vec![LATENT, 32, 5]),
+            (names::FFN_DOWN_EXPS, vec![32, LATENT, 5]),
+            (names::EXP_PROBS_B, vec![5]),
+        ] {
+            let mut t = tensors();
+            let name = format!("blk.4.{stem}");
+            t.iter_mut().find(|(n, ..)| *n == name).expect(stem).1 = dims;
+            refused("nhm-stack", keys(), &t, &[&name, "has other dims", "5]"]);
+        }
+        let mut t = tensors();
+        let name = format!("blk.1.{}", names::FFN_UP_EXPS);
+        t.iter_mut().find(|(n, ..)| *n == name).unwrap().1 = vec![LATENT, 16, 6];
+        refused("nhm-stack-max", keys(), &t, &[&name, "(want [16, 16, 4])"]);
+    }
+
+    /// The routed arrays agree with the layer's kind: a top-k on a Mamba-2
+    /// layer, a width on an attention layer, and a 0 on a MoE layer are each
+    /// refused naming the key and the layer.
+    #[test]
+    fn routed_arrays_off_their_kind_are_named() {
+        let cases = [
+            (
+                "expert_used_count",
+                [2, 2, 0, 0, 2, 2],
+                "is 2 at layer 0, a Mamba-2 layer, which routes nothing",
+            ),
+            (
+                "expert_feed_forward_length",
+                [0, 16, 8, 0, 32, 16],
+                "is 8 at layer 2, an attention layer, which routes nothing",
+            ),
+            (
+                "expert_used_count",
+                [0, 2, 0, 0, 0, 2],
+                "is 0 at layer 4, a MoE layer",
+            ),
+        ];
+        for (key, xs, want) in cases {
+            refused(
+                "nhm-arrays",
+                with(key, Some(V::I32s(xs.to_vec()))),
+                &tensors(),
+                &[&format!("nemotron_h_moe.{key}"), want],
+            );
+        }
+    }
+
+    /// `expert_count` is the largest layer's count: one above every router
+    /// is refused, one below a router names that router; a top-k past its
+    /// layer's experts is refused naming the layer.
+    #[test]
+    fn expert_counts_are_held_to_the_routers() {
+        refused(
+            "nhm-count-hi",
+            with("expert_count", Some(V::U32(8))),
+            &tensors(),
+            &["nemotron_h_moe.expert_count", "is 8", "has 6 rows"],
+        );
+        refused(
+            "nhm-count-lo",
+            with("expert_count", Some(V::U32(5))),
+            &tensors(),
+            &["blk.4.ffn_gate_inp.weight", "6 rows, past expert_count 5"],
+        );
+        refused(
+            "nhm-topk",
+            with("expert_used_count", Some(V::I32s(vec![0, 5, 0, 0, 2, 2]))),
+            &tensors(),
+            &[
+                "nemotron_h_moe.expert_used_count",
+                "is 5 at layer 1",
+                "4 experts",
+            ],
+        );
+    }
+
+    /// Every MoE key the reader needs is required by name, and a value the
+    /// description cannot hold is refused by name: another gating function,
+    /// a second shared expert, a group limit.
+    #[test]
+    fn the_moe_keys_are_named() {
+        for key in [
+            "expert_count",
+            "expert_shared_feed_forward_length",
+            "expert_shared_count",
+            "expert_gating_func",
+            "expert_weights_norm",
+            "expert_weights_scale",
+            "attention.layer_norm_epsilon",
+        ] {
+            refused(
+                "nhm-key",
+                with(key, None),
+                &tensors(),
+                &[&format!("nemotron_h_moe.{key}"), "absent"],
+            );
+        }
+        for (key, v, want) in [
+            (
+                "expert_gating_func",
+                V::U32(1),
+                "is 1; this reader reads the sigmoid router",
+            ),
+            (
+                "expert_shared_count",
+                V::U32(2),
+                "is 2; a layer runs one shared expert",
+            ),
+            (
+                "expert_group_count",
+                V::U32(4),
+                "is 4; the nemotron_h_moe router takes one group",
+            ),
+            (
+                "expert_weights_scale",
+                V::F32(0.0),
+                "is 0, not a finite positive value",
+            ),
+        ] {
+            refused("nhm-value", with(key, Some(v)), &tensors(), &[key, want]);
+        }
+    }
+
+    /// A projection's scale is optional, and when present one f32 value: an
+    /// f16 scale is refused by name. The unread keys are listed.
+    #[test]
+    fn a_projection_scale_is_one_optional_f32() {
+        let mut t = tensors();
+        t.retain(|(n, ..)| !n.ends_with(".scale"));
+        load("nhm-noscale", keys(), &t).expect("the scales are optional");
+        let mut t = tensors();
+        let name = format!("blk.3.{}", names::SSM_OUT_SCALE);
+        t.iter_mut().find(|(n, ..)| *n == name).unwrap().2 = Ty::F16;
+        refused(
+            "nhm-f16scale",
+            keys(),
+            &t,
+            &[&name, "is f16, not the f32 scale"],
+        );
+    }
+}

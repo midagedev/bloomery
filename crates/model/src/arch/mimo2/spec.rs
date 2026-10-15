@@ -88,6 +88,7 @@ pub fn spec_of(
                 experts: spec_u32("expert_count", hp.n_expert)?,
                 top_k: spec_u32("expert_used_count", hp.n_used)?,
                 expert_ff: spec_u32("expert_feed_forward_length", hp.expert_ff)?,
+                latent: None,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Sigmoid,

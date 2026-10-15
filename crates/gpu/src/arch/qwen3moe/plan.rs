@@ -616,6 +616,7 @@ mod tests {
                 experts: 256,
                 top_k: 8,
                 expert_ff: q35::EXPERT_FF,
+                latent: None,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Softmax,

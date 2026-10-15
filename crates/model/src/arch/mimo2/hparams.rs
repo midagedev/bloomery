@@ -14,14 +14,10 @@ use super::roles::{
     DENSE, MIXER, MOE, NEXTN, QKV_FUSED, QKV_SPLIT, SELECTION_BIAS, Stem, required,
 };
 use crate::arch::{
-    meta_f32, meta_u64, meta_usize, metadata, n_vocab, optional_usize, per_layer_count,
-    per_layer_items, positive,
+    meta_f32, meta_usize, metadata, n_vocab, one_expert_group, optional_usize, per_layer_count,
+    per_layer_items, positive, sigmoid_gating, unread_keys_of,
 };
 use crate::placement::PlacementError;
-
-/// llama.cpp's `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`, which the mimo2
-/// builder passes as a constant (:220).
-const SIGMOID: u64 = 2;
 
 /// What a layer attends, from `attention.sliding_window_pattern`: 0 a full
 /// layer, 1 a window of `sliding_window` positions (conversion/mimo.py:160).
@@ -118,16 +114,7 @@ const READ: &[&str] = &[
 /// [`Hparams::read`] does not read: listed, not refused.
 #[must_use]
 pub fn unread_keys(split: &Split) -> Vec<String> {
-    let prefix = split.arch_key("");
-    split
-        .iter_kv()
-        .map(|(k, _)| k)
-        .filter(|k| match k.strip_prefix(prefix.as_str()) {
-            Some(suffix) => !READ.contains(&suffix),
-            None => k.starts_with("general.sampling."),
-        })
-        .map(str::to_string)
-        .collect()
+    unread_keys_of(split, READ)
 }
 
 impl Hparams {
@@ -208,34 +195,9 @@ impl Hparams {
                     format!("is {n_used} of expert_count {n_expert}"),
                 ));
             }
-            let gating = match split.value(&split.arch_key("expert_gating_func")) {
-                Some(_) => meta_u64(split, "expert_gating_func")?,
-                None => {
-                    defaults.push("expert_gating_func = sigmoid (:220)".to_string());
-                    SIGMOID
-                }
-            };
-            if gating != SIGMOID {
-                return Err(metadata(
-                    split,
-                    "expert_gating_func",
-                    format!("is {gating}; this reader reads the sigmoid router ({SIGMOID})"),
-                ));
-            }
-            // The group stage runs only past one group (llama-graph.cpp
-            // `build_moe_ffn`'s `n_expert_groups > 1`), which no mimo2 file
-            // carries.
-            for key in ["expert_group_count", "expert_group_used_count"] {
-                if let Some(v) = optional_usize(split, key)?
-                    && v != 1
-                {
-                    return Err(metadata(
-                        split,
-                        key,
-                        format!("is {v}; the mimo2 router takes one group"),
-                    ));
-                }
-            }
+            // The builder passes the sigmoid router as a constant (:220).
+            sigmoid_gating(split, Some(":220"), &mut defaults)?;
+            one_expert_group(split, "the mimo2 router")?;
             (
                 n_expert,
                 n_used,

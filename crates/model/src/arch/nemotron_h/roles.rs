@@ -7,35 +7,11 @@
 use gguf::Split;
 
 use super::hparams::{Hparams, Kind};
-use super::names::{
-    ATTN_K, ATTN_NORM, ATTN_OUTPUT, ATTN_Q, ATTN_V, FFN_DOWN, FFN_UP, SSM_A, SSM_CONV,
-    SSM_CONV_BIAS, SSM_D, SSM_DT_BIAS, SSM_IN, SSM_NORM, SSM_OUT,
-};
+use super::names::{ATTN_NORM, FFN_DOWN, FFN_UP};
 use crate::arch::classify::{Counts, classify_with};
-use crate::arch::stems::{Stem, opt, req};
+use crate::arch::hybrid::{ATTENTION, MAMBA};
+use crate::arch::stems::{Stem, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
-
-/// A Mamba-2 layer. The conv bias is the one stem the loader does not require.
-pub(super) const MAMBA: &[Stem] = &[
-    req(ATTN_NORM, Role::Attention),
-    req(SSM_A, Role::Attention),
-    req(SSM_D, Role::Attention),
-    req(SSM_DT_BIAS, Role::Attention),
-    req(SSM_CONV, Role::Attention),
-    opt(SSM_CONV_BIAS, Role::Attention),
-    req(SSM_IN, Role::Attention),
-    req(SSM_NORM, Role::Attention),
-    req(SSM_OUT, Role::Attention),
-];
-
-/// An attention layer. No rope table is among the stems.
-pub(super) const ATTENTION: &[Stem] = &[
-    req(ATTN_NORM, Role::Attention),
-    req(ATTN_Q, Role::Attention),
-    req(ATTN_K, Role::Attention),
-    req(ATTN_V, Role::Attention),
-    req(ATTN_OUTPUT, Role::Attention),
-];
 
 /// A dense MLP layer. `attn_norm` is this block's pre-FFN norm.
 pub(super) const MLP: &[Stem] = &[

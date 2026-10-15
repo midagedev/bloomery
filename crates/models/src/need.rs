@@ -10,7 +10,7 @@ use gguf::GgmlType;
 
 use crate::shape::MoeShape;
 use crate::{
-    Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, LatentUp,
+    Act, Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, LatentUp,
     LayerIdx, Mixer, ModelSpec, NgramRule, PoolRule, Residual, RopeMode, Score, Selector, Source,
 };
 
@@ -105,6 +105,15 @@ pub enum Need {
     HashRouting,
     /// A shared expert of `ff` values.
     Shared { ff: u32, sigmoid_gate: bool },
+    /// Routed experts that read and write a `latent`-value row: the layer's
+    /// input projected down to it before them, their sum back up after.
+    LatentExperts { latent: u32 },
+    /// Experts (`shared`: the shared expert, else the routed ones) of an
+    /// activation other than SwiGLU, the one every routed body runs.
+    ExpertAct { shared: bool, act: Act },
+    /// Routed stacks whose expert count or width differs from layer to layer:
+    /// `shapes` distinct (count, width) pairs over the trunk.
+    ExpertShapes { shapes: u32 },
     /// A dense feed-forward layer of `ff` values.
     DenseFfn { ff: u32 },
     /// A dense squared-ReLU layer of `ff` values, with no gate.
@@ -288,6 +297,26 @@ impl fmt::Display for Need {
                 }
                 Ok(())
             }
+            Need::LatentExperts { latent } => write!(
+                f,
+                "routed experts in a {latent}-value latent (ffn_latent_down before them, \
+                 ffn_latent_up after their sum)"
+            ),
+            Need::ExpertAct { shared, act } => {
+                let who = if *shared {
+                    "shared expert"
+                } else {
+                    "routed experts"
+                };
+                match act {
+                    Act::ReluSqr => write!(f, "{who} of squared ReLU, no gate"),
+                    other => write!(f, "{who} of {}", other.what()),
+                }
+            }
+            Need::ExpertShapes { shapes } => write!(
+                f,
+                "routed stacks whose expert count and width differ by layer ({shapes} shapes)"
+            ),
             Need::DenseFfn { ff } => write!(f, "dense SwiGLU layer: ff {ff}"),
             Need::ReluSqr { ff } => write!(f, "squared-ReLU dense layer: ff {ff}"),
             Need::GeGlu { ff } => write!(f, "dense GELU GLU layer: ff {ff}"),
@@ -442,20 +471,35 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                     at(Need::HashRouting);
                 }
                 at(Need::Router(MoeShape::of(m)));
+                if let Some(latent) = m.latent {
+                    at(Need::LatentExperts { latent });
+                }
+                if !matches!(m.act, Act::SwiGlu { .. }) {
+                    at(Need::ExpertAct {
+                        shared: false,
+                        act: m.act,
+                    });
+                }
                 if let Some(s) = m.shared {
                     at(Need::Shared {
                         ff: s.ff,
                         sigmoid_gate: s.sigmoid_gate,
                     });
+                    if !matches!(s.act, Act::SwiGlu { .. }) {
+                        at(Need::ExpertAct {
+                            shared: true,
+                            act: s.act,
+                        });
+                    }
                 }
             }
             Ffn::Dense { ff, act } => match act {
-                crate::Act::SwiGlu { .. } => at(Need::DenseFfn { ff: *ff }),
+                Act::SwiGlu { .. } => at(Need::DenseFfn { ff: *ff }),
                 // Width 0 is a layer with no feed-forward block. A squared
                 // ReLU of a positive width is the block.
-                crate::Act::ReluSqr if *ff > 0 => at(Need::ReluSqr { ff: *ff }),
-                crate::Act::ReluSqr => {}
-                crate::Act::GeGlu => at(Need::GeGlu { ff: *ff }),
+                Act::ReluSqr if *ff > 0 => at(Need::ReluSqr { ff: *ff }),
+                Act::ReluSqr => {}
+                Act::GeGlu => at(Need::GeGlu { ff: *ff }),
             },
         }
         if layer.residual == Residual::Hc
@@ -488,6 +532,17 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
         }
     }
     let mut model = |n: Need| out.push((n, None));
+    let mut shapes: Vec<(u32, u32)> = Vec::new();
+    for m in spec.layers.iter().filter_map(crate::LayerSpec::moe) {
+        if !shapes.contains(&(m.experts, m.expert_ff)) {
+            shapes.push((m.experts, m.expert_ff));
+        }
+    }
+    if shapes.len() > 1 {
+        model(Need::ExpertShapes {
+            shapes: u32::try_from(shapes.len()).expect("a count of u32 layer shapes"),
+        });
+    }
     if spec
         .layers
         .iter()

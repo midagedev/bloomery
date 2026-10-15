@@ -18,9 +18,11 @@ pub mod draft;
 pub mod dspark;
 pub mod gemma_embedding2;
 pub mod glm5next;
+mod hybrid;
 pub mod mimo2;
 pub mod names;
 pub mod nemotron_h;
+pub mod nemotron_h_moe;
 pub mod qwen35moe;
 pub mod qwen3moe;
 mod stems;
@@ -42,6 +44,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
         Some("glm5next" | GLM5_NEXT_LLAMA_CPP) => glm5next::spec::read(split)?,
         Some("mimo2") => mimo2::spec::read(split)?,
         Some("nemotron_h") => nemotron_h::spec::read(split)?,
+        Some("nemotron_h_moe") => nemotron_h_moe::spec::read(split)?,
         Some(GEMMA_EMBEDDING2) => gemma_embedding2::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
@@ -143,8 +146,8 @@ fn architecture_is(is: &str) -> PlacementError {
 }
 
 /// An architecture a file's `general.architecture` names, when this crate has
-/// a reader or a program for it. `nemotron_h` and `gemma-embedding2` have a
-/// reader and no program.
+/// a reader or a program for it. `nemotron_h_moe` and `gemma-embedding2` have
+/// a reader and no program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
     Deepseek2,
@@ -154,6 +157,7 @@ pub enum Arch {
     Glm5next,
     Mimo2,
     NemotronH,
+    NemotronHMoe,
     GemmaEmbedding2,
 }
 
@@ -181,6 +185,7 @@ impl Arch {
             "glm5next" | GLM5_NEXT_LLAMA_CPP => Ok(Arch::Glm5next),
             "mimo2" => Ok(Arch::Mimo2),
             "nemotron_h" => Ok(Arch::NemotronH),
+            "nemotron_h_moe" => Ok(Arch::NemotronHMoe),
             GEMMA_EMBEDDING2 => Ok(Arch::GemmaEmbedding2),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
@@ -202,6 +207,7 @@ impl Arch {
             Arch::Glm5next => "glm5next",
             Arch::Mimo2 => "mimo2",
             Arch::NemotronH => "nemotron_h",
+            Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::GemmaEmbedding2 => GEMMA_EMBEDDING2,
         }
     }
@@ -317,6 +323,74 @@ pub(crate) fn per_layer_count(
                 .ok_or_else(|| metadata(split, suffix, format!("has no count at layer {l}")))
         })
         .collect()
+}
+
+/// The architecture keys of `split` whose suffix `read` does not list, and
+/// its `general.sampling.*` keys: what a family's reader leaves unread,
+/// listed for its meta gate to pin, not refused.
+pub(crate) fn unread_keys_of(split: &Split, read: &[&str]) -> Vec<String> {
+    let prefix = split.arch_key("");
+    split
+        .iter_kv()
+        .map(|(k, _)| k)
+        .filter(|k| match k.strip_prefix(prefix.as_str()) {
+            Some(suffix) => !read.contains(&suffix),
+            None => k.starts_with("general.sampling."),
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// `expert_gating_func`'s sigmoid router: ik's `LLM_EXPERT_GATING_FUNC_SIGMOID`
+/// and llama.cpp-mainline's `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`
+/// (src/llama-hparams.h:19), one id.
+const SIGMOID: u64 = 2;
+
+/// `expert_gating_func`, held to the sigmoid router, the one the sigmoid-router
+/// families' bodies run: another value is refused by name. An absent key is
+/// the sigmoid router where the family's loader defaults it — `absent` the
+/// line that says where, recorded in `defaults` — and refused by name where
+/// `absent` is `None`.
+pub(crate) fn sigmoid_gating(
+    split: &Split,
+    absent: Option<&str>,
+    defaults: &mut Vec<String>,
+) -> Result<(), PlacementError> {
+    let key = "expert_gating_func";
+    let gating = match (split.value(&split.arch_key(key)), absent) {
+        (None, Some(line)) => {
+            defaults.push(format!("{key} = sigmoid ({line})"));
+            SIGMOID
+        }
+        _ => meta_u64(split, key)?,
+    };
+    if gating != SIGMOID {
+        return Err(metadata(
+            split,
+            key,
+            format!("is {gating}; this reader reads the sigmoid router ({SIGMOID})"),
+        ));
+    }
+    Ok(())
+}
+
+/// `expert_group_count` and `expert_group_used_count`: absent or 1. The group
+/// stage runs only past one group (llama-graph.cpp `build_moe_ffn`'s
+/// `n_expert_groups > 1`), which `router` — the router that refuses it, as
+/// the refusal names it — does not run; any other count is refused by name.
+pub(crate) fn one_expert_group(split: &Split, router: &str) -> Result<(), PlacementError> {
+    for key in ["expert_group_count", "expert_group_used_count"] {
+        if let Some(v) = optional_usize(split, key)?
+            && v != 1
+        {
+            return Err(metadata(
+                split,
+                key,
+                format!("is {v}; {router} takes one group"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Required tensors at their expected dimensions; missing names precede dimension errors.
@@ -649,6 +723,8 @@ pub(crate) mod synthetic {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Ty {
         F32,
+        /// Two bytes a value.
+        F16,
         /// Blocks of 32 values in 34 bytes; the first dim a multiple of 32.
         Q8_0,
         /// Blocks of 256 values in 210 bytes; any first dim (a partial final
@@ -663,6 +739,7 @@ pub(crate) mod synthetic {
         fn id_and_bytes(self, n: u64) -> (u32, u64) {
             match self {
                 Ty::F32 => (0, 4 * n),
+                Ty::F16 => (1, 2 * n),
                 Ty::Q8_0 => {
                     assert!(n.is_multiple_of(32), "{n} values are not whole Q8_0 blocks");
                     (8, n / 32 * 34)
@@ -784,6 +861,7 @@ mod tests {
             Arch::Glm5next,
             Arch::Mimo2,
             Arch::NemotronH,
+            Arch::NemotronHMoe,
             Arch::GemmaEmbedding2,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);

@@ -49,7 +49,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
         Arch::MiMo2 => Some(Program::Mimo2Body),
         Arch::NemotronH => Some(Program::NemotronHBody),
-        Arch::GemmaEmbedding2 => None,
+        Arch::NemotronHMoe | Arch::GemmaEmbedding2 => None,
     }
 }
 

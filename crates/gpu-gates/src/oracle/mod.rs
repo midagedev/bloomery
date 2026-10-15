@@ -129,6 +129,7 @@ pub fn for_arch(a: Arch) -> Result<&'static Oracle, GateError> {
             Err("mimo2 has no oracle row: its gate reads the sets through refset's family".into())
         }
         Arch::NemotronH => Err("nemotron_h has no oracle row: no program runs it".into()),
+        Arch::NemotronHMoe => Err("nemotron_h_moe has no oracle row: no program runs it".into()),
         Arch::GemmaEmbedding2 => {
             Err("gemma-embedding2 has no oracle row: no program runs it".into())
         }

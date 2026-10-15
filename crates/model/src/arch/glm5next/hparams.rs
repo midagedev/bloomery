@@ -8,13 +8,10 @@ use gguf::{Split, Value};
 
 use super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, required};
 use crate::arch::{
-    meta_arr, meta_bool, meta_f32, meta_u64, meta_usize, metadata, n_vocab, nextn_layers,
-    optional_usize, positive,
+    meta_arr, meta_bool, meta_f32, meta_usize, metadata, n_vocab, nextn_layers, one_expert_group,
+    optional_usize, positive, sigmoid_gating, unread_keys_of,
 };
 use crate::placement::PlacementError;
-
-/// ik's `LLM_EXPERT_GATING_FUNC_SIGMOID` (`src/llama-hparams.h`).
-const SIGMOID: u64 = 2;
 
 /// What a layer mixes with: `attention.head_count_kv` 0 marks a KDA layer,
 /// 1 a latent one (:2388-2391), and the tensors must agree.
@@ -171,16 +168,7 @@ const READ: &[&str] = &[
 /// [`Hparams::read`] does not read: listed, not refused.
 #[must_use]
 pub fn unread_keys(split: &Split) -> Vec<String> {
-    let prefix = split.arch_key("");
-    split
-        .iter_kv()
-        .map(|(k, _)| k)
-        .filter(|k| match k.strip_prefix(prefix.as_str()) {
-            Some(suffix) => !READ.contains(&suffix),
-            None => k.starts_with("general.sampling."),
-        })
-        .map(str::to_string)
-        .collect()
+    unread_keys_of(split, READ)
 }
 
 impl Hparams {
@@ -286,31 +274,8 @@ impl Hparams {
                 format!("is {n_used} of expert_count {n_expert}"),
             ));
         }
-        for key in ["expert_group_count", "expert_group_used_count"] {
-            if let Some(v) = optional_usize(split, key)?
-                && v != 1
-            {
-                return Err(metadata(
-                    split,
-                    key,
-                    format!("is {v}; ik's glm5next router takes one group"),
-                ));
-            }
-        }
-        let gating = match split.value(&split.arch_key("expert_gating_func")) {
-            Some(_) => meta_u64(split, "expert_gating_func")?,
-            None => {
-                defaults.push("expert_gating_func = sigmoid (:2330-2333)".to_string());
-                SIGMOID
-            }
-        };
-        if gating != SIGMOID {
-            return Err(metadata(
-                split,
-                "expert_gating_func",
-                format!("is {gating}; this reader reads the sigmoid router ({SIGMOID})"),
-            ));
-        }
+        one_expert_group(split, "ik's glm5next router")?;
+        sigmoid_gating(split, Some(":2330-2333"), &mut defaults)?;
         // ik divides the picks' weights by their sum only `if (norm_w)`
         // (llm_build_context :1548); the body runs that rule alone.
         let weights_norm = meta_bool(split, "expert_weights_norm")?;

@@ -76,6 +76,7 @@ pub fn spec_of(
                     experts: spec_u32("expert_count", e.n_expert)?,
                     top_k: spec_u32("expert_used_count", e.n_used)?,
                     expert_ff: spec_u32("expert_feed_forward_length", e.ff)?,
+                    latent: None,
                     act: Act::SwiGlu { limit: None },
                     router: Router {
                         score: match e.score {

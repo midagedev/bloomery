@@ -57,6 +57,7 @@ impl AnyEngine {
                 | Arch::Glm5next
                 | Arch::Mimo2
                 | Arch::NemotronH
+                | Arch::NemotronHMoe
                 | Arch::GemmaEmbedding2),
             ) => {
                 return Err(GpuError::UnsupportedArch(a.name().to_string()));

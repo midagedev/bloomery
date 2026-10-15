@@ -114,11 +114,12 @@ FROM_NAME = {
     "Glm5next": ("glm5next", "glm5-next"),
     "Mimo2": ("mimo2",),
     "NemotronH": ("nemotron_h",),
+    "NemotronHMoe": ("nemotron_h_moe",),
     "GemmaEmbedding2": ("gemma-embedding2",),
 }
 # crates/model/src/arch/mod.rs:spec — the architectures the model reader takes (QWEN35_BODY is `qwen35` and `clef`).
 SPEC = ("deepseek41", "deepseek4", "qwen3moe", "qwen35moe", "qwen4exp", "qwen35", "clef", "glm5next", "glm5-next",
-        "mimo2", "nemotron_h", "gemma-embedding2")
+        "mimo2", "nemotron_h", "nemotron_h_moe", "gemma-embedding2")
 # crates/gpu-gates/src/bin/shared/serve_seats/decide.rs:ROWS with the constants of
 # crates/decision/src/release/{clef,lev}.rs.
 DECIDE_ROWS = (
@@ -263,6 +264,10 @@ def route(arch, decision, repo, card, spec=None):
         return None, no_head(arch)
     else:
         seat = next((s for s in SEAT_ORDER if serves(s, arch)), None)
+        if seat is None and arch in spec:
+            # bloomery_serve.rs:no_seat lists what no program runs of a file the reader describes; the list is
+            # the file's, which this mirror does not compute.
+            return None, f"a {arch} file, which no seat serves: the coverage list (model::arch::coverage::check)"
         if seat is None:
             return None, f"a {arch} file, which no seat serves; the seats are --model " + ", ".join(SEAT_WORDS)
     if arch not in spec:
@@ -1734,8 +1739,8 @@ def self_test():
          "qwen36"),
         ("a name dropped from the source is named", ARCH_RS, '"glm5next" | GLM5_NEXT_LLAMA_CPP =>', '"glm5next" =>',
          "glm5-next"),
-        ("an id added to GgmlType::from_u32 is named", QUANT_RS, "            39 => GgmlType::MXFP4,\n",
-         "            39 => GgmlType::MXFP4,\n            40 => GgmlType::NVFP4,\n", "'40'"),
+        ("an id added to GgmlType::from_u32 is named", QUANT_RS, "            40 => GgmlType::NVFP4,\n",
+         "            40 => GgmlType::NVFP4,\n            41 => GgmlType::Q1_0,\n", "'41'"),
         ("a new site read against a body35 list is named", BODY35_RS,
          "v_ty: ty_of(file, &v, kv, h, PROJ)?,", "v_ty: ty_of(file, &v, kv, h, PROJ)?, x_ty: ty_of(file, &v, kv, h, PROJ)?,",
          "sites per list PROJ"),

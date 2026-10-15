@@ -42,7 +42,9 @@
 //! name, saying what would seat it (`--head`, a row's `--hf` repo, or a file
 //! that carries its head); a
 //! file whose architecture no seat serves is refused by name listing the
-//! seat words; a file whose architecture does not match an explicit
+//! seat words, or, when the model reader describes it, listing what no
+//! program runs of it (`model::arch::coverage::check`, as the plans refuse
+//! it); a file whose architecture does not match an explicit
 //! `--model` is refused by name before any load.
 //! `--version` prints this crate's version and the build's commit and exits.
 //!
@@ -296,13 +298,7 @@ models (the --model word is optional with a model file: the file's architecture 
                     .iter()
                     .copied()
                     .find(|m| m.serves(a))
-                    .ok_or_else(|| {
-                        format!(
-                            "{} is a {a} file, which no seat serves; the seats are --model {}",
-                            path.display(),
-                            seat_words()
-                        )
-                    })?,
+                    .ok_or_else(|| no_seat(&path, &split, a))?,
                 a.to_owned(),
             ),
             None => {
@@ -315,6 +311,31 @@ models (the --model word is optional with a model file: the file's architecture 
             }
         };
         Ok((seat, arch))
+    }
+
+    /// The refusal of a file of architecture `a` that no seat serves: what no
+    /// program runs of it (the coverage list the plans refuse a file with)
+    /// when the model reader describes it, else the seat words, with the
+    /// reader's refusal when it has one of its own.
+    fn no_seat(path: &std::path::Path, split: &Split, a: &str) -> String {
+        let head = format!("{} is a {a} file, which no seat serves", path.display());
+        match model::arch::spec(split) {
+            Ok(read) => {
+                let missing = model::arch::coverage::check(&read.spec, &read.tensors);
+                if missing.is_empty() {
+                    format!("{head}; the seats are --model {}", seat_words())
+                } else {
+                    format!(
+                        "{head}: {}",
+                        model::placement::PlacementError::Unimplemented(missing)
+                    )
+                }
+            }
+            Err(model::ModelError::UnknownArchitecture(_)) => {
+                format!("{head}; the seats are --model {}", seat_words())
+            }
+            Err(e) => format!("{head} ({e}); the seats are --model {}", seat_words()),
+        }
     }
 
     /// The `general.architecture` of the model file's first shard

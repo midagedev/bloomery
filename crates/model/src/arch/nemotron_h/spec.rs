@@ -6,19 +6,15 @@
 //! is read.
 
 use gguf::Split;
-use models::{
-    Act, Arch, Ffn, Gqa, LayerSpec, Mamba2, Mixer, ModelSpec, ReasoningFormat, Residual, Rope,
-    RopeMode, ToolFormat,
-};
+use models::{Act, Arch, Ffn, LayerSpec, Mixer, ModelSpec, ReasoningFormat, Residual};
 
 use super::hparams::{Hparams, Kind};
 use super::roles;
+use crate::arch::hybrid::{Attn, NO_BLOCK, mamba2, nope_gqa};
 use crate::arch::{Read, chat_of, spec_u32};
 use crate::placement::PlacementError;
 
-/// The tool-call markup the family's template teaches: `<tool_call>` with
-/// `<function=…>` and `<parameter=…>`.
-pub const TOOLS: Option<ToolFormat> = Some(ToolFormat::QwenXml);
+pub use crate::arch::hybrid::TOOLS;
 
 /// `split`'s description and roles. This reader takes no key default.
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
@@ -35,45 +31,16 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
 
 /// The description of the file `hp` was read from.
 pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, PlacementError> {
-    let mamba = Mamba2 {
-        d_inner: spec_u32("ssm.inner_size", hp.ssm.d_inner)?,
-        d_state: spec_u32("ssm.state_size", hp.ssm.d_state)?,
-        n_heads: spec_u32("ssm.time_step_rank", hp.ssm.n_heads)?,
-        head_dim: spec_u32("ssm.inner_size / ssm.time_step_rank", hp.ssm.head_dim)?,
-        n_groups: spec_u32("ssm.group_count", hp.ssm.n_groups)?,
-        d_conv: spec_u32("ssm.conv_kernel", hp.ssm.d_conv)?,
-        d_in_proj: spec_u32("ssm input projection", hp.ssm.d_in_proj)?,
-    };
-    let no_block = Ffn::Dense {
-        ff: 0,
-        act: Act::ReluSqr,
+    let mamba = mamba2(&hp.ssm)?;
+    let attn = Attn {
+        n_head: hp.n_head,
+        key_len: hp.key_len,
+        value_len: hp.value_len,
     };
     let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
         let (mixer, ffn) = match hp.kinds[l] {
-            Kind::Mamba => (Mixer::Mamba2(mamba), no_block.clone()),
-            Kind::Attention => (
-                Mixer::Gqa(Gqa {
-                    heads: spec_u32("attention.head_count", hp.n_head)?,
-                    kv_heads: spec_u32("attention.head_count_kv", hp.kv[l])?,
-                    head_dim: spec_u32("attention.key_length", hp.key_len)?,
-                    value_dim: spec_u32("attention.value_length", hp.value_len)?,
-                    // No value is rotated. `rope.dimension_count` was read
-                    // and is not this layer's.
-                    rope: Rope {
-                        mode: RopeMode::None,
-                        dims: 0,
-                        base: 0.0,
-                        yarn: None,
-                    },
-                    qk_norm: false,
-                    out_gate: false,
-                    select: None,
-                    window: None,
-                    sinks: false,
-                    value_scale: None,
-                }),
-                no_block.clone(),
-            ),
+            Kind::Mamba => (Mixer::Mamba2(mamba), NO_BLOCK),
+            Kind::Attention => (Mixer::Gqa(nope_gqa(&attn, hp.kv[l])?), NO_BLOCK),
             Kind::Mlp => (
                 Mixer::None,
                 Ffn::Dense {
@@ -390,10 +357,11 @@ pub(super) mod tests {
         assert!(err.contains(&norm), "{err}");
     }
 
-    /// `nemotron_h_moe`, and any other `nemotron*` string, is not this reader.
+    /// `nemotron_h_moe` is its own family, read by its own reader; any other
+    /// `nemotron*` string is not a reader's.
     #[test]
-    fn nemotron_h_moe_is_unknown() {
-        for arch in ["nemotron_h_moe", "nemotron", "nemotron_x"] {
+    fn nemotron_h_moe_is_its_own_family() {
+        for arch in ["nemotron", "nemotron_x"] {
             assert!(
                 Arch::from_name(arch).is_err(),
                 "{arch} is a known architecture"
@@ -402,6 +370,14 @@ pub(super) mod tests {
             assert_eq!(err, format!("unsupported architecture \"{arch}\""));
         }
         assert_eq!(Arch::from_name("nemotron_h").unwrap(), Arch::NemotronH);
+        assert_eq!(
+            Arch::from_name("nemotron_h_moe").unwrap(),
+            Arch::NemotronHMoe
+        );
+        // The nemotron_h_moe reader, not this one: its first refusal names
+        // its own prefix.
+        let err = load("nemotron_h_moe", "nemotron_h_moe", vec![], &[]).expect_err("no keys");
+        assert!(err.contains("nemotron_h_moe.block_count"), "{err}");
     }
 
     /// Each `ssm.*` key is required by name. Dropping the check for one of
