@@ -29,15 +29,14 @@ LIBLLAMA=$(ldd "$TOKENIZE" | awk '$1 == "libllama.so" || $1 == "libllama.so.0" {
 [ -f "$LIBLLAMA" ] || { echo "dump-nemotron: $TOKENIZE loads no libllama.so (ldd names '$LIBLLAMA')" >&2; exit 66; }
 TOK_MD5=$(md5sum < "$TOKENIZE" | cut -d' ' -f1)
 LIB_MD5=$(md5sum < "$LIBLLAMA" | cut -d' ' -f1)
-[ "$TOK_MD5" = 5df95d3a942effc971ff170432d840fd ] || {
-  echo "dump-nemotron: llama-tokenize md5 is $TOK_MD5, the pinned mainline is 5df95d3a942effc971ff170432d840fd" >&2
+# The pin literals live in the build script, which wrote this record. A live
+# binary that does not match it is not the one nemotron_ref was linked against.
+want_build=$(awk '$1 == "build" { $1 = ""; sub(/^ /, ""); print; exit }' "$REC")
+[ "llama-tokenize $TOK_MD5 libllama.so $LIB_MD5" = "$want_build" ] || {
+  echo "dump-nemotron: $TOKENIZE or $LIBLLAMA differs from the build $BIN was linked against ($want_build)" >&2
   exit 2
 }
-[ "$LIB_MD5" = 3575b1f39e7773379fec011d39f32a77 ] || {
-  echo "dump-nemotron: libllama md5 is $LIB_MD5, the pinned mainline is 3575b1f39e7773379fec011d39f32a77" >&2
-  exit 2
-}
-export BLOOMERY_REF_BUILD="llama-tokenize $TOK_MD5 libllama.so $LIB_MD5"
+export BLOOMERY_REF_BUILD="$want_build"
 export CUDA_VISIBLE_DEVICES=""
 
 TEXT=$BLOOMERY_DATA/ref-tokenizer-nemotron

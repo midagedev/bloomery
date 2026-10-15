@@ -107,7 +107,7 @@ pub static QWEN38: Family = Family {
 };
 
 /// The Nemotron 3 Nano 4B file the tokenizer gate loads (`pixtral`).
-pub(crate) const NEMOTRON_MODEL: &str =
+const NEMOTRON_MODEL: &str =
     "/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf";
 
 /// Nemotron 3 Nano 4B's set (`pixtral` pre-tokenizer).
@@ -141,7 +141,7 @@ fn qwen38_model() -> Result<String, RefError> {
     Ok(super::qwen4exp::MODEL.to_string())
 }
 
-fn nemotron_model() -> Result<String, RefError> {
+pub(crate) fn nemotron_model() -> Result<String, RefError> {
     Ok(NEMOTRON_MODEL.to_string())
 }
 

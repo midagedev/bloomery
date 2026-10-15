@@ -13,12 +13,6 @@
 #                   nemotron_ref links its existing build and does not rebuild it: a rebuild
 #                   moves the md5s the tokenizer family pins.
 #   IK              no ik oracle. The default is only so IKBIN can be formed; nothing here runs it.
-#   LOGITS_SET      ref-nemotron-logits under $BLOOMERY_DATA: four last-position rows.
-#   CODE_TEXT       the tokenizer oracle's copy of the code corpus the other families use
-#                   (engram-corpus.sh: the reference tree's src/*.cpp).
-#   PROSE_TEXT      the same for prose (that tree's docs/**/*.md and README).
-#   PROMPTS         name:count:text. The counts include the BOS the file adds. code5 and
-#                   code29 are prefixes of CODE_TEXT; prose64 and prose512 of PROSE_TEXT.
 #
 # No lease and no card: the file is a few gigabytes and the dump hides CUDA.
 #
@@ -28,7 +22,3 @@ MODEL_NAME=nemotron_h
 : "${IK:=/home/user/ik-idxkey}"
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf}
-: "${LOGITS_SET:=ref-nemotron-logits}"
-CODE_TEXT=${BLOOMERY_DATA:-/root/bloomery-data}/ref-tokenizer-nemotron/code.txt
-PROSE_TEXT=${BLOOMERY_DATA:-/root/bloomery-data}/ref-tokenizer-nemotron/prose.txt
-PROMPTS=(code5:5:code code29:29:code prose64:64:prose prose512:512:prose)

@@ -219,13 +219,7 @@ impl LogitsSet {
                 format!("{} holds {n} ids, {} wants {}", p.ids_file, p.name, p.n_ids),
             ));
         }
-        let row = self.logits(p)?;
-        if row.len() != p.n_vocab as usize {
-            return Err(RefError::malformed(
-                self.dir.join(&p.logits_file).display(),
-                format!("{} logits, {} wants {}", row.len(), p.name, p.n_vocab),
-            ));
-        }
+        self.logits(p)?;
         Ok(())
     }
 }

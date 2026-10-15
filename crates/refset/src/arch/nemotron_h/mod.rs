@@ -1,23 +1,15 @@
-//! The Nemotron 3 Nano family. The logits set is dumped from [`MODEL`] by
-//! mainline llama.cpp ([`super::tokenizer::NEMOTRON_BUILD`]), which is the
-//! build the tokenizer family already pins. ik has no `nemotron_h`.
+//! The Nemotron 3 Nano family. The logits set is dumped from the tokenizer
+//! family's model ([`super::tokenizer::nemotron_model`]) by mainline llama.cpp
+//! ([`super::tokenizer::NEMOTRON_BUILD`]), the build that family already pins.
+//! ik has no `nemotron_h`.
 
-use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 /// The architecture every nemotron manifest names in its `# arch` line.
 pub const ARCH: &str = "nemotron_h";
 
-/// The file the tree runs. The tokenizer family owns the path.
-pub const MODEL: &str = super::tokenizer::NEMOTRON_MODEL;
-
 /// Last-position logits of four prompts, mainline on the CPU.
 pub const LOGITS_SET: &str = "ref-nemotron-logits";
-
-/// [`MODEL`], as a family's `runs`.
-fn model() -> Result<String, RefError> {
-    Ok(MODEL.to_string())
-}
 
 /// Mainline's last-position logits (`just dump-ref-nemotron`).
 pub static LOGITS: Family = Family {
@@ -28,7 +20,7 @@ pub static LOGITS: Family = Family {
     identity: Identity::NemotronLogits,
     arch: Some(ARCH),
     build: Some(Build::Is(super::tokenizer::NEMOTRON_BUILD)),
-    runs: Some(model),
+    runs: Some(super::tokenizer::nemotron_model),
     draft_runs: None,
     consumers: &[],
 };
@@ -90,7 +82,12 @@ mod tests {
         };
         assert_eq!(p, crate::arch::tokenizer::NEMOTRON_BUILD);
         assert_eq!(LOGITS.sets, &["ref-nemotron-logits"]);
-        assert_eq!(runs(), crate::arch::tokenizer::NEMOTRON_MODEL);
+        assert_eq!(
+            runs(),
+            crate::arch::tokenizer::NEMOTRON
+                .runs()
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
     }
 
     /// A finished set opens, and `logits` is that column's file.
