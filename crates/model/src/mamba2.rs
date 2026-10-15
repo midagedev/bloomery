@@ -116,6 +116,13 @@ impl Checked {
         self.conv_dim
     }
 
+    /// The in-projection's row: `z`, `xBC` and `dt` side by side,
+    /// `d_inner + conv_dim + n_head` values.
+    #[must_use]
+    pub fn in_proj_width(self) -> usize {
+        self.geom.d_inner + self.conv_dim + self.geom.n_heads
+    }
+
     /// The widths this check accepted.
     #[must_use]
     pub fn geom(self) -> Geom {

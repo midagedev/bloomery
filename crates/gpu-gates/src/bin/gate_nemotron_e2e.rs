@@ -502,18 +502,8 @@ mod gate {
                 ok = false;
                 continue;
             }
-            let max_delta = got
-                .iter()
-                .zip(&want)
-                .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
-                .fold(0.0, f64::max);
-            let dot: f64 = got
-                .iter()
-                .zip(&want)
-                .map(|(a, b)| f64::from(*a) * f64::from(*b))
-                .sum();
-            let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-            let cosine = dot / (norm(&got) * norm(&want));
+            let max_delta = max_delta(&got, &want);
+            let cosine = cosine(&got, &want);
             let (top_got, top_want) = (top_ids(&got, TOP_K), top_ids(&want, TOP_K));
             let (mut set_got, mut set_want) = (top_got.clone(), top_want.clone());
             set_got.sort_unstable();

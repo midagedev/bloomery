@@ -353,7 +353,7 @@ impl Body {
                 Layer::Mamba(mm) => {
                     let g = sh.mamba.geom();
                     let (inner, conv_dim) = (g.d_inner, sh.mamba.conv_dim());
-                    let ld = 2 * inner + 2 * g.n_groups * g.d_state + g.n_heads;
+                    let ld = sh.mamba.in_proj_width();
                     norm_rows((gpu, w), (sh.eps, sh.hidden, m), &mm.norm, src, xn)?;
                     project(&cx, (acts, route), l, xn, &mut [(&mm.ssm_in, ld, zxbcdt)])?;
                     self.k.mamba.enqueue_steps(

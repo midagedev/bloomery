@@ -212,7 +212,7 @@ impl Scratch {
         Ok(Scratch {
             xn: z(sh.hidden)?,
             delta: z(sh.hidden)?,
-            zxbcdt: z(2 * g.d_inner + 2 * g.n_groups * g.d_state + g.n_heads)?,
+            zxbcdt: z(sh.mamba.in_proj_width())?,
             y: z(g.d_inner)?,
             q: z(n_head * HEAD)?,
             k: z(kv_width)?,

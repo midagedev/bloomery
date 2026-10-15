@@ -127,7 +127,7 @@ impl Body {
                 PASS_ROWS.min(ctx),
                 &PromptShape {
                     hidden,
-                    ld: 2 * ssm.d_inner + 2 * ssm.n_groups * ssm.d_state + ssm.n_heads,
+                    ld: mamba.in_proj_width(),
                     inner: ssm.d_inner,
                     n_head: hp.n_head,
                     n_kv,
