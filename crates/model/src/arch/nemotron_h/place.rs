@@ -12,9 +12,6 @@
 //! with the context, and a Mamba-2 layer's scan state and conv ring, which do
 //! not; an MLP layer holds nothing ([`KvLayout::layer_bytes`]).
 
-use std::num::NonZeroUsize;
-
-use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::Split;
 use models::ModelSpec;
 use runtime::stores::{dense_kv_bytes, mamba2_bytes};
@@ -32,8 +29,6 @@ use crate::placement::{
 /// What a plan of a `nemotron_h` file is made from, read from its headers.
 #[derive(Clone, Debug)]
 pub struct PlanInputs {
-    /// The file's hyperparameters.
-    pub hp: Hparams,
     /// Every tensor with its role, and the model's layer count.
     pub model: ModelTensors,
     /// The typed model description the coverage check reads.
@@ -114,7 +109,6 @@ impl PlanInputs {
         let read = spec::read(split)?;
         let kv = KvLayout::of(&hp);
         Ok(PlanInputs {
-            hp,
             model: read.tensors,
             spec: read.spec,
             kv,
@@ -135,20 +129,6 @@ impl PlanInputs {
         ctx_max: u64,
         levers: &PlanLevers,
     ) -> Result<Plan<'a>, PlaceError> {
-        self.plan_with_slots(machine, ctx_max, levers, NonZeroUsize::MIN)
-    }
-
-    /// The placement of a load that serves `slots` resident sequences of
-    /// `ctx_max` positions each: every layer's stores counted `slots` times
-    /// on the card ([`SeqTerms::slots_of`] over [`PlanInputs::seq_terms`]),
-    /// refused as [`PlanInputs::plan`] refuses.
-    pub fn plan_with_slots<'a>(
-        &'a self,
-        machine: &'a Machine,
-        ctx_max: u64,
-        levers: &PlanLevers,
-        slots: NonZeroUsize,
-    ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max == 0 {
             return Err(PlaceError::CtxZero);
         }
@@ -161,31 +141,15 @@ impl PlanInputs {
         if machine.cards.len() != 1 {
             return Err(PlaceError::Cards(machine.cards.len()));
         }
-        let kv = self.seq_terms().slots_of(slots.get() as u64);
         let plan = placement::plan_routed(
             &self.model,
             machine,
             ctx_max,
-            &kv,
+            &self.kv,
             levers,
             routed_rule(Program::NemotronHBody),
         )?;
         checked(plan).map_err(PlaceError::Broken)
-    }
-
-    /// What one resident sequence of a load of the file holds on its card
-    /// ([`SeqTerms`]): its stores over the layers ([`KvLayout`]), no draft
-    /// and nothing beside them.
-    #[must_use]
-    pub fn seq_terms(&self) -> SeqTerms<'_> {
-        SeqTerms {
-            layers: Stores {
-                kv: &self.kv,
-                count: self.hp.n_layer,
-            },
-            draft: None,
-            beside: 0,
-        }
     }
 }
 
@@ -245,7 +209,7 @@ mod tests {
     use gguf::Split;
 
     use super::super::spec::tests::{CONV, HEAD, INNER, KV, geo, keys, tensors};
-    use super::{KvBytes, KvLayout, PlaceError, PlanInputs, PlanLevers};
+    use super::{KvBytes, PlaceError, PlanInputs, PlanLevers};
     use crate::arch::synthetic::{V, header_shaped};
     use crate::placement::workstation;
 
@@ -308,7 +272,7 @@ mod tests {
     #[test]
     fn the_context_moves_only_the_attention_term() {
         let inputs = inputs("nemotron-place-ctx");
-        let machine = workstation::plan_gate(inputs.hp.n_layer);
+        let machine = workstation::plan_gate(inputs.model.layers);
         let levers = PlanLevers::default();
         let (a, b) = (1_024u64, 4_096u64);
         let small = inputs.plan(&machine, a, &levers).expect("a short plan");
@@ -334,7 +298,7 @@ mod tests {
     fn a_machine_or_context_the_body_does_not_run_is_refused() {
         let inputs = inputs("nemotron-place-refuse");
         let levers = PlanLevers::default();
-        let machine = workstation::plan_gate(inputs.hp.n_layer);
+        let machine = workstation::plan_gate(inputs.model.layers);
         assert!(matches!(
             inputs.plan(&machine, 0, &levers),
             Err(PlaceError::CtxZero)
@@ -366,30 +330,5 @@ mod tests {
             ),
             other => panic!("{other:?}, not the card-count refusal"),
         }
-    }
-
-    /// The count of resident sequences multiplies every layer's stores.
-    #[test]
-    fn slots_count_every_sequence() {
-        let inputs = inputs("nemotron-place-slots");
-        let machine = workstation::plan_gate(inputs.hp.n_layer);
-        let levers = PlanLevers::default();
-        let one = inputs.plan(&machine, 1_024, &levers).expect("one slot");
-        let three = inputs
-            .plan_with_slots(
-                &machine,
-                1_024,
-                &levers,
-                std::num::NonZeroUsize::new(3).unwrap(),
-            )
-            .expect("three slots");
-        assert_eq!(three.cards[0].kv_bytes, 3 * one.cards[0].kv_bytes);
-        let layout: &KvLayout = &inputs.kv;
-        assert_eq!(
-            inputs.seq_terms().bytes(1_024, 1),
-            (0..inputs.hp.n_layer)
-                .map(|l| layout.layer_bytes(l, 1_024))
-                .sum::<u64>()
-        );
     }
 }

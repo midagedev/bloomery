@@ -20,6 +20,7 @@ use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
+use model::arch::names::blk as layer_name;
 use model::arch::nemotron_h::hparams::{Hparams, Kind};
 use model::arch::nemotron_h::names;
 use model::mamba2::Geom;
@@ -41,7 +42,6 @@ pub struct DecodeInput {
 
 /// The nemotron_h chain over one sequence on one card.
 pub struct Body {
-    pub(super) hp: Hparams,
     /// The Q5_0 token table's name.
     pub(super) embed: String,
     pub(super) sh: Shape,
@@ -129,7 +129,6 @@ impl Body {
             sh,
             layers,
             embed,
-            hp,
         })
     }
 
@@ -271,11 +270,6 @@ impl Names<'_> {
     }
 }
 
-/// `blk.{l}.{stem}`.
-fn layer_name(l: usize, stem: &str) -> String {
-    format!("blk.{l}.{stem}")
-}
-
 impl ChainBody for Body {
     type Input = DecodeInput;
     type Host = NoHost;
@@ -329,7 +323,7 @@ impl ChainBody for Body {
     }
 
     fn head_eps(&self) -> f32 {
-        self.hp.rms_eps
+        self.sh.eps
     }
 
     fn resident_bytes(&self) -> usize {

@@ -846,6 +846,12 @@ impl<B: ChainBody> GpuModel<B> {
         self.body.layers()
     }
 
+    /// The positions the resident caches were sized for: the most a
+    /// sequence holds.
+    pub fn ctx_max(&self) -> usize {
+        self.ctx_max
+    }
+
     /// Device bytes of everything this model holds resident: the weights and
     /// the body, plus the heads' scratch — a multi-row pass's heads once one
     /// has run — and every parked slot's sequence

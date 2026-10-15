@@ -70,8 +70,8 @@ use std::time::Instant;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu::{Gpu, NemotronHModel};
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, keep_where_standing,
-    model_props, note_line, parallel_line, placement_of, slots_of,
+    ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
+    parallel_line, placement_of, slots_of,
 };
 use bloomery_gpu_gates::generate::{Place, choose_ctx};
 use bloomery_gpu_gates::record::{self, Record};
@@ -131,18 +131,19 @@ impl Nemotron {
         let mut m = NemotronHModel::open(gpu, file, a.ctx)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
+        let ctx = m.ctx_max();
         let total = t.elapsed();
         Record::new(&record::LOAD_NEMOTRON)
             .w("arch", "nemotron_h")
             .u("resident_bytes", m.resident_bytes())
-            .u("ctx", a.ctx)
+            .u("ctx", ctx)
             .u("slots", 1)
             .u("layers", m.layers().len())
             .u("graph_nodes", nodes)
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(&m, total, opened);
-        Ok(Nemotron { m, ctx: a.ctx })
+        Ok(Nemotron { m, ctx })
     }
 }
 
@@ -189,7 +190,11 @@ impl Seat for Nemotron {
     /// `n` when it is the whole held sequence, else nothing: the caller then
     /// resets the slot and feeds the prompt again.
     fn keep(&self, n: usize) -> (usize, Option<String>) {
-        keep_where_standing(n, self.pos(), NO_STEP_BACK)
+        if n == self.pos() {
+            (n, None)
+        } else {
+            (0, Some(NO_STEP_BACK.to_owned()))
+        }
     }
 
     /// Nowhere: no prompt call is cut for a prefix a later request keeps.
@@ -257,7 +262,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let chosen = Place::choose_untiered(a.place, &census, "nemotron")?;
     chosen.record().eprint();
     let place = chosen.place;
-    let machine = place.machine_untiered()?(inputs.hp.n_layer);
+    let machine = place.machine_untiered()?(inputs.model.layers);
     // The context, then the plan around it (`choose_ctx`, every seat's): a
     // tier card, a second card, a context the card cannot hold and a budget
     // that binds are refused here by name, before any load.

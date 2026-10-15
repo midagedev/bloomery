@@ -4,7 +4,7 @@
 
 /// `blk.{l}.{stem}`.
 #[must_use]
-pub(crate) fn blk(l: usize, stem: &str) -> String {
+pub fn blk(l: usize, stem: &str) -> String {
     format!("blk.{l}.{stem}")
 }
 

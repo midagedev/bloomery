@@ -585,6 +585,15 @@ const GATED_BLOCK: &[GgmlType] = &[
     GgmlType::Q6_K,
 ];
 
+/// The types a nemotron_h body site reads (`gpu/src/arch/nemotron_h/step.rs`
+/// `SITE_TYPES`, each a launch of `gpu/src/site.rs`).
+const NEMOTRON_SITES: &[GgmlType] = &[
+    GgmlType::Q5_0,
+    GgmlType::Q8_0,
+    GgmlType::Q4_K,
+    GgmlType::Q6_K,
+];
+
 /// The per-tensor type pins of the programs, as lists (the qwen3moe body's
 /// dense FFN; `Body35`'s
 /// site types, its `PROJ`, `EMBED` and `HEAD_TY` in
@@ -785,6 +794,38 @@ const TYPE_PINS: &[TypePin] = &[
         names: None,
         what: "output head (the head reads q8_0)",
         reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::NemotronHBody,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the card reads q5_0 rows)",
+        reads: &[GgmlType::Q5_0],
+    },
+    TypePin {
+        program: Program::NemotronHBody,
+        role: Role::Head,
+        matrices: true,
+        names: None,
+        what: "output head (the head reads q6_K, q4_K and q8_0)",
+        reads: &[GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::NemotronHBody,
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "Mamba-2 and attention projections (the body reads q5_0, q8_0, q4_K and q6_K)",
+        reads: NEMOTRON_SITES,
+    },
+    TypePin {
+        program: Program::NemotronHBody,
+        role: Role::DenseFfn,
+        matrices: true,
+        names: None,
+        what: "dense FFN (the body reads q5_0, q8_0, q4_K and q6_K)",
+        reads: NEMOTRON_SITES,
     },
 ];
 
@@ -1914,6 +1955,74 @@ mod tests {
                 "q5_K output head (the head reads q8_0 planes, q6_K or q4_K word planes)"
                     .to_string()
             )]
+        );
+    }
+
+    /// A nemotron_h file's token table and head are items unless their type
+    /// is one the body reads: q5_0 rows for the table, the common head's
+    /// q8_0, q6_K or q4_K for `output`.
+    #[test]
+    fn the_nemotron_embedding_and_head_pins_read_the_bodys_types() {
+        let whole = |name: &str, role: Role, ty: GgmlType, needle: &str| {
+            let spec = ModelSpec {
+                arch: Arch::NemotronH,
+                hidden: 3136,
+                vocab: 131_072,
+                ctx_train: 262_144,
+                rms_eps: 1e-5,
+                layers: Vec::new(),
+                mtp: Vec::new(),
+                hc: None,
+                engram: None,
+                encoder: None,
+                chat: ChatSpec {
+                    pre: String::new(),
+                    template: None,
+                    tools: None,
+                    reasoning: None,
+                },
+            };
+            let model = ModelTensors {
+                tensors: vec![ModelTensor {
+                    name: name.to_string(),
+                    shard: 0,
+                    layer: None,
+                    role,
+                    ty,
+                    dims: vec![3136, 131_072],
+                    file_bytes: 0,
+                    gathered_rows: None,
+                }],
+                layers: 42,
+                experts: 0,
+                experts_used: 0,
+            };
+            super::check(&spec, &model)
+                .into_iter()
+                .filter(|u| u.feature.contains(needle))
+                .map(|u| u.feature)
+                .collect::<Vec<String>>()
+        };
+        let embed = |ty| {
+            whole(
+                "token_embd.weight",
+                Role::TokenEmbedding,
+                ty,
+                "token embedding",
+            )
+        };
+        assert_eq!(embed(GgmlType::Q5_0), Vec::<String>::new());
+        assert_eq!(
+            embed(GgmlType::Q8_0),
+            ["q8_0 token embedding (the card reads q5_0 rows)".to_string()]
+        );
+        let head = |ty| whole("output.weight", Role::Head, ty, "output head");
+        for ty in [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K] {
+            assert_eq!(head(ty), Vec::<String>::new(), "{ty}");
+        }
+        assert_eq!(
+            head(GgmlType::Q5_K),
+            ["q5_K output head (the head reads q6_K, q4_K and q8_0)".to_string()]
         );
     }
 

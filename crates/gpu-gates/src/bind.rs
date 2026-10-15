@@ -620,18 +620,6 @@ pub fn placement_of(name: &str, machine: &Machine, plan: &Plan<'_>) -> Option<Pl
     placement.ok()
 }
 
-/// [`Seat::keep`] of a body whose state cannot step back (a recurrent state
-/// no rollback restores): `n` when it is the whole held sequence (`pos`, the
-/// position the model stands at), else nothing with `why` as the rule that
-/// kept less. The caller resets the slot and feeds the prompt again.
-pub fn keep_where_standing(n: usize, pos: usize, why: &str) -> (usize, Option<String>) {
-    if n == pos {
-        (n, None)
-    } else {
-        (0, Some(why.to_owned()))
-    }
-}
-
 /// A seat's [`Seat::note`]: a prefix kept less of than shared is a `cache
 /// reuse` record; every other note prints as `name`'s line.
 pub fn note_line(name: &str, note: &CacheNote) {
@@ -3101,26 +3089,10 @@ impl Drop for SeatEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, Link, Reply, keep_where_standing};
+    use super::{Cmd, Link, Reply};
     use std::sync::mpsc;
 
     const N_VOCAB: usize = 8;
-
-    /// A body whose state cannot step back keeps the whole held sequence and
-    /// nothing shorter, and says why for the shorter.
-    #[test]
-    fn a_state_that_cannot_step_back_keeps_only_where_it_stands() {
-        assert_eq!(keep_where_standing(7, 7, "why"), (7, None));
-        assert_eq!(keep_where_standing(0, 0, "why"), (0, None));
-        assert_eq!(
-            keep_where_standing(6, 7, "why"),
-            (0, Some("why".to_owned()))
-        );
-        assert_eq!(
-            keep_where_standing(0, 7, "why"),
-            (0, Some("why".to_owned()))
-        );
-    }
 
     /// The factory's sampler is the sampler crate's chain over the request's
     /// parameters, and a parameter the chain refuses (a non-finite
