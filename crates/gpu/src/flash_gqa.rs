@@ -2771,7 +2771,8 @@ unsafe fn seg_scalar_g<const G: usize>(
 ) {
     const { assert!(G == GROUP || G == GROUP_5) };
     // Eight fills the block, so that instance's pad checks are `true`.
-    const FULL: bool = G == GROUP;
+    // An inline const: a nested const item cannot name the generic parameter.
+    let full = const { G == GROUP };
 
     let b = thread::blockIdx_x() as usize;
     let nkv = n_kv as usize;
@@ -2796,7 +2797,7 @@ unsafe fn seg_scalar_g<const G: usize>(
     let span = seg_span(limit, n_seg, seg_keys as usize);
     let lo = seg * span;
     if lo >= limit {
-        if lane == 0 && (FULL || w < G) {
+        if lane == 0 && (full || w < G) {
             // SAFETY: a live warp's h < (kh + 1)·G <= n_head, so idx <
             // m·n_head·segs and both slots are inside part_ms.
             unsafe {
@@ -2811,7 +2812,7 @@ unsafe fn seg_scalar_g<const G: usize>(
     // Row t's group query rows. A full group stages four values on every
     // thread; a short group stages only the threads that own its rows.
     let qb = (t * n_head + kh * G) * HEAD;
-    if FULL || tid < G * HEAD / 4 {
+    if full || tid < G * HEAD / 4 {
         let mut i = 0usize;
         while i < 4 {
             // SAFETY: the thread owns four values inside the group's
@@ -2861,7 +2862,7 @@ unsafe fn seg_scalar_g<const G: usize>(
         }
         thread::sync_threads();
 
-        if FULL || w < G {
+        if full || w < G {
             // The score of key t0 + lane for head h.
             let live = t0 + lane < hi;
             let mut a = [0.0f32; ILP];
@@ -2895,7 +2896,7 @@ unsafe fn seg_scalar_g<const G: usize>(
         t0 += KEY_TILE;
     }
 
-    if FULL || w < G {
+    if full || w < G {
         // SAFETY: idx is inside the partials, as on the neutral path; lane
         // `lane` owns dims 4·lane .. +3, and lane 0 writes (m, s).
         unsafe {
@@ -2956,8 +2957,8 @@ mod flash_gqa_kernels {
         segs: u32,
         seg_keys: u32,
         m: u32,
-        mut part_v: DisjointSlice<f32>,
-        mut part_ms: DisjointSlice<f32>,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
     ) {
         static mut QS: SharedArray<f32, { GROUP * HEAD }> = SharedArray::UNINIT;
         static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
@@ -3024,8 +3025,8 @@ mod flash_gqa_kernels {
         segs: u32,
         seg_keys: u32,
         m: u32,
-        mut part_v: DisjointSlice<f32>,
-        mut part_ms: DisjointSlice<f32>,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
     ) {
         static mut QS: SharedArray<f32, { GROUP_5 * HEAD }> = SharedArray::UNINIT;
         static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
