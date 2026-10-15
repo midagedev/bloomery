@@ -312,7 +312,7 @@ default_lane() {
       case $rest6000 in
         *"$gate_name"*|*BLOOMERY_GATE_CARD*|*BLOOMERY_CARD=*) echo 3090; return ;;
       esac
-      local direct_target='(^|[[:space:];&|])(\./)?target/'
+      local direct_target='(^|[^[:alnum:]_=/.-])(\./)?target/'
       if [[ $rest6000 =~ $device_run || $rest6000 =~ $direct_target ]]; then echo 3090; return; fi
       quiet_scripts "$rest6000" models || { echo 3090; return; }
       echo a6000
@@ -372,6 +372,10 @@ self_test() {
   [ "$got" = 3090 ] || fail "default_lane: a target/ binary after the gate stays on the 3090, got '$got'"
   got=$(default_lane "$form bash tools/$gate gen && ./target/release/generate_ds41 --plan")
   [ "$got" = 3090 ] || fail "default_lane: a ./target/ binary after the gate stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && (target/release/generate_qwen3moe --tokens 0)")
+  [ "$got" = 3090 ] || fail "default_lane: a grouped target/ binary stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && \"target/release/generate_qwen3moe\" --tokens 0")
+  [ "$got" = 3090 ] || fail "default_lane: a quoted target/ binary stays on the 3090, got '$got'"
   got=$(default_lane "$form bash tools/$gate gen && bash too""ls/ref/q38-3090-server.sh /tmp/probe")
   [ "$got" = 3090 ] || fail "default_lane: a script off the allowlist after the gate stays on the 3090, got '$got'"
   got=$(default_lane "Q=\$(sed -n p too""ls/ref/models/qwen35moe.sh) && $form bash tools/$gate gen")
