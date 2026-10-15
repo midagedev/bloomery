@@ -123,7 +123,7 @@ pre-review *ARGS:
     python3 tools/review/local.py {{ARGS}}
 
 # Before a push request: `just pre-review` and `just remote-static BASE` (default origin/main) on one clean committed HEAD
-# at once, one line each and the exit of the first red. A tree with uncommitted tracked changes is refused (64). The
+# at once, one line each and the exit of the first red. A tree with uncommitted or untracked files is refused (64). The
 # owner is tools/pre-push.sh.
 pre-push *ARGS:
     ./tools/pre-push.sh {{ARGS}}

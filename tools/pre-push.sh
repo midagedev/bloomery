@@ -2,15 +2,16 @@
 # bloomery — the two checks a push request names, on one committed HEAD and at once: `just pre-review` (Shingler's
 # reviewer, tools/review/local.py) and `just remote-static BASE` (mac-static on the second Mac, tools/mac-remote.sh).
 #
-#   tools/pre-push.sh [BASE]      BASE (default origin/main) is mac-static's scope; pre-review gets `--base BASE` only
-#                                 when BASE is given (else its own default: the stacked parent, else origin/main)
+#   tools/pre-push.sh [BASE]      BASE, one rev (default origin/main), is mac-static's scope; pre-review gets
+#                                 `--base BASE` only when BASE is given (else its own default)
 #   tools/pre-push.sh --self-test the clean-tree rule, the parallel start, the lines and the exit code, against stubs
 #
-# A tree with uncommitted changes to tracked files is refused (64): mac-remote sends the worktree's content and
-# pre-review reviews the committed HEAD, so only a clean tree makes them one SHA. The two run in parallel from the
+# A tree with uncommitted changes or untracked files is refused (64): mac-remote sends the worktree's content, untracked
+# files included, and pre-review reviews the committed HEAD, so only a clean tree makes them one SHA. The two run in parallel from the
 # tree's root, each into its own log under ~/.cache/bloomery/pre-push/<sha8>/; when each ends it prints
 # `pre-push: <check> rc <n> in <s> s: <its last line>`, and at the end the logs' directory.
-# Exit: 0 both green; otherwise pre-review's rc when it is red, else mac-static's; 64 usage or a dirty tree.
+# Exit: 0 both green; otherwise pre-review's rc when it is red, else mac-static's; 64 usage, a BASE that is a range,
+# or a dirty tree (a check's own 64 is told apart by its line).
 # The failure it blocks: a push request whose two checks ran on two heads, or one after the other.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,14 +33,16 @@ run_one() {
 pre_push() {
   local base=${1:-} sha dir rp rs rcp rcs
   [ $# -le 1 ] || { say "pre-push: takes at most one BASE"; return 64; }
+  case $base in *..*) say "pre-push: BASE is one rev, not a range: $base"; return 64 ;; esac
   cd "$TREE"
-  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-    say "pre-push: the tree has uncommitted changes to tracked files; commit them first (mac-static would check them, pre-review would not)"
+  if [ -n "$(git status --porcelain)" ]; then
+    say "pre-push: the tree has uncommitted or untracked files; commit or remove them first (mac-static would check them, pre-review would not)"
     return 64
   fi
   sha=$(git rev-parse HEAD)
   dir=$HOME/.cache/bloomery/pre-push/${sha:0:8}
   mkdir -p "$dir"
+  rm -f "$dir"/*.rc # a run that dies before writing its rc reads as 70, never as the last run's rc
   say "pre-push: pre-review and mac-static of ${sha:0:8} at once"
   # shellcheck disable=SC2086 # REVIEW and STATIC are command lines
   if [ -n "$base" ]; then run_one pre-review "$dir/pre-review.log" $REVIEW --base "$base" & else run_one pre-review "$dir/pre-review.log" $REVIEW & fi
@@ -88,6 +91,12 @@ self_test() {
   rc=0; out=$(t 0 0) || rc=$?
   [ "$rc" = 64 ] && [ ! -e "$d/review.started" ] && [ ! -e "$d/static.started" ] || fail "a dirty tree was not refused 64 before either ran: $rc $out"
   git -C "$d/repo" checkout -q -- a
+  touch "$d/repo/u"
+  rc=0; out=$(t 0 0) || rc=$?
+  [ "$rc" = 64 ] && [ ! -e "$d/review.started" ] && [ ! -e "$d/static.started" ] || fail "an untracked file was not refused 64 before either ran: $rc $out"
+  rm -f "$d/repo/u"
+  rc=0; out=$(t 0 0 HEAD~1..HEAD) || rc=$?
+  [ "$rc" = 64 ] || fail "a range BASE ended $rc, not 64"
   rc=0; out=$(t 0 0 a b) || rc=$?
   [ "$rc" = 64 ] || fail "two BASEs ended $rc, not 64"
   rm -rf "$d"
