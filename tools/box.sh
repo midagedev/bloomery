@@ -288,7 +288,8 @@ default_lane() {
   esac
   # The `:-a6000` form plus its gpu-gate.sh call is the A6000 even when the command names target/
   # or python. What remains after those calls is another gate, another card spelling, or device code
-  # of its own: that stays on the 3090. A form with no gate call after it is not this pin.
+  # of its own (a cargo run, or a target/ binary run by path): that stays on the 3090. A form with no
+  # gate call after it is not this pin.
   call6000="$a6000_form bash tools/$gate_name"
   case $c in
     *"$a6000_form"*)
@@ -297,7 +298,8 @@ default_lane() {
       case $rest6000 in
         *"$gate_name"*|*BLOOMERY_GATE_CARD*|*BLOOMERY_CARD=*) echo 3090; return ;;
       esac
-      if [[ $rest6000 =~ $device_run ]]; then echo 3090; return; fi
+      local direct_target='(^|[[:space:];&|])(\./)?target/'
+      if [[ $rest6000 =~ $device_run || $rest6000 =~ $direct_target ]]; then echo 3090; return; fi
       echo a6000
       return ;;
   esac
@@ -359,6 +361,10 @@ self_test() {
   box_env=()
   got=$(default_lane "$form bash tools/$gate gen && bash tools/$gate other")
   [ "$got" = 3090 ] || fail "default_lane: a second gate call stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && target/release/generate_ds41 --plan")
+  [ "$got" = 3090 ] || fail "default_lane: a target/ binary after the gate stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && ./target/release/generate_ds41 --plan")
+  [ "$got" = 3090 ] || fail "default_lane: a ./target/ binary after the gate stays on the 3090, got '$got'"
   # call [VAR=value…] -- ARGS…: the scratch box.sh with ARGS, in an environment of PATH, HOME, TZ and the VARs only; rc and out are its result.
   call() {
     local envs=()
