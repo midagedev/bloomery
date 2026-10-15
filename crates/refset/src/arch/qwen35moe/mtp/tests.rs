@@ -419,6 +419,22 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         "names nothing to check",
     );
     at(
+        "no tap rows under # rows",
+        &[],
+        &|d| {
+            for t in [
+                "tap\tmtp_eh_proj\t0\tf32\t2\tmtp_eh_proj.r0.f32",
+                "tap\tffn_moe_topk\t0\ti32\t2\tffn_moe_topk.r0.i32",
+                "tap\tmtp_eh_proj\t2\tf32\t2\tmtp_eh_proj.r2.f32",
+                "tap\tffn_moe_topk\t2\ti32\t2\tffn_moe_topk.r2.i32",
+            ] {
+                swap(d, t, "");
+            }
+            swap(d, "# complete\t4\t0", "# complete\t0\t0");
+        },
+        "names nothing to check",
+    );
+    at(
         "no # tokens_count line",
         &[],
         &|d| swap(d, "# tokens_count\t4", ""),
