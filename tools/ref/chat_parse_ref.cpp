@@ -20,19 +20,25 @@
 
 #include <cstdio>
 #include <cstring>
-#include <fstream>
-#include <sstream>
 #include <string>
 
 static bool read_file(const char * path, std::string & out) {
-    std::ifstream f(path, std::ios::binary);
+    FILE * f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "chat_parse_ref: cannot open %s\n", path);
         return false;
     }
-    std::ostringstream s;
-    s << f.rdbuf();
-    out = s.str();
+    out.clear();
+    char   buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) != 0) {
+        out.append(buf, n);
+    }
+    const bool ok = ferror(f) == 0;
+    if (fclose(f) != 0 || !ok) {
+        fprintf(stderr, "chat_parse_ref: cannot read %s\n", path);
+        return false;
+    }
     return true;
 }
 
