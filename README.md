@@ -36,20 +36,9 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.3.2)
+## Status (0.3.3)
 
-0.3.2 adds MiniCPM-V 4.7 35B-A3B (text only; images in 0.3.3), tested as `Q4_K_M`. It is main `3a21bf63` plus the #46 fix, plus the version bump at `9bd7d577`. With `BLOOMERY_RESIDENCY` unset, the default Qwen3.8 load is no longer refused on 64 GB hosts ([#46](https://github.com/midagedev/bloomery/issues/46), reported by @juliankang4). The hosts measured for this release are not a 64 GB shape, so that host was not re-checked. Release validation is the lunchtime freeze on main `f382b474` (Train A 147/147 fixture, Train B 163/163 fixture, deferred real 66/66) plus a narrowed batch for the #46 fix. There is no full real-tier re-run. `gate-gpu-qwen38-serve`'s real tier is 70/72 on that baseline and on this commit, the same two preexisting paged failures.
-
-The release pass on this tarball ran four rows (18:16:42–18:21:21 KST, every row rc 0, no red line). The other rows of the wider pass were not re-run. They reuse that lunch validation.
-
-| Model, place | Long prompt: tokens, prefill tok/s, first token | Decode after it | Short prompt decode | Off cells, red |
-|---|---|---|---|---|
-| Qwen3.6-35B-A3B UD-Q4_K_XL, DSpark off, `a` | 5,673, 7,223, 0.79 s | 143.6 tok/s | 148.0 tok/s | — |
-| Qwen3.8 UD-Q4_K_XL, `a` | 5,673, 1,703, 3.36 s | 78.4 tok/s | 91.0 tok/s | — |
-| Qwen3.8 UD-Q4_K_XL, `bp` | 5,673, 1,706, 3.35 s | 85.8 tok/s | 101.2 tok/s | — |
-| MiniCPM-V 4.7 35B-A3B Q4_K_M text, unset (picks `a`) | 5,673, 7,664, 0.75 s | 193.4 tok/s | 201.9 tok/s | — |
-
-Greedy, thinking off, `--ctx-size 16384`, serving defaults, one load. The long prompt is 5,673 tokens. MiniCPM-V 4.7 images are not in this release.
+0.3.3 adds MiniCPM-V 4.7 35B-A3B image input ([#147](https://github.com/midagedev/bloomery/pull/147)), with `--mmproj` on the `qwen3` seat; a tile is capped at 70 tokens. The Qwen3.8 limits 0.3.2 listed are fixed: the paged log names the asked draft before the yield ([#121](https://github.com/midagedev/bloomery/pull/121)), and `gate-gpu-qwen4exp-mtp` (pg) plans its card experts with their route scratch ([#255](https://github.com/midagedev/bloomery/pull/255)). The release pass for this tarball is in the [0.3.3 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.3).
 
 | Area | State |
 |---|---|
@@ -68,12 +57,11 @@ Greedy, thinking off, `--ctx-size 16384`, serving defaults, one load. The long p
 | Cards | One card, or one card plus one expert-tier card (`--place bp`). With `--place` unset and two cards visible, Qwen3.8 and GLM-5.3 add the second card when their plan finds it pays |
 | Host RAM under the model | Runs on Qwen3.8, GLM-5.3 and V4.1: the routed experts the RAM cannot hold are paged from the model file on NVMe through a RAM arena. Tokens equal the all-RAM load. A plan keeps 512 MiB under the free RAM it reads, and a paged load shrinks its arena when it finds less RAM than planned. A paged Qwen3.8 load serves one slot by default with the MTP draft off; a set `BLOOMERY_DRAFT=mtp` runs, and a set `--parallel` is served unless the room's floor refuses it by name. Adaptive residency runs on it. In 0.3.1 a set `--parallel` of 2 or more on a paged Qwen3.8 plan failed at load. On WSL2 with the model on a Windows drive, set `BLOOMERY_NVTIER_READ=buffered` |
 | MiMo-V2.6-Flash | Its hot routed experts sit on the card, the rest on the host. After a 5,620-token prompt it decodes at 34.0 tok/s (0.2.10: 19.1), first token at 52.9 s (RTX A6000, `--place` unset, 0.3.0's release check) |
-| Image input | V4.1, Qwen3.6, GLM-5.3 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag). Under `--hf` with no `--mmproj`, a seat takes the projector in the model's repo when it costs the text model no card experts or context; otherwise it prints the projector's bytes and serves text (`--no-mmproj` skips it). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
+| Image input | V4.1, Qwen3.6, MiniCPM-V 4.7, GLM-5.3 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag). Under `--hf` with no `--mmproj`, a seat takes the projector in the model's repo when it costs the text model no card experts or context; otherwise it prints the projector's bytes and serves text (`--no-mmproj` skips it). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
 
-### Known issues and limits (0.3.2)
+### Known issues and limits (0.3.3)
 
-- **On Qwen3.8 loads that page experts through the NVMe tier, `gate-gpu-qwen38-serve`'s real tier is 70/72.** The two failures are preexisting and the same on `f382b474`. Setting `BLOOMERY_DRAFT=mtp` was refused by name at start from 0.3.1 through 0.3.2. On this tree a set draft runs and an unset one stays off. A default load keeps the draft off. On a small card whose draft auto-yields, the paged log prints `asked_draft=off` instead of `on`. That print is cosmetic.
-- **`gate-gpu-qwen4exp-mtp` (pg) is a known gate-side red, and its fix does not ship in 0.3.2.** On an RTX A6000 the drafted plan's stage card holds 2,843,738,112 B less room than the plain plan at the same budget (15:52 KST, rc 1). This is the gate's clause, not a serving-default load refusal.
+- **The Qwen3.6 real-tier e2e gate's `split` residency clause can fail on one run and pass on the next at the same commit** (logits distance from the off run 2.812e-1 against its 0.26 band, then 1.833e-1). The experts it streams follow the lane rate measured at runtime, so the clause's distance moves from run to run. This is a developer gate, not a change in what a load serves.
 - **Unset context is the seats' ladder (PIN(2026-10-14)).** With `--ctx-size` unset, one slot asks the lesser of
   262,144 and the file's limit and halves while the plan is short of the card, and of the host where the body keeps
   no tier past it. A set `--ctx-size` that does not fit is refused
@@ -104,12 +92,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.2-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.2-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.3-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.3-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.2](https://github.com/midagedev/bloomery/releases/tag/v0.3.2)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.3.3](https://github.com/midagedev/bloomery/releases/tag/v0.3.3)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
@@ -120,7 +108,7 @@ One binary, six seats; the file's architecture picks the seat, and `--place` can
 | `ds41` | [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | `bloomery-serve --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M` |
 | `glm` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `bloomery-serve --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL` |
 | `qwen38` | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `bloomery-serve --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL` |
-| `qwen3` | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (images with `--mmproj`), [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf) (text; images in 0.3.3, new in 0.3.2) | `bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` |
+| `qwen3` | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (images with `--mmproj`), [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf) (images with `--mmproj` since 0.3.3) | `bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` |
 | `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
 
