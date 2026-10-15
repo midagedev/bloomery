@@ -4279,7 +4279,6 @@ fn fixture_bolt_round_trip() {
         (0, "ssm_in.scale", NVFP4_TENSOR_SCALE),
         (0, "ssm_out.scale", NVFP4_TENSOR_SCALE),
         (1, "attn_norm.weight", 1.0),
-        (1, "exp_probs_b.bias", 0.0),
     ] {
         match rule_at(&plan, f, leaf) {
             Rule::Const { value } if *value == want => {}
@@ -4288,6 +4287,16 @@ fn fixture_bolt_round_trip() {
                 other.describe()
             ),
         }
+    }
+    // The router's selection bias is a spread, never a constant: a constant
+    // moves no pick, so a body that skipped the add would pass.
+    match rule_at(&plan, 1, "exp_probs_b.bias") {
+        Rule::Uniform { half_width, .. } if *half_width == bolt::BIAS_HALF_WIDTH => {}
+        other => panic!(
+            "layer 1 exp_probs_b.bias: {}, want a spread of ±{}",
+            other.describe(),
+            bolt::BIAS_HALF_WIDTH
+        ),
     }
     for leaf in ["ssm_in.weight", "ssm_out.weight"] {
         match rule_of(&plan, leaf) {

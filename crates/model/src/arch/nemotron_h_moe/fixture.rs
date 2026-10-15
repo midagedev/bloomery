@@ -150,15 +150,28 @@ pub fn key_rule(suffix: &str) -> Option<KeyRule> {
 /// The value of an F32 tensor the family names, by its name past `blk.N.`: the
 /// trunk's ([`hybrid::trunk_const`]) at [`SCAN`]; the two NVFP4 per-tensor
 /// scales, [`NVFP4_TENSOR_SCALE`] (the scale the generator writes the NVFP4
-/// blocks at); and the router's selection bias, 0. A constant bias moves no
-/// pick, and the real file's biases (4.44 to 51.25 [measured]) are far from the
-/// sigmoid scores' range, so the fixture routes on the scores.
+/// blocks at). The router's selection bias is a spread ([`spread_value`]).
 pub fn const_value(leaf: &str) -> Option<f32> {
     match leaf {
         SSM_IN_SCALE | SSM_OUT_SCALE => Some(NVFP4_TENSOR_SCALE),
-        EXP_PROBS_B => Some(0.0),
         _ => hybrid::trunk_const(leaf, &SCAN),
     }
+}
+
+/// The half-width of the router's selection bias (`exp_probs_b`), drawn per
+/// expert. A constant bias moves no pick, so a body that skipped the add would
+/// pass; the real file's biases (4.44 to 51.25 [measured]) would fix the picks
+/// whatever the scores. ±0.05 (σ 0.029) sits under the sigmoid scores' range
+/// and against about 0.01 between the ninth and tenth score at the top of 240
+/// to 496 [derived: unit-variance logits, the order statistics' spacing times
+/// the sigmoid's slope there], so the add moves the top-9 on some positions and
+/// fixes none.
+pub const BIAS_HALF_WIDTH: f32 = 0.05;
+
+/// The spread of an F32 tensor the family names: the router's selection bias
+/// ([`BIAS_HALF_WIDTH`]).
+pub fn spread_value(leaf: &str) -> Option<f32> {
+    (leaf == EXP_PROBS_B).then_some(BIAS_HALF_WIDTH)
 }
 
 /// `layers` keeps the source's facts: one layer of each kind (Mamba-2,
@@ -208,6 +221,10 @@ impl Family for Bolt {
 
     fn const_value(&self, leaf: &str) -> Option<f32> {
         const_value(leaf)
+    }
+
+    fn spread_value(&self, leaf: &str) -> Option<f32> {
+        spread_value(leaf)
     }
 
     /// Only `expert_count` moves with the map, and the map is held to
