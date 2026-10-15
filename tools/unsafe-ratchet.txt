@@ -225,11 +225,11 @@ gguf 9 2 0
 # layers' conv and the Mamba-2 step now share (one unsafe fn, its one block); each block with its SAFETY line.
 # PIN(2026-10-14): gpu 1769 -> 1771 blocks, a new kernel entry, not old code relaxed: gqa_prefill_flash_256_p2_lower's
 # call into prefill_256_p and the walk's read of a row's first key (k_first_buf), each with its SAFETY line.
-# PIN(2026-10-15): gpu 1771 -> 1786 blocks, new code, not old code relaxed: embed_rows_q5_0 (the Q5_0 embedding gather:
-# its position words, the code and scale words, the output row) and gqa_flash_seg_g5
-# (the head-128 group-5 flash entry over the shared flash core) read and write through raw pointers; each block with
-# its SAFETY line.
-gpu 1786 195 10
+# PIN(2026-10-15): gpu 1771 -> 1787 blocks, 195 -> 196 fns, new code, not old code relaxed: embed_rows_q5_0 (the Q5_0
+# embedding gather: its position words, the code and scale words, the output row) and gqa_flash_seg_g5 (the head-128
+# group-5 flash entry) read and write through raw pointers, and seg_scalar_g (the scalar core that entry calls) is one
+# unsafe fn. The group-8 entry keeps its own body. Each block with its SAFETY line.
+gpu 1787 196 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
