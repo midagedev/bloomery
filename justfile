@@ -873,6 +873,12 @@ build-ref-nemotron:
 dump-ref-nemotron:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=600 BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'bash tools/ref/dump-nemotron.sh'
 
+# Mainline llama.cpp's chat layer as an oracle: tools/ref/chat_parse_ref.cpp renders one user turn through a chat
+# template and parses a generation as llama-server parses it (content, reasoning, tool calls). It links mainline's
+# existing build (tools/ref/build-chat-parse-ref.sh) into $BLOOMERY_DATA/bin/chat_parse_ref. No card: the lane is none.
+build-ref-chat-parse:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 ./tools/box.sh 'bash tools/ref/build-chat-parse-ref.sh'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:
