@@ -1766,7 +1766,7 @@ def case_load_ready(fx):
 
 def case_cancelled_elsewhere(fx):
     for state, want in (({"status": "cancelled", "rc": 137}, 137), ({"status": "cancelled", "rc": None}, 81)):
-        fx.serve([{"status": "running"}, {"status": "running"}, state])
+        fx.serve([{"status": "running"}, {"status": "running"}, state], gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
         got, so, se = fx.client(*fx.run_args())
         check(got == want and b"boxq: j1 cancelled elsewhere\n" in se and fx.rc_file() == f"{want}\n",
               f"a job cancelled by someone else exits {want} and says so: {got} {se!r} {fx.rc_file()!r}")
@@ -1916,7 +1916,8 @@ def case_attach_leave(fx):
         fx.gone(fx.tail_pids, 2)
     for end, want in (({"status": "failed", "rc": 3}, 3), ({"status": "done", "rc": 0}, 0),
                       ({"status": "cancelled", "rc": 143}, 81), ({"status": "lost", "rc": None}, 81)):
-        fx.serve([{"status": "running"}, end])
+        # the end is answered only once both tails recorded their pids, so a slow host cannot stop one before it did
+        fx.serve([{"status": "running"}, end], gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
         got, so, se = fx.client("attach", "j1", "--leave", "--rc-dir", fx.rc_dir)
         check(got == want and fx.rc_file() is None,
               f"--leave on a job that ends {end}: {want}, no mirror: {got} {se!r} {fx.rc_file()!r}")
