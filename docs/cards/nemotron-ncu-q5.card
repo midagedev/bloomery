@@ -1,0 +1,14 @@
+# One Nemotron ssm_in q5_0_gemv launch under Nsight Compute on the RTX A6000: does the resident Q5_0 layout
+# (pack_q5_0: an int8 code a value plus an f32 scale per 32, q5.rs:1068) make the launch read 9 bits a value?
+# Derived: 17504 rows x (3136 + 3136/32 x 4) B = 61,751,712 B; the file's bytes are 37,738,624.
+kind: profile
+question: how many DRAM bytes does one ssm_in q5_0_gemv launch read on the A6000?
+term: dram__bytes_read.sum of q5_0_gemv launches with grid 2188 (ssm_in), generate_qwen3moe eager mode,
+  NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf, RTX A6000
+unit: MB
+predict: 58..66
+condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, the binary of the baseline (perf-nemogen d2c14332),
+  --mode eager, ncu --kernel-name q5_0_gemv over the first launches; the grid-2188 rows read
+decide-in: the resident layout reads 9 bits a value: engine's compact resident Q5_0 (N7d) is the decode lever
+decide-below: near 38 MB: the layout is not the cost; the gemv's efficiency is, and the A/B is next
+decide-above: a second read path (activation, scales) is larger than derived: read the l1/l2 sectors
