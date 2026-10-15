@@ -149,7 +149,8 @@ impl Acts {
 }
 
 /// The rows a chain runs over, `rows` of each width: the step's one row
-/// ([`Scratch`]) and a prompt pass's rows ([`super::prefill`]).
+/// ([`Scratch`]) and a prompt pass's rows ([`super::prefill`]), with the
+/// flash partials and the embedding's row outputs.
 pub(super) struct RowBuffers {
     pub(super) xn: DeviceBuffer<f32>,
     pub(super) delta: DeviceBuffer<f32>,
@@ -161,11 +162,18 @@ pub(super) struct RowBuffers {
     pub(super) attn: DeviceBuffer<f32>,
     pub(super) up: DeviceBuffer<f32>,
     pub(super) act: DeviceBuffer<f32>,
+    pub(super) part_v: DeviceBuffer<f32>,
+    pub(super) part_ms: DeviceBuffer<f32>,
+    /// The embedding's outputs: the position word the scan reads and the live
+    /// key count the flash reads, one of each a row.
+    pub(super) pos: DeviceBuffer<u32>,
+    pub(super) n_keys: DeviceBuffer<u32>,
 }
 
 impl RowBuffers {
     /// `rows` rows of each width for `sh`, `n_head` query heads and the
-    /// widest `ff` an MLP layer has. Load-time only.
+    /// widest `ff` an MLP layer has, the flash partials at the rows a flash
+    /// run takes. Load-time only.
     pub(super) fn new(
         stream: &cuda_core::CudaStream,
         rows: usize,
@@ -176,6 +184,7 @@ impl RowBuffers {
             Ok(DeviceBuffer::zeroed(stream, rows * n.max(1))?)
         };
         let kv_width = sh.n_kv * HEAD;
+        let attn_rows = rows.min(crate::model::MAX_PASS_ROWS);
         Ok(RowBuffers {
             xn: z(sh.hidden)?,
             delta: z(sh.hidden)?,
@@ -187,6 +196,10 @@ impl RowBuffers {
             attn: z(n_head * HEAD)?,
             up: z(ff)?,
             act: z(ff)?,
+            part_v: DeviceBuffer::zeroed(stream, partials_v_len(attn_rows, n_head))?,
+            part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(attn_rows, n_head))?,
+            pos: DeviceBuffer::zeroed(stream, rows)?,
+            n_keys: DeviceBuffer::zeroed(stream, rows)?,
         })
     }
 
@@ -202,36 +215,28 @@ impl RowBuffers {
             &self.attn,
             &self.up,
             &self.act,
+            &self.part_v,
+            &self.part_ms,
         ]
         .iter()
         .map(|b| b.num_bytes())
-        .sum()
+        .sum::<usize>()
+            + self.pos.num_bytes()
+            + self.n_keys.num_bytes()
     }
 }
 
 /// The buffers one step runs over, m = 1.
 pub(super) struct Scratch {
     pub(super) buf: RowBuffers,
-    pub(super) part_v: DeviceBuffer<f32>,
-    pub(super) part_ms: DeviceBuffer<f32>,
     pub(super) mamba: Mamba2Scratch,
     /// The record [`WORD_POS`], [`WORD_TOKEN`] and [`ROW_WORDS`] name.
     pub(super) words: DeviceBuffer<u32>,
-    /// The embedding's outputs: the position word the scan reads and the live
-    /// key count the flash reads.
-    pub(super) pos: DeviceBuffer<u32>,
-    pub(super) n_keys: DeviceBuffer<u32>,
 }
 
 impl Scratch {
     pub(super) fn bytes(&self) -> usize {
-        self.buf.bytes()
-            + self.part_v.num_bytes()
-            + self.part_ms.num_bytes()
-            + self.words.num_bytes()
-            + self.pos.num_bytes()
-            + self.n_keys.num_bytes()
-            + self.mamba.device_bytes()
+        self.buf.bytes() + self.words.num_bytes() + self.mamba.device_bytes()
     }
 
     /// The scratch for `sh`, the widest `ff` an MLP layer has and the
@@ -244,12 +249,8 @@ impl Scratch {
     ) -> Result<Scratch, GpuError> {
         Ok(Scratch {
             buf: RowBuffers::new(stream, 1, sh, (n_head, ff))?,
-            part_v: DeviceBuffer::zeroed(stream, partials_v_len(1, n_head))?,
-            part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(1, n_head))?,
             mamba: Mamba2Scratch::new(stream, sh.mamba)?,
             words: DeviceBuffer::zeroed(stream, ROW_WORDS + sh.n_kv)?,
-            pos: DeviceBuffer::zeroed(stream, 1)?,
-            n_keys: DeviceBuffer::zeroed(stream, 1)?,
         })
     }
 }
@@ -377,7 +378,7 @@ fn mamba_layer(
             conv_b: cx.f32(&m.conv_b)?,
             norm: Some(cx.f32(&m.ssm_norm)?),
             eps: sh.eps,
-            pos: &s.pos,
+            pos: &s.buf.pos,
             pos_at: 0,
             fault: cx.gpu.layer_sink(l)?,
             y: &mut s.buf.y,
@@ -433,13 +434,13 @@ fn attn_layer(
             q: &s.buf.q,
             kc: a.kc.buf(),
             vc: a.vc.buf(),
-            n_keys: &s.n_keys,
+            n_keys: &s.buf.n_keys,
             scale: 1.0 / (HEAD as f32).sqrt(),
             n_kv: sh.n_kv,
             ctx: sh.ctx,
             m: 1,
-            part_v: &mut s.part_v,
-            part_ms: &mut s.part_ms,
+            part_v: &mut s.buf.part_v,
+            part_ms: &mut s.buf.part_ms,
             fault,
             y: &mut s.buf.attn,
         },
@@ -506,8 +507,8 @@ impl Body {
                     pos0: &pos0,
                     first: 0,
                     y: first,
-                    pos: &mut self.s.pos,
-                    n_keys: &mut self.s.n_keys,
+                    pos: &mut self.s.buf.pos,
+                    n_keys: &mut self.s.buf.n_keys,
                 },
                 self.sh.hidden,
             )?;

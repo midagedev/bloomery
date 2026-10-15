@@ -19,7 +19,7 @@ use super::body::Body;
 use super::step::{Layer, RowBuffers, Shape, Site, norm_rows, residual_rows};
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
-use crate::flash_gqa::{GROUP_5, GqaArgs, HEAD, partials_ms_len, partials_v_len};
+use crate::flash_gqa::{GROUP_5, GqaArgs, HEAD};
 use crate::gemm::{GemmInput, GemmRoute};
 use crate::head::Head;
 use crate::model::{GpuModel, MAX_PASS_ROWS};
@@ -60,11 +60,6 @@ pub(super) struct Prompt {
     /// `h · rows · HEAD`, what the plane append reads.
     kh: DeviceBuffer<f32>,
     vh: DeviceBuffer<f32>,
-    part_v: DeviceBuffer<f32>,
-    part_ms: DeviceBuffer<f32>,
-    /// Each row's position and live key count, the embedding's outputs.
-    pos: DeviceBuffer<u32>,
-    n_keys: DeviceBuffer<u32>,
     /// The word record ([`P_POS`], [`P_ROWS`], the ids) and its host copy.
     words: DeviceBuffer<u32>,
     host_words: Vec<u32>,
@@ -91,7 +86,6 @@ impl Prompt {
             Ok(DeviceBuffer::zeroed(stream, rows * n.max(1))?)
         };
         let kv_width = sh.n_kv * HEAD;
-        let attn_rows = rows.min(MAX_PASS_ROWS);
         let mut acts: Vec<ActAt> = Vec::new();
         let mut forms: Vec<(usize, bool, bool)> = Vec::new();
         for s in layers.iter().flat_map(Layer::sites) {
@@ -119,10 +113,6 @@ impl Prompt {
             buf: RowBuffers::new(stream, rows, sh, (n_head, ff))?,
             kh: z(kv_width)?,
             vh: z(kv_width)?,
-            part_v: DeviceBuffer::zeroed(stream, partials_v_len(attn_rows, n_head))?,
-            part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(attn_rows, n_head))?,
-            pos: DeviceBuffer::zeroed(stream, rows)?,
-            n_keys: DeviceBuffer::zeroed(stream, rows)?,
             words: DeviceBuffer::zeroed(stream, n_words)?,
             host_words: vec![0; n_words],
             route: GemmRoute::new(stream, rows, 1)?,
@@ -133,19 +123,10 @@ impl Prompt {
     /// The device bytes the pass's buffers hold.
     pub(super) fn bytes(&self) -> usize {
         self.buf.bytes()
-            + [
-                &self.xa,
-                &self.xb,
-                &self.kh,
-                &self.vh,
-                &self.part_v,
-                &self.part_ms,
-            ]
-            .iter()
-            .map(|b| b.num_bytes())
-            .sum::<usize>()
-            + self.pos.num_bytes()
-            + self.n_keys.num_bytes()
+            + [&self.xa, &self.xb, &self.kh, &self.vh]
+                .iter()
+                .map(|b| b.num_bytes())
+                .sum::<usize>()
             + self.words.num_bytes()
             + self.route.bytes()
             + self.acts.iter().map(|a| a.acts.bytes()).sum::<usize>()
@@ -268,8 +249,8 @@ impl Body {
                     pos0: &pos0,
                     first: 0,
                     y: &mut p.xa,
-                    pos: &mut p.pos,
-                    n_keys: &mut p.n_keys,
+                    pos: &mut p.buf.pos,
+                    n_keys: &mut p.buf.n_keys,
                 },
                 sh.hidden,
             )?;
@@ -294,10 +275,6 @@ impl Body {
                 buf,
                 kh,
                 vh,
-                part_v,
-                part_ms,
-                pos: rows_pos,
-                n_keys,
                 words,
                 route,
                 acts,
@@ -314,6 +291,10 @@ impl Body {
                 attn,
                 up,
                 act,
+                part_v,
+                part_ms,
+                pos: rows_pos,
+                n_keys,
             } = buf;
             let (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>) =
                 if in_a { (xa, xb) } else { (xb, xa) };
