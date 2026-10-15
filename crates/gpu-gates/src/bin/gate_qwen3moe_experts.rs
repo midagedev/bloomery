@@ -55,8 +55,7 @@
 //! eager launch.
 //!
 //! Q5_0 embedding rows (`embed_rows_q5_0`) are bit-identical to `dequant_row`
-//! on the same bytes. `relu_sqr` is bit-identical to `max(x, 0)^2`, and a
-//! non-finite input is copied through.
+//! on the same bytes.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -141,7 +140,6 @@ mod gate {
         ok &= embed(&gpu, &gguf, &sets)?;
         ok &= embed_kquant(&gpu)?;
         ok &= embed_q5_0(&gpu)?;
-        ok &= relu_sqr(&gpu)?;
         ok &= gate_up_body(&gpu, &gguf, &ex)?;
         ok &= gate_up_tap(&gpu, &gguf, &ex, &sets)?;
         ok &= combine(&gpu, &ex, &sets, stream)?;
@@ -207,53 +205,6 @@ mod gate {
             verdict(host_ok && pos_ok && graph_ok && oor_ok)
         );
         Ok(host_ok && pos_ok && graph_ok && oor_ok)
-    }
-
-    /// Host transcription of `relu_sqr`: a non-finite input stays that value,
-    /// and a finite one is `max(x, 0)^2`.
-    fn host_relu_sqr(v: f32) -> f32 {
-        if !v.is_finite() {
-            v
-        } else {
-            let r = if v > 0.0 { v } else { 0.0 };
-            r * r
-        }
-    }
-
-    /// `relu_sqr` against [`host_relu_sqr`], bit for bit, including a
-    /// non-finite input, and one captured node.
-    fn relu_sqr(gpu: &Gpu) -> Result<bool, GateError> {
-        let x = [
-            0.0f32,
-            1.5,
-            -2.0,
-            f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            3.0,
-        ];
-        let want: Vec<f32> = x.iter().copied().map(host_relu_sqr).collect();
-        let stream = gpu.stream();
-        let xb = DeviceBuffer::from_host(stream, &x)?;
-        let mut y = DeviceBuffer::<f32>::zeroed(stream, x.len())?;
-        gpu.elem().enqueue_relu_sqr(stream, &xb, x.len(), &mut y)?;
-        stream.synchronize()?;
-        let got = y.to_host_vec(stream)?;
-        let host_ok = bits_equal(&got, &want);
-        // The eager read ends before this closure borrows `y` again.
-        let mut enqueue = |s: &CudaStream| gpu.elem().enqueue_relu_sqr(s, &xb, x.len(), &mut y);
-        let g = gpu.capture(&mut enqueue)?;
-        g.launch(stream)?;
-        stream.synchronize()?;
-        let replay = y.to_host_vec(stream)?;
-        let nodes = g.node_count();
-        let graph_ok = bits_equal(&replay, &want) && nodes == 1;
-        println!(
-            "relu_sqr n={}: vs host bit_identical={host_ok} graph_nodes={nodes} graph_same={graph_ok} {}",
-            x.len(),
-            verdict(host_ok && graph_ok)
-        );
-        Ok(host_ok && graph_ok)
     }
 
     // ------------------------------------------------------------ 1. embed

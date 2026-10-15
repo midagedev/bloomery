@@ -1101,37 +1101,6 @@ mod elem_kernels {
         e.map(silu_mul);
     }
 
-    /// `y[i] = max(x[i], 0)^2` over `n` values. A non-finite input is copied
-    /// as it is: `max` of a non-finite is not this rule, and the square of
-    /// `−inf` is not 0.
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (x.len() >= n, y.len() >= n)
-    )]
-    pub fn relu_sqr(x: &[f32], n: u32, mut y: DisjointSlice<f32>) {
-        let i = thread::index_1d().get();
-        if i >= n as usize {
-            return;
-        }
-        // SAFETY: i < n <= x.len() and y.len() by the launch contract; thread
-        // i owns entry i.
-        let v = unsafe { *x.get_unchecked(i) };
-        let out = if !v.is_finite() {
-            v
-        } else {
-            let r = if v > 0.0 { v } else { 0.0 };
-            r * r
-        };
-        // SAFETY: i < n <= y.len() by the launch contract; thread i owns
-        // entry i.
-        unsafe {
-            *y.get_unchecked_mut(i) = out;
-        }
-    }
-
     /// `y[i] = a[i] + b[i]`, elementwise over `n` values — exact; the body
     /// is one add, so nothing is extracted into a core.
     #[kernel]
@@ -2174,29 +2143,6 @@ impl ElemKernels {
             .module
             .prepare_swiglu(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.swiglu(stream, &prep, gate, up, n, y)?;
-        Ok(())
-    }
-
-    /// Enqueue `y = max(x, 0)^2` over `n` values (flat). A non-finite input
-    /// stays that value. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_relu_sqr(
-        &self,
-        stream: &CudaStream,
-        x: &DeviceBuffer<f32>,
-        n: usize,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        if n == 0 || x.len() < n || y.len() < n {
-            return Err(GpuError::shape(
-                "enqueue_relu_sqr",
-                format!("n={n}, x.len() {}, y.len() {}", x.len(), y.len()),
-            ));
-        }
-        let n = launch_u32("enqueue_relu_sqr", "n", n)?;
-        let prep = self
-            .module
-            .prepare_relu_sqr(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
-        self.module.relu_sqr(stream, &prep, x, n, y)?;
         Ok(())
     }
 
