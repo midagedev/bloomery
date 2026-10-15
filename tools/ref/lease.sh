@@ -1250,21 +1250,59 @@ EOF
   # ended by the group's TERM. The command reads the runner's stdin.
   if command -v flock > /dev/null 2>&1; then
     command -v timeout > /dev/null || cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout"
-    printf '%s\n' '#!/bin/sh' 'trap "exit 7" TERM' 'echo "$$ $PPID" > "$1"' 'while :; do sleep 1; done' > "$t/held"
+    printf '%s\n' '#!/bin/sh' 'trap "exit 7" TERM' 'echo "$$ $PPID" > "${HELD_PID:-$1}"' 'while :; do sleep 1; done' > "$t/held"
     chmod +x "$t/held"
+    for model in ds41 qwen3moe; do
+      sed -n '/^ref_arm() {/,/^}/p; /^ours_arm() {/,/^}/p' \
+        "$LEASE_TREE/tools/ref/depth-$model.sh" > "$t/$model-arm-functions"
+    done
+    cat > "$t/depth-arm-harness" << 'EOF'
+TEST_BIN=$3 TEST_PID=$4
+N=1 WARM='' PH_DIR=''
+A_DEP=(6) A_BIN=("$TEST_BIN") A_PLACE=(a) A_MEM=('') A_PREFILL=('')
+MEM_SCOPE_SCRIPT='exec "$@"'
+arm_envs() { ARM_ENVS=(); }
+arm_feed() { ARM_FEED=("$TEST_PID"); }
+arm_prompt() { echo 0; }
+arm_ctx() { echo 64; }
+evict_arm() { :; }
+majflt_now() { echo 0; }
+majflt_mark() { cat; }
+witness() { :; }
+ref_witness() { :; }
+ours_pre() { :; }
+ref_cmd() { REF_BIN=$TEST_BIN; REF_ARGS=("$TEST_PID"); REF_ENV=(); REF_MARK=''; }
+pp_eng() { [ "$1" = pp ]; }
+EOF
+    cat > "$t/tbin/systemd-run" << 'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case $1 in -p) shift 2 ;; --scope | --quiet) shift ;; *) break ;; esac
+done
+exec "$@"
+EOF
+    chmod +x "$t/tbin/systemd-run"
     n=0 BOUND=20
     # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
     # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
     # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
-    for form in direct capture; do
+    for form in direct capture ds41-ours ds41-ref ds41-pp qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
       for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
         n=$((n + 1))
+        funcs=''
         case $form in
           direct) call='lease_bounded "$BOUND" "$3" "$4"' ;;
           capture) call='lease_out_init; echo "capture dir $LEASE_OUT_DIR"; lease_capture "$BOUND" "$3" "$4"' ;;
+          ds41-ours | qwen3moe-ours) call='source "$5"; source "$6"; ours_arm 0 1' ;;
+          ds41-ref | qwen3moe-ref) call='source "$5"; source "$6"; ref_arm stub 6 1' ;;
+          ds41-pp) call='source "$5"; source "$6"; ref_arm pp 6 1' ;;
+          qwen3moe-mem) call='source "$5"; source "$6"; A_MEM=(1); ours_arm 0 1' ;;
         esac
-        BOUND=$BOUND bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp $call; echo next arm; }" \
-          _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" > "$t/bout$n" 2>&1 &
+        case $form in ds41-*) funcs=$t/ds41-arm-functions ;; qwen3moe-*) funcs=$t/qwen3moe-arm-functions ;; esac
+        BOUND=$BOUND HELD_PID="$t/held$n.pid" PATH="$t/tbin:$PATH" \
+          bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp $call; echo next arm; }" \
+          _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" \
+          "$funcs" "$t/depth-arm-harness" > "$t/bout$n" 2>&1 &
         rp=$!
         i=0
         until [ -s "$t/held$n.pid" ] || [ "$i" = 100 ]; do

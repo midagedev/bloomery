@@ -2220,8 +2220,11 @@ ref_arm() {
   ref_witness
   t0=$(date +%s)
   f0=$(majflt_now)
-  raw=$(timeout --kill-after=10 "$BOUND" "$REF_BIN" "${REF_ARGS[@]}" 2>&1 | majflt_mark "$markf" "$REF_MARK"; exit "${PIPESTATUS[0]}")
-  rc=$?
+  lease_out_init || exit 70
+  rc=0
+  lease_filter "$BOUND" stdout "$LEASE_OUT_FILE" majflt_mark "$markf" "$REF_MARK" -- \
+    "$REF_BIN" "${REF_ARGS[@]}" || rc=$?
+  raw=$(< "$LEASE_OUT_FILE")
   f1=$(majflt_now)
   t1=$(date +%s)
   mark=$(cat "$markf")
@@ -2368,16 +2371,17 @@ ours_arm() {
   arm_envs "$i"
   t0=$(date +%s)
   f0=$(majflt_now)
+  rc=0
   if [ -n "${A_MEM[$i]}" ]; then
-    out=$(timeout --kill-after=10 "$BOUND" systemd-run --scope --quiet \
+    lease_capture "$BOUND" systemd-run --scope --quiet \
       -p "MemoryMax=${A_MEM[$i]}G" -p MemorySwapMax=0 \
       env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} bash -c "$MEM_SCOPE_SCRIPT" -- \
       "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" \
-      ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
+      ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} || rc=$?
   else
-    out=$(timeout --kill-after=10 "$BOUND" env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
+    lease_capture "$BOUND" env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} || rc=$?
   fi
-  rc=$?
+  out=$LEASE_OUT
   f1=$(majflt_now)
   t1=$(date +%s)
   MAJ_WHOLE=$((f1 - f0)) MAJ_TIMED=
