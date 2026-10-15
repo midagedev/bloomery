@@ -286,29 +286,49 @@ impl Site {
     }
 }
 
-/// `y = rms_norm(x, name)` at the model's epsilon.
+/// `y = rms_norm(x, name)` over `m` rows of `hidden` at `eps`: the step's
+/// one row and a prompt pass's rows ([`super::prefill`]).
+pub(super) fn norm_rows(
+    (gpu, w): (&Gpu, &Weights),
+    (eps, hidden, m): (f32, usize, usize),
+    name: &str,
+    x: &DeviceBuffer<f32>,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let gain = w.f32_buf(WHAT, name)?;
+    gpu.elem()
+        .enqueue_rms_norm(gpu.stream(), x, gain, eps, hidden, m, y)
+}
+
+/// `dst = src + delta` over `n` values, the layer's residual.
+pub(super) fn residual_rows(
+    gpu: &Gpu,
+    n: usize,
+    src: &DeviceBuffer<f32>,
+    delta: &DeviceBuffer<f32>,
+    dst: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    gpu.elem().enqueue_add(gpu.stream(), src, delta, n, dst)
+}
+
+/// `y = rms_norm(x, name)`, one row.
 fn norm(
     cx: &Cx<'_>,
     name: &str,
     x: &DeviceBuffer<f32>,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let gain = cx.f32(name)?;
-    cx.gpu
-        .elem()
-        .enqueue_rms_norm(cx.gpu.stream(), x, gain, cx.sh.eps, cx.sh.hidden, 1, y)
+    norm_rows((cx.gpu, cx.w), (cx.sh.eps, cx.sh.hidden, 1), name, x, y)
 }
 
-/// `dst = src + delta`, the layer's residual.
+/// `dst = src + delta`, one row.
 fn residual(
     cx: &Cx<'_>,
     src: &DeviceBuffer<f32>,
     delta: &DeviceBuffer<f32>,
     dst: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    cx.gpu
-        .elem()
-        .enqueue_add(cx.gpu.stream(), src, delta, cx.sh.hidden, dst)
+    residual_rows(cx.gpu, cx.sh.hidden, src, delta, dst)
 }
 
 /// One Mamba-2 layer: the `ssm_in` output is `[z | xBC | dt]`, three views of

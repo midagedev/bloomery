@@ -16,7 +16,7 @@
 //! GEMM's band, not bit for bit.
 
 use super::body::Body;
-use super::step::{Layer, Site};
+use super::step::{Layer, Site, norm_rows, residual_rows};
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{GROUP_5, GqaArgs, HEAD, partials_ms_len, partials_v_len};
@@ -196,8 +196,6 @@ struct Cx<'a> {
     gpu: &'a Gpu,
     w: &'a Weights,
     wk: WideKernels<'a>,
-    eps: f32,
-    hidden: usize,
     m: usize,
 }
 
@@ -249,31 +247,6 @@ fn project(
         )?;
     }
     Ok(())
-}
-
-/// `y = rms_norm(x, name)` over the pass's rows.
-fn norm(
-    cx: &Cx<'_>,
-    name: &str,
-    x: &DeviceBuffer<f32>,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let gain = cx.w.f32_buf(WHAT, name)?;
-    cx.gpu
-        .elem()
-        .enqueue_rms_norm(cx.gpu.stream(), x, gain, cx.eps, cx.hidden, cx.m, y)
-}
-
-/// `dst = src + delta` over the pass's rows.
-fn residual(
-    cx: &Cx<'_>,
-    src: &DeviceBuffer<f32>,
-    delta: &DeviceBuffer<f32>,
-    dst: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    cx.gpu
-        .elem()
-        .enqueue_add(cx.gpu.stream(), src, delta, cx.m * cx.hidden, dst)
 }
 
 impl Body {
@@ -345,8 +318,6 @@ impl Body {
                 gemm: &self.k.gemm,
                 g32: Some(&self.k.g32),
             },
-            eps: sh.eps,
-            hidden: sh.hidden,
             m,
         };
         let mut in_a = true;
@@ -383,7 +354,7 @@ impl Body {
                     let g = sh.mamba.geom();
                     let (inner, conv_dim) = (g.d_inner, sh.mamba.conv_dim());
                     let ld = 2 * inner + 2 * g.n_groups * g.d_state + g.n_heads;
-                    norm(&cx, &mm.norm, src, xn)?;
+                    norm_rows((gpu, w), (sh.eps, sh.hidden, m), &mm.norm, src, xn)?;
                     project(&cx, (acts, route), l, xn, &mut [(&mm.ssm_in, ld, zxbcdt)])?;
                     self.k.mamba.enqueue_steps(
                         stream,
@@ -420,7 +391,7 @@ impl Body {
                 }
                 Layer::Attn(a) => {
                     let kv_width = n_kv * HEAD;
-                    norm(&cx, &a.norm, src, xn)?;
+                    norm_rows((gpu, w), (sh.eps, sh.hidden, m), &a.norm, src, xn)?;
                     project(
                         &cx,
                         (acts, route),
@@ -490,7 +461,7 @@ impl Body {
                     project(&cx, (acts, route), l, attn, &mut [(&a.o, sh.hidden, delta)])?;
                 }
                 Layer::Mlp(ml) => {
-                    norm(&cx, &ml.norm, src, xn)?;
+                    norm_rows((gpu, w), (sh.eps, sh.hidden, m), &ml.norm, src, xn)?;
                     project(&cx, (acts, route), l, xn, &mut [(&ml.up, ml.ff, up)])?;
                     gpu.elem().enqueue_relu_sqr(stream, up, m * ml.ff, act)?;
                     project(
@@ -502,7 +473,7 @@ impl Body {
                     )?;
                 }
             }
-            residual(&cx, src, delta, dst)?;
+            residual_rows(gpu, m * sh.hidden, src, delta, dst)?;
             in_a = !in_a;
         }
         if let Some(head) = head {
