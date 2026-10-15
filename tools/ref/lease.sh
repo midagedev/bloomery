@@ -1348,19 +1348,27 @@ EOF
     check bounded-capture-exit-trap "$(trap -p EXIT)" $'trap -- \'rm -rf "$t"\nlease_out_clean\' EXIT'
     cat > "$t/exit-trap-runner" << 'EOF'
 source "$1"
+TRAP_READS=$3.reads
+trap() {
+  if [ "$*" = '-p EXIT' ]; then printf "%s\n" "$BASH_SUBSHELL" >> "$TRAP_READS"; fi
+  builtin trap "$@"
+}
 trap 'printf "%s\n" "runner'\''s trap" > "$2"
 printf "%s\n" kept >> "$2"' EXIT
+RETURN_ARGS=$3.args
+set -T
+trap 'if [ "${FUNCNAME[0]}" = lease_out_init ]; then printf "%s\n" "$#" >> "$RETURN_ARGS"; fi' RETURN
 lease_capture 10 true
 lease_out_init
 echo "$LEASE_OUT_DIR" > "$3"
-echo "$4" > "$3.arg"
 EOF
     RC=0
     lease_bounded 10 bash "$t/exit-trap-runner" "$LEASE_TREE/tools/ref/lease.sh" \
-      "$t/exit-marker" "$t/exit-dir" sentinel > "$t/exit-log" 2>&1 || RC=$?
+      "$t/exit-marker" "$t/exit-dir" > "$t/exit-log" 2>&1 || RC=$?
     check bounded-capture-quoted-exit-rc "$RC" 0
     check bounded-capture-quoted-exit-ran "$(cat "$t/exit-marker")" "$(printf "runner's trap\nkept")"
-    check bounded-capture-exit-positional "$(cat "$t/exit-dir.arg")" sentinel
+    check bounded-capture-exit-trap-shell "$(cat "$t/exit-dir.reads")" "$(printf '0\n0')"
+    check bounded-capture-exit-positional "$(cat "$t/exit-dir.args")" "$(printf '0\n0')"
     cdir=$(cat "$t/exit-dir")
     check bounded-capture-quoted-exit-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
     cat > "$t/comment-exit-runner" << 'EOF'
