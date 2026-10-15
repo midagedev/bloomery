@@ -227,11 +227,12 @@ def device_dirs(base_tree, out, base_sha):
     os.replace(tmp, cache)
 
 
-def review_slot():
+def review_slot(say=lambda m: None):
     """One of two flock slots. A third pre-review polls both and takes the first that frees."""
     d = os.path.expanduser("~/.cache/bloomery-review")
     os.makedirs(d, exist_ok=True)
     fds = [open(os.path.join(d, f"slot{i}"), "a") for i in (0, 1)]
+    said = False
     while True:
         for f in fds:
             try:
@@ -239,6 +240,9 @@ def review_slot():
                 return f
             except BlockingIOError:
                 continue
+        if not said:
+            say("pre-review: both review slots are busy; waiting")
+            said = True
         time.sleep(0.05)
 
 
@@ -371,9 +375,9 @@ def claude_ok():
         p = subprocess.run(["claude", "--version"], capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise Stop(75, f"pre-review: claude --version failed ({type(e).__name__}): 설치 깨짐; nothing was reviewed") from e
+        raise Stop(75, f"pre-review: claude --version failed ({type(e).__name__}): broken install; nothing was reviewed") from e
     if p.returncode != 0:
-        raise Stop(75, f"pre-review: claude --version failed (rc {p.returncode}): 설치 깨짐; nothing was reviewed")
+        raise Stop(75, f"pre-review: claude --version failed (rc {p.returncode}): broken install; nothing was reviewed")
 
 
 def pre_checks(pr_tree, paths, say):
@@ -397,7 +401,7 @@ def must_fix_titles(body):
 
 
 def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
-    slot = None if stubbed else review_slot()  # held until this review returns
+    slot = None if stubbed else review_slot(say)  # held until this review returns
     if not stubbed and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
     if not stubbed:
@@ -606,7 +610,7 @@ def self_test():
                 got = None
             except Stop as e:
                 got = e
-            expect(got is not None and got.code == 75 and "설치 깨짐" in got.msg,
+            expect(got is not None and got.code == 75 and "broken install" in got.msg,
                    f"a claude that fails --version ends 75 naming a broken install: {got and (got.code, got.msg)}")
             open(fake, "w").write("#!/bin/sh\necho 2.0.0\nexit 0\n")
             os.chmod(fake, 0o755)
@@ -656,9 +660,10 @@ def self_test():
         try:
             held = [review_slot(), review_slot()]
             seen = []
+            said = []
 
             def third():
-                review_slot()
+                review_slot(said.append)
                 seen.append(1)
 
             th = threading.Thread(target=third)
@@ -667,8 +672,10 @@ def self_test():
             waited = seen == []
             held.pop().close()  # slot 1 frees; slot 0 stays held
             th.join(5)
-            expect(waited and seen == [1] and not th.is_alive(),
-                   f"a third pre-review takes the free slot, not only slot 0: waited {waited}, ran {seen}, alive {th.is_alive()}")
+            expect(waited and seen == [1] and not th.is_alive()
+                   and said == ["pre-review: both review slots are busy; waiting"],
+                   f"a third pre-review takes the free slot, not only slot 0, and says it is waiting: "
+                   f"waited {waited}, ran {seen}, alive {th.is_alive()}, said {said}")
         finally:
             for f in held:
                 f.close()
