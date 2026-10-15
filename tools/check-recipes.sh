@@ -291,6 +291,9 @@ blk_macstatic() { tool_selftest mac-static.sh; }
 # dirty-tree, lock and ledger rules, and (on macOS) the whole flow against a stub ssh that runs the "remote" in a
 # fake home, are tested here, no remote and no cargo.
 blk_macremote() { tool_selftest mac-remote.sh; }
+# pre-push.sh runs pre-review and mac-static of one clean HEAD at once: its clean-tree refusal, the parallel start, the
+# BASE it hands each, its lines and its exit code, against two stub checks in a scratch repo.
+blk_prepush() { tool_selftest pre-push.sh; }
 # box.sh's hold on this side (~/.cache/bloomery/box-hold/<owner>, the header): its refusal before any rsync or ssh, the owner's and a
 # read's pass, the `--hold up|down` rules and a looping caller stopping at its next call, on a scratch copy under a fake HOME with
 # ssh and rsync stubs, no box.
@@ -868,7 +871,7 @@ proc_leg
 unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote prepush boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
