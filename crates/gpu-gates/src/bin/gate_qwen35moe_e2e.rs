@@ -477,17 +477,6 @@ mod gate {
     /// that; a wiring fault still reads order one.
     const U_L0_REL_Q32: f64 = 1e-2;
 
-    /// (u)'s layer-0 band for the file this gate runs on: [`U_L0_REL_Q32`]
-    /// when layer 0 is the Q8_0 delta layout (`Shape` admits it only with its
-    /// shared expert apart), else [`U_L0_REL`].
-    fn u_l0_band() -> f64 {
-        if shape().apart()[0] {
-            U_L0_REL_Q32
-        } else {
-            U_L0_REL
-        }
-    }
-
     /// PIN(2026-09-27): (d)'s bound on the step at position 1,024 free-running
     /// from each run's own state — each layer's output distance from ik's and
     /// the logits' — the ubatch run's over the pass run's. Derivation: past
@@ -2606,7 +2595,13 @@ mod gate {
         let slots: Vec<usize> = (0..RING_ROWS).collect();
         // (u)
         let mut ok = true;
-        let band = u_l0_band();
+        // (u)'s layer-0 band: U_L0_REL_Q32 where layer 0 is the Q8_0 delta
+        // layout (`Shape` admits it only with its shared expert apart).
+        let band = if shape().apart()[0] {
+            U_L0_REL_Q32
+        } else {
+            U_L0_REL
+        };
         for (l, (a, b)) in ub.stores.iter().zip(&pass.stores).enumerate() {
             let (x, y) = store_rel(a, b, &slots);
             if l == 0 {
