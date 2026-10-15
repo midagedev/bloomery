@@ -751,7 +751,10 @@ mod cli {
     /// [`cli::run`] already refuses, by name before the load: the body runs
     /// whole on one card with f16 K/V.
     fn nemotron_refused(kv: KvQ8, place: bool) -> Result<(), GateError> {
-        let set = [("--place", place), ("BLOOMERY_QWEN3_KV=q8_0", kv == KvQ8::Q8)];
+        let set = [
+            ("--place", place),
+            ("BLOOMERY_QWEN3_KV=q8_0", kv == KvQ8::Q8),
+        ];
         match set.iter().find(|(_, on)| *on) {
             Some((name, _)) => Err(format!(
                 "{name} on a nemotron_h file: its body runs whole on one card, one sequence, \
