@@ -16,7 +16,7 @@
 //! another file, and one written by another mainline build.
 
 use crate::RefError;
-use crate::columns::{Columns, Row, file_name};
+use crate::columns::{Columns, Row, file_name, one};
 use crate::family::{Family, Identity};
 use std::collections::HashSet;
 use std::fmt;
@@ -260,13 +260,6 @@ impl LogitsSet {
         }
         self.logits(p)?;
         Ok(())
-    }
-}
-
-fn one(f: &[&str], at: &dyn fmt::Display, want: &str) -> Result<String, RefError> {
-    match f {
-        [_, v] if !v.is_empty() => Ok((*v).to_string()),
-        _ => Err(RefError::malformed(at, format!("want {want}"))),
     }
 }
 

@@ -294,7 +294,7 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         "a file outside the directory",
         &["tap\tx\t0\tf32\t2\t../trunk_h.f32"],
         &|_| {},
-        "is not a name under the set's directory",
+        "does not name a file of the set's directory",
     );
     at(
         "a prompt whose id is not the step's token",
@@ -364,6 +364,24 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         &[],
         &|d| swap(d, "step\t1\t12\t1\t6\t7", "step\t1\t12\t2\t6\t7"),
         "step row 1",
+    );
+    at(
+        "a step row gone",
+        &[],
+        &|d| swap(d, "step\t2\t13\t2\t8\t8", ""),
+        "2 step rows, # mtp says 3 steps ran",
+    );
+    at(
+        "a trunk file outside the directory",
+        &[],
+        &|d| {
+            swap(
+                d,
+                "trunk\th_nextn\tf32\t4\t2\ttrunk_h.f32",
+                "trunk\th_nextn\tf32\t4\t2\t../trunk_h.f32",
+            )
+        },
+        "does not name a file of the set's directory",
     );
     at(
         "a line after the trailer",

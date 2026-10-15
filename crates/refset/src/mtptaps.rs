@@ -26,7 +26,7 @@
 //! build, for another architecture, without the MTP context, and one whose files disagree with its rows.
 
 use crate::RefError;
-use crate::columns::{Columns, Row, need};
+use crate::columns::{Columns, Row, file_name, need, one};
 use crate::family::{Family, Identity};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
@@ -581,26 +581,8 @@ fn read_f32(path: &Path, want: u64, file: &str) -> Result<Vec<f32>, RefError> {
         .collect())
 }
 
-fn one(f: &[&str], at: &dyn fmt::Display, want: &str) -> Result<String, RefError> {
-    match f {
-        [_, v] if !v.is_empty() => Ok((*v).to_string()),
-        _ => Err(RefError::malformed(at, format!("want {want}"))),
-    }
-}
-
 fn number(v: &str, at: &dyn fmt::Display) -> Result<u32, RefError> {
     crate::columns::parse_field(v, "count", at)
-}
-
-/// A file name of the set: one component, so a row cannot name a file outside the directory.
-fn file_name(name: &str, at: &dyn fmt::Display) -> Result<(), RefError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
-        return Err(RefError::malformed(
-            at,
-            format!("file {name:?} is not a name under the set's directory"),
-        ));
-    }
-    Ok(())
 }
 
 fn step_row(r: &Row<'_>) -> Result<Step, RefError> {

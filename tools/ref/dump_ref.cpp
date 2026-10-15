@@ -594,8 +594,8 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "dump_ref: --tokens and --tokens-file are exclusive\n");
             return 2;
         }
-        if (tokens_count == 0) {
-            fprintf(stderr, "dump_ref: --tokens-count must be positive\n");
+        if (tokens_count < 0) {
+            fprintf(stderr, "dump_ref: --tokens-file needs --tokens-count\n");
             return 2;
         }
         if (!read_token_file(tokens_file, tokens_count, tokens)) return 2;

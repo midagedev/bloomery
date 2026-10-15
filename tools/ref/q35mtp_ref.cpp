@@ -56,26 +56,6 @@ static int fail(const std::string & what, const std::string & detail = "") {
     return 1;
 }
 
-static bool write_ids(const std::string & path, const std::vector<llama_token> & ids) {
-    FILE * f = fopen(path.c_str(), "w");
-    if (!f) {
-        fprintf(stderr, "q35mtp_ref: cannot write %s\n", path.c_str());
-        return false;
-    }
-    for (llama_token id : ids) {
-        if (fprintf(f, "%d\n", (int) id) < 0) {
-            fclose(f);
-            fprintf(stderr, "q35mtp_ref: short write on %s\n", path.c_str());
-            return false;
-        }
-    }
-    if (fclose(f) != 0) {
-        fprintf(stderr, "q35mtp_ref: short write on %s\n", path.c_str());
-        return false;
-    }
-    return true;
-}
-
 static bool parse_rows(const char * spec, std::vector<int> & rows) {
     const char * p = spec;
     while (*p) {

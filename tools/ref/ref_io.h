@@ -67,6 +67,23 @@ bool read_token_file(const std::string & path, long long count, std::vector<Toke
     return false;
 }
 
+// The ids, one decimal id a line (the form read_token_file reads), every line written and the file closed.
+template <typename Token>
+bool write_ids(const std::string & path, const std::vector<Token> & ids) {
+    FILE * f = fopen(path.c_str(), "w");
+    if (!f) {
+        perror(path.c_str());
+        return false;
+    }
+    bool ok = true;
+    for (Token id : ids) ok = ok && fprintf(f, "%d\n", (int) id) >= 0;
+    if (fclose(f) != 0 || !ok) {
+        fprintf(stderr, "%s: short write\n", path.c_str());
+        return false;
+    }
+    return true;
+}
+
 // `bytes` bytes to `path`, every byte written and the file closed, or named on stderr.
 inline bool write_bytes(const std::string & path, const void * data, size_t bytes) {
     FILE * f = fopen(path.c_str(), "wb");

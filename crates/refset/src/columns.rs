@@ -113,7 +113,7 @@ where
 /// `name` is one file of the set's own directory. Empty, `.`, `..`, or a
 /// slash is `Malformed`: the manifest must not name a path outside it.
 pub(crate) fn file_name(name: &str, at: &dyn Display) -> Result<(), RefError> {
-    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) || matches!(name, "." | "..") {
         return Err(RefError::malformed(
             at,
             format!("{name:?} does not name a file of the set's directory"),
@@ -131,4 +131,12 @@ pub(crate) fn need<'a>(
 ) -> Result<&'a Columns, RefError> {
     cols.as_ref()
         .ok_or_else(|| RefError::malformed(at, format!("a {what} row before its column line")))
+}
+
+/// The one value of a `# key\t<value>` header line, or a malformed-set error naming the form `want`.
+pub(crate) fn one(f: &[&str], at: &dyn Display, want: &str) -> Result<String, RefError> {
+    match f {
+        [_, v] if !v.is_empty() => Ok((*v).to_string()),
+        _ => Err(RefError::malformed(at, format!("want {want}"))),
+    }
 }
