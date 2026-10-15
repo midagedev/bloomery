@@ -91,22 +91,23 @@ pub struct Crossing {
     pub prog: Option<usize>,
 }
 
-/// The reader's side of one counter: the generation it last delivered.
+/// One side's last generation of a counter: delivered on the reader,
+/// posted on the writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Relay {
     seen: u32,
 }
 
 impl Relay {
-    /// A relay that has delivered every generation up to `inbox`.
-    pub(super) fn at(inbox: u32) -> Relay {
-        Relay { seen: inbox }
+    /// A relay whose last generation is `seen`.
+    pub(super) fn at(seen: u32) -> Relay {
+        Relay { seen }
     }
 
-    /// What the inbox's value `now` delivers: `Ok(false)` nothing new (a
+    /// What the value `now` carries: `Ok(false)` nothing new (a
     /// repeated post included), `Ok(true)` one generation more, and the step
     /// as the error for anything else, since a row has at most one go or done
-    /// in flight. Wrapping.
+    /// in flight. Wrapping. The writer checks here before posting.
     pub(super) fn take(&mut self, now: u32) -> Result<bool, u32> {
         match now.wrapping_sub(self.seen) {
             0 => Ok(false),
@@ -305,10 +306,10 @@ impl Half {
     fn post(&mut self, i: usize, page: &dyn Page, wire: &mut dyn Wire) -> bool {
         let line = &self.lines[i];
         let g = page.word(line.c.counter).load(Ordering::Acquire);
-        match g.wrapping_sub(line.posted) {
-            0 => return false,
-            1 => {}
-            step => {
+        match Relay::at(line.posted).take(g) {
+            Ok(false) => return false,
+            Ok(true) => {}
+            Err(step) => {
                 let why = format!(
                     "the tier page's counter at byte {} stepped by {step} between two posts: a row \
                      has at most one go or done in flight",
@@ -564,7 +565,7 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use super::super::{DRAIN, End, Memory, Mirror, Pump};
+    use super::super::{DRAIN, End, Memory, Mirror, Pump, Side};
     use super::{Crossing, Half, Move, Page, Reader, Relay, TAIL_LINE, Wire};
     use crate::host::step::RELEASE;
 
@@ -692,6 +693,32 @@ mod tests {
         }
     }
 
+    /// A wire that runs a card step and pump pass at a chosen reap.
+    struct StepOnReap {
+        wire: Memory<Mem>,
+        step: Option<Box<dyn FnOnce() + Send>>,
+        skip_first: bool,
+    }
+
+    impl Wire for StepOnReap {
+        fn post(&mut self, moves: &[Move]) -> Result<(), String> {
+            self.wire.post(moves)
+        }
+
+        fn reap(&mut self) -> Result<bool, String> {
+            if self.skip_first {
+                self.skip_first = false;
+            } else if let Some(step) = self.step.take() {
+                step();
+            }
+            self.wire.reap()
+        }
+
+        fn abort(&mut self) -> Result<(), String> {
+            self.wire.abort()
+        }
+    }
+
     #[test]
     fn a_relay_delivers_each_generation_once_across_the_wrap() {
         let mut r = Relay::at(u32::MAX - 1);
@@ -765,30 +792,17 @@ mod tests {
         }
     }
 
-    /// Mirrored pages as the link holds them over the model row, with no
-    /// pump thread ([`link_over`]).
+    /// Mirrored pages over the model row, with no pump thread: the stage
+    /// card's end over `stage`, posting through `stage_wire`, and the tier
+    /// cards' end over `tier`, posting through `tier_wire`.
     fn link(
         stage: &Arc<Mem>,
         tier: &Arc<Mem>,
         stage_wire: impl Wire + 'static,
         tier_wire: impl Wire + 'static,
     ) -> Mirror<Mem> {
-        link_over(row, stage, tier, stage_wire, tier_wire)
-    }
-
-    /// Mirrored pages as the link holds them over `crossings`, with no pump
-    /// thread: the stage card's end over `stage`, posting through
-    /// `stage_wire`, and the tier cards' end over `tier`, posting through
-    /// `tier_wire`.
-    fn link_over(
-        crossings: fn() -> Vec<Crossing>,
-        stage: &Arc<Mem>,
-        tier: &Arc<Mem>,
-        stage_wire: impl Wire + 'static,
-        tier_wire: impl Wire + 'static,
-    ) -> Mirror<Mem> {
         let half = |side, page: &Arc<Mem>| {
-            Half::new(crossings(), side, TAIL, &**page).expect("the model row fits before the tail")
+            Half::new(row(), side, TAIL, &**page).expect("the model row fits before the tail")
         };
         Mirror {
             pumps: Vec::new(),
@@ -1033,24 +1047,66 @@ mod tests {
     }
 
     // The tiers of a row post the same spans. A release stops every tier's
-    // counters on both ends before any counter moves, so a released tier
-    // card that runs on (its done stepped after the release, over the rows
-    // the tier cards' page holds) carries nothing to the stage's page.
+    // counters on both ends before any counter moves. Each card and pump
+    // run during the other end's settle, before the first raise, and the
+    // tier card runs again after release; neither end carries a span.
     #[test]
     fn a_release_stops_every_tiers_counters_before_any_moves() {
         let stage = page(&[]);
         let tier = page(&[]);
-        let mut m = link_over(
-            two_tiers,
-            &stage,
-            &tier,
-            wire(&stage, &tier),
-            wire(&tier, &stage),
-        );
-        m.run_on = Some((CNT_1, 1));
-        tier.word(ROWS).store(7, Ordering::Relaxed);
+        let tier_end = Arc::new(End::new(
+            Half::new(two_tiers(), Reader::Tier, TAIL, &*tier).expect("the tier's crossings"),
+            StepOnReap {
+                wire: wire(&tier, &stage),
+                step: None,
+                skip_first: true,
+            },
+            Arc::clone(&tier),
+        ));
+        let stage_end = Arc::new(End::new(
+            Half::new(two_tiers(), Reader::Stage, TAIL, &*stage).expect("the stage's crossings"),
+            StepOnReap {
+                wire: wire(&stage, &tier),
+                step: Some(Box::new({
+                    let stage = Arc::clone(&stage);
+                    let tier = Arc::clone(&tier_end);
+                    move || {
+                        assert_eq!(stage.word(CNT).load(Ordering::Acquire), 0);
+                        let page = tier.page();
+                        assert_eq!(page.word(GO).load(Ordering::Acquire), 0);
+                        page.word(ROWS).store(7, Ordering::Relaxed);
+                        page.word(CNT_1).fetch_add(1, Ordering::Release);
+                        page.word(PROG_1).fetch_add(1, Ordering::Release);
+                        assert!(!tier.pass(), "a tier carried a done during release");
+                    }
+                })),
+                skip_first: false,
+            },
+            Arc::clone(&stage),
+        ));
+        tier_end.lock().1.step = Some(Box::new({
+            let stage = Arc::clone(&stage_end);
+            let tier = Arc::clone(&tier);
+            move || {
+                let page = stage.page();
+                assert_eq!(page.word(CNT).load(Ordering::Acquire), 0);
+                assert_eq!(tier.word(GO).load(Ordering::Acquire), 0);
+                page.word(IMAGE).store(11, Ordering::Relaxed);
+                page.word(GO_1).fetch_add(1, Ordering::Release);
+                assert!(!stage.pass(), "the stage carried a go during release");
+            }
+        }));
+        let m = Mirror {
+            pumps: Vec::new(),
+            stage: stage_end,
+            tier: tier_end,
+            run_on: Some((CNT_1, 1)),
+        };
         assert_eq!(m.release(RELEASE), Ok(()));
         assert_eq!(m.broken(), None);
+        assert_eq!(tier.word(CNT_1).load(Ordering::Acquire), 2);
+        assert_eq!(stage.word(GO_1).load(Ordering::Acquire), 1);
+        assert_eq!(tier.word(IMAGE).load(Ordering::Acquire), 0, "image carried");
         assert_eq!(stage.word(ROWS).load(Ordering::Acquire), 0, "rows carried");
         assert_eq!(
             stage.word(PROG_1).load(Ordering::Acquire),
