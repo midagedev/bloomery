@@ -25,6 +25,7 @@
 //! tier inside the step), [`Rows`] (a pass of several rows), [`Rollback`],
 //! [`Instrumented`] (a synthetic depth) and [`Probed`] (the node-price probe).
 
+mod errors;
 pub(crate) mod kernels;
 pub(crate) mod lookup;
 pub(crate) mod probe;
@@ -43,7 +44,7 @@ use crate::host::nvtier::{ArenaKind, NvTier};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
-use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
+use crate::hybrid::{Chain, HostResidency, Refusal};
 use crate::watchdog;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
@@ -1203,13 +1204,15 @@ impl<B: ChainBody> GpuModel<B> {
     /// when the body's host service refused input the card should already
     /// have refused, it released every wait of the step, so the call drains,
     /// and the fault word read on the engine stream behind it names the
-    /// refusal ([`name_refusal`]) — the card's fault when the card raised one
-    /// at or before that layer, else the host's error. When the word holds a
+    /// refusal ([`crate::hybrid::name_refusal`]): the card's fault when the
+    /// card raised one at or before that layer, else the host's error. When the word holds a
     /// later layer's fault, the caller's [`GpuModel::note_fault`] returns
     /// that fault with the host's error behind it, so the call ends poisoned
     /// and still names the refusal's layer, which came first. A failed read
     /// names the refusal and the call's error beside its own. Any other
-    /// result passes through.
+    /// result passes through. An unsettled release keeps its error: the
+    /// refusal is taken and poisons the call's slots, and the stream whose
+    /// waits still stand is not read.
     ///
     /// On a model that parks another slot the refusal also poisons the slots
     /// the call ran on (`slots`, [`PoisonWhy::Refused`]): the layers before
@@ -1232,32 +1235,22 @@ impl<B: ChainBody> GpuModel<B> {
         slots: SlotSet,
         name: impl FnOnce(&mut Refusal),
     ) -> Result<T, GpuError> {
-        const WHAT: &str = "GpuModel::name_host_refusal";
-        let e = match r {
-            Err(e) => e,
-            Ok(v) => return Ok(v),
-        };
-        let Some(mut refusal) = self.body.host().and_then(HostServed::take_host_refusal) else {
-            return Err(e);
-        };
-        name(&mut refusal);
-        if !self.parked.is_empty() && self.poisoned.is_none() {
-            self.poisoned = Some(SlotFault {
-                slots,
-                why: PoisonWhy::Refused(refusal.clone()),
-            });
-        }
-        match self.gpu.fault() {
-            Ok(word) => Err(name_refusal(&refusal, word)),
-            Err(s) => Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{} refused the input of layer {} ({}) and the call failed ({e}), and reading \
-                     the fault word behind it failed too ({s})",
-                    refusal.what, refusal.layer, refusal.detail
-                ),
-            )),
-        }
+        let (body, parked, poisoned) = (&mut self.body, &self.parked, &mut self.poisoned);
+        errors::name_host_refusal(
+            r,
+            || {
+                let mut refusal = body.host().and_then(HostServed::take_host_refusal)?;
+                name(&mut refusal);
+                if !parked.is_empty() && poisoned.is_none() {
+                    *poisoned = Some(SlotFault {
+                        slots,
+                        why: PoisonWhy::Refused(refusal.clone()),
+                    });
+                }
+                Some(refusal)
+            },
+            || self.gpu.fault(),
+        )
     }
 
     /// The step head's readback after a [`RowHeads::One`] pass, whose rows
@@ -1489,8 +1482,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// Pass through the result of `what`, a call that may have launched,
     /// remembering a fault it carries: the state the faulted call wrote
     /// poisons every later call until [`GpuModel::reset`]. A fault is the
-    /// call's error whatever else failed: any other error is read behind
-    /// ([`GpuModel::fault_behind`]). The fault prints its site mask in this
+    /// call's error whatever else failed: another error is read behind
+    /// ([`GpuModel::fault_behind`]) unless its stream is stalled or its
+    /// release unsettled. The fault prints its site mask in this
     /// body's step order. A body crate passes its own launches' results
     /// through it — a draft layer's walk poisons the model as a step does.
     pub fn note_fault<T>(
@@ -1509,16 +1503,17 @@ impl<B: ChainBody> GpuModel<B> {
         r: Result<T, GpuError>,
         slots: SlotSet,
     ) -> Result<T, GpuError> {
-        let mut e = match r {
-            Ok(v) => return Ok(v),
-            Err(e @ GpuError::Fault { .. }) => e,
+        let mut e = match errors::note_fault(r, |e| match e {
             // The stream did not drain within the bound: the fault word's
             // read would wait it out again.
-            Err(e @ GpuError::Stalled { .. }) => match self.body.host() {
+            e @ GpuError::Stalled { .. } => match self.body.host() {
                 Some(h) => h.noted(e),
                 None => e,
             },
-            Err(e) => self.fault_behind(what, e),
+            e => self.fault_behind(what, e),
+        }) {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
         };
         if let GpuError::Fault { fault, .. } = &mut e {
             *fault = fault.in_arch(B::arch());

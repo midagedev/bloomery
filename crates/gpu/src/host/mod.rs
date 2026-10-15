@@ -699,18 +699,6 @@ impl Poison {
         };
         PoisonMark { kind, what, layer }
     }
-
-    /// `note` added to what the poison saw.
-    fn note(&mut self, note: &str) {
-        let saw = match self {
-            Poison::Refused(r) => &mut r.detail,
-            Poison::Failed { error, .. } => error,
-            Poison::Panicked { message, .. } => message,
-            Poison::CardLost { detail, .. } => detail,
-        };
-        saw.push_str("; ");
-        saw.push_str(note);
-    }
 }
 
 impl std::fmt::Display for Poison {
@@ -838,7 +826,7 @@ impl Health {
         Some(GpuError::protocol(
             what,
             format!(
-                "the host tier is poisoned ({cause}); a reset lifts only refused input — \
+                "the host tier is poisoned ({cause}); a reset lifts only refused input, so \
                  reload the model"
             ),
         ))
@@ -906,17 +894,17 @@ impl Health {
         if !self.poisoned {
             return Ok(());
         }
-        let mut poison = self
+        let poison = self
             .poison
             .clone()
             .expect("a poisoned tier holds its poison: set_poison and set_lost set both");
-        if let Some(held) = &self.held {
-            poison.note(held);
-        }
-        Err(GpuError::HostPoisoned {
+        Err(self.released(
             what,
-            poison: Box::new(poison),
-        })
+            GpuError::HostPoisoned {
+                what,
+                poison: Box::new(poison),
+            },
+        ))
     }
 }
 
@@ -2233,7 +2221,9 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// Refuse `what` while a failed service has the tier poisoned
-    /// ([`GpuError::HostPoisoned`], naming the poison): what a body checks
+    /// ([`GpuError::HostPoisoned`], naming the poison; under a release that
+    /// left a card's waits standing, [`GpuError::Unsettled`] with it as the
+    /// source): what a body checks
     /// before anything else a call of its own would refuse, since after a
     /// failed service the poison is the cause.
     pub fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
@@ -2930,9 +2920,8 @@ impl<H: HostExperts> HostTier<H> {
     /// releases every pending wait first, so the stream drains instead of
     /// hanging a later synchronize, unless the tier link leaves a card's
     /// waits standing, which the error names ([`HostTier::release_all`]).
-    /// A planted refusal
-    /// ([`HostTier::plant_refusal`]) is returned here, as the service's own
-    /// refusal of this layer's input.
+    /// A planted refusal ([`HostTier::plant_refusal`]) is returned here, as
+    /// the service's own refusal of this layer's input.
     fn serve(
         &mut self,
         layer: usize,
@@ -2999,7 +2988,7 @@ impl<H: HostExperts> HostTier<H> {
     /// the refusal recorded for the caller's naming
     /// ([`HostTier::take_step_refusal`], [`HostTier::refusal`]), the tier
     /// poisoned as [`Poison::Refused`] with the refusal its cause, every
-    /// wait released ([`HostTier::serve`]'s failure arm) — and the error a
+    /// wait released ([`HostTier::serve`]'s failure arm), and the error a
     /// refusing service returns.
     fn refuse_planted(&mut self, layer: usize, detail: String) -> GpuError {
         let r = Refusal {
@@ -3239,6 +3228,43 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn a_poisoned_tier_keeps_held_waits_on_later_calls() {
+        use std::error::Error;
+
+        let health = super::Health {
+            poisoned: true,
+            poison: Some(super::Poison::Refused(super::Refusal {
+                what: "Hybrid::serve",
+                layer: 3,
+                detail: "planted refusal".into(),
+            })),
+            held: Some("the stage end left its done counter waiting".into()),
+            ..Default::default()
+        };
+        let error = health
+            .refuse_if_poisoned("Hybrid::begin_group")
+            .expect_err("the tier is poisoned");
+        assert!(matches!(
+            &error,
+            GpuError::Unsettled { what: "Hybrid::begin_group", detail, .. }
+                if detail == "the stage end left its done counter waiting"
+        ));
+        let source = error
+            .source()
+            .and_then(|source| source.downcast_ref::<GpuError>())
+            .expect("the later call keeps its typed poison under the held waits");
+        assert!(matches!(
+            source,
+            GpuError::HostPoisoned { what: "Hybrid::begin_group", poison }
+                if matches!(
+                    &**poison,
+                    super::Poison::Refused(super::Refusal { what: "Hybrid::serve", layer: 3, detail })
+                        if detail == "planted refusal"
+                )
+        ));
     }
 
     #[test]

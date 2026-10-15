@@ -2031,6 +2031,8 @@ impl Body {
         let chain = nanos(t1.elapsed());
         let (mut sums, tally) = match chained {
             Ok(done) => done,
+            // The release left the cards waiting: neither stream drains for a fault read.
+            Err(e @ GpuError::Unsettled { .. }) => return Err(e),
             Err(e) => {
                 let tier = self.hybrid.tier_fault();
                 return Err(fault_or(gpu, tier, b, e));
