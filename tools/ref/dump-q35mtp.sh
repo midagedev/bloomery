@@ -13,8 +13,8 @@
 # the card's gate lock, the bound (Q35MTP_BOUND, default 1500 s) and the card pick (BLOOMERY_GATE_CARD); no timing lease
 # (a functional oracle). The script links itself as target/release/q35mtp_dump and runs under that name inside the runner.
 #
-# Q35MTP_SET moves the set (a trial run installs nothing under the family's name). `--cpu` runs the same binary on the host instead (no card in view, -ngl 0, -t 16, no gate lock) into the same set,
-# for a card whose MTP context refuses; the set's `# backend` line says which one wrote it.
+# Q35MTP_SET moves the set (a trial run installs nothing under the family's name). `--cpu` runs the same binary on the host instead
+# (no card in view, -ngl 0, -t 16, no gate lock), only into a set Q35MTP_SET names; the set's `# backend` line says which one wrote it.
 #
 #   dump-q35mtp.sh [--cpu] [--tap NAME]...   the default taps are the profile's MTP_TAPS; --tap replaces them
 set -euo pipefail
@@ -22,6 +22,11 @@ REAL=$(readlink -f "${BASH_SOURCE[0]}")
 cd "$(dirname "$REAL")/../.."
 cpu=0
 if [ "${1:-}" = --cpu ]; then cpu=1; shift; fi
+# The family's set is the card's (mmvq over q8_1); a --cpu run writes only to a set Q35MTP_SET names.
+if [ "$cpu" = 1 ] && [ -z "${Q35MTP_SET:-}" ]; then
+  echo "dump-q35mtp: --cpu writes a trial set; name it with Q35MTP_SET (the family's set is the card's)" >&2
+  exit 64
+fi
 if [ "$(basename "${BASH_SOURCE[0]}")" != q35mtp_dump ] && [ "$cpu" = 0 ]; then
   mkdir -p target/release
   ln -sf ../../tools/ref/dump-q35mtp.sh target/release/q35mtp_dump
