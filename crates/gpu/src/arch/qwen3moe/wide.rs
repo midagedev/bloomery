@@ -387,6 +387,7 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize, forms: Forms) -> usize {
     let f32s = 3 * rows * d.hidden
         + rows * (q_len + 2 * kv_len)
         + if q_len == att { 0 } else { rows * att }
+        + if forms.out_gate { rows * att } else { 0 }
         + if rows > 1 { n * kv_len } else { 0 }
         + part_v
         + partials_ms_len(n, d.n_head)
@@ -531,7 +532,7 @@ pub(super) fn attention(
 /// The head-256 attention half ([`GqaKind::Gated256`]): `ffn_inp = x + W_o ·
 /// (flash ⊙ σ(gate))`. A K-quant `attn_output` reads the gated rows quantized
 /// in one launch; any other type reads them as f32 rows (the out gate into
-/// the free query buffer), quantized as it takes them.
+/// the arena's gated rows), quantized as it takes them.
 fn gated_256(
     c: &Ctx<'_>,
     n: &GqaPlan,
@@ -553,6 +554,7 @@ fn gated_256(
         k: kr,
         v,
         q_out,
+        gated_rows,
         attn,
         ffn_inp,
         wide,
@@ -641,7 +643,11 @@ fn gated_256(
         )?;
         attn
     } else {
-        // The flash has read the queries: their buffer takes the gated rows.
+        // The gated rows have a buffer of their own: `q_out` keeps the
+        // queries the flash read.
+        let gated = gated_rows
+            .as_mut()
+            .ok_or(GpuError::state(WHAT_ATTN, "the arena's gated rows"))?;
         q35.q38.enqueue_out_gate(
             stream,
             OutGateArgs {
@@ -650,11 +656,11 @@ fn gated_256(
                 n_head: d.n_head,
                 m,
                 fault: c.sink,
-                y: q_out,
+                y: gated,
             },
         )?;
-        act_attn.quantize(c, q_out, m, &[n.o_ty])?;
-        q_out
+        act_attn.quantize(c, gated, m, &[n.o_ty])?;
+        gated
     };
     let input = act_attn.input(gated);
     gemm(

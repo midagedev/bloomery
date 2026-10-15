@@ -1049,7 +1049,10 @@ impl KvPlanes {
 /// Q8_0 site — and on the gemv arm the gate and up rows of an unfused
 /// gate·up, and the row-major output of a K-quant site launched alone at
 /// more than one row (`cols` values a column); and on a chain with a layer
-/// that keeps its shared expert apart, that expert's buffers (`apart`).
+/// that keeps its shared expert apart, that expert's buffers (`apart`); and
+/// on a chain whose gated head-256 layer has an output projection of a type
+/// other than a K-quant, the f32 rows of the gated flash output that
+/// projection reads (`out_gate`).
 /// [`Forms::KQUANT`] is a chain of fused Q4_K and Q6_K sites: the buffers
 /// the arena held before any other type ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1060,6 +1063,7 @@ pub(super) struct Forms {
     pub(super) glu: bool,
     pub(super) cols: usize,
     pub(super) apart: Option<ApartForms>,
+    pub(super) out_gate: bool,
 }
 
 /// What a chain whose layer keeps its shared expert apart from its routed
@@ -1094,6 +1098,7 @@ impl Forms {
         glu: false,
         cols: 0,
         apart: None,
+        out_gate: false,
     };
 }
 
@@ -1186,6 +1191,11 @@ pub(super) struct Arena {
     /// block holds gates beside them (the rope writes them out of place);
     /// `None` when the rope turns `q` in place.
     pub(super) q_out: Option<DeviceBuffer<f32>>,
+    /// The flash output times the sigmoid of its gate, `[rows][n_head][head]`,
+    /// the f32 rows an output projection other than a K-quant reads
+    /// ([`Forms::out_gate`]); `None` on a chain with no such layer. A buffer of
+    /// its own, so `q_out` still holds the queries the flash read.
+    pub(super) gated_rows: Option<DeviceBuffer<f32>>,
     /// A Q6_K value projection's output at more than one token: `q6k_gemv`
     /// writes it row-major, and a copy puts it into `v` token-major. `None`
     /// on a one-row arena, where the gemv writes `v` itself.
@@ -1876,6 +1886,7 @@ impl Arena {
             k,
             v,
             q_out: gated.then(|| f(rows * attn_len)).transpose()?,
+            gated_rows: forms.out_gate.then(|| f(rows * attn_len)).transpose()?,
             v_cols: (rows > 1).then(|| f(narrow * kv_len)).transpose()?,
             part_v: f(part_v)?,
             part_ms: f(partials_ms_len(narrow, d.n_head))?,
@@ -1991,6 +2002,7 @@ impl Arena {
             + self.n_keys.num_bytes()
             + self.v_cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.q_out.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.gated_rows.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.gdn.as_ref().map_or(0, GdnArena::bytes)
             + self.wide.as_ref().map_or(0, Wide::bytes)
             + self

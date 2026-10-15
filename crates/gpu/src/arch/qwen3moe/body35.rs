@@ -1011,6 +1011,7 @@ impl Forms {
         let mut hid: Vec<SiteTy> = Vec::new();
         let (mut attn, mut h, mut glu, mut cols) = (Vec::new(), Vec::new(), false, 0usize);
         let mut apart: Vec<SiteTy> = Vec::new();
+        let mut out_gate = false;
         let mut alone = |ty: SiteTy, rows: usize| {
             if ty.kgemv_order() == Some(Order::RowMajor) {
                 cols = cols.max(rows);
@@ -1021,6 +1022,7 @@ impl Forms {
                 MixerPlan::Gqa(g) => {
                     hid.extend([g.q_ty, g.k_ty, g.v_ty]);
                     attn.push(g.o_ty);
+                    out_gate |= g.kind == GqaKind::Gated256 && !g.o_ty.kquant();
                     if !g.qkv_fused() {
                         alone(g.q_ty, d.q_rows);
                         alone(g.k_ty, d.kv_len());
@@ -1076,6 +1078,7 @@ impl Forms {
             glu,
             cols,
             apart: (!apart.is_empty()).then(|| ApartForms { h: wants(&apart) }),
+            out_gate,
         }
     }
 }

@@ -790,7 +790,7 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
     let Arena {
         x,
         normed,
-        q_out,
+        gated_rows,
         attn,
         act_attn,
         ffn_inp,
@@ -798,11 +798,11 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
         ..
     } = s;
     // An output projection of another type reads f32 rows: at head 128 the
-    // flash's own, at head 256 the products `gated_256` wrote into the free
-    // query buffer.
+    // flash's own, at head 256 the products `gated_256` wrote into the gated
+    // rows.
     let rows = match n.kind {
         GqaKind::Neox128 => &*attn,
-        GqaKind::Gated256 => q_out.as_ref().ok_or(GpuError::state(
+        GqaKind::Gated256 => gated_rows.as_ref().ok_or(GpuError::state(
             "qwen3moe::attention",
             "the arena's gated rows",
         ))?,
@@ -851,8 +851,8 @@ pub(super) fn out_resid(
 /// read out of the `[q | gate]` rows into their own buffer; the flash over
 /// the rows' live key counts; the output projection's input — for a K-quant
 /// `attn_output` quantized with each value multiplied by the sigmoid of its
-/// gate, for any other type those products as f32 rows into the query
-/// buffer the flash has read.
+/// gate, for any other type those products as f32 rows into the arena's
+/// gated rows. The queries stay in `q_out`.
 fn gated_256(
     c: &Ctx<'_>,
     n: &GqaPlan,
@@ -910,6 +910,10 @@ fn gated_256(
         c.mma,
     )?;
     if !n.o_ty.kquant() {
+        let gated = s
+            .gated_rows
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "the arena's gated rows"))?;
         return q35.q38.enqueue_out_gate(
             stream,
             OutGateArgs {
@@ -918,7 +922,7 @@ fn gated_256(
                 n_head: d.n_head,
                 m,
                 fault: c.sink,
-                y: q_out,
+                y: gated,
             },
         );
     }

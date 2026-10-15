@@ -526,10 +526,10 @@ fn gqa_layer(
             c.sink,
         )?;
     } else {
-        let q_out = s
-            .q_out
+        let gated = s
+            .gated_rows
             .as_mut()
-            .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
+            .ok_or(GpuError::state(WHAT, "the arena's gated rows"))?;
         q35.q38.enqueue_out_gate(
             stream,
             OutGateArgs {
@@ -538,7 +538,7 @@ fn gqa_layer(
                 n_head: d.n_head,
                 m,
                 fault: c.sink,
-                y: q_out,
+                y: gated,
             },
         )?;
     }
