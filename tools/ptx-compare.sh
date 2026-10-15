@@ -71,10 +71,12 @@ side_run() {
   return "$rc"
 }
 
-# side_failed <name> <rc> <build log>: the named line of a failed side; the exit code it maps to (75 and 70 as box.sh gave them, else 1).
+# side_failed <name> <rc> <build log>: the named line of a failed side; the exit code it maps to (75, 83 and 70 as box.sh gave
+# them, so gate-batch's dir-lock retry sees an 83; else 1).
 side_failed() {
   case $2 in
     75) echo "ptx-compare: $1: rc 75: the box is held by a sitting or a lease (contention, not failure; nothing was built): run again, BLOOMERY_BOX_WAIT=3600 waits longer" >&2; return 75 ;;
+    83) echo "ptx-compare: $1: rc 83: directory lock refused ($3)" >&2; return "$2" ;;
     70) echo "ptx-compare: $1: rc 70: the box's toolchain (box.sh's exit 70: the cuda-oxide backend of this commit's pin is missing)" >&2; return 70 ;;
     *) echo "ptx-compare: $1: the box command ended rc $2 (the build or the scan: $3)" >&2; return 1 ;;
   esac
@@ -83,10 +85,6 @@ side_failed() {
 # valid_scan <log>: 0 when the log reads as a full scan of one bin (recipes.py's reader, against itself: identical).
 valid_scan() {
   python3 "$ROOT/tools/recipes.py" ptx-compare "$1" "$1" > /dev/null 2>&1
-}
-
-compare() { # compare <base scan> <head scan> <base label> <head label>: recipes.py's table and exit code
-  python3 "$ROOT/tools/recipes.py" ptx-compare "$1" "$2" --base-label "$3" --head-label "$4"
 }
 
 # run_compare <base rev> <bin> <features> <base only 0|1> <no cache 0|1>
@@ -117,7 +115,7 @@ run_compare() {
     fi
     # one scanner on both sides; -p keeps its mtime, so a second run's base tree has the id the first synced (box.sh's tree id)
     cp -p "$ROOT/tools/ptx-scan.sh" "$src/tools/ptx-scan.sh" || { rm -rf "$src"; die 70 "cannot lay tools/ptx-scan.sh over the base tree"; }
-    tmp=$dir/base.scan.tmp
+    tmp=$(mktemp "$dir/base.scan.XXXXXX") || die 70 "cannot create base scan"
     side_run "base ${sha:0:12}" "$src" "$bremote" "$(scan_command "$feats" "$bin")" "$tmp" "$dir/base.build.log"
     rc=$?
     rm -rf "$src"
@@ -131,7 +129,7 @@ run_compare() {
       mv -f "$tmp" "$dir/base.scan.bad"
       return 2
     fi
-    mv -f "$tmp" "$dir/base.scan"
+    mv -f "$tmp" "$dir/base.scan" || return 70
   fi
   if [ "$baseonly" = 1 ]; then
     echo "ptx-compare: base ${sha:0:12} of $bin ($feats) is cached: $dir/base.scan"
@@ -140,7 +138,7 @@ run_compare() {
   # --- the head side: this tree as box.sh syncs it
   hl=$(git -C "$ROOT" rev-parse --short=8 HEAD 2> /dev/null || echo unknown)
   [ -z "$(git -C "$ROOT" status --porcelain 2> /dev/null)" ] || hl=$hl+uncommitted
-  tmp=$dir/head.scan.tmp
+  tmp=$(mktemp "$dir/head.scan.XXXXXX") || die 70 "cannot create head scan"
   side_run "head $hl" "$ROOT" "" "$(scan_command "$feats" "$bin")" "$tmp" "$dir/head.build.log"
   rc=$?
   if [ "$rc" != 0 ]; then
@@ -148,9 +146,12 @@ run_compare() {
     side_failed "head $hl" "$rc" "$dir/head.build.log"
     return $?
   fi
-  mv -f "$tmp" "$dir/head.scan"
-  compare "$dir/base.scan" "$dir/head.scan" "${sha:0:12}" "$hl" | tee "$dir/compare.txt"
-  return "${PIPESTATUS[0]}"
+  # this call's private scan is the one compared; head.scan is published after, for the next reader
+  python3 "$ROOT/tools/recipes.py" ptx-compare "$dir/base.scan" "$tmp" --base-label "${sha:0:12}" --head-label "$hl" |
+    tee "$dir/compare.txt"
+  rc=${PIPESTATUS[0]}
+  mv -f "$tmp" "$dir/head.scan" || return 70
+  return "$rc"
 }
 
 # --- the self-test: both sides on stub box.sh and ptx-scan.sh in a temp git repo, the table through the real recipes.py
@@ -194,7 +195,8 @@ echo "   Compiling stub v0.1.0 ($side)" >&2
 var=STUB_RC_$(echo "$side" | tr a-z A-Z)
 rc=${!var:-0}
 [ "$rc" = 0 ] || exit "$rc"
-cat "$STUB_DIR/$side.scan"
+[ "$side" = base ] || sleep "${STUB_SLEEP_HEAD:-0}"
+if [ "$side" = head ] && [ -n "${STUB_HEAD_SCAN:-}" ]; then cat "$STUB_HEAD_SCAN"; else cat "$STUB_DIR/$side.scan"; fi
 STUB
   chmod +x "$t/repo/tools/box.sh" "$t/repo/tools/ptx-scan.sh" "$t/repo/tools/ptx-compare.sh"
   (
@@ -277,6 +279,23 @@ STUB
   [ "$rc" = 70 ] && has "the box's toolchain"; ok "head side rc 70: the toolchain, passed on" $?
   run STUB_RC_HEAD=1 -- "$base_sha" gx --features gpu
   [ "$rc" = 1 ] && has 'head' && has 'the box command ended rc 1'; ok "head side rc 1: named, rc 1" $?
+  run STUB_RC_HEAD=83 -- "$base_sha" gx --features gpu
+  [ "$rc" = 83 ] && has 'rc 83: directory lock refused'; ok "head side rc 83: passed on, so gate-batch's dir-lock retry sees it" $?
+  # two calls with one cache key at once: a slow one scanning changed PTX and a fast one scanning the base's; each compares
+  # its own scan (a shared temp file let the fast one's publish stand in for the slow one's head)
+  mklog gx alpha:9 beta:2 > "$t/stub/changed.scan"
+  mklog gx alpha:1 beta:2 > "$t/stub/same.scan"
+  : > "$t/stub/box.log"
+  ( cd "$t" && STUB_HEAD_SCAN="$t/stub/changed.scan" STUB_SLEEP_HEAD=2 bash "$t/repo/tools/ptx-compare.sh" "$base_sha" gx --features gpu > "$t/slow.out" 2>&1 < /dev/null; echo $? > "$t/slow.rc" ) &
+  slow=$!
+  sleep 1
+  # mid-scan, the slow call's head scan is a private name, never the shared one another call would truncate
+  shared=$(find "$t/repo/target" -name head.scan.tmp 2> /dev/null | head -1)
+  ( cd "$t" && STUB_HEAD_SCAN="$t/stub/same.scan" bash "$t/repo/tools/ptx-compare.sh" "$base_sha" gx --features gpu > "$t/fast.out" 2>&1 < /dev/null; echo $? > "$t/fast.rc" ) &
+  fast=$!
+  wait "$slow" "$fast"
+  out="slow rc $(cat "$t/slow.rc"), fast rc $(cat "$t/fast.rc"), shared temp '${shared}'"
+  [ -z "$shared" ] && [ "$(cat "$t/slow.rc")" = 3 ] && [ "$(cat "$t/fast.rc")" = 0 ] && grep -q '  changed       1: alpha' "$t/slow.out"; ok "two calls at once: each compares its own private head scan" $?
   # 8. usage
   run -- no-such-rev gx
   [ "$rc" = 64 ] && has "names no commit"; ok "a rev that names no commit: 64" $?
