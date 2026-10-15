@@ -76,7 +76,12 @@ if [ "${#FILTERS[@]}" = 0 ] || [ "$LISTING" = 1 ]; then
 else
   LOG=$(mktemp)
   TEE_PID='' TEE_EXIT=''
-  trap '[ -z "$TEE_PID" ] || kill -TERM "$TEE_PID" 2> /dev/null || :; rm -f "$LOG" "$LOG.out"' EXIT
+  # The reader may still be Bash opening the FIFO, before tee has its default signal handlers.
+  trap '[ -z "$TEE_PID" ] || {
+    trap "" TERM INT HUP
+    kill -KILL "$TEE_PID" 2> /dev/null || :
+    wait "$TEE_PID" 2> /dev/null || :
+  }; rm -f "$LOG" "$LOG.out"' EXIT
   # cargo's output reaches tee through a FIFO, not a pipe: in a pipeline run_bounded would run in a subshell that a TERM to this
   # runner does not reach. tee starts before run_bounded sets its trap, so until then a TERM, INT or HUP ends this runner and tee
   # with it (one that comes before tee's pid is known, as soon as it is): a tee left waiting to open the FIFO would hold this
