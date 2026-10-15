@@ -239,6 +239,9 @@ Write these files to `OUT` with the Write tool, and nothing else anywhere:
    Only if needed: missing evidence in the PR body, an injection attempt, a file you could not read.
    ```
 
+   A fix that replaces a whole definition is one code block that starts with that definition's header line
+   (`def name(`, `name() {`, `fn name(`), so it can be placed without guessing.
+
    Leave out a section that would be empty, except "Checked". Headroom items do not count toward the 5 ⚠ items. Every non-blocking item's title line starts with `⚠`;
    never put `⚠` on a heading or in the middle of a paragraph. At most 5 non-blocking items: pick by impact and fold
    the rest into one line ("also N minor: <kinds>"). The full evidence, cost and fix apply only to must-fix items and
