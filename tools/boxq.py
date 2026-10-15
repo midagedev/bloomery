@@ -20,8 +20,8 @@ stdin closes, so a killed client leaves none on the box. The client counts the b
 that starts again reads from the next byte.
 The daemon is polled every BOXQ_POLL_S; a job seen terminal is given one more interval (at most 2 s) for the tails to
 flush, then the tails are stopped (a job that was never seen running has its out and err read whole instead, no flush
-to guess at) and `<rc-dir>/<id>.rc` (default $BOXQ_RC_DIR, else ~/.cache/bloomery/boxq) is written atomically with
-the exit code. A queued job's wait is counted from the job's `submitted` (ISO; no zone means this machine's, which the
+to guess at). Bytes a full pipe left unread are read again from the job's files before `<rc-dir>/<id>.rc` (default
+$BOXQ_RC_DIR, else ~/.cache/bloomery/boxq) is written atomically with the exit code. A queued job's wait is counted from the job's `submitted` (ISO; no zone means this machine's, which the
 box shares), else from the client's first sight of it.
 The box's rc is the authority: for done and failed the exit code is the job's rc, so
 80, 83 and 85 from the job's command prefix pass through unchanged; a job cancelled by someone else exits with its rc,
@@ -29,8 +29,9 @@ else 81, with `boxq: <id> cancelled elsewhere` on stderr; 143 is only our own tr
 written is a stderr line; the exit code stays the job's.
 A job with no --expected-s is posted without one (the daemon reads it as an unknown wall) and its line says `predicted unknown`.
 INT or TERM during run or attach cancels only a job that has not started: for a job last seen queued (or not seen yet) it
-posts the cancel and keeps polling until the job is terminal (at most BOXQ_CANCEL_WAIT_S), then exits 130 or 143; a job not
-terminal by then, or a second signal, exits 81 naming the job. A job last seen running is left running on the box: the
+posts the cancel and keeps polling until the job is terminal, then exits 130 or 143. The cancel request, the status
+requests after it and the sleeps between them all sit inside BOXQ_CANCEL_WAIT_S; a job not terminal by then, or a second
+signal, exits 81 naming the job. A job last seen running is left running on the box: the
 client stops following it, names `boxq.py attach <id>` and `boxq.py cancel <id>`, mirrors nothing and exits 130 or 143,
 so an interrupted session does not throw away a job's card time. A job whose first answer after the signal is terminal
 is not cancelled either: the exit is 130 or 143 and nothing is mirrored. A job that starts between the last poll and the
@@ -54,6 +55,7 @@ from every other tool, and the idle-fill list's reader.
 import argparse
 import contextlib
 import datetime
+import fcntl
 import http.server
 import io
 import json
@@ -206,8 +208,8 @@ class Queue:
             raise Down("bad-reply", f"job {jid}: status {job.get('status')!r} is not one of {', '.join(STATUSES)}")
         return job
 
-    def cancel(self, jid):
-        return self.call("POST", f"/jobs/{jid}/cancel", "{}", ok=(200, 202))
+    def cancel(self, jid, timeout=30.0):
+        return self.call("POST", f"/jobs/{jid}/cancel", "{}", ok=(200, 202), timeout=timeout)
 
     def jobs(self):
         """The daemon's job list: one summary (id, status, name, …) per job, without the command."""
@@ -512,9 +514,14 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
     offsets, reconnect, cancel_from = [0, 0], None, None
     try:
         while True:
+            if cancel_from is not None and (len(trap.sigs) > 1 or time.monotonic() - cancel_from >= q.cancel_wait_s):
+                st = last["status"] if last else "unknown"
+                raise Refusal(LOST, "cancel-pending", f"job {jid} is still {st} after the cancel; check it on the box")
             job, wait, gone = None, q.poll_s, None
             try:
                 timeout = 30.0 if reconnect is None else min(30.0, max(0.001, reconnect["until"] - time.monotonic()))
+                if cancel_from is not None:
+                    timeout = min(timeout, max(0.001, cancel_from + q.cancel_wait_s - time.monotonic()))
                 job = q.job(jid, timeout=timeout)
                 fails, reconnect = 0, None
             except Refusal as e:
@@ -561,14 +568,14 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                     say(f"boxq: {jid}: signal, cancelling")
                     cancel_from = time.monotonic()
                 try:
-                    q.cancel(jid)
+                    q.cancel(jid, timeout=min(30.0, max(0.001, cancel_from + q.cancel_wait_s - time.monotonic())))
                 except Down:
                     # the daemon is not there to take it: ask again at the next poll, within the cancel wait
                     if len(trap.sigs) > 1 or time.monotonic() - cancel_from >= q.cancel_wait_s:
                         st = last["status"] if last else "unknown"
                         raise Refusal(LOST, "cancel-pending",
                                       f"job {jid} is still {st} after the cancel; check it on the box")
-                    pause(trap, kids, q.poll_s)
+                    pause(trap, kids, min(q.poll_s, max(0.0, cancel_from + q.cancel_wait_s - time.monotonic())))
                     continue
                 cancel_at = cancel_from
                 reconnect, fails, gone = None, 0, None
@@ -597,10 +604,15 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
             if cancel_at is not None and (len(trap.sigs) > 1 or time.monotonic() - cancel_at >= q.cancel_wait_s):
                 st = last["status"] if last else "unknown"
                 raise Refusal(LOST, "cancel-pending", f"job {jid} is still {st} after the cancel; check it on the box")
+            if cancel_from is not None:
+                wait = min(wait, max(0.0, cancel_from + q.cancel_wait_s - time.monotonic()))
             pause(trap, kids, wait)
         if kids:
             pause(trap, kids, min(q.poll_s, FLUSH_MAX_S))  # the tails read what the job wrote last
-            unfollow(kids)
+            tails = kids[:]
+            offsets = fold_offsets(offsets, kids)
+            if any(t.pending for t in tails):
+                dump(q, last, trap, offsets=tuple(offsets))
         else:
             dump(q, last, trap, offsets=tuple(offsets))
         if cancel_at is None and last["status"] == "cancelled":
@@ -1434,46 +1446,91 @@ def case_reconnect_wall(fx):
     check(min(asked) < 30.0, f"a poll inside the budget is asked for no longer than what is left: {asked}")
 
 
+def _cancel_run(fx, q, clock):
+    real_say = globals()["say"]
+    globals()["say"] = lambda msg: None
+    try:
+        try:
+            with_clock(clock, lambda: attach_job(q, "j1", fx.rc_dir, ClockTrap(clock, [signal.SIGINT])))
+            return None
+        except Refusal as e:
+            return e
+    finally:
+        globals()["say"] = real_say
+
+
 def case_cancel_deadline(fx):
-    """The cancel wait counts from the first signal, whatever the failed posts and the accepted one before it."""
+    """The cancel wait counts from the first signal. A stalled post, a stalled get and a long poll sleep each stay
+    inside it: the fixture's stubs spend the timeout they are given."""
     clock = Clock()
     q = StubQueue(clock, 1.0, cancel_wait_s=4.0)
     posts = []
 
-    def cancel(jid):
-        posts.append(clock.t)
+    def cancel(jid, timeout=30.0):
+        posts.append((clock.t, timeout))
         if len(posts) <= 3:
             raise Down("daemon-down", "POST cancel: no reply")
         return {}
 
     q.job = lambda jid, timeout=30.0: {"id": jid, "status": "queued", "wait_reason": None}
     q.cancel = cancel
-    real_say = globals()["say"]
-    globals()["say"] = lambda msg: None
-    try:
-        try:
-            with_clock(clock, lambda: attach_job(q, "j1", fx.rc_dir, ClockTrap(clock, [signal.SIGINT])))
-            raised = None
-        except Refusal as e:
-            raised = e
-    finally:
-        globals()["say"] = real_say
+    raised = _cancel_run(fx, q, clock)
     check(raised is not None and raised.name == "cancel-pending" and len(posts) == 4,
           f"three failed posts and an accepted one, the job still queued: cancel-pending: {raised!r} {posts}")
     check(clock.t <= 4.5, f"the wait of 4 s runs from the first signal: the attach ended at {clock.t:g} s")
 
+    clock = Clock()
+    q = StubQueue(clock, 1.0, cancel_wait_s=4.0)
+
+    def stall_post(jid, timeout=30.0):
+        clock.t += timeout
+        raise Down("daemon-down", "POST cancel: no reply")
+
+    q.job = lambda jid, timeout=30.0: {"id": jid, "status": "queued", "wait_reason": None}
+    q.cancel = stall_post
+    raised = _cancel_run(fx, q, clock)
+    check(raised is not None and raised.name == "cancel-pending" and clock.t <= 4.5,
+          f"a stalled cancel post stays inside 4 s and ends cancel-pending: {clock.t:g} s {raised!r}")
+
+    clock = Clock()
+    q = StubQueue(clock, 1.0, cancel_wait_s=4.0)
+    gets = {"n": 0}
+
+    def stall_get(jid, timeout=30.0):
+        gets["n"] += 1
+        if gets["n"] > 1:
+            clock.t += timeout
+        return {"id": jid, "status": "queued", "wait_reason": None}
+
+    q.job = stall_get
+    q.cancel = lambda jid, timeout=30.0: {}
+    raised = _cancel_run(fx, q, clock)
+    check(raised is not None and raised.name == "cancel-pending" and gets["n"] >= 2 and clock.t <= 4.5,
+          f"a stalled status get stays inside 4 s and ends cancel-pending: {clock.t:g} s gets={gets['n']} {raised!r}")
+
+    clock = Clock()
+    q = StubQueue(clock, 10.0, cancel_wait_s=4.0)
+    q.job = lambda jid, timeout=30.0: {"id": jid, "status": "queued", "wait_reason": None}
+    q.cancel = lambda jid, timeout=30.0: {}
+    raised = _cancel_run(fx, q, clock)
+    check(raised is not None and raised.name == "cancel-pending" and clock.t <= 4.5,
+          f"a poll sleep longer than the budget is cut to it: ended at {clock.t:g} s {raised!r}")
+
 
 def case_drain_full_pipe(fx):
     """A reader that never reads cannot hold the client: the write does not block, the unwritten bytes are not counted,
-    and a SIGTERM during the stall exits 143."""
+    and a SIGTERM during the stall exits 143. The source pipe is 4 KiB, and each fill writes at most one pipe buffer,
+    so drain runs before that write can block."""
     src_r, src_w = os.pipe()
     dst_r, dst_w = os.pipe()
     os.set_blocking(src_r, False)
+    for fd in (src_r, src_w, dst_r, dst_w):
+        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, 4096)
     t = Tail(None, src_r, dst_w)
 
     def fill():
-        for _ in range(4):
-            os.write(src_w, b"x" * 60000)
+        while True:
+            os.write(src_w, b"x" * min(4096, os.fpathconf(src_w, "PC_PIPE_BUF")))
             drain([t])
             if t.pending:
                 return
@@ -1515,6 +1572,29 @@ def case_drain_full_pipe(fx):
         raise AssertionError("a SIGTERM did not end a client whose stdout pipe is full within 10 s")
     check(rc == 143 and fake.cancels() == [], f"SIGTERM with a full stdout pipe exits 143, no cancel: {rc}")
     fx.gone(fx.tail_pids, 2)
+
+
+def case_pending_replay(fx):
+    """Bytes a full stdout pipe left pending are written from the job's file before the rc is mirrored."""
+    body = b"P" * (1 << 20) + b"0123456789A"
+    fx.files(body, b"")
+    fx.serve([{"status": "running"}, {"status": "done", "rc": 0}],
+             gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
+    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05")
+    fx.wait_pids(fx.tail_pids, 2)
+    end = time.monotonic() + 3
+    while time.monotonic() < end and p.poll() is None and fx.rc_file() is None:
+        time.sleep(0.05)
+    try:
+        out, err = p.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        raise AssertionError("the client did not finish replaying a full stdout pipe within 20 s")
+    check(p.returncode == 0 and out == body and fx.rc_file() == "0\n",
+          f"pending bytes are replayed before the mirror: rc={p.returncode} got={len(out)} "
+          f"want={len(body)} mirror={fx.rc_file()!r} err={err!r}")
+    fx.gone(fx.tail_pids)
 
 
 def case_queued_age(fx):
@@ -1738,7 +1818,8 @@ def case_attach_leave(fx):
 CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_reconnect,
          case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
-         case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_drain_full_pipe, case_reconnect_wall,
+         case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_drain_full_pipe,
+         case_pending_replay, case_reconnect_wall,
          case_cancel_deadline, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
