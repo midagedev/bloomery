@@ -397,7 +397,7 @@ def must_fix_titles(body):
 
 
 def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
-    slot = review_slot()  # held until this review returns
+    slot = None if stubbed else review_slot()  # held until this review returns
     if not stubbed and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
     if not stubbed:
@@ -852,7 +852,8 @@ def self_test():
                        "L.gh_json = lambda *a: None\nL.device_dirs = lambda b, o, s: open(o, 'w').write('crates/gpu\\n')\n"
                        "L.read_ledger = lambda b, o: (open(o, 'w').close(), 'v0')[1]\n"
                        "sys.exit(L.main(['--base', 'basebr', '--minutes', '5']))\n")
-            proc = subprocess.Popen([sys.executable, "-c", wrapper], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.Popen([sys.executable, "-c", wrapper], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env={**os.environ, "HOME": t})
             for _ in range(200):
                 if os.path.exists(pidf) and open(pidf).read().strip():
                     break
