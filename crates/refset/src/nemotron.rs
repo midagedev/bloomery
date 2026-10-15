@@ -190,31 +190,7 @@ impl LogitsSet {
     /// Prompt `p`'s last-position logits, `n_vocab` f32, little-endian.
     pub fn logits(&self, p: &Prompt) -> Result<Vec<f32>, RefError> {
         let path = self.dir.join(&p.logits_file);
-        let bytes = std::fs::read(&path).map_err(|e| {
-            RefError::missing(
-                &path,
-                format!("nemotron: cannot read {}: {e}", path.display()),
-            )
-        })?;
-        let want = p.n_vocab as usize * 4;
-        if bytes.len() != want {
-            return Err(RefError::malformed(
-                path.display(),
-                format!(
-                    "{} is {} bytes, {} logits of {} want {want}",
-                    p.logits_file,
-                    bytes.len(),
-                    p.name,
-                    p.n_vocab
-                ),
-            ));
-        }
-        let mut out = Vec::with_capacity(p.n_vocab as usize);
-        for chunk in bytes.chunks_exact(4) {
-            out.push(f32::from_le_bytes(
-                chunk.try_into().expect("chunks_exact(4)"),
-            ));
-        }
+        let out = crate::columns::read_f32(&path, u64::from(p.n_vocab), &p.logits_file)?;
         if let Some(i) = out.iter().position(|v| !v.is_finite()) {
             return Err(RefError::malformed(
                 path.display(),

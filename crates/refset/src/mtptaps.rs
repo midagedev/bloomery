@@ -26,7 +26,7 @@
 //! build, for another architecture, without the MTP context, and one whose files disagree with its rows.
 
 use crate::RefError;
-use crate::columns::{Columns, Row, file_name, need, one};
+use crate::columns::{Columns, Row, file_name, need, one, read_bytes, read_f32};
 use crate::family::{Family, Identity};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
@@ -214,22 +214,11 @@ impl TapSet {
                 }
                 h if h.starts_with('#') => {}
                 "trunk" => {
-                    let c = need(&trunk_cols, "trunk", &at)?;
-                    let r = c.row(line, &at)?;
-                    let file = r.text("file")?;
-                    file_name(file, &at)?;
+                    let r = need(&trunk_cols, "trunk", &at)?.row(line, &at)?;
                     if set.trunk.is_some() {
                         return Err(RefError::malformed(&at, "a second trunk row"));
                     }
-                    set.trunk = Some(Trunk {
-                        name: r.text("name")?.to_string(),
-                        rows: r.parse("rows")?,
-                        width: r.parse("width")?,
-                        file: file.to_string(),
-                    });
-                    if r.text("type")? != "f32" {
-                        return Err(RefError::malformed(&at, "the trunk rows are f32"));
-                    }
+                    set.trunk = Some(trunk_row(&r, &at)?);
                 }
                 "step" => {
                     let r = need(&step_cols, "step", &at)?.row(line, &at)?;
@@ -536,36 +525,6 @@ impl TapSet {
     }
 }
 
-/// `want` four-byte values of `path`, as bytes.
-fn read_bytes(path: &Path, want: u64, file: &str) -> Result<Vec<u8>, RefError> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        RefError::missing(
-            path,
-            format!("mtptaps: cannot read {}: {e}", path.display()),
-        )
-    })?;
-    if bytes.len() as u64 != want * 4 {
-        return Err(RefError::malformed(
-            path.display(),
-            format!(
-                "{file} is {} bytes, {want} values want {}",
-                bytes.len(),
-                want * 4
-            ),
-        ));
-    }
-    Ok(bytes)
-}
-
-fn read_f32(path: &Path, want: u64, file: &str) -> Result<Vec<f32>, RefError> {
-    Ok(read_bytes(path, want, file)?
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect())
-}
-
 /// `# complete <tap rows> 0`, the manifest's last line: a set whose trailer counts other tap rows
 /// than it holds lost rows after the writer counted them. `after` is the lines after the trailer.
 fn check_trailer<'a>(
@@ -592,6 +551,21 @@ fn check_trailer<'a>(
 
 fn number(v: &str, at: &dyn fmt::Display) -> Result<u32, RefError> {
     crate::columns::parse_field(v, "count", at)
+}
+
+/// The trunk row: its rows are f32 and its file is one name of the set's directory.
+fn trunk_row(r: &Row<'_>, at: &dyn fmt::Display) -> Result<Trunk, RefError> {
+    let file = r.text("file")?;
+    file_name(file, at)?;
+    if r.text("type")? != "f32" {
+        return Err(RefError::malformed(at, "the trunk rows are f32"));
+    }
+    Ok(Trunk {
+        name: r.text("name")?.to_string(),
+        rows: r.parse("rows")?,
+        width: r.parse("width")?,
+        file: file.to_string(),
+    })
 }
 
 fn step_row(r: &Row<'_>) -> Result<Step, RefError> {

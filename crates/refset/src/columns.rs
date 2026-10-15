@@ -5,6 +5,7 @@
 
 use crate::RefError;
 use std::fmt::Display;
+use std::path::Path;
 use std::str::FromStr;
 
 /// The names of one row kind's fields, from its column line: field 0 is the
@@ -139,4 +140,31 @@ pub(crate) fn one(f: &[&str], at: &dyn Display, want: &str) -> Result<String, Re
         [_, v] if !v.is_empty() => Ok((*v).to_string()),
         _ => Err(RefError::malformed(at, format!("want {want}"))),
     }
+}
+
+/// `want` four-byte values of `path`, as bytes.
+pub(crate) fn read_bytes(path: &Path, want: u64, file: &str) -> Result<Vec<u8>, RefError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| RefError::missing(path, format!("cannot read {}: {e}", path.display())))?;
+    if bytes.len() as u64 != want * 4 {
+        return Err(RefError::malformed(
+            path.display(),
+            format!(
+                "{file} is {} bytes, {want} values want {}",
+                bytes.len(),
+                want * 4
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// `want` little-endian f32 values of `path`.
+pub(crate) fn read_f32(path: &Path, want: u64, file: &str) -> Result<Vec<f32>, RefError> {
+    Ok(read_bytes(path, want, file)?
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect())
 }
