@@ -102,6 +102,8 @@ pub use watchdog::Busy as EngineBusy;
 pub type Deepseek2Model = GpuModel<arch::deepseek2::Body>;
 /// The qwen3moe engine: the whole model on one card.
 pub type Qwen3moeModel = GpuModel<arch::qwen3moe::Body>;
+/// The nemotron_h engine: the whole model on one card.
+pub type NemotronHModel = GpuModel<arch::nemotron_h::Body>;
 pub use tensor::{DeviceTensor, PartedBuffer, Q8Act, TensorWindow, Window, WindowMut, window};
 
 /// Host-side failure: context creation, module loading, device allocation,

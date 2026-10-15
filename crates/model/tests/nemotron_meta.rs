@@ -109,11 +109,8 @@ fn hw_nemotron_h_header() {
         bad.push("an attention layer emits a rope need".to_string());
     }
     let items = model::arch::coverage::check(s, &read.tensors);
-    if !items
-        .iter()
-        .any(|u| u.feature == "a layer program for nemotron_h")
-    {
-        bad.push(format!("coverage has no program item: {items:?}"));
+    if !items.is_empty() {
+        bad.push(format!("coverage has uncovered items: {items:?}"));
     }
     if read.tensors.tensors.len() != 263 {
         bad.push(format!("tensors {}", read.tensors.tensors.len()));

@@ -16,7 +16,9 @@
 //!   bit `f32_gemv` on every row and column). A K-quant site's gemv is
 //!   [`kgemv`]. A Q5_0 site's is [`blocks32_gemv`].
 //! - [`kgemv`], a K-quant site at most eight columns over the q8_1 rows:
-//!   Q3_K, Q4_K and Q6_K their gemvs, row-major (`m` outputs a row); Q5_K
+//!   Q3_K, Q4_K and Q6_K their gemvs, row-major (`m` outputs a row; a Q6_K
+//!   row of an odd super-block count the down `_sel` over one expert, one
+//!   column); Q5_K
 //!   the K-quant down `_sel` over a stack of one expert, token-major (a slot
 //!   a column). [`SiteTy::kgemv_order`] is this family's layout and is
 //!   `None` for Q5_0. Where a body copies a row-major output token-major,
@@ -46,6 +48,7 @@ use crate::gemm::{
 };
 use crate::kquant::{Act, KquantKernels, SelDown};
 use crate::q5::Q8Blocks32;
+use crate::q6k_sel::Q6kSelKernels;
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
@@ -323,10 +326,12 @@ const KGEMV_COLS: usize = 8;
 
 /// The kernels a K-quant site's [`kgemv`] launches beyond the `Gpu`'s own:
 /// the K-quant `_sel` family, whose Q5_K down entry over a stack of one
-/// expert is the Q5_K gemv, and that one expert's id for each of
+/// expert is the Q5_K gemv, the Q6_K `_sel` entry, which a Q6_K row of an odd
+/// super-block count runs the same way, and that one expert's id for each of
 /// [`KGEMV_COLS`] slots.
 pub struct KGemvKernels {
     kq: KquantKernels,
+    q6: Q6kSelKernels,
     one: DeviceBuffer<u32>,
 }
 
@@ -336,6 +341,7 @@ impl KGemvKernels {
     pub fn load(gpu: &Gpu) -> Result<KGemvKernels, GpuError> {
         Ok(KGemvKernels {
             kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
+            q6: Q6kSelKernels::load(gpu.context(), gpu.fault_word())?,
             one: DeviceBuffer::zeroed(gpu.stream(), KGEMV_COLS)?,
         })
     }
@@ -358,6 +364,25 @@ pub fn kgemv(
     const WHAT: &str = "site::kgemv";
     match ty {
         SiteTy::Q4K => gpu.enqueue_gemv_q4k(kq(w, WHAT, name)?, act, y),
+        // An odd super-block count leaves the rows unaligned to the words the
+        // plain gemv reads: the `_sel` entry addresses rows by byte, so the
+        // site runs as a stack of one expert, one column (where its layout
+        // is the row-major one).
+        SiteTy::Q6K if act.n_sb() % 2 == 1 => {
+            if act.m() != 1 {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "{name} is Q6_K at an odd {} super-blocks a row: one column, got {}",
+                        act.n_sb(),
+                        act.m()
+                    ),
+                ));
+            }
+            let wt = kq(w, WHAT, name)?;
+            kk.q6
+                .enqueue_gemv_q6k_sel(gpu.stream(), wt, act, &kk.one, 1, wt.rows(), y)
+        }
         SiteTy::Q6K => gpu.enqueue_gemv_q6k(kq(w, WHAT, name)?, act, y),
         SiteTy::Q3K => gpu.enqueue_gemv_q3k(kq(w, WHAT, name)?, act, y),
         SiteTy::Q5K => {

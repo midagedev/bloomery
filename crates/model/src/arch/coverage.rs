@@ -117,7 +117,11 @@ pub const AVAILABLE: &[Available] = &[
         runs: |n| matches!(n, Need::ReluSqr { .. }),
     },
     Available {
-        programs: &[Program::Qwen3moeBody, Program::Qwen35Body, Program::NemotronHBody],
+        programs: &[
+            Program::Qwen3moeBody,
+            Program::Qwen35Body,
+            Program::NemotronHBody,
+        ],
         at: "models/src/shape.rs GQA",
         runs: |n| {
             matches!(

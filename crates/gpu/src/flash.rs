@@ -75,7 +75,7 @@ use crate::fault::{FaultSink, FaultSite};
 use crate::flash_gqa::{SEGMENTS, seg_span};
 use crate::launch_u32;
 use crate::q8_1_quant_vals;
-use crate::tensor::{DeviceTensor, Q8Act};
+use crate::tensor::{DeviceTensor, Q8Act, Window};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::convert::{cvt_f16x2_f32, cvt_f32_f16x2_lo};
 use cuda_device::{
@@ -1747,6 +1747,18 @@ mod flash_kernels {
     }
 }
 
+/// [`FlashKernels::enqueue_kv_append_planes`]'s placement: the `heads` row
+/// words that follow word `first_word` of `words` (head `h` at
+/// `first_word + h`), the `m` rows each head appends, and the sink a row past
+/// the cache raises on.
+pub struct PlaneAppend<'a> {
+    pub words: &'a DeviceBuffer<u32>,
+    pub first_word: usize,
+    pub heads: usize,
+    pub m: usize,
+    pub fault: FaultSink,
+}
+
 /// The loaded P5 device module: `kv_append`, `kv_append_pos_buf`,
 /// `flash_latent`, the tensor-core segment pass `flash_latent_mma`,
 /// `flash_merge` and the q8 twins. Owns no context and no stream — every
@@ -1923,6 +1935,40 @@ impl FlashKernels {
             cache.buf_mut(),
             fault,
         )?;
+        Ok(())
+    }
+
+    /// [`FlashKernels::enqueue_kv_append_pos_buf`] for every key head of one
+    /// layer's head-major planes: head `h`'s `m` rows come from `src(h)` and
+    /// land at the row word `at.first_word + h` of `at.words` names, so a
+    /// plane of `ctx` rows a head is addressed by words `p + h · ctx`. One
+    /// launch per head. Asynchronous, allocation-free, capturable; `src`
+    /// builds views over buffers that stay in place for a captured graph's
+    /// life, and `at.words` stays allocated and in place likewise.
+    pub fn enqueue_kv_append_planes<'s>(
+        &self,
+        stream: &CudaStream,
+        at: &PlaneAppend<'_>,
+        mut src: impl FnMut(usize) -> Result<Window<'s, f32>, GpuError>,
+        cache: &mut DeviceTensor<u16>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_kv_append_planes";
+        if at.heads == 0 || at.words.len() < at.first_word + at.heads {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} heads from word {} of a {}-word buffer",
+                    at.heads,
+                    at.first_word,
+                    at.words.len()
+                ),
+            ));
+        }
+        for head in 0..at.heads {
+            let rows = src(head)?;
+            let word = Window::<u32>::of(at.words, 4 * (at.first_word + head), 1)?;
+            self.enqueue_kv_append_pos_buf(stream, &rows, &word, cache, at.m, at.fault)?;
+        }
         Ok(())
     }
 

@@ -57,6 +57,7 @@ use model::arch::dspark::DraftHeld;
 use model::quant::quantize_q8_0;
 
 use super::{DraftLayers, OwnHeld, Q8Rows};
+use crate::flash::PlaneAppend;
 use crate::flash_gqa::{
     FlashGqaKernels, GROUP, GqaArgs, HEAD_256, PACK_4, partials_ms_len, partials_v_len_256,
 };
@@ -405,6 +406,14 @@ fn up_f32(gpu: &Gpu, v: &[f32]) -> Result<DeviceBuffer<f32>, GpuError> {
 
 fn zeros_f32(gpu: &Gpu, n: usize) -> Result<DeviceBuffer<f32>, GpuError> {
     Ok(DeviceBuffer::zeroed(gpu.stream(), n.max(1))?)
+}
+
+/// Key head `head`'s whole buffer of `bufs` as the view an append reads.
+fn whole(bufs: &[DeviceBuffer<f32>], head: usize) -> Result<Window<'_, f32>, GpuError> {
+    let buf = bufs
+        .get(head)
+        .ok_or_else(|| shape_err(format!("key head {head} of {}", bufs.len())))?;
+    Window::of(buf, 0, buf.len())
 }
 
 impl DenseLayers {
@@ -809,25 +818,17 @@ impl DraftLayers for DenseLayers {
                     &mut s.kn[head],
                 )?;
                 elem.enqueue_rope(stream, &s.kn[head], &s.ctx_cs, hd, 1, n, &mut s.kr[head])?;
-                for second in 0..2 {
-                    let word = Window::<u32>::of(&s.ctx_words, 4 * (second * n_kv + head), 1)?;
-                    flash.enqueue_kv_append_pos_buf(
-                        stream,
-                        &s.kr[head],
-                        &word,
-                        &mut layer.kc,
-                        n,
-                        fault,
-                    )?;
-                    flash.enqueue_kv_append_pos_buf(
-                        stream,
-                        &s.vb[head],
-                        &word,
-                        &mut layer.vc,
-                        n,
-                        fault,
-                    )?;
-                }
+            }
+            for second in 0..2 {
+                let at = PlaneAppend {
+                    words: &s.ctx_words,
+                    first_word: second * n_kv,
+                    heads: n_kv,
+                    m: n,
+                    fault,
+                };
+                flash.enqueue_kv_append_planes(stream, &at, |h| whole(&s.kr, h), &mut layer.kc)?;
+                flash.enqueue_kv_append_planes(stream, &at, |h| whole(&s.vb, h), &mut layer.vc)?;
             }
         }
         Ok(())
@@ -945,24 +946,16 @@ impl DraftLayers for DenseLayers {
                     &mut s.kn[head],
                 )?;
                 elem.enqueue_rope(stream, &s.kn[head], &s.blk_cs, hd, 1, m, &mut s.kr[head])?;
-                let word = Window::<u32>::of(&s.blk_words, 4 * head, 1)?;
-                flash.enqueue_kv_append_pos_buf(
-                    stream,
-                    &s.kr[head],
-                    &word,
-                    &mut layer.kc,
-                    m,
-                    fault,
-                )?;
-                flash.enqueue_kv_append_pos_buf(
-                    stream,
-                    &s.vb[head],
-                    &word,
-                    &mut layer.vc,
-                    m,
-                    fault,
-                )?;
             }
+            let at = PlaneAppend {
+                words: &s.blk_words,
+                first_word: 0,
+                heads: n_kv,
+                m,
+                fault,
+            };
+            flash.enqueue_kv_append_planes(stream, &at, |h| whole(&s.kr, h), &mut layer.kc)?;
+            flash.enqueue_kv_append_planes(stream, &at, |h| whole(&s.vb, h), &mut layer.vc)?;
             let plane_bytes = 2 * GUARD * hd;
             let plane_len = n_kv * planes * hd;
             let kc = Window::<u16>::of(layer.kc.buf(), plane_bytes, plane_len)?;

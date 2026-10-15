@@ -405,6 +405,10 @@ name = "gate_mamba2"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_nemotron_e2e"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_load_v41"
 required-features = ["gpu"]
 

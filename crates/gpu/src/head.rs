@@ -63,6 +63,14 @@ impl OutW<'_> {
     }
 }
 
+/// The head's q8_1 form, refused by name on a head that holds none (its
+/// projection reads the f32 rows).
+fn held(act: &mut Option<Q8Act>) -> Result<&mut Q8Act, GpuError> {
+    act.as_mut().ok_or_else(|| {
+        GpuError::state("Head::enqueue", "a q8_1 form (a K-quant lm_head holds one)")
+    })
+}
+
 /// The lm_head weight (`output.weight`) and its row width. The type is
 /// checked, not assumed — a file whose lm_head is another format needs a
 /// different gemv, and a silent plane reuse would misread its bytes.
@@ -180,7 +188,9 @@ pub struct Head {
     /// The chain's input — the last block's output vector. The assembly round
     /// writes here through `input_mut`; the gate through `set_input`.
     x: DeviceBuffer<f32>,
-    act: Q8Act,
+    /// The q8_1 form of the normed rows a K-quant projection reads; a Q8_0
+    /// head reads the f32 rows and holds none (its width need not divide 256).
+    act: Option<Q8Act>,
     logits: DeviceBuffer<f32>,
     /// The `m` argmax tokens, then the fault's first-layer word and that
     /// layer's site mask as the argmax found them. Seeded with the (0, 0)
@@ -281,7 +291,10 @@ impl Head {
             n_vocab,
             m,
             x,
-            act: Q8Act::with_k(stream, m, hidden)?,
+            act: match out_w {
+                OutW::Q8_0 { .. } => None,
+                OutW::Q6K(_) | OutW::Q4K(_) => Some(Q8Act::with_k(stream, m, hidden)?),
+            },
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
             token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
             rows_done,
@@ -322,11 +335,7 @@ impl Head {
             + self.logits.num_bytes()
             + self.token_out.num_bytes()
             + self.rows_done.as_ref().map_or(0, DeviceBuffer::num_bytes)
-            + self.act.q3.num_bytes()
-            + self.act.q4.num_bytes()
-            + self.act.q6.num_bytes()
-            + self.act.s8.num_bytes()
-            + self.act.d8.num_bytes()
+            + self.act.as_ref().map_or(0, Q8Act::device_bytes)
     }
 
     /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
@@ -360,12 +369,14 @@ impl Head {
         let fault = gpu.fault_sink(LAYER_HEAD);
         match head_out_w(out)?.0 {
             OutW::Q6K(out_w) => {
-                gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
-                gpu.enqueue_gemv_q6k(out_w, &self.act, &mut self.logits)?;
+                let act = held(&mut self.act)?;
+                gpu.enqueue_quantize_q8_1_head(rows, act)?;
+                gpu.enqueue_gemv_q6k(out_w, &*act, &mut self.logits)?;
             }
             OutW::Q4K(out_w) => {
-                gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
-                gpu.enqueue_gemv_q4k(out_w, &self.act, &mut self.logits)?;
+                let act = held(&mut self.act)?;
+                gpu.enqueue_quantize_q8_1_head(rows, act)?;
+                gpu.enqueue_gemv_q4k(out_w, &*act, &mut self.logits)?;
             }
             OutW::Q8_0 { qs, d } => {
                 gpu.q8f32()
@@ -437,9 +448,10 @@ impl Head {
     {
         let shape = (self.eps, self.hidden, self.m);
         let rows = norm_rows(gpu, (w, self.gain.as_str()), &mut self.fin, shape, &self.x)?;
-        gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
+        let act = held(&mut self.act)?;
+        gpu.enqueue_quantize_q8_1_head(rows, act)?;
         tail(
-            &self.act,
+            &*act,
             head_q6k_w(w)?,
             gpu.fault_sink(LAYER_HEAD),
             &mut self.logits,
