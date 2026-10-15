@@ -102,7 +102,7 @@ for who in main workers; do
   awk -v who="$who" -v ms="$ms_step" -v top="$TOP" '
     $1 == who { n[$2]++; t++ }
     END {
-      for (s in n) printf "%7.2f%% %7.3f  %s\n", 100 * n[s] / t, ms * n[s] / t, s | "sort -rn | head -n " top
+      for (s in n) printf "%7.2f%% %7.3f  %s\n", 100 * n[s] / t, ms * n[s] / t, s | ("sort -rn | head -n " top)
       close("sort -rn | head -n " top)
       printf "  (%d samples)\n", t
     }' "$OUT/samples.txt"
