@@ -465,6 +465,29 @@ mod gate {
     /// reads an error of order one.
     const U_L0_REL: f64 = 1e-4;
 
+    /// PIN(2026-10-15): (u)'s layer-0 band when layer 0's delta projections
+    /// are Q8_0. [`U_L0_REL`]'s premise,
+    /// the same codes on both arms, does not hold there: the gemv arm reads
+    /// the f32 rows (`site::gemv`), the wide arm the rows quantized to q8
+    /// blocks of 32 (`site::gemm`), so the runs differ by that rounding, not
+    /// by sum order [derived: a value's error is uniform within ±amax/254 of
+    /// its block; at amax ≈ 2.2 · rms over 32 values, 2.2 / 254 / √3 ≈ 5e-3
+    /// of a row, which the projections and the state carry; measured on the
+    /// unjoined fixture, state 5.157e-3 and ring 3.539e-3]. The band is twice
+    /// that; a wiring fault still reads order one.
+    const U_L0_REL_Q32: f64 = 1e-2;
+
+    /// (u)'s layer-0 band for the file this gate runs on: [`U_L0_REL_Q32`]
+    /// when layer 0 is the Q8_0 delta layout (`Shape` admits it only with its
+    /// shared expert apart), else [`U_L0_REL`].
+    fn u_l0_band() -> f64 {
+        if shape().apart()[0] {
+            U_L0_REL_Q32
+        } else {
+            U_L0_REL
+        }
+    }
+
     /// PIN(2026-09-27): (d)'s bound on the step at position 1,024 free-running
     /// from each run's own state — each layer's output distance from ik's and
     /// the logits' — the ubatch run's over the pass run's. Derivation: past
@@ -2583,13 +2606,14 @@ mod gate {
         let slots: Vec<usize> = (0..RING_ROWS).collect();
         // (u)
         let mut ok = true;
+        let band = u_l0_band();
         for (l, (a, b)) in ub.stores.iter().zip(&pass.stores).enumerate() {
             let (x, y) = store_rel(a, b, &slots);
             if l == 0 {
-                let pass0 = kinds[0] == LayerKind35::Delta && worse(x, y) <= U_L0_REL;
+                let pass0 = kinds[0] == LayerKind35::Delta && worse(x, y) <= band;
                 println!(
                     "{label}wide layer=0 {:?} state_rel={x:.3e} ring_rel={y:.3e} against the pass run \
-                     (band {U_L0_REL:.0e}) {}",
+                     (band {band:.0e}) {}",
                     kinds[0],
                     verdict(pass0)
                 );
