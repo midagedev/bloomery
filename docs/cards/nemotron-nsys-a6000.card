@@ -1,0 +1,17 @@
+# One Nemotron 3 Nano 4B decode run under Nsight Systems on the RTX A6000: which kernels take the 6.67 ms step
+# that the baseline (nemotron-base-a6000.card) measured, against the DRAM model's 3.9-4.5 ms. Every replay is a
+# one-token step (the prompt runs as steps), so a kernel's time a step is its total over the P + n - 1 replays.
+kind: profile
+question: which kernels take the Nemotron decode step's 6.67 ms on the A6000, and which sit far under their
+  byte rate?
+term: kernel ms a step (cuda_gpu_kern_sum total / replays), generate_qwen3moe --tokens <6 ids> -n 64 --ctx 256
+  --time, graph replay, NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf, RTX A6000
+unit: ms
+predict: 6.0..6.8
+condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, the binary of the baseline (perf-nemogen d2c14332);
+  the kernel sum a step read beside the step's 6.67 ms; nsys's own overhead named if the timed step moves
+decide-in: name the top kernels by ms a step and each one's byte rate (its weight bytes / its time): the one
+  furthest under ~650 GB/s is the first speed target, written for engine
+decide-below: the kernel sum is well under the step: the gap is launch or sync, not kernels; count the
+  nodes (380 measured, 319 derived) and the host gaps
+decide-above: nsys moved the step; read the time line's replay windows instead of the totals
