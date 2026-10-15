@@ -61,9 +61,6 @@ pub struct KvLayout {
     kv_heads: usize,
     head_dim: usize,
     q8: bool,
-    /// The stage rope table, in bytes a position: `rope.dimension_count` f32.
-    /// The body copies one table at load, not one per sequence.
-    rope_row: u64,
 }
 
 impl KvLayout {
@@ -75,7 +72,6 @@ impl KvLayout {
             kv_heads: hp.n_head_kv,
             head_dim: hp.head_dim,
             q8: false,
-            rope_row: hp.rope.dims as u64 * F32_BYTES,
         }
     }
 
@@ -102,7 +98,7 @@ impl KvBytes for KvLayout {
     }
 
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
-        self.rope_row * ctx_max
+        self.head_dim as u64 * F32_BYTES * ctx_max
     }
 }
 
@@ -198,7 +194,7 @@ mod tests {
     use super::super::hparams::{Experts, Hparams, Rope, RopeMode, Score};
     use super::{KvBytes, KvLayout};
 
-    /// `rope.dimension_count` f32 a position, through [`KvLayout::of`]. The
+    /// `head_dim` f32 a position, through [`KvLayout::of`]. The
     /// q8 cache keeps the same table. A count of no row, or of half a row,
     /// is not the table the body copies.
     #[test]

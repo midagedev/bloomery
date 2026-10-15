@@ -234,12 +234,6 @@ impl RopeRows {
         })
     }
 
-    /// The table's device bytes.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        (self.table.len() * size_of::<f32>()) as u64
-    }
-
     /// The positions the table holds: the cache's rows.
     #[must_use]
     pub fn rows(&self) -> usize {

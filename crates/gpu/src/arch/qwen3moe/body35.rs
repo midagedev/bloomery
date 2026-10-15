@@ -1666,7 +1666,7 @@ impl Body35 {
                 (ubatch_arena(stream, (d, forms), ubatch.get(), free)?, None)
             }
             Some((open, counted)) => {
-                refuse_stage_rows_past(WHAT, open.plan, 0, rope.bytes())?;
+                refuse_stage_rows_past(WHAT, open.plan, 0, rope.table.num_bytes() as u64)?;
                 let side = placed_bytes(&d, plans.len(), open.rows)?;
                 let u = counted_arena(stream, (d, forms), ubatch.get(), counted, side)?;
                 (u, Some(Placed::new(gpu, w, &plans, &d, open)?))

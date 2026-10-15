@@ -944,7 +944,7 @@ impl Body {
         let (ub, placed) = match placed {
             None => (Ubatch::new(stream, dims, ubatch, Q32::of(&plans))?, None),
             Some((open, counted)) => {
-                refuse_stage_rows_past(what, open.plan, 0, rope.bytes())?;
+                refuse_stage_rows_past(what, open.plan, 0, rope.table.num_bytes() as u64)?;
                 let side = placed_bytes(&dims, plans.len(), open.rows)?;
                 let arena = counted_arena(stream, (dims, forms), ubatch, counted, side)?;
                 let ub = Ubatch::placed(stream, arena, ubatch)?;
