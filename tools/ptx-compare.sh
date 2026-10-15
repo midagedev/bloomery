@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # `just ptx-compare BASE BIN [--features F]`: the add and move classes' ptx-scan proof (AGENTS.md's change-class table) as one command.
 #   tools/ptx-compare.sh BASE BIN [--features F] [--base-only] [--no-cache]
-#   tools/ptx-compare.sh --compare BASE_SCAN HEAD_SCAN [--base-label L] [--head-label L]
 #   tools/ptx-compare.sh --self-test
 #
 # What it does. Scans BIN twice with the driver JIT (the add class reads the JIT columns), at BASE and at this tree, and prints one table
@@ -39,7 +38,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds
 ARCH=sm_86 # the ptx scan is sm_86's (tools/scan-args.sh refuses another BLOOMERY_ARCH before this runs)
-USAGE="usage: ptx-compare.sh BASE BIN [--features F] [--base-only] [--no-cache] | --compare BASE_SCAN HEAD_SCAN [--base-label L] [--head-label L] | --self-test"
+USAGE="usage: ptx-compare.sh BASE BIN [--features F] [--base-only] [--no-cache] | --self-test"
 
 die() { # die <rc> <message>
   echo "ptx-compare: $2" >&2
@@ -287,13 +286,7 @@ STUB
   [ "$rc" = 64 ] && has "is no cargo feature list"; ok "a feature list that is none: 64" $?
   run -- "$base_sha"
   [ "$rc" = 64 ] && has "usage:"; ok "a missing bin: usage, 64" $?
-  # 9. --compare on saved scans: no box
-  mklog gx alpha:1 beta:2 > "$t/a.scan"
-  mklog gx alpha:1 beta:2 gamma:3 > "$t/b.scan"
-  : > "$t/stub/box.log"
-  run -- --compare "$t/a.scan" "$t/b.scan" --base-label X --head-label Y
-  [ "$rc" = 0 ] && has 'base=X head=Y' && has 'ptx-compare: added-only (rc 0)' && [ ! -s "$t/stub/box.log" ]; ok "--compare: two saved scans, the table, no box call" $?
-  # 10. the build lines are the ptx-scan recipe's (a drift here means the head side scans something the recipe does not)
+  # 9. the build lines are the ptx-scan recipe's (a drift here means the head side scans something the recipe does not)
   recipe=$(awk '/^ptx-scan /{f=1; next} f && /^[^ ]/{exit} f' "$ROOT/justfile")
   case $recipe in
     *"cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} "*"--bin oxart_jit"*"&& cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh "*) rc=0 ;;
@@ -309,22 +302,6 @@ STUB
 # --- the command line
 case ${1:-} in
   --self-test) self_test; exit ;;
-  --compare)
-    shift
-    [ $# -ge 2 ] || die 64 "$USAGE"
-    b=$1 h=$2
-    shift 2
-    bl=base hl=head
-    while [ $# -gt 0 ]; do
-      case $1 in
-        --base-label) [ $# -ge 2 ] || die 64 "$USAGE"; bl=$2; shift 2 ;;
-        --head-label) [ $# -ge 2 ] || die 64 "$USAGE"; hl=$2; shift 2 ;;
-        *) die 64 "$USAGE" ;;
-      esac
-    done
-    compare "$b" "$h" "$bl" "$hl"
-    exit
-    ;;
 esac
 [ $# -ge 2 ] || die 64 "$USAGE"
 REV=$1 BIN=$2
