@@ -381,6 +381,18 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         "empty token id",
     );
     at(
+        "a tap file with a backslash",
+        &["tap\tx\t0\tf32\t2\ta\\b"],
+        &|_| {},
+        "does not name a file of the set's directory",
+    );
+    at(
+        "a tap file with a NUL",
+        &["tap\tx\t0\tf32\t2\ta\0b"],
+        &|_| {},
+        "does not name a file of the set's directory",
+    );
+    at(
         "a step row gone",
         &[],
         &|d| swap(d, "step\t2\t13\t2\t8\t8", ""),
