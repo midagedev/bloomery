@@ -316,7 +316,7 @@ fn resident_is_compact(
     let resident = dw.resident_bytes();
     let placement = resident_size(GgmlType::Q5_0, k, rows);
     let bytes_ok = packed_bytes == file + pad
-        && profile == Some(file)
+        && profile == Some(file + pad)
         && resident == packed_bytes
         && placement == Some(resident);
     let DevWeight::Q5_0 { w, .. } = &dw else {

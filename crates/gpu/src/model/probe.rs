@@ -39,8 +39,8 @@ fn kq_row_bytes(ty: GgmlType, k: usize) -> Option<usize> {
 
 /// Bytes of `rows` rows of a resident weight in the layout its kernel
 /// addresses. A Q5_0 row is the file's 22 bytes per 32 values (16 `qs`, 4
-/// `qh`, the f16 scale; an odd block count's last half-word of padding is
-/// never addressed); a Q5_1 row is eight code words plus the block's scale
+/// `qh`, the f16 scale), plus two bytes per odd-block row because the scale
+/// reader loads whole words; a Q5_1 row is eight code words plus the block's scale
 /// and min per 32 values — the `q_stride` window padding past the last block
 /// is allocated but never addressed. The q8_0 planes are addressed whole, so
 /// theirs are the card format's own bytes.
@@ -49,7 +49,7 @@ pub fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
     let k = w.k();
     Some(match w {
         DevWeight::KQuant { ty, .. } => rows * kq_row_bytes(*ty, k)?,
-        DevWeight::Q5_0 { .. } => rows * 22 * (k / 32),
+        DevWeight::Q5_0 { .. } => rows * 4 * crate::q5::q5_0_row_words(k / 32),
         DevWeight::Q5_1 { .. } => rows * 40 * (k / 32),
         DevWeight::Q8_0 { .. } | DevWeight::Q8_0Derived { .. } => {
             resident_size(GgmlType::Q8_0, k, rows)?
