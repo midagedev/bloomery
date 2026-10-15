@@ -266,26 +266,18 @@ macro_rules! w32 {
         if $live {
             let (wrow, first, qst) = $pv;
             let b = $n - first;
-            let c = wrow + 256 * (b >> 5) + (b & 31);
-            // SAFETY: the pair's row is inside the stack and `b < K/32 <= 32
-            // · windows`, so `256 · (b >> 5) + 224 + (b & 31) < qst` and `qst
-            // + b` lies before the row's end `qst + K/32`; the stack holds
-            // `n_experts · rows` such rows (launch contract).
+            // SAFETY: the pair's row is inside the stack and holds `qst` code
+            // words, the whole 256-word window of `b` among them (`b < K/32 <=
+            // 32 · windows`); `qst + b` lies in its scale section, before the
+            // row's end `qst + K/32` (launch contract).
             unsafe {
-                [
-                    *$w.get_unchecked(c),
-                    *$w.get_unchecked(c + 32),
-                    *$w.get_unchecked(c + 64),
-                    *$w.get_unchecked(c + 96),
-                    *$w.get_unchecked(c + 128),
-                    *$w.get_unchecked(c + 160),
-                    *$w.get_unchecked(c + 192),
-                    *$w.get_unchecked(c + 224),
+                (
+                    crate::q5::q5_code_words($w, wrow, b),
                     *$w.get_unchecked(wrow + qst + b),
-                ]
+                )
             }
         } else {
-            [0u32; 9]
+            ([0u32; 8], 0u32)
         }
     }};
     (@store plane($qs:ident, $wd:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
@@ -363,15 +355,15 @@ macro_rules! w32 {
             // next barrier.
             unsafe {
                 let p = $dst.add(8 * $pj);
-                *p = $raw[0];
-                *p.add(1) = $raw[1];
-                *p.add(2) = $raw[2];
-                *p.add(3) = $raw[3];
-                *p.add(4) = $raw[4];
-                *p.add(5) = $raw[5];
-                *p.add(6) = $raw[6];
-                *p.add(7) = $raw[7];
-                *$dst.add(16 + $pj) = $raw[8];
+                *p = $raw.0[0];
+                *p.add(1) = $raw.0[1];
+                *p.add(2) = $raw.0[2];
+                *p.add(3) = $raw.0[3];
+                *p.add(4) = $raw.0[4];
+                *p.add(5) = $raw.0[5];
+                *p.add(6) = $raw.0[6];
+                *p.add(7) = $raw.0[7];
+                *$dst.add(16 + $pj) = $raw.1;
             }
         }
     }};

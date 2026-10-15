@@ -35,7 +35,10 @@
 //!    a non-finite `A` each raise `Mamba2Scan` at the launch's layer and
 //!    leave the norm group they sit in entirely non-finite, never a
 //!    plausible `y`; every other group is the clean launch's bits. Clean
-//!    launches raise nothing.
+//!    launches raise nothing. The prompt pass with a `−∞` dt in its middle
+//!    token raises it too, with and without the norm: its first row is
+//!    finite and the middle row's plant (the norm group, or head 0's
+//!    channels) is non-finite.
 //! 5. replay: the capture is one node. Replayed over three tokens whose
 //!    inputs and position word are rewritten between replays, it equals the
 //!    eager run bit for bit (`y` of every token, the ring, the state).
@@ -982,6 +985,31 @@ mod gate {
         let got = run(&mut dev, &tok)?;
         dev.a.copy_from_host(cx.gpu.stream(), &w.a)?;
         ok &= check("-inf A", &got.y[0], 0)?;
+        // The prompt pass with a −∞ dt in its middle token, with and without
+        // the norm: the named fault, a finite first row, and the middle row's
+        // plant non-finite (the norm group of head 0, or head 0's channels).
+        let mut bad = tok.clone();
+        bad.dt[0] = f32::NEG_INFINITY;
+        let toks = [tok.clone(), bad, tok.clone()];
+        for norm in [true, false] {
+            let (got, _) = pass_run(cx, &mut dev, (&ring0, &st.scan, P0), &toks, norm, false)?;
+            let f = cx.gpu.take_fault()?;
+            let first_finite = got.y[0].iter().all(|v| v.is_finite());
+            let plant = if norm {
+                group(&got.y[1], 0)
+            } else {
+                &got.y[1][..HEAD_DIM]
+            };
+            let plant_bad = plant.iter().all(|v| !v.is_finite());
+            let pass = f == want && first_finite && plant_bad;
+            let shown = f.map_or("none".to_owned(), |f| f.to_string());
+            println!(
+                "fault -inf dt in a pass of 3 (norm {norm}): raised {shown}, row 0 finite \
+                 {first_finite}, row 1 plant non-finite {plant_bad} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
         Ok(ok)
     }
 
