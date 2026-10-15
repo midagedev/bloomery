@@ -376,7 +376,7 @@ def claude_ok():
                            stdin=subprocess.DEVNULL, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Stop(75, f"pre-review: claude --version failed ({type(e).__name__}): broken install; nothing was reviewed") from e
-    if p.returncode != 0:
+    if p.returncode != 0 or not (p.stdout + p.stderr).strip():
         raise Stop(75, f"pre-review: claude --version failed (rc {p.returncode}): broken install; nothing was reviewed")
 
 
@@ -620,6 +620,16 @@ def self_test():
             except Stop as e:
                 ok_ver = False
             expect(ok_ver, "a claude that answers --version is a healthy install")
+            for body in ("#!/bin/sh\nexit 0\n", "#!/bin/sh\nprintf ' \\n\\n'\nexit 0\n"):
+                open(fake, "w").write(body)
+                os.chmod(fake, 0o755)
+                try:
+                    claude_ok()
+                    got = None
+                except Stop as e:
+                    got = e
+                expect(got is not None and got.code == 75 and "broken install" in got.msg,
+                       f"a claude that exits 0 with no version text ends 75 naming a broken install: {got and (got.code, got.msg)}")
         finally:
             if saved_path is None:
                 os.environ.pop("PATH", None)
