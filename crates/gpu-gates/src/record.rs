@@ -3686,6 +3686,8 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
     &HOST_ONLY,
     &LANE,
+    &LOAD_NEMOTRON,
+    &CAPTURE,
     &LOAD_DRAFT_OFF38,
     &MTP_HEAD38,
     &TAPS_SEQ,

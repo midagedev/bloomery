@@ -2239,7 +2239,8 @@ mod cli {
     }
 
     /// The nemotron_h engine on the card the run holds, its step captured in
-    /// graph mode, with the `load` and `capture` lines.
+    /// graph mode, with its `load` record (the seat's [`record::LOAD_NEMOTRON`])
+    /// and, in graph mode, its [`record::CAPTURE`].
     fn open_nemotron(
         file: Split,
         (ctx, mode): (usize, StepMode),
@@ -2247,17 +2248,22 @@ mod cli {
     ) -> Result<NemotronHModel, GateError> {
         let mut m = NemotronHModel::open(Gpu::new()?, file, ctx)?;
         m.set_mode(mode);
-        println!(
-            "load arch=nemotron_h resident_bytes={} ctx={ctx} cache=f16 layers={} mode={} \
-             prompt=step in {:.1} s (runtime value)",
-            m.resident_bytes(),
-            m.layers().len(),
-            mode_name(mode),
-            t.elapsed().as_secs_f64()
-        );
+        let nodes = if mode == StepMode::Graph {
+            m.capture_step()?
+        } else {
+            0
+        };
+        Record::new(&record::LOAD_NEMOTRON)
+            .w("arch", "nemotron_h")
+            .u("resident_bytes", m.resident_bytes())
+            .u("ctx", ctx)
+            .u("slots", 1)
+            .u("layers", m.layers().len())
+            .u("graph_nodes", nodes)
+            .f("load_s", t.elapsed().as_secs_f64())
+            .print();
         if mode == StepMode::Graph {
-            let step = m.capture_step()?;
-            println!("capture graph_nodes={step}");
+            Record::new(&record::CAPTURE).u("graph_nodes", nodes).print();
         }
         Ok(m)
     }

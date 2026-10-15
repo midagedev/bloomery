@@ -1,0 +1,19 @@
+# The first Nemotron 3 Nano 4B rows on the RTX 3090, before N7c and N7d: the A6000 table's arms on the other card,
+# a table of its own. Predicted from measurements, not the DRAM model the A6000 card missed: the 0.3.3 toktape on
+# this card read decode 155.3 tok/s through bloomery-serve (tz7hzsysnd9u85cpf8mf), and the A6000's resident Q5_0
+# reads 1.73x its file bytes at ~640 GB/s (nemotron-ncu-q5.card), a term that scales with the card's DRAM rate.
+kind: baseline
+question: where do our Nemotron 3 Nano 4B decode and step-by-step prompt sit beside mainline llama.cpp on the
+  RTX 3090?
+term: tok/s @ n = 96, depth 6, NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf, generate_qwen3moe --time, graph replay,
+  RTX 3090
+unit: tok/s
+predict: 150..162
+condition: one lease, BLOOMERY_CARD=3090, the default rounds; arms 6 lcpp:6 512 lcpppp:512 4096 lcpp:4096
+  lcpppp:4096; the full output to a file first; [cpu-busy] and [other-busy] counts read beside each mean
+reason: sets the 3090's pre-N7c/N7d rows (AGENTS: a table per card); why now: the user made Nemotron
+  optimization the first priority, and the A6000 table exists
+decide-in: publish the rows in their 3090 table beside the A6000's; N7d's card predicts from both
+decide-below: the serve path and the CLI differ on this card: read the toktape's itl against the CLI's step ms
+decide-above: the 3090's DRAM rate carries the int8 Q5_0 reads better than the A6000's: re-read the
+  A6000 ncu rate against this card's

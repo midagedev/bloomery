@@ -2124,7 +2124,7 @@ depth-gpu-ds41 *ARMS:
 # --tokens로 넣는다(행 라벨 ours@prose). prose 팔은 같은 P의 prose 팔하고만, 자기 표에서 비교한다.
 # Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 the runner prints the command lines and exits before the lease, and nothing is built.
 depth-gpu-qwen3moe *ARMS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL="${BLOOMERY_MODEL:-qwen3moe}" ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # Qwen3.6-35B-A3B(qwen35moe) 같은 표: depth-gpu-qwen3moe의 러너·팔·표를 qwen35moe 프로필로 돈다. 우리 팔은 같은
 # generate_qwen3moe가 파일 헤더에서 아키텍처를 읽어 Body35로 연다.
@@ -2155,7 +2155,7 @@ depth-gpu-qwen4exp *ARMS:
 # so a depth D arm feeds D ids. The references are mainline llama.cpp's arms (lcpp:, lcpppp:); ik and mistral.rs arms
 # are refused by name. BLOOMERY_DRY=1 prints the command lines and builds nothing.
 depth-gpu-nemotron *ARMS:
-    BLOOMERY_MODEL=nemotron_h ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=nemotron_h just depth-gpu-qwen3moe {{ARMS}}
 
 # GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용):
 # ours `<D>` (the first D prose ids, run as the binary's `--prefill` default, batches; `kind=` in the row names the feed),

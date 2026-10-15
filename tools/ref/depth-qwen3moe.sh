@@ -747,6 +747,9 @@ q3_self_test() {
   run_parse BLOOMERY_MODEL=nemotron_h -- 6 lcpp:6
   want nemotron-arms 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256" \
     "[parse] lcpp:6: kind=ref depth=6 label=lcpp env=- load=(a process of its own)"
+  run_parse BLOOMERY_MODEL=nemotron_h --
+  want nemotron-default 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256" \
+    "[parse] lcpp:6: kind=ref depth=6 label=lcpp env=- load=(a process of its own)"
   run_parse BLOOMERY_MODEL=nemotron_h -- ik:6
   want nemotron-ik 64 "arm 'ik:6': the nemotron_h profile runs ours, bin: and mainline llama.cpp arms"
   run_parse BLOOMERY_MODEL=nemotron_h -- mrspp:512
@@ -1342,7 +1345,11 @@ case $AB_WARMUP in
   *) echo "depth-qwen3moe.sh: BLOOMERY_AB_WARMUP is 1 (one discarded run of the first arm under rotate; the blocks' discards under blocks, the default there) or 0 (none; the default under rotate), got '$AB_WARMUP'" >&2; exit 64 ;;
 esac
 ARMS=("$@")
-[ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6 lcpp:6)
+if [ ${#ARMS[@]} -eq 0 ]; then
+  # nemotron_h has no ik arm (the refusal below), so its default is ours and mainline.
+  ARMS=(6 lcpp:6)
+  [ "$MODEL_NAME" = nemotron_h ] || ARMS=(6 ik:6 lcpp:6)
+fi
 ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 # Per arm, by its index in ARMS: the kind (ours, ref, srv or bin), the depth, the row label, the engine
 # (ours, bin, or the reference's), the binary (ours and bin) and a server arm's ids (lcg).
