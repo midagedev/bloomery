@@ -420,6 +420,9 @@ pub enum QuantError {
         byte: u8,
         why: &'static str,
     },
+    /// A byte that is no UE4M3 scale, outside a block ([`ue4m3_to_f32_half`]).
+    #[error("{byte:#04x} is no UE4M3 scale: {why}")]
+    NotUe4m3 { byte: u8, why: &'static str },
 }
 
 /// Dequantize `n = dst.len()` values of one contiguous span of type `ty`.
@@ -985,8 +988,14 @@ fn dequant_mxfp4(src: &[u8], dst: &mut [f32]) {
 ///
 /// # Errors
 ///
-/// Why the byte is no scale.
-fn ue4m3_to_f32_half(byte: u8) -> Result<f32, &'static str> {
+/// [`QuantError::NotUe4m3`], naming the byte and why it is no scale.
+pub fn ue4m3_to_f32_half(byte: u8) -> Result<f32, QuantError> {
+    ue4m3(byte).map_err(|why| QuantError::NotUe4m3 { byte, why })
+}
+
+/// [`ue4m3_to_f32_half`] with the reason alone, for a caller that names the
+/// block and sub-block itself.
+fn ue4m3(byte: u8) -> Result<f32, &'static str> {
     if byte & 0x80 != 0 {
         return Err("bit 7 set: UE4M3 has no sign bit");
     }
@@ -1027,7 +1036,7 @@ fn dequant_nvfp4(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
             .enumerate()
         {
             let byte = blk[sub];
-            let d = ue4m3_to_f32_half(byte).map_err(|why| QuantError::UndefinedScale {
+            let d = ue4m3(byte).map_err(|why| QuantError::UndefinedScale {
                 ty: GgmlType::NVFP4,
                 block,
                 sub,
@@ -1983,6 +1992,21 @@ mod tests {
         }
     }
 
+    /// The public decode refuses a byte that is no scale with the crate's error, naming it.
+    #[test]
+    fn ue4m3_to_f32_half_names_a_byte_that_is_no_scale() {
+        assert_eq!(super::ue4m3_to_f32_half(0x38), Ok(0.5));
+        for (byte, why) in [
+            (0x7Fu8, "E4M3's NaN"),
+            (0x80, "bit 7 set: UE4M3 has no sign bit"),
+        ] {
+            assert_eq!(
+                super::ue4m3_to_f32_half(byte),
+                Err(QuantError::NotUe4m3 { byte, why })
+            );
+        }
+    }
+
     /// A scale byte UE4M3 does not define — 0x7F, E4M3's NaN, or any byte
     /// with bit 7 set — is refused naming the block, the sub-block and the
     /// byte. Decoding it as mainline does (0x7F to 0, bit 7 dropped) passes
@@ -2006,7 +2030,7 @@ mod tests {
                     block: 1,
                     sub: 2,
                     byte,
-                    why: super::ue4m3_to_f32_half(byte).unwrap_err(),
+                    why: super::ue4m3(byte).unwrap_err(),
                 }
             );
             let text = e.to_string();
