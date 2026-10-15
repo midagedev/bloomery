@@ -38,6 +38,13 @@
 #      longest first (ties in list order), each to the lane with the smaller running sum (lane B on a
 #      tie). Its card is its lane's, never `any`: BLOOMERY_GATE_CARD=3090 in lane A, a6000 in lane B
 #      (where it never queues on the 3090 lock); a recipe with no device code gets none.
+#   class B  fixed to the A6000's lane: every tools/gpu-gate.sh call carries
+#      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000}, a gate whose default working set needs more
+#      than the 3090. Cards a6000, not stealable, so an unpinned batch does not place it on the 3090.
+#      A 3090 call, a box.sh card pick or solo keeps the lane that already won; a real-tier v41-load
+#      member without the `any` form stays on the chain's 3090 candidate. --lanes 1 preserves defaults
+#      and caller/item card overrides. Any other spelling of BLOOMERY_GATE_CARD on a gpu-gate.sh call is
+#      still refused. A fixture-tier solo-real recipe that picks the A6000 through box.sh is the same class.
 #   X  alone, after both lanes end: a recipe (or a dependency) that carries the just attribute
 #      `[group('solo')]`, whose gate pins a host-memory count (page faults, page-cache residency) that
 #      another lane's model loads move; and a recipe that uses box.sh's own card pick
@@ -896,6 +903,10 @@ cn-red:
 [group('canary')]
 cn-ok:
     ./tools/box.sh 'bash tools/gate.sh -p co'
+
+# An A6000-default gate: every gpu-gate.sh call is the :-a6000 form, so the batch fixes it to lane B.
+a6-pin:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000} bash tools/gpu-gate.sh gen_a6'
 JF
   # The pack's resource table: a row per solo/solo-real recipe of the fixture justfile above (a
   # recipe the justfile does not hold — sr-arm arrives in a case below — is ignored), and the pack
@@ -1435,6 +1446,28 @@ FP
     env BLOOMERY_CARD=3090 "${gb[@]}" --dry-run steal-fix
   check 'card: the A6000 still plans a recipe fixed to it' 0 '^lane B  sr-a6000 ' \
     env BLOOMERY_CARD=a6000 "${gb[@]}" --tier fixture --dry-run sr-a6000
+  check 'card: an a6000-form recipe is class B, fixed to the A6000' 0 \
+    '^a6-pin	B	fixed	a6000	' "${gb[@]}" --classes
+  out=$("${gb[@]}" --dry-run plain-any a6-pin 2>&1) || fail 'card: the a6000-form dry run failed' "$out"
+  if grep -q "^lane B  a6-pin .*BLOOMERY_GATE_CARD=a6000' just a6-pin$" <<< "$out" \
+    && ! grep -q movable <<< "$(grep -A3 '^lane B  a6-pin ' <<< "$out")" \
+    && grep -q "^lane A  plain-any .*BLOOMERY_GATE_CARD=3090' just plain-any$" <<< "$out"; then
+    pass 'card: an unpinned batch keeps the a6000-form recipe on the A6000, and the any recipe can take the 3090'
+  else fail 'card: an unpinned batch keeps the a6000-form recipe on the A6000, and the any recipe can take the 3090' "$out"; fi
+  check 'card: one lane keeps the recipe default' 0 \
+    '^lane A  a6-pin +just a6-pin$' "${gb[@]}" --lanes 1 --dry-run a6-pin
+  check 'card: one lane preserves an item card override' 0 \
+    "^lane A  a6-pin .*BLOOMERY_GATE_CARD=3090' just a6-pin$" \
+    "${gb[@]}" --lanes 1 --dry-run 'a6-pin@BLOOMERY_GATE_CARD=3090'
+  check 'card: one lane preserves a caller card override' 0 \
+    "^lane A  a6-pin .*BLOOMERY_GATE_CARD=3090' just a6-pin$" \
+    env BLOOMERY_BOX_ENV=BLOOMERY_GATE_CARD=3090 "${gb[@]}" --lanes 1 --dry-run a6-pin
+  check 'card: both refuses an a6000-form recipe, by name' 65 \
+    '^gate-batch: a6-pin is fixed to the a6000; BLOOMERY_CARD=both' \
+    env BLOOMERY_CARD=both "${gb[@]}" --dry-run a6-pin
+  check 'card: the 3090 refuses an a6000-form recipe, by name' 65 \
+    '^gate-batch: a6-pin is fixed to the a6000; BLOOMERY_CARD=3090 is another card' \
+    env BLOOMERY_CARD=3090 "${gb[@]}" --dry-run a6-pin
   mutant_of card-noboth \
     's%^    3090|a6000|both) ;;$%    never) ;; # MUTANT card-noboth%' \
     '# MUTANT card-noboth$'
@@ -3802,6 +3835,9 @@ def closure(name, seen):
 
 GPU_GATE = "tools/gpu-gate.sh"
 ANY = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
+# The A6000's own default. A recipe whose gpu-gate.sh calls are all this form is class B, fixed to
+# lane B (cards a6000), not a balanced item a lane may place on the 3090.
+A6000 = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000}"
 # The names the structural rule (walk() and takes_lease below) cannot see: timing-card.sh, a library a
 # timing runner sources, which takes no lease itself; gpu-ab.py, a Python runner walk() does not read;
 # the lease lock named in a recipe's own text, which walk() does not read either. Every runner that calls
@@ -3873,7 +3909,8 @@ def takes_lease(path):
 # WALK_DEPTH hops from the recipe's text; a chain that would go deeper is a named refusal, never a
 # walk cut short. Two questions are asked of every file it reaches, by this one walker: does it take
 # the timing lease (takes_lease), and does it call tools/gpu-gate.sh — in command position, with the
-# call's card form: `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}` (balanced), none (the 3090), or
+# call's card form: `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}` (balanced),
+# `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000}` (fixed to the A6000), none (the 3090), or
 # any other BLOOMERY_GATE_CARD on the call (a form this runner does not read: refused). A mention in
 # a message (echo, printf, die, fail, say) is not a script the file runs.
 # tools/gpu-gate.sh itself is the runner a call reaches, and its text is not followed; nor is this file's
@@ -3944,6 +3981,8 @@ def walk(start):
             call = m.group(0)
             if ANY in call:
                 res["calls"].append(("any", where))
+            elif A6000 in call:
+                res["calls"].append(("a6000", where))
             elif "BLOOMERY_GATE_CARD" in call:
                 res["calls"].append(("unread", f"{where}: {call.strip()}"))
             else:
@@ -3964,8 +4003,8 @@ GATE_FORMS = {}
 
 
 def classify(name):
-    """(lane, reason) for a recipe and its dependencies: lane A, B or X, or T (a timed recipe) or R
-    (refused for another reason), which do not run in a batch."""
+    """(lane, reason) for a recipe and its dependencies: lane A, B, S (the `:-a6000` form, placed as
+    class B) or X, or T (a timed recipe) or R (refused for another reason), which do not run in a batch."""
     lanes_seen, reasons, forms = set(), [], set()
     for n in closure(name, set()):
         text = body(n)
@@ -3988,6 +4027,9 @@ def classify(name):
             if form == "any":
                 lanes_seen.add("B")
                 reasons.append(f"{n}: gpu-gate.sh any ({where})")
+            elif form == "a6000":
+                lanes_seen.add("S")
+                reasons.append(f"{n}: gpu-gate.sh a6000 ({where})")
             else:
                 lanes_seen.add("A")
                 reasons.append(f"{n}: gpu-gate.sh 3090 ({where})")
@@ -4004,6 +4046,10 @@ def classify(name):
                     lanes_seen.add("B")
                     forms.add("any")
                     reasons.append(f"{n}: gpu-gate.sh any")
+                elif A6000 in seg:
+                    lanes_seen.add("S")
+                    forms.add("a6000")
+                    reasons.append(f"{n}: gpu-gate.sh a6000")
                 elif "BLOOMERY_GATE_CARD" in seg:
                     return "R", f"{n}: a gpu-gate.sh call sets BLOOMERY_GATE_CARD in a form this runner does not read: {seg.strip()}"
                 else:
@@ -4018,7 +4064,8 @@ def classify(name):
                 reasons.append(f"{n}: direct target/release run (box env 3090 pin, no gate lock)")
     GATE_FORMS[name] = forms
     why = "; ".join(dict.fromkeys(r for r in reasons))
-    for lane in ("X", "A", "B"):
+    # S (the `:-a6000` form) loses to a 3090 call or a box.sh card pick, and beats a balanced `any`.
+    for lane in ("X", "A", "S", "B"):
         if lane in lanes_seen:
             return lane, why
     return "B", "no device code" + (f" ({why})" if why else "")
@@ -4720,7 +4767,7 @@ def placement(name, lane, lanes):
         if box:
             labels = [box]
         elif uses_gpu_gate:
-            labels = ["any" if "any" in GATE_FORMS[name] else "3090"]
+            labels = ["any" if GATE_FORMS[name] & {"any", "a6000"} else "3090"]
         else:
             labels = ["3090" if lane == "A" else "none"]
         return "A", "one-lane", ["-"], labels
@@ -4757,6 +4804,10 @@ def placement(name, lane, lanes):
         # member runs on the 3090.
         # Not in the fixture tier: a fixture load takes no V4.1 load lock and has no such host set.
         return "A", "fixed", (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
+    if lane == "S":
+        # The `:-a6000` form: class B, the A6000's lane, one card, not stealable. A real-tier
+        # v41-load returned above (the chain's 3090 candidate, or lane A); solo returned as lane X.
+        return "B", "fixed", ["a6000"], ["a6000"]
     if lane == "A":
         return "A", "fixed", (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
     if uses_gpu_gate:
@@ -4766,7 +4817,8 @@ def placement(name, lane, lanes):
 
 # --classes: every recipe of the justfile, one line each, and nothing else runs:
 #   <recipe>\t<class>\t<kind>\t<cards>\t<reason>
-# class A (fixed, the 3090), F (balanced), X (alone), T (timed: refused in a batch) or R (refused for
+# class A (fixed, the 3090), B (fixed, the A6000: the `:-a6000` form, or a fixture-tier solo-real
+# A6000 pick), F (balanced), X (alone), T (timed: refused in a batch) or R (refused for
 # another reason); cards the candidates, `-` for none forced. tools/check-recipes.sh reads the T lines.
 if src == "classes":
     prefetch_real_file(sorted(recipes))
@@ -5306,8 +5358,8 @@ tail = max(pool["3090"], pool["a6000"], -(-pool["bal"] // 2),
 phase1 = max(sums["C"], -(-work // 2), pinned["3090"], pinned["a6000"], sums["C"] + tail)
 wall = max(phase1, sums["A"], sums["B"]) + pack_wall
 print("\x1f".join(["=", str(sums["A"]), str(sums["B"]), str(pack_wall), str(sums["C"]), str(wall), str(len(defaults)), " ".join(defaults)]))
-# The run order: lanes A and X in record order, lane B's fixed items (class B: a solo-real recipe that picks the A6000 in the
-# fixture tier) first in record order, then its balanced items in the order the balance placed them — its skips, then
+# The run order: lanes A and X in record order, lane B's fixed items (class B: the `:-a6000` form,
+# and a solo-real recipe that picks the A6000 in the fixture tier) first in record order, then its balanced items in the order the balance placed them — its skips, then
 # longest first. Every lane-A item opens with a release build, and cargo holds one build lock per target
 # directory for the whole box tree: a lane-B build that starts at t = 0 (a device crate's lib tests build
 # for ~100 s) makes lane A's first build wait for it. When the longest balanced item runs on the Mac

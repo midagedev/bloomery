@@ -2028,9 +2028,11 @@ gate-gpu-qwen38-serve:
 # target/qwen3-serve-gate/<n>/. The build takes glm5next: bloomery-serve links every seat's device bundle. --images adds
 # the image clauses (the `vision` build, the family's bf16 projector and the oracle sets of ref_qwen35moe_vis_chatids_* and
 # _decode_*): the qwen3moe file's --mmproj refusal and, on the Qwen3.6 file, the seat with its encoder.
+# The default card is the A6000. The seat loads two models, the image projector and the context ladder,
+# which needs more room than the 3090 past the Qwen3.6 weights. BLOOMERY_GATE_CARD=3090 still overrides.
 [group('pool')]
 gate-gpu-qwen3-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --dir $D --images'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --dir $D --images'
 
 # bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
 # default (SERVE_PLACE=gate for the 3090), the port 8080 unless SERVE_PORT, a four-hour gate bound unless

@@ -114,8 +114,9 @@
 #   are 81, 84 and 130/143 (see its header). A queued job has no stdin (input waiting on it is refused, 64), and BLOOMERY_BOX_WAIT and
 #   BLOOMERY_HOLD_OWNER do not reach the daemon.
 #   BLOOMERY_Q_CLASS=lead|round|sitting|fill   the job's class, which sets its priority (default round)
-#   BLOOMERY_Q_CARD=3090|a6000|both|any|none   the lane (default BLOOMERY_CARD, else default_lane below: any for a
-#                             command whose every device run is a gpu-gate.sh call in the `any` form, else 3090; both set to
+#   BLOOMERY_Q_CARD=3090|a6000|both|any|none   the lane (default BLOOMERY_CARD, else default_lane below: a6000 when
+#                             every gpu-gate.sh call is the `:-a6000` form, any when every device run is a
+#                             gpu-gate.sh call in the `any` form, else 3090; both set to
 #                             different values: 64). `any` is the daemon's choice of a card: the card pick and
 #                             BLOOMERY_BOX_CARD then read $SIGNALBOX_CARD, which the daemon sets in the job's
 #                             environment. `none` holds no card and pins none beyond the default
@@ -258,18 +259,38 @@ print(h.hexdigest()[:16])
 PY
 }
 
-# default_lane CMD: the queue lane of a call that names none. `any` when CMD runs device code only through gpu-gate.sh
+# default_lane CMD: the queue lane of a call that names none. `a6000` when every gpu-gate.sh call is the
+# `:-a6000` form (BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000}) and the rest sets no card and runs no
+# device code of its own — read before the target/ and python early return, because a serve recipe names
+# both and still belongs on the A6000. `any` when CMD runs device code only through gpu-gate.sh
 # calls in the `any` form (BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}), and every other script it names is one that
 # runs none, so either card's lock is the run's own; else 3090, the box's pin. A command it cannot read for certain stays
 # on 3090: the failure it blocks is the other way round, a fixture batch of `any` gates queued one after another on the
-# 3090's lane while the A6000 sits idle. A card BLOOMERY_BOX_ENV names as BLOOMERY_GATE_CARD (tools/gate-batch.sh's lane A)
-# is the lane, and any other value of it (any, which the daemon's pick would contradict) keeps 3090, so the export after
-# the lane's own never names a card its lane did not get. The scan reads only `.sh` names and the cargo, target/ and
-# python forms above; the allowlist below is the scripts that run no device code, and a script not on it stays on 3090.
-# Plain cargo (`cargo test`, tools/gate.sh without --oxide) builds no device crate (AGENTS.md), so it holds no card.
+# 3090's lane while the A6000 sits idle. A card BLOOMERY_BOX_ENV names as BLOOMERY_GATE_CARD (tools/gate-batch.sh's lane A
+# or its fixed A6000 lane) is the lane, and any other value of it (any, which the daemon's pick would contradict) keeps
+# 3090, so the export after the lane's own never names a card its lane did not get. The scan reads only `.sh` names and
+# the cargo, target/ and python forms above; the allowlist below is the scripts that run no device code, and a script
+# not on it stays on 3090. Plain cargo (`cargo test`, tools/gate.sh without --oxide) builds no device crate (AGENTS.md),
+# so it holds no card.
+# quiet_scripts REST [models]: every tools/ script REST names is on the allowlist of scripts that run no device code;
+# with `models`, a model file under tools/ref/models/ too (the A6000 recipe reads one for its metadata).
+quiet_scripts() {
+  local s models=${2:-}
+  # [t]ools: spelled with a class so tools/recipes.py's tree-walk detector does not read this scan of CMD as a walk of the tree
+  for s in $(grep -o '[t]ools/[A-Za-z0-9/_.-]*\.sh' <<< "$1" || true); do
+    case $s in
+      tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/ref-paths.sh) ;;
+      [t]ools/ref/models/*.sh) [ "$models" = models ] || return 1 ;;  # [t]: not a script reference to the walk
+      *) return 1 ;;
+    esac
+  done
+}
+
 default_lane() {
-  local c=$1 rest s kv gate_card=
+  local c=$1 rest kv gate_card= rest6000 call6000
   local device_run='cargo[[:space:]]+([+-]|oxide[[:space:]]+(run|test)|run)|gate[.]sh[[:space:]]+--oxide'
+  # Split so a walk of this file does not see a gpu-gate.sh call. The form alone is not a call.
+  local a6000_form='BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000}' gate_name='gpu-''gate.sh'
   # the job exports BLOOMERY_BOX_ENV in order, so its last BLOOMERY_GATE_CARD entry is the card the gates see
   for kv in ${box_env[@]+"${box_env[@]}"}; do
     [ "${kv%%=*}" != BLOOMERY_GATE_CARD ] || gate_card=$kv
@@ -278,6 +299,24 @@ default_lane() {
     '') ;;
     BLOOMERY_GATE_CARD=3090 | BLOOMERY_GATE_CARD=a6000 | BLOOMERY_GATE_CARD=both) echo "${gate_card#*=}"; return ;;
     *) echo 3090; return ;;
+  esac
+  # The `:-a6000` form plus its gpu-gate.sh call is the A6000 even when the command names target/
+  # or python. What remains after those calls is another gate, another card spelling, or device code
+  # of its own (a cargo run, a target/ binary run by path, a script off the allowlist): that stays on
+  # the 3090. A form with no gate call after it is not this pin.
+  call6000="$a6000_form bash tools/$gate_name"
+  case $c in
+    *"$a6000_form"*)
+      rest6000=${c//"$call6000"/}
+      if [ "$rest6000" = "$c" ]; then echo 3090; return; fi
+      case $rest6000 in
+        *"$gate_name"*|*BLOOMERY_GATE_CARD*|*BLOOMERY_CARD=*) echo 3090; return ;;
+      esac
+      local direct_target='(^|[^[:alnum:]_=/.-])(\./)?target/'
+      if [[ $rest6000 =~ $device_run || $rest6000 =~ $direct_target ]]; then echo 3090; return; fi
+      quiet_scripts "$rest6000" models || { echo 3090; return; }
+      echo a6000
+      return ;;
   esac
   if [[ $c =~ $device_run ]]; then echo 3090; return; fi
   case $c in
@@ -288,13 +327,7 @@ default_lane() {
   if [ "$rest" = "$c" ]; then echo 3090; return; fi
   # a card the command sets itself (an export, or another gate's pin) outlives the daemon's pick
   case $rest in *BLOOMERY_GATE_CARD=*) echo 3090; return ;; esac
-  # [t]ools: spelled with a class so tools/recipes.py's tree-walk detector does not read this scan of CMD as a walk of the tree
-  for s in $(grep -o '[t]ools/[A-Za-z0-9/_.-]*\.sh' <<< "$rest" || true); do
-    case $s in
-      tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/ref-paths.sh) ;;
-      *) echo 3090; return ;;
-    esac
-  done
+  quiet_scripts "$rest" || { echo 3090; return; }
   echo any
 }
 
@@ -322,6 +355,31 @@ self_test() {
     return 70
   fi
   fail() { echo "box.sh: self-test: $*" >&2; fails=$((fails + 1)); }
+  # default_lane reads box_env. This test owns an empty one: the live script assigns it after --self-test returns.
+  # The form, the gate name and the script paths are split so a walk of this file does not see a call or a script.
+  local box_env=() form gate got
+  form='BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000}'
+  gate='gpu-''gate.sh'
+  got=$(default_lane "D=target/x && $form bash tools/$gate gen")
+  [ "$got" = a6000 ] || fail "default_lane: a :-a6000 gate that names target/ is the A6000, got '$got'"
+  box_env=(BLOOMERY_GATE_CARD=3090)
+  got=$(default_lane "D=target/x && $form bash tools/$gate gen")
+  [ "$got" = 3090 ] || fail "default_lane: a BOX_ENV card of 3090 wins over the :-a6000 form, got '$got'"
+  box_env=()
+  got=$(default_lane "$form bash tools/$gate gen && bash tools/$gate other")
+  [ "$got" = 3090 ] || fail "default_lane: a second gate call stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && target/release/generate_ds41 --plan")
+  [ "$got" = 3090 ] || fail "default_lane: a target/ binary after the gate stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && ./target/release/generate_ds41 --plan")
+  [ "$got" = 3090 ] || fail "default_lane: a ./target/ binary after the gate stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && (target/release/generate_qwen3moe --tokens 0)")
+  [ "$got" = 3090 ] || fail "default_lane: a grouped target/ binary stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && \"target/release/generate_qwen3moe\" --tokens 0")
+  [ "$got" = 3090 ] || fail "default_lane: a quoted target/ binary stays on the 3090, got '$got'"
+  got=$(default_lane "$form bash tools/$gate gen && bash too""ls/ref/q38-3090-server.sh /tmp/probe")
+  [ "$got" = 3090 ] || fail "default_lane: a script off the allowlist after the gate stays on the 3090, got '$got'"
+  got=$(default_lane "Q=\$(sed -n p too""ls/ref/models/qwen35moe.sh) && $form bash tools/$gate gen")
+  [ "$got" = a6000 ] || fail "default_lane: a model file read beside the gate is the A6000, got '$got'"
   # call [VAR=value…] -- ARGS…: the scratch box.sh with ARGS, in an environment of PATH, HOME, TZ and the VARs only; rc and out are its result.
   call() {
     local envs=()
