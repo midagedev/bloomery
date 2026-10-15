@@ -3,9 +3,8 @@
 //! (`nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF`). One contract, one
 //! test; it prints the summary, then fails with every pin that differs.
 //!
-//! `hw_`: needs the file on the box (`just gate-nemotron-h-moe-meta`), at
-//! the box's path or at `BLOOMERY_MODEL` inside the box
-//! (`BLOOMERY_BOX_ENV='BLOOMERY_MODEL=<path>'`). Headers only: the reader
+//! `hw_`: needs the file on the box at [`FILE`] (`just
+//! gate-nemotron-h-moe-meta`). Headers only: the reader
 //! holds every tensor to the dims the keys give it, so the tensor headers are
 //! read and the bytes are not. The tensors are pinned to tile the file's data
 //! to its last byte, so a block size the reader gets wrong fails a pin.
@@ -129,13 +128,10 @@ const COVERAGE: &[(&str, usize)] = &[
 #[test]
 #[ignore = "needs the Bolt 24GB GGUF on the box (just gate-nemotron-h-moe-meta)"]
 fn hw_nemotron_h_moe_header() {
-    let file = std::env::var_os("BLOOMERY_MODEL").map_or_else(
-        || FILE.to_string(),
-        |v| v.into_string().expect("BLOOMERY_MODEL must be UTF-8"),
-    );
-    let len = fs::metadata(&file).map(|m| m.len());
+    let file = FILE;
+    let len = fs::metadata(file).map(|m| m.len());
     let mut bad = Vec::new();
-    let split = gguf::Split::open(&file).unwrap_or_else(|e| panic!("open {file}: {e}"));
+    let split = gguf::Split::open(file).unwrap_or_else(|e| panic!("open {file}: {e}"));
     let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec: {e}"));
     let hp = model::arch::nemotron_h_moe::hparams::Hparams::read(&split)
         .unwrap_or_else(|e| panic!("hparams: {e}"));
