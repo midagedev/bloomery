@@ -23,8 +23,8 @@
 //! - The body holds one sequence: its attention layers' K and V planes of one
 //!   context and its Mamba-2 layers' scan state and conv ring. It has no slot
 //!   rows, so `--parallel` above 1 is refused by name before any plan.
-//! - The body has no prompt batch: a prompt call is one decode step an id
-//!   (`GpuModel::step` over the ids), so the prompt rate is the decode rate.
+//! - A prompt call of several ids runs the body's prompt path
+//!   (`GpuModel::prefill`, passes of many rows); one id is a step.
 //! - A Mamba-2 state cannot step back. A request keeps the prefix it shares
 //!   with what the slot holds only when that prefix is the whole held
 //!   sequence (the position the model stands at); any other shared prefix is
@@ -154,10 +154,15 @@ impl Seat for Nemotron {
         self.m.ctx_max()
     }
 
-    /// One decode step an id, the argmax after the last: the body has no
-    /// prompt batch.
+    /// A prompt of several ids runs the batched path
+    /// ([`bloomery_gpu::GpuModel::prefill`], passes of many rows); one id is a
+    /// step.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        Ok(self.m.step(ids)?)
+        if ids.len() > 1 {
+            Ok(self.m.prefill(ids)?)
+        } else {
+            Ok(self.m.step(ids)?)
+        }
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
