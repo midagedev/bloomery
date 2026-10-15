@@ -55,9 +55,12 @@ while [ $# -gt 0 ]; do
 done
 if [ ${#taps[@]} = 0 ]; then for t in "${MTP_TAPS[@]}"; do taps+=(--tap "$t"); done; fi
 SET=${Q35MTP_SET:-$BLOOMERY_DATA/ref-mtp/qwen35moe_mainline_prose64}
+mkdir -p "$(dirname "$SET")"
+# One writer a destination, card or --cpu, held through the install and the staging cleanup.
+exec {set_lock}> "$SET.lock"
+flock -n "$set_lock" || { echo "dump-q35mtp: $SET already has a writer" >&2; exit 75; }
 STAGE=$SET.staging
 rm -rf "$STAGE"
-mkdir -p "$(dirname "$SET")"
 drop_incomplete_stage() {
   [ -d "$STAGE" ] || return 0
   rm -rf "$STAGE"

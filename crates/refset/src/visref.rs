@@ -16,6 +16,7 @@
 //! (`[logits, n_vocab]` f32).
 
 use crate::RefError;
+use crate::columns::need as need_cols;
 use crate::columns::{Columns, Row, parse_field};
 use crate::family::{Family, Identity};
 use std::fmt;
@@ -353,15 +354,6 @@ fn columns(kind: &str, f: &[&str], at: &dyn fmt::Display) -> Result<Columns, Ref
         .get(1)
         .ok_or_else(|| RefError::malformed(at, format!("# {kind} columns names none")))?;
     Ok(Columns::new(kind, names.split(' ')))
-}
-
-fn need_cols<'a>(
-    cols: &'a Option<Columns>,
-    what: &str,
-    at: &dyn fmt::Display,
-) -> Result<&'a Columns, RefError> {
-    cols.as_ref()
-        .ok_or_else(|| RefError::malformed(at, format!("a {what} row before its column line")))
 }
 
 fn case_row(r: &Row<'_>) -> Result<Case, RefError> {

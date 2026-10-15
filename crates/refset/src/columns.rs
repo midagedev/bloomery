@@ -121,3 +121,14 @@ pub(crate) fn file_name(name: &str, at: &dyn Display) -> Result<(), RefError> {
     }
     Ok(())
 }
+
+/// The column line a data row of kind `what` is read by, or a malformed-set error naming the row
+/// that came before it.
+pub(crate) fn need<'a>(
+    cols: &'a Option<Columns>,
+    what: &str,
+    at: &dyn Display,
+) -> Result<&'a Columns, RefError> {
+    cols.as_ref()
+        .ok_or_else(|| RefError::malformed(at, format!("a {what} row before its column line")))
+}

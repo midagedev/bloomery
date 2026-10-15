@@ -10,7 +10,7 @@
 //! those names.
 
 use crate::RefError;
-use crate::columns::{Columns, Row, parse_field};
+use crate::columns::{Columns, Row, need, parse_field};
 use crate::family::Family;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -251,15 +251,6 @@ fn columns(kind: &str, f: &[&str], at: &dyn fmt::Display) -> Result<Columns, Ref
         .get(1)
         .ok_or_else(|| RefError::malformed(at, format!("# {kind} columns names none")))?;
     Ok(Columns::new(kind, names.split(' ')))
-}
-
-fn need<'a>(
-    cols: &'a Option<Columns>,
-    what: &str,
-    at: &dyn fmt::Display,
-) -> Result<&'a Columns, RefError> {
-    cols.as_ref()
-        .ok_or_else(|| RefError::malformed(at, format!("a {what} row before its column line")))
 }
 
 fn image_row(r: &Row<'_>) -> Result<Image, RefError> {

@@ -26,7 +26,7 @@
 //! build, for another architecture, without the MTP context, and one whose files disagree with its rows.
 
 use crate::RefError;
-use crate::columns::{Columns, Row};
+use crate::columns::{Columns, Row, need};
 use crate::family::{Family, Identity};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
@@ -208,10 +208,28 @@ impl TapSet {
                 }
                 "# step columns" => step_cols = Some(Columns::new("step", f[1..].iter().copied())),
                 "# tap columns" => tap_cols = Some(Columns::new("tap", f[1..].iter().copied())),
-                "# complete" => set.complete = true,
+                "# complete" => {
+                    // `# complete <tap rows> 0`, the manifest's last line: a set whose trailer
+                    // counts other tap rows than it holds lost rows after the writer counted them.
+                    if f.len() != 3
+                        || f[2] != "0"
+                        || number(f[1], &at)? as usize != set.taps.len()
+                        || text.lines().skip(i + 1).any(|l| !l.is_empty())
+                    {
+                        return Err(RefError::malformed(
+                            &at,
+                            format!(
+                                "the trailer `{}` is not `# complete\t{}\t0` on the last line",
+                                f.join("\t"),
+                                set.taps.len()
+                            ),
+                        ));
+                    }
+                    set.complete = true;
+                }
                 h if h.starts_with('#') => {}
                 "trunk" => {
-                    let c = need(trunk_cols.as_ref(), "trunk", &at)?;
+                    let c = need(&trunk_cols, "trunk", &at)?;
                     let r = c.row(line, &at)?;
                     let file = r.text("file")?;
                     file_name(file, &at)?;
@@ -229,7 +247,7 @@ impl TapSet {
                     }
                 }
                 "step" => {
-                    let r = need(step_cols.as_ref(), "step", &at)?.row(line, &at)?;
+                    let r = need(&step_cols, "step", &at)?.row(line, &at)?;
                     let step = step_row(&r)?;
                     if !seen.insert(("step", step.row, String::new())) {
                         return Err(RefError::malformed(
@@ -240,7 +258,7 @@ impl TapSet {
                     set.steps.push(step);
                 }
                 "tap" => {
-                    let r = need(tap_cols.as_ref(), "tap", &at)?.row(line, &at)?;
+                    let r = need(&tap_cols, "tap", &at)?.row(line, &at)?;
                     let tap = tap_row(&r, &at)?;
                     if !seen.insert(("tap", tap.row, tap.name.clone())) {
                         return Err(RefError::malformed(
@@ -572,19 +590,6 @@ fn one(f: &[&str], at: &dyn fmt::Display, want: &str) -> Result<String, RefError
 
 fn number(v: &str, at: &dyn fmt::Display) -> Result<u32, RefError> {
     crate::columns::parse_field(v, "count", at)
-}
-
-fn need<'a>(
-    cols: Option<&'a Columns>,
-    kind: &str,
-    at: &dyn fmt::Display,
-) -> Result<&'a Columns, RefError> {
-    cols.ok_or_else(|| {
-        RefError::malformed(
-            at,
-            format!("a {kind} row before its `# {kind} columns` line"),
-        )
-    })
 }
 
 /// A file name of the set: one component, so a row cannot name a file outside the directory.

@@ -88,7 +88,8 @@ fn write_set(dir: &Path, h: &Header<'_>, extra: &[&str]) {
     );
     lines.extend(extra.iter().map(|l| (*l).to_string()));
     if h.complete {
-        lines.push("# complete\t4\t0".to_string());
+        let taps = lines.iter().filter(|l| l.starts_with("tap\t")).count();
+        lines.push(format!("# complete\t{taps}\t0"));
     }
     put(dir, "MANIFEST.tsv", (lines.join("\n") + "\n").as_bytes());
 }
@@ -342,6 +343,25 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         &["tap\tmtp_eh_proj\t1\tf32\t2\tmtp_eh_proj.r0.f32"],
         &|_| {},
         "a tap at a row # rows does not name",
+    );
+    at(
+        "a tap name gone at every row, the trailer unchanged",
+        &[],
+        &|d| {
+            swap(d, "tap\tffn_moe_topk\t0\ti32\t2\tffn_moe_topk.r0.i32", "");
+            swap(d, "tap\tffn_moe_topk\t2\ti32\t2\tffn_moe_topk.r2.i32", "");
+        },
+        "is not `# complete\t2\t0` on the last line",
+    );
+    at(
+        "a line after the trailer",
+        &[],
+        &|d| {
+            let m =
+                std::fs::read_to_string(d.join("MANIFEST.tsv")).unwrap_or_else(|e| panic!("{e}"));
+            put(d, "MANIFEST.tsv", (m + "# arch\tqwen35moe\n").as_bytes());
+        },
+        "on the last line",
     );
     std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
 }
