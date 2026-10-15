@@ -4433,7 +4433,7 @@ impl PackedSeg {
     }
 }
 
-/// [`FlashGqaKernels::enqueue_pass`]'s arguments: `m` rows of `n_kv · GROUP`
+/// [`FlashGqaKernels::enqueue_pass`]'s arguments: `m` rows of `n_kv · PACK`
 /// query heads (roped, unscaled, token-major), the layer's two planes of
 /// `n_kv · ctx` rows, each row's live key count on the device (`m` of them),
 /// the partials scratch ([`partials_v_len`], [`partials_ms_len`] of `m`
@@ -4588,7 +4588,14 @@ impl FlashGqaKernels {
         Ok(FlashGqaKernels { module })
     }
 
-    /// Enqueue head-128 attention; refused counts fault and yield NaNs.
+    /// Enqueue `m` rows' attention for `PACK` query heads a key head
+    /// (`GROUP`, or `GROUP_5` with `mma` false): the segment pass
+    /// (`m · n_kv · [`SEGMENTS`]` blocks; the tensor-core one when `mma`)
+    /// and the merge (`m · n_kv · PACK` blocks). Each block cuts its row's
+    /// range from the row's own count, so every count the kernels accept is
+    /// walked in full; a count of zero or past `ctx` raises
+    /// [`FaultSite::KeyCount`] on `a.fault` and its row is NaN. Two launches.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_pass<const PACK: usize>(
         &self,
         stream: &CudaStream,
