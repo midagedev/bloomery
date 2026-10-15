@@ -589,11 +589,8 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                 try:
                     q.cancel(jid, timeout=min(30.0, max(0.001, cancel_from + q.cancel_wait_s - time.monotonic())))
                 except Down:
-                    # the daemon is not there to take it: ask again at the next poll, within the cancel wait
-                    if len(trap.sigs) > 1 or time.monotonic() - cancel_from >= q.cancel_wait_s:
-                        st = last["status"] if last else "unknown"
-                        raise Refusal(LOST, "cancel-pending",
-                                      f"job {jid} is still {st} after the cancel; check it on the box")
+                    # the daemon is not there to take it: ask again at the next poll, within the cancel wait (the loop's
+                    # first check ends it past the wait or on a second signal)
                     pause(trap, kids, min(q.poll_s, max(0.0, cancel_from + q.cancel_wait_s - time.monotonic())))
                     continue
                 cancel_at = cancel_from
@@ -620,9 +617,6 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                     queued_at = None
                 if job["status"] in TERMINAL:
                     break
-            if cancel_at is not None and (len(trap.sigs) > 1 or time.monotonic() - cancel_at >= q.cancel_wait_s):
-                st = last["status"] if last else "unknown"
-                raise Refusal(LOST, "cancel-pending", f"job {jid} is still {st} after the cancel; check it on the box")
             if cancel_from is not None:
                 wait = min(wait, max(0.0, cancel_from + q.cancel_wait_s - time.monotonic()))
             pause(trap, kids, wait)
