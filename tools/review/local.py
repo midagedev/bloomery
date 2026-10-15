@@ -216,10 +216,9 @@ def device_dirs(base_tree, out, base_sha=None):
     if cache and os.path.isfile(cache):
         shutil.copy(cache, out)
         return
-    # review.yml pins stable: cargo metadata must not install the nightly the base tree names.
-    env = dict(os.environ, RUSTUP_TOOLCHAIN="stable")
+    # No toolchain override: rustup reads rust-toolchain.toml. install.sh installs only that channel, not stable.
     p = subprocess.run([sys.executable, os.path.join(base_tree, "tools/review/post.py"), "device", "--root", base_tree,
-                        "--out", out], capture_output=True, text=True, env=env)
+                        "--out", out], capture_output=True, text=True)
     if p.returncode:
         raise Stop(70, f"pre-review: post.py device failed: {p.stderr.strip()[:200]}")
     if cache:
@@ -710,8 +709,8 @@ def self_test():
             device_dirs(t, outs[2], "sha-b")
             expect(ran == [1, 1] and open(outs[1]).read() == "crates/gpu/\n" and published == ["crates/gpu/\n", "crates/gpu/\n"],
                    f"device dirs run once per base sha and replace the cache whole: ran {len(ran)}, published {published}")
-            expect(envs == ["stable", "stable"],
-                   f"post.py device runs under RUSTUP_TOOLCHAIN=stable: {envs}")
+            expect(envs == [None, None],
+                   f"post.py device does not force RUSTUP_TOOLCHAIN: {envs}")
         finally:
             os.replace = real_replace
             subprocess.run = real_run
@@ -892,17 +891,23 @@ def self_test():
                 rc = e.code
             expect(rc == 0 and any("pre-checks skipped" in m for m in skipped),
                    f"--no-pre-checks skips a red pre-check and the review ends 0: {rc} {skipped}")
-            # context seconds start after the pre-checks: a slow check is not part of them
-            open(os.path.join(repo, "tools/check-levers.sh"), "w").write("sleep 1.2\nexit 0\n")
+            # context seconds start after the pre-checks: the clock, not a sleep, places that boundary
+            from types import SimpleNamespace
+            from unittest.mock import patch
+
+            open(os.path.join(repo, "tools/check-levers.sh"), "w").write("exit 0\n")
             sh("git", "add", "-A")
-            sh("git", "commit", "-qm", "topic: a slow pre-check")
+            sh("git", "commit", "-qm", "topic: a timing pre-check")
             runner("**Verdict: CLEAN**: fine\n\n### Checked\nall")
             buf = io.StringIO()
-            a = argparse.Namespace(base="basebr", full=False, minutes=10, body=None, no_pre_checks=False)
-            with contextlib.redirect_stdout(buf):
+            a = argparse.Namespace(base="basebr", full=False, minutes=10,
+                                   body=None, no_pre_checks=False)
+            ticks = iter((0, 0, 10, 10, 11, 11))
+            fake_time = SimpleNamespace(time=lambda: next(ticks))
+            with patch.dict(g, time=fake_time), contextlib.redirect_stdout(buf):
                 rc = review(a, stubbed=True, say=lambda m: None)
             ctx_s = re.search(r"context (\d+) s", buf.getvalue())
-            expect(rc == 0 and ctx_s is not None and int(ctx_s.group(1)) == 0,
+            expect(rc == 0 and ctx_s is not None and int(ctx_s.group(1)) == 1,
                    f"context time starts after pre-checks: {buf.getvalue()!r}")
         finally:
             os.chdir(cwd)
