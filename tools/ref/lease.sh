@@ -492,7 +492,7 @@ lease_bounded() {
 # lease_out_init: a temp dir for the runner's own shell to capture a lease_bounded command's output in
 # (LEASE_OUT_FILE, and LEASE_OUT_FIFO for a live filter; pass either as LEASE_BOUNDED_OUT), removed by lease_out_clean, which it adds to
 # the runner's EXIT trap without replacing it (call it again after a later `trap … EXIT`).
-LEASE_OUT_DIR='' LEASE_OUT_FILE='' LEASE_OUT_FIFO=''
+LEASE_OUT_DIR='' LEASE_OUT_FILE='' LEASE_OUT_FIFO='' LEASE_OUT=''
 lease_out_clean() {
   [ -z "$LEASE_OUT_DIR" ] || { rm -f "$LEASE_OUT_FILE" "$LEASE_OUT_FIFO"; rmdir "$LEASE_OUT_DIR" 2> /dev/null; }
   return 0
@@ -1376,6 +1376,17 @@ EOF
     check bounded-capture-comment-exit-ran "$(cat "$t/comment-marker")" runner
     cdir=$(cat "$t/comment-dir")
     check bounded-capture-comment-exit-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
+    RC=0
+    lease_capture 5 bash -c '
+      set -u
+      source "$1"
+      mktemp() { return 1; }
+      rc=0
+      lease_capture 10 true || rc=$?
+      printf "rc=%s out=[%s]\n" "$rc" "$LEASE_OUT"
+    ' _ "$LEASE_TREE/tools/ref/lease.sh" || RC=$?
+    check bounded-capture-init-failure-rc "$RC" 0
+    check bounded-capture-init-failure-output "$LEASE_OUT" 'rc=70 out=[]'
     RC=0
     lease_filter 10 stdout "$t/filter-both" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-filter-command-rc "$RC" 3
