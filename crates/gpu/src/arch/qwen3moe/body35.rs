@@ -3219,6 +3219,14 @@ impl Slots for Body35 {
     /// rows and host sums are a call's scratch. Load-time allocation.
     fn new_seq(&mut self, gpu: &Gpu) -> Result<Slot35, GpuError> {
         const WHAT_N: &str = "qwen35moe::Body35::new_seq";
+        // The draft K/V is one cache on the body, so a second sequence
+        // would attend to the first sequence's rows.
+        if self.mtp.is_some() {
+            return Err(GpuError::shape(
+                WHAT_N,
+                "an in-file MTP load supports one resident sequence",
+            ));
+        }
         if self.lanes > PLAIN_LANES {
             return Err(GpuError::shape(
                 WHAT_N,

@@ -25,7 +25,9 @@
 //!   the logits the card wrote, on every step of (s).
 //! - (r) refusals by name on the live draft: a position past its K/V rows, a
 //!   token past the vocabulary and a hidden row too short leave the load as
-//!   it was, and the step they interrupted repeats to the same token.
+//!   it was, and the step they interrupted repeats to the same token. A
+//!   second resident sequence (`add_slots(2)`) is refused by name and the
+//!   load keeps its one slot.
 //! - (s) the draft's acceptance against the target: a 64-id prompt through the target,
 //!   one step at a time for its own next tokens and in one pass for its
 //!   final-norm rows; the draft is then fed each position in order — the
@@ -257,14 +259,9 @@ mod gate {
     /// The deterministic values of (j): a xorshift stream mapped to
     /// `[-1, 1)` times `scale`.
     fn values(n: usize, seed: u64, scale: f32) -> Vec<f32> {
-        let mut s = seed;
+        let mut rng = bloomery_gpu_gates::GateRng(seed);
         (0..n)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * scale
-            })
+            .map(|_| (2.0 * rng.unit() - 1.0) * scale)
             .collect()
     }
 
@@ -515,6 +512,19 @@ mod gate {
         println!(
             "(r) the step the refusals interrupted repeats: token {again} (before: {last}) {}",
             verdict(same)
+        );
+        let extra = m.add_slots(2);
+        let text = extra.as_ref().err().map(ToString::to_string);
+        let named = text
+            .as_deref()
+            .is_some_and(|e| e.contains("one resident sequence"));
+        let kept = m.slots() == 1;
+        ok &= named && kept;
+        println!(
+            "(r) a second resident sequence: {} slots {} {}",
+            text.as_deref().unwrap_or("accepted"),
+            m.slots(),
+            verdict(named && kept)
         );
         Ok(ok)
     }
