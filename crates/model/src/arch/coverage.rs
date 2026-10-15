@@ -2201,10 +2201,12 @@ mod tests {
                 GgmlType::Q6_K,
                 GgmlType::F16,
                 GgmlType::IQ4_XS,
+                GgmlType::IQ2_XXS,
             ] {
                 assert_eq!(embed(program, ty), Vec::<String>::new(), "{program:?} {ty}");
             }
-            for ty in [GgmlType::IQ2_XXS, GgmlType::IQ1_S, GgmlType::I8] {
+            // PIN(2026-10-16): IQ2_XXS joined the embedding's set when `dequant_row` began to decode it.
+            for ty in [GgmlType::IQ1_S, GgmlType::I8] {
                 assert_eq!(
                     embed(program, ty),
                     [format!(
