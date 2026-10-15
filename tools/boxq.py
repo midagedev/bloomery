@@ -934,6 +934,8 @@ class Fix:
         os.makedirs(bindir)
         self.script(os.path.join(bindir, "tail"),
                     f'echo $$ >> {q(self.tail_pids)}\nexec {q(shutil.which("tail"))} "$@"\n')
+        if not shutil.which("stdbuf"):  # a Mac: the box's `stdbuf -o0 tail` runs here as plain tail
+            self.script(os.path.join(bindir, "stdbuf"), 'shift\nexec "$@"\n')
         self.script(self.ssh, f'printf "%s\\n" "$*" >> {q(self.ssh_log)}\nfor last; do :; done\n'
                               f'if [ -f {q(self.replay_fail)} ]; then\n'
                               f'  case "$last" in\n'
@@ -1450,29 +1452,20 @@ def case_reconnect_wall(fx):
         raise Down("daemon-down", "GET /jobs/j1: no reply")
 
     q.job = job
-    real_say = globals()["say"]
-    globals()["say"] = lambda msg: None
-    try:
-        try:
-            with_clock(clock, lambda: attach_job(q, "j1", fx.rc_dir, ClockTrap(clock)))
-            raised = None
-        except Down as e:
-            raised = e
-    finally:
-        globals()["say"] = real_say
-    check(raised is not None and raised.name == "daemon-down" and raised.line == RESUME_LINE.format(jid="j1"),
+    raised = _cancel_run(fx, q, clock, sigs=())
+    check(isinstance(raised, Down) and raised.name == "daemon-down" and raised.line == RESUME_LINE.format(jid="j1"),
           f"a budget past ends in 84 with the resume line: {raised!r}")
     # two misses and their sleeps, the third miss at 100 s, then the budget of 30 s: 130 s, not 150 or more
     check(clock.t <= 131.0, f"the budget counts the requests' time: the attach ended at {clock.t:g} s, 131 s at most")
     check(min(asked) < 30.0, f"a poll inside the budget is asked for no longer than what is left: {asked}")
 
 
-def _cancel_run(fx, q, clock):
+def _cancel_run(fx, q, clock, sigs=(signal.SIGINT,)):
     real_say = globals()["say"]
     globals()["say"] = lambda msg: None
     try:
         try:
-            with_clock(clock, lambda: attach_job(q, "j1", fx.rc_dir, ClockTrap(clock, [signal.SIGINT])))
+            with_clock(clock, lambda: attach_job(q, "j1", fx.rc_dir, ClockTrap(clock, sigs)))
             return None
         except Refusal as e:
             return e
@@ -1540,12 +1533,12 @@ def case_cancel_deadline(fx):
 
 def case_drain_full_pipe(fx):
     """A reader that never reads cannot hold the client: the write does not block, the unwritten bytes are not counted,
-    and a SIGTERM during the stall exits 143. The source pipe is 4 KiB, and each fill writes at most one pipe buffer,
-    so drain runs before that write can block."""
+    and a SIGTERM during the stall exits 143. Where the platform can shrink a pipe (Linux), each is 4 KiB so the stall
+    comes in a few writes; each fill writes at most one pipe buffer, so drain runs before that write can block."""
     src_r, src_w = os.pipe()
     dst_r, dst_w = os.pipe()
     os.set_blocking(src_r, False)
-    for fd in (src_r, src_w, dst_r, dst_w):
+    for fd in (src_r, src_w, dst_r, dst_w) if hasattr(fcntl, "F_SETPIPE_SZ") else ():
         fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, 4096)
     t = Tail(None, src_r, dst_w)
 
