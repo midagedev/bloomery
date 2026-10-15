@@ -171,7 +171,7 @@ mod tests {
         std::fs::write(d.join("p.logits.f32"), logits).unwrap_or_else(|e| panic!("{e}"));
         match LogitsSet::open(&d, &LOGITS) {
             Err(RefError::Malformed { what, .. }) => {
-                assert!(what.contains("non-finite logit at index 1"), "{what}");
+                assert!(what.contains("non-finite value at index 1"), "{what}");
             }
             other => panic!("a non-finite logit: {other:?}"),
         }

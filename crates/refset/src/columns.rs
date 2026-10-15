@@ -159,14 +159,21 @@ pub(crate) fn read_bytes(path: &Path, want: u64, file: &str) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
-/// `want` little-endian f32 values of `path`.
+/// `want` little-endian f32 values of `path`, each finite (a reference value is never NaN or infinite).
 pub(crate) fn read_f32(path: &Path, want: u64, file: &str) -> Result<Vec<f32>, RefError> {
-    Ok(read_bytes(path, want, file)?
+    let values: Vec<f32> = read_bytes(path, want, file)?
         .as_chunks::<4>()
         .0
         .iter()
         .map(|c| f32::from_le_bytes(*c))
-        .collect())
+        .collect();
+    if let Some(i) = values.iter().position(|v| !v.is_finite()) {
+        return Err(RefError::malformed(
+            path.display(),
+            format!("non-finite value at index {i}"),
+        ));
+    }
+    Ok(values)
 }
 
 /// Little-endian i32 values, four bytes each (the caller has checked the length).

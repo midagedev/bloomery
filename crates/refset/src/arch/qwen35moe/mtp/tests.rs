@@ -447,6 +447,24 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         "no trunk row",
     );
     at(
+        "a NaN in a tap file",
+        &[],
+        &|d| put(d, "mtp_eh_proj.r2.f32", &f32s(&[f32::NAN, 0.5])),
+        "non-finite value at index 0",
+    );
+    at(
+        "an infinity in the trunk file",
+        &[],
+        &|d| {
+            put(
+                d,
+                "trunk_h.f32",
+                &f32s(&[0., 1., 2., f32::INFINITY, 4., 5., 6., 7.]),
+            )
+        },
+        "non-finite value at index 3",
+    );
+    at(
         "a step row gone",
         &[],
         &|d| swap(d, "step\t2\t13\t2\t8\t8", ""),

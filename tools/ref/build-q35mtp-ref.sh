@@ -20,7 +20,9 @@ OUT=${Q35MTP_OUT:-$BLOOMERY_DATA/bin}
 SRC=$HERE/tools/ref/q35mtp_ref.cpp
 L=$MTP_LCPP
 git_lcpp() { git -c safe.directory="$L" -C "$L" "$@"; }
-if [ -n "$(git_lcpp status --porcelain --untracked-files=no)" ]; then
+# A failed query ends the build (set -e on the assignment), so an unreadable index is not read as a clean tree.
+dirty=$(git_lcpp status --porcelain --untracked-files=no)
+if [ -n "$dirty" ]; then
   echo "build-q35mtp-ref: $L has tracked changes; the oracle is the commit's build, not an edited tree" >&2
   exit 2
 fi

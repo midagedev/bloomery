@@ -187,15 +187,11 @@ impl LogitsSet {
 
     /// Prompt `p`'s last-position logits, `n_vocab` f32, little-endian.
     pub fn logits(&self, p: &Prompt) -> Result<Vec<f32>, RefError> {
-        let path = self.dir.join(&p.logits_file);
-        let out = crate::columns::read_f32(&path, u64::from(p.n_vocab), &p.logits_file)?;
-        if let Some(i) = out.iter().position(|v| !v.is_finite()) {
-            return Err(RefError::malformed(
-                path.display(),
-                format!("non-finite logit at index {i}"),
-            ));
-        }
-        Ok(out)
+        crate::columns::read_f32(
+            &self.dir.join(&p.logits_file),
+            u64::from(p.n_vocab),
+            &p.logits_file,
+        )
     }
 
     fn check_prompt(&self, p: &Prompt) -> Result<(), RefError> {

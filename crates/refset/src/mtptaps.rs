@@ -407,7 +407,14 @@ impl TapSet {
             ));
         }
         for t in &self.taps {
-            read_bytes(&self.dir.join(&t.file), u64::from(t.n), &t.file)?;
+            match t.elem {
+                Elem::F32 => {
+                    self.tap_f32(&t.name, t.row)?;
+                }
+                Elem::I32 => {
+                    read_bytes(&self.dir.join(&t.file), u64::from(t.n), &t.file)?;
+                }
+            }
         }
         Ok(())
     }

@@ -425,6 +425,11 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "q35mtp_ref: tapped vs untapped logits: worst |d| %.6g over every step, %.6g over the tapped rows; "
                     "argmax equal at %d/%d steps, %d/%zu tapped rows\n",
             worst_all, worst_rows, same_all, steps, same_rows, rows.size());
+    // Tapping must not move the oracle: the tapped run's logits equal the untapped run's on every step.
+    if (worst_all != 0.0 || same_all != steps) {
+        return fail("the tapped run's logits differ from the untapped run's; the set is not written",
+                    std::to_string(worst_all));
+    }
 
     const std::string final_path = out + "/MANIFEST.tsv";
     const std::string partial_path = final_path + ".partial";
