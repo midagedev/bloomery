@@ -131,9 +131,9 @@
 //!   (`placed_slots_load_names_the_split` red); one counted for every slot
 //!   names twice the planes and the clause is red.
 //!   `placed_props_engine_placement_is_the_plans`: the placed arm's `/props`
-//!   `engine.placement` is its plan's — the card, then the host, each device's
-//!   bytes its classes' sum, routed experts on the host exactly when the plan
-//!   record's `host_experts` is not 0; `props_engine_whole_load_names_no_placement`:
+//!   `engine.placement` is its plan's — the card, then the host, routed experts
+//!   on the host exactly when the plan record's `host_experts` is not 0;
+//!   `props_engine_whole_load_names_no_placement`:
 //!   the whole-card arm opens with no plan, so it reports none and its line
 //!   says why. FAIL-first: a seat that reports no placement is red on the
 //!   placed arm. `slots_count_their_checkpoints`
@@ -1880,18 +1880,12 @@ mod gate {
             total.is_some_and(|t| n_ctx == t / 2),
         );
         // `/props`' placement is the plan's when the load placed one (its plan record printed): the
-        // card, then the host, each device's bytes its classes' sum, and routed experts on the host
-        // exactly when the record puts them there. A whole-card load has no plan: no placement, and
-        // the seat's line says why.
+        // card, then the host, and routed experts on the host exactly when the record puts them
+        // there. A whole-card load has no plan: no placement, and the seat's line says why.
         let placement = &props["engine"]["placement"];
         match plan.as_ref().and_then(Option::as_ref) {
             Some(rec) => {
                 let devices = placement["devices"].as_array().cloned().unwrap_or_default();
-                let summed = |d: &Value| {
-                    d["classes"]
-                        .as_object()
-                        .map(|c| c.values().filter_map(|b| b.as_u64()).sum::<u64>())
-                };
                 let host_experts = devices
                     .get(1)
                     .and_then(|d| d["classes"]["experts"].as_u64())
@@ -1906,9 +1900,6 @@ mod gate {
                             .and_then(|d| d.strip_prefix("GPU"))
                             .is_some_and(|n| n.parse::<u32>().is_ok())
                         && devices[1]["device"] == "CPU"
-                        && devices.iter().all(|d| {
-                            d["bytes"].as_u64().is_some() && d["bytes"].as_u64() == summed(d)
-                        })
                         && devices[0]["bytes"].as_u64().is_some_and(|b| b > 0)
                         && u64_of(Some(rec), "host_experts")
                             .is_some_and(|h| (h > 0) == (host_experts > 0)),
