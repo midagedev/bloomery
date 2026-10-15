@@ -13,6 +13,7 @@ The card changes when a run may start, never what a runner measures.
   card.py check <file> [--rounds N] [--round-minutes M]
   card.py lease <path> [--rounds N] [--round-minutes M]
   card.py verdict <file> <ratio>...
+  card.py new <kind> <file> --<key> <value>... [--comment <text>]...
 
 check   validates <file>, any path, and prints `card: ok …`, or `card: refused <NAME> (rc <n>): …` on
         stderr with the exit code below.
@@ -29,6 +30,12 @@ verdict a noninf card's outcome after its sitting: <ratio>... are the per-round 
         falls in, and that region's decision. Exit 0 on pass, 1 on fail. The runners' line is
         <bare arm> / <arm with an @ list>, so the changed arm is the bare one: a placement A/B sets
         the changed placement in BLOOMERY_GEN_PLACE and the base as the other arms' @place=.
+new     writes a new card at <file> (it must not exist) from one `--<key> <value>` pair per key, in the
+        format's key order, a value wrapped at 110 columns onto two-space continuation lines, each
+        `--comment` a `#` line above the keys (ORDER, the example cards' order). The text goes through `check` before anything is written:
+        a refusal prints as `check` prints it and writes nothing. It prints `card: wrote <file>` and the
+        check's lines. A flag that names no key, a key given twice, a value with a line break and an
+        existing <file> are usage errors (64).
 --rounds N         the runner's actual round count: an ab or noninf card is checked at N instead of
                    its own `rounds`, and a difference is printed. The other kinds take no rounds and
                    ignore it.
@@ -486,11 +493,85 @@ def lease_path(arg):
     return path
 
 
+WRAP = 110
+ORDER = ('question', 'term', 'unit', 'predict', 'rounds', 'sd', 'margin', 'condition', 'reason', 'minutes',
+         'decide-in', 'decide-below', 'decide-above')
+
+
+def wrapped(first, text, indent):
+    """`text` after `first`, broken at spaces into lines of at most WRAP columns, each line after the
+    first opened by `indent`; a word longer than a line stays whole."""
+    lines, line = [], first
+    for word in text.split():
+        if line not in (first, indent) and len(line) + 1 + len(word) > WRAP:
+            lines.append(line)
+            line = indent
+        line = f'{line}{word}' if line in (first, indent) else f'{line} {word}'
+    lines.append(line)
+    return lines
+
+
+def render(kind, values, comments):
+    """A card's text: the comments, `kind`, then the given keys in ORDER (the example cards' order;
+    a key the kind does not take is written too, and `check` refuses it by name)."""
+    lines = []
+    for c in comments:
+        lines += wrapped('# ', c, '# ')
+    lines.append(f'kind: {kind}')
+    for k in ORDER:
+        if k in values:
+            lines += wrapped(f'{k}: ', values[k], '  ')
+    return '\n'.join(lines) + '\n'
+
+
+def new(argv, usage):
+    """`card.py new`: render, check, then write; nothing is written on a refusal."""
+    if len(argv) < 2:
+        print(usage, file=sys.stderr)
+        return USAGE
+    kind, out, rest = argv[0], argv[1], argv[2:]
+    values, comments = {}, []
+    while rest:
+        flag = rest.pop(0)
+        key = flag[2:] if flag.startswith('--') else ''
+        if not rest or not (key == 'comment' or key in KEYS - {'kind'}):
+            print(f'card.py: new: {flag!r} names no key of a card (or has no value); {usage}', file=sys.stderr)
+            return USAGE
+        value = rest.pop(0)
+        if '\n' in value or '\r' in value:
+            print(f'card.py: new: --{key} holds a line break; give it as one line', file=sys.stderr)
+            return USAGE
+        if key == 'comment':
+            comments.append(value)
+        elif key in values:
+            print(f'card.py: new: --{key} given twice', file=sys.stderr)
+            return USAGE
+        else:
+            values[key] = value
+    if os.path.lexists(out):
+        print(f'card.py: new: {out} exists; new writes a new card only', file=sys.stderr)
+        return USAGE
+    text = render(kind, values, comments)
+    try:
+        notes, verdict = check(text, None, None)
+    except Refused as e:
+        return refuse(e, f'{out} (not written)', '')
+    with open(out, 'x', encoding='utf-8') as f:
+        f.write(text)
+    print(f'card: wrote {out}')
+    for line in notes:
+        print(f'card: {line}')
+    print(f'card: {verdict}')
+    return 0
+
+
 def main(argv):
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding='utf-8')
     usage = ('usage: card.py check <file> | lease <docs/cards/<slug>.card> [--rounds N] [--round-minutes M]'
-             ' | verdict <file> <ratio>...')
+             ' | verdict <file> <ratio>... | new <kind> <file> --<key> <value>... [--comment <text>]...')
+    if argv[:1] == ['new']:
+        return new(argv[1:], usage)
     if len(argv) < 2 or argv[0] not in ('check', 'lease', 'verdict'):
         print(usage, file=sys.stderr)
         return USAGE

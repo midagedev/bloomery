@@ -241,6 +241,37 @@ card under-ruler.card 68 'box minutes at 5 rounds: 5 x 2\.5 = 12\.5 min' --round
 card under-ruler.card 68 'box minutes: unknown'
 card under-ruler.card 0 'the runner runs 5 rounds and the card says 3: checked at 5' --rounds 5
 card valid-ab.card 68 'the runner runs 2 rounds and the card says 4: checked at 2' --rounds 2
+# card.py new: render, check, then write; a refusal writes nothing.
+newc() {
+  local name=$1 want=$2 pat=$3
+  shift 3
+  run "new $name" "$want" "$pat" python3 "$ROOT/tools/ref/card.py" new "$@"
+}
+NEWAB=(--question q --term "tok/s @ n=96, depth 6, A6000" --unit % --rounds 4 --condition c --decide-in a
+  --decide-below b --decide-above c)
+newc ab-written 0 '^card: wrote .*/new-ab\.card$' ab "$tmp/new-ab.card" --predict +18..+28 "${NEWAB[@]}" \
+  --comment "a comment line"
+has "new ab-checked" 'ok kind=ab h = 1\.038 % at 4 rounds'
+run "new ab-round-trip" 0 'ok kind=ab h = 1\.038 %' python3 "$ROOT/tools/ref/card.py" check "$tmp/new-ab.card"
+if [ "$(sed -n 2p "$tmp/new-ab.card")" = 'kind: ab' ] && [ "$(sed -n 7p "$tmp/new-ab.card")" = 'rounds: 4' ]; then
+  pass "new ab-order"
+else
+  fail "new ab-order" "line 2 not kind, or line 7 not rounds" "$tmp/new-ab.card"
+fi
+newc exists 64 'exists; new writes a new card only' ab "$tmp/new-ab.card" --predict +18..+28 "${NEWAB[@]}"
+newc under-ruler 68 'refused CARD_UNDER_RULER \(rc 68\).*\(not written\)' ab "$tmp/new-ruler.card" \
+  --predict +0.1..+0.2 "${NEWAB[@]}"
+if [ -e "$tmp/new-ruler.card" ]; then fail "new under-ruler-unwritten" "the refused card was written"; else pass "new under-ruler-unwritten"; fi
+newc malformed 65 "no \`reason\` \(kind baseline requires it\)" baseline "$tmp/new-base.card" --question q
+newc bad-flag 64 "'--bogus' names no key" ab "$tmp/new-flag.card" --bogus x
+newc twice 64 '--unit given twice' ab "$tmp/new-twice.card" --unit % --unit %
+newc wrap 0 '^card: wrote' profile "$tmp/new-wrap.card" --question "$(printf 'word %.0s' $(seq 1 40))" --term t --unit ms \
+  --predict 1..2 --condition c --decide-in a --decide-below b --decide-above c
+if awk 'length > 110 { bad = 1 } END { exit bad }' "$tmp/new-wrap.card" && grep -q '^  word' "$tmp/new-wrap.card"; then
+  pass "new wrap-110"
+else
+  fail "new wrap-110" "a line past 110 columns, or no continuation line" "$tmp/new-wrap.card"
+fi
 card straddle.card 68 'contains 0, so its nearest edge is 0: no round count resolves it'
 card sd-override.card 0 'h = 1\.020 % at 3 rounds .*sd 0\.45 % — a paired ratio SD'
 card sd-no-source.card 65 'names no source'
