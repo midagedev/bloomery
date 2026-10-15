@@ -1,4 +1,4 @@
-# Why mamba2_step and the ssm_out q4k_gemv sit under their byte rate (nemotron-ncu-q4k-scan.card: ~210 and ~465
+# Why mamba2_step and the ssm_out q4k_gemv sit under their byte rate (nemotron-ncu-q4k-scan.card's run record: ~210 and ~465
 # GB/s of DRAM traffic): their warp stall reasons and achieved occupancy, so the lever (grid, split-K, ILP) comes
 # from the measurement. Derived from the launch shapes: mamba2_step 480 blocks x 128 threads, q4k_gemv 392 x 256 on
 # 84 SMs, so neither launch fills the card's resident warps for long.

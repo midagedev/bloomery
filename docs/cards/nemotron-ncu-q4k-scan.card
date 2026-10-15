@@ -14,3 +14,6 @@ condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, perf-nemogen 9af670da
 decide-in: q4k_gemv reads its file bytes, so its ~460 GB/s is the kernel: a q4k gemv rate round for engine
 decide-below: no reading below the file's bytes is possible; recheck the launch's shape
 decide-above: the Q4_K resident layout is wider than the file: the same lever as N7d
+# Run record (ncu, RTX A6000, eager mode, perf-nemogen 9af670da (#287), six launches each): the ssm_out q4k_gemv
+# read 13.57 MB of DRAM in 28.6-29.9 us, ~465 GB/s (decide-in); mamba2_step read 4.27 MB and wrote 0.94 MB in
+# 21.3-30.0 us, ~210 GB/s by DRAM bytes (the state write mostly stays in L2).
