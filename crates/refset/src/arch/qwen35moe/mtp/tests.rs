@@ -354,6 +354,18 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         "is not `# complete\t2\t0` on the last line",
     );
     at(
+        "a trailer whose second field is not 0",
+        &[],
+        &|d| swap(d, "# complete\t4\t0", "# complete\t4\t1"),
+        "is not `# complete\t4\t0` on the last line",
+    );
+    at(
+        "a step at another position than its row",
+        &[],
+        &|d| swap(d, "step\t1\t12\t1\t6\t7", "step\t1\t12\t2\t6\t7"),
+        "step row 1",
+    );
+    at(
         "a line after the trailer",
         &[],
         &|d| {
