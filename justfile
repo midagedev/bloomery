@@ -683,6 +683,19 @@ build-ref-hidden:
 dump-hidden-qwen35 *SETS:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/hidden.sh {{SETS}}'
 
+# The Qwen3.6 MTP step oracle's binary: q35mtp_ref (tools/ref/q35mtp_ref.cpp) linked against llama.cpp mainline's libllama in the
+# qwen35moe profile's MTP_LCPP tree (tools/ref/build-q35mtp-ref.sh); builds nothing in that tree.
+build-ref-q35mtp:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/build-q35mtp-ref.sh'
+
+# The Qwen3.6 MTP step oracle set (refset family mtp-qwen35moe-mainline): llama.cpp mainline's graph_mtp over the first 64 prose
+# ids fed teacher-forced (step i: token ids[i+1], position i, the trunk's h_nextn row i), every step run in order, the profile's
+# MTP_TAPS nodes dumped at MTP_ROWS = 0, 5, 31, 62, into $BLOOMERY_DATA/ref-mtp/qwen35moe_mainline_prose64 (tools/ref/dump-q35mtp.sh).
+# Trunk and MTP context on the card box.sh puts in view, through its gate lock; no lease (a functional oracle). `--cpu` runs on the
+# host (no card, no lock); `--tap NAME` (repeatable) replaces the default tap list.
+dump-ref-q35mtp *ARGS:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-q35mtp && bash tools/ref/dump-q35mtp.sh {{ARGS}}'
+
 # Clef-Flash image input, the oracle's binary: dump_mtmd (tools/ref/clefvis/dump_mtmd.cpp) linked against llama.cpp mainline's libmtmd in the qwen35 profile's tree (tools/ref/clefvis/build-clefvis.sh).
 build-clefvis-ref:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'

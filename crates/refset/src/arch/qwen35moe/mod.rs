@@ -7,6 +7,7 @@ use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 pub mod fixture;
+pub mod mtp;
 pub mod vis;
 
 /// The file every qwen35moe set is dumped from and the tree runs. The
@@ -56,6 +57,7 @@ pub static IK: Family = Family {
 pub static FAMILIES: &[&Family] = &[
     &IK,
     &fixture::IK,
+    &mtp::MAINLINE,
     &vis::TAPS,
     &vis::CHATIDS,
     &vis::HIDDEN,

@@ -19,6 +19,7 @@
 //!   `MANIFEST.tsv` and the files its rows name.
 //! - [`dsref`]: ik's DSpark draft sets (`tools/ref/dump_draft.cpp`).
 //! - [`mtpref`]: ik's MTP draft sets (`tools/ref/dump_mtp.cpp`).
+//! - [`mtptaps`]: mainline's MTP step, tap by tap (`tools/ref/q35mtp_ref.cpp`).
 //! - [`greedy`]: ik's greedy continuations (`tools/ref/argmax_ref.cpp`).
 //! - [`kld`]: ik's KL-divergence base runs (`tools/ref/ik-ppl.sh`).
 //! - [`vision`]: the vision encoder's oracle (`tools/ref/vision/dump_vision.py`).
@@ -53,6 +54,7 @@ pub mod ik;
 pub mod kld;
 mod md5;
 pub mod mtpref;
+pub mod mtptaps;
 pub mod nemotron;
 pub mod tokenizer;
 pub mod vision;

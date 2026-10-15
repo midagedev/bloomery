@@ -41,6 +41,15 @@
 #                   budget)), not the up to 4096 a step qwen3moe's prompt gets. An mrspp row of this
 #                   profile is a prefill in 512-token chunks
 #
+#   MTP_LCPP        the mainline tree the MTP step oracle (tools/ref/q35mtp_ref.cpp, `just dump-ref-q35mtp`) links
+#                   against: it carries llama_model_qwen35moe::graph_mtp, the MTP context type and the nextn
+#                   embeddings (llama-ext.h), which LCPP's older tree gives through another batch call
+#   MTP_MODEL       the file that carries the next-token layer (blk.40 and nextn.*): unsloth's UD-Q4_K_M. The
+#                   refset family mtp-qwen35moe-mainline states this path as its identity
+#   MTP_IDS         the prose ids the MTP set feeds (the first MTP_PROMPT of them; the first 64 equal the d1k set's
+#                   prefix), MTP_IDS_SHA256 the check; MTP_ROWS the steps whose taps are dumped, MTP_TAPS the graph's
+#                   own node names read at them (the recipe's default list; q35mtp_ref takes any)
+#
 # Deliberately unset: IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, IK_BEST_FLAGS and REF_PROMPTS. Nobody has
 # read whether ik's fused flags (-fmoe, -mqkv, -muge) apply to build_qwen35moe, and no CPU flag sweep
 # and no prompt set exist for this model. Every script that reads them runs under `set -u`
@@ -65,6 +74,15 @@ REF_DUMP_LEASE=1
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
 : "${LCPP_GPU_FLAGS:=-ngl 99 -fa on}"
+: "${MTP_LCPP:=/home/user/llama.cpp-36a73916}"
+MTP_MODEL=/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+MTP_IDS=${BLOOMERY_DATA:-/root/bloomery-data}/qwen35moe/corpus-prose.ids
+MTP_IDS_SHA256=dca5f89b2903f9ffd2f4e20eec18a9fdf3561bcb531a721a114e4fab68e925be
+MTP_PROMPT=64
+MTP_ROWS=0,5,31,62
+MTP_TAPS=(mtp_hnorm mtp_enorm mtp_concat mtp_eh_proj mtp_attn_out mtp_attn_residual
+  ffn_moe_logits ffn_moe_topk ffn_moe_weights_norm mtp_ffn_moe_out mtp_shared_expert_gate_sigmoid
+  mtp_ffn_shexp_gated mtp_ffn_out mtp_post_ffn h_nextn mtp_shared_head_norm result_output)
 : "${MRS:=/home/user/mistral.rs}"
 : "${MRSBIN:=$MRS/target/release/mistralrs}"
 : "${MRS_FLAGS:=--format gguf}"
