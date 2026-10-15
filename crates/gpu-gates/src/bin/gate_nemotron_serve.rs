@@ -34,9 +34,9 @@
 //! - `completion_ids`: `/completion` at temperature 0, [`N`] tokens, of [`PROSE`] (`/tokenize`)
 //!   and of the chat turn the server's own template renders (`/apply-template`, `/tokenize`),
 //!   each from an empty cache (`cache_prompt: false`), answers the ids `NemotronHModel` gives
-//!   directly on the same ids as the seat runs them (a prompt of several ids through `prefill`,
-//!   one id a step, then each answer fed back), or a prefix of them ending at an end-of-generation
-//!   id. FAIL-first:
+//!   directly on the same ids split as the server feeds the seat (every id but the last through
+//!   `prefill`, the last as a step, then each answer fed back), or a prefix of them ending at an
+//!   end-of-generation id. FAIL-first:
 //!   a prefill that skips the first id moves the ids and the clause is red.
 //! - `chat_is_200`: `/v1/chat/completions` of the same turn at temperature 0 and `max_tokens`
 //!   [`N`] is a 200 whose `usage` counts the prompt's ids and the completion's tokens, and whose
@@ -277,14 +277,21 @@ mod gate {
         Ok(answer)
     }
 
-    /// The prompt `ids` as the seat runs it (`prefill` for several ids, one step for one), from
-    /// where `m` stands, then [`N`] greedy ids.
+    /// The prompt `ids` as the server feeds the seat, from where `m` stands: every id but the
+    /// last through the seat's prompt call (`prefill` for several ids, one step for one), the last
+    /// as the first `next` step; then [`N`] greedy ids.
     fn seat_answer(m: &mut NemotronHModel, ids: &[u32]) -> Result<Vec<u32>, GateError> {
-        let first = if ids.len() > 1 {
-            m.prefill(ids)?
-        } else {
-            m.step(ids)?
-        };
+        let (&last, head) = ids.split_last().ok_or("an empty prompt")?;
+        match head.len() {
+            0 => {}
+            1 => {
+                m.step(head)?;
+            }
+            _ => {
+                m.prefill(head)?;
+            }
+        }
+        let first = m.step(&[last])?;
         continue_from(m, first, N)
     }
 
