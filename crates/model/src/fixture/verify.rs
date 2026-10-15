@@ -2,6 +2,7 @@
 //! sampled chunks byte for byte, each sampled block against its rule, and the
 //! dequantized RMS.
 
+use gguf::iq_tables::IQ2XXS_GRID;
 use gguf::quant::{KVALUES_MXFP4, half_to_f32, ue4m3_to_f32_half};
 use gguf::{Split, Value, dequant_row};
 
@@ -166,6 +167,9 @@ fn block_fault(rule: &Rule, blk: &[u8], y: &[f32], window: Window) -> Option<Str
                 None => Ok(()),
             }
         }),
+        Rule::Iq2Xxs { d, band } => {
+            scale_at(0, "d", *d).and_then(|d| iq2xxs_fault(blk, y, d, band))
+        }
         Rule::Mxfp4 { e_lo, .. } => {
             if blk[0] != *e_lo && blk[0] != e_lo + 1 {
                 Err(format!(
@@ -202,6 +206,44 @@ fn block_fault(rule: &Rule, blk: &[u8], y: &[f32], window: Window) -> Option<Str
         }
     };
     r.err()
+}
+
+/// IQ2_XXS: per 32-value sub-block the scale code `2s + 1` is in `band`, and
+/// each group of eight values `y` is `d·(2s + 1)/8` times the grid entry's bytes
+/// with the signs the seven stored bits give, the eighth the parity that keeps
+/// the group's negatives even.
+fn iq2xxs_fault(blk: &[u8], y: &[f32], d: f32, band: &Band) -> Result<(), String> {
+    for (j, (w, vals)) in blk[2..]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(y.as_chunks::<32>().0)
+        .enumerate()
+    {
+        let aux = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
+        let s = aux >> 28;
+        if !band.holds(2 * s as i32 + 1) {
+            return Err(format!("sub-block {j} scale {s} is outside the band"));
+        }
+        let db = d * (0.5 + s as f32) * 0.25;
+        for (l, group) in vals.as_chunks::<8>().0.iter().enumerate() {
+            let signs = (aux >> (7 * l)) & 127;
+            let grid = IQ2XXS_GRID[usize::from(w[l])].to_le_bytes();
+            for (i, (&v, &g)) in group.iter().zip(&grid).enumerate() {
+                let negative = if i < 7 {
+                    signs >> i & 1 == 1
+                } else {
+                    signs.count_ones() % 2 == 1
+                };
+                if v.abs() != db * f32::from(g) || v.is_sign_negative() != negative {
+                    return Err(format!(
+                        "sub-block {j} group {l} value {i} dequantizes {v}, not the grid byte {g} at scale {s} with its stored sign"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// NVFP4: each sub-block's scale byte is the rule's low byte or its

@@ -80,6 +80,10 @@ const PINS: &[(u32, &[(&str, &str)])] = &[(
             "ad9f292b0574895194e2d3402929bce2d47c66b6faf012a9a726097074679f34",
         ),
         (
+            "iq2_xxs",
+            "68403acb73a2c4d0919537db9bda7e11876c16cd63d38db72e1cd0b977c79bf7",
+        ),
+        (
             "f32",
             "170e80ead00fcfc810f67f86d91c037b2c1e5c9c9575af44121401f10e1d5c81",
         ),
@@ -99,7 +103,7 @@ const PINS: &[(u32, &[(&str, &str)])] = &[(
 )];
 
 /// The types [`rule_for`] takes, in its order.
-const TYPES: [GgmlType; 13] = [
+const TYPES: [GgmlType; 14] = [
     GgmlType::Q3_K,
     GgmlType::Q4_K,
     GgmlType::Q5_K,
@@ -110,6 +114,7 @@ const TYPES: [GgmlType; 13] = [
     GgmlType::IQ4_NL,
     GgmlType::MXFP4,
     GgmlType::NVFP4,
+    GgmlType::IQ2_XXS,
     GgmlType::F32,
     GgmlType::F16,
     GgmlType::BF16,

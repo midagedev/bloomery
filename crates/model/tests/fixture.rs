@@ -111,8 +111,7 @@
 //! The Nemotron 3.5 Bolt spec (`model::arch::nemotron_h_moe::fixture`), the first hybrid with latent
 //! MoE layers of different shapes, NVFP4 mixer projections and per-tensor scales. The synthetic
 //! clauses plan a small `nemotron_h_moe` source of eight layers (its routed and shared experts
-//! Q4_K, where the real file's are IQ2_XXS, which the generator has no rule for) through the
-//! family's own rules; the real header on the box:
+//! IQ2_XXS, as the real file's are) through the family's own rules; the real header on the box:
 //!
 //! 27. the written fixture of the synthetic source verifies, the engine's reader reads its kinds
 //!     and per-layer experts, `expert_count` is the map's largest router, the family's constants
@@ -123,7 +122,9 @@
 //!     a written fixture whose layer holds another layer's experts is refused by name;
 //! 29. the NVFP4 rule: the window holds every (type, K) of the real file's NVFP4 census, filled at
 //!     σ through `gguf::dequant_row`; a K or a window no scale byte pair fits is refused by name;
-//!     a block whose scale byte is not the rule's is refused by name;
+//! 31. the IQ2_XXS rule: the window holds every K of the real file's IQ2_XXS census, filled at σ
+//!     through `gguf::dequant_row`, the signs and scales read back from the written bytes; a K or a
+//!     window no scale fits is refused by name, and a block whose `d` is not the rule's is refused;
 //! 30. the real header: the plan of the four layers `[0, 3, 7, 48]`, the written file verified
 //!     against the source, and the maps that lose a kind or the two shapes refused.
 //!
@@ -4105,11 +4106,10 @@ fn hw_fixture_nemotron_refusals() {
 /// A synthetic `nemotron_h_moe` source of eight layers at small widths, one unsplit file: Mamba-2
 /// at layers 0, 2 and 5, attention at 4, latent MoE at 1 (8 experts × 256 wide), 3 (12 × 512), 6
 /// (8 × 256) and 7 (10 × 256), `expert_count` 12. Layer 6's `ffn_down_shexp` is Q5_0 and the other
-/// MoE layers' Q4_K, one stem of two types; the routed and shared experts are Q4_K where the real
-/// file's are IQ2_XXS, which the generator has no rule for. The tensors are zeros: the generator
-/// reads the header alone.
+/// MoE layers' IQ2_XXS, one stem of two types; the routed and shared experts are IQ2_XXS as the real
+/// file's are. The tensors are zeros: the generator reads the header alone.
 fn bolt_source(path: &Path, extra_kvs: &[(&str, Value)]) -> Split {
-    use GgmlType::{F32, NVFP4, Q4_K, Q5_0, Q8_0};
+    use GgmlType::{F32, IQ2_XXS, NVFP4, Q5_0, Q8_0};
     const E: u64 = 256;
     let name = |l: usize, stem: &str| format!("blk.{l}.{stem}");
     let mamba = |l: usize| {
@@ -4143,9 +4143,9 @@ fn bolt_source(path: &Path, extra_kvs: &[(&str, Value)]) -> Split {
             (name(l, "exp_probs_b.bias"), vec![n], F32),
             (name(l, "ffn_latent_down.weight"), vec![E, 256], Q8_0),
             (name(l, "ffn_latent_up.weight"), vec![256, E], Q8_0),
-            (name(l, "ffn_up_exps.weight"), vec![256, w, n], Q4_K),
-            (name(l, "ffn_down_exps.weight"), vec![w, 256, n], Q4_K),
-            (name(l, "ffn_up_shexp.weight"), vec![E, 256], Q4_K),
+            (name(l, "ffn_up_exps.weight"), vec![256, w, n], IQ2_XXS),
+            (name(l, "ffn_down_exps.weight"), vec![w, 256, n], IQ2_XXS),
+            (name(l, "ffn_up_shexp.weight"), vec![E, 256], IQ2_XXS),
             (name(l, "ffn_down_shexp.weight"), vec![256, E], shexp_down),
         ]
     };
@@ -4157,11 +4157,11 @@ fn bolt_source(path: &Path, extra_kvs: &[(&str, Value)]) -> Split {
     for l in 0..8 {
         tensors.extend(match l {
             0 | 2 | 5 => mamba(l),
-            1 => moe(l, 8, 256, Q4_K),
-            3 => moe(l, 12, 512, Q4_K),
+            1 => moe(l, 8, 256, IQ2_XXS),
+            3 => moe(l, 12, 512, IQ2_XXS),
             4 => attn(l),
             6 => moe(l, 8, 256, Q5_0),
-            _ => moe(l, 10, 256, Q4_K),
+            _ => moe(l, 10, 256, IQ2_XXS),
         });
     }
     let arr = |v: &[i32]| Value::Array(v.iter().map(|&x| Value::I32(x)).collect());
@@ -4257,7 +4257,7 @@ fn bolt_kv<'a>(p: &'a Plan, suffix: &str) -> &'a Value {
         .1
 }
 
-/// Contract 27: the synthetic source's fixture is written and verified (NVFP4, Q8_0, Q4_K, Q5_0
+/// Contract 27: the synthetic source's fixture is written and verified (NVFP4, Q8_0, IQ2_XXS, Q5_0
 /// blocks, the F32 constants), read by the engine's reader as [Mamba-2, MoE, attention, MoE] with
 /// the source layers' experts, its per-layer arrays at the map's layers, `expert_count` the map's
 /// largest router (10 on a map without the 12-expert layer), and the family's constants land: the
@@ -4386,9 +4386,9 @@ fn fixture_bolt_refuses_a_map_that_loses_a_kind_a_pair_or_a_shape() {
             vec!["ffn_down_shexp.weight", "q5_0", "source layer 6"],
         ),
         (
-            "ffn_down_shexp Q4_K dropped (layer 1 the first)",
+            "ffn_down_shexp IQ2_XXS dropped (layer 1 the first)",
             vec![0, 4, 6],
-            vec!["ffn_down_shexp.weight", "q4_K", "source layer 1"],
+            vec!["ffn_down_shexp.weight", "iq2_xxs", "source layer 1"],
         ),
     ] {
         let s = FixtureSpec {
@@ -4498,6 +4498,62 @@ fn fixture_bolt_nvfp4_rule_fills_at_sigma() {
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }
 
+/// Contract 31: the spec's window holds every IQ2_XXS K of the real file's census (1,024 for the
+/// routed up stack, 1,536 and 2,560 for its down stack, 4,096 and 5,376 for the shared expert), a
+/// filled chunk of each dequantizes to an RMS within ±10 % of `1/√K` after every block passes
+/// `check_units` (the scale in the band, each value the grid byte at its scale and stored sign, the
+/// eighth sign of a group the parity of the other seven). A K and a window no scale reaches are refused by name; a block
+/// whose `d` is not the rule's is refused by name, and the unchanged block passes.
+#[test]
+fn fixture_bolt_iq2_xxs_rule_fills_at_sigma() {
+    let window = bolt::spec().window;
+    let mut bad = Vec::new();
+    for k in [1024, 1536, 2560, 4096, 5376] {
+        let ty = GgmlType::IQ2_XXS;
+        let t = match rule_for("t", ty, k, window) {
+            Ok(rule) => one_chunk(ty, k, rule),
+            Err(e) => {
+                bad.push(format!("{ty} K = {k}: {e}"));
+                continue;
+            }
+        };
+        match filled_ratio(&t, window) {
+            Ok(r) if (0.9..=1.1).contains(&r) => {
+                println!(
+                    "bolt window: {ty} K = {k}: {}; RMS / sigma = {r:.4}",
+                    t.rule.describe()
+                );
+            }
+            Ok(r) => bad.push(format!("{ty} K = {k}: RMS / sigma = {r:.4}")),
+            Err(e) => bad.push(format!("{ty} K = {k}: {e}")),
+        }
+    }
+    let above = Window::new(1.0 / 32.0, 1.0 / 16.0).unwrap();
+    for (what, k, w) in [
+        ("a K past every scale", 1u64 << 40, window),
+        ("a window above every scale", 4096, above),
+    ] {
+        match rule_for("t", GgmlType::IQ2_XXS, k, w) {
+            Err(FixtureError::NoScale { ty, k: got, .. })
+                if (ty, got) == (GgmlType::IQ2_XXS, k) => {}
+            other => bad.push(format!("{what}: {other:?}")),
+        }
+    }
+    let rule = rule_for("t", GgmlType::IQ2_XXS, 4096, window).unwrap();
+    let t = one_chunk(GgmlType::IQ2_XXS, 4096, rule);
+    let mut bytes = vec![0u8; 66 * 4];
+    t.fill_chunk(7, 0, &mut bytes[..]);
+    if let Err(e) = fixture::check_units(&t, &bytes, 0, window) {
+        bad.push(format!("the control block: {e}"));
+    }
+    bytes[0] ^= 1;
+    match fixture::check_units(&t, &bytes, 0, window) {
+        Err(e) if e.to_string().contains("the rule's") => {}
+        other => bad.push(format!("a d off the rule: {other:?}")),
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
 fn bolt_real() -> Split {
     Split::open(bolt::DEFAULT_MODEL)
         .unwrap_or_else(|e| panic!("open the Bolt file {}: {e}", bolt::DEFAULT_MODEL))
@@ -4596,12 +4652,19 @@ fn hw_fixture_bolt_plan() {
         (0, "ssm_norm.weight", 1.0),
         (0, "ssm_in.scale", NVFP4_TENSOR_SCALE),
         (0, "ssm_out.scale", NVFP4_TENSOR_SCALE),
-        (1, "exp_probs_b.bias", 0.0),
     ] {
         match rule_at(&p, f, leaf) {
             Rule::Const { value } if *value == v => {}
             other => panic!("{leaf}: {}, want constant {v}", other.describe()),
         }
+    }
+    match rule_at(&p, 1, "exp_probs_b.bias") {
+        Rule::Uniform { half_width, .. } if *half_width == bolt::BIAS_HALF_WIDTH => {}
+        other => panic!(
+            "exp_probs_b.bias: {}, want a spread of ±{}",
+            other.describe(),
+            bolt::BIAS_HALF_WIDTH
+        ),
     }
     assert_eq!(bolt_kv(&p, "expert_count").as_unsigned(), Some(496));
     let guard = dir("bolt-plan");
@@ -4680,8 +4743,7 @@ fn hw_fixture_bolt_end_to_end() {
 /// Contract 30: on the real header, a map that loses a kind or the difference between two MoE
 /// layers is refused by name at the plan, and maps that keep both shapes pass the family's map
 /// check: layers 3 (240 × 1,536) and 5 (240 × 2,048) differ in width alone, 5 and 12 are one shape.
-/// The controls call the map check, not the plan, which the real file's IQ2_XXS stacks need a
-/// fill rule for.
+/// The controls call the map check.
 #[test]
 #[ignore = "needs the box and the Nemotron 3.5 Bolt file (just gate-fixture)"]
 fn hw_fixture_bolt_refusals() {
