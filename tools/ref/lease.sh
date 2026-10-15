@@ -66,7 +66,7 @@ LEASE_TREE=$(cd "$__lease_dir/../.." 2> /dev/null && pwd) || LEASE_TREE=
 # The lease's file, its probe, the holds, box.sh's guard, lease_holders and now: lease-probe.sh.
 # shellcheck source=tools/ref/lease-probe.sh
 source "$__lease_dir/lease-probe.sh"
-# run_bounded, which lease_bounded runs its command through: tools/gate-bound.sh.
+# run_bounded and lease_stop, the shared bounded-command cleanup: tools/gate-bound.sh.
 # shellcheck source=tools/gate-bound.sh
 source "$__lease_dir/../gate-bound.sh"
 unset __lease_dir
@@ -470,47 +470,6 @@ lease_bound() {
       return 64
       ;;
   esac
-}
-# lease_stop <timeout pid>: TERM the monitor and its group, wait up to 10 s before KILL, then reap
-# the monitor. Allow another 10 s for KILL to finish, reporting a group still alive then. A monitor
-# that exited without forwarding TERM can leave a live group behind. Zombies hold no descriptors;
-# only live processes keep cleanup waiting. The caller ignores further signals.
-lease_stop() {
-  local pid=$1 sig target err table p pg state live failed=0 deadline
-  for sig in TERM KILL; do
-    for target in "$pid" "-$pid"; do
-      if err=$(LC_ALL=C kill -s "$sig" -- "$target" 2>&1); then :; else
-        case $err in
-          *'No such process'*) ;;
-          *) printf '[bound] cannot send %s to %s: %s\n' "$sig" "$target" "$err" >&2; failed=70 ;;
-        esac
-      fi
-    done
-    deadline=$((SECONDS + 10))
-    while :; do
-      if ! table=$(ps -eo pid=,pgid=,stat=); then
-        echo "[bound] cannot read processes while stopping $pid" >&2
-        failed=70
-        break
-      fi
-      live=''
-      while read -r p pg state; do
-        if { [ "$p" = "$pid" ] || [ "$pg" = "$pid" ]; } && [[ $state != Z* ]]; then live=1; break; fi
-      done <<< "$table"
-      [ -n "$live" ] || break 2
-      if [ "$SECONDS" -ge "$deadline" ]; then
-        if [ "$sig" = KILL ]; then
-          echo "[bound] $pid or its process group still alive 10 s after KILL" >&2
-          return 70
-        fi
-        break
-      fi
-      sleep 0.1 9>&-
-    done
-  done
-  [ "$failed" = 0 ] || return "$failed"
-  wait "$pid" 2> /dev/null || :
-  return "$failed"
 }
 lease_bounded() {
   local bound=${1:-} rc=0

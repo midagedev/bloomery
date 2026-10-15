@@ -22,12 +22,54 @@ gate_bound() {
   BOUND=$v
 }
 
+# lease_stop <timeout pid>: TERM the monitor and its group, wait up to 10 s before KILL, then reap
+# the monitor. Allow another 10 s for KILL to finish, reporting a group still alive then. A monitor
+# that exited without forwarding TERM can leave a live group behind. Zombies hold no descriptors;
+# only live processes keep cleanup waiting. The caller ignores further signals.
+lease_stop() {
+  local pid=$1 sig target err table p pg state live failed=0 deadline
+  for sig in TERM KILL; do
+    for target in "$pid" "-$pid"; do
+      if err=$(LC_ALL=C kill -s "$sig" -- "$target" 2>&1); then :; else
+        case $err in
+          *'No such process'*) ;;
+          *) printf '[bound] cannot send %s to %s: %s\n' "$sig" "$target" "$err" >&2; failed=70 ;;
+        esac
+      fi
+    done
+    deadline=$((SECONDS + 10))
+    while :; do
+      if ! table=$(ps -eo pid=,pgid=,stat=); then
+        echo "[bound] cannot read processes while stopping $pid" >&2
+        failed=70
+        break
+      fi
+      live=''
+      while IFS=$' \t\n' read -r p pg state; do
+        if { [ "$p" = "$pid" ] || [ "$pg" = "$pid" ]; } && [[ $state != Z* ]]; then live=1; break; fi
+      done <<< "$table"
+      [ -n "$live" ] || break 2
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        if [ "$sig" = KILL ]; then
+          echo "[bound] $pid or its process group still alive 10 s after KILL" >&2
+          return 70
+        fi
+        break
+      fi
+      sleep 0.1 9>&-
+    done
+  done
+  [ "$failed" = 0 ] || return "$failed"
+  wait "$pid" 2> /dev/null || :
+  return "$failed"
+}
+
 # run_bounded <command…>: the bounded command (`timeout … <binary>`) as a child the runner waits for,
 # its return the child's code. timeout runs the binary in a process group of its own, which a signal
 # to the runner's group never reaches. So a TERM or HUP to the runner (an INT too, unless the runner
 # was started with & by a shell, which leaves INT ignored) goes on to the child as a TERM, and the
 # runner waits for the child and its process group before going on. The TERM reaches the group too,
-# including a command GNU timeout started before returning from fork. lease_stop (tools/ref/lease.sh)
+# including a command GNU timeout started before returning from fork. lease_stop
 # bounds that cleanup at 10 s before KILL. The child keeps the runner's stdin, which a command run
 # with & would not. The trap is set before the child starts: one that comes before the child's
 # pid is known is held in BIN_SIGNAL and passed on as soon as the pid is, once (BIN_SENT says the trap
@@ -40,11 +82,6 @@ gate_bound() {
 # signal that was passed on (empty: none), for a caller that stops on it.
 run_bounded() {
   local traps s rc=0 BIN_PID='' BIN_SENT=''
-  # The lease and gate runners share the same process-group cleanup.
-  if ! declare -F lease_stop > /dev/null; then
-    # shellcheck source=tools/ref/lease.sh
-    source "${BASH_SOURCE[0]%/*}/ref/lease.sh" || return $?
-  fi
   traps=$(trap -p TERM INT HUP)
   # shellcheck disable=SC2034 # the caller reads it
   BIN_SIGNAL=
