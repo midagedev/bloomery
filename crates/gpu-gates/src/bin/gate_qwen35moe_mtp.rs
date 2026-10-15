@@ -42,6 +42,11 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/e2e.rs"]
+#[allow(dead_code, reason = "this gate uses only the shared argmax")]
+mod e2e;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, PrefillPath, Qwen35moeModel, addresses};
     use bloomery_gpu::mtp::{MtpInputArgs, MtpKernels};
@@ -132,18 +137,6 @@ mod gate {
                 before.len()
             ))
         })
-    }
-
-    /// The first index of the largest value: the argmax a tie gives to the
-    /// lower row.
-    fn first_argmax(x: &[f32]) -> usize {
-        let mut best = 0;
-        for (i, &v) in x.iter().enumerate() {
-            if v > x[best] {
-                best = i;
-            }
-        }
-        best
     }
 
     /// (q): the refusals at open, before the card is touched.
@@ -345,7 +338,7 @@ mod gate {
             worst(&one[..HIDDEN], &re),
             worst(&one[HIDDEN..2 * HIDDEN], &rh),
         );
-        let one_ok = we <= band && wh <= band;
+        let one_ok = one[..2 * HIDDEN].iter().all(|v| v.is_finite()) && we <= band && wh <= band;
         println!(
             "(j) one stream: e half worst {we:.3e}, h half {wh:.3e} of band {band:.3e} {}",
             verdict(one_ok)
@@ -414,7 +407,7 @@ mod gate {
             h.copy_from_host(&stream, &rows[i * HIDDEN..(i + 1) * HIDDEN])?;
             let token = m.mtp_draft(ids[i + 1], i, &h)?;
             let logits = draft_logits(m)?;
-            let at = first_argmax(&logits);
+            let at = super::e2e::argmax(&logits) as usize;
             argmax_ok += usize::from(at == token as usize);
             peak = (logits[at], at);
             drafted.push(token);

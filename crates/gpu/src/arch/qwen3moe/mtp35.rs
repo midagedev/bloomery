@@ -53,7 +53,6 @@ struct Names {
     eh: String,
     enorm: String,
     hnorm: String,
-    head_gain: String,
 }
 
 impl Names {
@@ -63,7 +62,6 @@ impl Names {
             eh: blk(model::arch::qwen35moe::mtp::EH_PROJ),
             enorm: blk(model::arch::qwen35moe::mtp::ENORM),
             hnorm: blk(model::arch::qwen35moe::mtp::HNORM),
-            head_gain: blk(model::arch::qwen35moe::mtp::SHARED_HEAD_NORM),
         }
     }
 }
@@ -171,7 +169,10 @@ impl Mtp35 {
         let forms = Forms::of(std::slice::from_ref(&plan), &d);
         let head = Head::with_gain(
             gpu,
-            (&w, names.head_gain.as_str()),
+            (
+                &w,
+                &super::body35::blk(index, model::arch::qwen35moe::mtp::SHARED_HEAD_NORM),
+            ),
             target,
             draft.rms_eps,
             1,
