@@ -69,7 +69,7 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 |---|---|---|
 | `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` | `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
 | `bloomery-serve-qwen38` | the same, `--features deepseek41` (the feature scopes the server code; it runs no V4.1 code) | Qwen3.8-Flash-Next |
-| `bloomery-serve` | `… --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|mimo2\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, Clef-Flash, lev |
+| `bloomery-serve` | `… --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|mimo2\|nemotron\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, Nemotron 3 Nano 4B, Clef-Flash, lev |
 | `generate_qwen3moe` | `… --features gpu --release --bin generate_qwen3moe` | Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
 | `generate_glm5next` | `… --features glm5next --release --bin generate_glm5next` | GLM-5.3-Flash |
 | `r8conv` | `cargo build --release -p bloomery-model --bin r8conv` | the V4.1 sidecar |

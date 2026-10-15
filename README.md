@@ -65,7 +65,7 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 - **On Qwen3.8 loads that page experts through the NVMe tier, `gate-gpu-qwen38-serve`'s real tier was 70/72 on 0.3.2's
   baseline (`f382b474`), with two preexisting paged failures.** It was not re-run for this note; the 0.3.3 release pass
   re-checks it. A default load keeps the draft off.
-- **Nemotron 3 Nano 4B reads a prompt at its decode rate:** the body has no prompt batch, so a prompt runs one decode step per token. It serves one slot on one card; `--parallel` above 1, a placement of more than one card or with a tier card, and a draft lever are each refused by name. A request keeps what the slot holds only when its prompt extends the whole held sequence (the Mamba-2 state cannot step back); the seat runs no prompt cache.
+- **Nemotron 3 Nano 4B reads a prompt at its decode rate and serves one slot on one card** ([the nemotron seat](docs/serving.md#the-seats) names what it refuses and when it keeps a prefix).
 - **Unset context is the seats' ladder (PIN(2026-10-14)).** With `--ctx-size` unset, one slot asks the lesser of
   262,144 and the file's limit and halves while the plan is short of the card, and of the host where the body keeps
   no tier past it. A set `--ctx-size` that does not fit is refused

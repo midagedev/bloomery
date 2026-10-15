@@ -81,6 +81,12 @@ Where it ends today: one model a server, sm_86+ GPUs, and the seats' own default
 
 ## The seats
 
+The nemotron seat serves Nemotron 3 Nano 4B (`--model nemotron -m PATH`) whole on one card, one slot: `--parallel`
+above 1, a placement of more than one card or with a tier card, and a draft lever are refused by name. The body has
+no prompt batch, so a prompt runs one decode step per token, at the decode rate. A Mamba-2 state cannot step back: a
+request keeps what the slot holds only when its prompt extends the whole held sequence, and any other prompt resets
+the slot and is read again. The seat runs no prompt cache; a snapshot or a resume is refused by name.
+
 The decide seat answers SystemOne requests, one at a time. Clef-Flash also reads images (Image input, below); lev reads text states only. It serves two decision models: Clef-Flash (a joint schema head) and lev (`--hf ggml-org/lev-GGUF:Q4_K_M`, a label readout; its file's `qwen35.decision.type` picks it, and its request is rendered by the file's own `systemone` template):
 
 ```sh
@@ -95,7 +101,7 @@ bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` needs no head flag. The earlier `qw
 file: `--head joint_head.safetensors`, its `joint_head_config.json` beside it. A `--head` beside a `clef` file names the
 head instead of the file's own.
 
-**Concurrent requests.** Every generative seat takes `--parallel N` (unset, one slot; a set
+**Concurrent requests.** Every generative seat but nemotron (one slot, above) takes `--parallel N` (unset, one slot; a set
 `--ctx-size` with no `--parallel` serves one slot at the whole of it — the flag is one request's context, as
 llama-server reads it, and the startup line says so). A count you set is never lowered. The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
@@ -213,7 +219,7 @@ binary's `--help`.
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
-  streams wait. The decide seat serves one request at a time; DSpark drafts never rejoin — `--parallel > 1` with
+  streams wait. The decide seat serves one request at a time, and the nemotron seat one slot; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.
 - With adaptive residency on, a request's tokens follow the placement its passes ran on, and the placement follows
   the history of passes (the requests before it and the streams beside it): the same history gives the same tokens
