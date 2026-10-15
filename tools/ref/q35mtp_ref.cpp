@@ -49,50 +49,11 @@
 #include <sys/stat.h>
 #include <vector>
 
+#include "ref_io.h"
+
 static int fail(const std::string & what, const std::string & detail = "") {
     fprintf(stderr, "q35mtp_ref: %s%s%s\n", what.c_str(), detail.empty() ? "" : ": ", detail.c_str());
     return 1;
-}
-
-static bool read_ids(const std::string & path, int n, std::vector<llama_token> & ids) {
-    std::ifstream in(path);
-    if (!in) {
-        fprintf(stderr, "q35mtp_ref: cannot read %s\n", path.c_str());
-        return false;
-    }
-    std::string line;
-    long long lines = 0;
-    while ((int) ids.size() < n && std::getline(in, line)) {
-        ++lines;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
-            fprintf(stderr, "q35mtp_ref: %s:%lld is not a token id: '%s'\n", path.c_str(), lines, line.c_str());
-            return false;
-        }
-        ids.push_back((llama_token) v);
-    }
-    if ((int) ids.size() < n) {
-        fprintf(stderr, "q35mtp_ref: %s holds %zu ids and the prompt asks for %d\n", path.c_str(), ids.size(), n);
-        return false;
-    }
-    return true;
-}
-
-static bool write_bytes(const std::string & path, const void * data, size_t bytes) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        fprintf(stderr, "q35mtp_ref: cannot write %s\n", path.c_str());
-        return false;
-    }
-    const bool ok = fwrite(data, 1, bytes, f) == bytes;
-    if (fclose(f) != 0 || !ok) {
-        fprintf(stderr, "q35mtp_ref: short write on %s\n", path.c_str());
-        return false;
-    }
-    return true;
 }
 
 static bool write_ids(const std::string & path, const std::vector<llama_token> & ids) {
@@ -130,10 +91,15 @@ static bool parse_rows(const char * spec, std::vector<int> & rows) {
     return !rows.empty();
 }
 
-// The first index of the largest value: the argmax a tie gives to the lower id.
+// The first index of the largest value: the argmax a tie gives to the lower id. A non-finite logit ends the run
+// with 1 naming its id: no comparison orders a NaN, so no token or distance is written from such a row.
 static int first_argmax(const float * x, int n) {
     int best = 0;
-    for (int i = 1; i < n; ++i) {
+    for (int i = 0; i < n; ++i) {
+        if (!std::isfinite(x[i])) {
+            fprintf(stderr, "q35mtp_ref: non-finite logit %g at id %d\n", (double) x[i], i);
+            std::exit(1);
+        }
         if (x[i] > x[best]) best = i;
     }
     return best;
@@ -265,17 +231,17 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--tokens-file") == 0 && more) {
             tokens_file = argv[++i];
         } else if (strcmp(argv[i], "--tokens-count") == 0 && more) {
-            n = atoi(argv[++i]);
+            if (!parse_i32("q35mtp_ref", "--tokens-count", argv[++i], 2, n)) return 2;
         } else if (strcmp(argv[i], "--rows") == 0 && more) {
             if (!parse_rows(argv[++i], rows)) return fail("--rows wants i,i,...", argv[i]);
         } else if (strcmp(argv[i], "--tap") == 0 && more) {
             taps.push_back(argv[++i]);
         } else if (strcmp(argv[i], "-c") == 0 && more) {
-            n_ctx = atoi(argv[++i]);
+            if (!parse_i32("q35mtp_ref", "-c", argv[++i], 0, n_ctx)) return 2;
         } else if (strcmp(argv[i], "-ngl") == 0 && more) {
-            ngl = atoi(argv[++i]);
+            if (!parse_i32("q35mtp_ref", "-ngl", argv[++i], 0, ngl)) return 2;
         } else if (strcmp(argv[i], "-t") == 0 && more) {
-            threads = atoi(argv[++i]);
+            if (!parse_i32("q35mtp_ref", "-t", argv[++i], 0, threads)) return 2;
         } else {
             return fail("unknown or incomplete argument", argv[i]);
         }
@@ -299,7 +265,7 @@ int main(int argc, char ** argv) {
         if (uniq.size() != taps.size()) return fail("--tap names a tap twice");
     }
     std::vector<llama_token> ids;
-    if (!read_ids(tokens_file, n, ids)) return 2;
+    if (!read_token_file(tokens_file, n, ids)) return 2;
     if (n_ctx == 0) n_ctx = n;
     if (n_ctx < n) return fail("the prompt does not fit in -c", std::to_string(n_ctx));
 
@@ -459,7 +425,7 @@ int main(int argc, char ** argv) {
     llama_free(m.ctx);
 
     if (!write_ids(out + "/prompt.ids", ids)) return 1;
-    if (!write_bytes(out + "/trunk_h.f32", h.data(), h.size() * sizeof(float))) return 1;
+    if (!write_raw(out + "/trunk_h.f32", h.data(), h.size())) return 1;
 
     // The sanity line: the draft's token against the target's own next token after the fed id, as the gate's
     // acceptance reads it (the last 16 steps, and every step).

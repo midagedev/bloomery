@@ -1,7 +1,8 @@
 use super::{MAINLINE, MAINLINE_BUILD, MODEL};
 use crate::RefError;
+use crate::clefvis::testkit::scratch as dir;
 use crate::mtptaps::{Elem, IDS_FILE, TapSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const IDS: [u32; 4] = [10, 11, 12, 13];
 
@@ -25,13 +26,6 @@ impl Default for Header<'_> {
             complete: true,
         }
     }
-}
-
-fn dir(what: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("bloomery-mtptaps-{what}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
-    d
 }
 
 fn put(dir: &Path, name: &str, bytes: &[u8]) {
@@ -106,7 +100,7 @@ fn refused(d: &Path, what: &str) -> RefError {
 /// i32 as the node is; a name or a row the set does not hold is refused naming both.
 #[test]
 fn a_finished_set_reads_a_tap_by_name_and_row() {
-    let d = dir("ok");
+    let d = dir("mtptaps-ok");
     write_set(&d, &Header::default(), &[]);
     let p = MAINLINE.check_set(&d).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(p.dumped_from, MODEL);
@@ -150,7 +144,7 @@ fn a_finished_set_reads_a_tap_by_name_and_row() {
 /// without the MTP context (no `# mtp` line, or a model with no next-token layer) and one without its trailer.
 #[test]
 fn the_family_refuses_a_set_of_another_file_build_or_arch_or_without_the_mtp_context() {
-    let d = dir("refuse");
+    let d = dir("mtptaps-refuse");
     let other_build = "0000000aa";
     let cases: [(&str, Header<'_>); 6] = [
         (
@@ -249,7 +243,7 @@ fn the_family_refuses_a_set_of_another_file_build_or_arch_or_without_the_mtp_con
 /// tapped row that is no step, and a tap a row lacks.
 #[test]
 fn a_set_whose_files_or_rows_disagree_is_malformed() {
-    let d = dir("malformed");
+    let d = dir("mtptaps-malformed");
     let at = |what: &str, extra: &[&str], edit: &dyn Fn(&Path), want: &str| {
         write_set(&d, &Header::default(), extra);
         edit(&d);

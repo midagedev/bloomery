@@ -7,7 +7,7 @@
 # name). Its build is the one that exists; this links against it and builds nothing in it. q35mtp_ref includes the
 # tree's staging header src/llama-ext.h (the nextn embeddings), so it is built from that tree's sources at that commit.
 # Output: $BLOOMERY_DATA/bin/q35mtp_ref (Q35MTP_OUT moves it) and q35mtp_ref.build beside it, naming the sha256 of the
-# q35mtp_ref.cpp it was built from, the mainline commit and the md5 of the libllama it links; dump-q35mtp.sh refuses a
+# q35mtp_ref.cpp and ref_io.h it was built from, the mainline commit and the md5 of the libllama it links; dump-q35mtp.sh refuses a
 # binary whose record does not match its own tree. The compile writes a temporary name and only a finished link
 # replaces the installed binary.
 set -euo pipefail
@@ -32,7 +32,7 @@ LIB_MD5=$(md5sum < "$LIB/libllama.so.0" | cut -d' ' -f1)
 mkdir -p "$OUT"
 TMP=$OUT/q35mtp_ref.tmp.$$
 trap 'rm -f "$TMP" "$TMP.build"' EXIT
-SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+SRC_SHA=$(cat "$SRC" "$HERE/tools/ref/ref_io.h" | sha256sum | cut -d' ' -f1)
 g++ -std=c++17 -O2 -o "$TMP" "$SRC" -I"$L/include" -I"$L/ggml/include" -I"$L/src" \
   -L"$LIB" -lllama -lggml -lggml-base -Wl,-rpath,"$LIB"
 printf 'source_sha256 %s\nlcpp %s\nlcpp_commit %s\nlibllama_md5 %s\n' "$SRC_SHA" "$(readlink -f "$L")" "$COMMIT" "$LIB_MD5" > "$TMP.build"

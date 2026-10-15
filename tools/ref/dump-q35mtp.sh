@@ -3,9 +3,9 @@
 # the prompt's first MTP_PROMPT prose ids, fed teacher-forced (step i: token ids[i+1], position i, the trunk's h_nextn
 # row i), every step run in order and the graph nodes MTP_TAPS dumped at the steps MTP_ROWS, by q35mtp_ref
 # (tools/ref/q35mtp_ref.cpp), into $BLOOMERY_DATA/ref-mtp/qwen35moe_mainline_prose64 — the set the refset family
-# mtp-qwen35moe-mainline checks and gate_qwen35moe_mtp's clause (m) reads.
+# mtp-qwen35moe-mainline checks.
 #
-# The binary must be the one built from this tree's q35mtp_ref.cpp (its .build record's source sha256) against the profile's
+# The binary must be the one built from this tree's q35mtp_ref.cpp and ref_io.h (its .build record's source sha256) against the profile's
 # MTP_LCPP at its current commit and libllama (build-q35mtp-ref.sh), and the ids file must have the profile's sha256:
 # either refused names what differs. The set is written to <set>.staging and moved over the old set only when q35mtp_ref
 # exits 0 and its manifest has the `# mtp` line and the `# complete` trailer. Every layer and the head are on the card
@@ -33,7 +33,7 @@ source tools/ref/ref-paths.sh
 [ "$MODEL_NAME" = qwen35moe ] ||
   { echo "dump-q35mtp: the MTP set is the qwen35moe profile's; this command picked $MODEL_NAME" >&2; exit 2; }
 BIN=$BLOOMERY_DATA/bin/q35mtp_ref
-want_src=$(sha256sum tools/ref/q35mtp_ref.cpp | cut -d' ' -f1)
+want_src=$(cat tools/ref/q35mtp_ref.cpp tools/ref/ref_io.h | sha256sum | cut -d' ' -f1)
 want_commit=$(git -c safe.directory="$MTP_LCPP" -C "$MTP_LCPP" rev-parse --short=9 HEAD)
 want_lib=$(md5sum < "$MTP_LCPP/build/bin/libllama.so.0" | cut -d' ' -f1)
 if ! grep -qx "source_sha256 $want_src" "$BIN.build" 2>/dev/null ||
