@@ -21,7 +21,8 @@ that starts again reads from the next byte.
 The daemon is polled every BOXQ_POLL_S; a job seen terminal is given one more interval (at most 2 s) for the tails to
 flush, then the tails are stopped (a job that was never seen running has its out and err read whole instead, no flush
 to guess at). Bytes a full pipe left unread are read again from the job's files before `<rc-dir>/<id>.rc` (default
-$BOXQ_RC_DIR, else ~/.cache/bloomery/boxq) is written atomically with the exit code. A queued job's wait is counted from the job's `submitted` (ISO; no zone means this machine's, which the
+$BOXQ_RC_DIR, else ~/.cache/bloomery/boxq) is written atomically with the exit code. A replay ssh that does not exit 0
+is exit 84 with the resume line and no rc file. A queued job's wait is counted from the job's `submitted` (ISO; no zone means this machine's, which the
 box shares), else from the client's first sight of it.
 The box's rc is the authority: for done and failed the exit code is the job's rc, so
 80, 83 and 85 from the job's command prefix pass through unchanged; a job cancelled by someone else exits with its rc,
@@ -48,7 +49,7 @@ is decided as after any poll.
   BOXQ_RECONNECT_S seconds of backoff after those misses (300)
 
 Exit: the job's rc (run, attach); 0 ok; 64 usage or no such job; 81 lost, or still running after the cancel; 84 the daemon
-is not alive past the reconnect bound, or answers outside the wire; 130/143 a trapped INT/TERM; a daemon refusal exits with the rc it names. 80, 83
+is not alive past the reconnect bound, answers outside the wire, or a replay ssh does not exit 0; 130/143 a trapped INT/TERM; a daemon refusal exits with the rc it names. 80, 83
 and 85 are tools/box.sh's, and only pass through here. tools/boxq-check.py holds the guard that keeps the five codes apart
 from every other tool, and the idle-fill list's reader.
 """
@@ -398,10 +399,27 @@ def dump(q, job, trap, fds=(1, 2), offsets=(0, 0)):
         else:
             cmds.append(f"[ ! -e {qpath} ] || exec cat {qpath}")
         out_fds.append(fd)
-    kids = spawn_all(q, cmds, out_fds)
-    while any(k.poll() is None for k in kids) and not trap.sigs:
-        trap.wait(0.1)
-    unfollow(kids)
+    # The children write to pipes this process drains, so a closed local reader drops bytes (drain's rule) and is not
+    # an ssh failure. A non-zero ssh is a missed read: 84 and no rc file, the same as a daemon the client cannot reach.
+    kids = spawn_all(q, cmds, [subprocess.PIPE] * len(cmds))
+    tails = []
+    try:
+        for proc, fd in zip(kids, out_fds):
+            src = os.dup(proc.stdout.fileno())
+            proc.stdout.close()
+            os.set_blocking(src, False)
+            tails.append(Tail(proc, src, fd))
+        while not trap.sigs and any(t.src is not None or t.pending or t.proc.poll() is None for t in tails):
+            pause(trap, tails, 0.1)
+        if not trap.sigs:
+            codes = [p.poll() for p in kids]
+            if any(code != 0 for code in codes):
+                say(f"boxq: {job['id']}: output read failed: ssh rc {codes}")
+                raise Down("daemon-down", f"job {job['id']}: output read failed: ssh rc {codes}",
+                           RESUME_LINE.format(jid=job["id"]))
+    finally:
+        unfollow(tails)
+        unfollow(kids)
 
 
 def _proc(k):
@@ -900,6 +918,7 @@ class Fix:
         self.rc_dir, self.ssh = os.path.join(tmp, "rc"), os.path.join(tmp, "ssh")
         self.ssh_log = os.path.join(tmp, "ssh.log")
         self.tail_pids, self.hung_pids = os.path.join(tmp, "tail.pids"), os.path.join(tmp, "hung.pid")
+        self.replay_fail = os.path.join(tmp, "replay-fail")
 
     def call(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -922,6 +941,12 @@ class Fix:
         self.script(os.path.join(bindir, "tail"),
                     f'echo $$ >> {q(self.tail_pids)}\nexec {q(shutil.which("tail"))} "$@"\n')
         self.script(self.ssh, f'printf "%s\\n" "$*" >> {q(self.ssh_log)}\nfor last; do :; done\n'
+                              f'if [ -f {q(self.replay_fail)} ]; then\n'
+                              f'  case "$last" in\n'
+                              f'    *"-F "*) ;;\n'
+                              f'    *"exec cat "*|*"exec tail -c "*) exit 255 ;;\n'
+                              f'  esac\n'
+                              f'fi\n'
                               f'PATH={q(bindir)}:$PATH\nexport PATH\nexec sh -c "$last"\n')
         os.makedirs(self.rc_dir, exist_ok=True)
 
@@ -1599,6 +1624,32 @@ def case_pending_replay(fx):
     fx.gone(fx.tail_pids)
 
 
+def case_replay_ssh(fx):
+    """An ssh that exits 255 while unread bytes are replayed is exit 84, and no rc file is written."""
+    body = b"P" * (1 << 20) + b"0123456789A"
+    fx.files(body, b"")
+    open(fx.replay_fail, "w").close()
+    fx.serve([{"status": "running"}, {"status": "done", "rc": 0}],
+             gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
+    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05")
+    fx.wait_pids(fx.tail_pids, 2)
+    # Leave stdout unread so the pipe fills and the replay ssh is the one that would finish the file.
+    end = time.monotonic() + 3
+    while time.monotonic() < end and p.poll() is None and fx.rc_file() is None:
+        time.sleep(0.05)
+    try:
+        out, err = p.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        raise AssertionError("a replay whose ssh fails did not end the client within 20 s")
+    check(p.returncode == 84 and fx.rc_file() is None and out != body
+          and b"left as it is on the box" in err and b"attach j1" in err,
+          f"a replay ssh exiting 255 exits 84 and mirrors nothing: rc={p.returncode} "
+          f"got={len(out)} want={len(body)} mirror={fx.rc_file()!r} err={err!r}")
+    fx.gone(fx.tail_pids)
+
+
 def case_replay_signal(fx):
     """A signal while unread bytes are replayed is the signal's exit, and no rc file is written."""
     body = b"P" * (1 << 20) + b"0123456789A"
@@ -1844,7 +1895,7 @@ CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_predicti
          case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
          case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_drain_full_pipe,
-         case_pending_replay, case_replay_signal, case_reconnect_wall,
+         case_pending_replay, case_replay_ssh, case_replay_signal, case_reconnect_wall,
          case_cancel_deadline, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
