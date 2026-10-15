@@ -54,7 +54,7 @@ echo "build-dump-mtp: ik libraries current in $(($(date +%s) - t0)) s"
 mkdir -p "$OUT"
 TMP=$OUT/dump_mtp.tmp.$$
 trap 'rm -f "$TMP" "$TMP.build"' EXIT
-SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+SRC_SHA=$(cat "$SRC" "$HERE/tools/ref/ref_io.h" | sha256sum | cut -d' ' -f1)
 # -rdynamic exports dump_mtp's ggml_backend_sched_graph_compute_async and llama_set_mtp_op_type so
 # libllama's calls bind to them (its header says why); -ldl for the dlsym(RTLD_NEXT) that forwards to
 # the libraries' own.

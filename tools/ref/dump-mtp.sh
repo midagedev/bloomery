@@ -102,7 +102,7 @@ for lib in libllama.so libggml.so; do
   esac
 done
 SRC="${BASH_SOURCE[0]%/*}/dump_mtp.cpp"
-SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+SRC_SHA=$(cat "$SRC" "${BASH_SOURCE[0]%/*}/ref_io.h" | sha256sum | cut -d' ' -f1)
 rec() { awk -v k="$1" '$1 == k { print $2 }' "$BIN.build" 2>/dev/null || true; }
 stale=()
 [ "$(rec source_sha256)" = "$SRC_SHA" ] || stale+=("$SRC (sha256 ${SRC_SHA:0:12}; the binary's record names '$(rec source_sha256 | cut -c1-12)')")

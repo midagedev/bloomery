@@ -105,6 +105,7 @@
 #include "common.h"
 #include "llama.h"
 #include "ggml.h"
+#include "ref_io.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -564,7 +565,7 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--tokens-file") == 0 && i + 1 < argc) {
             tokens_file = argv[++i];
         } else if (strcmp(argv[i], "--tokens-count") == 0 && i + 1 < argc) {
-            tokens_count = std::max(0LL, atoll(argv[++i]));  // 0 is refused below
+            if (!parse_i64("dump_ref", "--tokens-count", argv[++i], 1, LLONG_MAX, tokens_count)) return 2;
         } else if (strcmp(argv[i], "--decode-step") == 0) {
             decode_step = true;
         } else if (strcmp(argv[i], "--prefill-every-node") == 0) {

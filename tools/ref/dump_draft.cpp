@@ -52,6 +52,7 @@
 #include "ggml.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ref_io.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -526,7 +527,7 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--tokens-file") == 0 && i + 1 < argc) {
             tokens_file = argv[++i];
         } else if (strcmp(argv[i], "--tokens-count") == 0 && i + 1 < argc) {
-            tokens_count = atoll(argv[++i]);
+            if (!parse_i64("dump_draft", "--tokens-count", argv[++i], 1, LLONG_MAX, tokens_count)) return 2;
         } else if (strcmp(argv[i], "--expect-arch") == 0 && i + 1 < argc) {
             expect_arch = argv[++i];
         } else if (strcmp(argv[i], "--expect-draft-arch") == 0 && i + 1 < argc) {
