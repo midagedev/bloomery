@@ -5,8 +5,9 @@
 // Headers are # model, # build (BLOOMERY_REF_BUILD, the tokenizer family's spelling of the
 // mainline md5s) and # arch. # complete is written only after every file, by renaming the manifest.
 //
-//   nemotron_ref -m <gguf> --out <dir> --prompt <name>:<n>:<ids> ... [-c <ctx>] [-ub <ubatch>] [-t <threads>]
+//   nemotron_ref -m <gguf> --arch <name> --out <dir> --prompt <name>:<n>:<ids> ... [-c <ctx>] [-ub <ubatch>] [-t <threads>]
 //
+// --arch is the general.architecture the file must state (nemotron_h or nemotron_h_moe); any other is refused.
 // --prompt is repeated, once a prompt. <ids> is one decimal id a line, at least <n> of them; the
 // first <n> are the prompt. n_gpu_layers is 0. The caller also empties CUDA_VISIBLE_DEVICES.
 
@@ -85,13 +86,15 @@ static void print_top5(const std::string & name, const float * row, int n_vocab)
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, out;
+    std::string model_path, out, want_arch;
     int n_ctx = 0, n_ubatch = 512, threads = 0;
     std::vector<Prompt> prompts;
     for (int i = 1; i < argc; ++i) {
         const bool more = i + 1 < argc;
         if (strcmp(argv[i], "-m") == 0 && more) {
             model_path = argv[++i];
+        } else if (strcmp(argv[i], "--arch") == 0 && more) {
+            want_arch = argv[++i];
         } else if (strcmp(argv[i], "--out") == 0 && more) {
             out = argv[++i];
         } else if (strcmp(argv[i], "--prompt") == 0 && more) {
@@ -113,8 +116,8 @@ int main(int argc, char ** argv) {
         }
     }
     const char * build = getenv("BLOOMERY_REF_BUILD");
-    if (model_path.empty() || out.empty() || prompts.empty() || n_ubatch <= 0 || !build || !*build) {
-        fprintf(stderr, "usage: nemotron_ref -m <gguf> --out <dir> --prompt <name>:<n>:<ids> ... "
+    if (model_path.empty() || want_arch.empty() || out.empty() || prompts.empty() || n_ubatch <= 0 || !build || !*build) {
+        fprintf(stderr, "usage: nemotron_ref -m <gguf> --arch <name> --out <dir> --prompt <name>:<n>:<ids> ... "
                         "[-c <ctx>] [-ub <ubatch>] [-t <threads>]\n"
                         "BLOOMERY_REF_BUILD must name the mainline build\n");
         return 2;
@@ -160,8 +163,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     char arch[128] = {};
-    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0 || strcmp(arch, "nemotron_h") != 0) {
-        fprintf(stderr, "nemotron_ref: general.architecture is '%s', want nemotron_h\n", arch);
+    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0 || want_arch != arch) {
+        fprintf(stderr, "nemotron_ref: general.architecture is '%s', want %s\n", arch, want_arch.c_str());
         return 1;
     }
 

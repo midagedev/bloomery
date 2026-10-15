@@ -1,12 +1,12 @@
-//! Last-position logits of Nemotron 3 Nano (`tools/ref/nemotron_ref.cpp`,
-//! `just dump-ref-nemotron`). One prompt is one row, read by the names on
+//! Last-position logits of Nemotron 3 Nano and 3.5 Bolt (`tools/ref/nemotron_ref.cpp`,
+//! `just dump-ref-nemotron`, `just dump-ref-nemotron-moe`). One prompt is one row, read by the names on
 //! `# prompt columns`. `logits` is the last position only, `n_vocab` f32,
 //! little-endian; `ids` is that prompt, one id a line.
 //!
 //! ```text
 //! # model    <path>
 //! # build    llama-tokenize <md5> libllama.so <md5>
-//! # arch     nemotron_h
+//! # arch     nemotron_h (the Bolt: nemotron_h_moe)
 //! # prompt columns  name  n_ids  n_vocab  ids  logits
 //! prompt  code5  5  131072  code5.ids  code5.logits.f32
 //! # complete  4  0
@@ -295,4 +295,265 @@ fn prompt_row(r: &Row<'_>, at: &dyn fmt::Display) -> Result<Prompt, RefError> {
         ids_file: ids_file.to_string(),
         logits_file: logits_file.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogitsSet;
+    use crate::RefError;
+    use crate::family::{Build, Family, Identity};
+    use std::path::Path;
+
+    /// Every last-position logits family of the arch table runs each test below: a family added to the table is
+    /// covered with no line here, and a family's own file holds only what names that family.
+    fn each_family(check: impl Fn(&Family)) {
+        let mut n = 0;
+        for fam in crate::arch::all().filter(|f| f.identity == Identity::NemotronLogits) {
+            check(fam);
+            n += 1;
+        }
+        assert!(
+            n >= 2,
+            "the arch table holds {n} logits families, want the Nano's and the Bolt's"
+        );
+    }
+
+    fn pin(fam: &Family) -> &'static str {
+        match fam.build {
+            Some(Build::Is(p)) => p,
+            _ => panic!("{}: the logits family pins no build", fam.name),
+        }
+    }
+
+    fn runs(fam: &Family) -> String {
+        fam.runs().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Write one prompt's ids and logits and the manifest. `complete` adds the trailer.
+    fn write(fam: &Family, dir: &Path, model: &str, build: &str, complete: bool) {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(dir.join("p.ids"), "0\n1\n2\n3\n0\n").unwrap_or_else(|e| panic!("{e}"));
+        let logits: Vec<u8> = [0.0f32, 1.5, -0.5, 0.25]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        std::fs::write(dir.join("p.logits.f32"), logits).unwrap_or_else(|e| panic!("{e}"));
+        let arch = fam
+            .arch
+            .unwrap_or_else(|| panic!("the family names no arch"));
+        let mut text = format!(
+            "# model\t{model}\n# build\t{build}\n# arch\t{arch}\n\
+             # prompt columns\tname\tn_vocab\tn_ids\tlogits\tids\n\
+             prompt\tp\t4\t5\tp.logits.f32\tp.ids\n"
+        );
+        if complete {
+            text.push_str("# complete\t1\t0\n");
+        }
+        std::fs::write(dir.join("MANIFEST.tsv"), text).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn dir(fam: &Family, tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "bloomery-{}-{tag}-{}",
+            fam.name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// A finished set opens, and `logits` is that column's file.
+    #[test]
+    fn a_finished_set_reads_logits_by_column_name() {
+        each_family(|fam| {
+            let d = dir(fam, "ok");
+            write(fam, &d, &runs(fam), pin(fam), true);
+            let set = LogitsSet::open(&d, fam).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(set.prompts.len(), 1);
+            let row = set
+                .logits(&set.prompts[0])
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(row[1], 1.5);
+            assert_eq!(
+                set.ids(&set.prompts[0]).unwrap_or_else(|e| panic!("{e}")),
+                [0, 1, 2, 3, 0]
+            );
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// No `# complete`: unfinished, even when the other lines are well formed.
+    #[test]
+    fn a_set_without_its_trailer_is_unfinished() {
+        each_family(|fam| {
+            let d = dir(fam, "trailer");
+            write(fam, &d, &runs(fam), pin(fam), false);
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Unfinished { set }) => assert_eq!(set, d.display().to_string()),
+                other => panic!("a set without its trailer: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// Another model path is stale.
+    #[test]
+    fn a_set_of_another_model_is_stale() {
+        each_family(|fam| {
+            let d = dir(fam, "model");
+            write(fam, &d, "/models/other/file.gguf", pin(fam), true);
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Stale { dumped_from, .. }) => {
+                    assert_eq!(dumped_from, "/models/other/file.gguf");
+                }
+                other => panic!("another file: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// Another mainline build is foreign.
+    #[test]
+    fn a_set_of_another_build_is_foreign() {
+        each_family(|fam| {
+            let d = dir(fam, "build");
+            write(
+                fam,
+                &d,
+                &runs(fam),
+                "llama-tokenize 00000000000000000000000000000000 libllama.so 00000000000000000000000000000000",
+                true,
+            );
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Foreign { field, .. }) => assert_eq!(field, "build"),
+                other => panic!("another build: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// A line that is not a token id is malformed, naming the field and the text.
+    #[test]
+    fn a_token_line_that_is_not_an_id_is_malformed() {
+        each_family(|fam| {
+            let d = dir(fam, "bad-id");
+            write(fam, &d, &runs(fam), pin(fam), true);
+            std::fs::write(d.join("p.ids"), "0\n1\n2\ngarbage\n0\n")
+                .unwrap_or_else(|e| panic!("{e}"));
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Malformed { what, .. }) => {
+                    assert!(
+                        what.contains("token id") && what.contains("garbage"),
+                        "{what}"
+                    );
+                }
+                other => panic!("a token line that is not an id: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// A NaN or infinite logit is malformed, naming its index.
+    #[test]
+    fn a_non_finite_logit_is_malformed() {
+        each_family(|fam| {
+            let d = dir(fam, "nan-logit");
+            write(fam, &d, &runs(fam), pin(fam), true);
+            let logits: Vec<u8> = [0.0f32, f32::NAN, -0.5, 0.25]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            std::fs::write(d.join("p.logits.f32"), logits).unwrap_or_else(|e| panic!("{e}"));
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Malformed { what, .. }) => {
+                    assert!(what.contains("non-finite logit at index 1"), "{what}");
+                }
+                other => panic!("a non-finite logit: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// An empty line among the ids is malformed, as the C++ reader that writes the set refuses it.
+    #[test]
+    fn an_empty_token_line_is_malformed() {
+        each_family(|fam| {
+            let d = dir(fam, "empty-id");
+            write(fam, &d, &runs(fam), pin(fam), true);
+            std::fs::write(d.join("p.ids"), "0\n\n1\n2\n3\n0\n").unwrap_or_else(|e| panic!("{e}"));
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Malformed { what, .. }) => {
+                    assert!(what.contains("empty token id"), "{what}")
+                }
+                other => panic!("an empty token line: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// An id at or past `n_vocab` is malformed, naming the id and the vocabulary.
+    #[test]
+    fn a_token_id_outside_the_vocabulary_is_malformed() {
+        each_family(|fam| {
+            let d = dir(fam, "oob-id");
+            write(fam, &d, &runs(fam), pin(fam), true);
+            std::fs::write(d.join("p.ids"), "0\n1\n2\n3\n4\n").unwrap_or_else(|e| panic!("{e}"));
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Malformed { what, .. }) => {
+                    assert!(what.contains("outside vocabulary"), "{what}");
+                }
+                other => panic!("a token id outside the vocabulary: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// The trailer's count is the prompt rows. One row and `# complete 2` is malformed.
+    #[test]
+    fn a_completion_count_that_is_not_the_prompt_rows_is_malformed() {
+        each_family(|fam| {
+            let d = dir(fam, "complete-n");
+            write(fam, &d, &runs(fam), pin(fam), true);
+            let text =
+                std::fs::read_to_string(d.join("MANIFEST.tsv")).unwrap_or_else(|e| panic!("{e}"));
+            std::fs::write(
+                d.join("MANIFEST.tsv"),
+                text.replace("# complete\t1\t0\n", "# complete\t2\t0\n"),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Malformed { what, .. }) => {
+                    assert!(what.contains("completion count"), "{what}");
+                }
+                other => panic!("a completion count that is not the prompt rows: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
+
+    /// A completion count that does not parse is malformed, naming the field.
+    #[test]
+    fn a_completion_count_that_does_not_parse_is_malformed() {
+        each_family(|fam| {
+            let d = dir(fam, "complete-bad");
+            write(fam, &d, &runs(fam), pin(fam), true);
+            let text =
+                std::fs::read_to_string(d.join("MANIFEST.tsv")).unwrap_or_else(|e| panic!("{e}"));
+            std::fs::write(
+                d.join("MANIFEST.tsv"),
+                text.replace("# complete\t1\t0\n", "# complete\tgarbage\t0\n"),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Malformed { what, .. }) => {
+                    assert!(
+                        what.contains("complete count") && what.contains("garbage"),
+                        "{what}"
+                    );
+                }
+                other => panic!("a completion count that does not parse: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        });
+    }
 }

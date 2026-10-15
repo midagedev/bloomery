@@ -864,7 +864,7 @@ test-ref-io:
     g++ -std=c++17 -Wall -o "${TMPDIR:-/tmp}/ref_io_test" tools/ref/ref_io_test.cpp && "${TMPDIR:-/tmp}/ref_io_test"
 
 # Nemotron 3 Nano 4B last-position logits, mainline on the CPU (ik has no nemotron_h). nemotron_ref
-# links the existing mainline build (tools/ref/build-nemotron-ref.sh; it does not rebuild it) and
+# links the existing mainline build (tools/ref/build-nemotron-ref.sh, run under either nemotron profile; it does not rebuild it) and
 # writes $BLOOMERY_DATA/ref-nemotron-logits (refset family ref-nemotron-logits). CUDA stays hidden.
 # No card: the lane is none.
 build-ref-nemotron:
@@ -878,6 +878,15 @@ dump-ref-nemotron:
 # existing build (tools/ref/build-chat-parse-ref.sh) into $BLOOMERY_DATA/bin/chat_parse_ref. No card: the lane is none.
 build-ref-chat-parse:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 ./tools/box.sh 'bash tools/ref/build-chat-parse-ref.sh'
+
+# Nemotron 3.5 Bolt (nemotron_h_moe) last-position logits: the same scripts as the Nano's under the nemotron_h_moe profile, which names its
+# own mainline tree (/home/user/llama.cpp-mainline-bolt, cd0a5b6a1) and so its own binary (nemotron_ref_moe). The 22 GB file on the CPU
+# into $BLOOMERY_DATA/ref-nemotron-moe-logits (refset family ref-nemotron-moe-logits).
+build-ref-nemotron-moe:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=90 BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'bash tools/ref/build-nemotron-ref.sh'
+
+dump-ref-nemotron-moe:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=312 BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'bash tools/ref/dump-nemotron.sh'
 
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.

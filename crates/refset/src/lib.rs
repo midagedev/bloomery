@@ -28,8 +28,8 @@
 //! - [`emb2`]: llama.cpp mainline's EmbeddingGemma 2 dumps and server
 //!   vectors (`tools/ref/emb2/emb2.sh`).
 //! - [`dequant`]: ggml's dequantized rows (`tools/ref/dump-dequant.sh`).
-//! - [`nemotron`]: mainline's last-position logits of Nemotron 3 Nano
-//!   (`tools/ref/nemotron_ref.cpp`).
+//! - [`nemotron`]: mainline's last-position logits of Nemotron 3 Nano and
+//!   3.5 Bolt (`tools/ref/nemotron_ref.cpp`).
 //! - [`census`]: the census stubs — header-only copies of many users' model
 //!   files, pinned by `tools/census/stubs.tsv` (the writer
 //!   `tools/type-census.py --stubs`) and checked against it.
