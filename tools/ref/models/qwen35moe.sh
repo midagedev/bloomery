@@ -123,8 +123,8 @@ ref_step_variant() {
     *)     return 1 ;;
   esac
   case $name in
-    d1k|u1s4|u1s5) STEP_TOKENS_FILE=$BLOOMERY_DATA/qwen35moe/corpus-prose.ids
-                   STEP_TOKENS_SHA256=dca5f89b2903f9ffd2f4e20eec18a9fdf3561bcb531a721a114e4fab68e925be ;;
+    d1k|u1s4|u1s5) STEP_TOKENS_FILE=$MTP_IDS
+                   STEP_TOKENS_SHA256=$MTP_IDS_SHA256 ;;
   esac
   # The fixture tier's d1k set also holds ik's routes of the prefill's positions (dump_ref --prefill-routes), as
   # qwen4exp.sh's long sets do: the picks, the raw gathered scores and the final weights a gate plants into a batch-fed run of

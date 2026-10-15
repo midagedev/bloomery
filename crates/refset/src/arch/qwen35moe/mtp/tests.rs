@@ -366,6 +366,15 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         "step row 1",
     );
     at(
+        "two step rows' numbers swapped",
+        &[],
+        &|d| {
+            swap(d, "step\t1\t12\t1\t6\t7", "step\t2\t12\t2\t6\t7");
+            swap(d, "step\t2\t13\t2\t8\t8", "step\t1\t13\t1\t8\t8");
+        },
+        "step row 2 is not step 1",
+    );
+    at(
         "a step row gone",
         &[],
         &|d| swap(d, "step\t2\t13\t2\t8\t8", ""),

@@ -16,7 +16,7 @@
 //! another file, and one written by another mainline build.
 
 use crate::RefError;
-use crate::columns::{Columns, Row, file_name, one};
+use crate::columns::{Columns, Row, file_name, need, one};
 use crate::family::{Family, Identity};
 use std::collections::HashSet;
 use std::fmt;
@@ -118,9 +118,7 @@ impl LogitsSet {
                 }
                 h if h.starts_with('#') => {}
                 "prompt" => {
-                    let c = cols.as_ref().ok_or_else(|| {
-                        RefError::malformed(&at, "a prompt row before its `# prompt columns` line")
-                    })?;
+                    let c = need(&cols, "prompt", &at)?;
                     let prompt = prompt_row(&c.row(line, &at)?, &at)?;
                     if !seen.insert(prompt.name.clone()) {
                         return Err(RefError::malformed(
