@@ -27,9 +27,10 @@ hand-run check-levers caught.
 Prints the verdict, the must-fix titles and where the output is (~/.cache/bloomery/pre-review/<branch>-<sha8>/).
 A CLEAN review also prints one line for the pull request body, with the full HEAD sha.
 A base that lacks commits origin/main has is behind it and is refused by name before the reviewer runs.
+A missing origin/main is not that case. A failed ancestry walk stops 70.
 Exit: 0 CLEAN; 1 MUST_FIX or a red pre-check; 75 no claude CLI, or a role past --minutes (default 10); 64 usage,
 or a base behind origin/main; 65 output post.py refused
-or a review with no verdict; 70 a context step that failed (named).
+or a review with no verdict; 70 a context step or a git command that failed (named).
 The failure it blocks: a pull request whose first Shingler review is a MUST_FIX, each fold another 10-27 minute round.
 """
 
@@ -367,8 +368,8 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     base_sha = git("rev-parse", args.base).strip()
     main_sha = git_ok("rev-parse", "--verify", "origin/main")
     if main_sha and base_sha != main_sha:
-        behind = git_ok("rev-list", "--count", f"{base_sha}..{main_sha}")
-        if behind not in (None, "0"):
+        behind = git("rev-list", "--count", f"{base_sha}..{main_sha}").strip()
+        if behind != "0":
             noun = "commit" if behind == "1" else "commits"
             raise Stop(64, f"pre-review: base {args.base} ({base_sha[:8]}) is behind origin/main ({main_sha[:8]}): "
                            f"origin/main has {behind} {noun} the base does not")
@@ -646,6 +647,19 @@ def self_test():
             rc, msgs = go("**Verdict: CLEAN**: should not run\n\n### Checked\nall")
             expect(rc == 64 and any("is behind origin/main" in m for m in msgs),
                    f"a base behind origin/main is refused by name before the review: {rc} {msgs}")
+            sh("git", "update-ref", "refs/remotes/origin/main", "basebr")
+            # A commit whose parent object is gone: rev-parse still names it, rev-list cannot walk it.
+            tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, capture_output=True,
+                                   check=True, text=True).stdout.strip()
+            parent = subprocess.run(["git", "commit-tree", tree, "-m", "parent"], cwd=repo,
+                                     capture_output=True, check=True, text=True).stdout.strip()
+            child = subprocess.run(["git", "commit-tree", tree, "-p", parent, "-m", "child"], cwd=repo,
+                                    capture_output=True, check=True, text=True).stdout.strip()
+            os.remove(os.path.join(repo, ".git", "objects", parent[:2], parent[2:]))
+            sh("git", "update-ref", "refs/remotes/origin/main", child)
+            rc, msgs = go("**Verdict: CLEAN**: should not run\n\n### Checked\nall")
+            expect(rc == 70 and any("rev-list" in m for m in msgs),
+                   f"a failed ancestry walk stops 70: {rc} {msgs}")
             sh("git", "update-ref", "refs/remotes/origin/main", "basebr")
             keep = os.path.join(t, "home/.cache/bloomery/pre-review/topic-" + git("rev-parse", "HEAD").strip()[:8])
             ctx_files = set(os.listdir(os.path.join(keep, "ctx")))
