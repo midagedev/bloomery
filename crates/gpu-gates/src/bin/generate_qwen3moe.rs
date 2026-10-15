@@ -2263,7 +2263,9 @@ mod cli {
             .f("load_s", t.elapsed().as_secs_f64())
             .print();
         if mode == StepMode::Graph {
-            Record::new(&record::CAPTURE).u("graph_nodes", nodes).print();
+            Record::new(&record::CAPTURE)
+                .u("graph_nodes", nodes)
+                .print();
         }
         Ok(m)
     }
