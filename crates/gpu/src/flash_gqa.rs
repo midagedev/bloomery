@@ -2769,10 +2769,8 @@ unsafe fn seg_scalar_g<const G: usize>(
     vs: *mut u64,
     ws: *mut f32,
 ) {
-    const { assert!(G == GROUP || G == GROUP_5) };
-    // Eight fills the block, so that instance's pad checks are `true`.
-    // An inline const: a nested const item cannot name the generic parameter.
-    let full = const { G == GROUP };
+    // The group-of-eight entry keeps its own body. This core is a shorter group.
+    const { assert!(G < GROUP) };
 
     let b = thread::blockIdx_x() as usize;
     let nkv = n_kv as usize;
@@ -2797,7 +2795,7 @@ unsafe fn seg_scalar_g<const G: usize>(
     let span = seg_span(limit, n_seg, seg_keys as usize);
     let lo = seg * span;
     if lo >= limit {
-        if lane == 0 && (full || w < G) {
+        if lane == 0 && w < G {
             // SAFETY: a live warp's h < (kh + 1)·G <= n_head, so idx <
             // m·n_head·segs and both slots are inside part_ms.
             unsafe {
@@ -2809,10 +2807,10 @@ unsafe fn seg_scalar_g<const G: usize>(
     }
     let hi = (lo + span).min(limit);
 
-    // Row t's group query rows. A full group stages four values on every
-    // thread; a short group stages only the threads that own its rows.
+    // Row t's group query rows. A short group stages only the threads that
+    // own its rows.
     let qb = (t * n_head + kh * G) * HEAD;
-    if full || tid < G * HEAD / 4 {
+    if tid < G * HEAD / 4 {
         let mut i = 0usize;
         while i < 4 {
             // SAFETY: the thread owns four values inside the group's
@@ -2862,7 +2860,7 @@ unsafe fn seg_scalar_g<const G: usize>(
         }
         thread::sync_threads();
 
-        if full || w < G {
+        if w < G {
             // The score of key t0 + lane for head h.
             let live = t0 + lane < hi;
             let mut a = [0.0f32; ILP];
@@ -2896,7 +2894,7 @@ unsafe fn seg_scalar_g<const G: usize>(
         t0 += KEY_TILE;
     }
 
-    if full || w < G {
+    if w < G {
         // SAFETY: idx is inside the partials, as on the neutral path; lane
         // `lane` owns dims 4·lane .. +3.
         unsafe {
@@ -2907,8 +2905,8 @@ unsafe fn seg_scalar_g<const G: usize>(
             *part_v.get_unchecked_mut(o + 3) = acc[3];
         }
     }
-    // Lane 0 writes (m, s). A full group keeps this the kernel's own test.
-    if lane == 0 && (full || w < G) {
+    // Lane 0 of a live warp writes (m, s).
+    if lane == 0 && w < G {
         // SAFETY: idx is inside part_ms, as on the neutral path.
         unsafe {
             *part_ms.get_unchecked_mut(2 * idx) = mx;
