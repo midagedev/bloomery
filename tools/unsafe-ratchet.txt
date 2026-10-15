@@ -241,7 +241,11 @@ gguf 9 2 0
 # body that calls it (its input and output through raw pointers), each block with its SAFETY line.
 # PIN(2026-10-15): gpu 1816 -> 1818 blocks, new code, not old code relaxed: the tier link's RDMA end registers its
 # page with its NIC and posts its writes from it (host/link/rdma.rs), two blocks, each with its SAFETY line.
-gpu 1818 198 10
+# PIN(2026-10-16): gpu 1818 -> 1843 blocks, 198 -> 199 fns, new kernel entries, not old code relaxed: the
+# Mamba-2 prompt pass (mamba2_steps, mamba2_ring_tail, mamba2_norm_rows and their pass_input helper, an unsafe fn)
+# adds 23 blocks and the packed Q5_0 GEMM reader (gemm_q5_0p) adds 2 (its load and store); each block has its
+# SAFETY line.
+gpu 1843 199 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
