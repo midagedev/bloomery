@@ -1,0 +1,19 @@
+# Mainline llama.cpp (cd0a5b6a1, build-cuda) on Nemotron 3.5 Bolt 74B-A9B 24 GB on the RTX 3090 (250 W cap),
+# whole on the card if its 20.5 GiB fit: the 3090's own target table beside the A6000's (s1187, 81.36 tok/s at
+# depth 6). Derived from the A6000 row by the cards' DRAM rates (936 vs 768 GB/s peak), less for the cap:
+# 80..110 tok/s.
+kind: baseline
+question: where does mainline llama.cpp decode and prefill Nemotron 3.5 Bolt 74B-A9B 24 GB on the RTX 3090?
+term: tok/s @ n = 96, depth 6, NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf, llama-bench -ngl 99 -fa on, RTX
+  3090
+unit: tok/s
+predict: 80..110
+condition: one lease, BLOOMERY_TIMING_GPU the 3090, the default rounds; arms lcpp:6 lcpp:4096 lcpppp:512
+  lcpppp:4096; a load that does not fit is a FAIL row named by the runner, not a number; busy tags read beside
+  each mean
+reason: the 3090's reference rows for Bolt; why now: the user asked for Bolt baselines first, and the 3090 is
+  free
+decide-in: publish the 3090 table beside the A6000's
+decide-below: the 3090's cap or the NVFP4 path is the term: read the clock-event mask in the witness
+decide-above: the 3090 carries the IQ2_XXS and NVFP4 reads better than the A6000: note it for R1's per-card
+  targets

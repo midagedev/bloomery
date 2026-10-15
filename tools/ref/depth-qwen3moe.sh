@@ -754,6 +754,9 @@ q3_self_test() {
   want nemotron-ik 64 "arm 'ik:6': the nemotron_h profile runs ours, bin: and mainline llama.cpp arms"
   run_parse BLOOMERY_MODEL=nemotron_h -- mrspp:512
   want nemotron-mrs 64 "arm 'mrspp:512': the nemotron_h profile runs ours, bin: and mainline llama.cpp arms"
+  # The Bolt profile (nemotron_h_moe) refuses the same arms, by its own name.
+  run_parse BLOOMERY_MODEL=nemotron_h_moe -- ik:6
+  want nemotron-moe-ik 64 "arm 'ik:6': the nemotron_h_moe profile runs ours, bin: and mainline llama.cpp arms"
   # The refusals, each by name before anything runs.
   run_parse -- 6@
   want empty-list 64 "an empty NAME=VALUE list"
@@ -1291,9 +1294,9 @@ esac
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 case $MODEL_NAME in
-  qwen3moe | qwen35moe | qwen4exp | nemotron_h) ;;
+  qwen3moe | qwen35moe | qwen4exp | nemotron_h | nemotron_h_moe) ;;
   *)
-    echo "depth-qwen3moe.sh: the profile is $MODEL_NAME — pick qwen3moe, qwen35moe, qwen4exp or nemotron_h on the Mac side (BLOOMERY_MODEL=…)" >&2
+    echo "depth-qwen3moe.sh: the profile is $MODEL_NAME — pick qwen3moe, qwen35moe, qwen4exp, nemotron_h or nemotron_h_moe on the Mac side (BLOOMERY_MODEL=…)" >&2
     exit 64
     ;;
 esac
@@ -1348,7 +1351,7 @@ ARMS=("$@")
 if [ ${#ARMS[@]} -eq 0 ]; then
   # nemotron_h has no ik arm (the refusal below), so its default is ours and mainline.
   ARMS=(6 lcpp:6)
-  [ "$MODEL_NAME" = nemotron_h ] || ARMS=(6 ik:6 lcpp:6)
+  case $MODEL_NAME in nemotron_h | nemotron_h_moe) ;; *) ARMS=(6 ik:6 lcpp:6) ;; esac
 fi
 ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 # Per arm, by its index in ARMS: the kind (ours, ref, srv or bin), the depth, the row label, the engine
@@ -1659,12 +1662,14 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
   kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS='' AMEM='' AMODEL='' APREFILL='' blist=''
-  # nemotron_h: ik has no nemotron_h, and no mistral.rs build here is shown to load one.
-  if [ "$MODEL_NAME" = nemotron_h ]; then
-    case $eng in
-      ik* | mrs*) arm_refuse "$a" "the nemotron_h profile runs ours, bin: and mainline llama.cpp arms: ik has no nemotron_h, and no mistral.rs build here is shown to load one" ;;
-    esac
-  fi
+  # The nemotron profiles: ik has neither, and no mistral.rs build here is shown to load one.
+  case $MODEL_NAME in
+    nemotron_h | nemotron_h_moe)
+      case $eng in
+        ik* | mrs*) arm_refuse "$a" "the $MODEL_NAME profile runs ours, bin: and mainline llama.cpp arms: ik has no $MODEL_NAME, and no mistral.rs build here is shown to load one" ;;
+      esac
+      ;;
+  esac
   # `@` is ours, a prose arm's or a bin: arm's list: split at it first, so a value with a `:` is not
   # read as a reference's arm. place=, model= and prefill= on a reference or server arm are refused by name
   # (the header's Placement, model=, Prefill).

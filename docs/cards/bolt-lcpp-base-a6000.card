@@ -1,0 +1,17 @@
+# Mainline llama.cpp (cd0a5b6a1, #30520, the first tree to load the file; built here with CUDA in build-cuda)
+# on Nemotron 3.5 Bolt 74B-A9B 24 GB on the RTX A6000, whole on the card: the target rows Bolt work is judged
+# against before our engine has a load path. Derived band: ~9B active parameters at ~4.5 bits is ~5 GB a
+# token, at 600-700 GB/s 7-9 ms, plus attention and the router: 60..130 tok/s, wide because the NVFP4 experts
+# run without FP4 hardware on sm_86.
+kind: baseline
+question: where does mainline llama.cpp decode and prefill Nemotron 3.5 Bolt 74B-A9B 24 GB on the A6000?
+term: tok/s @ n = 96, depth 6, NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf, llama-bench -ngl 99 -fa on, RTX
+  A6000
+unit: tok/s
+predict: 60..130
+condition: one lease, BLOOMERY_CARD=a6000, the default rounds; arms lcpp:6 lcpp:4096 lcpppp:512 lcpppp:4096,
+  no ours arm (no load path yet); the 3090 left to models' gates; busy tags read beside each mean
+reason: the reference rows Bolt work is judged against; why now: the A6000 is idle while engine's Bolt R0 runs
+decide-in: publish the rows as Bolt's target table; profile the decode step's top kernels next
+decide-below: the NVFP4 expert path is the term: name its kernel in the nsys table
+decide-above: the bytes a token are fewer than derived: re-read the file's expert types

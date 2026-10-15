@@ -1,0 +1,15 @@
+# Mainline llama.cpp (cd0a5b6a1) decoding Nemotron 3.5 Bolt 74B-A9B 24 GB on the RTX A6000 under Nsight
+# Systems: its top kernels by time a token, the shape Bolt work aims at. bolt-lcpp-base-a6000.card measured
+# 81.36 tok/s at depth 6 (box job s1187), a 12.3 ms token.
+kind: profile
+question: which kernels take mainline llama.cpp's 12.3 ms Bolt decode token on the A6000?
+term: kernel ms a token (cuda_gpu_kern_sum total / tokens), llama-bench -p 0 -n 64 -d 6 -r 1 -ngl 99 -fa on,
+  graph node tracing, RTX A6000
+unit: ms
+predict: 11..13.5
+condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, nsys --cuda-graph-trace=node; the kernel sum a
+  token read beside the 12.3 ms token and nsys's own overhead named
+decide-in: name the top kernels by ms a token and, where the type is known, their byte rate: Bolt's kernel
+  targets, written for engine
+decide-below: the token is launch- or sync-bound in llama.cpp: count its graph nodes
+decide-above: nsys moved the token; read the replay windows instead of the totals
