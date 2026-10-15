@@ -1299,6 +1299,18 @@ EOF
     check bounded-capture-rc "$RC" 3
     check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
     RC=0
+    lease_filter 10 stdout "$t/filter-both" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    check bounded-filter-command-rc "$RC" 3
+    check bounded-filter-combined-output "$(cat "$t/filter-both")" "$(printf 'out\nerr')"
+    RC=0
+    lease_filter 10 stderr "$t/filter-stderr" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    check bounded-filter-stderr-rc "$RC" 3
+    check bounded-filter-stdout "$(cat "$LEASE_OUT_FILE")" out
+    check bounded-filter-stderr "$(cat "$t/filter-stderr")" err
+    RC=0
+    lease_filter 10 stdout "$t/filter-failed" sh -c 'cat; exit 4' -- echo out || RC=$?
+    check bounded-filter-reader-rc "$RC" 4
+    RC=0
     lease_bounded 5 bash -c 'source "$1"; lease_filter 0600 stdout "$2" cat -- true' \
       _ "$LEASE_TREE/tools/ref/lease.sh" "$t/refused-filter" > "$t/refused-filter-log" 2>&1 || RC=$?
     check bounded-filter-refused-rc "$RC" 64

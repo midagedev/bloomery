@@ -155,14 +155,8 @@ stamp() {
 
 # bench <log>: one bench run, its lines stamped; its rc.
 bench() {
-  local r=0 sp
-  lease_out_init || return 70
-  stamp < "$LEASE_OUT_FIFO" > "$1" &
-  sp=$!
-  BLOOMERY_THREADS=$THREADS BLOOMERY_HOST_LEASE=1 LEASE_BOUNDED_OUT=$LEASE_OUT_FIFO lease_bounded "$BOUND" "$BENCH" --time --rounds 1 \
-    --seconds "$SECS" --warmup "$WARMUP" --arms "$ARMS" || r=$?
-  wait "$sp" || true
-  return "$r"
+  BLOOMERY_THREADS=$THREADS BLOOMERY_HOST_LEASE=1 lease_filter "$BOUND" stdout "$1" stamp -- \
+    "$BENCH" --time --rounds 1 --seconds "$SECS" --warmup "$WARMUP" --arms "$ARMS"
 }
 
 WITNESS=(head loadavg pressure-cpu pressure-io card gpus gpu-apps busiest lock-holder cpu-freq meminfo model)
