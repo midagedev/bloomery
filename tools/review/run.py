@@ -372,7 +372,9 @@ def self_test():
         except KeyboardInterrupt:
             assert "fakefake" not in open(os.path.join(trace, "reviewer.ndjson")).read()
 
-        # The time limit stops the whole process group, a grandchild included.
+        # The time limit stops the whole process group, a grandchild included. The pid file can still be empty
+        # right after launch returns, and a killed grandchild can linger as a zombie until it is reaped: wait
+        # for a whole pid, then count only a live process as outliving the limit.
         os.makedirs(os.path.join(paths[0], "tools", "review"))
         pid = os.path.join(d, "pid")
         script = os.path.join(paths[0], "tools", "review", "run-claude.sh")
@@ -380,9 +382,20 @@ def self_test():
         MINUTES["reviewer"] = 0.02
         assert launch("claude", "reviewer", paths, {"PATH": os.environ.get("PATH", "")}) == TIMEOUT
         for _ in range(50):
+            text = read(pid)
+            if text and text.endswith("\n") and text.strip().isdigit():
+                grandchild = int(text)
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the grandchild's pid never appeared")
+        for _ in range(50):
             try:
-                os.kill(int(open(pid).read()), 0)
+                os.kill(grandchild, 0)
             except ProcessLookupError:
+                break
+            if subprocess.run(["ps", "-o", "stat=", "-p", str(grandchild)], capture_output=True,
+                              text=True).stdout.startswith("Z"):
                 break
             time.sleep(0.1)
         else:
