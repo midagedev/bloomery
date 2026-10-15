@@ -135,6 +135,18 @@
 //! for bit its f16 twin on the synthesized dequantized cache at 5,121 and
 //! 65,537, and one launch of [`ROWS`] rows at counts straddling the
 //! threshold each row bit for bit its one-row launch.
+//!
+//! Group 16 (`enqueue_pass` at [`GROUP_16`], two group-of-eight packs a key
+//! head through windows), at Nemotron 3.5 Bolt's 32 query heads over 2 key
+//! heads of 128, on a seeded cache NaN past the count, both passes, at 6,
+//! 512 and 4,096 keys: every head within the band above of the exact
+//! attention over its key head `h / 16`; bit for bit the group-of-eight
+//! launch over planes holding each key head twice (the eight-head entry's
+//! own arithmetic, which the windows must not move); a rerun bit-identical.
+//! At 512 keys the prefill shape and the `key_count` fault clause above at
+//! group 16; at 4,096 the captured launch, `2 · n_kv` segment nodes of
+//! [`SEGMENTS`] blocks and one merge of `n_head` blocks, replaying the eager
+//! bits.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -145,8 +157,8 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GROUP_5, GqaArgs, GqaQ8Args, HEAD, KEY_TILE, SEG_KEYS, SEGMENTS,
-        partials_ms_len, partials_v_len, seg_span,
+        FlashGqaKernels, GROUP, GROUP_5, GROUP_16, GqaArgs, GqaQ8Args, HEAD, KEY_TILE, SEG_KEYS,
+        SEGMENTS, partials_ms_len, partials_v_len, seg_span,
     };
     use bloomery_gpu::flash_gqa_prefill::{
         FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE,
@@ -228,9 +240,10 @@ mod gate {
             .collect()
     }
 
-    /// One launch of `m` query rows (`q` and `n_keys` hold `m` each) over
-    /// the cache planes, into fresh scratch, raising on `fault`, read back.
-    fn run_once(
+    /// One launch of `m` query rows (`q` and `n_keys` hold `m` each) at `G`
+    /// query heads a key head over the cache planes, into fresh scratch,
+    /// raising on `fault`, read back.
+    fn run_once<const G: usize>(
         k: &FlashGqaKernels,
         (stream, fault): (&CudaStream, FaultSink),
         q: &DeviceBuffer<f32>,
@@ -239,11 +252,11 @@ mod gate {
         g: &Geom,
         mma: bool,
     ) -> Result<Vec<f32>, GateError> {
-        let (n_head, m) = (g.n_kv * GROUP, n_keys.len());
+        let (n_head, m) = (g.n_kv * G, n_keys.len());
         let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(m, n_head))?;
         let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * n_head * HEAD)?;
-        k.enqueue_pass::<GROUP>(
+        k.enqueue_pass::<G>(
             stream,
             GqaArgs {
                 q,
@@ -265,9 +278,10 @@ mod gate {
         Ok(y.to_host_vec(stream)?)
     }
 
-    /// The prefill shape (module doc): one launch of [`ROWS`] rows against
-    /// each row's one-row launch. Returns whether every row matched.
-    fn rows_check(
+    /// The prefill shape (module doc): one launch of [`ROWS`] rows at `G`
+    /// query heads a key head against each row's one-row launch. Returns
+    /// whether every row matched.
+    fn rows_check<const G: usize>(
         k: &FlashGqaKernels,
         gpu: &Gpu,
         q: &[f32],
@@ -278,11 +292,11 @@ mod gate {
     ) -> Result<bool, GateError> {
         let stream = gpu.stream();
         let run = (stream, gpu.unlabelled_sink());
-        let n_head = g.n_kv * GROUP;
+        let n_head = g.n_kv * G;
         let rows = rotated_rows(q, n_head);
         let limits = spread_counts(live)?;
         let cache = (&inp.kc, &inp.vc);
-        let all = run_once(
+        let all = run_once::<G>(
             k,
             run,
             &DeviceBuffer::from_host(stream, &rows.concat())?,
@@ -293,7 +307,7 @@ mod gate {
         )?;
         let mut same = true;
         for (t, row) in rows.iter().enumerate() {
-            let one = run_once(
+            let one = run_once::<G>(
                 k,
                 run,
                 &DeviceBuffer::from_host(stream, row)?,
@@ -305,7 +319,7 @@ mod gate {
             same &= bits_equal(&all[t * n_head * HEAD..(t + 1) * n_head * HEAD], &one);
         }
         println!(
-            "rows pass={} m={ROWS} keys={limits:?} ctx={}: each row = its one-row launch bit for bit {}",
+            "rows group={G} pass={} m={ROWS} keys={limits:?} ctx={}: each row = its one-row launch bit for bit {}",
             if mma { "mma" } else { "scalar" },
             g.ctx,
             verdict(same)
@@ -315,8 +329,9 @@ mod gate {
 
     /// The decode flash's refusal (module doc): the prefill-shape launch with
     /// row 3's count past the cache and row 5's zero, labelled with layer 13,
-    /// against the same launch clean. Returns whether every check held.
-    fn decode_fault(
+    /// against the same launch clean, at `G` query heads a key head. Returns
+    /// whether every check held.
+    fn decode_fault<const G: usize>(
         k: &FlashGqaKernels,
         gpu: &Gpu,
         q: &[f32],
@@ -329,7 +344,7 @@ mod gate {
         let layer = 13usize;
         let run = (stream, gpu.layer_sink(layer)?);
         let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::KeyCount));
-        let n_head = g.n_kv * GROUP;
+        let n_head = g.n_kv * G;
         let w = n_head * HEAD;
         let qd = DeviceBuffer::from_host(stream, &rotated_rows(q, n_head).concat())?;
         let clean = spread_counts(live)?;
@@ -339,7 +354,7 @@ mod gate {
         bad[bad_zero] = 0;
         let cache = (&inp.kc, &inp.vc);
         let before = gpu.fault()?;
-        let y = run_once(
+        let y = run_once::<G>(
             k,
             run,
             &qd,
@@ -349,7 +364,7 @@ mod gate {
             mma,
         )?;
         let after_clean = gpu.fault()?;
-        let yb = run_once(
+        let yb = run_once::<G>(
             k,
             run,
             &qd,
@@ -369,7 +384,7 @@ mod gate {
                 others_same &= bits_equal(a, b);
             }
         }
-        let y2 = run_once(
+        let y2 = run_once::<G>(
             k,
             run,
             &qd,
@@ -386,7 +401,7 @@ mod gate {
             && others_same
             && clean_again;
         println!(
-            "decode fault pass={} m={ROWS} counts {} (past ctx {}) and 0 at rows {bad_hi}, {bad_zero}: word \
+            "decode fault group={G} pass={} m={ROWS} counts {} (past ctx {}) and 0 at rows {bad_hi}, {bad_zero}: word \
              \"{}\" (want \"{}\", clean before {} and after the clean run {}), those rows NaN {bad_nan}, \
              other rows bit-identical {others_same}, clean rerun bits and word clean {clean_again} {}",
             if mma { "mma" } else { "scalar" },
@@ -1230,7 +1245,7 @@ mod gate {
         let y = run_once_q8(k, run, &qd, &nk, &c, g, false)?;
         let y2 = run_once_q8(k, run, &qd, &nk, &c, g, false)?;
         let ys = run_once_q8(k, run, &qd, &nk, &c, g, true)?;
-        let tw = run_once(k, run, &qd, &nk, (&c.k16, &c.v16), g, true)?;
+        let tw = run_once::<GROUP>(k, run, &qd, &nk, (&c.k16, &c.v16), g, true)?;
         let (rerun, sentinel) = (bits_equal(&y, &y2), bits_equal(&y, &ys));
         let twin_same = bits_equal(&y, &tw);
         let dec_ok = rerun && sentinel && twin_same;
@@ -1778,6 +1793,189 @@ mod gate {
         Ok(ok)
     }
 
+    /// The group-16 clause's key heads (Nemotron 3.5 Bolt's 32/2), its counts,
+    /// and its cache height: the largest count and a tile of NaN rows past it.
+    const G16_KV: usize = 2;
+    const G16_KEYS: [usize; 3] = [6, 512, 4_096];
+    const G16_CTX: usize = 4_096 + KEY_TILE;
+
+    /// Head 128, [`GROUP_16`] query heads a key head (module doc of
+    /// `flash_gqa`: two group-of-eight packs a key head), both passes, on a
+    /// seeded query and cache whose rows at or past the count are NaN. At
+    /// each count of [`G16_KEYS`]: every head within its band of the exact
+    /// attention over key head `h / 16`; bit for bit the group-of-eight
+    /// launch over planes holding each key head twice (`2 · n_kv` key heads,
+    /// so head `h` reads key head `h / 8` of them, the real `h / 16`); a
+    /// rerun bit-identical. At 512 keys the prefill shape and the fault
+    /// clause at group 16; at 4,096 the captured launch: `2 · n_kv` segment
+    /// nodes of [`SEGMENTS`] blocks and one merge of `n_head`, replaying the
+    /// eager bits.
+    fn group16(k: &FlashGqaKernels, gpu: &Gpu, scale: f32) -> Result<bool, GateError> {
+        let (n_kv, ctx) = (G16_KV, G16_CTX);
+        let n_head = n_kv * GROUP_16;
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let to16 = |v: Vec<f32>| -> Vec<u16> { v.into_iter().map(f32_to_f16_bits).collect() };
+        let q: Vec<f32> = activations(HEAD, n_head, 1601)
+            .iter()
+            .map(|v| v * SEED_Q_SCALE)
+            .collect();
+        let kb = to16(activations(HEAD, n_kv * ctx, 1602));
+        let vb = to16(activations(HEAD, n_kv * ctx, 1603));
+        let (kf, vf): (Vec<f32>, Vec<f32>) = (
+            kb.iter().map(|&h| half_to_f32(h)).collect(),
+            vb.iter().map(|&h| half_to_f32(h)).collect(),
+        );
+        let past = |b: &[u16], live: usize| -> Vec<u16> {
+            b.iter()
+                .enumerate()
+                .map(|(i, &h)| if (i / HEAD) % ctx >= live { NAN16 } else { h })
+                .collect()
+        };
+        // Each key head's plane twice: key head `j` of the twin is `j / 2`.
+        let twice = |b: &[u16]| -> Vec<u16> {
+            b.chunks(ctx * HEAD)
+                .flat_map(|p| p.iter().chain(p).copied())
+                .collect()
+        };
+        let g = Geom { scale, n_kv, ctx };
+        let g_twin = Geom {
+            scale,
+            n_kv: n_kv * GROUP_16 / GROUP,
+            ctx,
+        };
+        let mut ok = true;
+        for keys in G16_KEYS {
+            let (kp, vp) = (past(&kb, keys), past(&vb, keys));
+            let inp = Inputs {
+                q: DeviceBuffer::from_host(stream, &q)?,
+                kc: DeviceBuffer::from_host(stream, &kp)?,
+                vc: DeviceBuffer::from_host(stream, &vp)?,
+                n_keys: DeviceBuffer::from_host(stream, &[u32::try_from(keys)?])?,
+            };
+            let (tk, tv) = (
+                DeviceBuffer::from_host(stream, &twice(&kp))?,
+                DeviceBuffer::from_host(stream, &twice(&vp))?,
+            );
+            let exacts: Vec<Exact> = (0..n_head)
+                .map(|h| {
+                    let plane = (h / GROUP_16) * ctx * HEAD;
+                    exact(
+                        &q[h * HEAD..(h + 1) * HEAD],
+                        &kf[plane..plane + keys * HEAD],
+                        &vf[plane..plane + keys * HEAD],
+                        keys,
+                        scale,
+                    )
+                })
+                .collect();
+            for mma in [false, true] {
+                let name = if mma { "mma" } else { "scalar" };
+                let run = (stream, unl);
+                let cache = (&inp.kc, &inp.vc);
+                let y = run_once::<GROUP_16>(k, run, &inp.q, &inp.n_keys, cache, &g, mma)?;
+                let rerun = bits_equal(
+                    &y,
+                    &run_once::<GROUP_16>(k, run, &inp.q, &inp.n_keys, cache, &g, mma)?,
+                );
+                let yt = run_once::<GROUP>(k, run, &inp.q, &inp.n_keys, (&tk, &tv), &g_twin, mma)?;
+                let twin = bits_equal(&y, &yt);
+                let mut worst = 0.0f64;
+                let mut band = true;
+                for (h, ex) in exacts.iter().enumerate() {
+                    let bound = if mma { &ex.bound_mma } else { &ex.bound_ours };
+                    for d in 0..HEAD {
+                        let e = (f64::from(y[h * HEAD + d]) - ex.o[d]).abs() / bound[d];
+                        worst = worst.max(e);
+                        band &= e <= 1.0;
+                    }
+                }
+                let pass = band && twin && rerun;
+                println!(
+                    "flash group16 head={HEAD} heads={n_head}/{n_kv} keys={keys} ctx={ctx} pass={name}: \
+                     measured/bound {worst:.3e} band={band} group8_twin_bits={twin} rerun={rerun} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+                if keys == 512 {
+                    ok &= rows_check::<GROUP_16>(k, gpu, &q, &inp, keys, &g, mma)?;
+                    ok &= decode_fault::<GROUP_16>(k, gpu, &q, &inp, keys, &g, mma)?;
+                }
+                if keys == 4_096 {
+                    ok &= group16_graph(k, gpu, &inp, &g, mma, &y)?;
+                }
+            }
+        }
+        Ok(ok)
+    }
+
+    /// [`group16`]'s captured launch: one row, its nodes and their grids, and
+    /// the replay's bits against the eager `want`.
+    fn group16_graph(
+        k: &FlashGqaKernels,
+        gpu: &Gpu,
+        inp: &Inputs,
+        g: &Geom,
+        mma: bool,
+        want: &[f32],
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let n_head = g.n_kv * GROUP_16;
+        let (mut pv, mut pms, mut y) = (
+            DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?,
+            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?,
+            DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?,
+        );
+        let graph = gpu.capture(|s| {
+            k.enqueue_pass::<GROUP_16>(
+                s,
+                GqaArgs {
+                    q: &inp.q,
+                    kc: &inp.kc,
+                    vc: &inp.vc,
+                    n_keys: &inp.n_keys,
+                    scale: g.scale,
+                    n_kv: g.n_kv,
+                    ctx: g.ctx,
+                    m: 1,
+                    part_v: &mut pv,
+                    part_ms: &mut pms,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut y,
+                },
+                mma,
+            )
+        })?;
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let nodes = graph.nodes()?;
+        let grids = |prefix: &str| -> Vec<[u32; 3]> {
+            nodes
+                .iter()
+                .filter_map(|n| n.kernel.as_ref())
+                .filter(|kn| kn.name.starts_with(prefix))
+                .map(|kn| kn.grid)
+                .collect()
+        };
+        let (seg, merge) = (grids("gqa_flash_seg"), grids("gqa_flash_merge"));
+        let want_seg = vec![[u32::try_from(SEGMENTS)?, 1, 1]; g.n_kv * GROUP_16 / GROUP];
+        let want_merge = vec![[u32::try_from(n_head)?, 1, 1]];
+        let shape = nodes.len() == want_seg.len() + 1
+            && nodes.iter().all(|n| n.kernel.is_some())
+            && seg == want_seg
+            && merge == want_merge;
+        let same = bits_equal(&y.to_host_vec(stream)?, want);
+        let pass = shape && same;
+        println!(
+            "flash group16 graph pass={} nodes={} seg_grids={seg:?} (want {want_seg:?}) \
+             merge_grids={merge:?} (want {want_merge:?}) replay_bits_eager={same} {}",
+            if mma { "mma" } else { "scalar" },
+            nodes.len(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
@@ -1875,7 +2073,7 @@ mod gate {
                 let mut ys = Vec::new();
                 for (pass, mma) in [false, true].into_iter().enumerate() {
                     let run = |i: &Inputs| {
-                        run_once(
+                        run_once::<GROUP>(
                             &k,
                             (stream, gpu.unlabelled_sink()),
                             &i.q,
@@ -1920,8 +2118,8 @@ mod gate {
                     }
                     set_ok &= layer_ok;
                     if l == 0 {
-                        set_ok &= rows_check(&k, &gpu, &q, &inp, live, &g, mma)?;
-                        set_ok &= decode_fault(&k, &gpu, &q, &inp, live, &g, mma)?;
+                        set_ok &= rows_check::<GROUP>(&k, &gpu, &q, &inp, live, &g, mma)?;
+                        set_ok &= decode_fault::<GROUP>(&k, &gpu, &q, &inp, live, &g, mma)?;
                     }
                     ys.push(y);
                 }
@@ -2020,6 +2218,7 @@ mod gate {
         ok &= seeded_ok;
         ok &= q8_window_refusal(&kp, &gpu, scale)?;
         ok &= group5(&k, &gpu, scale)?;
+        ok &= group16(&k, &gpu, scale)?;
         println!("gate_qwen3moe_flash: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

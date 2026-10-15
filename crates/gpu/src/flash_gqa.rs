@@ -47,6 +47,17 @@
 //! cores from the query rounded to f16 (`mma.m16n8k16`, the group's eight
 //! heads in rows 0–7 of a 16-row tile). The caller picks one per launch.
 //!
+//! A group of [`GROUP_16`] query heads a key head runs on those entries
+//! unchanged ([`FlashGqaKernels::enqueue_pass`] at `GROUP_16`): for each row
+//! `t`, key head `kh` and pack `p ∈ {0, 1}`, one segment launch of one row
+//! over one key head, through windows — the query heads `kh·16 + 8p ..` of
+//! row `t`, key head `kh`'s two planes, row `t`'s count, and those heads'
+//! partials at their place in the `m · n_head` layout — then the one merge
+//! over all `n_head` heads. A launch of one row and one key head reads the
+//! window's heads and plane exactly as the group-of-eight launch over planes
+//! holding each key head twice reads them, so every head's bits are that
+//! launch's.
+//!
 //! Keys at or past the live count get weight exactly zero and are never
 //! loaded: the staging writes zero for them, so a padded row holding a NaN
 //! pattern reaches no result.
@@ -143,6 +154,7 @@ use crate::flash::{
 };
 use crate::launch_u32;
 use crate::rope_neox::q8_plane_lens;
+use crate::tensor::{Window, WindowMut};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::{
@@ -234,6 +246,12 @@ const _: () = assert!(PACK_12 + PAD_12 == MMA_ROWS && PAD_12 <= PACK_12 && PACK_
 /// staged words, which five does not. The pass is scalar.
 pub const GROUP_5: usize = 5;
 const _: () = assert!(GROUP_5 == 5);
+
+/// Query heads a key head that [`FlashGqaKernels::enqueue_pass`] serves as
+/// two [`GROUP`]-head packs over the same planes (the module doc's group-16
+/// paragraph): no entry of its own.
+pub const GROUP_16: usize = 2 * GROUP;
+const _: () = assert!(GROUP_16.is_multiple_of(GROUP) && GROUP_16 > GROUP);
 
 /// Segments every decode launch cuts a row's keys into, whatever the cache
 /// height: per (row, key head) unit about one block for each SM of either
@@ -4454,6 +4472,21 @@ pub struct GqaArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
+/// One head-128 segment launch's inputs: [`GqaArgs`] without what only the
+/// merge reads.
+struct Seg<'a> {
+    q: &'a DeviceBuffer<f32>,
+    kc: &'a DeviceBuffer<u16>,
+    vc: &'a DeviceBuffer<u16>,
+    n_keys: &'a DeviceBuffer<u32>,
+    scale: f32,
+    n_kv: usize,
+    ctx: usize,
+    m: usize,
+    part_v: &'a mut DeviceBuffer<f32>,
+    part_ms: &'a mut DeviceBuffer<f32>,
+}
+
 /// [`FlashGqaKernels::enqueue_pass_256_p12_sel`]'s arguments: those of
 /// [`GqaArgs`] with each row's list (`m · width` cache rows, ascending) and its length
 /// (`n_sel`, `m` of them) in place of the live counts.
@@ -4589,20 +4622,23 @@ impl FlashGqaKernels {
     }
 
     /// Enqueue `m` rows' attention for `PACK` query heads a key head
-    /// (`GROUP`, or `GROUP_5` with `mma` false): the segment pass
-    /// (`m · n_kv · [`SEGMENTS`]` blocks; the tensor-core one when `mma`)
-    /// and the merge (`m · n_kv · PACK` blocks). Each block cuts its row's
-    /// range from the row's own count, so every count the kernels accept is
-    /// walked in full; a count of zero or past `ctx` raises
-    /// [`FaultSite::KeyCount`] on `a.fault` and its row is NaN. Two launches.
-    /// Asynchronous, allocation-free, capturable.
+    /// (`GROUP`, `GROUP_5` with `mma` false, or `GROUP_16`): the segment pass
+    /// (`m · n_kv · [`SEGMENTS`]` blocks; the tensor-core one when `mma`) and
+    /// the merge (`m · n_kv · PACK` blocks). At `GROUP_16` the segment pass is
+    /// the group-of-eight entry launched once a (row, key head, pack) — `m ·
+    /// n_kv · 2` launches of [`SEGMENTS`] blocks (the module doc's group-16
+    /// paragraph) — so a call is `2 · m · n_kv + 1` launches; else two. Each
+    /// block cuts its row's range from the row's own count, so every count the
+    /// kernels accept is walked in full; a count of zero or past `ctx` raises
+    /// [`FaultSite::KeyCount`] on `a.fault` and its row is NaN. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_pass<const PACK: usize>(
         &self,
         stream: &CudaStream,
         a: GqaArgs<'_>,
         mma: bool,
     ) -> Result<(), GpuError> {
-        const { assert!(PACK == GROUP || PACK == GROUP_5) };
+        const { assert!(PACK == GROUP || PACK == GROUP_5 || PACK == GROUP_16) };
         let what = "flash_gqa::enqueue";
         if PACK == GROUP_5 && mma {
             return Err(GpuError::shape(what, "group 5 requires the scalar pass"));
@@ -4629,33 +4665,46 @@ impl FlashGqaKernels {
                 format!("{name}.len() {got} < {need}"),
             ));
         }
-        let grid = launch_u32(what, "grid", a.m * a.n_kv * SEGMENTS)?;
-        let merge_grid = launch_u32(what, "merge grid", a.m * n_head)?;
+        let GqaArgs {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = a;
+        let seg = Seg {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v: &mut *part_v,
+            part_ms: &mut *part_ms,
+        };
+        // The merge's launch values, converted before any launch so a
+        // refused one leaves nothing enqueued.
+        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
         let heads = launch_u32(what, "n_head", n_head)?;
-        let n_kv = launch_u32(what, "n_kv", a.n_kv)?;
-        let ctx = launch_u32(what, "ctx", a.ctx)?;
+        let ctx_u = launch_u32(what, "ctx", ctx)?;
         let segs = launch_u32(what, "segs", SEGMENTS)?;
         let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
-        let m = launch_u32(what, "m", a.m)?;
-        let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
-        if PACK == GROUP_5 {
-            let prep = self.module.prepare_gqa_flash_seg_g5(cfg)?;
-            self.module.gqa_flash_seg_g5(
-                stream, &prep, a.q, a.kc, a.vc, a.n_keys, a.scale, n_kv, ctx, segs, seg_keys, m,
-                a.part_v, a.part_ms,
-            )?;
-        } else if mma {
-            let prep = self.module.prepare_gqa_flash_seg_mma(cfg)?;
-            self.module.gqa_flash_seg_mma(
-                stream, &prep, a.q, a.kc, a.vc, a.n_keys, a.scale, n_kv, ctx, segs, seg_keys, m,
-                a.part_v, a.part_ms,
-            )?;
-        } else {
-            let prep = self.module.prepare_gqa_flash_seg(cfg)?;
-            self.module.gqa_flash_seg(
-                stream, &prep, a.q, a.kc, a.vc, a.n_keys, a.scale, n_kv, ctx, segs, seg_keys, m,
-                a.part_v, a.part_ms,
-            )?;
+        let m_u = launch_u32(what, "m", m)?;
+        // Each arm names its instance: a `const` assert of the others would
+        // fail at the instantiation of this one.
+        match PACK {
+            GROUP_16 => self.seg_packs::<GROUP_16>(stream, what, seg, mma)?,
+            GROUP_5 => self.seg_pass::<GROUP_5>(stream, what, seg, mma)?,
+            _ => self.seg_pass::<GROUP>(stream, what, seg, mma)?,
         }
         let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
             merge_grid,
@@ -4663,9 +4712,127 @@ impl FlashGqaKernels {
             0,
         ))?;
         self.module.gqa_flash_merge(
-            stream, &prep, a.part_v, a.part_ms, a.n_keys, heads, ctx, segs, seg_keys, m, a.fault,
-            a.y,
+            stream, &prep, part_v, part_ms, n_keys, heads, ctx_u, segs, seg_keys, m_u, fault, y,
         )?;
+        Ok(())
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass`]'s segment launch at `PACK` (`GROUP`
+    /// or `GROUP_5`) query heads a key head: `s.m · s.n_kv ·` [`SEGMENTS`]
+    /// blocks of the pack's entry, the tensor-core one when `mma`. The
+    /// caller checked the buffers.
+    fn seg_pass<const PACK: usize>(
+        &self,
+        stream: &CudaStream,
+        what: &'static str,
+        s: Seg<'_>,
+        mma: bool,
+    ) -> Result<(), GpuError> {
+        const { assert!(PACK == GROUP || PACK == GROUP_5) };
+        let grid = launch_u32(what, "grid", s.m * s.n_kv * SEGMENTS)?;
+        let n_kv = launch_u32(what, "n_kv", s.n_kv)?;
+        let ctx = launch_u32(what, "ctx", s.ctx)?;
+        let segs = launch_u32(what, "segs", SEGMENTS)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m = launch_u32(what, "m", s.m)?;
+        let Seg {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            part_v,
+            part_ms,
+            ..
+        } = s;
+        let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
+        if PACK == GROUP_5 {
+            let prep = self.module.prepare_gqa_flash_seg_g5(cfg)?;
+            self.module.gqa_flash_seg_g5(
+                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
+                part_ms,
+            )?;
+        } else if mma {
+            let prep = self.module.prepare_gqa_flash_seg_mma(cfg)?;
+            self.module.gqa_flash_seg_mma(
+                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
+                part_ms,
+            )?;
+        } else {
+            let prep = self.module.prepare_gqa_flash_seg(cfg)?;
+            self.module.gqa_flash_seg(
+                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
+                part_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The segment pass of `PACK` (a multiple of [`GROUP`]) query heads a key
+    /// head as `PACK / GROUP` group-of-eight launches a (row, key head): row
+    /// `t`, key head `kh` and pack `p` launch [`Self::seg_pass`] at `GROUP`
+    /// over one row and one key head — the query heads `h0 = t·n_head +
+    /// kh·PACK + p·GROUP ..` of `s.q`, key head `kh`'s planes, row `t`'s
+    /// count — into the partials of heads `h0 ..`, where the merge over
+    /// `n_head` heads reads them. The caller checked the buffers, so every
+    /// window lies inside its parent.
+    fn seg_packs<const PACK: usize>(
+        &self,
+        stream: &CudaStream,
+        what: &'static str,
+        s: Seg<'_>,
+        mma: bool,
+    ) -> Result<(), GpuError> {
+        const { assert!(PACK.is_multiple_of(GROUP) && PACK > GROUP) };
+        let Seg {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+        } = s;
+        let n_head = n_kv * PACK;
+        let plane = ctx * HEAD;
+        let (f32_b, u16_b, u32_b) = (size_of::<f32>(), size_of::<u16>(), size_of::<u32>());
+        for t in 0..m {
+            let count = Window::<u32>::of(n_keys, t * u32_b, 1)?;
+            for kh in 0..n_kv {
+                let kw = Window::<u16>::of(kc, kh * plane * u16_b, plane)?;
+                let vw = Window::<u16>::of(vc, kh * plane * u16_b, plane)?;
+                for p in 0..PACK / GROUP {
+                    let h0 = t * n_head + kh * PACK + p * GROUP;
+                    let qw = Window::<f32>::of(q, h0 * HEAD * f32_b, GROUP * HEAD)?;
+                    let mut pv = WindowMut::<f32>::of_mut(
+                        &mut *part_v,
+                        partials_v_len(1, h0) * f32_b,
+                        partials_v_len(1, GROUP),
+                    )?;
+                    let mut pms = WindowMut::<f32>::of_mut(
+                        &mut *part_ms,
+                        partials_ms_len(1, h0) * f32_b,
+                        partials_ms_len(1, GROUP),
+                    )?;
+                    let one = Seg {
+                        q: &qw,
+                        kc: &kw,
+                        vc: &vw,
+                        n_keys: &count,
+                        scale,
+                        n_kv: 1,
+                        ctx,
+                        m: 1,
+                        part_v: &mut pv,
+                        part_ms: &mut pms,
+                    };
+                    self.seg_pass::<GROUP>(stream, what, one, mma)?;
+                }
+            }
+        }
         Ok(())
     }
 
