@@ -122,10 +122,3 @@ pub(crate) fn stamps_at(lanes: usize, lane: u32, at: u32) -> Result<Vec<u32>, Gp
     })? = at;
     Ok(st)
 }
-
-/// A layer's state store: `K` (the architecture's K/V planes) or a
-/// [`RecStore`].
-pub(crate) enum LayerStore<K> {
-    Kv(K),
-    Rec(RecStore),
-}

@@ -1518,9 +1518,10 @@ impl LaneWord {
 }
 
 /// A layer's state store: K/V planes by position, or a recurrent store.
-/// The variants are [`crate::recur::LayerStore`]'s; the methods below are
-/// this family's.
-pub(super) type LayerStore = crate::recur::LayerStore<KvPlanes>;
+pub(super) enum LayerStore {
+    Kv(KvPlanes),
+    Rec(RecStore),
+}
 
 /// A layer's store as one layer's enqueue borrows it.
 pub(super) enum StoreMut<'a> {
@@ -1528,7 +1529,7 @@ pub(super) enum StoreMut<'a> {
     Rec(&'a mut RecStore),
 }
 
-impl crate::recur::LayerStore<KvPlanes> {
+impl LayerStore {
     pub(super) fn as_mut(&mut self) -> StoreMut<'_> {
         match self {
             Self::Kv(k) => StoreMut::Kv(k),

@@ -152,9 +152,11 @@ mod gate {
         Ok(())
     }
 
-    /// `rows` of Q5_0 (`k` values, two blocks) whose low and high nibbles
-    /// differ, so a read of the low half's word in place of the high half's
-    /// disagrees with `dequant_row`.
+    /// `rows` of Q5_0 (`k` values, `k / 32` blocks) whose low and high
+    /// nibbles differ and whose codes differ from block to block, so a read
+    /// of the low half's word in place of the high half's, or of another
+    /// block's (another 32-block window's) words, disagrees with
+    /// `dequant_row`.
     fn q5_0_bytes(rows: usize, k: usize) -> Vec<u8> {
         let blocks = k / 32;
         let mut bytes = vec![0u8; rows * blocks * 22];
@@ -163,10 +165,14 @@ mod gate {
                 let blk = &mut bytes[(r * blocks + b) * 22..][..22];
                 let d = 0.5f32 + 0.25 * (b + r) as f32;
                 blk[..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-                let qh: u32 = 0xA5A5_5A5A ^ (r as u32).wrapping_mul(0x0101_0101);
+                let qh: u32 = 0xA5A5_5A5A
+                    ^ (r as u32).wrapping_mul(0x0101_0101)
+                    ^ (b as u32).wrapping_mul(0x9E37_79B9);
                 blk[2..6].copy_from_slice(&qh.to_le_bytes());
                 for j in 0..16 {
-                    blk[6 + j] = j as u8 | ((15 - j) as u8) << 4;
+                    let lo = (j + b) % 16;
+                    let hi = (15 - j + 3 * b) % 16;
+                    blk[6 + j] = lo as u8 | (hi as u8) << 4;
                 }
             }
         }
@@ -178,51 +184,23 @@ mod gate {
     /// past the table (NaN row, `FaultSite::TokenId`, the other rows intact).
     fn embed_q5_0(gpu: &Gpu) -> Result<bool, GateError> {
         const ROWS: usize = 4;
-        const K: usize = 64;
+        // 34 blocks: past the first 32-block window of the packed code plane.
+        const K: usize = 1088;
         let bytes = q5_0_bytes(ROWS, K);
         let packed = bloomery_gpu::q5::pack_q5_0(&bytes, K, ROWS)?;
         let cols = packed.len() / ROWS;
         let table = DeviceTensor::upload(gpu.stream(), &packed, ROWS, cols)?;
         let ids = [0u32, (ROWS - 1) as u32, 1];
-        let launch = |ids: &[u32], graph: bool| -> Result<(Embedded, usize), GateError> {
-            let stream = gpu.stream();
-            let idb = DeviceBuffer::from_host(stream, ids)?;
-            let p0 = DeviceBuffer::from_host(stream, &[POS0])?;
-            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; ids.len() * K])?;
-            let mut pos = DeviceBuffer::from_host(stream, &vec![SENT_POS; ids.len()])?;
-            let mut n_keys = DeviceBuffer::from_host(stream, &vec![SENT_POS; ids.len()])?;
-            let mut enqueue = |s: &CudaStream| {
-                gpu.elem().enqueue_embed_rows_q5_0(
-                    s,
-                    EmbedRowsArgs {
-                        w: &table,
-                        ids: &idb,
-                        pos0: &p0,
-                        first: FIRST,
-                        y: &mut y,
-                        pos: &mut pos,
-                        n_keys: &mut n_keys,
-                    },
-                    K,
-                )
-            };
-            let nodes = if graph {
-                let g = gpu.capture(&mut enqueue)?;
-                g.launch(stream)?;
-                g.node_count()
-            } else {
-                enqueue(stream)?;
-                0
-            };
-            stream.synchronize()?;
-            Ok((
-                Embedded {
-                    y: y.to_host_vec(stream)?,
-                    pos: pos.to_host_vec(stream)?,
-                    n_keys: n_keys.to_host_vec(stream)?,
-                },
-                nodes,
-            ))
+        let launch = |ids: &[u32], graph: bool| {
+            gather(
+                gpu,
+                (&table, Some(GgmlType::Q5_0)),
+                ids,
+                POS0,
+                FIRST,
+                K,
+                graph,
+            )
         };
         let (got, _) = launch(&ids, false)?;
         let mut want = vec![0.0f32; ids.len() * K];
@@ -316,7 +294,8 @@ mod gate {
     /// `ids` gathered from `table` (`k` values a row), the rows' positions
     /// from `pos0` and offset `first`: eagerly, or captured as a graph and
     /// replayed once, which also returns its node count. `ty` `None` takes
-    /// the Q4_K entry directly, `Some(t)` the K-quant entry of type `t`.
+    /// the Q4_K entry directly, `Some(Q5_0)` the Q5_0 entry, `Some(t)` the
+    /// K-quant entry of type `t`.
     #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
     fn gather(
         gpu: &Gpu,
@@ -345,6 +324,7 @@ mod gate {
             };
             match ty {
                 None => gpu.elem().enqueue_embed_rows_q4k(s, args),
+                Some(GgmlType::Q5_0) => gpu.elem().enqueue_embed_rows_q5_0(s, args, k),
                 Some(ty) => gpu.elem().enqueue_embed_rows_kquant(s, ty, args),
             }
         };
