@@ -1454,8 +1454,14 @@ FP
     && grep -q "^lane A  plain-any .*BLOOMERY_GATE_CARD=3090' just plain-any$" <<< "$out"; then
     pass 'card: an unpinned batch keeps the a6000-form recipe on the A6000, and the any recipe can take the 3090'
   else fail 'card: an unpinned batch keeps the a6000-form recipe on the A6000, and the any recipe can take the 3090' "$out"; fi
-  check 'card: --lanes 1 forces the A6000 for an a6000-form recipe' 0 \
-    "BLOOMERY_GATE_CARD=a6000' just a6-pin" "${gb[@]}" --lanes 1 --dry-run a6-pin
+  check 'card: one lane keeps the recipe default' 0 \
+    '^lane A  a6-pin +just a6-pin$' "${gb[@]}" --lanes 1 --dry-run a6-pin
+  check 'card: one lane preserves an item card override' 0 \
+    "^lane A  a6-pin .*BLOOMERY_GATE_CARD=3090' just a6-pin$" \
+    "${gb[@]}" --lanes 1 --dry-run 'a6-pin@BLOOMERY_GATE_CARD=3090'
+  check 'card: one lane preserves a caller card override' 0 \
+    "^lane A  a6-pin .*BLOOMERY_GATE_CARD=3090' just a6-pin$" \
+    env BLOOMERY_BOX_ENV=BLOOMERY_GATE_CARD=3090 "${gb[@]}" --lanes 1 --dry-run a6-pin
   check 'card: both refuses an a6000-form recipe, by name' 65 \
     '^gate-batch: a6-pin is fixed to the a6000; BLOOMERY_CARD=both' \
     env BLOOMERY_CARD=both "${gb[@]}" --dry-run a6-pin
@@ -4760,13 +4766,8 @@ def placement(name, lane, lanes):
     if lanes == "1":
         if box:
             labels = [box]
-        elif (uses_gpu_gate and GATE_FORMS[name] == {"a6000"}
-              and not (tier == "real" and group_of(name, "v41-load"))):
-            # The A6000's own default, forced into the item env. A queued one-lane run otherwise
-            # keeps the box pin: the command names target/, so the lane scan returns 3090.
-            return "A", "one-lane", ["a6000"], ["a6000"]
         elif uses_gpu_gate:
-            labels = ["any" if "any" in GATE_FORMS[name] else "3090"]
+            labels = ["any" if GATE_FORMS[name] & {"any", "a6000"} else "3090"]
         else:
             labels = ["3090" if lane == "A" else "none"]
         return "A", "one-lane", ["-"], labels
