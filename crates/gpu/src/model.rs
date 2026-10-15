@@ -33,7 +33,7 @@ pub(crate) mod slots;
 
 pub use kernels::{Q8_0GemvHeadsArgs, StepKernels};
 pub(crate) use lookup::f32_gain;
-pub use probe::{OpTime, StepProbe};
+pub use probe::{OpTime, StepProbe, weight_bytes};
 pub use slots::{SlotRange, SlotRows, Slots, SlotsOut};
 
 use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};

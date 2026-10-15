@@ -526,6 +526,7 @@ mod fused_kernels {
                 s8,
                 k_blocks as usize,
                 q_stride as usize,
+                q_stride as usize + 2 * k_blocks as usize,
                 row0 as usize + row,
                 0,
                 1,

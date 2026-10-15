@@ -8,9 +8,11 @@
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE, quad_finite};
+use crate::flash::half_bits_to_f32;
 use crate::hybrid::HOST;
 use crate::launch_u32;
 use crate::q4k_sel::QuantSel;
+use crate::q5_1_sel::q5_1_codes;
 use crate::q8_1_quant_block;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -22,8 +24,8 @@ use std::sync::Arc;
 
 // ------------------------------------------------------------------- cores
 
-/// The eight code words of 32-value block `b` of the row based at word
-/// `wbase`, in the packed layout's transposed order (word i at
+/// The eight code words of 32-value block `b` of the `pack_q5_1` row based at
+/// word `wbase`, in that layout's transposed order (word i at
 /// `wbase + 256*(b>>5) + 32*i + (b&31)`), so a warp's eight code loads are
 /// lane-consecutive.
 ///
@@ -50,6 +52,77 @@ pub(crate) unsafe fn q5_code_words(w: &[u32], wbase: usize, b: usize) -> [u32; 8
             *w.get_unchecked(base + 224),
         ]
     }
+}
+
+/// u32 words of one `pack_q5_0` row of `k_blocks` 32-value blocks: four
+/// planes of `k_blocks` `qs` words, one plane of `k_blocks` `qh` words, then
+/// the blocks' f16 scales two to a word (`k_blocks.div_ceil(2)` words) — the
+/// file's 22 bytes a block, plus two bytes of padding when `k_blocks` is odd.
+#[inline(always)]
+#[must_use]
+pub const fn q5_0_row_words(k_blocks: usize) -> usize {
+    5 * k_blocks + k_blocks.div_ceil(2)
+}
+
+/// The eight code words of one Q5_0 block from its `qh` word and its four
+/// `qs` words: [`q5_1_codes`]'s unsigned codes `q` (0..31) less 16 a byte, so
+/// each byte is the signed `q − 16` (−16..15) and the dp4a chain is the exact
+/// signed block dot. Per byte `((c | 0x80) − 0x10) ^ 0x80` is `c − 16` modulo
+/// 256: a byte of `c | 0x8080_8080` is at least `0x80`, so the subtraction
+/// borrows from no neighbour.
+#[inline(always)]
+#[must_use]
+pub fn q5_0_codes(qh: u32, qs: [u32; 4]) -> [u32; 8] {
+    let c = q5_1_codes(qh, qs);
+    let less16 = |x: u32| ((x | 0x8080_8080) - 0x1010_1010) ^ 0x8080_8080;
+    [
+        less16(c[0]),
+        less16(c[1]),
+        less16(c[2]),
+        less16(c[3]),
+        less16(c[4]),
+        less16(c[5]),
+        less16(c[6]),
+        less16(c[7]),
+    ]
+}
+
+/// Block `b` of the `pack_q5_0` row based at word `wbase` (`k_blocks` blocks a
+/// row): its eight code words ([`q5_0_codes`]) and its scale `d`, the file's
+/// f16 widened exactly to f32. Each of the six loads is lane-consecutive
+/// across a warp whose lanes take consecutive blocks: plane words `wbase +
+/// i·k_blocks + b` (`i < 4` the `qs` words, `i = 4` the `qh` word) and the
+/// scale word `wbase + 5·k_blocks + b/2`, half `b & 1`.
+///
+/// # Safety
+///
+/// `b < k_blocks` and `wbase + q5_0_row_words(k_blocks) <= w.len()`: the
+/// largest index read is `wbase + 5·k_blocks + (k_blocks − 1)/2`.
+#[inline(always)]
+pub(crate) unsafe fn q5_0_block(
+    w: &[u32],
+    wbase: usize,
+    k_blocks: usize,
+    b: usize,
+) -> ([u32; 8], f32) {
+    let p = wbase + b;
+    // SAFETY: p + 4·k_blocks < wbase + 5·k_blocks and wbase + 5·k_blocks + b/2
+    // < wbase + q5_0_row_words(k_blocks) <= w.len(), as b < k_blocks, by this
+    // fn's `# Safety`.
+    let (qs, qh, dw) = unsafe {
+        (
+            [
+                *w.get_unchecked(p),
+                *w.get_unchecked(p + k_blocks),
+                *w.get_unchecked(p + 2 * k_blocks),
+                *w.get_unchecked(p + 3 * k_blocks),
+            ],
+            *w.get_unchecked(p + 4 * k_blocks),
+            *w.get_unchecked(wbase + 5 * k_blocks + (b >> 1)),
+        )
+    };
+    let d = half_bits_to_f32((dw >> (16 * (b & 1))) as u16);
+    (q5_0_codes(qh, qs), d)
 }
 
 /// One block's A chain: its eight code words dp4a-accumulated against the q8
@@ -108,26 +181,31 @@ unsafe fn q5_block_col(cw: &[u32; 8], q: &[u32], qb: usize, d: f32, mds: f32, e:
 /// them across the warp. Returns only the first `m_cols` accumulators.
 ///
 /// Buffer layouts (the packers and `q5_quantize_q8` write, this reads):
-/// - `w`, per row: `q_stride` code words (block b's word i at
-///   `256*(b>>5) + 32*i + (b&31)`, one byte per value), then `k_blocks` f32
-///   block scales d, then — Q5_1 only — `k_blocks` f32 block mins m.
-///   Q5_0 code bytes hold code−16 ∈ [−16, 15], making the dp4a chain the
-///   exact signed block dot; Q5_1 keeps the unsigned 0..31 code and adds the
-///   `m·(block sum)` offset term instead (`q5_1` selects both).
-/// - `q`, per column: `q_stride` words in the same transposed order; `d8`
+/// - `w`, per row, Q5_0 (`q5_1` false): the `pack_q5_0` row of
+///   [`q5_0_row_words`] words, each block decoded in registers by
+///   [`q5_0_block`] to code bytes `q − 16` ∈ [−16, 15], making the dp4a
+///   chain the exact signed block dot, and its f32 scale d.
+/// - `w`, per row, Q5_1 (`q5_1` true): `q_stride` code words (block b's word
+///   i at `256*(b>>5) + 32*i + (b&31)`, one byte per value, the unsigned
+///   0..31 code), then `k_blocks` f32 block scales d, then `k_blocks` f32
+///   block mins m; the `m·(block sum)` offset term carries the code's offset.
+/// - `q`, per column: `q_stride` words in the transposed order above; `d8`
 ///   and `s8`, per column: `k_blocks` entries, block-indexed. Column c reads
 ///   `(col0 + c)` of each.
 ///
+/// Weight rows are `row_words` words apart, row `row_abs` based at word
+/// `row_abs * row_words`.
+///
 /// # Safety
 ///
-/// `w.len() >= (row_abs + 1) * row_words` (with `row_words = q_stride +
-/// k_blocks`, or `+ 2*k_blocks` when `q5_1`), `q_stride >= 256 *
-/// ceil(k_blocks / 32)`, `q.len() >= (col0 + m_cols) * q_stride`, `d8.len()`
-/// and `s8.len()` `>= (col0 + m_cols) * k_blocks`, and `1 <= m_cols <= 8`
-/// (column 0 is always read). A kernel caller discharges them from its launch
-/// facts (`crate::view`'s module doc): the `requires` clauses bounding the
-/// four buffers at its guarded row and its columns, and `q_stride` and
-/// `m_cols` as its launchers pass them.
+/// `w.len() >= (row_abs + 1) * row_words`, `row_words >=
+/// q5_0_row_words(k_blocks)` (or `>= q_stride + 2*k_blocks` when `q5_1`),
+/// `q_stride >= 256 * ceil(k_blocks / 32)`, `q.len() >= (col0 + m_cols) *
+/// q_stride`, `d8.len()` and `s8.len()` `>= (col0 + m_cols) * k_blocks`, and
+/// `1 <= m_cols <= 8` (column 0 is always read). A kernel caller discharges
+/// them from its launch facts (`crate::view`'s module doc): the `requires`
+/// clauses bounding the four buffers at its guarded row and its columns, and
+/// `q_stride` and `m_cols` as its launchers pass them.
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
@@ -140,18 +218,15 @@ pub(crate) unsafe fn q5_row_dot(
     s8: &[i32],
     k_blocks: usize,
     q_stride: usize,
+    row_words: usize,
     row_abs: usize,
     col0: usize,
     m_cols: usize,
     lane: usize,
     q5_1: bool,
 ) -> [f32; 8] {
-    let row_words = if q5_1 {
-        q_stride + 2 * k_blocks
-    } else {
-        q_stride + k_blocks
-    };
     let wbase = row_abs * row_words;
+    // Q5_1's scale and min planes follow its code words.
     let sbase = wbase + q_stride;
     let d8b0 = col0 * k_blocks;
     let q0 = col0 * q_stride;
@@ -167,17 +242,25 @@ pub(crate) unsafe fn q5_row_dot(
 
     let mut b = lane;
     while b < k_blocks {
-        // SAFETY: b < k_blocks and q_stride >= 256*((b>>5)+1), and the row at
-        // wbase ends at or before w.len(), by this fn's `# Safety`.
-        let cw = unsafe { q5_code_words(w, wbase, b) };
-        // SAFETY: sbase + b < sbase + k_blocks <= row end <= w.len() by this
-        // fn's contract.
-        let d = f32::from_bits(unsafe { *w.get_unchecked(sbase + b) });
-        let mv = if q5_1 {
-            // SAFETY: sbase + k_blocks + b < row end <= w.len().
-            f32::from_bits(unsafe { *w.get_unchecked(sbase + k_blocks + b) })
+        let (cw, d, mv) = if q5_1 {
+            // SAFETY: b < k_blocks and q_stride >= 256*((b>>5)+1), and the
+            // row at wbase ends at or before w.len(), by this fn's `# Safety`.
+            let cw = unsafe { q5_code_words(w, wbase, b) };
+            // SAFETY: sbase + b and sbase + k_blocks + b lie before
+            // sbase + 2*k_blocks <= wbase + row_words <= w.len() by this fn's
+            // contract.
+            let (d, m) = unsafe {
+                (
+                    *w.get_unchecked(sbase + b),
+                    *w.get_unchecked(sbase + k_blocks + b),
+                )
+            };
+            (cw, f32::from_bits(d), f32::from_bits(m))
         } else {
-            0.0
+            // SAFETY: b < k_blocks, and wbase + q5_0_row_words(k_blocks) <=
+            // wbase + row_words <= w.len() by this fn's `# Safety`.
+            let (cw, d) = unsafe { q5_0_block(w, wbase, k_blocks, b) };
+            (cw, d, 0.0)
         };
         let qslot = 256 * (b >> 5) + (b & 31);
 
@@ -635,7 +718,10 @@ mod q5_kernels {
     /// row `row0`, against activation columns `col0..col0+m_cols` of the q8
     /// scratch, writing `y[y0 + r*m_cols + c]` (r the local row). Layouts and
     /// bounds: `q5_row_dot`, whose contract this kernel's launch contract
-    /// states over its own parameters (`row_words = q_stride + k_blocks`).
+    /// states over its own parameters: rows are `5·k_blocks + s_words` words
+    /// apart, at least `q5_0_row_words(k_blocks)` when `2·s_words >=
+    /// k_blocks` (the launcher passes `s_words = ⌈k_blocks/2⌉`, the packed
+    /// row's own).
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -646,7 +732,8 @@ mod q5_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            w.len() >= (row0 + n_rows) * (q_stride + k_blocks),
+            2 * s_words >= k_blocks,
+            w.len() >= (row0 + n_rows) * (5 * k_blocks + s_words),
             q.len() >= (col0 + m_cols) * q_stride,
             d8.len() >= (col0 + m_cols) * k_blocks,
             s8.len() >= (col0 + m_cols) * k_blocks,
@@ -659,6 +746,7 @@ mod q5_kernels {
         d8: &[f32],
         s8: &[i32],
         k_blocks: u32,
+        s_words: u32,
         q_stride: u32,
         row0: u32,
         n_rows: u32,
@@ -673,9 +761,11 @@ mod q5_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        // SAFETY: row < n_rows, so `requires` bounds w at row0 + row and q, d8,
-        // s8 at col0 + m_cols columns; `enqueue_gemv_q5_0` passes the
-        // activation's own q_stride and refuses m_cols outside 1..=8.
+        // SAFETY: row < n_rows, so `requires` bounds w at row0 + row (rows of
+        // 5*k_blocks + s_words >= q5_0_row_words(k_blocks) words, as 2*s_words
+        // >= k_blocks) and q, d8, s8 at col0 + m_cols columns;
+        // `enqueue_gemv_q5_0` passes the activation's own q_stride and refuses
+        // m_cols outside 1..=8.
         let f = unsafe {
             q5_row_dot(
                 w,
@@ -684,6 +774,7 @@ mod q5_kernels {
                 s8,
                 k_blocks as usize,
                 q_stride as usize,
+                5 * k_blocks as usize + s_words as usize,
                 row0 as usize + row,
                 col0 as usize,
                 m_cols as usize,
@@ -775,6 +866,7 @@ mod q5_kernels {
                 s8,
                 k_blocks as usize,
                 q_stride as usize,
+                q_stride as usize + 2 * k_blocks as usize,
                 row0 as usize + row,
                 col0 as usize,
                 m_cols as usize,
@@ -818,7 +910,8 @@ mod q5_kernels {
     /// Q5_0 gemv over expert slots selected on the device (the MoE down
     /// projection, decode shape): one launch computes `n_slots` experts of
     /// the resident flat stack — `n_experts * rows_per_expert` rows of
-    /// `q_stride + k_blocks` words — where slot s reads activation column
+    /// `5·k_blocks + s_words` words as `q5_0_gemv` takes them — where slot s
+    /// reads activation column
     /// `s` of the q8 scratch (each expert's down input differs) and writes
     /// `y[s*rows_per_expert + r]`; m_cols = 1 per slot. The selected ids
     /// are read from `sel`, a device buffer, so the launch is addressable
@@ -843,7 +936,8 @@ mod q5_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            w.len() >= n_experts * rows_per_expert * (q_stride + k_blocks),
+            2 * s_words >= k_blocks,
+            w.len() >= n_experts * rows_per_expert * (5 * k_blocks + s_words),
             q.len() >= n_slots * q_stride,
             d8.len() >= n_slots * k_blocks,
             s8.len() >= n_slots * k_blocks,
@@ -858,6 +952,7 @@ mod q5_kernels {
         s8: &[i32],
         sel: &[u32],
         k_blocks: u32,
+        s_words: u32,
         q_stride: u32,
         n_experts: u32,
         rows_per_expert: u32,
@@ -884,8 +979,9 @@ mod q5_kernels {
         }
         let id = id as usize;
         // SAFETY: id < n_experts and slot < n_slots, so `requires` bounds w at
-        // the row and q, d8, s8 at column slot; m_cols is 1; the launcher
-        // passes the activation's own q_stride.
+        // the row (rows of 5*k_blocks + s_words >= q5_0_row_words(k_blocks)
+        // words, as 2*s_words >= k_blocks) and q, d8, s8 at column slot; m_cols is 1; the
+        // launcher passes the activation's own q_stride.
         let f = unsafe {
             q5_row_dot(
                 w,
@@ -894,6 +990,7 @@ mod q5_kernels {
                 s8,
                 k_blocks as usize,
                 q_stride as usize,
+                5 * k_blocks as usize + s_words as usize,
                 id * rows_per_expert as usize + row % rows_per_expert as usize,
                 slot, // col0: slot s reads activation column s
                 1,    // m_cols: one output per slot row
@@ -1065,91 +1162,103 @@ pub struct Q8Blocks32Host {
     pub d8: Vec<f32>,
 }
 
+/// The bytes of one gguf Q5_0 block: f16 `d`, the high-bit word `qh` at
+/// byte 2, the 16 nibble bytes `qs` at byte 6.
+const Q5_0_BLOCK_BYTES: usize = 22;
+
 /// Repack `rows` rows of raw gguf Q5_0 bytes (22 B per 32-value block: d f16,
-/// qh u32 at +2, 16 qs bytes at +6) into the gemv weight layout: per row
-/// `q_stride + k/32` u32 words — the code section (byte v of block b's word i
-/// is the 5-bit code of value `32b + 4i + v` minus 16, so the dp4a chain is
-/// the exact signed block dot; word i at `256*(b>>5) + 32*i + (b&31)`, window
-/// padding zero) — then `k/32` f32 block scales d as bits. Load-time cost.
+/// qh u32 at +2, 16 qs bytes at +6) into the gemv weight layout, the file's
+/// bytes regrouped by kind so a warp's lanes, one block each, load
+/// consecutive words: per row of `kb = k/32` blocks, [`q5_0_row_words`]
+/// words — plane `i < 4` holds block b's `qs` bytes `4i..4i+4` as word
+/// `i·kb + b`, plane 4 its `qh` as word `4·kb + b`, then block b's f16 `d`
+/// is half `b & 1` (low half for even b) of word `5·kb + b/2`, a last odd
+/// half zero. Nothing is decoded here: [`q5_0_block`] unpacks a block's
+/// codes `q − 16` and widens `d` in registers. Load-time cost.
 pub fn pack_q5_0(bytes: &[u8], k: usize, rows: usize) -> Result<Vec<u32>, GpuError> {
-    pack_q5(bytes, k, rows, false)
+    let k_blocks = q5_blocks("pack_q5_0", bytes, k, rows, Q5_0_BLOCK_BYTES)?;
+    let row_words = q5_0_row_words(k_blocks);
+    let mut out = vec![0u32; row_words * rows];
+    let word = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    for (r, row) in out.chunks_exact_mut(row_words).enumerate() {
+        for b in 0..k_blocks {
+            let blk = &bytes[(r * k_blocks + b) * Q5_0_BLOCK_BYTES..][..Q5_0_BLOCK_BYTES];
+            for i in 0..4 {
+                row[i * k_blocks + b] = word(&blk[6 + 4 * i..]);
+            }
+            row[4 * k_blocks + b] = word(&blk[2..]);
+            let d = u32::from(u16::from_le_bytes([blk[0], blk[1]]));
+            row[5 * k_blocks + b / 2] |= d << (16 * (b % 2));
+        }
+    }
+    Ok(out)
 }
 
 /// Repack `rows` rows of raw gguf Q5_1 bytes (24 B per block: d f16, m f16,
 /// qh u32 at +4, 16 qs bytes at +8) into the gemv weight layout: per row
-/// `q_stride + 2*k/32` words — the code section as `pack_q5_0` but with the
-/// unsigned 0..31 code (value = q5·d + m), then `k/32` f32 scales d, then
-/// `k/32` f32 mins m. The gemv adds `m·(block sum)` as the offset term.
+/// `q_stride + 2*k/32` words — the code section (byte v of block b's word i
+/// is the unsigned 0..31 code of value `32b + 4i + v`; word i at `256*(b>>5)
+/// + 32*i + (b&31)`, window padding zero, `q_stride = 256*ceil(k/1024)`),
+/// then `k/32` f32 scales d, then `k/32` f32 mins m (value = q5·d + m). The
+/// gemv adds `m·(block sum)` as the offset term. Load-time cost.
 pub fn pack_q5_1(bytes: &[u8], k: usize, rows: usize) -> Result<Vec<u32>, GpuError> {
-    pack_q5(bytes, k, rows, true)
+    let k_blocks = q5_blocks("pack_q5_1", bytes, k, rows, 24)?;
+    let q_stride = 256 * k_blocks.div_ceil(32);
+    let row_words = q_stride + 2 * k_blocks;
+    let mut out = vec![0u32; row_words * rows];
+    for (r, row) in out.chunks_exact_mut(row_words).enumerate() {
+        for b in 0..k_blocks {
+            let blk = &bytes[(r * k_blocks + b) * 24..][..24];
+            let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+            let m = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+            let qh = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+            row[q_stride + b] = d.to_bits();
+            row[q_stride + k_blocks + b] = m.to_bits();
+            let wbase = 256 * (b >> 5) + (b & 31);
+            for j in 0..16usize {
+                let qs = blk[8 + j];
+                // The fifth bit of value j is qh bit j, of value 16+j qh bit
+                // 16+j (ggml's xh_0/xh_1 shifts, scalar form).
+                let xh0 = ((qh >> j) << 4) & 0x10;
+                let xh1 = (qh >> (j + 12)) & 0x10;
+                let lo = u32::from(qs & 0x0f) | xh0;
+                let hi = u32::from(qs >> 4) | xh1;
+                let sh = 8 * u32::try_from(j % 4).expect("j % 4 < 4");
+                row[wbase + 32 * (j / 4)] |= lo << sh;
+                row[wbase + 32 * (j / 4 + 4)] |= hi << sh;
+            }
+        }
+    }
+    Ok(out)
 }
 
-fn pack_q5(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<u32>, GpuError> {
+/// The block count `k/32` of a q5 repack of `rows` rows of `k` values from
+/// `bytes`, `blk_bytes` a block; a `k` that is not a positive multiple of 32
+/// or `bytes` shorter than the rows is refused by name.
+fn q5_blocks(
+    what: &'static str,
+    bytes: &[u8],
+    k: usize,
+    rows: usize,
+    blk_bytes: usize,
+) -> Result<usize, GpuError> {
     if k == 0 || !k.is_multiple_of(32) {
         return Err(GpuError::shape(
-            "pack_q5",
+            what,
             format!("k must be a positive multiple of 32, got {k}"),
         ));
     }
-    let k_blocks = k / 32;
-    let blk_bytes = if q5_1 { 24 } else { 22 };
-    let need = k_blocks * blk_bytes * rows;
+    let need = k / 32 * blk_bytes * rows;
     if bytes.len() < need {
         return Err(GpuError::shape(
-            "pack_q5",
+            what,
             format!(
                 "bytes.len() {len} < k/32 * block * rows = {need}",
                 len = bytes.len()
             ),
         ));
     }
-    let q_stride = 256 * k_blocks.div_ceil(32);
-    let scale_words = if q5_1 { 2 * k_blocks } else { k_blocks };
-    let mut out = vec![0u32; (q_stride + scale_words) * rows];
-    for r in 0..rows {
-        let row = &mut out[r * (q_stride + scale_words)..(r + 1) * (q_stride + scale_words)];
-        for b in 0..k_blocks {
-            let blk = &bytes[(r * k_blocks + b) * blk_bytes..][..blk_bytes];
-            let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-            let (qh_off, qs_off) = if q5_1 { (4, 8) } else { (2, 6) };
-            let qh = u32::from_le_bytes([
-                blk[qh_off],
-                blk[qh_off + 1],
-                blk[qh_off + 2],
-                blk[qh_off + 3],
-            ]);
-            let m = if q5_1 {
-                half_to_f32(u16::from_le_bytes([blk[2], blk[3]]))
-            } else {
-                0.0
-            };
-            row[q_stride + b] = d.to_bits();
-            if q5_1 {
-                row[q_stride + k_blocks + b] = m.to_bits();
-            }
-            let wbase = 256 * (b >> 5) + (b & 31);
-            for j in 0..16usize {
-                let qs = blk[qs_off + j];
-                // The fifth bit of value j is qh bit j, of value 16+j qh bit
-                // 16+j (ggml's xh_0/xh_1 shifts, scalar form).
-                let xh0 = ((qh >> j) << 4) & 0x10;
-                let xh1 = (qh >> (j + 12)) & 0x10;
-                let lo = (qs & 0x0f) as i32 | xh0 as i32;
-                let hi = (qs >> 4) as i32 | xh1 as i32;
-                // Q5_0 folds the −16 into the byte (two's complement); Q5_1
-                // keeps the unsigned code.
-                let (lo_b, hi_b) = if q5_1 {
-                    (lo as u32, hi as u32)
-                } else {
-                    (((lo - 16) as u32) & 0xff, ((hi - 16) as u32) & 0xff)
-                };
-                let sh = 8 * u32::try_from(j % 4).expect("j % 4 < 4");
-                row[wbase + 32 * (j / 4)] |= lo_b << sh;
-                row[wbase + 32 * (j / 4 + 4)] |= hi_b << sh;
-            }
-        }
-    }
-    Ok(out)
+    Ok(k / 32)
 }
 
 /// The loaded q5 device module and its enqueue API. Every enqueue is
@@ -1365,8 +1474,8 @@ impl Q5Kernels {
 
     /// Enqueue `y[y0 + r*m_cols + c] = w_row(row0 + r) · act column
     /// (col0 + c)` for Q5_0 weights packed by `pack_q5_0` — `w` uploaded
-    /// with `cols = q_stride + k/32` over the whole flat stack, so experts
-    /// are reached by `row0` without a gather copy.
+    /// with `cols = q5_0_row_words(k/32)` over the whole flat stack, so
+    /// experts are reached by `row0` without a gather copy.
     #[allow(
         clippy::too_many_arguments,
         reason = "host launcher; folding these into a *Args struct is the R8 round"
@@ -1384,12 +1493,12 @@ impl Q5Kernels {
         y0: usize,
     ) -> Result<(), GpuError> {
         let k_blocks = act.k() / 32;
-        if w.cols() != act.q_stride() + k_blocks {
+        if w.cols() != q5_0_row_words(k_blocks) {
             return Err(GpuError::shape(
                 "enqueue_gemv_q5_0",
                 format!(
-                    "Q5_0 row is q_stride + k/32 = {} words, got cols {}",
-                    act.q_stride() + k_blocks,
+                    "Q5_0 row is 5·k/32 + ⌈k/64⌉ = {} words, got cols {}",
+                    q5_0_row_words(k_blocks),
                     w.cols()
                 ),
             ));
@@ -1423,6 +1532,7 @@ impl Q5Kernels {
             ));
         }
         let what = "enqueue_gemv_q5_0";
+        let s_words = launch_u32(what, "s_words", k_blocks.div_ceil(2))?;
         let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
         let q_stride = launch_u32(what, "q_stride", act.q_stride())?;
         let row0 = launch_u32(what, "row0", row0)?;
@@ -1441,6 +1551,7 @@ impl Q5Kernels {
             &act.d8,
             &act.s8,
             k_blocks,
+            s_words,
             q_stride,
             row0,
             n_rows,
@@ -1458,7 +1569,7 @@ impl Q5Kernels {
     /// `w[sel[s]*rows_per_expert .. +rows_per_expert] · act` column `s` (m
     /// per slot is 1; `act` holds at least `n_slots` quantized columns).
     /// `w` is the full resident stack packed by `pack_q5_0`,
-    /// `cols = q_stride + k/32`, `rows` a positive multiple of
+    /// `cols = q5_0_row_words(k/32)`, `rows` a positive multiple of
     /// `rows_per_expert` (`n_experts = rows/rows_per_expert`). `sel` is a
     /// device buffer of at least `n_slots` ids read by the kernel per
     /// launch, so a captured graph replay picks up new ids written between
@@ -1477,12 +1588,12 @@ impl Q5Kernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let k_blocks = act.k() / 32;
-        if w.cols() != act.q_stride() + k_blocks {
+        if w.cols() != q5_0_row_words(k_blocks) {
             return Err(GpuError::shape(
                 "enqueue_gemv_q5_0_sel",
                 format!(
-                    "Q5_0 row is q_stride + k/32 = {} words, got cols {}",
-                    act.q_stride() + k_blocks,
+                    "Q5_0 row is 5·k/32 + ⌈k/64⌉ = {} words, got cols {}",
+                    q5_0_row_words(k_blocks),
                     w.cols()
                 ),
             ));
@@ -1520,6 +1631,7 @@ impl Q5Kernels {
         }
         let what = "enqueue_gemv_q5_0_sel";
         let grid = launch_u32(what, "grid", (n_slots * rows_per_expert).div_ceil(8))?;
+        let s_words = launch_u32(what, "s_words", k_blocks.div_ceil(2))?;
         let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
         let q_stride = launch_u32(what, "q_stride", act.q_stride())?;
         let n_experts = launch_u32(what, "n_experts", w.rows() / rows_per_expert)?;
@@ -1537,6 +1649,7 @@ impl Q5Kernels {
             &act.s8,
             sel,
             k_blocks,
+            s_words,
             q_stride,
             n_experts,
             rows_per_expert,

@@ -701,16 +701,18 @@ mod elem_kernels {
     }
 
     /// Dequantize `ids.len()` rows of a Q5_0 table in the `pack_q5_0` layout
-    /// (`q_stride + k/32` u32 words a row; byte `j % 4` of word
-    /// `256·(b>>5) + (b&31) + 32·(j/4)` of block `b = v/32` is the low half's
-    /// code when `v%32 < 16`, and the high half lives `4` word-groups later)
-    /// into `y`, with each row's position and live key count as
-    /// `embed_rows_q4k`. The code byte is the 5-bit code minus 16, and the
-    /// block's scale is the f32 bits after the code plane, so a value is that
-    /// byte as `i8` times the scale. Q5_0's rows are 32-value blocks split
-    /// into a code plane and a scale plane, not 256-value super-blocks, so
-    /// this does not share [`embed_rows_sb`]. An id past `n_rows` raises
-    /// [`FaultSite::TokenId`] and writes a NaN row, as `embed_rows` does.
+    /// (`q5::q5_0_row_words(k_blocks)` u32 words a row: block `b`'s nibble
+    /// byte `j < 16` is byte `j % 4` of word `(j/4)·k_blocks + b`, its high
+    /// bits `qh` word `4·k_blocks + b`, its f16 scale half `b & 1` of word
+    /// `5·k_blocks + b/2`) into `y`, with each row's position and live key
+    /// count as `embed_rows_q4k`. Value `v` of block `b = v/32` with `t =
+    /// v % 32` is the low (`t < 16`) or high nibble of byte `t % 16`, with
+    /// `qh` bit `t` as its fifth bit, minus 16, times the scale — ggml's
+    /// `dequantize_row_q5_0`. Q5_0's rows are 32-value blocks split into
+    /// planes, not 256-value super-blocks, so this does not share
+    /// [`embed_rows_sb`]. An id past `n_rows` raises [`FaultSite::TokenId`]
+    /// and writes a NaN row, as `embed_rows` does. Rows are `5·k_blocks +
+    /// s_words` words apart: the launcher passes `s_words = ⌈k_blocks/2⌉`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -721,7 +723,8 @@ mod elem_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            w.len() >= (q_stride + k_blocks) * n_rows,
+            2 * s_words >= k_blocks,
+            w.len() >= (5 * k_blocks + s_words) * n_rows,
             y.len() >= k * ids.len(),
             pos0.len() >= 1,
             pos.len() >= ids.len(),
@@ -735,7 +738,7 @@ mod elem_kernels {
         first: u32,
         n_rows: u32,
         k: u32,
-        q_stride: u32,
+        s_words: u32,
         k_blocks: u32,
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
@@ -762,28 +765,27 @@ mod elem_kernels {
         // SAFETY: t < ids.len() by the guard.
         let id = unsafe { *ids.get_unchecked(t) };
         let out = if id < n_rows {
+            let kb = k_blocks as usize;
             let b = v / 32;
             let within = v % 32;
             let j = within % 16;
-            // The high half of the block (values 16..32) is the second group
-            // of four words; the low half is the first.
-            let word_i = j / 4 + 4 * usize::from(within >= 16);
-            let byte = j % 4;
-            let row_words = q_stride as usize + k_blocks as usize;
-            let row = id as usize * row_words;
-            let wbase = 256 * (b >> 5) + (b & 31);
-            // SAFETY: id < n_rows, b < k/32 = k_blocks (v < k and the launcher
-            // passes k = 32·k_blocks), and word_i < 8, so
-            // wbase + 32·word_i < q_stride (a window is 256 words and the
-            // addressed word sits in the last 256 of that window). The scale
-            // word is the next k_blocks words. The row ends at
-            // (id+1)·(q_stride+k_blocks) <= w.len() by the launch contract.
-            let word = unsafe { *w.get_unchecked(row + wbase + 32 * word_i) };
-            let code = ((word >> (8 * byte)) & 0xff) as u8 as i8;
-            // SAFETY: b < k_blocks, so the scale word row + q_stride + b sits
-            // inside the row, which ends at (id+1)·(q_stride+k_blocks) <=
-            // w.len() by the launch contract.
-            let scale = f32::from_bits(unsafe { *w.get_unchecked(row + q_stride as usize + b) });
+            let row = id as usize * (5 * kb + s_words as usize);
+            // SAFETY: id < n_rows and b < k/32 = k_blocks (v < k and the
+            // launcher passes k = 32·k_blocks), so the qs word (j/4 < 4), the
+            // qh word and the scale word 5·kb + b/2 < 5·kb + s_words
+            // (2·s_words >= kb) lie inside the row, which ends at
+            // (id+1)·(5·kb + s_words) <= w.len() by the launch contract.
+            let (qs, qh, dw) = unsafe {
+                (
+                    *w.get_unchecked(row + (j / 4) * kb + b),
+                    *w.get_unchecked(row + 4 * kb + b),
+                    *w.get_unchecked(row + 5 * kb + b / 2),
+                )
+            };
+            let byte = (qs >> (8 * (j % 4))) & 0xff;
+            let nib = if within < 16 { byte & 0x0f } else { byte >> 4 };
+            let code = (nib | (((qh >> within) & 1) << 4)) as i32 - 16;
+            let scale = half_to_f32((dw >> (16 * (b & 1))) as u16);
             (code as f32) * scale
         } else {
             if v == 0 {
@@ -1798,8 +1800,8 @@ impl ElemKernels {
 
     /// Enqueue the Q5_0 embedding lookup of one unit of rows: `args.ids` each
     /// select one row of `args.w` in the `pack_q5_0` layout (`k` values, `k`
-    /// a positive multiple of 32, `q_stride + k/32` words a row with
-    /// `q_stride = 256·ceil((k/32)/32)`), dequantized into `args.y`
+    /// a positive multiple of 32, `q5::q5_0_row_words(k/32)` words a row),
+    /// dequantized into `args.y`
     /// token-major, bit-identical to `gguf::quant::dequant_row` on the same
     /// row bytes, with each row's position and live key count as
     /// [`Self::enqueue_embed_rows_q4k`]. An id past the table raises
@@ -1828,12 +1830,12 @@ impl ElemKernels {
             ));
         }
         let k_blocks = k / 32;
-        let q_stride = 256 * k_blocks.div_ceil(32);
-        if w.rows() == 0 || w.cols() != q_stride + k_blocks {
+        let row_words = crate::q5::q5_0_row_words(k_blocks);
+        if w.rows() == 0 || w.cols() != row_words {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "a Q5_0 table is {q_stride} + {k_blocks} words a row, got {}x{}",
+                    "a Q5_0 table is {row_words} words a row, got {}x{}",
                     w.rows(),
                     w.cols()
                 ),
@@ -1864,7 +1866,7 @@ impl ElemKernels {
         let first = launch_u32(what, "first", first)?;
         let n_rows = launch_u32(what, "w.rows()", w.rows())?;
         let k = launch_u32(what, "k", k)?;
-        let q_stride = launch_u32(what, "q_stride", q_stride)?;
+        let s_words = launch_u32(what, "s_words", k_blocks.div_ceil(2))?;
         let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
         let prep = self
             .module
@@ -1879,7 +1881,7 @@ impl ElemKernels {
             first,
             n_rows,
             k,
-            q_stride,
+            s_words,
             k_blocks,
             fault,
             y,

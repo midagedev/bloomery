@@ -451,11 +451,12 @@ mod gemm32_kernels {
     }
 
     /// [`gemm_q8_0p`] for the resident packed Q5_0 (`q5.rs`, `pack_q5_0`):
-    /// `w` is `n_experts · rows` rows of `256 · windows + blocks` words —
-    /// the int8 codes `q − 16` in the gemv's transposed word order (block
-    /// `b`'s word `i` at `256·(b >> 5) + 32·i + (b & 31)`), then the
-    /// blocks' f32 scales; `windows` is the row's 32-block windows. The
-    /// codes are signed already, so there is no min term (`s` is not read).
+    /// `w` is `n_experts · rows` rows `5 · blocks + s_words` words apart (the
+    /// launcher passes `s_words = ⌈blocks/2⌉`, `q5::q5_0_row_words`) — block
+    /// `b`'s `qs` words at `i · blocks + b` (`i < 4`), its `qh` at `4 · blocks
+    /// + b`, its f16 `d` half `b & 1` of word `5 · blocks + b/2`, read by the
+    /// gemv's reader `q5::q5_0_block`. Each block stages as the codes `q − 16`,
+    /// signed, so there is no min term (`s` is not read).
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -466,8 +467,8 @@ mod gemm32_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            32 * windows >= blocks,
-            w.len() >= n_experts * rows * (256 * windows + blocks),
+            2 * s_words >= blocks,
+            w.len() >= n_experts * rows * (5 * blocks + s_words),
             2 * steps >= blocks,
             q.len() >= act_cols * 16 * steps,
             d.len() >= act_cols * 2 * steps,
@@ -479,7 +480,7 @@ mod gemm32_kernels {
     )]
     pub fn gemm_q5_0p(
         w: &[u32],
-        windows: u32,
+        s_words: u32,
         q: &[u32],
         d: &[f32],
         s: &[i32],
@@ -498,7 +499,7 @@ mod gemm32_kernels {
         mut y: DisjointSlice<f32>,
     ) {
         gemm32_block!(
-            wt: q50p(w, windows),
+            wt: q50p(w, s_words),
             mins: false,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),

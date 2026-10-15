@@ -4812,7 +4812,7 @@ mod gate {
             let ids = DeviceBuffer::<u32>::zeroed(stream, 9)?;
             let plane = r8.weight(Lay::Q8Plane)?;
             let (qs, _) = r8.plane.as_ref().ok_or("a Q8_0 stack with no planes")?;
-            // Packed Q5_0 rows at K 96: 259 words a row where K 320 needs 266.
+            // Packed Q5_0 rows at K 96: 17 words a row where K 320 needs 55.
             let (w50, _) = weights_q50(rows, 96, 0x35f0)?;
             let p50 = pack_q5_0(&w50.bytes, 96, rows)?;
             let q50_96 = DeviceTensor::upload(stream, &p50, rows, p50.len() / rows)?;
@@ -4906,7 +4906,7 @@ mod gate {
                         &route,
                         &mut y,
                     ),
-                    "packed Q5_0 rows at K = 320 are 266 words",
+                    "packed Q5_0 rows at K = 320 are 55 words",
                 ),
                 (
                     "rows_not_16",

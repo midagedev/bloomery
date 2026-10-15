@@ -71,8 +71,9 @@ pub enum DevWeight {
         w: DeviceTensor<u32>,
         k: usize,
     },
-    /// Q5_0 file tensor in the `pack_q5_0` layout: `q_stride + k/32` words
-    /// per row, `q_stride = 256·ceil(k/1024)`. `k` is a multiple of 32.
+    /// Q5_0 file tensor in the `pack_q5_0` layout: `q5_0_row_words(k/32) =
+    /// 5·k/32 + ⌈k/64⌉` words per row, the file's 22 bytes a block regrouped
+    /// into planes. `k` is a multiple of 32.
     Q5_0 { w: DeviceTensor<u32>, k: usize },
     /// Q5_1 file tensor in the `pack_q5_1` layout: `q_stride + 2·k/32` words
     /// per row. `k` is a multiple of 32.

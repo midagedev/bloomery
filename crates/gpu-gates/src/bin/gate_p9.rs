@@ -21,7 +21,7 @@
 
 // Module-level because the reference helpers below `main` share them.
 #[cfg(feature = "gpu")]
-use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0};
+use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, q5_0_row_words};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
 #[cfg(feature = "gpu")]
@@ -225,10 +225,8 @@ fn run() -> Result<(), GateError> {
         Some(&[1408, 2048, 64]),
     )?;
     let (k5, rpe5, nexp5) = (1408usize, 2048usize, 64usize);
-    let k_blocks5 = k5 / 32;
-    let q_stride5 = 256 * k_blocks5.div_ceil(32);
     let packed5 = pack_q5_0(w5_bytes, k5, nexp5 * rpe5)?;
-    let w5_dev = DeviceTensor::upload(stream, &packed5, nexp5 * rpe5, q_stride5 + k_blocks5)?;
+    let w5_dev = DeviceTensor::upload(stream, &packed5, nexp5 * rpe5, q5_0_row_words(k5 / 32))?;
     // One activation column per slot (each expert's down input differs).
     let x5 = activations(k5, N_SLOTS, SEED_Q5);
     let x5_dev = DeviceBuffer::from_host(stream, &x5)?;

@@ -157,10 +157,10 @@ mod gate {
     /// past the table (NaN row, `FaultSite::TokenId`, the other rows intact).
     fn embed_q5_0(gpu: &Gpu) -> Result<bool, GateError> {
         const ROWS: usize = 4;
-        // 34 blocks: past the first 32-block window of the packed code plane.
+        // 34 blocks: an even count, so the packed row has no padding half,
+        // and more than 32, so a block's plane word is not its lane's.
         const K: usize = 1088;
-        // Reuse synthetic_rows with the Q5_0 scale at byte 0; host emulation
-        // confirms this seed rejects both addressing mutants.
+        // Reuse synthetic_rows with the Q5_0 scale at byte 0.
         let bytes = synthetic_rows((GgmlType::Q5_0, &[0]), (ROWS, K / 32), 0x2545_f491)?;
         let packed = bloomery_gpu::q5::pack_q5_0(&bytes, K, ROWS)?;
         let cols = packed.len() / ROWS;

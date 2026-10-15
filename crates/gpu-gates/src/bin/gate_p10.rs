@@ -41,7 +41,7 @@
 use bloomery_gpu::arch::deepseek2::Body;
 #[cfg(feature = "gpu")]
 #[cfg(feature = "gpu")]
-use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, pack_q5_1};
+use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, pack_q5_1, q5_0_row_words};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::q8f32::Q8F32Kernels;
 #[cfg(feature = "gpu")]
@@ -504,11 +504,14 @@ fn expected_planes(
 /// (f16), qh (u32 LE), qs[16]; `block_q5_1` is d, m (f16), qh, qs[16]; value
 /// j's code is the low nibble of qs[j] (j < 16) or the high nibble of
 /// qs[j − 16], with bit j of qh as its fifth bit. The places come from the
-/// kernel's side: per row `256·⌈k/1024⌉` code words — block b's word i at
-/// `256·(b/32) + 32·i + b%32`, byte t holding the code of value 4i + t, the
-/// order `q5_quantize_q8` writes the activation words in; Q5_0 stores the
-/// code minus 16 as a signed byte, Q5_1 the code; unused words zero — then
-/// each block's d as f32 bits and, for Q5_1, each block's m.
+/// kernels' side. Q5_0 keeps the file's bytes in planes: per row of `kb`
+/// blocks, block b's qs bytes `4i..4i+4` as word `i·kb + b` (`i < 4`), its
+/// qh as word `4·kb + b`, then its d bits as half `b % 2` of word `5·kb +
+/// b/2` (`⌈kb/2⌉` words, an odd count's last half zero). Q5_1 has per row
+/// `256·⌈k/1024⌉` code words — block b's word i at `256·(b/32) + 32·i +
+/// b%32`, byte t holding the code of value 4i + t, the order
+/// `q5_quantize_q8` writes the activation words in; unused words zero —
+/// then each block's d and each block's m as f32 bits.
 #[cfg(feature = "gpu")]
 fn gate_q5_words(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<u32>, GateError> {
     let (block, qh_at, qs_at) = if q5_1 { (24, 4, 8) } else { (22, 2, 6) };
@@ -523,13 +526,27 @@ fn gate_q5_words(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<
         .into());
     }
     let q_stride = 256 * kb.div_ceil(32);
-    let row_words = q_stride + if q5_1 { 2 * kb } else { kb };
+    let row_words = if q5_1 {
+        q_stride + 2 * kb
+    } else {
+        5 * kb + kb.div_ceil(2)
+    };
     let mut out = vec![0u32; rows * row_words];
     for (r, row) in out.chunks_exact_mut(row_words).enumerate() {
         for b in 0..kb {
             let blk = &bytes[(r * kb + b) * block..][..block];
-            let qh =
-                u32::from_le_bytes([blk[qh_at], blk[qh_at + 1], blk[qh_at + 2], blk[qh_at + 3]]);
+            let le =
+                |at: usize| u32::from_le_bytes([blk[at], blk[at + 1], blk[at + 2], blk[at + 3]]);
+            let qh = le(qh_at);
+            if !q5_1 {
+                for i in 0..4 {
+                    row[i * kb + b] = le(qs_at + 4 * i);
+                }
+                row[4 * kb + b] = qh;
+                row[5 * kb + b / 2] |=
+                    u32::from(u16::from_le_bytes([blk[0], blk[1]])) << (16 * (b % 2));
+                continue;
+            }
             for j in 0..32 {
                 let low = if j < 16 {
                     blk[qs_at + j] & 0x0f
@@ -537,14 +554,10 @@ fn gate_q5_words(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<
                     blk[qs_at + j - 16] >> 4
                 };
                 let code = low | ((((qh >> j) & 1) as u8) << 4);
-                let byte = if q5_1 { code } else { (code as i8 - 16) as u8 };
-                row[256 * (b / 32) + 32 * (j / 4) + b % 32] |= u32::from(byte) << (8 * (j % 4));
+                row[256 * (b / 32) + 32 * (j / 4) + b % 32] |= u32::from(code) << (8 * (j % 4));
             }
             row[q_stride + b] = half_to_f32(u16::from_le_bytes([blk[0], blk[1]])).to_bits();
-            if q5_1 {
-                row[q_stride + kb + b] =
-                    half_to_f32(u16::from_le_bytes([blk[2], blk[3]])).to_bits();
-            }
+            row[q_stride + kb + b] = half_to_f32(u16::from_le_bytes([blk[2], blk[3]])).to_bits();
         }
     }
     Ok(out)
@@ -754,12 +767,11 @@ fn kid_q5_0_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErr
         info.dims[1] as usize,
         info.dims[2] as usize,
     );
-    let kb = k / 32;
     let rref = DeviceTensor::upload(
         stream,
         &pack_q5_0(bytes, k, nexp * rpe)?,
         nexp * rpe,
-        256 * kb.div_ceil(32) + kb,
+        q5_0_row_words(k / 32),
     )?;
     let DevWeight::Q5_0 { w: res, .. } = w
         .get("blk.1.ffn_down_exps.weight")

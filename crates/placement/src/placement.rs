@@ -401,10 +401,12 @@ pub enum CardFormat {
     /// need not start on a word (q6_K at k = 768 is 630 bytes); the padding
     /// only makes the buffer a whole number of words per row.
     KQuant,
-    /// q5_0 in the gemv's layout: per row one byte per 5-bit code in 1024-value
-    /// windows, then one f32 scale per 32-value block.
+    /// q5_0 in the gemv's layout: per row the file's 22 bytes a 32-value
+    /// block regrouped into planes — four `qs` words and one `qh` word a
+    /// block, then the f16 scales two to a word.
     Q5_0,
-    /// q5_1: the q5_0 layout plus one f32 min per block.
+    /// q5_1 in the gemv's layout: per row one byte per 5-bit code in
+    /// 1024-value windows, then one f32 scale and one f32 min per block.
     Q5_1,
     /// q8_0 in two planes: per 32-value block 8 code words and the block's
     /// f16 scale bits as the file stores them.
@@ -477,7 +479,7 @@ impl CardFormat {
             return None;
         }
         let blocks = k / blck;
-        // The q5 code section: one byte per code, in whole 1024-value windows.
+        // The Q5_1 code section: one byte per code, in whole 1024-value windows.
         let window = || k.div_ceil(1024).checked_mul(1024);
         Some(match self {
             CardFormat::KQuant => {
@@ -489,7 +491,10 @@ impl CardFormat {
                 vec![words.div_ceil(rows).checked_mul(rows)?.checked_mul(4)?]
             }
             CardFormat::Q5_0 => {
-                vec![rows.checked_mul(window()?.checked_add(blocks.checked_mul(4)?)?)?]
+                // Per block four `qs` words and one `qh` word, then the f16
+                // scales two to a word (`q5::q5_0_row_words`).
+                let words = blocks.checked_mul(5)?.checked_add(blocks.div_ceil(2))?;
+                vec![rows.checked_mul(words.checked_mul(4)?)?]
             }
             CardFormat::Q5_1 => {
                 vec![rows.checked_mul(window()?.checked_add(blocks.checked_mul(8)?)?)?]
