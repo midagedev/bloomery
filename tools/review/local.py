@@ -25,7 +25,10 @@ ends the run 1 by name, before the reviewer's cost. The failure it blocks: a lev
 hand-run check-levers caught.
 
 Prints the verdict, the must-fix titles and where the output is (~/.cache/bloomery/pre-review/<branch>-<sha8>/).
-Exit: 0 CLEAN; 1 MUST_FIX or a red pre-check; 75 no claude CLI, or a role past --minutes (default 10); 64 usage; 65 output post.py refused
+A CLEAN review also prints one line for the pull request body, with the full HEAD sha.
+A base that lacks commits origin/main has is behind it and is refused by name before the reviewer runs.
+Exit: 0 CLEAN; 1 MUST_FIX or a red pre-check; 75 no claude CLI, or a role past --minutes (default 10); 64 usage,
+or a base behind origin/main; 65 output post.py refused
 or a review with no verdict; 70 a context step that failed (named).
 The failure it blocks: a pull request whose first Shingler review is a MUST_FIX, each fold another 10-27 minute round.
 """
@@ -78,6 +81,12 @@ def git(*args):
     if p.returncode:
         raise Stop(70, f"pre-review: git {' '.join(args)} failed: {p.stderr.strip()[:200]}")
     return p.stdout
+
+
+def git_ok(*args):
+    """stdout of a git call, or None when git refuses it. A clone with no origin/main is not refused for that."""
+    p = subprocess.run(["git", *args], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else None
 
 
 def gh_json(*args):
@@ -356,6 +365,13 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
         say(f"pre-review: git fetch origin failed or took over {NET_S} s; {args.base} is as this clone last saw it")
     head = git("rev-parse", "HEAD").strip()
     base_sha = git("rev-parse", args.base).strip()
+    main_sha = git_ok("rev-parse", "--verify", "origin/main")
+    if main_sha and base_sha != main_sha:
+        behind = git_ok("rev-list", "--count", f"{base_sha}..{main_sha}")
+        if behind not in (None, "0"):
+            noun = "commit" if behind == "1" else "commits"
+            raise Stop(64, f"pre-review: base {args.base} ({base_sha[:8]}) is behind origin/main ({main_sha[:8]}): "
+                           f"origin/main has {behind} {noun} the base does not")
     if git("status", "--porcelain", "--untracked-files=no").strip():
         say("pre-review: the tree has uncommitted changes; what is reviewed is the committed HEAD, what a push sends")
     branch = re.sub(r"[^A-Za-z0-9._-]", "_", git("rev-parse", "--abbrev-ref", "HEAD").strip())
@@ -407,6 +423,8 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     for t in titles[:12]:
         print(f"  must fix: {t}")
     print(f"  review: {keep}/out/review.md")
+    if m.group(1) == "CLEAN":
+        print(f"pre-review: PR body: Pre-review CLEAN at {head}.")
     return 1 if m.group(1) == "MUST_FIX" else 0
 
 
@@ -599,6 +617,8 @@ def self_test():
         home = os.environ.get("HOME")
         os.environ["HOME"] = os.path.join(t, "home")
         os.environ["PRE_REVIEW_TEST_STUB"] = stub
+        # origin/main at the base: the branch's base is not behind it. A later case moves it ahead.
+        sh("git", "update-ref", "refs/remotes/origin/main", "basebr")
         try:
             def go(text, sleep=0, minutes=10):
                 a = argparse.Namespace(base="basebr", full=False, minutes=minutes, body=None)
@@ -614,14 +634,30 @@ def self_test():
                 rc, _ = go("**Verdict: CLEAN**: fine\n\n### Checked\nall")
             expect(rc == 0, f"a CLEAN review ends 0 (got {rc})")
             expect("$" not in buf.getvalue(), f"accounting that is not available is not printed as a cost: {buf.getvalue()!r}")
+            head_sha = git("rev-parse", "HEAD").strip()
+            expect(f"pre-review: PR body: Pre-review CLEAN at {head_sha}." in buf.getvalue().splitlines(),
+                   f"a CLEAN review prints one PR-body line with the full HEAD sha: {buf.getvalue()!r}")
+            sh("git", "checkout", "-q", "main")
+            open(os.path.join(repo, "m.txt"), "w").write("m\n")
+            sh("git", "add", "m.txt")
+            sh("git", "commit", "-qm", "main moves")
+            sh("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+            sh("git", "checkout", "-q", "topic")
+            rc, msgs = go("**Verdict: CLEAN**: should not run\n\n### Checked\nall")
+            expect(rc == 64 and any("is behind origin/main" in m for m in msgs),
+                   f"a base behind origin/main is refused by name before the review: {rc} {msgs}")
+            sh("git", "update-ref", "refs/remotes/origin/main", "basebr")
             keep = os.path.join(t, "home/.cache/bloomery/pre-review/topic-" + git("rev-parse", "HEAD").strip()[:8])
             ctx_files = set(os.listdir(os.path.join(keep, "ctx")))
             expect(ctx_files == set(CTX_FILES), f"the kept ctx holds the workflow's files: {sorted(ctx_files)}")
             pj = json.load(open(os.path.join(keep, "ctx/pr.json")))
             expect(tuple(pj) == PR_KEYS and pj["mode"] == "full" and pj["run"] == "local", f"pr.json: {pj}")
             expect(open(os.path.join(keep, "ctx/files.txt")).read() == "modified\t+1\t-0\ta.txt\n", "files.txt of the branch")
-            rc, _ = go("**Verdict: MUST_FIX**: no\n\n### Must fix\n#### 1. Broken\n")
-            expect(rc == 1, f"a MUST_FIX review ends 1 (got {rc})")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc, _ = go("**Verdict: MUST_FIX**: no\n\n### Must fix\n#### 1. Broken\n")
+            expect(rc == 1 and "PR body:" not in buf.getvalue(),
+                   f"a MUST_FIX review ends 1 and prints no PR-body line (got {rc}): {buf.getvalue()!r}")
             pidf = os.path.join(t, "child.pid")
             open(stub, "w").write(f"#!/usr/bin/env bash\n( sleep 30 & echo $! > {pidf}; wait )\n")
             a = argparse.Namespace(base="basebr", full=False, minutes=0.03, body=None)

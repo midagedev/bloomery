@@ -116,7 +116,9 @@ contrib-check *ARGS:
 
 # Before a push: Shingler's reviewer on this machine, on the committed HEAD against origin/main, under your own Claude
 # login (`--full` adds the validator, `--minutes N` bounds a role, default 10). Exit 0 CLEAN, 1 MUST_FIX, 75 no verdict.
-# Nothing is posted; the pull request's own review stays the review of record. The owner is tools/review/local.py.
+# A base behind origin/main is refused by name (64) before the reviewer runs. A CLEAN run prints one pull-request body
+# line with the full HEAD sha. Nothing is posted; the pull request's own review stays the review of record. The owner
+# is tools/review/local.py.
 pre-review *ARGS:
     python3 tools/review/local.py {{ARGS}}
 
