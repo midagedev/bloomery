@@ -85,7 +85,7 @@ use super::placed::{
     placed_bytes, placed_scratch, prompt_rows, tally_shape,
 };
 use super::plan::{
-    DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
+    DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
     SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, kind35, kinds35, moe_fits, q35,
     shared_entry,
 };
@@ -1071,9 +1071,9 @@ impl Forms {
                 alone(f.down_ty, d.hidden);
             }
         }
-        let wants = |tys: &[SiteTy]| Wants {
-            q128: tys.iter().any(|t| t.reads() == Form::Q8x128),
-            q32: tys.iter().any(|t| t.reads() == Form::Q8x32),
+        let wants = |tys: &[SiteTy]| {
+            let (q128, q32) = crate::site::WideActs::wants_of(tys);
+            Wants { q128, q32 }
         };
         Forms {
             hid: wants(&hid),

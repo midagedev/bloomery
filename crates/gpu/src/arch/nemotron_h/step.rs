@@ -311,26 +311,6 @@ pub(super) fn residual_rows(
     gpu.elem().enqueue_add(gpu.stream(), src, delta, n, dst)
 }
 
-/// `y = rms_norm(x, name)`, one row.
-fn norm(
-    cx: &Cx<'_>,
-    name: &str,
-    x: &DeviceBuffer<f32>,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    norm_rows((cx.gpu, cx.w), (cx.sh.eps, cx.sh.hidden, 1), name, x, y)
-}
-
-/// `dst = src + delta`, one row.
-fn residual(
-    cx: &Cx<'_>,
-    src: &DeviceBuffer<f32>,
-    delta: &DeviceBuffer<f32>,
-    dst: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    residual_rows(cx.gpu, cx.sh.hidden, src, delta, dst)
-}
-
 /// One Mamba-2 layer: the `ssm_in` output is `[z | xBC | dt]`, three views of
 /// the one buffer at `0`, `d_inner` and `d_inner + conv_dim` values (llama.cpp
 /// `build_mamba2_layer`'s views at `0`, `d_inner`, `2·d_inner + 2·n_group·d_state`).
@@ -346,7 +326,13 @@ fn mamba_layer(
         sh.mamba.conv_dim(),
         sh.mamba.geom().n_heads,
     );
-    norm(cx, &m.norm, src, &mut s.xn)?;
+    norm_rows(
+        (cx.gpu, cx.w),
+        (cx.sh.eps, cx.sh.hidden, 1),
+        &m.norm,
+        src,
+        &mut s.xn,
+    )?;
     m.ssm_in.project(cx, acts, l, &s.xn, &mut s.zxbcdt)?;
     let f32s = size_of::<f32>();
     let z = Window::<f32>::of(&s.zxbcdt, 0, inner)?;
@@ -376,7 +362,7 @@ fn mamba_layer(
         },
     )?;
     m.ssm_out.project(cx, acts, l, &s.y, &mut s.delta)?;
-    residual(cx, src, &s.delta, dst)
+    residual_rows(cx.gpu, cx.sh.hidden, src, &s.delta, dst)
 }
 
 /// Key head `h`'s row of `buf`, the view an append reads.
@@ -396,7 +382,13 @@ fn attn_layer(
 ) -> Result<(), GpuError> {
     let sh = cx.sh;
     let fault = cx.gpu.layer_sink(l)?;
-    norm(cx, &a.norm, src, &mut s.xn)?;
+    norm_rows(
+        (cx.gpu, cx.w),
+        (cx.sh.eps, cx.sh.hidden, 1),
+        &a.norm,
+        src,
+        &mut s.xn,
+    )?;
     a.q.project(cx, acts, l, &s.xn, &mut s.q)?;
     a.k.project(cx, acts, l, &s.xn, &mut s.k)?;
     a.v.project(cx, acts, l, &s.xn, &mut s.v)?;
@@ -429,7 +421,7 @@ fn attn_layer(
         false,
     )?;
     a.o.project(cx, acts, l, &s.attn, &mut s.delta)?;
-    residual(cx, src, &s.delta, dst)
+    residual_rows(cx.gpu, cx.sh.hidden, src, &s.delta, dst)
 }
 
 /// One MLP layer: `down(relu²(up(x)))`, no gate.
@@ -439,13 +431,19 @@ fn mlp_layer(
     (s, acts): (&mut Scratch, &mut Acts),
     (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
 ) -> Result<(), GpuError> {
-    norm(cx, &m.norm, src, &mut s.xn)?;
+    norm_rows(
+        (cx.gpu, cx.w),
+        (cx.sh.eps, cx.sh.hidden, 1),
+        &m.norm,
+        src,
+        &mut s.xn,
+    )?;
     m.up.project(cx, acts, l, &s.xn, &mut s.up)?;
     cx.gpu
         .elem()
         .enqueue_relu_sqr(cx.gpu.stream(), &s.up, m.ff, &mut s.act)?;
     m.down.project(cx, acts, l, &s.act, &mut s.delta)?;
-    residual(cx, src, &s.delta, dst)
+    residual_rows(cx.gpu, cx.sh.hidden, src, &s.delta, dst)
 }
 
 impl Body {

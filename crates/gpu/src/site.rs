@@ -538,6 +538,15 @@ impl WideActs {
         )
     }
 
+    /// The wide forms any of `tys` reads ([`WideActs::wants`] over them).
+    #[must_use]
+    pub fn wants_of(tys: &[SiteTy]) -> (bool, bool) {
+        tys.iter().fold((false, false), |(a, b), &t| {
+            let (x, y) = WideActs::wants(t);
+            (a | x, b | y)
+        })
+    }
+
     /// `cols` columns of `k` values in the forms `(q128, q32)` asks for.
     /// Load-time only.
     pub fn new(
@@ -629,10 +638,7 @@ impl WideActsMut<'_> {
         tys: &[SiteTy],
     ) -> Result<(), GpuError> {
         const WHAT_Q: &str = "site::WideActsMut::quantize";
-        let (q128, q32) = (
-            tys.iter().any(|&t| WideActs::wants(t).0),
-            tys.iter().any(|&t| WideActs::wants(t).1),
-        );
+        let (q128, q32) = WideActs::wants_of(tys);
         if q128 {
             let a = self.q128.as_deref_mut().ok_or(GpuError::state(
                 WHAT_Q,

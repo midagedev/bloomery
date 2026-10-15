@@ -22,8 +22,8 @@ use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{
-    DownEntry, FfnPlan, FfnRoute, Form, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan,
-    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry,
+    DownEntry, FfnPlan, FfnRoute, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan, SharedPlan,
+    SharedSites, SiteTy, down_entry, gate_up_entry,
 };
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
@@ -381,10 +381,8 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
 /// The quantizer launches a wide input takes for sites of types `tys`: one
 /// for each of the q8_1-of-128 and q8-of-32 forms one of them reads.
 pub(super) fn wide_quants(tys: &[SiteTy]) -> usize {
-    [Form::Q8x128, Form::Q8x32]
-        .iter()
-        .filter(|f| tys.iter().any(|t| t.reads() == **f))
-        .count()
+    let (q128, q32) = crate::site::WideActs::wants_of(tys);
+    usize::from(q128) + usize::from(q32)
 }
 
 /// Enqueue layer `slot`'s FFN half alone: `ffn_inp` in, the output residual

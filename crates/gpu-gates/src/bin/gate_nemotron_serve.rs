@@ -452,6 +452,11 @@ mod gate {
         Ok(resent.tokens == fresh.tokens && resent.cache_n == 0)
     }
 
+    // PIN(2026-10-16): the kept slot's answer is held to the run of its held split
+    // (`extension_is_the_held_run`), no longer to a fresh run of the longer prompt: since the
+    // prompt path runs passes, a fresh run is one pass over all of it, and the held split's steps
+    // differ from it by the q8 rounding of the activations at the Q8_0 sites (the prose prompt's
+    // resent and fresh answers part on the batched path).
     /// `extension_keeps_the_held_sequence` (the module header): the slot holds the prose prompt
     /// and its answer (`held`'s tokens, from an empty cache), and the prompt with that answer
     /// appended is sent. Its answer, kept for `extension_is_the_held_run`.
