@@ -85,7 +85,7 @@ else
     # shellcheck disable=SC2064 # the code now, TEE_PID when the trap runs
     trap "TEE_EXIT=${s#*:}; [ -z \"\$TEE_PID\" ] || exit ${s#*:}" "${s%:*}"
   done
-  mkfifo "$LOG.out"
+  mkfifo "$LOG.out" || exit 70
   tee "$LOG" < "$LOG.out" &
   TEE_PID=$!
   [ -z "$TEE_EXIT" ] || exit "$TEE_EXIT"

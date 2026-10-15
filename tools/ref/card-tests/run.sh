@@ -1155,6 +1155,16 @@ run 'gate.sh: a plain cargo test never reads BLOOMERY_ARCH' 0 '^cargo test -p x 
 GS_ARGS=(-p x --release --lib -- f)
 run "gate.sh: a filter's call passes cargo's output through" 78 '^cargo test -p x --release --lib -- f$' gs
 has '  … and ends 78 when no test passed, by name' 'the filter f matched no test'
+# A filter's call whose FIFO cannot be made (here a link already holds its path) ends 70 before cargo runs, and the path it
+# found is never opened for writing.
+mkdir -p "$GS/fifo"
+printf '#!/bin/sh\necho %s\n' "$GS/log" > "$GS/fifo/mktemp"
+chmod +x "$GS/fifo/mktemp"
+echo keep > "$GS/target"
+ln -sf "$GS/target" "$GS/log.out"
+run "gate.sh: a FIFO it cannot make ends 70" 70 'mkfifo.*File exists' gs PATH="$GS/fifo:$GS/stub:$PATH"
+if [ "$(cat "$GS/target")" = keep ] && ! grep -q '^cargo ' "$tmp/out"; then pass '  … before cargo runs, and the linked file stays as it was'
+else fail '  … before cargo runs, and the linked file stays as it was' "cargo ran or the target changed" "$tmp/out"; fi
 
 # card-precheck.sh: lease_card before the build, with the recipe's own card or the environment's.
 pre() {
