@@ -195,6 +195,8 @@ generate_ds41   index_pool                               0           0
 generate_ds41   iq2_xs_gate_up_sel                       0           0
 generate_ds41   iq2_xs_gemv_sel                          0           0
 generate_ds41   iq2_xs_rows                              0           0
+generate_ds41   iq2_xxs_gemv_sel                         0           0
+generate_ds41   iq2_xxs_rows                             0           0
 generate_ds41   iq3_s_gate_up_sel                        0           0
 generate_ds41   iq3_s_gemv_sel                           0           0
 generate_ds41   iq3_xxs_gate_up_sel                      0           0
@@ -232,6 +234,7 @@ generate_ds41   mxfp4_gemv_sel                           0           0
 generate_ds41   neox_append_k192                         0           0
 generate_ds41   neox_append_k192_ring                    0           0
 generate_ds41   norm_quant                               0           0
+generate_ds41   nvfp4_gemv                               0           0
 generate_ds41   ple_conv                                 0           0
 generate_ds41   ple_gate                                 0           0
 generate_ds41   q2_k_rows                                0           0
@@ -449,6 +452,8 @@ gate_e2e   index_pool                               0           0
 gate_e2e   iq2_xs_gate_up_sel                       0           0
 gate_e2e   iq2_xs_gemv_sel                          0           0
 gate_e2e   iq2_xs_rows                              0           0
+gate_e2e   iq2_xxs_gemv_sel                         0           0
+gate_e2e   iq2_xxs_rows                             0           0
 gate_e2e   iq3_s_gate_up_sel                        0           0
 gate_e2e   iq3_s_gemv_sel                           0           0
 gate_e2e   iq3_xxs_gate_up_sel                      0           0
@@ -483,6 +488,7 @@ gate_e2e   mxfp4_gemv_sel                           0           0
 gate_e2e   neox_append_k192                         0           0
 gate_e2e   neox_append_k192_ring                    0           0
 gate_e2e   norm_quant                               0           0
+gate_e2e   nvfp4_gemv                               0           0
 gate_e2e   ple_conv                                 0           0
 gate_e2e   ple_gate                                 0           0
 gate_e2e   q2_k_rows                                0           0
