@@ -1341,8 +1341,11 @@ gate-r8:
 # under the NextN load (half the experts on each card-eligible layer) and the traps its reader and the kernels' constants
 # fall into, refused by name; the Nemotron 3 Nano 4B spec (model::arch::nemotron_h::fixture) against the Nemotron file's
 # header: the five-layer plan read back by the engine's hparams (kinds, every stem and type pair of the source), the written
-# fixture (about 0.93 GB) verified against it, and the maps that lose a kind or a pair refused by name; and a toy family's
-# r8 sidecar written, checked and refused when absent, other or flipped.
+# fixture (about 0.93 GB) verified against it, and the maps that lose a kind or a pair refused by name; the Nemotron 3.5 Bolt
+# spec (model::arch::nemotron_h_moe::fixture) against the Bolt file's header: the four-layer plan read back by the engine's
+# hparams (kinds, the two MoE layers' expert shapes, expert_count the map's largest router, every stem and type pair of the
+# source), the written fixture (about 2.16 GB) verified against it, and the maps that lose a kind or the two shapes refused
+# by name; and a toy family's r8 sidecar written, checked and refused when absent, other or flipped.
 # Reads headers only; writes only under this tree's target/tmp (the Nemotron clause writes its one 0.93 GB file there).
 gate-fixture:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-fixture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test fixture --bin fixture -- --include-ignored --nocapture --test-threads=1'

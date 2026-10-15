@@ -5,7 +5,7 @@ use std::fmt;
 
 use gguf::GgmlType;
 use gguf::iq_tables::KVALUES_IQ4NL;
-use gguf::quant::{KVALUES_MXFP4, f32_to_f16_bits, half_to_f32};
+use gguf::quant::{KVALUES_MXFP4, f32_to_f16_bits, half_to_f32, ue4m3_to_f32_half};
 
 use super::FixtureError;
 
@@ -130,6 +130,12 @@ pub enum Rule {
     /// `2^(E−128)·kvalues[c]`: `E` is `e_lo` with probability `p_lo / 2^32`,
     /// else `e_lo + 1`; `c` uniform over the 16 codes.
     Mxfp4 { e_lo: u8, p_lo: u64 },
+    /// Each of a block's four 16-value sub-blocks takes the UE4M3
+    /// scale byte `s_lo` with probability `p_lo / 2^32`, else `s_lo + 1`; `c`
+    /// uniform over the 16 codes. The block's dequant is `d·kvalues_fp4[c]`
+    /// without the tensor's scale [`NVFP4_TENSOR_SCALE`] `S`, which the
+    /// engine multiplies by.
+    Nvfp4 { s_lo: u8, p_lo: u64 },
     /// Uniform in `[−half_width, half_width)`, rounded to the type.
     Uniform { ty: FloatTy, half_width: f32 },
     /// Every element `value` (F32).
@@ -214,6 +220,16 @@ impl Rule {
                 e_lo + 1,
                 i32::from(*e_lo) - 127
             ),
+            Rule::Nvfp4 { s_lo, p_lo } => {
+                let d = |b: u8| ue4m3_to_f32_half(b).expect("a byte below 0x7F is a scale");
+                format!(
+                    "UE4M3 scale {s_lo:#04x} (d {:.4e}) with p {:.4}, else {:#04x} (d {:.4e}), times the tensor scale {NVFP4_TENSOR_SCALE:.4e}; codes uniform over the 16 kvalues",
+                    d(*s_lo),
+                    *p_lo as f64 / 4_294_967_296.0,
+                    s_lo + 1,
+                    d(s_lo + 1)
+                )
+            }
             Rule::Uniform { ty, half_width } => {
                 format!("{} uniform in ±{half_width:.4e}", ty.ggml())
             }
@@ -261,6 +277,16 @@ pub(super) const Q5_0_OFFSET: f32 = 16.0;
 /// reaches a smaller K, a band of the smaller a larger one; a band holds codes
 /// of both signs, so no band is one constant.
 const IQ4NL_CODE_SQ: f64 = 1.0;
+/// NVFP4 (`block_nvfp4`: four UE4M3 sub-block scale bytes, 64 four-bit codes,
+/// value `S·d·kvalues_fp4[c]`; [`ue4m3_to_f32_half`] decodes `d`) carries a
+/// per-tensor f32 scale `S`, a tensor of its own (`<name>.scale`) that the
+/// block's dequant leaves out. The fixture fixes `S` for every NVFP4 tensor,
+/// and its family names each `.scale` tensor's constant as this value: a power
+/// of two, near the middle of the real file's (1.3e-4 to 1.6e-3, median 4e-4
+/// [measured]), so `S·d` is exact. The window holds the product `S·d`.
+pub const NVFP4_TENSOR_SCALE: f32 = 1.0 / 2048.0;
+/// The largest scale byte whose successor is still a scale: 0x7F is E4M3's NaN.
+const UE4M3_LAST_PAIR: u8 = 0x7D;
 
 fn f16(x: f64) -> u16 {
     f32_to_f16_bits(x as f32)
@@ -366,6 +392,9 @@ pub fn rule_for(name: &str, ty: GgmlType, k: u64, window: Window) -> Result<Rule
             .ok_or_else(|| no_scale("band of kvalue codes"))
         }
         GgmlType::MXFP4 => mxfp4_rule(sigma).ok_or_else(|| no_scale("E8M0 exponent pair")),
+        GgmlType::NVFP4 => {
+            nvfp4_rule(sigma, window).ok_or_else(|| no_scale("UE4M3 scale byte pair"))
+        }
         GgmlType::F32 => Ok(uniform(FloatTy::F32)),
         GgmlType::F16 => Ok(uniform(FloatTy::F16)),
         GgmlType::BF16 => Ok(uniform(FloatTy::BF16)),
@@ -376,16 +405,20 @@ pub fn rule_for(name: &str, ty: GgmlType, k: u64, window: Window) -> Result<Rule
     }
 }
 
+/// `E[kvalue²]` of the 4-bit float codes MXFP4 and NVFP4 share, drawn uniformly.
+fn fp4_code_sq() -> f64 {
+    KVALUES_MXFP4
+        .iter()
+        .map(|&k| f64::from(k) * f64::from(k))
+        .sum::<f64>()
+        / KVALUES_MXFP4.len() as f64
+}
+
 /// MXFP4's scale is E8M0 (`2^(E−128)`, a power of two), not an f16: the
 /// f16 window does not apply. `E[d²]` is matched exactly by mixing the two
 /// exponents around `σ² / E[kvalue²]`; both must be normal E8M0 codes.
 fn mxfp4_rule(sigma: f64) -> Option<Rule> {
-    let code_sq: f64 = KVALUES_MXFP4
-        .iter()
-        .map(|&k| f64::from(k) * f64::from(k))
-        .sum::<f64>()
-        / KVALUES_MXFP4.len() as f64;
-    let t = sigma * sigma / code_sq;
+    let t = sigma * sigma / fp4_code_sq();
     let e = (t.log2() / 2.0).floor();
     let lo = (2.0f64).powf(e);
     let p = (4.0 * lo * lo - t) / (3.0 * lo * lo);
@@ -395,6 +428,35 @@ fn mxfp4_rule(sigma: f64) -> Option<Rule> {
     }
     Some(Rule::Mxfp4 {
         e_lo: byte as u8,
+        p_lo: (p.clamp(0.0, 1.0) * 4_294_967_296.0) as u64,
+    })
+}
+
+/// Whether UE4M3 scale byte `byte` is a scale whose product with
+/// [`NVFP4_TENSOR_SCALE`] lies in `window`.
+pub(super) fn nvfp4_scale_in_window(byte: u8, window: Window) -> bool {
+    ue4m3_to_f32_half(byte)
+        .is_ok_and(|d| (window.lo..=window.hi).contains(&(NVFP4_TENSOR_SCALE * d)))
+}
+
+/// NVFP4's sub-block scale is a UE4M3 byte, a scale per 16 values, and the
+/// bytes' decodes grow with the byte. The `E[(S·d)²]` that gives the tensor
+/// σ = 1/√K is matched exactly by mixing two adjacent bytes, the largest whose
+/// `d` is at most the target and its successor, both in the window.
+fn nvfp4_rule(sigma: f64, window: Window) -> Option<Rule> {
+    let t = (sigma / f64::from(NVFP4_TENSOR_SCALE)).powi(2) / fp4_code_sq();
+    let d_sq = |b: u8| {
+        let d = f64::from(ue4m3_to_f32_half(b).expect("a byte below 0x7F is a scale"));
+        d * d
+    };
+    let s_lo = (1..=UE4M3_LAST_PAIR).rev().find(|&b| d_sq(b) <= t)?;
+    let (lo, hi) = (d_sq(s_lo), d_sq(s_lo + 1));
+    if t >= hi || !nvfp4_scale_in_window(s_lo, window) || !nvfp4_scale_in_window(s_lo + 1, window) {
+        return None;
+    }
+    let p = (hi - t) / (hi - lo);
+    Some(Rule::Nvfp4 {
+        s_lo,
         p_lo: (p.clamp(0.0, 1.0) * 4_294_967_296.0) as u64,
     })
 }
@@ -615,6 +677,18 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
                 let r = rng.next() & 0xffff_ffff;
                 blk[0] = if r < *p_lo { *e_lo } else { e_lo + 1 };
                 rng.fill(&mut blk[1..17]);
+            }
+        }
+        Rule::Nvfp4 { s_lo, p_lo } => {
+            let pick = |r: u64| if r < *p_lo { *s_lo } else { s_lo + 1 };
+            for blk in units::<36>(out) {
+                let (scales, codes) = blk.split_at_mut(4);
+                for pair in scales.as_chunks_mut::<2>().0 {
+                    let r = rng.next();
+                    pair[0] = pick(r & 0xffff_ffff);
+                    pair[1] = pick(r >> 32);
+                }
+                rng.fill(codes);
             }
         }
         Rule::Uniform { ty, half_width } => {

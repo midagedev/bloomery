@@ -46,6 +46,7 @@ const DIRS: &[(&str, &str)] = &[
     ("deepseek41", "v41"),
     ("glm5next", "glm5next"),
     ("nemotron_h", "nemotron"),
+    ("nemotron_h_moe", "nemotron-bolt"),
     ("qwen35moe", "qwen35moe"),
 ];
 

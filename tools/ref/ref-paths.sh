@@ -97,6 +97,7 @@ case "${BLOOMERY_TIER:-real}" in
       deepseek41) __fixture_dir=v41 ;;
       glm5next) __fixture_dir=glm5next ;;
       nemotron_h) __fixture_dir=nemotron ;;
+      nemotron_h_moe) __fixture_dir=nemotron-bolt ;;
       qwen35moe) __fixture_dir=qwen35moe ;;
       deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;
       *) __fixture_dir=none ;;

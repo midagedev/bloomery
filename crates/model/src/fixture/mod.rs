@@ -62,6 +62,7 @@ mod budget;
 #[cfg(test)]
 mod digest;
 mod fill;
+pub(crate) mod hybrid;
 mod plan;
 mod remote;
 mod sidecar;
@@ -71,7 +72,7 @@ mod verify;
 mod write;
 
 pub use budget::check as check_budget;
-pub use fill::{Band, CHUNK_TARGET, FloatTy, Rule, Window, rule_for};
+pub use fill::{Band, CHUNK_TARGET, FloatTy, NVFP4_TENSOR_SCALE, Rule, Window, rule_for};
 pub use plan::{FilePlan, Kvs, Plan, PlannedTensor, header_sha256, plan};
 pub(crate) use plan::{int_like, items, split_layer, unsigned};
 pub use remote::{

@@ -27,7 +27,7 @@
 //! listed size with its header (fetched through the hf crate's client) at the front, in a
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
-//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `nemotron`)
+//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `nemotron`, `nemotron-bolt`)
 //! reads its row of [`SOURCES`]: repo, quant and revision; a `<repo>:<quant>` takes `main`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
@@ -55,6 +55,7 @@ use hf::{Entry, RepoRef};
 use model::arch::deepseek41::fixture as v41;
 use model::arch::glm5next::fixture as glm5;
 use model::arch::nemotron_h::fixture as nemo;
+use model::arch::nemotron_h_moe::fixture as bolt;
 use model::arch::qwen35moe::fixture as qwen38;
 use model::arch::qwen35moe::fixture::qwen35moe as qwen36;
 use model::fixture::{
@@ -73,12 +74,13 @@ flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a
 flags of fetch: the same but --draft, and --rev R";
 
 /// Every family's spec, found by the architecture it declares.
-const SPECS: [fn() -> FixtureSpec; 5] = [
+const SPECS: [fn() -> FixtureSpec; 6] = [
     v41::spec,
     qwen38::spec,
     qwen36::spec,
     glm5::spec,
     nemo::spec,
+    bolt::spec,
 ];
 
 /// Where a family's draft fixture comes from on the hub.
@@ -106,7 +108,7 @@ struct Source {
 }
 
 /// One row per entry of [`SPECS`].
-const SOURCES: [Source; 5] = [
+const SOURCES: [Source; 6] = [
     Source {
         spec: v41::spec,
         family: "v41",
@@ -152,6 +154,16 @@ const SOURCES: [Source; 5] = [
         quant: "Q4_K_M",
         // The commit the 2,837,072,864-byte file's header was read at.
         rev: Some("ba223d14e45525f7fae81db77ea8cabeb2fc6c25"),
+        draft: DraftSource::None,
+    },
+    Source {
+        spec: bolt::spec,
+        family: "nemotron-bolt",
+        repo: "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
+        quant: "24GB",
+        // The repo's head commit when the row was written (the hub's API); the box's copy of
+        // the file was not compared with it.
+        rev: Some("e0fecb69cb3e5e4c5e8a056fa2aec98c78e91246"),
         draft: DraftSource::None,
     },
 ];

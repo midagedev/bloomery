@@ -8,6 +8,7 @@
 //! coverage check lists what is missing. The dialect's authority is
 //! llama.cpp's `src/models/nemotron-h.cpp`, which loads both architectures.
 
+pub mod fixture;
 pub mod hparams;
 pub mod names;
 pub mod roles;

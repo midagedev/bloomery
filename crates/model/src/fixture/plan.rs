@@ -9,7 +9,9 @@ use gguf::write::{Layout, TensorDecl, file_alignment};
 use gguf::{GgmlType, Split, Value};
 use sha2::{Digest, Sha256};
 
-use super::fill::{FloatTy, Rule, Window, chunk_len, chunk_rng, fill_units, rule_for};
+use super::fill::{
+    FloatTy, NVFP4_TENSOR_SCALE, Rule, Window, chunk_len, chunk_rng, fill_units, rule_for,
+};
 use super::spec::{CardBudget, DraftSpec, Family, FixtureSpec, KeyRule, Options, Tables};
 use super::{
     FIXTURE_VERSION, FixtureError, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256,
@@ -87,6 +89,11 @@ impl PlannedTensor {
             // A uniform draw in `±h` has standard deviation `h/√3`: a matrix's
             // `h` is `√3/√K`, a spread vector's the family's.
             Rule::Uniform { half_width, .. } => Some(f64::from(half_width) / 3.0f64.sqrt()),
+            // The block's dequant leaves out the tensor's scale `S`; the
+            // product with it is the one at σ = 1/√K.
+            Rule::Nvfp4 { .. } => {
+                Some(1.0 / (f64::from(NVFP4_TENSOR_SCALE) * (self.dims[0] as f64).sqrt()))
+            }
             _ => Some(1.0 / (self.dims[0] as f64).sqrt()),
         }
     }

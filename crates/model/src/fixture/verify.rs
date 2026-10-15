@@ -2,12 +2,12 @@
 //! sampled chunks byte for byte, each sampled block against its rule, and the
 //! dequantized RMS.
 
-use gguf::quant::{KVALUES_MXFP4, half_to_f32};
+use gguf::quant::{KVALUES_MXFP4, half_to_f32, ue4m3_to_f32_half};
 use gguf::{Split, Value, dequant_row};
 
 use super::fill::{
-    Band, Q4K_MIN_PER_SCALE, Q5_0_OFFSET, Q5K_MIN_PER_SCALE, Rule, Window, q3k_scale, scale_min_k4,
-    unit_bytes,
+    Band, Q4K_MIN_PER_SCALE, Q5_0_OFFSET, Q5K_MIN_PER_SCALE, Rule, Window, nvfp4_scale_in_window,
+    q3k_scale, scale_min_k4, unit_bytes,
 };
 use super::plan::{FilePlan, PlannedTensor, header_sha256, items, plan, unsigned};
 use super::sidecar::{self, SidecarStat};
@@ -184,6 +184,7 @@ fn block_fault(rule: &Rule, blk: &[u8], y: &[f32], window: Window) -> Option<Str
                 }
             }
         }
+        Rule::Nvfp4 { s_lo, .. } => nvfp4_fault(blk, y, *s_lo, window),
         Rule::Uniform { half_width, .. } => {
             let limit = half_width * (1.0 + 1.0 / 128.0);
             if y[0].is_finite() && y[0].abs() <= limit {
@@ -201,6 +202,34 @@ fn block_fault(rule: &Rule, blk: &[u8], y: &[f32], window: Window) -> Option<Str
         }
     };
     r.err()
+}
+
+/// NVFP4: each sub-block's scale byte is the rule's low byte or its
+/// successor, a scale with `S·d` in `window`, and each of the sub-block's
+/// values `y` (the dequant without the tensor's scale) is `d·kvalue`.
+fn nvfp4_fault(blk: &[u8], y: &[f32], s_lo: u8, window: Window) -> Result<(), String> {
+    for (j, vals) in y.as_chunks::<16>().0.iter().enumerate() {
+        let byte = blk[j];
+        if byte != s_lo && byte != s_lo + 1 {
+            return Err(format!(
+                "sub-block {j} scale byte {byte:#04x} is neither {s_lo:#04x} nor {:#04x}",
+                s_lo + 1
+            ));
+        }
+        if !nvfp4_scale_in_window(byte, window) {
+            return Err(format!(
+                "sub-block {j} scale byte {byte:#04x} puts S·d outside {window}"
+            ));
+        }
+        let d = ue4m3_to_f32_half(byte).map_err(|why| format!("sub-block {j}: {why}"))?;
+        if let Some(v) = vals
+            .iter()
+            .find(|&&v| !KVALUES_MXFP4.iter().any(|&k| f32::from(k) * d == v))
+        {
+            return Err(format!("sub-block {j} dequantizes {v}, not d·kvalue"));
+        }
+    }
+    Ok(())
 }
 
 /// Sixteen signed sub-block scales in `band`, and each value of sub-block

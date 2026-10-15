@@ -20,7 +20,7 @@ pub mod gemma_embedding;
 pub mod gemma_embedding2;
 mod gemma_encoder;
 pub mod glm5next;
-mod hybrid;
+pub(crate) mod hybrid;
 pub mod mimo2;
 pub mod names;
 pub mod nemotron_h;

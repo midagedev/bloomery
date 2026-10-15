@@ -108,6 +108,25 @@
 //! 26. the source traps its rules refuse by name: a missing `full_attention_interval`, another
 //!     model width, and an architecture key no rule covers.
 //!
+//! The Nemotron 3.5 Bolt spec (`model::arch::nemotron_h_moe::fixture`), the first hybrid with latent
+//! MoE layers of different shapes, NVFP4 mixer projections and per-tensor scales. The synthetic
+//! clauses plan a small `nemotron_h_moe` source of eight layers (its routed and shared experts
+//! Q4_K, where the real file's are IQ2_XXS, which the generator has no rule for) through the
+//! family's own rules; the real header on the box:
+//!
+//! 27. the written fixture of the synthetic source verifies, the engine's reader reads its kinds
+//!     and per-layer experts, `expert_count` is the map's largest router, the family's constants
+//!     land (the scan's vectors, the router bias, the NVFP4 `.scale` tensors at the generator's
+//!     tensor scale), and the NVFP4 projections and the F32 router are filled by their rules;
+//! 28. a layer map that loses a kind, a (stem, type) pair or the difference between two MoE
+//!     layers' (expert count, width) is refused by name, each beside a control map that plans;
+//!     a written fixture whose layer holds another layer's experts is refused by name;
+//! 29. the NVFP4 rule: the window holds every (type, K) of the real file's NVFP4 census, filled at
+//!     σ through `gguf::dequant_row`; a K or a window no scale byte pair fits is refused by name;
+//!     a block whose scale byte is not the rule's is refused by name;
+//! 30. the real header: the plan of the four layers `[0, 3, 7, 48]`, the written file verified
+//!     against the source, and the maps that lose a kind or the two shapes refused.
+//!
 //! Files go under this crate's `CARGO_TARGET_TMPDIR` and are removed.
 
 use std::collections::{BTreeMap, HashMap};
@@ -126,6 +145,10 @@ use model::arch::glm5next::hparams::Kind as GlmKind;
 use model::arch::glm5next::place::{NextnInputs, PlanInputs as GlmInputs};
 use model::arch::nemotron_h::fixture as nemo;
 use model::arch::nemotron_h::hparams::{Hparams as NemoHparams, Kind as NemoKind};
+use model::arch::nemotron_h_moe::fixture as bolt;
+use model::arch::nemotron_h_moe::hparams::{
+    Experts as BoltExperts, Hparams as BoltHparams, Kind as BoltKind,
+};
 use model::arch::qwen35moe::fixture as q38;
 use model::arch::qwen35moe::fixture::qwen35moe as q36;
 use model::arch::qwen35moe::hparams::{Hparams, Kind};
@@ -134,7 +157,8 @@ use model::fileio;
 use model::fixture::{
     self, CHUNK_TARGET, CardBudget, DEFAULT_SHARD_BYTES, Family, FilePlan, FixtureError,
     FixtureSpec, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256, KEY_VERSION,
-    KeyRule, Options, Plan, PlannedTensor, Rule, Sample, SidecarSpec, Tables, Window, rule_for,
+    KeyRule, NVFP4_TENSOR_SCALE, Options, Plan, PlannedTensor, Rule, Sample, SidecarSpec, Tables,
+    Window, rule_for,
 };
 use model::placement::PlanLevers;
 use model::placement::workstation::{self, RTX_3090};
@@ -2088,14 +2112,15 @@ fn fixture_sidecar() {
 /// chunk holds.
 fn one_chunk(ty: GgmlType, k: u64, rule: Rule) -> PlannedTensor {
     let unit = ty.type_size().unwrap();
-    let rows = CHUNK_TARGET as u64 / unit * 32 / k;
+    let blck = ty.blck_size().unwrap();
+    let rows = CHUNK_TARGET as u64 / unit * blck / k;
     PlannedTensor {
         name: format!("t.{ty}.{k}"),
         source: String::new(),
         layer: None,
         dims: vec![k, rows],
         ty,
-        nbytes: rows * (k / 32) * unit,
+        nbytes: rows * (k / blck) * unit,
         rule,
     }
 }
@@ -2106,12 +2131,17 @@ fn one_chunk(ty: GgmlType, k: u64, rule: Rule) -> PlannedTensor {
 fn filled_ratio(t: &PlannedTensor, window: Window) -> Result<f64, FixtureError> {
     let mut bytes = vec![0u8; t.nbytes as usize];
     t.fill_chunk(7, 0, &mut bytes);
-    let mut y = vec![0f32; bytes.len() / t.ty.type_size().unwrap() as usize * 32];
+    let mut y = vec![
+        0f32;
+        bytes.len() / t.ty.type_size().unwrap() as usize
+            * t.ty.blck_size().unwrap() as usize
+    ];
     gguf::dequant_row(t.ty, &bytes, &mut y).unwrap();
     let rms = (y.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / y.len() as f64).sqrt();
     let sample = fixture::check_units(t, &bytes, 0, window)?;
     fixture::rms_within(t, &sample)?;
-    Ok(rms * (t.dims[0] as f64).sqrt())
+    // The ratio to the rule's own σ: 1/√K, or for NVFP4 that over the tensor's scale.
+    Ok(rms / t.sigma().expect("a quantized tensor has a σ"))
 }
 
 /// The window the rule contracts below are written at: [2^-13, 2^-10], which
@@ -3552,7 +3582,12 @@ fn nemo_spec() -> FixtureSpec {
 
 /// The rule the plan gives the tensor of `leaf` in fixture layer 0.
 fn rule_of<'a>(p: &'a Plan, leaf: &str) -> &'a Rule {
-    let name = format!("blk.0.{leaf}");
+    rule_at(p, 0, leaf)
+}
+
+/// The rule the plan gives the tensor of `leaf` in fixture layer `f`.
+fn rule_at<'a>(p: &'a Plan, f: usize, leaf: &str) -> &'a Rule {
+    let name = format!("blk.{f}.{leaf}");
     &p.target
         .tensors
         .iter()
@@ -4060,6 +4095,620 @@ fn hw_fixture_nemotron_refusals() {
             }
             (false, Err(e), _) => bad.push(format!("{what}: refused as {e}")),
             (false, Ok(_), _) => bad.push(format!("{what}: planned")),
+        }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+// ------------------------------------------------------------------ Nemotron 3.5 Bolt
+
+/// A synthetic `nemotron_h_moe` source of eight layers at small widths, one unsplit file: Mamba-2
+/// at layers 0, 2 and 5, attention at 4, latent MoE at 1 (8 experts × 256 wide), 3 (12 × 512), 6
+/// (8 × 256) and 7 (10 × 256), `expert_count` 12. Layer 6's `ffn_down_shexp` is Q5_0 and the other
+/// MoE layers' Q4_K, one stem of two types; the routed and shared experts are Q4_K where the real
+/// file's are IQ2_XXS, which the generator has no rule for. The tensors are zeros: the generator
+/// reads the header alone.
+fn bolt_source(path: &Path, extra_kvs: &[(&str, Value)]) -> Split {
+    use GgmlType::{F32, NVFP4, Q4_K, Q5_0, Q8_0};
+    const E: u64 = 256;
+    let name = |l: usize, stem: &str| format!("blk.{l}.{stem}");
+    let mamba = |l: usize| {
+        vec![
+            (name(l, "attn_norm.weight"), vec![E], F32),
+            (name(l, "ssm_a"), vec![1, 4], F32),
+            (name(l, "ssm_d"), vec![1, 4], F32),
+            (name(l, "ssm_dt.bias"), vec![4], F32),
+            (name(l, "ssm_conv1d.weight"), vec![4, 1024], F32),
+            (name(l, "ssm_conv1d.bias"), vec![1024], F32),
+            (name(l, "ssm_in.weight"), vec![E, 1540], NVFP4),
+            (name(l, "ssm_in.scale"), vec![1], F32),
+            (name(l, "ssm_norm.weight"), vec![256, 2], F32),
+            (name(l, "ssm_out.weight"), vec![512, E], NVFP4),
+            (name(l, "ssm_out.scale"), vec![1], F32),
+        ]
+    };
+    let attn = |l: usize| {
+        vec![
+            (name(l, "attn_norm.weight"), vec![E], F32),
+            (name(l, "attn_q.weight"), vec![E, 256], Q8_0),
+            (name(l, "attn_k.weight"), vec![E, 128], Q8_0),
+            (name(l, "attn_v.weight"), vec![E, 128], Q8_0),
+            (name(l, "attn_output.weight"), vec![256, E], Q8_0),
+        ]
+    };
+    let moe = |l: usize, n: u64, w: u64, shexp_down: GgmlType| {
+        vec![
+            (name(l, "attn_norm.weight"), vec![E], F32),
+            (name(l, "ffn_gate_inp.weight"), vec![E, n], F32),
+            (name(l, "exp_probs_b.bias"), vec![n], F32),
+            (name(l, "ffn_latent_down.weight"), vec![E, 256], Q8_0),
+            (name(l, "ffn_latent_up.weight"), vec![256, E], Q8_0),
+            (name(l, "ffn_up_exps.weight"), vec![256, w, n], Q4_K),
+            (name(l, "ffn_down_exps.weight"), vec![w, 256, n], Q4_K),
+            (name(l, "ffn_up_shexp.weight"), vec![E, 256], Q4_K),
+            (name(l, "ffn_down_shexp.weight"), vec![256, E], shexp_down),
+        ]
+    };
+    let mut tensors: Vec<(String, Vec<u64>, GgmlType)> = vec![
+        ("token_embd.weight".into(), vec![E, 64], Q8_0),
+        ("output_norm.weight".into(), vec![E], F32),
+        ("output.weight".into(), vec![E, 64], Q8_0),
+    ];
+    for l in 0..8 {
+        tensors.extend(match l {
+            0 | 2 | 5 => mamba(l),
+            1 => moe(l, 8, 256, Q4_K),
+            3 => moe(l, 12, 512, Q4_K),
+            4 => attn(l),
+            6 => moe(l, 8, 256, Q5_0),
+            _ => moe(l, 10, 256, Q4_K),
+        });
+    }
+    let arr = |v: &[i32]| Value::Array(v.iter().map(|&x| Value::I32(x)).collect());
+    let u32v = |k: &str, v: u32| (format!("nemotron_h_moe.{k}"), Value::U32(v));
+    let mut kvs: Vec<(String, Value)> = vec![
+        (
+            gguf::GENERAL_ARCHITECTURE.to_string(),
+            Value::String("nemotron_h_moe".into()),
+        ),
+        (
+            "general.name".to_string(),
+            Value::String("synthetic".into()),
+        ),
+        u32v("block_count", 8),
+        u32v("context_length", 4096),
+        u32v("embedding_length", 256),
+        (
+            "nemotron_h_moe.feed_forward_length".into(),
+            arr(&[0, 256, 0, 512, 0, 0, 256, 256]),
+        ),
+        u32v("attention.head_count", 4),
+        (
+            "nemotron_h_moe.attention.head_count_kv".into(),
+            arr(&[0, 0, 0, 0, 2, 0, 0, 0]),
+        ),
+        (
+            "nemotron_h_moe.attention.layer_norm_rms_epsilon".into(),
+            Value::F32(1e-5),
+        ),
+        (
+            "nemotron_h_moe.attention.layer_norm_epsilon".into(),
+            Value::F32(1e-5),
+        ),
+        u32v("expert_count", 12),
+        u32v("expert_group_count", 1),
+        u32v("expert_group_used_count", 1),
+        u32v("expert_gating_func", 2),
+        u32v("vocab_size", 64),
+        u32v("rope.dimension_count", 64),
+        u32v("ssm.conv_kernel", 4),
+        u32v("ssm.state_size", 128),
+        u32v("ssm.group_count", 2),
+        u32v("ssm.inner_size", 512),
+        u32v("ssm.time_step_rank", 4),
+        (
+            "nemotron_h_moe.rope.scaling.finetuned".into(),
+            Value::Bool(false),
+        ),
+        u32v("attention.key_length", 64),
+        u32v("attention.value_length", 64),
+        (
+            "nemotron_h_moe.expert_feed_forward_length".into(),
+            arr(&[0, 256, 0, 512, 0, 0, 256, 256]),
+        ),
+        (
+            "nemotron_h_moe.expert_used_count".into(),
+            arr(&[0, 4, 0, 4, 0, 0, 4, 4]),
+        ),
+        u32v("expert_shared_feed_forward_length", 256),
+        u32v("expert_shared_count", 1),
+        (
+            "nemotron_h_moe.expert_weights_norm".into(),
+            Value::Bool(true),
+        ),
+        (
+            "nemotron_h_moe.expert_weights_scale".into(),
+            Value::F32(5.0),
+        ),
+        u32v("moe_latent_size", 256),
+    ];
+    kvs.extend(extra_kvs.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    zero_source(path, &kvs, &tensors)
+}
+
+/// The production family on the synthetic source's layers: Mamba-2, MoE (12 × 512), attention and
+/// MoE (8 × 256, `ffn_down_shexp` Q5_0): one of each kind, both shapes and both pairs of the one
+/// stem that has two.
+fn bolt_spec() -> FixtureSpec {
+    FixtureSpec {
+        layers: vec![0, 3, 4, 6],
+        ..bolt::spec()
+    }
+}
+
+/// The value of metadata key `suffix` of `arch`'s `plan`.
+fn bolt_kv<'a>(p: &'a Plan, suffix: &str) -> &'a Value {
+    let key = format!("nemotron_h_moe.{suffix}");
+    &p.target
+        .kvs
+        .iter()
+        .find(|(k, _)| *k == key)
+        .unwrap_or_else(|| panic!("no {key}"))
+        .1
+}
+
+/// Contract 27: the synthetic source's fixture is written and verified (NVFP4, Q8_0, Q4_K, Q5_0
+/// blocks, the F32 constants), read by the engine's reader as [Mamba-2, MoE, attention, MoE] with
+/// the source layers' experts, its per-layer arrays at the map's layers, `expert_count` the map's
+/// largest router (10 on a map without the 12-expert layer), and the family's constants land: the
+/// scan's vectors, the router bias 0, both `.scale` tensors at the generator's tensor scale, the
+/// router a matrix draw at `1/√K` and the NVFP4 projections under the NVFP4 rule.
+#[test]
+fn fixture_bolt_round_trip() {
+    let guard = dir("bolt-round-trip");
+    let d = &guard.0;
+    let src = bolt_source(&d.join("src.gguf"), &[]);
+    let spec = bolt_spec();
+    let plan = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    for (f, leaf, want) in [
+        (0, "ssm_a", -0.39),
+        (0, "ssm_d", 0.22),
+        (0, "ssm_dt.bias", -3.0),
+        (0, "ssm_conv1d.bias", 0.0),
+        (0, "ssm_norm.weight", 1.0),
+        (0, "ssm_in.scale", NVFP4_TENSOR_SCALE),
+        (0, "ssm_out.scale", NVFP4_TENSOR_SCALE),
+        (1, "attn_norm.weight", 1.0),
+        (1, "exp_probs_b.bias", 0.0),
+    ] {
+        match rule_at(&plan, f, leaf) {
+            Rule::Const { value } if *value == want => {}
+            other => panic!(
+                "layer {f} {leaf}: {}, want constant {want}",
+                other.describe()
+            ),
+        }
+    }
+    for leaf in ["ssm_in.weight", "ssm_out.weight"] {
+        match rule_of(&plan, leaf) {
+            Rule::Nvfp4 { .. } => {}
+            other => panic!("{leaf}: {}, want the NVFP4 rule", other.describe()),
+        }
+    }
+    match rule_at(&plan, 1, "ffn_gate_inp.weight") {
+        Rule::Uniform { half_width, .. } => {
+            let want = (3.0f64.sqrt() / 16.0) as f32;
+            assert!((half_width - want).abs() < 1e-6, "{half_width}");
+        }
+        other => panic!("ffn_gate_inp.weight: {}", other.describe()),
+    }
+    let ints = |k: &str| unsigned_items(bolt_kv(&plan, k));
+    assert_eq!(ints("feed_forward_length"), [0, 512, 0, 256]);
+    assert_eq!(ints("expert_feed_forward_length"), [0, 512, 0, 256]);
+    assert_eq!(ints("expert_used_count"), [0, 4, 0, 4]);
+    assert_eq!(ints("attention.head_count_kv"), [0, 0, 2, 0]);
+    assert_eq!(bolt_kv(&plan, "expert_count").as_unsigned(), Some(12));
+    let out = d.join("fx");
+    fixture::generate(&spec, &src, None, &out, &spec.options(), &mut |_| {}).unwrap();
+    let first = out.join("nemotron-bolt-fixture-00001-of-00001.gguf");
+    let fx = Split::open(&first).unwrap();
+    assert_eq!(fx.shard_count(), 1);
+    fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    let hp = BoltHparams::read(&fx).unwrap();
+    assert_eq!(
+        hp.kinds,
+        [
+            BoltKind::Mamba,
+            BoltKind::Moe,
+            BoltKind::Attention,
+            BoltKind::Moe
+        ]
+    );
+    let shape = |n_expert, ff| {
+        Some(BoltExperts {
+            n_expert,
+            top_k: 4,
+            ff,
+        })
+    };
+    assert_eq!(hp.experts, [None, shape(12, 512), None, shape(8, 256)]);
+    assert_eq!(hp.n_expert, 12);
+    let (s, info) = fx.find("blk.0.ssm_in.scale").unwrap();
+    let at = fx.shard(s).unwrap().data_base() as usize + info.offset as usize;
+    assert_eq!(
+        floats(&fx.shard(s).unwrap().mapping()[at..at + 4]),
+        [NVFP4_TENSOR_SCALE]
+    );
+    // `expert_count` follows the map: layers 6 and 7 hold 8 and 10 experts, the source says 12.
+    let small = FixtureSpec {
+        layers: vec![0, 6, 4, 7],
+        ..bolt::spec()
+    };
+    let p = fixture::plan(&small, &src, None, &small.options()).unwrap();
+    assert_eq!(bolt_kv(&p, "expert_count").as_unsigned(), Some(10));
+}
+
+/// Contract 28: a layer map that loses a kind, a (stem, type) pair or the difference between two
+/// MoE layers' (expert count, width) is refused by name at the plan; each refusal sits beside the
+/// control map, which plans. A written fixture whose MoE layer holds another layer's experts is
+/// refused by name by the family's kinds check, and passes it against its own map.
+#[test]
+fn fixture_bolt_refuses_a_map_that_loses_a_kind_a_pair_or_a_shape() {
+    let guard = dir("bolt-map");
+    let d = &guard.0;
+    let src = bolt_source(&d.join("src.gguf"), &[]);
+    let mut bad = Vec::new();
+    let control = bolt_spec();
+    if let Err(e) = fixture::plan(&control, &src, None, &control.options()) {
+        bad.push(format!("the control map: {e}"));
+    }
+    for (what, layers, want) in [
+        ("no Mamba-2 layer", vec![3, 4, 6], vec!["Mamba"]),
+        ("no attention layer", vec![0, 3, 6], vec!["Attention"]),
+        ("no MoE layer", vec![0, 4], vec!["Moe"]),
+        (
+            "one shape twice (layers 1 and 6, 8 × 256)",
+            vec![0, 1, 4, 6],
+            vec!["shape", "(8, 256)"],
+        ),
+        (
+            "ffn_down_shexp Q5_0 dropped (layer 6)",
+            vec![0, 1, 3, 4],
+            vec!["ffn_down_shexp.weight", "q5_0", "source layer 6"],
+        ),
+        (
+            "ffn_down_shexp Q4_K dropped (layer 1 the first)",
+            vec![0, 4, 6],
+            vec!["ffn_down_shexp.weight", "q4_K", "source layer 1"],
+        ),
+    ] {
+        let s = FixtureSpec {
+            layers,
+            ..bolt::spec()
+        };
+        match fixture::plan(&s, &src, None, &s.options()) {
+            Err(e) if want.iter().all(|w| e.to_string().contains(w)) => {
+                println!("bolt map: {what}: {e}");
+            }
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(_) => bad.push(format!("{what}: planned")),
+        }
+    }
+    // The kinds check: a fixture written from map [0, 6, 4, 7] read against the map
+    // [0, 7, 4, 6], whose layer 1 is the same width (256) and another expert count (10, not 8).
+    let written = FixtureSpec {
+        layers: vec![0, 6, 4, 7],
+        ..bolt::spec()
+    };
+    let out = d.join("fx");
+    fixture::generate(&written, &src, None, &out, &written.options(), &mut |_| {}).unwrap();
+    let fx = Split::open(out.join("nemotron-bolt-fixture-00001-of-00001.gguf")).unwrap();
+    if let Err(e) = bolt::check_kinds(&written, &fx, &src) {
+        bad.push(format!("the kinds check against its own map: {e}"));
+    }
+    let swapped = FixtureSpec {
+        layers: vec![0, 7, 4, 6],
+        ..bolt::spec()
+    };
+    match bolt::check_kinds(&swapped, &fx, &src) {
+        Err(e)
+            if ["layer 1 (source 7)", "experts"]
+                .iter()
+                .all(|w| e.to_string().contains(w)) =>
+        {
+            println!("bolt map: a swapped expert shape: {e}");
+        }
+        other => bad.push(format!("a swapped expert shape: {other:?}")),
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 29: the spec's window holds every NVFP4 (type, K) of the real file's census (K = 4,096
+/// for `ssm_in`, 8,192 for `ssm_out`) and the Q8_0 Ks the latent pair and the globals have, and a
+/// filled chunk of each dequantizes to an RMS within ±10 % of the rule's σ (for NVFP4, `1/√K` over
+/// the tensor scale). A K no scale byte pair reaches, and a window the product of the tensor scale
+/// and the scale cannot enter, are refused by name; a block whose scale byte is not the rule's is
+/// refused by name, and the unchanged block passes.
+#[test]
+fn fixture_bolt_nvfp4_rule_fills_at_sigma() {
+    let window = bolt::spec().window;
+    let mut bad = Vec::new();
+    for (ty, k) in [
+        (GgmlType::NVFP4, 4096),
+        (GgmlType::NVFP4, 8192),
+        (GgmlType::Q8_0, 1024),
+        (GgmlType::Q8_0, 4096),
+    ] {
+        let t = match rule_for("t", ty, k, window) {
+            Ok(rule) => one_chunk(ty, k, rule),
+            Err(e) => {
+                bad.push(format!("{ty} K = {k}: {e}"));
+                continue;
+            }
+        };
+        match filled_ratio(&t, window) {
+            Ok(r) if (0.9..=1.1).contains(&r) => {
+                println!(
+                    "bolt window: {ty} K = {k}: {}; RMS / sigma = {r:.4}",
+                    t.rule.describe()
+                );
+            }
+            Ok(r) => bad.push(format!("{ty} K = {k}: RMS / sigma = {r:.4}")),
+            Err(e) => bad.push(format!("{ty} K = {k}: {e}")),
+        }
+    }
+    let narrow = Window::new(1.0 / 16384.0, 1.0 / 8192.0).unwrap();
+    for (what, k, w) in [
+        ("a K past every scale byte", 1u64 << 40, window),
+        ("a window below the scale", 4096, narrow),
+    ] {
+        match rule_for("t", GgmlType::NVFP4, k, w) {
+            Err(FixtureError::NoScale { ty, k: got, .. }) if (ty, got) == (GgmlType::NVFP4, k) => {}
+            other => bad.push(format!("{what}: {other:?}")),
+        }
+    }
+    let rule = rule_for("t", GgmlType::NVFP4, 4096, window).unwrap();
+    let Rule::Nvfp4 { s_lo, .. } = rule else {
+        panic!("{}", rule.describe())
+    };
+    let t = one_chunk(GgmlType::NVFP4, 4096, rule);
+    let mut bytes = vec![0u8; 36 * 4];
+    t.fill_chunk(7, 0, &mut bytes[..]);
+    if let Err(e) = fixture::check_units(&t, &bytes, 0, window) {
+        bad.push(format!("the control block: {e}"));
+    }
+    match fixture::check_units(&t, &bytes, 0, narrow) {
+        Err(e) if e.to_string().contains("outside") => {}
+        other => bad.push(format!("a scale outside the window: {other:?}")),
+    }
+    bytes[2] = s_lo + 2;
+    match fixture::check_units(&t, &bytes, 0, window) {
+        Err(e) if e.to_string().contains("sub-block 2") && e.to_string().contains("neither") => {}
+        other => bad.push(format!("a scale byte off the rule: {other:?}")),
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+fn bolt_real() -> Split {
+    Split::open(bolt::DEFAULT_MODEL)
+        .unwrap_or_else(|e| panic!("open the Bolt file {}: {e}", bolt::DEFAULT_MODEL))
+}
+
+/// Contract 30: the plan of the real header: four layers from source layers 0, 3, 7 and 48 read
+/// back by the engine's reader as [Mamba-2, MoE, attention, MoE] with the source's experts (240 ×
+/// 1,536 and 496 × 2,560, top 9), `expert_count` 496, one shard with no `split.*` keys, 37 tensors
+/// at 2,158,358,920 bytes [derived from the header's tensor sizes], every tensor its source's at
+/// its dims and type, every (stem, type) pair of the source's layers held, and the constants where
+/// they are named.
+#[test]
+#[ignore = "needs the box and the Nemotron 3.5 Bolt file (just gate-fixture)"]
+fn hw_fixture_bolt_plan() {
+    let src = bolt_real();
+    let spec = bolt::spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).expect("the plan of the real file");
+    let t = &p.target;
+    assert_eq!(
+        unsigned_items(
+            &t.kvs
+                .iter()
+                .find(|(k, _)| k == KEY_SOURCE_LAYERS)
+                .unwrap()
+                .1
+        ),
+        [0, 3, 7, 48]
+    );
+    assert_eq!(t.shards.len(), 1, "one shard");
+    assert!(
+        t.kvs.iter().all(|(k, _)| !k.starts_with("split.")),
+        "no split keys"
+    );
+    assert_eq!(t.tensors.len(), 37);
+    let payload: u64 = t.tensors.iter().map(|pt| pt.nbytes).sum();
+    assert_eq!(payload, 2_158_358_920, "tensor payload");
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for pt in &t.tensors {
+        let info = src
+            .find(&pt.source)
+            .unwrap_or_else(|| panic!("no source tensor {}", pt.source))
+            .1;
+        assert_eq!((pt.ty, &pt.dims), (info.ty, &info.dims), "{}", pt.name);
+        if let Some(f) = pt.layer {
+            let l = bolt::LAYER_MAP[f];
+            assert_eq!(
+                pt.name,
+                format!("blk.{f}.{}", leaf_of(&pt.source)),
+                "{}",
+                pt.name
+            );
+            assert!(pt.source.starts_with(&format!("blk.{l}.")), "{}", pt.source);
+            pairs.push((leaf_of(&pt.name).to_string(), pt.ty.to_string()));
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    let held: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let mut want: Vec<(&str, &str)> = vec![
+        ("attn_k.weight", "q8_0"),
+        ("attn_norm.weight", "f32"),
+        ("attn_output.weight", "q8_0"),
+        ("attn_q.weight", "q8_0"),
+        ("attn_v.weight", "q8_0"),
+        ("exp_probs_b.bias", "f32"),
+        ("ffn_down_exps.weight", "iq2_xxs"),
+        ("ffn_down_shexp.weight", "iq2_xxs"),
+        ("ffn_gate_inp.weight", "f32"),
+        ("ffn_latent_down.weight", "q8_0"),
+        ("ffn_latent_up.weight", "q8_0"),
+        ("ffn_up_exps.weight", "iq2_xxs"),
+        ("ffn_up_shexp.weight", "iq2_xxs"),
+        ("ssm_a", "f32"),
+        ("ssm_conv1d.bias", "f32"),
+        ("ssm_conv1d.weight", "f32"),
+        ("ssm_d", "f32"),
+        ("ssm_dt.bias", "f32"),
+        ("ssm_in.scale", "f32"),
+        ("ssm_in.weight", "nvfp4"),
+        ("ssm_norm.weight", "f32"),
+        ("ssm_out.scale", "f32"),
+        ("ssm_out.weight", "nvfp4"),
+    ];
+    want.sort();
+    assert_eq!(
+        held, want,
+        "every (stem, type) pair of the real file's layers"
+    );
+    for (f, leaf, v) in [
+        (0, "ssm_a", -0.39),
+        (0, "ssm_d", 0.22),
+        (0, "ssm_dt.bias", -3.0),
+        (0, "ssm_norm.weight", 1.0),
+        (0, "ssm_in.scale", NVFP4_TENSOR_SCALE),
+        (0, "ssm_out.scale", NVFP4_TENSOR_SCALE),
+        (1, "exp_probs_b.bias", 0.0),
+    ] {
+        match rule_at(&p, f, leaf) {
+            Rule::Const { value } if *value == v => {}
+            other => panic!("{leaf}: {}, want constant {v}", other.describe()),
+        }
+    }
+    assert_eq!(bolt_kv(&p, "expert_count").as_unsigned(), Some(496));
+    let guard = dir("bolt-plan");
+    let fx = Split::open(header_only(t, &guard.0)).unwrap();
+    let hp = bolt::check_kinds(&spec, &fx, &src).unwrap();
+    assert_eq!(
+        hp.kinds,
+        [
+            BoltKind::Mamba,
+            BoltKind::Moe,
+            BoltKind::Attention,
+            BoltKind::Moe
+        ]
+    );
+    let shape = |n_expert, ff| {
+        Some(BoltExperts {
+            n_expert,
+            top_k: 9,
+            ff,
+        })
+    };
+    assert_eq!(hp.experts, [None, shape(240, 1536), None, shape(496, 2560)]);
+    assert_eq!(
+        (hp.n_layer, hp.n_embd, hp.n_expert, hp.latent, hp.shared_ff),
+        (4, 4096, 496, 1024, 5376)
+    );
+    assert_eq!(
+        (hp.ssm.n_heads, hp.ssm.n_groups, hp.ssm.d_inner),
+        (128, 8, 8192)
+    );
+    let total: u64 = t.layouts().unwrap().iter().map(|(_, l)| l.file_len()).sum();
+    println!(
+        "bolt plan: {} layers kinds {:?}; {} tensors, payload {payload} B, file {total} B ({:.3} GB), card budget {}",
+        hp.n_layer,
+        hp.kinds,
+        t.tensors.len(),
+        total as f64 / 1e9,
+        p.card_budget
+    );
+}
+
+/// Contract 30: the fixture written from the real header is verified against it, and a flipped
+/// byte of an NVFP4 tensor is refused by name.
+#[test]
+#[ignore = "needs the box and the Nemotron 3.5 Bolt file (just gate-fixture)"]
+fn hw_fixture_bolt_end_to_end() {
+    let src = bolt_real();
+    let spec = bolt::spec();
+    let guard = dir("bolt-e2e");
+    let out = guard.0.join("fx");
+    let t0 = Instant::now();
+    let stats = fixture::generate(&spec, &src, None, &out, &spec.options(), &mut |_| {}).unwrap();
+    println!(
+        "bolt e2e: generate {stats:?} in {:.1} s",
+        t0.elapsed().as_secs_f64()
+    );
+    let first = out.join("nemotron-bolt-fixture-00001-of-00001.gguf");
+    let fx = Split::open(&first).unwrap();
+    let (v, _) = fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    println!("bolt e2e: verify {v:?}");
+    assert_eq!(v.tensors, 37);
+    let len = std::fs::metadata(&first).unwrap().len();
+    println!("bolt e2e: file {len} B");
+    let name = "blk.0.ssm_in.weight";
+    let (s, info) = fx.find(name).unwrap();
+    let at = fx.shard(s).unwrap().data_base() + info.offset;
+    drop(fx);
+    flip(&first, at);
+    let fx = Split::open(&first).unwrap();
+    match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
+        Err(e) if e.to_string().contains(name) => println!("bolt e2e: a flipped byte: {e}"),
+        other => panic!("a flipped byte of {name}: {other:?}"),
+    }
+}
+
+/// Contract 30: on the real header, a map that loses a kind or the difference between two MoE
+/// layers is refused by name at the plan, and maps that keep both shapes pass the family's map
+/// check: layers 3 (240 × 1,536) and 5 (240 × 2,048) differ in width alone, 5 and 12 are one shape.
+/// The controls call the map check, not the plan, which the real file's IQ2_XXS stacks need a
+/// fill rule for.
+#[test]
+#[ignore = "needs the box and the Nemotron 3.5 Bolt file (just gate-fixture)"]
+fn hw_fixture_bolt_refusals() {
+    let src = bolt_real();
+    let hp = BoltHparams::read(&src).unwrap();
+    let mut bad = Vec::new();
+    for (what, layers, want) in [
+        ("the spec's map", vec![0, 3, 7, 48], None),
+        ("two widths of one count", vec![0, 3, 5, 7], None),
+        ("no Mamba-2 layer", vec![3, 7, 48], Some(vec!["Mamba"])),
+        (
+            "no attention layer",
+            vec![0, 3, 48],
+            Some(vec!["Attention"]),
+        ),
+        ("no MoE layer", vec![0, 7], Some(vec!["Moe"])),
+        (
+            "one shape twice (layers 5 and 12, 240 × 2,048)",
+            vec![0, 5, 7, 12],
+            Some(vec!["shape", "(240, 2048)"]),
+        ),
+    ] {
+        let s = FixtureSpec {
+            layers: layers.clone(),
+            ..bolt::spec()
+        };
+        match (want, fixture::plan(&s, &src, None, &s.options())) {
+            (None, _) => match bolt::check_map(&hp, &src, &layers) {
+                Ok(_) => println!("bolt refusals: {what}: held"),
+                Err(e) => bad.push(format!("{what}: refused as {e}")),
+            },
+            (Some(w), Err(e)) if w.iter().all(|x| e.to_string().contains(x)) => {
+                println!("bolt refusals: {what}: {e}");
+            }
+            (Some(_), Err(e)) => bad.push(format!("{what}: refused as {e}")),
+            (Some(_), Ok(_)) => bad.push(format!("{what}: planned")),
         }
     }
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
