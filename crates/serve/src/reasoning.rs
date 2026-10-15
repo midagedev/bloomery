@@ -114,6 +114,14 @@ pub struct ThinkSplit {
     /// A tag that ends the span too and stays in the output: a call the
     /// markup lets follow the reasoning without `</think>`.
     ends_too: Option<&'static str>,
+    /// Content past every span starts at its first non-whitespace character
+    /// (Qwen3-Coder's markup: llama.cpp's parser reads `reasoning << content`).
+    trim_content: bool,
+    /// The whitespace that opens the content is still being dropped.
+    trimming: bool,
+    /// A span the model opens with its own `<think>` drops the whitespace
+    /// after its `</think>` ([`ThinkSplit::trimming_after_opened`]).
+    trim_after_opened: bool,
 }
 
 impl ThinkSplit {
@@ -131,6 +139,9 @@ impl ThinkSplit {
             may_open: entry == ThinkEntry::MayOpen,
             held: String::new(),
             ends_too: None,
+            trim_content: false,
+            trimming: false,
+            trim_after_opened: false,
         }
     }
 
@@ -140,6 +151,26 @@ impl ThinkSplit {
     #[must_use]
     pub fn ending_at(mut self, tag: &'static str) -> Self {
         self.ends_too = Some(tag);
+        self
+    }
+
+    /// The same splitter, dropping the whitespace that opens the content on
+    /// every path past the span: the span closed by the prompt, closed by
+    /// `</think>`, or never opened. Qwen3-Coder's markup reads so in
+    /// llama.cpp (`reasoning << content`, a space between the two).
+    #[must_use]
+    pub fn trimming_content(mut self) -> Self {
+        self.trim_content = true;
+        self.trimming = !self.inside && !self.may_open;
+        self
+    }
+
+    /// The same splitter, dropping the whitespace after the `</think>` of a
+    /// span the model opened, as llama.cpp's optional leading span takes it
+    /// when reasoning is split out.
+    #[must_use]
+    pub fn trimming_after_opened(mut self) -> Self {
+        self.trim_after_opened = true;
         self
     }
 
@@ -156,11 +187,22 @@ impl ThinkSplit {
         }
         if !self.inside {
             return Split {
-                content: piece.to_owned(),
+                content: self.past_span(piece),
                 ..Split::default()
             };
         }
         self.in_span_step(piece)
+    }
+
+    /// Text past the span: as given, or with its opening whitespace dropped
+    /// while the content is still being trimmed.
+    fn past_span(&mut self, text: &str) -> String {
+        if !self.trimming {
+            return text.to_owned();
+        }
+        let rest = text.trim_start_matches(is_space);
+        self.trimming = rest.is_empty();
+        rest.to_owned()
     }
 
     /// Outside a span the model may still open. Leading whitespace and a
@@ -176,6 +218,7 @@ impl ThinkSplit {
         if let Some(tail) = rest.strip_prefix(THINK_OPEN).map(str::to_owned) {
             self.may_open = false;
             self.inside = true;
+            self.trim_content |= self.trim_after_opened;
             self.held.clear();
             let mut s = self.in_span_step(&tail);
             s.opened = true;
@@ -185,8 +228,10 @@ impl ThinkSplit {
             return Split::default();
         }
         self.may_open = false;
+        self.trimming = self.trim_content;
+        let held = std::mem::take(&mut self.held);
         Split {
-            content: std::mem::take(&mut self.held),
+            content: self.past_span(&held),
             ..Split::default()
         }
     }
@@ -209,7 +254,9 @@ impl ThinkSplit {
         }
         if let Some(at) = close {
             self.inside = false;
-            let content = self.held[at + THINK_CLOSE.len()..].to_owned();
+            self.trimming = self.trim_content;
+            let after = self.held[at + THINK_CLOSE.len()..].to_owned();
+            let content = self.past_span(&after);
             self.held.truncate(at);
             return Split {
                 reasoning: std::mem::take(&mut self.held),
@@ -233,8 +280,10 @@ impl ThinkSplit {
     pub fn finish(&mut self) -> Split {
         if self.may_open {
             self.may_open = false;
+            self.trimming = self.trim_content;
+            let held = std::mem::take(&mut self.held);
             return Split {
-                content: std::mem::take(&mut self.held),
+                content: self.past_span(&held),
                 ..Split::default()
             };
         }
@@ -243,6 +292,12 @@ impl ThinkSplit {
             ..Split::default()
         }
     }
+}
+
+/// The whitespace llama.cpp's parser skips between its parts: C's `isspace`
+/// over bytes, the six ASCII spaces and no other.
+fn is_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
 }
 
 /// Length of the longest suffix of `text` that is a proper prefix of `pat`, cut on
@@ -318,7 +373,8 @@ mod tests {
     /// A prompt that leaves the span to the model: the model's leading
     /// `<think>` opens it — the whitespace before the tag and the tag itself
     /// in neither field — and any other text first leaves the whole
-    /// generation as content, a later tag included.
+    /// generation as content, a later tag included. Opted in, the whitespace
+    /// after its `</think>` is in neither field too.
     #[test]
     fn a_model_opened_span_enters_on_a_leading_tag() {
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n");
@@ -327,6 +383,10 @@ mod tests {
             (p.reasoning.as_str(), p.opened, p.closed, p.content.as_str()),
             ("\nwhy\n", true, true, "\nHello")
         );
+        let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n").trimming_after_opened();
+        let p = s.push(" \n<think>\nwhy\n</think>\n");
+        assert_eq!((p.reasoning.as_str(), p.content.as_str()), ("\nwhy\n", ""));
+        assert_eq!(s.push(" Hello").content, "Hello");
         // Whitespace alone decides nothing; at the end it is content.
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n");
         assert_eq!(s.push("  "), Split::default());
@@ -339,5 +399,19 @@ mod tests {
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n");
         assert_eq!(s.push("<thi"), Split::default());
         assert_eq!(s.push("nk>ok").reasoning, "ok");
+    }
+
+    /// The opening whitespace dropped is C's `isspace` over bytes, as
+    /// llama.cpp's parser skips it: `\x0B` and `\x0C` go, U+3000 and U+00A0
+    /// stay, and a piece of whitespace alone waits for the text after it.
+    #[test]
+    fn the_content_drops_the_six_ascii_spaces_and_no_other() {
+        let mut s = ThinkSplit::for_prompt("<think></think>").trimming_content();
+        assert_eq!(s.push(" \t\n").content, "");
+        assert_eq!(s.push("\x0B\x0C\rHello \n").content, "Hello \n");
+        let mut s = ThinkSplit::for_prompt("<think></think>").trimming_content();
+        assert_eq!(s.push("\u{3000}Hello").content, "\u{3000}Hello");
+        let mut s = ThinkSplit::for_prompt("<think></think>").trimming_content();
+        assert_eq!(s.push("\u{a0}Hello").content, "\u{a0}Hello");
     }
 }

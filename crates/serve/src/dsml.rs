@@ -454,7 +454,10 @@ impl ChatParser {
         ChatParser {
             format,
             think: split.then(|| {
-                let t = ThinkSplit::for_prompt(prompt);
+                let mut t = ThinkSplit::for_prompt(prompt);
+                if format == ReasoningFormat::Deepseek {
+                    t = t.trimming_after_opened();
+                }
                 if call_ends_span {
                     t.ending_at(qwenxml::CALL_OPEN)
                 } else {
@@ -469,6 +472,18 @@ impl ChatParser {
             }),
             total: Message::default(),
         }
+    }
+
+    /// The same parser for a template whose markup is `format`: Qwen3-Coder's
+    /// drops the whitespace that opens the content when reasoning is split
+    /// out, with or without the request's tools, as llama.cpp's parser for
+    /// the markup reads it ([`ThinkSplit::trimming_content`]).
+    #[must_use]
+    pub fn for_template(mut self, format: ToolFormat) -> Self {
+        if format == ToolFormat::QwenXml && self.format == ReasoningFormat::Deepseek {
+            self.think = self.think.take().map(ThinkSplit::trimming_content);
+        }
+        self
     }
 
     /// Parses a whole generation.

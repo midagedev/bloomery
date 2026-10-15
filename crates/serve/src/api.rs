@@ -3577,7 +3577,7 @@ fn chat_plan(
     let (text, input) = chat_input(state, b)?;
     let tools = tool_scan(state, b)?;
     gate_reasoning_budget(&mut p, &text);
-    let parser = ChatParser::with_tools(&text, format, tools);
+    let parser = ChatParser::with_tools(&text, format, tools).for_template(state.tool_format);
     Ok(ChatPlan {
         p,
         input,
@@ -7121,7 +7121,9 @@ mod tests {
     /// the span in the prompt (`reasoning_effort: "none"`), so the output
     /// parser starts outside it and the think budget holds nothing. The same
     /// request without it opens the span, and the whole output is
-    /// `reasoning_content`.
+    /// `reasoning_content`. The mock's output after the prompt's closed span
+    /// is the newlines that end it, echoed, which Qwen3.8's markup drops from
+    /// the start of the content as llama.cpp's parser does: no field takes them.
     #[test]
     fn thinking_off_puts_the_whole_output_in_content() {
         let (addr, _state, _ended) = super::testserve::spawn(
@@ -7154,9 +7156,10 @@ mod tests {
             off.get("reasoning_content").is_none(),
             "thinking off: no reasoning: {off}"
         );
-        assert!(
-            off["content"].as_str().is_some_and(|s| !s.is_empty()),
-            "thinking off: the whole output is content: {off}"
+        assert_eq!(
+            off["content"].as_str(),
+            Some(""),
+            "thinking off: the output is content, its opening newlines dropped: {off}"
         );
     }
 

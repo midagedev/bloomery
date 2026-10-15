@@ -836,3 +836,354 @@ fn hw_qwen_malformed_call_is_an_api_error() {
         assert!(e.starts_with(want), "{e}");
     }
 }
+
+/// The content after the think span, on every fixture template, as llama.cpp
+/// mainline's chat layer parses the same generation (`tools/ref/chat_parse_ref`
+/// over each template, one user turn, `reasoning_format` auto): the
+/// Qwen3-Coder parser (Qwen3.6, Qwen3.8, Nemotron) drops the whitespace that
+/// opens the content, with the span open, closed by the prompt, or ended by a
+/// call; a span the model opens itself (Qwen3's) drops the whitespace after its
+/// `</think>`; GLM's and V4.1's keep it, as does Qwen3's prompt-closed span.
+/// Whitespace before a call stays in the content on every template.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_content_after_the_span_is_mainlines() {
+    let call = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+    // (template, thinking, tools, output, content, reasoning, calls)
+    let cases: Vec<(&str, &str, bool, bool, String, &str, Option<&str>, usize)> = vec![
+        (
+            "qwen38",
+            TEMPLATE,
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "Hello",
+            Some("r"),
+            0,
+        ),
+        (
+            "qwen38",
+            TEMPLATE,
+            false,
+            false,
+            "\nHello".into(),
+            "Hello",
+            None,
+            0,
+        ),
+        (
+            "qwen36",
+            QWEN36,
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "Hello",
+            Some("r"),
+            0,
+        ),
+        (
+            "qwen36",
+            QWEN36,
+            false,
+            false,
+            "\nHello".into(),
+            "Hello",
+            None,
+            0,
+        ),
+        (
+            "nemotron",
+            NEMOTRON,
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "Hello",
+            Some("r"),
+            0,
+        ),
+        (
+            "nemotron",
+            NEMOTRON,
+            false,
+            false,
+            "\nHello".into(),
+            "Hello",
+            None,
+            0,
+        ),
+        (
+            "glm5",
+            GLM5,
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "\n\nHello",
+            Some("r"),
+            0,
+        ),
+        (
+            "glm5",
+            GLM5,
+            false,
+            false,
+            "\nHello".into(),
+            "",
+            Some("\nHello"),
+            0,
+        ),
+        (
+            "v41",
+            V41_TEMPLATE,
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "\n\nHello",
+            Some("r"),
+            0,
+        ),
+        (
+            "v41",
+            V41_TEMPLATE,
+            false,
+            false,
+            "\nHello".into(),
+            "\nHello",
+            None,
+            0,
+        ),
+        (
+            "qwen3",
+            QWEN3,
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "r</think>\n\nHello",
+            None,
+            0,
+        ),
+        (
+            "qwen3",
+            QWEN3,
+            false,
+            false,
+            "\nHello".into(),
+            "\nHello",
+            None,
+            0,
+        ),
+        (
+            "qwen3",
+            QWEN3,
+            true,
+            false,
+            "<think>r</think>\n\nHello".into(),
+            "Hello",
+            Some("r"),
+            0,
+        ),
+        (
+            "qwen38",
+            TEMPLATE,
+            true,
+            true,
+            format!("r</think>\n\n{call}"),
+            "",
+            Some("r"),
+            1,
+        ),
+        (
+            "qwen38",
+            TEMPLATE,
+            false,
+            true,
+            format!("\n{call}\n"),
+            "",
+            None,
+            1,
+        ),
+        (
+            "qwen38",
+            TEMPLATE,
+            false,
+            true,
+            format!("Let me check.\n{call}"),
+            "Let me check.\n",
+            None,
+            1,
+        ),
+        (
+            "qwen36",
+            QWEN36,
+            true,
+            true,
+            format!("r</think>\n\n{call}"),
+            "",
+            Some("r"),
+            1,
+        ),
+        (
+            "qwen36",
+            QWEN36,
+            false,
+            true,
+            format!("\n{call}\n"),
+            "",
+            None,
+            1,
+        ),
+        (
+            "qwen36",
+            QWEN36,
+            false,
+            true,
+            format!("Let me check.\n{call}"),
+            "Let me check.\n",
+            None,
+            1,
+        ),
+        (
+            "nemotron",
+            NEMOTRON,
+            true,
+            true,
+            format!("r</think>\n\n{call}"),
+            "",
+            Some("r"),
+            1,
+        ),
+        (
+            "nemotron",
+            NEMOTRON,
+            false,
+            true,
+            format!("\n{call}\n"),
+            "",
+            None,
+            1,
+        ),
+        (
+            "nemotron",
+            NEMOTRON,
+            false,
+            true,
+            format!("Let me check.\n{call}"),
+            "Let me check.\n",
+            None,
+            1,
+        ),
+        // C's isspace: the ideographic space stays, the vertical tab and form feed go.
+        (
+            "nemotron",
+            NEMOTRON,
+            false,
+            false,
+            "\u{3000}Hello".into(),
+            "\u{3000}Hello",
+            None,
+            0,
+        ),
+        (
+            "nemotron",
+            NEMOTRON,
+            false,
+            false,
+            "\x0B\x0CHello".into(),
+            "Hello",
+            None,
+            0,
+        ),
+        (
+            "qwen3",
+            QWEN3,
+            true,
+            false,
+            "<think>r</think>\u{3000}Hello".into(),
+            "\u{3000}Hello",
+            Some("r"),
+            0,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, template, thinking, with_tools, out, content, reasoning, calls) in cases {
+        let addr = start_templated(Box::new(ScriptedEngine::new(4096, &out)), template);
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}],
+            "temperature": 0, "chat_template_kwargs": {"enable_thinking": thinking}});
+        if with_tools {
+            body["tools"] = json!([{"type": "function", "function": {"name": "get_time",
+                "description": "time", "parameters": {"type": "object", "properties": {}}}}]);
+        }
+        for stream in [false, true] {
+            body["stream"] = json!(stream);
+            let r = post(addr, "/v1/chat/completions", &body);
+            assert_eq!(r.status, 200, "{name} {out:?}: {}", r.body);
+            let (got_content, got_reasoning, got_calls) = if stream {
+                let (_, folded) = fold_stream(&r.body).expect("no error event");
+                let n = folded["calls"].as_array().map_or(0, Vec::len);
+                (
+                    folded["content"].clone(),
+                    folded["reasoning_content"].clone(),
+                    n,
+                )
+            } else {
+                let v = r.json();
+                let m = &v["choices"][0]["message"];
+                let n = m["tool_calls"].as_array().map_or(0, Vec::len);
+                (m["content"].clone(), m["reasoning_content"].clone(), n)
+            };
+            // The folded stream holds an absent `reasoning_content` as "".
+            let want_reasoning = match (reasoning, stream) {
+                (Some(r), _) => json!(r),
+                (None, true) => json!(""),
+                (None, false) => Value::Null,
+            };
+            if got_content != json!(content)
+                || got_reasoning != want_reasoning
+                || got_calls != calls
+            {
+                wrong.push(format!(
+                    "{name} thinking={thinking} tools={with_tools} stream={stream} {out:?}: \
+                     content {got_content} reasoning {got_reasoning} calls {got_calls}, \
+                     want {content:?} {want_reasoning} {calls}"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} case(s) differ from mainline:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// With `reasoning_format: none` nothing is split out and nothing is dropped:
+/// the whitespace after a model-opened span's `</think>` stays in the content,
+/// as llama.cpp's parser keeps it (`chat_parse_ref --reasoning-format none`:
+/// `<think>r</think>\n\nHello` on Qwen3's template, with or without tools).
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_reasoning_format_none_drops_nothing() {
+    let addr = start_templated(
+        Box::new(ScriptedEngine::new(4096, "<think>r</think>\n\nHello")),
+        QWEN3,
+    );
+    for with_tools in [false, true] {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}],
+            "temperature": 0, "reasoning_format": "none"});
+        if with_tools {
+            body["tools"] = json!([{"type": "function", "function": {"name": "get_time",
+                "description": "time", "parameters": {"type": "object", "properties": {}}}}]);
+        }
+        let r = post(addr, "/v1/chat/completions", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = r.json();
+        let content = v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content.ends_with("</think>\n\nHello"),
+            "tools={with_tools}: {v}"
+        );
+    }
+}
