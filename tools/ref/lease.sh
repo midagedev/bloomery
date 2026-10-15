@@ -1243,7 +1243,7 @@ EOF
   # ---- lease_bounded ----
   # A runner that holds a lease (a temp file) runs a stub under lease_bounded and then its next arm; the
   # stub sets a trap that ends it 7 on a TERM, writes its pid and its parent's (its timeout) and holds.
-  # A TERM to the runner's pid, sent as soon as the stub's pid is there, ends the stub, its timeout and
+  # A TERM to the runner's pid, sent once the stub and its waiting timeout are ready, ends the stub, its timeout and
   # then the runner, by the runner's own TERM trap when it set one, within seconds: the lease is free once
   # the runner is gone and the next arm never starts. A stub still there once the checks are made is let
   # go. Of the output only the runner's own two lines are read: the stub's /bin/sh may report its sleep
@@ -1307,6 +1307,15 @@ exec "$@"
 EOF
     chmod +x "$t/tbin/systemd-run"
     n=0 BOUND=20
+    bounded_ready() {
+      local sp ip state
+      [ -s "$1" ] && read -r sp ip < "$1" || return 1
+      # A child's PID file can precede timeout's return from fork, when GNU timeout handles a TERM
+      # by exiting without forwarding it. Its sleeping state marks the wait for the held command.
+      state=$(ps -o stat= -p "$ip" 2> /dev/null) || return 1
+      case $state in *S*) return 0 ;; esac
+      return 1
+    }
     # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
     # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
     # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
@@ -1333,10 +1342,11 @@ EOF
           "$funcs" "$t/depth-arm-harness" "$t/startup-gate-bound.sh" "$t/held-preheat.py" > "$t/bout$n" 2>&1 &
         rp=$!
         i=0
-        until { [ -s "$t/held$n.pid" ] && { [ "$form" != startup ] || [ -s "$t/gap$n" ]; }; } || [ "$i" = 100 ]; do
+        until { bounded_ready "$t/held$n.pid" && { [ "$form" != startup ] || [ -s "$t/gap$n" ]; }; } || [ "$i" = 100 ]; do
           sleep 0.1
           i=$((i + 1))
         done
+        check "bounded-$form-ready${trp:+-trap}" "$(bounded_ready "$t/held$n.pid" && echo yes || echo no)" yes
         s0=$SECONDS
         kill -TERM "$rp" 2> /dev/null
         [ "$form" != startup ] || { check "bounded-startup-gap${trp:+-trap}" "$(cat "$t/gap$n")" gap; touch "$t/go$n"; }
