@@ -799,9 +799,10 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
     } = s;
     // An output projection of another type reads f32 rows: at head 128 the
     // flash's own, at head 256 the products `gated_256` wrote into the gated
-    // rows.
+    // rows. A K-quant one reads `act_attn`, so its f32 operand is unused.
     let rows = match n.kind {
         GqaKind::Neox128 => &*attn,
+        GqaKind::Gated256 if n.o_ty.kquant() => &*attn,
         GqaKind::Gated256 => gated_rows.as_ref().ok_or(GpuError::state(
             "qwen3moe::attention",
             "the arena's gated rows",
