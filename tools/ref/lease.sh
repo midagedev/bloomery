@@ -1264,7 +1264,8 @@ EOF
       sed -n '/^ref_arm() {/,/^}/p; /^ours_arm() {/,/^}/p; /^preheat_arm() {/,/^}/p' \
         "$LEASE_TREE/tools/ref/depth-$model.sh" > "$t/$model-arm-functions"
     done
-    sed -n "/^MEM_SCOPE_SCRIPT='/,/^'$/p" "$LEASE_TREE/tools/ref/depth-qwen3moe.sh" >> "$t/qwen3moe-arm-functions"
+    qwen3moe=depth-qwen3moe
+    sed -n "/^MEM_SCOPE_SCRIPT='/,/^'$/p" "$LEASE_TREE/tools/ref/$qwen3moe.sh" >> "$t/qwen3moe-arm-functions"
     cstate='cstate-ab'
     sed -n '/^for ((r = 1;/,$p' "$LEASE_TREE/tools/ref/$cstate.sh" > "$t/cstate-arms"
     cat > "$t/depth-arm-harness" << 'EOF'
