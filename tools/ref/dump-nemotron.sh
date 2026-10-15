@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Dump the last-position logit rows of the profile's prompts (the Bolt's ten, the Nano's four), for the profile the
+# Dump the last-position logit rows of the profile's prompts (ten for each), for the profile the
 # command runs under: nemotron_h (Nano 4B) into
 # $BLOOMERY_DATA/ref-nemotron-logits, nemotron_h_moe (Bolt 74B-A9B) into $BLOOMERY_DATA/ref-nemotron-moe-logits. The script,
 # its checks and the harness source are one for both; the profile picks the model file, the set, the binary, the
-# architecture nemotron_ref must find in the file and the prompts (the Nano's four are a subset of the Bolt's ten).
+# architecture nemotron_ref must find in the file and the prompts.
 # The prompts are 1 to 4096 ids: a few short ones, the counts on each side of a 256-row
 # chunk (255, 256, 257), and two long ones (1024 prose, 4096 code).
 # CPU only: CUDA_VISIBLE_DEVICES is emptied and nemotron_ref asks for no GPU layers.
@@ -17,10 +17,10 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
 case $MODEL_NAME in
-  # The Nano keeps the four prompts its gate (gate_nemotron_e2e, CTX 640) reads; the Bolt takes all ten.
+  # Both take all ten: the Nano's gate (gate_nemotron_e2e, CTX 4160) holds the prompt path on every one.
   nemotron_h)
-    SET_NAME=ref-nemotron-logits CTX=512
-    PROMPTS=(code5 code29 prose64 prose512) ;;
+    SET_NAME=ref-nemotron-logits CTX=4096
+    PROMPTS=(code5 code29 code4096 prose1 prose64 prose255 prose256 prose257 prose512 prose1024) ;;
   nemotron_h_moe)
     SET_NAME=ref-nemotron-moe-logits CTX=4096
     PROMPTS=(code5 code29 code4096 prose1 prose64 prose255 prose256 prose257 prose512 prose1024) ;;
