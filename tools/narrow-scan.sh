@@ -549,22 +549,25 @@ self_test() {
   fifo_blocked() {
     local label=$1 launch=$2 hp k kid rc
     rm -rf "$t/lock.d" "$t/lock.d.flock"
-    rm -f "$t/side.fifo" "$t/side.build.log"
+    rm -f "$t/side.fifo" "$t/side.build.log" "$t/side.kid"
     mkfifo "$t/side.fifo"
     export -f lock_take
+    # $! is the launch, not lock_take's python. The pause lets that child close fd 9 before the holder dies.
     bash -c 'lock_take "$1" 0 "fifo" >/dev/null 2>&1 || exit 1
       out=$2 name=side fifo=$3
       eval "$4"
-      exec sleep 30' _ "$t/lock.d" "$t" "$t/side.fifo" "$launch" &
+      echo $! > "$5"
+      exec sleep 30' _ "$t/lock.d" "$t" "$t/side.fifo" "$launch" "$t/side.kid" &
     hp=$!
     kid='' k=0
     while [ "$k" -lt 50 ]; do
-      kid=$(ps -o pid= --ppid "$hp" 2> /dev/null | head -n 1 | tr -d ' ' || true)
-      [ -n "$kid" ] && break
+      [ -s "$t/side.kid" ] && break
       kill -0 "$hp" 2> /dev/null || break
       sleep 0.05
       k=$((k + 1))
     done
+    kid=$(cat "$t/side.kid" 2> /dev/null || true)
+    sleep 0.2
     kill -TERM "$hp" 2> /dev/null || true
     wait "$hp" 2> /dev/null || true
     rc=1
