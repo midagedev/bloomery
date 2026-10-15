@@ -367,7 +367,7 @@ fn dtod_check(
 /// `shape.host_pitch` bytes apart in the destination. One call regroups a
 /// strided layout (token-major rows into head-major runs). Refused by name,
 /// nothing enqueued, when either span leaves its buffer ([`dtod_check`]).
-/// Asynchronous on `stream` and capturable; the two buffers are distinct
+/// Asynchronous on `stream`; the two buffers are distinct
 /// borrows, so the spans never overlap.
 pub fn dtod_2d<D>(
     stream: &CudaStream,
