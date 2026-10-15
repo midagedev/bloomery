@@ -117,11 +117,7 @@ pub const AVAILABLE: &[Available] = &[
         runs: |n| matches!(n, Need::ReluSqr { .. }),
     },
     Available {
-        programs: &[
-            Program::Qwen3moeBody,
-            Program::Qwen35Body,
-            Program::NemotronHBody,
-        ],
+        programs: &[Program::Qwen3moeBody, Program::Qwen35Body],
         at: "models/src/shape.rs GQA",
         runs: |n| {
             matches!(
@@ -136,6 +132,23 @@ pub const AVAILABLE: &[Available] = &[
                 // The pack-5 row (head 128, group 5) is launched by no Qwen
                 // body; the program that launches it names its own entry.
                 } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack != 5)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::NemotronHBody],
+        at: "gpu/src/flash_gqa.rs gqa_flash_seg_g5",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head,
+                    value,
+                    group,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack == 5)
             )
         },
     },
