@@ -526,6 +526,18 @@ pub struct WideActs {
 }
 
 impl WideActs {
+    /// The wide forms a site of type `ty` reads, `(q128, q32)`: q8_1 blocks of
+    /// 128 for a K-quant site; q8 blocks of 32 (`GemmAct32`) for a Q8_0 site
+    /// and for a Q5_0 site, whose gemv reads `Q8Blocks32` and whose GEMM
+    /// reads the same blocks in the wide layout.
+    #[must_use]
+    pub fn wants(ty: SiteTy) -> (bool, bool) {
+        (
+            ty.reads() == Form::Q8x128,
+            matches!(ty.reads(), Form::Q8x32 | Form::Q8Blocks32),
+        )
+    }
+
     /// `cols` columns of `k` values in the forms `(q128, q32)` asks for.
     /// Load-time only.
     pub fn new(
@@ -617,15 +629,18 @@ impl WideActsMut<'_> {
         tys: &[SiteTy],
     ) -> Result<(), GpuError> {
         const WHAT_Q: &str = "site::WideActsMut::quantize";
-        let reads = |f: Form| tys.iter().any(|t| t.reads() == f);
-        if reads(Form::Q8x128) {
+        let (q128, q32) = (
+            tys.iter().any(|&t| WideActs::wants(t).0),
+            tys.iter().any(|&t| WideActs::wants(t).1),
+        );
+        if q128 {
             let a = self.q128.as_deref_mut().ok_or(GpuError::state(
                 WHAT_Q,
                 "the unit's q8_1 blocks of 128 (a K-quant site reads them)",
             ))?;
             gpu.enqueue_quantize_gemm(x, m, a, sink)?;
         }
-        if reads(Form::Q8x32) {
+        if q32 {
             let a = self.q32.as_deref_mut().ok_or(GpuError::state(
                 WHAT_Q,
                 "the unit's q8 blocks of 32 (a Q8_0 or Q5_0 site reads them)",

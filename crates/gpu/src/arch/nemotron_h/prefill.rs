@@ -111,10 +111,7 @@ impl Prompt {
         let mut acts: Vec<ActAt> = Vec::new();
         let mut forms: Vec<(usize, bool, bool)> = Vec::new();
         for s in layers.iter().flat_map(Layer::sites) {
-            let (q128, q32) = (
-                s.ty.reads() == site::Form::Q8x128,
-                s.ty.reads() == site::Form::Q8x32,
-            );
+            let (q128, q32) = WideActs::wants(s.ty);
             match forms.iter_mut().find(|f| f.0 == s.k) {
                 Some(f) => {
                     f.1 |= q128;
