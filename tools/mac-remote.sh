@@ -228,7 +228,7 @@ pool_pick() {
       return 0
     fi
     resv_unlock
-    if [ -z "$choice" ] && [ "$answered" = 0 ] && [ "$retried" = 0 ]; then
+    if [ "$answered" = 0 ] && [ "$retried" = 0 ]; then # no record is reachable, so there is no choice
       printf 'mac-remote: pool:\n%s' "$notes" >&2
       say "mac-remote: no Mac of the pool answered; one more survey in $POOL_RETRY_S s"
       retried=1
@@ -925,6 +925,7 @@ self_test() {
   rc=0; out=$(cd "$HERE" && HOME=$fake POOL_RETRY_S=0 PATH=$d/sshbin:$PATH "$HERE/tools/mac-remote.sh" 2>&1) || rc=$?
   [ "$rc" = 75 ] || fail "a pool of unreachable Macs ended rc $rc, not 75: $out"
   case $out in *"m1: not reachable"*"m2: not reachable"*) ;; *) fail "the unreachable Macs are not named: $out" ;; esac
+  case $out in *pool-leak-sentinel*|*nowhere.example*) fail "a pool host was printed: $out" ;; esac
   [ "$(grep -c 'no Mac of the pool answered; one more survey in 0 s' <<< "$out")" = 1 ] ||
     fail "a pool none of whose Macs answered is surveyed once more, once, and says so: $out"
   # the Macs answer from the third ssh on (the second survey): the one retry picks one
@@ -933,8 +934,8 @@ self_test() {
   rc=0; out=$( POOL_DIR=$fake/.config/bloomery/mac-remote.d RESV_DIR=$d/resv-retry POOL_RETRY_S=0 PATH=$d/sshbin:$PATH
     mkdir -p "$RESV_DIR"; pool_pick tr 2>&1 && echo "MAC_NAME=$MAC_NAME" ) || rc=$?
   case $rc:$out in 0:*"one more survey"*"picked m"*"MAC_NAME=m"*) ;; *) fail "a pool that answers on the retry is picked from: rc $rc $out" ;; esac
+  case $out in *pool-leak-sentinel*|*nowhere.example*) fail "a pool host was printed on the retry: $out" ;; esac
   printf '#!/bin/sh\nexit 255\n' > "$d/sshbin/ssh"
-  case $out in *pool-leak-sentinel*|*nowhere.example*) fail "a pool host was printed: $out" ;; esac
   rc=0; out=$(cd "$HERE" && HOME=$fake BLOOMERY_MAC_REMOTE=m1 PATH=$d/sshbin:$PATH "$HERE/tools/mac-remote.sh" 2>&1) || rc=$?
   case $out in *"pinned to m1"*) ;; *) fail "the pin is not named: $out" ;; esac
   case $out in *"picked "*) fail "a pinned run surveyed the pool: $out" ;; esac
