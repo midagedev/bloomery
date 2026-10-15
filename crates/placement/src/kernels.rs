@@ -207,7 +207,8 @@ pub enum SiteEntry {
     Q6k,
     /// `Q5Kernels::enqueue_gemv_q5_0` (`crates/gpu/src/q5.rs`) over the packed
     /// Q5_0 layout, the site as one expert (`row0 = 0`), through
-    /// `site::blocks32_gemv` on the `Q8Blocks32` rows. No wide GEMM.
+    /// `site::blocks32_gemv` on the `Q8Blocks32` rows; wide, the 32-value GEMM
+    /// over the same blocks in `GemmAct32` (`gemm_q5_0p`).
     Q5_0,
     /// `Q8F32Kernels::enqueue_q8_0_gemv` (`enqueue_q8_0_gemv_mcol` past one
     /// column) over the q8f32 planes and f32 rows; wide, `Gemm32Weight::Q8_0Plane`.

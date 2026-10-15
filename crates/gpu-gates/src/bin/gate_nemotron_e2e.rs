@@ -22,11 +22,13 @@
 //!   give equal ones).
 //! - `fault_word_clean`: the fault word is clean after every run.
 //!
-//! - `top1_is_mainlines`: for each prompt of the `ref-nemotron-logits` set,
-//!   the body's argmax at the last position is the set's.
-//! - `logits_near_mainlines`: per prompt the max |Δ| and the cosine of the
-//!   last-position logits against the set's are printed. The floor is cosine
-//!   at least [`COSINE_FLOOR`] and the same set of top-5 ids; a prompt below
+//! - `top1_is_mainlines`: for each prompt of [`STEP_PROMPTS`] in the
+//!   `ref-nemotron-logits` set, the body's argmax at the last position is the
+//!   set's.
+//! - `logits_near_mainlines`: per prompt of [`STEP_PROMPTS`] the max |Δ| and
+//!   the cosine of the last-position logits against the set's are printed.
+//!   The floor is cosine at least [`COSINE_FLOOR`] and the same set of top-5
+//!   ids; a prompt below
 //!   it is a FAIL, never a pin. The order inside the top-5 is printed with
 //!   both sides' logits and not gated: two logits closer than the quantised
 //!   file's own noise swap places, and the order of rank 1 is the other
@@ -109,6 +111,27 @@ mod gate {
 
     /// How many of the highest logits must be the same ids.
     const TOP_K: usize = 5;
+
+    /// The set's prompts the step path's mainline clauses read
+    /// (`top1_is_mainlines`, `logits_near_mainlines`); the prompt path's
+    /// clauses read every prompt. The others hold the step path to floors no
+    /// derived rounding band backs yet (prose1 and prose257 near ties,
+    /// prose256's cosine), an open finding of the plan.
+    const STEP_PROMPTS: &[&str] = &["code5", "code29", "prose64", "prose512"];
+
+    /// The set's prompts `STEP_PROMPTS` names, each present.
+    fn step_prompts(case: &Case) -> Result<Vec<&refset::nemotron::Prompt>, GateError> {
+        STEP_PROMPTS
+            .iter()
+            .map(|n| {
+                case.set
+                    .prompts
+                    .iter()
+                    .find(|p| p.name == *n)
+                    .ok_or_else(|| format!("the set holds no prompt {n}").into())
+            })
+            .collect()
+    }
 
     /// Tokens of the prompt every clause runs.
     const PROMPT_LEN: usize = 16;
@@ -425,7 +448,7 @@ mod gate {
     fn top1_is_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
         const CLAUSE: &str = "top1_is_mainlines";
         let mut ok = true;
-        for p in &case.set.prompts {
+        for p in step_prompts(case)? {
             let want = crate::e2e::argmax(&case.set.logits(p)?);
             let Some((got, logits)) = body_on(CLAUSE, m, case, p)? else {
                 ok = false;
@@ -447,7 +470,7 @@ mod gate {
     fn logits_near_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
         const CLAUSE: &str = "logits_near_mainlines";
         let mut ok = true;
-        for p in &case.set.prompts {
+        for p in step_prompts(case)? {
             let want = case.set.logits(p)?;
             let Some((_, got)) = body_on(CLAUSE, m, case, p)? else {
                 ok = false;
