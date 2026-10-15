@@ -20,7 +20,8 @@ stdin closes, so a killed client leaves none on the box. The client counts the b
 that starts again reads from the next byte.
 The daemon is polled every BOXQ_POLL_S; a job seen terminal is given one more interval (at most 2 s) for the tails to
 flush, then the tails are stopped (a job that was never seen running has its out and err read whole instead, no flush
-to guess at). Bytes a full pipe left unread are read again from the job's files before `<rc-dir>/<id>.rc` (default
+to guess at). Every byte the tails did not pass on (a full pipe here, a tail short of the file's end) is read
+again from the job's files before `<rc-dir>/<id>.rc` (default
 $BOXQ_RC_DIR, else ~/.cache/bloomery/boxq) is written atomically with the exit code. A replay ssh that does not exit 0
 is exit 84 with the resume line and no rc file. A queued job's wait is counted from the job's `submitted` (ISO; no zone means this machine's, which the
 box shares), else from the client's first sight of it.
@@ -620,12 +621,10 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
             pause(trap, kids, wait)
         if kids:
             pause(trap, kids, min(q.poll_s, FLUSH_MAX_S))  # the tails read what the job wrote last
-            tails = kids[:]
-            offsets = fold_offsets(offsets, kids)
-            if any(t.pending for t in tails):
-                dump(q, last, trap, offsets=tuple(offsets))
-        else:
-            dump(q, last, trap, offsets=tuple(offsets))
+        # whatever the tails did not pass on (a full local pipe, a tail that had not reached the end) is read from the
+        # job's files, from the next byte, before the rc is mirrored
+        offsets = fold_offsets(offsets, kids)
+        dump(q, last, trap, offsets=tuple(offsets))
         if trap.sigs and cancel_at is None:
             say(f"boxq: {jid}: signal; the job had already ended {last['status']} on the box (no rc mirrored)")
             return trap.rc()
@@ -912,6 +911,7 @@ class Fix:
         self.tail_pids, self.hung_pids = os.path.join(tmp, "tail.pids"), os.path.join(tmp, "hung.pid")
         self.follow_pids = os.path.join(tmp, "follow.pids")  # the tails started with -F (tail_pids has every tail)
         self.replay_fail = os.path.join(tmp, "replay-fail")
+        self.tail_stall = os.path.join(tmp, "tail-stall")  # a -F tail passes 5 bytes on, then stalls until stopped
 
     def call(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -933,7 +933,9 @@ class Fix:
         os.makedirs(bindir)
         self.script(os.path.join(bindir, "tail"),
                     f'echo $$ >> {q(self.tail_pids)}\n'
-                    f'case " $* " in *" -F "*) echo $$ >> {q(self.follow_pids)} ;; esac\n'  # a follow, not dump's read
+                    f'case " $* " in *" -F "*) echo $$ >> {q(self.follow_pids)}\n'  # a follow, not dump's read
+                    f'  if [ -f {q(self.tail_stall)} ]; then for f; do :; done; head -c 5 "$f"; exec sleep 600; fi ;;\n'
+                    f'esac\n'
                     f'exec {q(shutil.which("tail"))} "$@"\n')
         if not shutil.which("stdbuf"):  # a Mac: the box's `stdbuf -o0 tail` runs here as plain tail
             self.script(os.path.join(bindir, "stdbuf"), 'shift\nexec "$@"\n')
@@ -1020,9 +1022,11 @@ class Fix:
             time.sleep(0.02)
 
     def gone(self, path, n=None, secs=3):
-        """The pids a stub recorded (n of them, when n is given) are all gone; the record restarts."""
+        """The pids a stub recorded are all gone; the record restarts. For tail_pids, n counts the -F tails among them
+        (each attach that ends also reads its files' rest with tail -c)."""
         pids = self.pids(path)
-        check(n is None or len(pids) == n, f"{os.path.basename(path)} holds {len(pids)} pids, {n} expected")
+        counted = self.pids(self.follow_pids) if path == self.tail_pids else pids
+        check(n is None or len(counted) == n, f"{os.path.basename(path)} holds {len(counted)} counted pids, {n} expected")
         end = time.monotonic() + secs
         while any(alive(p) for p in pids):
             check(time.monotonic() < end, f"pids still alive {secs} s on: {[p for p in pids if alive(p)]}")
@@ -1353,7 +1357,8 @@ def case_flush_cap(fx):
     for poll, flush in (("5", 2.0), ("1", 1.0)):
         trap = RecTrap()
         rc = attach_job(Queue(fx.env(BOXQ_POLL_S=poll)), "j1", fx.rc_dir, trap)
-        check(rc == 0 and trap.waits == [float(poll), flush],
+        # after the flush only dump's own short waits for its tail -c reads follow
+        check(rc == 0 and trap.waits[:2] == [float(poll), flush] and all(w <= 0.1 for w in trap.waits[2:]),
               f"the flush after a terminal status is min(poll, 2 s): poll {poll} s waited {trap.waits}")
         fx.gone(fx.tail_pids)  # the waits are instant, so a tail may be stopped before it recorded its pid
         fx.fake.polls = 0
@@ -1644,6 +1649,19 @@ def case_pending_replay(fx):
     fx.gone(fx.tail_pids)
 
 
+def case_stalled_tail(fx):
+    """A tail that stalls before the file's end, with nothing pending here: the rest is read from the file before the
+    rc is mirrored."""
+    body = b"hello world\n"
+    fx.files(body, b"")
+    open(fx.tail_stall, "w").close()
+    fx.serve([{"status": "running"}, {"status": "done", "rc": 0}], gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
+    got, out, err = fx.client(*fx.run_args(), BOXQ_POLL_S="0.05")
+    check(got == 0 and out == body and fx.rc_file() == "0\n",
+          f"a stalled tail's unread rest is read before the mirror: rc={got} out={out!r} mirror={fx.rc_file()!r} err={err!r}")
+    fx.gone(fx.tail_pids)
+
+
 def case_replay_ssh(fx):
     """An ssh that exits 255 while unread bytes are replayed is exit 84, and no rc file is written."""
     body = b"P" * (1 << 20) + b"0123456789A"
@@ -1915,7 +1933,7 @@ CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_predicti
          case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
          case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_drain_full_pipe,
-         case_pending_replay, case_replay_ssh, case_replay_signal, case_reconnect_wall, case_reconnect_step,
+         case_pending_replay, case_stalled_tail, case_replay_ssh, case_replay_signal, case_reconnect_wall, case_reconnect_step,
          case_cancel_deadline, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
