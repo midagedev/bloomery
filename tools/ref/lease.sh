@@ -511,7 +511,7 @@ lease_out_init() {
     *)
       eval "exit_trap=(${cur#trap -- })"
       # shellcheck disable=SC2064 # the runner's trap text now, to run again at exit
-      trap "${exit_trap[0]:+${exit_trap[0]}; }lease_out_clean" EXIT
+      trap "${exit_trap[0]:+${exit_trap[0]}$'\n'}lease_out_clean" EXIT
       ;;
   esac
 }
@@ -1345,7 +1345,7 @@ EOF
     lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-capture-rc "$RC" 3
     check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
-    check bounded-capture-exit-trap "$(trap -p EXIT)" "trap -- 'rm -rf \"\$t\"; lease_out_clean' EXIT"
+    check bounded-capture-exit-trap "$(trap -p EXIT)" $'trap -- \'rm -rf "$t"\nlease_out_clean\' EXIT'
     cat > "$t/exit-trap-runner" << 'EOF'
 source "$1"
 trap 'printf "%s\n" "runner'\''s trap" > "$2"
@@ -1363,6 +1363,19 @@ EOF
     check bounded-capture-exit-positional "$(cat "$t/exit-dir.arg")" sentinel
     cdir=$(cat "$t/exit-dir")
     check bounded-capture-quoted-exit-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
+    cat > "$t/comment-exit-runner" << 'EOF'
+source "$1"
+trap 'echo runner > "$2" # trailing comment' EXIT
+lease_capture 10 true
+echo "$LEASE_OUT_DIR" > "$3"
+EOF
+    RC=0
+    lease_bounded 10 bash "$t/comment-exit-runner" "$LEASE_TREE/tools/ref/lease.sh" \
+      "$t/comment-marker" "$t/comment-dir" > "$t/comment-log" 2>&1 || RC=$?
+    check bounded-capture-comment-exit-rc "$RC" 0
+    check bounded-capture-comment-exit-ran "$(cat "$t/comment-marker")" runner
+    cdir=$(cat "$t/comment-dir")
+    check bounded-capture-comment-exit-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
     RC=0
     lease_filter 10 stdout "$t/filter-both" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-filter-command-rc "$RC" 3
