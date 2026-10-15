@@ -389,5 +389,7 @@ tokenizer 0 0 0
 # (`ibv_wc_status_str`), each with its SAFETY line. The fns are the `unsafe extern "C" fn` pointer types the loader
 # fills, the symbol lookup, the memory registration and the post of a chain of writes, whose ranges the NIC reads
 # after the call; the impls are Send and Sync for the raw handles the owned types hold.
-verbs 57 22 2
+# PIN(2026-10-15): verbs 57 -> 56 blocks, shared code: gid_entry owns the GID entry initialization and extended
+# query for discovery and Nic::open, one block with its SAFETY line in place of their two.
+verbs 56 22 2
 vision 0 0 0

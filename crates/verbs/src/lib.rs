@@ -506,27 +506,32 @@ fn roce_v2_gid(v: &Verbs, ctx: *mut Context) -> Option<u8> {
         return None;
     }
     gid_indices(port.gid_tbl_len).find(|&i| {
-        let mut e = GidEntry {
-            gid: Gid::default(),
-            gid_index: 0,
-            port_num: 0,
-            gid_type: 0,
-            ndev_ifindex: 0,
-        };
-        // SAFETY: `ctx` is open and `e` a writable entry of the size passed.
-        let rc = unsafe {
-            (v.f.query_gid_ex)(
-                ctx,
-                u32::from(PORT),
-                u32::from(i),
-                &mut e,
-                0,
-                size_of::<GidEntry>(),
-            )
-        };
+        let (rc, e) = gid_entry(v, ctx, i);
         let ipv4 = e.gid.raw[..10].iter().all(|&b| b == 0) && e.gid.raw[10..12] == [0xff, 0xff];
         rc == 0 && e.gid_type == GID_TYPE_ROCE_V2 && ipv4
     })
+}
+
+fn gid_entry(v: &Verbs, ctx: *mut Context, index: u8) -> (c_int, GidEntry) {
+    let mut e = GidEntry {
+        gid: Gid::default(),
+        gid_index: 0,
+        port_num: 0,
+        gid_type: 0,
+        ndev_ifindex: 0,
+    };
+    // SAFETY: ctx is an open context; e is writable for the supplied size.
+    let rc = unsafe {
+        (v.f.query_gid_ex)(
+            ctx,
+            u32::from(PORT),
+            u32::from(index),
+            &mut e,
+            0,
+            size_of::<GidEntry>(),
+        )
+    };
+    (rc, e)
 }
 
 /// The indices of a GID table of `len` entries, each one a `u8`.
@@ -596,24 +601,7 @@ impl Nic {
             return Err(format!("{name}: port {PORT} is not active (state {})", port.state).into());
         }
         nic.mtu = port.active_mtu;
-        let mut e = GidEntry {
-            gid: Gid::default(),
-            gid_index: 0,
-            port_num: 0,
-            gid_type: 0,
-            ndev_ifindex: 0,
-        };
-        // SAFETY: `ctx` is open and `e` a writable entry of the size passed.
-        let rc = unsafe {
-            (v.f.query_gid_ex)(
-                nic.ctx.0,
-                u32::from(PORT),
-                u32::from(gid_index),
-                &mut e,
-                0,
-                size_of::<GidEntry>(),
-            )
-        };
+        let (rc, e) = gid_entry(v, nic.ctx.0, gid_index);
         if rc != 0 || e.gid == Gid::default() {
             return Err(format!("{name}: no GID at index {gid_index}").into());
         }
