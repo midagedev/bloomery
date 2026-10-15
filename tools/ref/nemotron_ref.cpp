@@ -6,11 +6,19 @@
 // mainline md5s) and # arch. # complete is written only after every file, by renaming the manifest.
 //
 //   nemotron_ref -m <gguf> --arch <name> --out <dir> --prompt <name>:<n>:<ids> ... [-c <ctx>] [-ub <ubatch>] [-t <threads>]
+//                [--fixture-line <line>]
 //
 // --arch is the general.architecture the file must state (nemotron_h or nemotron_h_moe); any other is refused.
+// --fixture-line is the fixture file's `# fixture` line (refset-check --fixture-line), written verbatim beside # model.
+// A file with routed experts also gets each MoE layer's selection at the last position: the graph's ffn_moe_topk-<il>
+// tensor (the ids ggml_top_k picked over the biased probabilities) read through the eval callback, its last token's
+// row; ffn_moe_probs-<il> gives the layer's expert count. One `# route layer <il> <n_expert> <k>` line per layer and a
+// routes column (<name>.routes.i32, the layers in order). A file whose graph names no ffn_moe_topk writes neither.
 // --prompt is repeated, once a prompt. <ids> is one decimal id a line, at least <n> of them; the
 // first <n> are the prompt. n_gpu_layers is 0. The caller also empties CUDA_VISIBLE_DEVICES.
 
+#include "ggml-backend.h"
+#include "ggml.h"
 #include "llama.h"
 #include "ref_io.h"
 
@@ -22,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -70,6 +79,45 @@ static bool write_ids(const std::string & path, const std::vector<llama_token> &
     return true;
 }
 
+// The last token's selection of each MoE layer in the last decode, and each layer's expert count. A ubatch overwrites
+// the one before it, so after a prompt's decode each row is its last token's.
+struct Routes {
+    std::map<int, std::vector<int32_t>> ids;
+    std::map<int, int64_t> n_expert;
+    bool failed = false;
+};
+
+// The layer of a tensor named <stem>-<il>, or -1.
+static int layer_of(const char * name, const char * stem) {
+    const size_t n = strlen(stem);
+    if (strncmp(name, stem, n) != 0 || name[n] != '-') return -1;
+    char * end = nullptr;
+    const long il = strtol(name + n + 1, &end, 10);
+    return end && *end == '\0' && il >= 0 && il < INT_MAX ? (int) il : -1;
+}
+
+static bool on_eval(ggml_tensor * t, bool ask, void * user) {
+    Routes & r = *static_cast<Routes *>(user);
+    const int probs = layer_of(t->name, "ffn_moe_probs");
+    if (probs >= 0) {
+        r.n_expert[probs] = t->ne[0];
+        return false;
+    }
+    const int il = layer_of(t->name, "ffn_moe_topk");
+    if (il < 0) return false;
+    if (ask) return true;
+    if (t->type != GGML_TYPE_I32 || t->ne[1] < 1) {
+        fprintf(stderr, "nemotron_ref: %s is %s [%lld, %lld], want i32 [k, tokens]\n", t->name, ggml_type_name(t->type),
+                (long long) t->ne[0], (long long) t->ne[1]);
+        r.failed = true;
+        return false;
+    }
+    std::vector<int32_t> & row = r.ids[il];
+    row.resize((size_t) t->ne[0]);
+    ggml_backend_tensor_get(t, row.data(), (size_t) (t->ne[1] - 1) * t->nb[1], row.size() * sizeof(int32_t));
+    return true;
+}
+
 static void print_top5(const std::string & name, const float * row, int n_vocab) {
     const int k = std::min(n_vocab, 5);
     std::vector<int> order(n_vocab);
@@ -86,7 +134,7 @@ static void print_top5(const std::string & name, const float * row, int n_vocab)
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, out, want_arch;
+    std::string model_path, out, want_arch, fixture_line;
     int n_ctx = 0, n_ubatch = 512, threads = 0;
     std::vector<Prompt> prompts;
     for (int i = 1; i < argc; ++i) {
@@ -95,6 +143,12 @@ int main(int argc, char ** argv) {
             model_path = argv[++i];
         } else if (strcmp(argv[i], "--arch") == 0 && more) {
             want_arch = argv[++i];
+        } else if (strcmp(argv[i], "--fixture-line") == 0 && more) {
+            fixture_line = argv[++i];
+            if (fixture_line.rfind("# fixture\t", 0) != 0 || fixture_line.find('\n') != std::string::npos) {
+                fprintf(stderr, "nemotron_ref: --fixture-line wants one '# fixture<TAB>...' line\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--out") == 0 && more) {
             out = argv[++i];
         } else if (strcmp(argv[i], "--prompt") == 0 && more) {
@@ -118,7 +172,7 @@ int main(int argc, char ** argv) {
     const char * build = getenv("BLOOMERY_REF_BUILD");
     if (model_path.empty() || want_arch.empty() || out.empty() || prompts.empty() || n_ubatch <= 0 || !build || !*build) {
         fprintf(stderr, "usage: nemotron_ref -m <gguf> --arch <name> --out <dir> --prompt <name>:<n>:<ids> ... "
-                        "[-c <ctx>] [-ub <ubatch>] [-t <threads>]\n"
+                        "[-c <ctx>] [-ub <ubatch>] [-t <threads>] [--fixture-line <line>]\n"
                         "BLOOMERY_REF_BUILD must name the mainline build\n");
         return 2;
     }
@@ -146,6 +200,9 @@ int main(int argc, char ** argv) {
     cp.n_batch = (uint32_t) max_n;
     cp.n_ubatch = (uint32_t) std::min(n_ubatch, max_n);
     cp.n_seq_max = 1;
+    Routes routes;
+    cp.cb_eval = on_eval;
+    cp.cb_eval_user_data = &routes;
     if (threads > 0) {
         cp.n_threads = threads;
         cp.n_threads_batch = threads;
@@ -173,6 +230,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     llama_batch batch = llama_batch_init(max_n, 0, 1);
+    std::vector<std::pair<int, int64_t>> route_layers;  // (il, n_expert) in layer order, from the first prompt
+    size_t route_k = 0;
     for (int i = 0; i < (int) prompts.size(); ++i) {
         const Prompt & p = prompts[i];
         if (i > 0) llama_memory_clear(llama_get_memory(ctx), true);
@@ -199,6 +258,43 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (routes.failed) return 1;
+        if (i == 0) {
+            for (const auto & [il, row] : routes.ids) {
+                const auto n = routes.n_expert.find(il);
+                if (n == routes.n_expert.end()) {
+                    fprintf(stderr, "nemotron_ref: layer %d has ffn_moe_topk and no ffn_moe_probs\n", il);
+                    return 1;
+                }
+                if (route_k == 0) route_k = row.size();
+                if (row.size() != route_k) {
+                    fprintf(stderr, "nemotron_ref: layer %d selects %zu experts, layer %d %zu\n", il, row.size(),
+                            route_layers.front().first, route_k);
+                    return 1;
+                }
+                route_layers.emplace_back(il, n->second);
+            }
+        }
+        if (routes.ids.size() != route_layers.size()) {
+            fprintf(stderr, "nemotron_ref: %s routed %zu layers, the first prompt %zu\n", p.name.c_str(), routes.ids.size(),
+                    route_layers.size());
+            return 1;
+        }
+        if (!route_layers.empty()) {
+            std::vector<int32_t> flat;
+            for (const auto & [il, n_expert] : route_layers) {
+                for (int32_t id : routes.ids[il]) {
+                    if (id < 0 || id >= n_expert) {
+                        fprintf(stderr, "nemotron_ref: %s layer %d selected expert %d of %lld\n", p.name.c_str(), il, id,
+                                (long long) n_expert);
+                        return 1;
+                    }
+                    flat.push_back(id);
+                }
+            }
+            if (!write_raw(out + "/" + p.name + ".routes.i32", flat.data(), flat.size())) return 1;
+            routes.ids.clear();
+        }
         if (!write_ids(out + "/" + p.name + ".ids", p.ids)) return 1;
         if (!write_raw(out + "/" + p.name + ".logits.f32", row, (size_t) n_vocab)) return 1;
         print_top5(p.name, row, n_vocab);
@@ -213,13 +309,19 @@ int main(int argc, char ** argv) {
     }
     fprintf(m, "# nemotron_ref — last-position logits, raw f32, little-endian\n");
     fprintf(m, "# model\t%s\n", model_path.c_str());
+    if (!fixture_line.empty()) fprintf(m, "%s\n", fixture_line.c_str());
     fprintf(m, "# build\t%s\n", build);
     fprintf(m, "# arch\t%s\n", arch);
     fprintf(m, "# source\tllama_get_logits_ith(ctx, -1)\n");
-    fprintf(m, "# prompt columns\tname\tn_ids\tn_vocab\tids\tlogits\n");
+    for (const auto & [il, n_expert] : route_layers) {
+        fprintf(m, "# route layer\t%d\t%lld\t%zu\n", il, (long long) n_expert, route_k);
+    }
+    fprintf(m, "# prompt columns\tname\tn_ids\tn_vocab\tids\tlogits%s\n", route_layers.empty() ? "" : "\troutes");
     for (const Prompt & p : prompts) {
-        fprintf(m, "prompt\t%s\t%d\t%d\t%s.ids\t%s.logits.f32\n", p.name.c_str(), p.n, n_vocab, p.name.c_str(),
+        fprintf(m, "prompt\t%s\t%d\t%d\t%s.ids\t%s.logits.f32", p.name.c_str(), p.n, n_vocab, p.name.c_str(),
                 p.name.c_str());
+        if (!route_layers.empty()) fprintf(m, "\t%s.routes.i32", p.name.c_str());
+        fprintf(m, "\n");
     }
     fprintf(m, "# complete\t%zu\t0\n", prompts.size());
     if (fclose(m) != 0 || rename(partial_path.c_str(), final_path.c_str()) != 0) {

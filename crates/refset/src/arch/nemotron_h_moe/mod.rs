@@ -1,7 +1,9 @@
 //! The Nemotron 3.5 Bolt family (`nemotron_h_moe`). The logits set is dumped from the Bolt GGUF by mainline llama.cpp
 //! at `cd0a5b6a1` ([`BUILD`]), which loads files whose layers hold different routed-expert counts; the Nano's family pins the older tree. `tools/ref/dump-nemotron.sh` is the one script for both
 //! and its reader is [`crate::nemotron::LogitsSet`]. The Bolt file sets `add_bos_token` false, so its prompts are the
-//! Nano's ids without the leading BOS. ik has no `nemotron_h_moe`.
+//! Nano's ids without the leading BOS. ik has no `nemotron_h_moe`. The fixture tier's mirror is in [`fixture`].
+
+pub mod fixture;
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
@@ -38,7 +40,7 @@ pub static LOGITS: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&LOGITS];
+pub static FAMILIES: &[&Family] = &[&LOGITS, &fixture::LOGITS];
 
 #[cfg(test)]
 mod tests {

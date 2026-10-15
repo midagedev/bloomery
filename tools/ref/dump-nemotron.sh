@@ -13,6 +13,9 @@
 # file does not (add_bos_token false): on the same text its ids are the Nano's without the leading BOS (id 1),
 # so a Bolt prompt of n ids is the Nano's ids 2 to n+1.
 # Mainline is not rebuilt.
+# BLOOMERY_TIER=fixture dumps the profile's set on its fixture file (ref-paths.sh: the model is its first shard): the set
+# is its real twin's name behind `fx_` (fixture_dump_tier) and carries the file's `# fixture` line (fixture_line), which
+# nemotron_ref writes beside `# model`. The Bolt's fixture is fx_ref-nemotron-moe-logits; the Nano has no fixture tier.
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
@@ -28,6 +31,12 @@ esac
 # prompt path on every one.
 CTX=4096
 PROMPTS=(code5 code29 code4096 prose1 prose64 prose255 prose256 prose257 prose512 prose1024)
+fixture_dump_tier dump-nemotron.sh
+if [ -n "$SET_PREFIX" ] && [ "$MODEL_NAME" != nemotron_h_moe ]; then
+  echo "dump-nemotron: BLOOMERY_TIER=fixture: $SET_NAME has no fixture twin (crates/refset names only the Bolt's, fx_ref-nemotron-moe-logits) (exit 66)" >&2
+  exit 66
+fi
+SET_NAME=$SET_PREFIX$SET_NAME
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SRC=$HERE/tools/ref/nemotron_ref.cpp
 IO=$HERE/tools/ref/ref_io.h
@@ -55,6 +64,9 @@ want_build=$(awk '$1 == "build" { $1 = ""; sub(/^ /, ""); print; exit }' "$REC")
   exit 2
 }
 export BLOOMERY_REF_BUILD="$want_build"
+FIXTURE_LINE=$(fixture_line dump-nemotron.sh)
+FIXTURE_ARGS=()
+[ -z "$FIXTURE_LINE" ] || FIXTURE_ARGS=(--fixture-line "$FIXTURE_LINE")
 export CUDA_VISIBLE_DEVICES=""
 
 TEXT=$BLOOMERY_DATA/ref-tokenizer-nemotron
@@ -92,7 +104,7 @@ STAGE=$SET.staging
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 trap 'drop_incomplete_stage; rm -rf "$WORK"' EXIT
-"$BIN" -m "$MODEL" --arch "$MODEL_NAME" --out "$STAGE" -c "$CTX" -ub 512 -t 8 "${ARGS[@]}"
+"$BIN" -m "$MODEL" --arch "$MODEL_NAME" --out "$STAGE" -c "$CTX" -ub 512 -t 8 "${FIXTURE_ARGS[@]}" "${ARGS[@]}"
 grep -q '^# complete' "$STAGE/MANIFEST.tsv" || {
   echo "dump-nemotron: the staged set has no completion trailer — not installing it" >&2
   exit 1

@@ -896,7 +896,9 @@ build-ref-chat-parse:
 
 # Nemotron 3.5 Bolt (nemotron_h_moe) last-position logits: the same scripts as the Nano's under the nemotron_h_moe profile, which names its
 # own mainline tree (/home/user/llama.cpp-mainline-bolt, cd0a5b6a1) and so its own binary (nemotron_ref_moe). The 22 GB file on the CPU
-# into $BLOOMERY_DATA/ref-nemotron-moe-logits (refset family ref-nemotron-moe-logits).
+# into $BLOOMERY_DATA/ref-nemotron-moe-logits (refset family ref-nemotron-moe-logits). `BLOOMERY_TIER=fixture just dump-ref-nemotron-moe`
+# dumps the same prompts on the Bolt fixture into $BLOOMERY_DATA/fx_ref-nemotron-moe-logits (fx-ref-nemotron-moe-logits), with each
+# MoE layer's last-position experts.
 build-ref-nemotron-moe:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=90 BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'bash tools/ref/build-nemotron-ref.sh'
 
