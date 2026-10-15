@@ -1,24 +1,29 @@
-//! GPU gate for the IQ2_XS, IQ3_XXS, IQ4_XS and Q2_K row cores
+//! GPU gate for the IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS and Q2_K row cores
 //! (`bloomery_gpu::iq`) on one card.
 //!
-//! Weights are the synthetic rows `dequant_ref --synthetic` writes for
-//! `just gate-1-1` (`$BLOOMERY_DATA/ref-synth/<type>.blocks`: 64 rows ggml
-//! quantized, then 16 rows of random codes, 4096 values each): all 80 rows at
-//! K = 4096, and the first 79 rows cut to their first nine super-blocks (K =
-//! 2304: a partial last lane iteration, three q8 groups, an odd count of
-//! f16 scales). Activations are eight seeded columns uniform on ±2, quantized
-//! by the engine's q8_1 rule on the host and uploaded in the Q4_K
-//! permutation, so the gate sees the cores alone.
+//! Weights are the synthetic rows of `bloomery_gpu_gates::iq_rows`
+//! (`dequant_ref --synthetic`'s dump for `just gate-1-1`, 64 rows ggml
+//! quantized and 16 of random codes, 4096 values each; IQ2_XXS's 80 rows
+//! seeded blocks, which the harness does not write): all 80 rows at K = 4096,
+//! and the first 79 rows cut to their first nine super-blocks (K = 2304: a
+//! partial last lane iteration, three q8 groups, an odd count of f16
+//! scales). IQ2_XXS also runs Nemotron 3.5 Bolt's shared expert, seeded
+//! blocks at its two shapes: the up, 5,376 rows of K = 4,096, and the down,
+//! 4,096 rows of K = 5,376 (21 super-blocks: a partial last lane iteration
+//! and an odd count of f16 scales). Activations are eight seeded columns
+//! uniform on ±2, quantized by the engine's q8_1 rule on the host and
+//! uploaded in the Q4_K permutation, so the gate sees the cores alone.
 //!
-//! Per format and K:
+//! Per format and geometry:
 //! 1. **Host rule, bits.** Every output equals the module's host
 //!    transcription (`lane_partial_host` per lane, then the butterfly) bit
 //!    for bit; a second launch equals the first; an m = 3 launch equals the
 //!    first three columns of the m = 8 one.
 //! 2. **f32 reference, band.** Against the rows ggml's rule dequantizes
 //!    (`gguf::dequant_row`) times the f32 activations, summed in f64: every
-//!    output's error within the bound below, and `max|ours − ref| / max|ref|`
-//!    over each geometry's outputs under the format's pin.
+//!    output finite and written (none left at the sentinel), its error within
+//!    the bound below, and `max|ours − ref| / max|ref|` over each
+//!    geometry's outputs under the format's pin.
 //!
 //! The bound of item 2 (the MXFP4 gate's derivation, `gate_dspark_experts`).
 //! A value `x` of a 128-value block with scale `d = amax/127` is stored as
@@ -42,19 +47,15 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::Gpu;
-    use bloomery_gpu::iq::{
-        IqFormat, IqKernels, IqRows, SUB_VALUES, lane_partial_host, sub_sums_host,
-    };
+    use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
     use bloomery_gpu_gates::act_rule::q8_1_codes;
-    use bloomery_gpu_gates::rounding::{U, butterfly, gamma};
-    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::iq_rows::{Col, SYNTH_K, dot_host, dot_ref, seeded_blocks, synth_rows};
+    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::DeviceBuffer;
-    use gguf::quant::{dequant_row, half_to_f32};
+    use gguf::quant::dequant_row;
 
     /// Activation columns per launch.
     const M: usize = 8;
-    /// Values per full synthetic row.
-    const K_FULL: usize = 4096;
     /// The cut geometry: nine super-blocks, 79 rows.
     const K_CUT: usize = 2304;
     const ROWS_CUT: usize = 79;
@@ -62,18 +63,28 @@ mod gate {
     /// back as these bits.
     const SENT: f32 = 1.0e30;
 
+    /// Bolt's shared expert: hidden 4,096, width 5,376.
+    const BOLT_HIDDEN: usize = 4096;
+    const BOLT_SHARED: usize = 5376;
+    /// The seeds of the shared expert's two stacks.
+    const SEED_SHARED: [u64; 2] = [0xb017_5a2e_0001, 0xb017_5a2e_0002];
+
     /// PIN(2026-09-24): per format, the larger `max|ours − ref| / max|ref|`
     /// of the two geometries, rounded up: 3.630e-3 (IQ2_XS, K = 4096), 5.788e-3
     /// (IQ3_XXS, 2304), 3.813e-3 (IQ4_XS, 2304), 5.650e-3 (Q2_K, 4096) — the
     /// derivation's 0.4 % for every format.
-    const REL_PIN: [(IqFormat, f64); 4] = [
+    /// PIN(2026-10-16): IQ2_XXS, the largest of its four geometries, rounded
+    /// up: 4.559e-3 (K = 2304; 4.537e-3 at Bolt's shared up) — the same 0.4 %.
+    const REL_PIN: [(IqFormat, f64); 5] = [
+        (IqFormat::Iq2Xxs, 4.6e-3),
         (IqFormat::Iq2Xs, 3.7e-3),
         (IqFormat::Iq3Xxs, 5.8e-3),
         (IqFormat::Iq4Xs, 3.9e-3),
         (IqFormat::Q2K, 5.7e-3),
     ];
 
-    const FORMATS: [IqFormat; 4] = [
+    const FORMATS: [IqFormat; 5] = [
+        IqFormat::Iq2Xxs,
         IqFormat::Iq2Xs,
         IqFormat::Iq3Xxs,
         IqFormat::Iq4Xs,
@@ -112,63 +123,6 @@ mod gate {
         (q, d8)
     }
 
-    /// One row's dot by the host rule: the 32 lane partials, then the
-    /// butterfly.
-    fn dot_host(fmt: IqFormat, row: &[u8], col: &(Vec<i8>, Vec<f32>)) -> f32 {
-        butterfly(std::array::from_fn(|lane| {
-            lane_partial_host(fmt, row, &col.0, &col.1, lane)
-        }))
-    }
-
-    /// `Σ_k |t_k|` of the rule's lane terms for one row and column, and the
-    /// largest lane iteration count `n_it`.
-    fn term_mag(fmt: IqFormat, row: &[u8], col: &(Vec<i8>, Vec<f32>)) -> (f64, usize) {
-        let bb = fmt.block_bytes();
-        let codes = col.0.as_chunks::<SUB_VALUES>().0;
-        let n_sub = 8 * row.len() / bb;
-        let mut mag = 0.0f64;
-        for (b, xq) in codes.iter().enumerate().take(n_sub) {
-            let blk = &row[bb * (b / 8)..bb * (b / 8 + 1)];
-            let (i, m) = sub_sums_host(fmt, blk, b % 8, xq);
-            let dx = f64::from(col.1[b / 4]);
-            let h = |at: usize| f64::from(half_to_f32(u16::from_le_bytes([blk[at], blk[at + 1]])));
-            mag += match fmt {
-                IqFormat::Iq2Xs => (h(0) / 8.0 * dx * f64::from(i)).abs(),
-                IqFormat::Iq3Xxs => (h(0) / 4.0 * dx * f64::from(i)).abs(),
-                IqFormat::Iq3S | IqFormat::Iq4Xs => (h(0) * dx * f64::from(i)).abs(),
-                IqFormat::Q2K => {
-                    (h(80) * dx * f64::from(i)).abs() + (h(82) * dx * f64::from(m)).abs()
-                }
-            };
-        }
-        (mag, n_sub.div_ceil(32))
-    }
-
-    /// The exact dot of a dequantized row with f32 activations, and the
-    /// module doc's bound on our error.
-    fn dot_ref(
-        fmt: IqFormat,
-        row: &[u8],
-        w: &[f32],
-        x: &[f32],
-        col: &(Vec<i8>, Vec<f32>),
-    ) -> (f64, f64) {
-        let (mut exact, mut quant, mut wx) = (0.0f64, 0.0f64, 0.0f64);
-        for (b, (wb, xb)) in w.chunks(128).zip(x.chunks(128)).enumerate() {
-            let d = f64::from(col.1[b]);
-            let mut sw = 0.0f64;
-            for (&wi, &xi) in wb.iter().zip(xb) {
-                exact += f64::from(wi) * f64::from(xi);
-                sw += f64::from(wi).abs();
-                wx += (f64::from(wi) * f64::from(xi)).abs();
-            }
-            quant += d / 2.0 * (1.0 + 256.0 * U) * sw;
-        }
-        let (mag, n_it) = term_mag(fmt, row, col);
-        let deq = if fmt == IqFormat::Q2K { U * wx } else { 0.0 };
-        (exact, quant + gamma(2 * n_it + 6) * mag + deq)
-    }
-
     /// One geometry's rows: file bytes per row and the stack's row count.
     struct Rows {
         bytes: Vec<u8>,
@@ -176,41 +130,44 @@ mod gate {
         k: usize,
     }
 
-    /// The format's synthetic rows, all of them at K = 4096, or the cut.
-    fn load_rows(fmt: IqFormat, cut: bool) -> Result<Rows, GateError> {
-        let name = fmt.ggml().name().ok_or("an IqFormat names its type")?;
-        let path = data_dir().join("ref-synth").join(format!("{name}.blocks"));
-        let all = std::fs::read(&path)
-            .map_err(|e| format!("{}: {e} (run `just gate-1-1` first)", path.display()))?;
+    /// The format's geometries: its synthetic rows at K = 4096 and cut to
+    /// K = 2304 (module doc), and for IQ2_XXS Bolt's shared expert, up and
+    /// down.
+    fn geometries(fmt: IqFormat) -> Result<Vec<Rows>, GateError> {
+        let all = synth_rows(fmt)?;
         let bb = fmt.block_bytes();
-        let row_bytes = K_FULL / 256 * bb;
-        if all.is_empty() || !all.len().is_multiple_of(row_bytes) {
-            return Err(format!(
-                "{}: {} bytes is not whole rows of {row_bytes}",
-                path.display(),
-                all.len()
-            )
-            .into());
-        }
-        if !cut {
-            let rows = all.len() / row_bytes;
-            return Ok(Rows {
-                bytes: all,
-                rows,
-                k: K_FULL,
-            });
-        }
+        let row_bytes = SYNTH_K / 256 * bb;
         let keep = K_CUT / 256 * bb;
-        let bytes = all
+        let cut = all
             .chunks(row_bytes)
             .take(ROWS_CUT)
             .flat_map(|r| r[..keep].iter().copied())
             .collect();
-        Ok(Rows {
-            bytes,
-            rows: ROWS_CUT,
-            k: K_CUT,
-        })
+        let mut g = vec![
+            Rows {
+                rows: all.len() / row_bytes,
+                bytes: all,
+                k: SYNTH_K,
+            },
+            Rows {
+                bytes: cut,
+                rows: ROWS_CUT,
+                k: K_CUT,
+            },
+        ];
+        if fmt == IqFormat::Iq2Xxs {
+            for (i, (rows, k)) in [(BOLT_SHARED, BOLT_HIDDEN), (BOLT_HIDDEN, BOLT_SHARED)]
+                .into_iter()
+                .enumerate()
+            {
+                g.push(Rows {
+                    bytes: seeded_blocks(fmt, rows * k / 256, SEED_SHARED[i]),
+                    rows,
+                    k,
+                });
+            }
+        }
+        Ok(g)
     }
 
     /// One launch of `m` columns into a sentinel-filled `y`, read back.
@@ -234,12 +191,11 @@ mod gate {
         gpu: &Gpu,
         kern: &IqKernels,
         fmt: IqFormat,
-        cut: bool,
+        r: &Rows,
     ) -> Result<(bool, f64), GateError> {
-        let r = load_rows(fmt, cut)?;
         let s = gpu.stream();
         let x = seeded(M * r.k, 7001 + r.k as u32, -2.0, 4.0);
-        let cols: Vec<_> = x.chunks(r.k).map(q8_1_codes).collect();
+        let cols: Vec<Col> = x.chunks(r.k).map(q8_1_codes).collect();
         let (qw, d8w) = act_words(&cols, r.k);
         let (q, d8) = (
             DeviceBuffer::from_host(s, &qw)?,
@@ -281,16 +237,22 @@ mod gate {
         let rerun = bits_equal(&y, &again);
         let masked = bits_equal(&y[..3 * r.rows], &y3);
         let in_bound = ratio_max <= 1.0;
+        let written = y
+            .iter()
+            .chain(&y3)
+            .all(|v| v.is_finite() && v.to_bits() != SENT.to_bits());
         let name = fmt.ggml().name().unwrap_or("?");
         println!(
             "{name:8} k={} rows={} m={M}: host rule {same}/{} bit-identical {}; rerun {}; m=3 {}; \
-             f32 ref max|err| {err_max:.3e} max|ref| {ref_max:.3e} rel {:.3e}, worst err/bound {ratio_max:.3e} {}",
+             finite and written {}; f32 ref max|err| {err_max:.3e} max|ref| {ref_max:.3e} rel {:.3e}, \
+             worst err/bound {ratio_max:.3e} {}",
             r.k,
             r.rows,
             host.len(),
             verdict(bits),
             verdict(rerun),
             verdict(masked),
+            verdict(written),
             err_max / ref_max,
             verdict(in_bound),
         );
@@ -301,7 +263,10 @@ mod gate {
                 o.to_bits()
             );
         }
-        Ok((bits && rerun && masked && in_bound, err_max / ref_max))
+        Ok((
+            bits && rerun && masked && written && in_bound,
+            err_max / ref_max,
+        ))
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -310,10 +275,10 @@ mod gate {
         let mut ok = true;
         for fmt in FORMATS {
             let mut rel = 0.0f64;
-            for cut in [false, true] {
-                let (pass, r) = check(&gpu, &kern, fmt, cut)?;
+            for r in geometries(fmt)? {
+                let (pass, e) = check(&gpu, &kern, fmt, &r)?;
                 ok &= pass;
-                rel = rel.max(r);
+                rel = rel.max(e);
             }
             let pin = REL_PIN
                 .iter()
@@ -323,7 +288,7 @@ mod gate {
             let under = rel <= pin;
             ok &= under;
             println!(
-                "{:8} max|rel|, the larger of the two geometries: {rel:.4e} (pin {pin:.1e}) {}",
+                "{:8} max|rel|, the largest of its geometries: {rel:.4e} (pin {pin:.1e}) {}",
                 fmt.ggml().name().unwrap_or("?"),
                 verdict(under)
             );

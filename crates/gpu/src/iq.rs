@@ -1,4 +1,4 @@
-//! IQ2_XS, IQ3_XXS, IQ4_XS and Q2_K weights against q8_1 activations: the
+//! IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS and Q2_K weights against q8_1 activations: the
 //! card layout of each format, one lane's share of a row's dot
 //! (device-callable, the [`crate::mxfp4`] shape), and the same rule on the
 //! host. IQ3_S has the host rule and the file format below only: its card
@@ -7,6 +7,11 @@
 //!
 //! File formats (ggml's blocks, 256 values each; `gguf::quant` ports their
 //! dequant bit for bit):
+//! - IQ2_XXS, 66 B: f16 `d` @0, then two u32 words a 32-value sub-block `ib`
+//!   @`2 + 8ib`: `idx`, whose byte `l` indexes `iq2xxs_grid` (eight
+//!   magnitudes, bytes of a u64) for values `8l .. 8l + 8`, and `aux`, whose
+//!   bits `7l .. 7l + 7` are group `l`'s sign index (as IQ2_XS's) and bits
+//!   28.. the scale `s`; the factor is `d·(0.5 + s)/4`.
 //! - IQ2_XS, 74 B: f16 `d` @0, 32 u16 codes @2, 8 scale bytes @66. Code `g`
 //!   of 32-value sub-block `ib` covers values `8g .. 8g + 8` of the block: its
 //!   low 9 bits index `iq2xs_grid` (eight magnitudes, bytes of a u64), its
@@ -43,6 +48,7 @@
 //!
 //! | format | plane 0 | plane 1 | plane 2 |
 //! |---|---|---|---|
+//! | IQ2_XXS | `idx`, `aux`: 2 words per sub-block `g` | — | `d` halves, as IQ2_XS |
 //! | IQ2_XS | codes, 2 words per sub-block `g` | scale bytes, 4 per word (`g/4`, byte `g % 4`) | `d` halves, 2 per word (`h/2`, half `h % 2`) |
 //! | IQ3_XXS | index bytes, 2 words per `g` | `aux`, 1 word per `g` | `d` halves, as IQ2_XS |
 //! | IQ4_XS | code bytes, 4 words per `g` | `d \| scales_h << 16`, `scales_l`: 2 words per `h` | — |
@@ -70,10 +76,11 @@
 //! - integer sums over the sub-block's 32 values, exact in i32, by `dp4a` on
 //!   the device: IQ2_XS `S0` over values 0..16 and `S1` over 16..32 of the
 //!   signed grid values times the codes,
-//!   `I = (2(s & 15) + 1)·S0 + (2(s >> 4) + 1)·S1`; IQ3_XXS `I = (2s + 1)·S` over all 32; IQ4_XS `I = (ls − 32)·S`;
+//!   `I = (2(s & 15) + 1)·S0 + (2(s >> 4) + 1)·S1`; IQ2_XXS and IQ3_XXS
+//!   `I = (2s + 1)·S` over all 32; IQ4_XS `I = (ls − 32)·S`;
 //!   Q2_K, per 16-value half `t`, `A_t = Σ q·x` and `B_t = Σ x`, `SA = Σ_t
 //!   (sc_t & 15)·A_t`, `SM = Σ_t (sc_t >> 4)·B_t`;
-//! - from `f = 0`: IQ2_XS `f = fma((d/8)·d_x, I, f)`, IQ3_XXS `f = fma((d/4)·d_x,
+//! - from `f = 0`: IQ2_XXS and IQ2_XS `f = fma((d/8)·d_x, I, f)`, IQ3_XXS `f = fma((d/4)·d_x,
 //!   I, f)`, IQ3_S `f = fma(d·d_x, I, f)` with `I = (2s + 1)·S` over all 32,
 //!   IQ4_XS `f = fma(d·d_x, I, f)`, Q2_K `f = fma(d·d_x, SA, f)` then
 //!   `f = fma(−(dmin·d_x), SM, f)`, `d_x` the scale of the 128-value block
@@ -95,7 +102,7 @@ use cuda_device::vector::{U32x2, U32x4, as_vectors};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
 use gguf::iq_tables::{
-    IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+    IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 use gguf::quant::{GgmlType, half_to_f32};
 use std::sync::Arc;
@@ -109,6 +116,8 @@ const SUBS: usize = SB_VALUES / SUB_VALUES;
 
 /// The IQ2_XS grid behind a reference: one device global (module doc).
 const GRID2: &[u64; 512] = &IQ2XS_GRID;
+/// The IQ2_XXS grid, likewise: 256 entries, a byte index.
+const GRID2XXS: &[u64; 256] = &IQ2XXS_GRID;
 /// The IQ3_XXS grid, likewise.
 pub(crate) const GRID3: &[u32; 256] = &IQ3XXS_GRID;
 /// The IQ3_S grid, likewise: 512 entries, a 9-bit index.
@@ -128,10 +137,11 @@ const KV1: u32 = kv_word(1);
 const KV2: u32 = kv_word(2);
 const KV3: u32 = kv_word(3);
 
-/// The five formats this module takes. [`IqFormat::Iq3S`] has the host rule
+/// The six formats this module takes. [`IqFormat::Iq3S`] has the host rule
 /// only ([`IqFormat::plane_words`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IqFormat {
+    Iq2Xxs,
     Iq2Xs,
     Iq3Xxs,
     Iq3S,
@@ -144,6 +154,7 @@ impl IqFormat {
     #[must_use]
     pub fn of(ty: GgmlType) -> Option<IqFormat> {
         match ty {
+            GgmlType::IQ2_XXS => Some(IqFormat::Iq2Xxs),
             GgmlType::IQ2_XS => Some(IqFormat::Iq2Xs),
             GgmlType::IQ3_XXS => Some(IqFormat::Iq3Xxs),
             GgmlType::IQ3_S => Some(IqFormat::Iq3S),
@@ -157,6 +168,7 @@ impl IqFormat {
     #[must_use]
     pub fn ggml(self) -> GgmlType {
         match self {
+            IqFormat::Iq2Xxs => GgmlType::IQ2_XXS,
             IqFormat::Iq2Xs => GgmlType::IQ2_XS,
             IqFormat::Iq3Xxs => GgmlType::IQ3_XXS,
             IqFormat::Iq3S => GgmlType::IQ3_S,
@@ -189,6 +201,7 @@ impl IqFormat {
     #[must_use]
     pub fn plane_words(self, n: usize) -> Option<[usize; 3]> {
         match self {
+            IqFormat::Iq2Xxs => Some([16 * n, 0, n.div_ceil(2)]),
             IqFormat::Iq2Xs => Some([16 * n, 2 * n, n.div_ceil(2)]),
             IqFormat::Iq3Xxs => Some([16 * n, 8 * n, n.div_ceil(2)]),
             IqFormat::Iq3S => None,
@@ -255,6 +268,10 @@ impl IqFormat {
                 }
             }
             match self {
+                IqFormat::Iq2Xxs => {
+                    p0.extend((0..16).map(|i| word(blk, 2 + 4 * i)));
+                    p2[h / 2] |= u32::from(half(blk, 0)) << (16 * (h % 2));
+                }
                 IqFormat::Iq2Xs => {
                     p0.extend((0..16).map(|i| word(blk, 2 + 4 * i)));
                     p1.extend((0..2).map(|i| word(blk, 66 + 4 * i)));
@@ -320,6 +337,34 @@ pub(crate) fn iq2_group(code: u32) -> (u32, u32) {
     (
         signed4(g as u32, sign_mask4(s)),
         signed4((g >> 32) as u32, sign_mask4(s >> 4)),
+    )
+}
+
+/// One IQ2_XXS group: the grid index in the low byte of `i` under the sign
+/// index in the low 7 bits of `si`, as two value-order words.
+#[inline(always)]
+pub(crate) fn iq2xxs_group(i: u32, si: u32) -> (u32, u32) {
+    // SAFETY: i & 255 < 256, GRID2XXS's length.
+    let g = unsafe { *GRID2XXS.get_unchecked((i & 255) as usize) };
+    let s = signs_of(si & 127);
+    (
+        signed4(g as u32, sign_mask4(s)),
+        signed4((g >> 32) as u32, sign_mask4(s >> 4)),
+    )
+}
+
+/// One IQ2_XXS sub-block from its two words (module doc): its eight signed
+/// value words in value order and the factor `2s + 1`. The plane core and
+/// `iq_sel`'s raw-block reader both decode through it.
+#[inline(always)]
+pub(crate) fn iq2xxs_sub(idx: u32, aux: u32) -> ([u32; 8], i32) {
+    let (w0, w1) = iq2xxs_group(idx, aux);
+    let (w2, w3) = iq2xxs_group(idx >> 8, aux >> 7);
+    let (w4, w5) = iq2xxs_group(idx >> 16, aux >> 14);
+    let (w6, w7) = iq2xxs_group(idx >> 24, aux >> 21);
+    (
+        [w0, w1, w2, w3, w4, w5, w6, w7],
+        (2 * (aux >> 28) + 1) as i32,
     )
 }
 
@@ -562,6 +607,51 @@ pub unsafe fn iq2_xs_lane_partials<const M: usize>(
     f
 }
 
+/// Lane `lane`'s partial sums of one IQ2_XXS row, as
+/// [`iq2_xs_lane_partials`].
+///
+/// # Safety
+///
+/// `qs` holds at least `8 · n_sb · (row + 1)` vectors and `dh`
+/// `ceil(n_sb · (row + 1) / 2)` words; the activation bounds and `lane` as
+/// [`iq2_xs_lane_partials`].
+#[inline(always)]
+pub unsafe fn iq2_xxs_lane_partials<const M: usize>(
+    qs: &[U32x2],
+    dh: &[u32],
+    row: usize,
+    n_sb: usize,
+    a: ActCols<'_>,
+    mask: u32,
+    lane: usize,
+) -> [f32; 8] {
+    const {
+        assert!(M > 0);
+        assert!(M <= 8);
+    };
+    let mut f = [0.0f32; 8];
+    let n_sub = SUBS * n_sb;
+    let (g0, h0) = (row * n_sub, row * n_sb);
+    let mut b = lane;
+    while b < n_sub {
+        let (g, h) = (g0 + b, h0 + (b >> 3));
+        // SAFETY: b < n_sub, so g and h are inside the planes by this fn's
+        // contract.
+        let (v, dw) = unsafe { (*qs.get_unchecked(g), *dh.get_unchecked(h >> 1)) };
+        let d = half_bits_to_f32((dw >> (16 * (h & 1))) as u16) * 0.125;
+        let [idx, aux] = v.0;
+        let (w, ai) = iq2xxs_sub(idx, aux);
+        for_cols!(M, mask, C => {
+            // SAFETY: as in iq2_xs_lane_partials.
+            let (x, dx) = unsafe { a.col(C, b) };
+            let i = ai * dp4_all(&w, &x);
+            f[C] = (d * dx).mul_add(i as f32, f[C]);
+        });
+        b += 32;
+    }
+    f
+}
+
 /// Lane `lane`'s partial sums of one IQ3_XXS row, as
 /// [`iq2_xs_lane_partials`].
 ///
@@ -779,6 +869,19 @@ fn sign(signs: u8, j: usize) -> i32 {
 pub fn sub_sums_host(fmt: IqFormat, blk: &[u8], ib: usize, xq: &[i8; SUB_VALUES]) -> (i32, i32) {
     let x = |j: usize| i32::from(xq[j]);
     match fmt {
+        IqFormat::Iq2Xxs => {
+            let at = 2 + 8 * ib;
+            let aux = u32::from_le_bytes(std::array::from_fn(|i| blk[at + 4 + i]));
+            let mut sum = 0i32;
+            for l in 0..4 {
+                let grid = IQ2XXS_GRID[usize::from(blk[at + l])].to_le_bytes();
+                let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                for (j, &g) in grid.iter().enumerate() {
+                    sum += i32::from(g) * sign(signs, j) * x(8 * l + j);
+                }
+            }
+            ((2 * (aux >> 28) as i32 + 1) * sum, 0)
+        }
         IqFormat::Iq2Xs => {
             let s = i32::from(blk[66 + ib]);
             let mut half = [0i32; 2];
@@ -860,6 +963,21 @@ pub fn sub_sums_host(fmt: IqFormat, blk: &[u8], ib: usize, xq: &[i8; SUB_VALUES]
     }
 }
 
+/// The f32 scales of one file block that the rule's integer sums of
+/// [`sub_sums_host`] are multiplied by (with the column's `d_x`): `(d/8, 0)`
+/// for IQ2_XXS and IQ2_XS, `(d/4, 0)` for IQ3_XXS, `(d, 0)` for IQ3_S and
+/// IQ4_XS, `(d, dmin)` for Q2_K (the second scales `SM` and is subtracted).
+/// `d/8` and `d/4` are exact.
+#[must_use]
+pub fn sub_scales_host(fmt: IqFormat, blk: &[u8]) -> (f32, f32) {
+    match fmt {
+        IqFormat::Iq2Xxs | IqFormat::Iq2Xs => (half_at(blk, 0) * 0.125, 0.0),
+        IqFormat::Iq3Xxs => (half_at(blk, 0) * 0.25, 0.0),
+        IqFormat::Iq3S | IqFormat::Iq4Xs => (half_at(blk, 0), 0.0),
+        IqFormat::Q2K => (half_at(blk, 80), half_at(blk, 82)),
+    }
+}
+
 /// Lane `lane`'s partial of one row on the host, the module doc's rule:
 /// `row` the row's file bytes, `xq` the column's int8 codes in value order,
 /// `d8` its 128-value block scales.
@@ -874,15 +992,11 @@ pub fn lane_partial_host(fmt: IqFormat, row: &[u8], xq: &[i8], d8: &[f32], lane:
         let blk = &row[bb * (b / SUBS)..bb * (b / SUBS + 1)];
         let (i, m) = sub_sums_host(fmt, blk, b % SUBS, &codes[b]);
         let dx = d8[b / 4];
-        f = match fmt {
-            IqFormat::Iq2Xs => (half_at(blk, 0) * 0.125 * dx).mul_add(i as f32, f),
-            IqFormat::Iq3Xxs => (half_at(blk, 0) * 0.25 * dx).mul_add(i as f32, f),
-            IqFormat::Iq3S | IqFormat::Iq4Xs => (half_at(blk, 0) * dx).mul_add(i as f32, f),
-            IqFormat::Q2K => {
-                let f = (half_at(blk, 80) * dx).mul_add(i as f32, f);
-                (-(half_at(blk, 82) * dx)).mul_add(m as f32, f)
-            }
-        };
+        let (si, sm) = sub_scales_host(fmt, blk);
+        f = (si * dx).mul_add(i as f32, f);
+        if fmt == IqFormat::Q2K {
+            f = (-(sm * dx)).mul_add(m as f32, f);
+        }
         b += 32;
     }
     f
@@ -925,7 +1039,7 @@ unsafe fn store_cols(
 mod iq_kernels {
     use super::*;
 
-    // The four row kernels: warp `r` (eight to a 256-thread block) runs its
+    // The five row kernels: warp `r` (eight to a 256-thread block) runs its
     // format's core over row `r` of the planes (the module doc's layout)
     // against `m_cols` q8_1 columns and stores `y[c · rows + r]`. Column `c`
     // has `256 · n_grp` q words at `c · 256 · n_grp` and `2 · n_sb` scales at
@@ -991,6 +1105,65 @@ mod iq_kernels {
         // column c < m_cols its 256·n_grp words and 2·n_sb scales; the
         // returns above are warp-uniform.
         let f = unsafe { iq2_xs_lane_partials::<8>(v, sc, dh, row, n_sb as usize, a, mask, lane) };
+        // SAFETY: row < rows and m_cols <= 8 (checked above), y by the contract.
+        unsafe { store_cols(&f, m_cols as usize, rows as usize, row, lane, &mut y) };
+    }
+
+    /// IQ2_XXS rows (`iq2_xxs_lane_partials`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            qs.len() >= rows * 16 * n_sb,
+            dh.len() >= n_dh,
+            q.len() >= m_cols * 256 * n_grp,
+            d8.len() >= m_cols * 2 * n_sb,
+            y.len() >= m_cols * rows
+        )
+    )]
+    pub fn iq2_xxs_rows(
+        qs: &[u32],
+        dh: &[u32],
+        rows: u32,
+        n_sb: u32,
+        n_dh: u32,
+        n_grp: u32,
+        m_cols: u32,
+        q: &[u32],
+        d8: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        let tid = thread::index_1d().get();
+        let row = (tid / 256) * 8 + (tid % 256) / 32;
+        if row >= rows as usize || m_cols == 0 || m_cols > 8 {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let mask = (1u32 << m_cols) - 1;
+        let a = ActCols {
+            q,
+            d8,
+            q0: 0,
+            q_col: 256 * n_grp as usize,
+            d0: 0,
+            d_col: 2 * n_sb as usize,
+        };
+        let Some(v) = as_vectors::<U32x2>(qs) else {
+            return;
+        };
+        // n_dh only bounds dh in the launch contract.
+        let _ = n_dh;
+        // SAFETY: row < rows; the contract gives 8·n_sb word pairs a row,
+        // n_dh = ceil(rows·n_sb/2) halves words, and column c < m_cols its
+        // 256·n_grp words and 2·n_sb scales; the returns above are
+        // warp-uniform.
+        let f = unsafe { iq2_xxs_lane_partials::<8>(v, dh, row, n_sb as usize, a, mask, lane) };
         // SAFETY: row < rows and m_cols <= 8 (checked above), y by the contract.
         unsafe { store_cols(&f, m_cols as usize, rows as usize, row, lane, &mut y) };
     }
@@ -1268,6 +1441,11 @@ impl IqKernels {
         let [p0, p1, p2] = &w.planes;
         let md = &self.module;
         match w.fmt {
+            IqFormat::Iq2Xxs => {
+                let n_dh = launch_u32(what, "n_dh", p2.len())?;
+                let prep = md.prepare_iq2_xxs_rows(cfg)?;
+                md.iq2_xxs_rows(stream, &prep, p0, p2, rows, n_sb, n_dh, n_grp, m, q, d8, y)?;
+            }
             IqFormat::Iq2Xs => {
                 let n_dh = launch_u32(what, "n_dh", p2.len())?;
                 let prep = md.prepare_iq2_xs_rows(cfg)?;
@@ -1303,7 +1481,10 @@ impl IqKernels {
 
 #[cfg(test)]
 mod tests {
-    use super::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, sign_mask4, signed4, signs_of};
+    use super::{
+        IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, sign_mask4, signed4,
+        signs_of,
+    };
 
     /// The device's computed signs equal ggml's table, and the SWAR negation
     /// equals the scalar one on every grid word under every sign pattern.
@@ -1314,6 +1495,7 @@ mod tests {
         }
         let words: Vec<u32> = IQ2XS_GRID
             .iter()
+            .chain(&IQ2XXS_GRID)
             .flat_map(|g| [*g as u32, (*g >> 32) as u32])
             .chain(IQ3XXS_GRID)
             .chain(IQ3S_GRID)

@@ -1,8 +1,9 @@
 //! GPU gate for the i-quant expert-select entries over raw blocks
 //! (`bloomery_gpu::iq_sel`) on one card: the IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS
-//! gate·ups, the IQ4_NL down `_sel32` (Qwen3.8 UD-Q3_K_XL's card-leg formats)
-//! and the IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS downs over `Q8Act`
-//! (GLM-5.3-Flash UD-Q2_K_XL's and UD-IQ4_XS's).
+//! gate·ups, the IQ4_NL down `_sel32` (Qwen3.8 UD-Q3_K_XL's card-leg formats),
+//! the IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS downs over `Q8Act`
+//! (GLM-5.3-Flash UD-Q2_K_XL's and UD-IQ4_XS's), and IQ2_XXS's one-stack
+//! entry, Nemotron 3.5 Bolt's routed up and down (clauses 10, 12 and 13).
 //!
 //! IQ3_S has no plane kernels (`IqFormat::has_planes`), so clause 2 and the
 //! plane half of clause 10 do not apply to it. Its rule is held by clause 1
@@ -12,7 +13,9 @@
 //!
 //! Weights. The gate·up formats take the synthetic rows `dequant_ref
 //! --synthetic` writes (`$BLOOMERY_DATA/ref-synth/<type>.blocks`: 64 rows
-//! ggml-quantized then 16 rows of random codes, 4096 values each) cut to ten
+//! ggml-quantized then 16 rows of random codes, 4096 values each; IQ2_XXS,
+//! which the harness does not write, 80 rows of seeded blocks:
+//! `bloomery_gpu_gates::iq_rows`) cut to ten
 //! super-blocks (K = 2,560, Qwen3.8's gate width) and to nine (K = 2,304, a
 //! partial last lane iteration), cycled into stacks of 4 experts × 80 rows
 //! with a per-expert row phase (so two experts never share a row's bytes)
@@ -70,8 +73,8 @@
 //! 8. **Refusals by name.** A wrong type, short words, `k` off the block,
 //!    short `sel` or `y`, a down's activation with fewer columns than slots:
 //!    each an `Err(Shape)` of its launcher naming the case.
-//! 10. **`Q8Act` downs** (`iq2_xs_gemv_sel`, `iq3_xxs_gemv_sel`,
-//!     `iq4_xs_gemv_sel`) at K = 2,048 (GLM's down width) and K = 2,304 (a
+//! 10. **`Q8Act` downs** (`iq2_xxs_gemv_sel`, `iq2_xs_gemv_sel`,
+//!     `iq3_xxs_gemv_sel`, `iq3_s_gemv_sel`, `iq4_xs_gemv_sel`) at K = 2,048 (GLM's down width) and K = 2,304 (a
 //!     partial last lane iteration), 8 slots with one column a slot: the rows
 //!     equal the host rule bit for bit (`lane_partial_host` per lane plus the
 //!     butterfly), the plane entry over `IqFormat::repack` of the same rows,
@@ -94,9 +97,31 @@
 //!     column past the eighth. The clause's rows were ggml-quantized and random
 //!     blocks; the leg test's are random blocks, which reach every code of
 //!     the three formats.
-//! 12. **Capture, `Q8Act` entries.** The IQ2_XS gate·up and the three downs
-//!     captured in one graph replay as four nodes, bit-identical to the eager
-//!     launches.
+//! 12. **Capture, `Q8Act` entries.** The IQ2_XS and IQ3_S gate·ups and the
+//!     five downs captured in one graph replay as seven nodes, bit-identical
+//!     to the eager launches.
+//! 13. **IQ2_XXS at Bolt's shapes** (`iq2_xxs_gemv_sel` through
+//!     `enqueue_gemv_sel_cols`), seeded stacks at four of the file's
+//!     (expert count, width) pairs — (240, 1,536), (304, 2,048), (432, 2,304),
+//!     (496, 2,560): every width, the smallest and the largest count. The
+//!     routed up: `n` experts of `w` rows at K = 1,024, two tokens of nine
+//!     slots each on its token's column (`slots_per_col` 9); the routed down:
+//!     `n` experts of 1,024 rows at K = `w`, one token's nine slots a column
+//!     each. Per leg: the host rule (bits), a rerun and a wider activation
+//!     (bits), the plane kernel `iq2_xxs_rows` over `IqFormat::repack` of the
+//!     slots' experts (bits), every output finite and written and `HOST` rows
+//!     at the sentinel, and every row of every slot within `dot_ref`'s f64
+//!     band (`iq_rows`; the dot bound below), a `PIN(2026-10-16):` per leg
+//!     ratcheting `max|ours − ref| / max|ref|`. An id at the layer's own count
+//!     raises `ExpertId` and leaves its rows at the sentinel, every other slot
+//!     the clean launch's; the down through `enqueue_gemv_sel` equals it
+//!     through `enqueue_gemv_sel_cols` at 1, bit for bit. Refused by name: a
+//!     `slots_per_col` of 0, nine on another format's down, one column for
+//!     two runs, short ids.
+//!
+//! `--bench-kernels [--bench-arm <op>|iq2xxs]` runs no clause: it prices the
+//! IQ2_XXS launches at Bolt's shapes (the `bench` module below), lead-only
+//! under `tools/ref/time-gate.sh`'s lease.
 //! 9. **Route vs host dot, a real file** (`--model <path>`): the Qwen3.8
 //!    UD-Q3_K_XL first shard's own stacks, four experts a layer of layers 0
 //!    (IQ3_XXS/IQ4_NL), 4 (IQ3_XXS/Q8_0) and 2 (IQ4_XS/Q8_0), read from the
@@ -139,13 +164,15 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/bench.rs"]
+mod bench_arm;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::Fault;
-    use bloomery_gpu::iq::{
-        IqFormat, IqKernels, IqRows, SUB_VALUES, lane_partial_host, sub_sums_host,
-    };
+    use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
     use bloomery_gpu::iq_sel::{
         IQ4_NL_BLOCK_BYTES, IqDown, IqGateUp, IqSelKernels, iq4_nl_row_dot32_host,
     };
@@ -154,8 +181,11 @@ mod gate {
     use bloomery_gpu::q5::Q8Blocks32;
     use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels};
     use bloomery_gpu::{DeviceTensor, Q8Act};
+    use bloomery_gpu_gates::iq_rows::{
+        Col, SYNTH_K, dot_host, dot_ref, seeded_blocks, synth_rows as synth_all,
+    };
     use bloomery_gpu_gates::rounding::{U, butterfly, gamma};
-    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::iq_tables::KVALUES_IQ4NL;
@@ -166,8 +196,6 @@ mod gate {
     const SLOTS: usize = 10;
     /// The m sweep of clauses 1 and 3.
     const MS: [usize; 4] = [1, 2, 4, 8];
-    /// Values per full synthetic row.
-    const K_FULL: usize = 4096;
     /// The cut geometries: ten and nine super-blocks.
     const KS: [usize; 2] = [2560, 2304];
     /// What `h` and `y` hold before a launch, so an output a kernel skips
@@ -188,7 +216,8 @@ mod gate {
         IqFormat::Iq4Xs,
     ];
     /// The formats of the `Q8Act` downs.
-    const Q8_FMTS: [IqFormat; 4] = [
+    const Q8_FMTS: [IqFormat; 5] = [
+        IqFormat::Iq2Xxs,
         IqFormat::Iq2Xs,
         IqFormat::Iq3Xxs,
         IqFormat::Iq3S,
@@ -284,24 +313,16 @@ mod gate {
         }
     }
 
-    /// The synthetic rows of `fmt` cut to `n_sb` super-blocks, or the error.
+    /// The synthetic rows of `fmt` (`iq_rows::synth_rows`) cut to `n_sb`
+    /// super-blocks, or the error.
     fn synth_rows(fmt: IqFormat, n_sb: usize) -> Result<Vec<Vec<u8>>, GateError> {
-        let name = fmt.ggml().name().ok_or("an IqFormat names its type")?;
-        let path = data_dir().join("ref-synth").join(format!("{name}.blocks"));
-        let all = std::fs::read(&path)
-            .map_err(|e| format!("{}: {e} (run `just gate-1-1` first)", path.display()))?;
+        let all = synth_all(fmt)?;
         let bb = fmt.block_bytes();
-        let row_bytes = K_FULL / 256 * bb;
-        if all.is_empty() || !all.len().is_multiple_of(row_bytes) {
-            return Err(format!(
-                "{}: {} bytes is not whole rows of {row_bytes}",
-                path.display(),
-                all.len()
-            )
-            .into());
-        }
         let keep = n_sb * bb;
-        Ok(all.chunks(row_bytes).map(|r| r[..keep].to_vec()).collect())
+        Ok(all
+            .chunks(SYNTH_K / 256 * bb)
+            .map(|r| r[..keep].to_vec())
+            .collect())
     }
 
     /// A gate·up stack of `experts · rpe` rows over the format's synthetic
@@ -380,9 +401,6 @@ mod gate {
     fn q4_slot(v: usize) -> usize {
         256 * (v >> 8) + 32 * (v & 7) + 8 * ((v >> 6) & 3) + ((v >> 3) & 7)
     }
-
-    /// One activation column: value-order int8 codes and block scales.
-    type Col = (Vec<i8>, Vec<f32>);
 
     /// A `Q8Act`'s device-quantized columns read back through
     /// `walk_a_planes`: value-order codes and block scales a column.
@@ -522,14 +540,6 @@ mod gate {
             .collect()
     }
 
-    /// One row's dot by the host rule: the 32 lane partials, then the
-    /// butterfly.
-    fn dot_host(fmt: IqFormat, row: &[u8], col: &(Vec<i8>, Vec<f32>)) -> f32 {
-        butterfly(std::array::from_fn(|lane| {
-            lane_partial_host(fmt, row, &col.0, &col.1, lane)
-        }))
-    }
-
     /// The gate·up's host rule over `sel`: `SENT` for `HOST` slots and ids
     /// past the stack, `act::apply` of the two host-rule dots elsewhere.
     fn gu_host(st: &GuStack, cols: &[Col], sel: &[u32], rule: Act) -> Vec<f32> {
@@ -567,51 +577,6 @@ mod gate {
             }
         }
         y
-    }
-
-    /// `Σ_k |t_k|` of the rule's lane terms for one row and column, and the
-    /// largest lane iteration count `n_it` (gate_iq's term_mag).
-    fn term_mag(fmt: IqFormat, row: &[u8], col: &(Vec<i8>, Vec<f32>)) -> (f64, usize) {
-        let bb = fmt.block_bytes();
-        let codes = col.0.as_chunks::<SUB_VALUES>().0;
-        let n_sub = 8 * row.len() / bb;
-        let mut mag = 0.0f64;
-        for (b, xq) in codes.iter().enumerate().take(n_sub) {
-            let blk = &row[bb * (b / 8)..bb * (b / 8 + 1)];
-            let (i, _) = sub_sums_host(fmt, blk, b % 8, xq);
-            let dx = f64::from(col.1[b / 4]);
-            let h = f64::from(half_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
-            mag += match fmt {
-                IqFormat::Iq2Xs => (h / 8.0 * dx * f64::from(i)).abs(),
-                IqFormat::Iq3Xxs => (h / 4.0 * dx * f64::from(i)).abs(),
-                _ => (h * dx * f64::from(i)).abs(),
-            };
-        }
-        (mag, n_sub.div_ceil(32))
-    }
-
-    /// The exact dot of a dequantized row with f32 activations, and the
-    /// module doc's bound on our error (gate_iq's dot_ref over 128-value
-    /// blocks).
-    fn dot_ref(
-        fmt: IqFormat,
-        row: &[u8],
-        w: &[f32],
-        x: &[f32],
-        col: &(Vec<i8>, Vec<f32>),
-    ) -> (f64, f64) {
-        let (mut exact, mut quant) = (0.0f64, 0.0f64);
-        for (b, (wb, xb)) in w.chunks(128).zip(x.chunks(128)).enumerate() {
-            let d = f64::from(col.1[b]);
-            let mut sw = 0.0f64;
-            for (&wi, &xi) in wb.iter().zip(xb) {
-                exact += f64::from(wi) * f64::from(xi);
-                sw += f64::from(wi).abs();
-            }
-            quant += d / 2.0 * (1.0 + 256.0 * U) * sw;
-        }
-        let (mag, n_it) = term_mag(fmt, row, col);
-        (exact, quant + gamma(2 * n_it + 6) * mag)
     }
 
     /// `silu` in f64 (the clause-3 and clause-4 references).
@@ -2008,6 +1973,8 @@ mod gate {
     /// gate·up; IQ2_XS takes GLM's width and the partial-lane one.
     fn gu_ks(fmt: IqFormat) -> &'static [usize] {
         match fmt {
+            // No gate·up: Bolt's IQ2_XXS experts have no gate (clause 13).
+            IqFormat::Iq2Xxs => &[],
             IqFormat::Iq2Xs => &[4096, 2304],
             IqFormat::Iq3Xxs => &[2560, 2304, 4096],
             IqFormat::Iq3S => &[4096, 2304],
@@ -2285,7 +2252,7 @@ mod gate {
         Ok(ok)
     }
 
-    /// Clause 12: the IQ2_XS gate·up and the three downs in one graph.
+    /// Clause 12: the IQ2_XS and IQ3_S gate·ups and the `Q8Act` downs in one graph.
     fn check_q8_capture(c: &Ctx) -> Result<bool, GateError> {
         let s = c.gpu.stream();
         let gu = gu_stack(IqFormat::Iq2Xs, 4096, 4, 80)?;
@@ -2412,8 +2379,397 @@ mod gate {
         Ok(pass)
     }
 
+    /// Bolt's routed (expert count, width) pairs clause 13 runs: every width
+    /// of the file, at its smallest and largest layer counts and two between
+    /// (`bolt-arch.md`'s R0 section lists the twelve).
+    const BOLT_PAIRS: [(usize, usize); 4] = [(240, 1536), (304, 2048), (432, 2304), (496, 2560)];
+    /// Bolt's latent width: the routed up's K and the down's rows an expert.
+    const BOLT_LATENT: usize = 1024;
+    /// Bolt's routed slots a token.
+    const BOLT_TOP: usize = 9;
+    /// Tokens of the up's launches: two runs of [`BOLT_TOP`] slots.
+    const BOLT_TOKENS: usize = 2;
+    /// PIN(2026-10-16): clause 13's `max|ours − f64 ref| / max|ref|`, the
+    /// larger over the four pairs, per leg, rounded up: 4.952e-3 (up, 496 ×
+    /// 2,560) and 5.725e-3 (down, 240 × 1,536) — the dot class's 0.4 % with
+    /// the spread of 18 and 9 slots' rows.
+    const REL_PIN_BOLT: [(&str, f64); 2] = [("up", 5.0e-3), ("down", 5.8e-3)];
+
+    /// A seeded IQ2_XXS stack of `experts · rpe` rows of `k` values
+    /// (`iq_rows::seeded_blocks`), in the gate·up stack's shape with no up.
+    fn bolt_stack(experts: usize, rpe: usize, k: usize, seed: u64) -> GuStack {
+        GuStack {
+            fmt: IqFormat::Iq2Xxs,
+            g: seeded_blocks(IqFormat::Iq2Xxs, experts * rpe * k / 256, seed),
+            u: Vec::new(),
+            experts,
+            rpe,
+            k,
+        }
+    }
+
+    /// Clause 13's ids, [`BOLT_TOP`] a token for `tokens` tokens of a layer
+    /// of `n` experts: the first and the last expert, an expert twice in a
+    /// token and in both, `HOST` at slot 6.
+    fn bolt_sel(tokens: usize, n: usize) -> Vec<u32> {
+        let n = n as u32;
+        (0..tokens as u32)
+            .flat_map(|t| {
+                [
+                    0,
+                    n - 1,
+                    17 * t + 5,
+                    n / 2,
+                    3,
+                    n - 2 - t,
+                    u32::MAX,
+                    1 + t,
+                    0,
+                ]
+            })
+            .collect()
+    }
+
+    /// The one-stack `_sel` (`enqueue_gemv_sel_cols`, slot `s` on column `s /
+    /// spc`) into a SENT-filled buffer, synchronized: the rows and the fault.
+    fn sel_cols(
+        c: &Ctx,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        sel: &[u32],
+        rpe: usize,
+        spc: usize,
+    ) -> Result<(Vec<f32>, Option<Fault>), GateError> {
+        let stream = c.gpu.stream();
+        let sel_dev = DeviceBuffer::from_host(stream, sel)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; sel.len() * rpe])?;
+        c.iqsel.enqueue_gemv_sel_cols(
+            stream,
+            GgmlType::IQ2_XXS,
+            &SelDown {
+                w,
+                act,
+                sel: &sel_dev,
+                n_slots: sel.len(),
+                rows_per_expert: rpe,
+            },
+            spc,
+            c.gpu.unlabelled_sink(),
+            &mut y,
+        )?;
+        stream.synchronize()?;
+        Ok((y.to_host_vec(stream)?, c.gpu.take_fault()?))
+    }
+
+    /// The host rule of [`sel_cols`]: `SENT` for `HOST` and ids past the
+    /// stack, the host-rule dot with column `s / spc` elsewhere.
+    fn sel_cols_host(st: &GuStack, cols: &[Col], sel: &[u32], spc: usize) -> Vec<f32> {
+        let mut y = vec![SENT; sel.len() * st.rpe];
+        for (s, &id) in sel.iter().enumerate() {
+            if id as usize >= st.experts {
+                continue;
+            }
+            for r in 0..st.rpe {
+                let ra = id as usize * st.rpe + r;
+                y[s * st.rpe + r] = dot_host(st.fmt, st.row(false, ra), &cols[s / spc]);
+            }
+        }
+        y
+    }
+
+    /// The plane kernel's rows for the same slots: per slot, `iq2_xxs_rows`
+    /// over `IqFormat::repack` of its expert's rows against the one column
+    /// the slot reads (`s / spc`, copied out of `act`).
+    fn sel_cols_planes(
+        c: &Ctx,
+        st: &GuStack,
+        act: &Q8Act,
+        sel: &[u32],
+        spc: usize,
+    ) -> Result<Vec<f32>, GateError> {
+        let s = c.gpu.stream();
+        let (q4, _s8, d8) = walk_a_planes(act);
+        let (q4, d8) = (q4.to_host_vec(s)?, d8.to_host_vec(s)?);
+        let n_sb = st.k / 256;
+        let (cw, cd) = (256 * n_sb.div_ceil(4), 2 * n_sb);
+        let rb = st.row_bytes();
+        let mut want = vec![SENT; sel.len() * st.rpe];
+        for (si, &id) in sel.iter().enumerate() {
+            let e = id as usize;
+            if e >= st.experts {
+                continue;
+            }
+            let col = si / spc;
+            let rows = IqRows::upload(
+                s,
+                st.fmt,
+                &st.g[e * st.rpe * rb..][..st.rpe * rb],
+                st.rpe,
+                st.k,
+            )?;
+            let qd = DeviceBuffer::from_host(s, &q4[col * cw..(col + 1) * cw])?;
+            let d8d = DeviceBuffer::from_host(s, &d8[col * cd..(col + 1) * cd])?;
+            let mut ye = DeviceBuffer::from_host(s, &vec![0.0f32; st.rpe])?;
+            c.iq.enqueue_rows(s, &rows, &qd, &d8d, 1, &mut ye)?;
+            want[si * st.rpe..(si + 1) * st.rpe].copy_from_slice(&ye.to_host_vec(s)?);
+        }
+        Ok(want)
+    }
+
+    /// Clause 13 over one leg (the up or the down of one pair): the slots'
+    /// rows against the host rule (bits), a rerun, a wider activation, the
+    /// plane kernel (bits), every output finite and written and `HOST` rows
+    /// at the sentinel, and the f64 band of `dot_ref` over every row of
+    /// every slot; the leg's `max|ours − ref| / max|ref|`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one leg's stack, its activation in three forms and the slots' ids and column rule"
+    )]
+    fn check_bolt_leg(
+        c: &Ctx,
+        leg: &str,
+        st: &GuStack,
+        w: &DeviceTensor<u32>,
+        x: &[f32],
+        (act, cols, wide): (&Q8Act, &[Col], &Q8Act),
+        sel: &[u32],
+        spc: usize,
+    ) -> Result<(bool, f64), GateError> {
+        let (y, fault) = sel_cols(c, w, act, sel, st.rpe, spc)?;
+        let (again, fault2) = sel_cols(c, w, act, sel, st.rpe, spc)?;
+        let (y_wide, fault3) = sel_cols(c, w, wide, sel, st.rpe, spc)?;
+        let host = sel_cols_host(st, cols, sel, spc);
+        let planes = sel_cols_planes(c, st, act, sel, spc)?;
+        let bits = bits_equal(&y, &host);
+        let rerun = bits_equal(&y, &again);
+        let wide_bits = bits_equal(&y, &y_wide);
+        let cross = bits_equal(&y, &planes);
+        let sentinel = host_slots_sent(sel, &y, st.rpe);
+        let written = sel.iter().enumerate().all(|(si, &id)| {
+            id == u32::MAX
+                || y[si * st.rpe..(si + 1) * st.rpe]
+                    .iter()
+                    .all(|v| v.is_finite() && v.to_bits() != SENT.to_bits())
+        });
+        let no_fault = fault.is_none() && fault2.is_none() && fault3.is_none();
+        let (mut err_max, mut ref_max, mut ratio_max) = (0.0f64, 0.0f64, 0.0f64);
+        let mut w_f32 = vec![0.0f32; st.k];
+        for (si, &id) in sel.iter().enumerate() {
+            if id == u32::MAX {
+                continue;
+            }
+            let col = si / spc;
+            for r in 0..st.rpe {
+                let rb = st.row(false, id as usize * st.rpe + r);
+                dequant_row(GgmlType::IQ2_XXS, rb, &mut w_f32)?;
+                let (exact, bound) = dot_ref(
+                    st.fmt,
+                    rb,
+                    &w_f32,
+                    &x[col * st.k..(col + 1) * st.k],
+                    &cols[col],
+                );
+                let err = (f64::from(y[si * st.rpe + r]) - exact).abs();
+                err_max = err_max.max(err);
+                ref_max = ref_max.max(exact.abs());
+                ratio_max = ratio_max.max(err / bound);
+            }
+        }
+        let in_band = ratio_max <= 1.0;
+        let rel = err_max / ref_max;
+        let pass =
+            bits && rerun && wide_bits && cross && sentinel && written && in_band && no_fault;
+        println!(
+            "bolt_{leg}[IQ2_XXS experts={} rpe={} k={} slots={} slots_per_col={spc}] host_rule_bits={} \
+             rerun={} wide_act={} cross_layout={} host_slots_sentinel={} finite_and_written={} \
+             f64_band={} (worst err/bound {ratio_max:.3e}) rel={rel:.4e} fault=\"{}\" {}{}{}",
+            st.experts,
+            st.rpe,
+            st.k,
+            sel.len(),
+            verdict(bits),
+            verdict(rerun),
+            verdict(wide_bits),
+            verdict(cross),
+            verdict(sentinel),
+            verdict(written),
+            verdict(in_band),
+            shown(&fault),
+            verdict(pass),
+            mismatch("host_rule", &y, &host),
+            mismatch("cross", &y, &planes),
+        );
+        Ok((pass, rel))
+    }
+
+    /// Clause 13 at one (expert count, width) pair: the routed up (K =
+    /// [`BOLT_LATENT`], `w` rows an expert, [`BOLT_TOKENS`] tokens of
+    /// [`BOLT_TOP`] slots on their token's column) and the routed down (K =
+    /// `w`, [`BOLT_LATENT`] rows an expert, one token's slots a column each,
+    /// through both launchers), then an id at the layer's count, which the
+    /// launch refuses on the card: `ExpertId`, its rows at the sentinel,
+    /// every other slot the clean launch's. The two legs' `rel`.
+    fn check_bolt(c: &Ctx, n: usize, w: usize) -> Result<(bool, f64, f64), GateError> {
+        let s = c.gpu.stream();
+        let seed = 0xb017_0000_0000_u64 ^ ((n as u64) << 16) ^ w as u64;
+        let mut ok = true;
+
+        let up = bolt_stack(n, w, BOLT_LATENT, seed);
+        let wu = up.upload(s, false)?;
+        let t = BOLT_TOKENS;
+        let xu = seeded(t * BOLT_LATENT, 9401 + w as u32, -2.0, 4.0);
+        let (act_u, cols_u) = slot_act(c, &xu, BOLT_LATENT, t, t)?;
+        let (wide_u, _) = slot_act(c, &xu, BOLT_LATENT, t, t + 2)?;
+        let sel_u = bolt_sel(t, n);
+        let (pass, rel_up) = check_bolt_leg(
+            c,
+            "up",
+            &up,
+            &wu,
+            &xu,
+            (&act_u, &cols_u, &wide_u),
+            &sel_u,
+            BOLT_TOP,
+        )?;
+        ok &= pass;
+
+        // The layer's own count: id n is a slot of a larger layer, past this one.
+        let (clean, _) = sel_cols(c, &wu, &act_u, &sel_u, w, BOLT_TOP)?;
+        let mut bad = sel_u.clone();
+        bad[2] = n as u32;
+        let (yb, fault) = sel_cols(c, &wu, &act_u, &bad, w, BOLT_TOP)?;
+        let bad_sent = yb[2 * w..3 * w]
+            .iter()
+            .all(|&v| v.to_bits() == SENT.to_bits());
+        let named = fault.is_some_and(|f| {
+            GpuError::fault("gate_iq_sel", f)
+                .to_string()
+                .contains("expert_id")
+        });
+        let others_same = clean
+            .iter()
+            .zip(&yb)
+            .enumerate()
+            .all(|(i, (a, b))| i / w == 2 || a.to_bits() == b.to_bits());
+        let (_, next_fault) = sel_cols(c, &wu, &act_u, &sel_u, w, BOLT_TOP)?;
+        let ids_pass = bad_sent && named && others_same && next_fault.is_none();
+        ok &= ids_pass;
+        println!(
+            "bolt_ids[IQ2_XXS experts={n} rpe={w}] id_{n}_sentinel={} fault_names_expert_id={} \
+             others_are_clean={} next_clean_clean={} fault=\"{}\" {}",
+            verdict(bad_sent),
+            verdict(named),
+            verdict(others_same),
+            verdict(next_fault.is_none()),
+            shown(&fault),
+            verdict(ids_pass),
+        );
+        drop((up, wu));
+
+        let down = bolt_stack(n, BOLT_LATENT, w, seed ^ (1 << 40));
+        let wd = down.upload(s, false)?;
+        let xd = seeded(BOLT_TOP * w, 9501 + w as u32, -2.0, 4.0);
+        let (act_d, cols_d) = slot_act(c, &xd, w, BOLT_TOP, BOLT_TOP)?;
+        let (wide_d, _) = slot_act(c, &xd, w, BOLT_TOP, BOLT_TOP + 3)?;
+        let sel_d = bolt_sel(1, n);
+        let (pass, rel_down) = check_bolt_leg(
+            c,
+            "down",
+            &down,
+            &wd,
+            &xd,
+            (&act_d, &cols_d, &wide_d),
+            &sel_d,
+            1,
+        )?;
+        ok &= pass;
+        let (y1, f1) = sel_cols(c, &wd, &act_d, &sel_d, BOLT_LATENT, 1)?;
+        let (y2, f2) = down_q8(c, GgmlType::IQ2_XXS, &wd, &act_d, &sel_d, BOLT_LATENT)?;
+        let same = bits_equal(&y1, &y2) && f1.is_none() && f2.is_none();
+        ok &= same;
+        println!(
+            "bolt_down_launchers[IQ2_XXS experts={n} k={w}] gemv_sel_eq_gemv_sel_cols_1={} {}",
+            verdict(same),
+            verdict(same),
+        );
+        Ok((ok, rel_up, rel_down))
+    }
+
+    /// Clause 13's refusals of `enqueue_gemv_sel_cols` by name: a
+    /// `slots_per_col` of 0, a run of slots on another format's entry, an
+    /// activation of fewer columns than the runs, short ids.
+    fn check_bolt_refusals(c: &Ctx) -> Result<bool, GateError> {
+        let s = c.gpu.stream();
+        let st = bolt_stack(4, 64, BOLT_LATENT, 0xb017_4ef5);
+        let w = st.upload(s, false)?;
+        let x = seeded(2 * BOLT_LATENT, 9601, -2.0, 4.0);
+        let (act1, _) = slot_act(c, &x, BOLT_LATENT, 1, 1)?;
+        let (act2, _) = slot_act(c, &x, BOLT_LATENT, 2, 2)?;
+        let sel18 = DeviceBuffer::from_host(s, &[0u32; 2 * BOLT_TOP])?;
+        let sel3 = DeviceBuffer::from_host(s, &[0u32; 3])?;
+        let mut y = DeviceBuffer::from_host(s, &vec![SENT; 2 * BOLT_TOP * 64])?;
+        let sink = c.gpu.unlabelled_sink();
+        let mut launch = |ty: GgmlType, act: &Q8Act, sel: &DeviceBuffer<u32>, spc: usize| {
+            c.iqsel
+                .enqueue_gemv_sel_cols(
+                    s,
+                    ty,
+                    &SelDown {
+                        w: &w,
+                        act,
+                        sel,
+                        n_slots: 2 * BOLT_TOP,
+                        rows_per_expert: 64,
+                    },
+                    spc,
+                    sink,
+                    &mut y,
+                )
+                .err()
+        };
+        let cases = [
+            (
+                "slots_per_col_0",
+                launch(GgmlType::IQ2_XXS, &act2, &sel18, 0),
+            ),
+            (
+                "iq2_xs_slots_per_col_9",
+                launch(GgmlType::IQ2_XS, &act2, &sel18, BOLT_TOP),
+            ),
+            (
+                "one_column_for_two_runs",
+                launch(GgmlType::IQ2_XXS, &act1, &sel18, BOLT_TOP),
+            ),
+            (
+                "short_sel",
+                launch(GgmlType::IQ2_XXS, &act2, &sel3, BOLT_TOP),
+            ),
+        ];
+        let mut ok = true;
+        for (case, e) in cases {
+            let pass = matches!(
+                &e,
+                Some(GpuError::Shape {
+                    what: "IqSelKernels::enqueue_gemv_sel_cols",
+                    ..
+                })
+            );
+            println!(
+                "refuse_cols[{case}] want=Err(Shape enqueue_gemv_sel_cols) got=\"{}\" {}",
+                e.map_or_else(|| "Ok".to_string(), |e| e.to_string()),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        s.synchronize()?;
+        Ok(ok && c.gpu.take_fault()?.is_none())
+    }
+
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
+        if std::env::args().any(|a| a == "--bench-kernels") {
+            return bench::run(&gpu);
+        }
         let c = Ctx {
             iqsel: IqSelKernels::load(gpu.context(), gpu.fault_word())?,
             iq: IqKernels::load(gpu.context())?,
@@ -2487,6 +2843,21 @@ mod gate {
             let w = st.upload(s, false)?;
             ok &= check_q8_down(&c, &st, &w, false)?;
         }
+        let mut bolt_rel = [0.0f64; 2];
+        for (n, w) in BOLT_PAIRS {
+            let (pass, up, down) = check_bolt(&c, n, w)?;
+            ok &= pass;
+            bolt_rel = [bolt_rel[0].max(up), bolt_rel[1].max(down)];
+        }
+        for ((leg, pin), rel) in REL_PIN_BOLT.iter().zip(bolt_rel) {
+            let under = rel <= *pin;
+            ok &= under;
+            println!(
+                "IQ2_XXS  bolt {leg} max|rel|, the larger of the four pairs: {rel:.4e} (pin {pin:.1e}) {}",
+                verdict(under),
+            );
+        }
+        ok &= check_bolt_refusals(&c)?;
         ok &= check_ids_and_nan(&c)?;
         ok &= check_q8_down_ids_nan(&c)?;
         ok &= check_capture(&c)?;
@@ -2502,5 +2873,173 @@ mod gate {
         }
         println!("gate_iq_sel: {}", verdict(ok));
         if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+    /// `--bench-kernels`: the IQ2_XXS launches of Nemotron 3.5 Bolt at its
+    /// shapes, the eager burst and the graph replay of each (`bench op=`
+    /// rows), timed by `tools/ref/time-gate.sh` under the machine lease; no
+    /// case runs and nothing asserts. The arms:
+    /// - `iq2xxs_5376`, `iq2xxs_4096`: the shared expert's up (5,376 rows of K
+    ///   = 4,096) and down (4,096 rows of K = 5,376), `iq2_xxs_rows` at one
+    ///   column over seeded blocks (`IqRows` refuses a non-finite `d`);
+    /// - `iq2xxs_moe_up_<n>x<w>`, `iq2xxs_moe_down_<n>x<w>`: one token's nine
+    ///   routed slots of a layer of `n` experts of width `w`
+    ///   (`iq2_xxs_gemv_sel`: the up K = 1,024 on the token's column, the down
+    ///   K = `w` a column a slot), nine distinct experts spread over the
+    ///   stack, its words [`fill_pattern`](crate::bench_arm::fill_pattern), as
+    ///   `gate_gemm`'s arms.
+    ///
+    /// `bytes` is the weight rows the launch reads plus its activation words
+    /// and outputs. `--bench-arm <op>` runs the arm of that name, and
+    /// `--bench-arm iq2xxs` every arm above; a name no arm carries is a named
+    /// error.
+    mod bench {
+        use super::{BOLT_LATENT, BOLT_PAIRS, BOLT_TOP};
+        use crate::bench_arm::{
+            GREPS, N, ROUNDS, burst, fill_pattern, fill_pattern_f32, print_arm, replay,
+        };
+        use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
+        use bloomery_gpu::iq_sel::IqSelKernels;
+        use bloomery_gpu::kquant::{SelDown, walk_a_planes};
+        use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+        use bloomery_gpu_gates::GateError;
+        use bloomery_gpu_gates::iq_rows::seeded_blocks;
+        use cuda_core::{CudaStream, DeviceBuffer};
+        use gguf::quant::GgmlType;
+
+        /// Bolt's shared expert: hidden and width.
+        const SHARED: (usize, usize) = (4096, 5376);
+        /// IQ2_XXS bytes per 256 values.
+        const BB: usize = 66;
+
+        /// Whether `op` runs under `only` (an exact arm name, or `iq2xxs` for
+        /// every arm).
+        fn wanted(only: Option<&str>, op: &str) -> bool {
+            only.is_none_or(|o| o == op || o == "iq2xxs")
+        }
+
+        /// `x` (`m` columns of `k` values) quantized into a fresh `Q8Act`.
+        fn act(gpu: &Gpu, m: usize, k: usize) -> Result<Q8Act, GateError> {
+            let s = gpu.stream();
+            let x = DeviceBuffer::from_host(s, &fill_pattern_f32(m * k))?;
+            let mut a = Q8Act::with_slots(s, m, k)?;
+            gpu.enqueue_quantize_q8_1_cols(&x, &mut a, m, 0)?;
+            s.synchronize()?;
+            Ok(a)
+        }
+
+        /// One arm: its burst, its graph replay, its row.
+        fn arm(
+            gpu: &Gpu,
+            op: &str,
+            rows: usize,
+            bytes: u64,
+            enq: &mut dyn FnMut(&CudaStream) -> Result<(), bloomery_gpu::GpuError>,
+        ) -> Result<(), GateError> {
+            let s = gpu.stream();
+            let e = burst(s, enq)?;
+            let g = gpu.capture(|cs| (0..N).try_for_each(|_| enq(cs)))?;
+            let r = replay(s, &g)?;
+            print_arm(op, rows, bytes, g.node_count(), e, r);
+            Ok(())
+        }
+
+        pub fn run(gpu: &Gpu) -> Result<(), GateError> {
+            println!("bench n_per_burst={N} rounds={ROUNDS} graph_launches_per_round={GREPS}");
+            let only = {
+                let mut args = std::env::args().skip_while(|a| a != "--bench-arm");
+                match args.next() {
+                    None => None,
+                    Some(_) => Some(args.next().ok_or(
+                        "gate_iq_sel: --bench-arm wants an arm name (a `bench op=` value, or iq2xxs)",
+                    )?),
+                }
+            };
+            let only = only.as_deref();
+            let s = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let mut ran = false;
+
+            let iq = IqKernels::load(gpu.context())?;
+            let (hidden, width) = SHARED;
+            for (op, rows, k) in [
+                ("iq2xxs_5376", width, hidden),
+                ("iq2xxs_4096", hidden, width),
+            ] {
+                if !wanted(only, op) {
+                    continue;
+                }
+                ran = true;
+                let fmt = IqFormat::Iq2Xxs;
+                let w =
+                    IqRows::upload(s, fmt, &seeded_blocks(fmt, rows * k / 256, 0xbe0c), rows, k)?;
+                let a = act(gpu, 1, k)?;
+                let (q4, _s8, d8) = walk_a_planes(&a);
+                let mut y = DeviceBuffer::<f32>::zeroed(s, rows)?;
+                let bytes = (rows * k / 256 * BB + q4.len() * 4 + d8.len() * 4 + rows * 4) as u64;
+                arm(gpu, op, rows, bytes, &mut |cs| {
+                    iq.enqueue_rows(cs, &w, q4, d8, 1, &mut y)
+                })?;
+            }
+
+            let iqsel = IqSelKernels::load(gpu.context(), gpu.fault_word())?;
+            for (n, wd) in BOLT_PAIRS {
+                // The up: w rows an expert of K = 1,024, the nine slots on one
+                // column; the down: 1,024 rows of K = w, a column a slot.
+                for (leg, rpe, k, cols, spc) in [
+                    ("up", wd, BOLT_LATENT, 1, BOLT_TOP),
+                    ("down", BOLT_LATENT, wd, BOLT_TOP, 1),
+                ] {
+                    let op = format!("iq2xxs_moe_{leg}_{n}x{wd}");
+                    if !wanted(only, &op) {
+                        continue;
+                    }
+                    ran = true;
+                    let n_rows = n * rpe;
+                    let words =
+                        runtime::words::stream_words((n_rows * k / 256 * BB) as u64, n_rows as u64)
+                            .ok_or("gate_iq_sel: a stack of no rows")?
+                            as usize;
+                    let w = DeviceTensor::<u32>::upload(
+                        s,
+                        &fill_pattern(words),
+                        n_rows,
+                        words / n_rows,
+                    )?;
+                    let a = act(gpu, cols, k)?;
+                    let ids: Vec<u32> = (0..BOLT_TOP).map(|i| (i * n / BOLT_TOP) as u32).collect();
+                    let sel = DeviceBuffer::from_host(s, &ids)?;
+                    let mut y = DeviceBuffer::<f32>::zeroed(s, BOLT_TOP * rpe)?;
+                    let (q4, _s8, d8) = walk_a_planes(&a);
+                    let bytes = (BOLT_TOP * rpe * k / 256 * BB
+                        + q4.len() * 4
+                        + d8.len() * 4
+                        + BOLT_TOP * rpe * 4) as u64;
+                    arm(gpu, &op, BOLT_TOP * rpe, bytes, &mut |cs| {
+                        iqsel.enqueue_gemv_sel_cols(
+                            cs,
+                            GgmlType::IQ2_XXS,
+                            &SelDown {
+                                w: &w,
+                                act: &a,
+                                sel: &sel,
+                                n_slots: BOLT_TOP,
+                                rows_per_expert: rpe,
+                            },
+                            spc,
+                            sink,
+                            &mut y,
+                        )
+                    })?;
+                }
+            }
+            s.synchronize()?;
+            if gpu.take_fault()?.is_some() {
+                return Err("gate_iq_sel: a bench arm raised the fault word".into());
+            }
+            match only {
+                Some(o) if !ran => Err(format!("gate_iq_sel: --bench-arm {o} names no arm").into()),
+                _ => Ok(()),
+            }
+        }
     }
 }
