@@ -569,7 +569,7 @@ pub(super) fn planes(dw: &DevWeight) -> Option<[u64; 2]> {
 pub(super) fn at_open<'w>(
     target: &'w Weights,
     b: &BorrowedPlanes,
-    what: &str,
+    what: &'static str,
 ) -> Result<&'w DevWeight, GpuError> {
     let dw = target
         .get(&b.name)
