@@ -367,6 +367,9 @@ impl TapSet {
                 "no # rows or no tap rows: the set names nothing to check",
             ));
         }
+        if self.rows.iter().collect::<HashSet<_>>().len() != self.rows.len() {
+            return Err(RefError::malformed(at.display(), "duplicate # rows entry"));
+        }
         let names: Vec<&str> = {
             let mut v: Vec<&str> = Vec::new();
             for t in &self.taps {
@@ -501,12 +504,7 @@ impl TapSet {
             ));
         }
         let bytes = read_bytes(&self.dir.join(&t.file), u64::from(t.n), &t.file)?;
-        Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| i32::from_le_bytes(*c))
-            .collect())
+        Ok(crate::columns::i32s_of(&bytes))
     }
 }
 

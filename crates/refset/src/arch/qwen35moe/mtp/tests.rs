@@ -393,6 +393,44 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         "does not name a file of the set's directory",
     );
     at(
+        "repeated rows hide taps at a nonexistent step",
+        &[
+            "tap\tmtp_eh_proj\t5\tf32\t2\tmtp_eh_proj.r0.f32",
+            "tap\tffn_moe_topk\t5\ti32\t2\tffn_moe_topk.r0.i32",
+        ],
+        &|d| swap(d, "# rows\t0\t2", "# rows\t0\t0\t2"),
+        "duplicate # rows entry",
+    );
+    at(
+        "no # rows and no tap rows",
+        &[],
+        &|d| {
+            swap(d, "# rows\t0\t2", "");
+            for t in [
+                "tap\tmtp_eh_proj\t0\tf32\t2\tmtp_eh_proj.r0.f32",
+                "tap\tffn_moe_topk\t0\ti32\t2\tffn_moe_topk.r0.i32",
+                "tap\tmtp_eh_proj\t2\tf32\t2\tmtp_eh_proj.r2.f32",
+                "tap\tffn_moe_topk\t2\ti32\t2\tffn_moe_topk.r2.i32",
+            ] {
+                swap(d, t, "");
+            }
+            swap(d, "# complete\t4\t0", "# complete\t0\t0");
+        },
+        "names nothing to check",
+    );
+    at(
+        "no # tokens_count line",
+        &[],
+        &|d| swap(d, "# tokens_count\t4", ""),
+        "no # tokens_count line",
+    );
+    at(
+        "no trunk row",
+        &[],
+        &|d| swap(d, "trunk\th_nextn\tf32\t4\t2\ttrunk_h.f32", ""),
+        "no trunk row",
+    );
+    at(
         "a step row gone",
         &[],
         &|d| swap(d, "step\t2\t13\t2\t8\t8", ""),

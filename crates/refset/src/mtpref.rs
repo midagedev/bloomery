@@ -16,6 +16,7 @@
 
 use crate::RefError;
 use crate::columns::Columns;
+use crate::columns::i32s_of;
 use crate::dsref::{Draft, Plain, Verify};
 use crate::family::Family;
 use crate::ik::{
@@ -632,14 +633,6 @@ impl MtpSet {
 fn place(c: &Columns, line: &str, at: &dyn fmt::Display) -> Result<(i32, Graph), RefError> {
     let r = c.row(line, at)?;
     Ok((r.parse("block")?, Graph::parse(r.text("graph")?, at)?))
-}
-
-fn i32s_of(b: &[u8]) -> Vec<i32> {
-    b.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| i32::from_le_bytes(*c))
-        .collect()
 }
 
 #[cfg(test)]

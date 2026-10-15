@@ -168,3 +168,12 @@ pub(crate) fn read_f32(path: &Path, want: u64, file: &str) -> Result<Vec<f32>, R
         .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
+
+/// Little-endian i32 values, four bytes each (the caller has checked the length).
+pub(crate) fn i32s_of(b: &[u8]) -> Vec<i32> {
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
+        .collect()
+}
