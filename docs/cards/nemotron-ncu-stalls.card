@@ -14,3 +14,9 @@ condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, perf-nemogen 9af670da
 decide-in: name each kernel's top stall reason and its share, beside its occupancy, for engine's N7e spec
 decide-below: occupancy is the term: more blocks or rows per block first
 decide-above: occupancy is not the term: the stall reason (long scoreboard, barrier, dependency) is
+# Run record (ncu WarpStateStats/Occupancy/LaunchStats, RTX A6000, eager, perf-nemogen 9af670da (#287), two launches
+# each): the card ran with the predict above, which names no kernel. Measured achieved occupancy: mamba2_step 44.4 %
+# (theoretical 75 %; its launch ceiling is 47.6 % [derived], 480 x 128 threads over 84 SMs x 1,536), in the band;
+# q4k_gemv 77.2 % (theoretical 100 %, launch ceiling 77.8 % [derived]), above it. Read per kernel: mamba2_step is
+# under-filled (decide-below's lever), q4k_gemv is not (decide-above: its 32.1-cycle L1TEX long scoreboard, 79 %).
+# The band is left as it ran; a next card on these kernels names one kernel per band.
