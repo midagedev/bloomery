@@ -3,7 +3,7 @@
 //! and the scan stores allocated once, and the per-step record refreshed
 //! before every enqueue or replay.
 
-use super::prefill::{PASS_ROWS, Prompt, PromptShape};
+use super::prefill::{PASS_ROWS, Prompt};
 use super::step::{
     Acts, AttnLayer, Kernels, Layer, MambaLayer, MlpLayer, ROW_WORDS, SITE_TYPES, Scratch, Shape,
     Site, WORD_POS, WORD_TOKEN,
@@ -122,19 +122,7 @@ impl Body {
                 kgemv: KGemvKernels::load(gpu)?,
                 gemm: GemmKernels::load(ctx_)?,
             },
-            prompt: Prompt::new(
-                stream,
-                PASS_ROWS.min(ctx),
-                &PromptShape {
-                    hidden,
-                    ld: mamba.in_proj_width(),
-                    inner: ssm.d_inner,
-                    n_head: hp.n_head,
-                    n_kv,
-                    ff,
-                },
-                &layers,
-            )?,
+            prompt: Prompt::new(stream, PASS_ROWS.min(ctx), &sh, (hp.n_head, ff), &layers)?,
             acts: Acts::new(stream, layers.iter().flat_map(Layer::sites))?,
             s: Scratch::new(stream, &sh, hp.n_head, ff)?,
             r: DeviceBuffer::zeroed(stream, hidden)?,

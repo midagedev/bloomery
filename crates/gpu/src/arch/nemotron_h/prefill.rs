@@ -16,7 +16,7 @@
 //! GEMM's band, not bit for bit.
 
 use super::body::Body;
-use super::step::{Layer, Site, norm_rows, residual_rows};
+use super::step::{Layer, RowBuffers, Shape, Site, norm_rows, residual_rows};
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{GROUP_5, GqaArgs, HEAD, partials_ms_len, partials_v_len};
@@ -54,20 +54,12 @@ pub(super) struct Prompt {
     /// The pass's two residual streams, each `rows` rows of `hidden`.
     xa: DeviceBuffer<f32>,
     xb: DeviceBuffer<f32>,
-    xn: DeviceBuffer<f32>,
-    delta: DeviceBuffer<f32>,
-    zxbcdt: DeviceBuffer<f32>,
-    y: DeviceBuffer<f32>,
-    q: DeviceBuffer<f32>,
-    k: DeviceBuffer<f32>,
-    v: DeviceBuffer<f32>,
+    /// The chain's row buffers at `rows` rows, the step's own at one.
+    buf: RowBuffers,
     /// The pass's K and V rows regrouped head-major: head `h`'s rows at
     /// `h · rows · HEAD`, what the plane append reads.
     kh: DeviceBuffer<f32>,
     vh: DeviceBuffer<f32>,
-    attn: DeviceBuffer<f32>,
-    up: DeviceBuffer<f32>,
-    act: DeviceBuffer<f32>,
     part_v: DeviceBuffer<f32>,
     part_ms: DeviceBuffer<f32>,
     /// Each row's position and live key count, the embedding's outputs.
@@ -81,23 +73,15 @@ pub(super) struct Prompt {
     acts: Vec<ActAt>,
 }
 
-/// The widths a pass's buffers are cut for.
-pub(super) struct PromptShape {
-    pub(super) hidden: usize,
-    pub(super) ld: usize,
-    pub(super) inner: usize,
-    pub(super) n_head: usize,
-    pub(super) n_kv: usize,
-    pub(super) ff: usize,
-}
-
 impl Prompt {
-    /// The buffers for passes of up to `rows` rows over `sh`, and the
+    /// The buffers for passes of up to `rows` rows over `sh`, `n_head` query
+    /// heads and the widest `ff` (the step's [`Scratch`] arguments), and the
     /// quantized forms each width `layers`' sites read. Load-time only.
     pub(super) fn new(
         stream: &CudaStream,
         rows: usize,
-        sh: &PromptShape,
+        sh: &Shape,
+        (n_head, ff): (usize, usize),
         layers: &[Layer],
     ) -> Result<Prompt, GpuError> {
         if rows == 0 {
@@ -129,23 +113,14 @@ impl Prompt {
         let n_words = P_ROWS + sh.n_kv + rows;
         Ok(Prompt {
             rows,
-            q_width: sh.n_head * HEAD,
+            q_width: n_head * HEAD,
             xa: z(sh.hidden)?,
             xb: z(sh.hidden)?,
-            xn: z(sh.hidden)?,
-            delta: z(sh.hidden)?,
-            zxbcdt: z(sh.ld)?,
-            y: z(sh.inner)?,
-            q: z(sh.n_head * HEAD)?,
-            k: z(kv_width)?,
-            v: z(kv_width)?,
+            buf: RowBuffers::new(stream, rows, sh, (n_head, ff))?,
             kh: z(kv_width)?,
             vh: z(kv_width)?,
-            attn: z(sh.n_head * HEAD)?,
-            up: z(sh.ff)?,
-            act: z(sh.ff)?,
-            part_v: DeviceBuffer::zeroed(stream, partials_v_len(attn_rows, sh.n_head))?,
-            part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(attn_rows, sh.n_head))?,
+            part_v: DeviceBuffer::zeroed(stream, partials_v_len(attn_rows, n_head))?,
+            part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(attn_rows, n_head))?,
             pos: DeviceBuffer::zeroed(stream, rows)?,
             n_keys: DeviceBuffer::zeroed(stream, rows)?,
             words: DeviceBuffer::zeroed(stream, n_words)?,
@@ -157,27 +132,18 @@ impl Prompt {
 
     /// The device bytes the pass's buffers hold.
     pub(super) fn bytes(&self) -> usize {
-        [
-            &self.xa,
-            &self.xb,
-            &self.xn,
-            &self.delta,
-            &self.zxbcdt,
-            &self.y,
-            &self.q,
-            &self.k,
-            &self.v,
-            &self.kh,
-            &self.vh,
-            &self.attn,
-            &self.up,
-            &self.act,
-            &self.part_v,
-            &self.part_ms,
-        ]
-        .iter()
-        .map(|b| b.num_bytes())
-        .sum::<usize>()
+        self.buf.bytes()
+            + [
+                &self.xa,
+                &self.xb,
+                &self.kh,
+                &self.vh,
+                &self.part_v,
+                &self.part_ms,
+            ]
+            .iter()
+            .map(|b| b.num_bytes())
+            .sum::<usize>()
             + self.pos.num_bytes()
             + self.n_keys.num_bytes()
             + self.words.num_bytes()
@@ -325,18 +291,9 @@ impl Body {
             let Prompt {
                 xa,
                 xb,
-                xn,
-                delta,
-                zxbcdt,
-                y,
-                q,
-                k,
-                v,
+                buf,
                 kh,
                 vh,
-                attn,
-                up,
-                act,
                 part_v,
                 part_ms,
                 pos: rows_pos,
@@ -346,6 +303,18 @@ impl Body {
                 acts,
                 ..
             } = p;
+            let RowBuffers {
+                xn,
+                delta,
+                zxbcdt,
+                y,
+                q,
+                k,
+                v,
+                attn,
+                up,
+                act,
+            } = buf;
             let (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>) =
                 if in_a { (xa, xb) } else { (xb, xa) };
             let fault = gpu.layer_sink(l)?;

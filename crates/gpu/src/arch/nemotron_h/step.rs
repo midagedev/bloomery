@@ -148,8 +148,9 @@ impl Acts {
     }
 }
 
-/// The buffers one step runs over, m = 1.
-pub(super) struct Scratch {
+/// The rows a chain runs over, `rows` of each width: the step's one row
+/// ([`Scratch`]) and a prompt pass's rows ([`super::prefill`]).
+pub(super) struct RowBuffers {
     pub(super) xn: DeviceBuffer<f32>,
     pub(super) delta: DeviceBuffer<f32>,
     pub(super) zxbcdt: DeviceBuffer<f32>,
@@ -160,6 +161,57 @@ pub(super) struct Scratch {
     pub(super) attn: DeviceBuffer<f32>,
     pub(super) up: DeviceBuffer<f32>,
     pub(super) act: DeviceBuffer<f32>,
+}
+
+impl RowBuffers {
+    /// `rows` rows of each width for `sh`, `n_head` query heads and the
+    /// widest `ff` an MLP layer has. Load-time only.
+    pub(super) fn new(
+        stream: &cuda_core::CudaStream,
+        rows: usize,
+        sh: &Shape,
+        (n_head, ff): (usize, usize),
+    ) -> Result<RowBuffers, GpuError> {
+        let z = |n: usize| -> Result<DeviceBuffer<f32>, GpuError> {
+            Ok(DeviceBuffer::zeroed(stream, rows * n.max(1))?)
+        };
+        let kv_width = sh.n_kv * HEAD;
+        Ok(RowBuffers {
+            xn: z(sh.hidden)?,
+            delta: z(sh.hidden)?,
+            zxbcdt: z(sh.mamba.in_proj_width())?,
+            y: z(sh.mamba.geom().d_inner)?,
+            q: z(n_head * HEAD)?,
+            k: z(kv_width)?,
+            v: z(kv_width)?,
+            attn: z(n_head * HEAD)?,
+            up: z(ff)?,
+            act: z(ff)?,
+        })
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        [
+            &self.xn,
+            &self.delta,
+            &self.zxbcdt,
+            &self.y,
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.attn,
+            &self.up,
+            &self.act,
+        ]
+        .iter()
+        .map(|b| b.num_bytes())
+        .sum()
+    }
+}
+
+/// The buffers one step runs over, m = 1.
+pub(super) struct Scratch {
+    pub(super) buf: RowBuffers,
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
     pub(super) mamba: Mamba2Scratch,
@@ -173,23 +225,9 @@ pub(super) struct Scratch {
 
 impl Scratch {
     pub(super) fn bytes(&self) -> usize {
-        [
-            &self.xn,
-            &self.delta,
-            &self.zxbcdt,
-            &self.y,
-            &self.q,
-            &self.k,
-            &self.v,
-            &self.attn,
-            &self.up,
-            &self.act,
-            &self.part_v,
-            &self.part_ms,
-        ]
-        .iter()
-        .map(|b| b.num_bytes())
-        .sum::<usize>()
+        self.buf.bytes()
+            + self.part_v.num_bytes()
+            + self.part_ms.num_bytes()
             + self.words.num_bytes()
             + self.pos.num_bytes()
             + self.n_keys.num_bytes()
@@ -204,24 +242,10 @@ impl Scratch {
         n_head: usize,
         ff: usize,
     ) -> Result<Scratch, GpuError> {
-        let g = sh.mamba.geom();
-        let z = |n: usize| -> Result<DeviceBuffer<f32>, GpuError> {
-            Ok(DeviceBuffer::zeroed(stream, n.max(1))?)
-        };
-        let kv_width = sh.n_kv * HEAD;
         Ok(Scratch {
-            xn: z(sh.hidden)?,
-            delta: z(sh.hidden)?,
-            zxbcdt: z(sh.mamba.in_proj_width())?,
-            y: z(g.d_inner)?,
-            q: z(n_head * HEAD)?,
-            k: z(kv_width)?,
-            v: z(kv_width)?,
-            attn: z(n_head * HEAD)?,
-            up: z(ff)?,
-            act: z(ff)?,
-            part_v: z(partials_v_len(1, n_head))?,
-            part_ms: z(partials_ms_len(1, n_head))?,
+            buf: RowBuffers::new(stream, 1, sh, (n_head, ff))?,
+            part_v: DeviceBuffer::zeroed(stream, partials_v_len(1, n_head))?,
+            part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(1, n_head))?,
             mamba: Mamba2Scratch::new(stream, sh.mamba)?,
             words: DeviceBuffer::zeroed(stream, ROW_WORDS + sh.n_kv)?,
             pos: DeviceBuffer::zeroed(stream, 1)?,
@@ -331,13 +355,14 @@ fn mamba_layer(
         (cx.sh.eps, cx.sh.hidden, 1),
         &m.norm,
         src,
-        &mut s.xn,
+        &mut s.buf.xn,
     )?;
-    m.ssm_in.project(cx, acts, l, &s.xn, &mut s.zxbcdt)?;
+    m.ssm_in
+        .project(cx, acts, l, &s.buf.xn, &mut s.buf.zxbcdt)?;
     let f32s = size_of::<f32>();
-    let z = Window::<f32>::of(&s.zxbcdt, 0, inner)?;
-    let xbc = Window::<f32>::of(&s.zxbcdt, inner * f32s, conv_dim)?;
-    let dt = Window::<f32>::of(&s.zxbcdt, (inner + conv_dim) * f32s, heads)?;
+    let z = Window::<f32>::of(&s.buf.zxbcdt, 0, inner)?;
+    let xbc = Window::<f32>::of(&s.buf.zxbcdt, inner * f32s, conv_dim)?;
+    let dt = Window::<f32>::of(&s.buf.zxbcdt, (inner + conv_dim) * f32s, heads)?;
     cx.k.mamba.enqueue_step(
         cx.gpu.stream(),
         StepArgs {
@@ -355,14 +380,14 @@ fn mamba_layer(
             pos: &s.pos,
             pos_at: 0,
             fault: cx.gpu.layer_sink(l)?,
-            y: &mut s.y,
+            y: &mut s.buf.y,
             ring: &mut m.store.ring,
             state: &mut m.store.state,
             scratch: &mut s.mamba,
         },
     )?;
-    m.ssm_out.project(cx, acts, l, &s.y, &mut s.delta)?;
-    residual_rows(cx.gpu, cx.sh.hidden, src, &s.delta, dst)
+    m.ssm_out.project(cx, acts, l, &s.buf.y, &mut s.buf.delta)?;
+    residual_rows(cx.gpu, cx.sh.hidden, src, &s.buf.delta, dst)
 }
 
 /// Key head `h`'s row of `buf`, the view an append reads.
@@ -387,11 +412,11 @@ fn attn_layer(
         (cx.sh.eps, cx.sh.hidden, 1),
         &a.norm,
         src,
-        &mut s.xn,
+        &mut s.buf.xn,
     )?;
-    a.q.project(cx, acts, l, &s.xn, &mut s.q)?;
-    a.k.project(cx, acts, l, &s.xn, &mut s.k)?;
-    a.v.project(cx, acts, l, &s.xn, &mut s.v)?;
+    a.q.project(cx, acts, l, &s.buf.xn, &mut s.buf.q)?;
+    a.k.project(cx, acts, l, &s.buf.xn, &mut s.buf.k)?;
+    a.v.project(cx, acts, l, &s.buf.xn, &mut s.buf.v)?;
     let at = PlaneAppend {
         words: &s.words,
         first_word: ROW_WORDS,
@@ -400,12 +425,12 @@ fn attn_layer(
         fault,
     };
     let flash = cx.gpu.flash();
-    flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(&s.k), &mut a.kc)?;
-    flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(&s.v), &mut a.vc)?;
+    flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(&s.buf.k), &mut a.kc)?;
+    flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(&s.buf.v), &mut a.vc)?;
     cx.k.flash.enqueue_pass::<GROUP_5>(
         cx.gpu.stream(),
         GqaArgs {
-            q: &s.q,
+            q: &s.buf.q,
             kc: a.kc.buf(),
             vc: a.vc.buf(),
             n_keys: &s.n_keys,
@@ -416,12 +441,12 @@ fn attn_layer(
             part_v: &mut s.part_v,
             part_ms: &mut s.part_ms,
             fault,
-            y: &mut s.attn,
+            y: &mut s.buf.attn,
         },
         false,
     )?;
-    a.o.project(cx, acts, l, &s.attn, &mut s.delta)?;
-    residual_rows(cx.gpu, cx.sh.hidden, src, &s.delta, dst)
+    a.o.project(cx, acts, l, &s.buf.attn, &mut s.buf.delta)?;
+    residual_rows(cx.gpu, cx.sh.hidden, src, &s.buf.delta, dst)
 }
 
 /// One MLP layer: `down(relu²(up(x)))`, no gate.
@@ -436,14 +461,14 @@ fn mlp_layer(
         (cx.sh.eps, cx.sh.hidden, 1),
         &m.norm,
         src,
-        &mut s.xn,
+        &mut s.buf.xn,
     )?;
-    m.up.project(cx, acts, l, &s.xn, &mut s.up)?;
+    m.up.project(cx, acts, l, &s.buf.xn, &mut s.buf.up)?;
     cx.gpu
         .elem()
-        .enqueue_relu_sqr(cx.gpu.stream(), &s.up, m.ff, &mut s.act)?;
-    m.down.project(cx, acts, l, &s.act, &mut s.delta)?;
-    residual_rows(cx.gpu, cx.sh.hidden, src, &s.delta, dst)
+        .enqueue_relu_sqr(cx.gpu.stream(), &s.buf.up, m.ff, &mut s.buf.act)?;
+    m.down.project(cx, acts, l, &s.buf.act, &mut s.buf.delta)?;
+    residual_rows(cx.gpu, cx.sh.hidden, src, &s.buf.delta, dst)
 }
 
 impl Body {
