@@ -439,8 +439,13 @@ impl TapSet {
             )
         })?;
         text.lines()
-            .filter(|l| !l.is_empty())
             .map(|l| {
+                if l.is_empty() {
+                    return Err(RefError::malformed(
+                        path.display(),
+                        format!("{IDS_FILE}: empty token id"),
+                    ));
+                }
                 l.parse().map_err(|e| {
                     RefError::malformed(path.display(), format!("{IDS_FILE}: id {l:?}: {e}"))
                 })

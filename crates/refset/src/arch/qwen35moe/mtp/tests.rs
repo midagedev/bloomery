@@ -375,6 +375,12 @@ fn a_set_whose_files_or_rows_disagree_is_malformed() {
         "step row 2 is not step 1",
     );
     at(
+        "an empty line among the prompt ids",
+        &[],
+        &|d| put(d, IDS_FILE, b"10\n\n11\n12\n13\n"),
+        "empty token id",
+    );
+    at(
         "a step row gone",
         &[],
         &|d| swap(d, "step\t2\t13\t2\t8\t8", ""),
