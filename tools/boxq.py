@@ -34,7 +34,8 @@ requests after it and the sleeps between them all sit inside BOXQ_CANCEL_WAIT_S;
 signal, exits 81 naming the job. A job last seen running is left running on the box: the
 client stops following it, names `boxq.py attach <id>` and `boxq.py cancel <id>`, mirrors nothing and exits 130 or 143,
 so an interrupted session does not throw away a job's card time. A job whose first answer after the signal is terminal
-is not cancelled either: the exit is 130 or 143 and nothing is mirrored. A job that starts between the last poll and the
+is not cancelled either: the exit is 130 or 143 and nothing is mirrored. A signal while unread bytes are replayed is
+that same exit, and no rc file. A job that starts between the last poll and the
 cancel is cancelled (the poll interval is the window).
 After POLL_FAILS (3) polls in a row that cannot reach the daemon the client backs off exponentially for at most
 BOXQ_RECONNECT_S seconds (300), resumes each tail at the next byte, and only past that bound exits 84 with
@@ -615,6 +616,9 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                 dump(q, last, trap, offsets=tuple(offsets))
         else:
             dump(q, last, trap, offsets=tuple(offsets))
+        if trap.sigs and cancel_at is None:
+            say(f"boxq: {jid}: signal; the job had already ended {last['status']} on the box (no rc mirrored)")
+            return trap.rc()
         if cancel_at is None and last["status"] == "cancelled":
             say(f"boxq: {jid} cancelled elsewhere")
         if leave:
@@ -1389,8 +1393,6 @@ class Clock:
 
 
 class ClockTrap:
-    sigs = ()
-
     def __init__(self, clock, sigs=()):
         self.clock, self.sigs = clock, list(sigs)
 
@@ -1403,8 +1405,8 @@ class ClockTrap:
 class StubQueue:
     """The attach's Queue with no wire: `poll_s`, the budgets, and a job() and cancel() the case scripts."""
 
-    def __init__(self, clock, poll_s, reconnect_s=0.0, cancel_wait_s=0.0):
-        self.clock, self.poll_s, self.reconnect_s, self.cancel_wait_s = clock, poll_s, reconnect_s, cancel_wait_s
+    def __init__(self, poll_s, reconnect_s=0.0, cancel_wait_s=0.0):
+        self.poll_s, self.reconnect_s, self.cancel_wait_s = poll_s, reconnect_s, cancel_wait_s
         self.note_s = 60.0
 
 
@@ -1420,7 +1422,7 @@ def with_clock(clock, fn):
 def case_reconnect_wall(fx):
     """The reconnect budget is wall time: a poll that hangs its whole timeout counts, not only the sleeps between."""
     clock = Clock()
-    q = StubQueue(clock, 5.0, reconnect_s=30.0)
+    q = StubQueue(5.0, reconnect_s=30.0)
     asked = []
 
     def job(jid, timeout=30.0):
@@ -1463,7 +1465,7 @@ def case_cancel_deadline(fx):
     """The cancel wait counts from the first signal. A stalled post, a stalled get and a long poll sleep each stay
     inside it: the fixture's stubs spend the timeout they are given."""
     clock = Clock()
-    q = StubQueue(clock, 1.0, cancel_wait_s=4.0)
+    q = StubQueue(1.0, cancel_wait_s=4.0)
     posts = []
 
     def cancel(jid, timeout=30.0):
@@ -1480,7 +1482,7 @@ def case_cancel_deadline(fx):
     check(clock.t <= 4.5, f"the wait of 4 s runs from the first signal: the attach ended at {clock.t:g} s")
 
     clock = Clock()
-    q = StubQueue(clock, 1.0, cancel_wait_s=4.0)
+    q = StubQueue(1.0, cancel_wait_s=4.0)
 
     def stall_post(jid, timeout=30.0):
         clock.t += timeout
@@ -1493,7 +1495,7 @@ def case_cancel_deadline(fx):
           f"a stalled cancel post stays inside 4 s and ends cancel-pending: {clock.t:g} s {raised!r}")
 
     clock = Clock()
-    q = StubQueue(clock, 1.0, cancel_wait_s=4.0)
+    q = StubQueue(1.0, cancel_wait_s=4.0)
     gets = {"n": 0}
 
     def stall_get(jid, timeout=30.0):
@@ -1509,7 +1511,7 @@ def case_cancel_deadline(fx):
           f"a stalled status get stays inside 4 s and ends cancel-pending: {clock.t:g} s gets={gets['n']} {raised!r}")
 
     clock = Clock()
-    q = StubQueue(clock, 10.0, cancel_wait_s=4.0)
+    q = StubQueue(10.0, cancel_wait_s=4.0)
     q.job = lambda jid, timeout=30.0: {"id": jid, "status": "queued", "wait_reason": None}
     q.cancel = lambda jid, timeout=30.0: {}
     raised = _cancel_run(fx, q, clock)
@@ -1594,6 +1596,29 @@ def case_pending_replay(fx):
     check(p.returncode == 0 and out == body and fx.rc_file() == "0\n",
           f"pending bytes are replayed before the mirror: rc={p.returncode} got={len(out)} "
           f"want={len(body)} mirror={fx.rc_file()!r} err={err!r}")
+    fx.gone(fx.tail_pids)
+
+
+def case_replay_signal(fx):
+    """A signal while unread bytes are replayed is the signal's exit, and no rc file is written."""
+    body = b"P" * (1 << 20) + b"0123456789A"
+    fx.files(body, b"")
+    fx.serve([{"status": "running"}, {"status": "done", "rc": 0}],
+             gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
+    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05")
+    fx.wait_pids(fx.tail_pids, 3)  # the third pid is the replay tail: the job is already terminal
+    p.send_signal(signal.SIGTERM)
+    # Do not read stdout yet: a full pipe is what holds the replay, so the signal is what ends it.
+    try:
+        rc = p.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        raise AssertionError("a signal during replay did not end the client within 20 s")
+    out, err = p.communicate()
+    check(rc == 143 and fx.rc_file() is None,
+          f"a signal during replay exits 143 and mirrors nothing: rc={rc} mirror={fx.rc_file()!r} "
+          f"got={len(out)} err={err!r}")
     fx.gone(fx.tail_pids)
 
 
@@ -1819,7 +1844,7 @@ CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_predicti
          case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
          case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_drain_full_pipe,
-         case_pending_replay, case_reconnect_wall,
+         case_pending_replay, case_replay_signal, case_reconnect_wall,
          case_cancel_deadline, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
