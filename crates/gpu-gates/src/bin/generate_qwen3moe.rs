@@ -386,6 +386,7 @@ mod cli {
     use app::arch::qwen3moe::Q38Cfg;
     use app::mtp::{MtpBody, MtpDraft, WindowDraft};
     use app::{Session, SessionError};
+    use bloomery_gpu::arch::nemotron_h::Body as BodyNh;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
@@ -398,7 +399,6 @@ mod cli {
     use bloomery_gpu::host::xstream::{XLayer, XReport};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
-    use bloomery_gpu::arch::nemotron_h::Body as BodyNh;
     use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, Qwen3moeModel};
 
     use bloomery_gpu_gates::generate::{Place, card_words, lane_at};

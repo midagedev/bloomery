@@ -2149,6 +2149,14 @@ depth-gpu-qwen35moe *ARMS:
 depth-gpu-qwen4exp *ARMS:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
+# Nemotron 3 Nano 4B (nemotron_h), the same table: depth-gpu-qwen3moe's runner and tables under the nemotron_h
+# profile (tools/ref/models/nemotron_h.sh). Our arm is the same generate_qwen3moe, which reads the architecture from
+# the file's header and runs the whole model on one card, its prompt as steps (`kind=step`); `--seed-depth` is refused,
+# so a depth D arm feeds D ids. The references are mainline llama.cpp's arms (lcpp:, lcpppp:); ik and mistral.rs arms
+# are refused by name. BLOOMERY_DRY=1 prints the command lines and builds nothing.
+depth-gpu-nemotron *ARMS:
+    BLOOMERY_MODEL=nemotron_h ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+
 # GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용):
 # ours `<D>` (the first D prose ids, run as the binary's `--prefill` default, batches; `kind=` in the row names the feed),
 # llama.cpp PR 두 가지 `lcpp27752:<D>`·`lcpp27754:<D>`(-d D)와 `…pp[<U>]:<P>`,

@@ -1,0 +1,25 @@
+# The first Nemotron 3 Nano 4B rows on the RTX A6000, before N7c: ours (generate_qwen3moe, the whole
+# model on the card, the prompt run as steps) beside mainline llama.cpp's llama-bench, decode at depth 6,
+# 512 and 4096 and prompt at P = 512 and 4096 (ours: the `time prompt` row of the same arm, a step per
+# id). The band is the DRAM model [derived]: 2.7168 GB a step at 600-700 GB/s plus 319 nodes x 0.852 us.
+# The 0.3.3 toktape on the 3090 (tz7hzsysnd9u85cpf8mf) read decode 155.3 tok/s against that model's 3090
+# band 257-288, so the model already misses a term; this card names the band it predicts and which way a
+# miss sends the next run.
+kind: baseline
+question: where does our first Nemotron 3 Nano 4B decode and step-by-step prompt sit beside mainline
+  llama.cpp on the RTX A6000, and how far under the DRAM model?
+term: tok/s @ n = 96, depth 6, NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf, generate_qwen3moe --time, graph
+  replay, RTX A6000
+unit: tok/s
+predict: 208..241
+condition: one lease, BLOOMERY_CARD=a6000, the default rounds; arms 6 lcpp:6 512 lcpppp:512 4096
+  lcpp:4096 lcpppp:4096; no [cpu-busy], [other-busy] or [cold]; the full output to a file first; the
+  depth 4096 decode read against 204..235 and the prompt rows against the decode rate (a step per id)
+reason: sets the pre-N7c rows N7c (batched prefill) and multi-slot are judged against; why now: the
+  user made Nemotron optimization the first priority and no timed nemotron_h row exists
+decide-in: publish the rows in their A6000 table; speed work goes to bytes (head, KV), not kernel
+  instructions
+decide-below: profile one step (nsys on generate_qwen3moe) and name the kernel under its byte rate:
+  first suspects the Q5_0 dp4a gemv on ssm_in and the fused mamba2 step; the 3090's 155 says this side
+decide-above: the effective rate is above 700 GB/s: re-read the band of every dense-gemv card on this
+  ruler
