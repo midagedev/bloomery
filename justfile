@@ -122,6 +122,12 @@ contrib-check *ARGS:
 pre-review *ARGS:
     python3 tools/review/local.py {{ARGS}}
 
+# Before a push request: `just pre-review` and `just remote-static BASE` (default origin/main) on one clean committed HEAD
+# at once, one line each and the exit of the first red. A tree with uncommitted or untracked files is refused (64). The
+# owner is tools/pre-push.sh.
+pre-push *ARGS:
+    ./tools/pre-push.sh {{ARGS}}
+
 # 레시피 자체의 점검(맥, grep뿐). 게이트 줄의 `||`는 종료 코드를 삼킨다 — tools/check-recipes.sh 머리말.
 check-recipes:
     ./tools/check-recipes.sh
