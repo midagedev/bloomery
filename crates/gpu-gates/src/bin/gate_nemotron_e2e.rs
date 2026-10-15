@@ -144,7 +144,7 @@ mod gate {
         set: LogitsSet,
         /// The step path's argmax and last-position logits per set prompt,
         /// run once and read by every clause after the first.
-        steps: RefCell<BTreeMap<String, (u32, Vec<f32>)>>,
+        steps: RefCell<BTreeMap<String, Last>>,
     }
 
     struct Prompt {
@@ -171,6 +171,9 @@ mod gate {
         ("prefill_edges", prefill_edges),
         ("fault_word_clean", fault_word_clean),
     ];
+
+    /// A run's argmax after the prompt and its last-position logits.
+    type Last = (u32, Vec<f32>);
 
     /// A step run: the argmax id and the logits after each token.
     struct Run {
@@ -425,7 +428,7 @@ mod gate {
         m: &mut Model,
         case: &Case,
         p: &refset::nemotron::Prompt,
-    ) -> Result<Option<(u32, Vec<f32>)>, GateError> {
+    ) -> Result<Option<Last>, GateError> {
         if let Some(hit) = case.steps.borrow().get(&p.name) {
             return Ok(Some(hit.clone()));
         }
@@ -559,7 +562,7 @@ mod gate {
         m: &mut Model,
         name: &str,
         (ids, rows): (&[u32], usize),
-    ) -> Result<Option<(u32, Vec<f32>)>, GateError> {
+    ) -> Result<Option<Last>, GateError> {
         m.reset()?;
         match m.prefill_with(ids, rows) {
             Ok(id) => Ok(Some((id, m.logits()?))),
@@ -579,7 +582,7 @@ mod gate {
         m: &mut Model,
         case: &Case,
         p: &refset::nemotron::Prompt,
-    ) -> Result<Option<(f64, (u32, Vec<f32>))>, GateError> {
+    ) -> Result<Option<(f64, Last)>, GateError> {
         let want = case.set.logits(p)?;
         let Some(step) = body_on(clause, m, case, p)? else {
             return Ok(None);
