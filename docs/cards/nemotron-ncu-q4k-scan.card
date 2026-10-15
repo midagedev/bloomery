@@ -1,0 +1,16 @@
+# The next two Nemotron decode kernels after q5_0_gemv under Nsight Compute on the RTX A6000: q4k_gemv (33 a step,
+# 0.97 ms, ~460 GB/s by file bytes in nemotron-nsys-a6000) and mamba2_step (21 a step, 0.51 ms, ~325 GB/s of scan
+# state). Is each one's gap the bytes it reads or the kernel? Derived: ssm_out Q4_K [7680, 3136] file bytes
+# 13,547,520; mamba2_step reads and writes 3,932,160 B of state a layer (7.86 MB), plus its conv ring and inputs.
+kind: profile
+question: how many DRAM bytes do one ssm_out q4k_gemv launch and one mamba2_step launch move on the A6000, and
+  at what rate?
+term: dram__bytes_read.sum and dram__bytes_write.sum of the first q4k_gemv and mamba2_step launches,
+  generate_qwen3moe eager mode, NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf, RTX A6000
+unit: MB
+predict: 13..15
+condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, perf-nemogen 9af670da (#287), --mode eager, ncu over the
+  first six launches of each kernel; the predict is the ssm_out q4k_gemv read
+decide-in: q4k_gemv reads its file bytes, so its ~460 GB/s is the kernel: a q4k gemv rate round for engine
+decide-below: no reading below the file's bytes is possible; recheck the launch's shape
+decide-above: the Q4_K resident layout is wider than the file: the same lever as N7d

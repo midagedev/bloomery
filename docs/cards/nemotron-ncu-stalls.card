@@ -1,0 +1,16 @@
+# Why mamba2_step and the ssm_out q4k_gemv sit under their byte rate (nemotron-ncu-q4k-scan.card: ~210 and ~465
+# GB/s of DRAM traffic): their warp stall reasons and achieved occupancy, so the lever (grid, split-K, ILP) comes
+# from the measurement. Derived from the launch shapes: mamba2_step 480 blocks x 128 threads, q4k_gemv 392 x 256 on
+# 84 SMs, so neither launch fills the card's resident warps for long.
+kind: profile
+question: what stalls the warps of one mamba2_step and one ssm_out q4k_gemv launch on the A6000, and what
+  occupancy do they reach?
+term: ncu WarpStateStats, Occupancy and LaunchStats sections of the first two launches of each kernel,
+  generate_qwen3moe eager mode, NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf, RTX A6000
+unit: percent
+predict: 10..60
+condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, perf-nemogen 9af670da (#287), --mode eager; the predict
+  is achieved occupancy
+decide-in: name each kernel's top stall reason and its share, beside its occupancy, for engine's N7e spec
+decide-below: occupancy is the term: more blocks or rows per block first
+decide-above: occupancy is not the term: the stall reason (long scoreboard, barrier, dependency) is
