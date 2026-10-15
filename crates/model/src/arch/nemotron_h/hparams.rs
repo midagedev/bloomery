@@ -14,10 +14,8 @@ use gguf::Split;
 use super::names::{self, ATTN_NORM};
 use super::roles;
 pub use crate::arch::hybrid::Ssm;
-use crate::arch::hybrid::{
-    Attn, attn, layer_kinds, layers_agree, mamba_dims, no_nextn, rms_eps, ssm,
-};
-use crate::arch::{n_vocab, per_layer_count, positive};
+use crate::arch::hybrid::{Attn, attn, layer_kinds, layers_agree, mamba_dims, no_nextn, ssm};
+use crate::arch::{finite_positive, n_vocab, per_layer_count, positive};
 use crate::placement::PlacementError;
 
 /// What a layer is, from the two per-layer arrays.
@@ -71,7 +69,7 @@ impl Hparams {
         no_nextn(split)?;
         let n_embd = positive(split, "embedding_length")?;
         let n_ctx = positive(split, "context_length")?;
-        let rms_eps = rms_eps(split)?;
+        let rms_eps = finite_positive(split, "attention.layer_norm_rms_epsilon")?;
         let attn = attn(split)?;
         let ssm = ssm(split)?;
         let n_vocab = n_vocab(split)?;
@@ -112,30 +110,13 @@ impl Hparams {
             |kind| vec![roles::stems_of(kind)],
             &[Kind::Mamba, Kind::Attention, Kind::Mlp],
         )?;
-        hp.dims_agree(split)?;
+        crate::arch::hybrid::dims_agree(
+            split,
+            hp.n_embd,
+            hp.n_vocab,
+            hp.kinds.iter().enumerate().map(|(l, &k)| hp.want(l, k)),
+        )?;
         Ok(hp)
-    }
-
-    /// The tensors whose dims the keys name hold exactly those dims. A
-    /// tensor the file does not carry is skipped: [`Self::tensors_agree`]
-    /// already named it. The first tensor of other dims, by name.
-    fn dims_agree(&self, split: &Split) -> Result<(), PlacementError> {
-        let e = self.n_embd as u64;
-        let vocab = self.n_vocab as u64;
-        let mut want = vec![
-            (names::token_embd(), vec![e, vocab]),
-            (names::output(), vec![e, vocab]),
-            (names::output_norm(), vec![e]),
-        ];
-        for (l, &kind) in self.kinds.iter().enumerate() {
-            want.extend(
-                self.want(l, kind)
-                    .into_iter()
-                    .map(|(stem, dims)| (format!("blk.{l}.{stem}"), dims)),
-            );
-        }
-        want.retain(|(name, _)| split.find(name).is_some());
-        crate::arch::tensors_agree(split, want)
     }
 
     /// The dims the keys give layer `l` of `kind`, ggml order.

@@ -266,6 +266,19 @@ fn meta_f32(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
         .ok_or_else(|| metadata(split, suffix, "is absent or not a float"))
 }
 
+/// `<architecture>.<suffix>` as a finite positive float.
+pub(crate) fn finite_positive(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
+    let v = meta_f32(split, suffix)?;
+    if !v.is_finite() || v <= 0.0 {
+        return Err(metadata(
+            split,
+            suffix,
+            format!("is {v}, not a finite positive value"),
+        ));
+    }
+    Ok(v)
+}
+
 /// `<architecture>.<suffix>` as a string.
 fn meta_str<'a>(split: &'a Split, suffix: &str) -> Result<&'a str, PlacementError> {
     split

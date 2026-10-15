@@ -2,7 +2,7 @@
 //! are the common ones, a Mamba-2 or attention layer's the hybrid trunk's,
 //! and a layer's names are `blk.{l}.{stem}`.
 
-use crate::arch::names::{blk, routed_stacks};
+use crate::arch::names::blk;
 
 pub use crate::arch::hybrid::{
     ATTN_K, ATTN_NORM, ATTN_OUTPUT, ATTN_Q, ATTN_V, SSM_A, SSM_CONV, SSM_CONV_BIAS, SSM_D,
@@ -34,37 +34,8 @@ pub const FFN_UP_SHEXP: &str = "ffn_up_shexp.weight";
 /// The shared expert's down projection.
 pub const FFN_DOWN_SHEXP: &str = "ffn_down_shexp.weight";
 
-/// `blk.{l}.ffn_up_exps.weight`, the common spelling of a routed up stack.
-#[must_use]
-pub fn ffn_up_exps(l: usize) -> String {
-    let [_, up, _] = routed_stacks(l);
-    up
-}
-
-/// `blk.{l}.ffn_down_exps.weight`, the common spelling of a routed down
-/// stack.
-#[must_use]
-pub fn ffn_down_exps(l: usize) -> String {
-    let [_, _, down] = routed_stacks(l);
-    down
-}
-
 /// `blk.{l}.ffn_gate_inp.weight`.
 #[must_use]
 pub fn ffn_gate_inp(l: usize) -> String {
     blk(l, FFN_GATE_INP)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{FFN_DOWN_EXPS, FFN_UP_EXPS, ffn_down_exps, ffn_up_exps};
-    use crate::arch::names::blk;
-
-    /// The stacks' functions spell the stems this family's role table holds.
-    /// Mutant: up and down swapped in either function.
-    #[test]
-    fn the_stack_names_are_the_tables_stems() {
-        assert_eq!(ffn_up_exps(7), blk(7, FFN_UP_EXPS));
-        assert_eq!(ffn_down_exps(7), blk(7, FFN_DOWN_EXPS));
-    }
 }

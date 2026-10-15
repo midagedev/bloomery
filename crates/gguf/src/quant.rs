@@ -979,7 +979,7 @@ fn dequant_mxfp4(src: &[u8], dst: &mut [f32]) {
 /// # Errors
 ///
 /// Why the byte is no scale.
-pub fn ue4m3_to_f32_half(byte: u8) -> Result<f32, &'static str> {
+fn ue4m3_to_f32_half(byte: u8) -> Result<f32, &'static str> {
     if byte & 0x80 != 0 {
         return Err("bit 7 set: UE4M3 has no sign bit");
     }
@@ -1878,8 +1878,8 @@ mod tests {
     /// One NVFP4 block built by hand: scales 1, 2, 2^-9 and 448 (bytes 0x38,
     /// 0x40, 0x01, 0x7E), every code byte 0x71 (low nibble code 1 = 0.5, high
     /// nibble code 7 = 6). Each sub-block is eight 0.5s then eight 6s at its
-    /// scale. A swapped nibble order, a sub-block read at another stride or a
-    /// scale not halved against the doubled code table fails it.
+    /// scale. A swapped nibble order or a scale not halved against the
+    /// doubled code table fails it.
     #[test]
     fn nvfp4_decodes_a_hand_built_block() {
         let mut src = vec![0x38, 0x40, 0x01, 0x7E];
@@ -1897,18 +1897,19 @@ mod tests {
 
     /// NVFP4 over its defined domain: 32 blocks whose 128 sub-block scales
     /// run through every defined byte 0x00..=0x7E, each sub-block holding
-    /// every code once (low nibble j, high nibble 15 − j), decode to
-    /// `e2m1(code) · ue4m3(scale)` computed in f64 from the formats'
-    /// definitions. Every such product is an f32, so the comparison is on
-    /// bits.
+    /// every code once (low nibble j + sub, high nibble 15 − j + sub, mod 16,
+    /// so the four sub-blocks' bytes differ and a sub-block read at another
+    /// offset fails), decode to `e2m1(code) · ue4m3(scale)` computed in f64
+    /// from the formats' definitions. Every such product is an f32, so the
+    /// comparison is on bits.
     #[test]
     fn nvfp4_decodes_every_defined_scale_and_code() {
         let scales: Vec<u8> = (0..128u8).map(|i| i % 127).collect();
         let mut src = Vec::with_capacity(32 * 36);
         for d in scales.chunks(4) {
             src.extend_from_slice(d);
-            for _ in 0..4 {
-                src.extend((0..8u8).map(|j| j | ((15 - j) << 4)));
+            for sub in 0..4u8 {
+                src.extend((0..8u8).map(|j| ((j + sub) & 15) | (((15 - j + sub) & 15) << 4)));
             }
         }
         let mut dst = vec![0.0f32; 32 * 64];
@@ -1916,7 +1917,8 @@ mod tests {
         for (s, out) in dst.as_chunks::<16>().0.iter().enumerate() {
             let scale = ue4m3(scales[s]);
             for (i, &got) in out.iter().enumerate() {
-                let code = if i < 8 { i } else { 15 - (i - 8) } as u8;
+                let base = if i < 8 { i } else { 15 - (i - 8) };
+                let code = ((base + s % 4) & 15) as u8;
                 let want = (e2m1(code) * scale) as f32;
                 assert_eq!(
                     got.to_bits(),

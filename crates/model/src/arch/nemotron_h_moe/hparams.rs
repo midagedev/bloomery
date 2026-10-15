@@ -23,11 +23,9 @@ use super::names::{
 };
 use super::roles;
 pub use crate::arch::hybrid::Ssm;
-use crate::arch::hybrid::{
-    Attn, attn, layer_kinds, layers_agree, mamba_dims, no_nextn, rms_eps, ssm,
-};
+use crate::arch::hybrid::{Attn, attn, layer_kinds, layers_agree, mamba_dims, no_nextn, ssm};
 use crate::arch::{
-    meta_bool, meta_f32, metadata, n_vocab, one_expert_group, per_layer_count, positive,
+    finite_positive, meta_bool, metadata, n_vocab, one_expert_group, per_layer_count, positive,
     sigmoid_gating, unread_keys_of,
 };
 use crate::placement::PlacementError;
@@ -81,10 +79,6 @@ pub struct Hparams {
     pub n_vocab: usize,
     /// `attention.layer_norm_rms_epsilon`.
     pub rms_eps: f32,
-    /// `attention.layer_norm_epsilon`: the loader requires it for a
-    /// next-token head's final norm (nemotron-h.cpp:18), which this reader
-    /// does not run. Read and checked, not used.
-    pub norm_eps: f32,
     /// `attention.head_count`.
     pub n_head: usize,
     /// `attention.key_length`.
@@ -95,9 +89,6 @@ pub struct Hparams {
     pub ssm: Ssm,
     /// `attention.head_count_kv`, per layer. 0 on a Mamba-2 or MoE layer.
     pub kv: Vec<usize>,
-    /// `feed_forward_length`, per layer: the kind marker, 0 on a Mamba-2 or
-    /// attention layer.
-    pub ff: Vec<usize>,
     /// Every layer's kind, in order.
     pub kinds: Vec<Kind>,
     /// `expert_count`: the largest MoE layer's expert count.
@@ -167,8 +158,8 @@ impl Hparams {
         no_nextn(split)?;
         let n_embd = positive(split, "embedding_length")?;
         let n_ctx = positive(split, "context_length")?;
-        let rms_eps = rms_eps(split)?;
-        let norm_eps = finite_positive(split, "attention.layer_norm_epsilon")?;
+        let rms_eps = finite_positive(split, "attention.layer_norm_rms_epsilon")?;
+        finite_positive(split, "attention.layer_norm_epsilon")?;
         let attn = attn(split)?;
         let ssm = ssm(split)?;
         let n_vocab = n_vocab(split)?;
@@ -242,13 +233,11 @@ impl Hparams {
             n_ctx,
             n_vocab,
             rms_eps,
-            norm_eps,
             n_head: attn.n_head,
             key_len: attn.key_len,
             value_len: attn.value_len,
             ssm,
             kv,
-            ff,
             kinds,
             n_expert,
             experts,
@@ -258,7 +247,12 @@ impl Hparams {
             weights_scale,
             defaults,
         };
-        hp.dims_agree(split)?;
+        crate::arch::hybrid::dims_agree(
+            split,
+            hp.n_embd,
+            hp.n_vocab,
+            hp.kinds.iter().enumerate().map(|(l, &k)| hp.want(l, k)),
+        )?;
         hp.scales_agree(split)?;
         Ok(hp)
     }
@@ -281,28 +275,6 @@ impl Hparams {
             key_len: self.key_len,
             value_len: self.value_len,
         }
-    }
-
-    /// The tensors whose dims the keys name hold exactly those dims. A
-    /// tensor the file does not carry is skipped: `layers_agree` already
-    /// named a required one. Every tensor of other dims, the first by name.
-    fn dims_agree(&self, split: &Split) -> Result<(), PlacementError> {
-        let e = self.n_embd as u64;
-        let vocab = self.n_vocab as u64;
-        let mut want = vec![
-            (names::token_embd(), vec![e, vocab]),
-            (names::output(), vec![e, vocab]),
-            (names::output_norm(), vec![e]),
-        ];
-        for (l, &kind) in self.kinds.iter().enumerate() {
-            want.extend(
-                self.want(l, kind)
-                    .into_iter()
-                    .map(|(stem, dims)| (format!("blk.{l}.{stem}"), dims)),
-            );
-        }
-        want.retain(|(name, _)| split.find(name).is_some());
-        crate::arch::tensors_agree(split, want)
     }
 
     /// The dims the keys give layer `l` of `kind`, ggml order.
@@ -357,19 +329,6 @@ impl Hparams {
         }
         Ok(())
     }
-}
-
-/// `<architecture>.<suffix>` as a finite positive float.
-fn finite_positive(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
-    let v = meta_f32(split, suffix)?;
-    if !v.is_finite() || v <= 0.0 {
-        return Err(metadata(
-            split,
-            suffix,
-            format!("is {v}, not a finite positive value"),
-        ));
-    }
-    Ok(v)
 }
 
 /// Layer `l`'s entries of the two routed arrays agree with its kind: both

@@ -2490,7 +2490,7 @@ gate-nemotron-meta:
 # router's, routed arrays off their layer's kind, expert_count not the largest router's, a MoE key missing or of a
 # value the description cannot hold, a projection scale that is not one f32) and the coverage items of a latent MoE
 # layer, then the reader's description of the 24GB GGUF at the box's path
-# (BLOOMERY_BOX_ENV='BLOOMERY_MODEL=<path>' names another). Headers only, seconds.
+# (the test reads one fixed path). Headers only, seconds.
 gate-nemotron-h-moe-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::nemotron_h_moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test nemotron_h_moe_meta -- --ignored --nocapture'
 

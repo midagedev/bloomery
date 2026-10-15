@@ -11,7 +11,7 @@ use models::{Act, Ffn, Gqa, Mamba2, Rope, RopeMode, ToolFormat};
 
 use crate::arch::names::{output, output_norm, token_embd};
 use crate::arch::stems::{Stem, opt, req, required};
-use crate::arch::{meta_f32, meta_usize, metadata, mul, optional_usize, positive, spec_u32};
+use crate::arch::{meta_usize, metadata, mul, optional_usize, positive, spec_u32};
 use crate::placement::{PlacementError, Role};
 
 // ------------------------------------------------------------------ names
@@ -141,19 +141,31 @@ impl Attn {
     }
 }
 
-/// `attention.layer_norm_rms_epsilon`: every block norm's, a finite positive
-/// value.
-pub(in crate::arch) fn rms_eps(split: &Split) -> Result<f32, PlacementError> {
-    let key = "attention.layer_norm_rms_epsilon";
-    let eps = meta_f32(split, key)?;
-    if !eps.is_finite() || eps <= 0.0 {
-        return Err(metadata(
-            split,
-            key,
-            format!("is {eps}, not a finite positive epsilon"),
-        ));
+/// The tensors whose dims the keys name hold exactly those dims: the three
+/// model-level tensors and each layer's `layers` entries, ggml order. A
+/// tensor the file does not carry is skipped: `layers_agree` already named a
+/// required one. Every tensor of other dims, the first by name.
+pub(in crate::arch) fn dims_agree(
+    split: &Split,
+    hidden: usize,
+    vocab: usize,
+    layers: impl Iterator<Item = Vec<(&'static str, Vec<u64>)>>,
+) -> Result<(), PlacementError> {
+    let (e, v) = (hidden as u64, vocab as u64);
+    let mut want = vec![
+        (token_embd(), vec![e, v]),
+        (output(), vec![e, v]),
+        (output_norm(), vec![e]),
+    ];
+    for (l, layer) in layers.enumerate() {
+        want.extend(
+            layer
+                .into_iter()
+                .map(|(stem, dims)| (format!("blk.{l}.{stem}"), dims)),
+        );
     }
-    Ok(eps)
+    want.retain(|(name, _)| split.find(name).is_some());
+    super::tensors_agree(split, want)
 }
 
 /// `attention.head_count`, `.key_length` and `.value_length`, and
