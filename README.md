@@ -61,7 +61,7 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 
 ### Known issues and limits (0.3.3)
 
-- **The Qwen3.6 real-tier e2e gate's `split` residency clause can fail on one run and pass on the next at the same commit** (logits distance from the off run up to 4.879e-1 against its 0.26 band, then 1.6–1.8e-1 on a rerun). The experts it streams follow the lane rate measured at runtime, so the clause's distance moves from run to run. This is a developer gate, not a change in what a load serves.
+- **The Qwen3.6 real-tier e2e gate's `split` residency clause can fail on one run and pass on the next at the same commit** (on an RTX 3090, logits distance from the off run up to 4.879e-1 against its 0.26 band, then 1.6–1.8e-1 on a rerun). The experts it streams follow the lane rate measured at runtime, so the clause's distance moves from run to run. This is a developer gate, not a change in what a load serves.
 - **On Qwen3.8 loads that page experts through the NVMe tier, `gate-gpu-qwen38-serve`'s real tier was 70/72 on 0.3.2's
   baseline (`f382b474`), with two preexisting paged failures.** It was not re-run for this note; the 0.3.3 release pass
   re-checks it. A default load keeps the draft off.
