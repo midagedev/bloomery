@@ -30,8 +30,9 @@
 # two tracks never wait on each other's dirs. A second run builds incrementally: the BASE side costs a sync and the scans
 # (no scan is cached; they run again), the HEAD side the crates the change touched. A pair belongs to this recipe alone,
 # and one run uses it at a time: a lock under ~/.cache/bloomery named by the pair, an fcntl flock on a file
-# held for the whole scan (python3's fcntl: the Mac has no flock(1)). Each launch closes that fd, so a child
-# does not keep the lock after this process exits. While the flock is held this run also creates that directory
+# held for the whole scan (python3's fcntl: the Mac has no flock(1)). Each launch closes that fd before it
+# opens a FIFO, so a child blocked on the open does not keep the lock after this process exits. While the
+# flock is held this run also creates that directory
 # and writes its pid, so an older copy's mkdir of the same path fails. A directory whose pid is live, or not
 # written yet, is refused and not deleted. A dead directory is removed only while this flock is already held,
 # and this run removes its own directory when it drops the flock. A second run waits up to NARROW_WAIT
@@ -322,17 +323,19 @@ run_side() {
   fifo=$out/$name.build.fifo
   rm -f "$fifo" 9>&-
   mkfifo "$fifo" 9>&- || die 70 "cannot make $fifo"
-  # fd 9 is the flock. A child that inherits it holds the lock after this process exits.
-  tee "$out/$name.build.log" < "$fifo" >&2 9>&- &
+  # fd 9 is the flock. Close it before opening the FIFO: a child blocked on that open keeps the lock
+  # after this process exits.
+  tee "$out/$name.build.log" 9>&- < "$fifo" >&2 &
   tp=$!
   # git must not find this tree's repository above the archive (box.sh stamps its HEAD into the build as the commit). Job control
   # makes the subshell the leader of a process group of its own, so a stop reaches box.sh's ssh and rsync with the one pid.
+  # The close is on the subshell, before its redirect opens the FIFO.
   set -m
   (
     cd "$src" && exec env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER \
       -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S GIT_CEILING_DIRECTORIES="$out" BLOOMERY_REMOTE="$dir" \
-      ./tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out" 9>&-
-  ) > "$fifo" &
+      ./tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out"
+  ) 9>&- > "$fifo" &
   bp=$!
   set +m
   ACTIVE_PIDF=$out/$name.box.pid
@@ -540,11 +543,52 @@ self_test() {
   kill -TERM "$sp" 2> /dev/null || true
   wait "$sp" 2> /dev/null || true
   # The strings sit in this function, so the check reads the script with this function removed.
+  # A child blocked opening a FIFO keeps fd 9 when the close comes after that open. These launches
+  # are the script's own lines: the holder is killed while the child waits, and the lock is free.
   body=$(awk '/^self_test\(\)/{skip=1} skip && /^}$/{skip=0; next} !skip' "$0")
+  fifo_blocked() {
+    local label=$1 launch=$2 hp k kid rc
+    rm -rf "$t/lock.d" "$t/lock.d.flock"
+    rm -f "$t/side.fifo" "$t/side.build.log"
+    mkfifo "$t/side.fifo"
+    export -f lock_take
+    bash -c 'lock_take "$1" 0 "fifo" >/dev/null 2>&1 || exit 1
+      out=$2 name=side fifo=$3
+      eval "$4"
+      exec sleep 30' _ "$t/lock.d" "$t" "$t/side.fifo" "$launch" &
+    hp=$!
+    kid='' k=0
+    while [ "$k" -lt 50 ]; do
+      kid=$(ps -o pid= --ppid "$hp" 2> /dev/null | head -n 1 | tr -d ' ' || true)
+      [ -n "$kid" ] && break
+      kill -0 "$hp" 2> /dev/null || break
+      sleep 0.05
+      k=$((k + 1))
+    done
+    kill -TERM "$hp" 2> /dev/null || true
+    wait "$hp" 2> /dev/null || true
+    rc=1
+    if [ -n "$kid" ]; then
+      lock_take "$t/lock.d" 0 "after the blocked child" >/dev/null 2>&1
+      rc=$?
+      kill -TERM "$kid" 2> /dev/null || true
+      wait "$kid" 2> /dev/null || true
+    fi
+    lock_release
+    rm -f "$t/side.fifo" "$t/side.build.log"
+    [ "$rc" = 0 ]
+    ok "$label" $?
+  }
+  tee_line=$(grep -F 'tee "$out/$name.build.log"' <<< "$body" | head -n 1)
+  tee_line=${tee_line#"${tee_line%%[![:space:]]*}"}
+  fifo_blocked "lock: a logger blocked on the FIFO does not keep the flock after the holder exits" "$tee_line"
+  wline=$(grep -F '> "$fifo" &' <<< "$body" | head -n 1)
+  fifo_blocked "lock: a writer blocked on the FIFO does not keep the flock after the holder exits" "( : )${wline#*\)}"
   miss=0
   for site in \
-    'tee "$out/$name.build.log" < "$fifo" >&2 9>&- &' \
-    './tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out" 9>&-' \
+    'tee "$out/$name.build.log" 9>&- < "$fifo" >&2 &' \
+    './tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out"' \
+    ') 9>&- > "$fifo" &' \
     '"$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 9>&- &' \
     '{ git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"; } 9>&-' \
     'split_logs "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&-' \
