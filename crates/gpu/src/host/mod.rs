@@ -3234,7 +3234,9 @@ mod tests {
             assert_eq!(source.to_string(), text);
             assert_eq!(
                 error.to_string(),
-                format!("{text}; Hybrid::serve release: the stage end left its done counter waiting")
+                format!(
+                    "{text}; Hybrid::serve release: the stage end left its done counter waiting"
+                )
             );
         }
     }
