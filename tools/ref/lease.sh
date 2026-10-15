@@ -1247,6 +1247,31 @@ EOF
     lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-capture-rc "$RC" 3
     check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
+    mkdir -p "$t/expert-tree/tools/ref"
+    cp "$LEASE_TREE/tools/ref/expert-union-dump.sh" "$t/expert-tree/tools/ref/"
+    printf '%s\n' 'MODEL=unused' 'REF_PROMPTS=$STUB_EXPERT_PROMPTS' > "$t/expert-tree/tools/ref/ref-paths.sh"
+    printf '%s\n' 'DECODE_BIN=$STUB_EXPERT_BIN' 'LEASE_ARM_BOUND=10' \
+      'lease_take() { :; }' 'lease_bounded() { shift; "$@"; }' > "$t/expert-tree/tools/ref/lease.sh"
+    cat > "$t/expert-bin" << 'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --tokens ]; then tokens=$2; break; fi
+  shift
+done
+echo "$tokens" >> "$STUB_EXPERT_CALLS"
+[ "$tokens" != 2 ] || exit 3
+echo 'generated 7'
+EOF
+    chmod +x "$t/expert-bin"
+    printf 'first\tstub\t1\nsecond\tstub\t2\nthird\tstub\t3\n' > "$t/expert-prompts"
+    RC=0
+    lease_bounded 10 env STUB_EXPERT_BIN="$t/expert-bin" STUB_EXPERT_PROMPTS="$t/expert-prompts" \
+      STUB_EXPERT_CALLS="$t/expert-calls" bash "$t/expert-tree/tools/ref/expert-union-dump.sh" \
+      "$t/expert-out" > "$t/expert-log" 2>&1 || RC=$?
+    check expert-dump-failed-prompt-rc "$RC" 1
+    check expert-dump-stops-at-failure "$(cat "$t/expert-calls")" "$(printf '1\n2')"
+    check expert-dump-first-collected "$(cat "$t/expert-out/first.gen")" 'generated 7'
+    matches expert-dump-names-failure '^prompt second failed$' "$(cat "$t/expert-log")"
     check bounded-stdin "$(printf 'stdin reaches it\n' | lease_bounded 10 cat 2>&1)" 'stdin reaches it'
   else
     echo "skip lease_bounded: no flock(1) and no tools/ref/card-tests/bin/flock stand-in"
