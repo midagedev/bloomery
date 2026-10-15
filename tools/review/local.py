@@ -210,10 +210,10 @@ def build_ctx(ctx, base_tree, base_sha, head, args, say):
     return meta
 
 
-def device_dirs(base_tree, out, base_sha=None):
+def device_dirs(base_tree, out, base_sha):
     """post.py device, copied from the cache for this base sha when that file is already there."""
-    cache = base_sha and os.path.expanduser(f"~/.cache/bloomery-review/device-{base_sha}")
-    if cache and os.path.isfile(cache):
+    cache = os.path.expanduser(f"~/.cache/bloomery-review/device-{base_sha}")
+    if os.path.isfile(cache):
         shutil.copy(cache, out)
         return
     # No toolchain override: rustup reads rust-toolchain.toml. install.sh installs only that channel, not stable.
@@ -221,11 +221,10 @@ def device_dirs(base_tree, out, base_sha=None):
                         "--out", out], capture_output=True, text=True)
     if p.returncode:
         raise Stop(70, f"pre-review: post.py device failed: {p.stderr.strip()[:200]}")
-    if cache:
-        os.makedirs(os.path.dirname(cache), exist_ok=True)
-        tmp = f"{cache}.{os.getpid()}"
-        shutil.copy(out, tmp)
-        os.replace(tmp, cache)
+    os.makedirs(os.path.dirname(cache), exist_ok=True)
+    tmp = f"{cache}.{os.getpid()}"
+    shutil.copy(out, tmp)
+    os.replace(tmp, cache)
 
 
 def review_slot():
@@ -755,7 +754,7 @@ def self_test():
         saved = {k: g[k] for k in ("gh_json", "device_dirs", "read_ledger")}
         # no network and no cargo here: gh answers nothing, the device list and the ledger are fixed
         g["gh_json"] = lambda *a: None
-        g["device_dirs"] = lambda base_tree, out, base_sha=None: open(out, "w").write("crates/gpu\n")
+        g["device_dirs"] = lambda base_tree, out, base_sha: open(out, "w").write("crates/gpu\n")
         def fake_ledger(base_tree, out):
             open(out, "w").close()
             return "v0"
@@ -850,7 +849,7 @@ def self_test():
             wrapper = (f"import shutil, sys\nsys.path.insert(0, {HERE!r})\nimport local as L\nreal = shutil.which\n"
                        "shutil.which = lambda n, *a: '/x' if n == 'claude' else real(n, *a)\n"
                        "L.claude_ok = lambda: None\n"
-                       "L.gh_json = lambda *a: None\nL.device_dirs = lambda b, o, s=None: open(o, 'w').write('crates/gpu\\n')\n"
+                       "L.gh_json = lambda *a: None\nL.device_dirs = lambda b, o, s: open(o, 'w').write('crates/gpu\\n')\n"
                        "L.read_ledger = lambda b, o: (open(o, 'w').close(), 'v0')[1]\n"
                        "sys.exit(L.main(['--base', 'basebr', '--minutes', '5']))\n")
             proc = subprocess.Popen([sys.executable, "-c", wrapper], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
