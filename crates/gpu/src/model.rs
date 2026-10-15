@@ -1929,11 +1929,7 @@ pub fn refuse_scratch_past(
         .get(card)
         .map(|c| c.scratch_bytes)
         .ok_or_else(|| GpuError::shape(what, format!("the plan has no card {card}")))?;
-    let rows = plan
-        .cards
-        .get(card)
-        .map(|c| c.stage_rows_bytes)
-        .ok_or_else(|| GpuError::shape(what, format!("the plan totals no card {card}")))?;
+    let rows = stage_rows(what, plan, card)?;
     let term = term + rows;
     if made as u64 > term {
         return Err(GpuError::shape(
@@ -1945,6 +1941,38 @@ pub fn refuse_scratch_past(
         ));
     }
     Ok(())
+}
+
+/// Refused by name, as `what`'s, when the stage's position rows the load
+/// made, `made` device bytes, pass what card `card` of `plan` counts for them
+/// (`CardTotals::stage_rows_bytes`, the rope tables at the context): the check
+/// of a body whose scratch the plan holds by a term of its own rather than
+/// through [`refuse_scratch_past`].
+pub fn refuse_stage_rows_past(
+    what: &'static str,
+    plan: &Plan<'_>,
+    card: usize,
+    made: u64,
+) -> Result<(), GpuError> {
+    let rows = stage_rows(what, plan, card)?;
+    if made > rows {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the stage's position rows hold {made} device bytes; card {card}'s plan counts \
+                 {rows} for them"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The stage's position rows card `card` of `plan` counts.
+fn stage_rows(what: &'static str, plan: &Plan<'_>, card: usize) -> Result<u64, GpuError> {
+    plan.cards
+        .get(card)
+        .map(|c| c.stage_rows_bytes)
+        .ok_or_else(|| GpuError::shape(what, format!("the plan totals no card {card}")))
 }
 
 /// The placed load after its body, which took `built`: the output head the

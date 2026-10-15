@@ -166,12 +166,14 @@ const DRAFT_KV_ROW: u64 = 2048;
 const DRAFT_MAP: u64 = 993_280;
 const LIST_ROWS: u32 = 40_960;
 // The largest context each card holds with the draft (full head), as predicted [derived: the plan
-// test's CARD_MAX_CTX budget less 2,785,017,856 B of draft granules, over 28,416 + 2,048 B a
-// position plus the draft program's arena, whose dense flash partials grow 198,144 B a 64-key
-// segment (3,096 B a position) — the same budget over 33,560 B a position, its 4.86 MB of fixed
-// rows beside the granules; the last pool counted whole]. Printed beside the boundary the test
-// finds; the clause holds the plan to that boundary.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_194_276), ("3090", 431_309)];
+// test's room after its fixed terms, less the draft granules 2,785,017,856 B, the map 993,280 B
+// and the arena 53,526,700 B, over 30,720 B a position — the cache's 28,416, the draft store's
+// 2,048 and the stage rope table's 256 — the last pool counted whole, then one fewer]. Printed
+// beside the boundary the test finds; the clause holds the plan to that boundary.
+// PIN(2026-10-15): the arena stays one fixed addend (mtp_arena_bytes at vocab 248,320). Room
+// 37,251,097,876 (A6000) and 11,649,066,260 (3090) over 30,720 is 1,212,600 and 379,201; the pin
+// is one fewer.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_212_599), ("3090", 379_200)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -365,6 +367,7 @@ fn hw_qwen4exp_mtp_plan() {
                 .sum::<u64>()
                 + ctx * DRAFT_KV_ROW
                 + model::arch::qwen35moe::place::mtp_arena_bytes(u64::from(full.draft.vocab))
+                + model::placement::KvBytes::stage_position_bytes(&inputs.kv, ctx)
         };
         let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);
         while lo < hi {

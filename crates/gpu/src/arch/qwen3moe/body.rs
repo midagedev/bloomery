@@ -31,6 +31,7 @@ use crate::host::swap_source::ResidencyGlue;
 use crate::linear::LinearKernels;
 use crate::model::{
     ChainBody, GpuModel, Instrumented, Rollback, RowHeads, SlotRange, SlotRows, Slots, block_count,
+    refuse_stage_rows_past,
 };
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
@@ -937,11 +938,13 @@ impl Body {
             .map(|_| KvPlanes::new(stream, &dims, kv))
             .collect::<Result<Vec<_>, _>>()?;
         let k = Kernels::load(gpu, needs_site_kernels(w, &plans, placed.is_some()))?;
-        let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
+        let table = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
+        let rope = RopeRows::new(stream, &table, HEAD, dims.ctx)?;
         let forms = Forms::of(&plans, &dims);
         let (ub, placed) = match placed {
             None => (Ubatch::new(stream, dims, ubatch, Q32::of(&plans))?, None),
             Some((open, counted)) => {
+                refuse_stage_rows_past(what, open.plan, 0, rope.bytes())?;
                 let side = placed_bytes(&dims, plans.len(), open.rows)?;
                 let arena = counted_arena(stream, (dims, forms), ubatch, counted, side)?;
                 let ub = Ubatch::placed(stream, arena, ubatch)?;
@@ -951,7 +954,7 @@ impl Body {
         Ok(Body {
             prefill: Prefill::new(stream, dims, forms)?,
             ub,
-            rope: RopeRows::new(stream, &rope, HEAD, dims.ctx)?,
+            rope,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream, false)?,
             slot_in: SlotIn::new(stream)?,

@@ -23,7 +23,7 @@ use crate::placement::{
     self, Card, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation,
     checked, joined,
 };
-use runtime::stores::{kv_q8_row_bytes, kv_row_bytes};
+use runtime::stores::{F32_BYTES, kv_q8_row_bytes, kv_row_bytes};
 
 /// The qwen3moe program, whose card experts read the routed stacks
 /// ([`routed_rule`] of it): by part, a gate and an up
@@ -61,6 +61,9 @@ pub struct KvLayout {
     kv_heads: usize,
     head_dim: usize,
     q8: bool,
+    /// The stage rope table, in bytes a position: `rope.dimension_count` f32.
+    /// The body copies one table at load, not one per sequence.
+    rope_row: u64,
 }
 
 impl KvLayout {
@@ -72,6 +75,7 @@ impl KvLayout {
             kv_heads: hp.n_head_kv,
             head_dim: hp.head_dim,
             q8: false,
+            rope_row: hp.rope.dims as u64 * F32_BYTES,
         }
     }
 
@@ -95,6 +99,10 @@ impl KvBytes for KvLayout {
         } else {
             0
         }
+    }
+
+    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        self.rope_row * ctx_max
     }
 }
 
@@ -182,5 +190,46 @@ impl PlanInputs {
             routed_rule(PROGRAM),
         )?;
         checked(plan).map_err(PlaceError::Broken)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::hparams::{Experts, Hparams, Rope, RopeMode, Score};
+    use super::{KvBytes, KvLayout};
+
+    /// `rope.dimension_count` f32 a position, through [`KvLayout::of`]. The
+    /// q8 cache keeps the same table. A count of no row, or of half a row,
+    /// is not the table the body copies.
+    #[test]
+    fn the_stage_rope_row_is_the_width_the_body_copies() {
+        let kv = layout(128);
+        assert_eq!(kv.stage_position_bytes(10), 128 * 4 * 10);
+        assert_eq!(kv.in_q8().stage_position_bytes(10), 128 * 4 * 10);
+    }
+
+    fn layout(head_dim: usize) -> KvLayout {
+        KvLayout::of(&Hparams {
+            n_layer: 1,
+            n_embd: head_dim,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim,
+            rope: Rope {
+                mode: RopeMode::Neox,
+                base: 1e6,
+                dims: head_dim,
+            },
+            rms_eps: 1e-6,
+            n_vocab: 2,
+            n_ctx_train: head_dim,
+            experts: Experts {
+                n_expert: 1,
+                n_used: 1,
+                ff: 1,
+                score: Score::Softmax,
+                weights_norm: true,
+            },
+        })
     }
 }

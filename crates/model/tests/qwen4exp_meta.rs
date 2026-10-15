@@ -177,16 +177,19 @@ const HOST_TABLES: u64 = 28_800_138_240;
 // PIN(2026-09-28): KV_AT and CARD_MAX_CTX past the verify's delta lanes [derived: each GDN layer's
 // state keeps runtime::stores::DELTA_LANES = 4 lanes with a u32 stamp each, 3 · 3,145,728 + 16 =
 // 9,437,200 B past the one lane, 339,739,200 B over the 36 layers; KV_AT was 246,554,624 and
-// 1,061,298,176, CARD_MAX_CTX 1,520,312 and 619,339, each now 339,739,200 / 28,416 = 11,955.9
+// 1,061,298,176, CARD_MAX_CTX 1,520,312 and 619,339, each then 339,739,200 / 28,416 = 11,955.9
 // positions lower, rounded to 11,956 (one fewer when the old boundary's slack passed 26,000 B)].
 const KV_AT: [(u64, u64); 2] = [(4096, 586_293_824), (32_768, 1_401_037_376)];
 // The largest context each card holds, as predicted [derived: (usable − margin − the dense
-// granules − context − scratch − 469,901,888 B of recurrent bytes) over 28,416 B a position, the
-// last pool counted whole]. Printed beside the boundary the test finds from the plan's own totals;
-// the clause holds the placement to that boundary, not to this figure. PIN(2026-09-28): the
-// scratch counts the ubatch walk's at U = 4,096 [derived: CARD_SCRATCH's 4,096 row − 64 MiB =
-// 2,770,817,024 B over 28,416 B a position, 97,509.05 positions, rounded up to 97,510].
-const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_410_846), ("3090", 509_873)];
+// granules − context − scratch − 469,901,888 B of recurrent bytes) over 28,672 B a position —
+// the cache's 28,416 plus the stage rope table's 256 — the last pool counted whole, then one
+// fewer]. Printed beside the boundary the test finds from the plan's own totals; the clause
+// holds the placement to that boundary, not to this figure. PIN(2026-09-28): the scratch counts
+// the ubatch walk's at U = 4,096 [derived: CARD_SCRATCH's 4,096 row − 64 MiB = 2,770,817,024 B
+// over 28,416 B a position, 97,509.05 positions, rounded up to 97,510].
+// PIN(2026-10-15): the stage rope table joins the per-position term. Room 40,090,635,712 (A6000)
+// and 14,488,604,096 (3090) over 28,672 is 1,398,250 and 505,322; the pin is one fewer.
+const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_398_249), ("3090", 505_321)];
 // PIN(2026-09-28): the card's scratch, the m = 1 scratch and the ubatch walk's at 4,096
 // positions [derived: 64 MiB + place::ubatch_scratch_bytes(4096) = 67,108,864 + 4,096 ·
 // 668,277 + 32 MiB].
@@ -469,7 +472,12 @@ fn hw_qwen4exp_plan() {
         let fixed =
             c.dense_bytes + c.expert_bytes + c.rounding_bytes + c.scratch_bytes + c.context_bytes;
         let limit = at.usable_bytes(spec) - spec.margin_bytes;
-        let kv = |ctx: u64| -> u64 { (0..hp.n_layer).map(|l| inputs.kv.layer_bytes(l, ctx)).sum() };
+        let kv = |ctx: u64| -> u64 {
+            (0..hp.n_layer)
+                .map(|l| inputs.kv.layer_bytes(l, ctx))
+                .sum::<u64>()
+                + inputs.kv.stage_position_bytes(ctx)
+        };
         let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);
         while lo < hi {
             let mid = lo + (hi - lo).div_ceil(2);
@@ -848,7 +856,7 @@ fn hw_qwen4exp_card_plan() {
     use model::arch::models::headpick::HeadSet;
     use model::arch::qwen35moe::place::{self, Experts, MtpInputs, PlanInputs};
     use model::placement::workstation::{A6000, CONTEXT, MARGIN, RTX_3090};
-    use model::placement::{CardFormat, Device, Format, Plan, PlanLevers, Role};
+    use model::placement::{CardFormat, Device, Format, KvBytes, Plan, PlanLevers, Role};
 
     let mut o = String::new();
     let mut b: Vec<String> = Vec::new();
@@ -1005,11 +1013,15 @@ fn hw_qwen4exp_card_plan() {
     }
     for card in [A6000, RTX_3090] {
         let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
+        // PIN(2026-10-15): the floor holds the stage rope table, 64 f32 a position, 256 B at
+        // 4,096 positions (1,048,576 B), beside the cache.
+        let stage = inputs.kv.stage_position_bytes(KV_AT[0].0);
         let floor = CARD_DENSE
             + CARD_ROUNDING
             + KV_AT[0].1
             + CONTEXT
             + scratch_at(place::UBATCH_PLANNED)
+            + stage
             + MARGIN;
         let levers = PlanLevers {
             card_budget_bytes: Some(floor),
@@ -1270,7 +1282,7 @@ fn hw_qwen4exp_q3_card_plan() {
     use model::arch::qwen35moe::mtp::BorrowedHead;
     use model::arch::qwen35moe::place::{self, Experts, MtpInputs, PlanInputs};
     use model::placement::workstation::{A6000, CONTEXT, MARGIN, RTX_3090};
-    use model::placement::{CardFormat, Device, Format, Plan, PlanLevers, Role};
+    use model::placement::{CardFormat, Device, Format, KvBytes, Plan, PlanLevers, Role};
 
     let mut o = String::new();
     let mut b: Vec<String> = Vec::new();
@@ -1418,11 +1430,15 @@ fn hw_qwen4exp_q3_card_plan() {
     }
     for card in [A6000, RTX_3090] {
         let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
+        // PIN(2026-10-15): the floor holds the stage rope table, 64 f32 a position, 256 B at
+        // 4,096 positions (1,048,576 B), beside the cache.
+        let stage = inputs.kv.stage_position_bytes(KV_AT[0].0);
         let floor = CARD_DENSE_Q3
             + CARD_ROUNDING_Q3
             + KV_AT[0].1
             + CONTEXT
             + scratch_at(place::UBATCH_PLANNED)
+            + stage
             + MARGIN;
         let levers = PlanLevers {
             card_budget_bytes: Some(floor),

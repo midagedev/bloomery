@@ -64,8 +64,8 @@ use crate::placement::{
 };
 
 use runtime::stores::{
-    DELTA_LANES, delta_lane_bytes, dense_kv_bytes, kv_q8_row_bytes, kv_row_bytes, ple_ring_bytes,
-    recurrent_bytes, selecting_bytes,
+    DELTA_LANES, F32_BYTES, delta_lane_bytes, dense_kv_bytes, kv_q8_row_bytes, kv_row_bytes,
+    ple_ring_bytes, recurrent_bytes, selecting_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -794,12 +794,14 @@ impl PlanInputs {
         )?;
         let t = &plan.cards[0];
         // The draft's term is the reserve the expert rule spread within, so
-        // the bound and the budget count one number.
+        // the bound and the budget count one number. The stage rope rows are
+        // the target card's, beside the cache.
         let total = [
             t.dense_bytes,
             t.expert_bytes,
             t.rounding_bytes,
             t.kv_bytes,
+            t.stage_rows_bytes,
             t.scratch_bytes,
             t.context_bytes,
             reserve,
@@ -909,12 +911,14 @@ impl PlanInputs {
         plan.cards[0].grow_kv(rows);
         let t = &plan.cards[0];
         // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
-        // reserve the expert rule spread within.
+        // reserve the expert rule spread within, and the stage rope rows are
+        // the target card's.
         let total = [
             t.dense_bytes,
             t.expert_bytes,
             t.rounding_bytes,
             t.kv_bytes,
+            t.stage_rows_bytes,
             t.scratch_bytes,
             t.context_bytes,
             reserve,
@@ -1447,6 +1451,10 @@ pub struct KvLayout {
     select: Option<(usize, Vec<usize>)>,
     /// A plain attention layer's planes in q8_0's layout.
     q8: bool,
+    /// The stage rope table, in bytes a position: `rope.dimension_count`
+    /// f32. The body copies one table at load, not one per sequence. A media
+    /// sequence's own table is outside this count.
+    rope_row: u64,
 }
 
 impl KvLayout {
@@ -1486,6 +1494,7 @@ impl KvLayout {
             head_dim: hp.head_dim,
             select: exp.map(|e| (e.idx_dim, e.ratios.clone())),
             q8: false,
+            rope_row: hp.rope_dims as u64 * F32_BYTES,
         }
     }
 
@@ -1592,6 +1601,10 @@ impl KvBytes for KvLayout {
             None => 0,
         };
         own + ple
+    }
+
+    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        self.rope_row * ctx_max
     }
 }
 
@@ -2102,7 +2115,9 @@ fn draft_machine() -> Machine {
 }
 
 /// The MTP layer's store: every position's K and V
-/// (`runtime::stores::dense_kv_bytes`).
+/// (`runtime::stores::dense_kv_bytes`). The draft program reads the target's
+/// rope table and allocates none of its own, so the stage rows stay the
+/// trait's default.
 #[derive(Clone, Copy, Debug)]
 struct MtpKv {
     kv_heads: usize,
@@ -2141,6 +2156,7 @@ mod tests {
             head_dim: 256,
             select: Some((128, vec![0, 0, 4])),
             q8: false,
+            rope_row: 64 * 4,
         };
         assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200);
         assert_eq!(kv.layer_bytes(1, 4096), 3_596_288 + 9_437_200 + 696_320);
@@ -2177,6 +2193,7 @@ mod tests {
                 (0..48).map(|l| if l % 4 == 3 { 4 } else { 0 }).collect(),
             )),
             q8: false,
+            rope_row: 64 * 4,
         };
         let checkpoint = 36 * 3_596_288 + 696_320;
         assert_eq!(kv.state_bytes(0), 2 * checkpoint);
@@ -2227,6 +2244,7 @@ mod tests {
             head_dim: 256,
             select: None,
             q8: false,
+            rope_row: 64 * 4,
         };
         assert_eq!(layout(1).layer_bytes(0, 4096), one.0);
         assert_eq!(layout(8).layer_bytes(0, 4096), eight.0);
@@ -2250,6 +2268,7 @@ mod tests {
             head_dim: 128,
             select: None,
             q8: false,
+            rope_row: 128 * 4,
         };
         let f16 = plain.layer_bytes(0, 4096);
         let q8 = plain.in_q8().layer_bytes(0, 4096);
@@ -2265,9 +2284,55 @@ mod tests {
             head_dim: 256,
             select: Some((128, vec![4])),
             q8: false,
+            rope_row: 64 * 4,
         };
         let sel = selecting.layer_bytes(0, 4096);
         assert_eq!(selecting.in_q8().layer_bytes(0, 4096), sel);
+    }
+
+    /// The stage rope rows, through [`KvLayout::of`]: `rope.dimension_count`
+    /// f32 a position, not the head width. The q8 cache keeps the same table.
+    /// A count of no row, or of half a row, is not the table the body copies.
+    #[test]
+    fn the_stage_rope_row_is_rope_dims_not_the_head() {
+        let narrow = layout(64, 256);
+        assert_eq!(narrow.stage_position_bytes(8), 64 * 4 * 8);
+        assert_eq!(narrow.in_q8().stage_position_bytes(8), 64 * 4 * 8);
+        assert_eq!(layout(128, 256).stage_position_bytes(8), 128 * 4 * 8);
+    }
+
+    fn layout(rope_dims: usize, head_dim: usize) -> KvLayout {
+        use super::super::hparams::{FfnKind, Hparams, SectionOrder, Variant};
+        KvLayout::of(&Hparams {
+            variant: Variant::Qwen35Moe,
+            n_layer: 1,
+            n_trunk: 1,
+            n_embd: head_dim,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim,
+            rope_dims,
+            rope_sections: [0, 0, 0, 0],
+            rope_order: SectionOrder::Tyxz,
+            rope_base: 1e7,
+            rms_eps: 1e-6,
+            n_vocab: 2,
+            n_ctx_train: 8,
+            n_expert: 0,
+            n_used: 0,
+            expert_ff: 0,
+            shared_ff: None,
+            ff: None,
+            conv: 4,
+            state: 1,
+            v_heads: 1,
+            k_heads: 1,
+            interval: 1,
+            kinds: vec![Kind::Attention],
+            ffns: vec![FfnKind::Dense],
+            exp: None,
+            defaults: Vec::new(),
+        })
     }
 
     /// The card rule over Qwen3.8's routed stacks ([`super::routed_rule`]) on
@@ -3061,6 +3126,11 @@ mod tests {
             fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
                 self.kv.shadow_bytes(layer, ctx_max) * self.slots
             }
+
+            /// One copy for every slot: the slots read one stage's rows.
+            fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+                self.kv.stage_position_bytes(ctx_max)
+            }
         }
 
         /// The target's plan of `slots` slots: each layer's bytes times the
@@ -3173,6 +3243,7 @@ mod tests {
                 + t.expert_bytes
                 + t.rounding_bytes
                 + t.kv_bytes
+                + t.stage_rows_bytes
                 + t.scratch_bytes
                 + t.context_bytes
                 + t.reserve_bytes;

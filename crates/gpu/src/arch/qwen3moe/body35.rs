@@ -112,6 +112,7 @@ use crate::linear::{self, LinearShape};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, SeqRope};
 use crate::model::{
     ChainBody, GpuModel, HostServed, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
+    refuse_stage_rows_past,
 };
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
@@ -1665,6 +1666,7 @@ impl Body35 {
                 (ubatch_arena(stream, (d, forms), ubatch.get(), free)?, None)
             }
             Some((open, counted)) => {
+                refuse_stage_rows_past(WHAT, open.plan, 0, rope.bytes())?;
                 let side = placed_bytes(&d, plans.len(), open.rows)?;
                 let u = counted_arena(stream, (d, forms), ubatch.get(), counted, side)?;
                 (u, Some(Placed::new(gpu, w, &plans, &d, open)?))
