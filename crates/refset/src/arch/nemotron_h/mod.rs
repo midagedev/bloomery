@@ -32,6 +32,7 @@ pub static FAMILIES: &[&Family] = &[&LOGITS];
 mod tests {
     use super::LOGITS;
     use crate::RefError;
+    use crate::clefvis::testkit::scratch as dir;
     use crate::family::Build;
     use crate::nemotron::LogitsSet;
     use std::path::Path;
@@ -67,13 +68,6 @@ mod tests {
         std::fs::write(dir.join("MANIFEST.tsv"), text).unwrap_or_else(|e| panic!("{e}"));
     }
 
-    fn dir(tag: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("bloomery-nemotron-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
-
     /// The build pin is the tokenizer family's constant.
     #[test]
     fn the_build_pin_is_the_tokenizer_familys() {
@@ -93,7 +87,7 @@ mod tests {
     /// A finished set opens, and `logits` is that column's file.
     #[test]
     fn a_finished_set_reads_logits_by_column_name() {
-        let d = dir("ok");
+        let d = dir("nemotron-ok");
         write(&d, &runs(), pin(), true);
         let set = LogitsSet::open(&d, &LOGITS).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(set.prompts.len(), 1);
@@ -107,7 +101,7 @@ mod tests {
     /// No `# complete`: unfinished, even when the other lines are well formed.
     #[test]
     fn a_set_without_its_trailer_is_unfinished() {
-        let d = dir("trailer");
+        let d = dir("nemotron-trailer");
         write(&d, &runs(), pin(), false);
         match LogitsSet::open(&d, &LOGITS) {
             Err(RefError::Unfinished { set }) => assert_eq!(set, d.display().to_string()),
@@ -119,7 +113,7 @@ mod tests {
     /// Another model path is stale.
     #[test]
     fn a_set_of_another_model_is_stale() {
-        let d = dir("model");
+        let d = dir("nemotron-model");
         write(&d, "/models/other/file.gguf", pin(), true);
         match LogitsSet::open(&d, &LOGITS) {
             Err(RefError::Stale { dumped_from, .. }) => {
@@ -133,7 +127,7 @@ mod tests {
     /// Another mainline build is foreign.
     #[test]
     fn a_set_of_another_build_is_foreign() {
-        let d = dir("build");
+        let d = dir("nemotron-build");
         write(
             &d,
             &runs(),
@@ -150,7 +144,7 @@ mod tests {
     /// A line that is not a token id is malformed, naming the field and the text.
     #[test]
     fn a_token_line_that_is_not_an_id_is_malformed() {
-        let d = dir("bad-id");
+        let d = dir("nemotron-bad-id");
         write(&d, &runs(), pin(), true);
         std::fs::write(d.join("p.ids"), "0\n1\n2\ngarbage\n0\n").unwrap_or_else(|e| panic!("{e}"));
         match LogitsSet::open(&d, &LOGITS) {
@@ -168,7 +162,7 @@ mod tests {
     /// A NaN or infinite logit is malformed, naming its index.
     #[test]
     fn a_non_finite_logit_is_malformed() {
-        let d = dir("nan-logit");
+        let d = dir("nemotron-nan-logit");
         write(&d, &runs(), pin(), true);
         let logits: Vec<u8> = [0.0f32, f32::NAN, -0.5, 0.25]
             .into_iter()
@@ -177,7 +171,7 @@ mod tests {
         std::fs::write(d.join("p.logits.f32"), logits).unwrap_or_else(|e| panic!("{e}"));
         match LogitsSet::open(&d, &LOGITS) {
             Err(RefError::Malformed { what, .. }) => {
-                assert!(what.contains("non-finite logit at index 1"), "{what}");
+                assert!(what.contains("non-finite value at index 1"), "{what}");
             }
             other => panic!("a non-finite logit: {other:?}"),
         }
@@ -187,7 +181,7 @@ mod tests {
     /// An empty line among the ids is malformed, as the C++ reader that writes the set refuses it.
     #[test]
     fn an_empty_token_line_is_malformed() {
-        let d = dir("empty-id");
+        let d = dir("nemotron-empty-id");
         write(&d, &runs(), pin(), true);
         std::fs::write(d.join("p.ids"), "0\n\n1\n2\n3\n0\n").unwrap_or_else(|e| panic!("{e}"));
         match LogitsSet::open(&d, &LOGITS) {
@@ -202,7 +196,7 @@ mod tests {
     /// An id at or past `n_vocab` is malformed, naming the id and the vocabulary.
     #[test]
     fn a_token_id_outside_the_vocabulary_is_malformed() {
-        let d = dir("oob-id");
+        let d = dir("nemotron-oob-id");
         write(&d, &runs(), pin(), true);
         std::fs::write(d.join("p.ids"), "0\n1\n2\n3\n4\n").unwrap_or_else(|e| panic!("{e}"));
         match LogitsSet::open(&d, &LOGITS) {
@@ -217,7 +211,7 @@ mod tests {
     /// The trailer's count is the prompt rows. One row and `# complete 2` is malformed.
     #[test]
     fn a_completion_count_that_is_not_the_prompt_rows_is_malformed() {
-        let d = dir("complete-n");
+        let d = dir("nemotron-complete-n");
         write(&d, &runs(), pin(), true);
         let text =
             std::fs::read_to_string(d.join("MANIFEST.tsv")).unwrap_or_else(|e| panic!("{e}"));
@@ -238,7 +232,7 @@ mod tests {
     /// A completion count that does not parse is malformed, naming the field.
     #[test]
     fn a_completion_count_that_does_not_parse_is_malformed() {
-        let d = dir("complete-bad");
+        let d = dir("nemotron-complete-bad");
         write(&d, &runs(), pin(), true);
         let text =
             std::fs::read_to_string(d.join("MANIFEST.tsv")).unwrap_or_else(|e| panic!("{e}"));

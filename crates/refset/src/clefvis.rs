@@ -207,7 +207,8 @@ impl Projector {
     }
 }
 
-/// The mainline commit the Qwen3.6 and Qwen3.8 image-input sets name in their `# build` line.
+/// The mainline commit the Qwen3.6 and Qwen3.8 image-input sets and the Qwen3.6 MTP step sets name in their `# build`
+/// line.
 // PIN(2026-10-10): /home/user/llama.cpp-36a73916 at its HEAD 36a73916ee0c (ggml-org master, 2026-10-07), the tree that
 // carries the qwen4exp and GLM5-Next fixes after Clef's pin (`crate::arch::qwen35::LCPP_BUILD`); both trees stay on the box.
 pub const QVIS_LCPP_BUILD: &str = "36a73916e";

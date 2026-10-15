@@ -1,5 +1,5 @@
 #pragma once
-// Token files and raw f32 rows for the mainline oracles (hidden_ref, nemotron_ref).
+// Token files and raw f32 rows for the mainline oracles (hidden_ref, nemotron_ref, q35mtp_ref).
 // A token id is a non-negative 32-bit integer. The header does not include llama.h:
 // llama_token is that integer, so a vector of it is a vector of int32_t.
 
@@ -67,16 +67,43 @@ bool read_token_file(const std::string & path, long long count, std::vector<Toke
     return false;
 }
 
-inline bool write_raw(const std::string & path, const float * data, size_t count) {
-    FILE * f = fopen(path.c_str(), "wb");
+// The ids, one decimal id a line (the form read_token_file reads), every line written and the file closed.
+template <typename Token>
+bool write_ids(const std::string & path, const std::vector<Token> & ids) {
+    FILE * f = fopen(path.c_str(), "w");
     if (!f) {
         perror(path.c_str());
         return false;
     }
-    const bool ok = fwrite(data, sizeof(float), count, f) == count;
+    bool ok = true;
+    for (Token id : ids) ok = ok && fprintf(f, "%d\n", (int) id) >= 0;
     if (fclose(f) != 0 || !ok) {
         fprintf(stderr, "%s: short write\n", path.c_str());
         return false;
     }
     return true;
+}
+
+// `bytes` bytes to `path`, every byte written and the file closed, or named on stderr.
+inline bool write_bytes(const std::string & path, const void * data, size_t bytes) {
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) {
+        perror(path.c_str());
+        return false;
+    }
+    const bool ok = fwrite(data, 1, bytes, f) == bytes;
+    if (fclose(f) != 0 || !ok) {
+        fprintf(stderr, "%s: short write\n", path.c_str());
+        return false;
+    }
+    return true;
+}
+
+// `count` elements of `size` bytes each, the ik dumpers' typed rows.
+inline bool write_raw(const std::string & path, const void * data, size_t size, size_t count) {
+    return write_bytes(path, data, size * count);
+}
+
+inline bool write_raw(const std::string & path, const float * data, size_t count) {
+    return write_bytes(path, data, count * sizeof(float));
 }

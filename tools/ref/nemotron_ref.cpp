@@ -49,26 +49,6 @@ static bool parse_prompt(const char * spec, Prompt & p) {
     return true;
 }
 
-static bool write_ids(const std::string & path, const std::vector<llama_token> & ids) {
-    FILE * f = fopen(path.c_str(), "w");
-    if (!f) {
-        fprintf(stderr, "nemotron_ref: cannot write %s\n", path.c_str());
-        return false;
-    }
-    for (llama_token id : ids) {
-        if (fprintf(f, "%d\n", (int) id) < 0) {
-            fclose(f);
-            fprintf(stderr, "nemotron_ref: short write on %s\n", path.c_str());
-            return false;
-        }
-    }
-    if (fclose(f) != 0) {
-        fprintf(stderr, "nemotron_ref: short write on %s\n", path.c_str());
-        return false;
-    }
-    return true;
-}
-
 static void print_top5(const std::string & name, const float * row, int n_vocab) {
     const int k = std::min(n_vocab, 5);
     std::vector<int> order(n_vocab);
@@ -113,7 +93,7 @@ int main(int argc, char ** argv) {
         }
     }
     const char * build = getenv("BLOOMERY_REF_BUILD");
-    if (model_path.empty() || out.empty() || prompts.empty() || n_ubatch <= 0 || !build || !*build) {
+    if (model_path.empty() || out.empty() || prompts.empty() || !build || !*build) {
         fprintf(stderr, "usage: nemotron_ref -m <gguf> --out <dir> --prompt <name>:<n>:<ids> ... "
                         "[-c <ctx>] [-ub <ubatch>] [-t <threads>]\n"
                         "BLOOMERY_REF_BUILD must name the mainline build\n");

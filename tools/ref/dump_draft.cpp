@@ -52,6 +52,7 @@
 #include "ggml.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ref_io.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -169,24 +170,6 @@ static void gather(const ggml_tensor * t, const uint8_t * src, bool logical,
         if (is_int) ints[li] = v_int;
         ++li;
     }
-}
-
-static bool write_raw(const std::string & path, const void * data, size_t size, size_t count) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        fprintf(stderr, "dump_draft: cannot write %s\n", path.c_str());
-        return false;
-    }
-    if (fwrite(data, size, count, f) != count) {
-        fprintf(stderr, "dump_draft: short write on %s\n", path.c_str());
-        fclose(f);
-        return false;
-    }
-    if (fclose(f) != 0) {
-        fprintf(stderr, "dump_draft: cannot flush %s\n", path.c_str());
-        return false;
-    }
-    return true;
 }
 
 static bool write_twin(dump_ctx * d, const ggml_tensor * t, const char * name, int occurrence, bool input,
@@ -421,33 +404,6 @@ static void report_unhandled(const dump_ctx & d) {
     fprintf(stderr, "dump_draft: %d tensors skipped as unhandled: %s\n", total, types.empty() ? "none" : types.c_str());
 }
 
-static bool read_token_file(const std::string & path, long long count, std::vector<llama_token> & ids) {
-    std::ifstream in(path);
-    if (!in) {
-        fprintf(stderr, "dump_draft: cannot read %s\n", path.c_str());
-        return false;
-    }
-    std::string line;
-    long long   lines = 0;
-    while ((long long) ids.size() < count && std::getline(in, line)) {
-        ++lines;
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
-            fprintf(stderr, "dump_draft: %s:%lld is not a token id: '%s'\n", path.c_str(), lines, line.c_str());
-            return false;
-        }
-        ids.push_back((llama_token) v);
-    }
-    if ((long long) ids.size() < count) {
-        fprintf(stderr, "dump_draft: %s holds %zu token ids and --tokens-count asks for %lld\n", path.c_str(),
-                ids.size(), count);
-        return false;
-    }
-    return true;
-}
-
 static std::string file_arch(const std::string & path) {
     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
@@ -526,7 +482,7 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--tokens-file") == 0 && i + 1 < argc) {
             tokens_file = argv[++i];
         } else if (strcmp(argv[i], "--tokens-count") == 0 && i + 1 < argc) {
-            tokens_count = atoll(argv[++i]);
+            if (!parse_i64("dump_draft", "--tokens-count", argv[++i], 1, LLONG_MAX, tokens_count)) return 2;
         } else if (strcmp(argv[i], "--expect-arch") == 0 && i + 1 < argc) {
             expect_arch = argv[++i];
         } else if (strcmp(argv[i], "--expect-draft-arch") == 0 && i + 1 < argc) {

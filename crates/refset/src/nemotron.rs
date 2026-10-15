@@ -16,7 +16,7 @@
 //! another file, and one written by another mainline build.
 
 use crate::RefError;
-use crate::columns::{Columns, Row, file_name};
+use crate::columns::{Columns, Row, file_name, need, one};
 use crate::family::{Family, Identity};
 use std::collections::HashSet;
 use std::fmt;
@@ -118,9 +118,7 @@ impl LogitsSet {
                 }
                 h if h.starts_with('#') => {}
                 "prompt" => {
-                    let c = cols.as_ref().ok_or_else(|| {
-                        RefError::malformed(&at, "a prompt row before its `# prompt columns` line")
-                    })?;
+                    let c = need(&cols, "prompt", &at)?;
                     let prompt = prompt_row(&c.row(line, &at)?, &at)?;
                     if !seen.insert(prompt.name.clone()) {
                         return Err(RefError::malformed(
@@ -189,39 +187,11 @@ impl LogitsSet {
 
     /// Prompt `p`'s last-position logits, `n_vocab` f32, little-endian.
     pub fn logits(&self, p: &Prompt) -> Result<Vec<f32>, RefError> {
-        let path = self.dir.join(&p.logits_file);
-        let bytes = std::fs::read(&path).map_err(|e| {
-            RefError::missing(
-                &path,
-                format!("nemotron: cannot read {}: {e}", path.display()),
-            )
-        })?;
-        let want = p.n_vocab as usize * 4;
-        if bytes.len() != want {
-            return Err(RefError::malformed(
-                path.display(),
-                format!(
-                    "{} is {} bytes, {} logits of {} want {want}",
-                    p.logits_file,
-                    bytes.len(),
-                    p.name,
-                    p.n_vocab
-                ),
-            ));
-        }
-        let mut out = Vec::with_capacity(p.n_vocab as usize);
-        for chunk in bytes.chunks_exact(4) {
-            out.push(f32::from_le_bytes(
-                chunk.try_into().expect("chunks_exact(4)"),
-            ));
-        }
-        if let Some(i) = out.iter().position(|v| !v.is_finite()) {
-            return Err(RefError::malformed(
-                path.display(),
-                format!("non-finite logit at index {i}"),
-            ));
-        }
-        Ok(out)
+        crate::columns::read_f32(
+            &self.dir.join(&p.logits_file),
+            u64::from(p.n_vocab),
+            &p.logits_file,
+        )
     }
 
     fn check_prompt(&self, p: &Prompt) -> Result<(), RefError> {
@@ -260,13 +230,6 @@ impl LogitsSet {
         }
         self.logits(p)?;
         Ok(())
-    }
-}
-
-fn one(f: &[&str], at: &dyn fmt::Display, want: &str) -> Result<String, RefError> {
-    match f {
-        [_, v] if !v.is_empty() => Ok((*v).to_string()),
-        _ => Err(RefError::malformed(at, format!("want {want}"))),
     }
 }
 

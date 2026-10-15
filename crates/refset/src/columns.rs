@@ -5,6 +5,7 @@
 
 use crate::RefError;
 use std::fmt::Display;
+use std::path::Path;
 use std::str::FromStr;
 
 /// The names of one row kind's fields, from its column line: field 0 is the
@@ -113,11 +114,73 @@ where
 /// `name` is one file of the set's own directory. Empty, `.`, `..`, or a
 /// slash is `Malformed`: the manifest must not name a path outside it.
 pub(crate) fn file_name(name: &str, at: &dyn Display) -> Result<(), RefError> {
-    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) || matches!(name, "." | "..") {
         return Err(RefError::malformed(
             at,
             format!("{name:?} does not name a file of the set's directory"),
         ));
     }
     Ok(())
+}
+
+/// The column line a data row of kind `what` is read by, or a malformed-set error naming the row
+/// that came before it.
+pub(crate) fn need<'a>(
+    cols: &'a Option<Columns>,
+    what: &str,
+    at: &dyn Display,
+) -> Result<&'a Columns, RefError> {
+    cols.as_ref()
+        .ok_or_else(|| RefError::malformed(at, format!("a {what} row before its column line")))
+}
+
+/// The one value of a `# key\t<value>` header line, or a malformed-set error naming the form `want`.
+pub(crate) fn one(f: &[&str], at: &dyn Display, want: &str) -> Result<String, RefError> {
+    match f {
+        [_, v] if !v.is_empty() => Ok((*v).to_string()),
+        _ => Err(RefError::malformed(at, format!("want {want}"))),
+    }
+}
+
+/// `want` four-byte values of `path`, as bytes.
+pub(crate) fn read_bytes(path: &Path, want: u64, file: &str) -> Result<Vec<u8>, RefError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| RefError::missing(path, format!("cannot read {}: {e}", path.display())))?;
+    if bytes.len() as u64 != want * 4 {
+        return Err(RefError::malformed(
+            path.display(),
+            format!(
+                "{file} is {} bytes, {want} values want {}",
+                bytes.len(),
+                want * 4
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// `want` little-endian f32 values of `path`, each finite (a reference value is never NaN or infinite).
+pub(crate) fn read_f32(path: &Path, want: u64, file: &str) -> Result<Vec<f32>, RefError> {
+    let values: Vec<f32> = read_bytes(path, want, file)?
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect();
+    if let Some(i) = values.iter().position(|v| !v.is_finite()) {
+        return Err(RefError::malformed(
+            path.display(),
+            format!("non-finite value at index {i}"),
+        ));
+    }
+    Ok(values)
+}
+
+/// Little-endian i32 values, four bytes each (the caller has checked the length).
+pub(crate) fn i32s_of(b: &[u8]) -> Vec<i32> {
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
+        .collect()
 }

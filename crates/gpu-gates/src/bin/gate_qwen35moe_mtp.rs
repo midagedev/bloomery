@@ -66,9 +66,10 @@ mod gate {
 
     const WHAT: &str = "gate_qwen35moe_mtp";
 
-    /// The file the gate runs on: unsloth's `UD-Q4_K_M` with its next-token
-    /// layer. Pinned by `general.name` and by its size in bytes.
-    const DRAFT_FILE: &str = "/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+    // The file the gate runs on: unsloth's `UD-Q4_K_M` with its next-token
+    // layer (the MTP step family's file). Pinned by `general.name` and by its
+    // size in bytes.
+    use refset::arch::qwen35moe::mtp::MODEL as DRAFT_FILE;
     const DRAFT_NAME: &str = "Qwen3.6-35B-A3B";
     const DRAFT_BYTES: u64 = 22_663_387_424;
 

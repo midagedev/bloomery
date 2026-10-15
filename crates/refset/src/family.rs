@@ -31,6 +31,10 @@ pub enum Identity {
     /// names [`crate::fixture::first_shard`], and `# fixture` equals
     /// [`crate::fixture::line`] of that file.
     FixtureManifest,
+    /// `# model\t<path>` in an MTP step set's `MANIFEST.tsv` (`tools/ref/q35mtp_ref.cpp`): the target file, which
+    /// carries the next-token layer; `# build` naming the mainline commit and `# mtp` the next-token layers and the
+    /// steps the MTP context ran ([`crate::mtptaps::TapSet`]).
+    MtpTaps,
     /// [`Identity::MtpManifest`] of a set dumped on a fixture file: `# model`
     /// and `# fixture` as [`Identity::FixtureManifest`]'s, and
     /// `# draft_model\t<path>` too for a family whose draft is a file of its
@@ -326,6 +330,14 @@ impl Family {
                 Ok(Provenance {
                     dumped_from: stated(set.model.as_deref()),
                     draft: set.draft_model,
+                    build: set.build,
+                })
+            }
+            Identity::MtpTaps => {
+                let set = crate::mtptaps::TapSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.model.as_deref()),
+                    draft: None,
                     build: set.build,
                 })
             }

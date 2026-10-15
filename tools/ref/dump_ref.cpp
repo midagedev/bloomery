@@ -105,6 +105,7 @@
 #include "common.h"
 #include "llama.h"
 #include "ggml.h"
+#include "ref_io.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -197,24 +198,6 @@ static void gather(const ggml_tensor * t, const uint8_t * src, bool logical,
         if (is_int) ints[li] = v_int;
         ++li;
     }
-}
-
-static bool write_raw(const std::string & path, const void * data, size_t size, size_t count) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        fprintf(stderr, "dump_ref: cannot write %s\n", path.c_str());
-        return false;
-    }
-    if (fwrite(data, size, count, f) != count) {
-        fprintf(stderr, "dump_ref: short write on %s\n", path.c_str());
-        fclose(f);
-        return false;
-    }
-    if (fclose(f) != 0) {
-        fprintf(stderr, "dump_ref: cannot flush %s\n", path.c_str());
-        return false;
-    }
-    return true;
 }
 
 // An integer tensor's lossless twin for one layout, and its `int` row. i64 stays 64-bit;
@@ -447,36 +430,6 @@ static void report_unhandled(const dump_ctx & d) {
     fprintf(stderr, "dump_ref: %d tensors skipped as unhandled: %s\n", total, types.empty() ? "none" : types.c_str());
 }
 
-// One decimal token id per line, the format engram-corpus.sh writes and router_trace reads: the
-// first `count` ids, or every line for a negative count. A shorter file is an error, not a shorter
-// set — a decode step at another position is another set.
-static bool read_token_file(const std::string & path, long long count, std::vector<llama_token> & ids) {
-    std::ifstream in(path);
-    if (!in) {
-        fprintf(stderr, "dump_ref: cannot read %s\n", path.c_str());
-        return false;
-    }
-    std::string line;
-    long long   lines = 0;
-    while ((count < 0 || (long long) ids.size() < count) && std::getline(in, line)) {
-        ++lines;
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
-            fprintf(stderr, "dump_ref: %s:%lld is not a token id: '%s'\n", path.c_str(), lines, line.c_str());
-            return false;
-        }
-        ids.push_back((llama_token) v);
-    }
-    if (count >= 0 && (long long) ids.size() < count) {
-        fprintf(stderr, "dump_ref: %s holds %zu token ids and --tokens-count asks for %lld\n", path.c_str(),
-                ids.size(), count);
-        return false;
-    }
-    return true;
-}
-
 static double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -557,14 +510,20 @@ int main(int argc, char ** argv) {
     passthrough.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
-            char * list = argv[++i];
-            for (char * p = strtok(list, ","); p; p = strtok(nullptr, ",")) {
-                tokens.push_back((llama_token) atoi(p));
+            const std::string list(argv[++i]);
+            for (size_t at = 0;;) {
+                const size_t end = list.find(',', at);
+                const std::string field = list.substr(at, end == std::string::npos ? end : end - at);
+                int id = 0;
+                if (!parse_i32("dump_ref", "--tokens", field.c_str(), 0, id)) return 2;
+                tokens.push_back((llama_token) id);
+                if (end == std::string::npos) break;
+                at = end + 1;
             }
         } else if (strcmp(argv[i], "--tokens-file") == 0 && i + 1 < argc) {
             tokens_file = argv[++i];
         } else if (strcmp(argv[i], "--tokens-count") == 0 && i + 1 < argc) {
-            tokens_count = std::max(0LL, atoll(argv[++i]));  // 0 is refused below
+            if (!parse_i64("dump_ref", "--tokens-count", argv[++i], 1, LLONG_MAX, tokens_count)) return 2;
         } else if (strcmp(argv[i], "--decode-step") == 0) {
             decode_step = true;
         } else if (strcmp(argv[i], "--prefill-every-node") == 0) {
@@ -593,8 +552,8 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "dump_ref: --tokens and --tokens-file are exclusive\n");
             return 2;
         }
-        if (tokens_count == 0) {
-            fprintf(stderr, "dump_ref: --tokens-count must be positive\n");
+        if (tokens_count < 0) {
+            fprintf(stderr, "dump_ref: --tokens-file needs --tokens-count\n");
             return 2;
         }
         if (!read_token_file(tokens_file, tokens_count, tokens)) return 2;

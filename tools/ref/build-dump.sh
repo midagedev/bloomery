@@ -14,7 +14,7 @@ SRC=$HERE/tools/ref/dump_ref.cpp
 mkdir -p "$OUT"
 TMP=$OUT/dump_ref.tmp.$$
 trap 'rm -f "$TMP" "$TMP.build"' EXIT
-SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+SRC_SHA=$(cat "$SRC" "$HERE/tools/ref/ref_io.h" | sha256sum | cut -d' ' -f1)
 ref_cxx -o "$TMP" "$SRC" "${REF_LLAMA_INC[@]}" "${REF_LLAMA_LINK[@]}"
 printf 'source_sha256 %s\nik %s\n' "$SRC_SHA" "$(readlink -f "$IK")" > "$TMP.build"
 mv -f "$TMP" "$OUT/dump_ref"
