@@ -20,7 +20,7 @@ use super::hparams::{Hparams, Kind};
 use super::spec;
 use crate::arch::coverage;
 use crate::placement::accepts::{Program, routed_rule};
-use crate::placement::ctx_ask::{PlanRefusal, Short};
+use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::{
     self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
     Violation, checked, joined,
@@ -78,12 +78,6 @@ impl PlanRefusal for PlaceError {
             Self::Broken(v) => Some(v),
             _ => None,
         }
-    }
-
-    /// The card's reading alone: the plan has no host side, so a context that
-    /// does not fit is short of the card's bytes.
-    fn short(&self) -> Option<Short> {
-        self.card_short()
     }
 }
 

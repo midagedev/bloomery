@@ -339,11 +339,15 @@ pub(super) mod tests {
             needs.iter().all(|(n, _)| !matches!(n, Need::QkRope { .. })),
             "{needs:?}"
         );
-        let items = coverage::check(&read.spec, &read.tensors);
         // PIN(2026-10-15): the nemotron_h body now runs the program, the
         // Mamba-2 and the squared-ReLU layers, so the clauses that listed them
         // as missing are gone; this header's attention (head 8, group 2) has
-        // no flash row.
+        // no flash row. Its f32 matrices are type items the body's pins name
+        // (`coverage::TYPE_PINS`), set aside here: this test is about needs.
+        let items: Vec<_> = coverage::check(&read.spec, &read.tensors)
+            .into_iter()
+            .filter(|u| !u.feature.starts_with("f32 "))
+            .collect();
         assert!(
             items
                 .iter()

@@ -798,7 +798,7 @@ const TYPE_PINS: &[TypePin] = &[
     TypePin {
         program: Program::NemotronHBody,
         role: Role::TokenEmbedding,
-        matrices: true,
+        matrices: false,
         names: None,
         what: "token embedding (the card reads q5_0 rows)",
         reads: &[GgmlType::Q5_0],
@@ -806,23 +806,35 @@ const TYPE_PINS: &[TypePin] = &[
     TypePin {
         program: Program::NemotronHBody,
         role: Role::Head,
-        matrices: true,
-        names: None,
+        matrices: false,
+        names: Some(|n| n == "output.weight"),
         what: "output head (the head reads q6_K, q4_K and q8_0)",
         reads: &[GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q8_0],
     },
     TypePin {
         program: Program::NemotronHBody,
         role: Role::Attention,
-        matrices: true,
-        names: None,
+        matrices: false,
+        names: Some(|n| {
+            use super::nemotron_h::names as nm;
+            [
+                nm::SSM_IN,
+                nm::SSM_OUT,
+                nm::ATTN_Q,
+                nm::ATTN_K,
+                nm::ATTN_V,
+                nm::ATTN_OUTPUT,
+            ]
+            .into_iter()
+            .any(|stem| n.ends_with(stem))
+        }),
         what: "Mamba-2 and attention projections (the body reads q5_0, q8_0, q4_K and q6_K)",
         reads: NEMOTRON_SITES,
     },
     TypePin {
         program: Program::NemotronHBody,
         role: Role::DenseFfn,
-        matrices: true,
+        matrices: false,
         names: None,
         what: "dense FFN (the body reads q5_0, q8_0, q4_K and q6_K)",
         reads: NEMOTRON_SITES,
@@ -2023,6 +2035,35 @@ mod tests {
         assert_eq!(
             head(GgmlType::Q5_K),
             ["q5_K output head (the head reads q6_K, q4_K and q8_0)".to_string()]
+        );
+        assert_eq!(
+            embed(GgmlType::F32),
+            ["f32 token embedding (the card reads q5_0 rows)".to_string()]
+        );
+        assert_eq!(
+            head(GgmlType::F32),
+            ["f32 output head (the head reads q6_K, q4_K and q8_0)".to_string()]
+        );
+        let proj = |name: &str, role: Role| whole(name, role, GgmlType::F32, "(the body reads");
+        assert_eq!(
+            proj("blk.0.ssm_in.weight", Role::Attention),
+            [
+                "f32 Mamba-2 and attention projections (the body reads q5_0, q8_0, q4_K and q6_K)"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            proj("blk.2.ffn_up.weight", Role::DenseFfn),
+            ["f32 dense FFN (the body reads q5_0, q8_0, q4_K and q6_K)".to_string()]
+        );
+        assert_eq!(
+            whole(
+                "blk.0.ssm_a",
+                Role::Attention,
+                GgmlType::F32,
+                "(the body reads"
+            ),
+            Vec::<String>::new()
         );
     }
 

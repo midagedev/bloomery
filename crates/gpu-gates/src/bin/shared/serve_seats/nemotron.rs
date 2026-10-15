@@ -113,11 +113,9 @@ struct OpenSeat {
     ctx: usize,
 }
 
-/// The model on the engine thread and the positions its planes were sized
-/// for.
+/// The model on the engine thread.
 struct Nemotron {
     m: NemotronHModel,
-    ctx: usize,
 }
 
 impl Nemotron {
@@ -143,7 +141,7 @@ impl Nemotron {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(&m, total, opened);
-        Ok(Nemotron { m, ctx })
+        Ok(Nemotron { m })
     }
 }
 
@@ -153,7 +151,7 @@ impl Seat for Nemotron {
     }
 
     fn ctx_max(&self) -> usize {
-        self.ctx
+        self.m.ctx_max()
     }
 
     /// One decode step an id, the argmax after the last: the body has no

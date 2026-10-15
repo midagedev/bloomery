@@ -15,7 +15,7 @@ use crate::mamba2::{self, Mamba2Kernels};
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
 use crate::recur::RecStore;
 use crate::site::{self, KGemvKernels, SiteTy};
-use crate::weights::Weights;
+use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -72,7 +72,7 @@ impl GpuModel<Body> {
 }
 
 impl Body {
-    fn load(gpu: &Gpu, file: &Split, w: &Weights, ctx: usize) -> Result<Body, GpuError> {
+    fn load(gpu: &Gpu, file: &Split, w: &mut Weights, ctx: usize) -> Result<Body, GpuError> {
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         if ctx == 0 {
             return Err(GpuError::shape(WHAT, "a cache of 0 rows"));
@@ -90,7 +90,7 @@ impl Body {
         )?;
         let n_kv = attention_heads(&hp)?;
         let hidden = hp.n_embd;
-        let kinds = Names { file, w };
+        let mut kinds = Names { file, w };
         let embed = names::token_embd();
         kinds.site(&embed, (hp.n_vocab, hidden), &[SiteTy::Q5_0])?;
         let stream = gpu.stream();
@@ -177,10 +177,13 @@ fn attention_heads(hp: &Hparams) -> Result<usize, GpuError> {
     Ok(found.unwrap_or(0))
 }
 
+/// The derived conv bias of a file whose Mamba-2 layers hold none.
+const ZERO_CONV_BIAS: &str = "derived.nemotron_h.zero_conv_bias";
+
 /// The file and its resident weights, what a load resolves names against.
 struct Names<'a> {
     file: &'a Split,
-    w: &'a Weights,
+    w: &'a mut Weights,
 }
 
 impl Names<'_> {
@@ -206,6 +209,26 @@ impl Names<'_> {
         self.site(&layer_name(l, stem), shape, SITE_TYPES)
     }
 
+    /// Layer `l`'s conv bias of `len` values: the file's, or where the file
+    /// holds none (the bias is optional) one zero vector every such layer
+    /// reads, resident from load.
+    fn conv_bias(&mut self, l: usize, len: usize, stream: &CudaStream) -> Result<String, GpuError> {
+        if self
+            .file
+            .find(&layer_name(l, names::SSM_CONV_BIAS))
+            .is_some()
+        {
+            return self.vector(l, names::SSM_CONV_BIAS, len);
+        }
+        let name = ZERO_CONV_BIAS.to_owned();
+        if self.w.get(&name).is_none() {
+            let w = DeviceTensor::zeroed(stream, 1, len)?;
+            self.w
+                .insert_derived(name.clone(), DevWeight::F32 { w, k: len })?;
+        }
+        Ok(name)
+    }
+
     /// The f32 vector `stem` of layer `l`, `len` values: its name.
     fn vector(&self, l: usize, stem: &str, len: usize) -> Result<String, GpuError> {
         let name = layer_name(l, stem);
@@ -220,7 +243,7 @@ impl Names<'_> {
     }
 
     fn layer(
-        &self,
+        &mut self,
         hp: &Hparams,
         l: usize,
         ctx: usize,
@@ -239,7 +262,7 @@ impl Names<'_> {
                     d: self.vector(l, names::SSM_D, s.n_heads)?,
                     dt_bias: self.vector(l, names::SSM_DT_BIAS, s.n_heads)?,
                     conv_w: self.vector(l, names::SSM_CONV, s.d_conv * s.conv_dim)?,
-                    conv_b: self.vector(l, names::SSM_CONV_BIAS, s.conv_dim)?,
+                    conv_b: self.conv_bias(l, s.conv_dim, stream)?,
                     ssm_norm: self.vector(l, names::SSM_NORM, s.d_inner)?,
                     store: RecStore::new(stream, lens, 1)?,
                     norm,
