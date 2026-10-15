@@ -531,7 +531,7 @@ lease_capture() {
 # a live filter in the output file, with the bounded command owned by the runner's shell.
 # stdout filters the combined output; stderr leaves stdout in LEASE_OUT_FILE.
 lease_filter() {
-  local bound=$1 stream=$2 output=$3 rc=0 reader filter_rc=0
+  local bound=$1 stream=$2 output=$3 rc=0 reader='' filter_rc=0
   local -a filter=()
   shift 3
   lease_bound "$bound" || return $?
@@ -540,13 +540,36 @@ lease_filter() {
   [ "$#" -gt 1 ] && [ "${#filter[@]}" -gt 0 ] || { echo 'lease_filter: a filter and -- command are required' >&2; return 64; }
   shift
   lease_out_init || return 70
-  "${filter[@]}" < "$LEASE_OUT_FIFO" > "$output" &
+  local filter_traps pending='' s signal_rc
+  filter_traps=$(trap -p TERM INT HUP)
+  # Hold early signals until the reader PID is known; restore the caller before forwarding them.
+  for s in TERM INT HUP; do
+    case $s in TERM) signal_rc=143 ;; INT) signal_rc=130 ;; HUP) signal_rc=129 ;; esac
+    # shellcheck disable=SC2064 # the signal and its status now, the reader when the trap runs
+    trap "pending=$s; [ -z \"\$reader\" ] || {
+      trap '' TERM INT HUP
+      kill -TERM \"\$reader\" 2> /dev/null || :
+      wait \"\$reader\" 2> /dev/null || :
+      reader=''
+      trap - TERM INT HUP
+      eval \"\$filter_traps\"
+      kill -s $s \$\$
+      return $signal_rc
+    }" "$s"
+  done
+  "${filter[@]}" 9>&- < "$LEASE_OUT_FIFO" > "$output" &
   reader=$!
+  [ -z "$pending" ] || kill -s "$pending" $$
   case $stream in
     stdout) LEASE_BOUNDED_OUT=$LEASE_OUT_FIFO LEASE_BOUNDED_ERR= lease_bounded "$bound" "$@" || rc=$? ;;
     stderr) LEASE_BOUNDED_OUT=$LEASE_OUT_FILE LEASE_BOUNDED_ERR=$LEASE_OUT_FIFO lease_bounded "$bound" "$@" || rc=$? ;;
   esac
-  wait "$reader" || filter_rc=$?
+  if [ -n "$reader" ]; then
+    wait "$reader" || filter_rc=$?
+    reader=''
+  fi
+  trap - TERM INT HUP
+  eval "$filter_traps"
   [ "$rc" -ne 0 ] || rc=$filter_rc
   return "$rc"
 }
@@ -1284,6 +1307,35 @@ EOF
     env BLOOMERY_HOST_BOUND=0600 bash "$LEASE_TREE/tools/ref/dma-dram-share.sh" --parse-only \
       > "$t/refused-dma-log" 2>&1 || RC=$?
     check dma-leading-zero-bound-rc "$RC" 64
+    cat > "$t/filter-open-runner" << 'EOF'
+source "$1"
+exec 9> "$2"
+flock -n 9 || exit 75
+lease_bounded() {
+  echo "$!" > "$TEST_READER"
+  echo ready > "$TEST_READY"
+  read -r line < "$TEST_HOLD"
+}
+lease_filter 10 stdout "$3" cat -- true
+EOF
+    mkfifo "$t/filter-hold"
+    RC=0
+    lease_capture 5 bash -c '
+      source "$1"
+      TEST_READER="$2/reader.pid" TEST_READY="$2/reader.ready" TEST_HOLD="$2/filter-hold" \
+        bash "$2/filter-open-runner" "$1" "$2/filter-lock" "$2/filter-output" &
+      runner=$!
+      for ((i=0; i<100; i++)); do [ ! -s "$2/reader.ready" ] || break; sleep 0.01; done
+      kill -TERM "$runner" 2>/dev/null
+      wait "$runner" 2>/dev/null || :
+      state=free
+      lease_free "$2/filter-lock" 2>/dev/null || state=held
+      reader=$(cat "$2/reader.pid")
+      kill -TERM "$reader" 2>/dev/null || :
+      echo "$state"
+    ' _ "$LEASE_TREE/tools/ref/lease.sh" "$t" || RC=$?
+    check bounded-filter-open-term-rc "$RC" 0
+    check bounded-filter-open-term-lease "$LEASE_OUT" free
     mkdir -p "$t/expert-tree/tools/ref"
     cp "$LEASE_TREE/tools/ref/expert-union-dump.sh" "$t/expert-tree/tools/ref/"
     printf '%s\n' 'MODEL=unused' 'REF_PROMPTS=$STUB_EXPERT_PROMPTS' > "$t/expert-tree/tools/ref/ref-paths.sh"
