@@ -194,31 +194,22 @@ mod tests {
     use super::super::hparams::{Experts, Hparams, Rope, RopeMode, Score};
     use super::{KvBytes, KvLayout};
 
-    /// `head_dim` f32 a position, through [`KvLayout::of`]. The
-    /// q8 cache keeps the same table. A count of no row, or of half a row,
-    /// is not the table the body copies.
     #[test]
     fn the_stage_rope_row_is_the_width_the_body_copies() {
-        let kv = layout(128);
-        assert_eq!(kv.stage_position_bytes(10), 128 * 4 * 10);
-        assert_eq!(kv.in_q8().stage_position_bytes(10), 128 * 4 * 10);
-    }
-
-    fn layout(head_dim: usize) -> KvLayout {
-        KvLayout::of(&Hparams {
+        let kv = KvLayout::of(&Hparams {
             n_layer: 1,
-            n_embd: head_dim,
+            n_embd: 128,
             n_head: 1,
             n_head_kv: 1,
-            head_dim,
+            head_dim: 128,
             rope: Rope {
                 mode: RopeMode::Neox,
                 base: 1e6,
-                dims: head_dim,
+                dims: 128,
             },
             rms_eps: 1e-6,
             n_vocab: 2,
-            n_ctx_train: head_dim,
+            n_ctx_train: 128,
             experts: Experts {
                 n_expert: 1,
                 n_used: 1,
@@ -226,6 +217,8 @@ mod tests {
                 score: Score::Softmax,
                 weights_norm: true,
             },
-        })
+        });
+        assert_eq!(kv.stage_position_bytes(10), 128 * 4 * 10);
+        assert_eq!(kv.in_q8().stage_position_bytes(10), 128 * 4 * 10);
     }
 }

@@ -2290,28 +2290,19 @@ mod tests {
         assert_eq!(selecting.in_q8().layer_bytes(0, 4096), sel);
     }
 
-    /// The stage rope rows, through [`KvLayout::of`]: `rope.dimension_count`
-    /// f32 a position, not the head width. The q8 cache keeps the same table.
-    /// A count of no row, or of half a row, is not the table the body copies.
     #[test]
     fn the_stage_rope_row_is_rope_dims_not_the_head() {
-        let narrow = layout(64, 256);
-        assert_eq!(narrow.stage_position_bytes(8), 64 * 4 * 8);
-        assert_eq!(narrow.in_q8().stage_position_bytes(8), 64 * 4 * 8);
-        assert_eq!(layout(128, 256).stage_position_bytes(8), 128 * 4 * 8);
-    }
-
-    fn layout(rope_dims: usize, head_dim: usize) -> KvLayout {
         use super::super::hparams::{FfnKind, Hparams, SectionOrder, Variant};
-        KvLayout::of(&Hparams {
+
+        let hp = Hparams {
             variant: Variant::Qwen35Moe,
             n_layer: 1,
             n_trunk: 1,
-            n_embd: head_dim,
+            n_embd: 256,
             n_head: 1,
             n_head_kv: 1,
-            head_dim,
-            rope_dims,
+            head_dim: 256,
+            rope_dims: 64,
             rope_sections: [0, 0, 0, 0],
             rope_order: SectionOrder::Tyxz,
             rope_base: 1e7,
@@ -2332,7 +2323,14 @@ mod tests {
             ffns: vec![FfnKind::Dense],
             exp: None,
             defaults: Vec::new(),
-        })
+        };
+        let narrow = KvLayout::of(&hp);
+        assert_eq!(narrow.stage_position_bytes(8), 64 * 4 * 8);
+        assert_eq!(narrow.in_q8().stage_position_bytes(8), 64 * 4 * 8);
+        assert_eq!(
+            KvLayout::of(&Hparams { rope_dims: 128, ..hp }).stage_position_bytes(8),
+            128 * 4 * 8
+        );
     }
 
     /// The card rule over Qwen3.8's routed stacks ([`super::routed_rule`]) on

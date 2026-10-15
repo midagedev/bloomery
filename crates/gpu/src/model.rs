@@ -1948,7 +1948,7 @@ pub fn refuse_scratch_past(
 /// (`CardTotals::stage_rows_bytes`, the rope tables at the context): the check
 /// of a body whose scratch the plan holds by a term of its own rather than
 /// through [`refuse_scratch_past`].
-pub fn refuse_stage_rows_past(
+pub(crate) fn refuse_stage_rows_past(
     what: &'static str,
     plan: &Plan<'_>,
     card: usize,
