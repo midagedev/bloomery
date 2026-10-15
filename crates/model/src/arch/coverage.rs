@@ -1077,9 +1077,9 @@ fn weight_formats(program: Option<Program>, t: &ModelTensor) -> Vec<Need> {
             .map(|(what, _)| *what)
             .collect(),
         // No program: an item only when no program's pin reads the type,
-        // named by the first pin.
-        None if pins.iter().all(|(_, reads)| !reads) => {
-            pins.iter().take(1).map(|(what, _)| *what).collect()
+        // named by the tensor's role (no program's pin names its reader).
+        None if !pins.is_empty() && pins.iter().all(|(_, reads)| !reads) => {
+            vec![unrun_role(t.role)]
         }
         None => Vec::new(),
     };
@@ -1087,6 +1087,21 @@ fn weight_formats(program: Option<Program>, t: &ModelTensor) -> Vec<Need> {
         .into_iter()
         .map(|what| Need::WeightFormat { what, ty: t.ty })
         .collect()
+}
+
+/// The name of a weight-format item for a file no program runs: what the
+/// tensor is, by its role.
+fn unrun_role(role: Role) -> &'static str {
+    match role {
+        Role::Attention => "mixer matrices (attention, Mamba-2 or delta rule)",
+        Role::Router => "router",
+        Role::RoutedExperts => "routed experts",
+        Role::SharedExpert => "shared expert",
+        Role::DenseFfn => "dense FFN",
+        Role::TokenEmbedding => "token embedding",
+        Role::Head => "output head",
+        _ => "weights",
+    }
 }
 
 /// Every part of `spec` (with its tensors `model`) that no program runs:

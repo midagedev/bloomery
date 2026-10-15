@@ -113,23 +113,12 @@ const COVERAGE: &[(&str, usize)] = &[
         3,
     ),
     (
-        "nvfp4 attention and delta-rule matrices (the body reads q3_K, q4_K, q5_K, q6_K and \
-         q8_0)",
+        "nvfp4 mixer matrices (attention, Mamba-2 or delta rule)",
         40,
     ),
     ("iq2_xxs routed experts on a card", 40),
-    (
-        "iq2_xxs routed experts down (the body reads q4_K, q5_K and q6_K)",
-        40,
-    ),
-    (
-        "iq2_xxs routed experts gate and up (the body reads q4_K and q5_K)",
-        40,
-    ),
-    (
-        "iq2_xxs shared expert (the body reads q8_0, q4_K, q5_K and q6_K)",
-        40,
-    ),
+    ("iq2_xxs routed experts", 40),
+    ("iq2_xxs shared expert", 40),
     (
         "routed stacks whose expert count and width differ by layer (12 shapes)",
         0,
