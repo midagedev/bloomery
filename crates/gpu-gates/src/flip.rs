@@ -407,26 +407,6 @@ mod tests {
         6.0 * band * copy_rms(v)
     }
 
-    // The margin copies the gates carried, as they read when they were lifted:
-    // `gate_ds41_callstream`'s, `gate_qwen38_residency`'s and `gate_qwen35moe_e2e`'s, one body
-    // word for word.
-
-    fn copy_margin(row: &[f32]) -> Result<f32, GateError> {
-        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for (i, &v) in row.iter().enumerate() {
-            if !v.is_finite() {
-                return Err(format!("logit {i} is {v}").into());
-            }
-            if v > a {
-                b = a;
-                a = v;
-            } else if v > b {
-                b = v;
-            }
-        }
-        Ok(a - b)
-    }
-
     /// The lifted `flip_cap` and `margin_cap` are the copies they were lifted from, bit for bit
     /// (the expected functions above are the copies' bodies), on a hand row, a row far from zero
     /// (where the spread and the RMS differ), 4,096 normal values and an empty row. Mutant: the
@@ -465,51 +445,28 @@ mod tests {
         );
     }
 
-    /// The lifted `head_margin` is the copies, bit for bit, on a hand row, a row holding a ±0
-    /// pair and a tie, and 4,096 normals. What the copies left undefined the owner names: a row
-    /// with a value that is not finite and a row shorter than two are errors by name, never a
-    /// silent NaN, infinity or 0. Mutant: the subtraction swapped (the runner-up less the top),
-    /// or a refusal dropped.
+    /// `head_margin` on fixtures: a hand row's top logit less its runner-up (2.0 − 1.25), a tie
+    /// holding a ±0 pair at 0, and the fixed generator's 4,096-normal row at its derived bits; a
+    /// row with a value that is not finite and a row shorter than two are errors by name, never
+    /// a silent NaN, infinity or 0. Mutant: the subtraction swapped (the runner-up less the
+    /// top), or a refusal dropped.
     #[test]
-    fn the_lifted_head_margin_is_the_copies_and_names_what_they_left_undefined() {
-        let rows = [
-            vec![0.5f32, 2.0, -1.0, 1.25],
-            vec![-0.0f32, 0.0, 3.0, 3.0],
-            row(4096, 0.7, 0.3),
-        ];
-        for v in &rows {
-            assert_eq!(
-                head_margin(v).unwrap().to_bits(),
-                copy_margin(v).unwrap().to_bits(),
-                "the lifted margin is the copies"
-            );
+    fn head_margin_matches_fixtures_and_names_invalid_rows() {
+        for (v, want) in [
+            (vec![0.5f32, 2.0, -1.0, 1.25], 0.75f32.to_bits()),
+            (vec![-0.0, 0.0, 3.0, 3.0], 0.0f32.to_bits()),
+            // Expected bits [derived] for this fixed-generator input.
+            (row(4096, 0.7, 0.3), 0x3a9d_9000),
+        ] {
+            assert_eq!(head_margin(&v).unwrap().to_bits(), want);
         }
-        assert_eq!(head_margin(&rows[0]).unwrap(), 0.75, "2.0 less 1.25");
-        assert_eq!(
-            head_margin(&rows[1]).unwrap(),
-            0.0,
-            "a tie reads 0 (and a ±0 pair is no overflow)"
-        );
-        let nan = [1.0f32, f32::NAN, 2.0];
-        assert_eq!(
-            head_margin(&nan).unwrap_err().to_string(),
-            copy_margin(&nan).unwrap_err().to_string(),
-            "the refusal is the copies'"
-        );
-        assert_eq!(head_margin(&nan).unwrap_err().to_string(), "logit 1 is NaN");
-        assert_eq!(
-            head_margin(&[0.0, f32::INFINITY]).unwrap_err().to_string(),
-            "logit 1 is inf"
-        );
-        assert_eq!(
-            head_margin(&[]).unwrap_err().to_string(),
-            "0 logits, a top-1 margin needs two",
-            "an empty row is refused, not a silent NaN"
-        );
-        assert_eq!(
-            head_margin(&[1.0]).unwrap_err().to_string(),
-            "1 logits, a top-1 margin needs two",
-            "a one-value row is refused, not a silent infinity"
-        );
+        for (v, want) in [
+            (vec![1.0, f32::NAN, 2.0], "logit 1 is NaN"),
+            (vec![0.0, f32::INFINITY], "logit 1 is inf"),
+            (vec![], "0 logits, a top-1 margin needs two"),
+            (vec![1.0], "1 logits, a top-1 margin needs two"),
+        ] {
+            assert_eq!(head_margin(&v).unwrap_err().to_string(), want);
+        }
     }
 }
