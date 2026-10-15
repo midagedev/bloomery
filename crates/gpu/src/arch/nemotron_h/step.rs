@@ -6,7 +6,7 @@
 use super::body::Body;
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
-use crate::flash_gqa::{FlashGqaKernels, GqaArgs, HEAD, partials_ms_len, partials_v_len};
+use crate::flash_gqa::{FlashGqaKernels, GROUP_5, GqaArgs, HEAD, partials_ms_len, partials_v_len};
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
 use crate::mamba2::{Mamba2Kernels, Mamba2Scratch, StepArgs};
@@ -387,7 +387,7 @@ fn attn_layer(
     let flash = cx.gpu.flash();
     flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(&s.k), &mut a.kc)?;
     flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(&s.v), &mut a.vc)?;
-    cx.k.flash.enqueue_pass_g5(
+    cx.k.flash.enqueue_pass::<GROUP_5>(
         cx.gpu.stream(),
         GqaArgs {
             q: &s.q,
@@ -403,6 +403,7 @@ fn attn_layer(
             fault,
             y: &mut s.attn,
         },
+        false,
     )?;
     a.o.project(cx, acts, l, &s.attn, &mut s.delta)?;
     residual(cx, src, &s.delta, dst)
