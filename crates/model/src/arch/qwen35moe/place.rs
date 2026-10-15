@@ -2328,7 +2328,11 @@ mod tests {
         assert_eq!(narrow.stage_position_bytes(8), 64 * 4 * 8);
         assert_eq!(narrow.in_q8().stage_position_bytes(8), 64 * 4 * 8);
         assert_eq!(
-            KvLayout::of(&Hparams { rope_dims: 128, ..hp }).stage_position_bytes(8),
+            KvLayout::of(&Hparams {
+                rope_dims: 128,
+                ..hp
+            })
+            .stage_position_bytes(8),
             128 * 4 * 8
         );
     }
