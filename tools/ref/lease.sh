@@ -1371,6 +1371,87 @@ EOF
         matches "bounded-$form-term${trp:+-trap}" "^stub ran: yes, left: none, lease: free, ended before the $BOUND s bound, out: \[${trp:+trap ran }\]${cfix}\$" "$OUT"
       done
     done
+    # The profiling runner owns a decoder beside its bounded perf command. Cancel it only once
+    # both timeout monitors are waiting, with perf record active and the decoder holding the lease.
+    perf='perf-decode'
+    mkdir -p "$t/perf-tree/tools/ref" "$t/perf-bin"
+    cp "$LEASE_TREE/tools/ref/$perf.sh" "$t/perf-tree/tools/ref/"
+    printf '%s\n' 'MODEL=unused REF_TOKENS=0' > "$t/perf-tree/tools/ref/ref-paths.sh"
+    cat > "$t/perf-tree/tools/ref/lease.sh" << 'EOF'
+source "$STUB_PERF_LEASE"
+lease_take() { exec 9> "$STUB_PERF_LOCK"; flock -n 9; }
+witness() { :; }
+EOF
+    cat > "$t/perf-bin/decoder" << 'EOF'
+#!/bin/sh
+echo 'step '
+exec "$STUB_PERF_HELD" "$STUB_PERF_PID"
+EOF
+    cat > "$t/perf-bin/perf" << 'EOF'
+#!/bin/sh
+[ "$1" = record ] || exit 64
+exec "$STUB_PERF_HELD" "$STUB_PERF_RECORD"
+EOF
+    # /proc is Linux-only; the stub's PID file provides the same timeout-child lookup on the Mac.
+    cat > "$t/perf-bin/awk" << 'EOF'
+#!/bin/sh
+case ${2:-} in
+  /proc/*/task/*/children)
+    read -r child parent < "$STUB_PERF_PID" || exit 1
+    [ "$2" = "/proc/$parent/task/$parent/children" ] || exit 1
+    echo "$child"
+    ;;
+  *) exec /usr/bin/awk "$@" ;;
+esac
+EOF
+    cat > "$t/perf-bin/mktemp" << 'EOF'
+#!/bin/sh
+if [ "$*" = '-d /tmp/perf-decode.XXXXXX' ]; then
+  exec /usr/bin/mktemp -d "$STUB_PERF_DIR/out.XXXXXX"
+fi
+exec /usr/bin/mktemp "$@"
+EOF
+    chmod +x "$t/perf-bin/"*
+    STUB_PERF_LEASE="$LEASE_TREE/tools/ref/lease.sh" STUB_PERF_LOCK="$t/perf.lock" \
+      STUB_PERF_HELD="$t/held" STUB_PERF_PID="$t/perf-decoder.pid" STUB_PERF_RECORD="$t/perf-record.pid" \
+      BLOOMERY_DECODE_BIN="$t/perf-bin/decoder" STUB_PERF_DIR="$t" BLOOMERY_ARM_BOUND=$BOUND \
+      PATH="$t/perf-bin:$PATH" bash "$t/perf-tree/tools/ref/$perf.sh" > "$t/perf-log" 2>&1 &
+    rp=$!
+    i=0
+    until { bounded_ready "$t/perf-decoder.pid" && bounded_ready "$t/perf-record.pid"; } || [ "$i" = 100 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    check bounded-perf-record-ready "$(bounded_ready "$t/perf-decoder.pid" && bounded_ready "$t/perf-record.pid" && echo yes || echo no)" yes
+    lk=free
+    lease_free "$t/perf.lock" 2> /dev/null || lk=held
+    check bounded-perf-record-lease-held "$lk" held
+    s0=$SECONDS
+    kill -TERM "$rp" 2> /dev/null
+    RC=0
+    wait "$rp" || RC=$?
+    check bounded-perf-record-term-rc "$RC" 143
+    ended=before
+    [ "$((SECONDS - s0))" -lt "$BOUND" ] || ended='at or after'
+    left=''
+    for child in decoder record; do
+      if [ -s "$t/perf-$child.pid" ]; then
+        read -r sp ip < "$t/perf-$child.pid"
+        if kill -0 "$sp" 2> /dev/null; then left="$left $child"; fi
+        if kill -0 "$ip" 2> /dev/null; then left="$left $child-timeout"; fi
+      fi
+    done
+    lk=free
+    lease_free "$t/perf.lock" 2> /dev/null || lk=held
+    check bounded-perf-record-term "left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound" \
+      "left: none, lease: free, ended before the $BOUND s bound"
+    # Let a surviving timeout reap its stub after the assertions, including on the unfixed runner.
+    for child in decoder record; do
+      if [ -s "$t/perf-$child.pid" ]; then
+        read -r sp ip < "$t/perf-$child.pid"
+        kill -TERM "$ip" 2> /dev/null || :
+      fi
+    done
     RC=0
     lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-capture-rc "$RC" 3

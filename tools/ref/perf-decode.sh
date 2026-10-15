@@ -28,8 +28,15 @@ lease_take
 witness pre
 # Bounded like every child under the lease (lease_bounded's bound); perf attaches to the decode binary
 # itself, the bound's child, whose pid is the main thread's tid in the tables below.
+bound_pid='' decode_exit=''
+trap 'trap "" TERM INT HUP; [ -z "$bound_pid" ] || { kill -TERM "$bound_pid" 2>/dev/null || :; wait "$bound_pid" 2>/dev/null || :; }' EXIT
+for s in TERM:143 INT:130 HUP:129; do
+  # shellcheck disable=SC2064 # the signal's status now, the decoder PID when the trap runs
+  trap "decode_exit=${s#*:}; [ -z \"\$bound_pid\" ] || exit ${s#*:}" "${s%:*}"
+done
 timeout --kill-after=10 "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" > "$OUT/decode.log" 2>&1 &
 bound_pid=$!
+[ -z "$decode_exit" ] || exit "$decode_exit"
 pid=
 while [ -z "$pid" ]; do
   kill -0 "$bound_pid" 2> /dev/null || { echo "decode exited before perf could attach" >&2; cat "$OUT/decode.log" >&2; exit 1; }
@@ -50,7 +57,13 @@ else
 fi
 lease_bounded "$LEASE_ARM_BOUND" perf record -q -e cpu-clock -F 10000 "${target[@]}" -o "$OUT/perf.data" -- sleep "$SECS" 2> "$OUT/perf.err" || echo "[perf] record rc=$?: $(tr '\n' ' ' < "$OUT/perf.err")"
 if kill -0 "$pid" 2> /dev/null; then inside=yes; else inside=no; fi
-wait "$bound_pid"
+decode_rc=0
+wait "$bound_pid" || decode_rc=$?
+bound_pid=''
+# Later profiling commands keep their normal signal handling once the decoder has been reaped.
+trap - TERM INT HUP
+[ -z "$decode_exit" ] || exit "$decode_exit"
+[ "$decode_rc" -eq 0 ] || exit "$decode_rc"
 witness post
 steps_done=$(grep -cE '^ +[0-9]+ +[0-9]+ +[0-9.]+ ' "$OUT/decode.log")
 grep -E 'decode steps in|per step' "$OUT/decode.log"
