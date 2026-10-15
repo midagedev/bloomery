@@ -1345,6 +1345,24 @@ EOF
     lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-capture-rc "$RC" 3
     check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
+    check bounded-capture-exit-trap "$(trap -p EXIT)" "trap -- 'rm -rf \"\$t\"; lease_out_clean' EXIT"
+    cat > "$t/exit-trap-runner" << 'EOF'
+source "$1"
+trap 'printf "%s\n" "runner'\''s trap" > "$2"
+printf "%s\n" kept >> "$2"' EXIT
+lease_capture 10 true
+lease_out_init
+echo "$LEASE_OUT_DIR" > "$3"
+echo "$4" > "$3.arg"
+EOF
+    RC=0
+    lease_bounded 10 bash "$t/exit-trap-runner" "$LEASE_TREE/tools/ref/lease.sh" \
+      "$t/exit-marker" "$t/exit-dir" sentinel > "$t/exit-log" 2>&1 || RC=$?
+    check bounded-capture-quoted-exit-rc "$RC" 0
+    check bounded-capture-quoted-exit-ran "$(cat "$t/exit-marker")" "$(printf "runner's trap\nkept")"
+    check bounded-capture-exit-positional "$(cat "$t/exit-dir.arg")" sentinel
+    cdir=$(cat "$t/exit-dir")
+    check bounded-capture-quoted-exit-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
     RC=0
     lease_filter 10 stdout "$t/filter-both" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-filter-command-rc "$RC" 3
