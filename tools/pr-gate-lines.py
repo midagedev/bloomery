@@ -16,7 +16,8 @@ Any other line is a named error. Each item prints as
   - `<recipe>` (lane <x>): ok|FAIL rc <n>|skip|deferred|yield|unclaimed, <wall> s
 and the first `gate-batch: … logs in DIR` line (the stdout's) or the DONE line is printed above them as the batch's identity.
 
-rc 84 is tools/boxq.py's: the Mac lost the daemon for three polls and the job is left running on the box, so the item's
+rc 84 is tools/boxq.py's: the Mac lost the daemon past BOXQ_RECONNECT_S of backoff (or past three polls when its
+ssh could not start) and the job is left running on the box, so the item's
 result is not known here. The job id is the one in boxq's `boxq: <id> left as it is on the box; resume with: …` line (a
 lost daemon past BOXQ_RECONNECT_S) or its `boxq: <name>: job <id> is left as it is: …` line (printed when
 the attach ends 84), taken from the item's own log (DIR/g-<stem>.log, next to LOG unless --logs names another directory)

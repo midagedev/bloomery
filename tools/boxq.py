@@ -38,15 +38,15 @@ so an interrupted session does not throw away a job's card time. A job whose fir
 is not cancelled either: the exit is 130 or 143 and nothing is mirrored. A signal while unread bytes are replayed is
 that same exit, and no rc file. A job that starts between the last poll and the
 cancel is cancelled (the poll interval is the window).
-After POLL_FAILS (3) polls in a row that cannot reach the daemon the client backs off exponentially for at most
-BOXQ_RECONNECT_S seconds (300), resumes each tail at the next byte, and only past that bound exits 84 with
+After POLL_FAILS (3) polls in a row that cannot reach the daemon the client backs off exponentially, each pause at
+most RECONNECT_STEP_S (60 s), for at most BOXQ_RECONNECT_S seconds (900), resumes each tail at the next byte, and only past that bound exits 84 with
 `boxq: <id> left as it is on the box; resume with: tools/boxq.py attach <id>` and no rc file. A signal during a pause
 is decided as after any poll.
 
   BOXQ_HOST   ssh host (default $BLOOMERY_BOX, else ws)      BOXQ_URL            the daemon (http://127.0.0.1:8030)
   BOXQ_SSH    the ssh command (default ssh)                  BOXQ_POLL_S         poll interval, seconds (5)
   BOXQ_NOTE_S seconds between queue-wait lines (60)          BOXQ_CANCEL_WAIT_S  wait after a cancel (150)
-  BOXQ_RECONNECT_S seconds of backoff after those misses (300)
+  BOXQ_RECONNECT_S seconds of backoff after those misses (900)
 
 Exit: the job's rc (run, attach); 0 ok; 64 usage or no such job; 81 lost, or still running after the cancel; 84 the daemon
 is not alive past the reconnect bound, answers outside the wire, or a replay ssh does not exit 0; 130/143 a trapped INT/TERM; a daemon refusal exits with the rc it names. 80, 83
@@ -84,9 +84,10 @@ TERMINAL = ("done", "failed", "cancelled", "lost")
 LOST, DOWN = 81, 84
 INT_RC, TERM_RC = 130, 143
 POLL_FAILS = 3  # polls in a row that cannot reach the daemon before the attach starts backing off
-RECONNECT_S = 300.0  # BOXQ_RECONNECT_S default: the backoff budget, then 84
+RECONNECT_S = 900.0  # BOXQ_RECONNECT_S default: the backoff budget, then 84 (a daemon blip has lasted ~12 min)
+RECONNECT_STEP_S = 60.0  # the longest one backoff pause: a daemon back is seen within this
 RESUME_LINE = "boxq: {jid} left as it is on the box; resume with: tools/boxq.py attach {jid}"
-LINK_DOWN = ("daemon-down", "no-ssh")  # the Down names a blip can clear; any other answer is not waited out
+LINK_DOWN = ("daemon-down",)  # the Down names a blip can clear; any other (an ssh that cannot start) is not waited out
 FLUSH_MAX_S = 2.0  # the longest the tails get, after a terminal status, to read what the job wrote last
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -386,18 +387,15 @@ def follow(q, job, fds=(1, 2), offsets=(0, 0)):
 
 def dump(q, job, trap, fds=(1, 2), offsets=(0, 0)):
     """A job whose tails are not running: each file is read from the next unread byte and the children end by
-    themselves; a file the job never wrote, or a path it never got, is skipped. The first read is `cat`; a resumed
-    read is `tail -c` from the next byte."""
+    themselves; a file the job never wrote, or a path it never got, is skipped. Each file is read with `tail -c` from
+    the next unread byte."""
     cmds, out_fds = [], []
     for key, fd, skip in zip(("out", "err"), fds, offsets):
         path = box_path(job, key)
         if not path:
             continue
         qpath = shlex.quote(path)
-        if skip > 0:
-            cmds.append(f"[ ! -e {qpath} ] || exec tail -c +{skip + 1} {qpath}")
-        else:
-            cmds.append(f"[ ! -e {qpath} ] || exec cat {qpath}")
+        cmds.append(f"[ ! -e {qpath} ] || exec tail -c +{skip + 1} {qpath}")
         out_fds.append(fd)
     # The children write to pipes this process drains, so a closed local reader drops bytes (drain's rule) and is not
     # an ssh failure. A non-zero ssh is a missed read: 84 and no rc file, the same as a daemon the client cannot reach.
@@ -564,7 +562,7 @@ def attach_job(q, jid, rc_dir, trap, leave=False):
                     if remain <= 0:
                         gone = Down("daemon-down", e.msg, RESUME_LINE.format(jid=jid))
                     else:
-                        wait = min(q.poll_s * 2 ** min(reconnect["shift"], 20), remain)
+                        wait = min(q.poll_s * 2 ** min(reconnect["shift"], 20), RECONNECT_STEP_S, remain)
                         reconnect["shift"] += 1
                         say(f"boxq: {jid}: reconnecting, next poll in {wait:g} s")
             # a pending signal is decided here, before this poll's answer is taken: another client's job (leave) and a job
@@ -912,6 +910,7 @@ class Fix:
         self.rc_dir, self.ssh = os.path.join(tmp, "rc"), os.path.join(tmp, "ssh")
         self.ssh_log = os.path.join(tmp, "ssh.log")
         self.tail_pids, self.hung_pids = os.path.join(tmp, "tail.pids"), os.path.join(tmp, "hung.pid")
+        self.follow_pids = os.path.join(tmp, "follow.pids")  # the tails started with -F (tail_pids has every tail)
         self.replay_fail = os.path.join(tmp, "replay-fail")
 
     def call(self, *argv):
@@ -933,14 +932,16 @@ class Fix:
         bindir, q = os.path.join(self.tmp, "bin"), shlex.quote
         os.makedirs(bindir)
         self.script(os.path.join(bindir, "tail"),
-                    f'echo $$ >> {q(self.tail_pids)}\nexec {q(shutil.which("tail"))} "$@"\n')
+                    f'echo $$ >> {q(self.tail_pids)}\n'
+                    f'case " $* " in *" -F "*) echo $$ >> {q(self.follow_pids)} ;; esac\n'  # a follow, not dump's read
+                    f'exec {q(shutil.which("tail"))} "$@"\n')
         if not shutil.which("stdbuf"):  # a Mac: the box's `stdbuf -o0 tail` runs here as plain tail
             self.script(os.path.join(bindir, "stdbuf"), 'shift\nexec "$@"\n')
         self.script(self.ssh, f'printf "%s\\n" "$*" >> {q(self.ssh_log)}\nfor last; do :; done\n'
                               f'if [ -f {q(self.replay_fail)} ]; then\n'
                               f'  case "$last" in\n'
                               f'    *"-F "*) ;;\n'
-                              f'    *"exec cat "*|*"exec tail -c "*) exit 255 ;;\n'
+                              f'    *"exec tail -c "*) exit 255 ;;\n'
                               f'  esac\n'
                               f'fi\n'
                               f'PATH={q(bindir)}:$PATH\nexport PATH\nexec sh -c "$last"\n')
@@ -1027,6 +1028,8 @@ class Fix:
             check(time.monotonic() < end, f"pids still alive {secs} s on: {[p for p in pids if alive(p)]}")
             time.sleep(0.02)
         open(path, "w").close()
+        if path == self.tail_pids:
+            open(self.follow_pids, "w").close()
 
     def wait_requests(self, fake, n, which=None, secs=10):
         end = time.monotonic() + secs
@@ -1042,7 +1045,7 @@ class Fix:
             if p.poll() is None:
                 p.kill()
                 p.communicate()
-        for path in (self.tail_pids, self.hung_pids):
+        for path in (self.tail_pids, self.follow_pids, self.hung_pids):
             for pid in self.pids(path):
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGKILL)
@@ -1302,7 +1305,7 @@ def case_int_cancel(fx):
         p.send_signal(sig)
         got, so, se = fx.finish(p)
         cancels = fake.cancels()
-        check(got == want and b"elsewhere" not in se and fx.pids(fx.tail_pids) == [],
+        check(got == want and b"elsewhere" not in se and fx.pids(fx.follow_pids) == [],
               f"{sig.name} on a queued job exits {want}, the cancel is ours, no tail to stop: {got} {se!r}")
         check(len(cancels) == 1 and cancels[0][0] == "POST" and cancels[0][2] == b"{}",
               f"one POST cancel with {{}}: {cancels}")
@@ -1460,9 +1463,39 @@ def case_reconnect_wall(fx):
     check(min(asked) < 30.0, f"a poll inside the budget is asked for no longer than what is left: {asked}")
 
 
-def _cancel_run(fx, q, clock, sigs=(signal.SIGINT,)):
+def case_reconnect_step(fx):
+    """A long budget backs off in pauses of at most RECONNECT_STEP_S; an ssh that cannot start is not waited out."""
+    clock, said = Clock(), []
+    q = StubQueue(5.0, reconnect_s=RECONNECT_S)
+
+    def job(jid, timeout=30.0):
+        raise Down("daemon-down", "GET /jobs/j1: no reply")
+
+    q.job = job
     real_say = globals()["say"]
-    globals()["say"] = lambda msg: None
+    globals()["say"] = said.append
+    try:
+        raised = _cancel_run(fx, q, clock, sigs=(), quiet=False)
+        steps = [float(m.rsplit(" in ", 1)[1].split()[0]) for m in said if "reconnecting, next poll in" in m]
+        check(isinstance(raised, Down) and steps and max(steps) == RECONNECT_STEP_S and clock.t >= RECONNECT_S,
+              f"pauses stop growing at {RECONNECT_STEP_S:g} s and the budget is spent: max {max(steps or [0]):g}, "
+              f"ended at {clock.t:g} s {raised!r}")
+        clock = Clock()
+
+        def no_ssh(jid, timeout=30.0):
+            raise Down("no-ssh", "/typo: No such file or directory")
+
+        q.job = no_ssh
+        raised = _cancel_run(fx, q, clock, sigs=(), quiet=False)
+        check(isinstance(raised, Down) and raised.name == "no-ssh" and clock.t < 60,
+              f"an ssh that cannot start ends 84 after the polls, not the backoff: {clock.t:g} s {raised!r}")
+    finally:
+        globals()["say"] = real_say
+
+
+def _cancel_run(fx, q, clock, sigs=(signal.SIGINT,), quiet=True):
+    real_say = globals()["say"]
+    globals()["say"] = (lambda msg: None) if quiet else real_say
     try:
         try:
             with_clock(clock, lambda: attach_job(q, "j1", fx.rc_dir, ClockTrap(clock, sigs)))
@@ -1733,12 +1766,12 @@ def case_attach_env(fx):
         mirrored = os.path.join(fx.tmp, where, "j1.rc")
         check(got == 0 and so == b"out\n" and os.path.exists(mirrored) and open(mirrored).read() == "0\n",
               f"attach to a finished job prints its out and mirrors into {where}: {got} {so!r} {se!r}")
-    check(fx.pids(fx.tail_pids) == [], "a job that finished before the attach is read whole, with no tail -F")
+    check(fx.pids(fx.follow_pids) == [], "a job that finished before the attach is read whole, with no tail -F")
     for path in (fx.out, fx.err):
         os.unlink(path)
     fx.serve([{"status": "cancelled"}])
     got, so, se = fx.client("attach", "j1", BOXQ_RC_DIR=os.path.join(fx.tmp, "envrc"))
-    check(got == 81 and so == b"" and se == b"boxq: j1 cancelled elsewhere\n" and fx.pids(fx.tail_pids) == [],
+    check(got == 81 and so == b"" and se == b"boxq: j1 cancelled elsewhere\n" and fx.pids(fx.follow_pids) == [],
           f"a cancelled job that never wrote a file: 81 and one line: {got} {so!r} {se!r}")
 
 
@@ -1772,7 +1805,7 @@ def case_mirror(fx):
 def case_config(fx):
     q = Queue({})
     got = (q.host, q.ssh, q.url, q.poll_s, q.note_s, q.cancel_wait_s, q.reconnect_s)
-    check(got == ("ws", ["ssh"], "http://127.0.0.1:8030", 5.0, 60.0, 150.0, 300.0), f"the defaults: {got}")
+    check(got == ("ws", ["ssh"], "http://127.0.0.1:8030", 5.0, 60.0, 150.0, 900.0), f"the defaults: {got}")
     q = Queue({"BLOOMERY_BOX": "bx", "BOXQ_SSH": "ssh -o BatchMode=yes", "BOXQ_URL": "http://h:1/", "BOXQ_POLL_S": "2"})
     check((q.host, q.ssh, q.url, q.poll_s) == ("bx", ["ssh", "-o", "BatchMode=yes"], "http://h:1", 2.0), "the env's values")
     check(Queue({"BOXQ_HOST": "h", "BLOOMERY_BOX": "bx"}).host == "h", "BOXQ_HOST beats BLOOMERY_BOX")
@@ -1882,7 +1915,7 @@ CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_predicti
          case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
          case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_drain_full_pipe,
-         case_pending_replay, case_replay_ssh, case_replay_signal, case_reconnect_wall,
+         case_pending_replay, case_replay_ssh, case_replay_signal, case_reconnect_wall, case_reconnect_step,
          case_cancel_deadline, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
 
