@@ -16,7 +16,7 @@
 //! another file, and one written by another mainline build.
 
 use crate::RefError;
-use crate::columns::{Columns, Row};
+use crate::columns::{Columns, Row, file_name};
 use crate::family::{Family, Identity};
 use std::collections::HashSet;
 use std::fmt;
@@ -229,16 +229,6 @@ fn one(f: &[&str], at: &dyn fmt::Display, want: &str) -> Result<String, RefError
         [_, v] if !v.is_empty() => Ok((*v).to_string()),
         _ => Err(RefError::malformed(at, format!("want {want}"))),
     }
-}
-
-fn file_name(name: &str, at: &dyn fmt::Display) -> Result<(), RefError> {
-    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
-        return Err(RefError::malformed(
-            at,
-            format!("{name:?} does not name a file of the set's directory"),
-        ));
-    }
-    Ok(())
 }
 
 fn prompt_row(r: &Row<'_>, at: &dyn fmt::Display) -> Result<Prompt, RefError> {

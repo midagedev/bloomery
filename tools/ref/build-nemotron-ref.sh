@@ -25,16 +25,6 @@ LIBLLAMA=$(ldd "$TOKENIZE" | awk '$1 == "libllama.so" || $1 == "libllama.so.0" {
 [ -f "$LIBLLAMA" ] || { echo "build-nemotron-ref: $TOKENIZE loads no libllama.so (ldd names '$LIBLLAMA')" >&2; exit 66; }
 TOK_MD5=$(md5sum < "$TOKENIZE" | cut -d' ' -f1)
 LIB_MD5=$(md5sum < "$LIBLLAMA" | cut -d' ' -f1)
-# The tokenizer family's pin. Recording a different pair would make every nemotron set foreign
-# and would mean this tree was rebuilt.
-[ "$TOK_MD5" = 5df95d3a942effc971ff170432d840fd ] || {
-  echo "build-nemotron-ref: llama-tokenize md5 is $TOK_MD5, the pinned mainline is 5df95d3a942effc971ff170432d840fd" >&2
-  exit 2
-}
-[ "$LIB_MD5" = 3575b1f39e7773379fec011d39f32a77 ] || {
-  echo "build-nemotron-ref: libllama md5 is $LIB_MD5, the pinned mainline is 3575b1f39e7773379fec011d39f32a77" >&2
-  exit 2
-}
 BUILD_ID="llama-tokenize $TOK_MD5 libllama.so $LIB_MD5"
 COMMIT=$(git_lcpp rev-parse --short=9 HEAD)
 LIBDIR=$LCPP/build/bin

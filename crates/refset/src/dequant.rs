@@ -198,12 +198,7 @@ impl DequantSet {
 
 fn file_row(r: &Row<'_>, at: &dyn fmt::Display) -> Result<SetFile, RefError> {
     let name = r.text("file")?;
-    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
-        return Err(RefError::malformed(
-            at,
-            format!("{name:?} does not name a file of the set's directory"),
-        ));
-    }
+    crate::columns::file_name(name, at)?;
     let md5 = r.text("md5")?;
     check_hex("md5", md5, at)?;
     Ok(SetFile {

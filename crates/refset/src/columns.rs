@@ -109,3 +109,15 @@ where
     v.parse()
         .map_err(|e| RefError::malformed(at, format!("{name} {v:?}: {e}")))
 }
+
+/// `name` is one file of the set's own directory. Empty, `.`, `..`, or a
+/// slash is `Malformed`: the manifest must not name a path outside it.
+pub(crate) fn file_name(name: &str, at: &dyn Display) -> Result<(), RefError> {
+    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
+        return Err(RefError::malformed(
+            at,
+            format!("{name:?} does not name a file of the set's directory"),
+        ));
+    }
+    Ok(())
+}
