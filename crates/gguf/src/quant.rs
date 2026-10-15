@@ -1410,13 +1410,14 @@ pub fn quantize_row_q8_0_roundtrip(x: &[f32], out: &mut [f32]) {
 /// are BF16 in ggml (`vec_dot_type`, ggml.c:1494), which this engine does not encode, and
 /// f32 would be a plausible wrong answer. So is every type [`dequant_row`] does not decode. Q2_K and
 /// IQ2_XS take Q8_K in ggml (ggml.c:895, :1105 on the IQK build; `iqk_set_kernels_kquants` and
-/// `iqk_set_kernels_iquants` accept Q8_K only for them); the other i-quants take Q8_K too and have no
-/// CPU matmul here. Q2_0, mainline's alone, takes Q8_0 (`f2cc7282c` ggml-cpu.c:237), the column
+/// `iqk_set_kernels_iquants` accept Q8_K only for them), and IQ2_XXS too (ggml.c:1064, mainline's
+/// ggml-cpu.c:340); the other i-quants take Q8_K too and have no CPU matmul here. Q2_0, mainline's alone, takes Q8_0 (`f2cc7282c` ggml-cpu.c:237), the column
 /// qdot's Q2_0 kernel reads. NVFP4 has a reference decode and no CPU matmul here.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
         GgmlType::Q2_K
         | GgmlType::Q3_K
+        | GgmlType::IQ2_XXS
         | GgmlType::IQ2_XS
         | GgmlType::IQ3_XXS
         | GgmlType::IQ3_S
@@ -1433,7 +1434,6 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
         GgmlType::F32 | GgmlType::F16 => Ok(None),
         GgmlType::BF16
         | GgmlType::NVFP4
-        | GgmlType::IQ2_XXS
         | GgmlType::IQ1_S
         | GgmlType::IQ2_S
         | GgmlType::I8
@@ -1618,12 +1618,15 @@ mod tests {
     // and :1105 name Q8_K as their vec_dot_type, and ik's kernel tables accept no other column.
     // PIN(2026-10-12): Q2_0 takes Q8_0, no longer refused: qdot fuses it, and mainline's ggml-cpu.c:237
     // (`f2cc7282c`) names Q8_0 as its vec_dot_type.
+    // PIN(2026-10-16): IQ2_XXS takes Q8_K, no longer refused: qdot fuses it, and ggml.c:1064 (mainline's
+    // ggml-cpu.c:340) names Q8_K as its vec_dot_type.
     #[test]
     fn activation_formats_are_ggmls_vec_dot_types() {
         use super::ActivationFormat::{Q8_0, Q8_2X4, Q8K};
         for (ty, want) in [
             (GgmlType::Q2_K, Some(Q8K)),
             (GgmlType::Q3_K, Some(Q8K)),
+            (GgmlType::IQ2_XXS, Some(Q8K)),
             (GgmlType::IQ2_XS, Some(Q8K)),
             (GgmlType::IQ3_XXS, Some(Q8K)),
             (GgmlType::IQ3_S, Some(Q8K)),

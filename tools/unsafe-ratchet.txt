@@ -393,7 +393,9 @@ placement 0 0 0
 # take their column factors from q82x4_dy_my (one unsafe fn of 8 blocks, one per pointer offset and load) and their
 # scale and min loads from q45k_scales_ps and q45k_mins_ps (safe AVX2 fns of one load block each); the two AVX-512
 # bodies keep one block per load, store, pointer offset or unsafe call (7 and 12); each with its SAFETY line.
-qdot 172 80 0
+# PIN(2026-10-16): qdot 172 -> 178 blocks, 80 -> 83 fns, new code: the IQ2_XXS x Q8_K AVX2 dot and column tile and the
+# lifted keven_signs_word (bolt-r1), each block with its SAFETY line.
+qdot 178 83 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

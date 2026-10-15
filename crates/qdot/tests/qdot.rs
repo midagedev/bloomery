@@ -2219,6 +2219,148 @@ fn hw_iq2xs_kernel_predicts_ik() {
     );
 }
 
+// ------------------------------------------------------- IQ2_XXS x Q8_K
+// ggml's x86 vec dot is the reference and no harness dumps it, so the gates stand on the
+// crate's own oracles: kernel vs mirror (bit identity, the twins' contract), ours vs the
+// dequant oracle (a band, below) and tile vs dot_row (bit identity).
+
+/// An IQ2_XXS block: f16 `d`, then per sub-block `s` the four grid index bytes `idx(4s)`
+/// .. `idx(4s + 3)` and the sign/scale word `aux(s)` (bits `7l .. 7l + 7` group `l`'s
+/// [`KSIGNS_IQ2XS`] index, bits 28..32 the scale nibble).
+fn iq2xxs_block(d: u16, idx: impl Fn(usize) -> u8, aux: impl Fn(usize) -> u32) -> Vec<u8> {
+    let mut b = d.to_le_bytes().to_vec();
+    for s in 0..8 {
+        b.extend((0..4).map(|l| idx(4 * s + l)));
+        b.extend_from_slice(&aux(s).to_le_bytes());
+    }
+    b
+}
+
+/// The band gate's hand-built block: sub-block `s` reads grid entry `s` in all four
+/// groups, sign index `7 − s` on every group and the scale nibble `s`.
+fn iq2xxs_hand_block() -> Vec<u8> {
+    iq2xxs_block(
+        F16_ONE,
+        |i| ((i / 4) % 8) as u8,
+        |s| {
+            let v = 7 - s as u32;
+            (s as u32) << 28 | v | v << 7 | v << 14 | v << 21
+        },
+    )
+}
+
+/// IQ2_XXS end blocks: every index 0xFF with every sign bit and the top scale under
+/// either sign of `d`, the signs alone (scale 0), the scale alone (no signs), every index
+/// 0 under a scrambled word, a scrambled pattern, d = 0 and a subnormal d.
+const IQ2XXS_ENDS: [IqEnd; 8] = [
+    || iq2xxs_block(F16_ONE, |_| 0xFF, |_| 0xFFFF_FFFF),
+    || iq2xxs_block(F16_NEG_ONE, |_| 0xFF, |_| 0xFFFF_FFFF),
+    || iq2xxs_block(F16_ONE, |_| 0xFF, |_| 0x0FFF_FFFF),
+    || iq2xxs_block(F16_ONE, |_| 0xFF, |_| 0xF000_0000),
+    || iq2xxs_block(F16_ONE, |_| 0, |_| 0xA5C3_1E87),
+    || {
+        iq2xxs_block(
+            F16_ONE,
+            |i| (i * 37 + 11) as u8,
+            |s| 0x1E87_A5C3u32.rotate_left(5 * s as u32),
+        )
+    },
+    || iq2xxs_block(0, |_| 0xFF, |_| 0xFFFF_FFFF),
+    || iq2xxs_block(F16_TINY, |i| i as u8, |_| 0xF0F0_F0F0),
+];
+
+/// IQ2_XXS kernel vs mirror on [`generated_gate_a`]'s rows (random bytes, finite scales)
+/// at 16, three and one blocks, and on the ends of [`IQ2XXS_ENDS`] (every grid index, sign
+/// index and scale nibble at its extreme, d = 0, a subnormal d) at one and three blocks
+/// against the ±3.0 and seeded columns — bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn iq2xxs_kernel_matches_mirror() {
+    generated_gate_a(GgmlType::IQ2_XXS, 66, 256, &[4096, 768, 256]);
+    for k in [256, 768] {
+        let nb = k / 256;
+        let rows = legacy_end_rows(&IQ2XXS_ENDS, nb, |end| end());
+        let cols = legacy_tile_columns(GgmlType::IQ2_XXS, k, vec![]);
+        for (r, row) in rows.chunks(66 * nb).enumerate() {
+            for (j, col) in cols.iter().enumerate() {
+                let a = dot_row_avx2(GgmlType::IQ2_XXS, row, col, k).unwrap();
+                let b = dot_row_scalar(GgmlType::IQ2_XXS, row, col, k).unwrap();
+                assert!(
+                    a.to_bits() == b.to_bits(),
+                    "end row {r} (k = {k}) column {j}: kernel {a:e} (bits {:#x}) and mirror {b:e} \
+                     (bits {:#x}) must be bit-identical",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+        eprintln!(
+            "IQ2_XXS: {} end rows x {} columns bit-identical (k = {k})",
+            rows.len() / (66 * nb),
+            cols.len()
+        );
+    }
+}
+
+/// IQ2_XXS against the dequant oracle: `dequant_row`'s f32 weights (held to ggml's
+/// `dequantize_row_iq2_xxs` bit for bit in gguf) times the column's scaled codes, summed
+/// exactly in f64, at the hand-built block ([`iq2xxs_hand_block`]), the ends' one- and
+/// three-block rows and sixteen random blocks, through `dot_row` and `dot_row_scalar`.
+///
+/// The oracle's weights carry two f32 roundings a term (`db`, then the value), ours one
+/// fmadd a block and the closing hsum's three adds a lane, and the ×0.125 is exact, so
+/// the band is `gamma_(nb + 10) · Σ|term|` with `gamma_n = n·u / (1 − n·u)` and
+/// `u = 2^-24` — both sides' roundings over the exact dot. A wrong grid byte, sign bit or
+/// scale nibble moves a whole term.
+#[test]
+fn iq2xxs_dot_is_within_its_f64_bound() {
+    let mut rng = Lcg(0x2C_0F7E);
+    for k in [256usize, 768, 4096] {
+        let nb = k / 256;
+        let x: Vec<f32> = (0..k).map(|_| rng.unit() * 30.0).collect();
+        let mut acol = vec![0u8; col_bytes(GgmlType::IQ2_XXS, k)];
+        quantize_col(GgmlType::IQ2_XXS, &x, &mut acol);
+        let mut rows = vec![iq2xxs_hand_block().repeat(nb)];
+        rows.extend(
+            legacy_end_rows(&IQ2XXS_ENDS, nb, |end| end())
+                .chunks(66 * nb)
+                .map(<[u8]>::to_vec),
+        );
+        for _ in 0..4 {
+            rows.push(iq_random_block(&mut rng, 66, &[0]).repeat(nb));
+        }
+        let n_u = (nb + 10) as f64 * 2f64.powi(-24);
+        for (r, row) in rows.iter().enumerate() {
+            let mut w = vec![0.0f32; k];
+            dequant_row(GgmlType::IQ2_XXS, row, &mut w).unwrap();
+            let (mut exact, mut abs) = (0.0f64, 0.0f64);
+            for (b, wb) in w.as_chunks::<256>().0.iter().enumerate() {
+                let blk = &acol[296 * b..296 * (b + 1)];
+                let dy = f64::from(f32::from_le_bytes(blk[0..4].try_into().unwrap()));
+                for (&wv, &q) in wb.iter().zip(&blk[8..264]) {
+                    let term = f64::from(wv) * (dy * f64::from(q as i8));
+                    exact += term;
+                    abs += term.abs();
+                }
+            }
+            let bound = n_u / (1.0 - n_u) * abs;
+            for (path, got) in [
+                ("dot_row", dot_row(GgmlType::IQ2_XXS, row, &acol, k)),
+                (
+                    "dot_row_scalar",
+                    dot_row_scalar(GgmlType::IQ2_XXS, row, &acol, k),
+                ),
+            ] {
+                let got = f64::from(got.unwrap());
+                assert!(
+                    (got - exact).abs() <= bound,
+                    "{path} k = {k} row {r}: got {got:e}, exact {exact:e}, bound {bound:e}"
+                );
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------- Q8_0 x Q8_2_X4
 // The oracle is a synthetic block set (tools/ref/q8f0_ref.cpp): its generator writes the
 // column's f32 values, ik's q8_2_x4 bytes of it and every weight row into the dump, so this
@@ -4837,6 +4979,15 @@ fn hw_q2k_tile_matches_dot_row() {
 #[ignore = "hw: needs the box (AVX2)"]
 fn hw_iq2xs_tile_matches_dot_row() {
     iq_tile_synthetic(GgmlType::IQ2_XS, 74, 256, &[4096, 768, 256], &IQ2XS_ENDS);
+}
+
+/// IQ2_XXS tile clause: random rows and the ends of [`IQ2XXS_ENDS`] at k = 4096, 768 and
+/// 256 — tile = `dot_row` per column, bit for bit. No IQ2_XXS file is on the box, so
+/// there are no real rows.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_iq2xxs_tile_matches_dot_row() {
+    iq_tile_synthetic(GgmlType::IQ2_XXS, 66, 256, &[4096, 768, 256], &IQ2XXS_ENDS);
 }
 
 /// IQ4_NL tile clause: random rows and the ends of [`IQ4NL_ENDS`] at each of
