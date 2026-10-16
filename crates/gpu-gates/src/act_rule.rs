@@ -34,8 +34,8 @@
 //! rounding of the codes.
 //!
 //! [`site_rel`] reads both sides' worst-case rounding per weight type for
-//! the projections of the GLM-5.3 and Qwen3.8 bodies; the table above and
-//! [`Rule::of`] are the V4.1 dense gemv's.
+//! the projections of the GLM-5.3, Qwen3.8 and Nemotron 3.5 Bolt bodies; the
+//! table above and [`Rule::of`] are the V4.1 dense gemv's.
 
 use gguf::quant::{ActivationFormat, GgmlType, activation_format, half_to_f32};
 
@@ -211,13 +211,15 @@ impl SiteRel {
 
 /// How both engines round the activation of a projection whose weight is `ty`, as [`q8_rel`] of
 /// each side's block (0 for f32): ik's on a batch of at most 31 columns, and our launch `arm`'s.
-/// `None` for a type or an arm no launch of the GLM-5.3 and Qwen3.8 bodies reads.
+/// `None` for a type or an arm no launch of the GLM-5.3, Qwen3.8 and Nemotron 3.5 Bolt bodies
+/// reads.
 ///
 /// - ik: `gguf::quant::activation_format`'s table, the weight type's `vec_dot_type` — Q3_K,
-///   IQ2_XS, IQ3_S, IQ3_XXS and IQ4_XS read q8_K blocks of [`QK_K`] values, as Q2_K does, Q4_K, Q5_K, Q6_K, Q8_0, Q5_1 and
+///   IQ2_XXS, IQ2_XS, IQ3_S, IQ3_XXS and IQ4_XS read q8_K blocks of [`QK_K`] values, as Q2_K does, Q4_K, Q5_K, Q6_K, Q8_0, Q5_1 and
 ///   IQ4_NL q8_2 blocks of [`crate::ik_q8_2::QK`], F32 f32 — which ggml applies whatever the
 ///   column count. The table's one q8_0 row, Q2_0, is mainline's, and no ik dot reads it:
-///   `None`. The iqk matmul's `is_dequant_better` changes the weight's form, not the
+///   `None`. NVFP4 is mainline's alone (`vec_dot_nvfp4_q8_1`, a CUDA dot), so its row counts no ik
+///   side. The iqk matmul's `is_dequant_better` changes the weight's form, not the
 ///   activation's, and only from 32 columns up (64 for Q6_K), so a batch under 32 columns runs
 ///   the weight's own dot on that form.
 /// - Ours: the form each launch reads. A dense site is `crates/gpu/src/site.rs`'s
@@ -227,13 +229,20 @@ impl SiteRel {
 ///   q8_1 blocks of [`Q8_1_BLOCK`] under a K-quant, IQ3_XXS or IQ4_XS (the gate·up's `Q8Act` and
 ///   the grouped GEMM's `GemmAct`) and q8 blocks of [`Q8_32_BLOCK`] under Q8_0, Q5_1 or IQ4_NL
 ///   (`Q8Blocks32` and `GemmAct32`). An IQ2_XS, IQ3_S or Q2_K expert stack is read by the host tier
-///   alone, whose dot takes the q8_K blocks of [`QK_K`] values ik's takes, so ours is ik's there. For Q5_K this differs from [`Rule::of`], which names the
+///   alone, whose dot takes the q8_K blocks of [`QK_K`] values ik's takes, so ours is ik's there.
+///   Bolt's body adds IQ2_XXS on the expert and the gemv (`iq2_xxs_gemv_sel`, `iq2_xxs_rows`) and
+///   NVFP4 on the gemv (`nvfp4_gemv`, the ssm_in/ssm_out), every one reading q8_1 blocks of
+///   [`Q8_1_BLOCK`]. For Q5_K this differs from [`Rule::of`], which names the
 ///   V4.1 gemv's f32.
 #[must_use]
 pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
     let ours = match (ty, arm) {
         (GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K, _)
         | (GgmlType::IQ3_XXS | GgmlType::IQ4_XS, Arm::Expert) => Some(Q8_1_BLOCK),
+        // Bolt's IQ2_XXS: the routed `iq2_xxs_gemv_sel` and the dense `iq2_xxs_rows` read q8_1.
+        (GgmlType::IQ2_XXS, Arm::Expert | Arm::Gemv) => Some(Q8_1_BLOCK),
+        // Bolt's dense NVFP4 (`nvfp4_gemv`, the ssm_in/ssm_out) reads the engine's q8_1.
+        (GgmlType::NVFP4, Arm::Gemv) => Some(Q8_1_BLOCK),
         (GgmlType::Q8_0, Arm::Gemm | Arm::Expert)
         | (GgmlType::Q5_1 | GgmlType::IQ4_NL, Arm::Expert)
         | (GgmlType::Q5_0, Arm::Gemv) => Some(Q8_32_BLOCK),
@@ -243,12 +252,17 @@ pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
         (GgmlType::Q8_0, Arm::Gemv) | (GgmlType::F32, Arm::Gemv | Arm::Gemm) => None,
         _ => return None,
     };
-    let ik = match activation_format(ty).ok()? {
-        Some(ActivationFormat::Q8K) => Some(QK_K),
-        Some(ActivationFormat::Q8_2X4) => Some(crate::ik_q8_2::QK),
-        // Q2_0's column, mainline's alone: no ik dot reads q8_0 blocks, so ik has no side to count.
-        Some(ActivationFormat::Q8_0) => return None,
-        None => None,
+    let ik = match ty {
+        // NVFP4, mainline's alone (`vec_dot_nvfp4_q8_1`): no ik dot reads it, so ik has no side
+        // to count, as Q2_0's q8_0 column.
+        GgmlType::NVFP4 => None,
+        _ => match activation_format(ty).ok()? {
+            Some(ActivationFormat::Q8K) => Some(QK_K),
+            Some(ActivationFormat::Q8_2X4) => Some(crate::ik_q8_2::QK),
+            // Q2_0's column, mainline's alone: no ik dot reads q8_0 blocks, so ik has no side to count.
+            Some(ActivationFormat::Q8_0) => return None,
+            None => None,
+        },
     };
     let rel = |block: Option<usize>| block.map_or(0.0, q8_rel);
     Some(SiteRel {
@@ -972,6 +986,15 @@ mod site_tests {
         for ty in [GgmlType::IQ3_XXS, GgmlType::IQ4_XS] {
             assert_eq!(site_rel(ty, Arm::Expert), q(q256, q128), "{ty}");
         }
+        // Bolt's IQ2_XXS: the card's `iq2_xxs_gemv_sel` (experts) and `iq2_xxs_rows` (dense) read
+        // the engine's q8_1; ggml's dot takes q8_K, as the other i-quants do.
+        assert_eq!(site_rel(GgmlType::IQ2_XXS, Arm::Expert), q(q256, q128));
+        assert_eq!(site_rel(GgmlType::IQ2_XXS, Arm::Gemv), q(q256, q128));
+        assert_eq!(site_rel(GgmlType::IQ2_XXS, Arm::Gemm), None);
+        // Bolt's dense NVFP4 (`nvfp4_gemv`) reads the engine's q8_1; mainline's alone, so no ik side.
+        assert_eq!(site_rel(GgmlType::NVFP4, Arm::Gemv), q(None, q128));
+        assert_eq!(site_rel(GgmlType::NVFP4, Arm::Gemm), None);
+        assert_eq!(site_rel(GgmlType::NVFP4, Arm::Expert), None);
         for ty in [GgmlType::IQ2_XS, GgmlType::IQ3_S, GgmlType::Q2_K] {
             assert_eq!(site_rel(ty, Arm::Expert), q(q256, q256), "{ty}");
         }
