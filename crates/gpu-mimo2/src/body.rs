@@ -89,6 +89,8 @@ pub(crate) struct Kernels {
     pub block: Option<KBlockKernels>,
     pub router: RouterKernels,
     pub handoff: HandoffKernels,
+    /// The wide F32 tile GEMM the router's scores run on.
+    pub g32: bloomery_gpu::gemm::Gemm32Kernels,
 }
 
 impl Kernels {
@@ -101,6 +103,7 @@ impl Kernels {
             block: k_block.then(|| KBlockKernels::load(gpu)).transpose()?,
             router: RouterKernels::load(ctx)?,
             handoff: HandoffKernels::load(ctx)?,
+            g32: bloomery_gpu::gemm::Gemm32Kernels::load(gpu.context())?,
         })
     }
 }

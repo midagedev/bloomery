@@ -114,9 +114,12 @@ mod gate {
             fault: FaultSink,
         ) -> Result<(), GpuError>;
         #[allow(clippy::too_many_arguments, reason = "the module's launcher, flat")]
+        #[allow(clippy::too_many_arguments, reason = "the module's launcher, flat")]
         fn enqueue_rows(
             k: &Self::Kernels,
             s: &CudaStream,
+            gpu: &bloomery_gpu::Gpu,
+            wide: &bloomery_gpu::gemm::Gemm32Kernels,
             w: &DeviceTensor<f32>,
             x: &DeviceBuffer<f32>,
             bias: &DeviceBuffer<f32>,
@@ -170,9 +173,12 @@ mod gate {
                     k.enqueue_router(s, w, x, bias, Self::SCALE, out, fault)
                 }
 
+                #[allow(clippy::too_many_arguments, reason = "the module's launcher, flat")]
                 fn enqueue_rows(
                     k: &Self::Kernels,
                     s: &CudaStream,
+                    gpu: &bloomery_gpu::Gpu,
+                    wide: &bloomery_gpu::gemm::Gemm32Kernels,
                     w: &DeviceTensor<f32>,
                     x: &DeviceBuffer<f32>,
                     bias: &DeviceBuffer<f32>,
@@ -182,7 +188,20 @@ mod gate {
                     weights: &mut DeviceBuffer<f32>,
                     fault: FaultSink,
                 ) -> Result<(), GpuError> {
-                    k.enqueue_router_rows(s, w, x, bias, Self::SCALE, t, probs, ids, weights, fault)
+                    k.enqueue_router_rows(
+                        s,
+                        gpu,
+                        wide,
+                        w,
+                        x,
+                        bias,
+                        Self::SCALE,
+                        t,
+                        probs,
+                        ids,
+                        weights,
+                        fault,
+                    )
                 }
 
                 fn read(
@@ -304,6 +323,7 @@ mod gate {
     struct Cx<I: Inst> {
         gpu: Gpu,
         rk: I::Kernels,
+        g32: bloomery_gpu::gemm::Gemm32Kernels,
     }
 
     /// What one-token launches leave, token-major: logits and scores
@@ -366,6 +386,8 @@ mod gate {
         I::enqueue_rows(
             &cx.rk,
             s,
+            &cx.gpu,
+            &cx.g32,
             w,
             &xd,
             bias,
@@ -699,7 +721,8 @@ mod gate {
             I::SCALE
         );
         let rk = I::load(gpu.context())?;
-        let cx = Cx::<I> { gpu, rk };
+        let g32 = bloomery_gpu::gemm::Gemm32Kernels::load(gpu.context())?;
+        let cx = Cx::<I> { gpu, rk, g32 };
         let s = cx.gpu.stream();
         let sd = seeded_router::<I>();
         let w = DeviceTensor::upload(s, &sd.w, I::E, K)?;

@@ -18,7 +18,7 @@
 //! results at its own count; a count no instance is built for is refused by
 //! name at load.
 
-use crate::{DeviceTensor, FaultSink, GpuError};
+use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use std::sync::Arc;
 
@@ -31,8 +31,8 @@ crate::sigmoid_router_instance! {
         experts: 240,
         used: 9,
         kernels: nemotron_moe_router_240_kernels,
-        entries: nemotron_moe_router_240, nemotron_moe_router_240_scores, nemotron_moe_router_240_pick,
-        prepare: prepare_nemotron_moe_router_240, prepare_nemotron_moe_router_240_scores, prepare_nemotron_moe_router_240_pick,
+        entries: nemotron_moe_router_240, nemotron_moe_router_240_pick,
+        prepare: prepare_nemotron_moe_router_240, prepare_nemotron_moe_router_240_pick,
     }
 }
 
@@ -42,8 +42,8 @@ crate::sigmoid_router_instance! {
         experts: 304,
         used: 9,
         kernels: nemotron_moe_router_304_kernels,
-        entries: nemotron_moe_router_304, nemotron_moe_router_304_scores, nemotron_moe_router_304_pick,
-        prepare: prepare_nemotron_moe_router_304, prepare_nemotron_moe_router_304_scores, prepare_nemotron_moe_router_304_pick,
+        entries: nemotron_moe_router_304, nemotron_moe_router_304_pick,
+        prepare: prepare_nemotron_moe_router_304, prepare_nemotron_moe_router_304_pick,
     }
 }
 
@@ -53,8 +53,8 @@ crate::sigmoid_router_instance! {
         experts: 368,
         used: 9,
         kernels: nemotron_moe_router_368_kernels,
-        entries: nemotron_moe_router_368, nemotron_moe_router_368_scores, nemotron_moe_router_368_pick,
-        prepare: prepare_nemotron_moe_router_368, prepare_nemotron_moe_router_368_scores, prepare_nemotron_moe_router_368_pick,
+        entries: nemotron_moe_router_368, nemotron_moe_router_368_pick,
+        prepare: prepare_nemotron_moe_router_368, prepare_nemotron_moe_router_368_pick,
     }
 }
 
@@ -64,8 +64,8 @@ crate::sigmoid_router_instance! {
         experts: 432,
         used: 9,
         kernels: nemotron_moe_router_432_kernels,
-        entries: nemotron_moe_router_432, nemotron_moe_router_432_scores, nemotron_moe_router_432_pick,
-        prepare: prepare_nemotron_moe_router_432, prepare_nemotron_moe_router_432_scores, prepare_nemotron_moe_router_432_pick,
+        entries: nemotron_moe_router_432, nemotron_moe_router_432_pick,
+        prepare: prepare_nemotron_moe_router_432, prepare_nemotron_moe_router_432_pick,
     }
 }
 
@@ -75,8 +75,8 @@ crate::sigmoid_router_instance! {
         experts: 496,
         used: 9,
         kernels: nemotron_moe_router_496_kernels,
-        entries: nemotron_moe_router_496, nemotron_moe_router_496_scores, nemotron_moe_router_496_pick,
-        prepare: prepare_nemotron_moe_router_496, prepare_nemotron_moe_router_496_scores, prepare_nemotron_moe_router_496_pick,
+        entries: nemotron_moe_router_496, nemotron_moe_router_496_pick,
+        prepare: prepare_nemotron_moe_router_496, prepare_nemotron_moe_router_496_pick,
     }
 }
 
@@ -290,6 +290,8 @@ impl Routers {
     pub(crate) fn enqueue_rows(
         &self,
         stream: &CudaStream,
+        gpu: &Gpu,
+        wide: &crate::gemm::Gemm32Kernels,
         n_expert: usize,
         w: &DeviceTensor<f32>,
         x: &DeviceBuffer<f32>,
@@ -304,21 +306,21 @@ impl Routers {
         fault: FaultSink,
     ) -> Result<(), GpuError> {
         match n_expert {
-            e240::N_EXPERT => self
-                .e240
-                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
-            e304::N_EXPERT => self
-                .e304
-                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
-            e368::N_EXPERT => self
-                .e368
-                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
-            e432::N_EXPERT => self
-                .e432
-                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
-            e496::N_EXPERT => self
-                .e496
-                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
+            e240::N_EXPERT => self.e240.enqueue_router_rows(
+                stream, gpu, wide, w, x, bias, scale, t, probs, ids, weights, fault,
+            ),
+            e304::N_EXPERT => self.e304.enqueue_router_rows(
+                stream, gpu, wide, w, x, bias, scale, t, probs, ids, weights, fault,
+            ),
+            e368::N_EXPERT => self.e368.enqueue_router_rows(
+                stream, gpu, wide, w, x, bias, scale, t, probs, ids, weights, fault,
+            ),
+            e432::N_EXPERT => self.e432.enqueue_router_rows(
+                stream, gpu, wide, w, x, bias, scale, t, probs, ids, weights, fault,
+            ),
+            e496::N_EXPERT => self.e496.enqueue_router_rows(
+                stream, gpu, wide, w, x, bias, scale, t, probs, ids, weights, fault,
+            ),
             other => Err(GpuError::shape(
                 "Routers::enqueue_rows",
                 format!("a router of {other} experts: the instances route over {COUNTS:?}"),

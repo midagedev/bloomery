@@ -202,6 +202,8 @@ pub(crate) struct Kernels {
     pub hc: HcKernels,
     pub attn: AttnKernels,
     pub router: RouterKernels,
+    /// The wide F32 tile GEMM the router's scores run on.
+    pub g32: bloomery_gpu::gemm::Gemm32Kernels,
     pub experts: ExpertKernels,
     pub ffn: FfnKernels,
     /// The K-quant blocks' kernels: `None` on a file whose blocks are all q8_0.
@@ -226,6 +228,7 @@ impl Kernels {
             block: k_blocks.then(|| KBlockKernels::load(gpu)).transpose()?,
             kpool: KpoolKernels::load(ctx)?,
             qsa: QsaKernels::load(ctx)?,
+            g32: bloomery_gpu::gemm::Gemm32Kernels::load(gpu.context())?,
         })
     }
 

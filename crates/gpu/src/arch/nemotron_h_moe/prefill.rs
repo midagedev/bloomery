@@ -441,6 +441,8 @@ fn moe_rows(
     let iq = cx.iq;
     cx.routers.enqueue_rows(
         stream,
+        cx.gpu,
+        &cx.g32,
         ml.route.n_expert(),
         w.f32_tensor(WHAT, &ml.router)?,
         &p.buf.xn,

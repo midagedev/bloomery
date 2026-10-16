@@ -965,6 +965,8 @@ impl PromptProgram<'_> {
         };
         self.k.router.enqueue_router_rows(
             stream,
+            gpu,
+            &self.k.g32,
             w.f32_tensor(WHAT, router)?,
             &b.normed,
             bias,
