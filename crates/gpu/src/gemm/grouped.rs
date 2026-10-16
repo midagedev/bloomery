@@ -1274,9 +1274,14 @@ macro_rules! gemm_block {
 #[inline(always)]
 pub(super) unsafe fn win(w: &[u32], byte: usize) -> u32 {
     let a = byte / 4;
-    // SAFETY: both words are inside `w` by this fn's contract.
-    let (lo, hi) = unsafe { (*w.get_unchecked(a), *w.get_unchecked(a + 1)) };
-    (((u64::from(hi) << 32u64) | u64::from(lo)) >> (8 * (byte & 3))) as u32
+    // SAFETY: word `a` is inside `w` by this fn's contract; the second word,
+    // the one holding the window's last byte, only when the window is
+    // unaligned — an aligned window at the stream's end must not read the
+    // word past it.
+    unsafe {
+        let (lo, hi) = (*w.get_unchecked(a), *w.get_unchecked((byte + 3) / 4));
+        (((u64::from(hi) << 32u64) | u64::from(lo)) >> (8 * (byte & 3))) as u32
+    }
 }
 
 /// Byte `b` of `w`, sign-extended.
