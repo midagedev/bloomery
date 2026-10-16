@@ -255,6 +255,55 @@ impl Prompt {
         self.rows
     }
 
+    /// The buffer the last layer of a pass writes: a pass swaps its two
+    /// residual streams once a layer starting from `x[0]`, so after
+    /// `n_layers` layers the last layer's output is `x[n_layers % 2]`.
+    pub(super) fn last_x(&self, n_layers: usize) -> &DeviceBuffer<f32> {
+        &self.x[n_layers % 2]
+    }
+
+    /// The pass's word record for `ids` from `pos` — the first position, one
+    /// plane row a key head ([`P_ROWS`]), then the ids — written and
+    /// uploaded. The record's one writer: an eager pass
+    /// ([`Body::enqueue_pass`]) and a verifying [`Rows::plan_rows`], before
+    /// every replay, both come here. Synchronizing copy; never inside a
+    /// capture.
+    pub(super) fn plan_words(
+        &mut self,
+        stream: &CudaStream,
+        sh: &Shape,
+        ids: &[u32],
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        let m = ids.len();
+        if m == 0 || m > self.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a pass of {m} ids; the prompt buffers hold 1..={}",
+                    self.rows
+                ),
+            ));
+        }
+        let b = &mut self.b;
+        b.host_words[P_POS] = pos;
+        for h in 0..sh.n_kv {
+            b.host_words[P_ROWS + h] = h
+                .checked_mul(sh.ctx)
+                .and_then(|r| r.checked_add(pos as usize))
+                .and_then(|r| u32::try_from(r).ok())
+                .ok_or_else(|| {
+                    GpuError::shape(
+                        WHAT,
+                        format!("row {h} · {} + {pos} does not fit a u32 row word", sh.ctx),
+                    )
+                })?;
+        }
+        let at = Self::ids_at(sh.n_kv);
+        b.host_words[at..at + m].copy_from_slice(ids);
+        Ok(b.words.copy_from_host(stream, &b.host_words)?)
+    }
+
     /// The device bytes the pass's buffers hold.
     pub(super) fn bytes(&self) -> usize {
         let b = &self.b;
@@ -789,23 +838,14 @@ impl Body {
                 format!("a pass of {m} ids; the prompt buffers hold 1..={}", p.rows),
             ));
         }
-        let b = &mut p.b;
-        b.host_words[P_POS] = pos;
-        for h in 0..n_kv {
-            b.host_words[P_ROWS + h] = h
-                .checked_mul(sh.ctx)
-                .and_then(|r| r.checked_add(pos as usize))
-                .and_then(|r| u32::try_from(r).ok())
-                .ok_or_else(|| {
-                    GpuError::shape(
-                        WHAT,
-                        format!("row {h} · {} + {pos} does not fit a u32 row word", sh.ctx),
-                    )
-                })?;
+        // A capture records the launches only: the replay reads the record
+        // the plan before it wrote ([`Prompt::plan_words`], the record's one
+        // writer outside a capture).
+        if !crate::capturing(stream)? {
+            p.plan_words(stream, &sh, ids, pos)?;
         }
+        let b = &mut p.b;
         let at = Prompt::ids_at(n_kv);
-        b.host_words[at..at + m].copy_from_slice(ids);
-        b.words.copy_from_host(stream, &b.host_words)?;
         if m > COLS {
             self.k
                 .gemm
@@ -888,6 +928,20 @@ impl Body {
                             y: &mut buf.y,
                             ring: &mut mm.store.ring,
                             state: &mut mm.store.state,
+                            // A verifying load keeps every row's state but
+                            // the last's in its lanes (`self.verify`, disjoint
+                            // from the kernels `cx` borrows); a pass longer
+                            // than the lanes holds no lane row.
+                            lane_rows: self
+                                .verify
+                                .as_ref()
+                                .filter(|v| m <= v.rows)
+                                .map_or(0, |_| m - 1),
+                            lanes: self
+                                .verify
+                                .as_mut()
+                                .filter(|v| m <= v.rows)
+                                .and_then(|v| v.lane(l)),
                         },
                     )?;
                     project_rows(
@@ -1031,6 +1085,7 @@ impl GpuModel<Body> {
         if ids.is_empty() {
             return Err(GpuError::shape(WHAT, "empty token slice"));
         }
+        self.body(WHAT)?.refuse_waiting(WHAT, "a prompt pass")?;
         let cap = self.body(WHAT)?.prompt.rows();
         if rows == 0 || rows > cap {
             return Err(GpuError::shape(

@@ -25,6 +25,7 @@ mod body;
 mod moe;
 mod prefill;
 pub mod router;
+mod verify;
 
 pub use crate::arch::hybrid::DecodeInput;
 pub use body::Body;

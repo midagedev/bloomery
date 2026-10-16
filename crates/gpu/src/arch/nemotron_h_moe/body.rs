@@ -11,7 +11,7 @@ use crate::arch::hybrid::{
 use crate::flash_gqa::GROUP_16;
 use crate::head::Head;
 use crate::iq_sel::IqSelKernels;
-use crate::model::{ChainBody, GpuModel, NoHost, block_count};
+use crate::model::{ChainBody, GpuModel, MAX_PASS_ROWS, NoHost, block_count};
 use crate::q38::{EmbedQ8Args, Q38Kernels};
 use crate::site::SiteTy;
 use crate::weights::Weights;
@@ -26,6 +26,7 @@ use std::ops::Range;
 
 use super::prefill::{PASS_ROWS, Prompt, derive_q8};
 use super::router::Routers;
+use super::verify::Verify;
 
 const WHAT: &str = "nemotron_h_moe::Body::load";
 const STEP: &str = "nemotron_h_moe::Body::enqueue_chain";
@@ -73,6 +74,15 @@ pub struct Body {
     words: Words,
     /// The prompt pass's buffers ([`Body::enqueue_pass`]).
     pub(super) prompt: Prompt,
+    /// The Mamba-2 layers' verify lanes and the verify they wait on
+    /// ([`GpuModel::open_verifying`]); `None` on a plain load, which holds
+    /// no bytes and verifies nothing.
+    pub(super) verify: Option<Verify>,
+    /// The positions the recurrent stores hold: a call's end once its
+    /// launches are enqueued. The next position is the model's
+    /// ([`GpuModel::pos`]); a rollback with no verify waiting is a no-op
+    /// only at it.
+    pub(super) held: u32,
 }
 
 impl GpuModel<Body> {
@@ -84,13 +94,45 @@ impl GpuModel<Body> {
     pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
         let n_layers = block_count(&file, "nemotron_h_moe GpuModel::open")?;
         GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
-            Body::load(gpu, &file, w, ctx)
+            Body::load(gpu, &file, w, ctx, None)
+        })
+    }
+
+    /// [`GpuModel::open`] for a load that verifies drafted rows ([`Rows`]):
+    /// beside the plain load's buffers, each Mamba-2 layer keeps `rows − 1`
+    /// stamped states — the state after each row but the last of a pass — so
+    /// a verify of up to `rows` rows keeps any `1..=m` of them at its commit
+    /// by one device copy a Mamba-2 layer. A plain load is byte for byte the
+    /// plain [`GpuModel::open`]. `rows` outside `2..=`[`MAX_PASS_ROWS`] is
+    /// refused by name, before anything uploads.
+    pub fn open_verifying(
+        gpu: Gpu,
+        file: Split,
+        ctx: usize,
+        rows: usize,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        const WHAT: &str = "nemotron_h_moe GpuModel::open_verifying";
+        if !(2..=MAX_PASS_ROWS).contains(&rows) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a verify of {rows} rows; a verifying load holds 2..={MAX_PASS_ROWS}"),
+            ));
+        }
+        let n_layers = block_count(&file, WHAT)?;
+        GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
+            Body::load(gpu, &file, w, ctx, Some(rows))
         })
     }
 }
 
 impl Body {
-    fn load(gpu: &Gpu, file: &Split, w: &mut Weights, ctx: usize) -> Result<Body, GpuError> {
+    fn load(
+        gpu: &Gpu,
+        file: &Split,
+        w: &mut Weights,
+        ctx: usize,
+        verify_rows: Option<usize>,
+    ) -> Result<Body, GpuError> {
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         // A companion `.scale` is read for NVFP4 projections only
         // (weights::tensor_scale); a scaled Q8_0 ssm_in/ssm_out would enter
@@ -186,9 +228,13 @@ impl Body {
             .unwrap_or(0);
         let prompt = Prompt::new(stream, PASS_ROWS.min(ctx), (&sh, moe, hp.n_head), &layers)?;
         derive_q8(stream, file, w, &layers)?;
+        let verify = verify_rows
+            .map(|rows| Verify::new(stream, WHAT, &layers, rows, mamba.geom().d_inner))
+            .transpose()?;
         let ctx_ = gpu.context();
         Ok(Body {
             prompt,
+            verify,
             k: Kernels::load(gpu)?,
             mk: MoeKernels {
                 routers: Routers::load(ctx_)?,
@@ -205,6 +251,7 @@ impl Body {
             moe,
             layers,
             embed,
+            held: 0,
         })
     }
 
@@ -310,31 +357,37 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// The step record in one copy ([`Words::refresh`]).
+    /// The step record in one copy ([`Words::refresh`]), refused while a
+    /// verify waits for its commit.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
-        self.words.refresh(
-            "nemotron_h_moe::Body::refresh",
-            stream,
-            &self.sh,
-            input,
-            &mut self.s.words,
-        )
+        const WHAT: &str = "nemotron_h_moe::Body::step";
+        let DecodeInput { token, pos } = *input;
+        self.refuse_waiting(WHAT, &format!("a step at position {pos}"))?;
+        self.held = pos + 1;
+        let input = DecodeInput { token, pos };
+        self.words
+            .refresh(WHAT, stream, &self.sh, &input, &mut self.s.words)
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
         self.enqueue(gpu, w, head)
     }
 
-    /// Every scan state and conv ring back to zero. The K/V planes need
-    /// nothing: the flash never reads a row at or past the live count, and
-    /// every row below it is written by its own step first. The router's
-    /// results are written whole by every step before any read.
+    /// Every scan state and conv ring back to zero, and a waiting verify
+    /// dropped at 0 rows kept. The K/V planes need nothing: the flash never
+    /// reads a row at or past the live count, and every row below it is
+    /// written by its own step first. The router's results are written whole
+    /// by every step before any read.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         for layer in &mut self.layers {
             if let Layer::Mamba(m) = layer {
                 m.store.clear(gpu.stream(), &self.zeros)?;
             }
         }
+        if let Some(v) = self.verify.as_mut() {
+            v.pending = None;
+        }
+        self.held = 0;
         Ok(())
     }
 
@@ -354,6 +407,7 @@ impl ChainBody for Body {
             .sum();
         layers
             + self.prompt.bytes()
+            + self.verify.as_ref().map_or(0, Verify::bytes)
             + self.s.bytes()
             + self.ms.bytes()
             + self.acts.bytes()

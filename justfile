@@ -290,6 +290,19 @@ gate-gpu-nemotron-e2e:
 gate-gpu-nemotron-h-moe-e2e:
     BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_h_moe_e2e'
 
+# The nemotron_h_moe verify gate (one card, the fixture tier by default; BLOOMERY_TIER=real runs the
+# real file): a load opened to verify drafted rows (`open_verifying`: 8 lane states less one a
+# Mamba-2 layer) commits every `accepted` in 1..=m of a verify of m = 2 and 4 rows by one device copy
+# of row accepted − 1's lane, and the 16 steps after it give the plain load's ids and last logits bit
+# for bit (or the e2e gate's band where the pass's rows are not the steps' bits; graph and eager, a
+# chain of commits too); a lookup draft over Session<Body> emits the plain run's 64 ids, the
+# partial-commit pin the real tier's; the plain load holds no lane bytes and the verifying load
+# exactly the derivation's; the refusals by name.
+verify_tier := env_var_or_default('BLOOMERY_TIER', 'fixture')
+
+gate-gpu-nemotron-h-moe-verify:
+    BLOOMERY_TIER={{verify_tier}} BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_h_moe_verify'
+
 # The nemotron seat of bloomery-serve on Nemotron 3 Nano 4B Q4_K_M (gate_nemotron_serve's doc): `--plan` with no flag names its
 # default context (the ladder's rung, held by the ctx line and the rung above refused) and exits before any load, `--parallel 2` is
 # refused by name (the body holds one sequence); one server with no flag listens at the context its ctx line named, answers
