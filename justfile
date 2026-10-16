@@ -1410,6 +1410,15 @@ gate-r8:
 gate-fixture:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-fixture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test fixture --bin fixture -- --include-ignored --nocapture --test-threads=1'
 
+# Every fixture written under /models/fixtures (BLOOMERY_FIXTURE_ROOT) holds the card budget its header records: for each
+# family with a planned budget, the plan of the written file under it is half the experts on every card-eligible layer
+# (model::fixture::check_budget, the re-plan `fixture verify` runs, here from the written header alone: no source file, no
+# bytes, no card). A plan term that moves after a fixture was written (a table the card holds, a reserve) leaves the
+# recorded number a granule short and every gate that plans under the header sees a layer one expert off; this names the
+# family and the counts. Either tier: it reads the files as they are.
+gate-fixture-budget:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --bin fixture -- --ignored hw_the_written_fixtures_hold_their_recorded_budget --nocapture'
+
 # 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
 # hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다. The pool's own unit tests (--lib: the L3 size
 # reading, the CCD map's pin condition) run with it.
