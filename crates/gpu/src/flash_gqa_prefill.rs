@@ -3151,6 +3151,11 @@ impl SplitScratch {
             y: DeviceBuffer::<f32>::zeroed(stream, len)?,
         })
     }
+
+    /// The device bytes both sub-group buffers hold.
+    pub fn num_bytes(&self) -> usize {
+        self.q.num_bytes() + self.y.num_bytes()
+    }
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
