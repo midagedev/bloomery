@@ -1,0 +1,21 @@
+# from the engine paper decomposition (orca engine.md 04:2x): issue floor 309 us vs measured 2054 us, IPC 0.60
+# of 4.0, occupancy capped at 5 blocks/SM by both registers 96 and static smem 17536 B; chunk-parallel
+# predicted 0 (serial term 2.5%)
+kind: profile
+question: do the shfl butterfly chain and the unstaged per-token z load dominate mamba2_steps warp stalls at
+  the 5-block occupancy cap, as the paper decomposition predicts
+term: one 448-token mamba2_steps launch of the Bolt e2e prefill (code4096 pass 1, launch ordinal 85: code5 40
+  + code29 40 + 5), A6000, ncu WarpStateStats: the top two stall reasons share of warp cycles, beside
+  Occupancy and LaunchStats registers
+unit: stall-share %
+predict: 45..75
+condition: ncu on gate_nemotron_h_moe_e2e (real tier, r4 tree), --kernel-name mamba2_steps --launch-skip 85
+  --launch-count 1, sections SpeedOfLight Occupancy LaunchStats SchedulerStats WarpStateStats, clock-control
+  base, through tools/ref/lease-hold.sh with this card; the ncu u s here are counters, never a record beside
+  depth-gpu numbers
+decide-in: land the occupancy levers on bolt-mamba-occ in order: z staging (bit-identical), then the reg diet
+  to 6 then 8 blocks/SM (bit-identical), gates per the lead 04:02 order
+decide-below: stalls spread across reasons below 45: the 6.6x attribution is wrong; re-read the SASS before
+  any lever (the source-page form of ncu-gpu.sh on one launch)
+decide-above: one stall reason above 75: aim that reason alone (z staging if long-scoreboard, butterfly
+  batching if MIO/short) and drop the other levers from the round
