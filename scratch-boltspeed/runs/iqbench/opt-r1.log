@@ -1,0 +1,93 @@
+box.sh: /home/box/repo/bloomery-perf-iq2opt already holds this tree (sync-id 54eded917eb639d3): not synced
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt tree=54eded917eb639d3
+boxq: bloomery-perf-iq2opt-bash-38de37 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-bash-38de37 is job s1671
+boxq: s1671 waiting: none, eta unknown
+boxq: s1671 waiting: lanes busy, eta unknown
+boxq: s1671 waiting: lanes busy, eta unknown
+boxq: s1671 waiting: lanes busy, eta unknown
+boxq: s1671 waiting: lanes busy, eta unknown
+boxq: s1671 waiting: lanes busy, eta unknown
+boxq: s1671 waiting: lanes busy, eta unknown
+boxq: s1671 waiting: lanes busy, eta unknown
+boxq: s1671 waiting: lanes busy, eta unknown
+boxq: s1671: poll 1/3 failed: GET /jobs/s1671: no reply in 30 s
+boxq: s1671: poll 2/3 failed: GET /jobs/s1671: no reply in 30 s
+boxq: s1671: reconnecting, next poll in 5 s
+boxq: s1671 queued 1049 s (wait_reason lanes busy)
+[binary] target/release/gate_iq_sel sha256=c84dcd29620f mtime=2026-10-16T10:13:32Z (newer than its sources: dep-info)
+[lease] card: docs/cards/bolt-iq2opt.card sha256=ad9bc390ea5462f38f81c10efb5d19706018802e3816d8b59c38712e7e88aafc
+[lease] card | # IQ2_XXS decode cost (round bolt-iq2opt, base bolt-r1m 6cb26b2f): the decode reads a block-shared table (256
+[lease] card | # grid selectors + 128 sign selectors, Iq2XxsTab) and builds each group's eight signed values with one or and
+[lease] card | # two prmt over the magnitudes and their negatives; every output bit as before (host test
+[lease] card | # iq2xxs_table_decode_matches_the_computed_one: all 256 x 128 groups equal the old decode's words).
+[lease] card | # SASS [counted at build time, ptxas 13.3 sm_86, tools/sass-scan.sh --step; not a runtime number]:
+[lease] card | # iq2_xxs_rows one lane-iteration (one 32-value sub-block, m = 1) 191 -> 123 instructions (-36 %), 1528 -> 984
+[lease] card | # a 256-value block; LDG 15 -> 11, + 8 LDS. iq2_xxs_gemv_sel 195 -> 118 a sub-block (-39 %); its prologue +25
+[lease] card | # (the fill and one barrier) a warp. Registers rows 64 -> 64, sel 37 -> 39 (both 4 resp. 6 blocks a SM as
+[lease] card | # before); 1536 B smem a block.
+[lease] card | # L1 data-pipe wavefronts a warp-iteration [derived: 32 random picks; the grid as distinct 128 B lines of 2
+[lease] card | # KB, the table as the worst bank of 32]: base 2 (weights) + 1 (d) + 4 x 14.0 (divergent u64 grid) + 9
+[lease] card | # (activation) = 68; new 3 + 4 x 3.15 (grid words) + 4 x 2.78 (sign words) + 9 = 36.
+[lease] card | # iq2xxs_5376 (shared up, 5376 x 4096, 672 blocks, 256 warp-iterations a SM on 84 SMs) at 1.8 GHz [derived]:
+[lease] card | # base issue 256 x ~224 / 4 = 14.3 k cycles, L1 256 x 68 = 17.4 k, bytes 5.70 MB at 640 GB/s = 8.91 us = 16.0
+[lease] card | # k; measured 13.89 us = 25.0 k = 1.44 x the largest demand. New: issue 256 x ~156 / 4 = 10.0 k, L1 9.2 k,
+[lease] card | # bytes 16.0 k: the byte term is the largest; 1.44 x 10.0 k = 8.0 us sits under it, so 8.9 us at best, 11.5 us
+[lease] card | # if the 1.44 latency factor rides on the byte term's 0.73 of the old.
+[lease] card | # Routed arms [derived, same factor]: up (K 1024, one iteration a warp, prologue-heavy) 0.80..0.92 x their
+[lease] card | # 11.35..17.66 us; down 496x2560 (2.5 iterations) 0.70..0.85 x.
+[lease] card | kind: profile
+[lease] card | question: does the table decode take iq2_xxs_rows' shared-expert up launch from its instruction and L1 terms
+[lease] card |   down to near the byte term on the A6000?
+[lease] card | term: graph_us_mean of bench op=iq2xxs_5376 (gate_iq_sel --bench-kernels --bench-arm iq2xxs_5376,
+[lease] card |   shared/bench.rs: 64-launch graphs, 7 rounds), A6000, this tree beside bolt-r1m's 13.89 us (s1326)
+[lease] card | unit: us
+[lease] card | predict: 8.9..11.5
+[lease] card | condition: one lease (time-gate.sh), BLOOMERY_CARD=a6000, the bench's fixed fill pattern, this tree built with
+[lease] card |   --features gpu; the other iq2xxs arms read from the same run (--bench-arm iq2xxs) against the routed bands
+[lease] card |   in the comments
+[lease] card | decide-in: land the round: the decode is no longer the term; the next lever is the byte term (none on the
+[lease] card |   kernel side)
+[lease] card | decide-below: under the byte term: check the row's bytes against 5.70 MB (an L2 hit across graph launches)
+[lease] card |   before reading it as a win
+[lease] card | decide-above: ncu the arm (tools/ref/ncu-gpu.sh) for l1tex__data_pipe_lsu_wavefronts(_mem_shared),
+[lease] card |   l1tex__data_bank_conflicts_pipe_lsu_mem_shared and the stall split: a table-conflict or block-start-latency
+[lease] card |   term the derivation missed
+[lease] card: ok kind=profile (no ruler: not an ab card)
+[lease] timing card idle: GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4
+[lease] held by pid 1789583 at 2026-10-16T10:41:34Z
+[lease] netdata: frozen
+--- witness pre 2026-10-16T10:41:34Z ---
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1950 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119311646116 sw_thermal=595202908 hw_thermal=0 temp=47 C power=137.15 W
+    cpu-freq: MHz mean 919 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/gate_iq_sel sha256=c84dcd29620f mtime=2026-10-16T10:13:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 36.21 W, 210 MHz;1, 0 %, 137.15 W, 1950 MHz;
+    load=2.92 3.90 3.48 io=avg10=0.00 llm.service=inactive
+    busiest: rustc 100% | kswapd0 2.4% | nvidia-smi 2.4% | kcompactd0 2.0% | 
+    model: deepseek2
+bench n_per_burst=64 rounds=7 graph_launches_per_round=4
+bench op=iq2xxs_5376 rows=5376 nodes=64 bytes=5702784 eager_us_min=11.148 eager_us_mean=11.159 eager_us_max=11.166 graph_us_min=10.517 graph_us_mean=10.549 graph_us_max=10.654 graph_gbps=542.2
+bench op=iq2xxs_4096 rows=4096 nodes=64 bytes=5699752 eager_us_min=12.667 eager_us_mean=12.682 eager_us_max=12.705 graph_us_min=11.931 graph_us_mean=11.954 graph_us_max=12.039 graph_gbps=477.7
+bench op=iq2xxs_moe_up_240x1536 rows=13824 nodes=64 bytes=3705888 eager_us_min=9.772 eager_us_mean=9.782 eager_us_max=9.791 graph_us_min=9.110 graph_us_mean=9.130 graph_us_max=9.158 graph_gbps=406.8
+bench op=iq2xxs_moe_down_240x1536 rows=9216 nodes=64 bytes=3705264 eager_us_min=9.943 eager_us_mean=10.042 eager_us_max=10.241 graph_us_min=9.291 graph_us_mean=9.294 graph_us_max=9.299 graph_gbps=398.8
+bench op=iq2xxs_moe_up_304x2048 rows=18432 nodes=64 bytes=4940832 eager_us_min=12.139 eager_us_mean=12.150 eager_us_max=12.163 graph_us_min=11.504 graph_us_mean=11.508 graph_us_max=11.512 graph_gbps=429.5
+bench op=iq2xxs_moe_down_304x2048 rows=9216 nodes=64 bytes=4921920 eager_us_min=10.192 eager_us_mean=10.201 eager_us_max=10.210 graph_us_min=9.509 graph_us_mean=9.534 graph_us_max=9.552 graph_gbps=517.6
+bench op=iq2xxs_moe_up_432x2304 rows=20736 nodes=64 bytes=5558304 eager_us_min=13.618 eager_us_mean=13.631 eager_us_max=13.654 graph_us_min=12.985 graph_us_mean=12.992 graph_us_max=13.001 graph_gbps=428.1
+bench op=iq2xxs_moe_down_432x2304 rows=9216 nodes=64 bytes=5539464 eager_us_min=13.052 eager_us_mean=13.065 eager_us_max=13.076 graph_us_min=12.375 graph_us_mean=12.380 graph_us_max=12.391 graph_gbps=447.6
+bench op=iq2xxs_moe_up_496x2560 rows=23040 nodes=64 bytes=6175776 eager_us_min=15.359 eager_us_mean=15.380 eager_us_max=15.403 graph_us_min=14.386 graph_us_mean=14.400 graph_us_max=14.442 graph_gbps=429.3
+bench op=iq2xxs_moe_down_496x2560 rows=9216 nodes=64 bytes=6147792 eager_us_min=13.240 eager_us_mean=13.274 eager_us_max=13.292 graph_us_min=12.262 graph_us_mean=12.269 graph_us_max=12.285 graph_gbps=501.4
+--- witness post 2026-10-16T10:41:35Z ---
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000004 capped_us sw_power=119311706307 sw_thermal=595202908 hw_thermal=0 temp=50 C power=142.07 W
+    cpu-freq: MHz mean 838 min 400 max 4318 over 64 cpus governor=powersave
+    binary: target/release/gate_iq_sel sha256=c84dcd29620f mtime=2026-10-16T10:13:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 34.06 W, 210 MHz;1, 45 %, 142.07 W, 1935 MHz;
+    load=2.92 3.90 3.48 io=avg10=0.00 llm.service=inactive
+    busiest: rustc 99.9% | kswapd0 2.4% | nvidia-smi 2.4% | kcompactd0 2.0% | 
+    model: deepseek2
+gate_iq_sel --bench-kernels --bench-arm iq2xxs rc=0

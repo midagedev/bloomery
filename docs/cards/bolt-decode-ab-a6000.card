@@ -1,0 +1,15 @@
+# Bolt decode at depth 512 on the RTX A6000: main d0e8a8e1 beside #326 (IQ2_XXS _sel decode from a block-shared table
+# + the u32 slot split, kernel bench 0.72..0.85x a routed/shared IQ2 launch, s1660/s1671) and #329 (80 norm + quantize
+# folds, 1084 -> 1004 nodes). Derived: the IQ2 kernels are 2.57 ms of main's 12.18 ms step (nsys s1714's sitting's
+# sibling, the A6000 decode nsys), at ~0.78x that is -0.55 ms, 80.8 -> ~84.6 tok/s (+4.7 %); the folds -0.08 ms (+0.6 %,
+# under the ruler at 4 rounds, read only beside the others).
+kind: baseline
+question: how fast does Bolt decode at depth 512 on the A6000 with #326 and with #329, beside main, in one lease?
+term: tok/s @ n = 96, depth 512 (the row's tok/s(mean)), the #326 arm (generate_qwen3moe at perf-bolt-iq2opt), RTX A6000
+unit: tok/s
+predict: 83.5..86.0
+condition: one lease, BLOOMERY_CARD=a6000, BLOOMERY_AB_ROUNDS=4; arms bin:main:512, bin:#326:512, 512 (#329, this tree)
+reason: the user's two-line rule for #326 and #329; why now: #326 is approved and merges once CI is green
+decide-in: #326 and #329 state their A6000 decode line
+decide-below: the IQ2 kernels' share of the step is smaller than the nsys sum (overlap): re-read the nsys
+decide-above: L2 effects across layers: nsys the #326 step

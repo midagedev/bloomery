@@ -1,0 +1,18 @@
+# Bolt speed effort's start rows on the RTX A6000, whole card: ours (generate_qwen3moe, the prompt as one step per
+# id) beside mainline llama.cpp cd0a5b6a1 in one lease, at P = 512 and 2048, plus llama.cpp's ubatch lever at 2048.
+# Derived: llama.cpp's pp grows little from 512 (1548.68) to 4096 (1603.78, s1187), so pp2048 1500..1650; ours'
+# prompt is its decode rate, 81.68 at P = 512 (s1513) and ~81 at 2048 [derived: steps].
+kind: baseline
+question: where do ours and mainline llama.cpp read a 2048-id Bolt prompt on the A6000, and does -ub 1024 move
+  llama.cpp's?
+term: pp tok/s @ P = 2048, NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf, llama-bench -p 2048 -n 0 -ngl 99 -fa on,
+  RTX A6000
+unit: tok/s
+predict: 1500..1650
+condition: one lease, BLOOMERY_CARD=a6000, BLOOMERY_AB_ROUNDS=2; arms 512 2048 lcpp:6 lcpppp:512 lcpppp:2048
+  lcpppp1024:2048; busy tags read beside each mean
+reason: the start table of the Bolt speed plan (/workspace/agent-notes/bolt-speed-plan.md); why now: the lead's
+  baseline-first order, the route to ws just back
+decide-in: publish the rows in the plan's baseline table; the prefill target is the lcpp row
+decide-below: llama.cpp's pp falls with P: name the attention or scan term in its nsys
+decide-above: the ubatch lever is llama.cpp's best: its -ub row is the line to beat

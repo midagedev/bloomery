@@ -1,0 +1,583 @@
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf tree=8774cb22d3fb08b8
+boxq: bloomery-perf-bash-8965e5 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-bash-8965e5 is job s1700
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700: poll 1/3 failed: GET /jobs/s1700: no reply in 30 s
+boxq: s1700: poll 2/3 failed: GET /jobs/s1700: no reply in 30 s
+boxq: s1700: reconnecting, next poll in 5 s
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 waiting: lanes busy, eta unknown
+boxq: s1700 queued 1321 s (wait_reason lanes busy)
+[lease] card: docs/cards/bolt-e1-pp-a6000.card sha256=c46a98a9a66d3034c3a00abb46e9772b854e7826420b1696b304bdd466ed4d4f
+[lease] card | # Engine's Bolt batched prefill, two candidates beside main d0e8a8e1's prompt (one decode step per id, 82.47 / 81.17
+[lease] card | # tok/s at P = 512, s1642), on the A6000:
+[lease] card | # - E1 bolt-prefill 39fff4df: passes of 448 rows; Q8_0 sites and NVFP4 sites (through a Q8_0 twin requantized at
+[lease] card | #   load) as gemm32 past 8 rows; routed and shared experts through iq2_xxs_gemv_sel. Engine's band [derived]:
+[lease] card | #   500..1000 tok/s at P = 512, the experts' per-slot _sel rereads (~370 GB a 448-row pass) the dominant term.
+[lease] card | # - G1 bolt-prefill-g1 f7063282: E1 rebased on the IQ2_XXS grouped GEMM (routed and shared experts as GEMMs).
+[lease] card | #   Engine's band [derived]: 800..1600 tok/s at P = 512 (the per-slot rereads leave), target >= 820.
+[lease] card | # Both load-checked by engine on the real file (resident 27.41 GB with the Q8_0 twins, 24 greedy ids = --prefill step).
+[lease] card | kind: baseline
+[lease] card | question: how fast do E1's and G1's batched prefills read a 512- and a 4096-id Bolt prompt on the A6000, against
+[lease] card |   main's steps?
+[lease] card | term: pp tok/s @ P = 512 (the row's pp_tok/s), bin arm generate_qwen3moe built at 39fff4df, RTX A6000; the
+[lease] card |   f7063282 arm is read beside it against 800..1600
+[lease] card | unit: tok/s
+[lease] card | predict: 500..1000
+[lease] card | condition: one lease, BLOOMERY_CARD=a6000, BLOOMERY_AB_ROUNDS=2; arms 512 4096 (main) and the two bin arms at 512 and
+[lease] card |   4096; busy tags read beside each mean
+[lease] card | reason: the Bolt speed plan's prefill stage 1; why now: E1 and G1 load on the real file and the lead's deadline is
+[lease] card |   20:40
+[lease] card | decide-in: E1/G1 are the plan's prefill stage 1; G2/G3 and the chunked scan are priced from the gap to llama.cpp's
+[lease] card |   1549 (-ub 512) / 1890 (-ub 1024)
+[lease] card | decide-below: a per-pass term is larger than derived: nsys the pass before the next stage
+[lease] card | decide-above: the experts' L2 reuse covers more than derived: re-derive the next stage's gain
+[lease] card: ok kind=baseline (no ruler: not an ab card)
+f7063282
+-rwxr-xr-x 2 root root 21712168 Oct 16 19:54 /home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe
+-rwxr-xr-x 2 root root 21800040 Oct 16 19:57 /home/box/repo/bloomery-perf-g1/target/release/generate_qwen3moe
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe...
+
+
+✓ Cargo build succeeded
+[binary] target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z (newer than its sources: dep-info)
+[lease] card: docs/cards/bolt-e1-pp-a6000.card sha256=c46a98a9a66d3034c3a00abb46e9772b854e7826420b1696b304bdd466ed4d4f
+[lease] card | # Engine's Bolt batched prefill, two candidates beside main d0e8a8e1's prompt (one decode step per id, 82.47 / 81.17
+[lease] card | # tok/s at P = 512, s1642), on the A6000:
+[lease] card | # - E1 bolt-prefill 39fff4df: passes of 448 rows; Q8_0 sites and NVFP4 sites (through a Q8_0 twin requantized at
+[lease] card | #   load) as gemm32 past 8 rows; routed and shared experts through iq2_xxs_gemv_sel. Engine's band [derived]:
+[lease] card | #   500..1000 tok/s at P = 512, the experts' per-slot _sel rereads (~370 GB a 448-row pass) the dominant term.
+[lease] card | # - G1 bolt-prefill-g1 f7063282: E1 rebased on the IQ2_XXS grouped GEMM (routed and shared experts as GEMMs).
+[lease] card | #   Engine's band [derived]: 800..1600 tok/s at P = 512 (the per-slot rereads leave), target >= 820.
+[lease] card | # Both load-checked by engine on the real file (resident 27.41 GB with the Q8_0 twins, 24 greedy ids = --prefill step).
+[lease] card | kind: baseline
+[lease] card | question: how fast do E1's and G1's batched prefills read a 512- and a 4096-id Bolt prompt on the A6000, against
+[lease] card |   main's steps?
+[lease] card | term: pp tok/s @ P = 512 (the row's pp_tok/s), bin arm generate_qwen3moe built at 39fff4df, RTX A6000; the
+[lease] card |   f7063282 arm is read beside it against 800..1600
+[lease] card | unit: tok/s
+[lease] card | predict: 500..1000
+[lease] card | condition: one lease, BLOOMERY_CARD=a6000, BLOOMERY_AB_ROUNDS=2; arms 512 4096 (main) and the two bin arms at 512 and
+[lease] card |   4096; busy tags read beside each mean
+[lease] card | reason: the Bolt speed plan's prefill stage 1; why now: E1 and G1 load on the real file and the lead's deadline is
+[lease] card |   20:40
+[lease] card | decide-in: E1/G1 are the plan's prefill stage 1; G2/G3 and the chunked scan are priced from the gap to llama.cpp's
+[lease] card |   1549 (-ub 512) / 1890 (-ub 1024)
+[lease] card | decide-below: a per-pass term is larger than derived: nsys the pass before the next stage
+[lease] card | decide-above: the experts' L2 reuse covers more than derived: re-derive the next stage's gain
+[lease] card: ok kind=baseline (no ruler: not an ab card)
+[lease] timing card idle: GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4
+[lease] held by pid 1938867 at 2026-10-16T11:18:16Z
+[lease] netdata: frozen
+[config] model=/models/nemotron-3.5-bolt/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf n=96 rounds=2 warm=0 card=A6000 arm_bound=900s
+[config] ours: target/release/generate_qwen3moe ctx=D+N rounded up to 256
+[config] cpu guard: comms=[cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41 generate_qwen3moe llama-server mistralrs] threshold=50% strict=0
+[config] order: rotate
+[config] cold tag: majflt in the row's measured window (ours: from its prompt_ids line; lcpp: from its --progress line; mrs: from its Iteration line; ik and bin: the whole process) × 75 µs ≥ 1 % of that window
+[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)), mrspp mistralrs bench --prompt-len P --gen-len 1; ours from its time prompt row
+[config] arms=512 4096 bin:/home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe:512 bin:/home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe:4096 bin:/home/box/repo/bloomery-perf-g1/target/release/generate_qwen3moe:512 bin:/home/box/repo/bloomery-perf-g1/target/release/generate_qwen3moe:4096 timing_gpu=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4 other_gpu=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1 CUDA_VISIBLE_DEVICES=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4
+--- witness pre 2026-10-16T11:18:17Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=240 max=2100 MHz event_reasons=0x0000000000000001 capped_us sw_power=119565670572 sw_thermal=595202908 hw_thermal=0 temp=67 C power=85.56 W
+    cpu-freq: MHz mean 959 min 400 max 4292 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: [1938042, 21786 MiB;]
+    a6000-apps: []
+    gpu: 0, 100 %, 249.65 W, 1530 MHz;1, 0 %, 85.56 W, 240 MHz;
+    load=3.66 5.34 4.96 io=avg10=0.00 llm.service=inactive
+    busiest: gate_nemotron_h 193% | bash 2.9% | kswapd0 2.4% | nvidia-smi 2.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256154056 kB Cached: 246061684 kB 
+    pgmajfault: 392093919
+    bin:bloomery-perf-e1: /home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe sha256=96077d4528e6 head=? dirty_files=0
+    bin:bloomery-perf-e1: /home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe sha256=96077d4528e6 head=? dirty_files=0
+    bin:bloomery-perf-g1: /home/box/repo/bloomery-perf-g1/target/release/generate_qwen3moe sha256=fbd7e5eebfd7 head=? dirty_files=0
+    bin:bloomery-perf-g1: /home/box/repo/bloomery-perf-g1/target/release/generate_qwen3moe sha256=fbd7e5eebfd7 head=? dirty_files=0
+[load] r1 1 arm(s): 512 - one process, one load
+    load arch=nemotron_h_moe resident_bytes=22216023392 ctx=768 slots=1 layers=88 graph_nodes=1084 in 4.6 s
+    capture graph_nodes=1084
+--- witness pre r1 ours d=512 n=96 ctx=768 2026-10-16T11:18:22Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119565740248 sw_thermal=595202908 hw_thermal=0 temp=66 C power=110.14 W
+    cpu-freq: MHz mean 813 min 400 max 4485 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: [1938042, 21786 MiB;]
+    a6000-apps: [1939147, 21734 MiB;] [timing-card-busy]
+    gpu: 0, 100 %, 249.68 W, 1485 MHz;1, 0 %, 110.14 W, 1935 MHz;
+    load=4.89 5.57 5.03 io=avg10=0.00 llm.service=inactive
+    busiest: generate_qwen3m 513% | gate_nemotron_h 175% | kswapd0 2.4% | nvidia-smi 2.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255505232 kB Cached: 246070008 kB 
+    pgmajfault: 392093919
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.09s
+[other-busy] 2026-10-16T11:18:17Z compute apps on the other card (GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1): [1938042, 21786 MiB;]
+[other-busy] 2026-10-16T11:18:17Z compute apps on the other card (GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1): [1938042, 21786 MiB;]
+--- witness post r1 ours d=512 n=96 ctx=768 2026-10-16T11:18:30Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119565780855 sw_thermal=595202908 hw_thermal=0 temp=71 C power=265.69 W
+    cpu-freq: MHz mean 1098 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: [1938042, 21786 MiB;]
+    a6000-apps: []
+    gpu: 0, 100 %, 249.45 W, 1470 MHz;1, 99 %, 265.69 W, 1920 MHz;
+    load=4.66 5.51 5.02 io=avg10=0.00 llm.service=inactive
+    busiest: gate_nemotron_h 157% | kswapd0 2.4% | nvidia-smi 2.4% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256351328 kB Cached: 246061832 kB 
+    pgmajfault: 392093919
+step 0 511 2463 (the 512 prompt ids in prefill_steps=512 units, plan=step x512, 6.31 s, runtime value)
+time prompt n=512 ms=6313.7254 tok/s=81.09 passes=512 kind=step
+stat prompt ubatch_tokens=0 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 ours d=512 n=96 ctx=768 | tok/s(mean) 80.81 @ n=96, depth 512, A6000 | p50 12.3744 ms | mean 12.3747 ms | tok/s(p50) 80.81 | warm 0 | first10_p50 12.3741 | last10_p50 12.3761 | distinct_tokens 1 | nodes 1084 | pp_tok/s 81.09 (n=512, passes=512, kind=step) | slot 1/1 | wall 8s [other-busy] | majflt 0 (timed 0; ≤ 0.0 % of W 7.5017 s) | drive_read_bytes 0 (nvme0n1)
+[other-busy] 2026-10-16T11:18:31Z compute apps on the other card (GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1): [1938042, 21786 MiB;]
+[load] r1 1 arm(s): 4096 - one process, one load
+    load arch=nemotron_h_moe resident_bytes=22245383520 ctx=4352 slots=1 layers=88 graph_nodes=1084 in 4.6 s
+    capture graph_nodes=1084
+--- witness pre r1 ours d=4096 n=96 ctx=4352 2026-10-16T11:18:35Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119565780855 sw_thermal=595202908 hw_thermal=0 temp=67 C power=112.47 W
+    cpu-freq: MHz mean 1186 min 400 max 4291 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: [1938042, 21786 MiB;]
+    a6000-apps: [1939825, 21792 MiB;] [timing-card-busy]
+    gpu: 0, 100 %, 249.58 W, 1455 MHz;1, 0 %, 112.47 W, 1935 MHz;
+    load=4.44 5.45 5.00 io=avg10=0.00 llm.service=inactive
+    busiest: generate_qwen3m 519% | gate_nemotron_h 150% | ipmitool 2.5% | kswapd0 2.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255953484 kB Cached: 246070048 kB 
+    pgmajfault: 392093920
+--- witness post r1 ours d=4096 n=96 ctx=4352 2026-10-16T11:19:28Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119566761222 sw_thermal=595202908 hw_thermal=0 temp=74 C power=278.20 W
+    cpu-freq: MHz mean 1314 min 400 max 4541 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: [1938042, 21786 MiB;]
+    a6000-apps: []
+    gpu: 0, 100 %, 249.62 W, 1440 MHz;1, 7 %, 202.20 W, 1920 MHz;
+    load=3.37 4.99 4.87 io=avg10=0.00 llm.service=inactive
+    busiest: gate_nemotron_h 121% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256743444 kB Cached: 246062328 kB 
+    pgmajfault: 392093920
+step 0 4095 24 (the 4096 prompt ids in prefill_steps=4096 units, plan=step x4096, 50.91 s, runtime value)
+time prompt n=4096 ms=50910.7917 tok/s=80.45 passes=4096 kind=step
+stat prompt ubatch_tokens=0 (no prompt image)
+tokens [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 ours d=4096 n=96 ctx=4352 | tok/s(mean) 79.87 @ n=96, depth 4096, A6000 | p50 12.5245 ms | mean 12.5203 ms | tok/s(p50) 79.84 | warm 0 | first10_p50 12.5172 | last10_p50 12.5241 | distinct_tokens 1 | nodes 1084 | pp_tok/s 80.45 (n=4096, passes=4096, kind=step) | slot 1/1 | wall 53s [other-busy] | majflt 0 (timed 0; ≤ 0.0 % of W 52.1127 s) | drive_read_bytes 0 (nvme0n1)
+[other-busy] 2026-10-16T11:19:29Z compute apps on the other card (GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1): [1938042, 21786 MiB;]
+--- witness pre r1 bin:bloomery-perf-e1 d=512 n=96 ctx=768 2026-10-16T11:19:29Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119566761222 sw_thermal=595202908 hw_thermal=0 temp=72 C power=127.69 W
+    cpu-freq: MHz mean 854 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: [1938042, 21786 MiB;]
+    a6000-apps: []
+    gpu: 0, 100 %, 249.63 W, 1455 MHz;1, 0 %, 127.69 W, 1920 MHz;
+    load=3.37 4.99 4.87 io=avg10=0.00 llm.service=inactive
+    busiest: gate_nemotron_h 121% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256659828 kB Cached: 246062200 kB 
+    pgmajfault: 392093920
+--- witness post r1 bin:bloomery-perf-e1 d=512 n=96 ctx=768 2026-10-16T11:19:41Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119568281061 sw_thermal=595202908 hw_thermal=0 temp=69 C power=187.88 W
+    cpu-freq: MHz mean 736 min 400 max 4537 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 33.75 W, 210 MHz;1, 46 %, 187.88 W, 1920 MHz;
+    load=2.98 4.82 4.81 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256564608 kB Cached: 246054252 kB 
+    pgmajfault: 392093920
+load arch=nemotron_h_moe resident_bytes=27387409972 ctx=768 slots=1 layers=88 graph_nodes=1084 in 8.8 s
+capture graph_nodes=1084
+step 0 511 2463 (the 512 prompt ids in prefill_steps=2 units, plan=rows:448 x2, 1.54 s, runtime value)
+time prompt n=512 ms=1544.8160 tok/s=331.43 passes=2 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 bin:bloomery-perf-e1 d=512 n=96 ctx=768 | tok/s(mean) 80.87 @ n=96, depth 512, A6000 | p50 12.3511 ms | mean 12.3662 ms | tok/s(p50) 80.96 | warm 0 | first10_p50 12.3521 | last10_p50 12.3834 | distinct_tokens 1 | nodes 1084 | pp_tok/s 331.43 (n=512, passes=2, kind=gemm) | wall 12s [other-busy] | majflt 0 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 2.7320 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r1 bin:bloomery-perf-e1 d=4096 n=96 ctx=4352 2026-10-16T11:19:42Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119568281061 sw_thermal=595202908 hw_thermal=0 temp=68 C power=118.29 W
+    cpu-freq: MHz mean 995 min 400 max 4291 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.99 W, 210 MHz;1, 0 %, 118.29 W, 1920 MHz;
+    load=2.98 4.82 4.81 io=avg10=0.00 llm.service=inactive
+    busiest: liquidctl 100% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256477224 kB Cached: 246054256 kB 
+    pgmajfault: 392093920
+--- witness post r1 bin:bloomery-perf-e1 d=4096 n=96 ctx=4352 2026-10-16T11:20:05Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119580896824 sw_thermal=595202908 hw_thermal=0 temp=72 C power=243.28 W
+    cpu-freq: MHz mean 789 min 400 max 3980 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.25 W, 210 MHz;1, 98 %, 243.28 W, 1920 MHz;
+    load=4.00 4.97 4.86 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256725996 kB Cached: 246055612 kB 
+    pgmajfault: 392093932
+load arch=nemotron_h_moe resident_bytes=27416770100 ctx=4352 slots=1 layers=88 graph_nodes=1084 in 8.6 s
+capture graph_nodes=1084
+step 0 4095 24 (the 4096 prompt ids in prefill_steps=10 units, plan=rows:448 x10, 12.54 s, runtime value)
+time prompt n=4096 ms=12538.8367 tok/s=326.67 passes=10 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 bin:bloomery-perf-e1 d=4096 n=96 ctx=4352 | tok/s(mean) 80.03 @ n=96, depth 4096, A6000 | p50 12.4768 ms | mean 12.4952 ms | tok/s(p50) 80.15 | warm 0 | first10_p50 12.5336 | last10_p50 12.4725 | distinct_tokens 1 | nodes 1084 | pp_tok/s 326.67 (n=4096, passes=10, kind=gemm) | wall 23s | majflt 12 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 13.7384 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r1 bin:bloomery-perf-g1 d=512 n=96 ctx=768 2026-10-16T11:20:06Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119580896824 sw_thermal=595202908 hw_thermal=0 temp=71 C power=164.70 W
+    cpu-freq: MHz mean 837 min 400 max 4325 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.38 W, 210 MHz;1, 0 %, 122.82 W, 1920 MHz;
+    load=3.68 4.89 4.84 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256713488 kB Cached: 246055624 kB 
+    pgmajfault: 392093932
+--- witness post r1 bin:bloomery-perf-g1 d=512 n=96 ctx=768 2026-10-16T11:20:17Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119581085641 sw_thermal=595202908 hw_thermal=0 temp=68 C power=219.94 W
+    cpu-freq: MHz mean 855 min 400 max 4325 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.58 W, 210 MHz;1, 100 %, 219.94 W, 1920 MHz;
+    load=3.42 4.79 4.81 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256605388 kB Cached: 246055892 kB 
+    pgmajfault: 392093932
+load arch=nemotron_h_moe resident_bytes=27387409972 ctx=768 slots=1 layers=88 graph_nodes=1084 in 8.7 s
+capture graph_nodes=1084
+step 0 511 2463 (the 512 prompt ids in prefill_steps=2 units, plan=rows:448 x2, 0.55 s, runtime value)
+time prompt n=512 ms=551.9373 tok/s=927.64 passes=2 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 bin:bloomery-perf-g1 d=512 n=96 ctx=768 | tok/s(mean) 81.06 @ n=96, depth 512, A6000 | p50 12.3312 ms | mean 12.3365 ms | tok/s(p50) 81.10 | warm 0 | first10_p50 12.3038 | last10_p50 12.3524 | distinct_tokens 1 | nodes 1084 | pp_tok/s 927.64 (n=512, passes=2, kind=gemm) | wall 11s | majflt 0 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 1.7362 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r1 bin:bloomery-perf-g1 d=4096 n=96 ctx=4352 2026-10-16T11:20:18Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119581085641 sw_thermal=595202908 hw_thermal=0 temp=67 C power=138.67 W
+    cpu-freq: MHz mean 794 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.58 W, 210 MHz;1, 0 %, 138.67 W, 1920 MHz;
+    load=3.42 4.79 4.81 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256656556 kB Cached: 246055900 kB 
+    pgmajfault: 392093932
+--- witness post r1 bin:bloomery-perf-g1 d=4096 n=96 ctx=4352 2026-10-16T11:20:33Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119582758167 sw_thermal=595202908 hw_thermal=0 temp=69 C power=240.42 W
+    cpu-freq: MHz mean 731 min 400 max 3623 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.35 W, 210 MHz;1, 98 %, 240.42 W, 1920 MHz;
+    load=2.88 4.61 4.75 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256602892 kB Cached: 246055796 kB 
+    pgmajfault: 392093932
+load arch=nemotron_h_moe resident_bytes=27416770100 ctx=4352 slots=1 layers=88 graph_nodes=1084 in 8.7 s
+capture graph_nodes=1084
+step 0 4095 24 (the 4096 prompt ids in prefill_steps=10 units, plan=rows:448 x10, 4.22 s, runtime value)
+time prompt n=4096 ms=4216.3269 tok/s=971.46 passes=10 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 bin:bloomery-perf-g1 d=4096 n=96 ctx=4352 | tok/s(mean) 80.41 @ n=96, depth 4096, A6000 | p50 12.4382 ms | mean 12.4367 ms | tok/s(p50) 80.40 | warm 0 | first10_p50 12.4407 | last10_p50 12.4455 | distinct_tokens 1 | nodes 1084 | pp_tok/s 971.46 (n=4096, passes=10, kind=gemm) | wall 15s | majflt 0 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 5.4103 s) | drive_read_bytes 0 (nvme0n1)
+tokens r1: equal
+[load] r2 1 arm(s): 4096 - one process, one load
+    load arch=nemotron_h_moe resident_bytes=22245383520 ctx=4352 slots=1 layers=88 graph_nodes=1084 in 4.6 s
+    capture graph_nodes=1084
+--- witness pre r2 ours d=4096 n=96 ctx=4352 2026-10-16T11:20:38Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119582758167 sw_thermal=595202908 hw_thermal=0 temp=66 C power=105.76 W
+    cpu-freq: MHz mean 830 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: [1964630, 21792 MiB;] [timing-card-busy]
+    gpu: 0, 0 %, 30.27 W, 210 MHz;1, 0 %, 105.76 W, 1935 MHz;
+    load=2.81 4.56 4.73 io=avg10=0.00 llm.service=inactive
+    busiest: generate_qwen3m 513% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256145196 kB Cached: 246064128 kB 
+    pgmajfault: 392093932
+--- witness post r2 ours d=4096 n=96 ctx=4352 2026-10-16T11:21:31Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119583396336 sw_thermal=595202908 hw_thermal=0 temp=74 C power=285.30 W
+    cpu-freq: MHz mean 819 min 400 max 3991 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.19 W, 210 MHz;1, 24 %, 210.21 W, 1920 MHz;
+    load=1.87 4.01 4.53 io=avg10=0.07 llm.service=inactive
+    busiest: ps 100% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 257065108 kB Cached: 246056272 kB 
+    pgmajfault: 392093934
+step 0 4095 24 (the 4096 prompt ids in prefill_steps=4096 units, plan=step x4096, 50.92 s, runtime value)
+time prompt n=4096 ms=50917.2027 tok/s=80.44 passes=4096 kind=step
+stat prompt ubatch_tokens=0 (no prompt image)
+tokens [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r2 ours d=4096 n=96 ctx=4352 | tok/s(mean) 79.87 @ n=96, depth 4096, A6000 | p50 12.5225 ms | mean 12.5202 ms | tok/s(p50) 79.86 | warm 0 | first10_p50 12.5207 | last10_p50 12.5209 | distinct_tokens 1 | nodes 1084 | pp_tok/s 80.44 (n=4096, passes=4096, kind=step) | slot 1/1 | wall 53s | majflt 2 (timed 2; ≤ 0.0 % of W 52.1191 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r2 bin:bloomery-perf-e1 d=512 n=96 ctx=768 2026-10-16T11:21:31Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119583396336 sw_thermal=595202908 hw_thermal=0 temp=72 C power=129.64 W
+    cpu-freq: MHz mean 673 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.19 W, 210 MHz;1, 0 %, 129.64 W, 1920 MHz;
+    load=1.87 4.01 4.53 io=avg10=0.07 llm.service=inactive
+    busiest: ps 100% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 257003836 kB Cached: 246056272 kB 
+    pgmajfault: 392093934
+--- witness post r2 bin:bloomery-perf-e1 d=512 n=96 ctx=768 2026-10-16T11:21:44Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119584956194 sw_thermal=595202908 hw_thermal=0 temp=70 C power=261.11 W
+    cpu-freq: MHz mean 788 min 400 max 4285 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.11 W, 210 MHz;1, 6 %, 179.98 W, 1920 MHz;
+    load=1.73 3.91 4.49 io=avg10=0.01 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256693980 kB Cached: 246056604 kB 
+    pgmajfault: 392093934
+load arch=nemotron_h_moe resident_bytes=27387409972 ctx=768 slots=1 layers=88 graph_nodes=1084 in 8.8 s
+capture graph_nodes=1084
+step 0 511 2463 (the 512 prompt ids in prefill_steps=2 units, plan=rows:448 x2, 1.55 s, runtime value)
+time prompt n=512 ms=1553.7617 tok/s=329.52 passes=2 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r2 bin:bloomery-perf-e1 d=512 n=96 ctx=768 | tok/s(mean) 80.81 @ n=96, depth 512, A6000 | p50 12.3530 ms | mean 12.3749 ms | tok/s(p50) 80.95 | warm 0 | first10_p50 12.4207 | last10_p50 12.3840 | distinct_tokens 1 | nodes 1084 | pp_tok/s 329.52 (n=512, passes=2, kind=gemm) | wall 13s | majflt 0 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 2.7418 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r2 bin:bloomery-perf-e1 d=4096 n=96 ctx=4352 2026-10-16T11:21:44Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119584956194 sw_thermal=595202908 hw_thermal=0 temp=69 C power=179.98 W
+    cpu-freq: MHz mean 833 min 400 max 4556 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.11 W, 210 MHz;1, 0 %, 118.62 W, 1920 MHz;
+    load=1.73 3.91 4.49 io=avg10=0.01 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256700772 kB Cached: 246056588 kB 
+    pgmajfault: 392093934
+--- witness post r2 bin:bloomery-perf-e1 d=4096 n=96 ctx=4352 2026-10-16T11:22:07Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119597514110 sw_thermal=595202908 hw_thermal=0 temp=72 C power=215.05 W
+    cpu-freq: MHz mean 812 min 400 max 4291 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.60 W, 210 MHz;1, 98 %, 215.05 W, 1920 MHz;
+    load=1.75 3.74 4.42 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.2% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256613656 kB Cached: 246056644 kB 
+    pgmajfault: 392093934
+load arch=nemotron_h_moe resident_bytes=27416770100 ctx=4352 slots=1 layers=88 graph_nodes=1084 in 8.6 s
+capture graph_nodes=1084
+step 0 4095 24 (the 4096 prompt ids in prefill_steps=10 units, plan=rows:448 x10, 12.51 s, runtime value)
+time prompt n=4096 ms=12508.1688 tok/s=327.47 passes=10 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r2 bin:bloomery-perf-e1 d=4096 n=96 ctx=4352 | tok/s(mean) 80.02 @ n=96, depth 4096, A6000 | p50 12.4779 ms | mean 12.4970 ms | tok/s(p50) 80.14 | warm 0 | first10_p50 12.5407 | last10_p50 12.4810 | distinct_tokens 1 | nodes 1084 | pp_tok/s 327.47 (n=4096, passes=10, kind=gemm) | wall 23s | majflt 0 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 13.7079 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r2 bin:bloomery-perf-g1 d=512 n=96 ctx=768 2026-10-16T11:22:08Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119597514110 sw_thermal=595202908 hw_thermal=0 temp=71 C power=136.24 W
+    cpu-freq: MHz mean 986 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.60 W, 210 MHz;1, 0 %, 136.24 W, 1920 MHz;
+    load=1.75 3.74 4.42 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.2% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256572204 kB Cached: 246056644 kB 
+    pgmajfault: 392093934
+--- witness post r2 bin:bloomery-perf-g1 d=512 n=96 ctx=768 2026-10-16T11:22:19Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119597694285 sw_thermal=595202908 hw_thermal=0 temp=68 C power=237.29 W
+    cpu-freq: MHz mean 832 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.95 W, 210 MHz;1, 98 %, 237.29 W, 1920 MHz;
+    load=3.99 4.17 4.55 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.2% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256318152 kB Cached: 246056784 kB 
+    pgmajfault: 392093934
+load arch=nemotron_h_moe resident_bytes=27387409972 ctx=768 slots=1 layers=88 graph_nodes=1084 in 8.4 s
+capture graph_nodes=1084
+step 0 511 2463 (the 512 prompt ids in prefill_steps=2 units, plan=rows:448 x2, 0.55 s, runtime value)
+time prompt n=512 ms=552.4749 tok/s=926.74 passes=2 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r2 bin:bloomery-perf-g1 d=512 n=96 ctx=768 | tok/s(mean) 81.06 @ n=96, depth 512, A6000 | p50 12.3288 ms | mean 12.3365 ms | tok/s(p50) 81.11 | warm 0 | first10_p50 12.2997 | last10_p50 12.3464 | distinct_tokens 1 | nodes 1084 | pp_tok/s 926.74 (n=512, passes=2, kind=gemm) | wall 11s | majflt 0 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 1.7368 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r2 bin:bloomery-perf-g1 d=4096 n=96 ctx=4352 2026-10-16T11:22:20Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119597694285 sw_thermal=595202908 hw_thermal=0 temp=68 C power=156.74 W
+    cpu-freq: MHz mean 1354 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.88 W, 210 MHz;1, 0 %, 115.46 W, 1920 MHz;
+    load=3.99 4.17 4.55 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.2% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256307316 kB Cached: 246056788 kB 
+    pgmajfault: 392093934
+--- witness post r2 bin:bloomery-perf-g1 d=4096 n=96 ctx=4352 2026-10-16T11:22:35Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119599249530 sw_thermal=595202908 hw_thermal=0 temp=69 C power=231.81 W
+    cpu-freq: MHz mean 724 min 400 max 4107 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.10 W, 210 MHz;1, 97 %, 231.81 W, 1920 MHz;
+    load=3.49 4.05 4.50 io=avg10=0.00 llm.service=inactive
+    busiest: ps 100% | kswapd0 2.4% | nvidia-smi 2.2% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256682296 kB Cached: 246056824 kB 
+    pgmajfault: 392093934
+load arch=nemotron_h_moe resident_bytes=27416770100 ctx=4352 slots=1 layers=88 graph_nodes=1084 in 8.6 s
+capture graph_nodes=1084
+step 0 4095 24 (the 4096 prompt ids in prefill_steps=10 units, plan=rows:448 x10, 4.21 s, runtime value)
+time prompt n=4096 ms=4214.5627 tok/s=971.87 passes=10 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r2 bin:bloomery-perf-g1 d=4096 n=96 ctx=4352 | tok/s(mean) 80.42 @ n=96, depth 4096, A6000 | p50 12.4323 ms | mean 12.4351 ms | tok/s(p50) 80.44 | warm 0 | first10_p50 12.4221 | last10_p50 12.4586 | distinct_tokens 1 | nodes 1084 | pp_tok/s 971.87 (n=4096, passes=10, kind=gemm) | wall 15s | majflt 0 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 5.4083 s) | drive_read_bytes 0 (nvme0n1)
+[load] r2 1 arm(s): 512 - one process, one load
+    load arch=nemotron_h_moe resident_bytes=22216023392 ctx=768 slots=1 layers=88 graph_nodes=1084 in 4.5 s
+    capture graph_nodes=1084
+--- witness pre r2 ours d=512 n=96 ctx=768 2026-10-16T11:22:40Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119599249530 sw_thermal=595202908 hw_thermal=0 temp=66 C power=112.54 W
+    cpu-freq: MHz mean 1533 min 400 max 4295 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: [1989571, 21734 MiB;] [timing-card-busy]
+    gpu: 0, 0 %, 29.98 W, 210 MHz;1, 0 %, 109.48 W, 1935 MHz;
+    load=3.37 4.01 4.49 io=avg10=0.00 llm.service=inactive
+    busiest: generate_qwen3m 520% | kswapd0 2.4% | nvidia-smi 2.2% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256475068 kB Cached: 246065144 kB 
+    pgmajfault: 392093934
+--- witness post r2 ours d=512 n=96 ctx=768 2026-10-16T11:22:48Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119599300169 sw_thermal=595202908 hw_thermal=0 temp=70 C power=242.07 W
+    cpu-freq: MHz mean 632 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.50 W, 210 MHz;1, 97 %, 242.07 W, 1920 MHz;
+    load=3.00 3.91 4.45 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.2% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256854120 kB Cached: 246056980 kB 
+    pgmajfault: 392093934
+step 0 511 2463 (the 512 prompt ids in prefill_steps=512 units, plan=step x512, 6.32 s, runtime value)
+time prompt n=512 ms=6316.3271 tok/s=81.06 passes=512 kind=step
+stat prompt ubatch_tokens=0 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r2 ours d=512 n=96 ctx=768 | tok/s(mean) 80.79 @ n=96, depth 512, A6000 | p50 12.3802 ms | mean 12.3776 ms | tok/s(p50) 80.77 | warm 0 | first10_p50 12.3681 | last10_p50 12.3864 | distinct_tokens 1 | nodes 1084 | pp_tok/s 81.06 (n=512, passes=512, kind=step) | slot 1/1 | wall 8s | majflt 0 (timed 0; ≤ 0.0 % of W 7.5046 s) | drive_read_bytes 0 (nvme0n1)
+tokens r2: equal
+
+cpu-busy rows: 0 of 12 (BLOOMERY_CPU_BUSY_PCT=50% over [cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41 generate_qwen3moe llama-server mistralrs])
+other-busy rows: 3 of 12 (a compute process on the other card as the arm started)
+tokens-differ rounds: 0 of 2 (arms on one prompt, P and n whose greedy ids differ)
+cold rows: 0 of 12 (the measured window's majflt × 75 µs ≥ 1 % of that window)
+probe-off rows: 0 of 12 (an ours row whose load probed lane_gbs under 18.5 GB/s: a lighter prompt plan than its pair's)
+loop rows: 0 of 12 (a single-stream row whose distinct_tokens is under the floor of its steps, loop-floor.py: its arm decoded a loop, so a speed read against a pair on other text is void)
+failed arms: 0 (FAIL rows, the warm-up's or the discards' included)
+=== per-arm means (tok/s @ n=96, A6000). First column: ours from mean_ms, the references
+    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)
+    — the cross-engine ratio reads these. The p50 column is ours only. ===
+mean bin:bloomery-perf-e1 d=4096    80.03 tok/s  [80.02..80.03, spread 0.01%]  80.15 tok/s(p50) (n=2)  [cold 0/2] [probe-off 0/2]  untagged mean 80.03 tok/s (n=2)
+mean bin:bloomery-perf-e1 d=512    80.84 tok/s  [80.81..80.87, spread 0.07%]  80.95 tok/s(p50) (n=2)  [cold 0/2] [probe-off 0/2]  untagged mean 80.81 tok/s (n=1)
+mean bin:bloomery-perf-g1 d=4096    80.41 tok/s  [80.41..80.42, spread 0.01%]  80.42 tok/s(p50) (n=2)  [cold 0/2] [probe-off 0/2]  untagged mean 80.41 tok/s (n=2)
+mean bin:bloomery-perf-g1 d=512    81.06 tok/s  [81.06..81.06, spread 0.00%]  81.10 tok/s(p50) (n=2)  [cold 0/2] [probe-off 0/2]  untagged mean 81.06 tok/s (n=2)
+mean ours d=4096       79.87 tok/s  [79.87..79.87, spread 0.00%]  79.85 tok/s(p50) (n=2)  [cold 0/2] [probe-off 0/2]  untagged mean 79.87 tok/s (n=1)
+mean ours d=512        80.80 tok/s  [80.79..80.81, spread 0.02%]  80.79 tok/s(p50) (n=2)  [cold 0/2] [probe-off 0/2]  untagged mean 80.79 tok/s (n=1)
+
+=== ours / reference per depth: each round's ratio of the pair measured in that round (arms
+    that ran more than once in a round are averaged first), their mean with its 95 % interval
+    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ===
+ratio d=512   ours/bin:bloomery-perf-e1  mean 0.9995 ± 0.0031 (n=2)  of means 0.9995  per round: r1 0.9993 r2 0.9998  cpu-busy: ours 0/2, bin:bloomery-perf-e1 0/2  cold: ours 0/2, bin:bloomery-perf-e1 0/2  probe-off: ours 0/2
+ratio d=512   ours/bin:bloomery-perf-g1  mean 0.9968 ± 0.0016 (n=2)  of means 0.9968  per round: r1 0.9969 r2 0.9967  cpu-busy: ours 0/2, bin:bloomery-perf-g1 0/2  cold: ours 0/2, bin:bloomery-perf-g1 0/2  probe-off: ours 0/2
+ratio d=4096  ours/bin:bloomery-perf-e1  mean 0.9981 ± 0.0008 (n=2)  of means 0.9981  per round: r1 0.9980 r2 0.9981  cpu-busy: ours 0/2, bin:bloomery-perf-e1 0/2  cold: ours 0/2, bin:bloomery-perf-e1 0/2  probe-off: ours 0/2
+ratio d=4096  ours/bin:bloomery-perf-g1  mean 0.9932 ± 0.0008 (n=2)  of means 0.9932  per round: r1 0.9933 r2 0.9932  cpu-busy: ours 0/2, bin:bloomery-perf-g1 0/2  cold: ours 0/2, bin:bloomery-perf-g1 0/2  probe-off: ours 0/2
+
+=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, A6000). Ours: its time prompt
+    row (prefill through its token's readback); llama-bench's pp value over one repetition;
+    mistral.rs P / TTFT over one request. The tags count the rows that met contention or faults. ===
+mean pp bin:bloomery-perf-e1 p=4096   327.07 tok/s(pp)  [326.67..327.47, spread 0.24%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 0/2]  untagged mean 327.07 tok/s(pp) (n=2)
+mean pp bin:bloomery-perf-e1 p=512   330.48 tok/s(pp)  [329.52..331.43, spread 0.58%]  (n=2)  [cpu-busy 0/2] [other-busy 1/2] [cold 0/2] [probe-off 0/2]  untagged mean 329.52 tok/s(pp) (n=1)
+mean pp bin:bloomery-perf-g1 p=4096   971.66 tok/s(pp)  [971.46..971.87, spread 0.04%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 0/2]  untagged mean 971.66 tok/s(pp) (n=2)
+mean pp bin:bloomery-perf-g1 p=512   927.19 tok/s(pp)  [926.74..927.64, spread 0.10%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 0/2]  untagged mean 927.19 tok/s(pp) (n=2)
+mean pp ours p=4096       80.44 tok/s(pp)  [80.44..80.45, spread 0.01%]  (n=2)  [cpu-busy 0/2] [other-busy 1/2] [cold 0/2] [probe-off 0/2]  untagged mean 80.44 tok/s(pp) (n=1)
+mean pp ours p=512        81.08 tok/s(pp)  [81.06..81.09, spread 0.04%]  (n=2)  [cpu-busy 0/2] [other-busy 1/2] [cold 0/2] [probe-off 0/2]  untagged mean 81.06 tok/s(pp) (n=1)
+
+=== ours / reference prefill per prompt length: the decode table's statistics over the pp
+    values, then how many of each side's rows carried [other-busy] and [cold] ===
+ratio pp p=512   ours/bin:bloomery-perf-e1  mean 0.2453 ± 0.0084 (n=2)  of means 0.2453  per round: r1 0.2447 r2 0.2460  busy: ours [cpu-busy 0/2] [other-busy 1/2], bin:bloomery-perf-e1 [cpu-busy 0/2] [other-busy 1/2]  cold: ours 0/2, bin:bloomery-perf-e1 0/2  probe-off: ours 0/2
+ratio pp p=512   ours/bin:bloomery-perf-g1  mean 0.0874 ± 0.0003 (n=2)  of means 0.0874  per round: r1 0.0874 r2 0.0875  busy: ours [cpu-busy 0/2] [other-busy 1/2], bin:bloomery-perf-g1 [cpu-busy 0/2] [other-busy 0/2]  cold: ours 0/2, bin:bloomery-perf-g1 0/2  probe-off: ours 0/2
+ratio pp p=4096  ours/bin:bloomery-perf-e1  mean 0.2460 ± 0.0040 (n=2)  of means 0.2460  per round: r1 0.2463 r2 0.2456  busy: ours [cpu-busy 0/2] [other-busy 1/2], bin:bloomery-perf-e1 [cpu-busy 0/2] [other-busy 0/2]  cold: ours 0/2, bin:bloomery-perf-e1 0/2  probe-off: ours 0/2
+ratio pp p=4096  ours/bin:bloomery-perf-g1  mean 0.0828 ± 0.0003 (n=2)  of means 0.0828  per round: r1 0.0828 r2 0.0828  busy: ours [cpu-busy 0/2] [other-busy 1/2], bin:bloomery-perf-g1 [cpu-busy 0/2] [other-busy 0/2]  cold: ours 0/2, bin:bloomery-perf-g1 0/2  probe-off: ours 0/2
+--- witness post 2026-10-16T11:22:49Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1920 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119599300169 sw_thermal=595202908 hw_thermal=0 temp=69 C power=160.35 W
+    cpu-freq: MHz mean 742 min 400 max 4291 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=5bc5e73b1e9f mtime=2026-10-16T09:55:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.71 W, 210 MHz;1, 0 %, 160.35 W, 1920 MHz;
+    load=3.00 3.91 4.45 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.2% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256852356 kB Cached: 246056980 kB 
+    pgmajfault: 392093934
+    bin:bloomery-perf-e1: /home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe sha256=96077d4528e6 head=? dirty_files=0
+    bin:bloomery-perf-e1: /home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe sha256=96077d4528e6 head=? dirty_files=0
+    bin:bloomery-perf-g1: /home/box/repo/bloomery-perf-g1/target/release/generate_qwen3moe sha256=fbd7e5eebfd7 head=? dirty_files=0
+    bin:bloomery-perf-g1: /home/box/repo/bloomery-perf-g1/target/release/generate_qwen3moe sha256=fbd7e5eebfd7 head=? dirty_files=0

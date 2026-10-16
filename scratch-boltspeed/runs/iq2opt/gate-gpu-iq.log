@@ -1,0 +1,137 @@
+./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq'
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt tree=6f3ea6d0b6ce2932
+boxq: bloomery-perf-iq2opt-cargo-262136 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-cargo-262136 is job s1644
+boxq: s1644 waiting: bloomery-cpu.lock: held; card a6000 above 2000 MiB, eta unknown
+boxq: s1644 queued 35 s (wait_reason bloomery-cpu.lock: held; card a6000 above 2000 MiB)
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_iq...
+
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling cfg-if v1.0.5
+   Compiling thiserror v2.0.21
+   Compiling libc v0.2.190
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling cpufeatures v0.2.17
+   Compiling glob v0.3.4
+   Compiling prettyplease v0.2.37
+   Compiling crc32fast v1.5.2
+   Compiling rustix v0.38.44
+   Compiling bitflags v2.13.2
+   Compiling memchr v2.8.3
+   Compiling either v1.19.0
+   Compiling regex-syntax v0.8.11
+   Compiling serde_core v1.0.229
+   Compiling minimal-lexical v0.2.1
+   Compiling linux-raw-sys v0.4.15
+   Compiling libloading v0.8.9
+   Compiling generic-array v0.14.7
+   Compiling clang-sys v1.9.1
+   Compiling home v0.5.12
+   Compiling bindgen v0.69.5
+   Compiling nom v7.1.3
+   Compiling itertools v0.12.1
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling regex-automata v0.4.18
+   Compiling memmap2 v0.9.11
+   Compiling sha2 v0.10.9
+   Compiling rustc-hash v1.1.0
+   Compiling log v0.4.34
+   Compiling lazy_static v1.5.1
+   Compiling lazycell v1.3.0
+   Compiling shlex v1.3.0
+   Compiling simd-adler32 v0.3.10
+   Compiling hashbrown v0.17.1
+   Compiling which v4.4.2
+   Compiling equivalent v1.0.2
+   Compiling adler2 v2.0.1
+   Compiling cexpr v0.6.0
+   Compiling foldhash v0.1.5
+   Compiling bloomery-levers v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/levers)
+   Compiling object v0.36.7
+   Compiling zerocopy v0.8.61
+   Compiling zmij v1.0.23
+   Compiling indexmap v2.14.2
+   Compiling regex v1.13.1
+   Compiling hashbrown v0.15.5
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling anyhow v1.0.104
+   Compiling bloomery-threads v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/threads)
+   Compiling miniz_oxide v0.9.1
+   Compiling reserved-oxide-symbols v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling itoa v1.0.18
+   Compiling cuda-target-spec v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-core v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling miniz_oxide v0.8.9
+   Compiling flate2 v1.1.10
+   Compiling fdeflate v0.3.7
+   Compiling sha1 v0.10.7
+   Compiling zune-core v0.5.1
+   Compiling zune-jpeg v0.5.15
+   Compiling png v0.18.1
+   Compiling ptx-parse v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-verbs v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/verbs)
+   Compiling oxide-artifacts v0.2.1
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling zerocopy-derive v0.8.61
+   Compiling cuda-macros v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-core-derive v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-gguf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gguf)
+   Compiling libnvvm-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling nvjitlink-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-models v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/models)
+   Compiling bloomery-tokenizer v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/tokenizer)
+   Compiling bloomery-runtime v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/runtime)
+   Compiling bloomery-placement v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/placement)
+   Compiling bloomery-qdot v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/qdot)
+   Compiling bloomery-engram v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/engram)
+   Compiling bloomery-vision v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/vision)
+   Compiling cuda-artifact-finalizer v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-hf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/hf)
+   Compiling bloomery-model v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/model)
+   Compiling bloomery-refset v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/refset)
+   Compiling cuda-bindings v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling half v2.7.1
+   Compiling cuda-host v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-device v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-gpu v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu)
+   Compiling bloomery-app v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/app)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 26s
+
+✓ Cargo build succeeded
+gpu-gate.sh: gate_iq on the a6000 (asked a6000)
+iq2_xxs  k=4096 rows=80 m=8: host rule 640/640 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 4.551e0 max|ref| 1.164e3 rel 3.908e-3, worst err/bound 7.166e-2 PASS
+iq2_xxs  k=2304 rows=79 m=8: host rule 632/632 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 4.510e0 max|ref| 9.893e2 rel 4.559e-3, worst err/bound 8.558e-2 PASS
+iq2_xxs  k=4096 rows=5376 m=8: host rule 43008/43008 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 7.075e0 max|ref| 1.559e3 rel 4.537e-3, worst err/bound 1.071e-1 PASS
+iq2_xxs  k=5376 rows=4096 m=8: host rule 32768/32768 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 7.640e0 max|ref| 1.766e3 rel 4.326e-3, worst err/bound 9.010e-2 PASS
+iq2_xxs  max|rel|, the largest of its geometries: 4.5586e-3 (pin 4.6e-3) PASS
+iq2_xs   k=4096 rows=80 m=8: host rule 640/640 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 4.061e0 max|ref| 1.119e3 rel 3.630e-3, worst err/bound 5.681e-2 PASS
+iq2_xs   k=2304 rows=79 m=8: host rule 632/632 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 3.139e0 max|ref| 9.286e2 rel 3.381e-3, worst err/bound 6.434e-2 PASS
+iq2_xs   max|rel|, the largest of its geometries: 3.6301e-3 (pin 3.7e-3) PASS
+iq3_xxs  k=4096 rows=80 m=8: host rule 640/640 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 1.253e1 max|ref| 2.863e3 rel 4.378e-3, worst err/bound 7.398e-2 PASS
+iq3_xxs  k=2304 rows=79 m=8: host rule 632/632 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 1.136e1 max|ref| 1.962e3 rel 5.788e-3, worst err/bound 7.130e-2 PASS
+iq3_xxs  max|rel|, the largest of its geometries: 5.7881e-3 (pin 5.8e-3) PASS
+iq4_xs   k=4096 rows=80 m=8: host rule 640/640 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 7.103e1 max|ref| 2.276e4 rel 3.121e-3, worst err/bound 8.397e-2 PASS
+iq4_xs   k=2304 rows=79 m=8: host rule 632/632 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 5.173e1 max|ref| 1.357e4 rel 3.813e-3, worst err/bound 8.106e-2 PASS
+iq4_xs   max|rel|, the largest of its geometries: 3.8129e-3 (pin 3.9e-3) PASS
+q2_K     k=4096 rows=80 m=8: host rule 640/640 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 1.523e0 max|ref| 2.696e2 rel 5.650e-3, worst err/bound 5.175e-2 PASS
+q2_K     k=2304 rows=79 m=8: host rule 632/632 bit-identical PASS; rerun PASS; m=3 PASS; finite and written PASS; f32 ref max|err| 1.185e0 max|ref| 2.743e2 rel 4.320e-3, worst err/bound 6.505e-2 PASS
+q2_K     max|rel|, the largest of its geometries: 5.6505e-3 (pin 5.7e-3) PASS
+gate_iq: PASS
+gpu-gate.sh: gate_iq ran 13 s (exit 0)

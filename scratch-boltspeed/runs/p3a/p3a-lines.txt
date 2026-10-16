@@ -1,0 +1,24 @@
+eager_equals_replay: walk16 ids [1275, 1047, 1032, 1032], logits bit-identical true, finite true PASS
+logits_near_mainlines_real: 10 prompts gated at the floor PASS
+logits_near_mainlines_real: code29 29 tokens, max |delta| 0.3898, cosine 0.999998 (floor 0.999), top-5 body ["1935:57.823", "2810:57.822", "5803:57.501", "3729:56.741", "12476:55.342"] mainline ["1935:57.739", "2810:57.725", "5803:57.385", "3729:56.740", "12476:55.312"] PASS
+logits_near_mainlines_real: code4096 4096 tokens, max |delta| 1.9015, cosine 0.999928 (floor 0.999), top-5 body ["1424:61.280", "59773:51.773", "1429:48.710", "55630:48.490", "1032:48.165"] mainline ["1424:61.276", "59773:52.161", "1429:48.821", "55630:48.800", "1032:48.556"] PASS
+logits_near_mainlines_real: code5 5 tokens, max |delta| 0.7032, cosine 0.999988 (floor 0.999), top-5 body ["1050:43.388", "1763:42.966", "1051:42.489", "2867:42.354", "2986:41.864"] mainline ["1050:43.731", "1763:42.900", "1051:42.826", "2867:42.305", "2986:41.792"] PASS
+logits_near_mainlines_real: prose1 1 tokens, max |delta| 0.6788, cosine 0.999992 (floor 0.999), top-5 body ["1044:48.447", "1125:48.203", "1041:48.034", "1010:48.023", "1046:47.938"] mainline ["1044:48.517", "1125:48.276", "1041:48.038", "1046:47.917", "1010:47.524"] PASS
+logits_near_mainlines_real: prose1024 1024 tokens, max |delta| 0.3974, cosine 0.999998 (floor 0.999), top-5 body ["22952:62.045", "3299:58.698", "11274:52.392", "12901:52.321", "4310:52.006"] mainline ["22952:61.899", "3299:58.552", "11274:52.443", "12901:52.256", "4310:52.132"] PASS
+logits_near_mainlines_real: prose255 255 tokens, max |delta| 0.5002, cosine 0.999995 (floor 0.999), top-5 body ["22561:56.854", "1068:55.722", "12223:51.459", "49329:49.954", "13705:49.772"] mainline ["22561:57.118", "1068:55.761", "12223:51.591", "49329:50.106", "13705:49.987"] PASS
+logits_near_mainlines_real: prose256 256 tokens, max |delta| 0.5933, cosine 0.999993 (floor 0.999), top-5 body ["16807:55.102", "23947:48.298", "116900:47.957", "6999:46.254", "12164:46.208"] mainline ["16807:55.101", "23947:48.082", "116900:47.715", "6999:46.359", "34732:46.016"] PASS
+logits_near_mainlines_real: prose257 257 tokens, max |delta| 0.5237, cosine 0.999963 (floor 0.999), top-5 body ["4755:49.123", "8707:35.966", "1079:34.903", "3749:32.840", "9197:32.189"] mainline ["4755:48.989", "8707:35.942", "1079:34.729", "3749:32.743", "9197:32.134"] PASS
+logits_near_mainlines_real: prose512 512 tokens, max |delta| 0.5784, cosine 0.999996 (floor 0.999), top-5 body ["1046:54.893", "4015:48.805", "111316:48.750", "1045:47.886", "1095:45.751"] mainline ["1046:54.609", "111316:48.415", "4015:48.307", "1045:47.393", "1095:45.291"] PASS
+logits_near_mainlines_real: prose64 64 tokens, max |delta| 0.6988, cosine 0.999401 (floor 0.999), top-5 body ["2082:32.585", "1666:22.833", "4450:22.033", "2059:21.713", "2017:21.632"] mainline ["2082:32.911", "1666:23.058", "4450:22.350", "2059:21.660", "2017:21.583"] PASS
+reset_rewinds: walk16 ids equal true, logits bit-identical true PASS
+top1_is_mainlines_real: 7 of 10 prompts gated PASS
+top1_is_mainlines_real: code29 body argmax 1935 mainline 1935, margin 0.0137 <= band 0.7796: not gated
+top1_is_mainlines_real: code4096 body argmax 1424 mainline 1424, margin 9.1155 > band 3.8031 (2 x max |delta|) PASS
+top1_is_mainlines_real: code5 body argmax 1050 mainline 1050, margin 0.8308 <= band 1.4064: not gated
+top1_is_mainlines_real: prose1 body argmax 1044 mainline 1044, margin 0.2406 <= band 1.3576: not gated
+top1_is_mainlines_real: prose1024 body argmax 22952 mainline 22952, margin 3.3478 > band 0.7947 (2 x max |delta|) PASS
+top1_is_mainlines_real: prose255 body argmax 22561 mainline 22561, margin 1.3576 > band 1.0004 (2 x max |delta|) PASS
+top1_is_mainlines_real: prose256 body argmax 16807 mainline 16807, margin 7.0190 > band 1.1866 (2 x max |delta|) PASS
+top1_is_mainlines_real: prose257 body argmax 4755 mainline 4755, margin 13.0466 > band 1.0475 (2 x max |delta|) PASS
+top1_is_mainlines_real: prose512 body argmax 1046 mainline 1046, margin 6.1945 > band 1.1568 (2 x max |delta|) PASS
+top1_is_mainlines_real: prose64 body argmax 2082 mainline 2082, margin 9.8525 > band 1.3977 (2 x max |delta|) PASS

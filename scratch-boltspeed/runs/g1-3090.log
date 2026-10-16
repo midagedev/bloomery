@@ -1,0 +1,173 @@
+box.sh: queue round card=3090 predicted unknown remote=/home/box/repo/bloomery-perf-g1 tree=d15761ce4234c0a9
+boxq: bloomery-perf-g1-bash-df38fd class=round card=3090 predicted unknown
+boxq: bloomery-perf-g1-bash-df38fd is job s1720
+boxq: s1720 waiting: lanes busy, eta unknown
+boxq: s1720 waiting: lanes busy, eta unknown
+boxq: s1720 queued 99 s (wait_reason lanes busy)
+[lease] card: docs/cards/bolt-g1-pp-3090.card sha256=ba6e4564ca615b5e60c85ec98f2bed81dc356a50efe6896a1253b5fec241e395
+[lease] card | # Engine's G1 Bolt batched prefill (bolt-prefill-g1 f7063282) beside main d0e8a8e1 on the RTX 3090 (24 GB, 250 W):
+[lease] card | # the A6000 measured 927.19 pp tok/s at P = 512 (s1700), but G1 holds 27.41 GB resident with its Q8_0 twins of the
+[lease] card | # NVFP4 sites, past the 3090's 24 GB, so the question is whether it loads. Derived if it loads: the 3090's ~0.9x
+[lease] card | # of the A6000's rate on llama.cpp's pp (1359 vs 1535), so 750..900 tok/s; else a load FAIL row.
+[lease] card | kind: baseline
+[lease] card | question: does G1's batched prefill load and run a 512-id Bolt prompt on the 3090, and how fast, beside main?
+[lease] card | term: pp tok/s @ P = 512 (the row's pp_tok/s), ours arm = generate_qwen3moe built at f7063282 (this tree), RTX 3090
+[lease] card | unit: tok/s
+[lease] card | predict: 750..900
+[lease] card | condition: one lease on the 3090 (BLOOMERY_TIMING_GPU = the 3090), BLOOMERY_AB_ROUNDS=1; arms 512 (this tree, G1) and bin:
+[lease] card |   main's build at 512
+[lease] card | reason: the user's two-line rule (A6000 whole card and the 3090) for #328; why now: the 20:40 report
+[lease] card | decide-in: #328 states its 3090 line
+[lease] card | decide-below: a 3090-specific term (power cap, L2): nsys on the 3090
+[lease] card | decide-above: re-derive the 3090's rate
+[lease] card: ok kind=baseline (no ruler: not an ab card)
+[binary] target/release/generate_qwen3moe sha256=fbd7e5eebfd7 mtime=2026-10-16T10:57:28Z (newer than its sources: dep-info)
+[lease] card: docs/cards/bolt-g1-pp-3090.card sha256=ba6e4564ca615b5e60c85ec98f2bed81dc356a50efe6896a1253b5fec241e395
+[lease] card | # Engine's G1 Bolt batched prefill (bolt-prefill-g1 f7063282) beside main d0e8a8e1 on the RTX 3090 (24 GB, 250 W):
+[lease] card | # the A6000 measured 927.19 pp tok/s at P = 512 (s1700), but G1 holds 27.41 GB resident with its Q8_0 twins of the
+[lease] card | # NVFP4 sites, past the 3090's 24 GB, so the question is whether it loads. Derived if it loads: the 3090's ~0.9x
+[lease] card | # of the A6000's rate on llama.cpp's pp (1359 vs 1535), so 750..900 tok/s; else a load FAIL row.
+[lease] card | kind: baseline
+[lease] card | question: does G1's batched prefill load and run a 512-id Bolt prompt on the 3090, and how fast, beside main?
+[lease] card | term: pp tok/s @ P = 512 (the row's pp_tok/s), ours arm = generate_qwen3moe built at f7063282 (this tree), RTX 3090
+[lease] card | unit: tok/s
+[lease] card | predict: 750..900
+[lease] card | condition: one lease on the 3090 (BLOOMERY_TIMING_GPU = the 3090), BLOOMERY_AB_ROUNDS=1; arms 512 (this tree, G1) and bin:
+[lease] card |   main's build at 512
+[lease] card | reason: the user's two-line rule (A6000 whole card and the 3090) for #328; why now: the 20:40 report
+[lease] card | decide-in: #328 states its 3090 line
+[lease] card | decide-below: a 3090-specific term (power cap, L2): nsys on the 3090
+[lease] card | decide-above: re-derive the 3090's rate
+[lease] card: ok kind=baseline (no ruler: not an ab card)
+[lease] timing card idle: GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
+[lease] held by pid 2023766 at 2026-10-16T11:33:50Z
+[lease] netdata: frozen
+[config] model=/models/nemotron-3.5-bolt/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf n=96 rounds=1 warm=0 card=3090 arm_bound=900s
+[config] ours: target/release/generate_qwen3moe ctx=D+N rounded up to 256
+[config] cpu guard: comms=[cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41 generate_qwen3moe llama-server mistralrs] threshold=50% strict=0
+[config] order: rotate
+[config] cold tag: majflt in the row's measured window (ours: from its prompt_ids line; lcpp: from its --progress line; mrs: from its Iteration line; ik and bin: the whole process) × 75 µs ≥ 1 % of that window
+[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)), mrspp mistralrs bench --prompt-len P --gen-len 1; ours from its time prompt row
+[config] arms=512 bin:/home/box/repo/bloomery-perf/target/release/generate_qwen3moe:512 timing_gpu=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1 other_gpu=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4 CUDA_VISIBLE_DEVICES=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
+--- witness pre 2026-10-16T11:33:51Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=668984277915 sw_thermal=624424393722 hw_thermal=0 temp=45 C power=178.08 W
+    cpu-freq: MHz mean 959 min 400 max 4476 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=fbd7e5eebfd7 mtime=2026-10-16T10:57:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 178.08 W, 1980 MHz;1, 0 %, 20.27 W, 210 MHz;
+    load=4.29 3.90 4.15 io=avg10=0.00 llm.service=inactive
+    busiest: rustc 99.9% | bash 4.3% | nvidia-smi 2.5% | kswapd0 2.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254830760 kB Cached: 246212996 kB 
+    pgmajfault: 392095721
+    bin:bloomery-perf: /home/box/repo/bloomery-perf/target/release/generate_qwen3moe sha256=5bc5e73b1e9f head=? dirty_files=0
+[load] r1 1 arm(s): 512 - one process, one load
+[cpu-busy] 2026-10-16T11:33:52Z pre: 101.0% > 50% of one cpu over 1.0 s [cargo 0.0%;rustc 101.0%;]
+[cpu-busy] 2026-10-16T11:33:59Z pre r1 512: 99.7% > 50% of one cpu over 7.1 s [cargo 0.0%;rustc 99.7%;]
+--- witness pre r1 ours d=512 n=96 ctx=768 2026-10-16T11:33:59Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=668984277915 sw_thermal=624424393722 hw_thermal=0 temp=45 C power=149.39 W
+    cpu-freq: MHz mean 809 min 400 max 4291 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=fbd7e5eebfd7 mtime=2026-10-16T10:57:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 149.39 W, 1980 MHz;1, 0 %, 20.39 W, 210 MHz;
+    load=4.10 3.87 4.14 io=avg10=0.00 llm.service=inactive
+    busiest: rustc 99.9% | nvidia-smi 2.4% | kswapd0 2.4% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254901676 kB Cached: 246213100 kB 
+    pgmajfault: 392095721
+--- witness post r1 ours d=512 n=96 ctx=768 2026-10-16T11:33:59Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=668984277915 sw_thermal=624424393722 hw_thermal=0 temp=45 C power=149.39 W
+    cpu-freq: MHz mean 963 min 400 max 4291 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=fbd7e5eebfd7 mtime=2026-10-16T10:57:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 149.39 W, 1980 MHz;1, 0 %, 20.29 W, 210 MHz;
+    load=4.10 3.87 4.14 io=avg10=0.00 llm.service=inactive
+    busiest: rustc 99.9% | nvidia-smi 2.4% | kswapd0 2.4% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254849316 kB Cached: 246213096 kB 
+    pgmajfault: 392095721
+generate_qwen3moe: DriverError(2, "out of memory")
+  caused by: DriverError(2, "out of memory")
+
+FAIL r1 ours d=512 rc=1 | exited 1; last line:   caused by: DriverError(2, "out of memory") | full output: /tmp/depth-qwen3moe-ours-d512-r1.log [cpu-busy]
+--- witness pre r1 bin:bloomery-perf d=512 n=96 ctx=768 2026-10-16T11:34:00Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=668984277915 sw_thermal=624424393722 hw_thermal=0 temp=45 C power=145.50 W
+    cpu-freq: MHz mean 887 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=fbd7e5eebfd7 mtime=2026-10-16T10:57:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 145.50 W, 1980 MHz;1, 0 %, 20.29 W, 210 MHz;
+    load=4.10 3.87 4.14 io=avg10=0.00 llm.service=inactive
+    busiest: rustc 99.9% | nvidia-smi 2.4% | kswapd0 2.4% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254767056 kB Cached: 246213096 kB 
+    pgmajfault: 392095721
+--- witness post r1 bin:bloomery-perf d=512 n=96 ctx=768 2026-10-16T11:34:12Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1965 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=668991755662 sw_thermal=624424393722 hw_thermal=0 temp=50 C power=228.28 W
+    cpu-freq: MHz mean 952 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=fbd7e5eebfd7 mtime=2026-10-16T10:57:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 99 %, 228.28 W, 1965 MHz;1, 0 %, 20.11 W, 210 MHz;
+    load=3.63 3.77 4.11 io=avg10=0.00 llm.service=inactive
+    busiest: rustc 99.9% | nvidia-smi 2.4% | kswapd0 2.4% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255020292 kB Cached: 246213388 kB 
+[cpu-busy] 2026-10-16T11:34:13Z post r1 bin:bloomery-perf d=512: 100.0% > 50% of one cpu over 13.0 s [cargo 0.0%;rustc 100.0%;]
+    pgmajfault: 392095721
+load arch=nemotron_h_moe resident_bytes=22216023392 ctx=768 slots=1 layers=88 graph_nodes=1084 in 4.5 s
+capture graph_nodes=1084
+step 0 511 2463 (the 512 prompt ids in prefill_steps=512 units, plan=step x512, 6.30 s, runtime value)
+time prompt n=512 ms=6295.2413 tok/s=81.33 passes=512 kind=step
+stat prompt ubatch_tokens=0 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 bin:bloomery-perf d=512 n=96 ctx=768 | tok/s(mean) 81.23 @ n=96, depth 512, 3090 | p50 12.2865 ms | mean 12.3101 ms | tok/s(p50) 81.39 | warm 0 | first10_p50 12.1764 | last10_p50 12.2431 | distinct_tokens 1 | nodes 1084 | pp_tok/s 81.33 (n=512, passes=512, kind=step) | wall 12s [cpu-busy] | majflt 0 (timed ? (a one-arm run prints its prompt ids before its load: the whole process); ≤ 0.0 % of W 7.4770 s) | drive_read_bytes 0 (nvme0n1)
+
+cpu-busy rows: 1 of 1 (BLOOMERY_CPU_BUSY_PCT=50% over [cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41 generate_qwen3moe llama-server mistralrs])
+other-busy rows: 0 of 1 (a compute process on the other card as the arm started)
+tokens-differ rounds: 0 of 0 (arms on one prompt, P and n whose greedy ids differ)
+cold rows: 0 of 1 (the measured window's majflt × 75 µs ≥ 1 % of that window)
+probe-off rows: 0 of 1 (an ours row whose load probed lane_gbs under 18.5 GB/s: a lighter prompt plan than its pair's)
+loop rows: 0 of 1 (a single-stream row whose distinct_tokens is under the floor of its steps, loop-floor.py: its arm decoded a loop, so a speed read against a pair on other text is void)
+failed arms: 1 (FAIL rows, the warm-up's or the discards' included)
+=== dropped from the means and the ratios below, a failed arm each (the FAIL rows above) ===
+    dropped: ours at 512
+=== per-arm means (tok/s @ n=96, 3090). First column: ours from mean_ms, the references
+    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)
+    — the cross-engine ratio reads these. The p50 column is ours only. ===
+mean bin:bloomery-perf d=512    81.23 tok/s  [81.23..81.23, spread 0.00%]  81.39 tok/s(p50) (n=1)  [cold 0/1] [probe-off 0/1]  untagged mean n/a (every row tagged)
+
+=== ours / reference per depth: each round's ratio of the pair measured in that round (arms
+    that ran more than once in a round are averaged first), their mean with its 95 % interval
+    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ===
+
+=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, 3090). Ours: its time prompt
+    row (prefill through its token's readback); llama-bench's pp value over one repetition;
+    mistral.rs P / TTFT over one request. The tags count the rows that met contention or faults. ===
+mean pp bin:bloomery-perf p=512    81.33 tok/s(pp)  [81.33..81.33, spread 0.00%]  (n=1)  [cpu-busy 1/1] [other-busy 0/1] [cold 0/1] [probe-off 0/1]  untagged mean n/a (every row tagged)
+
+=== ours / reference prefill per prompt length: the decode table's statistics over the pp
+    values, then how many of each side's rows carried [other-busy] and [cold] ===
+--- witness post 2026-10-16T11:34:13Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1965 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=668991755662 sw_thermal=624424393722 hw_thermal=0 temp=49 C power=187.20 W
+    cpu-freq: MHz mean 791 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=fbd7e5eebfd7 mtime=2026-10-16T10:57:28Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 187.20 W, 1965 MHz;1, 0 %, 20.18 W, 210 MHz;
+    load=3.63 3.77 4.11 io=avg10=0.00 llm.service=inactive
+    busiest: rustc 99.9% | ipmitool 20.0% | nvidia-smi 2.4% | kswapd0 2.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254986920 kB Cached: 246213392 kB 
+    pgmajfault: 392095721
+    bin:bloomery-perf: /home/box/repo/bloomery-perf/target/release/generate_qwen3moe sha256=5bc5e73b1e9f head=? dirty_files=0
+failed arms: r1 ours d=512 rc=1; 

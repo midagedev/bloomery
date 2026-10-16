@@ -1,0 +1,15 @@
+# Engine's G1 Bolt prefill (bolt-prefill-g1 f7063282: passes of 448 rows, NVFP4 through Q8_0 twins as gemm32,
+# routed and shared IQ2_XXS experts as grouped GEMMs) under Nsight Systems on the RTX A6000, split by kernel, so the
+# next prefill lever is named before code. Derived from s1700: 971.66 pp tok/s at P = 4096 is 4.22 s a prompt, so
+# its kernels sum 3.8..4.4 s (less any host gaps between passes).
+kind: profile
+question: which kernels, by site (NVFP4 twin gemm32, routed and shared IQ2_XXS GEMM, attention flash, Mamba scan,
+  router, norms), make G1's 4096-id Bolt prompt on the A6000?
+term: kernel s of the prompt (nsys-table.py, --sort sum), generate_qwen3moe built at 19863679 (room-gated G1; the A6000 keeps the twins) --tokens <lcg 4096>
+  -n 2 --ctx 4352 --time, RTX A6000
+unit: s
+predict: 3.8..4.4
+condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, nsys -t cuda --cuda-graph-trace=node
+decide-in: rank the G1 pass's sites by s and price the next prefill stage against llama.cpp's 0.66 s/1k-id gap
+decide-below: host gaps between passes are a term: the pass loop's host time is the next lever
+decide-above: nsys overhead inflates short kernels: read the large sites only

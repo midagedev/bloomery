@@ -1,0 +1,96 @@
+BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_h_moe_e2e'
+box.sh: /home/box/repo/bloomery-perf-iq2opt already holds this tree (sync-id 54eded917eb639d3): not synced
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt tree=54eded917eb639d3
+boxq: bloomery-perf-iq2opt-cargo-d82635 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-cargo-d82635 is job s1654
+boxq: s1654 waiting: none, eta 0 s
+boxq: s1654 queued 9 s (wait_reason none)
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_e2e...
+
+
+✓ Cargo build succeeded
+load resident_bytes=2169811320 ctx=4112 layers=4 in 1.8 s (runtime value)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+warning: unused import: `Run`
+  --> crates/gpu-gates/src/bin/gate_nemotron_h_moe_e2e.rs:81:22
+   |
+81 |     use crate::e2e::{Run, argmax, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
+   |                      ^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `GpuError`
+  --> crates/gpu-gates/src/bin/gate_nemotron_h_moe_e2e.rs:84:29
+   |
+84 |     use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
+   |                             ^^^^^^^^
+
+warning: `bloomery-gpu-gates` (bin "gate_nemotron_h_moe_e2e") generated 2 warnings (run `cargo fix --bin "gate_nemotron_h_moe_e2e" -p bloomery-gpu-gates` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 1.20s
+gpu-gate.sh: gate_nemotron_h_moe_e2e on the a6000 (asked a6000)
+structure: layers mamba=1 attn=1 moe=2, graph_nodes=60 host=0, entries (got/want) mamba2_step=1/1 nvfp4_gemv=2/2 gqa_flash_merge=1/1 kv_append_pos_buf=4/4 iq2_xxs_gemv_sel=8/8 relu_sqr=4/4 weighted_sum=2/2 embed_rows_q8_0=1/1 nemotron_moe_router_240=1/1 nemotron_moe_router_496=1/1 group8_segments=4/4 group5_entries=0 (want 0) PASS
+structure: kernel entries add=6 argmax_finite_fault=1 embed_rows_q8_0=1 gqa_flash_merge=1 gqa_flash_seg=4 iq2_xxs_gemv_sel=8 kv_append_pos_buf=4 mamba2_step=1 nemotron_moe_router_240=1 nemotron_moe_router_496=1 nvfp4_gemv=2 q3k_quantize_q8_1=10 q8_0_gemv=9 relu_sqr=4 rms_norm=5 weighted_sum=2
+eager_equals_replay: walk16 ids [115919, 9478, 105406, 32931], logits bit-identical true, finite true PASS
+reset_rewinds: walk16 ids equal true, logits bit-identical true PASS
+state_carries: last token 119798 stepped twice from the same reset: ids [77039] vs [77039] equal true; scan state finite true nonzero true; logits after the walk differ from the token alone true PASS
+fixture-oracle: routing_is_mainlines
+routing_is_mainlines: eps 0.0338 (max |delta| / peak |logit| over the prompts that kept mainline's experts in every layer)
+routing_is_mainlines: code5 layer 1 body [71, 29, 6, 220, 101, 50, 54, 78, 192] mainline [71, 29, 6, 220, 101, 50, 54, 78, 192]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: code5 layer 3 body [321, 81, 196, 229, 367, 455, 340, 182, 202] mainline [321, 81, 196, 229, 367, 182, 455, 340, 430]: crossed at the cut: 1 of mainline's within the band of the body's 9th, worst gap/band 0.328; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: code29 layer 1 body [127, 211, 94, 220, 222, 98, 81, 104, 173] mainline [127, 211, 94, 220, 222, 98, 81, 104, 173]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: code29 layer 3 body [251, 404, 338, 200, 327, 390, 450, 276, 227] mainline [251, 404, 338, 200, 450, 276, 327, 390, 232]: crossed at the cut: 1 of mainline's within the band of the body's 9th, worst gap/band 0.062; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: code4096 layer 1 body [227, 55, 202, 79, 233, 194, 97, 113, 167] mainline [227, 55, 202, 79, 233, 194, 97, 113, 16]: crossed at the cut: 1 of mainline's within the band of the body's 9th, worst gap/band 0.045; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: code4096 layer 3 body [290, 321, 480, 98, 81, 301, 435, 477, 316] mainline [290, 435, 321, 480, 289, 477, 265, 301, 98]: after layer 1 crossed: not compared; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose1 layer 1 body [64, 148, 187, 29, 122, 152, 27, 214, 37] mainline [64, 148, 187, 29, 122, 152, 27, 214, 37]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose1 layer 3 body [236, 269, 474, 144, 306, 412, 357, 171, 240] mainline [236, 269, 474, 144, 306, 412, 357, 171, 241]: crossed at the cut: 1 of mainline's within the band of the body's 9th, worst gap/band 0.039; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose64 layer 1 body [180, 203, 187, 202, 162, 109, 143, 140, 213] mainline [180, 203, 187, 202, 109, 162, 143, 140, 213]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose64 layer 3 body [3, 238, 369, 226, 93, 247, 192, 450, 214] mainline [3, 238, 369, 226, 93, 247, 192, 450, 214]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose255 layer 1 body [148, 169, 200, 78, 165, 93, 124, 209, 104] mainline [148, 169, 200, 78, 165, 93, 124, 209, 104]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose255 layer 3 body [51, 342, 485, 294, 57, 419, 309, 237, 88] mainline [51, 342, 485, 294, 57, 419, 309, 237, 88]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose256 layer 1 body [78, 13, 209, 169, 69, 117, 32, 118, 130] mainline [78, 13, 209, 169, 69, 117, 32, 118, 130]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose256 layer 3 body [163, 65, 294, 246, 201, 188, 214, 143, 278] mainline [163, 65, 294, 246, 201, 188, 214, 143, 278]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose257 layer 1 body [78, 195, 175, 205, 136, 1, 220, 121, 172] mainline [195, 78, 175, 205, 136, 1, 220, 121, 172]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose257 layer 3 body [69, 310, 219, 344, 476, 94, 412, 79, 20] mainline [69, 310, 219, 344, 476, 94, 412, 79, 93]: crossed at the cut: 1 of mainline's within the band of the body's 9th, worst gap/band 0.086; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose512 layer 1 body [117, 126, 13, 130, 147, 113, 151, 205, 104] mainline [117, 126, 13, 130, 147, 113, 151, 205, 104]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose512 layer 3 body [125, 247, 78, 55, 65, 77, 365, 45, 488] mainline [125, 247, 55, 78, 65, 77, 365, 45, 488]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose1024 layer 1 body [35, 75, 20, 53, 38, 185, 225, 205, 8] mainline [35, 75, 53, 20, 38, 185, 225, 205, 8]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: prose1024 layer 3 body [23, 289, 474, 296, 89, 165, 447, 53, 483] mainline [23, 289, 474, 296, 89, 165, 447, 53, 483]: mainline's set; the body's top 9 of its scores + bias true, weights its renormalized scores x 5 true PASS
+routing_is_mainlines: 14 layer runs mainline's set, 5 crossed at the cut PASS
+fixture-oracle: logits_near_mainlines
+logits_near_mainlines: code5 5 tokens, max |delta| 1.1876, cosine 0.969132 (floor 0.999), top-5 body ["73112:4.254", "25859:4.109", "91723:3.926", "35970:3.911", "108674:3.905"] mainline ["73112:4.217", "25859:4.122", "43387:3.989", "91723:3.984", "78326:3.948"]: a layer's pick crossed mainline's at the cut, not gated
+logits_near_mainlines: code29 29 tokens, max |delta| 1.4162, cosine 0.955621 (floor 0.999), top-5 body ["58291:4.299", "35836:4.193", "97164:3.875", "78941:3.873", "94268:3.870"] mainline ["46117:4.204", "35836:4.048", "58291:4.023", "110159:3.996", "87697:3.939"]: a layer's pick crossed mainline's at the cut, not gated
+logits_near_mainlines: code4096 4096 tokens, max |delta| 2.3544, cosine 0.855135 (floor 0.999), top-5 body ["90693:4.334", "85985:4.317", "77247:4.247", "103298:4.173", "119799:4.067"] mainline ["126536:4.123", "103298:4.092", "64357:4.057", "128600:4.041", "96844:4.040"]: a layer's pick crossed mainline's at the cut, not gated
+logits_near_mainlines: prose1 1 tokens, max |delta| 1.2288, cosine 0.962005 (floor 0.999), top-5 body ["31264:4.514", "96674:4.207", "102043:4.047", "1339:4.037", "13627:3.985"] mainline ["80593:4.309", "85813:4.303", "1339:4.244", "96674:4.237", "70387:4.034"]: a layer's pick crossed mainline's at the cut, not gated
+logits_near_mainlines: prose64 64 tokens, max |delta| 0.1427, cosine 0.999514 (floor 0.999), top-5 body ["7829:4.081", "83252:3.911", "54927:3.879", "85559:3.861", "104105:3.787"] mainline ["7829:4.057", "54927:3.894", "83252:3.862", "85559:3.853", "116221:3.796"] PASS
+logits_near_mainlines: prose255 255 tokens, max |delta| 0.1431, cosine 0.999470 (floor 0.999), top-5 body ["53838:4.230", "56554:4.139", "36825:4.061", "75798:3.979", "63493:3.877"] mainline ["53838:4.244", "56554:4.163", "36825:4.055", "75798:3.965", "31744:3.884"] PASS
+logits_near_mainlines: prose256 256 tokens, max |delta| 0.1475, cosine 0.999535 (floor 0.999), top-5 body ["44665:4.359", "118599:4.262", "50406:4.207", "121793:4.167", "96109:4.101"] mainline ["44665:4.364", "50406:4.245", "118599:4.229", "121793:4.126", "96109:4.091"] PASS
+logits_near_mainlines: prose257 257 tokens, max |delta| 1.2284, cosine 0.963472 (floor 0.999), top-5 body ["26509:4.025", "118310:4.014", "10480:3.897", "121074:3.839", "98520:3.830"] mainline ["98520:4.070", "118310:3.978", "127355:3.918", "26509:3.878", "50069:3.822"]: a layer's pick crossed mainline's at the cut, not gated
+logits_near_mainlines: prose512 512 tokens, max |delta| 0.1347, cosine 0.999579 (floor 0.999), top-5 body ["12522:4.737", "71990:4.496", "70046:4.190", "112285:4.094", "73906:4.076"] mainline ["12522:4.658", "71990:4.524", "70046:4.193", "73906:4.078", "112285:4.056"] PASS
+logits_near_mainlines: prose1024 1024 tokens, max |delta| 0.1304, cosine 0.999592 (floor 0.999), top-5 body ["29378:4.223", "108567:3.903", "4705:3.880", "28776:3.832", "4451:3.768"] mainline ["29378:4.259", "108567:3.896", "4705:3.872", "28776:3.859", "52377:3.809"] PASS
+logits_near_mainlines: 5 of 10 prompts gated (every MoE layer mainline's experts) PASS
+fixture-oracle: top1_is_mainlines
+top1_is_mainlines: code5 body argmax 73112 mainline 73112, margin 0.0949 <= band 2.3751: not gated
+top1_is_mainlines: code29 body argmax 58291 mainline 46117, margin 0.1566 <= band 2.8323: not gated
+top1_is_mainlines: code4096 body argmax 90693 mainline 126536, margin 0.0304 <= band 4.7089: not gated
+top1_is_mainlines: prose1 body argmax 31264 mainline 80593, margin 0.0056 <= band 2.4575: not gated
+top1_is_mainlines: prose64 body argmax 7829 mainline 7829, margin 0.1629 <= band 0.2853: not gated
+top1_is_mainlines: prose255 body argmax 53838 mainline 53838, margin 0.0808 <= band 0.2862: not gated
+top1_is_mainlines: prose256 body argmax 44665 mainline 44665, margin 0.1188 <= band 0.2950: not gated
+top1_is_mainlines: prose257 body argmax 26509 mainline 98520, margin 0.0911 <= band 2.4569: not gated
+top1_is_mainlines: prose512 body argmax 12522 mainline 12522, margin 0.1343 <= band 0.2695: not gated
+top1_is_mainlines: prose1024 body argmax 29378 mainline 29378, margin 0.3621 > band 0.2608 (2 x max |delta|) PASS
+top1_is_mainlines: 1 of 10 prompts gated PASS
+deferred(real) oracle: routing_is_mainlines_real
+deferred(real) oracle: logits_near_mainlines_real
+deferred(real) oracle: top1_is_mainlines_real
+fault_word_clean: word None, poisoned None PASS
+clauses: 8 ran, 3 left to the real tier
+PASSED: gate_nemotron_h_moe_e2e the captured step holds the entries its layer kinds derive; eager and replay give bit-identical logits; a reset rewinds the ids and the logits bits; the scan state carries; the fault word stays clean; in the fixture tier the logits keep the cosine floor, the argmax is mainline's above the band and every MoE layer keeps mainline's experts on every prompt of the set
+gpu-gate.sh: gate_nemotron_h_moe_e2e ran 12 s (exit 0)

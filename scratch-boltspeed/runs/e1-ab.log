@@ -1,0 +1,12 @@
+BLOOMERY_MODEL="${BLOOMERY_MODEL:-qwen3moe}" ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'bash tools/ref/card-precheck.sh && { ours=; [ -n "512 4096 bin:/home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe:512 bin:/home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe:4096" ] || ours=1; for a in 512 4096 bin:/home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe:512 bin:/home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe:4096; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh 512 4096 bin:/home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe:512 bin:/home/box/repo/bloomery-perf-e1/target/release/generate_qwen3moe:4096'
+box.sh: /home/box/repo/bloomery-perf already holds this tree (sync-id 11ec412cbe2b0931): not synced
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf tree=11ec412cbe2b0931
+boxq: bloomery-perf-export-fed3e0 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-export-fed3e0 is job s1672
+boxq: s1672 waiting: lanes busy, eta unknown
+boxq: s1672 waiting: lanes busy, eta unknown
+boxq: s1672 waiting: lanes busy, eta unknown
+boxq: s1672 waiting: lanes busy, eta unknown
+boxq: s1672 waiting: lanes busy, eta unknown
+boxq: s1672 waiting: lanes busy, eta unknown
+boxq: s1672: signal, cancelling

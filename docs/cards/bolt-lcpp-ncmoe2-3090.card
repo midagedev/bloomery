@@ -1,0 +1,18 @@
+# Mainline llama.cpp cd0a5b6a1 on Nemotron 3.5 Bolt 24 GB on the RTX 3090 with the routed experts of the first K
+# layers on the host (--n-cpu-moe K), the K the first sitting left out: K = 16 measured 72.42 tok/s and K = 88
+# (every expert) 59.09 (s1647, s1655). K counts all 88 blocks, 40 MoE, so the host share grows with K until 88;
+# the line between the two measured rows [derived] puts K = 8..48 at 63..76 tok/s.
+kind: baseline
+question: how fast does mainline llama.cpp decode and prefill Bolt on the 3090 with the first K layers' experts on
+  the host, for K = 8, 24, 40, 48?
+term: tok/s @ n = 96, depth 6, NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf, llama-bench -ngl 99 -fa on
+  --n-cpu-moe K, RTX 3090
+unit: tok/s
+predict: 60..78
+condition: one lease per K, BLOOMERY_CARD=3090, BLOOMERY_AB_ROUNDS=2, LCPP_GPU_FLAGS='-ngl 99 -fa on --n-cpu-moe
+  K' for K in 8, 24, 40, 48; arms lcpp:6 lcpppp:512; -t the runner's default
+reason: the user's offload rule (bloomery's 3090 decode is not behind llama.cpp's --n-cpu-moe line); why now: the
+  user's 20:3x order
+decide-in: publish the K rows beside s1647 and s1655
+decide-below: llama.cpp's host MoE is slower than the line: our host tier's margin is larger
+decide-above: the host copy is hidden: read the per-K slope as llama.cpp's host rate

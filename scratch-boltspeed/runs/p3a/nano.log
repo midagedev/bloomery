@@ -1,0 +1,72 @@
+BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_e2e'
+box.sh: /home/box/repo/bloomery-perf-p3a already holds this tree (sync-id 8b2084b5cf308e76): not synced
+box.sh: queue round card=3090 predicted unknown remote=/home/box/repo/bloomery-perf-p3a tree=8b2084b5cf308e76
+boxq: bloomery-perf-p3a-cargo-303d16 class=round card=3090 predicted unknown
+boxq: bloomery-perf-p3a-cargo-303d16 is job s1704
+boxq: s1704 waiting: none, eta 0 s
+boxq: s1704 queued 9 s (wait_reason none)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-p3a/crates/gpu-gates)
+warning: unused import: `NodeInfo`
+  --> crates/gpu-gates/src/bin/gate_nemotron_e2e.rs:88:55
+   |
+88 |     use bloomery_gpu::{Gpu, GpuError, NemotronHModel, NodeInfo};
+   |                                                       ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `bloomery-gpu-gates` (bin "gate_nemotron_e2e") generated 1 warning (run `cargo fix --bin "gate_nemotron_e2e" -p bloomery-gpu-gates` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 1.09s
+gpu-gate.sh: gate_nemotron_e2e on the 3090 (asked 3090)
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_e2e...
+
+
+✓ Cargo build succeeded
+load resident_bytes=3206767096 ctx=4160 layers=42 in 1.6 s (runtime value)
+structure: layers mamba=21 attn=4 mlp=17, graph_nodes=380 host=0, entries (got/want) mamba2_step=21/21 relu_sqr=17/17 gqa_flash_seg_g5=4/4 gqa_flash_merge=4/4 kv_append_pos_buf=64/64 embed_rows_q5_0=1/1 group8_entries=0 (want 0) PASS
+structure: kernel entries add=42 argmax_finite_fault=1 embed_rows_q5_0=1 gqa_flash_merge=4 gqa_flash_seg_g5=4 kv_append_pos_buf=64 mamba2_step=21 q3k_quantize_q8_1=42 q4k_gemv=33 q5_0_gemv=48 q5_quantize_q8=48 q6k_gemv_sel=9 q8_0_gemv=3 relu_sqr=17 rms_norm=43
+eager_equals_replay: walk16 16 tokens, ids [1046, 6013, 1046, 5963], logits bit-identical true, finite true PASS
+reset_rewinds: walk16 ids equal true, logits bit-identical true PASS
+state_carries: walk16 last token 119798 stepped twice from the same reset: ids [1010] vs [1010] equal true; layer 0 scan state finite true nonzero true; logits after the prompt differ from the token alone true PASS
+top1_is_mainlines: code5 5 tokens, body argmax 16473 (logits' 16473), mainline 16473 PASS
+top1_is_mainlines: code29 29 tokens, body argmax 5803 (logits' 5803), mainline 5803 PASS
+top1_is_mainlines: prose64 64 tokens, body argmax 4317 (logits' 4317), mainline 4317 PASS
+top1_is_mainlines: prose512 512 tokens, body argmax 6911 (logits' 6911), mainline 6911 PASS
+logits_near_mainlines: code5 5 tokens, max |delta| 0.2406, cosine 0.999816 (floor 0.999), top-5 same ids true (body ["16473:14.158", "1051:12.079", "1050:11.762", "3480:11.663", "3628:11.424"], mainline ["16473:14.179", "1051:12.059", "1050:11.699", "3480:11.666", "3628:11.547"]) PASS
+logits_near_mainlines: code29 29 tokens, max |delta| 0.2306, cosine 0.999886 (floor 0.999), top-5 same ids true (body ["5803:14.501", "2018:14.270", "2818:14.150", "1935:13.002", "11842:12.949"], mainline ["5803:14.554", "2018:14.281", "2818:14.206", "1935:13.026", "11842:12.896"]) PASS
+logits_near_mainlines: prose64 64 tokens, max |delta| 0.2777, cosine 0.999858 (floor 0.999), top-5 same ids true (body ["4317:16.251", "6872:16.153", "91628:15.147", "1343:15.141", "1457:14.883"], mainline ["4317:16.277", "6872:16.177", "1343:15.173", "91628:15.042", "1457:14.877"]) PASS
+logits_near_mainlines: prose512 512 tokens, max |delta| 0.3773, cosine 0.999685 (floor 0.999), top-5 same ids true (body ["6911:19.891", "3620:13.223", "11876:11.395", "1046:11.026", "1095:10.987"], mainline ["6911:19.866", "3620:13.272", "11876:11.346", "1046:11.055", "1095:10.996"]) PASS
+prefill_is_mainlines: code5 5 tokens, argmax 16473 mainline 16473, cosine 0.999839 (floor 0.999), top-5 same ids true (printed), max |delta| 0.2487 (step path's 0.2406) PASS
+prefill_is_mainlines: code29 29 tokens, argmax 5803 mainline 5803, cosine 0.999891 (floor 0.999), top-5 same ids true (printed), max |delta| 0.2511 (step path's 0.2306) PASS
+prefill_is_mainlines: code4096 4096 tokens, argmax 1445 mainline 1445, cosine 0.999606 (floor 0.999), top-5 same ids true (printed), max |delta| 0.2679 (step path's 0.2548) PASS
+prefill_is_mainlines: prose1 1 tokens, argmax 1044 mainline 1044, cosine 0.999764 (floor 0.999), top-5 same ids true (printed), max |delta| 0.3166 (step path's 0.4128) PASS
+prefill_is_mainlines: prose64 64 tokens, argmax 4317 mainline 4317, cosine 0.999834 (floor 0.999), top-5 same ids false (printed), max |delta| 0.2769 (step path's 0.2777) PASS
+prefill_is_mainlines: prose255 255 tokens, argmax 1462 mainline 1462, cosine 0.999527 (floor 0.999), top-5 same ids true (printed), max |delta| 0.4517 (step path's 0.4116) PASS
+prefill_is_mainlines: prose256 256 tokens, argmax 1071 mainline 1071, cosine 0.999274 (floor 0.999), top-5 same ids true (printed), max |delta| 0.4447 (step path's 0.4542) PASS
+prefill_is_mainlines: prose257 257 tokens, argmax 16807 mainline 16807, cosine 0.999383 (floor 0.999), top-5 same ids false (printed), max |delta| 0.3427 (step path's 0.3744) PASS
+prefill_is_mainlines: prose512 512 tokens, argmax 6911 mainline 6911, cosine 0.999664 (floor 0.999), top-5 same ids true (printed), max |delta| 0.3873 (step path's 0.3773) PASS
+prefill_is_mainlines: prose1024 1024 tokens, argmax 4015 mainline 4015, cosine 0.999574 (floor 0.999), top-5 same ids true (printed), max |delta| 0.2957 (step path's 0.3081) PASS
+prefill_then_step_is_mainlines: code5 5 ids as a pass of 4 and a step, argmax 16473 mainline 16473, cosine 0.999835 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.2153 (printed) PASS
+prefill_then_step_is_mainlines: code29 29 ids as a pass of 28 and a step, argmax 5803 mainline 5803, cosine 0.999904 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.3098 (printed) PASS
+prefill_then_step_is_mainlines: code4096 4096 ids as a pass of 4095 and a step, argmax 1445 mainline 1445, cosine 0.999659 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.2695 (printed) PASS
+prefill_then_step_is_mainlines: prose1 1 id: no pass before its step, skipped
+prefill_then_step_is_mainlines: prose64 64 ids as a pass of 63 and a step, argmax 4317 mainline 4317, cosine 0.999881 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.3675 (printed) PASS
+prefill_then_step_is_mainlines: prose255 255 ids as a pass of 254 and a step, argmax 1462 mainline 1462, cosine 0.999440 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.3935 (printed) PASS
+prefill_then_step_is_mainlines: prose256 256 ids as a pass of 255 and a step, argmax 1071 mainline 1071, cosine 0.999122 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.3990 (printed) PASS
+prefill_then_step_is_mainlines: prose257 257 ids as a pass of 256 and a step, argmax 16807 mainline 16807, cosine 0.999405 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.5457 (printed) PASS
+prefill_then_step_is_mainlines: prose512 512 ids as a pass of 511 and a step, argmax 6911 mainline 6911, cosine 0.999657 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.4017 (printed) PASS
+prefill_then_step_is_mainlines: prose1024 1024 ids as a pass of 1023 and a step, argmax 4015 mainline 4015, cosine 0.999752 (floor 0.999); then 16 greedy steps: ids equal to the step path's for 16 of 16, largest |delta| 0.3281 (printed) PASS
+prefill_edges: prose255 255 tokens in passes of 256, argmax 1462 step path's 1462, max |delta| 0.2745 band B 0.4116 PASS
+prefill_edges: prose256 256 tokens in passes of 256, argmax 1071 step path's 1071, max |delta| 0.3270 band B 0.4542 PASS
+prefill_edges: prose257 257 tokens in passes of 256, argmax 16807 step path's 16807, max |delta| 0.3013 band B 0.3744 PASS
+prefill_edges: prose512 512 tokens in passes of 256, argmax 6911 step path's 6911, max |delta| 0.2812 band B 0.3773 PASS
+prefill_at_a_small_context: prose255's first 200 ids at ctx 256: argmax 1256 (the gate's model's 1256), logits bit-identical true PASS
+fault_word_clean: word None, poisoned None PASS
+PASSED: gate_nemotron_e2e the captured step holds the entries its layer kinds derive and no group-8 flash entry; eager and replay give bit-identical logits; a reset rewinds the ids and the logits bits; the scan state carries; the body's argmax is mainline's and its logits keep the cosine floor and the top-5 ids on every prompt of the set; the prompt path keeps mainline's argmax and cosine floor, also on the step after a pass, and stays within the step path's own band across pass edges of 256 rows and at a context under one pass; the fault word stays clean
+gpu-gate.sh: gate_nemotron_e2e ran 88 s (exit 0)

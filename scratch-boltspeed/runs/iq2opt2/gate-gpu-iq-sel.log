@@ -1,0 +1,271 @@
+./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel '
+box.sh: queue round card=3090 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt2 tree=9716e49b1ce10c5f
+boxq: bloomery-perf-iq2opt2-cargo-c15f88 class=round card=3090 predicted unknown
+boxq: bloomery-perf-iq2opt2-cargo-c15f88 is job s1745
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel...
+
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling cfg-if v1.0.5
+   Compiling thiserror v2.0.21
+   Compiling libc v0.2.190
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling glob v0.3.4
+   Compiling cpufeatures v0.2.17
+   Compiling prettyplease v0.2.37
+   Compiling crc32fast v1.5.2
+   Compiling rustix v0.38.44
+   Compiling serde_core v1.0.229
+   Compiling bitflags v2.13.2
+   Compiling memchr v2.8.3
+   Compiling either v1.19.0
+   Compiling regex-syntax v0.8.11
+   Compiling minimal-lexical v0.2.1
+   Compiling linux-raw-sys v0.4.15
+   Compiling libloading v0.8.9
+   Compiling generic-array v0.14.7
+   Compiling home v0.5.12
+   Compiling clang-sys v1.9.1
+   Compiling bindgen v0.69.5
+   Compiling nom v7.1.3
+   Compiling itertools v0.12.1
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling regex-automata v0.4.18
+   Compiling memmap2 v0.9.11
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling log v0.4.34
+   Compiling lazy_static v1.5.1
+   Compiling lazycell v1.3.0
+   Compiling shlex v1.3.0
+   Compiling simd-adler32 v0.3.10
+   Compiling rustc-hash v1.1.0
+   Compiling hashbrown v0.17.1
+   Compiling bloomery-levers v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/levers)
+   Compiling which v4.4.2
+   Compiling cexpr v0.6.0
+   Compiling equivalent v1.0.2
+   Compiling foldhash v0.1.5
+   Compiling adler2 v2.0.1
+   Compiling object v0.36.7
+   Compiling zerocopy v0.8.61
+   Compiling zmij v1.0.23
+   Compiling hashbrown v0.15.5
+   Compiling regex v1.13.1
+   Compiling indexmap v2.14.2
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling anyhow v1.0.104
+   Compiling miniz_oxide v0.9.1
+   Compiling bloomery-threads v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/threads)
+   Compiling reserved-oxide-symbols v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-target-spec v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling itoa v1.0.18
+   Compiling cuda-core v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling flate2 v1.1.10
+   Compiling miniz_oxide v0.8.9
+   Compiling fdeflate v0.3.7
+   Compiling sha1 v0.10.7
+   Compiling zune-core v0.5.1
+   Compiling ptx-parse v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling zune-jpeg v0.5.15
+   Compiling png v0.18.1
+   Compiling bloomery-verbs v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/verbs)
+   Compiling oxide-artifacts v0.2.1
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling zerocopy-derive v0.8.61
+   Compiling cuda-macros v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-core-derive v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-gguf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/gguf)
+   Compiling libnvvm-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-models v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/models)
+   Compiling bloomery-runtime v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/runtime)
+   Compiling nvjitlink-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-placement v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/placement)
+   Compiling bloomery-tokenizer v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/tokenizer)
+   Compiling cuda-artifact-finalizer v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-qdot v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/qdot)
+   Compiling bloomery-hf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/hf)
+   Compiling cuda-bindings v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-model v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/model)
+   Compiling bloomery-vision v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/vision)
+   Compiling bloomery-engram v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/engram)
+   Compiling bloomery-refset v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/refset)
+   Compiling half v2.7.1
+   Compiling cuda-host v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-device v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-gpu v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/gpu)
+   Compiling bloomery-app v0.1.0 (/home/box/repo/bloomery-perf-iq2opt2/crates/app)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt2/crates/gpu-gates)
+Read from remote host ws: Connection reset by peer
+client_loop: send disconnect: Broken pipe
+Read from remote host ws: Connection reset by peer
+client_loop: send disconnect: Broken pipe
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 25s
+gpu-gate.sh: gate_iq_sel on the 3090 (asked 3090)
+gpu-gate.sh: gate_iq_sel ran 8 s (exit 0)
+
+✓ Cargo build succeeded
+gu[iq2_xs k=4096 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=4096 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=4096 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=4096 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS f64_band=PASS fault="none" 
+gu[iq2_xs k=2304 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=2304 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=2304 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=2304 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS f64_band=PASS fault="none" 
+gu[iq2_xs k=2560 experts=2 rpe=640 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=2560 experts=2 rpe=640 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=2560 experts=2 rpe=640 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq2_xs k=2560 experts=2 rpe=640 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+silu[iq2_xs k=2560 m=4] rel=3.005e-8 band=1e-6 PASS rerun=PASS fault="none" PASS
+gu[iq3_xxs k=2560 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2560 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2560 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2560 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS f64_band=PASS fault="none" 
+gu[iq3_xxs k=2304 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2304 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2304 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2304 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS f64_band=PASS fault="none" 
+gu[iq3_xxs k=4096 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=4096 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=4096 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=4096 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS f64_band=PASS fault="none" 
+gu[iq3_xxs k=2560 experts=2 rpe=640 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2560 experts=2 rpe=640 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2560 experts=2 rpe=640 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_xxs k=2560 experts=2 rpe=640 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+silu[iq3_xxs k=2560 m=4] rel=2.382e-8 band=1e-6 PASS rerun=PASS fault="none" PASS
+gu[iq3_s k=4096 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=4096 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=4096 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=4096 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=2304 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=2304 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=2304 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=2304 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=2560 experts=2 rpe=640 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=2560 experts=2 rpe=640 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=2560 experts=2 rpe=640 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq3_s k=2560 experts=2 rpe=640 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+silu[iq3_s k=2560 m=4] rel=1.608e-8 band=1e-6 PASS rerun=PASS fault="none" PASS
+gu[iq4_xs k=2560 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2560 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2560 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2560 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS f64_band=PASS fault="none" 
+gu[iq4_xs k=2304 experts=4 rpe=80 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2304 experts=4 rpe=80 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2304 experts=4 rpe=80 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2304 experts=4 rpe=80 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS f64_band=PASS fault="none" 
+gu[iq4_xs k=2560 experts=2 rpe=640 m=1] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2560 experts=2 rpe=640 m=2] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2560 experts=2 rpe=640 m=4] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+gu[iq4_xs k=2560 experts=2 rpe=640 m=8] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a f64_band=PASS fault="none" 
+silu[iq4_xs k=2560 m=4] rel=4.579e-8 band=1e-6 PASS rerun=PASS fault="none" PASS
+iq2_xs   k=4096 max|rel|, the larger of the m-sweep: 1.4297e-2 (pin 1.7e-2) PASS
+iq2_xs   k=2304 max|rel|, the larger of the m-sweep: 1.1252e-2 (pin 1.4e-2) PASS
+iq3_xxs  k=2560 max|rel|, the larger of the m-sweep: 9.8509e-3 (pin 1.2e-2) PASS
+iq3_xxs  k=2304 max|rel|, the larger of the m-sweep: 1.6106e-2 (pin 2.0e-2) PASS
+iq3_xxs  k=4096 max|rel|, the larger of the m-sweep: 1.1411e-2 (pin 1.4e-2) PASS
+iq3_s    k=4096 max|rel|, the larger of the m-sweep: 1.2379e-2 (pin 1.5e-2) PASS
+iq3_s    k=2304 max|rel|, the larger of the m-sweep: 7.5603e-3 (pin 9.0e-3) PASS
+iq4_xs   k=2560 max|rel|, the larger of the m-sweep: 6.8619e-3 (pin 8.0e-3) PASS
+iq4_xs   k=2304 max|rel|, the larger of the m-sweep: 9.5002e-3 (pin 1.1e-2) PASS
+nl[k=640 experts=3 rpe=2560 slots=10] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS wide_act=PASS f64_band=PASS fault="none" 
+nl[k=640 experts=3 rpe=2560 slots=20] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS wide_act=PASS f64_band=PASS fault="none" 
+nl[k=640 experts=3 rpe=2560 slots=40] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS wide_act=PASS f64_band=PASS fault="none" 
+nl[k=640 experts=3 rpe=2560 slots=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS wide_act=PASS f64_band=PASS fault="none" 
+nl[k=608 experts=3 rpe=2560 slots=10] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS wide_act=PASS f64_band=PASS fault="none" 
+nl[k=608 experts=3 rpe=2560 slots=20] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS wide_act=PASS f64_band=PASS fault="none" 
+nl[k=608 experts=3 rpe=2560 slots=40] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS wide_act=PASS f64_band=PASS fault="none" 
+nl[k=608 experts=3 rpe=2560 slots=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS wide_act=PASS f64_band=PASS fault="none" 
+IQ4_NL   k=640 max|rel|, the larger of the m-sweep: 7.2018e-3 (pin 8.0e-3) PASS
+IQ4_NL   k=608 max|rel|, the larger of the m-sweep: 5.5599e-3 (pin 6.5e-3) PASS
+down[iq2_xxs k=2048 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS wide_act=PASS fault="none" 
+down[iq2_xxs k=2304 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS wide_act=PASS fault="none" 
+down[iq2_xxs k=2048 experts=2 rpe=4096] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a wide_act=PASS fault="none" 
+down[iq2_xs k=2048 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS wide_act=PASS fault="none" 
+down[iq2_xs k=2304 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS wide_act=PASS fault="none" 
+down[iq2_xs k=2048 experts=2 rpe=4096] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a wide_act=PASS fault="none" 
+down[iq3_xxs k=2048 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS wide_act=PASS fault="none" 
+down[iq3_xxs k=2304 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS wide_act=PASS fault="none" 
+down[iq3_xxs k=2048 experts=2 rpe=4096] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a wide_act=PASS fault="none" 
+down[iq3_s k=2048 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a wide_act=PASS fault="none" 
+down[iq3_s k=2304 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a wide_act=PASS fault="none" 
+down[iq3_s k=2048 experts=2 rpe=4096] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a wide_act=PASS fault="none" 
+down[iq4_xs k=2048 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS wide_act=PASS fault="none" 
+down[iq4_xs k=2304 experts=4 rpe=80] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=PASS wide_act=PASS fault="none" 
+down[iq4_xs k=2048 experts=2 rpe=4096] host_rule_bits=PASS rerun=PASS host_slots_sentinel=PASS cross_layout=n/a wide_act=PASS fault="none" 
+bolt_up[IQ2_XXS experts=240 rpe=1536 k=1024 slots=18 slots_per_col=9] host_rule_bits=PASS rerun=PASS wide_act=PASS cross_layout=PASS host_slots_sentinel=PASS finite_and_written=PASS f64_band=PASS (worst err/bound 1.656e-1) rel=3.2992e-3 fault="none" PASS
+bolt_ids[IQ2_XXS experts=240 rpe=1536] id_240_sentinel=PASS fault_names_expert_id=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+bolt_down[IQ2_XXS experts=240 rpe=1024 k=1536 slots=9 slots_per_col=1] host_rule_bits=PASS rerun=PASS wide_act=PASS cross_layout=PASS host_slots_sentinel=PASS finite_and_written=PASS f64_band=PASS (worst err/bound 1.484e-1) rel=5.7245e-3 fault="none" PASS
+bolt_down_launchers[IQ2_XXS experts=240 k=1536] gemv_sel_eq_gemv_sel_cols_1=PASS PASS
+bolt_up[IQ2_XXS experts=304 rpe=2048 k=1024 slots=18 slots_per_col=9] host_rule_bits=PASS rerun=PASS wide_act=PASS cross_layout=PASS host_slots_sentinel=PASS finite_and_written=PASS f64_band=PASS (worst err/bound 1.753e-1) rel=3.3739e-3 fault="none" PASS
+bolt_ids[IQ2_XXS experts=304 rpe=2048] id_304_sentinel=PASS fault_names_expert_id=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+bolt_down[IQ2_XXS experts=304 rpe=1024 k=2048 slots=9 slots_per_col=1] host_rule_bits=PASS rerun=PASS wide_act=PASS cross_layout=PASS host_slots_sentinel=PASS finite_and_written=PASS f64_band=PASS (worst err/bound 1.607e-1) rel=2.3920e-3 fault="none" PASS
+bolt_down_launchers[IQ2_XXS experts=304 k=2048] gemv_sel_eq_gemv_sel_cols_1=PASS PASS
+bolt_up[IQ2_XXS experts=432 rpe=2304 k=1024 slots=18 slots_per_col=9] host_rule_bits=PASS rerun=PASS wide_act=PASS cross_layout=PASS host_slots_sentinel=PASS finite_and_written=PASS f64_band=PASS (worst err/bound 1.861e-1) rel=4.2677e-3 fault="none" PASS
+bolt_ids[IQ2_XXS experts=432 rpe=2304] id_432_sentinel=PASS fault_names_expert_id=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+bolt_down[IQ2_XXS experts=432 rpe=1024 k=2304 slots=9 slots_per_col=1] host_rule_bits=PASS rerun=PASS wide_act=PASS cross_layout=PASS host_slots_sentinel=PASS finite_and_written=PASS f64_band=PASS (worst err/bound 1.327e-1) rel=4.0011e-3 fault="none" PASS
+bolt_down_launchers[IQ2_XXS experts=432 k=2304] gemv_sel_eq_gemv_sel_cols_1=PASS PASS
+bolt_up[IQ2_XXS experts=496 rpe=2560 k=1024 slots=18 slots_per_col=9] host_rule_bits=PASS rerun=PASS wide_act=PASS cross_layout=PASS host_slots_sentinel=PASS finite_and_written=PASS f64_band=PASS (worst err/bound 1.531e-1) rel=4.9515e-3 fault="none" PASS
+bolt_ids[IQ2_XXS experts=496 rpe=2560] id_496_sentinel=PASS fault_names_expert_id=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+bolt_down[IQ2_XXS experts=496 rpe=1024 k=2560 slots=9 slots_per_col=1] host_rule_bits=PASS rerun=PASS wide_act=PASS cross_layout=PASS host_slots_sentinel=PASS finite_and_written=PASS f64_band=PASS (worst err/bound 1.016e-1) rel=3.4777e-3 fault="none" PASS
+bolt_down_launchers[IQ2_XXS experts=496 k=2560] gemv_sel_eq_gemv_sel_cols_1=PASS PASS
+IQ2_XXS  bolt up max|rel|, the larger of the four pairs: 4.9515e-3 (pin 5.0e-3) PASS
+IQ2_XXS  bolt down max|rel|, the larger of the four pairs: 5.7245e-3 (pin 5.8e-3) PASS
+refuse_cols[slots_per_col_0] want=Err(Shape enqueue_gemv_sel_cols) got="IqSelKernels::enqueue_gemv_sel_cols: IQ2_XXS reads 0 slots a column: IQ2_XXS's entry takes a positive slots_per_col, every other format's down one column a slot (1)" PASS
+refuse_cols[iq2_xs_slots_per_col_9] want=Err(Shape enqueue_gemv_sel_cols: IQ2_XS reads 9 slots a column) got="IqSelKernels::enqueue_gemv_sel_cols: IQ2_XS reads 9 slots a column: IQ2_XXS's entry takes a positive slots_per_col, every other format's down one column a slot (1)" PASS
+refuse_cols[one_column_for_two_runs] want=Err(Shape enqueue_gemv_sel_cols) got="IqSelKernels::enqueue_gemv_sel_cols: 18 slots (at least one) at 9 a column: activation columns (act.m() 1) for every slot, an id a slot (sel.len() 18), y.len() 1152 >= n_slots*rows_per_expert = 1152" PASS
+refuse_cols[short_sel] want=Err(Shape enqueue_gemv_sel_cols) got="IqSelKernels::enqueue_gemv_sel_cols: 18 slots (at least one) at 9 a column: activation columns (act.m() 2) for every slot, an id a slot (sel.len() 3), y.len() 1152 >= n_slots*rows_per_expert = 1152" PASS
+ids_gu[iq2_xs] past_stack_nan=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+ids_gu[iq3_xxs] past_stack_nan=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+ids_gu[iq3_s] past_stack_nan=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+ids_gu[iq4_xs] past_stack_nan=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+ids_nl[k=640] past_stack_sentinel=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_host_rule=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+nan_gu[iq2_xs] exactly_poisoned_rows_nan=PASS others_are_clean=PASS fault="none" PASS
+nan_gu[iq3_xxs] exactly_poisoned_rows_nan=PASS others_are_clean=PASS fault="none" PASS
+nan_gu[iq3_s] exactly_poisoned_rows_nan=PASS others_are_clean=PASS fault="none" PASS
+nan_gu[iq4_xs] exactly_poisoned_rows_nan=PASS others_are_clean=PASS fault="none" PASS
+nan_nl[k=640] exactly_poisoned_rows_nan=PASS others_are_clean=PASS fault="none" PASS
+ids_down[iq2_xxs k=2048] past_stack_sentinel=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+nan_d_down[iq2_xxs k=2048] poisoned_rows_nan=PASS others_bit_equal=PASS fault="none" PASS
+ids_down[iq2_xs k=2048] past_stack_sentinel=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+nan_d_down[iq2_xs k=2048] poisoned_rows_nan=PASS others_bit_equal=PASS fault="none" PASS
+ids_down[iq3_xxs k=2048] past_stack_sentinel=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+nan_d_down[iq3_xxs k=2048] poisoned_rows_nan=PASS others_bit_equal=PASS fault="none" PASS
+ids_down[iq3_s k=2048] past_stack_sentinel=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+nan_d_down[iq3_s k=2048] poisoned_rows_nan=PASS others_bit_equal=PASS fault="none" PASS
+ids_down[iq4_xs k=2048] past_stack_sentinel=PASS fault_names_expert_id=PASS host_slots_sentinel=PASS others_are_clean=PASS next_clean_clean=PASS fault="an unlabelled launch site expert_id (a routed expert id past the stack's expert count); sites raised in an unlabelled launch (architecture unknown, so in code order, not step order): expert_id" PASS
+nan_d_down[iq4_xs k=2048] poisoned_rows_nan=PASS others_bit_equal=PASS fault="none" PASS
+capture graph_nodes=3 (want 3) replay_bits=PASS,PASS,PASS second_eager_bits=PASS,PASS,PASS fault=none PASS
+capture_q8 graph_nodes=7 (want 7) replay_bits=PASS second_eager_bits=PASS fault=none PASS
+refuse_gu[wrong_type_q4_k] want=Err(Shape enqueue_gate_up) got="IqSelKernels::enqueue_gate_up: the gate·up takes IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS stacks, got Q4_K" PASS
+refuse_gu[short_words] want=Err(Shape enqueue_gate_up) got="IqSelKernels::enqueue_gate_up: IQ3_XXS rows of k = 2560 (a multiple of 256) are 10 super-blocks of 98 bytes: 320 rows take Some(245) words a row over 313600 bytes, got 244 words a row over 312320 bytes" PASS
+refuse_gu[k_off_the_block] want=Err(Shape enqueue_gate_up) got="IqSelKernels::enqueue_gate_up: IQ3_XXS rows of k = 2304 (a multiple of 256) are 9 super-blocks of 98 bytes: 320 rows take Some(221) words a row over 282240 bytes, got 245 words a row over 313600 bytes" PASS
+refuse_gu[short_sel] want=Err(Shape enqueue_gate_up) got="IqSelKernels::enqueue_gate_up: 10 slots (at least one) at 10 a column (at least one) over 1 columns, sel.len() 3, h.len() 800 >= n_slots*rows_per_expert = 800" PASS
+refuse_gu[short_h] want=Err(Shape enqueue_gate_up) got="IqSelKernels::enqueue_gate_up: 10 slots (at least one) at 10 a column (at least one) over 1 columns, sel.len() 10, h.len() 8 >= n_slots*rows_per_expert = 800" PASS
+refuse_nl[q8_0_row_width] want=Err(Shape enqueue_down) got="IqSelKernels::enqueue_down: IQ4_NL rows of k = 640 (a multiple of 32) are 20 blocks of 18 bytes: 192 rows take Some(90) words a row over 69120 bytes, got 170 words a row over 130560 bytes" PASS
+refuse_nl[rows_per_expert_50_of_192] want=Err(Shape enqueue_down) got="IqSelKernels::enqueue_down: w.rows() 192 must be a positive multiple of rows_per_expert 50" PASS
+refuse_nl[two_columns_for_ten_slots] want=Err(Shape enqueue_down) got="IqSelKernels::enqueue_down: 10 slots (at least one): an activation column a slot (act.m() 2 >= n_slots), an id a slot (sel.len() 10), y.len() 640 >= n_slots*rows_per_expert = 640" PASS
+refuse_nl[short_y] want=Err(Shape enqueue_down) got="IqSelKernels::enqueue_down: 10 slots (at least one): an activation column a slot (act.m() 2 >= n_slots), an id a slot (sel.len() 10), y.len() 9 >= n_slots*rows_per_expert = 640" PASS
+refuse_q8[wrong_type_q4_k] want=Err(Shape enqueue_gemv_sel) got="IqSelKernels::enqueue_gemv_sel: the down takes IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS stacks, got Q4_K" PASS
+refuse_q8[iq4_xs_width_on_an_iq3_xxs_stack] want=Err(Shape enqueue_gemv_sel) got="IqSelKernels::enqueue_gemv_sel: IQ4_XS rows of k = 2048 (a multiple of 256) are 8 super-blocks of 136 bytes: 320 rows take Some(272) words a row over 348160 bytes, got 196 words a row over 250880 bytes" PASS
+refuse_q8[rows_per_expert_50_of_320] want=Err(Shape enqueue_gemv_sel) got="IqSelKernels::enqueue_gemv_sel: IQ3_XXS rows 320 must be a positive multiple of rows_per_expert 50" PASS
+refuse_q8[four_columns_for_eight_slots] want=Err(Shape enqueue_gemv_sel) got="IqSelKernels::enqueue_gemv_sel: 8 slots (at least one) at 1 a column: activation columns (act.m() 4) for every slot, an id a slot (sel.len() 8), y.len() 640 >= n_slots*rows_per_expert = 640" PASS
+refuse_q8[short_sel] want=Err(Shape enqueue_gemv_sel) got="IqSelKernels::enqueue_gemv_sel: 8 slots (at least one) at 1 a column: activation columns (act.m() 8) for every slot, an id a slot (sel.len() 3), y.len() 640 >= n_slots*rows_per_expert = 640" PASS
+refuse_q8[short_y] want=Err(Shape enqueue_gemv_sel) got="IqSelKernels::enqueue_gemv_sel: 8 slots (at least one) at 1 a column: activation columns (act.m() 8) for every slot, an id a slot (sel.len() 8), y.len() 9 >= n_slots*rows_per_expert = 640" PASS
+gate_iq_sel: PASS

@@ -1,0 +1,9 @@
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf tree=c8cc46837ccfb7bf
+boxq: bloomery-perf-lease-hold.sh-30a771 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-lease-hold.sh-30a771 is job s1714
+boxq: s1714 waiting: lanes busy, eta unknown
+boxq: s1714 waiting: lanes busy, eta 796 s
+boxq: s1714 waiting: lanes busy, eta 732 s
+boxq: s1714 waiting: lanes busy, eta 667 s
+boxq: s1714 waiting: lanes busy, eta 603 s
+boxq: s1714 waiting: lanes busy, eta 537 s

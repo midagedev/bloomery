@@ -1,0 +1,365 @@
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-g1b-a6000 tree=9c7cda7c511bb96f
+boxq: bloomery-perf-g1b-a6000-cargo-22d1dd class=round card=a6000 predicted unknown
+boxq: bloomery-perf-g1b-a6000-cargo-22d1dd is job s1730
+
+✓ Cargo build succeeded
+[binary] target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z (newer than its sources: dep-info)
+[lease] card: docs/cards/bolt-g1b-pp-a6000.card sha256=2d156ee5aef0043ee59c4850aa50c2116bd113b94996762e571fbb2739be1efb
+[lease] card | # Engine's room-gated G1 (bolt-prefill-g1 19863679 = 30ce3f32 + ptx-shapes rows): on the 3090 the twins do not fit,
+[lease] card | # so the NVFP4 sites run E1's 8-column gemv inside the passes and the Q8_0 GEMM and grouped IQ2 experts stay batched.
+[lease] card | # On the A6000 the twins fit and are kept, so the rate is G1 f7063282's (927.19 @ P=512, s1700) unchanged:
+[lease] card | # 880..1000 (its spread plus the session window).
+[lease] card | kind: baseline
+[lease] card | question: does the room-gated G1 keep its A6000 rate, and how fast does it read 512- and 4096-id Bolt prompts beside llama.cpp?
+[lease] card | term: pp tok/s @ P = 512 (the row's pp_tok/s), ours = generate_qwen3moe built at 19863679 (this tree), RTX A6000
+[lease] card | unit: tok/s
+[lease] card | predict: 880..1000
+[lease] card | condition: one lease , BLOOMERY_CARD=a6000, BLOOMERY_AB_ROUNDS=2; arms 512 4096 lcpppp:512
+[lease] card |   lcpppp:4096
+[lease] card | reason: the user's two-line rule (A6000 whole card and the 3090) for #328; why now: the 21:00 checkpoint
+[lease] card | decide-in: #328 states its 3090 line; option (c) is priced from the gap to llama.cpp
+[lease] card | decide-below: the fallback gemv costs more than derived: nsys the pass on the 3090
+[lease] card | decide-above: re-derive the NVFP4 sites' share
+[lease] card: ok kind=baseline (no ruler: not an ab card)
+[lease] /root/bloomery-cpu.lock is held; waiting up to 30 min. Its holder:
+[lease]   pid 2069589 holds it: comm=bash exe=/usr/bin/bash cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h03m48s card=docs/cards/bolt-g1b-pp-3090.card args=[bash tools/ref/depth-qwen3moe.sh 512 4096 lcpppp:512 lcpppp:4096]
+[lease]   pid 2081521 holds it: comm=timeout exe=/usr/bin/timeout cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h00m17s card=docs/cards/bolt-g1b-pp-3090.card args=[timeout --kill-after=10 1800 target/release/generate_qwen3moe --arm 100000,53606,14808,58936,59336,53416,32408,67176,28568,20008,67928,21944,75848,9848,29000,25]
+[lease]   pid 2081523 holds it: comm=generate_qwen3m exe=/home/box/repo/bloomery-perf-g1b-3090/target/release/generate_qwen3moe cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h00m17s card=docs/cards/bolt-g1b-pp-3090.card args=[target/release/generate_qwen3moe --arm 100000,53606,14808,58936,59336,53416,32408,67176,28568,20008,67928,21944,75848,9848,29000,25704,71128,64280,22248,17288,3]
+[lease]   /proc/locks: FLOCK WRITE taken by pid 2081387 (not running — a lock outlives the process that took it (for a runner, flock(1) itself, on the runner's descriptor 9); the holders are the processes above)
+[lease] still held after 1 min by:
+[lease]   pid 2069589 holds it: comm=bash exe=/usr/bin/bash cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h04m49s card=docs/cards/bolt-g1b-pp-3090.card args=[bash tools/ref/depth-qwen3moe.sh 512 4096 lcpppp:512 lcpppp:4096]
+[lease]   pid 2084604 holds it: comm=bash exe=/usr/bin/bash cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h00m08s card=docs/cards/bolt-g1b-pp-3090.card args=[bash tools/ref/depth-qwen3moe.sh 512 4096 lcpppp:512 lcpppp:4096]
+[lease]   pid 2084605 holds it: comm=timeout exe=/usr/bin/timeout cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h00m08s card=docs/cards/bolt-g1b-pp-3090.card args=[timeout --kill-after=10 900 /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench -m /models/nemotron-3.5-bolt/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.ggu]
+[lease]   pid 2084606 holds it: comm=bash exe=/usr/bin/bash cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h00m08s card=docs/cards/bolt-g1b-pp-3090.card args=[bash tools/ref/depth-qwen3moe.sh 512 4096 lcpppp:512 lcpppp:4096]
+[lease]   pid 2084607 holds it: comm=awk exe=/usr/bin/gawk cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h00m08s card=docs/cards/bolt-g1b-pp-3090.card args=[awk -v f=/tmp/depth-qwen3moe-mark.wuLozN -v re=: prompt run 1/1$ !s && re != "" && $0 ~ re {
+    while ((getline l < "/proc/vmstat") > 0) if (l ~ /^pgmajfault /]
+[lease]   pid 2084608 holds it: comm=llama-bench exe=/home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench cwd=/home/box/repo/bloomery-perf-g1b-3090 elapsed=0h00m08s card=docs/cards/bolt-g1b-pp-3090.card args=[/home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench -m /models/nemotron-3.5-bolt/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf -p 4096 -n 0 -r 1 -ngl 99 ]
+[lease]   /proc/locks: FLOCK WRITE taken by pid 2081387 (not running — a lock outlives the process that took it (for a runner, flock(1) itself, on the runner's descriptor 9); the holders are the processes above)
+[lease] timing card idle: GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4
+[lease] held by pid 2072520 at 2026-10-16T11:53:42Z
+[lease] netdata: frozen
+[config] model=/models/nemotron-3.5-bolt/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf n=96 rounds=2 warm=0 card=A6000 arm_bound=900s
+[config] ours: target/release/generate_qwen3moe ctx=D+N rounded up to 256
+[config] cpu guard: comms=[cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41 generate_qwen3moe llama-server mistralrs] threshold=50% strict=0
+[config] order: rotate
+[config] cold tag: majflt in the row's measured window (ours: from its prompt_ids line; lcpp: from its --progress line; mrs: from its Iteration line; ik and bin: the whole process) × 75 µs ≥ 1 % of that window
+[config] lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench flags=-ngl 99 -fa on (lcpp and lcpppp: --progress)
+[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)), mrspp mistralrs bench --prompt-len P --gen-len 1; ours from its time prompt row
+[config] arms=512 4096 lcpppp:512 lcpppp:4096 timing_gpu=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4 other_gpu=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1 CUDA_VISIBLE_DEVICES=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4
+--- witness pre 2026-10-16T11:53:42Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=210 max=2100 MHz event_reasons=0x0000000000000001 capped_us sw_power=119814646807 sw_thermal=595202908 hw_thermal=0 temp=42 C power=19.50 W
+    cpu-freq: MHz mean 959 min 400 max 4289 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 156.37 W, 1980 MHz;1, 0 %, 19.50 W, 210 MHz;
+    load=2.86 3.67 3.97 io=avg10=0.00 llm.service=inactive
+    busiest: rsync 2.8% | kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.7% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256580748 kB Cached: 247359568 kB 
+    pgmajfault: 392097362
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+[load] r1 1 arm(s): 512 - one process, one load
+    load arch=nemotron_h_moe resident_bytes=27387409972 ctx=768 slots=1 layers=88 graph_nodes=1084 in 8.9 s
+    capture graph_nodes=1084
+--- witness pre r1 ours d=512 n=96 ctx=768 2026-10-16T11:53:51Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1800 max=2100 MHz event_reasons=0x0000000000000000 capped_us sw_power=119814703605 sw_thermal=595202908 hw_thermal=0 temp=46 C power=76.52 W
+    cpu-freq: MHz mean 755 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: [2085619, 26810 MiB;] [timing-card-busy]
+    gpu: 0, 0 %, 31.08 W, 210 MHz;1, 0 %, 76.52 W, 1800 MHz;
+    load=2.81 3.63 3.95 io=avg10=0.00 llm.service=inactive
+    busiest: generate_qwen3m 443% | kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.7% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256222920 kB Cached: 247369132 kB 
+    pgmajfault: 392097363
+--- witness post r1 ours d=512 n=96 ctx=768 2026-10-16T11:53:54Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1980 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119814703605 sw_thermal=595202908 hw_thermal=0 temp=49 C power=219.91 W
+    cpu-freq: MHz mean 702 min 400 max 4291 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.96 W, 210 MHz;1, 98 %, 219.91 W, 1980 MHz;
+    load=2.81 3.63 3.95 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.7% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256629388 kB Cached: 247361188 kB 
+    pgmajfault: 392097363
+step 0 511 2463 (the 512 prompt ids in prefill_steps=2 units, plan=rows:448 x2, 0.54 s, runtime value)
+time prompt n=512 ms=543.0345 tok/s=942.85 passes=2 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 ours d=512 n=96 ctx=768 | tok/s(mean) 82.64 @ n=96, depth 512, A6000 | p50 12.0979 ms | mean 12.1011 ms | tok/s(p50) 82.66 | warm 0 | first10_p50 12.0977 | last10_p50 12.0921 | distinct_tokens 1 | nodes 1084 | pp_tok/s 942.85 (n=512, passes=2, kind=gemm) | slot 1/1 | wall 3s | majflt 0 (timed 0; ≤ 0.0 % of W 1.7047 s) | drive_read_bytes 0 (nvme0n1)
+[load] r1 1 arm(s): 4096 - one process, one load
+    load arch=nemotron_h_moe resident_bytes=27416770100 ctx=4352 slots=1 layers=88 graph_nodes=1084 in 8.5 s
+    capture graph_nodes=1084
+--- witness pre r1 ours d=4096 n=96 ctx=4352 2026-10-16T11:54:03Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1800 max=2100 MHz event_reasons=0x0000000000000000 capped_us sw_power=119814703605 sw_thermal=595202908 hw_thermal=0 temp=49 C power=77.02 W
+    cpu-freq: MHz mean 726 min 400 max 4537 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: [2091359, 26868 MiB;] [timing-card-busy]
+    gpu: 0, 0 %, 30.13 W, 210 MHz;1, 0 %, 77.06 W, 1800 MHz;
+    load=2.53 3.54 3.92 io=avg10=0.00 llm.service=inactive
+    busiest: generate_qwen3m 452% | kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.6% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256140616 kB Cached: 247369404 kB 
+    pgmajfault: 392097363
+--- witness post r1 ours d=4096 n=96 ctx=4352 2026-10-16T11:54:09Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1965 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119814703605 sw_thermal=595202908 hw_thermal=0 temp=55 C power=189.58 W
+    cpu-freq: MHz mean 765 min 400 max 3294 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.58 W, 210 MHz;1, 92 %, 189.58 W, 1965 MHz;
+    load=2.49 3.52 3.91 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.6% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256752844 kB Cached: 247361216 kB 
+    pgmajfault: 392097363
+step 0 4095 24 (the 4096 prompt ids in prefill_steps=10 units, plan=rows:448 x10, 4.12 s, runtime value)
+time prompt n=4096 ms=4120.9226 tok/s=993.95 passes=10 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r1 ours d=4096 n=96 ctx=4352 | tok/s(mean) 81.67 @ n=96, depth 4096, A6000 | p50 12.2430 ms | mean 12.2440 ms | tok/s(p50) 81.68 | warm 0 | first10_p50 12.2783 | last10_p50 12.2318 | distinct_tokens 1 | nodes 1084 | pp_tok/s 993.95 (n=4096, passes=10, kind=gemm) | slot 1/1 | wall 6s | majflt 0 (timed 0; ≤ 0.0 % of W 5.2963 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r1 lcpppp d=512 2026-10-16T11:54:10Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1965 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119814703605 sw_thermal=595202908 hw_thermal=0 temp=55 C power=101.82 W
+    cpu-freq: MHz mean 860 min 400 max 4400 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.94 W, 210 MHz;1, 0 %, 101.82 W, 1965 MHz;
+    load=2.49 3.52 3.91 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.6% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256795248 kB Cached: 247361228 kB 
+    pgmajfault: 392097363
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r1 lcpppp d=512 2026-10-16T11:54:14Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1875 max=2100 MHz event_reasons=0x0000000000000004 capped_us sw_power=119815248166 sw_thermal=595202908 hw_thermal=0 temp=58 C power=217.38 W
+    cpu-freq: MHz mean 740 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.15 W, 210 MHz;1, 96 %, 217.38 W, 1875 MHz;
+    load=2.45 3.49 3.90 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.6% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256612788 kB Cached: 247361236 kB 
+    pgmajfault: 392097363
+    lcpppp table | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+    lcpppp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |   1 |           pp512 |       1559.59 ± 0.00 |
+ROW r1 lcpppp p=512 n=0 | tok/s(pp) 1559.59 @ n=0, prompt 512, A6000 | ub 512 b 2048 (llama-bench defaults) | build cd0a5b6a1 (11668) | device NVIDIA RTX A6000 | wall 4s | majflt 0 (timed 0; ≤ 0.0 % of W 0.3283 s)
+--- witness pre r1 lcpppp d=4096 2026-10-16T11:54:14Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1965 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119815262659 sw_thermal=595202908 hw_thermal=0 temp=56 C power=209.71 W
+    cpu-freq: MHz mean 752 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.46 W, 210 MHz;1, 74 %, 209.71 W, 1965 MHz;
+    load=2.45 3.49 3.90 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.6% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256654748 kB Cached: 247361236 kB 
+    pgmajfault: 392097363
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r1 lcpppp d=4096 2026-10-16T11:54:23Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1950 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119820260947 sw_thermal=595202908 hw_thermal=0 temp=60 C power=273.72 W
+    cpu-freq: MHz mean 1408 min 400 max 4292 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.14 W, 210 MHz;1, 100 %, 273.72 W, 1950 MHz;
+    load=2.23 3.41 3.87 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.6% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256917092 kB Cached: 247362192 kB 
+    pgmajfault: 392097363
+    lcpppp table | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+    lcpppp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |   1 |          pp4096 |       1611.77 ± 0.00 |
+ROW r1 lcpppp p=4096 n=0 | tok/s(pp) 1611.77 @ n=0, prompt 4096, A6000 | ub 512 b 2048 (llama-bench defaults) | build cd0a5b6a1 (11668) | device NVIDIA RTX A6000 | wall 9s | majflt 0 (timed 0; ≤ 0.0 % of W 2.5413 s)
+[load] r2 1 arm(s): 4096 - one process, one load
+    load arch=nemotron_h_moe resident_bytes=27416770100 ctx=4352 slots=1 layers=88 graph_nodes=1084 in 8.6 s
+    capture graph_nodes=1084
+--- witness pre r2 ours d=4096 n=96 ctx=4352 2026-10-16T11:54:32Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1800 max=2100 MHz event_reasons=0x0000000000000000 capped_us sw_power=119820260947 sw_thermal=595202908 hw_thermal=0 temp=57 C power=81.11 W
+    cpu-freq: MHz mean 699 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: [2097899, 26868 MiB;] [timing-card-busy]
+    gpu: 0, 0 %, 29.86 W, 210 MHz;1, 0 %, 81.11 W, 1800 MHz;
+    load=4.41 3.85 4.01 io=avg10=0.00 llm.service=inactive
+    busiest: generate_qwen3m 446% | liquidctl 80.0% | kswapd0 2.4% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256082212 kB Cached: 247419844 kB 
+    pgmajfault: 392097363
+--- witness post r2 ours d=4096 n=96 ctx=4352 2026-10-16T11:54:38Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119820542730 sw_thermal=595202908 hw_thermal=0 temp=62 C power=241.04 W
+    cpu-freq: MHz mean 724 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 31.28 W, 210 MHz;1, 99 %, 241.04 W, 1935 MHz;
+    load=4.21 3.82 4.00 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.5% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256739908 kB Cached: 247411788 kB 
+    pgmajfault: 392097363
+step 0 4095 24 (the 4096 prompt ids in prefill_steps=10 units, plan=rows:448 x10, 4.16 s, runtime value)
+time prompt n=4096 ms=4162.0376 tok/s=984.13 passes=10 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r2 ours d=4096 n=96 ctx=4352 | tok/s(mean) 81.07 @ n=96, depth 4096, A6000 | p50 12.3325 ms | mean 12.3352 ms | tok/s(p50) 81.09 | warm 0 | first10_p50 12.3356 | last10_p50 12.3401 | distinct_tokens 1 | nodes 1084 | pp_tok/s 984.13 (n=4096, passes=10, kind=gemm) | slot 1/1 | wall 6s | majflt 0 (timed 0; ≤ 0.0 % of W 5.3462 s) | drive_read_bytes 0 (nvme0n1)
+--- witness pre r2 lcpppp d=512 2026-10-16T11:54:39Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119820542730 sw_thermal=595202908 hw_thermal=0 temp=62 C power=155.26 W
+    cpu-freq: MHz mean 754 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.90 W, 210 MHz;1, 0 %, 106.99 W, 1935 MHz;
+    load=4.21 3.82 4.00 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.5% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256743112 kB Cached: 247411788 kB 
+    pgmajfault: 392097363
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r2 lcpppp d=512 2026-10-16T11:54:43Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119821136840 sw_thermal=595202908 hw_thermal=0 temp=62 C power=224.37 W
+    cpu-freq: MHz mean 727 min 400 max 4277 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 29.88 W, 210 MHz;1, 100 %, 224.37 W, 1935 MHz;
+    load=3.96 3.77 3.98 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.5% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256768856 kB Cached: 247411672 kB 
+    pgmajfault: 392097363
+    lcpppp table | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+    lcpppp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |   1 |           pp512 |       1540.08 ± 0.00 |
+ROW r2 lcpppp p=512 n=0 | tok/s(pp) 1540.08 @ n=0, prompt 512, A6000 | ub 512 b 2048 (llama-bench defaults) | build cd0a5b6a1 (11668) | device NVIDIA RTX A6000 | wall 4s | majflt 0 (timed 0; ≤ 0.0 % of W 0.3325 s)
+--- witness pre r2 lcpppp d=4096 2026-10-16T11:54:43Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119821136840 sw_thermal=595202908 hw_thermal=0 temp=62 C power=224.37 W
+    cpu-freq: MHz mean 761 min 400 max 4537 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 29.88 W, 210 MHz;1, 100 %, 224.37 W, 1935 MHz;
+    load=3.96 3.77 3.98 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.5% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256783764 kB Cached: 247411672 kB 
+    pgmajfault: 392097363
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r2 lcpppp d=4096 2026-10-16T11:54:51Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1725 max=2100 MHz event_reasons=0x0000000000000004 capped_us sw_power=119826040254 sw_thermal=595202908 hw_thermal=0 temp=70 C power=298.90 W
+    cpu-freq: MHz mean 668 min 400 max 4079 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.82 W, 210 MHz;1, 100 %, 298.90 W, 1725 MHz;
+    load=3.58 3.70 3.95 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.5% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256952456 kB Cached: 247411684 kB 
+    pgmajfault: 392097363
+    lcpppp table | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+    lcpppp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |   1 |          pp4096 |       1594.97 ± 0.00 |
+ROW r2 lcpppp p=4096 n=0 | tok/s(pp) 1594.97 @ n=0, prompt 4096, A6000 | ub 512 b 2048 (llama-bench defaults) | build cd0a5b6a1 (11668) | device NVIDIA RTX A6000 | wall 8s | majflt 0 (timed 0; ≤ 0.0 % of W 2.5681 s)
+[load] r2 1 arm(s): 512 - one process, one load
+    load arch=nemotron_h_moe resident_bytes=27387409972 ctx=768 slots=1 layers=88 graph_nodes=1084 in 8.7 s
+    capture graph_nodes=1084
+--- witness pre r2 ours d=512 n=96 ctx=768 2026-10-16T11:55:00Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1800 max=2100 MHz event_reasons=0x0000000000000000 capped_us sw_power=119826194678 sw_thermal=595202908 hw_thermal=0 temp=62 C power=88.07 W
+    cpu-freq: MHz mean 774 min 400 max 3668 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: [2104342, 26810 MiB;] [timing-card-busy]
+    gpu: 0, 0 %, 29.84 W, 210 MHz;1, 0 %, 87.97 W, 1800 MHz;
+    load=3.45 3.67 3.94 io=avg10=0.00 llm.service=inactive
+    busiest: generate_qwen3m 450% | kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.5% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256113560 kB Cached: 247420020 kB 
+    pgmajfault: 392097363
+--- witness post r2 ours d=512 n=96 ctx=768 2026-10-16T11:55:03Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119826229619 sw_thermal=595202908 hw_thermal=0 temp=64 C power=188.79 W
+    cpu-freq: MHz mean 900 min 400 max 4291 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.94 W, 210 MHz;1, 67 %, 188.79 W, 1935 MHz;
+    load=3.33 3.64 3.93 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.5% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256604612 kB Cached: 247411836 kB 
+    pgmajfault: 392097363
+step 0 511 2463 (the 512 prompt ids in prefill_steps=2 units, plan=rows:448 x2, 0.55 s, runtime value)
+time prompt n=512 ms=548.3754 tok/s=933.67 passes=2 kind=gemm
+stat prompt ubatch_tokens=448 (no prompt image)
+tokens [2463, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+ROW r2 ours d=512 n=96 ctx=768 | tok/s(mean) 81.50 @ n=96, depth 512, A6000 | p50 12.2699 ms | mean 12.2705 ms | tok/s(p50) 81.50 | warm 0 | first10_p50 12.2546 | last10_p50 12.2795 | distinct_tokens 1 | nodes 1084 | pp_tok/s 933.67 (n=512, passes=2, kind=gemm) | slot 1/1 | wall 2s | majflt 0 (timed 0; ≤ 0.0 % of W 1.7263 s) | drive_read_bytes 0 (nvme0n1)
+
+cpu-busy rows: 0 of 8 (BLOOMERY_CPU_BUSY_PCT=50% over [cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41 generate_qwen3moe llama-server mistralrs])
+other-busy rows: 0 of 8 (a compute process on the other card as the arm started)
+tokens-differ rounds: 0 of 0 (arms on one prompt, P and n whose greedy ids differ)
+cold rows: 0 of 8 (the measured window's majflt × 75 µs ≥ 1 % of that window)
+probe-off rows: 0 of 8 (an ours row whose load probed lane_gbs under 18.5 GB/s: a lighter prompt plan than its pair's)
+loop rows: 0 of 8 (a single-stream row whose distinct_tokens is under the floor of its steps, loop-floor.py: its arm decoded a loop, so a speed read against a pair on other text is void)
+failed arms: 0 (FAIL rows, the warm-up's or the discards' included)
+=== per-arm means (tok/s @ n=96, A6000). First column: ours from mean_ms, the references
+    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)
+    — the cross-engine ratio reads these. The p50 column is ours only. ===
+mean ours d=4096       81.37 tok/s  [81.07..81.67, spread 0.74%]  81.39 tok/s(p50) (n=2)  [cold 0/2] [probe-off 0/2]  untagged mean 81.37 tok/s (n=2)
+mean ours d=512        82.07 tok/s  [81.50..82.64, spread 1.40%]  82.08 tok/s(p50) (n=2)  [cold 0/2] [probe-off 0/2]  untagged mean 82.07 tok/s (n=2)
+
+=== ours / reference per depth: each round's ratio of the pair measured in that round (arms
+    that ran more than once in a round are averaged first), their mean with its 95 % interval
+    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ===
+
+=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, A6000). Ours: its time prompt
+    row (prefill through its token's readback); llama-bench's pp value over one repetition;
+    mistral.rs P / TTFT over one request. The tags count the rows that met contention or faults. ===
+mean pp lcpppp p=4096   1603.37 tok/s(pp)  [1594.97..1611.77, spread 1.05%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 0/2]  untagged mean 1603.37 tok/s(pp) (n=2)
+mean pp lcpppp p=512    1549.84 tok/s(pp)  [1540.08..1559.59, spread 1.27%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 0/2]  untagged mean 1549.84 tok/s(pp) (n=2)
+mean pp ours p=4096      989.04 tok/s(pp)  [984.13..993.95, spread 1.00%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 0/2]  untagged mean 989.04 tok/s(pp) (n=2)
+mean pp ours p=512       938.26 tok/s(pp)  [933.67..942.85, spread 0.98%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 0/2]  untagged mean 938.26 tok/s(pp) (n=2)
+
+=== ours / reference prefill per prompt length: the decode table's statistics over the pp
+    values, then how many of each side's rows carried [other-busy] and [cold] ===
+ratio pp p=512   ours/lcpppp  mean 0.6054 ± 0.0108 (n=2)  of means 0.6054  per round: r1 0.6045 r2 0.6062  busy: ours [cpu-busy 0/2] [other-busy 0/2], lcpppp [cpu-busy 0/2] [other-busy 0/2]  cold: ours 0/2, lcpppp 0/2  probe-off: ours 0/2
+ratio pp p=4096  ours/lcpppp  mean 0.6169 ± 0.0022 (n=2)  of means 0.6169  per round: r1 0.6167 r2 0.6170  busy: ours [cpu-busy 0/2] [other-busy 0/2], lcpppp [cpu-busy 0/2] [other-busy 0/2]  cold: ours 0/2, lcpppp 0/2  probe-off: ours 0/2
+--- witness post 2026-10-16T11:55:04Z
+    timing-card: NVIDIA RTX A6000, 300.00 W, 2100 MHz
+    timing-card clocks: sm=1935 max=2100 MHz event_reasons=0x0000000000000400 capped_us sw_power=119826229619 sw_thermal=595202908 hw_thermal=0 temp=63 C power=112.73 W
+    cpu-freq: MHz mean 799 min 400 max 4288 over 64 cpus governor=powersave
+    binary: target/release/generate_qwen3moe sha256=e0a8698824b3 mtime=2026-10-16T11:52:32Z
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 30.94 W, 210 MHz;1, 0 %, 112.73 W, 1935 MHz;
+    load=3.33 3.64 3.93 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | kcompactd0 2.0% | nvidia-smi 1.5% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 256605908 kB Cached: 247411836 kB 
+    pgmajfault: 392097363
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+boxq: s1730: poll 1/3 failed: GET /jobs/s1730: no reply in 30 s
+boxq: s1730: poll 2/3 failed: GET /jobs/s1730: no reply in 30 s
+boxq: s1730: reconnecting, next poll in 5 s

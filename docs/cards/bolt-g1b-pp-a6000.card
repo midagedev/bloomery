@@ -1,0 +1,15 @@
+# Engine's room-gated G1 (bolt-prefill-g1 19863679 = 30ce3f32 + ptx-shapes rows): on the 3090 the twins do not fit,
+# so the NVFP4 sites run E1's 8-column gemv inside the passes and the Q8_0 GEMM and grouped IQ2 experts stay batched.
+# On the A6000 the twins fit and are kept, so the rate is G1 f7063282's (927.19 @ P=512, s1700) unchanged:
+# 880..1000 (its spread plus the session window).
+kind: baseline
+question: does the room-gated G1 keep its A6000 rate, and how fast does it read 512- and 4096-id Bolt prompts beside llama.cpp?
+term: pp tok/s @ P = 512 (the row's pp_tok/s), ours = generate_qwen3moe built at 19863679 (this tree), RTX A6000
+unit: tok/s
+predict: 880..1000
+condition: one lease , BLOOMERY_CARD=a6000, BLOOMERY_AB_ROUNDS=2; arms 512 4096 lcpppp:512
+  lcpppp:4096
+reason: the user's two-line rule (A6000 whole card and the 3090) for #328; why now: the 21:00 checkpoint
+decide-in: #328 states its 3090 line; option (c) is priced from the gap to llama.cpp
+decide-below: the fallback gemv costs more than derived: nsys the pass on the 3090
+decide-above: re-derive the NVFP4 sites' share

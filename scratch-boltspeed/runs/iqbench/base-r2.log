@@ -1,0 +1,7 @@
+box.sh: /home/box/repo/bloomery-perf already holds this tree (sync-id 344671c5688ec6dd): not synced
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf tree=344671c5688ec6dd
+boxq: bloomery-perf-bash-9f14ea class=round card=a6000 predicted unknown
+boxq: bloomery-perf-bash-9f14ea is job s1687
+boxq: s1687 waiting: lanes busy, eta unknown
+boxq: s1687 waiting: lanes busy, eta unknown
+boxq: s1687: signal, cancelling

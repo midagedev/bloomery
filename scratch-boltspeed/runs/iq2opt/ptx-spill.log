@@ -1,0 +1,74 @@
+./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv tools/ref/ptx-shapes/ generate_ds41 gate_e2e gate_qwen3vl_tower:vis_'
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt tree=9ea0342c15ae45c0
+boxq: bloomery-perf-iq2opt-cargo-dde909 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-cargo-dde909 is job s1715
+boxq: s1715 waiting: lanes busy, eta unknown
+boxq: s1715 waiting: lanes busy, eta unknown
+boxq: s1715 waiting: lanes busy, eta unknown
+boxq: s1715 waiting: lanes busy, eta unknown
+boxq: s1715 waiting: lanes busy, eta unknown
+boxq: s1715 queued 302 s (wait_reason lanes busy)
+   Compiling bloomery-hf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/hf)
+   Compiling bloomery-serve v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/serve)
+   Compiling bloomery-model v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/model)
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41...
+
+   Compiling bloomery-gpu v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu)
+   Compiling bloomery-gpu-deepseek41 v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-deepseek41)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-app v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/app)
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+warning: `bloomery-gpu-deepseek41` (lib) generated 1 warning (1 duplicate)
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 11s
+
+✓ Cargo build succeeded
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_e2e...
+
+   Compiling bloomery-gpu v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu)
+   Compiling bloomery-app v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/app)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+boxq: s1715: poll 1/3 failed: GET /jobs/s1715: no reply in 30 s
+boxq: s1715: poll 2/3 failed: GET /jobs/s1715: no reply in 30 s
+Timeout, server ws not responding.
+Timeout, server ws not responding.
+boxq: s1715: reconnecting, next poll in 5 s
+
+✓ Cargo build succeeded
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower --bin oxart_jit...
+
+
+✓ Cargo build succeeded
+ptx-scan bin=target/release/generate_ds41 section=.oxart bytes=11622200 ptxas=/usr/local/cuda-13.3/bin/ptxas ptxas-version=13.3.73 arch=sm_86 modules=2 jit-card=NVIDIA_RTX_A6000 jit-cc=8.6 jit-cuda=13.4
+ptx-spill bin=generate_ds41 table=tools/ref/ptx-shapes.tsv arch=sm_86 jit-cc=8.6
+ptx-spill bin=generate_ds41 entries=332 pinned=332 nonzero=ds41_attn_seg_stage(spill=8,jit_local=8) violations=0 PASS
+ptx-scan bin=target/release/gate_e2e section=.oxart bytes=9565912 ptxas=/usr/local/cuda-13.3/bin/ptxas ptxas-version=13.3.73 arch=sm_86 modules=1 jit-card=NVIDIA_RTX_A6000 jit-cc=8.6 jit-cuda=13.4
+ptx-spill bin=gate_e2e table=tools/ref/ptx-shapes.tsv arch=sm_86 jit-cc=8.6
+ptx-spill bin=gate_e2e entries=265 pinned=265 nonzero=none violations=0 PASS
+ptx-scan bin=target/release/gate_qwen3vl_tower section=.oxart bytes=10136616 ptxas=/usr/local/cuda-13.3/bin/ptxas ptxas-version=13.3.73 arch=sm_86 modules=2 filter=vis_ jit-card=NVIDIA_RTX_A6000 jit-cc=8.6 jit-cuda=13.4
+ptx-spill bin=gate_qwen3vl_tower table=tools/ref/ptx-shapes.tsv arch=sm_86 jit-cc=8.6
+ptx-spill bin=gate_qwen3vl_tower entries=16 pinned=16 nonzero=none violations=0 PASS
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 05s
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+   Compiling bloomery-gpu-vision v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-vision)
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+    Finished `release` profile [optimized] target(s) in 12.39s
+    Finished `release` profile [optimized] target(s) in 0.04s

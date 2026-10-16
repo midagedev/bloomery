@@ -1,0 +1,4 @@
+rsync: connection unexpectedly closed (0 bytes received so far) [sender]
+rsync error: error in rsync protocol data stream (code 12) at io.c(285) [sender=3.5.0]
+box.sh: /home/box/repo/bloomery-perf-g1 holds tree a4bc74a5e3300ef7 and this tree is 818a72ed8443ac99
+box.sh: a job of this remote directory is running (/root/bloomery-queue/dir-bloomery-perf-g1.lock is held on ws); its tree cannot be replaced under it: wait for it, or use another BLOOMERY_REMOTE

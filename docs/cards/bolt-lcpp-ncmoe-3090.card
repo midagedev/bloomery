@@ -1,0 +1,19 @@
+# Mainline llama.cpp cd0a5b6a1 on Nemotron 3.5 Bolt 24 GB on the RTX 3090 with the routed experts of the first K
+# layers on the host (--n-cpu-moe K): the offload row bloomery's host tier is judged against. Derived: a routed
+# layer's 9 picks are ~11.4 MB; on the host at ~60 GB/s (ggml's CPU MUL_MAT_ID, single stream, plus the copy of the
+# activation each way) ~0.25 ms a MoE layer. K counts layers by index, 40 of the 88 are MoE, so K = 16 puts ~7 MoE
+# layers' experts on the host and adds ~2 ms to a 12.7 ms token: 55..75 tok/s at K = 16; K = 88 is every expert.
+kind: baseline
+question: how fast does mainline llama.cpp decode and prefill Bolt on the 3090 with the first K layers' experts on
+  the host?
+term: tok/s @ n = 96, depth 6, NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf, llama-bench -ngl 99 -fa on
+  --n-cpu-moe 16, RTX 3090
+unit: tok/s
+predict: 55..75
+condition: one lease per K, BLOOMERY_CARD=3090, BLOOMERY_AB_ROUNDS=2, LCPP_GPU_FLAGS='-ngl 99 -fa on --n-cpu-moe
+  K' for K in 16, 48, 88; arms lcpp:6 lcpppp:512; -t the runner's default
+reason: the offload line of the Bolt speed plan (bloomery's core is the hybrid tier); why now: the lead's
+  baseline-first order
+decide-in: publish the K rows; bloomery's host tier for Bolt is judged against them
+decide-below: llama.cpp's host MoE is slower than the derivation: our qdot tier's margin is larger
+decide-above: the host copy is hidden: read the per-K slope as llama.cpp's host rate

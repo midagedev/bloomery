@@ -1,0 +1,96 @@
+BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen4exp-iqleg && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
+box.sh: /home/box/repo/bloomery-perf-iq2opt already holds this tree (sync-id 54eded917eb639d3): not synced
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt tree=54eded917eb639d3
+boxq: bloomery-perf-iq2opt-bash-694a68 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-bash-694a68 is job s1675
+boxq: s1675 waiting: lanes busy, eta unknown
+boxq: s1675 waiting: lanes busy, eta unknown
+boxq: s1675 waiting: lanes busy, eta unknown
+boxq: s1675 waiting: lanes busy, eta unknown
+boxq: s1675 waiting: lanes busy, eta unknown
+boxq: s1675 waiting: lanes busy, eta unknown
+boxq: s1675: poll 1/3 failed: GET /jobs/s1675: no reply in 30 s
+boxq: s1675: poll 2/3 failed: GET /jobs/s1675: no reply in 30 s
+boxq: s1675: reconnecting, next poll in 5 s
+boxq: s1675 queued 904 s (wait_reason lanes busy)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+    Finished `release` profile [optimized] target(s) in 1.82s
+gpu-gate.sh: gate_qwen4exp_iqleg on the a6000 (asked a6000), V4.1 load lock
+load host_tier type=iq3_xxs k=2560 path=fused
+load host_tier type=iq4_nl k=640 path=fused
+load host_tier type=iq4_xs k=2560 path=fused
+load host_tier type=q8_0 k=640 path=fused
+[default] load host_tier r8=off (no sidecar at /models/Qwen3.8-Flash-Next-UD-Q3_K_XL-r8/Qwen3.8-Flash-Next-UD-Q3_K_XL-r8.gguf; optional: a source checkout writes it with just r8-sidecar)
+[default] load host_tier type=iq3_xxs k=2560 path=fused
+[default] load host_tier type=iq4_nl k=640 path=fused
+[default] load host_tier type=iq4_xs k=2560 path=fused
+[default] load host_tier type=q8_0 k=640 path=fused
+[width1] load host_tier r8=off (no sidecar at /models/Qwen3.8-Flash-Next-UD-Q3_K_XL-r8/Qwen3.8-Flash-Next-UD-Q3_K_XL-r8.gguf; optional: a source checkout writes it with just r8-sidecar)
+[width1] load host_tier type=iq3_xxs k=2560 path=fused
+[width1] load host_tier type=iq4_nl k=640 path=fused
+[width1] load host_tier type=iq4_xs k=2560 path=fused
+[width1] load host_tier type=q8_0 k=640 path=fused
+gpu-gate.sh: gate_qwen4exp_iqleg ran 85 s (exit 0)
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg...
+
+
+✓ Cargo build succeeded
+move proof card bytes (total, driver reserve, device, free, holders): derived (25769803776, 419430400, None, None, None, false), the old literal (25769803776, 419430400, None, None, None, false) PASS
+named difference: the card's name "A6000", the old literal's "3090"
+clause 3 sample covers iq3_xxs: yes PASS
+clause 3 sample covers iq4_xs: yes PASS
+clause 3 sample covers iq4_nl: yes PASS
+clause 3 sample: layers [0, 2, 23, 24, 45, 47] of 48 (the card prefix n_l [151, 151, 150, 150, 150, 150]), 8 columns of 10 experts over 12 host-served ids PASS
+clause 3 layer 0 iq3_xxs/iq3_xxs/iq4_nl n_l=151: 399360 cells bit-equal to the dot in 0.1 s PASS
+clause 3 layer 2 iq4_xs/iq4_xs/q8_0 n_l=151: 399360 cells bit-equal to the dot in 0.1 s PASS
+clause 3 layer 23 iq3_xxs/iq3_xxs/iq4_nl n_l=150: 399360 cells bit-equal to the dot in 0.1 s PASS
+clause 3 layer 24 iq3_xxs/iq3_xxs/iq4_nl n_l=150: 399360 cells bit-equal to the dot in 0.1 s PASS
+clause 3 layer 45 iq3_xxs/iq3_xxs/iq4_nl n_l=150: 399360 cells bit-equal to the dot in 0.1 s PASS
+clause 3 layer 47 iq3_xxs/iq3_xxs/q8_0 n_l=150: 399360 cells bit-equal to the dot in 0.1 s PASS
+[default] iqleg width=32
+[default] move proof card bytes (total, driver reserve, device, free, holders): derived (25769803776, 419430400, None, None, None, false), the old literal (25769803776, 419430400, None, None, None, false) PASS
+[default] named difference: the card's name "A6000", the old literal's "3090"
+[default] plan card=A6000 host_experts=17362 card_experts=7214 ctx_max=1024 ubatch=1024
+[default] load resident_bytes=23174468172 ctx=1024 layers=48 in 24.2 s (runtime value)
+[default] iqleg prompt positions=512 services=48 cols=24576 host_slots=170308 in 1.7 s (runtime value)
+[default] iqleg step 0 token 271
+[default] iqleg step 1 token 248068
+[default] iqleg step 2 token 198
+[default] iqleg step 3 token 760
+[default] iqleg step 4 token 1156
+[default] iqleg step 5 token 579
+[default] iqleg step 6 token 1876
+[default] iqleg step 7 token 7701
+[default] iqleg dump /tmp/iqleg-1790042-default.bin ids=9 rows=9
+child default: exit status: 0 in 28.4 s (runtime value)
+clause 1 load host_tier type=iq3_xxs path=fused: true PASS
+clause 1 load host_tier type=iq4_xs path=fused: true PASS
+clause 1 load host_tier type=iq4_nl path=fused: true PASS
+clause 1 kind iq3_xxs/iq3_xxs/iq4_nl: 43 layers, host slots 153804, layers with none [] PASS
+clause 1 kind iq3_xxs/iq3_xxs/q8_0: 4 layers, host slots 13372, layers with none [] PASS
+clause 1 kind iq4_xs/iq4_xs/q8_0: 1 layers, host slots 3132, layers with none [] PASS
+[width1] iqleg width=1
+[width1] move proof card bytes (total, driver reserve, device, free, holders): derived (25769803776, 419430400, None, None, None, false), the old literal (25769803776, 419430400, None, None, None, false) PASS
+[width1] named difference: the card's name "A6000", the old literal's "3090"
+[width1] plan card=A6000 host_experts=17362 card_experts=7214 ctx_max=1024 ubatch=1024
+[width1] load resident_bytes=23174468172 ctx=1024 layers=48 in 23.6 s (runtime value)
+[width1] iqleg prompt positions=512 services=48 cols=24576 host_slots=170308 in 28.2 s (runtime value)
+[width1] iqleg step 0 token 271
+[width1] iqleg step 1 token 248068
+[width1] iqleg step 2 token 198
+[width1] iqleg step 3 token 760
+[width1] iqleg step 4 token 1156
+[width1] iqleg step 5 token 579
+[width1] iqleg step 6 token 1876
+[width1] iqleg step 7 token 7701
+[width1] iqleg dump /tmp/iqleg-1790042-width1.bin ids=9 rows=9
+child width1: exit status: 0 in 55.1 s (runtime value)
+clause 2 widths: default 32 and 1 (want > 1 and 1) PASS
+clause 2 bits: 8939556 bytes vs 8939556, 0 differ PASS

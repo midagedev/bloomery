@@ -1,0 +1,15 @@
+# Engine's G1 Bolt batched prefill (bolt-prefill-g1 f7063282) beside main d0e8a8e1 on the RTX 3090 (24 GB, 250 W):
+# the A6000 measured 927.19 pp tok/s at P = 512 (s1700), but G1 holds 27.41 GB resident with its Q8_0 twins of the
+# NVFP4 sites, past the 3090's 24 GB, so the question is whether it loads. Derived if it loads: the 3090's ~0.9x
+# of the A6000's rate on llama.cpp's pp (1359 vs 1535), so 750..900 tok/s; else a load FAIL row.
+kind: baseline
+question: does G1's batched prefill load and run a 512-id Bolt prompt on the 3090, and how fast, beside main?
+term: pp tok/s @ P = 512 (the row's pp_tok/s), ours arm = generate_qwen3moe built at f7063282 (this tree), RTX 3090
+unit: tok/s
+predict: 750..900
+condition: one lease on the 3090 (BLOOMERY_TIMING_GPU = the 3090), BLOOMERY_AB_ROUNDS=1; arms 512 (this tree, G1) and bin:
+  main's build at 512
+reason: the user's two-line rule (A6000 whole card and the 3090) for #328; why now: the 20:40 report
+decide-in: #328 states its 3090 line
+decide-below: a 3090-specific term (power cap, L2): nsys on the 3090
+decide-above: re-derive the 3090's rate

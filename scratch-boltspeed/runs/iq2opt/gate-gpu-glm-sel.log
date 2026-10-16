@@ -1,0 +1,135 @@
+BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_sel'
+box.sh: /home/box/repo/bloomery-perf-iq2opt already holds this tree (sync-id 54eded917eb639d3): not synced
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt tree=54eded917eb639d3
+boxq: bloomery-perf-iq2opt-cargo-1a214c class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-cargo-1a214c is job s1657
+   Compiling serde_json v1.0.151
+   Compiling bloomery-serve v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/serve)
+   Compiling bloomery-sampler v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/sampler)
+   Compiling bloomery-hf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/hf)
+   Compiling bloomery-jinja v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/jinja)
+   Compiling bloomery-model v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/model)
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_sel...
+
+   Compiling bloomery-gpu v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu)
+   Compiling bloomery-gpu-deepseek41 v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-deepseek41)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-app v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/app)
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+warning: `bloomery-gpu-deepseek41` (lib) generated 1 warning (1 duplicate)
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 07s
+
+✓ Cargo build succeeded
+gpu-gate.sh: gate_glm_sel on the a6000 (asked a6000)
+gate_glm_sel: device NVIDIA RTX A6000 — indexer heads=32 dim=128 pool=4 kept=512 width=2051
+pool counts 1..=2048 in one launch: plane bits differ from the host rule 0/65536 host_sites=0x0 fault=none mutants(moved bits, each > 0): no_ape=63398 ape_transposed=63733 plain_mean=65525 next_pool=65397 PASS
+score counts [2051, 2052, 9001, 16384] over 4096 pools: worst |kernel − rule| / band 0.001 (<= 1); slots past each row's pools NaN true; rerun bit for bit true; each token alone its column bit for bit true; fault=none; mutants past the band (scale 1/√128, no relu, head h+1's weight) [true, true, true] PASS
+topk counts [2051, 2052, 9001, 16384, 8192, 1, 2051]: every list, its length and the slots past it the rule's (the higher pool of a tie) — mismatched at []; fault=none; refused [count 0: length 0 fault layer 50 site pool_select; sites raised in layer 50 (architecture unknown, so in code order, not step order): pool_select true; count 16385: length 0 fault layer 51 site pool_select; sites raised in layer 51 (architecture unknown, so in code order, not step order): pool_select true]; mutants differ (lower tie, 513 kept, no tail, identity from 1) [true, true, true, true] PASS
+identity counts [1, 64, 65, 1000, 2051]: the lists are 0..c true; the attention over them (33 segments) = the prefix attention over 4096 rows (64 segments) bit for bit true; the list shifted by one differs true; fault=none PASS
+fault a NaN pool member: word "layer 60 site pool_select; sites raised in layer 60 (architecture unknown, so in code order, not step order): pool_select" (want "layer 60 site pool_select; sites raised in layer 60 (architecture unknown, so in code order, not step order): pool_select"), clean before true and after true PASS
+fault a NaN indexer query: word "layer 61 site pool_select; sites raised in layer 61 (architecture unknown, so in code order, not step order): pool_select" (want "layer 61 site pool_select; sites raised in layer 61 (architecture unknown, so in code order, not step order): pool_select"), clean before true and after true PASS
+fault a pool count past the cache: word "layer 62 site cache_pos; sites raised in layer 62 (architecture unknown, so in code order, not step order): cache_pos" (want "layer 62 site cache_pos; sites raised in layer 62 (architecture unknown, so in code order, not step order): cache_pos"), clean before true and after true PASS
+shape kernel=index_pool local_depot=false ld_local=0 st_local=0 PASS
+shape kernel=kpool_score local_depot=false ld_local=0 st_local=0 PASS
+shape kernel=qsa_topk_high local_depot=false ld_local=0 st_local=0 PASS
+ik pool ref_glm5next_d3kdsa layer 3: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 3: 767 pools, worst |ours − ik| / band 0.200 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 3: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut 3.0172e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 3: 2051 listed keys; ours vs the rule 2.04e-6, ik's vs the rule 7.63e-5 (printed), ours vs ik's 7.71e-5 (printed); band 7.06e-6 (ours <= it); mutant every position vs the rule 6.20e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 7: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 7: 767 pools, worst |ours − ik| / band 0.279 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 7: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -9.1917e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 7: 2051 listed keys; ours vs the rule 3.39e-6, ik's vs the rule 1.22e-4 (printed), ours vs ik's 1.21e-4 (printed); band 8.62e-6 (ours <= it); mutant every position vs the rule 5.92e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 11: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 11: 767 pools, worst |ours − ik| / band 0.165 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 11: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -9.8579e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 11: 2051 listed keys; ours vs the rule 2.60e-6, ik's vs the rule 1.50e-4 (printed), ours vs ik's 1.51e-4 (printed); band 8.88e-6 (ours <= it); mutant every position vs the rule 4.67e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 15: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 15: 767 pools, worst |ours − ik| / band 0.168 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 15: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 2 pools differ from ik's, all within twice the score band of ik's cut -6.1592e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 15: 2051 listed keys; ours vs the rule 3.98e-6, ik's vs the rule 9.56e-5 (printed), ours vs ik's 9.56e-5 (printed); band 1.08e-5 (ours <= it); mutant every position vs the rule 8.38e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 19: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 19: 767 pools, worst |ours − ik| / band 0.155 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 19: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -3.9622e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 19: 2051 listed keys; ours vs the rule 2.07e-6, ik's vs the rule 1.18e-4 (printed), ours vs ik's 1.19e-4 (printed); band 1.48e-5 (ours <= it); mutant every position vs the rule 4.82e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 23: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 23: 767 pools, worst |ours − ik| / band 0.147 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 23: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -9.4029e0: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 23: 2051 listed keys; ours vs the rule 5.00e-6, ik's vs the rule 1.27e-4 (printed), ours vs ik's 1.28e-4 (printed); band 1.62e-5 (ours <= it); mutant every position vs the rule 4.59e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 27: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 27: 767 pools, worst |ours − ik| / band 0.176 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 27: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -6.8069e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 27: 2051 listed keys; ours vs the rule 3.53e-6, ik's vs the rule 9.63e-5 (printed), ours vs ik's 9.66e-5 (printed); band 1.68e-5 (ours <= it); mutant every position vs the rule 8.23e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 31: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 31: 767 pools, worst |ours − ik| / band 0.144 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 31: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -7.0414e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 31: 2051 listed keys; ours vs the rule 2.96e-6, ik's vs the rule 1.07e-4 (printed), ours vs ik's 1.05e-4 (printed); band 9.07e-6 (ours <= it); mutant every position vs the rule 1.67e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 35: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 35: 767 pools, worst |ours − ik| / band 0.176 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 35: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -9.4383e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 35: 2051 listed keys; ours vs the rule 3.72e-6, ik's vs the rule 1.32e-4 (printed), ours vs ik's 1.33e-4 (printed); band 8.66e-6 (ours <= it); mutant every position vs the rule 2.98e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 39: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 39: 767 pools, worst |ours − ik| / band 0.185 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 39: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -1.1445e2: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 39: 2051 listed keys; ours vs the rule 2.87e-6, ik's vs the rule 1.33e-4 (printed), ours vs ik's 1.31e-4 (printed); band 1.12e-5 (ours <= it); mutant every position vs the rule 2.49e-2 (printed) fault=none PASS
+ik pool ref_glm5next_d3kdsa layer 43: 767 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d3kdsa layer 43: 767 pools, worst |ours − ik| / band 0.161 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d3kdsa layer 43: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -6.3528e1: true; fault=none PASS
+ik attn ref_glm5next_d3kdsa layer 43: 2051 listed keys; ours vs the rule 3.41e-6, ik's vs the rule 9.55e-5 (printed), ours vs ik's 9.59e-5 (printed); band 8.07e-6 (ours <= it); mutant every position vs the rule 4.81e-2 (printed) fault=none PASS
+ik attn ref_glm5next_d3kdsa mutant every position: past twice the band on 11 of 11 layers (>= 1) PASS
+ik pool ref_glm5next_d16kdsa layer 3: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 3: 4095 pools, worst |ours − ik| / band 0.188 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 3: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut 6.2474e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 3: 2051 listed keys; ours vs the rule 7.31e-6, ik's vs the rule 6.39e-5 (printed), ours vs ik's 6.36e-5 (printed); band 7.87e-6 (ours <= it); mutant every position vs the rule 3.05e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 7: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.996 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 7: 4095 pools, worst |ours − ik| / band 0.372 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 7: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -2.9876e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 7: 2051 listed keys; ours vs the rule 3.74e-6, ik's vs the rule 3.95e-5 (printed), ours vs ik's 4.32e-5 (printed); band 7.63e-6 (ours <= it); mutant every position vs the rule 2.15e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 11: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 11: 4095 pools, worst |ours − ik| / band 0.258 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 11: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -2.5191e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 11: 2051 listed keys; ours vs the rule 4.25e-6, ik's vs the rule 1.01e-4 (printed), ours vs ik's 1.02e-4 (printed); band 6.37e-6 (ours <= it); mutant every position vs the rule 2.97e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 15: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.996 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 15: 4095 pools, worst |ours − ik| / band 0.199 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 15: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -3.3694e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 15: 2051 listed keys; ours vs the rule 5.56e-6, ik's vs the rule 1.11e-4 (printed), ours vs ik's 1.12e-4 (printed); band 1.30e-5 (ours <= it); mutant every position vs the rule 2.34e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 19: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.996 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 19: 4095 pools, worst |ours − ik| / band 0.186 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 19: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 2 pools differ from ik's, all within twice the score band of ik's cut -1.0811e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 19: 2051 listed keys; ours vs the rule 2.49e-6, ik's vs the rule 1.25e-4 (printed), ours vs ik's 1.25e-4 (printed); band 1.70e-5 (ours <= it); mutant every position vs the rule 3.40e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 23: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.996 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 23: 4095 pools, worst |ours − ik| / band 0.176 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 23: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -6.3816e0: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 23: 2051 listed keys; ours vs the rule 2.88e-6, ik's vs the rule 1.46e-4 (printed), ours vs ik's 1.48e-4 (printed); band 1.51e-5 (ours <= it); mutant every position vs the rule 2.18e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 27: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 27: 4095 pools, worst |ours − ik| / band 0.187 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 27: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -5.4239e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 27: 2051 listed keys; ours vs the rule 4.32e-6, ik's vs the rule 2.13e-4 (printed), ours vs ik's 2.16e-4 (printed); band 1.53e-5 (ours <= it); mutant every position vs the rule 1.71e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 31: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 31: 4095 pools, worst |ours − ik| / band 0.207 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 31: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 2 pools differ from ik's, all within twice the score band of ik's cut -4.4692e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 31: 2051 listed keys; ours vs the rule 8.73e-6, ik's vs the rule 3.18e-4 (printed), ours vs ik's 3.13e-4 (printed); band 9.85e-6 (ours <= it); mutant every position vs the rule 2.02e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 35: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.996 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 35: 4095 pools, worst |ours − ik| / band 0.232 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 35: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -8.6422e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 35: 2051 listed keys; ours vs the rule 6.35e-6, ik's vs the rule 1.73e-4 (printed), ours vs ik's 1.79e-4 (printed); band 1.11e-5 (ours <= it); mutant every position vs the rule 1.32e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 39: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.996 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 39: 4095 pools, worst |ours − ik| / band 0.284 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 39: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -1.3293e2: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 39: 2051 listed keys; ours vs the rule 4.88e-6, ik's vs the rule 1.69e-4 (printed), ours vs ik's 1.70e-4 (printed); band 1.25e-5 (ours <= it); mutant every position vs the rule 2.32e-1 (printed) fault=none PASS
+ik pool ref_glm5next_d16kdsa layer 43: 4095 pools, worst |ours − ik| / (half an f16 ulp + 32u of the largest member) 0.995 (<= 1); fault=none; mutants past it [no_ape=true ape_transposed=true plain_mean=true] PASS
+ik score ref_glm5next_d16kdsa layer 43: 4095 pools, worst |ours − ik| / band 0.168 (<= 1; the band: tensor cores, the split, the pools' f16 rounding, ik's f32 dot) fault=none PASS
+ik select ref_glm5next_d16kdsa layer 43: on ik's scores our list = ik's 2051 cells exactly true (length 2051); on our scores 0 pools differ from ik's, all within twice the score band of ik's cut -2.3282e1: true; fault=none PASS
+ik attn ref_glm5next_d16kdsa layer 43: 2051 listed keys; ours vs the rule 3.30e-6, ik's vs the rule 2.14e-4 (printed), ours vs ik's 2.16e-4 (printed); band 1.24e-5 (ours <= it); mutant every position vs the rule 2.38e-1 (printed) fault=none PASS
+ik attn ref_glm5next_d16kdsa mutant every position: past twice the band on 11 of 11 layers (>= 1) PASS
+fixture-only(oracle): 7-10 ik: every latent layer of the fixture teacher-forced on the --dsa set fx_ref_glm5next_d3kdsa
+fixture-only(oracle): 7-10 ik: every latent layer of the fixture teacher-forced on the --dsa set fx_ref_glm5next_d16kdsa
+gate_glm_sel: 98 clauses, 0 failed — PASS
+gate_glm_sel: clauses: 8 ran, 0 left to the real tier, 2 left to the fixture tier
+gpu-gate.sh: gate_glm_sel ran 15 s (exit 0)

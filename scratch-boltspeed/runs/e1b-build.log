@@ -1,0 +1,13 @@
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-e1 tree=34dbb488bfa12f9e
+boxq: bloomery-perf-e1-cargo-5d06c0 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-e1-cargo-5d06c0 is job s1659
+boxq: s1659 waiting: lanes busy, eta unknown
+boxq: s1659 waiting: lanes busy, eta unknown
+boxq: s1659 queued 122 s (wait_reason lanes busy)
+boxq: s1659: poll 1/3 failed: GET /jobs/s1659: no reply in 30 s
+boxq: s1659: poll 2/3 failed: GET /jobs/s1659: no reply in 30 s
+Timeout, server ws not responding.
+Timeout, server ws not responding.
+boxq: s1659: reconnecting, next poll in 5 s
+
+✓ Cargo build succeeded

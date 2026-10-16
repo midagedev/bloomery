@@ -1,0 +1,7 @@
+box.sh: /home/box/repo/bloomery-perf-e1 already holds this tree (sync-id 22749a4881f0b2d0): not synced
+box.sh: queue round card=3090 predicted unknown remote=/home/box/repo/bloomery-perf-e1 tree=22749a4881f0b2d0
+boxq: bloomery-perf-e1-rm-60b4f5 class=round card=3090 predicted unknown
+boxq: bloomery-perf-e1-rm-60b4f5 is job s1699
+
+✓ Cargo build succeeded
+fatal: not a git repository: /workspace/repo/bloomery/.git/worktrees/bloomery-perf-e1

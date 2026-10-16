@@ -1,0 +1,269 @@
+./tools/ptx-compare.sh d0e8a8e1 gate_e2e --features gpu  
+ptx-compare: base d0e8a8e18757: ~/repo/bloomery-perf-iq2opt-ptxcmp-base
+box.sh: queue round card=a6000 predicted unknown remote=~/repo/bloomery-perf-iq2opt-ptxcmp-base tree=80918cc28ed7fa13
+boxq: bloomery-perf-iq2opt-ptxcmp-base-cargo-6c52d1 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-ptxcmp-base-cargo-6c52d1 is job s1689
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689 waiting: lanes busy, eta unknown
+boxq: s1689: poll 1/3 failed: GET /jobs/s1689: no reply in 30 s
+boxq: s1689: poll 2/3 failed: GET /jobs/s1689: no reply in 30 s
+boxq: s1689: reconnecting, next poll in 5 s
+boxq: s1689 queued 791 s (wait_reason lanes busy)
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_e2e --bin oxart_jit...
+
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling cfg-if v1.0.5
+   Compiling thiserror v2.0.21
+   Compiling libc v0.2.190
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling glob v0.3.4
+   Compiling cpufeatures v0.2.17
+   Compiling rustix v0.38.44
+   Compiling prettyplease v0.2.37
+   Compiling crc32fast v1.5.2
+   Compiling memchr v2.8.3
+   Compiling linux-raw-sys v0.4.15
+   Compiling serde_core v1.0.229
+   Compiling bitflags v2.13.2
+   Compiling either v1.19.0
+   Compiling regex-syntax v0.8.11
+   Compiling minimal-lexical v0.2.1
+   Compiling generic-array v0.14.7
+   Compiling clang-sys v1.9.1
+   Compiling nom v7.1.3
+   Compiling libloading v0.8.9
+   Compiling home v0.5.12
+   Compiling bindgen v0.69.5
+   Compiling itertools v0.12.1
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling memmap2 v0.9.11
+   Compiling digest v0.10.7
+   Compiling regex-automata v0.4.18
+   Compiling sha2 v0.10.9
+   Compiling lazycell v1.3.0
+   Compiling shlex v1.3.0
+   Compiling simd-adler32 v0.3.10
+   Compiling rustc-hash v1.1.0
+   Compiling which v4.4.2
+   Compiling log v0.4.34
+   Compiling lazy_static v1.5.1
+   Compiling cexpr v0.6.0
+   Compiling bloomery-levers v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/levers)
+   Compiling zerocopy v0.8.61
+   Compiling object v0.36.7
+   Compiling zmij v1.0.23
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling foldhash v0.1.5
+   Compiling adler2 v2.0.1
+   Compiling hashbrown v0.15.5
+   Compiling regex v1.13.1
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling anyhow v1.0.104
+   Compiling indexmap v2.14.2
+   Compiling miniz_oxide v0.9.1
+   Compiling bloomery-threads v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/threads)
+   Compiling cuda-target-spec v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-core v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling reserved-oxide-symbols v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling itoa v1.0.18
+   Compiling flate2 v1.1.10
+   Compiling miniz_oxide v0.8.9
+   Compiling fdeflate v0.3.7
+   Compiling sha1 v0.10.7
+   Compiling zune-core v0.5.1
+   Compiling ptx-parse v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling zune-jpeg v0.5.15
+   Compiling png v0.18.1
+   Compiling bloomery-verbs v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/verbs)
+   Compiling oxide-artifacts v0.2.1
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling zerocopy-derive v0.8.61
+   Compiling cuda-core-derive v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-macros v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-gguf v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/gguf)
+   Compiling libnvvm-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling nvjitlink-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-models v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/models)
+   Compiling bloomery-tokenizer v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/tokenizer)
+   Compiling bloomery-runtime v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/runtime)
+   Compiling bloomery-placement v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/placement)
+   Compiling bloomery-qdot v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/qdot)
+   Compiling bloomery-engram v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/engram)
+   Compiling bloomery-vision v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/vision)
+   Compiling cuda-artifact-finalizer v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-hf v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/hf)
+   Compiling bloomery-model v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/model)
+   Compiling bloomery-refset v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/refset)
+   Compiling cuda-bindings v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling half v2.7.1
+   Compiling cuda-device v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-host v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling bloomery-gpu v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/gpu)
+   Compiling bloomery-app v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/app)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-gpu-gates v0.3.3 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/gpu-gates)
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 23s
+
+✓ Cargo build succeeded
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling version_check v0.9.5
+   Compiling libc v0.2.190
+   Compiling thiserror v2.0.21
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.5
+   Compiling cpufeatures v0.2.17
+   Compiling memchr v2.8.3
+   Compiling zmij v1.0.23
+   Compiling bloomery-levers v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/levers)
+   Compiling serde_core v1.0.229
+   Compiling crc32fast v1.5.2
+   Compiling serde_json v1.0.151
+   Compiling itoa v1.0.18
+   Compiling object v0.36.7
+   Compiling foldhash v0.1.5
+   Compiling generic-array v0.14.7
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.15.5
+   Compiling syn v3.0.6
+   Compiling indexmap v2.14.2
+   Compiling memmap2 v0.9.11
+   Compiling bloomery-threads v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/threads)
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling thiserror-impl v2.0.21
+   Compiling bloomery-gguf v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/gguf)
+   Compiling bloomery-models v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/models)
+   Compiling bloomery-tokenizer v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/tokenizer)
+   Compiling bloomery-qdot v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/qdot)
+   Compiling bloomery-engram v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/engram)
+   Compiling bloomery-refset v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/refset)
+   Compiling bloomery-runtime v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/runtime)
+   Compiling bloomery-placement v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/placement)
+   Compiling bloomery-hf v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/hf)
+   Compiling oxide-artifacts v0.2.1
+   Compiling bloomery-model v0.1.0 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/model)
+   Compiling bloomery-gpu-gates v0.3.3 (/root/repo/bloomery-perf-iq2opt-ptxcmp-base/crates/gpu-gates)
+    Finished `release` profile [optimized] target(s) in 11.06s
+ptx-compare: head 2e30c849: the own remote dir of this tree
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt tree=a83bcfd1749c2dc2
+boxq: bloomery-perf-iq2opt-cargo-f809b5 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-cargo-f809b5 is job s1706
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 waiting: lanes busy, eta unknown
+boxq: s1706 queued 960 s (wait_reason lanes busy)
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_e2e --bin oxart_jit...
+
+   Compiling bloomery-models v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/models)
+   Compiling bloomery-refset v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/refset)
+   Compiling bloomery-runtime v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/runtime)
+   Compiling bloomery-placement v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/placement)
+   Compiling bloomery-hf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/hf)
+   Compiling bloomery-model v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/model)
+   Compiling bloomery-gpu v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu)
+   Compiling bloomery-app v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/app)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 11s
+
+✓ Cargo build succeeded
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling libc v0.2.190
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling thiserror v2.0.21
+   Compiling cfg-if v1.0.5
+   Compiling cpufeatures v0.2.17
+   Compiling memchr v2.8.3
+   Compiling serde_core v1.0.229
+   Compiling bloomery-levers v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/levers)
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling crc32fast v1.5.2
+   Compiling hashbrown v0.17.1
+   Compiling foldhash v0.1.5
+   Compiling itoa v1.0.18
+   Compiling equivalent v1.0.2
+   Compiling generic-array v0.14.7
+   Compiling object v0.36.7
+   Compiling hashbrown v0.15.5
+   Compiling syn v3.0.6
+   Compiling indexmap v2.14.2
+   Compiling memmap2 v0.9.11
+   Compiling bloomery-threads v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/threads)
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling thiserror-impl v2.0.21
+   Compiling bloomery-gguf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/gguf)
+   Compiling bloomery-models v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/models)
+   Compiling bloomery-tokenizer v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/tokenizer)
+   Compiling bloomery-qdot v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/qdot)
+   Compiling bloomery-refset v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/refset)
+   Compiling bloomery-engram v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/engram)
+   Compiling bloomery-runtime v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/runtime)
+   Compiling bloomery-placement v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/placement)
+   Compiling bloomery-hf v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/hf)
+   Compiling bloomery-model v0.1.0 (/home/box/repo/bloomery-perf-iq2opt/crates/model)
+   Compiling oxide-artifacts v0.2.1
+   Compiling bloomery-gpu-gates v0.3.3 (/home/box/repo/bloomery-perf-iq2opt/crates/gpu-gates)
+    Finished `release` profile [optimized] target(s) in 11.22s
+ptx-compare: bin=gate_e2e base=d0e8a8e18757 head=2e30c849 method=decl1 arch=sm_86 jit-cc=8.6
+  base entries  264
+  head entries  265
+  added         1: head_norm_neox_append_256_whole
+  removed       none
+  changed       11: iq2_xs_gate_up_sel (ptx-scan-md5:585109e8->cfa8be5a) | iq2_xs_gemv_sel (regs:40->39 jit_regs:40->39 ptx-scan-md5:a3b11773->60fd2c0f) | iq2_xxs_gemv_sel (smem:0->1536 ld.global.scalar:18->15 ptx-scan-md5:88815c86->6a6b6dd2) | iq2_xxs_rows (smem:0->1536 ld.global.scalar:77->74 ptx-scan-md5:ca36ab3f->0b93faec) | iq3_s_gate_up_sel (regs:59->64 jit_regs:59->64 ptx-scan-md5:92278ce0->29bd2316) | iq3_s_gemv_sel (ptx-scan-md5:992c07cc->0f59fd11) | iq3_xxs_gate_up_sel (regs:48->60 blk/SM(static):5->4 jit_regs:48->60 ptx-scan-md5:d5e42591->e64f07eb) | iq3_xxs_gemv_sel (ptx-scan-md5:6441bcf3->6f62f04e) | iq4_nl_gemv_sel32 (ptx-scan-md5:9d4eaa92->36d461b8) | iq4_xs_gate_up_sel (ptx-scan-md5:0508de88->28b44e96) | iq4_xs_gemv_sel (regs:39->40 jit_regs:39->40 ptx-scan-md5:788cf33c->da5c3090)
+ptx-compare: changed (rc 3)
+error: recipe `ptx-compare` failed on line 177 with exit code 3

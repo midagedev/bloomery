@@ -1,0 +1,4 @@
+mutant-run: 1 mutants from /tmp/claude-1000/-workspace-repo-bloomery-perf/13de5b33-6693-464c-b35e-172a11e4e6f0/scratchpad/p3a-mut over 1 files, logs in /tmp/mutant-run.WXzwej (clean runs: each)
+mut-unfold rc=1 20:11:13 killed
+clean-after-unfold rc=0 20:14:50 green
+mutant-run: 1 mutants, 1 killed, 0 survived, 0 not built, 0 not run, 0 red-other; clean runs 1 green — PASS

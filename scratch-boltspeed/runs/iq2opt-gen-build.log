@@ -1,0 +1,11 @@
+box.sh: queue round card=a6000 predicted unknown remote=/home/box/repo/bloomery-perf-iq2opt-ab tree=68d008110db9837e
+boxq: bloomery-perf-iq2opt-ab-rm-ba4c90 class=round card=a6000 predicted unknown
+boxq: bloomery-perf-iq2opt-ab-rm-ba4c90 is job s1723
+boxq: s1723 waiting: lanes busy, eta unknown
+boxq: s1723 waiting: lanes busy, eta unknown
+boxq: s1723: poll 1/3 failed: GET /jobs/s1723: no reply in 30 s
+boxq: s1723: poll 2/3 failed: GET /jobs/s1723: no reply in 30 s
+boxq: s1723: reconnecting, next poll in 5 s
+boxq: s1723 queued 555 s (wait_reason lanes busy)
+
+✓ Cargo build succeeded

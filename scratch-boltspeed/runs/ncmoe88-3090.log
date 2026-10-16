@@ -1,0 +1,313 @@
+box.sh: /home/box/repo/bloomery-perf already holds this tree (sync-id 98228cff74d4860a): not synced
+box.sh: queue round card=3090 predicted unknown remote=/home/box/repo/bloomery-perf tree=98228cff74d4860a
+boxq: bloomery-perf-export-e2edfe class=round card=3090 predicted unknown
+boxq: bloomery-perf-export-e2edfe is job s1655
+[lease] card: docs/cards/bolt-lcpp-ncmoe-3090.card sha256=89231f28437798d175647d66ba7954fd73d256c306b3c979bfa87cb442d9fe4d
+[lease] card | # Mainline llama.cpp cd0a5b6a1 on Nemotron 3.5 Bolt 24 GB on the RTX 3090 with the routed experts of the first K
+[lease] card | # layers on the host (--n-cpu-moe K): the offload row bloomery's host tier is judged against. Derived: a routed
+[lease] card | # layer's 9 picks are ~11.4 MB; on the host at ~60 GB/s (ggml's CPU MUL_MAT_ID, single stream, plus the copy of the
+[lease] card | # activation each way) ~0.25 ms a MoE layer. K counts layers by index, 40 of the 88 are MoE, so K = 16 puts ~7 MoE
+[lease] card | # layers' experts on the host and adds ~2 ms to a 12.7 ms token: 55..75 tok/s at K = 16; K = 88 is every expert.
+[lease] card | kind: baseline
+[lease] card | question: how fast does mainline llama.cpp decode and prefill Bolt on the 3090 with the first K layers' experts on
+[lease] card |   the host?
+[lease] card | term: tok/s @ n = 96, depth 6, NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf, llama-bench -ngl 99 -fa on
+[lease] card |   --n-cpu-moe 16, RTX 3090
+[lease] card | unit: tok/s
+[lease] card | predict: 55..75
+[lease] card | condition: one lease per K, BLOOMERY_CARD=3090, BLOOMERY_AB_ROUNDS=2, LCPP_GPU_FLAGS='-ngl 99 -fa on --n-cpu-moe
+[lease] card |   K' for K in 16, 48, 88; arms lcpp:6 lcpppp:512; -t the runner's default
+[lease] card | reason: the offload line of the Bolt speed plan (bloomery's core is the hybrid tier); why now: the lead's
+[lease] card |   baseline-first order
+[lease] card | decide-in: publish the K rows; bloomery's host tier for Bolt is judged against them
+[lease] card | decide-below: llama.cpp's host MoE is slower than the derivation: our qdot tier's margin is larger
+[lease] card | decide-above: the host copy is hidden: read the per-K slope as llama.cpp's host rate
+[lease] card: ok kind=baseline (no ruler: not an ab card)
+[lease] timing card idle: GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
+[lease] held by pid 1732999 at 2026-10-16T10:20:20Z
+[lease] netdata: frozen
+[config] model=/models/nemotron-3.5-bolt/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf n=96 rounds=4 warm=0 card=3090 arm_bound=900s
+[config] ours: target/release/generate_qwen3moe ctx=D+N rounded up to 256
+[config] cpu guard: comms=[cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41 generate_qwen3moe llama-server mistralrs] threshold=50% strict=0
+[config] order: rotate
+[config] cold tag: majflt in the row's measured window (ours: from its prompt_ids line; lcpp: from its --progress line; mrs: from its Iteration line; ik and bin: the whole process) × 75 µs ≥ 1 % of that window
+[config] lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench flags=-ngl 99 -fa on --n-cpu-moe 88 (lcpp and lcpppp: --progress)
+[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)), mrspp mistralrs bench --prompt-len P --gen-len 1; ours from its time prompt row
+[config] arms=lcpp:6 lcpppp:512 timing_gpu=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1 other_gpu=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4 CUDA_VISIBLE_DEVICES=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
+--- witness pre 2026-10-16T10:20:20Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=210 max=2145 MHz event_reasons=0x0000000000000001 capped_us sw_power=664764487503 sw_thermal=620683114043 hw_thermal=0 temp=32 C power=29.80 W
+    cpu-freq: MHz mean 858 min 400 max 4537 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 29.80 W, 210 MHz;1, 0 %, 19.03 W, 210 MHz;
+    load=1.21 1.94 2.19 io=avg10=0.06 llm.service=inactive
+    busiest: cargo-oxide 92.8% | bash 3.6% | kswapd0 2.4% | nvidia-smi 2.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255387088 kB Cached: 225011872 kB 
+    pgmajfault: 392048816
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness pre r1 lcpp d=6 2026-10-16T10:20:21Z
+[cpu-busy] 2026-10-16T10:20:21Z pre: 268.3% > 50% of one cpu over 1.0 s [cargo 1.0%;rustc 267.3%;]
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=210 max=2145 MHz event_reasons=0x0000000000000001 capped_us sw_power=664765487191 sw_thermal=620684113731 hw_thermal=0 temp=32 C power=29.72 W
+    cpu-freq: MHz mean 1174 min 400 max 4288 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 29.72 W, 210 MHz;1, 0 %, 18.94 W, 210 MHz;
+    load=1.21 1.94 2.19 io=avg10=0.06 llm.service=inactive
+    busiest: gate_nemotron_h 100% | kswapd0 2.4% | nvidia-smi 2.4% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255171284 kB Cached: 225025352 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r1 lcpp d=6 2026-10-16T10:20:26Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1995 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664766866726 sw_thermal=620685468511 hw_thermal=0 temp=41 C power=221.80 W
+    cpu-freq: MHz mean 1000 min 400 max 4291 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: [1733380, 2352 MiB;]
+    gpu: 0, 7 %, 173.11 W, 1995 MHz;1, 99 %, 298.68 W, 1860 MHz;
+    load=3.84 2.47 2.36 io=avg10=0.03 llm.service=inactive
+    busiest: gate_nemotron_h 137% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254429520 kB Cached: 225033552 kB 
+    pgmajfault: 392048833
+[other-busy] 2026-10-16T10:20:27Z compute apps on the other card (GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4): [1733380, 2352 MiB;]
+    lcpp table | model                          |       size |     params | backend    | ngl |  n_cpu_moe |  fa |            test |                  t/s |
+    lcpp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |         88 |   1 |       tg96 @ d6 |         53.39 ± 0.00 |
+ROW r1 lcpp d=6 n=96 | tok/s 53.39 @ n=96, depth 6, 3090 | build cd0a5b6a1 (11668) | device NVIDIA GeForce RTX 3090 | wall 5s | majflt 0 (timed 0; ≤ 0.0 % of W 1.7981 s)
+--- witness pre r1 lcpppp d=512 2026-10-16T10:20:27Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1995 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664766866726 sw_thermal=620685468511 hw_thermal=0 temp=40 C power=173.11 W
+    cpu-freq: MHz mean 844 min 400 max 4288 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: [1733380, 2352 MiB;]
+    gpu: 0, 7 %, 173.11 W, 1995 MHz;1, 99 %, 299.12 W, 1845 MHz;
+    load=3.84 2.47 2.36 io=avg10=0.03 llm.service=inactive
+    busiest: gate_nemotron_h 134% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254383972 kB Cached: 225033552 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r1 lcpppp d=512 2026-10-16T10:20:31Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664766896787 sw_thermal=620685468511 hw_thermal=0 temp=42 C power=209.90 W
+    cpu-freq: MHz mean 840 min 400 max 4291 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: [1733380, 2352 MiB;]
+    gpu: 0, 0 %, 209.90 W, 1980 MHz;1, 99 %, 299.42 W, 1860 MHz;
+    load=3.77 2.48 2.37 io=avg10=0.02 llm.service=inactive
+    busiest: gate_nemotron_h 118% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254403560 kB Cached: 225033676 kB 
+    pgmajfault: 392048833
+    lcpppp table | model                          |       size |     params | backend    | ngl |  n_cpu_moe |  fa |            test |                  t/s |
+    lcpppp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |         88 |   1 |           pp512 |        537.34 ± 0.00 |
+ROW r1 lcpppp p=512 n=0 | tok/s(pp) 537.34 @ n=0, prompt 512, 3090 | ub 512 b 2048 (llama-bench defaults) | build cd0a5b6a1 (11668) | device NVIDIA GeForce RTX 3090 | wall 4s [other-busy] | majflt 0 (timed 0; ≤ 0.0 % of W 0.9528 s)
+--- witness pre r2 lcpppp d=512 2026-10-16T10:20:32Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664766896787 sw_thermal=620685468511 hw_thermal=0 temp=42 C power=164.91 W
+    cpu-freq: MHz mean 983 min 400 max 4295 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: [1733380, 2352 MiB;]
+    gpu: 0, 0 %, 164.91 W, 1980 MHz;1, 99 %, 299.42 W, 1860 MHz;
+    load=3.77 2.48 2.37 io=avg10=0.02 llm.service=inactive
+    busiest: gate_nemotron_h 117% | kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254450664 kB Cached: 225033472 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+[other-busy] 2026-10-16T10:20:31Z compute apps on the other card (GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4): [1733380, 2352 MiB;]
+--- witness post r2 lcpppp d=512 2026-10-16T10:20:36Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664766896787 sw_thermal=620685468511 hw_thermal=0 temp=43 C power=204.05 W
+    cpu-freq: MHz mean 836 min 400 max 4045 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 204.05 W, 1980 MHz;1, 0 %, 63.87 W, 270 MHz;
+    load=3.55 2.46 2.36 io=avg10=0.01 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254968924 kB Cached: 225025112 kB 
+    pgmajfault: 392048833
+    lcpppp table | model                          |       size |     params | backend    | ngl |  n_cpu_moe |  fa |            test |                  t/s |
+    lcpppp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |         88 |   1 |           pp512 |        536.81 ± 0.00 |
+ROW r2 lcpppp p=512 n=0 | tok/s(pp) 536.81 @ n=0, prompt 512, 3090 | ub 512 b 2048 (llama-bench defaults) | build cd0a5b6a1 (11668) | device NVIDIA GeForce RTX 3090 | wall 4s [other-busy] | majflt 0 (timed 0; ≤ 0.0 % of W 0.9538 s)
+--- witness pre r2 lcpp d=6 2026-10-16T10:20:36Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664766896787 sw_thermal=620685468511 hw_thermal=0 temp=43 C power=159.30 W
+    cpu-freq: MHz mean 710 min 400 max 4537 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 159.30 W, 1980 MHz;1, 0 %, 63.87 W, 270 MHz;
+    load=3.55 2.46 2.36 io=avg10=0.01 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254871768 kB Cached: 225025392 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r2 lcpp d=6 2026-10-16T10:20:41Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664768213817 sw_thermal=620685468511 hw_thermal=0 temp=44 C power=216.98 W
+    cpu-freq: MHz mean 885 min 400 max 4291 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 216.98 W, 1980 MHz;1, 0 %, 21.16 W, 210 MHz;
+    load=3.34 2.43 2.35 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254854136 kB Cached: 225025400 kB 
+    pgmajfault: 392048833
+    lcpp table | model                          |       size |     params | backend    | ngl |  n_cpu_moe |  fa |            test |                  t/s |
+    lcpp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |         88 |   1 |       tg96 @ d6 |         60.78 ± 0.00 |
+ROW r2 lcpp d=6 n=96 | tok/s 60.78 @ n=96, depth 6, 3090 | build cd0a5b6a1 (11668) | device NVIDIA GeForce RTX 3090 | wall 4s | majflt 0 (timed 0; ≤ 0.0 % of W 1.5795 s)
+--- witness pre r3 lcpp d=6 2026-10-16T10:20:41Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664768213817 sw_thermal=620685468511 hw_thermal=0 temp=44 C power=171.65 W
+    cpu-freq: MHz mean 830 min 400 max 4288 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 171.65 W, 1980 MHz;1, 0 %, 21.16 W, 210 MHz;
+    load=3.34 2.43 2.35 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254797272 kB Cached: 225025404 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r3 lcpp d=6 2026-10-16T10:20:45Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664769573422 sw_thermal=620685468511 hw_thermal=0 temp=45 C power=186.69 W
+    cpu-freq: MHz mean 923 min 400 max 4093 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 186.69 W, 1980 MHz;1, 0 %, 20.44 W, 210 MHz;
+    load=3.15 2.41 2.34 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254718108 kB Cached: 225025400 kB 
+    pgmajfault: 392048833
+    lcpp table | model                          |       size |     params | backend    | ngl |  n_cpu_moe |  fa |            test |                  t/s |
+    lcpp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |         88 |   1 |       tg96 @ d6 |         60.93 ± 0.00 |
+ROW r3 lcpp d=6 n=96 | tok/s 60.93 @ n=96, depth 6, 3090 | build cd0a5b6a1 (11668) | device NVIDIA GeForce RTX 3090 | wall 4s | majflt 0 (timed 0; ≤ 0.0 % of W 1.5756 s)
+--- witness pre r3 lcpppp d=512 2026-10-16T10:20:46Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1980 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664769573422 sw_thermal=620685468511 hw_thermal=0 temp=45 C power=186.69 W
+    cpu-freq: MHz mean 1172 min 400 max 4288 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 186.69 W, 1980 MHz;1, 0 %, 19.94 W, 210 MHz;
+    load=3.15 2.41 2.34 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254634892 kB Cached: 225025400 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r3 lcpppp d=512 2026-10-16T10:20:50Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1965 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664769593455 sw_thermal=620685468511 hw_thermal=0 temp=46 C power=221.77 W
+    cpu-freq: MHz mean 874 min 400 max 4288 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 7 %, 177.23 W, 1965 MHz;1, 0 %, 19.78 W, 210 MHz;
+    load=3.06 2.40 2.34 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254969108 kB Cached: 225025540 kB 
+    pgmajfault: 392048833
+    lcpppp table | model                          |       size |     params | backend    | ngl |  n_cpu_moe |  fa |            test |                  t/s |
+    lcpppp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |         88 |   1 |           pp512 |        528.95 ± 0.00 |
+ROW r3 lcpppp p=512 n=0 | tok/s(pp) 528.95 @ n=0, prompt 512, 3090 | ub 512 b 2048 (llama-bench defaults) | build cd0a5b6a1 (11668) | device NVIDIA GeForce RTX 3090 | wall 4s | majflt 0 (timed 0; ≤ 0.0 % of W 0.9680 s)
+--- witness pre r4 lcpppp d=512 2026-10-16T10:20:51Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1965 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664769593455 sw_thermal=620685468511 hw_thermal=0 temp=46 C power=177.23 W
+    cpu-freq: MHz mean 1470 min 400 max 4290 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 7 %, 177.23 W, 1965 MHz;1, 0 %, 19.78 W, 210 MHz;
+    load=3.06 2.40 2.34 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 254907032 kB Cached: 225025544 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r4 lcpppp d=512 2026-10-16T10:20:55Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1965 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664769613260 sw_thermal=620685468511 hw_thermal=0 temp=47 C power=215.63 W
+    cpu-freq: MHz mean 761 min 400 max 4137 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 215.63 W, 1965 MHz;1, 0 %, 19.76 W, 210 MHz;
+    load=2.90 2.38 2.33 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255197884 kB Cached: 225025544 kB 
+    pgmajfault: 392048833
+    lcpppp table | model                          |       size |     params | backend    | ngl |  n_cpu_moe |  fa |            test |                  t/s |
+    lcpppp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |         88 |   1 |           pp512 |        525.67 ± 0.00 |
+ROW r4 lcpppp p=512 n=0 | tok/s(pp) 525.67 @ n=0, prompt 512, 3090 | ub 512 b 2048 (llama-bench defaults) | build cd0a5b6a1 (11668) | device NVIDIA GeForce RTX 3090 | wall 4s | majflt 0 (timed 0; ≤ 0.0 % of W 0.9740 s)
+--- witness pre r4 lcpp d=6 2026-10-16T10:20:56Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1965 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664769613260 sw_thermal=620685468511 hw_thermal=0 temp=46 C power=173.90 W
+    cpu-freq: MHz mean 786 min 400 max 4371 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 7 %, 173.90 W, 1965 MHz;1, 0 %, 19.76 W, 210 MHz;
+    load=2.90 2.38 2.33 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255152988 kB Cached: 225025544 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0
+--- witness post r4 lcpp d=6 2026-10-16T10:21:00Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1965 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664771097660 sw_thermal=620685468511 hw_thermal=0 temp=47 C power=189.54 W
+    cpu-freq: MHz mean 1163 min 400 max 4291 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 189.54 W, 1965 MHz;1, 0 %, 20.45 W, 210 MHz;
+    load=2.66 2.34 2.32 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255319704 kB Cached: 225025548 kB 
+    pgmajfault: 392048833
+    lcpp table | model                          |       size |     params | backend    | ngl |  n_cpu_moe |  fa |            test |                  t/s |
+    lcpp table | nemotron_h_moe 75B.A9B IQ2_XXS - 2.0625 bpw |  20.50 GiB |    74.04 B | CUDA       |  99 |         88 |   1 |       tg96 @ d6 |         61.26 ± 0.00 |
+ROW r4 lcpp d=6 n=96 | tok/s 61.26 @ n=96, depth 6, 3090 | build cd0a5b6a1 (11668) | device NVIDIA GeForce RTX 3090 | wall 4s | majflt 0 (timed 0; ≤ 0.0 % of W 1.5671 s)
+
+cpu-busy rows: 0 of 8 (BLOOMERY_CPU_BUSY_PCT=50% over [cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41 generate_qwen3moe llama-server mistralrs])
+other-busy rows: 2 of 8 (a compute process on the other card as the arm started)
+tokens-differ rounds: 0 of 0 (arms on one prompt, P and n whose greedy ids differ)
+cold rows: 0 of 8 (the measured window's majflt × 75 µs ≥ 1 % of that window)
+probe-off rows: 0 of 8 (an ours row whose load probed lane_gbs under 18.5 GB/s: a lighter prompt plan than its pair's)
+loop rows: 0 of 8 (a single-stream row whose distinct_tokens is under the floor of its steps, loop-floor.py: its arm decoded a loop, so a speed read against a pair on other text is void)
+failed arms: 0 (FAIL rows, the warm-up's or the discards' included)
+=== per-arm means (tok/s @ n=96, 3090). First column: ours from mean_ms, the references
+    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)
+    — the cross-engine ratio reads these. The p50 column is ours only. ===
+mean lcpp d=6          59.09 tok/s  [53.39..61.26, spread 14.74%]   (n=4)  [cold 0/4] [probe-off 0/4]  untagged mean 59.09 tok/s (n=4)
+
+=== ours / reference per depth: each round's ratio of the pair measured in that round (arms
+    that ran more than once in a round are averaged first), their mean with its 95 % interval
+    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ===
+
+=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, 3090). Ours: its time prompt
+    row (prefill through its token's readback); llama-bench's pp value over one repetition;
+    mistral.rs P / TTFT over one request. The tags count the rows that met contention or faults. ===
+mean pp lcpppp p=512     532.19 tok/s(pp)  [525.67..537.34, spread 2.22%]  (n=4)  [cpu-busy 0/4] [other-busy 2/4] [cold 0/4] [probe-off 0/4]  untagged mean 527.31 tok/s(pp) (n=2)
+
+=== ours / reference prefill per prompt length: the decode table's statistics over the pp
+    values, then how many of each side's rows carried [other-busy] and [cold] ===
+--- witness post 2026-10-16T10:21:00Z
+    timing-card: NVIDIA GeForce RTX 3090, 250.00 W, 2145 MHz
+    timing-card clocks: sm=1965 max=2145 MHz event_reasons=0x0000000000000400 capped_us sw_power=664771097660 sw_thermal=620685468511 hw_thermal=0 temp=47 C power=189.54 W
+    cpu-freq: MHz mean 895 min 400 max 4288 over 64 cpus governor=powersave
+    3090-apps: []
+    a6000-apps: []
+    gpu: 0, 0 %, 189.54 W, 1965 MHz;1, 0 %, 19.87 W, 210 MHz;
+    load=2.66 2.34 2.32 io=avg10=0.00 llm.service=inactive
+    busiest: kswapd0 2.4% | nvidia-smi 2.3% | kcompactd0 2.0% | netdata 1.4% | 
+    model: nemotron_h_moe
+    mem: MemAvailable: 255264564 kB Cached: 225025552 kB 
+    pgmajfault: 392048833
+    lcpp: /home/user/llama.cpp-mainline-bolt/build-cuda/bin/llama-bench sha256=5d610a487946 head=cd0a5b6a1 dirty_files=0

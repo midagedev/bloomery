@@ -1,0 +1,16 @@
+# Our Bolt decode step under Nsight Systems on the RTX A6000 (none exists: the 1084-node graph's kernel sum and its
+# gaps are unmeasured), and mainline llama.cpp's pp512 prompt split by kernel for engine's batched prefill design.
+# Derived for ours: llama.cpp's kernel sum is 12.36 ms a token (bolt-lcpp-nsys-a6000.card) and ours decodes at
+# 1.008 x its rate, so ours sums 11..13 ms a replay with ~0.1..0.5 ms of node gaps.
+kind: profile
+question: which kernels and how much gap make our 12.2 ms Bolt decode step, and which kernels make llama.cpp's
+  pp512 pass?
+term: kernel ms a replay (nsys-table.py --steps over the graph launches), generate_qwen3moe --tokens <6 ids> -n
+  64 --ctx 256 --time, graph node tracing, RTX A6000
+unit: ms
+predict: 11..13
+condition: one lease (lease-hold.sh), BLOOMERY_CARD=a6000, nsys -t cuda --cuda-graph-trace=node; llama-bench -p
+  512 -n 0 -r 1 -ngl 99 -fa on profiled in the same hold
+decide-in: rank the fold candidates (norm+quantize, residual epilogue) and the IQ2 rows by ms a step
+decide-below: the step is kernel-bound with no gap term: drop the node-count levers
+decide-above: the gaps are a term: price c_node from the window wall minus the kernel sum

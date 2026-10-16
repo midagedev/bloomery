@@ -1,0 +1,36 @@
+# IQ2_XXS decode cost (round bolt-iq2opt, base bolt-r1m 6cb26b2f): the decode reads a block-shared table (256
+# grid selectors + 128 sign selectors, Iq2XxsTab) and builds each group's eight signed values with one or and
+# two prmt over the magnitudes and their negatives; every output bit as before (host test
+# iq2xxs_table_decode_matches_the_computed_one: all 256 x 128 groups equal the old decode's words).
+# SASS [counted at build time, ptxas 13.3 sm_86, tools/sass-scan.sh --step; not a runtime number]:
+# iq2_xxs_rows one lane-iteration (one 32-value sub-block, m = 1) 191 -> 123 instructions (-36 %), 1528 -> 984
+# a 256-value block; LDG 15 -> 11, + 8 LDS. iq2_xxs_gemv_sel 195 -> 118 a sub-block (-39 %); its prologue +25
+# (the fill and one barrier) a warp. Registers rows 64 -> 64, sel 37 -> 39 (both 4 resp. 6 blocks a SM as
+# before); 1536 B smem a block.
+# L1 data-pipe wavefronts a warp-iteration [derived: 32 random picks; the grid as distinct 128 B lines of 2
+# KB, the table as the worst bank of 32]: base 2 (weights) + 1 (d) + 4 x 14.0 (divergent u64 grid) + 9
+# (activation) = 68; new 3 + 4 x 3.15 (grid words) + 4 x 2.78 (sign words) + 9 = 36.
+# iq2xxs_5376 (shared up, 5376 x 4096, 672 blocks, 256 warp-iterations a SM on 84 SMs) at 1.8 GHz [derived]:
+# base issue 256 x ~224 / 4 = 14.3 k cycles, L1 256 x 68 = 17.4 k, bytes 5.70 MB at 640 GB/s = 8.91 us = 16.0
+# k; measured 13.89 us = 25.0 k = 1.44 x the largest demand. New: issue 256 x ~156 / 4 = 10.0 k, L1 9.2 k,
+# bytes 16.0 k: the byte term is the largest; 1.44 x 10.0 k = 8.0 us sits under it, so 8.9 us at best, 11.5 us
+# if the 1.44 latency factor rides on the byte term's 0.73 of the old.
+# Routed arms [derived, same factor]: up (K 1024, one iteration a warp, prologue-heavy) 0.80..0.92 x their
+# 11.35..17.66 us; down 496x2560 (2.5 iterations) 0.70..0.85 x.
+kind: profile
+question: does the table decode take iq2_xxs_rows' shared-expert up launch from its instruction and L1 terms
+  down to near the byte term on the A6000?
+term: graph_us_mean of bench op=iq2xxs_5376 (gate_iq_sel --bench-kernels --bench-arm iq2xxs_5376,
+  shared/bench.rs: 64-launch graphs, 7 rounds), A6000, this tree beside bolt-r1m's 13.89 us (s1326)
+unit: us
+predict: 8.9..11.5
+condition: one lease (time-gate.sh), BLOOMERY_CARD=a6000, the bench's fixed fill pattern, this tree built with
+  --features gpu; the other iq2xxs arms read from the same run (--bench-arm iq2xxs) against the routed bands
+  in the comments
+decide-in: land the round: the decode is no longer the term; the next lever is the byte term (none on the
+  kernel side)
+decide-below: under the byte term: check the row's bytes against 5.70 MB (an L2 hit across graph launches)
+  before reading it as a win
+decide-above: ncu the arm (tools/ref/ncu-gpu.sh) for l1tex__data_pipe_lsu_wavefronts(_mem_shared),
+  l1tex__data_bank_conflicts_pipe_lsu_mem_shared and the stall split: a table-conflict or block-start-latency
+  term the derivation missed

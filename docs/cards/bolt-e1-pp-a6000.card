@@ -1,0 +1,23 @@
+# Engine's Bolt batched prefill, two candidates beside main d0e8a8e1's prompt (one decode step per id, 82.47 / 81.17
+# tok/s at P = 512, s1642), on the A6000:
+# - E1 bolt-prefill 39fff4df: passes of 448 rows; Q8_0 sites and NVFP4 sites (through a Q8_0 twin requantized at
+#   load) as gemm32 past 8 rows; routed and shared experts through iq2_xxs_gemv_sel. Engine's band [derived]:
+#   500..1000 tok/s at P = 512, the experts' per-slot _sel rereads (~370 GB a 448-row pass) the dominant term.
+# - G1 bolt-prefill-g1 f7063282: E1 rebased on the IQ2_XXS grouped GEMM (routed and shared experts as GEMMs).
+#   Engine's band [derived]: 800..1600 tok/s at P = 512 (the per-slot rereads leave), target >= 820.
+# Both load-checked by engine on the real file (resident 27.41 GB with the Q8_0 twins, 24 greedy ids = --prefill step).
+kind: baseline
+question: how fast do E1's and G1's batched prefills read a 512- and a 4096-id Bolt prompt on the A6000, against
+  main's steps?
+term: pp tok/s @ P = 512 (the row's pp_tok/s), bin arm generate_qwen3moe built at 39fff4df, RTX A6000; the
+  f7063282 arm is read beside it against 800..1600
+unit: tok/s
+predict: 500..1000
+condition: one lease, BLOOMERY_CARD=a6000, BLOOMERY_AB_ROUNDS=2; arms 512 4096 (main) and the two bin arms at 512 and
+  4096; busy tags read beside each mean
+reason: the Bolt speed plan's prefill stage 1; why now: E1 and G1 load on the real file and the lead's deadline is
+  20:40
+decide-in: E1/G1 are the plan's prefill stage 1; G2/G3 and the chunked scan are priced from the gap to llama.cpp's
+  1549 (-ub 512) / 1890 (-ub 1024)
+decide-below: a per-pass term is larger than derived: nsys the pass before the next stage
+decide-above: the experts' L2 reuse covers more than derived: re-derive the next stage's gain
