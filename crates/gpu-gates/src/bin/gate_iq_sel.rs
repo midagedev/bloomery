@@ -2827,8 +2827,11 @@ mod gate {
         let odd = bolt_stack(2, 64, 768, 0xb017_4ef6);
         let (wo, po) = (odd.upload(s, false)?, plane_of(&odd)?);
         let xo = seeded(9 * 768, 9601, -2.0, 4.0);
-        let (act_o, cols_o) = slot_act(c, &xo, 768, 9, 9)?;
-        let sel_o = bolt_sel(1, 2);
+        let (act_o, _c) = slot_act(c, &xo, 768, 9, 9)?;
+        // bolt_sel's ids assume a wide stack (17·t+5 of two experts leaves
+        // the range); this leg's nine slots stay inside its two experts,
+        // with one HOST sentinel for the clean-return row.
+        let sel_o = [0, 1, 1, 0, u32::MAX, 1, 0, 1, 0];
         let (yo_f, fo) = sel_cols(c, &wo, &act_o, &sel_o, 64, 1)?;
         let sel_o_dev = DeviceBuffer::from_host(s, &sel_o)?;
         let mut yo_p = DeviceBuffer::from_host(s, &vec![SENT; sel_o.len() * 64])?;
@@ -2848,43 +2851,6 @@ mod gate {
         let yo_p = yo_p.to_host_vec(s)?;
         let fault_free = fo.is_none() && c.gpu.take_fault()?.is_none();
         let odd_bits = bits_equal(&yo_f, &yo_p) && fault_free;
-        if !odd_bits {
-            // A diagnostic, not a pin: which side leaves the host rule.
-            let host_o = sel_cols_host(&odd, &cols_o, &sel_o, 1);
-            let (hf, hp) = (
-                yo_f.iter()
-                    .zip(&host_o)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count(),
-                yo_p.iter()
-                    .zip(&host_o)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count(),
-            );
-            let first: Vec<usize> = yo_f
-                .iter()
-                .zip(&yo_p)
-                .enumerate()
-                .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
-                .map(|(i, _)| i)
-                .take(4)
-                .collect();
-            let at = |i: usize| {
-                format!(
-                    "i={i} slot={} row={} file={:?} plane={:?} host={:?}",
-                    i / 64,
-                    i % 64,
-                    yo_f.get(i),
-                    yo_p.get(i),
-                    host_o.get(i)
-                )
-            };
-            println!(
-                "bolt_plane_odd_diag differ_vs_host file={hf} plane={hp} of {} | {}",
-                yo_f.len(),
-                first.iter().map(|&i| at(i)).collect::<Vec<_>>().join(" | ")
-            );
-        }
         ok &= odd_bits;
         println!(
             "bolt_plane_odd[IQ2_XXS experts=2 k=768] plane_eq_file_bits={} {}",
