@@ -30,9 +30,9 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertStack, GroupClaims, GroupInput, Lanes, R8Stack, RowLayout,
-    ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack,
-    WarmSpan, Weight, defers, matmul_q, matmul_q_group, matmul_q_group_into_on,
+    self, DEFER_MAX_COLS, ExpertForm, ExpertStack, GroupClaims, GroupInput, Lanes, R8Stack,
+    RowLayout, ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs,
+    UnionStack, WarmSpan, Weight, defers, matmul_q, matmul_q_group, matmul_q_group_into_on,
     matmul_q_group_swiglu, matmul_q_group_swiglu_into_on,
 };
 use crate::profile;
