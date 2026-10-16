@@ -996,19 +996,19 @@ macro_rules! wst_iq2p {
             let (e, rows, n_sb) = ($e as usize, $rows32 as usize, $n_sb32 as usize);
             let slab = $rt * GEMM_BM;
             let last = (rows - slab).min(GEMM_BM) - 1;
-            let row0 = e * rows + slab;
             let tid = $tid;
-            // The expert's words: its qs rows then its d tail.
+            // The expert's words: its qs rows then its d tail, addressed by
+            // the expert's own rows (the bases hold the expert).
             let (qs0, dh0) = (e * rows * n_sb * 33 / 2, e * rows * n_sb * 33 / 2 + rows * 16 * n_sb);
             // A thread's 16-byte chunk: row tid / 2 of the slab, the run's
             // half tid & 1. This warp's two rows, clamped to the last live
             // row, and their d word bases.
-            let (ca, c) = (row0 + (tid / 2).min(last), tid % 2);
-            let ra = (row0 + 16 * $wid + $g).min(row0 + last);
+            let (ca, c) = (slab + (tid / 2).min(last), tid % 2);
+            let ra = (slab + 16 * $wid + $g).min(slab + last);
             (
                 qs0 + ca * 16 * n_sb + 4 * c,
                 dh0 + ra * n_sb / 2,
-                dh0 + (ra + 8).min(row0 + last) * n_sb / 2,
+                dh0 + (ra + 8).min(slab + last) * n_sb / 2,
                 (tid / 2) * WTP_ROW_W + 4 * c,
                 (16 * $wid + $g) * WTP_ROW_W,
             )
