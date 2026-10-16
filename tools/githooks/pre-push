@@ -1,0 +1,13 @@
+#!/bin/bash
+# Delegator (tools/board/README.md): core.hooksPath=tools/githooks replaces the machine's global hooks, so each hook here
+# hands over to ~/.config/git/hooks/<name> first. That one runs the banned-word check and then the repo's own
+# .git/hooks/<name> (pre-push: fmt and check-*.sh), with stdin and arguments intact. Without the global hook, the repo's
+# own is called here. The same file serves pre-commit, commit-msg and pre-push (the name is $0's).
+name=$(basename "$0")
+g="$HOME/.config/git/hooks/$name"
+if [ -x "$g" ]; then
+    exec "$g" "$@"
+fi
+own="$(git rev-parse --git-common-dir)/hooks/$name"
+[ -x "$own" ] && exec "$own" "$@"
+exit 0

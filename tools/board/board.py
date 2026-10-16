@@ -24,6 +24,7 @@ Exit: 0 ok; 1 a source failed, the body is over GitHub's size limit, or the publ
 import argparse
 import dataclasses
 import datetime as dt
+import fcntl
 import io
 import json
 import os
@@ -31,6 +32,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 STATES = ("building", "static", "batch", "ab", "landing", "landed")
 QUIET_S = 3 * 3600  # a batch that has been quiet this long is shown as such
@@ -47,6 +49,10 @@ COMMENT_DAYS = 7  # an issue is listed while its last non-maintainer comment is 
 WORKER_LINES = 6
 ROLES = ("leader", "vision", "unitier", "common", "quant", "toktape")  # the session names that are workers
 NOTE_FRESH_S = 30 * 60  # a hand-written worker note newer than this shows in full; older, its first line as stale
+EVENTS_KEEP = 2000  # the newest lines of events.jsonl that are read
+EVENTS_ROTATE_BYTES = 5 * 1024 * 1024  # a log over this is renamed to events.jsonl.1 on read
+AGENT_STALE_S = 6 * 3600  # a subagent start with no stop this old is shown as "stale?"
+REPORT_MAX = 160
 BUSY_QUIET_S = 30 * 60  # a session that is not idle and has not changed status this long is flagged
 # Only the lead's landing batches (--ledger) stand for a train; a round's batch (--round-ledger) ran on a round's tree.
 DERIVE_MODES = ("lead",)
@@ -77,6 +83,7 @@ PRIVACY = (
     ("gh-token", r"ghp_"),
     ("token-assign", r"(?i)\btoken\b\s*[:=]"),
     ("bearer", r"(?i)bearer\s+\S"),
+    ("socket", r"uds:|/tmp/cc-socks|\.sock\b"),
 )
 PRIVACY_RES = tuple((name, re.compile(rx)) for name, rx in PRIVACY)
 
@@ -262,6 +269,8 @@ class Train:
     at: dt.datetime  # the file's mtime (when the lead last wrote it); a landed train: the newest of that, its head commit and its batch
     head: str = ""  # the branch head's hash when the branch is on origin/main
     derived: bool = False  # a batch's branch with no train file
+    tip: str = ""  # the newest commit event's hash on the branch (the post-commit hook), not yet on origin/main
+    tip_at: dt.datetime = None
 
 
 def read_trains(root):
@@ -382,11 +391,12 @@ def landing(tree, branch, base):
     return head[:8], parse_ts(out.strip()) if rc == 0 and out.strip() else None
 
 
-def resolve_trains(file_trains, batches, tree, now):
+def resolve_trains(file_trains, batches, tree, now, commits=None):
     """The trains shown. A trains/*.json is the lead's override of the facts below; a lead-mode batch whose branch has no
     train file makes a train of its own (named by the branch). The state is the file's if it names one, else the newest
     batch's. A branch on origin/main renders as landed whatever the file says, and a landed train drops off a day after
-    the newest of its file write, its head commit and its batch."""
+    the newest of its file write, its head commit and its batch. `commits` ({branch: (time, hash)}, from the post-commit
+    hook's events) moves a train's tip and time to its branch's newest commit."""
     newest = {}  # branch -> its newest batch (batches are newest first)
     for x in batches:
         newest.setdefault(x.start.get("branch") or "", x)
@@ -405,6 +415,10 @@ def resolve_trains(file_trains, batches, tree, now):
         if lr:
             t.head, t.state = lr[0], "landed"
             t.at = max([t.at, *(v for v in (lr[1], x.last if x else None) if v)])
+        c = (commits or {}).get(t.branch) if t.branch not in NOT_TRAIN_BRANCHES else None
+        if c and not lr:
+            t.tip, t.tip_at = c[1], c[0]
+            t.at = max(t.at, c[0])
         t.state = t.state or "unknown"
         if t.state == "landed" and (now - t.at).total_seconds() > DROP_S:
             continue
@@ -514,6 +528,11 @@ class Worker:
     tree: str = ""  # the cwd's last component when no other session shares it: compared with a batch's tree, never shown
     note: list = dataclasses.field(default_factory=list)  # workers/<role>.md, the non-blank lines
     note_at: dt.datetime = None
+    report: str = ""  # the newest msg event from this session (the SendMessage hook): its first line
+    report_at: dt.datetime = None
+    report_to: str = ""
+    rounds: list = dataclasses.field(default_factory=list)  # [(agent_type, started)] of subagent starts with no stop yet
+    stale_rounds: int = 0  # starts older than AGENT_STALE_S with no stop
 
 
 def pid_alive(pid):
@@ -587,6 +606,95 @@ def read_workers(root, sessions, roles):
             w.note, w.note_at = notes.get(role, ([], None))
             out.append(w)
     return out, problems
+
+
+# ----------------------------------------------------------------------------------------------
+# the event log: what the hooks saw (tools/board/hook.py, tools/githooks/post-commit)
+# ----------------------------------------------------------------------------------------------
+EVENT_KINDS = ("msg", "agent", "commit")
+
+
+def read_events(root):
+    """(events oldest first, problems): the newest EVENTS_KEEP lines of events.jsonl (and of events.jsonl.1, the log a
+    rotation renamed). A log over EVENTS_ROTATE_BYTES is renamed to .1 here, never by a hook. An event is the line's dict
+    plus `t`, its time; a line that is no JSON object with an integer ts and a string kind is counted, an unknown kind is
+    ignored (a newer hook may write it)."""
+    path = os.path.join(root, "events.jsonl")
+    problems = []
+    try:
+        if os.stat(path).st_size > EVENTS_ROTATE_BYTES:
+            os.replace(path, path + ".1")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        problems.append(f"events.jsonl: {e.strerror or type(e).__name__}")
+    raw = []
+    for p in (path + ".1", path):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                raw += fh.read().splitlines()[-EVENTS_KEEP:]
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            problems.append(f"{os.path.basename(p)}: {e.strerror or type(e).__name__}")
+    out, bad = [], 0
+    for ln in raw[-EVENTS_KEEP:]:
+        if not ln.strip():
+            continue
+        try:
+            j = json.loads(ln)
+            if not isinstance(j, dict) or not isinstance(j["ts"], int) or isinstance(j["ts"], bool) or not isinstance(j["kind"], str):
+                raise ValueError
+            j["t"] = epoch_ms(j["ts"])
+        except (ValueError, KeyError, TypeError, OverflowError, OSError):
+            bad += 1
+            continue
+        if j["kind"] in EVENT_KINDS:
+            out.append(j)
+    if bad:
+        problems.append(f"events.jsonl: {bad} unreadable line(s)")
+    out.sort(key=lambda e: e["t"])
+    return out, problems
+
+
+def role_name(s):
+    return re.sub(r"\s*\(\d+\)$", "", str(s))
+
+
+def attach_events(workers, events, now):
+    """Each worker's last report (its newest msg event), and its subagent starts with no stop: in flight, or past
+    AGENT_STALE_S, stale. A start older than DROP_S is forgotten."""
+    for w in workers:
+        msgs = [e for e in events if e["kind"] == "msg" and role_name(e.get("from", "")) == w.role]
+        if msgs:
+            e = msgs[-1]
+            w.report, w.report_at, w.report_to = str(e.get("text", "")), e["t"], str(e.get("to", ""))
+        open_ = {}
+        for e in events:
+            if e["kind"] != "agent" or role_name(e.get("parent", "")) != w.role:
+                continue
+            key = (str(e.get("type", "")), str(e.get("id", "")))
+            if e.get("phase") == "start":
+                open_[key] = e["t"]
+            elif e.get("phase") == "stop":
+                open_.pop(key, None)
+        for (typ, _), t in sorted(open_.items(), key=lambda kv: kv[1]):
+            age = (now - t).total_seconds()
+            if age > DROP_S:
+                continue
+            if age > AGENT_STALE_S:
+                w.stale_rounds += 1
+            else:
+                w.rounds.append((typ, t))
+
+
+def newest_commits(events):
+    """{branch: (time, hash)} of the newest commit event on each branch."""
+    out = {}
+    for e in events:
+        if e["kind"] == "commit" and isinstance(e.get("branch"), str) and isinstance(e.get("sha"), str):
+            out[e["branch"]] = (e["t"], e["sha"])
+    return out
 
 
 # ----------------------------------------------------------------------------------------------
@@ -667,19 +775,22 @@ class Board:
     log: list  # None when unavailable
     problems: dict  # source -> [what failed]: shown in its section, and exit 1
     gh_off: bool = False
+    events: list = dataclasses.field(default_factory=list)
 
 
 def collect(a, now):
     e_fetch = git_fetch(a.tree)  # first: a branch landed since the last fetch must show as landed
     file_trains, p1 = read_trains(a.dir)
     batches, p2 = read_batches(a.dir, now)
-    trains = resolve_trains(file_trains, batches, a.tree, now)
+    events, p5 = read_events(a.dir)
+    trains = resolve_trains(file_trains, batches, a.tree, now, newest_commits(events))
     workers, p3 = read_workers(a.dir, a.sessions, a.roles)
+    attach_events(workers, events, now)
     release, p4 = read_release(a.dir)
     if release is not None:
         release.tagged, release.tag_at, why = release_tag(a.tree, release.version)
         p4 += [why] if why else []
-    problems = {"trains": p1, "batches": p2, "workers": p3, "release": p4, "gh": [], "log": []}
+    problems = {"trains": p1, "batches": p2, "workers": p3, "release": p4, "gh": [], "log": [], "events": p5}
     prs = issues = None
     if not a.no_gh:
         repo = a.repo or repo_slug(a.tree)
@@ -700,7 +811,7 @@ def collect(a, now):
     log, e = git_log(a.tree)
     if e:
         problems["log"].append(e)
-    return Board(trains, batches, workers, release, prs, issues, log, problems, a.no_gh)
+    return Board(trains, batches, workers, release, prs, issues, log, problems, a.no_gh, events)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -825,7 +936,8 @@ def worker_lines(w, b, now):
         head = f"idle since {clock(w.since, now)}"
     else:
         head = w.status
-    quiet = w.updated is not None and w.alive and w.status != "idle" and (now - w.updated).total_seconds() > BUSY_QUIET_S
+    last = max((v for v in (w.updated, w.report_at, w.note_at) if v), default=None)  # a report or a note is a sign of life
+    quiet = last is not None and w.alive and w.status != "idle" and (now - last).total_seconds() > BUSY_QUIET_S
     L = [f"### {code(w.role)}: {head}" + (", **quiet 30+ min**" if quiet else ""), ""]
     if w.updated is not None:
         facts = [f"registry updated {ago((now - w.updated).total_seconds())} ({clock(w.updated, now)})"]
@@ -837,6 +949,12 @@ def worker_lines(w, b, now):
         if mine:
             facts.append(f"newest batch {code(mine.name)}: {batch_status(mine, now)}, {batch_progress(mine, now)}")
         L.append("- " + "; ".join(facts))
+    if w.report:
+        L.append(f"- last report {clock(w.report_at, now)}" + (f" (to {code(w.report_to)})" if w.report_to else "") + f": {cut(one_line(w.report), REPORT_MAX)}")
+    if w.rounds or w.stale_rounds:
+        names = ", ".join(sorted(t or "agent" for t, _ in w.rounds))
+        L.append("- rounds in flight: " + (f"{len(w.rounds)} ({names})" if w.rounds else "0")
+                 + (f"; {w.stale_rounds} started over 6 h ago with no stop, stale?" if w.stale_rounds else ""))
     if w.note:
         text = [re.sub(r"^[-*]\s+", "", ln.strip()) for ln in w.note]
         if (now - w.note_at).total_seconds() <= NOTE_FRESH_S:
@@ -844,7 +962,7 @@ def worker_lines(w, b, now):
             L += [f"  - {one_line(ln)}" for ln in text[:WORKER_LINES]]
             if len(text) > WORKER_LINES:
                 L.append(f"  - … {len(text) - WORKER_LINES} more line(s) not shown")
-        else:
+        elif not (w.report_at and w.report_at > w.note_at):  # a newer report supersedes an old note
             L.append(f"- (note from {clock(w.note_at, now)}, stale) {cut(text[0], SUBJECT_MAX)}")
     return L + [""]
 
@@ -869,7 +987,8 @@ def render(b, now):
         L += ["_No trains in flight._", ""]
     for t in b.trains[: LIST_MAX["trains"]]:
         L += [f"### {code(t.name)}: {t.state}", f"updated {clock(t.at, now)}; branch {code(t.branch or '-')} on base {code(t.base or '-')}"
-              + (f"; on origin/main at {code(t.head)}" if t.head else "") + (f"; {one_line(t.note)}" if t.note else ""), ""]
+              + (f"; on origin/main at {code(t.head)}" if t.head else "")
+              + (f"; branch head {code(t.tip)} committed {clock(t.tip_at, now)}" if t.tip else "") + (f"; {one_line(t.note)}" if t.note else ""), ""]
         for p in t.pieces[: LIST_MAX["pieces"]]:
             pr = f" #{p['pr']}" if p.get("pr") else ""
             L.append(f"- {one_line(p['what'])} ({one_line(p.get('owner', '?'))}){pr}")
@@ -968,6 +1087,8 @@ def finish(lines, patterns=PRIVACY_RES):
 def parser():
     ap = argparse.ArgumentParser(prog="board.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--publish", metavar="ISSUE", help="replace this issue's body instead of printing it")
+    ap.add_argument("--debounce", type=int, metavar="SECONDS", help="with --publish: publish at most once per SECONDS. A run inside the "
+                    "window waits it out and publishes then; a run that finds another waiting leaves it a mark and exits 0")
     ap.add_argument("--board-issue", metavar="ISSUE", help="the board's own issue, left out of the issue list (--publish implies it; "
                     "a preview names it to print what --publish would send)")
     ap.add_argument("--self-test", action="store_true")
@@ -992,13 +1113,50 @@ def parse(argv):
     return a
 
 
+SLEEP = time.sleep  # the self-test replaces it
+STAMP, AGAIN, LOCK = "last-publish", "publish-again", "publish.lock"
+
+
 def main(argv, now=None):
     a = parse(argv)
     for flag, v in (("--publish", a.publish), ("--board-issue", a.board_issue)):
         if v is not None and not v.isdigit():
             print(f"board.py: {flag} takes an issue number", file=sys.stderr)
             return 64
-    now = now or dt.datetime.now().astimezone()
+    if a.debounce is not None and (a.publish is None or a.debounce < 0):
+        print("board.py: --debounce takes SECONDS >= 0 and needs --publish", file=sys.stderr)
+        return 64
+    if a.debounce is None:
+        return once(a, now or dt.datetime.now().astimezone())
+    # Trailing debounce. One run holds the lock, waits out the window since the last publish, then renders and publishes,
+    # so what changed while it waited is in its body. A run that finds the lock held leaves a mark and exits: the holder
+    # clears the mark before it renders, and runs again if one was left while it rendered or published.
+    os.makedirs(a.dir, exist_ok=True)
+    again = os.path.join(a.dir, AGAIN)
+    with open(os.path.join(a.dir, LOCK), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            open(again, "w").close()
+            return 0
+        rc = 0
+        while True:
+            try:
+                wait = a.debounce - (time.time() - os.stat(os.path.join(a.dir, STAMP)).st_mtime)
+            except FileNotFoundError:
+                wait = 0
+            if wait > 0:
+                SLEEP(wait)
+            try:
+                os.remove(again)
+            except FileNotFoundError:
+                pass
+            rc = once(a, now or dt.datetime.now().astimezone())
+            if not os.path.exists(again):
+                return rc
+
+
+def once(a, now):
     board = collect(a, now)
     rc = 0
     for ps in board.problems.values():
@@ -1026,6 +1184,13 @@ def main(argv, now=None):
     if prc != 0:
         print(f"board.py: gh issue edit {a.publish} failed (exit {prc}): {one_line(err)[:200]}", file=sys.stderr)
         return 1
+    try:
+        os.makedirs(a.dir, exist_ok=True)
+        with open(os.path.join(a.dir, STAMP), "w"):
+            pass
+    except OSError as e:
+        print(f"board.py: {STAMP}: {e.strerror or type(e).__name__}", file=sys.stderr)
+        rc = 1
     return rc
 
 
@@ -1062,6 +1227,7 @@ PRIVACY_SAMPLES = {
     "gh-token": "key gh" + "p_abcdef leaked",
     "token-assign": "my TOKEN: abc is here",
     "bearer": "Authorization: Bearer abcdef",
+    "socket": "to uds:" + "/tmp/cc-socks/9.sock now",
 }
 CLEAN = (
     "- #12 `a plain title` by `someone`: not yet picked",
@@ -1102,6 +1268,7 @@ if sub.replace(" ", "-") in fail:
     sys.exit(1)
 if sub == "issue edit":
     json.dump({{"argv": sys.argv[1:], "body": sys.stdin.read()}}, open(state + "/edit.json", "w"))
+    open(state + "/edits.log", "a").write("edit\\n")
 elif sub in ("pr list", "issue list"):
     sys.stdout.write(open(state + "/" + sub.split()[0] + ".json").read())
 else:
@@ -1358,6 +1525,135 @@ def auto_cases(c, tmp, now):
     write(os.path.join(wroot, "workers/quant.md"), "round: x\nran on ws and ~" + "/repo\n", now, 60)
     text = render_of(wargs)[1]
     c.check("privacy: a worker note naming a host and a home is withheld from the full body", "ran on ws" not in text and "~/" not in text and text.endswith("\n1 lines withheld\n"), text[-120:])
+
+
+def hook_cases(c, tmp, now):
+    """The event log (boardhooks, 2026-10-12): msg, agent and commit events from the hooks, and the publish debounce. Each case
+    goes through collect/render/finish, so each is red on a board.py that reads no events.jsonl."""
+    ago_s = lambda s: now - dt.timedelta(seconds=s)
+    ms = lambda s: int(ago_s(s).timestamp() * 1000)
+    root, sess = os.path.join(tmp, "e-board"), os.path.join(tmp, "e-sessions")
+    os.makedirs(sess)
+    live = os.getpid()
+    for n, (name, status, age) in enumerate((("quant", "busy", 3600), ("leader", "busy", 120), ("vision", "busy", 3600), ("common", "idle", 3600)), 1):
+        write(os.path.join(sess, f"{n}.json"), json.dumps({"pid": live, "sessionId": f"s{n}", "cwd": "/Users" + f"/zz/{name}", "name": name,
+              "status": status, "kind": "interactive", "startedAt": ms(86400), "updatedAt": ms(age), "statusUpdatedAt": ms(age)}))
+    write(os.path.join(root, "workers/vision.md"), "old note\n", now, 3 * 3600)
+
+    def event(age, kind, **kw):
+        return json.dumps({"ts": ms(age), "kind": kind, **kw})
+
+    def log(*lines, tail=""):
+        write(os.path.join(root, "events.jsonl"), "\n".join(lines) + "\n" + tail)
+
+    args = ["--dir", root, "--tree", os.path.join(tmp, "no-such-tree"), "--no-gh", "--sessions", sess]
+
+    def view(argv=args):
+        b = capture(collect, parse(argv), now)[0]
+        return b, finish(render(b, now))[0]
+
+    def worker(text, role):
+        return block(text, f"### `{role}`")
+
+    # ---- msg: the last report, and what quiet reads
+    log(event(5000, "msg", **{"from": "quant", "to": "leader", "text": "first report"}),
+        event(600, "msg", **{"from": "quant", "to": "leader", "text": "round done: 3 gates green"}),
+        event(300, "msg", **{"from": "leader", "to": "quant", "text": "ack, go on"}))
+    b, text = view()
+    q = worker(text, "quant")
+    c.check("events: the newest msg from a worker is its last report, with its time and target",
+            "- last report 14:50 (to `leader`): round done: 3 gates green" in q and "first report" not in q, q)
+    c.check("events: a worker's report is its own, not another's", "ack, go on" in worker(text, "leader") and "ack, go on" not in q, text)
+    c.check("events: a busy worker whose registry is an hour old is not quiet after a report ten minutes ago", "quiet 30+ min" not in q, q)
+    c.check("events: a busy worker with no report and no note is still quiet", "### `vision`: busy, **quiet 30+ min**" in worker(text, "vision"), worker(text, "vision"))
+    log(event(5000, "msg", **{"from": "vision", "to": "leader", "text": "vision update"}))
+    c.check("events: a busy worker whose last report is old is quiet", "quiet 30+ min" in worker(view()[1], "vision"), worker(view()[1], "vision"))
+    write(os.path.join(root, "workers/quant.md"), "- x\n", now, 60)
+    log()
+    c.check("events: a fresh note file counts as a sign of life for quiet", "quiet 30+ min" not in worker(view()[1], "quant"), worker(view()[1], "quant"))
+    os.remove(os.path.join(root, "workers/quant.md"))
+    log(event(5000, "msg", **{"from": "vision", "to": "leader", "text": "newer than the old note"}).replace(str(ms(5000)), str(ms(600))))
+    v = worker(view()[1], "vision")
+    c.check("events: a report newer than a stale note replaces the note line", "newer than the old note" in v and "stale)" not in v, v)
+
+    # ---- agents: rounds in flight, stale
+    log(event(7200, "agent", phase="start", id="a1", type="Explore", parent="common"),
+        event(3600, "agent", phase="stop", id="a1", type="Explore", parent="common"),
+        event(1800, "agent", phase="start", id="a2", type="round", parent="common"),
+        event(900, "agent", phase="start", id="a3", type="Explore", parent="common"),
+        event(7 * 3600, "agent", phase="start", id="a4", type="general-purpose", parent="common"),
+        event(600, "agent", phase="start", id="a5", type="round", parent="leader"))
+    b, text = view()
+    cm, ld = worker(text, "common"), worker(text, "leader")
+    c.check("events: a start with no stop is a round in flight, a stopped one is not", "- rounds in flight: 2 (Explore, round)" in cm, cm)
+    c.check("events: a start older than 6 h with no stop is stale, not in flight", "1 started over 6 h ago with no stop, stale?" in cm, cm)
+    c.check("events: rounds are counted per parent", "- rounds in flight: 1 (round)" in ld and "stale?" not in ld, ld)
+    log(event(2 * 86400, "agent", phase="start", id="a6", type="Plan", parent="common"))
+    c.check("events: a start from over a day ago is forgotten", "rounds in flight" not in worker(view()[1], "common"), worker(view()[1], "common"))
+
+    # ---- commit: the train's head and time
+    write(os.path.join(root, "trains/tc.json"), json.dumps({"name": "tc", "branch": "tc", "base": "", "state": "building", "pieces": []}), now, 7200)
+    write(os.path.join(root, "trains/td.json"), json.dumps({"name": "td", "branch": "td", "base": "", "state": "building", "pieces": []}), now, 7200)
+    log(event(1500, "commit", branch="tc", sha="aaaa1111", subject="x", tree="t"),
+        event(500, "commit", branch="tc", sha="bbbb2222", subject="y", tree="t"),
+        event(400, "commit", branch="main", sha="cccc3333", subject="z", tree="t"),
+        event(300, "commit", branch="other", sha="dddd4444", subject="z", tree="t"))
+    b, text = view()
+    tc = block(text, "### `tc`")
+    c.check("events: the newest commit event on a train's branch is its head and its time",
+            "branch head `bbbb2222` committed 14:51" in tc and "updated 14:51;" in tc and "aaaa1111" not in tc, tc)
+    c.check("events: a train with no commit event, the trunk and a branch with no train change nothing",
+            "branch head" not in block(text, "### `td`") and "cccc3333" not in text and "dddd4444" not in text, text)
+
+    # ---- the log: bad lines, rotation, unknown kinds
+    log(event(60, "msg", **{"from": "leader", "to": "quant", "text": "fine"}), "{broken", '{"ts": "x", "kind": "msg"}', event(50, "future", x=1))
+    b = view()[0]
+    c.check("events: unreadable lines are counted, an unknown kind is ignored", b.problems["events"] == ["events.jsonl: 2 unreadable line(s)"], b.problems["events"])
+    log(*[event(10000 - i, "msg", **{"from": "leader", "to": "x", "text": f"m{i}"}) for i in range(EVENTS_KEEP + 50)])
+    evs = read_events(root)[0]
+    c.check("events: only the newest 2000 lines are read", len(evs) == EVENTS_KEEP and evs[-1]["text"] == f"m{EVENTS_KEEP + 49}", len(evs))
+    big = os.path.join(root, "events.jsonl")
+    with open(big, "a") as fh:
+        fh.truncate(EVENTS_ROTATE_BYTES + 1)
+    read_events(root)
+    c.check("events: a log over 5 MiB is renamed to events.jsonl.1 and the new log starts empty",
+            os.path.exists(big + ".1") and not os.path.exists(big), os.listdir(root))
+    os.remove(big + ".1")
+
+    # ---- privacy: a socket path and a host name in a message's first line
+    log(event(60, "msg", **{"from": "leader", "to": "quant", "text": "listening on uds:" + "/tmp/cc-socks/1.sock"}),
+        event(30, "msg", **{"from": "quant", "to": "leader", "text": "ran on ws and sihyung"}))
+    b, text = view()
+    c.check("events: a message naming a socket path or a host is withheld from the body, and the session id never rendered",
+            "cc-socks" not in text and "sihyung" not in text and "ran on ws" not in text and "s1" not in re.findall(r"\bs\d\b", text), text[-300:])
+
+    # ---- debounce
+    state = os.path.join(tmp, "d-gh")
+    os.makedirs(state)
+    write(os.path.join(state, "pr.json"), "[]")
+    write(os.path.join(state, "issue.json"), "[]")
+    gh = os.path.join(tmp, "d-gh-bin")
+    stub_gh(gh, state)
+    droot = os.path.join(tmp, "d-board")
+    dargs = ["--dir", droot, "--tree", os.path.join(tmp, "no-such-tree"), "--repo", "o/n", "--gh", gh, "--sessions", sess, "--publish", "99"]
+    edits = lambda: len(open(os.path.join(state, "edits.log")).read().split()) if os.path.exists(os.path.join(state, "edits.log")) else 0
+    global SLEEP
+    real_sleep, slept, inner = SLEEP, [], []
+    SLEEP = lambda s: (slept.append(s), inner.append(capture(main, [*dargs, "--debounce", "60"], now)[0]))
+    try:
+        attempt(c, "debounce: with no earlier publish the run publishes at once", lambda: (
+            (lambda r: edits() == 1 and not slept and os.path.exists(os.path.join(droot, STAMP)))(capture(main, [*dargs, "--debounce", "60"], now)[0]),
+            f"edits={edits()} slept={slept}"))
+        utime(os.path.join(droot, STAMP), now, 0)
+        os.utime(os.path.join(droot, STAMP), (time.time() - 10, time.time() - 10))
+        attempt(c, "debounce: a change inside the window waits it out, and a second change meanwhile does not publish again", lambda: (
+            (lambda r: edits() == 2 and len(slept) == 1 and 45 <= slept[0] <= 50 and inner == [0])(capture(main, [*dargs, "--debounce", "60"], now)[0]),
+            f"edits={edits()} slept={slept} inner={inner}"))
+        c.check("debounce: the mark a waiting run left is cleared", not os.path.exists(os.path.join(droot, AGAIN)), os.listdir(droot))
+        rc, _, err = capture(main, ["--debounce", "5"], now)
+        c.check("debounce: --debounce without --publish is a usage error", rc == 64 and "needs --publish" in err, (rc, err))
+    finally:
+        SLEEP = real_sleep
 
 
 def self_test():
@@ -1646,6 +1942,7 @@ def run_cases():
                 text.startswith("```text\n") and 2 <= len(block) <= ART_ROWS + 2 and max(len(ln) for ln in block) <= ART_COLS and text.index("```text") < text.index("## Release"), text[:300])
 
         auto_cases(c, tmp, now)
+        hook_cases(c, tmp, now)
 
     print(f"self-test: {'FAIL' if c.bad else 'ok'} ({c.n} cases, {c.bad} failed)")
     return 1 if c.bad else 0

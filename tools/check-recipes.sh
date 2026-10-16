@@ -392,6 +392,7 @@ blk_pytools() {
     "tools/bloomery/rows.py --self-test"
     "tools/bloomery/route_trace.py --self-test"
     "tools/board/board.py --self-test"
+    "tools/board/hook.py --self-test"
     "tools/boxq-check.py --self-test"
     "tools/boxq.py --self-test"
     "tools/check-comment-only.py --self-test"

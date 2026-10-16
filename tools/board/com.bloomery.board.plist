@@ -13,7 +13,7 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>GH_TOKEN=$(gh auth token --user @GHUSER@) || exit 1; export GH_TOKEN; exec @PYTHON@ @REPO@/tools/board/board.py --publish @ISSUE@</string>
+    <string>GH_TOKEN=$(gh auth token --user @GHUSER@) || exit 1; export GH_TOKEN; exec @PYTHON@ @REPO@/tools/board/board.py --publish @ISSUE@ --debounce 60</string>
   </array>
   <key>WorkingDirectory</key>
   <string>@REPO@</string>
@@ -22,8 +22,9 @@
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
-  <!-- Event-driven: launchd runs the job when a state file changes (a writer's start, end or landing), throttled to
-       one run per ThrottleInterval; the interval is only the fallback for gh-side changes (new PRs and comments). -->
+  <!-- Event-driven: launchd runs the job when a state file changes (a writer's start, end or landing) or a hook appends to
+       events.jsonl, throttled to one run per ThrottleInterval; board.py --debounce 60 then publishes at most once a
+       minute (a run inside the window waits it out); the interval is only the fallback for gh-side changes (new PRs and comments). -->
   <key>WatchPaths</key>
   <array>
     <string>@HOME@/.cache/bloomery/board/KICK</string>
@@ -31,6 +32,7 @@
     <string>@HOME@/.cache/bloomery/board/trains</string>
     <string>@HOME@/.cache/bloomery/board/workers</string>
     <string>@HOME@/.cache/bloomery/board/batch</string>
+    <string>@HOME@/.cache/bloomery/board/events.jsonl</string>
   </array>
   <key>ThrottleInterval</key>
   <integer>15</integer>

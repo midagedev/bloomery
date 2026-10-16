@@ -165,3 +165,31 @@ keyring at run time; launchd runs no shell hook, so it cannot rely on the active
 
     launchctl bootout gui/$(id -u)/com.bloomery.board
     rm ~/Library/LaunchAgents/com.bloomery.board.plist
+
+## Event hooks (boardhooks)
+
+The sessions and git feed `~/.cache/bloomery/board/events.jsonl` (one JSON line per event, one atomic append, never
+blocking a caller; errors go to `hook-errors.log`). board.py reads the newest 2 000 lines and renames a log over 5 MiB
+to `events.jsonl.1`.
+
+| Event | Writer | Board |
+|---|---|---|
+| `msg` | Claude Code `PostToolUse`, matcher `SendMessage` (`hook.py msg`): sender name from the session registry, target role (`other` if it is no plain name), first line cut to 200 | the worker's `last report` line; it counts for `quiet 30+ min` with the registry's update and the note file's mtime; a report newer than a stale note replaces the note line |
+| `agent` | `SubagentStart` / `SubagentStop` (`hook.py agent-start|agent-stop`): agent_type, agent_id, parent name. The docs list no name or model for these events | `rounds in flight: N (types)` per parent; a start with no stop for 6 h is `stale?`; a start over a day old is forgotten |
+| `commit` | `tools/githooks/post-commit`: branch, short hash, subject, worktree dir | a train row whose branch has a commit event shows `branch head <hash> committed HH:MM` and takes that time |
+
+Event strings go through the same privacy filter as every line (a socket path `uds:` / `.sock` is withheld too). A session
+id is never stored (an unknown session is `s:` and its first 8 characters) and never rendered.
+
+Install (the lead; none of it is done by the round that wrote it):
+
+    tools/board/install-hooks.sh                       # merges tools/board/claude-hooks.json into ~/.claude/settings.json
+                                                       # (backup first, idempotent, --uninstall, --settings FILE)
+    git config core.hooksPath tools/githooks           # post-commit for every worktree; the repo must set neither
+                                                       # core.hooksPath nor .git/hooks/post-commit already
+    # launchd: the plist install above, again (it now watches events.jsonl and runs board.py --publish N --debounce 60)
+    launchctl bootout gui/$(id -u)/com.bloomery.board; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bloomery.board.plist
+
+`--debounce SECONDS` (with `--publish`): one run holds `publish.lock`, waits out the window since `last-publish`, then renders
+and publishes, so what changed meanwhile is in its body; a run that finds the lock held leaves `publish-again` and exits 0,
+and the holder runs once more if the mark appears after it started to render.

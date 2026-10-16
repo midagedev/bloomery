@@ -1,0 +1,27 @@
+#!/bin/bash
+# The board's commit event (tools/board/README.md): one line in ~/.cache/bloomery/board/events.jsonl per commit, in any
+# worktree of this repo. The work (one git call, one date, one tr: ~80 ms of process starts) runs detached, so the commit
+# waits only for the shell's start; it never fails a commit (exit 0 on every path, errors go to hook-errors.log).
+# Installed by `git config core.hooksPath tools/githooks`.
+d=${BOARD_EVENTS_DIR:-$HOME/.cache/bloomery/board}
+mkdir -p "$d" 2>/dev/null || exit 0
+(
+    (
+    IFS=$'\037' read -r sha refs subject < <(git log -1 --format=$'%h\037%D\037%s' HEAD)
+    branch=HEAD # %D opens with `HEAD -> <branch>` on a branch and with `HEAD` when detached
+    case $refs in "HEAD -> "*) branch=${refs#HEAD -> }; branch=${branch%%,*} ;; esac
+    tree=${PWD##*/}
+    json() { # a JSON string body: backslash and quote escaped
+        local s=${1:0:$2}
+        s=${s//\\/\\\\}
+        REPLY=${s//\"/\\\"}
+    }
+    json "$branch" 100; b=$REPLY
+    json "$sha" 12; h=$REPLY
+    json "$subject" 120; s=$REPLY
+    json "$tree" 100; t=$REPLY
+    printf '{"ts":%s000,"kind":"commit","branch":"%s","sha":"%s","subject":"%s","tree":"%s"}\n' "$(date +%s)" "$b" "$h" "$s" "$t" |
+        LC_ALL=C tr -d '\000-\011\013-\037' >>"$d/events.jsonl"
+    ) 2>>"$d/hook-errors.log"
+) >/dev/null 2>&1 </dev/null &
+exit 0

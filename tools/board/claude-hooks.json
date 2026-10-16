@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "SendMessage",
+        "hooks": [{"type": "command", "command": "python3 @REPO@/tools/board/hook.py msg", "timeout": 5}]
+      }
+    ],
+    "SubagentStart": [
+      {"hooks": [{"type": "command", "command": "python3 @REPO@/tools/board/hook.py agent-start", "timeout": 5}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "python3 @REPO@/tools/board/hook.py agent-stop", "timeout": 5}]}
+    ]
+  }
+}
