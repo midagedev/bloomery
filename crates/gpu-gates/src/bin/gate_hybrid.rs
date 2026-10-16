@@ -52,13 +52,14 @@
 //! The card's slot list (`card_sel`) on the same boundary: an id past the
 //! card's prefix is written `HOST` with the word clean, and an id past the
 //! whole stack is written `HOST` and raises the layer's `ExpertId`.
-//! The card's routed combine (`weighted_sum_card`) there, nine slots a token:
-//! with every place a card slot it is `weighted_sum` bit for bit; with HOST
-//! slots (their down rows NaN, unread by the contract) the kept slots give
-//! the host transcription of the rule bit for bit — fused, the fma the device
-//! compiles both kernels' `acc += w·down` to; a place in `[n_card, HOST)`
-//! raises the layer's `ExpertId` and NaNs every value of its token, the
-//! other tokens the transcription.
+//! The card's routed combine (`ds41_ffn_card_acc_9`, the card slots' family
+//! at nine) there, nine slots a token: with every place a card slot it is
+//! `weighted_sum` bit for bit; with HOST slots (their down rows NaN, unread
+//! by the contract) the kept slots give the oracle `card_sum` bit for bit —
+//! fused, the fma the device compiles both kernels' `acc += w·down` to; a
+//! place in `[n_card, HOST)` at its first value raises the layer's
+//! `ExpertId` and NaNs every value of its token, the other tokens the
+//! oracle's.
 //! Last, on the engine itself (`n_l` = 32): a NaN in a hybrid layer's input
 //! residual through `step_layer_hybrid` returns the card's fault at that
 //! layer — its norm's and its router's sites in the mask, printed in the
@@ -114,6 +115,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::card_slots::{CardAcc, CardSlotKernels};
     use bloomery_gpu::fused::FusedKernels;
     use bloomery_gpu::hybrid::{
         Boundary, BoundaryShape, HOST, HostExperts, Hybrid, HybridConfig, Poison, PoisonKind,
@@ -134,6 +136,7 @@ mod gate {
     use gguf::{GgmlType, Gguf, Split};
     use model::arch::deepseek2::derived::Derived;
     use model::{Tensor2, Tensor2View};
+    use runtime::combine::card_sum;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1350,13 +1353,13 @@ mod gate {
             ok &= pass;
         }
 
-        // The card's routed combine (`weighted_sum_card`) over this
-        // boundary's places, nine slots a token (Bolt's count), three
-        // tokens: with every place a card slot it is `weighted_sum` bit for
-        // bit — the two kernels are the same expression, order and
-        // contraction; with HOST slots their down rows hold NaN (the
-        // contract leaves them unread) and the kept slots still give the
-        // host transcription of the rule bit for bit; a place in
+        // The card's routed combine (`ds41_ffn_card_acc_9`, the card slots'
+        // family at nine) over this boundary's places, nine slots a token
+        // (Bolt's count), three tokens: with every place a card slot it is
+        // `weighted_sum` bit for bit — the two kernels are the same
+        // expression, order and contraction; with HOST slots their down
+        // rows hold NaN (the contract leaves them unread) and the kept
+        // slots still give the oracle bit for bit; a place in
         // `[n_card, HOST)` names neither a card slot nor the host, so the
         // layer's ExpertId is raised and every value of its token is NaN
         // while the other tokens keep theirs.
@@ -1376,18 +1379,17 @@ mod gate {
             let sel_all: Vec<u32> = (0..M * E)
                 .map(|i| ((i / E + i % E) % R_CARD) as u32)
                 .collect();
-            // The rule itself, as the host reads it: ascending slots, the
-            // kept slots' `acc += w * down` from 0 — fused, because the
-            // device compiles the kernels' `acc += w * down` (both entries,
-            // `weighted_sum` included) to an fma.
+            // The rule itself, as the host reads it: the shared oracle
+            // `runtime::combine::card_sum`, ascending slots from zero —
+            // fused, because the device compiles the kernels'
+            // `acc += w * down` (both entries, `weighted_sum` included) to
+            // an fma.
             let sum_over = |down: &[f32], sel: &[u32], t: usize, d: usize| {
-                let mut acc = 0.0f32;
-                for e in 0..E {
-                    if sel[t * E + e] < n_card {
-                        acc = w[t * E + e].mul_add(down[(t * E + e) * rows + d], acc);
-                    }
-                }
-                acc
+                card_sum::<E>(
+                    std::array::from_fn(|e| down[(t * E + e) * rows + d]),
+                    std::array::from_fn(|e| w[t * E + e]),
+                    std::array::from_fn(|e| sel[t * E + e] < n_card),
+                )
             };
             let transcription = |down: &[f32], sel: &[u32]| -> Vec<f32> {
                 (0..M)
@@ -1396,6 +1398,27 @@ mod gate {
             };
             let down_dev = DeviceBuffer::from_host(stream, &down)?;
             let w_dev = DeviceBuffer::from_host(stream, &w)?;
+            let kernels = CardSlotKernels::load(gpu.context())?;
+            // The nine-slot card sum through the card slots' family, the
+            // buffers and extents the engine's card leg passes it.
+            let sum =
+                |down: &DeviceBuffer<f32>, sel: &DeviceBuffer<u32>, acc: &mut DeviceBuffer<f32>| {
+                    kernels.enqueue_card_acc(
+                        stream,
+                        &CardAcc {
+                            down,
+                            w: &w_dev,
+                            sel,
+                            n: rows,
+                            m: M,
+                            n_card: R_CARD,
+                            n_used: E,
+                            w_pitch: E,
+                            fault: gpu.layer_sink(R_LAYER)?,
+                        },
+                        acc,
+                    )
+                };
 
             // Every place a card slot: the card combine is the plain one,
             // bit for bit, and reruns identical.
@@ -1405,46 +1428,24 @@ mod gate {
             let mut card = DeviceBuffer::<f32>::zeroed(stream, rows * M)?;
             gpu.elem()
                 .enqueue_weighted_sum(stream, &down_dev, &w_dev, rows, E as u32, M, &mut full)?;
-            gpu.elem().enqueue_weighted_sum_card(
-                stream,
-                &down_dev,
-                &w_dev,
-                &sel_dev,
-                n_card,
-                rows,
-                E as u32,
-                M,
-                gpu.layer_sink(R_LAYER)?,
-                &mut card,
-            )?;
+            sum(&down_dev, &sel_dev, &mut card)?;
             stream.synchronize()?;
             let full_y = full.to_host_vec(stream)?;
             let card_y = card.to_host_vec(stream)?;
-            gpu.elem().enqueue_weighted_sum_card(
-                stream,
-                &down_dev,
-                &w_dev,
-                &sel_dev,
-                n_card,
-                rows,
-                E as u32,
-                M,
-                gpu.layer_sink(R_LAYER)?,
-                &mut card,
-            )?;
+            sum(&down_dev, &sel_dev, &mut card)?;
             stream.synchronize()?;
             let rerun = bits_equal(&card_y, &card.to_host_vec(stream)?);
             let same = bits_equal(&full_y, &card_y);
             let pass = same && rerun && gpu.take_fault()?.is_none();
             println!(
-                "refusal weighted_sum_card every slot a card slot: == weighted_sum bits {same}, \
+                "refusal card_acc_9 every slot a card slot: == weighted_sum bits {same}, \
                  rerun identical {rerun}, word clean {}",
                 verdict(pass)
             );
             ok &= pass;
 
             // HOST slots at chosen places, their down rows NaN: the kept
-            // slots' sum is the transcription bit for bit.
+            // slots' sum is `card_sum` bit for bit.
             gpu.clear_fault()?;
             let mut down_h = down.clone();
             let mut sel_h = sel_all.clone();
@@ -1460,47 +1461,25 @@ mod gate {
             let want_h = transcription(&down_h, &sel_h);
             let down_h_dev = DeviceBuffer::from_host(stream, &down_h)?;
             let sel_h_dev = DeviceBuffer::from_host(stream, &sel_h)?;
-            gpu.elem().enqueue_weighted_sum_card(
-                stream,
-                &down_h_dev,
-                &w_dev,
-                &sel_h_dev,
-                n_card,
-                rows,
-                E as u32,
-                M,
-                gpu.layer_sink(R_LAYER)?,
-                &mut card,
-            )?;
+            sum(&down_h_dev, &sel_h_dev, &mut card)?;
             stream.synchronize()?;
             let host_y = card.to_host_vec(stream)?;
             let pass = bits_equal(&host_y, &want_h) && gpu.take_fault()?.is_none();
             println!(
-                "refusal weighted_sum_card HOST slots skipped, their rows unread (NaN): == the \
-                 host transcription bits {}",
+                "refusal card_acc_9 HOST slots skipped, their rows unread (NaN): == card_sum \
+                 bits {}",
                 verdict(pass)
             );
             ok &= pass;
 
-            // A place in [n_card, HOST): the layer's ExpertId, that token
-            // every value NaN, the others the transcription.
+            // A place in [n_card, HOST), at its first value: the layer's
+            // ExpertId, that token every value NaN, the others the oracle.
             gpu.clear_fault()?;
             let mut sel_bad = sel_h.clone();
-            sel_bad[E + 6] = n_card + 3;
+            sel_bad[E + 6] = n_card;
             let want_bad = transcription(&down_h, &sel_bad);
             let sel_bad_dev = DeviceBuffer::from_host(stream, &sel_bad)?;
-            gpu.elem().enqueue_weighted_sum_card(
-                stream,
-                &down_h_dev,
-                &w_dev,
-                &sel_bad_dev,
-                n_card,
-                rows,
-                E as u32,
-                M,
-                gpu.layer_sink(R_LAYER)?,
-                &mut card,
-            )?;
+            sum(&down_h_dev, &sel_bad_dev, &mut card)?;
             stream.synchronize()?;
             let bad_y = card.to_host_vec(stream)?;
             let token = |y: &[f32], t: usize| y[t * rows..(t + 1) * rows].to_vec();
@@ -1511,8 +1490,8 @@ mod gate {
             let word_ok = word == Some(Fault::at(layer, FaultSite::ExpertId));
             let pass = bad_nan && others && word_ok;
             println!(
-                "refusal weighted_sum_card a place in [n_card, HOST): token NaN {bad_nan}, other \
-                 tokens the transcription {others}, word \"{}\" {}",
+                "refusal card_acc_9 a place in [n_card, HOST) at n_card: token NaN {bad_nan}, \
+                 other tokens the oracle {others}, word \"{}\" {}",
                 word.map_or_else(|| "none".to_string(), |f| f.to_string()),
                 verdict(pass)
             );
