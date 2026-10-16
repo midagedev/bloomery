@@ -107,6 +107,10 @@
 //! `hw_`: needs the V4.1 shards, the oracle set and V2-Lite on the box
 //! (`just gate-union`).
 
+#[path = "common/columns.rs"]
+mod columns;
+#[path = "common/panics.rs"]
+mod panics;
 #[path = "common/r8layer.rs"]
 mod r8layer;
 #[path = "common/v41set.rs"]
@@ -114,6 +118,7 @@ mod v41set;
 
 use std::sync::Arc;
 
+use columns::{diff_cells, seeded};
 use gguf::{GgmlType, Split, Weights};
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
@@ -124,6 +129,7 @@ use model::moe::{
 use model::ops::{self, RowLayout, Tensor2, Tensor2View};
 use model::placement::workstation;
 use model::r8file::{HostR8, R8Source, Sidecar};
+use panics::panic_text;
 
 /// The oracle set: the V4.1 node dumps' 5-token batch set.
 const SET: &str = refset::arch::deepseek41::BATCH;
@@ -227,18 +233,6 @@ fn dispatches_ok(scratch: u64, pool: Option<u64>, want: u64) -> bool {
 fn dispatch_note(scratch: u64, pool: Option<u64>, want: u64) -> String {
     let pool = pool.map_or_else(|| "-".to_string(), |p| p.to_string());
     format!("dispatches={scratch} pool={pool} want={want}")
-}
-
-/// Cells of `got` whose bits differ from `want`, a length mismatch counting
-/// every cell.
-fn diff_cells(got: &[f32], want: &[f32]) -> usize {
-    if got.len() != want.len() {
-        return got.len().max(want.len());
-    }
-    got.iter()
-        .zip(want)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count()
 }
 
 /// The V4.1 cases of one layer: the set's first k tokens for k <= 5, and
@@ -1065,21 +1059,6 @@ fn v2lite_path() -> String {
         .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
 }
 
-/// `n` seeded values in [-1, 1), every 61st scaled by 8 so a block's scale
-/// is set by an outlier the way real activations set it.
-fn seeded(n: usize, key: u64) -> Vec<f32> {
-    let mut s = key.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    (0..n)
-        .map(|i| {
-            s ^= s >> 12;
-            s ^= s << 25;
-            s ^= s >> 27;
-            let u = ((s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32) / 8_388_608.0 - 1.0;
-            if i % 61 == 0 { u * 8.0 } else { u }
-        })
-        .collect()
-}
-
 #[test]
 #[ignore = "hw: needs the box and the V2-Lite model file"]
 fn hw_union_file_matches_per_column_v2lite() {
@@ -1275,33 +1254,22 @@ const Q8_DOWN: &str = "blk.0.ffn_down_exps.weight";
 /// f32's unit roundoff.
 const U: f64 = 1.0 / 16_777_216.0;
 
-/// One routed layer — Q4_K gate and up, a Q8_0 or Q6_K down — written with `gguf::write` into
-/// its own directory (removed on drop), and the stacks' bytes the file holds.
-struct Q8Layer {
+/// A one-file gguf of synthetic stacks, `(name, type, [k, n, n_expert], bytes)` each, written
+/// with `gguf::write` into a directory of its own (removed on drop).
+struct StackFile {
     dir: std::path::PathBuf,
     source: std::path::PathBuf,
-    gate: Vec<u8>,
-    up: Vec<u8>,
-    down: Vec<u8>,
 }
 
-impl Q8Layer {
-    fn write(embd: usize, ff: usize, n_expert: usize, down_ty: GgmlType) -> Q8Layer {
+impl StackFile {
+    fn write(tag: &str, stacks: &[(&str, GgmlType, [usize; 3], &[u8])]) -> StackFile {
         use gguf::write::{Layout, TensorDecl, Writer};
-        let dir = std::env::temp_dir().join(format!("q8layer-{down_ty}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
         if dir.exists() {
             std::fs::remove_dir_all(&dir).unwrap();
         }
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("layer.gguf");
-        let gate = q8_stack(GgmlType::Q4_K, [embd, ff, n_expert], 0x6a7e);
-        let up = q8_stack(GgmlType::Q4_K, [embd, ff, n_expert], 0x0b);
-        let down = q8_stack(down_ty, [ff, embd, n_expert], 0xd0);
-        let stacks = [
-            (Q8_GATE, GgmlType::Q4_K, [embd, ff, n_expert], &gate),
-            (Q8_UP, GgmlType::Q4_K, [embd, ff, n_expert], &up),
-            (Q8_DOWN, down_ty, [ff, embd, n_expert], &down),
-        ];
         let decls: Vec<TensorDecl> = stacks
             .iter()
             .map(|&(name, ty, dims, b)| TensorDecl {
@@ -1314,23 +1282,47 @@ impl Q8Layer {
         let layout = Layout::new(&[], decls).unwrap();
         let file = std::io::BufWriter::new(std::fs::File::create(&source).unwrap());
         let mut w = Writer::new(file, layout).unwrap();
-        for &(name, _, _, b) in &stacks {
+        for &(name, _, _, b) in stacks {
             w.tensor(name, b).unwrap();
         }
         w.finish().unwrap();
+        StackFile { dir, source }
+    }
+}
+
+impl Drop for StackFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// One routed layer — Q4_K gate and up, a Q8_0 or Q6_K down — and the stacks' bytes its file holds.
+struct Q8Layer {
+    file: StackFile,
+    gate: Vec<u8>,
+    up: Vec<u8>,
+    down: Vec<u8>,
+}
+
+impl Q8Layer {
+    fn write(embd: usize, ff: usize, n_expert: usize, down_ty: GgmlType) -> Q8Layer {
+        let gate = q8_stack(GgmlType::Q4_K, [embd, ff, n_expert], 0x6a7e);
+        let up = q8_stack(GgmlType::Q4_K, [embd, ff, n_expert], 0x0b);
+        let down = q8_stack(down_ty, [ff, embd, n_expert], 0xd0);
+        let file = StackFile::write(
+            &format!("q8layer-{down_ty}"),
+            &[
+                (Q8_GATE, GgmlType::Q4_K, [embd, ff, n_expert], &gate),
+                (Q8_UP, GgmlType::Q4_K, [embd, ff, n_expert], &up),
+                (Q8_DOWN, down_ty, [ff, embd, n_expert], &down),
+            ],
+        );
         Q8Layer {
-            dir,
-            source,
+            file,
             gate,
             up,
             down,
         }
-    }
-}
-
-impl Drop for Q8Layer {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1404,7 +1396,7 @@ fn gamma(n: f64) -> f64 {
 fn hw_union_q8_0_down_matches_dequant() {
     let (embd, ff, n_expert) = Q8_LAYER;
     let layer = Q8Layer::write(embd, ff, n_expert, GgmlType::Q8_0);
-    let split = Split::open(&layer.source).unwrap();
+    let split = Split::open(&layer.file.source).unwrap();
     let src = R8Source::rows(&split);
     let spec = HostLayerSpec {
         gate: Q8_GATE,
@@ -1556,7 +1548,7 @@ fn q6_lists() -> Vec<Vec<(u32, f32)>> {
 fn hw_union_q6_k_down_matches_per_column() {
     let (embd, ff, n_expert) = Q6_LAYER;
     let layer = Q8Layer::write(embd, ff, n_expert, GgmlType::Q6_K);
-    let split = Split::open(&layer.source).unwrap();
+    let split = Split::open(&layer.file.source).unwrap();
     let src = R8Source::rows(&split);
     let spec = HostLayerSpec {
         gate: Q8_GATE,
@@ -1657,59 +1649,26 @@ const RELU2_KS: [usize; 4] = [1, 8, 9, 64];
 const RELU2_UP: &str = "blk.0.ffn_up_exps.weight";
 const RELU2_DOWN: &str = "blk.0.ffn_down_exps.weight";
 
-/// One relu² routed layer — IQ2_XXS up and down, no gate — written with `gguf::write` into
-/// its own directory (removed on drop), and the stacks' bytes the file holds.
+/// One relu² routed layer — IQ2_XXS up and down, no gate — and the stacks' bytes its file holds.
 struct Relu2Layer {
-    dir: std::path::PathBuf,
-    source: std::path::PathBuf,
+    file: StackFile,
     up: Vec<u8>,
     down: Vec<u8>,
 }
 
 impl Relu2Layer {
     fn write(embd: usize, ff: usize, n_expert: usize) -> Relu2Layer {
-        use gguf::write::{Layout, TensorDecl, Writer};
         let ty = GgmlType::IQ2_XXS;
-        let dir = std::env::temp_dir().join(format!("relu2layer-{ff}-{}", std::process::id()));
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-        std::fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("layer.gguf");
         let up = q8_stack(ty, [embd, ff, n_expert], 0x2e1);
         let down = q8_stack(ty, [ff, embd, n_expert], 0xd2e1);
-        let stacks = [
-            (RELU2_UP, [embd, ff, n_expert], &up),
-            (RELU2_DOWN, [ff, embd, n_expert], &down),
-        ];
-        let decls: Vec<TensorDecl> = stacks
-            .iter()
-            .map(|&(name, dims, b)| TensorDecl {
-                name: name.to_string(),
-                dims: dims.map(|d| d as u64).to_vec(),
-                type_id: ty.as_u32(),
-                nbytes: b.len() as u64,
-            })
-            .collect();
-        let layout = Layout::new(&[], decls).unwrap();
-        let file = std::io::BufWriter::new(std::fs::File::create(&source).unwrap());
-        let mut w = Writer::new(file, layout).unwrap();
-        for &(name, _, b) in &stacks {
-            w.tensor(name, b).unwrap();
-        }
-        w.finish().unwrap();
-        Relu2Layer {
-            dir,
-            source,
-            up,
-            down,
-        }
-    }
-}
-
-impl Drop for Relu2Layer {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let file = StackFile::write(
+            &format!("relu2layer-{ff}"),
+            &[
+                (RELU2_UP, ty, [embd, ff, n_expert], &up),
+                (RELU2_DOWN, ty, [ff, embd, n_expert], &down),
+            ],
+        );
+        Relu2Layer { file, up, down }
     }
 }
 
@@ -1746,18 +1705,6 @@ fn relu2_column(layer: &Relu2Layer, x: &[f32], list: &[(u32, f32)], ff: usize) -
     out
 }
 
-/// The text of the panic `call` raises, `None` when it returns.
-fn panic_text(call: &mut dyn FnMut()) -> Option<String> {
-    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).err()?;
-    Some(
-        payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
-            .unwrap_or_default(),
-    )
-}
-
 /// The relu² form — Bolt's ungated experts — through the common union: on two layers of
 /// different widths and expert counts (IQ2_XXS up and down, the latent 1024 wide), one scratch
 /// made for the wider serves both, and at k = 1, 8, 9 and 64 under both deferral arms the union
@@ -1778,7 +1725,7 @@ fn hw_union_relu2_matches_transcription() {
     let mut last = None;
     for (ff, n_expert) in RELU2_LAYERS {
         let layer = Relu2Layer::write(embd, ff, n_expert);
-        let split = Split::open(&layer.source).unwrap();
+        let split = Split::open(&layer.file.source).unwrap();
         let src = R8Source::rows(&split);
         let host_layer = HostLayer::build_relu2(
             src,
@@ -1871,7 +1818,7 @@ fn hw_union_relu2_matches_transcription() {
 
     // The refusals, on the wider layer (the last built).
     let (layer, ff) = last.expect("two layers ran");
-    let split = Split::open(&layer.source).unwrap();
+    let split = Split::open(&layer.file.source).unwrap();
     let src = R8Source::rows(&split);
     let host_layer = HostLayer::build_relu2(
         src,

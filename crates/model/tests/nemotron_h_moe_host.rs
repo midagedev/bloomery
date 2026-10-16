@@ -21,6 +21,10 @@
 //! gate-nemotron-h-moe-host`). Reads the stacks of the experts the columns
 //! list, in two layers: seconds.
 
+#[path = "common/columns.rs"]
+mod columns;
+
+use columns::{diff_cells, seeded};
 use gguf::Split;
 use model::arch::nemotron_h_moe::host;
 use model::arch::nemotron_h_moe::hparams::{Experts, Hparams, Kind};
@@ -35,21 +39,6 @@ const USED: usize = 9;
 /// The column counts: one, and Bolt's nine.
 const KS: [usize; 2] = [1, 9];
 
-/// `n` seeded values in [-1, 1), every 61st scaled by 8 so a block's scale is
-/// set by an outlier the way real activations set it.
-fn seeded(n: usize, key: u64) -> Vec<f32> {
-    let mut s = key.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    (0..n)
-        .map(|i| {
-            s ^= s >> 12;
-            s ^= s << 25;
-            s ^= s >> 27;
-            let u = ((s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32) / 8_388_608.0 - 1.0;
-            if i % 61 == 0 { u * 8.0 } else { u }
-        })
-        .collect()
-}
-
 /// Column `j`'s list: [`USED`] distinct experts of the layer's `n_expert`
 /// (every count of the file is coprime to 11, so the stride visits distinct
 /// ones), weights in [0.05, 0.3).
@@ -60,18 +49,6 @@ fn list(j: usize, n_expert: usize) -> Vec<(u32, f32)> {
             (e, 0.05 + 0.025 * ((i + j) % 10) as f32)
         })
         .collect()
-}
-
-/// Cells of `got` whose bits differ from `want`, a length mismatch counting
-/// every cell.
-fn diff_cells(got: &[f32], want: &[f32]) -> usize {
-    if got.len() != want.len() {
-        return got.len().max(want.len());
-    }
-    got.iter()
-        .zip(want)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count()
 }
 
 #[test]

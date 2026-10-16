@@ -10,9 +10,12 @@ mod manifest;
 mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
+#[path = "common/panics.rs"]
+mod panics;
 
 use gguf::GgmlType;
 use model::ops::{Tensor2, f32_tensor, matmul_q, rms_norm};
+use panics::panic_text;
 
 /// The slot-count observable and the deferral override are process-global,
 /// and cargo runs this file's tests in parallel — the tests that touch
@@ -715,18 +718,6 @@ fn hw_group_swiglu_matches_caller_composition() {
     check(&xall, "ne1=6 (prefill decline)");
 }
 
-/// The text of the panic `call` raises, `None` when it returns.
-fn panic_text(call: &mut dyn FnMut()) -> Option<String> {
-    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).err()?;
-    Some(
-        payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
-            .unwrap_or_default(),
-    )
-}
-
 /// The `_into` entries against the allocating ones: the same pairs, the
 /// weights cut through `ShardTensor` (the file opened as a one-shard split),
 /// written into caller-held blocks, give the allocating entries' outputs and
@@ -972,36 +963,28 @@ fn hw_group_into_matches_allocating_entries() {
                 let last = ups[0].data.len() - 1;
                 ups[0].data[last] = bad;
                 let inputs: Vec<GroupInput> = ups.iter().map(GroupInput::Relu2).collect();
-                let mut entries: Vec<(&str, Box<dyn FnMut() + '_>)> = vec![
-                    (
-                        "allocating",
-                        Box::new(|| {
-                            let _ = matmul_q_group_swiglu(&g, &d_refs, &inputs);
-                        }),
-                    ),
-                    (
-                        "_into",
-                        Box::new(|| {
-                            let (mut od, mut op) = (blank(&downs), blank(&pars));
-                            let _ = matmul_q_group_swiglu_into(
+                // The wide entry takes an input past the widest claim.
+                let entries: &[&str] = if x.ne1 > model::ops::DEFER_MAX_COLS {
+                    &["allocating", "_into", "wide"]
+                } else {
+                    &["allocating", "_into"]
+                };
+                for &entry in entries {
+                    let mut call = || {
+                        let (mut od, mut op) = (blank(&downs), blank(&pars));
+                        let _ = match entry {
+                            "allocating" => matmul_q_group_swiglu(&g, &d_refs, &inputs).map(drop),
+                            "_into" => {
+                                matmul_q_group_swiglu_into("test", &d_ws, &inputs, &mut od, &mut op)
+                                    .map(drop)
+                            }
+                            _ => model::ops::matmul_q_group_cols_into(
                                 "test", &d_ws, &inputs, &mut od, &mut op,
-                            );
-                        }),
-                    ),
-                ];
-                if x.ne1 > model::ops::DEFER_MAX_COLS {
-                    entries.push((
-                        "wide",
-                        Box::new(|| {
-                            let (mut od, mut op) = (blank(&downs), blank(&pars));
-                            let _ = model::ops::matmul_q_group_cols_into(
-                                "test", &d_ws, &inputs, &mut od, &mut op,
-                            );
-                        }),
-                    ));
-                }
-                for (entry, call) in &mut entries {
-                    let text = panic_text(call);
+                            )
+                            .map(drop),
+                        };
+                    };
+                    let text = panic_text(&mut call);
                     assert!(
                         text.as_deref()
                             .is_some_and(|t| t.contains("relu2: non-finite activation value")),

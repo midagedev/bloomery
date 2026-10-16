@@ -5,8 +5,8 @@
 //! hold no gate stack.
 
 use super::hparams::{Experts, Hparams};
-use super::names;
 use crate::ModelError;
+use crate::arch::names::routed_stacks;
 use crate::moe::{HostLayer, Relu2Spec};
 use crate::r8file::R8Source;
 
@@ -29,11 +29,13 @@ pub fn layer(src: R8Source<'_>, hp: &Hparams, l: usize) -> Result<Option<HostLay
     let Some(Experts { n_expert, ff, .. }) = *experts else {
         return Ok(None);
     };
+    // The common spelling of a routed stack; this architecture's files hold no gate.
+    let [_, up, down] = routed_stacks(l);
     HostLayer::build_relu2(
         src,
         &Relu2Spec {
-            up: &names::ffn_up_exps(l),
-            down: &names::ffn_down_exps(l),
+            up: &up,
+            down: &down,
             n_expert,
             embd: hp.latent,
             ff,
