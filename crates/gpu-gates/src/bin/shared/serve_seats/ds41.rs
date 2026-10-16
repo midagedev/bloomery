@@ -167,7 +167,7 @@
 //! device code; a build without it refuses the flag by name, and the seat
 //! serves no image): the file is the V4.1 encoder's GGUF, opened at load and
 //! refused by name when it is not ([`vision_seat::Projector`]'s checks, and
-//! [`gpu_vision::Encoder::load`]'s), and the encoder is resident from then
+//! [`vision_seat::open_tower`]'s), and the encoder is resident from then
 //! on — on a card this process holds that the placement's plan leaves off it
 //! (the 3090 under `--place a` here, at no cost to the plan), else on the
 //! stage card as a named reserve the plan's fit counts
@@ -226,11 +226,9 @@ use tokenizer::Tokenizer;
 #[cfg(feature = "vision")]
 use bloomery_gpu_gates::ds41_media;
 #[cfg(feature = "vision")]
-use bloomery_gpu_vision::encoder::Encoder;
-#[cfg(feature = "vision")]
 use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
-use vision_seat::{EncoderSeat, PleImage, Projector, SharedMedia, TextFacts};
+use vision_seat::{Opened, PleImage, SharedMedia, TextFacts};
 
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
@@ -395,39 +393,18 @@ fn slot_ctx(ctx: usize, slots: NonZeroUsize) -> Result<usize, GateError> {
     Ok(ctx)
 }
 
-/// What the seat holds of its image input from the plan to the load: the encoder's seat, the
-/// model's image input and the most image tokens one image takes.
-#[cfg(feature = "vision")]
-#[derive(Clone)]
-struct VisionSeat {
-    seat: EncoderSeat,
-    media: SharedMedia,
-    cap: usize,
-}
-
-/// What `--mmproj` opened for the plan: the encoder file's card figure — refused by name when the
-/// file is not the V4.1 encoder's — and the seat that figure goes on, with the file's projector
-/// held against the text model's embedding width and vocabulary by
-/// [`vision_seat::Projector::check_text`]. Refused by name under the step feed: a span's rows
-/// enter only through the batched call.
+/// What `--mmproj` opened for the plan ([`vision_seat::open_seat`]): the encoder file's card
+/// figure — refused by name when the file is not the V4.1 encoder's — and the seat that figure goes
+/// on, with the file's projector held against the text model's embedding width and vocabulary.
+/// Refused by name under the step feed: a span's rows enter only through the batched call.
 #[cfg(feature = "vision")]
 fn vision_of(
     a: &Args,
     prefill: body::PrefillMode,
     n_embd: usize,
     token: &dyn Fn(u32) -> Option<String>,
-) -> Result<Option<VisionSeat>, GateError> {
-    let Some(path) = a.vision.mmproj()? else {
-        if a.vision.sets_limits() {
-            return Err(
-                "--image-min-tokens/--image-max-tokens without --mmproj: no image input \
-                        to bound"
-                    .into(),
-            );
-        }
-        return Ok(None);
-    };
-    if prefill != body::PrefillMode::Batch {
+) -> Result<Option<Opened>, GateError> {
+    if a.vision.wanted()?.is_some() && prefill != body::PrefillMode::Batch {
         return Err(format!(
             "--mmproj under BLOOMERY_PREFILL={}: a media span's rows enter only through the \
              batched prompt call (BLOOMERY_PREFILL=batch)",
@@ -435,22 +412,18 @@ fn vision_of(
         )
         .into());
     }
-    let projector = Projector::open(
-        path,
-        &a.vision,
-        &[vision::arch::deepseek41v::PROJECTOR_TYPE],
-    )?;
     let facts = TextFacts {
         n_embd,
         imrope: None,
         ple: PleImage::Absent,
     };
-    projector.check_text(&facts, token)?;
-    Ok(Some(VisionSeat {
-        seat: vision_seat::encoder_seat(a.place, projector.card.total())?,
-        media: projector.media,
-        cap: projector.cap,
-    }))
+    vision_seat::open_seat(
+        &a.vision,
+        a.place,
+        &[vision::arch::deepseek41v::PROJECTOR_TYPE],
+        &facts,
+        token,
+    )
 }
 
 /// `--mmproj` on a build that takes no images: the flag is refused by name
@@ -605,7 +578,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         stats: levers.step_stats(),
         width,
         n_embd: inputs.hp.n_embd,
-        mmproj: a.vision.mmproj()?.map(Path::to_path_buf),
         #[cfg(feature = "vision")]
         vision,
     };
@@ -807,13 +779,10 @@ struct SeatArgs {
     width: WidthMode,
     /// The model file's embedding width: the width of a media span's row.
     n_embd: usize,
-    /// `--mmproj`: the encoder file (never set on a build without the
-    /// `vision` feature, which refuses the flag).
-    mmproj: Option<PathBuf>,
     /// The encoder's seat and image input under `--mmproj` ([`vision_of`]'s
     /// pick); `None` without the flag.
     #[cfg(feature = "vision")]
-    vision: Option<VisionSeat>,
+    vision: Option<Opened>,
 }
 
 /// The draft the seat serves, verified by the pair pass, behind the width
@@ -855,7 +824,7 @@ struct V41 {
 /// answers ([`Seat::media_model`]). Behind the `vision` feature.
 #[cfg(feature = "vision")]
 struct Vision {
-    enc: Encoder,
+    tower: Box<dyn bloomery_gpu_vision::Tower>,
     /// The encoder's own stream: `encode` enqueues on it and the row
     /// readback synchronizes it.
     stream: Arc<cuda_core::CudaStream>,
@@ -877,7 +846,7 @@ impl Vision {
     ) -> Result<vision_seat::SpanRows<body::MediaKind>, GateError> {
         let (n_embd, delims) = (self.n_embd, &self.delims);
         vision_seat::span_rows(
-            &mut self.enc,
+            &mut *self.tower,
             &self.stream,
             feeds.iter().map(|f| vision_seat::Image {
                 at: f.at,
@@ -885,7 +854,6 @@ impl Vision {
                 span_len: f.prepared.span_len,
             }),
             n_embd,
-            |p| p.plan.n_llm_h * p.plan.n_llm_w,
             |aligner, p| {
                 ds41_media::span_rows(aligner, (p.plan.n_llm_h, p.plan.n_llm_w), n_embd, delims)
             },
@@ -921,42 +889,35 @@ impl Saved for Ds41Saved {
 }
 
 /// The resident image encoder of `--mmproj` ([`Vision`]), opened on the seat
-/// the plan picked ([`EncoderSeat`]): the file loaded on its card — refused
-/// by name when it is not the V4.1 encoder's, or when its uploads are not
-/// the card figure the plan reserved (`Encoder::load`'s own check) — the
+/// the plan picked ([`vision_seat::EncoderSeat`]): the tower loaded on its card
+/// ([`vision_seat::open_tower`]) — refused by name when the file is not the V4.1
+/// encoder's, or when its uploads are not the card figure the plan reserved — the
 /// delimiter rows of its file read once, and the prompt batch's media half
 /// made ([`body::prepare_media`]). The `vision` record that follows the load
 /// names the card, which of the two seats it is, and the encoder's bytes.
 #[cfg(feature = "vision")]
 fn open_encoder(s: &mut Session<Body>, a: &SeatArgs) -> Result<Option<Vision>, GateError> {
-    let (Some(path), Some(v)) = (&a.mmproj, &a.vision) else {
+    let Some(v) = &a.vision else {
         return Ok(None);
     };
     let t = Instant::now();
-    let file = gguf::Gguf::open(path).map_err(|e| format!("--mmproj {}: {e}", path.display()))?;
-    let ordinal = usize::try_from(v.seat.ordinal)
-        .map_err(|_| format!("--mmproj {}: ordinal {}", path.display(), v.seat.ordinal))?;
-    let (stream, enc) = vision_seat::on_encoder_card(s.model().gpu().context(), || {
-        let on_card = |e| format!("--mmproj {}: the card {}: {e}", path.display(), v.seat.name);
-        let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(ordinal).map_err(on_card)?;
-        let enc = Encoder::load(&ctx, &stream, &file)
-            .map_err(|e| format!("--mmproj {}: {e}", path.display()))?;
-        Ok((stream, enc))
-    })?;
+    let (stream, tower) = vision_seat::open_tower(s.model().gpu().context(), v)?;
+    let file =
+        gguf::Gguf::open(&v.path).map_err(|e| format!("--mmproj {}: {e}", v.path.display()))?;
     let delims = ds41_media::delims(&file, a.n_embd)?;
     // The prompt batch's media half, beside the batch buffers the session's
     // own ready made.
     body::prepare_media(s.model_mut())?;
     vision_seat::record(
         &v.seat,
-        (enc.weight_bytes(), enc.scratch_bytes()),
+        (tower.weight_bytes(), tower.scratch_bytes()),
         vision_seat::ScratchHome::Own,
         v.cap,
         t.elapsed().as_secs_f64(),
     )
     .eprint();
     Ok(Some(Vision {
-        enc,
+        tower,
         stream,
         delims,
         n_embd: a.n_embd,

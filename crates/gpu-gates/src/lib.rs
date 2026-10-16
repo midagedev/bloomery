@@ -30,6 +30,7 @@ pub mod hc_host;
 pub mod host_stats;
 pub mod ik_norm;
 pub mod ik_q8_2;
+pub mod image_plan;
 pub mod kld;
 pub mod model_file;
 #[cfg(feature = "gpu")]

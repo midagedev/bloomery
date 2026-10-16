@@ -12,12 +12,18 @@
 //! * [`Projector`] — the file opened on the host: its projector type refused by name unless the
 //!   seat takes it, the tower's bytes on its card, the model's image input, and the row width;
 //!   [`Projector::check_text`] holds it against the text model, every mismatch refused by name.
+//! * [`open_seat`] — the flags to the opened encoder: the projector held against the text model and
+//!   seated for the plan ([`Opened`]); [`open_tower`] loads its tower on that card.
 //! * [`EncoderSeat`] — where the tower sits: the smallest card outside the plan, else a reserve on
 //!   the stage card ([`reserve_on`] puts the same reserve into a placed plan and a whole-fit probe).
-//! * [`table_bytes_per_position`] — what a plan adds per position of a sequence for a media load.
+//! * [`RESERVE`], [`reserve_on`], [`with_reserve`], [`refusal`] and [`table_bytes_per_position`] —
+//!   the plan's side of it, in [`crate::image_plan`] (a placement module of every build takes it):
+//!   the tower's reserve in a placed plan and a whole-fit probe, and what a plan adds per position
+//!   of a sequence for a media load.
 //! * [`on_encoder_card`] — binds the tower's card for a tower call and the model's card back.
 //! * [`span_rows`] — a media call's images encoded on the tower and read back as the rows a prompt call
-//!   splices ([`span_rows_of`] is its host half, which takes the readback as a closure).
+//!   splices ([`span_rows_of`] is its host half, which takes the readback as a closure); both towers
+//!   write one row of `width` a cell of the plan's token grid.
 //! * [`record`] — the `vision` line after the tower's load.
 
 use std::fmt::Display;
@@ -27,7 +33,6 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 use gguf::Gguf;
-use model::placement::Machine;
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
 use vision::arch::qwen3vl::TokenLimits;
@@ -36,6 +41,7 @@ use vision::{MediaModel, Patches, VisionError};
 
 use crate::GateError;
 use crate::generate::Place;
+pub use crate::image_plan::{RESERVE, refusal, reserve_on, table_bytes_per_position, with_reserve};
 use crate::record::{self, Record};
 
 /// A [`MediaModel`] the server holds across its threads (`serve::media::SharedMediaModel`).
@@ -87,6 +93,18 @@ impl Flags {
             .into()),
             (Some(p), false) => Ok(Some(p)),
             (None, _) => Ok(None),
+        }
+    }
+
+    /// [`Flags::mmproj`], refused by name when a token limit is given with no encoder file to
+    /// bound.
+    pub fn wanted(&self) -> Result<Option<&Path>, GateError> {
+        match self.mmproj()? {
+            None if self.sets_limits() => Err(
+                "--image-min-tokens/--image-max-tokens without --mmproj: no image input to bound"
+                    .into(),
+            ),
+            file => Ok(file),
         }
     }
 
@@ -310,9 +328,48 @@ impl Projector {
     }
 }
 
-/// What the plan's reserve for the tower is called, as the plan's terms name it (beside
-/// `workstation`'s draft and tier-batch reserves).
-pub const RESERVE: &str = "image encoder";
+/// What `--mmproj` opened for a seat's plan: the encoder file held against the text model, where
+/// its tower sits and the bytes the plan reserves for it.
+#[derive(Clone)]
+pub struct Opened {
+    pub path: PathBuf,
+    pub seat: EncoderSeat,
+    /// The model's image input, which the server renders and expands image parts by.
+    pub media: SharedMedia,
+    /// The most image tokens one image takes ([`Projector::cap`]).
+    pub cap: usize,
+    /// The tower's card figure: the plan's reserve on a stage-reserve seat, and what the tower's
+    /// load is held to ([`open_tower`]).
+    pub card: CardBytes,
+    /// The image-token limits the tower's activations are sized for.
+    pub limits: TokenLimits,
+}
+
+/// The seat's encoder under `flags`: `None` without `--mmproj`, refused by name when a limit is
+/// given with none (no image input to bound); else the file opened ([`Projector::open`], its type
+/// one of `takes`), held against the text model (`text`, `token` — [`Projector::check_text`]) and
+/// seated for a plan on `place` ([`encoder_seat`]). Every check runs before a card is touched.
+pub fn open_seat(
+    flags: &Flags,
+    place: Place,
+    takes: &[&str],
+    text: &TextFacts,
+    token: &dyn Fn(u32) -> Option<String>,
+) -> Result<Option<Opened>, GateError> {
+    let Some(path) = flags.wanted()? else {
+        return Ok(None);
+    };
+    let projector = Projector::open(path, flags, takes)?;
+    projector.check_text(text, token)?;
+    Ok(Some(Opened {
+        seat: encoder_seat(place, projector.card.total())?,
+        path: projector.path,
+        media: projector.media,
+        cap: projector.cap,
+        card: projector.card,
+        limits: flags.limits()?,
+    }))
+}
 
 /// Where the image encoder sits under `--mmproj`: on a card this process holds that the
 /// placement's plan leaves off it (the 3090 under `--place a` on this workstation, at no cost to
@@ -387,48 +444,6 @@ pub fn seat_of(
     })
 }
 
-/// `machine` with the tower's `reserve` on its stage card, when the seat is a stage reserve. The
-/// one place the reserve enters a machine: a placed plan's builder and a whole-fit probe both call
-/// it, so both fit the same bytes.
-pub fn reserve_on(machine: &mut Machine, reserve: Option<u64>) {
-    if let Some(bytes) = reserve {
-        machine.cards[0].reserves.push((RESERVE.to_owned(), bytes));
-    }
-}
-
-/// A machine builder (`layers` to its [`Machine`]) with [`reserve_on`] applied to what it builds.
-pub fn with_reserve(
-    plain: impl Fn(usize) -> Machine,
-    reserve: Option<u64>,
-) -> impl Fn(usize) -> Machine {
-    move |layers| {
-        let mut machine = plain(layers);
-        reserve_on(&mut machine, reserve);
-        machine
-    }
-}
-
-/// A plan's refusal, beside the reserve that was in it: with no reserve the refusal as it is.
-pub fn refusal(reserve: Option<u64>, e: impl Display) -> String {
-    reserve.map_or_else(
-        || e.to_string(),
-        |bytes| {
-            format!(
-                "the plan holds the image encoder's {bytes} B as the stage card's {RESERVE} \
-                 reserve: {e}"
-            )
-        },
-    )
-}
-
-/// The bytes a plan adds per position of a sequence for a media load: the sequence's own rotation
-/// table (`gpu::media::SeqRope`) holds a row of `width` f32 for each of its positions, `width`
-/// being the f32 a rope row turns (64 for the Qwen3-VL family's text, 256 B a position).
-#[must_use]
-pub const fn table_bytes_per_position(width: usize) -> u64 {
-    width as u64 * size_of::<f32>() as u64
-}
-
 /// Runs `work` — tower calls, which leave the tower's card bound to the engine thread — then binds
 /// `model` (the model's own context) back, whether or not `work` succeeded, so every body call
 /// after it runs with the model's card bound.
@@ -443,6 +458,45 @@ pub fn on_encoder_card<T>(
         .bind_to_thread()
         .map_err(|e| format!("binding the model's card back after the tower: {e}"))?;
     out
+}
+
+/// The tower of `at`'s file loaded on its seat's card, with the stream its readbacks run on
+/// ([`span_rows`]): the card bound for the load and the model's context (`model`) bound back
+/// ([`on_encoder_card`]), refused by name when the load's weight and activation bytes are not the
+/// card figure the plan reserved.
+#[cfg(feature = "vision")]
+pub fn open_tower(
+    model: &CudaContext,
+    at: &Opened,
+) -> Result<
+    (
+        Arc<cuda_core::CudaStream>,
+        Box<dyn bloomery_gpu_vision::Tower>,
+    ),
+    GateError,
+> {
+    let on = |e: &dyn Display| format!("--mmproj {}: {e}", at.path.display());
+    let file = Gguf::open(&at.path).map_err(|e| on(&e))?;
+    let ordinal = usize::try_from(at.seat.ordinal)
+        .map_err(|_| on(&format!("the card's ordinal {}", at.seat.ordinal)))?;
+    on_encoder_card(model, || {
+        let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(ordinal)
+            .map_err(|e| on(&format!("the card {}: {e}", at.seat.name)))?;
+        let tower =
+            bloomery_gpu_vision::open(&ctx, &stream, &file, at.limits).map_err(|e| on(&e))?;
+        let loaded = tower.weight_bytes() + tower.scratch_bytes();
+        if loaded != at.card.total() {
+            return Err(on(&format!(
+                "the tower holds {} B of weights and {} B of activations, {loaded} B; the plan \
+                 reserved {} B for it",
+                tower.weight_bytes(),
+                tower.scratch_bytes(),
+                at.card.total()
+            ))
+            .into());
+        }
+        Ok((stream, tower))
+    })
 }
 
 /// One image of a media call: where its span starts in the call's ids, the patches the tower
@@ -480,13 +534,11 @@ pub fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
     stream: &Arc<cuda_core::CudaStream>,
     images: impl IntoIterator<Item = Image<'a>>,
     width: usize,
-    rows_of: impl Fn(&Patches) -> usize,
     splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
 ) -> Result<SpanRows<K>, GateError> {
     span_rows_of(
         images,
         width,
-        rows_of,
         |patches| {
             let encoded = tower.encode(patches).map_err(|e| e.to_string())?;
             encoded
@@ -500,15 +552,14 @@ pub fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
 }
 
 /// The host half of [`span_rows`]: each image encoded and read back as bf16 by `encode`, the
-/// first `rows_of(patches) · width` values kept (fewer is refused by name) and handed to `splice`
-/// with the patches, which returns the span's rows and the kind of each of its positions; their
-/// count is the image's `span_len`, refused by name when it is not. What a tower's rows are and
-/// what its span adds around them (V4.1's delimiters, none for a merger's tokens) is `rows_of`
-/// and `splice`; the rest is the same for every tower.
+/// first `n_llm_h · n_llm_w · width` values kept (the tower writes one row of `width` a cell of
+/// the plan's grid; fewer is refused by name) and handed to `splice` with the patches, which
+/// returns the span's rows and the kind of each of its positions; their count is the image's
+/// `span_len`, refused by name when it is not. What a span adds around the cells' rows (V4.1's
+/// delimiters, none for a merger's tokens) is `splice`; the rest is the same for every tower.
 pub fn span_rows_of<'a, K, E: Display>(
     images: impl IntoIterator<Item = Image<'a>>,
     width: usize,
-    rows_of: impl Fn(&Patches) -> usize,
     mut encode: impl FnMut(&Patches) -> Result<Vec<u16>, E>,
     mut splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
 ) -> Result<SpanRows<K>, GateError> {
@@ -525,7 +576,7 @@ pub fn span_rows_of<'a, K, E: Display>(
     {
         let (h, w) = (patches.plan.n_llm_h, patches.plan.n_llm_w);
         let all = encode(patches).map_err(|e| format!("the image at {at}: {e}"))?;
-        let want = rows_of(patches) * width;
+        let want = h * w * width;
         let image = all.get(..want).ok_or_else(|| {
             format!(
                 "the image at {at}: {} encoded values for a {h}x{w} grid, want {want}",
@@ -549,6 +600,13 @@ pub fn span_rows_of<'a, K, E: Display>(
         out.kinds.extend(kinds);
     }
     Ok(out)
+}
+
+/// The splice of a merger tower's span ([`span_rows`]): the cells' rows as the tower wrote them,
+/// one position a cell, nothing around them — the placeholder's delimiters are ordinary ids.
+pub fn merged_cells(rows: &[u16], patches: &Patches) -> Result<(Vec<u16>, Vec<()>), GateError> {
+    let cells = patches.plan.n_llm_h * patches.plan.n_llm_w;
+    Ok((rows.to_vec(), vec![(); cells]))
 }
 
 /// Where a tower's activations live.
@@ -593,7 +651,7 @@ pub fn record(
 mod tests {
     use gguf::Value;
     use model::placement::devices::DeviceId;
-    use model::placement::workstation::{A6000, RTX_3090, plan_a};
+    use model::placement::workstation::{A6000, RTX_3090};
 
     use super::*;
 
@@ -751,47 +809,6 @@ mod tests {
         );
     }
 
-    /// The whole-fit probe and the placed plan take the one reserve: the machines both build carry
-    /// the same named bytes, the card sets aside exactly that much more, and none changes nothing.
-    #[test]
-    fn the_probe_and_the_placed_plan_see_the_same_reserve() {
-        let plain = plan_a(40);
-        let mut probe = plan_a(40);
-        reserve_on(&mut probe, Some(BYTES));
-        let placed = with_reserve(plan_a, Some(BYTES))(40);
-        assert_eq!(probe, placed);
-        assert_eq!(
-            probe.cards[0].reserves.last(),
-            Some(&(RESERVE.to_owned(), BYTES))
-        );
-        assert_eq!(
-            probe.cards[0].reserve_bytes(),
-            plain.cards[0].reserve_bytes() + BYTES
-        );
-        assert_eq!(
-            probe.cards[0].set_aside_bytes(),
-            plain.cards[0].set_aside_bytes() + BYTES
-        );
-        let mut none = plan_a(40);
-        reserve_on(&mut none, None);
-        assert_eq!(none, plain);
-        assert_eq!(with_reserve(plan_a, None)(40), plain);
-        assert_eq!(refusal(None, "no fit"), "no fit");
-        assert_eq!(
-            refusal(Some(BYTES), "no fit"),
-            "the plan holds the image encoder's 1476000000 B as the stage card's image encoder \
-             reserve: no fit"
-        );
-    }
-
-    /// The table term: a row of the rope's width in f32 a position (256 B at 64).
-    #[test]
-    fn the_table_term_is_a_row_of_f32_a_position() {
-        assert_eq!(table_bytes_per_position(64), 256);
-        assert_eq!(table_bytes_per_position(128), 512);
-        assert_eq!(table_bytes_per_position(0), 0);
-    }
-
     /// A media model of one image token.
     struct Stub(u32);
 
@@ -841,6 +858,34 @@ mod tests {
             imrope,
             ple,
         }
+    }
+
+    /// `open_seat` before any file or card: no `--mmproj` is no encoder, a limit without it is
+    /// refused by name (also beside `--no-mmproj`), a file that is not there is refused naming it.
+    #[test]
+    fn open_seat_refuses_by_name_before_a_card() {
+        let text = facts(2048, QWEN_ROPE, PleImage::Absent);
+        let open = |a: &[&str]| {
+            open_seat(&flags(a).unwrap(), Place::A, &[], &text, &qwen_vocab).map(|o| o.is_some())
+        };
+        assert!(!open(&[]).unwrap());
+        assert!(!open(&["--no-mmproj"]).unwrap());
+        let limits =
+            "--image-min-tokens/--image-max-tokens without --mmproj: no image input to bound";
+        assert_eq!(
+            open(&["--image-min-tokens", "4"]).unwrap_err().to_string(),
+            limits
+        );
+        assert_eq!(
+            open(&["--no-mmproj", "--image-max-tokens", "9"])
+                .unwrap_err()
+                .to_string(),
+            limits
+        );
+        let gone = open(&["--mmproj", "/nowhere/p.gguf"])
+            .unwrap_err()
+            .to_string();
+        assert!(gone.starts_with("--mmproj /nowhere/p.gguf: "), "{gone}");
     }
 
     /// The projector-to-text checks of the qwen3vl type, each refused by name; the Qwen3.8 text
@@ -1080,9 +1125,19 @@ mod tests {
         }
     }
 
-    /// The rows rule of a tower whose rows are the plan's grid, one row a cell.
+    /// The rows a tower writes for a plan's grid, one row a cell.
     fn cells(p: &Patches) -> usize {
         p.plan.n_llm_h * p.plan.n_llm_w
+    }
+
+    /// A merger tower's span ([`merged_cells`]) is the rows the tower wrote, a position a cell of
+    /// the plan's grid, with nothing around them.
+    #[test]
+    fn a_merged_span_is_the_cells_rows() {
+        let rows: Vec<u16> = (0..6 * W as u16).collect();
+        let (span, kinds) = merged_cells(&rows, &patches(2, 3)).unwrap();
+        assert_eq!(span, rows);
+        assert_eq!(kinds.len(), 6);
     }
 
     /// A span that adds rows around the tower's: a Start row of 9s, each grid row's cells and a
@@ -1124,7 +1179,7 @@ mod tests {
             let len = cells(p) * W + if n == 1 { 2 * W } else { 0 };
             Ok((0..len as u16).map(|i| n * 100 + i).collect())
         };
-        let got = span_rows_of(images, W, cells, encode, delimited).unwrap();
+        let got = span_rows_of(images, W, encode, delimited).unwrap();
         assert_eq!(seen, [(2, 2), (1, 3)]);
         assert_eq!(
             got.ats,
@@ -1184,12 +1239,12 @@ mod tests {
         };
         let rows = |len: usize| move |_: &Patches| Ok::<_, String>(vec![1; len]);
         let refused = |r: Result<SpanRows<Kind>, GateError>| r.unwrap_err().to_string();
-        let short = span_rows_of(image(8), W, cells, rows(4 * W - 1), delimited);
+        let short = span_rows_of(image(8), W, rows(4 * W - 1), delimited);
         assert_eq!(
             refused(short),
             "the image at 5: 11 encoded values for a 2x2 grid, want 12"
         );
-        let span = span_rows_of(image(7), W, cells, rows(4 * W), delimited);
+        let span = span_rows_of(image(7), W, rows(4 * W), delimited);
         assert_eq!(
             refused(span),
             "the image at 5: a 2x2 grid splices 8 positions, its prepare said 7"
@@ -1197,7 +1252,6 @@ mod tests {
         let failed = span_rows_of(
             image(8),
             W,
-            cells,
             |_: &Patches| Err::<Vec<u16>, _>("device lost"),
             delimited,
         );
