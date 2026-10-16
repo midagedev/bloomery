@@ -1637,11 +1637,19 @@ fn swiglu_into(gate: &[f32], up: &[f32], limit: Option<f32>, out: &mut [f32]) {
 
 /// `relu(up)²` into `out`: `r = max(up[i], 0)` then `r · r` of the f32,
 /// written once — the one call every relu² combine makes, on a claimant or on
-/// the caller.
+/// the caller. A NaN or an infinity in `up` is refused by name after the loop
+/// (the `max` would turn a NaN, and a negative infinity, into zero before the
+/// quantizer could see it); the loop itself carries no branch.
 fn relu2_into(up: &[f32], out: &mut [f32]) {
+    let mut invalid = false;
     for (o, &u) in out.iter_mut().zip(up) {
+        invalid |= !u.is_finite();
         let r = u.max(0.0);
         *o = r * r;
+    }
+    if invalid {
+        let bad = up.iter().find(|u| !u.is_finite());
+        panic!("relu2: non-finite activation value {bad:?}");
     }
 }
 
@@ -5043,10 +5051,11 @@ impl<'c, 'w> UnionCall<'c, 'w> {
 
     /// The cells the gate/up pass writes: two columns a slot gated — the
     /// gate's and the up's — one a slot for a relu² layer, the up's alone.
-    fn gu_cells(&self, slots: usize, ff: usize) -> usize {
+    fn gu_cells(&self) -> usize {
+        let cells = self.plan.slots() * self.gate.n;
         match self.form {
-            ExpertForm::Gated { .. } => 2 * slots * ff,
-            ExpertForm::Relu2 => slots * ff,
+            ExpertForm::Gated { .. } => 2 * cells,
+            ExpertForm::Relu2 => cells,
         }
     }
 
@@ -5073,7 +5082,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         out: &mut [f32],
         passes: &mut u64,
     ) -> Result<(), crate::ModelError> {
-        let (cols, ff, embd, slots) = (self.x.ne1(), self.gate.n, self.down.n, self.plan.slots());
+        let (cols, embd, slots) = (self.x.ne1(), self.down.n, self.plan.slots());
         assert_eq!(lists.len(), cols, "host union: one list a column of x");
         assert_eq!(
             out.len(),
@@ -5090,7 +5099,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
                 "x in the up's encoding",
             ))
         };
-        let gu = room(slabs.gu, self.gu_cells(slots, ff), "the gate/up slab");
+        let gu = room(slabs.gu, self.gu_cells(), "the gate/up slab");
         let qc = room(slabs.qc, slots * self.down.cb, "the combines' slab");
         let store = room(slabs.store, slots * embd, "the down store");
         // Poisoned like a dispatch's own buffers, so an unwritten cell shows.
@@ -5200,8 +5209,8 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         claims: Option<GroupClaims<'_>>,
         passes: &mut u64,
     ) -> Result<(), crate::ModelError> {
-        let (ff, embd, slots) = (self.gate.n, self.down.n, self.plan.slots());
-        let gu = room(gu, self.gu_cells(slots, ff), "the gate/up slab");
+        let (embd, slots) = (self.down.n, self.plan.slots());
+        let gu = room(gu, self.gu_cells(), "the gate/up slab");
         let qc = room(qc, slots * self.down.cb, "the combines' slab");
         let store = room(store, slots * embd, "the down store");
         if poison() {
