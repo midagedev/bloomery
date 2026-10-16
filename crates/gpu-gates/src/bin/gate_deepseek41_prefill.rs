@@ -1615,7 +1615,10 @@ mod gate {
                 verdict(pass)
             );
         }
-        for n_used in [5, 7, 9] {
+        // PIN(2026-10-16): the card sum stops refusing 9 (`CardSlots::Nine`);
+        // the nine-slot entry is checked by gate_hybrid's combine clauses and
+        // gate-gpu-lib's places test.
+        for n_used in [5, 7] {
             let z = DeviceBuffer::from_host(stream, &vec![0.0f32; SLOTS8 * N * M])?;
             let s = DeviceBuffer::from_host(stream, &[HOST; SLOTS8 * M])?;
             let mut acc = DeviceBuffer::from_host(stream, &[SENT; N * M])?;
