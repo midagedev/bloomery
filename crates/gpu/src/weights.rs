@@ -9,6 +9,7 @@
 //! `model::placement::CardFormat`'s. The gates (`gate_p10`, `gate_load_v41`)
 //! pin the uploads against independent host packings bit for bit.
 
+use crate::iq::repack_iq2xxs;
 use crate::mxfp4::{Nvfp4, Nvfp4Weight, Planes, repack};
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
@@ -52,12 +53,14 @@ pub fn head_tensor(split: &Split) -> &'static str {
 /// travel as a file tensor.
 pub enum DevWeight {
     /// A file tensor as the file stores its rows (`CardFormat::KQuant`): a
-    /// Q3_K/Q4_K/Q5_K/Q6_K tensor, or a routed Q5_1, Q8_0, IQ2_XS, IQ3_XXS,
+    /// Q3_K/Q4_K/Q5_K/Q6_K tensor, or a routed Q5_1, Q8_0, IQ3_XXS,
     /// IQ4_XS, IQ4_NL or MXFP4 stack a program's plan
     /// puts on the card in the file's `block_q5_1`s, `block_q8_0`s,
-    /// `block_iq2_xs`es, `block_iq3_xxs`es, `block_iq4_xs`es, `block_iq4_nl`s or
+    /// `block_iq3_xxs`es, `block_iq4_xs`es, `block_iq4_nl`s or
     /// `block_mxfp4`s,
-    /// which its `_sel` and GEMM entries read (`ty` says which). The raw row
+    /// which its `_sel` and GEMM entries read (`ty` says which) — an IQ2_XXS
+    /// expert stack loads as its plane ([`DevWeight::Iq2Xxs`]) instead. The
+    /// raw row
     /// stream as little-endian u32 words, zero-padded at its end to a whole
     /// number of words per row —
     /// the kernels address rows by BYTE offset (`row * row_bytes`), so the
@@ -114,8 +117,10 @@ pub enum DevWeight {
         k: usize,
         scale: f32,
     },
-    /// An IQ2_XXS expert stack re-laid into one flat word stream at load:
-    /// expert `e`'s region starts at word `e·rows·(k/256)·33/2` and holds its
+    /// An IQ2_XXS expert stack re-laid into one flat word stream at load —
+    /// every family's the same, keyed by the weight type
+    /// ([`CardFormat::KQuant`]'s arm in [`upload_rows`]): expert `e`'s
+    /// region starts at word `e·rows·(k/256)·33/2` and holds its
     /// rows' 16·(k/256) idx/aux words (the file's half verbatim, so every
     /// half a 16-byte run), then its rows' f16 `d` values as one continuous
     /// bitstream two a word (`rows·(k/256)/2` words) — byte for byte the
@@ -634,37 +639,6 @@ impl Weights {
     /// own); the caller names the error.
     pub fn take(&mut self, name: &str) -> Option<DevWeight> {
         self.by_name.remove(name)
-    }
-
-    /// Replace the resident weight `name` with `w`, returning the old one
-    /// for the caller to drop: the load-time plane of a file tensor's own
-    /// bytes, byte-neutral, so the swap the loader makes frees the file's
-    /// buffers under the same name and every reader by that name sees the
-    /// plane. Refused by name when `name` is not resident or `w`'s rows are
-    /// not the old one's (a swap that changed shape would strand the
-    /// layer's launches). Load-time only: the plane's upload synchronized
-    /// before this, so dropping the old buffers frees memory nothing reads.
-    pub(crate) fn replace(&mut self, name: &str, w: DevWeight) -> Result<DevWeight, GpuError> {
-        let what = "Weights::replace";
-        let old = self
-            .by_name
-            .get(name)
-            .ok_or_else(|| GpuError::tensor(what, name, "a resident weight to replace"))?;
-        if w.rows() != old.rows() {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{name} holds {} rows, the replacement {} — a replace keeps the shape",
-                    old.rows(),
-                    w.rows()
-                ),
-            ));
-        }
-        let old = self
-            .by_name
-            .insert(String::from(name), w)
-            .expect("resident above");
-        Ok(old)
     }
 
     /// The resident weight `name`, refused by name as `what`'s when absent.
@@ -1194,6 +1168,37 @@ fn upload_rows(
         // into the zeroed buffer and only the layout's zero tail is packed —
         // by the buffer's memset.
         CardFormat::KQuant => {
+            // An IQ2_XXS expert stack (a 3-D tensor, its rows whole experts:
+            // a tier leg that splits one is refused below by name) loads as
+            // its byte-neutral plane — the layout the grouped GEMM and the
+            // `_sel` gemv plane entries read, every family's the same
+            // ([`crate::iq::repack_iq2xxs`], the mxfp4::repack precedent).
+            // The plane's words are the stream's, zero-tail padded to whole
+            // words a row, so the layout's size above already covers them.
+            if t.ty == GgmlType::IQ2_XXS && t.dims.len() == 3 {
+                let rpe: usize = t.dims[1].try_into().map_err(|_| {
+                    GpuError::shape(
+                        what,
+                        format!("tensor {name}: its rows an expert pass usize"),
+                    )
+                })?;
+                if rpe == 0 || rows % rpe != 0 {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "tensor {name}: an IQ2_XXS expert stack of {rpe} rows an expert \
+                             cannot hold {rows} rows — its tiers hold whole experts"
+                        ),
+                    ));
+                }
+                let mut words = repack_iq2xxs(&flat_of(src, take)?, rows / rpe, rpe, k)?;
+                let cols = words.len().div_ceil(rows);
+                words.resize(cols * rows, 0);
+                return Ok(DevWeight::Iq2Xxs {
+                    w: upload_packed(stream, ring, what, name, &words, rows, cols)?,
+                    k,
+                });
+            }
             let words = stream_words(need, rows as u64)
                 .and_then(|w| usize::try_from(w).ok())
                 .ok_or_else(|| {

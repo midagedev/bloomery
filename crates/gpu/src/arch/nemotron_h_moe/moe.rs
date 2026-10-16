@@ -25,7 +25,6 @@
 
 use super::router::{RouteOut, Routers, TOP_K};
 use crate::arch::hybrid::{self, Acts, Cx, Names, Site, residual};
-use crate::iq::repack_iq2xxs;
 use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
 use crate::site::SiteTy;
@@ -137,9 +136,10 @@ impl MoeScratch {
     }
 }
 
-/// The resident IQ2_XXS weight `name` of `rows` rows of `k` values, in the
-/// file's blocks: its name; any other variant, type or shape is refused by
-/// name as `what`'s.
+/// The resident IQ2_XXS weight `name` of `rows` rows of `k` values — the
+/// loader hands its expert stacks as planes ([`DevWeight::Iq2Xxs`]), its
+/// one-expert weights in the file's blocks: its name; any other variant,
+/// type or shape is refused by name as `what`'s.
 fn iq2_xxs(
     w: &Weights,
     what: &'static str,
@@ -152,11 +152,10 @@ fn iq2_xxs(
             w: t,
             k: got,
         } if t.rows() == rows && *got == k => Ok(name.to_string()),
+        DevWeight::Iq2Xxs { w: t, k: got } if t.rows() == rows && *got == k => Ok(name.to_string()),
         _ => Err(GpuError::shape(
             what,
-            format!(
-                "{name} is not an IQ2_XXS weight of {rows} rows of {k} values in the file's blocks"
-            ),
+            format!("{name} is not an IQ2_XXS weight of {rows} rows of {k} values"),
         )),
     }
 }
@@ -177,43 +176,6 @@ fn stack<'w>(
     }
 }
 
-/// Layer `l`'s routed IQ2_XXS stack `sym` (`experts` experts of `rpe` rows of
-/// `k` values, the resident one [`iq2_xxs`] just validated) replaced by its
-/// load-time plane: the file's bytes repacked host-side
-/// ([`repack_iq2xxs`]), uploaded, the file's K-quant dropped — byte-neutral
-/// on the card, one stack's bytes the host and device transient. The plane's
-/// readers: the grouped GEMM's `gemm_iq2xxs_p` and the `_sel` gemv's plane
-/// launchers.
-fn repack_routed(
-    names: &mut Names<'_>,
-    stream: &CudaStream,
-    l: usize,
-    sym: &str,
-    experts: usize,
-    rpe: usize,
-    k: usize,
-) -> Result<(), GpuError> {
-    let what = names.what;
-    let name = layer_name(l, sym);
-    let Some((shard, t)) = names.file.find(&name) else {
-        return Err(GpuError::tensor(what, &name, "a file tensor to repack"));
-    };
-    let bytes = names
-        .file
-        .shard(shard)
-        .ok_or_else(|| GpuError::tensor(what, &name, "a readable shard"))?
-        .data(t)
-        .map_err(|e| GpuError::shape(what, format!("{name}: {e}")))?;
-    let mut words = repack_iq2xxs(bytes, experts, rpe, k)?;
-    // The stream_words convention of the file's stacks: whole words a row,
-    // the pad a zero tail at the stream's end (the regions never see it).
-    let cols = words.len().div_ceil(experts * rpe);
-    words.resize(cols * experts * rpe, 0);
-    let plane = DeviceTensor::upload(stream, &words, experts * rpe, cols)?;
-    drop(names.w.replace(&name, DevWeight::Iq2Xxs { w: plane, k })?);
-    Ok(())
-}
-
 impl MoeLayer {
     /// Latent MoE layer `l` of `hp`, its pre-norm `norm` resolved by the
     /// caller. A layer whose
@@ -221,7 +183,7 @@ impl MoeLayer {
     /// [`TOP_K`] or whose kept weights are not renormalized is refused by
     /// name. Load-time only.
     pub(super) fn load(
-        names: &mut Names<'_>,
+        names: &Names<'_>,
         (l, norm): (usize, String),
         hp: &Hparams,
         stream: &CudaStream,
@@ -270,10 +232,6 @@ impl MoeLayer {
             route: RouteOut::new(what, stream, n)?,
             norm,
         };
-        // The routed stacks become their planes: byte-neutral, read by the
-        // grouped GEMM's staged entry and the `_sel` gemv's plane launchers.
-        repack_routed(names, stream, l, FFN_UP_EXPS, n, ff, lat)?;
-        repack_routed(names, stream, l, FFN_DOWN_EXPS, n, lat, ff)?;
         Ok(layer)
     }
 

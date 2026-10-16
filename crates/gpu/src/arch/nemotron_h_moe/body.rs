@@ -178,7 +178,7 @@ impl Body {
                     (hidden, ctx),
                     stream,
                 )?),
-                Kind::Moe => Layer::Moe(MoeLayer::load(&mut names, (l, norm), &hp, stream)?),
+                Kind::Moe => Layer::Moe(MoeLayer::load(&names, (l, norm), &hp, stream)?),
             });
         }
         let mut acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;

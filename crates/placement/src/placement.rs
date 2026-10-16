@@ -449,7 +449,9 @@ pub enum CardFormat {
     /// q5_1 in [`CardFormat::Q5_1`] and q8_0 in [`CardFormat::Q8_0Planes`]).
     /// The kernels address a row by its byte offset in the stream, so a row
     /// need not start on a word (q6_K at k = 768 is 630 bytes); the padding
-    /// only makes the buffer a whole number of words per row.
+    /// only makes the buffer a whole number of words per row. An IQ2_XXS
+    /// expert stack loads through it as its byte-neutral plane (the GPU
+    /// loader's `DevWeight::Iq2Xxs`): same bytes, so this arithmetic holds.
     KQuant,
     /// q5_0 in the gemv's layout: per row the file's 22 bytes a 32-value
     /// block regrouped into planes — four `qs` words and one `qh` word a
