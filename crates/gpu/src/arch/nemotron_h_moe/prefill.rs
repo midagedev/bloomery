@@ -645,7 +645,7 @@ fn project_rows(
 /// The resident stack `name` a `_sel` launch reads.
 fn stack<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, GpuError> {
     match w.resident(WHAT, name)? {
-        DevWeight::KQuant { w, .. } => Ok(w),
+        DevWeight::KQuant { w, .. } | DevWeight::Iq2Xxs { w, .. } => Ok(w),
         _ => Err(GpuError::tensor(
             WHAT,
             name,
@@ -691,10 +691,9 @@ fn moe_rows(
         &mut p.lat,
     )?;
     let slots = TOP_K * m;
-    // The grouped GEMM's IQ2_XXS entry, where the build has one.
-    let gemm = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
-        .ok()
-        .filter(|_| m > COLS);
+    // The grouped GEMM's staged plane entry (the load swapped the routed
+    // stacks in).
+    let gemm = (m > COLS).then_some(GemmWeight::Iq2XxsPlane);
     if let Some(ty) = gemm {
         experts_gemm(
             cx,
@@ -714,7 +713,7 @@ fn moe_rows(
                 n_slots: slots,
                 rows_per_expert: ml.ff,
             };
-            iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut p.up)?;
+            iq.enqueue_gemv_sel_cols_plane(stream, &up, TOP_K, fault, &mut p.up)?;
         }
         {
             let act = slot_form(&mut p.slots, ml.ff, slots)?;
@@ -726,7 +725,7 @@ fn moe_rows(
                 n_slots: slots,
                 rows_per_expert: sh.latent,
             };
-            iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.down)?;
+            iq.enqueue_gemv_sel_plane(stream, &down, fault, &mut p.down)?;
         }
     }
     gpu.elem().enqueue_weighted_sum(
