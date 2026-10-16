@@ -184,7 +184,7 @@ def invocations(lines, macro):
     """The `KEY: ident, ident` binding lines of every `macro! { .. }` invocation in lines: a list, one dict a
     call, KEY -> ([idents], line)."""
     out, i = [], 0
-    start = re.compile(r"^\s*" + re.escape(macro) + r"!\s*\{")
+    start = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*" + re.escape(macro) + r"!\s*\{")
     while i < len(lines):
         if not start.match(lines[i]):
             i += 1
@@ -205,8 +205,9 @@ def invocations(lines, macro):
     return out
 
 
-def crate_kernels(root, crate):
-    """name -> (file, line) of every entry the crate's src declares; macro-bound names resolved."""
+def crate_scan(root, crate):
+    """The crate's kernel sites, its macro_rules! definitions and its file texts, the shared scan of
+    [`bin_kernels`]'s per-binary union below."""
     base = os.path.join(root, "crates", crate, "src")
 
     def unlisted(e):  # a directory the walk cannot list is an unreadable input (main_check's exit 2), never skipped
@@ -228,6 +229,20 @@ def crate_kernels(root, crate):
                 found.setdefault(("$", mac, name[1:]), []).append((r, ln))
             else:
                 found.setdefault(name, []).append((r, ln))
+    return found, macros, texts
+
+
+def bin_kernels(scans):
+    """name -> (file, line) of every entry a binary's device crates declare; macro-bound names resolved over the
+    union of those crates' files. A macro family may be defined in one of the binary's crates and invoked from
+    another (sigmoid_router_instance! lives in gpu, its glm5next and mimo2 instances in gpu-deepseek41), so a
+    `$name` family binds over every crate the binary links, not the defining crate's alone."""
+    found, macros, texts = {}, {}, {}
+    for f, m, t in scans:
+        for key, sites in f.items():
+            found.setdefault(key, []).extend(sites)
+        macros.update(m)
+        texts.update(t)
     out = {}
     for key, sites in found.items():
         if not isinstance(key, tuple):
@@ -298,19 +313,19 @@ def check(root):
     problems = []
     for b in sorted(set(rows) - {b for b, _ in bins}):
         problems.append(f"{b}: the table pins this binary, the {RECIPE} recipe does not run it")
-    kern, nrows, ndecl, decl = {}, 0, 0, {}
+    scan, nrows, ndecl, decl = {}, 0, 0, {}
     for b, flt in bins:
         if b not in BIN_CRATES:
             raise Refuse(f"{b}: the {RECIPE} recipe pins this binary and BIN_CRATES (tools/check-ptx-names.py) does not "
                          f"say which device crates it links: add the crates of the features the recipe builds it with")
     for b, flt in bins:
-        declared = {}
         for c in BIN_CRATES[b]:
-            if c not in kern:
-                kern[c] = crate_kernels(root, c)
-            for name, site in kern[c].items():
-                if flt in name:
-                    declared.setdefault(name, site)
+            if c not in scan:
+                scan[c] = crate_scan(root, c)
+        declared = {}
+        for name, site in bin_kernels([scan[c] for c in BIN_CRATES[b]]).items():
+            if flt in name:
+                declared.setdefault(name, site)
         decl[b] = declared
         have = rows.get(b, {})
         for e in sorted(set(have) - set(declared)):
@@ -383,6 +398,24 @@ pub mod kernels {
 
     #[kernel]
     pub fn k_two_8(a: &[u32]) {}
+}
+
+/// A family defined in this crate and invoked from another of a binary's crates (the gpu-side
+/// sigmoid_router_instance! shape).
+macro_rules! x_router_instance {
+    (
+        pub mod $m:ident {
+            entries: $xr:ident, $xs:ident,
+        }
+    ) => {
+        pub mod $m {
+            #[kernel]
+            pub fn $xr(a: &[u32]) {}
+
+            #[kernel]
+            pub fn $xs(a: &[u32]) {}
+        }
+    };
 }
 
 #[cfg(test)]
@@ -532,11 +565,17 @@ def self_test():
             ["generate_ds41 beta_router stale", "generate_ds41 beta_scores stale"],
             ds=DS_RS.replace("router_instance! {\n    pub mod beta {\n        experts: 256,\n        entries: beta_router, beta_scores,\n"
                              "        prepare: prepare_beta_router, prepare_beta_scores,\n    }\n}\n", ""))
-        ds3 = (DS_RS + "\nrouter_instance! {\n    pub mod gamma {\n        experts: 8,\n        entries: gamma_router, gamma_scores,\n"
+        ds3 = (DS_RS + "\ncrate::router_instance! {\n    pub mod gamma {\n        experts: 8,\n        entries: gamma_router, gamma_scores,\n"
                "        prepare: p_g_router, p_g_scores,\n    }\n}\n")
         at = f"crates/gpu-deepseek41/src/router.rs:{line_of(ds3, 'entries: gamma_router')}"
         run("macro: an added invocation's names are unpinned", 1,
             [f"generate_ds41 gamma_router unpinned ({at})", f"generate_ds41 gamma_scores unpinned ({at})"], ds=ds3)
+        # a family defined in gpu, invoked from gpu-deepseek41: per-crate binding never sees the invocation, and
+        # the names go stale or stay unseen (train0211i's mode, a red landing batch after green Mac checks).
+        ds4 = (DS_RS + "\ngpu_crate::x_router_instance! {\n    pub mod xi {\n        entries: x_router, x_scores,\n    }\n}\n")
+        at = f"crates/gpu-deepseek41/src/router.rs:{line_of(ds4, 'entries: x_router')}"
+        run("macro: a family defined in another crate of the binary binds its names", 1,
+            [f"generate_ds41 x_router unpinned ({at})", f"generate_ds41 x_scores unpinned ({at})"], ds=ds4)
         # the filter: a vision kernel without the substring is outside the pin, one with it must have a row.
         vis2 = VIS_RS + "\n#[kernel]\npub fn vis_three(a: &[f32]) {}\n"
         run("filter: a vis_ kernel with no row", 1,
