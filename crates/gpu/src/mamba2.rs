@@ -85,12 +85,13 @@
 //!   recomputes its group's channels again;
 //! - `mamba2_steps`, the step's grid: the scan only, reading the scratch. A
 //!   stage of [`STAGE_T`] tokens — each token's group `B` and `C`, its 16 `x`
-//!   channels and its head's `σ` and `dA`, 274 floats a token — is
-//!   double-buffered (2 · 8 · 274 · 4 = 17 536 B of static shared memory, so
-//!   five blocks an SM at sm_86's 100 KB, against the 2 176 B that held one
-//!   token before), so a token is a barrier only each eighth: the per-token
-//!   conv and its `expf` no longer sit between barriers. The state stays in
-//!   registers over the `U` tokens, stored once at the end; `D`, the gate
+//!   channels, its head's `σ` and `dA` and its 16 `z` channels, 290 floats a
+//!   token — is double-buffered (2 · 5 · 290 · 4 = 11 600 B of static shared
+//!   memory, so up to eight blocks an SM at sm_86's 100 KB, against the 2 176 B
+//!   that held one token before), so a token is a barrier only each fifth, and
+//!   the scan's loop reads shared memory only: the per-token conv, its `expf`
+//!   and the gate's `z` load no longer sit between barriers. The state stays
+//!   in registers over the `U` tokens, stored once at the end; `D`, the gate
 //!   and the un-normed `y` row are the step's;
 //! - `mamba2_ring_tail`: the inputs of positions `max(p, p + U − RING_ROWS)
 //!   .. p + U − 1` into their ring slots, what the steps' last writes leave;
@@ -132,22 +133,38 @@ const CH_PER_BLOCK: usize = WARPS * CH_PER_WARP;
 /// Shared f32s a block stages: its group's `B` and `C`, then its `x`.
 const STAGED: usize = 2 * STATE + CH_PER_BLOCK;
 /// Tokens of one stage of the pass's scan ([`mamba2_steps`]): the stage holds
-/// each token's group `B` and `C`, its 16 `x` channels and its head's `σ` and
-/// `dA`. 8 keeps the double-buffered stage at 17 536 B of static shared
-/// memory (five blocks an SM at sm_86's 100 KB) while dropping the barrier to
-/// one an eighth token; 16 would hold 35 072 B and two blocks an SM.
-pub const STAGE_T: usize = 8;
-/// Shared f32s one staged token of the pass's scan holds.
-const TOKEN_STAGED: usize = 2 * STATE + CH_PER_BLOCK + 2;
+/// each token's group `B` and `C`, its 16 `x` channels, its head's `σ` and
+/// `dA` and its 16 `z` channels. 5 keeps the double-buffered stage at
+/// 11 600 B of static shared memory: eight blocks an SM at sm_86's 100 KB
+/// (each block also reserves 1 KB: 8 · 12 624 B <= 102 400 B), one more than
+/// [`mamba2_steps`]'s register bound asks; 6 would hold 13 920 B and six
+/// blocks, 8 18 560 B and five.
+pub const STAGE_T: usize = 5;
+/// Shared f32s one staged token of the pass's scan holds: [`STAGED`] items
+/// (`B`, `C`, `x`), `σ` and `dA`, then the `z` channels.
+const TOKEN_STAGED: usize = STAGED + 2 + CH_PER_BLOCK;
+/// Where a staged token's `z` channels begin.
+const STAGED_Z: usize = STAGED + 2;
 /// The pass's scan stage: two halves of [`STAGE_T`] tokens.
 const STAGE_T2: usize = 2 * STAGE_T * TOKEN_STAGED;
 /// Staging rounds that cover a full half: `STAGE_T` tokens' items over the
 /// block's threads.
-const STAGE_ROUNDS: usize = (STAGE_T * TOKEN_STAGED + BLOCK - 1) / BLOCK;
+const STAGE_ROUNDS: usize = (STAGE_T * TOKEN_STAGED).div_ceil(BLOCK);
 
 // The entries' launch attributes spell the block out as a literal, and the
 // scan and the conv are written for these widths.
 const _: () = assert!(BLOCK == 128 && STATE == 128 && CONV_TAPS == 4 && CH_PER_BLOCK == 16);
+
+/// Whether channel `k` of the chunk exists (`chunk·16 + k < head_dim`), the
+/// compare in 32 bits: the contract holds `chunk·16 < head_dim + 16` and the
+/// state buffer holds `head_dim·128` floats, so no sum wraps. A 64-bit compare
+/// keeps two predicates a channel across the scan, one more than the register
+/// bound leaves room for.
+#[inline(always)]
+#[must_use]
+fn channel_live(chunk: usize, k: usize, head_dim: u32) -> bool {
+    ((chunk * CH_PER_BLOCK + k) as u32) < head_dim
+}
 
 #[cuda_module]
 mod mamba2_kernels {
@@ -597,7 +614,10 @@ mod mamba2_kernels {
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     #[kernel]
-    #[launch_bounds(128)]
+    // Seven blocks an SM: 72 registers a thread. A grid of 512 blocks (a
+    // 128-head, 4-chunk layer) on 84 SMs is one wave at seven; six leave a
+    // second wave of the last eight.
+    #[launch_bounds(128, 7)]
     #[launch_contract(
         domain = 1,
         block = (128, 1, 1),
@@ -644,7 +664,11 @@ mod mamba2_kernels {
             head_dim as usize,
             chunks as usize,
         );
-        let (u, ld, z0) = (u as usize, ld as usize, z0 as usize);
+        // The stage walk counts in 32 bits: `t0` is below `u`, and the item
+        // arithmetic is bounded by the stage; a 64-bit division by
+        // `TOKEN_STAGED` is a longer chain and its counters a register pair each.
+        let n_tok = u;
+        let (ld, z0) = (ld as usize, z0 as usize);
         let b = thread::blockIdx_x() as usize;
         if b >= n_head * chunks {
             return; // block-uniform
@@ -664,7 +688,7 @@ mod mamba2_kernels {
         // users (module doc: stage `s` stages into half `s mod 2`).
         let cs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE_PASS) };
         let (yp, statep) = (y.as_mut_ptr(), state.as_mut_ptr());
-        let (convp, sdp) = (conv.as_ptr(), sd.as_ptr());
+        let (convp, sdp, rowsp) = (conv.as_ptr(), sd.as_ptr(), rows.as_ptr());
         let c_x = h * hd + chunk * CH_PER_BLOCK;
 
         // The head's `D`, the one scalar no token moves, in every thread.
@@ -672,36 +696,38 @@ mod mamba2_kernels {
         let d_h = unsafe { *d.get_unchecked(h) };
 
         // The warp's four channels' state, held in registers over the pass.
+        // One index for the warp: its channels' rows are `STATE` apart, so the
+        // load and the final store address them from one base.
+        let srow = (h * hd + chunk * CH_PER_BLOCK + wid * CH_PER_WARP) * STATE + lane;
         let mut s = [0.0f32; CH_PER_WARP * 4];
         #[unroll]
         for i in 0usize..CH_PER_WARP {
-            let ch = chunk * CH_PER_BLOCK + wid * CH_PER_WARP + i;
-            if ch < hd {
-                let base = (h * hd + ch) * STATE + lane;
+            if channel_live(chunk, wid * CH_PER_WARP + i, head_dim) {
                 #[unroll]
                 for j in 0usize..4 {
                     // SAFETY: (h·hd + ch)·128 + lane + 96 < n_head·hd·128 <=
                     // state.len() by the contract.
-                    s[4 * i + j] = unsafe { *statep.add(base + 32 * j) };
+                    s[4 * i + j] = unsafe { *statep.add(srow + STATE * i + 32 * j) };
                 }
             }
         }
 
-        let mut t0 = 0usize;
-        while t0 < u {
-            let half = (t0 / STAGE_T % 2) * STAGE_T * TOKEN_STAGED;
-            let stage_n = (u - t0).min(STAGE_T);
+        let mut t0 = 0u32;
+        while t0 < n_tok {
+            let half = (t0 / STAGE_T as u32 % 2) * (STAGE_T * TOKEN_STAGED) as u32;
+            let stage_n = (n_tok - t0).min(STAGE_T as u32);
             // Stage tokens t0 .. t0 + stage_n of this block's group: each
-            // token's `B` and `C`, its 16 `x` channels and its head's `σ` and
-            // `dA`, items as the step's.
+            // token's `B` and `C`, its 16 `x` channels, its head's `σ` and
+            // `dA` and its 16 `z` channels, items as the step's.
             // Not unrolled: the rounds' index arithmetic unrolled is what
             // pushed the scan to the register cap (measured, ptx-scan), and
             // the stage writes need no ILP.
-            for round in 0usize..STAGE_ROUNDS {
-                let item = tid + BLOCK * round;
-                if item < stage_n * TOKEN_STAGED {
-                    let t_in = item / TOKEN_STAGED;
-                    let slot = item % TOKEN_STAGED;
+            for round in 0u32..STAGE_ROUNDS as u32 {
+                let item = tid as u32 + BLOCK as u32 * round;
+                if item < stage_n * TOKEN_STAGED as u32 {
+                    let t_in = (item / TOKEN_STAGED as u32) as usize;
+                    let slot = (item % TOKEN_STAGED as u32) as usize;
+                    let tok = t0 as usize + t_in;
                     let v = if slot < STAGED {
                         let (c, live) = if slot < STATE {
                             (inner + g * STATE + slot, true)
@@ -714,30 +740,40 @@ mod mamba2_kernels {
                         if live {
                             // SAFETY: (t0 + t_in)·conv_dim + c < u·conv_dim <=
                             // conv.len() by the contract.
-                            unsafe { *convp.add((t0 + t_in) * conv_dim + c) }
+                            unsafe { *convp.add(tok * conv_dim + c) }
                         } else {
                             0.0
                         }
-                    } else {
+                    } else if slot < STAGED_Z {
                         // SAFETY: 2·((t0 + t_in)·n_head + h) + (slot − STAGED)
                         // < 2·u·n_head <= sd.len() by the contract.
-                        unsafe { *sdp.add(2 * ((t0 + t_in) * n_head + h) + (slot - STAGED)) }
+                        unsafe { *sdp.add(2 * (tok * n_head + h) + (slot - STAGED)) }
+                    } else {
+                        // A masked channel (`ch >= hd`) stages 0.0 and is
+                        // never read, as `x` is.
+                        let k = slot - STAGED_Z;
+                        if chunk * CH_PER_BLOCK + k < hd {
+                            // SAFETY: (t0 + t_in)·ld + z0 + c_x + k < u·ld <=
+                            // rows.len(): the channel c_x + k − h·hd < hd, so
+                            // z0 + c_x + k < z0 + inner <= ld.
+                            unsafe { *rowsp.add(tok * ld + z0 + c_x + k) }
+                        } else {
+                            0.0
+                        }
                     };
                     // SAFETY: half + t_in·TOKEN_STAGED + slot < half +
                     // STAGE_T·TOKEN_STAGED <= STAGE_T2; this thread's item
                     // alone.
-                    unsafe { *cs.add(half + t_in * TOKEN_STAGED + slot) = v };
+                    unsafe { *cs.add(half as usize + t_in * TOKEN_STAGED + slot) = v };
                 }
             }
             thread::sync_threads();
 
-            for t_in in 0usize..stage_n {
-                let at0 = half + t_in * TOKEN_STAGED;
-                let row = (t0 + t_in) * ld;
+            for t_in in 0usize..stage_n as usize {
+                let at0 = half as usize + t_in * TOKEN_STAGED;
 
-                // SAFETY: at0 + lane + 96 + 128 < STAGE_T2 and
-                // at0 + STAGED + 1 < STAGE_T2; written before the barrier
-                // above.
+                // SAFETY: at0 + lane + 96 + 128 < STAGE_T2; written before the
+                // barrier above.
                 let (bq, cq) = unsafe {
                     (
                         [
@@ -754,16 +790,18 @@ mod mamba2_kernels {
                         ],
                     )
                 };
+                // SAFETY: at0 + STAGED + 1 < STAGE_T2; written before the
+                // barrier above.
                 let (sigma, decay) = unsafe { (*cs.add(at0 + STAGED), *cs.add(at0 + STAGED + 1)) };
                 #[unroll]
                 for i in 0usize..CH_PER_WARP {
                     let k = wid * CH_PER_WARP + i;
-                    let ch = chunk * CH_PER_BLOCK + k;
-                    if ch < hd {
-                        let at = h * hd + ch;
-                        // SAFETY: at0 + 2·STATE + k < STAGE_T2, written
-                        // before the barrier.
-                        let x = unsafe { *cs.add(at0 + 2 * STATE + k) };
+                    if channel_live(chunk, k, head_dim) {
+                        let at = c_x + k;
+                        // SAFETY: at0 + 2·STATE + k and at0 + STAGED_Z + k <
+                        // STAGE_T2, written before the barrier.
+                        let (x, zv) =
+                            unsafe { (*cs.add(at0 + 2 * STATE + k), *cs.add(at0 + STAGED_Z + k)) };
                         let x_dt = mul_rn_f32(x, sigma);
                         let mut acc = 0.0f32;
                         #[unroll]
@@ -777,9 +815,6 @@ mod mamba2_kernels {
                         acc += warp::shuffle_xor_f32(acc, 4);
                         acc += warp::shuffle_xor_f32(acc, 2);
                         acc += warp::shuffle_xor_f32(acc, 1);
-                        // SAFETY: row + z0 + at < u·ld <= rows.len(): z0 +
-                        // inner <= ld.
-                        let zv = unsafe { *rows.get_unchecked(row + z0 + at) };
                         let v = mul_rn_f32(silu(zv), acc + mul_rn_f32(x, d_h));
                         if lane == 0 {
                             if !v.is_finite() {
@@ -787,7 +822,7 @@ mod mamba2_kernels {
                             }
                             // SAFETY: (t0 + t_in)·inner + at < u·inner <=
                             // y.len(); lane 0 of this warp is its only writer.
-                            unsafe { *yp.add((t0 + t_in) * inner + at) = v };
+                            unsafe { *yp.add((t0 as usize + t_in) * inner + at) = v };
                         }
                     }
                 }
@@ -797,14 +832,12 @@ mod mamba2_kernels {
 
         #[unroll]
         for i in 0usize..CH_PER_WARP {
-            let ch = chunk * CH_PER_BLOCK + wid * CH_PER_WARP + i;
-            if ch < hd {
-                let base = (h * hd + ch) * STATE + lane;
+            if channel_live(chunk, wid * CH_PER_WARP + i, head_dim) {
                 #[unroll]
                 for j in 0usize..4 {
                     // SAFETY: as the loads above; each element is this lane's
                     // own.
-                    unsafe { *statep.add(base + 32 * j) = s[4 * i + j] };
+                    unsafe { *statep.add(srow + STATE * i + 32 * j) = s[4 * i + j] };
                 }
             }
         }
