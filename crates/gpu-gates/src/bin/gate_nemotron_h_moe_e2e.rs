@@ -46,7 +46,10 @@
 //!   |Δ| (by the triangle inequality no element's error can then swap the
 //!   two, so a differing id is the body's argmax, not the logits); below the
 //!   band the two ids and the margin are printed, not gated. The fixture's
-//!   logits are nearly flat, so a fixed floor would gate noise.
+//!   logits are nearly flat, so a fixed floor would gate noise. On every
+//!   prompt, band or not, the run's recorded id is the argmax of its own
+//!   logits row ([`argmax`]) — a row whose id is not its own argmax is
+//!   a FAIL.
 //!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
@@ -66,7 +69,7 @@ mod e2e;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use crate::e2e::{Run, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
+    use crate::e2e::{Run, argmax, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
     use bloomery_gpu::arch::nemotron_h_moe::Routing;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
@@ -622,6 +625,14 @@ mod gate {
             let margin = f64::from(want[top[0]]) - f64::from(want[top[1]]);
             let band = 2.0 * max_delta;
             let mainline = top[0] as u32;
+            let own = argmax(&run.logits);
+            if run.id != own {
+                println!(
+                    "{CLAUSE}: {} run id {} is not its logits' argmax {own} FAIL",
+                    p.name, run.id
+                );
+                ok = false;
+            }
             if margin > band {
                 gated += 1;
                 let pass = run.id == mainline;
