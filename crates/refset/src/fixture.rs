@@ -6,7 +6,9 @@
 //! set read against the next: a set of seed 1 read against a fixture of seed 2
 //! would open without complaint, and its differences from the engine would
 //! look like engine bugs. The `# fixture` line carries every
-//! `bloomery.fixture.*` header key of the file the set was dumped from, and a
+//! `bloomery.fixture.*` header key of the file the set was dumped from but the
+//! card budget (a planning input that moves no byte of the file or of any
+//! reference output, so a re-pinned budget needs no new dump), and a
 //! family of the fixture identities ([`crate::family::Identity::FixtureManifest`])
 //! holds the set to the line of the file the tree runs ([`line`]).
 //!
@@ -55,6 +57,9 @@ const DIRS: &[(&str, &str)] = &[
 const KEY_PREFIX: &str = "bloomery.fixture.";
 /// u32: its presence marks a fixture.
 const KEY_VERSION: &str = "bloomery.fixture.version";
+/// u64: the card byte budget the fixture's gate plans under. A planning input: no byte of the file and no
+/// reference output depends on it, so the `# fixture` line leaves it out ([`keys`]).
+const KEY_CARD_BUDGET: &str = "bloomery.fixture.card_budget";
 /// String array: present only on a file that holds some of the planned
 /// tensors.
 const KEY_SUBSET: &str = "bloomery.fixture.subset";
@@ -302,11 +307,12 @@ pub fn line(first_shard: &Path) -> Result<String, RefError> {
 
 /// `stated`, the text after the tab of the `# fixture` line set `set` carries, against the [`line`] of the fixture file
 /// whose first shard is `first_shard`: [`RefError::Stale`] unless the two lines are the same string, naming both. A set
-/// that states none is stale too — nothing says which generation of the fixture it came from.
+/// that states none is stale too — nothing says which generation of the fixture it came from. A line dumped while the
+/// line still carried the card budget is read without that token ([`without_budget`]): the budget is not a generation.
 pub fn check_stated(set: &Path, stated: Option<&str>, first_shard: &Path) -> Result<(), RefError> {
     let runs = line(first_shard)?;
     let dumped_from = stated.map(|s| format!("{LINE_PREFIX}{s}"));
-    if dumped_from.as_deref() == Some(runs.as_str()) {
+    if stated.map(without_budget).as_deref() == runs.strip_prefix(LINE_PREFIX) {
         return Ok(());
     }
     Err(RefError::Stale {
@@ -317,8 +323,19 @@ pub fn check_stated(set: &Path, stated: Option<&str>, first_shard: &Path) -> Res
     })
 }
 
+/// `text`, the body of a `# fixture` line, without its `bloomery.fixture.card_budget=` token: what sets dumped while
+/// the line still carried the budget state, read as the line of today.
+fn without_budget(text: &str) -> String {
+    let token = format!("{KEY_CARD_BUDGET}=");
+    text.split(' ')
+        .filter(|part| !part.starts_with(&token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// What follows the tab of the `# fixture` line: every header key of the file
-/// that starts with `bloomery.fixture.`, sorted by byte order, each as
+/// that starts with `bloomery.fixture.` but the card budget ([`KEY_CARD_BUDGET`]),
+/// sorted by byte order, each as
 /// `key=value`, joined by one space. A value is an integer in decimal, a bool
 /// as `true` or `false`, a string verbatim, or an array of those joined by
 /// `,` with no spaces. The header only is read: the file is mapped lazily, so
@@ -370,7 +387,7 @@ pub fn keys(first_shard: &Path) -> Result<String, RefError> {
         ));
     }
     let mut parts = Vec::with_capacity(held.len());
-    for (key, v) in held {
+    for (key, v) in held.into_iter().filter(|(k, _)| *k != KEY_CARD_BUDGET) {
         parts.push(format!("{key}={}", render(&file, key, v)?));
     }
     Ok(parts.join(" "))

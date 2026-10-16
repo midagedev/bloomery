@@ -63,8 +63,8 @@ fn fixture_kvs(seed: u64) -> Vec<(String, Value)> {
     ]
 }
 
-/// The line of [`fixture_kvs`] of seed 1, written out.
-const LINE_SEED_1: &str = "# fixture\tbloomery.fixture.card_budget=8589934592 bloomery.fixture.seed=1 \
+/// The line of [`fixture_kvs`] of seed 1, written out: every fixture key but the card budget.
+const LINE_SEED_1: &str = "# fixture\tbloomery.fixture.seed=1 \
                            bloomery.fixture.source_header_sha256=0123abcd \
                            bloomery.fixture.source_layers=0,3,5 bloomery.fixture.version=1";
 
@@ -75,9 +75,9 @@ fn line_of(dir: &Path, kvs: &[(String, Value)]) -> Result<String, RefError> {
     line(&path)
 }
 
-/// The line holds every `bloomery.fixture.` key, sorted by byte order, each
-/// `key=value` and one space between, whatever order the file lists them in;
-/// a key that only starts like the prefix is not in it.
+/// The line holds every `bloomery.fixture.` key but the card budget, sorted by
+/// byte order, each `key=value` and one space between, whatever order the file
+/// lists them in; a key that only starts like the prefix is not in it.
 #[test]
 fn the_line_is_every_fixture_key_sorted() -> Result<(), RefError> {
     let dir = temp("line")?;
@@ -594,6 +594,98 @@ fn a_node_set_of_another_generation_is_stale() -> Result<(), RefError> {
 
     remove(&root)?;
     remove(&other)?;
+    remove(&set)
+}
+
+/// `kvs` with the value of `key` replaced.
+fn with_key(kvs: &[(String, Value)], key: &str, v: Value) -> Vec<(String, Value)> {
+    let mut out = kvs.to_vec();
+    let slot = out
+        .iter_mut()
+        .find(|(k, _)| k == key)
+        .unwrap_or_else(|| panic!("{key} is not in the header"));
+    slot.1 = v;
+    out
+}
+
+/// The card budget is not a generation of the fixture: a set dumped before the budget moved, in the line's old form
+/// (the budget token in it) or the new one (without), opens against the re-budgeted file; the same set against a file
+/// that moved one key of the file's identity (the seed, the source's header digest, the layer map, the version) is still
+/// stale and names both lines.
+#[test]
+fn a_budget_move_leaves_a_set_current_and_another_key_does_not() -> Result<(), RefError> {
+    let root = temp("budget-root")?;
+    let set = temp("budget-set")?;
+    let u = under("fx-ik-glm5next", "ik-glm5next")?;
+    let (arch, build) = (u.arch, u.build);
+    let before = fixture_kvs(1);
+    let first = root_with(&root, arch, &before)?;
+    let ours = line(Path::new(&first))?;
+    assert!(!ours.contains("card_budget"), "{ours}");
+    // The old line: the same keys with the budget first, where the byte order put it.
+    let old = format!("bloomery.fixture.card_budget=8589934592 {}", body(&ours));
+
+    let moved = with_key(
+        &before,
+        "bloomery.fixture.card_budget",
+        Value::U64(8_590_983_168),
+    );
+    root_with(&root, arch, &moved)?;
+    assert_eq!(
+        line(Path::new(&first))?,
+        ours,
+        "the budget is not in the line"
+    );
+    for stated in [old.as_str(), body(&ours)] {
+        write_node_set(&set, arch, &first, Some(stated), build, true);
+        let p = open(u.family, &root, &set)?;
+        assert_eq!(p.dumped_from, first);
+    }
+
+    let moves = [
+        (
+            "seed",
+            with_key(&moved, "bloomery.fixture.seed", Value::U64(2)),
+        ),
+        (
+            "source_header_sha256",
+            with_key(
+                &moved,
+                "bloomery.fixture.source_header_sha256",
+                Value::String("4567ef01".to_string()),
+            ),
+        ),
+        (
+            "source_layers",
+            with_key(
+                &moved,
+                "bloomery.fixture.source_layers",
+                Value::Array(vec![Value::U32(0), Value::U32(3), Value::U32(6)]),
+            ),
+        ),
+        (
+            "version",
+            with_key(&moved, "bloomery.fixture.version", Value::U32(2)),
+        ),
+    ];
+    for (key, kvs) in moves {
+        root_with(&root, arch, &kvs)?;
+        let theirs = line(Path::new(&first))?;
+        assert_ne!(theirs, ours, "{key}");
+        for stated in [old.as_str(), body(&ours)] {
+            write_node_set(&set, arch, &first, Some(stated), build, true);
+            let e = open(u.family, &root, &set).expect_err(key);
+            assert!(matches!(e, RefError::Stale { .. }), "{key}: {e:?}");
+            let e = e.to_string();
+            assert!(
+                e.contains(&format!("dumped from # fixture\t{stated}"))
+                    && e.contains(&format!("the tree runs {theirs}")),
+                "{key}: {e}"
+            );
+        }
+    }
+
+    remove(&root)?;
     remove(&set)
 }
 
