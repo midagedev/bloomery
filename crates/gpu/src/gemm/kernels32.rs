@@ -1,6 +1,7 @@
 //! The one device module of the 32-value-block family: the Q8_0, IQ4_NL,
-//! Q5_1 and packed Q5_0 GEMMs, their activations' quantizers, the remapped
-//! route and the wide F32 product — every `#[kernel]` entry of the family,
+//! Q5_1, packed Q5_0 and NVFP4-plane GEMMs, their activations' quantizers,
+//! the remapped route and the wide F32 product — every `#[kernel]` entry of
+//! the family,
 //! so one bundle load serves them all. It is a module of its own, beside
 //! `kernels.rs`, so no entry of the K-quant family's module changes with it.
 //! Each GEMM entry is one expansion of `gemm32.rs`'s block; the quantizer,
@@ -346,6 +347,7 @@ mod gemm32_kernels {
         gemm32_block!(
             wt: plane(qs, wd),
             mins: false,
+            epi: plain,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),
         );
@@ -395,6 +397,7 @@ mod gemm32_kernels {
         gemm32_block!(
             wt: q8f(w),
             mins: false,
+            epi: plain,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),
         );
@@ -445,6 +448,7 @@ mod gemm32_kernels {
         gemm32_block!(
             wt: q51(w),
             mins: true,
+            epi: plain,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),
         );
@@ -501,6 +505,7 @@ mod gemm32_kernels {
         gemm32_block!(
             wt: q50p(w, s_words),
             mins: false,
+            epi: plain,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),
         );
@@ -553,6 +558,68 @@ mod gemm32_kernels {
         gemm32_block!(
             wt: iq4nl(w),
             mins: false,
+            epi: plain,
+            params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
+                n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_q8_0p`] for the resident NVFP4 planes (`mxfp4.rs`, `repack`):
+    /// `qs` is `n_experts · rows` rows of `4 · blocks` words (one 16-byte
+    /// vector a 32-value unit), `e` their `blocks / 2` scale words — one a
+    /// 64-value block, its four UE4M3 bytes, every one the repack checked —
+    /// and `scale` the tensor's F32 scale. Each staged row's eight code
+    /// words are the unit's nibbles decoded through the E2M1 table in value
+    /// order and words 16 and 18 its two sub-block scales as f32; the store
+    /// multiplies by `scale`. No min term (`s` is not read), and K is a
+    /// multiple of 64 (the host refuses it otherwise, so a unit's stream
+    /// index carries its half of the block).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            qs.len() >= n_experts * rows * 4 * blocks,
+            2 * e.len() >= n_experts * rows * blocks,
+            2 * steps >= blocks,
+            q.len() >= act_cols * 16 * steps,
+            d.len() >= act_cols * 2 * steps,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_nvfp4p(
+        qs: &[u32],
+        e: &[u32],
+        scale: f32,
+        q: &[u32],
+        d: &[f32],
+        s: &[i32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        blocks: u32,
+        steps: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        gemm32_block!(
+            wt: nvfp4p(qs, e, scale),
+            mins: false,
+            epi: nvfp4p,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),
         );
