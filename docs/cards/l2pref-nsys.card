@@ -1,0 +1,60 @@
+# PR #27 (@juliankang4): every decode gemv warp issues prefetch.global.L2 for its whole weight row before the walk. The same-lease
+# A/B (docs/cards/l2pref-a6000.card, 14 rounds, Qwen3.6-35B-A3B Q4_K_M, depth 6, n = 96, ctx 256, A6000) measured the candidate at
+# 0.9570 +- 0.0006 of the base: step p50 4.9185 -> 5.1377 ms (mean of the 14 rounds' p50), +219.2 us a step, +4.46 %. This profile
+# says which kernels carry it. Both arms are one binary pair at the same load key; the only difference is the PR's two commits.
+#
+# Decomposition [derived]. The step is one serial chain on the card (the next token waits on this step's argmax; 520 graph
+# nodes), so the wall change is the sum of the per-kernel changes plus the change of the gaps between kernels. The prefetch adds
+# no host, PCIe, NVMe or host-DRAM work (resident load, majflt 0), and a prefetch hint adds no gap: gaps are predicted unchanged
+# (|delta gap| <= 5 us a step). So  sum over kernels of delta = 219 us +- the tracer's scatter (the A/B's step runs a few us
+# longer than the window wall by the host turnaround, the same in both arms).
+# Where it lands: the L2-room term. A warp prefetches its whole row at once, then walks it, so the lines in flight are
+# resident warps x row bytes: 84 SMs x 48 warps = 4032 warps at most (the trace's registers and block size per launch fix the
+# real count; read there). From the file's header (hidden 2048, 40 layers of which 10 full attention, 8 of 256 experts, ff 512,
+# vocab 248320) and the PR's diff, per step [derived]: gate_up (experts.rs gate_up_row, Q4_K, gate and up row = 2304 B a warp):
+# 40 x 9.4 = 377 MB, in flight 9.3 MB; the head (head_argmax.rs, Q6_K row 1680 B): 417 MB, 6.8 MB; the GDN attn_qkv (lib.rs
+# Q6_K 1-column gemv, row 1680 B, 8192 rows): 30 x 13.8 = 413 MB, 6.8 MB; the Q4_K projections (proj.rs, 1152 B a row): 4.6 MB,
+# the down (q6k_sel, K = 512, 420 B a row): 275 MB, 1.7 MB, the router (256 rows, one prefetch per layer) stay under the A6000's
+# 6 MB L2 and are predicted 0 +- 10 us. A line pushed out before its load is read from DRAM twice. Crude overflow model (an
+# upper bound: a warp frees lines as it walks): evicted fraction (in flight - 6 MB) / in flight, gate_up 35 %, head and qkv 12 %;
+# extra DRAM bytes 132, 50 and 50 MB, at ~700 GB/s +188, +71 and +71 us = 330 us against the A/B's 219. Scaled to 219 the three
+# are 125, 47 and 47 us, so the top two sum 172..259 (the scaled and the unscaled model), and the top three carry the step's
+# loss with the other kernels near 0: the band's lower edge is the A/B card's decide-in share (80 % of 219 = 175 us), the upper
+# edge the unscaled model. Which of the head and qkv is second, and whether a third carries 10 % or more, is the open term.
+# Resource timeline of one step (base 4.92 ms): card chain ~4.7 ms (~1.9 GB a step [derived] -> ~400 GB/s mean, DRAM demand at
+# 768 GB/s = 2.5 ms, so DRAM is ~53 % of the step's cycles: the step is not purely a bandwidth wall, the gemv kernels at the
+# roofline are the ones that pay for extra bytes); host CPU: graph launch + argmax readback, serial after the card, ~0.1-0.2 ms;
+# PCIe: one token id in and one out, ~20 us, inside the host turnaround; host DRAM and NVMe: 0. The wall is card + host
+# turnaround in series, never a max over resources; the lever sits wholly in the card term, so nothing hides it.
+# Wall of the two runs [derived]: the load (21.2 GB warm in the page cache, ~10 s) + 1 prefill pass + 7 replays (~40 ms) + nsys
+# finalize and export (~15 s) + the tables (~5 s) = about 1.0-2.0 min each under the lease, 3-5 min with the sync.
+kind: profile
+question: which kernels lose with PR #27's L2 row prefetch on the A6000, and by how many microseconds a decode step each?
+term: sum over the two kernels with the largest |cand - base| of the kernel time a decode step, us, mean over replay windows 2-7
+  of generate_qwen3moe --seed-depth 6 -n 8 --ctx 256 --mode graph --time on Qwen3.6-35B-A3B Q4_K_M, A6000, cand (main dc49ae45 + the
+  PR's two commits) minus base (dc49ae45)
+unit: us
+predict: 175..260
+condition: one lease per arm through tools/ref/nsys-gpu.sh's lease_take with this card, the A6000 the timing card (the witness
+  `card` block names it and its power limit; no [other-busy] and no compute process of another owner before or after, else void);
+  the base arm first, then the candidate, each from its own tree and remote dir (the sync source is the tree whose box.sh runs).
+  The runner's window boundary is named, not searched for: embed_rows_q4k count must equal N = 8 in each trace (1 prefill pass +
+  7 replays), or no table (rc 3) and the run is void; each run exits 0 and prints `time step 1 .. 7` rows; both loads print the
+  same `load` line and the capture line `nodes=520` (the A/B's), else the arms differ in more than the PR. The tracer's flags are
+  the runner's (-t cuda --cuda-graph-trace=node --cuda-event-trace=false --sample=none --cpuctxsw=none). The replay window wall
+  of each arm sits within 10 % of the A/B's step (4.92 / 5.14 ms) less the host turnaround, else the tracer stretched it: read
+  only ratios. Commands: BLOOMERY_MODEL=qwen3moe BLOOMERY_REF_MODEL=/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf
+  BLOOMERY_REMOTE='~/repo/bloomery-l2pref-base' BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/l2pref-nsys.card'
+  <that tree>/tools/box.sh 'BLOOMERY_NSYS_DEPTHS=6 BLOOMERY_NSYS_N=8 BLOOMERY_NSYS_TOP=40 bash tools/ref/nsys-gpu.sh'; the profile
+  name qwen3moe is the runner's seed-form switch (nsys-gpu.sh: FORM=seed for MODEL_NAME=qwen3moe), the file is Qwen3.6's through
+  BLOOMERY_REF_MODEL, which generate_qwen3moe reads the architecture from; the same with the candidate tree
+decide-in: the two kernels carry the loss (their delta is 175 us or more, 80 % of the A/B's): post the per-kernel table to the PR
+  (27) and ask the contributor to bound the prefetch by the rows in flight against the card's L2 on those two kernels (prefetch a
+  row's head only, or not at all when the grid's in-flight bytes pass the L2); no further profile
+decide-below: under 175 us: the loss is spread over three or more kernels, not two over-large in-flight sets: read the top five
+  against their bytes, launch counts and the trace's registers and block size (the in-flight lines), and ask the contributor for a per-kernel lever (the prefetch on the kernels that
+  gain, off on the rest) before landing; a losing kernel whose in-flight lines sit under 6 MB means the L2-room model is not its cause,
+  and the next term is the issue-slot cost of the hint
+decide-above: over 260 us: the two lose more than the step, so other kernels gain: first compare each arm's window wall with the
+  A/B's step (a stretch of more than 10 % is the tracer's: read ratios only); if they match, read the gainers, which are the
+  kernels the prefetch should stay on, and propose the PR keep it there only

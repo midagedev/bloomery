@@ -1,0 +1,25 @@
+# PR #27 (@juliankang4): every decode gemv warp issues prefetch.global.L2 for its whole weight row before the
+# walk. On two GB10s it took the Qwen3.6-35B-A3B Q4_K_M step from 11.81 to 10.14 and 11.57 to 9.96 ms (the
+# contributor's runs, section 3.5). The same kernels serve the A6000, where the change must not lose.
+# Band [derived]: the walk's loads are already near the GDDR6 rate on this card, so the latency gain is small
+# (0..+2 %); the added instructions on a kernel near ~700 GB/s are 0 (AGENTS.md change-class table), and the
+# f32 router row, the one kernel well under that rate, adds one prefetch per 128 B (-0.5 % at most). The L2-room
+# term: a warp's walk follows its prefetch at once and frees its lines as it goes, so the lines in flight
+# average half a row per resident warp: ~4.6 MB for gate_up and ~3.4 MB for the head (84 SMs x 48 warps x half
+# the row bytes at K = 2048) against 6 MB of L2, so a prefetched line is not evicted before its load: 0.
+# The contributor's worst case (whole rows, 9.3 and 6.8 MB) is the decide-below branch's first suspect.
+kind: noninf
+question: does the L2 row prefetch cost Qwen3.6 decode on the A6000?
+term: decode tok/s @ n=64, depth 6, A6000, (cand - base) / base, paired by round
+unit: %
+predict: -0.5..2
+rounds: 14
+sd: 0.6 % same-binary per round, AGENTS.md 「Know the ruler」
+condition: the lead runs BLOOMERY_AB_ROUNDS=14 BLOOMERY_BOX_ENV='BLOOMERY_AB_LOAD=arm
+  BLOOMERY_LEASE_CARD=docs/cards/l2pref-a6000.card' just depth-gpu-qwen35moe 6
+  bin:/root/repo/bloomery-l2pref-base/target/release/generate_qwen3moe:6 from the l2pref tree (main dc49ae45
+  + the PR's two commits; the base is dc49ae45); order rotated every round; no [cpu-busy] or [other-busy] row
+decide-in: land the PR as it is
+decide-below: the loss passes the margin: find the kernel by nsys on both arms (gate_up and the head first),
+  and ask the contributor to bound the prefetch by the rows in flight against the card's L2 before landing
+decide-above: land it and record the A6000 gain beside the GB10 numbers
