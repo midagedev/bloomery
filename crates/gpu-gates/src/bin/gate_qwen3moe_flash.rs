@@ -885,6 +885,7 @@ mod gate {
             &all,
             g.scale,
             (g.n_kv * GROUP, g.n_kv),
+            0,
         );
         let differ = rows_alone(k, gpu, &rows, &counts, cache, g, &all)?;
         let pass = band && differ == 0;
@@ -912,7 +913,7 @@ mod gate {
         // The prefill flash (module doc): one rescale per 64-key tile, the
         // f16 weights normalized by their own sum, the tensor core's value
         // accumulation and the lanes' weight sums.
-        let bound_pref = prefill_bound(&ex, vh, HEAD, PREF_TILE);
+        let bound_pref = prefill_bound(&ex, vh, HEAD, PREF_TILE, 0);
         let ExactAttn {
             o,
             a,
@@ -1574,6 +1575,7 @@ mod gate {
                     &y,
                     g.scale,
                     (g.n_kv * GROUP, g.n_kv),
+                    0,
                 );
                 let differ = rows_alone(k, gpu, &q, &counts, (&c.kc, &c.vc), &g, &y)?;
                 let pass = rerun && nan_same && band && differ == 0;

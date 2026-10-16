@@ -77,6 +77,7 @@ const ACROSS_NAME: &str = "bloomery-tier-";
 /// Field order is drop order: the pumps stop before the pages go.
 pub(super) struct Link {
     mirror: Option<Mirror>,
+    remote: Option<Remote>,
     page: Arc<MappedHost>,
     /// On a shared page the counters this end releases; mirrored ends hold
     /// their own ([`Side::counters`]).
@@ -98,6 +99,21 @@ struct Mirror<P = MappedHost> {
     /// A test's tier card that runs on once released ([`Link::run_on`]).
     #[cfg(test)]
     run_on: Option<(usize, u32)>,
+}
+
+/// This process's ends of remote links, sharing its one page.
+#[derive(Default)]
+struct Remote {
+    pumps: Vec<Pump>,
+    ends: Vec<Arc<dyn Side>>,
+    counters: Vec<Vec<usize>>,
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        self.pumps.clear();
+        drop_settled(&self.ends);
+    }
 }
 
 impl pump::Page for MappedHost {
@@ -407,6 +423,7 @@ impl Link {
     ) -> Result<Link, GpuError> {
         Ok(Link {
             mirror: None,
+            remote: None,
             page: Arc::new(MappedHost::new(ctx, bytes, "cuMemHostAlloc (tier page)")?),
             counters,
             path: None,
@@ -432,6 +449,7 @@ impl Link {
         let page = MappedHost::shared_file(ctx, &path, bytes, true, "the tier page's file")?;
         Ok(Link {
             mirror: None,
+            remote: None,
             page: Arc::new(page),
             counters,
             path: Some(path),
@@ -462,6 +480,7 @@ impl Link {
         let page = MappedHost::shared_file(ctx, path, bytes, false, "the tier page's file")?;
         Ok(Link {
             mirror: None,
+            remote: None,
             page: Arc::new(page),
             counters,
             path: None,
@@ -539,6 +558,7 @@ impl Link {
                 #[cfg(test)]
                 run_on: None,
             }),
+            remote: None,
             page,
             counters: Vec::new(),
             path: None,
@@ -578,10 +598,76 @@ impl Link {
                 #[cfg(test)]
                 run_on: None,
             }),
+            remote: None,
             page,
             counters: Vec::new(),
             path: None,
         })
+    }
+
+    /// A local page with room for every remote end's relay tail.
+    pub(super) fn remote(
+        ctx: &Arc<CudaContext>,
+        bytes: usize,
+        crossings: usize,
+    ) -> Result<Link, GpuError> {
+        let (_, total) = link_tail(bytes, crossings);
+        let mut link = Self::shared(ctx, total, Vec::new())?;
+        link.remote = Some(Remote::default());
+        Ok(link)
+    }
+
+    /// An unconnected end over this page, on the control socket's RoCE port.
+    pub(super) fn rdma_end(
+        &self,
+        tail: usize,
+        crossings: Vec<Crossing>,
+        side: Reader,
+        ip: std::net::IpAddr,
+    ) -> Result<RdmaEnd, GpuError> {
+        let std::net::IpAddr::V4(ip) = ip else {
+            return Err(GpuError::shape(
+                "the remote tier link",
+                "an IPv4 RoCE port is required",
+            ));
+        };
+        let (dev, gid) = bloomery_verbs::roce_v2_at(ip)
+            .map_err(|e| GpuError::link("the remote tier link", e.to_string()))?;
+        RdmaEnd::new(Arc::clone(&self.page), tail, crossings, side, &dev, gid)
+    }
+
+    /// Keep a connected end and its pump until this page drops.
+    pub(super) fn keep_remote(&mut self, end: RdmaEnd) {
+        let remote = self.remote.as_mut().expect("a remote page holds its ends");
+        let (pump, side) = end.into_parts();
+        remote.pumps.extend(pump);
+        remote.counters.push(side.counters());
+        remote.ends.push(side);
+    }
+
+    pub(super) fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// One reset phase on this process's side, after both cards have drained.
+    pub(super) fn reset_remote(&self, phase: u8, counters: &[usize]) -> Result<(), String> {
+        let remote = self.remote.as_ref().ok_or("not a remote page")?;
+        for &off in counters {
+            let end = remote
+                .ends
+                .iter()
+                .zip(&remote.counters)
+                .find(|(_, counters)| counters.contains(&off))
+                .map(|(end, _)| end)
+                .ok_or_else(|| format!("no remote end carries counter {off}"))?;
+            match phase {
+                0 => end.stop(off),
+                1 => end.reset_writer(off),
+                2 => end.reset_reader(off),
+                _ => return Err(format!("unknown remote reset phase {phase}")),
+            }
+        }
+        self.broken().map_or(Ok(()), Err)
     }
 
     /// The page the tier cards reach: the shared page, or the tier cards'
@@ -667,6 +753,10 @@ impl Link {
     /// its own counters as they are, so its cards keep waiting: `Err` names
     /// it, and the link's drop never frees its pages.
     pub(super) fn release(&self, v: u32) -> Result<(), String> {
+        if let Some(remote) = &self.remote {
+            let ends: Vec<&dyn Side> = remote.ends.iter().map(|e| &**e).collect();
+            return release_settled(&ends, v);
+        }
         match &self.mirror {
             None => {
                 self.counters.iter().for_each(|&off| self.store(off, v));
@@ -680,6 +770,14 @@ impl Link {
     /// no go or signal pending, and on mirrored pages every generation
     /// carried and no end broken.
     pub(super) fn at_rest(&self, off: usize) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote
+                .ends
+                .iter()
+                .zip(&remote.counters)
+                .find(|(_, counters)| counters.contains(&off))
+                .is_some_and(|(end, _)| end.at_rest(off));
+        }
         match &self.mirror {
             None => self.load(off) == 0,
             Some(m) => m.at_rest(off),
@@ -694,6 +792,9 @@ impl Link {
     /// the counter carries again. Mirrored pages that stopped carrying for
     /// good, before the reset or in it, fail it by why ([`Link::broken`]).
     pub(super) fn reset(&self, off: usize) -> Result<(), String> {
+        if self.remote.is_some() {
+            return Err("a remote page resets both ends over its control channel".to_string());
+        }
         match &self.mirror {
             None => {
                 self.store(off, 0);
@@ -707,6 +808,13 @@ impl Link {
     /// neither 0 nor 1, a post the wire failed, or a pump thread that ended.
     /// `None` on the shared page.
     pub(super) fn broken(&self) -> Option<String> {
+        if let Some(remote) = &self.remote {
+            return remote
+                .ends
+                .iter()
+                .find_map(|e| e.broken())
+                .or_else(|| remote.pumps.iter().find_map(Pump::ended));
+        }
         self.mirror.as_ref()?.broken()
     }
 }
@@ -799,7 +907,66 @@ fn across_named(path: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    use super::*;
+
+    pub(in crate::host) fn remote_with_wire(
+        ctx: &Arc<CudaContext>,
+        bytes: usize,
+        crossings: Vec<Crossing>,
+        stalled: bool,
+    ) -> Link {
+        struct Held {
+            stalled: bool,
+            posted: bool,
+        }
+        impl Wire for Held {
+            fn post(&mut self, _: &[Move]) -> Result<(), String> {
+                self.posted = true;
+                Ok(())
+            }
+            fn reap(&mut self) -> Result<bool, String> {
+                if self.stalled && self.posted {
+                    Err("completion queue polling failed".into())
+                } else {
+                    Ok(true)
+                }
+            }
+            fn abort(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let mut link = Link::remote(ctx, bytes, crossings.len()).expect("a remote page");
+        let (tail, _) = link_tail(bytes, crossings.len());
+        let half =
+            Half::new(crossings.clone(), Reader::Tier, tail, &*link.page).expect("the crossings");
+        let end: Arc<dyn Side> = Arc::new(End::new(
+            half,
+            Held {
+                stalled,
+                posted: false,
+            },
+            Arc::clone(&link.page),
+        ));
+        if stalled {
+            let done = crossings
+                .iter()
+                .find(|c| c.reader == Reader::Stage)
+                .expect("a writer");
+            link.store(done.counter, 1);
+            assert!(!end.pass(), "the completion queue must fail after posting");
+            assert_eq!(
+                end.broken().as_deref(),
+                Some("completion queue polling failed")
+            );
+        }
+        link.remote = Some(Remote {
+            pumps: Vec::new(),
+            counters: vec![end.counters()],
+            ends: vec![end],
+        });
+        link
+    }
     use super::across_named;
     use std::path::Path;
 

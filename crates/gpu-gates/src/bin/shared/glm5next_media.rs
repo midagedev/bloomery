@@ -328,7 +328,14 @@ pub mod seat {
             at.cap,
             at.card.total()
         );
-        set_prefill_media(s.model_mut(), Some(at.media.image_token()))?;
+        set_prefill_media(
+            s.model_mut(),
+            Some(
+                at.media
+                    .image_token()
+                    .ok_or("the projector has no chat image token")?,
+            ),
+        )?;
         let ctx = s.model().gpu().context().clone();
         let mut tower = Resident::open(&ctx, &at)?;
         let images: Vec<Prepared> = SIZES

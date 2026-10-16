@@ -302,7 +302,7 @@ mod gate {
             let yn = run_pref(kp, gpu, &q, &counts, (&c.kn, &c.vn), ctx, scale, heads)?;
             let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
             let (band, worst) =
-                judge_prefill::<HEAD, KEY_TILE_512>(&q, &cu, &c.host, &y, scale, heads);
+                judge_prefill::<HEAD, KEY_TILE_512>(&q, &cu, &c.host, &y, scale, heads, 0);
             let mut differ = 0usize;
             for (r, &n) in counts.iter().enumerate() {
                 let one = run_pref(

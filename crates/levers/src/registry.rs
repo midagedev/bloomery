@@ -333,11 +333,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("auto"),
         doc: "The memory the NVMe expert tier's RAM arena is: `anon` an anonymous mapping, whose \
               slots a landing gives back to the kernel; `pinned` one `cuMemHostAlloc` the card \
-              maps, priced at load and never given back, its slots read by the host leg as \
-              `anon`'s are, write-combined on an integrated device alone (a discrete card's \
-              CPU reads write-combined pages uncached); `auto` is `pinned` on an integrated \
-              device and `anon` on a card with its own memory. `anon` and `pinned` are the \
-              same-binary arms. Read where the tier is built.",
+              maps, priced at load and never given back, write-combined on an integrated device \
+              alone (a discrete card's CPU reads write-combined pages uncached); a step's ids in \
+              its slots are read on the card by the step port's card leg where the family \
+              attaches it (GLM-5.3-Flash with no residency machine), which quantizes the \
+              activation as q8_1 and sums in its own order, and by the host leg as `anon`'s are \
+              elsewhere (a prompt's batch, every other load); `auto` is `pinned` on an \
+              integrated device and `anon` on a card with its own memory. `anon` and `pinned` are \
+              the same-binary arms. Read where the tier is built.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -356,7 +359,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               one machine (`weekly-gpu-ds41-lost` runs the V4.1 tier gate over it). `rdma` is \
               the loopback's two pages, each held by its own end with its own pump thread and \
               queue pair, the posts sent as RDMA writes between two queue pairs on the \
-              machine's first RoCE v2 port; it needs `libibverbs.so.1` and an active RoCE port. \
+              machine's first RoCE v2 port for local tiers, or on the control socket's local \
+              IPv4 RoCE port for node tiers. It needs `libibverbs.so.1` and an active RoCE port. \
               Each pump spins on one core while the load lives. Read where the host tier takes \
               its tier cards.",
         site: Site::Parsed {
@@ -371,10 +375,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means("every expert tier card is a card of the loading process"),
         doc: "Where a placed load's expert tiers run: the address of each tier's node, in the \
               plan's tier order, one a tier, where a `tier_server` process serves that tier's \
-              card over its control channel. The tier page is then a file under `/dev/shm`, \
-              which both processes map, so the node must share this host's memory (two \
-              processes on one machine): an address off this host is refused, and the channel \
-              has no authentication. The plan takes each tier card from its node's census. \
+              card over its control channel. A loopback node can map the stage's file under \
+              `/dev/shm`. A private IPv4 node off this host requires `BLOOMERY_TIER_LINK=rdma`: \
+              each process holds its own page and exchanges its endpoint on the channel. The \
+              channel has no authentication and belongs on a trusted network. The plan takes \
+              each tier card from its node's census. \
               Qwen3.8's load opens a tier on a node; the other families refuse one by name. \
               Read where a load takes its tier cards.",
         site: Site::Parsed {

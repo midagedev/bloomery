@@ -1,0 +1,12 @@
+kind: profile
+question: what latency does the counter relay expose for a small message on a direct RoCE link?
+term: link_probe --size 16384, 32768 and 65536 host-played one-way p50, half a request/reply, no GPU kernel
+unit: us
+predict: 1..30
+condition: two DGX Sparks on one direct RoCE port each, strict ordering, 100000 timed generations,
+  1000 warmup generations, 16 to 64 KiB each direction, one pump thread and one host player per node,
+  under lease-hold.sh on both nodes; the upper prediction is the documented full-image relay
+  round trip, while this run removes its GPU and payload work
+decide-in: retain the small-message reading beside the full-image relay reading
+decide-below: check the timer and both generation counts
+decide-above: check port selection and queue completion before a payload sweep

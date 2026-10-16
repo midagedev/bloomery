@@ -209,6 +209,22 @@ impl SplitTable {
         Ok(())
     }
 
+    /// Drop this split's mapping entries and page cache for the whole shard,
+    /// including folios that cross a table or row boundary. Pages another
+    /// process maps or locks may stay resident.
+    pub fn evict_shard(&self) -> Result<(), EngramError> {
+        let view = self.view()?;
+        let file = self.file()?;
+        let map = self.shard()?.mapping();
+        view.advise_pages(
+            map.as_ptr() as usize,
+            map.len().div_ceil(self.page) * self.page,
+            libc::MADV_DONTNEED,
+            "madvise(DONTNEED)",
+        )?;
+        fadvise_dontneed(file, 0, 0).map_err(|e| view.io("posix_fadvise(DONTNEED)", e))
+    }
+
     /// The shard's reader, whose mapping holds the table.
     fn shard(&self) -> Result<&Gguf, EngramError> {
         self.split

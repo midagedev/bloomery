@@ -63,6 +63,10 @@
 //! slot's rows `r` with `(r + s) % 4 == 0`, so each row is checked on a
 //! quarter of its expert's slots.
 //!
+//! Every reference worker must finish: a panic is a gate error, even after
+//! other workers have checked outputs. It is not a numeric or untouched-slot
+//! mismatch, and cannot be replaced with a partial reference result.
+//!
 //! `--case <text>` runs only the cases whose name contains `text` (the
 //! dense case is `dense`, the faults and refusals `fault`, the route table
 //! `route_table`).
@@ -2946,13 +2950,13 @@ mod gate {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// `each` over the slots `0..slots`, spread over the machine's threads
-        /// (at most 32), each thread folding into its own `init()`: one result
-        /// a thread, `Err` for a thread that panicked.
+        /// (at most 32), each thread folding into its own `init()`. Join every
+        /// worker before returning an error if any worker panicked.
         fn par_slots<T: Send>(
             slots: usize,
             init: impl Fn() -> T + Sync,
             each: impl Fn(usize, &mut T) + Sync,
-        ) -> Vec<std::thread::Result<T>> {
+        ) -> Result<Vec<T>, GateError> {
             let next = AtomicUsize::new(0);
             let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
             std::thread::scope(|sc| {
@@ -2971,7 +2975,19 @@ mod gate {
                         })
                     })
                     .collect();
-                hs.into_iter().map(|h| h.join()).collect()
+                let mut parts = Vec::with_capacity(threads);
+                let mut panicked = false;
+                for h in hs {
+                    match h.join() {
+                        Ok(part) => parts.push(part),
+                        Err(_) => panicked = true,
+                    }
+                }
+                if panicked {
+                    Err("reference thread panicked".into())
+                } else {
+                    Ok(parts)
+                }
             })
         }
 
@@ -3191,7 +3207,7 @@ mod gate {
             col: &(dyn Fn(usize) -> usize + Sync),
             y: &[f32],
             slots: usize,
-        ) -> Checked {
+        ) -> Result<Checked, GateError> {
             let kb = w.k / 32;
             let parts = par_slots(
                 slots,
@@ -3235,7 +3251,7 @@ mod gate {
                         }
                     }
                 },
-            );
+            )?;
             let mut all = Checked {
                 checked: 0,
                 band_off: 0,
@@ -3245,14 +3261,6 @@ mod gate {
                 first: None,
             };
             for p in parts {
-                let p = p.unwrap_or(Checked {
-                    checked: 0,
-                    band_off: 0,
-                    bits_off: 0,
-                    host_bad: 1,
-                    worst: 0.0,
-                    first: Some("reference thread panicked".into()),
-                });
                 all.checked += p.checked;
                 all.band_off += p.band_off;
                 all.bits_off += p.bits_off;
@@ -3260,7 +3268,7 @@ mod gate {
                 all.worst = all.worst.max(p.worst);
                 all.first = all.first.or(p.first);
             }
-            all
+            Ok(all)
         }
 
         /// The device side: both kernel families' modules and the engine.
@@ -3877,7 +3885,7 @@ mod gate {
                             worst,
                             first,
                             ..
-                        } = check(w, lay == Lay::Q51, ROWS, &ha, &|_| Some(0), &|s| s, &got, m);
+                        } = check(w, lay == Lay::Q51, ROWS, &ha, &|_| Some(0), &|s| s, &got, m)?;
                         let layouts = match lay {
                             Lay::Q8Plane => {
                                 y8 = got.clone();
@@ -4063,7 +4071,7 @@ mod gate {
                             &|s| s / top_k,
                             &got,
                             n_slots,
-                        );
+                        )?;
                         let fault = gpu.take_fault()?;
                         let pass = dec
                             && unwritten == 0
@@ -4172,7 +4180,14 @@ mod gate {
         /// The GEMM's `y` (token-major, `y[s · rows + r]`) against the
         /// gemv's (`yv`, the same layout) over `u` columns, each checked
         /// output against [`dot32`]'s contract bits and the gemv band.
-        fn gemv_cmp(w: &Wts, rows: usize, a: &HostAct, y: &[f32], yv: &[f32], u: usize) -> GemvCmp {
+        fn gemv_cmp(
+            w: &Wts,
+            rows: usize,
+            a: &HostAct,
+            y: &[f32],
+            yv: &[f32],
+            u: usize,
+        ) -> Result<GemvCmp, GateError> {
             let kb = w.k / 32;
             let rel = Q50_PIN * gamma(bloomery_gpu_gates::gemm32::q5_0p_gemv_roundings(kb));
             let parts = par_slots(
@@ -4221,7 +4236,7 @@ mod gate {
                         }
                     }
                 },
-            );
+            )?;
             let mut all = GemvCmp {
                 checked: 0,
                 bits_off: 0,
@@ -4232,15 +4247,6 @@ mod gate {
                 first: None,
             };
             for p in parts {
-                let p = p.unwrap_or(GemvCmp {
-                    checked: 0,
-                    bits_off: 0,
-                    band_off: 1,
-                    nonfinite: 0,
-                    worst: 0.0,
-                    same_bits: 0,
-                    first: Some("reference thread panicked".into()),
-                });
                 all.checked += p.checked;
                 all.bits_off += p.bits_off;
                 all.band_off += p.band_off;
@@ -4249,7 +4255,7 @@ mod gate {
                 all.same_bits += p.same_bits;
                 all.first = all.first.or(p.first);
             }
-            all
+            Ok(all)
         }
 
         /// `q5_0p_is_the_gemv`: the resident packed Q5_0 (`pack_q5_0`, the
@@ -4345,7 +4351,7 @@ mod gate {
                         worst,
                         same_bits,
                         first,
-                    } = gemv_cmp(&w, rows, &ha, &got, &yv, u);
+                    } = gemv_cmp(&w, rows, &ha, &got, &yv, u)?;
                     let fault = gpu.take_fault()?;
                     let pass = dec
                         && act_ok
@@ -4440,7 +4446,7 @@ mod gate {
                         &|s| s,
                         &got,
                         n_slots,
-                    );
+                    )?;
                     let fault = gpu.take_fault()?;
                     let pass =
                         dec && unwritten == 0 && band_off == 0 && bits_off == 0 && fault.is_none();
@@ -4655,7 +4661,7 @@ mod gate {
                     &|s| s,
                     &got,
                     n_slots,
-                );
+                )?;
                 let fault = gpu.take_fault()?;
                 let pass = dec
                     && table_ok
@@ -5149,6 +5155,129 @@ mod gate {
             ok &= refusals(&dev)?;
             println!("gemm32 wall_s={:.1}", t0.elapsed().as_secs_f64());
             Ok(ok)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use bloomery_gpu_gates::exit_with;
+            use std::process::ExitCode;
+
+            fn assert_gate_failure<T>(result: Result<T, GateError>) {
+                assert!(
+                    result.is_err(),
+                    "a partial reference is not a completed check"
+                );
+                assert_eq!(
+                    exit_with("gate_gemm", result.map(|_| ())),
+                    ExitCode::FAILURE
+                );
+            }
+
+            #[test]
+            fn checked_workers_must_complete() {
+                let (rows, k, slots) = (2, 32, 3);
+                let (w, decoded) = weights(false, rows, k, 73).expect("finite weights");
+                assert!(decoded);
+                let (a, _) = host_act(&activations(k, slots, 91), k, slots);
+                let mut y = Vec::with_capacity(rows * slots);
+                for s in 0..slots {
+                    for r in 0..rows {
+                        y.push(row_dot(&w, r, &a, s, false).0);
+                    }
+                }
+                let run = |expert: &(dyn Fn(usize) -> Option<usize> + Sync),
+                           col: &(dyn Fn(usize) -> usize + Sync),
+                           y: &[f32],
+                           slots| {
+                    check(&w, false, rows, &a, expert, col, y, slots)
+                };
+                let clean = run(&|_| Some(0), &|s| s, &y, slots).expect("complete reference");
+                assert_eq!(clean.checked, rows * slots);
+                assert_eq!((clean.band_off, clean.bits_off, clean.host_bad), (0, 0, 0));
+                let mut wrong = y.clone();
+                wrong[0] = SENT;
+                let mismatch = run(&|_| Some(0), &|s| s, &wrong, slots).expect("numeric mismatch");
+                assert_eq!((mismatch.band_off, mismatch.bits_off), (1, 1));
+                let host = run(&|_| None, &|s| s, &vec![SENT; y.len()], slots)
+                    .expect("untouched host slots");
+                assert_eq!((host.checked, host.host_bad), (0, 0));
+                let written = run(&|_| None, &|s| s, &y, slots).expect("written host slots");
+                assert_eq!(written.host_bad, slots);
+                let empty = run(&|_| Some(0), &|s| s, &[], 0).expect("no work");
+                assert_eq!(empty.checked, 0);
+
+                let calls = AtomicUsize::new(0);
+                assert_gate_failure(run(
+                    &|_| Some(0),
+                    &|s| {
+                        if s == 1 {
+                            assert_eq!(calls.fetch_add(1, Ordering::Relaxed), 0, "reference panic");
+                        }
+                        s
+                    },
+                    &y,
+                    slots,
+                ));
+                assert_eq!(calls.load(Ordering::Relaxed), 2);
+                assert_gate_failure(run(&|_| Some(0), &|_| panic!("reference panic"), &y, slots));
+                assert_gate_failure(par_slots::<()>(
+                    slots,
+                    || panic!("reference initializer panic"),
+                    |_, _| {},
+                ));
+            }
+
+            #[test]
+            fn gemv_comparison_workers_must_complete() {
+                let (rows, k, slots) = (2, 32, 3);
+                let (w, decoded) = weights_q50(rows, k, 74).expect("finite weights");
+                assert!(decoded);
+                let (a, _) = host_act(&activations(k, slots, 92), k, slots);
+                let mut y = Vec::with_capacity(rows * slots);
+                for s in 0..slots {
+                    for r in 0..rows {
+                        y.push(row_dot(&w, r, &a, s, false).0);
+                    }
+                }
+                let clean = gemv_cmp(&w, rows, &a, &y, &y, slots).expect("complete comparison");
+                assert_eq!(clean.checked, rows * slots);
+                assert_eq!((clean.bits_off, clean.band_off, clean.nonfinite), (0, 0, 0));
+                assert_gate_failure(gemv_cmp(&w, rows, &a, &y, &y[..y.len() - 1], slots));
+                assert_gate_failure(gemv_cmp(&w, rows, &a, &y, &[], slots));
+            }
+
+            #[test]
+            fn kquant_reference_workers_must_complete() {
+                use super::super::{Input, Stack, check_ref, decode, dot_ref};
+
+                let (rows, k, slots) = (2, 256, 3);
+                let st = Stack {
+                    name: "reference".into(),
+                    ty: GemmWeight::Q4K,
+                    bytes: synthetic(GemmWeight::Q4K, rows, 75).into(),
+                    n_exp: 1,
+                    rows,
+                    k,
+                    input: Input::PerSlot(1),
+                };
+                let ids = vec![0; slots];
+                let codes = vec![vec![1; k]; slots];
+                let d8 = vec![vec![0.5; k / 128]; slots];
+                let rb = st.ty.block_bytes();
+                let mut y = Vec::with_capacity(rows * slots);
+                for s in 0..slots {
+                    for r in 0..rows {
+                        let dec = decode(st.ty, &st.bytes[r * rb..(r + 1) * rb], k);
+                        y.push(dot_ref(&dec, &codes[s], &d8[s]).2);
+                    }
+                }
+                let clean = check_ref(&st, &ids, &codes, &d8, &y).expect("complete reference");
+                assert_eq!(clean.checked, rows * slots);
+                assert!(clean.decode_ok && clean.fail.is_none() && clean.bits_differ == 0);
+                assert_gate_failure(check_ref(&st, &ids, &codes, &d8, &y[..y.len() - 1]));
+                assert_gate_failure(check_ref(&st, &ids, &codes, &d8, &[]));
+            }
         }
     }
 }

@@ -48,6 +48,7 @@ pub mod ptx;
 pub mod q36_fixture;
 pub mod q38_fixture;
 pub mod qwen3moe;
+pub mod qwen_seat;
 pub mod record;
 #[cfg(feature = "gpu")]
 pub mod residency;

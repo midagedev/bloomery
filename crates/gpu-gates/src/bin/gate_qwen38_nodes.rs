@@ -137,6 +137,11 @@ mod gate {
             out: PathBuf,
             server: u32,
         },
+        Decode {
+            gib: u64,
+            tokens: usize,
+            out: PathBuf,
+        },
         /// A node 0 that holds its stage's stream and asks a step.
         Hold0 {
             gib: u64,
@@ -146,14 +151,14 @@ mod gate {
     fn parse_args() -> Result<Mode, GateError> {
         const USAGE: &str = "usage: gate_qwen38_nodes (node 0 modes, run by the gate: --node0 \
                              <gib> <out> <server pid> | --hold0 <gib>) or --measure \
-                             <local|node> <gib>";
+                             <local|node> <gib> or --decode0 <gib> <tokens> <out>";
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let gib = |s: &str| -> Result<u64, GateError> {
+        let gib = |s: &str, max: u64| -> Result<u64, GateError> {
             let n = s
                 .parse::<u64>()
                 .map_err(|e| format!("{s:?}: {e}: {USAGE}"))?;
-            if n == 0 || n > TOP_GIB {
-                return Err(format!("budget must be in 1..={TOP_GIB} GiB").into());
+            if n == 0 || n > max {
+                return Err(format!("budget must be in 1..={max} GiB").into());
             }
             Ok(n)
         };
@@ -161,18 +166,39 @@ mod gate {
             match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
                 [] => Mode::Gate,
                 ["--node0", g, out, server] => Mode::Node0 {
-                    gib: gib(g)?,
+                    gib: gib(g, TOP_GIB)?,
                     out: PathBuf::from(out),
                     server: server
                         .parse()
                         .map_err(|e| format!("{server:?}: {e}: {USAGE}"))?,
                 },
-                ["--hold0", g] => Mode::Hold0 { gib: gib(g)? },
+                ["--decode0", g, tokens, out] => {
+                    let tokens: usize = tokens
+                        .parse()
+                        .map_err(|e| format!("{tokens:?}: {e}: {USAGE}"))?;
+                    if tokens == 0 || tokens > CTX - PROMPT {
+                        return Err(format!(
+                            "decode tokens must be in 1..={}: {USAGE}",
+                            CTX - PROMPT
+                        )
+                        .into());
+                    }
+                    Mode::Decode {
+                        gib: gib(g, u64::MAX >> 30)?,
+                        tokens,
+                        out: PathBuf::from(out),
+                    }
+                }
+                ["--hold0", g] => Mode::Hold0 {
+                    gib: gib(g, TOP_GIB)?,
+                },
                 ["--measure", arm @ ("local" | "node"), g] => Mode::Measure {
                     arm: arm.to_string(),
-                    gib: gib(g)?,
+                    gib: gib(g, TOP_GIB)?,
                 },
-                ["--measure-node0", g] => Mode::MeasureNode0 { gib: gib(g)? },
+                ["--measure-node0", g] => Mode::MeasureNode0 {
+                    gib: gib(g, TOP_GIB)?,
+                },
                 _ => return Err(USAGE.into()),
             },
         )
@@ -840,11 +866,11 @@ mod gate {
             if opened[0] != Tag::Ok as u8 {
                 return Err(format!("bind: node 1 refused the valid open: {opened:?}").into());
             }
-            let path = alias.to_str().ok_or("a symlink path not UTF-8")?;
-            payload.clear().str(path).len(before.len()).len(1).len(0);
+            payload.clear();
+            bloomery_gpu::host::node::write_file_bind(&alias, before.len(), 1, 0, &mut payload)?;
             let reply = node_reply(&mut s, Tag::Bind, payload.done())?;
-            let refused =
-                reply[0] == Tag::Err as u8 && String::from_utf8_lossy(&reply[1..]).contains(path);
+            let refused = reply[0] == Tag::Err as u8
+                && String::from_utf8_lossy(&reply[1..]).contains(alias.to_string_lossy().as_ref());
             s.shutdown(Shutdown::Both)?;
             drop(s);
             let ended = n1.wait_within(Duration::from_secs(60))?;
@@ -1396,7 +1422,7 @@ mod gate {
         Ok(())
     }
 
-    fn measure(c: &Common, gib: u64) -> Result<(), GateError> {
+    fn measure(c: &Common, gib: u64, decode: Option<(usize, &Path)>) -> Result<(), GateError> {
         let nodes = bloomery_levers::tier_nodes()?;
         let (arm, card, at) = match nodes.as_slice() {
             [] => {
@@ -1408,8 +1434,19 @@ mod gate {
             _ => return Err("tier cost needs exactly one tier".into()),
         };
         let machine = c.machine(card)?;
-        let plan = plan_under(&c.inputs, &machine, gib)?
-            .map_err(|why| format!("under {gib} GiB: {why}"))?;
+        let plan = if decode.is_some() {
+            c.inputs.plan_with(
+                &machine,
+                CTX as u64,
+                &PlanLevers {
+                    card_budget_bytes: Some(gib << 30),
+                },
+                Experts::Card,
+            )?
+        } else {
+            plan_under(&c.inputs, &machine, gib)?
+                .map_err(|why| format!("under {gib} GiB: {why}"))?
+        };
         let identity = format!(
             "ctx={CTX} ub={} stage={:?} tier={:?} host={} host_bytes={}",
             c.ub, plan.n_l, plan.tier_n_l, plan.host.experts, plan.host.expert_bytes
@@ -1443,35 +1480,108 @@ mod gate {
             .map(str::parse::<u32>)
             .collect::<Result<Vec<_>, _>>()?
             .len();
-        let expected = if at.is_some() { 2 } else { 1 };
+        let expected = if at.is_some() {
+            let local = Command::new("nvidia-smi")
+                .args(["--query-gpu=uuid", "--format=csv,noheader,nounits"])
+                .output()?;
+            if !local.status.success() {
+                return Err(
+                    format!("nvidia-smi: {}", String::from_utf8_lossy(&local.stderr)).into(),
+                );
+            }
+            let device = machine.tiers[0]
+                .device
+                .ok_or("the tier census has no device UUID")?;
+            let uuid = bloomery_gpu_gates::gpu_census::gpu_uuid(&device.uuid);
+            if std::str::from_utf8(&local.stdout)?
+                .lines()
+                .any(|line| line.trim() == uuid.as_str())
+            {
+                2
+            } else {
+                1
+            }
+        } else {
+            1
+        };
         if gpu_processes != expected {
             return Err(
                 format!("{arm} needs {expected} GPU processes, saw {gpu_processes}").into(),
             );
         }
         s.clear()?;
-        let mut timed = Run::default();
+        let n = decode.map_or(96, |(n, _)| n);
+        let mut timed = Run {
+            tokens: Vec::with_capacity(PROMPT + n),
+            ..Run::default()
+        };
+        let step = |s: &mut Session<Body38>, run: &mut Run, id| -> Result<u32, GateError> {
+            if decode.is_none() {
+                q38_history::step(s, run, id)
+            } else {
+                let next = runtime::Target::step(s, id, runtime::Want::Argmax)?.argmax();
+                run.tokens.push(next);
+                Ok(next)
+            }
+        };
         let mut next = 0;
         for &id in &c.ids[..PROMPT] {
-            next = q38_history::step(&mut s, &mut timed, id)?;
+            next = step(&mut s, &mut timed, id)?;
         }
-        const N: usize = 96;
+        let counts = |s: &Session<Body38>| -> Result<(u64, u64, Vec<Vec<u64>>), GateError> {
+            Ok(s.model().body(NAME)?.hybrid().tiers().iter().fold(
+                (0, 0, Vec::new()),
+                |(issued, control, mut hits), t| {
+                    let stats = t.stats();
+                    hits.push(stats.layer_hits);
+                    (
+                        issued + stats.issued,
+                        control + stats.control_round_trips,
+                        hits,
+                    )
+                },
+            ))
+        };
+        let before = counts(&s)?;
         let start = Instant::now();
-        for _ in 0..N {
-            next = q38_history::step(&mut s, &mut timed, next)?;
+        for _ in 0..n {
+            next = step(&mut s, &mut timed, next)?;
         }
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let elapsed = start.elapsed().as_secs_f64();
+        let ms = elapsed * 1000.0;
+        let after = counts(&s)?;
+        let mut read_terms = None;
+        let mut wire = Vec::new();
+        if decode.is_some() {
+            read_terms = Some(Terms::of(&plan, u64::try_from(c.inputs.hp.n_embd)?)?);
+            let tiers = s.model().body(NAME)?.hybrid().tiers();
+            for tier in tiers {
+                wire.push((tier.cols(), tier.page_layout(tiers.len())?.wire_bytes()));
+            }
+        }
         record::Record::new(&record::TIER_COST)
             .w("arm", arm)
             .w("plan", identity)
             .list("history", &warm.tokens)
             .list("tokens", &timed.tokens)
             .u("prompt", PROMPT)
-            .u("decode", N)
-            .f("tg_tps", N as f64 * 1000.0 / ms)
-            .f("step_ms", ms / N as f64)
+            .u("decode", n)
+            .f("tg_tps", n as f64 * 1000.0 / ms)
+            .f("step_ms", ms / n as f64)
             .u("gpu_processes", gpu_processes)
+            .u("budget_gib", gib)
+            .f("elapsed_s", elapsed)
+            .u("control_round_trips", after.1 - before.1)
+            .u("handoffs", after.0 - before.0)
+            .w("read_terms", format!("{read_terms:?}"))
+            .w("wire", format!("{wire:?}"))
+            .w("hits_before", format!("{:?}", before.2))
+            .w("hits_after", format!("{:?}", after.2))
             .print();
+        if let Some((_, out)) = decode {
+            write_run(&timed, out)?;
+            write_run(&warm, &out.with_extension("history.run"))?;
+        }
         Ok(())
     }
 
@@ -1497,6 +1607,7 @@ mod gate {
                     Err(checks_failed())
                 }
             }
+            Mode::Decode { gib, tokens, out } => measure(&c, gib, Some((tokens, &out))),
             Mode::Hold0 { gib } => run_hold0(&c, gib),
             Mode::Measure { arm, gib } => {
                 if !bloomery_levers::tier_nodes()?.is_empty() {
@@ -1505,7 +1616,7 @@ mod gate {
                     );
                 }
                 if arm == "local" {
-                    measure(&c, gib)
+                    measure(&c, gib, None)
                 } else {
                     let (_server, addr) = node1(None)?;
                     let mut child = node0(&["--measure-node0".into(), gib.to_string()], addr)?;
@@ -1522,7 +1633,7 @@ mod gate {
             }
             Mode::MeasureNode0 { gib } => {
                 lever_addr()?;
-                measure(&c, gib)
+                measure(&c, gib, None)
             }
         }
     }
@@ -1535,6 +1646,69 @@ mod gate {
         };
         use bloomery_gpu::GpuError;
         use bloomery_gpu_gates::GateError;
+
+        #[test]
+        #[ignore = "needs a remote tier server and the model on both nodes"]
+        fn hw_a_refused_remote_replay_resets_to_its_fresh_history() -> Result<(), GateError> {
+            let levers = bloomery_levers::at_main(&[
+                super::CARD_BUDGET,
+                super::HOST_POPULATE,
+                super::HOST_LOCK,
+                super::CARD_DONTNEED,
+            ])?;
+            let c = super::Common::new(&levers)?;
+            let addr = super::lever_addr()?;
+            assert!(
+                !addr.ip().is_loopback(),
+                "the regression needs separate nodes"
+            );
+            let mut machine = None;
+            let (plan, _, independent) = super::census_plan(&c, &mut machine, addr)?;
+            assert!(independent, "the node budgets must use their own census");
+            let mut s = c.open(&plan)?;
+            let mut fresh = super::q38_history::history(&mut s, &c.ids, |_| Ok(()))?;
+            assert!(super::tier_structure(&s, &super::tier_layers(&plan))?);
+            let ready = s.model().body(NAME)?.hybrid().tiers()[0]
+                .stats()
+                .control_round_trips;
+            s.model_mut()
+                .body_parts(NAME)?
+                .2
+                .hybrid_mut()
+                .plant_refusal("remote replay refusal");
+            let error = s
+                .model_mut()
+                .step(&[c.ids[0]])
+                .expect_err("a planted refusal");
+            assert!(
+                error.to_string().contains("remote replay refusal"),
+                "{error}"
+            );
+            assert!(!matches!(error, GpuError::Unsettled { .. }), "{error}");
+            let before = s.model().body(NAME)?.hybrid().tiers()[0]
+                .stats()
+                .control_round_trips;
+            assert_eq!(
+                before - ready,
+                2,
+                "one replay launch and one remote release"
+            );
+            s.clear()?;
+            let after = s.model().body(NAME)?.hybrid().tiers()[0]
+                .stats()
+                .control_round_trips;
+            assert_eq!(after - before, 4, "three reset phases and one fault clear");
+            let mut recovered = super::q38_history::Run::default();
+            super::q38_history::step(&mut s, &mut recovered, c.ids[0])?;
+            fresh.tokens.truncate(1);
+            fresh.logits.truncate(1);
+            assert!(super::q38_history::same(
+                "first decode after refusal reset",
+                &fresh,
+                &recovered
+            ));
+            Ok(())
+        }
 
         #[test]
         fn census_clause_requires_the_remote_census() {

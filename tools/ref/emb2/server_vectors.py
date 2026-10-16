@@ -28,19 +28,108 @@ The header carries what the node-dump reader and the server family check: `# mod
 `# mmproj <path> sha256 <hex>`;
 then the server's flags and build, the build record's lines, and the `# complete` trailer, written last through a .partial
 name. Python's standard library only.
+
+Compare a running bloomery HTTP server with those saved vectors (no new oracle or threshold):
+  server_vectors.py compare --url <http://host:port> --set <server-set> [--ids-dir <dir> --case <name> ...]
+                            [--image <name>=<png> ...] [--mix-image <name>]
+Prints cosine and maximum absolute difference for each selected raw and normalized vector; image inputs use the
+collector's exact content-part construction. A successful command means the comparisons completed, not that a band passed.
 """
 
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import struct
+import sys
 import urllib.request
 from pathlib import Path
 
 MRL = (128, 256, 512)
+MIX_TEXT = "A picture of coloured rings and ramps: "
+
+
+def image_entries(images: list[str], mix: str | None):
+    """The same image-only and text-first inputs for collecting and comparing HTTP vectors."""
+    found = False
+    for item in images:
+        name, png = item.split("=", 1)
+        data = Path(png).read_bytes()
+        url = "data:image/png;base64," + base64.b64encode(data).decode()
+        part = {"type": "image_url", "image_url": {"url": url}}
+        yield f"img_{name}", {"content": [part]}, png, data
+        if name == mix:
+            found = True
+            text = {"type": "text", "text": MIX_TEXT}
+            yield f"mix_{name}", {"content": [text, part]}, png, data
+    if mix and not found:
+        raise SystemExit(f"server_vectors: --mix-image {mix} names no --image")
+
+
+def metrics(ours: list[float], reference: list[float]) -> tuple[float, float]:
+    """Cosine and maximum absolute difference, refusing empty, non-finite or unequal vectors."""
+    if not ours or len(ours) != len(reference) or not all(math.isfinite(x) for x in ours + reference):
+        raise ValueError("empty, non-finite or unequal vector extents")
+    dot = sum(x * y for x, y in zip(ours, reference))
+    norm = math.sqrt(sum(x * x for x in ours)) * math.sqrt(sum(y * y for y in reference))
+    if norm == 0:
+        raise ValueError("cosine is undefined for a zero vector")
+    return dot / norm, max(abs(x - y) for x, y in zip(ours, reference))
+
+
+def compare_main(argv: list[str]) -> None:
+    """Compare a running HTTP server with saved llama-server raw and normalized vectors."""
+    ap = argparse.ArgumentParser(description=compare_main.__doc__)
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--set", required=True, type=Path)
+    ap.add_argument("--ids-dir", type=Path)
+    ap.add_argument("--case", action="append", default=[])
+    ap.add_argument("--image", action="append", default=[])
+    ap.add_argument("--mix-image")
+    a = ap.parse_args(argv)
+    if not a.case and not a.image:
+        ap.error("at least one --case or --image is required")
+    if a.case and a.ids_dir is None:
+        ap.error("--case requires --ids-dir")
+    spec = importlib.util.spec_from_file_location("manifest", Path(__file__).resolve().parents[2] / "bloomery/manifest.py")
+    manifest = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(manifest)
+    m = manifest.read(str(a.set))
+    if m.complete is None or m.header.get("emb2") != "server" or m.header.get("arch") != "gemma-embedding2":
+        raise SystemExit(f"server_vectors: {a.set}: not a complete EmbeddingGemma 2 server set")
+    rows = {}
+    for row in m.rows("tensor"):
+        name = row["name"]
+        if name in rows:
+            raise SystemExit(f"server_vectors: {name}: duplicate tensor")
+        rows[name] = row
+    entries = []
+    for name in a.case:
+        entries.append((name, (a.ids_dir / f"{name}.txt").read_text(encoding="utf-8")))
+    entries.extend((name, entry) for name, entry, _, _ in image_entries(a.image, a.mix_image))
+    for name, entry in entries:
+        for node, normalization in (("raw", -1), ("embd", 2)):
+            key = f"{name}/{node}"
+            if key not in rows:
+                raise SystemExit(f"server_vectors: {a.set}: no tensor {key}")
+            row = rows[key]
+            if row["type"] != "f32" or row.int("occurrence") != 0 or any(row.int(f"ne{i}") != 1 for i in (1, 2, 3)):
+                raise SystemExit(f"server_vectors: {key}: not one F32 vector")
+            path = Path(m.dir) / manifest.dump_file_name(key, 0, "output", "contiguous", "f32")
+            data = path.read_bytes()
+            if len(data) != row.int("bytes") or len(data) != row.int("ne0") * 4:
+                raise SystemExit(f"server_vectors: {key}: tensor byte count differs")
+            reference = list(struct.unpack(f"<{len(data) // 4}f", data))
+            ours, count = embed(a.url, entry, normalization)
+            try:
+                cosine, maximum = metrics(ours, reference)
+            except ValueError as e:
+                raise SystemExit(f"server_vectors: {key}: {e}") from e
+            print(f"{key}: prompt_tokens {count} cosine {cosine:.9e} max_abs_diff {maximum:.9e}")
+
 
 
 def post(url: str, path: str, body: dict) -> dict:
@@ -119,6 +208,9 @@ def check_server(a: argparse.Namespace, build: str) -> dict:
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["compare"]:
+        compare_main(sys.argv[2:])
+        return
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
     ap.add_argument("--pid", required=True, type=int)
@@ -128,6 +220,7 @@ def main() -> None:
     ap.add_argument("--mmproj-sha256")
     ap.add_argument("--arch", choices=("gemma-embedding", "gemma-embedding2"), required=True)
     ap.add_argument("--card", required=True)
+    ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--build-record", required=True, type=Path)
     ap.add_argument("--ids-dir", required=True, type=Path)
     ap.add_argument("--case", action="append", required=True)
@@ -137,6 +230,8 @@ def main() -> None:
     ap.add_argument("--server-flags", default="")
     a = ap.parse_args()
 
+    if a.cpu and os.environ.get("CUDA_VISIBLE_DEVICES") != "":
+        raise SystemExit("server_vectors: --cpu requires CUDA_VISIBLE_DEVICES empty")
     build = os.environ.get("BLOOMERY_REF_BUILD", "")
     if not build:
         raise SystemExit("server_vectors: BLOOMERY_REF_BUILD names no commit")
@@ -157,7 +252,7 @@ def main() -> None:
         f"# build\t{build}",
         f"# arch\t{a.arch}",
         "# emb2\tserver",
-        f"# device\tcuda\tthreads\t-\tcard\t{a.card}",
+        f"# device\t{'cpu' if a.cpu else 'cuda'}\tthreads\t-\tcard\t{a.card}",
         f"# model_sha256\t{a.model_sha256}",
         f"# server_flags\t{a.server_flags}",
         f"# server_build\t{props['build_info']}",
@@ -180,17 +275,10 @@ def main() -> None:
         if got != want or n != len(want):
             raise SystemExit(f"server_vectors: {name}: the server's ids are not the oracle's ({same}, prompt_tokens {n})")
 
-    images = dict(i.split("=", 1) for i in a.image)
-    for name, png in images.items():
-        data = Path(png).read_bytes()
-        url = "data:image/png;base64," + base64.b64encode(data).decode()
-        part = {"type": "image_url", "image_url": {"url": url}}
-        n = pooled_rows(w, a.url, f"img_{name}", {"content": [part]}, False)
-        w.header.append(f"# image\timg_{name}\t{png}\t{hashlib.sha256(data).hexdigest()}\tprompt_tokens {n}")
-        if name == a.mix_image:
-            text = {"type": "text", "text": "A picture of coloured rings and ramps: "}
-            n = pooled_rows(w, a.url, f"mix_{name}", {"content": [text, part]}, False)
-            w.header.append(f"# image\tmix_{name}\t{png}\t{hashlib.sha256(data).hexdigest()}\tprompt_tokens {n}\ttext first")
+    for name, entry, png, data in image_entries(a.image, a.mix_image):
+        n = pooled_rows(w, a.url, name, entry, False)
+        suffix = "\ttext first" if name.startswith("mix_") else ""
+        w.header.append(f"# image\t{name}\t{png}\t{hashlib.sha256(data).hexdigest()}\tprompt_tokens {n}{suffix}")
     check_server(a, build)
     w.finish()
     print(f"server_vectors: {len(w.rows)} row(s) into {a.out}")

@@ -239,7 +239,7 @@ pub enum GpuError {
 
 impl GpuError {
     /// A geometry contract broken by the caller of `what`.
-    pub(crate) fn shape(what: &'static str, detail: impl Into<String>) -> GpuError {
+    pub fn shape(what: &'static str, detail: impl Into<String>) -> GpuError {
         GpuError::Shape {
             what,
             detail: detail.into(),
@@ -248,11 +248,7 @@ impl GpuError {
 
     /// A tensor `what` looked up that is absent or in the wrong format;
     /// `need` completes "is not …".
-    pub(crate) fn tensor(
-        what: &'static str,
-        name: impl Into<String>,
-        need: &'static str,
-    ) -> GpuError {
+    pub fn tensor(what: &'static str, name: impl Into<String>, need: &'static str) -> GpuError {
         GpuError::Tensor {
             what,
             name: name.into(),

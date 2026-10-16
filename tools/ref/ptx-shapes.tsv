@@ -168,6 +168,7 @@ generate_ds41   gqa_prefill_flash_256                    0           0
 generate_ds41   gqa_prefill_flash_256_p2                 0           0
 # jit_local is ptxas 13.3.73's sm_86 stack frame, not read on a cc 8.6 card; the two agree on every row of this table and of both cc 12.1 tables.
 generate_ds41   gqa_prefill_flash_256_p2_lower           0           0
+generate_ds41   gqa_prefill_flash_256_p1_lower           0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_512_p4                 0           0
@@ -215,8 +216,10 @@ generate_ds41   kda_delta_lanes                          0           0
 generate_ds41   kpool_score                              0           0
 generate_ds41   kq_card_gather                           0           0
 generate_ds41   kq_gate_up_act_q4k                       0           0
+generate_ds41   kq_gate_up_act_q4k_at                    0           0
 generate_ds41   kq_gate_up_act_q4k_tiles                 0           0
 generate_ds41   kq_gate_up_act_q5k                       0           0
+generate_ds41   kq_gate_up_act_q5k_at                    0           0
 generate_ds41   kq_gate_up_act_q5k_tiles                 0           0
 generate_ds41   kq_gate_up_act_q8_0                      0           0
 generate_ds41   kv_append                                0           0
@@ -282,12 +285,14 @@ generate_ds41   q5_q8_1_quantize_pair                    0           0
 generate_ds41   q5_quantize_q8                           0           0
 generate_ds41   q5_quantize_q8_sel                       0           0
 generate_ds41   q5k_gemv_sel                             0           0
+generate_ds41   q5k_gemv_sel_at                          0           0
 generate_ds41   q5k_gemv_tiles                           0           0
 generate_ds41   q6k_gemv                                 0           0
 generate_ds41   q6k_gemv_ids                            0           0
 generate_ds41   q6k_gemv_ids_mcol                       0           0
 generate_ds41   q6k_gemv_prefetch                        0           0
 generate_ds41   q6k_gemv_sel                             0           0
+generate_ds41   q6k_gemv_sel_at                          0           0
 generate_ds41   q6k_gemv_sel_prefetch                    0           0
 generate_ds41   q8_0_gemv                                0           0
 generate_ds41   q8_0_gemv_heads                          0           0
@@ -444,6 +449,7 @@ gate_e2e   gqa_prefill_flash_256                    0           0
 gate_e2e   gqa_prefill_flash_256_p2                 0           0
 # jit_local is ptxas 13.3.73's sm_86 stack frame, not read on a cc 8.6 card; the two agree on every row of this table and of both cc 12.1 tables.
 gate_e2e   gqa_prefill_flash_256_p2_lower           0           0
+gate_e2e   gqa_prefill_flash_256_p1_lower           0           0
 gate_e2e   gqa_prefill_flash_256_p4                 0           0
 gate_e2e   gqa_prefill_flash_256_q8                 0           0
 gate_e2e   gqa_prefill_flash_512_p4                 0           0
@@ -490,8 +496,10 @@ gate_e2e   kda_delta_lanes                          0           0
 gate_e2e   kpool_score                              0           0
 gate_e2e   kq_card_gather                           0           0
 gate_e2e   kq_gate_up_act_q4k                       0           0
+gate_e2e   kq_gate_up_act_q4k_at                    0           0
 gate_e2e   kq_gate_up_act_q4k_tiles                 0           0
 gate_e2e   kq_gate_up_act_q5k                       0           0
+gate_e2e   kq_gate_up_act_q5k_at                    0           0
 gate_e2e   kq_gate_up_act_q5k_tiles                 0           0
 gate_e2e   kq_gate_up_act_q8_0                      0           0
 gate_e2e   kv_append                                0           0
@@ -554,12 +562,14 @@ gate_e2e   q5_q8_1_quantize_pair                    0           0
 gate_e2e   q5_quantize_q8                           0           0
 gate_e2e   q5_quantize_q8_sel                       0           0
 gate_e2e   q5k_gemv_sel                             0           0
+gate_e2e   q5k_gemv_sel_at                          0           0
 gate_e2e   q5k_gemv_tiles                           0           0
 gate_e2e   q6k_gemv                                 0           0
 gate_e2e   q6k_gemv_ids                            0           0
 gate_e2e   q6k_gemv_ids_mcol                       0           0
 gate_e2e   q6k_gemv_prefetch                        0           0
 gate_e2e   q6k_gemv_sel                             0           0
+gate_e2e   q6k_gemv_sel_at                          0           0
 gate_e2e   q6k_gemv_sel_prefetch                    0           0
 gate_e2e   q8_0_gemv                                0           0
 gate_e2e   q8_0_gemv_heads                          0           0
@@ -622,20 +632,29 @@ gate_e2e   tier_fault_copy                          0           0
 gate_e2e   touch                                    0           0
 gate_e2e   weighted_sum                             0           0
 
-# gate_qwen3vl_tower (--features vision), the `vis_` entries of bloomery-gpu-vision only: V4.1's six, the Qwen3-VL tower's five, the glm5v tower's three, and MiniCPM's two
+# gate_qwen3vl_tower (--features vision), the shared vision entries, including Gemma4 residual and post-norm precision.
+# PIN(2026-10-15): the seven Gemma4 entries have zero sm_86 ptxas spill; jit_local=0 is a derived cc8.6 ceiling,
+# not a cc8.6 driver measurement. Both sm_86 and sm_121 PTX have zero JIT local bytes on GB10 cc12.1.
+gate_qwen3vl_tower   vis_add_f32                        0           0
 gate_qwen3vl_tower   vis_attn                           0           0
 gate_qwen3vl_tower   vis_attn_group                     0           0
 gate_qwen3vl_tower   vis_attn_h72                       0           0
+gate_qwen3vl_tower   vis_clamp_f32                      0           0
 gate_qwen3vl_tower   vis_gelu_erf                       0           0
 gate_qwen3vl_tower   vis_gelu_tanh                      0           0
 gate_qwen3vl_tower   vis_gemm_bf16                      0           0
+gate_qwen3vl_tower   vis_gemm_bf16_f32                  0           0
 gate_qwen3vl_tower   vis_head_rms_norm                  0           0
 gate_qwen3vl_tower   vis_layer_norm                     0           0
 gate_qwen3vl_tower   vis_mean_groups                    0           0
+gate_qwen3vl_tower   vis_pool_order_f32                 0           0
 gate_qwen3vl_tower   vis_pos_bilinear                   0           0
+gate_qwen3vl_tower   vis_position_rows                  0           0
 gate_qwen3vl_tower   vis_rms_norm                       0           0
+gate_qwen3vl_tower   vis_rms_norm_f32                   0           0
 gate_qwen3vl_tower   vis_rope2d                         0           0
 gate_qwen3vl_tower   vis_rope2d_h72                     0           0
+gate_qwen3vl_tower   vis_row_op                         0           0
 gate_qwen3vl_tower   vis_silu_mul                       0           0
 gate_qwen3vl_tower   vis_silu_mul_clamp                 0           0
 gate_qwen3vl_tower   vis_unfold                         0           0

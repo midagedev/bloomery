@@ -187,6 +187,165 @@ pub unsafe fn gate_up_act_body<D: SbDecode>(
     }
 }
 
+/// An arena entry's per-slot table ([`GateUpAt`], [`SelDownAt`]): slot `s`'s
+/// part `p` (gate 0, up 1, down 2) lies at word `offs[s · ARENA_PARTS + p]`
+/// of the arena, the expert's rows of that stack as its file holds them.
+pub const ARENA_PARTS: usize = 3;
+/// The arena table's gate, up and down part of a slot.
+pub const PART_GATE: usize = 0;
+pub const PART_UP: usize = 1;
+pub const PART_DOWN: usize = 2;
+/// An arena table offset marking a slot the arena entries skip: they write
+/// nothing and raise nothing for it.
+pub const ARENA_SKIP: u64 = u64::MAX;
+
+/// The `words` words of `arena` from word `off`, or `None` when they do not
+/// all lie inside it.
+#[inline(always)]
+pub fn arena_part(arena: &[u32], off: u64, words: usize) -> Option<&[u32]> {
+    let end = off.checked_add(words as u64)?;
+    if end > arena.len() as u64 {
+        return None;
+    }
+    // SAFETY: off <= end <= arena.len(), checked above.
+    Some(unsafe { arena.get_unchecked(off as usize..end as usize) })
+}
+
+/// The body of a down arena entry over format `D`: [`gemv_sel_body`] with
+/// slot `slot`'s expert read from its down part in `arena` (the slot's
+/// [`PART_DOWN`] offset) instead of from a stack by id. Row `r` of the part
+/// is the expert's row `r`, so the same bytes give the same bits. A slot
+/// marked [`ARENA_SKIP`] is left alone; a part that does not lie inside the
+/// arena raises [`FaultSite::ExpertId`] before any weight load and leaves
+/// the slot's rows of `y` as they were.
+///
+/// # Safety
+///
+/// As [`gemv_sel_body`] with `offs.len() >= n_slots · ARENA_PARTS` in place
+/// of the stack and id bounds.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub unsafe fn gemv_at_body<D: SbDecode>(
+    arena: &[u32],
+    offs: &[u64],
+    q: &[u32],
+    s8: &[i32],
+    d8: &[f32],
+    rows_per_expert: u32,
+    n_sb: u32,
+    iters: u32,
+    fault: FaultSink,
+    row: usize,
+    y: &mut DisjointSlice<f32>,
+) {
+    let rpe = rows_per_expert as usize;
+    let slot = row / rpe;
+    // SAFETY: slot < n_slots, so the index is inside offs by this fn's
+    // contract; the load is warp-uniform, so the returns below never
+    // diverge a warp.
+    let off = unsafe { *offs.get_unchecked(slot * ARENA_PARTS + PART_DOWN) };
+    let lane = warp::lane_id() as usize;
+    if off == ARENA_SKIP {
+        return;
+    }
+    let Some(w) = arena_part(arena, off, rpe * D::WORDS * n_sb as usize) else {
+        if lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        return;
+    };
+    // SAFETY: `w` is the part's rpe rows of D::WORDS · n_sb words and row %
+    // rpe one of them; column slot < n_slots of the planes, iters =
+    // ceil(n_sb/4), and all 32 lanes of the warp are here.
+    let f0 =
+        unsafe { row_dot_1col::<D>(w, q, s8, d8, n_sb as usize, iters, row % rpe, slot, lane) };
+    let s0 = warp::reduce_sum_f32(f0);
+    if lane == 0 {
+        // SAFETY: row < n_slots · rows_per_expert <= y.len() by this fn's
+        // contract; only lane 0 of the warp writes y[row].
+        unsafe {
+            *y.get_unchecked_mut(row) = s0;
+        }
+    }
+}
+
+/// The body of a gate·up arena entry over format `D`: [`gate_up_act_body`]
+/// with slot `slot`'s expert read from its gate and up parts in `arena`.
+/// A slot whose gate offset is [`ARENA_SKIP`] is left alone; a gate or up
+/// part that does not lie inside the arena raises [`FaultSite::ExpertId`]
+/// and writes NaN into the slot's rows of `h`.
+///
+/// # Safety
+///
+/// As [`gate_up_act_body`] with `offs.len() >= n_slots · ARENA_PARTS` in
+/// place of the stacks' and ids' bounds.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub unsafe fn gate_up_act_at_body<D: SbDecode>(
+    arena: &[u32],
+    offs: &[u64],
+    q: &[u32],
+    s8: &[i32],
+    d8: &[f32],
+    rows_per_expert: u32,
+    slots_per_col: u32,
+    n_sb: u32,
+    iters: u32,
+    act: u32,
+    limit: f32,
+    fault: FaultSink,
+    row: usize,
+    h: &mut DisjointSlice<f32>,
+) {
+    let rpe = rows_per_expert as usize;
+    let slot = row / rpe;
+    // SAFETY: slot < n_slots, so both indices are inside offs by this fn's
+    // contract; the loads are warp-uniform.
+    let (og, ou) = unsafe {
+        (
+            *offs.get_unchecked(slot * ARENA_PARTS + PART_GATE),
+            *offs.get_unchecked(slot * ARENA_PARTS + PART_UP),
+        )
+    };
+    let lane = warp::lane_id() as usize;
+    if og == ARENA_SKIP {
+        return;
+    }
+    let words = rpe * D::WORDS * n_sb as usize;
+    let (Some(wg), Some(wu)) = (arena_part(arena, og, words), arena_part(arena, ou, words)) else {
+        if lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+            // SAFETY: row < n_slots · rows_per_expert <= h.len() by this
+            // fn's contract; only lane 0 of the warp writes h[row].
+            unsafe { *h.get_unchecked_mut(row) = f32::NAN };
+        }
+        return;
+    };
+    let (r, col) = (row % rpe, slot / slots_per_col as usize);
+    // SAFETY: both parts hold rpe rows of D::WORDS · n_sb words and r is one
+    // of them; column col < m_cols because slot < n_slots <= m_cols ·
+    // slots_per_col; iters = ceil(n_sb/4); all 32 lanes of the warp are here.
+    let (fg, fu) = unsafe {
+        (
+            row_dot_1col::<D>(wg, q, s8, d8, n_sb as usize, iters, r, col, lane),
+            row_dot_1col::<D>(wu, q, s8, d8, n_sb as usize, iters, r, col, lane),
+        )
+    };
+    let g = warp::reduce_sum_f32(fg);
+    let u = warp::reduce_sum_f32(fu);
+    if lane == 0 {
+        // SAFETY: row < n_slots · rows_per_expert <= h.len() by this fn's
+        // contract; only lane 0 of the warp writes h[row].
+        unsafe { *h.get_unchecked_mut(row) = act::apply(act, limit, g, u) };
+    }
+}
+
 #[cuda_module]
 mod kquant_kernels {
     use super::*;
@@ -533,7 +692,203 @@ mod kquant_kernels {
             );
         }
     }
+
+    /// The Q5_K down arena entry ([`gemv_at_body`] over [`Q5k`]), four
+    /// blocks an SM pinned as [`q5k_gemv_sel`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            offs.len() >= n_slots * 3,
+            q.len() >= n_slots * 256 * iters,
+            s8.len() >= n_slots * 8 * n_sb,
+            d8.len() >= n_slots * 2 * n_sb,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q5k_gemv_sel_at(
+        arena: &[u32],
+        offs: &[u64],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // SAFETY: the launch contract is the body's (3 = ARENA_PARTS); the
+        // host passes iters = ceil(n_sb/4); the return above is warp-uniform
+        // and keeps row in range.
+        unsafe {
+            gemv_at_body::<Q5k>(
+                arena,
+                offs,
+                q,
+                s8,
+                d8,
+                rows_per_expert,
+                n_sb,
+                iters,
+                fault,
+                row,
+                &mut y,
+            );
+        }
+    }
+
+    /// The Q5_K gate·up arena entry ([`gate_up_act_at_body`] over [`Q5k`]),
+    /// four blocks an SM pinned as [`q5k_gemv_sel`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            offs.len() >= n_slots * 3,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn kq_gate_up_act_q5k_at(
+        arena: &[u32],
+        offs: &[u64],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // SAFETY: the launch contract is the body's (3 = ARENA_PARTS); the
+        // host passes iters = ceil(n_sb/4) and one of Act::code's codes; the
+        // return above is warp-uniform and keeps row in range.
+        unsafe {
+            gate_up_act_at_body::<Q5k>(
+                arena,
+                offs,
+                q,
+                s8,
+                d8,
+                rows_per_expert,
+                slots_per_col,
+                n_sb,
+                iters,
+                act,
+                limit,
+                fault,
+                row,
+                &mut h,
+            );
+        }
+    }
+
+    /// The Q4_K gate·up arena entry ([`gate_up_act_at_body`] over [`Q4k`]),
+    /// four blocks an SM pinned as [`q5k_gemv_sel`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            offs.len() >= n_slots * 3,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn kq_gate_up_act_q4k_at(
+        arena: &[u32],
+        offs: &[u64],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // SAFETY: the launch contract is the body's (3 = ARENA_PARTS); the
+        // host passes iters = ceil(n_sb/4) and one of Act::code's codes; the
+        // return above is warp-uniform and keeps row in range.
+        unsafe {
+            gate_up_act_at_body::<Q4k>(
+                arena,
+                offs,
+                q,
+                s8,
+                d8,
+                rows_per_expert,
+                slots_per_col,
+                n_sb,
+                iters,
+                act,
+                limit,
+                fault,
+                row,
+                &mut h,
+            );
+        }
+    }
 }
+
+// The arena entries' contracts spell the table's parts a slot as 3.
+const _: () = assert!(ARENA_PARTS == 3);
 
 // The entries spell Q4_K's super-block words as 36, Q5_K's as 44 and Q8_0's as 68.
 const _: () = assert!(Q4k::WORDS == 36 && Q5k::WORDS == 44 && Q8_0::WORDS == 68);
@@ -570,6 +925,38 @@ pub struct GateUpAct<'a> {
     pub n_slots: usize,
     pub rows_per_expert: usize,
     /// Slots a column: a token's run of slots.
+    pub slots_per_col: usize,
+    pub rule: Act,
+}
+
+/// A down arena launch ([`KquantKernels::enqueue_gemv_q5k_sel_at`],
+/// `Q6kSelKernels::enqueue_gemv_q6k_sel_at`): [`SelDown`] with each slot's
+/// expert read from its down part in `arena` at the slot's [`PART_DOWN`]
+/// offset of `offs` instead of from a stack by id.
+pub struct SelDownAt<'a> {
+    /// The arena as the card addresses it, in words.
+    pub arena: &'a DeviceBuffer<u32>,
+    /// [`ARENA_PARTS`] word offsets a slot, at least `n_slots` slots' worth,
+    /// read on the device at each launch; [`ARENA_SKIP`] skips the slot.
+    pub offs: &'a DeviceBuffer<u64>,
+    /// As [`SelDown::act`].
+    pub act: &'a Q8Act,
+    pub n_slots: usize,
+    pub rows_per_expert: usize,
+}
+
+/// A gate·up arena launch ([`KquantKernels::enqueue_gate_up_q4k_at`],
+/// [`KquantKernels::enqueue_gate_up_q5k_at`]): [`GateUpAct`] with each
+/// slot's expert read from its gate and up parts in `arena`.
+pub struct GateUpAt<'a> {
+    /// The arena as the card addresses it, in words.
+    pub arena: &'a DeviceBuffer<u32>,
+    /// As [`SelDownAt::offs`]; a slot's [`PART_GATE`] offset marks the skip.
+    pub offs: &'a DeviceBuffer<u64>,
+    /// As [`GateUpAct::act`].
+    pub act: &'a Q8Act,
+    pub n_slots: usize,
+    pub rows_per_expert: usize,
     pub slots_per_col: usize,
     pub rule: Act,
 }
@@ -736,6 +1123,127 @@ fn gate_up_dims(
     Ok(GateUpDims {
         grid: launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?,
         n_experts: launch_u32(what, "n_experts", n_experts)?,
+        rows_per_expert: launch_u32(what, "rows_per_expert", rpe)?,
+        n_slots: launch_u32(what, "n_slots", n_slots)?,
+        m_cols: launch_u32(what, "m_cols", m)?,
+        slots_per_col: launch_u32(what, "slots_per_col", spc)?,
+        n_sb: launch_u32(what, "n_sb", n_sb)?,
+        iters: launch_u32(what, "iters", n_sb.div_ceil(4))?,
+        act,
+        limit,
+    })
+}
+
+/// A checked down arena launch's grid and scalars, the entry's argument
+/// order.
+pub(crate) struct DownAtDims {
+    pub(crate) grid: u32,
+    pub(crate) rows_per_expert: u32,
+    pub(crate) n_slots: u32,
+    pub(crate) n_sb: u32,
+    iters: u32,
+}
+
+/// A checked gate·up arena launch's grid and scalars, the entry's argument
+/// order.
+struct GateUpAtDims {
+    grid: u32,
+    rows_per_expert: u32,
+    n_slots: u32,
+    m_cols: u32,
+    slots_per_col: u32,
+    n_sb: u32,
+    iters: u32,
+    act: u32,
+    limit: f32,
+}
+
+/// The slot checks the arena launches share: at least one slot, an
+/// offset table of `n_slots` slots, a nonempty arena and positive rows a
+/// part.
+pub(crate) fn arena_slots(
+    what: &'static str,
+    arena: &DeviceBuffer<u32>,
+    offs: &DeviceBuffer<u64>,
+    n_slots: usize,
+    rows_per_expert: usize,
+) -> Result<(), GpuError> {
+    if n_slots == 0
+        || offs.len() < n_slots * ARENA_PARTS
+        || arena.is_empty()
+        || rows_per_expert == 0
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{n_slots} slots (at least one): offs.len() {} >= n_slots*{ARENA_PARTS}, an \
+                 arena of {} words (at least one), rows_per_expert {rows_per_expert} (at least \
+                 one)",
+                offs.len(),
+                arena.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// [`SelDownAt`] checked as [`down_dims`] checks a stack's launch, for an
+/// output of `y_len` values.
+pub(crate) fn down_at_dims(
+    what: &'static str,
+    a: &SelDownAt<'_>,
+    y_len: usize,
+) -> Result<DownAtDims, GpuError> {
+    let (n_slots, rpe, n_sb) = (a.n_slots, a.rows_per_expert, a.act.n_sb());
+    arena_slots(what, a.arena, a.offs, n_slots, rpe)?;
+    if a.act.m() < n_slots || y_len < n_slots * rpe {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{n_slots} slots: an activation column a slot (act.m() {}), y.len() {y_len} >= \
+                 n_slots*rows_per_expert = {}",
+                a.act.m(),
+                n_slots * rpe
+            ),
+        ));
+    }
+    Ok(DownAtDims {
+        grid: launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?,
+        rows_per_expert: launch_u32(what, "rows_per_expert", rpe)?,
+        n_slots: launch_u32(what, "n_slots", n_slots)?,
+        n_sb: launch_u32(what, "n_sb", n_sb)?,
+        iters: launch_u32(what, "iters", n_sb.div_ceil(4))?,
+    })
+}
+
+/// [`GateUpAt`] checked as [`gate_up_dims`] checks a stack's launch, for an
+/// output of `h_len` values.
+fn gate_up_at_dims(
+    what: &'static str,
+    a: &GateUpAt<'_>,
+    h_len: usize,
+) -> Result<GateUpAtDims, GpuError> {
+    let (n_slots, rpe, spc, m, n_sb) = (
+        a.n_slots,
+        a.rows_per_expert,
+        a.slots_per_col,
+        a.act.m(),
+        a.act.n_sb(),
+    );
+    arena_slots(what, a.arena, a.offs, n_slots, rpe)?;
+    if spc == 0 || n_slots > m * spc || h_len < n_slots * rpe {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{n_slots} slots at {spc} a column (at least one) over {m} columns, h.len() \
+                 {h_len} >= n_slots*rows_per_expert = {}",
+                n_slots * rpe
+            ),
+        ));
+    }
+    let (act, limit) = a.rule.code();
+    Ok(GateUpAtDims {
+        grid: launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?,
         rows_per_expert: launch_u32(what, "rows_per_expert", rpe)?,
         n_slots: launch_u32(what, "n_slots", n_slots)?,
         m_cols: launch_u32(what, "m_cols", m)?,
@@ -942,6 +1450,114 @@ impl KquantKernels {
             d8,
             a.sel,
             d.n_experts,
+            d.rows_per_expert,
+            d.n_slots,
+            d.m_cols,
+            d.slots_per_col,
+            d.n_sb,
+            d.iters,
+            d.act,
+            d.limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the Q5_K down arena entry: as [`Self::enqueue_gemv_q5k_sel`],
+    /// slot `s`'s expert the down part at its offset in `a.arena` (module
+    /// consts for the table, [`ARENA_SKIP`] and a part past the arena,
+    /// which raises on `fault`). Asynchronous, allocation-free, capturable.
+    pub fn enqueue_gemv_q5k_sel_at(
+        &self,
+        stream: &CudaStream,
+        a: &SelDownAt<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let d = down_at_dims("enqueue_gemv_q5k_sel_at", a, y.len())?;
+        let prep = self
+            .module
+            .prepare_q5k_gemv_sel_at(LaunchConfig1D::new(d.grid, THREADS, 0))?;
+        let (q, s8, d8) = walk_a_planes(a.act);
+        self.module.q5k_gemv_sel_at(
+            stream,
+            &prep,
+            a.arena,
+            a.offs,
+            q,
+            s8,
+            d8,
+            d.rows_per_expert,
+            d.n_slots,
+            d.n_sb,
+            d.iters,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the Q5_K gate·up arena entry: as [`Self::enqueue_gate_up_q5k`],
+    /// slot `s`'s expert the gate and up parts at its offsets in `a.arena`
+    /// (a part past the arena raises on `fault` and writes NaN). Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_gate_up_q5k_at(
+        &self,
+        stream: &CudaStream,
+        a: &GateUpAt<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let d = gate_up_at_dims("enqueue_gate_up_q5k_at", a, h.len())?;
+        let prep = self
+            .module
+            .prepare_kq_gate_up_act_q5k_at(LaunchConfig1D::new(d.grid, THREADS, 0))?;
+        let (q, s8, d8) = walk_a_planes(a.act);
+        self.module.kq_gate_up_act_q5k_at(
+            stream,
+            &prep,
+            a.arena,
+            a.offs,
+            q,
+            s8,
+            d8,
+            d.rows_per_expert,
+            d.n_slots,
+            d.m_cols,
+            d.slots_per_col,
+            d.n_sb,
+            d.iters,
+            d.act,
+            d.limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the Q4_K gate·up arena entry: as [`Self::enqueue_gate_up_q5k_at`]
+    /// over Q4_K rows, the arithmetic of [`Self::enqueue_gate_up_q4k`].
+    pub fn enqueue_gate_up_q4k_at(
+        &self,
+        stream: &CudaStream,
+        a: &GateUpAt<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let d = gate_up_at_dims("enqueue_gate_up_q4k_at", a, h.len())?;
+        let prep = self
+            .module
+            .prepare_kq_gate_up_act_q4k_at(LaunchConfig1D::new(d.grid, THREADS, 0))?;
+        let (q, s8, d8) = walk_a_planes(a.act);
+        self.module.kq_gate_up_act_q4k_at(
+            stream,
+            &prep,
+            a.arena,
+            a.offs,
+            q,
+            s8,
+            d8,
             d.rows_per_expert,
             d.n_slots,
             d.m_cols,

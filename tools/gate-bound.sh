@@ -32,7 +32,7 @@ gate_bound() {
 # A failed process read skips its wait (KILL follows TERM without the grace) and returns 70 without
 # reaping the monitor.
 lease_stop() {
-  local pid=$1 sig target err table p pg state live monitor failed=0 deadline limit term_deadline
+  local pid=$1 sig target err table p state live monitor failed=0 deadline limit term_deadline
   local grace=${LEASE_STOP_GRACE:-9}
   deadline=$((SECONDS + grace))
   term_deadline=$((SECONDS + (grace > 2 ? grace - 2 : 0)))
@@ -48,14 +48,17 @@ lease_stop() {
       fi
       if [ "$sig" = KILL ] && [ "$target" = "$pid" ]; then continue; fi
       while :; do
-        if ! table=$(ps -eo pid=,pgid=,stat=); then
+        if ! table=$(
+          set -o pipefail
+          ps -eo pid=,pgid=,stat= | awk -v pid="$pid" '$1 == pid || $2 == pid { print $1, $3 }'
+        ); then
           echo "[bound] cannot read processes while stopping $pid" >&2
           failed=70
           break 2
         fi
         live='' monitor=''
-        while IFS=$' \t\n' read -r p pg state; do
-          if { [ "$p" = "$pid" ] || [ "$pg" = "$pid" ]; } && [[ $state != Z* ]]; then
+        while IFS=$' \t\n' read -r p state; do
+          if [ -n "$p" ] && [[ $state != Z* ]]; then
             live=1
             [ "$p" != "$pid" ] || monitor=1
           fi

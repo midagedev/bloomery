@@ -16,7 +16,6 @@
 use bloomery_gpu::Qwen3moeModel;
 use bloomery_gpu::arch::qwen3moe::KvQ8;
 use gguf::Split;
-use model::arch::Arch;
 use model::placement::PlanLevers;
 use model::placement::accepts::{self, Program};
 use model::placement::ctx_ask::DEFAULT_SLOTS;
@@ -46,7 +45,6 @@ pub fn serve_default(split: &Split) -> Result<String, String> {
     let whole_refuses = Qwen3moeModel::whole_load(split).is_err();
     let levers = PlanLevers::default();
     let opts = q3place::ServeOpts {
-        arch: Arch::Qwen3moe,
         place: None,
         levers: &levers,
         kv: KvQ8::F16,

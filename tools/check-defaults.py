@@ -35,7 +35,13 @@ What a pin is, and where the scanner looks:
              feeds an `.envs(..)` or a `for (k, v) in .. cmd.env(k, v)` loop
              with, be it a `const` array, a local `let` array or an arms
              table. A name given as `bloomery_levers::<CONST>`, a same-file
-             `const` or a one-hop `let` alias resolves to its value.
+             `const` or a one-hop `let` alias resolves to its value. A
+             shared harness file no recipe names runs under the recipes of
+             the bins that declare it as a module, `#[path = "..."]` on a
+             `mod` item (an attribute in a comment or a string is no
+             declaration). Such a file's pins are every including bin's, so
+             each value must resolve: an identifier the scanner cannot
+             resolve there (a parameter, a field) is a named error.
   flags      a CLI flag that overrides a lever, listed in FLAGS below: today
              `--cache-type-k` (the qwen3 seat's spelling of BLOOMERY_QWEN3_KV,
              shared/serve_seats/qwen3.rs). A new flag-to-lever coupling is a
@@ -63,7 +69,8 @@ row whose pin no longer exists, a twin whose path is not in the tree or whose
 needle occurs zero times or more than once in it, an undated `none`. Named
 error (exit 65): a registry row, a recipe or a TSV line the reader cannot
 parse, a lever the registry does not know, a gate file no recipe names, a
-directory of the scanned paths the scanner cannot list.
+directory of the scanned paths the scanner cannot list, a shared file's
+pin whose value the scanner cannot resolve.
 
 Blind spots, each named: lever values built in code as typed values the
 environment never carries (`Residency::Mid` consts, `set_hoststream`,
@@ -253,10 +260,12 @@ def scan_justfile(root, live):
 # ---------------------------------------------------------------- the rust side
 
 
-def scan_rust(rel, text, live, reg_consts):
+def scan_rust(rel, text, live, reg_consts, strict=False):
     """Pins of one Rust file: (lever, where-label-later, value, kind, rel:line). A
     lever's const resolves through the file's own consts, then the registry's
-    (`bloomery_levers::<CONST>`), so a pin never depends on its spelling."""
+    (`bloomery_levers::<CONST>`), so a pin never depends on its spelling.
+    `strict` (a shared harness file) refuses a value given by an identifier
+    that does not resolve."""
     consts = dict(re.findall(r'\b(?:pub )?const ([A-Z_][A-Z0-9_]*)\s*:\s*&(?:\'static )?str'
                              r'\s*=\s*"([^"]*)"', text))
     names = dict(reg_consts)
@@ -274,24 +283,31 @@ def scan_rust(rel, text, live, reg_consts):
         return names.get(arg)
 
     def value_of(arg):
+        """(value, the identifier when it did not resolve)."""
         arg = arg.strip()
         if arg.startswith('"') and arg.endswith('"') and len(arg) >= 2:
-            return arg[1:-1]
+            return arg[1:-1], None
         if re.fullmatch(r"&?'?[A-Za-z_][A-Za-z0-9_]*", arg):
             bare = arg.lstrip("&'")
             if bare in consts:
-                return consts[bare]
+                return consts[bare], None
             if bare in locals_:
-                return locals_[bare]
-            return bare
-        return re.sub(r"\s+", " ", arg)
+                return locals_[bare], None
+            return bare, bare
+        return re.sub(r"\s+", " ", arg), arg
 
     pins = []
     taken = []  # the '(' offsets an .env( or set_var( call already read
 
-    def add(lever, value, kind, at):
-        if lever in live:
-            pins.append((lever, None, value, kind, f"{rel}:{line_of(text, at)}"))
+    def add(lever, arg, kind, at):
+        if lever not in live:
+            return
+        value, unresolved = value_of(arg)
+        if strict and unresolved:
+            raise InputError(f"{rel}:{line_of(text, at)}: {lever} pinned to the identifier {unresolved}, "
+                             "which does not resolve to a value — a shared file pins for every bin that "
+                             "includes it, so give the value as a literal or a const")
+        pins.append((lever, None, value, kind, f"{rel}:{line_of(text, at)}"))
 
     for m in re.finditer(r"\.env\s*\(", text):
         inner = balanced(text, m.end() - 1)
@@ -301,7 +317,7 @@ def scan_rust(rel, text, live, reg_consts):
         if len(args) < 2:
             continue
         taken.append(m.end() - 1)
-        add(lever_of(args[0]), value_of(args[1]), "env", m.start())
+        add(lever_of(args[0]), args[1], "env", m.start())
     for m in re.finditer(r"\bset_var\s*\(", text):
         inner = balanced(text, m.end() - 1)
         if inner is None:
@@ -309,7 +325,7 @@ def scan_rust(rel, text, live, reg_consts):
         args = split_args(inner)
         if len(args) >= 2:
             taken.append(m.end() - 1)
-            add(lever_of(args[0]), value_of(args[1]), "set", m.start())
+            add(lever_of(args[0]), args[1], "set", m.start())
     pair = re.compile(r"\(\s*(\"BLOOMERY_[A-Z0-9_]+\"|bloomery_levers::[A-Z_][A-Z0-9_]*|[A-Z_][A-Z0-9_]*)"
                       r"\s*,\s*([^()]+?)\s*\)")
     plain = re.compile(r"&?(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*")
@@ -320,10 +336,10 @@ def scan_rust(rel, text, live, reg_consts):
         quoted = v.startswith('"') and v.endswith('"') and len(v) >= 2
         if not quoted and not plain.fullmatch(v):
             continue  # an expression value is no table arm: a computed value flows through .env(
-        add(lever_of(m.group(1)), value_of(m.group(2)), "table", m.start())
+        add(lever_of(m.group(1)), m.group(2), "table", m.start())
     for flag, (lever, _) in FLAGS.items():
         for m in re.finditer(re.escape(f'"{flag}"') + r'\s*,\s*"([^"]*)"', text):
-            add(lever, m.group(1), "flag", m.start())
+            add(lever, f'"{m.group(1)}"', "flag", m.start())
     return pins
 
 
@@ -351,27 +367,56 @@ def rust_files(root):
     return out
 
 
+def includers(root):
+    """{rel: [bin stem]}: the bins under crates/gpu-gates/src/bin that declare a
+    file as a module, `#[path = "..."]` on a `mod` item outside any comment or
+    string, keyed by that file's path from the root."""
+    from recipes import rust_lex
+
+    out = {}
+    base = os.path.join(root, "crates", "gpu-gates", "src", "bin")
+    decl = re.compile(r'#\[path\s*=\s*"([^"]+)"\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*\s*;')
+    files = next(walk(root, "crates", "gpu-gates", "src", "bin"), (None, None, []))[2]
+    for f in sorted(files):
+        if not f.endswith(".rs"):
+            continue
+        text = open(os.path.join(base, f), encoding="utf-8").read()
+        code, shape = rust_lex(text)
+        for m in decl.finditer(code):
+            if shape[m.start()] != "#":
+                continue
+            rel = os.path.relpath(os.path.normpath(os.path.join(base, m.group(1))), root)
+            out.setdefault(rel, []).append(os.path.splitext(f)[0])
+    return out
+
+
 def scan_tree(root):
     """Every pin of the tree's gate surface, with the recipe label a Rust pin's
     file runs under (several, comma-joined)."""
     live, reg_consts = live_levers(root)
     recipes = recipes_of(root)
     pins = scan_justfile(root, live)
+    taken_by = includers(root)
     for path in rust_files(root):
         rel = os.path.relpath(path, root)
         try:
             text = open(path, encoding="utf-8").read()
         except OSError as e:
             raise InputError(f"{rel}: {e}") from None
-        for lever, _, value, kind, site in scan_rust(rel, text, live, reg_consts):
-            stem = os.path.splitext(os.path.basename(rel))[0]
-            # a crate test runs by its recipe's `--test <stem>`; a gate bin by its
-            # name as a word (a substring would take `mt` for `glm5next`)
-            if rel.startswith("crates/") and "/tests/" in rel:
+        shared = False
+        stem = os.path.splitext(os.path.basename(rel))[0]
+        # a crate test runs by its recipe's `--test <stem>`; a gate bin by its
+        # name as a word (a substring would take `mt` for `glm5next`)
+        if rel.startswith("crates/") and "/tests/" in rel:
+            who = sorted(n for n, body in recipes.items()
+                         if re.search(rf"--test {stem}\b", body))
+        else:
+            who = sorted(n for n, body in recipes.items() if re.search(rf"\b{stem}\b", body))
+            if not who:
                 who = sorted(n for n, body in recipes.items()
-                             if re.search(rf"--test {stem}\b", body))
-            else:
-                who = sorted(n for n, body in recipes.items() if re.search(rf"\b{stem}\b", body))
+                             if any(re.search(rf"\b{b}\b", body) for b in taken_by.get(rel, [])))
+                shared = bool(who)
+        for lever, _, value, kind, site in scan_rust(rel, text, live, reg_consts, strict=shared):
             if not who:
                 raise InputError(f"{site}: a pin in {rel}, which no justfile recipe names — "
                                  "give its row a recipe or teach the scanner")
@@ -728,6 +773,48 @@ def self_test():
            resolve_twin(root, "mini/bin.rs", "dup"), resolve_twin(root, "mini/gone.rs", "one"))
     if got != ((1, 3), (0, None), (2, None), (None, None)):
         fails.append(f"resolve_twin: {got}")
+    # a shared harness file no recipe names runs under the recipes of the bins that
+    # declare it as a module; an attribute in a comment or a string declares nothing,
+    # and a value there that does not resolve is refused
+    shared = os.path.join(root, "crates", "gpu-gates", "src", "bin", "shared")
+    os.makedirs(shared)
+    family = os.path.join(shared, "mini_family.rs")
+    open(family, "w").write(_MINI_TEST)
+    bin_rs = os.path.join(root, "crates", "gpu-gates", "src", "bin", "gate_mini.rs")
+    saved_bin = open(bin_rs).read()
+
+    def shared_pins(link):
+        open(bin_rs, "w").write(saved_bin + link)
+        try:
+            return {(p[1], p[2]) for p in scan_tree(root)[0] if "mini_family" in p[4]}
+        except InputError as e:
+            return {("refused", "no recipe" if "no justfile recipe names" in str(e) else str(e))}
+
+    for link in ('#[path = "shared/mini_family.rs"]\nmod mini_family;\n',
+                 '#[path = "shared/mini_family.rs"] // why\nmod mini_family;\n',
+                 '#[path = "shared/mini_family.rs"] /* why */ mod mini_family;\n'):
+        got = shared_pins(link)
+        if got != {("gate-mini", "fixed")}:
+            fails.append(f"a shared file's pins through {link!r}: {sorted(got)}, expected the including bin's gate-mini")
+    for what, link in (("a line comment", '// #[path = "shared/mini_family.rs"]\n// mod mini_family;\n'),
+                       ("a block comment", '/* #[path = "shared/mini_family.rs"]\nmod mini_family; */\n'),
+                       ("a string", 'const S: &str = r#"#[path = "shared/mini_family.rs"]\nmod mini_family;"#;\n'),
+                       ("no module", '#[path = "shared/mini_family.rs"]\n'),
+                       ("an inline module", '#[path = "shared/mini_family.rs"]\nmod mini_family {}\n')):
+        got = shared_pins(link)
+        if got != {("refused", "no recipe")}:
+            fails.append(f"a shared file linked only by {what}: {sorted(got)}, expected refused as no recipe's")
+    open(family, "w").write(_MINI_TEST.replace('"fixed"', "word"))
+    got = shared_pins('#[path = "shared/mini_family.rs"]\nmod mini_family;\n')
+    if len(got) != 1 or "pinned to the identifier word" not in next(iter(got))[1]:
+        fails.append(f"a shared file's pin to an unresolved identifier: {sorted(got)}, expected refused by name")
+    for expr in ("cfg.word", "Cfg::WORD"):
+        open(family, "w").write(_MINI_TEST.replace('"fixed"', expr))
+        got = shared_pins('#[path = "shared/mini_family.rs"]\nmod mini_family;\n')
+        if len(got) != 1 or f"pinned to the identifier {expr}" not in next(iter(got))[1]:
+            fails.append(f"a shared file's pin to {expr}: {sorted(got)}, expected refused by name")
+    os.remove(family)
+    open(bin_rs, "w").write(saved_bin)
     # a gate file no recipe names is a named error
     open(os.path.join(root, "crates", "model", "tests", "orphan.rs"), "w").write(_MINI_TEST)
     try:

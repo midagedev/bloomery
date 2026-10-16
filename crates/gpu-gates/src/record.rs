@@ -1122,6 +1122,14 @@ pub static TIER_COST: Kind = Kind {
         key("tg_tps", Ty::F64(6), "tok/s"),
         key("step_ms", Ty::F64(6), "ms"),
         key("gpu_processes", Ty::U64, ""),
+        key("budget_gib", Ty::U64, "GiB"),
+        key("elapsed_s", Ty::F64(9), "s"),
+        key("control_round_trips", Ty::U64, "request/reply pairs"),
+        key("handoffs", Ty::U64, "go/done pairs"),
+        key("read_terms", Ty::Text, "B/token"),
+        key("wire", Ty::Text, "columns and go/done B per tier"),
+        key("hits_before", Ty::Text, "routed slots per tier and layer"),
+        key("hits_after", Ty::Text, "routed slots per tier and layer"),
     ],
     doc: "Plan (b') decode with a local or node tier after the same warm history.",
 };
@@ -1814,12 +1822,13 @@ pub static CLEF_ROWS: Kind = Kind {
 /// the ids its claims filled and found filled, and the ids it claimed as
 /// keep and as transient, the step port's claims: the ids they filled and
 /// found filled, the step layers whose claim had a miss and the wall those
-/// fills took, the host compute of the hit group under that read, and the
-/// wall of the fill reader's jobs by kind.
+/// fills took, the host compute of the hit group under that read, whether
+/// the step port's card leg reads the arena and the ids it held for the card,
+/// and the wall of the fill reader's jobs by kind.
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled, the step layers whose claim had a miss (one a layer, not a pick), the wall those fills took as the step call measured it, and the host compute of the hit group while that fill was still in flight; and the wall the fill reader's jobs ran, the prompt batches', the step's and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled, the step layers whose claim had a miss (one a layer, not a pick), the wall those fills took as the step call measured it, and the host compute of the hit group while that fill was still in flight; whether the step port's card leg reads the arena (on) or why not (off_anon: an anonymous arena the card has no address of; off_expert_tier: a load with expert tier cards; off_cols: a page of more than one column a row; off_types: a covered layer's stack of a type no arena entry takes; off_words: a covered layer's part off a 4-byte word; off_slots: a covered layer with fewer slots than the ids a pass's rows hold at once; off_residency: the residency machine runs; unattached: the load attached none), the ids the step port held in their slots for the card leg to read; and the wall the fill reader's jobs ran, the prompt batches', the step's and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
     parts: &[
         key("budget", U64, "B"),
         key("arena_planned", U64, "B"),
@@ -1850,8 +1859,25 @@ pub static NVTIER: Kind = Kind {
         key("step_fill_wall_ns", U64, "ns"),
         key("step_hits_under_read_ns", U64, "ns"),
         key("step_run_ns", U64, "ns"),
+        key("card_leg", Word, ""),
+        key("card_ids", U64, ""),
         key("prompt_run_ns", U64, "ns"),
         key("victim_run_ns", U64, "ns"),
+    ],
+};
+
+/// The NVMe family gate child's reply.
+pub static NVTIER_ARM: Kind = Kind {
+    name: "nvtier_arm",
+    head: "arm-child",
+    doc: "The paged arm state, counts and graph/eager positions.",
+    parts: &[
+        key("leg", Word, ""),
+        key("claims", U64, ""),
+        key("card_ids", U64, ""),
+        key("fills", U64, ""),
+        key("run", Csv, ""),
+        key("eager", Csv, ""),
     ],
 };
 
@@ -1866,7 +1892,7 @@ pub static NVTIER: Kind = Kind {
 pub static TIER_CENSUS: Kind = Kind {
     name: "tier_census",
     head: "tier census",
-    doc: "One span of a paged load: its phase (a gate's prompt, steps or slots phase; a server's call), the tokens its host services carried, the routed picks they saw and of them those served by a card (the stage card, a tier card, or a prompt's host slots left to the card route), read from the NVMe tier's RAM arena, or read through the model file's mapping (card + arena + file = picks when every host slot was read once); the bytes the arena's fills read, the bytes of the experts the residency machine put on the stage card and sent back to the host; the tier's drops of the mapping's pages and their wall on the dropper's thread; and the worker pool's dispatches that waited for another caller's job, with their wait.",
+    doc: "One span of a paged load: its phase (a gate's prompt, steps or slots phase; a server's call), the tokens its host services carried, the routed picks they saw and of them those served by a card (the stage card, a tier card, a prompt's host slots left to the card route, or the NVMe tier's ids the step port's card leg read from the arena's slots), read from the NVMe tier's RAM arena, or read through the model file's mapping (card + arena + file = picks when every host slot was read once); the bytes the arena's fills read, the bytes of the experts the residency machine put on the stage card and sent back to the host; the tier's drops of the mapping's pages and their wall on the dropper's thread; and the worker pool's dispatches that waited for another caller's job, with their wait.",
     parts: &[
         key("phase", Word, ""),
         key("tokens", U64, ""),
@@ -3391,6 +3417,17 @@ pub mod groups {
         pub const STATS: &[&Kind] = &[&STAT_STEP_HOST, &STAT_SUMMARY_HOST];
     }
 
+    /// `bin/shared/nvtier_family.rs`.
+    pub mod nvtier_family {
+        use crate::record::{Kind, NVTIER, NVTIER_ARM};
+
+        /// The loaded arm's tier counters: `arm_run`.
+        pub const ARM_RUN: &[&Kind] = &[&NVTIER];
+
+        /// The arm child's reply: `LegFacts::print`.
+        pub const ARM: &[&Kind] = &[&NVTIER_ARM];
+    }
+
     /// `bin/shared/ds41_split.rs`.
     pub mod ds41_split {
         use crate::record::{Kind, STAT_PREFILL_SPLIT};
@@ -3820,9 +3857,14 @@ pub fn mtp_stats(
     })
 }
 
-/// `gate_nvtier`'s rows: the tier's counters, the residency rule's two
-/// records of the paged plan and the tier census of each phase.
-pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST, &TIER_CENSUS];
+/// The NVMe family gates' rows: the tier's counters, the residency rule's
+/// two records of the paged plan, the tier census of each phase and the
+/// paged arm child's reply.
+pub static GATE_NVTIER: &[&Kind] = kinds![
+    groups::nvtier_family::ARM_RUN,
+    &[&RESIDENCY_UNSET, &RESIDENCY_HOST, &TIER_CENSUS],
+    groups::nvtier_family::ARM,
+];
 
 /// The printed plan's host-only causes under its actual expert rule.
 /// `None` is the user's all-host choice and emits no kernel diagnosis.
@@ -4095,6 +4137,12 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
             .u("step_fill_wall_ns", s.step_fill_wall_ns)
             .u("step_hits_under_read_ns", s.step_hits_under_read_ns)
             .u("step_run_ns", ran.step.run_ns)
+            .w(
+                "card_leg",
+                tier.card_leg()
+                    .map_or("on", bloomery_gpu::host::arena_leg::LegOff::name),
+            )
+            .u("card_ids", s.card_ids)
             .u("prompt_run_ns", ran.prompt.run_ns)
             .u("victim_run_ns", ran.victim.run_ns),
     )
@@ -4589,6 +4637,17 @@ mod tests {
         assert!(unsupported.starts_with(&Q8_0.to_string()), "{unsupported}");
         assert!(mismatch.starts_with(&Q5_K.to_string()), "{mismatch}");
         assert_ne!(unsupported, mismatch, "distinct causes must not collapse");
+        // The renderer hands the policy's own reason through, so losing or
+        // overwriting `cause.why` (keeping only the type prefix) cannot stay
+        // green. The reading ties the two representations, not a wording.
+        for cause in routed_rule(Program::Qwen35Body).host_only(&model).unwrap() {
+            let layer = u64::try_from(cause.layer).unwrap();
+            assert!(
+                why(layer, &cause.tensor.name).ends_with(cause.why),
+                "{}",
+                why(layer, &cause.tensor.name)
+            );
+        }
         assert!(host_only(&model, None).unwrap().next().is_none());
     }
 
@@ -4649,8 +4708,8 @@ mod tests {
     #[test]
     fn every_binary_registers_the_groups_its_entries_require() {
         use groups::{
-            bind, drafted, ds41_draft, ds41_split, host_stats, model_file, qwen3moe_place,
-            residency38, serve_client, side_seat, vision_seat,
+            bind, drafted, ds41_draft, ds41_split, host_stats, model_file, nvtier_family,
+            qwen3moe_place, residency38, serve_client, side_seat, vision_seat,
         };
         type Group = &'static [&'static Kind];
         let table: [(&str, Group, &[Group]); 13] = [
@@ -4753,9 +4812,14 @@ mod tests {
                 ],
             ),
             (
-                "gate_nvtier: residency38",
+                "gate_nvtier: residency38, nvtier_family::arm_run, LegFacts::print",
                 GATE_NVTIER,
-                &[residency38::UNSET, residency38::HOST],
+                &[
+                    residency38::UNSET,
+                    residency38::HOST,
+                    nvtier_family::ARM_RUN,
+                    nvtier_family::ARM,
+                ],
             ),
             (
                 "gate_deepseek41_prefill: ds41_split::split",
@@ -4882,9 +4946,9 @@ mod tests {
     }
 
     /// The `nvtier` record ends with the prompt union's six counters, the
-    /// step port's counters and the reader's walls, in the order the kind
-    /// declares them: a record that names one out of order or leaves one out
-    /// panics by name.
+    /// step port's counters, its card leg's state and id count and the
+    /// reader's walls, in the order the kind declares them: a record that
+    /// names one out of order or leaves one out panics by name.
     #[test]
     fn nvtier_ends_with_the_union_counters() {
         let line = Record::new(&NVTIER)
@@ -4917,21 +4981,24 @@ mod tests {
             .u("step_fill_wall_ns", 25)
             .u("step_hits_under_read_ns", 26)
             .u("step_run_ns", 27)
-            .u("prompt_run_ns", 28)
-            .u("victim_run_ns", 29)
+            .w("card_leg", "on")
+            .u("card_ids", 28)
+            .u("prompt_run_ns", 30)
+            .u("victim_run_ns", 31)
             .line();
         assert!(
             line.ends_with(
                 "drop_ns=13 slot_reads=14 mapping_reads=15 union_small=16 union_batched=17 \
                  union_fills=18 union_hits=19 keep_claims=20 transient_claims=21 step_fills=22 \
                  step_hits=23 step_miss_layers=24 step_fill_wall_ns=25 \
-                 step_hits_under_read_ns=26 step_run_ns=27 prompt_run_ns=28 victim_run_ns=29"
+                 step_hits_under_read_ns=26 step_run_ns=27 card_leg=on card_ids=28 \
+                 prompt_run_ns=30 victim_run_ns=31"
             ),
             "{line}"
         );
         let names: Vec<&str> = NVTIER.parts.iter().filter_map(Part::value_name).collect();
         assert_eq!(
-            names[names.len() - 14..],
+            names[names.len() - 16..],
             [
                 "union_small",
                 "union_batched",
@@ -4945,6 +5012,8 @@ mod tests {
                 "step_fill_wall_ns",
                 "step_hits_under_read_ns",
                 "step_run_ns",
+                "card_leg",
+                "card_ids",
                 "prompt_run_ns",
                 "victim_run_ns"
             ]

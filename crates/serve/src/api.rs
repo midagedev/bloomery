@@ -93,7 +93,7 @@ mod anthropic;
 /// The embeddings endpoints over the side model, a child of this module so
 /// they read a prompt as the completion path does.
 #[path = "embeddings.rs"]
-mod embeddings;
+pub mod embeddings;
 /// Per-token log-probabilities, which the generation loop collects and the
 /// completion and chat answers render.
 #[path = "logprobs.rs"]

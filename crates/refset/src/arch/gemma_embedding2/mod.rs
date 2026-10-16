@@ -14,7 +14,7 @@
 //!   its `# model` is the projector file and its `# arch` the projector's
 //!   (`clip`). [`TOWER_CPU`] is its CPU twin.
 //! - [`SERVER`]: llama-server's `/v1/embeddings` vectors of every text case and
-//!   image, normalized and raw (`tools/ref/emb2/server_vectors.py`).
+//!   image, normalized and raw (`tools/ref/emb2/server_vectors.py`). [`SERVER_CPU`] is its CPU twin.
 //! - [`AUDIO_MEL`]: the pinned host preprocessor's mel from synthetic decoded
 //!   mono PCM (`tools/ref/emb2/mel.sh`), with no model or device opened.
 //!
@@ -61,8 +61,23 @@ pub const TEXT_CPU_SET: &str = "ref_gemma_embedding2_text.cpu";
 pub const TOWER_SET: &str = "ref_gemma_embedding2_tower";
 pub const TOWER_CPU_SET: &str = "ref_gemma_embedding2_tower.cpu";
 
+/// The image inputs the mainline tower dump supplies, in the profile's order.
+pub const TOWER_IMAGES: &[&str] = &[
+    "small-200x200",
+    "min-96x64",
+    "free-448x448",
+    "free-640x480",
+    "pad-777x513",
+    "strip-1000x1",
+    "free-1024x768",
+];
+
+/// The gate that reads the tower sets.
+pub const TOWER_GATE: &str = "gate-gpu-gemma4v-tower";
+
 /// llama-server's vectors.
 pub const SERVER_SET: &str = "ref_gemma_embedding2_server";
+pub const SERVER_CPU_SET: &str = "ref_gemma_embedding2_server.cpu";
 
 /// A row's band in the encoder and serving gates: this many times the CPU
 /// twin's distance from the card set (`shared/glm5next_media.rs`'s `TWIN`,
@@ -97,6 +112,7 @@ fn mmproj() -> Result<String, RefError> {
 
 /// The gate that reads the text sets.
 const E2E: &[&str] = &["gate-gpu-gemma-embedding2-e2e"];
+const IMAGE: &[&str] = &[TOWER_GATE, "gate-gpu-gemma-embedding2-e2e"];
 
 /// The text cases' token rows, pooled vectors and layer taps on the card.
 pub static TEXT: Family = Family {
@@ -128,28 +144,37 @@ pub static TEXT_CPU: Family = Family {
     )
 };
 /// The image cases' tower taps and rows on the card.
-pub static TOWER: Family = family(
-    "tower-gemma4v",
-    &[TOWER_SET],
-    Kind::Tower,
-    &PROFILE,
-    crate::clefvis::TOWER_ARCH,
-    mmproj,
-    RECIPE,
-);
+pub static TOWER: Family = Family {
+    consumers: IMAGE,
+    ..family(
+        "tower-gemma4v",
+        &[TOWER_SET],
+        Kind::Tower,
+        &PROFILE,
+        crate::clefvis::TOWER_ARCH,
+        mmproj,
+        RECIPE,
+    )
+};
 /// The same, with no card in view.
-pub static TOWER_CPU: Family = family(
-    "tower-gemma4v-cpu",
-    &[TOWER_CPU_SET],
-    Kind::TowerCpu,
-    &PROFILE,
-    crate::clefvis::TOWER_ARCH,
-    mmproj,
-    RECIPE,
-);
+pub static TOWER_CPU: Family = Family {
+    consumers: IMAGE,
+    ..family(
+        "tower-gemma4v-cpu",
+        &[TOWER_CPU_SET],
+        Kind::TowerCpu,
+        &PROFILE,
+        crate::clefvis::TOWER_ARCH,
+        mmproj,
+        RECIPE,
+    )
+};
 /// llama-server's `/v1/embeddings` vectors.
 pub static SERVER: Family = Family {
-    consumers: &["gate-gpu-gemma-embedding2-serve"],
+    consumers: &[
+        "gate-gpu-gemma-embedding2-e2e",
+        "gate-gpu-gemma-embedding2-serve",
+    ],
     ..family(
         "server-gemma-embedding2",
         &[SERVER_SET],
@@ -183,8 +208,30 @@ pub static AUDIO_MEL: Family = Family {
     consumers: &["gate-emb2-mel"],
 };
 
+/// The same requests with the text model and projector on the CPU.
+pub static SERVER_CPU: Family = Family {
+    consumers: E2E,
+    ..family(
+        "server-gemma-embedding2-cpu",
+        &[SERVER_CPU_SET],
+        Kind::ServerCpu,
+        &PROFILE,
+        ARCH,
+        model,
+        RECIPE,
+    )
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&TEXT, &TEXT_CPU, &TOWER, &TOWER_CPU, &SERVER, &AUDIO_MEL];
+pub static FAMILIES: &[&Family] = &[
+    &TEXT,
+    &TEXT_CPU,
+    &TOWER,
+    &TOWER_CPU,
+    &SERVER,
+    &SERVER_CPU,
+    &AUDIO_MEL,
+];
 
 #[cfg(test)]
 mod tests;

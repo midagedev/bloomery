@@ -25,6 +25,12 @@
 //! one and adds minus one; it sits after the card's experts and the shared
 //! expert, so their work runs under the host's.
 //!
+//! On a load whose NVMe tier arena the card addresses, the step port's card
+//! leg ([`arena_leg::ArenaLeg`]) follows the wait: the host holds the
+//! service's arena ids filled and pinned, writes their slots' offsets beside
+//! the handoff and computes the other host slots; the card computes the held
+//! ids from their slots and adds their weighted sum to `hsum` before the add.
+//!
 //! No word is written by the card and the host at the same time: the
 //! generation, sequence and layer words only by the card; the counter by the
 //! host between a go and its wait, and by the card after the wait passes —
@@ -94,6 +100,7 @@
 //! lost card, which no reset lifts. A tier card may run in another process,
 //! a tier node ([`node`]), whose channel lost is a lost card too.
 
+pub mod arena_leg;
 pub mod batch;
 pub mod census;
 pub mod handoff;
@@ -201,7 +208,8 @@ pub fn refuse_expert_tiers(what: &'static str, machine: &Machine) -> Result<(), 
 /// weighted sum of the listed routed experts of layer `layer` for the
 /// activation `x` (one column of the model width), written over `out` (that
 /// width; an empty list writes zeros). The list is the handoff's host slots
-/// in slot order, at most the boundary's routed width `n_used`, each id with
+/// in slot order, less the ids the step port's card leg holds, at most the
+/// boundary's routed width `n_used`, each id with
 /// its routing weight; an architecture's scratch is made for that width at
 /// load and refuses a longer list by name. The protocol around the call — waiting for the go, checking the
 /// handoff, signalling the card, releasing it on a failure — is
@@ -999,6 +1007,45 @@ impl<H> HostTier<H> {
     }
 }
 
+impl HostTier<run::HostRun> {
+    /// Attach the step port's card leg over the NVMe tier's arena
+    /// ([`arena_leg::ArenaLeg`]) on `gpu`, the stage card the chain runs on:
+    /// on a load whose host run has an arena the card addresses, whose page
+    /// carries one column a row, which has no expert tier card and whose
+    /// residency machine does not run (`machine`: the load starts one,
+    /// which frees arena slots between passes); any other load keeps the
+    /// host leg, the reason noted on the tier
+    /// ([`nvtier::NvTier::card_leg`]). Nothing without an arena. Load-time
+    /// only, once, after [`HostTier::attach_tiers`] and before any capture.
+    pub fn attach_arena_leg(&mut self, gpu: &crate::Gpu, machine: bool) -> Result<(), GpuError> {
+        let Some(tier) = self.experts.tier().cloned() else {
+            return Ok(());
+        };
+        let leg = if !self.tiers.is_empty() {
+            Err(arena_leg::LegOff::ExpertTier)
+        } else if machine {
+            Err(arena_leg::LegOff::Residency)
+        } else {
+            arena_leg::ArenaLeg::new(
+                gpu,
+                &self.step.boundary,
+                &tier,
+                self.experts.first(),
+                self.experts.layers(),
+                self.experts.ff(),
+            )?
+        };
+        match leg {
+            Ok(leg) => {
+                tier.note_card_leg(None)?;
+                self.step.boundary.arena = Some(leg);
+            }
+            Err(off) => tier.note_card_leg(Some(off))?,
+        }
+        Ok(())
+    }
+}
+
 impl<H> Drop for HostTier<H> {
     fn drop(&mut self) {
         self.stop_swap();
@@ -1044,9 +1091,10 @@ impl<H: HostExperts> HostTier<H> {
     /// machine's tally and holds its staging window open while the pool waits
     /// for a go. The machine frees each layer's spare slots now, so every
     /// piece that sizes itself from the map's capacity is made first.
-    /// Load-time only; a second machine is refused by name, and so is a
+    /// Load-time only; a second machine is refused by name, and so are a
     /// machine on a load whose step runs a layer without the service
-    /// ([`HostTier::mark_unserved`]), before any slot moves.
+    /// ([`HostTier::mark_unserved`]) and one on a load with the step port's
+    /// card leg ([`HostTier::attach_arena_leg`]), before any slot moves.
     pub fn start_swap(
         &mut self,
         ctx: &Arc<CudaContext>,
@@ -1069,6 +1117,13 @@ impl<H: HostExperts> HostTier<H> {
             return Err(GpuError::state(
                 "HostTier::start_swap",
                 "a tier without a machine",
+            ));
+        }
+        if self.step.boundary.arena.is_some() {
+            return Err(GpuError::state(
+                "HostTier::start_swap",
+                "a load without the step port's card leg: the machine frees arena slots a card \
+                 hold keeps, so the load attaches no leg where it starts one",
             ));
         }
         let machine =
@@ -1793,10 +1848,8 @@ impl<H: HostExperts> HostTier<H> {
         let mut page = match (tiers.iter().find_map(TierCard::node), kind) {
             (None, _) => TierPage::new(stage, tiers[0].gpu()?, layout, kind)?,
             (Some(_), bloomery_levers::TierLink::Shared) => TierPage::across(stage, layout)?,
-            (
-                Some(addr),
-                kind @ (bloomery_levers::TierLink::Loopback | bloomery_levers::TierLink::Rdma),
-            ) => {
+            (Some(_), bloomery_levers::TierLink::Rdma) => TierPage::remote(stage, layout)?,
+            (Some(addr), kind @ bloomery_levers::TierLink::Loopback) => {
                 return Err(GpuError::shape(
                     WHAT,
                     format!(
@@ -1808,7 +1861,7 @@ impl<H: HostExperts> HostTier<H> {
             }
         };
         for (t, tier) in tiers.iter_mut().enumerate() {
-            tier.bind(&page, t, stage)?;
+            tier.bind(&mut page, t, stage)?;
         }
         page.unlink()?;
         self.tier_goes = tiers.iter().map(|t| t.progress(&page)).collect();
@@ -2386,6 +2439,7 @@ impl<H: HostExperts> HostTier<H> {
         if !stream_idle(stream)? {
             return Ok(());
         }
+        self.step.release_holds();
         let w = self.words();
         if let Some(page) = self.tier_page.as_ref() {
             for t in &mut self.tiers {
@@ -2902,6 +2956,14 @@ impl<H: HostExperts> HostTier<H> {
         self.step.boundary.release();
         if let Some(page) = self.tier_page.as_ref() {
             self.health.held = page.release().err();
+            if self.health.held.is_none() {
+                for tier in &mut self.tiers {
+                    if let Err(e) = tier.release_remote(page) {
+                        self.health.held = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -2952,6 +3014,7 @@ impl<H: HostExperts> HostTier<H> {
     ) -> Result<(), GpuError> {
         self.refuse_tier_batch("Hybrid::serve_batch")?;
         self.refuse_traced_batch("Hybrid::serve_batch")?;
+        self.step.release_holds();
         if let Some(detail) = self.planted.take() {
             return Err(self.refuse_planted_batch(layer, detail));
         }

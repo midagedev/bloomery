@@ -56,8 +56,8 @@ use gguf::Gguf;
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
 use vision::arch::minicpmv::{self, Group};
-use vision::arch::qwen3vl::TokenLimits;
-use vision::arch::{deepseek41v, glm5v, qwen3vl};
+pub(crate) use vision::arch::qwen3vl::TokenLimits;
+use vision::arch::{deepseek41v, gemma4v, glm5v, qwen3vl};
 use vision::mrope::Canvas;
 use vision::{EncoderInput, MediaModel, Patches, Prepared, VisionError};
 
@@ -175,6 +175,12 @@ impl Flags {
         self.min_tokens.is_some() || self.max_tokens.is_some()
     }
 
+    /// Whether the caller explicitly disables a repository's projector.
+    #[must_use]
+    pub fn disabled(&self) -> bool {
+        self.no_mmproj
+    }
+
     /// The image-token limits: the flags' values over `default`, the limits the projector starts
     /// from when no flag gives one ([`Rule`]), refused by name when `min` is 0 or above `max`.
     pub fn limits_over(&self, default: TokenLimits) -> Result<TokenLimits, GateError> {
@@ -186,7 +192,7 @@ impl Flags {
     }
 }
 
-/// A flag's count: a positive integer, or refused by name.
+/// A flag's count: an unsigned integer, or refused by name.
 fn count(flag: &str, v: &str) -> Result<usize, GateError> {
     v.parse::<usize>()
         .map_err(|e| format!("{flag} {v:?}: {e}").into())
@@ -270,6 +276,15 @@ pub fn rules() -> &'static [Rule] {
             default_limits: |_| TokenLimits::new(1, MINICPM_TILE_TOKENS),
             cap: |_, limits| Ok(limits.max()),
         },
+        Rule {
+            projector: gemma4v::PROJECTOR_TYPE,
+            ids: &[],
+            text_rope: None,
+            takes_limits: true,
+            out_dim: |f| Ok(gemma4v::Hparams::read(f)?.out_dim),
+            default_limits: |f| gemma4v::Hparams::read(f)?.default_limits(),
+            cap: |_, limits| Ok(limits.max()),
+        },
     ];
     RULES
 }
@@ -323,10 +338,7 @@ impl Projector {
     pub fn open(path: &Path, flags: &Flags, takes: &[&str]) -> Result<Projector, GateError> {
         let at = |e: &dyn Display| format!("--mmproj {}: {e}", path.display());
         let file = Gguf::open(path).map_err(|e| at(&e))?;
-        let kind = file
-            .value("clip.projector_type")
-            .and_then(gguf::Value::as_str)
-            .ok_or_else(|| at(&"clip.projector_type is absent or not a string"))?;
+        let kind = vision::arch::projector_type(&file).map_err(|e| at(&e))?;
         if !takes.contains(&kind) {
             return Err(at(&format!(
                 "projector type {kind:?}; this seat's text model takes {takes:?}"
@@ -420,20 +432,23 @@ impl Projector {
                 ))
             )));
         }
-        let image = self.media.image_token();
         match text.ple {
             PleImage::Absent => {}
             PleImage::NoKey => {
                 return Err(at(&"the text model carries per-layer embeddings and no \
                     ple.image_token_id, which must be the projector's image token"));
             }
-            PleImage::Id(id) if id != image => {
-                return Err(at(&format!(
-                    "the text model's ple.image_token_id is {id}, the projector's image token \
-                     is {image}"
-                )));
+            PleImage::Id(id) => {
+                let image = self.media.image_token().ok_or_else(|| {
+                    at(&"the projector has no chat image token for ple.image_token_id")
+                })?;
+                if id != image {
+                    return Err(at(&format!(
+                        "the text model's ple.image_token_id is {id}, the projector's image token \
+                         is {image}"
+                    )));
+                }
             }
-            PleImage::Id(_) => {}
         }
         Ok(())
     }
@@ -1459,8 +1474,8 @@ mod tests {
         fn image_marker(&self) -> &str {
             "<img>"
         }
-        fn image_token(&self) -> u32 {
-            self.0
+        fn image_token(&self) -> Option<u32> {
+            Some(self.0)
         }
         fn prepare(&self, _: &vision::Rgb8) -> Result<vision::Prepared, VisionError> {
             Err(VisionError::Limits {
@@ -1853,7 +1868,7 @@ mod tests {
         assert_eq!(
             open(&bare, &none, &["deepseek41v"]),
             format!(
-                "--mmproj {}: clip.projector_type is absent or not a string",
+                "--mmproj {}: metadata clip.projector_type: is absent",
                 bare.0.display()
             )
         );

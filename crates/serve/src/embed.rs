@@ -28,9 +28,23 @@ pub trait Embed: Send {
     /// The widths a request's `dimensions` may cut the pooled vector to, ascending; the last is
     /// the pooled vector's own width.
     fn dims(&self) -> Vec<usize>;
+    /// The side model's image preparer, present when a projector is loaded.
+    fn media(&self) -> Option<crate::media::SharedMediaModel> {
+        None
+    }
     /// One pass over one input: at least one id and at most [`Embed::ctx`], each below the
     /// vocabulary's size. The pooled vector, the full width (the last of [`Embed::dims`]).
     fn embed(&mut self, ids: &[u32]) -> Result<Vec<f32>, EmbedError>;
+    /// One pass with prepared images replacing the positions they occupy.
+    fn embed_media(
+        &mut self,
+        _ids: &[u32],
+        _images: &[crate::media::MediaFeed],
+    ) -> Result<Vec<f32>, EmbedError> {
+        Err(EmbedError(
+            "the embedding model has no image encoder (--embd-mmproj)".into(),
+        ))
+    }
 }
 
 /// A normalization llama.cpp's `common_embd_normalize` names (`embd_normalize`): `-1` none, `0`

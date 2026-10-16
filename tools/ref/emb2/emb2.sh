@@ -11,6 +11,7 @@
 #   text.cpu   ${SETPFX}_text.cpu: the same with no card in view
 #   tower      ${SETPFX}_tower: dump_emb2 tower over IMAGES on the card
 #   tower.cpu  ${SETPFX}_tower.cpu: the same with no card in view
+#   server.cpu ${SETPFX}_server.cpu: the same requests with both models on CPU
 #   server     ${SETPFX}_server: llama-server's /v1/embeddings vectors of every text
 #              case that is UTF-8 and every image (server_vectors.py), the server on 127.0.0.1:${EMB2_PORT:-8097} for the
 #              step's length
@@ -24,7 +25,7 @@
 # libllama.so it loads, and of the two cases files as they are now. Each set is written to <set>.staging and moved over the
 # old set only when its writer exits 0, so a failed step leaves the old set whole: the old set waits as <set>.old while the
 # new one takes its name, an exit or a caught signal in between moves it back, and a step that finds a <set>.old left by a
-# killed run restores it first (or discards it when the replacement is already there). The card steps (text, tower, server)
+# killed run restores it first (or retains it with a timestamp, when the new set has its name already). The card steps (text, tower, server)
 # go through tools/gpu-gate.sh, as clefvis.sh's do: the card's gate lock and the bound EMB2_BOUND (default 1500 s, parsed as
 # tools/gate-bound.sh parses BLOOMERY_GATE_BOUND), for the call and for each step; the script links itself as
 # target/release/emb2_dump and runs the card steps under that name inside the runner. The twins open no card
@@ -73,7 +74,7 @@ if [ "$(basename "${BASH_SOURCE[0]}")" != emb2_dump ] && [ ${#card_steps[@]} -gt
     a6000 | both) BLOOMERY_GATE_BOUND=$BOUND bash tools/gpu-gate.sh emb2_dump "${card_steps[@]}" ;;
     *) BLOOMERY_GATE_BOUND=$BOUND BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh emb2_dump "${card_steps[@]}" ;;
   esac
-  for s in text.cpu tower.cpu; do
+  for s in text.cpu tower.cpu server.cpu; do
     if selected "$s"; then bash "$REAL" "$s"; fi
   done
   exit 0
@@ -162,11 +163,19 @@ extra cases:3:$(md5sum < "crates/tokenizer/tests/$EMBED_CASES" | cut -d' ' -f1)
 EOF
 }
 
-# <set>.old left by a killed run: the old set when <set> is missing, a leftover when the new set had its name already.
+# Replaced sets and incomplete staging directories stay beside the published set under a unique retained name.
+retain() {
+  if [ -e "$1" ]; then
+    local kept=$1.retained.$(date -u +%Y%m%dT%H%M%SZ).$$
+    mv "$1" "$kept"
+    echo "emb2: retained $kept"
+  fi
+}
+
 recover() { # <final>
   [ -e "$1.old" ] || return 0
   if [ -e "$1" ]; then
-    rm -rf "$1.old"
+    retain "$1.old"
   else
     mv "$1.old" "$1"
     echo "emb2: restored $1 from $1.old"
@@ -178,7 +187,7 @@ publish() { # <staging> <final>: the old set stays whole until the new one has i
   if [ -e "$2" ]; then mv "$2" "$2.old"; fi
   mv "$1" "$2"
   publishing=
-  rm -rf "$2.old"
+  retain "$2.old"
   echo "emb2: $(basename "$2") -> $2"
 }
 
@@ -191,7 +200,10 @@ for name in "${IMAGES[@]}"; do
 done
 
 server_step() {
-  local stage=$1 card_name=$2 port=${EMB2_PORT:-8097} up='' log=$DATA/${SETPFX}_server.log flags media_args
+  local stage=$1 card_name=$2 device=$3 port=${EMB2_PORT:-8097} up='' log flags media_args
+  log=$DATA/${SETPFX}_server
+  if [ "$device" = cpu ]; then log+=.cpu; fi
+  log+=.log
   if (: < "/dev/tcp/127.0.0.1/$port") 2> /dev/null; then
     die "something already listens on 127.0.0.1:$port; stop it or set EMB2_PORT"
   fi
@@ -202,6 +214,12 @@ server_step() {
     flags+=(--mmproj "$MMPROJ")
     media_args=(--mmproj "$MMPROJ" --mmproj-sha256 "$MMPROJ_SHA256" "${image_args[@]}" --mix-image free-448x448)
   fi
+  local cpu=()
+  if [ "$device" = cpu ]; then
+    export CUDA_VISIBLE_DEVICES=
+    flags+=(-ngl 0 --no-mmproj-offload)
+    cpu=(--cpu)
+  fi
   "$SERVER_BIN" "${flags[@]}" > "$log" 2>&1 &
   server_pid=$!
   for _ in $(seq 120); do
@@ -211,7 +229,7 @@ server_step() {
   done
   [ -n "$up" ] || die "llama-server did not come up (log: $log)" 1
   timeout --kill-after=10 "$BOUND" python3 tools/ref/emb2/server_vectors.py --url "http://127.0.0.1:$port" --pid "$server_pid" \
-    --model "$MODEL" --arch "$MODEL_NAME" --model-sha256 "$MODEL_SHA256" --card "$card_name" \
+    "${cpu[@]}" --model "$MODEL" --arch "$MODEL_NAME" --model-sha256 "$MODEL_SHA256" --card "$card_name" \
     --build-record "$BIN.build" --ids-dir "$IDS" "${case_args[@]}" --out "$stage" "${media_args[@]}" \
     --server-flags "${flags[*]}"
   kill "$server_pid"
@@ -230,7 +248,7 @@ for s in "${ALL[@]}"; do
   stage=$set_dir.staging
   recover "$set_dir"
   verify
-  rm -rf "$stage"
+  retain "$stage"
   SECONDS=0
   case $s in
     text | text.cpu | tower | tower.cpu)
@@ -249,10 +267,10 @@ for s in "${ALL[@]}"; do
       "${run[@]}" timeout --kill-after=10 "$BOUND" "$BIN" "${args[@]}" "${where[@]}" -t "$THREADS" --build-record "$BIN.build" \
         --out "$stage"
       ;;
-    server)
+    server | server.cpu)
       ids_current
-      card_name=$(card)
-      server_step "$stage" "$card_name"
+      if [ "$s" = server.cpu ]; then card_name=cpu; device=cpu; else card_name=$(card); device=cuda; fi
+      server_step "$stage" "$card_name" "$device"
       ;;
   esac
   publish "$stage" "$set_dir"

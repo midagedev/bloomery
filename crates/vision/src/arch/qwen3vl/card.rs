@@ -12,11 +12,11 @@
 use std::collections::HashSet;
 
 use super::hparams::TILE_N;
-use super::size::TokenLimits;
 use super::tensors::{Export, expected};
 use super::{Hparams, TEMPORAL_FRAMES, names};
 pub use crate::arch::card::CardBytes;
 use crate::arch::card::activation_bytes;
+use crate::size::TokenLimits;
 
 /// The tower of a file of `hp` at `limits` image tokens (module doc).
 #[must_use]

@@ -66,7 +66,10 @@ pub struct TierCensus {
     /// The routed picks the services saw: the routed width a column.
     pub picks: u64,
     /// Of those, the ones the slot map sent to a card: the stage card's, a
-    /// tier card's, and a prompt's host slots left out for the card route.
+    /// tier card's, and a prompt's host slots left out for the card route;
+    /// and the NVMe tier's ids the step port's card leg read from the
+    /// arena's slots ([`super::nvtier::NvTierStats::card_ids`]), which the
+    /// host computation never lists.
     pub card: u64,
     /// Of those, the ones the host computation read from the arena's slots.
     pub arena: u64,

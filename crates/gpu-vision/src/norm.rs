@@ -188,6 +188,118 @@ mod norm_kernels {
         }
     }
 
+    /// RMSNorm of an F32 residual stream, stored as F32 or narrowed for a BF16 GEMM.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry uses the flat device ABI (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= rows * dim, gain.len() >= dim, y16.len() >= rows * dim, y32.len() >= rows * dim)
+    )]
+    pub fn vis_rms_norm_f32(
+        x: &[f32],
+        gain: &[f32],
+        eps: f32,
+        dim: u32,
+        rows: u32,
+        to_f32: u32,
+        mut y16: DisjointSlice<u16>,
+        mut y32: DisjointSlice<f32>,
+    ) {
+        static mut WSUM: SharedArray<f32, WARPS> = SharedArray::UNINIT;
+
+        let r = thread::blockIdx_x() as usize;
+        if r >= rows as usize {
+            return;
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let d = dim as usize;
+        let words = d / 2;
+        let base = r * d;
+        let mut acc = 0.0f32;
+        let mut w = tid;
+        while w < words {
+            let at = base + 2 * w;
+            // SAFETY: r < rows and 2w < dim keep at inside the input row.
+            let a = unsafe { *x.get_unchecked(at) };
+            // SAFETY: r < rows and 2w + 1 < dim keep at + 1 inside the input row.
+            let b = unsafe { *x.get_unchecked(at + 1) };
+            acc = fma_rn_f32(a, a, acc);
+            acc = fma_rn_f32(b, b, acc);
+            w += THREADS;
+        }
+        acc = add_rn_f32(acc, warp::shuffle_xor_f32(acc, 16));
+        acc = add_rn_f32(acc, warp::shuffle_xor_f32(acc, 8));
+        acc = add_rn_f32(acc, warp::shuffle_xor_f32(acc, 4));
+        acc = add_rn_f32(acc, warp::shuffle_xor_f32(acc, 2));
+        acc = add_rn_f32(acc, warp::shuffle_xor_f32(acc, 1));
+        // SAFETY: block-shared, WARPS == blockDim.x / 32, written before the barrier that
+        // publishes it.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        if warp::lane_id() == 0 {
+            // SAFETY: tid / 32 < WARPS bounds the slot; lane 0 is its one writer.
+            unsafe {
+                *ws.add(tid / 32) = acc;
+            }
+        }
+        thread::sync_threads();
+        // SAFETY: the eight slots, published by the barrier above.
+        let sums = unsafe {
+            [
+                *ws,
+                *ws.add(1),
+                *ws.add(2),
+                *ws.add(3),
+                *ws.add(4),
+                *ws.add(5),
+                *ws.add(6),
+                *ws.add(7),
+            ]
+        };
+        let mean = div_rn_f32(warp_tree(sums), d as f32);
+        let scale = div_rn_f32(1.0, sqrt_rn_f32(add_rn_f32(mean, eps)));
+        let mut w = tid;
+        while w < words {
+            let at = base + 2 * w;
+            // SAFETY: r < rows and 2*w < d bound this input lane.
+            let a = unsafe { *x.get_unchecked(at) };
+            // SAFETY: r < rows and 2*w + 1 < d bound this input lane.
+            let b = unsafe { *x.get_unchecked(at + 1) };
+            // SAFETY: 2*w < d <= gain.len().
+            let g0 = unsafe { *gain.get_unchecked(2 * w) };
+            // SAFETY: 2*w + 1 < d <= gain.len().
+            let g1 = unsafe { *gain.get_unchecked(2 * w + 1) };
+            let y0 = mul_rn_f32(g0, mul_rn_f32(a, scale));
+            let y1 = mul_rn_f32(g1, mul_rn_f32(b, scale));
+            if to_f32 != 0 {
+                // SAFETY: at < rows*d <= y32.len(); this thread owns this lane.
+                unsafe {
+                    *y32.get_unchecked_mut(at) = y0;
+                }
+                // SAFETY: at + 1 < rows*d <= y32.len(); this thread owns this lane.
+                unsafe {
+                    *y32.get_unchecked_mut(at + 1) = y1;
+                }
+            } else {
+                let y0 = f32_to_bf16_rne(y0);
+                // SAFETY: at < rows*d <= y16.len(); this thread owns this lane.
+                unsafe {
+                    *y16.get_unchecked_mut(at) = y0;
+                }
+                let y1 = f32_to_bf16_rne(y1);
+                // SAFETY: at + 1 < rows*d <= y16.len(); this thread owns this lane.
+                unsafe {
+                    *y16.get_unchecked_mut(at + 1) = y1;
+                }
+            }
+            w += THREADS;
+        }
+    }
+
     /// `x = RMSNorm(x)` in place over the `n_heads` heads of [`HEAD`] bf16 values at columns
     /// `col0 + h·64` of each of `rows` rows of `row_width`, every head with the gain of 64: the
     /// module rule per head. One warp per (row, head), eight to a block; lane `t` owns the pair at
@@ -265,6 +377,17 @@ pub struct NormKernels {
     module: norm_kernels::LoadedModule,
 }
 
+/// Both output buffers hold the row extent; only the selected storage format is written.
+pub(crate) struct FloatNormArgs<'a> {
+    pub x: &'a DeviceBuffer<f32>,
+    pub gain: &'a DeviceBuffer<f32>,
+    pub eps: f32,
+    pub rows: usize,
+    pub to_f32: bool,
+    pub y16: &'a mut DeviceBuffer<u16>,
+    pub y32: &'a mut DeviceBuffer<f32>,
+}
+
 impl NormKernels {
     /// Load this file's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<NormKernels, GpuError> {
@@ -318,6 +441,50 @@ impl NormKernels {
         )?;
         Ok(())
     }
+    pub(crate) fn enqueue_f32(
+        &self,
+        stream: &CudaStream,
+        a: FloatNormArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "NormKernels::enqueue_f32";
+        let dim = a.gain.len();
+        let n = a
+            .rows
+            .checked_mul(dim)
+            .ok_or_else(|| GpuError::shape(what, "element count overflows"))?;
+        launch_u32(what, "element count", n)?;
+        if dim == 0
+            || !dim.is_multiple_of(2)
+            || a.rows == 0
+            || a.x.len() < n
+            || a.y16.len() < n
+            || a.y32.len() < n
+        {
+            return Err(GpuError::shape(
+                what,
+                "the input and both output buffers must hold every even-width row",
+            ));
+        }
+        let prep = self.module.prepare_vis_rms_norm_f32(LaunchConfig1D::new(
+            launch_u32(what, "rows", a.rows)?,
+            THREADS_U32,
+            0,
+        ))?;
+        self.module.vis_rms_norm_f32(
+            stream,
+            &prep,
+            a.x,
+            a.gain,
+            a.eps,
+            launch_u32(what, "dim", dim)?,
+            launch_u32(what, "rows", a.rows)?,
+            u32::from(a.to_f32),
+            a.y16,
+            a.y32,
+        )?;
+        Ok(())
+    }
+
     /// Enqueue the per-head norm ([`HeadNormArgs`]): in place, one launch per segment. The gain is
     /// [`HEAD`] values; the heads must lie inside the row. Asynchronous.
     pub fn enqueue_heads(

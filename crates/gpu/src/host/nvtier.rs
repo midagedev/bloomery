@@ -6,7 +6,9 @@
 //! filled on a miss by [`DirectFile::read_span_uninit`] — over the resident pool for
 //! a decode step's misses, on the tier's own reader for a prompt batch's and
 //! a residency flip's victim — and lent to the host leg through the model
-//! side's [`TierSlots`] seam.
+//! side's [`TierSlots`] seam or, on a pinned arena, held for the step port's
+//! card leg, which computes a step's ids from their slots on the card
+//! ([`NvTier::hold_for_card`]).
 //! The file mapping serves the plan's host segment; every other id the leg
 //! reads — the NVMe segment's, and the card's victims once they flip — is
 //! this arena's, its slot refused by name while unfilled.
@@ -105,6 +107,7 @@ use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
 use model::placement::workstation::ArenaGrant;
 use model::placement::{ARENA_ALIGN, ArenaFloor, Device, Plan, Role, arena_window_bytes};
 
+use super::arena_leg::LegOff;
 use crate::GpuError;
 
 const _: () = assert!(model::placement::STEP_PORT_COLUMNS == model::ops::DEFER_MAX_COLS);
@@ -830,14 +833,16 @@ struct LayerArena {
     /// call. [`PIN_BUFFERS`] is the pins one layer can hold at once: a
     /// step's (`crates/model/src/moe.rs:2444`, `:2611`), two union batches
     /// (the computing batch's pin and the next batch's ticket, `:1768`,
-    /// `:1780`; an unbatched union holds one, `:1694`) and one of headroom.
+    /// `:1780`; an unbatched union holds one, `:1694`), and a card hold a
+    /// row of the step port's page ([`CardHold`]: a pass's rows each hold
+    /// the last layer until their next go).
     /// A pin past those takes a fresh buffer that joins the pool when it
     /// drops; it is never refused.
     idle: Mutex<Vec<Vec<u32>>>,
 }
 
 /// The id buffers cut for one layer's pool at the carve ([`LayerArena::idle`]).
-const PIN_BUFFERS: usize = 4;
+const PIN_BUFFERS: usize = 3 + super::page::MAX_ROWS;
 
 /// [`LayerArena::idle`] for a layer of `slots` slots: [`PIN_BUFFERS`] buffers
 /// of that capacity, the list itself sized so a buffer's return never grows
@@ -877,6 +882,20 @@ impl LayerArena {
         let row = *self.part_of.get()?.get(part)?;
         let slot = self.filled(id)?;
         Some(self.span_of(slot, id, row))
+    }
+
+    /// Whether every part of an id the layer serves starts on a 4-byte word
+    /// of the mapping in any slot: the layer's first byte, the slot size,
+    /// each part's window and each such id's skew are multiples of four
+    /// ([`LayerArena::span_of`]).
+    fn on_words(&self) -> bool {
+        let word = |n: usize| n.is_multiple_of(4);
+        word(self.base)
+            && word(self.slot_bytes)
+            && self.windows.iter().all(|&w| word(w))
+            && (0..self.n_expert)
+                .filter(|id| !self.host.contains(id))
+                .all(|id| self.parts[id as usize].iter().all(|r| word(r.skew)))
     }
 
     /// Whether a lane's open read pins slot `s`: the expert it holds is read
@@ -1151,6 +1170,35 @@ struct Pick {
     gone: Option<u32>,
 }
 
+/// Ids of one layer the card leg reads, pinned in their slots
+/// ([`NvTier::hold_for_card`]): no claim takes their slots and
+/// [`NvTier::release`] refuses them until the hold drops, which closes the
+/// reads and gives the id buffer back. It owns its tier, so the step port
+/// keeps it past the service that took it.
+#[must_use = "the slots stay pinned until the hold drops"]
+pub struct CardHold {
+    tier: Arc<NvTier>,
+    token: Option<PinToken>,
+}
+
+impl CardHold {
+    /// The held ids, in the order the hold was asked for them.
+    #[must_use]
+    pub fn ids(&self) -> &[u32] {
+        self.token.as_ref().map_or(&[], |t| &t.ids)
+    }
+}
+
+impl Drop for CardHold {
+    fn drop(&mut self) {
+        if let Some(t) = self.token.take()
+            && let Some(arena) = self.tier.by_layer.get(t.layer).and_then(|l| l.as_ref())
+        {
+            arena.unpin(t.layer, t.ids);
+        }
+    }
+}
+
 /// The tier's counters ([`NvTier::stats`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NvTierStats {
@@ -1220,6 +1268,9 @@ pub struct NvTierStats {
     /// Host compute of a step's hit group while its miss ticket was still
     /// in flight (ns). A ready ticket and a fill wait are not this.
     pub step_hits_under_read_ns: u64,
+    /// Ids the step port held for the card leg ([`NvTier::hold_for_card`]),
+    /// which the card read from their slots.
+    pub card_ids: u64,
 }
 
 /// The atomically counted [`NvTierStats`]: a counter a field.
@@ -1249,6 +1300,7 @@ struct Stats {
     step_miss_layers: AtomicU64,
     step_fill_wall_ns: AtomicU64,
     step_hits_under_read_ns: AtomicU64,
+    card_ids: AtomicU64,
     /// The last union call of each layer, kept when asked for
     /// ([`NvTier::record_unions`]); unset while off.
     unions: OnceLock<Mutex<Vec<Option<UnionBook>>>>,
@@ -1529,6 +1581,10 @@ pub struct NvTier {
     /// The dropper thread's shared state, and the thread, joined on drop.
     drops: Arc<DropShared>,
     dropper: Mutex<Option<JoinHandle<()>>>,
+    /// Whether the step port's card leg reads the arena (`None`) or why
+    /// not, as the load noted it ([`NvTier::note_card_leg`]); unset until
+    /// then. Set once at load through the shared tier, so a cell.
+    card_leg: OnceLock<Option<LegOff>>,
 }
 
 impl Drop for NvTier {
@@ -1865,6 +1921,7 @@ impl NvTier {
             page,
             drops,
             dropper: Mutex::new(Some(dropper)),
+            card_leg: OnceLock::new(),
         })
     }
 
@@ -2019,6 +2076,7 @@ impl NvTier {
             step_miss_layers: s.step_miss_layers.load(Ordering::Relaxed),
             step_fill_wall_ns: s.step_fill_wall_ns.load(Ordering::Relaxed),
             step_hits_under_read_ns: s.step_hits_under_read_ns.load(Ordering::Relaxed),
+            card_ids: s.card_ids.load(Ordering::Relaxed),
         }
     }
 
@@ -2443,6 +2501,112 @@ impl NvTier {
             self.audit_slots(layer, ids)?;
         }
         Ok(TierPin::new(held.arena, held.into_token()))
+    }
+
+    /// [`NvTier::ensure_pinned`] under [`Claim::Step`] for the card leg: every
+    /// id of `ids` the arena serves filled and pinned until the returned hold
+    /// drops, which the step port keeps until the card has read the slots
+    /// ([`super::step`]). `ids` are ids the arena serves, at most the layer's
+    /// slots. An invalid claim is refused by name.
+    pub fn hold_for_card(
+        self: &Arc<Self>,
+        layer: usize,
+        ids: &[u32],
+    ) -> Result<CardHold, GpuError> {
+        let ready = TierSlots::prefetch_pinned(self.as_ref(), layer, ids, Claim::Step)
+            .and_then(|ticket| ticket.wait())
+            .map_err(|e| GpuError::from(model::ModelError::Tier(e)))?;
+        let mut held = {
+            let _books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+            self.arena_of(layer, "NvTier::hold_for_card")?.pin_batch(
+                layer,
+                ids,
+                "NvTier::hold_for_card",
+            )?
+        };
+        drop(ready);
+        // The hold names its ids in the order asked, the order the step
+        // port writes their offsets in.
+        if held.ids.len() != ids.len() || ids.iter().any(|id| !held.ids.contains(id)) {
+            return Err(GpuError::state(
+                "NvTier::hold_for_card",
+                "a pin of exactly the asked ids",
+            ));
+        }
+        held.ids.copy_from_slice(ids);
+        if self.audit.get().is_some() {
+            self.audit_slots(layer, ids)?;
+        }
+        let token = held.into_token();
+        self.stats
+            .card_ids
+            .fetch_add(token.ids.len() as u64, Ordering::Relaxed);
+        Ok(CardHold {
+            tier: Arc::clone(self),
+            token: Some(token),
+        })
+    }
+
+    /// The arena as the card addresses it: its first byte's device address
+    /// and its length in 4-byte words. `None` on an anonymous arena.
+    #[must_use]
+    pub fn card_arena(&self) -> Option<(u64, usize)> {
+        Some((self.mem.device_start()?, self.mem.len() / 4))
+    }
+
+    /// Where the card leg reads layer `layer`'s expert `id` in the arena
+    /// ([`NvTier::card_arena`]): the word offsets of its gate, up and down
+    /// parts, as [`TierSlots::slot`] counts parts. Refused by name for an id
+    /// with no filled slot (the caller holds it, [`NvTier::hold_for_card`])
+    /// and for a part that does not start on a word.
+    pub fn card_offsets(&self, layer: usize, id: u32) -> Result<[u64; PARTS], GpuError> {
+        const WHAT: &str = "NvTier::card_offsets";
+        let arena = self.arena_of(layer, WHAT)?;
+        let mut offs = [0u64; PARTS];
+        for (p, off) in offs.iter_mut().enumerate() {
+            let (at, _) = arena.part_at(id, p).ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!("layer {layer} expert {id} part {p}: no filled slot holds it"),
+                )
+            })?;
+            if !at.is_multiple_of(4) {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("layer {layer} expert {id} part {p} starts at byte {at}, off a word"),
+                ));
+            }
+            *off = (at / 4) as u64;
+        }
+        Ok(offs)
+    }
+
+    /// Record whether the step port's card leg reads this arena: `None`, or
+    /// why it is off. Load-time only, once: a second note is refused by
+    /// name. [`NvTier::card_leg`] reads it.
+    pub(crate) fn note_card_leg(&self, off: Option<LegOff>) -> Result<(), GpuError> {
+        self.card_leg.set(off).map_err(|_| {
+            GpuError::state("NvTier::note_card_leg", "the card leg's state, noted twice")
+        })
+    }
+
+    /// `None` when the step port's card leg reads this arena, else why not;
+    /// [`LegOff::Unattached`] when the load never asked for one.
+    #[must_use]
+    pub fn card_leg(&self) -> Option<LegOff> {
+        *self.card_leg.get().unwrap_or(&Some(LegOff::Unattached))
+    }
+
+    /// Whether every part of an id layer `layer`'s arena serves starts on a
+    /// 4-byte word in whichever slot holds it, as the card leg's arena
+    /// entries read it ([`NvTier::card_offsets`]); false for a layer the
+    /// arena does not cover. Load-time.
+    #[must_use]
+    pub fn parts_on_words(&self, layer: usize) -> bool {
+        self.by_layer
+            .get(layer)
+            .and_then(|l| l.as_ref())
+            .is_some_and(LayerArena::on_words)
     }
 
     /// Layer `layer`'s slot count; 0 for a layer the arena does not cover.
@@ -4003,9 +4167,12 @@ mod tests {
 
     /// A pin's id buffer comes from the layer's pool and goes back to it when
     /// the guard drops, so the next pin of the layer takes the same buffer
-    /// and the steady state makes no allocator call for it. A pin past the
-    /// pool's [`super::PIN_BUFFERS`] takes a fresh buffer, never a refusal,
-    /// and the buffer joins the pool when its pin drops.
+    /// and the steady state makes no allocator call for it. The most pins a
+    /// layer holds at once (each row's card hold on a pass of
+    /// [`super::super::page::MAX_ROWS`] rows, a step's pin and two union
+    /// batches) take pooled buffers only. A pin past the pool's
+    /// [`super::PIN_BUFFERS`] takes a fresh buffer, never a refusal, and the
+    /// buffer joins the pool when its pin drops.
     #[test]
     fn a_pins_id_buffer_returns_to_the_layers_pool() {
         let arena = arena_of(8, 4);
@@ -4026,18 +4193,34 @@ mod tests {
         drop(second);
         let idle = |arena: &super::LayerArena| arena.idle.lock().unwrap().len();
         assert_eq!(idle(&arena), super::PIN_BUFFERS);
-        // Five at once: four from the pool, the fifth a fresh buffer.
+        let pooled: Vec<*const u32> = arena
+            .idle
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| b.as_ptr())
+            .collect();
+        let most: Vec<_> = (0..super::super::page::MAX_ROWS + 3)
+            .map(|_| pinned(&arena, &mut books, &[0, 1, 2]))
+            .collect();
+        assert!(
+            most.iter().all(|p| pooled.contains(&p.ids().as_ptr())),
+            "the most pins a layer holds at once took a fresh buffer"
+        );
+        drop(most);
+        // One past the pool at once: every pooled buffer, then a fresh one.
         let held: Vec<_> = (0..super::PIN_BUFFERS + 1)
             .map(|_| pinned(&arena, &mut books, &[0, 1, 2]))
             .collect();
         assert_eq!(idle(&arena), 0);
-        assert_eq!(open_reads(&arena, &[0, 1, 2]), [5, 5, 5]);
+        let n = super::PIN_BUFFERS as u32 + 1;
+        assert_eq!(open_reads(&arena, &[0, 1, 2]), [n, n, n]);
         drop(held);
         assert_eq!(open_reads(&arena, &[0, 1, 2]), [0, 0, 0]);
         assert_eq!(
             idle(&arena),
             super::PIN_BUFFERS + 1,
-            "the fifth pin's fresh buffer joined the pool"
+            "the last pin's fresh buffer joined the pool"
         );
     }
 
@@ -4474,6 +4657,23 @@ mod tests {
         }
     }
 
+    /// The split a tier's dropper holds: one tensor in `scratch`, never dropped here.
+    fn split_in(scratch: &Scratch) -> std::sync::Arc<gguf::Split> {
+        use gguf::write::{Layout, TensorDecl, Writer};
+        let path = scratch.0.join("model.gguf");
+        let decl = TensorDecl {
+            name: "x".into(),
+            dims: vec![4],
+            type_id: 0,
+            nbytes: 16,
+        };
+        let layout = Layout::new(&[], vec![decl]).unwrap();
+        let mut writer = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
+        writer.tensor("x", &[0; 16]).unwrap();
+        writer.finish().unwrap();
+        std::sync::Arc::new(gguf::Split::open(&path).unwrap())
+    }
+
     /// `devmap` over the tier's own carve ([`NvTier::carve`]): two paged
     /// layers, so the second's base is past 0, each stack row its own file
     /// and range, the leg's parts resolved to other rows (`[2, 0, 1]`), and
@@ -4493,8 +4693,6 @@ mod tests {
         use crate::graph::{MappedHost, cu};
         use bloomery_levers::NvTierMem;
         use engram::direct::DirectFile;
-        use gguf::Split;
-        use gguf::write::{Layout, TensorDecl, Writer};
         use model::moe::TierSlots;
         use model::placement::workstation::ArenaGrant;
         use std::sync::Arc;
@@ -4514,19 +4712,7 @@ mod tests {
         let (ctx, _stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let scratch = Scratch::new(if direct { "devmap-direct" } else { "devmap" });
         let paths: [_; PARTS] = std::array::from_fn(|row| scratch.0.join(format!("row{row}")));
-        // The split the tier's dropper holds: one tensor, never dropped here.
-        let model = scratch.0.join("model.gguf");
-        let decl = TensorDecl {
-            name: "x".into(),
-            dims: vec![4],
-            type_id: 0,
-            nbytes: 16,
-        };
-        let layout = Layout::new(&[], vec![decl]).unwrap();
-        let mut w = Writer::new(std::fs::File::create(&model).unwrap(), layout).unwrap();
-        w.tensor("x", &[0; 16]).unwrap();
-        w.finish().unwrap();
-        let split = Arc::new(Split::open(&model).unwrap());
+        let split = split_in(&scratch);
         let layer = || {
             let mut arena = arena_of(8, 0);
             arena.windows = [0, PAGE, 3 * PAGE];
@@ -4679,6 +4865,742 @@ mod tests {
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_devmap_a_direct_fill_lands_in_a_pinned_slot() {
         devmap_rounds(true);
+    }
+
+    /// A card hold ([`NvTier::hold_for_card`]) fills and pins its ids for as
+    /// long as it lives: no claim takes their slots while it does, its drop
+    /// gives them back to the LRU, and the step's fills and the card's ids
+    /// are counted. A hold of a miss and a hit names them in the order asked.
+    /// Each part's word offset is its slot's first byte in the
+    /// arena over four, a part that does not start on a word is refused by
+    /// name, and the layer then has parts off a word. The arena is anonymous,
+    /// so the card has no address of it. The card leg's state reads
+    /// unattached until the load notes it, once.
+    #[test]
+    fn a_card_hold_pins_its_ids_until_it_drops() {
+        use super::{ArenaKind, LegOff, NvTier};
+        use engram::direct::DirectFile;
+        use model::moe::TierSlots;
+        use model::placement::workstation::ArenaGrant;
+        use std::sync::Arc;
+        const PAGE: usize = DIRECT_ALIGN;
+        const LAYER: usize = 1;
+        const LEN: usize = 64;
+        // Expert `id`'s part of stack row `row`: one page an expert, a
+        // word-aligned skew a row; expert 7's skew is off a word.
+        let at = |row: usize, id: usize| id * PAGE + if id == 7 { 37 } else { 4 * (row + 1) };
+        let bytes_of = |row: usize| -> Vec<u8> {
+            (0..8 * PAGE)
+                .map(|i| ((i % 251) as u8).wrapping_add((83 * row + 1) as u8))
+                .collect()
+        };
+        let scratch = Scratch::new("card-hold");
+        let split = split_in(&scratch);
+        let files: [_; PARTS] = std::array::from_fn(|row| {
+            let path = scratch.0.join(format!("row{row}"));
+            std::fs::write(&path, bytes_of(row)).unwrap();
+            Arc::new(DirectFile::open_buffered(&path).unwrap())
+        });
+        let layer = || {
+            let mut arena = arena_of(8, 0);
+            arena.windows = [0, PAGE, 2 * PAGE];
+            arena.slot_bytes = 3 * PAGE;
+            arena.parts = (0..8)
+                .map(|id| {
+                    std::array::from_fn(|row| PartRange {
+                        at: at(row, id) as u64,
+                        len: LEN,
+                        skew: at(row, id) % PAGE,
+                    })
+                })
+                .collect();
+            arena.files = files.clone();
+            arena.part_of.set([0, 1, 2]).unwrap();
+            Some(arena)
+        };
+        let slots = [3 * PAGE];
+        let grant = ArenaGrant::whole((2 * slots[0]) as u64);
+        let tier = Arc::new(
+            NvTier::carve(
+                vec![None, layer()],
+                &slots,
+                2,
+                grant,
+                0,
+                &split,
+                ArenaKind::Anon,
+            )
+            .expect("the tier's carve"),
+        );
+        let hold = tier.hold_for_card(LAYER, &[1, 2]).unwrap();
+        assert_eq!(hold.ids(), [1, 2]);
+        for id in [1u32, 2] {
+            let offs = tier.card_offsets(LAYER, id).unwrap();
+            for (p, off) in offs.iter().enumerate() {
+                let part = tier.slot(LAYER, id, p).expect("a held id's slot");
+                assert_eq!(
+                    *off * 4,
+                    (part.as_ptr() as usize - tier.mem.start()) as u64,
+                    "expert {id} part {p}: the word offset of its slot's bytes"
+                );
+                let a = at(p, id as usize);
+                assert_eq!(
+                    part,
+                    &bytes_of(p)[a..a + LEN],
+                    "expert {id} part {p}: the file's bytes"
+                );
+            }
+        }
+        let e = tier
+            .ensure_pinned(LAYER, &[3], Claim::Step)
+            .map(|_| ())
+            .expect_err("both slots are held")
+            .to_string();
+        assert!(e.contains("pinned by a lane's read or a batch pin"), "{e}");
+        let s = tier.stats();
+        assert_eq!((s.card_ids, s.step_fills), (2, 2));
+        drop(hold);
+        let buffers = || {
+            let picks = tier.step.picks.lock().unwrap();
+            let evicted = tier.step.evicted.lock().unwrap();
+            let reads = tier.step.buf.reads.lock().unwrap();
+            (
+                (picks.as_ptr() as usize, picks.capacity()),
+                (evicted.as_ptr() as usize, evicted.capacity()),
+                (reads.as_ptr() as usize, reads.capacity()),
+            )
+        };
+        let warmed = buffers();
+        drop(
+            tier.ensure_pinned(LAYER, &[3], Claim::Step)
+                .expect("the dropped hold's slots are the LRU's again"),
+        );
+        let mixed = tier.hold_for_card(LAYER, &[5, 3]).unwrap();
+        assert_eq!(
+            mixed.ids(),
+            [5, 3],
+            "the asked order, the hit after the miss"
+        );
+        {
+            let reads = tier.step.buf.reads.lock().unwrap();
+            assert_eq!(reads.len(), 1, "the resident fill reads only the miss");
+            assert_eq!(reads[0].id, 5, "the card hold uses the resident step fill");
+        }
+        assert_eq!(buffers(), warmed, "a warmed eviction reuses its buffers");
+        drop(mixed);
+        let odd = tier.hold_for_card(LAYER, &[7]).unwrap();
+        let e = tier.card_offsets(LAYER, 7).unwrap_err().to_string();
+        assert!(e.contains("off a word"), "{e}");
+        drop(odd);
+        assert!(
+            !tier.parts_on_words(LAYER),
+            "expert 7's parts start off a word"
+        );
+        assert!(!tier.parts_on_words(0), "a layer the arena does not cover");
+        assert!(arena_of(8, 4).on_words(), "every part on a word");
+        assert_eq!(tier.card_leg(), Some(LegOff::Unattached));
+        tier.note_card_leg(Some(LegOff::Anon)).unwrap();
+        assert_eq!(tier.card_leg(), Some(LegOff::Anon));
+        let e = tier.note_card_leg(None).unwrap_err().to_string();
+        assert!(e.contains("noted twice"), "{e}");
+        assert_eq!(
+            tier.card_arena(),
+            None,
+            "an anonymous arena has no card address"
+        );
+    }
+
+    /// The arena entries over a pinned tier's slot that each round refills
+    /// in place with another expert, through the tier's own fill (`O_DIRECT`
+    /// and through the page cache): right after each refill, the Q4_K
+    /// gate·up and Q5_K down arena entries, eager and from a graph captured
+    /// in the first round, read the slot through its pin's addresses and
+    /// write that round's expert's rows, the stack `_sel` launches' over the
+    /// same bytes bit for bit and never the round before's. The parts are a
+    /// few hundred KiB, so a line of the expert before can still sit in the
+    /// card's cache when the refill lands; nothing else reads the arena in
+    /// between.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_refilled_pinned_slot_reads_as_its_new_expert_in_the_arena_entries() {
+        use super::{ArenaKind, NvTier};
+        use crate::Gpu;
+        use crate::card_leg::tests::{stack_bytes, words_of};
+        use crate::graph::Graph;
+        use crate::kquant::{
+            Act, GateUpAct, GateUpAt, KquantKernels, PART_DOWN, PART_GATE, PART_UP, SelDown,
+            SelDownAt,
+        };
+        use crate::q4k_sel::QuantSel;
+        use crate::tensor::{DeviceTensor, Q8Act, window};
+        use cuda_core::DeviceBuffer;
+        use engram::direct::DirectFile;
+        use gguf::GgmlType;
+        use model::placement::workstation::ArenaGrant;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering::Relaxed;
+        const PAGE: usize = DIRECT_ALIGN;
+        const LAYER: usize = 1;
+        const ID: u32 = 7;
+        const ROUNDS: usize = 4;
+        // The model width and the routed width: two and one super-blocks.
+        const N: usize = 512;
+        const FF: usize = 256;
+        // Per part (gate, up, down): its type, rows and k.
+        const ROLES: [(GgmlType, usize, usize); PARTS] = [
+            (GgmlType::Q4_K, FF, N),
+            (GgmlType::Q4_K, FF, N),
+            (GgmlType::Q5_K, N, FF),
+        ];
+        // Each part's first byte in its file: on a word, off the page.
+        const AT: [usize; PARTS] = [1248, PAGE + 36, 2 * PAGE + 4000];
+        let expert = |round: usize, p: usize| {
+            stack_bytes(
+                ROLES[p].0,
+                ROLES[p].1,
+                ROLES[p].2,
+                (round * PARTS + p) as u64 + 0x5eed,
+            )
+        };
+        let len: [usize; PARTS] = std::array::from_fn(|p| expert(0, p).len());
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let (stream, ctx) = (gpu.stream(), gpu.context());
+        let kq = KquantKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
+        let sink = gpu.layer_sink(0).expect("a sink");
+        let rule = Act::SwigluClamp { limit: 0.25 };
+        let normed: Vec<f32> = (0..N)
+            .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let normed = DeviceBuffer::from_host(stream, &normed).expect("the normed row");
+        let mut act_x = Q8Act::with_tier_cols(stream, 1, N).expect("act_x");
+        gpu.enqueue_quantize_q8_1_cols(&normed, &mut act_x, 1, 0)
+            .expect("q8_1");
+        let one = DeviceBuffer::from_host(stream, &[0u32]).expect("the place");
+
+        // The reference: the rounds' experts as stacks, round r's at id r.
+        let stacks: Vec<DeviceTensor<u32>> = (0..PARTS)
+            .map(|p| {
+                let rows = ROUNDS * ROLES[p].1;
+                let bytes: Vec<u8> = (0..ROUNDS).flat_map(|r| expert(r, p)).collect();
+                let words = words_of(&bytes, rows);
+                let n = words.len();
+                DeviceTensor::upload(stream, &words, rows, n / rows).expect("a stack")
+            })
+            .collect();
+        let want: Vec<(Vec<f32>, Vec<f32>)> = (0..ROUNDS)
+            .map(|r| {
+                let sel = DeviceBuffer::from_host(stream, &[r as u32]).expect("the id");
+                let mut h = DeviceBuffer::<f32>::zeroed(stream, FF).expect("h");
+                let mut act_h = Q8Act::with_slots(stream, 1, FF).expect("act_h");
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, N).expect("y");
+                let a = GateUpAct {
+                    wg: &stacks[PART_GATE],
+                    wu: &stacks[PART_UP],
+                    act: &act_x,
+                    sel: &sel,
+                    n_slots: 1,
+                    rows_per_expert: FF,
+                    slots_per_col: 1,
+                    rule,
+                };
+                kq.enqueue_gate_up_q4k(stream, &a, sink, &mut h)
+                    .expect("the stack gate·up");
+                let q = QuantSel {
+                    x: &h,
+                    cols: 0..1,
+                    sel: &one,
+                    n_card: 1,
+                };
+                gpu.q4k_sel()
+                    .enqueue_quantize_sel(stream, &q, sink, &mut act_h)
+                    .expect("the quantizer");
+                let d = SelDown {
+                    w: &stacks[PART_DOWN],
+                    act: &act_h,
+                    sel: &sel,
+                    n_slots: 1,
+                    rows_per_expert: N,
+                };
+                kq.enqueue_gemv_q5k_sel(stream, &d, sink, &mut y)
+                    .expect("the stack down");
+                (
+                    h.to_host_vec(stream).expect("h"),
+                    y.to_host_vec(stream).expect("y"),
+                )
+            })
+            .collect();
+        for r in 1..ROUNDS {
+            assert_ne!(
+                want[r],
+                want[r - 1],
+                "rounds {} and {r} have the same rows",
+                r - 1
+            );
+        }
+
+        // The tier: two paged layers, each part its own file at AT, each
+        // window the part's aligned span.
+        let mut windows = [0usize; PARTS];
+        let mut slot_bytes = 0;
+        for p in 0..PARTS {
+            windows[p] = slot_bytes;
+            slot_bytes += engram::direct::aligned_span(AT[p] as u64, len[p] as u64).1;
+        }
+        for direct in [false, true] {
+            let tag = if direct { "refill-direct" } else { "refill" };
+            let scratch = Scratch::new(tag);
+            let paths: [_; PARTS] = std::array::from_fn(|p| scratch.0.join(format!("part{p}")));
+            let split = split_in(&scratch);
+            let layer = || {
+                let mut arena = arena_of(8, 0);
+                arena.windows = windows;
+                arena.slot_bytes = slot_bytes;
+                arena.parts = vec![
+                    std::array::from_fn(|p| PartRange {
+                        at: AT[p] as u64,
+                        len: len[p],
+                        skew: AT[p] % PAGE,
+                    });
+                    8
+                ];
+                arena.part_of.set([0, 1, 2]).unwrap();
+                Some(arena)
+            };
+            let pinned = ArenaKind::of(ctx, bloomery_levers::NvTierMem::Pinned).unwrap();
+            let slots = [slot_bytes; 2];
+            let grant = ArenaGrant::whole((2 * slots.iter().sum::<usize>()) as u64);
+            let mut tier =
+                NvTier::carve(vec![layer(), layer()], &slots, 2, grant, 0, &split, pinned)
+                    .expect("the tier's carve");
+            let dev0 = tier
+                .mem
+                .device_start()
+                .expect("a pinned arena's card address");
+            // SAFETY: the tier's whole mapping, live until `tier` drops after
+            // the window and every launch that read it.
+            let arena = unsafe { window::<u32>(dev0, tier.mem.len() / 4, ctx) };
+            let mut offs = DeviceBuffer::<u64>::zeroed(stream, PARTS).expect("the table");
+            let mut h = DeviceBuffer::<f32>::zeroed(stream, FF).expect("h");
+            let mut act_h = Q8Act::with_slots(stream, 1, FF).expect("act_h");
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, N).expect("y");
+            let mut graph: Option<Graph> = None;
+            let mut table: Option<Vec<u64>> = None;
+            for round in 0..ROUNDS {
+                let case = format!("{tag} round {round}");
+                for (p, path) in paths.iter().enumerate() {
+                    let mut file = vec![0xA5u8; AT[p]];
+                    file.extend(expert(round, p));
+                    file.resize(file.len().next_multiple_of(PAGE), 0x5A);
+                    std::fs::write(path, file).unwrap();
+                }
+                let arena_l = tier.by_layer[LAYER].as_mut().unwrap();
+                arena_l.files = std::array::from_fn(|p| {
+                    Arc::new(if direct {
+                        DirectFile::open(&paths[p]).expect("a disk-backed file opens O_DIRECT")
+                    } else {
+                        DirectFile::open_buffered(&paths[p]).unwrap()
+                    })
+                });
+                let pick = super::Pick {
+                    slot: 1,
+                    id: ID,
+                    gone: None,
+                };
+                super::read_pick(&tier.mem, &super::read_of(arena_l, &pick))
+                    .unwrap_or_else(|e| panic!("{case}: the slot's fill: {e}"));
+                arena_l.of_id[ID as usize].store(2, Relaxed);
+                arena_l.slots[1].state.store(FILLED, Relaxed);
+                let pin = tier.pin(LAYER, &[ID]).unwrap();
+                let t: Vec<u64> = (0..PARTS)
+                    .map(|p| {
+                        let at = pin.device_slot(ID, p).expect("a pinned slot's address") - dev0;
+                        assert_eq!(at % 4, 0, "{case}: part {p} starts off a word");
+                        at / 4
+                    })
+                    .collect();
+                if let Some(t0) = &table {
+                    assert_eq!(&t, t0, "{case}: the slot moved");
+                } else {
+                    offs.copy_from_host(stream, &t).expect("the table");
+                    table = Some(t);
+                }
+                let run = |s: &cuda_core::CudaStream,
+                           h: &mut DeviceBuffer<f32>,
+                           act_h: &mut Q8Act,
+                           y: &mut DeviceBuffer<f32>|
+                 -> Result<(), crate::GpuError> {
+                    let a = GateUpAt {
+                        arena: &arena,
+                        offs: &offs,
+                        act: &act_x,
+                        n_slots: 1,
+                        rows_per_expert: FF,
+                        slots_per_col: 1,
+                        rule,
+                    };
+                    kq.enqueue_gate_up_q4k_at(s, &a, sink, h)?;
+                    let q = QuantSel {
+                        x: h,
+                        cols: 0..1,
+                        sel: &one,
+                        n_card: 1,
+                    };
+                    gpu.q4k_sel().enqueue_quantize_sel(s, &q, sink, act_h)?;
+                    let d = SelDownAt {
+                        arena: &arena,
+                        offs: &offs,
+                        act: act_h,
+                        n_slots: 1,
+                        rows_per_expert: N,
+                    };
+                    kq.enqueue_gemv_q5k_sel_at(s, &d, sink, y)
+                };
+                for how in ["eager", "graph"] {
+                    h.copy_from_host(stream, &[f32::NAN; FF]).expect("h");
+                    y.copy_from_host(stream, &[f32::NAN; N]).expect("y");
+                    if how == "eager" {
+                        run(stream, &mut h, &mut act_h, &mut y).expect("the arena entries");
+                    } else {
+                        if graph.is_none() {
+                            graph = Some(
+                                Graph::capture(stream, |s| run(s, &mut h, &mut act_h, &mut y))
+                                    .expect("the capture"),
+                            );
+                        }
+                        graph.as_ref().unwrap().launch(stream).expect("the replay");
+                    }
+                    let got = (
+                        h.to_host_vec(stream).expect("h"),
+                        y.to_host_vec(stream).expect("y"),
+                    );
+                    assert!(
+                        gpu.take_fault().expect("the fault word").is_none(),
+                        "{case} {how}: a fault"
+                    );
+                    if round > 0 {
+                        assert_ne!(
+                            got,
+                            want[round - 1],
+                            "{case} {how}: the slot still reads the round before's expert"
+                        );
+                    }
+                    for (what, g, w) in [
+                        ("h", &got.0, &want[round].0),
+                        ("down", &got.1, &want[round].1),
+                    ] {
+                        if let Some(i) = (0..w.len()).find(|&i| g[i].to_bits() != w[i].to_bits()) {
+                            panic!(
+                                "{case} {how}: {what} row {i}: arena {:#010x}, stack {:#010x}",
+                                g[i].to_bits(),
+                                w[i].to_bits()
+                            );
+                        }
+                    }
+                }
+                drop(pin);
+            }
+            drop(graph.take());
+            drop(std::mem::ManuallyDrop::into_inner(arena).into_raw_parts());
+        }
+    }
+
+    /// The card leg ([`super::super::arena_leg::ArenaLeg`]) adds a row's held
+    /// ids to its sum bit for bit as the stack launches do: two ids of a
+    /// pinned tier held for the card in slots 0 and 3 of six, the others the
+    /// host's, on row 1 of a two-row boundary whose sum starts nonzero; the
+    /// reference runs the leg's q8_1 of the activation, the stack `_sel`
+    /// gate·up, the slots' q8_1 and the stack `_sel` down over the same
+    /// experts, their weighted sum and its add to the starting sum.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_card_leg_sums_its_held_ids_as_the_stack_launches_do() {
+        use super::super::arena_leg::{ArenaLeg, DownAtEntry, GateUpAtEntry, LegLayer};
+        use super::super::page::Word;
+        use super::super::slots::HOST;
+        use super::super::step::{Boundary, BoundaryShape};
+        use super::{ArenaKind, NvTier};
+        use crate::Gpu;
+        use crate::card_leg::tests::{stack_bytes, words_of};
+        use crate::card_slots::{CardAcc, CardSlotKernels};
+        use crate::elem::ElemKernels;
+        use crate::kquant::{
+            Act, GateUpAct, KquantKernels, PART_DOWN, PART_GATE, PART_UP, SelDown,
+        };
+        use crate::q4k_sel::QuantSel;
+        use crate::tensor::{DeviceTensor, Q8Act};
+        use cuda_core::DeviceBuffer;
+        use engram::direct::DirectFile;
+        use gguf::GgmlType;
+        use model::placement::workstation::ArenaGrant;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering::Relaxed;
+        const PAGE: usize = DIRECT_ALIGN;
+        const LAYER: usize = 1;
+        const N_EXPERT: u32 = 8;
+        const ROW: usize = 1;
+        // The model width and the routed width: two and one super-blocks.
+        const N: usize = 512;
+        const FF: usize = 256;
+        const N_USED: usize = 6;
+        // Per slot, the id the card holds, or HOST for a slot the host computes.
+        const IDS: [u32; N_USED] = [2, HOST, HOST, 5, HOST, HOST];
+        // Per part (gate, up, down): its type, rows and k.
+        const ROLES: [(GgmlType, usize, usize); PARTS] = [
+            (GgmlType::Q4_K, FF, N),
+            (GgmlType::Q4_K, FF, N),
+            (GgmlType::Q5_K, N, FF),
+        ];
+        // Each part's expert 0 first byte in its file: on a word, off the page.
+        const AT: [usize; PARTS] = [1248, 36, 4000];
+        let expert = |id: u32, p: usize| {
+            stack_bytes(
+                ROLES[p].0,
+                ROLES[p].1,
+                ROLES[p].2,
+                (id as usize * PARTS + p) as u64 + 0x1eaf,
+            )
+        };
+        let len: [usize; PARTS] = std::array::from_fn(|p| expert(0, p).len());
+        let at = |id: u32, p: usize| AT[p] + id as usize * len[p];
+        let wave = |n: usize, mul: usize, off: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * mul) % 2001) as f32 / 1000.0 - off)
+                .collect()
+        };
+        let x = wave(N, 2654435761, 1.0);
+        let hsum = wave(N, 40503, 0.5);
+        let weights: Vec<f32> = (0..N_USED).map(|s| 0.125 + s as f32 / 16.0).collect();
+        let places = IDS.map(|id| if id == HOST { HOST } else { 0 });
+        let rule = Act::SwigluClamp { limit: 0.25 };
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let (stream, ctx) = (gpu.stream(), gpu.context());
+        let sink = gpu.layer_sink(LAYER).expect("a sink");
+
+        // The reference: every expert as a stack row, the stack launches.
+        let (want, leg_bytes) = {
+            let kq = KquantKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
+            let card = CardSlotKernels::load(ctx).expect("the card slot module");
+            let elem = ElemKernels::load(ctx, gpu.fault_word()).expect("the elem module");
+            let stacks: Vec<DeviceTensor<u32>> = (0..PARTS)
+                .map(|p| {
+                    let rows = N_EXPERT as usize * ROLES[p].1;
+                    let bytes: Vec<u8> = (0..N_EXPERT).flat_map(|id| expert(id, p)).collect();
+                    let words = words_of(&bytes, rows);
+                    let n = words.len();
+                    DeviceTensor::upload(stream, &words, rows, n / rows).expect("a stack")
+                })
+                .collect();
+            let x = DeviceBuffer::from_host(stream, &x).expect("x");
+            let hsum = DeviceBuffer::from_host(stream, &hsum).expect("the sum");
+            let w = DeviceBuffer::from_host(stream, &weights).expect("the weights");
+            let ids = DeviceBuffer::from_host(stream, &IDS).expect("the ids");
+            let places = DeviceBuffer::from_host(stream, &places).expect("the places");
+            let x_place = DeviceBuffer::from_host(stream, &[0u32]).expect("x's place");
+            let mut act_x = Q8Act::with_k(stream, 1, N).expect("act_x");
+            let mut h = DeviceBuffer::<f32>::zeroed(stream, N_USED * FF).expect("h");
+            let mut act_h = Q8Act::with_slots(stream, N_USED, FF).expect("act_h");
+            let mut down = DeviceBuffer::<f32>::zeroed(stream, N_USED * N).expect("down");
+            let mut acc = DeviceBuffer::<f32>::zeroed(stream, N).expect("acc");
+            let mut out = DeviceBuffer::<f32>::zeroed(stream, N).expect("out");
+            let q = QuantSel {
+                x: &x,
+                cols: 0..1,
+                sel: &x_place,
+                n_card: 1,
+            };
+            gpu.q4k_sel()
+                .enqueue_quantize_sel(stream, &q, sink, &mut act_x)
+                .expect("the activation's q8_1");
+            let a = GateUpAct {
+                wg: &stacks[PART_GATE],
+                wu: &stacks[PART_UP],
+                act: &act_x,
+                sel: &ids,
+                n_slots: N_USED,
+                rows_per_expert: FF,
+                slots_per_col: N_USED,
+                rule,
+            };
+            kq.enqueue_gate_up_q4k(stream, &a, sink, &mut h)
+                .expect("the stack gate·up");
+            let q = QuantSel {
+                x: &h,
+                cols: 0..N_USED,
+                sel: &places,
+                n_card: 1,
+            };
+            gpu.q4k_sel()
+                .enqueue_quantize_sel(stream, &q, sink, &mut act_h)
+                .expect("the slots' q8_1");
+            let d = SelDown {
+                w: &stacks[PART_DOWN],
+                act: &act_h,
+                sel: &ids,
+                n_slots: N_USED,
+                rows_per_expert: N,
+            };
+            kq.enqueue_gemv_q5k_sel(stream, &d, sink, &mut down)
+                .expect("the stack down");
+            let c = CardAcc {
+                down: &down,
+                w: &w,
+                sel: &places,
+                n: N,
+                m: 1,
+                n_card: 1,
+                n_used: N_USED,
+                w_pitch: N_USED,
+                fault: sink,
+            };
+            card.enqueue_card_acc(stream, &c, &mut acc)
+                .expect("the weighted sum");
+            elem.enqueue_add(stream, &hsum, &acc, N, &mut out)
+                .expect("the add");
+            let leg_bytes = x_place.num_bytes()
+                + act_x.device_bytes()
+                + h.num_bytes()
+                + act_h.device_bytes()
+                + down.num_bytes()
+                + acc.num_bytes();
+            (out.to_host_vec(stream).expect("the sum"), leg_bytes)
+        };
+        assert_ne!(want, hsum, "the held ids add nothing to the sum");
+
+        // The tier: one paged layer of two slots, each part its own file
+        // holding every expert from AT, each window the widest span an
+        // expert's part takes.
+        let scratch = Scratch::new("card-leg-sum");
+        let split = split_in(&scratch);
+        let files: [_; PARTS] = std::array::from_fn(|p| {
+            let path = scratch.0.join(format!("part{p}"));
+            let mut bytes = vec![0xA5u8; AT[p]];
+            bytes.extend((0..N_EXPERT).flat_map(|id| expert(id, p)));
+            bytes.resize(bytes.len().next_multiple_of(PAGE), 0x5A);
+            std::fs::write(&path, bytes).unwrap();
+            Arc::new(DirectFile::open_buffered(&path).unwrap())
+        });
+        let mut windows = [0usize; PARTS];
+        let mut slot_bytes = 0;
+        for p in 0..PARTS {
+            windows[p] = slot_bytes;
+            slot_bytes += (0..N_EXPERT)
+                .map(|id| aligned_span(at(id, p) as u64, len[p] as u64).1)
+                .max()
+                .unwrap();
+        }
+        let mut arena = arena_of(N_EXPERT, 0);
+        arena.windows = windows;
+        arena.slot_bytes = slot_bytes;
+        arena.parts = (0..N_EXPERT)
+            .map(|id| {
+                std::array::from_fn(|p| PartRange {
+                    at: at(id, p) as u64,
+                    len: len[p],
+                    skew: at(id, p) % PAGE,
+                })
+            })
+            .collect();
+        arena.files = files;
+        arena.part_of.set([0, 1, 2]).unwrap();
+        let pinned = ArenaKind::of(ctx, bloomery_levers::NvTierMem::Pinned).unwrap();
+        let grant = ArenaGrant::whole((2 * slot_bytes) as u64);
+        let tier = Arc::new(
+            NvTier::carve(
+                vec![None, Some(arena)],
+                &[slot_bytes],
+                2,
+                grant,
+                0,
+                &split,
+                pinned,
+            )
+            .expect("the tier's carve"),
+        );
+        assert!(tier.parts_on_words(LAYER), "every part on a word");
+
+        // The leg on row 1, its slots written as a service writes them.
+        let shape = BoundaryShape {
+            hidden: N,
+            n_used: N_USED,
+        };
+        let mut boundary = Boundary::with_rows(ctx, stream, shape, 2).expect("a two-row boundary");
+        let boundary_bytes = boundary.device_bytes();
+        let h = boundary.layout().handoff();
+        let (image, hsum_off) = boundary.row_offsets(ROW).unwrap();
+        let put = |off: usize, v: &[f32]| {
+            for (i, f) in v.iter().enumerate() {
+                boundary
+                    .page()
+                    .atomic_u32(off + 4 * i)
+                    .expect("a word of the page")
+                    .store(f.to_bits(), Relaxed);
+            }
+        };
+        put(image + 4 * h.x, &x);
+        put(image + 4 * h.weights, &weights);
+        put(hsum_off, &hsum);
+        let mut layers = vec![None; LAYER + 1];
+        layers[LAYER] = Some(LegLayer {
+            gate_up: GateUpAtEntry::Q4k,
+            down: DownAtEntry::Q5k,
+            rule,
+            fault: sink,
+        });
+        let mut leg = ArenaLeg::build(&gpu, &boundary, &tier, layers, FF).expect("the leg");
+        for error in [
+            leg.skip_row(2).unwrap_err(),
+            leg.set_slot(2, 0, None).unwrap_err(),
+            leg.set_slot(ROW, N_USED, None).unwrap_err(),
+            leg.enqueue(stream, 2, LAYER).unwrap_err(),
+        ] {
+            let text = error.to_string();
+            assert!(
+                text.contains("row 2 of 2") || text.contains("slot 6 of 6"),
+                "{text}"
+            );
+        }
+        leg.skip_row(ROW).expect("a row inside the leg");
+        let held: Vec<u32> = IDS.into_iter().filter(|&id| id != HOST).collect();
+        let hold = tier.hold_for_card(LAYER, &held).expect("the hold");
+        for (s, &id) in IDS.iter().enumerate() {
+            if id != HOST {
+                let offs = tier.card_offsets(LAYER, id).expect("a held id's offsets");
+                leg.set_slot(ROW, s, Some(offs))
+                    .expect("a slot inside the leg");
+            }
+        }
+        boundary.arena = Some(leg);
+        assert_eq!(
+            boundary.device_bytes(),
+            boundary_bytes + leg_bytes,
+            "the boundary counts the leg's owned device buffers"
+        );
+        boundary
+            .page()
+            .atomic_u32(Word::Cnt(ROW).offset())
+            .expect("the row's counter")
+            .store(1, std::sync::atomic::Ordering::Release);
+        boundary
+            .enqueue_back_of(stream, ROW, LAYER)
+            .expect("the row's card leg");
+        stream.synchronize().expect("the stream");
+        assert!(
+            gpu.take_fault().expect("the fault word").is_none(),
+            "the leg raised a fault"
+        );
+        let got = boundary
+            .page()
+            .f32_copy(hsum_off, N)
+            .expect("the row's sum");
+        if let Some(i) = (0..N).find(|&i| got[i].to_bits() != want[i].to_bits()) {
+            panic!(
+                "the card leg's sum at {i}: {:#010x}, the stack launches' {:#010x}",
+                got[i].to_bits(),
+                want[i].to_bits()
+            );
+        }
+        drop(hold);
+        drop(boundary);
     }
 
     /// A pin names what it refuses and pins nothing then: an id with no

@@ -10,9 +10,10 @@
 //!
 //! The model file is `-m`'s, else `$BLOOMERY_REF_MODEL`: this node's own
 //! copy, which must hold the rows node 0's plan gives the tier with node 0's
-//! bytes (each row's sha256). The address
-//! is a loopback one, else refused by name: the tier page is this host's
-//! memory, and the channel has no authentication. A port of 0 takes a free
+//! bytes (each row's sha256). The explicit listen address is loopback or
+//! private IPv4. Off-host nodes bind their own RDMA pages over this control
+//! channel, which has no authentication and belongs on a trusted network.
+//! A port of 0 takes a free
 //! one. The server prints `listening on <ip:port>` once bound, serves one
 //! load, and exits 0 once node 0 closes that load, whether node 0's side of
 //! it came up or failed; a connection that opened no tier (a census, a
@@ -56,10 +57,10 @@ mod server {
             }
         }
         let listen = listen.ok_or(USAGE)?;
-        if !listen.ip().is_loopback() {
+        if !bloomery_levers::tier_ip(listen.ip()) {
             return Err(format!(
-                "--listen {listen}: a tier server listens on a loopback address, the tier page \
-                 being this host's memory and the channel unauthenticated"
+                "--listen {listen}: a tier server needs a loopback or private IPv4 address; \
+                 the control channel has no authentication"
             )
             .into());
         }

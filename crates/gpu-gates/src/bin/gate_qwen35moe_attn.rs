@@ -665,7 +665,7 @@ mod gate {
     /// `q` one head's query, `kh`/`vh` its key head's first `n` rows.
     fn exact(q: &[f32], kh: &[f32], vh: &[f32], n: usize, scale: f32) -> Exact {
         let ex = exact_attn(q, kh, vh, HEAD, n, scale);
-        let bound_pref = prefill_bound(&ex, vh, HEAD, PREF_TILE);
+        let bound_pref = prefill_bound(&ex, vh, HEAD, PREF_TILE, 0);
         let ExactAttn {
             o,
             a,

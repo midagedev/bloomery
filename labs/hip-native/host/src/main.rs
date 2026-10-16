@@ -1,3 +1,5 @@
+mod selected;
+
 use std::ffi::{CStr, CString, c_char, c_void};
 
 unsafe extern "C" {
@@ -99,7 +101,16 @@ impl Context {
         unsafe { checked(hipStreamSynchronize(self.stream), "hipStreamSynchronize") }
     }
     fn launch(&self, f: *mut c_void, n: usize, args: &mut [*mut c_void]) -> Result<(), String> {
-        let blocks = u32::try_from(n.div_ceil(64)).map_err(|e| e.to_string())?;
+        self.launch_shape(f, n.div_ceil(64), 64, args)
+    }
+    fn launch_shape(
+        &self,
+        f: *mut c_void,
+        blocks: usize,
+        threads: u32,
+        args: &mut [*mut c_void],
+    ) -> Result<(), String> {
+        let blocks = u32::try_from(blocks).map_err(|e| e.to_string())?;
         // SAFETY: callers provide pointers to exact ABI argument storage and checked allocation sizes; synchronize before returning.
         unsafe {
             checked(
@@ -108,7 +119,7 @@ impl Context {
                     blocks,
                     1,
                     1,
-                    64,
+                    threads,
                     1,
                     1,
                     0,
@@ -307,8 +318,10 @@ fn run() -> Result<(), String> {
         for cols in [1, 32] {
             case(&mut s, &weights, k, rows, cols)?;
         }
+        selected::real(&mut s, &weights, k, rows)?;
     }
     dense_ffn(&mut s)?;
+    selected::synthetic(&mut s)?;
     Ok(())
 }
 

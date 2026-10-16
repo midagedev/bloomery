@@ -1003,8 +1003,8 @@ impl MediaModel for MockMedia {
         IMAGE_SPECIAL
     }
 
-    fn image_token(&self) -> u32 {
-        IMAGE_ID
+    fn image_token(&self) -> Option<u32> {
+        Some(IMAGE_ID)
     }
 
     fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {

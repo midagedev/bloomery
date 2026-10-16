@@ -2,7 +2,7 @@
 //! end to end on the Q8_0 file the sets are dumped from ([`MODEL`], held to
 //! its sha256), against llama.cpp mainline's text set dumped on the card
 //! ([`TEXT`]) and its CPU twin ([`TEXT_CPU`]), both read through
-//! [`Emb2Set::open`]: each case the set names, its ids read from the
+//! [`refset::emb2::Emb2Set::open`]: each case the set names, its ids read from the
 //! tokenizer oracle's gemma4 set ([`IDS_SET`]) and held to the set's count
 //! and digest, through one pass at the load's context with its taps read
 //! back.
@@ -22,7 +22,9 @@
 //!    case holds the global layers.
 //! 2. (d) The longest case run again with no taps is bit for bit the first
 //!    run's rows.
-//! 3. (r) Refused by name, the load untouched after each: a pass of no ids,
+//! 3. (i) Image-only and `mix_free-448x448` inputs assembled by the serving helper,
+//!    pooled and normalized against the server card set and its CPU twin.
+//! 4. (r) Refused by name, the load untouched after each: a pass of no ids,
 //!    of one id past the load's context and of an id past the vocabulary,
 //!    and a load at one position past [`CARD_CTX`].
 
@@ -39,22 +41,26 @@ fn main() -> std::process::ExitCode {
 #[path = "shared/e2e.rs"]
 mod e2e;
 
+#[path = "shared/emb2_image.rs"]
+mod image;
+
 #[cfg(feature = "gemma-embedding2")]
 mod gate {
     use std::path::Path;
     use std::time::Instant;
 
     use crate::e2e::{clause, elapsed, refused_by, rel, same_bits, tap};
+    use crate::image::open;
     use bloomery_gpu::Gpu;
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, sha256, verdict};
+    use bloomery_gpu_gates::{
+        GateError, RefManifest, checks_failed, data_dir, ref_model_path, sha256, verdict,
+    };
     use bloomery_gpu_gemma_embedding2::{Encoder, Pass, card_bytes};
     use gguf::Split;
     use model::arch::gemma_embedding2::hparams::{CARD_CTX, Hparams};
     use refset::arch::gemma_embedding2::{
         IDS_SET, MODEL, MODEL_SHA256, REL_FLOOR as FLOOR, TEXT, TEXT_CPU, TWIN,
     };
-    use refset::emb2::Emb2Set;
-    use refset::family::Family;
     use refset::ik::RefHeader;
     use refset::tokenizer::read_ids;
 
@@ -270,9 +276,95 @@ mod gate {
         Ok(ok && same)
     }
 
-    /// `family`'s set, read through its reader.
-    fn open(family: &Family) -> Result<RefManifest, GateError> {
-        Ok(Emb2Set::open(&family.path(family.sets[0]), family)?.man)
+    fn images(enc: &mut Encoder, model: &Path) -> Result<bool, GateError> {
+        use crate::image;
+        use bloomery_gpu::media::MediaSpan;
+        use bloomery_gpu_gates::bind::Vocab;
+        use bloomery_gpu_vision::gemma4v::Encoder as Tower;
+        use refset::arch::gemma_embedding2::{SERVER, SERVER_CPU, TOWER, TOWER_CPU, TOWER_IMAGES};
+        use serve::embeddings::{InputPart, assemble};
+        use vision::arch::{TokenLimits, gemma4v};
+
+        let card = image::open(&TOWER)?;
+        let cpu = image::open(&TOWER_CPU)?;
+        let server = image::open(&SERVER)?;
+        let server_cpu = image::open(&SERVER_CPU)?;
+        let file = gguf::Gguf::open(image::projector(model)?)?;
+        let hp = gemma4v::Hparams::read(&file)?;
+        let limits = TokenLimits::new(70, 1120)?;
+        let rule = hp.size_rule(limits)?;
+        let stream = enc.context().new_stream_with_priority(0)?;
+        let mut tower = Tower::load(enc.context(), &stream, &file, limits)?;
+        let tok = Vocab::new(tokenizer::Tokenizer::from_gguf(model)?)?;
+        let mut ok = true;
+        for name in TOWER_IMAGES {
+            let (rgb, digest) = image::image(&card, &cpu, name)?;
+            let p = gemma4v::preprocess(&rgb, &rule)?;
+            let tokens = p.plan.n_llm_h * p.plan.n_llm_w;
+            let rows = tower.encode(&p)?.rows.buf().to_host_vec(&stream)?;
+            for mixed in [false, true] {
+                if mixed && *name != "free-448x448" {
+                    continue;
+                }
+                let mut parts = Vec::new();
+                if mixed {
+                    parts.push(InputPart::Text("A picture of coloured rings and ramps: "));
+                }
+                parts.push(InputPart::Image {
+                    begin: gemma4v::IMAGE_BEGIN,
+                    end: gemma4v::IMAGE_END,
+                    positions: tokens,
+                });
+                let assembled = assemble(parts.into_iter().map(Ok), &tok, CARD_CTX)?;
+                let ids = &assembled.ids;
+                let span = assembled
+                    .spans
+                    .first()
+                    .ok_or("image assembly returned no span")?;
+                let key = format!("{}_{name}", if mixed { "mix" } else { "img" });
+                // The server pair must have consumed these same bytes and position count.
+                if image::image(&server, &server_cpu, &key)?.1 != digest {
+                    return Err(format!("{key}: server/tower image sha256 mismatch").into());
+                }
+                for man in [&server, &server_cpu] {
+                    let prefix = format!("# image\t{key}\t");
+                    let expected = format!("prompt_tokens {}", ids.len());
+                    if !man
+                        .header
+                        .other
+                        .iter()
+                        .any(|l| l.starts_with(&prefix) && l.split('\t').any(|f| f == expected))
+                    {
+                        return Err(format!(
+                            "{key}: server position count differs from {}",
+                            ids.len()
+                        )
+                        .into());
+                    }
+                }
+                let pass = enc.pass_media(
+                    ids,
+                    &[MediaSpan {
+                        at: span.clone(),
+                        rows: &rows,
+                    }],
+                    false,
+                )?;
+                let norm = serve::embed::normalize(&pass.pooled, serve::embed::Norm::default())?;
+                for (node, ours) in [("raw", &pass.pooled), ("embd", &norm)] {
+                    let key = format!("{key}/{node}");
+                    let expected = image::row(&server, &key, [768, 1, 1, 1])?;
+                    let twin = image::row(&server_cpu, &key, [768, 1, 1, 1])?;
+                    ok &= image::compare(
+                        &format!("(i) {key} pass_media {} positions", ids.len()),
+                        ours,
+                        &expected,
+                        &twin,
+                    );
+                }
+            }
+        }
+        Ok(ok)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -281,14 +373,15 @@ mod gate {
         if !args.is_empty() {
             return Err(format!("no arguments; got {args:?}").into());
         }
-        let digest = sha256(Path::new(MODEL))?;
+        let model = ref_model_path()?;
+        let digest = sha256(&model)?;
         if digest != MODEL_SHA256 {
             return Err(format!(
                 "{MODEL}: sha256 {digest}, the sets are dumped from {MODEL_SHA256}"
             )
             .into());
         }
-        let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let split = Split::open(&model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let hp = Hparams::read(&split).map_err(|e| format!("{MODEL}: {e}"))?;
         let read = model::arch::spec(&split).map_err(|e| format!("{MODEL}: {e}"))?;
         let encoder = read
@@ -350,7 +443,8 @@ mod gate {
                 refusals(&mut enc, c, &first.rows, hp.n_vocab),
             );
         }
-        let past = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        ok &= clause("(i)", "image inputs", images(&mut enc, &model));
+        let past = Split::open(&model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let refused = refused_by(
             &Encoder::open(past, ctx + 1, Gpu::new()?),
             "Encoder::open",

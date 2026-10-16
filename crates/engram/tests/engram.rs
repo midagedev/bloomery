@@ -810,6 +810,24 @@ fn hw_engram_expert_stack_evicts_and_reads_back() {
         1,
         "a refused eviction drops nothing, not even the expert named ahead of the bad id"
     );
+
+    let neighbour = open_table(&split, TABLE).unwrap();
+    let neighbour_ids = [0, TABLE_ROWS as u32 - 1];
+    table.populate(&all).unwrap();
+    neighbour.populate(&neighbour_ids).unwrap();
+    assert_eq!(table.resident_rows(&all).unwrap(), all.len() as u64);
+    assert_eq!(neighbour.resident_rows(&neighbour_ids).unwrap(), 2);
+    table.evict_shard().unwrap();
+    assert_eq!(
+        table.resident_pages(&all).unwrap().resident,
+        0,
+        "the whole-shard eviction drops every expert's pages"
+    );
+    assert_eq!(
+        neighbour.resident_pages(&neighbour_ids).unwrap().resident,
+        0,
+        "the whole-shard eviction also drops mapped pages beyond the stack"
+    );
 }
 
 /// A direct handle reads the file's bytes at an aligned offset into an aligned

@@ -15,11 +15,32 @@ name = "bloomery-hip-spike"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-qdot",
 ]
 
 [[package]]
 name = "bloomery-hip-spike-device"
 version = "0.1.0"
+
+[[package]]
+name = "bloomery-levers"
+version = "0.1.0"
+
+[[package]]
+name = "bloomery-qdot"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-threads",
+]
+
+[[package]]
+name = "bloomery-threads"
+version = "0.1.0"
+dependencies = [
+ "bloomery-levers",
+ "libc",
+]
 
 [[package]]
 name = "libc"

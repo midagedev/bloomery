@@ -478,11 +478,20 @@ impl Verbs {
 /// The first RoCE port the machine reports as active with a RoCE v2 GID
 /// mapped from an IPv4 address: the device's name and that GID's index.
 pub fn first_roce_v2() -> Result<(String, u8), VerbsError> {
+    roce_v2(None)
+}
+
+/// The active RoCE v2 port whose GID matches the control connection's local IPv4 address.
+pub fn roce_v2_at(addr: std::net::Ipv4Addr) -> Result<(String, u8), VerbsError> {
+    roce_v2(Some(addr))
+}
+
+fn roce_v2(addr: Option<std::net::Ipv4Addr>) -> Result<(String, u8), VerbsError> {
     let v = Verbs::load()?;
     let mut seen = Vec::new();
     for name in device_names(v)? {
         let ctx = open_by_name(v, &name)?;
-        let found = roce_v2_gid(v, ctx.0);
+        let found = roce_v2_gid(v, ctx.0, addr);
         // SAFETY: `ctx` was opened above and is closed once, here.
         let rc = unsafe { (v.f.close_device)(ctx.0) };
         teardown("ibv_close_device", rc);
@@ -492,14 +501,14 @@ pub fn first_roce_v2() -> Result<(String, u8), VerbsError> {
         }
     }
     Err(format!(
-        "no active RoCE port with an IPv4 RoCE v2 GID; devices: {}",
+        "no active RoCE port with an IPv4 RoCE v2 GID matching {addr:?}; devices: {}",
         seen.join(", ")
     )
     .into())
 }
 
 /// The first index of an IPv4 RoCE v2 GID on the active port of `ctx`.
-fn roce_v2_gid(v: &Verbs, ctx: *mut Context) -> Option<u8> {
+fn roce_v2_gid(v: &Verbs, ctx: *mut Context, addr: Option<std::net::Ipv4Addr>) -> Option<u8> {
     let mut port = port_attr();
     // SAFETY: `ctx` is open and `port` a writable struct of the library's layout.
     if unsafe { (v.f.query_port)(ctx, PORT, &mut port) } != 0 || port.state != PORT_ACTIVE {
@@ -508,7 +517,10 @@ fn roce_v2_gid(v: &Verbs, ctx: *mut Context) -> Option<u8> {
     gid_indices(port.gid_tbl_len).find(|&i| {
         let (rc, e) = gid_entry(v, ctx, i);
         let ipv4 = e.gid.raw[..10].iter().all(|&b| b == 0) && e.gid.raw[10..12] == [0xff, 0xff];
-        rc == 0 && e.gid_type == GID_TYPE_ROCE_V2 && ipv4
+        rc == 0
+            && e.gid_type == GID_TYPE_ROCE_V2
+            && ipv4
+            && addr.is_none_or(|a| e.gid.raw[12..] == a.octets())
     })
 }
 

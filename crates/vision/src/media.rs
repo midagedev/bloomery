@@ -78,6 +78,10 @@ impl EncoderInput {
 
 /// A model's image input, as data plus one prepare.
 pub trait MediaModel {
+    /// Ordinary text around image rows in an embedding input; no placeholder token is needed.
+    fn embedding_delimiters(&self) -> Option<(&str, &str)> {
+        None
+    }
     /// The placeholder text the chat template carries for the image at `index`: its position
     /// among all the images of the prompt, from 0, in the order of the images. A model that
     /// numbers its images writes the number into the text; one that does not ignores it.
@@ -96,10 +100,11 @@ pub trait MediaModel {
         None
     }
 
-    /// The id [`expand_spans`] finds in the tokenized prompt and expands to one copy
+    /// The optional id [`expand_spans`] finds in a tokenized chat prompt and expands to one copy
     /// per position of the image ([`Prepared::span_len`]): the one id V4.1's placeholder
     /// tokenizes to, and the `<|image_pad|>` between the two delimiter ids Clef's tokenizes to.
-    fn image_token(&self) -> u32;
+    /// `None` when images use embedding delimiters instead of a chat placeholder.
+    fn image_token(&self) -> Option<u32>;
 
     /// The separator between a message's content parts when they are flattened into one text:
     /// the separator of a [`PartJoin::Uniform`] join.

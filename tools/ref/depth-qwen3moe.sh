@@ -2061,23 +2061,19 @@ if [ -n "$TIMING_CARDS" ]; then
 else
   CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 fi
-# A binary's sha256 and its tree's HEAD and dirty count, once. GIT_OPTIONAL_LOCKS=0 keeps `git
-# status` from rewriting the index of a tree this root process does not own.
-tree_line() {
-  local bin=$1 tree=$2 sha head dirty
-  sha=$(sha256sum "$bin" | cut -c1-12)
-  head=$(git -c safe.directory="$tree" -C "$tree" rev-parse --short=9 HEAD 2> /dev/null || echo '?')
-  dirty=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$tree" -C "$tree" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
-  echo "$bin sha256=$sha head=$head dirty_files=$dirty"
-}
+# shellcheck source=tools/ref/source-inspection.sh
+source "${BASH_SOURCE[0]%/*}/source-inspection.sh" || exit 2
 IK_LINE='' LCPP_LINE='' MRS_LINE='' MRS_VERSION='' BIN_LINES=() SRV_LINE=''
-[ "$srv" = 0 ] || SRV_LINE=$(srv_tree "$(tree_line "$SRVBIN" "$LCPP")")
-[ "$ik" = 0 ] || IK_LINE=$(tree_line "$IKBIN" "$IK")
+if [ "$srv" = 1 ]; then
+  SRV_LINE=$(tree_line "$SRVBIN" "$LCPP") || exit $?
+  SRV_LINE=$(srv_tree "$SRV_LINE")
+fi
+if [ "$ik" = 1 ]; then IK_LINE=$(tree_line "$IKBIN" "$IK") || exit $?; fi
 # shellcheck disable=SC2153 # LCPP is the profile's, which shellcheck does not follow
-[ "$lcpp" = 0 ] || LCPP_LINE=$(tree_line "$LCPPBIN" "$LCPP")
+if [ "$lcpp" = 1 ]; then LCPP_LINE=$(tree_line "$LCPPBIN" "$LCPP") || exit $?; fi
 if [ "$mrs" = 1 ]; then
   # shellcheck disable=SC2153 # MRS is the profile's, as LCPP
-  MRS_LINE=$(tree_line "$MRSBIN" "$MRS")
+  MRS_LINE=$(tree_line "$MRSBIN" "$MRS") || exit $?
   MRS_VERSION=$("$MRSBIN" --version 2>&1 | head -n 1)
   MRS_LINE="$MRS_LINE version=${MRS_VERSION:-?}"
 fi
@@ -2086,7 +2082,8 @@ for i in "${!ARMS[@]}"; do
   b=${A_BIN[$i]}
   [ -x "$b" ] || { echo "depth-qwen3moe.sh: arm '${ARMS[$i]}': no binary at $b" >&2; exit 2; }
   t=$(bin_tree "$b")
-  BIN_LINES+=("${A_LABEL[$i]}: $(tree_line "$b" "$t")")
+  line=$(tree_line "$b" "$t") || exit $?
+  BIN_LINES+=("${A_LABEL[$i]}: $line")
 done
 # A lever arm's variables are the binary's to take (at_main refuses a lever it does not act on, a value its kind
 # does not take, a retired or unknown name, --levers included), so each distinct binary, word list and placement is

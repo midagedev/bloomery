@@ -610,7 +610,7 @@ impl CardLeg {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::hybrid::HOST;
     use crate::q4k_sel::QuantSel;
@@ -656,9 +656,9 @@ mod tests {
     /// `rows` rows of `k` values of `ty` in the file's block bytes: every
     /// byte random but each block's scales, which are finite and small, so no
     /// dot is NaN or infinite — the f16 `d` (and `dmin` of Q4_K and Q5_K, `m`
-    /// of Q5_1) or MXFP4's E8M0 byte. Every other byte of these types is a
+    /// of Q5_1; Q6_K's last in its block) or MXFP4's E8M0 byte. Every other byte of these types is a
     /// valid code, so any draw is a valid block.
-    fn stack_bytes(ty: GgmlType, rows: usize, k: usize, seed: u64) -> Vec<u8> {
+    pub(crate) fn stack_bytes(ty: GgmlType, rows: usize, k: usize, seed: u64) -> Vec<u8> {
         let block = usize::try_from(ty.type_size().expect("a block size")).expect("a size");
         let width = usize::try_from(ty.blck_size().expect("a block width")).expect("a width");
         let f16s = if matches!(ty, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q5_1) {
@@ -677,7 +677,9 @@ mod tests {
                 b[0] = 118 + u8::try_from(next(&mut state) % 4).expect("a byte");
                 continue;
             }
-            for scale in b[..2 * f16s].chunks_mut(2) {
+            // Q6_K's `d` closes its block; every other type's scales open it.
+            let at = if ty == GgmlType::Q6_K { block - 2 } else { 0 };
+            for scale in b[at..at + 2 * f16s].chunks_mut(2) {
                 let (exp, mant) = (5 + next(&mut state) % 4, next(&mut state) & 0x3ff);
                 let half = u16::try_from(exp << 10 | mant).expect("an f16");
                 scale.copy_from_slice(&half.to_le_bytes());
@@ -689,7 +691,7 @@ mod tests {
     /// The little-endian words of a byte stream of `rows` rows as the card
     /// holds it (`runtime::words::stream_words`: zero-padded to whole words a
     /// row).
-    fn words_of(bytes: &[u8], rows: usize) -> Vec<u32> {
+    pub(crate) fn words_of(bytes: &[u8], rows: usize) -> Vec<u32> {
         let total = stream_words(bytes.len() as u64, rows as u64).expect("a stack of rows");
         let mut w = vec![0u32; usize::try_from(total).expect("a word count")];
         for (word, c) in w.iter_mut().zip(bytes.chunks(4)) {
@@ -1287,5 +1289,285 @@ mod tests {
             own_rows.iter().all(|v| *v == SENT),
             "enqueue_rows wrote the buffers' own rows"
         );
+    }
+
+    /// The arena entries' cases, `(gate·up type, down type)`: each arena
+    /// entry runs in one, in GLM's pairs.
+    const AT_CASES: [(GgmlType, GgmlType); 2] = [
+        (GgmlType::Q4_K, GgmlType::Q5_K),
+        (GgmlType::Q5_K, GgmlType::Q6_K),
+    ];
+
+    /// The arena entries against the stack `_sel` launches of their format:
+    /// each expert's three parts copied as their file bytes into pinned host
+    /// memory the card maps, out of stack order and each at its own word
+    /// skew, and a table naming them by slot. The gate·up rows and, from the
+    /// stack run's q8_1 columns, the down rows are the stack launches' bit
+    /// for bit; a skipped slot keeps what it held. A part one word past the
+    /// arena raises `ExpertId`: the gate·up writes NaN, the down leaves the
+    /// slot alone.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_an_arena_part_computes_as_its_stack_rows() {
+        use crate::fault::FaultSite;
+        use crate::graph::MappedHost;
+        use crate::kquant::{
+            ARENA_PARTS, ARENA_SKIP, GateUpAt, PART_DOWN, PART_GATE, PART_UP, SelDownAt,
+        };
+        use crate::q6k_sel::Q6kSelKernels;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let (stream, ctx) = (gpu.stream(), gpu.context());
+        let kq = KquantKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
+        let q6 = Q6kSelKernels::load(ctx, gpu.fault_word()).expect("the q6k module");
+        let host_normed: Vec<f32> = (0..CAP * N)
+            .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &SEL).expect("the places");
+        let slots = CAP * SPC;
+        let rule = Act::SwigluClamp { limit: 0.25 };
+        let sink = gpu.layer_sink(0).expect("a sink");
+        let mut act_x = Q8Act::with_tier_cols(stream, CAP, N).expect("act_x");
+        gpu.enqueue_quantize_q8_1_cols(&normed, &mut act_x, CAP, 0)
+            .expect("q8_1");
+        for (gty, dty) in AT_CASES {
+            let case = format!("{gty} gate·up, {dty} down");
+            // Per part: the stack's file bytes, rows a part, and the rows' k.
+            let roles = [(gty, FF, N, 1u64), (gty, FF, N, 2), (dty, N, FF, 3)];
+            let bytes: Vec<Vec<u8>> = roles
+                .iter()
+                .map(|&(ty, rows, k, seed)| stack_bytes(ty, N_CARD * rows, k, seed << 32 | 0x51))
+                .collect();
+            let stacks: Vec<DeviceTensor<u32>> = roles
+                .iter()
+                .zip(&bytes)
+                .map(|(&(_, rows, _, _), b)| {
+                    let words = words_of(b, N_CARD * rows);
+                    let n = words.len();
+                    DeviceTensor::upload(stream, &words, N_CARD * rows, n / (N_CARD * rows))
+                        .expect("a stack")
+                })
+                .collect();
+            let part_len: Vec<usize> = bytes.iter().map(|b| b.len() / N_CARD).collect();
+            // Every expert's parts, down first, each 1..=11 words past the
+            // previous one's end.
+            let mut offs_of = [[0u64; ARENA_PARTS]; N_CARD];
+            let mut cursor = 3usize;
+            for (i, e) in [2usize, 0, 3, 1].into_iter().enumerate() {
+                for p in [PART_DOWN, PART_GATE, PART_UP] {
+                    offs_of[e][p] = cursor as u64;
+                    cursor += part_len[p].div_ceil(4) + 1 + (5 * i + 3 * p) % 11;
+                }
+            }
+            let arena_words = cursor;
+            let widest = part_len.iter().max().expect("parts").div_ceil(4);
+            let page =
+                MappedHost::read_in_place(ctx, 4 * (arena_words + widest), "the test's arena")
+                    .expect("pinned host memory the card maps");
+            for (e, offs) in offs_of.iter().enumerate() {
+                for p in 0..ARENA_PARTS {
+                    let src = &bytes[p][e * part_len[p]..(e + 1) * part_len[p]];
+                    // SAFETY: the part's bytes lie inside the allocation (the
+                    // cursor kept every part below arena_words words), and no
+                    // launch reads the page yet.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            page.host_at(4 * offs[p] as usize),
+                            src.len(),
+                        );
+                    }
+                }
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            // SAFETY: arena_words words of the live allocation the card maps,
+            // which outlives the window.
+            let arena = unsafe { crate::tensor::window::<u32>(page.dev_at(0), arena_words, ctx) };
+            let table = |past: Option<usize>| -> Vec<u64> {
+                let mut t = Vec::with_capacity(slots * ARENA_PARTS);
+                for (s, &id) in SEL.iter().enumerate() {
+                    if id == HOST {
+                        t.extend([ARENA_SKIP; ARENA_PARTS]);
+                        continue;
+                    }
+                    let mut o = offs_of[id as usize];
+                    if past == Some(s) {
+                        for p in 0..ARENA_PARTS {
+                            o[p] = (arena_words + 1 - part_len[p].div_ceil(4)) as u64;
+                        }
+                    }
+                    t.extend(o);
+                }
+                t
+            };
+            let offs = DeviceBuffer::from_host(stream, &table(None)).expect("the table");
+
+            let mut h_ref = DeviceBuffer::from_host(stream, &vec![SENT; slots * FF]).expect("h");
+            let mut h_at = DeviceBuffer::from_host(stream, &vec![SENT; slots * FF]).expect("h");
+            let a = GateUpAct {
+                wg: &stacks[PART_GATE],
+                wu: &stacks[PART_UP],
+                act: &act_x,
+                sel: &sel,
+                n_slots: slots,
+                rows_per_expert: FF,
+                slots_per_col: SPC,
+                rule,
+            };
+            let at = GateUpAt {
+                arena: &arena,
+                offs: &offs,
+                act: &act_x,
+                n_slots: slots,
+                rows_per_expert: FF,
+                slots_per_col: SPC,
+                rule,
+            };
+            match gty {
+                GgmlType::Q4_K => kq
+                    .enqueue_gate_up_q4k(stream, &a, sink, &mut h_ref)
+                    .and_then(|()| kq.enqueue_gate_up_q4k_at(stream, &at, sink, &mut h_at)),
+                _ => kq
+                    .enqueue_gate_up_q5k(stream, &a, sink, &mut h_ref)
+                    .and_then(|()| kq.enqueue_gate_up_q5k_at(stream, &at, sink, &mut h_at)),
+            }
+            .unwrap_or_else(|e| panic!("{case}: the gate·up: {e}"));
+            let mut act_h = Q8Act::with_slots(stream, slots, FF).expect("act_h");
+            let q = QuantSel {
+                x: &h_ref,
+                cols: 0..slots,
+                sel: &sel,
+                n_card: N_CARD,
+            };
+            gpu.q4k_sel()
+                .enqueue_quantize_sel(stream, &q, sink, &mut act_h)
+                .unwrap_or_else(|e| panic!("{case}: the quantizer: {e}"));
+            let mut y_ref = DeviceBuffer::from_host(stream, &vec![SENT; slots * N]).expect("y");
+            let mut y_at = DeviceBuffer::from_host(stream, &vec![SENT; slots * N]).expect("y");
+            let d_at = SelDownAt {
+                arena: &arena,
+                offs: &offs,
+                act: &act_h,
+                n_slots: slots,
+                rows_per_expert: N,
+            };
+            let down_at = |d: &SelDownAt<'_>, y: &mut DeviceBuffer<f32>| match dty {
+                GgmlType::Q5_K => kq.enqueue_gemv_q5k_sel_at(stream, d, sink, y),
+                _ => q6.enqueue_gemv_q6k_sel_at(stream, d, sink, y),
+            };
+            match dty {
+                GgmlType::Q5_K => {
+                    let d = SelDown {
+                        w: &stacks[PART_DOWN],
+                        act: &act_h,
+                        sel: &sel,
+                        n_slots: slots,
+                        rows_per_expert: N,
+                    };
+                    kq.enqueue_gemv_q5k_sel(stream, &d, sink, &mut y_ref)
+                }
+                _ => q6.enqueue_gemv_q6k_sel(
+                    stream,
+                    &stacks[PART_DOWN],
+                    &act_h,
+                    &sel,
+                    slots,
+                    N,
+                    &mut y_ref,
+                ),
+            }
+            .and_then(|()| down_at(&d_at, &mut y_at))
+            .unwrap_or_else(|e| panic!("{case}: the down: {e}"));
+            let (h_ref, h_got) = (
+                h_ref.to_host_vec(stream).expect("h"),
+                h_at.to_host_vec(stream).expect("h"),
+            );
+            let (y_ref, y_got) = (
+                y_ref.to_host_vec(stream).expect("y"),
+                y_at.to_host_vec(stream).expect("y"),
+            );
+            assert!(
+                gpu.take_fault().expect("the fault word").is_none(),
+                "{case}: a fault"
+            );
+            for (what, rpe, want, got) in [("h", FF, &h_ref, &h_got), ("down", N, &y_ref, &y_got)] {
+                for (s, &id) in SEL.iter().enumerate() {
+                    let rows = s * rpe..(s + 1) * rpe;
+                    if id == HOST {
+                        assert!(
+                            got[rows].iter().all(|v| *v == SENT),
+                            "{case}: {what} of slot {s} (skipped) was written"
+                        );
+                        continue;
+                    }
+                    assert!(
+                        got[rows.clone()]
+                            .iter()
+                            .all(|v| v.is_finite() && *v != SENT)
+                            && got[rows.clone()].iter().any(|v| *v != 0.0),
+                        "{case}: {what} of slot {s} (expert {id}) holds no finite rows the \
+                         entry wrote"
+                    );
+                    if let Some(r) = rows
+                        .clone()
+                        .find(|&r| got[r].to_bits() != want[r].to_bits())
+                    {
+                        panic!(
+                            "{case}: {what} of slot {s} (expert {id}) row {}: arena {:#010x}, \
+                             stack {:#010x}",
+                            r - rows.start,
+                            got[r].to_bits(),
+                            want[r].to_bits()
+                        );
+                    }
+                }
+            }
+
+            let past = DeviceBuffer::from_host(stream, &table(Some(0))).expect("the table");
+            let mut h = DeviceBuffer::from_host(stream, &vec![SENT; slots * FF]).expect("h");
+            let at = GateUpAt { offs: &past, ..at };
+            match gty {
+                GgmlType::Q4_K => kq.enqueue_gate_up_q4k_at(stream, &at, sink, &mut h),
+                _ => kq.enqueue_gate_up_q5k_at(stream, &at, sink, &mut h),
+            }
+            .unwrap_or_else(|e| panic!("{case}: the gate·up past the arena: {e}"));
+            let h = h.to_host_vec(stream).expect("h");
+            let fault = gpu.take_fault().expect("the fault word");
+            assert!(
+                fault
+                    .as_ref()
+                    .is_some_and(|f| f.code == FaultSite::ExpertId as u32 && f.layer == 0),
+                "{case}: a gate·up part past the arena raised {fault:?}"
+            );
+            assert!(
+                h[..FF].iter().all(|v| v.is_nan()),
+                "{case}: a gate·up part past the arena left rows that are not NaN"
+            );
+            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; slots * N]).expect("y");
+            down_at(
+                &SelDownAt {
+                    offs: &past,
+                    ..d_at
+                },
+                &mut y,
+            )
+            .unwrap_or_else(|e| panic!("{case}: the down past the arena: {e}"));
+            let y = y.to_host_vec(stream).expect("y");
+            let fault = gpu.take_fault().expect("the fault word");
+            assert!(
+                fault
+                    .as_ref()
+                    .is_some_and(|f| f.code == FaultSite::ExpertId as u32 && f.layer == 0),
+                "{case}: a down part past the arena raised {fault:?}"
+            );
+            assert!(
+                y[..N].iter().all(|v| *v == SENT),
+                "{case}: a down part past the arena wrote its slot"
+            );
+            // The window frees nothing; the page goes after every launch
+            // that read it drained (the reads above).
+            drop(std::mem::ManuallyDrop::into_inner(arena).into_raw_parts());
+            drop(page);
+        }
     }
 }

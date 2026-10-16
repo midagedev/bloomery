@@ -32,6 +32,8 @@ pub use architectures::ROWS;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
     model: source::Flags,
+    image: vision_seat::Flags,
+    ctx: Option<usize>,
 }
 
 impl Flags {
@@ -39,15 +41,47 @@ impl Flags {
     /// file is read here. A flag with no value or given twice, and `--embd-model` beside
     /// `--embd-hf`, are refused by name.
     pub fn take(args: &[String]) -> Result<(Flags, Vec<String>), GateError> {
+        let mut f = Flags::default();
         let mut selected = Vec::new();
         let mut rest = Vec::with_capacity(args.len());
+        let mut image_seen = std::collections::HashSet::new();
         let mut it = args.iter();
-        while let Some(arg) = it.next() {
-            let flag = match arg.as_str() {
+        while let Some(a) = it.next() {
+            let flag = a.as_str();
+            if let Some(image_flag) = match flag {
+                "--embd-mmproj" => Some("--mmproj"),
+                "--embd-no-mmproj" => Some("--no-mmproj"),
+                "--embd-image-min-tokens" => Some("--image-min-tokens"),
+                "--embd-image-max-tokens" => Some("--image-max-tokens"),
+                _ => None,
+            } {
+                if !image_seen.insert(flag) {
+                    return Err(format!("{flag} is given twice").into());
+                }
+                f.image
+                    .take(image_flag, &mut it.by_ref().map(String::as_str))
+                    .map_err(|e| format!("{flag}: {e}"))?;
+                continue;
+            }
+            if flag == "--embd-ctx" {
+                let v = it.next().ok_or("--embd-ctx needs a value")?;
+                let ctx = v
+                    .parse::<usize>()
+                    .map_err(|e| format!("--embd-ctx {v:?}: {e}"))?;
+                if f.ctx.is_some() {
+                    return Err("--embd-ctx is given twice".into());
+                }
+                if ctx == 0 {
+                    return Err("--embd-ctx needs one positive count".into());
+                }
+                f.ctx = Some(ctx);
+                continue;
+            }
+            let flag = match flag {
                 "--embd-model" => "--embd-model",
                 "--embd-hf" => "--hf",
                 _ => {
-                    rest.push(arg.clone());
+                    rest.push(a.clone());
                     continue;
                 }
             };
@@ -56,7 +90,11 @@ impl Flags {
         }
         let (model, _) = source::take(&selected, &["--embd-model"])
             .map_err(|e| format!("embedding flags (--embd-model/--embd-hf): {e}"))?;
-        Ok((Flags { model }, rest))
+        f.model = model;
+        if !f.names() && (!image_seen.is_empty() || f.ctx.is_some()) {
+            return Err("embedding image/context flags need --embd-model or --embd-hf".into());
+        }
+        Ok((f, rest))
     }
 
     /// Whether the flags name an embedding model.
@@ -87,14 +125,68 @@ impl Flags {
             .arch_get_u64("context_length")
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| format!("{}: no {arch}.context_length", path.display()))?;
-        let ctx = row.ctx.min(train);
-        let bytes = (row.bytes)(&split, ctx)
+        let limit = row.ctx.min(train);
+        let ctx = self.ctx.unwrap_or(limit);
+        if ctx > limit {
+            return Err(
+                format!("--embd-ctx {ctx}: the side model supports at most {limit}").into(),
+            );
+        }
+        let mut bytes = (row.bytes)(&split, ctx)
             .map_err(|e| format!("--embd-model {}: {e}", path.display()))?;
+        let projector_path = if let Some(p) = self.image.mmproj()? {
+            Some(p.to_path_buf())
+        } else if let (Some(hf), Some(mmproj)) = (&self.model.hf, row.projector_file) {
+            if cfg!(feature = "vision") && !self.image.disabled() {
+                let repo = hf::RepoRef::parse(hf)?;
+                Some(
+                    model_file::fetch_exact(&repo.repo, &[mmproj])?
+                        .into_iter()
+                        .next()
+                        .ok_or("the projector fetch returned no file")?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let projector = match projector_path.as_deref() {
+            Some(_) if !cfg!(feature = "vision") => {
+                return Err("--embd-mmproj needs the vision build feature".into());
+            }
+            Some(p) => {
+                let p = vision_seat::Projector::open(p, &self.image, row.projector_types)?;
+                let n_embd = split
+                    .arch_get_u64("embedding_length")
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or("the embedding width is absent")?;
+                p.check_text(
+                    &vision_seat::TextFacts {
+                        n_embd,
+                        imrope: None,
+                        ple: vision_seat::PleImage::Absent,
+                    },
+                    &|_| None,
+                )?;
+                bytes = bytes
+                    .checked_add(p.card.total())
+                    .ok_or("embedding model and tower byte count overflows")?;
+                Some(p)
+            }
+            None if self.image.sets_limits() => {
+                return Err(
+                    "--embd-image-min-tokens/--embd-image-max-tokens need --embd-mmproj".into(),
+                );
+            }
+            None => None,
+        };
         Ok(Some(Side {
             row,
             path,
             ctx,
             bytes,
+            projector,
         }))
     }
 }
@@ -111,6 +203,10 @@ pub struct Row {
     pub bytes: fn(&Split, usize) -> Result<u64, String>,
     /// The model of `side`'s file opened on `seat`'s card, on the thread that runs its passes.
     pub open: Open,
+    /// The BF16 projector this row reads from an `--embd-hf` repository.
+    pub projector_file: Option<&'static str>,
+    /// The projector types this embedding architecture accepts.
+    pub projector_types: &'static [&'static str],
 }
 
 /// A row's open: the model of `side`'s file on `seat`'s card.
@@ -148,6 +244,8 @@ pub struct Side {
     pub ctx: usize,
     /// The bytes it takes on its card ([`Row::bytes`]).
     pub bytes: u64,
+    /// The image tower sized before the chat plan; its bytes share this side seat's reserve.
+    pub projector: Option<vision_seat::Projector>,
 }
 
 impl Side {
@@ -177,7 +275,11 @@ impl Side {
 }
 
 /// One pass: the input's ids and where its answer goes.
-type Job = (Vec<u32>, mpsc::Sender<Result<Vec<f32>, EmbedError>>);
+type Job = (
+    Vec<u32>,
+    Vec<serve::media::MediaFeed>,
+    mpsc::Sender<Result<Vec<f32>, EmbedError>>,
+);
 
 /// The model the server's embeddings endpoints call, held on a thread of its own: the facts read
 /// once at its open, and the channel each pass goes through. Dropping it closes the channel and
@@ -189,6 +291,7 @@ pub struct SideEngine {
     name: String,
     ctx: usize,
     dims: Vec<usize>,
+    media: Option<serve::media::SharedMediaModel>,
 }
 
 impl SideEngine {
@@ -214,12 +317,24 @@ impl SideEngine {
                         return;
                     }
                 };
-                let facts = (model.tokenizer(), model.name(), model.ctx(), model.dims());
+                let facts = (
+                    model.tokenizer(),
+                    model.name(),
+                    model.ctx(),
+                    model.dims(),
+                    model.media(),
+                );
                 if opened_tx.send(Ok(facts)).is_err() {
                     return;
                 }
-                for (ids, answer) in rx {
-                    match catch_unwind(|| model.embed(&ids)) {
+                for (ids, images, answer) in rx {
+                    match catch_unwind(|| {
+                        if images.is_empty() {
+                            model.embed(&ids)
+                        } else {
+                            model.embed_media(&ids, &images)
+                        }
+                    }) {
                         Ok(v) => {
                             let _ = answer.send(v);
                         }
@@ -233,7 +348,7 @@ impl SideEngine {
                 }
             })
             .map_err(|e| format!("starting the embedding model's thread: {e}"))?;
-        let (tokenizer, name, ctx, dims) = match opened.recv() {
+        let (tokenizer, name, ctx, dims, media) = match opened.recv() {
             Ok(Ok(facts)) => facts,
             refused => {
                 // The thread ended with its open; nothing is left on its card.
@@ -251,6 +366,7 @@ impl SideEngine {
             name,
             ctx,
             dims,
+            media,
         })
     }
 }
@@ -271,6 +387,9 @@ impl Drop for SideEngine {
 }
 
 impl Embed for SideEngine {
+    fn media(&self) -> Option<serve::media::SharedMediaModel> {
+        self.media.clone()
+    }
     fn tokenizer(&self) -> Arc<dyn Tokenizer> {
         Arc::clone(&self.tokenizer)
     }
@@ -288,10 +407,19 @@ impl Embed for SideEngine {
     }
 
     fn embed(&mut self, ids: &[u32]) -> Result<Vec<f32>, EmbedError> {
+        self.embed_media(ids, &[])
+    }
+
+    fn embed_media(
+        &mut self,
+        ids: &[u32],
+        images: &[serve::media::MediaFeed],
+    ) -> Result<Vec<f32>, EmbedError> {
         let ended = || EmbedError("the embedding model's thread ended".to_owned());
         let jobs = self.jobs.as_ref().ok_or_else(ended)?;
         let (answer, answered) = mpsc::channel();
-        jobs.send((ids.to_vec(), answer)).map_err(|_| ended())?;
+        jobs.send((ids.to_vec(), images.to_vec(), answer))
+            .map_err(|_| ended())?;
         answered.recv().map_err(|_| ended())?
     }
 }
@@ -336,6 +464,49 @@ mod tests {
         let (none, _) = Flags::take(&args(&["--port", "1"])).expect("none");
         assert_eq!(none, Flags::default());
         assert!(!none.names());
+        let (image, rest) = Flags::take(&args(&[
+            "--embd-model",
+            "/e.gguf",
+            "--embd-ctx",
+            "8192",
+            "--embd-mmproj",
+            "/p.gguf",
+            "--embd-image-min-tokens",
+            "70",
+            "--embd-image-max-tokens",
+            "1120",
+            "--port",
+            "8080",
+        ]))
+        .expect("image flags");
+        assert_eq!(rest, args(&["--port", "8080"]));
+        assert_eq!(image.ctx, Some(8192));
+        assert_eq!(
+            image.image.mmproj().expect("projector"),
+            Some(std::path::Path::new("/p.gguf"))
+        );
+        assert!(image.image.sets_limits());
+        let default = crate::vision_seat::TokenLimits::new(1, 1).expect("limits");
+        let limits = image.image.limits_over(default).expect("image limits");
+        assert_eq!((limits.min(), limits.max()), (70, 1120));
+        for flag in ["--embd-image-min-tokens", "--embd-image-max-tokens"] {
+            let (zero, _) =
+                Flags::take(&args(&["--embd-model", "/a", flag, "0"])).expect("count parsed");
+            let e = zero
+                .image
+                .limits_over(default)
+                .expect_err("zero limit refused")
+                .to_string();
+            assert!(
+                e.starts_with("--image-min-tokens/--image-max-tokens: image size limits: "),
+                "{flag}: {e}"
+            );
+            assert!(e.contains("need 1 <= min <= max"), "{flag}: {e}");
+            let (one, _) =
+                Flags::take(&args(&["--embd-model", "/a", flag, "1"])).expect("count parsed");
+            let limits = one.image.limits_over(default).expect("one token limit");
+            assert_eq!((limits.min(), limits.max()), (1, 1));
+        }
         for (bad, why) in [
             (&["--embd-model"][..], "--embd-model needs a value"),
             (&["--embd-hf"], "--hf needs a value"),
@@ -343,6 +514,63 @@ mod tests {
             (&["--embd-hf", "x/y", "--embd-hf", "a/b"], "named twice"),
             (&["--embd-model", "/a", "--embd-hf", "x/y"], "named twice"),
             (&["--embd-hf", "x/y", "--embd-model", "/a"], "named twice"),
+            (&["--embd-mmproj", "/p"], "need --embd-model or --embd-hf"),
+            (&["--embd-no-mmproj"], "need --embd-model or --embd-hf"),
+            (
+                &["--embd-image-min-tokens", "70"],
+                "need --embd-model or --embd-hf",
+            ),
+            (
+                &["--embd-image-max-tokens", "1120"],
+                "need --embd-model or --embd-hf",
+            ),
+            (&["--embd-ctx", "8192"], "need --embd-model or --embd-hf"),
+            (
+                &["--embd-model", "/a", "--embd-ctx", "1", "--embd-ctx", "2"],
+                "--embd-ctx is given twice",
+            ),
+            (
+                &["--embd-model", "/a", "--embd-ctx", "0"],
+                "needs one positive count",
+            ),
+            (
+                &[
+                    "--embd-model",
+                    "/a",
+                    "--embd-mmproj",
+                    "/p",
+                    "--embd-mmproj",
+                    "/q",
+                ],
+                "--embd-mmproj is given twice",
+            ),
+            (
+                &["--embd-model", "/a", "--embd-no-mmproj", "--embd-no-mmproj"],
+                "--embd-no-mmproj is given twice",
+            ),
+            (
+                &[
+                    "--embd-model",
+                    "/a",
+                    "--embd-image-min-tokens",
+                    "70",
+                    "--embd-image-min-tokens",
+                    "80",
+                ],
+                "--embd-image-min-tokens is given twice",
+            ),
+            (
+                &[
+                    "--embd-model",
+                    "/a",
+                    "--embd-image-max-tokens",
+                    "1120",
+                    "--embd-image-max-tokens",
+                    "1200",
+                ],
+                "--embd-image-max-tokens is given twice",
+            ),
+            (&["--embd-model", "/a", "--embd-mmproj"], "--embd-mmproj"),
         ] {
             let e = Flags::take(&args(bad)).expect_err("refused").to_string();
             assert!(e.contains(why), "{bad:?}: {e}");

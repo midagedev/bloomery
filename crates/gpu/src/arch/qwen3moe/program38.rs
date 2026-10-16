@@ -759,7 +759,7 @@ impl Parts38<'_> {
                 return self.shared_add(l, None);
             }
             let b = hy.boundary();
-            b.enqueue_back_of(stream, 0)?;
+            b.enqueue_back_of(stream, 0, l)?;
             return self.shared_add(l, Some(b.hsum_of(0)?));
         }
         hy.enqueue_tier_back(stream, l, 0)?;

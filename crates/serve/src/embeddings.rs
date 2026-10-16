@@ -4,7 +4,7 @@
 //! `6868a52c`), with these differences: a field of another type than it takes is a 400 naming it
 //! (optional fields treat `null` as unset); `/v1/embeddings` refuses a `model` of another type
 //! than a string or a name other than the side model's, while the native routes ignore it; an object
-//! input (`{"prompt_string": …}`, or a `content` array of parts) is a 400, an input past the model's
+//! input with `prompt_string` is a 400, an input past the model's
 //! context is a 400 with no batch limit before it, an `embd_normalize` below `-1` or one whose
 //! norm f32 cannot scale by is a 400 ([`crate::embed::normalize`]), and `dimensions` cuts the
 //! pooled vector to one of the model's widths before it is normalized.
@@ -13,6 +13,8 @@
 //! array of token ids, an array of strings and token ids, or an array of these with no id at its
 //! top level, one vector each. Text is tokenized with the side model's vocabulary, the first text
 //! element of each input with its special tokens, as llama-server's `tokenize_mixed` puts them.
+//! An object with a `content` array prepares image parts through the side model's media rule.
+//! Delimiter text and every image span share one pass, with BOS and EOS around the whole input.
 //!
 //! The side model runs one request at a time. A failure in it ends the server as an engine's does:
 //! the request gets a 500, `/health` and every later request a 503, and the server exits after its
@@ -21,6 +23,7 @@
 
 use std::io;
 use std::net::TcpStream;
+use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
@@ -46,6 +49,7 @@ pub(super) struct Side {
     pub(super) name: String,
     pub(super) ctx: usize,
     dims: Vec<usize>,
+    media: Option<media::SharedMediaModel>,
 }
 
 impl Side {
@@ -58,6 +62,7 @@ impl Side {
             "an embedding model names its width, the last of its dims: {dims:?}"
         );
         Side {
+            media: embed.media(),
             tok: embed.tokenizer(),
             name: embed.name(),
             ctx: embed.ctx(),
@@ -131,7 +136,7 @@ fn answer(state: &State, req: &Request, oai: bool) -> Result<Value, ApiError> {
                 .collect(),
         ));
     }
-    let n_tokens: usize = inputs.iter().map(Vec::len).sum();
+    let n_tokens: usize = inputs.iter().map(|i| i.ids.len()).sum();
     let data: Vec<Value> = vectors
         .iter()
         .enumerate()
@@ -202,22 +207,141 @@ fn cut(side: &Side, b: &Map<String, Value>) -> Result<usize, ApiError> {
         })
 }
 
-/// The request's inputs as ids: an array with no id at its top level is one input an element,
+/// The request's inputs as ids and prepared images: an array with no id at its top level is one input an element,
 /// anything else one input, each read as a `/completion` prompt with the special tokens on. No
 /// input, an input of no id and one of more ids than the model's context are refused by name.
-fn inputs(side: &Side, key: &str, v: &Value) -> Result<Vec<Vec<u32>>, ApiError> {
+struct Input {
+    ids: Vec<u32>,
+    images: Vec<media::MediaFeed>,
+}
+
+/// One ordered embedding input part, after an image has been prepared and sized.
+pub enum InputPart<'a> {
+    Text(&'a str),
+    /// Tokenized delimiters around `positions` image rows.
+    Image {
+        begin: &'a str,
+        end: &'a str,
+        positions: usize,
+    },
+}
+
+/// Token ids and the image spans that replace their filler rows, in part order.
+pub struct Assembled {
+    pub ids: Vec<u32>,
+    pub spans: Vec<Range<usize>>,
+}
+
+/// Tokenize each part separately, with BOS and EOS around the whole input. Image spans are
+/// bounded by `ctx` before allocation; the caller checks the total length, including text and EOS.
+pub fn assemble<'a>(
+    parts: impl Iterator<Item = Result<InputPart<'a>, String>>,
+    tok: &dyn Tokenizer,
+    ctx: usize,
+) -> Result<Assembled, String> {
+    let mut parts = parts.peekable();
+    if parts.peek().is_none() {
+        return Err("Input content cannot be empty".into());
+    }
+    let mut ids = Vec::new();
+    let mut spans = Vec::new();
+    if tok.add_bos() {
+        ids.push(tok.bos());
+    }
+    for part in parts {
+        match part? {
+            InputPart::Text(text) => ids.extend(tok.encode(text)),
+            InputPart::Image {
+                begin,
+                end,
+                positions,
+            } => {
+                if positions == 0 {
+                    return Err("an embedding image has an empty span".into());
+                }
+                ids.extend(tok.encode(begin));
+                let at = ids.len();
+                let last = at
+                    .checked_add(positions)
+                    .filter(|&n| n <= ctx)
+                    .ok_or("image input exceeds the embedding context")?;
+                ids.resize(last, tok.bos());
+                spans.push(at..last);
+                ids.extend(tok.encode(end));
+            }
+        }
+    }
+    if tok.add_eos() {
+        ids.push(tok.eos());
+    }
+    if ids.is_empty() {
+        return Err("Input content cannot be empty".into());
+    }
+    Ok(Assembled { ids, spans })
+}
+
+fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
+    if let Some(parts) = v
+        .as_object()
+        .and_then(|o| o.get("content"))
+        .and_then(Value::as_array)
+    {
+        let mut images = Vec::new();
+        let ordered = parts.iter().map(|part| -> Result<InputPart<'_>, String> {
+            match media::parse_part(part).map_err(|e| e.to_string())? {
+                media::Part::Text(text) => Ok(InputPart::Text(text)),
+                media::Part::Image(url) => {
+                    let model = side
+                        .media
+                        .as_ref()
+                        .ok_or("image input needs --embd-mmproj")?;
+                    let (begin, end) = model
+                        .embedding_delimiters()
+                        .ok_or("the side projector has no embedding delimiters")?;
+                    let file = media::load(url).map_err(|e| e.to_string())?;
+                    let prepared =
+                        Arc::new(media::prepare(&file, &**model).map_err(|e| e.to_string())?);
+                    let positions = prepared.span_len;
+                    images.push(media::MediaFeed {
+                        at: 0,
+                        key: file.key,
+                        prepared,
+                    });
+                    Ok(InputPart::Image {
+                        begin,
+                        end,
+                        positions,
+                    })
+                }
+            }
+        });
+        let Assembled { ids, spans } = assemble(ordered, &*side.tok, side.ctx).map_err(invalid)?;
+        for (image, span) in images.iter_mut().zip(spans) {
+            image.at = span.start;
+        }
+        Ok(Input { ids, images })
+    } else {
+        Ok(Input {
+            ids: prompt_ids(&*side.tok, key, v, true)?,
+            images: Vec::new(),
+        })
+    }
+}
+
+fn inputs(side: &Side, key: &str, v: &Value) -> Result<Vec<Input>, ApiError> {
     let is_id = |x: &Value| x.is_u64() || x.is_i64();
     let inputs = match v {
         Value::Array(a) if !a.iter().any(is_id) => a
             .iter()
-            .map(|x| prompt_ids(&*side.tok, key, x, true))
+            .map(|x| input(side, key, x))
             .collect::<Result<Vec<_>, _>>()?,
-        v => vec![prompt_ids(&*side.tok, key, v, true)?],
+        v => vec![input(side, key, v)?],
     };
     if inputs.is_empty() {
         return Err(invalid("\"input\" must not be empty"));
     }
-    for ids in &inputs {
+    for input in &inputs {
+        let ids = &input.ids;
         if ids.is_empty() {
             return Err(invalid("Input content cannot be empty"));
         }
@@ -240,7 +364,7 @@ fn inputs(side: &Side, key: &str, v: &Value) -> Result<Vec<Vec<u32>>, ApiError> 
 /// Every input's pooled vector, through the side model under its lock, each pass after
 /// [`open`] holds. A model failure, a panic in it, its lock poisoned, and a vector that is not its
 /// width or not finite are fatal ([`fail`]).
-fn run(state: &State, side: &Side, inputs: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, ApiError> {
+fn run(state: &State, side: &Side, inputs: &[Input]) -> Result<Vec<Vec<f32>>, ApiError> {
     let Ok(mut model) = side.embed.lock() else {
         return Err(fail(
             state,
@@ -250,9 +374,15 @@ fn run(state: &State, side: &Side, inputs: &[Vec<u32>]) -> Result<Vec<Vec<f32>>,
     };
     let width = side.width();
     let mut pooled = Vec::with_capacity(inputs.len());
-    for ids in inputs {
+    for input in inputs {
         open(state)?;
-        let v = match panic::catch_unwind(AssertUnwindSafe(|| model.embed(ids))) {
+        let v = match panic::catch_unwind(AssertUnwindSafe(|| {
+            if input.images.is_empty() {
+                model.embed(&input.ids)
+            } else {
+                model.embed_media(&input.ids, &input.images)
+            }
+        })) {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(fail(state, side, e.0)),
             Err(p) => {
@@ -300,6 +430,10 @@ fn fail(state: &State, side: &Side, error: String) -> ApiError {
         message: error,
     }
 }
+
+#[cfg(test)]
+#[path = "arch/gemma4v.rs"]
+mod image_tests;
 
 #[cfg(test)]
 mod tests {
@@ -584,7 +718,14 @@ mod tests {
                 assert!(open(&waiting_state).is_ok());
                 entered.send(()).expect("entered");
                 let side = waiting_state.side.as_ref().expect("a side model");
-                run(&waiting_state, side, &[vec![id("a")]])
+                run(
+                    &waiting_state,
+                    side,
+                    &[Input {
+                        ids: vec![id("a")],
+                        images: Vec::new(),
+                    }],
+                )
             });
             ready
                 .recv_timeout(Duration::from_secs(5))

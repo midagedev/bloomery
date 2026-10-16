@@ -5,6 +5,8 @@
 
 use core::panic::PanicInfo;
 
+mod selected;
+
 #[panic_handler]
 fn panic(_: &PanicInfo<'_>) -> ! {
     loop {}

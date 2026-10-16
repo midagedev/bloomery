@@ -591,7 +591,7 @@ mod tests {
             + kv
             + rows
             + experts / 2
-            + small.cards[0].set_aside_bytes()
+            + small.cards[0].set_aside_bytes().expect("bounded set-aside")
             + small.cards[0].margin_bytes;
         match inputs.plan(&small, 4, &levers) {
             Err(e) => assert!(

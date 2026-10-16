@@ -1,5 +1,5 @@
 //! The pixel size an image is brought to before it is cut into patches: llama.cpp's mtmd rule
-//! for this projector (`img_tool::calc_size_preserved_ratio`, the dyn-size preprocessor), ported
+//! shared by dynamic-size projectors (`img_tool::calc_size_preserved_ratio`), ported
 //! operation for operation.
 //!
 //! Each side is rounded to a multiple of `align = patch * merge`; a size over the pixel limit is
@@ -106,6 +106,10 @@ impl SizeRule {
     #[must_use]
     pub fn merge(&self) -> usize {
         self.merge
+    }
+
+    pub(crate) fn max_tokens(&self) -> usize {
+        self.limits.max()
     }
 
     /// Pixels a token covers on a side: `patch * merge`.

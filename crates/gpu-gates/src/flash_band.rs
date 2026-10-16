@@ -91,12 +91,20 @@ pub fn exact_attn(
 /// `tile`-key tile, each weight rounded to f16 for the value product and
 /// normalized by the rounded weights' own sum, the tensor core's value
 /// accumulation over `⌈n/16⌉ + 16` roundings twice, and the lanes' weight
-/// sums over `⌈n/4⌉` weights and a rescale a tile.
+/// sums over `⌈n/4⌉` weights and a rescale a tile. `first` is the first
+/// key's original index: a group partly masked at either edge still counts.
 #[must_use]
-pub fn prefill_bound(ex: &ExactAttn, vh: &[f32], head: usize, tile: usize) -> Vec<f64> {
+pub fn prefill_bound(
+    ex: &ExactAttn,
+    vh: &[f32],
+    head: usize,
+    tile: usize,
+    first: usize,
+) -> Vec<f64> {
     let n = ex.pb.len();
     let es = 2f64.powi(-11) + 2.0 * gamma(head + 2);
-    let r = n.div_ceil(tile) as f64;
+    let tiles = (first % tile + n).div_ceil(tile);
+    let r = tiles as f64;
     let w16: Vec<f64> = ex
         .pb
         .iter()
@@ -111,8 +119,8 @@ pub fn prefill_bound(ex: &ExactAttn, vh: &[f32], head: usize, tile: usize) -> Ve
         })
         .collect();
     let dbar: f64 = w16.iter().sum();
-    let acc_pv = 2.0 * gamma(n.div_ceil(16) + 16);
-    let acc_l = gamma(n.div_ceil(4) + n.div_ceil(tile) + 2);
+    let acc_pv = 2.0 * gamma((first % 16 + n).div_ceil(16) + 16);
+    let acc_l = gamma((first % 4 + n).div_ceil(4) + tiles + 2);
     (0..head)
         .map(|d| {
             let (mut t_p, mut pv) = (0.0f64, 0.0f64);
@@ -136,7 +144,8 @@ pub fn prefill_bound(ex: &ExactAttn, vh: &[f32], head: usize, tile: usize) -> Ve
 /// the (row, head) units in `y`'s order over `(n_head, n_kv)`, head `h`
 /// reading key head `h / (n_head / n_kv)` of `cache` and row `t` its first
 /// `counts[t]` keys. Returns whether every value is within its bound and the
-/// largest measured over bound.
+/// largest measured over bound. `first` is the original first-key index
+/// when the cache passed here was cut to that key.
 #[cfg(feature = "gpu")]
 #[must_use]
 pub fn judge_prefill<const H: usize, const TILE: usize>(
@@ -146,6 +155,7 @@ pub fn judge_prefill<const H: usize, const TILE: usize>(
     y: &[f32],
     scale: f32,
     (n_head, n_kv): (usize, usize),
+    first: usize,
 ) -> (bool, f64) {
     crate::par_map(counts.len() * n_head, |i| {
         let n = counts[i / n_head];
@@ -159,7 +169,7 @@ pub fn judge_prefill<const H: usize, const TILE: usize>(
             n,
             scale,
         );
-        let bound = prefill_bound(&ex, vh, H, TILE);
+        let bound = prefill_bound(&ex, vh, H, TILE, first);
         let (mut ok, mut worst) = (true, 0.0f64);
         for d in 0..H {
             let e = (f64::from(y[i * H + d]) - ex.o[d]).abs();
@@ -175,4 +185,42 @@ pub fn judge_prefill<const H: usize, const TILE: usize>(
     })
     .into_iter()
     .fold((true, 0.0f64), |(ok, w), (o, x)| (ok && o, w.max(x)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefill_bound_counts_tiles_from_first_key() {
+        // Zero scores and unit values make the output and normalized weights
+        // exact, leaving only the value and denominator accumulation terms.
+        for n in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            let keys = vec![0.0f32; n];
+            let values = vec![1.0f32; n];
+            let ex = exact_attn(&[0.0], &keys, &values, 1, n, 1.0);
+            for tile in [32, 64] {
+                let old = 2.0 * gamma(n.div_ceil(16) + 16)
+                    + gamma(n.div_ceil(4) + n.div_ceil(tile) + 2)
+                    + 2.0 * U;
+                for first in [0, tile, 3 * tile] {
+                    let bound = prefill_bound(&ex, &values, 1, tile, first);
+                    assert_eq!(
+                        bound[0].to_bits(),
+                        old.to_bits(),
+                        "n={n} tile={tile} first={first}"
+                    );
+                }
+            }
+        }
+        let values = vec![1.0f32; 64];
+        let ex = exact_attn(&[0.0], &[0.0; 64], &values, 1, 64, 1.0);
+        let shifted = prefill_bound(&ex, &values, 1, 64, 16)[0];
+        let two_tiles = 2.0 * gamma(20) + gamma(20) + 2.0 * U;
+        assert_eq!(shifted.to_bits(), two_tiles.to_bits());
+        assert!(shifted > prefill_bound(&ex, &values, 1, 64, 0)[0]);
+        let unaligned = prefill_bound(&ex, &values, 1, 64, 1)[0];
+        let groups_at_both_edges = 2.0 * gamma(21) + gamma(21) + 2.0 * U;
+        assert_eq!(unaligned.to_bits(), groups_at_both_edges.to_bits());
+    }
 }

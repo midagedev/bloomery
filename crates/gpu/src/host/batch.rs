@@ -1243,6 +1243,7 @@ impl<H: HostExperts> HostTier<H> {
     pub fn serve_port(&mut self, key: BatchKey) -> Result<ServeTimes, GpuError> {
         const WHAT: &str = "HostTier::serve_key";
         self.health.refuse_if_poisoned(SERVE_BATCH)?;
+        self.step.release_holds();
         let h = self.step.boundary.layout.handoff();
         let stage = Arc::clone(self.step.boundary.region.context());
         let Some(port) = self.port.as_mut() else {

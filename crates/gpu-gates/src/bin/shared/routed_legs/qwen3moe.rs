@@ -13,7 +13,6 @@ use super::{Adapter, Arm, Outcome, floor_or, outcome_of, view_of};
 use bloomery_gpu::arch::qwen3moe::KvQ8;
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
-use model::arch::Arch;
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::DEFAULT_SLOTS;
 
@@ -35,7 +34,6 @@ impl Adapter for Row {
         // total.
         let levers = PlanLevers::default();
         let opts = q3place::ServeOpts {
-            arch: Arch::Qwen3moe,
             place: None,
             levers: &levers,
             kv: KvQ8::F16,

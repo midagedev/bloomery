@@ -228,7 +228,7 @@ cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/dspark-path.sh" "$ROOT/tool
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/load-groups.sh" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$ROOT/tools/ref/lever-arms.sh" \
   "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" "$ROOT/tools/ref/drive-read.sh" \
-  "$ROOT/tools/ref/bin-label.sh" \
+  "$ROOT/tools/ref/bin-label.sh" "$ROOT/tools/ref/source-inspection.sh" \
   "$T/tools/ref/"
 cp "$ROOT/tools/gate-bound.sh" "$T/tools/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
@@ -586,6 +586,10 @@ exec "$@"
 EOF
 chmod +x "$T/bin/"* "$T/target/release/generate_qwen3moe" "$T/base/target/release/generate_qwen3moe"
 BASEBIN=$T/base/target/release/generate_qwen3moe
+# The witness needs an inspectable source tree even though its engines are stand-ins.
+git -C "$T" init -q || exit 2
+git -C "$T" -c user.name=Stub -c user.email=stub@example.invalid -c commit.gpgsign=false \
+  commit --allow-empty -qm 'stub source provenance' || exit 2
 # The capped arms' two-shard split set (evict, evict-held): in a directory under this tree's target/, cargo's
 # build directory and disk-backed on the box, not under the temporary tree: posix_fadvise(DONTNEED) evicts no
 # tmpfs page, so on a tmpfs /tmp every page would stay resident and evict would be red for that reason. SH_FS

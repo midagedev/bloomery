@@ -209,7 +209,8 @@ cp "$RUNNER" "$T/tools/ref/depth-ds41.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/dspark-path.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" \
   "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" \
-  "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" "$ROOT/tools/ref/bin-label.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" "$ROOT/tools/ref/bin-label.sh" \
+  "$ROOT/tools/ref/source-inspection.sh" "$T/tools/ref/"
 cp "$ROOT/tools/gate-bound.sh" "$T/tools/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"

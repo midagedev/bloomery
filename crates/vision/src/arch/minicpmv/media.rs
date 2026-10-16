@@ -61,8 +61,8 @@ impl MediaModel for Media {
         &self.marker
     }
 
-    fn image_token(&self) -> u32 {
-        self.pad
+    fn image_token(&self) -> Option<u32> {
+        Some(self.pad)
     }
 
     fn part_join(&self) -> PartJoin {
@@ -108,7 +108,7 @@ mod tests {
             "<image_id>12</image_id><image><unk>"
         );
         assert_eq!(m.image_marker(), "<image><unk>");
-        assert_eq!(m.image_token(), 248_077);
+        assert_eq!(m.image_token(), Some(248_077));
         assert_eq!(m.part_join(), PartJoin::LlamaServer);
         // `<image_id>`, the digits, `</image_id>`, `<image>`.
         let head = m.image_head(12).expect("a numbered model has a head");
@@ -135,8 +135,12 @@ mod tests {
                 panic!("{w}x{h}: a MiniCPM-V image is a group of tiles");
             };
             assert_eq!((group.tiles.len(), group.rows()), (tiles, span), "{w}x{h}");
-            let ids =
-                expand_spans(&[5, 248_077, 6], m.image_token(), &[p.span_len]).expect("expand");
+            let ids = expand_spans(
+                &[5, 248_077, 6],
+                m.image_token().expect("chat image token"),
+                &[p.span_len],
+            )
+            .expect("expand");
             // One span, the range itself. `[1..1 + span]` is a one-element array of a
             // range, which is the lint's single-range init, not the positions inside it.
             assert_eq!(ids.spans.len(), 1, "{w}x{h}");

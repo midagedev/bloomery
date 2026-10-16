@@ -27,7 +27,11 @@ pub(crate) fn header(
     let device = format!(
         "{}\tthreads\t{}\tcard\t{}",
         kind.device(),
-        if kind == Kind::Server { "-" } else { "16" },
+        if matches!(kind, Kind::Server | Kind::ServerCpu) {
+            "-"
+        } else {
+            "16"
+        },
         if kind.device() == "cpu" {
             "cpu"
         } else {

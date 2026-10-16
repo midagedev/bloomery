@@ -90,8 +90,8 @@ impl MediaModel for Media {
         IMAGE_PLACEHOLDER
     }
 
-    fn image_token(&self) -> u32 {
-        IMAGE_TOKEN_ID
+    fn image_token(&self) -> Option<u32> {
+        Some(IMAGE_TOKEN_ID)
     }
 
     fn part_join(&self) -> PartJoin {
@@ -262,7 +262,7 @@ mod tests {
             Cow::Borrowed(IMAGE_PLACEHOLDER)
         ));
         assert_eq!(m.image_marker(), IMAGE_PLACEHOLDER);
-        assert_eq!(m.image_token(), IMAGE_TOKEN_ID);
+        assert_eq!(m.image_token(), Some(IMAGE_TOKEN_ID));
         assert_eq!(m.part_join(), PartJoin::LlamaServer);
         assert_eq!(m.part_separator(), "\n");
     }

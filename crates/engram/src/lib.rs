@@ -676,9 +676,8 @@ impl TableBytes<'_> {
         advice: libc::c_int,
         op: &'static str,
     ) -> Result<(), EngramError> {
-        // SAFETY: every caller rounds a span of `bytes` out to the whole pages
-        // that hold it, which lie inside the mapping `bytes` lies in (the
-        // type's contract); madvise reads and writes no memory of ours
+        // SAFETY: every caller supplies whole pages inside the file mapping
+        // `bytes` lies in; madvise reads and writes no memory of ours
         // through them. The one advice that can change what a read returns
         // is DONTNEED on an anonymous mapping, which zeroes the range; every
         // mapping this type covers is a read-only file mapping (a site's own,

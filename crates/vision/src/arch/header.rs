@@ -61,13 +61,22 @@ pub(crate) fn check_architecture(gguf: &Gguf) -> Result<(), VisionError> {
 
 /// The file names `projector` as its projector type.
 pub(crate) fn check_projector(m: &impl Meta, projector: &str) -> Result<(), VisionError> {
-    match need(m, KEY_PROJECTOR)?.as_str() {
+    match projector_value(m)?.as_str() {
         Some(p) if p == projector => Ok(()),
         Some(other) => Err(refusal(
             KEY_PROJECTOR,
             format!("is \"{other}\"; this module reads \"{projector}\""),
         )),
         None => Err(refusal(KEY_PROJECTOR, "is not a string")),
+    }
+}
+
+pub(crate) fn projector_value(m: &impl Meta) -> Result<&Value, VisionError> {
+    match m.value(KEY_PROJECTOR) {
+        Some(v) => Ok(v),
+        None => m
+            .value("clip.vision.projector_type")
+            .ok_or_else(|| refusal(KEY_PROJECTOR, "is absent")),
     }
 }
 

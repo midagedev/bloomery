@@ -10290,7 +10290,10 @@ def bin_feature_self_test(expect) -> None:
                 return [f"raised {err}"]
 
     base = "gate_glm5next_e2e (bloomery-gpu-gates, release): "
-    wide, narrow = "{deepseek41,glm5next,gpu,vision}", "{deepseek41,glm5next,gpu}"
+    tree = Tree(ROOT)
+    pkg = tree.packages["bloomery-gpu-gates"]
+    closure = lambda feats: "{" + ",".join(sorted(tree.feature_closure(pkg, feats.split(","))[0])) + "}"
+    wide, narrow = closure("glm5next,vision"), closure("glm5next")
     got = problems(("a", call("glm5next")), ("b", call("glm5next,vision")))
     expect(len(got) == 1 and got[0].startswith(f"{base}b {wide} vs a {narrow} "), f"bin features: glm5next vs glm5next,vision not refused by name: {got}")
     # the recipes' order and names do not move the line; a set shared by recipes lists them all, sorted

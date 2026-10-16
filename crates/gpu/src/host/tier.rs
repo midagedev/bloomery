@@ -504,6 +504,15 @@ impl TierLayout {
         })
     }
 
+    /// Bytes in one row's go and done posts, including their generation words.
+    #[must_use]
+    pub fn wire_bytes(&self) -> [usize; 2] {
+        let crossings = self.crossings();
+        std::array::from_fn(|i| {
+            crossings[i].spans.iter().map(|s| s.len()).sum::<usize>() + std::mem::size_of::<u32>()
+        })
+    }
+
     /// Tiers the page carries.
     #[must_use]
     pub fn tiers(&self) -> usize {
@@ -583,6 +592,27 @@ impl TierLayout {
                 ]
             })
             .collect()
+    }
+
+    /// One tier's end, with its relay tail apart from every other tier's.
+    fn remote_end(
+        &self,
+        link: &Link,
+        index: usize,
+        side: Reader,
+        ip: std::net::IpAddr,
+    ) -> Result<super::link::RdmaEnd, GpuError> {
+        self.check_tier(index)?;
+        let n = 2 * self.rows;
+        let bytes = TierPage::bytes_of(*self, "the remote tier page")?;
+        let (_, tail) = super::link::link_tail(bytes, index * n);
+        let crossings = self
+            .crossings()
+            .into_iter()
+            .skip(index * n)
+            .take(n)
+            .collect();
+        link.rdma_end(tail, crossings, side, ip)
     }
 
     /// Bytes the page holds.
@@ -671,6 +701,13 @@ impl TierPage {
             bytes,
             layout.crossings().iter().map(|c| c.counter).collect(),
         )?;
+        Self::over(stage, layout, link)
+    }
+
+    /// A page of this process alone, with one RDMA end per remote tier.
+    pub(super) fn remote(stage: &Gpu, layout: TierLayout) -> Result<TierPage, GpuError> {
+        let bytes = Self::bytes_of(layout, "TierPage::remote")?;
+        let link = Link::remote(stage.context(), bytes, layout.crossings().len())?;
         Self::over(stage, layout, link)
     }
 
@@ -1038,6 +1075,8 @@ pub struct TierTarget<'a> {
 /// What the tier has done since load, counted by the decode thread.
 #[derive(Clone, Debug, Default)]
 pub struct TierStats {
+    /// Completed control request/reply pairs on a node tier, zero for a local tier.
+    pub control_round_trips: u64,
     /// Tier layers the host asked of the tier (replayed or enqueued).
     pub issued: u64,
     /// Routed slots the host saw go to the tier, per layer of the set, in
@@ -1247,18 +1286,9 @@ impl TierWork {
         index: usize,
     ) -> Result<(), GpuError> {
         const BIND: &str = "TierWork::bind_opened";
-        if self.link.is_some() {
-            return Err(GpuError::shape(
-                BIND,
-                "a second bind: the tier is bound to a page already, and its graphs hold that \
-                 page's addresses",
-            ));
-        }
-        let layout = self.page_layout(tiers)?;
-        let need = layout
-            .bytes()
-            .ok_or_else(|| GpuError::shape(BIND, "the page's size passes usize"))?;
-        if bytes < need || index >= tiers {
+        let layout = self.binding_layout(tiers, index)?;
+        let need = TierPage::bytes_of(layout, BIND)?;
+        if bytes < need {
             return Err(GpuError::shape(
                 BIND,
                 format!(
@@ -1272,6 +1302,57 @@ impl TierWork {
         self.bind(layout, index, link.own_end());
         self.link = Some(link);
         Ok(())
+    }
+
+    fn binding_layout(&self, tiers: usize, index: usize) -> Result<TierLayout, GpuError> {
+        const BIND: &str = "TierWork::bind";
+        if self.link.is_some() {
+            return Err(GpuError::shape(
+                BIND,
+                "a second bind: the tier's graphs hold its page's addresses",
+            ));
+        }
+        let layout = self.page_layout(tiers)?;
+        layout.check_tier(index)?;
+        Ok(layout)
+    }
+
+    /// Bind this node's own page and connect its RDMA end to the stage's endpoint.
+    pub(super) fn bind_remote(
+        &mut self,
+        tiers: usize,
+        index: usize,
+        peer: &bloomery_verbs::Endpoint,
+        ip: std::net::IpAddr,
+    ) -> Result<bloomery_verbs::Endpoint, GpuError> {
+        let layout = self.binding_layout(tiers, index)?;
+        let bytes = TierPage::bytes_of(layout, "TierWork::bind_remote")?;
+        let mut link = Link::remote(self.gpu.context(), bytes, layout.crossings().len())?;
+        link.store(layout.word_off(index, TWord::Fault), FAULT_NONE);
+        let mut end = layout.remote_end(&link, index, Reader::Tier, ip)?;
+        let endpoint = end.endpoint(0x200);
+        end.connect(endpoint.psn, peer)?;
+        link.keep_remote(end);
+        self.bind(layout, index, link.own_end());
+        self.link = Some(link);
+        Ok(endpoint)
+    }
+
+    pub(super) fn reset_remote(&self, phase: u8) -> Result<(), GpuError> {
+        let (_, layout) = self.end.ok_or(GpuError::State {
+            what: "TierWork::reset_remote",
+            missing: "a bound page",
+        })?;
+        let link = self.link.as_ref().ok_or(GpuError::State {
+            what: "TierWork::reset_remote",
+            missing: "the node's link",
+        })?;
+        if phase == 0 {
+            self.release_opened()?;
+            self.drain(super::DRAIN_DEADLINE, "the remote reset's drain")?;
+        }
+        link.reset_remote(phase, &layout.counters(self.index).collect::<Vec<_>>())
+            .map_err(|e| GpuError::protocol("TierWork::reset_remote", e))
     }
 
     /// Rows of the page the work is bound to; `None` before it is bound.
@@ -1399,13 +1480,14 @@ impl TierWork {
     /// than read rows the tier served from images it never wrote. Nothing
     /// before it is bound to a page it opened. Returns whether it held a page
     /// whose words it released.
-    pub(super) fn release_opened(&self) -> bool {
-        if let Some(link) = &self.link {
-            link.release(RELEASE)
-                .expect("a tier node's shared page has no mirrored ends to settle");
-            true
-        } else {
-            false
+    pub(super) fn release_opened(&self) -> Result<bool, GpuError> {
+        match &self.link {
+            Some(link) => {
+                link.release(RELEASE)
+                    .map_err(|e| GpuError::protocol("TierWork::release_opened", e))?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -1625,7 +1707,7 @@ impl TierCard {
     }
 
     /// The layout of a page of `tiers` tiers this card's staging reads.
-    pub(super) fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
+    pub fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
         match &self.side {
             TierSide::Here(w) => w.page_layout(tiers),
             TierSide::Node(n) => n.page_layout(tiers),
@@ -1661,7 +1743,11 @@ impl TierCard {
     /// What the tier has done since load.
     #[must_use]
     pub fn stats(&self) -> TierStats {
-        self.stats.clone()
+        let mut stats = self.stats.clone();
+        if let TierSide::Node(n) = &self.side {
+            stats.control_round_trips = n.control_round_trips();
+        }
+        stats
     }
 
     /// Device bytes the tier holds besides its weights: the staging and the
@@ -1736,7 +1822,7 @@ impl TierCard {
     /// is current on return.
     pub(super) fn bind(
         &mut self,
-        page: &TierPage,
+        page: &mut TierPage,
         index: usize,
         stage: &Gpu,
     ) -> Result<(), GpuError> {
@@ -1755,6 +1841,13 @@ impl TierCard {
             TierSide::Here(w) => {
                 let end = page.link.tier_end(w.gpu().context(), BIND, &self.name)?;
                 w.bind(layout, index, end);
+            }
+            TierSide::Node(n) if page.link.is_remote() => {
+                let mut end = layout.remote_end(&page.link, index, Reader::Stage, n.local_ip()?)?;
+                let endpoint = end.endpoint(0x100);
+                let peer = n.bind_remote(layout.tiers, index, &endpoint)?;
+                end.connect(endpoint.psn, &peer)?;
+                page.link.keep_remote(end);
             }
             TierSide::Node(n) => {
                 let Some(path) = page.link.path() else {
@@ -1980,27 +2073,51 @@ impl TierCard {
         page.counters(self.index).all(|off| page.link.at_rest(off)) && !self.behind(page)
     }
 
+    /// Release the remote reader's waits and drain its stream, keeping its relay stopped.
+    pub(super) fn release_remote(&mut self, page: &TierPage) -> Result<(), GpuError> {
+        if page.link.is_remote()
+            && let TierSide::Node(n) = &mut self.side
+        {
+            n.release_remote()?;
+        }
+        Ok(())
+    }
+
     /// Back to a fresh tier's words once the tier's stream has drained:
     /// counters and go counters at 0, the host's count at the tier's
     /// progress, the tier's fault word and its copy clean. The host tier's
     /// reset calls it. A link that stopped carrying for good fails it by
     /// why.
     pub(super) fn reset(&mut self, page: &TierPage) -> Result<(), GpuError> {
-        match &mut self.side {
-            TierSide::Here(w) => w.sync()?,
-            TierSide::Node(n) => n.drain(super::DRAIN_DEADLINE)?,
-        }
-        for off in page.counters(self.index) {
-            page.link.reset(off).map_err(|b| {
-                GpuError::protocol(
-                    "TierCard::reset",
-                    format!(
-                        "the tier link of the expert tier on {} stopped carrying ({b}): reload the \
-                         model",
-                        self.name
-                    ),
-                )
-            })?;
+        if page.link.is_remote() {
+            match &mut self.side {
+                TierSide::Node(n) => {
+                    n.reset_remote(&page.link, &page.counters(self.index).collect::<Vec<_>>())?
+                }
+                TierSide::Here(_) => {
+                    return Err(GpuError::shape(
+                        "TierCard::reset",
+                        "a local tier on a remote page",
+                    ));
+                }
+            }
+        } else {
+            match &mut self.side {
+                TierSide::Here(w) => w.sync()?,
+                TierSide::Node(n) => n.drain(super::DRAIN_DEADLINE)?,
+            }
+            for off in page.counters(self.index) {
+                page.link.reset(off).map_err(|b| {
+                    GpuError::protocol(
+                        "TierCard::reset",
+                        format!(
+                            "the tier link of the expert tier on {} stopped carrying ({b}): reload the \
+                             model",
+                            self.name
+                        ),
+                    )
+                })?;
+            }
         }
         self.issued = self.progress(page);
         self.clear_fault(page)
@@ -2294,8 +2411,9 @@ fn copy_page(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
+pub(super) mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::{
         TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierOpen, TierPage, TierSet,
@@ -2306,6 +2424,82 @@ mod tests {
     use crate::host::step::{Chain, RELEASE};
     use bloomery_levers::TierLink;
     use model::ops::DEFER_MAX_COLS;
+
+    pub(in crate::host) fn remote_work(
+        file: &gguf::Split,
+        dropped: Arc<AtomicBool>,
+        stalled: bool,
+    ) -> super::TierWork {
+        struct Empty(Arc<AtomicBool>);
+        impl Drop for Empty {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        impl super::TierExperts for Empty {
+            fn enqueue_layer(
+                &mut self,
+                _: &Gpu,
+                _: &super::Weights,
+                _: usize,
+                _: super::TierIo<'_>,
+            ) -> Result<(), crate::GpuError> {
+                Ok(())
+            }
+            fn enqueue_block(
+                &mut self,
+                _: &Gpu,
+                _: &super::Weights,
+                _: usize,
+                _: super::TierBlock<'_>,
+            ) -> Result<(), crate::GpuError> {
+                Ok(())
+            }
+            fn block_bytes(&self) -> usize {
+                0
+            }
+        }
+        let gpu = Gpu::with_device(0).expect("a GPU");
+        let weights =
+            super::Weights::load_where(gpu.stream(), file, |_| false).expect("no weights");
+        let shape = TierShape {
+            hidden: 32,
+            n_used: 1,
+            rows: 1,
+            act: TierAct::F32,
+        };
+        let mut work = super::TierWork::open(gpu, weights, Box::new(Empty(dropped)), shape, 1)
+            .expect("empty work");
+        let layout = work.page_layout(1).expect("a layout");
+        let link = super::super::link::tests::remote_with_wire(
+            work.gpu().context(),
+            layout.bytes().expect("page bytes"),
+            layout.crossings(),
+            stalled,
+        );
+        work.bind(layout, 0, link.own_end());
+        work.link = Some(link);
+        work
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_remote_reset_releases_waits_before_its_drain() {
+        let (path, file) = super::super::node::tests::empty_file("remote-reset");
+        let mut work = remote_work(&file, Arc::new(AtomicBool::new(false)), false);
+        work.enqueue(0, 0, 1).expect("a go wait");
+        let result = work.reset_remote(0);
+        work.link
+            .as_ref()
+            .expect("a page")
+            .release(RELEASE)
+            .expect("release for cleanup");
+        work.sync().expect("drained for cleanup");
+        assert!(result.is_ok(), "{result:?}");
+        drop(work);
+        drop(file);
+        std::fs::remove_file(path).expect("remove the fixture");
+    }
 
     /// A family whose tier opens only in the loading process refuses a
     /// tier on a node by name, in one sentence, before it opens a card.
@@ -2529,6 +2723,7 @@ mod tests {
             (0, 64, 4096, 0, 0)
         );
         assert_eq!(i.words(), 64 + 4096);
+        assert_eq!(l.wire_bytes(), [16_644, 131_084]);
         assert!(l.rows_off(0) >= l.image_off(1) + 4 * i.words());
         assert!(l.bytes().unwrap() >= l.rows_off(1) + 4 * 8 * 4096);
         assert!(TierLayout::new(glm, 512, 0, 1).is_err());
@@ -2558,6 +2753,7 @@ mod tests {
             (0, 64, 4 * 2560, 4, 10)
         );
         assert!(i.sel + 4 * i.n_used <= i.x);
+        assert_eq!(l.wire_bytes(), [41_220, 409_612]);
         assert!(l.rows_off(0) >= l.image_off(0) + 4 * i.words());
         assert!(l.bytes().unwrap() >= l.rows_off(0) + 4 * 40 * 2560);
         assert_eq!(

@@ -7,11 +7,11 @@
 use std::borrow::Cow;
 
 use super::TEMPORAL_FRAMES;
-use super::size::SizeRule;
 use crate::GridPlan;
 use crate::media::{MediaModel, PartJoin, Prepared};
 use crate::preprocess::{PatchLayout, Patches, patchify};
 use crate::resample::pad_ceil;
+use crate::size::SizeRule;
 use crate::{Rgb8, VisionError};
 
 /// The placeholder Clef's prompt carries for one image.
@@ -81,8 +81,8 @@ impl MediaModel for Media {
         IMAGE_PLACEHOLDER
     }
 
-    fn image_token(&self) -> u32 {
-        IMAGE_TOKEN_ID
+    fn image_token(&self) -> Option<u32> {
+        Some(IMAGE_TOKEN_ID)
     }
 
     fn part_join(&self) -> PartJoin {
@@ -105,9 +105,9 @@ mod tests {
     use super::{IMAGE_PLACEHOLDER, Media, PAD_BLACK, VISION_END_ID, VISION_START_ID};
     use crate::MropeSeq;
     use crate::Rgb8;
-    use crate::arch::qwen3vl::size::{SizeRule, TokenLimits};
     use crate::media::{MediaModel, PartJoin};
     use crate::preprocess::{f32_to_bf16, normalize};
+    use crate::size::{SizeRule, TokenLimits};
 
     fn media() -> Media {
         Media::new(SizeRule::new(16, 2, TokenLimits::DEFAULT).expect("rule"))
@@ -126,7 +126,7 @@ mod tests {
             Cow::Borrowed(IMAGE_PLACEHOLDER)
         ));
         assert_eq!(m.image_marker(), IMAGE_PLACEHOLDER);
-        assert_eq!(m.image_token(), 248_056);
+        assert_eq!(m.image_token(), Some(248_056));
         assert_eq!((VISION_START_ID, VISION_END_ID), (248_053, 248_054));
         assert_eq!(PAD_BLACK, [0, 0, 0]);
         assert_eq!(m.part_separator(), "\n");

@@ -32,6 +32,16 @@ V4.1 rows of 2026-09-28, llama.cpp read the engram table cold on new prompt ids 
 one ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#v41-xeng)). If you know faster flags
 for a row, please open an issue.
 
+**Source witnesses.** `ik-draft.sh` and the Qwen, GLM and V4.1 depth runners print a binary hash, source
+HEAD and count of tracked dirty files. A failed `git status` is an inspection error, not a clean tree:
+the runner exits 2 with `source-inspection: git status failed` before taking the lease, including in
+`BLOOMERY_DRY=1` mode. V4.1 also accepts a tree synced without Git: its own tree prints
+`head=<BLOOMERY_GIT_COMMIT>(box.sh) dirty_files=?` when box.sh supplied the commit; otherwise, or for
+another no-Git tree, it prints `head=? dirty_files=?`. An unknown dirty count is never zero.
+`python3 tools/ref/source-inspection-test.py --self-test` exercises the runner exits with real clean,
+dirty and corrupt-index repositories and the V4.1 no-Git path; it uses dry runs and preflight stand-ins,
+not a GPU or timing evidence.
+
 ## Why it is fast
 
 Each point names the measurement that isolates it: the same engine, or a bench of that one path, with and

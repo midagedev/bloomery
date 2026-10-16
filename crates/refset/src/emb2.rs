@@ -18,6 +18,7 @@ pub enum Kind {
     Tower,
     TowerCpu,
     Server,
+    ServerCpu,
 }
 
 impl Kind {
@@ -27,7 +28,7 @@ impl Kind {
         match self {
             Kind::Text | Kind::TextCpu => "text",
             Kind::Tower | Kind::TowerCpu => "tower",
-            Kind::Server => "server",
+            Kind::Server | Kind::ServerCpu => "server",
         }
     }
 
@@ -35,7 +36,7 @@ impl Kind {
     #[must_use]
     pub const fn device(self) -> &'static str {
         match self {
-            Kind::TextCpu | Kind::TowerCpu => "cpu",
+            Kind::TextCpu | Kind::TowerCpu | Kind::ServerCpu => "cpu",
             Kind::Text | Kind::Tower | Kind::Server => "cuda",
         }
     }
@@ -114,7 +115,7 @@ impl Emb2Set {
                     ));
                 }
             },
-            Kind::Text | Kind::TextCpu | Kind::Server => {
+            Kind::Text | Kind::TextCpu | Kind::Server | Kind::ServerCpu => {
                 let model = one(&man, "model")?;
                 let [path] = model[..] else {
                     return Err(RefError::malformed(

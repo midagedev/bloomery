@@ -236,7 +236,7 @@ pub(crate) fn back(
     let stream = gpu.stream();
     let boundary = hybrid.boundary();
     let s = &mut *p.s;
-    boundary.enqueue_back_of(stream, 0)?;
+    boundary.enqueue_back_of(stream, 0, l)?;
     let shadowed = if p.card.has(l) { p.card.pre() } else { &s.x1 };
     let dest = dest.unwrap_or(&mut s.x);
     gpu.elem()

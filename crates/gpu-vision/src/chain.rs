@@ -11,11 +11,19 @@ use gguf::{GgmlType, Gguf};
 
 /// Where an encode's intermediate tensors go when a caller asks for them (a gate). `wants` is
 /// asked before each named point; a `true` synchronizes the stream and hands the tensor over
-/// as bf16 bits, `cols` values per row. The names are each tower's own (listed in its module
+/// through `take` for BF16 or `take_f32` for F32, `cols` values per row. Every sink handles both
+/// storage formats. The names are each tower's own (listed in its module
 /// doc), the oracle's file stems or graph node names a gate maps them to.
 pub trait TapSink {
     fn wants(&self, name: &str) -> bool;
     fn take(&mut self, name: &str, cols: usize, bits: Vec<u16>);
+    fn take_f32(&mut self, name: &str, cols: usize, values: Vec<f32>) {
+        self.take(
+            name,
+            cols,
+            values.into_iter().map(crate::f32_bf16).collect(),
+        );
+    }
 }
 
 /// The sink of a plain encode.
@@ -26,6 +34,7 @@ impl TapSink for NoTaps {
         false
     }
     fn take(&mut self, _: &str, _: usize, _: Vec<u16>) {}
+    fn take_f32(&mut self, _: &str, _: usize, _: Vec<f32>) {}
 }
 
 /// An encode's result: the rows the text model reads in place of an image's tokens (`out_dim` bf16
@@ -49,6 +58,26 @@ pub(crate) fn tap(
     if taps.wants(name) {
         let v = to_host(stream, buf, rows * cols)?;
         taps.take(name, cols, v);
+    }
+    Ok(())
+}
+
+/// Hand an F32 residual stream to a sink without changing its storage precision.
+pub(crate) fn tap_f32(
+    stream: &CudaStream,
+    taps: &mut dyn TapSink,
+    name: &str,
+    buf: &DeviceBuffer<f32>,
+    rows: usize,
+    cols: usize,
+) -> Result<(), GpuError> {
+    if taps.wants(name) {
+        stream.synchronize()?;
+        taps.take_f32(
+            name,
+            cols,
+            Window::<f32>::of(buf, 0, rows * cols)?.to_host_vec(stream)?,
+        );
     }
     Ok(())
 }

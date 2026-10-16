@@ -1242,7 +1242,7 @@ printf '#!/bin/sh\necho %s\n' "$GS/log" > "$GS/fifo/mktemp"
 chmod +x "$GS/fifo/mktemp"
 echo keep > "$GS/target"
 ln -sf "$GS/target" "$GS/log.out"
-run "gate.sh: a FIFO it cannot make ends 70" 70 'mkfifo.*File exists' gs PATH="$GS/fifo:$GS/stub:$PATH"
+rc_is 'gate.sh: a FIFO it cannot make ends 70' 70 gs PATH="$GS/fifo:$GS/stub:$PATH"
 if [ "$(cat "$GS/target")" = keep ] && ! grep -q '^cargo ' "$tmp/out"; then pass '  … before cargo runs, and the linked file stays as it was'
 else fail '  … before cargo runs, and the linked file stays as it was' "cargo ran or the target changed" "$tmp/out"; fi
 

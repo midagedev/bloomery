@@ -1,0 +1,13 @@
+kind: profile
+question: what payload byte rate does one direct RoCE link sustain without a GPU kernel?
+term: link_probe --size 33554432 payload bytes divided by host-played one-way median time,
+  half a request/reply, including the relay's ordering and completion work
+unit: GB/s
+predict: 1..25
+condition: two DGX Sparks, one 200 Gbit/s direct RoCE port each, strict ordering,
+  1000 timed generations and 100 warmup generations, 32 MiB each direction; both node
+  locks and leases held, clean 30-second idle witness, builds finished before the sitting;
+  retain small-message and GPU-played latency readings from the same sitting
+decide-in: normalize the node run's payload demand by this observed byte ceiling
+decide-below: check port selection and CPU contention before drawing a link limit
+decide-above: check the payload count and the half-round-trip timer
