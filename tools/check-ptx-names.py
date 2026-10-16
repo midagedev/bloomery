@@ -184,7 +184,7 @@ def invocations(lines, macro):
     """The `KEY: ident, ident` binding lines of every `macro! { .. }` invocation in lines: a list, one dict a
     call, KEY -> ([idents], line)."""
     out, i = [], 0
-    start = re.compile(r"^\s*" + re.escape(macro) + r"!\s*\{")
+    start = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*" + re.escape(macro) + r"!\s*\{")
     while i < len(lines):
         if not start.match(lines[i]):
             i += 1
@@ -205,8 +205,9 @@ def invocations(lines, macro):
     return out
 
 
-def crate_kernels(root, crate):
-    """name -> (file, line) of every entry the crate's src declares; macro-bound names resolved."""
+def crate_scan(root, crate):
+    """The crate's kernel sites, its macro_rules! definitions and its file texts, the shared scan of
+    [`crate_kernels`] and the per-binary union below."""
     base = os.path.join(root, "crates", crate, "src")
 
     def unlisted(e):  # a directory the walk cannot list is an unreadable input (main_check's exit 2), never skipped
@@ -228,6 +229,15 @@ def crate_kernels(root, crate):
                 found.setdefault(("$", mac, name[1:]), []).append((r, ln))
             else:
                 found.setdefault(name, []).append((r, ln))
+    return found, macros, texts
+
+
+def crate_kernels(root, crate):
+    """name -> (file, line) of every entry the crate's src declares; macro-bound names resolved. A macro family
+    may be defined in one of the binary's crates and invoked from another (sigmoid_router_instance! lives in gpu,
+    its glm5next and mimo2 instances in gpu-deepseek41), so the `$name` families of a binary's crates bind over
+    the union of those crates' files, not the defining crate's alone."""
+    found, macros, texts = crate_scan(root, crate)
     out = {}
     for key, sites in found.items():
         if not isinstance(key, tuple):
@@ -532,7 +542,7 @@ def self_test():
             ["generate_ds41 beta_router stale", "generate_ds41 beta_scores stale"],
             ds=DS_RS.replace("router_instance! {\n    pub mod beta {\n        experts: 256,\n        entries: beta_router, beta_scores,\n"
                              "        prepare: prepare_beta_router, prepare_beta_scores,\n    }\n}\n", ""))
-        ds3 = (DS_RS + "\nrouter_instance! {\n    pub mod gamma {\n        experts: 8,\n        entries: gamma_router, gamma_scores,\n"
+        ds3 = (DS_RS + "\ncrate::router_instance! {\n    pub mod gamma {\n        experts: 8,\n        entries: gamma_router, gamma_scores,\n"
                "        prepare: p_g_router, p_g_scores,\n    }\n}\n")
         at = f"crates/gpu-deepseek41/src/router.rs:{line_of(ds3, 'entries: gamma_router')}"
         run("macro: an added invocation's names are unpinned", 1,
