@@ -300,6 +300,70 @@ impl IqFormat {
     }
 }
 
+/// The grouped GEMM's IQ2_XXS plane of an expert stack's file bytes: one
+/// flat word stream an expert — its rows' `16·n_sb` idx/aux words (the
+/// file's half verbatim, every half a 16-byte run), then its rows' f16 `d`
+/// values packed two a word — so expert `e`'s region starts at word
+/// `e·rows·n_sb·33/2` ([`crate::weights::DevWeight::Iq2Xxs`]). Byte-neutral
+/// with the file's stream. `k` must be a positive multiple of 512 (a row's
+/// d tail packs whole super-block pairs), the bytes exactly
+/// `n_experts·rows·66·n_sb`, and every `d` finite — the last refused naming
+/// its expert, row and super-block.
+pub fn repack_iq2xxs(
+    bytes: &[u8],
+    n_experts: usize,
+    rows: usize,
+    k: usize,
+) -> Result<Vec<u32>, GpuError> {
+    let what = "iq::repack_iq2xxs";
+    if k == 0 || !k.is_multiple_of(512) {
+        return Err(GpuError::shape(
+            what,
+            format!("k {k} is not a positive multiple of 512"),
+        ));
+    }
+    let n_sb = k / SB_VALUES;
+    if bytes.len() != n_experts * rows * n_sb * 66 {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{} bytes for {n_experts} experts of {rows} rows of {k} values, want {}",
+                bytes.len(),
+                n_experts * rows * n_sb * 66
+            ),
+        ));
+    }
+    let mut plane = vec![0u32; n_experts * rows * n_sb * 33 / 2];
+    let exp_w = rows * n_sb * 33 / 2;
+    let word = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    let half = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+    for e in 0..n_experts {
+        for r in 0..rows {
+            for sb in 0..n_sb {
+                let blk = (e * rows + r) * n_sb * 66 + sb * 66;
+                if !half_to_f32(half(bytes, blk)).is_finite() {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "expert {e} row {r} super-block {sb}: the f16 d at byte {blk} is not \
+                             finite"
+                        ),
+                    ));
+                }
+                let qs = e * exp_w + r * 16 * n_sb + sb * 16;
+                for hh in 0..2 {
+                    for i in 0..8 {
+                        plane[qs + 8 * hh + i] = word(bytes, blk + 2 + 32 * hh + 4 * i);
+                    }
+                }
+                let dw = e * exp_w + rows * 16 * n_sb + r * n_sb / 2 + sb / 2;
+                plane[dw] |= u32::from(half(bytes, blk)) << (16 * (sb & 1));
+            }
+        }
+    }
+    Ok(plane)
+}
+
 // ---------------------------------------------------------------- device
 
 /// Byte masks: byte `j` of the result is `0xff` when bit `j` (`j < 4`) of

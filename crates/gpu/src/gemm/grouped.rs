@@ -87,6 +87,10 @@ pub(super) const S8_STAGE: usize = GEMM_BN * 4;
 /// row groups start in eight distinct bank quads: its four-lane qs reads hit
 /// 32 distinct banks and its 16-byte header reads eight distinct bank groups.
 pub(super) const WT_ROW_W: usize = 20;
+/// The staged IQ2_XXS plane's words a row: one half's eight idx/aux words.
+pub(super) const WTP_ROW_W: usize = 8;
+/// The staged IQ2_XXS plane's words a stage: the slab's 128 rows' halves.
+pub(super) const WTP_STAGE_W: usize = GEMM_BM * WTP_ROW_W;
 /// u32 words one stage of the staged Q4_K slab takes: the block's rows.
 pub(super) const WT_STAGE_W: usize = GEMM_BM * WT_ROW_W;
 
@@ -169,6 +173,12 @@ pub enum GemmWeight {
     Q5K,
     Q6K,
     Iq2Xxs,
+    /// The IQ2_XXS planes of [`crate::weights::DevWeight::Iq2Xxs`]: one flat
+    /// word stream an expert (its 16·n_sb idx/aux words a row, then its rows'
+    /// d halves two a word), byte for byte the file's stream re-laid — every
+    /// half a 16-byte run, so the entry stages it into shared memory instead
+    /// of the file stream's per-warp windows. `k` a multiple of 512.
+    Iq2XxsPlane,
     Iq3Xxs,
     Iq4Xs,
 }
@@ -204,7 +214,7 @@ impl GemmWeight {
             GemmWeight::Q4K => Q4K_SB_BYTES,
             GemmWeight::Q5K => Q5K_SB_BYTES,
             GemmWeight::Q6K => Q6K_SB_BYTES,
-            GemmWeight::Iq2Xxs => IQ2XXS_SB_BYTES,
+            GemmWeight::Iq2Xxs | GemmWeight::Iq2XxsPlane => IQ2XXS_SB_BYTES,
             GemmWeight::Iq3Xxs => IQ3XXS_SB_BYTES,
             GemmWeight::Iq4Xs => 4 * IQ4XS_SB_WORDS,
         }
@@ -864,8 +874,10 @@ macro_rules! wst_direct {
             Default::default()
         }
     };
-    (@after [] $ws:ident, $hdr:ident; $st:ident, $hh:ident, $t:ident, $raw:ident) => {{
+    (@after [] $ws:ident, $hdr:ident, $sb2:ident, $w2:ident; $st:ident, $hh:ident, $t:ident,
+     $raw:ident) => {{
         let () = $hdr;
+        let _ = ($sb2, $w2);
         $raw
     }};
 }
@@ -939,7 +951,9 @@ macro_rules! wst_q4k {
      $t:ident, $sb_units:expr) => {{
         let _ = $sb;
     }};
-    (@after [$wt:ident] $ws:ident, $hdr:ident; $st:ident, $hh:ident, $t:ident, $raw:ident) => {{
+    (@after [$wt:ident] $ws:ident, $hdr:ident, $sb2:ident, $w2:ident; $st:ident, $hh:ident,
+     $t:ident, $raw:ident) => {{
+        let _ = ($sb2, $w2);
         let () = $raw;
         // SAFETY: rows 16·wid + g and 16·wid + g + 8 of the slab are this
         // active warp's, so both are rows of stage `st`.
@@ -956,6 +970,101 @@ macro_rules! wst_q4k {
             }
         }
         (q4k_dec!(@load $hdr[0], p0, $t), q4k_dec!(@load $hdr[1], p1, $t))
+    }};
+}
+
+/// The IQ2_XXS plane's staged words: [`wst_q4k`]'s shape over the plane of
+/// [`crate::weights::DevWeight::Iq2Xxs`] — one flat word stream an expert
+/// (`[its rows' 16·n_sb idx/aux words][its rows' n_sb/2 d-half words]`, so
+/// expert `e` starts at word `e·rows·n_sb·33/2`), a row's half its four
+/// sub-blocks' eight words, one 32-byte run staged as two 16-byte chunks (one
+/// a thread: `GEMM_THREADS` = 2·GEMM_BM). The d words stay in global: one
+/// broadcast word a row a step, a seventeenth of the stream. `@decl` fixes
+/// each thread's chunk offset and this warp's two rows' d word bases (usize:
+/// a 4.4 G-word stack's offsets do not fit u32 arithmetic); a row past the
+/// slab's live rows copies the last live row, as [`wst_q4k`].
+macro_rules! wst_iq2p {
+    (@tile $wt:ident) => {{
+        static mut WT: SharedArray<u32, { 2 * WTP_STAGE_W }, 16> = SharedArray::UNINIT;
+        SharedArray::as_raw_mut_ptr(&raw mut WT)
+    }};
+    (@decl [$wt:ident] $ws:ident, $hdr:ident; $w:ident, $e:ident, $rows_n:ident, $rt:ident,
+     $row0:ident, $g:ident, $tid:ident, $wid:ident, $n_sb:ident, $rows32:ident, $n_sb32:ident,
+     $sb_units:expr) => {
+        let _ = ($w, $sb_units);
+        let $ws = {
+            let (e, rows, n_sb) = ($e as usize, $rows32 as usize, $n_sb32 as usize);
+            let slab = $rt * GEMM_BM;
+            let last = (rows - slab).min(GEMM_BM) - 1;
+            let row0 = e * rows + slab;
+            let tid = $tid;
+            // The expert's words: its qs rows then its d tail.
+            let (qs0, dh0) = (e * rows * n_sb * 33 / 2, e * rows * n_sb * 33 / 2 + rows * 16 * n_sb);
+            // A thread's 16-byte chunk: row tid / 2 of the slab, the run's
+            // half tid & 1. This warp's two rows, clamped to the last live
+            // row, and their d word bases.
+            let (ca, c) = (row0 + (tid / 2).min(last), tid % 2);
+            let ra = (row0 + 16 * $wid + $g).min(row0 + last);
+            (
+                qs0 + ca * 16 * n_sb + 4 * c,
+                dh0 + ra * n_sb / 2,
+                dh0 + (ra + 8).min(row0 + last) * n_sb / 2,
+                (tid / 2) * WTP_ROW_W + 4 * c,
+                (16 * $wid + $g) * WTP_ROW_W,
+            )
+        };
+        let $hdr = ();
+    };
+    (@stage [$wt:ident] $ws:ident; $w:ident, $sb:expr, $hh:expr, $st:expr, $tid:ident,
+     $sb_units:expr) => {{
+        let hh: usize = $hh;
+        // SAFETY: the source is the thread's chunk — word `qs0 + row·16·n_sb
+        // + sb·16 + hh·8 + 4·(tid & 1)` of the plane, a multiple of four
+        // words (16 bytes) into a plane whose base the launcher holds
+        // 16-byte aligned, inside the plane by the launch contract. The
+        // destination is that chunk's place in stage `st`, 16-byte aligned.
+        unsafe {
+            let src = $w.as_ptr().add($sb * 16 + 8 * hh + $ws.0);
+            let dst = $wt.add($st * WTP_STAGE_W);
+            cp_async_cg_16(dst.add($ws.3), src);
+        }
+    }};
+    (@head [$wt:ident] $dec:ident, $w:ident, $ws:ident, $active:ident, $sb:ident, $hh:ident,
+     $t:ident, $sb_units:expr) => {{
+        let _ = ($w, $active, $sb, $hh, $t, $sb_units);
+    }};
+    (@after [$wt:ident] $ws:ident, $hdr:ident, $sb2:ident, $w2:ident; $st:ident, $hh:ident,
+     $t:ident, $raw:ident) => {{
+        let () = $hdr;
+        let () = $raw;
+        let sb: usize = $sb2;
+        // SAFETY: rows 16·wid + g and 16·wid + g + 8 of the slab are this
+        // active warp's, so both are rows of stage `st`, 16-byte aligned,
+        // published by the barrier after the stage's wait; each d word a word
+        // of the plane by the launch contract.
+        let (p0, p1) = unsafe {
+            let p0 = $wt.add($st * WTP_STAGE_W).add($ws.4);
+            (p0, p0.add(8 * WTP_ROW_W))
+        };
+        let row = |p: *mut u32, db: usize| -> [u32; 13] {
+            let w = unsafe {
+                [
+                    (*(p as *const U32x4)).0,
+                    (*(p.add(4) as *const U32x4)).0,
+                ]
+            };
+            let dh = unsafe { *$w2.as_ptr().add(db + sb / 2) };
+            let t: u32 = $t as u32;
+            let (a0, a1, s0) = iq2xxs_lane(w[0][0], w[0][1], t);
+            let (b0, b1, s1) = iq2xxs_lane(w[0][2], w[0][3], t);
+            let (c0, c1, s2) = iq2xxs_lane(w[1][0], w[1][1], t);
+            let (d0, d1, s3) = iq2xxs_lane(w[1][2], w[1][3], t);
+            [
+                a0, a1, s0, b0, b1, s1, c0, c1, s2, d0, d1, s3,
+                dh >> (16 * (sb & 1) as u32),
+            ]
+        };
+        (row(p0, $ws.1), row(p1, $ws.2))
     }};
 }
 
@@ -1038,7 +1147,7 @@ macro_rules! gemm_step {
         thread::sync_threads();
 
         if $active {
-            let (raw0, raw1) = $wst!(@after [$($wsa),*] $ws, $hdr; st, hh, $t, raw);
+            let (raw0, raw1) = $wst!(@after [$($wsa),*] $ws, $hdr, $sb, $w; st, hh, $t, raw);
             // SAFETY: stage `st` is inside each shared array.
             let (bst, s8st, d8st) = unsafe {
                 (
@@ -1444,6 +1553,23 @@ impl GemmLaunch {
                 ),
             ));
         }
+        if ty == GemmWeight::Iq2XxsPlane
+            && (!n_sb.is_multiple_of(2)
+                || 2 * w.buf().len() != route.n_experts * rows_per_expert * 33 * n_sb
+                || !w.buf().cu_deviceptr().is_multiple_of(16))
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "an IQ2_XXS plane packs two super-blocks' d values a word, so it is exactly \
+                     {} words over a 16-byte-aligned stack: K must be a multiple of 512 and the \
+                     plane byte-neutral; this stack has n_sb {n_sb}, {} words, device address {:#x}",
+                    route.n_experts * rows_per_expert * 33 * n_sb / 2,
+                    w.buf().len(),
+                    w.buf().cu_deviceptr()
+                ),
+            ));
+        }
         if ty == GemmWeight::Q4K
             && (!w.buf().cu_deviceptr().is_multiple_of(16)
                 || w.buf().len() > (u32::MAX / 4) as usize)
@@ -1556,6 +1682,7 @@ impl GemmKernels {
             GemmWeight::Q5K => launch!(prepare_gemm_q5k, gemm_q5k),
             GemmWeight::Q6K => launch!(prepare_gemm_q6k, gemm_q6k),
             GemmWeight::Iq2Xxs => launch!(prepare_gemm_iq2xxs, gemm_iq2xxs),
+            GemmWeight::Iq2XxsPlane => launch!(prepare_gemm_iq2xxs_p, gemm_iq2xxs_p),
             GemmWeight::Iq3Xxs => launch!(prepare_gemm_iq3xxs, gemm_iq3xxs),
             GemmWeight::Iq4Xs => launch!(prepare_gemm_iq4xs, gemm_iq4xs),
         }

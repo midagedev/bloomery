@@ -8,8 +8,8 @@
 use super::grouped::{
     B_COL_W, B_STAGE_W, GEMM_BM, GEMM_NT, GEMM_THREADS, IQ2XXS_SB_BYTES, IQ3XXS_SB_BYTES,
     IQ4XS_SB_WORDS, Q3K_D, Q3K_QS, Q3K_SB_BYTES, Q3K_SCALES, Q4K_SB_WORDS, Q5K_SB_WORDS, Q6K_D,
-    Q6K_QH, Q6K_SB_BYTES, Q6K_SCALES, S8_STAGE, WT_ROW_W, WT_STAGE_W, iq2xxs_lane, iq3xxs_lane,
-    iq4xs_scale, q3k_code, q3k_scale_word, q5k_code, sbyte, ubyte, win,
+    Q6K_QH, Q6K_SB_BYTES, Q6K_SCALES, S8_STAGE, WT_ROW_W, WT_STAGE_W, WTP_ROW_W, WTP_STAGE_W,
+    iq2xxs_lane, iq3xxs_lane, iq4xs_scale, q3k_code, q3k_scale_word, q5k_code, sbyte, ubyte, win,
 };
 use super::route::{
     GEMM_MAX_EXPERTS, NO_EXPERT, ROUTE_HIST, ROUTE_THREADS, ROUTE_WARPS, route_id, tile_parts,
@@ -605,6 +605,65 @@ mod gemm_kernels {
             wst: wst_direct(),
             walk: plain,
             sb_units: IQ2XXS_SB_BYTES,
+            params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
+                act_cols, n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_iq2xxs`] over the load-time plane of
+    /// [`crate::weights::DevWeight::Iq2Xxs`]: the same words re-laid so every
+    /// row's half is a 16-byte run (expert `e` at word `e·rows·n_sb·33/2`:
+    /// its rows' 16·n_sb idx/aux words, then its rows' `n_sb/2` d words).
+    /// The step stages the slab's half through `GEMM_THREADS` 16-byte
+    /// cp.async copies and the warps read their rows from shared as v4; the
+    /// d words stay in global, one broadcast word a row a step (a seventeenth
+    /// of the stream). Byte-neutral with the file stack, so its launch
+    /// contract is [`gemm_iq2xxs`]'s; the decode is its decode, over the
+    /// staged words.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_experts * rows * 66 * n_sb,
+            q6.len() >= act_cols * 128 * half_it,
+            s8.len() >= act_cols * 8 * n_sb,
+            d8.len() >= act_cols * 2 * n_sb,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_iq2xxs_p(
+        w: &[u32],
+        q6: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        n_sb: u32,
+        half_it: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        gemm_block!(
+            dec: iq2xxs_dec,
+            wst: wst_iq2p(wt),
+            walk: plain,
+            sb_units: 16,
             params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
                 act_cols, n_slots, max_tiles, slot_div, row_tiles, y),
         );

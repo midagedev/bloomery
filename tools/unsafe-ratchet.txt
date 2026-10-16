@@ -306,7 +306,12 @@ gguf 9 2 0
 # mamba2_steps alone (its y phase reads z's staged value in its own block; the decode step keeps
 # the per-channel xor butterfly). Measured 1908/207 on the merged tree (the fold's call blocks)
 # differ from the branch pin by two; the ratchet follows the measurement.
-gpu 1908 207 10
+# PIN(2026-10-17): gpu 1903 -> 1912 blocks on the lever4 pick of bolt-r7: the IQ2_XXS plane's nine
+# (wst_iq2p's four — the cp.async stage, the shared row pointers, the two U32x4 row reads and the d
+# word read — and the gemv twin's five: iq2xxs_sub_p and down_sel_body_p's word pair read, the d
+# word read, the sel load, the activation column, the store), each with its SAFETY line, over the
+# 1903 bolt-r7 measures (its lint cleanup took five from the 1908 of bolt-r6).
+gpu 1912 207 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

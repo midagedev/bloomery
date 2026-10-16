@@ -114,6 +114,13 @@ pub enum DevWeight {
         k: usize,
         scale: f32,
     },
+    /// An IQ2_XXS expert stack re-laid into one flat word stream at load:
+    /// expert `e`'s region starts at word `e·rows·(k/256)·33/2` and holds its
+    /// rows' 16·(k/256) idx/aux words (the file's half verbatim, so every
+    /// half a 16-byte run), then its rows' f16 `d` values packed two a word
+    /// (`n_sb/2` a row) — byte for byte the file's stream, `k` a multiple of
+    /// 512. Read by the grouped GEMM's plane entry and the `_sel` gemv.
+    Iq2Xxs { w: DeviceTensor<u32>, k: usize },
 }
 
 impl DevWeight {
@@ -127,6 +134,7 @@ impl DevWeight {
             DevWeight::Q8_0 { d, .. } | DevWeight::Q8_0Derived { d, .. } => d.rows(),
             DevWeight::F32 { w, .. } => w.rows(),
             DevWeight::Nvfp4 { qs, .. } => qs.rows(),
+            DevWeight::Iq2Xxs { w, .. } => w.rows(),
         }
     }
 
@@ -140,7 +148,8 @@ impl DevWeight {
             | DevWeight::Q8_0 { k, .. }
             | DevWeight::Q8_0Derived { k, .. }
             | DevWeight::F32 { k, .. }
-            | DevWeight::Nvfp4 { k, .. } => *k,
+            | DevWeight::Nvfp4 { k, .. }
+            | DevWeight::Iq2Xxs { k, .. } => *k,
         }
     }
 
@@ -160,6 +169,7 @@ impl DevWeight {
             }
             DevWeight::F32 { w, .. } => vec![held(w)],
             DevWeight::Nvfp4 { qs, e, .. } => vec![held(qs), held(e)],
+            DevWeight::Iq2Xxs { w, .. } => vec![held(w)],
         }
     }
 
