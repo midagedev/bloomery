@@ -1827,7 +1827,7 @@ fn models(state: &State) -> Value {
 }
 
 fn props(state: &State) -> Value {
-    json!({
+    let mut props = json!({
         "system_prompt": "",
         "model_alias": state.alias,
         "model_path": state.model_path,
@@ -1843,7 +1843,11 @@ fn props(state: &State) -> Value {
         "n_ctx": state.info.ctx_max,
         "build_info": format!("bloomery-serve {VERSION}"),
         "engine": state.engine_props,
-    })
+    });
+    if let Some(side) = &state.side {
+        props["embedding_model"] = json!({ "alias": side.name, "path": side.path });
+    }
+    props
 }
 
 /// The commit this build names, set by `build.rs`. `--version` reads it too.

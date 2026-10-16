@@ -33,7 +33,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   `--mmproj` and `--embd-model` on the same off-plan card do not count each other's bytes; the second open
   fails by name if the card is short.
   The response `model` is the embedding file name, also listed separately in `/v1/models` with
-  `meta.n_embd` and `meta.n_ctx`. On `/v1/embeddings`, a `model` of another type than a string or a name
+  `meta.n_embd` and `meta.n_ctx`. `/props` adds `embedding_model` with the side model's `alias` and
+  `path` when one is loaded; `model_alias` and `model_path` still name the chat model.
+  On `/v1/embeddings`, a `model` of another type than a string or a name
   other than the embedding model's is a 400 `invalid_request_error` and runs no pass; `null` is unset.
   `/embedding` and `/embeddings` ignore `model`. An input past the model's context is a 400
   `exceed_context_size_error` naming both lengths. llama-server checks its physical batch first and answers an input

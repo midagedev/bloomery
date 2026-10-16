@@ -73,6 +73,7 @@ pub(super) fn open(side: &Side, seat: &EncoderSeat) -> Result<Box<dyn Embed>, St
             vision,
             tok,
             name,
+            path: side.path.display().to_string(),
             dims,
         }))
     };
@@ -85,6 +86,7 @@ struct Model {
     vision: Option<Resident>,
     tok: Arc<Vocab>,
     name: String,
+    path: String,
     dims: Vec<usize>,
 }
 
@@ -106,6 +108,10 @@ impl Embed for Model {
 
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    fn path(&self) -> String {
+        self.path.clone()
     }
 
     fn ctx(&self) -> usize {

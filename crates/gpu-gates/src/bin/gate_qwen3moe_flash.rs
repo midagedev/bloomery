@@ -161,6 +161,8 @@
 //! captured launch replaying the eager bits in `3 · group/8` nodes, a launch
 //! and two copies a sub-group; a group that is not a multiple of eight and a
 //! scratch shorter than the launch refused by name, nothing enqueued.
+//! The referee reads the full cache planes from key zero (`first = 0`);
+//! `p0` is the query's prefix length, not a cut of those planes.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -1772,8 +1774,15 @@ mod gate {
                 let y_nan = run_pref(k, gpu, &qd, &counts, (&c.kn, &c.vn), &g, Some(&mut scratch))?;
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &y_nan));
                 let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
-                let (band, worst) =
-                    judge_prefill::<HEAD, PREF_TILE>(&q, &cu, &c.host, &y, g.scale, (n_head, n_kv));
+                let (band, worst) = judge_prefill::<HEAD, PREF_TILE>(
+                    &q,
+                    &cu,
+                    &c.host,
+                    &y,
+                    g.scale,
+                    (n_head, n_kv),
+                    0,
+                );
                 // Each key head's plane twice: twin key head `j` is `j / 2`,
                 // so head `h` of the twin's group-of-eight launch reads the
                 // real key head `h / 16`.

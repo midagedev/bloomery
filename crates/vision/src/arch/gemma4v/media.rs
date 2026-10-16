@@ -55,6 +55,24 @@ pub fn conv_pixels(encoded: &[u16]) -> Result<Vec<f32>, VisionError> {
         .collect()
 }
 
+/// Prepare already sampled RGB frames in input order, without timestamps or truncation.
+pub fn prepare_video(frames: &[Rgb8], patch: usize) -> Result<Vec<Prepared>, VisionError> {
+    if frames.is_empty() || frames.len() > super::VIDEO_FRAMES {
+        return Err(VisionError::Limits {
+            detail: format!(
+                "gemma4v video takes 1 to {} decoded frames",
+                super::VIDEO_FRAMES
+            ),
+        });
+    }
+    let media = Media::new(SizeRule::new(
+        patch,
+        super::MERGE,
+        crate::arch::TokenLimits::new(70, super::VIDEO_TOKENS)?,
+    )?);
+    frames.iter().map(|frame| media.prepare(frame)).collect()
+}
+
 /// The image preparation rule; the side seat inserts delimiters through its tokenizer.
 #[derive(Clone, Copy, Debug)]
 pub struct Media {

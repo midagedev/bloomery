@@ -47,6 +47,7 @@ pub(super) struct Side {
     embed: Mutex<Box<dyn Embed>>,
     tok: Arc<dyn Tokenizer>,
     pub(super) name: String,
+    pub(super) path: String,
     pub(super) ctx: usize,
     dims: Vec<usize>,
     media: Option<media::SharedMediaModel>,
@@ -65,6 +66,7 @@ impl Side {
             media: embed.media(),
             tok: embed.tokenizer(),
             name: embed.name(),
+            path: embed.path(),
             ctx: embed.ctx(),
             dims,
             embed: Mutex::new(embed),
@@ -561,14 +563,58 @@ mod tests {
             &json!({ "input": "a", "encoding_format": "f16" }),
         );
         assert_eq!(status, 400, "{v}");
+    }
 
-        let (status, text) = roundtrip(addr, "GET", "/v1/models", &[], "");
-        let v: Value = serde_json::from_str(&text).expect("json");
-        assert_eq!(status, 200);
-        assert_eq!(v["data"][1]["id"], "mock-embd");
-        assert_eq!(v["data"][1]["meta"]["n_embd"], 4);
-        assert_eq!(v["data"][1]["meta"]["n_ctx"], 32);
-        assert!(v["data"][1]["meta"].get("n_ctx_train").is_none());
+    /// Discovery lists every seated model and reports the side model's file only when present.
+    #[test]
+    fn discovery_names_the_seated_models() {
+        for side in [None, Some(MockEmbed::new(32))] {
+            let has_side = side.is_some();
+            let (addr, state, calls, _) = serve(side);
+            let mut data = vec![json!({
+                "id": "mock",
+                "object": "model",
+                "created": state.start_unix,
+                "owned_by": "bloomery",
+                "meta": { "n_vocab": state.info.n_vocab, "n_ctx_train": 64 },
+                "max_model_len": 64,
+            })];
+            let mut names = vec![json!({ "name": "mock", "model": "mock" })];
+            if has_side {
+                data.push(json!({
+                    "id": "mock-embd",
+                    "object": "model",
+                    "created": state.start_unix,
+                    "owned_by": "bloomery",
+                    "meta": { "n_ctx": 32, "n_embd": 4 },
+                    "max_model_len": 32,
+                }));
+                names.push(json!({ "name": "mock-embd", "model": "mock-embd" }));
+            }
+            for path in ["/v1/models", "/models"] {
+                let (status, body) = roundtrip(addr, "GET", path, &[], "");
+                assert_eq!(status, 200, "{path}: {body}");
+                let v: Value = serde_json::from_str(&body).expect("models JSON");
+                assert_eq!(
+                    v,
+                    json!({ "object": "list", "data": data, "models": names })
+                );
+            }
+            let (status, body) = roundtrip(addr, "GET", "/props", &[], "");
+            assert_eq!(status, 200, "{body}");
+            let v: Value = serde_json::from_str(&body).expect("props JSON");
+            assert_eq!(v["model_alias"], "mock");
+            assert_eq!(v["model_path"], state.model_path);
+            if has_side {
+                assert_eq!(
+                    v["embedding_model"],
+                    json!({ "alias": "mock-embd", "path": "/models/mock-embd.gguf" })
+                );
+            } else {
+                assert!(v.get("embedding_model").is_none(), "{v}");
+            }
+            assert!(calls.lock().expect("calls").is_empty());
+        }
     }
 
     /// Which inputs a request holds and the ids each passes, as llama-server splits and

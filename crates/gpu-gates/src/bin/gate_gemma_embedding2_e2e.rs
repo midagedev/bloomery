@@ -276,6 +276,23 @@ mod gate {
         Ok(ok && same)
     }
 
+    fn pooled(
+        key: &str,
+        pooled: &[f32],
+        card: &RefManifest,
+        cpu: &RefManifest,
+    ) -> Result<bool, GateError> {
+        let norm = serve::embed::normalize(pooled, serve::embed::Norm::default())?;
+        let mut ok = true;
+        for (node, ours) in [("raw", pooled), ("embd", &norm)] {
+            let key = format!("{key}/{node}");
+            let expected = crate::image::row(card, &key, [768, 1, 1, 1])?;
+            let twin = crate::image::row(cpu, &key, [768, 1, 1, 1])?;
+            ok &= crate::image::compare(&key, ours, &expected, &twin);
+        }
+        Ok(ok)
+    }
+
     fn images(enc: &mut Encoder, model: &Path) -> Result<bool, GateError> {
         use crate::image;
         use bloomery_gpu::media::MediaSpan;
@@ -350,21 +367,88 @@ mod gate {
                     }],
                     false,
                 )?;
-                let norm = serve::embed::normalize(&pass.pooled, serve::embed::Norm::default())?;
-                for (node, ours) in [("raw", &pass.pooled), ("embd", &norm)] {
-                    let key = format!("{key}/{node}");
-                    let expected = image::row(&server, &key, [768, 1, 1, 1])?;
-                    let twin = image::row(&server_cpu, &key, [768, 1, 1, 1])?;
-                    ok &= image::compare(
-                        &format!("(i) {key} pass_media {} positions", ids.len()),
-                        ours,
-                        &expected,
-                        &twin,
-                    );
-                }
+                ok &= pooled(&key, &pass.pooled, &server, &server_cpu)?;
             }
         }
+        ok &= video(enc, &mut tower, &tok, hp.patch, &stream, (&card, &cpu))?;
         Ok(ok)
+    }
+
+    fn video(
+        enc: &mut Encoder,
+        tower: &mut bloomery_gpu_vision::gemma4v::Encoder,
+        tok: &bloomery_gpu_gates::bind::Vocab,
+        patch: usize,
+        stream: &std::sync::Arc<cuda_core::CudaStream>,
+        images: (&RefManifest, &RefManifest),
+    ) -> Result<bool, GateError> {
+        use crate::image;
+        use bloomery_gpu::media::MediaSpan;
+        use refset::arch::gemma_embedding2::{VIDEO, VIDEO_CPU, VIDEO_IMAGES, VIDEO_PREFIX};
+        use serve::embeddings::{InputPart, assemble};
+        use vision::arch::gemma4v;
+
+        let video = image::open(&VIDEO)?;
+        let video_cpu = image::open(&VIDEO_CPU)?;
+        let frames = VIDEO_IMAGES
+            .lines()
+            .enumerate()
+            .map(|(index, name)| {
+                let (rgb, digest) = image::image(&video, &video_cpu, &format!("frame_{index}"))?;
+                if image::image(images.0, images.1, name)?.1 != digest {
+                    return Err(format!("video frame {index}: expected {name}'s bytes").into());
+                }
+                Ok(rgb)
+            })
+            .collect::<Result<Vec<_>, GateError>>()?;
+        let prepared = gemma4v::prepare_video(&frames, patch)?;
+        let mut parts = vec![InputPart::Text(VIDEO_PREFIX)];
+        parts.extend(prepared.iter().map(|p| InputPart::Image {
+            begin: gemma4v::IMAGE_BEGIN,
+            end: gemma4v::IMAGE_END,
+            positions: p.span_len,
+        }));
+        let assembled = assemble(parts.into_iter().map(Ok), tok, CARD_CTX)?;
+        let expected = format!(
+            "# video\tvideo\tframes {}\tprompt_tokens {}",
+            frames.len(),
+            assembled.ids.len()
+        );
+        for man in [&video, &video_cpu] {
+            let lines = man
+                .header
+                .other
+                .iter()
+                .filter(|l| l.starts_with("# video\t"))
+                .collect::<Vec<_>>();
+            if lines != [&expected] {
+                return Err("video frame count or position count differs from reference".into());
+            }
+            let frame_count = man
+                .header
+                .other
+                .iter()
+                .filter(|l| l.starts_with("# image\t"))
+                .count();
+            if frame_count != frames.len() {
+                return Err("video reference has an unexpected frame count".into());
+            }
+        }
+        let rows = prepared
+            .iter()
+            .map(|p| Ok(tower.encode(p.grid()?)?.rows.buf().to_host_vec(stream)?))
+            .collect::<Result<Vec<_>, GateError>>()?;
+        let spans = assembled
+            .spans
+            .iter()
+            .zip(&rows)
+            .map(|(at, rows)| MediaSpan {
+                at: at.clone(),
+                rows,
+            })
+            .collect::<Vec<_>>();
+        let pass = enc.pass_media(&assembled.ids, &spans, false)?;
+        pooled("video", &pass.pooled, &video, &video_cpu)
     }
 
     pub fn run() -> Result<(), GateError> {

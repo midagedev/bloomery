@@ -63,18 +63,18 @@ BLOOMERY_GATE_BOUND=${EMB2_BOUND-1500} gate_bound "emb2 (EMB2_BOUND)" || exit $?
 # Outside the runner, a call with a card step: the card steps in one call through the runner, then the twins, each a call of
 # its own.
 card_steps=()
-for s in text tower server; do
+for s in text tower server video; do
   if selected "$s"; then card_steps+=("$s"); fi
 done
 if [ "$(basename "${BASH_SOURCE[0]}")" != emb2_dump ] && [ ${#card_steps[@]} -gt 0 ]; then
   mkdir -p target/release
-  ln -sf ../../tools/ref/emb2/emb2.sh target/release/emb2_dump
+  ln -sf "$REAL" target/release/emb2_dump
   # box.sh's BLOOMERY_CARD=a6000|both names the card; under its 3090 pin the runner takes whichever card is idle
   case "${BLOOMERY_BOX_CARD:-}" in
     a6000 | both) BLOOMERY_GATE_BOUND=$BOUND bash tools/gpu-gate.sh emb2_dump "${card_steps[@]}" ;;
     *) BLOOMERY_GATE_BOUND=$BOUND BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh emb2_dump "${card_steps[@]}" ;;
   esac
-  for s in text.cpu tower.cpu server.cpu; do
+  for s in text.cpu tower.cpu server.cpu video.cpu; do
     if selected "$s"; then bash "$REAL" "$s"; fi
   done
   exit 0
@@ -193,15 +193,20 @@ publish() { # <staging> <final>: the old set stays whole until the new one has i
 
 case_args=()
 while IFS= read -r id; do case_args+=(--case "$id"); done < <(awk -F'\t' '$1 ~ /^cases\// { print $1 }' "$IDS/MANIFEST.tsv" 2> /dev/null)
-image_args=()
-for name in "${IMAGES[@]}"; do
-  [ -f "tools/ref/clefvis/images/$name.png" ] || die "no image tools/ref/clefvis/images/$name.png"
-  image_args+=(--image "$name=tools/ref/clefvis/images/$name.png")
-done
+image_inputs() {
+  local name
+  image_args=()
+  for name in "$@"; do
+    [ -f "tools/ref/clefvis/images/$name.png" ] || die "no image tools/ref/clefvis/images/$name.png"
+    image_args+=(--image "$name=tools/ref/clefvis/images/$name.png")
+  done
+}
+image_inputs "${IMAGES[@]}"
 
 server_step() {
-  local stage=$1 card_name=$2 device=$3 port=${EMB2_PORT:-8097} up='' log flags media_args
-  log=$DATA/${SETPFX}_server
+  local stage=$1 card_name=$2 device=$3 kind=$4 port=${EMB2_PORT:-8097} up='' log flags media_args inputs
+  local image_args=("${image_args[@]}")
+  log=$DATA/${SETPFX}_$kind
   if [ "$device" = cpu ]; then log+=.cpu; fi
   log+=.log
   if (: < "/dev/tcp/127.0.0.1/$port") 2> /dev/null; then
@@ -210,9 +215,21 @@ server_step() {
   flags=(-m "$MODEL" --embeddings --pooling mean -c "$EMBED_CONTEXT" -b "$EMBED_CONTEXT" -ub "$EMBED_CONTEXT" -np 1 -ngl 99
     --host 127.0.0.1 --port "$port" --no-webui)
   media_args=()
+  inputs=("${case_args[@]}")
   if [ -n "${MMPROJ:-}" ]; then
     flags+=(--mmproj "$MMPROJ")
-    media_args=(--mmproj "$MMPROJ" --mmproj-sha256 "$MMPROJ_SHA256" "${image_args[@]}" --mix-image free-448x448)
+    if [ "$kind" = video ]; then
+      : "${VIDEO_IMAGES[*]:?the profile names VIDEO_IMAGES}"
+      image_inputs "${VIDEO_IMAGES[@]}"
+    fi
+    media_args=(--mmproj "$MMPROJ" --mmproj-sha256 "$MMPROJ_SHA256" "${image_args[@]}")
+    if [ "$kind" = video ]; then
+      flags+=(--image-max-tokens 140 --video-fps 1 --video-timestamp-interval 0)
+      media_args+=(--frames)
+      inputs=()
+    else
+      media_args+=(--mix-image free-448x448)
+    fi
   fi
   local cpu=()
   if [ "$device" = cpu ]; then
@@ -230,7 +247,7 @@ server_step() {
   [ -n "$up" ] || die "llama-server did not come up (log: $log)" 1
   timeout --kill-after=10 "$BOUND" python3 tools/ref/emb2/server_vectors.py --url "http://127.0.0.1:$port" --pid "$server_pid" \
     "${cpu[@]}" --model "$MODEL" --arch "$MODEL_NAME" --model-sha256 "$MODEL_SHA256" --card "$card_name" \
-    --build-record "$BIN.build" --ids-dir "$IDS" "${case_args[@]}" --out "$stage" "${media_args[@]}" \
+    --build-record "$BIN.build" --ids-dir "$IDS" "${inputs[@]}" --out "$stage" "${media_args[@]}" \
     --server-flags "${flags[*]}"
   kill "$server_pid"
   wait "$server_pid" 2> /dev/null || true
@@ -267,10 +284,10 @@ for s in "${ALL[@]}"; do
       "${run[@]}" timeout --kill-after=10 "$BOUND" "$BIN" "${args[@]}" "${where[@]}" -t "$THREADS" --build-record "$BIN.build" \
         --out "$stage"
       ;;
-    server | server.cpu)
-      ids_current
-      if [ "$s" = server.cpu ]; then card_name=cpu; device=cpu; else card_name=$(card); device=cuda; fi
-      server_step "$stage" "$card_name" "$device"
+    server | server.cpu | video | video.cpu)
+      if [ "${s%.cpu}" = server ]; then ids_current; fi
+      if [ "${s#*.}" = cpu ]; then card_name=cpu; device=cpu; else card_name=$(card); device=cuda; fi
+      server_step "$stage" "$card_name" "$device" "${s%.cpu}"
       ;;
   esac
   publish "$stage" "$set_dir"

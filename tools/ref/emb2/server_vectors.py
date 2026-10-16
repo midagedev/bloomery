@@ -223,13 +223,20 @@ def main() -> None:
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--build-record", required=True, type=Path)
     ap.add_argument("--ids-dir", required=True, type=Path)
-    ap.add_argument("--case", action="append", required=True)
+    ap.add_argument("--case", action="append", default=[])
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--image", action="append", default=[])
     ap.add_argument("--mix-image")
+    ap.add_argument("--frames", action="store_true", help="one ordered decoded-frame input from --image")
     ap.add_argument("--server-flags", default="")
     a = ap.parse_args()
 
+    if not a.case and not a.image:
+        ap.error("at least one --case or --image is required")
+    if a.frames and (not a.image or a.mix_image or a.case):
+        ap.error("--frames takes only ordered --image inputs")
+    if a.frames and (a.arch != "gemma-embedding2" or len(a.image) > 32):
+        ap.error("--frames requires gemma-embedding2 and at most 32 images")
     if a.cpu and os.environ.get("CUDA_VISIBLE_DEVICES") != "":
         raise SystemExit("server_vectors: --cpu requires CUDA_VISIBLE_DEVICES empty")
     build = os.environ.get("BLOOMERY_REF_BUILD", "")
@@ -275,10 +282,24 @@ def main() -> None:
         if got != want or n != len(want):
             raise SystemExit(f"server_vectors: {name}: the server's ids are not the oracle's ({same}, prompt_tokens {n})")
 
-    for name, entry, png, data in image_entries(a.image, a.mix_image):
-        n = pooled_rows(w, a.url, name, entry, False)
-        suffix = "\ttext first" if name.startswith("mix_") else ""
-        w.header.append(f"# image\t{name}\t{png}\t{hashlib.sha256(data).hexdigest()}\tprompt_tokens {n}{suffix}")
+    images = list(image_entries(a.image, a.mix_image))
+    if a.frames:
+        flags = a.server_flags.split()
+        for flag, value in (("--image-max-tokens", "140"), ("--video-fps", "1"), ("--video-timestamp-interval", "0")):
+            if flags.count(flag) != 1 or flags.index(flag) + 1 >= len(flags) or flags[flags.index(flag) + 1] != value:
+                ap.error(f"--frames requires {flag} {value} in --server-flags")
+        entry = {"content": [{"type": "text", "text": "Video:"}] + [
+            part for _, image, _, _ in images for part in image["content"]
+        ]}
+        n = pooled_rows(w, a.url, "video", entry, False)
+        w.header.append(f"# video\tvideo\tframes {len(images)}\tprompt_tokens {n}")
+        for index, (_, _, png, data) in enumerate(images):
+            w.header.append(f"# image\tframe_{index}\t{png}\t{hashlib.sha256(data).hexdigest()}")
+    else:
+        for name, entry, png, data in images:
+            n = pooled_rows(w, a.url, name, entry, False)
+            suffix = "\ttext first" if name.startswith("mix_") else ""
+            w.header.append(f"# image\t{name}\t{png}\t{hashlib.sha256(data).hexdigest()}\tprompt_tokens {n}{suffix}")
     check_server(a, build)
     w.finish()
     print(f"server_vectors: {len(w.rows)} row(s) into {a.out}")

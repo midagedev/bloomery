@@ -35,8 +35,12 @@ MMPROJ_SHA256=d2033b3cd0223cfb2e7a2b50dc80a664c78c816d375f5b017ec3ef80ee0bc766
 : "${LCPP:=/home/user/llama.cpp-6868a52c}"
 LCPP_PIN=6868a52cb337450658006ad2f9281c2eb63f1666
 IMAGES=(small-200x200 min-96x64 free-448x448 free-640x480 pad-777x513 strip-1000x1 free-1024x768)
+VIDEO_IMAGES=()
+while IFS= read -r image; do
+  VIDEO_IMAGES+=("$image")
+done < "$(dirname "${BASH_SOURCE[0]}")/../../../crates/refset/src/arch/gemma_embedding2/video-frames.txt"
 
 EMBED_VOCAB=gemma4
 EMBED_CASES=cases-gemma4.txt
 EMBED_CONTEXT=8192
-EMBED_STEPS=(text tower server text.cpu tower.cpu server.cpu)
+EMBED_STEPS=(text tower server video text.cpu tower.cpu server.cpu video.cpu)

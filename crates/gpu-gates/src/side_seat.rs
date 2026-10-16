@@ -289,6 +289,7 @@ pub struct SideEngine {
     thread: Option<JoinHandle<()>>,
     tokenizer: Arc<dyn Tokenizer>,
     name: String,
+    path: String,
     ctx: usize,
     dims: Vec<usize>,
     media: Option<serve::media::SharedMediaModel>,
@@ -320,6 +321,7 @@ impl SideEngine {
                 let facts = (
                     model.tokenizer(),
                     model.name(),
+                    model.path(),
                     model.ctx(),
                     model.dims(),
                     model.media(),
@@ -348,7 +350,7 @@ impl SideEngine {
                 }
             })
             .map_err(|e| format!("starting the embedding model's thread: {e}"))?;
-        let (tokenizer, name, ctx, dims, media) = match opened.recv() {
+        let (tokenizer, name, path, ctx, dims, media) = match opened.recv() {
             Ok(Ok(facts)) => facts,
             refused => {
                 // The thread ended with its open; nothing is left on its card.
@@ -364,6 +366,7 @@ impl SideEngine {
             thread: Some(thread),
             tokenizer,
             name,
+            path,
             ctx,
             dims,
             media,
@@ -396,6 +399,10 @@ impl Embed for SideEngine {
 
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    fn path(&self) -> String {
+        self.path.clone()
     }
 
     fn ctx(&self) -> usize {
@@ -590,6 +597,9 @@ mod tests {
         fn name(&self) -> String {
             "stub".to_owned()
         }
+        fn path(&self) -> String {
+            "/models/stub.gguf".to_owned()
+        }
         fn ctx(&self) -> usize {
             8
         }
@@ -628,8 +638,13 @@ mod tests {
         })
         .expect("open");
         assert_eq!(
-            (engine.name(), engine.ctx(), engine.dims()),
-            ("stub".to_owned(), 8, vec![1])
+            (engine.name(), engine.path(), engine.ctx(), engine.dims()),
+            (
+                "stub".to_owned(),
+                "/models/stub.gguf".to_owned(),
+                8,
+                vec![1]
+            )
         );
         assert_eq!(engine.embed(&[5, 6]).expect("a pass"), vec![2.0]);
         let e = engine.embed(&[0]).expect_err("the panic");

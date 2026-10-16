@@ -1,6 +1,6 @@
 use super::{
     ARCH, MMPROJ_BF16, MMPROJ_BF16_SHA256, MODEL, MODEL_SHA256, PROFILE, SERVER, SERVER_CPU, TEXT,
-    TEXT_CPU, TOWER, TOWER_CPU,
+    TEXT_CPU, TOWER, TOWER_CPU, VIDEO, VIDEO_CPU,
 };
 use crate::RefError;
 use crate::emb2::tests::{check, header, remove, set_dir};
@@ -40,13 +40,15 @@ type FileCase<'a> = (Kind, &'a Family, Vec<(&'a str, &'a str)>, &'a str);
 /// the trailer is written, and the text the error names.
 type RefusedCase<'a> = (Kind, &'a Family, (&'a str, &'a str), bool, &'a str);
 
-const ALL: [(Kind, &Family); 6] = [
+const ALL: [(Kind, &Family); 8] = [
     (Kind::Text, &TEXT),
     (Kind::TextCpu, &TEXT_CPU),
     (Kind::Tower, &TOWER),
     (Kind::TowerCpu, &TOWER_CPU),
     (Kind::Server, &SERVER),
     (Kind::ServerCpu, &SERVER_CPU),
+    (Kind::Server, &VIDEO),
+    (Kind::ServerCpu, &VIDEO_CPU),
 ];
 
 /// Each family takes a set of its own kind and device, of the pinned files,

@@ -893,6 +893,10 @@ impl crate::embed::Embed for MockEmbed {
         "mock-embd".to_owned()
     }
 
+    fn path(&self) -> String {
+        "/models/mock-embd.gguf".to_owned()
+    }
+
     fn ctx(&self) -> usize {
         self.ctx
     }

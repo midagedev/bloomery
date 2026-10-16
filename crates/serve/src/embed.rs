@@ -23,6 +23,8 @@ pub trait Embed: Send {
     fn tokenizer(&self) -> Arc<dyn Tokenizer>;
     /// The model's name: its `/v1/models` id and the `model` every OpenAI answer carries.
     fn name(&self) -> String;
+    /// The model file, reported as `/props`' `embedding_model.path`.
+    fn path(&self) -> String;
     /// The most positions one input takes.
     fn ctx(&self) -> usize;
     /// The widths a request's `dimensions` may cut the pooled vector to, ascending; the last is

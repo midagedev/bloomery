@@ -7,7 +7,7 @@ mod media;
 pub mod tensors;
 
 pub use hparams::Hparams;
-pub use media::{Media, conv_pixels, preprocess};
+pub use media::{Media, conv_pixels, prepare_video, preprocess};
 
 /// The projector type of the vision half of a Gemma4 multimodal file.
 pub const PROJECTOR_TYPE: &str = "gemma4v";
@@ -17,12 +17,46 @@ pub const MERGE: usize = 3;
 pub const IMAGE_BEGIN: &str = "<|image>";
 /// The tokenizer spelling after an image's rows.
 pub const IMAGE_END: &str = "<image|>";
+/// The checkpoint's pooled-token budget for each decoded video frame.
+pub(crate) const VIDEO_TOKENS: usize = 140;
+/// The checkpoint's maximum number of decoded frames in one input.
+pub(crate) const VIDEO_FRAMES: usize = 32;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::size::SizeRule;
     use crate::{Rgb8, arch::TokenLimits};
+
+    #[test]
+    fn decoded_video_preserves_frames_and_bounds_each_canvas() {
+        let frames = [
+            Rgb8::filled(777, 513, [255, 0, 0]),
+            Rgb8::filled(200, 200, [0, 0, 255]),
+        ];
+        let prepared = prepare_video(&frames, 16).unwrap();
+        assert_eq!(prepared.len(), frames.len());
+        for (frame, prepared) in frames.iter().zip(&prepared) {
+            let p = prepared.grid().unwrap();
+            let rule =
+                SizeRule::new(16, MERGE, TokenLimits::new(70, VIDEO_TOKENS).unwrap()).unwrap();
+            let expected = preprocess(frame, &rule).unwrap();
+            assert_eq!(
+                (p.plan.best_w, p.plan.best_h),
+                rule.aligned(frame.width, frame.height).unwrap()
+            );
+            assert_eq!(p.bf16, expected.bf16);
+            assert_eq!(prepared.span_len, p.plan.n_llm_w * p.plan.n_llm_h);
+            assert!(prepared.span_len <= 140);
+        }
+        let bound = vec![Rgb8::filled(1, 1, [0; 3]); 32];
+        assert_eq!(prepare_video(&bound, 16).unwrap().len(), 32);
+        assert!(prepare_video(&vec![bound[0].clone(); 33], 16).is_err());
+        assert!(prepare_video(&[], 16).is_err());
+        assert!(prepare_video(&[Rgb8::filled(0, 1, [0; 3])], 16).is_err());
+        let error = prepare_video(&[Rgb8::filled(1000, 1, [0; 3])], 16).unwrap_err();
+        assert!(error.to_string().contains("exceeds the image token budget"));
+    }
 
     #[test]
     fn gemma4v_canvas_and_patch_order() {

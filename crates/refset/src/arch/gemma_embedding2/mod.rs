@@ -79,6 +79,14 @@ pub const TOWER_GATE: &str = "gate-gpu-gemma4v-tower";
 pub const SERVER_SET: &str = "ref_gemma_embedding2_server";
 pub const SERVER_CPU_SET: &str = "ref_gemma_embedding2_server.cpu";
 
+/// Frame identities in the decoded-video reference input, in sequence order.
+pub const VIDEO_IMAGES: &str = include_str!("video-frames.txt");
+/// The pinned mainline video helper's text before the first frame.
+pub const VIDEO_PREFIX: &str = "Video:";
+/// Ordered decoded-frame vectors at the checkpoint's video token budget.
+pub const VIDEO_SET: &str = "ref_gemma_embedding2_video";
+pub const VIDEO_CPU_SET: &str = "ref_gemma_embedding2_video.cpu";
+
 /// A row's band in the encoder and serving gates: this many times the CPU
 /// twin's distance from the card set (`shared/glm5next_media.rs`'s `TWIN`,
 /// the Qwen seats' rule).
@@ -222,6 +230,33 @@ pub static SERVER_CPU: Family = Family {
     )
 };
 
+/// llama-server's timestamp-free decoded-frame sequence.
+pub static VIDEO: Family = Family {
+    consumers: E2E,
+    ..family(
+        "video-gemma-embedding2",
+        &[VIDEO_SET],
+        Kind::Server,
+        &PROFILE,
+        ARCH,
+        model,
+        RECIPE,
+    )
+};
+/// The same decoded frames with both models on the CPU.
+pub static VIDEO_CPU: Family = Family {
+    consumers: E2E,
+    ..family(
+        "video-gemma-embedding2-cpu",
+        &[VIDEO_CPU_SET],
+        Kind::ServerCpu,
+        &PROFILE,
+        ARCH,
+        model,
+        RECIPE,
+    )
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
 pub static FAMILIES: &[&Family] = &[
     &TEXT,
@@ -231,6 +266,8 @@ pub static FAMILIES: &[&Family] = &[
     &SERVER,
     &SERVER_CPU,
     &AUDIO_MEL,
+    &VIDEO,
+    &VIDEO_CPU,
 ];
 
 #[cfg(test)]
