@@ -9,10 +9,9 @@ use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside;
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
-use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::place as q35;
 use model::arch::{QWEN35_BODY, is_qwen35_body};
-use model::placement::workstation::CardSpec;
+use model::placement::workstation::{self, CardSpec};
 use model::placement::{KvBytes, Machine, WholeNeed, whole_need};
 use std::path::Path;
 
@@ -129,7 +128,7 @@ pub fn open_shape(ctx: usize, media: bool) -> Open35 {
 
 /// The whole-fit verdict of `o` on `card` (`placement::whole_need`): every
 /// tensor's granules, the cache of `o.ctx` rows, the card the program's plan
-/// lays out (`q3::machine`), the ubatch arena with the reserve the load's own
+/// lays out (`workstation::placed_with_arena`), the ubatch arena with the reserve the load's own
 /// fit check keeps free past it (`GpuModel::whole_load`), and what `seat`
 /// puts on the machine. The caller prints it.
 pub fn whole_verdict(
@@ -142,7 +141,7 @@ pub fn whole_verdict(
     let layers = inputs.hp.n_trunk;
     let ctx = u64::try_from(o.ctx)?;
     let kv = (0..layers).map(|l| inputs.kv.layer_bytes(l, ctx)).sum();
-    let mut machine = q3::machine(card, layers, 0);
+    let mut machine = workstation::placed_with_arena(card, layers, 0);
     seat(&mut machine);
     let name = card.name;
     let view = machine

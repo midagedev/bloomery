@@ -270,6 +270,22 @@ pub fn placed_on(spec: CardSpec, layers: usize, scratch: u64) -> Machine {
     machine
 }
 
+/// [`placed_on`] with the m = 1 scratch ([`SCRATCH`]) plus `arena` bytes: what
+/// a program's prompt arenas hold beyond it, which the program sizes and its
+/// load refuses to pass ([`counted_arena_bytes`]).
+#[must_use]
+pub fn placed_with_arena(spec: CardSpec, layers: usize, arena: u64) -> Machine {
+    placed_on(spec, layers, SCRATCH + arena)
+}
+
+/// The prompt-arena bytes a plan made by [`placed_with_arena`] counts on
+/// `card`: its scratch past the m = 1 scratch. A load whose arenas hold more
+/// is refused by name.
+#[must_use]
+pub const fn counted_arena_bytes(card: &Card) -> u64 {
+    card.scratch_bytes.saturating_sub(SCRATCH)
+}
+
 /// Design §5 (a): the A6000 runs all `layers` and the head; the 3090 is idle.
 #[must_use]
 pub fn plan_a(layers: usize) -> Machine {
@@ -1202,10 +1218,10 @@ mod tests {
         A6000, ArenaGrant, CONTEXT, Card, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceId,
         DeviceInfo, GRANULE, HOST_DRIFT, Host, HostNeed, HostRead, MARGIN, Machine, Node,
         PLAN_ROOM, PlacementError, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
-        TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room, cgroup_v2_path, gb10, host,
-        host_of, host_room, mem_available, placed_on, plan_a, plan_a_draft, plan_bp, plan_gate,
-        plan_node_tiers, plan_on, plan_room, plan_tiers, spec_of_device, tier_batch_bytes,
-        unified_of,
+        TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room, cgroup_v2_path,
+        counted_arena_bytes, gb10, host, host_of, host_room, mem_available, placed_with_arena,
+        plan_a, plan_a_draft, plan_bp, plan_gate, plan_node_tiers, plan_on, plan_room, plan_tiers,
+        spec_of_device, tier_batch_bytes, unified_of,
     };
 
     /// One plan room: `tools/ref/plan-room.sh --room`, the room
@@ -1573,12 +1589,14 @@ mod tests {
     }
 
     /// A placed load's machine holds every layer, the head and the token
-    /// embedding on its one card at the program's scratch, with this
+    /// embedding on its one card at the m = 1 scratch plus the program's
+    /// arena, which the plan counts back ([`counted_arena_bytes`]), with this
     /// machine's context, margin and granule and the spec's host.
     #[test]
     fn a_placed_load_holds_the_whole_model_at_its_scratch() {
         for spec in [RTX_3090, A6000] {
-            let m = placed_on(spec, 40, SCRATCH + 7);
+            let m = placed_with_arena(spec, 40, 7);
+            assert_eq!(counted_arena_bytes(&m.cards[0]), 7, "{}", spec.name);
             let want = Card {
                 name: spec.name.to_string(),
                 device: spec.device,
