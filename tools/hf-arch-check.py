@@ -93,14 +93,14 @@ ROW_BUDGET = 64 * MIB
 # fails on any name in one and not the other.
 
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::serves — the architecture strings each generative seat
-# serves. The glm seat reads its names through Arch::from_name (SERVES_VIA_FROM_NAME).
+# serves. The glm and nemotron seats read their names through Arch::from_name (SERVES_VIA_FROM_NAME).
 SERVES = {
     "ds41": ("deepseek41", "deepseek4"),
     "qwen38": ("qwen4exp",),
     "qwen3": ("qwen3moe", "qwen35moe"),
     "mimo2": ("mimo2",),
 }
-SERVES_VIA_FROM_NAME = {"glm": "Glm5next", "nemotron": "NemotronH"}
+SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "nemotron": ("NemotronH", "NemotronHMoe")}
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::ALL and Model::word — the generative seats in the order
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
 SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "nemotron")
@@ -195,7 +195,7 @@ SEAT_WORDS = SEAT_ORDER + (DECIDE_WORD,)
 def seat_names(seat):
     """The architecture strings of the generative `seat`."""
     if seat in SERVES_VIA_FROM_NAME:
-        return FROM_NAME[SERVES_VIA_FROM_NAME[seat]]
+        return [n for v in SERVES_VIA_FROM_NAME[seat] for n in FROM_NAME[v]]
     return SERVES[seat]
 
 
@@ -1339,7 +1339,7 @@ def src_seat_words(serve, consts_decide):
 
 
 def src_serves(serve, arch_consts, words):
-    """Model::serves: ({seat word: [names]}, {seat word: Arch variant it reads through Arch::from_name})."""
+    """Model::serves: ({seat word: [names]}, {seat word: [Arch variants]} it reads through Arch::from_name)."""
     lo, hi = serve.one_body("serves")
     direct, via = {}, {}
     for pat, (a, b) in serve.match_arms(lo, hi, r"\bmatch\s+self\b"):
@@ -1357,10 +1357,11 @@ def src_serves(serve, arch_consts, words):
             if head == "arch":
                 direct[word] = names_of(serve, rest[0], q, arch_consts)
             elif head == "Arch::from_name(arch)":
-                v = re.fullmatch(r"\s*Ok\(Arch::(\w+)\)\s*", tail)
-                if not v:
+                v = re.fullmatch(r"\s*Ok\((.*)\)\s*", tail, re.S)
+                alts = re.findall(r"Arch::(\w+)", v.group(1)) if v else []
+                if not v or " | ".join(f"Arch::{a}" for a in alts) != v.group(1).strip():
                     raise serve.err(rest[0], f"a from_name arm this tool cannot read: {tail.strip()!r}")
-                via[word] = v.group(1)
+                via[word] = tuple(alts)
             else:
                 raise serve.err(first[0], f"a matches! head this tool cannot read: {head!r}")
         else:
