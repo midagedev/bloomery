@@ -41,6 +41,15 @@
 //! combine in one pass and every down in one row dispatch, lanes cut by the
 //! tile's cost; the k <= 8 cases above claim their quantizations instead.
 //!
+//! The relu² form — Bolt's ungated experts, an arm of the same union — is held on two
+//! synthetic IQ2_XXS layers of different widths (no model file), served through one scratch
+//! made for the wider: at k = 1, 8, 9 and 64 under both deferral arms the union call,
+//! `experts_into` of every column and a transcription on qdot's own calls (`x` quantized,
+//! each up row dotted, `relu(u)²`, the combine quantized, each down row dotted, the
+//! list-order sum) are the same bits, in the dispatches the call is owed; and the scratch's
+//! expert width is a capacity, so a scratch narrower than the layer, of another embd, or
+//! with no room for a combine column is refused by name.
+//!
 //! The free entry `moe::experts_union_into` (one file, a `MoeBlockPlan`) is
 //! held to its own `experts_into` on V2-Lite's block 1 at k = 6, over seeded
 //! activation columns with lists overlapping by construction. Then every
@@ -109,8 +118,8 @@ use gguf::{GgmlType, Split, Weights};
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
 use model::moe::{
-    HostLayer, HostLayerSpec, HostScratch, UNION_MAX_COLS, UNION_TAIL_MAX_GROUPS, UnionScratch,
-    union_batch_slots,
+    HostLayer, HostLayerSpec, HostScratch, Relu2Spec, UNION_MAX_COLS, UNION_TAIL_MAX_GROUPS,
+    UnionScratch, union_batch_slots,
 };
 use model::ops::{self, RowLayout, Tensor2, Tensor2View};
 use model::placement::workstation;
@@ -1325,9 +1334,10 @@ impl Drop for Q8Layer {
     }
 }
 
-/// A stack `[k, n, n_expert]` of `ty` (Q4_K, Q6_K or Q8_0): xorshift bytes, each block's scales
-/// set finite — Q4_K's `d` 2^-7 and `dmin` 2^-8, Q6_K's `d` 2^-10 (its sixteen i8 scales the
-/// xorshift's), Q8_0's `d` of either sign at 2^-7 .. 2^-3.
+/// A stack `[k, n, n_expert]` of `ty` (Q4_K, Q6_K, Q8_0 or IQ2_XXS): xorshift bytes, each
+/// block's scales set finite — Q4_K's `d` 2^-7 and `dmin` 2^-8, Q6_K's `d` 2^-10 (its sixteen i8
+/// scales the xorshift's), Q8_0's `d` of either sign at 2^-7 .. 2^-3, IQ2_XXS's `d` 2^-10 (every
+/// other bit of its block is a valid grid index, sign or scale).
 fn q8_stack(ty: GgmlType, [k, n, n_expert]: [usize; 3], seed: u64) -> Vec<u8> {
     let (bs, ts) = (
         ty.blck_size().unwrap() as usize,
@@ -1350,6 +1360,7 @@ fn q8_stack(ty: GgmlType, [k, n, n_expert]: [usize; 3], seed: u64) -> Vec<u8> {
                 blk[2..4].copy_from_slice(&0x1C00u16.to_le_bytes());
             }
             GgmlType::Q6_K => blk[208..210].copy_from_slice(&0x1400u16.to_le_bytes()),
+            GgmlType::IQ2_XXS => blk[0..2].copy_from_slice(&0x1400u16.to_le_bytes()),
             GgmlType::Q8_0 => {
                 let r = next();
                 let (exp, mant, sign) = (
@@ -1628,5 +1639,278 @@ fn hw_union_q6_k_down_matches_per_column() {
         "PASSED: union q6_K down — the union call at k = 1, 8, 10 (the last through the row \
          lanes, its Q6_K down included) equal to experts_into bit for bit under both deferral arms \
          and the lane packs' prefetch"
+    );
+}
+
+/// Bolt's routed layers in the one shape that differs from layer to layer: the latent the
+/// experts run in, and two layers' own (ff, expert count) — the scratch is made for the wider.
+const RELU2_EMBD: usize = 1024;
+const RELU2_LAYERS: [(usize, usize); 2] = [(1536, 12), (2560, 16)];
+
+/// Bolt's routed list: nine experts a token, one past [`LIST`].
+const RELU2_USED: usize = 9;
+
+/// The relu² cases' column counts: one column, the widest call that claims, the narrowest that
+/// does not, and one that runs experts through several tile runs.
+const RELU2_KS: [usize; 4] = [1, 8, 9, 64];
+
+const RELU2_UP: &str = "blk.0.ffn_up_exps.weight";
+const RELU2_DOWN: &str = "blk.0.ffn_down_exps.weight";
+
+/// One relu² routed layer — IQ2_XXS up and down, no gate — written with `gguf::write` into
+/// its own directory (removed on drop), and the stacks' bytes the file holds.
+struct Relu2Layer {
+    dir: std::path::PathBuf,
+    source: std::path::PathBuf,
+    up: Vec<u8>,
+    down: Vec<u8>,
+}
+
+impl Relu2Layer {
+    fn write(embd: usize, ff: usize, n_expert: usize) -> Relu2Layer {
+        use gguf::write::{Layout, TensorDecl, Writer};
+        let ty = GgmlType::IQ2_XXS;
+        let dir = std::env::temp_dir().join(format!("relu2layer-{ff}-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("layer.gguf");
+        let up = q8_stack(ty, [embd, ff, n_expert], 0x2e1);
+        let down = q8_stack(ty, [ff, embd, n_expert], 0xd2e1);
+        let stacks = [
+            (RELU2_UP, [embd, ff, n_expert], &up),
+            (RELU2_DOWN, [ff, embd, n_expert], &down),
+        ];
+        let decls: Vec<TensorDecl> = stacks
+            .iter()
+            .map(|&(name, dims, b)| TensorDecl {
+                name: name.to_string(),
+                dims: dims.map(|d| d as u64).to_vec(),
+                type_id: ty.as_u32(),
+                nbytes: b.len() as u64,
+            })
+            .collect();
+        let layout = Layout::new(&[], decls).unwrap();
+        let file = std::io::BufWriter::new(std::fs::File::create(&source).unwrap());
+        let mut w = Writer::new(file, layout).unwrap();
+        for &(name, _, b) in &stacks {
+            w.tensor(name, b).unwrap();
+        }
+        w.finish().unwrap();
+        Relu2Layer {
+            dir,
+            source,
+            up,
+            down,
+        }
+    }
+}
+
+impl Drop for Relu2Layer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// One column of a relu² layer, transcribed from the contract on qdot's own calls and nothing of
+/// the union's or the leg's: `x` quantized once, each listed expert's up row dotted with it,
+/// `relu(u)²` of that row's f32, the combine quantized, each down row dotted with it, and the
+/// list-order sum `o += w · d` from zero.
+fn relu2_column(layer: &Relu2Layer, x: &[f32], list: &[(u32, f32)], ff: usize) -> Vec<f32> {
+    let ty = GgmlType::IQ2_XXS;
+    let embd = x.len();
+    let row = |k: usize| k / ty.blck_size().unwrap() as usize * ty.type_size().unwrap() as usize;
+    let (row_up, row_down) = (row(embd), row(ff));
+    let mut xq = vec![0u8; qdot::col_bytes(ty, embd)];
+    qdot::quantize_col(ty, x, &mut xq);
+    let mut hq = vec![0u8; qdot::col_bytes(ty, ff)];
+    let mut out = vec![0.0f32; embd];
+    for &(e, w) in list {
+        let e = e as usize;
+        let h: Vec<f32> = (0..ff)
+            .map(|r| {
+                let at = (e * ff + r) * row_up;
+                let u = qdot::dot_row(ty, &layer.up[at..at + row_up], &xq, embd).unwrap();
+                let relu = u.max(0.0);
+                relu * relu
+            })
+            .collect();
+        qdot::quantize_col(ty, &h, &mut hq);
+        for (o, cell) in out.iter_mut().enumerate() {
+            let at = (e * embd + o) * row_down;
+            let d = qdot::dot_row(ty, &layer.down[at..at + row_down], &hq, ff).unwrap();
+            *cell += w * d;
+        }
+    }
+    out
+}
+
+/// The relu² form — Bolt's ungated experts — through the common union: on two layers of
+/// different widths and expert counts (IQ2_XXS up and down, the latent 1024 wide), one scratch
+/// made for the wider serves both, and at k = 1, 8, 9 and 64 under both deferral arms the union
+/// call, `experts_into` of every column and `relu2_column`'s transcription on qdot's own calls
+/// are the same bits, in the dispatches the call is owed. A scratch exact for the narrower
+/// layer gives the same bits as the capacity scratch. Then the named refusals of the widths: a
+/// scratch narrower than the layer's ff, one of another embd, and one whose capacity holds no
+/// column encoding.
+#[test]
+#[ignore = "hw: the box's CPU (qdot's fused kernels run on AVX2); reads no model file"]
+fn hw_union_relu2_matches_transcription() {
+    let embd = RELU2_EMBD;
+    let ff_cap = RELU2_LAYERS.iter().map(|&(ff, _)| ff).max().unwrap();
+    let mut us = UnionScratch::new_routed(embd, ff_cap, UNION_MAX_COLS, RELU2_USED)
+        .expect("a scratch for the wider layer");
+    let mut failed: Vec<(usize, usize, &str)> = Vec::new();
+    let mut miscounted: Vec<(usize, usize, &str)> = Vec::new();
+    let mut last = None;
+    for (ff, n_expert) in RELU2_LAYERS {
+        let layer = Relu2Layer::write(embd, ff, n_expert);
+        let split = Split::open(&layer.source).unwrap();
+        let src = R8Source::rows(&split);
+        let host_layer = HostLayer::build_relu2(
+            src,
+            &Relu2Spec {
+                up: RELU2_UP,
+                down: RELU2_DOWN,
+                n_expert,
+                embd,
+                ff,
+            },
+        )
+        .unwrap_or_else(|e| panic!("a relu² layer of IQ2_XXS must build: {e}"));
+        assert_eq!(
+            host_layer.form(),
+            ops::ExpertForm::Relu2,
+            "build_relu2 gives the relu² form"
+        );
+        let x_all: Vec<f32> = (0..4).flat_map(|t| seeded(embd, 0x2e1 + t)).collect();
+        let mut host = HostScratch::new(embd, ff, RELU2_USED).expect("a scratch of nine experts");
+        let mut exact = UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, RELU2_USED)
+            .expect("a scratch exact for the layer");
+        for k in RELU2_KS {
+            let mut case = wide_case(&x_all, embd, k, n_expert, n_expert);
+            // One column carries Bolt's full nine.
+            case.lists[0] = (0..RELU2_USED as u32)
+                .map(|e| (e, 0.1 + 0.01 * e as f32))
+                .collect();
+            let want: Vec<f32> = (0..k)
+                .flat_map(|j| relu2_column(&layer, case.x.col(j), &case.lists[j], ff))
+                .collect();
+            assert!(
+                want.iter().all(|v| v.is_finite()),
+                "ff {ff} k {k}: the transcription gives finite values"
+            );
+            let (lo, hi, past) = cols_per_expert(&case);
+            let column = per_column(&host_layer, src, &case, &mut host);
+            let dd = diff_cells(&column, &want);
+            if dd != 0 {
+                failed.push((ff, k, "experts_into"));
+            }
+            let lists = case.slices();
+            let mut line = format!(
+                "relu2 ff={ff} k={k} slots={} union={} cols_per_expert={lo}..{hi} \
+                 past_one_run={past} experts_into: diff_cells={dd}",
+                case.slots(),
+                case.union()
+            );
+            for (arm, on) in ARMS {
+                ops::set_defer_quant(Some(on));
+                let mut got = vec![f32::NAN; embd * k];
+                let (r, ds, dp) = dispatched(&mut us, |us| {
+                    host_layer.experts_union_into(src, &case.x, &lists, &mut got, us)
+                });
+                let mut got_exact = vec![f32::NAN; embd * k];
+                let r_exact =
+                    host_layer.experts_union_into(src, &case.x, &lists, &mut got_exact, &mut exact);
+                ops::set_defer_quant(None);
+                r.unwrap_or_else(|e| panic!("relu2 ff {ff} k {k} {arm}: {e}"));
+                r_exact.unwrap_or_else(|e| panic!("relu2 ff {ff} k {k} {arm} exact: {e}"));
+                let (d, de) = (diff_cells(&got, &want), diff_cells(&got_exact, &want));
+                let want_d = call_dispatches(k, case.slots(), on);
+                line += &format!(
+                    " {arm}: diff_cells={d} exact_scratch={de} {}",
+                    dispatch_note(ds, dp, want_d)
+                );
+                if d != 0 {
+                    failed.push((ff, k, arm));
+                }
+                if de != 0 {
+                    failed.push((ff, k, "exact scratch"));
+                }
+                if !dispatches_ok(ds, dp, want_d) {
+                    miscounted.push((ff, k, arm));
+                }
+            }
+            println!("{line}");
+        }
+        last = Some((layer, ff));
+    }
+    assert!(
+        failed.is_empty(),
+        "{} (ff, k, call) relu² cases differ from the transcription: {failed:?}",
+        failed.len()
+    );
+    assert!(
+        miscounted.is_empty(),
+        "{} (ff, k, arm) relu² calls issued other than their dispatches: {miscounted:?}",
+        miscounted.len()
+    );
+
+    // The refusals, on the wider layer (the last built).
+    let (layer, ff) = last.expect("two layers ran");
+    let split = Split::open(&layer.source).unwrap();
+    let src = R8Source::rows(&split);
+    let host_layer = HostLayer::build_relu2(
+        src,
+        &Relu2Spec {
+            up: RELU2_UP,
+            down: RELU2_DOWN,
+            n_expert: RELU2_LAYERS[1].1,
+            embd,
+            ff,
+        },
+    )
+    .unwrap();
+    let one = [(0u32, 1.0f32)];
+    let x = Tensor2::zeros(embd, 1);
+    let mut out = vec![0.0f32; embd];
+    for (what, e, ff_made, want) in [
+        (
+            "scratch narrower than the layer's ff",
+            embd,
+            RELU2_LAYERS[0].0,
+            "scratch must be made for the block's widths",
+        ),
+        (
+            "scratch whose capacity holds no column encoding",
+            embd,
+            ff + 1,
+            "scratch must be made for the block's widths",
+        ),
+        (
+            "scratch of another embd",
+            embd / 2,
+            ff,
+            "the scratch must be made for the block's width",
+        ),
+    ] {
+        let mut other = UnionScratch::new_routed(e, ff_made, SMALL_COLS, RELU2_USED)
+            .unwrap_or_else(|err| panic!("{what}: the scratch itself must build: {err}"));
+        let got = refusal(
+            host_layer.experts_union_into(src, &x, &[&one[..]], &mut out, &mut other),
+            what,
+        );
+        assert!(
+            got.contains(want),
+            "{what}: refusal must name {want:?}, got {got:?}"
+        );
+        println!("relu2 refusal ({what}): {got}");
+    }
+    println!(
+        "PASSED: union relu² — IQ2_XXS up and down, ungated: the union call at k = 1, 8, 9, 64 on \
+         two layers of different widths through one scratch made for the wider equal to \
+         experts_into and to the transcription on qdot's calls, bit for bit under both deferral \
+         arms and in their dispatches; the widths' refusals by name"
     );
 }

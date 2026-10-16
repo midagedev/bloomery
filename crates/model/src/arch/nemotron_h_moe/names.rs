@@ -39,3 +39,15 @@ pub const FFN_DOWN_SHEXP: &str = "ffn_down_shexp.weight";
 pub fn ffn_gate_inp(l: usize) -> String {
     blk(l, FFN_GATE_INP)
 }
+
+/// `blk.{l}.ffn_up_exps.weight`.
+#[must_use]
+pub fn ffn_up_exps(l: usize) -> String {
+    blk(l, FFN_UP_EXPS)
+}
+
+/// `blk.{l}.ffn_down_exps.weight`.
+#[must_use]
+pub fn ffn_down_exps(l: usize) -> String {
+    blk(l, FFN_DOWN_EXPS)
+}

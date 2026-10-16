@@ -670,6 +670,54 @@ pub enum GroupInput<'a> {
     /// feeds the pair's weight ([`qdot::swiglu_clamp`]; a limit at or below
     /// 1e-6 clamps nothing).
     SwigluClamp(&'a Tensor2, &'a Tensor2, f32),
+    /// (`up`) — `relu(up)²` feeds the pair's weight: the ungated expert form
+    /// ([`ExpertForm::Relu2`]), whose layer holds no gate stack.
+    Relu2(&'a Tensor2),
+}
+
+/// The combine a [`GroupInput::Swiglu`], [`GroupInput::SwigluClamp`] or
+/// [`GroupInput::Relu2`] input stands for: the blocks it reads and the one
+/// call every path makes of them ([`InputCombine::write_par`]).
+#[derive(Clone, Copy)]
+enum InputCombine<'a> {
+    /// `silu(gate) · up`, clamped with `limit`.
+    Swiglu {
+        gate: &'a Tensor2,
+        up: &'a Tensor2,
+        limit: Option<f32>,
+    },
+    /// `relu(up)²`.
+    Relu2 { up: &'a Tensor2 },
+}
+
+impl InputCombine<'_> {
+    /// The combine of every column, into `out`.
+    fn write_par(&self, out: &mut [f32]) {
+        match self {
+            InputCombine::Swiglu { gate, up, limit } => {
+                swiglu_into(&gate.data, &up.data, *limit, out)
+            }
+            InputCombine::Relu2 { up } => relu2_into(&up.data, out),
+        }
+    }
+
+    /// The combine of column `t` alone, into `out`.
+    fn col_into(&self, t: usize, out: &mut [f32]) {
+        match self {
+            InputCombine::Swiglu { gate, up, limit } => {
+                swiglu_into(gate.col(t), up.col(t), *limit, out)
+            }
+            InputCombine::Relu2 { up } => relu2_into(up.col(t), out),
+        }
+    }
+
+    /// The profiler site the combine's time records under.
+    fn site(&self) -> &'static str {
+        match self {
+            InputCombine::Swiglu { .. } => "swiglu",
+            InputCombine::Relu2 { .. } => "relu2",
+        }
+    }
 }
 
 impl<'a> GroupInput<'a> {
@@ -680,6 +728,7 @@ impl<'a> GroupInput<'a> {
             GroupInput::Cols(x, _) | GroupInput::Quantized(x, _, _) => x,
             GroupInput::Ready(x) => x.view(),
             GroupInput::Swiglu(gate, _) | GroupInput::SwigluClamp(gate, _, _) => gate.view(),
+            GroupInput::Relu2(up) => up.view(),
         }
     }
 
@@ -697,13 +746,21 @@ impl<'a> GroupInput<'a> {
         self.cols().map_or(self.shape_of().ne1(), <[usize]>::len)
     }
 
-    /// The combine this input stands for — gate, up and the clamp limit — or
-    /// `None` for a ready block.
-    fn combine(self) -> Option<(&'a Tensor2, &'a Tensor2, Option<f32>)> {
+    /// The combine this input stands for, or `None` for a ready block.
+    fn combine(self) -> Option<InputCombine<'a>> {
         match self {
             GroupInput::Ready(_) | GroupInput::Cols(..) | GroupInput::Quantized(..) => None,
-            GroupInput::Swiglu(gate, up) => Some((gate, up, None)),
-            GroupInput::SwigluClamp(gate, up, limit) => Some((gate, up, Some(limit))),
+            GroupInput::Swiglu(gate, up) => Some(InputCombine::Swiglu {
+                gate,
+                up,
+                limit: None,
+            }),
+            GroupInput::SwigluClamp(gate, up, limit) => Some(InputCombine::Swiglu {
+                gate,
+                up,
+                limit: Some(limit),
+            }),
+            GroupInput::Relu2(up) => Some(InputCombine::Relu2 { up }),
         }
     }
 }
@@ -1570,7 +1627,7 @@ enum Dest<'o> {
 }
 
 /// `silu(gate) · up` into `out`, clamped when the pair carries a limit — the
-/// one call every combine makes, on a claimant or on the caller.
+/// one call every gated combine makes, on a claimant or on the caller.
 fn swiglu_into(gate: &[f32], up: &[f32], limit: Option<f32>, out: &mut [f32]) {
     match limit {
         None => qdot::swiglu(gate, up, out),
@@ -1578,21 +1635,40 @@ fn swiglu_into(gate: &[f32], up: &[f32], limit: Option<f32>, out: &mut [f32]) {
     }
 }
 
+/// `relu(up)²` into `out`: `r = max(up[i], 0)` then `r · r` of the f32,
+/// written once — the one call every relu² combine makes, on a claimant or on
+/// the caller.
+fn relu2_into(up: &[f32], out: &mut [f32]) {
+    for (o, &u) in out.iter_mut().zip(up) {
+        let r = u.max(0.0);
+        *o = r * r;
+    }
+}
+
 /// The allocating entry's caller-side combine: a fresh block and its time,
-/// recorded under the `swiglu` site. A plain pair is `ffn::swiglu_timed`
+/// recorded under the combine's site. A plain pair is `ffn::swiglu_timed`
 /// itself; a clamped one is the same shape with the clamped call.
-fn combine_timed(gate: &Tensor2, up: &Tensor2, limit: Option<f32>) -> (Tensor2, u64) {
-    if limit.is_none() {
+fn combine_timed(combine: InputCombine<'_>) -> (Tensor2, u64) {
+    if let InputCombine::Swiglu {
+        gate,
+        up,
+        limit: None,
+    } = combine
+    {
         return swiglu_timed(gate, up);
     }
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    let mut out = Tensor2::scratch(gate.ne0, gate.ne1);
-    swiglu_into(&gate.data, &up.data, limit, &mut out.data);
+    let (rows, cols) = match combine {
+        InputCombine::Swiglu { gate, .. } => (gate.ne0, gate.ne1),
+        InputCombine::Relu2 { up } => (up.ne0, up.ne1),
+    };
+    let mut out = Tensor2::scratch(rows, cols);
+    combine.write_par(&mut out.data);
     let ns = match t_call {
         Some(t_call) => {
             let ns = t_call.elapsed().as_nanos() as u64;
-            profile::record_time("swiglu", ns);
+            profile::record_time(combine.site(), ns);
             ns
         }
         None => 0,
@@ -1635,6 +1711,11 @@ fn group_core(
     let n_combine = (0..n_pairs)
         .filter(|&i| inputs.get(i).combine().is_some())
         .count();
+    // One combine form a group (one leg, one form): the site its deferred
+    // claim time records under.
+    let combine_site = (0..n_pairs)
+        .find_map(|i| inputs.get(i).combine().map(|c| c.site()))
+        .unwrap_or("swiglu");
     let defer = match inputs {
         Inputs::Ready(_) => defer_quant(),
         Inputs::Mixed(srcs) => {
@@ -1741,8 +1822,10 @@ fn group_core(
         // into the pair's par.
         let (x, swiglu) = match src.combine() {
             None => (SlotBlock::Input(xin), None),
-            Some((gate, up, limit)) => {
-                if (up.ne0, up.ne1) != (gate.ne0, gate.ne1) {
+            Some(combine) => {
+                if let InputCombine::Swiglu { gate, up, .. } = combine
+                    && (up.ne0, up.ne1) != (gate.ne0, gate.ne1)
+                {
                     return Err(crate::ModelError::Shape {
                         what: "swiglu up",
                         want_ne0: gate.ne0,
@@ -1754,7 +1837,7 @@ fn group_core(
                 let blk: *mut Tensor2 = match &mut sink {
                     Sink::Alloc { pars, .. } => {
                         let par = if caller_combines {
-                            let (par, ns) = combine_timed(gate, up, limit);
+                            let (par, ns) = combine_timed(combine);
                             caller_combine_ns += ns;
                             par
                         } else {
@@ -1784,7 +1867,7 @@ fn group_core(
                         if caller_combines {
                             let t_c = if lvl > 0 { Some(Instant::now()) } else { None };
                             // SAFETY: as the read above.
-                            swiglu_into(&gate.data, &up.data, limit, unsafe { &mut (*blk).data });
+                            combine.write_par(unsafe { &mut (*blk).data });
                             if let Some(t_c) = t_c {
                                 caller_combine_ns += t_c.elapsed().as_nanos() as u64;
                             }
@@ -1807,9 +1890,7 @@ fn group_core(
                 (
                     SlotBlock::Par(par),
                     Some(Combine {
-                        gate,
-                        up,
-                        limit,
+                        combine,
                         par: write,
                     }),
                 )
@@ -1950,7 +2031,7 @@ fn group_core(
         caller_combine_ns + rt.stage_ns
     } else {
         if defer && lvl > 0 && n_combine > 0 {
-            profile::record_time("swiglu", rt.swiglu_ns);
+            profile::record_time(combine_site, rt.swiglu_ns);
         }
         caller_combine_ns + rt.swiglu_ns
     };
@@ -2649,13 +2730,11 @@ impl<'a> SlotBlock<'a> {
     }
 }
 
-/// A combine slot's producer: gate, up, the clamp limit when the pair
-/// carries one, and the write view of the par block the slot's `x` names.
+/// A combine slot's producer: the combine the slot's input stands for and the
+/// write view of the par block the slot's `x` names.
 #[derive(Clone, Copy)]
 struct Combine<'a> {
-    gate: &'a Tensor2,
-    up: &'a Tensor2,
-    limit: Option<f32>,
+    combine: InputCombine<'a>,
     par: ParWrite,
 }
 
@@ -2707,7 +2786,7 @@ unsafe fn quant_range(
                     // `# Safety`); nothing reads the block before the join.
                     let par =
                         unsafe { std::slice::from_raw_parts_mut(comb.par.0.add(t * s.k), s.k) };
-                    swiglu_into(comb.gate.col(t), comb.up.col(t), comb.limit, par);
+                    comb.combine.col_into(t, par);
                     // SAFETY: column `t` of slot `d` is inside `cols`, this caller's alone (this fn's `# Safety`).
                     unsafe { shared.get(d).quantize_into(s.ty, s.k, par, t) };
                 }
@@ -2904,7 +2983,7 @@ impl<'a> DeferredSlots<'a> {
             // this claimer its only writer until DONE (this fn's `# Safety`);
             // the caller reads it only after the join.
             let par = unsafe { std::slice::from_raw_parts_mut(c.par.0, c.par.1) };
-            swiglu_into(&c.gate.data, &c.up.data, c.limit, par);
+            c.combine.write_par(par);
             if let Some(t_s) = t_s {
                 self.swiglu_ns.fetch_add(
                     t_s.elapsed().as_nanos() as u64,
@@ -4294,6 +4373,23 @@ pub fn host_stack_runs(
     Ok(())
 }
 
+/// The form of a layer's routed experts — which stacks the layer holds and
+/// the combine between them. An activation fact the architecture decides,
+/// not a model: the host union serves either form of any layer's stacks, so
+/// it lives here, beside the combines that read it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ExpertForm {
+    /// Gated SwiGLU: `[gate, up, down]`, the combine `silu(gate·x) ⊙ (up·x)`
+    /// — `clamp(up, ±limit) · min(silu(gate), limit)` with a limit above
+    /// 1e-6; at or below it the plain combine ([`qdot::swiglu_clamp`]'s
+    /// contract).
+    Gated { limit: f32 },
+    /// Ungated relu²: `[up, down]`, the combine `relu(up·x)²`
+    /// ([`relu2_into`]). A layer of this form holds no gate stack, and the
+    /// union reads its up where the gated form reads the gate and the up.
+    Relu2,
+}
+
 /// One stack of a union call, read off its [`ExpertStack`]: the weight type,
 /// the values a row contracts, its rows, the bytes of a row, the bytes of one
 /// input column in the type's encoding, and where its rows lie.
@@ -4452,14 +4548,15 @@ impl UnionStack {
 }
 
 /// Where a union call's combines come from and go: slot `q` of expert `d` is
-/// `silu(gate) · up` (clamped with `limit`) of its gate and up columns in
-/// `gu`, quantized in `ty`'s encoding into slot `q` of `qc`.
+/// its form's combine — `silu(gate) · up` (clamped with the limit) of its
+/// gate and up columns, or `relu(up)²` of its up column — in `gu`, quantized
+/// in `ty`'s encoding into slot `q` of `qc`.
 #[derive(Clone, Copy)]
 struct Combines<'c> {
     plan: UnionPlanView<'c>,
     gu: &'c [f32],
     ff: usize,
-    limit: Option<f32>,
+    form: ExpertForm,
     ty: GgmlType,
     qc: SharedQuantCols,
 }
@@ -4475,15 +4572,24 @@ impl Combines<'_> {
     unsafe fn slot(&self, d: usize, q: usize) {
         let (o, m) = (self.plan.off[d], self.plan.off[d + 1] - self.plan.off[d]);
         let t = q - o;
-        let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
-        let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
         PAR_BUF.with(|b| {
             let mut par = b.borrow_mut();
             if par.len() < self.ff {
                 par.resize(self.ff, 0.0);
             }
             let par = &mut par[..self.ff];
-            swiglu_into(gate, up, self.limit, par);
+            match self.form {
+                ExpertForm::Gated { limit } => {
+                    let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
+                    let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
+                    swiglu_into(gate, up, Some(limit), par);
+                }
+                // A relu² layer's first pass wrote the up at the slot itself.
+                ExpertForm::Relu2 => {
+                    let up = &self.gu[q * self.ff..][..self.ff];
+                    relu2_into(up, par);
+                }
+            }
             // SAFETY: the caller owns slot `q` of `qc`.
             unsafe { self.qc.quantize_into(self.ty, self.ff, par, q) };
         });
@@ -4619,10 +4725,12 @@ enum UnionClaims<'c> {
 
 /// Which rows a union pass runs: every expert's gate and up (pair `2d` is
 /// expert `d`'s gate, `2d + 1` its up, over the columns of x that list it),
-/// or every expert's down (pair `d`, over its combines).
+/// every expert's up alone (pair `d`, a relu² layer's first pass), or every
+/// expert's down (pair `d`, over its combines).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UnionPass {
     GateUp,
+    Up,
     Down,
 }
 
@@ -4657,6 +4765,7 @@ impl UnionRows<'_, '_> {
     fn split(&self, p: usize) -> (usize, usize) {
         match self.pass {
             UnionPass::GateUp => (p / 2, p % 2),
+            UnionPass::Up => (p, 1),
             UnionPass::Down => (p, 0),
         }
     }
@@ -4680,7 +4789,7 @@ impl RowSet for UnionRows<'_, '_> {
     fn pairs(&self) -> usize {
         match self.pass {
             UnionPass::GateUp => 2 * self.plan.n(),
-            UnionPass::Down => self.plan.n(),
+            UnionPass::Up | UnionPass::Down => self.plan.n(),
         }
     }
 
@@ -4752,6 +4861,7 @@ impl RowSet for UnionRows<'_, '_> {
                 (self.inputs[s], self.x_cols, Some(self.plan.cols(d))),
                 2 * o + s * m,
             ),
+            UnionPass::Up => ((self.inputs[1], self.x_cols, Some(self.plan.cols(d))), o),
             UnionPass::Down => {
                 // SAFETY: the method's contract — slots `o..o + m` are expert
                 // `d`'s, inside the combines' slab, which holds every slot of
@@ -4880,7 +4990,7 @@ pub(crate) struct UnionCall<'c, 'w> {
     plan: UnionPlanView<'c>,
     sources: [ExpertStack<'w>; 3],
     x: Tensor2View<'c>,
-    limit: Option<f32>,
+    form: ExpertForm,
     gate: UnionStack,
     up: UnionStack,
     down: UnionStack,
@@ -4889,17 +4999,20 @@ pub(crate) struct UnionCall<'c, 'w> {
 }
 
 impl<'c, 'w> UnionCall<'c, 'w> {
-    /// The call over `plan`'s experts of `sources` (`[gate, up, down]`), for
-    /// `x`'s columns and experts `ff` wide: the stacks checked
-    /// ([`UnionStack::of_call`]) and every id of the plan one of every
-    /// stack's experts, each failure its named error before any pass runs.
+    /// The call over `plan`'s experts of `sources` (`[gate, up, down]` — for
+    /// a relu² layer the up again in the gate's slot, the form reading one
+    /// stack where the gated reads two), for `x`'s columns and experts as
+    /// wide as the up's rows: the stacks checked ([`UnionStack::of_call`])
+    /// and every id of the plan one of every stack's experts, each failure
+    /// its named error before any pass runs. The layer's own width, never
+    /// the scratch's: a scratch may be made for a wider layer.
     pub(crate) fn new(
         plan: UnionPlanView<'c>,
         sources: [ExpertStack<'w>; 3],
         x: Tensor2View<'c>,
-        limit: Option<f32>,
-        ff: usize,
+        form: ExpertForm,
     ) -> Result<Self, crate::ModelError> {
+        let ff = sources[1].n;
         let [gate, up, down] = UnionStack::of_call(&sources, x.ne0(), ff)?;
         // The ids ascend: the last is the largest.
         if let Some(&e) = plan.ids.last()
@@ -4914,7 +5027,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             plan,
             sources,
             x,
-            limit,
+            form,
             gate,
             up,
             down,
@@ -4928,6 +5041,15 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         UnionCall { spread, ..self }
     }
 
+    /// The cells the gate/up pass writes: two columns a slot gated — the
+    /// gate's and the up's — one a slot for a relu² layer, the up's alone.
+    fn gu_cells(&self, slots: usize, ff: usize) -> usize {
+        match self.form {
+            ExpertForm::Gated { .. } => 2 * slots * ff,
+            ExpertForm::Relu2 => slots * ff,
+        }
+    }
+
     /// The call's passes, in order, through `slabs` into `out`: column `j`
     /// of `out` (`out[j·embd..(j + 1)·embd]`) is `lists[j]`'s weighted sum of
     /// its experts' downs of column `j` of x, from zero in list order.
@@ -4936,8 +5058,9 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     /// A call past [`DEFER_MAX_COLS`] columns runs five passes over the pool:
     /// x quantized — once more in the up's encoding when the up's rows read
     /// other bytes than the gate's ([`UnionStack::shares_input`]) — every
-    /// expert's gate and up rows, every slot's combine quantized, every
-    /// expert's down rows, every column's sum. A narrower one claims the
+    /// expert's gate and up rows (the up alone, one dispatch, for a relu²
+    /// layer), every slot's combine quantized, every expert's down rows,
+    /// every column's sum. A narrower one claims the
     /// quantizations inside its two row passes (x column by column, each
     /// expert's combines at once) and sums on the caller; with the deferral
     /// lever off it runs the quantize and combine passes too, four. Each
@@ -4967,7 +5090,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
                 "x in the up's encoding",
             ))
         };
-        let gu = room(slabs.gu, 2 * slots * ff, "the gate/up slab");
+        let gu = room(slabs.gu, self.gu_cells(slots, ff), "the gate/up slab");
         let qc = room(slabs.qc, slots * self.down.cb, "the combines' slab");
         let store = room(slabs.store, slots * embd, "the down store");
         // Poisoned like a dispatch's own buffers, so an unwritten cell shows.
@@ -5078,7 +5201,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         passes: &mut u64,
     ) -> Result<(), crate::ModelError> {
         let (ff, embd, slots) = (self.gate.n, self.down.n, self.plan.slots());
-        let gu = room(gu, 2 * slots * ff, "the gate/up slab");
+        let gu = room(gu, self.gu_cells(slots, ff), "the gate/up slab");
         let qc = room(qc, slots * self.down.cb, "the combines' slab");
         let store = room(store, slots * embd, "the down store");
         if poison() {
@@ -5160,9 +5283,10 @@ impl<'c, 'w> UnionCall<'c, 'w> {
 
     /// Every expert's gate and up rows over the columns that list it, into
     /// `gu`, one dispatch; the up reads `xq_up` when given, else the gate's
-    /// `xq`. With `claim` x is quantized as the dispatch's first work, column
-    /// by column; without, `xq` and `xq_up` hold it. Returns the longest
-    /// claim pass at level >= 1.
+    /// `xq`. A relu² layer's pass reads the up alone: one pair an expert,
+    /// one column a slot. With `claim` x is quantized as the dispatch's first
+    /// work, column by column; without, `xq` and `xq_up` hold it. Returns the
+    /// longest claim pass at level >= 1.
     fn gate_up(
         &self,
         xq: &mut [u8],
@@ -5189,6 +5313,14 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             done: std::sync::atomic::AtomicUsize::new(0),
             claim_ns: std::sync::atomic::AtomicU64::new(0),
         };
+        // A relu² layer's first pass reads the up alone: one pair an expert,
+        // the up's slots the store's shape.
+        let (pass, site, rec) = match self.form {
+            ExpertForm::Gated { .. } => {
+                (UnionPass::GateUp, "host_gate_up", &[self.gate, self.up][..])
+            }
+            ExpertForm::Relu2 => (UnionPass::Up, "host_up", &[self.up][..]),
+        };
         // SAFETY (construction site, referenced by every access): the slabs are
         // the caller's, borrowed for the whole dispatch, each holding the call's
         // columns or the plan's slots (`run`'s `room`). A pair writes only its
@@ -5197,7 +5329,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         // them — the quantize dispatch joined, or every claim counted done —
         // and each claim writes one column alone.
         let set = UnionRows {
-            pass: UnionPass::GateUp,
+            pass,
             plan: self.plan,
             stacks: [self.gate, self.up],
             sources: [self.sources[0], self.sources[1]],
@@ -5218,8 +5350,8 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         if let Some(t0) = t0 {
             let wall = t0.elapsed().as_nanos() as u64;
             record_union_rows(
-                "host_gate_up",
-                &[self.gate, self.up],
+                site,
+                rec,
                 self.plan.n(),
                 wall.saturating_sub(claim_ns),
                 &pacc,
@@ -5228,8 +5360,8 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         Ok(claim_ns)
     }
 
-    /// The combines of the call: slot `q`'s `silu(gate) · up` of its columns
-    /// in `gu`, quantized in the down's encoding into slot `q` of `qc`.
+    /// The combines of the call: slot `q`'s form's combine of its columns in
+    /// `gu`, quantized in the down's encoding into slot `q` of `qc`.
     fn combines<'a>(&self, gu: &'a [f32], qc: &mut [u8]) -> Combines<'a>
     where
         'c: 'a,
@@ -5238,7 +5370,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             plan: self.plan,
             gu,
             ff: self.gate.n,
-            limit: self.limit,
+            form: self.form,
             ty: self.down.ty,
             qc: SharedQuantCols::Bytes {
                 cb: self.down.cb,
@@ -6017,7 +6149,12 @@ mod tests {
             off: &[0, 1, 2],
             cols: &[0, 0],
         };
-        let e = match UnionCall::new(plan, [gate, up, down], x.view(), None, ff) {
+        let e = match UnionCall::new(
+            plan,
+            [gate, up, down],
+            x.view(),
+            crate::ops::ExpertForm::Gated { limit: 0.0 },
+        ) {
             Ok(_) => panic!("an id past the stacks must be refused"),
             Err(e) => e.to_string(),
         };
