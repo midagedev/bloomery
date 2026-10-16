@@ -24,7 +24,7 @@
 
 mod common;
 
-use common::{V41_TEMPLATE, post, start_templated};
+use common::{post, start_templated};
 use serde_json::{Value, json};
 use serve::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
 use serve::qwenxml::{ParamKinds, QwenXmlError};
@@ -33,24 +33,9 @@ use serve::{ChatTemplate, ScriptedEngine};
 
 const TEMPLATE: &str = include_str!("fixtures/qwen38-chat-template.jinja");
 const QWEN36: &str = include_str!("fixtures/qwen36-chat-template.jinja");
-const GLM5: &str = include_str!("fixtures/glm5-chat-template.jinja");
 const QWEN3: &str = include_str!("fixtures/qwen3-chat-template.jinja");
-const NEMOTRON: &str = include_str!("fixtures/nemotron-chat-template.jinja");
-const NEMOTRON_BOLT: &str = include_str!("fixtures/nemotron-bolt-chat-template.jinja");
 
-/// Every fixture chat template this gate reads, by name and source (`<name>
-/// -chat-template.jinja` under `fixtures/`, V4.1's through `common`): the
-/// seat table and the content-after-span cases look theirs up by name, so a
-/// name a table lacks fails its test by name.
-const FIXTURE_TEMPLATES: &[(&str, &str)] = &[
-    ("v41", V41_TEMPLATE),
-    ("glm5", GLM5),
-    ("qwen3", QWEN3),
-    ("qwen36", QWEN36),
-    ("qwen38", TEMPLATE),
-    ("nemotron", NEMOTRON),
-    ("nemotron-bolt", NEMOTRON_BOLT),
-];
+include!("common/fixture_templates.rs");
 
 /// The fixture template named `name`; a name [`FIXTURE_TEMPLATES`] lacks
 /// fails by name.

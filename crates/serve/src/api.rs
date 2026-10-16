@@ -4881,40 +4881,7 @@ mod tests {
         assert_eq!(status, 200, "{text}");
     }
 
-    /// Every fixture chat template, by name and source (`<name>-chat-template
-    /// .jinja` under `tests/fixtures/`): the tables that pin a template's
-    /// property iterate this list and look their expectation up by name, so a
-    /// fixture missing from a table fails it by name.
-    const FIXTURE_TEMPLATES: &[(&str, &str)] = &[
-        (
-            "qwen3",
-            include_str!("../tests/fixtures/qwen3-chat-template.jinja"),
-        ),
-        (
-            "qwen36",
-            include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
-        ),
-        (
-            "qwen38",
-            include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
-        ),
-        (
-            "glm5",
-            include_str!("../tests/fixtures/glm5-chat-template.jinja"),
-        ),
-        (
-            "v41",
-            include_str!("../tests/fixtures/v41-chat-template.jinja"),
-        ),
-        (
-            "nemotron",
-            include_str!("../tests/fixtures/nemotron-chat-template.jinja"),
-        ),
-        (
-            "nemotron-bolt",
-            include_str!("../tests/fixtures/nemotron-bolt-chat-template.jinja"),
-        ),
-    ];
+    include!("../tests/common/fixture_templates.rs");
 
     /// Which of the fixture chat templates need a tool call's `arguments` as
     /// an object ([`needs_object_arguments`]): the ones that walk it
