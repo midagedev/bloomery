@@ -665,7 +665,7 @@ mod tests {
             + c.kv_bytes
             + c.stage_rows_bytes
             + c.expert_bytes / 2
-            + small.cards[0].set_aside_bytes()
+            + small.cards[0].set_aside_bytes().expect("bounded set-aside")
             + small.cards[0].margin_bytes;
         let plan = inputs
             .plan_with(&small, 4, &levers, Experts::Placed)

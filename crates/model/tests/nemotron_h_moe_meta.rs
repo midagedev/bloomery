@@ -426,7 +426,9 @@ fn hw_nemotron_h_moe_plans_the_host_tier() {
                     + c.kv_bytes
                     + c.stage_rows_bytes
                     + c.expert_bytes / 2
-                    + machine.cards[0].set_aside_bytes()
+                    + machine.cards[0]
+                        .set_aside_bytes()
+                        .expect("bounded set-aside")
                     + machine.cards[0].margin_bytes;
                 println!("{name}: the partial arm's budget B = {budget}");
                 let levers = PlanLevers {
