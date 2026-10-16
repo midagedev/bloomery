@@ -2863,7 +2863,7 @@ mod gate {
         let full = plane_of(&st)?;
         let short_words = DeviceTensor::<u32>::upload(
             s,
-            &full.buf().to_host_vec(s)?[..full.buf().len() - full.cols()],
+            &full.buf().to_host_vec(s)?[..full.rows() * (full.cols() - 1)],
             full.rows(),
             full.cols() - 1,
         )?;
