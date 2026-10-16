@@ -299,6 +299,13 @@ gate-gpu-nemotron-h-moe-e2e:
 gate-gpu-nemotron-serve:
     BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
 
+# The same seat gate on the moe body (gate_nemotron_serve's doc, every clause one path over both
+# bodies): the Bolt fixture under the fixture tier (nemotron_h_moe, the fixture's four layers, any
+# card), the arch word and the layer count read from the file, the session stepped every id (the
+# body has no batched prefill). One card.
+gate-gpu-nemotron-h-moe-serve:
+    BLOOMERY_TIER=fixture BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-h-moe-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
+
 # GLM-5.3-Flash 라우터(288개 중 8개, sigmoid, ×2.5 — `router::glm5next`)를 모델 없이 합성 입력으로 호스트 규칙과 맞춘다.
 # 규칙마다 절이 하나다: logits·ids·weights·batch는 비트, scores는 sigmoid 밴드, ties·guard·fault·graph는 명시한 값.
 gate-gpu-glm-router:

@@ -1,5 +1,9 @@
 //! `gate_nemotron_serve` — the nemotron seat of `bloomery-serve` against the model it serves,
-//! on the nemotron_h file of the profile (`BLOOMERY_REF_MODEL`, Nemotron 3 Nano 4B Q4_K_M).
+//! on the nemotron file of the profile (`BLOOMERY_REF_MODEL`): a `nemotron_h` file (Nemotron 3
+//! Nano 4B Q4_K_M) or a `nemotron_h_moe` file (Nemotron 3.5 Bolt, the fixture under the fixture
+//! tier). The file's `general.architecture` picks the body once, at `run` ([`Body`], the gate's
+//! one dispatch point); any other architecture is refused by name, and every clause below is one
+//! path over both bodies.
 //!
 //!     gate_nemotron_serve --dir <dir>
 //!
@@ -27,17 +31,17 @@
 //! One server as a user starts it, `--port 0` and no other flag:
 //!
 //! - `load_and_listen`: it listens; the `load` record comes before the `listening` record; the load
-//!   names `arch=nemotron_h`, `slots=1` and the file's layer count, and its `ctx` and the
-//!   `listening` record's are the `ctx` line's: the context the plan chose is the context the load
-//!   made. FAIL-first: a seat whose load takes a context other than the plan's (a fixed one, or the
-//!   slot context halved) is red.
+//!   names the file's `arch` word, `slots=1` and the file's layer count (the body's hparams), and
+//!   its `ctx` and the `listening` record's are the `ctx` line's: the context the plan chose is the
+//!   context the load made. FAIL-first: a seat whose load takes a context other than the plan's (a
+//!   fixed one, or the slot context halved) is red.
 //! - `completion_ids`: `/completion` at temperature 0, [`N`] tokens, of [`PROSE`] (`/tokenize`)
 //!   and of the chat turn the server's own template renders (`/apply-template`, `/tokenize`),
-//!   each from an empty cache (`cache_prompt: false`), answers the ids `NemotronHModel` gives
-//!   directly on the same ids split as the server feeds the seat (every id but the last through
-//!   `prefill`, the last as a step, then each answer fed back), or a prefix of them ending at an
-//!   end-of-generation id. FAIL-first:
-//!   a prefill that skips the first id moves the ids and the clause is red.
+//!   each from an empty cache (`cache_prompt: false`), answers the ids the file's body gives
+//!   directly on the same split the server feeds the seat — the Nano's several-id head through
+//!   its batched prompt call and the last id as a step, the Bolt (no batched prefill) every id a
+//!   step — then each answer fed back, or a prefix of them ending at an end-of-generation id.
+//!   FAIL-first: a prefill that skips the first id moves the ids and the clause is red.
 //! - `chat_is_200`: `/v1/chat/completions` of the same turn at temperature 0 and `max_tokens`
 //!   [`N`] is a 200 whose `usage` counts the prompt's ids and the completion's tokens, and whose
 //!   message text is inside the text of the chat run's ids.
@@ -48,11 +52,11 @@
 //!   shared prefix reaches the refused rollback, the request fails and the clause is red.
 //! - `extension_keeps_the_held_sequence`: the prose prompt resent with its answer appended keeps
 //!   the held positions (`cache_n` above 0): the shared prefix is the whole held sequence.
-//! - `extension_is_the_held_run`: that resent answer is `NemotronHModel`'s run of the same split,
-//!   the server stopped: the prose prompt and its answer held, then the answer's last id and [`N`]
-//!   more. A fresh run of the longer prompt is one pass over all of it, which the held split's
-//!   steps differ from by the q8 rounding of the activations at the Q8_0 sites, so the split is
-//!   the reference.
+//! - `extension_is_the_held_run`: that resent answer is the body's run of the same split, the
+//!   server stopped: the prose prompt and its answer held, then the answer's last id and [`N`]
+//!   more. The Nano's held split (its batched prompt call, then steps) differs from a fresh one
+//!   pass over the longer prompt by the q8 rounding of the activations at the Q8_0 sites, so the
+//!   split is the reference; the Bolt holds and fresh-runs the same steps, equal exactly.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -64,7 +68,8 @@ mod gate {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use bloomery_gpu::{Gpu, NemotronHModel};
+    use bloomery_gpu::model::ChainBody;
+    use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
     use bloomery_gpu_gates::ctx_ladder::{ctx_line, default_line_held, field, rung_above};
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::serve_client::{
@@ -73,7 +78,9 @@ mod gate {
     };
     use bloomery_gpu_gates::{GateError, checks_failed, generate, ref_model_path};
     use gguf::Split;
-    use model::arch::nemotron_h::hparams::Hparams;
+    use model::arch::Arch;
+    use model::arch::nemotron_h::hparams::Hparams as NanoHparams;
+    use model::arch::nemotron_h_moe::hparams::Hparams as BoltHparams;
     use serde_json::json;
 
     const USAGE: &str = "usage: gate_nemotron_serve --dir <dir>";
@@ -268,7 +275,11 @@ mod gate {
     }
 
     /// `n` greedy ids from where `m` stands after `first`, each answer fed back.
-    fn continue_from(m: &mut NemotronHModel, first: u32, n: usize) -> Result<Vec<u32>, GateError> {
+    fn continue_from<B: ChainBody>(
+        m: &mut GpuModel<B>,
+        first: u32,
+        n: usize,
+    ) -> Result<Vec<u32>, GateError> {
         let mut answer = vec![first];
         while answer.len() < n {
             let last = *answer.last().ok_or("an empty answer")?;
@@ -278,43 +289,127 @@ mod gate {
     }
 
     /// The prompt `ids` as the server feeds the seat, from where `m` stands: every id but the
-    /// last through the seat's prompt call (`prefill` for several ids, one step for one), the last
-    /// as the first `next` step; then [`N`] greedy ids.
-    fn seat_answer(m: &mut NemotronHModel, ids: &[u32]) -> Result<Vec<u32>, GateError> {
+    /// last through the body's prompt call (`feed_head`: the Nano's batched prefill, the Bolt a
+    /// step an id), the last as the first `next` step; then [`N`] greedy ids.
+    fn seat_answer<B: ChainBody>(
+        m: &mut GpuModel<B>,
+        ids: &[u32],
+        feed_head: fn(&mut GpuModel<B>, &[u32]) -> Result<(), GpuError>,
+    ) -> Result<Vec<u32>, GateError> {
         let (&last, head) = ids.split_last().ok_or("an empty prompt")?;
-        match head.len() {
-            0 => {}
-            1 => {
-                m.step(head)?;
-            }
-            _ => {
-                m.prefill(head)?;
-            }
-        }
+        feed_head(m, head)?;
         let first = m.step(&[last])?;
         continue_from(m, first, N)
     }
 
-    /// What `NemotronHModel` gives directly, the server stopped: for each prompt from an empty
-    /// cache, its [`N`] answer ids; and the extension's run, the prose prompt and its answer held
-    /// then that answer's last id fed and [`N`] more ids, the split the server's kept slot runs.
-    fn session_ids(
+    /// The Nano's head feed: the seat's prompt call — one id a step, several the batched
+    /// [`GpuModel::prefill`].
+    fn nano_head(m: &mut NemotronHModel, head: &[u32]) -> Result<(), GpuError> {
+        match head.len() {
+            0 => Ok(()),
+            1 => m.step(head).map(|_| ()),
+            _ => m.prefill(head).map(|_| ()),
+        }
+    }
+
+    /// The Bolt's head feed: the body has no batched prefill, so the seat steps every prompt id.
+    /// An empty head is nothing fed.
+    fn bolt_head<B: ChainBody>(m: &mut GpuModel<B>, head: &[u32]) -> Result<(), GpuError> {
+        for &id in head {
+            m.step(&[id])?;
+        }
+        Ok(())
+    }
+
+    /// What the body's model gives directly, the server stopped: for each prompt from an empty
+    /// cache, its [`N`] answer ids (the prompt through `feed_head`, the way the seat feeds that
+    /// body, then each answer fed back); and the extension's run, the prose prompt and its answer
+    /// held then that answer's last id fed and [`N`] more ids, the split the server's kept slot
+    /// runs.
+    fn session_ids<B: ChainBody>(
         file: &Path,
         prompts: &[&[u32]],
         prose: &[u32],
+        open: fn(Gpu, Split, usize) -> Result<GpuModel<B>, GpuError>,
+        feed_head: fn(&mut GpuModel<B>, &[u32]) -> Result<(), GpuError>,
     ) -> Result<(Vec<Vec<u32>>, Vec<u32>), GateError> {
         let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
-        let mut m = NemotronHModel::open(Gpu::new()?, split, SESSION_CTX)?;
+        let mut m = open(Gpu::new()?, split, SESSION_CTX)?;
         let mut out = Vec::new();
         for ids in prompts {
             m.reset()?;
-            out.push(seat_answer(&mut m, ids)?);
+            out.push(seat_answer(&mut m, ids, feed_head)?);
         }
         m.reset()?;
-        let held = seat_answer(&mut m, prose)?;
+        let held = seat_answer(&mut m, prose, feed_head)?;
         let last = *held.last().ok_or("an empty held answer")?;
         let first = m.step(&[last])?;
         Ok((out, continue_from(&mut m, first, N)?))
+    }
+
+    /// The file's body, read once from its `general.architecture` at `run` — the gate's one
+    /// dispatch point. Every clause is one path over both; what the body picks is the session's
+    /// model, the way the seat feeds it a prompt, and the hparams the layer count reads.
+    #[derive(Clone, Copy)]
+    enum Body {
+        /// `nemotron_h`, a Nemotron 3 Nano file: the seat's prefill one `GpuModel::step` over the
+        /// ids.
+        Nano,
+        /// `nemotron_h_moe`, a Nemotron 3.5 Bolt file: the body has no batched prefill, so the
+        /// seat steps every id.
+        Bolt,
+    }
+
+    impl Body {
+        /// The body `file` declares, any other architecture refused by name.
+        fn of(file: &Path, split: &Split) -> Result<Body, GateError> {
+            let first = split
+                .shard(0)
+                .ok_or_else(|| format!("{} opened with no shard", file.display()))?;
+            match Arch::detect(first).map_err(|e| format!("{}: {e}", file.display()))? {
+                Arch::NemotronH => Ok(Body::Nano),
+                Arch::NemotronHMoe => Ok(Body::Bolt),
+                arch => Err(format!(
+                    "{} is a {} file; the nemotron seat serves nemotron_h and nemotron_h_moe \
+                     files",
+                    file.display(),
+                    arch.name(),
+                )
+                .into()),
+            }
+        }
+
+        /// The architecture's name, the `load` record's `arch` word.
+        fn name(&self) -> &'static str {
+            match self {
+                Body::Nano => "nemotron_h",
+                Body::Bolt => "nemotron_h_moe",
+            }
+        }
+
+        /// The file's layer count, the body's own hparams.
+        fn layers(&self, file: &Path, split: &Split) -> Result<u64, GateError> {
+            let in_file = |e| format!("{}: {e}", file.display());
+            let n = match self {
+                Body::Nano => NanoHparams::read(split).map_err(in_file)?.n_layer,
+                Body::Bolt => BoltHparams::read(split).map_err(in_file)?.n_layer,
+            };
+            Ok(u64::try_from(n)?)
+        }
+
+        /// The ids the body's model gives directly ([`session_ids`]), the prompt fed the way the
+        /// seat feeds that body, and the extension's run of the held split.
+        fn session_ids(
+            &self,
+            file: &Path,
+            prompts: &[&[u32]],
+            prose: &[u32],
+        ) -> Result<(Vec<Vec<u32>>, Vec<u32>), GateError> {
+            match self {
+                Body::Nano => session_ids(file, prompts, prose, NemotronHModel::open, nano_head),
+                Body::Bolt => session_ids(file, prompts, prose, NemotronHMoeModel::open, bolt_head),
+            }
+        }
     }
 
     /// What the server answered, held until it is stopped and the session has the card.
@@ -341,6 +436,7 @@ mod gate {
         dir: &Path,
         file: &Path,
         default_ctx: Option<u64>,
+        body: Body,
         layers: u64,
     ) -> Result<(Option<Answers>, bool), GateError> {
         let mut ok = true;
@@ -365,7 +461,7 @@ mod gate {
         let listen = records.one(&record::LISTENING_NEMOTRON)?;
         let named = ctx_line(&text).and_then(|l| field(l, "ctx"));
         let same_ctx = default_ctx.is_none_or(|c| named == Some(c));
-        let loaded = load.word("arch")? == "nemotron_h"
+        let loaded = load.word("arch")? == body.name()
             && load.u64("slots")? == 1
             && load.u64("layers")? == layers
             && listen.u64("slots")? == 1;
@@ -374,11 +470,12 @@ mod gate {
         let in_order = load.at() < listen.at();
         println!(
             "serve at {addr}: ctx line {:?} (the plan run's {same_ctx}); load {:?}; listening \
-             {:?}; load names arch, one slot and {layers} layers {loaded}; ctx is the line's \
+             {:?}; load names arch={}, one slot and {layers} layers {loaded}; ctx is the line's \
              {ctx_is_plans}; load before listening {in_order}",
             ctx_line(&text),
             load.line(),
-            listen.line()
+            listen.line(),
+            body.name()
         );
         check(
             &mut ok,
@@ -475,10 +572,10 @@ mod gate {
     }
 
     /// `completion_ids` (the module header), the server stopped and the session on the card.
-    fn completion_ids(file: &Path, a: &Answers) -> Result<bool, GateError> {
+    fn completion_ids(file: &Path, body: Body, a: &Answers) -> Result<bool, GateError> {
         let mut ok = true;
         let (ids, extended) =
-            session_ids(file, &[a.prose.as_slice(), a.turn.as_slice()], &a.prose)?;
+            body.session_ids(file, &[a.prose.as_slice(), a.turn.as_slice()], &a.prose)?;
         let prose = agree(&a.prose_answer.tokens, &a.prose_answer.stop, &ids[0]);
         let turn = agree(&a.turn_answer.tokens, &a.turn_answer.stop, &ids[1]);
         println!(
@@ -505,20 +602,17 @@ mod gate {
         std::fs::create_dir_all(&dir)?;
         let file = ref_model_path()?;
         let split = Split::open(&file).map_err(|e| format!("open {}: {e}", file.display()))?;
-        let layers = u64::try_from(
-            Hparams::read(&split)
-                .map_err(|e| format!("{}: {e}", file.display()))?
-                .n_layer,
-        )?;
+        let body = Body::of(&file, &split)?;
+        let layers = body.layers(&file, &split)?;
         drop(split);
         let mut ok = true;
         let (default_ctx, pass) = plan_only_names_its_default(&dir, &file)?;
         ok &= pass;
         ok &= parallel_above_one_is_refused(&dir, &file)?;
-        let (answers, pass) = served(&dir, &file, default_ctx, layers)?;
+        let (answers, pass) = served(&dir, &file, default_ctx, body, layers)?;
         ok &= pass;
         if let Some(a) = answers {
-            ok &= completion_ids(&file, &a)?;
+            ok &= completion_ids(&file, body, &a)?;
         }
         if !ok {
             return Err(checks_failed());
