@@ -37,7 +37,8 @@
 //! Otherwise, with no `--model`, the architecture of the file's first shard
 //! picks the seat: deepseek41 and deepseek4 the ds41 seat, glm5next and
 //! glm5-next the glm seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe
-//! the qwen3 seat, mimo2 the mimo2 seat, nemotron_h the nemotron seat;
+//! the qwen3 seat, mimo2 the mimo2 seat, nemotron_h and nemotron_h_moe the
+//! nemotron seat;
 //! a file of a decision row's backbone (qwen35) with no head is refused by
 //! name, saying what would seat it (`--head`, a row's `--hf` repo, or a file
 //! that carries its head); a
@@ -145,6 +146,7 @@ models (the --model word is optional with a model file: the file's architecture 
   qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
   mimo2   MiMo-V2.6-Flash              --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4
   nemotron Nemotron 3 Nano             --hf nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M
+  nemotron Nemotron 3.5 Bolt            -m <path>
   decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M
   decide  a decision model in its file --hf ggml-org/lev-GGUF:Q4_K_M";
 
@@ -235,7 +237,10 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Glm => matches!(Arch::from_name(arch), Ok(Arch::Glm5next)),
                 Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe"),
                 Model::Mimo2 => arch == "mimo2",
-                Model::Nemotron => matches!(Arch::from_name(arch), Ok(Arch::NemotronH)),
+                Model::Nemotron => matches!(
+                    Arch::from_name(arch),
+                    Ok(Arch::NemotronH | Arch::NemotronHMoe)
+                ),
             }
         }
     }

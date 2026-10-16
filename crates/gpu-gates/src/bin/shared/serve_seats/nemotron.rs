@@ -1,8 +1,12 @@
 //! `bloomery-serve --model nemotron` — the llama-server-compatible HTTP API on
-//! the nemotron_h engine: a Nemotron 3 Nano file (Mamba-2, attention and
-//! squared-ReLU MLP layers, dense), the whole model on one card, opened as
-//! `gate_nemotron_e2e` opens it (`NemotronHModel::open`, the step captured in
-//! graph mode).
+//! the nemotron engine, serving `nemotron_h` and `nemotron_h_moe` files with
+//! one sequence: a Nemotron 3 Nano file (Mamba-2, attention and squared-ReLU
+//! MLP layers, dense) or a Nemotron 3.5 Bolt file (Mamba-2, attention and
+//! latent MoE layers), the whole model on one card, each opened as its gate
+//! opens it (`NemotronHModel::open` as `gate_nemotron_e2e` opens the Nano,
+//! `NemotronHMoeModel::open` as `gate_nemotron_h_moe_e2e` opens the Bolt; the
+//! step captured in graph mode). The file's architecture picks the body once,
+//! at `run`; everything else is one path over both.
 //!
 //!     bloomery-serve --model nemotron [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
@@ -21,10 +25,13 @@
 //! does:
 //!
 //! - The body holds one sequence: its attention layers' K and V planes of one
-//!   context and its Mamba-2 layers' scan state and conv ring. It has no slot
-//!   rows, so `--parallel` above 1 is refused by name before any plan.
-//! - A prompt call of several ids runs the body's prompt path
-//!   (`GpuModel::prefill`, passes of many rows); one id is a step.
+//!   context and its Mamba-2 layers' scan state and conv ring (a Bolt file's
+//!   latent MoE layers hold nothing). It has no slot rows, so `--parallel`
+//!   above 1 is refused by name before any plan.
+//! - The prompt path is the body's: the Nano's is batched
+//!   (`GpuModel::prefill`, passes of many rows); Bolt's has no prompt batch,
+//!   one step an id (`GpuModel::step` over the ids), so its prompt rate is its
+//!   decode rate.
 //! - A Mamba-2 state cannot step back. A request keeps the prefix it shares
 //!   with what the slot holds only when that prefix is the whole held
 //!   sequence (the position the model stands at); any other shared prefix is
@@ -67,8 +74,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bloomery_gpu::model::StepMode;
-use bloomery_gpu::{Gpu, NemotronHModel};
+use bloomery_gpu::model::{ChainBody, StepMode};
+use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
     parallel_line, placement_of, slots_of,
@@ -79,6 +86,7 @@ use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::nemotron_h::place as nemotron_place;
+use model::arch::nemotron_h_moe::place as moe_place;
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::DeviceId;
@@ -113,26 +121,50 @@ struct OpenSeat {
     ctx: usize,
 }
 
-/// The model on the engine thread.
-struct Nemotron {
-    m: NemotronHModel,
+/// The model on the engine thread: either family's body, the seat's one path
+/// over both, with the body's prompt path.
+struct Nemotron<B: ChainBody> {
+    m: GpuModel<B>,
+    prefill: fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>,
 }
 
-impl Nemotron {
-    /// The model of the file at `a.path` on the planned card, in graph mode
-    /// with its step captured, the `load` record on stderr.
-    fn open(a: OpenSeat) -> Result<Nemotron, GateError> {
+/// The Nano's prompt path: several ids run the batched
+/// [`GpuModel::prefill`] (passes of many rows); one id is a step.
+fn prefill_nano(m: &mut NemotronHModel, ids: &[u32]) -> Result<u32, GpuError> {
+    if ids.len() > 1 {
+        m.prefill(ids)
+    } else {
+        m.step(ids)
+    }
+}
+
+/// A body with no prompt batch (Bolt's): one step an id, the argmax after the
+/// last, so the prompt rate is the decode rate.
+fn prefill_steps<B: ChainBody>(m: &mut GpuModel<B>, ids: &[u32]) -> Result<u32, GpuError> {
+    m.step(ids)
+}
+
+impl<B: ChainBody> Nemotron<B> {
+    /// The model of the file at `a.path` on the planned card, built by `open`
+    /// (the family's `GpuModel::open`) and carrying its prompt path `prefill`,
+    /// in graph mode with its step captured, the `load` record on stderr
+    /// naming the body's architecture.
+    fn open(
+        a: OpenSeat,
+        open: fn(Gpu, Split, usize) -> Result<GpuModel<B>, GpuError>,
+        prefill: fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>,
+    ) -> Result<Nemotron<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
         let opened = t.elapsed();
         let gpu = Gpu::open_card(&a.card, a.device)?;
-        let mut m = NemotronHModel::open(gpu, file, a.ctx)?;
+        let mut m = open(gpu, file, a.ctx)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let ctx = m.ctx_max();
         let total = t.elapsed();
         Record::new(&record::LOAD_NEMOTRON)
-            .w("arch", "nemotron_h")
+            .w("arch", B::arch().name())
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", ctx)
             .u("slots", 1)
@@ -141,11 +173,11 @@ impl Nemotron {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(&m, total, opened);
-        Ok(Nemotron { m })
+        Ok(Nemotron { m, prefill })
     }
 }
 
-impl Seat for Nemotron {
+impl<B: ChainBody + 'static> Seat for Nemotron<B> {
     fn pos(&self) -> usize {
         self.m.pos() as usize
     }
@@ -154,15 +186,9 @@ impl Seat for Nemotron {
         self.m.ctx_max()
     }
 
-    /// A prompt of several ids runs the batched path
-    /// ([`bloomery_gpu::GpuModel::prefill`], passes of many rows); one id is a
-    /// step.
+    /// The body's prompt path, the `prefill` its `open` chose.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        if ids.len() > 1 {
-            Ok(self.m.prefill(ids)?)
-        } else {
-            Ok(self.m.step(ids)?)
-        }
+        Ok((self.prefill)(&mut self.m, ids)?)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
@@ -226,23 +252,24 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     record::at_main(NAME, record::BLOOMERY_SERVE_NEMOTRON);
     arm_screen(levers.screen());
     let a = SeatFlags::parse(args, USAGE, |_, _| Ok(false))?;
-    if let Some(n) = a.parallel.filter(|&n| n > 1) {
-        return Err(format!(
-            "--parallel {n}: the nemotron_h body holds one sequence and no resident slots; the \
-             seat serves --parallel 1"
-        )
-        .into());
-    }
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let first = split
         .shard(0)
         .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
     let arch = Arch::detect(first).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !matches!(arch, Arch::NemotronH) {
+    if !matches!(arch, Arch::NemotronH | Arch::NemotronHMoe) {
         return Err(format!(
-            "{} is a {} file; the nemotron seat serves nemotron_h files",
+            "{} is a {} file; the nemotron seat serves nemotron_h and nemotron_h_moe files",
             path.display(),
+            arch.name()
+        )
+        .into());
+    }
+    if let Some(n) = a.parallel.filter(|&n| n > 1) {
+        return Err(format!(
+            "--parallel {n}: the {} body holds one sequence and no resident slots; the \
+             seat serves --parallel 1",
             arch.name()
         )
         .into());
@@ -254,7 +281,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         a.template_file.as_deref(),
         "nemotron",
     )?;
-    let inputs = nemotron_place::read(&split)?;
+    // The family's `place::read`, the first of the two branches the
+    // architecture takes (the other the open, at the spawn below).
+    let inputs = match arch {
+        Arch::NemotronH => nemotron_place::read(&split)?,
+        Arch::NemotronHMoe => moe_place::read(&split)?,
+        _ => unreachable!("the arch check above refused every other architecture"),
+    };
     let plan_levers = PlanLevers::from_levers(&levers)?;
     // The one slot, and what named it (`from` on the `parallel` line); the
     // start's note that `--ctx` is one request's context is left out, since
@@ -298,14 +331,26 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     drop(plan);
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
-    let engine = SeatEngine::spawn(
-        move || Nemotron::open(open),
-        slot_ctx,
-        vocab,
-        device,
-        props,
-        0,
-    )?;
+    // The family's `GpuModel::open` and prompt path, the engine thread's body.
+    let engine = match arch {
+        Arch::NemotronH => SeatEngine::spawn(
+            move || Nemotron::open(open, NemotronHModel::open, prefill_nano),
+            slot_ctx,
+            vocab,
+            device,
+            props,
+            0,
+        )?,
+        Arch::NemotronHMoe => SeatEngine::spawn(
+            move || Nemotron::open(open, NemotronHMoeModel::open, prefill_steps),
+            slot_ctx,
+            vocab,
+            device,
+            props,
+            0,
+        )?,
+        _ => unreachable!("the arch check above refused every other architecture"),
+    };
     let server = a.bind(engine, chat, &path, slots)?;
     Record::new(&record::LISTENING_NEMOTRON)
         .w("place", place.name())
