@@ -225,10 +225,42 @@ impl Family for Bolt {
     }
 
     /// Only `expert_count` moves with the map, and the map is held to
-    /// [`check_map`].
+    /// [`check_map`]. An NVFP4 tensor the map holds is refused without its
+    /// companion `.scale` at [`NVFP4_TENSOR_SCALE`]: the fill divides its
+    /// target σ by the tensor scale, so a missing scale would write the
+    /// projections at the wrong RMS.
     fn tables(&self, source: &Split, spec: &FixtureSpec) -> Result<Box<dyn Tables>, FixtureError> {
         let src = Hparams::read(source)?;
         let n_expert = check_map(&src, source, &spec.layers)?;
+        for (_, t) in source.iter_tensors() {
+            if t.ty != gguf::GgmlType::NVFP4 {
+                continue;
+            }
+            if let Some((l, _)) = crate::fixture::split_layer(&t.name)
+                && !spec.layers.contains(&l)
+            {
+                continue;
+            }
+            let scale = t
+                .name
+                .strip_suffix(".weight")
+                .map(|name| format!("{name}.scale"));
+            let leaf = scale
+                .as_deref()
+                .map(|name| crate::fixture::split_layer(name).map_or(name, |(_, leaf)| leaf));
+            if scale
+                .as_deref()
+                .and_then(|name| source.find(name))
+                .is_none()
+                || leaf.and_then(const_value) != Some(NVFP4_TENSOR_SCALE)
+            {
+                return Err(FixtureError::Tensor {
+                    name: t.name.clone(),
+                    detail: "NVFP4 fill requires a companion .scale tensor at NVFP4_TENSOR_SCALE"
+                        .into(),
+                });
+            }
+        }
         Ok(Box::new(MapTables { n_expert }))
     }
 

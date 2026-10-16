@@ -4109,6 +4109,13 @@ fn hw_fixture_nemotron_refusals() {
 /// MoE layers' IQ2_XXS, one stem of two types; the routed and shared experts are IQ2_XXS as the real
 /// file's are. The tensors are zeros: the generator reads the header alone.
 fn bolt_source(path: &Path) -> Split {
+    bolt_source_scales(path, true)
+}
+
+/// [`bolt_source`] with `scales` naming whether each Mamba-2 layer keeps its
+/// two `.scale` tensors: a source that drops them is the input the plan's
+/// NVFP4 guard refuses by name.
+fn bolt_source_scales(path: &Path, scales: bool) -> Split {
     use GgmlType::{F32, IQ2_XXS, NVFP4, Q5_0, Q8_0};
     const E: u64 = 256;
     let name = |l: usize, stem: &str| format!("blk.{l}.{stem}");
@@ -4232,6 +4239,14 @@ fn bolt_source(path: &Path) -> Split {
         ),
         u32v("moe_latent_size", 256),
     ];
+    let tensors = if scales {
+        tensors
+    } else {
+        tensors
+            .into_iter()
+            .filter(|(name, _, _)| !name.ends_with(".scale"))
+            .collect()
+    };
     zero_source(path, &kvs, &tensors)
 }
 
@@ -4260,8 +4275,9 @@ fn bolt_kv<'a>(p: &'a Plan, suffix: &str) -> &'a Value {
 /// blocks, the F32 constants), read by the engine's reader as [Mamba-2, MoE, attention, MoE] with
 /// the source layers' experts, its per-layer arrays at the map's layers, `expert_count` the map's
 /// largest router (10 on a map without the 12-expert layer), and the family's constants land: the
-/// scan's vectors, the router bias 0, both `.scale` tensors at the generator's tensor scale, the
-/// router a matrix draw at `1/√K` and the NVFP4 projections under the NVFP4 rule.
+/// scan's vectors, a spread router bias, both `.scale` tensors at the generator's tensor scale, the
+/// router a matrix draw at `1/√K` and the NVFP4 projections under the NVFP4 rule. A source that
+/// drops every `.scale` tensor is refused by name at the plan.
 #[test]
 fn fixture_bolt_round_trip() {
     let guard = dir("bolt-round-trip");
@@ -4354,6 +4370,15 @@ fn fixture_bolt_round_trip() {
     };
     let p = fixture::plan(&small, &src, None, &small.options()).unwrap();
     assert_eq!(bolt_kv(&p, "expert_count").as_unsigned(), Some(10));
+    // Every tensor of the source minus the `.scale` tensors: the NVFP4 fill
+    // divides its target σ by the tensor scale, so the plan refuses the pair
+    // by name before any file is written.
+    let dropped = bolt_source_scales(&d.join("no-scales.gguf"), false);
+    let msg = fixture::plan(&spec, &dropped, None, &spec.options())
+        .expect_err("a source without the .scale tensors plans no fixture")
+        .to_string();
+    assert!(msg.contains("blk.0.ssm_in.weight"), "{msg}");
+    assert!(msg.contains("companion .scale"), "{msg}");
 }
 
 /// Contract 28: a layer map that loses a kind, a (stem, type) pair or the difference between two
