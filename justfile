@@ -2639,8 +2639,12 @@ gate-nemotron-meta:
 # moe_latent_size, a per-layer array of the wrong length, a routed stack or bias whose expert dim is not its layer's
 # router's, routed arrays off their layer's kind, expert_count not the largest router's, a MoE key missing or of a
 # value the description cannot hold, a projection scale that is not one f32) and the coverage items of a latent MoE
-# layer, then the reader's description of the 24GB GGUF at the box's path
-# (the test reads one fixed path). Headers only, seconds.
+# layer; the plan's three places for the routed experts (Experts::Card, Placed, Host) on the fixture layout (a card that
+# holds every expert plans Placed as Card, a small card keeps each layer's id prefix and hosts the rest, the Host arm keeps
+# none on the card, a context of no position, a tier card and a second card are refused under every arm); then the
+# reader's description of the 24GB GGUF at the box's path (the test reads one fixed path) and, on its real header, the
+# host tier's plans: whether the 3090 holds every routed expert, a partial plan, the 12 GiB room and all-host, each
+# layer's prefix on the card and the rest on the host. Headers only, seconds.
 gate-nemotron-h-moe-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::nemotron_h_moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test nemotron_h_moe_meta -- --ignored --nocapture'
 
