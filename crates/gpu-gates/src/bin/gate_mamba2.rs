@@ -29,8 +29,10 @@
 //!    accepts and enqueue still refuses. A short buffer and a non-finite
 //!    norm epsilon are refused by name at enqueue, and so are a pass of 0
 //!    tokens, its `xbc` window past the row stride, rows shorter than `U`
-//!    strides and a `y` shorter than `U` rows. Nothing launched (the
-//!    outputs keep their poison, the fault word stays clean).
+//!    strides, a `y` shorter than `U` rows, a `lane_rows` without a lanes
+//!    buffer, a `lane_rows` past the pass and a lanes buffer shorter than
+//!    its rows. Nothing launched (the outputs keep their poison, the fault
+//!    word stays clean).
 //! 4. fault: a NaN in `x`, in `B`, an infinity in `z`, a non-finite `dt` and
 //!    a non-finite `A` each raise `Mamba2Scan` at the launch's layer and
 //!    leave the norm group they sit in entirely non-finite, never a
@@ -39,10 +41,15 @@
 //!    token raises it too, with and without the norm: its first row is
 //!    finite and the middle row's plant (the norm group, or head 0's
 //!    channels) is non-finite.
-//! 5. replay: the capture is one node. Replayed over three tokens whose
+//! 5. lanes: a pass of `U` = 4 tokens with `lane_rows` 3 on the exact
+//!    regime of clause 1: `lanes[t]` is the host twin's scan state after
+//!    t + 1 tokens bit for bit (t = 0, 1, 2), the final `state` the twin's
+//!    after 4, and `y` (and the state) the same pass run with `lane_rows` 0
+//!    bit for bit — the lanes perturb nothing.
+//! 6. replay: the capture is one node. Replayed over three tokens whose
 //!    inputs and position word are rewritten between replays, it equals the
 //!    eager run bit for bit (`y` of every token, the ring, the state).
-//! 6. steps_are_steps: the prompt pass (`enqueue_steps`, three entries) over
+//! 7. steps_are_steps: the prompt pass (`enqueue_steps`, three entries) over
 //!    `U` rows of an in-projection output (the `z`, `xbc`, `dt` columns at
 //!    the Nemotron offsets) against `U` `enqueue_step` launches from the
 //!    same ring, state and position: every `y` row, the final state and the
@@ -54,7 +61,7 @@
 //!    random input cannot tell the order); and a captured pass (three
 //!    nodes) replayed against the eager pass. The pass's refusals (`u` 0, a
 //!    column window past `ld`, short rows, a short `y`) are clause 3's.
-//! 7. shape: the entries compile with no local depot.
+//! 8. shape: the entries compile with no local depot.
 //!
 //! The band of clause 2. Write `u = 2^-24` and `ε = 2u = 2^-23`, one ulp at
 //! most. Both sides are the same f32 program on inputs that differ only in
@@ -142,7 +149,7 @@ mod gate {
     const X0: usize = INNER;
     const DT0: usize = INNER + CONV_DIM;
     const LD: usize = DT0 + HEADS;
-    /// The pass lengths of clause 6, and the steps that warm its start.
+    /// The pass lengths of clause 7, and the steps that warm its start.
     const STEPS_US: [usize; 7] = [1, 2, 3, 4, 5, 37, 256];
     const WARM: usize = 5;
 
@@ -425,16 +432,23 @@ mod gate {
         }
 
         /// The pass of `pass.u` rows on `stream`, from the position word,
-        /// into `y`.
+        /// into `y`, keeping `lane_rows` lane rows in `lanes` when given.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "the card, the kernels, the stream, the pass, its output, its lanes and the norm (rust-quality R8)"
+        )]
         fn steps(
             &mut self,
-            cx: &Ctx,
+            gpu: &Gpu,
+            k: &mut Mamba2Kernels,
             stream: &CudaStream,
             pass: Pass<'_>,
             y: &mut DeviceBuffer<f32>,
+            lanes: Option<&mut DeviceBuffer<f32>>,
+            lane_rows: usize,
             norm: bool,
         ) -> Result<(), GpuError> {
-            cx.k.enqueue_steps(
+            k.enqueue_steps(
                 stream,
                 StepsArgs {
                     shape: pass.shape,
@@ -453,10 +467,12 @@ mod gate {
                     eps: EPS,
                     pos: &self.pos,
                     pos_at: 0,
-                    fault: cx.gpu.layer_sink(LAYER)?,
+                    fault: gpu.layer_sink(LAYER)?,
                     y,
                     ring: &mut self.ring,
                     state: &mut self.state,
+                    lanes,
+                    lane_rows,
                 },
             )
         }
@@ -798,7 +814,7 @@ mod gate {
 
     // ---------------------------------------------------------------- clause 3
 
-    fn check_refuse(cx: &Ctx) -> Result<bool, GateError> {
+    fn check_refuse(cx: &mut Ctx) -> Result<bool, GateError> {
         let w = weights(Regime::Band, 0x0ef0_0001);
         let mut dev = Dev::new(cx, &w)?;
         let mut r = Rng(0x0ef0_0002);
@@ -896,7 +912,50 @@ mod gate {
                 x0,
                 rows: &rows,
             };
-            let e = dev.steps(cx, st, pass, &mut ys[yi], true).err();
+            let e = dev
+                .steps(&cx.gpu, &mut cx.k, st, pass, &mut ys[yi], None, 0, true)
+                .err();
+            let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
+            let pass = matches!(e, Some(GpuError::Shape { .. })) && text.contains(want);
+            named.push(format!("{label}={}", verdict(pass)));
+            ok &= pass;
+        }
+        // The lanes' refusals (module doc, clause 3): (label, u, y rows, a
+        // buffer, lane_rows, the text). The short-lanes case's y must hold
+        // its pass, or the y refusal fires first.
+        let mut lanes = DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); 2])?;
+        let lanes_cases = [
+            (
+                "pass lanes none",
+                2,
+                0,
+                false,
+                2usize,
+                "with no lanes buffer",
+            ),
+            ("pass lane_rows past u", 2, 0, true, 2, "lane_rows 2 >= u 2"),
+            ("pass lanes short", 2, 1, true, 1, "lanes.len()"),
+        ];
+        for (label, u, yi, has, lane_rows, want) in lanes_cases {
+            let pass = Pass {
+                shape: device_shape()?,
+                u,
+                ld: LD,
+                x0: X0,
+                rows: &rows,
+            };
+            let e = dev
+                .steps(
+                    &cx.gpu,
+                    &mut cx.k,
+                    st,
+                    pass,
+                    &mut ys[yi],
+                    has.then_some(&mut lanes),
+                    lane_rows,
+                    true,
+                )
+                .err();
             let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
             let pass = matches!(e, Some(GpuError::Shape { .. })) && text.contains(want);
             named.push(format!("{label}={}", verdict(pass)));
@@ -906,6 +965,7 @@ mod gate {
         for y in &ys {
             untouched &= y.to_host_vec(st)?.iter().all(|v| v.to_bits() == POISON);
         }
+        untouched &= lanes.to_host_vec(st)?.iter().all(|v| v.to_bits() == POISON);
         let y = dev.read_y(cx)?;
         untouched &= y.iter().all(|v| v.to_bits() == POISON);
         ok &= untouched && clean(cx, "refuse")?;
@@ -924,7 +984,7 @@ mod gate {
         &y[g * WIDTH..(g + 1) * WIDTH]
     }
 
-    fn check_fault(cx: &Ctx) -> Result<bool, GateError> {
+    fn check_fault(cx: &mut Ctx) -> Result<bool, GateError> {
         let seed = 0x0fa1_7001;
         let w = weights(Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
@@ -1015,6 +1075,92 @@ mod gate {
 
     // ---------------------------------------------------------------- clause 5
 
+    /// The pass's lane rows (module doc, clause 5): a pass of four tokens
+    /// with `lane_rows` 3 on the exact regime — each lane row the host
+    /// twin's state after its token bit for bit, the final state the twin's
+    /// after four, and `y` and the state the same pass with no lanes keeps
+    /// bit for bit.
+    fn check_lanes(cx: &mut Ctx) -> Result<bool, GateError> {
+        let seed = 0x0a11_a501;
+        let w = weights(Regime::Exact, seed);
+        let mut r = Rng(seed ^ 0x9e37_79b9);
+        let st = init(&mut r, false);
+        let toks: Vec<TokenIn> = (0..4).map(|_| token(Regime::Exact, &mut r)).collect();
+        let ring0 = ring_of(&st, P0, false);
+        // The twin's state after each prefix: lane row t's is token t's,
+        // the fourth the pass's final state.
+        let mut want = Vec::new();
+        for t in 1..=toks.len() {
+            want.push(host_run(&w, &st, &toks[..t], true)?.scan);
+        }
+        let mut dev = Dev::new(cx, &w)?;
+        dev.load(cx, &ring0, &st.scan)?;
+        let stream = cx.gpu.stream();
+        dev.pos.copy_from_host(stream, &[P0])?;
+        let rows = DeviceBuffer::from_host(stream, &rows_of(&toks))?;
+        let pass = Pass {
+            shape: device_shape()?,
+            u: toks.len(),
+            ld: LD,
+            x0: X0,
+            rows: &rows,
+        };
+        let mut lanes =
+            DeviceBuffer::from_host(stream, &vec![f32::from_bits(POISON); 3 * INNER * STATE])?;
+        let mut y =
+            DeviceBuffer::from_host(stream, &vec![f32::from_bits(POISON); toks.len() * INNER])?;
+        dev.steps(
+            &cx.gpu,
+            &mut cx.k,
+            stream,
+            pass,
+            &mut y,
+            Some(&mut lanes),
+            3,
+            true,
+        )?;
+        let got = lanes.to_host_vec(stream)?;
+        let scan = dev.state.to_host_vec(stream)?;
+        let mut rows_same = 0;
+        for (t, (a, b)) in got.chunks(INNER * STATE).zip(&want).enumerate() {
+            let (n, first) = diff(a, b);
+            if n == 0 {
+                rows_same += 1;
+            } else {
+                println!("lanes: row {t} first difference {first:?} ({n} values)");
+            }
+        }
+        let (ns, s_first) = diff(&scan, &want[3]);
+        if ns != 0 {
+            println!("lanes: state first difference {s_first:?}");
+        }
+        // The same pass with no lanes: identical y and state.
+        dev.load(cx, &ring0, &st.scan)?;
+        let mut y0 =
+            DeviceBuffer::from_host(stream, &vec![f32::from_bits(POISON); toks.len() * INNER])?;
+        dev.steps(&cx.gpu, &mut cx.k, stream, pass, &mut y0, None, 0, true)?;
+        let scan0 = dev.state.to_host_vec(stream)?;
+        let (ny, y_first) = diff(&y.to_host_vec(stream)?, &y0.to_host_vec(stream)?);
+        if ny != 0 {
+            println!("lanes: y first difference {y_first:?} ({ny} values)");
+        }
+        let (n0, s0_first) = diff(&scan, &scan0);
+        if n0 != 0 {
+            println!("lanes: the laneless state first difference {s0_first:?}");
+        }
+        let ok = rows_same == 3 && ns == 0 && ny == 0 && n0 == 0 && clean(cx, "lanes")?;
+        println!(
+            "lanes: rows the twin's state after their token bit for bit {rows_same}/3, state the \
+             twin's after 4 {}, y the laneless pass's bit for bit {} {}",
+            verdict(ns == 0),
+            verdict(ny == 0),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    // ---------------------------------------------------------------- clause 6
+
     fn check_replay(cx: &Ctx) -> Result<bool, GateError> {
         let seed = 0x0e91_a701;
         let w = weights(Regime::Band, seed);
@@ -1061,7 +1207,7 @@ mod gate {
         Ok(pass)
     }
 
-    // ---------------------------------------------------------------- clause 6
+    // ---------------------------------------------------------------- clause 7
 
     /// The pass's input rows of `toks`: each token's `z`, `xbc` and `dt` at
     /// their columns of a row of `LD`.
@@ -1079,7 +1225,7 @@ mod gate {
     /// eager or captured and replayed once: each token's `y` row, the final
     /// ring and state, and the captured graph's node count.
     fn pass_run(
-        cx: &Ctx,
+        cx: &mut Ctx,
         dev: &mut Dev,
         start: (&[f32], &[f32], u32),
         toks: &[TokenIn],
@@ -1087,8 +1233,11 @@ mod gate {
         capture: bool,
     ) -> Result<(DevRun, Option<usize>), GateError> {
         let (ring, scan, p) = start;
-        let st = cx.gpu.stream();
         dev.load(cx, ring, scan)?;
+        // The capture's body borrows the kernels mutably beside the card's
+        // own shared borrow, so the two are split here.
+        let Ctx { gpu, k } = cx;
+        let st = gpu.stream();
         dev.pos.copy_from_host(st, &[p])?;
         let rows = DeviceBuffer::from_host(st, &rows_of(toks))?;
         let mut y = DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); toks.len() * INNER])?;
@@ -1102,11 +1251,11 @@ mod gate {
         // The graph lives until the reads below are done.
         let graph = if capture {
             let (dev, y) = (&mut *dev, &mut y);
-            let g = cx.gpu.capture(|s| dev.steps(cx, s, pass, y, norm))?;
+            let g = gpu.capture(|s| dev.steps(gpu, k, s, pass, y, None, 0, norm))?;
             g.launch(st)?;
             Some(g)
         } else {
-            dev.steps(cx, st, pass, &mut y, norm)?;
+            dev.steps(gpu, k, st, pass, &mut y, None, 0, norm)?;
             None
         };
         let run = DevRun {
@@ -1152,9 +1301,9 @@ mod gate {
     }
 
     /// The pass against as many steps from the same start (module doc,
-    /// clause 6).
+    /// clause 7).
     fn steps_case(
-        cx: &Ctx,
+        cx: &mut Ctx,
         label: &str,
         dev: &mut Dev,
         start: (&[f32], &[f32], u32),
@@ -1171,7 +1320,7 @@ mod gate {
 
     /// `u` tokens from a ring and state that `WARM` steps left at `P0 +
     /// WARM`.
-    fn steps_warm(cx: &Ctx, u: usize, norm: bool, seed: u64) -> Result<bool, GateError> {
+    fn steps_warm(cx: &mut Ctx, u: usize, norm: bool, seed: u64) -> Result<bool, GateError> {
         let w = weights(Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
         let st = init(&mut r, false);
@@ -1200,7 +1349,7 @@ mod gate {
     }
 
     /// Five tokens from position 0 over a ring of garbage.
-    fn steps_start(cx: &Ctx) -> Result<bool, GateError> {
+    fn steps_start(cx: &mut Ctx) -> Result<bool, GateError> {
         let seed = 0x05e9_5701;
         let w = weights(Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
@@ -1263,7 +1412,7 @@ mod gate {
         out[0]
     }
 
-    /// The norm tie (module doc, clause 6). The conv passes `x` through
+    /// The norm tie (module doc, clause 7). The conv passes `x` through
     /// (taps 0, 0, 0, 1, no bias; `x` = 32 so SiLU is the identity) and
     /// makes `B` and `C` zero, so `y = silu(z)·fl(32·D)` whatever the scan
     /// holds. Per group, the mean square is `L + h` with `L = 2^30 + 128j`
@@ -1271,7 +1420,7 @@ mod gate {
     /// half its f32 ulp: the step's chunk order sums to exactly `960·(L +
     /// h)` (the Small chunks absorbed), which narrows to `L`; any order that
     /// adds the Small chunks first lands above the tie, at `L + 128`.
-    fn steps_tie(cx: &Ctx) -> Result<bool, GateError> {
+    fn steps_tie(cx: &mut Ctx) -> Result<bool, GateError> {
         let seed = 0x05e9_7e01;
         let scale_of = |m: f32| 1.0 / (m + EPS).sqrt();
         let j = (0u32..1 << 16)
@@ -1366,7 +1515,7 @@ mod gate {
 
     /// The pass captured (three nodes with the gain) and replayed once
     /// equals the eager pass bit for bit.
-    fn steps_capture(cx: &Ctx) -> Result<bool, GateError> {
+    fn steps_capture(cx: &mut Ctx) -> Result<bool, GateError> {
         let seed = 0x05e9_ca01;
         let w = weights(Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
@@ -1387,7 +1536,7 @@ mod gate {
         Ok(ok)
     }
 
-    fn check_steps(cx: &Ctx) -> Result<bool, GateError> {
+    fn check_steps(cx: &mut Ctx) -> Result<bool, GateError> {
         let mut ok = true;
         for norm in [true, false] {
             for (i, &u) in STEPS_US.iter().enumerate() {
@@ -1405,17 +1554,18 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         let k = Mamba2Kernels::load(gpu.context())?;
-        let cx = Ctx { gpu, k };
+        let mut cx = Ctx { gpu, k };
         if let Some(f) = cx.gpu.take_fault()? {
             return Err(format!("gate_mamba2: the fault word held {f} before any launch").into());
         }
         let mut ok = true;
         ok &= check_exact(&cx)?;
         ok &= check_band(&cx)?;
-        ok &= check_refuse(&cx)?;
-        ok &= check_fault(&cx)?;
+        ok &= check_refuse(&mut cx)?;
+        ok &= check_fault(&mut cx)?;
+        ok &= check_lanes(&mut cx)?;
         ok &= check_replay(&cx)?;
-        ok &= check_steps(&cx)?;
+        ok &= check_steps(&mut cx)?;
         ok &= no_local_depot(&[
             "mamba2_step",
             "mamba2_steps",
@@ -1433,10 +1583,11 @@ mod gate {
              count that does not divide, a short buffer and a non-finite norm eps refused by name; \
              a NaN in x or B, an infinity in z, a non-finite dt and a non-finite A raise \
              mamba2_scan and leave their norm group non-finite and the other groups the clean \
-             bits; a captured graph is one node and replays three tokens bit for bit as eager; \
-             the prompt pass over 1 to 256 rows equals as many steps bit for bit (every y row, \
-             the state, the ring; with and without the gain, from the sequence start, on a norm \
-             tie, captured); no local depot"
+             bits; a pass's lane rows hold each row's scan state bit for bit and perturb nothing \
+             (the lane refusals by name with the pass's); a captured graph is one node and \
+             replays three tokens bit for bit as eager; the prompt pass over 1 to 256 rows equals \
+             as many steps bit for bit (every y row, the state, the ring; with and without the \
+             gain, from the sequence start, on a norm tie, captured); no local depot"
         );
         Ok(())
     }

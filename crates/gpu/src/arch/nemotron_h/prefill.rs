@@ -330,6 +330,8 @@ impl Body {
                             y,
                             ring: &mut mm.store.ring,
                             state: &mut mm.store.state,
+                            lanes: None,
+                            lane_rows: 0,
                         },
                     )?;
                     project(

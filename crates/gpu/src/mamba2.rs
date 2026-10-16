@@ -90,6 +90,16 @@
 //!   step's norm arithmetic over the chunks of 16 channels in the step's
 //!   block order.
 //!
+//! A pass can also keep each row's scan state, for a caller that verifies
+//! drafted tokens and keeps fewer of the pass's rows than it ran: with
+//! `lane_rows` L, the steps entry stores, after token `t` < L, the state its
+//! registers hold then — the final store's values and indexing — into
+//! `lanes` row `t` (the state layout's `[d_inner][128]` a row), and `state`
+//! still holds the state after the pass's last token. A verify pass that
+//! keeps k < U rows takes row k − 1's state from `lanes[k − 1]`; the conv
+//! ring needs no lane, its slots keyed by position and a rejected row's
+//! never read before it is rewritten.
+//!
 //! No silent failure: state other than 128, a conv of other than 4 taps, a
 //! geometry that does not divide, a buffer too short and a non-finite norm
 //! epsilon are refused by name at enqueue, before any launch. A non-finite
@@ -467,8 +477,9 @@ mod mamba2_kernels {
 
     /// `U` tokens of one layer from the pass's rows (module doc): the step's
     /// grid and, per token, its operations in its order; the ring is read
-    /// only, the state is stored once after the last token, and `y` row `t`
-    /// is token `t`'s un-normed output.
+    /// only, the state is stored once after the last token, `y` row `t` is
+    /// token `t`'s un-normed output, and `lanes` row `t` (t < `lane_rows`)
+    /// is the state as it stands after token `t`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -483,6 +494,7 @@ mod mamba2_kernels {
             n_group >= 1,
             head_dim >= 1,
             u >= 1,
+            lane_rows < u,
             n_head == per * n_group,
             chunks * CH_PER_BLOCK >= head_dim,
             chunks * CH_PER_BLOCK < head_dim + CH_PER_BLOCK,
@@ -498,7 +510,8 @@ mod mamba2_kernels {
             pos.len() >= pos_at + 1,
             ring.len() >= RING_ROWS * (n_head * head_dim + 2 * n_group * STATE),
             y.len() >= u * n_head * head_dim,
-            state.len() >= n_head * head_dim * STATE
+            state.len() >= n_head * head_dim * STATE,
+            lanes.len() >= lane_rows * n_head * head_dim * STATE
         )
     )]
     pub fn mamba2_steps(
@@ -512,6 +525,7 @@ mod mamba2_kernels {
         pos: &[u32],
         pos_at: u32,
         u: u32,
+        lane_rows: u32,
         ld: u32,
         z0: u32,
         x0: u32,
@@ -524,6 +538,7 @@ mod mamba2_kernels {
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
         mut state: DisjointSlice<f32>,
+        mut lanes: DisjointSlice<f32>,
     ) {
         static mut STAGE2: SharedArray<f32, STAGED2> = SharedArray::UNINIT;
 
@@ -534,12 +549,13 @@ mod mamba2_kernels {
             head_dim as usize,
             chunks as usize,
         );
-        let (u, ld, z0, x0, dt0) = (
+        let (u, ld, z0, x0, dt0, lane_rows) = (
             u as usize,
             ld as usize,
             z0 as usize,
             x0 as usize,
             dt0 as usize,
+            lane_rows as usize,
         );
         let b = thread::blockIdx_x() as usize;
         if b >= n_head * chunks {
@@ -559,7 +575,12 @@ mod mamba2_kernels {
         // reference to a `static mut`; the barrier of each token orders its
         // users (module doc: token `t` stages into half `t mod 2`).
         let cs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE2) };
-        let (yp, statep, ringp) = (y.as_mut_ptr(), state.as_mut_ptr(), ring.as_ptr());
+        let (yp, statep, ringp, lanesp) = (
+            y.as_mut_ptr(),
+            state.as_mut_ptr(),
+            ring.as_ptr(),
+            lanes.as_mut_ptr(),
+        );
         // SAFETY: pos_at < pos.len() by the contract.
         let p = unsafe { *pos.get_unchecked(pos_at as usize) } as usize;
         let c_x = h * hd + chunk * CH_PER_BLOCK;
@@ -696,6 +717,27 @@ mod mamba2_kernels {
                         // SAFETY: t·inner + at < u·inner <= y.len(); lane 0
                         // of this warp is its only writer.
                         unsafe { *yp.add(t * inner + at) = v };
+                    }
+                }
+            }
+            // The lane row of token t (module doc): the state this pass
+            // holds in registers after it, the final store's values and
+            // indexing. The branch is block-uniform in t.
+            if t < lane_rows {
+                let lbase = t * inner * STATE;
+                #[unroll]
+                for i in 0usize..CH_PER_WARP {
+                    let ch = chunk * CH_PER_BLOCK + wid * CH_PER_WARP + i;
+                    if ch < hd {
+                        let base = (h * hd + ch) * STATE + lane;
+                        #[unroll]
+                        for j in 0usize..4 {
+                            // SAFETY: t < lane_rows and base + 32·j <
+                            // n_head·hd·STATE, so lbase + base + 32·j <
+                            // lane_rows·n_head·hd·STATE <= lanes.len() by
+                            // the contract; this lane's element alone.
+                            unsafe { *lanesp.add(lbase + base + 32 * j) = s[4 * i + j] };
+                        }
                     }
                 }
             }
@@ -1016,7 +1058,9 @@ pub struct StepArgs<'a> {
 /// `u` tokens. The inputs are `u` token-major rows of `rows`, row stride
 /// `ld`, each holding the token's `z` at column `z0`, its conv input `xbc` at
 /// `x0` and its raw `dt` at `dt0` (the in-projection's output as it lands);
-/// `y` takes `u` rows of `d_inner`. The pass needs no scratch.
+/// `y` takes `u` rows of `d_inner`. With `lane_rows` L > 0, `lanes` takes L
+/// rows of the state's layout, row `t` the state standing after token `t`
+/// (`None` only with L = 0: no lane row is kept). The pass needs no scratch.
 pub struct StepsArgs<'a> {
     pub shape: Checked,
     pub u: usize,
@@ -1038,11 +1082,17 @@ pub struct StepsArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
     pub ring: &'a mut DeviceBuffer<f32>,
     pub state: &'a mut DeviceBuffer<f32>,
+    pub lanes: Option<&'a mut DeviceBuffer<f32>>,
+    pub lane_rows: usize,
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct Mamba2Kernels {
     module: mamba2_kernels::LoadedModule,
+    /// The `lanes` of a pass that keeps no lane row (`lane_rows` 0: the
+    /// entry writes none, so this one element is never written), private,
+    /// so no caller can be pointed at it.
+    no_lanes: DeviceBuffer<f32>,
 }
 
 impl Mamba2Kernels {
@@ -1051,7 +1101,11 @@ impl Mamba2Kernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(mamba2_kernels, ctx)? };
-        Ok(Mamba2Kernels { module })
+        let stream = crate::role_stream(ctx, crate::StreamRole::Engine)?;
+        Ok(Mamba2Kernels {
+            module,
+            no_lanes: DeviceBuffer::zeroed(&stream, 1)?,
+        })
     }
 
     /// Enqueue one decode token of one layer ([`StepArgs`], module doc):
@@ -1160,11 +1214,18 @@ impl Mamba2Kernels {
     /// module doc): `mamba2_steps`, `mamba2_ring_tail` and, with a gain,
     /// `mamba2_norm_rows`, in that order on `stream`. Every `y` row, the ring
     /// and the state after it are those of `u` [`Self::enqueue_step`] calls
-    /// on the same rows at positions `p ..`. Refuses what the step refuses,
-    /// and `u` = 0, a column window past `ld`, rows shorter than `u · ld` and
-    /// a `y` shorter than `u` rows, by name, launching nothing. Two or three
-    /// launches. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_steps(&self, stream: &CudaStream, args: StepsArgs<'_>) -> Result<(), GpuError> {
+    /// on the same rows at positions `p ..`, and `lanes` row `t` is the state
+    /// standing after token `t`. Refuses what the step refuses, and `u` = 0,
+    /// a `lane_rows` without a lanes buffer, a `lane_rows` past `u`, a column
+    /// window past `ld`, rows shorter than `u · ld`, a `y` shorter than `u`
+    /// rows and a lanes buffer shorter than `lane_rows` rows, by name,
+    /// launching nothing. Two or three launches. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_steps(
+        &mut self,
+        stream: &CudaStream,
+        args: StepsArgs<'_>,
+    ) -> Result<(), GpuError> {
         let what = "mamba2::enqueue_steps";
         let StepsArgs {
             shape,
@@ -1187,6 +1248,8 @@ impl Mamba2Kernels {
             y,
             ring,
             state,
+            lanes,
+            lane_rows,
         } = args;
         let shape = check(what, shape.geom())?;
         if norm.is_some() && !eps.is_finite() {
@@ -1196,6 +1259,20 @@ impl Mamba2Kernels {
             return Err(GpuError::shape(
                 what,
                 "u 0 is refused: a pass holds a token",
+            ));
+        }
+        if lane_rows > 0 && lanes.is_none() {
+            return Err(GpuError::shape(
+                what,
+                format!("lane_rows {lane_rows} > 0 with no lanes buffer"),
+            ));
+        }
+        if lane_rows >= u {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "lane_rows {lane_rows} >= u {u}: the state after the last token is the state's"
+                ),
             ));
         }
         let g = shape.geom();
@@ -1223,6 +1300,11 @@ impl Mamba2Kernels {
             ("y", y.len(), u.saturating_mul(inner)),
             ("ring", ring.len(), RING_ROWS * conv_dim),
             ("state", state.len(), inner * STATE),
+            (
+                "lanes",
+                lanes.as_ref().map_or(0, |b| b.len()),
+                lane_rows.saturating_mul(inner * STATE),
+            ),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
             return Err(GpuError::shape(
@@ -1246,6 +1328,7 @@ impl Mamba2Kernels {
             launch_u32(what, "chunks", chunks)?,
         );
         let u32_x0 = launch_u32(what, "x0", x0)?;
+        let u32_lane_rows = launch_u32(what, "lane_rows", lane_rows)?;
         let steps = self.module.prepare_mamba2_steps(LaunchConfig1D::new(
             launch_u32(what, "blocks", blocks)?,
             BLOCK as u32,
@@ -1278,6 +1361,7 @@ impl Mamba2Kernels {
             pos,
             u32_pos_at,
             u32_u,
+            u32_lane_rows,
             u32_ld,
             launch_u32(what, "z0", z0)?,
             u32_x0,
@@ -1290,6 +1374,9 @@ impl Mamba2Kernels {
             fault,
             &mut *y,
             state,
+            // With no lanes (`lane_rows` 0) the entry writes no lane row:
+            // the module's one-element buffer stands in, never written.
+            lanes.unwrap_or(&mut self.no_lanes),
         )?;
         self.module.mamba2_ring_tail(
             stream,
