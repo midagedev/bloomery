@@ -1289,7 +1289,6 @@ mod gate {
     /// when the dump is not there.
     fn synth_blocks(ty: GemmWeight, n_sb_total: usize, seed: u64) -> Vec<u8> {
         let name = match ty {
-            GemmWeight::Iq2Xxs => "iq2_xxs",
             GemmWeight::Iq3Xxs => "iq3_xxs",
             GemmWeight::Iq4Xs => "iq4_xs",
             _ => return synthetic(ty, n_sb_total, seed),
