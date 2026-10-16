@@ -4,7 +4,7 @@
 //! - a projection is its site's gemv over column runs of at most
 //!   [`COLS`] rows ([`project_rows`]): Q8_0 `q8_0_gemv_mcol` on the f32 rows,
 //!   NVFP4 `nvfp4_gemv` on the run's q8_1 columns, each weight read once a
-//!   run;
+//!   run; past [`COLS`] rows a Q8_0 site is one 32-value GEMM over the pass;
 //! - a Mamba-2 layer is one pass over its tokens
 //!   ([`Mamba2Kernels::enqueue_steps`], bit for bit the steps' scan);
 //! - an attention layer appends the pass's K/V rows to its planes and runs
@@ -36,13 +36,14 @@ use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{GROUP_16, GqaArgs, HEAD};
 use crate::gemm::Gemm32Kernels;
+use crate::gemm::{GemmInput, GemmRoute};
 use crate::head::Head;
 use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
 use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::EmbedQ8Args;
-use crate::site::KGemvKernels;
 use crate::site::{self, SiteTy};
+use crate::site::{KGemvKernels, SiteWeight, WideActs, WideKernels};
 use crate::tensor::{Pitched, WindowMut, dtod_2d};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window, launch_u32};
@@ -113,9 +114,20 @@ struct PassBufs {
     /// The q8_1 slot forms the `_sel` launches read, one a width:
     /// `(k, columns, form)`.
     slots: Vec<(usize, usize, Q8Act)>,
+    /// The projections' forms ([`project_rows`]).
+    arms: Arms,
+}
+
+/// What a projection over the pass's rows reads beside its f32 rows.
+struct Arms {
     /// The q8_1 forms of one run of [`COLS`] columns the NVFP4 gemv reads,
     /// one a width.
     runs: Vec<Q8Act>,
+    /// The q8 blocks of 32 a Q8_0 GEMM reads, the pass's rows, one a width.
+    wide: Vec<(usize, WideActs)>,
+    /// The pass's one-expert table: slot `s` reads column `s`, filled once a
+    /// pass.
+    route: GemmRoute,
 }
 
 impl Prompt {
@@ -160,9 +172,13 @@ impl Prompt {
             want(moe.shared_ff, rows)?;
         }
         let mut runs: Vec<Q8Act> = Vec::new();
+        let mut wide: Vec<(usize, WideActs)> = Vec::new();
         for s in layers.iter().flat_map(Layer::sites) {
             if s.ty == SiteTy::Nvfp4 && !runs.iter().any(|a| a.k() == s.k) {
                 runs.push(Q8Act::with_k(stream, COLS, s.k)?);
+            }
+            if s.ty == SiteTy::Q8_0 && !wide.iter().any(|a| a.0 == s.k) {
+                wide.push((s.k, WideActs::new(stream, (false, true), cut, s.k)?));
             }
         }
         let n_words = P_ROWS + sh.n_kv + rows;
@@ -190,7 +206,11 @@ impl Prompt {
                 sum: z(sh.hidden)?,
                 zero_ids: DeviceBuffer::zeroed(stream, cut)?,
                 slots,
-                runs,
+                arms: Arms {
+                    runs,
+                    wide,
+                    route: GemmRoute::new(stream, cut, 1)?,
+                },
             },
         })
     }
@@ -215,7 +235,9 @@ impl Prompt {
             + b.ids.num_bytes()
             + b.zero_ids.num_bytes()
             + b.slots.iter().map(|s| s.2.device_bytes()).sum::<usize>()
-            + b.runs.iter().map(Q8Act::device_bytes).sum::<usize>()
+            + b.arms.runs.iter().map(Q8Act::device_bytes).sum::<usize>()
+            + b.arms.wide.iter().map(|a| a.1.bytes()).sum::<usize>()
+            + b.arms.route.bytes()
     }
 
     /// The word index the pass's ids start at.
@@ -241,6 +263,7 @@ fn slot_form(
 struct Cx<'a> {
     gpu: &'a Gpu,
     w: &'a Weights,
+    wk: WideKernels<'a>,
     g32: &'a Gemm32Kernels,
     kgemv: &'a KGemvKernels,
     routers: &'a Routers,
@@ -249,12 +272,14 @@ struct Cx<'a> {
 }
 
 /// `y = W · x` for site `s` over the pass's `m` rows of `x` (`s.k` values a
-/// row), `rows` output values a row, token-major: runs of up to [`COLS`]
-/// columns, each its family's multi-column gemv. A type the pass does not
-/// run is refused by name.
+/// row), `rows` output values a row, token-major. Up to [`COLS`] rows, and
+/// for an NVFP4 site at any count, runs of up to [`COLS`] columns, each its
+/// family's multi-column gemv (the step's sums); a Q8_0 site past [`COLS`]
+/// rows is one 32-value GEMM over the pass's table, on the rows' q8 blocks of
+/// 32. A type the pass does not run is refused by name.
 fn project_rows(
     cx: &Cx<'_>,
-    runs: &mut [Q8Act],
+    arms: &mut Arms,
     layer: usize,
     (s, rows): (&Site, usize),
     x: &DeviceBuffer<f32>,
@@ -262,6 +287,23 @@ fn project_rows(
 ) -> Result<(), GpuError> {
     let (gpu, f) = (cx.gpu, size_of::<f32>());
     let key = (s.ty, cx.w, s.name.as_str());
+    if s.ty == SiteTy::Q8_0 && cx.m > COLS {
+        let a =
+            arms.wide.iter_mut().find(|a| a.0 == s.k).ok_or_else(|| {
+                GpuError::shape(WHAT, format!("no q8 blocks of 32 of width {}", s.k))
+            })?;
+        a.1.quantize(gpu, &cx.wk, gpu.layer_sink(layer)?, x, cx.m, &[s.ty])?;
+        return site::gemm(
+            gpu,
+            &cx.wk,
+            (s.ty, cx.w, SiteWeight::Resident(&s.name)),
+            rows,
+            &a.1.input(x),
+            (&arms.route, GemmInput::PerSlot),
+            cx.m,
+            y,
+        );
+    }
     let mut c0 = 0;
     while c0 < cx.m {
         let c = (cx.m - c0).min(COLS);
@@ -272,7 +314,7 @@ fn project_rows(
                 site::gemv(gpu, cx.g32, key, &xw, c, &mut yw)?;
             }
             SiteTy::Nvfp4 => {
-                let act = runs.iter_mut().find(|a| a.k() == s.k).ok_or_else(|| {
+                let act = arms.runs.iter_mut().find(|a| a.k() == s.k).ok_or_else(|| {
                     GpuError::shape(WHAT, format!("no q8_1 run form of width {}", s.k))
                 })?;
                 gpu.quantize_q8_1_cols_at(x, c0 * s.k, act, c, gpu.layer_sink(layer)?)?;
@@ -333,7 +375,7 @@ fn moe_rows(
         .enqueue_row_from(stream, (&p.probs, &p.ids, &p.weights), m - 1)?;
     project_rows(
         cx,
-        &mut p.runs,
+        &mut p.arms,
         l,
         (&ml.latent_down, sh.latent),
         &p.buf.xn,
@@ -377,7 +419,7 @@ fn moe_rows(
     )?;
     project_rows(
         cx,
-        &mut p.runs,
+        &mut p.arms,
         l,
         (&ml.latent_up, hidden),
         &p.moe,
@@ -453,6 +495,11 @@ impl Body {
         let at = Prompt::ids_at(n_kv);
         b.host_words[at..at + m].copy_from_slice(ids);
         b.words.copy_from_host(stream, &b.host_words)?;
+        if m > COLS {
+            self.k
+                .gemm
+                .enqueue_route_dense(stream, m, &mut b.arms.route, gpu.unlabelled_sink())?;
+        }
         {
             let (qs, d) = w.q8_planes(WHAT, &self.embed)?;
             let ids_w = Window::<u32>::of(&b.words, at * size_of::<u32>(), m)?;
@@ -475,6 +522,10 @@ impl Body {
         let cx = Cx {
             gpu,
             w,
+            wk: WideKernels {
+                gemm: &self.k.gemm,
+                g32: Some(&self.k.g32),
+            },
             g32: &self.k.g32,
             kgemv: &self.k.kgemv,
             routers: &self.mk.routers,
@@ -497,7 +548,7 @@ impl Body {
                     norm_rows((gpu, w), (sh.eps, sh.hidden, m), &mm.norm, src, &mut buf.xn)?;
                     project_rows(
                         &cx,
-                        &mut b.runs,
+                        &mut b.arms,
                         l,
                         (&mm.ssm_in, ld),
                         &buf.xn,
@@ -530,7 +581,7 @@ impl Body {
                     )?;
                     project_rows(
                         &cx,
-                        &mut b.runs,
+                        &mut b.arms,
                         l,
                         (&mm.ssm_out, sh.hidden),
                         &buf.y,
@@ -542,9 +593,9 @@ impl Body {
                     let kv_width = n_kv * HEAD;
                     let buf = &mut b.buf;
                     norm_rows((gpu, w), (sh.eps, sh.hidden, m), &a.norm, src, &mut buf.xn)?;
-                    project_rows(&cx, &mut b.runs, l, (&a.q, q_width), &buf.xn, &mut buf.q)?;
-                    project_rows(&cx, &mut b.runs, l, (&a.k, kv_width), &buf.xn, &mut buf.k)?;
-                    project_rows(&cx, &mut b.runs, l, (&a.v, kv_width), &buf.xn, &mut buf.v)?;
+                    project_rows(&cx, &mut b.arms, l, (&a.q, q_width), &buf.xn, &mut buf.q)?;
+                    project_rows(&cx, &mut b.arms, l, (&a.k, kv_width), &buf.xn, &mut buf.k)?;
+                    project_rows(&cx, &mut b.arms, l, (&a.v, kv_width), &buf.xn, &mut buf.v)?;
                     for h in 0..n_kv {
                         let shape = Pitched {
                             width: HEAD * f,
@@ -618,7 +669,7 @@ impl Body {
                     }
                     project_rows(
                         &cx,
-                        &mut b.runs,
+                        &mut b.arms,
                         l,
                         (&a.o, sh.hidden),
                         &buf.attn,
