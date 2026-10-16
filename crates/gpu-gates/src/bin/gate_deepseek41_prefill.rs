@@ -1341,6 +1341,8 @@ mod gate {
             [0, 3, 5, 383, 9, 12, 300, 6],
             [0, 3, 5, past, 9, 12, 300, past + 616],
             [0.25, 0.125, 0.25, 0.125, 0.0625, 0.0625, 0.0625, 0.0625],
+            // PIN(2026-10-16): handoff8/10 stop refusing 9; the built
+            // nine-slot entry is checked by handoff9_cases.
             &[5, 7],
         )
     }

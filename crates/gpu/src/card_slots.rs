@@ -42,6 +42,8 @@ const _: () = assert!(THREADS == 256);
 pub const SLOTS_6: usize = 6;
 /// Slots a token of the `_8` sum, whose contract spells it as a literal.
 pub const SLOTS_8: usize = 8;
+/// Slots a token of the `_9` sum, whose contract spells it as a literal.
+pub const SLOTS_9: usize = 9;
 /// Slots a token of the `_10` sum, whose contract spells it as a literal.
 pub const SLOTS_10: usize = 10;
 
@@ -53,6 +55,8 @@ pub enum CardSlots {
     Six,
     /// Eight slots a token (GLM-5.3-Flash).
     Eight,
+    /// Nine slots a token (Bolt).
+    Nine,
     /// Ten slots a token, the router's weights at a pitch of eleven
     /// (Qwen3.8).
     Ten,
@@ -65,6 +69,7 @@ impl CardSlots {
         match n_used {
             SLOTS_6 => Some(CardSlots::Six),
             SLOTS_8 => Some(CardSlots::Eight),
+            SLOTS_9 => Some(CardSlots::Nine),
             SLOTS_10 => Some(CardSlots::Ten),
             _ => None,
         }
@@ -76,6 +81,7 @@ impl CardSlots {
         match self {
             CardSlots::Six => SLOTS_6,
             CardSlots::Eight => SLOTS_8,
+            CardSlots::Nine => SLOTS_9,
             CardSlots::Ten => SLOTS_10,
         }
     }
@@ -86,6 +92,7 @@ impl CardSlots {
         match self {
             CardSlots::Six => "ds41_ffn_card_acc",
             CardSlots::Eight => "ds41_ffn_card_acc_8",
+            CardSlots::Nine => "ds41_ffn_card_acc_9",
             CardSlots::Ten => "ds41_ffn_card_acc_10",
         }
     }
@@ -95,7 +102,7 @@ impl CardSlots {
         GpuError::Shape {
             what: "ds41_ffn_card_acc",
             detail: format!(
-                "{n_used} routed slots a token: the card sum's entries are built for 6, 8 and 10"
+                "{n_used} routed slots a token: the card sum's entries are built for 6, 8, 9 and 10"
             ),
         }
     }
@@ -307,6 +314,48 @@ mod card_slots_kernels {
         // helper's contract asks for at SLOTS_10 slots.
         let v =
             unsafe { card_acc_at::<SLOTS_10>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// [`ds41_ffn_card_acc`] of nine slots a token ([`card_acc_at`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w_pitch >= 9,
+            down.len() >= 9 * n * m,
+            w.len() >= w_pitch * m,
+            sel.len() >= 9 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_9(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        w_pitch: u32,
+        fault: FaultSink,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_9 slots.
+        let v =
+            unsafe { card_acc_at::<SLOTS_9>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -575,6 +624,12 @@ impl CardSlotKernels {
                     stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
                 )?;
             }
+            CardSlots::Nine => {
+                let prep = mo.prepare_ds41_ffn_card_acc_9(cfg)?;
+                mo.ds41_ffn_card_acc_9(
+                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                )?;
+            }
             CardSlots::Ten => {
                 let prep = mo.prepare_ds41_ffn_card_acc_10(cfg)?;
                 mo.ds41_ffn_card_acc_10(
@@ -605,7 +660,7 @@ mod tests {
         )
     }
 
-    /// The sum at 6, 8 and 10 slots (the weights at the router's pitch of
+    /// The sum at 6, 8, 9 and 10 slots (the weights at the router's pitch of
     /// eleven at ten): a token whose slots are on the card or [`HOST`] is
     /// `runtime::combine::card_sum`'s and raises nothing; a place in
     /// `[n_card, HOST)` — the first past the card and the last before the
@@ -631,7 +686,7 @@ mod tests {
             (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
         };
         let mut red = Vec::new();
-        for n_used in [SLOTS_6, SLOTS_8, SLOTS_10] {
+        for n_used in [SLOTS_6, SLOTS_8, SLOTS_9, SLOTS_10] {
             let w_pitch = if n_used == SLOTS_10 {
                 n_used + 1
             } else {
@@ -703,6 +758,7 @@ mod tests {
                         let want = match n_used {
                             SLOTS_6 => rule::<SLOTS_6>(args.0, args.1, args.2),
                             SLOTS_8 => rule::<SLOTS_8>(args.0, args.1, args.2),
+                            SLOTS_9 => rule::<SLOTS_9>(args.0, args.1, args.2),
                             _ => rule::<SLOTS_10>(args.0, args.1, args.2),
                         };
                         g.to_bits() != want.to_bits()
@@ -730,7 +786,7 @@ mod tests {
         }
         // A card of no expert: every place is the host's, and the sum is
         // zeros with nothing raised.
-        for n_used in [SLOTS_6, SLOTS_8, SLOTS_10] {
+        for n_used in [SLOTS_6, SLOTS_8, SLOTS_9, SLOTS_10] {
             let sel = DeviceBuffer::from_host(stream, &vec![HOST; M * n_used]).expect("sel");
             let z = DeviceBuffer::from_host(stream, &vec![f32::NAN; M * n_used * N]).expect("z");
             let mut acc = DeviceBuffer::from_host(stream, &[1.0f32; N * M]).expect("acc");

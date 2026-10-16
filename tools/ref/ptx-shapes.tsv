@@ -46,6 +46,7 @@ generate_ds41   ds41_ffn_card_acc                        0           0
 generate_ds41   ds41_ffn_card_acc_10                     0           0
 generate_ds41   ds41_ffn_card_acc_8                      0           0
 generate_ds41   ds41_ffn_card_acc_8_tier                 0           0
+generate_ds41   ds41_ffn_card_acc_9                      0           0
 generate_ds41   ds41_ffn_card_acc_tier                   0           0
 generate_ds41   ds41_ffn_handoff                         0           0
 generate_ds41   ds41_ffn_handoff_10                      0           0
@@ -355,7 +356,6 @@ generate_ds41   swiglu_quant32_sel                       0           0
 generate_ds41   tier_fault_copy                          0           0
 generate_ds41   touch                                    0           0
 generate_ds41   weighted_sum                             0           0
-generate_ds41   weighted_sum_card                        0           0
 # PIN(2026-09-25): ds41_attn_seg_stage is the staged prefix segment pass (prefill only, never on the decode path); its ring ⧺ staging source keeps a few registers more than ds41_attn_seg, which already sits at the 128-register cap of a 512-thread block, and ptxas spills 8 bytes. ds41_attn_seg_sel_stage fits in 112 with none.
 
 # gate_e2e (--features gpu)
@@ -377,6 +377,7 @@ gate_e2e   down_add_q5_1                            0           0
 gate_e2e   ds41_ffn_card_acc                        0           0
 gate_e2e   ds41_ffn_card_acc_10                     0           0
 gate_e2e   ds41_ffn_card_acc_8                      0           0
+gate_e2e   ds41_ffn_card_acc_9                      0           0
 gate_e2e   ds41_ffn_handoff                         0           0
 gate_e2e   ds41_ffn_handoff_10                      0           0
 gate_e2e   ds41_ffn_handoff_10_cols                 0           0
@@ -634,7 +635,6 @@ gate_e2e   swiglu_quant32_sel                       0           0
 gate_e2e   tier_fault_copy                          0           0
 gate_e2e   touch                                    0           0
 gate_e2e   weighted_sum                             0           0
-gate_e2e   weighted_sum_card                        0           0
 
 # gate_qwen3vl_tower (--features vision), the shared vision entries, including Gemma4 residual and post-norm precision.
 # PIN(2026-10-15): the seven Gemma4 entries have zero sm_86 ptxas spill; jit_local=0 is a derived cc8.6 ceiling,
