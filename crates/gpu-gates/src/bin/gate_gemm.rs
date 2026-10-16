@@ -2741,8 +2741,10 @@ mod gate {
     /// plane is a relayout, so [`run_case`]'s oracle bands hold on it AND
     /// every output is bit for bit the file entry's at the same ids and
     /// columns; the writer refuses by name a `k` that is not a multiple of
-    /// 512 and a non-finite `d`; and the file entry's type is refused on the
-    /// plane's words (its rows are not a file stack's).
+    /// 512 and a non-finite `d`; and the plane entry refuses an odd `n_sb`
+    /// by name (a plane's d packing needs whole super-block pairs — the
+    /// layouts are byte-neutral, so a stack's words alone never say which
+    /// entry reads them: the variant and the loader's one writer do).
     fn iq2xxs_plane_cases(dev: &Dev<'_>) -> Result<bool, GateError> {
         if ![
             "iq2xxs_plane_synth",
@@ -2827,12 +2829,15 @@ mod gate {
                 verdict(pass)
             );
             ok &= pass;
-            // The file entry's type on the plane's words: refused (a plane
-            // stack's rows are 33·n_sb/2 words, not a file row's).
+            // The plane entry on an odd n_sb (k 768): refused by name — its
+            // d packing needs whole super-block pairs.
             let stream = dev.gpu.stream();
+            let (n_exp, rows, k) = (16usize, 128usize, 768usize);
+            // The resident is the file words (the writer refuses an odd
+            // n_sb before any launch); the entry asked for is the plane's.
             let st = Stack {
                 name: "iq2xxs_plane_refusals".into(),
-                ty: GemmWeight::Iq2XxsPlane,
+                ty: GemmWeight::Iq2Xxs,
                 bytes: std::borrow::Cow::Owned(synthetic(
                     GemmWeight::Iq2Xxs,
                     n_exp * rows * k / 256,
@@ -2852,7 +2857,7 @@ mod gate {
             let refused = dev.gk.enqueue_gemm(
                 stream,
                 GemmArgs {
-                    ty: GemmWeight::Iq2Xxs,
+                    ty: GemmWeight::Iq2XxsPlane,
                     w: &res.w,
                     rows_per_expert: st.rows,
                     act: &res.act,
@@ -2863,7 +2868,7 @@ mod gate {
             );
             let pass = refused.is_err();
             println!(
-                "gemm case=iq2xxs_plane_refusals file_type_on_plane_refused={pass} {}",
+                "gemm case=iq2xxs_plane_refusals odd_n_sb_768={pass} {}",
                 verdict(pass)
             );
             ok &= pass;
