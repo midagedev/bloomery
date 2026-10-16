@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/nvtier.rs	2026-10-09 20:24:24
++++ b/crates/gpu/src/host/nvtier.rs	2026-10-09 20:24:24
+@@ -999,7 +999,7 @@
+             drops: self.drops.drops.load(Ordering::Relaxed),
+             drop_bytes: self.drops.drop_bytes.load(Ordering::Relaxed),
+             drop_ns: self.drops.drop_ns.load(Ordering::Relaxed),
+-            slots_per_layer: self.slots as u64,
++            slots_per_layer: 0,
+         }
+     }
+ 

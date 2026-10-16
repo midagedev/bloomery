@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/nvtier.rs	2026-10-09 20:24:24
++++ b/crates/gpu/src/host/nvtier.rs	2026-10-09 20:24:24
+@@ -835,6 +835,8 @@
+             });
+         }
+         let least = ArenaFloor::of(plan, ARENA_COLUMNS).map_err(|e| GpuError::plan(WHAT, e))?;
++        let least = ArenaFloor::new(least.k, least.columns, 0, least.slot_set)
++            .map_err(|e| GpuError::plan(WHAT, e))?;
+         let count = slots_of(plan.host.nvme_arena_bytes, &slot_sizes, &least)
+             .map_err(|e| GpuError::shape(WHAT, e))?;
+         let page = page_bytes().map_err(|e| GpuError::plan(WHAT, e))?;

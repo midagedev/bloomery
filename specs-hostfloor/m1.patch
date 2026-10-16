@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/nvtier.rs	2026-10-09 20:24:24
++++ b/crates/gpu/src/host/nvtier.rs	2026-10-09 20:24:24
+@@ -104,7 +104,7 @@
+     }
+     let n = (budget as usize) / total;
+     let want = least.slots.max(1);
+-    if (n as u64) < want {
++    if n == 0 {
+         return Err(format!(
+             "the arena's budget {budget} B carves {n} slots a paged layer over the paged layers' \
+              {total} B a slot set, under the floor of {want} slots ({} × {} ids a call + {} lane \

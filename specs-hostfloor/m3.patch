@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/nvtier.rs	2026-10-09 20:24:24
++++ b/crates/gpu/src/host/nvtier.rs	2026-10-09 20:24:24
+@@ -84,7 +84,7 @@
+ /// placement's one shape of a window ([`arena_window_bytes`]), the same
+ /// shape the staging swap's ring slot uses.
+ pub(crate) fn window_bytes(len: usize) -> usize {
+-    arena_window_bytes(len as u64) as usize
++    arena_window_bytes(len as u64) as usize + DIRECT_ALIGN
+ }
+ 
+ /// The slots a layer holds for the arena's `budget` bytes over the paged
