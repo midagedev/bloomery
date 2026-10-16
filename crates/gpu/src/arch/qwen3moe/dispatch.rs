@@ -579,6 +579,58 @@ pub(super) fn site_gemv(
     c.k.proj.enqueue_token_major(gpu.stream(), cols, rows, m, y)
 }
 
+/// The buffers a shared expert run as its own dense FFN ([`shared_dense`])
+/// writes: the gate and up rows (`ff` values a token), the SwiGLU rows `h`
+/// with their q8_1 form `act` (the activation of the unit's `m` columns), and
+/// the output `y` (`hidden` a token).
+pub(super) struct SharedDenseBufs<'a> {
+    pub(super) g: &'a mut DeviceBuffer<f32>,
+    pub(super) u: &'a mut DeviceBuffer<f32>,
+    pub(super) h: &'a mut DeviceBuffer<f32>,
+    pub(super) act: &'a mut Q8Act,
+    pub(super) y: &'a mut DeviceBuffer<f32>,
+}
+
+/// A shared expert as its own dense FFN at its site types, at `m <=
+/// GEMV_COLS` rows: the owner of the run for the whole-card load's apart arm
+/// ([`apart_down`]) and for a placed layer whose shared expert the `_sel`
+/// table does not run (`placed::SharedFfn::Sites`). Gate and up
+/// ([`site_gemv`]) read the normed rows in the form their type reads: `xin`
+/// is `(q8_1 of the normed rows, the f32 normed rows)`, a K-quant site the
+/// first, a Q8_0 or F32 site the second. Then the SwiGLU of the `ff`-wide
+/// rows into `b.h` (f32), its q8_1 form `b.act` only when the down is a
+/// K-quant site (any other down reads `b.h`), and the down into `b.y`
+/// (`hidden` wide). `cols` is the row-major scratch of a K-quant site
+/// launched alone past one row.
+pub(super) fn shared_dense(
+    c: &Ctx<'_>,
+    sh: &SharedSites,
+    (ff, hidden): (usize, usize),
+    xin: (&Q8Act, &DeviceBuffer<f32>),
+    m: usize,
+    mut cols: Option<&mut DeviceBuffer<f32>>,
+    b: SharedDenseBufs<'_>,
+) -> Result<(), GpuError> {
+    let SharedDenseBufs { g, u, h, act, y } = b;
+    site_gemv(
+        c,
+        (sh.gate_ty, &sh.gate),
+        ff,
+        xin,
+        m,
+        cols.as_deref_mut(),
+        g,
+    )?;
+    site_gemv(c, (sh.up_ty, &sh.up), ff, xin, m, cols.as_deref_mut(), u)?;
+    c.gpu
+        .elem()
+        .enqueue_swiglu(c.gpu.stream(), g, u, m * ff, h)?;
+    if sh.down_ty.kquant() {
+        c.gpu.enqueue_quantize_q8_1_layer(h, act, c.layer)?;
+    }
+    site_gemv(c, (sh.down_ty, &sh.down), hidden, (act, h), m, cols, y)
+}
+
 /// The attention half: `x` in, `ffn_inp = x + attn_output(attn(x))` out —
 /// q, k and v in one launch (a Q6_K v in its own) when Q4_K, else each by
 /// its type ([`site_gemv`]), the head norm and the rope by the rows'
@@ -1219,8 +1271,7 @@ impl FfnKernels {
 /// it at the table's entry (the K-quant family's, which skips the shared
 /// slot), the q8_1 of the routed slots' columns alone, the routed down
 /// `_sel`; the shared expert as its own dense FFN at its types
-/// ([`site_gemv`]: gate, up, the SwiGLU, the down, with the SwiGLU's q8_1
-/// for a K-quant down); and the combine with a host sum (`hostleg`): `((Σ
+/// ([`shared_dense`]); and the combine with a host sum (`hostleg`): `((Σ
 /// routed w·d + 0) + resid) + σ · shared`, ik's grouping, the host's routed
 /// sum zero because a whole-card load serves every routed slot on the card.
 fn apart_down(
@@ -1350,34 +1401,24 @@ fn apart_down(
             ));
         }
     }
-    let xin = (&act_ffn[i], &*normed);
-    site_gemv(
-        c,
-        (sh.gate_ty, &sh.gate),
-        d.ff,
-        xin,
-        m,
-        cols.as_mut(),
-        &mut a.g,
-    )?;
-    site_gemv(c, (sh.up_ty, &sh.up), d.ff, xin, m, cols.as_mut(), &mut a.u)?;
-    gpu.elem()
-        .enqueue_swiglu(stream, &a.g, &a.u, m * d.ff, &mut a.h)?;
     let sh_act = a.act.get_mut(i).ok_or(GpuError::state(
         WHAT,
         "the shared expert's SwiGLU activations of m columns",
     ))?;
-    if sh.down_ty.kquant() {
-        gpu.enqueue_quantize_q8_1_layer(&a.h, sh_act, c.layer)?;
-    }
-    site_gemv(
+    shared_dense(
         c,
-        (sh.down_ty, &sh.down),
-        d.hidden,
-        (sh_act, &a.h),
+        sh,
+        (d.ff, d.hidden),
+        (&act_ffn[i], &*normed),
         m,
         cols.as_mut(),
-        &mut a.y,
+        SharedDenseBufs {
+            g: &mut a.g,
+            u: &mut a.u,
+            h: &mut a.h,
+            act: sh_act,
+            y: &mut a.y,
+        },
     )?;
     kk.leg.enqueue_combine(
         stream,

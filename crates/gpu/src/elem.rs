@@ -1003,6 +1003,31 @@ mod elem_kernels {
         e.map(silu_mul);
     }
 
+    /// `y[i] = swiglu_clamp(gate[i], up[i], limit)`, elementwise over `n`
+    /// values: ik's clamped SwiGLU, the one function the K-quant gate·up
+    /// kernels and the SwiGLU quantizer apply (`kquant::act::apply`), written
+    /// as f32 rows. The core is called by its full path, as this kernel
+    /// takes its name.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (gate.len() >= n, up.len() >= n, y.len() >= n)
+    )]
+    pub fn swiglu_clamp(gate: &[f32], up: &[f32], n: u32, limit: f32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem2::new(gate, up, &mut y, i) };
+        e.map(move |g, u| crate::kquant::act::swiglu_clamp(g, u, limit));
+    }
+
     /// `y[i] = a[i] + b[i]`, elementwise over `n` values — exact; the body
     /// is one add, so nothing is extracted into a core.
     #[kernel]
@@ -1952,6 +1977,48 @@ impl ElemKernels {
             .module
             .prepare_swiglu(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.swiglu(stream, &prep, gate, up, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue `y = swiglu_clamp(gate, up, limit)` over `n` values (flat): ik's clamped SwiGLU
+    /// (`min(silu(g), limit) · max(-limit, min(limit, u))`; none at `limit <= 1e-6`) as f32 rows,
+    /// the value `kquant::act::apply` gives under [`Act::SwigluClamp`]. A `limit` that is not
+    /// finite is refused by name. Asynchronous, allocation-free, capturable.
+    ///
+    /// [`Act::SwigluClamp`]: crate::kquant::Act::SwigluClamp
+    pub fn enqueue_swiglu_clamp(
+        &self,
+        stream: &CudaStream,
+        gate: &DeviceBuffer<f32>,
+        up: &DeviceBuffer<f32>,
+        limit: f32,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "enqueue_swiglu_clamp";
+        if !limit.is_finite() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("the clamp limit must be finite, got {limit}"),
+            ));
+        }
+        if n == 0 || gate.len() < n || up.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "n={n}, gate.len() {}, up.len() {}, y.len() {}",
+                    gate.len(),
+                    up.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let n = launch_u32(WHAT, "n", n)?;
+        let prep =
+            self.module
+                .prepare_swiglu_clamp(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module
+            .swiglu_clamp(stream, &prep, gate, up, n, limit, y)?;
         Ok(())
     }
 

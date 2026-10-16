@@ -22,9 +22,10 @@
 //!   Q5_K, the table's entry for the stack's type), the q8_1 of the card
 //!   slots' rows, the down `_sel` the table names for the stack's type
 //!   ([`DownArm`]: Q4_K, Q5_K or Q6_K) — and on Qwen3.6 the shared
-//!   expert on its own stacks, a stack of one expert on a fixed route of
-//!   expert 0 ([`SharedFfn`]); a slot the host serves is [`HOST`] there and
-//!   no launch reads or writes it;
+//!   expert by its types ([`SharedFfn`]): on its own stacks, a stack of one
+//!   expert on a fixed route of expert 0, when the same table runs all three
+//!   parts, else as its own dense FFN at its site types; a slot the host
+//!   serves is [`HOST`] there and no launch reads or writes it;
 //! - the back: the step's wait (a unit's serve and upload are the walk's),
 //!   then the combine of the card's slots with the host's routed sum, the
 //!   residual and the shared expert (`hostleg`), into the next layer's
@@ -57,10 +58,11 @@
 //! placed load agrees with the whole-card one to the error of those sums.
 
 use super::body::{Kernels, ggml_ty, stack_tys};
-use super::dispatch::{self, Ctx, PassCtx};
+use super::dispatch::{self, Ctx, PassCtx, SharedDenseBufs};
 use super::hostleg::{HostCombineArgs, HostLegKernels, PlacesArgs};
 use super::plan::{
-    FfnPlan, FfnRoute, GateUpEntry, LayerPlan, SharedPlan, SharedSites, SiteTy, gate_up_entry,
+    FfnPlan, FfnRoute, GateUpEntry, LayerPlan, SharedPlan, SharedSites, SiteTy, down_entry,
+    gate_up_entry, shared_entry,
 };
 use super::program::{Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
@@ -78,6 +80,7 @@ use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid,
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
+use crate::site;
 use crate::tensor::{DeviceTensor, Q8Act, Window, WindowMut};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
@@ -103,10 +106,23 @@ pub(super) const PLACED_ROWS: usize = UNION_MAX_COLS;
 /// The rows of a placed decode step: the step arena's one row.
 const STEP_ROWS: usize = 1;
 
-/// The shared expert of a placed Qwen3.6 layer: its three stacks of one
-/// expert each, as the file holds them, its gate·up entry and its down's
-/// type.
-pub(super) struct SharedFfn {
+/// The shared expert of a placed Qwen3.6 layer, run by its plan's types
+/// ([`shared_ffn`]): the placed twin of the whole-card load's
+/// `Joined`/`Apart` split.
+pub(super) enum SharedFfn {
+    /// All three parts are types the card kernel table's `_sel` family runs
+    /// (a gate and up of one type with a [`gate_up_entry`], a down with a
+    /// [`down_entry`]): its three stacks of one expert each, as the file holds
+    /// them, on a fixed route of expert 0.
+    Stack(SharedStack),
+    /// Any other mix of the types [`shared_entry`] admits: the shared expert
+    /// as its own dense FFN at its site types (`dispatch::shared_dense`).
+    Sites,
+}
+
+/// A shared expert run as a stack of one expert ([`SharedFfn::Stack`]): its
+/// tensors, its gate·up entry and its down's type.
+pub(super) struct SharedStack {
     gate: String,
     up: String,
     down: String,
@@ -389,8 +405,8 @@ impl Placed {
     /// layer's card stacks checked against its card count and the types the
     /// launches take ([`stack_tys`]: the table's gate·up and down entries the
     /// FFN dispatch launches; a stack of other rows would leave slots that
-    /// neither side sums), the shared expert's stacks on a gated router's
-    /// chain, the boundary of one row, the host tier over every layer's
+    /// neither side sums), the shared expert of a gated router's chain
+    /// admitted by its plan's types ([`shared_ffn`]), the boundary of one row, the host tier over every layer's
     /// routed stacks (qdot's, refused by name for a stack no fused kernel
     /// serves) watching the fault word and holding the host set, its batch
     /// port for units of up to `o.rows` rows, and the buffers (past
@@ -818,21 +834,20 @@ fn placed_ffn(
     };
     let shared = match &p.ffn.route {
         FfnRoute::Router {
-            shared: Some(_), ..
+            shared: Some(SharedPlan::Apart(sh)),
+            ..
+        } => Some(shared_ffn(w, sh, (ff, h), l)?),
+        FfnRoute::Router {
+            shared: Some(SharedPlan::Joined),
+            ..
         } => {
-            let (g, u, dn) = (
-                format!("blk.{l}.ffn_gate_shexp.weight"),
-                format!("blk.{l}.ffn_up_shexp.weight"),
-                format!("blk.{l}.ffn_down_shexp.weight"),
-            );
-            let [gate_ty, up_ty, down_ty] = stack_tys(w, [&g, &u, &dn], (1, ff, h), l)?;
-            Some(SharedFfn {
-                gate_up: gate_up_entry(gate_ty, up_ty, WHAT)?,
-                gate: g,
-                up: u,
-                down: dn,
-                down_ty,
-            })
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}'s shared expert is folded into its stacks; a placed load keeps it \
+                     apart (apart_plans)"
+                ),
+            ));
         }
         FfnRoute::Router { shared: None, .. } => None,
         FfnRoute::Dense => {
@@ -860,6 +875,49 @@ fn placed_ffn(
         gate_up,
         down_ty,
         shared,
+    })
+}
+
+/// How layer `l`'s shared expert `sh` (the plan's [`SharedSites`], the file
+/// header's types) runs on the placed side, after its admission: each part's
+/// type is one [`shared_entry`] names a dense site for, refused by name with
+/// the layer, and each part is resident as that type at its shape
+/// (`site::site`; a placed load's weights are checked here, not by
+/// `check_resident`).
+///
+/// The rule is the placed twin of the whole-card `Joined`/`Apart` split: a
+/// shared expert the `_sel` table runs — a gate and up of one type with a
+/// [`gate_up_entry`] and a down with a [`down_entry`], which are the K-quant
+/// word planes today's stack of one expert reads — keeps that path, so a
+/// Q4_K_M placed load launches what it did; any other mix takes the dense
+/// FFN at its site types ([`SharedFfn::Sites`]).
+fn shared_ffn(
+    w: &Weights,
+    sh: &SharedSites,
+    (ff, h): (usize, usize),
+    l: usize,
+) -> Result<SharedFfn, GpuError> {
+    let at = |e: GpuError| GpuError::shape(WHAT, format!("layer {l}: {e}"));
+    for (name, ty, shape) in [
+        (&sh.gate, sh.gate_ty, (ff, h)),
+        (&sh.up, sh.up_ty, (ff, h)),
+        (&sh.down, sh.down_ty, (h, ff)),
+    ] {
+        shared_entry(ty, WHAT).map_err(at)?;
+        site::site(w, WHAT, name, shape, ty)?;
+    }
+    let stack = gate_up_entry(sh.gate_ty, sh.up_ty, WHAT)
+        .ok()
+        .zip(down_entry(sh.down_ty, WHAT).ok());
+    Ok(match stack {
+        Some((gate_up, _)) => SharedFfn::Stack(SharedStack {
+            gate: sh.gate.clone(),
+            up: sh.up.clone(),
+            down: sh.down.clone(),
+            gate_up,
+            down_ty: sh.down_ty,
+        }),
+        None => SharedFfn::Sites,
     })
 }
 
@@ -950,11 +1008,17 @@ fn route(
 /// Layer `l`'s card work under the host leg over `m` rows of arena `s`
 /// (module doc's shadow): the card's routed slots by the places in `rows`
 /// when the layer has card experts, then the shared expert.
+///
+/// `normed` is the f32 normed rows a Q8_0 or F32 shared-expert part reads
+/// ([`shared_sites`]): the step boundary's activation, where the step's
+/// front wrote them, or the arena's own when `None`, where a unit's front
+/// did.
 fn shadow(
     c: &Ctx<'_>,
     side: &PlacedSide,
     rows: &mut PlacedRows,
     s: &mut Arena,
+    normed: Option<&DeviceBuffer<f32>>,
     m: usize,
 ) -> Result<(), GpuError> {
     let (gpu, w, k) = (c.gpu, c.w, c.k);
@@ -1010,39 +1074,115 @@ fn shadow(
             &mut s.down,
         )?;
     }
-    if let (Some(sh), Some(r)) = (&f.shared, rows.shared.as_mut()) {
-        gate_up_sel(
-            (stream, &side.k.kquant),
-            sh.gate_up,
-            &GateUpAct {
-                wg: kq_weight(w, &sh.gate)?,
-                wu: kq_weight(w, &sh.up)?,
-                act: &s.act_ffn[i],
-                sel: &r.zero,
-                n_slots: m,
-                rows_per_expert: ff,
-                slots_per_col: 1,
-                rule: Act::SiluMul,
-            },
-            c.sink,
-            &mut r.h,
-        )?;
-        let act = r.act.get_mut(i).ok_or(GpuError::state(
-            WHAT,
-            "the shared expert's activations of m columns",
-        ))?;
-        gpu.enqueue_quantize_q8_1_layer(&r.h, act, c.layer)?;
-        down_sel(
-            (gpu, k, &side.k.kquant),
-            (sh.down_ty, kq_weight(w, &sh.down)?),
-            (act, &r.zero),
-            m,
-            hidden,
-            c.sink,
-            &mut r.y,
-        )?;
+    match (&f.shared, rows.shared.as_mut()) {
+        (Some(SharedFfn::Stack(sh)), Some(r)) => shared_stack(c, side, (sh, r), s, m)?,
+        (Some(SharedFfn::Sites), Some(r)) => shared_sites(c, r, s, normed, m)?,
+        (None, _) => {}
+        (Some(_), None) => {
+            return Err(GpuError::state(WHAT, "the shared expert's buffers"));
+        }
     }
     Ok(())
+}
+
+/// Layer `c.layer`'s shared expert as a stack of one expert on a fixed route
+/// of expert 0 ([`SharedFfn::Stack`]) over `m` rows: the gate·up `_sel`
+/// over the q8_1 of the normed rows into the SwiGLU rows, their q8_1, and
+/// the down `_sel` into the output `combine` adds.
+fn shared_stack(
+    c: &Ctx<'_>,
+    side: &PlacedSide,
+    (sh, r): (&SharedStack, &mut SharedRows),
+    s: &Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let RouteShape { hidden, ff, .. } = side.shape;
+    let i = s.col(m)?;
+    gate_up_sel(
+        (gpu.stream(), &side.k.kquant),
+        sh.gate_up,
+        &GateUpAct {
+            wg: kq_weight(w, &sh.gate)?,
+            wu: kq_weight(w, &sh.up)?,
+            act: &s.act_ffn[i],
+            sel: &r.zero,
+            n_slots: m,
+            rows_per_expert: ff,
+            slots_per_col: 1,
+            rule: Act::SiluMul,
+        },
+        c.sink,
+        &mut r.h,
+    )?;
+    let act = r.act.get_mut(i).ok_or(GpuError::state(
+        WHAT,
+        "the shared expert's activations of m columns",
+    ))?;
+    gpu.enqueue_quantize_q8_1_layer(&r.h, act, c.layer)?;
+    down_sel(
+        (gpu, k, &side.k.kquant),
+        (sh.down_ty, kq_weight(w, &sh.down)?),
+        (act, &r.zero),
+        m,
+        hidden,
+        c.sink,
+        &mut r.y,
+    )
+}
+
+/// Layer `c.layer`'s shared expert as its own dense FFN at its site types
+/// ([`SharedFfn::Sites`]) over `m` rows: `dispatch::shared_dense`, the run
+/// the whole-card load's apart arm makes. The gate and up read the q8_1 of
+/// the normed rows (`act_ffn[i]`, which the front's `norm_quant` wrote) or,
+/// for a Q8_0 or F32 part, the f32 normed rows: `normed`, or the arena's own
+/// when `None` (the same two buffers `route` wrote). The gate and up rows
+/// are the arena's apart buffers (`Forms::apart` sizes them for every placed
+/// load of a chain with a shared expert); the SwiGLU rows, their q8_1 and the
+/// output are the host leg's `r`, whose output `combine` adds.
+fn shared_sites(
+    c: &Ctx<'_>,
+    r: &mut SharedRows,
+    s: &mut Arena,
+    normed: Option<&DeviceBuffer<f32>>,
+    m: usize,
+) -> Result<(), GpuError> {
+    let sh = c.p.ffn.apart().ok_or(GpuError::state(
+        WHAT,
+        "a shared expert kept apart on a layer whose placed side runs its sites",
+    ))?;
+    let i = s.col(m)?;
+    let d = s.dims;
+    let Arena {
+        act_ffn,
+        normed: own,
+        cols,
+        apart,
+        ..
+    } = s;
+    let a = apart.as_mut().ok_or(GpuError::state(
+        WHAT,
+        "the arena's buffers of a shared expert kept apart",
+    ))?;
+    let act = r.act.get_mut(i).ok_or(GpuError::state(
+        WHAT,
+        "the shared expert's activations of m columns",
+    ))?;
+    dispatch::shared_dense(
+        c,
+        sh,
+        (d.ff, d.hidden),
+        (&act_ffn[i], normed.unwrap_or(&*own)),
+        m,
+        cols.as_mut(),
+        SharedDenseBufs {
+            g: &mut a.g,
+            u: &mut a.u,
+            h: &mut r.h,
+            act,
+            y: &mut r.y,
+        },
+    )
 }
 
 /// The gate·up `_sel` of the slots `a` selects over the stacks `a` names, at
@@ -1363,11 +1503,13 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
         hy.boundary().enqueue_go_of(stream, l, 0)
     }
 
-    /// The card's routed experts and the shared expert.
-    fn shadow(&mut self, _: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+    /// The card's routed experts and the shared expert (the norm's f32 rows
+    /// it may read are the boundary's).
+    fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let p = &mut self.p;
         let lc = ctx_of(p.c, at.layer)?;
-        shadow(&lc, p.side, p.rows, p.s, 1)
+        let normed = port.hybrid().boundary().normed();
+        shadow(&lc, p.side, p.rows, p.s, Some(normed), 1)
     }
 
     /// The wait, the combine — into the head's input after the last layer
@@ -1533,7 +1675,7 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
         if p.m > GEMV_COLS {
             return card_wide(&lc, p.side, p.rows, p.s, p.m);
         }
-        shadow(&lc, p.side, p.rows, p.s, p.m)
+        shadow(&lc, p.side, p.rows, p.s, None, p.m)
     }
 
     /// The combine over the host sums the walk's serve uploaded.
