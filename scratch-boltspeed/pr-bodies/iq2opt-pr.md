@@ -34,7 +34,11 @@ Rebased since onto main 85511826 as ab44b6ce / 2e30c849: `git diff 4b83c062 2e30
 | `just gate-gpu-glm-sel` | s1657 | `gate_glm_sel: 98 clauses, 0 failed — PASS` |
 | `just gate-gpu-routed-legs` | s1663 | `gate_routed_legs: PASS` |
 | `just gate-gpu-qwen4exp-iqleg` | s1675 | PASS (`clause 2 bits: 8939556 bytes vs 8939556, 0 differ`) |
-| `./tools/ptx-compare.sh d0e8a8e1 gate_e2e --features gpu` | s1689 | pending (queued); added to this body when it lands |
+| `./tools/ptx-compare.sh d0e8a8e1 gate_e2e --features gpu` (head 2e30c849, rebased on 85511826) | s1689 | rc 3: added 1 (`head_norm_neox_append_256_whole`, main's between d0e8a8e1 and 85511826, not this PR's), removed none, changed 11 = the i-quant `_sel` entries this PR rewrites (`iq2_xs/iq2_xxs/iq3_s/iq3_xxs/iq4_xs` gemv_sel and gate_up_sel, `iq4_nl_gemv_sel32`) and `iq2_xxs_rows` (its `iq2xxs_sub` reads the table); nothing else moved |
+| review fixes 25e230e1 (unused table param, split unsafe scopes): `just canon-check 8a16e7a4` | box, direct (no card, no queue job) | `canon-check: 3 bins, 883 entries: 883 identical, 0 reordered-only, 0 differs` — the same programs |
+| `just gate-gpu-iq-sel` @ 25e230e1 | s1745 | `gate_iq_sel: PASS` |
+| `just gate-gpu-iq` @ 25e230e1 | s1748 | `gate_iq: PASS` |
+| rebased onto main 98a513fc (no conflict): db89247e = 25e230e1's tree on the new base | — | fmt and `check-unsafe` (gpu 1869 203 10) green locally |
 
 Kernel A/B (`tools/ref/time-gate.sh gate_iq_sel --bench-kernels --bench-arm iq2xxs` under the lease, card `docs/cards/bolt-iq2opt.card`, one sitting a tree back to back; a second interleaved round was cancelled for the deadline):
 

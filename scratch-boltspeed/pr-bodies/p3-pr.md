@@ -36,7 +36,8 @@ nsys of main's decode (A6000, below) puts the graph's gaps near 0 (12175 µs of 
 | `BLOOMERY_TIER=fixture just gate-gpu-nemotron-h-moe-e2e` @ 77180fa2 | s1713 | PASSED; `graph_nodes=57` `norm_quant=3/3` |
 | FAIL-first P3b (MoE norm + quantize restored), fixture tier | s1716 | killed: `norm_quant=1/3 … clause structure FAIL`, only that clause; clean-after s1718 green; `mutant-run: 1 mutants, 1 killed, 0 survived … — PASS` |
 
-| fixture + real e2e @ cea33b80 | queued | (rows added when they land) |
+| `BLOOMERY_TIER=fixture just gate-gpu-nemotron-h-moe-e2e` @ cea33b80 | s1741 | PASSED; `graph_nodes=57` |
+| `just gate-gpu-nemotron-h-moe-e2e` (real) @ cea33b80 | s1744 | PASSED; `graph_nodes=1004`; the 24 printed logit/route/reset lines byte-identical (sorted, `cmp` rc 0) to 77180fa2's s1711 |
 
 Bit identity: at both commits, the real tier's 24 printed logit/route lines (`eager_equals_replay`, `logits_near_mainlines_real` per prompt with max |delta|, cosine and top-5 logits, `top1_is_mainlines_real` margins) are byte-identical (`cmp` rc 0) to the same gate's run on the bit-identical iq2opt branch (s1656, A6000), and eager = replay holds.
 
