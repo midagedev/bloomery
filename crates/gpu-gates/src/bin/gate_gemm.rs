@@ -3046,6 +3046,7 @@ mod gate {
                 Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput,
                 GemmKernels, GemmRoute, GemmWeight,
             };
+            use bloomery_gpu::iq::repack_iq2xxs;
             let stream = gpu.stream();
             let mut ran = false;
             let gk = GemmKernels::load(gpu.context())?;
@@ -3089,18 +3090,38 @@ mod gate {
                     1024,
                     448,
                 ),
+                // The plane entry's twin of the arm above: the same values
+                // through the loader's writer (its timing arm, the A/B of
+                // docs/cards/l4-iq2xxs-plane.card).
+                (
+                    GemmWeight::Iq2XxsPlane,
+                    "gemm_iq2xxs_bolt_up_t448p",
+                    66,
+                    66,
+                    432,
+                    9,
+                    2560,
+                    1024,
+                    448,
+                ),
             ] {
                 if only.is_some_and(|o| o != op) {
                     continue;
                 }
                 ran = true;
                 let n_rows = n_exp * rows;
-                let w = DeviceTensor::<u32>::upload(
-                    stream,
-                    &fill_pattern(n_rows * words),
-                    n_rows,
-                    words,
-                )?;
+                let filled = fill_pattern(n_rows * words);
+                // The plane arm's words come from the loader's writer over
+                // the same filled file stream (a plane's n_sb is even, so
+                // the file stream is word-aligned throughout); the pattern
+                // keeps the decode off its zero fast path in both entries.
+                let words_v = if ty == GemmWeight::Iq2XxsPlane {
+                    let file: Vec<u8> = filled.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    repack_iq2xxs(&file, n_exp, rows, k)?
+                } else {
+                    filled
+                };
+                let w = DeviceTensor::<u32>::upload(stream, &words_v, n_rows, words)?;
                 let n_slots = t * top_k;
                 let xs = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(t * k))?;
                 let mut act = GemmAct::new(stream, t, k)?;
