@@ -10,8 +10,9 @@
 //! - a Mamba-2 layer is one pass over its tokens
 //!   ([`Mamba2Kernels::enqueue_steps`], bit for bit the steps' scan);
 //! - an attention layer appends the pass's K/V rows to its planes and runs
-//!   the group-16 flash in runs of [`MAX_PASS_ROWS`] rows, each row over the
-//!   keys up to its own position;
+//!   the prefill flash's split entry over the pass's whole row set
+//!   ([`crate::flash_gqa_prefill::FlashGqaPrefill::enqueue_split`]), each
+//!   row over the keys up to its own position;
 //! - a latent MoE layer routes the pass's rows in two launches
 //!   ([`super::router::Routers::enqueue_rows`]), runs its kept experts as
 //!   one `iq2_xxs_gemv_sel` over the pass's `TOP_K · m` slots each for the
@@ -37,13 +38,14 @@ use super::router::{COUNTS, TOP_K};
 use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
 use crate::fault::FaultSink;
 use crate::flash::PlaneAppend;
-use crate::flash_gqa::{GROUP_16, GqaArgs, HEAD};
+use crate::flash_gqa::HEAD;
+use crate::flash_gqa_prefill::{GqaPrefillArgs, SplitScratch};
 use crate::gemm::Gemm32Kernels;
 use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::head::Head;
 use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
-use crate::model::{GpuModel, MAX_PASS_ROWS};
+use crate::model::GpuModel;
 use crate::q38::EmbedQ8Args;
 use crate::site::{self, SiteTy};
 use crate::site::{KGemvKernels, SiteWeight, WideActs, WideKernels};
@@ -121,6 +123,10 @@ struct PassBufs {
     arms: Arms,
     /// The experts' GEMM forms ([`experts_gemm`]).
     ex: ExpertArms,
+    /// The prefill flash's sub-group buffers: one plain launch's worth of
+    /// query and output rows, what the pass's whole-row split entry moves
+    /// through.
+    split: SplitScratch,
 }
 
 /// What the experts' GEMMs read past [`COLS`] rows.
@@ -245,6 +251,7 @@ impl Prompt {
                     wide,
                     route: GemmRoute::new(stream, cut, 1)?,
                 },
+                split: SplitScratch::new(stream, rows, sh.n_kv)?,
             },
         })
     }
@@ -274,6 +281,7 @@ impl Prompt {
             + b.arms.route.bytes()
             + b.ex.routes.iter().map(|r| r.1.bytes()).sum::<usize>()
             + b.ex.acts.iter().map(|a| a.2.bytes()).sum::<usize>()
+            + b.split.num_bytes()
     }
 
     /// The word index the pass's ids start at.
@@ -854,36 +862,23 @@ impl Body {
                         |h| Window::<f32>::of(vh, h * m * HEAD * f, m * HEAD),
                         &mut a.vc,
                     )?;
-                    let mut r0 = 0;
-                    while r0 < m {
-                        let mr = (m - r0).min(MAX_PASS_ROWS);
-                        let qw = Window::<f32>::of(&buf.q, r0 * q_width * f, mr * q_width)?;
-                        let nk = Window::<u32>::of(&buf.n_keys, r0 * size_of::<u32>(), mr)?;
-                        let mut yw = WindowMut::<f32>::of_mut(
-                            &mut buf.attn,
-                            r0 * q_width * f,
-                            mr * q_width,
-                        )?;
-                        self.k.flash.enqueue_pass::<GROUP_16>(
-                            stream,
-                            GqaArgs {
-                                q: &qw,
-                                kc: a.kc.buf(),
-                                vc: a.vc.buf(),
-                                n_keys: &nk,
-                                scale: 1.0 / (HEAD as f32).sqrt(),
-                                n_kv,
-                                ctx: sh.ctx,
-                                m: mr,
-                                part_v: &mut buf.part_v,
-                                part_ms: &mut buf.part_ms,
-                                fault,
-                                y: &mut yw,
-                            },
-                            false,
-                        )?;
-                        r0 += mr;
-                    }
+                    self.prefill.enqueue_split(
+                        stream,
+                        GqaPrefillArgs {
+                            q: &buf.q,
+                            kc: a.kc.buf(),
+                            vc: a.vc.buf(),
+                            n_keys: &buf.n_keys,
+                            scale: 1.0 / (HEAD as f32).sqrt(),
+                            n_head: q_width / HEAD,
+                            n_kv,
+                            ctx: sh.ctx,
+                            t: m,
+                            fault,
+                            y: &mut buf.attn,
+                        },
+                        &mut b.split,
+                    )?;
                     project_rows(
                         &cx,
                         &mut b.arms,

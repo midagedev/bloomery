@@ -9,6 +9,7 @@ use crate::arch::hybrid::{
     Words, attention_heads, attn_layer, mamba_layer, mamba_shape,
 };
 use crate::flash_gqa::GROUP_16;
+use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::head::Head;
 use crate::iq_sel::IqSelKernels;
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
@@ -61,6 +62,9 @@ pub struct Body {
     pub(super) k: Kernels,
     pub(super) mk: MoeKernels,
     pub(super) q38: Q38Kernels,
+    /// The prompt pass's attention: the prefill flash's split entry over the
+    /// pass's rows (the step path keeps the trunk's group-16 flash).
+    pub(super) prefill: FlashGqaPrefill,
     acts: Acts,
     s: hybrid::Scratch,
     ms: MoeScratch,
@@ -194,6 +198,7 @@ impl Body {
                 iq: IqSelKernels::load(ctx_, gpu.fault_word())?,
             },
             q38: Q38Kernels::load(ctx_)?,
+            prefill: FlashGqaPrefill::load(ctx_)?,
             acts,
             s: hybrid::Scratch::new(stream, &sh, hp.n_head, 0)?,
             ms: MoeScratch::new(stream, moe, hidden, ff)?,
